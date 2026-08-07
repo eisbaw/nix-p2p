@@ -67,6 +67,14 @@ clients, chain depth); the p2p wave points it at peer count.
 
 ## Negative feedback — how the system tells us it is wrong
 
+Fast/slow split (owner requirement, 2026-08-08): the suite is
+explicitly two-tier to keep the iteration cycle fast. FAST =
+`just build lint test` + e2e smoke — runs on every cycle, minutes.
+SLOW = full e2e matrix, VM tests, soaks, sweeps, fuzzing — runs on a
+cadence (wave boundaries, before handoff) via dedicated `just`
+recipes (`e2e`, `e2e-vm`, and later `test-slow`). A cycle that ran
+only FAST must say so; slow-tier results are never implied.
+
 Gates (all must pass; `just` recipes are the canonical entry points):
 1. `just build` — workspace compiles.
 2. `just lint` — clippy, `-D warnings`.
