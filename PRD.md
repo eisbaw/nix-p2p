@@ -1,6 +1,6 @@
 # PRD — nix-p2p: decentralized Nix binary cache (Candidate B)
 
-Status: **round 5 draft — under grill**
+Status: **ACCEPTED (round 6) — owner declared good enough; handed to phase 2**
 Tentative-vs-Committed: **experimental** (confirmed by owner, round 1)
 
 ## Essence / problem
@@ -59,6 +59,11 @@ Capabilities are then added gradually behind **module interfaces**:
    failures, wrong/corrupt data), so adversarial-upstream logic never
    lives inside the product daemon. Product modularity is for
    capability growth; the test proxy earns none of that complexity.
+
+   Code sharing between the two (settled, round 5, owner): **low-level
+   crates only** — pure-data code such as narinfo parsing and shared
+   types (likely nix-compat upstream anyway). No shared proxy or HTTP
+   logic: the fixture stays an independent witness of wire behavior.
 
 **Test strategy (settled, round 2, owner)**: container-based e2e from
 the start — controlled `nix.conf`, controlled networking, multiple
