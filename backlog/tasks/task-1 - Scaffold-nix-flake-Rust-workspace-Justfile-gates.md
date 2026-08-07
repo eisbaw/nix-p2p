@@ -4,7 +4,7 @@ title: 'Scaffold: nix flake + Rust workspace + Justfile gates'
 status: To Do
 assignee: []
 created_date: '2026-08-07 21:55'
-updated_date: '2026-08-07 22:04'
+updated_date: '2026-08-07 22:19'
 labels:
   - foundation
 dependencies: []
@@ -19,8 +19,8 @@ Foundation for everything. Nix flake devshell (pinned Rust toolchain, just), Car
 
 ## Acceptance Criteria
 <!-- AC:BEGIN -->
-- [ ] #1 nix develop provides toolchain; just build, just lint, just test all green
-- [ ] #2 Workspace has daemon and testproxy crates; no proxy logic shared between them
-- [ ] #3 just e2e exists and fails loudly (non-zero, clear message) while unimplemented
+- [ ] #1 nix develop provides pinned toolchain (rust-toolchain.toml + oxalica rust-overlay; clippy/rustfmt from the SAME toolchain derivation); just build, lint, test, fmt green
+- [ ] #2 Flake exposes packages.daemon and packages.testproxy via crane (not buildRustPackage cargoHash churn); nix build .#daemon green - VM tests and container images consume these
+- [ ] #3 Crate independence is mechanical: cargo tree -p testproxy contains no daemon crate (asserted by a lint/test); no shared crate until a second consumer actually exists
 - [ ] #4 just e2e, e2e-vm, measure, journey exist as stubs that exit 0 while printing '0 scenarios registered - NOT a pass' (commits stay unblocked); tasks 5/9/10/6 replace them with real gates and the stub state is forbidden after those close
 <!-- AC:END -->

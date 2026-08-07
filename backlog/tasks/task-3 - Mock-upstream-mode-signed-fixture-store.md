@@ -4,7 +4,7 @@ title: Mock upstream mode + signed fixture store
 status: To Do
 assignee: []
 created_date: '2026-08-07 21:55'
-updated_date: '2026-08-07 22:05'
+updated_date: '2026-08-07 22:19'
 labels:
   - irreversible
 dependencies:
@@ -20,8 +20,8 @@ Signed fixture store + mock upstream serving it. Review-gate hardened: fixtures 
 
 ## Acceptance Criteria
 <!-- AC:BEGIN -->
-- [ ] #1 Mock serves nix-cache-info/narinfo/nar for fixture closures; a container nix client with the test public key substitutes them successfully with require-sigs enabled
-- [ ] #2 Fixture set includes a NAR large enough (>=100MB) for mid-transfer kill tests
-- [ ] #3 Tampering test: flip one byte in a fixture narinfo signature field; client MUST reject (bite test)
+- [ ] #1 Generator produces closures covering Compression none, xz and zstd, plus one >=100MB NAR stored with compression=none (kill-at-50%-bytes needs real wire volume); generation pinned to flake inputs; workload version recorded in TESTING.md
+- [ ] #2 Narinfos signed ONLY by the test key - no foreign Sig lines (asserted); harness client trusted-public-keys contains exactly the test key (asserted)
+- [ ] #3 Tamper bite: mutate NarHash and Sig in a served narinfo -> in-process client verification rejects; re-asserted through the full container chain once task-5 exists (documented: this proves the chain preserves Nix's verification)
 - [ ] #4 Mock serves nix-cache-info with EXPLICIT Priority and WantMassQuery (file:// stores emit only StoreDir - verified; implicit defaults would un-ground ordering tests)
 <!-- AC:END -->

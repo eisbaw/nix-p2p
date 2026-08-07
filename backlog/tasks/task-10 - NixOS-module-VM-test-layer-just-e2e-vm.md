@@ -4,7 +4,7 @@ title: NixOS module + VM test layer (just e2e-vm)
 status: To Do
 assignee: []
 created_date: '2026-08-07 21:56'
-updated_date: '2026-08-07 22:14'
+updated_date: '2026-08-07 22:20'
 labels: []
 dependencies:
   - TASK-5
@@ -18,10 +18,9 @@ Minimal NixOS module (enable, port, upstream URL, nix.settings wiring for substi
 
 ## Acceptance Criteria
 <!-- AC:BEGIN -->
-- [ ] #1 just e2e-vm green: VM client substitutes fixture closure through daemon on a peer VM with testproxy+mock; S1+S2 asserted
-- [ ] #2 Module sets substituter ordering via nix.settings; daemon-off VM boots and builds fine (additive invariant at the module level)
-- [ ] #3 VM test wired into nix flake check or a just recipe (documented which, and why)
-- [ ] #4 Module: enable/port/upstream options, sets nix.settings substituter ordering; daemon-off VM boots and builds via fallback (module-level additive invariant)
+- [ ] #1 just e2e-vm wired to nix build .#checks.x86_64-linux.<test> -L (NOT nix flake check - keeps fast gates fast); test also exposed under checks for discoverability
+- [ ] #2 VM test green: client VM substitutes fixture closure through daemon + testproxy/mock VMs; S1+S2 asserted; fixtures reach the upstream VM via virtualisation.additionalPaths and are asserted ABSENT from the client VM store (else S1 passes vacuously); client substituters forced via lib.mkForce
+- [ ] #3 Module: enable/port/upstream options, sets nix.settings substituter ordering with an explicit ?priority=10 URL param on the daemon substituter; daemon-off VM boots and builds via fallback (module-level additive invariant)
 <!-- AC:END -->
 
 ## Implementation Notes

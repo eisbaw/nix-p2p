@@ -4,7 +4,7 @@ title: 'HARDENING: proxy robustness matrix (fault x depth), header hygiene deep 
 status: To Do
 assignee: []
 created_date: '2026-08-07 21:56'
-updated_date: '2026-08-07 22:06'
+updated_date: '2026-08-07 22:20'
 labels:
   - hardening
 dependencies:
@@ -22,8 +22,8 @@ Wave-end hardening block, part 1 - runs only against stabilized surfaces (post J
 
 ## Acceptance Criteria
 <!-- AC:BEGIN -->
-- [ ] #1 Fault x depth matrix implemented and green (or each red documented as a filed bug task)
-- [ ] #2 Header hygiene documented in-code and asserted by a test (list of forwarded/stripped headers)
-- [ ] #3 Deferred-findings inbox for these surfaces is empty (each closed or converted to a task)
+- [ ] #1 Fault x depth matrix (all 7 modes x depth 1..3) green - failures are FIXED in this task; a red row survives only by explicit owner-visible decision, never by silently filing it away (review gate removed the 'or documented' escape)
+- [ ] #2 Header hygiene documented in-code and asserted (forwarded/stripped allowlist); gzip Content-Encoding leg and an HTTP/2-upstream leg exercised (harness is otherwise HTTP/1.1-only, the real cache.nixos.org leg is not)
+- [ ] #3 Property/fuzz enlargement: narinfo unknown-field fuzz through the chain; path-traversal fuzz on cache keys (..%2f, non-base32, absurd lengths); ENOSPC in both cache layers degrades to passthrough, never serves a partial file
 - [ ] #4 deferred-finding label is empty: every deferred finding closed here or converted to an explicit task by owner decision
 <!-- AC:END -->

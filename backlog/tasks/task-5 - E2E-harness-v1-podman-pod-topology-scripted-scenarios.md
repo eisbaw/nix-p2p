@@ -4,7 +4,7 @@ title: 'E2E harness v1: podman-pod topology + scripted scenarios'
 status: To Do
 assignee: []
 created_date: '2026-08-07 21:55'
-updated_date: '2026-08-07 22:06'
+updated_date: '2026-08-07 22:19'
 labels: []
 dependencies:
   - TASK-3
@@ -20,8 +20,8 @@ Containerized harness, the canonical just e2e. Review-gate reality check (host-v
 
 ## Acceptance Criteria
 <!-- AC:BEGIN -->
-- [ ] #1 just e2e runs headless and green: build fixture closure through full chain, S1 oracle asserted, exact upstream hit counts asserted
-- [ ] #2 Corrupt-NAR fault scenario: build FAILS with hash error (prove-the-check-bites, TESTING.md)
-- [ ] #3 Scenario runner reports per-scenario pass/fail; a failing oracle fails just e2e (blocks commits per repo policy)
+- [ ] #1 just e2e green headless on rootless podman (no docker daemon): fixture closure through full chain, S1 byte oracle + exact per-layer request counts (client nix cache wiped; max-substitution-jobs=1 in counting scenarios)
+- [ ] #2 nix.conf topology pinned: daemon (priority<40) AND mock/testproxy as explicit direct fallback substituter; S2 scenarios assert the fallback actually served the bytes via request counts, not merely exit 0
+- [ ] #3 Corrupt-NAR scenario: build FAILS with hash error (bite); 404-fidelity scenario: absent path -> 404 at the client, build proceeds, substituter NOT marked failed
 - [ ] #4 Scenario runner reports per-scenario pass/fail; any failing oracle fails just e2e; just e2e-clean tears down pods reliably (Ctrl-C leak trap)
 <!-- AC:END -->

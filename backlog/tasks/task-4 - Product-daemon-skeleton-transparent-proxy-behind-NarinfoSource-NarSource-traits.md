@@ -6,7 +6,7 @@ title: >-
 status: To Do
 assignee: []
 created_date: '2026-08-07 21:55'
-updated_date: '2026-08-07 22:14'
+updated_date: '2026-08-07 22:19'
 labels: []
 dependencies:
   - TASK-1
@@ -23,11 +23,12 @@ The wave-0 product per PRD: a transparent binary-cache proxy whose only cleverne
 
 ## Acceptance Criteria
 <!-- AC:BEGIN -->
-- [ ] #1 Container nix client substitutes fixture closure via daemon -> testproxy -> mock; S1 byte-identity oracle passes
-- [ ] #2 nix-cache-info advertises priority < 40 and correct WantMassQuery; verified by a test reading it through a real nix client ordering decision
-- [ ] #3 Upstream unreachable: daemon answers errors within 2s, never hangs; client build still succeeds via fallback substituter
-- [ ] #4 All upstream access goes through the two traits; no direct HTTP calls elsewhere (compile-time seam for p2p waves)
-- [ ] #5 Upstream unreachable: clean error within 2s, no hang; HTTP client auto-decompression DISABLED - gzip Content-Encoding upstream test asserts FileHash still verifies at the client (reqwest/hyper default-decompression trap)
+- [ ] #1 NarSource shape frozen for the seam: resolve(nar_hash, expected_size) -> verified byte stream; the narinfo URL field is consumed inside UpstreamHttp ONLY; unit test proves a fake NarSource with zero URL knowledge satisfies the HTTP layer
+- [ ] #2 In-process integration test (no containers): daemon against testproxy+mock substitutes fixture narinfo+NAR - the fast fault-mode loop lives here; container-level S1 lands in task-5
+- [ ] #3 Signed narinfo fields byte-identical through the daemon (rewrite allowlist exists in code and is EMPTY per TESTING.md policy); bite: test-mutating a signed field makes client-side verification fail
+- [ ] #4 Status fidelity: upstream 404 stays 404, 403 stays 403 (S3-backed caches), unknown path kinds (log/*, *.ls, debuginfo/) pass through unchanged - nix log must not silently break
+- [ ] #5 nix-cache-info: priority < 40; WantMassQuery value DECIDED in-task with recorded reasoning (mass-query amplification vs discoverability), then asserted; ordering proven by request-count flip test using BOTH levers (daemon-advertised priority AND client-side ?priority= URL override)
+- [ ] #6 Upstream unreachable: clean error within 2s, no hang; HTTP client auto-decompression DISABLED - gzip Content-Encoding upstream test asserts FileHash still verifies at the client (reqwest/hyper default-decompression trap)
 <!-- AC:END -->
 
 ## Implementation Notes

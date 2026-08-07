@@ -4,7 +4,7 @@ title: 'Measurement: request/byte counters + egress report + gap histogram'
 status: To Do
 assignee: []
 created_date: '2026-08-07 21:56'
-updated_date: '2026-08-07 22:05'
+updated_date: '2026-08-07 22:20'
 labels:
   - irreversible
 dependencies:
@@ -21,8 +21,10 @@ The instrument the kill criterion depends on (PRD: <20% net egress cut kills p2p
 
 ## Acceptance Criteria
 <!-- AC:BEGIN -->
-- [ ] #1 just measure (or e2e scenario) emits machine-readable report: egress bytes both arms, p95 wall-clock both arms, gap histogram
-- [ ] #2 Bite test: test-proxy cache on vs off changes reported egress in the expected direction (S3)
-- [ ] #3 Latency bound check implemented: report flags p95 regression > 10% (S4) as failure
-- [ ] #4 just measure replaces the task-1 stub as a real recipe
+- [ ] #1 Counting rule committed as a doc next to the code: exactly what net upstream egress includes (bodies vs headers, narinfo vs nar bytes, retries, hedge losers); testproxy counters are ground truth; irreversible label rationale: the J2 baseline freezes against this definition
+- [ ] #2 Report: egress + p95 for both arms, N>=10 runs per arm with variance; A/A calibration (daemon-off vs daemon-off) proves noise floor <10%, else S4 is flagged unusable in the report itself
+- [ ] #3 Magnitude bite: fixed scenario asserts absolute egress equals the known sum of fixture file sizes within framing tolerance; daemon self-counters agree with testproxy ground truth within stated tolerance
+- [ ] #4 Gap-oracle bite: testproxy injects a known narinfo->nar delay X; histogram reports X within tolerance and tracks a changed X
+- [ ] #5 Latency bite: injected 200ms/request trips the >10% p95 flag; product-side bite: toggling the daemon narinfo cache (task-8) measurably moves narinfo egress (instrument validated against a PRODUCT change, not only the fixture)
+- [ ] #6 just measure replaces the task-1 stub as a real recipe
 <!-- AC:END -->

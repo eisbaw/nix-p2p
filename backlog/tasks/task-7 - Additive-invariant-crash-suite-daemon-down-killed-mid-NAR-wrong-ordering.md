@@ -4,7 +4,7 @@ title: 'Additive-invariant crash suite: daemon down, killed mid-NAR, wrong order
 status: To Do
 assignee: []
 created_date: '2026-08-07 21:55'
-updated_date: '2026-08-07 22:05'
+updated_date: '2026-08-07 22:20'
 labels: []
 dependencies:
   - TASK-5
@@ -19,8 +19,8 @@ S2 made into standing e2e scenarios: (a) daemon absent at nix-daemon store-open;
 
 ## Acceptance Criteria
 <!-- AC:BEGIN -->
-- [ ] #1 All three scenarios green in just e2e; kill-mid-transfer shows truncated-transfer event in test-proxy log AND successful fallback build (both asserted)
-- [ ] #2 Post-crash: nix-store --verify-path (or equivalent) proves no corrupt store path exists
-- [ ] #3 Scenarios run against compose harness; marked for reuse by the VM layer
+- [ ] #1 Crash scenarios green in just e2e: (a) daemon absent at store-open; (b) SIGKILL at 50% of the >=100MB NAR, triggered by BYTES OBSERVED at the testproxy, not a sleep; (c) kill DURING the narinfo response; (d) kill BETWEEN narinfo 200 and the NAR GET (the actual S2 claim); each asserts fallback served the bytes
+- [ ] #2 SIGSTOP stall scenario: no RST/FIN - measured behavior vs Nix stalled-download-timeout documented, build eventually succeeds via fallback; if the stall exceeds an acceptable bound, that is a finding to file, not a pass
+- [ ] #3 Post-crash state: fixture path IS present via fallback with NarHash equal to fixture's; no orphaned locks/tmp files; bite: an injected corrupt store path makes this check fail
 - [ ] #4 Keep-alive desync: upstream truncation while daemon survives -> next request on the reused connection returns correct bytes or the connection is closed (never NAR-tail-as-narinfo)
 <!-- AC:END -->
