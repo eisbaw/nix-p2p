@@ -35,6 +35,24 @@ daemon enabled ≤ 110% of daemon-off, in the harness. (PRD kill
 criterion: this bound plus, in later waves, ≥20% net egress cut on
 the favorable testbed — else the p2p thesis dies.)
 
+S5. **Scaling laws, measured then modeled (owner requirement, post-
+review).** Behavior at 10s/100s/1000s of peers must be characterized,
+but the host cannot run 1000 real nodes — so the harness sweeps the
+real system across a feasible range (target 1..30 nodes; peers are
+single processes, so prefer process/pod swarms over VMs for sweeps),
+samples per-node RSS, fds, and request latency, fits candidate
+models (O(1), O(log n), O(n), O(n log n), O(n²)) and extrapolates
+with confidence intervals. Honesty rules: (a) the report labels
+every extrapolated number as a model output, never a measurement;
+(b) fit quality (R², residuals) is reported alongside; (c) a
+superlinear fit on RAM or latency is a red flag surfaced, not a
+footnote; (d) extrapolation claims cover **resource scaling laws
+only** — emergent network effects (mainline DHT k-bucket dynamics,
+gossip fan-out at scale) are explicitly outside what small-N sweeps
+can predict, and the report must say so. Wave 1 builds and
+bite-tests this machinery on the axes that exist (concurrent
+clients, chain depth); the p2p wave points it at peer count.
+
 ## Good vs bad, observable
 
 | Observable | Good | Bad |
@@ -164,6 +182,8 @@ their absence is visible): DHT resolve latency oracles, peer yes/no
 probe abuse tests, claim-schema conformance/versioning tests,
 announce-on-demand behavior, hedge race + throughput-abort tests,
 NarSize-abort (claim-spam DoS) tests, multi-node p2p topologies,
+**peer-count scale sweeps** (S5 machinery is wave-1; pointing it at
+1..30 real peers and extrapolating to 100s/1000s is p2p-wave work),
 **real-world NAT traversal** (PRD "what bad looks like" names it;
 the container harness cannot prove it). PRD wave-0 reconciliation:
 its "multi-node topologies" is satisfied in wave 1 by the long-chain

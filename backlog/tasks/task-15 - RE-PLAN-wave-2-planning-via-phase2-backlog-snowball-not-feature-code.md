@@ -4,7 +4,7 @@ title: 'RE-PLAN: wave 2 planning via phase2-backlog-snowball (not feature code)'
 status: To Do
 assignee: []
 created_date: '2026-08-07 21:56'
-updated_date: '2026-08-07 22:06'
+updated_date: '2026-08-07 22:10'
 labels:
   - replan
 dependencies:
@@ -25,3 +25,9 @@ Re-plan task - not feature code. Re-invoke phase2-backlog-snowball with: the PRD
 - [ ] #4 Irreversible labels applied to wave-2 freeze-surface tasks per PRD map (claim schema, DHT key derivation, addressed-unit encoding)
 - [ ] #5 Wave exit gate: just e2e AND just e2e-vm both green at the moment of re-planning (a gate that vanished cannot be required - task-1 stubs must be long gone)
 <!-- AC:END -->
+
+## Implementation Notes
+
+<!-- SECTION:NOTES:BEGIN -->
+Owner requirement added post-review: wave-2 planning must include peer-count scale sweeps using the task-18 S5 machinery - real sweeps at 1..30 peers, regression-fit extrapolation to 100s/1000s for latency and RAM, with S5 honesty limits (resource laws only, not emergent DHT/gossip effects). See TESTING.md S5 and the not-grounded list.
+<!-- SECTION:NOTES:END -->
