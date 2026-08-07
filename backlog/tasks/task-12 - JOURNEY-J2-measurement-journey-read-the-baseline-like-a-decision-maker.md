@@ -4,7 +4,7 @@ title: 'JOURNEY J2: measurement journey - read the baseline like a decision-make
 status: To Do
 assignee: []
 created_date: '2026-08-07 21:56'
-updated_date: '2026-08-07 22:20'
+updated_date: '2026-08-07 23:57'
 labels:
   - journey
 dependencies:
@@ -23,3 +23,13 @@ Second interspersed journey. As the project owner: run the measurement workload 
 - [ ] #2 Written answers committed: is the prefetch window real (gap data vs 1-4s DHT lookups, PRD risk 3)? what must p2p beat? - these feed the go/no-go checkpoint directly
 - [ ] #3 Report gaps/friction filed as tasks
 <!-- AC:END -->
+
+## Implementation Notes
+
+<!-- SECTION:NOTES:BEGIN -->
+forward-carried from task-3 (119cbb7): the J2 baseline you write freezes against workload nix-p2p-fixture-workload-v1 (pinned in fixtures/workload.lock.json, described in TESTING.md 'Fixture workload'). Quote the version string next to every number in the baseline - a number without it cannot be compared to anything later.
+
+Two honesty caveats to carry into how the baseline is read: (a) payloads are incompressible seeded bytes, so compression ratios are unrepresentative of real nixpkgs closures; (b) the workload is 4 paths totalling ~111 MiB, dominated by one 110 MiB uncompressed NAR - it exercises byte volume, not closure breadth or narinfo count. If the decision-maker's question is about many-small-paths behaviour, this workload does not answer it and the baseline should say so rather than imply otherwise.
+
+If the lock ever forces a WORKLOAD_VERSION bump (e.g. a flake.lock update), the existing baseline is RETIRED, not adjusted - mark it so wherever it is quoted.
+<!-- SECTION:NOTES:END -->

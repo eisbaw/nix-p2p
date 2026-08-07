@@ -4,7 +4,7 @@ title: 'Measurement: request/byte counters + egress report + gap histogram'
 status: To Do
 assignee: []
 created_date: '2026-08-07 21:56'
-updated_date: '2026-08-07 22:40'
+updated_date: '2026-08-07 23:57'
 labels:
   - irreversible
 dependencies:
@@ -33,4 +33,12 @@ The instrument the kill criterion depends on (PRD: <20% net egress cut kills p2p
 
 <!-- SECTION:NOTES:BEGIN -->
 forward-carried from task-1 (e9b3378): 'just measure' is currently a stub that exits 0 printing '0 scenarios registered - NOT a pass'. Replace it, and add a DoD check that greps for that marker and requires zero hits for measure.
+
+forward-carried from task-3 (119cbb7): the measured workload is nix-p2p-fixture-workload-v1, pinned by fixtures/workload.lock.json. Any egress/latency number you record MUST quote that version string - it is what makes cross-wave comparison against the kill criterion meaningful, and the gate fails if TESTING.md stops naming it.
+
+Run 'just fixtures-large' for measurement runs: the fast tier omits fixture-big. fixture-big is 110 MiB (NarSize 115343872) stored with Compression: none, deliberately, so wire bytes equal disk bytes and the counting rule needs no correction factor for it. The other three are none/xz/zstd - for those, compressed FileSize is what crosses the wire and is NOT the NarSize; fixtures/out/manifest.json carries both (nar_size and file_size) per path, so the counting rule can be written against real numbers instead of estimates.
+
+Payloads are incompressible by construction (seeded SHAKE256), so xz/zstd bodies are close to their raw size - do not treat compression ratio here as representative of real nixpkgs closures. Say so where the baseline is written.
+
+CAUTION for the frozen baseline: a 'nix flake update' changes stdenv, which changes every payload's store path and NarHash, which changes the workload even though WORKLOAD_VERSION would sit still. The lock file turns that into a hard gate failure. If it ever fires, the previously recorded baseline is retired, not adjusted.
 <!-- SECTION:NOTES:END -->
