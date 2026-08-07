@@ -5,7 +5,7 @@ version.workspace = true
 edition.workspace = true
 
 # Deliberately dependency-free at scaffold time. The HTTP stack, async runtime
-# and NarinfoSource/NarSource module traits are task-2/task-4 decisions and are
+# and NarinfoSource/NarSource module traits are task-4's decisions and are
 # left unconstrained here on purpose.
 [dependencies]
 

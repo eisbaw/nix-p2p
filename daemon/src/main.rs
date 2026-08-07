@@ -2,7 +2,7 @@
 //!
 //! At this point the daemon serves no HTTP and has no p2p behaviour. It exists
 //! so the workspace, the gates and the flake packages are real and exercised
-//! from commit one. Task-2 grows the transparent proxy from here.
+//! from commit one. Task-4 grows the transparent proxy from here.
 //!
 //! Assumption baked in here and nowhere else: the binary identifies itself on
 //! stdout so container/VM harnesses (task-5, task-10) have something
@@ -22,7 +22,7 @@ fn banner() -> String {
 
 fn main() {
     println!("{}", banner());
-    println!("scaffold: no substituter endpoint yet (task-2)");
+    println!("scaffold: no substituter endpoint yet (task-4)");
 }
 
 #[cfg(test)]

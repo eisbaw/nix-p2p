@@ -4,9 +4,11 @@ description = "nix-p2p test fixture: local caching proxy fronting cache.nixos.or
 version.workspace = true
 edition.workspace = true
 
-# Deliberately dependency-free at scaffold time, and deliberately NOT sharing
-# any dependency choice with the daemon: the fixture must stay an independent
-# witness of wire behavior (PRD round 5).
+# Deliberately dependency-free at scaffold time. The fixture must stay an
+# independent witness of wire behavior (PRD round 5), so it should not adopt
+# the daemon's HTTP stack. Note that `just independence` enforces "no shared
+# CRATE", not "no shared third-party dependency" - keeping these dependency
+# sets disjoint is task-2's and task-4's discipline, not a mechanical gate.
 [dependencies]
 
 [lints]

@@ -54,16 +54,27 @@
         cargoExtraArgs = "--locked";
       };
 
-      # Dependency closure built once and shared by packages and checks. Both
-      # crates are dependency-free today; this is cheap now, load-bearing later.
-      cargoArtifacts = craneLib.buildDepsOnly commonArgs;
+      # Workspace-wide dependency closure. Used ONLY by workspace-level checks
+      # (clippy/test), never by the two packages - see memberPackage.
+      workspaceArtifacts = craneLib.buildDepsOnly commonArgs;
 
-      # Build exactly one workspace member.
+      # Per-member argument set. Each package gets its OWN dependency closure,
+      # so a broken testproxy dependency no longer fails `nix build .#daemon`
+      # once task-2/task-4 pick different HTTP stacks. Two couplings remain and
+      # are accepted, not overlooked: one Cargo.lock means one shared vendor
+      # derivation (a crate that fails to FETCH still breaks both), and `src`
+      # is the whole workspace, so editing testproxy invalidates daemon's
+      # build cache. Splitting either would mean two workspaces, which the PRD
+      # does not ask for.
+      memberArgs = name: commonArgs // {
+        pname = name;
+        cargoExtraArgs = "--locked --package ${name}";
+      };
+
       memberPackage = name:
-        craneLib.buildPackage (commonArgs // {
-          inherit cargoArtifacts;
-          pname = name;
-          cargoExtraArgs = "--locked --package ${name}";
+        let args = memberArgs name;
+        in craneLib.buildPackage (args // {
+          cargoArtifacts = craneLib.buildDepsOnly args;
           meta.mainProgram = name;
         });
     in
@@ -84,20 +95,47 @@
         inherit (self.packages.${system}) daemon testproxy;
 
         clippy = craneLib.cargoClippy (commonArgs // {
-          inherit cargoArtifacts;
+          cargoArtifacts = workspaceArtifacts;
           cargoClippyExtraArgs = "--workspace --all-targets -- -D warnings";
         });
 
         fmt = craneLib.cargoFmt { inherit src; pname = "nix-p2p-workspace"; version = cargoVersion; };
 
-        test = craneLib.cargoTest (commonArgs // { inherit cargoArtifacts; });
+        test = craneLib.cargoTest (commonArgs // { cargoArtifacts = workspaceArtifacts; });
+
+        # The independence guard is safety-critical and cargo will never lint
+        # it, so it gets the same treatment the Rust gets.
+        scripts = pkgs.runCommand "check-scripts" { nativeBuildInputs = [ pkgs.ruff ]; } ''
+          ruff check --no-cache ${./scripts}
+          ruff format --no-cache --check ${./scripts}
+          touch $out
+        '';
+
+        # Same script `just independence` runs - one implementation, two entry
+        # points. Living only in the Justfile would let a shared crate fail the
+        # local gate and sail through CI.
+        independence = craneLib.mkCargoDerivation (commonArgs // {
+          # null, not workspaceArtifacts: this reads manifests only, and
+          # waiting on the whole dependency closure would mean losing the
+          # independence signal exactly when a dependency build is broken.
+          cargoArtifacts = null;
+          pnameSuffix = "-independence";
+          nativeBuildInputs = (commonArgs.nativeBuildInputs or [ ]) ++ [ pkgs.python3 ];
+          doInstallCargoArtifacts = false;
+          buildPhaseCargoCommand = "python3 ${./scripts/check-independence.py}";
+          installPhaseCommand = "touch $out";
+        });
       };
 
       devShells.${system}.default = craneLib.devShell {
         # Pulls the checks' build inputs into the shell, so `nix develop` and
         # `nix flake check` cannot drift apart on toolchain or native deps.
         checks = self.checks.${system};
-        packages = [ pkgs.just ];
+        packages = [ pkgs.just pkgs.python3 pkgs.ruff ];
+        # Exact toolchain derivation, so the Justfile's `_toolchain` guard can
+        # prove the tools come from THIS one rather than from any /nix/store
+        # path that happens to be on PATH.
+        NIX_P2P_TOOLCHAIN = "${rustToolchain}";
         # No shellHook: house rule forbids verbose devshell output.
       };
     };

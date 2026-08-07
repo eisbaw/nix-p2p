@@ -6,7 +6,8 @@
 //! be depended on by the daemon - the fixture is an independent witness of
 //! wire behaviour, and `just independence` enforces that mechanically.
 //!
-//! At this point it proxies nothing. Task-3 grows the real fixture from here.
+//! At this point it proxies nothing. Task-2 grows the real fixture from here,
+//! task-3 adds the mock-upstream mode and the signed fixture store.
 //!
 //! The near-identical `banner()` in `daemon` is deliberate duplication, not an
 //! oversight: factoring it into a shared crate is exactly the coupling the PRD
@@ -22,7 +23,7 @@ fn banner() -> String {
 
 fn main() {
     println!("{}", banner());
-    println!("scaffold: no proxy endpoint yet (task-3)");
+    println!("scaffold: no proxy endpoint yet (task-2)");
 }
 
 #[cfg(test)]
