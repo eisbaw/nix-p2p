@@ -4,6 +4,7 @@ title: 'GO/NO-GO checkpoint: owner decides on the p2p premise with baseline in h
 status: To Do
 assignee: []
 created_date: '2026-08-07 22:06'
+updated_date: '2026-08-07 22:22'
 labels:
   - checkpoint
 dependencies:
@@ -22,3 +23,9 @@ Decision task, not code (inserted at review gate: hardening a product whose pref
 - [ ] #1 Decision recorded via backlog decision log citing baseline numbers: continue / adjust / stop
 - [ ] #2 If adjust or stop: task-15 re-plan scope updated BEFORE any hardening work starts
 <!-- AC:END -->
+
+## Implementation Notes
+
+<!-- SECTION:NOTES:BEGIN -->
+Owner standing intent (2026-08-08, pre-baseline): 'implement entire backlog - first full-NAR decentralized, then ca-chunked; iroh first prio.' This leans continue, but the checkpoint still runs: the J2 baseline (gap histogram, egress) gets surfaced to the owner before the p2p wave is planned, per PRD kill-criterion discipline.
+<!-- SECTION:NOTES:END -->
