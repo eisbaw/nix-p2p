@@ -1,6 +1,6 @@
 # PRD — nix-p2p: decentralized Nix binary cache (Candidate B)
 
-Status: **round 4 draft — under grill**
+Status: **round 5 draft — under grill**
 Tentative-vs-Committed: **experimental** (confirmed by owner, round 1)
 
 ## Essence / problem
@@ -40,12 +40,25 @@ from real builds) that validates or kills the value thesis.
 
 Capabilities are then added gradually behind **module interfaces**:
 
-- `MetadataSource` — narinfo lookup (upstream HTTP now; disk cache;
+- `NarinfoSource` — narinfo lookup (upstream HTTP now; disk cache;
   mock for tests; p2p relay in v2).
 - `NarSource` — resolve(NarHash) → verified NAR stream (upstream
   HTTP now; iroh whole-blob later; chunked castore in C).
 - The upstream cache itself is mockable: tests run against a fake
   cache.nixos.org with controlled latency, failures, and content.
+
+**Two components, strictly separated (settled, round 4, owner):**
+
+1. **The product daemon** (the decentralized proxy): very modular,
+   everything behind the interfaces above.
+2. **A local test cache-proxy**: a simple — hardcoding allowed —
+   transparent *caching* proxy that fronts cache.nixos.org. It exists
+   first as a pre-step: deep and broad test runs are developed against
+   it so the real cache is never loaded needlessly. It remains
+   permanently as the test fixture for fault injection (latency,
+   failures, wrong/corrupt data), so adversarial-upstream logic never
+   lives inside the product daemon. Product modularity is for
+   capability growth; the test proxy earns none of that complexity.
 
 **Test strategy (settled, round 2, owner)**: container-based e2e from
 the start — controlled `nix.conf`, controlled networking, multiple
@@ -55,6 +68,15 @@ nix-daemon + systemd semantics; compose gives fast iteration and
 adversarial network shaping). The e2e harness is wave-0 scope, not an
 afterthought: the additive invariant and crash behavior (below) must
 be tested from the first release.
+
+Standing test topologies (settled, round 4, owner):
+- nix client → product daemon → local test proxy → (mock | real
+  cache), the everyday development loop;
+- **long-chain**: multiple proxies chained (client → daemon → daemon
+  → … → test proxy → upstream) to prove composition — correct
+  passthrough, no header/metadata mangling, sane timeout behavior —
+  survives depth;
+- multi-node p2p topologies with fault injection at the test proxy.
 
 ## Users / actors
 
@@ -111,9 +133,11 @@ be tested from the first release.
 ## Scope & non-goals
 
 In scope (MVP, in delivery order):
-- **Wave 0**: transparent proxy + `nix-cache-info` semantics +
-  narinfo/claims disk cache + measurement + container/VM e2e harness
-  with mock upstream and multi-node topology.
+- **Wave 0**: local test cache-proxy (the pre-step shielding
+  cache.nixos.org) + transparent product proxy + `nix-cache-info`
+  semantics + narinfo/claims disk cache + measurement + container/VM
+  e2e harness with mock upstream, long-chain, and multi-node
+  topologies.
 - **Then**: iroh-blobs whole-NAR transfer (client + provider) behind
   `NarSource`; DHT-authoritative claim resolution **plus bounded
   fan-out yes/no queries to known peers** (this is how un-announced
@@ -160,7 +184,8 @@ Non-goals (explicit):
 | Metadata | cache.nixos.org only + daemon disk cache | Bandwidth offload MVP (round 1, owner) |
 | Privacy | Public swarm, documented risk, leech opt-out (round 1, owner) | Network effect; risk stated plainly |
 | Trust | Signed fields untouched; Nix verifies sig + NarHash | Daemon/peers outside TCB. Note: passthrough is **not byte-verbatim** — see compression, open question 1 |
-| Language | Rust (tokio) | iroh is Rust; nix-compat crates exist |
+| Language / toolchain | **Everything in Rust** (tokio); **nix flakes** for the dev/build environment (round 4, owner) | iroh is Rust; nix-compat crates exist; flakes pin the toolchain and feed the NixOS VM tests directly |
+| Test upstream shield | Separate simple local caching proxy, permanent fixture, fault injection lives there — never in the product (round 4, owner) | Protects cache.nixos.org from test load; keeps adversarial logic out of the modular daemon |
 
 ## Modularity seam for Candidate C (load-bearing requirement)
 
