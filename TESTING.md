@@ -88,8 +88,24 @@ Oracles (what a scenario asserts against):
   positive TTL) or an already-populated store makes the zero pass
   vacuously. Counting scenarios therefore (a) wipe the client's
   `$XDG_CACHE_HOME/nix` (or zero the narinfo TTLs) per scenario, and
-  (b) pin `max-substitution-jobs = 1`; the 16-way case belongs to the
+  (b) pin `max-substitution-jobs = 1`; concurrent cases belong to the
   hardening soak, where exact counts are not asserted.
+
+  Client knobs are scenario parameters, not ambient defaults
+  (ref: bmcgee.ie "TIL: how to optimise substitutions in Nix"):
+  `max-substitution-jobs` (default 16) and `http-connections`
+  (default 25) are pinned per scenario and swept where concurrency
+  matters — soak and S5 sweeps run at least {1, 16 (default), 128
+  (documented real-world power-user setting)}, reported per knob
+  value; a default-only pass is not a pass for concurrency-sensitive
+  scenarios. Substituter ordering in scenarios uses the
+  `?priority=N` URL override (client-side, lower wins, overrides the
+  advertised `nix-cache-info` Priority) as the canonical pinning
+  mechanism — belt and braces with the daemon's advertised value,
+  and a cheap second lever for ordering-flip bite tests. Wave-2
+  note: at 128 substitution jobs a naive 200 ms hedge fires ~128
+  concurrent upstream fetches — hedge design must be tested against
+  this knob, not only the default.
 - **Byte oracle**: NarHash / `nix-store --dump` comparison (S1).
 - **Build oracle**: `nix build` exit code + `--json` output.
 - **Egress oracle**: byte counters at the test proxy = ground truth

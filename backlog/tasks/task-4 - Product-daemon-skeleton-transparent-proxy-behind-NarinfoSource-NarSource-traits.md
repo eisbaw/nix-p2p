@@ -6,10 +6,12 @@ title: >-
 status: To Do
 assignee: []
 created_date: '2026-08-07 21:55'
-updated_date: '2026-08-07 22:05'
+updated_date: '2026-08-07 22:14'
 labels: []
 dependencies:
   - TASK-1
+references:
+  - 'https://bmcgee.ie/posts/2023/12/til-how-to-optimise-substitutions-in-nix/'
 priority: high
 ---
 
@@ -27,3 +29,9 @@ The wave-0 product per PRD: a transparent binary-cache proxy whose only cleverne
 - [ ] #4 All upstream access goes through the two traits; no direct HTTP calls elsewhere (compile-time seam for p2p waves)
 - [ ] #5 Upstream unreachable: clean error within 2s, no hang; HTTP client auto-decompression DISABLED - gzip Content-Encoding upstream test asserts FileHash still verifies at the client (reqwest/hyper default-decompression trap)
 <!-- AC:END -->
+
+## Implementation Notes
+
+<!-- SECTION:NOTES:BEGIN -->
+Ordering-flip bite test: use the ?priority=N substituter-URL override (bmcgee.ie TIL post) as a second flip lever alongside changing the daemon's advertised nix-cache-info Priority - both mechanisms must produce the expected request-count flip.
+<!-- SECTION:NOTES:END -->

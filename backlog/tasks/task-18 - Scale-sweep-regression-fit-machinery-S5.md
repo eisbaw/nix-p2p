@@ -4,6 +4,7 @@ title: Scale-sweep + regression-fit machinery (S5)
 status: To Do
 assignee: []
 created_date: '2026-08-07 22:10'
+updated_date: '2026-08-07 22:14'
 labels: []
 dependencies:
   - TASK-9
@@ -22,3 +23,9 @@ Owner requirement (post-review): characterize behavior at 10s/100s/1000s of peer
 - [ ] #3 Bite test: synthetic workload with known O(n) memory growth recovers a linear fit; known O(1) workload recovers constant - wrong-model selection fails the test
 - [ ] #4 Report flags superlinear RAM or latency fits prominently (red-flag section, not a footnote)
 <!-- AC:END -->
+
+## Implementation Notes
+
+<!-- SECTION:NOTES:BEGIN -->
+Sweep axes must include the client concurrency knobs max-substitution-jobs / http-connections in {1, 16, 128} (TESTING.md client-knobs rule), alongside client count and chain depth. Ref: bmcgee.ie TIL post.
+<!-- SECTION:NOTES:END -->
