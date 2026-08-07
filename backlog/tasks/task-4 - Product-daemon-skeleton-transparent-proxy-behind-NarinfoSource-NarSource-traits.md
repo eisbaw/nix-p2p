@@ -6,7 +6,7 @@ title: >-
 status: To Do
 assignee: []
 created_date: '2026-08-07 21:55'
-updated_date: '2026-08-07 22:19'
+updated_date: '2026-08-07 22:40'
 labels: []
 dependencies:
   - TASK-1
@@ -35,4 +35,6 @@ The wave-0 product per PRD: a transparent binary-cache proxy whose only cleverne
 
 <!-- SECTION:NOTES:BEGIN -->
 Ordering-flip bite test: use the ?priority=N substituter-URL override (bmcgee.ie TIL post) as a second flip lever alongside changing the daemon's advertised nix-cache-info Priority - both mechanisms must produce the expected request-count flip.
+
+forward-carried from task-1 (e9b3378): daemon/ crate exists with a scaffold main.rs (banner + placeholder), zero dependencies - the async runtime and HTTP stack are deliberately unconstrained and are YOUR decision. Workspace is edition 2024 / resolver 3, toolchain pinned to rust 1.97.1 in rust-toolchain.toml. Adding a workspace crate is allowed, but 'just independence' fails if daemon and testproxy end up sharing one: the allowlist in the Justfile starts empty and widening it is meant to be a reviewable diff (PRD round 5/6 - low-level pure-data crates only, and only once a second consumer exists). Do not deduplicate banner() across the two crates.
 <!-- SECTION:NOTES:END -->

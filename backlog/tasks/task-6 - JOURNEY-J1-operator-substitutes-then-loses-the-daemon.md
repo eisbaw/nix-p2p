@@ -4,7 +4,7 @@ title: 'JOURNEY J1: operator substitutes, then loses the daemon'
 status: To Do
 assignee: []
 created_date: '2026-08-07 21:55'
-updated_date: '2026-08-07 22:19'
+updated_date: '2026-08-07 22:40'
 labels:
   - journey
 dependencies:
@@ -23,3 +23,9 @@ First interspersed journey (every ~5 tasks). Act as a fresh operator, not a test
 - [ ] #2 S2 experienced AND asserted: daemon stopped mid-journey, subsequent build succeeds via fallback (request counts prove fallback served)
 - [ ] #3 Friction points filed as backlog tasks, or 'none found' emitted by the journey run itself (not hand-written prose)
 <!-- AC:END -->
+
+## Implementation Notes
+
+<!-- SECTION:NOTES:BEGIN -->
+forward-carried from task-1 (e9b3378): 'just journey' is currently a stub that exits 0 printing '0 scenarios registered - NOT a pass'. Replace it, and add a DoD check that greps for that marker and requires zero hits for journey.
+<!-- SECTION:NOTES:END -->

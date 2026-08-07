@@ -4,7 +4,7 @@ title: Mock upstream mode + signed fixture store
 status: To Do
 assignee: []
 created_date: '2026-08-07 21:55'
-updated_date: '2026-08-07 22:19'
+updated_date: '2026-08-07 22:40'
 labels:
   - irreversible
 dependencies:
@@ -25,3 +25,9 @@ Signed fixture store + mock upstream serving it. Review-gate hardened: fixtures 
 - [ ] #3 Tamper bite: mutate NarHash and Sig in a served narinfo -> in-process client verification rejects; re-asserted through the full container chain once task-5 exists (documented: this proves the chain preserves Nix's verification)
 - [ ] #4 Mock serves nix-cache-info with EXPLICIT Priority and WantMassQuery (file:// stores emit only StoreDir - verified; implicit defaults would un-ground ordering tests)
 <!-- AC:END -->
+
+## Implementation Notes
+
+<!-- SECTION:NOTES:BEGIN -->
+forward-carried from task-1 (e9b3378): flake.nix uses craneLib.cleanCargoSource, which keeps ONLY Cargo manifests and *.rs. Signed fixture narinfos, NAR blobs and the test ed25519 keypair will be silently excluded from the nix build source, while 'nix build .#testproxy' still runs cargo test in checkPhase - a test that skips-when-fixtures-absent becomes a vacuously green nix build while passing honestly under 'nix develop'. Widen the filter (lib.fileset union of filterCargoSources + tests/) in the same commit that adds the first fixture. A NOTE(task-3) comment marks the exact spot in flake.nix.
+<!-- SECTION:NOTES:END -->

@@ -4,7 +4,7 @@ title: 'Measurement: request/byte counters + egress report + gap histogram'
 status: To Do
 assignee: []
 created_date: '2026-08-07 21:56'
-updated_date: '2026-08-07 22:20'
+updated_date: '2026-08-07 22:40'
 labels:
   - irreversible
 dependencies:
@@ -28,3 +28,9 @@ The instrument the kill criterion depends on (PRD: <20% net egress cut kills p2p
 - [ ] #5 Latency bite: injected 200ms/request trips the >10% p95 flag; product-side bite: toggling the daemon narinfo cache (task-8) measurably moves narinfo egress (instrument validated against a PRODUCT change, not only the fixture)
 - [ ] #6 just measure replaces the task-1 stub as a real recipe
 <!-- AC:END -->
+
+## Implementation Notes
+
+<!-- SECTION:NOTES:BEGIN -->
+forward-carried from task-1 (e9b3378): 'just measure' is currently a stub that exits 0 printing '0 scenarios registered - NOT a pass'. Replace it, and add a DoD check that greps for that marker and requires zero hits for measure.
+<!-- SECTION:NOTES:END -->
