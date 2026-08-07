@@ -1,6 +1,6 @@
 # PRD — nix-p2p: decentralized Nix binary cache (Candidate B)
 
-Status: **round 3 draft — under grill**
+Status: **round 4 draft — under grill**
 Tentative-vs-Committed: **experimental** (confirmed by owner, round 1)
 
 ## Essence / problem
@@ -67,6 +67,14 @@ be tested from the first release.
   HTTP fallback.
 - **Deployment model (settled, round 1): public global swarm,
   documented privacy risk.** Announcing is opt-out (leech mode).
+- **Privacy invariant (settled, round 3): no enumeration, ever.**
+  Peers answer yes/no to a concrete NarHash query and serve bytes on
+  request; there is no endpoint that lists holdings. Precisely: this
+  protects *unguessable* paths (secret/private derivations — their
+  store hashes cannot be constructed by an outsider). It does NOT
+  prevent targeted membership probing of guessable public paths
+  (anyone can compute the store path of any nixpkgs derivation);
+  that residual leak stays documented under the public-swarm risk.
 
 ## What good looks like
 
@@ -107,8 +115,11 @@ In scope (MVP, in delivery order):
   narinfo/claims disk cache + measurement + container/VM e2e harness
   with mock upstream and multi-node topology.
 - **Then**: iroh-blobs whole-NAR transfer (client + provider) behind
-  `NarSource`; DHT-authoritative claim resolution; speculative
-  prefetch; HTTP hedge with **throughput-based abort** (a peer that
+  `NarSource`; DHT-authoritative claim resolution **plus bounded
+  fan-out yes/no queries to known peers** (this is how un-announced
+  whole-store supply becomes reachable, and the gossip accelerant's
+  real role: maintaining a set of live peers worth probing);
+  speculative prefetch; HTTP hedge with **throughput-based abort** (a peer that
   starts fast then stalls at 50 KB/s must lose the race too — start
   latency alone is not the guardrail); announce-after-fetch with an
   explicit **announce budget**; leech-mode flag.
@@ -139,6 +150,10 @@ Non-goals (explicit):
 | Delivery | Transparent proxy first, capabilities behind module interfaces, mockable upstream (round 2, owner) | Hook point + measurement before p2p; value thesis tested before DHT code |
 | Testing | Container + NixOS VM multi-node e2e from wave 0 (round 2, owner) | Controlled nix.conf/networking; real nix-daemon semantics; crash/fallback tests standing |
 | Payload granularity | Whole-NAR blobs | One BLAKE3 per NAR; no chunking agreement; shippable (C deferred) |
+| **Addressed unit** | **Raw (uncompressed) NAR**, BLAKE3 (round 3, owner) | Enables `--dump` seeding + C dedup; narinfo transport fields rewritten (unsigned, legal); ~3x wire bytes until per-connection zstd (a policy surface, not frozen) |
+| **Seeding scope** | **Whole /nix/store via `--dump`**, but strictly **query-answer only: yes/no per NarHash, no enumeration** (round 3, owner) | Largest supply at zero storage cost; listing endpoint would leak secret path names — see privacy invariant below |
+| **Announce policy** | **On-demand only**: publish a claim only when a path is fetched through the daemon (round 3, owner) | Demand-proven records; minimal DHT load; supply lags demand — un-announced holdings reachable via peer yes/no queries |
+| **Kill criterion** | **<20% net cache-egress cut on the favorable testbed kills the p2p thesis**; p95 build latency regression must stay <10% (round 3, owner) | If controlled always-on peers cannot hit 20%, the real world never will |
 | Transport | iroh / iroh-blobs | BLAKE3 incremental verified streaming, QUIC + holepunching |
 | Discovery | DHT-authoritative, gossip as accelerant (round 1, owner) | Must work from empty state; warm map is an optimization, never a requirement |
 | Latency guardrails | Prefetch + hedge (throughput-abort) | The only thing keeping DHT seconds off the user path — load-bearing |
@@ -209,10 +224,12 @@ Tentative / replaceable (velocity surfaces):
    if real narinfo→nar gaps are shorter, hedge wins, offload
    collapses (latency stays bounded — the failure is thesis-level,
    not UX-level).
-4. **Announce math**: full-store announcing on mainline is abusive
-   (~900 pps sustained for 50k paths) and NAT-fatal. An announce
-   budget is mandatory; any survivable budget biases supply toward
-   popular-recent paths (see risk 1's circularity). Open question 3.
+4. **Announce-on-demand means supply lags demand** (settled,
+   round 3): a path never fetched through any daemon since deployment
+   is undiscoverable via the DHT, regardless of how many stores hold
+   it. First-sight fetches always hit the cache; peer yes/no probes
+   partially compensate. A young network offloads little — the kill
+   criterion measures steady state, not launch day.
 5. **Raw-NAR wire cost**: if the addressed unit is the raw NAR
    (open question 1), peers ship ~3x the bytes of xz'd transfers.
    Per-connection compression can claw this back but is added
@@ -236,19 +253,18 @@ Tentative / replaceable (velocity surfaces):
     decision. Revise before phase 2 or implementers will build the
     wrong discovery layer.
 
-## Open questions (round-3 grill)
+## Open questions (remaining — deferred to phase 2 unless grilled further)
 
-1. **Addressed unit** (freezes hardest, decides the most): raw NAR
-   (enables `--dump` seeding + C dedup; ~3x wire bytes; narinfo
-   transport fields rewritten — safe, unsigned) vs compressed
-   `.nar.xz` file (byte-verbatim passthrough, 1x wire bytes; kills
-   `--dump` seeding, kills C dedup, addresses bytes produced by the
-   cache's compressor forever).
-2. **Seeding scope**: self-fetched paths only, or everything in
-   /nix/store via `--dump` (including locally-built bit-identical
-   paths, largest supply, zero storage cost)?
-3. **Announce budget**: what subset of held paths gets announced,
-   and at what rate? (Everything is off the table per risk 4.)
-4. **Kill criterion**: the concrete number that makes the experiment
-   honest — e.g. "≥X% net cache-egress reduction on the N-node
-   testbed under a realistic build mix, else stop."
+1. **DHT mechanism** (frozen surface, needs a spike not a guess):
+   mainline get_peers/announce on a NarHash-derived key vs BEP44
+   records vs iroh-native tracker/content-discovery. Decides
+   NodeId-vs-IP:port dialability (risk 8) and what an announce
+   actually costs. Planned as the first spike of the p2p wave.
+2. **Peer-query protocol details**: fan-out bound, timeout, how the
+   known-peer set is maintained (gossip membership vs past-peer
+   cache), and rate-limiting so yes/no probes do not become the new
+   enumeration vector (an attacker sweeping queries at high rate).
+3. **Figure revision** (housekeeping, blocks phase-2 onboarding):
+   fig-candidate-B/C still show gossip-first + tracker cold-start;
+   must be redrawn to DHT-authoritative + peer-probe before
+   implementers use them.
