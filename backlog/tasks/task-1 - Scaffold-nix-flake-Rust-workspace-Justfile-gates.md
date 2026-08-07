@@ -1,11 +1,11 @@
 ---
 id: TASK-1
 title: 'Scaffold: nix flake + Rust workspace + Justfile gates'
-status: In Progress
+status: Done
 assignee:
   - mped-architect
 created_date: '2026-08-07 21:55'
-updated_date: '2026-08-07 23:14'
+updated_date: '2026-08-07 23:15'
 labels:
   - foundation
 dependencies: []
@@ -77,17 +77,19 @@ KNOWN LIMITS (stated, not fixed):
 ## Final Summary
 
 <!-- SECTION:FINAL_SUMMARY:BEGIN -->
-Scaffold landed in e9b3378 (code) + follow-up tracker commit.
+Scaffold + NO-GO remediation. Commits: e9b3378 (scaffold), 95fc5f2 (tracker), acb37f3 (independence gate rebuilt, packages decoupled), 6921563 (tracker + forward-carry).
 
-AC#1 nix develop provides a pinned toolchain: rust-toolchain.toml pins channel 1.97.1 (exact, not 'stable'); flake reads it via oxalica rust-overlay fromRustupToolchainFile, so rustc/cargo/clippy/rustfmt all resolve inside one derivation (/nix/store/...-rust-minimal-1.97.1). just build/lint/test/fmt all exit 0 from a cold ./target.
+AC#1 pinned toolchain: rust-toolchain.toml pins 1.97.1 exactly; flake reads it via oxalica rust-overlay, so rustc/cargo/clippy/rustfmt all come from one derivation. 'just _toolchain' now proves it at every gate - all four tools must resolve inside the exact derivation the devshell exports, AND rustc --version must match rust-toolchain.toml, so the env var cannot override the single source of truth. Bite-tested with a fake toolchain reporting 1.80.0 (exit 1). build/lint/test/fmt all exit 0 from a cold target.
 
-AC#2 flake packages via crane: packages.x86_64-linux.daemon and .testproxy, single binary each, meta.mainProgram set. nix build .#daemon and .#testproxy both exit 0. Also added checks.* (clippy/fmt/test/daemon/testproxy) so 'nix flake check' runs 5 real checks instead of rubber-stamping; verified exit 0.
+AC#2 crane packages: packages.x86_64-linux.daemon and .testproxy, each now built from its OWN cargoArtifacts. nix build .#daemon and .#testproxy exit 0. Decoupling proven by breaking testproxy's source: nix build .#daemon still exits 0, nix build .#testproxy fails. Residual coupling (shared vendor derivation from one Cargo.lock, shared src) is documented in flake.nix rather than glossed.
 
-AC#3 mechanical crate independence: 'just independence' (a dependency of 'just lint') diffs workspace-local dependency sets. Proven to bite on three injections in scratch copies - direct edge daemon->testproxy (exit 1), direct edge testproxy->daemon (exit 1), and a shared workspace crate pulled in by both (exit 1); the clean control exits 0. The pairwise-only version of this check passed green on the shared-crate case, which is the realistic violation, hence the set-diff plus an allowlist that starts empty.
+AC#3 mechanical crate independence - this is what the NO-GO was about and it is now genuinely mechanical. scripts/check-independence.py is declaration-level (cargo metadata --no-deps) and runs from BOTH 'just independence' and checks.independence, so it can no longer pass CI while failing locally. The old cargo-tree version was empirically shown blind: with a shared crate behind optional=true on one side and cfg(windows) on the other, cargo tree printed the crate roots and nothing else. The guard runs 12 synthetic self-test workspaces (10 must-fail, 2 must-pass) before trusting itself, and is mutation-tested - dropping the out-of-workspace recursion, keying on a rename alias, or ignoring build-dependencies each trips it. Verified to fail the nix build on a real shared crate inside the sandbox. Exit 2 (cannot check) is distinct from exit 1 (violation).
 
-AC#4 honest stubs: just e2e, e2e-vm, measure, journey each exit 0 and print exactly '0 scenarios registered - NOT a pass' (byte-verified). Tasks 5/10/9/6 have forward-carried notes telling them to delete their stub and add a DoD grep requiring zero hits for the marker.
+AC#4 honest stubs: e2e, e2e-vm, measure, journey each exit 0 printing exactly '0 scenarios registered - NOT a pass'. Tasks 5/10/9/6 carry instructions to delete their stub and add a DoD grep for the marker.
 
-Gate numbers (cold ./target): build 0, lint 0, test 0 (2 unit tests, 0 failed), fmt 0 (no diff), package 0, nix build .#daemon 0, nix build .#testproxy 0, nix flake check 0 (5 checks), 4/4 stub markers exact.
+Gate numbers (cold target, clean tree): build 0, lint 0, test 0 (2 tests, 0 failed), fmt 0, independence 0, package 0, nix build .#daemon 0, nix build .#testproxy 0, nix flake check 0 (7 checks: daemon testproxy clippy fmt test scripts independence), 4/4 stub markers byte-exact.
 
-Reviewed by qa-test-runner and mped-architect before commit; one blocker (independence gate passed on the shared-crate case and its success message overclaimed) and eight should-fix findings were folded in - see task notes.
+Reviews: qa-test-runner + mped-architect ran on both cycles. Cycle 1 found one blocker (pairwise independence check passed on the shared-crate case). Cycle 2 - both reviewers independently found that my cargo-metadata rewrite had introduced a NEW bypass (hop through a crate outside the workspace), which the removed cargo-tree check would have caught; fixed and pinned with a regression case before commit.
+
+Known limits recorded in notes: the guard enforces 'no shared crate', not 'no shared code' (source-file tricks are invisible to any manifest-level check) and not 'no shared third-party dependency' (both crates picking the same HTTP stack passes) - the latter is carried forward as a hard requirement onto task-2 and task-4.
 <!-- SECTION:FINAL_SUMMARY:END -->
