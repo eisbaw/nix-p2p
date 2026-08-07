@@ -4,13 +4,14 @@ title: 'HARDENING: proxy robustness matrix (fault x depth), header hygiene deep 
 status: To Do
 assignee: []
 created_date: '2026-08-07 21:56'
+updated_date: '2026-08-07 22:06'
 labels:
   - hardening
 dependencies:
   - TASK-6
   - TASK-7
   - TASK-11
-  - TASK-12
+  - TASK-16
 ---
 
 ## Description
@@ -24,4 +25,5 @@ Wave-end hardening block, part 1 - runs only against stabilized surfaces (post J
 - [ ] #1 Fault x depth matrix implemented and green (or each red documented as a filed bug task)
 - [ ] #2 Header hygiene documented in-code and asserted by a test (list of forwarded/stripped headers)
 - [ ] #3 Deferred-findings inbox for these surfaces is empty (each closed or converted to a task)
+- [ ] #4 deferred-finding label is empty: every deferred finding closed here or converted to an explicit task by owner decision
 <!-- AC:END -->

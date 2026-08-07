@@ -4,6 +4,7 @@ title: 'Additive-invariant crash suite: daemon down, killed mid-NAR, wrong order
 status: To Do
 assignee: []
 created_date: '2026-08-07 21:55'
+updated_date: '2026-08-07 22:05'
 labels: []
 dependencies:
   - TASK-5
@@ -21,4 +22,5 @@ S2 made into standing e2e scenarios: (a) daemon absent at nix-daemon store-open;
 - [ ] #1 All three scenarios green in just e2e; kill-mid-transfer shows truncated-transfer event in test-proxy log AND successful fallback build (both asserted)
 - [ ] #2 Post-crash: nix-store --verify-path (or equivalent) proves no corrupt store path exists
 - [ ] #3 Scenarios run against compose harness; marked for reuse by the VM layer
+- [ ] #4 Keep-alive desync: upstream truncation while daemon survives -> next request on the reused connection returns correct bytes or the connection is closed (never NAR-tail-as-narinfo)
 <!-- AC:END -->

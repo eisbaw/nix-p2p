@@ -4,7 +4,9 @@ title: 'Measurement: request/byte counters + egress report + gap histogram'
 status: To Do
 assignee: []
 created_date: '2026-08-07 21:56'
-labels: []
+updated_date: '2026-08-07 22:05'
+labels:
+  - irreversible
 dependencies:
   - TASK-5
   - TASK-8
@@ -22,4 +24,5 @@ The instrument the kill criterion depends on (PRD: <20% net egress cut kills p2p
 - [ ] #1 just measure (or e2e scenario) emits machine-readable report: egress bytes both arms, p95 wall-clock both arms, gap histogram
 - [ ] #2 Bite test: test-proxy cache on vs off changes reported egress in the expected direction (S3)
 - [ ] #3 Latency bound check implemented: report flags p95 regression > 10% (S4) as failure
+- [ ] #4 just measure replaces the task-1 stub as a real recipe
 <!-- AC:END -->

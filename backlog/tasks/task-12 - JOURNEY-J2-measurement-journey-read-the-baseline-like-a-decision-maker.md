@@ -4,11 +4,11 @@ title: 'JOURNEY J2: measurement journey - read the baseline like a decision-make
 status: To Do
 assignee: []
 created_date: '2026-08-07 21:56'
+updated_date: '2026-08-07 22:06'
 labels:
   - journey
 dependencies:
   - TASK-9
-  - TASK-10
 ---
 
 ## Description
@@ -22,4 +22,5 @@ Second interspersed journey. As the project owner: run the measurement workload 
 - [ ] #1 Baseline recorded in TESTING.md: egress, p95, gap histogram summary, dated and workload-versioned
 - [ ] #2 Written answers to the two decision questions committed (notes or TESTING.md section)
 - [ ] #3 Report gaps/friction filed as tasks
+- [ ] #4 Report gaps/friction filed as tasks
 <!-- AC:END -->

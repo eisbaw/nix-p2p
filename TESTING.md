@@ -63,6 +63,15 @@ Oracles (what a scenario asserts against):
   source, path kind (narinfo/nar/cache-info), bytes, timing; scenarios
   assert exact upstream hit counts (e.g. "second build: 0 upstream
   NAR hits").
+  **Oracle-pairing rule (review gate, wave 1): a "0 upstream hits"
+  assertion is only valid when paired with an asserted NONZERO
+  request count at the layer under test** — otherwise Nix's own
+  client-side narinfo cache (`binary-cache-v6.sqlite`, 30-day
+  positive TTL) or an already-populated store makes the zero pass
+  vacuously. Counting scenarios therefore (a) wipe the client's
+  `$XDG_CACHE_HOME/nix` (or zero the narinfo TTLs) per scenario, and
+  (b) pin `max-substitution-jobs = 1`; the 16-way case belongs to the
+  hardening soak, where exact counts are not asserted.
 - **Byte oracle**: NarHash / `nix-store --dump` comparison (S1).
 - **Build oracle**: `nix build` exit code + `--json` output.
 - **Egress oracle**: byte counters at the test proxy = ground truth
@@ -71,7 +80,20 @@ Oracles (what a scenario asserts against):
   measured).
 - **Gap oracle**: narinfo→nar request-gap histogram per path,
   recorded by the test proxy; this is the empirical input the DHT
-  wave needs (PRD risk 3: is the prefetch window real?).
+  wave needs (PRD risk 3: is the prefetch window real?). Like every
+  oracle it must bite: the harness injects a known artificial gap and
+  the histogram must report it within tolerance.
+
+Measurement discipline (S3/S4 are decision inputs, so extra rigor):
+- The **counting rule** (exactly what "net upstream egress" includes:
+  bodies vs headers, narinfo vs nar, retries) is committed as a doc
+  next to the code; the test proxy's byte counters are ground truth
+  and the daemon's self-reported counters must agree within a stated
+  tolerance (the product is measured, not trusted).
+- **Sample discipline**: N ≥ 10 runs per arm, variance reported.
+- **A/A calibration**: daemon-off vs daemon-off must show a noise
+  floor below the 10% S4 threshold, else S4 is reported as unusable
+  — never silently trusted.
 
 Prove-the-check-bites (each oracle must be shown able to fail):
 - Corrupt-NAR fault mode on → build MUST fail with a hash error
@@ -85,8 +107,22 @@ Prove-the-check-bites (each oracle must be shown able to fail):
 Fault-injection modes (live in the **test proxy only** — never in
 the product daemon, per PRD): added latency (per path-kind),
 HTTP 500/503, connection reset, truncated NAR at N%, corrupted NAR
-bytes, wrong/stale narinfo, upstream unreachable. Each mode has a
-bite test.
+bytes, wrong/stale narinfo, upstream unreachable. **Ownership
+(review gate): all modes are implemented with an in-process bite
+test in the test-proxy task; the e2e harness carries the corrupt-NAR
+and 404-fidelity scenarios; the hardening block enlarges to the full
+fault × chain-depth matrix.** All fault modes are application-level
+— no kernel network shaping (netem/NET_ADMIN) in wave 1; rootless
+podman cannot provide it and nothing here needs it ("unreachable" =
+stop the container).
+
+Narinfo byte-fidelity policy (wave 1): the daemon and its cache
+treat narinfo as **verbatim bytes** end to end — the transport-field
+rewrite allowlist exists in code and is **empty**; wave 2 (raw-NAR
+p2p) will populate it (`URL`/`Compression`/`FileHash`/`FileSize`
+only — never the signed fields). A property test asserts arbitrary
+well-formed narinfos (unknown fields, odd ordering, multiple `Sig:`)
+pass through byte-identical, including across a daemon restart.
 
 ## Test layers
 
@@ -96,9 +132,15 @@ bite test.
    not their parser.
 2. **Integration** (in-process): daemon against test proxy + mock
    upstream, no containers; fast loop for fault-mode behavior.
-3. **E2E compose**: containerized client (real `nix`) + daemon +
-   test proxy + mock upstream; controlled `nix.conf`
-   (substituters, trusted test key); adversarial network shaping.
+3. **E2E containers**: rootless **podman pods driven by the scenario
+   runner** (host-verified: no Docker daemon; podman-compose too
+   partial to trust) — client (real `nix`, image built with
+   `dockerTools.buildImageWithNixDb`, `sandbox = false` inside the
+   container) + daemon + test proxy + mock upstream; controlled
+   `nix.conf`: daemon (priority < 40) AND the mock/testproxy as an
+   explicit direct fallback substituter — S2 requires a real
+   fallback target, and its scenarios assert the fallback actually
+   served the bytes (request counts), not merely exit 0.
 4. **NixOS VM tests**: same scenarios on real nix-daemon + systemd +
    the NixOS module; the truth layer for S2 (store-open behavior,
    service ordering).
@@ -121,14 +163,29 @@ Explicitly NOT grounded yet (owned by future waves, named now so
 their absence is visible): DHT resolve latency oracles, peer yes/no
 probe abuse tests, claim-schema conformance/versioning tests,
 announce-on-demand behavior, hedge race + throughput-abort tests,
-NarSize-abort (claim-spam DoS) tests, multi-node p2p topologies.
+NarSize-abort (claim-spam DoS) tests, multi-node p2p topologies,
+**real-world NAT traversal** (PRD "what bad looks like" names it;
+the container harness cannot prove it). PRD wave-0 reconciliation:
+its "multi-node topologies" is satisfied in wave 1 by the long-chain
+(multi-daemon) test; multi-node *p2p* topologies necessarily wait
+for p2p. Its "claims disk cache" is narinfo-only in wave 1; a claims
+cache without claims would be fiction.
 The wave-1 re-plan task must pull these from this list into
 grounding as the p2p wave gets planned — this list is the checklist
 it starts from.
 
-Irreversibility note: wave 1 deliberately contains **no
-`irreversible`-labeled tasks** — every wave-1 surface (crate layout,
-cache formats, metric definitions, harness internals) is local and
-replaceable per the PRD map. The first freeze events (claim schema,
-addressed-unit encoding, DHT key derivation) belong to the p2p wave
-and MUST carry the label there.
+Irreversibility note (revised at the review gate): wave 1 carries
+**two** `irreversible`-labeled tasks, not zero as first claimed. The
+review found that (a) the **measurement counting rule** and (b) the
+**pinned fixture workload** freeze the moment the J2 baseline is
+written into this file — redefining either afterwards invalidates
+every cross-wave comparison the kill criterion depends on. Those two
+tasks get phase 3's deep-review gate. Everything else in wave 1
+(crate layout, cache formats, harness internals) remains local and
+replaceable. The next freeze events (claim schema, addressed-unit
+encoding, DHT key derivation) belong to the p2p wave and MUST carry
+the label there.
+
+Go/no-go: an explicit owner-facing checkpoint task sits between the
+J2 baseline and the hardening block — hardening a product whose
+prefetch-window premise just died would be planned waste.

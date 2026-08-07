@@ -4,6 +4,7 @@ title: Narinfo disk cache in daemon (layered NarinfoSource)
 status: To Do
 assignee: []
 created_date: '2026-08-07 21:56'
+updated_date: '2026-08-07 22:05'
 labels: []
 dependencies:
   - TASK-4
@@ -20,4 +21,5 @@ First real module layering: NarinfoSource becomes disk-cache-over-upstream. Mirr
 - [ ] #1 Repeat narinfo requests served from disk: upstream narinfo hit count 0 on second run (oracle asserted)
 - [ ] #2 Cache survives daemon restart; corrupt cache entry is discarded and refetched, never served
 - [ ] #3 Negative-cache TTL: a 404d path becomes fetchable within the configured TTL after publication to mock upstream (test manipulates mock content)
+- [ ] #4 Validate-then-atomic-rename: a truncated upstream narinfo never enters the cache (mid-body truncation poisoning test); corrupt entries discarded and refetched, never served
 <!-- AC:END -->

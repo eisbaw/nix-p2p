@@ -4,6 +4,7 @@ title: 'HARDENING: concurrency soak + docs truthfulness sweep'
 status: To Do
 assignee: []
 created_date: '2026-08-07 21:56'
+updated_date: '2026-08-07 22:06'
 labels:
   - hardening
 dependencies:
@@ -21,4 +22,5 @@ Wave-end hardening block, part 2. Soak: max-substitution-jobs=16 storm of parall
 - [ ] #1 16-parallel substitution soak green: no deadlock, no fd/memory runaway (bounds asserted), all S1 checks pass under load
 - [ ] #2 README quickstart reproduced verbatim in a container; every command works as written
 - [ ] #3 TESTING.md matches implemented reality; drift corrected in the same commit
+- [ ] #4 README quickstart executed verbatim in a clean container - every command works as written; TESTING.md drift corrected in the same commit
 <!-- AC:END -->
