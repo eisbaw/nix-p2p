@@ -1,10 +1,10 @@
 ---
 id: TASK-3
 title: Mock upstream mode + signed fixture store
-status: To Do
+status: In Progress
 assignee: []
 created_date: '2026-08-07 21:55'
-updated_date: '2026-08-07 22:53'
+updated_date: '2026-08-07 23:39'
 labels:
   - irreversible
 dependencies:

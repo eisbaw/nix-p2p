@@ -233,3 +233,54 @@ the label there.
 Go/no-go: an explicit owner-facing checkpoint task sits between the
 J2 baseline and the hardening block — hardening a product whose
 prefetch-window premise just died would be planned waste.
+
+## Fixture workload (pinned; task-3)
+
+Version: **`nix-p2p-fixture-workload-v1`**. Every measurement number in
+this document is only comparable to another number taken against the
+same string — changing the payload set changes the egress baseline,
+which is why task-3 carries the `irreversible` label.
+
+Four locally-built paths, served as an ordinary static binary cache
+(`nix-cache-info` + narinfos + `nar/`), signed only by the test key
+`nix-p2p-test-1`:
+
+| Payload | Compression | Size | Why it is in the set |
+|---|---|---|---|
+| `fixture-lib` | none | 64 KiB | Raw-NAR case; referent of the closure below |
+| `fixture-app` | xz | tiny | Non-empty `References` — the reference list is part of the signed fingerprint |
+| `fixture-zstd` | zstd | 512 KiB | Third compression Nix may advertise |
+| `fixture-big` | none | 110 MiB | Byte-volume for kill-at-50%-bytes and the egress oracle; uncompressed so wire bytes equal disk bytes |
+
+This table is descriptive. **`fixtures/workload.lock.json` is
+authoritative** — it pins each payload's store path, NarHash and
+FileHash, and the gate fails when the generated tree diverges from it.
+That is also the only thing that notices a `flake.lock` bump, which
+changes every payload while the version string sits still. `fixtures/README.md`
+holds the design rationale; regeneration and the change procedure live there.
+
+`nix-cache-info` advertises **`Priority: 40`** and
+**`WantMassQuery: 1`** explicitly (a `file://` store writes `StoreDir`
+alone, and the omitted fields would silently become client defaults).
+
+Two limits on what the fixture gate proves, stated so a green line is
+not over-read:
+
+- **Determinism is repeatability, not reproducibility.** `just test`
+  regenerates back-to-back on one host with one `flake.lock` and
+  diffs. Byte-stability across machines or nixpkgs revisions is not
+  verified anywhere; the lock file is the instrument for that case.
+- **Enforcement is proven in Nix's direct store mode only.** The gate
+  drives the `nix` CLI, where `trusted-public-keys` is client-side.
+  A real `nix-daemon` ignores that setting for a non-trusted user and
+  enforces `require-sigs` daemon-side, so task-5 (containers) and
+  task-10 (VM) must re-assert the same three tampered inputs through
+  the **daemon** enforcement path. That is a different proof, not a
+  repeat.
+
+The fixture gate deliberately does **not** run inside `nix flake
+check`: the tree is generated and gitignored, so a sandboxed run would
+find no fixture and go vacuously green. It runs under `just test`
+(fast tier) and `just fixtures-large` (full tier, gates the 110 MiB
+payload). Any CI must invoke those inside `nix develop`, not rely on
+`nix flake check` alone.

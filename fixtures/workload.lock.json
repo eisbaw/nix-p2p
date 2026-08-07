@@ -1,0 +1,30 @@
+{
+  "paths": {
+    "app": {
+      "compression": "xz",
+      "file_hash": "sha256:15m2z8ar1r1jm5x7fqblq4s7438ghdmam396l5kwvc25jq8rzxb7",
+      "nar_hash": "sha256:0pgsb9mjmfj57w1ddmqn9z9667nwbqbnn699j1s1s99jhy6cppsm",
+      "store_path": "/nix/store/l30jg5xg904s62jvw5znmr682xpr993c-nix-p2p-fixture-app"
+    },
+    "big": {
+      "compression": "none",
+      "file_hash": "sha256:0c54jhdcrw50h6dcng70rk7sxzq10c0i01z11s4zpb904q0c09dh",
+      "nar_hash": "sha256:0c54jhdcrw50h6dcng70rk7sxzq10c0i01z11s4zpb904q0c09dh",
+      "store_path": "/nix/store/537fv8f7v6i3qq7l6yrcmcc54kdccd4x-nix-p2p-fixture-big"
+    },
+    "lib": {
+      "compression": "none",
+      "file_hash": "sha256:06rgb4vfjsg365xwwdjz12qhjnvg3w0agfvyqfp977hp3yk2bczb",
+      "nar_hash": "sha256:06rgb4vfjsg365xwwdjz12qhjnvg3w0agfvyqfp977hp3yk2bczb",
+      "store_path": "/nix/store/0a0lslqb6gbqnj6xqjlaljjqg6kgb3wz-nix-p2p-fixture-lib"
+    },
+    "zstd": {
+      "compression": "zstd",
+      "file_hash": "sha256:1nn8563y6j55y003xjk1bvb1854abmigsas2jgzy4shy0f4vnzpa",
+      "nar_hash": "sha256:176pix3424bx7179g5c2b0x341lb4p5hgc03zizqnfc44fns9q8p",
+      "store_path": "/nix/store/n4gcfilnaljqkqsadj7mcwyd6p0rvv0c-nix-p2p-fixture-zstd"
+    }
+  },
+  "public_key": "nix-p2p-test-1:empdFBu9wVZG12rPKToHMOTsU1qzWzeCcLdq/KQH0JQ=",
+  "workload_version": "nix-p2p-fixture-workload-v1"
+}

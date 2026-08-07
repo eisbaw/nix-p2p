@@ -12,3 +12,15 @@
 # it makes every `nix build` warn about a dirty git tree.
 /backlog/email-preferences.json
 
+# Bytecode for the gate scripts. The dev shell also sets
+# PYTHONDONTWRITEBYTECODE, so this is the belt to that pair of braces.
+__pycache__/
+
+# Generated fixture cache: NAR payloads (up to 110 MiB), narinfos, and the
+# derived test signing key. Deliberately not committed - determinism plus
+# pinning to flake.lock is what makes the workload reproducible, so the bytes
+# are an output, not an input. `just fixtures` recreates them.
+/fixtures/out/
+# Staging / retired trees from an interrupted or concurrent regeneration.
+/fixtures/.out.*
+

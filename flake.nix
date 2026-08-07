@@ -35,12 +35,29 @@
       cargoVersion =
         (builtins.fromTOML (builtins.readFile ./Cargo.toml)).workspace.package.version;
 
-      # NOTE (task-3): cleanCargoSource keeps only Cargo manifests and *.rs.
-      # The moment a test needs on-disk fixtures (narinfo/nar blobs, test
-      # signing keys - see TESTING.md), they must be added to this filter, or
-      # `nix build` will run a fixture-less, vacuously-green test suite while
-      # `nix develop` stays honest.
+      # cleanCargoSource keeps only Cargo manifests and *.rs. Task-1 left a
+      # note here to widen it once fixtures existed; task-3 did not, because
+      # the fixture cache is a GENERATED, gitignored artifact and is invisible
+      # to flakes however wide this filter gets. Instead no Rust test may
+      # depend on it - scripts/check-fixtures.py enforces that, and its
+      # docstring carries the tradeoff.
       src = craneLib.cleanCargoSource ./.;
+
+      # The mock upstream's payload set (task-3). Read from a file rather than
+      # inlined so the Nix expression, the generator and TESTING.md all quote
+      # one version string; check-fixtures.py asserts TESTING.md still names
+      # this one. The J2 measurement baseline is frozen against it.
+      workloadVersion = builtins.replaceStrings [ "\n" ] [ "" ]
+        (builtins.readFile ./fixtures/WORKLOAD_VERSION);
+
+      fixtureWorkload = import ./fixtures/workload.nix { inherit pkgs workloadVersion; };
+
+      # Python for the fixture scripts. cryptography derives the fixture
+      # signing key from a seed phrase, which is what keeps key material out of
+      # the repository (scripts/fixturelib.py). The independence check below
+      # keeps plain python3 - it needs no third-party module and should not
+      # wait on one.
+      pythonEnv = pkgs.python3.withPackages (ps: [ ps.cryptography ]);
 
       commonArgs = {
         inherit src;
@@ -86,7 +103,14 @@
         daemon = memberPackage "daemon";
         testproxy = memberPackage "testproxy";
         default = self.packages.${system}.daemon;
-      };
+      }
+      # Fixture payloads as packages.fixture-<name>, so `nix flake check`
+      # type-checks them for free: it evaluates every package but builds only
+      # `checks` (verified). They are deliberately NOT added to checks - the
+      # 110 MiB payload must stay out of both `nix flake check` and the devshell
+      # closure, and is built only by `just fixtures-large`.
+      // pkgs.lib.mapAttrs' (n: v: pkgs.lib.nameValuePair "fixture-${n}" v)
+        fixtureWorkload;
 
       # `nix flake check` must be able to fail, otherwise it is a rubber stamp.
       # These mirror the Justfile gates so CI has a single entry point; the
@@ -131,11 +155,24 @@
         # Pulls the checks' build inputs into the shell, so `nix develop` and
         # `nix flake check` cannot drift apart on toolchain or native deps.
         checks = self.checks.${system};
-        packages = [ pkgs.just pkgs.python3 pkgs.ruff ];
+        packages = [ pkgs.just pythonEnv pkgs.ruff ];
         # Exact toolchain derivation, so the Justfile's `_toolchain` guard can
         # prove the tools come from THIS one rather than from any /nix/store
         # path that happens to be on PATH.
         NIX_P2P_TOOLCHAIN = "${rustToolchain}";
+        # The fixture generator must compress with a PINNED nix: `nix copy`
+        # does the xz/zstd itself, so using whatever `nix` is on PATH would
+        # make the fixture bytes a function of the developer's host and break
+        # the byte-stability the frozen workload depends on.
+        NIX_P2P_NIX = "${pkgs.nix}";
+        # Named explicitly rather than trusting PATH: the checks pulled in
+        # above contribute their own plain python3, and which of the two wins
+        # `command -v` is an ordering accident that would surface as a missing
+        # `cryptography` module.
+        NIX_P2P_PYTHON = "${pythonEnv}";
+        # The gate scripts import a shared module; without this they would
+        # leave a scripts/__pycache__ behind on every run.
+        PYTHONDONTWRITEBYTECODE = "1";
         # No shellHook: house rule forbids verbose devshell output.
       };
     };

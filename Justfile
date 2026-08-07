@@ -48,26 +48,66 @@ _toolchain:
             ;;
     esac
 
+# Refuse to run the fixture gates against anything but the pinned Python.
+# Without this, `${NIX_P2P_PYTHON}/bin/python3` expands to `/bin/python3`
+# outside `nix develop` - which EXISTS on Debian and Ubuntu, so the run would
+# reach a system Python and die with an opaque missing-cryptography traceback
+# instead of saying what is actually wrong.
+_python:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    : "${NIX_P2P_PYTHON:?not set - run gates inside: nix develop -c just ...}"
+    : "${NIX_P2P_NIX:?not set - run gates inside: nix develop -c just ...}"
+    for tool in "${NIX_P2P_PYTHON}/bin/python3" "${NIX_P2P_NIX}/bin/nix"; do
+        test -x "${tool}" || { echo "${tool} is not executable" >&2; exit 1; }
+    done
+
 # Compile the whole workspace, tests and benches included.
 build: _toolchain
     cargo build --locked --workspace --all-targets
 
-# Clippy (warnings are errors), rustfmt drift, and the crate-independence guard.
-# scripts/ is linted too: the independence guard is safety-critical and would
-# otherwise be the only unchecked file in a repo gated at -D warnings.
-lint: _toolchain independence
+# scripts/ is linted too: the gate scripts are safety-critical and would
+# otherwise be the only unchecked files in a repo gated at -D warnings. The
+# fixture source guard runs here rather than only in `test` because it is a
+# source-policy check like `independence`, and it needs no generated fixture.
+# Clippy (warnings are errors), rustfmt drift, and the source-policy guards.
+lint: _toolchain _python independence
     cargo clippy --locked --workspace --all-targets -- -D warnings
     cargo fmt --all --check
     ruff check scripts
     ruff format --check scripts
+    "${NIX_P2P_PYTHON}/bin/python3" scripts/check-fixtures.py --source-guard
 
 # Assert daemon and testproxy stay strictly separated (PRD round 5/6).
 independence: _toolchain
     python3 scripts/check-independence.py
 
-# Unit and integration tests (in-process, no containers).
-test: _toolchain
+# Depends on the fast fixture tier because the signing and tamper assertions
+# live in scripts/, not in cargo (rationale: scripts/check-fixtures.py).
+# Unit and integration tests plus the fixture gate (in-process, no containers).
+test: _toolchain _python fixtures
     cargo test --locked --workspace
+    "${NIX_P2P_PYTHON}/bin/python3" scripts/check-fixtures.py
+
+# Regenerate the signed fixture cache - fast tier (none/xz/zstd, <1 MiB).
+fixtures: _python
+    "${NIX_P2P_PYTHON}/bin/python3" scripts/gen-fixtures.py
+
+# The slow-tier counterpart of `just test`: deliberately not a `just test`
+# dependency and not a flake check, because the payload must stay out of the
+# fast loop and out of the devshell closure - but the 110 MiB path still has
+# to be verified by something, so this recipe gates it rather than only
+# building it.
+# Regenerate and verify the fixture cache including the 110 MiB payload.
+fixtures-large: _python
+    "${NIX_P2P_PYTHON}/bin/python3" scripts/gen-fixtures.py --large
+    "${NIX_P2P_PYTHON}/bin/python3" scripts/check-fixtures.py
+
+# A Nix binary cache is static files, so any file server does; the containers
+# in task-5 serve the same tree their own way.
+# Serve the fixture cache as a mock upstream on 127.0.0.1.
+fixtures-serve port="8080": _python
+    "${NIX_P2P_PYTHON}/bin/python3" -m http.server --bind 127.0.0.1 --directory fixtures/out/cache {{ port }}
 
 # Apply rustfmt in place; `just lint` is what enforces it.
 fmt: _toolchain
