@@ -1,11 +1,11 @@
 ---
 id: TASK-1
 title: 'Scaffold: nix flake + Rust workspace + Justfile gates'
-status: Done
+status: In Progress
 assignee:
   - mped-architect
 created_date: '2026-08-07 21:55'
-updated_date: '2026-08-07 22:40'
+updated_date: '2026-08-07 23:14'
 labels:
   - foundation
 dependencies: []
@@ -29,7 +29,7 @@ Foundation for everything. Nix flake devshell (pinned Rust toolchain, just), Car
 ## Implementation Plan
 
 <!-- SECTION:PLAN:BEGIN -->
-1) flake.nix: nixpkgs + oxalica/rust-overlay + crane; devshell w/ toolchain-from-rust-toolchain.toml (clippy+rustfmt same derivation) + just; packages.daemon/.testproxy via crane. 2) Cargo workspace: daemon/ + testproxy/, independent, unit test each. 3) Justfile: build/lint/test/fmt + independence guard (cargo tree) + honest stubs e2e/e2e-vm/measure/journey printing '0 scenarios registered - NOT a pass'. 4) .gitignore, commit Cargo.lock. 5) Gate: nix develop -c just {build,lint,test,fmt}, nix build .#daemon/.#testproxy.
+REOPENED after codex cross-model NO-GO. F1: extract independence check into scripts/check-independence.py, invoked from BOTH just and checks.independence. F2: declaration-level via cargo metadata --no-deps (catches optional/target/dev-gated shared crates + transitive), with committed self-test bite cases. F3: per-package cargoArtifacts so packages.daemon does not depend on testproxy's dep build. F6: devshell exports NIX_P2P_TOOLCHAIN, _toolchain validates cargo/rustc/clippy/rustfmt all live inside it. F8: fix task refs in daemon/src/main.rs (task-2 -> task-4) and testproxy/src/main.rs (task-3 -> task-2).
 <!-- SECTION:PLAN:END -->
 
 ## Implementation Notes
@@ -50,6 +50,28 @@ Deferred / known limits:
 - Nothing mechanically forbids the stub state after tasks 5/9/10/6 close; that enforcement is prose in AC#4. Their DoD should grep for the marker string and require zero hits.
 - flake.nix uses craneLib.cleanCargoSource, which keeps only Cargo manifests and *.rs. On-disk test fixtures (narinfo/nar blobs, test signing keys) will be silently dropped, and 'nix build' runs cargo test in checkPhase - a fixture-less test that skips-when-absent would be a vacuous green inside nix while staying honest in nix develop. Comment left at the filter naming the hazard.
 - 'just build' against a warm ./target proves little; the cold run was done by hand (rm -rf target) and 'nix flake check' covers it in the sandbox.
+
+REOPENED after cross-model (codex) NO-GO on e9b3378; fixed in acb37f3.
+
+What was actually wrong (all four findings confirmed, not just accepted):
+- F1 the independence check lived only in the Justfile -> nix flake check never ran it. Now one script (scripts/check-independence.py) with two entry points: 'just independence' and checks.independence.
+- F2 the cargo-tree guard was bypassable. VERIFIED empirically, not assumed: a workspace where both crates pull a shared crate, one via optional=true and one via [target."cfg(windows)".dependencies], made 'cargo tree -p daemon' and 'cargo tree -p testproxy' print the crate roots and NOTHING else. Now declaration-level via 'cargo metadata --no-deps'.
+- F3 one workspace-wide cargoArtifacts coupled the two packages. Per-package now; proven by breaking testproxy's source and watching 'nix build .#daemon' still exit 0.
+- F6 _toolchain accepted any cargo under /nix/store. Now checks all four tools resolve inside the exact toolchain derivation AND cross-checks rustc --version against rust-toolchain.toml.
+- F8 task attributions corrected (task-4 owns daemon, task-2 owns testproxy).
+
+NEW GOTCHAS (feed-forward):
+- The cargo-metadata rewrite introduced a bypass of its OWN, found by review before commit: '--no-deps' describes only ONE workspace's members, so a hop through a crate outside the workspace (daemon -> ../vendor/middle -> shared, testproxy -> shared) dead-ended the closure and reported clean. The check that was REMOVED would have caught it. Lesson: when replacing a check, enumerate what the old one covered before deleting it. Fixed by following path deps wherever they resolve.
+- Reproducing that case is itself a trap: cargo AUTO-PROMOTES in-tree path dependencies to workspace members, and refuses a nested [workspace] table under a workspace root. A non-member crate must live OUTSIDE the workspace root directory - the self-test harness does that deliberately.
+- 'cargo metadata --no-deps' needs no network, no lockfile and no resolution, so the guard and its 12 synthetic self-test workspaces run unchanged inside the nix sandbox. That is why checks.independence can use cargoArtifacts = null and not wait on the dependency closure - which matters because a broken dep build would otherwise DESTROY the independence signal exactly when it is wanted.
+- Mutation-tested the self-test itself: dropping the out-of-workspace recursion, keying on a dependency rename alias, or ignoring build-dependencies each trips it (exit 2). Before the extra cases were added, the rename mutant passed green - a self-test with holes reads exactly like a self-test without them.
+- Exit codes are now distinct: 1 = coupled (real violation), 2 = could not check. CI can tell 'we broke the rule' from 'our tool broke'.
+
+KNOWN LIMITS (stated, not fixed):
+- The guard enforces 'no shared CRATE', not 'no shared code'. Source-file tricks ([lib] path pointing into the other crate, #[path] module includes, a build script copying a common file) are invisible to any manifest-level check.
+- Both components independently depending on the SAME third-party crate (two copies of one HTTP stack) is NOT caught. Deliberately not mechanised: a denylist of crate names nobody has chosen yet is a gate that looks like a check and is not one. Carried forward as a hard requirement onto task-2 and task-4, which pick the stacks.
+- Residual package coupling accepted and now named in flake.nix: one Cargo.lock means one vendor derivation (a crate that fails to FETCH still breaks both packages), and 'src' is the whole workspace, so editing testproxy invalidates daemon's build cache. Splitting either means two workspaces, which the PRD does not ask for.
+- 'NIX_P2P_TOOLCHAIN=/nix/store just build' still exits 0 - correctly, because the toolchain actually in use IS the pinned one. The version cross-check is what closes the real hole; verified with a fake toolchain reporting rustc 1.80.0 (exit 1).
 <!-- SECTION:NOTES:END -->
 
 ## Final Summary

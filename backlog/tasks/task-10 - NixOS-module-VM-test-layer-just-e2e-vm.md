@@ -4,7 +4,7 @@ title: NixOS module + VM test layer (just e2e-vm)
 status: To Do
 assignee: []
 created_date: '2026-08-07 21:56'
-updated_date: '2026-08-07 22:53'
+updated_date: '2026-08-07 23:15'
 labels: []
 dependencies:
   - TASK-5
@@ -29,4 +29,6 @@ Minimal NixOS module (enable, port, upstream URL, nix.settings wiring for substi
 Module should pin the daemon substituter with an explicit ?priority=10 URL param (client-side override, deterministic regardless of advertised priority) in addition to serving nix-cache-info Priority < 40. Ref: bmcgee.ie TIL post.
 
 forward-carried from task-1 (e9b3378): the NixOS module must consume flake packages.x86_64-linux.daemon (crane-built; bin/daemon; meta.mainProgram = "daemon"), not a rebuilt derivation. That attribute name is a de-facto interface shared with task-5's container images - renaming it breaks both. The flake pins nixpkgs nixos-26.05 (crane requires >= 26.05) while the dev host is NixOS 25.11; VM tests run against the flake's nixpkgs, so that is the version your test nodes get. System is hardcoded to x86_64-linux. When this lands, DELETE the 'just e2e-vm' stub (currently exits 0 printing '0 scenarios registered - NOT a pass') and add a DoD grep for that marker requiring zero hits.
+
+forward-carried from task-1 (acb37f3): 'nix flake check' now runs 7 real checks (daemon, testproxy, clippy, fmt, test, scripts, independence). If you add the VM test as a dedicated flake output rather than a check, say so explicitly in the task notes so nobody assumes 'nix flake check' covers it. packages.x86_64-linux.daemon is unchanged as the module's input and now has its own dependency closure.
 <!-- SECTION:NOTES:END -->

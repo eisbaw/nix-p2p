@@ -6,7 +6,7 @@ title: >-
 status: To Do
 assignee: []
 created_date: '2026-08-07 21:55'
-updated_date: '2026-08-07 22:53'
+updated_date: '2026-08-07 23:15'
 labels: []
 dependencies:
   - TASK-1
@@ -41,4 +41,6 @@ Ordering-flip bite test: use the ?priority=N substituter-URL override (bmcgee.ie
 forward-carried from task-1 (e9b3378): daemon/ crate exists with a scaffold main.rs (banner + placeholder), zero dependencies - the async runtime and HTTP stack are deliberately unconstrained and are YOUR decision. Workspace is edition 2024 / resolver 3, toolchain pinned to rust 1.97.1 in rust-toolchain.toml. Adding a workspace crate is allowed, but 'just independence' fails if daemon and testproxy end up sharing one: the allowlist in the Justfile starts empty and widening it is meant to be a reviewable diff (PRD round 5/6 - low-level pure-data crates only, and only once a second consumer exists). Do not deduplicate banner() across the two crates.
 
 codex review of task-1 (finding 5): dependency edges were wrong - AC#2 (in-process integration against testproxy+mock) requires tasks 2 and 3; edges added.
+
+forward-carried from task-1 (acb37f3), HARD REQUIREMENT: same as task-2's note, from the daemon side. 'just independence' enforces 'no shared CRATE', NOT 'no shared third-party dependency'. Pick the daemon's async/HTTP stack independently of whatever task-2 picked for testproxy (PRD round 5: the fixture is an independent witness of wire behavior), and add the stack crate names to the denylist next to ALLOWLIST in scripts/check-independence.py so it stops being discipline and becomes a gate. Also: adding a shared workspace crate now fails the guard - ALLOWLIST starts empty and widening it is meant to be a reviewable diff. The guard follows path deps out of the workspace, so routing through a vendored crate will not launder it.
 <!-- SECTION:NOTES:END -->

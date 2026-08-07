@@ -4,7 +4,7 @@ title: 'E2E harness v1: podman-pod topology + scripted scenarios'
 status: To Do
 assignee: []
 created_date: '2026-08-07 21:55'
-updated_date: '2026-08-07 22:40'
+updated_date: '2026-08-07 23:15'
 labels: []
 dependencies:
   - TASK-3
@@ -30,4 +30,6 @@ Containerized harness, the canonical just e2e. Review-gate reality check (host-v
 
 <!-- SECTION:NOTES:BEGIN -->
 forward-carried from task-1 (e9b3378): the flake exposes packages.x86_64-linux.daemon and .testproxy (crane-built, single binary each at bin/<name>, meta.mainProgram set, so 'nix run .#daemon' works). Consume THOSE for dockerTools images - do not re-derive builds. 'just package' prints both store paths. Renaming those attribute names breaks you and task-10, so treat them as an interface. When this task lands, DELETE the 'just e2e' stub: it currently exits 0 while printing '0 scenarios registered - NOT a pass'. Add a check to your DoD that greps the repo for that marker string and requires zero hits for e2e.
+
+forward-carried from task-1 (acb37f3): packages.x86_64-linux.daemon and .testproxy now each build from their OWN cargoArtifacts, so a broken dependency in one no longer fails the other's nix build - verified. Two couplings remain that will bite an image build: (1) one Cargo.lock means one shared vendor derivation, so a crate that fails to FETCH breaks both packages; (2) 'src' is the whole workspace, so any testproxy edit invalidates daemon's nix build cache and vice versa. Budget for full rebuilds when iterating on images.
 <!-- SECTION:NOTES:END -->
