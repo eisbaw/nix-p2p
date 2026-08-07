@@ -1,0 +1,187 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1240 880" font-family="Archivo, 'Helvetica Neue', Arial, sans-serif">
+  <defs>
+    <pattern id="grid4" width="20" height="20" patternUnits="userSpaceOnUse">
+      <path d="M 20 0 L 0 0 0 20" fill="none" stroke="#ECEEE7" stroke-width="1"/>
+    </pattern>
+    <marker id="dAmber" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#B45309"/>
+    </marker>
+    <marker id="dAqua" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#0E7C86"/>
+    </marker>
+    <marker id="dGray" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#8A9199"/>
+    </marker>
+    <marker id="dInk" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#22303A"/>
+    </marker>
+  </defs>
+
+  <rect width="1240" height="880" fill="#FAFAF6"/>
+  <rect width="1240" height="880" fill="url(#grid4)"/>
+
+  <text x="48" y="52" font-size="26" font-weight="700" fill="#22303A">P2P substituter — detailed data path</text>
+  <text x="48" y="76" font-family="'JetBrains Mono', monospace" font-size="13" fill="#6B7480">no mirror · cache.nixos.org is the only central party · everything else is libraries in one daemon</text>
+
+  <!-- nixcpp -->
+  <rect x="48" y="120" width="250" height="90" rx="3" fill="#F3F4F0" stroke="#22303A" stroke-width="1.4"/>
+  <text x="173" y="158" font-size="15" font-weight="600" fill="#22303A" text-anchor="middle">nixcpp / lix daemon</text>
+  <text x="173" y="182" font-family="'JetBrains Mono', monospace" font-size="11" fill="#6B7480" text-anchor="middle">unmodified · trusts localhost cache</text>
+
+  <!-- daemon shell -->
+  <rect x="48" y="280" width="470" height="460" rx="4" fill="#FFFFFF" stroke="#0E7C86" stroke-width="1.8"/>
+  <text x="64" y="308" font-family="'JetBrains Mono', monospace" font-size="12" letter-spacing="2" fill="#0E7C86">LOCALHOST SUBSTITUTER DAEMON</text>
+
+  <rect x="76" y="330" width="196" height="84" rx="3" fill="#F7F8F5" stroke="#22303A" stroke-width="1.1"/>
+  <text x="174" y="358" font-size="14" font-weight="600" fill="#22303A" text-anchor="middle">nix-compat</text>
+  <text x="174" y="378" font-family="'JetBrains Mono', monospace" font-size="10.5" fill="#6B7480" text-anchor="middle">narinfo parse / render</text>
+  <text x="174" y="394" font-family="'JetBrains Mono', monospace" font-size="10.5" fill="#6B7480" text-anchor="middle">signature passthrough</text>
+
+  <rect x="296" y="330" width="194" height="84" rx="3" fill="#F7F8F5" stroke="#22303A" stroke-width="1.1"/>
+  <text x="393" y="358" font-size="14" font-weight="600" fill="#22303A" text-anchor="middle">resolver</text>
+  <text x="393" y="378" font-family="'JetBrains Mono', monospace" font-size="10.5" fill="#6B7480" text-anchor="middle">NarHash -&gt; root claim</text>
+  <text x="393" y="394" font-family="'JetBrains Mono', monospace" font-size="10.5" fill="#6B7480" text-anchor="middle">queries the index</text>
+
+  <rect x="76" y="436" width="196" height="104" rx="3" fill="#F7F8F5" stroke="#22303A" stroke-width="1.1"/>
+  <text x="174" y="464" font-size="14" font-weight="600" fill="#22303A" text-anchor="middle">snix-castore</text>
+  <text x="174" y="486" font-family="'JetBrains Mono', monospace" font-size="10.5" fill="#6B7480" text-anchor="middle">chunked blobs · BLAKE3</text>
+  <text x="174" y="502" font-family="'JetBrains Mono', monospace" font-size="10.5" fill="#6B7480" text-anchor="middle">FastCDC dedup</text>
+  <text x="174" y="518" font-family="'JetBrains Mono', monospace" font-size="10.5" fill="#6B7480" text-anchor="middle">local persistent store</text>
+
+  <rect x="296" y="436" width="194" height="104" rx="3" fill="#E9F5F6" stroke="#0E7C86" stroke-width="1.3"/>
+  <text x="393" y="464" font-size="14" font-weight="600" fill="#22303A" text-anchor="middle">iroh endpoint</text>
+  <text x="393" y="486" font-family="'JetBrains Mono', monospace" font-size="10.5" fill="#4E8F96" text-anchor="middle">QUIC · holepunch · relay</text>
+  <text x="393" y="502" font-family="'JetBrains Mono', monospace" font-size="10.5" fill="#4E8F96" text-anchor="middle">iroh-blobs client</text>
+  <text x="393" y="518" font-family="'JetBrains Mono', monospace" font-size="10.5" fill="#4E8F96" text-anchor="middle">+ provider (serves peers)</text>
+
+  <rect x="76" y="562" width="196" height="84" rx="3" fill="#F7F8F5" stroke="#22303A" stroke-width="1.1"/>
+  <text x="174" y="590" font-size="14" font-weight="600" fill="#22303A" text-anchor="middle">NAR renderer</text>
+  <text x="174" y="610" font-family="'JetBrains Mono', monospace" font-size="10.5" fill="#6B7480" text-anchor="middle">assemble from castore</text>
+  <text x="174" y="628" font-family="'JetBrains Mono', monospace" font-size="10.5" font-weight="700" fill="#0E7C86" text-anchor="middle">6 · NarHash == signed ?</text>
+
+  <rect x="296" y="562" width="194" height="84" rx="3" fill="#F7F8F5" stroke="#22303A" stroke-width="1.1"/>
+  <text x="393" y="590" font-size="14" font-weight="600" fill="#22303A" text-anchor="middle">ingester</text>
+  <text x="393" y="610" font-family="'JetBrains Mono', monospace" font-size="10.5" fill="#6B7480" text-anchor="middle">nar-bridge as a library</text>
+  <text x="393" y="628" font-family="'JetBrains Mono', monospace" font-size="10.5" fill="#6B7480" text-anchor="middle">NAR -&gt; castore, on miss</text>
+
+  <rect x="76" y="666" width="414" height="56" rx="3" fill="#F7F8F5" stroke="#22303A" stroke-width="1.1" stroke-dasharray="5 3"/>
+  <text x="283" y="688" font-size="13" font-weight="600" fill="#22303A" text-anchor="middle">announcer · fires when a path lands in castore</text>
+  <text x="283" y="708" font-family="'JetBrains Mono', monospace" font-size="10.5" fill="#6B7480" text-anchor="middle">publish (NarHash, root digest, my NodeId)</text>
+
+  <!-- internal wiring -->
+  <line x1="272" y1="488" x2="296" y2="488" stroke="#22303A" stroke-width="1.2" marker-end="url(#dInk)"/>
+  <line x1="174" y1="436" x2="174" y2="414" stroke="#22303A" stroke-width="1.2" marker-end="url(#dInk)"/>
+  <line x1="174" y1="562" x2="174" y2="540" stroke="#22303A" stroke-width="1.2"/>
+  <line x1="393" y1="562" x2="393" y2="540" stroke="#22303A" stroke-width="1.2" marker-end="url(#dInk)"/>
+  <line x1="174" y1="646" x2="174" y2="666" stroke="#22303A" stroke-width="1.2" marker-end="url(#dInk)"/>
+  <line x1="393" y1="646" x2="393" y2="666" stroke="#22303A" stroke-width="1.2" marker-end="url(#dInk)"/>
+  <text x="284" y="660" font-family="'JetBrains Mono', monospace" font-size="9.5" fill="#8A9199" text-anchor="middle">p2p fetch complete            ingest complete</text>
+
+  <!-- right column -->
+  <rect x="740" y="90" width="452" height="110" rx="3" fill="#FBF3E6" stroke="#B45309" stroke-width="1.5"/>
+  <text x="966" y="122" font-size="15" font-weight="600" fill="#22303A" text-anchor="middle">cache.nixos.org</text>
+  <text x="966" y="146" font-family="'JetBrains Mono', monospace" font-size="11" fill="#8A5A16" text-anchor="middle">the only central party</text>
+  <text x="966" y="164" font-family="'JetBrains Mono', monospace" font-size="11" fill="#8A5A16" text-anchor="middle">narinfo · ed25519 over NarHash</text>
+  <text x="966" y="182" font-family="'JetBrains Mono', monospace" font-size="11" fill="#8A5A16" text-anchor="middle">full-NAR fallback</text>
+
+  <rect x="740" y="252" width="452" height="160" rx="3" fill="#FFFFFF" stroke="#22303A" stroke-width="1.3" stroke-dasharray="5 3"/>
+  <text x="966" y="280" font-size="14" font-weight="600" fill="#22303A" text-anchor="middle">distributed index (rendezvous only)</text>
+  <text x="966" y="300" font-family="'JetBrains Mono', monospace" font-size="10.5" fill="#6B7480" text-anchor="middle">mainline DHT (BEP44) / iroh-gossip topic / tracker</text>
+  <text x="966" y="326" font-family="'JetBrains Mono', monospace" font-size="10.5" fill="#22303A" text-anchor="middle">record:  NarHash =&gt; { root: blake3digest,</text>
+  <text x="966" y="344" font-family="'JetBrains Mono', monospace" font-size="10.5" fill="#22303A" text-anchor="middle">holders: [NodeId, ...] }</text>
+  <text x="966" y="368" font-family="'JetBrains Mono', monospace" font-size="10.5" fill="#6B7480" text-anchor="middle">no addresses stored · claims unauthenticated:</text>
+  <text x="966" y="386" font-family="'JetBrains Mono', monospace" font-size="10.5" fill="#6B7480" text-anchor="middle">the NarHash gate makes lying merely wasteful</text>
+
+  <!-- iroh node discovery bridge -->
+  <line x1="900" y1="412" x2="900" y2="460" stroke="#8A9199" stroke-width="1.3" stroke-dasharray="3 4" marker-end="url(#dGray)"/>
+  <text x="914" y="432" font-family="'JetBrains Mono', monospace" font-size="10" fill="#8A9199">NodeId -&gt; addr: iroh node discovery</text>
+  <text x="914" y="448" font-family="'JetBrains Mono', monospace" font-size="10" fill="#8A9199">(DNS / pkarr / mDNS) · built in</text>
+
+  <rect x="740" y="460" width="452" height="270" rx="4" fill="#E9F5F6" stroke="#0E7C86" stroke-width="1.5"/>
+  <text x="756" y="488" font-family="'JetBrains Mono', monospace" font-size="12" letter-spacing="2" fill="#0E7C86">PEER SWARM · IROH-BLOBS PROVIDERS</text>
+  <g stroke="#9CCFD3" stroke-width="1">
+    <line x1="830" y1="560" x2="950" y2="542"/>
+    <line x1="950" y1="542" x2="1080" y2="570"/>
+    <line x1="1080" y1="570" x2="1010" y2="626"/>
+    <line x1="1010" y1="626" x2="870" y2="620"/>
+    <line x1="870" y1="620" x2="830" y2="560"/>
+    <line x1="950" y1="542" x2="1010" y2="626"/>
+  </g>
+  <g fill="#FFFFFF" stroke="#0E7C86" stroke-width="1.4">
+    <circle cx="830" cy="560" r="20"/>
+    <circle cx="950" cy="542" r="20"/>
+    <circle cx="1080" cy="570" r="20"/>
+    <circle cx="870" cy="620" r="20"/>
+    <circle cx="1010" cy="626" r="20"/>
+  </g>
+  <g font-family="'JetBrains Mono', monospace" font-size="10" fill="#0E7C86" text-anchor="middle">
+    <text x="830" y="564">peer</text>
+    <text x="950" y="546">peer</text>
+    <text x="1080" y="574">peer</text>
+    <text x="870" y="624">peer</text>
+    <text x="1010" y="630">peer</text>
+  </g>
+  <text x="966" y="676" font-family="'JetBrains Mono', monospace" font-size="10.5" fill="#4E8F96" text-anchor="middle">hold chunks and directory nodes · run the same daemon</text>
+  <text x="966" y="696" font-family="'JetBrains Mono', monospace" font-size="10.5" fill="#4E8F96" text-anchor="middle">every /nix/store is a seed</text>
+
+  <!-- flow arrows -->
+  <line x1="140" y1="210" x2="140" y2="280" stroke="#22303A" stroke-width="1.5" marker-end="url(#dInk)"/>
+  <circle cx="140" cy="240" r="11" fill="#B45309"/>
+  <text x="140" y="244.5" font-family="'JetBrains Mono', monospace" font-size="12" font-weight="700" fill="#FFFFFF" text-anchor="middle">1</text>
+  <text x="158" y="244" font-family="'JetBrains Mono', monospace" font-size="10.5" fill="#22303A">GET $h.narinfo / GET nar/...</text>
+
+  <line x1="240" y1="280" x2="240" y2="210" stroke="#22303A" stroke-width="1.5" marker-end="url(#dInk)"/>
+  <circle cx="240" cy="245" r="11" fill="#0E7C86"/>
+  <text x="240" y="249.5" font-family="'JetBrains Mono', monospace" font-size="12" font-weight="700" fill="#FFFFFF" text-anchor="middle">7</text>
+  <text x="258" y="270" font-family="'JetBrains Mono', monospace" font-size="10.5" fill="#0E7C86">stream verified NAR</text>
+
+  <line x1="518" y1="340" x2="740" y2="150" stroke="#B45309" stroke-width="1.6" stroke-dasharray="6 4" marker-end="url(#dAmber)"/>
+  <circle cx="622" cy="252" r="11" fill="#B45309"/>
+  <text x="622" y="256.5" font-family="'JetBrains Mono', monospace" font-size="12" font-weight="700" fill="#FFFFFF" text-anchor="middle">2</text>
+  <text x="628" y="232" font-family="'JetBrains Mono', monospace" font-size="10.5" fill="#B45309" text-anchor="middle">fetch narinfo directly · sig intact</text>
+
+  <line x1="518" y1="380" x2="740" y2="320" stroke="#22303A" stroke-width="1.3" stroke-dasharray="3 4" marker-end="url(#dGray)"/>
+  <circle cx="626" cy="352" r="11" fill="#22303A"/>
+  <text x="626" y="356.5" font-family="'JetBrains Mono', monospace" font-size="12" font-weight="700" fill="#FFFFFF" text-anchor="middle">3</text>
+  <text x="640" y="378" font-family="'JetBrains Mono', monospace" font-size="10.5" fill="#22303A" text-anchor="middle">resolve NarHash -&gt; record</text>
+
+  <line x1="740" y1="520" x2="518" y2="464" stroke="#0E7C86" stroke-width="1.8" marker-end="url(#dAqua)"/>
+  <circle cx="628" cy="492" r="11" fill="#0E7C86"/>
+  <text x="628" y="496.5" font-family="'JetBrains Mono', monospace" font-size="12" font-weight="700" fill="#FFFFFF" text-anchor="middle">4</text>
+  <text x="652" y="450" font-family="'JetBrains Mono', monospace" font-size="10.5" fill="#0E7C86" text-anchor="middle">fetch root + directory nodes</text>
+  <text x="652" y="466" font-family="'JetBrains Mono', monospace" font-size="10.5" fill="#0E7C86" text-anchor="middle">(small, BLAKE3-verified) = chunk list</text>
+
+  <line x1="740" y1="610" x2="494" y2="530" stroke="#0E7C86" stroke-width="5" marker-end="url(#dAqua)"/>
+  <circle cx="614" cy="570" r="11" fill="#0E7C86"/>
+  <text x="614" y="574.5" font-family="'JetBrains Mono', monospace" font-size="12" font-weight="700" fill="#FFFFFF" text-anchor="middle">5</text>
+  <text x="636" y="596" font-family="'JetBrains Mono', monospace" font-size="10.5" font-weight="700" fill="#0E7C86" text-anchor="middle">fetch only missing chunks</text>
+
+  <path d="M 490 694 L 700 694 L 700 412" fill="none" stroke="#8A9199" stroke-width="1.3" stroke-dasharray="3 4" marker-end="url(#dGray)"/>
+  <circle cx="700" cy="694" r="11" fill="#8A9199"/>
+  <text x="700" y="698.5" font-family="'JetBrains Mono', monospace" font-size="12" font-weight="700" fill="#FFFFFF" text-anchor="middle">8</text>
+  <text x="688" y="718" font-family="'JetBrains Mono', monospace" font-size="10.5" fill="#8A9199" text-anchor="end">put record + add self as holder</text>
+
+  <path d="M 740 118 L 340 118 L 340 280" fill="none" stroke="#8A9199" stroke-width="1.3" stroke-dasharray="3 4" marker-end="url(#dGray)"/>
+  <text x="426" y="110" font-family="'JetBrains Mono', monospace" font-size="10.5" fill="#8A9199">miss path: full NAR -&gt; ingester -&gt; castore -&gt; seed</text>
+
+  <!-- legend -->
+  <g font-family="'JetBrains Mono', monospace" font-size="11">
+    <line x1="48" y1="782" x2="92" y2="782" stroke="#B45309" stroke-width="1.6" stroke-dasharray="6 4"/>
+    <text x="100" y="786" fill="#22303A">trust plane: signed metadata</text>
+    <line x1="48" y1="808" x2="92" y2="808" stroke="#0E7C86" stroke-width="5"/>
+    <text x="100" y="812" fill="#22303A">data plane: content-addressed payload</text>
+    <line x1="48" y1="834" x2="92" y2="834" stroke="#8A9199" stroke-width="1.3" stroke-dasharray="3 4"/>
+    <text x="100" y="838" fill="#22303A">control / fallback</text>
+  </g>
+
+  <!-- title block -->
+  <g>
+    <rect x="856" y="794" width="336" height="40" fill="#FFFFFF" stroke="#22303A" stroke-width="1.2"/>
+    <line x1="932" y1="794" x2="932" y2="834" stroke="#22303A" stroke-width="1"/>
+    <line x1="1132" y1="794" x2="1132" y2="834" stroke="#22303A" stroke-width="1"/>
+    <text x="894" y="819" font-family="'JetBrains Mono', monospace" font-size="12" font-weight="700" fill="#22303A" text-anchor="middle">FIG 02</text>
+    <text x="1032" y="812" font-family="'JetBrains Mono', monospace" font-size="10" fill="#22303A" text-anchor="middle">P2P NIX SUBSTITUTION</text>
+    <text x="1032" y="826" font-family="'JetBrains Mono', monospace" font-size="10" fill="#6B7480" text-anchor="middle">DETAILED DATA PATH</text>
+    <text x="1162" y="819" font-family="'JetBrains Mono', monospace" font-size="10" fill="#6B7480" text-anchor="middle">REV C</text>
+  </g>
+</svg>

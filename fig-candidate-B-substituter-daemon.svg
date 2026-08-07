@@ -1,0 +1,146 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="900" viewBox="0 0 1200 900" font-family="Inter, 'Segoe UI', system-ui, sans-serif">
+  <defs>
+    <marker id="aDark" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#57534e"/></marker>
+    <marker id="aAmber" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#d97706"/></marker>
+    <marker id="aTeal" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#0d9488"/></marker>
+  </defs>
+
+  <rect width="1200" height="900" fill="#fafaf9"/>
+
+  <text x="40" y="54" font-size="21" font-weight="700" fill="#1c1917">Candidate B — localhost substituter daemon (whole-NAR blobs)</text>
+  <text x="40" y="80" font-size="13.5" fill="#78716c">Recommended MVP — one binary in Nix's substituters list; gossip-fed index, iroh-blobs transfer, hedged fallback</text>
+
+  <!-- legend -->
+  <line x1="860" y1="48" x2="892" y2="48" stroke="#d97706" stroke-width="2.5"/>
+  <text x="900" y="52" font-size="11" fill="#57534e">trusted metadata (signed)</text>
+  <line x1="860" y1="70" x2="892" y2="70" stroke="#0d9488" stroke-width="3"/>
+  <text x="900" y="74" font-size="11" fill="#57534e">p2p payload (hash-verified)</text>
+  <line x1="860" y1="92" x2="892" y2="92" stroke="#78716c" stroke-width="1.6" stroke-dasharray="6 5"/>
+  <text x="900" y="96" font-size="11" fill="#57534e">fallback / side channel</text>
+
+  <!-- nix-daemon -->
+  <rect x="70" y="180" width="200" height="120" rx="8" fill="#ffffff" stroke="#a8a29e" stroke-width="1.4"/>
+  <text x="170" y="208" font-size="14.5" font-weight="700" fill="#1c1917" text-anchor="middle">nix-daemon</text>
+  <text x="170" y="232" font-size="10.5" fill="#57534e" text-anchor="middle" font-family="ui-monospace, monospace">substituters =</text>
+  <text x="170" y="248" font-size="10.5" fill="#57534e" text-anchor="middle" font-family="ui-monospace, monospace">localhost:5000,</text>
+  <text x="170" y="264" font-size="10.5" fill="#57534e" text-anchor="middle" font-family="ui-monospace, monospace">cache.nixos.org</text>
+  <text x="170" y="288" font-size="10.5" font-style="italic" fill="#78716c" text-anchor="middle">verifies sig + NarHash</text>
+
+  <!-- daemon group -->
+  <rect x="330" y="130" width="480" height="560" rx="12" fill="#eef2ff" fill-opacity="0.45" stroke="#6366f1" stroke-width="1.5"/>
+  <text x="350" y="157" font-size="13" font-weight="700" fill="#4338ca">nix-p2p daemon — one binary, speaks binary-cache HTTP API</text>
+
+  <!-- A: narinfo passthrough -->
+  <rect x="360" y="175" width="190" height="50" rx="7" fill="#ffffff" stroke="#78716c" stroke-width="1.4"/>
+  <text x="455" y="196" font-size="12.5" font-weight="700" fill="#1c1917" text-anchor="middle">narinfo passthrough</text>
+  <text x="455" y="213" font-size="10.5" fill="#78716c" text-anchor="middle">served verbatim, signed</text>
+  <circle cx="360" cy="175" r="10" fill="#1c1917"/>
+  <text x="360" y="179" font-size="11" font-weight="700" fill="#ffffff" text-anchor="middle">1</text>
+
+  <!-- Bx: claims index -->
+  <rect x="600" y="265" width="190" height="64" rx="7" fill="#ffffff" stroke="#0d9488" stroke-width="1.4"/>
+  <text x="695" y="287" font-size="12.5" font-weight="700" fill="#115e59" text-anchor="middle">claims index (in-mem)</text>
+  <text x="695" y="304" font-size="9.5" fill="#57534e" text-anchor="middle" font-family="ui-monospace, monospace">NarHash → BLAKE3, holders</text>
+  <text x="695" y="319" font-size="10" fill="#78716c" text-anchor="middle">no DHT on hot path</text>
+  <circle cx="600" cy="265" r="10" fill="#1c1917"/>
+  <text x="600" y="269" font-size="11" font-weight="700" fill="#ffffff" text-anchor="middle">2</text>
+
+  <!-- Cf: fetch whole NAR -->
+  <rect x="430" y="360" width="220" height="64" rx="7" fill="#f0fdfa" stroke="#0d9488" stroke-width="1.4"/>
+  <text x="540" y="383" font-size="12.5" font-weight="700" fill="#115e59" text-anchor="middle">fetch whole NAR</text>
+  <text x="540" y="401" font-size="10.5" fill="#115e59" text-anchor="middle">iroh-blobs — verified stream</text>
+  <text x="540" y="416" font-size="10" fill="#78716c" text-anchor="middle">concurrent across holders</text>
+  <circle cx="430" cy="360" r="10" fill="#1c1917"/>
+  <text x="430" y="364" font-size="11" font-weight="700" fill="#ffffff" text-anchor="middle">4</text>
+
+  <!-- E: hedge -->
+  <rect x="660" y="440" width="150" height="64" rx="7" fill="#ffffff" stroke="#78716c" stroke-width="1.3" stroke-dasharray="5 4"/>
+  <text x="735" y="461" font-size="11.5" font-weight="700" fill="#1c1917" text-anchor="middle">hedge</text>
+  <text x="735" y="477" font-size="10" fill="#57534e" text-anchor="middle">HTTP GET nar from cache</text>
+  <text x="735" y="492" font-size="10" fill="#57534e" text-anchor="middle">if p2p idle 200 ms</text>
+
+  <!-- gate -->
+  <polygon points="445,545 540,512 635,545 540,578" fill="#fef2f2" stroke="#dc2626" stroke-width="1.6"/>
+  <text x="540" y="540" font-size="11" font-weight="700" fill="#b91c1c" text-anchor="middle" font-family="ui-monospace, monospace">sha256(nar)</text>
+  <text x="540" y="557" font-size="11" font-weight="700" fill="#b91c1c" text-anchor="middle" font-family="ui-monospace, monospace">== NarHash?</text>
+  <circle cx="447" cy="513" r="10" fill="#1c1917"/>
+  <text x="447" y="517" font-size="11" font-weight="700" fill="#ffffff" text-anchor="middle">5</text>
+
+  <!-- F: serve + announce -->
+  <rect x="360" y="610" width="330" height="50" rx="7" fill="#ffffff" stroke="#78716c" stroke-width="1.4"/>
+  <text x="525" y="631" font-size="12.5" font-weight="700" fill="#1c1917" text-anchor="middle">stream NAR to Nix  ·  announce claim</text>
+  <text x="525" y="648" font-size="10.5" fill="#78716c" text-anchor="middle">ingest to local store → become a seeder</text>
+  <circle cx="360" cy="610" r="10" fill="#1c1917"/>
+  <text x="360" y="614" font-size="11" font-weight="700" fill="#ffffff" text-anchor="middle">6</text>
+  <circle cx="690" cy="610" r="10" fill="#1c1917"/>
+  <text x="690" y="614" font-size="11" font-weight="700" fill="#ffffff" text-anchor="middle">7</text>
+
+  <!-- cache -->
+  <rect x="880" y="160" width="270" height="80" rx="8" fill="#fef3c7" stroke="#d97706" stroke-width="1.6"/>
+  <text x="1015" y="188" font-size="14.5" font-weight="700" fill="#92400e" text-anchor="middle">cache.nixos.org</text>
+  <text x="1015" y="208" font-size="11" fill="#92400e" text-anchor="middle">narinfo + signatures</text>
+  <text x="1015" y="226" font-size="10.5" fill="#b45309" text-anchor="middle">trusted — unchanged</text>
+
+  <!-- gossip -->
+  <rect x="880" y="265" width="270" height="72" rx="8" fill="#f0fdfa" stroke="#0d9488" stroke-width="1.4" stroke-dasharray="6 4"/>
+  <text x="1015" y="287" font-size="12.5" font-weight="700" fill="#115e59" text-anchor="middle">iroh-gossip topic</text>
+  <text x="1015" y="304" font-size="10.5" fill="#115e59" text-anchor="middle">continuous claim broadcasts</text>
+  <text x="1015" y="320" font-size="9.5" fill="#78716c" text-anchor="middle">cold start: tracker (off hot path)</text>
+
+  <!-- swarm -->
+  <rect x="880" y="390" width="270" height="110" rx="8" fill="#ccfbf1" stroke="#0d9488" stroke-width="1.6"/>
+  <text x="1015" y="423" font-size="14.5" font-weight="700" fill="#115e59" text-anchor="middle">iroh swarm</text>
+  <text x="1015" y="445" font-size="11" fill="#115e59" text-anchor="middle">untrusted peers</text>
+  <text x="1015" y="464" font-size="10.5" fill="#0f766e" text-anchor="middle">whole-NAR blobs (BLAKE3)</text>
+
+  <!-- edges -->
+  <line x1="270" y1="215" x2="330" y2="215" stroke="#57534e" stroke-width="1.6" marker-end="url(#aDark)"/>
+  <text x="300" y="206" font-size="10" fill="#57534e" text-anchor="middle">GET narinfo</text>
+  <line x1="270" y1="250" x2="330" y2="250" stroke="#57534e" stroke-width="1.6" marker-end="url(#aDark)"/>
+  <text x="300" y="266" font-size="10" fill="#57534e" text-anchor="middle">GET nar/*</text>
+
+  <line x1="550" y1="200" x2="880" y2="200" stroke="#d97706" stroke-width="2" marker-end="url(#aAmber)"/>
+  <text x="715" y="191" font-size="11" fill="#92400e" text-anchor="middle">1  narinfo — signed, verbatim</text>
+
+  <line x1="440" y1="225" x2="440" y2="360" stroke="#57534e" stroke-width="1.5" stroke-dasharray="6 5" marker-end="url(#aDark)"/>
+  <text x="450" y="285" font-size="10.5" fill="#57534e">3  prefetch at narinfo time —</text>
+  <text x="450" y="301" font-size="10.5" fill="#57534e">claims lookup + fetch start</text>
+
+  <line x1="880" y1="300" x2="790" y2="300" stroke="#0d9488" stroke-width="1.5" stroke-dasharray="6 4" marker-end="url(#aTeal)"/>
+  <text x="835" y="291" font-size="10.5" fill="#115e59" text-anchor="middle">2  claims</text>
+
+  <line x1="640" y1="329" x2="640" y2="360" stroke="#57534e" stroke-width="1.5" marker-end="url(#aDark)"/>
+  <text x="648" y="348" font-size="10" fill="#57534e">holders + root</text>
+
+  <path d="M650,392 L830,392 L830,445 L880,445" fill="none" stroke="#0d9488" stroke-width="3.5" marker-end="url(#aTeal)"/>
+  <text x="740" y="384" font-size="11" fill="#115e59" text-anchor="middle">4  NAR bytes — any holder</text>
+
+  <path d="M680,504 L680,545 L637,545" fill="none" stroke="#78716c" stroke-width="1.4" stroke-dasharray="5 4" marker-end="url(#aDark)"/>
+
+  <line x1="540" y1="424" x2="540" y2="512" stroke="#57534e" stroke-width="1.6" marker-end="url(#aDark)"/>
+
+  <line x1="540" y1="578" x2="540" y2="610" stroke="#57534e" stroke-width="1.6" marker-end="url(#aDark)"/>
+  <text x="531" y="598" font-size="10.5" fill="#57534e" text-anchor="end">pass</text>
+  <text x="655" y="586" font-size="10" fill="#78716c">fail → next claim,</text>
+  <text x="655" y="600" font-size="10" fill="#78716c">exhausted → hedge/HTTP</text>
+
+  <path d="M360,635 L160,635 L160,300" fill="none" stroke="#57534e" stroke-width="1.6" marker-end="url(#aDark)"/>
+  <text x="255" y="626" font-size="10.5" fill="#57534e" text-anchor="middle">6  NAR stream — Nix re-verifies</text>
+
+  <path d="M690,635 L1170,635 L1170,301 L1152,301" fill="none" stroke="#0d9488" stroke-width="1.5" stroke-dasharray="6 4" marker-end="url(#aTeal)"/>
+  <text x="930" y="626" font-size="10.5" fill="#115e59" text-anchor="middle">7  announce Claim{NarHash, BLAKE3, me}</text>
+
+  <!-- assessment -->
+  <rect x="40" y="710" width="1120" height="175" rx="10" fill="#f5f5f4" stroke="#e7e5e4"/>
+  <text x="64" y="738" font-size="15" font-weight="700" fill="#1c1917">Assessment — recommended MVP</text>
+  <text x="64" y="766" font-size="14" font-weight="700" fill="#15803d">+</text>
+  <text x="86" y="766" font-size="12.5" fill="#292524">One binary speaking the binary-cache HTTP API; Nix's substituters list provides the fallback — nothing new is trusted.</text>
+  <text x="64" y="790" font-size="14" font-weight="700" fill="#15803d">+</text>
+  <text x="86" y="790" font-size="12.5" fill="#292524">Sees narinfo content, so prefetch hides p2p resolve latency under Nix's own request scheduling.</text>
+  <text x="64" y="814" font-size="14" font-weight="700" fill="#15803d">+</text>
+  <text x="86" y="814" font-size="12.5" fill="#292524">Gossip-fed local map: lookups and misses are instant; the 200 ms hedge bounds tail latency near today's cache latency.</text>
+  <text x="64" y="838" font-size="14" font-weight="700" fill="#15803d">+</text>
+  <text x="86" y="838" font-size="12.5" fill="#292524">Whole-NAR blobs: one BLAKE3 per NAR, no tree walk, no network-wide chunking agreement needed — shippable in weeks.</text>
+  <text x="64" y="862" font-size="14" font-weight="700" fill="#b91c1c">−</text>
+  <text x="86" y="862" font-size="12.5" fill="#292524">No chunk dedup: a small nixpkgs bump re-transfers full NARs, and every claim must carry two hashes (NarHash ↔ BLAKE3).</text>
+</svg>

@@ -1,0 +1,166 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="940" viewBox="0 0 1200 940" font-family="Inter, 'Segoe UI', system-ui, sans-serif">
+  <defs>
+    <marker id="aDark" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#57534e"/></marker>
+    <marker id="aAmber" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#d97706"/></marker>
+    <marker id="aTeal" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#0d9488"/></marker>
+  </defs>
+
+  <rect width="1200" height="940" fill="#fafaf9"/>
+
+  <text x="40" y="54" font-size="21" font-weight="700" fill="#1c1917">Candidate C — chunked substituter daemon (castore pool)</text>
+  <text x="40" y="80" font-size="13.5" fill="#78716c">v2 — content-defined chunking for dedup: one-RTT tree walk, concurrent multi-holder chunk streams, same NarHash gate</text>
+
+  <!-- legend -->
+  <line x1="860" y1="48" x2="892" y2="48" stroke="#d97706" stroke-width="2.5"/>
+  <text x="900" y="52" font-size="11" fill="#57534e">trusted metadata (signed)</text>
+  <line x1="860" y1="70" x2="892" y2="70" stroke="#0d9488" stroke-width="3"/>
+  <text x="900" y="74" font-size="11" fill="#57534e">p2p payload (hash-verified)</text>
+  <line x1="860" y1="92" x2="892" y2="92" stroke="#78716c" stroke-width="1.6" stroke-dasharray="6 5"/>
+  <text x="900" y="96" font-size="11" fill="#57534e">fallback / side channel</text>
+
+  <!-- nix-daemon -->
+  <rect x="70" y="180" width="200" height="120" rx="8" fill="#ffffff" stroke="#a8a29e" stroke-width="1.4"/>
+  <text x="170" y="208" font-size="14.5" font-weight="700" fill="#1c1917" text-anchor="middle">nix-daemon</text>
+  <text x="170" y="232" font-size="10.5" fill="#57534e" text-anchor="middle" font-family="ui-monospace, monospace">substituters =</text>
+  <text x="170" y="248" font-size="10.5" fill="#57534e" text-anchor="middle" font-family="ui-monospace, monospace">localhost:5000,</text>
+  <text x="170" y="264" font-size="10.5" fill="#57534e" text-anchor="middle" font-family="ui-monospace, monospace">cache.nixos.org</text>
+  <text x="170" y="288" font-size="10.5" font-style="italic" fill="#78716c" text-anchor="middle">verifies sig + NarHash</text>
+
+  <!-- daemon group -->
+  <rect x="330" y="130" width="480" height="580" rx="12" fill="#eef2ff" fill-opacity="0.45" stroke="#6366f1" stroke-width="1.5"/>
+  <text x="350" y="157" font-size="13" font-weight="700" fill="#4338ca">nix-p2p daemon — binary-cache HTTP API, castore-backed</text>
+
+  <!-- A: narinfo passthrough -->
+  <rect x="360" y="175" width="190" height="50" rx="7" fill="#ffffff" stroke="#78716c" stroke-width="1.4"/>
+  <text x="455" y="196" font-size="12.5" font-weight="700" fill="#1c1917" text-anchor="middle">narinfo passthrough</text>
+  <text x="455" y="213" font-size="10.5" fill="#78716c" text-anchor="middle">served verbatim, signed</text>
+  <circle cx="360" cy="175" r="10" fill="#1c1917"/>
+  <text x="360" y="179" font-size="11" font-weight="700" fill="#ffffff" text-anchor="middle">1</text>
+
+  <!-- W: tree walk -->
+  <rect x="360" y="270" width="190" height="64" rx="7" fill="#f0fdfa" stroke="#0d9488" stroke-width="1.4"/>
+  <text x="455" y="291" font-size="12.5" font-weight="700" fill="#115e59" text-anchor="middle">tree walk</text>
+  <text x="455" y="308" font-size="10.5" fill="#115e59" text-anchor="middle">dir closure under root</text>
+  <text x="455" y="323" font-size="10" fill="#78716c" text-anchor="middle">single round trip</text>
+  <circle cx="360" cy="270" r="10" fill="#1c1917"/>
+  <text x="360" y="274" font-size="11" font-weight="700" fill="#ffffff" text-anchor="middle">3</text>
+
+  <!-- Bx: claims index -->
+  <rect x="600" y="270" width="190" height="64" rx="7" fill="#ffffff" stroke="#0d9488" stroke-width="1.4"/>
+  <text x="695" y="291" font-size="12.5" font-weight="700" fill="#115e59" text-anchor="middle">claims index (gossip-fed)</text>
+  <text x="695" y="308" font-size="9.5" fill="#57534e" text-anchor="middle" font-family="ui-monospace, monospace">NarHash → castore root</text>
+  <text x="695" y="323" font-size="9.5" fill="#57534e" text-anchor="middle" font-family="ui-monospace, monospace">+ holder NodeIds</text>
+  <circle cx="600" cy="270" r="10" fill="#1c1917"/>
+  <text x="600" y="274" font-size="11" font-weight="700" fill="#ffffff" text-anchor="middle">2</text>
+
+  <!-- K: chunk fetch -->
+  <rect x="360" y="385" width="190" height="64" rx="7" fill="#f0fdfa" stroke="#0d9488" stroke-width="1.4"/>
+  <text x="455" y="406" font-size="12.5" font-weight="700" fill="#115e59" text-anchor="middle">chunk fetch</text>
+  <text x="455" y="423" font-size="10.5" fill="#115e59" text-anchor="middle">concurrent · ranged</text>
+  <text x="455" y="438" font-size="10" fill="#78716c" text-anchor="middle">multi-holder</text>
+  <circle cx="360" cy="385" r="10" fill="#1c1917"/>
+  <text x="360" y="389" font-size="11" font-weight="700" fill="#ffffff" text-anchor="middle">4</text>
+
+  <!-- S: castore store (open-bar data store) -->
+  <rect x="360" y="480" width="360" height="50" fill="#f5f5f4"/>
+  <line x1="360" y1="480" x2="720" y2="480" stroke="#78716c" stroke-width="1.6"/>
+  <line x1="360" y1="530" x2="720" y2="530" stroke="#78716c" stroke-width="1.6"/>
+  <line x1="360" y1="480" x2="360" y2="530" stroke="#78716c" stroke-width="1.6"/>
+  <text x="540" y="501" font-size="12" font-weight="700" fill="#1c1917" text-anchor="middle">castore — BLAKE3 chunk pool</text>
+  <text x="540" y="518" font-size="10" fill="#78716c" text-anchor="middle">dedup across store paths &amp; versions</text>
+
+  <!-- gate -->
+  <polygon points="445,590 540,558 635,590 540,622" fill="#fef2f2" stroke="#dc2626" stroke-width="1.6"/>
+  <text x="540" y="586" font-size="11" font-weight="700" fill="#b91c1c" text-anchor="middle" font-family="ui-monospace, monospace">sha256(nar)</text>
+  <text x="540" y="602" font-size="11" font-weight="700" fill="#b91c1c" text-anchor="middle" font-family="ui-monospace, monospace">== NarHash?</text>
+  <circle cx="452" cy="561" r="10" fill="#1c1917"/>
+  <text x="452" y="565" font-size="11" font-weight="700" fill="#ffffff" text-anchor="middle">5</text>
+
+  <!-- F: serve + announce -->
+  <rect x="360" y="650" width="330" height="48" rx="7" fill="#ffffff" stroke="#78716c" stroke-width="1.4"/>
+  <text x="525" y="670" font-size="12.5" font-weight="700" fill="#1c1917" text-anchor="middle">stream NAR to Nix  ·  announce claim</text>
+  <text x="525" y="687" font-size="10.5" fill="#78716c" text-anchor="middle">ingest → seed the chunks you hold</text>
+  <circle cx="360" cy="650" r="10" fill="#1c1917"/>
+  <text x="360" y="654" font-size="11" font-weight="700" fill="#ffffff" text-anchor="middle">6</text>
+  <circle cx="690" cy="650" r="10" fill="#1c1917"/>
+  <text x="690" y="654" font-size="11" font-weight="700" fill="#ffffff" text-anchor="middle">7</text>
+
+  <!-- cache -->
+  <rect x="880" y="160" width="270" height="80" rx="8" fill="#fef3c7" stroke="#d97706" stroke-width="1.6"/>
+  <text x="1015" y="188" font-size="14.5" font-weight="700" fill="#92400e" text-anchor="middle">cache.nixos.org</text>
+  <text x="1015" y="208" font-size="11" fill="#92400e" text-anchor="middle">narinfo + signatures</text>
+  <text x="1015" y="226" font-size="10.5" fill="#b45309" text-anchor="middle">trusted — unchanged</text>
+
+  <!-- gossip -->
+  <rect x="880" y="270" width="270" height="76" rx="8" fill="#f0fdfa" stroke="#0d9488" stroke-width="1.4" stroke-dasharray="6 4"/>
+  <text x="1015" y="292" font-size="12.5" font-weight="700" fill="#115e59" text-anchor="middle">iroh-gossip topic</text>
+  <text x="1015" y="309" font-size="10.5" fill="#115e59" text-anchor="middle">continuous claim broadcasts</text>
+  <text x="1015" y="325" font-size="9.5" fill="#78716c" text-anchor="middle">cold start: tracker (off hot path)</text>
+
+  <!-- swarm -->
+  <rect x="880" y="390" width="270" height="170" rx="8" fill="#ccfbf1" stroke="#0d9488" stroke-width="1.6"/>
+  <text x="1015" y="430" font-size="14.5" font-weight="700" fill="#115e59" text-anchor="middle">iroh swarm</text>
+  <text x="1015" y="452" font-size="11" fill="#115e59" text-anchor="middle">untrusted peers</text>
+  <text x="1015" y="472" font-size="10.5" fill="#0f766e" text-anchor="middle">directory nodes + chunks</text>
+  <text x="1015" y="490" font-size="10.5" fill="#0f766e" text-anchor="middle">(BLAKE3-addressed)</text>
+
+  <!-- edges -->
+  <line x1="270" y1="215" x2="330" y2="215" stroke="#57534e" stroke-width="1.6" marker-end="url(#aDark)"/>
+  <text x="300" y="206" font-size="10" fill="#57534e" text-anchor="middle">GET narinfo</text>
+  <line x1="270" y1="250" x2="330" y2="250" stroke="#57534e" stroke-width="1.6" marker-end="url(#aDark)"/>
+  <text x="300" y="266" font-size="10" fill="#57534e" text-anchor="middle">GET nar/*</text>
+
+  <line x1="550" y1="200" x2="880" y2="200" stroke="#d97706" stroke-width="2" marker-end="url(#aAmber)"/>
+  <text x="715" y="191" font-size="11" fill="#92400e" text-anchor="middle">1  narinfo — signed, verbatim</text>
+
+  <line x1="420" y1="225" x2="420" y2="270" stroke="#57534e" stroke-width="1.5" stroke-dasharray="6 5" marker-end="url(#aDark)"/>
+  <text x="428" y="251" font-size="10" fill="#57534e">prefetch</text>
+
+  <line x1="880" y1="302" x2="790" y2="302" stroke="#0d9488" stroke-width="1.5" stroke-dasharray="6 4" marker-end="url(#aTeal)"/>
+  <text x="835" y="293" font-size="10.5" fill="#115e59" text-anchor="middle">2  claims</text>
+
+  <line x1="600" y1="302" x2="550" y2="302" stroke="#57534e" stroke-width="1.5" marker-end="url(#aDark)"/>
+  <text x="575" y="294" font-size="10" fill="#57534e" text-anchor="middle">root</text>
+
+  <path d="M505,334 L505,352 L820,352 L820,418 L880,418" fill="none" stroke="#0d9488" stroke-width="1.8" marker-end="url(#aTeal)"/>
+  <text x="662" y="346" font-size="10.5" fill="#115e59" text-anchor="middle">3  directory closure — 1 RTT</text>
+
+  <line x1="420" y1="334" x2="420" y2="385" stroke="#57534e" stroke-width="1.5" marker-end="url(#aDark)"/>
+  <text x="412" y="362" font-size="10" fill="#57534e" text-anchor="end">blob digests</text>
+
+  <path d="M550,417 L790,417 L790,468 L880,468" fill="none" stroke="#0d9488" stroke-width="3.5" marker-end="url(#aTeal)"/>
+  <text x="662" y="409" font-size="11" fill="#115e59" text-anchor="middle">4  chunks — concurrent</text>
+
+  <line x1="450" y1="449" x2="450" y2="480" stroke="#57534e" stroke-width="1.5" marker-end="url(#aDark)"/>
+  <text x="458" y="468" font-size="10" fill="#57534e">put</text>
+
+  <line x1="540" y1="530" x2="540" y2="558" stroke="#57534e" stroke-width="1.6" marker-end="url(#aDark)"/>
+  <text x="548" y="548" font-size="10" fill="#57534e">renderNar</text>
+
+  <line x1="540" y1="622" x2="540" y2="650" stroke="#57534e" stroke-width="1.6" marker-end="url(#aDark)"/>
+  <text x="531" y="641" font-size="10.5" fill="#57534e" text-anchor="end">pass</text>
+  <text x="650" y="584" font-size="10" fill="#78716c">fail → next claim,</text>
+  <text x="650" y="598" font-size="10" fill="#78716c">exhausted → HTTP</text>
+
+  <path d="M360,674 L160,674 L160,300" fill="none" stroke="#57534e" stroke-width="1.6" marker-end="url(#aDark)"/>
+  <text x="252" y="665" font-size="10.5" fill="#57534e" text-anchor="middle">6  NAR stream — Nix re-verifies</text>
+
+  <path d="M690,674 L1170,674 L1170,308 L1152,308" fill="none" stroke="#0d9488" stroke-width="1.5" stroke-dasharray="6 4" marker-end="url(#aTeal)"/>
+  <text x="930" y="665" font-size="10.5" fill="#115e59" text-anchor="middle">7  announce claim</text>
+
+  <!-- assessment -->
+  <rect x="40" y="730" width="1120" height="190" rx="10" fill="#f5f5f4" stroke="#e7e5e4"/>
+  <text x="64" y="758" font-size="15" font-weight="700" fill="#1c1917">Assessment — v2, build after B proves the index layer</text>
+  <text x="64" y="786" font-size="14" font-weight="700" fill="#15803d">+</text>
+  <text x="86" y="786" font-size="12.5" fill="#292524">Chunk-level dedup: a nixpkgs bump re-transfers only changed chunks; long-tail seeding gets far cheaper.</text>
+  <text x="64" y="810" font-size="14" font-weight="700" fill="#15803d">+</text>
+  <text x="86" y="810" font-size="12.5" fill="#292524">Tree resolution costs one round trip; chunks then stream concurrently from many holders (throughput-bound).</text>
+  <text x="64" y="834" font-size="14" font-weight="700" fill="#15803d">+</text>
+  <text x="86" y="834" font-size="12.5" fill="#292524">Verification unchanged: every path still ends at the sha256 == NarHash gate, which Nix re-checks anyway.</text>
+  <text x="64" y="858" font-size="14" font-weight="700" fill="#b91c1c">−</text>
+  <text x="86" y="858" font-size="12.5" fill="#292524">Needs one canonical chunking scheme network-wide — peers that chunk differently share nothing.</text>
+  <text x="64" y="882" font-size="14" font-weight="700" fill="#b91c1c">−</text>
+  <text x="86" y="882" font-size="12.5" fill="#292524">Three address layers to keep mapped: store path → NarHash → castore root → chunk digests.</text>
+  <text x="64" y="906" font-size="14" font-weight="700" fill="#b91c1c">−</text>
+  <text x="86" y="906" font-size="12.5" fill="#292524">Most code of the three; castore is a moving target. Do not build this first.</text>
+</svg>
