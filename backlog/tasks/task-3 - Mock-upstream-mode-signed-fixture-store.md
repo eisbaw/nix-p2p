@@ -4,7 +4,7 @@ title: Mock upstream mode + signed fixture store
 status: To Do
 assignee: []
 created_date: '2026-08-07 21:55'
-updated_date: '2026-08-07 22:40'
+updated_date: '2026-08-07 22:53'
 labels:
   - irreversible
 dependencies:
@@ -30,4 +30,6 @@ Signed fixture store + mock upstream serving it. Review-gate hardened: fixtures 
 
 <!-- SECTION:NOTES:BEGIN -->
 forward-carried from task-1 (e9b3378): flake.nix uses craneLib.cleanCargoSource, which keeps ONLY Cargo manifests and *.rs. Signed fixture narinfos, NAR blobs and the test ed25519 keypair will be silently excluded from the nix build source, while 'nix build .#testproxy' still runs cargo test in checkPhase - a test that skips-when-fixtures-absent becomes a vacuously green nix build while passing honestly under 'nix develop'. Widen the filter (lib.fileset union of filterCargoSources + tests/) in the same commit that adds the first fixture. A NOTE(task-3) comment marks the exact spot in flake.nix.
+
+codex review of task-1 (finding 7): flake.nix cleanCargoSource excludes NARs/narinfos/keys - when adding fixtures, switch to an explicit fileset union and make MISSING fixtures a hard failure so nix-side tests cannot go vacuously green.
 <!-- SECTION:NOTES:END -->
