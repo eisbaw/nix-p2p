@@ -1,0 +1,14 @@
+[toolchain]
+# Single source of truth for the Rust toolchain. The flake devshell and the
+# crane-built packages both read THIS file, so `nix develop` and `nix build`
+# cannot drift apart. clippy and rustfmt are listed here (rather than pulled
+# from nixpkgs separately) so every tool comes from ONE derivation - mixed
+# toolchain versions produce phantom clippy failures that reproduce nowhere.
+#
+# An exact version, not "stable": with `-D warnings` in the lint gate, a
+# floating channel means an unrelated `nix flake update` can break a commit
+# that changed no Rust, with nothing in the diff to review. Toolchain bumps
+# are deliberate, greppable commits.
+channel = "1.97.1"
+components = ["rustc", "cargo", "clippy", "rustfmt", "rust-src"]
+profile = "minimal"

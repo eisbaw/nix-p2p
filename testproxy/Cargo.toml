@@ -1,0 +1,13 @@
+[package]
+name = "testproxy"
+description = "nix-p2p test fixture: local caching proxy fronting cache.nixos.org"
+version.workspace = true
+edition.workspace = true
+
+# Deliberately dependency-free at scaffold time, and deliberately NOT sharing
+# any dependency choice with the daemon: the fixture must stay an independent
+# witness of wire behavior (PRD round 5).
+[dependencies]
+
+[lints]
+workspace = true

@@ -1,0 +1,17 @@
+[workspace]
+resolver = "3"
+# Two strictly separated binaries (PRD "Two components, strictly separated"):
+#   daemon    - the product; modular, capabilities behind traits.
+#   testproxy - the test fixture; simple, hardcoding allowed, owns fault
+#               injection. Never depended on by the daemon, and vice versa.
+# There is deliberately no shared crate: per PRD round 5/6 sharing is limited
+# to low-level pure-data crates, and only once a second consumer actually
+# exists. `just lint` asserts that independence mechanically.
+members = ["daemon", "testproxy"]
+
+[workspace.package]
+version = "0.0.1"
+edition = "2024"
+
+[workspace.lints.rust]
+unsafe_code = "forbid"

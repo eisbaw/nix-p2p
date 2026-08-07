@@ -1,0 +1,14 @@
+# Rust build output. Cargo.lock is deliberately NOT ignored: crane needs a
+# committed lockfile to build reproducibly.
+/target/
+**/*.rs.bk
+
+# Nix build results
+/result
+/result-*
+.direnv/
+
+# Local state written by the backlog CLI, not project content. Left untracked
+# it makes every `nix build` warn about a dirty git tree.
+/backlog/email-preferences.json
+
