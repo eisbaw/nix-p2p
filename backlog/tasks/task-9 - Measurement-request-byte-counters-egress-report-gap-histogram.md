@@ -4,12 +4,13 @@ title: 'Measurement: request/byte counters + egress report + gap histogram'
 status: To Do
 assignee: []
 created_date: '2026-08-07 21:56'
-updated_date: '2026-08-08 00:32'
+updated_date: '2026-08-08 00:34'
 labels:
   - irreversible
 dependencies:
   - TASK-5
   - TASK-8
+  - TASK-20
 priority: high
 ---
 
@@ -53,4 +54,6 @@ Scope of what it earns: determinism on THAT machine against THAT store's copy. C
 Also from this round: the lock now pins a tier per payload, and 'just fixtures-large' runs the gate with --require-tier full, so a measurement run cannot silently proceed against a fast-tier tree missing the 110 MiB payload. If you script measurement setup, call 'just fixtures-large' rather than 'just fixtures'.
 
 round-2 deep-gate (architect): run check-fixtures.py (not just generation) before any measurement run; a measurement against an unverified tree is not a baseline.
+
+task-20 added as dependency: fixtures-verify-rebuild is a required pre-J2 step and must not misdiagnose cold stores before measurement relies on it (round-2 qa finding).
 <!-- SECTION:NOTES:END -->
