@@ -128,9 +128,20 @@ fmt: _toolchain
 package:
     nix build --no-link --print-out-paths .#daemon .#testproxy
 
-# E2E container harness - stub until task-5 lands the podman scenario runner.
-e2e:
-    @echo "{{ stub_marker }}"
+# The canonical e2e gate (task-5): rootless-podman-pod scenario runner driving
+# client(real nix) -> daemon -> testproxy -> mock-origin, asserting the
+# TESTING.md oracles. Depends on the full-tier fixtures (the 110 MiB payload is
+# part of S1's byte/egress oracles) and on the fail-closed check-fixtures gate,
+# which the harness itself invokes before serving anything. SLOW tier: container
+# runs are minutes, deliberately out of the fast `build lint test` loop.
+# Run the containerized e2e scenario suite (rootless podman pods).
+e2e: _python fixtures-large
+    "${NIX_P2P_PYTHON}/bin/python3" scripts/e2e_harness.py
+
+# Tear down every pod/container the e2e harness created (its label only - never
+# the fixture tree). Also the Ctrl-C leak trap's manual counterpart.
+e2e-clean:
+    "${NIX_P2P_PYTHON}/bin/python3" scripts/e2e_harness.py --clean
 
 # NixOS VM tests (real nix-daemon + systemd) - stub until task-10.
 e2e-vm:

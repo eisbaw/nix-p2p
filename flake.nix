@@ -94,14 +94,102 @@
           cargoArtifacts = craneLib.buildDepsOnly args;
           meta.mainProgram = name;
         });
+
+      daemon = memberPackage "daemon";
+      testproxy = memberPackage "testproxy";
+
+      # Static /etc for the e2e image. A real /etc/passwd is what lets the
+      # AC#3 scenarios drop from the container root (which runs nix-daemon) to
+      # an UNTRUSTED user via `runuser -u client`: that is the whole point of
+      # the daemon-side-enforcement proof - a caller whose trusted-public-keys
+      # nix-daemon must ignore. hosts entry keeps loopback name resolution from
+      # reaching for DNS. No nix.conf here on purpose: the scenarios template a
+      # writable NIX_CONF_DIR at runtime (system config differs per scenario),
+      # and an /etc symlink into the read-only store cannot be rewritten.
+      e2eEtc = pkgs.runCommand "nix-p2p-e2e-etc" { } ''
+        mkdir -p $out/etc
+        cat > $out/etc/passwd <<'EOF'
+        root:x:0:0:root:/root:/bin/bash
+        client:x:1000:1000:untrusted test client:/home/client:/bin/bash
+        nobody:x:65534:65534:nobody:/nonexistent:/bin/false
+        EOF
+        cat > $out/etc/group <<'EOF'
+        root:x:0:
+        client:x:1000:
+        nogroup:x:65534:
+        EOF
+        cat > $out/etc/nsswitch.conf <<'EOF'
+        passwd: files
+        group: files
+        hosts: files
+        EOF
+        cat > $out/etc/hosts <<'EOF'
+        127.0.0.1 localhost
+        ::1 localhost
+        EOF
+      '';
+
+      # ONE image, four roles (origin / testproxy / daemon / client), selected
+      # by the command the harness runs. A single image keeps the slow-tier
+      # build to one dockerTools invocation and guarantees every role sees the
+      # exact same nix, coreutils and binaries. buildImageWithNixDb (NOT plain
+      # buildImage) is mandatory: a plain image ships an empty
+      # /nix/var/nix/db, so every store path is "invalid" and the client's nix
+      # would try to substitute its own coreutils from the world. The nix db
+      # here registers the IMAGE's own closure only - the fixture store paths
+      # are deliberately absent, so the client genuinely substitutes them
+      # through the chain under test.
+      e2eImage = pkgs.dockerTools.buildImageWithNixDb {
+        name = "nix-p2p-e2e";
+        tag = "latest";
+        copyToRoot = pkgs.buildEnv {
+          name = "nix-p2p-e2e-root";
+          paths = with pkgs; [
+            nix
+            bashInteractive
+            coreutils
+            python3Minimal # origin: `python3 -m http.server`; stdlib only
+            utillinux # runuser: drop to the untrusted client user, no PAM
+            daemon
+            testproxy
+            e2eEtc
+          ];
+          pathsToLink = [ "/bin" "/etc" "/share" ];
+        };
+        # dockerTools images ship only the store; create the mutable dirs the
+        # roles write to. tmp is 1777 so the UNTRUSTED client user (uid 1000)
+        # can put its HOME/XDG_CACHE there - chowning home/client here would run
+        # in the single-uid build sandbox and fail, so the client's writable
+        # home is a runtime concern (a /tmp path), not an image one.
+        extraCommands = ''
+          mkdir -p tmp var/tmp root run
+          chmod 1777 tmp var/tmp
+        '';
+        config = {
+          Cmd = [ "/bin/bash" ];
+          Env = [
+            "PATH=/bin"
+            # sandbox=false: nested user namespaces in rootless podman cannot be
+            # relied on, and wave 1 only SUBSTITUTES (never builds) inside the
+            # container, so the build sandbox is unnecessary. experimental
+            # features enable `nix copy`/`nix path-info`. This is the DEFAULT
+            # config; the daemon-enforcement scenarios override it via a
+            # writable NIX_CONF_DIR.
+            "NIX_CONFIG=experimental-features = nix-command flakes\nsandbox = false\nbuild-users-group ="
+          ];
+        };
+      };
     in
     {
       packages.${system} = {
         # Consumed by the container images (task-5) and the NixOS module
         # (task-10). These attribute names are a public-ish interface: renaming
         # them breaks those consumers.
-        daemon = memberPackage "daemon";
-        testproxy = memberPackage "testproxy";
+        inherit daemon testproxy;
+        # The e2e container image (task-5). Slow-tier: built by `just e2e`, kept
+        # out of `checks` so `nix flake check` and the devshell closure stay
+        # lean (like the 110 MiB fixture payload).
+        e2e-image = e2eImage;
         default = self.packages.${system}.daemon;
       }
       # Fixture payloads as packages.fixture-<name>, so `nix flake check`
