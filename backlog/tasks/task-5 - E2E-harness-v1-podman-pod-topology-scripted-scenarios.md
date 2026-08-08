@@ -1,10 +1,10 @@
 ---
 id: TASK-5
 title: 'E2E harness v1: podman-pod topology + scripted scenarios'
-status: In Progress
+status: Done
 assignee: []
 created_date: '2026-08-07 21:55'
-updated_date: '2026-08-08 10:25'
+updated_date: '2026-08-08 11:01'
 labels: []
 dependencies:
   - TASK-3
@@ -127,3 +127,9 @@ STATUS: In Progress, awaiting deep RE-gate. Not Done.
 
 CORRECTION: the concurrent-run isolation follow-up is TASK-26 (pre-filed by the coordinator, label deferred-finding); my duplicate TASK-27 was archived.
 <!-- SECTION:NOTES:END -->
+
+## Final Summary
+
+<!-- SECTION:FINAL_SUMMARY:BEGIN -->
+DONE (LIGHT->DEEP: harness grounds tasks 6/7/9/11 so oracle validity was gate-critical). Canonical just e2e: rootless-podman-pod scenario runner (scripts/e2e_harness.py), 9 scenarios/50 checks, client(real nix)->daemon->testproxy->mock-origin. Deep gate ran 3 rounds: initial found 3 VACUOUS oracles by mutation (qa+codex; architect's read-only pass missed them), fixed; re-gate found 2 residual fail-opens (unknown-as-success species), fixed in-thread. All oracles proven to bite by mutation: S1 byte-identity (flipped byte->RED), AC#3 signature enforcement through the REAL nix-daemon path (uid-1000 via setpriv; 3 tamper rejections + a positive control), 404-fidelity at the daemon boundary, corrupt-NAR hash-mismatch bite, key-exclusion (host-side walk, aborts before mount), warm oracle-pairing (0 upstream PAIRED with nonzero received). e2e-clean teardown, Ctrl-C trap. Gates green. Reviews: qa GO, architect GO, codex GO (after 2 NO-GOs). Residual filed: task-26 (concurrent-run isolation). Reusable Pod/scenario seam for tasks 6/7/9/10/11. Deleted the e2e stub. KEY LESSON banked to memory: DEEP-gate harnesses by mutation, not reading - the reviewer who only read passed the dead check.
+<!-- SECTION:FINAL_SUMMARY:END -->
