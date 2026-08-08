@@ -4,10 +4,39 @@ description = "nix-p2p product daemon: localhost Nix binary-cache substituter"
 version.workspace = true
 edition.workspace = true
 
-# Deliberately dependency-free at scaffold time. The HTTP stack, async runtime
-# and NarinfoSource/NarSource module traits are task-4's decisions and are
-# left unconstrained here on purpose.
+# Library + thin binary: the library holds all behaviour so the in-process
+# integration tests drive the exact stack the binary runs.
+[lib]
+name = "daemon"
+path = "src/lib.rs"
+
+[[bin]]
+name = "daemon"
+path = "src/main.rs"
+
+# HTTP stack (task-4 decision): tokio + hyper 1.x LOW-LEVEL client/server, plus
+# body/util helpers. NOT axum/tower (a framework the wave-0 skeleton does not
+# need) and NOT reqwest (whose default gzip feature is the auto-decompression
+# trap AC#6 guards against). hyper's low-level client does no auto-decompression,
+# so verbatim byte forwarding is correct by construction. Chosen INDEPENDENTLY of
+# testproxy's std-only hand-roll so the fixture stays an independent witness of
+# wire behaviour (PRD round 5); the hyper-stack crate names are in
+# scripts/check-independence.py's denylist so convergence is a mechanical gate.
 [dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "net", "macros", "io-util", "time"] }
+hyper = { version = "1", features = ["http1", "server", "client"] }
+hyper-util = { version = "0.1", features = ["tokio"] }
+http = "1"
+http-body = "1"
+http-body-util = "0.1"
+bytes = "1"
+async-trait = "0.1"
+
+[dev-dependencies]
+# process: spawn the real testproxy binary for the fault-mode loop (AC#2).
+tokio = { version = "1", features = ["rt-multi-thread", "net", "macros", "io-util", "time", "process"] }
+# flate2: build a real gzip body for the AC#6 verbatim-forwarding bite.
+flate2 = "1"
 
 [lints]
 workspace = true

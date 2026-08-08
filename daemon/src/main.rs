@@ -1,33 +1,150 @@
-//! nix-p2p product daemon - scaffold only.
+//! nix-p2p product daemon - binary entrypoint.
 //!
-//! At this point the daemon serves no HTTP and has no p2p behaviour. It exists
-//! so the workspace, the gates and the flake packages are real and exercised
-//! from commit one. Task-4 grows the transparent proxy from here.
-//!
-//! Assumption baked in here and nowhere else: the binary identifies itself on
-//! stdout so container/VM harnesses (task-5, task-10) have something
-//! deterministic to assert against before real endpoints exist.
+//! A thin wrapper over the `daemon` library: parse flags, wire the single
+//! `UpstreamHttp` behind all three upstream traits, and serve. All behaviour
+//! lives in the library so the integration tests drive the exact same stack.
 //!
 //! The near-identical `banner()` in `testproxy` is deliberate duplication, not
-//! an oversight: factoring it into a shared crate is exactly the coupling the
-//! PRD forbids until a second consumer genuinely earns it.
+//! an oversight (task-1 note): factoring it into a shared crate is exactly the
+//! coupling the PRD forbids until a second consumer genuinely earns it.
+
+use std::net::{Ipv4Addr, SocketAddr};
+use std::process::ExitCode;
+use std::sync::Arc;
+
+use daemon::cacheinfo::DEFAULT_PRIORITY;
+use daemon::{App, CacheInfo, UpstreamHttp, serve};
+use tokio::net::TcpListener;
 
 /// Human- and machine-readable identity of this build.
-///
-/// Kept as a pure function of compile-time constants so it can be unit tested
-/// without running the binary, and so no caller has to reconstruct it.
 fn banner() -> String {
     format!("{} {}", env!("CARGO_PKG_NAME"), env!("CARGO_PKG_VERSION"))
 }
 
-fn main() {
+/// Startup configuration. Hand-rolled flag parsing, like the fixture - a CLI
+/// crate is a dependency a five-flag binary does not need.
+#[derive(Debug, Clone)]
+struct Config {
+    listen: SocketAddr,
+    upstream: String,
+    store_dir: String,
+    priority: u32,
+    want_mass_query: bool,
+}
+
+impl Default for Config {
+    fn default() -> Self {
+        Config {
+            // 8082: clear of the fixture upstream (8080) and the testproxy (8081).
+            listen: SocketAddr::from((Ipv4Addr::LOCALHOST, 8082)),
+            upstream: "http://127.0.0.1:8081".to_string(),
+            store_dir: "/nix/store".to_string(),
+            priority: DEFAULT_PRIORITY,
+            want_mass_query: true,
+        }
+    }
+}
+
+impl Config {
+    fn from_args<I: IntoIterator<Item = String>>(args: I) -> Result<Config, String> {
+        let mut config = Config::default();
+        let mut args = args.into_iter();
+        while let Some(flag) = args.next() {
+            let mut value = || {
+                args.next()
+                    .ok_or_else(|| format!("flag {flag} needs a value"))
+            };
+            match flag.as_str() {
+                "--listen" => {
+                    let raw = value()?;
+                    config.listen = raw
+                        .parse()
+                        .map_err(|e| format!("bad --listen {raw:?}: {e}"))?;
+                }
+                "--upstream" => config.upstream = value()?,
+                "--store-dir" => config.store_dir = value()?,
+                "--priority" => {
+                    let raw = value()?;
+                    config.priority = raw
+                        .parse()
+                        .map_err(|e| format!("bad --priority {raw:?}: {e}"))?;
+                }
+                "--want-mass-query" => {
+                    let raw = value()?;
+                    config.want_mass_query = match raw.as_str() {
+                        "1" | "true" | "yes" => true,
+                        "0" | "false" | "no" => false,
+                        other => return Err(format!("bad --want-mass-query {other:?}")),
+                    };
+                }
+                other => return Err(format!("unknown flag {other:?}")),
+            }
+        }
+        Ok(config)
+    }
+
+    fn cache_info(&self) -> CacheInfo {
+        CacheInfo {
+            store_dir: self.store_dir.clone(),
+            priority: self.priority,
+            want_mass_query: self.want_mass_query,
+        }
+    }
+}
+
+#[tokio::main]
+async fn main() -> ExitCode {
+    let config = match Config::from_args(std::env::args().skip(1)) {
+        Ok(config) => config,
+        Err(err) => {
+            eprintln!("daemon: {err}");
+            return ExitCode::from(2);
+        }
+    };
+
     println!("{}", banner());
-    println!("scaffold: no substituter endpoint yet (task-4)");
+
+    let upstream = match UpstreamHttp::new(&config.upstream) {
+        Ok(upstream) => Arc::new(upstream),
+        Err(err) => {
+            eprintln!("daemon: bad --upstream: {err}");
+            return ExitCode::from(2);
+        }
+    };
+
+    let app = Arc::new(App {
+        narinfo: upstream.clone(),
+        nar: upstream.clone(),
+        passthrough: upstream.clone(),
+        cache_info: config.cache_info(),
+    });
+
+    let listener = match TcpListener::bind(config.listen).await {
+        Ok(listener) => listener,
+        Err(err) => {
+            eprintln!("daemon: cannot bind {}: {err}", config.listen);
+            return ExitCode::FAILURE;
+        }
+    };
+    let local = listener
+        .local_addr()
+        .map(|a| a.to_string())
+        .unwrap_or_else(|_| config.listen.to_string());
+    println!(
+        "daemon: listening on {local} -> upstream {}",
+        config.upstream
+    );
+
+    if let Err(err) = serve(listener, app).await {
+        eprintln!("daemon: serve error: {err}");
+        return ExitCode::FAILURE;
+    }
+    ExitCode::SUCCESS
 }
 
 #[cfg(test)]
 mod tests {
-    use super::banner;
+    use super::*;
 
     #[test]
     fn banner_names_this_crate_and_a_version() {
@@ -36,12 +153,46 @@ mod tests {
             text.starts_with("daemon "),
             "banner must lead with the crate name, got {text:?}"
         );
-        // A version with no dots would mean the workspace version stopped
-        // propagating - cheap guard against a silently empty CARGO_PKG_VERSION.
         let version = text.strip_prefix("daemon ").expect("prefix checked above");
         assert!(
             version.split('.').count() >= 3,
             "expected a semver-ish version, got {version:?}"
         );
+    }
+
+    #[test]
+    fn parses_all_flags() {
+        let config = Config::from_args(
+            [
+                "--listen",
+                "127.0.0.1:9000",
+                "--upstream",
+                "http://example:80",
+                "--store-dir",
+                "/nix/store",
+                "--priority",
+                "25",
+                "--want-mass-query",
+                "0",
+            ]
+            .map(String::from),
+        )
+        .unwrap();
+        assert_eq!(config.listen.port(), 9000);
+        assert_eq!(config.upstream, "http://example:80");
+        assert_eq!(config.priority, 25);
+        assert!(!config.want_mass_query);
+    }
+
+    #[test]
+    fn unknown_flag_fails_fast() {
+        assert!(Config::from_args(["--nope".to_string()]).is_err());
+        assert!(Config::from_args(["--listen".to_string()]).is_err());
+        assert!(Config::from_args(["--priority".to_string(), "abc".to_string()]).is_err());
+    }
+
+    #[test]
+    fn default_config_advertises_a_preferred_priority() {
+        assert!(Config::default().priority < 40);
     }
 }
