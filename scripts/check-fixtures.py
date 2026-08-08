@@ -42,7 +42,7 @@ the fixture tree is missing and nothing was proven.
 from __future__ import annotations
 
 import argparse
-import hashlib
+import contextlib
 import json
 import os
 import re
@@ -78,7 +78,26 @@ def fail(message: str, code: int = 1) -> None:
 
 
 def ok(message: str) -> None:
-    print(f"check-fixtures: ok - {message}", flush=True)
+    """Report a passing check without letting the report change the verdict.
+
+    `check-fixtures | head` used to exit 120: the write raises EPIPE, the
+    message stays buffered, and CPython exits 120 when its own flush at
+    interpreter shutdown fails - a FAIL verdict for a pipe problem, on a run
+    where every assertion held. Same defect that was just fixed in
+    gen-fixtures' note(); this is its sibling. Redirecting the dead descriptor
+    to /dev/null makes the shutdown flush succeed so the exit status reports
+    the checks, not the pipe. fail() is deliberately NOT wrapped: a failure
+    that cannot be printed must still exit non-zero.
+    """
+    try:
+        print(f"check-fixtures: ok - {message}", flush=True)
+    except (OSError, ValueError):
+        with contextlib.suppress(Exception):
+            devnull = os.open(os.devnull, os.O_WRONLY)
+            try:
+                os.dup2(devnull, sys.stdout.fileno())
+            finally:
+                os.close(devnull)
 
 
 def pinned_nix() -> str:
@@ -91,16 +110,42 @@ def pinned_nix() -> str:
     return str(binary)
 
 
-def load_manifest(out_dir: Path) -> dict:
-    manifest = out_dir / "manifest.json"
-    if not manifest.is_file():
+def published_generation(out_root: Path) -> Path:
+    """Resolve `<out_root>/current`, or say why there is nothing to verify.
+
+    `--out` names the publication ROOT, the same thing gen-fixtures' `--out`
+    names, and the generation is reached through the `current` symlink. One
+    meaning of `--out` across both scripts is deliberate: the alternative -
+    this script pointing at a generation directly - is how a run ends up
+    verifying a generation that is not the published one.
+    """
+    if not out_root.is_dir():
         fail(
-            f"no fixture at {out_dir} - generate it first:\n"
+            f"no fixture publication root at {out_root} - generate it first:\n"
             "  nix develop -c just fixtures        (fast tier)\n"
             "  nix develop -c just fixtures-large  (adds the 110 MiB payload)",
             code=2,
         )
-    return json.loads(manifest.read_text())
+    generation = fx.resolve_current(out_root)
+    if generation is None:
+        fail(
+            f"{out_root / fx.CURRENT_LINK} is missing, is not a symlink, or does not "
+            f"point at a generation under {fx.GENERATIONS_DIR}/, so nothing "
+            "verifiable is published there. Regenerate with `just fixtures` / "
+            "`just fixtures-large`.",
+            code=2,
+        )
+    if not (generation / "manifest.json").is_file():
+        fail(
+            f"{out_root / fx.CURRENT_LINK} points at {generation}, which has no "
+            "manifest.json. The publication root is corrupt; regenerate it.",
+            code=2,
+        )
+    return generation
+
+
+def load_manifest(generation: Path) -> dict:
+    return json.loads((generation / "manifest.json").read_text())
 
 
 def check_workload_version_documented(repo: Path, manifest: dict) -> None:
@@ -124,7 +169,7 @@ def check_workload_version_documented(repo: Path, manifest: dict) -> None:
     ok(f"TESTING.md records workload version {version}")
 
 
-def check_matches_lock(repo: Path, out_dir: Path, manifest: dict) -> None:
+def check_matches_lock(repo: Path, generation: Path, manifest: dict) -> None:
     """The tree must BE the pinned workload for its tier - metadata and bytes.
 
     WORKLOAD_VERSION alone cannot catch the drift that matters most: bumping
@@ -141,8 +186,11 @@ def check_matches_lock(repo: Path, out_dir: Path, manifest: dict) -> None:
     110 MiB payload passed under --skip-determinism.
     """
     lock = fx.load_lock(repo)
-    problems = fx.lock_problems(manifest, lock) + fx.blob_problems(
-        out_dir / "cache", manifest
+    cache = generation / "cache"
+    problems = (
+        fx.lock_problems(manifest, lock)
+        + fx.completeness_problems(cache, manifest)
+        + fx.blob_problems(cache, manifest)
     )
     if problems:
         fail(
@@ -182,7 +230,21 @@ def check_cache_info(base_url: str, manifest: dict) -> None:
             text = body.read().decode()
     except OSError as exc:
         fail(f"could not fetch nix-cache-info over HTTP: {exc}")
-    served = dict(line.split(": ", 1) for line in text.splitlines() if ": " in line)
+    # Strict: every non-blank line must parse, and a repeated key is a
+    # conflict rather than a last-one-wins. Dropping unparseable lines let junk
+    # appended to the served file pass unnoticed, which is the same
+    # unrecognised-input-widens shape fixed elsewhere in this round - and it is
+    # inconsistent with fx.parse_narinfo, which raises on a malformed line.
+    served = {}
+    for line in text.splitlines():
+        if not line.strip():
+            continue
+        key, separator, value = line.partition(": ")
+        if not separator:
+            fail(f"served nix-cache-info has a malformed line: {line!r}")
+        if key in served:
+            fail(f"served nix-cache-info repeats the key {key!r}")
+        served[key] = value
     if served != EXPECTED_CACHE_INFO:
         fail(
             f"served nix-cache-info is {served}, expected exactly "
@@ -190,14 +252,23 @@ def check_cache_info(base_url: str, manifest: dict) -> None:
             "this file precisely so a wrong Priority cannot agree with itself."
         )
     # Weaker than the check above and kept anyway: it catches a manifest that
-    # disagrees with the file it claims to describe, which downstream
-    # consumers read instead of the file.
-    for key, expected in manifest["cache_info"].items():
-        if served.get(key) != str(expected):
-            fail(
-                f"manifest says nix-cache-info {key}={expected!r} but the served "
-                f"file says {served.get(key)!r}"
-            )
+    # disagrees with the file it claims to describe, which downstream consumers
+    # read instead of the file.
+    #
+    # Compared as a WHOLE, against the expected keys - not by iterating the
+    # manifest's own keys. Iterating what was supplied made the check's strength
+    # a function of its input: `"cache_info": {}` iterated nothing and passed,
+    # so a manifest that described no cache-info at all was indistinguishable
+    # from a correct one. Same fail-open species as an unknown tier excusing a
+    # payload; the fix is that the EXPECTATION drives the comparison.
+    declared = {k: str(v) for k, v in (manifest.get("cache_info") or {}).items()}
+    if declared != EXPECTED_CACHE_INFO:
+        fail(
+            f"manifest cache_info is {declared}, expected exactly "
+            f"{EXPECTED_CACHE_INFO}. Consumers read the manifest instead of the "
+            "served file, so a manifest that omits or renames a field describes a "
+            "cache that is not the one being served."
+        )
     ok(f"nix-cache-info served with explicit {served}")
 
 
@@ -327,8 +398,8 @@ def narinfo_file(cache: Path, entry: dict) -> Path:
     return cache / f"{Path(entry['store_path']).name.split('-')[0]}.narinfo"
 
 
-def run_bites(out_dir: Path, manifest: dict, public_line: str) -> None:
-    src_cache = out_dir / "cache"
+def run_bites(generation: Path, manifest: dict, public_line: str) -> None:
+    src_cache = generation / "cache"
     by_attr = {entry["attr"]: entry for entry in manifest["paths"]}
     target = by_attr[BITE_ATTR]
     # `app` references `lib`; the closure must be servable or the bite would
@@ -435,45 +506,7 @@ def run_bites(out_dir: Path, manifest: dict, public_line: str) -> None:
             )
 
 
-def tree_digest(root: Path) -> dict[str, str]:
-    """Contents AND metadata, per entry - directories included.
-
-    Contents alone were compared before, so two trees generated under
-    different umasks (022 -> 644/755, 077 -> 600/700) were reported identical
-    while being materially different to rsync, tar, an image build, or a
-    server deciding a file is unreadable. gen-fixtures now normalises modes
-    and mtimes; including them here is what proves the normalisation happened
-    rather than assuming it.
-
-    What the mtime component can and cannot catch, so it is not over-read: the
-    generator writes the same fixed mtime into both trees, so comparing them
-    detects EXTERNAL mutation of a published tree, never drift in the
-    generator itself - if normalisation broke, both sides would break
-    identically and still compare equal. The mode component has the same
-    shape. What actually pins the intended values is that they are constants
-    in fixturelib, reviewable in a diff.
-    """
-    digest = {}
-    # The ROOT is an entry too. Omitting it meant two trees whose top-level
-    # directory differed (0700 vs 0755) compared equal - the one directory a
-    # consumer must be able to traverse was the one nothing checked.
-    for path in [root, *sorted(root.rglob("*"))]:
-        stat = path.lstat()
-        if path.is_symlink():
-            body = f"symlink:{os.readlink(path)}"
-        elif path.is_dir():
-            body = "dir"
-        else:
-            body = hashlib.sha256(path.read_bytes()).hexdigest()
-        digest["." if path == root else str(path.relative_to(root))] = (
-            # Nanoseconds, not int(st_mtime): truncating to seconds made 1.1s
-            # and 1.9s compare equal, so sub-second drift was invisible.
-            f"{body} mode={stat.st_mode & 0o7777:04o} mtime_ns={stat.st_mtime_ns}"
-        )
-    return digest
-
-
-def check_determinism(out_dir: Path, manifest: dict) -> None:
+def check_determinism(generation: Path, manifest: dict) -> None:
     """Regenerating the same workload yields a byte-identical tree.
 
     Be exact about what this earns, because the obvious reading is wrong.
@@ -495,22 +528,25 @@ def check_determinism(out_dir: Path, manifest: dict) -> None:
     fixtures/workload.lock.json is the instrument for that case.
     """
     with tempfile.TemporaryDirectory(prefix="nix-p2p-determinism-") as tmp:
-        replica = Path(tmp) / "out"
+        replica_root = Path(tmp) / "out"
         cmd = [
             sys.executable,
             str(Path(__file__).resolve().parent / "gen-fixtures.py"),
             "--out",
-            str(replica),
+            str(replica_root),
         ]
-        if manifest["tier"] == "full":
+        if manifest["tier"] == fx.TIER_FULL:
             cmd.append("--large")
-        # `--out` points at a scratch tree, so the reuse shortcut in
+        # `--out` points at an empty scratch root, so the reuse shortcut in
         # gen-fixtures cannot fire and this always regenerates for real.
         result = subprocess.run(cmd, capture_output=True, text=True, check=False)
         if result.returncode != 0:
             fail(f"regeneration failed:\n{result.stderr.strip()}")
+        replica = fx.resolve_current(replica_root)
+        if replica is None:
+            fail(f"regeneration published nothing at {replica_root}", code=2)
 
-        original, regenerated = tree_digest(out_dir), tree_digest(replica)
+        original, regenerated = fx.tree_digest(generation), fx.tree_digest(replica)
         if original != regenerated:
             differing = sorted(
                 set(original) ^ set(regenerated)
@@ -540,7 +576,8 @@ def main() -> int:
         "--out",
         type=Path,
         default=fx.repo_root() / "fixtures" / "out",
-        help="fixture tree to verify",
+        help="fixture publication root; the generation under <dir>/current is "
+        "what gets verified",
     )
     parser.add_argument(
         "--skip-determinism",
@@ -558,29 +595,41 @@ def main() -> int:
     args = parser.parse_args()
 
     repo = fx.repo_root()
-    out_dir = args.out.resolve()
+    out_root = args.out.resolve()
 
-    manifest = load_manifest(out_dir)
+    generation = published_generation(out_root)
+    manifest = load_manifest(generation)
+    tier = manifest.get("tier")
+    # Checked before anything indexes on it. An unrecognised tier reaching the
+    # rank comparison below would be a KeyError traceback at best and, if the
+    # comparison were written the other way round, a silently satisfied
+    # requirement - the same fail-open shape load_lock rejects on the lock side.
+    if tier not in fx.TIERS:
+        fail(f"manifest declares tier {tier!r}, which is not one of {list(fx.TIERS)}")
     print(
-        f"check-fixtures: verifying {manifest['workload_version']} "
-        f"tier={manifest['tier']} paths={len(manifest['paths'])}"
+        f"check-fixtures: verifying {manifest['workload_version']} tier={tier} "
+        f"paths={len(manifest['paths'])} at {generation}"
     )
-    if args.require_tier == fx.TIER_FULL and manifest["tier"] != fx.TIER_FULL:
+    # A rank comparison, not a test for the one tier somebody happened to pass:
+    # `--require-tier fast` satisfied by a full tree is correct BECAUSE full
+    # outranks fast, and a tier added later inherits that rather than defaulting
+    # to "no requirement".
+    if args.require_tier and fx.TIER_RANK[tier] < fx.TIER_RANK[args.require_tier]:
         fail(
-            f"--require-tier full, but the tree at {out_dir} is tier "
-            f"{manifest['tier']!r}. Regenerate with `just fixtures-large`; "
-            "verifying a fast tree here would report the full workload green "
-            "without ever touching the 110 MiB payload."
+            f"--require-tier {args.require_tier}, but the published tree is tier "
+            f"{tier!r}. Regenerate with `just fixtures-large`; verifying a fast tree "
+            "here would report the full workload green without ever touching the "
+            "110 MiB payload."
         )
     check_workload_version_documented(repo, manifest)
-    check_matches_lock(repo, out_dir, manifest)
+    check_matches_lock(repo, generation, manifest)
 
     # The key is not re-derived here: check_matches_lock already tied the
     # manifest to the committed pin, and re-deriving it from the same seed
     # would only prove this file can call the same function gen-fixtures did.
     public_line = manifest["public_key"]
     check_trusted_keys_exactly_test_key(public_line)
-    run_bites(out_dir, manifest, public_line)
+    run_bites(generation, manifest, public_line)
     if args.skip_determinism:
         print(
             "check-fixtures: PARTIAL - repeatability NOT checked "
@@ -589,7 +638,7 @@ def main() -> int:
             flush=True,
         )
     else:
-        check_determinism(out_dir, manifest)
+        check_determinism(generation, manifest)
     return 0
 
 

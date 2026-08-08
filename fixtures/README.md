@@ -18,10 +18,42 @@ Generated, gitignored (`fixtures/out/`, created by `just fixtures`):
 
 | Path | Role |
 |---|---|
+| `generations/gen-<sha>/` | One **immutable** generation, named by the SHA-256 of its `manifest.json`. Built and fully validated before it is named; never written to, renamed or mutated afterwards. |
+| `current` | Symlink to the published generation. **Every consumer resolves through this** — the gate, `just fixtures-serve`, task-5's containers. |
+
+Inside a generation:
+
+| Path | Role |
+|---|---|
 | `cache/` | The binary cache itself: `nix-cache-info`, `<hash>.narinfo`, `nar/`. Plain static files - any file server is a sufficient mock upstream. |
 | `manifest.json` | What was generated: version, tier, public key, per-path compression / NarHash / NarSize / URL. Consumers read this instead of globbing. |
 | `test-key.pub` | The one public key the harness client trusts. |
 | `test-key.UNSAFE-TEST-ONLY.sec` | The signing key. Derived at generation time from a seed phrase that **is** committed, so it is fully reconstructible and **not secret** — it is worthless test-only key material. Deriving it just keeps a high-entropy blob out of git and out of the secret scanner's way (see `scripts/fixturelib.py`). |
+
+## Publication
+
+Publishing is **one atomic operation**: build and validate a generation, then
+`os.replace` a new `current` symlink over the old one. There is no
+half-published state, so there is nothing to roll back except one more symlink
+flip. Failure end states are exhaustive and are written into
+`gen-fixtures.py:publish`'s docstring:
+
+| Fails at | End state |
+|---|---|
+| build or validation | nothing published; the build directory is removed (or named, if it cannot be) |
+| the symlink flip | nothing changed; the validated generation stays on disk under `generations/`, named and inspectable |
+| the lock write | `current` is flipped back in one syscall; the old lock is intact; the new generation stays on disk, inert |
+| collecting superseded generations | **success**, with a warning naming the residue — the tree and the lock are both committed, so this is not a failed publication. A partially-collected directory is inert but not invisible: it still occupies its name, so the next run that rebuilds the same content publishes beside it under `gen-<sha>.superseded-<stamp>` |
+
+Two generations are kept: the published one and its predecessor. Older ones are
+deleted only through a file descriptor opened `O_NOFOLLOW|O_DIRECTORY` whose
+ownership marker is verified with `openat` on that same descriptor — a
+directory swapped in after a by-path check is not what gets removed. A
+directory without the marker is never deleted, empty or not.
+
+A reader that resolved `current` before a publication keeps reading a complete,
+immutable tree rather than racing a rename; it survives at least one further
+publication before its generation becomes collectable.
 
 ## Regenerating
 
@@ -39,8 +71,29 @@ Three different determinism claims, kept apart on purpose:
 | **Builds** are deterministic | `just fixtures-verify-rebuild` (`nix build --rebuild`) | Slow. **Required before the J2 baseline is recorded** — otherwise the frozen workload rests on whichever bytes happened to be realised first |
 | Cross-host / cross-nixpkgs | *nothing* | Not verified, not claimed. `workload.lock.json` is what fails loudly when the workload moves |
 
-Generation reuses an existing tree when it already matches the lock at the
-requested tier, so `just test` will not delete a full tier you just built.
+Generation reuses the published generation when it already matches the lock at
+the requested tier, so `just test` will not republish over a full tier you just
+built. Reuse checks the same *completeness* the gate does — `nix-cache-info`,
+one narinfo per payload, and every blob present at the right size — but not
+blob **hashes**, because re-hashing 110 MiB on every `just test` would cost
+more than it protects. So the one defect reuse can miss is corrupted blob
+*content*, which the gate re-hashes unconditionally. (Checking only the
+manifest and the blob sizes used to be enough to make `rm cache/nix-cache-info`
+unrecoverable: the gate failed, `just fixtures` reused, and the gate's own
+advice was to run `just fixtures`.)
+
+A generation that something mutated after publication no longer blocks its own
+repair. Its name is content-derived, so the corrected tree wants the same name;
+rather than refuse — which dead-ended on "remove it and rerun", naming the
+directory `current` still pointed at — the new tree is published beside it as
+`gen-<sha>.superseded-<stamp>` with a warning. The mutated directory is never
+modified or deleted by the generator (immutability is not conditional on the
+occupant being well-formed) and is collected by a later run.
+
+A tree from before the generations layout (`manifest.json` directly inside
+`fixtures/out/`) is refused rather than migrated — `rm -rf fixtures/out` once
+and regenerate. The tree is an output; a migration path in the generator would
+have outlived the transition by years.
 
 ## Two things that are easy to get wrong
 

@@ -4,7 +4,7 @@ title: 'Measurement: request/byte counters + egress report + gap histogram'
 status: To Do
 assignee: []
 created_date: '2026-08-07 21:56'
-updated_date: '2026-08-08 00:52'
+updated_date: '2026-08-08 02:01'
 labels:
   - irreversible
 dependencies:
@@ -62,4 +62,6 @@ forward-carried from task-3 round 3 (0a70c5e): scripts/check-rebuild.py now also
 Its scope limit is now documented and matters for you: it rebuilds each payload's OWN derivation, not its closure. Correct for the current leaf-shaped workload; if a payload ever gains a first-party dependency, that dependency is NOT covered and the attr list needs extending.
 
 Also: the generated tree's file modes and mtimes are now normalised (0644/0755, mtime 1, signing key 0600), so a tree copied with rsync/tar is identical to one served over HTTP. If measurement tooling copies the tree, it must preserve or re-normalise metadata, or the determinism gate will flag the copy.
+
+forward-carried from task-3 round 5: the fixture tree is now published as an immutable generation behind a symlink, so every path above that starts fixtures/out/ gains one level: fixtures/out/current/cache, fixtures/out/current/manifest.json, fixtures/out/current/test-key.pub. Resolve through fixtures/out/current (never name a generation directly); it is a relative symlink to generations/gen-<manifest-sha>, and the generation it points at is immutable, so a consumer that resolves it once cannot have the tree change underneath it. Retention is two generations, not a lease: re-resolve on ENOENT if you hold it across repeated regenerations.
 <!-- SECTION:NOTES:END -->

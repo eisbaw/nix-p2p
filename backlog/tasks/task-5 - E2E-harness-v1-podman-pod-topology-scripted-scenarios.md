@@ -4,7 +4,7 @@ title: 'E2E harness v1: podman-pod topology + scripted scenarios'
 status: To Do
 assignee: []
 created_date: '2026-08-07 21:55'
-updated_date: '2026-08-08 01:15'
+updated_date: '2026-08-08 02:00'
 labels: []
 dependencies:
   - TASK-3
@@ -60,4 +60,23 @@ forward-carried from task-3 round 4 (05a7dff): fixture publication is now a defi
 - fixtures/.out.retired.<ns>-<pid> - the previous tree, kept until the new one is fully published and recorded. A crash mid-transaction strands it and the next run tells you the single mv that restores it.
 - fixtures/.out.quarantine.<ns>-<pid> - a NEW tree that was built and published successfully but whose lock could not be written, so it was rolled back. Its presence means the committed lock and the tree on disk were deliberately kept consistent at the cost of the new tree. Read the error message before deleting.
 Nothing without a .nix-p2p-fixture-out marker file is ever deleted by the generator, so a directory of yours at any of these paths is safe - but the generator will refuse to proceed rather than work around it.
+
+forward-carried from task-3 round 5 (REPLACES the round-3 and round-4 publication notes above, which describe machinery that no longer exists). Fixture publication is now immutable generations plus an atomic symlink flip:
+
+  fixtures/out/generations/gen-<manifest-sha>/   built, validated, then never mutated
+  fixtures/out/current -> generations/gen-<...>  swapped with one os.replace
+
+PATHS YOUR HARNESS MUST USE. Everything moved one level down, behind 'current': the cache is fixtures/out/current/cache, the public key is fixtures/out/current/test-key.pub, the manifest is fixtures/out/current/manifest.json, and the signing key you must NEVER mount is fixtures/out/current/*.sec. AC#5's intent is unchanged - only the path is. Resolve through 'current'; never name a generation directly, or the harness pins a tree that regeneration has already superseded.
+
+THE ENOENT RESIDUAL IS GONE, and what replaces it is strictly better: a reader that has resolved 'current' keeps reading a complete, immutable generation across a republication - no torn tree, no ENOENT window, no retry needed. Delete the round-3 'retry on ENOENT during the publish swap' handling; it now has nothing to catch.
+
+The limit that DOES remain: retention is two generations (the published one and its predecessor), not a lease. A container that resolved 'current' and then idles through TWO further publications has its generation collected underneath it. Files already open stay readable; newly opened paths get ENOENT. So a long-lived harness should resolve 'current' once, hold the directory open (or bind-mount the RESOLVED generation path), and re-resolve on ENOENT.
+
+This also settles the round-2 finding (b) about bind-mounting pinning the inode. Bind-mount the resolved generation (readlink -f fixtures/out/current) rather than fixtures/out: the generation is immutable by contract, so the container serves a tree that provably cannot change under it, and the manifest sha in the generation's own name is the identity assertion that finding asked for. Bind-mounting fixtures/out/current itself follows the symlink at mount time and gives the same pinning, which is fine - just do not expect it to track a later flip.
+
+DIRECTORY NAMES YOUR CLEANUP MUST NOT BLANKET-DELETE - the round-4 list is obsolete. There are no more .out.retired.* or .out.quarantine.* directories; the quarantine concept does not exist. What can be left behind is fixtures/out/generations/gen-<sha> (a validated generation whose publication or lock write failed - inert, inspectable, and collected by the next successful run) and fixtures/out/generations/.building.<ns>-<pid> (a killed run's scratch). Both are safe to remove, but the generator collects them itself. Nothing without a .nix-p2p-fixture-out marker is ever deleted by the generator, and deletion is now done through an O_NOFOLLOW|O_DIRECTORY descriptor whose marker is verified via openat on that same fd - so a directory of yours at any of these paths survives even if it appears mid-run.
+
+A pre-generations tree (manifest.json directly inside fixtures/out) is REFUSED rather than migrated: 'rm -rf fixtures/out' once and regenerate. If your harness caches a fixtures/out from an earlier checkout, clear it.
+
+Unchanged and still binding: run 'just fixtures-large' (it gates with --require-tier full); metadata is normalised (0644/0755, mtime 1, key 0600) so copies need cp -a / rsync -a / tar -p; the harness must invoke check-fixtures.py, not only gen-fixtures.py; and AC#3's daemon-path re-assertion is still a different proof from check-fixtures.py's direct-store-mode one.
 <!-- SECTION:NOTES:END -->

@@ -256,21 +256,39 @@ This table is descriptive. **`fixtures/workload.lock.json` is
 authoritative** — it pins each payload's store path, NarHash and
 FileHash, and the gate fails when the generated tree diverges from it.
 That is also the only thing that notices a `flake.lock` bump, which
-changes every payload while the version string sits still. `fixtures/README.md`
-holds the design rationale; regeneration and the change procedure live there.
+changes every payload while the version string sits still. Its schema is
+closed: a field the tooling does not recognise is a hard error, because an
+ignored field looks like a pin and is erased by the next rewrite.
+`fixtures/README.md` holds the design rationale; regeneration and the change
+procedure live there.
+
+The fixture is **published as an immutable generation plus an atomic
+symlink flip**: `fixtures/out/generations/gen-<sha>/` is built and
+validated, then `fixtures/out/current` is `os.replace`d to point at it.
+Everything that consumes the fixture — the gate, `just fixtures-serve`,
+task-5's containers — resolves through `current`, and must keep doing so
+rather than naming a generation directly.
 
 `nix-cache-info` advertises **`Priority: 40`** and
 **`WantMassQuery: 1`** explicitly (a `file://` store writes `StoreDir`
 alone, and the omitted fields would silently become client defaults).
 
-Three limits on what the fixture gate proves, stated so a green line
-is not over-read:
+The limits on what the fixture gate proves, stated so a green line is
+not over-read:
 
 - **The reproducibility contract covers bytes *and* file metadata.**
   Modes and mtimes are normalised at generation (0644/0755, mtime 1,
   the signing key 0600), so the tree is umask-independent and a
   consumer that copies it with rsync/tar sees what an HTTP client
   sees. The determinism check compares metadata too.
+- **A reader that already resolved `current` is never torn.** It goes on
+  reading a complete, immutable generation across a republication, and
+  that generation survives at least one further publication before it
+  becomes collectable. (The previous publish-by-rename design gave such a
+  reader an `ENOENT` window instead; that window is gone.) What is *not*
+  provided is a lease: a reader idle across two publications can still
+  have its generation collected, so long-lived consumers should resolve
+  `current` once, hold the directory open, and re-resolve on ENOENT.
 - **`just test` proves EXPORT repeatability, not build determinism.**
   Regeneration finds the payloads already realised in the store, so it
   re-serialises, recompresses and re-signs them — it never rebuilds.
@@ -279,7 +297,11 @@ is not over-read:
   --rebuild`) is what covers that, and it is a **required step before
   the J2 baseline is recorded**. Neither proves byte-stability across
   machines or nixpkgs revisions; the lock file is the instrument for
-  that case.
+  that case. `just test` also verifies whichever tier is *published*,
+  and a full tier satisfies a fast request — so on a warm machine it
+  may verify four payloads while a cold CI run verifies three. The
+  fast tier is the coverage that can be relied on; `just
+  fixtures-large` is what guarantees the 110 MiB payload was touched.
 - **Enforcement is proven in Nix's direct store mode only.** The gate
   drives the `nix` CLI, where `trusted-public-keys` is client-side.
   A real `nix-daemon` ignores that setting for a non-trusted user and

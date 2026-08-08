@@ -28,6 +28,22 @@ is subtly wrong is worse than no fixture: the J2 egress baseline is frozen
 against this workload and a silent change makes every cross-wave comparison
 meaningless without anything looking broken.
 
+PUBLICATION is immutable generations plus one atomic symlink flip:
+
+    <out>/generations/gen-<manifest-sha>/   built, validated, then never touched
+    <out>/current -> generations/gen-<...>  swapped with a single os.replace
+
+Every consumer resolves through `current` (fixturelib.resolve_current), so a
+publication is one syscall with no intermediate state. The previous design
+renamed whole trees aside on publish and back again on rollback, with a
+quarantine directory for the failed-lock case; four review rounds each found a
+new hole in it (a rollback that fired on a failed `print`, a marker check
+racing its own delete, a quarantine collision that abandoned the rollback
+half-done, a cleanup failure reported as a failed publication). None of those
+states exist here: a generation is either complete and named, or it is not
+`current`. A failed run leaves its generation on disk, named and inspectable,
+and the next successful publication collects it.
+
 Why payloads are built locally, and the other design rationale: see
 fixtures/README.md, which is canonical. The short version, because it governs
 the code immediately below: `nix copy` propagates the signatures a path
@@ -42,10 +58,12 @@ Exit codes: 0 generated, 1 an assertion about the produced fixture failed,
 from __future__ import annotations
 
 import argparse
+import contextlib
 import fcntl
+import hashlib
 import json
 import os
-import shutil
+import stat
 import subprocess
 import sys
 import time
@@ -120,6 +138,58 @@ def fail(message: str, code: int = 1) -> None:
     sys.stdout.flush()
     print(f"gen-fixtures: FAIL - {message}", file=sys.stderr)
     raise SystemExit(code)
+
+
+def note(message: str, stream=None) -> None:
+    """Report something that must NEVER change the outcome.
+
+    Used only once the publication is committed. Writing to a stream can fail
+    on its own - EPIPE when the caller closed the pipe (`gen-fixtures | head`),
+    ENOSPC on a full disk - and at that point the generation and the lock are
+    both on disk. Letting a message that could not be delivered turn a
+    completed publication into a non-zero exit reports a state that did not
+    happen, which is the same class of lie as the rollback that used to fire
+    when commit_lock's own success line failed to print. This is the one place
+    in this file where suppressing an OSError is the correct thing to do.
+
+    Suppressing the write is not enough on its own. The failed write leaves the
+    message in the stream's buffer, and CPython exits 120 when its own flush at
+    interpreter shutdown fails - so `gen-fixtures | head -1` still returned
+    non-zero after a completed publication, by a second route. The underlying
+    descriptor is therefore redirected to /dev/null, which makes that final
+    flush succeed and leaves the exit status saying what actually happened.
+    """
+    target = stream or sys.stdout
+    try:
+        print(message, file=target, flush=True)
+    except (OSError, ValueError):
+        # ValueError too: writing to a closed stream raises "I/O operation on
+        # closed file", which is not an OSError and would otherwise escape and
+        # flip a committed publication to a failure.
+        #
+        # Best-effort by definition: a stream with no descriptor (a test
+        # double, a StringIO) has nothing to redirect and needs nothing.
+        with contextlib.suppress(Exception):
+            devnull = os.open(os.devnull, os.O_WRONLY)
+            try:
+                os.dup2(devnull, target.fileno())
+            finally:
+                os.close(devnull)
+
+
+def warn(message: str) -> None:
+    """Report a problem on a PRE-commit path without letting it become one.
+
+    Deliberately NOT note(). note() redirects the failing stream to /dev/null
+    so the interpreter's shutdown flush cannot fail, and that redirect outlives
+    the call: used on the unwind path it put /dev/null over fd 2 for the rest
+    of the process, so the fail() or LockError handler that runs afterwards
+    printed the real failure into the void and the run exited non-zero with no
+    message at all. Pre-commit, the message that MUST survive is the one that
+    comes later, so this suppresses the write and changes nothing else.
+    """
+    with contextlib.suppress(OSError, ValueError):
+        print(message, file=sys.stderr, flush=True)
 
 
 def pinned_nix() -> str:
@@ -266,24 +336,29 @@ def assert_no_unplanned_narinfos(cache: Path, store_paths: dict) -> None:
 
 
 def build_into(
-    staging: Path, repo: Path, secret_line: str, public_line: str, include_large: bool
+    built: Path, repo: Path, secret_line: str, public_line: str, include_large: bool
 ):
-    """Realise, sign and copy every planned payload into `staging`."""
-    staging.mkdir(parents=True)
+    """Realise, sign and copy every planned payload into `built`.
+
+    `built.mkdir` is deliberately NOT exist_ok: the build directory carries a
+    nanosecond timestamp, so anything already sitting there was put there by
+    something else, and refusing is the only safe answer.
+    """
+    built.mkdir(parents=True)
     # Written before anything else, so the directory is claimed from its first
     # moment: a run that dies mid-build still leaves a tree the next run is
     # allowed to clean up.
-    (staging / fx.OUT_MARKER).write_text(
+    (built / fx.OUT_MARKER).write_text(
         "Generated by scripts/gen-fixtures.py. Safe to delete; it is what marks "
         "this directory as ours, so --out cannot destroy anything else.\n"
     )
-    cache = staging / "cache"
+    cache = built / "cache"
     cache.mkdir()
 
-    secret_key = staging / SECRET_KEY_NAME
+    secret_key = built / SECRET_KEY_NAME
     secret_key.write_text(secret_line + "\n")
     secret_key.chmod(0o600)
-    (staging / "test-key.pub").write_text(public_line + "\n")
+    (built / "test-key.pub").write_text(public_line + "\n")
 
     cache_info = write_cache_info(cache)
 
@@ -356,17 +431,20 @@ def read_workload_version(repo: Path) -> str:
 def reusable(
     out_dir: Path, repo: Path, version: str, public_line: str, include_large: bool
 ) -> bool:
-    """True when the tree on disk already IS the requested workload.
+    """True when the PUBLISHED generation already IS the requested workload.
 
-    Without this, `just test` (which depends on the fast tier) would delete a
-    110 MiB full-tier tree that a container or measurement run had just spent
-    minutes building. Reuse is safe only because the decision is made against
-    the committed lock rather than against a timestamp: anything stale, from a
-    different workload version, or signed by a different key regenerates.
-    A full tree satisfies a request for the fast tier - it is a superset - but
-    never the other way round.
+    Without this, `just test` (which depends on the fast tier) would republish
+    over a 110 MiB full-tier tree that a container or measurement run had just
+    spent minutes building. Reuse is safe only because the decision is made
+    against the committed lock rather than against a timestamp: anything stale,
+    from a different workload version, or signed by a different key
+    regenerates. A full tree satisfies a request for the fast tier - it is a
+    superset - but never the other way round.
     """
-    manifest_file = out_dir / "manifest.json"
+    current = fx.resolve_current(out_dir)
+    if current is None or not current.is_dir():
+        return False
+    manifest_file = current / "manifest.json"
     if not manifest_file.is_file():
         return False
     try:
@@ -379,53 +457,117 @@ def reusable(
         return False
     if include_large and manifest.get("tier") != fx.TIER_FULL:
         return False
-    # Same definition of "is the pinned workload" the gate uses, including the
-    # tier's required payload set - so reuse can never keep a tree the gate
-    # would reject. Blob sizes are checked; blob hashes are not, because
-    # re-hashing 110 MiB on every `just test` would cost more than it protects
-    # (the gate hashes them, and generation is what this decides to skip).
+    # The tier's required payload set, AND the files a served cache must
+    # actually contain. Checking only the manifest and the blobs made this a
+    # whitelist standing in for "is this the pinned workload": deleting
+    # nix-cache-info or a narinfo left a tree the gate rejects and this reused,
+    # so `just fixtures` said success, `just test` failed, and its remediation
+    # advice was to run `just fixtures`.
+    #
+    # Blob sizes are checked; blob HASHES are not, because re-hashing 110 MiB
+    # on every `just test` would cost more than it protects. State the residual
+    # precisely rather than claiming parity with the gate: what this guarantees
+    # is that every file the workload owes is present and the right size, so
+    # the only defect it can miss is corrupted blob CONTENT - which the gate
+    # re-hashes unconditionally, and which cannot be produced by the accidents
+    # this shortcut exists to survive (an interrupted run, a stray deletion).
+    cache = current / "cache"
     lock = fx.load_lock(repo)
-    if fx.lock_problems(manifest, lock):
+    if fx.lock_problems(manifest, lock) or fx.completeness_problems(cache, manifest):
         return False
     for entry in manifest.get("paths", []):
-        blob = out_dir / "cache" / entry["url"]
-        if not blob.is_file() or blob.stat().st_size != entry["file_size"]:
+        blob, refusal = fx.confined_blob(cache, entry.get("url"))
+        if refusal is not None:
+            return False
+        if not blob.is_file() or blob.stat().st_size != entry.get("file_size"):
             return False
     return True
 
 
 def assert_safe_out_dir(out_dir: Path, repo: Path) -> None:
-    """Refuse to take ownership of a directory that is not ours to destroy.
+    """Refuse to take ownership of a directory that is not ours to write into.
 
-    `--out` publishes by renaming the old tree aside and deleting it. Pointed
-    at a home directory or a source tree by a typo (or a stale shell variable),
-    that is unrecoverable. Anything this script created carries OUT_MARKER; a
-    non-empty directory without it is someone else's.
+    Pointed at a home directory or a source tree by a typo (or a stale shell
+    variable), publication would scatter generations into it and later collect
+    them. Anything this script created carries OUT_MARKER; a non-empty
+    directory without it is someone else's.
     """
     if out_dir == repo or (out_dir / ".git").exists():
         fail(f"--out {out_dir} looks like a source tree; refusing", code=2)
-    if out_dir.exists():
-        if not out_dir.is_dir():
-            fail(f"--out {out_dir} exists and is not a directory", code=2)
-        if any(out_dir.iterdir()) and not (out_dir / fx.OUT_MARKER).exists():
-            fail(
-                f"--out {out_dir} is not empty and has no {fx.OUT_MARKER} marker, so "
-                "this script cannot show it created it. Refusing to delete it.\n"
-                "If it IS an old fixture tree from before the marker existed, "
-                f"remove it once by hand: rm -rf {out_dir}",
-                code=2,
-            )
+    if not out_dir.exists():
+        return
+    if not out_dir.is_dir():
+        fail(f"--out {out_dir} exists and is not a directory", code=2)
+    # is_file() on the un-followed path: .exists() follows symlinks, so a
+    # symlink named like the marker and pointing at any existing file let --out
+    # claim a non-empty foreign directory. purge_marked_dir already verifies
+    # this marker with O_NOFOLLOW; one ownership question deserves one answer.
+    marker = out_dir / fx.OUT_MARKER
+    if any(out_dir.iterdir()) and (marker.is_symlink() or not marker.is_file()):
+        fail(
+            f"--out {out_dir} is not empty and has no {fx.OUT_MARKER} marker, so "
+            "this script cannot show it created it. Refusing to write into it.\n"
+            "If it IS an old fixture tree from before the marker existed, "
+            f"remove it once by hand: rm -rf {out_dir}",
+            code=2,
+        )
+    # Pre-generations layout: the tree used to be published AS the --out
+    # directory (manifest.json and cache/ directly inside it). Refused rather
+    # than migrated: the tree is gitignored and rebuilt in seconds, so a
+    # one-time manual removal is cheaper and far more honest than a migration
+    # path that would live in this file forever for a single transition.
+    if (out_dir / "manifest.json").exists() and not (
+        out_dir / fx.GENERATIONS_DIR
+    ).is_dir():
+        fail(
+            f"{out_dir} holds a fixture tree in the old layout (manifest.json at the "
+            "top level). Publication is now an immutable generation plus a `current` "
+            f"symlink, so this directory cannot be reused.\n"
+            f"  Remove it once and regenerate: rm -rf {out_dir}",
+            code=2,
+        )
+    link = out_dir / fx.CURRENT_LINK
+    if not link.is_symlink() and link.exists():
+        fail(
+            f"{link} exists and is not a symlink. Publication replaces it with one "
+            "atomic os.replace, which cannot swap a symlink for a directory.\n"
+            f"  Inspect it, then remove it: rm -rf {link}",
+            code=2,
+        )
+
+
+def ensure_out_root(out_dir: Path) -> Path:
+    """Create the publication root and claim it. Returns the generations dir.
+
+    The marker goes down before anything else, exactly as it does inside a
+    generation: a run that dies immediately after must still leave a directory
+    the next run can recognise as its own.
+    """
+    out_dir.mkdir(parents=True, exist_ok=True)
+    marker = out_dir / fx.OUT_MARKER
+    if not marker.exists():
+        marker.write_text(
+            "Generated by scripts/gen-fixtures.py. Safe to delete; it is what marks "
+            "this directory as ours, so --out cannot destroy anything else.\n"
+        )
+    generations = out_dir / fx.GENERATIONS_DIR
+    generations.mkdir(exist_ok=True)
+    return generations
 
 
 @contextmanager
 def publication_lock(out_dir: Path):
-    """Serialise generators publishing to the same tree.
+    """Serialise generators publishing to the same root.
 
-    Staging plus rename keeps a READER from seeing a half-written tree, but two
-    WRITERS still race: both stage, both rename, and the loser's rename can
-    land after the winner's while its `retired` cleanup deletes the winner's
-    bytes. Observed as a spurious "signature is not valid" during review, which
-    is exactly the kind of failure that gets blamed on the code under test.
+    The symlink flip protects READERS - each sees one complete generation or
+    another - but two WRITERS still need ordering: both would build, both would
+    flip, and the loser's `collect_generations` could delete the generation the
+    winner had just published. Observed as a spurious "signature is not valid"
+    during review, which is exactly the kind of failure that gets blamed on the
+    code under test.
+
+    Also what makes build-directory names safe to collect: nothing else is
+    mid-build under generations/ while this is held.
     """
     out_dir.parent.mkdir(parents=True, exist_ok=True)
     lock_file = out_dir.parent / f".{out_dir.name}.publish.lock"
@@ -464,14 +606,15 @@ def generate(
     _name, _private, secret_line, public_line = fx.keypair()
     version = read_workload_version(repo)
     assert_safe_out_dir(out_dir, repo)
-    warn_about_stranded_trees(out_dir)
 
     # Checked against the committed lock, not against a constant living beside
     # the seed phrase: an external pin is the only kind a coordinated edit
-    # cannot walk past. Skipped only while bootstrapping a new lock.
+    # cannot walk past. Skipped only while bootstrapping a new lock, and read
+    # through load_lock so a lock with a schema this code does not understand
+    # is an error here too, not just at the comparison sites.
     lock_file = fx.lock_path(repo)
     if not write_lock or lock_file.is_file():
-        pinned = json.loads(lock_file.read_text())["public_key"]
+        pinned = fx.load_lock(repo)["public_key"]
         if public_line != pinned:
             fail(
                 f"derived public key {public_line} != the key pinned in "
@@ -480,90 +623,209 @@ def generate(
             )
 
     with publication_lock(out_dir):
+        generations = ensure_out_root(out_dir)
         if not write_lock and reusable(
             out_dir, repo, version, public_line, include_large
         ):
-            print(f"gen-fixtures: {version} already present at {out_dir} - reused")
+            current = fx.resolve_current(out_dir)
+            # Collect here too. collect_generations used to run only from
+            # publish(), so on a warm tree - the common case, since `just test`
+            # reuses - a generation stranded by a failed flip and a .building.*
+            # left by a SIGKILL accumulated forever at 110 MiB each, silently,
+            # because the warning lives in publish() as well.
+            collect_generations(generations, {current.name})
+            # note(), not print(): reuse changed nothing and the published tree
+            # is valid, so a stream this cannot be written to must not turn a
+            # correct state into a non-zero exit.
+            note(f"gen-fixtures: {version} already published at {current} - reused")
             return
 
-        staging = out_dir.parent / f".{out_dir.name}.staging.{os.getpid()}"
-        # The staging path is derived from a pid, so it is predictable and
-        # could already exist as something that is not ours. Same ownership
-        # discipline as --out: nothing without our marker is ever deleted.
-        safe_rmtree(staging, "staging directory")
+        stamp = f"{time.time_ns()}-{os.getpid()}"
+        building = generations / f".building.{stamp}"
         try:
-            # STEP 1: build.
-            entries = build_into(staging, repo, secret_line, public_line, include_large)
-            manifest = write_manifest(
-                staging, version, public_line, include_large, entries
+            # STEP 1: build into a private directory under generations/.
+            entries = build_into(
+                building, repo, secret_line, public_line, include_large
             )
-            fx.normalise_tree(staging, secret_names=frozenset({SECRET_KEY_NAME}))
+            manifest = write_manifest(
+                building, version, public_line, include_large, entries
+            )
+            fx.normalise_tree(building, secret_names=frozenset({SECRET_KEY_NAME}))
 
-            # STEP 2: validate the STAGED tree, before anything on disk moves.
-            # Blob self-consistency is checked in both modes - it compares the
-            # tree against its own manifest and says nothing about the lock -
-            # while the lock comparison applies only when the lock is meant to
-            # stay put. With --write-lock the workload is deliberately
-            # changing, so the equivalent refusal logic lives in step 3.
-            assert_blobs_consistent(staging, manifest)
+            # STEP 2: validate it FULLY, before it becomes a generation. Blob
+            # self-consistency is checked in both modes - it compares the tree
+            # against its own manifest and says nothing about the lock - while
+            # the lock comparison applies only when the lock is meant to stay
+            # put. With --write-lock the workload is deliberately changing, so
+            # the equivalent refusal logic lives in step 3.
+            assert_blobs_consistent(building, manifest)
             if not write_lock:
-                assert_matches_lock(staging, repo, manifest)
+                assert_matches_lock(building, repo, manifest)
 
-            # STEP 3: every remaining way this can REFUSE, still before any
-            # rename. prepare_lock decides; it does not write.
+            # STEP 3: every remaining way this can REFUSE, still before
+            # anything is published. prepare_lock decides; it does not write.
             pending = (
                 prepare_lock(repo, manifest, retire_baseline) if write_lock else None
             )
 
             # STEPS 4-7.
-            publish_transaction(staging, out_dir, repo, pending)
-        finally:
-            # Non-fatal: this runs while unwinding, and a refusal here must not
-            # replace the error that caused the unwind.
-            safe_rmtree(staging, "staging directory", fatal=False)
+            name = install_generation(building, generations, stamp)
+            published = publish(out_dir, generations, name, repo, pending)
+        except BaseException:
+            # Catches EVERYTHING, including the SystemExit that fail() raises
+            # and a KeyboardInterrupt: this is the unwinding path, and a
+            # refusal or an error while cleaning up must never replace the
+            # failure that caused the unwind.
+            remove_build_directory(generations, building.name)
+            raise
     tier = "full" if include_large else "fast"
-    print(f"gen-fixtures: {version} tier={tier} paths={len(entries)} -> {out_dir}")
+    note(f"gen-fixtures: {version} tier={tier} paths={len(entries)} -> {published}")
 
 
-def safe_rmtree(path: Path, what: str, fatal: bool = True) -> None:
-    """Delete a directory only if this script can show it created it.
+def remove_build_directory(generations: Path, name: str) -> None:
+    """Best-effort removal of the private build directory. Never raises.
 
-    This is the ONLY deletion primitive in this file. `shutil.rmtree` is never
-    called directly, including from cleanup paths, because the one place that
-    still did - the transaction's `finally` - deleted a foreign directory that
-    appeared at the staging path AFTER the preflight check had passed. A
-    predictable path plus a time-of-check/time-of-use gap is enough; the
-    marker has to be verified at the moment of deletion, not earlier.
-
-    `fatal=False` is for unwinding paths: refusing there must not raise, or a
-    cleanup refusal would replace the real error with itself. The run still
-    exits non-zero from whatever failed first; this only declines to delete.
+    Catches Exception rather than BaseException on purpose: a KeyboardInterrupt
+    arriving DURING cleanup is the operator asking again, and swallowing it
+    would make the run unkillable. Everything an unwind can realistically hit
+    here - a refusal, EACCES, EIO - is an Exception and is turned into a
+    warning, so the failure that caused the unwind is what gets reported.
     """
-    if not path.exists():
-        return
-    if path.is_symlink() or not path.is_dir():
-        message = f"{what} {path} exists and is not a plain directory; refusing"
-    elif any(path.iterdir()) and not (path / fx.OUT_MARKER).exists():
-        message = (
-            f"{what} {path} is not empty and has no {fx.OUT_MARKER} marker, so this "
-            f"script cannot show it created it. Refusing to delete it."
+    try:
+        refusal = purge_marked_dir(generations, name)
+    except Exception as error:  # noqa: BLE001 - unwinding path, see docstring
+        refusal = f"{error}"
+    if refusal is not None:
+        # warn(), not note(): this runs while unwinding, and note()'s /dev/null
+        # redirect would swallow the failure report that follows it.
+        warn(f"gen-fixtures: WARNING - left {generations / name} in place: {refusal}")
+
+
+def purge_marked_dir(parent: Path, name: str) -> str | None:
+    """Delete `parent/name` iff it is a directory of ours. Returns a refusal.
+
+    This is the ONLY deletion primitive in this file, and every step of it is
+    done through an open file descriptor rather than by path. The previous
+    version checked for the ownership marker by path and then called
+    shutil.rmtree by path, so a directory swapped in between those two moments
+    was deleted on the strength of a marker it never had - a real
+    time-of-check/time-of-use hole, since generation and build-directory names
+    are derivable. Here the directory is opened once with O_NOFOLLOW |
+    O_DIRECTORY, the marker is verified with openat ON THAT DESCRIPTOR, and the
+    contents are unlinked relative to it. Whatever the name refers to
+    afterwards, the bytes removed are the ones whose marker was seen.
+
+    An UNMARKED directory is never deleted, empty or not. Emptiness used to be
+    treated as consent, which quietly made `mkdir` at a predictable path a way
+    to have it removed.
+
+    Returns None when the directory is gone, or a human-readable reason when it
+    was left alone. Refusing is never fatal here: nothing this deletes is
+    load-bearing (a generation is immutable and inspectable; a build directory
+    is scratch), so the only right response to "cannot delete" is to say so.
+    """
+    try:
+        parent_fd = os.open(parent, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
+    except FileNotFoundError:
+        return None
+    try:
+        try:
+            dir_fd = os.open(
+                name,
+                os.O_RDONLY | os.O_NOFOLLOW | os.O_DIRECTORY | os.O_CLOEXEC,
+                dir_fd=parent_fd,
+            )
+        except FileNotFoundError:
+            return None
+        except OSError as error:
+            # ELOOP (a symlink, refused by O_NOFOLLOW) or ENOTDIR (a plain
+            # file). Either way it is not a directory this script created.
+            return f"{error}"
+        try:
+            try:
+                os.close(
+                    os.open(
+                        fx.OUT_MARKER,
+                        os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC,
+                        dir_fd=dir_fd,
+                    )
+                )
+            except OSError:
+                return (
+                    f"it carries no {fx.OUT_MARKER} marker, so this script cannot "
+                    "show it created it"
+                )
+            try:
+                unlink_contents(dir_fd)
+            except OSError as error:
+                # Everything this can raise - EACCES on an unwritable
+                # subdirectory, EIO, or the descent's own identity refusal -
+                # means "left alone", which is what this function returns
+                # rather than raises. The callers catch broadly anyway; going
+                # through the documented channel is what keeps the contract
+                # ("returns a refusal") true instead of nearly true.
+                return f"{error}"
+            # The final rmdir is unavoidably by name - POSIX has no rmdir(fd) -
+            # so the inode the name refers to is compared against the one that
+            # was just emptied. Without this, a directory swapped in after the
+            # contents were removed could be rmdir'd instead. The residual is
+            # the instant between this stat and the rmdir, and it can only
+            # remove an EMPTY directory; it is stated rather than hidden.
+            here = os.fstat(dir_fd)
+            there = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+            if (here.st_dev, here.st_ino) != (there.st_dev, there.st_ino):
+                return "it was replaced by a different directory while being removed"
+            os.rmdir(name, dir_fd=parent_fd)
+            return None
+        finally:
+            os.close(dir_fd)
+    finally:
+        os.close(parent_fd)
+
+
+def unlink_contents(dir_fd: int) -> None:
+    """Empty an open directory, depth first, never following a symlink.
+
+    The descent re-verifies identity at every level, not just at the top. The
+    top-level marker check plus O_NOFOLLOW does not protect a CHILD: stat a
+    subdirectory, then open it by name, and a real directory swapped in between
+    those two calls would be recursed into and emptied - the same
+    check-then-act shape as the round-4 marker race, one level down. Comparing
+    the stat's (dev, ino) against fstat on the descriptor that was actually
+    opened closes it: whatever the name means afterwards, the bytes removed
+    belong to the inode that was examined.
+    """
+    for entry in os.listdir(dir_fd):
+        info = os.stat(entry, dir_fd=dir_fd, follow_symlinks=False)
+        if not stat.S_ISDIR(info.st_mode):
+            os.unlink(entry, dir_fd=dir_fd)
+            continue
+        child_fd = os.open(
+            entry,
+            os.O_RDONLY | os.O_NOFOLLOW | os.O_DIRECTORY | os.O_CLOEXEC,
+            dir_fd=dir_fd,
         )
-    else:
-        shutil.rmtree(path)
-        return
-    if fatal:
-        fail(message, code=2)
-    print(f"gen-fixtures: WARNING - {message}", file=sys.stderr, flush=True)
+        try:
+            opened = os.fstat(child_fd)
+            if (opened.st_dev, opened.st_ino) != (info.st_dev, info.st_ino):
+                raise OSError(
+                    f"{entry!r} was replaced between being examined and being "
+                    "opened; refusing to delete its contents"
+                )
+            unlink_contents(child_fd)
+        finally:
+            os.close(child_fd)
+        os.rmdir(entry, dir_fd=dir_fd)
 
 
-def assert_blobs_consistent(staging: Path, manifest: dict) -> None:
+def assert_blobs_consistent(built: Path, manifest: dict) -> None:
     """The staged tree must contain the bytes its own manifest describes.
 
     Independent of the lock, so it runs in --write-lock mode too: a manifest
     that disagrees with the blobs beside it is broken whether or not the
     workload is deliberately changing.
     """
-    problems = fx.blob_problems(staging / "cache", manifest)
+    problems = fx.blob_problems(built / "cache", manifest)
     if problems:
         fail(
             "the tree just built does not match its own manifest, so it was "
@@ -572,7 +834,7 @@ def assert_blobs_consistent(staging: Path, manifest: dict) -> None:
         )
 
 
-def assert_matches_lock(staging: Path, repo: Path, manifest: dict) -> None:
+def assert_matches_lock(built: Path, repo: Path, manifest: dict) -> None:
     """The staged tree must be the pinned workload, or it is not published."""
     problems = fx.lock_problems(manifest, fx.load_lock(repo))
     if problems:
@@ -590,104 +852,270 @@ def assert_matches_lock(staging: Path, repo: Path, manifest: dict) -> None:
         )
 
 
-def publish_transaction(staging: Path, out_dir: Path, repo: Path, pending) -> None:
-    """Steps 4-7 of the publication protocol, with defined end states.
+def generation_name(built: Path) -> str:
+    """A generation is named by the SHA-256 of the manifest it published.
 
-    This code grew a new hole every time it was patched locally - the lock was
-    written before the tree, then after it with no rollback - so the ordering
-    and every failure's end state are specified here rather than inferred:
+    Content-derived rather than sequential, so the name says what the directory
+    is: two runs of the same workload at the same tier produce the same name,
+    and a run at a different tier produces a different one (the tier is a
+    manifest field). That is what lets a fast and a full generation coexist
+    instead of overwriting each other.
+    """
+    digest = hashlib.sha256((built / "manifest.json").read_bytes()).hexdigest()
+    return f"gen-{digest[:16]}"
 
-      4. rename out -> retired      (the old tree is KEPT, never deleted yet)
-      5. rename staging -> out
-      6. commit_lock                (atomic os.replace of the tracked lock)
-      7. only now, delete retired   (via safe_rmtree, marker-verified)
+
+def install_generation(built: Path, generations: Path, stamp: str) -> str:
+    """Turn the validated build directory into an IMMUTABLE generation.
+
+    One rename, and from that moment the directory is never written to, renamed
+    or mutated again - only read, and eventually collected. Everything that
+    could refuse has already run, so this is the last step that can touch a
+    tree at all.
+
+    The name is content-derived, so the target can legitimately already exist:
+    `--write-lock` bypasses the reuse shortcut, so running it twice rebuilds a
+    byte-identical tree. That case is compared with the same metadata-aware
+    digest the gate uses and ADOPTED, which is what "immutable and
+    content-named" predicts.
+
+    When the name is taken by anything else - a generation something mutated
+    after publication, a foreign file, a symlink - this publishes under a
+    disambiguated name instead of refusing. Refusing was the obvious choice and
+    it was wrong: the occupant of a content-derived name is usually the very
+    tree being repaired, so `just fixtures` dead-ended on "remove it and rerun"
+    naming the directory `current` still pointed at. One stray deletion inside
+    a published generation made the tool unable to fix itself, which is the
+    same unrecoverable shape as the reuse loop this round already closed.
+
+    Publishing beside it keeps every rule intact: the occupant is never
+    written to, renamed or deleted here (immutability is not conditional on the
+    occupant being ours), the flip still publishes a fully validated tree, and
+    the displaced directory is collected by a later run once it is no longer
+    `current` or its predecessor. The disambiguated name is the loud part - it
+    says in `ls` that something violated the contract.
+    """
+    name = generation_name(built)
+    target = generations / name
+    # lexists, not exists: a DANGLING symlink at a generation's name is
+    # invisible to exists(), so the rename would fail with a bare ENOTDIR.
+    if not os.path.lexists(target):
+        # A concurrent creator would make this raise ENOTEMPTY rather than
+        # merge two trees; the publication flock makes that a non-event, and
+        # the error is handled as a filesystem failure either way.
+        built.rename(target)
+        return name
+
+    reason = None
+    if target.is_symlink() or not target.is_dir():
+        reason = "it is not a directory"
+    elif fx.tree_digest(target) != fx.tree_digest(built):
+        reason = (
+            "its contents differ from the tree just built, so it was mutated or "
+            "truncated after publication"
+        )
+    if reason is None:
+        return name
+
+    superseded = f"{name}.superseded-{stamp}"
+    built.rename(generations / superseded)
+    warn(
+        f"gen-fixtures: WARNING - {target} already exists and {reason}. A generation "
+        "is immutable by contract, so it was NOT modified or deleted.\n"
+        f"  The freshly built tree was published as {superseded} instead; the old "
+        "directory is inert and a later run collects it.\n"
+        f"  If you want the plain name back, remove {target} once nothing is using "
+        "it and regenerate."
+    )
+    return superseded
+
+
+def publish(out_dir: Path, generations: Path, name: str, repo: Path, pending) -> Path:
+    """Steps 4-7: flip the symlink, record the lock, collect what is superseded.
+
+    The ordering and every failure's end state are specified here rather than
+    inferred from the code, because the previous design - rename the old tree
+    aside, rename the new one in, roll both back on failure - grew a new hole
+    in each of three review rounds. Publication is now a single atomic
+    operation, so there is no half-published state left to describe:
+
+      4. os.replace(tmp symlink, current)   ONE syscall; the flip
+      5. commit_lock                        ONE atomic os.replace of the lock
+      6. on 5 failing: flip `current` back  ONE syscall; exit 2
+      7. collect superseded generations     never touches `current`'s target
 
     Failures:
-      * at 4          nothing has moved. Old tree and old lock stand.
-      * at 5          one inverse rename restores the old tree. Old lock stands.
-      * at 6          the new tree is moved aside to a marker-carrying
-                      quarantine directory and the old tree is renamed back, so
-                      the end state is: OLD tree at out_dir, OLD lock intact,
-                      new tree preserved for inspection. Exit 2, naming both.
+      * at 4  nothing has changed. `current`, the old generation and the old
+              lock all stand. The validated new generation stays on disk under
+              generations/, named and inspectable.
+      * at 5  `current` is flipped back to the generation it pointed at (or
+              removed, if nothing was published before). The old lock is
+              intact, the new generation stays on disk. Exit 2, naming it.
+      * at 7  the tree AND the lock are committed, so this REPORTS SUCCESS with
+              a warning naming the residue. A failure to delete something
+              superseded is not a reason to call a completed publication
+              failed - the previous code did exactly that.
 
     The invariant behind all of it: the tracked lock must never describe a tree
-    that is not the one on disk, in either direction.
+    that is not the published one, in either direction.
     """
+    previous = fx.resolve_current(out_dir)
     stamp = f"{time.time_ns()}-{os.getpid()}"
-    retired = out_dir.parent / f".{out_dir.name}.retired.{stamp}"
 
-    # STEP 4 - keep the old tree, do not delete it.
-    had_previous = out_dir.exists()
-    if had_previous:
-        try:
-            out_dir.rename(retired)
-        except OSError as error:
-            fail(
-                f"could not set the previous tree aside ({error}). Nothing was "
-                f"changed: {out_dir} and the lock are as they were.",
-                code=2,
-            )
-
-    # STEP 5 - publish.
+    # STEP 4 - the publication itself.
     try:
-        staging.rename(out_dir)
+        point_current_at(out_dir, name, f"{stamp}-publish")
     except OSError as error:
-        if had_previous:
-            retired.rename(out_dir)
         fail(
-            f"could not publish the new tree ({error}). The previous tree has been "
-            f"restored to {out_dir} and the lock is untouched.",
+            f"could not publish ({error}). Nothing changed: {out_dir / fx.CURRENT_LINK}"
+            f" and the lock are as they were. The validated new generation is on disk "
+            f"at {generations / name}.",
             code=2,
         )
 
-    # STEP 6 - record it.
+    # STEP 5 - record it. ONLY the write-and-replace is inside the try, and
+    # commit_lock deliberately prints nothing: the previous version printed its
+    # success line inside the guarded block, so an EPIPE or ENOSPC on stdout
+    # was caught as "the lock could not be written" and triggered a rollback
+    # that reported the opposite of what had actually happened.
     if pending is not None:
         try:
             commit_lock(repo, pending)
         except OSError as error:
-            quarantine = out_dir.parent / f".{out_dir.name}.quarantine.{stamp}"
-            out_dir.rename(quarantine)
-            if had_previous:
-                retired.rename(out_dir)
-            fail(
-                f"the tree was published but the lock could not be written "
-                f"({error}), which would leave a tree no committed lock describes.\n"
-                f"  Rolled back. The new tree is preserved at: {quarantine}\n"
-                + (
-                    f"  The previous tree has been restored to: {out_dir}\n"
-                    if had_previous
-                    else f"  There was no previous tree, so {out_dir} is now absent.\n"
+            # The message is computed from what the rollback ACTUALLY did.
+            try:
+                rolled_back = restore_current(
+                    out_dir, previous, name, f"{stamp}-rollback"
                 )
-                + "  The committed lock is unchanged. Fix the permissions on "
-                f"{fx.lock_path(repo)} and rerun; the quarantined tree is then "
-                "safe to delete.",
+            except OSError as rollback_error:
+                rolled_back = (
+                    f"the rollback ALSO failed ({rollback_error}), so "
+                    f"{out_dir / fx.CURRENT_LINK} may still point at the new "
+                    "generation while the lock does not describe it - fix this by hand"
+                )
+            fail(
+                f"the tree was published but the lock could not be written ({error}), "
+                "which would leave a published tree no committed lock describes.\n"
+                f"  {rolled_back}\n"
+                f"  The committed lock is unchanged. The new generation is on disk at "
+                f"{generations / name}.\n"
+                f"  Fix the permissions on {fx.lock_path(repo)} and rerun.",
                 code=2,
             )
+        note(
+            f"gen-fixtures: rewrote {fx.lock_path(repo)} - commit it as a reviewed diff"
+        )
 
-    # STEP 7 - and only now is the old tree expendable.
-    if had_previous:
-        safe_rmtree(retired, "retired tree")
+    # STEP 6/7 - published; from here nothing may turn this into a failure.
+    keep = {name} | ({previous.name} if previous is not None else set())
+    collect_generations(generations, keep)
+    return generations / name
 
 
-def warn_about_stranded_trees(out_dir: Path) -> None:
-    """Name any tree a crash stranded, and say how to get it back.
+def point_current_at(out_dir: Path, name: str, stamp: str) -> None:
+    """Make `current` name `generations/<name>` in one atomic step.
 
-    Accepted residual: a process killed between the two renames in publish()
-    leaves the previous tree under `.<name>.retired.<pid>` and no `out_dir`.
-    Nothing is lost, but only if the operator is told where it went - an
-    unexplained `.retired.12345` directory reads as junk and gets deleted.
+    A symlink cannot be retargeted in place, so a uniquely named one is created
+    beside it and os.replace'd over it. os.replace on a symlink replaces the
+    LINK, never what it points at, and is atomic - which is the whole reason
+    the publication model changed: readers see the old generation or the new
+    one, never a directory mid-rename and never a missing one.
     """
-    stranded = sorted(out_dir.parent.glob(f".{out_dir.name}.retired.*"))
-    if not stranded:
-        return
-    print(
-        "gen-fixtures: NOTE - a previous run was interrupted mid-publication and "
-        f"left {[str(p) for p in stranded]}.\n"
-        "  Nothing is lost. This run rebuilds the tree from scratch, after which "
-        "they are safe to delete;\n"
-        f"  to restore one instead, stop and run: mv {stranded[0]} {out_dir}",
-        flush=True,
+    link = out_dir / fx.CURRENT_LINK
+    temporary = out_dir / f".{fx.CURRENT_LINK}.{stamp}"
+    os.symlink(fx.generation_link_target(name), temporary)
+    try:
+        os.replace(temporary, link)
+    except OSError:
+        # Nothing collects the publication root itself (collect_generations
+        # only scans generations/), so a leaked temporary would sit there
+        # forever contradicting the caller's "nothing changed" message.
+        with contextlib.suppress(OSError):
+            os.unlink(temporary)
+        raise
+
+
+def restore_current(out_dir: Path, previous: Path | None, name: str, stamp: str) -> str:
+    """Undo a flip. Returns what it ACTUALLY did, for the caller's message.
+
+    The caller must not describe the end state itself: the claim "the new
+    generation is inert" is only true if this returned, and stitching it into
+    the message unconditionally is how a rollback that failed still gets
+    reported as one that worked.
+
+    `name` is needed for the case the adopt path makes routine: rebuilding an
+    unchanged workload produces the generation that is ALREADY current, so
+    `previous.name == name` and the flip was a no-op. Rolling back then leaves
+    that generation published, and calling it inert - as this did - describes
+    the opposite of the disk. Nothing is wrong in that state; the report was.
+    """
+    link = out_dir / fx.CURRENT_LINK
+    if previous is None:
+        os.unlink(link)
+        return (
+            f"Rolled back: nothing had been published before, so {link} was removed "
+            "and the new generation is inert."
+        )
+    point_current_at(out_dir, previous.name, stamp)
+    if previous.name == name:
+        return (
+            f"Nothing to roll back: {link} already pointed at {previous.name}, which "
+            "is the generation this run rebuilt, so it was and still is the published "
+            "one. Only the lock write failed."
+        )
+    return (
+        f"Rolled back: {link} points at {previous.name} again, so the new generation "
+        "is inert."
     )
+
+
+def collect_generations(generations: Path, keep: set[str]) -> None:
+    """Delete superseded generations. Never fatal, never touches `keep`.
+
+    Two are kept: the one just published and the one it replaced. That buys a
+    reader ONE generation of lag - it goes on reading a complete, immutable
+    tree across a republication rather than racing a rename - and it makes
+    reverting a publication a single symlink flip. Be exact about the limit:
+    this is not a lease. A reader that resolved `current` and then idled
+    through TWO further publications has its generation collected underneath
+    it. Unbounded retention would be the worse trade for a 110 MiB fixture, so
+    the contract for long-lived consumers is stated instead (TESTING.md): hold
+    the directory open and re-resolve `current` on ENOENT.
+
+    Anything else under generations/ is collectable: an older generation, or a
+    build directory a killed run left behind. Deletion goes through
+    purge_marked_dir, so an unmarked directory that appears here is left alone
+    and named instead of removed.
+    """
+    left = []
+    try:
+        candidates = sorted(p.name for p in generations.iterdir())
+    except OSError as error:  # pragma: no cover - the directory just worked
+        note(
+            f"gen-fixtures: WARNING - published, but could not list {generations} "
+            f"to collect superseded generations: {error}",
+            sys.stderr,
+        )
+        return
+    for candidate in candidates:
+        if candidate in keep:
+            continue
+        try:
+            refusal = purge_marked_dir(generations, candidate)
+        except Exception as error:  # noqa: BLE001 - post-commit, see docstring
+            refusal = f"{error}"
+        if refusal is not None:
+            left.append(f"{generations / candidate} ({refusal})")
+    if left:
+        # SUCCESS with a warning, deliberately. The tree and the lock are both
+        # committed at this point; reporting failure because some superseded
+        # bytes could not be removed would describe a state that did not happen.
+        note(
+            "gen-fixtures: WARNING - published successfully, but these superseded "
+            "directories could not be removed and are safe to delete by hand:\n  - "
+            + "\n  - ".join(left),
+            sys.stderr,
+        )
 
 
 # The fields that say what a payload IS, for the purpose of deciding whether
@@ -750,7 +1178,10 @@ def prepare_lock(repo: Path, manifest: dict, retire_baseline: bool) -> dict:
         },
     }
     if lock_file.is_file():
-        old = json.loads(lock_file.read_text())
+        # Read through load_lock, not json.loads: a lock whose schema this code
+        # does not understand must not be silently compared field-by-field and
+        # then overwritten. It is an environment error (LockError -> exit 2).
+        old = fx.load_lock(repo)
         same_version = old.get("workload_version") == new["workload_version"]
         # Compared on MATERIAL fields only - the bytes a measurement was taken
         # against. Adding a field to this file's schema is not a baseline
@@ -790,12 +1221,26 @@ def commit_lock(repo: Path, new: dict) -> None:
 
     Atomic: a lock truncated by an interrupted run would leave the repository
     with no valid record of the frozen workload at all.
+
+    Prints NOTHING, and that is load-bearing rather than a style choice. This
+    function is called inside the caller's `except OSError` guard, so anything
+    here that can raise OSError after the os.replace has already succeeded gets
+    reported as "the lock could not be written" and rolled back - which is the
+    exact opposite of the truth. Writing to stdout can raise OSError (EPIPE,
+    ENOSPC), so the success line belongs to the caller, after the guard.
     """
     lock_file = fx.lock_path(repo)
     temporary = lock_file.with_suffix(f".tmp.{os.getpid()}")
-    temporary.write_text(json.dumps(new, indent=2, sort_keys=True) + "\n")
-    os.replace(temporary, lock_file)
-    print(f"gen-fixtures: rewrote {lock_file} - commit it as a reviewed diff")
+    try:
+        temporary.write_text(json.dumps(new, indent=2, sort_keys=True) + "\n")
+        os.replace(temporary, lock_file)
+    except OSError:
+        # Leaving a half-written temporary beside the tracked lock would be its
+        # own small mess. Suppressed because the original failure is what the
+        # caller must see and act on.
+        with contextlib.suppress(OSError):
+            temporary.unlink()
+        raise
 
 
 def write_manifest(
@@ -849,7 +1294,8 @@ def main() -> int:
         "--out",
         type=Path,
         default=fx.repo_root() / "fixtures" / "out",
-        help="directory to (re)generate; wiped first",
+        help="publication root: generations land in <dir>/generations and "
+        "<dir>/current is flipped to the new one",
     )
     parser.add_argument(
         "--large",

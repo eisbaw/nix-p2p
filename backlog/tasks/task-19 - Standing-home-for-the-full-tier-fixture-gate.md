@@ -4,6 +4,7 @@ title: Standing home for the full-tier fixture gate
 status: To Do
 assignee: []
 created_date: '2026-08-08 00:28'
+updated_date: '2026-08-08 02:01'
 labels:
   - deferred-finding
 dependencies: []
@@ -20,3 +21,9 @@ Likely resolution: task-5's e2e harness already needs the full tier (it serves f
 
 Do not resolve by weakening either gate or by folding the 110 MiB payload into just test - the fast loop staying fast is deliberate.
 <!-- SECTION:DESCRIPTION:END -->
+
+## Implementation Notes
+
+<!-- SECTION:NOTES:BEGIN -->
+forward-carried from task-3 round 5: the fixture tree is now published as an immutable generation behind a symlink, so every path above that starts fixtures/out/ gains one level: fixtures/out/current/cache, fixtures/out/current/manifest.json, fixtures/out/current/test-key.pub. Resolve through fixtures/out/current (never name a generation directly); it is a relative symlink to generations/gen-<manifest-sha>, and the generation it points at is immutable, so a consumer that resolves it once cannot have the tree change underneath it. Retention is two generations, not a lease: re-resolve on ENOENT if you hold it across repeated regenerations.
+<!-- SECTION:NOTES:END -->

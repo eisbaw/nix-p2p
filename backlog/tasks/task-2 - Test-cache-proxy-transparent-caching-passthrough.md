@@ -4,7 +4,7 @@ title: 'Test cache-proxy: transparent caching passthrough'
 status: To Do
 assignee: []
 created_date: '2026-08-07 21:55'
-updated_date: '2026-08-08 00:29'
+updated_date: '2026-08-08 02:01'
 labels: []
 dependencies:
   - TASK-1
@@ -40,4 +40,6 @@ HARD CONSTRAINT: no Rust source may reference fixtures/out. 'just lint' runs 'ch
 Dev shell now exports NIX_P2P_NIX (pinned nix 2.34.8) and NIX_P2P_PYTHON (python with cryptography); the Justfile '_python' recipe guards both. PYTHONDONTWRITEBYTECODE=1 keeps scripts/__pycache__ from appearing.
 
 forward-carried from task-3 round 2 (9dba842): the source guard moved to scripts/check-source-guard.py and now runs as a nix flake check as well as in 'just lint'. Needles widened: any .rs containing bare 'fixtures/' OR 'NIX_P2P_' fails. Both are unavailable inside a nix build sandbox, which is why cargo-side tests must not reach for them.
+
+forward-carried from task-3 round 5: the fixture tree is now published as an immutable generation behind a symlink, so every path above that starts fixtures/out/ gains one level: fixtures/out/current/cache, fixtures/out/current/manifest.json, fixtures/out/current/test-key.pub. Resolve through fixtures/out/current (never name a generation directly); it is a relative symlink to generations/gen-<manifest-sha>, and the generation it points at is immutable, so a consumer that resolves it once cannot have the tree change underneath it. Retention is two generations, not a lease: re-resolve on ENOENT if you hold it across repeated regenerations.
 <!-- SECTION:NOTES:END -->

@@ -19,8 +19,9 @@ __pycache__/
 # Generated fixture cache: NAR payloads (up to 110 MiB), narinfos, and the
 # derived test signing key. Deliberately not committed - determinism plus
 # pinning to flake.lock is what makes the workload reproducible, so the bytes
-# are an output, not an input. `just fixtures` recreates them.
+# are an output, not an input. `just fixtures` recreates them. Holds the
+# immutable generations and the `current` symlink that publishes one of them.
 /fixtures/out/
-# Staging / retired trees from an interrupted or concurrent regeneration.
+# The publication flock, taken beside the root it serialises.
 /fixtures/.out.*
 

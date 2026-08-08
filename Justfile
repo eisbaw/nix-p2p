@@ -112,10 +112,12 @@ fixtures-verify-rebuild: _python
     "${NIX_P2P_PYTHON}/bin/python3" scripts/check-rebuild.py
 
 # A Nix binary cache is static files, so any file server does; the containers
-# in task-5 serve the same tree their own way.
+# in task-5 serve the same tree their own way. Served through `current`, the
+# published-generation symlink every consumer resolves - never a generation
+# directly, which would go stale the moment the fixture is regenerated.
 # Serve the fixture cache as a mock upstream on 127.0.0.1.
 fixtures-serve port="8080": _python
-    "${NIX_P2P_PYTHON}/bin/python3" -m http.server --bind 127.0.0.1 --directory fixtures/out/cache {{ port }}
+    "${NIX_P2P_PYTHON}/bin/python3" -m http.server --bind 127.0.0.1 --directory fixtures/out/current/cache {{ port }}
 
 # Apply rustfmt in place; `just lint` is what enforces it.
 fmt: _toolchain
