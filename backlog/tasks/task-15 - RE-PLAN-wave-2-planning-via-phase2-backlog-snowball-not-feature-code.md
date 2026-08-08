@@ -4,7 +4,7 @@ title: 'RE-PLAN: wave 2 planning via phase2-backlog-snowball (not feature code)'
 status: To Do
 assignee: []
 created_date: '2026-08-07 21:56'
-updated_date: '2026-08-07 22:22'
+updated_date: '2026-08-08 08:28'
 labels:
   - replan
 dependencies:
@@ -32,4 +32,6 @@ Re-plan task - not feature code. Re-invoke phase2-backlog-snowball with: the PRD
 Owner requirement added post-review: wave-2 planning must include peer-count scale sweeps using the task-18 S5 machinery - real sweeps at 1..30 peers, regression-fit extrapolation to 100s/1000s for latency and RAM, with S5 honesty limits (resource laws only, not emergent DHT/gossip effects). See TESTING.md S5 and the not-grounded list.
 
 Owner standing goal (2026-08-08): implement the entire backlog; modular crates composed together; first simple full-NAR decentralized solution, then ca-chunked (Candidate C); iroh is first-priority transport, and wave-2 planning should design the NarSource/transport seam so OTHER protocols (e.g. BitTorrent) can slot in later without a network fork - transport pluggability joins the claim-schema freeze discussion.
+
+forward-carried from task-4 seam fix: the NarSource seam is NarKey{SignedNarHash,UpstreamPath} with a token->NarHash correlation catalog populated at narinfo-serve time. Wave-2 iroh NarSource keys on NarKey::SignedNarHash via the claims index; the correlation catalog is the seed of the PRD 'learn NarHash at narinfo time' prefetch. Plan the claims-index lookup to consume NarKey::SignedNarHash.
 <!-- SECTION:NOTES:END -->

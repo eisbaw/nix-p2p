@@ -6,7 +6,7 @@ title: >-
 status: Done
 assignee: []
 created_date: '2026-08-07 21:55'
-updated_date: '2026-08-08 08:18'
+updated_date: '2026-08-08 08:28'
 labels: []
 dependencies:
   - TASK-1
@@ -66,4 +66,6 @@ FORWARD-CARRY:
 - task-5 (containers): run the built binary `daemon --listen ADDR --upstream URL [--store-dir --priority --want-mass-query]` (.#daemon /bin/daemon). Fault-loop pattern reusable: daemon -> testproxy(bin) -> mock; POST /__testproxy/faults?... Re-assert S1 byte-identity + S2 fallback through the real nix-daemon enforcement path (container). NOTE nix build .#daemon does NOT run tests (crane buildPackage builds --release only); container CI must run `just test` / `nix flake check` inside nix develop.
 - task-8 (disk cache): layer at the NarinfoSource seam - wrap UpstreamHttp in a CachingNarinfoSource (impl NarinfoSource, consult disk then delegate) and swap App.narinfo (Arc<dyn NarinfoSource>). rewrite::apply is the wave-2 transport-rewrite seam (allowlist empty now).
 - task-9 (measurement): daemon self-counters slot into server::handle / UpstreamHttp dispatch. Measurement READS but does NOT TRUST them (testproxy byte counters are ground truth).
+
+Seam re-freeze (codex cadence NO-GO, orchestrator-adjudicated blocker): NarLocator(String) carried a URL token, not the signed NarHash - a wave-2 p2p NarSource keyed on a claims index would have no lookup key, and the seam test proved DI not URL-independence. Fix: typed enum NarKey{SignedNarHash(NarHash), UpstreamPath(token)}; correlate token->NarHash at narinfo-serve time (PRD prefetch design, minimal in-memory map) so the NORMAL nar path carries the signed NarHash through the seam; UpstreamPath only for un-correlated cold-start fallback; test must prove a URL-less p2p-style fake resolves the exact NarHash. This is the freeze that lets wave-2 swap iroh without touching the HTTP layer.
 <!-- SECTION:NOTES:END -->
