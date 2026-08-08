@@ -133,7 +133,7 @@ Measurement discipline (S3/S4 are decision inputs, so extra rigor):
   and the daemon's self-reported counters must agree within a stated
   tolerance (the product is measured, not trusted).
   The frozen doc is `scripts/MEASUREMENT_COUNTING_RULE.md` (counting-rule
-  version **`net-upstream-egress-v1`**); its executable form is
+  version **`net-upstream-egress-v2`**); its executable form is
   `scripts/measure.py` (`just measure`, task-9). Egress ground truth is the
   testproxy `bytes_sent` (body bytes) at the cache boundary; the unit is
   **compressed on-wire bytes (`file_size`), never `NarSize`**; truncated and

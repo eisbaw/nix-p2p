@@ -1966,21 +1966,27 @@ SCENARIOS = [
 # ---- preflight, image, runner ----------------------------------------------
 
 
-def preflight_gate() -> None:
+def preflight_gate(out_root: Path | None = None) -> None:
     """Run the fail-closed fixture gate BEFORE serving anything (round-2 deep-
     gate finding: never serve an unverified tree). --skip-determinism because
     the blob/sig/bite verification is what "unverified tree" means here;
     regeneration determinism is separately gated by `just fixtures-large`, which
-    `just e2e` depends on."""
+    `just e2e` depends on.
+
+    `out_root` MUST be the SAME publication root the caller then MEASURES/SERVES:
+    a report that verifies the default tree but measures a custom `--out` tree is
+    a provenance lie (codex finding). When given, it is threaded to
+    `check-fixtures --out` so the VERIFIED tree is the MEASURED tree."""
     script = Path(__file__).resolve().parent / "check-fixtures.py"
-    result = subprocess.run(
-        [sys.executable, str(script), "--require-tier", "full", "--skip-determinism"],
-        check=False,
-    )
+    argv = [sys.executable, str(script), "--require-tier", "full", "--skip-determinism"]
+    if out_root is not None:
+        argv += ["--out", str(out_root)]
+    result = subprocess.run(argv, check=False)
     if result.returncode != 0:
         die(
-            "check-fixtures gate failed - refusing to serve an unverified fixture "
-            f"tree (exit {result.returncode}). Run `just fixtures-large`."
+            "check-fixtures gate failed - refusing to serve/measure an unverified "
+            f"fixture tree at {out_root or 'fixtures/out'} (exit {result.returncode}). "
+            "Run `just fixtures-large`."
         )
 
 

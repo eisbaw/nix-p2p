@@ -17,7 +17,17 @@ The measurement instrument is `scripts/measure.py` (`just measure`); it emits a
 machine-readable JSON report whose `counting_rule` block quotes this file's
 version and the definition below.
 
-Counting-rule version: **`net-upstream-egress-v1`**.
+Counting-rule version: **`net-upstream-egress-v2`**.
+
+**v1 → v2 (codex re-gate, 2026-08-08 — no baseline recorded yet, so this is a
+correction, not a retirement):** v1 required *exactly one* full NAR crossing per
+target and marked a run INVALID otherwise. But a **wave-2 peer hit produces ZERO
+testproxy crossings** — the payload came from a peer, not the cache — which is
+*precisely the offload event this instrument exists to measure*. v1 would have
+rejected every real-offload run and, with `--runs > 10`, could have kept enough
+no-offload runs to report a misleading ~0 offload. v2 fixes this: **zero-or-one**
+full crossing per target, a zero-crossing being VALID *iff* the client
+independently confirms delivery (see §3/§4).
 
 ---
 
@@ -93,35 +103,56 @@ the decision metric. Two consequences are frozen here:
 
 ## 3. What "net upstream egress" EXCLUDES
 
+A **zero-crossing is NOT an exclusion — it is the offload signal.** A target that
+never crosses the cache boundary because a peer served it contributes **0** to
+egress, and that is the whole point of the measurement. It is admitted (VALID)
+only when the client independently confirms it was delivered (§4); a target that
+neither crossed nor was delivered is a real **miss**, and *that* is INVALID.
+
 | Excluded | Rule and rationale |
 |---|---|
-| **Truncated transfers (wave 1)** | A NAR record with `0 < bytes_sent < file_size` (a short body under a full `Content-Length`) is **not a delivered payload**. **Wave 1 has no hedging and no retries by design** (single substituter, `max-substitution-jobs=1`, no faults in the honest scenario), so *any* such record is a defect: it is excluded from the egress sum and makes the whole **run INVALID** (§4) — never silently summed as partial egress, never counted as 0. Discriminator: `bytes_sent < file_size` on a `kind == "nar"` record (task-7). |
-| **Retried / duplicate crossings** | When a transfer is retried (e.g. a killed daemon hop plus a fallback re-fetch), the SAME payload can cross the boundary more than once. Counting every crossing double-counts egress and corrupts the with/without-daemon delta. §4 enforces **exactly one full NAR record per payload** (a LIST, not a set, so a duplicate *full* crossing is caught, not just a truncated one) — any extra or duplicate NAR record makes the run INVALID. |
-| **Hedge losers — UNRESOLVED, deferred to the wave-2 freeze (do NOT read this row as settled)** | A hedge race issues a duplicate request and aborts the loser; the loser's bytes *do* cross the boundary and are real cost (PRD: *duplicated pulls make egress worse*). This creates a **direct tension with the wave-1 rule above**: a hedge loser is a partial NAR (`bytes_sent < file_size`), which is byte-for-byte indistinguishable from a truncated primary under the current discriminator, yet one must be COUNTED (hedge-loser waste) and the other EXCLUDED (truncated primary). **Wave 1 has zero hedging, so the tension does not arise and the wave-1 rule stands.** When hedging is introduced, this row MUST be resolved at that freeze by: (a) attributing exactly one *primary/winning* full transfer per payload for the offload metric, and (b) counting hedge-loser bytes into a **separate `hedge_waste` channel** (not the payload metric), discriminated by request provenance (which the testproxy log must then carry), NOT by byte count. Until then, `net-upstream-egress-v1` is defined only for the no-hedge regime. |
+| **Truncated transfers** | A NAR record with `0 < bytes_sent < file_size` (a short body under a full `Content-Length`) is **not a delivered payload**. In the honest measurement scenario (no faults, single substituter, `max-substitution-jobs=1`) any such record is a defect: excluded from the egress sum, and the whole **run is INVALID** (§4) — never silently summed as partial egress, never counted as 0. Discriminator: `bytes_sent < file_size` on a `kind == "nar"` record (task-7). |
+| **Retried / duplicate crossings** | A retry (e.g. a killed daemon hop plus a fallback re-fetch) can make the SAME payload cross the boundary more than once; counting every crossing double-counts egress. §4 admits **zero-or-one** full crossing per target (a per-target COUNT, so a *second* full crossing is caught) — a duplicate/extra full crossing makes the run INVALID. Note the asymmetry with the zero case: zero-or-one is fine, **two is not**. |
+| **Hedge losers — UNRESOLVED, deferred to the wave-2 freeze (do NOT read this row as settled)** | A hedge race issues a duplicate request and aborts the loser; the loser's bytes *do* cross the boundary and are real cost (PRD: *duplicated pulls make egress worse*). This creates a **direct tension with the wave-1 rule above**: a hedge loser is a partial NAR (`bytes_sent < file_size`), which is byte-for-byte indistinguishable from a truncated primary under the current discriminator, yet one must be COUNTED (hedge-loser waste) and the other EXCLUDED (truncated primary). **Wave 1 has zero hedging, so the tension does not arise and the wave-1 rule stands.** When hedging is introduced, this row MUST be resolved at that freeze by: (a) attributing exactly one *primary/winning* full transfer per payload for the offload metric, and (b) counting hedge-loser bytes into a **separate `hedge_waste` channel** (not the payload metric), discriminated by request provenance (which the testproxy log must then carry), NOT by byte count. Until then, `net-upstream-egress-v2` is defined only for the no-hedge regime — v2 fixed the zero-crossing (peer offload) case but does NOT resolve the partial-crossing (hedge loser vs truncated primary) ambiguity. |
 | **The signing key / control-plane bytes** | `__testproxy/*` admin traffic is never served as a cache response and is not in the request log; it cannot enter the sum. |
 
 ## 4. Run validity (fail-closed)
 
 A single run is one scripted workload execution (`nix-store --realise` of the
-fixture closure). A run is **VALID** iff *all* of:
+fixture closure). The validator is the pure function `classify_run` in
+`scripts/measure.py` (unit-tested via `just measure --self-test`). A run is
+**VALID** iff *all* of:
 
 1. the client exited 0 (the workload actually completed);
-2. no truncated NAR: every `kind == "nar"` record matching a requested payload
-   has `bytes_sent == file_size`;
-3. **exactly one full NAR record per payload** — the count of matching NAR
-   records equals the payload count AND each payload appears exactly once at its
-   full size (tracked as a LIST, so a *duplicate full* crossing is caught, not
-   just a truncated one; this is what excludes retried/duplicate crossings);
-4. **accounting closes**: `egress_total == nar + narinfo + cache_info + other`,
-   and `other == 0` (no unexpected `Kind::Other` passthrough traffic). A non-zero
-   `other` during a measurement run means an un-named channel is contributing
-   bytes to the headline total — the run is INVALID until it is explained.
+2. **no record is missing `bytes_sent`** — unknown is not 0; an absent counter
+   means egress is undeterminable (fail-closed);
+3. no truncated NAR: no `kind == "nar"` record matching a requested payload has
+   `0 < bytes_sent < file_size`;
+4. **zero-or-one full NAR crossing per target**, and every target is *accounted
+   for*:
+   - a target with **one** full crossing (`bytes_sent == file_size`) is the
+     normal cache-served delivery;
+   - a target with **zero** crossings is VALID **only** when the client
+     independently confirms delivery — `nix path-info` reports its NarHash, i.e.
+     nix realised/imported it (a wave-2 **peer hit**, or an already-in-store
+     target). Its bytes are correctly counted as **0 egress** (the offload);
+   - a target with **zero** crossings **and no client delivery** is a real
+     **miss** → INVALID (not offload);
+   - a target with **two or more** full crossings is a retry/duplicate →
+     INVALID (would double-count egress);
+5. **no un-named channel**: `other == 0` (no `Kind::Other` passthrough body
+   during a measurement run);
+6. **egress cross-check**: the `proxy_log`-summed `bytes_sent` equals the
+   `proxy_stats` endpoint's independently-derived `bytes_sent`. This is a real
+   falsifiable check (the two are computed separately — our Python parse vs the
+   proxy's Rust `Log::stats`), not the v1 tautology (`total == Σ buckets`, which
+   could never fail); a mismatch fails the run closed.
 
 If a run cannot have its egress determined — a counter missing, a transfer
-truncated, a duplicate crossing, an un-named channel, the client failed — that
-run is **INVALID**, excluded from the sample, and the reason is logged in the
-report's `invalid_runs` list. An invalid run is **never** counted as 0 egress and
-**never** counted as success.
+truncated, a duplicate crossing, a real miss, an un-named channel, a log/stats
+mismatch, the client failed — that run is **INVALID**, excluded from the sample,
+and the reason is logged in the report's `invalid_runs` list. An invalid run is
+**never** counted as 0 egress and **never** counted as success.
 
 **Arm usability threshold:** an arm needs at least `BASELINE_MIN_VALID_RUNS = 10`
 **valid** runs (§5) to be `usable`. Requesting `--runs < 10` (a dev smoke)
@@ -176,7 +207,7 @@ Every report embeds, so a number is never quoted against an unverified tree:
 - the fixture lock **public key** and per-payload **hashes**
   (`file_hash`, `nar_hash`, `store_path`) read from the resolved immutable
   generation's `lock.json`.
-- this file's `counting_rule_version` (`net-upstream-egress-v1`).
+- this file's `counting_rule_version` (`net-upstream-egress-v2`).
 - the fixture `tier` (`full` is required — the 110 MiB payload must be present).
 
 `just measure` runs the fail-closed `check-fixtures.py` gate **before** serving

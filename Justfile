@@ -86,9 +86,13 @@ independence: _toolchain
 # Depends on the fast fixture tier because the signing and tamper assertions
 # live in scripts/, not in cargo (rationale: scripts/check-fixtures.py).
 # Unit and integration tests plus the fixture gate (in-process, no containers).
+# measure.py --self-test unit-tests the egress validator (classify_run) and the
+# provenance fail-closed path with synthetic inputs - no containers, so it runs in
+# the fast tier alongside the fixture gate.
 test: _toolchain _python fixtures
     cargo test --locked --workspace
     "${NIX_P2P_PYTHON}/bin/python3" scripts/check-fixtures.py
+    "${NIX_P2P_PYTHON}/bin/python3" scripts/measure.py --self-test
 
 # Regenerate the signed fixture cache - fast tier (none/xz/zstd, <1 MiB).
 fixtures: _python

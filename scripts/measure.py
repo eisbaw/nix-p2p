@@ -5,7 +5,7 @@ Runs an identical scripted workload with-daemon vs without-daemon over the
 task-5 container harness (Pod seam) and emits a MACHINE-READABLE JSON report:
 net upstream egress (both arms), p95 wall-clock (both arms), and the narinfo->nar
 gap histogram. The counting rule that freezes the J2 baseline lives next to this
-file in `MEASUREMENT_COUNTING_RULE.md` (version `net-upstream-egress-v1`); this
+file in `MEASUREMENT_COUNTING_RULE.md` (version `net-upstream-egress-v2`); this
 script is its executable form and every report quotes it.
 
 GROUND TRUTH is the testproxy's own byte counters (`Pod.proxy_stats` /
@@ -19,8 +19,8 @@ never counted as 0 or as success.
 
 Every oracle bites by MUTATION: each bite runs a control (green) and a mutation
 that must make it RED, and asserts the flip. A metric that reports plausible-but-
-unfalsifiable numbers is the worst outcome for an irreversible baseline, so the
-instrument refuses to pass unless each bite is shown able to fail.
+unfalsifiable numbers is the worst outcome for the cross-wave comparison basis, so
+the instrument refuses to pass unless each bite is shown able to fail.
 
 WAVE-1 HONESTY: there is no p2p, so the daemon-on and daemon-off arms fetch
 identical bytes and the measured offload is ~0 BY CONSTRUCTION. This validates
@@ -46,7 +46,11 @@ import fixturelib as fx
 
 # ---- frozen constants (mirror MEASUREMENT_COUNTING_RULE.md) -----------------
 
-COUNTING_RULE_VERSION = "net-upstream-egress-v1"
+# v2 (codex re-gate): the validity rule allows ZERO-or-one full NAR crossing per
+# target - a ZERO-crossing is the wave-2 offload event (a peer served the payload,
+# so the cache saw nothing), VALID iff the client independently confirms delivery.
+# v1 required exactly one crossing and would have REJECTED every real-offload run.
+COUNTING_RULE_VERSION = "net-upstream-egress-v2"
 COUNTING_RULE_DOC = "scripts/MEASUREMENT_COUNTING_RULE.md"
 
 # A baseline needs at least this many VALID runs per arm (counting rule SECTION 5,
@@ -167,40 +171,56 @@ def _url_sizes(fixtures, attrs) -> dict[str, int]:
     }
 
 
-def measure_one_run(pod, substituter: str, keys: str, fixtures, attrs) -> RunResult:
-    """One workload execution. Resets the proxy COUNTERS (not its disk cache) so
-    each run's egress is the full workload; times the client; then derives egress
-    and validity from the proxy log (the single source of truth)."""
-    url_sizes = _url_sizes(fixtures, attrs)
-    targets = [fixtures.store_path(a) for a in attrs]
-    pod.proxy_reset()
-    started = time.perf_counter()
-    result = pod.client_run(targets, substituter, keys)
-    wall_s = time.perf_counter() - started
+def classify_run(
+    records: list[dict],
+    url_sizes: dict[str, int],
+    delivered_by_url: dict[str, bool],
+    stats_bytes_sent: int | None,
+    client_exit: int,
+    wall_s: float,
+) -> RunResult:
+    """PURE validity + egress derivation from a proxy log (single source of truth).
+    Extracted from I/O so the validator can be unit-tested with synthetic logs
+    (`--self-test`) - the codex re-gate wants the wave-2 shapes proven directly.
 
-    log = pod.proxy_log()
+    The counting rule (doc SECTION 3/4), v2:
+      * per target: ZERO-OR-ONE full NAR crossing. ZERO is the wave-2 OFFLOAD event
+        (a peer served it, the cache saw nothing) and is VALID *iff* the client
+        independently confirms delivery (`delivered_by_url`); ZERO crossings AND no
+        delivery is a real MISS -> INVALID.
+      * a SECOND full crossing of the same target (retry/duplicate) -> INVALID.
+      * any truncated crossing (0 < bytes_sent < file_size) -> INVALID.
+      * a record MISSING bytes_sent -> INVALID (unknown != 0; fail-closed).
+      * any Kind::Other body during a measurement -> INVALID (un-named channel).
+      * cross-check: the proxy_log byte sum MUST equal the proxy_stats endpoint's
+        independently-derived bytes_sent (a real falsifiable check, not a tautology).
+    """
     egress_total = egress_nar = egress_narinfo = egress_cacheinfo = egress_other = 0
     gaps: list[float] = []
     truncated: list[tuple] = []
-    full_nar_urls: list[str] = []  # LIST not set: a duplicate full crossing must show
-    matched_nar_records = 0  # NAR records that map to a requested payload
+    full_count = {u: 0 for u in url_sizes}
+    missing_bytes = 0
 
-    for record in log:
+    for record in records:
         kind = record.get("kind")
-        sent = int(record.get("bytes_sent", 0))
-        path = record.get("path", "")
+        # Fold-in (codex #3): a missing/absent bytes_sent is a HARD error - unknown
+        # is not 0. Do not sum it; flag the run.
+        raw = record.get("bytes_sent")
+        if raw is None:
+            missing_bytes += 1
+            continue
+        sent = int(raw)
         egress_total += sent
         if kind == "nar":
             egress_nar += sent
             gap = record.get("gap_ms")
             if gap is not None:
                 gaps.append(float(gap))
-            matched = next((u for u in url_sizes if u in path), None)
+            matched = next((u for u in url_sizes if u in record.get("path", "")), None)
             if matched is not None:
-                matched_nar_records += 1
                 size = url_sizes[matched]
                 if sent == size:
-                    full_nar_urls.append(matched)
+                    full_count[matched] += 1
                 elif 0 < sent < size:
                     truncated.append((matched, sent, size))
         elif kind == "narinfo":
@@ -211,31 +231,42 @@ def measure_one_run(pod, substituter: str, keys: str, fixtures, attrs) -> RunRes
             egress_other += sent
 
     reasons: list[str] = []
-    if result.exit_code != 0:
-        reasons.append(f"client exit {result.exit_code}")
+    if client_exit != 0:
+        reasons.append(f"client exit {client_exit}")
+    if missing_bytes:
+        reasons.append(
+            f"{missing_bytes} record(s) missing bytes_sent "
+            "(egress undeterminable; unknown != 0)"
+        )
     if truncated:
         reasons.append(f"truncated NAR (bytes_sent<file_size): {truncated}")
-    # EXACTLY one full NAR per payload - not ">=". A LIST (not a set) catches a
-    # duplicate FULL crossing (a retry/second-substituter/hedge winner whose first
-    # attempt completed), which a set would silently collapse while the egress sum
-    # still double-counts both (counting rule doc SECTION 3 + SECTION 4, exact).
-    if sorted(full_nar_urls) != sorted(url_sizes):
+    duplicates = [u for u, c in full_count.items() if c > 1]
+    if duplicates:
         reasons.append(
-            f"not exactly one full NAR per payload: {sorted(full_nar_urls)} "
-            f"vs {sorted(url_sizes)}"
+            f"duplicate full NAR crossing for {duplicates} (would double-count egress)"
         )
-    if matched_nar_records != len(attrs):
+    # ZERO crossing is VALID only with verified client delivery (a wave-2 peer hit,
+    # or an already-in-store target); ZERO crossing + not delivered = a real miss.
+    missed = [
+        u
+        for u, c in full_count.items()
+        if c == 0 and not delivered_by_url.get(u, False)
+    ]
+    if missed:
         reasons.append(
-            f"{matched_nar_records} NAR records for {len(attrs)} payloads "
-            "(duplicate/retried crossing - would double-count egress)"
+            f"target(s) neither crossed the cache nor delivered to the client "
+            f"(real miss, NOT offload): {missed}"
         )
-    # SECTION 3: the enumerated kinds MUST account for every counted byte, or the
-    # headline total hides an un-named channel. Any Kind::Other body during a
-    # measurement run is unexpected passthrough traffic -> the run is INVALID.
     if egress_other != 0:
         reasons.append(f"unexpected non-payload/metadata egress: {egress_other} bytes")
-    if egress_total != egress_nar + egress_narinfo + egress_cacheinfo + egress_other:
-        reasons.append("egress_total != sum of kind buckets (accounting gap)")
+    # Real cross-check (replaces the v1 tautology): the proxy's OWN stats endpoint
+    # derives bytes_sent from the same log in Rust; a mismatch means our parse and
+    # the proxy disagree - fail closed rather than trust a silently-drifted number.
+    if stats_bytes_sent is not None and egress_total != stats_bytes_sent:
+        reasons.append(
+            f"egress accounting mismatch: proxy_log sum {egress_total} != "
+            f"proxy_stats bytes_sent {stats_bytes_sent}"
+        )
 
     return RunResult(
         valid=not reasons,
@@ -247,7 +278,32 @@ def measure_one_run(pod, substituter: str, keys: str, fixtures, attrs) -> RunRes
         egress_cacheinfo=egress_cacheinfo,
         egress_other=egress_other,
         gap_ms=gaps,
-        client_exit=result.exit_code,
+        client_exit=client_exit,
+    )
+
+
+def measure_one_run(pod, substituter: str, keys: str, fixtures, attrs) -> RunResult:
+    """One workload execution. Resets the proxy COUNTERS (not its disk cache) so
+    each run's egress is the full workload; times the client; then derives egress
+    and validity (via the pure `classify_run`) from the proxy log + stats."""
+    url_sizes = _url_sizes(fixtures, attrs)
+    targets = [fixtures.store_path(a) for a in attrs]
+    pod.proxy_reset()
+    started = time.perf_counter()
+    result = pod.client_run(targets, substituter, keys)
+    wall_s = time.perf_counter() - started
+
+    log = pod.proxy_log()
+    stats_bytes_sent = pod.proxy_stats().get("bytes_sent")
+    # Verified client delivery per target: `nix path-info` reported a NarHash for
+    # the store path, i.e. nix realised/imported it. This is what makes a ZERO
+    # cache-crossing a legitimate OFFLOAD (peer hit) rather than a miss (v2 rule).
+    delivered_by_url = {
+        fixtures.entry(a)["url"]: (result.narhash(fixtures.store_path(a)) is not None)
+        for a in attrs
+    }
+    return classify_run(
+        log, url_sizes, delivered_by_url, stats_bytes_sent, result.exit_code, wall_s
     )
 
 
@@ -765,7 +821,8 @@ def build_report(ctx, fixtures, out_root, runs) -> dict:
             "ground_truth": "testproxy bytes_sent (body bytes); daemon self-report measured, not trusted",
             "unit": "compressed on-wire bytes (file_size), NEVER nar_size",
             "kill_criterion_metric": "payload (NAR) egress - symmetric across arms, not gameable by metadata caching",
-            "excludes": "response headers; truncated transfers; retried/duplicate crossings (run INVALID)",
+            "crossings_per_target": "zero-or-one full NAR crossing; zero is offload, VALID only with verified client delivery",
+            "excludes": "response headers; truncated transfers; duplicate crossings; a real miss (zero crossing + no delivery) is INVALID",
             "baseline_min_valid_runs": BASELINE_MIN_VALID_RUNS,
         },
         "provenance": prov,
@@ -864,6 +921,157 @@ def print_human_summary(report: dict) -> None:
     )
 
 
+# ---- self-test (pure validator + provenance; no containers) -----------------
+
+
+def _rec(kind, path, bytes_sent, gap_ms=None):
+    r = {"kind": kind, "path": path}
+    if bytes_sent is not None:
+        r["bytes_sent"] = bytes_sent
+    if gap_ms is not None:
+        r["gap_ms"] = gap_ms
+    return r
+
+
+def run_self_test() -> int:
+    """Pure unit tests of the v2 validator (the codex re-gate's wave-2 shapes) and
+    the provenance fail-closed fix. No containers, no nix - safe under `just test`.
+    Each check prints PASS/FAIL; returns 0 iff all pass."""
+    import tempfile
+
+    A, B = "nar/aaaa.nar", "nar/bbbb.nar"
+    sizes = {A: 100, B: 200}
+    ok = True
+
+    def check(name, cond, detail=""):
+        nonlocal ok
+        ok = ok and cond
+        print(
+            f"  {'PASS' if cond else 'FAIL'}  {name}"
+            + (f"  [{detail}]" if not cond and detail else "")
+        )
+
+    # 1. clean wave-1: each target crosses once, both delivered.
+    r = classify_run(
+        [_rec("nar", A, 100), _rec("nar", B, 200), _rec("narinfo", "x.narinfo", 10)],
+        sizes,
+        {A: True, B: True},
+        310,
+        0,
+        0.5,
+    )
+    check("clean wave-1 (1 crossing/target, delivered) -> VALID", r.valid, r.reason)
+    check("clean wave-1 egress_nar == 300", r.egress_nar == 300, str(r.egress_nar))
+
+    # 2. WAVE-2 OFFLOAD shape (the codex correctness case): B served by a peer ->
+    #    ZERO proxy crossings for B, but the client delivered it. VALID, and B's
+    #    bytes are NOT counted as egress (that is the offload).
+    r = classify_run(
+        [_rec("nar", A, 100), _rec("narinfo", "x.narinfo", 10)],
+        sizes,
+        {A: True, B: True},
+        110,
+        0,
+        0.5,
+    )
+    check("wave-2 offload (B zero-crossing + delivered) -> VALID", r.valid, r.reason)
+    check(
+        "wave-2 offload counts only A (egress_nar == 100)",
+        r.egress_nar == 100,
+        str(r.egress_nar),
+    )
+
+    # 3. zero-crossing + NOT delivered = a real MISS -> INVALID (the falsifying
+    #    mutation of case 2: flip B's delivery to False).
+    r = classify_run(
+        [_rec("nar", A, 100), _rec("narinfo", "x.narinfo", 10)],
+        sizes,
+        {A: True, B: False},
+        110,
+        0,
+        0.5,
+    )
+    check(
+        "zero-crossing + undelivered (real miss) -> INVALID",
+        not r.valid,
+        "unexpectedly valid",
+    )
+
+    # 4. duplicate FULL crossing of the same target -> INVALID (double-count guard).
+    r = classify_run(
+        [_rec("nar", A, 100), _rec("nar", A, 100), _rec("nar", B, 200)],
+        sizes,
+        {A: True, B: True},
+        400,
+        0,
+        0.5,
+    )
+    check("duplicate full crossing -> INVALID", not r.valid, "unexpectedly valid")
+
+    # 5. truncated crossing -> INVALID.
+    r = classify_run(
+        [_rec("nar", A, 50), _rec("nar", B, 200)],
+        sizes,
+        {A: True, B: True},
+        250,
+        0,
+        0.5,
+    )
+    check("truncated NAR -> INVALID", not r.valid, "unexpectedly valid")
+
+    # 6. missing bytes_sent (unknown != 0) -> INVALID.
+    r = classify_run(
+        [_rec("nar", A, None), _rec("nar", B, 200)],
+        sizes,
+        {A: True, B: True},
+        200,
+        0,
+        0.5,
+    )
+    check("missing bytes_sent -> INVALID", not r.valid, "unexpectedly valid")
+
+    # 7. proxy_log sum != proxy_stats bytes_sent -> INVALID (real cross-check).
+    r = classify_run(
+        [_rec("nar", A, 100), _rec("nar", B, 200)],
+        sizes,
+        {A: True, B: True},
+        999,
+        0,
+        0.5,
+    )
+    check("log-sum != stats bytes_sent -> INVALID", not r.valid, "unexpectedly valid")
+
+    # 8. client exit != 0 -> INVALID even if crossings look right.
+    r = classify_run(
+        [_rec("nar", A, 100), _rec("nar", B, 200)],
+        sizes,
+        {A: True, B: True},
+        300,
+        1,
+        0.5,
+    )
+    check("client exit nonzero -> INVALID", not r.valid, "unexpectedly valid")
+
+    # 9. PROVENANCE fail-closed (codex blocker 2): preflight_gate threaded with an
+    #    unverified --out tree must fail closed (SystemExit nonzero).
+    with tempfile.TemporaryDirectory() as d:
+        empty = Path(d) / "empty-out"
+        empty.mkdir()
+        raised_nonzero = False
+        try:
+            e2e.preflight_gate(empty)
+        except SystemExit as ex:
+            raised_nonzero = (ex.code or 0) != 0
+        check(
+            "preflight_gate(--out unverified tree) -> fail-closed",
+            raised_nonzero,
+            "did not fail closed",
+        )
+
+    print(f"\nmeasure --self-test: {'ALL PASS' if ok else 'FAILURES PRESENT'}")
+    return 0 if ok else 1
+
+
 # ---- main -------------------------------------------------------------------
 
 
@@ -893,10 +1101,21 @@ def main() -> int:
         help="run only the falsifiability bites (skip the slow main arms); for "
         "dev iteration and deep-gate re-checks. Emits no baseline.",
     )
+    parser.add_argument(
+        "--self-test",
+        action="store_true",
+        help="run the pure validator + provenance unit tests (no containers, no "
+        "nix) and exit. Wired into `just test`.",
+    )
     args = parser.parse_args()
 
+    if args.self_test:
+        return run_self_test()
+
     out_root = args.out.resolve()
-    e2e.preflight_gate()  # fail-closed: never measure against an unverified tree
+    # Provenance fail-closed (codex): verify the SAME tree we are about to measure,
+    # not the default one - thread --out into the gate.
+    e2e.preflight_gate(out_root)
     fixtures = e2e.resolve_fixtures(out_root)
     image = e2e.load_image()
     e2e.cleanup_pods()

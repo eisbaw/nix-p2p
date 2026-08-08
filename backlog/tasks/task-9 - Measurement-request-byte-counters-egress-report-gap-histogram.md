@@ -4,7 +4,7 @@ title: 'Measurement: request/byte counters + egress report + gap histogram'
 status: In Progress
 assignee: []
 created_date: '2026-08-07 21:56'
-updated_date: '2026-08-08 13:36'
+updated_date: '2026-08-08 13:59'
 labels:
   - irreversible
 dependencies:
@@ -215,4 +215,36 @@ separately. Re-verified: bites canary + full `just measure --runs 10` green.
 
 IRREVERSIBLE: not marked Done - left In Progress "awaiting deep gate"
 (qa+architect+codex panel per the counting-rule freeze).
+
+CODEX RE-GATE (NO-GO -> fixed, counting-rule v2):
+- BLOCKER 1 (wave-2 offload correctness): the v1 validator required EXACTLY ONE
+  full NAR crossing per target -> it would have marked every real wave-2 offload
+  run INVALID (a peer hit produces ZERO testproxy crossings, which IS the offload).
+  Fixed in classify_run (now a PURE, unit-tested function): per target ZERO-OR-ONE
+  full crossing; a ZERO-crossing is VALID iff the client independently confirms
+  delivery (nix path-info NarHash present = realised/imported, a peer hit) and its
+  bytes count as 0 egress; ZERO + no delivery = real MISS -> INVALID; a SECOND full
+  crossing = duplicate -> INVALID; truncated -> INVALID. Doc bumped v1 -> v2
+  (§1 rationale + §3/§4 rewrite). No baseline recorded yet, so a correction not a
+  retirement.
+- BLOCKER 2 (provenance): preflight_gate() verified the DEFAULT tree while
+  measure --out could measure a DIFFERENT tree. Fixed: --out threaded through
+  e2e.preflight_gate(out_root) -> check-fixtures --out; the verified tree is the
+  measured tree.
+- FOLD-INS: missing bytes_sent is now a HARD ERROR (unknown != 0, invalidates the
+  run); the v1 "accounting closes" tautology (total == Σ buckets) is replaced by a
+  REAL cross-check (proxy_log byte sum == proxy_stats endpoint bytes_sent).
+- Tests: scripts/measure.py --self-test (wired into `just test`, no containers) -
+  11 checks incl the fails-before/passes-after pair (zero-crossing+delivered VALID
+  with offload counted; zero-crossing+undelivered INVALID), duplicate/truncated/
+  missing-bytes/log-vs-stats/client-nonzero INVALID, clean wave-1 VALID, and
+  preflight(--out unverified) fail-closed.
+- Re-verified (per coordinator, no full 10-run rerun): build/lint/fmt/test green
+  (self-test ALL PASS) + `just measure --only-bites` green (four bites re-exercise
+  classify_run end-to-end). Full baseline is task-12's job.
+- Carry to task-12: v2 zero-crossing rule means a wave-2 peer hit shows as a valid
+  0-egress crossing; record egress on egress_payload_nar_bytes; a target that
+  neither crosses nor is client-delivered is a MISS (INVALID), not offload.
+
+Re-parked In Progress awaiting deep gate.
 <!-- SECTION:NOTES:END -->
