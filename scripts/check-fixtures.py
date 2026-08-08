@@ -444,9 +444,20 @@ def tree_digest(root: Path) -> dict[str, str]:
     server deciding a file is unreadable. gen-fixtures now normalises modes
     and mtimes; including them here is what proves the normalisation happened
     rather than assuming it.
+
+    What the mtime component can and cannot catch, so it is not over-read: the
+    generator writes the same fixed mtime into both trees, so comparing them
+    detects EXTERNAL mutation of a published tree, never drift in the
+    generator itself - if normalisation broke, both sides would break
+    identically and still compare equal. The mode component has the same
+    shape. What actually pins the intended values is that they are constants
+    in fixturelib, reviewable in a diff.
     """
     digest = {}
-    for path in sorted(root.rglob("*")):
+    # The ROOT is an entry too. Omitting it meant two trees whose top-level
+    # directory differed (0700 vs 0755) compared equal - the one directory a
+    # consumer must be able to traverse was the one nothing checked.
+    for path in [root, *sorted(root.rglob("*"))]:
         stat = path.lstat()
         if path.is_symlink():
             body = f"symlink:{os.readlink(path)}"
@@ -454,8 +465,10 @@ def tree_digest(root: Path) -> dict[str, str]:
             body = "dir"
         else:
             body = hashlib.sha256(path.read_bytes()).hexdigest()
-        digest[str(path.relative_to(root))] = (
-            f"{body} mode={stat.st_mode & 0o7777:04o} mtime={int(stat.st_mtime)}"
+        digest["." if path == root else str(path.relative_to(root))] = (
+            # Nanoseconds, not int(st_mtime): truncating to seconds made 1.1s
+            # and 1.9s compare equal, so sub-second drift was invisible.
+            f"{body} mode={stat.st_mode & 0o7777:04o} mtime_ns={stat.st_mtime_ns}"
         )
     return digest
 

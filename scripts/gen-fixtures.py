@@ -48,6 +48,7 @@ import os
 import shutil
 import subprocess
 import sys
+import time
 from contextlib import contextmanager
 from pathlib import Path
 
@@ -78,8 +79,22 @@ def plan_for(include_large: bool):
 
 
 def tier_of(attr: str) -> str:
-    """Derived from the plans, never restated. The plans decide what a tier is."""
-    return fx.TIER_FULL if attr in {a for a, _ in LARGE_PLAN} else fx.TIER_FAST
+    """Derived from the plans, never restated. The plans decide what a tier is.
+
+    An attr in neither plan is a hard error rather than a default. Falling back
+    to `fast` is the same fail-open species already fixed twice in this file
+    (an unknown tier excusing a payload from every required set): a payload
+    nobody planned would be silently pinned into the fast tier, and the tier
+    whose gate is supposed to cover it would never know it existed.
+    """
+    if attr in {a for a, _ in LARGE_PLAN}:
+        return fx.TIER_FULL
+    if attr in {a for a, _ in FAST_PLAN}:
+        return fx.TIER_FAST
+    fail(
+        f"payload {attr!r} is in neither FAST_PLAN nor LARGE_PLAN, so which tier "
+        "must contain it is undefined. Add it to a plan; do not let it default."
+    )
 
 
 # Loud enough that nobody mistakes it for real key material, and named once so
@@ -471,70 +486,95 @@ def generate(
             print(f"gen-fixtures: {version} already present at {out_dir} - reused")
             return
 
-        # Built in a private staging directory, VALIDATED there, and only then
-        # published with a rename. Order matters and was wrong once: publishing
-        # first meant a drifted tree replaced a good one and the process still
-        # exited 0, because the comparison against the lock happened afterwards
-        # in a different program. A tree that does not match the pin must never
-        # become the tree on disk.
         staging = out_dir.parent / f".{out_dir.name}.staging.{os.getpid()}"
         # The staging path is derived from a pid, so it is predictable and
         # could already exist as something that is not ours. Same ownership
         # discipline as --out: nothing without our marker is ever deleted.
         safe_rmtree(staging, "staging directory")
         try:
+            # STEP 1: build.
             entries = build_into(staging, repo, secret_line, public_line, include_large)
             manifest = write_manifest(
                 staging, version, public_line, include_large, entries
             )
             fx.normalise_tree(staging, secret_names=frozenset({SECRET_KEY_NAME}))
 
-            # One transaction, in the only safe order. The lock is the record
-            # of what is on disk, so it must never describe a tree that was
-            # not published: previously --write-lock replaced the tracked lock
-            # BEFORE publishing, and a publication failure restored the old
-            # tree while leaving the new lock behind - a repository whose lock
-            # and tree disagreed, with the disagreement committed.
-            #
-            # Anything that can REFUSE runs before publication; only the file
-            # write happens after it.
-            if write_lock:
-                pending = prepare_lock(repo, manifest, retire_baseline)
-            else:
-                pending = None
+            # STEP 2: validate the STAGED tree, before anything on disk moves.
+            # Blob self-consistency is checked in both modes - it compares the
+            # tree against its own manifest and says nothing about the lock -
+            # while the lock comparison applies only when the lock is meant to
+            # stay put. With --write-lock the workload is deliberately
+            # changing, so the equivalent refusal logic lives in step 3.
+            assert_blobs_consistent(staging, manifest)
+            if not write_lock:
                 assert_matches_lock(staging, repo, manifest)
-            publish(staging, out_dir)
-            if pending is not None:
-                commit_lock(repo, pending)
+
+            # STEP 3: every remaining way this can REFUSE, still before any
+            # rename. prepare_lock decides; it does not write.
+            pending = (
+                prepare_lock(repo, manifest, retire_baseline) if write_lock else None
+            )
+
+            # STEPS 4-7.
+            publish_transaction(staging, out_dir, repo, pending)
         finally:
-            # A no-op on success (publish renamed it away); on any failure it
-            # keeps a half-built tree from being mistaken for a fixture later.
-            if staging.exists():
-                shutil.rmtree(staging)
+            # Non-fatal: this runs while unwinding, and a refusal here must not
+            # replace the error that caused the unwind.
+            safe_rmtree(staging, "staging directory", fatal=False)
     tier = "full" if include_large else "fast"
     print(f"gen-fixtures: {version} tier={tier} paths={len(entries)} -> {out_dir}")
 
 
-def safe_rmtree(path: Path, what: str) -> None:
-    """Delete a directory only if this script can show it created it."""
+def safe_rmtree(path: Path, what: str, fatal: bool = True) -> None:
+    """Delete a directory only if this script can show it created it.
+
+    This is the ONLY deletion primitive in this file. `shutil.rmtree` is never
+    called directly, including from cleanup paths, because the one place that
+    still did - the transaction's `finally` - deleted a foreign directory that
+    appeared at the staging path AFTER the preflight check had passed. A
+    predictable path plus a time-of-check/time-of-use gap is enough; the
+    marker has to be verified at the moment of deletion, not earlier.
+
+    `fatal=False` is for unwinding paths: refusing there must not raise, or a
+    cleanup refusal would replace the real error with itself. The run still
+    exits non-zero from whatever failed first; this only declines to delete.
+    """
     if not path.exists():
         return
     if path.is_symlink() or not path.is_dir():
-        fail(f"{what} {path} exists and is not a plain directory; refusing", code=2)
-    if any(path.iterdir()) and not (path / fx.OUT_MARKER).exists():
-        fail(
+        message = f"{what} {path} exists and is not a plain directory; refusing"
+    elif any(path.iterdir()) and not (path / fx.OUT_MARKER).exists():
+        message = (
             f"{what} {path} is not empty and has no {fx.OUT_MARKER} marker, so this "
-            f"script cannot show it created it. Refusing to delete it.",
-            code=2,
+            f"script cannot show it created it. Refusing to delete it."
         )
-    shutil.rmtree(path)
+    else:
+        shutil.rmtree(path)
+        return
+    if fatal:
+        fail(message, code=2)
+    print(f"gen-fixtures: WARNING - {message}", file=sys.stderr, flush=True)
+
+
+def assert_blobs_consistent(staging: Path, manifest: dict) -> None:
+    """The staged tree must contain the bytes its own manifest describes.
+
+    Independent of the lock, so it runs in --write-lock mode too: a manifest
+    that disagrees with the blobs beside it is broken whether or not the
+    workload is deliberately changing.
+    """
+    problems = fx.blob_problems(staging / "cache", manifest)
+    if problems:
+        fail(
+            "the tree just built does not match its own manifest, so it was "
+            "discarded and the previous tree (if any) is untouched:\n  - "
+            + "\n  - ".join(problems)
+        )
 
 
 def assert_matches_lock(staging: Path, repo: Path, manifest: dict) -> None:
     """The staged tree must be the pinned workload, or it is not published."""
-    problems = fx.lock_problems(manifest, fx.load_lock(repo)) + fx.blob_problems(
-        staging / "cache", manifest
-    )
+    problems = fx.lock_problems(manifest, fx.load_lock(repo))
     if problems:
         fail(
             "the tree just built is NOT the workload pinned in "
@@ -550,32 +590,83 @@ def assert_matches_lock(staging: Path, repo: Path, manifest: dict) -> None:
         )
 
 
-def publish(staging: Path, out_dir: Path) -> None:
-    """Swap the validated tree into place, then drop the old one.
+def publish_transaction(staging: Path, out_dir: Path, repo: Path, pending) -> None:
+    """Steps 4-7 of the publication protocol, with defined end states.
 
-    Not atomic in the POSIX sense - two directories cannot be exchanged in one
-    call - but the caller holds the publication lock, the window where
-    `out_dir` does not exist is a rename rather than the length of a 110 MiB
-    copy, and a reader never sees a partly written tree.
+    This code grew a new hole every time it was patched locally - the lock was
+    written before the tree, then after it with no rollback - so the ordering
+    and every failure's end state are specified here rather than inferred:
 
-    Two accepted residuals, recorded rather than fixed. A reader that opens a
-    path during the swap gets ENOENT - loud and retryable, never a silently
-    wrong byte; task-5's harness is told to expect it. And a process killed
-    between the two renames strands the old tree under `.<name>.retired.<pid>`
-    with no `out_dir`; nothing is lost, and warn_about_stranded_trees() names
-    the directory and the one command that restores it.
+      4. rename out -> retired      (the old tree is KEPT, never deleted yet)
+      5. rename staging -> out
+      6. commit_lock                (atomic os.replace of the tracked lock)
+      7. only now, delete retired   (via safe_rmtree, marker-verified)
+
+    Failures:
+      * at 4          nothing has moved. Old tree and old lock stand.
+      * at 5          one inverse rename restores the old tree. Old lock stands.
+      * at 6          the new tree is moved aside to a marker-carrying
+                      quarantine directory and the old tree is renamed back, so
+                      the end state is: OLD tree at out_dir, OLD lock intact,
+                      new tree preserved for inspection. Exit 2, naming both.
+
+    The invariant behind all of it: the tracked lock must never describe a tree
+    that is not the one on disk, in either direction.
     """
-    retired = out_dir.parent / f".{out_dir.name}.retired.{os.getpid()}"
-    if out_dir.exists():
-        out_dir.rename(retired)
+    stamp = f"{time.time_ns()}-{os.getpid()}"
+    retired = out_dir.parent / f".{out_dir.name}.retired.{stamp}"
+
+    # STEP 4 - keep the old tree, do not delete it.
+    had_previous = out_dir.exists()
+    if had_previous:
+        try:
+            out_dir.rename(retired)
+        except OSError as error:
+            fail(
+                f"could not set the previous tree aside ({error}). Nothing was "
+                f"changed: {out_dir} and the lock are as they were.",
+                code=2,
+            )
+
+    # STEP 5 - publish.
     try:
         staging.rename(out_dir)
-    except OSError:
-        if retired.exists():
+    except OSError as error:
+        if had_previous:
             retired.rename(out_dir)
-        raise
-    if retired.exists():
-        shutil.rmtree(retired)
+        fail(
+            f"could not publish the new tree ({error}). The previous tree has been "
+            f"restored to {out_dir} and the lock is untouched.",
+            code=2,
+        )
+
+    # STEP 6 - record it.
+    if pending is not None:
+        try:
+            commit_lock(repo, pending)
+        except OSError as error:
+            quarantine = out_dir.parent / f".{out_dir.name}.quarantine.{stamp}"
+            out_dir.rename(quarantine)
+            if had_previous:
+                retired.rename(out_dir)
+            fail(
+                f"the tree was published but the lock could not be written "
+                f"({error}), which would leave a tree no committed lock describes.\n"
+                f"  Rolled back. The new tree is preserved at: {quarantine}\n"
+                + (
+                    f"  The previous tree has been restored to: {out_dir}\n"
+                    if had_previous
+                    else f"  There was no previous tree, so {out_dir} is now absent.\n"
+                )
+                + "  The committed lock is unchanged. Fix the permissions on "
+                f"{fx.lock_path(repo)} and rerun; the quarantined tree is then "
+                "safe to delete.",
+                code=2,
+            )
+
+    # STEP 7 - and only now is the old tree expendable.
+    if had_previous:
+        safe_rmtree(retired, "retired tree")
 
 
 def warn_about_stranded_trees(out_dir: Path) -> None:
