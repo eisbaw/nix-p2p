@@ -4,7 +4,7 @@ title: Mock upstream mode + signed fixture store
 status: In Progress
 assignee: []
 created_date: '2026-08-07 21:55'
-updated_date: '2026-08-08 02:21'
+updated_date: '2026-08-08 05:29'
 labels:
   - irreversible
 dependencies:
@@ -176,4 +176,23 @@ ACCEPTED RESIDUALS, updated where the redesign changed their meaning:
 Forward-carried: task-5 rewritten (paths gain current/, the ENOENT retry advice withdrawn, the obsolete .out.retired/.out.quarantine cleanup warnings replaced, bind-mount guidance settled against the immutable generation); tasks 2/9/10/19 given the path change.
 
 gate round 5: build/lint/fmt/test/fixtures-large/fixtures-verify-rebuild/package all exit 0; nix build .#daemon .#testproxy exit 0; nix flake check exit 0 (8 checks). cargo 2/2. Full tier: 12 ok, 4 positive controls, 3 bites, 0 PARTIAL. Determinism: two fresh roots produce the SAME generation name, diff -r exit 0 over 13 files / 115,939,516 bytes, metadata-aware digests equal over 18 entries. 3 concurrent generators exit 0 0 0. Cold start from no fixtures/out: just test exit 0, then fixtures-large exit 0. Stubs untouched (4x '0 scenarios registered - NOT a pass').
+
+ROUND 6 (commit 26a8ad0). awaiting deep gate (round 6).
+
+Round-5 gate: QA GO; codex NO-GO. The findings were two recurring SPECIES plus one unimplemented claim, so this round sweeps rather than point-fixes - the species rule in these notes now applies to the publication code itself.
+
+SWEEP A - namespace confinement. Enumerated EVERY filesystem operation in scripts/ that creates, opens, replaces, resolves or deletes under fixtures/ or the lock path, and anchored each; the list with its anchor per call site is in the commit message, so it can be audited directly rather than rediscovered. New anchors: mkstemp for the lock temp file, O_NOFOLLOW reads of the tracked lock, O_NOFOLLOW on the collector's PARENT open, fx.anchored_generations() (generations/ must be a real directory whose resolved path is inside the resolved root) as the single anchor every deletion and every root resolution passes through, and fx.symlink_problems() - a generation tree must contain ZERO symlinks, asserted at validation and by the gate.
+Codex's three instances, each reproduced failing first: (a) the pid-derived lock temp path let a planted symlink both overwrite an unrelated file AND turn the tracked lock into a symlink while reporting success; (b) 'cache -> /external/cache' inside a generation passed the gate exit 0, because confined_blob only ever walked components BELOW cache/ - this is exactly why the zero-symlink rule replaced a third per-component patch; (c) a symlinked generations/ made GC delete a marked directory OUTSIDE the publication root (gen-VICTIM), now refused exit 2 by generator and gate with the victim intact.
+
+SWEEP B - exception scope on critical sections. A KeyboardInterrupt between the symlink flip and the lock replace is not an OSError, so it walked out of 'except OSError' and left the new generation published against the OLD lock. The rollback is now attached to LEAVING the region (try/finally on a committed flag), not to a class of error, because anything that can interrupt Python can land in that window; commit_lock's temp cleanup widened to BaseException for the same reason. Bite: the injected KeyboardInterrupt now ends with old current + old lock. Swept the pattern - publish() is the only multi-step state change with a rollback handler.
+
+FIX C - the two-generation retention claim was asserted in round 5 and NOT implemented: warm reuse kept only 'current', so it deleted the predecessor on the next 'just test' and a PATH-resolving reader (no held fd) got ENOENT. Implemented with a 'previous' symlink - a pointer, not duplicated state - flipped atomically before 'current' and read by the collector on both the publish and reuse paths. Verified a path resolved before a publish is still readable after publish+reuse. 'ls -l fixtures/out' now shows what is retained, which makes the claim auditable rather than documented. The stated limit is unchanged: one publication of grace, not a lease.
+
+FIX D - an unreadable collided generation made the advertised supersede repair unreachable, in TWO places: reusable() let the OSError escape as 'filesystem error while generating', and install_generation let tree_digest raise. Both now treat unreadable as 'not it' and supersede. chmod 000 on a published cache/ goes from exit 2 with no repair to exit 0, superseded, gate green.
+
+FIX E - reuse/gate divergence CLOSED rather than bounded. Reuse now applies every tree check the gate applies. completeness_problems went from presence to structure (nix-cache-info parses and equals the manifest's declaration; every narinfo exists, is non-empty, parses, carries the required fields, names the right store path, and its Sig verifies), and blob hashing was reinstated - the round-5 rationale that re-hashing 110 MiB was too expensive was wrong by an order of magnitude, measured at 0.123s for 4 blobs / 116 MB. Termination is verified per rejection class, not argued: empty narinfo, changed cache-info field, same-size corrupted blob, truncated narinfo, bad Sig, symlinked cache/ - all six go gate=1 -> regen rebuilds (never 'reused') -> gate=0. No class remains where reuse accepts what the gate rejects, so no class can dead-end repair. What stays gate-only is not about the tree: TESTING.md naming the version, the client's trusted-keys, the positive controls and the tamper bites - none caused by a damaged tree, none fixed by regenerating one.
+
+Non-blocking, folded in: a partial removal can strip the ownership marker before failing, after which nothing here will ever delete the remainder; the warning now says so and prints the exact rm -rf per residue path.
+
+gate round 6: build/lint/fmt/test/fixtures-large/fixtures-verify-rebuild/package all exit 0; nix build .#daemon .#testproxy exit 0; nix flake check exit 0 (8 checks). cargo 2/2. Full tier: 12 ok, 4 positive controls, 3 bites, 0 PARTIAL. Determinism: two fresh roots produce the same generation name, diff -r exit 0, digests equal over 18 entries. 3 concurrent generators exit 0 0 0. Lock byte-identical (a39382de8782d6f7) and served content byte-identical (13 files, 115,939,516 bytes) - unchanged since round 2.
 <!-- SECTION:NOTES:END -->

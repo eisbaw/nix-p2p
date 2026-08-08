@@ -4,7 +4,7 @@ title: 'E2E harness v1: podman-pod topology + scripted scenarios'
 status: To Do
 assignee: []
 created_date: '2026-08-07 21:55'
-updated_date: '2026-08-08 02:00'
+updated_date: '2026-08-08 05:29'
 labels: []
 dependencies:
   - TASK-3
@@ -79,4 +79,13 @@ DIRECTORY NAMES YOUR CLEANUP MUST NOT BLANKET-DELETE - the round-4 list is obsol
 A pre-generations tree (manifest.json directly inside fixtures/out) is REFUSED rather than migrated: 'rm -rf fixtures/out' once and regenerate. If your harness caches a fixtures/out from an earlier checkout, clear it.
 
 Unchanged and still binding: run 'just fixtures-large' (it gates with --require-tier full); metadata is normalised (0644/0755, mtime 1, key 0600) so copies need cp -a / rsync -a / tar -p; the harness must invoke check-fixtures.py, not only gen-fixtures.py; and AC#3's daemon-path re-assertion is still a different proof from check-fixtures.py's direct-store-mode one.
+
+forward-carried from task-3 round 6 (26a8ad0), CORRECTING the round-5 note above. The two-generation retention was only a claim in round 5; it is implemented now, and there is a second symlink you will see in the publication root:
+  fixtures/out/current  -> generations/gen-<sha>   the published generation
+  fixtures/out/previous -> generations/gen-<sha>   the one it replaced, retained for readers
+Both are confined identically and both are read by the collector, including on the warm-reuse path (which previously deleted the predecessor immediately). The practical upgrade for your harness: a container that resolves fixtures/out/current to a PATH and holds no descriptor is now safe across one republication, not only one holding an open directory. The limit is unchanged - one publication of grace, not a lease - so re-resolve on ENOENT if you hold it across repeated regenerations.
+
+Also relevant to bind-mounting: a generation tree is now asserted to contain ZERO symlinks (at validation and by the gate), so 'readlink -f fixtures/out/current' followed by a bind mount of that path gives you a tree in which every path is provably inside the mount. 'current' and 'previous' are symlinks precisely because they live OUTSIDE the generation - do not bind-mount the publication root and expect the links to resolve inside a container with a different path layout; mount the resolved generation.
+
+And: 'just fixtures' now applies every tree check the gate applies, so if your harness sees the gate reject a fixture, regenerating genuinely repairs it (verified for six damage classes) instead of reporting 'reused'.
 <!-- SECTION:NOTES:END -->
