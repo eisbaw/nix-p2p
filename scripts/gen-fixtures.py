@@ -66,6 +66,7 @@ import os
 import stat
 import subprocess
 import sys
+import tempfile
 import time
 from contextlib import contextmanager
 from pathlib import Path
@@ -457,30 +458,41 @@ def reusable(
         return False
     if include_large and manifest.get("tier") != fx.TIER_FULL:
         return False
-    # The tier's required payload set, AND the files a served cache must
-    # actually contain. Checking only the manifest and the blobs made this a
-    # whitelist standing in for "is this the pinned workload": deleting
-    # nix-cache-info or a narinfo left a tree the gate rejects and this reused,
-    # so `just fixtures` said success, `just test` failed, and its remediation
-    # advice was to run `just fixtures`.
+    # EVERY class of tree defect the gate can reject, checked here too - blob
+    # hashes included. The old rationale for skipping them ("re-hashing 110 MiB
+    # on every `just test` would cost more than it protects") was simply wrong:
+    # measured, all four blobs total 116 MB and hash in 0.12 s, which is far
+    # below the cost of the `nix build` calls this shortcut skips. It was also
+    # the last thing keeping reuse weaker than the gate, and a reuse check
+    # weaker than the gate does not merely miss defects - it makes them
+    # UNREPAIRABLE, because `just fixtures` becomes a no-op on exactly the
+    # trees the gate is refusing.
     #
-    # Blob sizes are checked; blob HASHES are not, because re-hashing 110 MiB
-    # on every `just test` would cost more than it protects. State the residual
-    # precisely rather than claiming parity with the gate: what this guarantees
-    # is that every file the workload owes is present and the right size, so
-    # the only defect it can miss is corrupted blob CONTENT - which the gate
-    # re-hashes unconditionally, and which cannot be produced by the accidents
-    # this shortcut exists to survive (an interrupted run, a stray deletion).
+    # With this, every rejection class terminates: reuse refuses, the tree is
+    # rebuilt, and install_generation publishes it (superseding the damaged
+    # generation if the content-derived name collides). What remains gate-only
+    # is nothing about the TREE - only assertions about the environment
+    # (TESTING.md naming the version, the client's trusted-keys) and about
+    # Nix's behaviour (the positive controls and tamper bites), none of which a
+    # damaged fixture tree can cause and none of which regeneration can fix.
     cache = current / "cache"
     lock = fx.load_lock(repo)
-    if fx.lock_problems(manifest, lock) or fx.completeness_problems(cache, manifest):
+    try:
+        if (
+            fx.symlink_problems(current)
+            or fx.lock_problems(manifest, lock)
+            or fx.completeness_problems(cache, manifest)
+            or fx.blob_problems(cache, manifest)
+        ):
+            return False
+    except OSError:
+        # A published generation that cannot even be READ is not reusable, and
+        # saying so is the whole job of this function. Letting the error escape
+        # aborted the run with "filesystem error while generating" and left the
+        # unreadable generation in place - so an unreadable tree could not be
+        # repaired at all, which is the same dead-end shape as the reuse loop.
+        # The rebuild that follows supersedes it.
         return False
-    for entry in manifest.get("paths", []):
-        blob, refusal = fx.confined_blob(cache, entry.get("url"))
-        if refusal is not None:
-            return False
-        if not blob.is_file() or blob.stat().st_size != entry.get("file_size"):
-            return False
     return True
 
 
@@ -526,14 +538,18 @@ def assert_safe_out_dir(out_dir: Path, repo: Path) -> None:
             f"  Remove it once and regenerate: rm -rf {out_dir}",
             code=2,
         )
-    link = out_dir / fx.CURRENT_LINK
-    if not link.is_symlink() and link.exists():
-        fail(
-            f"{link} exists and is not a symlink. Publication replaces it with one "
-            "atomic os.replace, which cannot swap a symlink for a directory.\n"
-            f"  Inspect it, then remove it: rm -rf {link}",
-            code=2,
-        )
+    # Both publication links, checked the same way: os.replace cannot swap a
+    # symlink in over a directory, and `previous` is flipped by exactly the
+    # same primitive as `current`.
+    for link_name in (fx.CURRENT_LINK, fx.PREVIOUS_LINK):
+        link = out_dir / link_name
+        if not link.is_symlink() and link.exists():
+            fail(
+                f"{link} exists and is not a symlink. Publication replaces it with "
+                "one atomic os.replace, which cannot swap a symlink for a "
+                f"directory.\n  Inspect it, then remove it: rm -rf {link}",
+                code=2,
+            )
 
 
 def ensure_out_root(out_dir: Path) -> Path:
@@ -552,7 +568,20 @@ def ensure_out_root(out_dir: Path) -> Path:
         )
     generations = out_dir / fx.GENERATIONS_DIR
     generations.mkdir(exist_ok=True)
-    return generations
+    # Every deletion happens under this directory, so prove it is really inside
+    # the publication root before anything uses it. With `generations` a
+    # symlink, the collector followed it and deleted marked directories
+    # elsewhere on the filesystem.
+    anchored = fx.anchored_generations(out_dir)
+    if anchored is None:
+        fail(
+            f"{generations} is not a plain directory inside {out_dir} (a symlink, or "
+            "not a directory at all). Everything this script deletes lives under it, "
+            "so it will not act through it.\n"
+            f"  Inspect it, then remove it: rm -rf {generations}",
+            code=2,
+        )
+    return anchored
 
 
 @contextmanager
@@ -633,7 +662,7 @@ def generate(
             # reuses - a generation stranded by a failed flip and a .building.*
             # left by a SIGKILL accumulated forever at 110 MiB each, silently,
             # because the warning lives in publish() as well.
-            collect_generations(generations, {current.name})
+            collect_generations(generations, retained(out_dir, current))
             # note(), not print(): reuse changed nothing and the published tree
             # is valid, so a stream this cannot be written to must not turn a
             # correct state into a non-zero exit.
@@ -725,9 +754,19 @@ def purge_marked_dir(parent: Path, name: str) -> str | None:
     is scratch), so the only right response to "cannot delete" is to say so.
     """
     try:
-        parent_fd = os.open(parent, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
+        # O_NOFOLLOW on the PARENT too. Anchoring only the entries inside was
+        # not enough: with `generations` itself a symlink, this opened whatever
+        # it pointed at and collected marked directories outside the
+        # publication root entirely. The caller additionally proves the parent
+        # is the anchored generations directory (fx.anchored_generations); this
+        # is the syscall-level half of the same guarantee.
+        parent_fd = os.open(
+            parent, os.O_RDONLY | os.O_NOFOLLOW | os.O_DIRECTORY | os.O_CLOEXEC
+        )
     except FileNotFoundError:
         return None
+    except OSError as error:
+        return f"{parent} could not be opened as a plain directory: {error}"
     try:
         try:
             dir_fd = os.open(
@@ -909,11 +948,24 @@ def install_generation(built: Path, generations: Path, stamp: str) -> str:
     reason = None
     if target.is_symlink() or not target.is_dir():
         reason = "it is not a directory"
-    elif fx.tree_digest(target) != fx.tree_digest(built):
-        reason = (
-            "its contents differ from the tree just built, so it was mutated or "
-            "truncated after publication"
-        )
+    else:
+        try:
+            occupant = fx.tree_digest(target)
+        except Exception as error:  # noqa: BLE001 - see below
+            # ANY failure to read the occupant means the same thing: it cannot
+            # be shown to be the generation its name claims. Letting this raise
+            # made the repair path unreachable in exactly the case that needs
+            # it most - an unreadable generation is damage, and damage is what
+            # superseding exists to route around. Catching broadly is correct
+            # here precisely because the response does not depend on which
+            # error it was.
+            reason = f"it could not be read ({error})"
+        else:
+            if occupant != fx.tree_digest(built):
+                reason = (
+                    "its contents differ from the tree just built, so it was mutated "
+                    "or truncated after publication"
+                )
     if reason is None:
         return name
 
@@ -962,9 +1014,24 @@ def publish(out_dir: Path, generations: Path, name: str, repo: Path, pending) ->
     previous = fx.resolve_current(out_dir)
     stamp = f"{time.time_ns()}-{os.getpid()}"
 
-    # STEP 4 - the publication itself.
+    # STEP 4a - record the predecessor BEFORE the flip, so the retention claim
+    # ("the published generation and the one before it") is implemented rather
+    # than asserted. A crash between 4a and 4b leaves previous == current,
+    # which over-retains by nothing and under-retains nothing.
+    if previous is not None:
+        try:
+            point_link_at(out_dir, fx.PREVIOUS_LINK, previous.name, f"{stamp}-prev")
+        except OSError as error:
+            fail(
+                f"could not record the predecessor ({error}). Nothing changed: "
+                f"{out_dir / fx.CURRENT_LINK} and the lock are as they were. The "
+                f"validated new generation is on disk at {generations / name}.",
+                code=2,
+            )
+
+    # STEP 4b - the publication itself.
     try:
-        point_current_at(out_dir, name, f"{stamp}-publish")
+        point_link_at(out_dir, fx.CURRENT_LINK, name, f"{stamp}-publish")
     except OSError as error:
         fail(
             f"could not publish ({error}). Nothing changed: {out_dir / fx.CURRENT_LINK}"
@@ -973,47 +1040,78 @@ def publish(out_dir: Path, generations: Path, name: str, repo: Path, pending) ->
             code=2,
         )
 
-    # STEP 5 - record it. ONLY the write-and-replace is inside the try, and
+    # STEPS 5-6 - record it, and undo the flip if anything at all prevents that.
+    #
+    # The guard is try/finally on a `committed` flag, not `except OSError`.
+    # A KeyboardInterrupt delivered between the flip and the lock replace is
+    # not an OSError, so it walked straight out of the old handler and left the
+    # new generation published against the OLD lock - precisely the state this
+    # whole protocol exists to make impossible. Anything that can interrupt
+    # Python can land in that window, so the rollback has to be attached to
+    # LEAVING the region rather than to a class of error.
+    #
     # commit_lock deliberately prints nothing: the previous version printed its
     # success line inside the guarded block, so an EPIPE or ENOSPC on stdout
     # was caught as "the lock could not be written" and triggered a rollback
     # that reported the opposite of what had actually happened.
-    if pending is not None:
-        try:
-            commit_lock(repo, pending)
-        except OSError as error:
-            # The message is computed from what the rollback ACTUALLY did.
+    committed = False
+    rolled_back = None
+    try:
+        if pending is not None:
             try:
-                rolled_back = restore_current(
-                    out_dir, previous, name, f"{stamp}-rollback"
+                commit_lock(repo, pending)
+            except OSError as error:
+                rolled_back = safe_restore_current(out_dir, previous, name, stamp)
+                fail(
+                    f"the tree was published but the lock could not be written "
+                    f"({error}), which would leave a published tree no committed "
+                    f"lock describes.\n"
+                    f"  {rolled_back}\n"
+                    f"  The committed lock is unchanged. The new generation is on "
+                    f"disk at {generations / name}.\n"
+                    f"  Fix the permissions on {fx.lock_path(repo)} and rerun.",
+                    code=2,
                 )
-            except OSError as rollback_error:
-                rolled_back = (
-                    f"the rollback ALSO failed ({rollback_error}), so "
-                    f"{out_dir / fx.CURRENT_LINK} may still point at the new "
-                    "generation while the lock does not describe it - fix this by hand"
-                )
-            fail(
-                f"the tree was published but the lock could not be written ({error}), "
-                "which would leave a published tree no committed lock describes.\n"
-                f"  {rolled_back}\n"
-                f"  The committed lock is unchanged. The new generation is on disk at "
-                f"{generations / name}.\n"
-                f"  Fix the permissions on {fx.lock_path(repo)} and rerun.",
-                code=2,
-            )
-        note(
-            f"gen-fixtures: rewrote {fx.lock_path(repo)} - commit it as a reviewed diff"
-        )
+        committed = True
+    finally:
+        if not committed and rolled_back is None:
+            # Reached only by an exception the handler above does not name -
+            # KeyboardInterrupt, MemoryError, a bug in this file. The flip is
+            # undone on the way out and the failure propagates untouched.
+            undone = safe_restore_current(out_dir, previous, name, stamp)
+            warn(f"gen-fixtures: interrupted after publishing. {undone}")
 
-    # STEP 6/7 - published; from here nothing may turn this into a failure.
-    keep = {name} | ({previous.name} if previous is not None else set())
-    collect_generations(generations, keep)
+    note(
+        f"gen-fixtures: rewrote {fx.lock_path(repo)} - commit it as a reviewed diff"
+        if pending is not None
+        else f"gen-fixtures: published {name}"
+    )
+
+    # STEP 7 - published; from here nothing may turn this into a failure.
+    collect_generations(generations, retained(out_dir, generations / name))
     return generations / name
 
 
-def point_current_at(out_dir: Path, name: str, stamp: str) -> None:
-    """Make `current` name `generations/<name>` in one atomic step.
+def safe_restore_current(
+    out_dir: Path, previous: Path | None, name: str, stamp: str
+) -> str:
+    """restore_current that never raises. Returns what actually happened.
+
+    Used from both the error handler and the finally guard, where raising would
+    replace the failure being reported with a second, less useful one.
+    """
+    try:
+        return restore_current(out_dir, previous, name, f"{stamp}-rollback")
+    except OSError as error:
+        return (
+            f"the rollback ALSO failed ({error}), so {out_dir / fx.CURRENT_LINK} may "
+            "still point at the new generation while the lock does not describe it - "
+            "fix this by hand"
+        )
+
+
+def point_link_at(out_dir: Path, link_name: str, name: str, stamp: str) -> None:
+    """Make `<link_name>` name `generations/<name>` in one atomic step.
 
     A symlink cannot be retargeted in place, so a uniquely named one is created
     beside it and os.replace'd over it. os.replace on a symlink replaces the
@@ -1021,8 +1119,8 @@ def point_current_at(out_dir: Path, name: str, stamp: str) -> None:
     the publication model changed: readers see the old generation or the new
     one, never a directory mid-rename and never a missing one.
     """
-    link = out_dir / fx.CURRENT_LINK
-    temporary = out_dir / f".{fx.CURRENT_LINK}.{stamp}"
+    link = out_dir / link_name
+    temporary = out_dir / f".{link_name}.{stamp}"
     os.symlink(fx.generation_link_target(name), temporary)
     try:
         os.replace(temporary, link)
@@ -1056,7 +1154,7 @@ def restore_current(out_dir: Path, previous: Path | None, name: str, stamp: str)
             f"Rolled back: nothing had been published before, so {link} was removed "
             "and the new generation is inert."
         )
-    point_current_at(out_dir, previous.name, stamp)
+    point_link_at(out_dir, fx.CURRENT_LINK, previous.name, stamp)
     if previous.name == name:
         return (
             f"Nothing to roll back: {link} already pointed at {previous.name}, which "
@@ -1067,6 +1165,19 @@ def restore_current(out_dir: Path, previous: Path | None, name: str, stamp: str)
         f"Rolled back: {link} points at {previous.name} again, so the new generation "
         "is inert."
     )
+
+
+def retained(out_dir: Path, current: Path) -> set[str]:
+    """The generations retention protects: the published one and its predecessor.
+
+    Read from the two symlinks rather than remembered, so it is the same answer
+    on the publish path and the warm-reuse path. Reuse used to keep only
+    `current`, which deleted the predecessor on the very next `just test` and
+    made the stated one-publication grace period false for any reader that
+    resolves a PATH rather than holding a descriptor open.
+    """
+    previous = fx.resolve_previous(out_dir)
+    return {current.name} | ({previous.name} if previous is not None else set())
 
 
 def collect_generations(generations: Path, keep: set[str]) -> None:
@@ -1112,8 +1223,12 @@ def collect_generations(generations: Path, keep: set[str]) -> None:
         # bytes could not be removed would describe a state that did not happen.
         note(
             "gen-fixtures: WARNING - published successfully, but these superseded "
-            "directories could not be removed and are safe to delete by hand:\n  - "
-            + "\n  - ".join(left),
+            "directories could not be removed:\n  - "
+            + "\n  - ".join(left)
+            + "\n  They are inert. Note that a partial removal can strip the "
+            f"{fx.OUT_MARKER} marker before failing, after which this script will "
+            "never delete the remainder itself - reclaim it with:\n"
+            + "\n".join(f"    rm -rf {path.split(' (')[0]}" for path in left),
             sys.stderr,
         )
 
@@ -1230,14 +1345,29 @@ def commit_lock(repo: Path, new: dict) -> None:
     ENOSPC), so the success line belongs to the caller, after the guard.
     """
     lock_file = fx.lock_path(repo)
-    temporary = lock_file.with_suffix(f".tmp.{os.getpid()}")
+    # mkstemp, not a pid-derived name. The old temp path was predictable, and
+    # nothing stopped it being a symlink: write_text then followed it and
+    # overwrote an unrelated file, and os.replace moved the SYMLINK over the
+    # tracked lock - so the repository's record of the frozen workload became a
+    # symlink to attacker-chosen content while this reported success. mkstemp
+    # creates with O_CREAT|O_EXCL|O_NOFOLLOW semantics and an unguessable name,
+    # so there is no window to plant anything in, and it is created in the
+    # lock's own directory so the replace stays on one filesystem.
+    descriptor, temporary_name = tempfile.mkstemp(
+        dir=lock_file.parent, prefix=f".{lock_file.name}.", suffix=".tmp"
+    )
+    temporary = Path(temporary_name)
     try:
-        temporary.write_text(json.dumps(new, indent=2, sort_keys=True) + "\n")
+        with os.fdopen(descriptor, "w") as handle:
+            handle.write(json.dumps(new, indent=2, sort_keys=True) + "\n")
+        # mkstemp makes the file 0600; the tracked lock is reviewed source and
+        # must stay readable like the file it replaces.
+        os.chmod(temporary, 0o644)
         os.replace(temporary, lock_file)
-    except OSError:
-        # Leaving a half-written temporary beside the tracked lock would be its
-        # own small mess. Suppressed because the original failure is what the
-        # caller must see and act on.
+    except BaseException:
+        # BaseException, not OSError: a KeyboardInterrupt here must not leave a
+        # stray temporary beside the tracked lock either. The original failure
+        # is re-raised untouched; only the cleanup is suppressed.
         with contextlib.suppress(OSError):
             temporary.unlink()
         raise

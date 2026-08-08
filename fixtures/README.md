@@ -20,6 +20,7 @@ Generated, gitignored (`fixtures/out/`, created by `just fixtures`):
 |---|---|
 | `generations/gen-<sha>/` | One **immutable** generation, named by the SHA-256 of its `manifest.json`. Built and fully validated before it is named; never written to, renamed or mutated afterwards. |
 | `current` | Symlink to the published generation. **Every consumer resolves through this** — the gate, `just fixtures-serve`, task-5's containers. |
+| `previous` | Symlink to the generation `current` replaced. This is the *implementation* of the two-generation retention claim, not a decoration: the collector reads both links, so retention holds on the warm-reuse path too. `ls -l fixtures/out` shows exactly what is retained. |
 
 Inside a generation:
 
@@ -45,11 +46,21 @@ flip. Failure end states are exhaustive and are written into
 | the lock write | `current` is flipped back in one syscall; the old lock is intact; the new generation stays on disk, inert |
 | collecting superseded generations | **success**, with a warning naming the residue — the tree and the lock are both committed, so this is not a failed publication. A partially-collected directory is inert but not invisible: it still occupies its name, so the next run that rebuilds the same content publishes beside it under `gen-<sha>.superseded-<stamp>` |
 
-Two generations are kept: the published one and its predecessor. Older ones are
-deleted only through a file descriptor opened `O_NOFOLLOW|O_DIRECTORY` whose
-ownership marker is verified with `openat` on that same descriptor — a
-directory swapped in after a by-path check is not what gets removed. A
-directory without the marker is never deleted, empty or not.
+Two generations are kept: the published one (`current`) and its predecessor
+(`previous`). Older ones are deleted only through a file descriptor opened
+`O_NOFOLLOW|O_DIRECTORY` whose ownership marker is verified with `openat` on
+that same descriptor — a directory swapped in after a by-path check is not what
+gets removed. A directory without the marker is never deleted, empty or not.
+
+**Confinement.** A generation tree must contain **zero symlinks**, asserted at
+validation and again by the gate. That single rule is what makes every other
+containment check sufficient: `cache/` being replaced by a symlink to an
+external tree previously slipped past the per-component url checks, and the
+gate hashed, verified and served someone else's directory. `current` and
+`previous` are symlinks precisely because they live *outside* the generation.
+`generations/` itself is resolved and proved to be a real directory inside the
+publication root before anything is deleted through it, and the tracked lock is
+written via `mkstemp` and read with `O_NOFOLLOW`.
 
 A reader that resolved `current` before a publication keeps reading a complete,
 immutable tree rather than racing a rename; it survives at least one further
@@ -73,14 +84,25 @@ Three different determinism claims, kept apart on purpose:
 
 Generation reuses the published generation when it already matches the lock at
 the requested tier, so `just test` will not republish over a full tier you just
-built. Reuse checks the same *completeness* the gate does — `nix-cache-info`,
-one narinfo per payload, and every blob present at the right size — but not
-blob **hashes**, because re-hashing 110 MiB on every `just test` would cost
-more than it protects. So the one defect reuse can miss is corrupted blob
-*content*, which the gate re-hashes unconditionally. (Checking only the
-manifest and the blob sizes used to be enough to make `rm cache/nix-cache-info`
-unrecoverable: the gate failed, `just fixtures` reused, and the gate's own
-advice was to run `just fixtures`.)
+built. **Reuse applies every tree check the gate applies** — no symlinks, the
+lock, structural completeness (`nix-cache-info` parses and matches the
+manifest; every narinfo exists, is non-empty, parses, carries the required
+fields, names the right store path, and its `Sig` verifies), and every blob's
+SHA-256. Hashing was previously skipped on the theory that 110 MiB was too
+expensive; measured, all four blobs hash in 0.12 s, which is far below the
+`nix build` calls reuse skips.
+
+That parity is a correctness property, not tidiness. A reuse check weaker than
+the gate does not merely miss defects, it makes them **unrepairable**:
+`just fixtures` becomes a no-op on exactly the trees the gate is refusing, and
+the gate's own advice is to run `just fixtures`. Every rejection class now
+terminates — verified for an empty narinfo, a changed `nix-cache-info` field, a
+same-size corrupted blob, a truncated narinfo, a bad `Sig`, and a symlinked
+`cache/`: the gate rejects, regeneration rebuilds rather than reusing, and the
+gate passes. What remains gate-only concerns the *environment* (TESTING.md
+naming the version, the client's trusted-keys) and *Nix's behaviour* (the
+positive controls and tamper bites) — nothing a damaged tree can cause and
+nothing regeneration could fix.
 
 A generation that something mutated after publication no longer blocks its own
 repair. Its name is content-derived, so the corrected tree wants the same name;

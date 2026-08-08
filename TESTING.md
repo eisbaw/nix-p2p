@@ -283,12 +283,15 @@ not over-read:
   sees. The determinism check compares metadata too.
 - **A reader that already resolved `current` is never torn.** It goes on
   reading a complete, immutable generation across a republication, and
-  that generation survives at least one further publication before it
-  becomes collectable. (The previous publish-by-rename design gave such a
-  reader an `ENOENT` window instead; that window is gone.) What is *not*
-  provided is a lease: a reader idle across two publications can still
-  have its generation collected, so long-lived consumers should resolve
-  `current` once, hold the directory open, and re-resolve on ENOENT.
+  that generation survives one further publication before it becomes
+  collectable — retention is implemented by the `previous` symlink and
+  applies on the warm-reuse path too, so a reader that resolved a *path*
+  (holding no descriptor) is protected, not only one holding an open
+  directory. (The previous publish-by-rename design gave such a reader an
+  `ENOENT` window instead; that window is gone.) What is *not* provided
+  is a lease: a reader idle across **two** publications can still have
+  its generation collected, so long-lived consumers should re-resolve
+  `current` on ENOENT.
 - **`just test` proves EXPORT repeatability, not build determinism.**
   Regeneration finds the payloads already realised in the store, so it
   re-serialises, recompresses and re-signs them — it never rebuilds.

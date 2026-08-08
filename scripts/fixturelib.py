@@ -77,6 +77,13 @@ OUT_MARKER = ".nix-p2p-fixture-out"
 # recoverable-but-stranded intermediate state to describe.
 GENERATIONS_DIR = "generations"
 CURRENT_LINK = "current"
+# Retention is "the published generation and the one before it". That claim was
+# made in round 5 and not implemented: the warm reuse path had no idea what the
+# predecessor was and collected it immediately, so a reader that resolved a
+# PATH (rather than holding a descriptor) got ENOENT after publish+reuse. A
+# second symlink is the whole implementation - a pointer, not duplicated state -
+# and it makes the retention claim auditable with `ls -l fixtures/out`.
+PREVIOUS_LINK = "previous"
 
 
 def generation_link_target(name: str) -> str:
@@ -89,34 +96,82 @@ def generation_link_target(name: str) -> str:
     return f"{GENERATIONS_DIR}/{name}"
 
 
+def anchored_generations(out_root: Path) -> Path | None:
+    """`<out_root>/generations`, but only if it REALLY is inside out_root.
+
+    Every deletion this tooling performs happens under this directory, so it is
+    the single anchor the whole publication root hangs from. Confining the
+    `current` link's text was not enough: with `generations` itself a symlink to
+    somewhere else, the link text `generations/gen-x` was perfectly well-formed,
+    the gate verified a tree outside the root, and the collector deleted a
+    marked directory outside the root. Comparing the resolved path against the
+    resolved root is what makes "inside" mean inside rather than "spelled like
+    it is inside".
+
+    Returns None rather than raising: the generator repairs this by refusing
+    loudly with a remediation, the gate refuses to verify. Both need to say it
+    in their own voice.
+    """
+    generations = out_root / GENERATIONS_DIR
+    if generations.is_symlink() or not generations.is_dir():
+        return None
+    try:
+        anchored = generations.resolve(strict=True)
+        root = out_root.resolve(strict=True)
+    except OSError:
+        return None
+    # `not is_symlink()` already implies this for a direct child; the explicit
+    # comparison is what a reader (and an auditor) can check without having to
+    # reconstruct that argument, and it survives the directory being replaced
+    # by something cleverer later.
+    if anchored != root / GENERATIONS_DIR:
+        return None
+    return generations
+
+
+def _resolve_generation_link(out_root: Path, link_name: str) -> Path | None:
+    """Resolve one of the publication symlinks to a real generation directory.
+
+    Shared by `current` and `previous` so the two cannot drift apart in how
+    strictly they are confined - the collector trusts both.
+    """
+    link = out_root / link_name
+    if not link.is_symlink():
+        return None
+    generations = anchored_generations(out_root)
+    if generations is None:
+        return None
+    target = Path(os.path.normpath(os.path.join(out_root, os.readlink(link))))
+    if target.parent != generations or target.name in ("", ".", ".."):
+        return None
+    # The final component may itself be a symlink, so `generations/gen-x ->
+    # /elsewhere` satisfied every check above while the gate read
+    # /elsewhere/manifest.json. A generation is a real directory, always.
+    if target.is_symlink() or not target.is_dir():
+        return None
+    return target
+
+
 def resolve_current(out_root: Path) -> Path | None:
     """The generation `<out_root>/current` points at, or None.
 
-    None covers every way there is nothing trustworthy to resolve: no link at
-    all, a `current` that is not a symlink, or a link that does not name a
-    direct child of `<out_root>/generations`. The last is confinement, and it
-    is the same species as the manifest-url check below: `current` is joined
-    onto the publication root by every consumer, so an unconfined target
-    (`../../somewhere`, an absolute path) would have the gate verify - and the
-    mock upstream serve - a directory that is not a generation at all. Only the
-    exact shape publication produces is accepted.
+    None covers every way there is nothing trustworthy to resolve: no link, a
+    `current` that is not a symlink, a target that is not a direct child of an
+    anchored `generations/`, or a target that is itself a symlink. `current` is
+    joined onto the publication root by every consumer, so an unconfined target
+    would have the gate verify - and the mock upstream serve - a directory that
+    is not a generation at all.
 
     The generator treats None as "publish over it", which repairs a malformed
     link; the gate treats it as "nothing is published", which refuses.
     """
-    link = out_root / CURRENT_LINK
-    if not link.is_symlink():
-        return None
-    target = Path(os.path.normpath(os.path.join(out_root, os.readlink(link))))
-    if target.parent != out_root / GENERATIONS_DIR or target.name in ("", ".", ".."):
-        return None
-    # Confining the link TEXT is not enough: the final component may itself be
-    # a symlink, so `generations/gen-x -> /elsewhere` satisfied every check
-    # above while the gate read /elsewhere/manifest.json and the mock upstream
-    # served /elsewhere/cache. A generation is a real directory, always.
-    if target.is_symlink():
-        return None
-    return target
+    return _resolve_generation_link(out_root, CURRENT_LINK)
+
+
+def resolve_previous(out_root: Path) -> Path | None:
+    """The generation retained for readers that resolved `current` before the
+    last flip. Same confinement as `current`; None when there is none."""
+    return _resolve_generation_link(out_root, PREVIOUS_LINK)
 
 
 # Tiers are a property of the WORKLOAD, so they live in the lock rather than in
@@ -161,6 +216,23 @@ class LockError(Exception):
     """The committed lock is unusable, so nothing can be proven against it."""
 
 
+def read_no_follow(path: Path) -> str:
+    """Read a file, refusing to follow a symlink at the final component.
+
+    Used for the tracked lock, which is the definition of the frozen workload.
+    A symlink there would mean the workload every gate checks against is
+    whatever the link points at - and commit_lock could turn the tracked lock
+    INTO a symlink until this round, so this is not hypothetical. Reading
+    through one would launder that into a green run.
+    """
+    descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
+    try:
+        with os.fdopen(descriptor, "r", closefd=False) as handle:
+            return handle.read()
+    finally:
+        os.close(descriptor)
+
+
 def load_lock(repo: Path) -> dict:
     """Read AND validate the lock. An unusable lock is never a soft signal.
 
@@ -173,7 +245,7 @@ def load_lock(repo: Path) -> dict:
     """
     path = lock_path(repo)
     try:
-        lock = json.loads(path.read_text())
+        lock = json.loads(read_no_follow(path))
     except OSError as exc:
         raise LockError(f"cannot read {path}: {exc}") from exc
     except ValueError as exc:
@@ -464,45 +536,158 @@ def confined_blob(cache: Path, url) -> tuple[Path | None, str | None]:
     return candidate, None
 
 
+def symlink_problems(root: Path) -> list[str]:
+    """A generation tree must contain ZERO symlinks. Reports every one found.
+
+    Not a stylistic rule - it is the anchor that makes every other confinement
+    check sufficient. `confined_blob` walks the components BELOW `cache/`, so
+    replacing `cache` itself with a symlink to an external tree slipped past
+    it: the gate hashed, verified and served someone else's directory and
+    exited 0. Rather than teach each check to re-derive containment from a
+    different starting point, the tree is required to have no symlinks at all,
+    which is trivially true of anything this generator produces
+    (`normalise_tree` refuses to create one) and makes "resolved path stays
+    inside" hold by construction.
+
+    `current` and `previous` are symlinks, and they live OUTSIDE the
+    generation, in the publication root - which is exactly why this rule can be
+    absolute in here.
+    """
+    problems = []
+    if root.is_symlink():
+        problems.append(
+            f"{root.name} is a symlink; a generation must be a real directory"
+        )
+        return problems
+    for path in sorted(root.rglob("*")):
+        if path.is_symlink():
+            problems.append(
+                f"{path.relative_to(root)} is a symlink (-> {os.readlink(path)}); a "
+                "generation must contain none, so that every path inside it is "
+                "provably inside it"
+            )
+    return problems
+
+
 def narinfo_name(store_path: str) -> str:
     """`<hash>.narinfo`, the filename a client asks for. Defined once."""
     return f"{PurePosixPath(store_path).name.split('-')[0]}.narinfo"
 
 
+# Fields the fixture's own checks read out of a narinfo. Deriver and friends
+# are optional; these are not, and an absent one means the file cannot do its
+# job even though it exists.
+REQUIRED_NARINFO_FIELDS = (
+    "StorePath",
+    "URL",
+    "Compression",
+    "FileHash",
+    "FileSize",
+    "NarHash",
+    "NarSize",
+    "References",
+    "Sig",
+)
+
+
 def completeness_problems(cache: Path, manifest: dict) -> list[str]:
-    """The files a served cache must contain besides its NAR blobs.
+    """Everything about a served cache that is cheap to check without hashing.
 
-    A binary cache is `nix-cache-info` plus one narinfo per path plus the
-    blobs. blob_problems() covers only the last of those, which left a real
-    hole: deleting `nix-cache-info` or a narinfo from a published tree produced
-    a tree the GATE rejects and the GENERATOR happily reused, so
-    `just fixtures` reported success, `just test` failed, and the failure's own
-    advice was to run `just fixtures`. An unbreakable loop out of a one-file
-    deletion, escapable only by `rm -rf` - which is documented nowhere except
-    for the layout migration.
+    Presence AND structure: `nix-cache-info` parses and says what the manifest
+    says it says, and every payload's narinfo exists, is non-empty, parses,
+    carries the fields the fixture depends on, describes the right store path,
+    and bears a signature that verifies against the manifest's public key.
 
-    Split out rather than folded into blob_problems() because these are
-    presence checks on files whose contents other checks own (the gate compares
-    nix-cache-info against an independently stated expectation, and narinfo
-    signatures are verified at generation time). Shared so "is this tree the
-    workload" means one thing to the generator's reuse shortcut and to the gate.
+    The scope grew because the previous version's scope was the defect. Reuse
+    and the gate are supposed to share one definition of "is this the pinned
+    workload"; when reuse checked strictly less, a tree the gate rejected was
+    reported as reusable, `just fixtures` became a no-op, and the gate's own
+    advice ("regenerate") could not fix what it had just detected. Every class
+    the gate can reject a TREE for has to be visible here, or the repair loop
+    does not terminate.
+
+    Signature verification lives here rather than in the gate alone for the
+    same reason: it is the one remaining thing a damaged narinfo could fail
+    that hashing the NAR blobs would not catch.
     """
     problems = []
-    if not (cache / "nix-cache-info").is_file():
+    info = cache / "nix-cache-info"
+    if not info.is_file():
         problems.append("nix-cache-info is missing; the cache advertises nothing")
+    else:
+        declared = {k: str(v) for k, v in (manifest.get("cache_info") or {}).items()}
+        try:
+            served = {}
+            for line in info.read_text().splitlines():
+                if not line.strip():
+                    continue
+                key, separator, value = line.partition(": ")
+                if not separator:
+                    raise ValueError(f"malformed line {line!r}")
+                if key in served:
+                    raise ValueError(f"repeated key {key!r}")
+                served[key] = value
+        except (OSError, ValueError, UnicodeDecodeError) as error:
+            problems.append(f"nix-cache-info cannot be parsed: {error}")
+        else:
+            if served != declared:
+                problems.append(
+                    f"nix-cache-info on disk is {served}, but manifest.json declares "
+                    f"{declared}; the cache does not advertise what it claims to"
+                )
+
+    public_line = manifest.get("public_key")
     for entry in manifest.get("paths", []):
+        attr = entry.get("attr")
         store_path = entry.get("store_path")
         if not isinstance(store_path, str) or not store_path:
-            problems.append(f"payload {entry.get('attr')!r} has no store_path")
+            problems.append(f"payload {attr!r} has no store_path")
             continue
-        narinfo, refusal = confined_blob(cache, narinfo_name(store_path))
+        name = narinfo_name(store_path)
+        narinfo, refusal = confined_blob(cache, name)
         if refusal is not None:
-            problems.append(f"payload {entry.get('attr')!r}: {refusal}")
-        elif not narinfo.is_file():
+            problems.append(f"payload {attr!r}: {refusal}")
+            continue
+        if not narinfo.is_file():
             problems.append(
-                f"payload {entry.get('attr')!r}: {narinfo_name(store_path)} is "
-                "missing, so the path it describes cannot be substituted"
+                f"payload {attr!r}: {name} is missing, so the path it describes "
+                "cannot be substituted"
             )
+            continue
+        try:
+            text = narinfo.read_text()
+        except (OSError, UnicodeDecodeError) as error:
+            problems.append(f"payload {attr!r}: {name} cannot be read: {error}")
+            continue
+        if not text.strip():
+            problems.append(
+                f"payload {attr!r}: {name} is empty; a zero-byte narinfo is served "
+                "as a valid answer and substitutes nothing"
+            )
+            continue
+        try:
+            pairs = parse_narinfo(text)
+        except ValueError as error:
+            problems.append(f"payload {attr!r}: {name} does not parse: {error}")
+            continue
+        missing = [
+            f for f in REQUIRED_NARINFO_FIELDS if not any(k == f for k, _ in pairs)
+        ]
+        if missing:
+            problems.append(f"payload {attr!r}: {name} is missing field(s) {missing}")
+            continue
+        if field(pairs, "StorePath") != store_path:
+            problems.append(
+                f"payload {attr!r}: {name} describes "
+                f"{field(pairs, 'StorePath')!r}, manifest says {store_path!r}"
+            )
+            continue
+        if isinstance(public_line, str) and public_line:
+            if not verify_narinfo(pairs, public_line):
+                problems.append(
+                    f"payload {attr!r}: {name} carries a Sig that does not verify "
+                    "against the manifest's public key"
+                )
     return problems
 
 

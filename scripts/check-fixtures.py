@@ -188,7 +188,8 @@ def check_matches_lock(repo: Path, generation: Path, manifest: dict) -> None:
     lock = fx.load_lock(repo)
     cache = generation / "cache"
     problems = (
-        fx.lock_problems(manifest, lock)
+        fx.symlink_problems(generation)
+        + fx.lock_problems(manifest, lock)
         + fx.completeness_problems(cache, manifest)
         + fx.blob_problems(cache, manifest)
     )
@@ -197,8 +198,12 @@ def check_matches_lock(repo: Path, generation: Path, manifest: dict) -> None:
             "the fixture is NOT the workload pinned in "
             "fixtures/workload.lock.json:\n  - "
             + "\n  - ".join(problems)
-            + "\n\nIf the tree is merely incomplete, regenerate it "
-            "(`just fixtures` / `just fixtures-large`). If the pinned workload "
+            + f"\n\nIf the tree is merely damaged, regenerate it "
+            "(`just fixtures` / `just fixtures-large`): the generator checks the "
+            "same things this does, so it will rebuild rather than reuse, and it "
+            "publishes beside a damaged generation rather than refusing. If it "
+            f"still reports 'reused', remove the generation and rerun: rm -rf "
+            f"{generation}\nIf the pinned workload "
             "itself is meant to change, note that doing so RETIRES the J2 "
             "measurement baseline: bump fixtures/WORKLOAD_VERSION, run "
             "`gen-fixtures.py --large --write-lock`, update the TESTING.md "
