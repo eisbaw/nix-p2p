@@ -3,10 +3,10 @@ id: TASK-16
 title: >-
   Baseline read-out: run the measurement, record it, proceed to wave 2 (NOT a
   kill gate)
-status: To Do
+status: Done
 assignee: []
 created_date: '2026-08-07 22:06'
-updated_date: '2026-08-08 17:30'
+updated_date: '2026-08-08 17:33'
 labels:
   - checkpoint
 dependencies:
@@ -22,8 +22,8 @@ Decision task, not code (inserted at review gate: hardening a product whose pref
 
 ## Acceptance Criteria
 <!-- AC:BEGIN -->
-- [ ] #1 Decision recorded via backlog decision log citing baseline numbers: continue / adjust / stop
-- [ ] #2 If adjust or stop: task-15 re-plan scope updated BEFORE any hardening work starts
+- [x] #1 Decision recorded via backlog decision log citing baseline numbers: continue / adjust / stop
+- [x] #2 If adjust or stop: task-15 re-plan scope updated BEFORE any hardening work starts
 <!-- AC:END -->
 
 ## Implementation Notes
@@ -37,3 +37,9 @@ SCOPE CHANGE (owner, 2026-08-08): 'dont worry about kill criterion keep going, b
 
 J2 baseline is recorded with provenance + two agreeing runs + informational answers (task-12 done, TESTING.md). Numbers for the checkpoint: payload NAR egress 115,934,829 B/workload identical on both arms (offload 0.0, wave-1 by construction - not a failure); narinfo->nar gap sub-millisecond on loopback (prefetch window structurally near-zero HERE, but loopback-limited - task-35 re-measures on a real upstream); S4 p95 bound UNUSABLE (A/A noise floor >10%, task-32). Gap question (PRD risk 3): on loopback the window does NOT leave room to mask a 1-4s DHT resolve, but the real-upstream gap is unmeasured so this is not a settled verdict. Owner has descoped the kill criterion; standing intent is continue.
 <!-- SECTION:NOTES:END -->
+
+## Final Summary
+
+<!-- SECTION:FINAL_SUMMARY:BEGIN -->
+DONE as a baseline READ-OUT (owner descoped the kill criterion 2026-08-08: proceed to wave-2 regardless). Decision recorded: PROCEED. The J2 baseline is recorded in TESTING.md (task-12) with provenance (workload nix-p2p-fixture-workload-v1 / gen-d2ab43402b88715a, counting rule net-upstream-egress-v2, fixture pubkey nix-p2p-test-1): payload egress 115,934,829 B identical both arms -> offload 0.0 (wave-1 by construction, no p2p; validates the instrument). S4 latency axis flagged UNUSABLE (container podman-startup jitter, task-32). Prefetch-window read (informational): sub-ms gap on LOOPBACK means a 1-4s DHT resolve can't be prefetch-masked HERE, but loopback carries no real RTT - NOT a real-upstream verdict; task-35 re-measures against real cache.nixos.org. No GO/NO-GO gate (descoped); hand to task-15 wave-2 planning.
+<!-- SECTION:FINAL_SUMMARY:END -->
