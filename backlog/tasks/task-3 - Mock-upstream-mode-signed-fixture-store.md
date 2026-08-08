@@ -4,7 +4,7 @@ title: Mock upstream mode + signed fixture store
 status: In Progress
 assignee: []
 created_date: '2026-08-07 21:55'
-updated_date: '2026-08-08 06:51'
+updated_date: '2026-08-08 06:58'
 labels:
   - irreversible
 dependencies:
@@ -231,4 +231,18 @@ DEFERRED (codex residual finding 4) filed as TASK-21 (label deferred-finding): g
 gate round 8: build/lint/fmt/test/fixtures-large/fixtures-verify-rebuild/package all exit 0; nix build .#daemon .#testproxy exit 0; nix flake check exit 0 (9 checks - lock-sources joins). cargo 2/2. Full tier: 12 ok, 4 positive controls, 3 bites, 0 PARTIAL. Determinism: two fresh roots same name, diff -r exit 0, digests equal over 19 entries. Reuse repair loop terminates; 3 concurrent generators exit 0 0 0. Lock byte-identical (a39382de8782d6f7) and served content byte-identical - unchanged since round 2.
 
 Round-9 adjudication (TERMINAL, no round 10): codex round-8 verified the design-B redesign is CORRECT (split structurally gone via 10k concurrent flips; freeze check sound; byte-identical regression). The lone open item is guard-completeness: check-lock-sources.py catches known call-names but not a raw read_text() of the baseline path, so AC1's literal 'proves no runtime code opens the git baseline' is not met. Round 9 strengthens the guard to statically reject EVERY ORDINARY reintroduction (AST call-names + literal baseline path/filename string scan across runtime modules) and DOCUMENTS the irreducible residual (a dynamically-constructed path evades any static lint). AC1 'proves' is interpreted as 'statically rejects every ordinary reintroduction + honest residual' - a static guard cannot prove a negative against arbitrary code; this is disclosed honest interpretation, not AC-gaming (the guard is strengthened to its real limit, the gap disclosed, not the test weakened to pass). On verification that the strengthened guard bites codex's exact evasion (raw read_text), task-3 CLOSES. Further guard-obfuscation nitpicks -> hardening wave, not another round.
+
+ROUND 9 (commit e5ddb7c). awaiting deep gate (round 9). TERMINAL - one lint-only fix to the round-8 regression guard, then task-3 closes. Round-8 gate was QA GO / codex GO on design B itself (split structurally gone, verified at 10k concurrent flips; freeze check sound; regression byte-identical) with ONE guard-completeness gap.
+
+THE GAP: scripts/check-lock-sources.py enforced acceptance condition 1 by AST call-NAMES only, so codex's evasion - a raw (repo / 'fixtures' / 'workload.lock.json').read_text() injected into gate code - exited 0. Reproduced failing first.
+
+THE FIX (no runtime code touched): (1) the governed set is now DENY-BY-DEFAULT - every scripts/*.py except the baseline owner gen-fixtures.py, the reader-defining library fixturelib.py, and the guard itself - computed by glob, so a NEW runtime script is covered with no allowlist edit; (2) a name-REFERENCE scan (was call-only) catches an aliased reader (x = fx.load_baseline; x(repo) references the attribute even without calling that name); (3) a literal scan on governed modules fails any that name 'workload.lock.json' in a non-docstring string constant - which is what bites codex's raw read. Docstrings are excluded (a literal that reaches the file is never a docstring); the owner and library are exempt from the literal scan because they legitimately name the file in help/messages/definitions, and the owner is protected instead by the reference scan.
+
+Four bites (evidence in the git note): (a) codex's raw read_text of the baseline in gate code -> exit 1 (literal); (b) a load_baseline alias in gate code -> exit 1 (reference); (c) a brand-new runtime script reading the baseline -> exit 1 (deny-by-default), and a variant naming the literal -> exit 1; (d) HEAD clean -> exit 0. Plus an alias smuggled into a non-owner gen-fixtures function -> exit 1.
+
+HONEST RESIDUAL, documented in the script docstring, NOT fixed (irreducible): a dynamically-assembled path ('.'.join(['workload','lock','json']), os.path.join over computed fragments) names the baseline with no literal and no known reader-name and evades both checks - demonstrated, exit 0. A static guard cannot prove a negative against arbitrary code; it rejects every ordinary/literal reintroduction (the accidental read, copy-paste, rename, new script) which is what a regression guard is for, and does not defeat a deliberately obfuscated dynamic read. This is the honest content of AC1's word 'proves'.
+
+INVARIANT unchanged (lint-only, verified): git baseline a39382de8782d6f7; served cache 9 files / 115,937,013 bytes; embedded gen-<sha>/lock.json byte-identical to the git baseline. Only scripts/check-lock-sources.py changed.
+
+gate round 9: build/lint/fmt/test/fixtures-large/fixtures-verify-rebuild/package all exit 0; nix build .#daemon .#testproxy exit 0; nix flake check exit 0 (still 9 checks). cargo 2/2. Full tier: 12 ok, 4 positive controls, 3 bites, 0 PARTIAL. Stubs untouched.
 <!-- SECTION:NOTES:END -->
