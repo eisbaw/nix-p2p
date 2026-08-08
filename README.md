@@ -1,5 +1,10 @@
 # nix-p2p
 
+> **Work in progress — nothing here is stable.** The name "nix-p2p" is
+> tentative. The p2p protocol is not settled: the DHT mechanism, the claim
+> schema freeze, and the transport details are open wave-2 design work.
+> Expect interfaces, on-disk formats, and claims in this README to change.
+
 A decentralized Nix binary cache: a localhost substituter daemon that serves
 the standard binary-cache HTTP API, passes signed metadata through from
 cache.nixos.org, and (wave 2) fetches NAR payloads from a p2p swarm,
