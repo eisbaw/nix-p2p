@@ -4,7 +4,7 @@ title: Mock upstream mode + signed fixture store
 status: In Progress
 assignee: []
 created_date: '2026-08-07 21:55'
-updated_date: '2026-08-08 01:15'
+updated_date: '2026-08-08 01:30'
 labels:
   - irreversible
 dependencies:
@@ -136,4 +136,6 @@ NEW-12 (tier_of). Mapped any unknown attr to 'fast' - the same fail-open species
 QA INFORMATIONAL folded in: tree_digest's docstring now states what the mtime/mode comparison cannot catch - the generator writes the same fixed values into both trees, so the comparison detects EXTERNAL mutation of a published tree and never drift in the generator itself (if normalisation broke, both sides would break identically and still compare equal). What actually pins the intended values is that they are constants in fixturelib, reviewable in a diff.
 
 gate round 4: build/lint/fmt exit 0; test exit 0 (4s cold); fixtures-large exit 0 (5s, 12 ok / 0 PARTIAL); fixtures-verify-rebuild exit 0 (3s); package exit 0; nix build .#daemon .#testproxy exit 0; nix flake check exit 0 (3s, 8 checks). cargo 2/2. Determinism: diff -r exit 0 over 13 files / 115,939,516 bytes, and metadata-aware digests equal over 18 entries. Stubs untouched (4x '0 scenarios registered - NOT a pass').
+
+Orchestrator adjudication after deep-gate round 4 (codex NO-GO #4, five new blockers all inside the bespoke retire/quarantine/rollback machinery): STOP PATCHING, SIMPLIFY. Rounds 2-4 each grew transaction code that the next review broke - the machinery is the defect surface. Round 5 redesigns publication to immutable generation dirs + atomic symlink flip (publish = one atomic op; lock-commit failure = swap symlink back; no quarantine concept). Point fixes that survive the redesign: blob path confinement, strict lock schema, cache_info expected-keys iteration, fd-based marker-verified deletion. Fresh implementer per context-fatigue rule; incumbent's four rounds of notes are the onboarding.
 <!-- SECTION:NOTES:END -->
