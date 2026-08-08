@@ -433,13 +433,17 @@ impl NarinfoSource for NarinfoDiskCache {
         // poison from disk.
         //
         // NEVER cache a response the serving layer will FAIL CLOSED on (codex
-        // re-gate #2a): a 200 carrying an unsupported transfer-coding is turned
-        // into a 502 by the server, so caching it would make request #2 a HIT that
-        // serves 200 - an error response smuggled into the cache as a positive. The
-        // synthesised cache-hit response drops the Transfer-Encoding header, which
-        // is exactly how the divergence would leak. Gate insertion on it here.
+        // re-gate): a 200 the server turns into a 502 (unsupported transfer-coding
+        // OR a malformed Connection header) must not be cached, or request #2 would
+        // be a HIT serving 200 - an error response smuggled in as a positive. The
+        // synthesised cache-hit response drops those headers, which is exactly how
+        // the divergence would leak. Gate insertion on the SAME predicate the
+        // server uses, so a fully-received, well-formed, servable 200 - and only
+        // that - is cached.
         let cacheable = is_well_formed_narinfo(&bytes)
-            && !crate::source::has_unsupported_transfer_coding(&headers);
+            && !crate::source::has_unsupported_transfer_coding(&headers)
+            && !crate::source::connection_header_is_malformed(&headers)
+            && !crate::source::has_ambiguous_framing(&headers);
         if cacheable {
             self.install(
                 store_hash.as_str(),

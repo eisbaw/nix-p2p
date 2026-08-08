@@ -421,6 +421,7 @@ fn is_hop_by_hop(name: &HeaderName) -> bool {
 fn must_fail_closed(headers: &HeaderMap) -> bool {
     crate::source::has_unsupported_transfer_coding(headers)
         || crate::source::connection_header_is_malformed(headers)
+        || crate::source::has_ambiguous_framing(headers)
 }
 
 /// Map a transport failure to a fast, clean gateway error so Nix falls back.

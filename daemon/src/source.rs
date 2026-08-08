@@ -191,6 +191,18 @@ pub(crate) fn has_unsupported_transfer_coding(headers: &HeaderMap) -> bool {
     }
 }
 
+/// True if the response carries BOTH `Transfer-Encoding` and `Content-Length`
+/// (codex re-gate, RFC 7230 §3.3.3). A sender MUST NOT send both; when they
+/// conflict a recipient must ignore Content-Length, and the combination is a
+/// classic request/response-smuggling framing that hyper does not reliably
+/// de-chunk. Rather than forward an ambiguously-framed body (which truncated the
+/// client to the bogus `Content-Length`), the daemon FAILS CLOSED (502) - the
+/// clean, safe outcome. Also gates cache insertion: never cache such a response.
+pub(crate) fn has_ambiguous_framing(headers: &HeaderMap) -> bool {
+    headers.contains_key(http::header::TRANSFER_ENCODING)
+        && headers.contains_key(http::header::CONTENT_LENGTH)
+}
+
 /// True if any `Connection` header value contains a MALFORMED token - a byte
 /// that is not a valid HTTP token char, comma, or whitespace (obs-text, control,
 /// etc.), whether or not it sits next to a comma (codex re-gate #1). We cannot

@@ -326,6 +326,11 @@ fn serve_nar(
     let mut client_open = !request.is_head();
     let mut truncated = false;
     let mut cache_failed = false;
+    // Bytes actually received from upstream, and whether the upstream stream
+    // ended abnormally (a read error). A premature EOF is detected by comparing
+    // `received` to the declared length after the loop (codex re-gate #2b).
+    let mut received: u64 = 0;
+    let mut source_error = false;
     let mut buf = [0u8; STREAM_BUF];
 
     loop {
@@ -334,9 +339,11 @@ fn serve_nar(
             Ok(n) => n,
             Err(err) => {
                 eprintln!("testproxy: source read error for {}: {err}", request.path());
+                source_error = true;
                 break;
             }
         };
+        received += n as u64;
         let chunk = &buf[..n];
 
         // Cache always gets the full, correct bytes.
@@ -387,10 +394,22 @@ fn serve_nar(
         }
     }
 
-    // Publish the cache entry only after the whole correct body was captured.
-    // On a cache write error, drop the writer uncommitted (tmp is cleaned).
+    // Publish the cache entry only if the WHOLE upstream body was captured
+    // cleanly. A premature EOF (fewer bytes than the declared Content-Length), a
+    // source read error, or a cache write error must NOT commit - else a short
+    // NAR would be cached and served as a self-consistent "complete" 200 on the
+    // next hit (codex re-gate #2b). No declared length -> a clean EOF is complete
+    // (close-delimited; the Nix client is still the NarHash arbiter).
+    let incomplete = total_len.is_some_and(|len| received != len);
     if let Some(writer) = writer.take() {
-        if cache_failed {
+        if cache_failed || source_error || incomplete {
+            if incomplete {
+                eprintln!(
+                    "testproxy: premature EOF for {} ({received} of {} bytes); not caching",
+                    request.path(),
+                    total_len.unwrap_or(0)
+                );
+            }
             drop(writer);
         } else if let Err(err) = writer.commit(&disk) {
             eprintln!(

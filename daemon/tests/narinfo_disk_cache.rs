@@ -868,3 +868,63 @@ async fn cache_layer_bounds_oversized_narinfo_body() {
         .count();
     assert_eq!(nic, 0, "no oversized entry may be cached");
 }
+
+/// A source returning a 200 with a malformed Connection header and a body.
+struct BadConnSource {
+    hits: AtomicUsize2,
+    body: Vec<u8>,
+}
+
+#[async_trait]
+impl NarinfoSource for BadConnSource {
+    async fn fetch(&self, _hash: &StoreHash) -> Result<UpstreamResponse, SourceError> {
+        self.hits.fetch_add(1, Ordering::SeqCst);
+        let mut headers = HeaderMap::new();
+        // obs-text fused into a token: malformed -> server 502s it.
+        headers.insert(
+            http::header::CONNECTION,
+            http::HeaderValue::from_bytes(b"X-Hop\xff").unwrap(),
+        );
+        Ok(UpstreamResponse {
+            status: 200,
+            headers,
+            body: full(self.body.clone()),
+        })
+    }
+}
+
+/// FIX 2a (companion): a 200 with a malformed Connection header (which the server
+/// turns into a 502) must NOT be cached either - same never-cache-an-error rule.
+#[tokio::test]
+async fn malformed_connection_200_is_not_cached() {
+    let dir = TempDir::new("conn-nocache");
+    let body = narinfo(
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-x",
+        "1abc.nar.xz",
+        "sha256:deadbeef",
+        4096,
+    );
+    let upstream = Arc::new(BadConnSource {
+        hits: AtomicUsize2::new(0),
+        body,
+    });
+    let cache = NarinfoDiskCache::new(
+        dir.path(),
+        upstream.clone(),
+        Arc::new(ManualClock::new(1000)),
+    )
+    .unwrap();
+    let _ = cache.fetch(&StoreHash::new(HASH)).await.unwrap();
+    let _ = cache.fetch(&StoreHash::new(HASH)).await.unwrap();
+    let nic = std::fs::read_dir(dir.path())
+        .unwrap()
+        .flatten()
+        .filter(|e| e.path().extension().is_some_and(|x| x == "nic"))
+        .count();
+    assert_eq!(nic, 0, "a malformed-Connection 200 must not be cached");
+    assert_eq!(
+        upstream.hits.load(Ordering::SeqCst),
+        2,
+        "request #2 must reach upstream again (no cached 200)"
+    );
+}

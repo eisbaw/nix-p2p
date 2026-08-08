@@ -269,6 +269,34 @@ async fn multi_coding_transfer_encoding_fails_closed() {
     }
 }
 
+/// Transfer-Encoding + conflicting Content-Length (codex re-gate, RFC 7230
+/// §3.3.3): a response carrying BOTH is an ambiguous, smuggling-risk framing that
+/// hyper does not reliably de-chunk, and forwarding the upstream `Content-Length:
+/// 2` truncated the client to `he` of the 5-byte `hello`. The daemon must FAIL
+/// CLOSED (a clean 502) - and in particular must NEVER emit the truncated `he`.
+#[tokio::test]
+async fn transfer_encoding_with_conflicting_content_length_fails_closed() {
+    let response: &[u8] = b"HTTP/1.1 200 OK\r\n\
+        Transfer-Encoding: chunked\r\n\
+        Content-Length: 2\r\n\
+        \r\n5\r\nhello\r\n0\r\n\r\n";
+    let addr = raw_origin(response);
+    let (daemon, _h) = spawn_daemon(&format!("http://{addr}")).await;
+    let r = get(daemon, "/log/x").await;
+    assert_eq!(
+        r.status,
+        Some(502),
+        "TE + conflicting CL must fail closed, got status={:?} body={:?}",
+        r.status,
+        r.body_string()
+    );
+    assert_ne!(
+        r.body_string(),
+        "he",
+        "must NEVER emit the body truncated to the bogus Content-Length"
+    );
+}
+
 /// Bounded narinfo body (codex, task-13): an oversized narinfo must be rejected
 /// (502), not buffered into OOM. MAX_NARINFO_BYTES is 2 MiB; serve 3 MiB.
 #[tokio::test]
