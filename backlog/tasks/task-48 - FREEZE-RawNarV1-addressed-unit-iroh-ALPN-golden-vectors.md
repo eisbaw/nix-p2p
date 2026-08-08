@@ -4,7 +4,7 @@ title: 'FREEZE: RawNarV1 addressed unit + iroh ALPN (golden vectors)'
 status: In Progress
 assignee: []
 created_date: '2026-08-08 20:28'
-updated_date: '2026-08-08 21:24'
+updated_date: '2026-08-08 21:38'
 labels:
   - irreversible
 dependencies: []
@@ -56,4 +56,6 @@ FORWARD-CARRY: task-39 iroh addresses blobs by this Blake3Digest under IROH_BLOB
 Deep-gate architect GO (conditional on task-39 ALPN AC - now added). Non-blocking follow-ups noted: (3) BLAKE3_DOMAIN_SEPARATION guard is debug-only/decorative - consider const{assert!(is_none())} for compile-time bite in release; (4) the 'domain-separated would be caught' negative-control test is near-vacuous (the empty-vector pin af1349b9 is the real bite) - tighten in hardening. CRUX CONFIRMED: BLAKE3(raw NAR)==iroh blob hash (bao root == blake3::hash by construction).
 
 Deep-gate qa GO: all 6 bites verified by mutation (golden re-derivation genuine, recipe bite fires, determinism reproduced, no tautology). Non-blocking finding 2 (golden check soft-passes when fixtures absent) filed as a hardening task. Both Claude reviewers GO + crux confirmed; awaiting codex (the cross-model crux confirmation).
+
+Deep-gate codex NO-GO (3rd cross-model catch on a frozen surface): CRUX CONFIRMED by codex - BLAKE3(raw NAR) == iroh_blobs::Hash (iroh_blobs::Hash::new calls blake3::hash; bao root finalization == whole-content BLAKE3), AND /iroh-bytes/4 IS the real current iroh_blobs::ALPN (docs.rs verified - the ALPN guess was correct). But 3 wire-format canonicalization defects (claim.rs): (1) CRITICAL one claim can name two blobs (payload blake3 vs offer blake3 not enforced equal); (2) CRITICAL NarHashKey unrestricted String (freeze as strict sha256:<52 nix-base32>, align with source::NarHash); (3) HIGH malformed-KNOWN variant swallowed as Unknown (untagged) - same species as task-13. Both Claude reviewers (GO) checked the hash crux, missed the codec. Fix round sent. The ambiguous frozen wire is the walk-back-impossible risk the freeze exists to prevent.
 <!-- SECTION:NOTES:END -->
