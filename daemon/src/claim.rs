@@ -65,14 +65,16 @@
 //! The exact BYTE encoding of the addressed unit and of the transport locators is
 //! FROZEN by task-48, in two deliberately separated modules this one composes:
 //!   * [`crate::content_id::Blake3Digest`] - the UNIVERSAL, transport-independent
-//!     content identity (`BLAKE3(RawNarV1)`, canonical string `blake3:<hex>`). A
-//!     claim's payload and every offer carry it; it is the byte a peer is asked
-//!     for on any transport.
+//!     content identity (`BLAKE3(RawNarV1)`, canonical string `blake3:<hex>`). It
+//!     appears EXACTLY ONCE per claim - in the payload ([`KnownPayload::WholeNar`])
+//!     or once per [`HoldAnswer::Have`]; it is the byte a peer is asked for on any
+//!     transport.
 //!   * [`crate::transport::NodeId`] / [`crate::transport::BitTorrentInfoHash`] -
-//!     the per-TRANSPORT locators (an iroh ed25519 key; a BitTorrent infohash).
-//!     Not derivable from the content identity, and different per transport, which
-//!     is exactly why a claim carries both a universal identity and a
-//!     transport-specific locator.
+//!     the per-TRANSPORT locators (an iroh ed25519 key; a BitTorrent infohash). A
+//!     transport offer carries ONLY its locator, never the content digest, so a
+//!     claim cannot name two blobs. Not derivable from the content identity, and
+//!     different per transport, which is why a claim pairs the single universal
+//!     identity with per-transport locators.
 //!
 //! Earlier drafts held these as `String` placeholders; task-48 replaced them with
 //! the canonical typed encodings (their tests were updated for the new form).
@@ -510,12 +512,110 @@ fn check_size(len: usize) -> Result<(), ClaimCodecError> {
     }
 }
 
+/// A guard type that walks ANY JSON value purely to REJECT a repeated key at any
+/// object level (freeze round 4). It exists because `serde_json` SILENTLY accepts
+/// duplicate keys and keeps the LAST one - which on a FROZEN wire format is an
+/// ambiguous parse: a wire with two `payload.blake3` values, or a `kind` repeated
+/// (`whole_nar` then a future kind), would decode to a last-wins choice, so two
+/// independent implementations could disagree on the content identity or on
+/// whether a malformed known kind is present. Rejecting ANY repeated key gives
+/// EXACTLY ONE canonical parse - fail-closed, not last-wins. This runs BEFORE the
+/// real parse, over the WHOLE tree, so the later discriminator peek (which
+/// materialises a `Value`, itself last-wins) can never see a duplicate.
+struct NoDuplicateKeys;
+
+impl<'de> Deserialize<'de> for NoDuplicateKeys {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct GuardVisitor;
+
+        impl<'de> serde::de::Visitor<'de> for GuardVisitor {
+            type Value = NoDuplicateKeys;
+
+            fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str("any JSON value with no repeated object keys")
+            }
+
+            fn visit_bool<E: serde::de::Error>(self, _v: bool) -> Result<Self::Value, E> {
+                Ok(NoDuplicateKeys)
+            }
+            fn visit_i64<E: serde::de::Error>(self, _v: i64) -> Result<Self::Value, E> {
+                Ok(NoDuplicateKeys)
+            }
+            fn visit_u64<E: serde::de::Error>(self, _v: u64) -> Result<Self::Value, E> {
+                Ok(NoDuplicateKeys)
+            }
+            fn visit_f64<E: serde::de::Error>(self, _v: f64) -> Result<Self::Value, E> {
+                Ok(NoDuplicateKeys)
+            }
+            fn visit_str<E: serde::de::Error>(self, _v: &str) -> Result<Self::Value, E> {
+                Ok(NoDuplicateKeys)
+            }
+            fn visit_unit<E: serde::de::Error>(self) -> Result<Self::Value, E> {
+                Ok(NoDuplicateKeys)
+            }
+            fn visit_none<E: serde::de::Error>(self) -> Result<Self::Value, E> {
+                Ok(NoDuplicateKeys)
+            }
+            fn visit_some<D: serde::Deserializer<'de>>(
+                self,
+                deserializer: D,
+            ) -> Result<Self::Value, D::Error> {
+                NoDuplicateKeys::deserialize(deserializer)
+            }
+
+            fn visit_seq<A: serde::de::SeqAccess<'de>>(
+                self,
+                mut seq: A,
+            ) -> Result<Self::Value, A::Error> {
+                // Recurse into every element so a duplicate key nested inside an
+                // array of objects is caught too.
+                while seq.next_element::<NoDuplicateKeys>()?.is_some() {}
+                Ok(NoDuplicateKeys)
+            }
+
+            fn visit_map<A: serde::de::MapAccess<'de>>(
+                self,
+                mut map: A,
+            ) -> Result<Self::Value, A::Error> {
+                let mut seen = std::collections::HashSet::new();
+                while let Some(key) = map.next_key::<String>()? {
+                    if !seen.insert(key.clone()) {
+                        return Err(serde::de::Error::custom(format!(
+                            "duplicate key {key:?} (ambiguous wire is rejected)"
+                        )));
+                    }
+                    // Recurse into the value: a duplicate nested key must be caught
+                    // wherever it hides.
+                    map.next_value::<NoDuplicateKeys>()?;
+                }
+                Ok(NoDuplicateKeys)
+            }
+        }
+
+        deserializer.deserialize_any(GuardVisitor)
+    }
+}
+
+/// Reject a wire input containing a repeated key at ANY object level, so the
+/// input has exactly one canonical parse (see [`NoDuplicateKeys`]). Runs after the
+/// size gate, before the typed parse.
+fn reject_duplicate_keys(bytes: &[u8]) -> Result<(), ClaimCodecError> {
+    let mut de = serde_json::Deserializer::from_slice(bytes);
+    NoDuplicateKeys::deserialize(&mut de).map_err(|e| ClaimCodecError::Malformed(e.to_string()))?;
+    // No trailing tokens after the single value, matching `from_slice`'s contract.
+    de.end()
+        .map_err(|e| ClaimCodecError::Malformed(e.to_string()))?;
+    Ok(())
+}
+
 /// Decode + VALIDATE a claim. Parsing alone is not acceptance: the input is
-/// size-bounded, the `schema_version` is checked, an unknown payload/transport
-/// KIND is tolerated-but-dropped (never carried), and a malformed KNOWN kind is a
-/// hard error.
+/// size-bounded, DUPLICATE-KEY-rejected (one canonical parse), the
+/// `schema_version` is checked, an unknown payload/transport KIND is
+/// tolerated-but-dropped (never carried), and a malformed KNOWN kind is a hard
+/// error.
 pub fn decode_claim(bytes: &[u8]) -> Result<Claim, ClaimCodecError> {
     check_size(bytes.len())?;
+    reject_duplicate_keys(bytes)?;
     let claim: Claim =
         serde_json::from_slice(bytes).map_err(|e| ClaimCodecError::Malformed(e.to_string()))?;
     check_version(claim.schema_version, CLAIM_SCHEMA_VERSION)?;
@@ -527,9 +627,10 @@ pub fn encode_hold_query(query: &HoldQuery) -> Result<Vec<u8>, ClaimCodecError> 
     serde_json::to_vec(query).map_err(|e| ClaimCodecError::Malformed(e.to_string()))
 }
 
-/// Decode + validate a hold query (size- and version-checked).
+/// Decode + validate a hold query (size-, duplicate-key- and version-checked).
 pub fn decode_hold_query(bytes: &[u8]) -> Result<HoldQuery, ClaimCodecError> {
     check_size(bytes.len())?;
+    reject_duplicate_keys(bytes)?;
     let query: HoldQuery =
         serde_json::from_slice(bytes).map_err(|e| ClaimCodecError::Malformed(e.to_string()))?;
     check_version(query.schema_version, QUERY_SCHEMA_VERSION)?;
@@ -541,9 +642,10 @@ pub fn encode_hold_response(response: &HoldResponse) -> Result<Vec<u8>, ClaimCod
     serde_json::to_vec(response).map_err(|e| ClaimCodecError::Malformed(e.to_string()))
 }
 
-/// Decode + validate a hold response (size- and version-checked).
+/// Decode + validate a hold response (size-, duplicate-key- and version-checked).
 pub fn decode_hold_response(bytes: &[u8]) -> Result<HoldResponse, ClaimCodecError> {
     check_size(bytes.len())?;
+    reject_duplicate_keys(bytes)?;
     let response: HoldResponse =
         serde_json::from_slice(bytes).map_err(|e| ClaimCodecError::Malformed(e.to_string()))?;
     check_version(response.schema_version, QUERY_SCHEMA_VERSION)?;
@@ -764,6 +866,80 @@ mod tests {
             claim.transports.is_empty(),
             "the unknown transport (and its stray digest) must be dropped, not carried"
         );
+    }
+
+    // --- FINDINGS 1 & 4 root cause (freeze round 4): DUPLICATE-KEY rejection.
+    // serde_json accepts duplicate keys (last wins), an ambiguous parse on a
+    // frozen wire. We reject any repeated key at any level -> one canonical parse.
+    // json!() cannot express duplicate keys, so these wires are built as strings.
+
+    #[test]
+    fn duplicate_payload_digest_key_is_rejected() {
+        // Two `payload.blake3` values: last-wins would smuggle a SECOND blob
+        // (finding 1). The ambiguous wire is rejected outright.
+        let wire = format!(
+            "{{\"schema_version\":{CLAIM_SCHEMA_VERSION},\"key\":\"{KEY_HEX}\",\
+             \"payload\":{{\"kind\":\"whole_nar\",\"blake3\":\"{BLAKE3_HEX}\",\
+             \"blake3\":\"{OTHER_BLAKE3_HEX}\"}},\"holders\":[],\"transports\":[]}}"
+        );
+        match decode_claim(wire.as_bytes()) {
+            Err(ClaimCodecError::Malformed(why)) => {
+                assert!(
+                    why.contains("duplicate key"),
+                    "should name the duplicate: {why}"
+                )
+            }
+            other => panic!("a duplicate payload.blake3 must be rejected, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn duplicate_kind_key_is_rejected() {
+        // `kind` repeated - a malformed `whole_nar` followed by a future kind.
+        // last-wins would keep `future_kind`, silently DROPPING the malformed
+        // known (finding 4). Rejected instead.
+        let wire = format!(
+            "{{\"schema_version\":{CLAIM_SCHEMA_VERSION},\"key\":\"{KEY_HEX}\",\
+             \"payload\":{{\"kind\":\"whole_nar\",\"blake3\":\"blake3:not-hex\",\
+             \"kind\":\"future_kind\"}},\"holders\":[],\"transports\":[]}}"
+        );
+        assert!(matches!(
+            decode_claim(wire.as_bytes()),
+            Err(ClaimCodecError::Malformed(_))
+        ));
+    }
+
+    #[test]
+    fn duplicate_top_level_and_nested_offer_keys_are_rejected() {
+        // A repeated top-level key...
+        let dup_top = format!(
+            "{{\"schema_version\":{CLAIM_SCHEMA_VERSION},\"key\":\"{KEY_HEX}\",\
+             \"payload\":{{\"kind\":\"whole_nar\",\"blake3\":\"{BLAKE3_HEX}\"}},\
+             \"holders\":[],\"holders\":[\"{NODE_A_HEX}\"],\"transports\":[]}}"
+        );
+        assert!(matches!(
+            decode_claim(dup_top.as_bytes()),
+            Err(ClaimCodecError::Malformed(_))
+        ));
+        // ...and a repeated key nested inside an offer object (inside an array).
+        let dup_nested = format!(
+            "{{\"schema_version\":{CLAIM_SCHEMA_VERSION},\"key\":\"{KEY_HEX}\",\
+             \"payload\":{{\"kind\":\"whole_nar\",\"blake3\":\"{BLAKE3_HEX}\"}},\
+             \"holders\":[],\"transports\":[{{\"transport\":\"iroh\",\
+             \"node\":\"{NODE_A_HEX}\",\"node\":\"{NODE_B_HEX}\"}}]}}"
+        );
+        assert!(matches!(
+            decode_claim(dup_nested.as_bytes()),
+            Err(ClaimCodecError::Malformed(_))
+        ));
+    }
+
+    #[test]
+    fn a_canonical_dup_free_claim_still_decodes() {
+        // The guard must not reject a legitimate, duplicate-free claim.
+        let claim = sample_claim();
+        let bytes = encode_claim(&claim).unwrap();
+        assert_eq!(decode_claim(&bytes).unwrap(), claim);
     }
 
     // --- Forward-compat (freeze round 3): unknown KIND is TOLERATED-BUT-INERT

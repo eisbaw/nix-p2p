@@ -36,8 +36,10 @@ async-trait = "0.1"
 # std-only (an independent witness of wire behaviour), so these are never shared.
 # Not HTTP-stack crates, so `just independence`'s convergence denylist is
 # unaffected; the manifest guard only forbids a shared WORKSPACE crate.
-# serde_json is a normal (not dev) dep: the Unknown forward-compat catch-all
-# holds a serde_json::Value in the public types, not just in tests.
+# serde_json is a normal (not dev) dep: the claim decoder uses it to peek the
+# payload/transport discriminator and to reject duplicate keys (fail-closed, one
+# canonical parse) - not only in tests. There is NO public serde_json::Value
+# catch-all: unknown kinds are tolerated-but-inert, nothing is retained.
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 # BLAKE3 of the addressed unit (task-48 freeze): the raw-NAR content identity.
