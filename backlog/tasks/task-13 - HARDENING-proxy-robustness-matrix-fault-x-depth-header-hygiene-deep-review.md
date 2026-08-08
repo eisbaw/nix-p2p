@@ -1,10 +1,10 @@
 ---
 id: TASK-13
 title: 'HARDENING: proxy robustness matrix (fault x depth), header hygiene deep review'
-status: In Progress
+status: Done
 assignee: []
 created_date: '2026-08-07 21:56'
-updated_date: '2026-08-08 19:55'
+updated_date: '2026-08-08 19:56'
 labels:
   - hardening
 dependencies:
@@ -67,3 +67,9 @@ FIX 2 - error/truncated never cached as 200: (a) narinfo cache insert now gated 
 FILED to task-36 (NOT touched): whitespace-in-Connection-token, empty TE members (chunked,), legacy v1 poisoned entries / cache-format bump, unbounded std::fs::read on the cache-hit path, cap-before-status 502.
 GATES (synchronous, no e2e this round per owner - fixes are unit-testable, e2e already 22/22): just build green; just lint green; cargo test -p daemon (11/11 binaries) + -p testproxy (7/7 binaries incl. premature_eof) green. Both fixes shown fail-before/pass-after (testproxy bite via cargo test -p testproxy which recompiles it). From my side task-13 is complete; left In Progress with ACs checked for the orchestrator to close.
 <!-- SECTION:NOTES:END -->
+
+## Final Summary
+
+<!-- SECTION:FINAL_SUMMARY:BEGIN -->
+DONE (honest scope, mark-emulator closure). Core hardening delivered + real: fault x depth matrix (29/29, all 7 modes x depth 1-3), header hygiene incl a real RFC 7230 Connection-token fix, seeded path-traversal+identity fuzz, real-delta timing oracle, inbox triage. Two correctness fixes landed this round: TE+conflicting-Content-Length fails closed (RFC 7230 3.3.3, smuggling-risk framing - no truncate-and-serve) at both the serving and cache-insert gates; error/truncated responses never cached as a complete 200 (narinfo cache gated on the servable predicate; testproxy refuses to commit a premature-EOF NAR). ACs made honest by orchestrator (AC#3 rewritten to tested scope - no overclaim). Remaining hand-rolled-HTTP-framing edge cases (whitespace Connection tokens, empty TE members, legacy poisoned entries, cap-before-status, unbounded cache-hit read) are robustness-behind-Nix-hash-gate, deferred by design to task-36 (systematic/library-based rewrite). task-33 stays reopened (wave-2 budget-aware timeout). Reviews: qa GO, architect GO, codex found real defects across 4 passes (2 daemon correctness bugs fixed, oracles made real) - the cross-model gate earned its cost here.
+<!-- SECTION:FINAL_SUMMARY:END -->
