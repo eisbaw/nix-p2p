@@ -77,6 +77,9 @@ OUT_MARKER = ".nix-p2p-fixture-out"
 # recoverable-but-stranded intermediate state to describe.
 GENERATIONS_DIR = "generations"
 CURRENT_LINK = "current"
+# The AUTHORITATIVE lock lives here, INSIDE each generation. `current` points at
+# the generation, so one symlink flip commits the tree and its lock together.
+GEN_LOCK_NAME = "lock.json"
 # Retention is "the published generation and the one before it". That claim was
 # made in round 5 and not implemented: the warm reuse path had no idea what the
 # predecessor was and collected it immediately, so a reader that resolved a
@@ -304,15 +307,96 @@ def anchored_fixtures_dir(repo: Path):
         os.close(descriptor)
 
 
-def load_lock(repo: Path) -> dict:
-    """Read AND validate the lock. An unusable lock is never a soft signal.
+def validate_lock(lock, source: str) -> dict:
+    """Validate a parsed lock structure from any source. Shared, so the same
+    schema binds the AUTHORITATIVE lock inside a generation and the demoted
+    baseline in git.
 
-    Validation belongs here rather than at each use site because the lock is
-    the definition of the frozen workload: a field this file does not
-    understand cannot be allowed to mean "no constraint". A misspelled tier
-    (`fasst`) used to do exactly that - `expected_attrs` matched it against
-    neither tier, so the payload silently dropped out of the fast tier's
-    required set and a tree missing it verified green.
+    A field this file does not understand cannot be allowed to mean "no
+    constraint". A misspelled tier (`fasst`) used to do exactly that -
+    `expected_attrs` matched it against neither tier, so the payload silently
+    dropped out of the fast tier's required set and a tree missing it verified
+    green.
+    """
+    if not isinstance(lock, dict):
+        raise LockError(f"{source} is not a JSON object")
+    for key in sorted(LOCK_TOP_KEYS):
+        if key not in lock:
+            raise LockError(f"{source} has no {key!r}")
+    unknown = sorted(set(lock) - LOCK_TOP_KEYS)
+    if unknown:
+        raise LockError(
+            f"{source} has unrecognised top-level field(s) {unknown}. Nothing reads "
+            "them, and the next --write-lock would erase them without a word, so "
+            f"they cannot be allowed to look like a pin. Known fields are "
+            f"{sorted(LOCK_TOP_KEYS)}."
+        )
+    if not isinstance(lock["paths"], dict) or not lock["paths"]:
+        raise LockError(f"{source} pins no payloads")
+    for attr, pinned in lock["paths"].items():
+        if not isinstance(pinned, dict):
+            raise LockError(f"{source}: payload {attr!r} is not a JSON object")
+        missing = sorted(LOCK_PAYLOAD_KEYS - set(pinned))
+        if missing:
+            raise LockError(f"{source}: payload {attr!r} is missing {missing}")
+        extra = sorted(set(pinned) - LOCK_PAYLOAD_KEYS)
+        if extra:
+            raise LockError(
+                f"{source}: payload {attr!r} has unrecognised field(s) {extra}. Same "
+                "reason as above: an ignored field is a pin that is not a pin. "
+                f"Known fields are {sorted(LOCK_PAYLOAD_KEYS)}."
+            )
+        if pinned["tier"] not in TIERS:
+            raise LockError(
+                f"{source}: payload {attr!r} declares tier {pinned['tier']!r}, which "
+                f"is not one of {list(TIERS)}. An unknown tier would quietly excuse "
+                "the payload from every tier's required set."
+            )
+    return lock
+
+
+def load_generation_lock(generation: Path) -> dict:
+    """The AUTHORITATIVE lock: `<generation>/lock.json`, the runtime source of
+    truth for what workload the published tree IS.
+
+    This is what every runtime/gate/consistency reader resolves - via
+    `current -> gen-<sha>/lock.json`. Because the lock lives inside the
+    generation, the single symlink flip that publishes the tree commits its
+    lock in the same syscall: there are no longer two authoritative sources to
+    reconcile, and so publish() has nothing to roll back and nothing to read
+    back (the round-8 redesign). The git-tracked file below is NOT consulted
+    here.
+
+    Read relative to a descriptor on the generation dir, O_NOFOLLOW at the leaf,
+    consistent with the zero-symlink rule a generation is validated against.
+    """
+    lock_json = generation / GEN_LOCK_NAME
+    try:
+        gen_fd = open_dir(generation)
+    except OSError as exc:
+        raise LockError(f"cannot open generation {generation}: {exc}") from exc
+    try:
+        raw = read_at(gen_fd, GEN_LOCK_NAME)
+    except OSError as exc:
+        raise LockError(f"cannot read {lock_json}: {exc}") from exc
+    finally:
+        os.close(gen_fd)
+    try:
+        lock = json.loads(raw)
+    except ValueError as exc:
+        raise LockError(f"{lock_json} is not valid JSON: {exc}") from exc
+    return validate_lock(lock, str(lock_json))
+
+
+def load_baseline(repo: Path) -> dict:
+    """The DEMOTED, git-tracked baseline: `fixtures/workload.lock.json`.
+
+    A review / version-control artifact, NOT a runtime source of truth. It is
+    read only by the generator's freeze path - the fresh-build drift check and
+    `--write-lock` reconciliation - and written only at `--write-lock` time, so
+    the frozen baseline still lives in git and shows in `git diff`. No
+    runtime/gate/consistency code opens it; that is asserted by
+    scripts/check-lock-sources.py.
     """
     path = lock_path(repo)
     try:
@@ -322,42 +406,7 @@ def load_lock(repo: Path) -> dict:
         raise LockError(f"cannot read {path}: {exc}") from exc
     except ValueError as exc:
         raise LockError(f"{path} is not valid JSON: {exc}") from exc
-
-    if not isinstance(lock, dict):
-        raise LockError(f"{path} is not a JSON object")
-    for key in sorted(LOCK_TOP_KEYS):
-        if key not in lock:
-            raise LockError(f"{path} has no {key!r}")
-    unknown = sorted(set(lock) - LOCK_TOP_KEYS)
-    if unknown:
-        raise LockError(
-            f"{path} has unrecognised top-level field(s) {unknown}. Nothing reads "
-            "them, and the next --write-lock would erase them without a word, so "
-            f"they cannot be allowed to look like a pin. Known fields are "
-            f"{sorted(LOCK_TOP_KEYS)}."
-        )
-    if not isinstance(lock["paths"], dict) or not lock["paths"]:
-        raise LockError(f"{path} pins no payloads")
-    for attr, pinned in lock["paths"].items():
-        if not isinstance(pinned, dict):
-            raise LockError(f"{path}: payload {attr!r} is not a JSON object")
-        missing = sorted(LOCK_PAYLOAD_KEYS - set(pinned))
-        if missing:
-            raise LockError(f"{path}: payload {attr!r} is missing {missing}")
-        extra = sorted(set(pinned) - LOCK_PAYLOAD_KEYS)
-        if extra:
-            raise LockError(
-                f"{path}: payload {attr!r} has unrecognised field(s) {extra}. Same "
-                "reason as above: an ignored field is a pin that is not a pin. "
-                f"Known fields are {sorted(LOCK_PAYLOAD_KEYS)}."
-            )
-        if pinned["tier"] not in TIERS:
-            raise LockError(
-                f"{path}: payload {attr!r} declares tier {pinned['tier']!r}, which is "
-                f"not one of {list(TIERS)}. An unknown tier would quietly excuse the "
-                "payload from every tier's required set."
-            )
-    return lock
+    return validate_lock(lock, str(path))
 
 
 def expected_attrs(lock: dict, tier: str) -> set[str]:

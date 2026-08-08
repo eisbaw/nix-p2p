@@ -252,19 +252,26 @@ Four locally-built paths, served as an ordinary static binary cache
 | `fixture-zstd` | zstd | 512 KiB | Third compression Nix may advertise |
 | `fixture-big` | none | 110 MiB | Byte-volume for kill-at-50%-bytes and the egress oracle; uncompressed so wire bytes equal disk bytes |
 
-This table is descriptive. **`fixtures/workload.lock.json` is
-authoritative** — it pins each payload's store path, NarHash and
-FileHash, and the gate fails when the generated tree diverges from it.
-That is also the only thing that notices a `flake.lock` bump, which
-changes every payload while the version string sits still. Its schema is
-closed: a field the tooling does not recognise is a hard error, because an
-ignored field looks like a pin and is erased by the next rewrite.
-`fixtures/README.md` holds the design rationale; regeneration and the change
-procedure live there.
+This table is descriptive. The **authoritative** lock is the one **inside
+each generation** (`gen-<sha>/lock.json`), resolved at runtime via
+`current -> gen-<sha>/lock.json`; the gate holds the served tree to it.
+`fixtures/workload.lock.json` is a **demoted, git-tracked baseline** —
+byte-identical content, but a review artifact only: it is read solely by
+the generator's freeze/`--write-lock` path (which is what notices a
+`flake.lock` bump at build time and keeps the frozen baseline in `git
+diff`), never by runtime or gate code. Its schema is closed: an
+unrecognised field is a hard error, because an ignored field looks like a
+pin and is erased by the next rewrite. `fixtures/README.md` holds the
+design rationale; regeneration and the change procedure live there.
 
-The fixture is **published as an immutable generation plus an atomic
-symlink flip**: `fixtures/out/generations/gen-<sha>/` is built and
-validated, then `fixtures/out/current` is `os.replace`d to point at it.
+The fixture is **published with one atomic symlink flip, and one only**:
+`fixtures/out/generations/gen-<sha>/` is built and validated — *including
+its own `lock.json`* — then `fixtures/out/current` is `os.replace`d to
+point at it, committing the tree and its authoritative lock in the same
+syscall. `publish()` has **no rollback and no read-back** (the machinery
+that failed rounds 2–7); crash consistency is not "windowless" but
+*split-free* — killed before the flip leaves the old generation complete,
+killed after leaves the new one complete, with nothing in between.
 Everything that consumes the fixture — the gate, `just fixtures-serve`,
 task-5's containers — resolves through `current`, and must keep doing so
 rather than naming a generation directly.

@@ -147,6 +147,17 @@
           touch $out
         '';
 
+        # Enforces the round-8 single-runtime-source-of-truth boundary: the
+        # authoritative fixture lock is resolved through current -> gen/lock.json,
+        # and no runtime/gate code (nor publish()) opens the git-tracked baseline.
+        # Stdlib-only AST check, so it runs in both `just lint` and here; passed
+        # the scripts/ tree explicitly because a store copy has no siblings.
+        lock-sources = pkgs.runCommand "check-lock-sources"
+          { nativeBuildInputs = [ pkgs.python3 ]; } ''
+          python3 ${./scripts/check-lock-sources.py} ${./scripts}
+          touch $out
+        '';
+
         # Same script `just independence` runs - one implementation, two entry
         # points. Living only in the Justfile would let a shared crate fail the
         # local gate and sail through CI.

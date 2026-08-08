@@ -77,6 +77,7 @@ lint: _toolchain _python independence
     ruff check scripts
     ruff format --check scripts
     "${NIX_P2P_PYTHON}/bin/python3" scripts/check-source-guard.py
+    "${NIX_P2P_PYTHON}/bin/python3" scripts/check-lock-sources.py
 
 # Assert daemon and testproxy stay strictly separated (PRD round 5/6).
 independence: _toolchain

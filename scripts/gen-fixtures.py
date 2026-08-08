@@ -28,21 +28,32 @@ is subtly wrong is worse than no fixture: the J2 egress baseline is frozen
 against this workload and a silent change makes every cross-wave comparison
 meaningless without anything looking broken.
 
-PUBLICATION is immutable generations plus one atomic symlink flip:
+PUBLICATION is immutable generations plus one atomic symlink flip, and the
+AUTHORITATIVE lock lives INSIDE the generation:
 
-    <out>/generations/gen-<manifest-sha>/   built, validated, then never touched
-    <out>/current -> generations/gen-<...>  swapped with a single os.replace
+    <out>/generations/gen-<manifest-sha>/lock.json   the runtime source of truth
+    <out>/current -> generations/gen-<...>           swapped with one os.replace
 
-Every consumer resolves through `current` (fixturelib.resolve_current), so a
-publication is one syscall with no intermediate state. The previous design
-renamed whole trees aside on publish and back again on rollback, with a
-quarantine directory for the failed-lock case; four review rounds each found a
-new hole in it (a rollback that fired on a failed `print`, a marker check
-racing its own delete, a quarantine collision that abandoned the rollback
-half-done, a cleanup failure reported as a failed publication). None of those
-states exist here: a generation is either complete and named, or it is not
-`current`. A failed run leaves its generation on disk, named and inspectable,
-and the next successful publication collects it.
+Because the lock lives inside what `current` points at, that single os.replace
+commits the tree AND its lock in one syscall. There is no second authoritative
+source to reconcile, so publish() has NO rollback and NO read-back. Rounds 2-7
+all failed on machinery that reconciled the `current` symlink against the
+git-tracked lock to decide a rollback - a rollback that fired on a failed
+`print`, a read-back that returned False on a read error and destroyed a good
+publish, an interrupt that split the two writes. The fix was not a better
+reconciliation but DELETING the second source. Crash consistency is therefore
+not "windowless via a clever read-back"; it is that there is nothing to split:
+kill before the flip -> old-complete, kill after -> new-complete.
+
+The git-tracked fixtures/workload.lock.json is DEMOTED to a review artifact:
+byte-identical content, but read only by the freeze/--write-lock path
+(assert_matches_baseline, prepare_baseline) and written only at --write-lock,
+AFTER publication. Its lag is fine and visible in git. Every runtime/gate reader
+resolves the lock through `current -> gen-<sha>/lock.json`; that boundary is
+enforced by scripts/check-lock-sources.py.
+
+A failed run leaves its generation on disk, named and inspectable, and the next
+successful publication collects it.
 
 Why payloads are built locally, and the other design rationale: see
 fixtures/README.md, which is canonical. The short version, because it governs
@@ -479,8 +490,12 @@ def reusable(
     # Nix's behaviour (the positive controls and tamper bites), none of which a
     # damaged fixture tree can cause and none of which regeneration can fix.
     cache = current / "cache"
-    lock = fx.load_lock(repo)
     try:
+        # Against the generation's OWN authoritative lock, exactly as the gate
+        # does at runtime - not the git baseline. A published generation was
+        # validated against the baseline at build time; the runtime question is
+        # only whether the tree still matches the lock committed alongside it.
+        lock = fx.load_generation_lock(current)
         if (
             fx.symlink_problems(current)
             or fx.lock_problems(manifest, lock)
@@ -488,7 +503,7 @@ def reusable(
             or fx.blob_problems(cache, manifest)
         ):
             return False
-    except OSError:
+    except (OSError, fx.LockError):
         # A published generation that cannot even be READ is not reusable, and
         # saying so is the whole job of this function. Letting the error escape
         # aborted the run with "filesystem error while generating" and left the
@@ -684,21 +699,13 @@ def generate(
     version = read_workload_version(repo)
     assert_safe_out_dir(out_dir, repo)
 
-    # Checked against the committed lock, not against a constant living beside
-    # the seed phrase: an external pin is the only kind a coordinated edit
-    # cannot walk past. Skipped only while bootstrapping a new lock, and read
-    # through load_lock so a lock with a schema this code does not understand
-    # is an error here too, not just at the comparison sites.
-    lock_file = fx.lock_path(repo)
-    if not write_lock or lock_file.is_file():
-        pinned = fx.load_lock(repo)["public_key"]
-        if public_line != pinned:
-            fail(
-                f"derived public key {public_line} != the key pinned in "
-                f"{lock_file.name} ({pinned}). Every narinfo signed by the old key "
-                "is now unverifiable against this one."
-            )
-
+    # No git-baseline read here any more. The derived public key is compared
+    # against the baseline where the baseline is legitimately consulted - the
+    # fresh-build freeze check (assert_matches_baseline) and --write-lock
+    # reconciliation (prepare_baseline) - both of which run below AFTER the
+    # tree is built. Removing the standalone pre-check keeps the git file out of
+    # every runtime path; the cost is that a seed/key mismatch surfaces after
+    # the build rather than before it, with the same clear message.
     with (
         publication_lock(out_dir),
         anchored_publication(out_dir) as (
@@ -735,29 +742,59 @@ def generate(
             manifest = write_manifest(
                 building, version, public_line, include_large, entries
             )
+            # STEP 1b: write the AUTHORITATIVE lock INSIDE the generation. This
+            # is the round-8 change: the lock the runtime and the gate resolve
+            # is gen-<sha>/lock.json, committed atomically with the tree by the
+            # publish flip. Written from the manifest, so it is a deterministic
+            # function of the build and the generation stays content-addressed.
+            (building / fx.GEN_LOCK_NAME).write_text(
+                json.dumps(lock_dict_from_manifest(manifest), indent=2, sort_keys=True)
+                + "\n"
+            )
             fx.normalise_tree(building, secret_names=frozenset({SECRET_KEY_NAME}))
 
             # STEP 2: validate it FULLY, before it becomes a generation. Blob
             # self-consistency is checked in both modes - it compares the tree
-            # against its own manifest and says nothing about the lock - while
-            # the lock comparison applies only when the lock is meant to stay
-            # put. With --write-lock the workload is deliberately changing, so
-            # the equivalent refusal logic lives in step 3.
+            # against its own manifest and says nothing about the baseline -
+            # while the freeze check against the git baseline applies only on a
+            # plain build. With --write-lock the workload is deliberately
+            # changing, so the equivalent refusal logic lives below.
             assert_blobs_consistent(building, manifest)
+            assert_matches_generation_lock(building, manifest)
             if not write_lock:
-                assert_matches_lock(building, repo, manifest)
+                assert_matches_baseline(building, repo, manifest)
 
-            # STEP 3: every remaining way this can REFUSE, still before
-            # anything is published. prepare_lock decides; it does not write.
-            pending = (
-                prepare_lock(repo, manifest, retire_baseline) if write_lock else None
+            # STEP 3: at --write-lock, decide whether rewriting the demoted git
+            # baseline is allowed (may refuse). Still before anything published.
+            baseline = (
+                prepare_baseline(repo, manifest, retire_baseline)
+                if write_lock
+                else None
             )
 
-            # STEPS 4-7.
+            # STEP 4: publish - ONE symlink flip, no rollback, no read-back.
             name = install_generation(building, generations, generations_fd, stamp)
-            published = publish(
-                out_dir, generations, generations_fd, name, repo, pending
-            )
+            published = publish(out_dir, generations, generations_fd, name)
+
+            # STEP 5: reconcile the DEMOTED git baseline, AFTER publication and
+            # only at --write-lock. Publication is already committed; a failure
+            # here is SUCCESS-with-a-warning, never a rollback - the git file is
+            # a review artifact whose lag is visible in git.
+            if baseline is not None:
+                try:
+                    write_baseline(repo, baseline)
+                    note(
+                        f"gen-fixtures: rewrote {fx.lock_path(repo)} - commit it as a "
+                        "reviewed diff"
+                    )
+                except OSError as error:
+                    warn(
+                        f"gen-fixtures: {published.name} is PUBLISHED and authoritative, "
+                        f"but the git baseline {fx.lock_path(repo)} could not be "
+                        f"updated ({error}). The baseline now lags the published "
+                        "workload; this is visible in git status and reconciled by "
+                        "re-running with --write-lock. Nothing was rolled back."
+                    )
         except BaseException:
             # Catches EVERYTHING, including the SystemExit that fail() raises
             # and a KeyboardInterrupt: this is the unwinding path, and a
@@ -921,14 +958,41 @@ def assert_blobs_consistent(built: Path, manifest: dict) -> None:
         )
 
 
-def assert_matches_lock(built: Path, repo: Path, manifest: dict) -> None:
-    """The staged tree must be the pinned workload, or it is not published."""
-    problems = fx.lock_problems(manifest, fx.load_lock(repo))
+def assert_matches_generation_lock(built: Path, manifest: dict) -> None:
+    """The tree must match the AUTHORITATIVE lock just written inside it.
+
+    Cheap and self-referential on a fresh build (the lock is derived from this
+    manifest), but it is the check that GIVES the embedded lock its meaning: it
+    is the same comparison the gate runs at runtime, so the thing the gate will
+    later hold the served tree to is proven satisfiable at build time. Runs in
+    both modes - it says nothing about the git baseline.
+    """
+    problems = fx.lock_problems(manifest, fx.load_generation_lock(built))
     if problems:
         fail(
-            "the tree just built is NOT the workload pinned in "
-            "fixtures/workload.lock.json, so it was discarded and the previous "
-            "tree (if any) is untouched:\n  - "
+            "the tree just built does not match its own authoritative lock.json, so "
+            "it was discarded and nothing was published:\n  - "
+            + "\n  - ".join(problems)
+        )
+
+
+def assert_matches_baseline(built: Path, repo: Path, manifest: dict) -> None:
+    """FREEZE CHECK: a fresh build must match the git-tracked baseline.
+
+    This is the one place a plain build reads the demoted git baseline, and it
+    is read-only - the freeze gate that catches a flake.lock bump (new stdenv ->
+    new store paths) while WORKLOAD_VERSION stands still. It decides whether to
+    publish AT ALL; it is NOT the runtime consistency reconciliation that rounds
+    2-7 kept breaking (that lived in publish() and is gone). Skipped under
+    --write-lock, where the workload is deliberately changing and prepare_baseline
+    owns the equivalent refusal.
+    """
+    problems = fx.lock_problems(manifest, fx.load_baseline(repo))
+    if problems:
+        fail(
+            "the tree just built is NOT the workload recorded in the git baseline "
+            "fixtures/workload.lock.json, so it was discarded and nothing was "
+            "published:\n  - "
             + "\n  - ".join(problems)
             + "\n\nMost likely flake.lock moved. Changing the pinned workload "
             "RETIRES the J2 measurement baseline - every number recorded against "
@@ -1037,156 +1101,71 @@ def install_generation(
     return superseded
 
 
-def publish(
-    out_dir: Path,
-    generations: Path,
-    generations_fd: int,
-    name: str,
-    repo: Path,
-    pending,
-) -> Path:
-    """Steps 4-7: flip the symlink, record the lock, collect what is superseded.
+def publish(out_dir: Path, generations: Path, generations_fd: int, name: str) -> Path:
+    """Publish a generation with ONE symlink flip. No rollback, no read-back.
 
-    The ordering and every failure's end state are specified here rather than
-    inferred from the code, because the previous design - rename the old tree
-    aside, rename the new one in, roll both back on failure - grew a new hole
-    in each of three review rounds. Publication is now a single atomic
-    operation, so there is no half-published state left to describe:
+    This is the round-8 redesign, and the whole point is what is ABSENT. The
+    authoritative lock now lives INSIDE the generation (gen-<sha>/lock.json), so
+    `current -> gen-<sha>` is the only thing that has to move, and that single
+    os.replace atomically commits BOTH the tree and its lock. There is no second
+    authoritative source to reconcile, so there is nothing to roll back and
+    nothing to read back.
 
-      4. os.replace(tmp symlink, current)   ONE syscall; the flip
-      5. commit_lock                        ONE atomic os.replace of the lock
-      6. on 5 failing: flip `current` back  ONE syscall; exit 2
-      7. collect superseded generations     never touches `current`'s target
+    Rounds 2-7 all failed HERE, each on machinery that reconciled the `current`
+    symlink against the git-tracked lock to decide a rollback: a rollback fired
+    on a failed print (r4/5), a read-back returned False on a read error and
+    destroyed a good publish (r7), an interrupt split the two writes (r6/7). The
+    fix is not a better reconciliation - it is deleting the second source. The
+    git baseline is written, if at all, AFTER this returns, as a demoted review
+    artifact whose lag is fine and visible in git.
 
-    Failures:
-      * at 4  nothing has changed. `current`, the old generation and the old
-              lock all stand. The validated new generation stays on disk under
-              generations/, named and inspectable.
-      * at 5  `current` is flipped back to the generation it pointed at (or
-              removed, if nothing was published before). The old lock is
-              intact, the new generation stays on disk. Exit 2, naming it.
-      * at 7  the tree AND the lock are committed, so this REPORTS SUCCESS with
-              a warning naming the residue. A failure to delete something
-              superseded is not a reason to call a completed publication
-              failed - the previous code did exactly that.
+    Crash consistency, by seam (there is no split to prevent):
+      * before the flip           -> `current` is unchanged: OLD-complete.
+      * mid os.replace            -> os.replace is atomic: OLD- or NEW-complete.
+      * after the flip            -> `current` names the new generation, whose
+                                     lock.json is inside it: NEW-complete.
 
-    The invariant behind all of it: the tracked lock must never describe a tree
-    that is not the published one, in either direction.
+    `previous` is pointed at the outgoing generation BEFORE the flip, so the
+    retention contract holds even if the process dies right after the flip. It
+    is only a hint for the collector; if the flip never happens, `previous` and
+    `current` name the same generation, which over-retains nothing.
     """
     previous = fx.resolve_current(out_dir)
     stamp = f"{time.time_ns()}-{os.getpid()}"
 
-    # STEP 4a - record the predecessor BEFORE the flip, so the retention claim
-    # ("the published generation and the one before it") is implemented rather
-    # than asserted. A crash between 4a and 4b leaves previous == current,
-    # which over-retains by nothing and under-retains nothing.
+    # Record the predecessor first (retention). A failure here is before the
+    # flip, so nothing is published and the old state stands.
     if previous is not None:
         try:
             point_link_at(out_dir, fx.PREVIOUS_LINK, previous.name, f"{stamp}-prev")
         except OSError as error:
             fail(
                 f"could not record the predecessor ({error}). Nothing changed: "
-                f"{out_dir / fx.CURRENT_LINK} and the lock are as they were. The "
-                f"validated new generation is on disk at {generations / name}.",
+                f"{out_dir / fx.CURRENT_LINK} is as it was, and the new generation is "
+                f"on disk at {generations / name}.",
                 code=2,
             )
 
-    # STEPS 4b-6 - the flip and the lock write, as ONE guarded region.
-    #
-    # The flip is INSIDE the try. Round 6 opened the guard one statement after
-    # it, and an ordinary Ctrl-C landing between os.replace and entering the
-    # try left the new generation published against the OLD lock. There is no
-    # placement of a guard that "starts after" an effect and still covers it;
-    # the effect has to happen inside.
-    #
-    # The unwind decision is made from the DISK, not from a flag. That is the
-    # second half of the same lesson: an interrupt can land between the lock's
-    # os.replace and any assignment that would record it, so no flag can be set
-    # closely enough. A flag-based rollback undid the flip after the lock had
-    # already been written and produced the opposite split state from the one
-    # it was guarding - old current, new lock. Asking the file system "is the
-    # lock the new one?" has no window at all.
-    #
-    # commit_lock deliberately prints nothing: an earlier version printed its
-    # success line inside the guarded block, so an EPIPE on stdout was caught
-    # as "the lock could not be written" and triggered a rollback that reported
-    # the opposite of what had actually happened.
-    committed = False
-    reported = False
+    # THE publication: one flip. Failure here changes nothing (point_link_at
+    # cleans up its own temporary), so this is a plain OSError -> exit 2 with no
+    # rollback to attempt.
     try:
-        try:
-            point_link_at(out_dir, fx.CURRENT_LINK, name, f"{stamp}-publish")
-        except OSError as error:
-            reported = True
-            fail(
-                f"could not publish ({error}). Nothing changed: "
-                f"{out_dir / fx.CURRENT_LINK} and the lock are as they were. The "
-                f"validated new generation is on disk at {generations / name}.",
-                code=2,
-            )
-        if pending is not None:
-            try:
-                commit_lock(repo, pending)
-            except OSError as error:
-                rolled_back = safe_restore_current(out_dir, previous, name, stamp)
-                reported = True
-                fail(
-                    f"the tree was published but the lock could not be written "
-                    f"({error}), which would leave a published tree no committed "
-                    f"lock describes.\n"
-                    f"  {rolled_back}\n"
-                    f"  The committed lock is unchanged. The new generation is on "
-                    f"disk at {generations / name}.\n"
-                    f"  Fix the permissions on {fx.lock_path(repo)} and rerun.",
-                    code=2,
-                )
-        committed = True
-    finally:
-        if not committed and not reported:
-            # Reached only by something the handlers above do not name -
-            # KeyboardInterrupt, MemoryError, a bug in this file - at any point
-            # from before the flip to just after the lock was replaced.
-            if pending is not None and lock_on_disk_is(repo, pending):
-                # The lock DID land. Rolling the flip back now would create the
-                # split state instead of preventing it, so the publication is
-                # left complete and said so.
-                warn(
-                    "gen-fixtures: interrupted, but the tree and the lock were both "
-                    f"committed; {name} is published and the lock describes it."
-                )
-            else:
-                undone = safe_restore_current(out_dir, previous, name, stamp)
-                warn(f"gen-fixtures: interrupted after publishing. {undone}")
+        point_link_at(out_dir, fx.CURRENT_LINK, name, f"{stamp}-publish")
+    except OSError as error:
+        fail(
+            f"could not publish ({error}). Nothing changed: "
+            f"{out_dir / fx.CURRENT_LINK} is as it was; the validated new generation "
+            f"is on disk at {generations / name}.",
+            code=2,
+        )
 
-    note(
-        f"gen-fixtures: rewrote {fx.lock_path(repo)} - commit it as a reviewed diff"
-        if pending is not None
-        else f"gen-fixtures: published {name}"
-    )
+    note(f"gen-fixtures: published {name}")
 
-    # STEP 7 - published; from here nothing may turn this into a failure.
+    # Published; from here nothing may turn this into a failure.
     collect_generations(
         generations_fd, generations, retained(out_dir, generations / name)
     )
     return generations / name
-
-
-def safe_restore_current(
-    out_dir: Path, previous: Path | None, name: str, stamp: str
-) -> str:
-    """restore_current that never raises. Returns what actually happened.
-
-    Used from both the error handler and the finally guard, where raising would
-    replace the failure being reported with a second, less useful one.
-    """
-    try:
-        return restore_current(out_dir, previous, name, f"{stamp}-rollback")
-    except OSError as error:
-        return (
-            f"the rollback ALSO failed ({error}), so {out_dir / fx.CURRENT_LINK} may "
-            "still point at the new generation while the lock does not describe it - "
-            "fix this by hand"
-        )
 
 
 def point_link_at(out_dir: Path, link_name: str, name: str, stamp: str) -> None:
@@ -1194,9 +1173,9 @@ def point_link_at(out_dir: Path, link_name: str, name: str, stamp: str) -> None:
 
     A symlink cannot be retargeted in place, so a uniquely named one is created
     beside it and os.replace'd over it. os.replace on a symlink replaces the
-    LINK, never what it points at, and is atomic - which is the whole reason
-    the publication model changed: readers see the old generation or the new
-    one, never a directory mid-rename and never a missing one.
+    LINK, never what it points at, and is atomic - which is the whole reason the
+    publication model is a flip: readers see the old generation or the new one,
+    never a directory mid-rename and never a missing one.
     """
     link = out_dir / link_name
     temporary = out_dir / f".{link_name}.{stamp}"
@@ -1204,46 +1183,12 @@ def point_link_at(out_dir: Path, link_name: str, name: str, stamp: str) -> None:
     try:
         os.replace(temporary, link)
     except OSError:
-        # Nothing collects the publication root itself (collect_generations
-        # only scans generations/), so a leaked temporary would sit there
-        # forever contradicting the caller's "nothing changed" message.
+        # Nothing collects the publication root itself (collect_generations only
+        # scans generations/), so a leaked temporary would sit there forever
+        # contradicting the caller's "nothing changed" message.
         with contextlib.suppress(OSError):
             os.unlink(temporary)
         raise
-
-
-def restore_current(out_dir: Path, previous: Path | None, name: str, stamp: str) -> str:
-    """Undo a flip. Returns what it ACTUALLY did, for the caller's message.
-
-    The caller must not describe the end state itself: the claim "the new
-    generation is inert" is only true if this returned, and stitching it into
-    the message unconditionally is how a rollback that failed still gets
-    reported as one that worked.
-
-    `name` is needed for the case the adopt path makes routine: rebuilding an
-    unchanged workload produces the generation that is ALREADY current, so
-    `previous.name == name` and the flip was a no-op. Rolling back then leaves
-    that generation published, and calling it inert - as this did - describes
-    the opposite of the disk. Nothing is wrong in that state; the report was.
-    """
-    link = out_dir / fx.CURRENT_LINK
-    if previous is None:
-        os.unlink(link)
-        return (
-            f"Rolled back: nothing had been published before, so {link} was removed "
-            "and the new generation is inert."
-        )
-    point_link_at(out_dir, fx.CURRENT_LINK, previous.name, stamp)
-    if previous.name == name:
-        return (
-            f"Nothing to roll back: {link} already pointed at {previous.name}, which "
-            "is the generation this run rebuilt, so it was and still is the published "
-            "one. Only the lock write failed."
-        )
-    return (
-        f"Rolled back: {link} points at {previous.name} again, so the new generation "
-        "is inert."
-    )
 
 
 def retained(out_dir: Path, current: Path) -> set[str]:
@@ -1334,29 +1279,16 @@ def material(entry) -> dict:
     return {k: (entry or {}).get(k) for k in MATERIAL_KEYS}
 
 
-def prepare_lock(repo: Path, manifest: dict, retire_baseline: bool) -> dict:
-    """Build the new lock and decide whether writing it is allowed.
+def lock_dict_from_manifest(manifest: dict) -> dict:
+    """The authoritative lock content, derived deterministically from a manifest.
 
-    Everything that can REFUSE lives here, and this runs BEFORE publication;
-    commit_lock() only writes. Splitting them is what stops the tracked lock
-    from being replaced for a tree that then failed to publish - a repository
-    whose committed lock described a tree that never existed.
-
-    The fixture tree is generated and gitignored, so without this file nothing
-    in the repository records what the workload version actually denotes, and
-    the frozen workload the J2 baseline is measured against would be
-    unreviewable. It also catches the drift WORKLOAD_VERSION alone cannot:
-    bumping flake.lock changes stdenv, hence every store path, while the
-    version string sits still.
-
-    That last property is only real if the version cannot be REBOUND. Writing
-    a new lock under an unchanged version silently redefines what every
-    recorded measurement was taken against - the precise failure the lock
-    exists to prevent - so it takes an explicit flag whose name says what it
-    costs.
+    The SAME dict is written two places: `gen-<sha>/lock.json` inside every
+    generation (authoritative, always), and - only at `--write-lock` - the
+    git-tracked baseline. "The same content relocated", so the git file stays
+    byte-identical to what it always was while the runtime source of truth moves
+    inside the generation.
     """
-    lock_file = fx.lock_path(repo)
-    new = {
+    return {
         "workload_version": manifest["workload_version"],
         "public_key": manifest["public_key"],
         "paths": {
@@ -1374,11 +1306,31 @@ def prepare_lock(repo: Path, manifest: dict, retire_baseline: bool) -> dict:
             for entry in manifest["paths"]
         },
     }
+
+
+def prepare_baseline(repo: Path, manifest: dict, retire_baseline: bool) -> dict:
+    """Decide whether rewriting the DEMOTED git baseline is allowed, at
+    `--write-lock` time only.
+
+    Everything that can REFUSE lives here, and it runs BEFORE publication;
+    write_baseline() only writes. The git baseline is no longer authoritative at
+    runtime (the generation carries its own lock.json), but it remains the
+    reviewable, version-controlled record of the frozen workload, so rebinding a
+    version to different bytes still has to be a deliberate, flagged act.
+
+    It catches the drift WORKLOAD_VERSION alone cannot: bumping flake.lock
+    changes stdenv, hence every store path, while the version string sits still.
+    Writing a new baseline under an unchanged version silently redefines what
+    every recorded measurement was taken against, so it takes an explicit flag
+    whose name says what it costs.
+    """
+    lock_file = fx.lock_path(repo)
+    new = lock_dict_from_manifest(manifest)
     if lock_file.is_file():
-        # Read through load_lock, not json.loads: a lock whose schema this code
-        # does not understand must not be silently compared field-by-field and
-        # then overwritten. It is an environment error (LockError -> exit 2).
-        old = fx.load_lock(repo)
+        # Read through load_baseline, not json.loads: a baseline whose schema
+        # this code does not understand must not be silently compared
+        # field-by-field and then overwritten. LockError -> exit 2.
+        old = fx.load_baseline(repo)
         same_version = old.get("workload_version") == new["workload_version"]
         # Compared on MATERIAL fields only - the bytes a measurement was taken
         # against. Adding a field to this file's schema is not a baseline
@@ -1413,18 +1365,19 @@ def prepare_lock(repo: Path, manifest: dict, retire_baseline: bool) -> dict:
     return new
 
 
-def commit_lock(repo: Path, new: dict) -> None:
-    """Write the prepared lock. Runs only after the tree it describes exists.
+def write_baseline(repo: Path, new: dict) -> None:
+    """Write the DEMOTED git baseline. Runs AFTER publication, at `--write-lock`.
 
-    Atomic: a lock truncated by an interrupted run would leave the repository
-    with no valid record of the frozen workload at all.
+    Publication is already complete and authoritative before this is called -
+    the generation and its embedded lock.json were committed by the symlink
+    flip. This only updates the reviewable git record. If it fails, the caller
+    reports SUCCESS-with-a-warning: the published tree is correct and
+    self-describing; the git baseline merely lags, which is visible in `git
+    status` and reconciled by re-running `--write-lock`. There is nothing to
+    roll back, because this file is no longer authoritative.
 
-    Prints NOTHING, and that is load-bearing rather than a style choice. This
-    function is called inside the caller's `except OSError` guard, so anything
-    here that can raise OSError after the os.replace has already succeeded gets
-    reported as "the lock could not be written" and rolled back - which is the
-    exact opposite of the truth. Writing to stdout can raise OSError (EPIPE,
-    ENOSPC), so the success line belongs to the caller, after the guard.
+    Atomic all the same: a baseline truncated by an interrupted run would leave
+    a confusing half-written review artifact.
     """
     lock_file = fx.lock_path(repo)
     # Every step relative to a descriptor on `fixtures/`, not to a path.
@@ -1461,25 +1414,6 @@ def commit_lock(repo: Path, new: dict) -> None:
             with contextlib.suppress(OSError):
                 os.unlink(temporary_name, dir_fd=fixtures_fd)
             raise
-
-
-def lock_on_disk_is(repo: Path, pending: dict) -> bool:
-    """Has `pending` actually reached the tracked lock? Never raises.
-
-    Asked on the unwind path INSTEAD of consulting a flag. An interrupt can
-    land between the lock's os.replace and any assignment that would record
-    it, so no flag can be set closely enough; reading the file back has no
-    window at all. Getting this wrong is not academic - a flag-based rollback
-    undid the symlink flip after the lock had already been written, producing
-    the opposite split state from the one it was guarding against.
-    """
-    try:
-        with fx.anchored_fixtures_dir(repo) as fixtures_fd:
-            return (
-                json.loads(fx.read_at(fixtures_fd, fx.lock_path(repo).name)) == pending
-            )
-    except (OSError, ValueError, fx.LockError):
-        return False
 
 
 def write_manifest(

@@ -49,9 +49,19 @@ import fixturelib as fx
 
 
 # Every payload the lock pins, regardless of tier: build determinism of the
-# large payload is exactly what a measurement baseline depends on.
-def payload_attrs(repo: Path) -> list[str]:
-    return sorted(fx.load_lock(repo)["paths"])
+# large payload is exactly what a measurement baseline depends on. The lock is
+# the AUTHORITATIVE one INSIDE the published generation (current -> gen/lock.json),
+# not the demoted git baseline - check-rebuild is runtime/consistency code.
+def published_lock(repo: Path) -> dict:
+    out_root = repo / "fixtures" / "out"
+    generation = fx.resolve_current(out_root)
+    if generation is None:
+        fail(
+            f"nothing published at {out_root / fx.CURRENT_LINK} - generate first with "
+            "`just fixtures` / `just fixtures-large`",
+            code=2,
+        )
+    return fx.load_generation_lock(generation)
 
 
 def fail(message: str, code: int = 1) -> int:
@@ -88,8 +98,8 @@ def nix_build(repo: Path, attr: str, rebuild: bool):
 
 def main() -> int:
     repo = fx.repo_root()
-    lock = fx.load_lock(repo)
-    attrs = payload_attrs(repo)
+    lock = published_lock(repo)
+    attrs = sorted(lock["paths"])
     if not attrs:
         fail("the lock pins no payloads; nothing to rebuild", code=2)
 

@@ -12,7 +12,7 @@ Tracked (the definition):
 |---|---|
 | `WORKLOAD_VERSION` | The workload's identity. Quoted by `flake.nix`, embedded in every payload, and asserted to appear in `TESTING.md`. |
 | `workload.nix` | The payload derivations. Exposed as `packages.fixture-<name>`. |
-| `workload.lock.json` | Store path, NarHash, FileHash and **tier** of every payload. The generated tree is gitignored, so this is the only committed record of what the frozen workload *is*; it is also what makes the gate fail-closed (a tier must contain exactly its pinned payload set) and the only thing that notices when a `flake.lock` bump changes the workload. |
+| `workload.lock.json` | Store path, NarHash, FileHash and **tier** of every payload — a **demoted, git-tracked baseline**, NOT the runtime source of truth. It is the reviewable record of the frozen workload (so a `flake.lock` bump is caught at build time and shows in `git diff`), read only by the generator's freeze/`--write-lock` path and written only at `--write-lock`. No runtime or gate code opens it; the authoritative lock lives inside each generation (below). |
 
 Generated, gitignored (`fixtures/out/`, created by `just fixtures`):
 
@@ -27,24 +27,35 @@ Inside a generation:
 | Path | Role |
 |---|---|
 | `cache/` | The binary cache itself: `nix-cache-info`, `<hash>.narinfo`, `nar/`. Plain static files - any file server is a sufficient mock upstream. |
+| `lock.json` | The **authoritative** lock — the runtime source of truth. Byte-identical content to the git baseline above, but resolved via `current -> gen-<sha>/lock.json` by the gate and every consumer. Because it lives inside the generation, the single symlink flip that publishes the tree commits its lock in the same syscall. |
 | `manifest.json` | What was generated: version, tier, public key, per-path compression / NarHash / NarSize / URL. Consumers read this instead of globbing. |
 | `test-key.pub` | The one public key the harness client trusts. |
 | `test-key.UNSAFE-TEST-ONLY.sec` | The signing key. Derived at generation time from a seed phrase that **is** committed, so it is fully reconstructible and **not secret** — it is worthless test-only key material. Deriving it just keeps a high-entropy blob out of git and out of the secret scanner's way (see `scripts/fixturelib.py`). |
 
 ## Publication
 
-Publishing is **one atomic operation**: build and validate a generation, then
-`os.replace` a new `current` symlink over the old one. There is no
-half-published state, so there is nothing to roll back except one more symlink
-flip. Failure end states are exhaustive and are written into
-`gen-fixtures.py:publish`'s docstring:
+Publishing is **one atomic operation, and one only**: build and validate a
+generation — *including its own `lock.json`* — then `os.replace` a new `current`
+symlink over the old one. Because the authoritative lock lives inside the
+generation, that single flip commits the tree **and** its lock together. There
+is no second source to reconcile, so `publish()` has **no rollback and no
+read-back** — the machinery that failed a review in each of rounds 2–7. The
+crash-consistency property is therefore not "windowless via a clever read-back";
+it is that there is nothing to split:
 
-| Fails at | End state |
+| Killed | End state |
 |---|---|
-| build or validation | nothing published; the build directory is removed (or named, if it cannot be) |
-| the symlink flip | nothing changed; the validated generation stays on disk under `generations/`, named and inspectable |
-| the lock write | `current` is flipped back in one syscall; the old lock is intact; the new generation stays on disk, inert |
-| collecting superseded generations | **success**, with a warning naming the residue — the tree and the lock are both committed, so this is not a failed publication. A partially-collected directory is inert but not invisible: it still occupies its name, so the next run that rebuilds the same content publishes beside it under `gen-<sha>.superseded-<stamp>` |
+| before the flip | `current` unchanged — **old-complete** |
+| mid `os.replace` | atomic syscall — old- or new-complete, never between |
+| after the flip | `current` names the new generation, whose `lock.json` is inside it — **new-complete** |
+| build or validation (before the flip) | nothing published; the build directory is removed (or named, if it cannot be) |
+| collecting superseded generations (after the flip) | **success**, with a warning naming the residue. A partially-collected directory still occupies its name, so the next run that rebuilds the same content publishes beside it under `gen-<sha>.superseded-<stamp>` |
+
+The git baseline is written, if at all, **after** the flip and only at
+`--write-lock`. A failure there is `success`-with-a-warning: the published tree
+is authoritative and self-describing; the git file merely lags, which shows in
+`git status` and is reconciled by re-running `--write-lock`. Nothing is rolled
+back, because that file is not authoritative.
 
 Two generations are kept: the published one (`current`) and its predecessor
 (`previous`). Older ones are deleted only through a file descriptor opened

@@ -170,12 +170,14 @@ def check_workload_version_documented(repo: Path, manifest: dict) -> None:
 
 
 def check_matches_lock(repo: Path, generation: Path, manifest: dict) -> None:
-    """The tree must BE the pinned workload for its tier - metadata and bytes.
+    """The served tree must match its OWN authoritative lock - metadata and bytes.
 
-    WORKLOAD_VERSION alone cannot catch the drift that matters most: bumping
-    flake.lock changes stdenv, hence every derivation, hence every store path
-    and NarHash - while the version string sits still and the J2 baseline
-    silently stops describing the workload it was measured against.
+    The runtime source of truth is `current -> gen-<sha>/lock.json`, committed
+    with the tree by the publish flip. This gate holds the served tree to that
+    immutable lock: it catches any post-publish tampering of the manifest, the
+    narinfos, the cache-info, or the NAR blobs. Detecting a flake.lock BASELINE
+    drift is a separate, build-time concern (gen-fixtures' assert_matches_baseline
+    reads the git baseline); the git file is not consulted here.
 
     Two things this deliberately does NOT do, both because they failed open in
     review. It does not accept a subset ("3 of 4 pinned payloads" used to be a
@@ -185,7 +187,11 @@ def check_matches_lock(repo: Path, generation: Path, manifest: dict) -> None:
     perfectly about a file that has been deleted, which is how a missing
     110 MiB payload passed under --skip-determinism.
     """
-    lock = fx.load_lock(repo)
+    # The AUTHORITATIVE lock is INSIDE the generation, resolved via
+    # current -> gen-<sha>/lock.json. The git-tracked fixtures/workload.lock.json
+    # is NOT read here - it is a demoted review artifact, and this gate has one
+    # runtime source of truth (asserted by scripts/check-lock-sources.py).
+    lock = fx.load_generation_lock(generation)
     cache = generation / "cache"
     problems = (
         fx.symlink_problems(generation)
@@ -195,8 +201,8 @@ def check_matches_lock(repo: Path, generation: Path, manifest: dict) -> None:
     )
     if problems:
         fail(
-            "the fixture is NOT the workload pinned in "
-            "fixtures/workload.lock.json:\n  - "
+            "the served tree does NOT match its own authoritative "
+            f"{generation / fx.GEN_LOCK_NAME}:\n  - "
             + "\n  - ".join(problems)
             + f"\n\nIf the tree is merely damaged, regenerate it "
             "(`just fixtures` / `just fixtures-large`): the generator checks the "
@@ -213,7 +219,7 @@ def check_matches_lock(repo: Path, generation: Path, manifest: dict) -> None:
     ok(
         f"is the pinned workload for tier={tier}: "
         f"{len(manifest['paths'])} payload(s), metadata and NAR bytes verified "
-        f"against fixtures/workload.lock.json"
+        f"against the generation's own {fx.GEN_LOCK_NAME}"
     )
     if tier != fx.TIER_FULL:
         # Not a failure - the fast tier is a legitimate thing to run - but said
