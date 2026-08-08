@@ -18,8 +18,13 @@ Reusability (this is FOUNDATIONAL infra - tasks 6/7/9/11 build on it):
   * task-7 (crash injection): `Pod.kill("daemon")` mid-transfer; see NOTE there.
   * task-9 (egress/gap oracles): `Pod.proxy_stats()` / `proxy_log()` are the
     ground-truth counters; `record['gap_ms']` is the narinfo->nar gap.
-  * task-11 (chain N daemons): task-11 WILL add a `daemon_chain=N` param to Pod
-    (not present yet) to run d1->d2->...->testproxy; today Pod starts one daemon.
+  * task-11 (chain N daemons): `Pod(..., daemon_chain=N)` runs
+    client -> daemon-1 -> daemon-2 -> ... -> daemon-N -> testproxy -> origin,
+    each daemon on its own in-pod port (8082, 8083, ...) with a host port
+    published per hop (18082, 18083, ...) so per-entry-point oracles run
+    host-side. The long-chain scenarios assert S1 at depth, per-hop request
+    counts, the timeout invariant, and middle-daemon-kill recovery. task-13
+    (fault x depth matrix) and task-15 (p2p multi-hop) reuse this seam.
 
 Fixture handling (AC#5, task-3 deep-gate): we resolve the IMMUTABLE generation
 (`readlink -f fixtures/out/current`), bind-mount ONLY its `cache/` subdir into
@@ -43,6 +48,7 @@ import json
 import os
 import shutil
 import socket
+import statistics
 import subprocess
 import sys
 import time
@@ -69,6 +75,11 @@ DAEMON_PORT = 8082
 HOST_ORIGIN = 18080
 HOST_PROXY = 18081
 HOST_DAEMON = 18082
+# Ceiling on `daemon_chain=N` (task-11): daemon i takes in-pod port DAEMON_PORT+i
+# and host port HOST_DAEMON+i, so an unbounded N would eventually collide with
+# other host services. Depth-3 is the standing test; 32 is a generous band
+# (8082..8113 / 18082..18113) that fails fast on an absurd value.
+MAX_DAEMON_CHAIN = 32
 
 # The DoD honesty marker (Justfile `stub_marker`). A real harness with zero
 # scenarios registered is a stub pretending to pass; we print this and fail
@@ -350,10 +361,26 @@ class Pod:
         with_daemon: bool,
         expect,
         daemon_extra_args: tuple[str, ...] = (),
+        daemon_chain: int = 0,
     ):
         self.ctx = ctx
         self.pod = f"{POD_PREFIX}-{name}"
         self.served_cache = served_cache
+        # `daemon_chain=N` (task-11) runs N product daemons in series:
+        # client -> daemon-1 -> ... -> daemon-N -> testproxy. It is mutually
+        # exclusive with the single-daemon `with_daemon` path so the 15 existing
+        # scenarios keep starting the daemon exactly as before (role "daemon"),
+        # while chain scenarios opt in explicitly (roles "daemon-1".."daemon-N").
+        self.daemon_chain = int(daemon_chain)
+        if self.daemon_chain and with_daemon:
+            die("Pod: pass either with_daemon or daemon_chain=N, not both")
+        if self.daemon_chain < 0:
+            die(f"Pod: daemon_chain must be >= 0, got {self.daemon_chain}")
+        if self.daemon_chain > MAX_DAEMON_CHAIN:
+            die(
+                f"Pod: daemon_chain={self.daemon_chain} exceeds MAX_DAEMON_CHAIN "
+                f"({MAX_DAEMON_CHAIN}); higher hop counts collide with other host ports"
+            )
         self.with_daemon = with_daemon
         # Extra daemon CLI flags (task-9 product-side bite passes
         # --narinfo-cache-dir to toggle task-8's narinfo cache). Empty by default
@@ -374,6 +401,24 @@ class Pod:
 
     def _c(self, role: str) -> str:
         return f"{self.pod}-{role}"
+
+    def _daemon_roles(self) -> list[str]:
+        """The daemon container roles this pod runs, in chain order (the FIRST
+        is the chain head the client substitutes against). One "daemon" for the
+        single-daemon path; "daemon-1".."daemon-N" for a `daemon_chain=N` pod."""
+        if self.daemon_chain:
+            return [f"daemon-{i}" for i in range(1, self.daemon_chain + 1)]
+        if self.with_daemon:
+            return ["daemon"]
+        return []
+
+    def daemon_host_port(self, index: int = 1) -> int:
+        """Host-published port forwarding to daemon #index (1-based), for
+        host-side oracles that time or probe a specific entry point. Entering
+        the chain at daemon #i traverses (len(chain) - i + 1) hops, so daemon-1
+        is the DEEPEST entry (full depth) and daemon-N is a single hop - the
+        seam the timeout-invariant oracle uses to isolate the per-hop latency."""
+        return HOST_DAEMON + (index - 1)
 
     def _assert_no_secret_key_served(self) -> None:
         """AC#5, observed at the RIGHT boundary: walk the exact host tree that
@@ -417,6 +462,17 @@ class Pod:
     def _create(self) -> None:
         # Remove a stale pod of the same name first (a previous crashed run).
         run([self._pm, "pod", "rm", "-f", "--ignore", self.pod], check=False)
+        # Publish origin + proxy, plus one host port per daemon hop so a
+        # per-entry-point oracle can probe any hop directly (host-side). The
+        # single-daemon path publishes exactly 18082->8082 as before.
+        publish = [
+            "-p",
+            f"127.0.0.1:{HOST_ORIGIN}:{ORIGIN_PORT}",
+            "-p",
+            f"127.0.0.1:{HOST_PROXY}:{PROXY_PORT}",
+        ]
+        for i, _role in enumerate(self._daemon_roles()):
+            publish += ["-p", f"127.0.0.1:{HOST_DAEMON + i}:{DAEMON_PORT + i}"]
         run(
             [
                 self._pm,
@@ -426,12 +482,7 @@ class Pod:
                 self.pod,
                 "--label",
                 PROJECT_LABEL,
-                "-p",
-                f"127.0.0.1:{HOST_ORIGIN}:{ORIGIN_PORT}",
-                "-p",
-                f"127.0.0.1:{HOST_PROXY}:{PROXY_PORT}",
-                "-p",
-                f"127.0.0.1:{HOST_DAEMON}:{DAEMON_PORT}",
+                *publish,
             ]
         )
         # origin: static file server over the served cache (bind-mount, :ro).
@@ -485,7 +536,19 @@ class Pod:
                 "/tmp/proxy-cache",
             ]
         )
-        if self.with_daemon:
+        # Daemons, in chain order. Each hop's upstream is the NEXT daemon in the
+        # chain; the LAST hop's upstream is the testproxy. So the client enters
+        # at daemon-1 and its request threads every daemon before reaching the
+        # cache boundary (the only route from client to testproxy) - which is
+        # exactly why the testproxy request count at depth-N proves the whole
+        # chain carried the payload, no hop skipped.
+        roles = self._daemon_roles()
+        for i, role in enumerate(roles):
+            in_port = DAEMON_PORT + i
+            if i + 1 < len(roles):
+                upstream = f"http://127.0.0.1:{DAEMON_PORT + i + 1}"
+            else:
+                upstream = f"http://127.0.0.1:{PROXY_PORT}"
             run(
                 [
                     self._pm,
@@ -494,15 +557,15 @@ class Pod:
                     "--pod",
                     self.pod,
                     "--name",
-                    self._c("daemon"),
+                    self._c(role),
                     "--label",
                     PROJECT_LABEL,
                     self.ctx.image,
                     "/bin/daemon",
                     "--listen",
-                    f"0.0.0.0:{DAEMON_PORT}",
+                    f"0.0.0.0:{in_port}",
                     "--upstream",
-                    f"http://127.0.0.1:{PROXY_PORT}",
+                    upstream,
                     *self.daemon_extra_args,
                 ]
             )
@@ -513,8 +576,8 @@ class Pod:
             (f"http://127.0.0.1:{HOST_ORIGIN}/nix-cache-info", "origin"),
             (f"http://127.0.0.1:{HOST_PROXY}/nix-cache-info", "testproxy"),
         ]
-        if self.with_daemon:
-            targets.append((f"http://127.0.0.1:{HOST_DAEMON}/nix-cache-info", "daemon"))
+        for i, role in enumerate(self._daemon_roles()):
+            targets.append((f"http://127.0.0.1:{HOST_DAEMON + i}/nix-cache-info", role))
         deadline = time.time() + READY_TIMEOUT_S
         for url, role in targets:
             while True:
@@ -530,7 +593,7 @@ class Pod:
                 time.sleep(0.25)
 
     def _dump_logs(self) -> None:
-        for role in ("origin", "proxy", "daemon"):
+        for role in ["origin", "proxy", *self._daemon_roles()]:
             result = run([self._pm, "logs", self._c(role)], check=False)
             if result.stdout or result.stderr:
                 print(f"--- logs {self._c(role)} ---", file=sys.stderr)
@@ -1003,34 +1066,53 @@ def _host_nar_size(fixtures: Fixtures, attr: str) -> int:
 
 
 def _daemon_action_at_bytes(
-    pod: Pod, threshold: int, action: str, deadline_s: float = 180.0
+    pod: Pod,
+    threshold: int,
+    action: str,
+    *,
+    role: str = "daemon",
+    deadline_s: float = 180.0,
 ) -> int:
     """Poll the proxy's in-flight NAR byte gauge and fire `action` ("kill" or
-    "pause") on the daemon the instant the transfer crosses `threshold` bytes.
-    Returns the observed byte count at the moment of action (or the last reading
-    if the deadline passed without crossing - the caller asserts the crossing,
-    so a miss fails loudly, and `nar_tmp_bytes` dies on a broken probe)."""
+    "pause") on daemon `role` the instant the transfer crosses `threshold`
+    bytes. `role` is "daemon" for the single-daemon crash suite (task-7) and
+    "daemon-2" (etc.) for a middle-of-chain kill (task-11). Returns the observed
+    byte count at the moment of action (or the last reading if the deadline
+    passed without crossing - the caller asserts the crossing, so a miss fails
+    loudly, and `nar_tmp_bytes` dies on a broken probe)."""
     fire = {"kill": pod.kill, "pause": pod.pause}[action]
     deadline = time.time() + deadline_s
     observed = 0
     while time.time() < deadline:
         observed = pod.nar_tmp_bytes()
         if observed >= threshold:
-            fire("daemon")
+            fire(role)
             return observed
         time.sleep(0.02)
     return observed
 
 
+def _daemon_reachable_at(index: int, timeout: float = 1.0) -> bool:
+    """True iff daemon #index (1-based) answers /nix-cache-info on its host
+    port - the chain counterpart of `daemon_reachable`, used to confirm a
+    middle daemon really died after a kill."""
+    port = HOST_DAEMON + (index - 1)
+    try:
+        status, _ = http_get(f"http://127.0.0.1:{port}/nix-cache-info", timeout)
+    except OSError:
+        return False
+    return status == 200
+
+
 def _kill_daemon_at_bytes(pod: Pod, threshold: int, deadline_s: float = 180.0) -> int:
     """SIGKILL the daemon once the NAR transfer crosses `threshold` bytes."""
-    return _daemon_action_at_bytes(pod, threshold, "kill", deadline_s)
+    return _daemon_action_at_bytes(pod, threshold, "kill", deadline_s=deadline_s)
 
 
 def _stall_daemon_at_bytes(pod: Pod, threshold: int, deadline_s: float = 180.0) -> int:
     """FREEZE (pause) the daemon once the NAR crosses `threshold` - the SIGSTOP
     stall (no RST/FIN)."""
-    return _daemon_action_at_bytes(pod, threshold, "pause", deadline_s)
+    return _daemon_action_at_bytes(pod, threshold, "pause", deadline_s=deadline_s)
 
 
 def _wait_proxy_activity(pod: Pod, deadline_s: float = 20.0) -> bool:
@@ -1943,6 +2025,435 @@ def scenario_crash_keepalive_desync(ctx: Ctx, expect) -> None:
         )
 
 
+# ---- long-chain suite (task-11): depth-3 proxy composition ------------------
+#
+# Topology: client -> daemon-1 -> daemon-2 -> daemon-3 -> testproxy -> origin.
+# The client's ONLY preferred substituter is daemon-1 (chain head) and each
+# daemon's ONLY upstream is the next hop, so the testproxy receiving a request
+# at all proves the whole chain carried it (the boundary oracle for "no hop
+# skipped"). Byte identity is read at the CLIENT; request counts at the
+# TESTPROXY - never a daemon's self-narration (per-hop daemon logs are used only
+# as corroboration, anchored on the boundary count).
+
+CHAIN_DEPTH = 3
+
+# Per-hop added-latency bound, FIXED BEFORE IMPLEMENTATION (AC#2). On pod
+# loopback a transparent-passthrough hop adds sub-millisecond forwarding; 50 ms
+# is a generous ceiling. This number is a contract: change it ONLY by a recorded
+# review note, never post-hoc to fit a measurement (task-11 AC#2).
+PER_HOP_LATENCY_BOUND_MS = 50.0
+
+
+def _time_get_median_ms(
+    url: str, samples: int, *, warm: int = 1, timeout: float = 60.0
+) -> tuple[float, int]:
+    """Median wall time (ms) of `samples` GETs of `url`, after `warm` warm-up
+    GETs so a first-fetch origin miss / TCP warmup does not skew the median.
+    Returns (median_ms, last_status). Median (not mean) so a single scheduler
+    hiccup does not move the number."""
+    status = 0
+    for _ in range(warm):
+        status, _ = http_get(url, timeout=timeout)
+    timings = []
+    for _ in range(samples):
+        start = time.perf_counter()
+        status, _ = http_get(url, timeout=timeout)
+        timings.append((time.perf_counter() - start) * 1000.0)
+    return statistics.median(timings), status
+
+
+def _latency_scales_with_depth(
+    t_shallow_ms: float,
+    t_deep_ms: float,
+    shallow_hops: int,
+    deep_hops: int,
+    rel_tol: float = 0.25,
+) -> bool:
+    """True iff the deep-chain time looks like the shallow time SCALED by the
+    hop-count ratio - the signature of a per-hop MULTIPLYING timeout. The
+    correct (streamed/additive) model gives t_deep ~= t_shallow + small; a
+    multiplying model gives t_deep ~= t_shallow * (deep_hops/shallow_hops). A
+    pure function so the AC#2 bite exercises it directly on a synthetic
+    multiplied sample, without building a broken daemon."""
+    if t_shallow_ms <= 0 or shallow_hops <= 0:
+        return False
+    expected_if_multiplying = t_shallow_ms * (deep_hops / shallow_hops)
+    return t_deep_ms >= expected_if_multiplying * (1.0 - rel_tol)
+
+
+def scenario_chain_s1_and_counts(ctx: Ctx, expect) -> None:
+    """AC#1: depth-3 chain - S1 byte identity + exact per-hop request counts.
+    The `app` closure refs `lib`, so ONE realise exercises BOTH compression
+    encodings (app=xz, lib=none) through all three hops."""
+    fixtures = ctx.fixtures
+    payload_attrs = ["app", "lib"]  # xz + none, one closure (app refs lib)
+    # Name BOTH paths as realise targets: `app` alone pulls `lib` through its
+    # closure, but the client script only collects `nix path-info` for the paths
+    # it is handed, so the S1 byte oracle needs `lib` named to read its NarHash.
+    targets = [fixtures.store_path(attr) for attr in payload_attrs]
+    with Pod(
+        ctx,
+        "chain-s1",
+        fixtures.cache,
+        with_daemon=False,
+        expect=expect,
+        daemon_chain=CHAIN_DEPTH,
+    ) as pod:
+        pod.proxy_reset()
+        cold = pod.client_run(
+            targets, ctx.substituter_daemon_only(), fixtures.public_key
+        )
+        expect(
+            cold.exit_code == 0,
+            f"chain(depth-{CHAIN_DEPTH}): realise app closure through the chain succeeds",
+            cold.stderr[-400:],
+        )
+        # S1 byte oracle at the CLIENT boundary, both compression encodings.
+        for attr in payload_attrs:
+            store_path = fixtures.store_path(attr)
+            got = cold.narhash(store_path)
+            comp = fixtures.entry(attr).get("compression", "?")
+            expect(
+                got == fixtures.nar_hash(attr),
+                f"chain S1 byte oracle [{attr}/{comp}]: NarHash matches signed "
+                f"manifest through {CHAIN_DEPTH} hops",
+                f"got={got} want={fixtures.nar_hash(attr)}",
+            )
+        # Per-hop request counts, BOUNDARY oracle: the testproxy saw exactly one
+        # upstream NAR fetch and served exactly one NAR per payload. A hop that
+        # double-counted pushes these > len; a skipped hop severs the only route
+        # to the testproxy, so the realise above would have failed.
+        stats = pod.proxy_stats()
+        nar_up = stats["upstream"].get("nar", 0)
+        nar_rx = stats["received"].get("nar", 0)
+        expect(
+            nar_up == len(payload_attrs),
+            "chain count (boundary): testproxy saw exactly one upstream NAR "
+            "fetch per payload (no multiplication across hops)",
+            f"upstream nar={nar_up} want={len(payload_attrs)}",
+        )
+        expect(
+            nar_rx == len(payload_attrs),
+            "chain count (boundary): testproxy served exactly one NAR per payload",
+            f"received nar={nar_rx}",
+        )
+        # Per-hop corroboration: each daemon served each payload NAR exactly once
+        # (localizes a skip/double-count to a hop; anchored on the boundary count
+        # above, not a substitute for it).
+        for idx in range(1, CHAIN_DEPTH + 1):
+            log = pod.logs(f"daemon-{idx}")
+            for attr in payload_attrs:
+                url = fixtures.entry(attr)["url"]
+                count = log.count(url)
+                expect(
+                    count == 1,
+                    f"chain per-hop count: daemon-{idx} served {attr} NAR exactly once",
+                    f"count={count}",
+                )
+
+
+def scenario_chain_corrupt_bite(ctx: Ctx, expect) -> None:
+    """AC#1 BITE: prove the depth-3 S1 oracle catches a corrupted byte AT DEPTH.
+    Serves `lib` with a pristine, validly-signed narinfo but a mid-payload
+    corrupt NAR (the corrupt-nar fault at the origin) through all three hops -
+    the build must FAIL with a content-hash error, never accept corruption
+    because it crossed extra hops."""
+    fixtures = ctx.fixtures
+    scratch = ctx.scratch / "chain-corrupt-nar"
+    if scratch.exists():
+        shutil.rmtree(scratch)
+    cache = build_corrupt_nar_tree(fixtures, scratch)
+    lib = fixtures.store_path("lib")
+    with Pod(
+        ctx,
+        "chain-corrupt",
+        cache,
+        with_daemon=False,
+        expect=expect,
+        daemon_chain=CHAIN_DEPTH,
+    ) as pod:
+        result = pod.client_run(
+            [lib], ctx.substituter_daemon_only(), fixtures.public_key
+        )
+        expect(
+            result.exit_code != 0,
+            f"chain S1 BITE: corrupt NAR FAILS the build through {CHAIN_DEPTH} "
+            "hops (corruption never accepted at depth)",
+            f"exit={result.exit_code}",
+        )
+        expect(
+            result.narhash(lib) is None,
+            "chain S1 BITE: the corrupt path was NOT imported at depth",
+            "",
+        )
+        expect(
+            HASH_REJECT_NEEDLE in result.stderr,
+            f"chain S1 BITE: rejected as {HASH_REJECT_NEEDLE!r} (content-hash "
+            "gate holds at depth, not a NAR-parse error)",
+            f"stderr tail: {result.stderr[-400:]}",
+        )
+
+
+def scenario_chain_absent_404(ctx: Ctx, expect) -> None:
+    """AC#1 404-fidelity AT DEPTH: an absent path 404s cleanly through all three
+    hops (never a 502 at any hop), the present sibling still serves, and the
+    build proceeds. Observed at the chain HEAD's own HTTP response - the
+    boundary the property is about."""
+    fixtures = ctx.fixtures
+    present = fixtures.store_path("lib")
+    absent = "/nix/store/00000000000000000000000000000000-nix-p2p-absent"
+    absent_narinfo = fx.narinfo_name(absent)
+    present_narinfo = fx.narinfo_name(present)
+    head = HOST_DAEMON  # daemon-1 (chain head) host port
+    with Pod(
+        ctx,
+        "chain-absent",
+        fixtures.cache,
+        with_daemon=False,
+        expect=expect,
+        daemon_chain=CHAIN_DEPTH,
+    ) as pod:
+        status_absent, _ = http_get(f"http://127.0.0.1:{head}/{absent_narinfo}")
+        expect(
+            status_absent == 404,
+            f"chain 404-fidelity: chain head returns 404 for the absent path "
+            f"through {CHAIN_DEPTH} hops (not a 502)",
+            f"status={status_absent}",
+        )
+        status_present, _ = http_get(f"http://127.0.0.1:{head}/{present_narinfo}")
+        expect(
+            status_present == 200,
+            "chain 404-fidelity: chain head still serves the present narinfo (200)",
+            f"status={status_present}",
+        )
+        pod.proxy_reset()
+        result = pod.client_run(
+            [absent, present], ctx.substituter_daemon_only(), fixtures.public_key
+        )
+        got = result.narhash(present)
+        expect(
+            got == fixtures.nar_hash("lib"),
+            "chain 404-fidelity: present sibling still substitutes at depth "
+            "(build proceeds, chain head not marked failed)",
+            f"got={got} stderr={result.stderr[-300:]}",
+        )
+
+
+def scenario_chain_timeout_invariant(ctx: Ctx, expect) -> None:
+    """AC#2: client-visible latency at depth 3 must NOT scale with depth.
+    Measured on ONE pod by entering the SAME chain at different hops - daemon-N
+    (1 hop, shallow) vs daemon-1 (CHAIN_DEPTH hops, deep) - which holds
+    origin/proxy/host noise constant and isolates the added daemon hops.
+
+    Two assertions, per the AC:
+      (1) added latency < bound: (t_deep - t_shallow) / extra_hops < 50 ms/hop
+          (PER_HOP_LATENCY_BOUND_MS, fixed before implementation);
+      (2) total timeout does not multiply per hop: under a FIXED delay injected
+          ONCE at the testproxy, the deep-chain time stays ~= the shallow time
+          (both ~= the delay), NOT depth x the delay."""
+    fixtures = ctx.fixtures
+    present_narinfo = fx.narinfo_name(fixtures.store_path("lib"))
+    with Pod(
+        ctx,
+        "chain-timeout",
+        fixtures.cache,
+        with_daemon=False,
+        expect=expect,
+        daemon_chain=CHAIN_DEPTH,
+    ) as pod:
+        shallow_url = (
+            f"http://127.0.0.1:{pod.daemon_host_port(CHAIN_DEPTH)}/{present_narinfo}"
+        )
+        deep_url = f"http://127.0.0.1:{pod.daemon_host_port(1)}/{present_narinfo}"
+
+        # (1) No-fault per-hop added latency (median of many small narinfo GETs).
+        # WEAK GUARD by design: on pod loopback there is no real latency to
+        # multiply, so this delta is sub-millisecond noise (it can even go
+        # negative) and passes almost regardless of the design. It is a coarse
+        # regression tripwire; the REAL non-multiplication oracle is part (2)
+        # plus the synthetic BITE below, where a fixed delay makes the two
+        # entry points diverge only if a hop re-incurs it.
+        t_shallow, shallow_status = _time_get_median_ms(shallow_url, samples=25)
+        t_deep, deep_status = _time_get_median_ms(deep_url, samples=25)
+        expect(
+            shallow_status == 200 and deep_status == 200,
+            "chain timeout: narinfo probes served 200 at both entry points",
+            f"shallow={shallow_status} deep={deep_status}",
+        )
+        extra_hops = CHAIN_DEPTH - 1
+        per_hop = (t_deep - t_shallow) / extra_hops
+        expect(
+            per_hop < PER_HOP_LATENCY_BOUND_MS,
+            f"chain AC#2: per-hop added latency < {PER_HOP_LATENCY_BOUND_MS:.0f} "
+            "ms (bound fixed before implementation)",
+            f"per_hop={per_hop:.2f} ms (deep={t_deep:.2f} shallow={t_shallow:.2f}, "
+            f"{extra_hops} extra hops)",
+        )
+        print(
+            f"  chain AC#2 MEASURED (no fault): shallow(1 hop)={t_shallow:.2f}ms "
+            f"deep({CHAIN_DEPTH} hops)={t_deep:.2f}ms -> {per_hop:.2f}ms/hop "
+            f"(bound {PER_HOP_LATENCY_BOUND_MS:.0f})"
+        )
+
+        # (2) Fixed delay injected ONCE at the testproxy. A correct streamed
+        # passthrough incurs it once regardless of depth; a per-hop multiplying
+        # design would incur it at every hop.
+        #
+        # The delay is kept WELL BELOW the daemon's fixed 1000ms per-hop upstream
+        # header timeout (daemon/src/upstream.rs `header_timeout`). FINDING
+        # (filed for task-13/task-25): that timeout does NOT compose across hops
+        # - it starts when each hop sends its request, but inner hops fetch
+        # serially, so at depth the deepest upstream's effective deadline shrinks
+        # by the accumulated per-hop setup. A delay AT the 1000ms timeout that a
+        # 1-hop entry survives makes a 3-hop entry 502 (observed). That is a real
+        # depth-composition limit, not latency multiplication (the delay is still
+        # incurred once); this oracle stays below it to measure the property it
+        # names, and the finding is tracked separately rather than papered over.
+        delay_ms = 300
+        pod.proxy_faults(f"latency_narinfo_ms={delay_ms}")
+        t_shallow_d, shallow_d_status = _time_get_median_ms(
+            shallow_url, samples=3, warm=0
+        )
+        t_deep_d, deep_d_status = _time_get_median_ms(deep_url, samples=3, warm=0)
+        pod.proxy_faults("")
+        # Fail-fast: the whole invariant is vacuous if the delay never registered
+        # (a degenerate ~0ms shallow would make the ratio predicate pass on
+        # anything). Assert both probes were 200 AND the shallow entry actually
+        # incurred most of the injected delay before trusting the ratio.
+        expect(
+            shallow_d_status == 200 and deep_d_status == 200,
+            "chain AC#2: delayed narinfo probes served 200 at both entry points",
+            f"shallow={shallow_d_status} deep={deep_d_status}",
+        )
+        expect(
+            t_shallow_d >= 0.5 * delay_ms,
+            f"chain AC#2 precondition: the injected {delay_ms}ms delay registered "
+            "at the shallow entry (invariant is not vacuous)",
+            f"shallow={t_shallow_d:.1f}ms want>={0.5 * delay_ms:.0f}ms",
+        )
+        multiplies = _latency_scales_with_depth(t_shallow_d, t_deep_d, 1, CHAIN_DEPTH)
+        expect(
+            not multiplies,
+            f"chain AC#2: a fixed {delay_ms}ms upstream delay does NOT multiply "
+            f"per hop (deep ~= shallow, not {CHAIN_DEPTH}x)",
+            f"shallow={t_shallow_d:.1f}ms deep={t_deep_d:.1f}ms",
+        )
+        expect(
+            (t_deep_d - t_shallow_d) < extra_hops * PER_HOP_LATENCY_BOUND_MS,
+            "chain AC#2: even under the fixed delay the deep-vs-shallow gap stays "
+            "within the per-hop bound (the delay is incurred once, not per hop)",
+            f"gap={t_deep_d - t_shallow_d:.1f}ms "
+            f"bound={extra_hops * PER_HOP_LATENCY_BOUND_MS:.0f}ms",
+        )
+        print(
+            f"  chain AC#2 MEASURED (fixed {delay_ms}ms delay): "
+            f"shallow={t_shallow_d:.1f}ms deep={t_deep_d:.1f}ms "
+            f"(a multiplying design would give deep~={delay_ms * CHAIN_DEPTH}ms)"
+        )
+
+        # BITE: the non-multiplication predicate MUST flag a synthetic per-hop
+        # multiplied sample - else the check above could pass on anything.
+        synthetic_deep = t_shallow_d * CHAIN_DEPTH
+        expect(
+            _latency_scales_with_depth(t_shallow_d, synthetic_deep, 1, CHAIN_DEPTH),
+            "chain AC#2 BITE: the invariant goes RED on a synthetic per-hop-"
+            "multiplied latency sample",
+            f"synthetic deep={synthetic_deep:.1f}ms from shallow={t_shallow_d:.1f}ms",
+        )
+
+
+def scenario_chain_kill_middle_daemon(ctx: Ctx, expect) -> None:
+    """AC#3: kill the MIDDLE daemon mid-NAR; the client build still succeeds via
+    the explicit direct fallback (not merely the next daemon), and the failure
+    mode is visible in the logs. A companion control then proves the recovery is
+    REAL: with the middle hop still dead and NO fallback, the chain build FAILS -
+    the middle hop is load-bearing, so a skipped hop goes red."""
+    fixtures = ctx.fixtures
+    big = fixtures.store_path(BIG_ATTR)
+    big_size = _host_nar_size(fixtures, BIG_ATTR)
+    big_url = fixtures.entry(BIG_ATTR)["url"]
+    lib = fixtures.store_path("lib")
+    middle = 2  # of a depth-3 chain, daemon-2 is the middle hop
+    with Pod(
+        ctx,
+        "chain-killmid",
+        fixtures.cache,
+        with_daemon=False,
+        expect=expect,
+        daemon_chain=CHAIN_DEPTH,
+    ) as pod:
+        pod.proxy_reset()
+        # Throttle the NAR so the transfer window is wide and the mid-stream kill
+        # lands deterministically (same rationale as task-7 crash(b)).
+        pod.proxy_faults(f"throttle_nar_bps={THROTTLE_BPS}")
+        client = pod.client_run_async(
+            [big], ctx.substituter_daemon_and_fallback(), fixtures.public_key
+        )
+        observed = _daemon_action_at_bytes(
+            pod, big_size // 2, "kill", role=f"daemon-{middle}"
+        )
+        pct = (100 * observed // big_size) if big_size else 0
+        pod.proxy_faults("")  # unthrottle so the fallback serves at full speed
+        expect(
+            observed >= big_size // 2,
+            f"chain AC#3: killed daemon-{middle} (middle) at >=50% of the NAR by "
+            "BYTES OBSERVED at the proxy",
+            f"observed={observed}/{big_size} ({pct}%)",
+        )
+        expect(
+            not _daemon_reachable_at(middle),
+            f"chain AC#3: daemon-{middle} (middle) is gone after the kill",
+            "",
+        )
+        expect(
+            _daemon_reachable_at(1),
+            "chain AC#3: the chain head (daemon-1) survived - only the middle died",
+            "",
+        )
+        result = client.wait_result(timeout=300)
+        expect(
+            result.exit_code == 0,
+            "chain AC#3: build succeeds via fallback despite the middle-daemon kill",
+            result.stderr[-600:],
+        )
+        got = result.narhash(big)
+        expect(
+            got == fixtures.nar_hash(BIG_ATTR),
+            "chain AC#3: byte oracle - big NarHash matches upstream via fallback",
+            f"got={got}",
+        )
+        _assert_fallback_served_big(pod, fixtures, expect, "chain AC#3")
+        # Failure mode visible in logs: the middle-daemon death cut the in-flight
+        # transfer, so the proxy log shows a truncated-transfer event.
+        short, nar_records = _wait_for_short_nar(pod, big_url, big_size)
+        expect(
+            len(short) >= 1,
+            "chain AC#3: failure mode visible - proxy log shows a truncated-"
+            "transfer event (bytes_sent < file_size)",
+            f"nar records (bytes_sent,status)="
+            f"{[(r.get('bytes_sent'), r.get('status')) for r in nar_records]}",
+        )
+
+        # Companion control (recovery is REAL / skip-bite): daemon-2 is still
+        # dead. With daemon-1 ONLY (no fallback) a FRESH client cannot deliver -
+        # the middle hop is load-bearing, so the build FAILS. This proves the
+        # success above came from the fallback, not the chain limping on.
+        expect(
+            not _daemon_reachable_at(middle),
+            "chain AC#3 control: middle daemon still dead for the no-fallback probe",
+            "",
+        )
+        no_fallback = pod.client_run(
+            [lib], ctx.substituter_daemon_only(), fixtures.public_key
+        )
+        expect(
+            no_fallback.exit_code != 0,
+            "chain AC#3 BITE: with the middle hop dead and NO fallback, the chain "
+            "build FAILS (middle hop is load-bearing; a skipped hop goes red)",
+            f"exit={no_fallback.exit_code}",
+        )
+
+
 SCENARIOS = [
     ("topology", scenario_topology),
     ("s1-byte-and-counts", scenario_s1_byte_and_counts),
@@ -1960,6 +2471,12 @@ SCENARIOS = [
     ("crash-kill-between-narinfo-nar", scenario_crash_kill_between_narinfo_and_nar),
     ("crash-sigstop-stall", scenario_crash_sigstop_stall),
     ("crash-keepalive-desync", scenario_crash_keepalive_desync),
+    # long-chain suite (task-11): depth-3 proxy composition must survive depth.
+    ("chain-s1-and-counts", scenario_chain_s1_and_counts),
+    ("chain-corrupt-bite", scenario_chain_corrupt_bite),
+    ("chain-absent-404", scenario_chain_absent_404),
+    ("chain-timeout-invariant", scenario_chain_timeout_invariant),
+    ("chain-kill-middle-daemon", scenario_chain_kill_middle_daemon),
 ]
 
 
