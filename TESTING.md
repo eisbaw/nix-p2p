@@ -132,6 +132,17 @@ Measurement discipline (S3/S4 are decision inputs, so extra rigor):
   next to the code; the test proxy's byte counters are ground truth
   and the daemon's self-reported counters must agree within a stated
   tolerance (the product is measured, not trusted).
+  The frozen doc is `scripts/MEASUREMENT_COUNTING_RULE.md` (counting-rule
+  version **`net-upstream-egress-v1`**); its executable form is
+  `scripts/measure.py` (`just measure`, task-9). Egress ground truth is the
+  testproxy `bytes_sent` (body bytes) at the cache boundary; the unit is
+  **compressed on-wire bytes (`file_size`), never `NarSize`**; truncated and
+  retried transfers are excluded (a run containing one is INVALID, fail-closed).
+  The daemon self-counter tolerance is **≤ 1%** (NAR only). Every report embeds
+  the workload version + fixture lock public key/hashes + the counting-rule
+  version. **The J2 baseline (task-12) is what records numbers here** by running
+  `just measure` after `just fixtures-large` + `just fixtures-verify-rebuild`;
+  this task delivers the instrument, not the baseline.
 - **Sample discipline**: N ≥ 10 runs per arm, variance reported.
 - **A/A calibration**: daemon-off vs daemon-off must show a noise
   floor below the 10% S4 threshold, else S4 is reported as unusable

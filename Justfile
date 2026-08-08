@@ -147,9 +147,16 @@ e2e-clean:
 e2e-vm:
     @echo "{{ stub_marker }}"
 
-# Egress/latency measurement runs (S3/S4) - stub until task-9.
-measure:
-    @echo "{{ stub_marker }}"
+# The S3/S4 measurement instrument (task-9): runs an identical scripted workload
+# with-daemon vs without-daemon over the task-5 Pod seam and emits a
+# machine-readable egress + p95 + gap-histogram report, with each oracle proven
+# to bite by mutation. The counting rule it freezes lives next to the code in
+# scripts/MEASUREMENT_COUNTING_RULE.md. Full-tier fixtures + the fail-closed
+# check-fixtures gate (via the harness). SLOW tier: container runs are minutes.
+# WAVE-1 SCOPE: this measures the INSTRUMENT (offload is ~0 with no p2p yet).
+# Run the egress/latency/gap measurement and emit the report (S3/S4).
+measure *ARGS: _python fixtures-large
+    "${NIX_P2P_PYTHON}/bin/python3" scripts/measure.py {{ ARGS }}
 
 # Reuses the e2e Pod seam (scripts/e2e_harness.py) as its driver and asserts the
 # two operator oracles - the daemon's per-substitution log story (AC#1) and the

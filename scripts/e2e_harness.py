@@ -349,11 +349,16 @@ class Pod:
         served_cache: Path,
         with_daemon: bool,
         expect,
+        daemon_extra_args: tuple[str, ...] = (),
     ):
         self.ctx = ctx
         self.pod = f"{POD_PREFIX}-{name}"
         self.served_cache = served_cache
         self.with_daemon = with_daemon
+        # Extra daemon CLI flags (task-9 product-side bite passes
+        # --narinfo-cache-dir to toggle task-8's narinfo cache). Empty by default
+        # so every existing scenario starts the daemon exactly as before.
+        self.daemon_extra_args = tuple(daemon_extra_args)
         self._pm = ctx.podman
         # Every pod that mounts a cache asserts AC#5, so the key-exclusion oracle
         # covers all 8 scenarios, not a hand-picked few.
@@ -498,6 +503,7 @@ class Pod:
                     f"0.0.0.0:{DAEMON_PORT}",
                     "--upstream",
                     f"http://127.0.0.1:{PROXY_PORT}",
+                    *self.daemon_extra_args,
                 ]
             )
         self._await_ready()
