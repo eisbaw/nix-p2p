@@ -4,7 +4,7 @@ title: 'FREEZE: RawNarV1 addressed unit + iroh ALPN (golden vectors)'
 status: In Progress
 assignee: []
 created_date: '2026-08-08 20:28'
-updated_date: '2026-08-08 21:38'
+updated_date: '2026-08-08 21:55'
 labels:
   - irreversible
 dependencies: []
@@ -27,35 +27,27 @@ The hardest wave-2 freeze (arch+codex: harder than the schema, cannot be version
 ## Implementation Notes
 
 <!-- SECTION:NOTES:BEGIN -->
-FREEZE implemented; self-verified, awaiting DEEP gate (qa+architect+codex). NOT Done.
+FREEZE implemented; codex deep-gate round 1 was NO-GO on the claim wire format (architect GO, qa GO, codex confirmed the BLAKE3==iroh-blobs crux is sound and /iroh-bytes/4 IS the real current iroh_blobs ALPN). Round-2 fixes committed; re-parked In Progress awaiting RE-GATE. NOT Done.
 
-CANONICAL TYPES + ENCODINGS (frozen):
-- content_id::Blake3Digest = BLAKE3(RawNarV1), 32 bytes. Wire string 'blake3:'+64 lowercase hex. RawNarV1 = exact 'nix-store --dump' stream (uncompressed NAR; nix defines it). Recipe: PLAIN UNKEYED BLAKE3, NO domain separation (BLAKE3_DOMAIN_SEPARATION=None) so the digest EQUALS the iroh-blobs blob hash -> a peer fetches by it directly. Hex over nix-base32: reproducible by stock b3sum, no shared table, fixed-width, independent of any transport crate Display.
-- transport::NodeId = iroh ed25519 pubkey, 32 raw bytes, wire = 64 bare lowercase hex. Canonicalized on RAW BYTES; task-39 rebuilds via iroh::NodeId::from_bytes, never depending on iroh's Display.
-- transport::BitTorrentInfoHash = enum V1(20B SHA1)/V2(32B SHA256); wire hex, length (40/64) disambiguates. Proves a BT locator (infohash/piece-layout) is representable.
-- transport::IROH_BLOBS_ALPN = b'/iroh-bytes/4' (stock iroh-blobs, per PRD line 210).
+FROZEN ENCODINGS (unchanged, crux-confirmed):
+- content_id::Blake3Digest = BLAKE3(RawNarV1), plain unkeyed, NO domain sep (== iroh-blobs blob hash), wire 'blake3:'+64 lowercase hex.
+- transport::NodeId = ed25519 pubkey, 64 lowercase hex, canonicalized on raw bytes (from_bytes).
+- transport::BitTorrentInfoHash v1(20)/v2(32) hex slot.
+- IROH_BLOBS_ALPN = /iroh-bytes/4 (codex confirmed correct).
+- GOLDEN: lib fixture raw_nar_len=66048, NarHash sha256:06rgb4..., BLAKE3 blake3:95f49df0...; recipe vectors BLAKE3('')=af1349b9..., BLAKE3('nix-p2p/RawNarV1')=74f885af...
 
-GOLDEN VECTORS (daemon/tests/golden/raw_nar_v1.json, single source of truth):
-- fixture 'lib' (compression=none, so served .nar == raw NAR): raw_nar_len=66048, NarHash sha256:06rgb4vfjsg365xwwdjz12qhjnvg3w0agfvyqfp977hp3yk2bczb, BLAKE3 blake3:95f49df0cabd4f2cab42dfb89911ee9aa445a5126e445e0b5006532aef7d6638.
-- recipe vectors: BLAKE3('')=af1349b9... (published empty vector -> pins plain unkeyed), BLAKE3('nix-p2p/RawNarV1')=74f885af...
-- daemon/tests/golden_vectors.rs (include_str!, fixture-free) checks encodings in the Nix sandbox; scripts/check-golden-vectors.py RE-DERIVES from the real fixture (byte-for-byte, AC#1). BITES proven: recipe mutation (domain sep) fails golden tests; ALPN mutation fails conformance; corrupted golden digest fails python re-derivation.
+ROUND-2 CLAIM-WIRE CANONICALIZATION (commit for hashes: git log task-48):
+1 (CRIT) ONE content identity per claim. Offers are now PURE locators (Iroh{node}, BitTorrent{infohash}); blake3 lives once in payload WholeNar{blake3} or once per HoldAnswer::Have{blake3,offers}. A two-blob claim is structurally unrepresentable (chose option (a)).
+2 (CRIT) NarHashKey is a STRICT validated type: 32 sha256 bytes, canonical sha256:<52 lowercase nix-base32> via new daemon/src/nixbase32.rs (pinned to Nix's own printHash32 output). key:'not-a-nar-hash' now rejected on decode. Bridges source::NarHash via TryFrom (fallible; seam stays loose by wave-1 design, but real narinfo values are always canonical so they agree by construction).
+3 (HIGH) Discriminator-aware Deserialize for ClaimPayload/TransportOffer: unknown TAG -> Unknown (task-37 forward-compat intact), malformed KNOWN tag (bad blake3/node) -> hard ERROR (no silent swallow; the task-13 defect species).
+4 (MED) check-golden-vectors.py independently computes sha256(raw NAR) in nix-base32 vs trusting the manifest.
+5 (LOW) hex decode lowercase-only (one canonical form); NodeId ed25519 curve-point validity deferred to task-39's iroh::PublicKey::from_bytes (like the ALPN==iroh_blobs::ALPN assert).
 
-CONTENT-vs-TRANSPORT SEPARATION: universal identity (Blake3Digest) lives in content_id.rs with ZERO transport knowledge; per-transport locators (NodeId, infohash) + ALPN live in transport.rs. Every claim offer carries the shared Blake3Digest + its own locator -> a 2nd transport adds a locator+offer variant, never forks the identity.
+BITES proven live: finding2 lenient-parse -> claim_with_a_non_canonical_key_is_rejected FAILS; finding3 swallow -> malformed_known_payload_errors FAILS; finding1 structural. UntaggedPayload control encodes finding3 fails-before permanently in the suite. task-37 forward-compat + reserved-fields + bittorrent-representable all still green.
 
-claim.rs: replaced String placeholders RawNarBlake3/NodeId/BitTorrentInfoHash with the canonical typed encodings. task-37 tests still pass (updated to real hex/blake3: forms; wire_strings_match_typed guards the literals).
+GATE: nix develop -c just build/lint/test/fmt exit=0 (68 lib tests incl nixbase32/claim/hexfmt; golden_vectors 2; check-golden-vectors independent NarHash ok); nix build .#daemon ok.
 
-GATE: nix develop -c just build/lint/test/fmt all green; nix build .#daemon ok (flake src widened to keep tests/golden/*.json). blake3 crate daemon-only (independence green).
+HONEST LIMITS: (1) IROH_BLOBS_ALPN and NodeId ed25519-point validity still defer structural checks to task-39 (both fail loudly at connect, corrupt no addressing). (2) source::NarHash left as the loose wave-1 seam String (not unified into the strict type) to avoid rippling into catalog/narinfo_cache and their fake-hash tests; the strict twin + fallible bridge gives 'agree by construction' for real values, which is the interop property that matters.
 
-HONEST LIMITS:
-1. IROH_BLOBS_ALPN pinned WITHOUT an iroh dep (task-39 adds iroh). '/iroh-bytes/4' is my best knowledge of the stock value and is an ASSUMPTION; task-39 MUST assert ==iroh_blobs::ALPN. Low risk: a wrong ALPN fails LOUDLY at connect (S6), corrupts no held bytes, reconcilable at S6.
-2. iroh NodeId string form assumed; mitigated by canonicalizing on raw bytes + from_bytes/as_bytes, so iroh Display churn cannot break us.
-3. --dump reproduction: golden is a COMMITTED constant derived once via b3sum on the pinned reproducible fixture; cargo tests need no nix. Python re-derivation needs the fixture (fast tier ok? no - 'lib' is fast-tier; runs under just test).
-
-FORWARD-CARRY: task-39 iroh addresses blobs by this Blake3Digest under IROH_BLOBS_ALPN, NodeId via from_bytes; add ==iroh_blobs::ALPN assert. task-49 narinfo rewrite uses NarSize/raw unit (compressed .nar.xz is transport-only, never the addressed unit). task-50 availability index computes this same BLAKE3 (Blake3Digest::from_raw_nar).
-
-Deep-gate architect GO (conditional on task-39 ALPN AC - now added). Non-blocking follow-ups noted: (3) BLAKE3_DOMAIN_SEPARATION guard is debug-only/decorative - consider const{assert!(is_none())} for compile-time bite in release; (4) the 'domain-separated would be caught' negative-control test is near-vacuous (the empty-vector pin af1349b9 is the real bite) - tighten in hardening. CRUX CONFIRMED: BLAKE3(raw NAR)==iroh blob hash (bao root == blake3::hash by construction).
-
-Deep-gate qa GO: all 6 bites verified by mutation (golden re-derivation genuine, recipe bite fires, determinism reproduced, no tautology). Non-blocking finding 2 (golden check soft-passes when fixtures absent) filed as a hardening task. Both Claude reviewers GO + crux confirmed; awaiting codex (the cross-model crux confirmation).
-
-Deep-gate codex NO-GO (3rd cross-model catch on a frozen surface): CRUX CONFIRMED by codex - BLAKE3(raw NAR) == iroh_blobs::Hash (iroh_blobs::Hash::new calls blake3::hash; bao root finalization == whole-content BLAKE3), AND /iroh-bytes/4 IS the real current iroh_blobs::ALPN (docs.rs verified - the ALPN guess was correct). But 3 wire-format canonicalization defects (claim.rs): (1) CRITICAL one claim can name two blobs (payload blake3 vs offer blake3 not enforced equal); (2) CRITICAL NarHashKey unrestricted String (freeze as strict sha256:<52 nix-base32>, align with source::NarHash); (3) HIGH malformed-KNOWN variant swallowed as Unknown (untagged) - same species as task-13. Both Claude reviewers (GO) checked the hash crux, missed the codec. Fix round sent. The ambiguous frozen wire is the walk-back-impossible risk the freeze exists to prevent.
+FORWARD-CARRY: task-39 iroh addresses by Blake3Digest under IROH_BLOBS_ALPN, NodeId via from_bytes, add ==iroh_blobs::ALPN + ed25519-point asserts; task-49 narinfo rewrite uses the raw unit; task-50 availability index computes Blake3Digest::from_raw_nar and keys on the strict NarHashKey.
 <!-- SECTION:NOTES:END -->
