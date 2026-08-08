@@ -4,7 +4,7 @@ title: Mock upstream mode + signed fixture store
 status: In Progress
 assignee: []
 created_date: '2026-08-07 21:55'
-updated_date: '2026-08-08 05:29'
+updated_date: '2026-08-08 05:41'
 labels:
   - irreversible
 dependencies:
@@ -195,4 +195,6 @@ FIX E - reuse/gate divergence CLOSED rather than bounded. Reuse now applies ever
 Non-blocking, folded in: a partial removal can strip the ownership marker before failing, after which nothing here will ever delete the remainder; the warning now says so and prints the exact rm -rf per residue path.
 
 gate round 6: build/lint/fmt/test/fixtures-large/fixtures-verify-rebuild/package all exit 0; nix build .#daemon .#testproxy exit 0; nix flake check exit 0 (8 checks). cargo 2/2. Full tier: 12 ok, 4 positive controls, 3 bites, 0 PARTIAL. Determinism: two fresh roots produce the same generation name, diff -r exit 0, digests equal over 18 entries. 3 concurrent generators exit 0 0 0. Lock byte-identical (a39382de8782d6f7) and served content byte-identical (13 files, 115,939,516 bytes) - unchanged since round 2.
+
+Orchestrator closing adjudication (after deep-gate round 6): round 7 fixes exactly 3 items - finding 1 (FREEZE-INTEGRITY: Ctrl-C splits current/lock, non-adversarial, must-fix) and findings 2+3 folded as one ancestor-path-anchoring sweep (codex-labeled DATA-LOSS, but reachability needs a concurrent adversary racing filesystem ops under the developer's own uid in their own repo - outside a local test-fixture generator's threat model; folded in only because round 7 exists for finding 1 anyway and the sweep is bounded). AFTER round-7 verification, task-3 CLOSES: any remaining finding that does not touch freeze integrity (lock/workload identity) or non-adversarial data loss is a documented residual or a hardening-wave task (task-13), NOT another round. Rationale: the gate has narrowed from 'the freeze fails open' (rounds 1-2, existential) to ancestor-symlink TOCTOU under a hostile local uid (round 6); indefinite iteration on the wave's first irreversible surface starves the 14 tasks behind it. Threat model for the fixture generator recorded in-code as part of the sweep.
 <!-- SECTION:NOTES:END -->
