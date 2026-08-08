@@ -4,7 +4,7 @@ title: 'RE-PLAN: wave 2 planning via phase2-backlog-snowball (not feature code)'
 status: To Do
 assignee: []
 created_date: '2026-08-07 21:56'
-updated_date: '2026-08-08 08:28'
+updated_date: '2026-08-08 17:30'
 labels:
   - replan
 dependencies:
@@ -34,4 +34,6 @@ Owner requirement added post-review: wave-2 planning must include peer-count sca
 Owner standing goal (2026-08-08): implement the entire backlog; modular crates composed together; first simple full-NAR decentralized solution, then ca-chunked (Candidate C); iroh is first-priority transport, and wave-2 planning should design the NarSource/transport seam so OTHER protocols (e.g. BitTorrent) can slot in later without a network fork - transport pluggability joins the claim-schema freeze discussion.
 
 forward-carried from task-4 seam fix: the NarSource seam is NarKey{SignedNarHash,UpstreamPath} with a token->NarHash correlation catalog populated at narinfo-serve time. Wave-2 iroh NarSource keys on NarKey::SignedNarHash via the claims index; the correlation catalog is the seed of the PRD 'learn NarHash at narinfo time' prefetch. Plan the claims-index lookup to consume NarKey::SignedNarHash.
+
+J2 baseline recorded (task-12, TESTING.md 'J2 measurement baseline', 2026-08-08). Wave-2 re-plan inputs: (a) pre-p2p reference = payload NAR egress 115,934,829 B/workload (workload nix-p2p-fixture-workload-v1, gen-d2ab43402b88715a), offload 0.0 by construction - the number wave-2 offload is measured against by this same instrument. (b) PREFETCH-WINDOW FINDING: the narinfo->nar gap is sub-millisecond on the LOOPBACK harness (~0.5ms median, <2ms max), so a 1-4s DHT resolve cannot be masked by prefetch on these numbers - hedge (not prefetch) would carry offload. BUT this is loopback with a local mock, NOT a verdict on the real cache.nixos.org gap (which carries real RTT and may open a larger window). Filed task-35 to re-measure the gap on a real upstream BEFORE the hedge/prefetch design is committed. (c) S4 latency axis is UNUSABLE on the container tier (A/A noise floor >10%, task-32) - wave-2 latency claims need task-32's inner-realise timing or the VM tier.
 <!-- SECTION:NOTES:END -->

@@ -184,6 +184,118 @@ only — never the signed fields). A property test asserts arbitrary
 well-formed narinfos (unknown fields, odd ordering, multiple `Sig:`)
 pass through byte-identical, including across a daemon restart.
 
+## J2 measurement baseline (task-12)
+
+**Recorded 2026-08-08.** Instrument: `scripts/measure.py` (`just measure
+--runs 10`), counting rule `net-upstream-egress-v2`
+(`scripts/MEASUREMENT_COUNTING_RULE.md`). Provenance stamp (a number
+without this cannot be compared to anything later):
+
+- `workload_version`: **`nix-p2p-fixture-workload-v1`**, tier `full`,
+  generation `gen-d2ab43402b88715a`.
+- fixture lock public key:
+  `nix-p2p-test-1:empdFBu9wVZG12rPKToHMOTsU1qzWzeCcLdq/KQH0JQ=`.
+- per-payload wire sizes (`file_size`, the on-wire compressed bytes the
+  counting rule reads — **NOT `NarSize`**): `lib` 66 048 (none),
+  `app` 260 (xz, `nar_size` 408), `zstd` 524 649 (zstd, `nar_size`
+  524 808), `big` 115 343 872 (none). Payload sum = **115 934 829 B**.
+- rebuild determinism: `just fixtures-verify-rebuild` PASSED before this
+  baseline — 4 payloads rebuilt to identical outputs matching the lock,
+  **on this machine only** (cross-host reproducibility is proven by
+  nothing here and not implied).
+
+**Run-to-run agreement (AC#1): asserted, not assumed.** The full 10-run
+× 3-arm measurement was regenerated TWICE. The egress axis agreed
+**byte-for-byte** across both runs (every figure in the table below was
+identical run-1 vs run-2, same generation). The latency axis did not and
+is reported as unusable (see S4 below). Reports:
+`scratchpad/measure-run{1,2}.json`; instrument verdict both runs
+`instrument_trustworthy=true` (all four falsifiability bites pass,
+arms_usable=true).
+
+### Egress (both arms, N=10 valid/10, stdev = 0 across runs)
+
+| Channel | daemon-on | daemon-off | note |
+|---|---|---|---|
+| **payload NAR** (the metric) | **115 934 829 B** | **115 934 829 B** | identical → offload **0.0** |
+| narinfo (context) | 10 665 B | 10 665 B | held identical across arms by frozen rule |
+| cache-info (context) | 0 B | 51 B | daemon serves `nix-cache-info` locally |
+| total (context) | 115 945 494 B | 115 945 545 B | differ by 51 B = the cache-info only |
+
+**Offload = 0 BY CONSTRUCTION.** Wave 1 has no p2p, so both arms fetch
+identical bytes; this baseline validates the *instrument* and fixes the
+pre-p2p reference, it does **not** measure offload (offload > 0 is a
+wave-2 measurement by this same instrument). Reading 0 here as failure
+would be wrong. The daemon-on arm's total is 51 B *lower* only because it
+absorbs `nix-cache-info` metadata — exactly the definitional artifact the
+counting rule excludes by measuring offload on **payload** egress, not
+total.
+
+Compression caveat: fixture payloads are incompressible seeded bytes, so
+the narinfo/nar split and the xz/zstd ratios here are **not
+representative** of real nixpkgs closures. The workload is 4 paths
+dominated by one 110 MiB uncompressed NAR — it exercises byte *volume*,
+not closure breadth or narinfo count; a many-small-paths question is not
+answered by this baseline.
+
+### p95 wall-clock — S4 UNUSABLE, do NOT quote a container-tier bound
+
+N=10 valid/10 per arm. Per-run p95 (seconds): daemon-on 0.59 / 0.62,
+daemon-off-A1 0.63 / 0.62, daemon-off-A2 0.53 / 0.55 (run-1 / run-2).
+The **A/A noise floor** (two daemon-off arms that should agree) was
+**0.161 (run 1)** and **0.103 (run 2)** — both **≥ the 10% S4
+threshold**, so `s4_usable=false` in both reports. The harness cannot
+distinguish a 10% latency effect from its own podman-startup jitter, so
+**no container-tier p95 bound (S4) is trustworthy from this baseline** —
+stated honestly, not hidden. The VM tier (task-10, `just e2e-vm`) is the
+real store-open/service-ordering truth layer; the latency axis needs a
+quieter harness (or many more runs) before any S4 number can be quoted.
+`instrument_trustworthy` is orthogonal to `s4_usable`: the egress
+baseline above is sound even though the latency axis is not.
+
+### narinfo→nar gap histogram (PRD risk 3 empirical input)
+
+Per arm, n=40 gap samples, both runs. **Every sample fell in the
+`[0,10)` ms bucket.** Median gap **~0.44–0.57 ms**; p95 **~0.73–0.89
+ms**; max **< 2 ms** (1.9 ms worst single sample, run 2). The gap is
+**sub-millisecond on this loopback harness with a local mock origin.**
+
+### Informational answers (AC#2) — descoped from GO/NO-GO to read-out
+
+The owner descoped the kill criterion (2026-08-08): the project proceeds
+to the p2p wave regardless. These are the honest read of the data, now
+informational, feeding the wave-2 re-plan (task-15) rather than gating.
+
+**Is the prefetch window real (measured narinfo→nar gap vs the 1–4 s DHT
+lookup p2p must hide)?** On this harness, **no — the window is
+structurally near-zero (~0.5 ms median, < 2 ms max).** A DHT resolve of
+1–4 s (PRD risk 3) cannot be masked behind a sub-millisecond gap: p2p
+resolution would be ~1000–8000× longer than the lead time the daemon
+gets here. On these numbers alone the prefetch-masking premise does not
+hold and hedge (not prefetch) would carry offload.
+
+**CRITICAL caveat — this is loopback, not a verdict on the real gap.**
+The gap was measured over loopback against a local mock origin, which
+carries no real RTT. The real client→`cache.nixos.org` narinfo→nar gap
+includes upstream RTT, TLS, CDN latency and client think-time between the
+narinfo GET and the NAR GET — plausibly opening a materially larger
+prefetch window. A sub-millisecond loopback gap says the prefetch-masking
+assumption **must be validated against a real upstream in wave-2**, NOT
+that prefetch is dead. The instrument's gap-synthesis is only *proven to
+bite* for sub-second injected gaps (daemon 1000 ms `header_timeout`
+ceiling); multi-second real-gap fidelity is unvalidated here.
+
+**What must p2p beat?** To offload the payload NAR egress fixed above
+(~115.9 MB/workload here, dominated by the 110 MiB path), a peer path
+must deliver the NAR **before** the daemon would otherwise pull it from
+the cache — i.e. DHT-resolve + peer-fetch latency must be hidden inside
+the narinfo→nar gap **or** a hedge must win the race without the loser's
+bytes crossing the boundary (hedge-loser waste is a *separate* channel,
+still unresolved in the counting rule, deferred to the wave-2 freeze).
+Against a sub-ms loopback gap, prefetch cannot; against a real-upstream
+gap (unmeasured), it might. Wave-2 must re-measure the gap on a real
+upstream before committing the hedge/prefetch design.
+
 ## Test layers
 
 1. **Unit** (product crates): trait-level tests of

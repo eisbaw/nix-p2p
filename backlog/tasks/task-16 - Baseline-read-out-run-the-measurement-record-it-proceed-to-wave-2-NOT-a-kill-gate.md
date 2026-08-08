@@ -6,7 +6,7 @@ title: >-
 status: To Do
 assignee: []
 created_date: '2026-08-07 22:06'
-updated_date: '2026-08-08 12:46'
+updated_date: '2026-08-08 17:30'
 labels:
   - checkpoint
 dependencies:
@@ -34,4 +34,6 @@ Owner standing intent (2026-08-08, pre-baseline): 'implement entire backlog - fi
 Owner directive (2026-08-08): do not ask the owner - when this checkpoint is reached, route the GO/NO-GO decision through an mped-architect subagent framed as Mark-emulator (give it the J2 baseline, PRD kill criterion, and owner standing goals), record the verdict here, and proceed. Owner can override asynchronously.
 
 SCOPE CHANGE (owner, 2026-08-08): 'dont worry about kill criterion keep going, but do the measurement.' This is NO LONGER a GO/NO-GO kill decision - the owner proceeds to the p2p wave regardless of the baseline. Recast: run task-9's instrument, record the baseline (egress, p95, gap histogram) into TESTING.md for later comparison and tuning, then hand to task-15 wave-2 planning. No mark-emulator kill decision needed; keep going by directive.
+
+J2 baseline is recorded with provenance + two agreeing runs + informational answers (task-12 done, TESTING.md). Numbers for the checkpoint: payload NAR egress 115,934,829 B/workload identical on both arms (offload 0.0, wave-1 by construction - not a failure); narinfo->nar gap sub-millisecond on loopback (prefetch window structurally near-zero HERE, but loopback-limited - task-35 re-measures on a real upstream); S4 p95 bound UNUSABLE (A/A noise floor >10%, task-32). Gap question (PRD risk 3): on loopback the window does NOT leave room to mask a 1-4s DHT resolve, but the real-upstream gap is unmeasured so this is not a settled verdict. Owner has descoped the kill criterion; standing intent is continue.
 <!-- SECTION:NOTES:END -->
