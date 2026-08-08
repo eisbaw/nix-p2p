@@ -301,3 +301,44 @@ Tentative / replaceable (velocity surfaces):
    fig-candidate-B/C still show gossip-first + tracker cold-start;
    must be redrawn to DHT-authoritative + peer-probe before
    implementers use them.
+
+## Wave 2 scope (owner goal, 2026-08-08)
+
+Build the actual decentralization and CHARACTERIZE it. Not just "make
+iroh work" — model and profile the resource/performance envelope, then
+derive policies from what the models show.
+
+**Transports (pluggable behind the frozen `NarSource` seam):**
+- iroh whole-NAR (Candidate B payload) — FIRST PRIORITY.
+- BitTorrent — a SECOND transport backend; the transport interface and
+  the claim schema must admit it without a network fork.
+- (chunked/castore = Candidate C, later.)
+
+**Discovery/claims:** DHT-authoritative (mainline vs BEP44 vs
+iroh-native — a spike, first frozen surface), gossip accelerant,
+announce-on-demand, no-enumeration privacy (yes/no peer probes),
+NodeId->addr via iroh discovery. Keyed on `NarKey::SignedNarHash`
+(seam already frozen wave-1) via the correlation catalog.
+
+**Modeling & profiling (load-bearing, reuse/extend task-18 S5
+machinery):** scenario models covering TYPICAL and PATHOLOGICAL cases,
+estimating **RAM, disk, latency, throughput, and speedup over
+cache.nixos.org**. Pathological cases to model at minimum: a slow/
+throttled peer on a HIT; a dead/unreachable holder after a positive
+claim; DHT resolve timeout / cold-start empty index; NAT-blocked peer
+needing relay; thundering herd on a popular path; a lying/spam claim;
+seeder churn. Extrapolate to 10s/100s/1000s of peers per S5 (measure
+1..30, regression-fit, honest resource-laws-only caveat).
+
+**Policy derivation (findings -> backlog tasks):** the models surface
+the decisions. The archetype the owner named: on a HIT whose transfer
+is extremely slow, do we (a) abort and fall back to cache.nixos.org,
+(b) delayed-race / hedge (start the cache fetch, first-past-the-gate
+wins), or (c) adaptive by observed throughput? File a policy task per
+such decision the scenarios expose; do NOT hardcode a policy the data
+hasn't justified.
+
+**Grounding:** the wave-1 measurement instrument (`net-upstream-egress-v2`,
+which already counts a peer hit as a valid 0-egress crossing) is the
+speedup/offload yardstick; task-35's real-upstream narinfo->nar gap is
+the prefetch-vs-hedge design input.
