@@ -216,19 +216,90 @@ class LockError(Exception):
     """The committed lock is unusable, so nothing can be proven against it."""
 
 
-def read_no_follow(path: Path) -> str:
-    """Read a file, refusing to follow a symlink at the final component.
+# THREAT MODEL, so that this does not get reopened as an unbounded problem.
+# The anchoring below defends against exactly two things: (1) an ancestor
+# directory being swapped for a symlink CONCURRENTLY, after a path was resolved
+# and before it is used, and (2) an ancestor that is ALREADY a symlink being
+# silently written through, so the tooling edits a file outside the tree it
+# believes it is editing. It does NOT claim to defend a host where an attacker
+# already has write access under this uid: such an attacker edits
+# fixtures/workload.lock.json directly and no amount of descriptor discipline
+# helps. What is bought is that the fixture tooling cannot be TRICKED into
+# reaching outside its own root - which matters because it deletes directories
+# and rewrites the file that defines the frozen workload.
+#
+# The mechanism: resolve the root once, hold an O_NOFOLLOW|O_DIRECTORY
+# descriptor on it, and perform every subsequent operation relative to that
+# descriptor. `openat` does not re-walk ancestors, so a swap after the open
+# cannot redirect anything; where a real path must be handed to another process
+# (nix, an HTTP server), the path is re-checked against the held descriptor's
+# (dev, ino) first.
 
-    Used for the tracked lock, which is the definition of the frozen workload.
-    A symlink there would mean the workload every gate checks against is
-    whatever the link points at - and commit_lock could turn the tracked lock
-    INTO a symlink until this round, so this is not hypothetical. Reading
-    through one would launder that into a green run.
+DIR_FLAGS = os.O_RDONLY | os.O_NOFOLLOW | os.O_DIRECTORY | os.O_CLOEXEC
+
+
+def open_dir(path_or_name, dir_fd: int | None = None) -> int:
+    """Open a directory descriptor, never following a symlink at the leaf.
+
+    With `dir_fd`, `path_or_name` is a single component resolved by the kernel
+    relative to that descriptor - which is the whole point: no ancestor is
+    consulted, so no ancestor can be swapped underneath it.
     """
-    descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
+    return os.open(path_or_name, DIR_FLAGS, dir_fd=dir_fd)
+
+
+def same_inode(fd: int, path: Path) -> bool:
+    """Does `path` still name the directory `fd` holds open?
+
+    The check for the places a real path has to leave this process. A held
+    descriptor keeps pointing at the right inode no matter what happens to the
+    names above it; a path does not, so before handing one out it is compared
+    back to the anchor.
+    """
+    try:
+        held, named = os.fstat(fd), os.stat(path)
+    except OSError:
+        return False
+    return (held.st_dev, held.st_ino) == (named.st_dev, named.st_ino)
+
+
+def read_at(dir_fd: int, name: str) -> str:
+    """Read one file by name relative to an anchored directory descriptor.
+
+    Used for the tracked lock and WORKLOAD_VERSION - the two files that define
+    the frozen workload. A symlink at the file itself is refused by O_NOFOLLOW;
+    an ancestor cannot participate at all, because resolution starts at the
+    descriptor. Reading through either would launder someone else's file into a
+    green run.
+    """
+    descriptor = os.open(
+        name, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC, dir_fd=dir_fd
+    )
     try:
         with os.fdopen(descriptor, "r", closefd=False) as handle:
             return handle.read()
+    finally:
+        os.close(descriptor)
+
+
+@contextmanager
+def anchored_fixtures_dir(repo: Path):
+    """Hold a descriptor on `<repo>/fixtures` for the duration of a block.
+
+    `fixtures` being a symlink is refused here rather than discovered later:
+    with it pointing elsewhere, commit_lock wrote an unrelated file outside the
+    repository and reported success, and load_lock read that file back.
+    """
+    try:
+        descriptor = open_dir(repo / "fixtures")
+    except OSError as error:
+        raise LockError(
+            f"cannot open {repo / 'fixtures'} as a plain directory: {error}. If it "
+            "is a symlink, remove it - this tooling refuses to read or write the "
+            "frozen workload through one."
+        ) from error
+    try:
+        yield descriptor
     finally:
         os.close(descriptor)
 
@@ -245,7 +316,8 @@ def load_lock(repo: Path) -> dict:
     """
     path = lock_path(repo)
     try:
-        lock = json.loads(read_no_follow(path))
+        with anchored_fixtures_dir(repo) as fixtures_fd:
+            lock = json.loads(read_at(fixtures_fd, path.name))
     except OSError as exc:
         raise LockError(f"cannot read {path}: {exc}") from exc
     except ValueError as exc:

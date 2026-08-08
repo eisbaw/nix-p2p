@@ -66,7 +66,6 @@ import os
 import stat
 import subprocess
 import sys
-import tempfile
 import time
 from contextlib import contextmanager
 from pathlib import Path
@@ -418,7 +417,11 @@ def read_workload_version(repo: Path) -> str:
     Rejecting anything but exactly one clean line makes the two normalisations
     provably equivalent instead of coincidentally so.
     """
-    raw = (repo / "fixtures" / "WORKLOAD_VERSION").read_text()
+    # Read through the anchored fixtures descriptor for the same reason the
+    # lock is: it is the other file that defines the frozen workload, and it is
+    # embedded in every payload's seed.
+    with fx.anchored_fixtures_dir(repo) as fixtures_fd:
+        raw = fx.read_at(fixtures_fd, "WORKLOAD_VERSION")
     version = raw.strip()
     if raw != version + "\n" or not version:
         fail(
@@ -625,6 +628,51 @@ def publication_lock(out_dir: Path):
         os.close(descriptor)
 
 
+@contextmanager
+def anchored_publication(out_dir: Path):
+    """Resolve the publication root ONCE and hold descriptors on it.
+
+    Yields (generations_path, generations_fd). Everything destructive is done
+    relative to the descriptor; the path is carried for messages and for the
+    two places a real path must be handed to another process, each guarded by
+    assert_anchor_intact.
+
+    This is the sweep, not a patch: O_NOFOLLOW only ever guarded the FINAL
+    component of a path, so every ancestor was still followed on every call.
+    Swapping `out` for a symlink after `anchored_generations` had validated it
+    redirected the collector, which then deleted a marked generation outside
+    the root. Opening once and descending by descriptor removes the ancestors
+    from the question entirely - `openat` does not consult them.
+    """
+    generations = ensure_out_root(out_dir)
+    out_fd = fx.open_dir(out_dir)
+    try:
+        generations_fd = fx.open_dir(fx.GENERATIONS_DIR, dir_fd=out_fd)
+        try:
+            yield generations, generations_fd
+        finally:
+            os.close(generations_fd)
+    finally:
+        os.close(out_fd)
+
+
+def assert_anchor_intact(anchor_fd: int, path: Path) -> None:
+    """A real path is about to be used; prove it still names the anchor.
+
+    Descriptors are immune to ancestor swaps, but `nix copy` and the HTTP
+    server need paths. Comparing (dev, ino) back to the held descriptor is what
+    makes handing a path out safe - without it the anchoring would stop at the
+    boundary of this process.
+    """
+    if not fx.same_inode(anchor_fd, path):
+        fail(
+            f"{path} no longer names the directory this run anchored at startup - "
+            "something replaced a directory above it mid-run. Nothing further will "
+            "be written or deleted through that path.",
+            code=2,
+        )
+
+
 def generate(
     out_dir: Path,
     include_large: bool,
@@ -651,8 +699,13 @@ def generate(
                 "is now unverifiable against this one."
             )
 
-    with publication_lock(out_dir):
-        generations = ensure_out_root(out_dir)
+    with (
+        publication_lock(out_dir),
+        anchored_publication(out_dir) as (
+            generations,
+            generations_fd,
+        ),
+    ):
         if not write_lock and reusable(
             out_dir, repo, version, public_line, include_large
         ):
@@ -662,7 +715,7 @@ def generate(
             # reuses - a generation stranded by a failed flip and a .building.*
             # left by a SIGKILL accumulated forever at 110 MiB each, silently,
             # because the warning lives in publish() as well.
-            collect_generations(generations, retained(out_dir, current))
+            collect_generations(generations_fd, generations, retained(out_dir, current))
             # note(), not print(): reuse changed nothing and the published tree
             # is valid, so a stream this cannot be written to must not turn a
             # correct state into a non-zero exit.
@@ -673,6 +726,9 @@ def generate(
         building = generations / f".building.{stamp}"
         try:
             # STEP 1: build into a private directory under generations/.
+            # `nix copy` needs a real path, so the anchor is re-checked here -
+            # the one place a path leaves this process during publication.
+            assert_anchor_intact(generations_fd, generations)
             entries = build_into(
                 building, repo, secret_line, public_line, include_large
             )
@@ -698,20 +754,22 @@ def generate(
             )
 
             # STEPS 4-7.
-            name = install_generation(building, generations, stamp)
-            published = publish(out_dir, generations, name, repo, pending)
+            name = install_generation(building, generations, generations_fd, stamp)
+            published = publish(
+                out_dir, generations, generations_fd, name, repo, pending
+            )
         except BaseException:
             # Catches EVERYTHING, including the SystemExit that fail() raises
             # and a KeyboardInterrupt: this is the unwinding path, and a
             # refusal or an error while cleaning up must never replace the
             # failure that caused the unwind.
-            remove_build_directory(generations, building.name)
+            remove_build_directory(generations_fd, generations, building.name)
             raise
     tier = "full" if include_large else "fast"
     note(f"gen-fixtures: {version} tier={tier} paths={len(entries)} -> {published}")
 
 
-def remove_build_directory(generations: Path, name: str) -> None:
+def remove_build_directory(generations_fd: int, generations: Path, name: str) -> None:
     """Best-effort removal of the private build directory. Never raises.
 
     Catches Exception rather than BaseException on purpose: a KeyboardInterrupt
@@ -721,7 +779,7 @@ def remove_build_directory(generations: Path, name: str) -> None:
     warning, so the failure that caused the unwind is what gets reported.
     """
     try:
-        refusal = purge_marked_dir(generations, name)
+        refusal = purge_marked_dir(generations_fd, generations, name)
     except Exception as error:  # noqa: BLE001 - unwinding path, see docstring
         refusal = f"{error}"
     if refusal is not None:
@@ -730,7 +788,7 @@ def remove_build_directory(generations: Path, name: str) -> None:
         warn(f"gen-fixtures: WARNING - left {generations / name} in place: {refusal}")
 
 
-def purge_marked_dir(parent: Path, name: str) -> str | None:
+def purge_marked_dir(parent_fd: int, parent: Path, name: str) -> str | None:
     """Delete `parent/name` iff it is a directory of ours. Returns a refusal.
 
     This is the ONLY deletion primitive in this file, and every step of it is
@@ -753,73 +811,63 @@ def purge_marked_dir(parent: Path, name: str) -> str | None:
     load-bearing (a generation is immutable and inspectable; a build directory
     is scratch), so the only right response to "cannot delete" is to say so.
     """
+    # The caller HOLDS `parent_fd`, opened once by descent from the anchored
+    # publication root; `parent` is carried only for messages. Re-opening the
+    # parent by path here was the remaining ancestor hole: O_NOFOLLOW guards
+    # only the final component, so swapping `out` for a symlink after the root
+    # was resolved redirected this and it deleted a marked generation outside
+    # the root entirely. Resolution that begins at a held descriptor never
+    # consults an ancestor, so there is nothing left to swap.
     try:
-        # O_NOFOLLOW on the PARENT too. Anchoring only the entries inside was
-        # not enough: with `generations` itself a symlink, this opened whatever
-        # it pointed at and collected marked directories outside the
-        # publication root entirely. The caller additionally proves the parent
-        # is the anchored generations directory (fx.anchored_generations); this
-        # is the syscall-level half of the same guarantee.
-        parent_fd = os.open(
-            parent, os.O_RDONLY | os.O_NOFOLLOW | os.O_DIRECTORY | os.O_CLOEXEC
+        dir_fd = os.open(
+            name,
+            os.O_RDONLY | os.O_NOFOLLOW | os.O_DIRECTORY | os.O_CLOEXEC,
+            dir_fd=parent_fd,
         )
     except FileNotFoundError:
         return None
     except OSError as error:
-        return f"{parent} could not be opened as a plain directory: {error}"
+        # ELOOP (a symlink, refused by O_NOFOLLOW) or ENOTDIR (a plain
+        # file). Either way it is not a directory this script created.
+        return f"{error}"
     try:
         try:
-            dir_fd = os.open(
-                name,
-                os.O_RDONLY | os.O_NOFOLLOW | os.O_DIRECTORY | os.O_CLOEXEC,
-                dir_fd=parent_fd,
+            os.close(
+                os.open(
+                    fx.OUT_MARKER,
+                    os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC,
+                    dir_fd=dir_fd,
+                )
             )
-        except FileNotFoundError:
-            return None
-        except OSError as error:
-            # ELOOP (a symlink, refused by O_NOFOLLOW) or ENOTDIR (a plain
-            # file). Either way it is not a directory this script created.
-            return f"{error}"
+        except OSError:
+            return (
+                f"it carries no {fx.OUT_MARKER} marker, so this script cannot "
+                "show it created it"
+            )
         try:
-            try:
-                os.close(
-                    os.open(
-                        fx.OUT_MARKER,
-                        os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC,
-                        dir_fd=dir_fd,
-                    )
-                )
-            except OSError:
-                return (
-                    f"it carries no {fx.OUT_MARKER} marker, so this script cannot "
-                    "show it created it"
-                )
-            try:
-                unlink_contents(dir_fd)
-            except OSError as error:
-                # Everything this can raise - EACCES on an unwritable
-                # subdirectory, EIO, or the descent's own identity refusal -
-                # means "left alone", which is what this function returns
-                # rather than raises. The callers catch broadly anyway; going
-                # through the documented channel is what keeps the contract
-                # ("returns a refusal") true instead of nearly true.
-                return f"{error}"
-            # The final rmdir is unavoidably by name - POSIX has no rmdir(fd) -
-            # so the inode the name refers to is compared against the one that
-            # was just emptied. Without this, a directory swapped in after the
-            # contents were removed could be rmdir'd instead. The residual is
-            # the instant between this stat and the rmdir, and it can only
-            # remove an EMPTY directory; it is stated rather than hidden.
-            here = os.fstat(dir_fd)
-            there = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
-            if (here.st_dev, here.st_ino) != (there.st_dev, there.st_ino):
-                return "it was replaced by a different directory while being removed"
-            os.rmdir(name, dir_fd=parent_fd)
-            return None
-        finally:
-            os.close(dir_fd)
+            unlink_contents(dir_fd)
+        except OSError as error:
+            # Everything this can raise - EACCES on an unwritable
+            # subdirectory, EIO, or the descent's own identity refusal -
+            # means "left alone", which is what this function returns
+            # rather than raises. The callers catch broadly anyway; going
+            # through the documented channel is what keeps the contract
+            # ("returns a refusal") true instead of nearly true.
+            return f"{error}"
+        # The final rmdir is unavoidably by name - POSIX has no rmdir(fd) -
+        # so the inode the name refers to is compared against the one that
+        # was just emptied. Without this, a directory swapped in after the
+        # contents were removed could be rmdir'd instead. The residual is
+        # the instant between this stat and the rmdir, and it can only
+        # remove an EMPTY directory; it is stated rather than hidden.
+        here = os.fstat(dir_fd)
+        there = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+        if (here.st_dev, here.st_ino) != (there.st_dev, there.st_ino):
+            return "it was replaced by a different directory while being removed"
+        os.rmdir(name, dir_fd=parent_fd)
+        return None
     finally:
-        os.close(parent_fd)
+        os.close(dir_fd)
 
 
 def unlink_contents(dir_fd: int) -> None:
@@ -904,7 +952,9 @@ def generation_name(built: Path) -> str:
     return f"gen-{digest[:16]}"
 
 
-def install_generation(built: Path, generations: Path, stamp: str) -> str:
+def install_generation(
+    built: Path, generations: Path, generations_fd: int, stamp: str
+) -> str:
     """Turn the validated build directory into an IMMUTABLE generation.
 
     One rename, and from that moment the directory is never written to, renamed
@@ -942,7 +992,10 @@ def install_generation(built: Path, generations: Path, stamp: str) -> str:
         # A concurrent creator would make this raise ENOTEMPTY rather than
         # merge two trees; the publication flock makes that a non-event, and
         # the error is handled as a filesystem failure either way.
-        built.rename(target)
+        # Renamed relative to the held descriptor, so no ancestor is walked.
+        os.rename(
+            built.name, name, src_dir_fd=generations_fd, dst_dir_fd=generations_fd
+        )
         return name
 
     reason = None
@@ -970,7 +1023,9 @@ def install_generation(built: Path, generations: Path, stamp: str) -> str:
         return name
 
     superseded = f"{name}.superseded-{stamp}"
-    built.rename(generations / superseded)
+    os.rename(
+        built.name, superseded, src_dir_fd=generations_fd, dst_dir_fd=generations_fd
+    )
     warn(
         f"gen-fixtures: WARNING - {target} already exists and {reason}. A generation "
         "is immutable by contract, so it was NOT modified or deleted.\n"
@@ -982,7 +1037,14 @@ def install_generation(built: Path, generations: Path, stamp: str) -> str:
     return superseded
 
 
-def publish(out_dir: Path, generations: Path, name: str, repo: Path, pending) -> Path:
+def publish(
+    out_dir: Path,
+    generations: Path,
+    generations_fd: int,
+    name: str,
+    repo: Path,
+    pending,
+) -> Path:
     """Steps 4-7: flip the symlink, record the lock, collect what is superseded.
 
     The ordering and every failure's end state are specified here rather than
@@ -1029,39 +1091,45 @@ def publish(out_dir: Path, generations: Path, name: str, repo: Path, pending) ->
                 code=2,
             )
 
-    # STEP 4b - the publication itself.
-    try:
-        point_link_at(out_dir, fx.CURRENT_LINK, name, f"{stamp}-publish")
-    except OSError as error:
-        fail(
-            f"could not publish ({error}). Nothing changed: {out_dir / fx.CURRENT_LINK}"
-            f" and the lock are as they were. The validated new generation is on disk "
-            f"at {generations / name}.",
-            code=2,
-        )
-
-    # STEPS 5-6 - record it, and undo the flip if anything at all prevents that.
+    # STEPS 4b-6 - the flip and the lock write, as ONE guarded region.
     #
-    # The guard is try/finally on a `committed` flag, not `except OSError`.
-    # A KeyboardInterrupt delivered between the flip and the lock replace is
-    # not an OSError, so it walked straight out of the old handler and left the
-    # new generation published against the OLD lock - precisely the state this
-    # whole protocol exists to make impossible. Anything that can interrupt
-    # Python can land in that window, so the rollback has to be attached to
-    # LEAVING the region rather than to a class of error.
+    # The flip is INSIDE the try. Round 6 opened the guard one statement after
+    # it, and an ordinary Ctrl-C landing between os.replace and entering the
+    # try left the new generation published against the OLD lock. There is no
+    # placement of a guard that "starts after" an effect and still covers it;
+    # the effect has to happen inside.
     #
-    # commit_lock deliberately prints nothing: the previous version printed its
-    # success line inside the guarded block, so an EPIPE or ENOSPC on stdout
-    # was caught as "the lock could not be written" and triggered a rollback
-    # that reported the opposite of what had actually happened.
+    # The unwind decision is made from the DISK, not from a flag. That is the
+    # second half of the same lesson: an interrupt can land between the lock's
+    # os.replace and any assignment that would record it, so no flag can be set
+    # closely enough. A flag-based rollback undid the flip after the lock had
+    # already been written and produced the opposite split state from the one
+    # it was guarding - old current, new lock. Asking the file system "is the
+    # lock the new one?" has no window at all.
+    #
+    # commit_lock deliberately prints nothing: an earlier version printed its
+    # success line inside the guarded block, so an EPIPE on stdout was caught
+    # as "the lock could not be written" and triggered a rollback that reported
+    # the opposite of what had actually happened.
     committed = False
-    rolled_back = None
+    reported = False
     try:
+        try:
+            point_link_at(out_dir, fx.CURRENT_LINK, name, f"{stamp}-publish")
+        except OSError as error:
+            reported = True
+            fail(
+                f"could not publish ({error}). Nothing changed: "
+                f"{out_dir / fx.CURRENT_LINK} and the lock are as they were. The "
+                f"validated new generation is on disk at {generations / name}.",
+                code=2,
+            )
         if pending is not None:
             try:
                 commit_lock(repo, pending)
             except OSError as error:
                 rolled_back = safe_restore_current(out_dir, previous, name, stamp)
+                reported = True
                 fail(
                     f"the tree was published but the lock could not be written "
                     f"({error}), which would leave a published tree no committed "
@@ -1074,12 +1142,21 @@ def publish(out_dir: Path, generations: Path, name: str, repo: Path, pending) ->
                 )
         committed = True
     finally:
-        if not committed and rolled_back is None:
-            # Reached only by an exception the handler above does not name -
-            # KeyboardInterrupt, MemoryError, a bug in this file. The flip is
-            # undone on the way out and the failure propagates untouched.
-            undone = safe_restore_current(out_dir, previous, name, stamp)
-            warn(f"gen-fixtures: interrupted after publishing. {undone}")
+        if not committed and not reported:
+            # Reached only by something the handlers above do not name -
+            # KeyboardInterrupt, MemoryError, a bug in this file - at any point
+            # from before the flip to just after the lock was replaced.
+            if pending is not None and lock_on_disk_is(repo, pending):
+                # The lock DID land. Rolling the flip back now would create the
+                # split state instead of preventing it, so the publication is
+                # left complete and said so.
+                warn(
+                    "gen-fixtures: interrupted, but the tree and the lock were both "
+                    f"committed; {name} is published and the lock describes it."
+                )
+            else:
+                undone = safe_restore_current(out_dir, previous, name, stamp)
+                warn(f"gen-fixtures: interrupted after publishing. {undone}")
 
     note(
         f"gen-fixtures: rewrote {fx.lock_path(repo)} - commit it as a reviewed diff"
@@ -1088,7 +1165,9 @@ def publish(out_dir: Path, generations: Path, name: str, repo: Path, pending) ->
     )
 
     # STEP 7 - published; from here nothing may turn this into a failure.
-    collect_generations(generations, retained(out_dir, generations / name))
+    collect_generations(
+        generations_fd, generations, retained(out_dir, generations / name)
+    )
     return generations / name
 
 
@@ -1180,7 +1259,7 @@ def retained(out_dir: Path, current: Path) -> set[str]:
     return {current.name} | ({previous.name} if previous is not None else set())
 
 
-def collect_generations(generations: Path, keep: set[str]) -> None:
+def collect_generations(generations_fd: int, generations: Path, keep: set[str]) -> None:
     """Delete superseded generations. Never fatal, never touches `keep`.
 
     Two are kept: the one just published and the one it replaced. That buys a
@@ -1200,7 +1279,10 @@ def collect_generations(generations: Path, keep: set[str]) -> None:
     """
     left = []
     try:
-        candidates = sorted(p.name for p in generations.iterdir())
+        # Listed through the held descriptor, like every other step: iterdir()
+        # would walk the path again and could be redirected by an ancestor
+        # swapped after the root was anchored.
+        candidates = sorted(os.listdir(generations_fd))
     except OSError as error:  # pragma: no cover - the directory just worked
         note(
             f"gen-fixtures: WARNING - published, but could not list {generations} "
@@ -1212,7 +1294,7 @@ def collect_generations(generations: Path, keep: set[str]) -> None:
         if candidate in keep:
             continue
         try:
-            refusal = purge_marked_dir(generations, candidate)
+            refusal = purge_marked_dir(generations_fd, generations, candidate)
         except Exception as error:  # noqa: BLE001 - post-commit, see docstring
             refusal = f"{error}"
         if refusal is not None:
@@ -1345,32 +1427,59 @@ def commit_lock(repo: Path, new: dict) -> None:
     ENOSPC), so the success line belongs to the caller, after the guard.
     """
     lock_file = fx.lock_path(repo)
-    # mkstemp, not a pid-derived name. The old temp path was predictable, and
-    # nothing stopped it being a symlink: write_text then followed it and
-    # overwrote an unrelated file, and os.replace moved the SYMLINK over the
-    # tracked lock - so the repository's record of the frozen workload became a
-    # symlink to attacker-chosen content while this reported success. mkstemp
-    # creates with O_CREAT|O_EXCL|O_NOFOLLOW semantics and an unguessable name,
-    # so there is no window to plant anything in, and it is created in the
-    # lock's own directory so the replace stays on one filesystem.
-    descriptor, temporary_name = tempfile.mkstemp(
-        dir=lock_file.parent, prefix=f".{lock_file.name}.", suffix=".tmp"
-    )
-    temporary = Path(temporary_name)
+    # Every step relative to a descriptor on `fixtures/`, not to a path.
+    # O_NOFOLLOW only ever guarded the FINAL component, so with `fixtures`
+    # itself a symlink this wrote an unrelated file outside the repository and
+    # reported success. Resolution that starts at a held descriptor cannot
+    # consult an ancestor at all, so there is no ancestor to swap or to have
+    # been a symlink all along.
+    #
+    # O_CREAT|O_EXCL with an unguessable name replaces the old pid-derived temp
+    # path: predictable and unanchored, it let a planted symlink both overwrite
+    # an unrelated file and become the tracked lock itself.
+    with fx.anchored_fixtures_dir(repo) as fixtures_fd:
+        temporary_name = f".{lock_file.name}.{os.urandom(8).hex()}.tmp"
+        descriptor = os.open(
+            temporary_name,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC,
+            0o644,
+            dir_fd=fixtures_fd,
+        )
+        try:
+            with os.fdopen(descriptor, "w") as handle:
+                handle.write(json.dumps(new, indent=2, sort_keys=True) + "\n")
+            os.replace(
+                temporary_name,
+                lock_file.name,
+                src_dir_fd=fixtures_fd,
+                dst_dir_fd=fixtures_fd,
+            )
+        except BaseException:
+            # BaseException, not OSError: a KeyboardInterrupt here must not
+            # leave a stray temporary beside the tracked lock either. The
+            # original failure is re-raised untouched.
+            with contextlib.suppress(OSError):
+                os.unlink(temporary_name, dir_fd=fixtures_fd)
+            raise
+
+
+def lock_on_disk_is(repo: Path, pending: dict) -> bool:
+    """Has `pending` actually reached the tracked lock? Never raises.
+
+    Asked on the unwind path INSTEAD of consulting a flag. An interrupt can
+    land between the lock's os.replace and any assignment that would record
+    it, so no flag can be set closely enough; reading the file back has no
+    window at all. Getting this wrong is not academic - a flag-based rollback
+    undid the symlink flip after the lock had already been written, producing
+    the opposite split state from the one it was guarding against.
+    """
     try:
-        with os.fdopen(descriptor, "w") as handle:
-            handle.write(json.dumps(new, indent=2, sort_keys=True) + "\n")
-        # mkstemp makes the file 0600; the tracked lock is reviewed source and
-        # must stay readable like the file it replaces.
-        os.chmod(temporary, 0o644)
-        os.replace(temporary, lock_file)
-    except BaseException:
-        # BaseException, not OSError: a KeyboardInterrupt here must not leave a
-        # stray temporary beside the tracked lock either. The original failure
-        # is re-raised untouched; only the cleanup is suppressed.
-        with contextlib.suppress(OSError):
-            temporary.unlink()
-        raise
+        with fx.anchored_fixtures_dir(repo) as fixtures_fd:
+            return (
+                json.loads(fx.read_at(fixtures_fd, fx.lock_path(repo).name)) == pending
+            )
+    except (OSError, ValueError, fx.LockError):
+        return False
 
 
 def write_manifest(

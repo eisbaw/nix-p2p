@@ -52,7 +52,26 @@ Two generations are kept: the published one (`current`) and its predecessor
 that same descriptor — a directory swapped in after a by-path check is not what
 gets removed. A directory without the marker is never deleted, empty or not.
 
-**Confinement.** A generation tree must contain **zero symlinks**, asserted at
+**Confinement — and what it is and is not for.** The anchoring defends against
+exactly two things: an ancestor directory swapped for a symlink *concurrently*,
+after a path was resolved and before it is used; and an ancestor that is
+*already* a symlink being silently written through, so the tooling edits a file
+outside the tree it believes it is editing. It does **not** claim to defend a
+host where an attacker already has write access under your uid — that attacker
+edits `workload.lock.json` directly and no descriptor discipline helps. What is
+bought is that the fixture tooling cannot be *tricked* into reaching outside its
+own root, which matters because it deletes directories and rewrites the file
+that defines the frozen workload.
+
+The mechanism: resolve the root once, hold an `O_NOFOLLOW|O_DIRECTORY`
+descriptor on it, and perform every subsequent operation relative to that
+descriptor — `openat` never consults ancestors, so a swap after the open cannot
+redirect anything. `O_NOFOLLOW` alone was not enough: it guards only the *final*
+component, so every ancestor was still followed on every call. Where a real path
+must be handed to another process (`nix copy`, the HTTP server), it is compared
+back to the held descriptor's `(dev, ino)` first.
+
+A generation tree must additionally contain **zero symlinks**, asserted at
 validation and again by the gate. That single rule is what makes every other
 containment check sufficient: `cache/` being replaced by a symlink to an
 external tree previously slipped past the per-component url checks, and the
