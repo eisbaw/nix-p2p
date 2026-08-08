@@ -1,9 +1,10 @@
 ---
 id: TASK-48
 title: 'FREEZE: RawNarV1 addressed unit + iroh ALPN (golden vectors)'
-status: To Do
+status: In Progress
 assignee: []
 created_date: '2026-08-08 20:28'
+updated_date: '2026-08-08 21:10'
 labels:
   - irreversible
 dependencies: []
@@ -22,3 +23,9 @@ The hardest wave-2 freeze (arch+codex: harder than the schema, cannot be version
 - [ ] #2 The iroh ALPN constant + digest encoding + domain separation are pinned as named constants with a conformance test
 - [ ] #3 Content-identity (NarHash<->BLAKE3) is separated from transport-offer (NodeId+locator); a BitTorrent offer shape is representable (infohash/piece-layout slot), proving no fork
 <!-- AC:END -->
+
+## Implementation Notes
+
+<!-- SECTION:NOTES:BEGIN -->
+Implemented + gate-green (lint 0, daemon tests pass incl golden_vectors, golden checker re-derives blake3:95f49df0 from the fixture, blake3 daemon-only). Committed by orchestrator (implementer agent died on login-expired mid-finalize, work was complete+staged). Awaiting DEEP gate.
+<!-- SECTION:NOTES:END -->

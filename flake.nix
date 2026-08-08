@@ -41,7 +41,19 @@
       # to flakes however wide this filter gets. Instead no Rust test may
       # depend on it - scripts/check-fixtures.py enforces that, and its
       # docstring carries the tradeoff.
-      src = craneLib.cleanCargoSource ./.;
+      #
+      # Task-48 widens it by exactly one class: the COMMITTED golden vectors
+      # (daemon/tests/golden/*.json), which `daemon/tests/golden_vectors.rs`
+      # `include_str!`s so the frozen addressed-unit encoding is conformance-tested
+      # inside the sandbox. These are a tracked source input (unlike the fixture
+      # cache), so keeping them is exactly the widening task-1 anticipated.
+      src = pkgs.lib.cleanSourceWith {
+        src = ./.;
+        name = "source";
+        filter = path: type:
+          (builtins.match ".*/tests/golden/.*\\.json$" path != null)
+          || craneLib.filterCargoSources path type;
+      };
 
       # The mock upstream's payload set (task-3). Read from a file rather than
       # inlined so the Nix expression, the generator and TESTING.md all quote
@@ -54,10 +66,13 @@
 
       # Python for the fixture scripts. cryptography derives the fixture
       # signing key from a seed phrase, which is what keeps key material out of
-      # the repository (scripts/fixturelib.py). The independence check below
-      # keeps plain python3 - it needs no third-party module and should not
-      # wait on one.
-      pythonEnv = pkgs.python3.withPackages (ps: [ ps.cryptography ]);
+      # the repository (scripts/fixturelib.py). blake3 re-derives the task-48
+      # golden vector from the fixture NAR bytes (scripts/check-golden-vectors.py)
+      # - the "a second impl matches byte-for-byte" half of AC#1, which needs the
+      # fixture and so cannot live in a sandboxed cargo test. The independence
+      # check below keeps plain python3 - it needs no third-party module and
+      # should not wait on one.
+      pythonEnv = pkgs.python3.withPackages (ps: [ ps.cryptography ps.blake3 ]);
 
       commonArgs = {
         inherit src;

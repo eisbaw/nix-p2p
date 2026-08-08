@@ -40,6 +40,15 @@ async-trait = "0.1"
 # holds a serde_json::Value in the public types, not just in tests.
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+# BLAKE3 of the addressed unit (task-48 freeze): the raw-NAR content identity.
+# DAEMON-ONLY on purpose - testproxy stays std-only (an independent witness of
+# wire behaviour), so this is never shared. Default features only (std, no
+# rayon): the identity is computed one-shot, and pulling rayon would widen the
+# closure for no benefit. Not an HTTP-stack crate, so the independence
+# convergence denylist is unaffected. The addressed unit is BLAKE3(RawNarV1) with
+# NO domain separation, so this crate's plain `hash()` IS the frozen recipe and a
+# future iroh transport can address blobs by exactly this digest (see content_id).
+blake3 = "1"
 
 [dev-dependencies]
 # process: spawn the real testproxy binary for the fault-mode loop (AC#2).

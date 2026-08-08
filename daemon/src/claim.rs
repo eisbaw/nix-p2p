@@ -58,21 +58,31 @@
 //! `serde_json::Value`, which is JSON-shaped; when the binary codec is frozen the
 //! catch-all's value type is revisited (follow-up filed to task-48).
 //!
-//! ## What is NOT frozen here (honest deferral to task-48)
+//! ## The frozen identity encodings (task-48)
 //!
-//! The exact BYTE encoding of the addressed unit and of node identity - the
-//! raw-NAR-v1 BLAKE3 bytes, the iroh `NodeId`, a BitTorrent infohash - is the
-//! task-48 `RawNarV1`/`NodeId` freeze. Here they are `String` newtypes
-//! ([`RawNarBlake3`], [`NodeId`], [`BitTorrentInfoHash`]): they round-trip
-//! deterministically, but their canonical encoding is TODO(task-48) and is NOT
-//! settled by this module.
+//! The exact BYTE encoding of the addressed unit and of the transport locators is
+//! FROZEN by task-48, in two deliberately separated modules this one composes:
+//!   * [`crate::content_id::Blake3Digest`] - the UNIVERSAL, transport-independent
+//!     content identity (`BLAKE3(RawNarV1)`, canonical string `blake3:<hex>`). A
+//!     claim's payload and every offer carry it; it is the byte a peer is asked
+//!     for on any transport.
+//!   * [`crate::transport::NodeId`] / [`crate::transport::BitTorrentInfoHash`] -
+//!     the per-TRANSPORT locators (an iroh ed25519 key; a BitTorrent infohash).
+//!     Not derivable from the content identity, and different per transport, which
+//!     is exactly why a claim carries both a universal identity and a
+//!     transport-specific locator.
+//!
+//! Earlier drafts held these as `String` placeholders; task-48 replaced them with
+//! the canonical typed encodings (their tests were updated for the new form).
 
 use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+use crate::content_id::Blake3Digest;
 use crate::source::NarHash;
+use crate::transport::{BitTorrentInfoHash, NodeId};
 
 /// Wire schema version of [`Claim`]. Bumped only on a breaking change; a decoder
 /// rejects any other version cleanly (network-split boundary).
@@ -83,27 +93,10 @@ pub const CLAIM_SCHEMA_VERSION: u16 = 1;
 pub const QUERY_SCHEMA_VERSION: u16 = 1;
 
 // -------------------------------------------------------------------------
-// Identity newtypes. Encoding-deferred to task-48 (see module docs). String
-// today: deterministic + round-trips, but NOT the frozen canonical byte form.
+// Identity types. The addressed-unit BLAKE3 and the transport locators are the
+// task-48 freeze; they live in `content_id` (universal) and `transport`
+// (per-transport) and are composed here. See the module docs.
 // -------------------------------------------------------------------------
-
-/// The BLAKE3 of the addressed unit (the raw, uncompressed NAR - Candidate B).
-/// This is what a consumer actually fetches by, on any transport; a holder
-/// `NodeId` alone is insufficient. TODO(task-48): the exact 32-byte encoding and
-/// its string form freeze in the `RawNarV1` freeze, not here.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct RawNarBlake3(pub String);
-
-/// A holder's network identity (the iroh `NodeId` / ed25519 public key).
-/// TODO(task-48): the canonical 32-byte encoding freezes there; `String` here.
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
-pub struct NodeId(pub String);
-
-/// A BitTorrent infohash. Present so the BitTorrent transport is REPRESENTABLE
-/// (proves a 2nd transport is not a network fork); no BitTorrent backend exists
-/// here (task-38). TODO(task-48): infohash byte form (v1 20-byte / v2 32-byte).
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct BitTorrentInfoHash(pub String);
 
 /// The content identity a claim/query is ABOUT: the signed `NarHash` (the
 /// wave-1 [`crate::source::NarKey::SignedNarHash`] seam key, keyed on by the
@@ -166,8 +159,9 @@ pub enum ClaimPayload {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum KnownPayload {
-    /// A whole raw-NAR blob, addressed by its BLAKE3.
-    WholeNar { blake3: RawNarBlake3 },
+    /// A whole raw-NAR blob, addressed by its BLAKE3 (the universal content
+    /// identity, `blake3:<hex>` on the wire).
+    WholeNar { blake3: Blake3Digest },
     // future: CastoreRoot { root: CastoreRootDigest, .. }  // task: Candidate C
 }
 
@@ -196,18 +190,21 @@ pub enum TransportOffer {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "transport", rename_all = "snake_case")]
 pub enum KnownTransport {
-    /// iroh whole-blob (Candidate B, FIRST priority). Needs the holder `NodeId`
-    /// AND the raw-NAR `blake3` to fetch by - both carried here.
-    Iroh { node: NodeId, blake3: RawNarBlake3 },
+    /// iroh whole-blob (Candidate B, FIRST priority). Carries the transport
+    /// locator (the holder `NodeId`) AND the universal content identity
+    /// (`blake3`) - a consumer fetches by BLAKE3, so a bare holder identity is
+    /// insufficient. The two are separated on purpose (see [`crate::transport`]).
+    Iroh { node: NodeId, blake3: Blake3Digest },
     /// BitTorrent - REPRESENTABLE only, NOT implemented (no backend; task-38).
-    /// Present so a 2nd transport is not a network fork. Carries the infohash
-    /// AND the raw-NAR `blake3`, because a consumer still verifies/fetches by
-    /// BLAKE3 regardless of the swarm addressing. The wire tag is pinned
-    /// explicitly (`snake_case` would give the odd `bit_torrent`).
+    /// Present so a 2nd transport is not a network fork. Carries the
+    /// transport-specific locator (`infohash`) AND the SAME universal `blake3` a
+    /// consumer verifies/fetches by - proving the content identity is shared
+    /// across transports while the locator is per-transport. The wire tag is
+    /// pinned explicitly (`snake_case` would give the odd `bit_torrent`).
     #[serde(rename = "bittorrent")]
     BitTorrent {
         infohash: BitTorrentInfoHash,
-        blake3: RawNarBlake3,
+        blake3: Blake3Digest,
     },
 }
 
@@ -408,6 +405,39 @@ fn check_version(found: u16, expected: u16) -> Result<(), ClaimCodecError> {
 mod tests {
     use super::*;
 
+    // Canonical fixed identities, in BOTH typed and wire-string form, so the
+    // typed constructors and the raw-JSON literals below cannot drift. The
+    // `wire_strings_match_typed` test asserts they agree.
+    const NODE_A_HEX: &str = "1111111111111111111111111111111111111111111111111111111111111111";
+    const NODE_B_HEX: &str = "2222222222222222222222222222222222222222222222222222222222222222";
+    const BLAKE3_HEX: &str =
+        "blake3:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    const INFOHASH_HEX: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"; // 64 = v2
+
+    fn node_a() -> NodeId {
+        NodeId::from_bytes([0x11; 32])
+    }
+    fn node_b() -> NodeId {
+        NodeId::from_bytes([0x22; 32])
+    }
+    fn blake3_id() -> Blake3Digest {
+        Blake3Digest::from_bytes([0xaa; 32])
+    }
+    fn infohash() -> BitTorrentInfoHash {
+        BitTorrentInfoHash::v2([0xbb; 32])
+    }
+
+    #[test]
+    fn wire_strings_match_typed() {
+        // The raw-JSON literals used across these tests must equal the canonical
+        // string form of the typed identities, or a "future variant" fixture
+        // would fail to decode for the wrong reason.
+        assert_eq!(node_a().to_string(), NODE_A_HEX);
+        assert_eq!(node_b().to_string(), NODE_B_HEX);
+        assert_eq!(blake3_id().to_string(), BLAKE3_HEX);
+        assert_eq!(infohash().to_string(), INFOHASH_HEX);
+    }
+
     /// A fully-populated v1 claim (known payload + both transports + reserved
     /// fields set) so round-trip tests exercise every field.
     fn sample_claim() -> Claim {
@@ -415,17 +445,17 @@ mod tests {
             schema_version: CLAIM_SCHEMA_VERSION,
             key: NarHashKey::new("sha256:1b2c3d"),
             payload: ClaimPayload::Known(KnownPayload::WholeNar {
-                blake3: RawNarBlake3("blake3:aaaa".into()),
+                blake3: blake3_id(),
             }),
-            holders: vec![NodeId("node-a".into()), NodeId("node-b".into())],
+            holders: vec![node_a(), node_b()],
             transports: vec![
                 TransportOffer::Known(KnownTransport::Iroh {
-                    node: NodeId("node-a".into()),
-                    blake3: RawNarBlake3("blake3:aaaa".into()),
+                    node: node_a(),
+                    blake3: blake3_id(),
                 }),
                 TransportOffer::Known(KnownTransport::BitTorrent {
-                    infohash: BitTorrentInfoHash("ih:bbbb".into()),
-                    blake3: RawNarBlake3("blake3:aaaa".into()),
+                    infohash: infohash(),
+                    blake3: blake3_id(),
                 }),
             ],
             relay: None,
@@ -461,7 +491,7 @@ mod tests {
     #[serde(tag = "kind", rename_all = "snake_case")]
     #[allow(dead_code)]
     enum StrictPayload {
-        WholeNar { blake3: RawNarBlake3 },
+        WholeNar { blake3: Blake3Digest },
     }
 
     /// Bytes a NEWER peer would send: a `castore_root` payload this build does
@@ -471,10 +501,10 @@ mod tests {
             "schema_version": CLAIM_SCHEMA_VERSION,
             "key": "sha256:1b2c3d",
             "payload": { "kind": "castore_root", "digest": "castore:xyz", "chunks": 7 },
-            "holders": ["node-a"],
+            "holders": [NODE_A_HEX],
             "transports": [
-                { "transport": "iroh", "node": "node-a", "blake3": "blake3:aaaa" },
-                { "transport": "webseed", "url": "https://example.invalid/x", "blake3": "blake3:aaaa" }
+                { "transport": "iroh", "node": NODE_A_HEX, "blake3": BLAKE3_HEX },
+                { "transport": "webseed", "url": "https://example.invalid/x", "blake3": BLAKE3_HEX }
             ]
         });
         serde_json::to_vec(&wire).unwrap()
@@ -552,8 +582,8 @@ mod tests {
         let wire = serde_json::json!({
             "schema_version": CLAIM_SCHEMA_VERSION,
             "key": "sha256:1b2c3d",
-            "payload": { "kind": "whole_nar", "blake3": "blake3:aaaa" },
-            "holders": ["node-a"],
+            "payload": { "kind": "whole_nar", "blake3": BLAKE3_HEX },
+            "holders": [NODE_A_HEX],
             "transports": [],
             "future_field": { "some": "v2 thing" }
         });
@@ -601,12 +631,18 @@ mod tests {
     #[test]
     fn bittorrent_transport_is_representable_without_a_fork() {
         let offer = TransportOffer::Known(KnownTransport::BitTorrent {
-            infohash: BitTorrentInfoHash("ih:1234".into()),
-            blake3: RawNarBlake3("blake3:aaaa".into()),
+            infohash: infohash(),
+            blake3: blake3_id(),
         });
         let bytes = serde_json::to_vec(&offer).unwrap();
         let on_wire: Value = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(on_wire["transport"], "bittorrent");
+        // The transport-specific locator (infohash) and the UNIVERSAL content
+        // identity (blake3) are BOTH present and separate: a BitTorrent locator
+        // does not fit in a NodeId, so a 2nd transport is representable without
+        // forking the content identity.
+        assert_eq!(on_wire["infohash"], INFOHASH_HEX);
+        assert_eq!(on_wire["blake3"], BLAKE3_HEX);
         // Round-trips as a first-class known variant (a 2nd transport is not a
         // fork), while carrying the BLAKE3 a consumer fetches by.
         let back: TransportOffer = serde_json::from_slice(&bytes).unwrap();
@@ -616,14 +652,14 @@ mod tests {
     #[test]
     fn iroh_offer_carries_node_and_blake3() {
         let offer = TransportOffer::Known(KnownTransport::Iroh {
-            node: NodeId("node-a".into()),
-            blake3: RawNarBlake3("blake3:aaaa".into()),
+            node: node_a(),
+            blake3: blake3_id(),
         });
         let on_wire: Value = serde_json::from_slice(&serde_json::to_vec(&offer).unwrap()).unwrap();
         assert_eq!(on_wire["transport"], "iroh");
-        assert_eq!(on_wire["node"], "node-a");
+        assert_eq!(on_wire["node"], NODE_A_HEX);
         assert_eq!(
-            on_wire["blake3"], "blake3:aaaa",
+            on_wire["blake3"], BLAKE3_HEX,
             "the iroh offer MUST carry the BLAKE3 a consumer fetches by"
         );
     }
@@ -634,7 +670,7 @@ mod tests {
         let wire = serde_json::json!({
             "schema_version": 999,
             "key": "sha256:1b2c3d",
-            "payload": { "kind": "whole_nar", "blake3": "blake3:aaaa" },
+            "payload": { "kind": "whole_nar", "blake3": BLAKE3_HEX },
             "holders": [],
             "transports": []
         });
@@ -688,8 +724,8 @@ mod tests {
             schema_version: QUERY_SCHEMA_VERSION,
             answer: HoldAnswer::Have {
                 offers: vec![TransportOffer::Known(KnownTransport::Iroh {
-                    node: NodeId("node-a".into()),
-                    blake3: RawNarBlake3("blake3:aaaa".into()),
+                    node: node_a(),
+                    blake3: blake3_id(),
                 })],
             },
         };

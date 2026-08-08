@@ -1,0 +1,26 @@
+{
+  "_comment": "task-48 FROZEN golden vectors for the RawNarV1 addressed unit. RawNarV1 is the exact `nix-store --dump <path>` byte stream (uncompressed NAR); the addressed unit is BLAKE3(RawNarV1) with NO domain separation. This file is the single source of truth for the golden values: `daemon/tests/golden_vectors.rs` checks the ENCODINGS are canonical (no fixture needed, runs in the Nix sandbox), and `scripts/check-golden-vectors.py` RE-DERIVES them from the regenerated fixture and asserts they match byte-for-byte. Changing any value here is a deliberate, reviewed re-freeze.",
+  "recipe": "plain unkeyed BLAKE3 over the exact `nix-store --dump` bytes; no domain separation; canonical string form blake3:<64 lowercase hex chars>",
+  "recipe_vectors": [
+    {
+      "note": "the published BLAKE3 empty-input vector; a keyed or domain-separated recipe cannot produce it",
+      "input_utf8": "",
+      "blake3": "blake3:af1349b9f5f9a1a6a0404dea36dcc9499bcb25c9adc112b7cc9a93cae41f3262"
+    },
+    {
+      "note": "a fixed non-empty marker, cross-checked against a stock b3sum",
+      "input_utf8": "nix-p2p/RawNarV1",
+      "blake3": "blake3:74f885afdc845a012272e457f600cf78ed1297b47ac1a912047bd7351d32e23b"
+    }
+  ],
+  "fixture": {
+    "note": "the `lib` fixture path; compression=none, so its served .nar IS the raw NAR (== nix-store --dump). Belongs to workload nix-p2p-fixture-workload-v1, which is pinned reproducible, so this digest is stable until the workload is deliberately bumped.",
+    "workload_version": "nix-p2p-fixture-workload-v1",
+    "attr": "lib",
+    "compression": "none",
+    "url": "nar/06rgb4vfjsg365xwwdjz12qhjnvg3w0agfvyqfp977hp3yk2bczb.nar",
+    "raw_nar_len": 66048,
+    "nar_hash": "sha256:06rgb4vfjsg365xwwdjz12qhjnvg3w0agfvyqfp977hp3yk2bczb",
+    "blake3": "blake3:95f49df0cabd4f2cab42dfb89911ee9aa445a5126e445e0b5006532aef7d6638"
+  }
+}

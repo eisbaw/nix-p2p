@@ -88,6 +88,7 @@ independence: _toolchain
 test: _toolchain _python fixtures
     cargo test --locked --workspace
     "${NIX_P2P_PYTHON}/bin/python3" scripts/check-fixtures.py
+    "${NIX_P2P_PYTHON}/bin/python3" scripts/check-golden-vectors.py
     "${NIX_P2P_PYTHON}/bin/python3" scripts/measure.py --self-test
 
 # Regenerate the signed fixture cache - fast tier (none/xz/zstd, <1 MiB).
