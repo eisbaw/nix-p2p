@@ -1,0 +1,107 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1180" height="760" viewBox="0 0 1180 760" font-family="Helvetica,Arial,sans-serif">
+  <defs>
+    <marker id="arr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M0,0 L10,5 L0,10 z" fill="#555"/>
+    </marker>
+  </defs>
+  <rect width="1180" height="760" fill="#ffffff"/>
+
+  <text x="20" y="32" font-size="18" font-weight="bold" fill="#222">nix-p2p — wave-2 target architecture (PLANNED; wave-2 backlog tasks 37–52, TESTING.md S6–S9)</text>
+  <text x="20" y="52" font-size="12" fill="#666">p2p byte transfer behind the frozen NarSource seam. cache.nixos.org stays the sole metadata/trust authority; the unmodified Nix client keeps verifying Sig + NarHash.</text>
+
+  <!-- node A -->
+  <rect x="20" y="90" width="440" height="390" rx="8" fill="#fbfcfe" stroke="#4a6fa5"/>
+  <text x="32" y="112" font-size="13" font-weight="bold" fill="#4a6fa5">daemon node A — fetch side</text>
+
+  <rect x="40" y="130" width="190" height="115" rx="6" fill="#e8eef7" stroke="#4a6fa5"/>
+  <text x="50" y="148" font-size="12" font-weight="bold" fill="#222">serving layer (unchanged)</text>
+  <text x="50" y="164" font-size="11" fill="#333">wave 2 populates the rewrite<tspan x="50" dy="14">allowlist: URL / Compression /</tspan><tspan x="50" dy="14">FileHash / FileSize ONLY —</tspan><tspan x="50" dy="14">signed fields never (that is</tspan><tspan x="50" dy="14">a security event)</tspan></text>
+
+  <rect x="260" y="130" width="180" height="115" rx="6" fill="#f6f0fa" stroke="#7a5a9a"/>
+  <text x="270" y="148" font-size="12" font-weight="bold" fill="#5a3f78">hedge / prefetch policy</text>
+  <text x="270" y="164" font-size="11" fill="#5a3f78">derived from scenario models,<tspan x="270" dy="14">not hardcoded: hedge the</tspan><tspan x="270" dy="14">upstream with a throughput</tspan><tspan x="270" dy="14">abort; prefetch is a tail</tspan><tspan x="270" dy="14">optimisation (task-35 data)</tspan></text>
+
+  <rect x="40" y="290" width="190" height="80" rx="6" fill="#e8eef7" stroke="#4a6fa5"/>
+  <text x="50" y="308" font-size="12" font-weight="bold" fill="#222">NarSource seam (frozen)</text>
+  <text x="50" y="324" font-size="11" fill="#333">resolve(SignedNarHash) —<tspan x="50" dy="14">unchanged from wave 1</tspan></text>
+
+  <rect x="260" y="290" width="180" height="110" rx="6" fill="#f6f0fa" stroke="#7a5a9a"/>
+  <text x="270" y="308" font-size="12" font-weight="bold" fill="#5a3f78">Transport trait (task-38)</text>
+  <text x="270" y="324" font-size="11" fill="#5a3f78">claim transport tag selects<tspan x="270" dy="14">the impl: iroh (task-39,</tspan><tspan x="270" dy="14">first) | BitTorrent (second,</tspan><tspan x="270" dy="14">schema-admitted); unknown</tspan><tspan x="270" dy="14">tag skipped, never a crash</tspan></text>
+
+  <text x="155" y="430" font-size="11" fill="#666">expected_size = signed NarSize flows across<tspan x="155" dy="14">the seam → streaming over-size abort</tspan><tspan x="155" dy="14">(task-25, PRD risk 6)</tspan></text>
+
+  <!-- cache.nixos.org -->
+  <rect x="500" y="90" width="200" height="120" rx="6" fill="#f2f2f2" stroke="#777"/>
+  <text x="510" y="110" font-size="13" font-weight="bold" fill="#222">cache.nixos.org</text>
+  <text x="510" y="127" font-size="11" fill="#333">sole metadata / trust<tspan x="510" dy="14">authority: signed narinfos,</tspan><tspan x="510" dy="14">always; hedged NAR fallback</tspan><tspan x="510" dy="14">(S2 additive invariant</tspan><tspan x="510" dy="14">preserved)</tspan></text>
+
+  <!-- verification gates -->
+  <rect x="500" y="250" width="200" height="150" rx="6" fill="#ffffff" stroke="#555"/>
+  <text x="510" y="270" font-size="12" font-weight="bold" fill="#222">verification gates</text>
+  <text x="510" y="287" font-size="11" fill="#333">transport: BLAKE3 of the raw<tspan x="510" dy="14">NAR (iroh incremental);</tspan><tspan x="510" dy="14">trust: sha256 == NarHash +</tspan><tspan x="510" dy="14">ed25519 Sig, re-checked by</tspan><tspan x="510" dy="14">the unmodified client;</tspan><tspan x="510" dy="14">NarSize abort kills claim-</tspan><tspan x="510" dy="14">spam amplification (risk 6)</tspan></text>
+
+  <!-- node B -->
+  <rect x="740" y="90" width="420" height="250" rx="8" fill="#fbfcfe" stroke="#4a6fa5"/>
+  <text x="752" y="112" font-size="13" font-weight="bold" fill="#4a6fa5">daemon node B — seed side</text>
+
+  <rect x="760" y="130" width="180" height="120" rx="6" fill="#f6f0fa" stroke="#7a5a9a"/>
+  <text x="770" y="148" font-size="12" font-weight="bold" fill="#5a3f78">iroh provider (task-39)</text>
+  <text x="770" y="164" font-size="11" fill="#5a3f78">serves whole raw-NAR blobs,<tspan x="770" dy="14">BLAKE3-addressed, verified</tspan><tspan x="770" dy="14">streaming over QUIC (n0</tspan><tspan x="770" dy="14">relays for holepunching —</tspan><tspan x="770" dy="14">a soft-centralization limit)</tspan></text>
+
+  <rect x="970" y="130" width="170" height="120" rx="6" fill="#f2f2f2" stroke="#777"/>
+  <text x="980" y="148" font-size="12" font-weight="bold" fill="#222">/nix/store</text>
+  <text x="980" y="164" font-size="11" fill="#333">NARs rendered on demand<tspan x="980" dy="14">via nix-store --dump —</tspan><tspan x="980" dy="14">no second copy, no</tspan><tspan x="980" dy="14">retention problem</tspan></text>
+  <line x1="966" y1="190" x2="944" y2="190" stroke="#555" stroke-width="1.5" marker-end="url(#arr)"/>
+
+  <text x="760" y="285" font-size="11" fill="#666">announce-on-demand: claims<tspan x="760" dy="14">published only for paths</tspan><tspan x="760" dy="14">fetched through the daemon</tspan></text>
+
+  <!-- characterization -->
+  <rect x="20" y="540" width="210" height="180" rx="6" fill="#ffffff" stroke="#555"/>
+  <text x="30" y="560" font-size="12" font-weight="bold" fill="#222">characterization (S6–S9)</text>
+  <text x="30" y="577" font-size="11" fill="#333">S6 peer-served NAR e2e;<tspan x="30" dy="14">S7 speedup/offload vs the</tspan><tspan x="30" dy="14">upstream, measured; S8</tspan><tspan x="30" dy="14">pathological matrix (slow</tspan><tspan x="30" dy="14">peer, dead holder, cold DHT,</tspan><tspan x="30" dy="14">NAT relay, herd, lying claim,</tspan><tspan x="30" dy="14">churn); S9 profiling models</tspan><tspan x="30" dy="14">that bite; S5 scale-fit 1..30 →</tspan><tspan x="30" dy="14">extrapolate to 1000s</tspan></text>
+
+  <!-- discovery plane -->
+  <rect x="260" y="540" width="660" height="180" rx="8" fill="#f6f0fa" stroke="#7a5a9a" stroke-dasharray="6 4"/>
+  <text x="272" y="562" font-size="13" font-weight="bold" fill="#5a3f78">discovery / claims plane — DHT spike deferred (mainline vs BEP44 vs iroh-native)</text>
+
+  <rect x="280" y="580" width="300" height="120" rx="6" fill="#ffffff" stroke="#7a5a9a"/>
+  <text x="290" y="598" font-size="12" font-weight="bold" fill="#5a3f78">claim record v1 (task-37 — DRAFT)</text>
+  <text x="290" y="615" font-size="11" fill="#333">{schema_version, key: NarHash,<tspan x="290" dy="14">payload: WholeNar{blake3} | future,</tspan><tspan x="290" dy="14">holders, transport: Iroh|BitTorrent,</tspan><tspan x="290" dy="14">reserved: narinfo-relay v2, sigs} —</tspan><tspan x="290" dy="14">drafted in daemon/src/claim.rs but</tspan><tspan x="290" dy="14">UNWIRED; freeze confirms at S6/48</tspan></text>
+
+  <rect x="610" y="580" width="290" height="120" rx="6" fill="#ffffff" stroke="#7a5a9a"/>
+  <text x="620" y="598" font-size="12" font-weight="bold" fill="#5a3f78">resolution path</text>
+  <text x="620" y="615" font-size="11" fill="#333">minimal 2-node exchange first<tspan x="620" dy="14">(task-40), then DHT-authoritative;</tspan><tspan x="620" dy="14">gossip only an accelerant; peer</tspan><tspan x="620" dy="14">probes answer yes/no per NarHash</tspan><tspan x="620" dy="14">— NO enumeration, ever (privacy)</tspan></text>
+
+  <!-- timing reality -->
+  <rect x="950" y="540" width="210" height="180" rx="6" fill="#ffffff" stroke="#555"/>
+  <text x="960" y="560" font-size="12" font-weight="bold" fill="#222">timing reality (task-35)</text>
+  <text x="960" y="577" font-size="11" fill="#333">gap vs real cache.nixos.org:<tspan x="960" dy="14">small closure median 0.1–0.3 s</tspan><tspan x="960" dy="14">(run-varying), larger closure</tspan><tspan x="960" dy="14">median 1.4 s, max 3.1 s (n=1);</tspan><tspan x="960" dy="14">grows with closure size. DHT</tspan><tspan x="960" dy="14">resolve 1–4 s is a PRD</tspan><tspan x="960" dy="14">ASSUMPTION, unmeasured →</tspan><tspan x="960" dy="14">hedge carries offload; prefetch</tspan><tspan x="960" dy="14">= tail optimisation. TESTING.md</tspan></text>
+
+  <!-- arrows -->
+  <polyline points="230,150 245,150 245,110 496,110" fill="none" stroke="#555" stroke-width="1.5" marker-end="url(#arr)"/>
+  <text x="300" y="102" font-size="10" fill="#666">narinfo GET (metadata, always)</text>
+
+  <line x1="440" y1="180" x2="496" y2="180" stroke="#555" stroke-width="1.5" marker-end="url(#arr)"/>
+  <text x="444" y="172" font-size="10" fill="#666">hedged NAR</text>
+
+  <line x1="230" y1="325" x2="256" y2="325" stroke="#555" stroke-width="1.5" marker-end="url(#arr)"/>
+
+  <polyline points="440,320 470,320 470,430 940,430 940,254" fill="none" stroke="#555" stroke-width="1.5" marker-end="url(#arr)"/>
+  <text x="500" y="422" font-size="10" fill="#666">whole raw NAR over iroh (QUIC), BLAKE3-gated — peer bytes, zero upstream egress</text>
+  <text x="500" y="446" font-size="10" fill="#999">(BitTorrent later: same claim schema, second Transport impl)</text>
+
+  <polyline points="135,370 135,500 300,500 300,536" fill="none" stroke="#555" stroke-width="1.5" marker-end="url(#arr)"/>
+  <text x="145" y="492" font-size="10" fill="#666">resolve NarHash → holders</text>
+
+  <polyline points="850,344 850,470 700,470 700,536" fill="none" stroke="#555" stroke-width="1.5" marker-end="url(#arr)"/>
+  <text x="710" y="462" font-size="10" fill="#666">announce claims (on demand)</text>
+
+  <!-- legend -->
+  <rect x="20" y="735" width="14" height="14" fill="#e8eef7" stroke="#4a6fa5"/>
+  <text x="40" y="746" font-size="11" fill="#444">exists (wave 1)</text>
+  <rect x="150" y="735" width="14" height="14" fill="#f6f0fa" stroke="#7a5a9a"/>
+  <text x="170" y="746" font-size="11" fill="#444">planned (wave 2)</text>
+  <rect x="290" y="735" width="14" height="14" fill="#f2f2f2" stroke="#777"/>
+  <text x="310" y="746" font-size="11" fill="#444">external / unchanged</text>
+</svg>

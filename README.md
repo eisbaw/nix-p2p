@@ -93,3 +93,7 @@ just journey    # J1 operator journey
 - `TESTING.md` — what good and bad observably mean; the oracles the gates
   enforce.
 - `backlog/` — task tracker (use the `backlog` CLI, not direct file edits).
+- `figures/` — architecture overviews: `fig-arch-1` (wave-1 daemon seams),
+  `fig-arch-2` (test harness), `fig-arch-3` (wave-2 target, planned).
+  The `fig-candidate-*` originals predate the settled design and are stale
+  until task-17 revises them.

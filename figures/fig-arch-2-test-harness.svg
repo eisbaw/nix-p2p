@@ -1,0 +1,85 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1180" height="740" viewBox="0 0 1180 740" font-family="Helvetica,Arial,sans-serif">
+  <defs>
+    <marker id="arr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M0,0 L10,5 L0,10 z" fill="#555"/>
+    </marker>
+  </defs>
+  <rect width="1180" height="740" fill="#ffffff"/>
+
+  <text x="20" y="32" font-size="18" font-weight="bold" fill="#222">nix-p2p — test architecture (wave 1)</text>
+  <text x="20" y="52" font-size="12" fill="#666">TESTING.md oracles enforced by a containerized e2e harness, a NixOS VM truth layer, and a measurement instrument. Fault injection lives ONLY in the fixture.</text>
+
+  <!-- everyday pod -->
+  <rect x="20" y="70" width="860" height="180" rx="8" fill="#fbfcfe" stroke="#4a6fa5"/>
+  <text x="32" y="92" font-size="13" font-weight="bold" fill="#4a6fa5">rootless podman pod — just e2e (~20 scenarios, scripts/e2e_harness.py)</text>
+
+  <rect x="40" y="110" width="175" height="110" rx="6" fill="#f2f2f2" stroke="#777"/>
+  <text x="50" y="128" font-size="12" font-weight="bold" fill="#222">client container</text>
+  <text x="50" y="144" font-size="11" fill="#333">real nix, controlled<tspan x="50" dy="14">nix.conf: daemon is the</tspan><tspan x="50" dy="14">preferred substituter,</tspan><tspan x="50" dy="14">fallback to the next one</tspan></text>
+
+  <rect x="255" y="110" width="150" height="110" rx="6" fill="#e8eef7" stroke="#4a6fa5"/>
+  <text x="265" y="128" font-size="12" font-weight="bold" fill="#222">daemon</text>
+  <text x="265" y="144" font-size="11" fill="#333">the product under<tspan x="265" dy="14">test (transparent</tspan><tspan x="265" dy="14">proxy, wave 1)</tspan></text>
+
+  <rect x="445" y="110" width="195" height="110" rx="6" fill="#f4ecd9" stroke="#a08a5a"/>
+  <text x="455" y="128" font-size="12" font-weight="bold" fill="#222">testproxy (fixture)</text>
+  <text x="455" y="144" font-size="11" fill="#333">caching proxy, std-only,<tspan x="455" dy="14">no crate shared with the</tspan><tspan x="455" dy="14">daemon; request log =</tspan><tspan x="455" dy="14">ground-truth oracle</tspan><tspan x="455" dy="14">(kind, bytes, timing, gap)</tspan></text>
+
+  <rect x="680" y="110" width="175" height="110" rx="6" fill="#f4ecd9" stroke="#a08a5a"/>
+  <text x="690" y="128" font-size="12" font-weight="bold" fill="#222">mock origin</text>
+  <text x="690" y="144" font-size="11" fill="#333">static file server over<tspan x="690" dy="14">the signed fixture</tspan><tspan x="690" dy="14">cache (fixtures/out/</tspan><tspan x="690" dy="14">current)</tspan></text>
+
+  <line x1="215" y1="165" x2="251" y2="165" stroke="#555" stroke-width="1.5" marker-end="url(#arr)"/>
+  <line x1="405" y1="165" x2="441" y2="165" stroke="#555" stroke-width="1.5" marker-end="url(#arr)"/>
+  <line x1="640" y1="165" x2="676" y2="165" stroke="#555" stroke-width="1.5" marker-end="url(#arr)"/>
+
+  <!-- fault modes -->
+  <rect x="445" y="290" width="210" height="140" rx="6" fill="#ffffff" stroke="#a08a5a" stroke-dasharray="5 3"/>
+  <text x="455" y="310" font-size="12" font-weight="bold" fill="#222">fault injection (client-facing)</text>
+  <text x="455" y="327" font-size="11" fill="#333">latency (narinfo / nar),<tspan x="455" dy="14">HTTP 500 / 404, truncate,</tspan><tspan x="455" dy="14">corrupt bytes, connection</tspan><tspan x="455" dy="14">reset, throttle bytes/s —</tspan><tspan x="455" dy="14">the cache itself stays</tspan><tspan x="455" dy="14">byte-correct</tspan></text>
+  <line x1="540" y1="220" x2="540" y2="286" stroke="#999" stroke-width="1.2" stroke-dasharray="4 3" marker-end="url(#arr)"/>
+
+  <!-- fixtures -->
+  <rect x="680" y="290" width="230" height="150" rx="6" fill="#f4ecd9" stroke="#a08a5a"/>
+  <text x="690" y="310" font-size="12" font-weight="bold" fill="#222">fixtures/ — signed store</text>
+  <text x="690" y="327" font-size="11" fill="#333">deterministic pinned workload,<tspan x="690" dy="14">own ed25519 key; tamper</tspan><tspan x="690" dy="14">variants (bad sig, foreign key,</tspan><tspan x="690" dy="14">wrong NarHash, corrupt NAR);</tspan><tspan x="690" dy="14">immutable generations behind</tspan><tspan x="690" dy="14">one atomic symlink flip;</tspan><tspan x="690" dy="14">fail-closed check-fixtures gate</tspan></text>
+  <line x1="767" y1="220" x2="767" y2="286" stroke="#999" stroke-width="1.2" stroke-dasharray="4 3" marker-end="url(#arr)"/>
+
+  <!-- long chain -->
+  <rect x="20" y="290" width="400" height="140" rx="8" fill="#fbfcfe" stroke="#4a6fa5"/>
+  <text x="32" y="310" font-size="13" font-weight="bold" fill="#4a6fa5">long-chain — composition survives depth</text>
+  <rect x="35" y="330" width="62" height="42" rx="4" fill="#f2f2f2" stroke="#777"/>
+  <text x="43" y="355" font-size="10" fill="#222">client</text>
+  <rect x="107" y="330" width="52" height="42" rx="4" fill="#e8eef7" stroke="#4a6fa5"/>
+  <text x="112" y="355" font-size="10" fill="#222">daemon</text>
+  <rect x="169" y="330" width="52" height="42" rx="4" fill="#e8eef7" stroke="#4a6fa5"/>
+  <text x="174" y="355" font-size="10" fill="#222">daemon</text>
+  <rect x="231" y="330" width="52" height="42" rx="4" fill="#e8eef7" stroke="#4a6fa5"/>
+  <text x="236" y="355" font-size="10" fill="#222">daemon</text>
+  <rect x="293" y="330" width="72" height="42" rx="4" fill="#f4ecd9" stroke="#a08a5a"/>
+  <text x="299" y="355" font-size="10" fill="#222">testproxy</text>
+  <line x1="97" y1="351" x2="104" y2="351" stroke="#555" stroke-width="1.5" marker-end="url(#arr)"/>
+  <line x1="159" y1="351" x2="166" y2="351" stroke="#555" stroke-width="1.5" marker-end="url(#arr)"/>
+  <line x1="221" y1="351" x2="228" y2="351" stroke="#555" stroke-width="1.5" marker-end="url(#arr)"/>
+  <line x1="283" y1="351" x2="290" y2="351" stroke="#555" stroke-width="1.5" marker-end="url(#arr)"/>
+  <text x="35" y="395" font-size="11" fill="#333">fault × depth matrix; kill-middle-daemon;<tspan x="35" dy="14">per-hop header-timeout composition ceiling (task-33)</tspan></text>
+
+  <!-- NixOS VM -->
+  <rect x="20" y="460" width="400" height="180" rx="8" fill="#e9f4ea" stroke="#5a9a6a"/>
+  <text x="32" y="482" font-size="13" font-weight="bold" fill="#2f6e3f">NixOS VM truth layer — just e2e-vm</text>
+  <text x="32" y="500" font-size="11" fill="#333">3 QEMU VMs: peer (upstream nix-serve), client with the<tspan x="32" dy="14">daemon CO-LOCATED as localhost substituter (the NixOS</tspan><tspan x="32" dy="14">module, nixos/nix-p2p.nix), daemonoff (unit masked).</tspan><tspan x="32" dy="14">Real nix-daemon + systemd. Proves S1 byte-identity,</tspan><tspan x="32" dy="14">S2 fallback with the daemon stopped, and the module's</tspan><tspan x="32" dy="14">daemon-off additive invariant.</tspan></text>
+
+  <!-- oracles -->
+  <rect x="445" y="460" width="335" height="196" rx="8" fill="#ffffff" stroke="#555"/>
+  <text x="457" y="482" font-size="13" font-weight="bold" fill="#222">standing oracles (TESTING.md)</text>
+  <text x="457" y="500" font-size="11" fill="#333">S1  byte-identity through the chain<tspan x="457" dy="14">     (NarHash + bit-identical nix-store --dump)</tspan><tspan x="457" dy="14">S2  additive invariant: daemon dead or killed</tspan><tspan x="457" dy="14">     mid-NAR — the build still succeeds</tspan><tspan x="457" dy="14">S3  the egress INSTRUMENT is trustworthy;</tspan><tspan x="457" dy="14">     offload = 0 by construction in wave 1</tspan><tspan x="457" dy="14">     (counting rule net-upstream-egress-v2)</tspan><tspan x="457" dy="14">S4  p95 ≤ 110% — defined, but UNUSABLE at</tspan><tspan x="457" dy="14">     container tier (noise floor ≥ threshold)</tspan><tspan x="457" dy="14">S5  scaling laws: measure 1..30, regression-fit</tspan><tspan x="457" dy="14">oracles are shown able to FAIL (bite checks)</tspan></text>
+
+  <!-- measurement -->
+  <rect x="805" y="460" width="355" height="180" rx="8" fill="#ffffff" stroke="#555"/>
+  <text x="817" y="482" font-size="13" font-weight="bold" fill="#222">measurement instrument — just measure</text>
+  <text x="817" y="500" font-size="11" fill="#333">scripts/measure.py: identical scripted workload<tspan x="817" dy="14">with-daemon vs without → net egress report, p95</tspan><tspan x="817" dy="14">wall-clock, narinfo→nar gap histogram.</tspan><tspan x="817" dy="14">just journey: the J1 operator journey over the</tspan><tspan x="817" dy="14">same pod seam; J2 = the measurement read-out.</tspan><tspan x="817" dy="14">scripts/measure_real_gap.py (task-35): the same</tspan><tspan x="817" dy="14">gap vs the REAL cache.nixos.org — the wave-2</tspan><tspan x="817" dy="14">prefetch-vs-hedge design input.</tspan></text>
+
+  <!-- gates ribbon -->
+  <rect x="20" y="668" width="1140" height="44" rx="6" fill="#f7f7f7" stroke="#999"/>
+  <text x="34" y="695" font-size="12" fill="#333">fast tier (seconds):  just build · lint · test      |      slow tier (minutes):  just e2e · e2e-vm · measure · journey      |      CI:  nix flake check</text>
+</svg>
