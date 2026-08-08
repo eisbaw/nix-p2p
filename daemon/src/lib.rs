@@ -22,13 +22,15 @@
 mod body;
 pub mod cacheinfo;
 pub mod catalog;
+pub mod narinfo_cache;
 pub mod rewrite;
 pub mod server;
 pub mod source;
 pub mod upstream;
 
 pub use cacheinfo::CacheInfo;
-pub use catalog::NarCatalog;
+pub use catalog::{CorrelationStore, NarCatalog, NarMeta, NullCorrelation};
+pub use narinfo_cache::{Clock, NarinfoDiskCache, SystemClock};
 pub use server::{App, serve};
 pub use source::{
     NarBody, NarHash, NarKey, NarPathToken, NarSource, NarinfoSource, RawUpstream, SourceError,

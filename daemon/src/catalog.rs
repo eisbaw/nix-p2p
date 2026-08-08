@@ -45,6 +45,36 @@ pub struct NarMeta {
     pub nar_size: u64,
 }
 
+/// A PERSISTED correlation source consulted on an in-memory catalog miss.
+///
+/// task-4 froze the seam with an in-memory [`NarCatalog`] populated at
+/// narinfo-serve time; its honest limit was that a WARM Nix client skips the
+/// narinfo GET, so after a daemon restart a bare `GET /nar/<token>` had no
+/// correlation and fell back to `UpstreamPath`. task-8 closes that: the narinfo
+/// disk cache implements this trait, deriving `token -> (NarHash, NarSize)` from
+/// the persisted (byte-verbatim) narinfos, so the daemon can still dispatch
+/// `SignedNarHash` from a cold-in-memory-but-warm-on-disk state.
+///
+/// FORWARD-ONLY (`token -> meta`), like [`NarCatalog`]: a NAR request has the
+/// token and needs the hash. The lossy reverse map is deliberately not revived.
+pub trait CorrelationStore: Send + Sync {
+    /// The correlation persisted for this URL token, if any.
+    fn meta_for_token(&self, token: &str) -> Option<NarMeta>;
+}
+
+/// A [`CorrelationStore`] that knows nothing - the default when no persistent
+/// narinfo cache is wired (pure-upstream daemon, and the fake-source tests that
+/// do not exercise persistence). A miss here just yields the `UpstreamPath`
+/// fallback, exactly as before task-8.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct NullCorrelation;
+
+impl CorrelationStore for NullCorrelation {
+    fn meta_for_token(&self, _token: &str) -> Option<NarMeta> {
+        None
+    }
+}
+
 /// Forward token -> signed-NarHash+NarSize map, learned as narinfos pass through.
 /// FORWARD-ONLY on purpose: see the module docs for why there is no reverse map.
 #[derive(Debug, Default)]

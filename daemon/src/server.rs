@@ -30,7 +30,7 @@ use tokio::net::TcpListener;
 
 use crate::body::{empty, full};
 use crate::cacheinfo::CacheInfo;
-use crate::catalog::{NarCatalog, parse_correlation};
+use crate::catalog::{CorrelationStore, NarCatalog, parse_correlation};
 use crate::rewrite;
 use crate::source::{
     NarBody, NarKey, NarPathToken, NarSource, NarinfoSource, RawUpstream, SourceError, StoreHash,
@@ -47,6 +47,13 @@ pub struct App {
     /// narinfos populate it, NAR requests read it to carry the signed NarHash
     /// across the seam.
     pub catalog: Arc<NarCatalog>,
+    /// PERSISTED correlation, consulted only on an in-memory catalog MISS. In
+    /// production this is the narinfo disk cache, which derives `token -> meta`
+    /// from cached narinfos so a warm-on-disk-but-cold-in-memory daemon (post
+    /// restart, warm Nix client that skipped the narinfo GET) still dispatches
+    /// `SignedNarHash` (task-8; task-4's deferred steady-state). Defaults to
+    /// [`crate::catalog::NullCorrelation`] when no cache is wired.
+    pub correlation: Arc<dyn CorrelationStore>,
 }
 
 /// Serve on an already-bound listener until it errors. Binding is the caller's
@@ -127,9 +134,16 @@ async fn handle(req: Request<Incoming>, app: Arc<App>) -> Response<NarBody> {
             // for the wave-2 abort bound (wave-1 UpstreamHttp ignores the size).
             // The hint is the inbound token itself, never derived from the hash,
             // so byte-identity survives a NarHash shared across compressions.
-            // Otherwise fall back to the raw URL token - the documented cold-start
-            // degenerate (Nix skipped the narinfo GET, PRD risk 2).
-            let (key, expected_size) = match app.catalog.meta_for_token(token.as_str()) {
+            // On an in-memory miss, consult PERSISTED correlation (task-8): the
+            // narinfo disk cache derives token -> (hash, size) from cached
+            // narinfos, so a warm-on-disk-but-cold-in-memory daemon still carries
+            // the signed hash. Only when BOTH miss do we fall back to the raw URL
+            // token - the documented cold-start degenerate (PRD risk 2).
+            let correlated = app
+                .catalog
+                .meta_for_token(token.as_str())
+                .or_else(|| app.correlation.meta_for_token(token.as_str()));
+            let (key, expected_size) = match correlated {
                 Some(meta) => (
                     NarKey::SignedNarHash {
                         hash: meta.nar_hash,

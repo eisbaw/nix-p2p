@@ -13,7 +13,10 @@ use std::process::ExitCode;
 use std::sync::Arc;
 
 use daemon::cacheinfo::DEFAULT_PRIORITY;
-use daemon::{App, CacheInfo, NarCatalog, UpstreamHttp, serve};
+use daemon::{
+    App, CacheInfo, CorrelationStore, NarCatalog, NarinfoDiskCache, NarinfoSource, NullCorrelation,
+    SystemClock, UpstreamHttp, serve,
+};
 use tokio::net::TcpListener;
 
 /// Human- and machine-readable identity of this build.
@@ -30,6 +33,12 @@ struct Config {
     store_dir: String,
     priority: u32,
     want_mass_query: bool,
+    /// Directory for the persistent narinfo disk cache (task-8). When unset the
+    /// daemon runs pure-upstream (pre-task-8 behaviour); when set it layers
+    /// disk-cache-over-upstream and persists the NAR correlation across restarts.
+    /// Opt-in in wave 1 so enabling it in the container/NixOS paths is a separate,
+    /// reviewable change (filed: wire a default cache dir into the module + e2e).
+    narinfo_cache_dir: Option<String>,
 }
 
 impl Default for Config {
@@ -41,6 +50,7 @@ impl Default for Config {
             store_dir: "/nix/store".to_string(),
             priority: DEFAULT_PRIORITY,
             want_mass_query: true,
+            narinfo_cache_dir: None,
         }
     }
 }
@@ -62,6 +72,7 @@ impl Config {
                         .map_err(|e| format!("bad --listen {raw:?}: {e}"))?;
                 }
                 "--upstream" => config.upstream = value()?,
+                "--narinfo-cache-dir" => config.narinfo_cache_dir = Some(value()?),
                 "--store-dir" => config.store_dir = value()?,
                 "--priority" => {
                     let raw = value()?;
@@ -116,12 +127,34 @@ async fn main() -> ExitCode {
         }
     };
 
+    // Layer the persistent narinfo cache over the upstream when a cache dir is
+    // configured (task-8). The SAME instance is the narinfo source AND the
+    // persistent correlation store, so a warm-on-disk daemon dispatches the
+    // signed NarHash even after an in-memory-cold restart.
+    let (narinfo, correlation): (Arc<dyn NarinfoSource>, Arc<dyn CorrelationStore>) = match &config
+        .narinfo_cache_dir
+    {
+        Some(dir) => match NarinfoDiskCache::new(dir, upstream.clone(), Arc::new(SystemClock)) {
+            Ok(cache) => {
+                let cache = Arc::new(cache);
+                println!("daemon: narinfo disk cache at {dir}");
+                (cache.clone(), cache)
+            }
+            Err(err) => {
+                eprintln!("daemon: cannot open narinfo cache dir {dir:?}: {err}");
+                return ExitCode::FAILURE;
+            }
+        },
+        None => (upstream.clone(), Arc::new(NullCorrelation)),
+    };
+
     let app = Arc::new(App {
-        narinfo: upstream.clone(),
+        narinfo,
         nar: upstream.clone(),
         passthrough: upstream.clone(),
         cache_info: config.cache_info(),
         catalog,
+        correlation,
     });
 
     let listener = match TcpListener::bind(config.listen).await {

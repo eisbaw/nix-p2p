@@ -22,7 +22,8 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 
 use daemon::{
-    App, CacheInfo, NarCatalog, NarSource, NarinfoSource, RawUpstream, UpstreamHttp, serve,
+    App, CacheInfo, NarCatalog, NarSource, NarinfoSource, NullCorrelation, RawUpstream,
+    UpstreamHttp, serve,
 };
 use flate2::Compression;
 use flate2::read::{GzDecoder, GzEncoder};
@@ -247,6 +248,10 @@ pub fn app_from_upstream(
         passthrough: upstream as Arc<dyn RawUpstream>,
         cache_info,
         catalog,
+        // No persistent narinfo cache in the plain-upstream harness: a NAR
+        // request that misses the in-memory catalog takes the UpstreamPath
+        // fallback, exactly as before task-8.
+        correlation: Arc::new(NullCorrelation),
     })
 }
 
