@@ -4,7 +4,7 @@ title: 'E2E harness v1: podman-pod topology + scripted scenarios'
 status: Done
 assignee: []
 created_date: '2026-08-07 21:55'
-updated_date: '2026-08-08 09:45'
+updated_date: '2026-08-08 09:50'
 labels: []
 dependencies:
   - TASK-3
@@ -113,4 +113,6 @@ HONEST LIMITS / follow-ups:
 - 404-fidelity uses a synthesized absent store path (guaranteed 404) paired with a present sibling; "build proceeds" is read behaviorally as "the sibling still substitutes + substituter not marked failed", since a bare store path has no derivation to build. Documented in the scenario.
 
 NEEDS DEEP REVIEW? New container trust surface (the client image + nix.conf topology + the AC#5 key-exclusion assertion). Flagging for the orchestrator's tiered gate: the AC#5 assertion and the daemon-enforcement proof are the security-load-bearing parts.
+
+UPDATE (cd0d49e): added an 8th scenario, corrupt-nar (testproxy corrupt_nar fault through the chain: build fails, path not imported, proxy emitted the fault). Suite is now 8 scenarios / 44 checks, ~104s, green. This is the literal 'Corrupt-NAR scenario' of AC#3/TESTING.md, complementing tamper-narhash (narinfo-level content tamper).
 <!-- SECTION:NOTES:END -->
