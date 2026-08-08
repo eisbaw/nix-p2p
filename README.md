@@ -102,3 +102,7 @@ just journey    # J1 operator journey
   `fig-arch-2` (test harness), `fig-arch-3` (wave-2 target, planned).
   The `fig-candidate-*` originals predate the settled design and are stale
   until task-17 revises them.
+
+## License
+
+MIT — see `LICENSE`.
