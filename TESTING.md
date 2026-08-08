@@ -263,13 +263,18 @@ holds the design rationale; regeneration and the change procedure live there.
 **`WantMassQuery: 1`** explicitly (a `file://` store writes `StoreDir`
 alone, and the omitted fields would silently become client defaults).
 
-Two limits on what the fixture gate proves, stated so a green line is
-not over-read:
+Three limits on what the fixture gate proves, stated so a green line
+is not over-read:
 
-- **Determinism is repeatability, not reproducibility.** `just test`
-  regenerates back-to-back on one host with one `flake.lock` and
-  diffs. Byte-stability across machines or nixpkgs revisions is not
-  verified anywhere; the lock file is the instrument for that case.
+- **`just test` proves EXPORT repeatability, not build determinism.**
+  Regeneration finds the payloads already realised in the store, so it
+  re-serialises, recompresses and re-signs them — it never rebuilds.
+  A payload that built nondeterministically would be realised once and
+  pass forever. **`just fixtures-verify-rebuild`** (`nix build
+  --rebuild`) is what covers that, and it is a **required step before
+  the J2 baseline is recorded**. Neither proves byte-stability across
+  machines or nixpkgs revisions; the lock file is the instrument for
+  that case.
 - **Enforcement is proven in Nix's direct store mode only.** The gate
   drives the `nix` CLI, where `trusted-public-keys` is client-side.
   A real `nix-daemon` ignores that setting for a non-trusted user and

@@ -12,7 +12,7 @@ Tracked (the definition):
 |---|---|
 | `WORKLOAD_VERSION` | The workload's identity. Quoted by `flake.nix`, embedded in every payload, and asserted to appear in `TESTING.md`. |
 | `workload.nix` | The payload derivations. Exposed as `packages.fixture-<name>`. |
-| `workload.lock.json` | Store path, NarHash and FileHash of every payload. The generated tree is gitignored, so this is the only committed record of what the frozen workload *is* — and the only thing that notices when a `flake.lock` bump changes it. |
+| `workload.lock.json` | Store path, NarHash, FileHash and **tier** of every payload. The generated tree is gitignored, so this is the only committed record of what the frozen workload *is*; it is also what makes the gate fail-closed (a tier must contain exactly its pinned payload set) and the only thing that notices when a `flake.lock` bump changes the workload. |
 
 Generated, gitignored (`fixtures/out/`, created by `just fixtures`):
 
@@ -31,12 +31,13 @@ nix develop -c just fixtures-large  # full tier + gate, incl. the 110 MiB payloa
 nix develop -c just fixtures-serve  # serve it on 127.0.0.1:8080
 ```
 
-Regeneration is byte-stable: payload bytes come from a seeded XOF, Nix
-canonicalises metadata on store entry, and the compressors are the pinned
-`nix` from `flake.lock` (`NIX_P2P_NIX`). `just test` proves it by regenerating
-into a scratch directory and diffing — which establishes *repeatability* on
-one host, not reproducibility across hosts or nixpkgs revisions. Nothing
-verifies the latter; `workload.lock.json` is what fails loudly when it breaks.
+Three different determinism claims, kept apart on purpose:
+
+| Claim | Proven by | Notes |
+|---|---|---|
+| **Export** is repeatable | `just test` (regenerate into a scratch tree, diff) | Only re-serialises/recompresses/re-signs paths already in the store — it never rebuilds |
+| **Builds** are deterministic | `just fixtures-verify-rebuild` (`nix build --rebuild`) | Slow. **Required before the J2 baseline is recorded** — otherwise the frozen workload rests on whichever bytes happened to be realised first |
+| Cross-host / cross-nixpkgs | *nothing* | Not verified, not claimed. `workload.lock.json` is what fails loudly when the workload moves |
 
 Generation reuses an existing tree when it already matches the lock at the
 requested tier, so `just test` will not delete a full tier you just built.
@@ -71,9 +72,17 @@ being valid. So does bumping `flake.lock`: a new stdenv gives every payload a
 new store path and NarHash while `WORKLOAD_VERSION` sits still, which is
 exactly what `workload.lock.json` exists to catch.
 
-Either way:
+Either way, **this retires the J2 measurement baseline**: every number recorded
+against the old workload becomes incomparable. The procedure exists so that
+cost is paid deliberately rather than discovered later.
 
 1. Bump `WORKLOAD_VERSION`.
 2. `nix develop -c sh -c '"$NIX_P2P_PYTHON/bin/python3" scripts/gen-fixtures.py --large --write-lock'`
 3. Update the `TESTING.md` section — the gate fails until you do.
-4. Treat the existing measurement baseline as retired, and say so where it is quoted.
+4. Mark the existing measurement baseline retired wherever it is quoted.
+5. `nix develop -c just fixtures-verify-rebuild` before any new baseline is recorded.
+
+Rewriting the lock **without** bumping the version is refused: it would rebind
+a version string that measurements already cite, so old and new numbers would
+look comparable and would not be. `--retire-baseline` overrides that, and its
+name is the whole warning.

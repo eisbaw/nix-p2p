@@ -91,51 +91,6 @@ def pinned_nix() -> str:
     return str(binary)
 
 
-def guard_no_rust_fixture_dependency(repo: Path) -> None:
-    """Refuse to let a Rust test depend on this fixture tree.
-
-    flake.nix builds from a cleaned, git-tracked source and the fixture is
-    generated and gitignored, so it is never inside a Nix build sandbox. This
-    is a TRADEOFF, not a forced consequence, and it is worth stating as one: a
-    Rust test could read the tree and `panic!` when it is absent, which fails
-    `nix build .#testproxy` loudly rather than vacuously. The cost of that is a
-    carve-out - a feature gate, or `doCheck = false` for one crate - and wave 1
-    does not need the machinery. So the policy is: fixture-dependent assertions
-    live in scripts/. It resolves the codex finding on task-1 without widening
-    the source filter, which could not have worked anyway (a generated tree
-    cannot be added to a git-tracked filter).
-
-    This is a grep, so it is a speed bump rather than an invariant: `env!()`, a
-    const or string concatenation all evade it. It catches the accident, not
-    the determined. Lifting it needs a deliberate, reviewable diff here - same
-    discipline as the empty ALLOWLIST in check-independence.py.
-    """
-    skip = {"target", ".git", "fixtures"}
-    sources = sorted(
-        p for p in repo.rglob("*.rs") if not skip & set(p.relative_to(repo).parts)
-    )
-    offenders = []
-    for source in sources:
-        try:
-            text = source.read_text()
-        except UnicodeDecodeError:
-            fail(f"{source.relative_to(repo)} is not UTF-8; cannot scan it")
-        if "fixtures/out" in text:
-            offenders.append(str(source.relative_to(repo)))
-    if offenders:
-        fail(
-            "Rust sources reference the generated fixture tree: "
-            + ", ".join(offenders)
-            + "\nFixture-dependent assertions must live in scripts/ (see this "
-            "function's docstring) or they go vacuously green under `nix build`."
-        )
-    if not sources:
-        # A guard that scanned nothing reporting "ok" is the exact shape of a
-        # vacuous pass this repository exists to refuse.
-        fail("scanned zero .rs files - the guard is not looking where the code is")
-    ok(f"no Rust source depends on the generated fixture tree ({len(sources)} scanned)")
-
-
 def load_manifest(out_dir: Path) -> dict:
     manifest = out_dir / "manifest.json"
     if not manifest.is_file():
@@ -169,54 +124,53 @@ def check_workload_version_documented(repo: Path, manifest: dict) -> None:
     ok(f"TESTING.md records workload version {version}")
 
 
-def check_matches_lock(repo: Path, manifest: dict) -> None:
-    """The generated tree must match the committed lock, field for field.
+def check_matches_lock(repo: Path, out_dir: Path, manifest: dict) -> None:
+    """The tree must BE the pinned workload for its tier - metadata and bytes.
 
     WORKLOAD_VERSION alone cannot catch the drift that matters most: bumping
-    flake.lock changes stdenv, which changes every derivation, which changes
-    every store path and NarHash - while the version string sits still and the
-    J2 baseline silently stops describing the workload it was measured
-    against. The lock turns that into a failure with a name.
+    flake.lock changes stdenv, hence every derivation, hence every store path
+    and NarHash - while the version string sits still and the J2 baseline
+    silently stops describing the workload it was measured against.
 
-    `nix-p2p-fixture-app` is worth watching in particular: its content embeds
-    the store path of `nix-p2p-fixture-lib`, so a change in one propagates.
+    Two things this deliberately does NOT do, both because they failed open in
+    review. It does not accept a subset ("3 of 4 pinned payloads" used to be a
+    printed note, so deleting a payload from manifest.json still exited 0); the
+    tier's required set is checked for EQUALITY. And it does not stop at
+    metadata: the NAR blobs are re-hashed, because a manifest and a lock agree
+    perfectly about a file that has been deleted, which is how a missing
+    110 MiB payload passed under --skip-determinism.
     """
-    lock = json.loads((repo / "fixtures" / "workload.lock.json").read_text())
-    if lock["workload_version"] != manifest["workload_version"]:
-        fail(
-            f"lock pins workload {lock['workload_version']!r} but the fixture is "
-            f"{manifest['workload_version']!r}"
-        )
-    if lock["public_key"] != manifest["public_key"]:
-        fail(f"lock pins public key {lock['public_key']} != {manifest['public_key']}")
-    for entry in manifest["paths"]:
-        pinned = lock["paths"].get(entry["attr"])
-        if pinned is None:
-            fail(f"payload {entry['attr']!r} is not in fixtures/workload.lock.json")
-        for key in ("store_path", "compression", "nar_hash", "file_hash"):
-            if pinned[key] != entry[key]:
-                fail(
-                    f"payload {entry['attr']!r}: {key} is {entry[key]!r} but the lock "
-                    f"pins {pinned[key]!r}.\nThe frozen workload changed - most "
-                    "likely flake.lock moved. If that is intended, bump "
-                    "fixtures/WORKLOAD_VERSION, rerun "
-                    "`gen-fixtures.py --large --write-lock`, update TESTING.md, "
-                    "and treat the existing measurement baseline as retired."
-                )
-    missing = sorted(set(lock["paths"]) - {e["attr"] for e in manifest["paths"]})
-    ok(
-        f"matches fixtures/workload.lock.json ({len(manifest['paths'])} of "
-        f"{len(lock['paths'])} pinned payloads)"
+    lock = fx.load_lock(repo)
+    problems = fx.lock_problems(manifest, lock) + fx.blob_problems(
+        out_dir / "cache", manifest
     )
-    if missing:
-        # Said as its own line, not buried in the ok() above: the pinned
-        # hashes of these payloads were checked by NOTHING in this run, and a
-        # regression confined to them would pass unnoticed. `just
-        # fixtures-large` is the recipe that covers them.
+    if problems:
+        fail(
+            "the fixture is NOT the workload pinned in "
+            "fixtures/workload.lock.json:\n  - "
+            + "\n  - ".join(problems)
+            + "\n\nIf the tree is merely incomplete, regenerate it "
+            "(`just fixtures` / `just fixtures-large`). If the pinned workload "
+            "itself is meant to change, note that doing so RETIRES the J2 "
+            "measurement baseline: bump fixtures/WORKLOAD_VERSION, run "
+            "`gen-fixtures.py --large --write-lock`, update the TESTING.md "
+            "fixture section, and mark the old baseline retired where it is quoted."
+        )
+    tier = manifest["tier"]
+    ok(
+        f"is the pinned workload for tier={tier}: "
+        f"{len(manifest['paths'])} payload(s), metadata and NAR bytes verified "
+        f"against fixtures/workload.lock.json"
+    )
+    if tier != fx.TIER_FULL:
+        # Not a failure - the fast tier is a legitimate thing to run - but said
+        # as its own line rather than buried in an ok(), because the payloads
+        # outside this tier were checked by NOTHING in this run.
+        outside = sorted(set(lock["paths"]) - fx.expected_attrs(lock, tier))
         print(
-            "check-fixtures: NOT VERIFIED in this tier - "
-            + ", ".join(missing)
-            + " (run `just fixtures-large` to gate the full workload)",
+            f"check-fixtures: PARTIAL - tier={tier} does not cover "
+            + ", ".join(outside)
+            + "; run `just fixtures-large` to gate the full workload",
             flush=True,
         )
 
@@ -394,16 +348,24 @@ def run_bites(out_dir: Path, manifest: dict, public_line: str) -> None:
     with tempfile.TemporaryDirectory(prefix="nix-p2p-bites-") as tmp:
         root = Path(tmp)
 
+        # The positive control covers EVERY payload in the tier, not just the
+        # bite target. Importing only app+lib left zstd decompression and the
+        # 110 MiB NAR never once handled by a real client: a corrupt zstd frame
+        # or an unreadable large blob would have sailed through every check
+        # here while breaking the first scenario that actually used them.
         pristine = root / "pristine"
-        minimal_cache(src_cache, pristine, manifest, needed)
+        minimal_cache(src_cache, pristine, manifest, sorted(by_attr))
         with fx.static_server(pristine) as base_url:
             check_cache_info(base_url, manifest)
-            expect_accept(
-                base_url,
-                target["store_path"],
-                public_line,
-                "untampered narinfo copies with only the test key trusted",
-            )
+            for attr in sorted(by_attr):
+                entry = by_attr[attr]
+                expect_accept(
+                    base_url,
+                    entry["store_path"],
+                    public_line,
+                    f"{attr} ({entry['compression']}, {entry['file_size']} B on the "
+                    "wire) imports with only the test key trusted",
+                )
 
         # Bite 1: the signature bytes are corrupted.
         corrupt = root / "corrupt-sig"
@@ -482,14 +444,25 @@ def tree_digest(root: Path) -> dict[str, str]:
 
 
 def check_determinism(out_dir: Path, manifest: dict) -> None:
-    """AC#1: regenerating the same workload yields a byte-identical tree.
+    """Regenerating the same workload yields a byte-identical tree.
 
-    Scope, stated so nobody reads more into a green line than it earned: this
-    is REPEATABILITY - same host, same nix, same flake.lock, minutes apart. It
-    does not prove reproducibility across machines or across nixpkgs
-    revisions, and nothing in the fast tier could. The instrument for that case
-    is fixtures/workload.lock.json, which fails when the workload moves for
-    any reason including a flake.lock bump.
+    Be exact about what this earns, because the obvious reading is wrong.
+    Regeneration re-EXPORTS store paths that are already realised: `nix build`
+    finds them in the store and returns them without building anything. So
+    what is proven is that EXPORT is repeatable - NAR serialisation,
+    compression, signing and manifest writing - on one host with one
+    flake.lock, minutes apart. It says nothing about whether the DERIVATIONS
+    build deterministically: a payload that produced different bytes on every
+    build would be realised once and then pass this check forever.
+
+    Build determinism is a separate question with a separate check,
+    `just fixtures-verify-rebuild` (nix build --rebuild, which rebuilds and
+    compares against the realised output). It is slow, so it is not in the
+    fast loop - and it is a REQUIRED step before the J2 baseline is recorded,
+    noted on task-9 and task-12.
+
+    Neither check proves reproducibility across machines or nixpkgs revisions.
+    fixtures/workload.lock.json is the instrument for that case.
     """
     with tempfile.TemporaryDirectory(prefix="nix-p2p-determinism-") as tmp:
         replica = Path(tmp) / "out"
@@ -524,9 +497,10 @@ def check_determinism(out_dir: Path, manifest: dict) -> None:
                 "against it can be compared across waves."
             )
     ok(
-        f"regeneration byte-stable across {len(original)} files "
-        f"(tier={manifest['tier']}; same host and flake.lock - repeatability, "
-        "not cross-host reproducibility)"
+        f"EXPORT repeatable across {len(original)} files (tier={manifest['tier']}): "
+        "re-serialising, recompressing and re-signing already-realised store "
+        "paths is byte-identical. Build determinism is NOT covered here - see "
+        "`just fixtures-verify-rebuild`"
     )
 
 
@@ -541,30 +515,35 @@ def main() -> int:
     parser.add_argument(
         "--skip-determinism",
         action="store_true",
-        help="skip the regenerate-and-diff check (it regenerates the whole "
-        "workload, including the 110 MiB payload when the tier is full)",
+        help="skip the regenerate-and-diff check. The verdict then prints "
+        "PARTIAL: blob presence and hashes are still verified (that check is "
+        "not optional), but repeatability is not",
     )
     parser.add_argument(
-        "--source-guard",
-        action="store_true",
-        help="run only the Rust-source policy guard and exit; it needs no "
-        "fixture tree, so `just lint` runs it alongside the other source guards",
+        "--require-tier",
+        choices=fx.TIERS,
+        help="fail unless the tree is at least this tier. `just fixtures-large` "
+        "passes full, so it cannot silently pass by verifying a fast tree",
     )
     args = parser.parse_args()
 
     repo = fx.repo_root()
     out_dir = args.out.resolve()
 
-    guard_no_rust_fixture_dependency(repo)
-    if args.source_guard:
-        return 0
     manifest = load_manifest(out_dir)
     print(
         f"check-fixtures: verifying {manifest['workload_version']} "
         f"tier={manifest['tier']} paths={len(manifest['paths'])}"
     )
+    if args.require_tier == fx.TIER_FULL and manifest["tier"] != fx.TIER_FULL:
+        fail(
+            f"--require-tier full, but the tree at {out_dir} is tier "
+            f"{manifest['tier']!r}. Regenerate with `just fixtures-large`; "
+            "verifying a fast tree here would report the full workload green "
+            "without ever touching the 110 MiB payload."
+        )
     check_workload_version_documented(repo, manifest)
-    check_matches_lock(repo, manifest)
+    check_matches_lock(repo, out_dir, manifest)
 
     # The key is not re-derived here: check_matches_lock already tied the
     # manifest to the committed pin, and re-deriving it from the same seed
@@ -572,7 +551,14 @@ def main() -> int:
     public_line = manifest["public_key"]
     check_trusted_keys_exactly_test_key(public_line)
     run_bites(out_dir, manifest, public_line)
-    if not args.skip_determinism:
+    if args.skip_determinism:
+        print(
+            "check-fixtures: PARTIAL - repeatability NOT checked "
+            "(--skip-determinism); this run does not license any claim that "
+            "regeneration is byte-stable",
+            flush=True,
+        )
+    else:
         check_determinism(out_dir, manifest)
     return 0
 

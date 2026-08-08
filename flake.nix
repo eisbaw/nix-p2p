@@ -135,6 +135,18 @@
           touch $out
         '';
 
+        # Runs here as well as in `just lint`, because it is a check on SOURCE
+        # and needs no generated fixture - so there is no reason for it to be
+        # reachable only from a developer's local loop. Plain python3: the
+        # guard deliberately has no third-party dependency so it can live in
+        # both places. `src` is the cleaned cargo source, which is exactly the
+        # set of *.rs files a nix build would compile.
+        source-guard = pkgs.runCommand "check-source-guard"
+          { nativeBuildInputs = [ pkgs.python3 ]; } ''
+          python3 ${./scripts/check-source-guard.py} ${src}
+          touch $out
+        '';
+
         # Same script `just independence` runs - one implementation, two entry
         # points. Living only in the Justfile would let a shared crate fail the
         # local gate and sail through CI.

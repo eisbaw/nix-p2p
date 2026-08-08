@@ -8,14 +8,20 @@ in-process server the gate uses). Nothing here knows about the daemon or the
 testproxy; task-2's caching and fault-injection logic is not this file's
 business.
 
-Determinism (the point of the `irreversible` label on task-3): payload bytes
-come from a seeded XOF, Nix canonicalises metadata on store entry, and the
-compressors are the ones in the pinned `nix` from flake.lock. Scope that claim
-honestly - what is verified is REPEATABILITY: back-to-back regeneration on one
-machine with one flake.lock is byte-identical. Reproducibility across hosts and
-across nixpkgs revisions is NOT verified and is not claimed;
-fixtures/workload.lock.json is the instrument for that case, because it fails
-loudly when the workload moves.
+Determinism is the point of the `irreversible` label on task-3, so be exact
+about which of three different claims each check earns:
+
+  * EXPORT repeatability - re-serialising, recompressing and re-signing
+    already-realised store paths gives identical bytes. `just test` proves
+    this by regenerating and diffing.
+  * BUILD determinism - the derivations themselves produce the same output
+    twice. NOT covered above: regeneration finds the payloads already in the
+    store and never rebuilds them, so a nondeterministic payload would be
+    realised once and pass forever. `just fixtures-verify-rebuild` covers it,
+    and is required before the J2 baseline is recorded.
+  * Cross-host / cross-nixpkgs reproducibility - NOT verified anywhere, and
+    not claimed. fixtures/workload.lock.json is the instrument for that case:
+    it fails loudly when the workload moves for any reason.
 
 Every assertion below is fatal rather than a warning, because a fixture that
 is subtly wrong is worse than no fixture: the J2 egress baseline is frozen
@@ -36,11 +42,13 @@ Exit codes: 0 generated, 1 an assertion about the produced fixture failed,
 from __future__ import annotations
 
 import argparse
+import fcntl
 import json
 import os
 import shutil
 import subprocess
 import sys
+from contextlib import contextmanager
 from pathlib import Path
 
 import fixturelib as fx
@@ -63,6 +71,11 @@ FAST_PLAN = [
 LARGE_PLAN = [
     ("big", "none"),
 ]
+
+
+def plan_for(include_large: bool):
+    return FAST_PLAN + (LARGE_PLAN if include_large else [])
+
 
 # nix-cache-info values are written EXPLICITLY. A file:// store initialised by
 # Nix emits StoreDir only (verified), and both omitted fields then fall back to
@@ -123,22 +136,6 @@ def build_payload(repo: Path, attr: str) -> str:
     return out
 
 
-def assert_locally_built(store_path: str) -> None:
-    info = json.loads(nix("path-info", "--json", "--json-format", "1", store_path))
-    entry = info[store_path]
-    if entry["signatures"]:
-        fail(
-            f"{store_path} already carries signatures {entry['signatures']} - it was "
-            "substituted, not built here. Copying it would put a foreign Sig line in "
-            "the fixture and make the tamper bites pass for the wrong reason."
-        )
-    if not entry.get("ultimate"):
-        fail(
-            f"{store_path} is not marked ultimate (locally built). Refusing to sign a "
-            "path whose provenance this script cannot vouch for."
-        )
-
-
 def write_cache_info(cache: Path) -> str:
     """Write nix-cache-info before any copy, so Nix validates instead of writing it."""
     text = (
@@ -191,12 +188,68 @@ def assert_fixture_narinfo(
     return pairs
 
 
+def closure_of(store_paths) -> dict:
+    """Every path `nix copy` will actually transfer, keyed by store path.
+
+    `nix copy` copies CLOSURES, not the roots it is given. Checking provenance
+    on the roots alone would leave any unexpected closure member to be signed
+    into the fixture without ever appearing in the manifest - the same
+    two-signature hazard the root check exists to prevent, one level down. The
+    fixture's payloads are constructed to have no references outside the plan,
+    so this is expected to return exactly the roots; asserting it is what makes
+    that a fact rather than an assumption.
+    """
+    raw = nix("path-info", "--recursive", "--json", "--json-format", "1", *store_paths)
+    return json.loads(raw)
+
+
+def assert_closure_is_planned(store_paths: dict) -> None:
+    planned = set(store_paths.values())
+    closure = closure_of(sorted(planned))
+    unexpected = sorted(set(closure) - planned)
+    if unexpected:
+        fail(
+            "the closure of the planned payloads contains paths the workload does "
+            f"not describe: {unexpected}.\n`nix copy` transfers whole closures, so "
+            "these would be signed into the fixture and served without appearing in "
+            "manifest.json or the lock. Give the payload no such reference, or add "
+            "it to the plan deliberately."
+        )
+    for store_path, info in closure.items():
+        if info["signatures"]:
+            fail(
+                f"closure member {store_path} carries signatures "
+                f"{info['signatures']} - it was substituted, not built here."
+            )
+        if not info.get("ultimate"):
+            fail(f"closure member {store_path} is not marked ultimate (locally built)")
+
+
+def assert_no_unplanned_narinfos(cache: Path, store_paths: dict) -> None:
+    """The served tree must describe the planned payloads and nothing else."""
+    emitted = sorted(p.name for p in cache.glob("*.narinfo"))
+    planned = sorted(
+        f"{Path(p).name.split('-')[0]}.narinfo" for p in store_paths.values()
+    )
+    if emitted != planned:
+        fail(
+            f"the cache holds {len(emitted)} narinfo(s) but the plan has "
+            f"{len(planned)}.\nemitted: {emitted}\nplanned: {planned}\n"
+            "A narinfo nobody planned is a path the fixture serves and the "
+            "manifest does not describe."
+        )
+
+
 def build_into(
     staging: Path, repo: Path, secret_line: str, public_line: str, include_large: bool
 ):
     """Realise, sign and copy every planned payload into `staging`."""
     cache = staging / "cache"
     cache.mkdir(parents=True)
+    (staging / fx.OUT_MARKER).write_text(
+        "Generated by scripts/gen-fixtures.py. Safe to delete; it is what marks "
+        "this directory as ours, so --out cannot destroy anything else.\n"
+    )
 
     secret_key = staging / "test-key.UNSAFE-TEST-ONLY.sec"
     secret_key.write_text(secret_line + "\n")
@@ -205,12 +258,16 @@ def build_into(
 
     cache_info = write_cache_info(cache)
 
-    plan = FAST_PLAN + (LARGE_PLAN if include_large else [])
+    plan = plan_for(include_large)
     store_paths = {}
-    for attr, compression in plan:
+    for attr, _compression in plan:
         store_paths[attr] = build_payload(repo, attr)
-        assert_locally_built(store_paths[attr])
+    # Checked over the whole closure before anything is signed, not per root
+    # after each copy: the point is to know what will be transferred.
+    assert_closure_is_planned(store_paths)
+    for attr, compression in plan:
         copy_into_cache(cache, secret_key, store_paths[attr], compression)
+    assert_no_unplanned_narinfos(cache, store_paths)
 
     # Re-read every narinfo from disk AFTER the whole plan has run, and build
     # both the assertions and the manifest from those re-reads. Asserting on
@@ -291,32 +348,81 @@ def reusable(
         return False
     if manifest.get("public_key") != public_line:
         return False
-    if include_large and manifest.get("tier") != "full":
+    if include_large and manifest.get("tier") != fx.TIER_FULL:
         return False
-    lock = json.loads(lock_path(repo).read_text())
+    # Same definition of "is the pinned workload" the gate uses, including the
+    # tier's required payload set - so reuse can never keep a tree the gate
+    # would reject. Blob sizes are checked; blob hashes are not, because
+    # re-hashing 110 MiB on every `just test` would cost more than it protects
+    # (the gate hashes them, and generation is what this decides to skip).
+    lock = fx.load_lock(repo)
+    if fx.lock_problems(manifest, lock):
+        return False
     for entry in manifest.get("paths", []):
-        pinned = lock["paths"].get(entry["attr"])
-        if pinned is None:
-            return False
-        if any(
-            pinned[k] != entry[k] for k in ("store_path", "compression", "nar_hash")
-        ):
-            return False
-        # A manifest describing files that are gone is not a usable fixture.
-        if not (out_dir / "cache" / entry["url"]).is_file():
+        blob = out_dir / "cache" / entry["url"]
+        if not blob.is_file() or blob.stat().st_size != entry["file_size"]:
             return False
     return True
 
 
-def generate(out_dir: Path, include_large: bool, write_lock: bool = False) -> None:
+def assert_safe_out_dir(out_dir: Path, repo: Path) -> None:
+    """Refuse to take ownership of a directory that is not ours to destroy.
+
+    `--out` publishes by renaming the old tree aside and deleting it. Pointed
+    at a home directory or a source tree by a typo (or a stale shell variable),
+    that is unrecoverable. Anything this script created carries OUT_MARKER; a
+    non-empty directory without it is someone else's.
+    """
+    if out_dir == repo or (out_dir / ".git").exists():
+        fail(f"--out {out_dir} looks like a source tree; refusing", code=2)
+    if out_dir.exists():
+        if not out_dir.is_dir():
+            fail(f"--out {out_dir} exists and is not a directory", code=2)
+        if any(out_dir.iterdir()) and not (out_dir / fx.OUT_MARKER).exists():
+            fail(
+                f"--out {out_dir} is not empty and has no {fx.OUT_MARKER} marker, so "
+                "this script cannot show it created it. Refusing to delete it.\n"
+                "If it IS an old fixture tree from before the marker existed, "
+                f"remove it once by hand: rm -rf {out_dir}",
+                code=2,
+            )
+
+
+@contextmanager
+def publication_lock(out_dir: Path):
+    """Serialise generators publishing to the same tree.
+
+    Staging plus rename keeps a READER from seeing a half-written tree, but two
+    WRITERS still race: both stage, both rename, and the loser's rename can
+    land after the winner's while its `retired` cleanup deletes the winner's
+    bytes. Observed as a spurious "signature is not valid" during review, which
+    is exactly the kind of failure that gets blamed on the code under test.
+    """
+    out_dir.parent.mkdir(parents=True, exist_ok=True)
+    lock_file = out_dir.parent / f".{out_dir.name}.publish.lock"
+    handle = lock_file.open("w")
+    try:
+        fcntl.flock(handle, fcntl.LOCK_EX)
+        yield
+    finally:
+        handle.close()
+
+
+def generate(
+    out_dir: Path,
+    include_large: bool,
+    write_lock: bool = False,
+    retire_baseline: bool = False,
+) -> None:
     repo = fx.repo_root()
     _name, _private, secret_line, public_line = fx.keypair()
     version = read_workload_version(repo)
+    assert_safe_out_dir(out_dir, repo)
 
     # Checked against the committed lock, not against a constant living beside
     # the seed phrase: an external pin is the only kind a coordinated edit
     # cannot walk past. Skipped only while bootstrapping a new lock.
-    lock_file = lock_path(repo)
+    lock_file = fx.lock_path(repo)
     if not write_lock or lock_file.is_file():
         pinned = json.loads(lock_file.read_text())["public_key"]
         if public_line != pinned:
@@ -326,44 +432,68 @@ def generate(out_dir: Path, include_large: bool, write_lock: bool = False) -> No
                 "is now unverifiable against this one."
             )
 
-    # Built in a private staging directory and published with a rename, never
-    # written into out_dir in place. Two reasons, both observed: a run that
-    # fails halfway would otherwise leave a wiped or half-written tree that
-    # the gate then reports as a corrupt fixture, and a concurrent reader
-    # (a second `just test`, a running `just fixtures-serve`) would see the
-    # tree mid-rewrite - which surfaces as "signature is not valid" against a
-    # perfectly good fixture. Regenerating from scratch rather than
-    # incrementally is deliberate too: `nix copy` skips paths that are already
-    # present, so a tree left from an older workload would keep its narinfos.
-    if not write_lock and reusable(out_dir, repo, version, public_line, include_large):
-        print(f"gen-fixtures: {version} already present at {out_dir} - reused")
-        return
+    with publication_lock(out_dir):
+        if not write_lock and reusable(
+            out_dir, repo, version, public_line, include_large
+        ):
+            print(f"gen-fixtures: {version} already present at {out_dir} - reused")
+            return
 
-    staging = out_dir.parent / f".{out_dir.name}.staging.{os.getpid()}"
-    if staging.exists():
-        shutil.rmtree(staging)
-    try:
-        entries = build_into(staging, repo, secret_line, public_line, include_large)
-        write_manifest(staging, version, public_line, include_large, entries)
-        publish(staging, out_dir)
-    finally:
-        # A no-op on success (publish renamed it away); on any failure it
-        # keeps a half-built tree from being mistaken for a fixture later.
+        # Built in a private staging directory, VALIDATED there, and only then
+        # published with a rename. Order matters and was wrong once: publishing
+        # first meant a drifted tree replaced a good one and the process still
+        # exited 0, because the comparison against the lock happened afterwards
+        # in a different program. A tree that does not match the pin must never
+        # become the tree on disk.
+        staging = out_dir.parent / f".{out_dir.name}.staging.{os.getpid()}"
         if staging.exists():
             shutil.rmtree(staging)
-    if write_lock:
-        update_lock(repo, version, public_line, entries)
+        try:
+            entries = build_into(staging, repo, secret_line, public_line, include_large)
+            manifest = write_manifest(
+                staging, version, public_line, include_large, entries
+            )
+            if write_lock:
+                update_lock(repo, manifest, retire_baseline)
+            else:
+                assert_matches_lock(staging, repo, manifest)
+            publish(staging, out_dir)
+        finally:
+            # A no-op on success (publish renamed it away); on any failure it
+            # keeps a half-built tree from being mistaken for a fixture later.
+            if staging.exists():
+                shutil.rmtree(staging)
     tier = "full" if include_large else "fast"
     print(f"gen-fixtures: {version} tier={tier} paths={len(entries)} -> {out_dir}")
 
 
+def assert_matches_lock(staging: Path, repo: Path, manifest: dict) -> None:
+    """The staged tree must be the pinned workload, or it is not published."""
+    problems = fx.lock_problems(manifest, fx.load_lock(repo)) + fx.blob_problems(
+        staging / "cache", manifest
+    )
+    if problems:
+        fail(
+            "the tree just built is NOT the workload pinned in "
+            "fixtures/workload.lock.json, so it was discarded and the previous "
+            "tree (if any) is untouched:\n  - "
+            + "\n  - ".join(problems)
+            + "\n\nMost likely flake.lock moved. Changing the pinned workload "
+            "RETIRES the J2 measurement baseline - every number recorded against "
+            "the old workload becomes incomparable. If that is what you intend: "
+            "bump fixtures/WORKLOAD_VERSION, run `gen-fixtures.py --large "
+            "--write-lock`, update the TESTING.md fixture section, and mark the "
+            "existing baseline retired wherever it is quoted."
+        )
+
+
 def publish(staging: Path, out_dir: Path) -> None:
-    """Swap the finished tree into place, then drop the old one.
+    """Swap the validated tree into place, then drop the old one.
 
     Not atomic in the POSIX sense - two directories cannot be exchanged in one
-    call - but the window where `out_dir` does not exist is a rename rather
-    than the length of a 110 MiB copy, and a reader never sees a partly
-    written tree.
+    call - but the caller holds the publication lock, the window where
+    `out_dir` does not exist is a rename rather than the length of a 110 MiB
+    copy, and a reader never sees a partly written tree.
     """
     retired = out_dir.parent / f".{out_dir.name}.retired.{os.getpid()}"
     if out_dir.exists():
@@ -378,47 +508,100 @@ def publish(staging: Path, out_dir: Path) -> None:
         shutil.rmtree(retired)
 
 
-def lock_path(repo: Path) -> Path:
-    return repo / "fixtures" / "workload.lock.json"
+# The fields that say what a payload IS. Everything else in the lock is
+# bookkeeping that can change without retiring a measurement baseline.
+MATERIAL_KEYS = ("store_path", "compression", "nar_hash", "file_hash")
 
 
-def update_lock(repo: Path, version: str, public_line: str, entries) -> None:
+def material(entry) -> dict:
+    return {k: (entry or {}).get(k) for k in MATERIAL_KEYS}
+
+
+def update_lock(repo: Path, manifest: dict, retire_baseline: bool) -> None:
     """Rewrite the committed lock. Deliberate action, never automatic.
 
     The fixture tree is generated and gitignored, so without this file nothing
-    in the repository records what `nix-p2p-fixture-workload-v1` actually
-    denotes - and the frozen workload the J2 baseline is measured against
-    would be unreviewable. It also catches the drift that WORKLOAD_VERSION
-    alone cannot: bumping flake.lock changes stdenv, which changes every store
-    path, which silently changes the workload while the version string stays
-    put. Regenerating this file must therefore appear in a diff.
+    in the repository records what the workload version actually denotes, and
+    the frozen workload the J2 baseline is measured against would be
+    unreviewable. It also catches the drift WORKLOAD_VERSION alone cannot:
+    bumping flake.lock changes stdenv, hence every store path, while the
+    version string sits still.
+
+    That last property is only real if the version cannot be REBOUND. Writing
+    a new lock under an unchanged version silently redefines what every
+    recorded measurement was taken against - the precise failure the lock
+    exists to prevent - so it takes an explicit flag whose name says what it
+    costs.
     """
-    lock = {
-        "workload_version": version,
-        "public_key": public_line,
+    lock_file = fx.lock_path(repo)
+    new = {
+        "workload_version": manifest["workload_version"],
+        "public_key": manifest["public_key"],
         "paths": {
-            attr: {
-                "store_path": store_path,
-                "compression": compression,
-                "nar_hash": fx.field(pairs, "NarHash"),
-                "file_hash": fx.field(pairs, "FileHash"),
+            entry["attr"]: {
+                "store_path": entry["store_path"],
+                "compression": entry["compression"],
+                "nar_hash": entry["nar_hash"],
+                "file_hash": entry["file_hash"],
+                # Tier lives in the lock so the gate can demand a complete tree
+                # instead of verifying whatever it happens to find.
+                "tier": fx.TIER_FULL if entry["attr"] == "big" else fx.TIER_FAST,
             }
-            for attr, compression, store_path, pairs in entries
+            for entry in manifest["paths"]
         },
     }
-    lock_path(repo).write_text(json.dumps(lock, indent=2, sort_keys=True) + "\n")
-    print(f"gen-fixtures: rewrote {lock_path(repo)} - commit it as a reviewed diff")
+    if lock_file.is_file():
+        old = json.loads(lock_file.read_text())
+        same_version = old.get("workload_version") == new["workload_version"]
+        # Compared on MATERIAL fields only - the bytes a measurement was taken
+        # against. Adding a field to this file's schema is not a baseline
+        # event and must not demand a version bump; changing what a payload
+        # IS very much is.
+        changed = sorted(
+            attr
+            for attr in set(old.get("paths", {})) | set(new["paths"])
+            if material(old.get("paths", {}).get(attr))
+            != material(new["paths"].get(attr))
+        )
+        rebinding = bool(changed) or old.get("public_key") != new["public_key"]
+        if same_version and rebinding and not retire_baseline:
+            fail(
+                f"refusing to rebind workload version {new['workload_version']!r} to "
+                f"different bytes (changed: {changed or ['metadata']}).\n"
+                "Doing so RETIRES the J2 measurement baseline while leaving the "
+                "version string that identifies it unchanged, so old and new numbers "
+                "would look comparable and would not be.\n"
+                "Either bump fixtures/WORKLOAD_VERSION (the documented path), or pass "
+                "--retire-baseline to say deliberately that every measurement recorded "
+                "against this version is now void.",
+                code=2,
+            )
+        if same_version and rebinding:
+            print(
+                "gen-fixtures: WARNING - rebinding workload version "
+                f"{new['workload_version']!r} (changed: {changed}); every measurement "
+                "recorded against it is now RETIRED and must be marked so where it "
+                "is quoted."
+            )
+
+    # Written atomically: a lock truncated by an interrupted run would leave
+    # the repository with no valid record of the frozen workload at all.
+    temporary = lock_file.with_suffix(f".tmp.{os.getpid()}")
+    temporary.write_text(json.dumps(new, indent=2, sort_keys=True) + "\n")
+    os.replace(temporary, lock_file)
+    print(f"gen-fixtures: rewrote {lock_file} - commit it as a reviewed diff")
 
 
 def write_manifest(
     out_dir: Path, version: str, public_line: str, include_large: bool, entries
-) -> None:
+) -> dict:
     """Machine-readable description of what was generated.
 
     Consumers (the gate, task-9's measurement runs, task-5's containers) read
-    this instead of globbing the cache: the gate asserts exactly what the
-    manifest declares, so a partially generated tree fails loudly rather than
-    verifying a subset and reporting green.
+    this instead of globbing the cache. It describes the tree; it does not
+    DEFINE it - the lock does. That distinction is load-bearing: a manifest
+    that lists three payloads when the tier owes four is a red tree, not a
+    smaller workload, and fixturelib.lock_problems() is where that is decided.
     """
     manifest = {
         "workload_version": version,
@@ -451,6 +634,7 @@ def write_manifest(
     (out_dir / "manifest.json").write_text(
         json.dumps(manifest, indent=2, sort_keys=True) + "\n"
     )
+    return manifest
 
 
 def main() -> int:
@@ -474,6 +658,13 @@ def main() -> int:
         "do this only when the workload is meant to change, and bump "
         "fixtures/WORKLOAD_VERSION in the same commit",
     )
+    parser.add_argument(
+        "--retire-baseline",
+        action="store_true",
+        help="allow --write-lock to rebind the CURRENT workload version to "
+        "different bytes. Every measurement recorded against that version "
+        "becomes void; say so wherever it is quoted",
+    )
     args = parser.parse_args()
     # Validated before any work: rejecting the combination after building and
     # publishing a whole tree would waste the run and, worse, leave a fast-tier
@@ -484,7 +675,14 @@ def main() -> int:
             "would pin nothing about the fourth.",
             code=2,
         )
-    generate(args.out.resolve(), args.large, args.write_lock)
+    if args.retire_baseline and not args.write_lock:
+        fail("--retire-baseline only means anything with --write-lock", code=2)
+    # Tested BEFORE resolve(), which dereferences symlinks - checking the
+    # resolved path would have been dead code. Publishing through a symlink
+    # would replace it with a real directory and orphan whatever it pointed at.
+    if args.out.is_symlink():
+        fail(f"--out {args.out} is a symlink; refusing to publish through it", code=2)
+    generate(args.out.resolve(), args.large, args.write_lock, args.retire_baseline)
     return 0
 
 

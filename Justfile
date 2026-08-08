@@ -76,7 +76,7 @@ lint: _toolchain _python independence
     cargo fmt --all --check
     ruff check scripts
     ruff format --check scripts
-    "${NIX_P2P_PYTHON}/bin/python3" scripts/check-fixtures.py --source-guard
+    "${NIX_P2P_PYTHON}/bin/python3" scripts/check-source-guard.py
 
 # Assert daemon and testproxy stay strictly separated (PRD round 5/6).
 independence: _toolchain
@@ -101,7 +101,15 @@ fixtures: _python
 # Regenerate and verify the fixture cache including the 110 MiB payload.
 fixtures-large: _python
     "${NIX_P2P_PYTHON}/bin/python3" scripts/gen-fixtures.py --large
-    "${NIX_P2P_PYTHON}/bin/python3" scripts/check-fixtures.py
+    "${NIX_P2P_PYTHON}/bin/python3" scripts/check-fixtures.py --require-tier full
+
+# Rebuilds every payload derivation and compares against the realised output.
+# Slow by construction, so it is not in `just test` - but it is REQUIRED before
+# the J2 baseline is recorded: `just test` only proves export is repeatable,
+# which a nondeterministic payload would pass forever once realised.
+# Prove the fixture payloads BUILD deterministically, not just export so.
+fixtures-verify-rebuild: _python
+    "${NIX_P2P_PYTHON}/bin/python3" scripts/check-rebuild.py
 
 # A Nix binary cache is static files, so any file server does; the containers
 # in task-5 serve the same tree their own way.
