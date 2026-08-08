@@ -385,6 +385,89 @@ Against a sub-ms loopback gap, prefetch cannot; against a real-upstream
 gap (unmeasured), it might. Wave-2 must re-measure the gap on a real
 upstream before committing the hedge/prefetch design.
 
+### Real-upstream gap (task-35)
+
+**Recorded 2026-08-08.** The real-upstream re-measurement the caveat
+above demanded. Instrument: `scripts/measure_real_gap.py` against the
+**real `cache.nixos.org`** (no mock, no proxy in the measured path).
+
+**Methodology.** The gap is a client-side quantity, so we read `nix`'s
+own behaviour. Per closure: `nix copy --from https://cache.nixos.org
+--to <fresh temp store>` with a fresh (cold) `XDG_CACHE_HOME` forces a
+real cache miss — every narinfo and NAR is fetched over the wire.
+`nix copy`'s substitution download path is the same machinery
+`nix build` uses to pull a cache-miss closure. We parse nix's `-vvvv`
+`starting download of <URL>` lines, timestamping each at read time
+(a gap is a *difference* of two timestamps from one stream, so constant
+pipe latency cancels). Each nar URL is paired to its store path via the
+narinfo's `URL:` field (fetched once out of band — does not perturb
+timing), reproducing the loopback testproxy's exact pairing. We keep the
+**default** narinfo TTL: setting TTL=0 makes nix redundantly re-fetch
+each narinfo immediately before its NAR, collapsing the gap to one RTT
+(an artifact). Two anchors reported: `gap_first` (nar-start minus the
+**first** narinfo request for that path — the earliest signal, the
+best-case prefetch window) and `gap_last` (minus the **last** narinfo
+request — the loopback instrument's last-write-wins semantics). Here the
+two nearly coincide (each narinfo is fetched ~once per run). Definition
+of "gap" per path: request-issue time of the NAR minus request-issue
+time of that path's narinfo, at the client boundary — the lead time a
+fronting daemon would get. Network context: served from a Nordic Fastly
+edge PoP (`x-served-by: cache-bma-*`), steady-state RTT ~50–110 ms — a
+**favourable** RTT (client near a PoP); farther clients see larger gaps.
+
+**Numbers (gap_first, ms):**
+
+| Closure | paths / MiB | runs | median | p95 | min | max |
+|---|---|---|---|---|---|---|
+| `hello` | 5 / 11 | 5 | **298** | 1093 | 41 | 1127 |
+| `curl` | 21 / 21 | 1 | **1399** | 2132 | 182 | 3082 |
+
+Loopback baseline for comparison (task-12): median ~0.5 ms, max < 2 ms.
+
+**The gap is 500–5000× the loopback gap — and it is not a fixed number,
+it scales with closure NAR-download duration.** Structure is two-phase:
+nix fetches the closure's narinfos first (a short burst, ~50 ms RTT
+each, concurrent), then downloads the NARs. A path's gap is therefore
+`(time its narinfo was seen) → (time its NAR reaches the front of the
+download queue)`. Consequences, both empirically visible above:
+- **Head of the closure** (first NAR demanded): gap ≈ one narinfo-phase
+  ≈ tens–low-hundreds ms (`hello` min 41 ms, `curl` min 182 ms). A
+  1–4 s DHT resolve **cannot** be hidden here.
+- **Tail of a non-trivial closure**: gap grows with the NAR queue —
+  `curl`'s tail already reaches **3.08 s**, inside the 1–4 s DHT window
+  (3 of 21 paths in the [2000,5000) ms bucket). A bigger closure (a real
+  `nixpkgs` build is hundreds of paths / hundreds of MB) pushes tail
+  gaps to many seconds.
+
+**Implication for wave-2 (task-15) prefetch-vs-hedge design.** The
+loopback "prefetch is structurally dead" verdict was a **loopback
+artifact — do not carry it forward.** But prefetch is *not* uniformly
+viable either:
+1. **Prefetch is viable for the TAIL of large closures** — the daemon,
+   if it begins a DHT resolve on the *narinfo* request (the `gap_first`
+   signal, not the NAR request), has 1–3 s+ of lead for tail paths,
+   enough to overlap a DHT resolve.
+2. **Prefetch cannot cover the HEAD of any closure, nor small closures
+   at all** — the first few NARs (and every NAR of a `hello`-sized
+   build) are demanded within tens–hundreds of ms of their narinfo,
+   below the DHT-resolve floor. These MUST come from upstream or from a
+   **hedge** (race peer vs upstream, abort the loser) — prefetch alone
+   leaves them uncovered.
+3. Therefore **hedge must carry offload; prefetch is an optimisation on
+   top** that shrinks the hedge's redundant-fetch waste on the tail of
+   large closures. A prefetch-only design would offload ~nothing on
+   small/interactive builds and nothing on any closure's head.
+
+**Honest limits.** One machine, one CDN PoP, one moment; favourable
+Nordic RTT (~50–110 ms) — a near-lower-bound on the RTT contribution, so
+real-world gaps for distant clients are *larger*, not smaller (this
+strengthens, not weakens, the tail-prefetch case). Small closures only
+(polite to the public cache); the large-closure tail is reasoned +
+demonstrated on `curl`, not measured at nixpkgs scale. `gap_first`
+assumes the daemon triggers on the narinfo request; a daemon that only
+reacts at the NAR request gets `gap_last` ≈ one RTT and prefetch dies —
+the trigger point is a wave-2 design decision, not a given.
+
 ## Test layers
 
 1. **Unit** (product crates): trait-level tests of
