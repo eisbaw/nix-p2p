@@ -4,7 +4,7 @@ title: Mock upstream mode + signed fixture store
 status: In Progress
 assignee: []
 created_date: '2026-08-07 21:55'
-updated_date: '2026-08-08 06:11'
+updated_date: '2026-08-08 06:33'
 labels:
   - irreversible
 dependencies:
@@ -213,4 +213,20 @@ FILED ITEM (codex finding 4) RESOLVED rather than deferred, because the sweep co
 gate round 7: build/lint/fmt/test/fixtures-large/fixtures-verify-rebuild/package all exit 0; nix build .#daemon .#testproxy exit 0; nix flake check exit 0 (8 checks). cargo 2/2. Full tier: 12 ok, 4 positive controls, 3 bites, 0 PARTIAL. Determinism: two fresh roots produce the same generation name, diff -r exit 0, digests equal over 18 entries. All six round-6 repair classes still terminate. 3 concurrent generators exit 0 0 0. Lock byte-identical (a39382de8782d6f7) and served content byte-identical (13 files, 115,939,516 bytes) - unchanged since round 2.
 
 Round-8 decision (via mark-emulator, per no-questions directive): adopt design B - single atomic commit. Root cause reframed: not the lock_on_disk_is read-error fail-open (symptom) but TWO authoritative runtime sources of truth (current symlink + git-tracked workflow.lock.json) reconciled by read-back. Fix by moving the authoritative lock INTO gen-<sha>/lock.json so flipping current commits tree+lock in one os.replace; runtime derives everything from current and never opens the git-tracked file, which demotes to a review artifact reconciled only at --write-lock. Deletes all rollback logic. Escape hatch: if the refactor touches frozen bytes/signing (it must not - B relocates where the lock lives, not what it contains), STOP, fall back to design A (fix the fail-open + document the loud crash window), say so plainly. TERMINAL round: on GO task-3 closes; codex residual-class finding 4 (path-based ancestor resolution, hostile-same-uid, out of threat model) is filed to hardening, not another round.
+
+ROUND 8 (commit e6b1e3d). awaiting deep gate (round 8). DESIGN B - the owner chose redesign over patching after round 7. Root cause named by the owner: publication kept TWO authoritative runtime sources (the current symlink AND the git-tracked lock) and reconciled them in publish() to decide a rollback; the round-7 read-back was only the symptom. B deletes the reconciliation by deleting the second source.
+
+THE MOVE. The authoritative lock now lives INSIDE each generation as gen-<sha>/lock.json, written and validated at build, immutable once published. publish() is ONE os.replace of current; because the lock lives inside what current points at, that syscall commits tree+lock together. Deleted from gen-fixtures: commit_lock, lock_on_disk_is, safe_restore_current, restore_current. publish() body is 7 executable statements, none touching a lock (AST-checked). The git-tracked fixtures/workload.lock.json is DEMOTED to a review artifact: byte-identical content, read only by assert_matches_baseline (fresh-build freeze check) and prepare_baseline (--write-lock), written only at --write-lock AFTER the flip; a failure writing it is success-with-a-warning (published + baseline lags, visible in git, reconciled by re-running), never a rollback.
+
+ACCEPTANCE 1 (single runtime source), auditable: new scripts/check-lock-sources.py (in just lint AND a 9th flake check) parses the AST and proves check-fixtures.py/check-rebuild.py never call a baseline reader, publish() reads no lock at all, and only assert_matches_baseline/prepare_baseline read the git baseline. Everything runtime/gate resolves fx.load_generation_lock(current).
+
+ACCEPTANCE 2 (one committing syscall, zero rollback in publish), seam-by-seam fault injection: kill before flip -> current=gen-old (OLD-complete); kill after flip -> current=gen-new (NEW-complete); atomic replace -> NEW-complete. No seam splits (there is one authoritative object, one syscall). mid-os.replace is not a distinct seam (atomic). The --write-lock post-publish baseline write, forced to fail with fixtures/ read-only: exit 0, published, gate green, baseline unchanged, 'Nothing was rolled back.'
+
+ESCAPE HATCH not triggered: B relocates WHERE the lock lives and WHO reads it, not what it contains. embedded lock.json byte-identical to the git baseline (diff clean); generation name unchanged (gen-d2ab43402b88715a); served cache byte-identical (9 files / 115,937,013 bytes); git baseline after --write-lock still a39382de8782d6f7. The generation gains one file so the metadata-aware digest is 19 entries (was 18), equal across two fresh roots. workload.nix/seeds/signing/material hashes untouched.
+
+FREEZE DETECTION preserved, honestly split (TESTING.md + fixtures/README.md updated, 'windowless' language removed): the runtime gate proves internal consistency + tamper resistance against the embedded lock (verified: tampered nix-cache-info -> gate exit 1); the build-time freeze gate assert_matches_baseline proves a fresh build matches the git baseline read-only (verified: hand-edited baseline -> fresh build exit 1). This is a genuine separation of concerns, not a loss.
+
+DEFERRED (codex residual finding 4) filed as TASK-21 (label deferred-finding): generation resolution, retention and link flips remain path-based; exploiting needs the excluded hostile-same-uid ancestor swap. Not fixed - round 8 scope was exactly the three items.
+
+gate round 8: build/lint/fmt/test/fixtures-large/fixtures-verify-rebuild/package all exit 0; nix build .#daemon .#testproxy exit 0; nix flake check exit 0 (9 checks - lock-sources joins). cargo 2/2. Full tier: 12 ok, 4 positive controls, 3 bites, 0 PARTIAL. Determinism: two fresh roots same name, diff -r exit 0, digests equal over 19 entries. Reuse repair loop terminates; 3 concurrent generators exit 0 0 0. Lock byte-identical (a39382de8782d6f7) and served content byte-identical - unchanged since round 2.
 <!-- SECTION:NOTES:END -->

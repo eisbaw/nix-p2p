@@ -4,7 +4,7 @@ title: 'E2E harness v1: podman-pod topology + scripted scenarios'
 status: To Do
 assignee: []
 created_date: '2026-08-07 21:55'
-updated_date: '2026-08-08 05:29'
+updated_date: '2026-08-08 06:33'
 labels: []
 dependencies:
   - TASK-3
@@ -88,4 +88,6 @@ Both are confined identically and both are read by the collector, including on t
 Also relevant to bind-mounting: a generation tree is now asserted to contain ZERO symlinks (at validation and by the gate), so 'readlink -f fixtures/out/current' followed by a bind mount of that path gives you a tree in which every path is provably inside the mount. 'current' and 'previous' are symlinks precisely because they live OUTSIDE the generation - do not bind-mount the publication root and expect the links to resolve inside a container with a different path layout; mount the resolved generation.
 
 And: 'just fixtures' now applies every tree check the gate applies, so if your harness sees the gate reject a fixture, regenerating genuinely repairs it (verified for six damage classes) instead of reporting 'reused'.
+
+forward-carried from task-3 round 8 (e6b1e3d) - HOW THE HARNESS READS THE LOCK CHANGED. The authoritative fixture lock is now INSIDE each generation: fixtures/out/current/lock.json (i.e. gen-<sha>/lock.json, resolved through current). The git-tracked fixtures/workload.lock.json is DEMOTED to a review artifact and must NOT be read by the harness at runtime - it can lag a plain generate and only reconciles at --write-lock. If any container/nix.conf/assertion in your harness reads fixtures/workload.lock.json to learn the served workload, repoint it to fixtures/out/current/lock.json. Its content is byte-identical to the git baseline, so only the PATH changes. The public key you pin in trusted-public-keys is still fixtures/out/current/test-key.pub (unchanged). Bind-mount guidance unchanged: mount the resolved generation (readlink -f fixtures/out/current); it now also contains lock.json alongside cache/, manifest.json, test-key.pub - and, as before, the *.sec signing key you must never mount into a container.
 <!-- SECTION:NOTES:END -->
