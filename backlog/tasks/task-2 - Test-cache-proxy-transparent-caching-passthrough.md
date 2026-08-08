@@ -4,7 +4,7 @@ title: 'Test cache-proxy: transparent caching passthrough'
 status: To Do
 assignee: []
 created_date: '2026-08-07 21:55'
-updated_date: '2026-08-07 23:57'
+updated_date: '2026-08-08 00:29'
 labels: []
 dependencies:
   - TASK-1
@@ -38,4 +38,6 @@ forward-carried from task-3 (119cbb7): the mock upstream you cache in front of i
 HARD CONSTRAINT: no Rust source may reference fixtures/out. 'just lint' runs 'check-fixtures.py --source-guard' repo-wide over *.rs and fails on any hit. Reason: the fixture tree is generated and gitignored, so it is never inside a nix build sandbox, and 'nix build .#testproxy' runs cargo test in checkPhase - a fixture-dependent Rust test would be unrunnable there. Fixture-dependent assertions belong in scripts/. If task-2 genuinely needs one, that is a deliberate, reviewable diff to the guard plus a doCheck carve-out - not a quiet workaround.
 
 Dev shell now exports NIX_P2P_NIX (pinned nix 2.34.8) and NIX_P2P_PYTHON (python with cryptography); the Justfile '_python' recipe guards both. PYTHONDONTWRITEBYTECODE=1 keeps scripts/__pycache__ from appearing.
+
+forward-carried from task-3 round 2 (9dba842): the source guard moved to scripts/check-source-guard.py and now runs as a nix flake check as well as in 'just lint'. Needles widened: any .rs containing bare 'fixtures/' OR 'NIX_P2P_' fails. Both are unavailable inside a nix build sandbox, which is why cargo-side tests must not reach for them.
 <!-- SECTION:NOTES:END -->

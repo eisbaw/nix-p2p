@@ -4,7 +4,7 @@ title: 'E2E harness v1: podman-pod topology + scripted scenarios'
 status: To Do
 assignee: []
 created_date: '2026-08-07 21:55'
-updated_date: '2026-08-08 00:02'
+updated_date: '2026-08-08 00:29'
 labels: []
 dependencies:
   - TASK-3
@@ -41,4 +41,10 @@ Client nix.conf must use trusted-public-keys = <contents of fixtures/out/test-ke
 AC#3's re-assertion is NOT a copy-paste of scripts/check-fixtures.py. That script proves enforcement in nix's DIRECT store mode, where trusted-public-keys is client-side. A real nix-daemon IGNORES a non-trusted user's trusted-public-keys and enforces require-sigs daemon-side from /etc/nix/nix.conf. So task-5 must re-assert the SAME three tampered inputs through the DAEMON enforcement path - that is the added value, not a repeat. The three inputs and the exact nix error strings to expect: (1) corrupted Sig -> 'lacks a signature by a trusted key'; (2) valid signature by an untrusted key -> same message; (3) NarHash mutated AND re-signed with the trusted test key -> 'hash mismatch importing path'. Case 3 is the one that proves content integrity; mutating NarHash without re-signing only re-fires the signature check and proves nothing new. check-fixtures.py's minimal_cache()/tamper helpers are the reference implementation for building the tampered trees.
 
 Also: fixtures/out/manifest.json gives per-path compression/NarHash/NarSize/FileSize; nix-cache-info advertises Priority 40 / WantMassQuery 1 explicitly.
+
+forward-carried from task-3 round 2 (9dba842): use 'just fixtures-large' for harness setup - it now runs the gate with --require-tier full, so it cannot pass against a fast-tier tree missing the 110 MiB payload. Generation reuses an existing matching tree, so calling it repeatedly is cheap.
+
+Generation is now serialised with flock and publishes by rename after validating the staged tree against the lock, so a container build racing a 'just test' will not see a torn tree. If your harness points gen-fixtures at a custom --out, note it refuses any non-empty directory lacking a .nix-p2p-fixture-out marker and refuses symlinks.
+
+The source guard is now scripts/check-source-guard.py (stdlib-only) and runs BOTH in 'just lint' and as a 'source-guard' flake check. It rejects any .rs containing bare 'fixtures/' or 'NIX_P2P_' - so testproxy/daemon code cannot reach for the fixture tree or dev-shell variables even indirectly.
 <!-- SECTION:NOTES:END -->

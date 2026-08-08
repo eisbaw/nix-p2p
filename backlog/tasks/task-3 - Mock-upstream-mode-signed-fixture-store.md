@@ -4,7 +4,7 @@ title: Mock upstream mode + signed fixture store
 status: In Progress
 assignee: []
 created_date: '2026-08-07 21:55'
-updated_date: '2026-08-07 23:56'
+updated_date: '2026-08-08 00:28'
 labels:
   - irreversible
 dependencies:
@@ -61,4 +61,30 @@ HONEST LIMITS
 - Rust test suite is still 2 banner assertions; all substantive task-3 verification lives in scripts/, not cargo.
 
 Reviewed by qa-test-runner and mped-architect before commit; all blocking findings fixed (ruff format, undocumented lock, ungated full tier, unreachable --write-lock remediation text, tautological cache-info check, version substring hazard, 1-level-deep source glob, missing _python guard, late flag validation, WORKLOAD_VERSION normalisation mismatch between nix and python).
+
+NO-GO REMEDIATION ROUND (commit 9dba842). awaiting deep gate (round 2).
+
+All nine gate-breaking findings fixed; each was reproduced FAILING first, then fixed and reproduced passing (evidence in the git note on 9dba842).
+
+A. Lock verification failed open. The lock now carries a per-payload 'tier' and fixturelib.lock_problems() checks the tier's required payload set for EQUALITY as a hard fail(). The architect's exact repro (delete zstd from manifest.json) went from exit 0 with a printed note to exit 1. The old 'NOT VERIFIED in this tier' print became a PARTIAL line that appears only when the tier legitimately excludes a payload, never in place of a failure.
+B. --write-lock could rebind the same workload_version to different bytes. Now refused unless --retire-baseline is passed; comparison is on MATERIAL fields (store_path/compression/nar_hash/file_hash + public_key) so adding a schema field is not treated as a baseline event. Lock written atomically via os.replace. Every remediation string now leads with the fact that changing the workload RETIRES the J2 baseline.
+C. Publish-then-validate was backwards. The staged tree is validated against the lock BEFORE publish; on mismatch the staging tree is discarded and the previous tree is untouched (proven: manifest sha256 d2ab43402b88715a unchanged across a drifted regeneration). gen and check now share ONE definition of 'is the pinned workload'.
+D. Determinism was overclaimed. Regeneration re-exports already-realised store paths, so it proves EXPORT repeatability only; a nondeterministic payload would be realised once and pass forever. Added scripts/check-rebuild.py + 'just fixtures-verify-rebuild' (nix build --rebuild, 4/4 identical, 3s) and reworded TESTING.md, fixtures/README.md and every docstring/ok() line to name what each check actually proves. Recorded as a REQUIRED pre-J2 step on task-9 and task-12.
+E. AC#2 closure hole. nix copy transfers closures but only planned roots were provenance-checked. Now the full closure is computed via 'nix path-info --recursive' and any unplanned member is fatal, with signatures==[]/ultimate==true asserted for EVERY closure member; plus an assertion that the emitted narinfo set equals the planned set. Verified by giving a payload an outside reference: five unlisted store paths were reported fatal that would previously have been signed and served.
+F. Positive control covered app+lib only, so zstd decompression and the 110 MiB NAR were never exercised by a real client. Now every payload in the tier is imported (4 positive controls at full tier). Tamper bites stay on 'app' (the only payload with references).
+G. --skip-determinism vacuity. CHOSE the real fix over a marker: blob presence, size and SHA-256 (re-encoded to nix-base32) are verified in check_matches_lock, which is not optional. Deleting the 110 MiB nar under --skip-determinism went from exit 0 to exit 1; corrupting one byte also exits 1. ALSO added an explicit PARTIAL line when the flag is used, so both fixes are in place.
+H. Concurrency and --out safety. Publication serialised with fcntl.flock (3 concurrent generators -> exits 0 0 0, tree healthy). --out refuses any non-empty directory lacking a .nix-p2p-fixture-out ownership marker, refuses paths that look like a source tree, and refuses symlinks - the symlink test had to move BEFORE Path.resolve(), which dereferences and made the original check dead code. --require-tier full added so 'just fixtures-large' cannot pass by verifying a fast tree.
+I. SHAKE256 vs SHA-256: the code used SHA-256 for the ed25519 seed while the docstring said SHAKE256. DECIDED: correct the DOCS, do not rotate. Reasoning - SHA-256 of a fixed phrase is a perfectly good deterministic seed for a worthless test key, the derivation is unchanged and already pinned by the lock, and rotating would invalidate the lock and every generated tree to fix a comment. SHAKE256 remains correct for the payload BYTES in workload.nix, where an arbitrary output length is the point.
+J. Guard placement. The source guard moved out of check-fixtures.py into scripts/check-source-guard.py, stdlib-only so it can run in BOTH 'just lint' and a new 'source-guard' flake check (nix flake check is now 8 checks, was 7). Needles widened from the literal 'fixtures/out' to bare 'fixtures/' and 'NIX_P2P_'. It reports its scan count and exits 2 if it scanned zero files. Scope stated honestly in the script: it scans the cleaned cargo source (currently 2 .rs files) and is a substring scan, so env!()/const/concatenation still evade it.
+
+DISCLOSURE (not amended): commit 119cbb7's message quotes '115,938,947 bytes' for the two-tree determinism diff. The actual figure for that tree was 115,939,382; it is 115,939,516 now that the lock carries tier fields. All hashes matched the lock in both runs - only the byte total was stale. History left intact.
+
+FILED: TASK-19 'Standing home for the full-tier fixture gate' (deferred-finding) for the no-CI coverage gap QA raised.
+
+NEW LIMITS INTRODUCED BY THIS ROUND, stated plainly:
+- The reuse shortcut checks blob SIZE but not blob HASH (re-hashing 110 MiB on every 'just test' would cost more than it protects). The GATE hashes them; reuse only decides whether to skip generation.
+- flock serialises generators against each other; it does not stop a reader that opened a file before a publish. Staging+rename keeps the window to a rename.
+- check-rebuild proves determinism on THIS machine against THIS store's copy. Cross-machine reproducibility remains unverified by anything here.
+
+gate round 2: build/lint/fmt/test/package all exit 0; fixtures-large exit 0 (5s); fixtures-verify-rebuild exit 0 (3s, 4/4 payloads identical); nix build .#daemon .#testproxy exit 0; nix flake check exit 0 (3s, 8 checks). cargo 2 tests 2 passed. Full-tier check-fixtures: 11 ok, 4 positive controls, 3 bites, 0 PARTIAL. Two-tree determinism diff: diff -r exit 0, 13 files, 115,939,516 bytes. Stubs untouched (4x '0 scenarios registered - NOT a pass').
 <!-- SECTION:NOTES:END -->

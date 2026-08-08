@@ -4,7 +4,7 @@ title: 'Measurement: request/byte counters + egress report + gap histogram'
 status: To Do
 assignee: []
 created_date: '2026-08-07 21:56'
-updated_date: '2026-08-08 00:02'
+updated_date: '2026-08-08 00:29'
 labels:
   - irreversible
 dependencies:
@@ -43,4 +43,12 @@ Payloads are incompressible by construction (seeded SHAKE256), so xz/zstd bodies
 CAUTION for the frozen baseline: a 'nix flake update' changes stdenv, which changes every payload's store path and NarHash, which changes the workload even though WORKLOAD_VERSION would sit still. The lock file turns that into a hard gate failure. If it ever fires, the previously recorded baseline is retired, not adjusted.
 
 deep-gate finding on task-3 (architect): every measurement artifact must record workload_version + the fixture lock's public key and hashes; and one cross-host regeneration diff of the fixture tree must be performed and recorded before any J2 baseline number is quoted (repeatability is proven, cross-host reproducibility is not - the lock makes drift loud, the cross-host diff makes it checked).
+
+forward-carried from task-3 round 2 (9dba842): REQUIRED PRE-J2 STEP. Run 'nix develop -c just fixtures-verify-rebuild' and record its result before writing any measurement baseline.
+
+Why it is not optional: 'just test' regenerates the fixture and diffs it, but regeneration re-EXPORTS store paths that are already realised - nix build finds them and never rebuilds. So that check proves NAR serialisation, compression and signing are repeatable, and proves nothing about whether the payload derivations build deterministically. A payload that produced different bytes on every build would be realised once and pass 'just test' forever, and the frozen workload would rest on whichever bytes happened to land first - a baseline nobody, including its author, could reproduce. 'just fixtures-verify-rebuild' (nix build --rebuild per payload) is what closes that gap. It takes ~3s warm.
+
+Scope of what it earns: determinism on THAT machine against THAT store's copy. Cross-machine reproducibility is verified by nothing in this repository - do not let the baseline text imply otherwise.
+
+Also from this round: the lock now pins a tier per payload, and 'just fixtures-large' runs the gate with --require-tier full, so a measurement run cannot silently proceed against a fast-tier tree missing the 110 MiB payload. If you script measurement setup, call 'just fixtures-large' rather than 'just fixtures'.
 <!-- SECTION:NOTES:END -->
