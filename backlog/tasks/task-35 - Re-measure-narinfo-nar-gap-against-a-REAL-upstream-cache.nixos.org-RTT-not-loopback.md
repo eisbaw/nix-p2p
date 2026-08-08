@@ -6,12 +6,13 @@ title: >-
 status: To Do
 assignee: []
 created_date: '2026-08-08 17:30'
-updated_date: '2026-08-08 17:59'
+updated_date: '2026-08-08 20:04'
 labels:
   - finding
   - wave-2
   - measurement
 dependencies: []
+priority: high
 ---
 
 ## Description
@@ -30,4 +31,6 @@ FINDING from task-12 (J2 baseline read-out). The wave-1 narinfo->nar gap histogr
 
 <!-- SECTION:NOTES:BEGIN -->
 task-13 triage: KEEP for wave-2 - re-measuring the narinfo->nar gap against a REAL upstream RTT needs real network/TLS (task-24); the loopback gap is a wave-1 baseline. Distinct concern, feeds task-15.
+
+PRIORITIZED (owner, 2026-08-08): run this BEFORE the wave-2 hedge/prefetch design (task-15 planning). The loopback baseline showed a sub-ms narinfo->nar gap (DHT latency unmaskable by prefetch there); this validates/refutes that against real cache.nixos.org RTT. Its number is a required input to task-15's latency-hiding design.
 <!-- SECTION:NOTES:END -->

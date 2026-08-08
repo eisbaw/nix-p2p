@@ -4,7 +4,7 @@ title: 'HARDENING: concurrency soak + docs truthfulness sweep'
 status: To Do
 assignee: []
 created_date: '2026-08-07 21:56'
-updated_date: '2026-08-08 18:06'
+updated_date: '2026-08-08 20:04'
 labels:
   - hardening
 dependencies:
@@ -36,4 +36,6 @@ Forward-carry from task-13 (hardening pt1): surfaces the concurrency soak + docs
 4) Docs sweep: reconcile the new TESTING.md 'Hardening: fault x depth, header hygiene, fuzz (task-13)' section against code; the daemon now has a --header-timeout-ms flag (document in any operator/NixOS docs).
 
 Forward-carry from task-13 (VM fault re-assertion, re-deferred here with owner-visible decision): re-assert the 3 tamper narinfos AND testproxy fault modes THROUGH the systemd nix-daemon in the NixOS VM (nixos/vm-test.nix, just e2e-vm), expecting the task-5 daemon-side strings ('not signed by any of the keys in trusted-public-keys', 'hash mismatch importing path'). Reuse build_tamper_tree/build_corrupt_nar_tree; serve a key-free tamper cache from a peer node; ORACLE GOTCHA (banked): absent-before MUST use nix-VALIDITY (nix-store -q --hash fails 'not valid'), NOT test -e, because the nixos-test 9p-shared host store makes fixture files physically present on every node. Interpose testproxy for VM-level request-count/fault oracles.
+
+SEQUENCING (owner, 2026-08-08): deprioritized - owner chose to jump to wave-2 planning before finishing wave-1 hardening. task-14 (soak + docs sweep) deferred to run alongside/after wave-2 planning, not blocking. Relabeled for later.
 <!-- SECTION:NOTES:END -->
