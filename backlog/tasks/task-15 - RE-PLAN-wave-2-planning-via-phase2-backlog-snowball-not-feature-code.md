@@ -4,7 +4,7 @@ title: 'RE-PLAN: wave 2 planning via phase2-backlog-snowball (not feature code)'
 status: To Do
 assignee: []
 created_date: '2026-08-07 21:56'
-updated_date: '2026-08-08 18:05'
+updated_date: '2026-08-08 20:09'
 labels:
   - replan
 dependencies:
@@ -43,4 +43,6 @@ Forward-carry from task-13 (hardening pt1) - wave-2 p2p relevant findings:
 3) HTTP/2 + TLS gap (task-24): the daemon+testproxy are h1.1-plaintext only; fronting real cache.nixos.org or peers over TLS/h2 is unbuilt. h2-only upstream currently fails CLOSED (proven), which is safe but blocks real-upstream fronting.
 4) Unsigned-narinfo caching (task-30) blocks caching private/unsigned p2p peers - the narinfo cache requires a Sig line as its truncation signal.
 5) The seeded fuzz harness pattern (path-traversal containment + unknown-field identity) should be reused for the wave-2 claim-schema/DHT-key fuzz.
+
+WAVE-2 GOAL (owner, 2026-08-08) - drives this re-plan. See PRD 'Wave 2 scope'. Key: (1) iroh whole-NAR NarSource FIRST, BitTorrent as a 2nd pluggable transport (interface + claim schema must admit it); (2) DHT-authoritative discovery spike (mainline/BEP44/iroh-native) + gossip accelerant + no-enumeration probes, keyed on the frozen NarKey::SignedNarHash; (3) SCENARIO MODELING & PROFILING (reuse/extend task-18 S5): typical + pathological cases estimating RAM/disk/latency/throughput/speedup-over-cache, extrapolated to 1000s of peers; pathological set incl slow-peer-on-HIT, dead-holder-after-claim, DHT-timeout/cold-start, NAT-relay, thundering-herd, lying-claim, seeder-churn; (4) POLICY DERIVATION: file a policy task per decision the scenarios expose - archetype: slow-HIT -> abort-to-cache vs delayed-race/hedge vs adaptive-by-throughput. Do NOT hardcode a policy the data hasn't justified. Grounding: net-upstream-egress-v2 = speedup yardstick; task-35 real-gap = prefetch-vs-hedge input. When I invoke phase2-backlog-snowball for wave-2, design-for-test FIRST (the scenario models ARE the test grounding), then the backlog.
 <!-- SECTION:NOTES:END -->
