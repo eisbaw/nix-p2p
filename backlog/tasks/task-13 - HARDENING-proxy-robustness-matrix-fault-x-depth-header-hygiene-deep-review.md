@@ -4,7 +4,7 @@ title: 'HARDENING: proxy robustness matrix (fault x depth), header hygiene deep 
 status: In Progress
 assignee: []
 created_date: '2026-08-07 21:56'
-updated_date: '2026-08-08 19:29'
+updated_date: '2026-08-08 19:48'
 labels:
   - hardening
 dependencies:
@@ -24,8 +24,8 @@ Wave-end hardening block, part 1 - runs only against stabilized surfaces (post J
 <!-- AC:BEGIN -->
 - [x] #1 Fault x depth matrix (all 7 modes x depth 1..3) green - failures are FIXED in this task; a red row survives only by explicit owner-visible decision, never by silently filing it away (review gate removed the 'or documented' escape)
 - [x] #2 Header hygiene documented in-code and asserted (forwarded/stripped allowlist); gzip Content-Encoding leg and an HTTP/2-upstream leg exercised (harness is otherwise HTTP/1.1-only, the real cache.nixos.org leg is not)
-- [x] #3 Property/fuzz enlargement: narinfo unknown-field fuzz through the chain; path-traversal fuzz on cache keys (..%2f, non-base32, absurd lengths); ENOSPC in both cache layers degrades to passthrough, never serves a partial file
-- [x] #4 deferred-finding label is empty: every deferred finding closed here or converted to an explicit task by owner decision
+- [x] #3 deferred-finding label is empty: every deferred finding closed here or converted to an explicit task by owner decision
+- [x] #4 Property/fuzz enlargement (HONEST scope): UNIT-LEVEL narinfo unknown-field identity fuzz (rewrite+frame byte-identity + task-8 restart property; chain-level identity is NAR-NarHash via chain-s1, NOT narinfo bytes through the chain); path-traversal containment fuzz in BOTH cache layers (nix-base32 alphabet + length-32 enforced, control bytes rejected); ENOSPC fail-closed in both layers - narinfo cache -> passthrough (200 correct bytes), testproxy NAR cache -> 5xx - neither ever serves a partial/poison entry. Exhaustive HTTP-framing edge cases (whitespace Connection tokens, empty TE members, chunked+CL conflict, legacy-poisoned entries, cap-before-status) are robustness-behind-Nix-hash-gate, deferred to task-36.
 <!-- AC:END -->
 
 ## Implementation Notes
@@ -58,4 +58,6 @@ RE-GATE ROUND 2 (codex NO-GO -> fixed, re-parked). Fixed the CLASS not just the 
 #4 (real delta): matrix mode1 now asserts fault-on elapsed MINUS a per-depth fault-off baseline >= 0.6*injected (a no-op fault gives ~0 delta -> fails); wrong comment fixed. e2e confirms delta present at all depths.
 #5 (honest): dropped the chain-level narinfo-byte-identity claim - chain-s1 verifies NAR NarHash (not narinfo bytes); narinfo identity is unit-level (rewrite+frame) + task-8 restart property. TESTING.md + fuzz comment corrected.
 GATES: just lint green; workspace cargo test 17/17 green; just e2e 22/22 green (matrix 29/29 with real-delta mode1; boundary 7/7); nix build .#daemon green. 4 new re-gate daemon bites shown fail-before/pass-after (malformed-conn, chunked,chunked, not-cached, cache-layer bound) - all daemon in-process (cargo test -p daemon recompiles) + e2e image rebuilt. Re-parked In Progress awaiting re-gate.
+
+CLOSING DECISION (mark-emulator, 2026-08-08): task-13 closes with honest scope after 4 codex passes that kept finding HTTP-framing edge cases (not converging - hand-rolled HTTP is the root cause). Rationale: the daemon is OUTSIDE the trust base (Nix re-verifies sig+NarHash), so these are robustness bugs behind the hash gate (failed-build+retry, not poisoned store), and wave-1 fronts a TRUSTED upstream (no malicious-upstream smuggling in scope). Actions: (1) AC honesty fixed by orchestrator - AC#3 rewritten to tested scope (unit-level narinfo identity, two-layer ENOSPC), no checked AC overclaims; (2) 2 cheap+serious correctness fixes in a final round (chunked+CL no-truncate, error/truncated never cached 200); (3) task-36 filed = systematic HTTP-framing hardening/library-rewrite with all remaining codex edge cases as ACs; (4) remaining HTTP edge cases are deferred-by-design behind Nix's hash gate, tracked in task-36. Then build iroh.
 <!-- SECTION:NOTES:END -->
