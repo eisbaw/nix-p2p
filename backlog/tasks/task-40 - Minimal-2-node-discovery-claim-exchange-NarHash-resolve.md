@@ -4,7 +4,7 @@ title: 'Minimal 2-node discovery: claim exchange + NarHash resolve'
 status: To Do
 assignee: []
 created_date: '2026-08-08 20:12'
-updated_date: '2026-08-08 20:30'
+updated_date: '2026-08-08 23:10'
 labels: []
 dependencies:
   - TASK-37
@@ -28,4 +28,6 @@ Enough discovery for S6 (2-node), NOT the full DHT (deferred to the wave-2b spik
 
 <!-- SECTION:NOTES:BEGIN -->
 REVIEW REVISION: (1) Discovery::resolve returns the COMPLETE transport OFFER (NodeId + RawNarV1 BLAKE3 + transport tag), not merely a holder NodeId (codex#2) - iroh fetches by BLAKE3, so the NarHash->BLAKE3 mapping must be in the offer. (2) The claim PRODUCER is task-50 (availability index) - announce source is the index, not hand-waved. (3) Split discovery: DHT(NarHash-key)->candidate NodeIds [deferred to task-47 spike] THEN per-peer claim query [task-37 envelope, now]. Wave-2a uses minimal/direct discovery; do NOT bake an unversioned query wire (use task-37's envelope).
+
+FROM task-38 (commit 0d9d6e7): discovery replaces the in-memory claim map in TransportNarSource (daemon/src/transport_fetch.rs). Today announce()/claims: HashMap<canonical-NarHash-string, Claim> is the stand-in; swap it for the real index/DHT lookup (likely async). The consumer contract is fixed: discovery must yield a Claim whose content_id() is the Blake3Digest and whose .transports are the offers; fetch_via_offers() already picks offers by tag and skips unimplemented ones. Pick offers -> Transport is DONE - task-40 only needs to feed Claims. Note the key canonicalisation gotcha: keys must be canonical NarHashKey strings or lookup misses.
 <!-- SECTION:NOTES:END -->
