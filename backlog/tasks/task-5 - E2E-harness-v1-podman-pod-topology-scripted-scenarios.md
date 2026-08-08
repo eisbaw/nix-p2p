@@ -4,7 +4,7 @@ title: 'E2E harness v1: podman-pod topology + scripted scenarios'
 status: To Do
 assignee: []
 created_date: '2026-08-07 21:55'
-updated_date: '2026-08-08 06:33'
+updated_date: '2026-08-08 07:34'
 labels: []
 dependencies:
   - TASK-3
@@ -90,4 +90,6 @@ Also relevant to bind-mounting: a generation tree is now asserted to contain ZER
 And: 'just fixtures' now applies every tree check the gate applies, so if your harness sees the gate reject a fixture, regenerating genuinely repairs it (verified for six damage classes) instead of reporting 'reused'.
 
 forward-carried from task-3 round 8 (e6b1e3d) - HOW THE HARNESS READS THE LOCK CHANGED. The authoritative fixture lock is now INSIDE each generation: fixtures/out/current/lock.json (i.e. gen-<sha>/lock.json, resolved through current). The git-tracked fixtures/workload.lock.json is DEMOTED to a review artifact and must NOT be read by the harness at runtime - it can lag a plain generate and only reconciles at --write-lock. If any container/nix.conf/assertion in your harness reads fixtures/workload.lock.json to learn the served workload, repoint it to fixtures/out/current/lock.json. Its content is byte-identical to the git baseline, so only the PATH changes. The public key you pin in trusted-public-keys is still fixtures/out/current/test-key.pub (unchanged). Bind-mount guidance unchanged: mount the resolved generation (readlink -f fixtures/out/current); it now also contains lock.json alongside cache/, manifest.json, test-key.pub - and, as before, the *.sec signing key you must never mount into a container.
+
+forward-carried from task-2: drive testproxy via binary flags --listen ADDR --upstream URL --cache-dir PATH. Admin surface (not logged as cache traffic): GET /__testproxy/stats and /__testproxy/log (JSON), POST /__testproxy/reset (clears log+gaps, NOT the disk cache), POST /__testproxy/faults?PARAMS, POST /__testproxy/faults/clear. Fault params: latency_{cache_info,narinfo,nar}_ms=N; http_error=CODE[&http_error_kind=KIND]; connection_reset=all|KIND; truncate_pct=N; corrupt_nar=1; wrong_narinfo=1; unreachable=1 (unknown param -> 400). ORACLE PAIRING for a '0 upstream' scenario: POST /reset, run the repeat, then assert stats upstream_total==0 AND received_total>0 (counters are derived from the log; /reset zeroes them). Per-nar gap_ms gives the narinfo->nar gap oracle. Faults are egress-only so the disk cache stays byte-correct; corrupt-NAR still makes the CLIENT see a hash-failing body (the corrupt-NAR e2e bite).
 <!-- SECTION:NOTES:END -->

@@ -46,6 +46,7 @@ import json
 import subprocess
 import sys
 import tempfile
+import tomllib
 from collections import deque
 from pathlib import Path
 
@@ -54,6 +55,45 @@ SEPARATED = ("daemon", "testproxy")
 
 # Workspace-local crates both components may legally share. Empty on purpose.
 ALLOWLIST: frozenset[str] = frozenset()
+
+# HTTP-stack denylist (PRD round 5: "no shared proxy or HTTP logic"; the fixture
+# must stay an independent witness of wire behaviour). The manifest check above
+# only forbids a shared WORKSPACE crate; it cannot see the other real hazard,
+# which round 5 names explicitly - daemon and testproxy independently reaching
+# for the SAME third-party HTTP stack. This set is the mechanical guard against
+# that convergence: no crate here may be reachable by BOTH components at once.
+#
+# Scope is deliberate. Only client/server HTTP *logic* crates are listed -
+# pure-data crates (`http`, `bytes`, `url`) are the low-level sharing round 5
+# permits and are NOT here. testproxy (task-2) is std-only, so it shares nothing
+# today; task-4's daemon will pick one of these, which stays legal until the day
+# a testproxy change reaches for the same crate - at which point this gate bites.
+# Add a crate here when either component adopts it.
+HTTP_STACK_CRATES: frozenset[str] = frozenset(
+    {
+        # server / framework
+        "tiny_http",
+        "tiny-http",
+        "axum",
+        "axum-core",
+        "actix-web",
+        "warp",
+        "rocket",
+        "hyper",
+        "hyper-util",
+        "h2",
+        # client
+        "ureq",
+        "reqwest",
+        "isahc",
+        "curl",
+        "attohttpc",
+        # tower middleware stack
+        "tower",
+        "tower-http",
+        "tower-service",
+    }
+)
 
 EXIT_OK = 0
 EXIT_VIOLATION = 1
@@ -156,6 +196,100 @@ def find_violations(
         f"{left} and {right} share crate {crate}" for crate in sorted(shared)
     ]
     return violations
+
+
+def graph_from_lock(cargo_lock: Path) -> dict[str, set[str]]:
+    """Build a name -> {dependency names} graph from a Cargo.lock.
+
+    The RESOLVED graph is what the HTTP-stack check needs: it must see
+    third-party crates (which the `--no-deps` manifest graph deliberately does
+    not), and transitively - `axum` pulling `hyper` pulling `h2` must all be
+    reachable from `daemon`. Cargo.lock lists every resolved package with its
+    dependency names, needs no network, and is part of the flake source, so this
+    stays offline and sandbox-safe. Dependency strings are `"name"` or
+    `"name version"`; only the name matters here.
+    """
+    data = tomllib.loads(cargo_lock.read_text())
+    graph: dict[str, set[str]] = {}
+    for package in data.get("package", []):
+        name = package["name"]
+        edges = graph.setdefault(name, set())
+        for dependency in package.get("dependencies", []):
+            edges.add(dependency.split(" ", 1)[0])
+    return graph
+
+
+def http_convergence(
+    graph: dict[str, set[str]], http_crates: frozenset[str] = HTTP_STACK_CRATES
+) -> list[str]:
+    """Every HTTP-stack crate reachable by BOTH separated components.
+
+    Works on any resolved graph (a real Cargo.lock graph, or a synthetic one in
+    the self-test), so the rule can be proven to bite without a cargo build.
+    """
+    absent = [name for name in SEPARATED if name not in graph]
+    if absent:
+        raise CheckError(
+            f"Cargo.lock is missing workspace members: {', '.join(absent)}"
+        )
+    left, right = SEPARATED
+    reach = {name: reachable(graph, name) for name in SEPARATED}
+    shared_http = (reach[left] & reach[right]) & http_crates
+    return [
+        f"{left} and {right} both use HTTP stack crate {crate} "
+        "(PRD round 5: no shared HTTP logic)"
+        for crate in sorted(shared_http)
+    ]
+
+
+# (label, resolved graph, must_fail). Synthetic graphs so the check is proven to
+# bite without building anything - the same discipline as SELF_TEST_CASES.
+HTTP_SELF_TEST_CASES: list[tuple[str, dict[str, set[str]], bool]] = [
+    (
+        "std-only testproxy, hyper daemon - no convergence",
+        {"daemon": {"hyper", "h2"}, "testproxy": set(), "hyper": set(), "h2": set()},
+        False,
+    ),
+    (
+        "different stacks - axum daemon, ureq testproxy",
+        {
+            "daemon": {"axum"},
+            "testproxy": {"ureq"},
+            "axum": {"hyper"},
+            "hyper": set(),
+            "ureq": set(),
+        },
+        False,
+    ),
+    (
+        "same stack reached directly by both",
+        {"daemon": {"hyper"}, "testproxy": {"hyper"}, "hyper": set()},
+        True,
+    ),
+    (
+        "same stack reached transitively by both",
+        {
+            "daemon": {"axum"},
+            "axum": {"hyper"},
+            "testproxy": {"myhelper"},
+            "myhelper": {"hyper"},
+            "hyper": set(),
+        },
+        True,
+    ),
+]
+
+
+def http_self_test() -> list[str]:
+    """Run the HTTP-convergence check against synthetic graphs."""
+    failures = []
+    for label, graph, must_fail in HTTP_SELF_TEST_CASES:
+        violations = http_convergence(graph)
+        if must_fail and not violations:
+            failures.append(f"'{label}' should have been caught, was reported clean")
+        elif not must_fail and violations:
+            failures.append(f"'{label}' should be clean, reported {violations}")
+    return failures
 
 
 SHARED = '[dependencies]\nshared = { path = "../shared" }\n'
@@ -335,7 +469,7 @@ def self_test() -> list[str]:
 
 def main() -> int:
     try:
-        failures = self_test()
+        failures = self_test() + http_self_test()
         if failures:
             for failure in failures:
                 print(
@@ -347,6 +481,16 @@ def main() -> int:
             )
             return EXIT_CANNOT_CHECK
         violations = find_violations(Path.cwd())
+
+        # HTTP-stack convergence: read the RESOLVED graph from Cargo.lock. Its
+        # absence is not a silent pass - the rule cannot be proven, so say so.
+        cargo_lock = Path.cwd() / "Cargo.lock"
+        if not cargo_lock.is_file():
+            raise CheckError(
+                f"Cargo.lock not found at {cargo_lock}; cannot prove HTTP-stack "
+                "separation (run from the workspace root)"
+            )
+        violations += http_convergence(graph_from_lock(cargo_lock))
     except CheckError as error:
         print(f"independence check could not run: {error}", file=sys.stderr)
         return EXIT_CANNOT_CHECK
@@ -357,13 +501,17 @@ def main() -> int:
         return EXIT_VIOLATION
 
     caught = sum(1 for case in SELF_TEST_CASES if case[4])
+    http_caught = sum(1 for case in HTTP_SELF_TEST_CASES if case[2])
     print(
         f"crate independence: self-test green ({caught} bypasses caught, "
         f"{len(SELF_TEST_CASES) - caught} legitimate cases passed); "
         f"no {SEPARATED[0]}<->{SEPARATED[1]} edge and no shared crate outside the "
         f"allowlist ({len(ALLOWLIST)} entries), across declared normal/dev/build "
         "dependencies of every feature and target, following path deps out of "
-        "the workspace"
+        "the workspace. "
+        f"HTTP-stack denylist green ({http_caught} convergences caught in self-test, "
+        f"{len(HTTP_STACK_CRATES)} crates denied): no HTTP-logic crate reachable "
+        "by both components in the resolved Cargo.lock graph"
     )
     return EXIT_OK
 

@@ -6,7 +6,7 @@ title: >-
 status: To Do
 assignee: []
 created_date: '2026-08-07 21:55'
-updated_date: '2026-08-07 23:15'
+updated_date: '2026-08-08 07:34'
 labels: []
 dependencies:
   - TASK-1
@@ -43,4 +43,6 @@ forward-carried from task-1 (e9b3378): daemon/ crate exists with a scaffold main
 codex review of task-1 (finding 5): dependency edges were wrong - AC#2 (in-process integration against testproxy+mock) requires tasks 2 and 3; edges added.
 
 forward-carried from task-1 (acb37f3), HARD REQUIREMENT: same as task-2's note, from the daemon side. 'just independence' enforces 'no shared CRATE', NOT 'no shared third-party dependency'. Pick the daemon's async/HTTP stack independently of whatever task-2 picked for testproxy (PRD round 5: the fixture is an independent witness of wire behavior), and add the stack crate names to the denylist next to ALLOWLIST in scripts/check-independence.py so it stops being discipline and becomes a gate. Also: adding a shared workspace crate now fails the guard - ALLOWLIST starts empty and widening it is meant to be a reviewable diff. The guard follows path deps out of the workspace, so routing through a vendored crate will not launder it.
+
+forward-carried from task-2: testproxy is std-only (hand-rolled HTTP over std::net, zero http crates). scripts/check-independence.py now has an HTTP_STACK_CRATES denylist + a resolved-Cargo.lock transitive check (self-tested) enforcing that daemon and testproxy never converge on ONE http crate. You may freely pick hyper/axum/tower/reqwest - they are already in the denied set and testproxy uses none, so no conflict. If you adopt a stack crate NOT in the set, ADD it there. Do not reintroduce a shared workspace crate (ALLOWLIST is empty) and no source-level sharing.
 <!-- SECTION:NOTES:END -->

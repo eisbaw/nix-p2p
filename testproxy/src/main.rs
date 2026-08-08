@@ -6,12 +6,14 @@
 //! be depended on by the daemon - the fixture is an independent witness of
 //! wire behaviour, and `just independence` enforces that mechanically.
 //!
-//! At this point it proxies nothing. Task-2 grows the real fixture from here,
-//! task-3 adds the mock-upstream mode and the signed fixture store.
+//! The proxy logic lives in the library crate (`testproxy::*`); this binary is
+//! the thin entry point that parses flags and runs the server.
 //!
 //! The near-identical `banner()` in `daemon` is deliberate duplication, not an
 //! oversight: factoring it into a shared crate is exactly the coupling the PRD
 //! forbids until a second consumer genuinely earns it.
+
+use std::process::ExitCode;
 
 /// Human- and machine-readable identity of this build.
 ///
@@ -21,9 +23,23 @@ fn banner() -> String {
     format!("{} {}", env!("CARGO_PKG_NAME"), env!("CARGO_PKG_VERSION"))
 }
 
-fn main() {
-    println!("{}", banner());
-    println!("scaffold: no proxy endpoint yet (task-2)");
+fn main() -> ExitCode {
+    eprintln!("{}", banner());
+    let config = match testproxy::Config::from_args(std::env::args().skip(1)) {
+        Ok(config) => config,
+        Err(err) => {
+            eprintln!("testproxy: {err}");
+            eprintln!("usage: testproxy [--listen ADDR] [--upstream URL] [--cache-dir PATH]");
+            return ExitCode::FAILURE;
+        }
+    };
+    match testproxy::serve(config) {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(err) => {
+            eprintln!("testproxy: fatal: {err}");
+            ExitCode::FAILURE
+        }
+    }
 }
 
 #[cfg(test)]
