@@ -1,10 +1,10 @@
 ---
 id: TASK-9
 title: 'Measurement: request/byte counters + egress report + gap histogram'
-status: In Progress
+status: Done
 assignee: []
 created_date: '2026-08-07 21:56'
-updated_date: '2026-08-08 13:59'
+updated_date: '2026-08-08 14:00'
 labels:
   - irreversible
 dependencies:
@@ -248,3 +248,9 @@ CODEX RE-GATE (NO-GO -> fixed, counting-rule v2):
 
 Re-parked In Progress awaiting deep gate.
 <!-- SECTION:NOTES:END -->
+
+## Final Summary
+
+<!-- SECTION:FINAL_SUMMARY:BEGIN -->
+DONE (LIGHT; kill criterion descoped by owner mid-task -> honest comparison basis, not a project gate). scripts/measure.py (just measure) + scripts/MEASUREMENT_COUNTING_RULE.md (net-upstream-egress-v2). Runs identical workload daemon-on vs daemon-off over the task-5 Pod seam; emits machine-readable report: payload(NAR)+total egress both arms, p95 both arms, narinfo->nar gap histogram. Counting rule: ground truth = testproxy bytes_sent (daemon self-report measured-not-trusted, delta 0 clean); offload metric = PAYLOAD egress not total (metadata caching can't inflate it); compressed file_size not NarSize; ZERO-OR-ONE full crossing per target (a wave-2 peer hit is a valid 0-egress crossing when client delivery is confirmed - v1 wrongly rejected it, codex-caught); missing bytes_sent / duplicate / truncated / undelivered-zero-crossing -> run INVALID (fail-closed); hedge losers honestly deferred to the wave-2 freeze. Provenance: --out threaded through check-fixtures (verified tree == measured tree); reports workload_version + lock hashes. A/A noise floor 11.78% (podman-startup jitter) -> S4 flagged UNUSABLE not hidden; instrument_trustworthy independent of the noisy p95 axis (task-32 to time inner realise). All 5 bites fail-before/pass-after by mutation; measure --self-test 11/11 (no containers, in just test) incl. the zero-crossing VALID/INVALID pair + provenance fail-closed. Reviews: qa green (35/35 + 92 workspace), architect (payload-not-total + hedge deferral), codex (2 NO-GOs: URL... no - zero-crossing-rejection + provenance, both fixed, self-test-proven). Wave-1 offload ~0 by construction (no p2p - validates the instrument). Gap sub-ms on loopback (PRD risk-3 input; not a real-upstream verdict). Follow-ups: task-32 (S4 precision). Forward-carried to task-12/16/18.
+<!-- SECTION:FINAL_SUMMARY:END -->
