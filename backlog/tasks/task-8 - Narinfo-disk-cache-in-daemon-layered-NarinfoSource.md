@@ -4,7 +4,7 @@ title: Narinfo disk cache in daemon (layered NarinfoSource)
 status: Done
 assignee: []
 created_date: '2026-08-07 21:56'
-updated_date: '2026-08-08 11:25'
+updated_date: '2026-08-08 11:27'
 labels: []
 dependencies:
   - TASK-4
@@ -54,3 +54,9 @@ GOTCHAS / forward-carry:
 
 CORRECTION: the narinfo_disk_cache.rs test count is 8 (not 9 as written above): ac1, ac2, ac3, ac4_truncated, ac4_corrupt, warm_on_disk_daemon_dispatches_signed_nar_hash..., warm_on_disk_correlation_survives_past_positive_ttl, without_persisted_correlation... Gate line should read 'narinfo_disk_cache 8'.
 <!-- SECTION:NOTES:END -->
+
+## Final Summary
+
+<!-- SECTION:FINAL_SUMMARY:BEGIN -->
+DONE (LIGHT). daemon/src/narinfo_cache.rs: byte-verbatim disk-cache-over-upstream NarinfoSource (framed file: text header + length-checked verbatim body, never a reserialized struct) that also implements CorrelationStore. AC#1 repeat-from-disk oracle-paired; AC#2 negative+positive TTL both directions via injected ManualClock (neg 3600s, pos 30d); AC#3 gnarly-corpus byte-identity across restart; AC#4 validate-then-atomic-rename (tmp+fsync+rename) with the truncation-poisoning bite proven fails-before/passes-after. Delivers task-4's deferred steady-state: a warm-on-disk / cold-in-memory daemon dispatches SignedNarHash from persisted forward-only token->hash correlation (derived view of the verbatim cache, meta always re-parsed so no drift; no lossy reverse map). 49 daemon tests (8 new). qa green, architect no blocker (findings applied: signed-only caching documented, TTL-asymmetry guard test, verbose corrupt-discard, startup .tmp sweep). Opt-in via --narinfo-cache-dir. Follow-ups: task-27 (bounds/eviction), task-28 (fsync off async path), task-29 (default-wire + container AC#1 re-assert), task-30 (unsigned-narinfo caching).
+<!-- SECTION:FINAL_SUMMARY:END -->
