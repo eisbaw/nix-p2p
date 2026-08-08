@@ -55,13 +55,15 @@ use tokio::net::TcpStream;
 use tokio::time::timeout;
 
 use crate::source::{
-    NarKey, NarSource, NarinfoSource, RawUpstream, SourceError, StoreHash, UpstreamResponse,
+    MAX_NARINFO_BYTES, NarKey, NarSource, NarinfoSource, RawUpstream, SourceError, StoreHash,
+    UpstreamResponse,
 };
 
-/// Upper bound on a buffered (narinfo) body. A narinfo is a few hundred bytes;
-/// anything past this is a misbehaving upstream, not a narinfo, and is rejected
-/// rather than buffered unboundedly.
-const MAX_BUFFERED_BODY: usize = 8 * 1024 * 1024;
+/// Upper bound on a buffered (narinfo) body, applied by the `Limited` READER so
+/// the read STOPS at the cap (codex re-gate #6): the memory bound is real, not an
+/// oversized pre-buffer with a late guard. Shared `MAX_NARINFO_BYTES` so the
+/// upstream read, the serving layer and the disk cache all cap at the same value.
+const MAX_BUFFERED_BODY: usize = MAX_NARINFO_BYTES;
 
 /// Transparent HTTP client to a single upstream binary cache.
 #[derive(Debug, Clone)]

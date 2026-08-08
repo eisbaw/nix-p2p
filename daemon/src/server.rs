@@ -173,11 +173,6 @@ async fn handle(req: Request<Incoming>, app: Arc<App>) -> Response<NarBody> {
     }
 }
 
-/// Upper bound on a buffered narinfo body (codex, task-13). A real narinfo is a
-/// few hundred bytes to low KB; 2 MiB is a generous ceiling past which the
-/// response is not a narinfo. Buffering past it is refused (fail closed).
-const MAX_NARINFO_BYTES: usize = 2 * 1024 * 1024;
-
 /// Serve the locally-generated cache-info body (never proxied).
 fn respond_cache_info(info: &CacheInfo, is_head: bool) -> Response<NarBody> {
     let body = info.render().into_bytes();
@@ -213,27 +208,30 @@ async fn respond_narinfo(
     if resp.status != 200 {
         return forward(Ok(resp), is_head);
     }
-    // Fail closed on a transfer-coding we cannot honestly re-frame (codex, task-13):
-    // buffering + recomputing Content-Length over an undecoded gzip/… body would
-    // emit a Content-Length that disagrees with the actual coded bytes.
-    if has_unsupported_transfer_coding(&resp.headers) {
-        eprintln!("daemon: refusing narinfo with unsupported Transfer-Encoding");
+    // Fail closed on a response we cannot faithfully forward (codex re-gate):
+    // an unsupported transfer-coding (buffering + recomputing Content-Length over
+    // an undecoded body would emit a Content-Length that disagrees with the coded
+    // bytes) or a malformed Connection header we cannot safely parse.
+    if must_fail_closed(&resp.headers) {
+        eprintln!("daemon: refusing narinfo (unsupported coding / malformed Connection)");
         return text_status(StatusCode::BAD_GATEWAY, "upstream unavailable");
     }
 
     let UpstreamResponse { headers, body, .. } = resp;
-    // Bound the buffered narinfo body (codex, task-13): a narinfo is a few hundred
-    // bytes to low KB; anything past MAX_NARINFO_BYTES is a misbehaving upstream,
-    // not a narinfo. Fail closed rather than buffer unboundedly into OOM. The
-    // UpstreamHttp source is already Limited, but the serving layer enforces its
-    // own bound so ANY NarinfoSource (cache, future p2p) is covered here too.
-    let bytes = match http_body_util::Limited::new(body, MAX_NARINFO_BYTES)
+    // Bound the buffered narinfo body (codex re-gate): a narinfo is ~1 KB;
+    // anything past MAX_NARINFO_BYTES is a misbehaving upstream, not a narinfo.
+    // Fail closed rather than buffer unboundedly. Defence-in-depth: the upstream
+    // read is ALSO capped at this value, so no layer pre-buffers more.
+    let bytes = match http_body_util::Limited::new(body, crate::source::MAX_NARINFO_BYTES)
         .collect()
         .await
     {
         Ok(collected) => collected.to_bytes(),
         Err(err) => {
-            eprintln!("daemon: reading narinfo body (or exceeds {MAX_NARINFO_BYTES} B): {err}");
+            eprintln!(
+                "daemon: reading narinfo body (or exceeds {} B): {err}",
+                crate::source::MAX_NARINFO_BYTES
+            );
             return text_status(StatusCode::BAD_GATEWAY, "upstream unavailable");
         }
     };
@@ -318,11 +316,12 @@ fn forward(result: Result<UpstreamResponse, SourceError>, is_head: bool) -> Resp
         Ok(resp) => resp,
         Err(err) => return gateway_error(&err),
     };
-    // Fail closed on a transfer-coding we cannot faithfully forward (codex,
-    // task-13): hyper strips only the final `chunked` framing, so a `gzip,
-    // chunked` body would stream out still-gzipped with the coding erased.
-    if has_unsupported_transfer_coding(&resp.headers) {
-        eprintln!("daemon: refusing response with unsupported Transfer-Encoding");
+    // Fail closed on a response we cannot faithfully forward (codex re-gate):
+    // an unsupported transfer-coding (hyper strips only the final `chunked`, so a
+    // `gzip, chunked` or `chunked, chunked` body streams out mis-framed) or a
+    // malformed Connection header.
+    if must_fail_closed(&resp.headers) {
+        eprintln!("daemon: refusing response (unsupported coding / malformed Connection)");
         return text_status(StatusCode::BAD_GATEWAY, "upstream unavailable");
     }
     let UpstreamResponse {
@@ -391,22 +390,18 @@ fn forward_headers(dst: &mut HeaderMap, src: &HeaderMap) {
     }
 }
 
-/// The lower-cased field-names named in any `Connection:` header value (the
-/// connection-specific fields the sender marked as not-to-be-forwarded).
-///
-/// Parses the RAW BYTES, not `to_str()` (codex finding, task-13): a `Connection`
-/// value may legally carry obs-text (bytes 0x80-0xFF), on which `to_str()` fails,
-/// and a silent skip there would FORWARD the fields the header named
-/// (`Connection: X-Hop, \xff` leaks `X-Hop`). Byte parsing still extracts
-/// `x-hop` from such a value, so the strip is fail-closed. EVERY listed token is
-/// added, including `close`/`keep-alive`: those are connection directives with no
-/// legitimate end-to-end header of the same name, so stripping a same-named
-/// header is harmless and strictly safer than exempting it.
+/// The lower-cased field-names named in any well-formed `Connection:` header
+/// value. A MALFORMED Connection value (obs-text/control token) never reaches
+/// here: `connection_header_is_malformed` fails the whole response closed at the
+/// serving-layer gate before `forward_headers` runs. For a well-formed value we
+/// parse the raw bytes and add EVERY listed token, incl `close`/`keep-alive`:
+/// those are connection directives with no legitimate end-to-end header of the
+/// same name, so stripping a same-named header is harmless and strictly safer.
 fn connection_listed_tokens(src: &HeaderMap) -> std::collections::HashSet<Vec<u8>> {
     let mut tokens = std::collections::HashSet::new();
     for value in src.get_all(http::header::CONNECTION) {
         for token in value.as_bytes().split(|&b| b == b',') {
-            let token = ascii_lower_trim(token);
+            let token = crate::source::ascii_lower_trim(token);
             if !token.is_empty() {
                 tokens.insert(token);
             }
@@ -415,44 +410,17 @@ fn connection_listed_tokens(src: &HeaderMap) -> std::collections::HashSet<Vec<u8
     tokens
 }
 
-/// Trim ASCII whitespace and lower-case ASCII letters of a raw header token,
-/// leaving any non-ASCII (obs-text) bytes as-is so a garbage token cannot
-/// accidentally collide with a real header name.
-fn ascii_lower_trim(bytes: &[u8]) -> Vec<u8> {
-    let start = bytes.iter().position(|b| !b.is_ascii_whitespace());
-    let end = bytes.iter().rposition(|b| !b.is_ascii_whitespace());
-    match (start, end) {
-        (Some(s), Some(e)) => bytes[s..=e]
-            .iter()
-            .map(|b| b.to_ascii_lowercase())
-            .collect(),
-        _ => Vec::new(),
-    }
-}
-
 fn is_hop_by_hop(name: &HeaderName) -> bool {
     HOP_BY_HOP.contains(&name.as_str())
 }
 
-/// True if the upstream `Transfer-Encoding` names any coding beyond `chunked`/
-/// `identity` (e.g. `gzip, chunked`). hyper's http1 layer strips only the final
-/// `chunked` FRAMING; a `gzip` transfer-coding underneath it is left applied,
-/// so the bytes hyper hands us are still gzip-coded with that fact ERASED once we
-/// drop the hop-by-hop `Transfer-Encoding` header. We could neither re-frame it
-/// faithfully nor honestly `Content-Length` it (the buffered narinfo path would
-/// count undecoded bytes), so the daemon FAILS CLOSED on such a response rather
-/// than forward a mislabeled body (codex finding, task-13). The invariant: never
-/// emit a body whose declared coding disagrees with its actual bytes.
-fn has_unsupported_transfer_coding(headers: &HeaderMap) -> bool {
-    for value in headers.get_all(http::header::TRANSFER_ENCODING) {
-        for token in value.as_bytes().split(|&b| b == b',') {
-            let token = ascii_lower_trim(token);
-            if !token.is_empty() && token != b"chunked" && token != b"identity" {
-                return true;
-            }
-        }
-    }
-    false
+/// The serving-layer fail-closed gate: a response the daemon cannot faithfully
+/// forward (an unsupported transfer-coding, or a malformed `Connection` header we
+/// cannot safely parse) becomes a clean 502 rather than a mislabeled/leaky
+/// forward. Applied before building EVERY forwarded response (codex re-gate).
+fn must_fail_closed(headers: &HeaderMap) -> bool {
+    crate::source::has_unsupported_transfer_coding(headers)
+        || crate::source::connection_header_is_malformed(headers)
 }
 
 /// Map a transport failure to a fast, clean gateway error so Nix falls back.

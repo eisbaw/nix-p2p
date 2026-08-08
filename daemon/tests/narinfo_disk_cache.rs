@@ -769,3 +769,102 @@ async fn narinfo_cache_write_failure_degrades_to_passthrough_never_poisons() {
     perms.set_mode(0o700);
     std::fs::set_permissions(&tmp, perms).unwrap();
 }
+
+// =============================================================================
+// AC#3 (codex re-gate): the narinfo cache must NEVER cache a response the
+// serving layer will reject, and must bound the buffered body at the cache layer.
+// =============================================================================
+
+use std::sync::atomic::AtomicUsize as AtomicUsize2;
+
+/// A source returning a 200 with a chosen Transfer-Encoding header and body.
+struct TeSource {
+    hits: AtomicUsize2,
+    body: Vec<u8>,
+    te: String,
+}
+
+#[async_trait]
+impl NarinfoSource for TeSource {
+    async fn fetch(&self, _hash: &StoreHash) -> Result<UpstreamResponse, SourceError> {
+        self.hits.fetch_add(1, Ordering::SeqCst);
+        let mut headers = HeaderMap::new();
+        headers.insert(http::header::TRANSFER_ENCODING, self.te.parse().unwrap());
+        Ok(UpstreamResponse {
+            status: 200,
+            headers,
+            body: full(self.body.clone()),
+        })
+    }
+}
+
+/// #2a: a 200 carrying an unsupported transfer-coding (which the serving layer
+/// turns into a 502) must NOT be cached - else request #2 would be a HIT serving
+/// 200, smuggling an error response into the cache as a positive.
+#[tokio::test]
+async fn unsupported_transfer_coding_200_is_not_cached() {
+    let dir = TempDir::new("te-nocache");
+    // A well-formed narinfo BODY (so is_well_formed passes) but an unsupported
+    // `chunked, chunked` coding (so the server would 502 it).
+    let body = narinfo(
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-x",
+        "1abc.nar.xz",
+        "sha256:deadbeef",
+        4096,
+    );
+    let upstream = Arc::new(TeSource {
+        hits: AtomicUsize2::new(0),
+        body,
+        te: "chunked, chunked".to_string(),
+    });
+    let cache = NarinfoDiskCache::new(
+        dir.path(),
+        upstream.clone(),
+        Arc::new(ManualClock::new(1000)),
+    )
+    .unwrap();
+
+    // Two fetches: neither may install a positive entry.
+    let _ = cache.fetch(&StoreHash::new(HASH)).await.unwrap();
+    let nic: Vec<_> = std::fs::read_dir(dir.path())
+        .unwrap()
+        .flatten()
+        .filter(|e| e.path().extension().is_some_and(|x| x == "nic"))
+        .collect();
+    assert!(
+        nic.is_empty(),
+        "an unsupported-coding 200 must NOT be cached, found {nic:?}"
+    );
+    let _ = cache.fetch(&StoreHash::new(HASH)).await.unwrap();
+    assert_eq!(
+        upstream.hits.load(Ordering::SeqCst),
+        2,
+        "request #2 must reach upstream again (no cached 200 smuggled in)"
+    );
+}
+
+/// #6: the CACHE-LAYER buffer bound bites - an oversized narinfo body is rejected
+/// by the cache's Limited reader (not only the server layer).
+#[tokio::test]
+async fn cache_layer_bounds_oversized_narinfo_body() {
+    let dir = TempDir::new("oversize");
+    // 3 MiB > MAX_NARINFO_BYTES (2 MiB): the Limited reader must error.
+    let upstream = FakeUpstream::new(Behavior::Body(vec![b'x'; 3 * 1024 * 1024]));
+    let cache = NarinfoDiskCache::new(
+        dir.path(),
+        upstream.clone(),
+        Arc::new(ManualClock::new(1000)),
+    )
+    .unwrap();
+    let result = cache.fetch(&StoreHash::new(HASH)).await;
+    assert!(
+        result.is_err(),
+        "an oversized narinfo must be rejected at the cache layer, not buffered"
+    );
+    let nic = std::fs::read_dir(dir.path())
+        .unwrap()
+        .flatten()
+        .filter(|e| e.path().extension().is_some_and(|x| x == "nic"))
+        .count();
+    assert_eq!(nic, 0, "no oversized entry may be cached");
+}

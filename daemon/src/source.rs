@@ -145,6 +145,75 @@ pub struct UpstreamResponse {
     pub body: NarBody,
 }
 
+/// Upper bound on a buffered narinfo body, applied at EVERY layer that buffers
+/// one (the upstream read, the serving layer, the disk cache) so the memory
+/// bound is real - a read that STOPS at this cap, never an 8 MiB pre-buffer with
+/// a late guard (codex re-gate). A real narinfo is ~1 KB; 2 MiB is generously
+/// safe and past it the response is not a narinfo.
+pub const MAX_NARINFO_BYTES: usize = 2 * 1024 * 1024;
+
+/// Trim ASCII whitespace and lower-case ASCII letters of a raw header token,
+/// leaving any non-ASCII (obs-text) bytes as-is so a garbage token cannot
+/// accidentally collide with a real header name.
+pub(crate) fn ascii_lower_trim(bytes: &[u8]) -> Vec<u8> {
+    let start = bytes.iter().position(|b| !b.is_ascii_whitespace());
+    let end = bytes.iter().rposition(|b| !b.is_ascii_whitespace());
+    match (start, end) {
+        (Some(s), Some(e)) => bytes[s..=e]
+            .iter()
+            .map(|b| b.to_ascii_lowercase())
+            .collect(),
+        _ => Vec::new(),
+    }
+}
+
+/// True unless the response's `Transfer-Encoding` is ABSENT or EXACTLY a single
+/// `chunked`/`identity` token (codex re-gate #2b). hyper strips only ONE final
+/// `chunked` framing, so ANY additional coding - a non-chunked token like `gzip`,
+/// OR a duplicate `chunked, chunked` - leaves a body hyper did not fully decode.
+/// The daemon fails closed on such a response (never emits a body whose declared
+/// coding disagrees with its bytes), and it must NEVER be cached (see
+/// `narinfo_cache`). Absent TE, or a lone `chunked`/`identity`, is fine.
+pub(crate) fn has_unsupported_transfer_coding(headers: &HeaderMap) -> bool {
+    let mut tokens = Vec::new();
+    for value in headers.get_all(http::header::TRANSFER_ENCODING) {
+        for tok in value.as_bytes().split(|&b| b == b',') {
+            let t = ascii_lower_trim(tok);
+            if !t.is_empty() {
+                tokens.push(t);
+            }
+        }
+    }
+    match tokens.as_slice() {
+        [] => false,
+        [one] => one.as_slice() != b"chunked" && one.as_slice() != b"identity",
+        _ => true, // more than one coding: fail closed (incl. `chunked, chunked`)
+    }
+}
+
+/// True if any `Connection` header value contains a MALFORMED token - a byte
+/// that is not a valid HTTP token char, comma, or whitespace (obs-text, control,
+/// etc.), whether or not it sits next to a comma (codex re-gate #1). We cannot
+/// know which fields such a value names, so the daemon FAILS CLOSED on it rather
+/// than forward-verbatim on a parse anomaly. A well-formed `Connection` (all
+/// token chars) is parsed normally and its listed fields stripped.
+pub(crate) fn connection_header_is_malformed(headers: &HeaderMap) -> bool {
+    for value in headers.get_all(http::header::CONNECTION) {
+        for &b in value.as_bytes() {
+            if b == b',' || b.is_ascii_whitespace() || is_http_token_char(b) {
+                continue;
+            }
+            return true;
+        }
+    }
+    false
+}
+
+/// RFC 7230 `tchar`: the characters allowed in an HTTP token (field name).
+fn is_http_token_char(b: u8) -> bool {
+    b.is_ascii_alphanumeric() || b"!#$%&'*+-.^_`|~".contains(&b)
+}
+
 /// Why an upstream access could not produce a response at all.
 ///
 /// Distinct from a non-200 *response* (which is an `UpstreamResponse` with that

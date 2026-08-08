@@ -200,60 +200,73 @@ fn raw_origin(response: &'static [u8]) -> SocketAddr {
     addr
 }
 
-/// obs-text Connection bypass (codex, task-13): a `Connection` value carrying a
-/// non-ASCII (obs-text) byte makes `to_str()` fail; a silent skip there would
-/// FORWARD the fields the header named. Byte parsing still extracts and strips
-/// `X-Hop`. BITE: `Connection: X-Hop, \xff` + `X-Hop: leak` must NOT leak X-Hop.
+/// Malformed Connection header (codex re-gate #1): a `Connection` value with an
+/// obs-text/control byte in a token - whether next to a comma OR fused into the
+/// token with no comma - is un-parseable, so the daemon FAILS CLOSED (502) rather
+/// than forward-verbatim on a parse anomaly (which leaked `X-Hop`). Both shapes
+/// must 502, and X-Hop must never be forwarded.
 #[tokio::test]
-async fn obs_text_connection_value_still_strips_named_hop_header() {
-    // 0xFF is valid obs-text in a header value but breaks to_str().
-    let response: &[u8] = b"HTTP/1.1 200 OK\r\n\
+async fn malformed_connection_value_fails_closed() {
+    // (a) obs-text as its own token after a comma.
+    let comma: &[u8] = b"HTTP/1.1 200 OK\r\n\
         Content-Length: 2\r\n\
         Connection: X-Hop, \xff\r\n\
-        X-Hop: leak\r\n\
-        X-Kept: yes\r\n\
-        \r\nok";
-    let addr = raw_origin(response);
-    let (daemon, _h) = spawn_daemon(&format!("http://{addr}")).await;
-    let r = get(daemon, "/log/x").await;
-    assert_eq!(r.status, Some(200), "response should still be forwarded");
-    assert!(
-        r.header("x-hop").is_none(),
-        "a Connection-listed token must be stripped even when the Connection \
-         value has obs-text; saw {:?}",
-        r.header("x-hop")
-    );
-    assert_eq!(
-        r.header("x-kept"),
-        Some("yes"),
-        "an unlisted header must still be forwarded (non-vacuous)"
-    );
+        X-Hop: leak\r\n\r\nok";
+    // (b) obs-text FUSED into the token, no comma (the case that previously leaked).
+    let fused: &[u8] = b"HTTP/1.1 200 OK\r\n\
+        Content-Length: 2\r\n\
+        Connection: X-Hop\xff\r\n\
+        X-Hop: leak\r\n\r\nok";
+    for (label, response) in [("comma", comma), ("fused", fused)] {
+        let addr = raw_origin(response);
+        let (daemon, _h) = spawn_daemon(&format!("http://{addr}")).await;
+        let r = get(daemon, "/log/x").await;
+        assert_eq!(
+            r.status,
+            Some(502),
+            "malformed Connection ({label}) must fail closed, got {:?}",
+            r.status
+        );
+        assert!(
+            r.header("x-hop").is_none(),
+            "X-Hop must never be forwarded on a malformed Connection ({label})"
+        );
+    }
 }
 
-/// Multi-coding Transfer-Encoding (codex, task-13): hyper strips only the final
-/// `chunked` framing, so `Transfer-Encoding: gzip, chunked` would forward
-/// still-gzipped bytes with the coding forgotten. The daemon must FAIL CLOSED
-/// (502), never emit a body whose declared coding disagrees with its bytes.
+/// Multi-coding Transfer-Encoding (codex re-gate #2b): hyper strips only ONE
+/// final `chunked` framing, so ANY additional coding leaves a body it did not
+/// fully decode. `gzip, chunked` (non-chunked coding) AND `chunked, chunked`
+/// (duplicate coding) must both FAIL CLOSED (502) - never a 200 forwarding a
+/// mis-framed/undecoded body.
 #[tokio::test]
 async fn multi_coding_transfer_encoding_fails_closed() {
-    // A valid chunked body ("hello"), but TE names gzip underneath chunked.
-    let response: &[u8] = b"HTTP/1.1 200 OK\r\n\
+    let gzip_chunked: &[u8] = b"HTTP/1.1 200 OK\r\n\
         Transfer-Encoding: gzip, chunked\r\n\
         \r\n5\r\nhello\r\n0\r\n\r\n";
-    let addr = raw_origin(response);
-    let (daemon, _h) = spawn_daemon(&format!("http://{addr}")).await;
-    let r = get(daemon, "/log/x").await;
-    assert_eq!(
-        r.status,
-        Some(502),
-        "an unsupported multi-coding Transfer-Encoding must fail closed, got {:?}",
-        r.status
-    );
-    assert_ne!(
-        r.body_string().trim(),
-        "hello",
-        "the daemon must NOT forward the undecoded/mislabeled body"
-    );
+    // Double-chunked: hyper de-chunks once, the inner chunk records remain.
+    let chunked_chunked: &[u8] = b"HTTP/1.1 200 OK\r\n\
+        Transfer-Encoding: chunked, chunked\r\n\
+        \r\n5\r\nhello\r\n0\r\n\r\n";
+    for (label, response) in [
+        ("gzip,chunked", gzip_chunked),
+        ("chunked,chunked", chunked_chunked),
+    ] {
+        let addr = raw_origin(response);
+        let (daemon, _h) = spawn_daemon(&format!("http://{addr}")).await;
+        let r = get(daemon, "/log/x").await;
+        assert_eq!(
+            r.status,
+            Some(502),
+            "unsupported Transfer-Encoding ({label}) must fail closed, got {:?}",
+            r.status
+        );
+        assert_ne!(
+            r.body_string().trim(),
+            "hello",
+            "the daemon must NOT forward the undecoded/mis-framed body ({label})"
+        );
+    }
 }
 
 /// Bounded narinfo body (codex, task-13): an oversized narinfo must be rejected

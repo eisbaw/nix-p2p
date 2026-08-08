@@ -77,9 +77,6 @@ use http_body_util::BodyExt;
 use crate::catalog::{CorrelationStore, NarMeta};
 use crate::source::{NarHash, NarinfoSource, SourceError, StoreHash, UpstreamResponse};
 
-/// Upper bound on a buffered narinfo body at the cache layer (codex, task-13).
-const MAX_NARINFO_CACHE_BYTES: usize = 2 * 1024 * 1024;
-
 /// The Nix base32 alphabet: `[0-9a-z]` MINUS `e o u t` (32 symbols). A store-path
 /// hash is EXACTLY 32 of these. Used to reject a hostile or malformed cache key
 /// before it can name a file (task-13: the "non-base32 rejected" claim, made true).
@@ -415,15 +412,17 @@ impl NarinfoSource for NarinfoDiskCache {
         }
 
         // A 200: buffer the body so we can validate before caching AND serve it.
-        // Bounded (codex, task-13): a narinfo past MAX_NARINFO_CACHE_BYTES is not a
-        // narinfo; fail closed rather than buffer unboundedly into OOM.
+        // Bounded (codex re-gate): the `Limited` READER stops at MAX_NARINFO_BYTES,
+        // so the cache layer bounds memory too (its inner source may stream). This
+        // is the CACHE-LAYER guard, independent of the serving layer.
         let headers = resp.headers.clone();
-        let bytes = http_body_util::Limited::new(resp.body, MAX_NARINFO_CACHE_BYTES)
+        let bytes = http_body_util::Limited::new(resp.body, crate::source::MAX_NARINFO_BYTES)
             .collect()
             .await
             .map_err(|e| {
                 SourceError::Upstream(format!(
-                    "reading narinfo body (or exceeds {MAX_NARINFO_CACHE_BYTES} B): {e}"
+                    "reading narinfo body (or exceeds {} B): {e}",
+                    crate::source::MAX_NARINFO_BYTES
                 ))
             })?
             .to_bytes();
@@ -432,7 +431,16 @@ impl NarinfoSource for NarinfoDiskCache {
         // it never enters the cache. It is still passed through to the client
         // (which re-verifies), but the next request refetches rather than serving
         // poison from disk.
-        if is_well_formed_narinfo(&bytes) {
+        //
+        // NEVER cache a response the serving layer will FAIL CLOSED on (codex
+        // re-gate #2a): a 200 carrying an unsupported transfer-coding is turned
+        // into a 502 by the server, so caching it would make request #2 a HIT that
+        // serves 200 - an error response smuggled into the cache as a positive. The
+        // synthesised cache-hit response drops the Transfer-Encoding header, which
+        // is exactly how the divergence would leak. Gate insertion on it here.
+        let cacheable = is_well_formed_narinfo(&bytes)
+            && !crate::source::has_unsupported_transfer_coding(&headers);
+        if cacheable {
             self.install(
                 store_hash.as_str(),
                 &Entry {
@@ -443,7 +451,7 @@ impl NarinfoSource for NarinfoDiskCache {
             );
         } else {
             eprintln!(
-                "narinfo-cache: upstream narinfo for {} failed validation ({} bytes); not caching",
+                "narinfo-cache: upstream narinfo for {} not cacheable ({} bytes); not caching",
                 store_hash.as_str(),
                 bytes.len()
             );

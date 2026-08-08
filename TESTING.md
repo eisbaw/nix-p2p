@@ -252,21 +252,26 @@ Two distinct guarantees, each with its own claim so neither is over-read:
 A 5 000-iteration narinfo fuzz proves arbitrary well-formed narinfos
 (random ordering, unknown fields, multiple `Sig:`, mixed line endings)
 survive **`rewrite::apply` (identity) and the disk frame** byte-identical.
-This is a **unit-level** identity fuzz; **chain-level** byte-identity of a
-real narinfo/NAR through daemon×3 is covered by the e2e
-`chain-s1-and-counts` scenario (the two together, not either overclaimed).
-Write-failure in **both** cache layers is proven fail-closed: an
-unwritable narinfo cache **degrades to passthrough** (serves upstream
-bytes, writes no entry, refetches, leaves no `.tmp` residue —
-`narinfo_cache_write_failure_degrades_to_passthrough`), and an unwritable
-testproxy cache **fails closed** with a 5xx and no partial entry
-(`testproxy/tests/enospc.rs`). Both caches now **reap orphaned `.tmp`
-partials on startup** (crash-between-write-and-rename residue). HONEST
-scope: this is the ENOSPC-**at-open**/EACCES branch (same `install()`
-path as a mid-write ENOSPC); a true byte-N mid-stream ENOSPC needs a
-size-limited tmpfs not mountable rootless — the mid-stream no-poison
-invariant is instead covered by the `CacheWriter` drop-uncommitted unit
-test plus the startup reap.
+This is a **unit-level** narinfo-identity fuzz. What is proven at
+**chain** level is **NAR** byte-identity — the e2e `chain-s1-and-counts`
+scenario compares the client-side **NarHash** through daemon×3 — **not**
+narinfo bytes: there is no chain-level narinfo-byte-identity oracle, and
+none is claimed. (The task-8 restart property above covers narinfo
+byte-identity across a daemon restart, still unit level.)
+
+**Write-failure fail-closed — the precise two-layer statement** (the two
+caches degrade *differently*, both safely): the **daemon narinfo cache**
+→ **passthrough** (serves the upstream bytes at 200, writes no entry,
+refetches, leaves no `.tmp` residue —
+`narinfo_cache_write_failure_degrades_to_passthrough`); the **testproxy
+NAR cache** → **fail-closed 5xx** (a cache it cannot open is a hard error,
+by design). **Both**: never a partial or poison entry, and both **reap
+orphaned `.tmp` partials on startup** (crash-between-write-and-rename
+residue). HONEST scope: this exercises the ENOSPC-**at-open**/EACCES
+branch (same `install()`/`begin_write` path as a mid-write ENOSPC); a true
+byte-N mid-stream ENOSPC needs a size-limited tmpfs not mountable rootless
+— the mid-stream no-poison invariant is instead covered by the
+`CacheWriter` drop-uncommitted unit test plus the startup reap.
 
 ## J2 measurement baseline (task-12)
 

@@ -4,7 +4,7 @@ title: 'HARDENING: proxy robustness matrix (fault x depth), header hygiene deep 
 status: In Progress
 assignee: []
 created_date: '2026-08-07 21:56'
-updated_date: '2026-08-08 18:49'
+updated_date: '2026-08-08 19:29'
 labels:
   - hardening
 dependencies:
@@ -48,4 +48,14 @@ CORRECTNESS BUGS (daemon/src): (1) obs-text Connection bypass - connection_liste
 ORACLES MADE REAL / HONESTLY RESCOPED: (3) ENOSPC - renamed to the real cache-OPEN/EACCES branch it exercises, added .tmp startup reap to testproxy DiskCache (+ immediate partial-tmp cleanup in narinfo cache), no-residue asserts; documented byte-N mid-stream ENOSPC is not rootless-simulable (covered by CacheWriter drop-uncommitted test + startup reap); bites proven. (4) task-33 depth 'boundary' did not vary depth honestly - REOPENED task-33 (via CLI, reason recorded), rescoped the e2e scenario to an honest L-vs-T pin at FULL depth (no depth-pinned claim; all-depths printed as observation), added latency TIMING EVIDENCE to matrix mode1 (200ms injected/observed). (5) identity fuzz relabeled UNIT-level (rewrite+frame) with chain identity delegated to e2e chain-s1; safe_key tightened to real nix-base32 alphabet + length 32 (rejects e/o/u/t, wrong length, NUL, unicode - proven), so 'non-base32 rejected' is now TRUE; testproxy claim reduced to containment + control-byte reject.
 FOLD-INS: upstream.rs doc repointed task-33 -> task-15/task-35; qa N1 falsifiability-is-the-pair comment added to the boundary scenario.
 GATES (re-gate): just lint green; full workspace cargo test 17/17 binaries green; just e2e 22/22 scenarios green (matrix 29/29 incl. mode1 timing evidence; boundary 7/7 rescoped); nix build .#daemon green. Each of the 8 fixes shown fail-before/pass-after by mutation (cargo test -p <crate> recompiles the mutated crate; e2e image rebuilt via nix). task-33 now OPEN (budget-aware/WAN fix -> task-15/task-35). Re-parked In Progress awaiting re-gate.
+
+RE-GATE ROUND 2 (codex NO-GO -> fixed, re-parked). Fixed the CLASS not just the named input, each with fails-before/passes-after:
+#1 malformed Connection FAILS OPEN: obs-text/control fused into a token (no comma) leaked X-Hop. Added connection_header_is_malformed (any non-tchar/comma/ws byte) -> FAIL CLOSED 502 at the serving gate (both paths). Bite: X-Hop\xff (no comma) AND 'X-Hop, \xff' both -> 502, X-Hop never forwarded.
+#2a ERROR-RESPONSE CACHING: a 200 with unsupported coding (server 502s it) was cacheable via the disk cache, then HIT as 200. Gated cache insert on !has_unsupported_transfer_coding (cache never stores a response the server rejects). Bite: unsupported-TE narinfo twice through the cache -> not cached, upstream hit twice.
+#2b chunked,chunked: rewrote has_unsupported_transfer_coding - fail closed unless TE is ABSENT or EXACTLY one chunked/identity token (duplicate or non-chunked -> 502). Bite: chunked,chunked -> 502.
+#6 2 MiB bound was defeated (8 MiB pre-buffer): centralized MAX_NARINFO_BYTES in source.rs and applied it as the Limited READ cap at ALL THREE layers - UpstreamHttp read (was 8 MiB), server, AND cache. Added a CACHE-LAYER oversized bite (3 MiB -> cache.fetch Err).
+#3 (honest): TESTING.md now states the precise two-layer fail-closed - narinfo cache -> passthrough (200 correct bytes); testproxy NAR cache -> fail-closed 5xx; BOTH never a partial/poison entry.
+#4 (real delta): matrix mode1 now asserts fault-on elapsed MINUS a per-depth fault-off baseline >= 0.6*injected (a no-op fault gives ~0 delta -> fails); wrong comment fixed. e2e confirms delta present at all depths.
+#5 (honest): dropped the chain-level narinfo-byte-identity claim - chain-s1 verifies NAR NarHash (not narinfo bytes); narinfo identity is unit-level (rewrite+frame) + task-8 restart property. TESTING.md + fuzz comment corrected.
+GATES: just lint green; workspace cargo test 17/17 green; just e2e 22/22 green (matrix 29/29 with real-delta mode1; boundary 7/7); nix build .#daemon green. 4 new re-gate daemon bites shown fail-before/pass-after (malformed-conn, chunked,chunked, not-cached, cache-layer bound) - all daemon in-process (cargo test -p daemon recompiles) + e2e image rebuilt. Re-parked In Progress awaiting re-gate.
 <!-- SECTION:NOTES:END -->

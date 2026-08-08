@@ -2547,6 +2547,19 @@ def scenario_fault_depth_matrix(ctx: Ctx, expect) -> None:
         # -- fault-off baseline (the contrast every cell is measured against) --
         pod.proxy_faults("")
         pod.proxy_reset()
+
+        def _timed_get(port: int, path: str) -> tuple[dict, float]:
+            start = time.perf_counter()
+            resp = _raw_get(port, path)
+            return resp, (time.perf_counter() - start) * 1000.0
+
+        # Median of a few warm fault-off narinfo GETs per depth, so the mode1
+        # DELTA below is against a real baseline (not a fixed threshold a slow
+        # no-op could clear).
+        base_ms = {}
+        for d in depths:
+            samples = sorted(_timed_get(ports[d], present_narinfo)[1] for _ in range(5))
+            base_ms[d] = samples[len(samples) // 2]
         clean_info = {d: _raw_get(ports[d], present_narinfo) for d in depths}
         clean_nar = {d: _raw_get(ports[d], nar_url) for d in depths}
         for d in depths:
@@ -2564,20 +2577,21 @@ def scenario_fault_depth_matrix(ctx: Ctx, expect) -> None:
         clean_info_bytes = clean_info[1]["body"]
 
         # -- mode 1: added latency (sub-timeout) - tolerated, and ACTUALLY felt --
-        # Timing evidence (codex, task-13): assert the injected 200ms latency was
-        # really incurred (elapsed >= 150ms), so a no-op fault could not pass this
-        # cell. The fault-off baseline GETs above were sub-timeout-fast.
+        # Timing evidence as a real DELTA (codex re-gate #4): fault-on elapsed
+        # MINUS the fault-off baseline must recover most of the injected latency.
+        # A no-op fault gives ~0 delta and FAILS this cell (not a fixed threshold a
+        # slow baseline could clear). Tolerance 0.6x absorbs scheduling jitter.
         injected_ms = 200
         pod.proxy_faults(f"latency_narinfo_ms={injected_ms}")
         for d in depths:
-            start = time.perf_counter()
-            r = _raw_get(ports[d], present_narinfo)
-            elapsed_ms = (time.perf_counter() - start) * 1000.0
+            r, on_ms = _timed_get(ports[d], present_narinfo)
+            delta_ms = on_ms - base_ms[d]
             expect(
-                r["status"] == 200 and elapsed_ms >= 0.5 * injected_ms,
-                f"matrix mode1 latency depth {d}: sub-timeout latency served 200 "
-                f"AND was felt (~{injected_ms}ms injected, {elapsed_ms:.0f}ms observed)",
-                f"status={r['status']} elapsed={elapsed_ms:.0f}ms want>={0.5 * injected_ms:.0f}ms",
+                r["status"] == 200 and delta_ms >= 0.6 * injected_ms,
+                f"matrix mode1 latency depth {d}: served 200 AND the {injected_ms}ms "
+                f"injection shows up as a real delta over the fault-off baseline",
+                f"status={r['status']} on={on_ms:.0f}ms base={base_ms[d]:.0f}ms "
+                f"delta={delta_ms:.0f}ms want>={0.6 * injected_ms:.0f}ms",
             )
         pod.proxy_faults("")
 
