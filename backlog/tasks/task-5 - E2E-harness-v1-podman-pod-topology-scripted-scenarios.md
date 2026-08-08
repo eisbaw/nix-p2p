@@ -1,10 +1,10 @@
 ---
 id: TASK-5
 title: 'E2E harness v1: podman-pod topology + scripted scenarios'
-status: To Do
+status: Done
 assignee: []
 created_date: '2026-08-07 21:55'
-updated_date: '2026-08-08 07:34'
+updated_date: '2026-08-08 09:45'
 labels: []
 dependencies:
   - TASK-3
@@ -20,11 +20,11 @@ Containerized harness, the canonical just e2e. Review-gate reality check (host-v
 
 ## Acceptance Criteria
 <!-- AC:BEGIN -->
-- [ ] #1 just e2e green headless on rootless podman (no docker daemon): fixture closure through full chain, S1 byte oracle + exact per-layer request counts (client nix cache wiped; max-substitution-jobs=1 in counting scenarios)
-- [ ] #2 nix.conf topology pinned: daemon (priority<40) AND mock/testproxy as explicit direct fallback substituter; S2 scenarios assert the fallback actually served the bytes via request counts, not merely exit 0
-- [ ] #3 Corrupt-NAR scenario: build FAILS with hash error (bite); 404-fidelity scenario: absent path -> 404 at the client, build proceeds, substituter NOT marked failed
-- [ ] #4 Scenario runner reports per-scenario pass/fail; any failing oracle fails just e2e; just e2e-clean tears down pods reliably (Ctrl-C leak trap)
-- [ ] #5 Containers bind-mount fixtures/out/cache ONLY - the test signing key (fixtures/out/*.sec) must never be mounted into any container; asserted by the harness (deep-gate finding on task-3: key beside cache/ would silently void every 'peer cannot forge' claim in wave 2)
+- [x] #1 just e2e green headless on rootless podman (no docker daemon): fixture closure through full chain, S1 byte oracle + exact per-layer request counts (client nix cache wiped; max-substitution-jobs=1 in counting scenarios)
+- [x] #2 nix.conf topology pinned: daemon (priority<40) AND mock/testproxy as explicit direct fallback substituter; S2 scenarios assert the fallback actually served the bytes via request counts, not merely exit 0
+- [x] #3 Corrupt-NAR scenario: build FAILS with hash error (bite); 404-fidelity scenario: absent path -> 404 at the client, build proceeds, substituter NOT marked failed
+- [x] #4 Scenario runner reports per-scenario pass/fail; any failing oracle fails just e2e; just e2e-clean tears down pods reliably (Ctrl-C leak trap)
+- [x] #5 Containers bind-mount fixtures/out/cache ONLY - the test signing key (fixtures/out/*.sec) must never be mounted into any container; asserted by the harness (deep-gate finding on task-3: key beside cache/ would silently void every 'peer cannot forge' claim in wave 2)
 <!-- AC:END -->
 
 ## Implementation Notes
@@ -92,4 +92,25 @@ And: 'just fixtures' now applies every tree check the gate applies, so if your h
 forward-carried from task-3 round 8 (e6b1e3d) - HOW THE HARNESS READS THE LOCK CHANGED. The authoritative fixture lock is now INSIDE each generation: fixtures/out/current/lock.json (i.e. gen-<sha>/lock.json, resolved through current). The git-tracked fixtures/workload.lock.json is DEMOTED to a review artifact and must NOT be read by the harness at runtime - it can lag a plain generate and only reconciles at --write-lock. If any container/nix.conf/assertion in your harness reads fixtures/workload.lock.json to learn the served workload, repoint it to fixtures/out/current/lock.json. Its content is byte-identical to the git baseline, so only the PATH changes. The public key you pin in trusted-public-keys is still fixtures/out/current/test-key.pub (unchanged). Bind-mount guidance unchanged: mount the resolved generation (readlink -f fixtures/out/current); it now also contains lock.json alongside cache/, manifest.json, test-key.pub - and, as before, the *.sec signing key you must never mount into a container.
 
 forward-carried from task-2: drive testproxy via binary flags --listen ADDR --upstream URL --cache-dir PATH. Admin surface (not logged as cache traffic): GET /__testproxy/stats and /__testproxy/log (JSON), POST /__testproxy/reset (clears log+gaps, NOT the disk cache), POST /__testproxy/faults?PARAMS, POST /__testproxy/faults/clear. Fault params: latency_{cache_info,narinfo,nar}_ms=N; http_error=CODE[&http_error_kind=KIND]; connection_reset=all|KIND; truncate_pct=N; corrupt_nar=1; wrong_narinfo=1; unreachable=1 (unknown param -> 400). ORACLE PAIRING for a '0 upstream' scenario: POST /reset, run the repeat, then assert stats upstream_total==0 AND received_total>0 (counters are derived from the log; /reset zeroes them). Per-nar gap_ms gives the narinfo->nar gap oracle. Faults are egress-only so the disk cache stays byte-correct; corrupt-NAR still makes the CLIENT see a hash-failing body (the corrupt-NAR e2e bite).
+
+--- task-5 IMPLEMENTED (commit 80319ec) ---
+Deliverable: canonical `just e2e` (scripts/e2e_harness.py) + `just e2e-clean`, flake `e2e-image`. 7 scenarios / 41 checks green headless, ~92s wall on rootless podman 5.7. Fast gates (build/lint/test/fmt) still green; check-lock-sources now governs e2e_harness.py and passes (resolves the lock via current->gen/lock.json, never the baseline).
+
+SCENARIO-RUNNER SHAPE (for reuse). `Pod(ctx, name, served_cache, with_daemon)` is a context manager standing up origin(python http.server over the served cache)+testproxy+optional daemon in ONE pod, publishing 18080/18081/18082 to the host for host-side oracles. Methods: client_run(targets, substituters, keys) [fresh single-user root nix per call = empty store + wiped narinfo cache, max-substitution-jobs=1], client_daemon_run(target, substituters, sys_keys, caller_keys) [real nix-daemon + untrusted uid1000 via setpriv], proxy_reset/proxy_stats/proxy_log/proxy_faults, kill(role), exec(role, argv). A scenario is fn(ctx, expect); register in SCENARIOS. `--only NAME` (repeatable), `--list`, `--clean`.
+
+FIXTURE MOUNT: option B (no per-run copy). Resolve the IMMUTABLE generation (fx.resolve_current -> gen-<sha>), bind-mount ONLY gen/cache read-only into origin. Immutable-by-contract + manifest-sha-in-name IS the identity assertion the round-2 finding asked for. Tamper/absent scenarios serve a key-free scratch tree built from the cache with fixturelib (single source of truth for narinfo signing). check-fixtures.py --require-tier full --skip-determinism runs at startup (fail-closed; determinism separately gated by fixtures-large which e2e depends on).
+
+LOAD-BEARING GOTCHAS (host-verified, cost real cycles):
+1. Rootless podman forwards a PUBLISHED port to the container over a NON-loopback address (saw 10.64.x). A service bound 127.0.0.1 is unreachable from the host. All three services bind 0.0.0.0; siblings still use 127.0.0.1 (shared pod netns). This is why daemon/testproxy are launched with --listen 0.0.0.0:PORT (overriding their 127.0.0.1 defaults).
+2. runuser/su ABORT ("Critical error - immediate abort") in the minimal dockerTools image - no PAM stack. Drop privilege with `setpriv --reuid 1000 --regid 1000 --clear-groups` (util-linux, no PAM). util-linux is in the image for exactly this.
+3. buildImageWithNixDb extraCommands runs in a single-uid build sandbox: `chown 1000` fails ("Invalid argument"). The untrusted client's writable HOME/XDG is a /tmp (1777) path set at runtime, not an image chown.
+4. `nix path-info --json` (nix 2.x in the image) keys by store path and reports SRI `sha256-<base64>`, NOT the manifest's `sha256:<nix-base32>`. Harness canonicalises via base64-decode + fx.nix_base32. NarHash == sha256 of `nix-store --dump`, so canonical-equality IS the S1 bit-for-bit oracle.
+5. AC#3 daemon-path message DIFFERS from check-fixtures' direct-store mode: substituting through nix-daemon, a bad/foreign sig rejects with "not signed by any of the keys in 'trusted-public-keys'" (not "lacks a signature by a trusted key"). Case 3 (retampered NarHash, valid test-key sig) still rejects "hash mismatch importing path". This is the intended DIFFERENT proof.
+
+HONEST LIMITS / follow-ups:
+- podman is the HOST's (5.7.0), not pinned in the devshell. e2e is inherently host-coupled (subuid/subgid, user namespaces); a nix podman risks colliding with host storage/config. Harness fail-fasts if podman is absent. If reproducibility demands a pinned podman, that is a follow-up (not filed yet - low value while the host has a working one).
+- S2 covers the daemon-ABSENT fallback only. Kill-mid-transfer and daemon-returns-errors (TESTING.md S2 b/c) are task-7 (crash injection) - hook is Pod.kill(role).
+- 404-fidelity uses a synthesized absent store path (guaranteed 404) paired with a present sibling; "build proceeds" is read behaviorally as "the sibling still substitutes + substituter not marked failed", since a bare store path has no derivation to build. Documented in the scenario.
+
+NEEDS DEEP REVIEW? New container trust surface (the client image + nix.conf topology + the AC#5 key-exclusion assertion). Flagging for the orchestrator's tiered gate: the AC#5 assertion and the daemon-enforcement proof are the security-load-bearing parts.
 <!-- SECTION:NOTES:END -->
