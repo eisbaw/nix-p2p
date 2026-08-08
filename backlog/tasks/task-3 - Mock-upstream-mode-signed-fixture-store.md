@@ -4,7 +4,7 @@ title: Mock upstream mode + signed fixture store
 status: In Progress
 assignee: []
 created_date: '2026-08-07 21:55'
-updated_date: '2026-08-08 00:52'
+updated_date: '2026-08-08 01:15'
 labels:
   - irreversible
 dependencies:
@@ -110,4 +110,30 @@ ALSO: filesystem errors during generation now exit 2 with a legible message inst
 ACCEPTED RESIDUALS, documented in docstrings, not fixed (per instruction): reusable() checks blob existence and size only - acceptable because blob_problems() re-hashes unconditionally downstream, so reuse can never keep a tree the gate would reject; a reader hitting the publish swap gets ENOENT, which is loud and retryable and is carried to task-5; a crash between the two renames strands a recoverable tree, and warn_about_stranded_trees() now names it and the restoring command.
 
 gate round 3: build/lint/fmt exit 0; test exit 0 (4s cold); fixtures-large exit 0 (8s); fixtures-verify-rebuild exit 0 (2s); package exit 0; nix build .#daemon .#testproxy exit 0 (2s); nix flake check exit 0 (2s, 8 checks). cargo 2/2. Full tier: 11 ok, 4 positive controls, 3 bites, 0 PARTIAL. Stubs untouched (4x '0 scenarios registered - NOT a pass').
+
+ROUND 4 (commit 05a7dff). awaiting deep gate (round 4).
+
+Four bounded items, all reproduced FAILING first (evidence in the git note on 05a7dff).
+
+TRANSACTION PROTOCOL (replaces local patching). The publish/lock code had grown a new hole in each of the previous two rounds - round 2 wrote the lock before publishing, round 3 published before writing the lock with no rollback - so round 4 implements the specified state machine in publish_transaction() with the failure end states written into its docstring rather than inferred from the code:
+  1 build staging (ownership marker written first)
+  2 validate staging (blob self-consistency always; lock comparison when not --write-lock)
+  3 prepare_lock - ALL refusal logic (rebind, retire-baseline, material diff), still before any rename
+  4 rename out -> retired.<ns>-<pid>, old tree KEPT
+  5 rename staging -> out
+  6 commit_lock (atomic os.replace)
+  7 only after 6 succeeds: safe_rmtree(retired)
+Failure at 4: nothing has moved, old tree and old lock stand. Failure at 5: one inverse rename restores the old tree, old lock stands. Failure at 6: the new tree moves to a marker-carrying .out.quarantine.<ns>-<pid>, the old tree is renamed back, exit 2 naming BOTH trees and pointing at the lock path to fix.
+Validation had to be SPLIT to satisfy step 2 in both modes: blob_problems() compares the tree against its OWN manifest and is lock-independent, so it now runs under --write-lock too, where a lock comparison necessarily cannot.
+Codex's EACCES repro is the bite test, run as a genuine (non-injected) fault: --out under /tmp so staging lives outside the repo, then chmod a-w on fixtures/ so the lock write is the first thing that fails. Verified end state: old tree restored at out (3d1ac5e25ffb1bea unchanged), old lock intact (a39382de8782d6f7 unchanged), new tree preserved in quarantine with its manifest, zero stray retired dirs, exit 2. Steps 4 and 5 verified with injected OSErrors at the exact rename.
+
+FINDING 8 (finally-block race). safe_rmtree is now the ONLY deletion primitive; grep confirms a single shutil.rmtree call site in scripts/, inside it. The finally block was the last unconditional delete and is exactly what codex proved: a foreign unmarked directory appearing at the predictable staging path AFTER preflight got deleted. safe_rmtree gained fatal=False for unwinding paths - refusing during cleanup must not raise, or the cleanup refusal would replace the error that caused the unwind. Verified by recreating the race: the foreign file 'IRREPLACEABLE' survived, a WARNING was printed, and the reported failure is still the original mkdir error.
+
+NEW-11 (tree_digest). Two blind spots, both bitten: the root directory was not an entry at all (0700 vs 0755 compared equal - the one directory a consumer must traverse was the one nothing checked), and int(st_mtime) truncated to seconds (1.1s vs 1.9s compared equal). Now iterates [root, *rglob] with a '.' key and compares st_mtime_ns. Entry count over the full tier went 13 -> 18, which is the directories and root that were previously invisible.
+
+NEW-12 (tier_of). Mapped any unknown attr to 'fast' - the same fail-open species as the unknown-tier and subset-acceptance findings. An attr in neither FAST_PLAN nor LARGE_PLAN is now a hard error, so a payload nobody planned cannot be silently pinned into the fast tier.
+
+QA INFORMATIONAL folded in: tree_digest's docstring now states what the mtime/mode comparison cannot catch - the generator writes the same fixed values into both trees, so the comparison detects EXTERNAL mutation of a published tree and never drift in the generator itself (if normalisation broke, both sides would break identically and still compare equal). What actually pins the intended values is that they are constants in fixturelib, reviewable in a diff.
+
+gate round 4: build/lint/fmt exit 0; test exit 0 (4s cold); fixtures-large exit 0 (5s, 12 ok / 0 PARTIAL); fixtures-verify-rebuild exit 0 (3s); package exit 0; nix build .#daemon .#testproxy exit 0; nix flake check exit 0 (3s, 8 checks). cargo 2/2. Determinism: diff -r exit 0 over 13 files / 115,939,516 bytes, and metadata-aware digests equal over 18 entries. Stubs untouched (4x '0 scenarios registered - NOT a pass').
 <!-- SECTION:NOTES:END -->

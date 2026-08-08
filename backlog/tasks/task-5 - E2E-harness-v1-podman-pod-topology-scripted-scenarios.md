@@ -4,7 +4,7 @@ title: 'E2E harness v1: podman-pod topology + scripted scenarios'
 status: To Do
 assignee: []
 created_date: '2026-08-07 21:55'
-updated_date: '2026-08-08 00:52'
+updated_date: '2026-08-08 01:15'
 labels: []
 dependencies:
   - TASK-3
@@ -55,4 +55,9 @@ forward-carried from task-3 round 3 (0a70c5e): the fixture tree's metadata is no
 Accepted residual you must handle rather than debug: a reader that touches fixtures/out during a regeneration's publish swap gets ENOENT, not a corrupt file. It is loud and retryable. Do not treat it as fixture corruption; retry, or generate before starting the harness.
 
 If a run is interrupted mid-publication the previous tree is stranded at fixtures/.out.retired.<pid> and fixtures/out is absent; the next generation prints the directory and the mv that restores it. Do not blanket-delete .out.* directories in cleanup scripts without reading that message.
+
+forward-carried from task-3 round 4 (05a7dff): fixture publication is now a defined transaction. Two directory-name patterns your cleanup scripts must NOT blanket-delete:
+- fixtures/.out.retired.<ns>-<pid> - the previous tree, kept until the new one is fully published and recorded. A crash mid-transaction strands it and the next run tells you the single mv that restores it.
+- fixtures/.out.quarantine.<ns>-<pid> - a NEW tree that was built and published successfully but whose lock could not be written, so it was rolled back. Its presence means the committed lock and the tree on disk were deliberately kept consistent at the cost of the new tree. Read the error message before deleting.
+Nothing without a .nix-p2p-fixture-out marker file is ever deleted by the generator, so a directory of yours at any of these paths is safe - but the generator will refuse to proceed rather than work around it.
 <!-- SECTION:NOTES:END -->
