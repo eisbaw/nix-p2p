@@ -4,7 +4,7 @@ title: 'FREEZE: RawNarV1 addressed unit + iroh ALPN (golden vectors)'
 status: In Progress
 assignee: []
 created_date: '2026-08-08 20:28'
-updated_date: '2026-08-08 21:22'
+updated_date: '2026-08-08 21:24'
 labels:
   - irreversible
 dependencies: []
@@ -54,4 +54,6 @@ HONEST LIMITS:
 FORWARD-CARRY: task-39 iroh addresses blobs by this Blake3Digest under IROH_BLOBS_ALPN, NodeId via from_bytes; add ==iroh_blobs::ALPN assert. task-49 narinfo rewrite uses NarSize/raw unit (compressed .nar.xz is transport-only, never the addressed unit). task-50 availability index computes this same BLAKE3 (Blake3Digest::from_raw_nar).
 
 Deep-gate architect GO (conditional on task-39 ALPN AC - now added). Non-blocking follow-ups noted: (3) BLAKE3_DOMAIN_SEPARATION guard is debug-only/decorative - consider const{assert!(is_none())} for compile-time bite in release; (4) the 'domain-separated would be caught' negative-control test is near-vacuous (the empty-vector pin af1349b9 is the real bite) - tighten in hardening. CRUX CONFIRMED: BLAKE3(raw NAR)==iroh blob hash (bao root == blake3::hash by construction).
+
+Deep-gate qa GO: all 6 bites verified by mutation (golden re-derivation genuine, recipe bite fires, determinism reproduced, no tautology). Non-blocking finding 2 (golden check soft-passes when fixtures absent) filed as a hardening task. Both Claude reviewers GO + crux confirmed; awaiting codex (the cross-model crux confirmation).
 <!-- SECTION:NOTES:END -->
