@@ -18,7 +18,8 @@ Reusability (this is FOUNDATIONAL infra - tasks 6/7/9/11 build on it):
   * task-7 (crash injection): `Pod.kill("daemon")` mid-transfer; see NOTE there.
   * task-9 (egress/gap oracles): `Pod.proxy_stats()` / `proxy_log()` are the
     ground-truth counters; `record['gap_ms']` is the narinfo->nar gap.
-  * task-11 (chain N daemons): `Pod(daemon_chain=N)` adds d1->d2->...->testproxy.
+  * task-11 (chain N daemons): task-11 WILL add a `daemon_chain=N` param to Pod
+    (not present yet) to run d1->d2->...->testproxy; today Pod starts one daemon.
 
 Fixture handling (AC#5, task-3 deep-gate): we resolve the IMMUTABLE generation
 (`readlink -f fixtures/out/current`), bind-mount ONLY its `cache/` subdir into
@@ -197,6 +198,15 @@ def _narinfo_path(cache: Path, fixtures: Fixtures, attr: str) -> Path:
     return cache / fx.narinfo_name(fixtures.store_path(attr))
 
 
+def secret_key_problems(served_cache: Path) -> list[str]:
+    """Every *.sec anywhere under the tree that will be bind-mounted into a
+    container. Empty list == AC#5 holds. A module function so the mutation test
+    (inject a .sec, expect non-empty) can exercise it without a running pod.
+    """
+    root = Path(served_cache)
+    return sorted(str(p.relative_to(root)) for p in root.rglob("*.sec"))
+
+
 def build_tamper_tree(fixtures: Fixtures, scratch: Path, kind: str) -> Path:
     """Build a key-free scratch cache serving a tampered `app` (refs `lib`).
 
@@ -230,6 +240,27 @@ def build_tamper_tree(fixtures: Fixtures, scratch: Path, kind: str) -> Path:
         die(f"unknown tamper kind {kind!r}")
 
     target.write_text(fx.format_narinfo(pairs))
+    return cache
+
+
+def build_corrupt_nar_tree(fixtures: Fixtures, scratch: Path) -> Path:
+    """Build a key-free scratch cache serving `lib` with a PRISTINE, validly
+    signed narinfo but a NAR whose content bytes are corrupted - so only the
+    CONTENT-HASH gate can catch it (the signature still verifies).
+
+    A byte is flipped DEEP in the payload region, not at offset 0. Flipping the
+    archive magic (what testproxy's corrupt_nar fault does) makes nix fail with
+    "input doesn't look like a Nix archive" - a NAR-PARSE error that proves
+    nothing about the hash gate. `lib` is a 64 KiB uncompressed NAR, so a
+    mid-file flip stays inside the file contents: the archive still parses and
+    only the NarHash differs, yielding "hash mismatch importing path".
+    """
+    cache = scratch / "cache"
+    _minimal_cache(fixtures, cache, ["lib"])
+    nar = cache / fixtures.entry("lib")["url"]
+    data = bytearray(nar.read_bytes())
+    data[len(data) // 2] ^= 0xFF
+    nar.write_bytes(bytes(data))
     return cache
 
 
@@ -294,14 +325,25 @@ class Pod:
     manager so teardown is guaranteed even on an assertion failure.
     """
 
-    def __init__(self, ctx: Ctx, name: str, served_cache: Path, with_daemon: bool):
+    def __init__(
+        self,
+        ctx: Ctx,
+        name: str,
+        served_cache: Path,
+        with_daemon: bool,
+        expect,
+    ):
         self.ctx = ctx
         self.pod = f"{POD_PREFIX}-{name}"
         self.served_cache = served_cache
         self.with_daemon = with_daemon
         self._pm = ctx.podman
+        # Every pod that mounts a cache asserts AC#5, so the key-exclusion oracle
+        # covers all 8 scenarios, not a hand-picked few.
+        self._expect = expect
 
     def __enter__(self) -> Pod:
+        self._assert_no_secret_key_served()
         self._create()
         return self
 
@@ -310,6 +352,34 @@ class Pod:
 
     def _c(self, role: str) -> str:
         return f"{self.pod}-{role}"
+
+    def _assert_no_secret_key_served(self) -> None:
+        """AC#5, observed at the RIGHT boundary: walk the exact host tree that
+        gets bind-mounted into the origin and assert no *.sec is under it.
+
+        HOST-SIDE on purpose. The previous version shelled `find` INSIDE the
+        container, but findutils is not in the image (buildEnv ships coreutils),
+        so `podman exec ... find` returned rc=127 with empty stdout and the
+        check passed unconditionally - a dead oracle that stayed green even with
+        a real .sec injected into the served cache. We already hold the resolved
+        host path (`served_cache`); walking it needs no container binary and
+        observes precisely the bytes the origin will serve.
+        """
+        leaked = secret_key_problems(self.served_cache)
+        self._expect(
+            not leaked,
+            "AC#5: no *.sec under the served cache tree (host-side walk)",
+            f"leaked: {leaked}",
+        )
+        # Meaningful only because the key really exists beside the cache: assert
+        # that too, so this proves absence-FROM-THE-SERVED-TREE, not that no key
+        # exists anywhere.
+        gen_secrets = sorted(p.name for p in self.ctx.fixtures.generation.glob("*.sec"))
+        self._expect(
+            len(gen_secrets) >= 1,
+            "AC#5 precondition: the signing key exists in the generation root",
+            f"found {gen_secrets}",
+        )
 
     def _create(self) -> None:
         # Remove a stale pod of the same name first (a previous crashed run).
@@ -697,53 +767,11 @@ def make_expect(checks: list[Check]):
 # all its checks pass. Registered in SCENARIOS below.
 
 
-def assert_no_secret_key_mounted(pod: Pod, expect) -> None:
-    """AC#5: the *.sec signing key must never enter any container.
-
-    Meaningful only because the key really exists beside the cache: assert that
-    first (so a moved key cannot silently void the claim), then assert the
-    origin serves a tree with no *.sec at all.
-    """
-    secrets = list(pod.ctx.fixtures.generation.glob("*.sec"))
-    expect(
-        len(secrets) >= 1,
-        "AC#5 precondition: signing key exists in the generation root",
-        f"found {[s.name for s in secrets]}",
-    )
-    # Nothing named *.sec anywhere the origin can serve.
-    found = pod.exec("origin", ["find", "/srv/cache", "-name", "*.sec"])
-    leaked = found.stdout.strip()
-    expect(
-        leaked == "",
-        "AC#5: no *.sec under the origin's served cache",
-        f"leaked: {leaked!r}",
-    )
-    # And the bind-mount source is the cache subdir, not the generation root.
-    inspect = run([pod.ctx.podman, "inspect", pod._c("origin")], check=False).stdout
-    expect(
-        "test-key" not in _mount_sources(inspect, ".sec"),
-        "AC#5: no mount source path contains a *.sec file",
-        "",
-    )
-
-
-def _mount_sources(inspect_json: str, needle: str) -> str:
-    try:
-        data = json.loads(inspect_json)
-    except ValueError:
-        return ""
-    sources = []
-    for container in data:
-        for mount in container.get("Mounts", []):
-            sources.append(str(mount.get("Source", "")))
-    return "\n".join(s for s in sources if needle in Path(s).name)
-
-
 def scenario_topology(ctx: Ctx, expect) -> None:
     """AC#2: nix.conf topology is pinnable - the daemon advertises a preferred
     priority (< 40) and WantMassQuery, so Nix orders it ahead of a real cache.
     """
-    with Pod(ctx, "topology", ctx.fixtures.cache, with_daemon=True):
+    with Pod(ctx, "topology", ctx.fixtures.cache, with_daemon=True, expect=expect):
         status, body = http_get(f"http://127.0.0.1:{HOST_DAEMON}/nix-cache-info")
         text = body.decode()
         fields = dict(line.split(": ", 1) for line in text.splitlines() if ": " in line)
@@ -770,9 +798,7 @@ def scenario_s1_byte_and_counts(ctx: Ctx, expect) -> None:
     """
     fixtures = ctx.fixtures
     targets = [fixtures.store_path(a) for a in ALL_ATTRS]
-    with Pod(ctx, "s1", fixtures.cache, with_daemon=True) as pod:
-        assert_no_secret_key_mounted(pod, expect)
-
+    with Pod(ctx, "s1", fixtures.cache, with_daemon=True, expect=expect) as pod:
         # -- cold --
         pod.proxy_reset()
         cold = pod.client_run(
@@ -836,7 +862,7 @@ def scenario_s2_fallback(ctx: Ctx, expect) -> None:
     not merely exit 0)."""
     fixtures = ctx.fixtures
     targets = [fixtures.store_path(a) for a in ALL_ATTRS]
-    with Pod(ctx, "s2", fixtures.cache, with_daemon=False) as pod:
+    with Pod(ctx, "s2", fixtures.cache, with_daemon=False, expect=expect) as pod:
         # Sanity: the preferred substituter really is down.
         try:
             http_get(f"http://127.0.0.1:{HOST_DAEMON}/nix-cache-info", timeout=1.0)
@@ -878,8 +904,7 @@ def _tamper_scenario(ctx: Ctx, expect, kind: str, needle: str) -> None:
         shutil.rmtree(scratch)
     cache = build_tamper_tree(fixtures, scratch, kind)
     app_path = fixtures.store_path("app")
-    with Pod(ctx, f"tamper-{kind}", cache, with_daemon=False) as pod:
-        assert_no_secret_key_mounted(pod, expect)
+    with Pod(ctx, f"tamper-{kind}", cache, with_daemon=False, expect=expect) as pod:
         # Caller passes the FOREIGN key to prove the daemon ignores it.
         _n, _p, _s, foreign_pub = fx.keypair(
             fx.FOREIGN_SEED_PHRASE, fx.FOREIGN_KEY_NAME
@@ -926,20 +951,52 @@ def scenario_tamper_narhash(ctx: Ctx, expect) -> None:
     _tamper_scenario(ctx, expect, "narhash", HASH_REJECT_NEEDLE)
 
 
-def scenario_corrupt_nar(ctx: Ctx, expect) -> None:
-    """AC#3 / TESTING.md prove-the-check-bites: with the testproxy's corrupt-NAR
-    fault armed, the NAR BYTES are corrupted on egress (the disk cache stays
-    clean by design) - and the build MUST fail, never silently accept the
-    corrupt path. This exercises the real fault surface (task-9 reuses it),
-    distinct from tamper-narhash which mutates the narinfo. Routed through the
-    chain, so it also proves the daemon passes corruption through rather than
-    masking it.
+def scenario_daemon_positive_control(ctx: Ctx, expect) -> None:
+    """Positive control for the three AC#3 daemon-path rejections: a PRISTINE
+    `app` (refs `lib`) imports SUCCESSFULLY through the nix-daemon path as the
+    untrusted uid 1000. Without this, the rejections could be passing because
+    the client/daemon path is simply broken (wrong socket, unresolved user,
+    dead substituter) rather than because of the tampering. The caller still
+    passes the foreign key, which the daemon still ignores - it accepts here
+    because the narinfo is validly signed by the trusted test key.
     """
     fixtures = ctx.fixtures
+    app = fixtures.store_path("app")
+    with Pod(
+        ctx, "daemon-pos", fixtures.cache, with_daemon=False, expect=expect
+    ) as pod:
+        _n, _p, _s, foreign_pub = fx.keypair(
+            fx.FOREIGN_SEED_PHRASE, fx.FOREIGN_KEY_NAME
+        )
+        result = pod.client_daemon_run(
+            target=app,
+            substituters=ctx.substituter_origin_only(),
+            sys_keys=fixtures.public_key,
+            caller_keys=foreign_pub,
+        )
+        expect(
+            result.exit_code == 0,
+            "daemon-path positive control: a pristine app imports as the untrusted user",
+            f"exit={result.exit_code} stderr={result.stderr[-400:]}",
+        )
+
+
+def scenario_corrupt_nar(ctx: Ctx, expect) -> None:
+    """AC#3 / TESTING.md prove-the-check-bites: the HASH gate catches NAR
+    CONTENT corruption. Serves `lib` with a pristine, validly signed narinfo but
+    a NAR whose content bytes are corrupted (a mid-payload flip that survives
+    framing) - so the signature passes and only the content hash can catch it.
+    Routed through the daemon, proving the daemon passes corruption through
+    rather than masking it. Distinct from tamper-narhash (which mutates the
+    narinfo): here the narinfo is untouched and the BYTES are wrong.
+    """
+    fixtures = ctx.fixtures
+    scratch = ctx.scratch / "corrupt-nar"
+    if scratch.exists():
+        shutil.rmtree(scratch)
+    cache = build_corrupt_nar_tree(fixtures, scratch)
     lib = fixtures.store_path("lib")
-    with Pod(ctx, "corrupt-nar", fixtures.cache, with_daemon=True) as pod:
-        pod.proxy_reset()
-        pod.proxy_faults("corrupt_nar=1")
+    with Pod(ctx, "corrupt-nar", cache, with_daemon=True, expect=expect) as pod:
         result = pod.client_run(
             [lib], ctx.substituter_daemon_only(), fixtures.public_key
         )
@@ -953,58 +1010,62 @@ def scenario_corrupt_nar(ctx: Ctx, expect) -> None:
             "corrupt-NAR: the corrupt path was NOT imported into the store",
             "",
         )
-        # Nix's own content gate fired on the way in. The exact wording depends
-        # on where the flip lands (hash check vs NAR framing); assert the fault
-        # was actually emitted by the proxy AND the client rejected.
-        stats = pod.proxy_stats()
+        # SPECIFICALLY the hash gate, not any failure: a NAR-parse error would
+        # prove nix rejects garbage, not that it verifies content.
         expect(
-            stats["faults"].get("corrupt-nar", 0) > 0,
-            "corrupt-NAR: the proxy actually emitted the corrupt-NAR fault",
-            f"faults={stats['faults']}",
+            HASH_REJECT_NEEDLE in result.stderr,
+            f"corrupt-NAR: rejected as {HASH_REJECT_NEEDLE!r} (the content-hash "
+            "gate, not a NAR-parse error)",
+            f"stderr tail: {result.stderr[-400:]}",
         )
 
 
 def scenario_absent_404(ctx: Ctx, expect) -> None:
-    """AC#3 404-fidelity: an absent path -> 404 at the client, the build
-    proceeds (a sibling present path is still served), and the substituter is
-    NOT marked failed. Routed through the chain, so it also proves the daemon
-    forwards a 404 verbatim rather than turning it into a 502."""
+    """AC#3 404-fidelity: an absent path -> 404 AT THE DAEMON (not turned into a
+    502), the build proceeds (a sibling present path is still served), and the
+    substituter is NOT marked failed.
+
+    The oracle observes the DAEMON's own HTTP response - the boundary the
+    property is about. The earlier version inspected the testproxy log, which is
+    the wrong boundary: a daemon regression turning upstream 404 into 502 leaves
+    the upstream log identical and would have passed. Here we query the daemon
+    directly and read its status.
+    """
     fixtures = ctx.fixtures
     present = fixtures.store_path("lib")
     absent = "/nix/store/00000000000000000000000000000000-nix-p2p-absent"
-    with Pod(ctx, "absent", fixtures.cache, with_daemon=True) as pod:
+    absent_narinfo = fx.narinfo_name(absent)
+    present_narinfo = fx.narinfo_name(present)
+    with Pod(ctx, "absent", fixtures.cache, with_daemon=True, expect=expect) as pod:
+        # Boundary observation: the DAEMON returns 404 for the absent path...
+        status_absent, _ = http_get(f"http://127.0.0.1:{HOST_DAEMON}/{absent_narinfo}")
+        expect(
+            status_absent == 404,
+            "404-fidelity: the daemon returns 404 for the absent path (not a 502)",
+            f"daemon status={status_absent}",
+        )
+        # ...and still serves a present narinfo (it was not marked failed).
+        status_present, _ = http_get(
+            f"http://127.0.0.1:{HOST_DAEMON}/{present_narinfo}"
+        )
+        expect(
+            status_present == 200,
+            "404-fidelity: the daemon still serves the present narinfo (200)",
+            f"daemon status={status_present}",
+        )
+        # And the build PROCEEDS: the present sibling still substitutes in a run
+        # that also asks for the absent path. Asserted AFTER the 404 checks, so
+        # the sibling-served proof cannot pass unless the 404 was truly benign.
         pod.proxy_reset()
         result = pod.client_run(
             [absent, present], ctx.substituter_daemon_only(), fixtures.public_key
         )
-        # The present sibling must still be realised even though the run's
-        # overall exit is nonzero (the absent path is unrealisable). That is the
-        # proof the 404 did not disable the substituter.
         got = result.narhash(present)
         expect(
             got == fixtures.nar_hash("lib"),
-            "404-fidelity: the present sibling is still served after a 404",
+            "404-fidelity: the present sibling still substitutes despite the "
+            "absent path's 404 (build proceeds, substituter not marked failed)",
             f"got={got} stderr={result.stderr[-300:]}",
-        )
-        log = pod.proxy_log()
-        narinfo_reqs = [r for r in log if r["kind"] == "narinfo"]
-        statuses = {r["status"] for r in narinfo_reqs}
-        # The absent narinfo produced a 404 that the daemon forwarded verbatim
-        # (never a 502), and the substituter kept querying (present was served).
-        expect(
-            404 in statuses,
-            "404-fidelity: the absent narinfo returned 404 through the chain",
-            f"narinfo statuses={sorted(statuses)}",
-        )
-        expect(
-            502 not in {r["status"] for r in log},
-            "404-fidelity: the daemon forwarded 404 verbatim, never a 502",
-            "",
-        )
-        expect(
-            any(r["status"] == 200 for r in narinfo_reqs),
-            "404-fidelity: the substituter was not marked failed (served a 200 too)",
-            "",
         )
 
 
@@ -1012,6 +1073,7 @@ SCENARIOS = [
     ("topology", scenario_topology),
     ("s1-byte-and-counts", scenario_s1_byte_and_counts),
     ("s2-fallback", scenario_s2_fallback),
+    ("daemon-positive-control", scenario_daemon_positive_control),
     ("tamper-corrupt-sig", scenario_tamper_corrupt_sig),
     ("tamper-foreign-key", scenario_tamper_foreign_key),
     ("tamper-narhash", scenario_tamper_narhash),

@@ -100,12 +100,15 @@
 
       # Static /etc for the e2e image. A real /etc/passwd is what lets the
       # AC#3 scenarios drop from the container root (which runs nix-daemon) to
-      # an UNTRUSTED user via `runuser -u client`: that is the whole point of
-      # the daemon-side-enforcement proof - a caller whose trusted-public-keys
-      # nix-daemon must ignore. hosts entry keeps loopback name resolution from
-      # reaching for DNS. No nix.conf here on purpose: the scenarios template a
-      # writable NIX_CONF_DIR at runtime (system config differs per scenario),
-      # and an /etc symlink into the read-only store cannot be rewritten.
+      # an UNTRUSTED user (uid 1000) via `setpriv --reuid 1000 --regid 1000
+      # --clear-groups`: that is the whole point of the daemon-side-enforcement
+      # proof - a caller whose trusted-public-keys nix-daemon must ignore.
+      # (setpriv, NOT runuser/su: those need a PAM stack this minimal image has
+      # none of and abort immediately.) hosts entry keeps loopback name
+      # resolution from reaching for DNS. No nix.conf here on purpose: the
+      # scenarios template a writable NIX_CONF_DIR at runtime (system config
+      # differs per scenario), and an /etc symlink into the read-only store
+      # cannot be rewritten.
       e2eEtc = pkgs.runCommand "nix-p2p-e2e-etc" { } ''
         mkdir -p $out/etc
         cat > $out/etc/passwd <<'EOF'
@@ -149,7 +152,7 @@
             bashInteractive
             coreutils
             python3Minimal # origin: `python3 -m http.server`; stdlib only
-            utillinux # runuser: drop to the untrusted client user, no PAM
+            utillinux # setpriv: drop to the untrusted client uid, no PAM
             daemon
             testproxy
             e2eEtc
