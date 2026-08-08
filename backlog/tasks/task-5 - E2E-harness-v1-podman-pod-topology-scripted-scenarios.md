@@ -4,7 +4,7 @@ title: 'E2E harness v1: podman-pod topology + scripted scenarios'
 status: To Do
 assignee: []
 created_date: '2026-08-07 21:55'
-updated_date: '2026-08-08 00:29'
+updated_date: '2026-08-08 00:32'
 labels: []
 dependencies:
   - TASK-3
@@ -47,4 +47,6 @@ forward-carried from task-3 round 2 (9dba842): use 'just fixtures-large' for har
 Generation is now serialised with flock and publishes by rename after validating the staged tree against the lock, so a container build racing a 'just test' will not see a torn tree. If your harness points gen-fixtures at a custom --out, note it refuses any non-empty directory lacking a .nix-p2p-fixture-out marker and refuses symlinks.
 
 The source guard is now scripts/check-source-guard.py (stdlib-only) and runs BOTH in 'just lint' and as a 'source-guard' flake check. It rejects any .rs containing bare 'fixtures/' or 'NIX_P2P_' - so testproxy/daemon code cannot reach for the fixture tree or dev-shell variables even indirectly.
+
+round-2 deep-gate (architect): (a) harness must invoke check-fixtures.py (fail-closed gate), not just gen-fixtures.py, before serving fixtures in any scenario; (b) bind-mounting fixtures/out pins the inode - a regeneration during a container run leaves the container serving the OLD tree while the host lock says otherwise; mount per-run copies or assert tree identity (manifest sha) from inside the scenario.
 <!-- SECTION:NOTES:END -->

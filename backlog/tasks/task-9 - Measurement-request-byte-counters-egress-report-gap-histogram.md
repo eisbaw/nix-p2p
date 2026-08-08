@@ -4,7 +4,7 @@ title: 'Measurement: request/byte counters + egress report + gap histogram'
 status: To Do
 assignee: []
 created_date: '2026-08-07 21:56'
-updated_date: '2026-08-08 00:29'
+updated_date: '2026-08-08 00:32'
 labels:
   - irreversible
 dependencies:
@@ -51,4 +51,6 @@ Why it is not optional: 'just test' regenerates the fixture and diffs it, but re
 Scope of what it earns: determinism on THAT machine against THAT store's copy. Cross-machine reproducibility is verified by nothing in this repository - do not let the baseline text imply otherwise.
 
 Also from this round: the lock now pins a tier per payload, and 'just fixtures-large' runs the gate with --require-tier full, so a measurement run cannot silently proceed against a fast-tier tree missing the 110 MiB payload. If you script measurement setup, call 'just fixtures-large' rather than 'just fixtures'.
+
+round-2 deep-gate (architect): run check-fixtures.py (not just generation) before any measurement run; a measurement against an unverified tree is not a baseline.
 <!-- SECTION:NOTES:END -->

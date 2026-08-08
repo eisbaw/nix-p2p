@@ -4,7 +4,7 @@ title: Mock upstream mode + signed fixture store
 status: In Progress
 assignee: []
 created_date: '2026-08-07 21:55'
-updated_date: '2026-08-08 00:28'
+updated_date: '2026-08-08 00:32'
 labels:
   - irreversible
 dependencies:
@@ -87,4 +87,6 @@ NEW LIMITS INTRODUCED BY THIS ROUND, stated plainly:
 - check-rebuild proves determinism on THIS machine against THIS store's copy. Cross-machine reproducibility remains unverified by anything here.
 
 gate round 2: build/lint/fmt/test/package all exit 0; fixtures-large exit 0 (5s); fixtures-verify-rebuild exit 0 (3s, 4/4 payloads identical); nix build .#daemon .#testproxy exit 0; nix flake check exit 0 (3s, 8 checks). cargo 2 tests 2 passed. Full-tier check-fixtures: 11 ok, 4 positive controls, 3 bites, 0 PARTIAL. Two-tree determinism diff: diff -r exit 0, 13 files, 115,939,516 bytes. Stubs untouched (4x '0 scenarios registered - NOT a pass').
+
+round-2 deep-gate minor (architect, non-blocking): update_lock assigns tier via hardcoded attr=='big' (gen-fixtures.py ~:547), duplicating LARGE_PLAN knowledge - a second large payload would lock as fast and fail-closed with a misleading message. Derive tier from LARGE_PLAN when next touching this file (or in hardening).
 <!-- SECTION:NOTES:END -->
