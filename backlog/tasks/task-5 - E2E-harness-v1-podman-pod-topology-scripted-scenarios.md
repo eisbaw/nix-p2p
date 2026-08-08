@@ -4,7 +4,7 @@ title: 'E2E harness v1: podman-pod topology + scripted scenarios'
 status: To Do
 assignee: []
 created_date: '2026-08-07 21:55'
-updated_date: '2026-08-08 00:32'
+updated_date: '2026-08-08 00:52'
 labels: []
 dependencies:
   - TASK-3
@@ -49,4 +49,10 @@ Generation is now serialised with flock and publishes by rename after validating
 The source guard is now scripts/check-source-guard.py (stdlib-only) and runs BOTH in 'just lint' and as a 'source-guard' flake check. It rejects any .rs containing bare 'fixtures/' or 'NIX_P2P_' - so testproxy/daemon code cannot reach for the fixture tree or dev-shell variables even indirectly.
 
 round-2 deep-gate (architect): (a) harness must invoke check-fixtures.py (fail-closed gate), not just gen-fixtures.py, before serving fixtures in any scenario; (b) bind-mounting fixtures/out pins the inode - a regeneration during a container run leaves the container serving the OLD tree while the host lock says otherwise; mount per-run copies or assert tree identity (manifest sha) from inside the scenario.
+
+forward-carried from task-3 round 3 (0a70c5e): the fixture tree's metadata is now normalised at generation - 0644 files, 0755 dirs, mtime 1, and the signing key at 0600. If containers copy the tree (rather than bind-mounting it), preserve modes and times (cp -a / rsync -a / tar -p) or the determinism gate will flag the copy as drifted.
+
+Accepted residual you must handle rather than debug: a reader that touches fixtures/out during a regeneration's publish swap gets ENOENT, not a corrupt file. It is loud and retryable. Do not treat it as fixture corruption; retry, or generate before starting the harness.
+
+If a run is interrupted mid-publication the previous tree is stranded at fixtures/.out.retired.<pid> and fixtures/out is absent; the next generation prints the directory and the mv that restores it. Do not blanket-delete .out.* directories in cleanup scripts without reading that message.
 <!-- SECTION:NOTES:END -->

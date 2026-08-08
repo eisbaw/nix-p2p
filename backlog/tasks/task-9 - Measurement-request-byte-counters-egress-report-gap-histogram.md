@@ -4,7 +4,7 @@ title: 'Measurement: request/byte counters + egress report + gap histogram'
 status: To Do
 assignee: []
 created_date: '2026-08-07 21:56'
-updated_date: '2026-08-08 00:34'
+updated_date: '2026-08-08 00:52'
 labels:
   - irreversible
 dependencies:
@@ -56,4 +56,10 @@ Also from this round: the lock now pins a tier per payload, and 'just fixtures-l
 round-2 deep-gate (architect): run check-fixtures.py (not just generation) before any measurement run; a measurement against an unverified tree is not a baseline.
 
 task-20 added as dependency: fixtures-verify-rebuild is a required pre-J2 step and must not misdiagnose cold stores before measurement relies on it (round-2 qa finding).
+
+forward-carried from task-3 round 3 (0a70c5e): scripts/check-rebuild.py now also asserts that each payload's built output path EQUALS the store_path pinned in fixtures/workload.lock.json. If you reuse it, note the consequence: it fails when the checkout and the lock disagree, which is the desired behaviour for a pre-J2 gate but means it must be run on the same revision the baseline is recorded against.
+
+Its scope limit is now documented and matters for you: it rebuilds each payload's OWN derivation, not its closure. Correct for the current leaf-shaped workload; if a payload ever gains a first-party dependency, that dependency is NOT covered and the attr list needs extending.
+
+Also: the generated tree's file modes and mtimes are now normalised (0644/0755, mtime 1, signing key 0600), so a tree copied with rsync/tar is identical to one served over HTTP. If measurement tooling copies the tree, it must preserve or re-normalise metadata, or the determinism gate will flag the copy.
 <!-- SECTION:NOTES:END -->

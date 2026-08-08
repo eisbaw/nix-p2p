@@ -4,7 +4,7 @@ title: Mock upstream mode + signed fixture store
 status: In Progress
 assignee: []
 created_date: '2026-08-07 21:55'
-updated_date: '2026-08-08 00:32'
+updated_date: '2026-08-08 00:52'
 labels:
   - irreversible
 dependencies:
@@ -89,4 +89,25 @@ NEW LIMITS INTRODUCED BY THIS ROUND, stated plainly:
 gate round 2: build/lint/fmt/test/package all exit 0; fixtures-large exit 0 (5s); fixtures-verify-rebuild exit 0 (3s, 4/4 payloads identical); nix build .#daemon .#testproxy exit 0; nix flake check exit 0 (3s, 8 checks). cargo 2 tests 2 passed. Full-tier check-fixtures: 11 ok, 4 positive controls, 3 bites, 0 PARTIAL. Two-tree determinism diff: diff -r exit 0, 13 files, 115,939,516 bytes. Stubs untouched (4x '0 scenarios registered - NOT a pass').
 
 round-2 deep-gate minor (architect, non-blocking): update_lock assigns tier via hardcoded attr=='big' (gen-fixtures.py ~:547), duplicating LARGE_PLAN knowledge - a second large payload would lock as fast and fail-closed with a misleading message. Derive tier from LARGE_PLAN when next touching this file (or in hardening).
+
+ROUND 3 (commit 0a70c5e). awaiting deep gate (round 3).
+
+Eight round-2 findings fixed, each reproduced FAILING first (evidence in the git note on 0a70c5e).
+
+1. Invalid tier failed open. A lock entry with tier 'fasst' matched neither branch of expected_attrs, so the payload silently left the fast tier's required set. load_lock() now validates the whole lock structure and rejects any tier outside {fast, full}, raising fx.LockError -> exit 2 in all three scripts. Exit 2 rather than 1 deliberately: a definition that cannot be read proves nothing about the fixture either way.
+2. Duplicate-attr collapse. Manifest attrs were collapsed to a set before the equality check, so listing zstd twice and omitting lib had the same attr set as a correct tree minus a payload. Duplicates are now counted before collapsing: 'manifest lists [zstd] more than once (4 entries, 3 distinct)'.
+3. Rebuild provenance gap. check-rebuild proved the CURRENT flake attrs rebuild deterministically, never that they are the FROZEN workload - an edited workload.nix would rebuild perfectly into a store path no measurement was taken against and report green. Output paths are now asserted equal to the locked store_path.
+4. Split transaction. --write-lock replaced the tracked lock BEFORE publication, so a publication failure restored the old tree and left the new lock: a committed record of a tree that never existed. Split into prepare_lock (everything that can refuse, runs before publish) and commit_lock (write only, runs after). Proven by injecting an OSError inside publish() after prepare_lock: lock a39382de8782d6f7 and tree d2ab43402b88715a both unchanged.
+5. tier joins MATERIAL_KEYS - ADJUDICATION RECORDED. Architect (round 2) held that tier is schema bookkeeping: it changes no byte the fixture serves, so a tier edit is not 'different bytes' and should not demand a version bump. Codex (round 3) held that tier decides which payloads a tier's gate must contain, so moving 'big' from full to fast silently changes what a fast-tier measurement covered while the version string stands still. ADOPTED the codex reading, on asymmetry of cost: a spurious version bump is an annoyance, a silently redefined baseline is a wrong decision about the kill criterion. Also fixed the architect's round-2 minor in passing - tier is now derived from LARGE_PLAN via tier_of() instead of a hardcoded attr=='big'; regenerating the lock produced a ZERO diff, which is the evidence that the derivation is behaviour-preserving.
+6. Staging rmtree without ownership validation. Staging paths are pid-derived and therefore predictable, and were rmtree'd unconditionally. Now uses safe_rmtree() with the same OUT_MARKER discipline as --out, and build_into writes the marker as its very first action so a run that dies mid-build still leaves a tree the next run may clean. Proven with a foreign file at the staging path: exit 2, file survived.
+7. flock symlink truncation. The lock path was opened with Path.open('w'), which follows symlinks AND truncates - a symlink planted there truncated its target. Now os.open with O_CREAT|O_RDWR|O_NOFOLLOW|O_CLOEXEC and no truncation (the lock needs no contents), with an ELOOP-specific message explaining the refusal. Proven: target file containing PRECIOUS CONTENT intact after the attempt.
+8. Metadata dependence - CHOSE NORMALISATION over amending the contract, as recommended. fx.normalise_tree() sets 0644 files / 0755 dirs / mtime 1, with the signing key held at 0600, and rejects any symlink in a generated tree. tree_digest() now compares mode and mtime per entry (directories included), so the normalisation is verified rather than assumed - contents-only digests were exactly why this was invisible. Proven: full generations under umask 022 and umask 077 now both yield 644/600 and metadata-aware digests compare equal; previously 755/644 vs 700/600 while the digest called them identical. Contract text updated in TESTING.md and fixtures/README.md to state that the reproducibility promise covers bytes AND metadata. Rationale for normalising rather than documenting: a consumer copying the tree with rsync or tar (task-5 containers are the obvious candidate) would otherwise see a different tree than an HTTP client, which is precisely the drift a frozen workload cannot absorb.
+
+TASK-20 folded in and marked Done (not deep-gated) - see its final summary. Cold-store runs no longer accuse the workload of nondeterminism; genuine nondeterminism still exits 1, verified in isolation so the new provenance check could not mask it.
+
+ALSO: filesystem errors during generation now exit 2 with a legible message instead of a raw traceback; an interrupted publication names the stranded .out.retired.<pid> tree and the single mv that restores it.
+
+ACCEPTED RESIDUALS, documented in docstrings, not fixed (per instruction): reusable() checks blob existence and size only - acceptable because blob_problems() re-hashes unconditionally downstream, so reuse can never keep a tree the gate would reject; a reader hitting the publish swap gets ENOENT, which is loud and retryable and is carried to task-5; a crash between the two renames strands a recoverable tree, and warn_about_stranded_trees() now names it and the restoring command.
+
+gate round 3: build/lint/fmt exit 0; test exit 0 (4s cold); fixtures-large exit 0 (8s); fixtures-verify-rebuild exit 0 (2s); package exit 0; nix build .#daemon .#testproxy exit 0 (2s); nix flake check exit 0 (2s, 8 checks). cargo 2/2. Full tier: 11 ok, 4 positive controls, 3 bites, 0 PARTIAL. Stubs untouched (4x '0 scenarios registered - NOT a pass').
 <!-- SECTION:NOTES:END -->
