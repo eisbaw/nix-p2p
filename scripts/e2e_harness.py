@@ -371,6 +371,17 @@ class Pod:
             "AC#5: no *.sec under the served cache tree (host-side walk)",
             f"leaked: {leaked}",
         )
+        if leaked:
+            # Trust invariant: a DETECTED secret must NEVER be mounted. Abort
+            # before _create() rather than record-and-continue - the previous
+            # version recorded the failing check but still called _create(), so
+            # the injected key was bind-mounted and served at HTTP 200 (codex
+            # re-gate finding). run_scenarios turns this raise into a failing
+            # scenario; the key never enters a container.
+            raise RuntimeError(
+                f"AC#5 abort: secret key(s) {leaked} present in the served "
+                "cache tree; refusing to mount"
+            )
         # Meaningful only because the key really exists beside the cache: assert
         # that too, so this proves absence-FROM-THE-SERVED-TREE, not that no key
         # exists anywhere.
@@ -699,10 +710,27 @@ echo "===PATHINFO_END==="
 
 def _parse_client(result) -> ClientResult:
     stdout = result.stdout
-    exit_code = 0
+    # Fail-closed: 'unknown' must NEVER read as success. The client script echoes
+    # REALISE_RC=<n> after its `nix build`; if that marker is absent the client
+    # exited before it ran (codex re-gate: a client exiting 99 before nix-daemon
+    # started left exit_code defaulting to 0, so the positive-control scenario
+    # stayed green while the build never happened). A missing marker, or a podman
+    # outer failure overriding a claimed success, both resolve to failure.
+    realise_rc = None
     for line in stdout.splitlines():
         if line.startswith("REALISE_RC="):
-            exit_code = int(line.split("=", 1)[1])
+            with contextlib.suppress(ValueError):
+                realise_rc = int(line.split("=", 1)[1])
+    outer_rc = getattr(result, "returncode", 0)
+    if realise_rc is None:
+        # No marker: cannot prove success. Trust an outer failure; a 0 outer rc
+        # without the marker is still unproven -> sentinel failure (111).
+        exit_code = outer_rc if outer_rc != 0 else 111
+    elif outer_rc != 0 and realise_rc == 0:
+        # Client claimed success but podman itself failed -> the failure wins.
+        exit_code = outer_rc
+    else:
+        exit_code = realise_rc
     path_info: dict = {}
     begin = stdout.find("===PATHINFO_BEGIN===")
     end = stdout.find("===PATHINFO_END===")
