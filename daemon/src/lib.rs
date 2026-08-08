@@ -36,9 +36,9 @@ pub mod upstream;
 pub use cacheinfo::CacheInfo;
 pub use catalog::{CorrelationStore, NarCatalog, NarMeta, NullCorrelation};
 pub use claim::{
-    CLAIM_SCHEMA_VERSION, Claim, ClaimCodecError, ClaimPayload, ClaimSignature, HoldAnswer,
-    HoldQuery, HoldResponse, KnownPayload, KnownTransport, NAR_HASH_LEN, NAR_HASH_PREFIX,
-    NarHashKey, NarHashKeyParseError, QUERY_SCHEMA_VERSION, SignedNarinfoRelay, TransportOffer,
+    CLAIM_SCHEMA_VERSION, Claim, ClaimCodecError, ClaimSignature, HoldAnswer, HoldQuery,
+    HoldResponse, KnownPayload, KnownTransport, MAX_CLAIM_WIRE_BYTES, NAR_HASH_LEN,
+    NAR_HASH_PREFIX, NarHashKey, NarHashKeyParseError, QUERY_SCHEMA_VERSION, SignedNarinfoRelay,
     decode_claim, decode_hold_query, decode_hold_response, encode_claim, encode_hold_query,
     encode_hold_response,
 };
