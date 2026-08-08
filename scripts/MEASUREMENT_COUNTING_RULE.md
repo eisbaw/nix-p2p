@@ -1,12 +1,17 @@
-# Measurement counting rule (task-9) — the frozen J2 baseline definition
+# Measurement counting rule (task-9) — the cross-wave comparison basis
 
-**Status: `irreversible`.** This file defines exactly what "net upstream
-egress" means for every measurement number this project records. The J2
-baseline (task-12) is frozen against this definition, and the task-16 GO/NO-GO
-kill criterion (PRD: *"<20% net cache-egress cut on the favorable testbed kills
-the p2p thesis"*) is evaluated against it. Redefining "net upstream egress"
-after J2 is written invalidates every cross-wave comparison — so this document
-changes only by retiring the baseline, never by adjusting it in place.
+**Status: comparison basis (kill criterion DESCOPED by owner, 2026-08-08).**
+Originally this was the irreversible freeze for a `<20%` GO/NO-GO kill
+criterion; the owner has since directed that the project proceeds to the p2p
+wave regardless of the measurement outcome, so this definition is no longer a
+project gate. It remains the **stable comparison basis**: the wave-1 baseline
+(task-12) and any later p2p offload numbers are only comparable if they mean the
+same thing by "net upstream egress", so keep the definition and the version
+string stable and record them in every report. Changing the definition doesn't
+kill anything now, but it silently breaks cross-wave comparison — so still bump
+the version rather than adjusting a definition in place. (Historical PRD
+reference: the retired kill criterion was *"<20% net cache-egress cut on the
+favorable testbed kills the p2p thesis"*.)
 
 The measurement instrument is `scripts/measure.py` (`just measure`); it emits a
 machine-readable JSON report whose `counting_rule` block quotes this file's
@@ -56,7 +61,7 @@ can never disagree.
 **valid** served-response record in that arm (see §4 for validity), across all
 `N` runs unless a per-run figure is named.
 
-**The kill-criterion metric is PAYLOAD (NAR) egress, not total egress.** The
+**The offload comparison metric is PAYLOAD (NAR) egress, not total egress.** The
 project's go/no-go (PRD: `<20%` net cache-egress cut) is evaluated on
 `egress_payload_nar_bytes` — the NAR body bytes crossing the boundary — because
 (a) that is precisely what p2p offloads, and (b) it is **symmetric across the
@@ -66,12 +71,12 @@ the decision metric. Two consequences are frozen here:
 
 - The daemon serves `nix-cache-info` **locally**, so the daemon-on arm shows near-
   zero `cache-info` egress at the boundary while the daemon-off arm fetches it
-  every run. Measuring the kill criterion on *total* egress would therefore credit
+  every run. Measuring offload on *total* egress would therefore credit
   the daemon a small fixed "offload" for absorbing metadata — a definitional
   artifact, not offload. Measuring on payload egress removes it.
 - The daemon narinfo cache (task-8, `--narinfo-cache-dir`) reduces *narinfo*
   egress with **zero peers** (the product-side bite in §measure proves exactly
-  this). If the kill criterion were total egress, enabling that cache could push a
+  this). If the comparison metric were total egress, enabling that cache could push a
   marginal result over the 20% bar via metadata, not p2p. **Frozen rule: the
   daemon's narinfo-cache and cache-info handling are held IDENTICAL across the
   daemon-on and daemon-off arms**, and the decision metric is payload egress, so
@@ -80,7 +85,7 @@ the decision metric. Two consequences are frozen here:
 | Included | Rule |
 |---|---|
 | **Response BODIES** | Yes. `bytes_sent` is body bytes written to the socket. |
-| **Response HEADERS** | **No.** Headers are not in `bytes_sent`. Egress is a body-byte figure by definition; header overhead is a fixed per-request framing cost that does not scale with payload and is out of scope for the kill criterion. |
+| **Response HEADERS** | **No.** Headers are not in `bytes_sent`. Egress is a body-byte figure by definition; header overhead is a fixed per-request framing cost that does not scale with payload and is out of scope for the offload comparison. |
 | **NAR bytes** | Yes. Reported as `nar` and summed into the total. |
 | **narinfo bytes** | Yes. Reported as `narinfo` and summed into the total. The product-side bite (task-8 narinfo cache) moves precisely this figure. |
 | **`nix-cache-info` bytes** | Yes, counted into the total, reported as `cache_info`. Tiny and constant; kept in the total so "total egress" is literally every body byte the boundary emitted. |
