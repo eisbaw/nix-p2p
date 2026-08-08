@@ -926,6 +926,44 @@ def scenario_tamper_narhash(ctx: Ctx, expect) -> None:
     _tamper_scenario(ctx, expect, "narhash", HASH_REJECT_NEEDLE)
 
 
+def scenario_corrupt_nar(ctx: Ctx, expect) -> None:
+    """AC#3 / TESTING.md prove-the-check-bites: with the testproxy's corrupt-NAR
+    fault armed, the NAR BYTES are corrupted on egress (the disk cache stays
+    clean by design) - and the build MUST fail, never silently accept the
+    corrupt path. This exercises the real fault surface (task-9 reuses it),
+    distinct from tamper-narhash which mutates the narinfo. Routed through the
+    chain, so it also proves the daemon passes corruption through rather than
+    masking it.
+    """
+    fixtures = ctx.fixtures
+    lib = fixtures.store_path("lib")
+    with Pod(ctx, "corrupt-nar", fixtures.cache, with_daemon=True) as pod:
+        pod.proxy_reset()
+        pod.proxy_faults("corrupt_nar=1")
+        result = pod.client_run(
+            [lib], ctx.substituter_daemon_only(), fixtures.public_key
+        )
+        expect(
+            result.exit_code != 0,
+            "corrupt-NAR: build FAILS (corruption is never silently accepted)",
+            f"exit={result.exit_code}",
+        )
+        expect(
+            result.narhash(lib) is None,
+            "corrupt-NAR: the corrupt path was NOT imported into the store",
+            "",
+        )
+        # Nix's own content gate fired on the way in. The exact wording depends
+        # on where the flip lands (hash check vs NAR framing); assert the fault
+        # was actually emitted by the proxy AND the client rejected.
+        stats = pod.proxy_stats()
+        expect(
+            stats["faults"].get("corrupt-nar", 0) > 0,
+            "corrupt-NAR: the proxy actually emitted the corrupt-NAR fault",
+            f"faults={stats['faults']}",
+        )
+
+
 def scenario_absent_404(ctx: Ctx, expect) -> None:
     """AC#3 404-fidelity: an absent path -> 404 at the client, the build
     proceeds (a sibling present path is still served), and the substituter is
@@ -977,6 +1015,7 @@ SCENARIOS = [
     ("tamper-corrupt-sig", scenario_tamper_corrupt_sig),
     ("tamper-foreign-key", scenario_tamper_foreign_key),
     ("tamper-narhash", scenario_tamper_narhash),
+    ("corrupt-nar", scenario_corrupt_nar),
     ("absent-404", scenario_absent_404),
 ]
 
