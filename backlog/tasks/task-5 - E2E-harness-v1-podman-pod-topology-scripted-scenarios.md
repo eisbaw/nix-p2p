@@ -4,7 +4,7 @@ title: 'E2E harness v1: podman-pod topology + scripted scenarios'
 status: To Do
 assignee: []
 created_date: '2026-08-07 21:55'
-updated_date: '2026-08-07 23:57'
+updated_date: '2026-08-08 00:02'
 labels: []
 dependencies:
   - TASK-3
@@ -24,6 +24,7 @@ Containerized harness, the canonical just e2e. Review-gate reality check (host-v
 - [ ] #2 nix.conf topology pinned: daemon (priority<40) AND mock/testproxy as explicit direct fallback substituter; S2 scenarios assert the fallback actually served the bytes via request counts, not merely exit 0
 - [ ] #3 Corrupt-NAR scenario: build FAILS with hash error (bite); 404-fidelity scenario: absent path -> 404 at the client, build proceeds, substituter NOT marked failed
 - [ ] #4 Scenario runner reports per-scenario pass/fail; any failing oracle fails just e2e; just e2e-clean tears down pods reliably (Ctrl-C leak trap)
+- [ ] #5 Containers bind-mount fixtures/out/cache ONLY - the test signing key (fixtures/out/*.sec) must never be mounted into any container; asserted by the harness (deep-gate finding on task-3: key beside cache/ would silently void every 'peer cannot forge' claim in wave 2)
 <!-- AC:END -->
 
 ## Implementation Notes

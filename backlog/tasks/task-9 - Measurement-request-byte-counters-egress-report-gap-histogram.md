@@ -4,7 +4,7 @@ title: 'Measurement: request/byte counters + egress report + gap histogram'
 status: To Do
 assignee: []
 created_date: '2026-08-07 21:56'
-updated_date: '2026-08-07 23:57'
+updated_date: '2026-08-08 00:02'
 labels:
   - irreversible
 dependencies:
@@ -41,4 +41,6 @@ Run 'just fixtures-large' for measurement runs: the fast tier omits fixture-big.
 Payloads are incompressible by construction (seeded SHAKE256), so xz/zstd bodies are close to their raw size - do not treat compression ratio here as representative of real nixpkgs closures. Say so where the baseline is written.
 
 CAUTION for the frozen baseline: a 'nix flake update' changes stdenv, which changes every payload's store path and NarHash, which changes the workload even though WORKLOAD_VERSION would sit still. The lock file turns that into a hard gate failure. If it ever fires, the previously recorded baseline is retired, not adjusted.
+
+deep-gate finding on task-3 (architect): every measurement artifact must record workload_version + the fixture lock's public key and hashes; and one cross-host regeneration diff of the fixture tree must be performed and recorded before any J2 baseline number is quoted (repeatability is proven, cross-host reproducibility is not - the lock makes drift loud, the cross-host diff makes it checked).
 <!-- SECTION:NOTES:END -->
