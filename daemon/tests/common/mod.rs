@@ -227,16 +227,15 @@ pub async fn spawn_daemon_with(
     upstream_url: &str,
     cache_info: CacheInfo,
 ) -> (SocketAddr, DaemonHandle) {
-    // One shared catalog: UpstreamHttp reads it, the server (App) populates it.
+    // The catalog is the server's correlation state; UpstreamHttp needs none.
     let catalog = Arc::new(NarCatalog::new());
-    let upstream =
-        Arc::new(UpstreamHttp::new(upstream_url, catalog.clone()).expect("valid upstream"));
+    let upstream = Arc::new(UpstreamHttp::new(upstream_url).expect("valid upstream"));
     let app = app_from_upstream(upstream, catalog, cache_info);
     spawn_app(app).await
 }
 
-/// Assemble an [`App`] from one `UpstreamHttp` behind all three seams, sharing
-/// `catalog` between the server and the client.
+/// Assemble an [`App`] from one `UpstreamHttp` behind all three seams, with the
+/// server's correlation `catalog`.
 pub fn app_from_upstream(
     upstream: Arc<UpstreamHttp>,
     catalog: Arc<NarCatalog>,

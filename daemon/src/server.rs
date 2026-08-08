@@ -43,8 +43,9 @@ pub struct App {
     pub nar: Arc<dyn NarSource>,
     pub passthrough: Arc<dyn RawUpstream>,
     pub cache_info: CacheInfo,
-    /// Correlation state, shared with `UpstreamHttp`: narinfos populate it, NAR
-    /// requests read it to carry the signed NarHash across the seam.
+    /// Correlation state owned by the server (UpstreamHttp holds no catalog):
+    /// narinfos populate it, NAR requests read it to carry the signed NarHash
+    /// across the seam.
     pub catalog: Arc<NarCatalog>,
 }
 
@@ -121,13 +122,21 @@ async fn handle(req: Request<Incoming>, app: Arc<App>) -> Response<NarBody> {
         }
         Route::Nar(token) => {
             // Correlate: if the daemon saw this NAR's narinfo, carry the SIGNED
-            // NarHash (the wave-2 lookup key) across the seam, plus the signed
-            // NarSize for the wave-2 abort bound (wave-1 UpstreamHttp ignores it).
+            // NarHash (the wave-2 lookup key) across the seam, plus the EXACT
+            // requested token as the wave-1 transport hint and the signed NarSize
+            // for the wave-2 abort bound (wave-1 UpstreamHttp ignores the size).
+            // The hint is the inbound token itself, never derived from the hash,
+            // so byte-identity survives a NarHash shared across compressions.
             // Otherwise fall back to the raw URL token - the documented cold-start
-            // degenerate (Nix skipped the narinfo GET, PRD risk 2); only an HTTP
-            // upstream can serve that.
+            // degenerate (Nix skipped the narinfo GET, PRD risk 2).
             let (key, expected_size) = match app.catalog.meta_for_token(token.as_str()) {
-                Some(meta) => (NarKey::SignedNarHash(meta.nar_hash), Some(meta.nar_size)),
+                Some(meta) => (
+                    NarKey::SignedNarHash {
+                        hash: meta.nar_hash,
+                        upstream_hint: token,
+                    },
+                    Some(meta.nar_size),
+                ),
                 None => (NarKey::UpstreamPath(token), None),
             };
             forward(app.nar.resolve(&key, expected_size).await, is_head)

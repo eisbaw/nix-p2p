@@ -28,7 +28,6 @@
 //!     wave-1 scope (all tests front the mock/testproxy over loopback HTTP).
 //!     Tracked as task-24 rather than pulling a TLS stack in now.
 
-use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -40,7 +39,6 @@ use hyper_util::rt::TokioIo;
 use tokio::net::TcpStream;
 use tokio::time::timeout;
 
-use crate::catalog::NarCatalog;
 use crate::source::{
     NarKey, NarSource, NarinfoSource, RawUpstream, SourceError, StoreHash, UpstreamResponse,
 };
@@ -59,17 +57,16 @@ pub struct UpstreamHttp {
     authority: String,
     connect_timeout: Duration,
     header_timeout: Duration,
-    /// Shared correlation catalog: for a [`NarKey::SignedNarHash`] this is how
-    /// the client recovers the URL token to fetch (the transport detail the seam
-    /// deliberately does not carry). A wave-2 iroh source needs none of this.
-    catalog: Arc<NarCatalog>,
 }
 
 impl UpstreamHttp {
-    /// Build a client for `base`, e.g. `http://127.0.0.1:8080`, sharing
-    /// `catalog` with the server. Fails fast on a malformed base rather than
-    /// deferring the error to the first request.
-    pub fn new(base: &str, catalog: Arc<NarCatalog>) -> Result<Self, String> {
+    /// Build a client for `base`, e.g. `http://127.0.0.1:8080`. Fails fast on a
+    /// malformed base rather than deferring the error to the first request.
+    ///
+    /// Needs no catalog: for a [`NarKey::SignedNarHash`] the request already
+    /// carries the exact URL token as `upstream_hint`, which this client fetches
+    /// verbatim - it never reconstructs a token from the hash.
+    pub fn new(base: &str) -> Result<Self, String> {
         let (host, port) = parse_authority(base)?;
         let authority = format!("{host}:{port}");
         Ok(UpstreamHttp {
@@ -79,7 +76,6 @@ impl UpstreamHttp {
             // Short by design (AC#6): a down upstream fails clean, fast.
             connect_timeout: Duration::from_millis(1000),
             header_timeout: Duration::from_millis(1000),
-            catalog,
         })
     }
 
@@ -224,26 +220,12 @@ impl NarSource for UpstreamHttp {
         // The content identity becomes an upstream URL HERE and nowhere else -
         // the seam that lets wave 2 swap in an iroh source (which resolves the
         // SignedNarHash over p2p, and rejects UpstreamPath) behind the same
-        // trait. This HTTP impl handles BOTH variants, because HTTP addresses a
-        // NAR by its URL token regardless of how we learned to reach it.
+        // trait. This HTTP impl fetches by the URL token in either case, and
+        // crucially fetches the EXACT token the request carried - never one
+        // reconstructed from the hash (which is one-to-many across compression).
         let token = match key {
-            // Normal path: recover the URL token the narinfo advertised for this
-            // signed hash. On a correlated request this is always present; a miss
-            // means the catalog lost the mapping (should not happen), which we
-            // report rather than silently guessing a URL.
-            NarKey::SignedNarHash(hash) => self
-                .catalog
-                .token_for_hash(hash)
-                .ok_or_else(|| {
-                    SourceError::Upstream(format!(
-                        "no upstream URL known for signed NarHash {}",
-                        hash.as_str()
-                    ))
-                })?
-                .as_str()
-                .to_string(),
-            // Cold-start fallback: the raw URL token straight off the wire.
-            NarKey::UpstreamPath(token) => token.as_str().to_string(),
+            NarKey::SignedNarHash { upstream_hint, .. } => upstream_hint.as_str(),
+            NarKey::UpstreamPath(token) => token.as_str(),
         };
         self.fetch_streaming(&format!("/nar/{token}"), expected_size)
             .await
@@ -275,13 +257,11 @@ mod tests {
 
     #[test]
     fn rejects_https_in_wave_1() {
-        let catalog = Arc::new(NarCatalog::new());
-        assert!(UpstreamHttp::new("https://cache.nixos.org", catalog).is_err());
+        assert!(UpstreamHttp::new("https://cache.nixos.org").is_err());
     }
 
     #[test]
     fn rejects_bad_port() {
-        let catalog = Arc::new(NarCatalog::new());
-        assert!(UpstreamHttp::new("http://host:notaport", catalog).is_err());
+        assert!(UpstreamHttp::new("http://host:notaport").is_err());
     }
 }

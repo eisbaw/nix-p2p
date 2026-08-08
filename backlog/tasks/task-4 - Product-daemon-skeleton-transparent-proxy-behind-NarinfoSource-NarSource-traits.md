@@ -6,7 +6,7 @@ title: >-
 status: In Progress
 assignee: []
 created_date: '2026-08-07 21:55'
-updated_date: '2026-08-08 08:45'
+updated_date: '2026-08-08 09:04'
 labels: []
 dependencies:
   - TASK-1
@@ -80,4 +80,17 @@ codex NO-GO: the first cut froze the WRONG key - the seam passed an opaque compr
 Reviews of the re-cut: qa-test-runner GO (34 daemon tests stable x3, fault_loop ran, seam+catalog tests non-vacuous). mped-architect: 're-cut is a genuine fix, not theater'; found 1 MUST-FIX correctness bug -> FIXED: the wave-1 size guard compared the upstream's COMPRESSED Content-Length (FileSize) against the UNCOMPRESSED NarSize limit -> spurious TooLarge/502 for tiny/incompressible NARs + wrong-by-3x DoS bound. Fix (aligned with codex's own 'expected_size feeds the WAVE-2 abort' instruction): removed the wave-1 enforcement entirely (trusted CDN = no claim-spam threat; NarSize is the wrong unit for the compressed download). expected_size still flows across the seam for wave-2 (task-25 owns the raw-NAR abort). Also addressed architect honesty notes: derived-reverse-index comment; production-frequency caveat (warm Nix clients skip the narinfo GET per PRD risk 2, so UpstreamPath is steady-state repeat until task-8 persists narinfos - SignedNarHash is first-sight-within-a-lifetime, which is what PROVES the seam, not a steady-state hit-rate claim).
 
 Gate (FAST): build/lint(clippy -D warnings, fmt, ruff, independence + HTTP denylist, source-guard, lock-sources)/test all green; daemon 34 tests; testproxy 34; fixtures full-tier 4 payloads; nix build .#daemon ok. Catalog shared-instance invariant is wiring-enforced (main.rs: one Arc, two holders); the token-miss branch is a verbose error, not a panic.
+
+--- INTEGRITY FIX (codex seam re-review: seam CORRECT, but found a NEW wave-1 S1 blocker; parked awaiting re-review) ---
+codex re-review: SignedNarHash flow / non-vacuous test / size-guard removal all PASS. NEW blocker: the NarHash->token reverse map (token_for_hash) assumed NarHash->token is 1:1. It is 1:MANY - two narinfos with the SAME uncompressed NAR but DIFFERENT compression (xz/zstd/none) share a NarHash while having different URL tokens (FileHash-of-compressed differs). Recording A->H then B->H overwrote the reverse to H->B, so GET /nar/A -> SignedNarHash(H) -> reverse-map -> B -> served B's compressed bytes for an A request. Violated S1 byte-identity. Correct blocker.
+
+Fix (codex-specified): NarKey::SignedNarHash is now a STRUCT variant { hash: NarHash, upstream_hint: NarPathToken }. Server sets upstream_hint = the EXACT inbound /nar/<token> (never derived from the hash). UpstreamHttp fetches upstream_hint VERBATIM and no longer holds any catalog. The NarHash->token reverse map + token_for_hash are DELETED; the catalog is now a FORWARD-only token->(NarHash,NarSize) map, owned solely by the server. A wave-2 p2p source keys on `hash` and ignores upstream_hint (typed as transport, cannot masquerade as identity - distinct newtypes).
+
+Tests: NEW nar_hash_collision.rs - two narinfos share a NarHash, different tokens (aaaa.nar.xz / bbbb.nar.zst), distinct bodies; asserts GET /nar/A serves A's bytes and /nar/B serves B's, plus count_path==1 each. Fails-before (reverse map serves B for A) / passes-after. NEW catalog unit test two_tokens_sharing_a_nar_hash_are_both_retained_distinctly. Seam test updated: SeenKey::Signed{hash,hint,size} - proves the fake keys on hash only, hint carried but not used as identity.
+
+Architectural wins from the fix (per mped-architect): removed derived/duplicated state (the reverse index) -> one source of truth (forward map); UpstreamHttp is now a stateless HTTP client (no shared-mutable catalog coupling that the prior review flagged); removed a 'should not happen' runtime failure mode. On the wave-1 HTTP path SignedNarHash and UpstreamPath now fetch the SAME url (the inbound token), so the correlated path is byte-for-byte equivalent to naive passthrough - cannot regress fidelity.
+
+Reviews of this round: qa-test-runner GO (36 daemon tests stable x3, fault_loop ran, collision test non-vacuous & fails-on-old-design, no reverse-map remnants). mped-architect 'S1 integrity bug is genuinely fixed, ship it' - 2 doc nits FIXED (stale server.rs catalog-field doc said 'shared with UpstreamHttp'; dead Hash derives on NarHash/NarPathToken removed).
+
+Gate (FAST): build/lint(clippy -D warnings, fmt, ruff, independence + HTTP denylist, source/lock guards)/test all green; daemon 36 tests (lib 17 incl 4 catalog, bin 4, fault_loop 1, nar_hash_collision 1, seam 2, no_direct 1, ordering 2, passthrough 8); testproxy 34; fixtures full-tier 4 payloads; nix build .#daemon ok. Honest limits unchanged: catalog in-memory/unbounded (task-8); correlated SignedNarHash path is first-sight-within-a-lifetime, warm clients hit UpstreamPath (PRD risk 2); body-idle timeout + wave-2 NarSize abort = task-25; daemon TLS = task-24.
 <!-- SECTION:NOTES:END -->

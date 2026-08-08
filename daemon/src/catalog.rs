@@ -8,10 +8,13 @@
 //! wave-2 lookup key, actually flows across the seam on the normal path - or
 //! falls back to `UpstreamPath` on a miss.
 //!
-//! `UpstreamHttp` also consults it in reverse (signed NarHash -> URL token) to
-//! know which upstream URL to fetch for a `SignedNarHash` key, so the seam value
-//! stays content-identity while the transport detail lives here and inside
-//! `UpstreamHttp`.
+//! It is a FORWARD map only (`token -> NarHash+NarSize`). There is deliberately
+//! NO reverse `NarHash -> token` map: that mapping is one-to-MANY (two narinfos
+//! with the same uncompressed NAR but different compression share a NarHash while
+//! having different tokens), so a reverse lookup would serve the wrong compressed
+//! bytes for a request. Wave-1 delivery instead carries the exact requested token
+//! as `upstream_hint` in the `SignedNarHash` key, so `UpstreamHttp` never
+//! consults this catalog at all - it fetches the hint verbatim.
 //!
 //! Scope, stated so the freeze is honest:
 //!   * IN-MEMORY and UNBOUNDED. A long-running daemon accumulates one small entry
@@ -42,7 +45,8 @@ pub struct NarMeta {
     pub nar_size: u64,
 }
 
-/// Bidirectional token <-> signed-NarHash map, learned as narinfos pass through.
+/// Forward token -> signed-NarHash+NarSize map, learned as narinfos pass through.
+/// FORWARD-ONLY on purpose: see the module docs for why there is no reverse map.
 #[derive(Debug, Default)]
 pub struct NarCatalog {
     inner: RwLock<Inner>,
@@ -50,14 +54,10 @@ pub struct NarCatalog {
 
 #[derive(Debug, Default)]
 struct Inner {
-    /// URL token -> (signed NarHash, NarSize). Server reads this at nar-request
-    /// time to decide `SignedNarHash` vs `UpstreamPath`.
+    /// URL token -> (signed NarHash, NarSize). The server reads this at
+    /// nar-request time to decide `SignedNarHash` vs `UpstreamPath` and to attach
+    /// the signed hash to the request.
     by_token: HashMap<String, NarMeta>,
-    /// Derived reverse index of `by_token` (signed NarHash -> URL token), written
-    /// together with it under one lock in `record` so the two cannot diverge.
-    /// `UpstreamHttp` reads this to fetch a `SignedNarHash` key from the HTTP
-    /// upstream.
-    token_by_hash: HashMap<String, NarPathToken>,
 }
 
 impl NarCatalog {
@@ -70,9 +70,6 @@ impl NarCatalog {
     pub fn record(&self, token: NarPathToken, nar_hash: NarHash, nar_size: u64) {
         let mut inner = self.inner.write().expect("catalog lock poisoned");
         inner
-            .token_by_hash
-            .insert(nar_hash.as_str().to_string(), token.clone());
-        inner
             .by_token
             .insert(token.as_str().to_string(), NarMeta { nar_hash, nar_size });
     }
@@ -84,17 +81,6 @@ impl NarCatalog {
             .expect("catalog lock poisoned")
             .by_token
             .get(token)
-            .cloned()
-    }
-
-    /// The URL token to fetch for a signed NarHash, if known. Used by
-    /// `UpstreamHttp` to serve a `SignedNarHash` key over HTTP.
-    pub fn token_for_hash(&self, nar_hash: &NarHash) -> Option<NarPathToken> {
-        self.inner
-            .read()
-            .expect("catalog lock poisoned")
-            .token_by_hash
-            .get(nar_hash.as_str())
             .cloned()
     }
 }
@@ -156,21 +142,37 @@ Sig: k:AAAA==\n";
     }
 
     #[test]
-    fn round_trips_both_directions() {
+    fn records_and_looks_up_by_token() {
         let catalog = NarCatalog::new();
         let (token, hash, size) = parse_correlation(NARINFO).unwrap();
-        catalog.record(token.clone(), hash.clone(), size);
+        catalog.record(token, hash.clone(), size);
 
         let meta = catalog.meta_for_token("1abc.nar.xz").unwrap();
         assert_eq!(meta.nar_hash, hash);
         assert_eq!(meta.nar_size, 4096);
-        assert_eq!(catalog.token_for_hash(&hash), Some(token));
-        // Unknown lookups are misses, not panics.
+        // An unknown token is a miss, not a panic.
         assert!(catalog.meta_for_token("unknown.nar").is_none());
-        assert!(
-            catalog
-                .token_for_hash(&NarHash::new("sha256:zzz"))
-                .is_none()
+    }
+
+    #[test]
+    fn two_tokens_sharing_a_nar_hash_are_both_retained_distinctly() {
+        // The one-to-many case that sank the reverse map: same uncompressed NAR
+        // (same NarHash), different compression -> different tokens. Each token
+        // must resolve to ITS OWN entry so the daemon fetches the right token.
+        let catalog = NarCatalog::new();
+        let hash = NarHash::new("sha256:sharedhash");
+        catalog.record(NarPathToken::new("aaaa.nar.xz"), hash.clone(), 4096);
+        catalog.record(NarPathToken::new("bbbb.nar.zst"), hash.clone(), 4096);
+
+        // Both forward entries survive carrying the shared hash - neither
+        // overwrote the other (a reverse NarHash->token map could not do this).
+        assert_eq!(
+            catalog.meta_for_token("aaaa.nar.xz").unwrap().nar_hash,
+            hash
+        );
+        assert_eq!(
+            catalog.meta_for_token("bbbb.nar.zst").unwrap().nar_hash,
+            hash
         );
     }
 }

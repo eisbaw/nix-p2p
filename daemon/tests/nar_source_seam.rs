@@ -48,16 +48,22 @@ fn narinfo_body() -> Vec<u8> {
 }
 
 /// What the fake was asked to resolve - recorded so the test can prove which
-/// variant flowed.
+/// variant flowed. For the signed variant we capture the hint too, to prove it
+/// is carried but NOT used as the identity.
 #[derive(Debug, Clone, PartialEq)]
 enum SeenKey {
-    Signed(String, Option<u64>),
+    Signed {
+        hash: String,
+        hint: String,
+        size: Option<u64>,
+    },
     Path(String),
 }
 
 /// A p2p-style NAR source: a content store keyed ENTIRELY on the signed NarHash.
 /// It has no URLs, no HTTP, no notion of a `nar/` path. It serves a
-/// `SignedNarHash` it holds and REJECTS an `UpstreamPath` (it cannot fetch one).
+/// `SignedNarHash` it holds (keying ONLY on `hash`, ignoring the transport
+/// `upstream_hint`) and REJECTS an `UpstreamPath` (it cannot fetch one).
 struct FakeP2pNar {
     by_hash: HashMap<String, Vec<u8>>,
     seen: Arc<Mutex<Vec<SeenKey>>>,
@@ -71,11 +77,17 @@ impl NarSource for FakeP2pNar {
         expected_size: Option<u64>,
     ) -> Result<UpstreamResponse, SourceError> {
         match key {
-            NarKey::SignedNarHash(hash) => {
-                self.seen
-                    .lock()
-                    .unwrap()
-                    .push(SeenKey::Signed(hash.as_str().to_string(), expected_size));
+            NarKey::SignedNarHash {
+                hash,
+                upstream_hint,
+            } => {
+                self.seen.lock().unwrap().push(SeenKey::Signed {
+                    hash: hash.as_str().to_string(),
+                    hint: upstream_hint.as_str().to_string(),
+                    size: expected_size,
+                });
+                // Keys on the HASH only - the hint is a transport detail a p2p
+                // source has no use for.
                 let bytes = self.by_hash.get(hash.as_str()).ok_or_else(|| {
                     SourceError::Unreachable(format!("no p2p content for {}", hash.as_str()))
                 })?;
@@ -174,12 +186,19 @@ async fn signed_nar_hash_reaches_a_url_free_p2p_source_on_the_correlated_path() 
         "the daemon returned the fake's exact bytes"
     );
 
-    // The exact signed NarHash and NarSize crossed the seam - NOT a URL token.
+    // The exact signed NarHash + NarSize crossed the seam, and the transport hint
+    // is the requested token - carried, but the fake keyed on the HASH (it found
+    // content by NARHASH, not by the token), so the hint cannot masquerade as the
+    // identity.
     let seen = seen.lock().unwrap();
     assert_eq!(
         *seen,
-        vec![SeenKey::Signed(NARHASH.to_string(), Some(NARSIZE))],
-        "the normal path must carry SignedNarHash + NarSize, nothing else"
+        vec![SeenKey::Signed {
+            hash: NARHASH.to_string(),
+            hint: TOKEN.to_string(),
+            size: Some(NARSIZE),
+        }],
+        "the normal path must carry SignedNarHash{{hash,hint}} + NarSize"
     );
 }
 

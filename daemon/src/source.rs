@@ -22,15 +22,17 @@
 //! How the signed NarHash reaches the seam (the PRD "learn NarHash at narinfo
 //! time" design, minimal form): when a narinfo passes through, the server records
 //! `url-token -> (signed NarHash, NarSize)` in an in-memory [`crate::catalog`].
-//! When `GET /nar/<token>` then arrives, the server looks the token up and
-//! resolves via `SignedNarHash` on a hit - so the normal path carries the signed
-//! hash, proving wave-2's key actually flows - or falls back to `UpstreamPath` on
-//! a miss. `UpstreamHttp` maps either key to a concrete upstream URL (consulting
-//! the same catalog for the `SignedNarHash` case); a wave-2 `IrohNarSource`
-//! handles `SignedNarHash` directly and rejects `UpstreamPath`. No serving-layer
-//! change is needed for that swap. `tests/nar_source_seam.rs` proves a fake p2p
-//! source keyed purely on NarHash (zero URL knowledge) resolves the normal path
-//! and rejects the fallback.
+//! When `GET /nar/<token>` then arrives, the server looks the token up and, on a
+//! hit, resolves via `SignedNarHash { hash, upstream_hint }` where `upstream_hint`
+//! is the EXACT requested token (not derived from the hash - see the variant
+//! docs for why that would corrupt bytes). So the normal path carries the signed
+//! hash AND the precise transport token, non-lossily. `UpstreamHttp` fetches the
+//! token verbatim (it needs no catalog); a wave-2 `IrohNarSource` resolves by
+//! `hash` and ignores `upstream_hint`. No serving-layer change is needed for that
+//! swap. `tests/nar_source_seam.rs` proves a fake p2p source keyed purely on
+//! NarHash (zero URL knowledge) resolves the normal path and rejects the
+//! fallback; `tests/nar_hash_collision.rs` proves S1 byte-identity holds when two
+//! narinfos share a NarHash but differ in compression/token.
 //!
 //! [`RawUpstream`] is deliberately NOT a capability seam: it is the wave-1
 //! transparent-proxy passthrough for path kinds that are neither narinfo nor
@@ -74,7 +76,7 @@ impl StoreHash {
 /// wave-2 claims index / DHT keys on, and the value the client re-verifies. It is
 /// NOT the URL token (that is [`NarPathToken`], FileHash-derived and rewritten
 /// away in wave 2). Kept as a distinct newtype so the two can never be confused.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NarHash(String);
 
 impl NarHash {
@@ -90,7 +92,7 @@ impl NarHash {
 /// `1abc...nar.xz`, WITH any compression suffix). FileHash-derived for
 /// cache.nixos.org; a transport detail, NOT a signed hash. Only meaningful to an
 /// HTTP upstream, which is why a p2p source rejects it.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NarPathToken(String);
 
 impl NarPathToken {
@@ -106,13 +108,27 @@ impl NarPathToken {
 /// erased string, so the source can dispatch on what the value actually is (the
 /// erasure codex flagged in the first cut).
 ///
-/// The variant is the seam's honesty: `SignedNarHash` is the normal,
-/// correlated path (the wave-2 p2p key); `UpstreamPath` is the wave-1 cold-start
-/// fallback that only an HTTP upstream can resolve.
+/// The variant is the seam's honesty: `SignedNarHash` is the normal, correlated
+/// path (the wave-2 p2p key); `UpstreamPath` is the wave-1 cold-start fallback
+/// that only an HTTP upstream can resolve.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum NarKey {
-    /// Correlated at narinfo time: the signed NarHash. The wave-2 lookup key.
-    SignedNarHash(NarHash),
+    /// Correlated at narinfo time. Carries BOTH the trust anchor and the exact
+    /// transport token, because the two are NOT interchangeable:
+    SignedNarHash {
+        /// The signed NarHash - trust anchor and wave-2 p2p lookup key. A wave-2
+        /// source resolves by THIS and ignores `upstream_hint`.
+        hash: NarHash,
+        /// The EXACT `nar/`-relative token the request came in on, for wave-1
+        /// HTTP delivery. Carried explicitly - NOT reconstructed from `hash` -
+        /// because NarHash -> token is one-to-MANY: two narinfos with identical
+        /// uncompressed NAR content but different compression (xz vs zstd vs
+        /// none) share a NarHash yet have different tokens (FileHash-of-compressed
+        /// differs). Deriving the token from the hash would serve the wrong
+        /// compressed bytes for a request and break S1 byte-identity. Typed as a
+        /// transport hint so it can never masquerade as the identity.
+        upstream_hint: NarPathToken,
+    },
     /// Un-correlated cold-start fallback: the raw URL token. HTTP-only.
     UpstreamPath(NarPathToken),
 }

@@ -104,11 +104,11 @@ async fn main() -> ExitCode {
 
     println!("{}", banner());
 
-    // The correlation catalog is shared between the server (which populates it as
-    // narinfos pass through) and UpstreamHttp (which reads it to fetch a
-    // SignedNarHash key). One instance, two holders.
+    // The correlation catalog lives in the server only: it populates it as
+    // narinfos pass through and reads it at NAR-request time. UpstreamHttp needs
+    // no catalog - the request carries the exact URL token to fetch.
     let catalog = Arc::new(NarCatalog::new());
-    let upstream = match UpstreamHttp::new(&config.upstream, catalog.clone()) {
+    let upstream = match UpstreamHttp::new(&config.upstream) {
         Ok(upstream) => Arc::new(upstream),
         Err(err) => {
             eprintln!("daemon: bad --upstream: {err}");
