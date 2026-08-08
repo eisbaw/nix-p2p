@@ -22,6 +22,7 @@
 mod body;
 pub mod cacheinfo;
 pub mod catalog;
+pub mod claim;
 pub mod narinfo_cache;
 pub mod rewrite;
 pub mod server;
@@ -30,6 +31,12 @@ pub mod upstream;
 
 pub use cacheinfo::CacheInfo;
 pub use catalog::{CorrelationStore, NarCatalog, NarMeta, NullCorrelation};
+pub use claim::{
+    CLAIM_SCHEMA_VERSION, Claim, ClaimCodecError, ClaimPayload, ClaimSignature, HoldAnswer,
+    HoldQuery, HoldResponse, KnownPayload, KnownTransport, NarHashKey, NodeId,
+    QUERY_SCHEMA_VERSION, RawNarBlake3, SignedNarinfoRelay, TransportOffer, decode_claim,
+    decode_hold_query, decode_hold_response, encode_claim, encode_hold_query, encode_hold_response,
+};
 pub use narinfo_cache::{Clock, NarinfoDiskCache, SystemClock};
 pub use server::{App, serve};
 pub use source::{

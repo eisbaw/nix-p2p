@@ -31,6 +31,15 @@ http-body = "1"
 http-body-util = "0.1"
 bytes = "1"
 async-trait = "0.1"
+# Claim wire format (task-37): serde derives on the versioned record + query
+# envelope, JSON as the draft codec. DAEMON-ONLY on purpose - testproxy stays
+# std-only (an independent witness of wire behaviour), so these are never shared.
+# Not HTTP-stack crates, so `just independence`'s convergence denylist is
+# unaffected; the manifest guard only forbids a shared WORKSPACE crate.
+# serde_json is a normal (not dev) dep: the Unknown forward-compat catch-all
+# holds a serde_json::Value in the public types, not just in tests.
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
 
 [dev-dependencies]
 # process: spawn the real testproxy binary for the fault-mode loop (AC#2).
