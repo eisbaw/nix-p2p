@@ -4,7 +4,7 @@ title: Mock upstream mode + signed fixture store
 status: In Progress
 assignee: []
 created_date: '2026-08-07 21:55'
-updated_date: '2026-08-08 06:33'
+updated_date: '2026-08-08 06:51'
 labels:
   - irreversible
 dependencies:
@@ -229,4 +229,6 @@ FREEZE DETECTION preserved, honestly split (TESTING.md + fixtures/README.md upda
 DEFERRED (codex residual finding 4) filed as TASK-21 (label deferred-finding): generation resolution, retention and link flips remain path-based; exploiting needs the excluded hostile-same-uid ancestor swap. Not fixed - round 8 scope was exactly the three items.
 
 gate round 8: build/lint/fmt/test/fixtures-large/fixtures-verify-rebuild/package all exit 0; nix build .#daemon .#testproxy exit 0; nix flake check exit 0 (9 checks - lock-sources joins). cargo 2/2. Full tier: 12 ok, 4 positive controls, 3 bites, 0 PARTIAL. Determinism: two fresh roots same name, diff -r exit 0, digests equal over 19 entries. Reuse repair loop terminates; 3 concurrent generators exit 0 0 0. Lock byte-identical (a39382de8782d6f7) and served content byte-identical - unchanged since round 2.
+
+Round-9 adjudication (TERMINAL, no round 10): codex round-8 verified the design-B redesign is CORRECT (split structurally gone via 10k concurrent flips; freeze check sound; byte-identical regression). The lone open item is guard-completeness: check-lock-sources.py catches known call-names but not a raw read_text() of the baseline path, so AC1's literal 'proves no runtime code opens the git baseline' is not met. Round 9 strengthens the guard to statically reject EVERY ORDINARY reintroduction (AST call-names + literal baseline path/filename string scan across runtime modules) and DOCUMENTS the irreducible residual (a dynamically-constructed path evades any static lint). AC1 'proves' is interpreted as 'statically rejects every ordinary reintroduction + honest residual' - a static guard cannot prove a negative against arbitrary code; this is disclosed honest interpretation, not AC-gaming (the guard is strengthened to its real limit, the gap disclosed, not the test weakened to pass). On verification that the strengthened guard bites codex's exact evasion (raw read_text), task-3 CLOSES. Further guard-obfuscation nitpicks -> hardening wave, not another round.
 <!-- SECTION:NOTES:END -->
