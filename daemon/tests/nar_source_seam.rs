@@ -1,51 +1,120 @@
-//! AC#1: the `NarSource` seam is URL-free.
+//! AC#1 (re-cut after the codex NO-GO): the `NarSource` seam carries the SIGNED
+//! NarHash on the normal path, so a wave-2 p2p source - which resolves a NAR by
+//! its signed NarHash via a claims index, with NO upstream URL - has the key it
+//! needs.
 //!
-//! Proves a fake `NarSource` that has ZERO URL knowledge - it never parses a
-//! URL, never opens a socket, never constructs an upstream path - fully
-//! satisfies the daemon's HTTP serving layer. This is the load-bearing property
-//! of wave 0: because `resolve` takes a content identity (`NarHash`) plus an
-//! expected-size bound and NOT a URL, wave 2 can drop in an iroh source
-//! addressed by BLAKE3 without touching the serving layer. The narinfo `URL`
-//! field is consumed only inside `UpstreamHttp`, which this test never uses.
+//! Proves:
+//!   1. A fake p2p `NarSource` keyed PURELY on NarHash (zero URL knowledge)
+//!      resolves a NAR when the request is correlated (the daemon saw the
+//!      narinfo first). The exact signed NarHash and the signed NarSize reach the
+//!      fake across the seam.
+//!   2. The fake REJECTS a `NarKey::UpstreamPath` (it has no URL), and that
+//!      variant is reached ONLY on the un-correlated cold-start fallback (no
+//!      narinfo seen this lifetime). This is what makes `SignedNarHash` the
+//!      normal path rather than theater.
 
 mod common;
 
+use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use bytes::Bytes;
 use daemon::{
-    App, CacheInfo, NarLocator, NarSource, NarinfoSource, RawUpstream, SourceError, StoreHash,
-    UpstreamResponse,
+    App, CacheInfo, NarCatalog, NarKey, NarSource, NarinfoSource, RawUpstream, SourceError,
+    StoreHash, UpstreamResponse,
 };
 use http::HeaderMap;
 use http_body_util::{BodyExt, Full};
 
-/// Record of `(nar_hash, expected_size)` the fake was asked to resolve.
-type Seen = Arc<Mutex<Vec<(String, Option<u64>)>>>;
+const TOKEN: &str = "1abcdefghijklmnop.nar.xz";
+const NARHASH: &str = "sha256:1b2c3d4e5f60718293a4b5c6d7e8f90112233445566778899aabbccddeeff00";
+const NARSIZE: u64 = 4096;
 
-/// A NAR source with no notion of URLs, HTTP, or upstreams. It returns fixed
-/// bytes for any identity and records what it was asked for.
-struct FakeNar {
-    body: Vec<u8>,
-    seen: Seen,
+/// Narinfo whose `URL:` token, `NarHash:` and `NarSize:` the daemon will correlate.
+fn narinfo_body() -> Vec<u8> {
+    format!(
+        "StorePath: /nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-x\n\
+         URL: nar/{TOKEN}\n\
+         Compression: xz\n\
+         FileHash: sha256:0000000000000000000000000000000000000000000000000000\n\
+         FileSize: 100\n\
+         NarHash: {NARHASH}\n\
+         NarSize: {NARSIZE}\n\
+         References: \n\
+         Sig: nix-p2p-test-1:AAAA==\n"
+    )
+    .into_bytes()
+}
+
+/// What the fake was asked to resolve - recorded so the test can prove which
+/// variant flowed.
+#[derive(Debug, Clone, PartialEq)]
+enum SeenKey {
+    Signed(String, Option<u64>),
+    Path(String),
+}
+
+/// A p2p-style NAR source: a content store keyed ENTIRELY on the signed NarHash.
+/// It has no URLs, no HTTP, no notion of a `nar/` path. It serves a
+/// `SignedNarHash` it holds and REJECTS an `UpstreamPath` (it cannot fetch one).
+struct FakeP2pNar {
+    by_hash: HashMap<String, Vec<u8>>,
+    seen: Arc<Mutex<Vec<SeenKey>>>,
 }
 
 #[async_trait]
-impl NarSource for FakeNar {
+impl NarSource for FakeP2pNar {
     async fn resolve(
         &self,
-        locator: &NarLocator,
+        key: &NarKey,
         expected_size: Option<u64>,
     ) -> Result<UpstreamResponse, SourceError> {
-        self.seen
-            .lock()
-            .unwrap()
-            .push((locator.as_str().to_string(), expected_size));
+        match key {
+            NarKey::SignedNarHash(hash) => {
+                self.seen
+                    .lock()
+                    .unwrap()
+                    .push(SeenKey::Signed(hash.as_str().to_string(), expected_size));
+                let bytes = self.by_hash.get(hash.as_str()).ok_or_else(|| {
+                    SourceError::Unreachable(format!("no p2p content for {}", hash.as_str()))
+                })?;
+                let mut headers = HeaderMap::new();
+                headers.insert(http::header::CONTENT_LENGTH, bytes.len().into());
+                Ok(UpstreamResponse {
+                    status: 200,
+                    headers,
+                    body: Full::new(Bytes::from(bytes.clone()))
+                        .map_err(|never| match never {})
+                        .boxed(),
+                })
+            }
+            NarKey::UpstreamPath(token) => {
+                self.seen
+                    .lock()
+                    .unwrap()
+                    .push(SeenKey::Path(token.as_str().to_string()));
+                // A p2p source has no URL to fetch - it cannot serve this.
+                Err(SourceError::Unreachable(
+                    "a p2p source cannot resolve an UpstreamPath (no URL)".to_string(),
+                ))
+            }
+        }
+    }
+}
+
+/// Serves a fixed narinfo for any hash, so the daemon can correlate.
+struct FakeNarinfo {
+    body: Vec<u8>,
+}
+
+#[async_trait]
+impl NarinfoSource for FakeNarinfo {
+    async fn fetch(&self, _: &StoreHash) -> Result<UpstreamResponse, SourceError> {
         let mut headers = HeaderMap::new();
         headers.insert(
             http::header::CONTENT_TYPE,
-            "application/x-nix-nar".parse().unwrap(),
+            "text/x-nix-narinfo".parse().unwrap(),
         );
         headers.insert(http::header::CONTENT_LENGTH, self.body.len().into());
         Ok(UpstreamResponse {
@@ -58,81 +127,81 @@ impl NarSource for FakeNar {
     }
 }
 
-/// A source that always fails - stands in for the narinfo/passthrough seams,
-/// which this test does not exercise. Proves the NAR path needs none of them.
+/// Passthrough seam, unused here - always fails.
 struct Dead;
-
-#[async_trait]
-impl NarinfoSource for Dead {
-    async fn fetch(&self, _: &StoreHash) -> Result<UpstreamResponse, SourceError> {
-        Err(SourceError::Unreachable("unused in this test".into()))
-    }
-}
 
 #[async_trait]
 impl RawUpstream for Dead {
     async fn get(&self, _: &str) -> Result<UpstreamResponse, SourceError> {
-        Err(SourceError::Unreachable("unused in this test".into()))
+        Err(SourceError::Unreachable("unused".into()))
     }
 }
 
-#[tokio::test]
-async fn fake_nar_source_with_zero_url_knowledge_satisfies_the_http_layer() {
-    let canned = b"\x0dnix-archive-1 THIS IS A FAKE NAR PAYLOAD".to_vec();
-    let seen = Arc::new(Mutex::new(Vec::new()));
-    let fake = Arc::new(FakeNar {
-        body: canned.clone(),
-        seen: Arc::clone(&seen),
-    });
-
-    let app = Arc::new(App {
-        narinfo: Arc::new(Dead),
-        nar: fake as Arc<dyn NarSource>,
+fn build_app(canned_nar: &[u8], seen: Arc<Mutex<Vec<SeenKey>>>) -> Arc<App> {
+    let mut by_hash = HashMap::new();
+    by_hash.insert(NARHASH.to_string(), canned_nar.to_vec());
+    Arc::new(App {
+        narinfo: Arc::new(FakeNarinfo {
+            body: narinfo_body(),
+        }),
+        nar: Arc::new(FakeP2pNar { by_hash, seen }),
         passthrough: Arc::new(Dead),
         cache_info: CacheInfo::default(),
-    });
-    let (addr, _daemon) = common::spawn_app(app).await;
-
-    // A NAR request with a compression-suffixed locator: the serving layer hands
-    // the whole opaque token to the fake, which ignores it entirely.
-    let resp = common::get(addr, "/nar/1abcdefghijklmnopqrstuvwxyz.nar.xz").await;
-
-    assert_eq!(resp.status, Some(200), "fake source served the NAR route");
-    assert_eq!(
-        resp.body, canned,
-        "the daemon returned the fake's exact bytes"
-    );
-    assert_eq!(
-        resp.header("content-type"),
-        Some("application/x-nix-nar"),
-        "the fake's headers are forwarded"
-    );
-
-    // The seam carried the content identity (opaque token) and the size bound
-    // (None in wave-1 passthrough), and nothing else - no URL.
-    let seen = seen.lock().unwrap();
-    assert_eq!(seen.len(), 1, "the NAR route called the trait exactly once");
-    assert_eq!(seen[0].0, "1abcdefghijklmnopqrstuvwxyz.nar.xz");
-    assert_eq!(seen[0].1, None, "wave-1 passes no size bound");
+        catalog: Arc::new(NarCatalog::new()),
+    })
 }
 
 #[tokio::test]
-async fn nar_route_is_independent_of_narinfo_and_passthrough_seams() {
-    // Even with the other two seams hard-wired to fail, the NAR route works -
-    // the serving layer has no hidden dependency on them for NAR delivery.
+async fn signed_nar_hash_reaches_a_url_free_p2p_source_on_the_correlated_path() {
+    let canned = b"nix-archive-1 FAKE P2P NAR PAYLOAD".to_vec();
     let seen = Arc::new(Mutex::new(Vec::new()));
-    let app = Arc::new(App {
-        narinfo: Arc::new(Dead),
-        nar: Arc::new(FakeNar {
-            body: b"payload".to_vec(),
-            seen: Arc::clone(&seen),
-        }) as Arc<dyn NarSource>,
-        passthrough: Arc::new(Dead),
-        cache_info: CacheInfo::default(),
-    });
-    let (addr, _daemon) = common::spawn_app(app).await;
+    let (addr, _daemon) = common::spawn_app(build_app(&canned, Arc::clone(&seen))).await;
 
-    let resp = common::get(addr, "/nar/whatever.nar").await;
-    assert_eq!(resp.status, Some(200));
-    assert_eq!(resp.body, b"payload");
+    // 1. The daemon serves the narinfo -> it correlates token -> signed NarHash.
+    let narinfo = common::get(addr, "/somestorehash.narinfo").await;
+    assert_eq!(narinfo.status, Some(200));
+
+    // 2. The NAR request for that token now resolves via the SIGNED NarHash - the
+    //    p2p fake, which knows only hashes, serves it.
+    let nar = common::get(addr, &format!("/nar/{TOKEN}")).await;
+    assert_eq!(
+        nar.status,
+        Some(200),
+        "p2p source served the correlated NAR"
+    );
+    assert_eq!(
+        nar.body, canned,
+        "the daemon returned the fake's exact bytes"
+    );
+
+    // The exact signed NarHash and NarSize crossed the seam - NOT a URL token.
+    let seen = seen.lock().unwrap();
+    assert_eq!(
+        *seen,
+        vec![SeenKey::Signed(NARHASH.to_string(), Some(NARSIZE))],
+        "the normal path must carry SignedNarHash + NarSize, nothing else"
+    );
+}
+
+#[tokio::test]
+async fn uncorrelated_nar_request_falls_back_to_upstream_path_which_the_p2p_source_rejects() {
+    let canned = b"payload".to_vec();
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let (addr, _daemon) = common::spawn_app(build_app(&canned, Arc::clone(&seen))).await;
+
+    // No narinfo fetched first: the daemon never learned this token, so it falls
+    // back to UpstreamPath. The p2p fake has no URL and rejects it -> 502.
+    let nar = common::get(addr, "/nar/never-seen.nar").await;
+    assert_eq!(
+        nar.status,
+        Some(502),
+        "an un-correlated NAR hits the HTTP-only fallback, which a p2p source cannot serve"
+    );
+
+    let seen = seen.lock().unwrap();
+    assert_eq!(
+        *seen,
+        vec![SeenKey::Path("never-seen.nar".to_string())],
+        "the fallback path must carry UpstreamPath, and only on a cold miss"
+    );
 }

@@ -3,10 +3,10 @@ id: TASK-4
 title: >-
   Product daemon skeleton: transparent proxy behind NarinfoSource/NarSource
   traits
-status: Done
+status: In Progress
 assignee: []
 created_date: '2026-08-07 21:55'
-updated_date: '2026-08-08 08:28'
+updated_date: '2026-08-08 08:45'
 labels: []
 dependencies:
   - TASK-1
@@ -68,4 +68,16 @@ FORWARD-CARRY:
 - task-9 (measurement): daemon self-counters slot into server::handle / UpstreamHttp dispatch. Measurement READS but does NOT TRUST them (testproxy byte counters are ground truth).
 
 Seam re-freeze (codex cadence NO-GO, orchestrator-adjudicated blocker): NarLocator(String) carried a URL token, not the signed NarHash - a wave-2 p2p NarSource keyed on a claims index would have no lookup key, and the seam test proved DI not URL-independence. Fix: typed enum NarKey{SignedNarHash(NarHash), UpstreamPath(token)}; correlate token->NarHash at narinfo-serve time (PRD prefetch design, minimal in-memory map) so the NORMAL nar path carries the signed NarHash through the seam; UpstreamPath only for un-correlated cold-start fallback; test must prove a URL-less p2p-style fake resolves the exact NarHash. This is the freeze that lets wave-2 swap iroh without touching the HTTP layer.
+
+--- SEAM RE-CUT (codex cross-model NO-GO fix; parked awaiting seam re-review, NOT Done) ---
+codex NO-GO: the first cut froze the WRONG key - the seam passed an opaque compression-suffixed URL token (FileHash-derived), NOT the signed NarHash, so a wave-2 p2p NarSource (resolves by signed NarHash via a claims index, no URL) had no lookup key. Correct blocker. Fixed:
+
+1. Typed key, no String erasure: NarKey enum { SignedNarHash(NarHash) | UpstreamPath(NarPathToken) } (source.rs). NarHash (signed sha256, trust anchor) and NarPathToken (transport URL token) are distinct newtypes - can never be confused.
+2. Correlation at narinfo-serve time (PRD "learn NarHash at narinfo time", minimal form): new catalog.rs = in-memory bidirectional token<->(NarHash,NarSize) map. server::respond_narinfo parses URL/NarHash/NarSize from each narinfo passing through and records it. On GET /nar/<token>: catalog hit -> NarKey::SignedNarHash (+ expected_size Some(NarSize)); miss -> NarKey::UpstreamPath (cold-start fallback). So the SIGNED NarHash flows across the seam on the normal path.
+3. UpstreamHttp holds Arc<NarCatalog> (shared with the server); on SignedNarHash it recovers the URL token via catalog.token_for_hash to fetch. Wave-2 IrohNarSource handles SignedNarHash directly and rejects UpstreamPath.
+4. Seam test (nar_source_seam.rs) rewritten: FakeP2pNar keyed PURELY on NarHash (zero URL knowledge) - proves (a) correlated request delivers the exact SignedNarHash+NarSize to the fake (exact-vector assert; TOKEN textually != NARHASH so it can't pass vacuously), (b) uncorrelated request -> UpstreamPath -> fake REJECTS -> 502. Non-vacuous both directions.
+
+Reviews of the re-cut: qa-test-runner GO (34 daemon tests stable x3, fault_loop ran, seam+catalog tests non-vacuous). mped-architect: 're-cut is a genuine fix, not theater'; found 1 MUST-FIX correctness bug -> FIXED: the wave-1 size guard compared the upstream's COMPRESSED Content-Length (FileSize) against the UNCOMPRESSED NarSize limit -> spurious TooLarge/502 for tiny/incompressible NARs + wrong-by-3x DoS bound. Fix (aligned with codex's own 'expected_size feeds the WAVE-2 abort' instruction): removed the wave-1 enforcement entirely (trusted CDN = no claim-spam threat; NarSize is the wrong unit for the compressed download). expected_size still flows across the seam for wave-2 (task-25 owns the raw-NAR abort). Also addressed architect honesty notes: derived-reverse-index comment; production-frequency caveat (warm Nix clients skip the narinfo GET per PRD risk 2, so UpstreamPath is steady-state repeat until task-8 persists narinfos - SignedNarHash is first-sight-within-a-lifetime, which is what PROVES the seam, not a steady-state hit-rate claim).
+
+Gate (FAST): build/lint(clippy -D warnings, fmt, ruff, independence + HTTP denylist, source-guard, lock-sources)/test all green; daemon 34 tests; testproxy 34; fixtures full-tier 4 payloads; nix build .#daemon ok. Catalog shared-instance invariant is wiring-enforced (main.rs: one Arc, two holders); the token-miss branch is a verbose error, not a panic.
 <!-- SECTION:NOTES:END -->

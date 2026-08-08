@@ -21,7 +21,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 
-use daemon::{App, CacheInfo, NarSource, NarinfoSource, RawUpstream, UpstreamHttp, serve};
+use daemon::{
+    App, CacheInfo, NarCatalog, NarSource, NarinfoSource, RawUpstream, UpstreamHttp, serve,
+};
 use flate2::Compression;
 use flate2::read::{GzDecoder, GzEncoder};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -225,18 +227,27 @@ pub async fn spawn_daemon_with(
     upstream_url: &str,
     cache_info: CacheInfo,
 ) -> (SocketAddr, DaemonHandle) {
-    let upstream = Arc::new(UpstreamHttp::new(upstream_url).expect("valid upstream"));
-    let app = app_from_upstream(upstream, cache_info);
+    // One shared catalog: UpstreamHttp reads it, the server (App) populates it.
+    let catalog = Arc::new(NarCatalog::new());
+    let upstream =
+        Arc::new(UpstreamHttp::new(upstream_url, catalog.clone()).expect("valid upstream"));
+    let app = app_from_upstream(upstream, catalog, cache_info);
     spawn_app(app).await
 }
 
-/// Assemble an [`App`] from one `UpstreamHttp` behind all three seams.
-pub fn app_from_upstream(upstream: Arc<UpstreamHttp>, cache_info: CacheInfo) -> Arc<App> {
+/// Assemble an [`App`] from one `UpstreamHttp` behind all three seams, sharing
+/// `catalog` between the server and the client.
+pub fn app_from_upstream(
+    upstream: Arc<UpstreamHttp>,
+    catalog: Arc<NarCatalog>,
+    cache_info: CacheInfo,
+) -> Arc<App> {
     Arc::new(App {
         narinfo: upstream.clone() as Arc<dyn NarinfoSource>,
         nar: upstream.clone() as Arc<dyn NarSource>,
         passthrough: upstream as Arc<dyn RawUpstream>,
         cache_info,
+        catalog,
     })
 }
 

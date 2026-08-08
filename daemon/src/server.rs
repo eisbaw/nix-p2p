@@ -30,9 +30,10 @@ use tokio::net::TcpListener;
 
 use crate::body::{empty, full};
 use crate::cacheinfo::CacheInfo;
+use crate::catalog::{NarCatalog, parse_correlation};
 use crate::rewrite;
 use crate::source::{
-    NarBody, NarLocator, NarSource, NarinfoSource, RawUpstream, SourceError, StoreHash,
+    NarBody, NarKey, NarPathToken, NarSource, NarinfoSource, RawUpstream, SourceError, StoreHash,
     UpstreamResponse,
 };
 
@@ -42,6 +43,9 @@ pub struct App {
     pub nar: Arc<dyn NarSource>,
     pub passthrough: Arc<dyn RawUpstream>,
     pub cache_info: CacheInfo,
+    /// Correlation state, shared with `UpstreamHttp`: narinfos populate it, NAR
+    /// requests read it to carry the signed NarHash across the seam.
+    pub catalog: Arc<NarCatalog>,
 }
 
 /// Serve on an already-bound listener until it errors. Binding is the caller's
@@ -71,7 +75,9 @@ pub async fn serve(listener: TcpListener, app: Arc<App>) -> std::io::Result<()> 
 enum Route {
     CacheInfo,
     Narinfo(StoreHash),
-    Nar(NarLocator),
+    /// The `nar/`-relative URL token; correlation to a signed NarHash happens in
+    /// `handle`, not here.
+    Nar(NarPathToken),
     /// `log/*`, `*.ls`, `debuginfo/*`, and anything else - passthrough.
     Other,
 }
@@ -86,8 +92,8 @@ enum Route {
 fn classify(path: &str) -> Route {
     if path == "/nix-cache-info" {
         Route::CacheInfo
-    } else if let Some(locator) = path.strip_prefix("/nar/") {
-        Route::Nar(NarLocator::new(locator))
+    } else if let Some(token) = path.strip_prefix("/nar/") {
+        Route::Nar(NarPathToken::new(token))
     } else if let Some(rest) = path.strip_suffix(".narinfo") {
         Route::Narinfo(StoreHash::new(rest.trim_start_matches('/')))
     } else {
@@ -110,8 +116,22 @@ async fn handle(req: Request<Incoming>, app: Arc<App>) -> Response<NarBody> {
     // refinement; documented here so it is a choice, not an oversight.
     match classify(&path) {
         Route::CacheInfo => respond_cache_info(&app.cache_info, is_head),
-        Route::Narinfo(hash) => respond_narinfo(app.narinfo.fetch(&hash).await, is_head).await,
-        Route::Nar(hash) => forward(app.nar.resolve(&hash, None).await, is_head),
+        Route::Narinfo(hash) => {
+            respond_narinfo(app.narinfo.fetch(&hash).await, &app.catalog, is_head).await
+        }
+        Route::Nar(token) => {
+            // Correlate: if the daemon saw this NAR's narinfo, carry the SIGNED
+            // NarHash (the wave-2 lookup key) across the seam, plus the signed
+            // NarSize for the wave-2 abort bound (wave-1 UpstreamHttp ignores it).
+            // Otherwise fall back to the raw URL token - the documented cold-start
+            // degenerate (Nix skipped the narinfo GET, PRD risk 2); only an HTTP
+            // upstream can serve that.
+            let (key, expected_size) = match app.catalog.meta_for_token(token.as_str()) {
+                Some(meta) => (NarKey::SignedNarHash(meta.nar_hash), Some(meta.nar_size)),
+                None => (NarKey::UpstreamPath(token), None),
+            };
+            forward(app.nar.resolve(&key, expected_size).await, is_head)
+        }
         Route::Other => forward(app.passthrough.get(&path).await, is_head),
     }
 }
@@ -132,8 +152,15 @@ fn respond_cache_info(info: &CacheInfo, is_head: bool) -> Response<NarBody> {
 
 /// Narinfo: buffered so the (empty, wave-1) rewrite allowlist runs and
 /// byte-fidelity is guaranteed. Non-200 statuses forward verbatim (AC#4).
+///
+/// This is also where correlation happens: on a 200 we learn the
+/// `url-token -> (signed NarHash, NarSize)` mapping from the narinfo body and
+/// record it in the catalog, so the NAR request that follows carries the signed
+/// hash across the seam. Recording is done on the ORIGINAL upstream bytes,
+/// before the (wave-1 identity) rewrite.
 async fn respond_narinfo(
     result: Result<UpstreamResponse, SourceError>,
+    catalog: &NarCatalog,
     is_head: bool,
 ) -> Response<NarBody> {
     let resp = match result {
@@ -153,6 +180,13 @@ async fn respond_narinfo(
             return text_status(StatusCode::BAD_GATEWAY, "upstream unavailable");
         }
     };
+
+    // Learn the token -> signed-NarHash correlation. A malformed narinfo (any
+    // missing field) is simply not recorded, so its NAR request falls back to
+    // UpstreamPath - safe, never a hard failure.
+    if let Some((token, nar_hash, nar_size)) = parse_correlation(&bytes) {
+        catalog.record(token, nar_hash, nar_size);
+    }
     // Wave 1: the allowlist is empty, so this is byte-identical - unknown
     // fields, odd ordering and multiple Sig lines all survive (AC#3).
     let out_bytes = rewrite::apply(&bytes).into_owned();

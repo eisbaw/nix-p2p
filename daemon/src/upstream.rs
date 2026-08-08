@@ -28,19 +28,21 @@
 //!     wave-1 scope (all tests front the mock/testproxy over loopback HTTP).
 //!     Tracked as task-24 rather than pulling a TLS stack in now.
 
+use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
 use bytes::Bytes;
-use http::{HeaderMap, Uri};
+use http::Uri;
 use http_body_util::{BodyExt, Empty, Limited};
 use hyper::client::conn::http1;
 use hyper_util::rt::TokioIo;
 use tokio::net::TcpStream;
 use tokio::time::timeout;
 
+use crate::catalog::NarCatalog;
 use crate::source::{
-    NarLocator, NarSource, NarinfoSource, RawUpstream, SourceError, StoreHash, UpstreamResponse,
+    NarKey, NarSource, NarinfoSource, RawUpstream, SourceError, StoreHash, UpstreamResponse,
 };
 
 /// Upper bound on a buffered (narinfo) body. A narinfo is a few hundred bytes;
@@ -57,12 +59,17 @@ pub struct UpstreamHttp {
     authority: String,
     connect_timeout: Duration,
     header_timeout: Duration,
+    /// Shared correlation catalog: for a [`NarKey::SignedNarHash`] this is how
+    /// the client recovers the URL token to fetch (the transport detail the seam
+    /// deliberately does not carry). A wave-2 iroh source needs none of this.
+    catalog: Arc<NarCatalog>,
 }
 
 impl UpstreamHttp {
-    /// Build a client for `base`, e.g. `http://127.0.0.1:8080`. Fails fast on a
-    /// malformed base rather than deferring the error to the first request.
-    pub fn new(base: &str) -> Result<Self, String> {
+    /// Build a client for `base`, e.g. `http://127.0.0.1:8080`, sharing
+    /// `catalog` with the server. Fails fast on a malformed base rather than
+    /// deferring the error to the first request.
+    pub fn new(base: &str, catalog: Arc<NarCatalog>) -> Result<Self, String> {
         let (host, port) = parse_authority(base)?;
         let authority = format!("{host}:{port}");
         Ok(UpstreamHttp {
@@ -72,6 +79,7 @@ impl UpstreamHttp {
             // Short by design (AC#6): a down upstream fails clean, fast.
             connect_timeout: Duration::from_millis(1000),
             header_timeout: Duration::from_millis(1000),
+            catalog,
         })
     }
 
@@ -137,9 +145,19 @@ impl UpstreamHttp {
     }
 
     /// Fetch a body by streaming it straight through (NAR, passthrough): the
-    /// body never sits whole in memory. If `expected_size` is set and the
-    /// upstream declares a larger `Content-Length`, abort before downloading
-    /// (PRD risk 6 early guard).
+    /// body never sits whole in memory.
+    ///
+    /// `expected_size` is deliberately NOT enforced here (see `_expected_size`).
+    /// The PRD-risk-6 abort is a defense against *untrusted peers* claiming a huge
+    /// blob; wave-1's upstream is the trusted cache.nixos.org, which poses no such
+    /// threat. Worse, the bound would be wrong-unit: `expected_size` is the signed
+    /// NarSize (the raw, uncompressed NAR - the wave-2 addressed unit), but this
+    /// HTTP path downloads the *compressed* file, whose length is FileSize.
+    /// FileSize can exceed NarSize for tiny/incompressible NARs (container
+    /// overhead), so enforcing NarSize here would 502 legitimate content. The
+    /// abort belongs to the wave-2 NarSource, which transfers the raw NAR and for
+    /// which NarSize is the right bound (task-25). `expected_size` still crosses
+    /// the seam so that source has it.
     ///
     /// Scope limit (honest gap): `connect_timeout`/`header_timeout` bound connect
     /// and header arrival, but NOTHING here bounds an upstream that sends headers
@@ -151,22 +169,11 @@ impl UpstreamHttp {
     async fn fetch_streaming(
         &self,
         path: &str,
-        expected_size: Option<u64>,
+        _expected_size: Option<u64>,
     ) -> Result<UpstreamResponse, SourceError> {
         let response = self.send(path).await?;
         let status = response.status().as_u16();
         let headers = response.headers().clone();
-
-        // Dormant in wave 1: `expected_size` is always None here (the daemon
-        // serves NARs statelessly, with no narinfo in hand), so this early guard
-        // never fires. Populating it from the signed NarSize and adding the
-        // per-chunk streaming abort is task-25 (PRD risk 6, claim-spam DoS).
-        if let (Some(limit), Some(declared)) = (expected_size, content_length(&headers))
-            && declared > limit
-        {
-            return Err(SourceError::TooLarge { limit, declared });
-        }
-
         let body = response.into_body().map_err(std::io::Error::other).boxed();
         Ok(UpstreamResponse {
             status,
@@ -174,16 +181,6 @@ impl UpstreamHttp {
             body,
         })
     }
-}
-
-/// The upstream `Content-Length`, if present and parseable.
-fn content_length(headers: &HeaderMap) -> Option<u64> {
-    headers
-        .get(hyper::header::CONTENT_LENGTH)?
-        .to_str()
-        .ok()?
-        .parse()
-        .ok()
 }
 
 /// Split `http://host:port` (or `host:port`, or `http://host`) into host+port.
@@ -221,13 +218,34 @@ impl NarinfoSource for UpstreamHttp {
 impl NarSource for UpstreamHttp {
     async fn resolve(
         &self,
-        locator: &NarLocator,
+        key: &NarKey,
         expected_size: Option<u64>,
     ) -> Result<UpstreamResponse, SourceError> {
-        // The NAR locator becomes an upstream URL HERE and nowhere else - the
-        // seam that lets wave 2 swap in an iroh source (which resolves the
-        // locator over p2p instead) behind the same trait.
-        self.fetch_streaming(&format!("/nar/{}", locator.as_str()), expected_size)
+        // The content identity becomes an upstream URL HERE and nowhere else -
+        // the seam that lets wave 2 swap in an iroh source (which resolves the
+        // SignedNarHash over p2p, and rejects UpstreamPath) behind the same
+        // trait. This HTTP impl handles BOTH variants, because HTTP addresses a
+        // NAR by its URL token regardless of how we learned to reach it.
+        let token = match key {
+            // Normal path: recover the URL token the narinfo advertised for this
+            // signed hash. On a correlated request this is always present; a miss
+            // means the catalog lost the mapping (should not happen), which we
+            // report rather than silently guessing a URL.
+            NarKey::SignedNarHash(hash) => self
+                .catalog
+                .token_for_hash(hash)
+                .ok_or_else(|| {
+                    SourceError::Upstream(format!(
+                        "no upstream URL known for signed NarHash {}",
+                        hash.as_str()
+                    ))
+                })?
+                .as_str()
+                .to_string(),
+            // Cold-start fallback: the raw URL token straight off the wire.
+            NarKey::UpstreamPath(token) => token.as_str().to_string(),
+        };
+        self.fetch_streaming(&format!("/nar/{token}"), expected_size)
             .await
     }
 }
@@ -257,11 +275,13 @@ mod tests {
 
     #[test]
     fn rejects_https_in_wave_1() {
-        assert!(UpstreamHttp::new("https://cache.nixos.org").is_err());
+        let catalog = Arc::new(NarCatalog::new());
+        assert!(UpstreamHttp::new("https://cache.nixos.org", catalog).is_err());
     }
 
     #[test]
     fn rejects_bad_port() {
-        assert!(UpstreamHttp::new("http://host:notaport").is_err());
+        let catalog = Arc::new(NarCatalog::new());
+        assert!(UpstreamHttp::new("http://host:notaport", catalog).is_err());
     }
 }

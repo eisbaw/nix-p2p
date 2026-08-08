@@ -8,11 +8,12 @@
 //!   * [`NarinfoSource`] - narinfo lookup;
 //!   * [`NarSource`] - NAR resolution by content identity to a verified stream.
 //!
-//! Both have a single [`UpstreamHttp`] impl in wave 1. The seam shape (identity
-//! in, not a URL) is what lets wave 2 implement an iroh `NarSource` behind the
-//! same trait boundary; the boundary is frozen, though the caller gains
-//! narinfo-correlation and URL-rewrite wiring (see [`source`] for the precise
-//! scope of what survives).
+//! Both have a single [`UpstreamHttp`] impl in wave 1. The seam carries a TYPED
+//! [`NarKey`] (a signed NarHash on the normal path, learned by correlating each
+//! narinfo as it passes through - see [`catalog`]), which is exactly the key a
+//! wave-2 iroh/p2p `NarSource` resolves. The trait boundary is frozen; what wave
+//! 2 adds is the iroh impl and the narinfo URL rewrite, not a serving-layer
+//! change. See [`source`] for the precise scope.
 //!
 //! This crate is a library + a thin binary so the in-process integration tests
 //! can drive the real serving stack over loopback (`tests/`), the same code the
@@ -20,15 +21,17 @@
 
 mod body;
 pub mod cacheinfo;
+pub mod catalog;
 pub mod rewrite;
 pub mod server;
 pub mod source;
 pub mod upstream;
 
 pub use cacheinfo::CacheInfo;
+pub use catalog::NarCatalog;
 pub use server::{App, serve};
 pub use source::{
-    NarBody, NarLocator, NarSource, NarinfoSource, RawUpstream, SourceError, StoreHash,
-    UpstreamResponse,
+    NarBody, NarHash, NarKey, NarPathToken, NarSource, NarinfoSource, RawUpstream, SourceError,
+    StoreHash, UpstreamResponse,
 };
 pub use upstream::UpstreamHttp;

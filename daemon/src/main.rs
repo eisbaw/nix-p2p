@@ -13,7 +13,7 @@ use std::process::ExitCode;
 use std::sync::Arc;
 
 use daemon::cacheinfo::DEFAULT_PRIORITY;
-use daemon::{App, CacheInfo, UpstreamHttp, serve};
+use daemon::{App, CacheInfo, NarCatalog, UpstreamHttp, serve};
 use tokio::net::TcpListener;
 
 /// Human- and machine-readable identity of this build.
@@ -104,7 +104,11 @@ async fn main() -> ExitCode {
 
     println!("{}", banner());
 
-    let upstream = match UpstreamHttp::new(&config.upstream) {
+    // The correlation catalog is shared between the server (which populates it as
+    // narinfos pass through) and UpstreamHttp (which reads it to fetch a
+    // SignedNarHash key). One instance, two holders.
+    let catalog = Arc::new(NarCatalog::new());
+    let upstream = match UpstreamHttp::new(&config.upstream, catalog.clone()) {
         Ok(upstream) => Arc::new(upstream),
         Err(err) => {
             eprintln!("daemon: bad --upstream: {err}");
@@ -117,6 +121,7 @@ async fn main() -> ExitCode {
         nar: upstream.clone(),
         passthrough: upstream.clone(),
         cache_info: config.cache_info(),
+        catalog,
     });
 
     let listener = match TcpListener::bind(config.listen).await {
