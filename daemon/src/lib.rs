@@ -31,6 +31,7 @@ pub mod rewrite;
 pub mod server;
 pub mod source;
 pub mod transport;
+pub mod transport_fetch;
 pub mod upstream;
 
 pub use cacheinfo::CacheInfo;
@@ -52,4 +53,8 @@ pub use source::{
     StoreHash, UpstreamResponse,
 };
 pub use transport::{BitTorrentInfoHash, IROH_BLOBS_ALPN, NODE_ID_LEN, NodeId, NodeIdParseError};
+pub use transport_fetch::{
+    FakeTransport, FetchError, Transport, TransportError, TransportNarSource, TransportRegistry,
+    TransportTag, fetch_via_offers, verify_blake3,
+};
 pub use upstream::UpstreamHttp;
