@@ -124,4 +124,6 @@ Deep gate: architect GO, qa NO-GO, codex NO-GO - three oracles passed without pr
 FOLD-INS: daemon-path positive control (pristine app imports as uid 1000 - proves the rejections aren't a broken path); flake.nix comments corrected runuser->setpriv (trust-surface honesty); Pod(daemon_chain=N) docstring marked 'task-11 will add'.
 Suite now 9 scenarios / 50 checks green (~114s); FAST gates (build/lint/test/fmt) green. TASK-27 filed for concurrent-run port/label isolation (fails nonzero, not false-green -> deferred, not gate-breaking).
 STATUS: In Progress, awaiting deep RE-gate. Not Done.
+
+CORRECTION: the concurrent-run isolation follow-up is TASK-26 (pre-filed by the coordinator, label deferred-finding); my duplicate TASK-27 was archived.
 <!-- SECTION:NOTES:END -->
