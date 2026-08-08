@@ -2454,6 +2454,277 @@ def scenario_chain_kill_middle_daemon(ctx: Ctx, expect) -> None:
         )
 
 
+def _raw_get(port: int, path: str, timeout: float = 30.0) -> dict:
+    """Raw HTTP/1.1 GET against a host-published port, returning a dict with
+    `status`, `content_length`, `body` (bytes) and `complete` (body length ==
+    advertised Content-Length). Raw (not urllib) so a TRUNCATED transfer - the
+    body ending short of Content-Length, which urllib raises on - is an
+    observation here, not an exception. `status=None` means the peer produced no
+    valid HTTP response (a reset)."""
+    if not path.startswith("/"):
+        path = "/" + path
+    try:
+        sock = socket.create_connection(("127.0.0.1", port), timeout=timeout)
+    except OSError:
+        return {"status": None, "content_length": None, "body": b"", "complete": False}
+    sock.settimeout(timeout)
+    raw = b""
+    try:
+        sock.sendall(
+            f"GET {path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\n"
+            f"Connection: close\r\n\r\n".encode()
+        )
+        while True:
+            chunk = sock.recv(65536)
+            if not chunk:
+                break
+            raw += chunk
+    except OSError:
+        # A reset mid-exchange: treat what we have as the (possibly empty)
+        # response, flagged incomplete below.
+        pass
+    finally:
+        sock.close()
+
+    split = raw.find(b"\r\n\r\n")
+    if split < 0:
+        return {"status": None, "content_length": None, "body": b"", "complete": False}
+    head = raw[:split].decode("latin1")
+    lines = head.split("\r\n")
+    status = None
+    parts = lines[0].split(" ")
+    if len(parts) >= 2 and parts[1].isdigit():
+        status = int(parts[1])
+    content_length = None
+    for line in lines[1:]:
+        if ":" in line:
+            name, _, value = line.partition(":")
+            if name.strip().lower() == "content-length" and value.strip().isdigit():
+                content_length = int(value.strip())
+    body = raw[split + 4 :]
+    complete = (content_length is None) or (len(body) == content_length)
+    return {
+        "status": status,
+        "content_length": content_length,
+        "body": body,
+        "complete": complete,
+    }
+
+
+def _matrix_depth_port(pod: Pod, depth: int) -> int:
+    """Host port whose chain-entry traverses exactly `depth` hops. daemon #index
+    traverses (CHAIN_DEPTH - index + 1) hops, so depth `d` enters at index
+    CHAIN_DEPTH - d + 1: depth 1 = daemon-3 (shallow), depth 3 = daemon-1 (deep)."""
+    index = CHAIN_DEPTH - depth + 1
+    return pod.daemon_host_port(index)
+
+
+def scenario_fault_depth_matrix(ctx: Ctx, expect) -> None:
+    """AC#1: the FULL fault x depth matrix - each of the 7 testproxy fault modes
+    (mode 8 throttle is a crash-window aid, not an adversarial fault, and is
+    exercised by the crash suite) injected at the origin boundary and observed at
+    chain depths 1, 2 and 3 on ONE depth-3 pod (entering at daemon-3/-2/-1).
+
+    Observed at the RIGHT boundary - the CLIENT view (raw HTTP status/bytes) and
+    the testproxy - never daemon self-narration. Each fault's assertion CONTRASTS
+    with the fault-off baseline captured first, so a cell that could not tell
+    faulted from clean is not a passing cell (oracle-bite by construction)."""
+    fixtures = ctx.fixtures
+    present_narinfo = fx.narinfo_name(fixtures.store_path("lib"))
+    nar_url = fixtures.entry("lib")["url"]
+    depths = (1, 2, 3)
+
+    with Pod(
+        ctx,
+        "fault-matrix",
+        fixtures.cache,
+        with_daemon=False,
+        expect=expect,
+        daemon_chain=CHAIN_DEPTH,
+    ) as pod:
+        ports = {d: _matrix_depth_port(pod, d) for d in depths}
+
+        # -- fault-off baseline (the contrast every cell is measured against) --
+        pod.proxy_faults("")
+        pod.proxy_reset()
+        clean_info = {d: _raw_get(ports[d], present_narinfo) for d in depths}
+        clean_nar = {d: _raw_get(ports[d], nar_url) for d in depths}
+        for d in depths:
+            expect(
+                clean_info[d]["status"] == 200 and clean_nar[d]["status"] == 200,
+                f"matrix baseline depth {d}: narinfo+nar both 200 fault-off",
+                f"info={clean_info[d]['status']} nar={clean_nar[d]['status']}",
+            )
+            expect(
+                clean_nar[d]["complete"] and len(clean_nar[d]["body"]) > 0,
+                f"matrix baseline depth {d}: NAR is a complete non-empty body",
+                f"len={len(clean_nar[d]['body'])} cl={clean_nar[d]['content_length']}",
+            )
+        clean_nar_bytes = clean_nar[1]["body"]
+        clean_info_bytes = clean_info[1]["body"]
+
+        # -- mode 1: added latency (sub-timeout) - tolerated at every depth ----
+        pod.proxy_faults("latency_narinfo_ms=200")
+        for d in depths:
+            r = _raw_get(ports[d], present_narinfo)
+            expect(
+                r["status"] == 200,
+                f"matrix mode1 latency depth {d}: sub-timeout latency still 200",
+                f"status={r['status']}",
+            )
+        pod.proxy_faults("")
+
+        # -- mode 2: HTTP 503 - forwarded verbatim (status fidelity) ----------
+        pod.proxy_faults("http_error=503&http_error_kind=narinfo")
+        for d in depths:
+            r = _raw_get(ports[d], present_narinfo)
+            expect(
+                r["status"] == 503,
+                f"matrix mode2 http-503 depth {d}: upstream 503 forwarded verbatim",
+                f"status={r['status']}",
+            )
+        pod.proxy_faults("")
+
+        # -- mode 3: connection reset - fast, clean 502 to the client ---------
+        pod.proxy_faults("connection_reset=narinfo")
+        for d in depths:
+            r = _raw_get(ports[d], present_narinfo)
+            expect(
+                r["status"] == 502,
+                f"matrix mode3 reset depth {d}: transport reset -> clean 502",
+                f"status={r['status']}",
+            )
+        pod.proxy_faults("")
+
+        # -- mode 4: truncated NAR - short body survives the chain ------------
+        pod.proxy_faults("truncate_pct=50")
+        for d in depths:
+            r = _raw_get(ports[d], nar_url)
+            expect(
+                (not r["complete"]) and 0 < len(r["body"]) < len(clean_nar_bytes),
+                f"matrix mode4 truncate depth {d}: client sees a SHORT NAR body "
+                "(Content-Length full, bytes fewer) through the chain",
+                f"len={len(r['body'])} full={len(clean_nar_bytes)} "
+                f"complete={r['complete']}",
+            )
+        pod.proxy_faults("")
+        pod.proxy_reset()  # drop any short cache residue before the next mode
+
+        # -- mode 5: corrupted NAR - bytes differ, length preserved -----------
+        pod.proxy_faults("corrupt_nar=1")
+        for d in depths:
+            r = _raw_get(ports[d], nar_url)
+            expect(
+                r["status"] == 200
+                and len(r["body"]) == len(clean_nar_bytes)
+                and r["body"] != clean_nar_bytes,
+                f"matrix mode5 corrupt depth {d}: same-length DIFFERENT bytes "
+                "reach the client (daemon does not mask corruption; nix is the arbiter)",
+                f"status={r['status']} len={len(r['body'])} "
+                f"differs={r['body'] != clean_nar_bytes}",
+            )
+        pod.proxy_faults("")
+
+        # -- mode 6: wrong/stale narinfo - mutated metadata survives ----------
+        pod.proxy_faults("wrong_narinfo=1")
+        for d in depths:
+            r = _raw_get(ports[d], present_narinfo)
+            expect(
+                r["status"] == 200 and r["body"] != clean_info_bytes,
+                f"matrix mode6 wrong-narinfo depth {d}: mutated narinfo forwarded "
+                "verbatim (differs from clean; nix rejects on sig/hash)",
+                f"status={r['status']} differs={r['body'] != clean_info_bytes}",
+            )
+        pod.proxy_faults("")
+
+        # -- mode 7: upstream unreachable - fast, clean 502 at every depth ----
+        pod.proxy_faults("unreachable=1")
+        for d in depths:
+            start = time.perf_counter()
+            r = _raw_get(ports[d], present_narinfo)
+            elapsed_ms = (time.perf_counter() - start) * 1000.0
+            expect(
+                r["status"] == 502 and elapsed_ms < 5000,
+                f"matrix mode7 unreachable depth {d}: fast clean 502 "
+                f"({elapsed_ms:.0f}ms < 5000)",
+                f"status={r['status']} elapsed={elapsed_ms:.0f}ms",
+            )
+        pod.proxy_faults("")
+
+
+def scenario_chain_timeout_boundary(ctx: Ctx, expect) -> None:
+    """AC#1 / TASK-33: pin the upstream-latency vs header-timeout boundary that
+    flips a narinfo GET 200 -> 502, and PROVE the boundary MOVES when the timeout
+    changes. The daemon's per-hop `--header-timeout-ms` (added in task-13) is the
+    controllable lever.
+
+    Loopback honesty (recorded decision, task-33): the per-hop timeout does not
+    COMPOSE across hops (each hop restarts its own clock), but on pod loopback the
+    per-hop connect/send overhead is sub-millisecond, so the DEPTH-composition
+    term is below the noise floor - all depths flip together at L ~= T here. The
+    robustly-pinnable, deterministic boundary is therefore L-vs-T, moved via T;
+    the WAN-scale depth term is documented in `UpstreamHttp::with_header_timeout`
+    and TESTING.md rather than asserted knife-edge on loopback."""
+    fixtures = ctx.fixtures
+    present_narinfo = fx.narinfo_name(fixtures.store_path("lib"))
+    depths = (1, 2, 3)
+
+    def statuses_at(pod: Pod, latency_ms: int) -> dict:
+        pod.proxy_faults(f"latency_narinfo_ms={latency_ms}")
+        out = {}
+        for d in depths:
+            port = _matrix_depth_port(pod, d)
+            out[d] = _raw_get(port, present_narinfo, timeout=15.0)["status"]
+        pod.proxy_faults("")
+        return out
+
+    # Pod A: tight per-hop timeout T=500ms.
+    with Pod(
+        ctx,
+        "timeout-boundary-a",
+        fixtures.cache,
+        with_daemon=False,
+        expect=expect,
+        daemon_chain=CHAIN_DEPTH,
+        daemon_extra_args=("--header-timeout-ms", "500"),
+    ) as pod:
+        below = statuses_at(pod, 250)  # L < T -> served
+        above = statuses_at(pod, 900)  # L > T -> timed out
+        expect(
+            all(below[d] == 200 for d in depths),
+            "timeout boundary T=500: L=250ms (<T) serves 200 at every depth",
+            f"below={below}",
+        )
+        expect(
+            all(above[d] == 502 for d in depths),
+            "timeout boundary T=500: L=900ms (>T) flips to 502 at every depth",
+            f"above={above}",
+        )
+        print(f"  TASK-33 boundary T=500ms: L=250 -> {below}; L=900 -> {above}")
+
+    # Pod B: wider per-hop timeout T=1200ms. The SAME L=900ms that 502'd at T=500
+    # now serves 200 - the boundary MOVED with the timeout (the bite).
+    with Pod(
+        ctx,
+        "timeout-boundary-b",
+        fixtures.cache,
+        with_daemon=False,
+        expect=expect,
+        daemon_chain=CHAIN_DEPTH,
+        daemon_extra_args=("--header-timeout-ms", "1200"),
+    ) as pod:
+        moved = statuses_at(pod, 900)  # L < new T -> served again
+        expect(
+            all(moved[d] == 200 for d in depths),
+            "TASK-33 BITE: L=900ms that flipped 502 at T=500 now serves 200 at "
+            "T=1200 - the 200->502 boundary MOVES with the header timeout",
+            f"moved={moved}",
+        )
+        print(
+            f"  TASK-33 boundary MOVED: L=900 at T=1200 -> {moved} (was 502 at T=500)"
+        )
+
+
 SCENARIOS = [
     ("topology", scenario_topology),
     ("s1-byte-and-counts", scenario_s1_byte_and_counts),
@@ -2477,6 +2748,10 @@ SCENARIOS = [
     ("chain-absent-404", scenario_chain_absent_404),
     ("chain-timeout-invariant", scenario_chain_timeout_invariant),
     ("chain-kill-middle-daemon", scenario_chain_kill_middle_daemon),
+    # fault x depth matrix (task-13): all 7 fault modes x chain depth 1..3, and
+    # the TASK-33 latency-vs-timeout boundary pinned + shown to move.
+    ("fault-depth-matrix", scenario_fault_depth_matrix),
+    ("chain-timeout-boundary", scenario_chain_timeout_boundary),
 ]
 
 

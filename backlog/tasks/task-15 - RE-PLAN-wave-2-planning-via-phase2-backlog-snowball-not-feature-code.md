@@ -4,7 +4,7 @@ title: 'RE-PLAN: wave 2 planning via phase2-backlog-snowball (not feature code)'
 status: To Do
 assignee: []
 created_date: '2026-08-07 21:56'
-updated_date: '2026-08-08 17:30'
+updated_date: '2026-08-08 18:05'
 labels:
   - replan
 dependencies:
@@ -36,4 +36,11 @@ Owner standing goal (2026-08-08): implement the entire backlog; modular crates c
 forward-carried from task-4 seam fix: the NarSource seam is NarKey{SignedNarHash,UpstreamPath} with a token->NarHash correlation catalog populated at narinfo-serve time. Wave-2 iroh NarSource keys on NarKey::SignedNarHash via the claims index; the correlation catalog is the seed of the PRD 'learn NarHash at narinfo time' prefetch. Plan the claims-index lookup to consume NarKey::SignedNarHash.
 
 J2 baseline recorded (task-12, TESTING.md 'J2 measurement baseline', 2026-08-08). Wave-2 re-plan inputs: (a) pre-p2p reference = payload NAR egress 115,934,829 B/workload (workload nix-p2p-fixture-workload-v1, gen-d2ab43402b88715a), offload 0.0 by construction - the number wave-2 offload is measured against by this same instrument. (b) PREFETCH-WINDOW FINDING: the narinfo->nar gap is sub-millisecond on the LOOPBACK harness (~0.5ms median, <2ms max), so a 1-4s DHT resolve cannot be masked by prefetch on these numbers - hedge (not prefetch) would carry offload. BUT this is loopback with a local mock, NOT a verdict on the real cache.nixos.org gap (which carries real RTT and may open a larger window). Filed task-35 to re-measure the gap on a real upstream BEFORE the hedge/prefetch design is committed. (c) S4 latency axis is UNUSABLE on the container tier (A/A noise floor >10%, task-32) - wave-2 latency claims need task-32's inner-realise timing or the VM tier.
+
+Forward-carry from task-13 (hardening pt1) - wave-2 p2p relevant findings:
+1) The per-hop upstream header timeout does NOT compose across hops (task-33, now documented+configurable+boundary-pinned, but NOT fixed). A p2p multi-hop resolve path needs a BUDGET-AWARE deadline or it will 502 at depth exactly as the daemon chain does - this is a wave-2 design input, not just a daemon tweak.
+2) The depth-composition term is WAN-scale (sub-ms on loopback), so wave-2 must re-validate depth/timeout behaviour against REAL RTT (ties to task-35's real-upstream gap re-measure).
+3) HTTP/2 + TLS gap (task-24): the daemon+testproxy are h1.1-plaintext only; fronting real cache.nixos.org or peers over TLS/h2 is unbuilt. h2-only upstream currently fails CLOSED (proven), which is safe but blocks real-upstream fronting.
+4) Unsigned-narinfo caching (task-30) blocks caching private/unsigned p2p peers - the narinfo cache requires a Sig line as its truncation signal.
+5) The seeded fuzz harness pattern (path-traversal containment + unknown-field identity) should be reused for the wave-2 claim-schema/DHT-key fuzz.
 <!-- SECTION:NOTES:END -->

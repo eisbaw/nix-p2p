@@ -4,7 +4,7 @@ title: 'measure: time inner nix-store --realise for a clean S4 build wall-clock'
 status: To Do
 assignee: []
 created_date: '2026-08-08 13:35'
-updated_date: '2026-08-08 17:30'
+updated_date: '2026-08-08 17:59'
 labels:
   - measurement
 dependencies: []
@@ -20,4 +20,6 @@ measure.py (task-9) times the whole 'podman run --rm' per run, so the p95 build 
 
 <!-- SECTION:NOTES:BEGIN -->
 task-12 data point (J2 baseline read-out, 2026-08-08): the two J2 runs observed A/A noise floors of 0.161 and 0.103 - BOTH >= the 10% S4 threshold, so s4_usable=false in both reports and no container-tier p95 bound was quoted in the J2 baseline (TESTING.md). Confirms this task blocks a usable container-tier S4. The egress axis was byte-identical run-to-run and unaffected, as predicted here.
+
+task-13 triage: KEEP for wave-2 - measure inner nix-store --realise wall-clock is measurement-instrument work (S4 noise floor), not a daemon/proxy hardening finding. Distinct concern.
 <!-- SECTION:NOTES:END -->

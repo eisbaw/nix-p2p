@@ -169,6 +169,76 @@ mod tests {
         assert!(cache.resolve("/").is_none());
     }
 
+    // ---- AC#3 fuzz: no request path may resolve outside the cache root ------
+
+    /// Seeded xorshift64* PRNG - reproducible, no dependency, no entropy flake.
+    struct Rng(u64);
+    impl Rng {
+        fn next(&mut self) -> u64 {
+            let mut x = self.0;
+            x ^= x >> 12;
+            x ^= x << 25;
+            x ^= x >> 27;
+            self.0 = x;
+            x.wrapping_mul(0x2545_F491_4F6C_DD1D)
+        }
+        fn below(&mut self, n: usize) -> usize {
+            (self.next() % n as u64) as usize
+        }
+    }
+
+    #[test]
+    fn fuzz_request_paths_never_escape_cache_root() {
+        let root = scratch();
+        let cache = DiskCache::new(root.clone()).unwrap();
+        const POISON: &[&str] = &[
+            "..", "../", "..%2f", "/", "//", "etc", "passwd", "nar", "abc.nar", ".", "a", "\0",
+            "%2e%2e", "..\\", "0abc", "x",
+        ];
+        let mut rng = Rng(0x0bad_c0de_dead_1234);
+        let mut accepted = 0usize;
+        for _ in 0..20_000 {
+            // Build a random '/'-joined path from poison + legit fragments.
+            let mut path = String::from("/");
+            let parts = 1 + rng.below(6);
+            for i in 0..parts {
+                if i > 0 {
+                    path.push('/');
+                }
+                path.push_str(POISON[rng.below(POISON.len())]);
+            }
+            match cache.resolve(&path) {
+                None => {} // rejected before any filesystem access
+                Some(disk) => {
+                    accepted += 1;
+                    // Containment: every accepted path stays strictly under root,
+                    // and no component is a traversal or empty segment.
+                    assert!(
+                        disk.starts_with(&root),
+                        "accepted path {path:?} escaped root: {disk:?}"
+                    );
+                    let extra: Vec<_> = disk
+                        .strip_prefix(&root)
+                        .unwrap()
+                        .components()
+                        .map(|c| c.as_os_str().to_string_lossy().into_owned())
+                        .collect();
+                    assert!(
+                        extra.iter().all(|c| c != ".." && c != "." && !c.is_empty()),
+                        "accepted path {path:?} has a traversal component: {extra:?}"
+                    );
+                }
+            }
+        }
+        // Non-vacuous: a plainly-valid path IS accepted and lands under root.
+        let ok = cache.resolve("/nar/abcd.nar.xz").unwrap();
+        assert!(ok.starts_with(&root));
+        assert!(
+            accepted < 20_000,
+            "fuzz must reject SOME hostile paths (else vacuous), accepted {accepted}"
+        );
+    }
+
     #[test]
     fn commit_is_all_or_nothing() {
         let cache = DiskCache::new(scratch()).unwrap();

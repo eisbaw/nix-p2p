@@ -4,7 +4,7 @@ title: 'Daemon substitution log: full-drain byte + duration accounting'
 status: To Do
 assignee: []
 created_date: '2026-08-08 11:35'
-updated_date: '2026-08-08 11:47'
+updated_date: '2026-08-08 17:59'
 labels:
   - journey-finding
 dependencies: []
@@ -27,4 +27,6 @@ TASK-6 (J1 journey) added a per-substitution log line in daemon/src/server.rs (l
 
 <!-- SECTION:NOTES:BEGIN -->
 Scope clarification (mped-architect review of TASK-6): the wave-1 log reports bytes=Content-Length (the COMPRESSED on-wire size) and duration=time-to-upstream-headers. When the upstream sends no Content-Length (chunked) the daemon now logs bytes=unknown - it deliberately does NOT fall back to the signed NarSize, which is the UNCOMPRESSED size and thus a unit mismatch for any compressed NAR. Wave-2 full-drain accounting (wrap the streamed NarBody, count actual bytes, emit on completion) resolves both the drain-accuracy and the unknown-length cases with a single honest compressed-byte count.
+
+task-13 triage: KEEP for wave-2 - full-drain byte/duration accounting in the substitution log is a measurement-accuracy refinement (chunked/truncated transfers); exact for the Content-Length fixtures used today. Distinct concern, feeds task-9.
 <!-- SECTION:NOTES:END -->

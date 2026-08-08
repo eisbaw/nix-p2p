@@ -4,7 +4,7 @@ title: 'HARDENING: concurrency soak + docs truthfulness sweep'
 status: To Do
 assignee: []
 created_date: '2026-08-07 21:56'
-updated_date: '2026-08-08 17:18'
+updated_date: '2026-08-08 18:06'
 labels:
   - hardening
 dependencies:
@@ -28,4 +28,12 @@ Wave-end hardening block, part 2. Soak: max-substitution-jobs=16 storm of parall
 
 <!-- SECTION:NOTES:BEGIN -->
 forward-carry from task-10: VM truth layer exists (nixos/vm-test.nix). If concurrency/soak wants a VM data point, note the daemon runs under systemd DynamicUser (nixos/nix-p2p.nix) binding 127.0.0.1:port; max-substitution-jobs/http-connections are client nix.settings you can sweep on the client node. Same absent-before ORACLE GOTCHA as task-13: use nix-validity, not test -e.
+
+Forward-carry from task-13 (hardening pt1): surfaces the concurrency soak + docs sweep should hit -
+1) Run the fault x depth matrix AND the timeout boundary under CONCURRENCY (max-substitution-jobs {1,16,128}); task-13 pinned them at max-substitution-jobs=1 only. The per-hop header timeout composition and the fail-fast 502 paths are the concurrency-sensitive ones.
+2) Soak the ENOSPC/write-failure paths: task-13 proved single-shot fail-closed (narinfo cache -> passthrough, testproxy -> 5xx+no-partial); a soak should hammer them under load to confirm no tmp-file leak / no torn cache entry accumulates (testproxy CacheWriter drop-cleanup, narinfo .tmp reap).
+3) The blocking-fsync-on-async-path (task-28) is most likely to bite the daemon under a concurrent soak - worth measuring worker-stall there.
+4) Docs sweep: reconcile the new TESTING.md 'Hardening: fault x depth, header hygiene, fuzz (task-13)' section against code; the daemon now has a --header-timeout-ms flag (document in any operator/NixOS docs).
+
+Forward-carry from task-13 (VM fault re-assertion, re-deferred here with owner-visible decision): re-assert the 3 tamper narinfos AND testproxy fault modes THROUGH the systemd nix-daemon in the NixOS VM (nixos/vm-test.nix, just e2e-vm), expecting the task-5 daemon-side strings ('not signed by any of the keys in trusted-public-keys', 'hash mismatch importing path'). Reuse build_tamper_tree/build_corrupt_nar_tree; serve a key-free tamper cache from a peer node; ORACLE GOTCHA (banked): absent-before MUST use nix-VALIDITY (nix-store -q --hash fails 'not valid'), NOT test -e, because the nixos-test 9p-shared host store makes fixture files physically present on every node. Interpose testproxy for VM-level request-count/fault oracles.
 <!-- SECTION:NOTES:END -->

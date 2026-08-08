@@ -649,4 +649,217 @@ NarSize: 40";
             Some("0a0lslqb6gbqnj6xq")
         );
     }
+
+    // ---- AC#3 fuzz: cache-key path traversal must never escape root ---------
+
+    /// A tiny deterministic PRNG (xorshift64*) so the fuzz is seeded and
+    /// reproducible - no `rand`/`proptest` dependency, no Date/entropy flakiness.
+    struct Rng(u64);
+    impl Rng {
+        fn next(&mut self) -> u64 {
+            let mut x = self.0;
+            x ^= x >> 12;
+            x ^= x << 25;
+            x ^= x >> 27;
+            self.0 = x;
+            x.wrapping_mul(0x2545_F491_4F6C_DD1D)
+        }
+        fn below(&mut self, n: usize) -> usize {
+            (self.next() % n as u64) as usize
+        }
+    }
+
+    /// Build one hostile cache-key candidate from the seed: traversal sequences,
+    /// absolute paths, separators, NULs, dots, uppercase, unicode, and absurd
+    /// lengths - the AC#3 "path-traversal fuzz on cache keys" corpus.
+    fn hostile_key(rng: &mut Rng) -> String {
+        const POISON: &[&str] = &[
+            "..",
+            "../",
+            "..%2f",
+            "..\\",
+            "/",
+            "//",
+            "/etc/passwd",
+            ".",
+            "./",
+            "a/b",
+            "a.b",
+            "\0",
+            "%00",
+            "UP",
+            "ﬁ",
+            "é",
+            " ",
+            "\n",
+            "\t",
+            ":",
+            "*",
+            "nar/x",
+            "..;/",
+        ];
+        let mut s = String::new();
+        let parts = 1 + rng.below(6);
+        for _ in 0..parts {
+            match rng.below(3) {
+                // a legit base32 fragment ...
+                0 => {
+                    for _ in 0..rng.below(8) {
+                        let alphabet = b"0123456789abcdefghijklmnpqrsvwxyz";
+                        s.push(alphabet[rng.below(alphabet.len())] as char);
+                    }
+                }
+                // ... spliced with a poison token (the traversal attempt) ...
+                1 => s.push_str(POISON[rng.below(POISON.len())]),
+                // ... or an absurdly long run.
+                _ => s.push_str(&"a".repeat(rng.below(600))),
+            }
+        }
+        s
+    }
+
+    #[test]
+    fn fuzz_hostile_cache_keys_never_escape_root() {
+        let root = PathBuf::from("/var/cache/nixp2p-narinfo");
+        let cache = NarinfoDiskCache {
+            root: root.clone(),
+            inner: std::sync::Arc::new(NoopSource),
+            clock: std::sync::Arc::new(SystemClock),
+            positive_ttl: POSITIVE_TTL,
+            negative_ttl: NEGATIVE_TTL,
+            tmp_seq: AtomicU64::new(0),
+            token_index: RwLock::new(HashMap::new()),
+        };
+        let mut rng = Rng(0x1234_5678_9abc_def0);
+        let mut accepted = 0usize;
+        for _ in 0..20_000 {
+            let key = hostile_key(&mut rng);
+            match cache.entry_path(&key) {
+                None => {} // rejected: never touches the filesystem
+                Some(path) => {
+                    accepted += 1;
+                    // If accepted, safe_key already guaranteed a single ascii
+                    // [0-9a-z] component. Prove containment structurally: the
+                    // parent is exactly root and the file name has no separators
+                    // and no traversal component.
+                    assert_eq!(
+                        path.parent(),
+                        Some(root.as_path()),
+                        "accepted key {key:?} escaped root: {path:?}"
+                    );
+                    assert_eq!(
+                        path.components().count(),
+                        root.components().count() + 1,
+                        "accepted key {key:?} added more than one component: {path:?}"
+                    );
+                    let name = path.file_name().unwrap().to_str().unwrap();
+                    assert!(name.ends_with(".nic"));
+                    assert!(!name.contains('/') && !name.contains('\\') && name != "..");
+                    assert!(path.starts_with(&root));
+                }
+            }
+        }
+        // Non-vacuous: a valid base32 key IS accepted (the fuzz can produce one).
+        assert_eq!(
+            cache
+                .entry_path("0a0lslqb6gbqnj6xqjlaljjqg6kgb3wz")
+                .unwrap(),
+            root.join("0a0lslqb6gbqnj6xqjlaljjqg6kgb3wz.nic"),
+        );
+        // And the corpus really did probe both branches.
+        assert!(
+            accepted < 20_000,
+            "fuzz must reject SOME hostile keys (else vacuous), accepted {accepted}"
+        );
+    }
+
+    // ---- AC#3 fuzz: arbitrary well-formed narinfos survive byte-identical ---
+
+    /// Generate a well-formed narinfo with random field ORDERING, random unknown
+    /// fields, multiple `Sig:` lines, empty `References`, and mixed line endings.
+    /// This extends task-8's byte-verbatim property to a fuzzed corpus.
+    fn random_narinfo(rng: &mut Rng) -> Vec<u8> {
+        let mut fields: Vec<String> = vec![
+            "StorePath: /nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-x".into(),
+            "URL: nar/1abc.nar.xz".into(),
+            "NarHash: sha256:1b2c3d4e5f".into(),
+            format!("NarSize: {}", rng.next() % 1_000_000),
+            "References: ".into(),
+            "Sig: nix-p2p-test-1:AAAA==".into(),
+        ];
+        // Random unknown fields (must survive verbatim).
+        for _ in 0..rng.below(4) {
+            fields.push(format!(
+                "X-Unknown-{}: value {}",
+                rng.next() % 99,
+                rng.next() % 99
+            ));
+        }
+        // Occasionally a second Sig line (multi-sig narinfos are valid).
+        if rng.below(2) == 0 {
+            fields.push("Sig: other-key-1:BBBB==".into());
+        }
+        // Optional transport fields in random spots.
+        if rng.below(2) == 0 {
+            fields.push("Compression: xz".into());
+            fields.push("FileHash: sha256:9999".into());
+            fields.push("FileSize: 1234".into());
+        }
+        // Shuffle (Fisher-Yates) so ordering is arbitrary.
+        for i in (1..fields.len()).rev() {
+            let j = rng.below(i + 1);
+            fields.swap(i, j);
+        }
+        // Mixed line endings, but a trailing newline so the last field is intact.
+        let sep = if rng.below(2) == 0 { "\n" } else { "\r\n" };
+        let mut body = fields.join(sep);
+        body.push('\n');
+        body.into_bytes()
+    }
+
+    #[test]
+    fn fuzz_well_formed_narinfos_roundtrip_byte_identical() {
+        let mut rng = Rng(0xdead_beef_cafe_0001);
+        let mut well_formed = 0usize;
+        for _ in 0..5_000 {
+            let body = random_narinfo(&mut rng);
+            // The rewrite allowlist is identity (wave 1): bytes must be untouched.
+            assert_eq!(
+                crate::rewrite::apply(&body).as_ref(),
+                body.as_slice(),
+                "rewrite must be identity for {:?}",
+                String::from_utf8_lossy(&body)
+            );
+            // Framed disk round-trip must preserve the body byte-for-byte.
+            let entry = Entry {
+                kind: EntryKind::Positive,
+                fetched_at: 42,
+                body: body.clone(),
+            };
+            let decoded =
+                Entry::decode(&entry.encode()).expect("a well-formed narinfo frame must decode");
+            assert_eq!(
+                decoded.body, body,
+                "body must survive the frame byte-for-byte"
+            );
+            if is_well_formed_narinfo(&body) {
+                well_formed += 1;
+            }
+        }
+        // Non-vacuous: the generator really does produce cacheable narinfos.
+        assert!(
+            well_formed > 0,
+            "fuzz produced no well-formed narinfos - the property is vacuous"
+        );
+    }
+
+    /// A no-op inner source so the fuzz can build a `NarinfoDiskCache` without a
+    /// live upstream (it only exercises `entry_path`, never `fetch`).
+    struct NoopSource;
+    #[async_trait]
+    impl NarinfoSource for NoopSource {
+        async fn fetch(&self, _hash: &StoreHash) -> Result<UpstreamResponse, SourceError> {
+            Err(SourceError::Upstream("noop".into()))
+        }
+    }
 }

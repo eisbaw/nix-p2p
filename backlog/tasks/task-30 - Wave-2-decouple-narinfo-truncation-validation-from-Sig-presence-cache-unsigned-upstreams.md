@@ -6,6 +6,7 @@ title: >-
 status: To Do
 assignee: []
 created_date: '2026-08-08 11:24'
+updated_date: '2026-08-08 17:59'
 labels:
   - wave2
   - daemon
@@ -24,3 +25,9 @@ narinfo_cache.rs is_well_formed_narinfo() requires a Sig: line as its cheap tail
 - [ ] #1 A complete unsigned narinfo is cached and served from disk on repeat
 - [ ] #2 Truncation detection still bites without relying on Sig presence
 <!-- AC:END -->
+
+## Implementation Notes
+
+<!-- SECTION:NOTES:BEGIN -->
+task-13 triage: KEEP for wave-2 - decoupling truncation validation from Sig presence (cache unsigned upstreams) is a wave-2 feature; wave-1 targets signed caches only. Distinct concern.
+<!-- SECTION:NOTES:END -->

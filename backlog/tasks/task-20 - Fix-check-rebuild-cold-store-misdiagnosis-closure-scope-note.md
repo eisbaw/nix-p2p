@@ -4,9 +4,8 @@ title: Fix check-rebuild cold-store misdiagnosis + closure scope note
 status: Done
 assignee: []
 created_date: '2026-08-08 00:34'
-updated_date: '2026-08-08 00:52'
-labels:
-  - deferred-finding
+updated_date: '2026-08-08 17:59'
+labels: []
 dependencies:
   - TASK-3
 ---
@@ -23,6 +22,12 @@ Round-2 deep-gate finding (qa, medium): on a store where a payload derivation wa
 - [x] #2 Genuine nondeterminism (realised output + --rebuild differs) still exits 1 with the nondeterminism diagnosis
 - [x] #3 Closure-scope limitation documented in the script docstring
 <!-- AC:END -->
+
+## Implementation Notes
+
+<!-- SECTION:NOTES:BEGIN -->
+task-13 triage: task is already Done; removing the stale deferred-finding label (AC#4 inbox cleanup).
+<!-- SECTION:NOTES:END -->
 
 ## Final Summary
 

@@ -39,6 +39,12 @@ struct Config {
     /// Opt-in in wave 1 so enabling it in the container/NixOS paths is a separate,
     /// reviewable change (filed: wire a default cache dir into the module + e2e).
     narinfo_cache_dir: Option<String>,
+    /// Per-hop upstream header timeout in milliseconds (default 1000). Exposed so
+    /// the fault x depth matrix (task-13) can move the 200->502 latency ceiling
+    /// deliberately and so an operator fronting a slow upstream can widen it. It
+    /// is a FIXED per-hop deadline that does NOT compose across a daemon chain
+    /// (task-33); see `UpstreamHttp::with_header_timeout`.
+    header_timeout_ms: u64,
 }
 
 impl Default for Config {
@@ -51,6 +57,7 @@ impl Default for Config {
             priority: DEFAULT_PRIORITY,
             want_mass_query: true,
             narinfo_cache_dir: None,
+            header_timeout_ms: 1000,
         }
     }
 }
@@ -73,6 +80,12 @@ impl Config {
                 }
                 "--upstream" => config.upstream = value()?,
                 "--narinfo-cache-dir" => config.narinfo_cache_dir = Some(value()?),
+                "--header-timeout-ms" => {
+                    let raw = value()?;
+                    config.header_timeout_ms = raw
+                        .parse()
+                        .map_err(|e| format!("bad --header-timeout-ms {raw:?}: {e}"))?;
+                }
                 "--store-dir" => config.store_dir = value()?,
                 "--priority" => {
                     let raw = value()?;
@@ -120,7 +133,10 @@ async fn main() -> ExitCode {
     // no catalog - the request carries the exact URL token to fetch.
     let catalog = Arc::new(NarCatalog::new());
     let upstream = match UpstreamHttp::new(&config.upstream) {
-        Ok(upstream) => Arc::new(upstream),
+        Ok(upstream) => Arc::new(
+            upstream
+                .with_header_timeout(std::time::Duration::from_millis(config.header_timeout_ms)),
+        ),
         Err(err) => {
             eprintln!("daemon: bad --upstream: {err}");
             return ExitCode::from(2);
@@ -213,6 +229,8 @@ mod tests {
                 "25",
                 "--want-mass-query",
                 "0",
+                "--header-timeout-ms",
+                "250",
             ]
             .map(String::from),
         )
@@ -221,6 +239,7 @@ mod tests {
         assert_eq!(config.upstream, "http://example:80");
         assert_eq!(config.priority, 25);
         assert!(!config.want_mass_query);
+        assert_eq!(config.header_timeout_ms, 250);
     }
 
     #[test]

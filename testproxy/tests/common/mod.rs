@@ -167,30 +167,60 @@ impl RawResponse {
     }
 }
 
+/// A "connection died with no valid HTTP response" observation - the expected
+/// outcome of the connection-reset fault.
+fn no_response() -> RawResponse {
+    RawResponse {
+        status: None,
+        headers: vec![],
+        body: vec![],
+        content_length: None,
+        short: true,
+    }
+}
+
+/// Whether an I/O error means "the peer tore the connection down" rather than a
+/// real test failure. task-34 ROOT CAUSE: the connection-reset fault shuts the
+/// socket at an arbitrary point relative to the client's write/read, so the
+/// abnormal close surfaces as ANY of this family depending on scheduling under
+/// load - not only `ConnectionReset`. The previous helper caught only
+/// `ConnectionReset` on the read and let the others `?`-propagate into the
+/// test's `.unwrap()`, which is the intermittent panic. Classifying the whole
+/// family (on the WRITE and the READ) makes the reset observation deterministic.
+fn conn_dropped(err: &io::Error) -> bool {
+    matches!(
+        err.kind(),
+        io::ErrorKind::ConnectionReset
+            | io::ErrorKind::ConnectionAborted
+            | io::ErrorKind::BrokenPipe
+            | io::ErrorKind::UnexpectedEof
+    )
+}
+
 /// Issue a request and read the whole response (until the server closes the
-/// connection). Never panics on a reset - that is a valid observation here.
+/// connection). Never panics on a reset - that is a valid observation here, and
+/// it is deterministic regardless of exactly when the reset lands (task-34).
 pub fn raw_request(addr: SocketAddr, method: &str, target: &str) -> io::Result<RawResponse> {
     let mut stream = TcpStream::connect(addr)?;
     stream.set_read_timeout(Some(Duration::from_secs(10)))?;
-    write!(
+    // The server may reset before/while we send; a torn write is still a valid
+    // "no response" observation, not a test error.
+    if let Err(err) = write!(
         stream,
         "{method} {target} HTTP/1.1\r\nHost: {addr}\r\nConnection: close\r\n\r\n"
-    )?;
-    stream.flush()?;
+    )
+    .and_then(|()| stream.flush())
+    {
+        if conn_dropped(&err) {
+            return Ok(no_response());
+        }
+        return Err(err);
+    }
 
     let mut raw = Vec::new();
-    // A reset shows up as ConnectionReset; treat it as "no response".
     match stream.read_to_end(&mut raw) {
         Ok(_) => {}
-        Err(err) if err.kind() == io::ErrorKind::ConnectionReset => {
-            return Ok(RawResponse {
-                status: None,
-                headers: vec![],
-                body: vec![],
-                content_length: None,
-                short: true,
-            });
-        }
+        Err(err) if conn_dropped(&err) => return Ok(no_response()),
         Err(err) => return Err(err),
     }
 

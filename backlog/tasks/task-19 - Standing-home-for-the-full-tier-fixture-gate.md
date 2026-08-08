@@ -4,9 +4,9 @@ title: Standing home for the full-tier fixture gate
 status: To Do
 assignee: []
 created_date: '2026-08-08 00:28'
-updated_date: '2026-08-08 02:01'
+updated_date: '2026-08-08 17:59'
 labels:
-  - deferred-finding
+  - wave2
 dependencies: []
 ---
 
@@ -26,4 +26,6 @@ Do not resolve by weakening either gate or by folding the 110 MiB payload into j
 
 <!-- SECTION:NOTES:BEGIN -->
 forward-carried from task-3 round 5: the fixture tree is now published as an immutable generation behind a symlink, so every path above that starts fixtures/out/ gains one level: fixtures/out/current/cache, fixtures/out/current/manifest.json, fixtures/out/current/test-key.pub. Resolve through fixtures/out/current (never name a generation directly); it is a relative symlink to generations/gen-<manifest-sha>, and the generation it points at is immutable, so a consumer that resolves it once cannot have the tree change underneath it. Retention is two generations, not a lease: re-resolve on ENOENT if you hold it across repeated regenerations.
+
+task-13 triage (KEEP, out of scope): this is a CI/scheduling-infrastructure gap (no CI exists in-repo to invoke the full-tier fixture gate + rebuild-determinism gate on a cold checkout), NOT a correctness finding against the wave-1 daemon/proxy surfaces task-13 hardened. Both gates exist and bite; only an automatic invoker is missing. Kept as an explicit standing task; reclassified deferred-finding -> wave2 (needs a CI/ops decision, out of this hardening wave).
 <!-- SECTION:NOTES:END -->

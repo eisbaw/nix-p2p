@@ -14,6 +14,21 @@
 //! "silently gunzip and strip the header while forwarding the compressed
 //! Content-Length" trap cannot occur here because no decoding layer exists.
 //!
+//! Protocol scope (HTTP/2 gap, task-13 hardening audit - stated so it is a
+//! known ceiling, not a latent surprise): this client speaks HTTP/1.1 ONLY
+//! (`hyper::client::conn::http1`, and the `daemon` crate enables only hyper's
+//! `http1` feature). The real cache.nixos.org (Fastly) negotiates HTTP/2 over
+//! TLS/ALPN but ALSO serves HTTP/1.1 on the same origin, so an h1.1 client
+//! reaches it correctly - the daemon does not NEED h2 for wave-1's plain-HTTP
+//! upstreams. What it CANNOT do is talk to an h2-ONLY (prior-knowledge/h2c)
+//! upstream: the h1 handshake writes an HTTP/1.1 request line and then fails to
+//! parse the peer's HTTP/2 frames, which surfaces as a fast, clean
+//! [`SourceError`] (a 502 to Nix), never a hang or a mis-decode. That
+//! fail-closed behaviour is pinned by `daemon/tests/header_hygiene.rs`
+//! (`h2_only_upstream_fails_closed_not_hang`). Adding h2/ALPN negotiation is a
+//! wave-2 concern bundled with the TLS work (task-24); wave-1 fronts plain HTTP
+//! only.
+//!
 //! Fast-failure discipline (AC#6 / S2): a down upstream must not hang the build
 //! path. Connect and header reads are each bounded by a short timeout so a
 //! dead/black-holed upstream yields a clean 502 well within 2 s, letting Nix
@@ -77,6 +92,27 @@ impl UpstreamHttp {
             connect_timeout: Duration::from_millis(1000),
             header_timeout: Duration::from_millis(1000),
         })
+    }
+
+    /// Override the per-hop upstream header timeout (default 1000 ms).
+    ///
+    /// KNOWN CEILING (task-33, characterised by the task-13 fault x depth
+    /// matrix): this is a FIXED per-hop deadline - each daemon starts its own
+    /// clock when IT sends its upstream request. It does NOT compose across a
+    /// daemon chain: inner hops fetch serially, so at depth the deepest
+    /// upstream's effective deadline is the OUTERMOST hop's timeout minus the
+    /// accumulated per-hop connect/send overhead. Relationship: an upstream
+    /// whose header latency is L is served iff L + (depth-1)*overhead <
+    /// header_timeout at every hop, so the OUTERMOST hop is the first to 502 as
+    /// L approaches the timeout. On a loopback chain the per-hop overhead is
+    /// sub-millisecond, so the observable flip is governed by L vs
+    /// `header_timeout` (depth-composition is real but WAN-scale, below the
+    /// loopback noise floor - see TESTING.md). Making the deadline budget-aware
+    /// across hops is the wave-2 fix kept on task-33; exposing this knob lets an
+    /// operator (and the e2e boundary pin) move the ceiling deliberately.
+    pub fn with_header_timeout(mut self, header_timeout: Duration) -> Self {
+        self.header_timeout = header_timeout;
+        self
     }
 
     /// Open a fresh connection, send a GET for `path`, and return the response

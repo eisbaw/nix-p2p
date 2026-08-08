@@ -689,3 +689,78 @@ async fn without_persisted_correlation_the_same_request_falls_back_to_upstream_p
         vec![SeenKey::Path(TOKEN.to_string())]
     );
 }
+
+// =============================================================================
+// AC#3 (task-13): ENOSPC / write-failure in the narinfo cache DEGRADES TO
+// PASSTHROUGH - the upstream bytes are still served and no poison entry lands.
+// =============================================================================
+
+/// A disk-full / unwritable cache must NOT fail the request and must NOT cache a
+/// partial entry: caching is an optimisation, correctness never depends on it.
+/// ENOSPC and EACCES traverse the SAME best-effort branch in `install()`
+/// (`write_durably` returns `Err` -> logged -> upstream bytes served), so making
+/// the `.tmp` staging dir unwritable faithfully exercises the ENOSPC path
+/// without a size-limited tmpfs (which rootless CI cannot mount).
+#[cfg(unix)]
+#[tokio::test]
+async fn enospc_narinfo_cache_degrades_to_passthrough_never_poisons() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = TempDir::new("enospc");
+    let body = narinfo(
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-x",
+        "1abc.nar.xz",
+        "sha256:deadbeef",
+        4096,
+    );
+    let upstream = FakeUpstream::new(Behavior::Body(body.clone()));
+    let cache = NarinfoDiskCache::new(
+        dir.path(),
+        upstream.clone(),
+        Arc::new(ManualClock::new(1000)),
+    )
+    .unwrap();
+
+    // Make the staging area unwritable AFTER construction (new() created it):
+    // every subsequent `File::create` under .tmp now fails, modelling ENOSPC.
+    let tmp = dir.path().join(".tmp");
+    let mut perms = std::fs::metadata(&tmp).unwrap().permissions();
+    perms.set_mode(0o500); // r-x: create() inside fails
+    std::fs::set_permissions(&tmp, perms).unwrap();
+
+    // Fetch #1: the write fails, but the upstream bytes are served VERBATIM.
+    let first = cache.fetch(&StoreHash::new(HASH)).await.unwrap();
+    assert_eq!(first.status, 200);
+    assert_eq!(
+        body_bytes(first).await,
+        body,
+        "an unwritable cache must still serve the upstream body verbatim"
+    );
+    assert_eq!(upstream.hits(), 1);
+
+    // No poison landed: no .nic entry exists, so fetch #2 refetches (passthrough),
+    // it does not serve a partial/corrupt cached file.
+    let nic_files: Vec<_> = std::fs::read_dir(dir.path())
+        .unwrap()
+        .flatten()
+        .filter(|e| e.path().extension().is_some_and(|x| x == "nic"))
+        .collect();
+    assert!(
+        nic_files.is_empty(),
+        "a failed write must leave NO cache entry, found {nic_files:?}"
+    );
+
+    let second = cache.fetch(&StoreHash::new(HASH)).await.unwrap();
+    assert_eq!(body_bytes(second).await, body);
+    assert_eq!(
+        upstream.hits(),
+        2,
+        "with no entry written, the second fetch must reach upstream again \
+         (proves passthrough, not a served partial)"
+    );
+
+    // Restore perms so TempDir::drop can clean up.
+    let mut perms = std::fs::metadata(&tmp).unwrap().permissions();
+    perms.set_mode(0o700);
+    std::fs::set_permissions(&tmp, perms).unwrap();
+}

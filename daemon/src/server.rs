@@ -315,28 +315,75 @@ fn forward(result: Result<UpstreamResponse, SourceError>, is_head: bool) -> Resp
     response
 }
 
+/// The daemon's forwarded/stripped header allowlist, documented so it is a
+/// deliberate policy and asserted by `daemon/tests/header_hygiene.rs` (task-13).
+/// The daemon is a TRANSPARENT proxy, so the policy is deny-a-fixed-set,
+/// forward-everything-else - the inverse of a curated allowlist, because the
+/// content-integrity fields the client verifies (`Content-Encoding`,
+/// `Content-Length`, `ETag`, and every end-to-end header) must survive verbatim
+/// and enumerating them would silently drop any we forgot.
+///
+/// Three classes:
+///   * STRIP (never relayed) - the RFC 7230 §6.1 hop-by-hop headers below, PLUS
+///     any field-name listed in a `Connection:` header value. These describe a
+///     single TCP hop (this client<->that server) and are meaningless, or
+///     actively wrong, one hop further on.
+///   * FORWARD verbatim (everything else) - crucially `Content-Encoding` (a gzip
+///     NAR relays unchanged for the client to decompress + verify, AC#6),
+///     `Content-Type`, `ETag`, `Last-Modified`, `Cache-Control`, `Accept-Ranges`
+///     and any `X-*`. The daemon adds NO decoding layer, so these pass byte-exact.
+///   * NEVER TOUCH - the narinfo BODY (the signed fingerprint) and the NAR bytes.
+///     Header hygiene here concerns the response HEADER MAP only; `Content-Length`
+///     is the one header the serving layer RECOMPUTES, and only for the buffered
+///     narinfo path where it must equal the bytes actually emitted (see
+///     `respond_narinfo`). On the streamed NAR path even `Content-Length` is
+///     forwarded verbatim.
+const HOP_BY_HOP: &[&str] = &[
+    "connection",
+    "keep-alive",
+    "proxy-authenticate",
+    "proxy-authorization",
+    "te",
+    "trailer",
+    "transfer-encoding",
+    "upgrade",
+];
+
 /// Copy every header except hop-by-hop ones (which belong to a single
-/// connection and must not be relayed).
+/// connection and must not be relayed). Honours the `Connection:` header's own
+/// token list per RFC 7230 §6.1: `Connection: X-Foo` marks `X-Foo` hop-by-hop
+/// for this message, so it is stripped too - a keep-alive/desync hazard the
+/// long-chain hardening (task-11/task-13) specifically guards against.
 fn forward_headers(dst: &mut HeaderMap, src: &HeaderMap) {
+    let connection_tokens = connection_listed_tokens(src);
     for (name, value) in src {
-        if is_hop_by_hop(name) {
+        if is_hop_by_hop(name) || connection_tokens.contains(name.as_str()) {
             continue;
         }
         dst.append(name.clone(), value.clone());
     }
 }
 
+/// The lower-cased field-names named in any `Connection:` header value (the
+/// connection-specific fields the sender marked as not-to-be-forwarded).
+fn connection_listed_tokens(src: &HeaderMap) -> std::collections::HashSet<String> {
+    let mut tokens = std::collections::HashSet::new();
+    for value in src.get_all(http::header::CONNECTION) {
+        if let Ok(text) = value.to_str() {
+            for token in text.split(',') {
+                let token = token.trim().to_ascii_lowercase();
+                // "close"/"keep-alive" are connection directives, not field
+                // names to strip; the latter is already hop-by-hop anyway.
+                if !token.is_empty() && token != "close" {
+                    tokens.insert(token);
+                }
+            }
+        }
+    }
+    tokens
+}
+
 fn is_hop_by_hop(name: &HeaderName) -> bool {
-    const HOP_BY_HOP: &[&str] = &[
-        "connection",
-        "keep-alive",
-        "proxy-authenticate",
-        "proxy-authorization",
-        "te",
-        "trailer",
-        "transfer-encoding",
-        "upgrade",
-    ];
     HOP_BY_HOP.contains(&name.as_str())
 }
 

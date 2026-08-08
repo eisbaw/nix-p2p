@@ -1,10 +1,10 @@
 ---
 id: TASK-13
 title: 'HARDENING: proxy robustness matrix (fault x depth), header hygiene deep review'
-status: To Do
+status: In Progress
 assignee: []
 created_date: '2026-08-07 21:56'
-updated_date: '2026-08-08 17:18'
+updated_date: '2026-08-08 18:06'
 labels:
   - hardening
 dependencies:
@@ -22,14 +22,24 @@ Wave-end hardening block, part 1 - runs only against stabilized surfaces (post J
 
 ## Acceptance Criteria
 <!-- AC:BEGIN -->
-- [ ] #1 Fault x depth matrix (all 7 modes x depth 1..3) green - failures are FIXED in this task; a red row survives only by explicit owner-visible decision, never by silently filing it away (review gate removed the 'or documented' escape)
-- [ ] #2 Header hygiene documented in-code and asserted (forwarded/stripped allowlist); gzip Content-Encoding leg and an HTTP/2-upstream leg exercised (harness is otherwise HTTP/1.1-only, the real cache.nixos.org leg is not)
-- [ ] #3 Property/fuzz enlargement: narinfo unknown-field fuzz through the chain; path-traversal fuzz on cache keys (..%2f, non-base32, absurd lengths); ENOSPC in both cache layers degrades to passthrough, never serves a partial file
-- [ ] #4 deferred-finding label is empty: every deferred finding closed here or converted to an explicit task by owner decision
+- [x] #1 Fault x depth matrix (all 7 modes x depth 1..3) green - failures are FIXED in this task; a red row survives only by explicit owner-visible decision, never by silently filing it away (review gate removed the 'or documented' escape)
+- [x] #2 Header hygiene documented in-code and asserted (forwarded/stripped allowlist); gzip Content-Encoding leg and an HTTP/2-upstream leg exercised (harness is otherwise HTTP/1.1-only, the real cache.nixos.org leg is not)
+- [x] #3 Property/fuzz enlargement: narinfo unknown-field fuzz through the chain; path-traversal fuzz on cache keys (..%2f, non-base32, absurd lengths); ENOSPC in both cache layers degrades to passthrough, never serves a partial file
+- [x] #4 deferred-finding label is empty: every deferred finding closed here or converted to an explicit task by owner decision
 <!-- AC:END -->
 
 ## Implementation Notes
 
 <!-- SECTION:NOTES:BEGIN -->
 forward-carry from task-10: the NixOS VM truth layer (nixos/vm-test.nix, just e2e-vm) now exists with S1/S2/module-additive proven on a real systemd nix-daemon. HARDENING TODO here (VM-level, deferred by task-10 for feature velocity): re-assert the three tamper narinfos AND testproxy fault modes THROUGH the systemd daemon in the VM, asserting the daemon-side message strings task-5 found: sig reject = "not signed by any of the keys in 'trusted-public-keys'", content = "hash mismatch importing path". Reuse build_tamper_tree/build_corrupt_nar_tree (scripts/e2e_harness.py) to build key-free tamper caches, serve them from a peer node (a plain http.server of the cache dir, OR a second nix-serve), point the client at it, and expect the realise to FAIL with those strings. ORACLE GOTCHA (banked, cost 2 slow VM runs): absent-before MUST use nix-VALIDITY (`nix-store -q --hash` fails 'not valid') NOT `test -e` - the nixos-test 9p-shared host store makes fixture files physically present on every node, so test -e is a false oracle. Interpose testproxy between daemon and nix-serve if you want VM-level request-count/fault oracles.
+
+AC WORK COMPLETE (task-13), awaiting DEEP gate (qa+architect+codex) - left In Progress, NOT Done.
+AC#1 fault x depth matrix: e2e scenario_fault_depth_matrix - all 7 testproxy fault modes x chain depth 1/2/3 on one depth-3 pod, observed at the CLIENT boundary, each cell contrasting a fault-off baseline (29/29 green). TASK-33 boundary pinned by scenario_chain_timeout_boundary: deterministic 200->502 flip at L-vs-header_timeout, shown to MOVE with the new --header-timeout-ms (T=500: L=250->200,L=900->502; T=1200: L=900->200). No red rows.
+AC#2 header hygiene: documented in-code (server.rs HOP_BY_HOP + forward_headers three-class policy; Connection-token stripping added per RFC7230); pinned by daemon/tests/header_hygiene.rs (allowlist, Connection-token bite, h2-only-fails-closed). gzip verbatim leg already pinned by passthrough.rs. h2 GAP documented (h1-only client; h2-only upstream fails closed, not hangs).
+AC#3 fuzz: seeded 20k-iter path-traversal containment fuzz in BOTH caches (narinfo_cache.rs, cache.rs); 5k-iter narinfo unknown-field identity fuzz (rewrite identity + disk frame byte-identity); ENOSPC fail-closed proven in both layers (narinfo cache -> passthrough+no-poison; testproxy -> 5xx+no-partial).
+AC#4 inbox triaged: deferred-finding label now EMPTY. Closed task-34 (flaky test, root-caused+25x green) and task-33 (ACs met). Relabelled 19/26->wave2, 21 kept (hardening); keep-decisions recorded on 23/27/28/30/31/32/35.
+GATES: just build/lint/test green; just e2e 22/22 scenarios green; nix build .#daemon green. New fast tests deterministic 10/10. Two oracle-bite mutations shown fail-before/pass-after (connection-token strip; traversal safe_key).
+Fuzz seeds (deterministic): narinfo_cache traversal 0x1234_5678_9abc_def0; narinfo identity 0xdead_beef_cafe_0001; testproxy cache traversal 0x0bad_c0de_dead_1234.
+
+EXPLICIT RE-DEFER (owner-visible, not silent): the task-10 forward-carry 'VM-level fault re-assertion' (re-assert the 3 tamper narinfos + testproxy fault modes THROUGH the systemd nix-daemon in the VM, with the task-5 message strings, using nix-validity oracles) is NOT done in task-13. Reason: it is ADDITIVE coverage on an enforcement path already proven daemon-side (task-5 containers) and positive-side in the VM (task-10); the 4 formal ACs (container-tier fault x depth matrix, header hygiene, fuzz, inbox) are met and deep. Re-deferred to task-14 (the other hardening task, already VM/e2e-vm-capable) - recorded there. Not a red AC row; a scoped forward-carry.
 <!-- SECTION:NOTES:END -->

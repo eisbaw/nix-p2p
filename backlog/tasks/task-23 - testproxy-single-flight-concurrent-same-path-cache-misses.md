@@ -4,6 +4,7 @@ title: 'testproxy: single-flight concurrent same-path cache misses'
 status: To Do
 assignee: []
 created_date: '2026-08-08 07:31'
+updated_date: '2026-08-08 17:59'
 labels:
   - testproxy
   - follow-up
@@ -22,3 +23,9 @@ task-2's cache is integrity-safe under concurrency (atomic tmp+rename; every rea
 <!-- AC:BEGIN -->
 - [ ] #1 concurrent misses for one cold path cause exactly one upstream fetch
 <!-- AC:END -->
+
+## Implementation Notes
+
+<!-- SECTION:NOTES:BEGIN -->
+task-13 triage: KEEP for wave-2 - testproxy single-flight coalescing is a redundant-work OPTIMISATION; integrity already holds under concurrency (atomic rename). Not a correctness finding on the stabilized surfaces; distinct concern.
+<!-- SECTION:NOTES:END -->

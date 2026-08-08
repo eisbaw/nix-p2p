@@ -184,6 +184,74 @@ only — never the signed fields). A property test asserts arbitrary
 well-formed narinfos (unknown fields, odd ordering, multiple `Sig:`)
 pass through byte-identical, including across a daemon restart.
 
+## Hardening: fault × depth, header hygiene, fuzz (task-13)
+
+Wave-end hardening against the stabilized wave-1 surfaces.
+
+**Fault × depth matrix** (`e2e_harness.py::scenario_fault_depth_matrix`):
+all 7 testproxy fault modes × chain depth 1–3 on one depth-3 pod
+(entering at daemon-3/-2/-1), observed at the **client** boundary (raw
+HTTP status/bytes) and the testproxy — never daemon self-narration.
+Each cell contrasts against a fault-off baseline (so a cell that could
+not tell faulted from clean is not a passing cell): mode 1 latency
+(sub-timeout) stays 200; mode 2 HTTP-503 forwards verbatim; modes 3/7
+(reset, unreachable) become a fast clean **502**; mode 4 truncate yields
+a short body (Content-Length full, bytes fewer); mode 5 corrupt yields
+same-length different bytes (the daemon does **not** mask corruption —
+Nix is the arbiter, proven separately by the real-build
+`chain-corrupt-bite`); mode 6 wrong-narinfo forwards mutated metadata.
+Mode 8 (throttle) is a crash-window aid, exercised by the crash suite.
+
+**TASK-33 header-timeout ceiling** (`scenario_chain_timeout_boundary`):
+the per-hop upstream header timeout is a **fixed per-hop deadline** that
+does not compose across a daemon chain — an upstream of latency `L` is
+served iff `L + (depth-1)·per_hop_overhead < header_timeout` at every
+hop, so the **outermost** hop 502s first as `L` approaches the timeout.
+The timeout is now configurable (`daemon --header-timeout-ms`, was a
+hardcoded 1000 ms). The boundary is pinned deterministically and shown
+to **move with the timeout**: at `T=500 ms`, `L=250` serves 200 at every
+depth and `L=900` flips to 502 at every depth; at `T=1200 ms` the same
+`L=900` serves 200 again. **Loopback limitation (recorded decision):**
+per-hop connect/send overhead is sub-millisecond on pod loopback, so the
+depth-composition term is below the noise floor — all depths flip
+together at `L≈T` here. A clean *depth-separated* flip is WAN-scale and
+not robustly pinnable on loopback, so the asserted boundary is `L`-vs-`T`
+(moved via `T`); the budget-aware composing-timeout fix is forward-
+carried to wave-2 (task-15), not required by task-33's ACs.
+
+**Header hygiene** (`daemon/src/server.rs`, pinned by
+`daemon/tests/header_hygiene.rs`): the daemon is a transparent proxy, so
+the policy is **strip a fixed hop-by-hop set, forward everything else
+verbatim** (the inverse of a curated allowlist — the client-verified
+content fields must all survive). STRIP = the RFC 7230 §6.1 hop-by-hop
+headers **plus any field named in a `Connection:` header value** (a
+keep-alive/desync hazard the long-chain guards against; new in task-13).
+FORWARD = `Content-Encoding` (gzip relayed verbatim, no auto-decompress
+— pinned by `passthrough.rs`), `Content-Type`, `ETag`, `Cache-Control`,
+`Age`, `Last-Modified`, and any `X-*`. `Content-Length` is the one
+header the serving layer recomputes, and only for the buffered narinfo
+path. **HTTP/2 gap (documented ceiling):** the upstream client speaks
+HTTP/1.1 only; cache.nixos.org also serves h1.1 so the daemon reaches
+it, but an **h2-only** upstream fails **closed** (a fast 502, never a
+hang or mis-decode) — pinned by `h2_only_upstream_fails_closed_not_hang`.
+h2/ALPN is bundled with the wave-2 TLS work (task-24).
+
+**Fuzz / fail-closed** (seeded, deterministic — no entropy/Date flake):
+`narinfo_cache.rs` and `cache.rs` carry 20 000-iteration seeded fuzz
+loops proving no hostile cache key (`..%2f`, absolute, non-base32, NUL,
+absurd length) ever resolves outside the cache root (containment
+asserted structurally; non-vacuous — a valid key IS accepted). A
+5 000-iteration narinfo fuzz proves arbitrary well-formed narinfos
+(random ordering, unknown fields, multiple `Sig:`, mixed line endings)
+survive the rewrite (identity) and the disk frame byte-identical. ENOSPC
+in **both** cache layers is proven fail-closed: an unwritable narinfo
+cache **degrades to passthrough** (serves upstream bytes, writes no
+entry, refetches — `enospc_narinfo_cache_degrades_to_passthrough`), and
+an unwritable testproxy cache **fails closed** with a 5xx and no partial
+entry published (`testproxy/tests/enospc.rs`). ENOSPC and EACCES take the
+same write-error branch, so a read-only staging dir faithfully models
+"no space" without a size-limited tmpfs.
+
 ## J2 measurement baseline (task-12)
 
 **Recorded 2026-08-08.** Instrument: `scripts/measure.py` (`just measure
