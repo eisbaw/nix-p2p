@@ -64,9 +64,10 @@
 //!     STREAM-VERIFIES by (iroh-blobs speaks BLAKE3, not sha256).
 //!
 //! Both are functions of the same `RawNarV1` bytes, so a holder computes both from
-//! one `--dump`. The claim binds them: it is keyed on the signed `NarHash` and its
-//! payload carries the `Blake3Digest` EXACTLY ONCE (transport offers are pure
-//! locators - they do not repeat it). The trust chain is unchanged - the Nix
+//! one `--dump`. The claim binds them: it is keyed on the signed `NarHash` and a
+//! known `WholeNar` payload carries the `Blake3Digest` at most once (transport
+//! offers are pure locators - they never repeat it, so a claim can never name two
+//! blobs). The trust chain is unchanged - the Nix
 //! client still re-verifies `sha256(nar) == NarHash` after any p2p fetch (wave-1
 //! S1); BLAKE3 only addresses and stream-verifies the transfer, it never replaces
 //! the signed sha256 gate.
