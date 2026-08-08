@@ -4,7 +4,7 @@ title: Mock upstream mode + signed fixture store
 status: In Progress
 assignee: []
 created_date: '2026-08-07 21:55'
-updated_date: '2026-08-08 01:30'
+updated_date: '2026-08-08 02:21'
 labels:
   - irreversible
 dependencies:
@@ -138,4 +138,42 @@ QA INFORMATIONAL folded in: tree_digest's docstring now states what the mtime/mo
 gate round 4: build/lint/fmt exit 0; test exit 0 (4s cold); fixtures-large exit 0 (5s, 12 ok / 0 PARTIAL); fixtures-verify-rebuild exit 0 (3s); package exit 0; nix build .#daemon .#testproxy exit 0; nix flake check exit 0 (3s, 8 checks). cargo 2/2. Determinism: diff -r exit 0 over 13 files / 115,939,516 bytes, and metadata-aware digests equal over 18 entries. Stubs untouched (4x '0 scenarios registered - NOT a pass').
 
 Orchestrator adjudication after deep-gate round 4 (codex NO-GO #4, five new blockers all inside the bespoke retire/quarantine/rollback machinery): STOP PATCHING, SIMPLIFY. Rounds 2-4 each grew transaction code that the next review broke - the machinery is the defect surface. Round 5 redesigns publication to immutable generation dirs + atomic symlink flip (publish = one atomic op; lock-commit failure = swap symlink back; no quarantine concept). Point fixes that survive the redesign: blob path confinement, strict lock schema, cache_info expected-keys iteration, fd-based marker-verified deletion. Fresh implementer per context-fatigue rule; incumbent's four rounds of notes are the onboarding.
+
+ROUND 5 (commit 2d3af2a). awaiting deep gate (round 5).
+
+REDESIGN, per the orchestrator's adjudication - the publication machinery was replaced, not patched. Publication is now immutable generations plus one atomic symlink flip:
+  fixtures/out/generations/gen-<sha256(manifest.json)[:16]>/  built, validated, then never touched
+  fixtures/out/current -> generations/gen-<...>                swapped with a single os.replace
+Every consumer resolves through 'current' (fixturelib.resolve_current). There is no half-published state, so rollback is one more symlink flip and the quarantine concept no longer exists. A failed run leaves its generation on disk, named and inspectable; a later run collects it. Two generations are retained (published + predecessor).
+
+Failure end states, each verified on disk: flip fails -> nothing changed, generation inert on disk; lock write fails -> current flips back in one syscall, old lock intact, exit 2 (codex's EACCES repro: current -> gen-3d1ac5e25ffb1bea, lock a39382de8782d6f7 unchanged, gen-d2ab43402b88715a preserved, zero stray .tmp); GC fails -> SUCCESS with a warning naming the residue.
+
+POINT FIXES, each reproduced FAILING first (evidence in the git note on 2d3af2a):
+(a) blob url confinement. Codex's '../../outside.nar' repro: the old code exited 0 and PUBLISHED a cache whose narinfo named a blob absent from nar/, while blob_problems hashed a file outside the tree and reported 'NAR bytes verified'. Now refused before publish.
+(b) closed lock schema. Unknown top-level and per-payload fields were accepted, ignored, then silently erased by the next --write-lock (measured: 'survives: False'). Now LockError -> exit 2.
+(c) cache_info comparison iterates the EXPECTED keys. manifest cache_info={} went from exit 0 to exit 1.
+(d) species sweep beyond codex's two: --require-tier was a special case for 'full' (now a TIER_RANK comparison); an unrecognised manifest tier reached a lookup unchecked; generate() and prepare_lock read the lock with raw json.loads, bypassing validation; and resolve_current had NO confinement, so a crafted 'current' could make the gate verify and the mock upstream serve outside the publication root.
+
+Round-4 findings, all reproduced then closed: commit_lock's own print inside the caller's except OSError (the old code exits 2 saying 'the committed lock is unchanged' while the lock on disk IS the new one); unwind cleanup that raised and replaced the causing error; post-commit cleanup failure reported as failure; marker-check-then-delete TOCTOU (a swapped-in foreign directory was deleted; now refused, and empty unmarked directories are no longer treated as consent). Deletion is one fd-based primitive throughout.
+
+TWO ARCHITECT PASSES ON THE REDESIGN ITSELF found three further blockers, all reproduced and fixed inside this round rather than deferred:
+1. reusable() was a whitelist standing in for 'is this the pinned workload'. 'rm fixtures/out/current/cache/nix-cache-info' made the tool unable to repair itself - gate exit 1, 'just fixtures' exit 0 'reused', gate exit 1, forever, with the gate advising the command that does nothing. Reuse and gate now share fx.completeness_problems(); the false claim of parity with the gate is replaced by what reuse actually proves.
+2. Refusing to install over a mutated generation dead-ended for the same reason: the name is content-derived, so the occupant is usually the tree being repaired, and 'remove it and rerun' named the directory 'current' still pointed at. The corrected tree is now published beside it as gen-<sha>.superseded-<stamp> with a warning; the mutated directory is still never modified or deleted, and a later run collects it. Verified self-healing end to end.
+3. restore_current claimed 'the new generation is inert' without knowing the new name; on the adopt path (previous == name, which is the documented --write-lock-twice case) it described the opposite of the disk.
+Also fixed: note()'s /dev/null redirect was reachable from the PRE-commit unwind, where it put /dev/null over fd 2 so the real failure printed into the void (measured); expected_attrs mapped every non-full tier to the fast set - a third instance of the fail-open species, latent under two tiers; unlink_contents had the round-4 marker race one level down; check-fixtures' ok() had the exit-120 pipe bug; check_cache_info dropped malformed served lines; the ownership marker was checked with .exists(), which follows symlinks; point_current_at leaked its temporary symlink; tree_digest blocked forever on a FIFO; collect_generations never ran on the reuse path, so residue accumulated unboundedly at 110 MiB a generation on a warm tree.
+
+LOCK UNCHANGED, as required: '--large --write-lock' twice leaves a39382de8782d6f7 byte-identical to the pre-redesign lock, and the served content is byte-identical too (13 files, 115,939,516 bytes, per-file sha256 unchanged). Only the publication mechanics moved.
+
+ACCEPTED RESIDUALS, updated where the redesign changed their meaning:
+- The ENOENT window a reader could hit during publish-by-rename is GONE, and what replaces it is better: a reader that resolved 'current' keeps reading a complete, immutable generation. The limit that remains is retention, not tearing - two generations, not a lease - so a consumer idle across two publications can still lose its generation. Carried to task-5 with the concrete contract (hold the directory open, re-resolve on ENOENT).
+- reusable() checks presence and size, not blob hash, so the only defect it can miss is corrupted blob CONTENT; the gate re-hashes unconditionally.
+- The final rmdir is by name (POSIX has no rmdir(fd)); a dev/ino comparison closes all but the instant before it, and that residual can only remove an EMPTY directory.
+- flock covers generators against each other on one resolved root. NOT covered and now stated: two aliases of one root (bind mount), two --write-lock runs against different roots sharing the tracked lock, and the gate, which takes no lock at all.
+- A run killed between the build directory's mkdir and its marker write leaves a directory nothing may ever delete (unmarked = never deleted), re-warned about forever.
+- Generation names are 64-bit truncations; a collision produces a spurious 'superseded' publish, never a wrong adoption.
+- A pre-generations tree at fixtures/out is REFUSED, not migrated: 'rm -rf fixtures/out' once. The tree is a gitignored output; a migration path would have outlived the transition.
+
+Forward-carried: task-5 rewritten (paths gain current/, the ENOENT retry advice withdrawn, the obsolete .out.retired/.out.quarantine cleanup warnings replaced, bind-mount guidance settled against the immutable generation); tasks 2/9/10/19 given the path change.
+
+gate round 5: build/lint/fmt/test/fixtures-large/fixtures-verify-rebuild/package all exit 0; nix build .#daemon .#testproxy exit 0; nix flake check exit 0 (8 checks). cargo 2/2. Full tier: 12 ok, 4 positive controls, 3 bites, 0 PARTIAL. Determinism: two fresh roots produce the SAME generation name, diff -r exit 0 over 13 files / 115,939,516 bytes, metadata-aware digests equal over 18 entries. 3 concurrent generators exit 0 0 0. Cold start from no fixtures/out: just test exit 0, then fixtures-large exit 0. Stubs untouched (4x '0 scenarios registered - NOT a pass').
 <!-- SECTION:NOTES:END -->
