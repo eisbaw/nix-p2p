@@ -29,6 +29,9 @@ all argue against; the implementation strategy below is deliberately
 measurement-first so this thesis is tested before any DHT code
 exists.
 
+**SCOPE CHANGE (owner directive, 2026-08-08): the kill criterion is DESCOPED to a non-blocking metric.** The project proceeds to the p2p wave regardless of the wave-1 measurement outcome. The measurement instrument (task-9) is still built and kept honest (it informs tuning, hedge design, and the prefetch-window question), but a <20% net-egress result no longer stops the project. Consequently the task-16 checkpoint is recast from GO/NO-GO to 'read the baseline, then proceed to wave-2 planning', and task-9's counting rule is a useful comparison basis rather than an irreversible project gate.
+
+
 ## Implementation strategy (settled, round 2, owner)
 
 **Wave 0 is a transparent proxy**: a daemon that does nothing but

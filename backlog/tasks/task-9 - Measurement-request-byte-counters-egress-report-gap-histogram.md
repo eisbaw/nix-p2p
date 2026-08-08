@@ -4,7 +4,7 @@ title: 'Measurement: request/byte counters + egress report + gap histogram'
 status: To Do
 assignee: []
 created_date: '2026-08-07 21:56'
-updated_date: '2026-08-08 12:38'
+updated_date: '2026-08-08 12:46'
 labels:
   - irreversible
 dependencies:
@@ -82,4 +82,6 @@ shape (bytes_sent < Content-Length/file_size, fault=None) is the discriminator;
 see scenario crash-kill-mid-nar. Also: the new `throttle_nar_bps` fault paces a
 transfer without changing total bytes - handy for measurement bite tests that need
 a wide observation window.
+
+SCOPE CHANGE (owner, 2026-08-08): kill criterion descoped to a non-blocking metric. Still build the instrument and keep it HONEST (bites must bite, testproxy counters are ground truth), but the counting rule is a comparison basis, not an irreversible project-gate freeze - so the close gate is LIGHT+one mutation-verify pass, not a task-3-style multi-round freeze panel. Do NOT over-invest in freeze ceremony.
 <!-- SECTION:NOTES:END -->
