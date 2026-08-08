@@ -397,9 +397,13 @@ own behaviour. Per closure: `nix copy --from https://cache.nixos.org
 real cache miss — every narinfo and NAR is fetched over the wire.
 `nix copy`'s substitution download path is the same machinery
 `nix build` uses to pull a cache-miss closure. We parse nix's `-vvvv`
-`starting download of <URL>` lines, timestamping each at read time
-(a gap is a *difference* of two timestamps from one stream, so constant
-pipe latency cancels). Each nar URL is paired to its store path via the
+`starting download of <URL>` lines, timestamping each at read time as a
+proxy for request-issue time (the two differ by nix-side buffering and
+NAR-phase reader backpressure — a non-constant lag of order tens of ms
+that does *not* fully cancel; negligible vs the seconds-scale tail, but a
+real fraction of the tens–hundreds-ms head, so **head gaps are
+order-of-magnitude, not precise**). Each nar URL is paired to its store
+path via the
 narinfo's `URL:` field (fetched once out of band — does not perturb
 timing), reproducing the loopback testproxy's exact pairing. We keep the
 **default** narinfo TTL: setting TTL=0 makes nix redundantly re-fetch
@@ -458,7 +462,13 @@ viable either:
    large closures. A prefetch-only design would offload ~nothing on
    small/interactive builds and nothing on any closure's head.
 
-**Honest limits.** One machine, one CDN PoP, one moment; favourable
+**Honest limits.** Point values are noisy across time: a later session
+measured `hello` at median ~115 ms (min 23 ms, max 684 ms) vs the ~298 ms
+in the table — a ~2.5× swing from RTT / Fastly-shield-warmth drift. Read
+the table as **representative order-of-magnitude, not a stable constant**;
+the two load-bearing facts survive the noise (real gap is 2–3 orders
+above sub-ms loopback; small-closure gaps are sub-second while `curl`'s
+tail reaches ~3 s). One machine, one CDN PoP, one moment; favourable
 Nordic RTT (~50–110 ms) — a near-lower-bound on the RTT contribution, so
 real-world gaps for distant clients are *larger*, not smaller (this
 strengthens, not weakens, the tail-prefetch case). Small closures only

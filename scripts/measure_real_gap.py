@@ -24,8 +24,14 @@ and the window closes when the nar is demanded.
 
 We reproduce this client-side against the real cache by reading `nix`'s own
 `-vvvv` debug log. Every request nix issues emits `starting download of <URL>`;
-we timestamp that line at read time. Because a gap is the DIFFERENCE of two
-read-timestamps from the same stream, any constant pipe latency cancels.
+we timestamp that line at READ time (when our reader sees it), which is a proxy
+for the request-issue time. The two differ by nix-side stderr buffering and, in
+the noisy NAR phase, reader backpressure -- a per-line lag that is NOT constant
+and does NOT fully cancel in a gap. This jitter is order tens of ms: negligible
+for the TAIL (seconds) but a real fraction of the HEAD gaps (tens-hundreds ms),
+so head numbers are order-of-magnitude, not precise. (`starting download of`
+requires `-vvvv`, so the line volume cannot be reduced; this is an inherent
+fidelity limit of the log-parsing method, stated not hidden.)
 
 We report TWO anchors so the reader can see both ends:
   * gap_first = nar_start - FIRST narinfo_start for that path
@@ -158,7 +164,7 @@ def run_copy(cache: str, store_path: str) -> list[Event]:
             if not m:
                 continue
             t = time.monotonic()
-            url = m.group(1).rstrip("'\"")
+            url = m.group(1).strip("'\"")
             events.append(Event(t=t, url=url, kind=classify(url)))
         rc = proc.wait(timeout=600)
         if rc != 0:
@@ -221,6 +227,7 @@ def compute_gaps(cache: str, events: list[Event]) -> list[dict]:
 
     gaps: list[dict] = []
     seen_nar: set[str] = set()
+    unpaired: list[str] = []
     for ev in events:
         if ev.kind != "nar":
             continue
@@ -230,17 +237,33 @@ def compute_gaps(cache: str, events: list[Event]) -> list[dict]:
         seen_nar.add(base)
         ni = narinfo_times.get(base)
         if not ni:
-            log(f"WARN nar {base} had no paired narinfo request; skipping")
+            unpaired.append(base)
             continue
         preceding = [t for t in ni if t <= ev.t]
         if not preceding:
-            preceding = ni  # clock ties: fall back to all
+            # A nar request timestamped before every narinfo request for the
+            # same path violates the two-phase model (clock/ordering anomaly).
+            # Surface it, do not silently fold it in.
+            log(f"WARN nar {base}: no narinfo request precedes it (ordering anomaly)")
+            preceding = ni
         gaps.append(
             {
                 "nar": base,
                 "gap_first_ms": (ev.t - min(preceding)) * 1000.0,
                 "gap_last_ms": (ev.t - max(preceding)) * 1000.0,
             }
+        )
+    # Fail-fast reconciliation: every NAR request MUST pair to a narinfo, or
+    # the histogram silently reports a biased subset. The likeliest cause of a
+    # drop is a transient failure of the out-of-band narinfo GET (a Fastly
+    # 429/timeout), and a dropped TAIL path would understate max/p95 -- exactly
+    # the number the task-35 conclusion rests on. Refuse a partial distribution,
+    # same discipline as the non-zero `nix copy` exit.
+    if unpaired:
+        raise SystemExit(
+            f"{len(unpaired)} of {len(seen_nar)} NAR requests failed to pair "
+            f"to a narinfo (out-of-band narinfo fetch likely failed): "
+            f"{unpaired} -- refusing to report a biased gap distribution"
         )
     return gaps
 
