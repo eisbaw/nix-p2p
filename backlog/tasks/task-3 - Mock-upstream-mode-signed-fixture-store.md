@@ -4,7 +4,7 @@ title: Mock upstream mode + signed fixture store
 status: In Progress
 assignee: []
 created_date: '2026-08-07 21:55'
-updated_date: '2026-08-08 05:50'
+updated_date: '2026-08-08 06:11'
 labels:
   - irreversible
 dependencies:
@@ -211,4 +211,6 @@ THREAT MODEL, recorded in scripts/fixturelib.py and fixtures/README.md so this i
 FILED ITEM (codex finding 4) RESOLVED rather than deferred, because the sweep covered it for free: fixtures/WORKLOAD_VERSION is now read with fx.read_at() relative to the anchored fixtures descriptor, exactly like the tracked lock. manifest.json reads happen inside a generation and are covered by the anchored generations descriptor plus the zero-symlink rule; they are listed that way in the call-site table rather than given a separate mechanism. The full updated call-site table is in the commit message and the git note, so codex can audit it directly.
 
 gate round 7: build/lint/fmt/test/fixtures-large/fixtures-verify-rebuild/package all exit 0; nix build .#daemon .#testproxy exit 0; nix flake check exit 0 (8 checks). cargo 2/2. Full tier: 12 ok, 4 positive controls, 3 bites, 0 PARTIAL. Determinism: two fresh roots produce the same generation name, diff -r exit 0, digests equal over 18 entries. All six round-6 repair classes still terminate. 3 concurrent generators exit 0 0 0. Lock byte-identical (a39382de8782d6f7) and served content byte-identical (13 files, 115,939,516 bytes) - unchanged since round 2.
+
+Round-8 decision (via mark-emulator, per no-questions directive): adopt design B - single atomic commit. Root cause reframed: not the lock_on_disk_is read-error fail-open (symptom) but TWO authoritative runtime sources of truth (current symlink + git-tracked workflow.lock.json) reconciled by read-back. Fix by moving the authoritative lock INTO gen-<sha>/lock.json so flipping current commits tree+lock in one os.replace; runtime derives everything from current and never opens the git-tracked file, which demotes to a review artifact reconciled only at --write-lock. Deletes all rollback logic. Escape hatch: if the refactor touches frozen bytes/signing (it must not - B relocates where the lock lives, not what it contains), STOP, fall back to design A (fix the fail-open + document the loud crash window), say so plainly. TERMINAL round: on GO task-3 closes; codex residual-class finding 4 (path-based ancestor resolution, hostile-same-uid, out of threat model) is filed to hardening, not another round.
 <!-- SECTION:NOTES:END -->
