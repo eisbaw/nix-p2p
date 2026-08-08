@@ -372,6 +372,19 @@ fn serve_nar(
                 client_open = false;
             }
         }
+
+        // Mode 8: bandwidth throttle - pace the stream so a mid-transfer crash
+        // (SIGKILL/SIGSTOP at N% of a NAR) has a WIDE, deterministic window to
+        // land in. Without it a 110 MiB loopback transfer completes faster than
+        // an out-of-process observer can catch it mid-flight. Paced on `n` (the
+        // bytes moved this iteration, cache + client) so the tmp file grows at
+        // the throttled rate too, which is what the crash harness observes.
+        if let Some(bps) = faults.throttle_nar_bps
+            && bps > 0
+            && n > 0
+        {
+            std::thread::sleep(std::time::Duration::from_secs_f64(n as f64 / bps as f64));
+        }
     }
 
     // Publish the cache entry only after the whole correct body was captured.
@@ -554,6 +567,13 @@ fn parse_faults(query: &str) -> Result<FaultConfig, String> {
                         .map_err(|_| format!("bad truncate_pct {value:?}"))?,
                 )
             }
+            "throttle_nar_bps" => {
+                faults.throttle_nar_bps = Some(
+                    value
+                        .parse()
+                        .map_err(|_| format!("bad throttle_nar_bps {value:?}"))?,
+                )
+            }
             "corrupt_nar" => faults.corrupt_nar = truthy(value),
             "wrong_narinfo" => faults.wrong_narinfo = truthy(value),
             "unreachable" => faults.unreachable = truthy(value),
@@ -610,5 +630,12 @@ mod tests {
         assert_eq!(faults.http_error_for(Kind::Nar), None);
         assert_eq!(faults.truncate_nar_pct, Some(25));
         assert!(parse_faults("bogus=1").is_err());
+    }
+
+    #[test]
+    fn parse_faults_reads_throttle_and_rejects_garbage() {
+        let faults = parse_faults("throttle_nar_bps=8388608").unwrap();
+        assert_eq!(faults.throttle_nar_bps, Some(8 * 1024 * 1024));
+        assert!(parse_faults("throttle_nar_bps=notanumber").is_err());
     }
 }

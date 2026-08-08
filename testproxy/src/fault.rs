@@ -12,10 +12,12 @@
 //!   5. corrupted NAR bytes
 //!   6. wrong/stale narinfo
 //!   7. upstream unreachable (fast gateway failure, no upstream contacted)
+//!   8. NAR bandwidth throttle (a wide, deterministic mid-transfer crash window)
 //!
 //! Design rule that makes the modes safe to run against a live cache: modes
 //! 4-6 mutate only the *client-facing egress*, never the disk cache, so the
-//! cache stays byte-correct even mid-fault. See `proxy.rs`.
+//! cache stays byte-correct even mid-fault. See `proxy.rs`. Mode 8 only paces
+//! the egress; the cache still receives every byte.
 
 use crate::kind::Kind;
 use std::collections::BTreeMap;
@@ -57,6 +59,11 @@ pub struct FaultConfig {
     pub wrong_narinfo: bool,
     /// Mode 7: model a fully-down upstream - fail fast for every kind.
     pub unreachable: bool,
+    /// Mode 8: throttle NAR egress to this many bytes/second. Not adversarial on
+    /// its own - it exists so a mid-transfer CRASH (SIGKILL/SIGSTOP at N% of a
+    /// large NAR) has a wide, deterministic window to land in, instead of the
+    /// transfer completing before an out-of-process observer can act (task-7).
+    pub throttle_nar_bps: Option<u64>,
 }
 
 impl FaultConfig {

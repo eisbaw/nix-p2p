@@ -42,9 +42,11 @@ import contextlib
 import json
 import os
 import shutil
+import socket
 import subprocess
 import sys
 import time
+import types
 import urllib.error
 import urllib.request
 from dataclasses import dataclass, field
@@ -647,6 +649,92 @@ class Pod:
     def exec(self, role: str, argv: list[str], check: bool = False):
         return run([self._pm, "exec", self._c(role), *argv], check=check)
 
+    # -- crash-suite additions (task-7) --
+
+    def client_run_async(
+        self,
+        targets: list[str],
+        substituters: str,
+        keys: str,
+        *,
+        extra_options: str = "",
+        integrity: bool = False,
+    ) -> BackgroundClient:
+        """Start a `client_run` WITHOUT waiting, so the daemon can be killed or
+        frozen mid-build (task-7). Same fresh-client discipline as `client_run`
+        (clean store, wiped narinfo cache, max-substitution-jobs=1). `integrity`
+        appends the post-crash store-integrity + orphan scan + verify/corrupt
+        bite trailer (AC#3). Returns a handle whose `wait_result()` yields the
+        same `ClientResult` a synchronous run would.
+        """
+        script = _CRASH_CLIENT_SCRIPT.format(
+            subs=substituters,
+            keys=keys,
+            extra_opts=extra_options,
+            targets=" ".join(targets),
+        )
+        if integrity:
+            script += _INTEGRITY_TRAILER.format(targets=" ".join(targets))
+        popen = subprocess.Popen(
+            [
+                self._pm,
+                "run",
+                "--rm",
+                "--pod",
+                self.pod,
+                "--label",
+                PROJECT_LABEL,
+                self.ctx.image,
+                "bash",
+                "-c",
+                script,
+            ],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        return BackgroundClient(popen)
+
+    def pause(self, role: str) -> None:
+        """Freeze a role via the cgroup freezer (`podman pause`). This models a
+        SIGSTOP stall: the process stops WITHOUT closing its sockets, so peers
+        see no RST/FIN - the connection just goes silent (task-7 SIGSTOP case)."""
+        run([self._pm, "pause", self._c(role)], check=False)
+
+    def unpause(self, role: str) -> None:
+        run([self._pm, "unpause", self._c(role)], check=False)
+
+    def nar_tmp_bytes(self) -> int:
+        """Bytes the proxy has streamed into its in-progress NAR cache tmp file.
+
+        The proxy streams a NAR miss origin->cache->client in one loop, so the
+        tmp file size tracks how far the transfer has progressed. Because that
+        loop is flow-controlled by the proxy->daemon egress (one hop upstream of
+        nix), this is a faithful gauge of 'bytes the proxy has pushed toward the
+        daemon' - close enough to mid-transfer progress for the BYTES-OBSERVED
+        kill trigger (AC#1(b)), and necessary because the request record itself
+        is only logged on COMPLETION, so the log cannot report in-flight bytes.
+
+        Sums ALL `.tmp/*` files, which is unambiguous ONLY because the crash
+        client pins `max-substitution-jobs=1` + `http-connections=1` (exactly one
+        NAR in flight). Returns 0 when no NAR is in flight (glob empty).
+
+        FAIL-CLOSED: a failed `podman exec` (proxy dead/gone) must NOT read as
+        '0 bytes in flight' - that would spin the kill loop to its deadline and
+        then fail with a misleading observed=0. A nonzero exec is fatal."""
+        result = self.exec("proxy", ["bash", "-c", _TMP_SIZE_SNIPPET])
+        if result.returncode != 0:
+            die(
+                "proxy tmp-byte probe failed "
+                f"(rc={result.returncode}): {result.stderr.strip()!r}. "
+                "The proxy container is unreachable; the kill trigger cannot observe bytes."
+            )
+        try:
+            return int((result.stdout or "0").strip() or "0")
+        except ValueError:
+            die(f"proxy tmp-byte probe returned non-integer: {result.stdout!r}")
+            raise AssertionError  # unreachable; satisfies type checkers
+
 
 # Single-user client: realise into the container's own store, then report
 # NarHash for the byte oracle. Markers delimit machine-readable output.
@@ -767,6 +855,275 @@ def _parse_client(result) -> ClientResult:
         stderr=result.stderr,
         path_info=path_info,
     )
+
+
+# ---- crash-suite driver additions (task-7) ---------------------------------
+#
+# A background client (so the daemon can be killed/frozen mid-build), a
+# proxy-tmp byte gauge for the BYTES-OBSERVED kill trigger, and the crash
+# client script (base realise + optional post-crash integrity/orphan/verify
+# trailer). The scenarios themselves live in the SCENARIOS block below.
+
+# Sum the sizes of every in-progress NAR cache tmp file at the proxy. `stat`
+# ships in the image's coreutils; `find` does NOT, so the glob loop is bash.
+_TMP_SIZE_SNIPPET = (
+    "s=0; for f in /tmp/proxy-cache/.tmp/*; do "
+    '[ -f "$f" ] && s=$((s+$(stat -c %s "$f"))); done; echo "$s"'
+)
+
+# The crash client: same knobs as `_CLIENT_SCRIPT` plus a per-scenario
+# `{extra_opts}` slot (e.g. a pinned `stalled-download-timeout`), and an ORPHANS
+# scan so every crash run can be checked for store residue. Kept SEPARATE from
+# `_CLIENT_SCRIPT` so the crash-specific slots never perturb the base scenarios.
+_CRASH_CLIENT_SCRIPT = r"""
+set -uo pipefail
+export XDG_CACHE_HOME=/tmp/nixcache
+rm -rf "$XDG_CACHE_HOME"; mkdir -p "$XDG_CACHE_HOME"
+common=(
+  --option substituters "{subs}"
+  --option trusted-public-keys "{keys}"
+  --option require-sigs true
+  --option max-substitution-jobs 1
+  --option http-connections 1
+  --option narinfo-cache-positive-ttl 0
+  --option narinfo-cache-negative-ttl 0
+  --option substitute true
+  {extra_opts}
+)
+nix-store --realise "${{common[@]}}" {targets} >/tmp/realised 2>/tmp/err
+RC=$?
+echo "REALISE_RC=$RC"
+cat /tmp/err >&2
+echo "===PATHINFO_BEGIN==="
+python3 - {targets} <<'PY'
+import json, subprocess, sys
+
+merged = {{}}
+for path in sys.argv[1:]:
+    result = subprocess.run(
+        ["nix", "path-info", "--json", path], capture_output=True, text=True
+    )
+    if result.returncode == 0:
+        try:
+            merged.update(json.loads(result.stdout))
+        except ValueError:
+            pass
+print(json.dumps(merged))
+PY
+echo "===PATHINFO_END==="
+echo "===ORPHANS_BEGIN==="
+# Store residue an interrupted import could leave: in-progress `.tmp*` additions
+# and the trash dir. A clean run leaves neither. `ls` (coreutils) only.
+ls -1d /nix/store/.tmp* 2>/dev/null || true
+ls -1 /nix/store/trash 2>/dev/null || true
+echo "===ORPHANS_END==="
+"""
+
+# Appended when `integrity=True`: prove the surviving store path is intact via
+# Nix's OWN content check (`nix-store --verify-path` recomputes the NAR hash and
+# compares it to the registered one), THEN corrupt a byte and show the same
+# check goes RED - the AC#3 bite, self-contained in one container run.
+_INTEGRITY_TRAILER = r"""
+echo "===VERIFY_CLEAN_BEGIN==="
+nix-store --verify-path {targets} 2>&1
+echo "VERIFY_CLEAN_RC=$?"
+echo "===VERIFY_CLEAN_END==="
+echo "===VERIFY_CORRUPT_BEGIN==="
+python3 - {targets} <<'PY'
+import os, sys
+# Corrupt ONE byte inside the first realised path so the on-disk content no
+# longer matches its registered NarHash. Runs as container root, which may write
+# read-only store files; chmod first anyway so the intent is explicit.
+for path in sys.argv[1:]:
+    target = path if os.path.isfile(path) else None
+    if target is None:
+        for root, _dirs, files in os.walk(path):
+            if files:
+                target = os.path.join(root, files[0])
+                break
+    if target is None:
+        print("NO_FILE_TO_CORRUPT", path)
+        continue
+    try:
+        os.chmod(target, 0o644)
+    except OSError:
+        pass
+    with open(target, "ab") as handle:
+        handle.write(b"\xff")
+    print("CORRUPTED", target)
+    break
+PY
+nix-store --verify-path {targets} 2>&1
+echo "VERIFY_CORRUPT_RC=$?"
+echo "===VERIFY_CORRUPT_END==="
+"""
+
+
+class BackgroundClient:
+    """A `client_run` in flight. `wait_result` blocks for completion and parses
+    the same `ClientResult` the synchronous path returns, so a crash scenario
+    reads the outcome identically - only the KILL happens in between."""
+
+    def __init__(self, popen: subprocess.Popen):
+        self._popen = popen
+
+    def running(self) -> bool:
+        return self._popen.poll() is None
+
+    def wait_result(self, timeout: float = 300.0) -> ClientResult:
+        try:
+            stdout, stderr = self._popen.communicate(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            self._popen.kill()
+            stdout, stderr = self._popen.communicate()
+            # Fail-closed: a timed-out background client proved nothing.
+            faux = types.SimpleNamespace(
+                stdout=stdout or "",
+                stderr=(stderr or "") + "\n[harness: client timed out]",
+                returncode=124,
+            )
+            return _parse_client(faux)
+        faux = types.SimpleNamespace(
+            stdout=stdout or "", stderr=stderr or "", returncode=self._popen.returncode
+        )
+        return _parse_client(faux)
+
+
+def _host_nar_size(fixtures: Fixtures, attr: str) -> int:
+    """The on-disk NAR file size at the origin = the wire bytes for an
+    UNCOMPRESSED payload (`big` is uncompressed by fixture design), so it is both
+    the Content-Length the client sees and the 100%-of-transfer mark."""
+    return (fixtures.cache / fixtures.entry(attr)["url"]).stat().st_size
+
+
+def _daemon_action_at_bytes(
+    pod: Pod, threshold: int, action: str, deadline_s: float = 180.0
+) -> int:
+    """Poll the proxy's in-flight NAR byte gauge and fire `action` ("kill" or
+    "pause") on the daemon the instant the transfer crosses `threshold` bytes.
+    Returns the observed byte count at the moment of action (or the last reading
+    if the deadline passed without crossing - the caller asserts the crossing,
+    so a miss fails loudly, and `nar_tmp_bytes` dies on a broken probe)."""
+    fire = {"kill": pod.kill, "pause": pod.pause}[action]
+    deadline = time.time() + deadline_s
+    observed = 0
+    while time.time() < deadline:
+        observed = pod.nar_tmp_bytes()
+        if observed >= threshold:
+            fire("daemon")
+            return observed
+        time.sleep(0.02)
+    return observed
+
+
+def _kill_daemon_at_bytes(pod: Pod, threshold: int, deadline_s: float = 180.0) -> int:
+    """SIGKILL the daemon once the NAR transfer crosses `threshold` bytes."""
+    return _daemon_action_at_bytes(pod, threshold, "kill", deadline_s)
+
+
+def _stall_daemon_at_bytes(pod: Pod, threshold: int, deadline_s: float = 180.0) -> int:
+    """FREEZE (pause) the daemon once the NAR crosses `threshold` - the SIGSTOP
+    stall (no RST/FIN)."""
+    return _daemon_action_at_bytes(pod, threshold, "pause", deadline_s)
+
+
+def _wait_proxy_activity(pod: Pod, deadline_s: float = 20.0) -> bool:
+    """Block until the proxy has logged at least one request - the observable
+    signal that the client has begun contacting substituters (it queries the
+    testproxy's /nix-cache-info at startup). Lets the narinfo-phase kill trigger
+    on real activity rather than a blind sleep."""
+    deadline = time.time() + deadline_s
+    while time.time() < deadline:
+        if pod.proxy_log():
+            return True
+        time.sleep(0.02)
+    return False
+
+
+def _wait_for_proxy_record(
+    pod: Pod, kind: str, needle: str, deadline_s: float = 45.0
+) -> bool:
+    """Block until a proxy log record of `kind` whose path contains `needle`
+    appears (logged on completion). This is the observable trigger for the
+    kill-between-narinfo-and-NAR case: the narinfo record appearing means the
+    client has (just) received the narinfo."""
+    deadline = time.time() + deadline_s
+    while time.time() < deadline:
+        for record in pod.proxy_log():
+            if record.get("kind") == kind and needle in record.get("path", ""):
+                return True
+        time.sleep(0.02)
+    return False
+
+
+def _section(stdout: str, name: str) -> str | None:
+    """Extract a `===NAME_BEGIN=== ... ===NAME_END===` block from client output."""
+    begin_marker = f"==={name}_BEGIN==="
+    end_marker = f"==={name}_END==="
+    begin = stdout.find(begin_marker)
+    end = stdout.find(end_marker)
+    if begin == -1 or end == -1:
+        return None
+    return stdout[begin + len(begin_marker) : end].strip()
+
+
+def _rc_in_section(stdout: str, name: str, rc_key: str) -> int | None:
+    section = _section(stdout, name)
+    if section is None:
+        return None
+    for line in section.splitlines():
+        if line.startswith(f"{rc_key}="):
+            with contextlib.suppress(ValueError):
+                return int(line.split("=", 1)[1])
+    return None
+
+
+def _looks_like_http_response(data: bytes) -> bool:
+    """True iff `data` begins a valid HTTP response. The keep-alive desync oracle
+    (AC#4) is exactly `not this` on the SECOND response: if a reused connection
+    ever handed back NAR-tail bytes as the next 'response', they would NOT start
+    with `HTTP/`. Defined as a function so the bite can exercise it directly."""
+    return data.startswith(b"HTTP/")
+
+
+def _raw_read_response(
+    sock: socket.socket, timeout: float = 8.0
+) -> tuple[bytes, bytes, bool]:
+    """Read one HTTP/1.1 response from a raw socket. Returns
+    (head_bytes, body_bytes, closed). Handles a SHORT body (fewer bytes than
+    Content-Length, then the peer closes) - which is the truncation case - by
+    returning what arrived and closed=True. Does not assume keep-alive framing."""
+    sock.settimeout(timeout)
+    buf = b""
+    # Read until end of headers.
+    while b"\r\n\r\n" not in buf:
+        try:
+            chunk = sock.recv(4096)
+        except (TimeoutError, socket.timeout, OSError):
+            return buf, b"", True
+        if not chunk:
+            return buf, b"", True
+        buf += chunk
+    head, _, rest = buf.partition(b"\r\n\r\n")
+    content_length = None
+    for line in head.split(b"\r\n"):
+        if line.lower().startswith(b"content-length:"):
+            with contextlib.suppress(ValueError):
+                content_length = int(line.split(b":", 1)[1].strip())
+    body = rest
+    closed = False
+    if content_length is not None:
+        while len(body) < content_length:
+            try:
+                chunk = sock.recv(4096)
+            except (TimeoutError, socket.timeout, OSError):
+                closed = True
+                break
+            if not chunk:
+                closed = True  # peer closed before Content-Length: truncated
+                break
+            body += chunk
+    return head, body, closed
 
 
 # ---- scenario context + reporting ------------------------------------------
@@ -1115,6 +1472,471 @@ def scenario_absent_404(ctx: Ctx, expect) -> None:
         )
 
 
+# ---- crash suite (task-7): S2 additive invariant under daemon crashes -------
+#
+# Every scenario asserts fallback ACTUALLY SERVED the bytes (proxy request
+# counts / byte oracle), never exit 0 alone. The kill point is chosen by BYTES
+# OBSERVED at the proxy or by an OBSERVED proxy log record - never a blind sleep.
+# `big` (>=100 MiB, uncompressed) is the kill target: its transfer window is
+# wide and its wire bytes equal its NAR bytes.
+
+BIG_ATTR = "big"
+
+# NAR throttle for the mid-transfer crash cases (proxy fault `throttle_nar_bps`).
+# 8 MiB/s turns the 110 MiB `big` transfer into a ~14 s window - wide enough for
+# an out-of-process observer to catch 50% and kill/freeze, short enough to keep
+# the scenario in the SLOW tier's budget.
+THROTTLE_BPS = 8 * 1024 * 1024
+
+
+def _assert_fallback_served_big(
+    pod: Pod, fixtures: Fixtures, expect, label: str
+) -> None:
+    """Shared oracle: the proxy served at least one FULL `big` NAR (bytes_sent ==
+    file_size) to a client - the request-count proof that the fallback truly
+    delivered the payload, not merely that the build exited 0."""
+    big_size = _host_nar_size(fixtures, BIG_ATTR)
+    big_url = fixtures.entry(BIG_ATTR)["url"]
+    full = [
+        record
+        for record in pod.proxy_log()
+        if record.get("kind") == "nar"
+        and big_url in record.get("path", "")
+        and record.get("bytes_sent") == big_size
+    ]
+    expect(
+        len(full) >= 1,
+        f"{label}: the fallback ACTUALLY served the full NAR (bytes_sent == file_size)",
+        f"full-NAR records={len(full)} want>=1 (file_size={big_size})",
+    )
+
+
+def _wait_for_short_nar(
+    pod: Pod, nar_url: str, file_size: int, deadline_s: float = 30.0
+) -> tuple[list[dict], list[dict]]:
+    """Poll the proxy log until a truncated NAR record (0 < bytes_sent <
+    file_size) for `nar_url` appears, or the deadline passes. Returns
+    (short_records, all_matching_records). The truncated record trails the kill
+    because the proxy keeps draining origin->cache after the client vanished."""
+    deadline = time.time() + deadline_s
+    nar_records: list[dict] = []
+    while time.time() < deadline:
+        nar_records = [
+            record
+            for record in pod.proxy_log()
+            if record.get("kind") == "nar" and nar_url in record.get("path", "")
+        ]
+        short = [r for r in nar_records if 0 < r.get("bytes_sent", 0) < file_size]
+        if short:
+            return short, nar_records
+        time.sleep(0.1)
+    return [], nar_records
+
+
+def scenario_crash_daemon_absent(ctx: Ctx, expect) -> None:
+    """AC#1(a): the daemon is ABSENT at nix-daemon store-open. The build must
+    still succeed via the explicit direct fallback, which serves the bytes."""
+    fixtures = ctx.fixtures
+    big = fixtures.store_path(BIG_ATTR)
+    with Pod(
+        ctx, "crash-absent", fixtures.cache, with_daemon=False, expect=expect
+    ) as pod:
+        expect(not daemon_reachable(), "crash(a): daemon is absent at store-open", "")
+        pod.proxy_reset()
+        result = pod.client_run(
+            [big], ctx.substituter_daemon_and_fallback(), fixtures.public_key
+        )
+        expect(
+            result.exit_code == 0,
+            "crash(a): build succeeds via fallback with the daemon absent",
+            result.stderr[-400:],
+        )
+        _assert_fallback_served_big(pod, fixtures, expect, "crash(a)")
+        got = result.narhash(big)
+        expect(
+            got == fixtures.nar_hash(BIG_ATTR),
+            "crash(a): byte oracle - big NarHash matches upstream via fallback",
+            f"got={got}",
+        )
+
+
+def scenario_crash_kill_mid_nar(ctx: Ctx, expect) -> None:
+    """AC#1(b) + AC#3: SIGKILL the daemon at ~50% of the `big` NAR - triggered by
+    BYTES OBSERVED at the proxy, not a sleep - then prove (1) a truncated-transfer
+    event is visible in the proxy log AND the fallback served the full bytes
+    (both, per TESTING.md), and (2) the surviving store is intact by Nix's own
+    view with no orphaned tmp/lock residue; the corrupt-path bite shows the
+    integrity check goes RED."""
+    fixtures = ctx.fixtures
+    big = fixtures.store_path(BIG_ATTR)
+    big_size = _host_nar_size(fixtures, BIG_ATTR)
+    big_url = fixtures.entry(BIG_ATTR)["url"]
+    with Pod(
+        ctx, "crash-midnar", fixtures.cache, with_daemon=True, expect=expect
+    ) as pod:
+        pod.proxy_reset()
+        # Throttle the NAR so the transfer window is WIDE and deterministic: a
+        # 110 MiB pod-loopback transfer otherwise completes before an
+        # out-of-process kill can land mid-stream (measured: both records full).
+        pod.proxy_faults(f"throttle_nar_bps={THROTTLE_BPS}")
+        client = pod.client_run_async(
+            [big],
+            ctx.substituter_daemon_and_fallback(),
+            fixtures.public_key,
+            integrity=True,
+        )
+        observed = _kill_daemon_at_bytes(pod, big_size // 2)
+        pct = (100 * observed // big_size) if big_size else 0
+        pod.proxy_faults("")  # unthrottle so the fallback path serves at full speed
+        expect(
+            observed >= big_size // 2,
+            "crash(b): kill fired at >=50% of the NAR by BYTES OBSERVED at the proxy",
+            f"observed={observed}/{big_size} ({pct}%)",
+        )
+        expect(not daemon_reachable(), "crash(b): daemon is gone after the kill", "")
+        result = client.wait_result(timeout=300)
+        expect(
+            result.exit_code == 0,
+            "crash(b): build succeeds via fallback despite the mid-NAR kill",
+            result.stderr[-600:],
+        )
+        got = result.narhash(big)
+        expect(
+            got == fixtures.nar_hash(BIG_ATTR),
+            "crash(b): byte oracle - big NarHash matches upstream via fallback",
+            f"got={got}",
+        )
+        # The truncated-transfer event: the daemon's NAR request to the proxy was
+        # cut mid-stream, so its record shows bytes_sent short of file_size. That
+        # record is only logged once the proxy finishes draining origin->cache
+        # (it keeps caching the correct bytes after the client vanished), which
+        # can trail the fallback's completion - so poll for it, bounded.
+        short, nar_records = _wait_for_short_nar(pod, big_url, big_size)
+        expect(
+            len(short) >= 1,
+            "crash(b): proxy log shows a truncated-transfer event (bytes_sent < file_size)",
+            f"nar records (bytes_sent,status)="
+            f"{[(r.get('bytes_sent'), r.get('status')) for r in nar_records]}",
+        )
+        _assert_fallback_served_big(pod, fixtures, expect, "crash(b)")
+
+        # -- AC#3 post-crash store integrity, from the client's own output --
+        clean_rc = _rc_in_section(result.stdout, "VERIFY_CLEAN", "VERIFY_CLEAN_RC")
+        corrupt_rc = _rc_in_section(
+            result.stdout, "VERIFY_CORRUPT", "VERIFY_CORRUPT_RC"
+        )
+        orphans = _section(result.stdout, "ORPHANS") or ""
+        expect(
+            clean_rc == 0,
+            "crash(b)/AC#3: nix-store --verify-path passes on the surviving path",
+            f"verify-clean rc={clean_rc}",
+        )
+        expect(
+            orphans.strip() == "",
+            "crash(b)/AC#3: no orphaned tmp/lock residue in the store after the crash",
+            f"orphans={orphans!r}",
+        )
+        # BITE: the same integrity check MUST go RED once a store byte is flipped.
+        expect(
+            corrupt_rc is not None and corrupt_rc != 0,
+            "crash(b)/AC#3 BITE: verify-path FAILS on an injected corrupt store path",
+            f"verify-corrupt rc={corrupt_rc} (expected nonzero)",
+        )
+
+
+def scenario_crash_kill_during_narinfo(ctx: Ctx, expect) -> None:
+    """AC#1(c): lose the daemon in the narinfo phase - before it ever delivers a
+    complete narinfo, and before any NAR.
+
+    OBSERVABILITY LIMIT (honest): the daemon serves /nix-cache-info LOCALLY
+    (daemon/src/cacheinfo.rs), so the proxy never sees a daemon cache-info, and a
+    narinfo only hits the proxy log on COMPLETION. There is thus no proxy event
+    that means 'the daemon is mid-narinfo'. So this scenario does not claim a
+    microsecond-precise 'during the response' hit; it ENFORCES the property that
+    matters: two independent faults make it impossible for the daemon to have
+    delivered a NAR when killed - `latency_narinfo_ms` holds the narinfo open for
+    3 s, and `throttle_nar_bps` makes any NAR that somehow started far too slow to
+    finish - and the kill fires on the first OBSERVED proxy activity (no blind
+    sleep). The oracle then proves the daemon served NO NAR (from its own log)
+    and the build recovered via fallback. If nix's probe ordering ever let a NAR
+    complete first, the throttle+latency would still prevent it, and the no-NAR
+    oracle would catch a regression rather than pass vacuously."""
+    fixtures = ctx.fixtures
+    big = fixtures.store_path(BIG_ATTR)
+    big_url = fixtures.entry(BIG_ATTR)["url"]
+    with Pod(
+        ctx, "crash-narinfo", fixtures.cache, with_daemon=True, expect=expect
+    ) as pod:
+        pod.proxy_reset()
+        # Widen the narinfo phase AND throttle any NAR, so a mistimed kill cannot
+        # be beaten by a fast unthrottled NAR completing (review finding #1).
+        pod.proxy_faults(f"latency_narinfo_ms=3000&throttle_nar_bps={THROTTLE_BPS}")
+        client = pod.client_run_async(
+            [big], ctx.substituter_daemon_and_fallback(), fixtures.public_key
+        )
+        expect(
+            _wait_proxy_activity(pod),
+            "crash(c): observed client activity at the proxy (narinfo phase open)",
+            "",
+        )
+        pod.kill("daemon")  # fire on the OBSERVED activity, not a blind sleep
+        pod.proxy_faults("")  # clear faults so the fallback path is not delayed
+        expect(
+            not daemon_reachable(),
+            "crash(c): daemon killed in the narinfo phase",
+            "",
+        )
+        # The ENFORCED invariant: the daemon served no NAR before dying. Its
+        # per-substitution log line (server.rs) is emitted only on a 200 NAR, so
+        # its absence proves no NAR was delivered - this is what makes 'lost
+        # before the NAR' a real, biting assertion rather than a timing hope.
+        daemon_log = pod.logs("daemon")
+        expect(
+            big_url not in daemon_log,
+            "crash(c): the daemon served NO NAR before dying (kill was pre-NAR)",
+            f"daemon log tail: {daemon_log[-300:]!r}",
+        )
+        result = client.wait_result(timeout=300)
+        expect(
+            result.exit_code == 0,
+            "crash(c): build succeeds via fallback despite the narinfo-phase kill",
+            result.stderr[-600:],
+        )
+        got = result.narhash(big)
+        expect(
+            got == fixtures.nar_hash(BIG_ATTR),
+            "crash(c): byte oracle - big NarHash matches upstream via fallback",
+            f"got={got}",
+        )
+        _assert_fallback_served_big(pod, fixtures, expect, "crash(c)")
+
+
+def scenario_crash_kill_between_narinfo_and_nar(ctx: Ctx, expect) -> None:
+    """AC#1(d) - THE S2 claim: kill the daemon BETWEEN the narinfo 200 and the
+    NAR GET. A proxy latency fault on the NAR widens that phase so the kill lands
+    before any NAR bytes reach the client; the trigger is the OBSERVED narinfo
+    record. The question this answers: after losing the substituter it got the
+    narinfo from, does nix recover via the next substituter, or fail? We assert
+    recovery (build + fallback served) and REPORT whether nix re-queried the
+    fallback's narinfo (an observation, not a pass/fail criterion)."""
+    fixtures = ctx.fixtures
+    big = fixtures.store_path(BIG_ATTR)
+    big_narinfo = fx.narinfo_name(big)
+    with Pod(
+        ctx, "crash-between", fixtures.cache, with_daemon=True, expect=expect
+    ) as pod:
+        pod.proxy_reset()
+        pod.proxy_faults("latency_nar_ms=3000")
+        client = pod.client_run_async(
+            [big], ctx.substituter_daemon_and_fallback(), fixtures.public_key
+        )
+        saw_narinfo = _wait_for_proxy_record(pod, "narinfo", big_narinfo)
+        expect(
+            saw_narinfo,
+            "crash(d): observed the narinfo served (client has the narinfo)",
+            "",
+        )
+        pod.kill("daemon")
+        pod.proxy_faults("")  # clear latency so the fallback path is prompt
+        expect(
+            not daemon_reachable(),
+            "crash(d): daemon killed after narinfo, before NAR",
+            "",
+        )
+        result = client.wait_result(timeout=300)
+        expect(
+            result.exit_code == 0,
+            "crash(d): build recovers via fallback after losing the daemon post-narinfo",
+            result.stderr[-600:],
+        )
+        got = result.narhash(big)
+        expect(
+            got == fixtures.nar_hash(BIG_ATTR),
+            "crash(d): byte oracle - big NarHash matches upstream via fallback",
+            f"got={got}",
+        )
+        _assert_fallback_served_big(pod, fixtures, expect, "crash(d)")
+        # Observation (not asserted): how nix recovered - re-query vs reuse.
+        narinfo_count = sum(
+            1
+            for r in pod.proxy_log()
+            if r.get("kind") == "narinfo" and big_narinfo in r.get("path", "")
+        )
+        recovery = (
+            "re-queried fallback narinfo"
+            if narinfo_count >= 2
+            else "reused daemon narinfo"
+        )
+        print(
+            f"  crash(d) OBSERVATION: nix {recovery} "
+            f"(proxy saw {narinfo_count} big.narinfo request(s))"
+        )
+
+
+def scenario_crash_sigstop_stall(ctx: Ctx, expect) -> None:
+    """AC#2: SIGSTOP-style stall (cgroup freeze: no RST/FIN). The daemon is
+    FROZEN mid-NAR, so the client's connection to it goes silent. Nothing in the
+    daemon bounds a stalled body (see upstream.rs / task-25), so recovery relies
+    entirely on nix's client-side `stalled-download-timeout` - which we pin low
+    for a bounded test and MEASURE. The build must still complete via fallback;
+    if the stall exceeded an acceptable bound that is a FINDING (task-25), not a
+    pass."""
+    fixtures = ctx.fixtures
+    big = fixtures.store_path(BIG_ATTR)
+    big_size = _host_nar_size(fixtures, BIG_ATTR)
+    pinned_timeout_s = 8
+    bound_s = pinned_timeout_s * 4  # generous upper bound for the pinned test
+    with Pod(
+        ctx, "crash-sigstop", fixtures.cache, with_daemon=True, expect=expect
+    ) as pod:
+        pod.proxy_reset()
+        # Throttle the NAR so the freeze reliably lands mid-body (same rationale
+        # as crash(b)). It is NOT cleared here: the frozen daemon's proxy thread
+        # holds the throttled clone and stays blocked anyway, and the fallback
+        # request is a fresh cache miss served from origin - a separate thread we
+        # do want prompt, so we clear once the freeze is in place, below.
+        pod.proxy_faults(f"throttle_nar_bps={THROTTLE_BPS}")
+        # `download-attempts 1` is load-bearing (review finding #2): with nix's
+        # default of 5, nix would RETRY the frozen daemon several times before
+        # failing over, so `elapsed` would be several x the timeout and the bound
+        # check below would flake RED on a nix retry policy, not a daemon defect.
+        # Pinned to 1, the failover is deterministic: one stall, then fallback.
+        extra = (
+            f"--option stalled-download-timeout {pinned_timeout_s} "
+            "--option connect-timeout 5 "
+            "--option download-attempts 1"
+        )
+        client = pod.client_run_async(
+            [big],
+            ctx.substituter_daemon_and_fallback(),
+            fixtures.public_key,
+            extra_options=extra,
+        )
+        observed = _stall_daemon_at_bytes(pod, big_size // 4)
+        pod.proxy_faults("")  # unthrottle so the fallback serves promptly
+        expect(
+            observed >= big_size // 4,
+            "sigstop: daemon frozen mid-NAR by BYTES OBSERVED (no RST/FIN)",
+            f"observed={observed}/{big_size}",
+        )
+        frozen_at = time.time()
+        try:
+            result = client.wait_result(timeout=300)
+        finally:
+            pod.unpause("daemon")  # let teardown proceed cleanly
+        elapsed = time.time() - frozen_at
+        expect(
+            result.exit_code == 0,
+            "sigstop: build eventually succeeds via fallback despite the frozen daemon",
+            result.stderr[-600:],
+        )
+        got = result.narhash(big)
+        expect(
+            got == fixtures.nar_hash(BIG_ATTR),
+            "sigstop: byte oracle - big NarHash matches upstream via fallback",
+            f"got={got}",
+        )
+        _assert_fallback_served_big(pod, fixtures, expect, "sigstop")
+        expect(
+            elapsed <= bound_s,
+            f"sigstop: recovered within {bound_s}s of the freeze "
+            f"(FINDING for task-25 if exceeded: daemon has no body-idle timeout)",
+            f"measured {elapsed:.1f}s (pinned stalled-download-timeout={pinned_timeout_s}s)",
+        )
+        print(
+            f"  sigstop MEASURED: fallback completed {elapsed:.1f}s after the freeze; "
+            f"nix stalled-download-timeout pinned to {pinned_timeout_s}s "
+            "(default is 300s - the unbounded hang a daemon body-idle timeout would cap; task-25)"
+        )
+
+
+def scenario_crash_keepalive_desync(ctx: Ctx, expect) -> None:
+    """AC#4: an upstream truncation while the daemon SURVIVES must never let the
+    next request on a reused keep-alive connection read NAR-tail-as-narinfo. We
+    drive the daemon with a raw HTTP/1.1 client: first prove keep-alive reuse
+    really happens (else the test is vacuous), then truncate a NAR mid-body and
+    show the reused connection either closes or returns a valid response - never
+    leftover NAR bytes. The oracle's discriminator is bite-checked directly."""
+    fixtures = ctx.fixtures
+    lib_size = _host_nar_size(fixtures, "lib")
+    lib_url = fixtures.entry("lib")["url"]  # nar/<hash>.nar
+    lib_narinfo = fx.narinfo_name(fixtures.store_path("lib"))  # <hash>.narinfo
+    addr = ("127.0.0.1", HOST_DAEMON)
+    with Pod(
+        ctx, "crash-keepalive", fixtures.cache, with_daemon=True, expect=expect
+    ) as pod:
+        pod.proxy_reset()
+
+        # (1) Keep-alive reuse really works: two cache-info GETs on one socket.
+        with contextlib.closing(socket.create_connection(addr, timeout=8)) as sock:
+            sock.sendall(
+                b"GET /nix-cache-info HTTP/1.1\r\nHost: 127.0.0.1\r\n"
+                b"Connection: keep-alive\r\n\r\n"
+            )
+            head1, _body1, _closed1 = _raw_read_response(sock)
+            sock.sendall(
+                b"GET /nix-cache-info HTTP/1.1\r\nHost: 127.0.0.1\r\n"
+                b"Connection: keep-alive\r\n\r\n"
+            )
+            head2, _body2, _closed2 = _raw_read_response(sock)
+        reuse_works = head1.startswith(b"HTTP/1.1 200") and head2.startswith(
+            b"HTTP/1.1 200"
+        )
+        expect(
+            reuse_works,
+            "keepalive: the daemon reuses a keep-alive connection (test is not vacuous)",
+            f"head1={head1[:20]!r} head2={head2[:20]!r}",
+        )
+
+        # (2) Truncate the NAR mid-body while the daemon survives, then issue a
+        # narinfo GET on the SAME connection. `truncate_pct` (not
+        # `connection_reset`) is used deliberately: we need a SHORT BODY under a
+        # full Content-Length, which is what can desync framing - a reset would
+        # give no response to reuse at all.
+        pod.proxy_faults("truncate_pct=50")
+        resp2_head = b""
+        first_body_len = 0
+        with contextlib.closing(socket.create_connection(addr, timeout=8)) as sock:
+            sock.sendall(
+                f"GET /{lib_url} HTTP/1.1\r\nHost: 127.0.0.1\r\n"
+                "Connection: keep-alive\r\n\r\n".encode()
+            )
+            _nhead, nbody, _nclosed = _raw_read_response(sock)
+            first_body_len = len(nbody)
+            with contextlib.suppress(OSError):
+                sock.sendall(
+                    f"GET /{lib_narinfo} HTTP/1.1\r\nHost: 127.0.0.1\r\n"
+                    "Connection: keep-alive\r\n\r\n".encode()
+                )
+                resp2_head, _rb, _rc = _raw_read_response(sock)
+        pod.proxy_faults("")  # clear the fault
+
+        expect(
+            0 < first_body_len < lib_size,
+            "keepalive: the first NAR was truncated (fault fired, not vacuous)",
+            f"first body {first_body_len} of {lib_size}",
+        )
+        # THE property: the second read is never NAR-tail masquerading as a
+        # response. Either the connection closed (empty) or a real HTTP response.
+        desync = bool(resp2_head) and not _looks_like_http_response(resp2_head)
+        expect(
+            not desync,
+            "keepalive: reused connection never returns NAR-tail-as-narinfo "
+            "(closed, or a valid HTTP response)",
+            f"second-response head={resp2_head[:40]!r}",
+        )
+
+        # BITE: the discriminator MUST reject NAR bytes and accept a real
+        # response - otherwise the check above could pass on anything.
+        nar_magic = b"\x0d\x00\x00\x00\x00\x00\x00\x00nix-archive-1"
+        expect(
+            (not _looks_like_http_response(nar_magic))
+            and _looks_like_http_response(b"HTTP/1.1 200 OK\r\n"),
+            "keepalive BITE: the desync discriminator flags NAR-tail and accepts HTTP",
+            "",
+        )
+
+
 SCENARIOS = [
     ("topology", scenario_topology),
     ("s1-byte-and-counts", scenario_s1_byte_and_counts),
@@ -1125,6 +1947,13 @@ SCENARIOS = [
     ("tamper-narhash", scenario_tamper_narhash),
     ("corrupt-nar", scenario_corrupt_nar),
     ("absent-404", scenario_absent_404),
+    # crash suite (task-7): S2 additive invariant under daemon crashes.
+    ("crash-daemon-absent", scenario_crash_daemon_absent),
+    ("crash-kill-mid-nar", scenario_crash_kill_mid_nar),
+    ("crash-kill-during-narinfo", scenario_crash_kill_during_narinfo),
+    ("crash-kill-between-narinfo-nar", scenario_crash_kill_between_narinfo_and_nar),
+    ("crash-sigstop-stall", scenario_crash_sigstop_stall),
+    ("crash-keepalive-desync", scenario_crash_keepalive_desync),
 ]
 
 

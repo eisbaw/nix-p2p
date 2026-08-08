@@ -4,7 +4,7 @@ title: 'Long-chain test: client -> daemon x3 -> testproxy -> mock'
 status: To Do
 assignee: []
 created_date: '2026-08-07 21:56'
-updated_date: '2026-08-08 09:46'
+updated_date: '2026-08-08 12:38'
 labels: []
 dependencies:
   - TASK-5
@@ -28,4 +28,15 @@ PRD round-5 requirement: proxy composition must survive depth. Chain at least th
 <!-- SECTION:NOTES:BEGIN -->
 --- from task-5 (80319ec): chaining N daemons ---
 Pod currently starts ONE daemon (--upstream testproxy). To chain client -> d1 -> d2 -> ... -> dN -> testproxy: start N daemon containers in the pod on distinct ports (8082, 8083, ...), each --upstream the NEXT one's http://127.0.0.1:PORT, the last --upstream the testproxy. Generalise Pod with a daemon_chain=N param (a small loop over the existing daemon-run block); bind each 0.0.0.0 (the port-forward gotcha) and publish only the ones you assert on. Client substituter = the FIRST daemon (?priority=10). S1 byte oracle must hold end-to-end (NarHash == manifest through N hops); added-latency bound is the S4 oracle from task-9's counters (gap_ms accumulates per hop). The daemon is a transparent passthrough with no disk cache (wave 1), so a repeat still shows upstream==0 only at the testproxy layer, not the daemons.
+
+--- forward-carry from task-7 (killing a MIDDLE daemon in the chain) ---
+Reuse the task-7 crash seams for chain crash tests: Pod.kill/pause a middle
+daemon (dN), the testproxy `throttle_nar_bps` fault + Pod.nar_tmp_bytes() as the
+bytes-observed mid-transfer trigger, and _daemon_action_at_bytes(kill|pause). Two
+properties to carry per hop: (a) S2 additive-invariant still holds when a middle
+hop dies mid-NAR (the client must recover via a fallback substituter, not just the
+next daemon); (b) the keep-alive DESYNC guard (crash-keepalive-desync) applies at
+EACH daemon hop - an upstream truncation into a surviving daemon must never let the
+next request on the reused connection read NAR-tail-as-narinfo. NOTE: task-11 still
+needs the `daemon_chain=N` Pod param (not built yet).
 <!-- SECTION:NOTES:END -->

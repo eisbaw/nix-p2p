@@ -4,7 +4,7 @@ title: 'Measurement: request/byte counters + egress report + gap histogram'
 status: To Do
 assignee: []
 created_date: '2026-08-07 21:56'
-updated_date: '2026-08-08 11:41'
+updated_date: '2026-08-08 12:38'
 labels:
   - irreversible
 dependencies:
@@ -69,4 +69,17 @@ forward-carried from task-3 round 5: the fixture tree is now published as an imm
 `Pod.proxy_stats()` returns the derived Stats JSON: received/upstream/cache_hits per kind (cache-info/narinfo/nar), received_total, upstream_total, bytes_sent, faults. `Pod.proxy_log()` returns the per-request records; each NAR record carries gap_ms (narinfo->nar wall gap) - the gap-histogram input. Egress oracle = bytes_sent (proxy is ground truth; daemon self-report is NOT trusted). The counting discipline is already enforced: proxy_reset() zeroes counters but NOT the disk cache (so cache-on/off deltas are real), client_run wipes the client narinfo cache and pins max-substitution-jobs=1 per run. s1-byte-and-counts already demonstrates the cold(upstream==N)/warm(upstream==0, received>0) paired delta - the S3 bite is the same shape with bytes_sent. For A/A and N>=10 sampling, wrap client_run in a loop; the Pod persists across runs within a scenario.
 
 From TASK-6 (J1 journey): the daemon now emits one operator-facing line per served NAR in daemon/src/server.rs::log_substitution -> 'daemon: substituted path=nar/<token> source=<upstream> bytes=<n> duration_ms=<d>'. Measurement can parse this for a coarse per-substitution count/byte view, BUT read TASK-31 first: bytes=Content-Length (not a counted drain) and duration_ms=time-to-upstream-headers (not full body drain). For authoritative counters keep using the testproxy stats/log endpoint (Pod.proxy_stats/proxy_log) - the daemon log is narration, the proxy log is ground truth. New reusable accessor Pod.logs(role) in scripts/e2e_harness.py reads a container's stdout host-side.
+
+--- forward-carry from task-7 (crashes the measurement must handle) ---
+A mid-transfer daemon crash produces proxy records that egress/counting must NOT
+naively sum: (1) a TRUNCATED NAR record (status 200, bytes_sent < file_size) from
+the killed daemon hop, AND (2) the fallback's FULL NAR - plus the killed daemon's
+proxy thread keeps draining origin->cache, so the SAME payload can be fetched from
+origin twice (killed-drain + fallback miss). Counting both as delivered payloads
+would double-count egress and corrupt the with/without-daemon delta. The egress
+rule must exclude/attribute truncated + retried transfers. The truncated-record
+shape (bytes_sent < Content-Length/file_size, fault=None) is the discriminator;
+see scenario crash-kill-mid-nar. Also: the new `throttle_nar_bps` fault paces a
+transfer without changing total bytes - handy for measurement bite tests that need
+a wide observation window.
 <!-- SECTION:NOTES:END -->
