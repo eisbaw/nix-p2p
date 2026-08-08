@@ -35,7 +35,7 @@ Three different determinism claims, kept apart on purpose:
 
 | Claim | Proven by | Notes |
 |---|---|---|
-| **Export** is repeatable | `just test` (regenerate into a scratch tree, diff) | Only re-serialises/recompresses/re-signs paths already in the store — it never rebuilds |
+| **Export** is repeatable | `just test` (regenerate into a scratch tree, diff) | Only re-serialises/recompresses/re-signs paths already in the store — it never rebuilds. Compares **contents and metadata**: modes and mtimes are normalised at generation (0644/0755, mtime 1, the signing key 0600), so the tree does not depend on the developer's umask and a consumer copying it with rsync or tar sees the same thing an HTTP client does |
 | **Builds** are deterministic | `just fixtures-verify-rebuild` (`nix build --rebuild`) | Slow. **Required before the J2 baseline is recorded** — otherwise the frozen workload rests on whichever bytes happened to be realised first |
 | Cross-host / cross-nixpkgs | *nothing* | Not verified, not claimed. `workload.lock.json` is what fails loudly when the workload moves |
 

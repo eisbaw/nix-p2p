@@ -436,11 +436,28 @@ def run_bites(out_dir: Path, manifest: dict, public_line: str) -> None:
 
 
 def tree_digest(root: Path) -> dict[str, str]:
-    return {
-        str(p.relative_to(root)): hashlib.sha256(p.read_bytes()).hexdigest()
-        for p in sorted(root.rglob("*"))
-        if p.is_file()
-    }
+    """Contents AND metadata, per entry - directories included.
+
+    Contents alone were compared before, so two trees generated under
+    different umasks (022 -> 644/755, 077 -> 600/700) were reported identical
+    while being materially different to rsync, tar, an image build, or a
+    server deciding a file is unreadable. gen-fixtures now normalises modes
+    and mtimes; including them here is what proves the normalisation happened
+    rather than assuming it.
+    """
+    digest = {}
+    for path in sorted(root.rglob("*")):
+        stat = path.lstat()
+        if path.is_symlink():
+            body = f"symlink:{os.readlink(path)}"
+        elif path.is_dir():
+            body = "dir"
+        else:
+            body = hashlib.sha256(path.read_bytes()).hexdigest()
+        digest[str(path.relative_to(root))] = (
+            f"{body} mode={stat.st_mode & 0o7777:04o} mtime={int(stat.st_mtime)}"
+        )
+    return digest
 
 
 def check_determinism(out_dir: Path, manifest: dict) -> None:
@@ -564,4 +581,11 @@ def main() -> int:
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    # A malformed or unrecognisable lock is an environment failure, not a
+    # verdict about the fixture: nothing can be proven against a definition
+    # that cannot be read, so it exits 2 rather than 1.
+    try:
+        sys.exit(main())
+    except fx.LockError as error:
+        print(f"check-fixtures: FAIL - {error}", file=sys.stderr)
+        sys.exit(2)

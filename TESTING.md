@@ -266,6 +266,11 @@ alone, and the omitted fields would silently become client defaults).
 Three limits on what the fixture gate proves, stated so a green line
 is not over-read:
 
+- **The reproducibility contract covers bytes *and* file metadata.**
+  Modes and mtimes are normalised at generation (0644/0755, mtime 1,
+  the signing key 0600), so the tree is umask-independent and a
+  consumer that copies it with rsync/tar sees what an HTTP client
+  sees. The determinism check compares metadata too.
 - **`just test` proves EXPORT repeatability, not build determinism.**
   Regeneration finds the payloads already realised in the store, so it
   re-serialises, recompresses and re-signs them — it never rebuilds.

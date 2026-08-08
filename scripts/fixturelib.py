@@ -26,6 +26,7 @@ import functools
 import hashlib
 import http.server
 import json
+import os
 import threading
 from contextlib import contextmanager
 from pathlib import Path
@@ -81,14 +82,56 @@ def lock_path(repo: Path) -> Path:
     return repo / "fixtures" / "workload.lock.json"
 
 
+class LockError(Exception):
+    """The committed lock is unusable, so nothing can be proven against it."""
+
+
 def load_lock(repo: Path) -> dict:
-    return json.loads(lock_path(repo).read_text())
+    """Read AND validate the lock. An unusable lock is never a soft signal.
+
+    Validation belongs here rather than at each use site because the lock is
+    the definition of the frozen workload: a field this file does not
+    understand cannot be allowed to mean "no constraint". A misspelled tier
+    (`fasst`) used to do exactly that - `expected_attrs` matched it against
+    neither tier, so the payload silently dropped out of the fast tier's
+    required set and a tree missing it verified green.
+    """
+    path = lock_path(repo)
+    try:
+        lock = json.loads(path.read_text())
+    except OSError as exc:
+        raise LockError(f"cannot read {path}: {exc}") from exc
+    except ValueError as exc:
+        raise LockError(f"{path} is not valid JSON: {exc}") from exc
+
+    for key in ("workload_version", "public_key", "paths"):
+        if key not in lock:
+            raise LockError(f"{path} has no {key!r}")
+    if not isinstance(lock["paths"], dict) or not lock["paths"]:
+        raise LockError(f"{path} pins no payloads")
+    for attr, pinned in lock["paths"].items():
+        missing = [
+            k
+            for k in ("store_path", "compression", "nar_hash", "file_hash", "tier")
+            if k not in pinned
+        ]
+        if missing:
+            raise LockError(f"{path}: payload {attr!r} is missing {missing}")
+        if pinned["tier"] not in TIERS:
+            raise LockError(
+                f"{path}: payload {attr!r} declares tier {pinned['tier']!r}, which is "
+                f"not one of {list(TIERS)}. An unknown tier would quietly excuse the "
+                "payload from every tier's required set."
+            )
+    return lock
 
 
 def expected_attrs(lock: dict, tier: str) -> set[str]:
     """Payload names a tree of `tier` must contain - no more, no fewer.
 
-    `full` is a superset of `fast`, so a full tree owes every payload.
+    `full` is a superset of `fast`, so a full tree owes every payload. Tier
+    values are validated in load_lock, so an unrecognised one can never reach
+    this comparison and silently match nothing.
     """
     if tier not in TIERS:
         raise ValueError(f"unknown tier {tier!r}")
@@ -125,6 +168,41 @@ def file_hash_of(path: Path) -> str:
     return "sha256:" + nix_base32(digest.digest())
 
 
+# Fixed metadata for every generated file. Without this the tree's modes are
+# whatever the developer's umask happened to be (022 -> 644/755, 077 ->
+# 600/700), so two "byte-identical" trees could differ to rsync, tar, a
+# container image build, or a static server deciding a file is unreadable.
+# mtime 1 mirrors what Nix itself canonicalises store paths to.
+TREE_FILE_MODE = 0o644
+TREE_DIR_MODE = 0o755
+TREE_SECRET_MODE = 0o600
+TREE_MTIME = 1
+
+
+def normalise_tree(root: Path, secret_names: frozenset[str] = frozenset()) -> None:
+    """Make the tree's metadata a function of the workload, not of the umask.
+
+    The contract this file promises consumers is byte-for-byte reproducibility
+    of a served binary cache. Contents alone were normalised before; modes and
+    mtimes were inherited from the process umask, so the same workload produced
+    different trees under `umask 022` and `umask 077`. Normalising is cheap and
+    keeps the promise whole, which matters as soon as anything copies the tree
+    with rsync/tar rather than reading it over HTTP.
+    """
+    for path in sorted(root.rglob("*"), reverse=True):
+        if path.is_symlink():
+            raise ValueError(f"unexpected symlink in generated tree: {path}")
+        if path.is_dir():
+            path.chmod(TREE_DIR_MODE)
+        else:
+            path.chmod(
+                TREE_SECRET_MODE if path.name in secret_names else TREE_FILE_MODE
+            )
+        os.utime(path, (TREE_MTIME, TREE_MTIME))
+    root.chmod(TREE_DIR_MODE)
+    os.utime(root, (TREE_MTIME, TREE_MTIME))
+
+
 def lock_problems(manifest: dict, lock: dict) -> list[str]:
     """Every way a generated tree can fail to be the pinned workload.
 
@@ -151,7 +229,19 @@ def lock_problems(manifest: dict, lock: dict) -> list[str]:
         problems.append(f"manifest declares unknown tier {tier!r}")
         return problems
 
-    present = {entry["attr"] for entry in manifest.get("paths", [])}
+    # Counted BEFORE collapsing to a set. Set equality compares membership, so
+    # a manifest listing `zstd` twice and omitting `lib` has the same attr set
+    # as a correct one minus a payload - the cardinality check is what makes
+    # "exactly this workload" mean exactly.
+    listed = [entry["attr"] for entry in manifest.get("paths", [])]
+    duplicates = sorted({a for a in listed if listed.count(a) > 1})
+    if duplicates:
+        problems.append(
+            f"manifest lists {duplicates} more than once ({len(listed)} entries, "
+            f"{len(set(listed))} distinct); payload identity must be unique"
+        )
+
+    present = set(listed)
     required = expected_attrs(lock, tier)
     # Set EQUALITY, not containment. A missing payload means the tree is not
     # the workload it claims to be - whether the plan shrank, a copy failed, or
