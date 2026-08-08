@@ -1,10 +1,10 @@
 ---
 id: TASK-5
 title: 'E2E harness v1: podman-pod topology + scripted scenarios'
-status: Done
+status: In Progress
 assignee: []
 created_date: '2026-08-07 21:55'
-updated_date: '2026-08-08 09:50'
+updated_date: '2026-08-08 10:25'
 labels: []
 dependencies:
   - TASK-3
@@ -115,4 +115,13 @@ HONEST LIMITS / follow-ups:
 NEEDS DEEP REVIEW? New container trust surface (the client image + nix.conf topology + the AC#5 key-exclusion assertion). Flagging for the orchestrator's tiered gate: the AC#5 assertion and the daemon-enforcement proof are the security-load-bearing parts.
 
 UPDATE (cd0d49e): added an 8th scenario, corrupt-nar (testproxy corrupt_nar fault through the chain: build fails, path not imported, proxy emitted the fault). Suite is now 8 scenarios / 44 checks, ~104s, green. This is the literal 'Corrupt-NAR scenario' of AC#3/TESTING.md, complementing tamper-narhash (narinfo-level content tamper).
+
+--- VACUOUS-ORACLE FIX ROUND (commit 548d8a2); re-parked for deep re-gate ---
+Deep gate: architect GO, qa NO-GO, codex NO-GO - three oracles passed without proving their property. All fixed with fails-before/passes-after evidence:
+- BLOCKER 1 (AC#5 DEAD): shelled `find` inside the container, but findutils is absent -> rc=127/empty/pass; a real .sec in the served cache stayed GREEN. Now HOST-SIDE walk (secret_key_problems) of the exact bind-mounted tree, in EVERY scenario via Pod.__enter__ (all 9), paired with the key-exists-in-gen-root precondition. Removed the vacuous mount-basename sub-check. EVIDENCE: inject .sec -> RED, clean -> GREEN.
+- BLOCKER 2 (404 wrong boundary): read the testproxy log (upstream), so a daemon 404->502 regression would pass. Now queries the DAEMON's HTTP response: absent->404 (not 502), present->200, sibling-served asserted AFTER. EVIDENCE: daemon returns 200 for present, so ==404 discriminates - a regression goes RED.
+- BLOCKER 3 (corrupt-NAR vacuous): testproxy corrupt_nar inverts from byte 0 -> nix 'input doesn't look like a Nix archive' (PARSE error); scenario accepted ANY failure. Now serves a pristine validly-signed narinfo with a mid-payload byte flip (survives framing) and asserts specifically 'hash mismatch importing path'. EVIDENCE: byte-0 flip -> parse error, new check RED; mid flip -> hash mismatch, GREEN.
+FOLD-INS: daemon-path positive control (pristine app imports as uid 1000 - proves the rejections aren't a broken path); flake.nix comments corrected runuser->setpriv (trust-surface honesty); Pod(daemon_chain=N) docstring marked 'task-11 will add'.
+Suite now 9 scenarios / 50 checks green (~114s); FAST gates (build/lint/test/fmt) green. TASK-27 filed for concurrent-run port/label isolation (fails nonzero, not false-green -> deferred, not gate-breaking).
+STATUS: In Progress, awaiting deep RE-gate. Not Done.
 <!-- SECTION:NOTES:END -->
