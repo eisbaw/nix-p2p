@@ -154,6 +154,7 @@ async fn main() -> ExitCode {
         passthrough: upstream.clone(),
         cache_info: config.cache_info(),
         catalog,
+        upstream_label: config.upstream.clone(),
         correlation,
     });
 

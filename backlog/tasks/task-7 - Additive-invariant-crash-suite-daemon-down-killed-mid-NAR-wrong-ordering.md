@@ -4,7 +4,7 @@ title: 'Additive-invariant crash suite: daemon down, killed mid-NAR, wrong order
 status: To Do
 assignee: []
 created_date: '2026-08-07 21:55'
-updated_date: '2026-08-08 09:46'
+updated_date: '2026-08-08 11:41'
 labels: []
 dependencies:
   - TASK-5
@@ -30,4 +30,6 @@ S2 made into standing e2e scenarios: (a) daemon absent at nix-daemon store-open;
 <!-- SECTION:NOTES:BEGIN -->
 --- from task-5 (80319ec): crash-injection hooks ---
 `Pod.kill(role)` (podman kill) is the entry point. To kill the daemon MID-NAR-TRANSFER: launch a client_run in the BACKGROUND (subprocess.Popen without wait - refactor client_run to expose the argv, or add a client_run_async), poll `pod.proxy_stats()`/`pod.proxy_log()` until the NAR request for the 110 MiB `big` payload appears (it is uncompressed so the transfer window is wide), then `pod.kill("daemon")`. The truncated-transfer event is then visible in proxy_log() (status/bytes_sent short of file_size). For daemon-RETURNS-ERRORS (S2 c): the daemon has no fault injection (by design); simplest is to point the daemon's --upstream at a dead port so it 502s, or front it with a faulted testproxy. S2 in task-5 only covers daemon-ABSENT; the kill-mid-transfer and error cases are yours. The oracle-pairing discipline (reset proxy, max-substitution-jobs=1, fresh client per run) is already baked into Pod.client_run.
+
+From TASK-6 (J1 journey): scripts/journey.py demonstrates the daemon-down path - Pod.kill('daemon') then a build via ctx.substituter_daemon_and_fallback(), asserting exit 0 AND testproxy received-NAR count == payloads (fallback truly served). New Pod.logs(role) accessor lets a crash suite read operator-visible daemon output; note the daemon emits NO substitution line once dead (silence is the observable), and a killed container's published port yields connection-refused (OSError) not a hang - the journey uses that as its 'daemon is really gone' oracle.
 <!-- SECTION:NOTES:END -->

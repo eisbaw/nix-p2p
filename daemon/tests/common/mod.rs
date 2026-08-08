@@ -248,6 +248,7 @@ pub fn app_from_upstream(
         passthrough: upstream as Arc<dyn RawUpstream>,
         cache_info,
         catalog,
+        upstream_label: "test-upstream".to_string(),
         // No persistent narinfo cache in the plain-upstream harness: a NAR
         // request that misses the in-memory catalog takes the UpstreamPath
         // fallback, exactly as before task-8.

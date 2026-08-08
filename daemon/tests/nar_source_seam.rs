@@ -160,6 +160,7 @@ fn build_app(canned_nar: &[u8], seen: Arc<Mutex<Vec<SeenKey>>>) -> Arc<App> {
         passthrough: Arc::new(Dead),
         cache_info: CacheInfo::default(),
         catalog: Arc::new(NarCatalog::new()),
+        upstream_label: "test-upstream".to_string(),
         correlation: Arc::new(daemon::NullCorrelation),
     })
 }

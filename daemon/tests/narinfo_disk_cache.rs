@@ -576,6 +576,7 @@ async fn warm_on_disk_daemon_dispatches_signed_nar_hash_after_in_memory_cold_res
             passthrough: Arc::new(Dead),
             cache_info: CacheInfo::default(),
             catalog: Arc::new(NarCatalog::new()),
+            upstream_label: "test-upstream".to_string(),
             correlation: cache.clone(),
         });
         let (addr, _d) = common::spawn_app(app).await;
@@ -601,6 +602,7 @@ async fn warm_on_disk_daemon_dispatches_signed_nar_hash_after_in_memory_cold_res
         passthrough: Arc::new(Dead),
         cache_info: CacheInfo::default(),
         catalog: Arc::new(NarCatalog::new()), // COLD in memory
+        upstream_label: "test-upstream".to_string(),
         correlation: cache2.clone(),
     });
     let (addr, _d) = common::spawn_app(app).await;
@@ -671,6 +673,7 @@ async fn without_persisted_correlation_the_same_request_falls_back_to_upstream_p
         passthrough: Arc::new(Dead),
         cache_info: CacheInfo::default(),
         catalog: Arc::new(NarCatalog::new()),
+        upstream_label: "test-upstream".to_string(),
         correlation: Arc::new(NullCorrelation),
     });
     let (addr, _d) = common::spawn_app(app).await;

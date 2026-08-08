@@ -6,6 +6,7 @@ title: >-
 status: To Do
 assignee: []
 created_date: '2026-08-08 11:24'
+updated_date: '2026-08-08 11:41'
 labels:
   - wave1-followup
   - daemon
@@ -24,3 +25,9 @@ task-8 shipped the narinfo disk cache OPT-IN via --narinfo-cache-dir (daemon/src
 - [ ] #1 Daemon uses a narinfo disk cache by default (sensible state dir), documented
 - [ ] #2 e2e harness + NixOS module pass the cache dir; a container scenario asserts AC#1 oracle-paired (nonzero daemon narinfo, zero upstream narinfo on the repeat)
 <!-- AC:END -->
+
+## Implementation Notes
+
+<!-- SECTION:NOTES:BEGIN -->
+From TASK-6 (J1 journey): scripts/journey.py has a runtime friction DETECTOR for this task - it greps the default daemon's log for 'narinfo disk cache at' and, while absent, emits FRICTION referencing TASK-29. When you default-wire the narinfo disk cache (main.rs prints that line when --narinfo-cache-dir is set), the journey's FRICTION for TASK-29 auto-clears - so re-run 'just journey' as part of this task's DoD to confirm the default operator now gets a persistent cache.
+<!-- SECTION:NOTES:END -->

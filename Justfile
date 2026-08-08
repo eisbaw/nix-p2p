@@ -151,6 +151,11 @@ e2e-vm:
 measure:
     @echo "{{ stub_marker }}"
 
-# End-to-end user journey walkthrough - stub until task-6.
-journey:
-    @echo "{{ stub_marker }}"
+# Reuses the e2e Pod seam (scripts/e2e_harness.py) as its driver and asserts the
+# two operator oracles - the daemon's per-substitution log story (AC#1) and the
+# fallback-served-by-request-counts proof (AC#2) - then emits its FRICTION
+# manifest. Full-tier fixtures + the e2e image, so it shares e2e's SLOW tier and
+# fail-closed preflight gate.
+# J1 operator journey (task-6): substitute through the daemon, then lose it.
+journey: _python fixtures-large
+    "${NIX_P2P_PYTHON}/bin/python3" scripts/journey.py

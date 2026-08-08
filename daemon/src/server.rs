@@ -18,6 +18,7 @@
 
 use std::convert::Infallible;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use http::{HeaderMap, HeaderName};
 use http_body_util::BodyExt;
@@ -47,6 +48,12 @@ pub struct App {
     /// narinfos populate it, NAR requests read it to carry the signed NarHash
     /// across the seam.
     pub catalog: Arc<NarCatalog>,
+    /// The daemon's CONFIGURED upstream, echoed verbatim as `source=` in the
+    /// per-substitution log line. Presentation-only (never used to build a
+    /// request), so the server layer keeps depending on the trait objects alone
+    /// and not on a concrete HTTP client. This is the `--upstream` string as
+    /// given; in wave-1 (no redirects) it is also the host actually dialed.
+    pub upstream_label: String,
     /// PERSISTED correlation, consulted only on an in-memory catalog MISS. In
     /// production this is the narinfo disk cache, which derives `token -> meta`
     /// from cached narinfos so a warm-on-disk-but-cold-in-memory daemon (post
@@ -143,6 +150,9 @@ async fn handle(req: Request<Incoming>, app: Arc<App>) -> Response<NarBody> {
                 .catalog
                 .meta_for_token(token.as_str())
                 .or_else(|| app.correlation.meta_for_token(token.as_str()));
+            // Capture the inbound token for the log's `path=` before it is moved
+            // into the key; it is the exact NAR locator the client asked for.
+            let nar_token = token.as_str().to_string();
             let (key, expected_size) = match correlated {
                 Some(meta) => (
                     NarKey::SignedNarHash {
@@ -153,7 +163,11 @@ async fn handle(req: Request<Incoming>, app: Arc<App>) -> Response<NarBody> {
                 ),
                 None => (NarKey::UpstreamPath(token), None),
             };
-            forward(app.nar.resolve(&key, expected_size).await, is_head)
+            let started = Instant::now();
+            let result = app.nar.resolve(&key, expected_size).await;
+            // Log BEFORE `forward` moves `result`: the ordering is load-bearing.
+            log_substitution(&app.upstream_label, &nar_token, &result, started.elapsed());
+            forward(result, is_head)
         }
         Route::Other => forward(app.passthrough.get(&path).await, is_head),
     }
@@ -229,6 +243,53 @@ async fn respond_narinfo(
     map.remove(http::header::CONTENT_LENGTH);
     map.insert(http::header::CONTENT_LENGTH, len.into());
     response
+}
+
+/// One comprehensible line per NAR substitution the daemon serves, so an
+/// operator tailing the daemon sees WHAT moved, FROM WHERE, HOW MUCH, and HOW
+/// LONG. Emitted only for a 200 (an actual substitution); a 404 or a transport
+/// error is not a substitution and is reported by the error paths, not here.
+///
+/// `bytes` is the upstream `Content-Length` - the COMPRESSED on-wire transfer
+/// size - or `unknown` when the upstream sent none (a chunked response). It is
+/// deliberately NOT the signed NarSize: NarSize is the UNCOMPRESSED size, a
+/// different quantity for any compressed NAR, so guessing with it would print a
+/// wrong-unit number. Absence is reported honestly as `unknown`.
+///
+/// WAVE-1 LIMITATION (filed TASK-31): `duration_ms` is the time to the upstream
+/// RESPONSE HEADERS, not the full body drain - the NAR body streams verbatim
+/// AFTER this point - and `bytes` is `Content-Length`, not a counted drain, so a
+/// truncated transfer would still log its advertised length. Full-drain
+/// accounting is a wave-2 refinement that TASK-9's measurement layer consumes.
+fn log_substitution(
+    source: &str,
+    nar_token: &str,
+    result: &Result<UpstreamResponse, SourceError>,
+    elapsed: Duration,
+) {
+    let Ok(resp) = result else { return };
+    if resp.status != 200 {
+        return;
+    }
+    let bytes = match content_length(&resp.headers) {
+        Some(n) => n.to_string(),
+        None => "unknown".to_string(),
+    };
+    println!(
+        "daemon: substituted path=/nar/{nar_token} source={source} bytes={bytes} duration_ms={}",
+        elapsed.as_millis()
+    );
+}
+
+/// Parse an upstream `Content-Length` into bytes, or `None` when absent or
+/// malformed (chunked transfers, which then fall back to the signed NarSize).
+fn content_length(headers: &HeaderMap) -> Option<u64> {
+    headers
+        .get(http::header::CONTENT_LENGTH)?
+        .to_str()
+        .ok()?
+        .parse()
+        .ok()
 }
 
 /// Forward a streaming upstream response (NAR / passthrough) verbatim.

@@ -131,6 +131,21 @@ def http_post(url: str, timeout: float = 10.0) -> tuple[int, bytes]:
         return error.code, error.read()
 
 
+def daemon_reachable(timeout: float = 1.0) -> bool:
+    """True iff the daemon answers /nix-cache-info on its published host port.
+
+    A killed (or never-started) daemon's forwarded port yields connection-
+    refused - an OSError, which `urllib.error.URLError` subclasses - so this is
+    the single 'is the daemon still there' probe shared by the s2 scenario and
+    the J1 journey (task-6), rather than each re-implementing the try/except.
+    """
+    try:
+        status, _ = http_get(f"http://127.0.0.1:{HOST_DAEMON}/nix-cache-info", timeout)
+    except OSError:
+        return False
+    return status == 200
+
+
 # ---- fixture + tamper trees ------------------------------------------------
 
 
@@ -526,6 +541,14 @@ class Pod:
         """
         run([self._pm, "kill", self._c(role)], check=False)
 
+    def logs(self, role: str) -> str:
+        """The combined stdout+stderr a role's container has emitted, host-side
+        via `podman logs`. task-6 (journey) reads the daemon's log to assert the
+        operator-facing substitution story; task-7/9 reuse it for crash and
+        counter narration. Returns "" for a role that never started."""
+        result = run([self._pm, "logs", self._c(role)], check=False)
+        return result.stdout + result.stderr
+
     # -- oracles (host-side) --
 
     def proxy_reset(self) -> None:
@@ -892,12 +915,7 @@ def scenario_s2_fallback(ctx: Ctx, expect) -> None:
     targets = [fixtures.store_path(a) for a in ALL_ATTRS]
     with Pod(ctx, "s2", fixtures.cache, with_daemon=False, expect=expect) as pod:
         # Sanity: the preferred substituter really is down.
-        try:
-            http_get(f"http://127.0.0.1:{HOST_DAEMON}/nix-cache-info", timeout=1.0)
-            daemon_up = True
-        except OSError:
-            daemon_up = False
-        expect(not daemon_up, "S2 precondition: daemon is not running", "")
+        expect(not daemon_reachable(), "S2 precondition: daemon is not running", "")
 
         pod.proxy_reset()
         result = pod.client_run(
