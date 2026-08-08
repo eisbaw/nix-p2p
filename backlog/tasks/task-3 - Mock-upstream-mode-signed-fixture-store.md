@@ -1,10 +1,10 @@
 ---
 id: TASK-3
 title: Mock upstream mode + signed fixture store
-status: In Progress
+status: Done
 assignee: []
 created_date: '2026-08-07 21:55'
-updated_date: '2026-08-08 06:58'
+updated_date: '2026-08-08 07:01'
 labels:
   - irreversible
 dependencies:
@@ -246,3 +246,9 @@ INVARIANT unchanged (lint-only, verified): git baseline a39382de8782d6f7; served
 
 gate round 9: build/lint/fmt/test/fixtures-large/fixtures-verify-rebuild/package all exit 0; nix build .#daemon .#testproxy exit 0; nix flake check exit 0 (still 9 checks). cargo 2/2. Full tier: 12 ok, 4 positive controls, 3 bites, 0 PARTIAL. Stubs untouched.
 <!-- SECTION:NOTES:END -->
+
+## Final Summary
+
+<!-- SECTION:FINAL_SUMMARY:BEGIN -->
+DONE after 9 implementation + 8 deep-gate rounds (irreversible surface; J2 baseline freezes against this workload). Delivers: deterministic signed fixture set (compression none/xz/zstd + a 115MB uncompressed NAR), test-ed25519-signed narinfos (test key only, no foreign Sig), mock-upstream nix-cache-info with explicit Priority/WantMassQuery, 3 tamper bites + 4 positive controls through a real nix client. Publication redesigned (design B, via mark-emulator) to a single authoritative lock inside gen-<sha>/lock.json committed by one atomic 'current' symlink flip - no rollback logic, no two-source reconciliation, crash-before=old-complete / crash-after=new-complete (10k concurrent flips verified no torn state by codex). Fail-closed freeze: tier-set equality, blob re-hash, --write-lock rebind refusal, rebuild-determinism check, ancestor-path anchoring, strengthened lock-source guard. Git baseline a39382de8782d6f7 byte-identical since round 2. Final gate: build/lint/test/fixtures-large/fixtures-verify-rebuild all 0; nix flake check 9 checks; 4 stubs intact. Reviewer trail: QA+architect+codex, dual/triple GO on the redesign; residuals filed as task-19 (CI home for full-tier gate), task-21 (path-based ancestor resolution + owner-exemption, hostile-same-uid, out of threat model). Key lessons banked to memory: single source of truth over reconciled duplicates; specify state machines for transaction bugs; class sweeps not point fixes; measure before documenting a performance residual; verify the test harness actually invokes the code (a bite that doesn't bite is the failure mode that survives everything).
+<!-- SECTION:FINAL_SUMMARY:END -->

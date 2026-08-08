@@ -4,6 +4,7 @@ title: Path-based residual in fixture publication (ancestor-swap hardening)
 status: To Do
 assignee: []
 created_date: '2026-08-08 06:32'
+updated_date: '2026-08-08 07:01'
 labels:
   - deferred-finding
   - hardening
@@ -27,3 +28,9 @@ REMEDIATION SHAPE (for the hardening wave, not now): thread the held out_fd into
 - [ ] #2 a bite swaps out_dir for a symlink after anchored_publication resolves it and proves the current flip does not follow the swap (lands in the real root or fails closed)
 - [ ] #3 the threat-model note in fixturelib.py/README is updated to state that publication link ops are now descriptor-relative too
 <!-- AC:END -->
+
+## Implementation Notes
+
+<!-- SECTION:NOTES:BEGIN -->
+Additional guard residual (task-3 round 9, orchestrator-verified): check-lock-sources.py exempts gen-fixtures.py (the baseline owner) from the literal scan, so a bare-literal baseline read smuggled into a NON-owner helper INSIDE gen-fixtures.py is not caught (verified exit 0). Low severity - gen-fixtures legitimately owns the baseline; the runtime GATE modules (which must derive only from current->gen/lock.json) ARE fully covered (literal+alias+deny-by-default, all verified biting). Full coverage needs function-level analysis inside the owner. Hardening-wave item, not a blocker.
+<!-- SECTION:NOTES:END -->
