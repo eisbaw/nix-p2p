@@ -3,10 +3,10 @@ id: TASK-4
 title: >-
   Product daemon skeleton: transparent proxy behind NarinfoSource/NarSource
   traits
-status: In Progress
+status: Done
 assignee: []
 created_date: '2026-08-07 21:55'
-updated_date: '2026-08-08 09:04'
+updated_date: '2026-08-08 09:14'
 labels: []
 dependencies:
   - TASK-1
@@ -94,3 +94,9 @@ Reviews of this round: qa-test-runner GO (36 daemon tests stable x3, fault_loop 
 
 Gate (FAST): build/lint(clippy -D warnings, fmt, ruff, independence + HTTP denylist, source/lock guards)/test all green; daemon 36 tests (lib 17 incl 4 catalog, bin 4, fault_loop 1, nar_hash_collision 1, seam 2, no_direct 1, ordering 2, passthrough 8); testproxy 34; fixtures full-tier 4 payloads; nix build .#daemon ok. Honest limits unchanged: catalog in-memory/unbounded (task-8); correlated SignedNarHash path is first-sight-within-a-lifetime, warm clients hit UpstreamPath (PRD risk 2); body-idle timeout + wave-2 NarSize abort = task-25; daemon TLS = task-24.
 <!-- SECTION:NOTES:END -->
+
+## Final Summary
+
+<!-- SECTION:FINAL_SUMMARY:BEGIN -->
+DONE (LIGHT + 3 codex cadence rounds on the seam). Wave-0 transparent proxy daemon behind NarinfoSource/NarSource traits. Seam frozen CORRECTLY for wave-2 after two cross-model NO-GOs: NarKey{SignedNarHash{hash,upstream_hint}|UpstreamPath(token)} - the trait carries the signed NarHash as content identity (wave-2 iroh key) with the exact inbound URL token as an honestly-typed transport hint; forward-only token->(NarHash,NarSize) catalog populated at narinfo-serve time (PRD prefetch seed); UpstreamHttp stateless, fetches the hint verbatim. All upstream access confined to upstream.rs (grep-guarded). Wave-1 behavior: gzip forwarded verbatim (hyper low-level, no auto-decompress), 404/403/unknown-kind status fidelity, narinfo signed fields byte-identical (empty rewrite allowlist), clean <2s 502 on upstream-down, nix-cache-info Priority 30 / WantMassQuery 1. Bonus fix: removed a wave-1 size guard that compared compressed Content-Length against uncompressed NarSize (spurious 502). 36 daemon tests. Gates: build/lint/test/nix-build all green. Reviews: qa GO x3, architect ship-it x3, codex GO (after 2 seam NO-GOs it caught: URL-keyed seam, then NarHash-collision wrong-bytes S1 violation). Residuals: task-8 (catalog persist/bound; steady-state correlation needs narinfo persistence - warm Nix client skips narinfo GET), task-24 (daemon TLS), task-25 (body-idle timeout + wave-2 NarSize abort). Container S1 re-assert -> task-5.
+<!-- SECTION:FINAL_SUMMARY:END -->
