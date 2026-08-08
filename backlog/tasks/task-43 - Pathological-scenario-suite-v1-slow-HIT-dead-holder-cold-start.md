@@ -4,9 +4,11 @@ title: 'Pathological scenario suite v1: slow-HIT, dead-holder, cold-start'
 status: To Do
 assignee: []
 created_date: '2026-08-08 20:13'
+updated_date: '2026-08-08 20:30'
 labels: []
 dependencies:
   - TASK-42
+  - TASK-51
 ---
 
 ## Description
@@ -21,3 +23,9 @@ The first cut of the S8 pathological matrix (the rest deferred to wave-2b re-pla
 - [ ] #2 Each scenario emits its profiling cost (added latency, wasted bytes, RAM) into the task-F report
 - [ ] #3 Honest limit: which pathological cases are NOT yet covered (NAT, herd, lying-claim, churn) named for the wave-2b re-plan
 <!-- AC:END -->
+
+## Implementation Notes
+
+<!-- SECTION:NOTES:BEGIN -->
+REVIEW REVISION (arch#3/qa#4/codex#5): (1) The slow-HIT policy does NOT exist at task-43 runtime (task-44 models it, later task implements). So task-43 asserts ONLY the WEAK invariant - never unbounded-hang, never wrong bytes - via the task-51 conservative safety envelope (dep added). Do NOT assert 'policy fires'. (2) PIN numeric bounds; add a per-cell FAULT-OFF baseline (like the wave-1 fault x depth matrix) so the bite bites. (3) Rename 'DHT cold-start' -> 'minimal-discovery cold-start' (no DHT in wave-2a, codex#7). (4) Collects traces to FEED task-44's policy model.
+<!-- SECTION:NOTES:END -->

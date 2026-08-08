@@ -4,9 +4,11 @@ title: 'Minimal 2-node discovery: claim exchange + NarHash resolve'
 status: To Do
 assignee: []
 created_date: '2026-08-08 20:12'
+updated_date: '2026-08-08 20:30'
 labels: []
 dependencies:
-  - TASK-39
+  - TASK-37
+  - TASK-50
 ---
 
 ## Description
@@ -21,3 +23,9 @@ Enough discovery for S6 (2-node), NOT the full DHT (deferred to the wave-2b spik
 - [ ] #2 A NarHash no peer holds resolves to a miss fast (bounded), then the daemon falls back to upstream (S2 preserved)
 - [ ] #3 No-enumeration: the probe answers yes/no for a concrete NarHash; there is no endpoint listing a peers holdings
 <!-- AC:END -->
+
+## Implementation Notes
+
+<!-- SECTION:NOTES:BEGIN -->
+REVIEW REVISION: (1) Discovery::resolve returns the COMPLETE transport OFFER (NodeId + RawNarV1 BLAKE3 + transport tag), not merely a holder NodeId (codex#2) - iroh fetches by BLAKE3, so the NarHash->BLAKE3 mapping must be in the offer. (2) The claim PRODUCER is task-50 (availability index) - announce source is the index, not hand-waved. (3) Split discovery: DHT(NarHash-key)->candidate NodeIds [deferred to task-47 spike] THEN per-peer claim query [task-37 envelope, now]. Wave-2a uses minimal/direct discovery; do NOT bake an unversioned query wire (use task-37's envelope).
+<!-- SECTION:NOTES:END -->

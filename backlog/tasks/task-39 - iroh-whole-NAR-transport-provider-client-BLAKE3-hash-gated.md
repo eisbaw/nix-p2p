@@ -4,9 +4,11 @@ title: 'iroh whole-NAR transport (provider + client, BLAKE3 hash-gated)'
 status: To Do
 assignee: []
 created_date: '2026-08-08 20:12'
+updated_date: '2026-08-08 20:30'
 labels: []
 dependencies:
   - TASK-38
+  - TASK-48
 priority: high
 ---
 
@@ -22,3 +24,9 @@ FIRST transport (owner: iroh first prio). A node runs an iroh-blobs PROVIDER ser
 - [ ] #2 A corrupted/wrong blob from a lying provider fails the gate; no wrong bytes reach the store (bite)
 - [ ] #3 iroh is a daemon-only dep; the independence guard still passes (testproxy does not gain iroh)
 <!-- AC:END -->
+
+## Implementation Notes
+
+<!-- SECTION:NOTES:BEGIN -->
+REVIEW REVISION: (1) task-39 no longer DEFINES the addressed unit - it CONSUMES the frozen RawNarV1 from task-48 (dep added). (2) Corruption bite must be SPLIT (codex#6): (a) mutated bytes fail the BLAKE3 TRANSPORT gate; (b) a DIFFERENT valid NAR with its own valid BLAKE3 PASSES transport but fails the signed sha256==NarHash TRUST gate - test both, they are different gates.
+<!-- SECTION:NOTES:END -->

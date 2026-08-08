@@ -4,6 +4,7 @@ title: 'JOURNEY J3: operator gets a real build served from a peer'
 status: To Do
 assignee: []
 created_date: '2026-08-08 20:13'
+updated_date: '2026-08-08 20:30'
 labels:
   - journey
 dependencies:
@@ -22,3 +23,9 @@ Interspersed journey (wave-2a). Act as an operator with two machines (two daemon
 - [ ] #2 S6 experienced end-to-end (peer-served) AND S2 (peer offline mid-build -> fallback) - both asserted, not narrated
 - [ ] #3 Friction filed as tasks or an explicit none-found emitted by the run
 <!-- AC:END -->
+
+## Implementation Notes
+
+<!-- SECTION:NOTES:BEGIN -->
+REVIEW REVISION (qa#5): 'cache.nixos.org untouched' is an OVERCLAIM - the signed narinfo still comes from upstream in wave-2a. Assert NAR-payload served by the peer (egress 0 for the NAR) + narinfo egress as nonzero context. Do not claim the cache is untouched.
+<!-- SECTION:NOTES:END -->
