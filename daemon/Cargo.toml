@@ -51,12 +51,31 @@ serde_json = "1"
 # NO domain separation, so this crate's plain `hash()` IS the frozen recipe and a
 # future iroh transport can address blobs by exactly this digest (see content_id).
 blake3 = "1"
+# iroh p2p transport (task-39): the FIRST real peer-to-peer byte transfer. A node
+# runs an iroh-blobs PROVIDER serving its NARs addressed by BLAKE3(RawNarV1), and a
+# CLIENT that fetches a blob by that exact Blake3Digest from a peer EndpointId.
+# iroh-blobs speaks plain-unkeyed BLAKE3 (bao) so the addressed unit IS the blob
+# hash (content_id.rs freeze) and the transfer is BLAKE3-verified incrementally
+# (gate 1) for free. DAEMON-ONLY on purpose: testproxy stays std-only (an
+# independent witness of wire behaviour), so these are never shared. Neither is an
+# HTTP-stack crate, so `just independence`'s convergence denylist is unaffected -
+# the guard only forbids a shared WORKSPACE crate or a shared HTTP stack.
+# iroh-blobs 0.103 depends on iroh ^1.0, so the two majors are pinned together in
+# Cargo.lock. n0 relay dependence for WAN holepunch is a known soft-centralization
+# limit (PRD); the daemon dials direct addresses where it has them.
+iroh = "1"
+iroh-blobs = "0.103"
 
 [dev-dependencies]
 # process: spawn the real testproxy binary for the fault-mode loop (AC#2).
 tokio = { version = "1", features = ["rt-multi-thread", "net", "macros", "io-util", "time", "process"] }
 # flate2: build a real gzip body for the AC#6 verbatim-forwarding bite.
 flate2 = "1"
+# sha2: model NIX's sha256==NarHash TRUST gate (gate 2) in the iroh transfer test.
+# Test-only: the daemon never re-implements Nix's gate (it is outside the TCB);
+# the test computes sha256 exactly as the Nix client would, to prove gate 2 is a
+# DIFFERENT gate from the BLAKE3 transport gate (the corruption-bite split).
+sha2 = "0.10"
 
 [lints]
 workspace = true
