@@ -6,7 +6,7 @@ title: >-
 status: To Do
 assignee: []
 created_date: '2026-08-08 11:24'
-updated_date: '2026-08-08 11:41'
+updated_date: '2026-08-08 17:18'
 labels:
   - wave1-followup
   - daemon
@@ -30,4 +30,6 @@ task-8 shipped the narinfo disk cache OPT-IN via --narinfo-cache-dir (daemon/src
 
 <!-- SECTION:NOTES:BEGIN -->
 From TASK-6 (J1 journey): scripts/journey.py has a runtime friction DETECTOR for this task - it greps the default daemon's log for 'narinfo disk cache at' and, while absent, emits FRICTION referencing TASK-29. When you default-wire the narinfo disk cache (main.rs prints that line when --narinfo-cache-dir is set), the journey's FRICTION for TASK-29 auto-clears - so re-run 'just journey' as part of this task's DoD to confirm the default operator now gets a persistent cache.
+
+forward-carry from task-10: the NixOS module nixos/nix-p2p.nix has a narinfoCacheDir option (default null = OFF; daemon --narinfo-cache-dir unset). Wire a DEFAULT here. CAUTION: the daemon service runs under systemd DynamicUser, which cannot write an arbitrary absolute dir - use serviceConfig.StateDirectory (=> /var/lib/<name>, owned by the dynamic user) and pass that path, or drop DynamicUser. The VM test (nixos/vm-test.nix) is where you re-assert the e2e AC1 through systemd once the cache is on.
 <!-- SECTION:NOTES:END -->

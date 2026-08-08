@@ -4,7 +4,7 @@ title: 'JOURNEY J2: measurement journey - read the baseline like a decision-make
 status: To Do
 assignee: []
 created_date: '2026-08-07 21:56'
-updated_date: '2026-08-08 00:29'
+updated_date: '2026-08-08 17:18'
 labels:
   - journey
 dependencies:
@@ -38,4 +38,6 @@ forward-carried from task-3 round 2 (9dba842): before the J2 baseline is written
 Word the baseline carefully on three separate claims, which task-3 now keeps apart deliberately: (a) export repeatability - proven by 'just test'; (b) build determinism - proven by 'just fixtures-verify-rebuild', on one machine only; (c) cross-host / cross-nixpkgs reproducibility - proven by NOTHING here and not to be implied.
 
 Rebinding the workload version is now refused by the tooling unless --retire-baseline is passed, precisely so a baseline's identifier cannot be silently redefined under it. If you ever see that flag in a diff, the baseline it names is void.
+
+forward-carry from task-10: a NixOS VM data point now exists (just e2e-vm) proving S1 byte-identity + S2 fallback on a REAL systemd nix-daemon (17.77s test). If the J2 baseline read-out wants to note VM vs container tiers: the VM is the S2 truth layer (real store-open/service ordering); the container tier owns the S3/S4 egress/latency numbers and request-count oracles. No measurement numbers are produced by the VM test - it is a correctness gate, not an instrument.
 <!-- SECTION:NOTES:END -->

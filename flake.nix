@@ -184,6 +184,12 @@
       };
     in
     {
+      # The NixOS module (task-10). System-independent, so it lives outside the
+      # per-system sets. Consumers wire `services.nix-p2p.package` to
+      # `packages.<system>.daemon`; the VM test does exactly that.
+      nixosModules.nix-p2p = import ./nixos/nix-p2p.nix;
+      nixosModules.default = self.nixosModules.nix-p2p;
+
       packages.${system} = {
         # Consumed by the container images (task-5) and the NixOS module
         # (task-10). These attribute names are a public-ish interface: renaming
@@ -193,6 +199,18 @@
         # out of `checks` so `nix flake check` and the devshell closure stay
         # lean (like the 110 MiB fixture payload).
         e2e-image = e2eImage;
+
+        # The NixOS VM test (task-10): real nix-daemon + systemd, the S2 truth
+        # layer. A PACKAGE, not a check, on purpose (task-1 codex finding 4):
+        # `nix flake check` builds every `checks` attr and the devshell pulls
+        # their inputs, so a VM test under `checks` would make every fast gate
+        # boot QEMU. `just e2e-vm` builds THIS attr directly and nothing else
+        # does. Runs only on x86_64-linux with /dev/kvm.
+        vm-test = import ./nixos/vm-test.nix {
+          inherit pkgs daemon;
+          fixtures = fixtureWorkload;
+        };
+
         default = self.packages.${system}.daemon;
       }
       # Fixture payloads as packages.fixture-<name>, so `nix flake check`

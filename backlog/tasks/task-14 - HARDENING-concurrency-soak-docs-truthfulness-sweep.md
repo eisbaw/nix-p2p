@@ -4,7 +4,7 @@ title: 'HARDENING: concurrency soak + docs truthfulness sweep'
 status: To Do
 assignee: []
 created_date: '2026-08-07 21:56'
-updated_date: '2026-08-07 22:20'
+updated_date: '2026-08-08 17:18'
 labels:
   - hardening
 dependencies:
@@ -23,3 +23,9 @@ Wave-end hardening block, part 2. Soak: max-substitution-jobs=16 storm of parall
 - [ ] #2 Same-path dogpile at the harshest swept setting (128 jobs): concurrent cold-cache requests for ONE large NAR -> single upstream fetch (or explicitly documented safe alternative); never a partial/corrupt byte served
 - [ ] #3 README quickstart executed verbatim in a clean container - every command works as written; TESTING.md drift corrected in the same commit
 <!-- AC:END -->
+
+## Implementation Notes
+
+<!-- SECTION:NOTES:BEGIN -->
+forward-carry from task-10: VM truth layer exists (nixos/vm-test.nix). If concurrency/soak wants a VM data point, note the daemon runs under systemd DynamicUser (nixos/nix-p2p.nix) binding 127.0.0.1:port; max-substitution-jobs/http-connections are client nix.settings you can sweep on the client node. Same absent-before ORACLE GOTCHA as task-13: use nix-validity, not test -e.
+<!-- SECTION:NOTES:END -->

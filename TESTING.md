@@ -81,8 +81,15 @@ Gates (all must pass; `just` recipes are the canonical entry points):
 3. `just test` — unit + integration (in-process, mock upstream).
 4. `just e2e` — container harness: scripted scenarios with oracles
    below. E2E failures BLOCK commits (repo policy).
-5. `just e2e-vm` — NixOS VM test(s): real nix-daemon + systemd
-   semantics (slower; standing, and required before wave exit).
+5. `just e2e-vm` — NixOS VM test (real nix-daemon + systemd
+   semantics; slower; standing, and required before wave exit). It
+   builds ONE dedicated flake output, `packages.x86_64-linux.vm-test`
+   (`nix build .#vm-test`), NOT a flake check: everything under
+   `checks` is built by `nix flake check` and pulled into the devshell
+   closure, so a VM test there would make every fast gate boot QEMU
+   (task-1 codex finding 4). `nix flake check` therefore does NOT cover
+   the VM test — `just e2e-vm` is its only entry point. Needs
+   `/dev/kvm`.
 
 Oracles (what a scenario asserts against):
 - **Request-count oracle**: the test proxy logs every request with
@@ -194,9 +201,18 @@ pass through byte-identical, including across a daemon restart.
    explicit direct fallback substituter — S2 requires a real
    fallback target, and its scenarios assert the fallback actually
    served the bytes (request counts), not merely exit 0.
-4. **NixOS VM tests**: same scenarios on real nix-daemon + systemd +
-   the NixOS module; the truth layer for S2 (store-open behavior,
-   service ordering).
+4. **NixOS VM tests** (`nixos/vm-test.nix`, via the NixOS module
+   `nixos/nix-p2p.nix`): real nix-daemon + systemd; the truth layer for
+   S2 (store-open behavior, service ordering). Wave-1 scope: S1
+   byte-identity through the daemon, S2 fallback with the daemon
+   stopped, and the module's daemon-off additive invariant — each with
+   an absent-before/present-after substitution (per-node writable store
+   images, so the fixture is genuinely absent on the client, not merely
+   unregistered). The systemd nix-daemon trusts EXACTLY the test cache
+   key with require-sigs on. Deferred to the hardening wave (task-13/14,
+   filed): the three tamper narinfos and testproxy fault modes
+   re-asserted through the systemd daemon, and VM-level request-count
+   oracles.
 5. **Long-chain**: client → daemon×N → test proxy → upstream,
    N ≥ 3.
 
@@ -326,10 +342,13 @@ not over-read:
 - **Enforcement is proven in Nix's direct store mode only.** The gate
   drives the `nix` CLI, where `trusted-public-keys` is client-side.
   A real `nix-daemon` ignores that setting for a non-trusted user and
-  enforces `require-sigs` daemon-side, so task-5 (containers) and
-  task-10 (VM) must re-assert the same three tampered inputs through
-  the **daemon** enforcement path. That is a different proof, not a
-  repeat.
+  enforces `require-sigs` daemon-side, so task-5 (containers) re-asserts
+  the same three tampered inputs through the **daemon** enforcement
+  path. That is a different proof, not a repeat. task-10's VM layer
+  proves the daemon-side POSITIVE path (S1 accepted on exactly the test
+  key, require-sigs on) through the real systemd nix-daemon; re-asserting
+  the three tamper NEGATIVES there is deferred to the hardening wave
+  (task-13/14, filed).
 
 The fixture gate deliberately does **not** run inside `nix flake
 check`: the tree is generated and gitignored, so a sandboxed run would

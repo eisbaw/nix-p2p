@@ -4,10 +4,6 @@
 # sandbox - use it for CI and to catch anything that only passes against a
 # warm ./target.
 
-# Honesty marker for gates whose harness does not exist yet. A stub that looks
-# like a pass is forbidden - tasks 5/9/10/6 replace these with real gates.
-stub_marker := "0 scenarios registered - NOT a pass"
-
 # Show the available gates.
 default:
     @just --list
@@ -147,9 +143,16 @@ e2e: _python fixtures-large
 e2e-clean:
     "${NIX_P2P_PYTHON}/bin/python3" scripts/e2e_harness.py --clean
 
-# NixOS VM tests (real nix-daemon + systemd) - stub until task-10.
+# The NixOS VM truth layer (task-10): real nix-daemon + systemd + the NixOS
+# module. Builds ONE dedicated flake package (packages.x86_64-linux.vm-test),
+# NOT a flake check - a VM test under `checks` would make `nix flake check` and
+# the devshell boot QEMU (task-1 codex finding 4), so it is invoked directly
+# here and only here. Proves S1 byte-identity through the daemon, S2 fallback
+# with the daemon stopped, and the module's daemon-off additive invariant.
+# SLOW tier: boots three QEMU VMs, needs /dev/kvm; minutes, not seconds.
+# Run the NixOS VM test (real nix-daemon + systemd).
 e2e-vm:
-    @echo "{{ stub_marker }}"
+    nix build -L --no-link .#vm-test
 
 # The S3/S4 measurement instrument (task-9): runs an identical scripted workload
 # with-daemon vs without-daemon over the task-5 Pod seam and emits a
