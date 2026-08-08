@@ -2563,14 +2563,21 @@ def scenario_fault_depth_matrix(ctx: Ctx, expect) -> None:
         clean_nar_bytes = clean_nar[1]["body"]
         clean_info_bytes = clean_info[1]["body"]
 
-        # -- mode 1: added latency (sub-timeout) - tolerated at every depth ----
-        pod.proxy_faults("latency_narinfo_ms=200")
+        # -- mode 1: added latency (sub-timeout) - tolerated, and ACTUALLY felt --
+        # Timing evidence (codex, task-13): assert the injected 200ms latency was
+        # really incurred (elapsed >= 150ms), so a no-op fault could not pass this
+        # cell. The fault-off baseline GETs above were sub-timeout-fast.
+        injected_ms = 200
+        pod.proxy_faults(f"latency_narinfo_ms={injected_ms}")
         for d in depths:
+            start = time.perf_counter()
             r = _raw_get(ports[d], present_narinfo)
+            elapsed_ms = (time.perf_counter() - start) * 1000.0
             expect(
-                r["status"] == 200,
-                f"matrix mode1 latency depth {d}: sub-timeout latency still 200",
-                f"status={r['status']}",
+                r["status"] == 200 and elapsed_ms >= 0.5 * injected_ms,
+                f"matrix mode1 latency depth {d}: sub-timeout latency served 200 "
+                f"AND was felt (~{injected_ms}ms injected, {elapsed_ms:.0f}ms observed)",
+                f"status={r['status']} elapsed={elapsed_ms:.0f}ms want>={0.5 * injected_ms:.0f}ms",
             )
         pod.proxy_faults("")
 
@@ -2653,32 +2660,50 @@ def scenario_fault_depth_matrix(ctx: Ctx, expect) -> None:
 
 
 def scenario_chain_timeout_boundary(ctx: Ctx, expect) -> None:
-    """AC#1 / TASK-33: pin the upstream-latency vs header-timeout boundary that
-    flips a narinfo GET 200 -> 502, and PROVE the boundary MOVES when the timeout
-    changes. The daemon's per-hop `--header-timeout-ms` (added in task-13) is the
-    controllable lever.
+    """TASK-33 (partial - NOT a depth-pinned boundary): pin the upstream-latency
+    vs per-hop-header-timeout boundary that flips a narinfo GET 200 -> 502, and
+    PROVE it MOVES when the timeout changes. The daemon's `--header-timeout-ms`
+    (task-13) is the controllable lever.
 
-    Loopback honesty (recorded decision, task-33): the per-hop timeout does not
-    COMPOSE across hops (each hop restarts its own clock), but on pod loopback the
-    per-hop connect/send overhead is sub-millisecond, so the DEPTH-composition
-    term is below the noise floor - all depths flip together at L ~= T here. The
-    robustly-pinnable, deterministic boundary is therefore L-vs-T, moved via T;
-    the WAN-scale depth term is documented in `UpstreamHttp::with_header_timeout`
-    and TESTING.md rather than asserted knife-edge on loopback."""
+    HONEST SCOPE (codex re-gate): this does NOT pin a *depth*-dependent boundary.
+    On pod loopback the per-hop connect/send overhead is sub-millisecond, so the
+    fixed-per-hop-timeout composition term is below the noise floor and does not
+    separate depth 1 from depth 3 - a depth-pinned flip is WAN-scale and not
+    honestly assertable here. So the asserted CLAIM is only: at the FULL chain
+    depth (depth-3 entry, worst case), the flip is governed by L vs T and moves
+    with T. The all-depths statuses are PRINTED as an observation (they agree),
+    never asserted as a depth boundary. task-33 stays OPEN for the budget-aware
+    fix and its real-WAN validation (task-15/task-35).
+
+    FALSIFIABILITY (qa N1): the bite is the PAIR, not either assertion alone -
+    'L=900 -> 502 at T=500' AND 'L=900 -> 200 at T=1200' TOGETHER require the flip
+    to depend on T (T=500 < 900 < T=1200). Either alone could pass on a broken
+    daemon (always-502 or always-200)."""
     fixtures = ctx.fixtures
     present_narinfo = fx.narinfo_name(fixtures.store_path("lib"))
     depths = (1, 2, 3)
+    deep = CHAIN_DEPTH  # depth-3 entry (daemon-1): worst case, the full chain
 
-    def statuses_at(pod: Pod, latency_ms: int) -> dict:
+    def status_at_depth(pod: Pod, depth: int, latency_ms: int) -> int:
         pod.proxy_faults(f"latency_narinfo_ms={latency_ms}")
-        out = {}
-        for d in depths:
-            port = _matrix_depth_port(pod, d)
-            out[d] = _raw_get(port, present_narinfo, timeout=15.0)["status"]
+        st = _raw_get(_matrix_depth_port(pod, depth), present_narinfo, timeout=15.0)[
+            "status"
+        ]
+        pod.proxy_faults("")
+        return st
+
+    def observe_all(pod: Pod, latency_ms: int) -> dict:
+        pod.proxy_faults(f"latency_narinfo_ms={latency_ms}")
+        out = {
+            d: _raw_get(_matrix_depth_port(pod, d), present_narinfo, timeout=15.0)[
+                "status"
+            ]
+            for d in depths
+        }
         pod.proxy_faults("")
         return out
 
-    # Pod A: tight per-hop timeout T=500ms.
+    # Pod A: tight per-hop timeout T=500ms. Assert the L-vs-T flip at FULL depth.
     with Pod(
         ctx,
         "timeout-boundary-a",
@@ -2688,22 +2713,27 @@ def scenario_chain_timeout_boundary(ctx: Ctx, expect) -> None:
         daemon_chain=CHAIN_DEPTH,
         daemon_extra_args=("--header-timeout-ms", "500"),
     ) as pod:
-        below = statuses_at(pod, 250)  # L < T -> served
-        above = statuses_at(pod, 900)  # L > T -> timed out
+        below = status_at_depth(pod, deep, 250)  # L < T -> served
+        above = status_at_depth(pod, deep, 900)  # L > T -> timed out
         expect(
-            all(below[d] == 200 for d in depths),
-            "timeout boundary T=500: L=250ms (<T) serves 200 at every depth",
-            f"below={below}",
+            below == 200,
+            "timeout boundary T=500 (full depth-3): L=250ms (<T) serves 200",
+            f"status={below}",
         )
         expect(
-            all(above[d] == 502 for d in depths),
-            "timeout boundary T=500: L=900ms (>T) flips to 502 at every depth",
-            f"above={above}",
+            above == 502,
+            "timeout boundary T=500 (full depth-3): L=900ms (>T) flips to 502",
+            f"status={above}",
         )
-        print(f"  TASK-33 boundary T=500ms: L=250 -> {below}; L=900 -> {above}")
+        print(
+            f"  TASK-33 L-vs-T at T=500ms: L=250->{observe_all(pod, 250)}; "
+            f"L=900->{observe_all(pod, 900)} (all-depths OBSERVATION, loopback: "
+            "no depth separation - the honest limit)"
+        )
 
     # Pod B: wider per-hop timeout T=1200ms. The SAME L=900ms that 502'd at T=500
-    # now serves 200 - the boundary MOVED with the timeout (the bite).
+    # now serves 200 at full depth - the boundary MOVED with the timeout (the
+    # bite; falsifiability is this paired with the T=500 L=900->502 above).
     with Pod(
         ctx,
         "timeout-boundary-b",
@@ -2713,15 +2743,16 @@ def scenario_chain_timeout_boundary(ctx: Ctx, expect) -> None:
         daemon_chain=CHAIN_DEPTH,
         daemon_extra_args=("--header-timeout-ms", "1200"),
     ) as pod:
-        moved = statuses_at(pod, 900)  # L < new T -> served again
+        moved = status_at_depth(pod, deep, 900)  # L < new T -> served again
         expect(
-            all(moved[d] == 200 for d in depths),
-            "TASK-33 BITE: L=900ms that flipped 502 at T=500 now serves 200 at "
-            "T=1200 - the 200->502 boundary MOVES with the header timeout",
-            f"moved={moved}",
+            moved == 200,
+            "TASK-33 BITE (full depth-3): L=900ms that flipped 502 at T=500 now "
+            "serves 200 at T=1200 - the 200->502 boundary MOVES with the timeout",
+            f"status={moved}",
         )
         print(
-            f"  TASK-33 boundary MOVED: L=900 at T=1200 -> {moved} (was 502 at T=500)"
+            f"  TASK-33 boundary MOVED: L=900 at T=1200 (full depth) -> {moved} "
+            "(was 502 at T=500)"
         )
 
 

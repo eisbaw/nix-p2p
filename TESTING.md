@@ -202,22 +202,23 @@ Nix is the arbiter, proven separately by the real-build
 `chain-corrupt-bite`); mode 6 wrong-narinfo forwards mutated metadata.
 Mode 8 (throttle) is a crash-window aid, exercised by the crash suite.
 
-**TASK-33 header-timeout ceiling** (`scenario_chain_timeout_boundary`):
-the per-hop upstream header timeout is a **fixed per-hop deadline** that
-does not compose across a daemon chain — an upstream of latency `L` is
-served iff `L + (depth-1)·per_hop_overhead < header_timeout` at every
-hop, so the **outermost** hop 502s first as `L` approaches the timeout.
-The timeout is now configurable (`daemon --header-timeout-ms`, was a
-hardcoded 1000 ms). The boundary is pinned deterministically and shown
-to **move with the timeout**: at `T=500 ms`, `L=250` serves 200 at every
-depth and `L=900` flips to 502 at every depth; at `T=1200 ms` the same
-`L=900` serves 200 again. **Loopback limitation (recorded decision):**
-per-hop connect/send overhead is sub-millisecond on pod loopback, so the
-depth-composition term is below the noise floor — all depths flip
-together at `L≈T` here. A clean *depth-separated* flip is WAN-scale and
-not robustly pinnable on loopback, so the asserted boundary is `L`-vs-`T`
-(moved via `T`); the budget-aware composing-timeout fix is forward-
-carried to wave-2 (task-15), not required by task-33's ACs.
+**TASK-33 header-timeout ceiling** (`scenario_chain_timeout_boundary`,
+task-33 **REOPENED**): the per-hop upstream header timeout is a **fixed
+per-hop deadline** that does not compose across a daemon chain — an
+upstream of latency `L` is served iff `L + (depth-1)·per_hop_overhead <
+header_timeout` at every hop. The timeout is now configurable
+(`daemon --header-timeout-ms`, was a hardcoded 1000 ms). What is
+**honestly pinned** is the `L`-vs-`T` boundary at **full chain depth**,
+shown to **move with the timeout**: at `T=500 ms`, `L=250` (<T) serves
+200 and `L=900` (>T) flips to 502; at `T=1200 ms` the same `L=900` serves
+200 again (the bite is that *pair*, requiring the flip to depend on `T`).
+What is **NOT** claimed: a **depth-pinned** boundary. Per-hop connect/send
+overhead is sub-millisecond on pod loopback, so the depth-composition term
+is below the noise floor and depths 1–3 flip **together** at `L≈T`
+(printed as an observation, never asserted). A clean depth-separated flip
+is WAN-scale; validating it, and the budget-aware composing-timeout fix,
+is the reopened task-33's remaining work, owned by wave-2 (task-15) and
+tied to the real-RTT re-measure (task-35).
 
 **Header hygiene** (`daemon/src/server.rs`, pinned by
 `daemon/tests/header_hygiene.rs`): the daemon is a transparent proxy, so
@@ -236,21 +237,36 @@ it, but an **h2-only** upstream fails **closed** (a fast 502, never a
 hang or mis-decode) — pinned by `h2_only_upstream_fails_closed_not_hang`.
 h2/ALPN is bundled with the wave-2 TLS work (task-24).
 
-**Fuzz / fail-closed** (seeded, deterministic — no entropy/Date flake):
-`narinfo_cache.rs` and `cache.rs` carry 20 000-iteration seeded fuzz
-loops proving no hostile cache key (`..%2f`, absolute, non-base32, NUL,
-absurd length) ever resolves outside the cache root (containment
-asserted structurally; non-vacuous — a valid key IS accepted). A
-5 000-iteration narinfo fuzz proves arbitrary well-formed narinfos
+**Fuzz / fail-closed** (seeded, deterministic — no entropy/Date flake).
+Two distinct guarantees, each with its own claim so neither is over-read:
+- *Daemon narinfo cache key* (`narinfo_cache.rs`, 20 000 iters): a store
+  hash is EXACTLY 32 Nix-base32 characters, so `safe_key` **rejects**
+  wrong length, the non-base32 letters `e o u t`, NUL, uppercase and
+  non-ASCII — proven explicitly — and every accepted key is a single
+  component under root (containment). Non-vacuous: a real key is accepted.
+- *testproxy cache path* (`cache.rs`, 20 000 iters): request paths are NOT
+  base32 (they carry `.nar[.xz]` etc.), so the claim is **containment
+  only** — no path escapes the root — plus a NUL/ASCII-control reject for
+  hygiene. Corpus includes `..%2f`, absolute, unicode, control bytes and
+  absurd lengths.
+A 5 000-iteration narinfo fuzz proves arbitrary well-formed narinfos
 (random ordering, unknown fields, multiple `Sig:`, mixed line endings)
-survive the rewrite (identity) and the disk frame byte-identical. ENOSPC
-in **both** cache layers is proven fail-closed: an unwritable narinfo
-cache **degrades to passthrough** (serves upstream bytes, writes no
-entry, refetches — `enospc_narinfo_cache_degrades_to_passthrough`), and
-an unwritable testproxy cache **fails closed** with a 5xx and no partial
-entry published (`testproxy/tests/enospc.rs`). ENOSPC and EACCES take the
-same write-error branch, so a read-only staging dir faithfully models
-"no space" without a size-limited tmpfs.
+survive **`rewrite::apply` (identity) and the disk frame** byte-identical.
+This is a **unit-level** identity fuzz; **chain-level** byte-identity of a
+real narinfo/NAR through daemon×3 is covered by the e2e
+`chain-s1-and-counts` scenario (the two together, not either overclaimed).
+Write-failure in **both** cache layers is proven fail-closed: an
+unwritable narinfo cache **degrades to passthrough** (serves upstream
+bytes, writes no entry, refetches, leaves no `.tmp` residue —
+`narinfo_cache_write_failure_degrades_to_passthrough`), and an unwritable
+testproxy cache **fails closed** with a 5xx and no partial entry
+(`testproxy/tests/enospc.rs`). Both caches now **reap orphaned `.tmp`
+partials on startup** (crash-between-write-and-rename residue). HONEST
+scope: this is the ENOSPC-**at-open**/EACCES branch (same `install()`
+path as a mid-write ENOSPC); a true byte-N mid-stream ENOSPC needs a
+size-limited tmpfs not mountable rootless — the mid-stream no-poison
+invariant is instead covered by the `CacheWriter` drop-uncommitted unit
+test plus the startup reap.
 
 ## J2 measurement baseline (task-12)
 

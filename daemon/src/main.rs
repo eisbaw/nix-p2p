@@ -82,9 +82,19 @@ impl Config {
                 "--narinfo-cache-dir" => config.narinfo_cache_dir = Some(value()?),
                 "--header-timeout-ms" => {
                     let raw = value()?;
-                    config.header_timeout_ms = raw
+                    let ms: u64 = raw
                         .parse()
                         .map_err(|e| format!("bad --header-timeout-ms {raw:?}: {e}"))?;
+                    // Reject 0 (codex, task-13): a 0 ms header timeout fires before
+                    // any upstream can answer, so EVERY request 502s - a bricked-
+                    // but-superficially-healthy daemon. Require a positive, sane
+                    // value; the upper bound catches a units typo (e.g. seconds).
+                    if !(1..=600_000).contains(&ms) {
+                        return Err(format!(
+                            "bad --header-timeout-ms {ms}: must be 1..=600000 (0 bricks the daemon)"
+                        ));
+                    }
+                    config.header_timeout_ms = ms;
                 }
                 "--store-dir" => config.store_dir = value()?,
                 "--priority" => {
@@ -247,6 +257,26 @@ mod tests {
         assert!(Config::from_args(["--nope".to_string()]).is_err());
         assert!(Config::from_args(["--listen".to_string()]).is_err());
         assert!(Config::from_args(["--priority".to_string(), "abc".to_string()]).is_err());
+    }
+
+    #[test]
+    fn header_timeout_zero_is_rejected() {
+        // 0 ms bricks the daemon (every request 502s before any upstream answer);
+        // reject at parse rather than start a bricked-but-healthy-looking daemon.
+        assert!(
+            Config::from_args(["--header-timeout-ms".to_string(), "0".to_string()]).is_err(),
+            "0 must be rejected"
+        );
+        // Absurd (units typo) is rejected too; a sane value is accepted.
+        assert!(
+            Config::from_args(["--header-timeout-ms".to_string(), "9999999".to_string()]).is_err()
+        );
+        assert_eq!(
+            Config::from_args(["--header-timeout-ms".to_string(), "500".to_string()])
+                .unwrap()
+                .header_timeout_ms,
+            500
+        );
     }
 
     #[test]

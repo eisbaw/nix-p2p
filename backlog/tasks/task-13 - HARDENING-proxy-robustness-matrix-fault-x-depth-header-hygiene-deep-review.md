@@ -4,7 +4,7 @@ title: 'HARDENING: proxy robustness matrix (fault x depth), header hygiene deep 
 status: In Progress
 assignee: []
 created_date: '2026-08-07 21:56'
-updated_date: '2026-08-08 18:06'
+updated_date: '2026-08-08 18:49'
 labels:
   - hardening
 dependencies:
@@ -42,4 +42,10 @@ GATES: just build/lint/test green; just e2e 22/22 scenarios green; nix build .#d
 Fuzz seeds (deterministic): narinfo_cache traversal 0x1234_5678_9abc_def0; narinfo identity 0xdead_beef_cafe_0001; testproxy cache traversal 0x0bad_c0de_dead_1234.
 
 EXPLICIT RE-DEFER (owner-visible, not silent): the task-10 forward-carry 'VM-level fault re-assertion' (re-assert the 3 tamper narinfos + testproxy fault modes THROUGH the systemd nix-daemon in the VM, with the task-5 message strings, using nix-validity oracles) is NOT done in task-13. Reason: it is ADDITIVE coverage on an enforcement path already proven daemon-side (task-5 containers) and positive-side in the VM (task-10); the 4 formal ACs (container-tier fault x depth matrix, header hygiene, fuzz, inbox) are met and deep. Re-deferred to task-14 (the other hardening task, already VM/e2e-vm-capable) - recorded there. Not a red AC row; a scoped forward-carry.
+
+RE-GATE ROUND (codex NO-GO -> fixed, re-parked awaiting re-gate). Addressed all 6 findings + fold-ins, each with fails-before/passes-after mutation:
+CORRECTNESS BUGS (daemon/src): (1) obs-text Connection bypass - connection_listed_tokens now parses RAW BYTES not to_str() (which fails on obs-text and silently forwarded named hop tokens) and strips every listed token incl close/keep-alive; bite: 'Connection: X-Hop, \xff' no longer leaks X-Hop. (2) Transfer-Encoding multi-coding - has_unsupported_transfer_coding fails closed (502) in forward() AND respond_narinfo() when TE names any coding beyond chunked/identity; proven LOAD-BEARING (200 without it - hyper does NOT self-fail); wire test added. (6) --header-timeout-ms 0 rejected at parse (require 1..=600000); narinfo body BOUNDED (2 MiB Limited) in server respond_narinfo AND narinfo_cache fetch; bites proven.
+ORACLES MADE REAL / HONESTLY RESCOPED: (3) ENOSPC - renamed to the real cache-OPEN/EACCES branch it exercises, added .tmp startup reap to testproxy DiskCache (+ immediate partial-tmp cleanup in narinfo cache), no-residue asserts; documented byte-N mid-stream ENOSPC is not rootless-simulable (covered by CacheWriter drop-uncommitted test + startup reap); bites proven. (4) task-33 depth 'boundary' did not vary depth honestly - REOPENED task-33 (via CLI, reason recorded), rescoped the e2e scenario to an honest L-vs-T pin at FULL depth (no depth-pinned claim; all-depths printed as observation), added latency TIMING EVIDENCE to matrix mode1 (200ms injected/observed). (5) identity fuzz relabeled UNIT-level (rewrite+frame) with chain identity delegated to e2e chain-s1; safe_key tightened to real nix-base32 alphabet + length 32 (rejects e/o/u/t, wrong length, NUL, unicode - proven), so 'non-base32 rejected' is now TRUE; testproxy claim reduced to containment + control-byte reject.
+FOLD-INS: upstream.rs doc repointed task-33 -> task-15/task-35; qa N1 falsifiability-is-the-pair comment added to the boundary scenario.
+GATES (re-gate): just lint green; full workspace cargo test 17/17 binaries green; just e2e 22/22 scenarios green (matrix 29/29 incl. mode1 timing evidence; boundary 7/7 rescoped); nix build .#daemon green. Each of the 8 fixes shown fail-before/pass-after by mutation (cargo test -p <crate> recompiles the mutated crate; e2e image rebuilt via nix). task-33 now OPEN (budget-aware/WAN fix -> task-15/task-35). Re-parked In Progress awaiting re-gate.
 <!-- SECTION:NOTES:END -->

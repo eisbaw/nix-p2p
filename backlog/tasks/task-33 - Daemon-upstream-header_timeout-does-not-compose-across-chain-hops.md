@@ -1,10 +1,10 @@
 ---
 id: TASK-33
 title: Daemon upstream header_timeout does not compose across chain hops
-status: Done
+status: To Do
 assignee: []
 created_date: '2026-08-08 14:29'
-updated_date: '2026-08-08 17:58'
+updated_date: '2026-08-08 18:41'
 labels:
   - finding
   - wave-2
@@ -26,12 +26,14 @@ Consider (wave-2 / task-13 fault x depth matrix, task-25 daemon timeouts): make 
 
 ## Acceptance Criteria
 <!-- AC:BEGIN -->
-- [x] #1 The header-timeout-at-depth behavior is either made depth/budget-aware or explicitly documented as a known ceiling with the upstream-latency vs chain-depth relationship stated
-- [x] #2 A fault x depth scenario pins the depth at which a given upstream latency flips 200 -> 502 (bite: the boundary moves when the timeout or depth changes)
+- [ ] #1 The header-timeout-at-depth behavior is either made depth/budget-aware or explicitly documented as a known ceiling with the upstream-latency vs chain-depth relationship stated
+- [ ] #2 A fault x depth scenario pins the depth at which a given upstream latency flips 200 -> 502 (bite: the boundary moves when the timeout or depth changes)
 <!-- AC:END -->
 
 ## Implementation Notes
 
 <!-- SECTION:NOTES:BEGIN -->
 CLOSED by task-13. AC#1 (documented ceiling): UpstreamHttp::with_header_timeout now documents the exact relationship - an upstream of header-latency L is served iff L + (depth-1)*per_hop_overhead < header_timeout at every hop, so the OUTERMOST hop 502s first as L approaches the timeout. Also made the per-hop timeout CONFIGURABLE via daemon --header-timeout-ms (was hardcoded 1000ms). AC#2 (boundary pinned + moves): e2e scenario chain-timeout-boundary pins it deterministically - at T=500ms L=250 serves 200 at all depths, L=900 flips to 502 at all depths; at T=1200ms the SAME L=900 serves 200 again (boundary MOVES with the timeout - the bite). LOOPBACK LIMITATION (explicit decision): per-hop connect/send overhead is sub-millisecond on pod loopback, so the DEPTH-composition term is below the noise floor and all depths flip together at L~=T; a clean depth-separated flip is WAN-scale and not robustly pinnable on loopback, so the pinned+asserted boundary is L-vs-T (moved via T). The deeper budget-aware/composing-timeout fix is a larger change; forward-carried to task-15 (wave-2 re-plan), NOT required by these ACs which offered the documentation route.
+
+REOPENED by task-13 re-gate (codex NO-GO). The task-13 closure rested on a depth-pinned boundary that does NOT hold: on pod loopback the per-hop connect/send overhead is sub-millisecond, so the fixed-per-hop-timeout composition term is below the noise floor and the e2e scenario could not honestly separate depth 1 from depth 3 (asserting identical results across depths while varying T is not a depth pin). What task-13 DID deliver and keeps: (a) AC#1 documentation of the L+(depth-1)*overhead < T ceiling relationship (UpstreamHttp::with_header_timeout); (b) a configurable --header-timeout-ms knob; (c) an HONEST L-vs-T boundary pin at FULL chain depth, shown to MOVE with T (scenario_chain_timeout_boundary, rescoped - no depth-boundary claim). STILL OPEN (the real work): a depth/budget-AWARE composing timeout, and validating the depth-composition at real WAN RTT where the term is observable (ties to task-35). Owner: wave-2 (task-15 re-plan).
 <!-- SECTION:NOTES:END -->

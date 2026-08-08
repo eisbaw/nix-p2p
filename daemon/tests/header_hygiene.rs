@@ -178,6 +178,101 @@ async fn h2_only_upstream_fails_closed_not_hang() {
     let _ = addr; // silence unused on some cfgs
 }
 
+/// A raw byte-exact origin: every connection gets `response` verbatim after the
+/// request head is drained. Needed for wire cases the String-keyed MockUpstream
+/// cannot express - obs-text (0x80-0xFF) header bytes and a real chunked
+/// Transfer-Encoding.
+fn raw_origin(response: &'static [u8]) -> SocketAddr {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("raw origin binds");
+    let addr = listener.local_addr().unwrap();
+    std::thread::spawn(move || {
+        for incoming in listener.incoming() {
+            let Ok(mut stream) = incoming else { continue };
+            std::thread::spawn(move || {
+                // Drain the request head so the client's write completes.
+                let mut buf = [0u8; 2048];
+                let _ = stream.read(&mut buf);
+                let _ = stream.write_all(response);
+                let _ = stream.flush();
+            });
+        }
+    });
+    addr
+}
+
+/// obs-text Connection bypass (codex, task-13): a `Connection` value carrying a
+/// non-ASCII (obs-text) byte makes `to_str()` fail; a silent skip there would
+/// FORWARD the fields the header named. Byte parsing still extracts and strips
+/// `X-Hop`. BITE: `Connection: X-Hop, \xff` + `X-Hop: leak` must NOT leak X-Hop.
+#[tokio::test]
+async fn obs_text_connection_value_still_strips_named_hop_header() {
+    // 0xFF is valid obs-text in a header value but breaks to_str().
+    let response: &[u8] = b"HTTP/1.1 200 OK\r\n\
+        Content-Length: 2\r\n\
+        Connection: X-Hop, \xff\r\n\
+        X-Hop: leak\r\n\
+        X-Kept: yes\r\n\
+        \r\nok";
+    let addr = raw_origin(response);
+    let (daemon, _h) = spawn_daemon(&format!("http://{addr}")).await;
+    let r = get(daemon, "/log/x").await;
+    assert_eq!(r.status, Some(200), "response should still be forwarded");
+    assert!(
+        r.header("x-hop").is_none(),
+        "a Connection-listed token must be stripped even when the Connection \
+         value has obs-text; saw {:?}",
+        r.header("x-hop")
+    );
+    assert_eq!(
+        r.header("x-kept"),
+        Some("yes"),
+        "an unlisted header must still be forwarded (non-vacuous)"
+    );
+}
+
+/// Multi-coding Transfer-Encoding (codex, task-13): hyper strips only the final
+/// `chunked` framing, so `Transfer-Encoding: gzip, chunked` would forward
+/// still-gzipped bytes with the coding forgotten. The daemon must FAIL CLOSED
+/// (502), never emit a body whose declared coding disagrees with its bytes.
+#[tokio::test]
+async fn multi_coding_transfer_encoding_fails_closed() {
+    // A valid chunked body ("hello"), but TE names gzip underneath chunked.
+    let response: &[u8] = b"HTTP/1.1 200 OK\r\n\
+        Transfer-Encoding: gzip, chunked\r\n\
+        \r\n5\r\nhello\r\n0\r\n\r\n";
+    let addr = raw_origin(response);
+    let (daemon, _h) = spawn_daemon(&format!("http://{addr}")).await;
+    let r = get(daemon, "/log/x").await;
+    assert_eq!(
+        r.status,
+        Some(502),
+        "an unsupported multi-coding Transfer-Encoding must fail closed, got {:?}",
+        r.status
+    );
+    assert_ne!(
+        r.body_string().trim(),
+        "hello",
+        "the daemon must NOT forward the undecoded/mislabeled body"
+    );
+}
+
+/// Bounded narinfo body (codex, task-13): an oversized narinfo must be rejected
+/// (502), not buffered into OOM. MAX_NARINFO_BYTES is 2 MiB; serve 3 MiB.
+#[tokio::test]
+async fn oversized_narinfo_is_rejected_not_buffered() {
+    let big = vec![b'x'; 3 * 1024 * 1024];
+    let upstream =
+        MockUpstream::start(move |_m, _p| MockResponse::ok("text/x-nix-narinfo", big.clone()));
+    let (daemon, _h) = spawn_daemon(&upstream.base_url()).await;
+    let r = get(daemon, "/00000000000000000000000000000000.narinfo").await;
+    assert_eq!(
+        r.status,
+        Some(502),
+        "a narinfo over the buffer bound must fail closed, got {:?}",
+        r.status
+    );
+}
+
 /// A local sanity assert that the mock/daemon plumbing above is not vacuous:
 /// a plain end-to-end header with no special handling is forwarded.
 #[tokio::test]

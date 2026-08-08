@@ -108,8 +108,10 @@ impl UpstreamHttp {
     /// sub-millisecond, so the observable flip is governed by L vs
     /// `header_timeout` (depth-composition is real but WAN-scale, below the
     /// loopback noise floor - see TESTING.md). Making the deadline budget-aware
-    /// across hops is the wave-2 fix kept on task-33; exposing this knob lets an
-    /// operator (and the e2e boundary pin) move the ceiling deliberately.
+    /// across hops (and validating it at real WAN RTT) is wave-2 work owned by
+    /// task-15 (re-plan) and task-33/task-35 (the reopened finding + real-upstream
+    /// re-measure); exposing this knob lets an operator (and the e2e boundary pin)
+    /// move the L-vs-T ceiling deliberately.
     pub fn with_header_timeout(mut self, header_timeout: Duration) -> Self {
         self.header_timeout = header_timeout;
         self

@@ -77,6 +77,17 @@ use http_body_util::BodyExt;
 use crate::catalog::{CorrelationStore, NarMeta};
 use crate::source::{NarHash, NarinfoSource, SourceError, StoreHash, UpstreamResponse};
 
+/// Upper bound on a buffered narinfo body at the cache layer (codex, task-13).
+const MAX_NARINFO_CACHE_BYTES: usize = 2 * 1024 * 1024;
+
+/// The Nix base32 alphabet: `[0-9a-z]` MINUS `e o u t` (32 symbols). A store-path
+/// hash is EXACTLY 32 of these. Used to reject a hostile or malformed cache key
+/// before it can name a file (task-13: the "non-base32 rejected" claim, made true).
+const NIX_BASE32: &[u8] = b"0123456789abcdfghijklmnpqrsvwxyz";
+
+/// Length of a Nix store-path hash in base32 characters.
+const STORE_HASH_LEN: usize = 32;
+
 /// Positive narinfo TTL: 30 days, matching Nix's default `narinfo-cache-positive-ttl`.
 pub const POSITIVE_TTL: Duration = Duration::from_secs(30 * 24 * 3600);
 /// Negative narinfo TTL: 3600 s, matching Nix's default `narinfo-cache-negative-ttl`.
@@ -318,6 +329,9 @@ impl NarinfoDiskCache {
         let bytes = entry.encode();
         if let Err(err) = write_durably(&tmp, &bytes) {
             eprintln!("narinfo-cache: write tmp {tmp:?}: {err}");
+            // A mid-write failure (e.g. ENOSPC) leaves a partial tmp; remove it
+            // now rather than wait for the next startup reap (task-13 hygiene).
+            let _ = std::fs::remove_file(&tmp);
             return;
         }
         if let Err(err) = std::fs::rename(&tmp, &final_path) {
@@ -401,12 +415,17 @@ impl NarinfoSource for NarinfoDiskCache {
         }
 
         // A 200: buffer the body so we can validate before caching AND serve it.
+        // Bounded (codex, task-13): a narinfo past MAX_NARINFO_CACHE_BYTES is not a
+        // narinfo; fail closed rather than buffer unboundedly into OOM.
         let headers = resp.headers.clone();
-        let bytes = resp
-            .body
+        let bytes = http_body_util::Limited::new(resp.body, MAX_NARINFO_CACHE_BYTES)
             .collect()
             .await
-            .map_err(|e| SourceError::Upstream(format!("reading narinfo body: {e}")))?
+            .map_err(|e| {
+                SourceError::Upstream(format!(
+                    "reading narinfo body (or exceeds {MAX_NARINFO_CACHE_BYTES} B): {e}"
+                ))
+            })?
             .to_bytes();
 
         // VALIDATE-THEN-RENAME: a truncated/short narinfo is not well-formed, so
@@ -517,17 +536,18 @@ pub fn is_well_formed_narinfo(body: &[u8]) -> bool {
     store_path && url && nar_hash && nar_size && references && sig
 }
 
-/// Reject a store hash that is not a safe, single-component filename. Nix store
-/// hashes are lowercase base32 (`[0-9a-z]`), so anything with a separator, dot,
-/// or other character is hostile (path traversal) and bypasses the cache.
+/// Reject a store hash that is not a valid Nix store-path hash. A real hash is
+/// EXACTLY [`STORE_HASH_LEN`] characters from the [`NIX_BASE32`] alphabet, so any
+/// separator, dot, wrong length, NUL, non-base32 letter (`e o u t`), uppercase or
+/// non-ASCII is hostile or malformed and bypasses the cache (task-13: the
+/// containment guard AND the "non-base32 / wrong-length rejected" claim). Enforced
+/// here rather than approximated with `[0-9a-z]` so the claim is exactly true.
 fn safe_key(store_hash: &str) -> Option<String> {
-    if store_hash.is_empty() || store_hash.len() > 255 {
+    let bytes = store_hash.as_bytes();
+    if bytes.len() != STORE_HASH_LEN {
         return None;
     }
-    if store_hash
-        .bytes()
-        .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit())
-    {
+    if bytes.iter().all(|b| NIX_BASE32.contains(b)) {
         Some(store_hash.to_string())
     } else {
         None
@@ -638,16 +658,43 @@ NarSize: 40";
         assert!(Entry::decode(&raw).is_none());
     }
 
+    // A canonical valid 32-char nix-base32 store hash (no e/o/u/t).
+    const VALID_KEY: &str = "0a0lslqb6gbqnj6xqjlaljjqg6kgb3wz";
+
     #[test]
     fn safe_key_rejects_traversal() {
         assert!(safe_key("../etc/passwd").is_none());
         assert!(safe_key("a/b").is_none());
         assert!(safe_key("a.b").is_none());
         assert!(safe_key("UPPER").is_none());
-        assert_eq!(
-            safe_key("0a0lslqb6gbqnj6xq").as_deref(),
-            Some("0a0lslqb6gbqnj6xq")
+        assert_eq!(safe_key(VALID_KEY).as_deref(), Some(VALID_KEY));
+    }
+
+    #[test]
+    fn safe_key_enforces_nix_base32_alphabet_and_length() {
+        assert_eq!(VALID_KEY.len(), STORE_HASH_LEN);
+        assert!(safe_key(VALID_KEY).is_some());
+        // Wrong length (a store hash is EXACTLY 32): reject shorter and longer.
+        assert!(safe_key(&VALID_KEY[..31]).is_none(), "31 chars must reject");
+        assert!(
+            safe_key(&format!("{VALID_KEY}0")).is_none(),
+            "33 chars must reject"
         );
+        // Non-base32 letters e/o/u/t (correct length) must reject.
+        for bad in ['e', 'o', 'u', 't'] {
+            let key: String = std::iter::once(bad)
+                .chain(VALID_KEY.chars().skip(1))
+                .collect();
+            assert_eq!(key.len(), STORE_HASH_LEN);
+            assert!(safe_key(&key).is_none(), "nix-base32 must reject {bad:?}");
+        }
+        // NUL, uppercase and unicode (correct length) must reject.
+        assert!(safe_key(&format!("{}\0", &VALID_KEY[..31])).is_none());
+        assert!(safe_key(&VALID_KEY.to_uppercase()).is_none());
+        let unicode: String = std::iter::once('é')
+            .chain(VALID_KEY.chars().skip(1))
+            .collect();
+        assert!(safe_key(&unicode).is_none(), "non-ascii must reject");
     }
 
     // ---- AC#3 fuzz: cache-key path traversal must never escape root ---------
@@ -778,6 +825,15 @@ NarSize: 40";
     /// Generate a well-formed narinfo with random field ORDERING, random unknown
     /// fields, multiple `Sig:` lines, empty `References`, and mixed line endings.
     /// This extends task-8's byte-verbatim property to a fuzzed corpus.
+    ///
+    /// SCOPE (codex re-gate): this is a UNIT-level identity fuzz over the two
+    /// transforms the daemon applies to a narinfo - `rewrite::apply` (identity in
+    /// wave 1) and the disk-cache frame encode/decode. It does NOT fetch through a
+    /// daemon chain. CHAIN-level byte-identity of a real narinfo (and its NAR)
+    /// through daemon x N is covered by the e2e `chain-s1-and-counts` scenario,
+    /// which asserts the client-side NarHash matches the signed manifest through
+    /// three hops. The two together cover "arbitrary fields survive" (here) and
+    /// "survives the real chain" (e2e) without overclaiming either.
     fn random_narinfo(rng: &mut Rng) -> Vec<u8> {
         let mut fields: Vec<String> = vec![
             "StorePath: /nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-x".into(),

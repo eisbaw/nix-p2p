@@ -30,16 +30,30 @@ impl DiskCache {
     /// Create (if needed) the cache root and its sibling `.tmp` directory.
     /// The tmp dir lives *under* the root so `rename` stays within one
     /// filesystem and therefore stays atomic.
+    ///
+    /// Reaps any orphaned `.tmp/*` files a previous crash left BETWEEN write and
+    /// rename (task-13 codex finding): a completed write is always renamed out of
+    /// `.tmp`, so anything still there is a dead partial and never a servable
+    /// entry - removing it on startup stops the staging area leaking across
+    /// restarts (the narinfo cache already does this; the testproxy cache now
+    /// matches).
     pub fn new(root: PathBuf) -> io::Result<Self> {
         let tmp_dir = root.join(".tmp");
         fs::create_dir_all(&tmp_dir)?;
+        if let Ok(dir) = fs::read_dir(&tmp_dir) {
+            for entry in dir.flatten() {
+                let _ = fs::remove_file(entry.path());
+            }
+        }
         Ok(DiskCache { root, tmp_dir })
     }
 
     /// Map a request path to its on-disk location, rejecting anything that
-    /// could escape the cache root. A fixture still gets a sanitised path:
-    /// `..`, empty and current-dir components are refused (fail fast) rather
-    /// than silently normalised.
+    /// could escape the cache root or name a hostile file. A fixture still gets a
+    /// sanitised path: `..`, empty, current-dir, and any component carrying a NUL
+    /// or ASCII control byte are refused (fail fast) rather than silently
+    /// normalised. Containment is the load-bearing guarantee; the control-byte
+    /// reject is hygiene (a NUL in a cache filename is always hostile/invalid).
     pub fn resolve(&self, request_path: &str) -> Option<PathBuf> {
         let relative = request_path.strip_prefix('/').unwrap_or(request_path);
         if relative.is_empty() {
@@ -47,6 +61,9 @@ impl DiskCache {
         }
         for component in relative.split('/') {
             if component.is_empty() || component == "." || component == ".." {
+                return None;
+            }
+            if component.bytes().any(|b| b < 0x20 || b == 0x7f) {
                 return None;
             }
         }
@@ -188,12 +205,56 @@ mod tests {
     }
 
     #[test]
+    fn resolve_rejects_control_bytes_and_reaps_tmp() {
+        let root = scratch();
+        {
+            let cache = DiskCache::new(root.clone()).unwrap();
+            // Control/NUL bytes in a component are rejected (contained anyway, but
+            // hostile/invalid as a filename).
+            assert!(cache.resolve("/nar/a\0b.nar").is_none(), "NUL rejected");
+            assert!(
+                cache.resolve("/nar/a\x01b").is_none(),
+                "control byte rejected"
+            );
+            assert!(cache.resolve("/nar/ok.nar").is_some());
+            // Plant an orphan .tmp file (a crash-between-write-and-rename residue).
+            fs::write(cache.tmp_dir.join("orphan-123"), b"partial").unwrap();
+            assert!(cache.tmp_dir.join("orphan-123").exists());
+        }
+        // A fresh cache over the SAME root sweeps the staging area on startup.
+        let cache2 = DiskCache::new(root.clone()).unwrap();
+        assert!(
+            !cache2.tmp_dir.join("orphan-123").exists(),
+            "startup must reap orphaned .tmp partials (no leak across restart)"
+        );
+    }
+
+    #[test]
     fn fuzz_request_paths_never_escape_cache_root() {
         let root = scratch();
         let cache = DiskCache::new(root.clone()).unwrap();
         const POISON: &[&str] = &[
-            "..", "../", "..%2f", "/", "//", "etc", "passwd", "nar", "abc.nar", ".", "a", "\0",
-            "%2e%2e", "..\\", "0abc", "x",
+            "..",
+            "../",
+            "..%2f",
+            "/",
+            "//",
+            "etc",
+            "passwd",
+            "nar",
+            "abc.nar",
+            ".",
+            "a",
+            "\0",
+            "%2e%2e",
+            "..\\",
+            "0abc",
+            "x",
+            "café",
+            "ﬁ",
+            "\x7f",
+            "\x01",
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
         ];
         let mut rng = Rng(0x0bad_c0de_dead_1234);
         let mut accepted = 0usize;
