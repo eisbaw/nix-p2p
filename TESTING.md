@@ -557,3 +557,78 @@ find no fixture and go vacuously green. It runs under `just test`
 (fast tier) and `just fixtures-large` (full tier, gates the 110 MiB
 payload). Any CI must invoke those inside `nix develop`, not rely on
 `nix flake check` alone.
+
+# WAVE 2 grounding — real p2p, modeling & profiling (design-for-test)
+
+Companion to PRD "Wave 2 scope". Wave-1 signals S1–S5 still hold; these
+add the p2p and profiling grounding. The trust invariant is UNCHANGED:
+Nix re-verifies sig+NarHash, so the daemon+peers stay outside the TCB;
+a peer can only ever cost a failed-build-and-retry, never a poisoned
+store path. Every p2p acquisition still ends at the `sha256(nar)==NarHash`
+gate (wave-1 S1).
+
+## Acceptance signals
+
+S6. **Peer-served NAR (the core p2p acceptance signal).** In a >=2-node
+testbed, node A resolves a path's NarHash (via the discovery layer),
+fetches the NAR from node B over iroh (whole-blob), and it passes the
+NarHash gate — byte-identical to what cache.nixos.org would serve. The
+measurement (net-upstream-egress-v2) counts this as a VALID 0-egress
+crossing (a real offload). If S6 can pass while bytes crossed the cache
+boundary, or fail while a peer genuinely served it, the instrument is
+lying (wave-1 already grounded that distinction).
+
+S7. **Speedup / offload, measured not asserted.** On the p2p testbed,
+net cache egress with peers vs without is reported per the frozen
+counting rule; a peer HIT shows as 0 payload egress. "Speedup over
+cache.nixos.org" = wall-clock and egress delta, with the honest caveat
+that a container/loopback testbed is not residential-uplink reality.
+
+S8. **Pathological scenarios degrade gracefully (policy-observable).**
+Each pathological case has a DEFINED good behavior; the system never
+serves wrong bytes and never hangs unbounded. The cases + their
+observable good/bad:
+
+| Scenario | Good (observable) | Bad |
+|---|---|---|
+| Slow/throttled peer on a HIT | policy fires (abort->cache, or hedge wins) within a bounded time; build succeeds | build stalls on the slow peer for minutes |
+| Dead/unreachable holder after a positive claim | fast failover to next holder or cache; claim marked stale | hang waiting on a dead NodeId |
+| DHT resolve timeout / cold-start empty index | bounded resolve wait, then cache fallback; never blocks the build path unboundedly | 1-4s DHT latency leaks into every build |
+| NAT-blocked peer | relay path used, or peer skipped fast | undialable peer stalls the fetch |
+| Thundering herd on a popular path | bounded fan-out; no self-DoS; single-flight per path | N concurrent identical fetches |
+| Lying / spam claim | NarHash gate rejects; wasted-dial bounded; peer scored down | attacker-chosen huge blob downloaded in full before the gate |
+| Seeder churn | resolution tolerates holders joining/leaving; no wrong bytes | churn causes a wrong-bytes serve or a crash |
+
+S9. **Profiling models bite (resource/perf estimation).** The scenario
+models estimate RAM, disk, latency, throughput, speedup and extrapolate
+to 10s/100s/1000s of peers (S5 machinery: measure 1..30, regression-fit,
+resource-laws-only caveat, extrapolations labeled model-output). BITE:
+a synthetic workload with known O(n) RAM growth recovers a linear fit;
+a superlinear RAM/latency fit is surfaced as a red flag, not buried. A
+model that reports plausible-but-unfalsifiable numbers is the worst
+outcome (wave-1 oracle-bite lesson applies).
+
+## Policy derivation (findings -> tasks, do NOT pre-hardcode)
+
+The models EXPOSE the policy decisions; wave-2 does not bake a policy
+the data hasn't justified. The archetype (owner-named): on a HIT whose
+transfer is extremely slow, the choices are (a) abort and fall back to
+cache.nixos.org, (b) delayed-race / hedge (start the cache fetch, first
+past the NarHash gate wins, cancel the loser), (c) adaptive by observed
+throughput (abort only if throughput < X for T seconds). The wave-2
+plan includes a MODELING task that characterizes each under the slow-peer
+scenario; the chosen policy is filed as its own task grounded in that
+data, with the loser-bytes cost counted in the hedge_waste channel the
+counting rule reserves.
+
+## Wave-2 frozen surfaces (irreversible — deep-gated in phase 3)
+
+- **Claim wire schema** (version field, payload enum WholeNar{blake3} /
+  future CastoreRoot, reserved fields for signed-narinfo-relay + claim
+  signatures, and a TRANSPORT tag so BitTorrent is not a network fork).
+- **DHT key derivation** (NarHash -> DHT key mapping; which DHT).
+- **Addressed-unit encoding** (raw-NAR BLAKE3 per PRD; the byte a peer
+  is asked for).
+These freeze the moment two independent daemons interoperate; changing
+them splits the network. Everything else (transport internals, the
+profiler, policy thresholds, gossip) is a velocity surface.
