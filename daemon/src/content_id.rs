@@ -6,8 +6,9 @@
 //! iroh, no BitTorrent, no ALPN. Those are transport-specific LOCATORS and live in
 //! [`crate::transport`]. Keeping the content identity here, with zero transport
 //! knowledge, is precisely what lets a second transport (BitTorrent, a future
-//! webseed) be added WITHOUT forking the supply network: every transport offer
-//! carries this same universal identity plus its own locator (see
+//! webseed) be added WITHOUT forking the supply network: the content identity
+//! appears exactly once per claim (in the payload / `Have`), and each transport
+//! offer is a PURE LOCATOR that carries no digest of its own (see
 //! [`crate::claim`]).
 //!
 //! ## The addressed unit: `RawNarV1`

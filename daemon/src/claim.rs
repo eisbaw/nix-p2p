@@ -66,9 +66,11 @@
 //! FROZEN by task-48, in two deliberately separated modules this one composes:
 //!   * [`crate::content_id::Blake3Digest`] - the UNIVERSAL, transport-independent
 //!     content identity (`BLAKE3(RawNarV1)`, canonical string `blake3:<hex>`). It
-//!     appears EXACTLY ONCE per claim - in the payload ([`KnownPayload::WholeNar`])
-//!     or once per [`HoldAnswer::Have`]; it is the byte a peer is asked for on any
-//!     transport.
+//!     appears AT MOST ONCE per claim - in a known payload
+//!     ([`KnownPayload::WholeNar`]) or once per [`HoldAnswer::Have`]; an absent or
+//!     unknown-kind payload carries none. It is never duplicated (transport offers
+//!     are pure locators), so a claim can never name two different blobs; it is the
+//!     byte a peer is asked for on any transport.
 //!   * [`crate::transport::NodeId`] / [`crate::transport::BitTorrentInfoHash`] -
 //!     the per-TRANSPORT locators (an iroh ed25519 key; a BitTorrent infohash). A
 //!     transport offer carries ONLY its locator, never the content digest, so a
