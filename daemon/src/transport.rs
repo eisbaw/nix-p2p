@@ -63,9 +63,18 @@ pub const NODE_ID_LEN: usize = 32;
 /// A holder's iroh network identity: an ed25519 public key. Transport-specific
 /// (an iroh coordinate, not a universal content identity).
 ///
-/// Canonical wire string: 64 lowercase hex chars (no prefix - it is a bare key,
-/// matching how iroh treats a `NodeId`). Convert to/from the raw 32 bytes for the
-/// iroh handle via [`NodeId::from_bytes`]/[`NodeId::as_bytes`].
+/// Canonical wire string: 64 LOWERCASE hex chars (no prefix - it is a bare key,
+/// matching how iroh treats a `NodeId`; uppercase is rejected on decode, see
+/// [`crate::hexfmt`]). Convert to/from the raw 32 bytes for the iroh handle via
+/// [`NodeId::from_bytes`]/[`NodeId::as_bytes`].
+///
+/// STRUCTURAL VALIDATION (codex finding 5): this validates length and lowercase
+/// hex, but NOT that the 32 bytes are a valid ed25519 curve point. That check
+/// needs the pinned iroh constructor (`iroh::PublicKey::from_bytes`, which
+/// rejects a non-canonical point) and so DEFERS to task-39, exactly like the
+/// `IROH_BLOBS_ALPN == iroh_blobs::ALPN` assert. Stated so the deferral is a
+/// decision, not an oversight: a non-point NodeId is undiallable and fails loudly
+/// at connect time, it cannot corrupt content addressing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct NodeId([u8; NODE_ID_LEN]);
 

@@ -9,6 +9,12 @@
 //! any transport crate's `Display` choice (iroh's own string form is a transport
 //! detail we convert to/from via raw bytes, never depend on).
 //!
+//! FROZEN RULE (task-48 re-gate, codex finding 5): the canonical encoding is
+//! LOWERCASE hex, and decode REJECTS uppercase. One string encodes each value, so
+//! two implementations cannot disagree about a canonical identity and a
+//! byte-for-byte wire comparison is exact. (nix-base32 for `NarHash` is likewise
+//! lowercase-only - see [`crate::nixbase32`].)
+//!
 //! Kept tiny and dependency-free on purpose: a `hex` crate would be one more
 //! thing the daemon and testproxy could accidentally converge on, and this is six
 //! lines. `pub(crate)` - it is an encoding utility, not part of the frozen API.
@@ -32,7 +38,9 @@ pub(crate) fn encode(bytes: &[u8]) -> String {
 pub(crate) enum HexError {
     /// The string was not exactly `2 * expected_len` characters.
     WrongLength { expected_chars: usize, found: usize },
-    /// A character outside `[0-9a-fA-F]` appeared at `index`.
+    /// A character outside `[0-9a-f]` appeared at `index`. Uppercase is
+    /// deliberately rejected: the frozen canonical form is lowercase (see module
+    /// docs), so exactly one string encodes each value.
     NonHexChar { index: usize },
 }
 
@@ -50,9 +58,19 @@ impl std::fmt::Display for HexError {
     }
 }
 
-/// Decode a lowercase-or-uppercase hex string into exactly `N` bytes. The length
-/// is checked FIRST so a truncated identity is a clean `WrongLength`, never a
-/// silent partial decode.
+/// A single LOWERCASE hex nibble (`0-9a-f`). Uppercase returns `None` on purpose:
+/// the frozen canonical form is lowercase, so decode is strict about it.
+fn lower_nibble(b: u8) -> Option<u8> {
+    match b {
+        b'0'..=b'9' => Some(b - b'0'),
+        b'a'..=b'f' => Some(b - b'a' + 10),
+        _ => None,
+    }
+}
+
+/// Decode a LOWERCASE hex string into exactly `N` bytes. The length is checked
+/// FIRST so a truncated identity is a clean `WrongLength`, never a silent partial
+/// decode; uppercase is rejected as `NonHexChar` (frozen lowercase canonical).
 pub(crate) fn decode_fixed<const N: usize>(hex: &str) -> Result<[u8; N], HexError> {
     if hex.len() != N * 2 {
         return Err(HexError::WrongLength {
@@ -63,13 +81,9 @@ pub(crate) fn decode_fixed<const N: usize>(hex: &str) -> Result<[u8; N], HexErro
     let mut out = [0u8; N];
     let bytes = hex.as_bytes();
     for (i, slot) in out.iter_mut().enumerate() {
-        let hi = (bytes[i * 2] as char)
-            .to_digit(16)
-            .ok_or(HexError::NonHexChar { index: i * 2 })?;
-        let lo = (bytes[i * 2 + 1] as char)
-            .to_digit(16)
-            .ok_or(HexError::NonHexChar { index: i * 2 + 1 })?;
-        *slot = ((hi << 4) | lo) as u8;
+        let hi = lower_nibble(bytes[i * 2]).ok_or(HexError::NonHexChar { index: i * 2 })?;
+        let lo = lower_nibble(bytes[i * 2 + 1]).ok_or(HexError::NonHexChar { index: i * 2 + 1 })?;
+        *slot = (hi << 4) | lo;
     }
     Ok(out)
 }
@@ -87,13 +101,9 @@ pub(crate) fn decode_var(hex: &str) -> Result<Vec<u8>, HexError> {
     let bytes = hex.as_bytes();
     let mut out = Vec::with_capacity(hex.len() / 2);
     for i in 0..hex.len() / 2 {
-        let hi = (bytes[i * 2] as char)
-            .to_digit(16)
-            .ok_or(HexError::NonHexChar { index: i * 2 })?;
-        let lo = (bytes[i * 2 + 1] as char)
-            .to_digit(16)
-            .ok_or(HexError::NonHexChar { index: i * 2 + 1 })?;
-        out.push(((hi << 4) | lo) as u8);
+        let hi = lower_nibble(bytes[i * 2]).ok_or(HexError::NonHexChar { index: i * 2 })?;
+        let lo = lower_nibble(bytes[i * 2 + 1]).ok_or(HexError::NonHexChar { index: i * 2 + 1 })?;
+        out.push((hi << 4) | lo);
     }
     Ok(out)
 }
@@ -131,10 +141,13 @@ mod tests {
     }
 
     #[test]
-    fn accepts_uppercase_but_encode_is_lowercase() {
-        // Decoding is lenient (uppercase accepted) but the canonical encode is
-        // always lowercase, so a round-trip normalises case.
-        let decoded = decode_fixed::<2>("AABB").unwrap();
-        assert_eq!(encode(&decoded), "aabb");
+    fn rejects_uppercase_so_canonical_is_lowercase_only() {
+        // Frozen rule: decode is lowercase-only, so exactly one string encodes a
+        // value and a wire comparison is exact.
+        assert_eq!(
+            decode_fixed::<2>("AABB"),
+            Err(HexError::NonHexChar { index: 0 })
+        );
+        assert_eq!(decode_fixed::<2>("aabb").unwrap(), [0xaa, 0xbb]);
     }
 }

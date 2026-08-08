@@ -26,6 +26,7 @@ pub mod claim;
 pub mod content_id;
 mod hexfmt;
 pub mod narinfo_cache;
+mod nixbase32;
 pub mod rewrite;
 pub mod server;
 pub mod source;
@@ -36,9 +37,10 @@ pub use cacheinfo::CacheInfo;
 pub use catalog::{CorrelationStore, NarCatalog, NarMeta, NullCorrelation};
 pub use claim::{
     CLAIM_SCHEMA_VERSION, Claim, ClaimCodecError, ClaimPayload, ClaimSignature, HoldAnswer,
-    HoldQuery, HoldResponse, KnownPayload, KnownTransport, NarHashKey, QUERY_SCHEMA_VERSION,
-    SignedNarinfoRelay, TransportOffer, decode_claim, decode_hold_query, decode_hold_response,
-    encode_claim, encode_hold_query, encode_hold_response,
+    HoldQuery, HoldResponse, KnownPayload, KnownTransport, NAR_HASH_LEN, NAR_HASH_PREFIX,
+    NarHashKey, NarHashKeyParseError, QUERY_SCHEMA_VERSION, SignedNarinfoRelay, TransportOffer,
+    decode_claim, decode_hold_query, decode_hold_response, encode_claim, encode_hold_query,
+    encode_hold_response,
 };
 pub use content_id::{
     BLAKE3_DIGEST_LEN, BLAKE3_DOMAIN_SEPARATION, BLAKE3_PREFIX, Blake3Digest, DigestParseError,

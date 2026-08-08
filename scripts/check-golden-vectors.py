@@ -29,6 +29,7 @@ violation), 2 the fixture tree or environment is missing so nothing was proven.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import sys
 from pathlib import Path
@@ -150,10 +151,30 @@ def check_fixture_vector(golden: dict, generation: Path, manifest: dict) -> None
             "A second derivation did NOT match byte-for-byte. Either the fixture "
             "bytes changed or the golden is wrong; both are freeze violations."
         )
+
+    # INDEPENDENTLY compute the NarHash from the raw NAR bytes rather than trusting
+    # the manifest (codex finding 4): sha256(raw) in Nix base-32. This catches a
+    # wrong manifest NarHash instead of comparing the manifest to itself, and it
+    # cross-checks the Rust nixbase32 encoder against Python's on the same digest.
+    computed_narhash = "sha256:" + fx.nix_base32(hashlib.sha256(raw).digest())
+    for label, expected in (
+        ("golden", fixture["nar_hash"]),
+        ("manifest", entry["nar_hash"]),
+    ):
+        if computed_narhash != expected:
+            fail(
+                f"NarHash MISMATCH vs {label} (finding 4):\n"
+                f"  {label} says: {expected}\n"
+                f"  sha256(raw NAR) is: {computed_narhash}\n"
+                "The NarHash is derived independently from the bytes here, so a "
+                "wrong recorded value is caught, not trusted."
+            )
+
     ok(
         f"addressed unit re-derived from {entry['url']} "
         f"({len(raw)} raw NAR bytes): BLAKE3 matches the committed golden "
-        f"{fixture['blake3']}, NarHash {fixture['nar_hash']}"
+        f"{fixture['blake3']}; independently-computed NarHash {computed_narhash} "
+        "matches golden and manifest"
     )
 
 

@@ -98,35 +98,116 @@ pub const QUERY_SCHEMA_VERSION: u16 = 1;
 // (per-transport) and are composed here. See the module docs.
 // -------------------------------------------------------------------------
 
-/// The content identity a claim/query is ABOUT: the signed `NarHash` (the
-/// wave-1 [`crate::source::NarKey::SignedNarHash`] seam key, keyed on by the
-/// correlation catalog).
-///
-/// This is the wire-serializable TWIN of the seam's [`NarHash`], kept as its own
-/// newtype rather than adding serde to the frozen wave-1 `source.rs`: wire
-/// encoding is a claim-layer concern, and the frozen seam type stays untouched.
-/// [`From`]/[`NarHashKey::to_nar_hash`] bridge the two so `NarHash` remains the
-/// single semantic source of truth. Follow-up (task-48): consider unifying by
-/// adding serde to the seam type once its encoding is frozen.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct NarHashKey(pub String);
+/// Length in bytes of the SHA-256 `NarHash` a claim/query is keyed on.
+pub const NAR_HASH_LEN: usize = 32;
 
-impl NarHashKey {
-    pub fn new(value: impl Into<String>) -> Self {
-        NarHashKey(value.into())
-    }
-    pub fn as_str(&self) -> &str {
-        &self.0
-    }
-    /// Bridge back to the frozen seam identity type.
-    pub fn to_nar_hash(&self) -> NarHash {
-        NarHash::new(self.0.clone())
+/// The algorithm prefix of the canonical `NarHash` string. Frozen: only sha256 is
+/// admitted (Nix signs sha256 NarHashes; a claim carries exactly that).
+pub const NAR_HASH_PREFIX: &str = "sha256:";
+
+/// The content identity a claim/query is ABOUT: the signed `NarHash` - the value
+/// Nix SIGNS and the wave-2 discovery layer keys on. FROZEN (codex finding 2): a
+/// STRICT type holding the 32 raw SHA-256 bytes, canonical wire form
+/// `sha256:<52 lowercase nix-base32>` (Nix's own encoding, see
+/// [`crate::nixbase32`]), VALIDATED on parse/decode/Display.
+///
+/// Why strict, not a free `String`: this key routes discovery and indexing, so a
+/// permissive key (`"not-a-nar-hash"`, wrong length, wrong alphabet) would let two
+/// nodes disagree about what key a path has and silently split the network. The
+/// value is the interop identity; it must have exactly one canonical form.
+///
+/// Relationship to the wave-1 seam type [`crate::source::NarHash`]: that type is an
+/// intentionally-opaque `String` correlation key internal to the daemon (never on
+/// the p2p wire); this is the STRICT wire twin. They agree by construction for
+/// real values - [`NarHashKey::to_nar_hash`] emits the canonical string, and
+/// [`TryFrom`]`<&NarHash>` validates the seam value into this type (fallible,
+/// because the seam is loose by wave-1 design). A real narinfo `NarHash` is always
+/// `sha256:<52 nix-base32>`, so the bridge never rejects a genuine value; a
+/// non-canonical seam value fails fast rather than reaching the wire.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct NarHashKey([u8; NAR_HASH_LEN]);
+
+/// Why a string was not a canonical [`NarHashKey`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum NarHashKeyParseError {
+    /// The `sha256:` prefix was missing (only sha256 NarHashes are admitted).
+    MissingPrefix,
+    /// The base-32 body was not a canonical 52-char lowercase nix-base32 digest.
+    BadBase32(String),
+}
+
+impl std::fmt::Display for NarHashKeyParseError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            NarHashKeyParseError::MissingPrefix => {
+                write!(f, "missing '{NAR_HASH_PREFIX}' prefix on a NarHash key")
+            }
+            NarHashKeyParseError::BadBase32(why) => write!(f, "malformed NarHash base-32: {why}"),
+        }
     }
 }
 
-impl From<&NarHash> for NarHashKey {
-    fn from(hash: &NarHash) -> Self {
-        NarHashKey(hash.as_str().to_string())
+impl std::error::Error for NarHashKeyParseError {}
+
+impl NarHashKey {
+    /// Wrap the 32 raw SHA-256 bytes of a NarHash.
+    pub const fn from_sha256_bytes(bytes: [u8; NAR_HASH_LEN]) -> Self {
+        NarHashKey(bytes)
+    }
+
+    /// The raw 32 SHA-256 bytes.
+    pub const fn as_bytes(&self) -> &[u8; NAR_HASH_LEN] {
+        &self.0
+    }
+
+    /// The 52-char nix-base32 body (WITHOUT the `sha256:` prefix).
+    pub fn to_nix_base32(&self) -> String {
+        crate::nixbase32::encode(&self.0)
+    }
+
+    /// Bridge to the wave-1 seam identity type, as its canonical string.
+    pub fn to_nar_hash(&self) -> NarHash {
+        NarHash::new(self.to_string())
+    }
+}
+
+impl std::str::FromStr for NarHashKey {
+    type Err = NarHashKeyParseError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        let body = s
+            .strip_prefix(NAR_HASH_PREFIX)
+            .ok_or(NarHashKeyParseError::MissingPrefix)?;
+        let bytes = crate::nixbase32::decode_fixed::<NAR_HASH_LEN>(body)
+            .map_err(|e| NarHashKeyParseError::BadBase32(e.to_string()))?;
+        Ok(NarHashKey(bytes))
+    }
+}
+
+impl std::fmt::Display for NarHashKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{NAR_HASH_PREFIX}{}", self.to_nix_base32())
+    }
+}
+
+impl Serialize for NarHashKey {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(&self.to_string())
+    }
+}
+
+impl<'de> Deserialize<'de> for NarHashKey {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let s = String::deserialize(deserializer)?;
+        s.parse().map_err(serde::de::Error::custom)
+    }
+}
+
+impl TryFrom<&NarHash> for NarHashKey {
+    type Error = NarHashKeyParseError;
+
+    fn try_from(hash: &NarHash) -> Result<Self, Self::Error> {
+        hash.as_str().parse()
     }
 }
 
@@ -134,15 +215,18 @@ impl From<&NarHash> for NarHashKey {
 // Payload: WHAT content identity the claim is about.
 // -------------------------------------------------------------------------
 
-/// What content a claim describes. Forward-compatible: a payload kind this build
-/// does not know parses into [`ClaimPayload::Unknown`] VERBATIM and is ignored,
-/// never an error (see module forward-compat docs).
+/// What content a claim describes. Forward-compatible, but STRICTLY so (codex
+/// finding 3): a payload whose `kind` this build does NOT recognise is kept
+/// verbatim as [`ClaimPayload::Unknown`] and ignored; a payload with a KNOWN
+/// `kind` but malformed fields is a hard ERROR, never silently swallowed as
+/// Unknown. The two axes are distinct - unknown TAG (forward-compat, preserve)
+/// vs malformed KNOWN (a real defect, reject) - and conflating them is exactly
+/// the task-13 defect species this discriminator-aware decode avoids.
 ///
-/// `#[serde(untagged)]` makes the wrapper invisible on the wire: a `Known`
-/// serializes as its inner tagged object, an `Unknown` as its raw value. On
-/// decode, `Known` is tried first; if the tag is unrecognised the inner
-/// (internally-tagged) enum fails and the input is captured as `Unknown`.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+/// Serialize is untagged (a `Known` emits its inner tagged object, an `Unknown`
+/// its raw value); Deserialize is hand-written to peek the discriminator - see
+/// the `Deserialize` impl below.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(untagged)]
 pub enum ClaimPayload {
     Known(KnownPayload),
@@ -150,6 +234,11 @@ pub enum ClaimPayload {
     /// verbatim so relaying does not destroy it; ignored by logic.
     Unknown(Value),
 }
+
+/// The payload `kind` tags THIS build claims to understand. EXTEND THIS when
+/// adding a [`KnownPayload`] variant, so a malformed instance of the NEW kind is
+/// rejected (not swallowed) while a still-unknown kind stays `Unknown`.
+const KNOWN_PAYLOAD_KINDS: &[&str] = &["whole_nar"];
 
 /// The payload kinds THIS build understands. `WholeNar` (Candidate B) is the
 /// only wave-2 kind; `CastoreRoot` (Candidate C chunked) is the reserved future
@@ -159,24 +248,43 @@ pub enum ClaimPayload {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum KnownPayload {
-    /// A whole raw-NAR blob, addressed by its BLAKE3 (the universal content
-    /// identity, `blake3:<hex>` on the wire).
+    /// A whole raw-NAR blob, addressed by the claim's single BLAKE3 (the
+    /// universal content identity, `blake3:<hex>` on the wire).
     WholeNar { blake3: Blake3Digest },
     // future: CastoreRoot { root: CastoreRootDigest, .. }  // task: Candidate C
+}
+
+impl<'de> Deserialize<'de> for ClaimPayload {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        // Peek the discriminator on the raw value, then dispatch: a KNOWN kind is
+        // strict-parsed (errors propagate); anything else is preserved as Unknown.
+        let value = Value::deserialize(deserializer)?;
+        let is_known = value
+            .get("kind")
+            .and_then(Value::as_str)
+            .is_some_and(|tag| KNOWN_PAYLOAD_KINDS.contains(&tag));
+        if is_known {
+            let known =
+                serde_json::from_value::<KnownPayload>(value).map_err(serde::de::Error::custom)?;
+            Ok(ClaimPayload::Known(known))
+        } else {
+            Ok(ClaimPayload::Unknown(value))
+        }
+    }
 }
 
 // -------------------------------------------------------------------------
 // Transport offer: HOW to fetch the content.
 // -------------------------------------------------------------------------
 
-/// One way to fetch the claimed content. Forward-compatible like
-/// [`ClaimPayload`]: an unknown transport is kept verbatim and ignored.
+/// One way to fetch the claimed content: a PURE LOCATOR (the content identity is
+/// the claim/Have's single `blake3`, never repeated here - codex finding 1).
+/// Forward-compatible like [`ClaimPayload`] and STRICTLY so (codex finding 3): an
+/// unknown `transport` tag is preserved as `Unknown`; a KNOWN transport with a
+/// malformed locator is a hard ERROR, not silently downgraded to `Unknown`.
 ///
-/// The offer carries what the transport needs to ACTUALLY fetch - for iroh, the
-/// holder `NodeId` AND the raw-NAR `RawNarBlake3` (a consumer fetches by BLAKE3;
-/// a bare holder identity is insufficient). BitTorrent is a representable
-/// variant (a 2nd transport is not a fork) though no backend exists here.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+/// Serialize is untagged; Deserialize is hand-written to peek the discriminator.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(untagged)]
 pub enum TransportOffer {
     Known(KnownTransport),
@@ -184,28 +292,53 @@ pub enum TransportOffer {
     Unknown(Value),
 }
 
+/// The `transport` tags THIS build claims to understand. EXTEND when adding a
+/// [`KnownTransport`] variant (same rule as [`KNOWN_PAYLOAD_KINDS`]).
+const KNOWN_TRANSPORT_TAGS: &[&str] = &["iroh", "bittorrent"];
+
+impl<'de> Deserialize<'de> for TransportOffer {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let value = Value::deserialize(deserializer)?;
+        let is_known = value
+            .get("transport")
+            .and_then(Value::as_str)
+            .is_some_and(|tag| KNOWN_TRANSPORT_TAGS.contains(&tag));
+        if is_known {
+            let known = serde_json::from_value::<KnownTransport>(value)
+                .map_err(serde::de::Error::custom)?;
+            Ok(TransportOffer::Known(known))
+        } else {
+            Ok(TransportOffer::Unknown(value))
+        }
+    }
+}
+
 /// The transports THIS build can represent. Only `Iroh` has a fetch backend
 /// (task-38); `BitTorrent` is representable to prove the schema admits a 2nd
 /// transport without a network fork.
+///
+/// A transport offer is a PURE LOCATOR: it carries ONLY the transport-specific
+/// coordinate, NOT the content identity (codex finding 1). The universal
+/// `blake3` a consumer fetches/verifies by lives EXACTLY ONCE per claim - in the
+/// payload ([`KnownPayload::WholeNar`]) - or once per [`HoldAnswer::Have`]. This
+/// is the (a) fix: there is no second copy of the content address to disagree
+/// with the first, so a claim can never name two different blobs. The separation
+/// of universal-identity from per-transport-locator is thereby structural, not a
+/// runtime cross-check.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "transport", rename_all = "snake_case")]
 pub enum KnownTransport {
-    /// iroh whole-blob (Candidate B, FIRST priority). Carries the transport
-    /// locator (the holder `NodeId`) AND the universal content identity
-    /// (`blake3`) - a consumer fetches by BLAKE3, so a bare holder identity is
-    /// insufficient. The two are separated on purpose (see [`crate::transport`]).
-    Iroh { node: NodeId, blake3: Blake3Digest },
+    /// iroh whole-blob (Candidate B, FIRST priority). The locator is the holder
+    /// `NodeId`; the blob to fetch is the claim/Have's single `blake3`.
+    Iroh { node: NodeId },
     /// BitTorrent - REPRESENTABLE only, NOT implemented (no backend; task-38).
-    /// Present so a 2nd transport is not a network fork. Carries the
-    /// transport-specific locator (`infohash`) AND the SAME universal `blake3` a
-    /// consumer verifies/fetches by - proving the content identity is shared
-    /// across transports while the locator is per-transport. The wire tag is
-    /// pinned explicitly (`snake_case` would give the odd `bit_torrent`).
+    /// Present so a 2nd transport is not a network fork; its locator is an
+    /// `infohash` (a coordinate a `NodeId` cannot express), proving the schema
+    /// admits a transport whose addressing differs. The content is still the
+    /// claim/Have's single `blake3`. The wire tag is pinned explicitly
+    /// (`snake_case` would give the odd `bit_torrent`).
     #[serde(rename = "bittorrent")]
-    BitTorrent {
-        infohash: BitTorrentInfoHash,
-        blake3: Blake3Digest,
-    },
+    BitTorrent { infohash: BitTorrentInfoHash },
 }
 
 // -------------------------------------------------------------------------
@@ -301,8 +434,14 @@ pub struct HoldQuery {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "answer", rename_all = "snake_case")]
 pub enum HoldAnswer {
-    /// "Yes, I hold it" + how to fetch it (offers for the queried hash only).
-    Have { offers: Vec<TransportOffer> },
+    /// "Yes, I hold it": the single content identity (`blake3`) for the queried
+    /// key, plus pure-locator offers (codex finding 1). The `blake3` lives here
+    /// exactly once - a Have has no payload - so the offers carry no digest to
+    /// disagree with it. A consumer fetches the `blake3` via any offer's locator.
+    Have {
+        blake3: Blake3Digest,
+        offers: Vec<TransportOffer>,
+    },
     /// "No, I do not hold it."
     Absent,
 }
@@ -408,12 +547,16 @@ mod tests {
     // Canonical fixed identities, in BOTH typed and wire-string form, so the
     // typed constructors and the raw-JSON literals below cannot drift. The
     // `wire_strings_match_typed` test asserts they agree.
+    const KEY_HEX: &str = "sha256:06rgb4vfjsg365xwwdjz12qhjnvg3w0agfvyqfp977hp3yk2bczb";
     const NODE_A_HEX: &str = "1111111111111111111111111111111111111111111111111111111111111111";
     const NODE_B_HEX: &str = "2222222222222222222222222222222222222222222222222222222222222222";
     const BLAKE3_HEX: &str =
         "blake3:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
     const INFOHASH_HEX: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"; // 64 = v2
 
+    fn key() -> NarHashKey {
+        KEY_HEX.parse().expect("KEY_HEX is a canonical NarHash")
+    }
     fn node_a() -> NodeId {
         NodeId::from_bytes([0x11; 32])
     }
@@ -432,6 +575,7 @@ mod tests {
         // The raw-JSON literals used across these tests must equal the canonical
         // string form of the typed identities, or a "future variant" fixture
         // would fail to decode for the wrong reason.
+        assert_eq!(key().to_string(), KEY_HEX);
         assert_eq!(node_a().to_string(), NODE_A_HEX);
         assert_eq!(node_b().to_string(), NODE_B_HEX);
         assert_eq!(blake3_id().to_string(), BLAKE3_HEX);
@@ -439,23 +583,20 @@ mod tests {
     }
 
     /// A fully-populated v1 claim (known payload + both transports + reserved
-    /// fields set) so round-trip tests exercise every field.
+    /// fields set) so round-trip tests exercise every field. Note the single
+    /// content identity lives ONLY in the payload; the offers are pure locators.
     fn sample_claim() -> Claim {
         Claim {
             schema_version: CLAIM_SCHEMA_VERSION,
-            key: NarHashKey::new("sha256:1b2c3d"),
+            key: key(),
             payload: ClaimPayload::Known(KnownPayload::WholeNar {
                 blake3: blake3_id(),
             }),
             holders: vec![node_a(), node_b()],
             transports: vec![
-                TransportOffer::Known(KnownTransport::Iroh {
-                    node: node_a(),
-                    blake3: blake3_id(),
-                }),
+                TransportOffer::Known(KnownTransport::Iroh { node: node_a() }),
                 TransportOffer::Known(KnownTransport::BitTorrent {
                     infohash: infohash(),
-                    blake3: blake3_id(),
                 }),
             ],
             relay: None,
@@ -472,63 +613,123 @@ mod tests {
         assert_eq!(claim, back);
     }
 
+    // --- CODEX FINDING 2: NarHashKey is a STRICT, validated identity --------
+
     #[test]
-    fn nar_hash_key_bridges_the_frozen_seam_type() {
-        let seam = NarHash::new("sha256:deadbeef");
-        let key = NarHashKey::from(&seam);
-        assert_eq!(key.as_str(), "sha256:deadbeef");
-        assert_eq!(key.to_nar_hash(), seam);
+    fn nar_hash_key_bridges_the_seam_type_by_construction() {
+        // to_nar_hash emits the canonical string; TryFrom validates it back. A
+        // real seam value round-trips to the same strict key.
+        let key = key();
+        let seam = key.to_nar_hash();
+        assert_eq!(seam.as_str(), KEY_HEX);
+        assert_eq!(NarHashKey::try_from(&seam).unwrap(), key);
     }
 
-    // --- Forward-compat: unknown VARIANT survives, is not an error ---------
-
-    /// A strict payload enum WITHOUT the `Unknown` catch-all. It exists only to
-    /// PROVE the catch-all is load-bearing: on the same future-variant bytes,
-    /// this one ERRORS (fails-before) while [`ClaimPayload`] succeeds
-    /// (passes-after). Without this control the forward-compat test could pass
-    /// vacuously.
-    #[derive(Debug, Deserialize)]
-    #[serde(tag = "kind", rename_all = "snake_case")]
-    #[allow(dead_code)]
-    enum StrictPayload {
-        WholeNar { blake3: Blake3Digest },
+    #[test]
+    fn nar_hash_key_parse_rejects_non_canonical() {
+        // Direct parse: missing prefix, wrong alphabet, wrong length all rejected.
+        assert_eq!(
+            "not-a-nar-hash".parse::<NarHashKey>(),
+            Err(NarHashKeyParseError::MissingPrefix)
+        );
+        assert!(matches!(
+            "sha256:not-base32-and-too-short".parse::<NarHashKey>(),
+            Err(NarHashKeyParseError::BadBase32(_))
+        ));
+        // A canonical value uppercased is no longer canonical (nix-base32 is
+        // lowercase-only), so it is rejected too.
+        assert!(KEY_HEX.to_uppercase().parse::<NarHashKey>().is_err());
     }
+
+    #[test]
+    fn claim_with_a_non_canonical_key_is_rejected() {
+        // fails-before (String key): `"not-a-nar-hash"` decoded fine, letting two
+        // nodes disagree on a path's key. passes-after: decode_claim REJECTS it.
+        let wire = serde_json::json!({
+            "schema_version": CLAIM_SCHEMA_VERSION,
+            "key": "not-a-nar-hash",
+            "payload": { "kind": "whole_nar", "blake3": BLAKE3_HEX },
+            "holders": [],
+            "transports": []
+        });
+        let bytes = serde_json::to_vec(&wire).unwrap();
+        assert!(
+            matches!(decode_claim(&bytes), Err(ClaimCodecError::Malformed(_))),
+            "a claim whose key is not a canonical NarHash must be rejected"
+        );
+    }
+
+    // --- CODEX FINDING 1: exactly ONE content identity per claim ------------
+
+    #[test]
+    fn a_claim_names_exactly_one_content_identity() {
+        // The content address lives ONLY in the payload; offers are pure
+        // locators. There is structurally no second blake3 to disagree with it.
+        let on_wire: Value =
+            serde_json::from_slice(&encode_claim(&sample_claim()).unwrap()).unwrap();
+        assert_eq!(on_wire["payload"]["blake3"], BLAKE3_HEX);
+        for offer in on_wire["transports"].as_array().unwrap() {
+            assert!(
+                offer.get("blake3").is_none(),
+                "a transport offer must NOT carry its own blake3 (finding 1): {offer}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_stray_offer_blake3_cannot_introduce_a_second_identity() {
+        // Even if a peer put a DIFFERENT blake3 on an iroh offer, the typed model
+        // has no field for it, so the decoded claim still has exactly one content
+        // identity (the payload's). A two-blob claim is not representable.
+        let wire = serde_json::json!({
+            "schema_version": CLAIM_SCHEMA_VERSION,
+            "key": KEY_HEX,
+            "payload": { "kind": "whole_nar", "blake3": BLAKE3_HEX },
+            "holders": [NODE_A_HEX],
+            "transports": [
+                { "transport": "iroh", "node": NODE_A_HEX,
+                  "blake3": "blake3:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb" }
+            ]
+        });
+        let claim = decode_claim(&serde_json::to_vec(&wire).unwrap()).expect("decode");
+        assert_eq!(
+            claim.payload,
+            ClaimPayload::Known(KnownPayload::WholeNar {
+                blake3: blake3_id()
+            })
+        );
+        assert_eq!(
+            claim.transports,
+            vec![TransportOffer::Known(KnownTransport::Iroh {
+                node: node_a()
+            })],
+            "the stray offer blake3 is not part of the typed offer - no 2nd identity"
+        );
+    }
+
+    // --- Forward-compat: unknown TAG survives; malformed KNOWN errors -------
 
     /// Bytes a NEWER peer would send: a `castore_root` payload this build does
-    /// not know, and a `webseed` transport it does not know, both carrying data.
+    /// not know, and a `webseed` transport it does not know. Offers are pure
+    /// locators (no blake3), matching finding 1.
     fn future_variant_claim_bytes() -> Vec<u8> {
         let wire = serde_json::json!({
             "schema_version": CLAIM_SCHEMA_VERSION,
-            "key": "sha256:1b2c3d",
+            "key": KEY_HEX,
             "payload": { "kind": "castore_root", "digest": "castore:xyz", "chunks": 7 },
             "holders": [NODE_A_HEX],
             "transports": [
-                { "transport": "iroh", "node": NODE_A_HEX, "blake3": BLAKE3_HEX },
-                { "transport": "webseed", "url": "https://example.invalid/x", "blake3": BLAKE3_HEX }
+                { "transport": "iroh", "node": NODE_A_HEX },
+                { "transport": "webseed", "url": "https://example.invalid/x" }
             ]
         });
         serde_json::to_vec(&wire).unwrap()
     }
 
     #[test]
-    fn unknown_payload_variant_is_rejected_by_a_strict_enum() {
-        // fails-before: the naive enum without a catch-all cannot parse a future
-        // payload kind.
-        let bytes = serde_json::to_vec(
-            &serde_json::json!({ "kind": "castore_root", "digest": "castore:xyz" }),
-        )
-        .unwrap();
-        let strict: Result<StrictPayload, _> = serde_json::from_slice(&bytes);
-        assert!(
-            strict.is_err(),
-            "strict enum must reject an unknown payload kind (proves the catch-all matters)"
-        );
-    }
-
-    #[test]
     fn unknown_variants_parse_and_are_ignored_not_errored() {
-        // passes-after: the real types parse a future claim, keeping the unknown
-        // payload and transport as `Unknown`, never erroring.
+        // task-37 forward-compat still holds: an unknown TAG is preserved as
+        // Unknown, never an error.
         let claim = decode_claim(&future_variant_claim_bytes())
             .expect("a future-variant claim must decode, not error");
 
@@ -536,32 +737,89 @@ mod tests {
             matches!(claim.payload, ClaimPayload::Unknown(_)),
             "unknown payload kind must land in ClaimPayload::Unknown"
         );
-
-        // The known iroh transport is still usable; the unknown one is ignored
-        // (kept as Unknown), never an error.
-        let known: Vec<_> = claim
+        let known = claim
             .transports
             .iter()
             .filter(|t| matches!(t, TransportOffer::Known(_)))
-            .collect();
-        let unknown: Vec<_> = claim
+            .count();
+        let unknown = claim
             .transports
             .iter()
             .filter(|t| matches!(t, TransportOffer::Unknown(_)))
-            .collect();
-        assert_eq!(known.len(), 1, "the iroh offer must still be understood");
-        assert_eq!(
-            unknown.len(),
-            1,
-            "the future transport must be kept as Unknown"
+            .count();
+        assert_eq!(known, 1, "the iroh offer must still be understood");
+        assert_eq!(unknown, 1, "the future transport must be kept as Unknown");
+    }
+
+    // --- CODEX FINDING 3: malformed KNOWN variant ERRORS, not swallowed -----
+
+    /// The OLD untagged behaviour, kept as a fails-before control: it swallows a
+    /// malformed KNOWN variant into `Unknown` instead of erroring. The real
+    /// [`ClaimPayload`] must instead ERROR - that is the finding-3 fix.
+    #[derive(Debug, Deserialize)]
+    #[serde(untagged)]
+    #[allow(dead_code)]
+    enum UntaggedPayload {
+        Known(KnownPayload),
+        Unknown(Value),
+    }
+
+    #[test]
+    fn malformed_known_payload_errors_instead_of_becoming_unknown() {
+        // A KNOWN kind (`whole_nar`) with a malformed blake3.
+        let bad = serde_json::json!({ "kind": "whole_nar", "blake3": "blake3:not-hex" });
+
+        // fails-before: the untagged control swallows it as Unknown (the defect).
+        let swallowed: UntaggedPayload = serde_json::from_value(bad.clone()).unwrap();
+        assert!(
+            matches!(swallowed, UntaggedPayload::Unknown(_)),
+            "control: untagged decode swallows a malformed known variant (the bug)"
+        );
+
+        // passes-after: the real payload decode ERRORS on the malformed known kind.
+        let strict: Result<ClaimPayload, _> = serde_json::from_value(bad);
+        assert!(
+            strict.is_err(),
+            "a malformed whole_nar payload must ERROR, not become Unknown"
+        );
+    }
+
+    #[test]
+    fn malformed_known_transport_errors_but_unknown_tag_is_preserved() {
+        // A KNOWN transport (`iroh`) with a malformed node must ERROR.
+        let bad_iroh = serde_json::json!({ "transport": "iroh", "node": "not-hex" });
+        assert!(
+            serde_json::from_value::<TransportOffer>(bad_iroh).is_err(),
+            "a malformed iroh offer must ERROR (finding 3)"
+        );
+        // An UNKNOWN transport tag is still preserved as Unknown (forward-compat).
+        let future = serde_json::json!({ "transport": "webseed", "url": "x" });
+        let offer: TransportOffer = serde_json::from_value(future).unwrap();
+        assert!(matches!(offer, TransportOffer::Unknown(_)));
+    }
+
+    #[test]
+    fn a_malformed_known_offer_inside_a_claim_fails_the_whole_decode() {
+        // The finding-3 fix must hold end-to-end, not just on a bare offer.
+        let wire = serde_json::json!({
+            "schema_version": CLAIM_SCHEMA_VERSION,
+            "key": KEY_HEX,
+            "payload": { "kind": "whole_nar", "blake3": BLAKE3_HEX },
+            "holders": [],
+            "transports": [ { "transport": "iroh", "node": "not-hex" } ]
+        });
+        let bytes = serde_json::to_vec(&wire).unwrap();
+        assert!(
+            matches!(decode_claim(&bytes), Err(ClaimCodecError::Malformed(_))),
+            "a claim carrying a malformed known offer must be rejected"
         );
     }
 
     #[test]
     fn unknown_variant_value_survives_an_unknown_to_known_round_trip() {
         // An old node relaying a future claim must not DESTROY the future
-        // variant's data. Decode (we see it as Unknown) -> re-encode -> a peer
-        // that DOES know the variant recovers the original bytes.
+        // variant's data. Decode (Unknown) -> re-encode -> a peer that knows the
+        // variant recovers the original bytes.
         let original = future_variant_claim_bytes();
         let as_value: Value = serde_json::from_slice(&original).unwrap();
 
@@ -581,7 +839,7 @@ mod tests {
         // flatten catch-all must keep it across a round-trip.
         let wire = serde_json::json!({
             "schema_version": CLAIM_SCHEMA_VERSION,
-            "key": "sha256:1b2c3d",
+            "key": KEY_HEX,
             "payload": { "kind": "whole_nar", "blake3": BLAKE3_HEX },
             "holders": [NODE_A_HEX],
             "transports": [],
@@ -626,41 +884,38 @@ mod tests {
         assert_eq!(claim, back);
     }
 
-    // --- BitTorrent representable, iroh implemented-shape ------------------
+    // --- BitTorrent representable, iroh implemented-shape (pure locators) ---
 
     #[test]
     fn bittorrent_transport_is_representable_without_a_fork() {
         let offer = TransportOffer::Known(KnownTransport::BitTorrent {
             infohash: infohash(),
-            blake3: blake3_id(),
         });
         let bytes = serde_json::to_vec(&offer).unwrap();
         let on_wire: Value = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(on_wire["transport"], "bittorrent");
-        // The transport-specific locator (infohash) and the UNIVERSAL content
-        // identity (blake3) are BOTH present and separate: a BitTorrent locator
-        // does not fit in a NodeId, so a 2nd transport is representable without
-        // forking the content identity.
+        // The transport-specific locator (infohash) is present; the content
+        // identity is NOT duplicated here (it is the claim's single blake3). A
+        // BitTorrent locator does not fit in a NodeId, so a 2nd transport is
+        // representable without forking the content identity.
         assert_eq!(on_wire["infohash"], INFOHASH_HEX);
-        assert_eq!(on_wire["blake3"], BLAKE3_HEX);
-        // Round-trips as a first-class known variant (a 2nd transport is not a
-        // fork), while carrying the BLAKE3 a consumer fetches by.
+        assert!(
+            on_wire.get("blake3").is_none(),
+            "an offer is a pure locator - no duplicated content identity"
+        );
         let back: TransportOffer = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(offer, back);
     }
 
     #[test]
-    fn iroh_offer_carries_node_and_blake3() {
-        let offer = TransportOffer::Known(KnownTransport::Iroh {
-            node: node_a(),
-            blake3: blake3_id(),
-        });
+    fn iroh_offer_is_a_pure_node_locator() {
+        let offer = TransportOffer::Known(KnownTransport::Iroh { node: node_a() });
         let on_wire: Value = serde_json::from_slice(&serde_json::to_vec(&offer).unwrap()).unwrap();
         assert_eq!(on_wire["transport"], "iroh");
         assert_eq!(on_wire["node"], NODE_A_HEX);
-        assert_eq!(
-            on_wire["blake3"], BLAKE3_HEX,
-            "the iroh offer MUST carry the BLAKE3 a consumer fetches by"
+        assert!(
+            on_wire.get("blake3").is_none(),
+            "the iroh offer is a pure locator; the blake3 is the claim's single id"
         );
     }
 
@@ -669,7 +924,7 @@ mod tests {
     fn wrong_version_claim_bytes() -> Vec<u8> {
         let wire = serde_json::json!({
             "schema_version": 999,
-            "key": "sha256:1b2c3d",
+            "key": KEY_HEX,
             "payload": { "kind": "whole_nar", "blake3": BLAKE3_HEX },
             "holders": [],
             "transports": []
@@ -689,8 +944,7 @@ mod tests {
             "raw serde parses a v999 record - the field alone does not reject"
         );
 
-        // passes-after: decode_claim CHECKS the version and rejects cleanly (an
-        // Err with both numbers, never a panic, never a silent accept).
+        // passes-after: decode_claim CHECKS the version and rejects cleanly.
         match decode_claim(&bytes) {
             Err(ClaimCodecError::UnsupportedVersion { found, expected }) => {
                 assert_eq!(found, 999);
@@ -712,7 +966,7 @@ mod tests {
     fn hold_query_round_trips_and_names_one_hash() {
         let query = HoldQuery {
             schema_version: QUERY_SCHEMA_VERSION,
-            key: NarHashKey::new("sha256:1b2c3d"),
+            key: key(),
         };
         let bytes = encode_hold_query(&query).expect("encode");
         assert_eq!(decode_hold_query(&bytes).expect("decode"), query);
@@ -723,9 +977,9 @@ mod tests {
         let have = HoldResponse {
             schema_version: QUERY_SCHEMA_VERSION,
             answer: HoldAnswer::Have {
+                blake3: blake3_id(),
                 offers: vec![TransportOffer::Known(KnownTransport::Iroh {
                     node: node_a(),
-                    blake3: blake3_id(),
                 })],
             },
         };
@@ -740,11 +994,33 @@ mod tests {
     }
 
     #[test]
+    fn have_response_carries_exactly_one_content_identity() {
+        // A Have has no payload, so it carries the single blake3 itself; its
+        // offers are pure locators (finding 1 applied to the query path).
+        let have = HoldResponse {
+            schema_version: QUERY_SCHEMA_VERSION,
+            answer: HoldAnswer::Have {
+                blake3: blake3_id(),
+                offers: vec![TransportOffer::Known(KnownTransport::Iroh {
+                    node: node_a(),
+                })],
+            },
+        };
+        let on_wire: Value = serde_json::from_slice(&encode_hold_response(&have).unwrap()).unwrap();
+        assert_eq!(on_wire["blake3"], BLAKE3_HEX);
+        for offer in on_wire["offers"].as_array().unwrap() {
+            assert!(
+                offer.get("blake3").is_none(),
+                "Have offers are pure locators"
+            );
+        }
+    }
+
+    #[test]
     fn hold_response_is_yes_no_only_and_scoped_to_the_query() {
         // The response answers HAVE/ABSENT and nothing else - there is no
         // variant that enumerates other holdings. An "absent" answer carries no
-        // offers at all; a "have" carries offers ONLY for the queried hash
-        // (there is structurally no field naming any OTHER hash).
+        // offers and no blake3 at all.
         let absent = HoldResponse {
             schema_version: QUERY_SCHEMA_VERSION,
             answer: HoldAnswer::Absent,
@@ -756,11 +1032,12 @@ mod tests {
             on_wire.get("offers").is_none(),
             "an absent answer must not leak a holdings listing"
         );
+        assert!(on_wire.get("blake3").is_none());
     }
 
     #[test]
     fn hold_query_wrong_version_is_rejected_cleanly() {
-        let wire = serde_json::json!({ "schema_version": 999, "key": "sha256:1b2c3d" });
+        let wire = serde_json::json!({ "schema_version": 999, "key": KEY_HEX });
         let bytes = serde_json::to_vec(&wire).unwrap();
         assert!(matches!(
             decode_hold_query(&bytes),
