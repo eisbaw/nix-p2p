@@ -83,6 +83,21 @@ HOST_DAEMON = 18082
 # (8082..8113 / 18082..18113) that fails fast on an absurd value.
 MAX_DAEMON_CHAIN = 32
 
+# Ceiling on `p2p_holders=N` (task-42 swarm profiling): a p2p pod takes in-pod
+# port DAEMON_PORT+i and host port HOST_DAEMON+i for node-a plus each holder, so
+# N holders occupy N+1 ports. 30 keeps the whole swarm inside the same
+# 8082..8113 / 18082..18113 band MAX_DAEMON_CHAIN reserves, and matches the
+# TESTING.md S5 "target 1..30 nodes" range - above that the sweep would silently
+# collide with whatever else the host published.
+MAX_P2P_HOLDERS = 30
+
+# Where a daemon's on-disk state (its narinfo disk cache) is mounted inside the
+# container when a pod is given a `state_root`. The HOST side of that mount is
+# what task-42 walks to measure disk footprint: host-side on purpose, because
+# `du`/`find` are NOT in this image and an in-container probe would return
+# rc=127 and pass unconditionally (the dead-oracle trap this repo has hit).
+DAEMON_STATE_MOUNT = "/srv/state"
+
 # The DoD honesty marker (Justfile `stub_marker`). A real harness with zero
 # scenarios registered is a stub pretending to pass; we print this and fail
 # closed if that ever happens, and `just e2e` succeeding proves it absent.
@@ -420,6 +435,8 @@ class Pod:
         p2p_seed_dir: Path | None = None,
         p2p_seeds: tuple[P2pSeed, ...] = (),
         p2p_claim_overrides: dict[str, str] | None = None,
+        p2p_holders: int = 1,
+        state_root: Path | None = None,
     ):
         self.ctx = ctx
         self.pod = f"{POD_PREFIX}-{name}"
@@ -437,6 +454,31 @@ class Pod:
         # valid-but-wrong NAR that passes the transport gate yet fails Nix's
         # sha256==NarHash gate. Maps nar_hash -> the filename whose blake3 to use.
         self.p2p_claim_overrides = dict(p2p_claim_overrides or {})
+        # SWARM (task-42): how many HOLDER peers this p2p pod runs. 1 is the
+        # task-41 two-node S6 topology and is what every existing scenario gets,
+        # byte-for-byte unchanged. N > 1 adds node-b2..node-bN, each a real,
+        # independently-seeded iroh provider process, so a resource sweep has a
+        # peer-count axis with REAL points instead of extrapolating from 2.
+        #
+        # HONEST LIMITATION, stated where it is created rather than discovered in
+        # the report: node A's claims all name holder `node-b`. `InMemoryDiscovery
+        # ::announce` REPLACES on key, so a multi-holder claim cannot be expressed
+        # through `--p2p-claim` today (last write wins) - the swarm therefore
+        # measures what N peer PROCESSES plus an N-entry peer address book cost,
+        # NOT holder-selection or dial fan-out across N candidates. Multi-holder
+        # claims are TASK-43/47 territory.
+        self.p2p_holders = int(p2p_holders)
+        if self.p2p and not (1 <= self.p2p_holders <= MAX_P2P_HOLDERS):
+            die(
+                f"Pod: p2p_holders={self.p2p_holders} outside 1..{MAX_P2P_HOLDERS} "
+                "(higher counts collide with other published host ports)"
+            )
+        # Optional HOST directory under which each daemon role gets its own
+        # bind-mounted state dir (used as `--narinfo-cache-dir`). Present so
+        # task-42 can measure a node's on-disk footprint by walking the host side
+        # of the mount - the only observation point that needs no binary inside
+        # the image. None (every existing scenario) leaves the daemon stateless.
+        self.state_root = Path(state_root).resolve() if state_root else None
         # Parsed once node B announces (node_id, sockets); oracles read it.
         self.iroh_identity: tuple[str, str] | None = None
         if self.p2p and (with_daemon or daemon_chain):
@@ -526,8 +568,12 @@ class Pod:
         if self.p2p:
             # node-a (index 0 -> DAEMON_PORT, the client's substituter) first so
             # the generic publish/await loops map it to the standard daemon ports;
-            # node-b (index 1 -> DAEMON_PORT+1) is the iroh provider.
-            return ["node-a", "node-b"]
+            # node-b (index 1 -> DAEMON_PORT+1) is the iroh provider that every
+            # claim names. node-b2..node-bN (task-42 swarm) are additional real
+            # provider processes at DAEMON_PORT+2.. - the peer-count axis.
+            return ["node-a", "node-b"] + [
+                f"node-b{i}" for i in range(2, self.p2p_holders + 1)
+            ]
         if self.daemon_chain:
             return [f"daemon-{i}" for i in range(1, self.daemon_chain + 1)]
         if self.with_daemon:
@@ -541,6 +587,36 @@ class Pod:
         is the DEEPEST entry (full depth) and daemon-N is a single hop - the
         seam the timeout-invariant oracle uses to isolate the per-hop latency."""
         return HOST_DAEMON + (index - 1)
+
+    def state_dir(self, role: str) -> Path:
+        """HOST path backing `role`'s in-container state mount. Raises when the
+        pod has no `state_root` - a caller asking for a footprint the pod was
+        never configured to keep must fail loudly, not receive an empty dir that
+        would measure as a comfortable 0 bytes."""
+        if self.state_root is None:
+            raise RuntimeError(
+                f"state_dir({role!r}): this pod was created without state_root, "
+                "so it has no on-disk state to measure (0 would be a lie)"
+            )
+        return self.state_root / role
+
+    def _state_args(self, role: str) -> list[str]:
+        """`podman run` fragments giving `role` its own host-backed state dir.
+
+        Empty for a pod without `state_root`, so every pre-task-42 scenario runs
+        the daemon with exactly the arguments it ran with before."""
+        if self.state_root is None:
+            return []
+        host_dir = self.state_dir(role)
+        host_dir.mkdir(parents=True, exist_ok=True)
+        return ["--volume", f"{host_dir}:{DAEMON_STATE_MOUNT}"]
+
+    def _daemon_state_flags(self) -> list[str]:
+        """Daemon CLI flags matching `_state_args`'s mount. Kept beside it so the
+        mount and the flag that uses it cannot drift apart."""
+        if self.state_root is None:
+            return []
+        return ["--narinfo-cache-dir", DAEMON_STATE_MOUNT]
 
     def _assert_no_secret_key_served(self) -> None:
         """AC#5, observed at the RIGHT boundary: walk the exact host tree that
@@ -685,61 +761,83 @@ class Pod:
                         self._c(role),
                         "--label",
                         PROJECT_LABEL,
+                        *self._state_args(role),
                         self.ctx.image,
                         "/bin/daemon",
                         "--listen",
                         f"0.0.0.0:{in_port}",
                         "--upstream",
                         upstream,
+                        *self._daemon_state_flags(),
                         *self.daemon_extra_args,
                     ]
                 )
         self._await_ready()
 
     def _create_p2p(self) -> None:
-        """Two-phase p2p bring-up (S6): start node B (iroh provider, seeded), read
-        its announced iroh identity + per-blob content ids from its log, then start
-        node A wired to fetch those NarHashes from B over iroh. Node A can only be
-        configured AFTER B announces, so this cannot use the single-shot loop."""
+        """Two-phase p2p bring-up (S6, swarm-capable): start every HOLDER node
+        (iroh provider, seeded), read each announced iroh identity + per-blob
+        content ids from its log, then start node A wired to dial ALL of them and
+        to claim each NarHash from `node-b`. Node A can only be configured AFTER
+        the holders announce, so this cannot use the single-shot loop.
+
+        With `p2p_holders=1` this is exactly the task-41 two-node S6 topology.
+        With N > 1 it is a swarm of N independent provider PROCESSES - the
+        peer-count axis task-42 fits. Every holder seeds the SAME NARs, so the
+        per-node cost is comparable across the swarm; only node-b is claimed
+        (see `p2p_holders` for why a multi-holder claim is not expressible yet).
+        """
         node_a_port = DAEMON_PORT  # index 0: the client's substituter target
-        node_b_port = DAEMON_PORT + 1  # index 1
         proxy = f"http://127.0.0.1:{PROXY_PORT}"
 
-        # -- node B: provider + HTTP daemon, seeded with each raw NAR --
+        # -- holders: provider + HTTP daemon, each seeded with every raw NAR --
         seed_args: list[str] = []
         for seed in self.p2p_seeds:
             seed_args += ["--iroh-seed-nar", f"/srv/seed/{seed.filename}"]
         if self.p2p_seed_dir is None:
             die("Pod: p2p_seeds given without p2p_seed_dir")
-        run(
-            [
-                self._pm,
-                "run",
-                "-d",
-                "--pod",
-                self.pod,
-                "--name",
-                self._c("node-b"),
-                "--label",
-                PROJECT_LABEL,
-                "--volume",
-                f"{self.p2p_seed_dir}:/srv/seed:ro",
-                self.ctx.image,
-                "/bin/daemon",
-                "--listen",
-                f"0.0.0.0:{node_b_port}",
-                "--upstream",
-                proxy,
-                "--iroh-provider",
-                *seed_args,
-            ]
-        )
-        node_id, sockets, blake3_by_path = self._await_iroh_identity(
-            "node-b", len(self.p2p_seeds)
-        )
+        holder_roles = self._daemon_roles()[1:]
+        for offset, role in enumerate(holder_roles):
+            run(
+                [
+                    self._pm,
+                    "run",
+                    "-d",
+                    "--pod",
+                    self.pod,
+                    "--name",
+                    self._c(role),
+                    "--label",
+                    PROJECT_LABEL,
+                    "--volume",
+                    f"{self.p2p_seed_dir}:/srv/seed:ro",
+                    *self._state_args(role),
+                    self.ctx.image,
+                    "/bin/daemon",
+                    "--listen",
+                    f"0.0.0.0:{DAEMON_PORT + 1 + offset}",
+                    "--upstream",
+                    proxy,
+                    "--iroh-provider",
+                    *self._daemon_state_flags(),
+                    *seed_args,
+                ]
+            )
+        # Await each holder's identity SEPARATELY. Fail-closed by construction:
+        # `_await_iroh_identity` dies if a holder never announces, so a swarm
+        # point can never be recorded with a node that silently failed to come up.
+        holders: list[tuple[str, str, dict[str, str]]] = [
+            self._await_iroh_identity(role, len(self.p2p_seeds))
+            for role in holder_roles
+        ]
+        node_id, sockets, blake3_by_path = holders[0]
         self.iroh_identity = (node_id, sockets)
 
-        # -- node A: iroh client wired to B's identity + one claim per seed --
+        # -- node A: iroh client wired to EVERY holder's identity + one claim per
+        # seed (all naming holder 0, `node-b`) --
+        peer_args: list[str] = []
+        for holder_id, holder_sockets, _ in holders:
+            peer_args += ["--iroh-peer", f"{holder_id}@{holder_sockets}"]
         claim_args: list[str] = []
         for seed in self.p2p_seeds:
             # The corruption bite points a NarHash at a DIFFERENT file's blake3.
@@ -760,15 +858,16 @@ class Pod:
                 self._c("node-a"),
                 "--label",
                 PROJECT_LABEL,
+                *self._state_args("node-a"),
                 self.ctx.image,
                 "/bin/daemon",
                 "--listen",
                 f"0.0.0.0:{node_a_port}",
                 "--upstream",
                 proxy,
-                "--iroh-peer",
-                f"{node_id}@{sockets}",
+                *peer_args,
                 *claim_args,
+                *self._daemon_state_flags(),
                 *self.daemon_extra_args,
             ]
         )

@@ -648,7 +648,13 @@ def max_overlap(intervals: list[tuple[int, int]]) -> int:
 # ---- the sweep arms (containers) --------------------------------------------
 
 
-def _silent_expect(collector: list):
+def silent_expect(collector: list):
+    """A `Pod` expect callback that RECORDS instead of printing: a sweep runs
+    hundreds of pods and the per-pod AC#5 assertions would drown the report.
+    Public (with `int_list` below) because task-42's profiler drives the same Pod
+    seam the same way - a second copy would be a second definition of how a sweep
+    treats a failed pod precondition."""
+
     def expect(ok: bool, name: str, detail: str = "") -> bool:
         collector.append((bool(ok), name, detail))
         return bool(ok)
@@ -812,7 +818,7 @@ def sweep_clients(ctx, fixtures, counts, jobs: int, conns: int, repeats: int) ->
                     f"scale-clients-{count}-{rep}",
                     fixtures.cache,
                     with_daemon=True,
-                    expect=_silent_expect([]),
+                    expect=silent_expect([]),
                 ) as pod:
                     with NodeSampler(pod, pod.roles()) as sampler:
                         arm = _drive_clients(
@@ -871,7 +877,7 @@ def sweep_chain(ctx, fixtures, depths, repeats: int) -> Axis:
                     fixtures.cache,
                     with_daemon=False,
                     daemon_chain=depth,
-                    expect=_silent_expect([]),
+                    expect=silent_expect([]),
                 ) as pod:
                     with NodeSampler(pod, pod.roles()) as sampler:
                         arm = _drive_clients(
@@ -943,7 +949,7 @@ def sweep_knobs(ctx, fixtures, values, clients: int, repeats: int) -> Axis:
                     f"scale-knobs-{value}-{rep}",
                     fixtures.cache,
                     with_daemon=True,
-                    expect=_silent_expect([]),
+                    expect=silent_expect([]),
                 ) as pod:
                     with NodeSampler(pod, pod.roles()) as sampler:
                         arm = _drive_clients(
@@ -1477,7 +1483,7 @@ def run_self_test() -> int:  # noqa: C901 - a flat list of checks reads better h
 # ---- main -------------------------------------------------------------------
 
 
-def _int_list(raw: str) -> tuple[int, ...]:
+def int_list(raw: str) -> tuple[int, ...]:
     return tuple(int(x) for x in raw.replace(",", " ").split())
 
 
@@ -1500,19 +1506,19 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "--clients",
-        type=_int_list,
+        type=int_list,
         default=DEFAULT_CLIENT_COUNTS,
         help="concurrent-client counts to sweep (default: %(default)s)",
     )
     parser.add_argument(
         "--chain-depths",
-        type=_int_list,
+        type=int_list,
         default=DEFAULT_CHAIN_DEPTHS,
         help="proxy-chain depths to sweep (default: %(default)s)",
     )
     parser.add_argument(
         "--knobs",
-        type=_int_list,
+        type=int_list,
         default=DEFAULT_KNOB_VALUES,
         help="max-substitution-jobs / http-connections values (default: %(default)s)",
     )
@@ -1525,7 +1531,7 @@ def main() -> int:
     )
     parser.add_argument(
         "--extrapolate-to",
-        type=_int_list,
+        type=int_list,
         default=scalefit.DEFAULT_EXTRAPOLATION_TARGETS,
         help="n values to extrapolate to (default: %(default)s)",
     )
