@@ -406,6 +406,15 @@ def extrapolate(fit: CandidateFit, n: float, max_measured_n: float) -> dict:
     mean_ci = _interval(fit, n, prediction=False)
     pred_pi = _interval(fit, n, prediction=True)
     factor = n / max_measured_n if max_measured_n else float("inf")
+    # Every metric this fitter is pointed at (bytes, descriptors, seconds) is
+    # non-negative, but a symmetric t interval knows nothing about that domain.
+    # An interval reaching below zero is therefore not a mystery to hide or a
+    # number to silently clamp - it is the fit telling you it does not constrain
+    # this metric at all. Surfaced as its own flag so a reader sees the verdict
+    # rather than an absurd bound.
+    below_zero = any(
+        interval is not None and interval[0] < 0.0 for interval in (mean_ci, pred_pi)
+    )
     return {
         "kind": MODEL_OUTPUT_KIND,
         "n": n,
@@ -417,10 +426,19 @@ def extrapolate(fit: CandidateFit, n: float, max_measured_n: float) -> dict:
         "r_squared": fit.r_squared,
         "residual_std_error": fit.residual_std_error,
         "extrapolation_factor_beyond_measured": factor,
+        "interval_extends_below_zero": below_zero,
         "caveat": (
             f"MODEL OUTPUT, not a measurement: {factor:.1f}x beyond the largest "
             f"measured n ({max_measured_n:g}). Resource scaling laws only; "
             "emergent network effects are out of scope."
+            + (
+                " UNINFORMATIVE: the interval extends below zero, which is "
+                "outside the physical range of this metric - the fit does not "
+                "constrain it at this n. Do not read the point estimate as a "
+                "prediction."
+                if below_zero
+                else ""
+            )
         ),
     }
 
@@ -878,6 +896,27 @@ def run_self_test() -> int:  # noqa: C901 - a flat list of checks reads better h
         width_1000 > width_100,
         f"{width_1000:.6f} vs {width_100:.6f}",
     )
+    # A metric whose interval reaches below zero is UNINFORMATIVE, not a bound
+    # to quietly clamp. Observed on a real sweep (client p95 latency at n=1000),
+    # so the flag is checked both ways: on a noisy near-zero series and on a
+    # clean one, so it is not always-on.
+    wild = fit_scaling(
+        ns,
+        _synthetic("constant", ns, a=0.15, b=0.0, noise=0.9, seed=31),
+        metric="wild-latency",
+        unit="seconds",
+    )
+    check(
+        "an interval reaching below zero is flagged UNINFORMATIVE",
+        wild["extrapolations"][-1]["interval_extends_below_zero"],
+        f"mean CI {wild['extrapolations'][-1]['ci95_mean_response']} / "
+        f"prediction PI {wild['extrapolations'][-1]['pi95_new_observation']}",
+    )
+    check(
+        "and the flag is not always-on (a clean fit is not flagged)",
+        not cover["extrapolations"][-1]["interval_extends_below_zero"],
+    )
+
     noisy_shape = fit_scaling(
         ns,
         _synthetic("linear", ns, a=64.0, b=8.0, noise=0.05, seed=23),

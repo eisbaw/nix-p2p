@@ -1062,7 +1062,12 @@ def print_human_summary(report: dict) -> None:
         print(
             f"        n={far['n']}: {far['point_estimate']:.6g} {fit['unit']} "
             f"(95% CI {far['ci95_mean_response']})"
-            + ("" if fit["identifiable"] else "  [class NOT identifiable]"),
+            + ("" if fit["identifiable"] else "  [class NOT identifiable]")
+            + (
+                "  [UNINFORMATIVE: interval crosses zero]"
+                if far["interval_extends_below_zero"]
+                else ""
+            ),
             file=out,
         )
     print(
