@@ -25,10 +25,22 @@
 //!     HOLDS. The only valid oracle for RELEASE. `VmHWM` cannot answer it (it is
 //!     monotone by kernel definition) and `VmRSS` need not (glibc may keep a freed
 //!     arena), which is proven by mutation in `store_residency_oracle.rs`.
-//!   * `VmHWM` - valid for exactly one direction: DID WE ALLOCATE. A high-water
-//!     mark cannot miss an allocation that happened, and that is precisely what
-//!     task-72 AC#4 asks for ("without the bound, RSS tracks the NAR size"). It is
-//!     used here for that and never to claim a release.
+//!   * `VmRSS` measured WHILE THE PAYLOAD IS STILL ALIVE - valid for exactly one
+//!     direction: DID WE ALLOCATE. Live, touched pages are resident by definition,
+//!     so a 64 MiB buffer we are still holding cannot fail to show up. That is
+//!     precisely what task-72 AC#4 asks for ("without the bound, RSS tracks the NAR
+//!     size"). It is used here for that and NEVER to claim a release, where the
+//!     allocator's arena policy makes it unsound.
+//!
+//! `VmHWM` was the first choice for the allocation direction and is WRONG here, for
+//! a reason worth writing down: it is a high-water mark over the whole PROCESS, and
+//! `cargo test` runs this file's tests as threads of one process. Once any test has
+//! allocated 64 MiB, the mark is already there, and the next test's identical
+//! allocation produces NO RISE - so the assertion fails on correct code, depending
+//! on the order the scheduler happened to pick. Measured: a rise of 8,359,936 B for
+//! a 67,108,976 B NAR that was genuinely allocated. Monotone is exactly what makes
+//! it safe against missing an allocation and exactly what makes it useless for
+//! measuring a second one.
 //!
 //! Every oracle in this file is proven by MUTATION - the bound is REMOVED with
 //! `ServeBudget::unbounded()` and the same assertions are shown to flip. A test
@@ -92,6 +104,24 @@ const SMALL_BUDGET_BYTES: u64 = 16 * 1024 * 1024;
 const RELEASE_DEADLINE: Duration = Duration::from_secs(20);
 /// Sweep interval for the supply-model providers under test.
 const SWEEP: Duration = Duration::from_millis(100);
+/// How long a deliberately-blocked supplier stays blocked before giving up. It
+/// exists so a FAILING test still terminates - see `CountingSupplier::supply`.
+/// Comfortably longer than any assertion deadline in this file, so it never ends a
+/// block early enough to change what a test observes.
+const BLOCKED_SUPPLY_LIMIT: Duration = Duration::from_secs(45);
+
+/// RESIDENT MEMORY IS PROCESS-GLOBAL, and `cargo test` runs this file's tests as
+/// THREADS of one process. A concurrent test holding a 64 MiB payload would land
+/// inside another's measured window, and the failure mode is a FALSE ALARM on the
+/// bound - the worst kind to debug. Every RSS-measured window is taken under this
+/// lock, so the readings bracket one allocation story at a time.
+///
+/// It does not make the reading attributable - nothing can - it makes it EXCLUSIVE,
+/// which is what the negative assertion ("the bounded arm did NOT allocate") needs.
+/// A TOKIO mutex, not a `std` one: these are async tests and the guard is held
+/// across awaits, where a blocking guard would park a runtime worker (and clippy
+/// says so).
+static VM_HWM_WINDOW: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 /// One `VmXxx: N kB` field of this process, in BYTES. Panics rather than reading
 /// 0 on a missing field: an instrument that silently reports zero would make every
@@ -159,6 +189,11 @@ struct CountingSupplier {
     /// A size this supplier CLAIMS for one digest without being able to back it -
     /// used to prove admission reads the declared size and never the real bytes.
     lie: Option<(Blake3Digest, u64)>,
+    /// A digest whose `supply` BLOCKS until the flag is set. It models the one
+    /// thing a hostile-or-slow peer can do that no timeout on our side prevents:
+    /// keep a serve in flight. Tests use it to hold the in-flight table non-empty
+    /// while something else must still make progress.
+    block: Option<(Blake3Digest, Arc<std::sync::atomic::AtomicBool>)>,
 }
 
 impl CountingSupplier {
@@ -170,6 +205,7 @@ impl CountingSupplier {
                 .collect(),
             supplied: AtomicUsize::new(0),
             lie: None,
+            block: None,
         }
     }
 
@@ -190,6 +226,23 @@ impl NarSupplier for CountingSupplier {
 
     fn supply(&self, content: &Blake3Digest) -> Result<Vec<u8>, SupplyError> {
         self.supplied.fetch_add(1, Ordering::SeqCst);
+        if let Some((digest, released)) = &self.block
+            && digest == content
+        {
+            // Polled, not parked: `supply` runs under `spawn_blocking`, so blocking
+            // here is legitimate, and a poll keeps the test free of a second
+            // synchronisation primitive to get wrong.
+            //
+            // BOUNDED, and that bound is not decoration. `spawn_blocking` tasks
+            // cannot be cancelled, and dropping a tokio runtime WAITS for them - so
+            // an unbounded spin here means any test that panics before releasing
+            // the flag hangs forever instead of reporting its failure. Found the
+            // hard way while mutation-testing this file.
+            let give_up = Instant::now() + BLOCKED_SUPPLY_LIMIT;
+            while !released.load(Ordering::SeqCst) && Instant::now() < give_up {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        }
         self.nars
             .get(content)
             .cloned()
@@ -208,6 +261,10 @@ async fn the_serve_bound_declines_a_large_nar_and_removing_it_restores_the_alloc
     let content = Blake3Digest::from_raw_nar(&nar);
     let nar_len = nar.len() as u64;
 
+    // Exclusive for the whole test: both arms measure VmHWM, and they must not be
+    // measured through each other or through another test's payload.
+    let _window = VM_HWM_WINDOW.lock().await;
+
     // ---- ARM 1: the bound is IN PLACE. -----------------------------------
     let supplier = Arc::new(CountingSupplier::new([nar.clone()]));
     let bounded = IrohProvider::spawn_supplying(
@@ -215,6 +272,7 @@ async fn the_serve_bound_declines_a_large_nar_and_removing_it_restores_the_alloc
         ServeBudget {
             max_nar_bytes_uncompressed_nar: SMALL_BUDGET_BYTES,
             max_inflight_bytes_uncompressed_nar: SMALL_BUDGET_BYTES,
+            ..ServeBudget::default()
         },
         SWEEP,
     )
@@ -222,7 +280,7 @@ async fn the_serve_bound_declines_a_large_nar_and_removing_it_restores_the_alloc
     .expect("provider spawns");
     let client = client_wired_to(&bounded).await;
 
-    let hwm_before_bounded = vm_bytes("VmHWM");
+    let rss_before_bounded = vm_bytes("VmRSS");
     let refused = fetch(&client, &bounded, &content).await;
     assert!(
         refused.is_err(),
@@ -258,8 +316,8 @@ async fn the_serve_bound_declines_a_large_nar_and_removing_it_restores_the_alloc
         StoreResidency::default(),
         "a declined serve must leave the store holding nothing"
     );
-    let hwm_after_bounded = vm_bytes("VmHWM");
-    let rise_bounded = hwm_after_bounded.saturating_sub(hwm_before_bounded);
+    let rss_after_bounded = vm_bytes("VmRSS");
+    let rise_bounded = rss_after_bounded.saturating_sub(rss_before_bounded);
 
     client.shutdown().await;
     bounded.shutdown().await;
@@ -273,7 +331,7 @@ async fn the_serve_bound_declines_a_large_nar_and_removing_it_restores_the_alloc
             .expect("provider spawns");
     let client2 = client_wired_to(&unbounded).await;
 
-    let hwm_before_unbounded = vm_bytes("VmHWM");
+    let rss_before_unbounded = vm_bytes("VmRSS");
     let served = fetch(&client2, &unbounded, &content)
         .await
         .expect("without a bound the same request is served");
@@ -289,14 +347,18 @@ async fn the_serve_bound_declines_a_large_nar_and_removing_it_restores_the_alloc
         "the unbounded arm must have REGENERATED the NAR - that is the allocation \
          the bound prevents"
     );
-    let hwm_after_unbounded = vm_bytes("VmHWM");
-    let rise_unbounded = hwm_after_unbounded.saturating_sub(hwm_before_unbounded);
+    // TAKEN WHILE `served` IS STILL ALIVE. That is the whole basis of this
+    // reading: the fetched NAR is a live, touched buffer, so it is resident by
+    // definition and cannot be missed. Reading after dropping it would be asking
+    // the allocator a question it does not have to answer honestly.
+    let rss_after_unbounded = vm_bytes("VmRSS");
+    let rise_unbounded = rss_after_unbounded.saturating_sub(rss_before_unbounded);
 
-    // AC#4's bite, stated as a comparison rather than an absolute: peak RSS
+    // AC#4's bite, stated as a comparison rather than an absolute: resident memory
     // TRACKS the NAR size when the bound is gone and does not when it is there.
-    // VmHWM is a sound oracle in exactly this direction - it is monotone, so it
-    // cannot MISS an allocation that happened. (It is useless for the opposite
-    // question, which is why release is asserted on store residency instead.)
+    // Sound in this direction because the payload is LIVE at the reading; unsound
+    // in the other, which is why every release claim in this file is on store
+    // residency instead.
     assert!(
         rise_unbounded >= nar_len / 2,
         "removing the bound must make peak RSS track the NAR: it rose {rise_unbounded} B \
@@ -312,8 +374,8 @@ async fn the_serve_bound_declines_a_large_nar_and_removing_it_restores_the_alloc
         "task-72 AC#1/AC#4, measured on this host:\n  \
          NAR                    = {nar_len} B (uncompressed NAR)\n  \
          per-NAR bound          = {SMALL_BUDGET_BYTES} B\n  \
-         BOUNDED   -> declined={} supplier_calls={} VmHWM rise={rise_bounded} B\n  \
-         UNBOUNDED -> served={} B supplier_calls={} VmHWM rise={rise_unbounded} B",
+         BOUNDED   -> declined={} supplier_calls={} VmRSS rise={rise_bounded} B\n  \
+         UNBOUNDED -> served={} B supplier_calls={} VmRSS rise={rise_unbounded} B",
         counters.declined_too_large,
         supplier.supplied(),
         served.len(),
@@ -358,6 +420,53 @@ async fn admission_reads_the_declared_size_and_never_the_bytes() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn a_source_that_produces_more_than_it_declared_is_refused() {
+    // The budget charged for what the supplier DECLARED. If the produced bytes are
+    // only checked against the per-NAR cap, a source that declared 1 KiB and
+    // produced 4 MiB sails through (4 MiB < the cap) while the in-flight ledger
+    // still says 1 KiB - and the in-flight total is exactly the bound that stops a
+    // swarm of individually-acceptable serves. The two sizes describe the same NAR,
+    // so they must be EQUAL, not merely both under a cap.
+    let nar = nar_of(4 * 1024 * 1024, 0xe1);
+    let content = Blake3Digest::from_raw_nar(&nar);
+    let mut supplier = CountingSupplier::new([nar]);
+    // Declares 1 KiB; will produce 4 MiB.
+    supplier.lie = Some((content, 1024));
+    let supplier = Arc::new(supplier);
+
+    let provider = IrohProvider::spawn_supplying(supplier.clone(), ServeBudget::default(), SWEEP)
+        .await
+        .expect("provider spawns");
+    let client = client_wired_to(&provider).await;
+
+    assert!(
+        fetch(&client, &provider, &content).await.is_err(),
+        "a source that produced 4 MiB against a 1 KiB reservation must be refused"
+    );
+    assert_eq!(
+        supplier.supplied(),
+        1,
+        "the mismatch is only observable AFTER the source produced its bytes, so \
+         the supplier must have been called - otherwise this test is passing for \
+         the wrong reason"
+    );
+    assert_eq!(
+        provider.serve_counters().declined_too_large,
+        1,
+        "the refusal must be attributed to the SIZE, not folded into supply_failed"
+    );
+    let idle = poll_until_empty(&provider).await;
+    assert_eq!(
+        idle,
+        StoreResidency::default(),
+        "a refused mismatch must leave nothing behind, got {idle:?}"
+    );
+
+    client.shutdown().await;
+    provider.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn the_inflight_total_declines_a_second_serve_it_cannot_afford() {
     // Two DISTINCT NARs, each individually acceptable, whose SUM is not. The
     // per-NAR bound cannot catch this; the in-flight total is the bound that does.
@@ -376,6 +485,7 @@ async fn the_inflight_total_declines_a_second_serve_it_cannot_afford() {
             max_nar_bytes_uncompressed_nar: 8 * 1024 * 1024,
             // Room for exactly ONE of them at a time.
             max_inflight_bytes_uncompressed_nar: a.len() as u64,
+            ..ServeBudget::default()
         },
         SWEEP,
     )
@@ -404,6 +514,7 @@ async fn the_inflight_total_declines_a_second_serve_it_cannot_afford() {
         ServeBudget {
             max_nar_bytes_uncompressed_nar: 8 * 1024 * 1024,
             max_inflight_bytes_uncompressed_nar: 1,
+            ..ServeBudget::default()
         },
         SWEEP,
     )
@@ -432,6 +543,12 @@ async fn the_inflight_total_declines_a_second_serve_it_cannot_afford() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn announcing_holds_nothing_and_a_completed_serve_releases_what_it_used() {
+    // Held for the same reason the bound test holds it: this test allocates the
+    // same 64 MiB payload, and doing so inside that test's measured window would
+    // make its negative RSS assertion fail for a reason that has nothing to do with
+    // the bound.
+    let _window = VM_HWM_WINDOW.lock().await;
+
     let nar = nar_of(BIG_NAR_BYTES, 0x44);
     let content = Blake3Digest::from_raw_nar(&nar);
     let nar_len = nar.len() as u64;
@@ -633,6 +750,189 @@ async fn concurrent_requests_for_one_absent_digest_regenerate_it_exactly_once() 
     let idle = poll_until_empty(&provider).await;
     assert_eq!(idle, StoreResidency::default(), "got {idle:?}");
 
+    provider.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_peer_that_disconnects_mid_admission_gives_its_reservation_back() {
+    // THE S1 DEFECT, as an experiment. The first cut released the reservation where
+    // the transfer's UPDATE STREAM ended, and returned early - without releasing -
+    // when the verdict could not be delivered. That is precisely what happens when
+    // the peer hangs up, and the window spans the whole regeneration. Four such
+    // requests left the node permanently `busy` for everyone, holding a gigabyte it
+    // would never release, with no timeout, no reaper and no counter to show it.
+    //
+    // The oracle is the BUDGET, not the code path: after a peer vanishes mid-serve,
+    // an honest peer must still be admitted. That stays true however the release is
+    // implemented, which is what makes it worth asserting.
+    let big = nar_of(4 * 1024 * 1024, 0xc1);
+    let other = nar_of(4 * 1024 * 1024, 0xc2);
+    let (big_digest, other_digest) = (
+        Blake3Digest::from_raw_nar(&big),
+        Blake3Digest::from_raw_nar(&other),
+    );
+    let released = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let mut supplier = CountingSupplier::new([big.clone(), other.clone()]);
+    supplier.block = Some((big_digest, released.clone()));
+    let supplier = Arc::new(supplier);
+
+    let provider = IrohProvider::spawn_supplying(
+        supplier.clone(),
+        ServeBudget {
+            max_nar_bytes_uncompressed_nar: 8 * 1024 * 1024,
+            // Room for exactly ONE of the two at a time, so a leaked reservation is
+            // immediately visible as the other one being refused.
+            max_inflight_bytes_uncompressed_nar: big.len() as u64,
+            // SHORT ON PURPOSE, and the reason is a measured one: when a peer
+            // vanishes the provider's update stream does not end - the connection
+            // stays live from our side until QUIC's idle timeout - so this deadline
+            // is the ONLY thing that reclaims the reservation. Pinned here rather
+            // than inherited so the test is about the mechanism and not about
+            // whatever the shipped default happens to be.
+            max_serve_duration: Duration::from_secs(2),
+        },
+        SWEEP,
+    )
+    .await
+    .expect("provider spawns");
+    let addr = provider.addr().await.expect("provider addr");
+    let node = provider.node_id();
+
+    // A peer that asks for the blocked digest and then GOES AWAY while the node is
+    // still regenerating it.
+    let doomed = {
+        let addr = addr.clone();
+        tokio::spawn(async move {
+            let client = IrohTransport::spawn().await.expect("client binds");
+            client.add_peer(&addr);
+            let _ = client
+                .fetch(&big_digest, &KnownTransport::Iroh { node }, None)
+                .await;
+            client.shutdown().await;
+        })
+    };
+    // Let the admission get as far as the blocked supplier.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    doomed.abort();
+    let _ = doomed.await;
+    released.store(true, Ordering::SeqCst);
+
+    // THE ASSERTION: the budget comes BACK, within a bound, so an honest peer is
+    // served. Stated as "within a bound" and not "immediately" on purpose - the
+    // abandoned admission is legitimately still finishing its regeneration for a
+    // moment after the peer leaves, and refusing during that moment is the budget
+    // working, not leaking. What must not happen is that it never comes back.
+    //
+    // THE BOUND IS THE BITE. With `max_serve_duration` raised, this loop runs to
+    // its own deadline and fails - which is how the deadline was shown to be the
+    // thing doing the work, rather than something else happening to tidy up.
+    let client = client_wired_to(&provider).await;
+    let deadline = Instant::now() + Duration::from_secs(20);
+    let served = loop {
+        match fetch(&client, &provider, &other_digest).await {
+            Ok(bytes) => break bytes,
+            Err(why) => {
+                assert!(
+                    Instant::now() < deadline,
+                    "the honest peer was still refused {:?} after the vanished peer \
+                     left: its reservation was never given back, so the budget is \
+                     permanently short. Last error: {why}",
+                    Duration::from_secs(20)
+                );
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+        }
+    };
+    assert_eq!(served, other);
+
+    // ...and the store settles empty, so the abandoned blob was not pinned either.
+    let idle = poll_until_empty(&provider).await;
+    assert_eq!(idle, StoreResidency::default(), "got {idle:?}");
+
+    client.shutdown().await;
+    provider.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn the_collector_still_reclaims_while_another_serve_is_in_flight() {
+    // THE S2 DEFECT, as an experiment. The first cut let a sweep run only from
+    // global quiescence: the protect callback ABORTED whenever anything was in
+    // flight. Under sustained traffic the in-flight table is never empty at a tick,
+    // so nothing was ever collected - and a `MemStore` has no capacity bound of its
+    // own, so resident bytes would grow to the whole announced corpus. One slow
+    // reader is enough to hold that door open. "Holds nothing at rest" would then
+    // be true only of a node that is not being used.
+    //
+    // The callback now PROTECTS what is in flight instead of refusing to run, which
+    // is both safer (an admission registers its hash before it adds) and stronger.
+    let served_then_idle = nar_of(4 * 1024 * 1024, 0xd1);
+    let held_open = nar_of(4 * 1024 * 1024, 0xd2);
+    let (idle_digest, held_digest) = (
+        Blake3Digest::from_raw_nar(&served_then_idle),
+        Blake3Digest::from_raw_nar(&held_open),
+    );
+    let release = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let mut supplier = CountingSupplier::new([served_then_idle.clone(), held_open]);
+    supplier.block = Some((held_digest, release.clone()));
+    let supplier = Arc::new(supplier);
+
+    let provider = IrohProvider::spawn_supplying(supplier, ServeBudget::default(), SWEEP)
+        .await
+        .expect("provider spawns");
+    let addr = provider.addr().await.expect("provider addr");
+    let node = provider.node_id();
+
+    // ORDER MATTERS, and getting it wrong makes this test vacuous - which is how
+    // the first cut of it was caught. If the finished serve completes BEFORE
+    // anything is in flight, the collector reclaims it during the quiet moment and
+    // the test passes under the aborting callback too. The blocked serve must be in
+    // flight FIRST, and stay there.
+    //
+    // 1. Start a serve and KEEP IT IN FLIGHT (its supplier is blocked).
+    let stuck = {
+        let addr = addr.clone();
+        tokio::spawn(async move {
+            let client = IrohTransport::spawn().await.expect("client binds");
+            client.add_peer(&addr);
+            let got = client
+                .fetch(&held_digest, &KnownTransport::Iroh { node }, None)
+                .await;
+            client.shutdown().await;
+            got
+        })
+    };
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    // 2. NOW serve a different NAR to completion, with the first one still stuck.
+    //    Its blob is resident and untagged the moment it finishes, and the node is
+    //    never idle again for the rest of the test.
+    let client = client_wired_to(&provider).await;
+    fetch(&client, &provider, &idle_digest)
+        .await
+        .expect("a second NAR is served while the first is still in flight");
+
+    // 3. THE ASSERTION: the finished serve is reclaimed to ZERO even though the
+    //    node is still busy.
+    //
+    //    ZERO, not "under some ceiling". The first cut of this assertion allowed
+    //    "one in-flight serve" worth of residency - but the stuck serve is blocked
+    //    INSIDE its supplier, so its blob was never added and it occupies no store
+    //    bytes at all. The ceiling could therefore never be exceeded and the test
+    //    passed under the aborting callback too. Caught by mutation M9; recorded
+    //    here because a ceiling that cannot be exceeded is not a ceiling.
+    let idle = poll_until_empty(&provider).await;
+    assert_eq!(
+        idle,
+        StoreResidency::default(),
+        "the collector did not reclaim the finished serve while another was in \
+         flight - the store is still holding {idle:?}. A node that only reclaims \
+         when it is idle does not hold nothing at rest: it holds everything it has \
+         ever served, for as long as any peer keeps one request open"
+    );
+
+    release.store(true, Ordering::SeqCst);
+    let _ = stuck.await;
+    client.shutdown().await;
     provider.shutdown().await;
 }
 

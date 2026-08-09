@@ -72,9 +72,10 @@ pub use transport_fetch::{
     TransportTag, fetch_via_offers, verify_blake3,
 };
 pub use transport_iroh::{
-    BODY_IDLE_TIMEOUT, DEFAULT_MAX_INFLIGHT_NAR_BYTES, DEFAULT_MAX_SERVE_NAR_BYTES, DIAL_TIMEOUT,
-    FETCH_TIMEOUT, FileNarSupplier, IndexNarSupplier, IrohError, IrohPeerAddr, IrohProvider,
-    IrohTransport, NarSupplier, SafetyEnvelope, ServeBudget, ServeCounters, ServeDecline,
-    ServeWindow, StoreResidency, StoreRetention, SupplyError, iroh_blobs_alpn,
+    BODY_IDLE_TIMEOUT, DEFAULT_MAX_INFLIGHT_NAR_BYTES, DEFAULT_MAX_SERVE_DURATION,
+    DEFAULT_MAX_SERVE_NAR_BYTES, DIAL_TIMEOUT, FETCH_TIMEOUT, FileNarSupplier, IndexNarSupplier,
+    IrohError, IrohPeerAddr, IrohProvider, IrohTransport, NarSupplier, SafetyEnvelope, ServeBudget,
+    ServeCounters, ServeDecline, ServeWindow, StoreResidency, StoreRetention, SupplyError,
+    iroh_blobs_alpn,
 };
 pub use upstream::UpstreamHttp;

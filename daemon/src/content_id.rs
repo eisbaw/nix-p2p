@@ -95,6 +95,18 @@ pub const BLAKE3_PREFIX: &str = "blake3:";
 /// empty-input vector.
 pub const BLAKE3_DOMAIN_SEPARATION: Option<&[u8]> = None;
 
+/// The recipe pin, as a COMPILE-TIME assertion rather than a `debug_assert` in
+/// each constructor. Both forms said the same thing, but a `debug_assert` fires
+/// only in debug builds and only when the function runs; this fails the BUILD, in
+/// every profile, the moment someone adds domain separation without reckoning with
+/// what it does (it splits the network and diverges from the iroh-blobs blob hash).
+/// Same idiom as the ALPN cross-check in `transport_iroh`.
+const _: () = assert!(
+    BLAKE3_DOMAIN_SEPARATION.is_none(),
+    "the frozen recipe is plain unkeyed BLAKE3 (task-48); domain separation would \
+     split the network and diverge from the iroh-blobs blob hash"
+);
+
 /// Slice size [`Blake3Digest::stream_raw_nar`] consumes its input in, and hence
 /// its peak allocation regardless of NAR size. NOT frozen and NOT interop-visible:
 /// BLAKE3 is a streaming hash, so any chunking yields the identical digest. 64 KiB
@@ -118,11 +130,6 @@ impl Blake3Digest {
     /// it. `debug_assert` on [`BLAKE3_DOMAIN_SEPARATION`] pins the recipe against
     /// a future edit that adds separation without updating this function.
     pub fn from_raw_nar(raw_nar: &[u8]) -> Self {
-        debug_assert!(
-            BLAKE3_DOMAIN_SEPARATION.is_none(),
-            "the frozen recipe is plain unkeyed BLAKE3; adding domain separation \
-             splits the network and diverges from the iroh-blobs blob hash"
-        );
         Blake3Digest(*blake3::hash(raw_nar).as_bytes())
     }
 
@@ -143,11 +150,6 @@ impl Blake3Digest {
     /// `streaming_recipe_equals_the_one_shot_recipe` asserts it over sizes that
     /// straddle the chunk boundary rather than trusting that sentence.
     pub fn stream_raw_nar<R: std::io::Read>(mut raw_nar: R) -> std::io::Result<(Self, u64)> {
-        debug_assert!(
-            BLAKE3_DOMAIN_SEPARATION.is_none(),
-            "the frozen recipe is plain unkeyed BLAKE3; adding domain separation \
-             splits the network and diverges from the iroh-blobs blob hash"
-        );
         let mut hasher = blake3::Hasher::new();
         let mut chunk = vec![0u8; STREAM_CHUNK_BYTES];
         let mut total: u64 = 0;

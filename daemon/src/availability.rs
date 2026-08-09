@@ -454,6 +454,12 @@ pub struct AvailabilityIndex {
     /// the caller already has, exactly like [`AvailabilityIndex::hold`], so the
     /// no-enumeration invariant is unchanged.
     ///
+    /// It is PRUNED with the registration it came from ([`Self::forget_supply_bindings`]),
+    /// so supply can never outlive hold. Without that, a store path that was
+    /// un-registered but still present on disk stayed fully servable - supply
+    /// strictly larger than hold, which is AC#2 failing in the one direction that
+    /// matters (announcing a serve the index has disowned).
+    ///
     /// STATED LIMIT (the task-61 seeding gap, filed as task-82): this map is
     /// in-memory, so after a restart a digest is unsuppliable until some
     /// hold-query re-derives it. Warming it at boot would mean re-dumping the
@@ -530,13 +536,21 @@ impl AvailabilityIndex {
             }
             // New key OR a moved path: a fresh entry with an uncomputed digest. Never
             // touches a digest lock, so the map lock is never held over one.
-            entries.insert(
+            let replaced = entries.insert(
                 key,
                 Arc::new(Entry {
                     store_path,
                     digest: Mutex::new(None),
                 }),
             );
+            // The supply direction must follow the registration. A replaced entry
+            // whose digest was already derived would otherwise stay servable under
+            // the OLD path forever - supply would be a superset of hold, which is
+            // the AC#2 equality failing in the direction that matters (announcing a
+            // serve for content the index has disowned).
+            if let Some(replaced) = replaced {
+                self.forget_supply_bindings(&replaced);
+            }
             self.persist_locked(&entries)?;
         }
         Ok(())
@@ -627,6 +641,20 @@ impl AvailabilityIndex {
         Ok(raw_nar)
     }
 
+    /// Withdraw every supply binding that points at `gone`, so a registration the
+    /// index has disowned stops being servable at the same instant.
+    ///
+    /// By POINTER IDENTITY, not by digest: the caller holds the exact `Arc` that
+    /// was removed, and matching on the digest would mean recomputing it (a dump)
+    /// on a path whose whole purpose is to forget. Called with the `entries` lock
+    /// held, which fixes the lock order as entries-then-by_digest everywhere.
+    fn forget_supply_bindings(&self, gone: &Arc<Entry>) {
+        self.by_digest
+            .lock()
+            .expect("by-digest mutex")
+            .retain(|_, entry| !Arc::ptr_eq(entry, gone));
+    }
+
     /// The reverse lookup, and the ONLY way into `by_digest`. Deliberately private
     /// and deliberately per-digest: there is no method that yields the map, its
     /// keys or its length, so the no-enumeration invariant survives the addition
@@ -696,7 +724,8 @@ impl AvailabilityIndex {
     /// has the entry, so a restart reloads it; the caller sees the `Err`.
     pub fn drop(&self, key: &NarHashKey) -> Result<(), PersistError> {
         let mut entries = self.entries.lock().expect("entries mutex");
-        if entries.remove(key).is_some() {
+        if let Some(removed) = entries.remove(key) {
+            self.forget_supply_bindings(&removed);
             self.persist_locked(&entries)?;
         }
         Ok(())
@@ -711,6 +740,7 @@ impl AvailabilityIndex {
         match entries.get(key) {
             Some(current) if Arc::ptr_eq(current, observed) => {
                 entries.remove(key);
+                self.forget_supply_bindings(observed);
                 self.persist_locked(&entries)?;
             }
             // A concurrent register replaced (or a concurrent drop already removed)

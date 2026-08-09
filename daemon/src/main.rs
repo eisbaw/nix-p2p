@@ -17,11 +17,11 @@ use daemon::cacheinfo::DEFAULT_PRIORITY;
 use daemon::claim::CLAIM_SCHEMA_VERSION;
 use daemon::{
     AllowlistRawServe, App, Blake3Digest, CacheInfo, Claim, CorrelationStore,
-    DEFAULT_MAX_INFLIGHT_NAR_BYTES, DEFAULT_MAX_SERVE_NAR_BYTES, FallbackNarSource,
-    FileNarSupplier, InMemoryDiscovery, IrohPeerAddr, IrohProvider, IrohTransport, KnownPayload,
-    KnownTransport, NarCatalog, NarHashKey, NarSource, NarinfoDiskCache, NarinfoSource, NoRawServe,
-    NodeId, NullCorrelation, RawServeDecision, ServeBudget, SystemClock, TransportNarSource,
-    TransportRegistry, UpstreamHttp, serve,
+    DEFAULT_MAX_INFLIGHT_NAR_BYTES, DEFAULT_MAX_SERVE_DURATION, DEFAULT_MAX_SERVE_NAR_BYTES,
+    FallbackNarSource, FileNarSupplier, InMemoryDiscovery, IrohPeerAddr, IrohProvider,
+    IrohTransport, KnownPayload, KnownTransport, NarCatalog, NarHashKey, NarSource,
+    NarinfoDiskCache, NarinfoSource, NoRawServe, NodeId, NullCorrelation, RawServeDecision,
+    ServeBudget, SystemClock, TransportNarSource, TransportRegistry, UpstreamHttp, serve,
 };
 use tokio::net::TcpListener;
 
@@ -165,6 +165,12 @@ struct Config {
     /// Largest TOTAL across concurrently-admitted serves, same units. Bounds a
     /// swarm of peers each asking for something individually acceptable.
     iroh_max_inflight_nar_bytes: u64,
+    /// How long ONE admitted serve may hold its slice of the in-flight budget
+    /// before the reservation is reclaimed, in milliseconds. A peer that opens a
+    /// get-request and then never reads would otherwise hold its share for the life
+    /// of the process; the fetch-side safety envelope bounds a stalled HOLDER, not
+    /// a stalled READER.
+    iroh_max_serve_duration_ms: u64,
     /// How often the provider's collector may reclaim what is no longer being
     /// served, in milliseconds. It is the LATENCY of the release, not its
     /// correctness: a sweep only runs from quiescence (see `StoreRetention`).
@@ -193,6 +199,7 @@ impl Default for Config {
             iroh_seed_nar: Vec::new(),
             iroh_max_serve_nar_bytes: DEFAULT_MAX_SERVE_NAR_BYTES,
             iroh_max_inflight_nar_bytes: DEFAULT_MAX_INFLIGHT_NAR_BYTES,
+            iroh_max_serve_duration_ms: DEFAULT_MAX_SERVE_DURATION.as_millis() as u64,
             // 500 ms: comfortably inside the profiler's 3 s post-transfer settle
             // window, so an idle node's residency reading is the released one and
             // not a race; and long enough that a burst of serves does not spend the
@@ -263,6 +270,10 @@ impl Config {
                     config.iroh_max_inflight_nar_bytes =
                         parse_positive_u64("--iroh-max-inflight-nar-bytes", &value()?)?;
                 }
+                "--iroh-max-serve-duration-ms" => {
+                    config.iroh_max_serve_duration_ms =
+                        parse_positive_u64("--iroh-max-serve-duration-ms", &value()?)?;
+                }
                 "--iroh-sweep-interval-ms" => {
                     config.iroh_sweep_interval_ms =
                         parse_positive_u64("--iroh-sweep-interval-ms", &value()?)?;
@@ -298,11 +309,27 @@ impl Config {
 /// only when a peer actually asks, inside the serve budget, and released after.
 /// The `IROH-SEED` line is byte-identical, so the harness contract is unchanged.
 async fn setup_iroh_provider(config: &Config) -> Result<Arc<IrohProvider>, String> {
+    // FILE-BACKED, not store-backed. `IndexNarSupplier` (an `AvailabilityIndex`
+    // over `nix-store --dump`) is the supplier a real node wants and is proven in
+    // `daemon/tests/serve_budget_and_supply.rs`, but nothing here opens an index
+    // yet - so the shipped daemon regenerates from the raw-NAR files it was
+    // pointed at, not from /nix/store. TASK-83 wires the real one.
     let supplier = Arc::new(FileNarSupplier::new());
     let budget = ServeBudget {
         max_nar_bytes_uncompressed_nar: config.iroh_max_serve_nar_bytes,
         max_inflight_bytes_uncompressed_nar: config.iroh_max_inflight_nar_bytes,
+        max_serve_duration: std::time::Duration::from_millis(config.iroh_max_serve_duration_ms),
     };
+    // S11: a node whose in-flight total is below its per-NAR bound declines EVERY
+    // serve with `busy` - "a daemon that looks healthy and does nothing", the exact
+    // failure `parse_positive_u64` rejects 0 for. Refuse at startup, naming both.
+    if budget.max_inflight_bytes_uncompressed_nar < budget.max_nar_bytes_uncompressed_nar {
+        return Err(format!(
+            "--iroh-max-inflight-nar-bytes {} is below --iroh-max-serve-nar-bytes {}: \
+             every serve at the per-NAR bound would be declined as busy",
+            budget.max_inflight_bytes_uncompressed_nar, budget.max_nar_bytes_uncompressed_nar
+        ));
+    }
     let provider = IrohProvider::spawn_supplying(
         supplier.clone(),
         budget,
@@ -337,9 +364,10 @@ async fn setup_iroh_provider(config: &Config) -> Result<Arc<IrohProvider>, Strin
         );
     }
     println!(
-        "IROH-SERVE-BUDGET max_nar_bytes_uncompressed_nar={} max_inflight_bytes_uncompressed_nar={} sweep_interval_ms={}",
+        "IROH-SERVE-BUDGET max_nar_bytes_uncompressed_nar={} max_inflight_bytes_uncompressed_nar={} max_serve_duration_ms={} sweep_interval_ms={}",
         budget.max_nar_bytes_uncompressed_nar,
         budget.max_inflight_bytes_uncompressed_nar,
+        config.iroh_max_serve_duration_ms,
         config.iroh_sweep_interval_ms
     );
 
@@ -424,7 +452,8 @@ async fn setup_iroh_provider(config: &Config) -> Result<Arc<IrohProvider>, Strin
                     println!(
                         "IROH-SERVE-COUNTERS admitted={} regenerated={} declined={} \
                          declined_too_large={} declined_busy={} declined_unknown={} \
-                         declined_supply_failed={}",
+                         declined_supply_failed={} declined_store_unreadable={} \
+                         reservations_timed_out={}",
                         counters.admitted,
                         counters.regenerated,
                         counters.declined(),
@@ -432,6 +461,8 @@ async fn setup_iroh_provider(config: &Config) -> Result<Arc<IrohProvider>, Strin
                         counters.declined_busy,
                         counters.declined_unknown,
                         counters.declined_supply_failed,
+                        counters.declined_store_unreadable,
+                        counters.reservations_timed_out,
                     );
                 }
             }
