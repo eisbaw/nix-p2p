@@ -19,6 +19,7 @@
 //! can drive the real serving stack over loopback (`tests/`), the same code the
 //! container harness (task-5) will drive over a socket.
 
+pub mod availability;
 mod body;
 pub mod cacheinfo;
 pub mod catalog;
@@ -35,6 +36,10 @@ pub mod transport_fetch;
 pub mod transport_iroh;
 pub mod upstream;
 
+pub use availability::{
+    AnnounceSink, AvailabilityError, AvailabilityIndex, CommandNarDumper, DumpError, IndexStore,
+    JsonFileStore, NarDumper, NullAnnounce, NullStore, PersistError, StorePath,
+};
 pub use cacheinfo::CacheInfo;
 pub use catalog::{CorrelationStore, NarCatalog, NarMeta, NullCorrelation};
 pub use claim::{
