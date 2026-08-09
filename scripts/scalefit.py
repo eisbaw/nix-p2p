@@ -351,7 +351,13 @@ def _fit_basis(xs: list[float], ys: list[float], basis: Basis) -> CandidateFit:
         model=basis.name,
         label=basis.label,
         rank=basis.rank,
-        superlinear=basis.superlinear,
+        # SUPERLINEAR GROWTH, not merely a superlinear BASIS. A quadratic fit
+        # with a NEGATIVE slope is a decreasing function; calling it superlinear
+        # made task-42's near-constant fd series (11,11,...,10,10,10) a RED FLAG
+        # whose own extrapolation was -4015 descriptors at n=1000. S5(c) exists
+        # to surface growth that does not survive scale, and a false flag on a
+        # metric that went DOWN is the noise that makes a real flag ignorable.
+        superlinear=basis.superlinear and slope > 0.0,
         intercept=intercept,
         slope=slope,
         n_points=n,
@@ -793,6 +799,58 @@ def run_self_test() -> int:  # noqa: C901 - a flat list of checks reads better h
     check(
         "known O(n) is NOT flagged superlinear (the flag is not always-on)",
         linear_report["superlinear"] is False,
+    )
+
+    # A superlinear BASIS with a NEGATIVE slope is a DECREASING function and must
+    # NOT be a red flag. This is a REGRESSION TEST for a real false flag: task-42
+    # swept peer file descriptors and got 11,11,...,10,10,10 - near-constant with
+    # one step DOWN - which AICc fitted as quadratic with slope < 0 and the
+    # basis-only rule flagged as superlinear resource growth, extrapolating to
+    # -4015 descriptors at n=1000. `superlinear` now means superlinear GROWTH.
+    decreasing = fit_scaling(
+        [1, 1, 1, 2, 2, 2, 4, 4, 4, 8, 8, 8, 16, 16, 16],
+        [11, 11, 11, 11, 11, 11, 11, 11, 11, 11, 11, 11, 10, 10, 10],
+        metric="near-constant-with-a-step-down",
+        unit="descriptors",
+    )
+    check(
+        "a DECREASING fit on a superlinear basis is NOT flagged superlinear "
+        f"(selected {decreasing['selected_model']}, slope {decreasing['slope']:.4g})",
+        decreasing["slope"] < 0 and decreasing["superlinear"] is False,
+        f"model={decreasing['selected_model']} slope={decreasing['slope']} "
+        f"superlinear={decreasing['superlinear']}",
+    )
+    check(
+        "and it therefore produces NO red flag",
+        red_flags_for({"fds": decreasing}) == [],
+    )
+    # The rule must be DIRECTION-sensitive, not simply disabled. Mirror the same
+    # y series about its own mean: the slope on every basis is exactly negated
+    # while the residuals - and therefore R^2, AICc and the selected class - are
+    # unchanged. So the ONLY thing that differs is the sign, and the flag must
+    # flip. A check that merely asserted "superlinear is not None" here would
+    # have passed with the rule deleted.
+    fd_xs = [1, 1, 1, 2, 2, 2, 4, 4, 4, 8, 8, 8, 16, 16, 16]
+    fd_ys = [11, 11, 11, 11, 11, 11, 11, 11, 11, 11, 11, 11, 10, 10, 10]
+    fd_mean = sum(fd_ys) / len(fd_ys)
+    mirrored = fit_scaling(
+        fd_xs,
+        [2 * fd_mean - y for y in fd_ys],
+        metric="the same series mirrored about its mean",
+        unit="descriptors",
+    )
+    check(
+        "MIRROR: the same data with the slope sign flipped selects the SAME "
+        "class but IS flagged superlinear (direction-sensitive, not disabled)",
+        mirrored["selected_model"] == decreasing["selected_model"]
+        and mirrored["slope"] > 0
+        and mirrored["superlinear"] is True,
+        f"model={mirrored['selected_model']} slope={mirrored['slope']} "
+        f"superlinear={mirrored['superlinear']}",
+    )
+    check(
+        "and the mirrored fit DOES reach the red-flag section",
+        [f["id"] for f in red_flags_for({"fds": mirrored})] == ["fds"],
     )
 
     # --- 3. noise robustness: the selector must not chase noise -------------

@@ -212,6 +212,8 @@ scale-sweep *ARGS: _python fixtures-large
 # Full-tier fixtures + the fail-closed check-fixtures gate. SLOW tier: ~20
 # minutes of container runs at the default grid (the fast-tier half is the
 # --self-test wired into `just test`). Label-scoped cleanup on exit and SIGTERM.
+# Do NOT run this concurrently with `e2e`/`measure`/`scale-sweep`: they share one
+# podman label and would tear down each other's pods mid-run (TASK-58).
 # Run the p2p profile (RAM/disk/latency/throughput/speedup) and emit the report.
 profile *ARGS: _python fixtures-large
     "${NIX_P2P_PYTHON}/bin/python3" scripts/profile_p2p.py {{ ARGS }}

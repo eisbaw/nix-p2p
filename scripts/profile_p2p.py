@@ -920,6 +920,12 @@ def run_speedup_arms(ctx, fixtures, runs: int, state_root: Path) -> dict:
 
     # -- peers ON --
     on_runs: list[ProfileRun] = []
+    # Runs in which the holder's OWN provider counter did NOT advance by the full
+    # workload. Such a run is still VALID - its egress figure is real, and the
+    # frozen counting rule already scores an upstream fallback as full egress -
+    # but it means the peers-ON arm partly measured the peers-OFF path, and that
+    # has to be visible rather than averaged into a comfortable offload number.
+    on_shortfalls: list[dict] = []
     scratch = ctx.scratch / "speedup-seed"
     seed_dir, seeds = e2e.build_p2p_seed_dir(fixtures, scratch, list(SPEEDUP_ATTRS))
     expected_served = sum(s.nar_size for s in seeds)
@@ -948,6 +954,14 @@ def run_speedup_arms(ctx, fixtures, runs: int, state_root: Path) -> dict:
                     after = pod.node_b_served_bytes(
                         want_at_least=before + expected_served
                     )
+                    if after - before < expected_served:
+                        on_shortfalls.append(
+                            {
+                                "run": index,
+                                "served_bytes_uncompressed_nar": after - before,
+                                "expected_bytes_uncompressed_nar": expected_served,
+                            }
+                        )
                     on_runs.append(
                         score_run(
                             pod,
@@ -1019,6 +1033,13 @@ def run_speedup_arms(ctx, fixtures, runs: int, state_root: Path) -> dict:
     peers_off["disk"] = off_disk
     peers_on["sampler_errors"] = on_sampler_errors
     peers_off["sampler_errors"] = off_sampler_errors
+    peers_on["peer_serve_shortfall_runs"] = on_shortfalls
+    peers_on["peer_serve_shortfall_note"] = (
+        "runs where node-b's own provider counter did not advance by the full "
+        "workload, i.e. the build fell back to upstream. The runs stay VALID (the "
+        "egress figure is real) but a nonzero count means this arm partly "
+        "measured the peers-OFF path"
+    )
     # The 110 MiB payload is the bursty workload task-18 never had: this is where
     # the high-water/point-sample distinction gets exercised (or does not), and
     # where the in-RAM blob store's cost per held byte becomes a number.
@@ -1376,6 +1397,14 @@ def print_human_summary(report: dict) -> None:
                 f"{_mib(gap['max_gap_bytes_ram'])}{smoke}",
                 file=out,
             )
+            shortfalls = arm.get("peer_serve_shortfall_runs")
+            if shortfalls:
+                print(
+                    f"               WARNING: {len(shortfalls)} run(s) fell back "
+                    "to upstream (holder counter did not advance) - this arm "
+                    "partly measured the peers-OFF path",
+                    file=out,
+                )
             cost = arm["held_content_ram_cost"]
             if cost.get("measured"):
                 worst = max(
@@ -2080,6 +2109,11 @@ def main() -> int:
     e2e.preflight_gate(out_root)
     fixtures = e2e.resolve_fixtures(out_root)
     image = e2e.load_image()
+    # TASK-58: this sweeps EVERY pod carrying the project label, not just ours,
+    # because there is one shared label across all container instruments. Running
+    # this concurrently with `just e2e`/`measure`/`scale-sweep` makes each tear
+    # down the other's pods mid-measurement. The ~20-minute runtime here makes
+    # that overlap far likelier than it was for the short instruments.
     e2e.cleanup_pods()
 
     scratch = Path(os.environ.get("TMPDIR", "/tmp")) / f"nix-p2p-profile-{os.getpid()}"
@@ -2125,11 +2159,14 @@ def main() -> int:
         config,
         args.extrapolate_to,
     )
-    print_human_summary(report)
+    # PERSIST BEFORE PRETTY-PRINTING. The human summary is a formatter over a
+    # report that cost ~20 minutes of container runs to produce; a KeyError in
+    # the formatter must not be able to throw the measurement away.
     text = json.dumps(report, indent=2, default=str)
     if args.report:
         args.report.write_text(text + "\n")
         print(f"profile: report written to {args.report}", file=sys.stderr)
+    print_human_summary(report)
     print(text)
     return 0 if report["verdict"]["usable"] else 1
 

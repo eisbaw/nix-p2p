@@ -86,6 +86,7 @@ Slow tier (minutes, containers/VMs; not part of the fast loop):
 just e2e        # podman-pod scenario suite (needs rootless podman)
 just e2e-vm     # NixOS VM test (needs /dev/kvm)
 just measure    # egress/latency/gap measurement report
+just profile    # p2p RAM/disk/latency/throughput/speedup report (peer swarm)
 just journey    # J1 operator journey
 ```
 
