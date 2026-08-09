@@ -281,7 +281,32 @@ Tentative / replaceable (velocity surfaces):
    post-MVP.
 9. **Privacy accepted, not solved**; leech mode is the mitigation.
 10. **iroh API churn**: accepted maintenance tax.
-11. **Stale figures**: fig-candidate-B/C SVGs still show gossip-first
+11. **Peer-transport throughput ceiling ≈ 2 Gb/s per connection, and it
+    is inherent to QUIC-over-UDP, not to our code** (MEASURED,
+    task-64, `daemon/examples/iroh_throughput.rs`, 110 MiB on
+    loopback, medians): the product's `IrohTransport::fetch` moves
+    187 MB/s; iroh-blobs alone 255 MB/s; raw QUIC on the same iroh
+    endpoint stack 371 MB/s; loopback TCP 1042 MB/s. Decomposed,
+    73% of the per-byte cost sits *below* our code (50% raw
+    QUIC/UDP, 23% iroh-blobs+bao); deleting all of our own overhead
+    would buy 1.36x, not the 3.6x the task-42 report's framing
+    implies. The cause is **UDP datagram rate**, not CPU, crypto or
+    BLAKE3: plain loopback UDP at QUIC's 1452 B datagram size — no
+    crypto, no congestion control, no reliability — runs at only
+    196 MB/s, *slower* than the full iroh path, while no thread
+    anywhere exceeds 0.58 of a core and the product path makes 68x
+    the context switches of the TCP arm for the same bytes.
+    CONSEQUENCE FOR THE THESIS: 255 MB/s is ~2.0 Gb/s, so on 1 GbE,
+    Wi-Fi or any WAN link the peer transport is *not* the binding
+    constraint and this deficit does not touch the value thesis. It
+    binds only where the alternative source is faster than ~2 Gb/s —
+    i.e. loopback and 10 GbE. The task-42 3.6x is therefore mostly a
+    statement about an unrealistically fast *baseline* (loopback TCP
+    with 64 KiB writes), which is exactly what task-63's WAN-shaped
+    upstream arm exists to fix. One large lever remains and is not
+    yet taken: 4 concurrent connections reach 649 MB/s aggregate
+    (2.54x), so the limit is per-connection, not machine-wide.
+12. **Stale figures**: fig-candidate-B/C SVGs still show gossip-first
     with tracker cold-start; superseded by DHT-authoritative
     decision. Revise before phase 2 or implementers will build the
     wrong discovery layer.
