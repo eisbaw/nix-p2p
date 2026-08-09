@@ -90,12 +90,13 @@ import math
 import os
 import random
 import shutil
-import signal
 import statistics
 import subprocess
 import sys
 import tempfile
 import time
+import traceback
+import zlib
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -109,7 +110,7 @@ import scalefit
 # "peak RSS" whose first divergence would be invisible. `measure` owns the frozen
 # egress counting rule. Both are import-clean (no side effects at import).
 import scale_sweep as ss
-from measure import classify_run, percentile, stat_block
+from measure import BASELINE_MIN_VALID_RUNS, classify_run, percentile, stat_block
 
 # ---- frozen constants (this instrument's counting rule) ---------------------
 
@@ -132,7 +133,7 @@ DEFAULT_REPEATS = 3
 # Runs per arm in the speedup/throughput arm. 10 is
 # `measure.BASELINE_MIN_VALID_RUNS`, the frozen counting rule's floor for an arm
 # to be `usable`; below it the arm is reported as a dev smoke, not a baseline.
-DEFAULT_SPEEDUP_RUNS = 10
+DEFAULT_SPEEDUP_RUNS = BASELINE_MIN_VALID_RUNS
 
 # Swarm-axis workload: SMALL attrs only. Every holder seeds every NAR into its
 # in-RAM blob store, so a 110 MiB payload at n=16 would be ~1.8 GiB of held
@@ -167,18 +168,22 @@ UNIT_SUFFIXES = (
     "_bytes_compressed_wire",
 )
 
-# S9 study parameters. 120 replicates per (class, noise) keeps the whole study
-# ~1 s (measured: 500 fits in 1.05 s) so it belongs in the FAST tier, and is
-# enough resolution for the rate floors below.
+# S9 study parameters. 5 classes x 3 noise levels x 120 replicates = 1800 fits,
+# MEASURED at 4.0-4.8 s on this host (ten samples). That is the honest cost of
+# putting this in the FAST tier; 120 replicates is what gives the rate floors
+# below their resolution, and the seeds are stable (see `stable_seed`) so the
+# rates are facts rather than a per-run draw.
 STUDY_REPLICATES = 120
 STUDY_NOISE_LEVELS = (0.01, 0.02, 0.05)
 
-# Rate floors the self-test GATES on, at STUDY_GATE_NOISE. Chosen from the
-# measured rates on the default grid, with margin; they are floors on the
-# INSTRUMENT, and a regression in scalefit's selection must trip them.
+# Rate floors the self-test GATES on, at STUDY_GATE_NOISE. Because `stable_seed`
+# makes the study deterministic, the measured rates below are FACTS, not draws -
+# so a thin margin is safe: the number cannot move without a code change, and
+# moving it is exactly what these floors exist to catch.
 STUDY_GATE_NOISE = 0.02
 GATE_EXACT_RATE = {
-    # measured 0.95 / 0.94 / 0.92 at noise 0.02, 200 seeds, grid 1..16
+    # measured on grid 1,2,4,8,16 at noise 0.02, 120 replicates, stable seeds:
+    # linear 0.933, constant 0.900, quadratic 1.000, linearithmic 1.000.
     "linear": 0.90,
     "constant": 0.88,
 }
@@ -186,10 +191,20 @@ GATE_EXACT_RATE = {
 # must NEVER be classified linear. `linear_rate` is gated at exactly 0.0.
 GATE_SUPERLINEAR_RATE = {"quadratic": 1.0, "linearithmic": 0.95}
 
+# CEILINGS on the instrument's two error rates. These were previously PRINTED
+# and not asserted - and they are precisely the rates that scalefit's
+# `superlinear = basis AND slope > 0` change moves, so a regression that doubled
+# the false-flag rate would have shipped green. Measured with stable seeds:
+# a genuinely LINEAR law is falsely flagged superlinear 0.067 of the time at
+# noise 0.02, and O(n log n) is mistaken for LINEAR 0.125 of the time at 0.05
+# (the discrimination limit of this grid). Ceilings sit above those with room.
+GATE_MAX_FALSE_SUPERLINEAR_RATE = 0.12
+GATE_MAX_SUPERLINEAR_AS_LINEAR_RATE = 0.20
+
 # The rate at which the LINEAR-vs-SUPERLINEAR split must hold, in both
 # directions, for a noise level to count as a regime where the S9 bite is
 # demonstrated (`bite_applicability`). 0.90 rather than 0.95 because the
-# `constant` generator tops out near 0.93 on pure noise - AICc occasionally buys
+# `constant` generator measures exactly 0.900 on pure noise - AICc occasionally buys
 # a second parameter - and a floor no generator can reach would make the block
 # report "unknown" forever, which is worse than a slightly loose but reachable
 # one. It is a floor on the INSTRUMENT, not on the product.
@@ -211,25 +226,44 @@ CLASS_FAMILY = {
 # ---- pure: the unit gate ----------------------------------------------------
 
 
+def unit_labelled(key: str) -> bool:
+    """Is `key` a properly unit-labelled byte quantity?
+
+    ANY key mentioning `bytes` anywhere - not just as a suffix - must END in a
+    recognised unit, optionally followed by the rate marker `_per_s`. The
+    endswith-only version of this rule was itself the vacuous-oracle shape it
+    exists to prevent: `bytes_sent` (a real key name in this codebase, see
+    `Pod.proxy_stats`), `egress_bytes_total` and `total_bytes_moved` all passed
+    it CLEAN, and the self-test's mutations had been chosen to match the
+    implementation rather than the claim. A rule stated as "a reader cannot mix
+    what the schema will not let the writer spell" has to cover what the writer
+    can actually spell.
+    """
+    body = key[: -len("_per_s")] if key.endswith("_per_s") else key
+    return any(body.endswith(suffix) for suffix in UNIT_SUFFIXES)
+
+
 def unit_violations(node, path: str = "") -> list[str]:
-    """Every `*_bytes` key must carry a recognised unit suffix. Empty == clean.
+    """Every key naming a byte quantity must carry a recognised unit. Empty == clean.
 
     This is the mechanical form of the rule the project keeps breaking in prose:
     NarSize (uncompressed, signed) and FileSize (compressed, on-wire) are
-    DIFFERENT UNITS, and a report that names both `*_bytes` invites the ratio
-    that has already been wrong three times. A reader cannot mix what the schema
-    will not let the writer spell.
+    DIFFERENT UNITS, and a report that names both `bytes` invites the ratio that
+    has already been wrong three times.
     """
     problems: list[str] = []
     if isinstance(node, dict):
         for key, value in node.items():
             here = f"{path}.{key}" if path else str(key)
-            if isinstance(key, str) and key.endswith("_bytes"):
+            # `bytes` as a whole TOKEN, so `bytesize`-style words do not trip it
+            # while `bytes_sent` and `total_bytes_moved` do.
+            names_bytes = isinstance(key, str) and "bytes" in key.split("_")
+            if names_bytes and not unit_labelled(key):
                 problems.append(
-                    f"{here}: byte-valued key without a unit suffix. Use one of "
-                    f"{', '.join(UNIT_SUFFIXES)} - NarSize and FileSize are "
-                    "different units and an unlabelled `_bytes` lets them be "
-                    "compared"
+                    f"{here}: byte-valued key without a unit label. It must END "
+                    f"in one of {', '.join(UNIT_SUFFIXES)} (optionally + "
+                    "'_per_s') - NarSize and FileSize are different units and an "
+                    "unlabelled byte key lets them be compared"
                 )
             problems += unit_violations(value, here)
     elif isinstance(node, list):
@@ -325,6 +359,21 @@ def dir_footprint(path: Path) -> DiskFootprint:
 # ---- pure: the S9 bite (class recovery, MEASURED not asserted) ---------------
 
 
+def stable_seed(model: str, noise: float, replicate: int) -> int:
+    """A reproducible seed for the S9 study.
+
+    NOT `hash(...)`: Python randomises `str.__hash__` per process, so a seed
+    derived from it is reproducible only while something happens to set
+    PYTHONHASHSEED - which nixpkgs' python setup hook does, and this repo does
+    NOT. Measured with that accident removed, the gated recovery rates wandered
+    (constant 0.892..0.975 against a 0.88 floor), so a FAST-tier gate on every
+    commit was one environment change away from being a lottery, and the rates
+    quoted in TESTING.md were reproducible by luck. crc32 over the explicit text
+    is stable across processes, machines and Python versions.
+    """
+    return zlib.crc32(f"{model}|{noise!r}|{replicate}".encode())
+
+
 def synthetic_series(model: str, grid, repeats: int, noise: float, seed: int):
     """(xs, ys) drawn from a KNOWN class with reproducible RELATIVE noise.
 
@@ -393,7 +442,7 @@ def class_recovery_study(grid, *, repeats: int, replicates: int, noise_levels) -
                     grid,
                     repeats,
                     noise,
-                    seed=hash((model, noise, replicate)) & 0xFFFFFFFF,
+                    seed=stable_seed(model, noise, replicate),
                 )
                 fit = scalefit.fit_scaling(
                     xs, ys, metric=f"synthetic {model}", unit="bytes"
@@ -472,9 +521,9 @@ SWARM_METRICS = (
         "worst per-peer on-disk daemon state vs swarm size",
     ),
     (
-        "realise_p95_s",
+        "client_realise_s",
         "seconds",
-        "client p95 in-container realise latency vs swarm size",
+        "client in-container realise duration vs swarm size",
     ),
 )
 
@@ -489,12 +538,29 @@ def label_resources(resources: dict) -> dict:
     into `swarm_total_rss_hwm_bytes_ram` in one and `total_rss_hwm_bytes_ram` in
     another, which is exactly how a report grows two names for one measurement.
     """
-    return {
-        "peer_rss_hwm_bytes_ram": resources["daemon_rss_hwm_bytes"],
-        "peer_rss_point_max_bytes_ram": resources["daemon_rss_point_max_bytes"],
-        "swarm_total_rss_hwm_bytes_ram": resources["chain_total_rss_hwm_bytes"],
-        "peer_fd_max": resources["daemon_fd_max"],
-        "per_role": {
+    # `aggregate_samples` samples EVERY long-lived pod role, so `per_role`
+    # carries the fixture `origin` and the `testproxy` alongside the daemons.
+    # Splitting them here is load-bearing, not tidiness: every per-role consumer
+    # in this module is asking a question about PEERS. Left mixed, the
+    # "RAM per held NarSize byte" line could name the fixture HTTP server as the
+    # worst node and attribute its memory to the iroh blob store - a wrong claim
+    # in the one line a reader quotes.
+    # FAIL-CLOSED, not fail-open. An absent `daemon_roles_sampled` used to mean
+    # "no peers": `per_role` came back EMPTY and every peer silently moved into
+    # `infrastructure_per_role`, so a caller who built a resources dict without
+    # the key lost all per-peer RAM statistics with no error. "We could not tell
+    # which roles were peers" and "there were no peers" must not be the same
+    # observation.
+    if "daemon_roles_sampled" not in resources:
+        raise ss.SampleError(
+            "label_resources: the aggregate has no `daemon_roles_sampled`, so "
+            "peers cannot be told apart from the fixture origin/testproxy. "
+            "Refusing to report an empty peer set as if it were a measurement."
+        )
+    daemons = set(resources["daemon_roles_sampled"])
+
+    def rows(selector) -> dict:
+        return {
             role: {
                 "rss_hwm_bytes_ram": row["rss_hwm_bytes"],
                 "rss_point_max_bytes_ram": row["rss_point_max_bytes"],
@@ -503,7 +569,20 @@ def label_resources(resources: dict) -> dict:
                 "ticks": row["ticks"],
             }
             for role, row in resources["per_role"].items()
-        },
+            if selector(role)
+        }
+
+    return {
+        "peer_rss_hwm_bytes_ram": resources["daemon_rss_hwm_bytes"],
+        "peer_rss_point_max_bytes_ram": resources["daemon_rss_point_max_bytes"],
+        "swarm_total_rss_hwm_bytes_ram": resources["chain_total_rss_hwm_bytes"],
+        "peer_fd_max": resources["daemon_fd_max"],
+        # DAEMON roles only - the peers. Every per-role statistic in this report
+        # is computed from this.
+        "per_role": rows(lambda role: role in daemons),
+        # The fixture origin and testproxy. Reported so nothing is hidden, but
+        # never mixed into a claim about what a PEER costs.
+        "infrastructure_per_role": rows(lambda role: role not in daemons),
     }
 
 
@@ -513,6 +592,7 @@ def swarm_metrics_from(resources: dict, disks: dict, realise_s: list[float]) -> 
     client's latency."""
     labelled = label_resources(resources)
     labelled.pop("per_role")
+    labelled.pop("infrastructure_per_role")
     labelled.update(
         {
             "peer_disk_apparent_bytes_ondisk": max(
@@ -524,7 +604,11 @@ def swarm_metrics_from(resources: dict, disks: dict, realise_s: list[float]) -> 
             "swarm_total_disk_allocated_bytes_ondisk": sum(
                 d.allocated_bytes_ondisk for d in disks.values()
             ),
-            "realise_p95_s": percentile(realise_s, 95) if realise_s else None,
+            # NOT named `_p95`. A swarm point runs ONE client, so `realise_s`
+            # holds a single observation and its "p95" is just that observation.
+            # A `_p95` key would promise a tail robustness the data has not got;
+            # the tail lives in the REPLICATES, which are separate points.
+            "client_realise_s": percentile(realise_s, 95) if realise_s else None,
         }
     )
     return labelled
@@ -609,7 +693,7 @@ def held_content_ram_cost(per_role: dict, held_bytes_uncompressed_nar: int) -> d
     return {
         "measured": True,
         "held_bytes_uncompressed_nar": held_bytes_uncompressed_nar,
-        "per_role_rss_bytes_ram_per_held_nar_byte": {
+        "per_role_peak_rss_ram_per_held_nar_byte_ratio": {
             role: row["rss_hwm_bytes_ram"] / held_bytes_uncompressed_nar
             for role, row in per_role.items()
         },
@@ -669,7 +753,7 @@ def summarize_profile_arm(
         # `measure.BASELINE_MIN_VALID_RUNS` can be `usable` for a dev loop but it
         # is NOT a baseline, and saying so is the difference between a smoke run
         # and a number someone quotes later.
-        "dev_smoke_below_n10": len(valid) < 10,
+        "dev_smoke_below_n10": len(valid) < BASELINE_MIN_VALID_RUNS,
         "invalid_runs": [
             {"run": i, "reason": r.reason} for i, r in enumerate(runs) if not r.valid
         ],
@@ -705,8 +789,10 @@ def speedup_block(peers_on: dict, peers_off: dict, unit_evidence: dict) -> dict:
     """
     off_nar = peers_off["egress_payload_nar_bytes_compressed_wire"]["mean"]
     on_nar = peers_on["egress_payload_nar_bytes_compressed_wire"]["mean"]
-    off_p50 = peers_off["realise_s"]["mean"]
-    on_p50 = peers_on["realise_s"]["mean"]
+    # Named for what they ARE. `stat_block` has both a mean and a p95 and calling
+    # the mean `p50` is a trap for the next reader, whatever the emitted key says.
+    off_mean = peers_off["realise_s"]["mean"]
+    on_mean = peers_on["realise_s"]["mean"]
     off_p95 = peers_off["realise_s"]["p95"]
     on_p95 = peers_on["realise_s"]["p95"]
 
@@ -718,6 +804,24 @@ def speedup_block(peers_on: dict, peers_off: dict, unit_evidence: dict) -> dict:
     offload = None
     if off_nar not in (None, 0) and on_nar is not None:
         offload = (off_nar - on_nar) / off_nar
+    # The speedup is THE number a reader will quote, so it does not get to be a
+    # bare point ratio in a report that carries intervals everywhere else. A
+    # worst/best pair built from each arm's own min and max brackets it without
+    # assuming a distribution the sample is far too small to justify.
+    on_values = peers_on["realise_s"]["values"]
+    off_values = peers_off["realise_s"]["values"]
+    bracket = None
+    if on_values and off_values:
+        bracket = {
+            "worst_case": min(off_values) / max(on_values),
+            "best_case": max(off_values) / min(on_values),
+            "how": (
+                "slowest-peer vs fastest-cache and vice versa, from the observed "
+                "values only. NOT a confidence interval - it is the range the "
+                "measured runs actually span, which is the honest statement for "
+                "a sample this small."
+            ),
+        }
     return {
         "counting_rule": "net-upstream-egress-v2 (scripts/MEASUREMENT_COUNTING_RULE.md)",
         "unit_coincidence_evidence": unit_evidence,
@@ -728,13 +832,16 @@ def speedup_block(peers_on: dict, peers_off: dict, unit_evidence: dict) -> dict:
         "peer_served_corroboration_bytes_uncompressed_nar": peers_on[
             "peer_served_bytes_uncompressed_nar"
         ]["mean"],
-        "realise_mean_peers_off_s": off_p50,
-        "realise_mean_peers_on_s": on_p50,
+        "realise_mean_peers_off_s": off_mean,
+        "realise_mean_peers_on_s": on_mean,
+        "realise_stdev_peers_off_s": peers_off["realise_s"]["stdev"],
+        "realise_stdev_peers_on_s": peers_on["realise_s"]["stdev"],
         "realise_p95_peers_off_s": off_p95,
         "realise_p95_peers_on_s": on_p95,
         # >1 means peers are FASTER. A ratio of seconds; no bytes involved.
-        "latency_speedup_mean": ratio(off_p50, on_p50),
+        "latency_speedup_mean": ratio(off_mean, on_mean),
         "latency_speedup_p95": ratio(off_p95, on_p95),
+        "latency_speedup_observed_range": bracket,
         "caveat": (
             "The 'upstream' here is the in-pod testproxy on loopback, NOT "
             "cache.nixos.org. A loopback/container testbed is not residential- "
@@ -873,6 +980,9 @@ def sweep_swarm(ctx, fixtures, sizes, repeats: int, state_root: Path) -> ss.Axis
                     expected_served = sum(s.nar_size for s in seeds)
                     served = pod.node_b_served_bytes(want_at_least=expected_served)
                     realise_s = ss.parse_realise_seconds(result.stdout)
+                    # The independent witness that tells a real upstream fallback
+                    # apart from a lagging holder log (see below).
+                    upstream_nar = pod.proxy_stats().get("nar", 0)
 
                 reasons: list[str] = list(sampler.errors)
                 if result.exit_code != 0:
@@ -886,14 +996,27 @@ def sweep_swarm(ctx, fixtures, sizes, repeats: int, state_root: Path) -> ss.Axis
                 # that quietly fell back to upstream: the claimed holder's OWN
                 # provider counter must show it served the whole workload. Without
                 # it a point could be a fully-upstream build wearing a peer label.
+                #
+                # `node_b_served_bytes` returns its best-so-far on timeout with no
+                # signal that it timed out, so a shortfall ALONE cannot tell a real
+                # fallback from a lagging monitor. The testproxy's upstream NAR
+                # count is the independent witness: a fallback moved payload
+                # across the cache boundary, a lagging log did not.
                 if served < expected_served:
                     reasons.append(
                         f"peer-serve precondition failed: node-b served {served} B "
-                        f"< expected {expected_served} B (uncompressed NAR) - this "
-                        "build was not actually peer-served"
+                        f"< expected {expected_served} B (uncompressed NAR); "
+                        f"upstream served {upstream_nar} NAR request(s) - "
+                        + (
+                            "this build fell back to upstream"
+                            if upstream_nar > 0
+                            else "nothing crossed the cache boundary, so the "
+                            "holder's log monitor lagged rather than the peer "
+                            "failing"
+                        )
                     )
                 metrics = swarm_metrics_from(
-                    resources, disks, [realise_s] if realise_s else []
+                    resources, disks, [] if realise_s is None else [realise_s]
                 )
                 point = ss.SweepPoint(
                     n=size,
@@ -904,6 +1027,7 @@ def sweep_swarm(ctx, fixtures, sizes, repeats: int, state_root: Path) -> ss.Axis
                         "daemon_processes": size + 1,
                         "peer_served_bytes_uncompressed_nar": served,
                         "expected_served_bytes_uncompressed_nar": expected_served,
+                        "upstream_nar_requests": upstream_nar,
                         "container_wall_s": wall_s,
                         "realise_s": realise_s,
                         "per_role_disk": {
@@ -914,6 +1038,10 @@ def sweep_swarm(ctx, fixtures, sizes, repeats: int, state_root: Path) -> ss.Axis
                 )
             except (RuntimeError, ss.SampleError, OSError, ValueError) as error:
                 point.reason = f"swarm point raised: {error!r}"
+                # Fail VERBOSELY: a 20-minute instrument whose deliverable is a
+                # JSON file must be able to explain its own invalid points
+                # without a stderr scrollback.
+                point.detail["traceback"] = traceback.format_exc()
             except SystemExit as error:
                 # `e2e.die` (exit code 2) is fatal to a SCENARIO but must only
                 # invalidate a POINT here: a swarm of 17 containers has 17 chances
@@ -946,7 +1074,7 @@ def run_speedup_arms(ctx, fixtures, runs: int, state_root: Path) -> dict:
     wire_total = sum(int(fixtures.entry(a)["file_size"]) for a in SPEEDUP_ATTRS)
     nar_total = sum(int(fixtures.entry(a)["nar_size"]) for a in SPEEDUP_ATTRS)
     substituter = ctx.substituter_daemon_only()
-    min_valid = min(runs, 10)
+    min_valid = min(runs, BASELINE_MIN_VALID_RUNS)
 
     # -- peers ON --
     on_runs: list[ProfileRun] = []
@@ -984,24 +1112,38 @@ def run_speedup_arms(ctx, fixtures, runs: int, state_root: Path) -> dict:
                     after = pod.node_b_served_bytes(
                         want_at_least=before + expected_served
                     )
+                    scored = score_run(
+                        pod,
+                        fixtures,
+                        SPEEDUP_ATTRS,
+                        result,
+                        wall_s,
+                        peer_served=after - before,
+                    )
+                    on_runs.append(scored)
                     if after - before < expected_served:
+                        # Record the EGRESS beside the shortfall: it is the
+                        # disambiguator between "the build really fell back to
+                        # upstream" (full crossing) and "the holder's log monitor
+                        # lagged our poll" (zero crossing). Without it the two
+                        # are the same observation.
                         on_shortfalls.append(
                             {
                                 "run": index,
                                 "served_bytes_uncompressed_nar": after - before,
                                 "expected_bytes_uncompressed_nar": expected_served,
+                                "egress_nar_bytes_compressed_wire": (
+                                    scored.egress_nar_bytes_compressed_wire
+                                ),
+                                "likely_cause": (
+                                    "upstream fallback (payload crossed the cache "
+                                    "boundary)"
+                                    if scored.egress_nar_bytes_compressed_wire > 0
+                                    else "holder log-monitor lag (nothing crossed "
+                                    "the cache boundary, so a peer did serve it)"
+                                ),
                             }
                         )
-                    on_runs.append(
-                        score_run(
-                            pod,
-                            fixtures,
-                            SPEEDUP_ATTRS,
-                            result,
-                            wall_s,
-                            peer_served=after - before,
-                        )
-                    )
             on_resources = ss.aggregate_samples(sampler.samples, pod.daemon_roles())
             on_disk = {
                 role: vars(dir_footprint(pod.state_dir(role)))
@@ -1061,28 +1203,58 @@ def run_speedup_arms(ctx, fixtures, runs: int, state_root: Path) -> dict:
     peers_off["resources"] = label_resources(off_resources)
     peers_on["disk"] = on_disk
     peers_off["disk"] = off_disk
-    peers_on["sampler_errors"] = on_sampler_errors
-    peers_off["sampler_errors"] = off_sampler_errors
     peers_on["peer_serve_shortfall_runs"] = on_shortfalls
     peers_on["peer_serve_shortfall_note"] = (
         "runs where node-b's own provider counter did not advance by the full "
-        "workload, i.e. the build fell back to upstream. The runs stay VALID (the "
-        "egress figure is real) but a nonzero count means this arm partly "
-        "measured the peers-OFF path"
+        "workload. The runs stay VALID (the egress figure is real). Read each "
+        "entry's `egress_nar_bytes_compressed_wire` to tell the two causes "
+        "apart: a FULL crossing means the build really fell back to upstream, a "
+        "ZERO crossing means the peer served it and only node-b's log monitor "
+        "lagged the 5 s poll (node_b_served_bytes returns its best-so-far on "
+        "timeout, with no signal that it timed out). Asserting 'fell back to "
+        "upstream' from the shortfall alone would conflate the two."
     )
     # The 110 MiB payload is the bursty workload task-18 never had: this is where
     # the high-water/point-sample distinction gets exercised (or does not), and
     # where the in-RAM blob store's cost per held byte becomes a number.
-    for arm, held in ((peers_on, nar_total), (peers_off, 0)):
+    for arm, held, errors in (
+        (peers_on, nar_total, on_sampler_errors),
+        (peers_off, 0, off_sampler_errors),
+    ):
         arm["high_water_vs_point_sample"] = hwm_vs_point_roles(
             arm["resources"]["per_role"], f"speedup arm {arm['arm']}, per role"
         )
         arm["held_content_ram_cost"] = held_content_ram_cost(
             arm["resources"]["per_role"], held
         )
+        # Sampler errors were being COLLECTED and never consumed: an arm whose
+        # /proc reads mostly failed still reported `usable: true`, with its RSS
+        # aggregates computed from whatever survived. They invalidate the
+        # RESOURCE claims specifically - the EGRESS claims come from the
+        # testproxy and are untouched by a failed /proc read, so scoping the
+        # damage is more honest than failing the whole arm.
+        arm["sampler_errors"] = errors
+        arm["resources_trustworthy"] = not errors
+        if errors:
+            arm["resources"]["WARNING"] = (
+                f"{len(errors)} resource sample(s) FAILED; every RSS/fd figure "
+                "in this block is computed from an incomplete sample and must "
+                "not be quoted. The egress figures are unaffected (different "
+                "instrument)."
+            )
     return {
+        "ran": True,
         "attrs": list(SPEEDUP_ATTRS),
         "runs_requested": runs,
+        "topology_note": (
+            "The two arms are identical in everything the COUNTING RULE requires "
+            "(client script, knobs, narinfo-cache config, payloads); only the "
+            "presence of a holding peer differs. They are NOT identical in "
+            "TOPOLOGY: peers-on runs two daemon processes (node-a + node-b), "
+            "peers-off one. The egress comparison is therefore sound, but the "
+            "`resources` blocks are NOT like-for-like - peers-on's per-peer "
+            "figure is a max over two daemons, peers-off's over one."
+        ),
         "peers_on": peers_on,
         "peers_off": peers_off,
         "speedup": speedup_block(peers_on, peers_off, unit_evidence),
@@ -1222,11 +1394,26 @@ def build_report(
         "unit_violations": unit_problems,
         "compliant": not s5_violations and not unit_problems,
     }
+    # A speedup arm that RAISED is not a missing arm - it is a failed one, and
+    # `usable` must say so. `speedup is None` means it was never asked for
+    # (--skip-speedup), which is a different statement.
     speedup_usable = True
+    speedup_dev_smoke = False
     if speedup is not None:
-        speedup_usable = (
-            speedup["peers_on"]["usable"] and speedup["peers_off"]["usable"]
-        )
+        if not speedup.get("ran"):
+            speedup_usable = False
+        else:
+            speedup_usable = (
+                speedup["peers_on"]["usable"] and speedup["peers_off"]["usable"]
+            )
+            # The frozen counting rule's SECTION 5 floor. An arm below it is a
+            # dev smoke, and a report containing one must not read as quotable:
+            # `dev_smoke_below_n10` existed but gated nothing, so
+            # `--speedup-runs 3` produced `usable: true`.
+            speedup_dev_smoke = (
+                speedup["peers_on"]["dev_smoke_below_n10"]
+                or speedup["peers_off"]["dev_smoke_below_n10"]
+            )
     report["verdict"] = {
         "swarm_valid_observations": valid_points,
         "swarm_total_observations": len(axis.points),
@@ -1234,6 +1421,7 @@ def build_report(
         "fit_problems": problems,
         "all_metrics_fitted": problems == [],
         "speedup_arms_usable": speedup_usable,
+        "speedup_dev_smoke": speedup_dev_smoke,
         "honesty_compliant": report["honesty"]["compliant"],
         "red_flag_count": len(red_flags),
         # AC#2 travels WITH the report: a profile whose grid was too short to
@@ -1249,11 +1437,15 @@ def build_report(
             problems == []
             and report["honesty"]["compliant"]
             and speedup_usable
+            and not speedup_dev_smoke
             and bool(study.get("ran"))
         ),
         "note": (
-            "`usable` is about the INSTRUMENT. Red flags are findings about the "
-            "PRODUCT and do not make the profile unusable - they make it useful."
+            "`usable` means THESE NUMBERS MAY BE QUOTED. It is about the "
+            "INSTRUMENT: red flags are findings about the PRODUCT and do not "
+            "make the profile unusable - they make it useful. A speedup arm "
+            "below the frozen counting rule's 10-valid-run floor DOES make it "
+            "unusable, because a dev smoke is not a baseline."
         ),
     }
     return report
@@ -1266,8 +1458,10 @@ def bite_applicability(study: dict, spread: dict, models: dict) -> dict:
     Without this the report states two true things far apart - "a known-O(n^2)
     law is never fitted linear at 2% noise" and "here is a fitted latency law" -
     and lets a reader join them. They do not always join: task-42's measured
-    latency spread was 8-20% while the bite is demonstrated at 2-5%, and that
-    same latency axis selected THREE different classes across three runs. The
+    latency spread was 8-20% and even its RSS spread was 2-4%, while the
+    linear-vs-superlinear split is demonstrated only up to 1% relative noise on
+    this grid; that same latency axis selected THREE different classes across
+    three runs. The
     number that saves a reader from the wrong conclusion is the comparison, so
     the report computes it instead of leaving it as an exercise.
 
@@ -1290,14 +1484,22 @@ def bite_applicability(study: dict, spread: dict, models: dict) -> dict:
     any_class_rows = next(iter(study["per_class"].values()))
     noise_levels = sorted(float(key) for key in any_class_rows)
     replicates = max(1, any_class_rows[str(noise_levels[0])]["replicates"])
-    # A rate that lands ON the floor is a coin flip about whether the regime is
-    # declared: this study measured the O(n log n) flag rate at EXACTLY 0.900 at
-    # 5% noise, so with a bare `>= floor` the reported regime would oscillate
-    # between 0.02 and 0.05 from run to run - and a number that flips is not a
-    # number. Require the rate to clear the floor by two Monte-Carlo standard
-    # errors, which errs toward NOT declaring a marginal regime.
+    # Clear the floor by two Monte-Carlo standard errors before declaring the
+    # regime. `stable_seed` makes the measured rate reproducible, so this is NOT
+    # about a number that flips between runs - it is about the rate being an
+    # ESTIMATE: 120 replicates pin the true rate only to about +/-0.027, so a
+    # measured 0.933 is consistent with a true rate below the 0.90 floor. The
+    # margin errs toward NOT declaring a marginal regime, which is the direction
+    # that cannot mislead. It does mean the EFFECTIVE requirement is ~0.955, not
+    # 0.90, and `effective_threshold` reports that rather than leaving a reader
+    # to infer the floor was the bar.
     margin = 2.0 * math.sqrt(floor * (1.0 - floor) / replicates)
     threshold = min(1.0, floor + margin)
+    # CONTIGUOUS from the quietest level, and it STOPS at the first failure.
+    # Discrimination degrades with noise, but nothing here enforces that, and
+    # without the break a study that failed at 2% and passed at 5% (a
+    # Monte-Carlo fluke, or a genuinely non-monotone selector) would report the
+    # regime as 5% - claiming coverage over a gap it does not have.
     proven_to = None
     for noise in noise_levels:
         ok = True
@@ -1307,8 +1509,9 @@ def bite_applicability(study: dict, spread: dict, models: dict) -> dict:
                 ok = ok and rate >= threshold
             else:
                 ok = ok and (1.0 - rate) >= threshold
-        if ok:
-            proven_to = noise
+        if not ok:
+            break
+        proven_to = noise
     per_metric = {}
     for fit_id, fit in models.items():
         key = fit_id.split(".", 1)[-1]
@@ -1390,27 +1593,46 @@ def replicate_spread(points) -> dict:
 
 def provenance(fixtures, out_root: Path) -> dict:
     """What makes these numbers re-derivable. The HOST is part of a resource
-    result, so it is recorded: a law measured on one machine does not transfer."""
+    result, so it is recorded: a law measured on one machine does not transfer.
+
+    FAIL-VERBOSE, not fail-silent: every lookup that can fail records WHY under
+    `unavailable` instead of leaving a blank field. This is the one block whose
+    entire job is re-derivability, so "unknown" quietly reading as "" is exactly
+    the failure it must not have.
+    """
     generation = fx.resolve_current(out_root)
     lock = json.loads((generation / "lock.json").read_text())
+    unavailable: dict[str, str] = {}
+
     total_ram = None
     try:
         for line in Path("/proc/meminfo").read_text().splitlines():
             if line.startswith("MemTotal:"):
                 total_ram = int(line.split()[1]) * 1024
-    except OSError:
-        pass
-    commit = ""
-    try:
-        commit = subprocess.run(
-            ["git", "rev-parse", "HEAD"],
-            capture_output=True,
-            text=True,
-            check=False,
-            cwd=str(fx.repo_root()),
-        ).stdout.strip()
-    except OSError:
-        pass
+    except OSError as error:
+        unavailable["mem_total_bytes_ram"] = str(error)
+
+    def git(*argv) -> str | None:
+        try:
+            result = subprocess.run(
+                ["git", *argv],
+                capture_output=True,
+                text=True,
+                check=False,
+                cwd=str(fx.repo_root()),
+            )
+        except OSError as error:
+            unavailable[f"git {' '.join(argv)}"] = str(error)
+            return None
+        if result.returncode != 0:
+            unavailable[f"git {' '.join(argv)}"] = (
+                f"exit {result.returncode}: {result.stderr.strip()}"
+            )
+            return None
+        return result.stdout
+
+    commit = git("rev-parse", "HEAD")
+    dirty = git("status", "--porcelain")
     return {
         "workload_version": fixtures.manifest["workload_version"],
         "fixture_tier": fixtures.manifest["tier"],
@@ -1418,7 +1640,12 @@ def provenance(fixtures, out_root: Path) -> dict:
         "generation": generation.name,
         "swarm_attrs": list(SWARM_ATTRS),
         "speedup_attrs": list(SPEEDUP_ATTRS),
-        "git_commit": commit,
+        "git_commit": None if commit is None else commit.strip(),
+        # A commit hash alone does NOT describe the code that produced these
+        # numbers when the tree is dirty - and `just profile` is normally run
+        # from a dirty tree during development. Say which it was.
+        "git_clean": None if dirty is None else dirty.strip() == "",
+        "unavailable": unavailable,
         "host": {
             "kernel": os.uname().release,
             "machine": os.uname().machine,
@@ -1480,7 +1707,7 @@ def print_human_summary(report: dict) -> None:
                 f"  swarm_total={_mib(m['swarm_total_rss_hwm_bytes_ram'])}"
                 f"  fds={m['peer_fd_max']}"
                 f"  disk={m['peer_disk_allocated_bytes_ondisk']} B"
-                f"  realise_p95={m['realise_p95_s']}",
+                f"  realise={m['client_realise_s']}",
                 file=out,
             )
     hwm = swarm["high_water_vs_point_sample"]
@@ -1519,7 +1746,7 @@ def print_human_summary(report: dict) -> None:
             cost = arm["held_content_ram_cost"]
             if cost.get("measured"):
                 worst = max(
-                    cost["per_role_rss_bytes_ram_per_held_nar_byte"].items(),
+                    cost["per_role_peak_rss_ram_per_held_nar_byte_ratio"].items(),
                     key=lambda kv: kv[1],
                 )
                 print(
@@ -1624,7 +1851,7 @@ def _synthetic_swarm_axis(model: str, metric: str = "peer_rss_hwm_bytes_ram"):
             "peer_disk_apparent_bytes_ondisk": 4096.0,
             "peer_disk_allocated_bytes_ondisk": 4096.0,
             "swarm_total_disk_allocated_bytes_ondisk": 4096.0 * n,
-            "realise_p95_s": 1.0 + 0.05 * n,
+            "client_realise_s": 1.0 + 0.05 * n,
         }
         metrics[metric] = 64.0e6 + 2.0e6 * basis.transform(n)
         axis.points.append(ss.SweepPoint(n=n, valid=True, metrics=metrics))
@@ -1690,7 +1917,35 @@ def run_self_test() -> int:  # noqa: C901 - a flat list of checks reads better h
     )
     check(
         "a non-byte key is untouched",
-        unit_violations({"realise_p95_s": 1, "fd_max": 3}) == [],
+        unit_violations({"client_realise_s": 1, "fd_max": 3}) == [],
+    )
+    # The rule must cover what a WRITER CAN SPELL, not just the suffix shape the
+    # implementation happened to test. Every name below passed the earlier
+    # endswith-only version CLEAN - `bytes_sent` is a real key in this codebase
+    # (Pod.proxy_stats), so it was one copy-paste from the report. That is the
+    # vacuous-oracle species: mutations chosen to match the code rather than the
+    # claim.
+    for spelling in (
+        "bytes_sent",
+        "egress_bytes_total",
+        "total_bytes_moved",
+        "free_disk_bytes_ondisk_at_start",
+        "throughput_bytes_per_s",
+        "x_bytes_ram_extra",
+        "bytes",
+    ):
+        check(
+            f"MUTATION: `{spelling}` is REJECTED (bytes named anywhere, not just "
+            "as a suffix)",
+            unit_violations({spelling: 1}) != [],
+        )
+    check(
+        "a rate key keeps its unit through `_per_s`",
+        unit_violations({"throughput_bytes_uncompressed_nar_per_s": 1}) == [],
+    )
+    check(
+        "a word merely CONTAINING 'bytes' is not a byte key",
+        unit_violations({"bytesize_note": "x"}) == [],
     )
 
     # unit coincidence precondition, proven both ways with a fake fixture set.
@@ -1753,18 +2008,28 @@ def run_self_test() -> int:  # noqa: C901 - a flat list of checks reads better h
         quad["linear_rate"] == 0.0,
         f"{quad['linear_rate']:.3f} != 0",
     )
-    # The honest counterpart, REPORTED not gated: how often a genuinely LINEAR
-    # law is falsely flagged superlinear on this grid.
+    # The two ERROR rates, now GATED rather than merely printed. They are the
+    # rates scalefit's `superlinear = basis AND slope > 0` change moves, so
+    # leaving them ungated meant nothing watched the metric most exposed to that
+    # change: a regression doubling the false-flag rate would have shipped green.
     lin = study["per_class"]["linear"][gate]
-    print(
-        f"      [reported, not gated] false-superlinear rate for a LINEAR law "
-        f"at noise {gate}: {lin['superlinear_rate']:.3f}"
+    check(
+        f"a genuinely LINEAR law is falsely flagged superlinear at most "
+        f"{GATE_MAX_FALSE_SUPERLINEAR_RATE} (measured "
+        f"{lin['superlinear_rate']:.3f}) - crying wolf makes a real flag "
+        "ignorable",
+        lin["superlinear_rate"] <= GATE_MAX_FALSE_SUPERLINEAR_RATE,
+        f"{lin['superlinear_rate']:.3f}",
     )
-    worst_nlogn = study["per_class"]["linearithmic"][str(max(STUDY_NOISE_LEVELS))]
-    print(
-        f"      [reported, not gated] O(n log n) mistaken for LINEAR at noise "
-        f"{max(STUDY_NOISE_LEVELS)}: {worst_nlogn['linear_rate']:.3f} - the "
-        "discrimination limit of this grid"
+    worst_noise = str(max(STUDY_NOISE_LEVELS))
+    worst_nlogn = study["per_class"]["linearithmic"][worst_noise]
+    check(
+        f"O(n log n) is mistaken for LINEAR at most "
+        f"{GATE_MAX_SUPERLINEAR_AS_LINEAR_RATE} even at the worst studied noise "
+        f"{worst_noise} (measured {worst_nlogn['linear_rate']:.3f}) - this is the "
+        "discrimination limit of this grid, and it must not silently worsen",
+        worst_nlogn["linear_rate"] <= GATE_MAX_SUPERLINEAR_AS_LINEAR_RATE,
+        f"{worst_nlogn['linear_rate']:.3f}",
     )
 
     # The guard is caught rather than let-crash on purpose: a mutation that
@@ -1916,6 +2181,31 @@ def run_self_test() -> int:  # noqa: C901 - a flat list of checks reads better h
         inflated["egress_offload_fraction"] == block["egress_offload_fraction"],
         f"{inflated['egress_offload_fraction']} vs {block['egress_offload_fraction']}",
     )
+    observed_range = block["latency_speedup_observed_range"]
+    check(
+        "the speedup ratio carries the range the runs actually spanned "
+        "(not a bare point estimate)",
+        isinstance(observed_range, dict)
+        and observed_range.get("worst_case") == 2.0
+        and observed_range.get("best_case") == 2.0,
+        f"got {observed_range!r} - a bare ratio with no dispersion is the one "
+        "number a reader quotes and the one you cannot defend",
+    )
+    spread_on = summarize_profile_arm(
+        "peers-on",
+        [_fake_run(realise_s=t) for t in [1.0, 2.0, 3.0] * 4],
+        workload_bytes_compressed_wire=1,
+        workload_bytes_uncompressed_nar=1,
+        min_valid=10,
+    )
+    spread_range = speedup_block(spread_on, off, {})["latency_speedup_observed_range"]
+    check(
+        f"a noisy peers-ON arm widens that range instead of hiding the noise "
+        f"({spread_range})",
+        isinstance(spread_range, dict)
+        and spread_range["worst_case"] < spread_range["best_case"],
+    )
+
     starved = summarize_profile_arm(
         "peers-on",
         [_fake_run(valid=False, reason="client exit 1") for _ in range(10)],
@@ -1934,6 +2224,7 @@ def run_self_test() -> int:  # noqa: C901 - a flat list of checks reads better h
     prov = {"workload_version": "test", "fixture_tier": "full", "host": {}}
     config = {"self_test": True}
     speedup_measured = {
+        "ran": True,
         "attrs": ["lib"],
         "runs_requested": 10,
         "peers_on": on,
@@ -1962,6 +2253,53 @@ def run_self_test() -> int:  # noqa: C901 - a flat list of checks reads better h
     )
     check("no red flag for a linear law", report["red_flags"] == [])
     check("verdict usable on a clean synthetic profile", report["verdict"]["usable"])
+
+    # `usable` must mean "these numbers may be quoted". Two ways it must not.
+    smoke = json.loads(json.dumps(speedup_measured))
+    smoke["peers_on"]["dev_smoke_below_n10"] = True
+    smoke_report = build_report(linear, smoke, study, prov, config, (10, 100, 1000))
+    check(
+        "MUTATION: a speedup arm below the frozen 10-run floor makes the whole "
+        "report UNUSABLE (dev_smoke_below_n10 used to gate nothing)",
+        not smoke_report["verdict"]["usable"]
+        and smoke_report["verdict"]["speedup_dev_smoke"],
+        str(smoke_report["verdict"]),
+    )
+    # Caught, not let-crash: without the `ran` guard `build_report` reaches into
+    # a failed arm's absent `peers_on` and dies with a KeyError. That is red, but
+    # a self-test that dies with a traceback does not NAME what broke.
+    try:
+        failed_arm = build_report(
+            linear,
+            {"ran": False, "reason": "a holder never announced"},
+            study,
+            prov,
+            config,
+            (10, 100, 1000),
+        )
+        failed_ok = (
+            not failed_arm["verdict"]["usable"]
+            and failed_arm["models"] != {}
+            and failed_arm["measured"]["speedup"]["reason"]
+            == "a holder never announced"
+        )
+        failed_detail = str(failed_arm["verdict"])
+    except (KeyError, TypeError) as error:
+        failed_ok = False
+        failed_detail = f"build_report raised on a FAILED arm: {error!r}"
+    check(
+        "MUTATION: a speedup arm that RAISED makes the report unusable, and the "
+        "swarm axis SURVIVES into it (a late failure must not discard an earlier "
+        "measurement)",
+        failed_ok,
+        failed_detail,
+    )
+    check(
+        "--skip-speedup (speedup absent, not failed) still yields a usable report",
+        build_report(linear, None, study, prov, config, (10, 100, 1000))["verdict"][
+            "usable"
+        ],
+    )
 
     quad_axis = _synthetic_swarm_axis("quadratic")
     quad_report = build_report(
@@ -2090,6 +2428,7 @@ def run_self_test() -> int:  # noqa: C901 - a flat list of checks reads better h
         "daemon_rss_point_max_bytes": 100,
         "chain_total_rss_hwm_bytes": 400,
         "daemon_fd_max": 12,
+        "daemon_roles_sampled": ["node-b"],
         "per_role": {
             "node-b": {
                 "rss_hwm_bytes": 300,
@@ -2135,13 +2474,84 @@ def run_self_test() -> int:  # noqa: C901 - a flat list of checks reads better h
     check(
         "RAM cost per held NarSize byte is a NAMED cross-unit ratio",
         cost["measured"]
-        and cost["per_role_rss_bytes_ram_per_held_nar_byte"]["node-b"] == 3.0,
+        and cost["per_role_peak_rss_ram_per_held_nar_byte_ratio"]["node-b"] == 3.0,
         str(cost),
     )
     check(
         "an arm that holds nothing reports NO ratio (not a 0, not a div-by-zero)",
         held_content_ram_cost(roles, 0)["measured"] is False,
     )
+    # The S9 study seed must not depend on PYTHONHASHSEED. Measured: with the
+    # `hash()` version and a randomized seed, the gated `constant` recovery rate
+    # wandered to 0.892 against a 0.88 floor - a FAST-tier gate one environment
+    # change from being a lottery, and TESTING.md's quoted rates true by accident.
+    check(
+        "the S9 seed is stable across processes (not `hash()`)",
+        stable_seed("linear", 0.02, 7) == stable_seed("linear", 0.02, 7)
+        and stable_seed("linear", 0.02, 7) == zlib.crc32(b"linear|0.02|7"),
+        str(stable_seed("linear", 0.02, 7)),
+    )
+    check(
+        "and it separates the inputs it is given",
+        len(
+            {
+                stable_seed("linear", 0.02, 7),
+                stable_seed("quadratic", 0.02, 7),
+                stable_seed("linear", 0.05, 7),
+                stable_seed("linear", 0.02, 8),
+            }
+        )
+        == 4,
+    )
+
+    # Infrastructure roles must never enter a claim about what a PEER costs.
+    mixed = {
+        "daemon_rss_hwm_bytes": 300,
+        "daemon_rss_point_max_bytes": 100,
+        "chain_total_rss_hwm_bytes": 300,
+        "daemon_fd_max": 12,
+        "daemon_roles_sampled": ["node-b"],
+        "per_role": {
+            "node-b": {
+                "rss_hwm_bytes": 300,
+                "rss_point_max_bytes": 100,
+                "rss_point_last_bytes": 90,
+                "fd_max": 12,
+                "ticks": 5,
+            },
+            # The fixture HTTP server, deliberately the LARGEST RSS here.
+            "origin": {
+                "rss_hwm_bytes": 900,
+                "rss_point_max_bytes": 900,
+                "rss_point_last_bytes": 900,
+                "fd_max": 4,
+                "ticks": 5,
+            },
+        },
+    }
+    split = label_resources(mixed)
+    check(
+        "MUTATION: the fixture `origin` is kept OUT of per_role (it would "
+        "otherwise be the 'worst node' in the RAM-per-held-byte line)",
+        list(split["per_role"]) == ["node-b"]
+        and list(split["infrastructure_per_role"]) == ["origin"],
+        str(list(split["per_role"])),
+    )
+    check(
+        "so RAM-per-held-byte names the PEER, not the fixture server",
+        max(
+            held_content_ram_cost(split["per_role"], 100)[
+                "per_role_peak_rss_ram_per_held_nar_byte_ratio"
+            ].items(),
+            key=lambda kv: kv[1],
+        )[0]
+        == "node-b",
+    )
+    check(
+        "and the infrastructure roles are still REPORTED, not dropped",
+        split["infrastructure_per_role"]["origin"]["rss_hwm_bytes_ram"] == 900,
+    )
+
     check(
         "an arm below the counting rule's 10-valid-run floor is marked a DEV SMOKE",
         summarize_profile_arm(
@@ -2191,11 +2601,11 @@ def run_self_test() -> int:  # noqa: C901 - a flat list of checks reads better h
             "identifiable": True,
             "r_squared": 0.99,
         },
-        "swarm.realise_p95_s": {"identifiable": False, "r_squared": 0.31},
+        "swarm.client_realise_s": {"identifiable": False, "r_squared": 0.31},
     }
     fake_spread = {
         "peer_rss_hwm_bytes_ram": {"median_relative_spread": 0.01},
-        "realise_p95_s": {"median_relative_spread": 0.20},
+        "client_realise_s": {"median_relative_spread": 0.20},
     }
     applicability = bite_applicability(study, fake_spread, fake_models)
     check(
@@ -2209,17 +2619,76 @@ def run_self_test() -> int:  # noqa: C901 - a flat list of checks reads better h
     check(
         "a NOISY metric (20% spread) is reported OUTSIDE it - the class name is "
         "explicitly not a law there",
-        applicability["per_metric"]["swarm.realise_p95_s"]["inside_demonstrated_regime"]
+        applicability["per_metric"]["swarm.client_realise_s"][
+            "inside_demonstrated_regime"
+        ]
         is False
-        and "OUTSIDE" in applicability["per_metric"]["swarm.realise_p95_s"]["verdict"],
-        str(applicability["per_metric"]["swarm.realise_p95_s"]),
+        and "OUTSIDE"
+        in applicability["per_metric"]["swarm.client_realise_s"]["verdict"],
+        str(applicability["per_metric"]["swarm.client_realise_s"]),
+    )
+
+    # A membership test ("the answer is one of the studied levels") would pass
+    # with `proven_to = noise_levels[0]` hardcoded - a liveness check wearing a
+    # derivation check's label. Prove DERIVATION by changing the study and
+    # requiring the answer to follow.
+    def study_with(rates: dict) -> dict:
+        """A study whose linear-vs-superlinear split holds exactly at the noise
+        levels in `rates` (mapping noise -> holds?)."""
+        return {
+            "ran": True,
+            "per_class": {
+                model: {
+                    str(noise): {
+                        "replicates": 120,
+                        "selections": {},
+                        "exact_rate": 1.0,
+                        # A superlinear generator flagged, a non-superlinear one
+                        # not - inverted at any level meant to fail.
+                        "superlinear_rate": (
+                            1.0
+                            if scalefit.BASIS_BY_NAME[model].superlinear == holds
+                            else 0.0
+                        ),
+                        "linear_rate": 0.0,
+                        "family_rate": 1.0,
+                    }
+                    for noise, holds in rates.items()
+                }
+                for model in scalefit.BASIS_BY_NAME
+            },
+        }
+
+    all_good = bite_applicability(
+        study_with({0.01: True, 0.02: True, 0.05: True}), {}, {}
+    )
+    only_quiet = bite_applicability(
+        study_with({0.01: True, 0.02: False, 0.05: False}), {}, {}
     )
     check(
-        "the demonstrated regime is DERIVED from the study, not hardcoded "
-        f"(={applicability['bite_demonstrated_up_to_relative_noise']})",
-        applicability["bite_demonstrated_up_to_relative_noise"]
-        in applicability["studied_noise_levels"],
-        str(applicability),
+        "DERIVATION: the regime FOLLOWS the study - a fitter good to 5% reports "
+        f"{all_good['bite_demonstrated_up_to_relative_noise']}, one good only to "
+        f"1% reports {only_quiet['bite_demonstrated_up_to_relative_noise']}",
+        all_good["bite_demonstrated_up_to_relative_noise"] == 0.05
+        and only_quiet["bite_demonstrated_up_to_relative_noise"] == 0.01,
+        f"{all_good['bite_demonstrated_up_to_relative_noise']} / "
+        f"{only_quiet['bite_demonstrated_up_to_relative_noise']}",
+    )
+    gapped = bite_applicability(
+        study_with({0.01: True, 0.02: False, 0.05: True}), {}, {}
+    )
+    check(
+        "a GAP does not extend the regime past it (contiguous from the quietest "
+        f"level; reports {gapped['bite_demonstrated_up_to_relative_noise']}, not 0.05)",
+        gapped["bite_demonstrated_up_to_relative_noise"] == 0.01,
+        str(gapped["bite_demonstrated_up_to_relative_noise"]),
+    )
+    check(
+        "a fitter that fails even at the quietest level demonstrates NO regime",
+        bite_applicability(study_with({0.01: False, 0.02: False}), {}, {})[
+            "bite_demonstrated_up_to_relative_noise"
+        ]
+        is None,
     )
     check(
         "with no study, applicability says so rather than guessing",
@@ -2232,17 +2701,6 @@ def run_self_test() -> int:  # noqa: C901 - a flat list of checks reads better h
 
 
 # ---- main --------------------------------------------------------------------
-
-
-def _install_sigterm_cleanup() -> None:
-    """Tear the pods down on SIGTERM as well as Ctrl-C. On a host at 95% disk a
-    leaked swarm pod is not a tidiness issue."""
-
-    def handler(_signum, _frame):
-        e2e.cleanup_pods("(SIGTERM)")
-        raise SystemExit(143)
-
-    signal.signal(signal.SIGTERM, handler)
 
 
 def main() -> int:
@@ -2297,7 +2755,21 @@ def main() -> int:
     if args.self_test:
         return run_self_test()
 
-    _install_sigterm_cleanup()
+    # Reused, not re-declared: `scale_sweep` already owns the SIGTERM->teardown
+    # contract, and two copies of "how a sweep cleans up when killed" is two
+    # things to forget to update.
+    ss.install_sigterm_cleanup()
+    # PRECONDITIONS FIRST, all of them, before anything expensive. Both of these
+    # used to fire late: the holder ceiling only when a pod was created (turning
+    # an argument error into silently-invalid data points), and the wire==NarSize
+    # assertion only at the top of the speedup arm, ~15 minutes into the run.
+    over = [n for n in args.swarm if not 1 <= n <= e2e.MAX_P2P_HOLDERS]
+    if over:
+        e2e.die(
+            f"--swarm values {over} are outside 1..{e2e.MAX_P2P_HOLDERS}; higher "
+            "counts collide with other published host ports. This is an argument "
+            "error, not a data point."
+        )
     free = shutil.disk_usage(fx.repo_root()).free
     if free < MIN_FREE_DISK_BYTES:
         e2e.die(
@@ -2311,6 +2783,11 @@ def main() -> int:
     out_root = args.out.resolve()
     e2e.preflight_gate(out_root)
     fixtures = e2e.resolve_fixtures(out_root)
+    # Pure, cheap, reads only the manifest - so it belongs HERE, not 15 minutes
+    # in at the top of the speedup arm. A fixture regenerated to xz must refuse
+    # to start, not waste the swarm sweep first.
+    if not args.skip_speedup:
+        assert_unit_coincidence(fixtures, SPEEDUP_ATTRS)
     image = e2e.load_image()
     # TASK-58: this sweeps EVERY pod carrying the project label, not just ours,
     # because there is one shared label across all container instruments. Running
@@ -2334,7 +2811,7 @@ def main() -> int:
         "speedup_attrs": list(SPEEDUP_ATTRS),
         "poll_interval_s": ss.POLL_INTERVAL_S,
         "extrapolation_targets": list(args.extrapolate_to),
-        "free_disk_bytes_ondisk_at_start": free,
+        "free_disk_at_start_bytes_ondisk": free,
     }
 
     axis = ss.Axis(name="swarm", variable="peer holder count", description="not run")
@@ -2342,11 +2819,39 @@ def main() -> int:
     try:
         axis = sweep_swarm(ctx, fixtures, args.swarm, args.repeats, state_root)
         if not args.skip_speedup:
-            speedup = run_speedup_arms(ctx, fixtures, args.speedup_runs, state_root)
+            # The speedup arm gets its OWN handler: it runs after ~15 minutes of
+            # swarm sweeping, and letting a holder that failed to announce (or
+            # any raise in here) propagate would discard the completed axis and
+            # write no report at all. The same principle the JSON-before-summary
+            # ordering below exists for - a later failure must not destroy an
+            # earlier measurement.
+            try:
+                speedup = run_speedup_arms(ctx, fixtures, args.speedup_runs, state_root)
+            except (RuntimeError, ss.SampleError, OSError, ValueError) as error:
+                speedup = {
+                    "ran": False,
+                    "reason": f"{error!r}",
+                    "traceback": traceback.format_exc(),
+                }
+            except SystemExit as error:
+                if error.code != 2:  # see sweep_swarm for the code-2 contract
+                    raise
+                speedup = {
+                    "ran": False,
+                    "reason": f"aborted by the Pod seam (e2e.die, exit {error.code})",
+                }
     finally:
-        # Label-scoped teardown, same contract as `just e2e-clean`.
+        # Label-scoped teardown, same contract as `just e2e-clean`. Cleanup
+        # FAILURES are reported: on a host at 95% used, a pod or scratch tree
+        # that would not go away is signal, not noise.
         e2e.cleanup_pods()
-        shutil.rmtree(scratch, ignore_errors=True)
+        try:
+            shutil.rmtree(scratch)
+        except OSError as error:
+            print(
+                f"profile: WARNING - could not remove scratch {scratch}: {error}",
+                file=sys.stderr,
+            )
 
     study = class_recovery_study(
         args.swarm,

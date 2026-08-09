@@ -745,16 +745,25 @@ definition). Three rules are mechanical, not editorial:
 - **The bite is MEASURED, not asserted.** `class_recovery_study()` runs
   a Monte-Carlo over known-class generators *on the swept grid*, under
   multiplicative noise, and the self-test gates on RATES — one lucky
-  seed is a coin flip, not an oracle. Measured at 2% noise on
-  {1,2,4,8,16}: O(n²) is fitted linear **0.000** of the time (the bite),
-  O(n) recovers linear 0.967, O(1) recovers constant 0.933. The
-  instrument's own limits are REPORTED, not hidden: a genuinely linear
-  law is falsely flagged superlinear 3.3% of the time, and O(n log n) is
-  mistaken for linear 10% of the time at 5% noise. The report puts the
-  sweep's OBSERVED replicate spread beside those numbers, so a reader
-  can see whether the real data sits inside the regime where the bite
-  holds. A grid too short to demonstrate the bite sets
-  `s9_bite_demonstrated=false` and makes the report UNUSABLE.
+  seed is a coin flip, not an oracle. The seeds are `crc32`-derived, not
+  `hash()`: Python randomizes `str.__hash__` per process, so the earlier
+  version's rates were reproducible only because nixpkgs happens to set
+  `PYTHONHASHSEED` — a FAST-tier gate one environment change from being
+  a lottery. Measured at 2% noise on {1,2,4,8,16}, 120 replicates:
+  O(n²) is fitted linear **0.000** of the time (the bite), O(n log n)
+  likewise 0.000, O(n) recovers linear 0.933, O(1) recovers constant
+  0.900. The instrument's own error rates are now GATED, not merely
+  printed — they are exactly what the superlinear-rule change moves: a
+  genuinely linear law is falsely flagged superlinear 6.7% of the time
+  at 2% noise (ceiling 12%), and O(n log n) is mistaken for linear 12.5%
+  of the time at 5% noise (ceiling 20%). The report puts the sweep's
+  OBSERVED replicate spread beside those numbers via
+  `verdict.bite_applicability`, so a reader can see whether the real
+  data sits inside the regime where the bite holds — on this grid that
+  regime reaches only ~1% relative noise, and the measured RSS spread
+  (2–4%) and latency spread (8–20%) are both OUTSIDE it. A grid too
+  short to demonstrate the bite sets `s9_bite_demonstrated=false` and
+  makes the report UNUSABLE.
 - **A red flag means superlinear GROWTH.** The first real run fitted the
   peer fd series (11,11,…,10,10,10) as quadratic with a *negative* slope
   and flagged it, extrapolating to −4015 descriptors. `scalefit` now

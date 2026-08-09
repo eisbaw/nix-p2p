@@ -1487,7 +1487,7 @@ def int_list(raw: str) -> tuple[int, ...]:
     return tuple(int(x) for x in raw.replace(",", " ").split())
 
 
-def _install_sigterm_cleanup() -> None:
+def install_sigterm_cleanup() -> None:
     """Tear the pods down on SIGTERM too, not only on Ctrl-C.
 
     Learned the hard way: a `timeout`-killed sweep left a pod running, because
@@ -1562,7 +1562,7 @@ def main() -> int:
     if args.self_test:
         return run_self_test()
 
-    _install_sigterm_cleanup()
+    install_sigterm_cleanup()
     free = shutil.disk_usage(fx.repo_root()).free
     if free < MIN_FREE_DISK_BYTES:
         e2e.die(

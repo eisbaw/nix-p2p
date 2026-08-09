@@ -59,7 +59,11 @@ from dataclasses import dataclass, field
 
 # ---- frozen constants -------------------------------------------------------
 
-FITTER_VERSION = "scalefit-v1"
+# v1 -> v2 (task-42): `superlinear` changed MEANING - it now requires the fitted
+# slope to be positive, not merely a superlinear basis. That changes what
+# `red_flags_for` emits for the same input, so two reports stamped `scalefit-v1`
+# would have had different red-flag semantics. Bumping is what this field is for.
+FITTER_VERSION = "scalefit-v2"
 
 # Fewer points than this and AICc is undefined for the 3-parameter candidates
 # (n - k - 1 <= 0), so selection would be a coin flip dressed as statistics.
@@ -421,28 +425,45 @@ def extrapolate(fit: CandidateFit, n: float, max_measured_n: float) -> dict:
     below_zero = any(
         interval is not None and interval[0] < 0.0 for interval in (mean_ci, pred_pi)
     )
+    # And the POINT ESTIMATE itself. Flagging only the interval left the absurd
+    # number in the report: task-42's near-constant fd series extrapolated to
+    # -29 descriptors at n=100 with `interval_extends_below_zero` set but the
+    # estimate stated plainly, and a point estimate is what a reader quotes.
+    # Negative bytes/descriptors/seconds are outside the metric's domain, so the
+    # fit does not describe the metric there, whatever the interval says.
+    estimate = fit.predict(n)
+    estimate_below_zero = estimate < 0.0
     return {
         "kind": MODEL_OUTPUT_KIND,
         "n": n,
         "model": fit.model,
         "model_label": fit.label,
-        "point_estimate": fit.predict(n),
+        "point_estimate": estimate,
         "ci95_mean_response": list(mean_ci) if mean_ci else None,
         "pi95_new_observation": list(pred_pi) if pred_pi else None,
         "r_squared": fit.r_squared,
         "residual_std_error": fit.residual_std_error,
         "extrapolation_factor_beyond_measured": factor,
         "interval_extends_below_zero": below_zero,
+        "point_estimate_below_zero": estimate_below_zero,
+        # ONE field a consumer can branch on, instead of every consumer
+        # re-deriving "is this number meaningful" from two flags.
+        "uninformative": below_zero or estimate_below_zero,
         "caveat": (
             f"MODEL OUTPUT, not a measurement: {factor:.1f}x beyond the largest "
             f"measured n ({max_measured_n:g}). Resource scaling laws only; "
             "emergent network effects are out of scope."
             + (
-                " UNINFORMATIVE: the interval extends below zero, which is "
-                "outside the physical range of this metric - the fit does not "
-                "constrain it at this n. Do not read the point estimate as a "
-                "prediction."
-                if below_zero
+                " UNINFORMATIVE: "
+                + (
+                    "the POINT ESTIMATE itself is negative"
+                    if estimate_below_zero
+                    else "the interval extends below zero"
+                )
+                + ", which is outside the physical range of this metric - the "
+                "fit does not constrain it at this n. Do not read the point "
+                "estimate as a prediction."
+                if (below_zero or estimate_below_zero)
                 else ""
             )
         ),
@@ -972,7 +993,37 @@ def run_self_test() -> int:  # noqa: C901 - a flat list of checks reads better h
     )
     check(
         "and the flag is not always-on (a clean fit is not flagged)",
-        not cover["extrapolations"][-1]["interval_extends_below_zero"],
+        not cover["extrapolations"][-1]["interval_extends_below_zero"]
+        and not cover["extrapolations"][-1]["uninformative"],
+    )
+    # The POINT ESTIMATE going negative is its own failure, and it is the one a
+    # reader quotes. Regression test with the real series that produced it:
+    # task-42's peer fd sweep, 11,11,...,10,10,10, extrapolated to NEGATIVE
+    # descriptors while only the interval flag was set.
+    fds = fit_scaling(
+        [1, 1, 1, 2, 2, 2, 4, 4, 4, 8, 8, 8, 16, 16, 16],
+        [11, 11, 11, 11, 11, 11, 11, 11, 11, 11, 11, 11, 10, 10, 10],
+        metric="near-constant-fds",
+        unit="descriptors",
+        targets=(100, 1000),
+    )
+    far = fds["extrapolations"][-1]
+    check(
+        f"a NEGATIVE point estimate ({far['point_estimate']:.1f} descriptors at "
+        f"n={far['n']}) is flagged UNINFORMATIVE in its own right",
+        far["point_estimate"] < 0
+        and far["point_estimate_below_zero"]
+        and far["uninformative"],
+        str(far["point_estimate"]),
+    )
+    check(
+        "and its caveat SAYS the point estimate is the problem",
+        "POINT ESTIMATE itself is negative" in far["caveat"],
+        far["caveat"],
+    )
+    check(
+        "`uninformative` is not always-on for a physically sensible estimate",
+        not any(e["point_estimate_below_zero"] for e in cover["extrapolations"]),
     )
 
     noisy_shape = fit_scaling(
