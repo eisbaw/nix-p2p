@@ -73,6 +73,6 @@ pub use transport_fetch::{
 };
 pub use transport_iroh::{
     BODY_IDLE_TIMEOUT, DIAL_TIMEOUT, FETCH_TIMEOUT, IrohError, IrohPeerAddr, IrohProvider,
-    IrohTransport, SafetyEnvelope, iroh_blobs_alpn,
+    IrohTransport, SafetyEnvelope, ServeWindow, StoreResidency, StoreRetention, iroh_blobs_alpn,
 };
 pub use upstream::UpstreamHttp;

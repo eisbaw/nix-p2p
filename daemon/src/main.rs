@@ -270,10 +270,24 @@ async fn setup_iroh_provider(config: &Config) -> Result<Arc<IrohProvider>, Strin
     // Ground-truth served-bytes monitor: poll the provider's own byte counter and
     // log it whenever it advances, so the harness reads node B's SENT bytes (not
     // node A's self-report) as the peer-served oracle.
+    //
+    // Two more machine-readable lines ride the same loop (task-65):
+    //
+    //   IROH-STORE-RESIDENT - the RESIDENCY oracle. What the blob store says it
+    //     holds, asked of the store itself. Peak RSS cannot answer this (VmHWM is
+    //     monotone, and glibc need not return a freed arena), so a residency claim
+    //     gated on RSS alone would fail on a correct fix and pass on a wrong one.
+    //
+    //   IROH-SERVE-WINDOW - one line per COMPLETED serve, with the holder-side
+    //     start/end of the transfer. The concurrency precondition is measured from
+    //     these, not from the fetching client's request windows, which would overlap
+    //     even if the serves had taken turns.
     {
         let provider = provider.clone();
         tokio::spawn(async move {
             let mut last = 0u64;
+            let mut windows_logged = 0usize;
+            let mut last_residency: Option<daemon::StoreResidency> = None;
             loop {
                 tokio::time::sleep(std::time::Duration::from_millis(200)).await;
                 let served = provider.bytes_served();
@@ -283,6 +297,29 @@ async fn setup_iroh_provider(config: &Config) -> Result<Arc<IrohProvider>, Strin
                         "IROH-SERVED-TOTAL bytes={served} transfers={}",
                         provider.transfers_completed()
                     );
+                }
+                let windows = provider.serve_windows();
+                for window in windows.iter().skip(windows_logged) {
+                    println!(
+                        "IROH-SERVE-WINDOW start_ms={:.3} end_ms={:.3} bytes_uncompressed_nar={}",
+                        window.start_ms, window.end_ms, window.bytes_uncompressed_nar
+                    );
+                }
+                windows_logged = windows.len();
+                // FAIL VERBOSELY, never silently: a residency reading that could not
+                // be taken is logged as an error line, so the harness sees "unknown"
+                // rather than inferring "holds nothing" from a missing line.
+                match provider.store_residency().await {
+                    Ok(residency) => {
+                        if last_residency != Some(residency) {
+                            last_residency = Some(residency);
+                            println!(
+                                "IROH-STORE-RESIDENT blobs={} bytes_uncompressed_nar={}",
+                                residency.blobs, residency.bytes_uncompressed_nar
+                            );
+                        }
+                    }
+                    Err(err) => eprintln!("IROH-STORE-RESIDENT-ERROR {err}"),
                 }
             }
         });

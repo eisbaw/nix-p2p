@@ -49,20 +49,22 @@
 use std::collections::HashMap;
 use std::fmt;
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use bao_tree::io::BaoContentItem;
 use iroh::endpoint::{RelayMode, presets};
 use iroh::protocol::Router;
 use iroh::{Endpoint, EndpointAddr, PublicKey};
+use iroh_blobs::api::blobs::BlobStatus;
 use iroh_blobs::get::request::{GetBlobItem, get_blob};
 use iroh_blobs::provider::events::{
     EventMask, EventSender, ProviderMessage, RequestMode, RequestUpdate,
 };
-use iroh_blobs::store::mem::MemStore;
+use iroh_blobs::store::mem::{MemStore, Options as MemStoreOptions};
+use iroh_blobs::store::{GcConfig, ProtectCb, ProtectOutcome};
 use iroh_blobs::{BlobsProtocol, Hash};
 use n0_future::StreamExt;
 
@@ -185,6 +187,10 @@ pub enum IrohError {
     InvalidNodeId(String),
     /// No socket address is bound yet, so no dialable address can be published.
     NoBoundAddress,
+    /// The blob store could not be asked what it currently holds. RAISED, never
+    /// reported as "holds nothing": a residency oracle that answers 0 when it
+    /// could not look would pass every future eviction change (task-65).
+    StoreQuery(String),
 }
 
 impl fmt::Display for IrohError {
@@ -194,6 +200,7 @@ impl fmt::Display for IrohError {
             IrohError::Seed(why) => write!(f, "iroh-blobs seed failed: {why}"),
             IrohError::InvalidNodeId(why) => write!(f, "invalid iroh node id: {why}"),
             IrohError::NoBoundAddress => f.write_str("iroh endpoint has no bound address yet"),
+            IrohError::StoreQuery(why) => write!(f, "iroh-blobs store query failed: {why}"),
         }
     }
 }
@@ -241,6 +248,72 @@ impl IrohPeerAddr {
 // Provider (node B): serve this node's NARs by BLAKE3 over iroh-blobs.
 // -------------------------------------------------------------------------
 
+/// What the provider's blob store does with content after it is seeded (task-65).
+///
+/// THIS IS A MECHANISM, NOT A POLICY DECISION. The daemon's default is - and stays -
+/// [`StoreRetention::RetainAll`], byte-for-byte the behaviour every wave-2a
+/// measurement was taken against. Choosing what a node should actually do (regenerate
+/// on demand vs a bounded evicting store) is TASK-61's decision and is deliberately
+/// NOT made here. What is provided here is the ability to RELEASE, without which the
+/// residency oracle below could only ever be reasoned about, never broken.
+#[derive(Debug, Clone)]
+pub enum StoreRetention {
+    /// Hold every seeded blob for the life of the process (the daemon's behaviour).
+    RetainAll,
+    /// Hold everything until [`IrohProvider::release_all`] is called, then let
+    /// iroh-blobs' own garbage collector sweep ONCE, within `sweep_interval`.
+    ///
+    /// ARMED BY THE RELEASE, NOT BY THE CLOCK, and that is not a stylistic choice.
+    /// iroh-blobs' gc calls `clear_protected()` before it marks, so a sweep landing
+    /// while blobs are being ADDED can delete a blob whose named tag is not written
+    /// yet (upstream says as much where it keeps `Blobs::delete` private: "it does
+    /// not work as expected when called manually, because blobs are protected from
+    /// deletion"). MEASURED here, not theorised: a free-running 50 ms gc alongside
+    /// 512 seeds kept 501 of them. A background evictor for this store therefore
+    /// needs that race solved before it is a policy option at all - a lesson
+    /// forward-carried to TASK-61.
+    ReleaseOnRequest { sweep_interval: Duration },
+}
+
+/// What the blob store currently HOLDS, asked of the store itself (task-65).
+///
+/// This is the residency oracle. It is NOT peak RSS: `VmHWM` is monotone by kernel
+/// definition, so it cannot observe a release at all, and `VmRSS` cannot either when
+/// glibc keeps a freed arena instead of returning it to the OS. An RSS-only oracle
+/// therefore fails on a correct fix and passes on a wrong one. This asks iroh-blobs
+/// which blobs it still has and how big they are.
+///
+/// STATED LIMIT: it answers "does the STORE still hold this content". With
+/// [`MemStore`] that IS resident memory by construction. Under a future on-disk store
+/// it would not be, and the mapping from store residency to RAM would have to be
+/// re-derived (TASK-61).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct StoreResidency {
+    /// Blobs the store still holds.
+    pub blobs: u64,
+    /// Their total size in UNCOMPRESSED NAR bytes (NarSize units - the addressed unit
+    /// is the raw NAR, so a blob's size IS its NarSize). Never FileSize.
+    pub bytes_uncompressed_nar: u64,
+}
+
+/// One COMPLETED get-transfer this provider served, as a half-open time window
+/// measured on the HOLDER's own clock (task-65).
+///
+/// Why the holder's clock and not the fetching client's: the concurrency dimension
+/// asks whether k serves actually OVERLAPPED, and a k-way overlap measured at the
+/// HTTP client would be satisfied even if the daemon serialised the peer fetches
+/// internally - the client windows would still overlap while the serves took turns.
+/// A precondition that cannot fail is not a precondition (the task-18 rule).
+#[derive(Debug, Clone, Copy)]
+pub struct ServeWindow {
+    /// Milliseconds from provider spawn to the transfer's `Started` event.
+    pub start_ms: f64,
+    /// Milliseconds from provider spawn to its `Completed` event.
+    pub end_ms: f64,
+    /// Declared blob size served, in UNCOMPRESSED NAR bytes.
+    pub bytes_uncompressed_nar: u64,
+}
+
 /// An iroh-blobs PROVIDER: an endpoint + an in-memory blob store served under the
 /// iroh-blobs ALPN. It answers a client's get-request for a blob addressed by
 /// `BLAKE3(RawNarV1)`.
@@ -248,6 +321,11 @@ pub struct IrohProvider {
     endpoint: Endpoint,
     store: MemStore,
     router: Router,
+    /// Per-transfer serve windows on this provider's own clock (see [`ServeWindow`]).
+    serve_windows: Arc<Mutex<Vec<ServeWindow>>>,
+    /// One-shot arming flag for [`StoreRetention::ReleaseOnRequest`]. `None` under
+    /// [`StoreRetention::RetainAll`], where nothing sweeps.
+    gc_armed: Option<Arc<AtomicBool>>,
     /// Total DECLARED size of the whole-blob transfers this provider has COMPLETED,
     /// observed from iroh-blobs' own provider events (never a client self-report).
     /// This is the S6 ground-truth oracle: node A's daemon claiming it "fetched from
@@ -268,9 +346,45 @@ impl IrohProvider {
     /// Bind a provider endpoint on loopback with the relay DISABLED and NO
     /// discovery, and start serving its (initially empty) blob store under the
     /// iroh-blobs ALPN. Seed blobs with [`Self::seed`].
+    ///
+    /// Retention is [`StoreRetention::RetainAll`] - the daemon's behaviour, unchanged.
     pub async fn spawn() -> Result<Self, IrohError> {
+        Self::spawn_with_retention(StoreRetention::RetainAll).await
+    }
+
+    /// [`Self::spawn`] with an explicit store [`StoreRetention`]. See that type for
+    /// why the non-default variant exists and why it is not a policy decision.
+    pub async fn spawn_with_retention(retention: StoreRetention) -> Result<Self, IrohError> {
         let endpoint = bind_loopback_endpoint().await?;
-        let store = MemStore::new();
+        let (store, gc_armed) = match retention {
+            StoreRetention::RetainAll => (MemStore::new(), None),
+            StoreRetention::ReleaseOnRequest { sweep_interval } => {
+                let armed = Arc::new(AtomicBool::new(false));
+                let flag = armed.clone();
+                // The gc's own pre-mark hook, used as an ARMING GATE rather than to
+                // protect individual hashes: `Abort` skips the whole run, so no
+                // sweep can race a concurrent seed. `swap(false)` makes each
+                // `release_all` arm exactly ONE sweep, so content seeded after a
+                // release is not silently collected by the next tick.
+                let add_protected: ProtectCb = Arc::new(move |_live| {
+                    let flag = flag.clone();
+                    Box::pin(async move {
+                        if flag.swap(false, Ordering::SeqCst) {
+                            ProtectOutcome::Continue
+                        } else {
+                            ProtectOutcome::Abort
+                        }
+                    })
+                });
+                let store = MemStore::new_with_opts(MemStoreOptions {
+                    gc_config: Some(GcConfig {
+                        interval: sweep_interval,
+                        add_protected: Some(add_protected),
+                    }),
+                });
+                (store, Some(armed))
+            }
+        };
 
         // Provider-side byte counter (the S6 ground-truth oracle). `NotifyLog`
         // asks iroh-blobs for per-request transfer events on a NOTIFY channel -
@@ -283,9 +397,17 @@ impl IrohProvider {
         let (events, mut rx) = EventSender::channel(64, mask);
         let bytes_served = Arc::new(AtomicU64::new(0));
         let transfers_completed = Arc::new(AtomicU64::new(0));
+        // The zero of this provider's serve-window clock. Windows are reported
+        // RELATIVE to it because the only question asked of them - did k serves
+        // overlap, and for how long was this provider actually serving - is answered
+        // entirely within one provider. An absolute wall clock would invite a
+        // cross-host comparison the measurement does not support.
+        let serve_origin = Instant::now();
+        let serve_windows = Arc::new(Mutex::new(Vec::<ServeWindow>::new()));
         {
             let bytes_served = bytes_served.clone();
             let transfers_completed = transfers_completed.clone();
+            let serve_windows = serve_windows.clone();
             tokio::spawn(async move {
                 // One outer message per get-request; each carries an update
                 // sub-stream (Started -> [Progress] -> Completed/Aborted). We sum
@@ -294,19 +416,42 @@ impl IrohProvider {
                     if let ProviderMessage::GetRequestReceivedNotify(msg) = msg {
                         let bytes_served = bytes_served.clone();
                         let transfers_completed = transfers_completed.clone();
+                        let serve_windows = serve_windows.clone();
                         let mut updates = msg.rx;
                         tokio::spawn(async move {
                             let mut blob_size: u64 = 0;
+                            let mut started_ms: Option<f64> = None;
                             while let Ok(Some(update)) = updates.recv().await {
                                 match update {
-                                    RequestUpdate::Started(started) => blob_size = started.size,
+                                    RequestUpdate::Started(started) => {
+                                        blob_size = started.size;
+                                        started_ms =
+                                            Some(serve_origin.elapsed().as_secs_f64() * 1000.0);
+                                    }
                                     RequestUpdate::Completed(_) => {
                                         bytes_served.fetch_add(blob_size, Ordering::Relaxed);
                                         transfers_completed.fetch_add(1, Ordering::Relaxed);
+                                        // A Completed with no Started would be a
+                                        // window with no beginning; dropped rather
+                                        // than back-dated to zero, which would make
+                                        // every transfer look maximally overlapping.
+                                        if let Some(start_ms) = started_ms.take() {
+                                            let end_ms =
+                                                serve_origin.elapsed().as_secs_f64() * 1000.0;
+                                            serve_windows
+                                                .lock()
+                                                .expect("serve windows mutex")
+                                                .push(ServeWindow {
+                                                    start_ms,
+                                                    end_ms,
+                                                    bytes_uncompressed_nar: blob_size,
+                                                });
+                                        }
                                     }
                                     // Progress is redundant with Started.size for a
                                     // whole-blob serve; an Aborted transfer is NOT
-                                    // counted (no bytes credited to a failed serve).
+                                    // counted (no bytes credited to a failed serve,
+                                    // and no window recorded for one).
                                     _ => {}
                                 }
                             }
@@ -326,6 +471,8 @@ impl IrohProvider {
             endpoint,
             store,
             router,
+            serve_windows,
+            gc_armed,
             bytes_served,
             transfers_completed,
         })
@@ -341,6 +488,78 @@ impl IrohProvider {
     /// Count of completed get-transfers served (see [`Self::bytes_served`]).
     pub fn transfers_completed(&self) -> u64 {
         self.transfers_completed.load(Ordering::Relaxed)
+    }
+
+    /// Every completed serve's [`ServeWindow`], in completion order.
+    pub fn serve_windows(&self) -> Vec<ServeWindow> {
+        self.serve_windows
+            .lock()
+            .expect("serve windows mutex")
+            .clone()
+    }
+
+    /// THE RESIDENCY ORACLE (task-65): what the blob store holds RIGHT NOW, asked of
+    /// the store itself rather than inferred from the process's resident memory.
+    ///
+    /// See [`StoreResidency`] for why peak RSS cannot answer this and what this does
+    /// and does not claim. Partial blobs count their stored prefix: a half-received
+    /// blob is half-resident, and rounding it to zero would understate what a node
+    /// is holding mid-transfer - precisely the case a streaming change (TASK-62)
+    /// makes interesting.
+    pub async fn store_residency(&self) -> Result<StoreResidency, IrohError> {
+        let hashes = self
+            .store
+            .blobs()
+            .list()
+            .hashes()
+            .await
+            .map_err(|e| IrohError::StoreQuery(format!("listing blobs: {e}")))?;
+        let mut residency = StoreResidency::default();
+        for hash in hashes {
+            let status = self
+                .store
+                .blobs()
+                .status(hash)
+                .await
+                .map_err(|e| IrohError::StoreQuery(format!("status of {hash}: {e}")))?;
+            let size = match status {
+                BlobStatus::Complete { size } => size,
+                BlobStatus::Partial { size } => size.unwrap_or(0),
+                // Listed a moment ago, gone now: a concurrent release. Not an error,
+                // and NOT counted - the store is telling us it no longer holds it.
+                BlobStatus::NotFound => continue,
+            };
+            residency.blobs += 1;
+            residency.bytes_uncompressed_nar += size;
+        }
+        Ok(residency)
+    }
+
+    /// Drop every tag protecting this provider's blobs and arm ONE garbage-collector
+    /// sweep, so a store built with [`StoreRetention::ReleaseOnRequest`] genuinely
+    /// REMOVES them. Returns the number of tags removed.
+    ///
+    /// Untagging without a sweep on a [`StoreRetention::RetainAll`] store leaves the
+    /// content held (nothing sweeps) - which is itself an assertion the task-65
+    /// residency test makes, because an oracle that reported the CALLER'S INTENT
+    /// instead of the store's state would answer "released" here and would have
+    /// proven nothing.
+    ///
+    /// This is NOT an eviction policy. TASK-61 owns deciding whether and when a node
+    /// should release what it serves; this is the primitive that decision would use.
+    pub async fn release_all(&self) -> Result<u64, IrohError> {
+        let removed = self
+            .store
+            .tags()
+            .delete_all()
+            .await
+            .map_err(|e| IrohError::StoreQuery(format!("deleting tags: {e}")))?;
+        // Arm AFTER untagging, so the armed sweep cannot run against a store whose
+        // tags are still in place and conclude there is nothing to collect.
+        if let Some(armed) = &self.gc_armed {
+            armed.store(true, Ordering::SeqCst);
+        }
+        Ok(removed)
     }
 
     /// Content-addressed "put": add the raw NAR bytes to the served store and
