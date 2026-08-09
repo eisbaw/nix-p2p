@@ -1,10 +1,11 @@
 ---
 id: TASK-42
 title: 'Profiling harness: RAM/disk/latency/throughput/speedup over the p2p testbed'
-status: To Do
-assignee: []
+status: In Progress
+assignee:
+  - '@me'
 created_date: '2026-08-08 20:13'
-updated_date: '2026-08-09 11:16'
+updated_date: '2026-08-09 13:03'
 labels: []
 dependencies:
   - TASK-41
@@ -79,4 +80,89 @@ Other traps:
   Monte-Carlo coverage rate (scalefit's self-test does; measured 0.965 / 0.960).
 - The intervals UNDER-COVER under multiplicative noise (0.865 measured at n=1000). Resource
   metrics are multiplicative-ish, so treat far extrapolation intervals as optimistic and say so.
+
+## Implementation plan (task-42 implementer)
+
+NEW: `scripts/profile_p2p.py` (+ `just profile`, SLOW tier), reusing rather than
+reimplementing: `scale_sweep.{NodeSampler,read_node,aggregate_samples,max_overlap,
+parse_realise_seconds,latency_block,SweepPoint,Axis}`, `scalefit.{fit_scaling,
+sweep_report_violations,red_flags_for}`, `measure.{classify_run,percentile,stat_block}`.
+
+TWO ARMS.
+1. SWARM axis (FITTED, n = holder peers, grid 1,2,4,8,16): a real p2p swarm of
+   n+1 daemon PROCESSES in one pod (node-a + node-b..node-bN, every holder an
+   iroh provider seeded with the raw NARs). Fitted: worst per-peer VmHWM, swarm
+   total VmHWM, worst per-peer fds, per-peer on-disk bytes, client p95 realise.
+2. SPEEDUP/THROUGHPUT arm (NOT fitted): peers-ON vs peers-OFF over the frozen
+   net-upstream-egress-v2 rule (measure.classify_run), with `big` (110 MiB) so
+   throughput is a real number and VmHWM/VmRSS finally get a bursty workload.
+
+UNIT DISCIPLINE (the NarSize-vs-FileSize trap, 3x recurred) is MECHANICAL here:
+every key ending in `_bytes` must carry one of `_ram`/`_ondisk`/
+`_uncompressed_nar`/`_compressed_wire`; `unit_violations(report)` fails the run
+otherwise, proven by mutation. The speedup arm uses ONLY `compression: none`
+attrs (lib, big) and ASSERTS file_size == nar_size from the manifest, so wire
+and NarSize coincide by checked precondition rather than by hope.
+
+S9 BITE (AC#2) is a Monte-Carlo class-recovery study over the REAL grid, gated
+on rates (not one lucky seed): O(n)->linear, O(1)->constant, O(n^2)->superlinear
+and NEVER linear, O(n log n)->superlinear; wrong-model = selected class outside
+the generated class's family -> self-test FAILS.
+
+Pod seam extension: `p2p_holders=N` (swarm) and `state_root=` (a host-side
+bind-mounted --narinfo-cache-dir per node, so DISK is walked host-side at the
+right boundary - no in-container binary, no rc=127 dead oracle).
+
+## Implementation record (task-42)
+
+LANDED: `scripts/profile_p2p.py` + `just profile` (SLOW) + its container-free
+`--self-test` in the FAST `just test` gate; `Pod(p2p_holders=N, state_root=)`
+in the e2e seam; a correctness fix in `scalefit` (FITTER_VERSION -> v2).
+
+### Gotchas that cost time (forward-carried to 43/44/52/54)
+
+1. THE IROH BLOB STORE IS `MemStore`. There is no on-disk blob store to profile.
+   Held content costs RSS: holder peak 248 MiB for a 110 MiB NAR (2.15x),
+   fetching node 141 MiB, vs 10.7 MiB for the peers-OFF daemon. On-disk state is
+   4096 B (the narinfo cache), FLAT across n=1..16. The disk AC is answered by a
+   finding, not a number.
+2. `InMemoryDiscovery::announce` REPLACES on key, so `--p2p-claim` cannot express
+   a multi-holder claim. The swarm axis therefore measures n peer PROCESSES plus
+   an n-entry address book, NOT holder selection or dial fan-out.
+3. `e2e.die` is `sys.exit(2)`, not an exception. With 17 containers per point one
+   holder failing to announce killed the WHOLE run. Caught and demoted to an
+   invalid POINT; root fix filed as TASK-60.
+4. REPLICATES DECIDE THE CLASS. --repeats 1 fitted client latency O(n log n) and
+   raised a RED FLAG; --repeats 3 fitted O(1) on one run and O(n) on the next,
+   both with identifiable=false. Three classes, one metric. task-18's lesson,
+   re-confirmed.
+5. A red flag meant a superlinear BASIS, not superlinear GROWTH. The fd series
+   11,11,...,10,10,10 fitted quadratic with slope -0.004, was flagged, and
+   extrapolated to -4015 descriptors. Fixed in scalefit (slope > 0 required) and
+   regression-tested with that exact series, direction-sensitivity proven by
+   MIRRORING it about its mean.
+6. `hash()` IS NOT REPRODUCIBLE. The S9 study's seeds looked deterministic only
+   because nixpkgs' python hook sets PYTHONHASHSEED, which this repo does not.
+   The gated rates wandered to 0.892 against a 0.88 floor. Use crc32.
+7. THE UNIT GATE WAS ITSELF THE VACUOUS SHAPE. endswith('_bytes') let
+   `bytes_sent` (a real key here), `egress_bytes_total` and `total_bytes_moved`
+   through, and the mutations had been chosen to match the code, not the claim.
+8. `aggregate_samples` per_role includes the fixture origin and testproxy. The
+   'RAM per held byte: worst node' line takes a max over it - one unlucky
+   fixture-server RSS and the summary attributes it to the blob store.
+9. A peers-ON arm can silently become peers-OFF. Assert the holder's OWN
+   provider counter, and record the upstream egress beside any shortfall:
+   'fell back to upstream' and 'the holder's log monitor lagged' are otherwise
+   the same observation.
+
+### Rejected approaches
+- Extrapolating the peer axis from the 2-node S6 topology: two points cannot
+  discriminate O(n) from O(n log n). Built a real swarm instead.
+- Measuring container disk via `podman ps --size` or an in-container `du`: `du`
+  and `find` are not in the e2e image (rc=127, reads as 0 bytes). Bind-mounted a
+  host dir as --narinfo-cache-dir and walked the HOST side.
+- Filtering the false red flag inside profile_p2p: that is a workaround. Fixed
+  the meaning of `superlinear` in scalefit instead.
+- A one-seed 'the fitter got it right' bite: a coin flip dressed as an oracle.
+  Monte-Carlo rate gates instead.
 <!-- SECTION:NOTES:END -->

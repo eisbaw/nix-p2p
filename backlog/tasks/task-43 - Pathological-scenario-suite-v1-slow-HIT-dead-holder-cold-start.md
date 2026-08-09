@@ -4,7 +4,7 @@ title: 'Pathological scenario suite v1: slow-HIT, dead-holder, cold-start'
 status: To Do
 assignee: []
 created_date: '2026-08-08 20:13'
-updated_date: '2026-08-09 11:16'
+updated_date: '2026-08-09 12:26'
 labels: []
 dependencies:
   - TASK-42
@@ -50,4 +50,53 @@ FORWARD-CARRY from task-51: the pathological suite should assert the envelope bo
 - If a pathological arm produces a superlinear RAM/latency law, feed it through
   `scalefit.fit_scaling` + `scalefit.red_flags_for` so the red flag is surfaced under the same
   S5 rules rather than in prose.
+
+## Forward-carried from task-42 (profiling harness)
+
+THE TOPOLOGY YOU EXTEND ALREADY EXISTS. `Pod(..., p2p_holders=N)` runs node-a
+plus node-b..node-bN, each a real independently-seeded iroh provider PROCESS
+(task-42 ran N=16, i.e. 17 daemons in one pod, 15/15 sweep points valid). N=1 is
+byte-for-byte the task-41 two-node S6 topology, so nothing you inherit is a
+special case. `Pod(..., state_root=)` bind-mounts a HOST dir per daemon role as
+its --narinfo-cache-dir; `pod.state_dir(role)` gives you the host side to walk.
+
+DEAD-HOLDER IS ALREADY HALF-SPECIFIED BY WHAT THE SWARM CANNOT DO.
+`InMemoryDiscovery::announce` REPLACES on key, so `--p2p-claim` cannot express
+a multi-holder claim (last write wins). Your dead-holder/failover scenario
+therefore needs a claim surface that carries >1 holder before 'fast failover to
+the NEXT holder' is even testable - today the only failover is peer -> upstream,
+which S6 already covers. Treat that as a PREREQUISITE, not a detail: without it
+the failover case degenerates into the fallback case you already have.
+
+REUSE, DO NOT REBUILD. `scripts/profile_p2p.py` has the pieces your suite needs:
+`score_run()` (frozen counting rule + in-container REALISE_NS in one verdict),
+`summarize_profile_arm()`, `dir_footprint()` (host-side, fail-closed on a
+missing dir), and `hwm_gap_summary()`. `scale_sweep` still owns /proc sampling
+and `max_overlap()`.
+
+TRAPS THAT COST ME TIME:
+- `e2e.die` inside a pod bring-up is `sys.exit(2)`, NOT an exception in the
+  caught tuple. With 17 containers per point there are 17 chances for one holder
+  to miss its identity announcement, and an uncaught SystemExit kills the WHOLE
+  run. profile_p2p catches SystemExit, invalidates the POINT when code == 2, and
+  re-raises anything else (notably the SIGTERM handler's 143). Copy that.
+- A peers-ON arm can silently become a peers-off arm: if the holder does not
+  serve, the build succeeds via upstream and every number is still 'valid'. Assert
+  the holder's OWN provider counter (`pod.node_b_served_bytes`) advanced by the
+  full workload, per run. profile_p2p records `peer_serve_shortfall_runs`.
+- `grep`/`find`/`du` are NOT in the e2e image. Anything you want to know about a
+  container, observe HOST-side.
+- Running `just profile`/`scale-sweep`/`measure`/`e2e` concurrently makes them
+  tear down each other's pods (one shared podman label) - filed as TASK-58.
+
+MEASURED BASELINE YOUR PATHOLOGICAL CASES DEVIATE FROM (this host, 110 MiB
+`big` payload, loopback):
+- peer-served realise 0.690 s mean vs upstream 0.184 s -> the peer path is
+  ~3.7x SLOWER than a loopback cache while offloading 100% of payload wire bytes.
+- iroh throughput 168 MB/s (NarSize units) vs HTTP-through-daemon 660 MB/s.
+- holder peak RSS 248 MiB for a 110 MiB NAR (2.15x); fetching node 141 MiB;
+  peers-OFF daemon 10.7 MiB. Both ends resident-size the whole NAR.
+- swarm size 1..16 had NO measurable effect on client latency (fitted O(1), class
+  not identifiable) and none on per-peer RSS/fds (O(1), 19-21 MiB, 10-11 fds).
+  Only the HOST total grows: O(n), R^2=0.9996.
 <!-- SECTION:NOTES:END -->

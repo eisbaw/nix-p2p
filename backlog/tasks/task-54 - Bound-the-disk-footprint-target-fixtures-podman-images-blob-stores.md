@@ -4,7 +4,7 @@ title: 'Bound the disk footprint (target/, fixtures, podman images, blob stores)
 status: To Do
 assignee: []
 created_date: '2026-08-08 22:11'
-updated_date: '2026-08-09 11:16'
+updated_date: '2026-08-09 12:27'
 labels:
   - tooling
 dependencies:
@@ -46,4 +46,45 @@ does today, so the footprint work can bound it deliberately:
 - Do not shrink the default N grid below 5 DISTINCT points to save disk: `scalefit.MIN_POINTS`
   is 5 and the fitter REFUSES to fit fewer. Shrinking the grid silently turns the sweep into a
   no-op that still exits 0 on the arms it skipped. Bound the payload, not the point count.
+
+## Forward-carried from task-42 (profiling harness) - AC#2 input
+
+WHAT TASK-42 DELIVERED FOR YOUR AC#2. `just profile` measures footprint at the
+right boundary and refuses to run below headroom:
+- `MIN_FREE_DISK_BYTES = 8 GiB` fail-fast precondition with a message naming
+  TASK-54, so a sweep dies before it starts rather than with a mid-run ENOSPC.
+- `dir_footprint()` walks a node's on-disk state HOST-side (apparent + allocated
+  + file count) and RAISES on a missing directory - 'measured the wrong place'
+  can never present as a comfortable 0 bytes. Host-side because `du`/`find` are
+  not in the e2e image (an in-container probe returns rc=127 and reads as 0).
+- Every pod is torn down label-scoped on exit AND on SIGTERM; per-point seed
+  dirs (a 110 MiB copy each for the speedup arm) are rmtree'd in a `finally`.
+- The swarm axis deliberately uses SMALL attrs: every holder seeds every NAR into
+  an in-RAM store, so `big` at n=16 would be ~1.8 GiB of held content and would
+  measure the host running out of memory rather than a scaling law. Coverage was
+  not shrunk to dodge disk - the 110 MiB payload is exercised in full in the
+  speedup arm, where only one holder holds it.
+
+THE HEADLINE FINDING, WHICH CHANGES WHAT YOU ARE BOUNDING: there is NO on-disk
+blob store. `IrohProvider::spawn` uses `MemStore` (daemon/src/transport_iroh.rs),
+so held content costs RESIDENT MEMORY, not disk. Measured:
+- per-node on-disk state: 4096 B allocated (1182 B apparent, 2 files) - the
+  narinfo disk cache and nothing else, FLAT across n = 1..16 (fitted O(1),
+  R^2 = 1.0). A holder that serves no narinfo writes 0 files.
+- per-node RSS: holder peak 248 MiB while holding/serving a 110 MiB NAR (2.15x),
+  fetching node 141 MiB (whole-NAR transport buffers it too), against 10.7 MiB
+  for the same daemon with peers off.
+- swarm total RSS is O(n) (R^2 0.9996): 37.8 MiB at n=1 -> 306 MiB at n=16.
+  MODEL OUTPUT at n=1000: 18.6 GB (95% CI 18.4-18.9 GB) - a labelled
+  extrapolation, not a measurement, and its intervals are known to UNDER-cover
+  under multiplicative noise (task-18: 0.865 vs 0.95 nominal at n=1000).
+
+So the footprint you need to bound is a MEMORY footprint, and the two levers are
+an on-disk/streaming blob store and an addressed unit smaller than the whole NAR
+(castore chunks). A disk cap alone would bound nothing that is currently large.
+
+The report block `disk_finding` states all of this in-band, and
+`held_content_ram_cost` reports RSS per held NarSize byte per node - a NAMED
+cross-unit ratio (the report's unit gate forbids unlabelled `_bytes` keys
+precisely so NarSize and FileSize can never be silently compared).
 <!-- SECTION:NOTES:END -->
