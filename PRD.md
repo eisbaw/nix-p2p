@@ -281,52 +281,76 @@ Tentative / replaceable (velocity surfaces):
    post-MVP.
 9. **Privacy accepted, not solved**; leech mode is the mitigation.
 10. **iroh API churn**: accepted maintenance tax.
-11. **Peer-transport throughput is ~2 Gb/s per connection on
-    loopback, and ~70% of that cost is below our code** (MEASURED,
+11. **The peer path does ~13x TCP's CPU work per byte, and one
+    connection recruits only ~2.7 of 14 cores to do it** (MEASURED,
     task-64, `daemon/examples/iroh_throughput.rs`, `just iroh-bench`,
-    110 MiB, medians of 5, 14-core host): the product's
-    `IrohTransport::fetch` moves 189 MB/s; iroh-blobs alone 274; raw
-    QUIC on the same iroh endpoint stack 315; loopback TCP 1060.
-    Deleting *all* of our own overhead would buy ~1.4x, not the 3.6x
-    the task-42 framing implies.
-    CAUSE (named, and it is NOT what the first pass concluded): the
-    binding term is **per-packet processing granularity and the
-    cross-thread handoffs it generates, per connection**. Throughput
-    tracks the size of the unit the path moves, across three
-    different protocols: naive UDP at 1454 B/datagram → 260 MB/s;
-    QUIC, whose GSO coalesces to ~9000 B/datagram → 315 MB/s despite
-    *adding* crypto, congestion control and reliability; TCP with
-    64 KiB writes → 1060 MB/s. The product path makes ~36 000 context
-    switches per 110 MiB against TCP's ~580 (61x), while no thread
-    anywhere exceeds 0.56 of a core and the process uses only 2.6 of
-    14. So it is not CPU work, not crypto, not BLAKE3/bao (blake3 over
-    the whole payload is ~10% of the path) and not our copies (~13%).
-    It is also NOT a host-wide ceiling: 3 concurrent connections
-    reach 528 MB/s aggregate (1.9x; 2.5x measured at N=4 on another
-    run), which is the one large lever not yet taken (task-67).
-    RESOLUTION, stated because the breakdown invites over-reading:
-    the headline "~70% below our code" is stable across runs (68-73%),
-    and the `Vec`-copy term is stable at ~0.7 ns/B (~13%). The split
-    *between* iroh-blobs+bao and our verify+timeout is NOT resolved by
-    this instrument — those two adjacent differences swap by ±0.7 ns/B
-    between runs of the same binary on the same host. Quote the
-    headline, not the sub-percentages.
-    WHAT THIS DOES **NOT** ESTABLISH: every number here is zero-RTT
-    loopback. On a WAN, single-stream QUIC is bounded by the receive
-    window over RTT, a regime *no arm here touches* — quinn's default
-    windows can bind well below 2 Gb/s at 30-100 ms RTT. So this must
-    not be read as "peers are fast enough on a real network": that is
-    **unmeasured**, and establishing it is task-63's job. What it does
-    establish is that the task-42 3.6x is largely a statement about an
-    unrealistically fast *baseline* (loopback TCP), not about iroh.
-    HONEST LIMITS OF THE MEASUREMENT: provider and client run in ONE
-    process on ONE tokio runtime and share worker threads, so absolute
-    figures are likely pessimistic — which is why `fetch` reads 189
-    MB/s here while task-42's in-daemon figure is 210 MB/s for a path
-    that *also* contains all of nix. The conclusions rest on ratios
-    between arms measured under identical conditions, not on the
-    absolute numbers. One host, load average varying 2.8-6.5 between
-    runs; treat sub-10% differences as noise.
+    110 MiB loopback, medians of 5, 14-core host). Throughput and CPU
+    per byte, same host, same payload, same run:
+
+        loopback TCP, one write_all     1165 MB/s   0.98 cpu-ns/B
+        loopback TCP, 1452 B writes     1154 MB/s   1.35
+        plain UDP, 1452 B datagrams      287 MB/s   4.95
+        raw QUIC on the iroh stack       445 MB/s   5.64
+        iroh-blobs get_blob              318 MB/s   9.47
+        IrohTransport::fetch (product)   204 MB/s  13.20
+
+    CAUSE, with the control that pins it. Two hypotheses were tried and
+    REFUTED before this one, so the discriminating experiment matters
+    more than the story: `tcp_write_1452` hands the SAME socket and
+    protocol the SAME bytes in QUIC-sized pieces — ~79 000 writes
+    instead of one — and throughput does not move (1154 vs 1165) even
+    though context switches rise 3.6x. So per-syscall granularity and
+    handoff COUNT are not the binding term. What does bind is
+    per-PACKET work: those 79 000 TCP writes are coalesced by the
+    kernel into 3 723 segments of ~31 KB, while the UDP arm's 79 000
+    writes become 79 492 real packets of 1451 B — and that difference
+    alone costs +3.6 cpu-ns/B (~5.5 us of CPU per extra packet, both
+    directions, including the userspace async wakeup). QUIC's GSO wins
+    5.8x of that back (13 784 units at ~8.4 KB), which is why QUIC
+    beats naive UDP while also doing crypto, congestion control and
+    reliability. On top of the packet path, iroh-blobs+bao adds ~3.8
+    cpu-ns/B of per-BYTE work at unchanged packet count.
+    NOT the cause, each ruled out by measurement: CPU saturation (2.7
+    of 14 cores; no OS thread above 0.61 on any iroh arm — though see
+    the limits below); crypto; BLAKE3/bao alone (blake3 over the whole
+    payload is 0.45 cpu-ns/B, ~3%); our own copies (~12%).
+    OURS vs NOT OURS: ~72% of the per-byte cost sits below our code
+    (stable at 68-73% across runs). Our `Vec` accumulation plus
+    `verify_blake3` and the per-leaf timeouts are ~28%, so deleting ALL
+    of our own overhead buys 1.4-1.6x — not the 3.6x the task-42
+    framing implies. NOTE one impurity: a slice of the "not ours"
+    bucket IS ours (`IrohProvider`'s own provider-event plumbing runs
+    on the serve path).
+    NOT a host ceiling: concurrent fetches aggregate 306 / 433 / 643
+    MB/s at N = 1 / 2 / 4 — sublinear but still climbing at 4, so the
+    limit is per-connection. That is the one large lever not yet
+    pulled (task-67), and it costs ~3x the CPU for ~2x the bytes.
+    WHAT THIS DOES **NOT** ESTABLISH. (a) Every number is zero-RTT
+    loopback. Single-stream QUIC on a WAN is bounded by receive window
+    over RTT, a regime NO arm here touches, and quinn's defaults can
+    bind well below these figures at 30-100 ms RTT. So this is NOT
+    "peers are fast enough on a real network" — that is unmeasured and
+    is task-63's job. (b) Which per-byte term dominates INSIDE the
+    transport is not resolved: the iroh-blobs-vs-our-overhead split
+    swings by +-0.7 ns/B between runs of the same binary, so quote the
+    ~72% headline, never the sub-percentages. (c) `busiest-thread`
+    rules out a saturated OS THREAD, not a saturated tokio TASK — on a
+    work-stealing runtime one pegged task migrates and reads as ~0.5
+    on several threads. Settling that needs a `current_thread` arm
+    that does not exist yet.
+    HONEST LIMITS OF THE INSTRUMENT: provider and client share ONE
+    process and ONE tokio runtime, so absolute figures are likely
+    pessimistic — which is why `fetch` reads 204 MB/s here while
+    task-42's in-daemon figure is 210 MB/s for a path that ALSO
+    contains all of nix. Conclusions rest on ratios between arms
+    measured under identical conditions. One host; load average moved
+    2.7-6.5 between runs and several arms move 20% with it; treat
+    sub-10% differences as noise.
+    NEGATIVE RESULT worth keeping: pre-sizing the receive buffer was
+    measured in situ before being written and is worth 0-3% (inside
+    noise), against 12% for the same change in isolation. Not shipped;
+    it would also let an unverified narinfo NarSize trigger a huge
+    eager allocation, and allocation failure in Rust aborts.
 12. **Stale figures**: fig-candidate-B/C SVGs still show gossip-first
     with tracker cold-start; superseded by DHT-authoritative
     decision. Revise before phase 2 or implementers will build the

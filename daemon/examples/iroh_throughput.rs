@@ -24,7 +24,8 @@
 //!
 //! Everything else is a CONTEXT BASELINE from a different path, and subtracting
 //! across the boundary is invalid. `tcp_loopback` changes the protocol, the
-//! socket type and the write size at once. `udp_send_1452` additionally changes
+//! socket type and the write size at once - which is why `tcp_write_1452`
+//! exists as the single-variable control. `udp_send_1452` additionally changes
 //! the DELIVERY SEMANTICS - it is lossy and send-side - and going from it to
 //! `quic_bidi_drain` ADDS crypto, congestion control, reliability, loss recovery
 //! AND generic-segmentation offload, with the net difference POSITIVE. None of
@@ -37,12 +38,19 @@
 //! * `memcpy_16k` - `Vec::extend_from_slice` in 16 KiB bites into a `Vec::new()`
 //!   with no reserve. Bounds the RECEIVE-BUFFER cost of `dial_and_stream`'s
 //!   growing `Vec`, reallocation included.
+//! * `tcp_write_1452` - the SAME protocol and socket as `tcp_loopback`, with the
+//!   payload handed over in QUIC-sized pieces instead of one `write_all`. THE
+//!   SINGLE-VARIABLE CONTROL: it is the only place unit size is varied with
+//!   everything else held constant, so it is the only arm that can support or
+//!   refute "throughput tracks the size of the unit the path moves".
 //! * `memcpy_16k_reserved` - the same copy into a pre-sized `Vec`. The gap to
 //!   `memcpy_16k` is the headroom a `reserve` in `dial_and_stream` could
 //!   recover, measured rather than assumed.
 //! * `tcp_loopback` - the same bytes over a plain loopback TCP socket. Bounds
 //!   what the KERNEL can do here, so a QUIC number can be read against a ceiling
-//!   instead of against a hunch.
+//!   instead of against a hunch. The sender hands the socket the WHOLE payload
+//!   in one `write_all` (it is not "64 KiB writes" - nothing here writes 64 KiB;
+//!   65536 is the loopback MTU, which no arm measures).
 //! * `udp_send_1452` - the same bytes as plain loopback UDP datagrams at the size
 //!   QUIC uses, with no crypto, no congestion control and no reliability. NOT a
 //!   ceiling - it is what a NAIVE syscall-per-datagram loop costs, i.e. the
@@ -82,19 +90,30 @@
 //! Three side-channels are recorded next to every arm, because "how fast"
 //! without "why" is a story:
 //!
+//! * CPU-NS/B = total process CPU nanoseconds per payload byte. This is the
+//!   most REPRODUCIBLE statistic the bench produces (it holds to ~3% across runs
+//!   where throughput moves 20%), because it divides out how many cores the
+//!   scheduler happened to give the arm. It is the right axis for "how much work
+//!   does this path do per byte", as distinct from "how fast did it go".
 //! * CPU-CORES = process CPU-seconds / wall-seconds, summed over EVERY thread
 //!   from `/proc/self/task/*/schedstat` (already nanoseconds, so no USER_HZ
 //!   assumption). ~1.0 on a single-threaded arm means one core pegged; a network
 //!   arm well above 1.0 is spending real CPU somewhere.
-//! * BUSIEST-THREAD = the same for the single hottest thread. This settles a
-//!   SERIALIZATION point: a receive path spread over several threads none of
-//!   which is pegged is limited by work volume, while one thread at ~1.00 with
-//!   idle siblings is limited by that thread and no extra core helps it.
-//! * DGRAMS / B/DGRAM = the system's UDP InDatagrams delta across BOTH address
-//!   families (`/proc/net/snmp` plus `/proc/net/snmp6`) and the payload bytes per
-//!   datagram. This settles the "loopback MTU / no GSO" candidate: ~1450 B/dgram
-//!   means one datagram per wire packet, while a GSO/GRO-coalesced path shows
-//!   several KiB.
+//! * BUSIEST-THREAD = the same for the single hottest thread. It rules OUT one
+//!   specific thing - a single pegged OS thread - and nothing more. KNOWN
+//!   METHODOLOGICAL LIMIT, stated because it is easy to over-read: this is a
+//!   multi-threaded work-stealing tokio runtime, so ONE saturated tokio TASK
+//!   migrates across workers and shows up as ~0.5 on several threads, which is
+//!   indistinguishable here from genuinely distributed work. Settling that needs
+//!   a `current_thread` arm or per-task poll-time instrumentation; neither
+//!   exists yet, so "no single-threaded bottleneck" is the claim this column
+//!   supports, and "no serialization point" is NOT.
+//! * PKTS / B/PKT = network units the arm caused - UDP InDatagrams across BOTH
+//!   address families (`/proc/net/snmp` plus `/proc/net/snmp6`) PLUS TCP OutSegs -
+//!   and the payload bytes per unit. One axis comparable across the TCP, UDP and
+//!   QUIC arms, which is what makes "does throughput track the size of the unit
+//!   the path moves?" answerable rather than assertable. A UDP-only counter
+//!   cannot see the TCP arms, so it cannot compare them.
 //!
 //! All three are process- or host-wide and approximate - another process' UDP
 //! traffic lands in the same counter, which is why the RAW datagram count is
@@ -135,15 +154,12 @@ const REPEATS: usize = 5;
 /// bench's `memcpy_16k` arm uses so the two are comparable.
 const CHUNK: usize = 16 * 1024;
 
-/// Concurrent fetches in the parallelism arm: a quarter of the host's cores,
-/// clamped to [2, 4]. Derived rather than baked in - a hardcoded 4 silently
-/// measures core exhaustion on a 4-core laptop, and then the arm answers "is
-/// this a per-connection limit" with "no" for the wrong reason. Printed in the
-/// header so a reader knows what N was.
-fn parallel_fetches() -> usize {
-    let cores = std::thread::available_parallelism().map_or(4, |n| n.get());
-    (cores / 4).clamp(2, 4)
-}
+/// Concurrent-fetch counts SWEPT by the parallelism arm. A sweep rather than one
+/// N on purpose: a single point answers "per-connection or machine-wide?" only
+/// relative to this host's core count, whereas the SHAPE of aggregate throughput
+/// over N answers it host-independently. x1 is included so the sweep carries its
+/// own baseline instead of borrowing `iroh_drain`'s.
+const PARALLEL_SWEEP: &[usize] = &[1, 2, 4];
 
 // ---------------------------------------------------------------------------
 // Payload: deterministic, incompressible, generated in-process.
@@ -293,6 +309,32 @@ fn switch_delta(before: &HashMap<String, u64>, after: &HashMap<String, u64>) -> 
         .sum()
 }
 
+/// TCP segments SENT system-wide (`/proc/net/snmp`, `Tcp:` line, `OutSegs`).
+///
+/// Load-bearing, not decoration: the whole "is the cost per packet or per
+/// syscall?" question needs the TCP arms' PACKET count, not just their write
+/// count. `tcp_write_1452` issues the same ~79 000 writes as the UDP arm but the
+/// kernel coalesces them toward the 65536-byte loopback MTU, so it emits far
+/// fewer packets - and that difference is the answer. Inferring it from the MTU
+/// would have been a story; this measures it.
+fn tcp_out_segments() -> Option<u64> {
+    let text = std::fs::read_to_string("/proc/net/snmp").ok()?;
+    let mut columns: Option<Vec<String>> = None;
+    for line in text.lines() {
+        let Some(rest) = line.strip_prefix("Tcp:") else {
+            continue;
+        };
+        match &columns {
+            None => columns = Some(rest.split_whitespace().map(str::to_owned).collect()),
+            Some(names) => {
+                let index = names.iter().position(|n| n == "OutSegs")?;
+                return rest.split_whitespace().nth(index)?.parse().ok();
+            }
+        }
+    }
+    None
+}
+
 /// UDP datagrams received system-wide across BOTH address families, or `None`.
 ///
 /// Requires BOTH counters. Summing whichever family happens to be readable is
@@ -301,6 +343,15 @@ fn switch_delta(before: &HashMap<String, u64>, after: &HashMap<String, u64>) -> 
 /// measurement. Refusing to answer is the honest degradation.
 fn udp_in_datagrams() -> Option<u64> {
     Some(udp4_in_datagrams()? + udp6_in_datagrams()?)
+}
+
+/// The NETWORK UNITS an arm caused: UDP datagrams received plus TCP segments
+/// sent. One axis that is comparable across the TCP, UDP and QUIC arms, which is
+/// what makes "does throughput track the size of the unit the path moves?"
+/// answerable at all - a UDP-only counter cannot see the TCP arms and so cannot
+/// compare them.
+fn network_units() -> Option<u64> {
+    Some(udp_in_datagrams()? + tcp_out_segments()?)
 }
 
 // ---------------------------------------------------------------------------
@@ -313,6 +364,11 @@ fn udp_in_datagrams() -> Option<u64> {
 /// wrong - an 8 MiB single-threaded arm was reporting 2.21 "cpu-cores", which is
 /// arithmetically impossible and is the probe's own cost leaking into the delta.
 const MIN_SIDE_CHANNEL_S: f64 = 0.020;
+
+/// Below this many datagrams in a window, the count cannot be told apart from
+/// another process' background UDP traffic, so the DERIVED bytes-per-datagram is
+/// withheld. The raw count is still printed.
+const MIN_DATAGRAMS: u64 = 100;
 
 /// What an arm's body hands back.
 #[derive(Default)]
@@ -328,7 +384,14 @@ struct Detail {
 
 /// One timed execution of an arm.
 struct Sample {
+    /// The window the THROUGHPUT is reported over.
     seconds: f64,
+    /// The window the side-channel PROBES actually span, which is always the
+    /// whole closure. Kept distinct from `seconds` because an arm may report a
+    /// narrower window (see [`Detail::seconds`]): normalising CPU by the narrow
+    /// window would inflate it with work done outside, which is the same class
+    /// of bug as billing an idle timeout to throughput, moved one column over.
+    probe_seconds: f64,
     /// (total CPU nanoseconds over all threads, busiest single thread's share).
     cpu_nanos: Option<(u64, u64)>,
     udp_datagrams: Option<u64>,
@@ -358,15 +421,16 @@ impl Arm {
         let worst = rate(order[order.len() - 1]);
         let best = rate(order[0]);
         let sample = &self.samples[median_i];
-        let too_short = sample.seconds < MIN_SIDE_CHANNEL_S;
+        let too_short = sample.probe_seconds < MIN_SIDE_CHANNEL_S;
         let cores = match sample.cpu_nanos {
-            _ if too_short => "  n/a busiest-thread   n/a".to_string(),
+            _ if too_short => "  n/a busiest-thread   n/a cpu-ns/B    n/a".to_string(),
             Some((total, busiest)) => format!(
-                "{:>5.2} busiest-thread {:>5.2}",
-                total as f64 / 1e9 / sample.seconds,
-                busiest as f64 / 1e9 / sample.seconds
+                "{:>5.2} busiest-thread {:>5.2} cpu-ns/B {:>6.2}",
+                total as f64 / 1e9 / sample.probe_seconds,
+                busiest as f64 / 1e9 / sample.probe_seconds,
+                total as f64 / bytes as f64,
             ),
-            None => "    ? busiest-thread     ?".to_string(),
+            None => "    ? busiest-thread     ? cpu-ns/B      ?".to_string(),
         };
         // The RAW count is printed beside the derived B/dgram on purpose: a
         // non-UDP arm still picks up a handful of background datagrams from other
@@ -375,7 +439,12 @@ impl Arm {
         let datagrams = match sample.udp_datagrams {
             _ if too_short => "      n/a          ".to_string(),
             None => "        ?          ".to_string(),
-            Some(0) => "        0          ".to_string(),
+            // Below this the count is indistinguishable from another process'
+            // background UDP, and a derived B/dgram over it is not a
+            // measurement. Print the raw count, withhold the derived figure -
+            // the earlier "dgrams 1  115343360" on a pure-memory arm read as
+            // data, which is exactly what this file forbids elsewhere.
+            Some(count) if count < MIN_DATAGRAMS => format!("{count:>9}   (noise)"),
             Some(count) => format!("{count:>9} {:>9.0}", bytes as f64 / count as f64),
         };
         let switches = match sample.context_switches {
@@ -385,7 +454,7 @@ impl Arm {
         };
         println!(
             "  {:<19} median {:>8.1} MB/s  (min {:>7.1}, max {:>7.1})  {:>8.1} ms  \
-             cpu-cores {cores}  ctxsw {switches}  dgrams {datagrams}{}",
+             cpu-cores {cores}  ctxsw {switches}  pkts {datagrams}{}",
             self.name,
             median,
             worst,
@@ -410,7 +479,7 @@ where
 {
     let mut samples = Vec::with_capacity(REPEATS);
     for _ in 0..REPEATS {
-        let udp_before = udp_in_datagrams();
+        let units_before = network_units();
         let switches_before = context_switches();
         let cpu_before = cpu_nanos();
         let started = Instant::now();
@@ -421,9 +490,10 @@ where
         // summed counter go DOWN, and a negative "CPU used" would be a silent lie.
         samples.push(Sample {
             seconds: detail.seconds.unwrap_or(wall),
+            probe_seconds: wall,
             cpu_nanos: cpu_before.zip(cpu_after).map(|(a, b)| cpu_delta(&a, &b)),
-            udp_datagrams: udp_before
-                .zip(udp_in_datagrams())
+            udp_datagrams: units_before
+                .zip(network_units())
                 .map(|(a, b)| b.saturating_sub(a)),
             context_switches: switches_before
                 .zip(context_switches())
@@ -592,16 +662,25 @@ async fn raw_quic_get(endpoint: &Endpoint, addr: EndpointAddr, expected: usize, 
 /// Push `bytes` through a loopback TCP socket and read them all back out. The
 /// receiver accumulates into a `Vec` exactly like `dial_and_stream`, so the QUIC
 /// arms are compared against a socket path that pays the SAME copy.
-async fn tcp_roundtrip(bytes: &'static [u8]) {
+async fn tcp_roundtrip(bytes: &'static [u8], write_size: Option<usize>) {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
         .await
         .expect("tcp listener binds");
     let addr = listener.local_addr().expect("listener has an address");
     let sender = tokio::spawn(async move {
         let (mut socket, _) = listener.accept().await.expect("accept");
-        tokio::io::AsyncWriteExt::write_all(&mut socket, bytes)
-            .await
-            .expect("write_all");
+        match write_size {
+            None => tokio::io::AsyncWriteExt::write_all(&mut socket, bytes)
+                .await
+                .expect("write_all"),
+            Some(size) => {
+                for piece in bytes.chunks(size) {
+                    tokio::io::AsyncWriteExt::write_all(&mut socket, piece)
+                        .await
+                        .expect("write_all");
+                }
+            }
+        }
         tokio::io::AsyncWriteExt::shutdown(&mut socket)
             .await
             .expect("shutdown");
@@ -712,7 +791,6 @@ async fn udp_send_ceiling(data: &'static [u8]) -> Detail {
 
 #[tokio::main]
 async fn main() {
-    let parallel = parallel_fetches();
     println!(
         "TASK-64 iroh loopback throughput decomposition: {REPEATS} repeats/arm, median \
          reported, decimal MB/s (1e6 B/s) over UNCOMPRESSED bytes."
@@ -722,7 +800,7 @@ async fn main() {
     // differences as noise" - and an output that needs an out-of-band note to be
     // reinterpreted has a single-source-of-truth problem.
     println!(
-        "host: {} cores, parallelism arm N={parallel}, load average {}, kernel {}",
+        "host: {} cores, parallelism sweep N={PARALLEL_SWEEP:?}, load average {}, kernel {}",
         std::thread::available_parallelism().map_or("?".into(), |n| n.to_string()),
         std::fs::read_to_string("/proc/loadavg")
             .map(|l| l.split_whitespace().take(3).collect::<Vec<_>>().join(" "))
@@ -776,8 +854,25 @@ async fn main() {
         .report(bytes);
 
         // --- the kernel's loopback ceiling ---------------------------------
+        // THE SINGLE-VARIABLE CONTROL. `tcp_loopback` hands the socket the whole
+        // payload in one `write_all`; `tcp_write_1452` hands it the SAME bytes,
+        // over the SAME protocol and socket, in QUIC-sized pieces. Everything
+        // except the write unit is held constant, which is the one thing a
+        // naive-UDP-vs-QUIC-vs-TCP comparison can never do - those differ in
+        // protocol, crypto, congestion control and delivery semantics all at
+        // once, so "throughput tracks unit size" cannot be inferred from them.
+        // If small writes collapse TCP toward the QUIC arms, unit granularity is
+        // the binding term; if TCP shrugs them off, it is NOT, and the cost is
+        // per-byte work rather than per-unit overhead.
         time_arm("tcp_loopback", || async {
-            tcp_roundtrip(data).await;
+            tcp_roundtrip(data, None).await;
+            Detail::default()
+        })
+        .await
+        .report(bytes);
+
+        time_arm("tcp_write_1452", || async {
+            tcp_roundtrip(data, Some(QUIC_DATAGRAM)).await;
             Detail::default()
         })
         .await
@@ -862,46 +957,51 @@ async fn main() {
         .await
         .report(bytes);
 
-        // The PARALLELISM discriminator. If N concurrent whole-blob fetches move
-        // ~N x the bytes in the same wall time, the single-fetch number is a
-        // PER-CONNECTION serialization limit and parallel range-fetching would
-        // recover it. If aggregate throughput stays flat, the ceiling is
-        // machine-wide (CPU / UDP path) and no amount of striping helps.
-        // Reported as AGGREGATE MB/s over PARALLEL x payload.
-        let parallel_clients: Vec<Endpoint> = {
-            let mut v = Vec::new();
-            for _ in 0..parallel {
-                v.push(bare_endpoint().await);
-            }
-            v
-        };
-        time_arm("iroh_drain_xN", || {
-            let clients = &parallel_clients;
-            let addr = addr.clone();
-            let digest = &digest;
-            let digest = *digest;
-            async move {
-                // Real tokio tasks, not a joined future set: the fetches must be
-                // able to occupy DIFFERENT cores, or the arm would measure one
-                // core's ceiling and call it a per-connection limit.
-                let mut set = tokio::task::JoinSet::new();
-                for endpoint in clients {
-                    let endpoint = endpoint.clone();
-                    let addr = addr.clone();
-                    set.spawn(async move {
-                        raw_get(&endpoint, addr, &digest, bytes, Sink::Discard).await
-                    });
+        // The PARALLELISM discriminator, SWEPT rather than sampled at one N.
+        // A single N answers "is this per-connection" only relative to the host's
+        // core count; the SHAPE of the curve over N answers it host-independently.
+        // Aggregate MB/s that keeps climbing with N means a per-connection limit;
+        // a curve that flattens means the machine is the ceiling. Reported as
+        // AGGREGATE MB/s over N x payload.
+        for n in PARALLEL_SWEEP {
+            let clients: Vec<Endpoint> = {
+                let mut v = Vec::new();
+                for _ in 0..*n {
+                    v.push(bare_endpoint().await);
                 }
-                while let Some(joined) = set.join_next().await {
-                    joined.expect("parallel fetch task");
+                v
+            };
+            let name: &'static str = match n {
+                1 => "iroh_drain_x1",
+                2 => "iroh_drain_x2",
+                _ => "iroh_drain_x4",
+            };
+            time_arm(name, || {
+                let clients = &clients;
+                let addr = addr.clone();
+                async move {
+                    // Real tokio tasks, not a joined future set: the fetches must
+                    // be able to occupy DIFFERENT cores, or the arm would measure
+                    // one core's ceiling and call it a per-connection limit.
+                    let mut set = tokio::task::JoinSet::new();
+                    for endpoint in clients {
+                        let endpoint = endpoint.clone();
+                        let addr = addr.clone();
+                        set.spawn(async move {
+                            raw_get(&endpoint, addr, &digest, bytes, Sink::Discard).await
+                        });
+                    }
+                    while let Some(joined) = set.join_next().await {
+                        joined.expect("parallel fetch task");
+                    }
+                    Detail::default()
                 }
-                Detail::default()
+            })
+            .await
+            .report(bytes * n);
+            for endpoint in clients {
+                endpoint.close().await;
             }
-        })
-        .await
-        .report(bytes * parallel);
-        for endpoint in parallel_clients {
-            endpoint.close().await;
         }
 
         let client = IrohTransport::spawn().await.expect("client spawns");
