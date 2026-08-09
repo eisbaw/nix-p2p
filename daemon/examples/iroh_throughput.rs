@@ -13,10 +13,23 @@
 //! attribute the deficit to a cause you need the transport measured ALONE, which
 //! is what this does.
 //!
-//! ## The arms, in the order they narrow the search
+//! ## The arms: one SUBTRACTION LADDER plus context baselines
 //!
-//! Listed cheapest-layer first. Each arm removes exactly one layer from the one
-//! below it, so a DIFFERENCE between two adjacent arms is that layer's cost.
+//! Read the arms as two groups, because only one of them supports subtraction.
+//!
+//! The LADDER is `quic_bidi_drain -> iroh_drain -> iroh_collect ->
+//! daemon_fetch`. Each rung adds exactly one layer to the rung above it over the
+//! same connection type, so a difference between adjacent rungs IS that layer's
+//! cost.
+//!
+//! Everything else is a CONTEXT BASELINE from a different path, and subtracting
+//! across the boundary is invalid. `tcp_loopback` changes the protocol, the
+//! socket type and the write size at once. `udp_send_1452` additionally changes
+//! the DELIVERY SEMANTICS - it is lossy and send-side - and going from it to
+//! `quic_bidi_drain` ADDS crypto, congestion control, reliability, loss recovery
+//! AND generic-segmentation offload, with the net difference POSITIVE. None of
+//! that is a layer subtraction in either direction. These arms answer "what does
+//! a comparable path cost on this host", not "what does this layer cost".
 //!
 //! * `blake3_oneshot` - `blake3::hash` over the payload. Bounds the VERIFY cost:
 //!   the daemon hashes the whole NAR again in `verify_blake3` after bao already
@@ -31,9 +44,10 @@
 //!   what the KERNEL can do here, so a QUIC number can be read against a ceiling
 //!   instead of against a hunch.
 //! * `udp_send_1452` - the same bytes as plain loopback UDP datagrams at the size
-//!   QUIC uses, with no crypto, no congestion control and no reliability. The
-//!   CEILING any UDP-based transport lives under here, which is how "loopback
-//!   MTU / datagram rate" stops being a hunch.
+//!   QUIC uses, with no crypto, no congestion control and no reliability. NOT a
+//!   ceiling - it is what a NAIVE syscall-per-datagram loop costs, i.e. the
+//!   reference quinn's GSO batching has to beat, and it does beat it. Timed to
+//!   the last DELIVERED byte, and the delivered fraction is printed.
 //! * `quic_bidi_drain` / `quic_bidi_collect` - the same payload over a raw QUIC
 //!   bidirectional stream on the SAME iroh `Endpoint` stack, under a private
 //!   ALPN, with iroh-blobs and bao NOT in the path. This is the discriminator
@@ -41,7 +55,11 @@
 //!   bao cost this much".
 //! * `iroh_drain` - real iroh-blobs `get_blob` over a real QUIC connection, leaf
 //!   data DISCARDED: no accumulation, no re-hash, no timeouts. The transport
-//!   alone.
+//!   alone. CAVEAT on attributing `quic_bidi_drain -> iroh_drain` wholly to
+//!   upstream: `IrohProvider` also runs OUR provider-event plumbing on the serve
+//!   path (a `NotifyLog` channel plus a task per get-request, feeding
+//!   `bytes_served`), which `RawQuicResponder` does not. Small, but it is ours,
+//!   and it lands in that difference.
 //! * `iroh_collect` - the same, accumulating into a `Vec` the way
 //!   `dial_and_stream` does. `iroh_drain` -> `iroh_collect` IS the copy cost.
 //! * `iroh_collect_resvd` - the same again into a pre-sized `Vec`, so the
@@ -117,10 +135,15 @@ const REPEATS: usize = 5;
 /// bench's `memcpy_16k` arm uses so the two are comparable.
 const CHUNK: usize = 16 * 1024;
 
-/// Concurrent fetches in the parallelism arm. 4 on a 14-core host: enough to
-/// expose a per-connection ceiling, few enough that the arm is not just
-/// measuring the host running out of cores.
-const PARALLEL: usize = 4;
+/// Concurrent fetches in the parallelism arm: a quarter of the host's cores,
+/// clamped to [2, 4]. Derived rather than baked in - a hardcoded 4 silently
+/// measures core exhaustion on a 4-core laptop, and then the arm answers "is
+/// this a per-connection limit" with "no" for the wrong reason. Printed in the
+/// header so a reader knows what N was.
+fn parallel_fetches() -> usize {
+    let cores = std::thread::available_parallelism().map_or(4, |n| n.get());
+    (cores / 4).clamp(2, 4)
+}
 
 // ---------------------------------------------------------------------------
 // Payload: deterministic, incompressible, generated in-process.
@@ -229,19 +252,24 @@ fn udp6_in_datagrams() -> Option<u64> {
     None
 }
 
-/// Context switches this process has made, summed over every thread
-/// (`/proc/self/task/*/status`), voluntary and involuntary together. A voluntary
-/// switch is a thread blocking - i.e. a HANDOFF. When an arm moves the same bytes
-/// as another but makes an order of magnitude more switches while no single
-/// thread is pegged, the pipeline is bounded by wakeup latency, not by CPU work,
-/// and that is a different fix from "make the code faster".
-fn context_switches() -> Option<u64> {
-    let mut total: u64 = 0;
-    let mut seen = false;
+/// Context switches per THREAD (`/proc/self/task/*/status`), voluntary and
+/// involuntary together. A voluntary switch is a thread blocking - i.e. a
+/// HANDOFF. When an arm moves the same bytes as another but makes an order of
+/// magnitude more switches while no single thread is pegged, the pipeline is
+/// bounded by wakeup latency, not by CPU work, and that is a different fix from
+/// "make the code faster".
+///
+/// Per-TID for the same reason [`cpu_nanos`] is: a summed scalar drops the
+/// lifetime count of any thread that exits mid-arm, which silently UNDERCOUNTS
+/// and then gets clamped to zero by `saturating_sub`. Endpoints are opened and
+/// closed all through this bench, so thread churn is real, not hypothetical.
+fn context_switches() -> Option<HashMap<String, u64>> {
+    let mut per_thread = HashMap::new();
     for entry in std::fs::read_dir("/proc/self/task").ok()?.flatten() {
         let Ok(text) = std::fs::read_to_string(entry.path().join("status")) else {
             continue;
         };
+        let mut total: u64 = 0;
         for line in text.lines() {
             if (line.starts_with("voluntary_ctxt_switches:")
                 || line.starts_with("nonvoluntary_ctxt_switches:"))
@@ -249,26 +277,54 @@ fn context_switches() -> Option<u64> {
                 && let Ok(count) = value.parse::<u64>()
             {
                 total += count;
-                seen = true;
             }
         }
+        per_thread.insert(entry.file_name().to_string_lossy().into_owned(), total);
     }
-    seen.then_some(total)
+    (!per_thread.is_empty()).then_some(per_thread)
 }
 
-/// UDP datagrams received system-wide across BOTH address families.
+/// Context switches made between two [`context_switches`] readings, summed over
+/// threads with the same churn-safety as [`cpu_delta`].
+fn switch_delta(before: &HashMap<String, u64>, after: &HashMap<String, u64>) -> u64 {
+    after
+        .iter()
+        .map(|(tid, end)| end.saturating_sub(before.get(tid).copied().unwrap_or(0)))
+        .sum()
+}
+
+/// UDP datagrams received system-wide across BOTH address families, or `None`.
+///
+/// Requires BOTH counters. Summing whichever family happens to be readable is
+/// the very trap [`udp6_in_datagrams`] documents: on a host with IPv6 disabled
+/// `/proc/net/snmp6` is absent, and a v4-only sum would print as a complete
+/// measurement. Refusing to answer is the honest degradation.
 fn udp_in_datagrams() -> Option<u64> {
-    let v4 = udp4_in_datagrams();
-    let v6 = udp6_in_datagrams();
-    match (v4, v6) {
-        (None, None) => None,
-        (a, b) => Some(a.unwrap_or(0) + b.unwrap_or(0)),
-    }
+    Some(udp4_in_datagrams()? + udp6_in_datagrams()?)
 }
 
 // ---------------------------------------------------------------------------
 // Reporting.
 // ---------------------------------------------------------------------------
+
+/// An arm below this duration cannot support the /proc side-channels: reading
+/// them costs tens of `/proc/self/task/*` files, which is a large fraction of a
+/// sub-20 ms window. Those columns are SUPPRESSED there rather than printed
+/// wrong - an 8 MiB single-threaded arm was reporting 2.21 "cpu-cores", which is
+/// arithmetically impossible and is the probe's own cost leaking into the delta.
+const MIN_SIDE_CHANNEL_S: f64 = 0.020;
+
+/// What an arm's body hands back.
+#[derive(Default)]
+struct Detail {
+    /// Override the wall clock for this repeat. Almost every arm leaves this
+    /// `None` and is timed end-to-end. It exists for `udp_send_1452`, whose
+    /// receiver can only learn the transfer ended by NOT hearing anything for a
+    /// while - so the wall clock would bill that silence as transfer time.
+    seconds: Option<f64>,
+    /// A caveat printed with the row, for a fact the MB/s column cannot carry.
+    note: Option<String>,
+}
 
 /// One timed execution of an arm.
 struct Sample {
@@ -277,6 +333,7 @@ struct Sample {
     cpu_nanos: Option<(u64, u64)>,
     udp_datagrams: Option<u64>,
     context_switches: Option<u64>,
+    note: Option<String>,
 }
 
 /// One arm's samples at one size, reported as decimal MB/s over the payload.
@@ -301,7 +358,9 @@ impl Arm {
         let worst = rate(order[order.len() - 1]);
         let best = rate(order[0]);
         let sample = &self.samples[median_i];
+        let too_short = sample.seconds < MIN_SIDE_CHANNEL_S;
         let cores = match sample.cpu_nanos {
+            _ if too_short => "  n/a busiest-thread   n/a".to_string(),
             Some((total, busiest)) => format!(
                 "{:>5.2} busiest-thread {:>5.2}",
                 total as f64 / 1e9 / sample.seconds,
@@ -314,52 +373,62 @@ impl Arm {
         // processes, and `dgrams 2` makes that obviously noise while a bare
         // "B/dgram 57671680" would read as a measurement.
         let datagrams = match sample.udp_datagrams {
+            _ if too_short => "      n/a          ".to_string(),
             None => "        ?          ".to_string(),
             Some(0) => "        0          ".to_string(),
             Some(count) => format!("{count:>9} {:>9.0}", bytes as f64 / count as f64),
         };
         let switches = match sample.context_switches {
+            _ if too_short => "     n/a".to_string(),
             Some(count) => format!("{count:>8}"),
             None => "       ?".to_string(),
         };
         println!(
             "  {:<19} median {:>8.1} MB/s  (min {:>7.1}, max {:>7.1})  {:>8.1} ms  \
-             cpu-cores {cores}  ctxsw {switches}  dgrams {datagrams}",
+             cpu-cores {cores}  ctxsw {switches}  dgrams {datagrams}{}",
             self.name,
             median,
             worst,
             best,
             sample.seconds * 1e3,
+            sample.note.as_deref().unwrap_or(""),
         );
     }
 }
 
-/// Time `body` `REPEATS` times, recording wall seconds plus the CPU and UDP
-/// side-channels around each repeat.
+/// Time `body` `REPEATS` times, recording seconds plus the CPU, context-switch
+/// and UDP side-channels around each repeat.
+///
+/// PROBE ORDER MATTERS and is deliberate. The CPU reading is taken LAST among
+/// the "before" probes and FIRST among the "after" probes, so that the other
+/// probes' own cost - `context_switches` alone reads a `status` file per thread -
+/// falls OUTSIDE the CPU delta instead of being billed to the arm.
 async fn time_arm<F, Fut>(name: &'static str, mut body: F) -> Arm
 where
     F: FnMut() -> Fut,
-    Fut: std::future::Future<Output = ()>,
+    Fut: std::future::Future<Output = Detail>,
 {
     let mut samples = Vec::with_capacity(REPEATS);
     for _ in 0..REPEATS {
-        let cpu_before = cpu_nanos();
         let udp_before = udp_in_datagrams();
         let switches_before = context_switches();
+        let cpu_before = cpu_nanos();
         let started = Instant::now();
-        body().await;
-        let seconds = started.elapsed().as_secs_f64();
-        // saturating_sub: a thread that exited mid-arm can make the summed CPU
-        // total go DOWN, and a negative "CPU used" would be a silent lie.
+        let detail = body().await;
+        let wall = started.elapsed().as_secs_f64();
+        let cpu_after = cpu_nanos();
+        // saturating_sub throughout: a thread that exited mid-arm can make a
+        // summed counter go DOWN, and a negative "CPU used" would be a silent lie.
         samples.push(Sample {
-            seconds,
-            cpu_nanos: cpu_before.zip(cpu_nanos()).map(|(a, b)| cpu_delta(&a, &b)),
+            seconds: detail.seconds.unwrap_or(wall),
+            cpu_nanos: cpu_before.zip(cpu_after).map(|(a, b)| cpu_delta(&a, &b)),
             udp_datagrams: udp_before
                 .zip(udp_in_datagrams())
                 .map(|(a, b)| b.saturating_sub(a)),
             context_switches: switches_before
                 .zip(context_switches())
-                .map(|(a, b)| b.saturating_sub(a)),
+                .map(|(a, b)| switch_delta(&a, &b)),
+            note: detail.note,
         });
     }
     Arm { name, samples }
@@ -562,16 +631,23 @@ async fn tcp_roundtrip(bytes: &'static [u8]) {
 const QUIC_DATAGRAM: usize = 1452;
 
 /// Push the payload through a plain loopback UDP socket in QUIC-sized datagrams,
-/// with NO congestion control, NO crypto, NO acknowledgements and NO reliability -
-/// the absolute ceiling a UDP-based transport could reach here. Reports the SEND
-/// side: UDP drops silently under receiver pressure, so the sender is never
-/// throttled and what is measured is the datagram-rate cost itself.
+/// with NO congestion control, NO crypto, NO acknowledgements and NO reliability.
+/// This is what a NAIVE syscall-per-datagram UDP path costs, which is the
+/// reference quinn's GSO batching has to beat.
+///
+/// TIMING SUBTLETY, and it was a real bug before it was a comment: UDP drops
+/// silently under receiver pressure, so the receiver cannot know the transfer
+/// ended except by NOT hearing anything for a while. Timing this arm by the wall
+/// clock therefore billed a 200 ms idle timeout as transfer time and understated
+/// the rate by ~40% at 110 MiB - which inverted the conclusion this arm exists to
+/// support. The window is now start-of-send to LAST DELIVERED BYTE, reported via
+/// [`Detail::seconds`].
 ///
 /// The delivered fraction is asserted to be non-trivial rather than exact -
 /// demanding 100% would make this a reliability test, and a loopback UDP flood
-/// legitimately drops. What must NOT happen is delivery collapsing to nothing,
-/// which would mean the receiver never ran and the send rate is meaningless.
-async fn udp_send_ceiling(data: &'static [u8]) {
+/// legitimately drops - and it is also PRINTED, because a rate over an unstated
+/// delivery fraction is not a measurement.
+async fn udp_send_ceiling(data: &'static [u8]) -> Detail {
     let receiver = tokio::net::UdpSocket::bind("127.0.0.1:0")
         .await
         .expect("udp receiver binds");
@@ -582,11 +658,13 @@ async fn udp_send_ceiling(data: &'static [u8]) {
     sender.connect(receiver_addr).await.expect("udp connect");
 
     let expected = data.len();
+    let started = Instant::now();
     let drain = tokio::spawn(async move {
         let mut buf = vec![0u8; QUIC_DATAGRAM];
         let mut received = 0usize;
-        // A 200 ms gap means the sender has finished and the socket has drained,
-        // so the timeout ending the loop is the NORMAL exit, not a failure.
+        let mut last_byte_at = Instant::now();
+        // The 200 ms gap is only how the loop LEARNS the sender stopped; it is
+        // not part of the measured window, which ends at `last_byte_at`.
         while let Ok(Ok(n)) = tokio::time::timeout(
             std::time::Duration::from_millis(200),
             receiver.recv(&mut buf),
@@ -594,11 +672,12 @@ async fn udp_send_ceiling(data: &'static [u8]) {
         .await
         {
             received += n;
+            last_byte_at = Instant::now();
             if received >= expected {
                 break;
             }
         }
-        received
+        (received, last_byte_at)
     });
 
     for datagram in data.chunks(QUIC_DATAGRAM) {
@@ -608,12 +687,23 @@ async fn udp_send_ceiling(data: &'static [u8]) {
             tokio::task::yield_now().await;
         }
     }
-    let received = drain.await.expect("udp drain task");
+    let (received, last_byte_at) = drain.await.expect("udp drain task");
     assert!(
         received > expected / 100,
         "raw UDP delivered {received} of {expected} bytes - the receiver never ran, \
          so the send rate means nothing"
     );
+    Detail {
+        seconds: Some(
+            last_byte_at
+                .saturating_duration_since(started)
+                .as_secs_f64(),
+        ),
+        note: Some(format!(
+            "  delivered {:.1}%",
+            100.0 * received as f64 / expected as f64
+        )),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -622,10 +712,24 @@ async fn udp_send_ceiling(data: &'static [u8]) {
 
 #[tokio::main]
 async fn main() {
+    let parallel = parallel_fetches();
     println!(
-        "TASK-64 iroh loopback throughput decomposition ({} repeats/arm, decimal MB/s over \
-         uncompressed bytes)",
-        REPEATS
+        "TASK-64 iroh loopback throughput decomposition: {REPEATS} repeats/arm, median \
+         reported, decimal MB/s (1e6 B/s) over UNCOMPRESSED bytes."
+    );
+    // Host context in the artifact itself. Every conclusion drawn from this
+    // output is relative to the host - "0.58 of N cores", "treat sub-10%
+    // differences as noise" - and an output that needs an out-of-band note to be
+    // reinterpreted has a single-source-of-truth problem.
+    println!(
+        "host: {} cores, parallelism arm N={parallel}, load average {}, kernel {}",
+        std::thread::available_parallelism().map_or("?".into(), |n| n.to_string()),
+        std::fs::read_to_string("/proc/loadavg")
+            .map(|l| l.split_whitespace().take(3).collect::<Vec<_>>().join(" "))
+            .unwrap_or_else(|_| "?".into()),
+        std::fs::read_to_string("/proc/sys/kernel/osrelease")
+            .map(|k| k.trim().to_string())
+            .unwrap_or_else(|_| "?".into()),
     );
 
     for &mib in SIZES_MIB {
@@ -640,6 +744,7 @@ async fn main() {
         // --- CPU-only bounds (no network at all) ---------------------------
         time_arm("blake3_oneshot", || async {
             std::hint::black_box(blake3::hash(data));
+            Detail::default()
         })
         .await
         .report(bytes);
@@ -650,6 +755,7 @@ async fn main() {
                 sink.extend_from_slice(chunk);
             }
             std::hint::black_box(sink.len());
+            Detail::default()
         })
         .await
         .report(bytes);
@@ -664,6 +770,7 @@ async fn main() {
                 sink.extend_from_slice(chunk);
             }
             std::hint::black_box(sink.len());
+            Detail::default()
         })
         .await
         .report(bytes);
@@ -671,15 +778,14 @@ async fn main() {
         // --- the kernel's loopback ceiling ---------------------------------
         time_arm("tcp_loopback", || async {
             tcp_roundtrip(data).await;
+            Detail::default()
         })
         .await
         .report(bytes);
 
-        time_arm("udp_send_1452", || async {
-            udp_send_ceiling(data).await;
-        })
-        .await
-        .report(bytes);
+        time_arm("udp_send_1452", || async { udp_send_ceiling(data).await })
+            .await
+            .report(bytes);
 
         // --- raw QUIC: the SAME endpoint stack with blobs/bao removed ------
         let raw_provider_endpoint = bare_endpoint().await;
@@ -696,24 +802,37 @@ async fn main() {
         let raw_client = bare_endpoint().await;
         time_arm("quic_bidi_drain", || async {
             raw_quic_get(&raw_client, raw_provider_addr.clone(), bytes, false).await;
+            Detail::default()
         })
         .await
         .report(bytes);
         time_arm("quic_bidi_collect", || async {
             raw_quic_get(&raw_client, raw_provider_addr.clone(), bytes, true).await;
+            Detail::default()
         })
         .await
         .report(bytes);
         raw_client.close().await;
         let _ = raw_router.shutdown().await;
 
-        // --- the provider, and the holder-side seed cost -------------------
+        // --- the holder-side seed cost, on a THROWAWAY provider ------------
+        // Its own provider because `seed` is repeated: five 110 MiB blobs would
+        // otherwise pile up in the MemStore the fetch arms serve from, and this
+        // bench must not be the reason a later RSS measurement (TASK-65) reads
+        // high.
+        {
+            let scratch = IrohProvider::spawn().await.expect("provider spawns");
+            time_arm("provider_seed", || async {
+                scratch.seed(data).await.expect("seed succeeds");
+                Detail::default()
+            })
+            .await
+            .report(bytes);
+            scratch.shutdown().await;
+        }
+
+        // --- the provider the fetch arms read from -------------------------
         let provider = IrohProvider::spawn().await.expect("provider spawns");
-        let seed = time_arm("provider_seed", || async {
-            provider.seed(data).await.expect("seed succeeds");
-        })
-        .await;
-        seed.report(bytes);
         let digest = provider.seed(data).await.expect("seed succeeds");
         let addr = provider_endpoint_addr(&provider);
 
@@ -721,12 +840,14 @@ async fn main() {
         let bare = bare_endpoint().await;
         time_arm("iroh_drain", || async {
             raw_get(&bare, addr.clone(), &digest, bytes, Sink::Discard).await;
+            Detail::default()
         })
         .await
         .report(bytes);
 
         time_arm("iroh_collect", || async {
             raw_get(&bare, addr.clone(), &digest, bytes, Sink::Grow).await;
+            Detail::default()
         })
         .await
         .report(bytes);
@@ -736,6 +857,7 @@ async fn main() {
         // allocation it would make against an untrusted NarSize?
         time_arm("iroh_collect_resvd", || async {
             raw_get(&bare, addr.clone(), &digest, bytes, Sink::Reserved).await;
+            Detail::default()
         })
         .await
         .report(bytes);
@@ -748,7 +870,7 @@ async fn main() {
         // Reported as AGGREGATE MB/s over PARALLEL x payload.
         let parallel_clients: Vec<Endpoint> = {
             let mut v = Vec::new();
-            for _ in 0..PARALLEL {
+            for _ in 0..parallel {
                 v.push(bare_endpoint().await);
             }
             v
@@ -773,10 +895,11 @@ async fn main() {
                 while let Some(joined) = set.join_next().await {
                     joined.expect("parallel fetch task");
                 }
+                Detail::default()
             }
         })
         .await
-        .report(bytes * PARALLEL);
+        .report(bytes * parallel);
         for endpoint in parallel_clients {
             endpoint.close().await;
         }
@@ -792,6 +915,7 @@ async fn main() {
                 .await
                 .expect("daemon fetch succeeds");
             assert_eq!(got.len(), bytes, "fetch must return the whole payload");
+            Detail::default()
         })
         .await
         .report(bytes);
