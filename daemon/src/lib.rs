@@ -70,6 +70,7 @@ pub use transport_fetch::{
     TransportTag, fetch_via_offers, verify_blake3,
 };
 pub use transport_iroh::{
-    FETCH_TIMEOUT, IrohError, IrohPeerAddr, IrohProvider, IrohTransport, iroh_blobs_alpn,
+    BODY_IDLE_TIMEOUT, DIAL_TIMEOUT, FETCH_TIMEOUT, IrohError, IrohPeerAddr, IrohProvider,
+    IrohTransport, SafetyEnvelope, iroh_blobs_alpn,
 };
 pub use upstream::UpstreamHttp;

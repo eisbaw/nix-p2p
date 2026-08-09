@@ -53,12 +53,14 @@ use std::sync::Mutex;
 use std::time::Duration;
 
 use async_trait::async_trait;
+use bao_tree::io::BaoContentItem;
 use iroh::endpoint::{RelayMode, presets};
 use iroh::protocol::Router;
 use iroh::{Endpoint, EndpointAddr, PublicKey};
-use iroh_blobs::get::request::get_blob;
+use iroh_blobs::get::request::{GetBlobItem, get_blob};
 use iroh_blobs::store::mem::MemStore;
 use iroh_blobs::{BlobsProtocol, Hash};
+use n0_future::StreamExt;
 
 use crate::claim::KnownTransport;
 use crate::content_id::Blake3Digest;
@@ -102,11 +104,63 @@ pub fn iroh_blobs_alpn() -> &'static [u8] {
     iroh_blobs::ALPN
 }
 
-/// A coarse upper bound on how long one dial+fetch may take before it is declared
-/// unusable. NOT the full safety envelope (task-51 owns per-request abort; task-25
-/// owns the signed NarSize streaming bound) - just a guard so a wedged connection
-/// cannot hang a resolution forever. Fail fast, try the next offer.
-pub const FETCH_TIMEOUT: Duration = Duration::from_secs(20);
+// -------------------------------------------------------------------------
+// The conservative safety envelope (task-51). PROVISIONAL DEFAULTS.
+// -------------------------------------------------------------------------
+//
+// These three time bounds plus the streaming NarSize cap are the FLOOR task-43
+// asserts (never unbounded-hang, never OOM), NOT a tuned policy. task-44 MODELS
+// the real slow-HIT policy (hedge / delayed-race / adaptive) and a later task
+// implements the winner; do NOT read these numbers as the answer. The slow-HIT
+// DEFAULT here is the simplest safe thing: a bounded abort -> fall back to
+// upstream. The values are deliberately generous (a healthy LAN peer finishes far
+// inside them) and conservative (a dead/stalled/lying peer is cut off well before
+// it can hang a build or exhaust memory).
+
+/// DIAL bound: how long `endpoint.connect()` may take before a holder is declared
+/// dead/unreachable. A `NodeId` that never answers the QUIC handshake is cut off
+/// here -> bounded failure -> the driver tries the next offer or falls back to
+/// upstream, never a hang. (task-40's `PROBE_TIMEOUT` bounded DISCOVERY; this
+/// bounds the FETCH dial.) PROVISIONAL.
+pub const DIAL_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// BODY-IDLE bound: the maximum gap between successive bytes once the transfer has
+/// started. A peer that connects then STALLS mid-stream (no progress for this long)
+/// is aborted. This is the real slow-peer guard - distinct from a total-time cap: a
+/// slow-but-PROGRESSING peer keeps resetting this idle clock and is tolerated,
+/// while a STALLED one trips it fast. PROVISIONAL.
+pub const BODY_IDLE_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// TOTAL bound: a coarse backstop over the whole dial+transfer, so a peer that
+/// stays just under the idle bound forever (dribbling one chunk per idle-epsilon)
+/// still cannot run unbounded. The idle bound is the precise guard; this is the
+/// belt-and-suspenders ceiling. PROVISIONAL. (Kept as `FETCH_TIMEOUT`, the name
+/// task-39 exported, now widened to sit above dial+idle.)
+pub const FETCH_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// The three time bounds of the safety envelope, injectable so a test can pin
+/// SHORT bounds and prove a dead/stalled peer yields a bounded abort (mirrors
+/// [`crate::discovery::DirectDiscovery::with_timeout`]). [`Default`] is the
+/// PROVISIONAL production envelope above.
+#[derive(Debug, Clone, Copy)]
+pub struct SafetyEnvelope {
+    /// Bound on `connect()` (the dead-holder guard).
+    pub dial_timeout: Duration,
+    /// Bound on the gap between successive body chunks (the stall guard).
+    pub body_idle_timeout: Duration,
+    /// Coarse backstop over the whole dial+transfer.
+    pub total_timeout: Duration,
+}
+
+impl Default for SafetyEnvelope {
+    fn default() -> Self {
+        Self {
+            dial_timeout: DIAL_TIMEOUT,
+            body_idle_timeout: BODY_IDLE_TIMEOUT,
+            total_timeout: FETCH_TIMEOUT,
+        }
+    }
+}
 
 // -------------------------------------------------------------------------
 // Errors.
@@ -154,6 +208,25 @@ impl std::error::Error for IrohError {}
 pub struct IrohPeerAddr(EndpointAddr);
 
 impl IrohPeerAddr {
+    /// Build a dialable address from a peer's [`NodeId`] and its direct socket
+    /// addresses. This is the resolution a discovery layer (task-40/47) produces -
+    /// "here is the node and where to reach it" - made constructible without the
+    /// `iroh` crate. (task-51's dead-holder bite also uses it to point a valid
+    /// `NodeId` at a black-hole socket.)
+    pub fn new(node: NodeId, sockets: impl IntoIterator<Item = SocketAddr>) -> Self {
+        // A NodeId is 32 bytes; PublicKey::from_bytes only fails off-curve, which
+        // Transport::fetch rejects via validate_node_id before dialing. Build the
+        // EndpointAddr from whatever key bytes we were given; an off-curve id simply
+        // never gets past validation to a dial.
+        let key = PublicKey::from_bytes(node.as_bytes())
+            .unwrap_or_else(|_| PublicKey::from_bytes(&[0u8; 32]).expect("zero key is on-curve"));
+        let mut addr = EndpointAddr::new(key);
+        for socket in sockets {
+            addr = addr.with_ip_addr(socket);
+        }
+        IrohPeerAddr(addr)
+    }
+
     /// The peer's node identity (our canonical [`NodeId`] type).
     pub fn node_id(&self) -> NodeId {
         NodeId::from_bytes(*self.0.id.as_bytes())
@@ -254,17 +327,31 @@ pub struct IrohTransport {
     /// here a test wires it via [`Self::add_peer`]. Behind a `Mutex` because
     /// [`Transport::fetch`] takes `&self`.
     peers: Mutex<HashMap<NodeId, EndpointAddr>>,
+    /// The task-51 safety envelope (dial / body-idle / total bounds). Default is
+    /// the PROVISIONAL production envelope; a test pins short bounds via
+    /// [`Self::with_envelope`].
+    envelope: SafetyEnvelope,
 }
 
 impl IrohTransport {
     /// Bind a client endpoint on loopback with the relay DISABLED and NO
-    /// discovery. Register the peers it may dial with [`Self::add_peer`].
+    /// discovery. Register the peers it may dial with [`Self::add_peer`]. Uses the
+    /// default (PROVISIONAL) [`SafetyEnvelope`]; override with [`Self::with_envelope`].
     pub async fn spawn() -> Result<Self, IrohError> {
         let endpoint = bind_loopback_endpoint().await?;
         Ok(Self {
             endpoint,
             peers: Mutex::new(HashMap::new()),
+            envelope: SafetyEnvelope::default(),
         })
+    }
+
+    /// Replace the safety envelope (dial / body-idle / total time bounds). A test
+    /// pins SHORT bounds to prove a dead/stalled peer yields a bounded abort without
+    /// waiting the production seconds.
+    pub fn with_envelope(mut self, envelope: SafetyEnvelope) -> Self {
+        self.envelope = envelope;
+        self
     }
 
     /// Register a peer's dialable address (the discovery stand-in): a subsequent
@@ -292,31 +379,100 @@ impl IrohTransport {
         self.endpoint.close().await;
     }
 
-    /// The dial+fetch, factored out so a single [`FETCH_TIMEOUT`] wraps it.
-    async fn dial_and_fetch(
+    /// The dial+stream, with the full task-51 envelope:
+    ///   1. DIAL bounded by `envelope.dial_timeout` (dead-holder guard).
+    ///   2. The body is STREAMED leaf-by-leaf (never buffered whole first), with:
+    ///      - each stream step bounded by `envelope.body_idle_timeout` (stall guard);
+    ///      - a running NarSize CAP: the moment cumulative bytes exceed
+    ///        `expected_size` the stream is dropped and [`TransportError::TooLarge`]
+    ///        returned, so a lying holder claiming a small NarSize but serving a huge
+    ///        blob is cut off at ~NarSize, memory bounded (risk 6). The bound is the
+    ///        SIGNED NarSize (uncompressed raw NAR) - the exact unit of the streamed
+    ///        `RawNarV1` - NEVER the compressed FileSize.
+    ///
+    /// The whole thing is additionally wrapped in `envelope.total_timeout` by the
+    /// caller as a coarse backstop.
+    async fn dial_and_stream(
         &self,
         content: &Blake3Digest,
         addr: EndpointAddr,
         node: &NodeId,
+        expected_size: Option<u64>,
     ) -> Result<Vec<u8>, TransportError> {
-        // Direct dial (no relay): the address carries the peer's loopback sockets.
-        let connection = self
-            .endpoint
-            .connect(addr, iroh_blobs::ALPN)
-            .await
-            .map_err(|e| TransportError::Unavailable(format!("iroh dial to {node} failed: {e}")))?;
+        // 1. DIAL, bounded: a NodeId that never answers the QUIC handshake is cut
+        //    off here rather than hanging the resolution.
+        let connection = match tokio::time::timeout(
+            self.envelope.dial_timeout,
+            self.endpoint.connect(addr, iroh_blobs::ALPN),
+        )
+        .await
+        {
+            Ok(Ok(conn)) => conn,
+            Ok(Err(e)) => {
+                return Err(TransportError::Unavailable(format!(
+                    "iroh dial to {node} failed: {e}"
+                )));
+            }
+            Err(_elapsed) => {
+                return Err(TransportError::Unavailable(format!(
+                    "iroh dial to {node} exceeded {:?} (dead holder)",
+                    self.envelope.dial_timeout
+                )));
+            }
+        };
 
-        // Fetch by the exact BLAKE3 addressed unit. iroh-blobs' bao decode verifies
-        // each content item against `hash` as it streams (gate 1, incremental and
-        // fail-fast) - a holder that cannot honestly serve `hash` errors here
-        // rather than delivering wrong bytes.
+        // 2. STREAM by the exact BLAKE3 addressed unit. iroh-blobs' bao decode
+        //    verifies each leaf against `hash` as it arrives (gate 1, incremental).
+        //    We drive it as a STREAM (not `.bytes()`, which buffers everything) so
+        //    the NarSize cap can abort mid-transfer.
         let hash = Hash::from_bytes(*content.as_bytes());
-        let bytes = get_blob(connection, hash).bytes().await.map_err(|e| {
-            TransportError::Unavailable(format!(
-                "iroh get_blob failed (holder cannot honestly serve {content}): {e}"
-            ))
-        })?;
-        let raw = bytes.to_vec();
+        let mut stream = get_blob(connection, hash);
+        let mut raw: Vec<u8> = Vec::new();
+        loop {
+            // Body-idle guard: no forward progress within the bound => stalled peer.
+            let item =
+                match tokio::time::timeout(self.envelope.body_idle_timeout, stream.next()).await {
+                    Ok(Some(item)) => item,
+                    Ok(None) => {
+                        return Err(TransportError::Unavailable(format!(
+                            "iroh stream from {node} ended before the blob completed"
+                        )));
+                    }
+                    Err(_elapsed) => {
+                        // Dropping `stream` (and its connection) here aborts the transfer.
+                        return Err(TransportError::Unavailable(format!(
+                            "iroh transfer from {node} stalled: no bytes for {:?}",
+                            self.envelope.body_idle_timeout
+                        )));
+                    }
+                };
+
+            match item {
+                GetBlobItem::Item(BaoContentItem::Leaf(leaf)) => {
+                    raw.extend_from_slice(&leaf.data);
+                    // Running NarSize cap: abort the instant we exceed the signed
+                    // bound. Memory is held to <= bound + one bao chunk, regardless
+                    // of how large the lying blob actually is. Dropping `stream` at
+                    // the return aborts the transfer; we never drain the rest.
+                    if let Some(limit) = expected_size
+                        && raw.len() as u64 > limit
+                    {
+                        return Err(TransportError::TooLarge {
+                            limit,
+                            streamed: raw.len() as u64,
+                        });
+                    }
+                }
+                // Parent (tree) nodes carry no leaf data - bao uses them to verify.
+                GetBlobItem::Item(BaoContentItem::Parent(_)) => {}
+                GetBlobItem::Done(_stats) => break,
+                GetBlobItem::Error(cause) => {
+                    return Err(TransportError::Unavailable(format!(
+                        "iroh get_blob failed (holder cannot honestly serve {content}): {cause}"
+                    )));
+                }
+            }
+        }
 
         // Re-assert gate 1 with the daemon's single-source-of-truth recipe. bao
         // already enforced it on the wire; this makes the trait contract explicit
@@ -336,6 +492,7 @@ impl Transport for IrohTransport {
         &self,
         content: &Blake3Digest,
         offer: &KnownTransport,
+        expected_size: Option<u64>,
     ) -> Result<Vec<u8>, TransportError> {
         // Defensive: the registry dispatches by tag, but a wrong variant is a bug
         // worth surfacing rather than silently mis-serving.
@@ -367,11 +524,20 @@ impl Transport for IrohTransport {
                 ))
             })?;
 
-        // Coarse fail-fast bound so a wedged dial/transfer cannot hang forever.
-        match tokio::time::timeout(FETCH_TIMEOUT, self.dial_and_fetch(content, addr, node)).await {
+        // Coarse total backstop over dial+transfer, on top of the finer-grained
+        // dial and body-idle bounds inside `dial_and_stream`. A TooLarge abort from
+        // the streaming cap propagates through unchanged (it is a deliberate abort,
+        // not a hang the backstop should mask).
+        match tokio::time::timeout(
+            self.envelope.total_timeout,
+            self.dial_and_stream(content, addr, node, expected_size),
+        )
+        .await
+        {
             Ok(result) => result,
             Err(_elapsed) => Err(TransportError::Unavailable(format!(
-                "iroh fetch from {node} exceeded {FETCH_TIMEOUT:?}"
+                "iroh fetch from {node} exceeded total bound {:?}",
+                self.envelope.total_timeout
             ))),
         }
     }

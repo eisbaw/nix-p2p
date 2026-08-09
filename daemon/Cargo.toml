@@ -65,6 +65,15 @@ blake3 = "1"
 # limit (PRD); the daemon dials direct addresses where it has them.
 iroh = "1"
 iroh-blobs = "0.103"
+# task-51 safety envelope: the signed-NarSize abort must fire DURING the transfer,
+# so we drive `get_blob` as a STREAM (leaf-by-leaf) and stop the moment cumulative
+# bytes exceed the signed NarSize - never buffer a huge lying blob then check.
+# `bao-tree` names the leaf item the stream yields; `n0-future`'s `StreamExt` is the
+# exact `Stream` driver iroh-blobs itself uses. Both are already transitive under
+# iroh-blobs (no new closure), daemon-only, and non-HTTP-stack (the independence
+# convergence denylist is unaffected).
+bao-tree = "0.16"
+n0-future = "0.3"
 
 [dev-dependencies]
 # process: spawn the real testproxy binary for the fault-mode loop (AC#2).
@@ -76,6 +85,12 @@ flate2 = "1"
 # the test computes sha256 exactly as the Nix client would, to prove gate 2 is a
 # DIFFERENT gate from the BLAKE3 transport gate (the corruption-bite split).
 sha2 = "0.10"
+# iroh (task-51): the body-idle bite needs a PATHOLOGICAL provider that establishes
+# the QUIC connection then STALLS mid-transfer - a hostile peer the friendly public
+# API (IrohProvider) deliberately cannot express. Building one needs a custom
+# ProtocolHandler at the iroh layer, so the safety-envelope test reaches for `iroh`
+# directly (only that one test does; the rest stay on the daemon's public API).
+iroh = "1"
 
 [lints]
 workspace = true

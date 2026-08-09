@@ -587,6 +587,7 @@ name = "daemon"
 version = "0.0.1"
 dependencies = [
  "async-trait",
+ "bao-tree",
  "blake3",
  "bytes",
  "flate2",
@@ -597,6 +598,7 @@ dependencies = [
  "hyper-util",
  "iroh",
  "iroh-blobs",
+ "n0-future",
  "serde",
  "serde_json",
  "sha2 0.10.9",

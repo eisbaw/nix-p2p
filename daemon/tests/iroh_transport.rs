@@ -105,7 +105,7 @@ async fn honest_iroh_fetch_passes_both_gates() {
     let client = client_wired_to(&provider).await;
     assert_eq!(client.tag(), TransportTag::Iroh);
     let got = client
-        .fetch(&content, &iroh_offer(&provider))
+        .fetch(&content, &iroh_offer(&provider), Some(nar.len() as u64))
         .await
         .expect("a real two-endpoint iroh fetch of the seeded blob");
 
@@ -147,7 +147,7 @@ async fn wrong_content_id_fails_closed_over_real_iroh() {
     assert_ne!(bogus, held_id);
 
     let client = client_wired_to(&provider).await;
-    match client.fetch(&bogus, &iroh_offer(&provider)).await {
+    match client.fetch(&bogus, &iroh_offer(&provider), None).await {
         // fail-closed: no bytes for an id the holder cannot honestly serve.
         Err(TransportError::NotHeld(_)) | Err(TransportError::Unavailable(_)) => {}
         Ok(_) => panic!("a holder lacking the id must not yield bytes"),
@@ -180,7 +180,7 @@ async fn a_different_valid_nar_passes_gate1_but_fails_gate2() {
     let client = client_wired_to(&provider).await;
     // The (lying) claim pointed the wanted key at sub_content; fetch by it.
     let got = client
-        .fetch(&sub_content, &iroh_offer(&provider))
+        .fetch(&sub_content, &iroh_offer(&provider), None)
         .await
         .expect("the substituted blob is internally valid, so the transport succeeds");
 

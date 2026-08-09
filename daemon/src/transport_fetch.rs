@@ -161,6 +161,17 @@ pub enum TransportError {
     /// A transport-specific failure (dial refused, timeout, reset). Real backends
     /// (task-39) produce this; it means "this holder is unusable, try the next".
     Unavailable(String),
+    /// The risk-6 SIZE ABORT (task-51): the holder streamed MORE than the signed
+    /// NarSize bound. `streamed` is the byte count when the cap tripped (at least
+    /// `limit`): a lower bound on the true blob size, since the stream is aborted
+    /// early rather than drained. The bound is the SIGNED NarSize (uncompressed raw
+    /// NAR),
+    /// NEVER the compressed FileSize (the unit trap). Unlike [`Self::Unavailable`],
+    /// this is a DELIBERATE abort of a lying claim, not a "try the next holder"
+    /// signal: every offer in the claim addresses the SAME oversized BLAKE3, so the
+    /// driver short-circuits it (see [`fetch_via_offers`]) into a propagating
+    /// [`crate::source::SourceError::TooLarge`] rather than falling back.
+    TooLarge { limit: u64, streamed: u64 },
 }
 
 impl fmt::Display for TransportError {
@@ -176,6 +187,10 @@ impl fmt::Display for TransportError {
                 "offer is a {got} locator but this transport services {expected}"
             ),
             TransportError::Unavailable(why) => write!(f, "transport unavailable: {why}"),
+            TransportError::TooLarge { limit, streamed } => write!(
+                f,
+                "size abort: holder streamed {streamed} bytes, over the signed NarSize bound {limit}"
+            ),
         }
     }
 }
@@ -195,6 +210,13 @@ pub enum FetchError {
         skipped: Vec<TransportTag>,
         failed: Vec<(TransportTag, String)>,
     },
+    /// The risk-6 SIZE ABORT short-circuited the offer loop (task-51): a holder
+    /// streamed more than the signed NarSize bound. This is NOT "try the next
+    /// offer" - every offer in the claim addresses the SAME oversized BLAKE3 - so
+    /// the driver stops immediately and the caller maps this to a PROPAGATING
+    /// [`crate::source::SourceError::TooLarge`] (never an upstream fallback, which
+    /// would paper over a deliberate abort).
+    TooLarge { limit: u64, streamed: u64 },
 }
 
 impl fmt::Display for FetchError {
@@ -215,6 +237,10 @@ impl fmt::Display for FetchError {
                 }
                 Ok(())
             }
+            FetchError::TooLarge { limit, streamed } => write!(
+                f,
+                "size abort: a holder streamed {streamed} bytes, over the signed NarSize bound {limit}"
+            ),
         }
     }
 }
@@ -238,19 +264,34 @@ impl std::error::Error for FetchError {}
 ///
 /// The trait is object-safe (`dyn Transport`) so a [`TransportRegistry`] can
 /// dispatch offers decoded at runtime.
+///
+/// ## `expected_size`: the signed-NarSize safety bound (task-51)
+///
+/// task-39 deliberately left this trait size-less and carried the per-request
+/// bound forward to here. `expected_size` is the SIGNED NarSize from the narinfo
+/// (`Some` on the normal correlated path, `None` on the cold-start fallback where
+/// no signed bound is known). It is the UNCOMPRESSED raw-NAR byte count - the same
+/// unit as the transferred `RawNarV1` for a peer-served path - NEVER the compressed
+/// FileSize (the recurring unit trap). A streaming impl MUST enforce it DURING the
+/// transfer (abort the moment cumulative bytes exceed it), so a lying holder that
+/// claims a small NarSize but serves a huge blob is cut off at ~NarSize rather than
+/// buffered whole (risk 6 / OOM). `None` disables the size abort but not the
+/// transport's own time/idle envelope.
 #[async_trait]
 pub trait Transport: Send + Sync {
     /// Which offer variant this transport services. Its registration key.
     fn tag(&self) -> TransportTag;
 
     /// Fetch `content` using `offer`'s locator, returning gate-1-verified raw NAR
-    /// bytes. `offer` is guaranteed by the registry to be the variant matching
-    /// [`Transport::tag`]; an impl may still guard with
+    /// bytes, aborting if the transfer exceeds `expected_size` (the signed NarSize;
+    /// see the trait docs). `offer` is guaranteed by the registry to be the variant
+    /// matching [`Transport::tag`]; an impl may still guard with
     /// [`TransportError::WrongOffer`].
     async fn fetch(
         &self,
         content: &Blake3Digest,
         offer: &KnownTransport,
+        expected_size: Option<u64>,
     ) -> Result<Vec<u8>, TransportError>;
 }
 
@@ -298,17 +339,25 @@ impl TransportRegistry {
 /// Fetch `content` by trying each of `offers` in order, returning the first
 /// gate-1-verified bytes.
 ///
+/// `expected_size` is the signed NarSize bound (task-51), threaded to each
+/// [`Transport::fetch`] so the risk-6 abort fires at the streaming boundary.
+///
 /// Selection + fail-closed policy (AC#2):
 ///   * An offer whose transport has NO registered backend is SKIPPED (recorded,
 ///     resolution continues) - never a crash.
 ///   * An offer whose fetch FAILS (holder absent, integrity gate fired, dial
 ///     failed) is recorded and the next offer is tried - fail closed, try next.
+///   * An offer that trips the SIZE ABORT ([`TransportError::TooLarge`]) SHORT-
+///     CIRCUITS the loop: every offer in the claim addresses the same oversized
+///     BLAKE3, so trying the next is pointless, and falling back would paper over a
+///     deliberate abort. Returns [`FetchError::TooLarge`] straight away.
 ///   * If no offer yields bytes, returns [`FetchError::Exhausted`] with both lists
 ///     so the failure is diagnosable and the caller can fall back to the cache.
 pub async fn fetch_via_offers(
     registry: &TransportRegistry,
     content: &Blake3Digest,
     offers: &[KnownTransport],
+    expected_size: Option<u64>,
 ) -> Result<Vec<u8>, FetchError> {
     let mut skipped = Vec::new();
     let mut failed = Vec::new();
@@ -319,8 +368,12 @@ pub async fn fetch_via_offers(
                 // Unknown/unimplemented transport: skip, do not crash.
                 skipped.push(tag);
             }
-            Some(transport) => match transport.fetch(content, offer).await {
+            Some(transport) => match transport.fetch(content, offer, expected_size).await {
                 Ok(bytes) => return Ok(bytes),
+                // A deliberate size abort is not "try the next holder": short-circuit.
+                Err(TransportError::TooLarge { limit, streamed }) => {
+                    return Err(FetchError::TooLarge { limit, streamed });
+                }
                 Err(err) => failed.push((tag, err.to_string())),
             },
         }
@@ -360,15 +413,17 @@ impl TransportNarSource {
 
 #[async_trait]
 impl NarSource for TransportNarSource {
-    /// `_expected_size` (the signed NarSize bound, risk-6 abort) is accepted but
-    /// NOT enforced here yet: the bound must be enforced DURING streaming inside
-    /// the transport (task-25), not post-hoc in this driver, or a lying holder
-    /// could stream a huge blob before a late check - defeating the bound. Left as
-    /// a forward-carry so the enforcement lands at the streaming boundary.
+    /// `expected_size` (the signed NarSize bound, risk-6 abort) is threaded through
+    /// [`fetch_via_offers`] to [`Transport::fetch`], where a streaming impl enforces
+    /// it DURING the transfer (task-51) - never post-hoc in this driver, which would
+    /// let a lying holder stream a huge blob before a late check and defeat the
+    /// bound. A trip returns [`FetchError::TooLarge`], which this maps to the
+    /// PROPAGATING [`SourceError::TooLarge`] (a [`crate::discovery::FallbackNarSource`]
+    /// does NOT paper it over with an upstream fetch).
     async fn resolve(
         &self,
         key: &NarKey,
-        _expected_size: Option<u64>,
+        expected_size: Option<u64>,
     ) -> Result<UpstreamResponse, SourceError> {
         // The p2p path resolves ONLY the signed-NarHash key. An UpstreamPath is the
         // wave-1 cold-start fallback (a raw URL) that a URL-less p2p source cannot
@@ -404,10 +459,20 @@ impl NarSource for TransportNarSource {
             .ok_or_else(|| SourceError::Upstream(FetchError::NoContentId.to_string()))?;
 
         // Gate 1 lives inside the transports; the driver picks an offer and returns
-        // the verified bytes (or fails closed for HTTP fallback).
-        let bytes = fetch_via_offers(&self.registry, content, &claim.transports)
+        // the verified bytes (or fails closed for HTTP fallback). The signed NarSize
+        // bound rides along so the risk-6 abort fires at the streaming boundary.
+        let bytes = fetch_via_offers(&self.registry, content, &claim.transports, expected_size)
             .await
-            .map_err(|err| SourceError::Unreachable(err.to_string()))?;
+            .map_err(|err| match err {
+                // A deliberate size abort PROPAGATES (no upstream fallback):
+                FetchError::TooLarge { limit, streamed } => SourceError::TooLarge {
+                    limit,
+                    declared: streamed,
+                },
+                // A miss / exhausted offer set folds to a fast, clean miss the
+                // FallbackNarSource turns into upstream fallback (S2).
+                other => SourceError::Unreachable(other.to_string()),
+            })?;
 
         // Hand the raw NAR upward. Gate 2 (sha256 == NarHash) is Nix's, downstream:
         // the bytes are byte-identical to what the NarHash addresses, so that gate
@@ -476,6 +541,12 @@ impl Transport for FakeTransport {
         &self,
         content: &Blake3Digest,
         offer: &KnownTransport,
+        // Deliberately IGNORED: this is a whole-in-memory stand-in, not a streaming
+        // transport, so it has no streaming boundary to enforce the risk-6 NarSize
+        // abort at. Enforcing it post-hoc here (buffer-then-check) would model the
+        // exact anti-pattern task-51 fixes, so the real abort lives in IrohTransport
+        // (the streaming path) and this fake stays a pure content-addressed lookup.
+        _expected_size: Option<u64>,
     ) -> Result<Vec<u8>, TransportError> {
         // Defensive: the registry dispatches by tag, but a wrong variant is a bug
         // worth surfacing rather than silently mis-serving.
@@ -679,7 +750,7 @@ mod tests {
 
         // A claim offering ONLY bittorrent: the offer is skipped (no backend) and
         // resolution is cleanly exhausted - NOT a panic.
-        match fetch_via_offers(&registry, &content, std::slice::from_ref(&bt_offer)).await {
+        match fetch_via_offers(&registry, &content, std::slice::from_ref(&bt_offer), None).await {
             Err(FetchError::Exhausted { skipped, failed }) => {
                 assert_eq!(skipped, vec![TransportTag::BitTorrent]);
                 assert!(failed.is_empty());
@@ -693,6 +764,7 @@ mod tests {
             &registry,
             &content,
             &[bt_offer, KnownTransport::Iroh { node: node() }],
+            None,
         )
         .await
         .expect("bittorrent skipped, iroh fetches");
@@ -726,6 +798,7 @@ mod tests {
             &registry,
             &content,
             &[KnownTransport::Iroh { node: node() }],
+            None,
         )
         .await
         {
@@ -736,6 +809,83 @@ mod tests {
                 assert!(failed[0].1.contains("does not hold"));
             }
             other => panic!("expected exhaustion after a failed offer, got {other:?}"),
+        }
+    }
+
+    /// A transport that always trips the risk-6 size abort (models a streaming
+    /// backend that cut a lying oversized blob off at the signed NarSize). Used to
+    /// prove the SHORT-CIRCUIT + error mapping without a real network - the REAL
+    /// streaming abort over iroh is `iroh_transport.rs`.
+    struct AbortingTransport {
+        limit: u64,
+        streamed: u64,
+    }
+    #[async_trait]
+    impl Transport for AbortingTransport {
+        fn tag(&self) -> TransportTag {
+            TransportTag::Iroh
+        }
+        async fn fetch(
+            &self,
+            _content: &Blake3Digest,
+            _offer: &KnownTransport,
+            _expected_size: Option<u64>,
+        ) -> Result<Vec<u8>, TransportError> {
+            Err(TransportError::TooLarge {
+                limit: self.limit,
+                streamed: self.streamed,
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn a_size_abort_short_circuits_offers_and_does_not_try_the_next() {
+        // Two offers, both iroh. The first trips TooLarge; the loop must NOT try the
+        // second (every offer addresses the same oversized BLAKE3) - it short-
+        // circuits into FetchError::TooLarge, carrying the bound through.
+        let content = Blake3Digest::from_raw_nar(RAW_NAR);
+        let mut registry = TransportRegistry::new();
+        registry.register(Box::new(AbortingTransport {
+            limit: 1024,
+            streamed: 1040,
+        }));
+        let offers = [
+            KnownTransport::Iroh { node: node() },
+            KnownTransport::Iroh { node: node() },
+        ];
+        match fetch_via_offers(&registry, &content, &offers, Some(1024)).await {
+            Err(FetchError::TooLarge { limit, streamed }) => {
+                assert_eq!((limit, streamed), (1024, 1040));
+            }
+            other => panic!("a size abort must short-circuit into TooLarge, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_size_abort_maps_to_propagating_source_too_large() {
+        // Through the NarSource: TransportError::TooLarge -> FetchError::TooLarge ->
+        // SourceError::TooLarge (which FallbackNarSource propagates, never papers
+        // over - proven in discovery.rs). This wires the seam end to end.
+        let content = Blake3Digest::from_raw_nar(RAW_NAR);
+        let mut registry = TransportRegistry::new();
+        registry.register(Box::new(AbortingTransport {
+            limit: 1024,
+            streamed: 999_999,
+        }));
+        let source = source_with(
+            registry,
+            vec![claim_with(
+                content,
+                vec![KnownTransport::Iroh { node: node() }],
+            )],
+        );
+        match source.resolve(&signed_key(), Some(1024)).await {
+            Err(SourceError::TooLarge { limit, declared }) => {
+                assert_eq!(limit, 1024);
+                assert_eq!(declared, 999_999);
+            }
+            Err(other) => panic!("expected a propagating SourceError::TooLarge, got {other}"),
+            Ok(_) => panic!("a size abort must NOT resolve to bytes"),
         }
     }
 
