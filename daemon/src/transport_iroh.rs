@@ -49,6 +49,7 @@
 use std::collections::HashMap;
 use std::fmt;
 use std::net::SocketAddr;
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -58,16 +59,19 @@ use bao_tree::io::BaoContentItem;
 use iroh::endpoint::{RelayMode, presets};
 use iroh::protocol::Router;
 use iroh::{Endpoint, EndpointAddr, PublicKey};
+use iroh_blobs::api::TempTag;
 use iroh_blobs::api::blobs::BlobStatus;
 use iroh_blobs::get::request::{GetBlobItem, get_blob};
 use iroh_blobs::provider::events::{
-    EventMask, EventSender, ProviderMessage, RequestMode, RequestUpdate,
+    AbortReason, EventMask, EventSender, ProviderMessage, RequestMode, RequestUpdate,
 };
 use iroh_blobs::store::mem::{MemStore, Options as MemStoreOptions};
 use iroh_blobs::store::{GcConfig, ProtectCb, ProtectOutcome};
 use iroh_blobs::{BlobsProtocol, Hash};
 use n0_future::StreamExt;
+use tokio::sync::watch;
 
+use crate::availability::AvailabilityIndex;
 use crate::claim::KnownTransport;
 use crate::content_id::Blake3Digest;
 use crate::transport::{IROH_BLOBS_ALPN, NodeId};
@@ -245,20 +249,603 @@ impl IrohPeerAddr {
 }
 
 // -------------------------------------------------------------------------
+// The SUPPLY seam (task-61's decision) and the SERVE BUDGET (task-72).
+// -------------------------------------------------------------------------
+//
+// TASK-61 decided the supply model: REGENERATE ON DEMAND, hold nothing at rest.
+// The numbers that forced it are in PRD.md ("Supply model"): the owner's real
+// store is 108,401 paths / 155,621 MiB of NAR, which at task-65's measured
+// holder cost of 2.0033 bytes of RSS per byte of NAR would be ~304 GiB of RAM to
+// hold, and whose p100 path is 3186 MiB - about 6.2 GiB of RAM for ONE serve
+// (model output, extrapolated past the fitted 8..128 MiB grid).
+//
+// Two consequences, and they are the whole of this section:
+//
+//   1. ANNOUNCING MUST NOT COST HOLDING. A node names what it can serve by
+//      digest; the digest is derived from the bytes with
+//      `Blake3Digest::stream_raw_nar` in 64 KiB slices and the bytes are then
+//      dropped. What survives is a [`NarSupplier`] binding: "this digest, that
+//      source".
+//   2. IN-FLIGHT MEMORY IS NOW THE ENTIRE MEMORY COST, so it is the thing that
+//      must be BOUNDED. The daemon is outside the trust base: any peer may ask
+//      for the largest NAR we announce, so "serve whatever is asked" is a
+//      remote-triggerable OOM (an AVAILABILITY defect - Nix still re-verifies
+//      sig + NarHash, so never wrong bytes). [`ServeBudget`] is the bound and
+//      [`IrohProvider`] enforces it BEFORE allocating anything.
+
+/// Why an on-demand supply of a raw NAR failed. A string, not an enum: the
+/// failure is whatever the underlying source said (a missing file, a
+/// `nix-store --dump` that exited nonzero), and flattening those into categories
+/// would lose the only useful part.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SupplyError(pub String);
+
+impl fmt::Display for SupplyError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "on-demand NAR supply failed: {}", self.0)
+    }
+}
+
+impl std::error::Error for SupplyError {}
+
+/// Where a node REGENERATES a raw NAR from when a peer asks for it (the task-61
+/// supply model). The implementation for a real node dumps the store path; the
+/// one here reads back the exact raw NAR file the node announced.
+///
+/// The two methods are separate ON PURPOSE, and the split is the security
+/// property: [`Self::declared_size`] must answer the admission question -
+/// "how big is this, and do we even have it?" - **without producing a single
+/// byte**, so a request for a 3 GiB NAR is declined at zero allocation cost.
+/// [`Self::supply`] is called only after admission has already agreed to pay.
+///
+/// NO ENUMERATION (PRD privacy invariant, owner constraint from phase 1). Both
+/// methods are per-digest probes. There is deliberately no `list`, no `iter` and
+/// no `len`: a peer may learn yes/no about a digest it can already name, never
+/// what a node holds.
+pub trait NarSupplier: Send + Sync {
+    /// The uncompressed NAR size (NarSize units - never a compressed FileSize)
+    /// this digest would produce, answered WITHOUT producing the bytes. `None`
+    /// means this node cannot supply it at all.
+    fn declared_size(&self, content: &Blake3Digest) -> Option<u64>;
+
+    /// Produce the exact `RawNarV1` bytes for `content`. Called only after the
+    /// serve budget has admitted the request. Blocking: the caller runs it off
+    /// the async runtime.
+    fn supply(&self, content: &Blake3Digest) -> Result<Vec<u8>, SupplyError>;
+}
+
+/// A [`NarSupplier`] backed by raw-NAR FILES on disk: the shape the wave-2a
+/// harness and the `--iroh-seed-nar` flag speak. A real node's supplier dumps
+/// `/nix/store` instead (task-50's `CommandNarDumper` is that producer); the seam
+/// is the same either way, which is the point of having it.
+///
+/// [`Self::announce`] is what replaced the eager startup seed: it stream-hashes
+/// the file in bounded memory and records the binding. Peak allocation is one
+/// 64 KiB chunk, whatever the NAR's size - so a node can announce a 3 GiB path
+/// without ever holding 3 GiB.
+pub struct FileNarSupplier {
+    /// `BLAKE3(RawNarV1) -> the file holding exactly those bytes`. Behind a
+    /// `Mutex` because announcing happens on the startup path while serving reads
+    /// it from the provider's tasks.
+    by_digest: Mutex<HashMap<Blake3Digest, PathBuf>>,
+}
+
+impl Default for FileNarSupplier {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl FileNarSupplier {
+    /// An empty supplier: it can supply nothing until something is announced.
+    pub fn new() -> Self {
+        FileNarSupplier {
+            by_digest: Mutex::new(HashMap::new()),
+        }
+    }
+
+    /// Read `path` ONCE in bounded memory to learn what it is, record the
+    /// binding, and return `(digest, nar_size)` so the caller can publish a
+    /// claim. The file is NOT retained in memory and NOT copied.
+    ///
+    /// Fails fast and loudly: an unreadable seed file is a configuration error
+    /// that must stop startup, not a node that silently announces nothing.
+    pub fn announce(&self, path: impl Into<PathBuf>) -> Result<(Blake3Digest, u64), SupplyError> {
+        let path = path.into();
+        let file = std::fs::File::open(&path)
+            .map_err(|e| SupplyError(format!("opening raw NAR {}: {e}", path.display())))?;
+        let (digest, nar_size) = Blake3Digest::stream_raw_nar(std::io::BufReader::new(file))
+            .map_err(|e| SupplyError(format!("hashing raw NAR {}: {e}", path.display())))?;
+        self.by_digest
+            .lock()
+            .expect("supplier mutex")
+            .insert(digest, path);
+        Ok((digest, nar_size))
+    }
+}
+
+impl NarSupplier for FileNarSupplier {
+    fn declared_size(&self, content: &Blake3Digest) -> Option<u64> {
+        let path = self
+            .by_digest
+            .lock()
+            .expect("supplier mutex")
+            .get(content)?
+            .clone();
+        // The file's LENGTH is the NarSize, because the announced file IS the raw
+        // NAR. Metadata only - no read, no allocation: this runs before the
+        // budget has agreed to anything.
+        std::fs::metadata(&path).ok().map(|meta| meta.len())
+    }
+
+    fn supply(&self, content: &Blake3Digest) -> Result<Vec<u8>, SupplyError> {
+        let path = self
+            .by_digest
+            .lock()
+            .expect("supplier mutex")
+            .get(content)
+            .cloned()
+            .ok_or_else(|| SupplyError(format!("no announced source for {content}")))?;
+        std::fs::read(&path)
+            .map_err(|e| SupplyError(format!("reading raw NAR {}: {e}", path.display())))
+    }
+}
+
+/// The [`NarSupplier`] a REAL node uses: its own [`AvailabilityIndex`], which
+/// regenerates a raw NAR from `/nix/store` with `nix-store --dump`.
+///
+/// THIS IS THE FIX FOR TASK-72 GAP 2, and the direction of the dependency is the
+/// point. The transport consumes the index; the index knows nothing about
+/// transports (its module docs are explicit that seeding is external), so adding a
+/// supply path did not turn the index into a transport-aware module. What it did
+/// was make one set out of two: the index answers "yes, I hold NarHash k" only for
+/// registrations it can also produce bytes for, and this adapter is how the
+/// provider reaches those bytes.
+pub struct IndexNarSupplier {
+    index: Arc<AvailabilityIndex>,
+}
+
+impl IndexNarSupplier {
+    /// Serve from this node's availability index.
+    pub fn new(index: Arc<AvailabilityIndex>) -> Self {
+        IndexNarSupplier { index }
+    }
+}
+
+impl NarSupplier for IndexNarSupplier {
+    fn declared_size(&self, content: &Blake3Digest) -> Option<u64> {
+        self.index.supply_size(content)
+    }
+
+    fn supply(&self, content: &Blake3Digest) -> Result<Vec<u8>, SupplyError> {
+        self.index
+            .supply_raw_nar(content)
+            .map_err(|e| SupplyError(e.to_string()))
+    }
+}
+
+/// Largest single NAR the node agrees to serve, in NarSize bytes. PROVISIONAL,
+/// like the [`SafetyEnvelope`] time bounds, and chosen against the owner's
+/// measured store rather than by feel: p99 there is 10.92 MiB and p100 is
+/// 3186.03 MiB, so 256 MiB serves essentially every real path while declining the
+/// handful whose serve would cost gigabytes of RAM.
+pub const DEFAULT_MAX_SERVE_NAR_BYTES: u64 = 256 * 1024 * 1024;
+
+/// Largest TOTAL of concurrently-admitted NARs, in NarSize bytes. PROVISIONAL.
+/// Four maximum-size serves at once; beyond that a peer is declined rather than
+/// queued, because queueing a request whose memory we cannot afford only moves
+/// the OOM later.
+pub const DEFAULT_MAX_INFLIGHT_NAR_BYTES: u64 = 1024 * 1024 * 1024;
+
+/// The numeric bound on what serving may cost (task-72 AC#1). Both fields are in
+/// NarSize units - UNCOMPRESSED NAR bytes, the addressed unit - never the
+/// compressed FileSize a narinfo carries.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ServeBudget {
+    /// Above this, a single blob is DECLINED rather than allocated.
+    pub max_nar_bytes_uncompressed_nar: u64,
+    /// Above this total across concurrently-admitted serves, a further request is
+    /// DECLINED rather than admitted.
+    pub max_inflight_bytes_uncompressed_nar: u64,
+}
+
+impl Default for ServeBudget {
+    fn default() -> Self {
+        ServeBudget {
+            max_nar_bytes_uncompressed_nar: DEFAULT_MAX_SERVE_NAR_BYTES,
+            max_inflight_bytes_uncompressed_nar: DEFAULT_MAX_INFLIGHT_NAR_BYTES,
+        }
+    }
+}
+
+impl ServeBudget {
+    /// The PRE-task-72 behaviour: serve whatever is asked, allocate whatever that
+    /// costs. It exists so the bound can be proven by MUTATION - a test removes
+    /// the bound with this and shows the allocation come back - and for no other
+    /// reason. It is deliberately not reachable from the CLI: an operator who
+    /// wants no bound can raise the number, and will then have written the number
+    /// they chose.
+    pub fn unbounded() -> Self {
+        ServeBudget {
+            max_nar_bytes_uncompressed_nar: u64::MAX,
+            max_inflight_bytes_uncompressed_nar: u64::MAX,
+        }
+    }
+}
+
+/// Why a get-request was refused before any memory was committed to it. Each
+/// variant is counted separately in [`ServeCounters`]: "we declined 12 requests"
+/// is not actionable, "we declined 12 as over the per-NAR bound" is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ServeDecline {
+    /// The blob is larger than [`ServeBudget::max_nar_bytes_uncompressed_nar`].
+    TooLarge,
+    /// Admitting it would push concurrently-held bytes past
+    /// [`ServeBudget::max_inflight_bytes_uncompressed_nar`].
+    Busy,
+    /// Neither the store nor the supplier knows this digest. (iroh-blobs would
+    /// fail the transfer anyway; declining here makes it a NAMED, counted answer
+    /// instead of an opaque stream error.)
+    Unknown,
+    /// The supplier knew the digest but could not produce the bytes (a GC'd store
+    /// path, an unreadable file, content that no longer hashes to the digest).
+    SupplyFailed,
+}
+
+impl ServeDecline {
+    /// The stable, greppable name used in counters and logs.
+    pub const fn reason(self) -> &'static str {
+        match self {
+            ServeDecline::TooLarge => "too_large",
+            ServeDecline::Busy => "busy",
+            ServeDecline::Unknown => "unknown",
+            ServeDecline::SupplyFailed => "supply_failed",
+        }
+    }
+
+    /// How the refusal is reported to the peer. `RateLimited` says "try later"
+    /// (a busy node genuinely will be free later); `Permission` says "not from
+    /// me" for the three that will not change on their own.
+    const fn abort_reason(self) -> AbortReason {
+        match self {
+            ServeDecline::Busy => AbortReason::RateLimited,
+            _ => AbortReason::Permission,
+        }
+    }
+}
+
+/// What the admission gate has done since startup. Counters, not a log, because
+/// the interesting question ("is this node refusing work, and why") is a rate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct ServeCounters {
+    /// Get-requests admitted (the budget agreed to pay for them).
+    pub admitted: u64,
+    /// Admissions that had to REGENERATE the content first (a supplier call).
+    /// The difference between this and `admitted` is the store-hit rate.
+    pub regenerated: u64,
+    /// Declined: over the per-NAR bound.
+    pub declined_too_large: u64,
+    /// Declined: over the in-flight total.
+    pub declined_busy: u64,
+    /// Declined: digest unknown to both the store and the supplier.
+    pub declined_unknown: u64,
+    /// Declined: the supplier could not produce the bytes.
+    pub declined_supply_failed: u64,
+}
+
+impl ServeCounters {
+    /// Total declines, whatever the reason.
+    pub fn declined(&self) -> u64 {
+        self.declined_too_large
+            + self.declined_busy
+            + self.declined_unknown
+            + self.declined_supply_failed
+    }
+}
+
+/// One admitted, not-yet-finished serve. `refs` because two peers can ask for the
+/// same digest at once: the content is materialised ONCE and both are served from
+/// it, so the budget charges for it once and releases it when the LAST of them is
+/// done.
+struct Inflight {
+    refs: usize,
+    bytes_uncompressed_nar: u64,
+    /// Holds the blob against the garbage collector for the life of the serve.
+    /// `None` for a blob that was already resident (nothing to pin that this
+    /// admission created).
+    tag: Option<TempTag>,
+    /// SINGLE FLIGHT. `None` while the first admitter is regenerating the content;
+    /// `Some(true)` once the blob is in the store; `Some(false)` if regeneration
+    /// failed. Followers WAIT on this rather than returning "allowed" against a
+    /// blob that does not exist yet - which would hand the peer an empty transfer
+    /// under exactly the herd condition that makes on-demand supply interesting.
+    ///
+    /// A `watch` and not a `Notify`: `watch` carries the STATE as well as the
+    /// edge, so a follower that arrives after the leader already published cannot
+    /// miss the wakeup and hang. That lost-wakeup window is the whole reason this
+    /// is not a bare notification.
+    state: watch::Sender<Option<bool>>,
+}
+
+/// What [`ServeGate::reserve`] decided this caller must do next.
+enum Reservation {
+    /// This caller is the first: it must produce the bytes and publish the result.
+    Materialise,
+    /// The content is already in the store; nothing to do.
+    Ready,
+    /// Another caller is materialising it; wait for their verdict.
+    Follow(watch::Receiver<Option<bool>>),
+}
+
+/// The admission gate: the budget, what can be regenerated, and what is in flight.
+struct ServeGate {
+    budget: ServeBudget,
+    supplier: Option<Arc<dyn NarSupplier>>,
+    /// The SINGLE SOURCE OF TRUTH for "what is this node currently on the hook
+    /// for". In-flight BYTES are summed from it rather than tracked in a parallel
+    /// counter: two representations of one fact is how they drift.
+    inflight: Mutex<HashMap<Hash, Inflight>>,
+    /// One-shot arming for the post-serve sweep (see [`StoreRetention`]).
+    gc_armed: Option<Arc<AtomicBool>>,
+    admitted: AtomicU64,
+    regenerated: AtomicU64,
+    declined_too_large: AtomicU64,
+    declined_busy: AtomicU64,
+    declined_unknown: AtomicU64,
+    declined_supply_failed: AtomicU64,
+}
+
+impl ServeGate {
+    fn counters(&self) -> ServeCounters {
+        ServeCounters {
+            admitted: self.admitted.load(Ordering::Relaxed),
+            regenerated: self.regenerated.load(Ordering::Relaxed),
+            declined_too_large: self.declined_too_large.load(Ordering::Relaxed),
+            declined_busy: self.declined_busy.load(Ordering::Relaxed),
+            declined_unknown: self.declined_unknown.load(Ordering::Relaxed),
+            declined_supply_failed: self.declined_supply_failed.load(Ordering::Relaxed),
+        }
+    }
+
+    fn count_decline(&self, why: ServeDecline) {
+        let counter = match why {
+            ServeDecline::TooLarge => &self.declined_too_large,
+            ServeDecline::Busy => &self.declined_busy,
+            ServeDecline::Unknown => &self.declined_unknown,
+            ServeDecline::SupplyFailed => &self.declined_supply_failed,
+        };
+        counter.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Reserve `size` bytes for `hash`, or say why not, and say what this caller
+    /// must do next.
+    ///
+    /// THE BUDGET IS CHECKED BEFORE ANYTHING IS PRODUCED. That ordering is the
+    /// whole of task-72 AC#1: `size` came from metadata or from the store's own
+    /// accounting, so a 3 GiB request is refused having allocated nothing.
+    ///
+    /// The insert also happens HERE, before any `add_bytes`, and THAT ordering is
+    /// load-bearing for the collector race - see the `ProtectCb` in
+    /// [`IrohProvider::spawn_with`].
+    fn reserve(
+        &self,
+        hash: Hash,
+        size: u64,
+        must_regenerate: bool,
+    ) -> Result<Reservation, ServeDecline> {
+        if size > self.budget.max_nar_bytes_uncompressed_nar {
+            return Err(ServeDecline::TooLarge);
+        }
+        let mut inflight = self.inflight.lock().expect("inflight mutex");
+        if let Some(entry) = inflight.get_mut(&hash) {
+            entry.refs += 1;
+            return Ok(match *entry.state.borrow() {
+                Some(true) => Reservation::Ready,
+                _ => Reservation::Follow(entry.state.subscribe()),
+            });
+        }
+        let held: u64 = inflight
+            .values()
+            .map(|e| e.bytes_uncompressed_nar)
+            .sum::<u64>();
+        if held.saturating_add(size) > self.budget.max_inflight_bytes_uncompressed_nar {
+            return Err(ServeDecline::Busy);
+        }
+        // A resident blob is published READY at insert time: there is nothing to
+        // wait for, and leaving it `None` would strand a concurrent follower.
+        let (state, _) = watch::channel(if must_regenerate { None } else { Some(true) });
+        inflight.insert(
+            hash,
+            Inflight {
+                refs: 1,
+                bytes_uncompressed_nar: size,
+                tag: None,
+                state,
+            },
+        );
+        Ok(if must_regenerate {
+            Reservation::Materialise
+        } else {
+            Reservation::Ready
+        })
+    }
+
+    /// Publish the outcome of a materialisation to this caller and to any
+    /// followers: the pinning tag on success, the verdict either way.
+    fn publish(&self, hash: Hash, tag: Option<TempTag>) {
+        let ok = tag.is_some();
+        if let Some(entry) = self.inflight.lock().expect("inflight mutex").get_mut(&hash) {
+            entry.tag = tag;
+            // `send_replace`, not `send`: with no followers subscribed `send`
+            // reports an error, and a materialisation that succeeded must not be
+            // recorded as failed just because nobody happened to be waiting.
+            entry.state.send_replace(Some(ok));
+        }
+    }
+
+    /// Give back one reference. When the last one goes the entry is removed - which
+    /// DROPS its [`TempTag`] - and, if nothing at all is in flight, exactly one
+    /// collector sweep is armed.
+    fn release(&self, hash: Hash) {
+        let mut inflight = self.inflight.lock().expect("inflight mutex");
+        if let Some(entry) = inflight.get_mut(&hash) {
+            entry.refs -= 1;
+            if entry.refs == 0 {
+                inflight.remove(&hash);
+            }
+        }
+        if inflight.is_empty()
+            && let Some(armed) = &self.gc_armed
+        {
+            armed.store(true, Ordering::SeqCst);
+        }
+    }
+}
+
+/// THE ADMISSION GATE. Runs before iroh-blobs is allowed to serve a get-request,
+/// and is where task-72's two gaps are closed:
+///
+///   * GAP 1 (peer-triggerable OOM): the size is established from metadata or from
+///     the store's own accounting, and compared against the budget, BEFORE anything
+///     is produced. A 3 GiB request costs a `stat`, not 3 GiB.
+///   * GAP 2 (announced but unservable): a digest the supplier can produce is
+///     materialised HERE, so "we announced it" and "we can serve it" are the same
+///     statement. A digest neither the store nor the supplier knows is declined as
+///     `Unknown` - a named, counted answer instead of a dial that hangs up mid-stream.
+async fn admit(gate: &Arc<ServeGate>, store: &MemStore, hash: Hash) -> Result<(), ServeDecline> {
+    let content = Blake3Digest::from_bytes(*hash.as_bytes());
+
+    // 1. HOW BIG IS IT - answered WITHOUT producing anything.
+    let resident = match store.blobs().status(hash).await {
+        Ok(BlobStatus::Complete { size }) => Some(size),
+        // Partial, NotFound, or a store that could not answer: not servable as it
+        // stands. Fall through to the supplier, which can produce it whole.
+        _ => None,
+    };
+    let (size, must_regenerate) = match resident {
+        Some(size) => (size, false),
+        None => match gate
+            .supplier
+            .as_ref()
+            .and_then(|supplier| supplier.declared_size(&content))
+        {
+            Some(size) => (size, true),
+            None => return Err(ServeDecline::Unknown),
+        },
+    };
+
+    // 2. THE BOUND, and the reservation, before the allocation.
+    match gate.reserve(hash, size, must_regenerate)? {
+        Reservation::Ready => {}
+        Reservation::Materialise => match materialise(gate, store, &content, hash).await {
+            Ok(()) => {
+                gate.regenerated.fetch_add(1, Ordering::Relaxed);
+            }
+            Err(why) => {
+                // Tell the followers BEFORE giving up the reservation: `publish`
+                // needs the entry to still be there, and `release` may remove it.
+                gate.publish(hash, None);
+                gate.release(hash);
+                return Err(why);
+            }
+        },
+        Reservation::Follow(mut state) => {
+            loop {
+                if let Some(ok) = *state.borrow_and_update() {
+                    if ok {
+                        break;
+                    }
+                    gate.release(hash);
+                    return Err(ServeDecline::SupplyFailed);
+                }
+                // `Err` means the entry (and its sender) went away - which only
+                // happens on the failure path, so it reads the same as `Some(false)`.
+                if state.changed().await.is_err() {
+                    gate.release(hash);
+                    return Err(ServeDecline::SupplyFailed);
+                }
+            }
+        }
+    }
+    gate.admitted.fetch_add(1, Ordering::Relaxed);
+    Ok(())
+}
+
+/// Produce the content for `hash` and put it in the store, pinned for the serve.
+///
+/// Called ONLY after [`ServeGate::reserve`] has agreed to pay for it, and only by
+/// the single caller that won the single-flight race.
+async fn materialise(
+    gate: &Arc<ServeGate>,
+    store: &MemStore,
+    content: &Blake3Digest,
+    hash: Hash,
+) -> Result<(), ServeDecline> {
+    let supplier = gate.supplier.clone().ok_or(ServeDecline::Unknown)?;
+    for _attempt in 0..MATERIALISE_ATTEMPTS {
+        let supplier = supplier.clone();
+        let content = *content;
+        // `spawn_blocking`: a supplier reads a file or shells out to
+        // `nix-store --dump`. Running that on a runtime worker would stall every
+        // other task on this thread for the length of a whole-NAR read.
+        let raw = tokio::task::spawn_blocking(move || supplier.supply(&content))
+            .await
+            .map_err(|_joined| ServeDecline::SupplyFailed)?
+            .map_err(|_supply| ServeDecline::SupplyFailed)?;
+        // The budget is not negotiable even for our own supplier: a source whose
+        // real size exceeds the metadata it declared must not smuggle an unbounded
+        // allocation past a gate that has already said yes.
+        if raw.len() as u64 > gate.budget.max_nar_bytes_uncompressed_nar {
+            return Err(ServeDecline::TooLarge);
+        }
+        // BY VALUE. `add_bytes` takes `impl Into<bytes::Bytes>`, so a `Vec<u8>` is
+        // MOVED into the store, not copied. That is why this path costs ~1x the NAR
+        // rather than the ~2x `IrohProvider::seed` costs, and it is NOT task-46's
+        // fix arriving early: task-46 owns removing the `to_vec()` from `seed`,
+        // whose `&[u8]` signature forces the copy. This is a different call site
+        // that never had a borrowed slice to begin with. See task-46's notes.
+        let tag = store
+            .blobs()
+            .add_bytes(raw)
+            .temp_tag()
+            .await
+            .map_err(|_add| ServeDecline::SupplyFailed)?;
+        if tag.hash() != hash {
+            // The supplier produced content that is not what was asked for (a store
+            // path rebuilt, a file replaced). Serving it would be serving the wrong
+            // blob under the right name; refuse, loudly and counted.
+            return Err(ServeDecline::SupplyFailed);
+        }
+        // THE ONE COLLECTOR RETRY. See `StoreRetention::ReleaseAfterServe`: a sweep
+        // already past its protect callback can delete a blob added under it. That
+        // can happen at most once, because the next callback sees this hash in the
+        // in-flight table and aborts - so if the blob is here, we are done, and if
+        // it is not, the second attempt cannot lose the same way.
+        if store.blobs().has(hash).await.unwrap_or(false) {
+            gate.publish(hash, Some(tag));
+            return Ok(());
+        }
+    }
+    Err(ServeDecline::SupplyFailed)
+}
+
+// -------------------------------------------------------------------------
 // Provider (node B): serve this node's NARs by BLAKE3 over iroh-blobs.
 // -------------------------------------------------------------------------
 
-/// What the provider's blob store does with content after it is seeded (task-65).
+/// What the provider's blob store does with content after it is seeded (task-65)
+/// or regenerated (task-72).
 ///
-/// THIS IS A MECHANISM, NOT A POLICY DECISION. The daemon's default is - and stays -
-/// [`StoreRetention::RetainAll`], byte-for-byte the behaviour every wave-2a
-/// measurement was taken against. Choosing what a node should actually do (regenerate
-/// on demand vs a bounded evicting store) is TASK-61's decision and is deliberately
-/// NOT made here. What is provided here is the ability to RELEASE, without which the
-/// residency oracle below could only ever be reasoned about, never broken.
+/// TASK-61 HAS NOW MADE THE POLICY DECISION that task-65 deliberately left open:
+/// regenerate on demand, hold only the in-flight serve. That decision is expressed
+/// by [`StoreRetention::ReleaseAfterServe`], which the daemon uses whenever a
+/// [`NarSupplier`] is configured. [`StoreRetention::RetainAll`] remains the default
+/// of the bare [`IrohProvider::spawn`] constructor, because the in-process tests
+/// that seed a blob and fetch it are not modelling a node's supply policy.
 #[derive(Debug, Clone)]
 pub enum StoreRetention {
-    /// Hold every seeded blob for the life of the process (the daemon's behaviour).
+    /// Hold every seeded blob for the life of the process. No collector runs at
+    /// all, so nothing can be released.
     RetainAll,
     /// Hold everything until [`IrohProvider::release_all`] is called, then let
     /// iroh-blobs' own garbage collector sweep ONCE, within `sweep_interval`.
@@ -273,7 +860,35 @@ pub enum StoreRetention {
     /// needs that race solved before it is a policy option at all - a lesson
     /// forward-carried to TASK-61.
     ReleaseOnRequest { sweep_interval: Duration },
+    /// THE TASK-61 SUPPLY MODEL: hold a blob only while a serve of it is in
+    /// flight, then let it go. A node under this retention holds nothing at rest -
+    /// its store residency returns to zero after an idle period, whatever it
+    /// announces.
+    ///
+    /// HOW THE TASK-65 COLLECTOR RACE IS SOLVED, since that warning said a
+    /// background evictor was not a policy option until it was. Two rules, and
+    /// together they make a lost blob impossible rather than merely unlikely:
+    ///
+    ///   1. A sweep is ARMED only when the last in-flight serve finishes, and the
+    ///      `ProtectCb` REFUSES (`Abort`, re-arming for the next tick) if anything
+    ///      is in flight when it runs. So a sweep only ever begins from quiescence.
+    ///   2. An admission inserts its hash into the in-flight table BEFORE it calls
+    ///      `add_bytes`. `iroh_blobs::store::gc::run_gc` is ONE SEQUENTIAL LOOP
+    ///      (`cb().await` then `gc_run_once().await`), so at most ONE sweep can be
+    ///      between "callback returned" and "sweep finished" at any instant. A blob
+    ///      added in that window can be collected exactly once; the retry cannot
+    ///      lose, because by then the table is non-empty and every subsequent
+    ///      callback aborts. That is why [`MATERIALISE_ATTEMPTS`] is 2 and not "a
+    ///      few" - the bound is a proof, not a hope.
+    ReleaseAfterServe { sweep_interval: Duration },
 }
+
+/// How many times a materialisation may re-add a blob the collector took from
+/// under it. TWO, and the reason it is exactly two is the sequential-`run_gc`
+/// argument on [`StoreRetention::ReleaseAfterServe`]. A third attempt would be
+/// unreachable; making it configurable would invite someone to "fix" a race by
+/// raising it.
+const MATERIALISE_ATTEMPTS: usize = 2;
 
 /// What the blob store currently HOLDS, asked of the store itself (task-65).
 ///
@@ -323,9 +938,10 @@ pub struct IrohProvider {
     router: Router,
     /// Per-transfer serve windows on this provider's own clock (see [`ServeWindow`]).
     serve_windows: Arc<Mutex<Vec<ServeWindow>>>,
-    /// One-shot arming flag for [`StoreRetention::ReleaseOnRequest`]. `None` under
-    /// [`StoreRetention::RetainAll`], where nothing sweeps.
-    gc_armed: Option<Arc<AtomicBool>>,
+    /// The task-72 admission gate: the serve budget, the on-demand supplier, and
+    /// what is in flight right now. Shared with the request-intercept task and with
+    /// the collector's protect callback.
+    gate: Arc<ServeGate>,
     /// Total DECLARED size of the whole-blob transfers this provider has COMPLETED,
     /// observed from iroh-blobs' own provider events (never a client self-report).
     /// This is the S6 ground-truth oracle: node A's daemon claiming it "fetched from
@@ -347,51 +963,115 @@ impl IrohProvider {
     /// discovery, and start serving its (initially empty) blob store under the
     /// iroh-blobs ALPN. Seed blobs with [`Self::seed`].
     ///
-    /// Retention is [`StoreRetention::RetainAll`] - the daemon's behaviour, unchanged.
+    /// Retention is [`StoreRetention::RetainAll`] and there is NO on-demand
+    /// supplier: this is the "a test seeds a blob and fetches it" constructor, not
+    /// a node's supply policy. The serve budget is nevertheless the DEFAULT one and
+    /// not [`ServeBudget::unbounded`] - a provider that will serve anything at any
+    /// size has to be asked for explicitly (see [`Self::spawn_with`]).
     pub async fn spawn() -> Result<Self, IrohError> {
         Self::spawn_with_retention(StoreRetention::RetainAll).await
     }
 
-    /// [`Self::spawn`] with an explicit store [`StoreRetention`]. See that type for
-    /// why the non-default variant exists and why it is not a policy decision.
+    /// [`Self::spawn`] with an explicit store [`StoreRetention`], no supplier.
     pub async fn spawn_with_retention(retention: StoreRetention) -> Result<Self, IrohError> {
+        Self::spawn_with(retention, ServeBudget::default(), None).await
+    }
+
+    /// THE TASK-61 SUPPLY-MODEL CONSTRUCTOR: a provider that holds nothing at rest
+    /// and REGENERATES what a peer asks for, inside `budget`.
+    ///
+    /// This is what the daemon uses. `supplier` answers "can I produce this digest,
+    /// and how big is it" without producing anything, so the budget can refuse
+    /// before a byte is allocated.
+    pub async fn spawn_supplying(
+        supplier: Arc<dyn NarSupplier>,
+        budget: ServeBudget,
+        sweep_interval: Duration,
+    ) -> Result<Self, IrohError> {
+        Self::spawn_with(
+            StoreRetention::ReleaseAfterServe { sweep_interval },
+            budget,
+            Some(supplier),
+        )
+        .await
+    }
+
+    /// The one real constructor. Everything else is a named shorthand for a
+    /// (retention, budget, supplier) triple.
+    pub async fn spawn_with(
+        retention: StoreRetention,
+        budget: ServeBudget,
+        supplier: Option<Arc<dyn NarSupplier>>,
+    ) -> Result<Self, IrohError> {
         let endpoint = bind_loopback_endpoint().await?;
-        let (store, gc_armed) = match retention {
-            StoreRetention::RetainAll => (MemStore::new(), None),
-            StoreRetention::ReleaseOnRequest { sweep_interval } => {
-                let armed = Arc::new(AtomicBool::new(false));
-                let flag = armed.clone();
-                // The gc's own pre-mark hook, used as an ARMING GATE rather than to
-                // protect individual hashes: `Abort` skips the whole run, so no
-                // sweep can race a concurrent seed. `swap(false)` makes each
-                // `release_all` arm exactly ONE sweep, so content seeded after a
-                // release is not silently collected by the next tick.
+        let sweeps = !matches!(retention, StoreRetention::RetainAll);
+        let gate = Arc::new(ServeGate {
+            budget,
+            supplier,
+            inflight: Mutex::new(HashMap::new()),
+            gc_armed: sweeps.then(|| Arc::new(AtomicBool::new(false))),
+            admitted: AtomicU64::new(0),
+            regenerated: AtomicU64::new(0),
+            declined_too_large: AtomicU64::new(0),
+            declined_busy: AtomicU64::new(0),
+            declined_unknown: AtomicU64::new(0),
+            declined_supply_failed: AtomicU64::new(0),
+        });
+
+        let store = match retention {
+            StoreRetention::RetainAll => MemStore::new(),
+            StoreRetention::ReleaseOnRequest { sweep_interval }
+            | StoreRetention::ReleaseAfterServe { sweep_interval } => {
+                let gate_for_cb = gate.clone();
+                // The collector's pre-mark hook, used as an ARMING GATE rather than
+                // to protect individual hashes: `Abort` skips the WHOLE run, which
+                // is a stronger guarantee than protecting a hash set that a
+                // concurrent add is not yet in.
+                //
+                //   * not armed -> Abort. `swap(false)` makes each arming (a
+                //     `release_all`, or the last in-flight serve finishing) release
+                //     exactly ONE sweep, so content added after it is not silently
+                //     collected by the next tick.
+                //   * armed but something is in flight -> Abort, and RE-ARM. Not
+                //     dropping the arming matters: a release request that landed
+                //     while a serve was running must still happen, just later.
+                //     Measured upstream hazard (task-65): a free-running 50 ms
+                //     collector alongside 512 concurrent seeds ate 11 of them.
                 let add_protected: ProtectCb = Arc::new(move |_live| {
-                    let flag = flag.clone();
+                    let gate = gate_for_cb.clone();
                     Box::pin(async move {
-                        if flag.swap(false, Ordering::SeqCst) {
-                            ProtectOutcome::Continue
-                        } else {
-                            ProtectOutcome::Abort
+                        let Some(armed) = &gate.gc_armed else {
+                            return ProtectOutcome::Abort;
+                        };
+                        if !armed.swap(false, Ordering::SeqCst) {
+                            return ProtectOutcome::Abort;
                         }
+                        if !gate.inflight.lock().expect("inflight mutex").is_empty() {
+                            armed.store(true, Ordering::SeqCst);
+                            return ProtectOutcome::Abort;
+                        }
+                        ProtectOutcome::Continue
                     })
                 });
-                let store = MemStore::new_with_opts(MemStoreOptions {
+                MemStore::new_with_opts(MemStoreOptions {
                     gc_config: Some(GcConfig {
                         interval: sweep_interval,
                         add_protected: Some(add_protected),
                     }),
-                });
-                (store, Some(armed))
+                })
             }
         };
 
-        // Provider-side byte counter (the S6 ground-truth oracle). `NotifyLog`
-        // asks iroh-blobs for per-request transfer events on a NOTIFY channel -
-        // observe-only, no intercept to answer - so serving is never gated on us
-        // draining events, yet we see the exact bytes each get-transfer moves.
+        // `InterceptLog`, not `NotifyLog`: the provider now ANSWERS each
+        // get-request before it is served. That answer is the whole of task-72
+        // AC#1 - iroh-blobs blocks on our verdict (`rx.await??` in
+        // `provider::events::EventSender::request`) and only then reads the store
+        // (`handle_get` calls `get_request` before `handle_get_impl`), so both the
+        // size bound and the on-demand materialisation happen BEFORE any bytes
+        // exist. `Log` keeps the per-transfer updates the S6 byte oracle and the
+        // task-65 serve windows are built from.
         let mask = EventMask {
-            get: RequestMode::NotifyLog,
+            get: RequestMode::InterceptLog,
             ..EventMask::DEFAULT
         };
         let (events, mut rx) = EventSender::channel(64, mask);
@@ -408,17 +1088,40 @@ impl IrohProvider {
             let bytes_served = bytes_served.clone();
             let transfers_completed = transfers_completed.clone();
             let serve_windows = serve_windows.clone();
+            let gate = gate.clone();
+            let store = store.clone();
             tokio::spawn(async move {
                 // One outer message per get-request; each carries an update
-                // sub-stream (Started -> [Progress] -> Completed/Aborted). We sum
-                // the Started size of every transfer that reaches Completed.
+                // sub-stream (Started -> [Progress] -> Completed/Aborted).
                 while let Some(msg) = rx.recv().await {
-                    if let ProviderMessage::GetRequestReceivedNotify(msg) = msg {
+                    if let ProviderMessage::GetRequestReceived(msg) = msg {
                         let bytes_served = bytes_served.clone();
                         let transfers_completed = transfers_completed.clone();
                         let serve_windows = serve_windows.clone();
-                        let mut updates = msg.rx;
+                        let gate = gate.clone();
+                        let store = store.clone();
+                        // One task PER REQUEST. Admission can block for as long as a
+                        // `nix-store --dump` takes, and doing that on the receive
+                        // loop would make one large regeneration stall every other
+                        // peer's admission.
                         tokio::spawn(async move {
+                            let hash = msg.request.hash;
+                            let mut updates = msg.rx;
+                            let verdict = admit(&gate, &store, hash).await;
+                            if let Err(why) = verdict {
+                                gate.count_decline(why);
+                            }
+                            // ANSWER FIRST: iroh-blobs is blocked on this oneshot and
+                            // no update can arrive until it is sent.
+                            let answered = msg
+                                .tx
+                                .send(verdict.map_err(ServeDecline::abort_reason))
+                                .await;
+                            if verdict.is_err() || answered.is_err() {
+                                // Nothing was admitted (or the peer vanished before
+                                // we could say so), so there is nothing to release.
+                                return;
+                            }
                             let mut blob_size: u64 = 0;
                             let mut started_ms: Option<f64> = None;
                             while let Ok(Some(update)) = updates.recv().await {
@@ -455,6 +1158,11 @@ impl IrohProvider {
                                     _ => {}
                                 }
                             }
+                            // The update stream ended: the transfer is over, however
+                            // it ended. Release in ALL cases - an aborted or dropped
+                            // transfer that kept its reservation would leak the
+                            // budget and eventually decline every peer with `busy`.
+                            gate.release(hash);
                         });
                     }
                 }
@@ -472,10 +1180,15 @@ impl IrohProvider {
             store,
             router,
             serve_windows,
-            gc_armed,
+            gate,
             bytes_served,
             transfers_completed,
         })
+    }
+
+    /// What the admission gate has admitted, regenerated and declined so far.
+    pub fn serve_counters(&self) -> ServeCounters {
+        self.gate.counters()
     }
 
     /// Total raw-NAR bytes this provider has SERVED to clients over completed
@@ -545,8 +1258,10 @@ impl IrohProvider {
     /// instead of the store's state would answer "released" here and would have
     /// proven nothing.
     ///
-    /// This is NOT an eviction policy. TASK-61 owns deciding whether and when a node
-    /// should release what it serves; this is the primitive that decision would use.
+    /// This is the OPERATOR-DRIVEN release. The task-61 supply model's automatic
+    /// one is [`StoreRetention::ReleaseAfterServe`], which arms the same sweep when
+    /// the last in-flight serve finishes; this remains for a caller that wants to
+    /// drop everything now.
     pub async fn release_all(&self) -> Result<u64, IrohError> {
         let removed = self
             .store
@@ -556,7 +1271,7 @@ impl IrohProvider {
             .map_err(|e| IrohError::StoreQuery(format!("deleting tags: {e}")))?;
         // Arm AFTER untagging, so the armed sweep cannot run against a store whose
         // tags are still in place and conclude there is nothing to collect.
-        if let Some(armed) = &self.gc_armed {
+        if let Some(armed) = &self.gate.gc_armed {
             armed.store(true, Ordering::SeqCst);
         }
         Ok(removed)
@@ -564,8 +1279,19 @@ impl IrohProvider {
 
     /// Content-addressed "put": add the raw NAR bytes to the served store and
     /// return their [`Blake3Digest`] (the iroh-blobs blob hash, which equals our
-    /// frozen addressed unit). This is the honest holder path; the real index that
-    /// renders a node's NARs via `nix-store --dump` is task-50.
+    /// frozen addressed unit).
+    ///
+    /// THIS IS NOT THE SUPPLY MODEL. Task-61 decided a node regenerates on demand
+    /// and holds nothing at rest ([`Self::spawn_supplying`] + [`NarSupplier`]);
+    /// `seed` is the eager PUT that in-process tests use to put a known blob in
+    /// front of a fetch. Under [`StoreRetention::ReleaseAfterServe`] a blob seeded
+    /// this way is collectible once anything has been served, because it holds no
+    /// tag - which is correct for that retention and wrong for what a test usually
+    /// means, so pair `seed` with [`StoreRetention::RetainAll`].
+    ///
+    /// The `to_vec` here is the copy TASK-46 owns: the `&[u8]` signature forces it.
+    /// The supply path (`materialise`) takes its `Vec<u8>` by value and does not
+    /// pay it.
     pub async fn seed(&self, raw_nar: &[u8]) -> Result<Blake3Digest, IrohError> {
         let tag = self
             .store

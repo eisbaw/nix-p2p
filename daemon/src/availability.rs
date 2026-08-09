@@ -56,6 +56,15 @@
 //! caller retries rather than caching an error. The [`NarDumper`] seam lets a test
 //! count invocations and prove the "exactly once under N callers" bite.
 //!
+//! ## Supply (task-72): the index is also what a peer is SERVED from
+//!
+//! Answering "yes" used to be free of any obligation - the provider could only
+//! serve blobs that had been eagerly seeded into it, so a positive answer for one
+//! of 108k registered paths meant dial-then-fail. [`AvailabilityIndex::supply_size`]
+//! and [`AvailabilityIndex::supply_raw_nar`] close that: a yes now implies a
+//! regenerable NAR, because both are answered from the same registration through
+//! the same materialisation check. Both are per-digest probes; nothing lists.
+//!
 //! ## Honest limits (forward-carried)
 //!
 //!   * [`CommandNarDumper`] BUFFERS the whole `nix-store --dump` stream to apply the
@@ -67,12 +76,12 @@
 //!   * The index is synchronous and holds the entry lock across the (blocking) dump.
 //!     A caller on an async runtime should drive it via `spawn_blocking`. Making the
 //!     dump itself async is deferred with the streaming change.
-//!   * The `key -> store_path` binding is NOT verified at the source: `blake3_for`
+//!   * The `key -> store_path` binding is NOT verified at the source: `derive`
 //!     computes only the BLAKE3, never re-derives `sha256(dump)` to assert it equals
 //!     `key` (see [`AvailabilityIndex::register`]). Nix's gate 2 backstops it, but a
 //!     source-side check would make a mis-registration fail loud here. Forward-carried
 //!     (wants a sha256 pass over the NAR).
-//!   * SEEDING is external by design: producing a claim's `Iroh` offer does NOT put
+//!   * SEEDING (the eager kind) is external by design: producing a claim's `Iroh` offer does NOT put
 //!     the blob into this node's iroh-blobs store. task-39's [`crate::transport_iroh::IrohProvider::seed`]
 //!     is fed FROM this index (task-39/40/41 wire it); until then an announced offer
 //!     is data-complete but a peer cannot yet fetch it end-to-end. [`AnnounceSink::announce`]
@@ -395,14 +404,27 @@ impl AnnounceSink for NullAnnounce {
 // The index.
 // -------------------------------------------------------------------------
 
+/// What ONE `nix-store --dump` derived: the addressed unit AND the NarSize that
+/// produced it. They are kept together because they come from the same bytes in
+/// the same pass - deriving the size separately would be a second source of truth
+/// for one fact, and the unit would be the first thing to drift (NarSize, the
+/// uncompressed dump length, is not the compressed FileSize a narinfo carries).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DerivedNar {
+    /// The frozen addressed unit, `BLAKE3(RawNarV1)`.
+    pub blake3: Blake3Digest,
+    /// The exact length of the dump, in UNCOMPRESSED NAR bytes. NEVER a FileSize.
+    pub nar_size_uncompressed_nar: u64,
+}
+
 /// One registered holding: the store path (source of truth) and the single-flight
-/// cache of its derived addressed unit.
+/// cache of what its dump derives.
 struct Entry {
     store_path: StorePath,
-    /// The derived `BLAKE3(RawNarV1)`, computed UNDER this lock exactly once. The
+    /// The derived [`DerivedNar`], computed UNDER this lock exactly once. The
     /// lock IS the single-flight guard: concurrent callers block here while the
     /// first one dumps + hashes.
-    digest: Mutex<Option<Blake3Digest>>,
+    digest: Mutex<Option<DerivedNar>>,
 }
 
 /// A node's local availability index and claim producer. See the module docs.
@@ -419,6 +441,24 @@ pub struct AvailabilityIndex {
     /// mutation's disk write briefly serialises other mutations - an accepted
     /// latency-coupling limit for a small index (see the module-level honest limits).
     entries: Mutex<HashMap<NarHashKey, Arc<Entry>>>,
+    /// `Blake3Digest -> Entry`: the SUPPLY direction (task-72 AC#2). It is the
+    /// same entries, indexed the other way, and it is DERIVED - populated as a
+    /// side effect of computing a digest, never persisted, rebuilt on demand.
+    ///
+    /// WHY IT EXISTS AT ALL. Before task-72 the index could answer "do you hold
+    /// NarHash k?" for every registered path while the provider could only serve
+    /// what had been eagerly seeded - so a positive answer did not imply a
+    /// servable blob, and in deployment that is dial-then-fail. A peer fetches by
+    /// BLAKE3, so making the two sets equal means being able to go BACK from the
+    /// digest to the path. Nothing here can be listed: it is probed with a digest
+    /// the caller already has, exactly like [`AvailabilityIndex::hold`], so the
+    /// no-enumeration invariant is unchanged.
+    ///
+    /// STATED LIMIT (the task-61 seeding gap, filed as task-82): this map is
+    /// in-memory, so after a restart a digest is unsuppliable until some
+    /// hold-query re-derives it. Warming it at boot would mean re-dumping the
+    /// whole store.
+    by_digest: Mutex<HashMap<Blake3Digest, Arc<Entry>>>,
     dumper: Arc<dyn NarDumper>,
     store: Arc<dyn IndexStore>,
     announce: Arc<dyn AnnounceSink>,
@@ -447,6 +487,7 @@ impl AvailabilityIndex {
         Ok(AvailabilityIndex {
             node_id,
             entries: Mutex::new(entries),
+            by_digest: Mutex::new(HashMap::new()),
             dumper,
             store,
             announce,
@@ -464,7 +505,7 @@ impl AvailabilityIndex {
     /// carry is free: BLAKE3 is cheap-to-recompute derived state.)
     ///
     /// TRUST ASSUMPTION (fail-fast-at-source gap, deliberately deferred): this binds
-    /// `key -> store_path` on the CALLER's word. `blake3_for` later computes only the
+    /// `key -> store_path` on the CALLER's word. `derive` later computes only the
     /// BLAKE3 of the dump; it does NOT re-derive `sha256(dump)` and assert it equals
     /// `key`. So a mis-registration yields a well-formed but FALSE claim. It cannot
     /// cause a bad install - the Nix client re-verifies `sha256(nar) == NarHash`
@@ -524,11 +565,78 @@ impl AvailabilityIndex {
             return Ok(HoldAnswer::Absent);
         }
 
-        let blake3 = self.blake3_for(&entry)?;
+        let derived = self.derive(&entry)?;
+        // THE SUPPLY BINDING (task-72 AC#2). A positive hold-answer now also makes
+        // the content SERVABLE: the provider fetches by BLAKE3, and this is the
+        // only way back from that digest to the path it is regenerated from. The
+        // two sets - "what I answer yes about" and "what I can serve" - are made
+        // equal HERE, at the single place a yes is produced.
+        self.by_digest
+            .lock()
+            .expect("by-digest mutex")
+            .insert(derived.blake3, Arc::clone(&entry));
         Ok(HoldAnswer::Have {
-            blake3,
+            blake3: derived.blake3,
             offers: vec![self.iroh_offer()],
         })
+    }
+
+    /// The NarSize this node would produce for `blake3`, answered WITHOUT
+    /// producing it - the admission question a serve budget asks. `None` means
+    /// this node cannot supply it.
+    ///
+    /// The materialisation check is repeated here, not assumed from the cached
+    /// derivation: a path GC'd since the digest was computed must drop out of
+    /// SUPPLY at the same instant it drops out of [`Self::hold`], or the two sets
+    /// diverge again in the one direction that matters (we would promise a serve
+    /// we cannot perform).
+    pub fn supply_size(&self, blake3: &Blake3Digest) -> Option<u64> {
+        let entry = self.entry_for_digest(blake3)?;
+        if !entry.store_path.exists() {
+            return None;
+        }
+        entry
+            .digest
+            .lock()
+            .expect("digest mutex")
+            .map(|derived| derived.nar_size_uncompressed_nar)
+    }
+
+    /// Regenerate the exact `RawNarV1` bytes for `blake3` from the real store.
+    /// This is the task-61 supply model's producer: no copy is retained, the dump
+    /// happens now.
+    ///
+    /// FAILS LOUD on a mismatch. A store path that no longer dumps to the digest
+    /// it was announced under is not "close enough" - serving it would hand a peer
+    /// the wrong blob under the right name, and the caller must decline rather
+    /// than let iroh-blobs discover it mid-stream.
+    pub fn supply_raw_nar(&self, blake3: &Blake3Digest) -> Result<Vec<u8>, AvailabilityError> {
+        let entry = self.entry_for_digest(blake3).ok_or_else(|| {
+            AvailabilityError::Dump(DumpError(format!(
+                "no registered holding supplies {blake3}"
+            )))
+        })?;
+        let raw_nar = self.dumper.dump(&entry.store_path)?;
+        let actual = Blake3Digest::from_raw_nar(&raw_nar);
+        if actual != *blake3 {
+            return Err(AvailabilityError::Dump(DumpError(format!(
+                "{} now dumps to {actual}, not the announced {blake3}",
+                entry.store_path
+            ))));
+        }
+        Ok(raw_nar)
+    }
+
+    /// The reverse lookup, and the ONLY way into `by_digest`. Deliberately private
+    /// and deliberately per-digest: there is no method that yields the map, its
+    /// keys or its length, so the no-enumeration invariant survives the addition
+    /// of a supply path.
+    fn entry_for_digest(&self, blake3: &Blake3Digest) -> Option<Arc<Entry>> {
+        self.by_digest
+            .lock()
+            .expect("by-digest mutex")
+            .get(blake3)
+            .map(Arc::clone)
     }
 
     /// The versioned wire envelope for a [`HoldQuery`] probe: the same yes/no
@@ -617,17 +725,22 @@ impl AvailabilityIndex {
     /// uncomputed key block here and observe the cached `Some`; distinct keys use
     /// distinct locks and hash in parallel. A dump failure leaves the slot `None`
     /// so the next caller retries.
-    fn blake3_for(&self, entry: &Entry) -> Result<Blake3Digest, AvailabilityError> {
+    fn derive(&self, entry: &Entry) -> Result<DerivedNar, AvailabilityError> {
         let mut slot = entry.digest.lock().expect("digest mutex");
-        if let Some(digest) = *slot {
-            return Ok(digest);
+        if let Some(derived) = *slot {
+            return Ok(derived);
         }
         let raw_nar = self.dumper.dump(&entry.store_path)?;
         // The frozen recipe, applied in exactly one place: BLAKE3(RawNarV1), plain
-        // and unkeyed, over the uncompressed dump - matches the task-48 golden.
-        let digest = Blake3Digest::from_raw_nar(&raw_nar);
-        *slot = Some(digest);
-        Ok(digest)
+        // and unkeyed, over the uncompressed dump - matches the task-48 golden. The
+        // NarSize is read off the SAME buffer rather than stat'ed separately, so it
+        // cannot describe different bytes than the digest does.
+        let derived = DerivedNar {
+            blake3: Blake3Digest::from_raw_nar(&raw_nar),
+            nar_size_uncompressed_nar: raw_nar.len() as u64,
+        };
+        *slot = Some(derived);
+        Ok(derived)
     }
 
     /// This node's iroh transport offer (a pure locator: just the NodeId).

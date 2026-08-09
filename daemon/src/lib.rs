@@ -38,8 +38,8 @@ pub mod transport_iroh;
 pub mod upstream;
 
 pub use availability::{
-    AnnounceSink, AvailabilityError, AvailabilityIndex, CommandNarDumper, DumpError, IndexStore,
-    JsonFileStore, NarDumper, NullAnnounce, NullStore, PersistError, StorePath,
+    AnnounceSink, AvailabilityError, AvailabilityIndex, CommandNarDumper, DerivedNar, DumpError,
+    IndexStore, JsonFileStore, NarDumper, NullAnnounce, NullStore, PersistError, StorePath,
 };
 pub use cacheinfo::CacheInfo;
 pub use catalog::{CorrelationStore, NarCatalog, NarMeta, NullCorrelation};
@@ -72,7 +72,9 @@ pub use transport_fetch::{
     TransportTag, fetch_via_offers, verify_blake3,
 };
 pub use transport_iroh::{
-    BODY_IDLE_TIMEOUT, DIAL_TIMEOUT, FETCH_TIMEOUT, IrohError, IrohPeerAddr, IrohProvider,
-    IrohTransport, SafetyEnvelope, ServeWindow, StoreResidency, StoreRetention, iroh_blobs_alpn,
+    BODY_IDLE_TIMEOUT, DEFAULT_MAX_INFLIGHT_NAR_BYTES, DEFAULT_MAX_SERVE_NAR_BYTES, DIAL_TIMEOUT,
+    FETCH_TIMEOUT, FileNarSupplier, IndexNarSupplier, IrohError, IrohPeerAddr, IrohProvider,
+    IrohTransport, NarSupplier, SafetyEnvelope, ServeBudget, ServeCounters, ServeDecline,
+    ServeWindow, StoreResidency, StoreRetention, SupplyError, iroh_blobs_alpn,
 };
 pub use upstream::UpstreamHttp;

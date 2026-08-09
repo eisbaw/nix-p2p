@@ -16,11 +16,12 @@ use std::sync::Arc;
 use daemon::cacheinfo::DEFAULT_PRIORITY;
 use daemon::claim::CLAIM_SCHEMA_VERSION;
 use daemon::{
-    AllowlistRawServe, App, Blake3Digest, CacheInfo, Claim, CorrelationStore, FallbackNarSource,
-    InMemoryDiscovery, IrohPeerAddr, IrohProvider, IrohTransport, KnownPayload, KnownTransport,
-    NarCatalog, NarHashKey, NarSource, NarinfoDiskCache, NarinfoSource, NoRawServe, NodeId,
-    NullCorrelation, RawServeDecision, SystemClock, TransportNarSource, TransportRegistry,
-    UpstreamHttp, serve,
+    AllowlistRawServe, App, Blake3Digest, CacheInfo, Claim, CorrelationStore,
+    DEFAULT_MAX_INFLIGHT_NAR_BYTES, DEFAULT_MAX_SERVE_NAR_BYTES, FallbackNarSource,
+    FileNarSupplier, InMemoryDiscovery, IrohPeerAddr, IrohProvider, IrohTransport, KnownPayload,
+    KnownTransport, NarCatalog, NarHashKey, NarSource, NarinfoDiskCache, NarinfoSource, NoRawServe,
+    NodeId, NullCorrelation, RawServeDecision, ServeBudget, SystemClock, TransportNarSource,
+    TransportRegistry, UpstreamHttp, serve,
 };
 use tokio::net::TcpListener;
 
@@ -101,6 +102,23 @@ fn parse_claim_spec(raw: &str) -> Result<ClaimSpec, String> {
     })
 }
 
+/// Parse a byte/millisecond budget that must be POSITIVE.
+///
+/// Zero is rejected for the same reason `--header-timeout-ms 0` is: a zero serve
+/// budget declines every peer, and a zero sweep interval spins the collector - both
+/// are daemons that look healthy and do nothing. There is deliberately NO
+/// "unlimited" spelling: an operator who wants no practical bound writes a large
+/// number, and has then written the number they chose.
+fn parse_positive_u64(flag: &str, raw: &str) -> Result<u64, String> {
+    let value: u64 = raw
+        .parse()
+        .map_err(|e| format!("bad {flag} {raw:?}: {e}"))?;
+    if value == 0 {
+        return Err(format!("bad {flag} 0: must be positive"));
+    }
+    Ok(value)
+}
+
 /// Human- and machine-readable identity of this build.
 fn banner() -> String {
     format!("{} {}", env!("CARGO_PKG_NAME"), env!("CARGO_PKG_VERSION"))
@@ -132,10 +150,25 @@ struct Config {
     /// stays readiness-pollable and is a real peer). Off by default. The S6 harness
     /// sets it on node B only.
     iroh_provider: bool,
-    /// Raw-NAR files to seed into the iroh provider (node B). Each is served by its
-    /// `BLAKE3(RawNarV1)` content id, printed on startup so the harness can wire
-    /// node A's claim to it.
+    /// Raw-NAR files this node ANNOUNCES it can serve (node B). Each is served by
+    /// its `BLAKE3(RawNarV1)` content id, printed on startup so the harness can
+    /// wire node A's claim to it. Under the task-61 supply model the file is
+    /// stream-hashed once to learn that id and then NOT held: the bytes are
+    /// regenerated from the file when a peer asks.
     iroh_seed_nar: Vec<String>,
+    /// Largest single NAR this node agrees to serve, in UNCOMPRESSED NAR bytes
+    /// (NarSize - never the compressed FileSize). Above it a peer is DECLINED
+    /// rather than the node allocating. The bound exists because the daemon is
+    /// outside the trust base: without it any peer can pick the largest NAR we
+    /// announce and make us allocate it (task-72 gap 1).
+    iroh_max_serve_nar_bytes: u64,
+    /// Largest TOTAL across concurrently-admitted serves, same units. Bounds a
+    /// swarm of peers each asking for something individually acceptable.
+    iroh_max_inflight_nar_bytes: u64,
+    /// How often the provider's collector may reclaim what is no longer being
+    /// served, in milliseconds. It is the LATENCY of the release, not its
+    /// correctness: a sweep only runs from quiescence (see `StoreRetention`).
+    iroh_sweep_interval_ms: u64,
     /// Node A (client) mode: peer iroh addresses to dial (`NodeId -> sockets`), the
     /// discovery stand-in for the fetch layer (task-40's in-memory address book).
     iroh_peers: Vec<PeerSpec>,
@@ -158,6 +191,13 @@ impl Default for Config {
             header_timeout_ms: 1000,
             iroh_provider: false,
             iroh_seed_nar: Vec::new(),
+            iroh_max_serve_nar_bytes: DEFAULT_MAX_SERVE_NAR_BYTES,
+            iroh_max_inflight_nar_bytes: DEFAULT_MAX_INFLIGHT_NAR_BYTES,
+            // 500 ms: comfortably inside the profiler's 3 s post-transfer settle
+            // window, so an idle node's residency reading is the released one and
+            // not a race; and long enough that a burst of serves does not spend the
+            // process's time sweeping an empty store.
+            iroh_sweep_interval_ms: 500,
             iroh_peers: Vec::new(),
             p2p_claims: Vec::new(),
         }
@@ -215,6 +255,18 @@ impl Config {
                 }
                 "--iroh-provider" => config.iroh_provider = true,
                 "--iroh-seed-nar" => config.iroh_seed_nar.push(value()?),
+                "--iroh-max-serve-nar-bytes" => {
+                    config.iroh_max_serve_nar_bytes =
+                        parse_positive_u64("--iroh-max-serve-nar-bytes", &value()?)?;
+                }
+                "--iroh-max-inflight-nar-bytes" => {
+                    config.iroh_max_inflight_nar_bytes =
+                        parse_positive_u64("--iroh-max-inflight-nar-bytes", &value()?)?;
+                }
+                "--iroh-sweep-interval-ms" => {
+                    config.iroh_sweep_interval_ms =
+                        parse_positive_u64("--iroh-sweep-interval-ms", &value()?)?;
+                }
                 "--iroh-peer" => config.iroh_peers.push(parse_peer_spec(&value()?)?),
                 "--p2p-claim" => config.p2p_claims.push(parse_claim_spec(&value()?)?),
                 other => return Err(format!("unknown flag {other:?}")),
@@ -232,24 +284,64 @@ impl Config {
     }
 }
 
-/// Node B: spawn an iroh-blobs provider, seed each configured raw NAR, print its
-/// dialable identity + each blob's content id (machine-readable lines the harness
-/// parses), and start a monitor that logs the ground-truth served-bytes counter as
-/// it changes. Returns the provider so `main` keeps it (and its router) alive.
+/// Node B: spawn an iroh-blobs provider under the TASK-61 SUPPLY MODEL, ANNOUNCE
+/// each configured raw NAR without holding it, print the dialable identity + each
+/// blob's content id (machine-readable lines the harness parses), and start a
+/// monitor that logs the ground-truth served-bytes counter as it changes. Returns
+/// the provider so `main` keeps it (and its router) alive.
+///
+/// WHAT CHANGED IN TASK-72, and why the flag name still says "seed": the flag
+/// names raw-NAR FILES this node can serve, and it still does. What no longer
+/// happens is the eager `std::fs::read` + `provider.seed()` that put every one of
+/// them in RAM at startup and kept them there for the process lifetime. Announcing
+/// now costs one streamed BLAKE3 pass in 64 KiB slices; the bytes are produced
+/// only when a peer actually asks, inside the serve budget, and released after.
+/// The `IROH-SEED` line is byte-identical, so the harness contract is unchanged.
 async fn setup_iroh_provider(config: &Config) -> Result<Arc<IrohProvider>, String> {
-    let provider = IrohProvider::spawn().await.map_err(|e| e.to_string())?;
+    let supplier = Arc::new(FileNarSupplier::new());
+    let budget = ServeBudget {
+        max_nar_bytes_uncompressed_nar: config.iroh_max_serve_nar_bytes,
+        max_inflight_bytes_uncompressed_nar: config.iroh_max_inflight_nar_bytes,
+    };
+    let provider = IrohProvider::spawn_supplying(
+        supplier.clone(),
+        budget,
+        std::time::Duration::from_millis(config.iroh_sweep_interval_ms),
+    )
+    .await
+    .map_err(|e| e.to_string())?;
 
     for path in &config.iroh_seed_nar {
-        let bytes = std::fs::read(path).map_err(|e| format!("reading seed NAR {path:?}: {e}"))?;
-        let blake3 = provider.seed(&bytes).await.map_err(|e| e.to_string())?;
+        // Fails fast at STARTUP: a raw NAR we cannot read is a configuration error,
+        // not a node that quietly announces nothing and dial-then-fails later.
+        let (blake3, nar_bytes) = supplier
+            .announce(path)
+            .map_err(|e| format!("announcing raw NAR {path:?}: {e}"))?;
+        // Announcing something the budget would refuse to serve is exactly the
+        // "index promises what the provider cannot deliver" defect task-72 exists
+        // to remove - in a different disguise. Refuse at startup, naming both
+        // numbers, rather than shipping a claim that is dead on arrival.
+        if nar_bytes > budget.max_nar_bytes_uncompressed_nar {
+            return Err(format!(
+                "raw NAR {path:?} is {nar_bytes} B (uncompressed NAR) but \
+                 --iroh-max-serve-nar-bytes is {}: announcing it would publish a \
+                 claim this node would then decline to serve",
+                budget.max_nar_bytes_uncompressed_nar
+            ));
+        }
         // Machine-readable: the harness maps path -> NarHash and builds node A's
         // --p2p-claim <narhash>=<this blake3>@<this node_id>.
         println!(
-            "IROH-SEED path={path} bytes={} blake3={}",
-            bytes.len(),
+            "IROH-SEED path={path} bytes={nar_bytes} blake3={}",
             blake3.to_hex()
         );
     }
+    println!(
+        "IROH-SERVE-BUDGET max_nar_bytes_uncompressed_nar={} max_inflight_bytes_uncompressed_nar={} sweep_interval_ms={}",
+        budget.max_nar_bytes_uncompressed_nar,
+        budget.max_inflight_bytes_uncompressed_nar,
+        config.iroh_sweep_interval_ms
+    );
 
     let sockets = provider.socket_addrs();
     if sockets.is_empty() {
@@ -288,6 +380,7 @@ async fn setup_iroh_provider(config: &Config) -> Result<Arc<IrohProvider>, Strin
             let mut last = 0u64;
             let mut windows_logged = 0usize;
             let mut last_residency: Option<daemon::StoreResidency> = None;
+            let mut last_counters: Option<daemon::ServeCounters> = None;
             loop {
                 tokio::time::sleep(std::time::Duration::from_millis(200)).await;
                 let served = provider.bytes_served();
@@ -320,6 +413,26 @@ async fn setup_iroh_provider(config: &Config) -> Result<Arc<IrohProvider>, Strin
                         }
                     }
                     Err(err) => eprintln!("IROH-STORE-RESIDENT-ERROR {err}"),
+                }
+                // The ADMISSION GATE's own story (task-72). A node that is
+                // declining peers must say so and say WHY: "declined 12" is not
+                // actionable, "declined 12 over the per-NAR bound" is. Logged only
+                // when it moves, like the byte counter above.
+                let counters = provider.serve_counters();
+                if last_counters != Some(counters) {
+                    last_counters = Some(counters);
+                    println!(
+                        "IROH-SERVE-COUNTERS admitted={} regenerated={} declined={} \
+                         declined_too_large={} declined_busy={} declined_unknown={} \
+                         declined_supply_failed={}",
+                        counters.admitted,
+                        counters.regenerated,
+                        counters.declined(),
+                        counters.declined_too_large,
+                        counters.declined_busy,
+                        counters.declined_unknown,
+                        counters.declined_supply_failed,
+                    );
                 }
             }
         });

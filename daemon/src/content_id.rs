@@ -95,6 +95,13 @@ pub const BLAKE3_PREFIX: &str = "blake3:";
 /// empty-input vector.
 pub const BLAKE3_DOMAIN_SEPARATION: Option<&[u8]> = None;
 
+/// Slice size [`Blake3Digest::stream_raw_nar`] consumes its input in, and hence
+/// its peak allocation regardless of NAR size. NOT frozen and NOT interop-visible:
+/// BLAKE3 is a streaming hash, so any chunking yields the identical digest. 64 KiB
+/// is a page-multiple read that keeps syscalls off the hot path without making the
+/// buffer itself a memory question.
+pub const STREAM_CHUNK_BYTES: usize = 64 * 1024;
+
 /// `BLAKE3(RawNarV1)` - the universal, transport-independent content identity of a
 /// raw (uncompressed) NAR. This is the byte a peer is asked for on any transport.
 ///
@@ -117,6 +124,42 @@ impl Blake3Digest {
              splits the network and diverges from the iroh-blobs blob hash"
         );
         Blake3Digest(*blake3::hash(raw_nar).as_bytes())
+    }
+
+    /// The SAME frozen recipe, applied to a `RawNarV1` byte STREAM in bounded
+    /// memory. Returns the digest and the exact number of bytes consumed (its
+    /// NarSize, uncompressed - never a FileSize).
+    ///
+    /// It exists because of the task-61 supply decision: a node must be able to
+    /// ANNOUNCE what it can serve without HOLDING it. Announcing needs the digest,
+    /// the digest needs every byte, but nothing needs every byte AT ONCE - so the
+    /// input is consumed in [`STREAM_CHUNK_BYTES`] slices and the peak allocation
+    /// is that chunk, whatever the NAR's size. Reading a 3186 MiB NAR to announce
+    /// it costs 64 KiB here; `from_raw_nar` on the same NAR costs 3186 MiB.
+    ///
+    /// It is deliberately in THIS module and not at the call site: the recipe is
+    /// frozen and has exactly one home. BLAKE3 is a streaming hash, so the two
+    /// constructors agree byte-for-byte by construction - and the unit test
+    /// `streaming_recipe_equals_the_one_shot_recipe` asserts it over sizes that
+    /// straddle the chunk boundary rather than trusting that sentence.
+    pub fn stream_raw_nar<R: std::io::Read>(mut raw_nar: R) -> std::io::Result<(Self, u64)> {
+        debug_assert!(
+            BLAKE3_DOMAIN_SEPARATION.is_none(),
+            "the frozen recipe is plain unkeyed BLAKE3; adding domain separation \
+             splits the network and diverges from the iroh-blobs blob hash"
+        );
+        let mut hasher = blake3::Hasher::new();
+        let mut chunk = vec![0u8; STREAM_CHUNK_BYTES];
+        let mut total: u64 = 0;
+        loop {
+            let read = raw_nar.read(&mut chunk)?;
+            if read == 0 {
+                break;
+            }
+            hasher.update(&chunk[..read]);
+            total += read as u64;
+        }
+        Ok((Blake3Digest(*hasher.finalize().as_bytes()), total))
     }
 
     /// Wrap a known 32-byte digest (e.g. one read from a claim on the wire, or a
@@ -226,6 +269,43 @@ mod tests {
         );
         // Domain separation is frozen OFF; the recipe above depends on it.
         assert!(BLAKE3_DOMAIN_SEPARATION.is_none());
+    }
+
+    #[test]
+    fn streaming_recipe_equals_the_one_shot_recipe() {
+        // The sizes that matter are the ones straddling the chunk boundary: a
+        // streaming hash that dropped or double-counted a partial final chunk
+        // would agree on the exact multiples and diverge everywhere else, so a
+        // test at one round size would not bite.
+        for len in [
+            0,
+            1,
+            STREAM_CHUNK_BYTES - 1,
+            STREAM_CHUNK_BYTES,
+            STREAM_CHUNK_BYTES + 1,
+            3 * STREAM_CHUNK_BYTES + 7,
+        ] {
+            // Not a constant byte: a hash fed the wrong ORDER of chunks would still
+            // match on a uniform buffer, which would make this test vacuous.
+            let bytes: Vec<u8> = (0..len).map(|i| (i % 251) as u8).collect();
+            let (streamed, consumed) =
+                Blake3Digest::stream_raw_nar(bytes.as_slice()).expect("a slice reader cannot fail");
+            assert_eq!(
+                streamed,
+                Blake3Digest::from_raw_nar(&bytes),
+                "the streaming and one-shot constructors are the SAME frozen recipe; \
+                 they diverged at len={len}"
+            );
+            assert_eq!(
+                consumed, len as u64,
+                "stream_raw_nar must report the exact NarSize it consumed"
+            );
+        }
+        // And it still lands on the published vector, so the freeze covers it too.
+        assert_eq!(
+            Blake3Digest::stream_raw_nar(b"".as_slice()).unwrap().0,
+            BLAKE3_EMPTY.parse::<Blake3Digest>().unwrap(),
+        );
     }
 
     #[test]
