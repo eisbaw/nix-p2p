@@ -176,13 +176,34 @@ fault × chain-depth matrix.** All fault modes are application-level
 podman cannot provide it and nothing here needs it ("unreachable" =
 stop the container).
 
-Narinfo byte-fidelity policy (wave 1): the daemon and its cache
-treat narinfo as **verbatim bytes** end to end — the transport-field
-rewrite allowlist exists in code and is **empty**; wave 2 (raw-NAR
-p2p) will populate it (`URL`/`Compression`/`FileHash`/`FileSize`
-only — never the signed fields). A property test asserts arbitrary
+Narinfo byte-fidelity policy: on the **normal (non-peer) path** the
+daemon and its cache treat narinfo as **verbatim bytes** end to end
+(`rewrite::apply` is the identity). A property test asserts arbitrary
 well-formed narinfos (unknown fields, odd ordering, multiple `Sig:`)
 pass through byte-identical, including across a daemon restart.
+
+**Transport-field rewrite (task-49, `rewrite::to_raw`):** on the
+**peer-served path** — gated by `RawServeDecision::will_serve_raw`,
+i.e. only when the daemon will serve this NarHash's RAW nar itself —
+the allowlist is now populated with exactly
+`{Compression, URL, FileHash, FileSize}` (the UNSIGNED transport
+fields) and nothing else. Those are rewritten to describe the raw nar
+(`Compression: none`, `URL -> nar/<NarHash>.nar`, `FileHash = NarHash`,
+`FileSize = NarSize`) while every SIGNED field (`StorePath`, `NarHash`,
+`NarSize`, `References`, `Deriver`, `CA`, `Sig`) stays **byte-identical**
+— the ed25519 fingerprint is untouched, so the client's signature and
+NarHash gates both pass. Unit tests pin the allowlist ∩ signed-fields =
+∅, the FileHash==NarHash / FileSize==NarSize invariants (the
+NarSize-vs-FileSize unit trap), and that the already-`none` form is a
+byte-for-byte fixed point. `scripts/check-rewrite-realnix.py` is the
+end-to-end oracle: **real nix** accepts the daemon's own rewrite (via
+`daemon rewrite-narinfo`) + the raw nar for none/xz/zstd, and **rejects**
+a one-char mutation of the signed `NarHash` (the bite proving signed
+fields must be preserved). The wave-1 binary wires `NoRawServe` (never
+rewrite); task-41 wires the availability-backed decision + a raw NAR
+source. **Peer-miss / mid-transfer:** a raw source that fails yields a
+fast clean **502**, so nix falls back to the next substituter / upstream
+(S2); the daemon never masks a short or corrupt transfer.
 
 ## Hardening: fault × depth, header hygiene, fuzz (task-13)
 

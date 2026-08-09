@@ -253,6 +253,8 @@ pub fn app_from_upstream(
         // request that misses the in-memory catalog takes the UpstreamPath
         // fallback, exactly as before task-8.
         correlation: Arc::new(NullCorrelation),
+        // The plain-upstream harness never serves raw, so narinfos relay verbatim.
+        raw_serve: Arc::new(daemon::NoRawServe),
     })
 }
 

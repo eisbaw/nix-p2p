@@ -85,11 +85,15 @@ independence: _toolchain
 # measure.py --self-test unit-tests the egress validator (classify_run) and the
 # provenance fail-closed path with synthetic inputs - no containers, so it runs in
 # the fast tier alongside the fixture gate.
-test: _toolchain _python fixtures
+test: build _python fixtures
     cargo test --locked --workspace
     "${NIX_P2P_PYTHON}/bin/python3" scripts/check-fixtures.py
     "${NIX_P2P_PYTHON}/bin/python3" scripts/check-golden-vectors.py
     "${NIX_P2P_PYTHON}/bin/python3" scripts/measure.py --self-test
+    # task-49: real nix accepts the daemon's rewritten narinfo + raw nar
+    # (none/xz/zstd) and rejects a signed-field mutation. Needs the `daemon`
+    # binary (hence the `build` dep) and the fast-tier fixtures.
+    "${NIX_P2P_PYTHON}/bin/python3" scripts/check-rewrite-realnix.py
 
 # Regenerate the signed fixture cache - fast tier (none/xz/zstd, <1 MiB).
 fixtures: _python

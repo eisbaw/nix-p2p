@@ -162,6 +162,7 @@ fn build_app(canned_nar: &[u8], seen: Arc<Mutex<Vec<SeenKey>>>) -> Arc<App> {
         catalog: Arc::new(NarCatalog::new()),
         upstream_label: "test-upstream".to_string(),
         correlation: Arc::new(daemon::NullCorrelation),
+        raw_serve: Arc::new(daemon::NoRawServe),
     })
 }
 

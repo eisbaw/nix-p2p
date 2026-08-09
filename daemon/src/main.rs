@@ -14,8 +14,8 @@ use std::sync::Arc;
 
 use daemon::cacheinfo::DEFAULT_PRIORITY;
 use daemon::{
-    App, CacheInfo, CorrelationStore, NarCatalog, NarinfoDiskCache, NarinfoSource, NullCorrelation,
-    SystemClock, UpstreamHttp, serve,
+    App, CacheInfo, CorrelationStore, NarCatalog, NarinfoDiskCache, NarinfoSource, NoRawServe,
+    NullCorrelation, SystemClock, UpstreamHttp, serve,
 };
 use tokio::net::TcpListener;
 
@@ -126,8 +126,43 @@ impl Config {
     }
 }
 
+/// The `rewrite-narinfo` filter subcommand: read a narinfo on stdin, apply the
+/// task-49 transport rewrite (`to_raw`), write the rewritten narinfo on stdout.
+/// Exits 0 on success, 3 on a `RewriteError` (an un-rewritable narinfo), 1 on an
+/// I/O error. It is the exact serving-layer rewrite as a pure filter, so an
+/// operator (and the real-nix e2e in scripts/) can see and verify precisely what
+/// the daemon would hand a client for a peer-served path.
+fn run_rewrite_narinfo_filter() -> ExitCode {
+    use std::io::{Read, Write};
+    let mut input = Vec::new();
+    if let Err(err) = std::io::stdin().read_to_end(&mut input) {
+        eprintln!("daemon rewrite-narinfo: reading stdin: {err}");
+        return ExitCode::FAILURE;
+    }
+    match daemon::to_raw(&input) {
+        Ok(rewrite) => {
+            if let Err(err) = std::io::stdout().write_all(&rewrite.body) {
+                eprintln!("daemon rewrite-narinfo: writing stdout: {err}");
+                return ExitCode::FAILURE;
+            }
+            ExitCode::SUCCESS
+        }
+        Err(err) => {
+            eprintln!("daemon rewrite-narinfo: {err}");
+            ExitCode::from(3)
+        }
+    }
+}
+
 #[tokio::main]
 async fn main() -> ExitCode {
+    // A tiny subcommand surface: `rewrite-narinfo` is a synchronous stdin->stdout
+    // filter, handled before any flag parsing or the async serve loop.
+    let mut raw_args = std::env::args().skip(1).peekable();
+    if raw_args.peek().map(String::as_str) == Some("rewrite-narinfo") {
+        return run_rewrite_narinfo_filter();
+    }
+
     let config = match Config::from_args(std::env::args().skip(1)) {
         Ok(config) => config,
         Err(err) => {
@@ -182,6 +217,10 @@ async fn main() -> ExitCode {
         catalog,
         upstream_label: config.upstream.clone(),
         correlation,
+        // Wave-1 binary never serves raw itself, so every narinfo is relayed
+        // verbatim and the client fetches the compressed upstream nar (S2). task-41
+        // wires an availability-backed RawServeDecision alongside a raw NAR source.
+        raw_serve: Arc::new(NoRawServe),
     });
 
     let listener = match TcpListener::bind(config.listen).await {

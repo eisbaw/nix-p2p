@@ -34,8 +34,8 @@ use crate::cacheinfo::CacheInfo;
 use crate::catalog::{CorrelationStore, NarCatalog, parse_correlation};
 use crate::rewrite;
 use crate::source::{
-    NarBody, NarKey, NarPathToken, NarSource, NarinfoSource, RawUpstream, SourceError, StoreHash,
-    UpstreamResponse,
+    NarBody, NarHash, NarKey, NarPathToken, NarSource, NarinfoSource, RawUpstream, SourceError,
+    StoreHash, UpstreamResponse,
 };
 
 /// Everything a request needs, injected so tests can swap any source for a fake.
@@ -61,6 +61,14 @@ pub struct App {
     /// `SignedNarHash` (task-8; task-4's deferred steady-state). Defaults to
     /// [`crate::catalog::NullCorrelation`] when no cache is wired.
     pub correlation: Arc<dyn CorrelationStore>,
+    /// Decides, per NarHash, whether the daemon will serve the RAW nar itself and
+    /// therefore rewrite the narinfo's transport fields to raw (task-49). MUST be
+    /// coupled with a raw-capable `nar` source: a `true` here without one hands the
+    /// client a raw narinfo the daemon cannot back. The wave-1 binary wires
+    /// [`crate::rewrite::NoRawServe`] (never rewrite -> verbatim upstream narinfo +
+    /// compressed nar, the S2 path); task-41 wires the availability-backed decision
+    /// alongside a raw NAR source.
+    pub raw_serve: Arc<dyn rewrite::RawServeDecision>,
 }
 
 /// Serve on an already-bound listener until it errors. Binding is the caller's
@@ -132,7 +140,13 @@ async fn handle(req: Request<Incoming>, app: Arc<App>) -> Response<NarBody> {
     match classify(&path) {
         Route::CacheInfo => respond_cache_info(&app.cache_info, is_head),
         Route::Narinfo(hash) => {
-            respond_narinfo(app.narinfo.fetch(&hash).await, &app.catalog, is_head).await
+            respond_narinfo(
+                app.narinfo.fetch(&hash).await,
+                &app.catalog,
+                app.raw_serve.as_ref(),
+                is_head,
+            )
+            .await
         }
         Route::Nar(token) => {
             // Correlate: if the daemon saw this NAR's narinfo, carry the SIGNED
@@ -190,14 +204,16 @@ fn respond_cache_info(info: &CacheInfo, is_head: bool) -> Response<NarBody> {
 /// Narinfo: buffered so the (empty, wave-1) rewrite allowlist runs and
 /// byte-fidelity is guaranteed. Non-200 statuses forward verbatim (AC#4).
 ///
-/// This is also where correlation happens: on a 200 we learn the
-/// `url-token -> (signed NarHash, NarSize)` mapping from the narinfo body and
-/// record it in the catalog, so the NAR request that follows carries the signed
-/// hash across the seam. Recording is done on the ORIGINAL upstream bytes,
-/// before the (wave-1 identity) rewrite.
+/// This is also where correlation and the task-49 transport rewrite happen: on a
+/// 200 we learn the `url-token -> (signed NarHash, NarSize)` mapping from the
+/// narinfo body and, if `raw_serve` says the daemon will serve this NarHash's RAW
+/// nar, rewrite the UNSIGNED transport fields to describe that raw nar and
+/// correlate the REWRITTEN token. Otherwise the upstream narinfo is served
+/// verbatim (the S2 path) and the original token is correlated.
 async fn respond_narinfo(
     result: Result<UpstreamResponse, SourceError>,
     catalog: &NarCatalog,
+    raw_serve: &dyn rewrite::RawServeDecision,
     is_head: bool,
 ) -> Response<NarBody> {
     let resp = match result {
@@ -236,15 +252,52 @@ async fn respond_narinfo(
         }
     };
 
-    // Learn the token -> signed-NarHash correlation. A malformed narinfo (any
-    // missing field) is simply not recorded, so its NAR request falls back to
-    // UpstreamPath - safe, never a hard failure.
-    if let Some((token, nar_hash, nar_size)) = parse_correlation(&bytes) {
-        catalog.record(token, nar_hash, nar_size);
-    }
-    // Wave 1: the allowlist is empty, so this is byte-identical - unknown
-    // fields, odd ordering and multiple Sig lines all survive (AC#3).
-    let out_bytes = rewrite::apply(&bytes).into_owned();
+    // Learn the token -> signed-NarHash correlation, and decide whether to rewrite
+    // the narinfo's transport fields to describe the RAW nar (task-49). A malformed
+    // narinfo yields no correlation, is never rewritten, and its NAR request falls
+    // back to UpstreamPath - safe, never a hard failure. The rewrite decision is
+    // keyed on the SIGNED NarHash the correlation carries.
+    let correlation = parse_correlation(&bytes);
+    let rewrite_to_raw = correlation
+        .as_ref()
+        .is_some_and(|(_, nar_hash, _)| raw_serve.will_serve_raw(nar_hash.as_str()));
+
+    let (out_bytes, rewrote) = if rewrite_to_raw {
+        match rewrite::to_raw(&bytes) {
+            Ok(rw) => {
+                // Correlate the REWRITTEN URL token (what the client requests next)
+                // back to the signed NarHash, so GET /nar/<token> dispatches
+                // SignedNarHash to the raw NAR source rather than 404 on a stale
+                // compressed token. FileHash == NarHash and FileSize == NarSize by
+                // construction (Compression: none), so the client's transport gate
+                // passes against the raw bytes and its NarHash gate passes unchanged.
+                catalog.record(
+                    NarPathToken::new(rw.url_token),
+                    NarHash::new(rw.nar_hash),
+                    rw.nar_size,
+                );
+                (rw.body, true)
+            }
+            Err(err) => {
+                // Fail SAFE, never half-rewritten: a narinfo will_serve_raw accepted
+                // but to_raw could not rewrite is served VERBATIM. Record NO
+                // correlation, so the follow-up NAR request takes the UpstreamPath
+                // fallback and fetches the actual COMPRESSED bytes this verbatim
+                // narinfo describes - never a rewritten token that a raw-only source
+                // would mis-serve as raw under a Compression: xz narinfo. Should not
+                // occur for a well-formed cache narinfo, so it is logged.
+                eprintln!("daemon: narinfo rewrite-to-raw skipped ({err}); serving verbatim");
+                (rewrite::apply(&bytes).into_owned(), false)
+            }
+        }
+    } else {
+        // Normal (non-peer) path: byte-identical passthrough - unknown fields, odd
+        // ordering and multiple Sig lines all survive (AC#3).
+        if let Some((token, nar_hash, nar_size)) = correlation {
+            catalog.record(token, nar_hash, nar_size);
+        }
+        (rewrite::apply(&bytes).into_owned(), false)
+    };
     let len = out_bytes.len();
 
     let builder = Response::builder().status(StatusCode::OK);
@@ -256,6 +309,15 @@ async fn respond_narinfo(
         })
         .expect("narinfo response is well-formed");
     forward_headers(response.headers_mut(), &headers);
+    if rewrote {
+        // The emitted body differs from upstream, so upstream validators no longer
+        // describe it. Drop them rather than forward an ETag/Last-Modified for bytes
+        // we did not send - byte-fidelity at the fidelity layer. nix verifies via
+        // Sig/NarHash, not these, so nothing depends on them.
+        let map = response.headers_mut();
+        map.remove(http::header::ETAG);
+        map.remove(http::header::LAST_MODIFIED);
+    }
     // Content-Length must match the bytes we actually emit.
     let map = response.headers_mut();
     map.remove(http::header::CONTENT_LENGTH);

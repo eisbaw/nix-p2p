@@ -53,6 +53,7 @@ pub use content_id::{
     BLAKE3_DIGEST_LEN, BLAKE3_DOMAIN_SEPARATION, BLAKE3_PREFIX, Blake3Digest, DigestParseError,
 };
 pub use narinfo_cache::{Clock, NarinfoDiskCache, SystemClock};
+pub use rewrite::{NoRawServe, RawRewrite, RawServeDecision, RewriteError, to_raw};
 pub use server::{App, serve};
 pub use source::{
     NarBody, NarHash, NarKey, NarPathToken, NarSource, NarinfoSource, RawUpstream, SourceError,
