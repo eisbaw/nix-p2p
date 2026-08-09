@@ -58,7 +58,9 @@ pub use discovery::{
     PROBE_TIMEOUT, PeerQuery, PeerQueryError,
 };
 pub use narinfo_cache::{Clock, NarinfoDiskCache, SystemClock};
-pub use rewrite::{NoRawServe, RawRewrite, RawServeDecision, RewriteError, to_raw};
+pub use rewrite::{
+    AllowlistRawServe, NoRawServe, RawRewrite, RawServeDecision, RewriteError, to_raw,
+};
 pub use server::{App, serve};
 pub use source::{
     NarBody, NarHash, NarKey, NarPathToken, NarSource, NarinfoSource, RawUpstream, SourceError,

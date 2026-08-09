@@ -45,7 +45,9 @@ import argparse
 import base64
 import contextlib
 import json
+import lzma
 import os
+import re
 import shutil
 import socket
 import statistics
@@ -271,6 +273,59 @@ def build_tamper_tree(fixtures: Fixtures, scratch: Path, kind: str) -> Path:
     return cache
 
 
+@dataclass
+class P2pSeed:
+    """One raw NAR node B will seed into its iroh provider, plus the NarHash it
+    backs. `filename` is the file's in-mount name (/srv/seed/<filename>);
+    `nar_hash` is the full `sha256:<base32>` the narinfo carries; `nar_size` is the
+    uncompressed byte length node B's provider counter should report per serve."""
+
+    filename: str
+    nar_hash: str
+    nar_size: int
+    store_path: str
+
+
+def build_p2p_seed_dir(
+    fixtures: Fixtures, scratch: Path, attrs: list[str]
+) -> tuple[Path, list[P2pSeed]]:
+    """Materialise the RAW (uncompressed) NAR for each `attr` into a fresh scratch
+    dir node B mounts and seeds. Already-raw NARs are copied; xz NARs are
+    decompressed with stdlib `lzma` - so an `xz` fixture exercises the task-49
+    compressed->raw narinfo rewrite while node B still serves the raw bytes whose
+    sha256 is the signed NarHash (Nix's gate 2 re-checks that on the client, so a
+    wrong decompression fails LOUD rather than silently). zstd is unsupported here
+    (no stdlib codec); pick raw/xz attrs for S6.
+    """
+    seed_dir = scratch / "seed"
+    seed_dir.mkdir(parents=True)
+    seeds: list[P2pSeed] = []
+    for attr in attrs:
+        entry = fixtures.entry(attr)
+        url = entry["url"]  # nar/<f>.nar[.xz|.zst]
+        src = fixtures.cache / url
+        nar_hash = entry["nar_hash"]  # sha256:<base32>
+        digest = nar_hash.split(":", 1)[1]
+        filename = f"{digest}.nar"
+        dst = seed_dir / filename
+        if url.endswith(".nar"):
+            shutil.copy2(src, dst)
+        elif url.endswith(".nar.xz"):
+            dst.write_bytes(lzma.decompress(src.read_bytes()))
+        else:
+            die(f"build_p2p_seed_dir: no stdlib raw-NAR codec for {url!r} (use raw/xz)")
+        actual = dst.stat().st_size
+        if actual != entry["nar_size"]:
+            die(
+                f"raw NAR for {attr} is {actual} B but manifest NarSize is "
+                f"{entry['nar_size']} B (decompression produced wrong bytes)"
+            )
+        seeds.append(
+            P2pSeed(filename, nar_hash, entry["nar_size"], entry["store_path"])
+        )
+    return seed_dir, seeds
+
+
 def build_corrupt_nar_tree(fixtures: Fixtures, scratch: Path) -> Path:
     """Build a key-free scratch cache serving `lib` with a PRISTINE, validly
     signed narinfo but a NAR whose content bytes are corrupted - so only the
@@ -362,10 +417,30 @@ class Pod:
         expect,
         daemon_extra_args: tuple[str, ...] = (),
         daemon_chain: int = 0,
+        p2p_seed_dir: Path | None = None,
+        p2p_seeds: tuple[P2pSeed, ...] = (),
+        p2p_claim_overrides: dict[str, str] | None = None,
     ):
         self.ctx = ctx
         self.pod = f"{POD_PREFIX}-{name}"
         self.served_cache = served_cache
+        # p2p (task-41, S6): a TWO-NODE topology - node B runs an iroh provider
+        # seeded from `p2p_seed_dir`, node A is wired to fetch those NARs from B
+        # over iroh. Mutually exclusive with the single-daemon / chain paths. The
+        # two nodes share the pod's loopback netns, so node A dials node B's iroh
+        # endpoint on 127.0.0.1 (verified this crosses the container sandbox netns).
+        self.p2p = bool(p2p_seeds)
+        self.p2p_seed_dir = p2p_seed_dir
+        self.p2p_seeds = tuple(p2p_seeds)
+        # Optional per-NarHash blake3 override (the corruption bite): serve a claim
+        # whose content id points at a DIFFERENT seeded file, so node A fetches a
+        # valid-but-wrong NAR that passes the transport gate yet fails Nix's
+        # sha256==NarHash gate. Maps nar_hash -> the filename whose blake3 to use.
+        self.p2p_claim_overrides = dict(p2p_claim_overrides or {})
+        # Parsed once node B announces (node_id, sockets); oracles read it.
+        self.iroh_identity: tuple[str, str] | None = None
+        if self.p2p and (with_daemon or daemon_chain):
+            die("Pod: p2p is mutually exclusive with with_daemon / daemon_chain")
         # `daemon_chain=N` (task-11) runs N product daemons in series:
         # client -> daemon-1 -> ... -> daemon-N -> testproxy. It is mutually
         # exclusive with the single-daemon `with_daemon` path so the 15 existing
@@ -406,6 +481,11 @@ class Pod:
         """The daemon container roles this pod runs, in chain order (the FIRST
         is the chain head the client substitutes against). One "daemon" for the
         single-daemon path; "daemon-1".."daemon-N" for a `daemon_chain=N` pod."""
+        if self.p2p:
+            # node-a (index 0 -> DAEMON_PORT, the client's substituter) first so
+            # the generic publish/await loops map it to the standard daemon ports;
+            # node-b (index 1 -> DAEMON_PORT+1) is the iroh provider.
+            return ["node-a", "node-b"]
         if self.daemon_chain:
             return [f"daemon-{i}" for i in range(1, self.daemon_chain + 1)]
         if self.with_daemon:
@@ -542,34 +622,157 @@ class Pod:
         # cache boundary (the only route from client to testproxy) - which is
         # exactly why the testproxy request count at depth-N proves the whole
         # chain carried the payload, no hop skipped.
-        roles = self._daemon_roles()
-        for i, role in enumerate(roles):
-            in_port = DAEMON_PORT + i
-            if i + 1 < len(roles):
-                upstream = f"http://127.0.0.1:{DAEMON_PORT + i + 1}"
-            else:
-                upstream = f"http://127.0.0.1:{PROXY_PORT}"
-            run(
-                [
-                    self._pm,
-                    "run",
-                    "-d",
-                    "--pod",
-                    self.pod,
-                    "--name",
-                    self._c(role),
-                    "--label",
-                    PROJECT_LABEL,
-                    self.ctx.image,
-                    "/bin/daemon",
-                    "--listen",
-                    f"0.0.0.0:{in_port}",
-                    "--upstream",
-                    upstream,
-                    *self.daemon_extra_args,
-                ]
-            )
+        if self.p2p:
+            self._create_p2p()
+        else:
+            roles = self._daemon_roles()
+            for i, role in enumerate(roles):
+                in_port = DAEMON_PORT + i
+                if i + 1 < len(roles):
+                    upstream = f"http://127.0.0.1:{DAEMON_PORT + i + 1}"
+                else:
+                    upstream = f"http://127.0.0.1:{PROXY_PORT}"
+                run(
+                    [
+                        self._pm,
+                        "run",
+                        "-d",
+                        "--pod",
+                        self.pod,
+                        "--name",
+                        self._c(role),
+                        "--label",
+                        PROJECT_LABEL,
+                        self.ctx.image,
+                        "/bin/daemon",
+                        "--listen",
+                        f"0.0.0.0:{in_port}",
+                        "--upstream",
+                        upstream,
+                        *self.daemon_extra_args,
+                    ]
+                )
         self._await_ready()
+
+    def _create_p2p(self) -> None:
+        """Two-phase p2p bring-up (S6): start node B (iroh provider, seeded), read
+        its announced iroh identity + per-blob content ids from its log, then start
+        node A wired to fetch those NarHashes from B over iroh. Node A can only be
+        configured AFTER B announces, so this cannot use the single-shot loop."""
+        node_a_port = DAEMON_PORT  # index 0: the client's substituter target
+        node_b_port = DAEMON_PORT + 1  # index 1
+        proxy = f"http://127.0.0.1:{PROXY_PORT}"
+
+        # -- node B: provider + HTTP daemon, seeded with each raw NAR --
+        seed_args: list[str] = []
+        for seed in self.p2p_seeds:
+            seed_args += ["--iroh-seed-nar", f"/srv/seed/{seed.filename}"]
+        if self.p2p_seed_dir is None:
+            die("Pod: p2p_seeds given without p2p_seed_dir")
+        run(
+            [
+                self._pm,
+                "run",
+                "-d",
+                "--pod",
+                self.pod,
+                "--name",
+                self._c("node-b"),
+                "--label",
+                PROJECT_LABEL,
+                "--volume",
+                f"{self.p2p_seed_dir}:/srv/seed:ro",
+                self.ctx.image,
+                "/bin/daemon",
+                "--listen",
+                f"0.0.0.0:{node_b_port}",
+                "--upstream",
+                proxy,
+                "--iroh-provider",
+                *seed_args,
+            ]
+        )
+        node_id, sockets, blake3_by_path = self._await_iroh_identity(
+            "node-b", len(self.p2p_seeds)
+        )
+        self.iroh_identity = (node_id, sockets)
+
+        # -- node A: iroh client wired to B's identity + one claim per seed --
+        claim_args: list[str] = []
+        for seed in self.p2p_seeds:
+            # The corruption bite points a NarHash at a DIFFERENT file's blake3.
+            src_file = self.p2p_claim_overrides.get(seed.nar_hash, seed.filename)
+            blake3 = blake3_by_path.get(f"/srv/seed/{src_file}")
+            if blake3 is None:
+                self._dump_logs()
+                die(f"node B never announced a blake3 for /srv/seed/{src_file}")
+            claim_args += ["--p2p-claim", f"{seed.nar_hash}={blake3}@{node_id}"]
+        run(
+            [
+                self._pm,
+                "run",
+                "-d",
+                "--pod",
+                self.pod,
+                "--name",
+                self._c("node-a"),
+                "--label",
+                PROJECT_LABEL,
+                self.ctx.image,
+                "/bin/daemon",
+                "--listen",
+                f"0.0.0.0:{node_a_port}",
+                "--upstream",
+                proxy,
+                "--iroh-peer",
+                f"{node_id}@{sockets}",
+                *claim_args,
+                *self.daemon_extra_args,
+            ]
+        )
+
+    def _await_iroh_identity(
+        self, role: str, n_seeds: int
+    ) -> tuple[str, str, dict[str, str]]:
+        """Poll `role`'s log for the provider's announced identity + seed content
+        ids. Returns (node_id, dialable_sockets_csv, {seed_path: blake3}). Filters
+        the announced sockets to loopback IPv4 (the reliable in-pod address; the
+        codex-flagged IPv6 wildcard `[::]` is dropped)."""
+        deadline = time.time() + READY_TIMEOUT_S
+        addr_re = re.compile(r"IROH-PROVIDER-ADDR node_id=(\S+) sockets=(\S+)")
+        seed_re = re.compile(r"IROH-SEED path=(\S+) bytes=\d+ blake3=(\S+)")
+        while True:
+            log = self.logs(role)
+            addr = addr_re.search(log)
+            seeds = dict(seed_re.findall(log))
+            if addr and len(seeds) >= n_seeds:
+                node_id, sockets_csv = addr.group(1), addr.group(2)
+                socks = [
+                    s for s in sockets_csv.split(",") if s.startswith("127.0.0.1:")
+                ]
+                socks = socks or sockets_csv.split(",")
+                return node_id, ",".join(socks), seeds
+            if time.time() > deadline:
+                self._dump_logs()
+                die(f"{role} never announced its iroh identity + {n_seeds} seed(s)")
+            time.sleep(0.25)
+
+    def node_b_served_bytes(
+        self, want_at_least: int = 1, timeout_s: float = 5.0
+    ) -> int:
+        """The GROUND-TRUTH peer-served byte count: the max `IROH-SERVED-TOTAL
+        bytes=N` node B has logged (from its own iroh provider counter, NOT node
+        A's self-report). Polls up to `timeout_s` for the counter to reach
+        `want_at_least`, since node B's monitor logs it slightly after a fetch."""
+        served_re = re.compile(r"IROH-SERVED-TOTAL bytes=(\d+)")
+        deadline = time.time() + timeout_s
+        best = 0
+        while True:
+            vals = [int(m) for m in served_re.findall(self.logs("node-b"))]
+            best = max([best, *vals])
+            if best >= want_at_least or time.time() > deadline:
+                return best
+            time.sleep(0.2)
 
     def _await_ready(self) -> None:
         targets = [
@@ -2770,6 +2973,261 @@ def scenario_chain_timeout_boundary(ctx: Ctx, expect) -> None:
         )
 
 
+# ---- S6: peer-served NAR over iroh (task-41, the wave-2 acceptance signal) --
+#
+# Topology: node B seeds the raw NARs into an iroh provider; node A resolves each
+# NarHash via a configured claim and fetches the NAR from B over iroh (whole-blob,
+# BLAKE3-gated), rewrites the narinfo to raw (task-49), and a REAL nix client
+# accepts the peer-served bytes. The oracle is hardened per the wave-2 review:
+#   - the peer-served count is node B's PROVIDER byte counter (ground truth), not
+#     node A's self-report;
+#   - 0 upstream NAR egress is non-vacuous because the client store is absent-
+#     before (a fresh --rm container) and a peers-OFF contrast arm proves the same
+#     build pulls the FULL NAR from upstream (the egress channel is not dead);
+#   - "cache untouched" is scoped honestly: NAR-payload egress == 0, while narinfo
+#     egress is asserted NONZERO as context (narinfo still comes from upstream in
+#     wave-2a - claiming otherwise would be an overclaim).
+
+# app (xz upstream -> exercises the compressed->raw rewrite) references lib (raw);
+# both are peer-served so upstream NAR egress is a clean 0 for the whole closure.
+S6_ATTRS = ["app", "lib"]
+
+
+def scenario_s6_p2p(ctx: Ctx, expect) -> None:
+    """S6 core: a real nix build served from a peer over iroh, byte-identical,
+    with the hardened 0-egress oracle + the peers-OFF contrast arm."""
+    fixtures = ctx.fixtures
+    seed_dir, seeds = build_p2p_seed_dir(fixtures, ctx.scratch / "s6-seed", S6_ATTRS)
+    # Realise BOTH paths explicitly (app pulls lib transitively anyway) so
+    # `nix path-info` reports a NarHash for each and the byte oracle can check
+    # both - a transitive-only path is substituted correctly but not queryable.
+    targets = [fixtures.store_path(a) for a in S6_ATTRS]
+    expected_served = sum(s.nar_size for s in seeds)
+
+    # -- peers ON: the peer serves the whole closure --
+    with Pod(
+        ctx,
+        "s6",
+        fixtures.cache,
+        with_daemon=False,
+        expect=expect,
+        p2p_seed_dir=seed_dir,
+        p2p_seeds=seeds,
+    ) as pod:
+        # absent-before: a fresh --rm client container has only the image closure
+        # in its store, so app+lib are absent before this build (the 0-egress is
+        # therefore about THIS acquisition, not a warm store).
+        pod.proxy_reset()
+        res = pod.client_run(
+            targets, ctx.substituter_daemon_only(), fixtures.public_key
+        )
+        expect(
+            res.exit_code == 0,
+            "S6: real nix build completes with the NAR served by node B over iroh",
+            res.stderr[-600:],
+        )
+        for attr in S6_ATTRS:
+            sp = fixtures.store_path(attr)
+            got = res.narhash(sp)
+            expect(
+                got == fixtures.nar_hash(attr),
+                f"S6 S1 byte-identity: {attr} NarHash matches signed upstream",
+                f"got={got} want={fixtures.nar_hash(attr)}",
+            )
+
+        stats = pod.proxy_stats()
+        nar_up = stats["upstream"].get("nar", 0)
+        ninfo_up = stats["upstream"].get("narinfo", 0)
+        served = pod.node_b_served_bytes(want_at_least=expected_served)
+        # THE oracle: 0 NAR-payload egress PAIRED with node B's ground-truth
+        # provider byte counter (not node A's self-report).
+        expect(
+            nar_up == 0 and served >= expected_served,
+            "S6 oracle: 0 upstream NAR egress PAIRED with node B provider-counted "
+            "peer-served bytes",
+            f"upstream.nar={nar_up} node_b_served={served} want>={expected_served}",
+        )
+        # honest scope: narinfo STILL comes from upstream in wave-2a (context, not
+        # an overclaim of 'cache untouched').
+        expect(
+            ninfo_up > 0,
+            "S6 context: narinfo egress is NONZERO (wave-2a serves narinfo upstream)",
+            f"upstream.narinfo={ninfo_up}",
+        )
+
+    # -- peers OFF contrast: the SAME build pulls the full NAR from upstream --
+    with Pod(ctx, "s6-off", fixtures.cache, with_daemon=True, expect=expect) as pod:
+        pod.proxy_reset()
+        res = pod.client_run(
+            targets, ctx.substituter_daemon_only(), fixtures.public_key
+        )
+        expect(
+            res.exit_code == 0,
+            "S6 contrast: peers-off build still succeeds (via upstream)",
+            res.stderr[-600:],
+        )
+        nar_up = pod.proxy_stats()["upstream"].get("nar", 0)
+        expect(
+            nar_up >= 1,
+            "S6 contrast: peers-off pulls the FULL NAR from upstream (falsifies "
+            "the 0-egress - the channel is live)",
+            f"upstream.nar={nar_up}",
+        )
+
+
+def scenario_s6_corrupt_bite(ctx: Ctx, expect) -> None:
+    """S6 bite: a peer serving a DIFFERENT valid NAR (passes the BLAKE3 transport
+    gate) is caught by Nix's sha256==NarHash gate; the build FAILS and no wrong
+    bytes are stored. We point `lib`'s claim at `app`'s (smaller) blake3, so the
+    substituted NAR passes the signed-NarSize cap and reaches the NarHash gate."""
+    fixtures = ctx.fixtures
+    seed_dir, seeds = build_p2p_seed_dir(
+        fixtures, ctx.scratch / "s6-bite-seed", S6_ATTRS
+    )
+    lib_hash = fixtures.nar_hash("lib")
+    app_seed = next(s for s in seeds if s.store_path == fixtures.store_path("app"))
+    lib_path = fixtures.store_path("lib")
+    # This bite RELIES on app's NAR being smaller than lib's signed NarSize: only
+    # then does the substituted (app) NAR pass the task-51 NarSize cap and reach
+    # Nix's hash gate. Guard it, so a fixture regeneration that inverted the sizes
+    # fails LOUD here instead of silently moving the bite to the size-abort path.
+    expect(
+        fixtures.entry("app")["nar_size"] < fixtures.entry("lib")["nar_size"],
+        "S6 bite precondition: app NarSize < lib NarSize (bite hits the hash gate, "
+        "not the size cap)",
+        f"app={fixtures.entry('app')['nar_size']} lib={fixtures.entry('lib')['nar_size']}",
+    )
+
+    with Pod(
+        ctx,
+        "s6-bite",
+        fixtures.cache,
+        with_daemon=False,
+        expect=expect,
+        p2p_seed_dir=seed_dir,
+        p2p_seeds=seeds,
+        # lib's NarHash now points at app's blake3 -> a valid-but-wrong NAR.
+        p2p_claim_overrides={lib_hash: app_seed.filename},
+    ) as pod:
+        res = pod.client_run(
+            [lib_path], ctx.substituter_daemon_only(), fixtures.public_key
+        )
+        expect(
+            res.exit_code != 0,
+            "S6 bite: build FAILS when the peer serves a valid-but-wrong NAR",
+            f"exit={res.exit_code}",
+        )
+        expect(
+            HASH_REJECT_NEEDLE in (res.stderr + res.stdout),
+            "S6 bite: failure is the sha256==NarHash gate (no wrong bytes stored)",
+            res.stderr[-600:],
+        )
+
+
+def scenario_s6_fallback(ctx: Ctx, expect) -> None:
+    """S6 through S2: node B dies -> node A's p2p primary fails and it falls back
+    to upstream, so the build still succeeds (the task-51 safety envelope bounds
+    the dead holder, FallbackNarSource routes to the cache).
+
+    Uses `lib`, an ALREADY-RAW upstream path. A REAL wave-2a limitation this
+    surfaces: for a COMPRESSED-upstream path the daemon rewrote to raw (e.g.
+    `app`), upstream has no raw NAR under the rewritten token, so a dead peer is
+    NOT recoverable from upstream - the build fails FAIL-CLOSED (no wrong bytes),
+    it does not fail OVER. Upstream fallback of a peer-served path therefore holds
+    only where upstream can also serve the raw NAR (already-raw paths). Making
+    raw-serve health-aware (don't rewrite when no live raw source) is deferred to
+    the task-43/44 policy work. We kill node B before the build (dead-holder); a
+    killed-MID-115MB-transfer variant extends this in the task-43 suite."""
+    fixtures = ctx.fixtures
+    seed_dir, seeds = build_p2p_seed_dir(fixtures, ctx.scratch / "s6-fb-seed", ["lib"])
+    lib_path = fixtures.store_path("lib")
+    with Pod(
+        ctx,
+        "s6-fb",
+        fixtures.cache,
+        with_daemon=False,
+        expect=expect,
+        p2p_seed_dir=seed_dir,
+        p2p_seeds=seeds,
+    ) as pod:
+        pod.kill("node-b")
+        pod.proxy_reset()
+        res = pod.client_run(
+            [lib_path], ctx.substituter_daemon_only(), fixtures.public_key
+        )
+        expect(
+            res.exit_code == 0,
+            "S6 fallback: peer-served path builds despite node B dead (p2p miss -> upstream)",
+            res.stderr[-600:],
+        )
+        got = res.narhash(lib_path)
+        expect(
+            got == fixtures.nar_hash("lib"),
+            "S6 fallback: lib still byte-identical (served by upstream after failover)",
+            f"got={got}",
+        )
+        nar_up = pod.proxy_stats()["upstream"].get("nar", 0)
+        expect(
+            nar_up >= 1,
+            "S6 fallback: upstream actually served the NAR (fallback engaged, not "
+            "a silent local hit)",
+            f"upstream.nar={nar_up}",
+        )
+
+
+def scenario_s6_compressed_fail_closed(ctx: Ctx, expect) -> None:
+    """S6 bite (the fail-CLOSED limitation, GROUNDED, not just documented): a
+    COMPRESSED-upstream path (`app`, xz) whose narinfo node A rewrote to raw has no
+    raw NAR upstream under the rewritten token, so when the peer dies the p2p miss
+    CANNOT fail over - the build must fail CLEANLY (bounded, no wrong bytes, no
+    hang), NOT hang and NOT poison the store. This is the negative-feedback the
+    mped review flagged as missing for the milestone's core safety claim. The
+    proper fail-OVER fix (preserve the compressed token + decompress-on-fallback)
+    is task-43/44; here we prove the current behaviour is fail-closed, not unsafe."""
+    fixtures = ctx.fixtures
+    # Seed + claim ONLY app (compressed): app is rewritten to raw, lib (app's dep,
+    # unclaimed) is served normally from upstream, so any failure is app's raw path.
+    seed_dir, seeds = build_p2p_seed_dir(fixtures, ctx.scratch / "s6-fc-seed", ["app"])
+    app_path = fixtures.store_path("app")
+    with Pod(
+        ctx,
+        "s6-fc",
+        fixtures.cache,
+        with_daemon=False,
+        expect=expect,
+        p2p_seed_dir=seed_dir,
+        p2p_seeds=seeds,
+    ) as pod:
+        pod.kill("node-b")
+        pod.proxy_reset()
+        # client_run has a 300s subprocess timeout; a genuine hang would raise
+        # TimeoutExpired -> a FAILING scenario, so a PASS here already means bounded.
+        res = pod.client_run(
+            [app_path], ctx.substituter_daemon_only(), fixtures.public_key
+        )
+        expect(
+            res.exit_code != 0,
+            "S6 fail-closed: compressed-rewritten path FAILS when the peer is dead "
+            "(no raw NAR upstream to fail over to)",
+            f"exit={res.exit_code}",
+        )
+        # No wrong bytes: app was never materialised (fail-closed, not poisoned).
+        expect(
+            res.narhash(app_path) is None,
+            "S6 fail-closed: app NOT stored (no wrong/partial bytes imported)",
+            f"narhash={res.narhash(app_path)}",
+        )
+        # The failure is a clean 'no substituter'/'missing in cache', NOT a hash
+        # mismatch (which would mean bytes were fetched) or a hang.
+        out = res.stderr + res.stdout
+        clean = ("no substituter" in out) or ("does not exist in binary cache" in out)
+        expect(
+            clean,
+            "S6 fail-closed: failure is a clean bounded gateway/absent error",
+            out[-600:],
+        )
+
+
 SCENARIOS = [
     ("topology", scenario_topology),
     ("s1-byte-and-counts", scenario_s1_byte_and_counts),
@@ -2797,6 +3255,11 @@ SCENARIOS = [
     # the TASK-33 latency-vs-timeout boundary pinned + shown to move.
     ("fault-depth-matrix", scenario_fault_depth_matrix),
     ("chain-timeout-boundary", scenario_chain_timeout_boundary),
+    # S6 (task-41): peer-served NAR over iroh - the wave-2 acceptance signal.
+    ("s6-p2p", scenario_s6_p2p),
+    ("s6-corrupt-bite", scenario_s6_corrupt_bite),
+    ("s6-fallback", scenario_s6_fallback),
+    ("s6-compressed-fail-closed", scenario_s6_compressed_fail_closed),
 ]
 
 

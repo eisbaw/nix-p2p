@@ -128,6 +128,62 @@ async fn honest_iroh_fetch_passes_both_gates() {
     client.shutdown().await;
 }
 
+// ---- S6 oracle: the PROVIDER-side byte counter grounds "peer-served" --------
+// The whole S6 offload claim rests on node B genuinely SENDING the NAR bytes.
+// node A's daemon self-reporting "I fetched from a peer" is untrusted narration
+// (wave-1 lesson); the ground truth is node B's provider counting the bytes it
+// served. This proves that counter observes exactly the NAR size, from iroh's
+// own provider events, after a real fetch - and stays zero when nothing is sent.
+
+#[tokio::test]
+async fn provider_byte_counter_grounds_the_peer_served_bytes() {
+    let nar = synth_raw_nar(b"S6: the whole-NAR node B actually serves node A");
+    let provider = IrohProvider::spawn().await.expect("provider binds");
+    let content = provider.seed(&nar).await.expect("seed the raw NAR");
+
+    // Before any fetch: nothing served (the absent-before analogue for the counter).
+    assert_eq!(
+        provider.bytes_served(),
+        0,
+        "no bytes served before any fetch"
+    );
+    assert_eq!(provider.transfers_completed(), 0);
+
+    let client = client_wired_to(&provider).await;
+    let got = client
+        .fetch(&content, &iroh_offer(&provider), Some(nar.len() as u64))
+        .await
+        .expect("a real two-endpoint iroh fetch");
+    assert_eq!(got, nar, "byte-identical peer-served NAR");
+
+    // The provider event task is async: poll the counter up to a bound rather
+    // than assume it has drained by the time the client's fetch future resolved.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while provider.bytes_served() != nar.len() as u64 {
+        if std::time::Instant::now() > deadline {
+            panic!(
+                "provider byte counter never reached {} (saw {})",
+                nar.len(),
+                provider.bytes_served()
+            );
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    assert_eq!(
+        provider.bytes_served(),
+        nar.len() as u64,
+        "the ground-truth counter equals exactly the served NAR size"
+    );
+    assert_eq!(
+        provider.transfers_completed(),
+        1,
+        "exactly one completed transfer served"
+    );
+
+    provider.shutdown().await;
+    client.shutdown().await;
+}
+
 // ---- AC#2 bite (a): a holder that cannot honestly serve the requested id ----
 // yields NO bytes over real iroh (bao/get fails closed). Wrong bytes for a valid
 // hash are impossible against a stock iroh-blobs provider (content-addressed +

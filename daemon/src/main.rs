@@ -10,14 +10,96 @@
 
 use std::net::{Ipv4Addr, SocketAddr};
 use std::process::ExitCode;
+use std::str::FromStr;
 use std::sync::Arc;
 
 use daemon::cacheinfo::DEFAULT_PRIORITY;
+use daemon::claim::CLAIM_SCHEMA_VERSION;
 use daemon::{
-    App, CacheInfo, CorrelationStore, NarCatalog, NarinfoDiskCache, NarinfoSource, NoRawServe,
-    NullCorrelation, SystemClock, UpstreamHttp, serve,
+    AllowlistRawServe, App, Blake3Digest, CacheInfo, Claim, CorrelationStore, FallbackNarSource,
+    InMemoryDiscovery, IrohPeerAddr, IrohProvider, IrohTransport, KnownPayload, KnownTransport,
+    NarCatalog, NarHashKey, NarSource, NarinfoDiskCache, NarinfoSource, NoRawServe, NodeId,
+    NullCorrelation, RawServeDecision, SystemClock, TransportNarSource, TransportRegistry,
+    UpstreamHttp, serve,
 };
 use tokio::net::TcpListener;
+
+/// A configured peer's iroh address: its `NodeId` and one-or-more direct sockets
+/// the daemon can dial it on. In the wave-2a container topology the harness reads
+/// node B's `IROH-PROVIDER-ADDR` line and passes it here via `--iroh-peer`; a real
+/// discovery/DHT (task-47) replaces this configured resolution.
+#[derive(Debug, Clone)]
+struct PeerSpec {
+    node: NodeId,
+    sockets: Vec<SocketAddr>,
+}
+
+/// A configured p2p claim: "this signed `NarHash` is held by `node` as the raw NAR
+/// whose content id is `blake3`". Seeds the daemon's discovery AND its raw-serve
+/// allowlist from ONE datum, so the two can never drift (a `will_serve_raw(true)`
+/// always has a claim - hence a raw NAR source - behind it). The harness builds it
+/// from node B's `IROH-SEED` line (blake3) + the fixture manifest (NarHash).
+#[derive(Debug, Clone)]
+struct ClaimSpec {
+    /// The full signed NarHash string, `sha256:<base32>` (the exact form the
+    /// narinfo carries and [`daemon::catalog::parse_correlation`] emits). KEPT as
+    /// the original string for the raw-serve allowlist, so allowlist matching is
+    /// byte-equal to what the narinfo carries (no re-encode round-trip risk).
+    nar_hash: String,
+    /// The SAME NarHash canonicalised once at parse time, for the discovery claim.
+    /// Parsing here (not again at wiring) is the single canonicalisation.
+    key: NarHashKey,
+    blake3: Blake3Digest,
+    node: NodeId,
+}
+
+/// Parse `--iroh-peer <nodeid_hex>@<socket>[,<socket>...]`.
+fn parse_peer_spec(raw: &str) -> Result<PeerSpec, String> {
+    let (node_hex, sockets_csv) = raw
+        .split_once('@')
+        .ok_or_else(|| format!("bad --iroh-peer {raw:?}: expected <nodeid_hex>@<socket>[,...]"))?;
+    let node: NodeId = node_hex
+        .parse()
+        .map_err(|e| format!("bad --iroh-peer node id {node_hex:?}: {e}"))?;
+    let mut sockets = Vec::new();
+    for s in sockets_csv.split(',').filter(|s| !s.is_empty()) {
+        sockets.push(
+            s.parse::<SocketAddr>()
+                .map_err(|e| format!("bad --iroh-peer socket {s:?}: {e}"))?,
+        );
+    }
+    if sockets.is_empty() {
+        return Err(format!("bad --iroh-peer {raw:?}: no sockets after '@'"));
+    }
+    Ok(PeerSpec { node, sockets })
+}
+
+/// Parse `--p2p-claim <narhash>=<blake3_hex>@<nodeid_hex>`. `<narhash>` is the full
+/// `sha256:<base32>` NarHash; `<blake3_hex>` is the 64-hex raw-NAR content id.
+fn parse_claim_spec(raw: &str) -> Result<ClaimSpec, String> {
+    let (nar_hash, rest) = raw.split_once('=').ok_or_else(|| {
+        format!("bad --p2p-claim {raw:?}: expected <narhash>=<blake3hex>@<nodeid>")
+    })?;
+    let (blake3_hex, node_hex) = rest.split_once('@').ok_or_else(|| {
+        format!("bad --p2p-claim {raw:?}: expected <narhash>=<blake3hex>@<nodeid>")
+    })?;
+    // Canonicalise the NarHash ONCE, here (fail fast at config time, not at the
+    // first request); the allowlist still keys on the original string form.
+    let key = NarHashKey::from_str(nar_hash)
+        .map_err(|e| format!("bad --p2p-claim NarHash {nar_hash:?}: {e}"))?;
+    let blake3: Blake3Digest = format!("blake3:{blake3_hex}")
+        .parse()
+        .map_err(|e| format!("bad --p2p-claim blake3 {blake3_hex:?}: {e}"))?;
+    let node: NodeId = node_hex
+        .parse()
+        .map_err(|e| format!("bad --p2p-claim node id {node_hex:?}: {e}"))?;
+    Ok(ClaimSpec {
+        nar_hash: nar_hash.to_string(),
+        key,
+        blake3,
+        node,
+    })
+}
 
 /// Human- and machine-readable identity of this build.
 fn banner() -> String {
@@ -45,6 +127,22 @@ struct Config {
     /// is a FIXED per-hop deadline that does NOT compose across a daemon chain
     /// (task-33); see `UpstreamHttp::with_header_timeout`.
     header_timeout_ms: u64,
+    /// Node B (provider) mode: run an iroh-blobs provider seeded with the raw NARs
+    /// named by `iroh_seed_nar`, in ADDITION to the normal HTTP daemon (so the node
+    /// stays readiness-pollable and is a real peer). Off by default. The S6 harness
+    /// sets it on node B only.
+    iroh_provider: bool,
+    /// Raw-NAR files to seed into the iroh provider (node B). Each is served by its
+    /// `BLAKE3(RawNarV1)` content id, printed on startup so the harness can wire
+    /// node A's claim to it.
+    iroh_seed_nar: Vec<String>,
+    /// Node A (client) mode: peer iroh addresses to dial (`NodeId -> sockets`), the
+    /// discovery stand-in for the fetch layer (task-40's in-memory address book).
+    iroh_peers: Vec<PeerSpec>,
+    /// Node A (client) mode: configured claims (signed NarHash -> raw-NAR blake3 +
+    /// holder). Seeds BOTH the in-memory discovery and the raw-serve allowlist, so a
+    /// peer-served path both resolves over iroh and gets the task-49 raw rewrite.
+    p2p_claims: Vec<ClaimSpec>,
 }
 
 impl Default for Config {
@@ -58,6 +156,10 @@ impl Default for Config {
             want_mass_query: true,
             narinfo_cache_dir: None,
             header_timeout_ms: 1000,
+            iroh_provider: false,
+            iroh_seed_nar: Vec::new(),
+            iroh_peers: Vec::new(),
+            p2p_claims: Vec::new(),
         }
     }
 }
@@ -111,6 +213,10 @@ impl Config {
                         other => return Err(format!("bad --want-mass-query {other:?}")),
                     };
                 }
+                "--iroh-provider" => config.iroh_provider = true,
+                "--iroh-seed-nar" => config.iroh_seed_nar.push(value()?),
+                "--iroh-peer" => config.iroh_peers.push(parse_peer_spec(&value()?)?),
+                "--p2p-claim" => config.p2p_claims.push(parse_claim_spec(&value()?)?),
                 other => return Err(format!("unknown flag {other:?}")),
             }
         }
@@ -124,6 +230,127 @@ impl Config {
             want_mass_query: self.want_mass_query,
         }
     }
+}
+
+/// Node B: spawn an iroh-blobs provider, seed each configured raw NAR, print its
+/// dialable identity + each blob's content id (machine-readable lines the harness
+/// parses), and start a monitor that logs the ground-truth served-bytes counter as
+/// it changes. Returns the provider so `main` keeps it (and its router) alive.
+async fn setup_iroh_provider(config: &Config) -> Result<Arc<IrohProvider>, String> {
+    let provider = IrohProvider::spawn().await.map_err(|e| e.to_string())?;
+
+    for path in &config.iroh_seed_nar {
+        let bytes = std::fs::read(path).map_err(|e| format!("reading seed NAR {path:?}: {e}"))?;
+        let blake3 = provider.seed(&bytes).await.map_err(|e| e.to_string())?;
+        // Machine-readable: the harness maps path -> NarHash and builds node A's
+        // --p2p-claim <narhash>=<this blake3>@<this node_id>.
+        println!(
+            "IROH-SEED path={path} bytes={} blake3={}",
+            bytes.len(),
+            blake3.to_hex()
+        );
+    }
+
+    let sockets = provider.socket_addrs();
+    if sockets.is_empty() {
+        return Err("iroh provider bound no sockets".to_string());
+    }
+    let sockets_csv = sockets
+        .iter()
+        .map(|s| s.to_string())
+        .collect::<Vec<_>>()
+        .join(",");
+    // The dialable address for node A's --iroh-peer <node_id>@<sockets>.
+    println!(
+        "IROH-PROVIDER-ADDR node_id={} sockets={sockets_csv}",
+        provider.node_id().to_hex()
+    );
+
+    let provider = Arc::new(provider);
+    // Ground-truth served-bytes monitor: poll the provider's own byte counter and
+    // log it whenever it advances, so the harness reads node B's SENT bytes (not
+    // node A's self-report) as the peer-served oracle.
+    {
+        let provider = provider.clone();
+        tokio::spawn(async move {
+            let mut last = 0u64;
+            loop {
+                tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+                let served = provider.bytes_served();
+                if served != last {
+                    last = served;
+                    println!(
+                        "IROH-SERVED-TOTAL bytes={served} transfers={}",
+                        provider.transfers_completed()
+                    );
+                }
+            }
+        });
+    }
+
+    Ok(provider)
+}
+
+/// Node A: assemble the p2p `NarSource` (iroh transport wired to the configured
+/// peers + an in-memory discovery seeded from the configured claims) IN FRONT of
+/// the HTTP upstream, plus the matching raw-serve allowlist. Both are built from
+/// the ONE `p2p_claims` set so discovery and raw-serve can never drift.
+async fn setup_p2p_source(
+    config: &Config,
+    upstream: Arc<UpstreamHttp>,
+) -> Result<(Arc<dyn NarSource>, Arc<dyn RawServeDecision>), String> {
+    // Fail fast (config-time, not first-request): every claim's holder MUST have a
+    // configured dialable address. Without this a typo'd/omitted `--iroh-peer`
+    // node silently degrades to upstream fallback (raw paths) or a fail-closed 404
+    // (compressed-rewritten paths) at the first request - a confusing runtime miss
+    // instead of a loud startup error.
+    let peer_nodes: std::collections::HashSet<NodeId> =
+        config.iroh_peers.iter().map(|p| p.node).collect();
+    for claim in &config.p2p_claims {
+        if !peer_nodes.contains(&claim.node) {
+            return Err(format!(
+                "claim for {} names holder {} but no --iroh-peer supplies its address",
+                claim.nar_hash,
+                claim.node.to_hex()
+            ));
+        }
+    }
+
+    let transport = IrohTransport::spawn().await.map_err(|e| e.to_string())?;
+    for peer in &config.iroh_peers {
+        transport.add_peer(&IrohPeerAddr::new(peer.node, peer.sockets.iter().copied()));
+    }
+    let mut registry = TransportRegistry::new();
+    registry.register(Box::new(transport));
+
+    let discovery = InMemoryDiscovery::new();
+    for claim in &config.p2p_claims {
+        // Reuse the key canonicalised once at parse time (SSOT for the parsed form).
+        discovery.announce(Claim {
+            schema_version: CLAIM_SCHEMA_VERSION,
+            key: claim.key,
+            payload: Some(KnownPayload::WholeNar {
+                blake3: claim.blake3,
+            }),
+            holders: vec![claim.node],
+            transports: vec![KnownTransport::Iroh { node: claim.node }],
+            relay: None,
+            signatures: vec![],
+        });
+    }
+
+    let transport_source = Arc::new(TransportNarSource::new(registry, Arc::new(discovery)));
+    let nar: Arc<dyn NarSource> = Arc::new(FallbackNarSource::new(transport_source, upstream));
+    let raw_serve: Arc<dyn RawServeDecision> = Arc::new(AllowlistRawServe::new(
+        config.p2p_claims.iter().map(|c| c.nar_hash.clone()),
+    ));
+
+    println!(
+        "daemon: p2p source wired ({} peer(s), {} claim(s))",
+        config.iroh_peers.len(),
+        config.p2p_claims.len()
+    );
+    Ok((nar, raw_serve))
 }
 
 /// The `rewrite-narinfo` filter subcommand: read a narinfo on stdin, apply the
@@ -209,18 +436,49 @@ async fn main() -> ExitCode {
         None => (upstream.clone(), Arc::new(NullCorrelation)),
     };
 
+    // Node B (provider) mode: stand up an iroh-blobs provider seeded with the raw
+    // NARs, so this node serves peers over iroh ALONGSIDE its HTTP surface (it stays
+    // readiness-pollable). Held for the process lifetime (its router serves while it
+    // is alive); dropping it would stop serving peers.
+    let _iroh_provider = if config.iroh_provider {
+        match setup_iroh_provider(&config).await {
+            Ok(provider) => Some(provider),
+            Err(err) => {
+                eprintln!("daemon: iroh provider setup failed: {err}");
+                return ExitCode::FAILURE;
+            }
+        }
+    } else {
+        None
+    };
+
+    // Node A (client) mode: put the p2p NarSource (iroh transport + configured
+    // discovery) IN FRONT of the HTTP upstream via FallbackNarSource, and pair it
+    // with the raw-serve allowlist so a peer-served path is both resolved over iroh
+    // AND gets the task-49 raw narinfo rewrite. Absent any peer/claim config the
+    // node stays a pure HTTP substituter (the wave-1 S2 path, NoRawServe).
+    let (nar, raw_serve): (Arc<dyn NarSource>, Arc<dyn RawServeDecision>) =
+        if config.iroh_peers.is_empty() && config.p2p_claims.is_empty() {
+            (upstream.clone(), Arc::new(NoRawServe))
+        } else {
+            match setup_p2p_source(&config, upstream.clone()).await {
+                Ok(pair) => pair,
+                Err(err) => {
+                    eprintln!("daemon: p2p source setup failed: {err}");
+                    return ExitCode::FAILURE;
+                }
+            }
+        };
+
     let app = Arc::new(App {
         narinfo,
-        nar: upstream.clone(),
+        nar,
         passthrough: upstream.clone(),
         cache_info: config.cache_info(),
         catalog,
         upstream_label: config.upstream.clone(),
         correlation,
-        // Wave-1 binary never serves raw itself, so every narinfo is relayed
-        // verbatim and the client fetches the compressed upstream nar (S2). task-41
-        // wires an availability-backed RawServeDecision alongside a raw NAR source.
-        raw_serve: Arc::new(NoRawServe),
+        raw_serve,
     });
 
     let listener = match TcpListener::bind(config.listen).await {
@@ -321,5 +579,69 @@ mod tests {
     #[test]
     fn default_config_advertises_a_preferred_priority() {
         assert!(Config::default().priority < 40);
+    }
+
+    // A valid 64-hex NodeId (parse is hex-only; the ed25519 curve check lives at
+    // the dial boundary) and a 64-hex blake3, for the config-parse tests.
+    const NODE_HEX: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    const BLAKE3_HEX: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+    const NARHASH: &str = "sha256:06rgb4vfjsg365xwwdjz12qhjnvg3w0agfvyqfp977hp3yk2bczb";
+
+    #[test]
+    fn parse_peer_spec_accepts_node_and_one_or_more_sockets() {
+        let spec = parse_peer_spec(&format!("{NODE_HEX}@127.0.0.1:35766")).unwrap();
+        assert_eq!(spec.sockets.len(), 1);
+        let multi = parse_peer_spec(&format!("{NODE_HEX}@127.0.0.1:1,127.0.0.1:2")).unwrap();
+        assert_eq!(multi.sockets.len(), 2);
+        // The parsed node round-trips to the same 64-hex id.
+        assert_eq!(spec.node.to_hex(), NODE_HEX);
+    }
+
+    #[test]
+    fn parse_peer_spec_fails_fast_on_malformed_input() {
+        // No '@'; a non-hex node; a garbage socket; an empty socket list.
+        assert!(parse_peer_spec("no-at-sign").is_err());
+        assert!(parse_peer_spec("zzzz@127.0.0.1:1").is_err());
+        assert!(parse_peer_spec(&format!("{NODE_HEX}@not-a-socket")).is_err());
+        assert!(parse_peer_spec(&format!("{NODE_HEX}@")).is_err());
+    }
+
+    #[test]
+    fn parse_claim_spec_accepts_narhash_blake3_node() {
+        let spec = parse_claim_spec(&format!("{NARHASH}={BLAKE3_HEX}@{NODE_HEX}")).unwrap();
+        assert_eq!(spec.nar_hash, NARHASH);
+        assert_eq!(spec.node.to_hex(), NODE_HEX);
+        assert_eq!(spec.blake3.to_hex(), BLAKE3_HEX);
+    }
+
+    #[test]
+    fn parse_claim_spec_fails_fast_on_malformed_input() {
+        // Missing '='; missing '@'; a non-canonical NarHash; a short blake3; a bad node.
+        assert!(parse_claim_spec("no-equals").is_err());
+        assert!(parse_claim_spec(&format!("{NARHASH}={BLAKE3_HEX}")).is_err());
+        assert!(parse_claim_spec(&format!("not-a-narhash={BLAKE3_HEX}@{NODE_HEX}")).is_err());
+        assert!(parse_claim_spec(&format!("{NARHASH}=dead@{NODE_HEX}")).is_err());
+        assert!(parse_claim_spec(&format!("{NARHASH}={BLAKE3_HEX}@zzzz")).is_err());
+    }
+
+    #[test]
+    fn parses_p2p_flags() {
+        let config = Config::from_args(
+            [
+                "--iroh-provider",
+                "--iroh-seed-nar",
+                "/srv/seed/a.nar",
+                "--iroh-peer",
+                &format!("{NODE_HEX}@127.0.0.1:35766"),
+                "--p2p-claim",
+                &format!("{NARHASH}={BLAKE3_HEX}@{NODE_HEX}"),
+            ]
+            .map(String::from),
+        )
+        .unwrap();
+        assert!(config.iroh_provider);
+        assert_eq!(config.iroh_seed_nar, vec!["/srv/seed/a.nar".to_string()]);
+        assert_eq!(config.iroh_peers.len(), 1);
+        assert_eq!(config.p2p_claims.len(), 1);
     }
 }

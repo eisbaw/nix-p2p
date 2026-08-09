@@ -356,6 +356,44 @@ impl RawServeDecision for NoRawServe {
     }
 }
 
+/// The wave-2a decision: serve RAW exactly the NarHashes the daemon has a
+/// discovery claim for. A CONFIGURED allowlist (not a DHT) - the same known-peer-set
+/// discipline as [`crate::discovery::DirectDiscovery`]. The integration site
+/// (`main.rs`) builds BOTH this allowlist and the p2p discovery from the ONE
+/// peer/claim config, so a `true` here has a CONFIGURED raw source behind it.
+///
+/// HONESTY (the trait contract, [`RawServeDecision`], demands a raw-capable source):
+/// the coupling is a CONFIGURED guarantee, not a runtime one. If the configured
+/// holder is DEAD at request time, an ALREADY-RAW path still falls back to the raw
+/// upstream NAR, but a path whose narinfo was rewritten from COMPRESSED to raw has
+/// no raw NAR upstream under the rewritten token, so it fails FAIL-CLOSED (a clean
+/// error, never wrong bytes) rather than failing over. Closing that (decompress-on-
+/// fallback, or health-aware rewrite) is task-43/44; see `scenario_s6_fallback`.
+///
+/// Keyed on the FULL signed `NarHash` string (`sha256:<base32>`), exactly the form
+/// [`crate::catalog::parse_correlation`] hands [`RawServeDecision::will_serve_raw`],
+/// so a claim's `NarHash` and the narinfo's `NarHash` agree by construction with no
+/// prefix juggling at the boundary.
+#[derive(Debug, Default, Clone)]
+pub struct AllowlistRawServe {
+    hashes: std::collections::HashSet<String>,
+}
+
+impl AllowlistRawServe {
+    /// Serve raw exactly these `sha256:<base32>` NarHashes.
+    pub fn new(hashes: impl IntoIterator<Item = String>) -> Self {
+        Self {
+            hashes: hashes.into_iter().collect(),
+        }
+    }
+}
+
+impl RawServeDecision for AllowlistRawServe {
+    fn will_serve_raw(&self, nar_hash: &str) -> bool {
+        self.hashes.contains(nar_hash)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

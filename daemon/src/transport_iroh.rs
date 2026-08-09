@@ -49,7 +49,8 @@
 use std::collections::HashMap;
 use std::fmt;
 use std::net::SocketAddr;
-use std::sync::Mutex;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -58,6 +59,9 @@ use iroh::endpoint::{RelayMode, presets};
 use iroh::protocol::Router;
 use iroh::{Endpoint, EndpointAddr, PublicKey};
 use iroh_blobs::get::request::{GetBlobItem, get_blob};
+use iroh_blobs::provider::events::{
+    EventMask, EventSender, ProviderMessage, RequestMode, RequestUpdate,
+};
 use iroh_blobs::store::mem::MemStore;
 use iroh_blobs::{BlobsProtocol, Hash};
 use n0_future::StreamExt;
@@ -244,6 +248,20 @@ pub struct IrohProvider {
     endpoint: Endpoint,
     store: MemStore,
     router: Router,
+    /// Total DECLARED size of the whole-blob transfers this provider has COMPLETED,
+    /// observed from iroh-blobs' own provider events (never a client self-report).
+    /// This is the S6 ground-truth oracle: node A's daemon claiming it "fetched from
+    /// a peer" is untrusted narration; node B counting the bytes it SERVED is the
+    /// ground truth. It is a LOWER BOUND on wire bytes: it credits the blob size on
+    /// `Completed` (for a fresh whole-blob serve, size == bytes sent), never credits
+    /// `Aborted`, and would under-count only if the bounded event channel lagged
+    /// (harmless for S6's small blobs; exact byte-on-wire accounting for large
+    /// payloads is a task-42/43 concern).
+    bytes_served: Arc<AtomicU64>,
+    /// Count of COMPLETED get-transfers served (each a whole blob handed to a
+    /// client). Paired with [`Self::bytes_served`] so a nonzero byte count is
+    /// attributable to real transfers, not a spurious event.
+    transfers_completed: Arc<AtomicU64>,
 }
 
 impl IrohProvider {
@@ -253,9 +271,54 @@ impl IrohProvider {
     pub async fn spawn() -> Result<Self, IrohError> {
         let endpoint = bind_loopback_endpoint().await?;
         let store = MemStore::new();
+
+        // Provider-side byte counter (the S6 ground-truth oracle). `NotifyLog`
+        // asks iroh-blobs for per-request transfer events on a NOTIFY channel -
+        // observe-only, no intercept to answer - so serving is never gated on us
+        // draining events, yet we see the exact bytes each get-transfer moves.
+        let mask = EventMask {
+            get: RequestMode::NotifyLog,
+            ..EventMask::DEFAULT
+        };
+        let (events, mut rx) = EventSender::channel(64, mask);
+        let bytes_served = Arc::new(AtomicU64::new(0));
+        let transfers_completed = Arc::new(AtomicU64::new(0));
+        {
+            let bytes_served = bytes_served.clone();
+            let transfers_completed = transfers_completed.clone();
+            tokio::spawn(async move {
+                // One outer message per get-request; each carries an update
+                // sub-stream (Started -> [Progress] -> Completed/Aborted). We sum
+                // the Started size of every transfer that reaches Completed.
+                while let Some(msg) = rx.recv().await {
+                    if let ProviderMessage::GetRequestReceivedNotify(msg) = msg {
+                        let bytes_served = bytes_served.clone();
+                        let transfers_completed = transfers_completed.clone();
+                        let mut updates = msg.rx;
+                        tokio::spawn(async move {
+                            let mut blob_size: u64 = 0;
+                            while let Ok(Some(update)) = updates.recv().await {
+                                match update {
+                                    RequestUpdate::Started(started) => blob_size = started.size,
+                                    RequestUpdate::Completed(_) => {
+                                        bytes_served.fetch_add(blob_size, Ordering::Relaxed);
+                                        transfers_completed.fetch_add(1, Ordering::Relaxed);
+                                    }
+                                    // Progress is redundant with Started.size for a
+                                    // whole-blob serve; an Aborted transfer is NOT
+                                    // counted (no bytes credited to a failed serve).
+                                    _ => {}
+                                }
+                            }
+                        });
+                    }
+                }
+            });
+        }
+
         // BlobsProtocol serves get-requests from `store`; MemStore is a cheap
         // shared handle, so blobs seeded AFTER spawn are served by the same store.
-        let blobs = BlobsProtocol::new(&store, None);
+        let blobs = BlobsProtocol::new(&store, Some(events));
         let router = Router::builder(endpoint.clone())
             .accept(iroh_blobs::ALPN, blobs)
             .spawn();
@@ -263,7 +326,21 @@ impl IrohProvider {
             endpoint,
             store,
             router,
+            bytes_served,
+            transfers_completed,
         })
+    }
+
+    /// Total raw-NAR bytes this provider has SERVED to clients over completed
+    /// get-transfers (the ground-truth peer-served counter). Observed from
+    /// iroh-blobs provider events, so it cannot be forged by a client.
+    pub fn bytes_served(&self) -> u64 {
+        self.bytes_served.load(Ordering::Relaxed)
+    }
+
+    /// Count of completed get-transfers served (see [`Self::bytes_served`]).
+    pub fn transfers_completed(&self) -> u64 {
+        self.transfers_completed.load(Ordering::Relaxed)
     }
 
     /// Content-addressed "put": add the raw NAR bytes to the served store and
@@ -290,6 +367,14 @@ impl IrohProvider {
     /// This provider's node identity (the locator a claim's `Iroh` offer carries).
     pub fn node_id(&self) -> NodeId {
         NodeId::from_bytes(*self.endpoint.id().as_bytes())
+    }
+
+    /// The concrete direct sockets this provider is bound to. In the wave-2a pod
+    /// these are loopback (`127.0.0.1:PORT`), reachable by a peer in the SAME
+    /// (shared) pod network namespace. node B prints these so node A can dial it
+    /// with no relay/discovery; a real discovery/DHT (task-47) resolves them.
+    pub fn socket_addrs(&self) -> Vec<SocketAddr> {
+        self.endpoint.bound_sockets()
     }
 
     /// This provider's dialable address (node id + bound loopback sockets), for a
