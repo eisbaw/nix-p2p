@@ -543,7 +543,7 @@ is a negative control. Measured this run:
 | per-request latency (median) | 0.63 ms | 51.18 ms | 50 ms (recovered **50.55 ms**) |
 | NAR rate | 1408.7 MB/s | **20.00 MB/s** | 20.97 MB/s cap (0.954×) |
 
-The unshaped control is **70× the cap**, so the measurement channel is
+The unshaped control is **67× the cap**, so the measurement channel is
 nowhere near the limiter — that anti-vacuity check is asserted, not
 assumed, and a probe whose control is not materially faster is a *named*
 failure. **Bite proven by mutation:** with `fault_params()` stubbed to
