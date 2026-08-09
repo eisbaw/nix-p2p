@@ -6,7 +6,7 @@ title: >-
 status: To Do
 assignee: []
 created_date: '2026-08-08 20:13'
-updated_date: '2026-08-09 13:33'
+updated_date: '2026-08-09 14:02'
 labels: []
 dependencies:
   - TASK-43
@@ -81,4 +81,39 @@ REPLICATES ARE NOT OPTIONAL (task-18's lesson, re-confirmed the hard way): with
 --repeats 1 the client latency axis fitted O(n log n) and raised a RED FLAG;
 with --repeats 3 the same axis fitted O(1). A class that moves between runs is
 not a law.
+
+## Forward-carried from TASK-64: the peer-vs-upstream cost model, measured
+
+Numbers your policy model should use instead of guessing (all 110 MiB, loopback,
+medians, `just iroh-bench`, daemon/examples/iroh_throughput.rs):
+
+  * Peer path, product's own `IrohTransport::fetch`: 187 MB/s, ~616 ms.
+  * Peer path, transport floor (iroh-blobs, no copy/verify):  255 MB/s.
+  * Loopback TCP (the unrealistically fast upstream stand-in): 1042 MB/s.
+  * FOUR concurrent peer connections: 649 MB/s AGGREGATE (2.54x) at 7.81 CPU
+    cores vs 2.95 for one. Per-connection limit, not machine-wide.
+
+THREE things this should change in the model:
+
+1. The peer path's ceiling is ~2.0 Gb/s per connection and 73% of its per-byte
+   cost is inherent to QUIC-over-UDP, not to our code. So a hedge/race policy
+   must NOT be tuned as if the peer path could be made to match a local HTTP
+   cache. It cannot, on loopback. On any link at or below ~2 Gb/s the link binds
+   first and the peer path is competitive - which is the regime that matters.
+   Model the two regimes separately; a single global policy tuned on loopback
+   numbers will be wrong for every real deployment.
+2. CPU is a real policy cost, not free. The peer path burns 2.6-3.0 CPU cores
+   while moving 187 MB/s; the TCP arm burns 1.15 cores at 1042 MB/s. That is
+   ~14x the CPU per byte. A policy that races peer-and-upstream on every fetch
+   is not merely wasteful of bandwidth, it is expensive in CPU on the CLIENT.
+   Whatever hedge you choose, price the CPU.
+3. Latency is not linear in bytes at the small end. At 8 MiB the product fetch
+   is ~48 ms and at 110 MiB ~616 ms, so per-byte cost dominates well before the
+   payload sizes that matter; the fixed dial cost is small. A delayed-race timer
+   can therefore be set from a bytes-per-second estimate rather than needing a
+   separate small-object case.
+
+Also: the provisional SafetyEnvelope's BODY_IDLE_TIMEOUT of 10 s is enormous
+relative to these numbers - a healthy 110 MiB fetch completes in ~0.6 s. That
+is fine as a floor but it is not a policy, exactly as task-51 said.
 <!-- SECTION:NOTES:END -->

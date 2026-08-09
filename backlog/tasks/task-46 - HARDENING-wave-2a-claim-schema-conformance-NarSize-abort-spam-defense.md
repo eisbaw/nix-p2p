@@ -4,7 +4,7 @@ title: 'HARDENING (wave-2a): claim-schema conformance + NarSize-abort spam defen
 status: To Do
 assignee: []
 created_date: '2026-08-08 20:13'
-updated_date: '2026-08-09 13:33'
+updated_date: '2026-08-09 14:03'
 labels:
   - hardening
 dependencies:
@@ -30,4 +30,20 @@ Wave-2a hardening block, deep-gated (runs against stabilized wave-2a surfaces). 
 
 <!-- SECTION:NOTES:BEGIN -->
 REVIEW REVISION (qa#6/codex#5): (1) task-51 owns the DEFAULT NarSize abort; task-46 HARDENS/fuzzes it + adds the HOSTILE-provider fixture (a peer that claims NarHash X but serves an oversized/wrong blob - no task owned this; task-41's bite is only corrupted bytes). (2) State the TRUST PRECONDITION: the NarSize-abort is valid ONLY because the narinfo (hence signed NarSize) comes from cache.nixos.org in wave-2a; the claim schema carries NO size field; v2 signed-narinfo-relay would break this - document it. (3) Claim-schema conformance fuzz stays.
+
+## Forward-carried from TASK-64: the seed clone now has a number
+
+`IrohProvider::seed`'s `raw_nar.to_vec()` (daemon/src/transport_iroh.rs) costs,
+measured: 819 MB/s for a 110 MiB payload = ~141 ms and one full extra resident
+copy, holder-side, per seed. Instrument: daemon/examples/iroh_throughput.rs, arm
+`provider_seed`, run it with `just iroh-bench`. Use that arm to pin your
+before/after rather than inventing a new harness.
+
+Caveat on interpreting it: the arm times the WHOLE `seed` call, which is the
+`to_vec` clone AND iroh-blobs' bao outboard computation over the payload. So
+141 ms is an upper bound on what removing the clone can save, not the clone's
+own cost. `blake3_oneshot` in the same run is 49 ms over the same bytes, which
+is roughly what the outboard's hashing must cost - so the clone is plausibly
+most of the remainder, but that split is not measured and you should measure it
+rather than quote 141 ms as the clone.
 <!-- SECTION:NOTES:END -->

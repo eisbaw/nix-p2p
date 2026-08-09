@@ -6,7 +6,7 @@ title: >-
 status: To Do
 assignee: []
 created_date: '2026-08-09 13:31'
-updated_date: '2026-08-09 13:33'
+updated_date: '2026-08-09 14:02'
 labels: []
 dependencies:
   - TASK-42
@@ -24,3 +24,29 @@ TASK-42 swept peer COUNT at roughly constant held-bytes and correctly found per-
 - [ ] #2 A concurrency dimension: k overlapping serves of the same size, with the measured overlap asserted (a point whose overlap != k is INVALID, per the task-18 rule)
 - [ ] #3 The residency oracle is NOT peak RSS alone; state which mechanism is used and prove by mutation that it distinguishes 'the store released it' from 'the allocator kept the arena'
 <!-- AC:END -->
+
+## Implementation Notes
+
+<!-- SECTION:NOTES:BEGIN -->
+## Forward-carried from TASK-64: instrumentation you can reuse, and one trap
+
+TASK-64 added daemon/examples/iroh_throughput.rs (`just iroh-bench`), which
+reads per-thread CPU nanoseconds from /proc/self/task/*/schedstat and context
+switches from /proc/self/task/*/status, in-process and with no new dependency.
+If your RSS-vs-bytes axis wants a CPU or wakeup axis beside it, that machinery
+is there and already proven by mutation.
+
+TRAP, measured the hard way, that bears directly on any /proc-derived counter
+you add: UDP datagram counts read from /proc/net/snmp alone are WRONG for iroh.
+iroh binds BOTH an IPv4 and an IPv6 socket and picks a path per connection, so
+the same arm reported ~15 000 datagrams for 110 MiB in one run and ~10 in the
+next - the IPv6 runs were invisible. /proc/net/snmp6 (`Udp6InDatagrams`) must be
+summed in. Counting one family is worse than counting none, because the miss
+looks like a measurement rather than a gap. Assume the same asymmetry for any
+other network counter you reach for.
+
+Also relevant to a bytes-axis: `provider_seed` (IrohProvider::seed, which
+`to_vec()`s the caller's slice and computes the bao outboard) runs at 819 MB/s
+for 110 MiB - i.e. ~141 ms and a full extra copy of the payload on the holder
+side. That is the TASK-46 clone, now with a number attached.
+<!-- SECTION:NOTES:END -->
