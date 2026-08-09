@@ -62,20 +62,31 @@ Measured on the container testbed (single host, so read the caveats):
 
 | Measurement | Result |
 |---|---|
-| Upstream NAR-payload egress offloaded | **1.00** (all of it) |
-| vs. a WAN-shaped upstream (50 ms RTT, 20 MiB/s) | peer path **9.3× faster** |
-| vs. a zero-latency loopback upstream | peer path **3.6× slower** |
-| Holder RAM per byte served | **1.02 B/B** [1.009 .. 1.031] |
+| Upstream NAR-payload egress offloaded | **1.00** (all of it), both conditions |
+| vs. a WAN-shaped upstream (50 ms RTT, 20 MiB/s) | peer path **6.1× faster** |
+| vs. a zero-latency loopback upstream | peer path **4.0× slower** |
+| Holder RAM per byte served | **1.018 B/B** [1.007 .. 1.028] |
 | Holder RAM held per byte *announced*, at rest | **0.00** |
+| Holder RAM per concurrent serve | **38.4 MB** [38.0 .. 38.8] |
 
-Holder RAM is a slope fitted over five NAR sizes with a 95% confidence interval,
-not a single-point ratio; it was **2.004 [2.000 .. 2.009]** before the supply
-model, with the blob store holding 1.00 bytes per byte announced *forever*. The
-two speedup figures are the same system against different upstreams — the
-ranking flips, so neither is quotable alone. The 9.3× magnitude is linear in
-the bandwidth cap; the *flip* is the robust part. `TESTING.md` forbids claiming
-emergent network effects from single-host sweeps, and the peer link is still
-loopback, so peer-side numbers are upper bounds.
+Every figure above is from one full profiling run on the current tree. Holder
+RAM is a slope fitted over five NAR sizes with a 95% confidence interval, not a
+single-point ratio; before the supply model it was **2.004 [2.000 .. 2.009]**
+with the blob store holding 1.00 bytes per byte announced *forever*.
+
+The two speedup figures are the same system against different upstreams — the
+ranking flips, so neither is quotable alone, and the magnitude is roughly peer
+rate ÷ bandwidth cap, sampled at one cap. The *flip* is the robust part, not
+the number. Both are means over 10 runs; the WAN condition's observed runs span
+5.3–8.3×.
+
+The supply model **cost latency to buy the memory guarantee**: regenerating a
+NAR per serve moved peers-on from 0.638 s to 0.964 s under WAN shaping (6.1×
+rather than the 9.3× the retain-everything build reached). That trade is stated
+rather than buried — holding nothing at rest is not free.
+
+`TESTING.md` forbids claiming emergent network effects from single-host sweeps,
+and the peer link is still loopback, so peer-side numbers are upper bounds.
 
 See `PRD.md` for the full design record and `backlog/` for task state.
 
