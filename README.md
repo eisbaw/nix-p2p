@@ -167,6 +167,34 @@ axis, a concurrency axis and both upstream conditions.
   The `fig-candidate-*` originals predate the settled design and are stale
   until task-17 revises them.
 
+## References
+
+Prior art and the problem this exists to address. Both threads are from June
+2023 and neither has produced a shipped implementation, which is part of why
+this project is deliberately measurement-first.
+
+- [Peer-to-peer binary cache RFC/working group/poll](https://discourse.nixos.org/t/peer-to-peer-binary-cache-rfc-working-group-poll/29568)
+  (NixOS Discourse, Nabile-Rahmani) — polls the community on a decentralized
+  binary cache, motivated by CDN costs cited in the thread as exceeding
+  €50k/month, and sketches a `services.nix-serve-p2p` where users seed. The
+  discussion is largely BitTorrent-vs-IPFS, and the objections raised there —
+  availability of the long tail, untrusted peers, sharding and rebalancing —
+  are the ones this design has to answer rather than assume away.
+- [Migration of S3 bucket payments to the Foundation](https://github.com/NixOS/foundation/issues/86)
+  (NixOS/foundation, refroni) — the storage-cost side of the same problem,
+  cataloguing ~11 alternatives from distributed stores (Tahoe-LAFS, Garage,
+  Ceph) to decentralized mirror networks and outright deletion.
+
+Where this project differs from most of those proposals: it decentralizes the
+**bytes only** and leaves trust exactly where it is. cache.nixos.org keeps
+signing narinfos, an unmodified Nix client re-verifies the signature and
+NarHash, and every peer stays outside the trusted computing base — so a hostile
+or broken peer costs a retry, never a bad store path. It also targets
+*bandwidth* rather than storage: `PRD.md` treats the long tail as a case where
+a CDN is strong and swarms are weak, and does not pretend otherwise. Whether
+peers actually beat a CDN as a byte source is treated as a thesis to measure,
+not a premise — see the numbers and their caveats under Status.
+
 ## License
 
 MIT — see `LICENSE`.
