@@ -4,7 +4,7 @@ title: 'HARDENING (wave-2a): claim-schema conformance + NarSize-abort spam defen
 status: To Do
 assignee: []
 created_date: '2026-08-08 20:13'
-updated_date: '2026-08-09 22:09'
+updated_date: '2026-08-09 23:07'
 labels:
   - hardening
 dependencies:
@@ -96,4 +96,27 @@ the supplier), so removing its clone will NOT move the profiler's holder slope.
 If you want a number, measure it where `seed` is actually called - or state
 plainly that the fix is a code-quality one whose runtime effect is confined to
 tests. Do not quote the size-axis slope as evidence for it.
+
+## Second thing forward-carried from TASK-72: the decline log is a NEW spam surface
+
+This task already owns 'NarSize-abort spam defense'. Task-72 added a sibling on
+the SERVE side: every declined get-request now prints one line,
+
+    IROH-SERVE-DECLINED reason=<category> hash=<hex> why=<cause>
+
+on stderr, from the provider's per-request task. That line is the fix for a real
+problem (a bare counter could not distinguish a permissions error from a GC'd path
+from a digest mismatch), and it is deliberately one line per DECLINE and never per
+serve - but it is still unbounded in a peer's control. A peer that asks repeatedly
+for digests we do not have gets us to write a line per request, at whatever rate it
+can dial.
+
+Severity is the same class as the abort spam you already own: log volume and I/O,
+not integrity, and the daemon is outside the TCB either way. Treat them together
+rather than inventing a second rate-limiter - and note the counters
+(IROH-SERVE-COUNTERS, logged only when they MOVE) already carry the aggregate, so
+whatever suppression you choose can drop repeats without losing the signal.
+
+Suggested shape, not prescribed: rate-limit per (reason, peer) with a periodic
+'suppressed N' line, so a burst costs one line and the count survives.
 <!-- SECTION:NOTES:END -->
