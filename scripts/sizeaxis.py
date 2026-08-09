@@ -934,7 +934,13 @@ def measure_point(
                 "peer_serve_rate": rate,
                 "host_fetch_span_s": host_span_s,
                 "fetches": fetches,
-                "ram_per_nar_byte": ram_per_nar_byte(metrics, n),
+                # SEEDED BYTES, not `n`. On the size axis the two coincide, but
+                # on the CONCURRENCY axis n is k - so passing `n` here divided
+                # resident memory by 3 and labelled the result "per NAR byte".
+                # The denominator of a per-byte ratio has to be a byte count on
+                # every axis it is computed on, which is the whole reason this
+                # report spells its units into its key names.
+                "ram_per_nar_byte": ram_per_nar_byte(metrics, seeded_bytes),
             },
         )
     except (RuntimeError, ss.SampleError, OSError, ValueError) as error:
@@ -1676,6 +1682,19 @@ def run_self_test() -> int:  # noqa: C901 - a flat list of checks reads better h
         "a summary of a real arm quotes both slopes WITH their intervals",
         sum("95% CI" in line for line in human_lines(long_measured, long_models)) == 2,
         str(human_lines(long_measured, long_models)),
+    )
+    ratio = ram_per_nar_byte(
+        {"holder_rss_hwm_bytes_ram": 300, "fetcher_rss_hwm_bytes_ram": 200}, 100
+    )
+    check(
+        "the per-NAR-byte ratio divides by a BYTE COUNT",
+        ratio["holder_peak_rss_ram_per_nar_byte_ratio"] == 3.0
+        and ratio["nar_bytes_uncompressed_nar"] == 100,
+        str(ratio),
+    )
+    check(
+        "a zero/absent byte count yields NO ratio rather than a division by zero",
+        ram_per_nar_byte({"holder_rss_hwm_bytes_ram": 300}, 0)["measured"] is False,
     )
     check(
         "the summary states the peak-RSS vs store-residency decomposition",
