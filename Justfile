@@ -218,6 +218,18 @@ scale-sweep *ARGS: _python fixtures-large
 profile *ARGS: _python fixtures-large
     "${NIX_P2P_PYTHON}/bin/python3" scripts/profile_p2p.py {{ ARGS }}
 
+# The task-64 transport decomposition: a layered loopback throughput bench
+# (memcpy / TCP / raw UDP / raw QUIC / iroh-blobs / the product's own fetch)
+# that attributes the peer-path per-byte cost to a LAYER, so "iroh is slow" is
+# replaced by a number per layer. RELEASE on purpose: a debug build measures
+# rustc, not iroh. No containers and no fixtures - it synthesises its payload -
+# so it runs in ~3 minutes anywhere. NOT a gate: it prints numbers and asserts
+# only that each arm really moved the bytes. A throughput THRESHOLD on a shared
+# host would be a flake, not an oracle.
+# Decompose the iroh peer-path throughput by layer (task-64).
+iroh-bench: _toolchain
+    cargo run --locked --release --example iroh_throughput
+
 # Reuses the e2e Pod seam (scripts/e2e_harness.py) as its driver and asserts the
 # two operator oracles - the daemon's per-substitution log story (AC#1) and the
 # fallback-served-by-request-counts proof (AC#2) - then emits its FRICTION
