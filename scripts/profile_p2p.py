@@ -19,6 +19,25 @@ kind:
       A peer hit is a valid 0-egress crossing there; that is the speedup
       yardstick and this module does not invent a second one.
 
+      Run under TWO NAMED UPSTREAM CONDITIONS (task-63), because "the speedup"
+      is not a number until you say what the peer path was raced against:
+        * `loopback_control` - the in-pod testproxy at ~0 RTT and ~758 MB/s.
+          A CONTROL, not a user's cache: it isolates the peer transport's own
+          cost (TASK-64) by removing the link from the comparison.
+        * `wan_shaped` - the same testproxy carrying an injected per-request RTT
+          and a NAR egress cap DERIVED from real-upstream measurement (task-35
+          against cache.nixos.org, plus direct probes of it). This is the arm
+          that answers the owner goal, which names a speedup over
+          cache.nixos.org.
+      The shaping is ASSERTED, never assumed: `probe_upstream_link` times the
+      proxy HOST-SIDE, outside the shaper, unshaped and then shaped over the
+      same channel, and `shaping_violations` fails the run when the injected
+      RTT is not recovered, the cap is not achieved, OR the unshaped control is
+      not fast enough to tell the two apart. Every speedup key carries its
+      condition as a suffix and `speedup_qualifier_violations` (plus
+      `human_summary_violations`, over the printed text) refuses a report that
+      states a bare one.
+
 WHY A SWARM OF PROCESSES. A peer IS one daemon process - it does not fork per
 client. The heavy, host-bound component is the CLIENT (a whole `podman run` of
 real nix with its own store), which is why task-18 swept clients against ONE
@@ -96,6 +115,7 @@ import sys
 import tempfile
 import time
 import traceback
+import urllib.request
 import zlib
 from dataclasses import dataclass
 from pathlib import Path
@@ -149,6 +169,89 @@ SWARM_ATTRS = ("lib",)
 # separate VmHWM from point-sampled VmRSS (task-18 left that distinction
 # unexercised because its workload grew RSS monotonically).
 SPEEDUP_ATTRS = ("lib", "big")
+
+# ---- the upstream condition (task-63) ---------------------------------------
+#
+# The speedup arm used to have ONE upstream: the in-pod testproxy on loopback,
+# ~0 RTT and ~758 MB/s. No user owns that machine, and the owner goal names
+# "speed up over cache.nixos.org". Against a fake upstream that fast the peer
+# path measured 3.5x SLOWER, and every threshold fitted to that number would be
+# fitted to an artifact. So the arm now runs under TWO named upstream
+# conditions and the report may never state a speedup without saying which.
+#
+# `loopback_control` is NOT deleted: a zero-latency upstream is the useful
+# control that isolates the peer transport's own cost (TASK-64).
+LOOPBACK_CONTROL = "loopback_control"
+WAN_SHAPED = "wan_shaped"
+UPSTREAM_CONDITIONS = (LOOPBACK_CONTROL, WAN_SHAPED)
+
+# Every speedup RATIO key must end in one of these, so a bare "speedup: 0.283"
+# is not spellable. Mechanical, like the byte units above and for the same
+# reason: the qualifier that lives only in a prose caveat is the qualifier that
+# gets dropped when the number is quoted.
+CONDITION_SUFFIXES = tuple(f"_{condition}" for condition in UPSTREAM_CONDITIONS)
+
+# --- the WAN shaping parameters, DERIVED (see the task-63 notes) -------------
+#
+# RTT. TASK-35 measured the real thing against cache.nixos.org and TESTING.md
+# ("Real-upstream gap (task-35)") records: steady-state RTT 50-110 ms to a
+# Nordic Fastly edge PoP, and a head-of-closure gap - which is ~one round trip,
+# un-prefetchable - of min 41 ms (`hello`) / 182 ms (`curl`). Direct probes from
+# THIS host on 2026-08-09 (curl `time_connect`, 5 samples) measured one TCP
+# round trip at 27, 28, 31, 77, 78 ms, and warm per-request TTFB-minus-connect
+# at 27-31 ms. 50 ms is the BOTTOM of the task-35 band and above this host's
+# median - i.e. deliberately at the upstream-FAVOURABLE end of the measured
+# evidence, so the WAN arm understates real-world latency and any peer advantage
+# it shows is a lower bound.
+WAN_RTT_MS = 50
+
+# BANDWIDTH, in bytes_compressed_wire per second - the bytes actually on the
+# wire, which is what the testproxy's mode-8 throttle paces. NOT NarSize: a cap
+# applied to compressed bytes and reported against uncompressed NAR bytes is
+# exactly the unit confusion this file gates against. (For the speedup arm the
+# two coincide by CHECKED PRECONDITION - `assert_unit_coincidence` - because its
+# payloads are `compression: none`; that coincidence is what makes the cap
+# quotable in either unit for THIS workload and no other.)
+#
+# Derived two ways, and the larger (upstream-favourable) one taken:
+#   * directly measured from this host, 2026-08-09: a single-stream HTTPS GET of
+#     a real 56 616 908 B `.nar.zst` from cache.nixos.org sustained 21.4 MB/s
+#     (2.65 s); a 2.5 MB NAR sustained 8.1-8.7 MB/s (slow-start dominated, so
+#     the 56 MB figure is the sustained one);
+#   * implied by TASK-35's own numbers: the tail gap is (narinfo phase + the NAR
+#     queue ahead of it), so closure-NAR-bytes / max gap_first bounds the
+#     aggregate rate from below - 11 MiB / 1.127 s ~ 9.8 MB/s (`hello`),
+#     21 MiB / 3.082 s ~ 6.8 MB/s (`curl`).
+# 20 MiB/s = 20 971 520 B/s sits at the fast end (this host's sustained
+# single-stream rate), so the shaped upstream is FASTER than what task-35's
+# distribution implies. Same discipline as the RTT: err toward the upstream.
+WAN_BANDWIDTH_BYTES_COMPRESSED_WIRE_PER_S = 20 * 1024**2
+
+# The shaping probe's assertion bands. The probe times requests HOST-SIDE
+# through the published proxy port - outside the shaper - unshaped and then
+# shaped, through the same channel, so the channel's own overhead cancels.
+#
+# Latency: the recovered delta (shaped median - unshaped median) must land in
+# [0.8, 1.6] x the injected RTT. The floor catches a shaper that did not fire;
+# the ceiling catches one firing more than once per request (which would mean
+# the arm carries an RTT nobody asked for).
+SHAPING_RTT_DELTA_BAND = (0.8, 1.6)
+# Bandwidth: the achieved rate must land in [0.70, 1.10] x the cap. The pacing
+# sleep runs AFTER each 64 KiB chunk, so overshoot above the cap is structurally
+# impossible beyond one chunk; the floor absorbs sleep-granularity overshoot
+# (~1758 sleeps for a 110 MiB payload) plus the per-request RTT.
+SHAPING_RATE_BAND = (0.70, 1.10)
+# THE ANTI-VACUITY CHECK. A probe whose UNSHAPED control is already as slow as
+# the shaping cannot tell shaped from unshaped, and would confirm any shaping
+# whatsoever - the vacuous-oracle shape this project has been burned by three
+# times. So the unshaped control must be at least this much faster, or the
+# probe reports a NAMED failure rather than a pass.
+SHAPING_CONTROL_MIN_RATE_FACTOR = 3.0
+SHAPING_CONTROL_MAX_LATENCY_FRACTION = 0.5
+# Narinfo GETs per latency sample set. Small and cached, so the body time is
+# negligible against a 50 ms injected RTT; the median of 7 shrugs off a single
+# scheduler hiccup without making the probe expensive.
+SHAPING_LATENCY_SAMPLES = 7
 
 # Refuse to start below this much free disk. The host runs at ~95% used and this
 # instrument spins swarms that each hold a blob store plus a per-pod seed copy of
@@ -304,6 +407,271 @@ def assert_unit_coincidence(fixtures, attrs) -> dict:
             "mix units."
         )
     return evidence
+
+
+# ---- pure: upstream shaping and its assertion (task-63) ---------------------
+
+
+@dataclass(frozen=True)
+class UpstreamShaping:
+    """RTT + bandwidth injected into the testproxy so the upstream arm carries
+    real-upstream cost instead of loopback's ~0 RTT and ~758 MB/s.
+
+    WHERE IT IS INJECTED, and why there. The testproxy's own fault modes 1
+    (per-kind added latency) and 8 (`throttle_nar_bps`) do the shaping. The
+    fixture is where environment and adversarial behaviour belong - the PRD rule
+    is that none of it ever lives inside the product daemon - and reusing the
+    existing, unit-tested primitives means the measured path gains no extra hop
+    and no extra CPU. It is also what makes the shaping observable: the proxy
+    port is published to the host, so the assertion below times requests from
+    OUTSIDE the shaper rather than asking the shaper how it did.
+
+    Rejected alternatives: a Python TCP relay between daemon and testproxy (an
+    extra hop and extra CPU on the very path whose throughput is in question,
+    and it would have to re-implement pacing); `tc netem` in the pod netns
+    (needs NET_ADMIN, which rootless podman does not have).
+
+    HONEST LIMIT, stated where the knob is defined. This is a SERVICE-LATENCY
+    and EGRESS-RATE shaper, not a link emulator. It adds one delay per REQUEST
+    and paces the response body. It does NOT model per-round-trip RTT inside a
+    transfer, TCP slow start, or a receive-window-over-RTT ceiling - so a
+    bandwidth-delay-product effect is absent by construction, and the WAN arm
+    therefore still FLATTERS the upstream. See `shaping_fidelity_note()`.
+    """
+
+    rtt_ms: int
+    bandwidth_bytes_compressed_wire_per_s: int
+
+    def fault_params(self) -> str:
+        """The testproxy admin query string that arms this shaping."""
+        return (
+            f"latency_cache_info_ms={self.rtt_ms}"
+            f"&latency_narinfo_ms={self.rtt_ms}"
+            f"&latency_nar_ms={self.rtt_ms}"
+            f"&throttle_nar_bps={self.bandwidth_bytes_compressed_wire_per_s}"
+        )
+
+    def as_report(self) -> dict:
+        return {
+            "injected_rtt_ms": self.rtt_ms,
+            "injected_bandwidth_bytes_compressed_wire_per_s": (
+                self.bandwidth_bytes_compressed_wire_per_s
+            ),
+            "applied_by": (
+                "testproxy fault mode 1 (per-kind added latency) + mode 8 "
+                "(throttle_nar_bps); armed through the Pod seam's proxy_faults"
+            ),
+            "cap_unit": (
+                "bytes_compressed_wire per second - the bytes actually on the "
+                "wire. For THIS workload wire == NarSize by checked "
+                "precondition (assert_unit_coincidence), and only for this one."
+            ),
+            "derivation": (
+                "RTT: task-35 / TESTING.md measured 50-110 ms steady-state to "
+                "cache.nixos.org's Fastly PoP and a 41 ms head-of-closure gap; "
+                "direct probes from this host measured 27-78 ms per TCP round "
+                "trip. BANDWIDTH: a 56.6 MB single-stream GET from "
+                "cache.nixos.org sustained 21.4 MB/s from this host, and "
+                "task-35's tail gaps imply 6.8-9.8 MB/s aggregate. Both knobs "
+                "are set at the UPSTREAM-FAVOURABLE end, so the arm understates "
+                "any peer advantage."
+            ),
+        }
+
+
+def shaping_fidelity_note() -> dict:
+    """What this shaping does and - louder - what it does NOT do."""
+    return {
+        "models": [
+            "one added round trip per upstream REQUEST (cache-info, narinfo, nar)",
+            "a sustained cap on NAR egress in bytes_compressed_wire per second",
+        ],
+        "does_not_model": [
+            "per-round-trip RTT WITHIN a transfer: no TCP slow start, no "
+            "receive-window-over-RTT ceiling, so the bandwidth-delay product "
+            "that binds a real WAN transfer is absent. TASK-64's forward-carried "
+            "point - that WAN is window-over-RTT bound while loopback is "
+            "CPU-bound - is therefore only PARTLY exercised here: this arm makes "
+            "the upstream slow, it does not make it BDP-limited.",
+            "TLS handshake and session-resumption cost (the testproxy is plain "
+            "HTTP; TLS is TASK-22/TASK-24)",
+            "loss, reordering, jitter, or a competing-flow-shaped queue",
+            "CDN behaviour: PoP selection, cache-miss shielding, rate limits",
+            "THE PEER SIDE. Only the upstream is shaped. The peer transport "
+            "still runs over pod loopback at ~187-255 MB/s (TASK-64), which no "
+            "real LAN peer reaches - a 1 GbE peer moves 125 MB/s. Every "
+            "peer-advantage number here is therefore an UPPER bound on the peer "
+            "side at the same time as a lower bound on the upstream side. "
+            "Shaping the peer link needs a primitive we do not have rootless "
+            "(see the follow-up filed by task-63).",
+        ],
+        "consequence": (
+            "The WAN-shaped arm is a REALISTIC-COST upstream, not a simulated "
+            "network. It answers 'does the peer path win once the upstream is "
+            "not a fiction' - it does not predict a wire-level WAN transfer."
+        ),
+    }
+
+
+def shaping_violations(evidence: dict, shaping: UpstreamShaping) -> list[str]:
+    """Did the shaping ACTUALLY take effect? Empty list == asserted, not assumed.
+
+    PURE, so `--self-test` can prove it bites without containers. Three checks,
+    and the third is the one that matters most:
+
+      1. the recovered latency delta is the injected RTT, within band;
+      2. the achieved NAR rate is the injected cap, within band;
+      3. THE UNSHAPED CONTROL IS MATERIALLY FASTER. A probe whose unshaped
+         channel is already as slow as the shaping would confirm ANY shaping,
+         including none - it is the vacuous oracle in its natural habitat. So
+         "I could not tell shaped from unshaped" is a NAMED FAILURE here, never
+         a pass.
+    """
+    problems: list[str] = []
+
+    def number(key: str):
+        value = evidence.get(key)
+        if not isinstance(value, (int, float)) or value != value:  # NaN-safe
+            problems.append(
+                f"shaping probe is missing a usable `{key}` ({value!r}); an "
+                "unmeasured shaper is an unasserted one"
+            )
+            return None
+        return float(value)
+
+    unshaped_ms = number("unshaped_request_latency_median_ms")
+    shaped_ms = number("shaped_request_latency_median_ms")
+    unshaped_rate = number("unshaped_nar_bytes_compressed_wire_per_s")
+    shaped_rate = number("shaped_nar_bytes_compressed_wire_per_s")
+
+    if unshaped_ms is not None and shaped_ms is not None:
+        delta_ms = shaped_ms - unshaped_ms
+        low, high = SHAPING_RTT_DELTA_BAND
+        if not low * shaping.rtt_ms <= delta_ms <= high * shaping.rtt_ms:
+            problems.append(
+                f"injected RTT NOT recovered: shaped median {shaped_ms:.1f} ms "
+                f"- unshaped median {unshaped_ms:.1f} ms = {delta_ms:.1f} ms, "
+                f"outside [{low * shaping.rtt_ms:.1f}, "
+                f"{high * shaping.rtt_ms:.1f}] ms for an injected "
+                f"{shaping.rtt_ms} ms"
+            )
+        ceiling = SHAPING_CONTROL_MAX_LATENCY_FRACTION * shaping.rtt_ms
+        if unshaped_ms > ceiling:
+            problems.append(
+                f"VACUOUS PROBE: the unshaped control already costs "
+                f"{unshaped_ms:.1f} ms, more than {ceiling:.1f} ms "
+                f"({SHAPING_CONTROL_MAX_LATENCY_FRACTION:g} x the injected "
+                f"{shaping.rtt_ms} ms), so this probe cannot tell a shaped "
+                "request from an unshaped one"
+            )
+
+    cap = shaping.bandwidth_bytes_compressed_wire_per_s
+    if shaped_rate is not None:
+        low, high = SHAPING_RATE_BAND
+        if not low * cap <= shaped_rate <= high * cap:
+            problems.append(
+                f"injected bandwidth cap NOT achieved: shaped NAR rate "
+                f"{shaped_rate:.0f} B(wire)/s outside [{low * cap:.0f}, "
+                f"{high * cap:.0f}] B(wire)/s for a {cap} B(wire)/s cap"
+            )
+    if unshaped_rate is not None:
+        floor = SHAPING_CONTROL_MIN_RATE_FACTOR * cap
+        if unshaped_rate < floor:
+            problems.append(
+                f"VACUOUS PROBE: the unshaped control only reached "
+                f"{unshaped_rate:.0f} B(wire)/s, below the "
+                f"{SHAPING_CONTROL_MIN_RATE_FACTOR:g}x-cap floor "
+                f"{floor:.0f} B(wire)/s - the measurement channel is itself the "
+                "limiter, so a rate at the cap proves nothing about the shaper"
+            )
+    return problems
+
+
+def speedup_qualifier_violations(report: dict) -> list[str]:
+    """AC#2, mechanically: no unqualified speedup number anywhere. Empty == clean.
+
+    Scoped to the speedup subtree (elsewhere `speedup_runs` and friends are
+    configuration, not ratios). Inside it, every key naming a `speedup` must end
+    in an upstream-condition suffix, and the by-condition index must actually
+    carry both conditions - a report that quietly dropped the WAN arm and kept
+    one nicely-suffixed number would otherwise pass.
+    """
+    problems: list[str] = []
+    speedup = (report.get("measured") or {}).get("speedup")
+    if speedup is None:
+        return problems  # --skip-speedup: nothing claimed, nothing to qualify
+
+    def walk(node, path: str) -> None:
+        if isinstance(node, dict):
+            for key, value in node.items():
+                here = f"{path}.{key}"
+                if isinstance(key, str) and "speedup" in key.split("_"):
+                    if not any(key.endswith(s) for s in CONDITION_SUFFIXES):
+                        problems.append(
+                            f"{here}: speedup key without an upstream-condition "
+                            f"suffix. It must end in one of "
+                            f"{', '.join(CONDITION_SUFFIXES)} - a speedup "
+                            "against a loopback testproxy and one against a "
+                            "WAN-shaped upstream are different claims and the "
+                            "schema must not let them be spelled the same"
+                        )
+                walk(value, here)
+        elif isinstance(node, list):
+            for index, value in enumerate(node):
+                walk(value, f"{path}[{index}]")
+
+    walk(speedup, "measured.speedup")
+
+    if speedup.get("ran"):
+        index = speedup.get("by_upstream_condition")
+        if not isinstance(index, dict):
+            problems.append(
+                "measured.speedup: no `by_upstream_condition` index - a speedup "
+                "report must be indexed by the upstream it was measured against"
+            )
+        else:
+            missing = [c for c in UPSTREAM_CONDITIONS if c not in index]
+            if missing:
+                problems.append(
+                    f"measured.speedup.by_upstream_condition is missing "
+                    f"{missing}; both the loopback CONTROL and the WAN-shaped "
+                    "arm must be present (or explicitly recorded as not run) so "
+                    "neither can be quoted as if it were the other"
+                )
+    return problems
+
+
+# What makes a summary LINE a speedup claim. Deliberately literal: `speedup=`
+# is how this summary spells a ratio, and `faster`/`slower` are how it spells a
+# ranking. `speedup_arms_usable=` is an instrument flag, not a claim, and does
+# not contain `speedup=` - which is exactly why the marker is the equals sign.
+#
+# HONEST LIMIT of this rule: it is a substring check over our own output, so it
+# catches the phrasings this file actually emits and not a future one that
+# prints the ratio with no word attached. That is the same trade the unit gate
+# makes, and the self-test proves it bites on the shapes we do emit.
+_SPEEDUP_CLAIM_MARKERS = ("speedup=", "faster", "slower")
+
+
+def human_summary_violations(lines: list[str]) -> list[str]:
+    """AC#2 for the HUMAN summary, which is the part people actually read.
+
+    The JSON gate above cannot see the printed text, and a report whose schema
+    forbids an unqualified speedup while its summary prints one has satisfied
+    the letter of the rule and none of its point.
+    """
+    problems: list[str] = []
+    for number, line in enumerate(lines, start=1):
+        lowered = line.lower()
+        if not any(marker in lowered for marker in _SPEEDUP_CLAIM_MARKERS):
+            continue
+        if any(condition in lowered for condition in UPSTREAM_CONDITIONS):
+            continue
+        problems.append(
+            f"human summary line {number} states a speedup without naming the "
+            f"upstream condition ({' or '.join(UPSTREAM_CONDITIONS)}): {line!r}"
+        )
+    return problems
 
 
 # ---- pure: disk footprint ---------------------------------------------------
@@ -721,6 +1089,43 @@ class ProfileRun:
     egress_nar_bytes_compressed_wire: int
     egress_total_bytes_compressed_wire: int
     peer_served_bytes_uncompressed_nar: int = 0
+    # A REAL transport rate at the cache boundary (see TASK-68 below). None when
+    # nothing crossed - a peer hit has no upstream transfer to rate.
+    upstream_nar_transport_bytes_compressed_wire_per_s: float | None = None
+
+
+def upstream_nar_transport_rate(records: list[dict]) -> float | None:
+    """Achieved bytes_compressed_wire per second at the CACHE BOUNDARY, from the
+    testproxy's own per-record `bytes_sent` / `duration_ms`.
+
+    TASK-68 context, partly addressed here. The arm's `realise_rate_*` figure is
+    NOT a transport rate: its numerator is a constant and its denominator is a
+    whole `nix-store --realise` (unpack + sha256 NarHash + store registration),
+    so it is algebraically 1/realise_s times a constant and its ratio across arms
+    is identically 1/latency-ratio. THIS figure is different in kind: it is bytes
+    on a socket over the time that socket was being written, which is a link
+    rate and the thing to compare against a peer link rate.
+
+    It INCLUDES the per-request injected latency and the pacing sleeps, because
+    both are part of what the client waits for - which is also what makes it a
+    second, independent witness that the shaping took effect. It measures only
+    the UPSTREAM side; the peer side has no equivalent instrument yet (TASK-68
+    stays open for that half).
+    """
+    total_bytes = 0
+    total_s = 0.0
+    for record in records:
+        if record.get("kind") != "nar":
+            continue
+        sent = record.get("bytes_sent")
+        duration_ms = record.get("duration_ms")
+        if sent is None or duration_ms is None:
+            continue
+        total_bytes += int(sent)
+        total_s += float(duration_ms) / 1000.0
+    if total_bytes <= 0 or total_s <= 0:
+        return None
+    return total_bytes / total_s
 
 
 def summarize_profile_arm(
@@ -735,14 +1140,27 @@ def summarize_profile_arm(
     the host-side podman wall clock is reported beside it and never used for a
     speedup ratio, because container create/start/teardown is not the product.
 
-    Throughput is stated per UNIT and per arm; the two arms' throughputs are only
+    The rate figure is stated per UNIT and per arm; the two arms' rates are only
     comparable because `assert_unit_coincidence` proved wire == NarSize for this
     workload, which the report records as evidence."""
     valid = [r for r in runs if r.valid]
     realise = [r.realise_s for r in valid if r.realise_s is not None]
-    # Per-run throughput, not total/total: a mean of ratios and a ratio of means
+    # Per-run rate, not total/total: a mean of ratios and a ratio of means
     # differ, and the per-run figure is the one with a distribution.
-    throughput = [workload_bytes_uncompressed_nar / s for s in realise if s and s > 0]
+    #
+    # TASK-68: this used to be called `throughput_*`, which invited exactly the
+    # reading it cannot support. The numerator is a CONSTANT (the workload) and
+    # the denominator is a whole `nix-store --realise`, so this is 1/realise_s
+    # rescaled - its cross-arm ratio is identically the inverse of the latency
+    # ratio, and it carries unpack + NarHash + store registration on top of any
+    # transfer. It is a REALISE RATE. The transport rate lives beside it, keyed
+    # `upstream_nar_transport_bytes_compressed_wire_per_s`.
+    realise_rate = [workload_bytes_uncompressed_nar / s for s in realise if s and s > 0]
+    transport = [
+        r.upstream_nar_transport_bytes_compressed_wire_per_s
+        for r in valid
+        if r.upstream_nar_transport_bytes_compressed_wire_per_s is not None
+    ]
     return {
         "arm": name,
         "runs": len(runs),
@@ -774,11 +1192,26 @@ def summarize_profile_arm(
         "peer_served_bytes_uncompressed_nar": stat_block(
             [float(r.peer_served_bytes_uncompressed_nar) for r in valid]
         ),
-        "throughput_bytes_uncompressed_nar_per_s": stat_block(throughput),
+        # NOT a transport rate - see the TASK-68 note above.
+        "realise_rate_bytes_uncompressed_nar_per_s": stat_block(realise_rate),
+        "realise_rate_is_not_a_transport_rate": (
+            "workload bytes / whole-`nix-store --realise` seconds. The numerator "
+            "is constant, so this is 1/realise_s rescaled and its cross-arm "
+            "ratio is identically 1/latency-ratio; the denominator additionally "
+            "carries unpack, sha256 NarHash and store registration. Read "
+            "`upstream_nar_transport_bytes_compressed_wire_per_s` for a link "
+            "rate (TASK-68)."
+        ),
+        # The measured link rate at the cache boundary. Empty for an arm whose
+        # payload never crossed it (a peer hit) - which is the correct answer,
+        # not zero.
+        "upstream_nar_transport_bytes_compressed_wire_per_s": stat_block(transport),
     }
 
 
-def speedup_block(peers_on: dict, peers_off: dict, unit_evidence: dict) -> dict:
+def speedup_block(
+    peers_on: dict, peers_off: dict, unit_evidence: dict, condition: str
+) -> dict:
     """The S7 speedup/offload statement, assembled so a cross-unit ratio is not
     expressible: every quantity in a ratio here is drawn from ONE unit family.
 
@@ -786,7 +1219,20 @@ def speedup_block(peers_on: dict, peers_off: dict, unit_evidence: dict) -> dict:
     `latency_speedup` is a ratio of in-container SECONDS. The peer-served figure
     (NarSize units) is reported as corroboration - it is what proves the bytes
     really moved peer-to-peer - and is never a term in either ratio.
+
+    TASK-63: every speedup key is suffixed with the UPSTREAM CONDITION it was
+    measured against, because a speedup over a ~0-RTT loopback testproxy and a
+    speedup over a WAN-shaped upstream are different claims about different
+    machines. `speedup_qualifier_violations` fails a report that spells either
+    one without saying which, and the self-test proves that by mutation.
     """
+    if condition not in UPSTREAM_CONDITIONS:
+        raise ValueError(
+            f"unknown upstream condition {condition!r}; must be one of "
+            f"{UPSTREAM_CONDITIONS} - an unnamed condition would produce exactly "
+            "the unqualified speedup number this suffix exists to prevent"
+        )
+    suffix = f"_{condition}"
     off_nar = peers_off["egress_payload_nar_bytes_compressed_wire"]["mean"]
     on_nar = peers_on["egress_payload_nar_bytes_compressed_wire"]["mean"]
     # Named for what they ARE. `stat_block` has both a mean and a p95 and calling
@@ -822,8 +1268,34 @@ def speedup_block(peers_on: dict, peers_off: dict, unit_evidence: dict) -> dict:
                 "a sample this small."
             ),
         }
+    if condition == LOOPBACK_CONTROL:
+        caveat = (
+            "CONTROL ARM. The 'upstream' here is the in-pod testproxy on "
+            "loopback at ~0 RTT - NOT cache.nixos.org, and not a machine any "
+            "user owns. This arm exists to isolate the PEER TRANSPORT's own "
+            "cost (TASK-64) by removing the link from the comparison; it is not "
+            "an answer to the owner goal, which names a speedup over "
+            "cache.nixos.org. Read `wan_shaped` for that. Real-upstream timing "
+            "(task-35, measured against cache.nixos.org): median narinfo->nar "
+            "gap ~300 ms, up to 3.08 s at closure tails - absent from every "
+            "number in this block, by design."
+        )
+    else:
+        caveat = (
+            "WAN-SHAPED ARM. The upstream carries an injected per-request RTT "
+            "and a NAR egress cap derived from the real-upstream measurements "
+            "(task-35 plus direct probes of cache.nixos.org); see "
+            "`shaping` and `shaping_evidence` for the values and for the "
+            "outside-the-shaper proof that they took effect. Both knobs sit at "
+            "the upstream-FAVOURABLE end of the measured evidence, and the PEER "
+            "side is NOT shaped (still pod loopback), so the peer advantage "
+            "stated here is an upper bound on the peer side and a lower bound "
+            "on the upstream cost. See `shaping_fidelity` for what the shaper "
+            "does not model - notably the receive-window-over-RTT ceiling."
+        )
     return {
         "counting_rule": "net-upstream-egress-v2 (scripts/MEASUREMENT_COUNTING_RULE.md)",
+        "upstream_condition": condition,
         "unit_coincidence_evidence": unit_evidence,
         "egress_payload_peers_off_bytes_compressed_wire": off_nar,
         "egress_payload_peers_on_bytes_compressed_wire": on_nar,
@@ -838,20 +1310,12 @@ def speedup_block(peers_on: dict, peers_off: dict, unit_evidence: dict) -> dict:
         "realise_stdev_peers_on_s": peers_on["realise_s"]["stdev"],
         "realise_p95_peers_off_s": off_p95,
         "realise_p95_peers_on_s": on_p95,
-        # >1 means peers are FASTER. A ratio of seconds; no bytes involved.
-        "latency_speedup_mean": ratio(off_mean, on_mean),
-        "latency_speedup_p95": ratio(off_p95, on_p95),
-        "latency_speedup_observed_range": bracket,
-        "caveat": (
-            "The 'upstream' here is the in-pod testproxy on loopback, NOT "
-            "cache.nixos.org. A loopback/container testbed is not residential- "
-            "uplink reality: it makes the CACHE side unrealistically fast, so the "
-            "latency speedup measured here is a LOWER bound on what a real "
-            "upstream would show and the egress offload is the transferable "
-            "number. Real-upstream timing (task-35, measured against "
-            "cache.nixos.org): median narinfo->nar gap ~300 ms, up to 3.08 s at "
-            "closure tails - that gap is absent from every number in this block."
-        ),
+        # >1 means peers are FASTER. A ratio of seconds; no bytes involved. The
+        # condition suffix is not decoration - see the docstring.
+        f"latency_speedup_mean{suffix}": ratio(off_mean, on_mean),
+        f"latency_speedup_p95{suffix}": ratio(off_p95, on_p95),
+        f"latency_speedup_observed_range{suffix}": bracket,
+        "caveat": caveat,
     }
 
 
@@ -881,8 +1345,9 @@ def score_run(
         fixtures.entry(a)["url"]: (result.narhash(fixtures.store_path(a)) is not None)
         for a in attrs
     }
+    records = pod.proxy_log()
     verdict = classify_run(
-        pod.proxy_log(),
+        records,
         url_sizes,
         delivered,
         pod.proxy_stats().get("bytes_sent"),
@@ -904,6 +1369,9 @@ def score_run(
         egress_nar_bytes_compressed_wire=verdict.egress_nar,
         egress_total_bytes_compressed_wire=verdict.egress_total,
         peer_served_bytes_uncompressed_nar=peer_served,
+        upstream_nar_transport_bytes_compressed_wire_per_s=(
+            upstream_nar_transport_rate(records)
+        ),
     )
 
 
@@ -1067,14 +1535,153 @@ def sweep_swarm(ctx, fixtures, sizes, repeats: int, state_root: Path) -> ss.Axis
     return axis
 
 
-def run_speedup_arms(ctx, fixtures, runs: int, state_root: Path) -> dict:
-    """peers-ON vs peers-OFF over the same workload, scored by the frozen rule.
+def _timed_get(url: str, *, timeout_s: float = 300.0) -> tuple[int, float]:
+    """GET `url`, stream the body to nowhere, return (bytes read, seconds).
+
+    Streamed rather than `.read()`: the probe fetches a 110 MiB NAR and a
+    host-side instrument that resident-sizes the payload would be measuring its
+    own allocator alongside the link.
+    """
+    started = time.perf_counter()
+    total = 0
+    with urllib.request.urlopen(url, timeout=timeout_s) as response:  # noqa: S310
+        if response.status != 200:
+            raise RuntimeError(f"probe GET {url} returned {response.status}")
+        while True:
+            chunk = response.read(64 * 1024)
+            if not chunk:
+                break
+            total += len(chunk)
+    return total, time.perf_counter() - started
+
+
+def _probe_urls(fixtures) -> tuple[str, str, int]:
+    """(narinfo URL, NAR URL, NAR wire bytes) for the probe's `big` payload."""
+    base = f"http://127.0.0.1:{e2e.HOST_PROXY}"
+    entry = fixtures.entry("big")
+    narinfo = f"{base}/{fx.narinfo_name(fixtures.store_path('big'))}"
+    return narinfo, f"{base}/{entry['url']}", int(entry["file_size"])
+
+
+def prewarm_upstream_cache(fixtures) -> None:
+    """Pull the workload through the testproxy once, host-side, before an arm.
+
+    Applied to EVERY speedup pod in EVERY upstream condition, and that
+    uniformity is the point: without it the first peers-OFF run of each arm
+    would carry an origin fetch the other nine do not, and the WAN condition -
+    which must probe the proxy anyway - would end up warm while the loopback
+    CONTROL stayed cold. A confound that differs between the two conditions
+    being compared is worse than one that is present in both.
+    """
+    narinfo_url, nar_url, wire_bytes = _probe_urls(fixtures)
+    _timed_get(narinfo_url)
+    got, _ = _timed_get(nar_url)
+    if got != wire_bytes:
+        raise RuntimeError(
+            f"prewarm read {got} B from {nar_url}, expected {wire_bytes} B "
+            "(bytes_compressed_wire); refusing to measure against a proxy whose "
+            "cache is not holding the whole payload"
+        )
+
+
+def probe_upstream_link(pod, fixtures, shaping: UpstreamShaping) -> dict:
+    """ASSERT the shaping (AC#1). Measures the link HOST-SIDE, through the
+    published proxy port - i.e. from OUTSIDE the shaper - unshaped and then
+    shaped, over the same channel, and leaves the shaping armed.
+
+    Measuring both states through one channel is what makes this an assertion
+    rather than a reading: the channel's own cost (podman's rootless port
+    forwarding, the host's scheduler, the proxy's own service time) is present
+    in both and cancels out of the latency delta, while the unshaped rate is the
+    negative control that stops a slow channel from masquerading as a working
+    shaper. `shaping_violations` consumes the result and a non-empty verdict
+    fails the run.
+
+    A caller MUST NOT interpret "no exception" as "shaped": the numbers are
+    returned and judged separately, on purpose, so the judging is a pure
+    function the self-test can break.
+    """
+    narinfo_url, nar_url, wire_bytes = _probe_urls(fixtures)
+
+    def latency_median_ms() -> float:
+        samples = []
+        for _ in range(SHAPING_LATENCY_SAMPLES):
+            _, elapsed = _timed_get(narinfo_url)
+            samples.append(elapsed * 1000.0)
+        return statistics.median(samples)
+
+    def nar_rate() -> float:
+        got, elapsed = _timed_get(nar_url)
+        if got != wire_bytes:
+            raise RuntimeError(
+                f"probe read {got} B from {nar_url}, expected {wire_bytes} B "
+                "(bytes_compressed_wire) - a partial body would make the rate a "
+                "fiction"
+            )
+        return got / elapsed
+
+    pod.proxy_faults("")  # start from a known-unshaped state
+    unshaped_ms = latency_median_ms()
+    unshaped_rate = nar_rate()
+
+    pod.proxy_faults(shaping.fault_params())
+    shaped_ms = latency_median_ms()
+    shaped_rate = nar_rate()
+
+    return {
+        "measured_from": (
+            "the HOST, through the published testproxy port - outside the "
+            "shaper, not the shaper's own account of itself"
+        ),
+        "probe_payload_bytes_compressed_wire": wire_bytes,
+        "latency_samples_per_state": SHAPING_LATENCY_SAMPLES,
+        "unshaped_request_latency_median_ms": unshaped_ms,
+        "shaped_request_latency_median_ms": shaped_ms,
+        "recovered_rtt_ms": shaped_ms - unshaped_ms,
+        "unshaped_nar_bytes_compressed_wire_per_s": unshaped_rate,
+        "shaped_nar_bytes_compressed_wire_per_s": shaped_rate,
+        "shaped_over_cap_fraction": (
+            shaped_rate / shaping.bandwidth_bytes_compressed_wire_per_s
+        ),
+        "negative_control": (
+            "the unshaped numbers ARE the control: `shaping_violations` fails "
+            "when they are not materially faster than the shaped ones, so a "
+            "shaper that never fired cannot pass by looking like a slow channel"
+        ),
+    }
+
+
+def run_speedup_arms(  # noqa: C901 - two arms x two conditions reads flatter inline
+    ctx,
+    fixtures,
+    runs: int,
+    state_root: Path,
+    *,
+    condition: str,
+    shaping: UpstreamShaping | None,
+) -> dict:
+    """peers-ON vs peers-OFF over the same workload, scored by the frozen rule,
+    against ONE named upstream condition.
 
     The two arms are held IDENTICAL in everything the counting rule says must be
     identical: same client script, same knobs, same narinfo-cache configuration
-    (both get a state dir), same payloads. The ONLY difference is whether a peer
-    holds the NARs.
+    (both get a state dir), same payloads, same upstream shaping. The ONLY
+    difference is whether a peer holds the NARs.
+
+    `condition` names the upstream both arms face and travels into every speedup
+    key. `shaping` is None for the loopback CONTROL - which is deliberately left
+    byte-for-byte as it was, so its numbers stay comparable with the task-42
+    baseline - and an `UpstreamShaping` for the WAN arm, where it is ARMED on
+    both pods and ASSERTED from outside the shaper before any run is scored.
     """
+    if condition not in UPSTREAM_CONDITIONS:
+        raise ValueError(f"unknown upstream condition {condition!r}")
+    if (shaping is None) != (condition == LOOPBACK_CONTROL):
+        raise ValueError(
+            f"condition {condition!r} and shaping {shaping!r} disagree: the "
+            "loopback control is the unshaped condition and the WAN condition "
+            "is the shaped one. A mislabelled arm is worse than no arm."
+        )
     unit_evidence = assert_unit_coincidence(fixtures, SPEEDUP_ATTRS)
     targets = [fixtures.store_path(a) for a in SPEEDUP_ATTRS]
     wire_total = sum(int(fixtures.entry(a)["file_size"]) for a in SPEEDUP_ATTRS)
@@ -1090,20 +1697,26 @@ def run_speedup_arms(ctx, fixtures, runs: int, state_root: Path) -> dict:
     # but it means the peers-ON arm partly measured the peers-OFF path, and that
     # has to be visible rather than averaged into a comfortable offload number.
     on_shortfalls: list[dict] = []
-    scratch = ctx.scratch / "speedup-seed"
+    shaping_evidence: dict = {}
+    scratch = ctx.scratch / f"speedup-seed-{condition}"
     seed_dir, seeds = e2e.build_p2p_seed_dir(fixtures, scratch, list(SPEEDUP_ATTRS))
     expected_served = sum(s.nar_size for s in seeds)
     try:
         with e2e.Pod(
             ctx,
-            "prof-speed-on",
+            f"prof-speed-on-{condition}",
             fixtures.cache,
             with_daemon=False,
             expect=ss.silent_expect([]),
             p2p_seed_dir=seed_dir,
             p2p_seeds=seeds,
-            state_root=state_root / "speedup-on",
+            state_root=state_root / f"speedup-on-{condition}",
         ) as pod:
+            prewarm_upstream_cache(fixtures)
+            if shaping is not None:
+                shaping_evidence["peers_on_pod"] = probe_upstream_link(
+                    pod, fixtures, shaping
+                )
             with ss.NodeSampler(pod, pod.roles()) as sampler:
                 for index in range(runs):
                     print(
@@ -1163,12 +1776,17 @@ def run_speedup_arms(ctx, fixtures, runs: int, state_root: Path) -> dict:
     off_runs: list[ProfileRun] = []
     with e2e.Pod(
         ctx,
-        "prof-speed-off",
+        f"prof-speed-off-{condition}",
         fixtures.cache,
         with_daemon=True,
         expect=ss.silent_expect([]),
-        state_root=state_root / "speedup-off",
+        state_root=state_root / f"speedup-off-{condition}",
     ) as pod:
+        prewarm_upstream_cache(fixtures)
+        if shaping is not None:
+            shaping_evidence["peers_off_pod"] = probe_upstream_link(
+                pod, fixtures, shaping
+            )
         with ss.NodeSampler(pod, pod.roles()) as sampler:
             for index in range(runs):
                 print(
@@ -1248,8 +1866,49 @@ def run_speedup_arms(ctx, fixtures, runs: int, state_root: Path) -> dict:
                 "not be quoted. The egress figures are unaffected (different "
                 "instrument)."
             )
+    # AC#1: the shaping is ASSERTED, and asserted LOUDLY. A shaper we configured
+    # but never checked is the vacuous oracle this project has shipped three
+    # times, so a failed assertion raises rather than annotating: the arm's
+    # numbers would be labelled `wan_shaped` while describing an unshaped
+    # upstream, which is a worse artifact than the one task-63 exists to fix.
+    shaping_problems: list[str] = []
+    if shaping is not None:
+        for pod_name, evidence in sorted(shaping_evidence.items()):
+            shaping_problems += [
+                f"{pod_name}: {problem}"
+                for problem in shaping_violations(evidence, shaping)
+            ]
+        if not shaping_evidence:
+            shaping_problems.append(
+                "no shaping probe ran at all, so nothing was asserted"
+            )
+        if shaping_problems:
+            raise ValueError(
+                "upstream shaping NOT verified for condition "
+                f"{condition!r}: " + "; ".join(shaping_problems)
+            )
+
     return {
         "ran": True,
+        "upstream_condition": condition,
+        "shaping": None if shaping is None else shaping.as_report(),
+        "shaping_fidelity": None if shaping is None else shaping_fidelity_note(),
+        "shaping_evidence": shaping_evidence or None,
+        "shaping_asserted": shaping is None or not shaping_problems,
+        "shaping_assertion_note": (
+            "the loopback CONTROL is unshaped by definition, so there is "
+            "nothing to assert"
+            if shaping is None
+            else "measured host-side, outside the shaper, unshaped then shaped "
+            "over the same channel; judged by the pure `shaping_violations`, "
+            "which fails when the unshaped control cannot be told apart from "
+            "the shaped one"
+        ),
+        "prewarm_note": (
+            "the testproxy's disk cache is pulled warm host-side before every "
+            "arm in every condition, so no run carries an origin fetch the "
+            "others do not"
+        ),
         "attrs": list(SPEEDUP_ATTRS),
         "runs_requested": runs,
         "topology_note": (
@@ -1263,7 +1922,125 @@ def run_speedup_arms(ctx, fixtures, runs: int, state_root: Path) -> dict:
         ),
         "peers_on": peers_on,
         "peers_off": peers_off,
-        "speedup": speedup_block(peers_on, peers_off, unit_evidence),
+        f"speedup_{condition}": speedup_block(
+            peers_on, peers_off, unit_evidence, condition
+        ),
+    }
+
+
+# The task-42 loopback numbers this task PINS as the control (AC#3). Kept as
+# data, not prose, so the current run can be compared against them mechanically
+# and any drift is visible instead of remembered. The suffix is not optional
+# even here - `speedup_qualifier_violations` walks this block too.
+PINNED_TASK42_CONTROL = {
+    "source": "task-42 `just profile`, the run that motivated task-63",
+    "upstream": (
+        "in-pod testproxy on pod loopback: ~0 RTT, ~758 MB/s. UNSHAPED - this "
+        "is the control, not a user's cache"
+    ),
+    "realise_mean_peers_on_s": 0.562,
+    "realise_mean_peers_off_s": 0.159,
+    "latency_speedup_mean_loopback_control": 0.283,
+    "reading": (
+        "peers measured 3.5x SLOWER than a zero-latency upstream. TASK-64 "
+        "root-caused it: the peer transport tops out at ~187-255 MB/s while the "
+        "loopback testproxy does ~1042 MB/s of TCP, so the deficit is a "
+        "statement about an upstream no user owns. It is retained because a "
+        "zero-latency upstream is the only arm that isolates the peer "
+        "transport's own cost."
+    ),
+}
+
+
+def cross_condition_block(by_condition: dict) -> dict:
+    """State the two conditions side by side, and say whether the RANKING moved.
+
+    This is the deliverable sentence of task-63, so it is computed rather than
+    written: the reader should not have to divide two numbers from opposite ends
+    of a JSON file to find out whether shaping the upstream changed the answer.
+    """
+    rows = {}
+    for condition, block in sorted(by_condition.items()):
+        if not isinstance(block, dict) or not block.get("ran"):
+            rows[condition] = {
+                "ran": False,
+                "reason": (block or {}).get("reason", "not run"),
+            }
+            continue
+        speed = block[f"speedup_{condition}"]
+        key = f"latency_speedup_mean_{condition}"
+        value = speed.get(key)
+        rows[condition] = {
+            "ran": True,
+            "realise_mean_peers_on_s": speed["realise_mean_peers_on_s"],
+            "realise_mean_peers_off_s": speed["realise_mean_peers_off_s"],
+            key: value,
+            "peers_faster": None if value is None else value > 1.0,
+            "egress_offload_fraction": speed["egress_offload_fraction"],
+            "upstream_link_rate_peers_off_bytes_compressed_wire_per_s": (
+                block["peers_off"][
+                    "upstream_nar_transport_bytes_compressed_wire_per_s"
+                ]["mean"]
+            ),
+        }
+    ranks = {c: r.get("peers_faster") for c, r in rows.items() if r.get("ran")}
+    distinct = {v for v in ranks.values() if v is not None}
+    return {
+        "per_condition": rows,
+        "ranking_flipped": len(distinct) > 1,
+        "ranking_note": (
+            "TRUE means the peer path wins under one upstream condition and "
+            "loses under the other - i.e. the task-42 result was a property of "
+            "the upstream, not of the peer transport. FALSE with both true "
+            "means peers win either way; FALSE with both false means the peer "
+            "path is genuinely behind even against a realistic upstream."
+        ),
+        "peer_side_link_rate": (
+            "NOT measured by this instrument. The upstream link rate above is "
+            "real (testproxy bytes_sent / duration_ms at the cache boundary); "
+            "the peer side has no equivalent counter yet, so the honest "
+            "comparison uses TASK-64's separate bench: ~187 MB/s for the "
+            "product's full peer fetch path and ~255 MB/s for iroh-blobs alone, "
+            "both LOOPBACK. TASK-68 owns closing this half."
+        ),
+        "pinned_task42_control": PINNED_TASK42_CONTROL,
+    }
+
+
+def run_speedup_conditions(
+    ctx, fixtures, runs: int, state_root: Path, shaping: UpstreamShaping
+) -> dict:
+    """The speedup arm under EVERY upstream condition, indexed by condition.
+
+    Sequential, not parallel: the instruments share one podman label and one set
+    of published ports, and two conditions racing each other would measure the
+    contention (TASK-58).
+    """
+    by_condition: dict = {}
+    for condition in UPSTREAM_CONDITIONS:
+        print(
+            f"profile: speedup arm under upstream condition {condition!r}",
+            file=sys.stderr,
+        )
+        by_condition[condition] = run_speedup_arms(
+            ctx,
+            fixtures,
+            runs,
+            state_root,
+            condition=condition,
+            shaping=None if condition == LOOPBACK_CONTROL else shaping,
+        )
+    return {
+        "ran": True,
+        "why_two_conditions": (
+            "The owner goal names a speedup over cache.nixos.org, and the "
+            "task-42 arm measured against an in-pod testproxy at ~0 RTT and "
+            "~758 MB/s - a machine no user owns. Both are reported and neither "
+            "may be quoted without its condition: `loopback_control` isolates "
+            "the peer transport's own cost, `wan_shaped` answers the goal."
+        ),
+        "by_upstream_condition": by_condition,
+        "cross_condition": cross_condition_block(by_condition),
     }
 
 
@@ -1391,14 +2168,17 @@ def build_report(
     }
     s5_violations = scalefit.sweep_report_violations(report)
     unit_problems = unit_violations(report)
+    qualifier_problems = speedup_qualifier_violations(report)
     report["honesty"] = {
         "rules": (
-            "TESTING.md S5 (a)-(d) via scalefit.sweep_report_violations, plus this "
-            "module's unit rule via unit_violations"
+            "TESTING.md S5 (a)-(d) via scalefit.sweep_report_violations, this "
+            "module's unit rule via unit_violations, and task-63's "
+            "upstream-condition rule via speedup_qualifier_violations"
         ),
         "s5_violations": s5_violations,
         "unit_violations": unit_problems,
-        "compliant": not s5_violations and not unit_problems,
+        "speedup_qualifier_violations": qualifier_problems,
+        "compliant": not s5_violations and not unit_problems and not qualifier_problems,
     }
     # A speedup arm that RAISED is not a missing arm - it is a failed one, and
     # `usable` must say so. `speedup is None` means it was never asked for
@@ -1409,17 +2189,32 @@ def build_report(
         if not speedup.get("ran"):
             speedup_usable = False
         else:
-            speedup_usable = (
-                speedup["peers_on"]["usable"] and speedup["peers_off"]["usable"]
-            )
-            # The frozen counting rule's SECTION 5 floor. An arm below it is a
-            # dev smoke, and a report containing one must not read as quotable:
-            # `dev_smoke_below_n10` existed but gated nothing, so
-            # `--speedup-runs 3` produced `usable: true`.
-            speedup_dev_smoke = (
-                speedup["peers_on"]["dev_smoke_below_n10"]
-                or speedup["peers_off"]["dev_smoke_below_n10"]
-            )
+            conditions = speedup.get("by_upstream_condition") or {}
+            if not conditions:
+                speedup_usable = False
+            for block in conditions.values():
+                if not block.get("ran"):
+                    speedup_usable = False
+                    continue
+                # EVERY condition must stand on its own. A usable loopback
+                # control next to a WAN arm that failed its shaping assertion
+                # would let the control be quoted as if the goal question had
+                # been answered.
+                speedup_usable = (
+                    speedup_usable
+                    and block["peers_on"]["usable"]
+                    and block["peers_off"]["usable"]
+                    and bool(block.get("shaping_asserted"))
+                )
+                # The frozen counting rule's SECTION 5 floor. An arm below it is
+                # a dev smoke, and a report containing one must not read as
+                # quotable: `dev_smoke_below_n10` existed but gated nothing, so
+                # `--speedup-runs 3` produced `usable: true`.
+                speedup_dev_smoke = (
+                    speedup_dev_smoke
+                    or block["peers_on"]["dev_smoke_below_n10"]
+                    or block["peers_off"]["dev_smoke_below_n10"]
+                )
     report["verdict"] = {
         "swarm_valid_observations": valid_points,
         "swarm_total_observations": len(axis.points),
@@ -1673,127 +2468,202 @@ def _mib(value) -> str:
     return "n/a" if value is None else f"{value / 1024**2:.1f} MiB"
 
 
-def print_human_summary(report: dict) -> None:
-    out = sys.stderr
-    print("\n============== profile: HUMAN SUMMARY ==============", file=out)
+def _rate(value) -> str:
+    """A bytes/second figure in MB/s, or `n/a`. Unit-agnostic on purpose: the
+    caller says which byte unit it is, because this cannot know."""
+    return "n/a" if value is None else f"{value / 1e6:.1f} MB/s"
+
+
+def _condition_speedup_lines(condition: str, block: dict) -> list[str]:
+    """The per-condition speedup paragraph. Every claim line names its
+    condition - not as courtesy, but because `human_summary_violations`
+    rejects the summary otherwise (AC#2)."""
+    lines: list[str] = []
+    if not block.get("ran"):
+        return [f"    [{condition}] arm did NOT run: {block.get('reason', 'unknown')}"]
+    speed = block[f"speedup_{condition}"]
+    lines.append(f"    -- upstream condition: {condition} --")
+    shaping = block.get("shaping")
+    if shaping:
+        evidence = (block.get("shaping_evidence") or {}).get("peers_off_pod") or {}
+        lines.append(
+            f"       shaping injected: RTT {shaping['injected_rtt_ms']} ms, cap "
+            f"{_rate(shaping['injected_bandwidth_bytes_compressed_wire_per_s'])}"
+            " (wire)"
+        )
+        if evidence:
+            lines.append(
+                f"       shaping ASSERTED host-side: recovered RTT "
+                f"{evidence['recovered_rtt_ms']:.1f} ms, achieved "
+                f"{_rate(evidence['shaped_nar_bytes_compressed_wire_per_s'])}"
+                f" (wire); unshaped control "
+                f"{evidence['unshaped_request_latency_median_ms']:.1f} ms / "
+                f"{_rate(evidence['unshaped_nar_bytes_compressed_wire_per_s'])}"
+            )
+    else:
+        lines.append(
+            "       unshaped by definition: ~0 RTT, no cap - the control that "
+            "isolates the peer transport's own cost"
+        )
+    lines.append(
+        f"       egress payload  peers-off "
+        f"{speed['egress_payload_peers_off_bytes_compressed_wire']} B(wire) -> "
+        f"peers-on {speed['egress_payload_peers_on_bytes_compressed_wire']} "
+        f"B(wire)   offload={speed['egress_offload_fraction']}"
+    )
+    lines.append(
+        f"       realise mean    peers-off {speed['realise_mean_peers_off_s']} s "
+        f"-> peers-on {speed['realise_mean_peers_on_s']} s   "
+        f"[{condition}] speedup={speed[f'latency_speedup_mean_{condition}']}"
+    )
+    lines.append(
+        "       upstream link   peers-off "
+        + _rate(
+            block["peers_off"]["upstream_nar_transport_bytes_compressed_wire_per_s"][
+                "mean"
+            ]
+        )
+        + " (wire, testproxy bytes_sent/duration_ms - a REAL link rate)"
+    )
+    lines.append(
+        "       realise rate    peers-on "
+        + _rate(block["peers_on"]["realise_rate_bytes_uncompressed_nar_per_s"]["mean"])
+        + "  peers-off "
+        + _rate(block["peers_off"]["realise_rate_bytes_uncompressed_nar_per_s"]["mean"])
+        + " (NarSize; NOT a transport rate - TASK-68)"
+    )
+    return lines
+
+
+def human_summary_lines(report: dict) -> list[str]:  # noqa: C901 - a flat report
+    """The human summary as DATA, so it can be gated before it is printed.
+
+    Returning lines instead of printing them is what lets
+    `human_summary_violations` run over the actual text a reader will see. A
+    summary that is only checked by eye is the part of the report where a
+    carefully-qualified JSON number turns back into a bare speedup.
+    """
+    lines = ["", "============== profile: HUMAN SUMMARY =============="]
     flags = report.get("red_flags", [])
     if flags:
-        print("\n  *** RED FLAGS - SUPERLINEAR RESOURCE GROWTH ***", file=out)
+        lines.append("")
+        lines.append("  *** RED FLAGS - SUPERLINEAR RESOURCE GROWTH ***")
         for flag in flags:
             worst = flag.get("worst_extrapolation") or {}
-            print(
+            lines.append(
                 f"    {flag['id']}: {flag['selected_label']}  "
-                f"R^2={flag['r_squared']:.4f} identifiable={flag['identifiable']}",
-                file=out,
+                f"R^2={flag['r_squared']:.4f} identifiable={flag['identifiable']}"
             )
             if worst.get("point_estimate") is not None:
-                print(
+                lines.append(
                     f"      MODEL OUTPUT at n={worst.get('n')}: "
-                    f"{worst['point_estimate']:.6g} {flag['unit']}",
-                    file=out,
+                    f"{worst['point_estimate']:.6g} {flag['unit']}"
                 )
     else:
-        print("  red flags        : none (no superlinear fit)", file=out)
+        lines.append("  red flags        : none (no superlinear fit)")
 
     swarm = report["measured"]["swarm"]
     valid = sum(1 for p in swarm["points"] if p["valid"])
-    print(
+    lines.append(
         f"  swarm axis       : {valid}/{len(swarm['points'])} valid over "
-        f"{len(swarm['distinct_n'])} distinct n {swarm['distinct_n']}",
-        file=out,
+        f"{len(swarm['distinct_n'])} distinct n {swarm['distinct_n']}"
     )
     for point in swarm["points"]:
         if not point["valid"]:
-            print(f"      INVALID n={point['n']}: {point['reason']}", file=out)
+            lines.append(f"      INVALID n={point['n']}: {point['reason']}")
     for point in swarm["points"]:
         if point["valid"]:
             m = point["metrics"]
-            print(
+            lines.append(
                 f"      n={point['n']:<3} peer_rss_hwm={_mib(m['peer_rss_hwm_bytes_ram'])}"
                 f"  swarm_total={_mib(m['swarm_total_rss_hwm_bytes_ram'])}"
                 f"  fds={m['peer_fd_max']}"
                 f"  disk={m['peer_disk_allocated_bytes_ondisk']} B"
-                f"  realise={m['client_realise_s']}",
-                file=out,
+                f"  realise={m['client_realise_s']}"
             )
     hwm = swarm["high_water_vs_point_sample"]
-    print(
+    lines.append(
         f"  VmHWM vs VmRSS   : separated at "
         f"{hwm['observations_where_hwm_exceeds_point_sample']}/"
         f"{hwm['observations']} swarm points, max gap "
-        f"{_mib(hwm['max_gap_bytes_ram'])} (exercised={hwm['exercised']})",
-        file=out,
+        f"{_mib(hwm['max_gap_bytes_ram'])} (exercised={hwm['exercised']})"
     )
 
     speed = report["measured"].get("speedup")
-    if speed:
-        s = speed["speedup"]
-        for arm in (speed["peers_on"], speed["peers_off"]):
-            gap = arm["high_water_vs_point_sample"]
-            smoke = (
-                "  [DEV SMOKE, < 10 valid runs]" if arm["dev_smoke_below_n10"] else ""
+    if speed and speed.get("ran"):
+        for condition, block in sorted(speed["by_upstream_condition"].items()):
+            if not block.get("ran"):
+                continue
+            for arm in (block["peers_on"], block["peers_off"]):
+                gap = arm["high_water_vs_point_sample"]
+                smoke = (
+                    "  [DEV SMOKE, < 10 valid runs]"
+                    if arm["dev_smoke_below_n10"]
+                    else ""
+                )
+                lines.append(
+                    f"  {arm['arm']}/{condition}: {arm['valid_runs']}/{arm['runs']}"
+                    f" valid   VmHWM separated at "
+                    f"{gap['observations_where_hwm_exceeds_point_sample']}/"
+                    f"{gap['observations']} roles, max gap "
+                    f"{_mib(gap['max_gap_bytes_ram'])}{smoke}"
+                )
+                shortfalls = arm.get("peer_serve_shortfall_runs")
+                if shortfalls:
+                    lines.append(
+                        f"               WARNING: {len(shortfalls)} run(s) fell "
+                        "back to upstream (holder counter did not advance) - "
+                        "this arm partly measured the peers-OFF path"
+                    )
+                cost = arm["held_content_ram_cost"]
+                if cost.get("measured"):
+                    worst = max(
+                        cost["per_role_peak_rss_ram_per_held_nar_byte_ratio"].items(),
+                        key=lambda kv: kv[1],
+                    )
+                    lines.append(
+                        f"               RAM per held NarSize byte: worst node "
+                        f"{worst[0]} = {worst[1]:.2f}x (in-RAM blob store)"
+                    )
+        lines.append("")
+        lines.append(
+            "  SPEEDUP / OFFLOAD, PER UPSTREAM CONDITION (measured, frozen "
+            "counting rule)."
+        )
+        lines.append(
+            "  There is no such thing as 'the' speedup here: the number depends "
+            "on which upstream"
+        )
+        lines.append(
+            "  the peer path was raced against, so every ratio below carries "
+            "its condition."
+        )
+        for condition, block in sorted(speed["by_upstream_condition"].items()):
+            lines += _condition_speedup_lines(condition, block)
+        cross = speed.get("cross_condition") or {}
+        pinned = cross.get("pinned_task42_control") or {}
+        if pinned:
+            lines.append(
+                f"    PINNED task-42 loopback_control: peers-on "
+                f"{pinned['realise_mean_peers_on_s']} s vs peers-off "
+                f"{pinned['realise_mean_peers_off_s']} s, "
+                f"[loopback_control] speedup="
+                f"{pinned['latency_speedup_mean_loopback_control']}"
             )
-            print(
-                f"  {arm['arm']:<10} : {arm['valid_runs']}/{arm['runs']} valid"
-                f"   VmHWM separated at "
-                f"{gap['observations_where_hwm_exceeds_point_sample']}/"
-                f"{gap['observations']} roles, max gap "
-                f"{_mib(gap['max_gap_bytes_ram'])}{smoke}",
-                file=out,
+        if cross:
+            lines.append(
+                f"    RANKING FLIPPED between upstream conditions: "
+                f"{cross.get('ranking_flipped')}"
             )
-            shortfalls = arm.get("peer_serve_shortfall_runs")
-            if shortfalls:
-                print(
-                    f"               WARNING: {len(shortfalls)} run(s) fell back "
-                    "to upstream (holder counter did not advance) - this arm "
-                    "partly measured the peers-OFF path",
-                    file=out,
-                )
-            cost = arm["held_content_ram_cost"]
-            if cost.get("measured"):
-                worst = max(
-                    cost["per_role_peak_rss_ram_per_held_nar_byte_ratio"].items(),
-                    key=lambda kv: kv[1],
-                )
-                print(
-                    f"               RAM per held NarSize byte: worst node "
-                    f"{worst[0]} = {worst[1]:.2f}x (in-RAM blob store)",
-                    file=out,
-                )
-        print("\n  SPEEDUP / OFFLOAD (measured, frozen counting rule):", file=out)
-        print(
-            f"    egress payload  peers-off "
-            f"{s['egress_payload_peers_off_bytes_compressed_wire']} B(wire) -> "
-            f"peers-on {s['egress_payload_peers_on_bytes_compressed_wire']} B(wire)"
-            f"   offload={s['egress_offload_fraction']}",
-            file=out,
-        )
-        print(
-            f"    realise mean    peers-off {s['realise_mean_peers_off_s']} s -> "
-            f"peers-on {s['realise_mean_peers_on_s']} s  "
-            f"speedup={s['latency_speedup_mean']}",
-            file=out,
-        )
-        print(
-            f"    throughput      peers-on "
-            f"{speed['peers_on']['throughput_bytes_uncompressed_nar_per_s']['mean']}"
-            f" B(NarSize)/s   peers-off "
-            f"{speed['peers_off']['throughput_bytes_uncompressed_nar_per_s']['mean']}"
-            f" B(NarSize)/s",
-            file=out,
-        )
 
-    print(
-        "\n  MODELS (every number below is a MODEL OUTPUT, not a measurement):",
-        file=out,
-    )
+    lines.append("")
+    lines.append("  MODELS (every number below is a MODEL OUTPUT, not a measurement):")
     for fit_id, fit in report["models"].items():
         far = fit["extrapolations"][-1]
-        print(
-            f"    {fit_id:<48} {fit['selected_label']:<10} R^2={fit['r_squared']:.4f}",
-            file=out,
+        lines.append(
+            f"    {fit_id:<48} {fit['selected_label']:<10} R^2={fit['r_squared']:.4f}"
         )
-        print(
+        lines.append(
             f"        n={far['n']}: {far['point_estimate']:.6g} {fit['unit']} "
             f"(95% CI {far['ci95_mean_response']})"
             + ("" if fit["identifiable"] else "  [class NOT identifiable]")
@@ -1801,44 +2671,65 @@ def print_human_summary(report: dict) -> None:
                 "  [UNINFORMATIVE: interval crosses zero]"
                 if far["interval_extends_below_zero"]
                 else ""
-            ),
-            file=out,
+            )
         )
         applicability = report["verdict"].get("bite_applicability", {})
         row = (applicability.get("per_metric") or {}).get(fit_id)
         if row and row.get("inside_demonstrated_regime") is False:
-            print(
+            lines.append(
                 f"        NOISE: observed replicate spread "
                 f"{row['observed_median_relative_spread']:.1%} exceeds the "
                 f"{applicability['bite_demonstrated_up_to_relative_noise']:.0%} "
                 "at which class recovery is demonstrated - do not read the "
-                "class name as a law",
-                file=out,
+                "class name as a law"
             )
-    print(
-        "\n  CAVEAT: resource scaling laws only. Emergent network effects (DHT "
-        "k-buckets,\n  gossip fan-out, thundering herds) are NOT predictable from "
-        "this sweep.\n  DISK: the iroh blob store is in RAM (MemStore) - held "
-        "content costs RSS, not disk.",
-        file=out,
+    lines.append("")
+    lines.append(
+        "  CAVEAT: resource scaling laws only. Emergent network effects (DHT k-buckets,"
     )
+    lines.append(
+        "  gossip fan-out, thundering herds) are NOT predictable from this sweep."
+    )
+    lines.append(
+        "  DISK: the iroh blob store is in RAM (MemStore) - held content costs "
+        "RSS, not disk."
+    )
+    lines.append(
+        "  UPSTREAM: the WAN arm shapes SERVICE LATENCY and EGRESS RATE, not a link: no"
+    )
+    lines.append(
+        "  slow start and no receive-window-over-RTT ceiling, and the PEER side is not"
+    )
+    lines.append("  shaped at all (still pod loopback). See `shaping_fidelity`.")
     verdict = report["verdict"]
-    print(
-        f"\n  VERDICT: usable={verdict['usable']} "
+    lines.append("")
+    lines.append(
+        f"  VERDICT: usable={verdict['usable']} "
         f"(honesty_compliant={verdict['honesty_compliant']} "
         f"all_metrics_fitted={verdict['all_metrics_fitted']} "
-        f"speedup_arms_usable={verdict['speedup_arms_usable']} "
+        f"arms_usable={verdict['speedup_arms_usable']} "
         f"s9_bite_demonstrated={verdict['s9_bite_demonstrated']} "
-        f"red_flags={verdict['red_flag_count']})",
-        file=out,
+        f"red_flags={verdict['red_flag_count']})"
     )
     for problem in verdict["fit_problems"]:
-        print(f"    PROBLEM: {problem}", file=out)
+        lines.append(f"    PROBLEM: {problem}")
     for violation in (
-        report["honesty"]["s5_violations"] + report["honesty"]["unit_violations"]
+        report["honesty"]["s5_violations"]
+        + report["honesty"]["unit_violations"]
+        + report["honesty"]["speedup_qualifier_violations"]
     ):
-        print(f"    HONESTY VIOLATION: {violation}", file=out)
-    print("====================================================\n", file=out)
+        lines.append(f"    HONESTY VIOLATION: {violation}")
+    lines.append("====================================================")
+    lines.append("")
+    return lines
+
+
+def print_human_summary(report: dict) -> list[str]:
+    """Print the summary and return its lines, so the caller can gate them."""
+    lines = human_summary_lines(report)
+    for line in lines:
+        print(line, file=sys.stderr)
+    return lines
 
 
 # ---- self-test (pure; no containers) ----------------------------------------
@@ -1873,9 +2764,31 @@ def _fake_run(**kwargs) -> ProfileRun:
         "egress_nar_bytes_compressed_wire": 0,
         "egress_total_bytes_compressed_wire": 0,
         "peer_served_bytes_uncompressed_nar": 0,
+        "upstream_nar_transport_bytes_compressed_wire_per_s": 100e6,
     }
     base.update(kwargs)
     return ProfileRun(**base)
+
+
+# A shaping and a probe result that SHOULD pass, so every mutation below is a
+# single-variable change away from a known-clean baseline. Numbers chosen to sit
+# inside the bands with room, not on their edges - a baseline that only just
+# passes turns every band change into a self-test failure and teaches nothing.
+_SELF_TEST_SHAPING = UpstreamShaping(
+    rtt_ms=50, bandwidth_bytes_compressed_wire_per_s=20 * 1024**2
+)
+_GOOD_SHAPING_EVIDENCE = {
+    "measured_from": "self-test (synthetic)",
+    "probe_payload_bytes_compressed_wire": 115_343_872,
+    "latency_samples_per_state": SHAPING_LATENCY_SAMPLES,
+    "unshaped_request_latency_median_ms": 1.4,
+    "shaped_request_latency_median_ms": 53.0,
+    "recovered_rtt_ms": 51.6,
+    "unshaped_nar_bytes_compressed_wire_per_s": 700e6,
+    "shaped_nar_bytes_compressed_wire_per_s": 20.5e6,
+    "shaped_over_cap_fraction": 20.5e6 / (20 * 1024**2),
+    "negative_control": "self-test (synthetic)",
+}
 
 
 def run_self_test() -> int:  # noqa: C901 - a flat list of checks reads better here
@@ -2164,7 +3077,7 @@ def run_self_test() -> int:  # noqa: C901 - a flat list of checks reads better h
         min_valid=10,
     )
     check("an arm at the floor is usable", on["usable"] and off["usable"])
-    block = speedup_block(on, off, {"lib": {"coincide": True}})
+    block = speedup_block(on, off, {"lib": {"coincide": True}}, WAN_SHAPED)
     check(
         "a full peer hit is a 100% egress offload",
         block["egress_offload_fraction"] == 1.0,
@@ -2172,22 +3085,56 @@ def run_self_test() -> int:  # noqa: C901 - a flat list of checks reads better h
     )
     check(
         "latency speedup is a ratio of IN-CONTAINER seconds (4.0/2.0 = 2.0)",
-        block["latency_speedup_mean"] == 2.0,
-        str(block["latency_speedup_mean"]),
+        block[f"latency_speedup_mean_{WAN_SHAPED}"] == 2.0,
+        str(block[f"latency_speedup_mean_{WAN_SHAPED}"]),
+    )
+    check(
+        "the speedup key CARRIES its upstream condition, so a loopback ratio "
+        "and a WAN ratio cannot be spelled the same (task-63 AC#2)",
+        f"latency_speedup_mean_{WAN_SHAPED}" in block
+        and "latency_speedup_mean" not in block,
+        str(sorted(k for k in block if "speedup" in k)),
+    )
+    control_block = speedup_block(
+        on, off, {"lib": {"coincide": True}}, LOOPBACK_CONTROL
+    )
+    check(
+        "the loopback CONTROL block is keyed differently from the WAN one",
+        f"latency_speedup_mean_{LOOPBACK_CONTROL}" in control_block
+        and f"latency_speedup_mean_{WAN_SHAPED}" not in control_block,
+        str(sorted(k for k in control_block if "speedup" in k)),
+    )
+    unnamed = False
+    try:
+        speedup_block(on, off, {}, "some-upstream-i-did-not-name")
+    except ValueError:
+        unnamed = True
+    check(
+        "MUTATION: an UNNAMED upstream condition is REFUSED, not silently "
+        "suffixed (that is how an unqualified number gets born)",
+        unnamed,
+    )
+    check(
+        "the realise rate says in its own key that it is a realise rate, and a "
+        "REAL transport rate sits beside it (TASK-68)",
+        "realise_rate_bytes_uncompressed_nar_per_s" in off
+        and "throughput_bytes_uncompressed_nar_per_s" not in off
+        and "upstream_nar_transport_bytes_compressed_wire_per_s" in off,
+        str(sorted(k for k in off if k.endswith("_per_s"))),
     )
     # THE cross-unit trap, proven: make the peer-served (NarSize) figure absurdly
     # large and assert the offload fraction does NOT move. If NarSize had leaked
     # into the wire-unit ratio it would.
     on_inflated = json.loads(json.dumps(on))
     on_inflated["peer_served_bytes_uncompressed_nar"]["mean"] = 999_999_999_999
-    inflated = speedup_block(on_inflated, off, {"lib": {"coincide": True}})
+    inflated = speedup_block(on_inflated, off, {"lib": {"coincide": True}}, WAN_SHAPED)
     check(
         "MUTATION: inflating the NarSize-unit peer-served figure does NOT move "
         "the wire-unit offload fraction (no cross-unit leak)",
         inflated["egress_offload_fraction"] == block["egress_offload_fraction"],
         f"{inflated['egress_offload_fraction']} vs {block['egress_offload_fraction']}",
     )
-    observed_range = block["latency_speedup_observed_range"]
+    observed_range = block[f"latency_speedup_observed_range_{WAN_SHAPED}"]
     check(
         "the speedup ratio carries the range the runs actually spanned "
         "(not a bare point estimate)",
@@ -2204,7 +3151,9 @@ def run_self_test() -> int:  # noqa: C901 - a flat list of checks reads better h
         workload_bytes_uncompressed_nar=1,
         min_valid=10,
     )
-    spread_range = speedup_block(spread_on, off, {})["latency_speedup_observed_range"]
+    spread_range = speedup_block(spread_on, off, {}, WAN_SHAPED)[
+        f"latency_speedup_observed_range_{WAN_SHAPED}"
+    ]
     check(
         f"a noisy peers-ON arm widens that range instead of hiding the noise "
         f"({spread_range})",
@@ -2229,22 +3178,227 @@ def run_self_test() -> int:  # noqa: C901 - a flat list of checks reads better h
     print("\n  -- report assembly + honesty gates --")
     prov = {"workload_version": "test", "fixture_tier": "full", "host": {}}
     config = {"self_test": True}
+
+    def _condition_arm(condition: str) -> dict:
+        shaping = None if condition == LOOPBACK_CONTROL else _SELF_TEST_SHAPING
+        # The two per-arm blocks the container path attaches after scoring; the
+        # summary reads them, so a synthetic arm without them would only prove
+        # the report assembles, not that it PRINTS.
+        arms = {}
+        for name in ("peers_on", "peers_off"):
+            arm = json.loads(json.dumps(on if name == "peers_on" else off))
+            arm["high_water_vs_point_sample"] = hwm_vs_point_roles(
+                {"node-a": {"rss_hwm_bytes_ram": 300, "rss_point_max_bytes_ram": 100}},
+                f"self-test {name}",
+            )
+            arm["held_content_ram_cost"] = held_content_ram_cost(
+                {"node-a": {"rss_hwm_bytes_ram": 300}},
+                100 if name == "peers_on" else 0,
+            )
+            arms[name] = arm
+        return {
+            "ran": True,
+            "upstream_condition": condition,
+            "shaping": None if shaping is None else shaping.as_report(),
+            "shaping_fidelity": None if shaping is None else shaping_fidelity_note(),
+            "shaping_evidence": (
+                None
+                if shaping is None
+                else {"peers_off_pod": dict(_GOOD_SHAPING_EVIDENCE)}
+            ),
+            "shaping_asserted": True,
+            "attrs": ["lib"],
+            "runs_requested": 10,
+            "peers_on": arms["peers_on"],
+            "peers_off": arms["peers_off"],
+            f"speedup_{condition}": speedup_block(
+                on, off, {"lib": {"coincide": True}}, condition
+            ),
+        }
+
+    by_condition = {c: _condition_arm(c) for c in UPSTREAM_CONDITIONS}
     speedup_measured = {
         "ran": True,
-        "attrs": ["lib"],
-        "runs_requested": 10,
-        "peers_on": on,
-        "peers_off": off,
-        "speedup": block,
+        "by_upstream_condition": by_condition,
+        "cross_condition": cross_condition_block(by_condition),
     }
     linear = _synthetic_swarm_axis("linear")
     report = build_report(
         linear, speedup_measured, study, prov, config, (10, 100, 1000)
     )
     check(
-        "assembled report is honesty-COMPLIANT (S5 + units)",
+        "assembled report is honesty-COMPLIANT (S5 + units + condition labels)",
         report["honesty"]["compliant"],
-        str(report["honesty"]["s5_violations"] + report["honesty"]["unit_violations"]),
+        str(
+            report["honesty"]["s5_violations"]
+            + report["honesty"]["unit_violations"]
+            + report["honesty"]["speedup_qualifier_violations"]
+        ),
+    )
+
+    # --- task-63: the shaping assertion, proven to BITE by mutation ----------
+    print("\n  -- upstream shaping: the assertion, and its bite --")
+    check(
+        "a probe that recovered the injected RTT and hit the cap is CLEAN",
+        shaping_violations(_GOOD_SHAPING_EVIDENCE, _SELF_TEST_SHAPING) == [],
+        str(shaping_violations(_GOOD_SHAPING_EVIDENCE, _SELF_TEST_SHAPING)),
+    )
+    # THE mutation the whole task turns on: the shaping was never applied, so
+    # the shaped observations equal the unshaped ones. A checker that passes
+    # here would confirm any shaping at all, including none.
+    never_applied = dict(_GOOD_SHAPING_EVIDENCE)
+    never_applied["shaped_request_latency_median_ms"] = never_applied[
+        "unshaped_request_latency_median_ms"
+    ]
+    never_applied["shaped_nar_bytes_compressed_wire_per_s"] = never_applied[
+        "unshaped_nar_bytes_compressed_wire_per_s"
+    ]
+    problems = shaping_violations(never_applied, _SELF_TEST_SHAPING)
+    check(
+        "MUTATION: the shaping was NEVER APPLIED (shaped == unshaped) -> the "
+        "assertion goes RED and NAMES both failures",
+        len(problems) == 2
+        and any("RTT NOT recovered" in p for p in problems)
+        and any("bandwidth cap NOT achieved" in p for p in problems),
+        str(problems),
+    )
+    latency_only = dict(_GOOD_SHAPING_EVIDENCE)
+    latency_only["shaped_nar_bytes_compressed_wire_per_s"] = 700e6
+    check(
+        "MUTATION: RTT injected but the bandwidth cap did not fire -> REJECTED, "
+        "with only the bandwidth named (the checks are independent)",
+        [p for p in shaping_violations(latency_only, _SELF_TEST_SHAPING) if "cap" in p]
+        and not [
+            p
+            for p in shaping_violations(latency_only, _SELF_TEST_SHAPING)
+            if "RTT" in p
+        ],
+        str(shaping_violations(latency_only, _SELF_TEST_SHAPING)),
+    )
+    # The anti-vacuity half: a channel already slower than the shaping would let
+    # a dead shaper pass. It must be a NAMED failure, not a silent success.
+    slow_channel = dict(_GOOD_SHAPING_EVIDENCE)
+    slow_channel["unshaped_nar_bytes_compressed_wire_per_s"] = 21e6
+    check(
+        "MUTATION: the unshaped CONTROL is no faster than the cap -> VACUOUS "
+        "PROBE, named and rejected (a slow channel must not pass as a shaper)",
+        any(
+            "VACUOUS PROBE" in p
+            for p in shaping_violations(slow_channel, _SELF_TEST_SHAPING)
+        ),
+        str(shaping_violations(slow_channel, _SELF_TEST_SHAPING)),
+    )
+    slow_unshaped_latency = dict(_GOOD_SHAPING_EVIDENCE)
+    slow_unshaped_latency["unshaped_request_latency_median_ms"] = 40.0
+    slow_unshaped_latency["shaped_request_latency_median_ms"] = 90.0
+    check(
+        "MUTATION: an unshaped control already costing most of the injected RTT "
+        "-> VACUOUS PROBE, even though the delta itself looks right",
+        any(
+            "VACUOUS PROBE" in p
+            for p in shaping_violations(slow_unshaped_latency, _SELF_TEST_SHAPING)
+        ),
+        str(shaping_violations(slow_unshaped_latency, _SELF_TEST_SHAPING)),
+    )
+    missing = dict(_GOOD_SHAPING_EVIDENCE)
+    missing.pop("shaped_nar_bytes_compressed_wire_per_s")
+    check(
+        "MUTATION: a probe MISSING a measurement is a failure, not a skip "
+        "(unmeasured != asserted)",
+        any(
+            "missing a usable" in p
+            for p in shaping_violations(missing, _SELF_TEST_SHAPING)
+        ),
+        str(shaping_violations(missing, _SELF_TEST_SHAPING)),
+    )
+    unverified = json.loads(json.dumps(speedup_measured))
+    unverified["by_upstream_condition"][WAN_SHAPED]["shaping_asserted"] = False
+    check(
+        "MUTATION: a WAN arm whose shaping was NOT asserted makes the whole "
+        "report UNUSABLE (an unverified shaper may not be quoted)",
+        not build_report(linear, unverified, study, prov, config, (10, 100, 1000))[
+            "verdict"
+        ]["usable"],
+    )
+
+    # --- task-63 AC#2: no unqualified speedup, in JSON or in the summary -----
+    print("\n  -- AC#2: every speedup names its upstream condition --")
+    check(
+        "the two-condition report passes the qualifier gate",
+        speedup_qualifier_violations(report) == [],
+        str(speedup_qualifier_violations(report)),
+    )
+    bare = json.loads(json.dumps(report))
+    bare["measured"]["speedup"]["by_upstream_condition"][WAN_SHAPED][
+        f"speedup_{WAN_SHAPED}"
+    ]["latency_speedup_mean"] = 6.1
+    check(
+        "MUTATION: a BARE `latency_speedup_mean` anywhere in the speedup subtree "
+        "-> REJECTED (task-63 AC#2)",
+        speedup_qualifier_violations(bare) != [],
+        str(speedup_qualifier_violations(bare)),
+    )
+    dropped = json.loads(json.dumps(report))
+    dropped["measured"]["speedup"]["by_upstream_condition"].pop(WAN_SHAPED)
+    check(
+        "MUTATION: dropping the WAN arm and keeping only the nicely-suffixed "
+        "loopback CONTROL -> REJECTED (the control alone is not the goal answer)",
+        speedup_qualifier_violations(dropped) != [],
+        str(speedup_qualifier_violations(dropped)),
+    )
+    unindexed = json.loads(json.dumps(report))
+    unindexed["measured"]["speedup"].pop("by_upstream_condition")
+    check(
+        "MUTATION: a speedup report with no by-condition index -> REJECTED",
+        speedup_qualifier_violations(unindexed) != [],
+    )
+    summary_lines = human_summary_lines(report)
+    check(
+        "the printed HUMAN summary states no unqualified speedup either",
+        human_summary_violations(summary_lines) == [],
+        str(human_summary_violations(summary_lines)),
+    )
+    check(
+        "MUTATION: an unqualified speedup line in the human summary -> REJECTED "
+        "(the JSON gate cannot see the text a reader actually reads)",
+        human_summary_violations(["    realise mean ... speedup=6.12"]) != [],
+    )
+    check(
+        "and a line naming its condition passes",
+        human_summary_violations([f"    [{WAN_SHAPED}] speedup=6.12"]) == [],
+    )
+    check(
+        "the summary actually PRINTS both conditions (not just the JSON)",
+        any(LOOPBACK_CONTROL in line for line in summary_lines)
+        and any(WAN_SHAPED in line for line in summary_lines),
+    )
+    check(
+        "the summary pins the task-42 loopback control numbers (AC#3)",
+        any("PINNED task-42" in line and "0.562" in line for line in summary_lines),
+        str([ln for ln in summary_lines if "PINNED" in ln]),
+    )
+    flipped = cross_condition_block(
+        {
+            LOOPBACK_CONTROL: _condition_arm(LOOPBACK_CONTROL),
+            WAN_SHAPED: _condition_arm(WAN_SHAPED),
+        }
+    )
+    check(
+        "identical arms under both conditions do NOT report a ranking flip",
+        flipped["ranking_flipped"] is False,
+        str(flipped["ranking_flipped"]),
+    )
+    slow_peer = _condition_arm(LOOPBACK_CONTROL)
+    slow_peer[f"speedup_{LOOPBACK_CONTROL}"][
+        f"latency_speedup_mean_{LOOPBACK_CONTROL}"
+    ] = 0.283
+    check(
+        "peers losing under one condition and winning under the other IS a "
+        "ranking flip, computed not narrated",
+        cross_condition_block(
+            {LOOPBACK_CONTROL: slow_peer, WAN_SHAPED: _condition_arm(WAN_SHAPED)}
+        )["ranking_flipped"]
+        is True,
     )
     check(
         "known O(n) per-peer RSS recovers linear",
@@ -2262,7 +3416,7 @@ def run_self_test() -> int:  # noqa: C901 - a flat list of checks reads better h
 
     # `usable` must mean "these numbers may be quoted". Two ways it must not.
     smoke = json.loads(json.dumps(speedup_measured))
-    smoke["peers_on"]["dev_smoke_below_n10"] = True
+    smoke["by_upstream_condition"][WAN_SHAPED]["peers_on"]["dev_smoke_below_n10"] = True
     smoke_report = build_report(linear, smoke, study, prov, config, (10, 100, 1000))
     check(
         "MUTATION: a speedup arm below the frozen 10-run floor makes the whole "
@@ -2737,6 +3891,27 @@ def main() -> int:
         help="run only the fitted swarm axis (dev loop)",
     )
     parser.add_argument(
+        "--wan-rtt-ms",
+        type=int,
+        default=WAN_RTT_MS,
+        help="RTT injected into the WAN-shaped upstream arm, per request "
+        "(default: %(default)s; derived from task-35, see the constant)",
+    )
+    parser.add_argument(
+        "--wan-bandwidth-mib-s",
+        type=float,
+        default=WAN_BANDWIDTH_BYTES_COMPRESSED_WIRE_PER_S / 1024**2,
+        help="NAR egress cap for the WAN-shaped arm, in MiB of "
+        "bytes_compressed_wire per second (default: %(default)s)",
+    )
+    parser.add_argument(
+        "--wan-probe-only",
+        action="store_true",
+        help="stand up ONE pod, arm the shaping, assert it from outside the "
+        "shaper and exit. The cheap way to check the shaping still bites "
+        "without paying for the whole ~30-minute profile",
+    )
+    parser.add_argument(
         "--extrapolate-to",
         type=ss.int_list,
         default=scalefit.DEFAULT_EXTRAPOLATION_TARGETS,
@@ -2808,11 +3983,50 @@ def main() -> int:
     state_root.mkdir(parents=True, exist_ok=True)
     ctx = e2e.Ctx(podman=e2e.podman(), image=image, fixtures=fixtures, scratch=scratch)
 
+    shaping = UpstreamShaping(
+        rtt_ms=args.wan_rtt_ms,
+        bandwidth_bytes_compressed_wire_per_s=int(args.wan_bandwidth_mib_s * 1024**2),
+    )
+
+    # The cheap bite check: one pod, arm the shaping, assert it from outside,
+    # exit. This is how the shaping's oracle is re-proven after a change without
+    # paying for the full profile - and how it was proven to go RED by disabling
+    # the shaping (task-63 notes).
+    if args.wan_probe_only:
+        with e2e.Pod(
+            ctx,
+            "prof-wan-probe",
+            fixtures.cache,
+            with_daemon=True,
+            expect=ss.silent_expect([]),
+            state_root=state_root / "wan-probe",
+        ) as pod:
+            prewarm_upstream_cache(fixtures)
+            evidence = probe_upstream_link(pod, fixtures, shaping)
+        problems = shaping_violations(evidence, shaping)
+        print(
+            json.dumps(
+                {
+                    "shaping": shaping.as_report(),
+                    "evidence": evidence,
+                    "violations": problems,
+                },
+                indent=2,
+            )
+        )
+        e2e.cleanup_pods()
+        shutil.rmtree(scratch, ignore_errors=True)
+        for problem in problems:
+            print(f"profile: SHAPING NOT VERIFIED: {problem}", file=sys.stderr)
+        return 1 if problems else 0
+
     config = {
         "swarm_sizes": list(args.swarm),
         "repeats_per_point": args.repeats,
         "speedup_runs": args.speedup_runs,
         "speedup_skipped": bool(args.skip_speedup),
+        "upstream_conditions": list(UPSTREAM_CONDITIONS),
+        "wan_shaping": shaping.as_report(),
         "swarm_attrs": list(SWARM_ATTRS),
         "speedup_attrs": list(SPEEDUP_ATTRS),
         "poll_interval_s": ss.POLL_INTERVAL_S,
@@ -2832,7 +4046,9 @@ def main() -> int:
             # ordering below exists for - a later failure must not destroy an
             # earlier measurement.
             try:
-                speedup = run_speedup_arms(ctx, fixtures, args.speedup_runs, state_root)
+                speedup = run_speedup_conditions(
+                    ctx, fixtures, args.speedup_runs, state_root, shaping
+                )
             except (RuntimeError, ss.SampleError, OSError, ValueError) as error:
                 speedup = {
                     "ran": False,
@@ -2880,9 +4096,15 @@ def main() -> int:
     if args.report:
         args.report.write_text(text + "\n")
         print(f"profile: report written to {args.report}", file=sys.stderr)
-    print_human_summary(report)
+    summary_lines = print_human_summary(report)
+    # AC#2 covers the SUMMARY, not only the schema - so it is gated here, on the
+    # text that was actually printed, and an unqualified speedup in it makes the
+    # run fail like any other honesty violation.
+    summary_problems = human_summary_violations(summary_lines)
+    for problem in summary_problems:
+        print(f"profile: HONESTY VIOLATION (human summary): {problem}", file=sys.stderr)
     print(text)
-    return 0 if report["verdict"]["usable"] else 1
+    return 0 if report["verdict"]["usable"] and not summary_problems else 1
 
 
 if __name__ == "__main__":
