@@ -1,11 +1,11 @@
 ---
 id: TASK-42
 title: 'Profiling harness: RAM/disk/latency/throughput/speedup over the p2p testbed'
-status: In Progress
+status: Done
 assignee:
   - '@me'
 created_date: '2026-08-08 20:13'
-updated_date: '2026-08-09 13:03'
+updated_date: '2026-08-09 13:22'
 labels: []
 dependencies:
   - TASK-41
@@ -21,9 +21,9 @@ The owner-goal profiling instrument (extend task-18 S5 machinery + net-upstream-
 
 ## Acceptance Criteria
 <!-- AC:BEGIN -->
-- [ ] #1 just profile emits a report: per-node RSS/fds, disk footprint, latency p50/p95, throughput, egress-vs-upstream, for a scripted p2p workload
-- [ ] #2 S9 bite: a synthetic known-O(n)-RAM scenario recovers a linear regression fit; a known-O(1) recovers constant; wrong-model selection fails the self-test
-- [ ] #3 Extrapolation labeled model-output (never measurement); R^2/residuals reported; resource-laws-only caveat stated (no emergent-network-effect claims)
+- [x] #1 just profile emits a report: per-node RSS/fds, disk footprint, latency p50/p95, throughput, egress-vs-upstream, for a scripted p2p workload
+- [x] #2 S9 bite: a synthetic known-O(n)-RAM scenario recovers a linear regression fit; a known-O(1) recovers constant; wrong-model selection fails the self-test
+- [x] #3 Extrapolation labeled model-output (never measurement); R^2/residuals reported; resource-laws-only caveat stated (no emergent-network-effect claims)
 <!-- AC:END -->
 
 ## Implementation Notes
@@ -165,4 +165,65 @@ in the e2e seam; a correctness fix in `scalefit` (FITTER_VERSION -> v2).
   the meaning of `superlinear` in scalefit instead.
 - A one-seed 'the fitter got it right' bite: a coin flip dressed as an oracle.
   Monte-Carlo rate gates instead.
+
+## Final summary (task-42 DONE)
+
+DELIVERED: `scripts/profile_p2p.py` (~2.5k lines) + `just profile` (SLOW) + a
+91-check container-free `--self-test` in the FAST `just test` gate; the Pod seam
+gains `p2p_holders=N` (a real n+1-process peer swarm) and `state_root=` (host-side
+disk measurement); `scalefit` -> v2 (a red flag now means superlinear GROWTH).
+
+GATES (this tree): build 0, lint 0, test 0 (209 cargo tests; 202 self-test
+checks across four instruments), e2e 0 (26/26 scenarios, 200 checks),
+profile 0 (usable=true, honesty_compliant=true, red_flags=0, 15/15 swarm points,
+10/10 per speedup arm). git notes --ref=verification carries the detail.
+
+HEADLINE MEASUREMENTS (this host; every byte figure unit-labelled by schema):
+  MEASURED, swarm 1..16 holder peers, 3 replicates, 15/15 valid
+    per-peer peak RSS (VmHWM)  19.1-21.2 MiB     fitted O(1), NOT identifiable
+    swarm-total peak RSS       37.9 -> ~305 MiB  fitted O(n), R^2 0.9985
+    per-peer fds               10-11             fit not identifiable, R^2 0.54
+    per-peer on-disk           4096 B allocated  fitted O(1), R^2 1.0, FLAT
+    client realise             0.028-0.037 s     fitted O(1), R^2 0.0
+  MEASURED, speedup arm (110 MiB + 64 KiB, compression:none, 10 valid runs/arm)
+    egress payload   peers-off 115,409,920 B(wire) -> peers-on 0 -> offload 1.00
+    realise mean     peers-off 0.159 s vs peers-on 0.562 s
+    latency speedup  0.283 (range 0.177-0.511) -> THE PEER PATH IS ~3.5x SLOWER
+    throughput       iroh 210 MB/s vs HTTP-through-daemon 758 MB/s (NarSize)
+    peak RSS         node-b 236.7 MiB, node-a 135.9 MiB, peers-OFF daemon 10.7 MiB
+    RAM per held NarSize byte  node-b 2.15x, node-a 1.23x
+  MODEL OUTPUT (labelled, never a measurement)
+    swarm-total RSS at n=1000: 18.75 GB (95% CI 18.32-19.18 GB)
+
+FINDINGS THE NEXT WAVE MUST NOT REDISCOVER
+1. THERE IS NO ON-DISK BLOB STORE. `IrohProvider` uses `MemStore`, so held
+   content costs RAM. Per-node disk is 4096 B, flat. The binding constraint for
+   scale is MEMORY, and a whole-NAR addressed unit makes BOTH ends resident-size
+   the payload. -> TASK-54's subject changes.
+2. THE PEER PATH IS SLOWER THAN THE CACHE ON THIS TESTBED, while offloading 100%
+   of payload egress. The 'upstream' is a loopback testproxy, i.e. an
+   unrealistically fast cache, so 0.283 is NOT a product number - but it does
+   mean the slow-HIT policy question is the NORMAL case here, not an edge case.
+   -> TASK-44 must model both regimes.
+3. TASK-18's HIGH-WATER GAP IS NOW CLOSED. The 110 MiB burst separated VmHWM
+   from the point sample by 99.8 MiB on the holder. The distinction is
+   EXERCISED, not merely reported.
+4. SWARM SIZE 1..16 MOVED NOTHING per-peer: RSS, fds, disk and client latency
+   are all flat. Only the host total grows, linearly.
+
+HONEST LIMITATIONS OF THE INSTRUMENT
+- The fitted CLASSES for RSS and latency are not backed by a demonstrated
+  recovery rate: on this grid the linear-vs-superlinear split is demonstrated
+  only to ~1% relative noise, and the observed replicate spread is 1.7-4.0%.
+  The report computes this per metric and prints a NOISE warning; read
+  `identifiable`, R^2 and interval width, not the class name.
+- Extrapolation intervals UNDER-cover under multiplicative noise (0.865 vs 0.95
+  nominal at n=1000). Far extrapolations are optimistic.
+- The swarm axis measures n peer PROCESSES plus an n-entry address book, NOT
+  holder selection or dial fan-out: a multi-holder claim is not expressible
+  (announce replaces on key).
+- `nix flake check` was NOT run; the cargo results come from a warm ./target.
+- Follow-ups filed: TASK-58 (shared podman label), TASK-59 (parallel S5 report
+  implementations + the unit rule policing only one schema), TASK-60
+  (e2e.die as control flow).
 <!-- SECTION:NOTES:END -->
