@@ -1293,6 +1293,24 @@ def human_lines(measured: dict, models: dict) -> list[str]:
         "  residency oracle (store-side, NOT peak RSS): holder retains everything "
         f"it served = {retains}"
     )
+    # THE DECOMPOSITION, and the reason both fits exist. Peak RSS and store
+    # residency are fitted against the SAME n, so a reader can see how much of the
+    # holder's per-byte cost is content the store is actually holding and how much
+    # is transient. Stated as two numbers side by side and a named candidate, NOT
+    # as a subtraction: the two slopes have different numerators (resident memory
+    # vs NarSize), and this report does not do cross-unit arithmetic.
+    residency_fit = models.get("size.holder_store_resident_bytes_uncompressed_nar")
+    rss_fit = models.get("size.holder_rss_hwm_bytes_ram")
+    if residency_fit and rss_fit and residency_fit.get("slope_ci95"):
+        lines.append(
+            f"    the holder's STORE holds {residency_fit['slope']:.4f} NarSize "
+            f"bytes per byte of NAR while its PEAK RSS grows at "
+            f"{rss_fit['slope']:.4f} bytes of RAM per byte of NAR. The two are "
+            "fitted against the same n, so the difference between them is memory "
+            "the store is NOT holding - the seed-time file buffer plus the "
+            "`add_bytes(raw_nar.to_vec())` clone at transport_iroh.rs, which "
+            "TASK-46 owns. That is a code artifact, not the architecture."
+        )
     independence = size.get("derived_quantity_independence", {})
     if independence.get("checked"):
         lines.append(f"  derived-quantity gate: {independence['verdict']}")
@@ -1658,6 +1676,28 @@ def run_self_test() -> int:  # noqa: C901 - a flat list of checks reads better h
         "a summary of a real arm quotes both slopes WITH their intervals",
         sum("95% CI" in line for line in human_lines(long_measured, long_models)) == 2,
         str(human_lines(long_measured, long_models)),
+    )
+    check(
+        "the summary states the peak-RSS vs store-residency decomposition",
+        any(
+            "the store is NOT holding" in line
+            for line in human_lines(long_measured, long_models)
+        ),
+    )
+    check(
+        "with no residency fit there is NO decomposition line (it is not "
+        "asserted from one number)",
+        not any(
+            "the store is NOT holding" in line
+            for line in human_lines(
+                long_measured,
+                {
+                    k: v
+                    for k, v in long_models.items()
+                    if k != "size.holder_store_resident_bytes_uncompressed_nar"
+                },
+            )
+        ),
     )
 
     print(f"\nsizeaxis --self-test: {'ALL PASS' if ok else 'FAILURES PRESENT'}")
