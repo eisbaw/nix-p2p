@@ -1049,6 +1049,12 @@ def sweep_swarm(ctx, fixtures, sizes, repeats: int, state_root: Path) -> ss.Axis
                 # whole sweep to that would be a harness fault reported as a
                 # missing law. Any OTHER exit code - notably the SIGTERM handler's
                 # 143 - is a real request to stop and is re-raised.
+                #
+                # TASK-60: this is a WORKAROUND for `die()` being control flow.
+                # Sniffing an exit code loses the message (the reason below can
+                # only point at a stderr scrollback) and demotes any future
+                # genuinely-fatal `die(..., code=2)` to a bad data point. The
+                # root fix is a raisable `e2e.HarnessError`.
                 if error.code != 2:
                     raise
                 point.reason = (
