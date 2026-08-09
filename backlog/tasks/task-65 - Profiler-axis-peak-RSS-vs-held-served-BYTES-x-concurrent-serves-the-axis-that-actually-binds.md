@@ -3,11 +3,11 @@ id: TASK-65
 title: >-
   Profiler axis: peak RSS vs held/served BYTES x concurrent serves (the axis
   that actually binds)
-status: In Progress
+status: Done
 assignee:
   - '@me'
 created_date: '2026-08-09 13:31'
-updated_date: '2026-08-09 17:26'
+updated_date: '2026-08-09 17:37'
 labels: []
 dependencies:
   - TASK-42
@@ -21,9 +21,9 @@ TASK-42 swept peer COUNT at roughly constant held-bytes and correctly found per-
 
 ## Acceptance Criteria
 <!-- AC:BEGIN -->
-- [ ] #1 just profile grows a size axis: >=5 distinct NAR sizes, one holder + one fetcher, fitted slope (bytes of RSS per byte of NAR) with confidence interval via scalefit, for BOTH the holder and the fetcher
-- [ ] #2 A concurrency dimension: k overlapping serves of the same size, with the measured overlap asserted (a point whose overlap != k is INVALID, per the task-18 rule)
-- [ ] #3 The residency oracle is NOT peak RSS alone; state which mechanism is used and prove by mutation that it distinguishes 'the store released it' from 'the allocator kept the arena'
+- [x] #1 just profile grows a size axis: >=5 distinct NAR sizes, one holder + one fetcher, fitted slope (bytes of RSS per byte of NAR) with confidence interval via scalefit, for BOTH the holder and the fetcher
+- [x] #2 A concurrency dimension: k overlapping serves of the same size, with the measured overlap asserted (a point whose overlap != k is INVALID, per the task-18 rule)
+- [x] #3 The residency oracle is NOT peak RSS alone; state which mechanism is used and prove by mutation that it distinguishes 'the store released it' from 'the allocator kept the arena'
 <!-- AC:END -->
 
 ## Implementation Plan
@@ -214,4 +214,28 @@ DESIGN NOTES / gotchas for whoever follows:
  * task-42's 18.75 GB @ n=1000 is now qualified AT THE FIT (not in prose
    elsewhere) as a host-total harness figure, and the printed summary says so.
    Proven by mutation.
+
+## FINAL
+
+All three ACs met and verified. Full gates: build/lint/test/e2e/profile all EXIT=0;
+`just profile` at the default grid returns usable=True with 15/15 valid size points,
+15/15 valid concurrency points (measured overlap == k for k=1..5) and 10/10 valid
+speedup runs in both upstream conditions. Verification note on commit 080374f.
+
+HONEST LIMITS a reader should carry forward:
+ 1. The size axis's consumer is a host-side HTTP reader, not real nix. It measures
+    the DAEMONS' memory, which is the question; it proves nothing about nix's
+    acceptance of what the daemon serves (S6 and check-rewrite-realnix own that,
+    against the real fixtures).
+ 2. The payloads are SYNTHETIC single-file NARs: real framing, real sha256 NarHash,
+    really signed - but never realised by nix, and the store path hash is derived
+    from the content rather than from a derivation.
+ 3. The residency oracle answers 'does the STORE hold this'. With MemStore that IS
+    RAM residency by construction; under an on-disk store it is not.
+ 4. The 'allocator merely retains' case is proven against VmHWM, which retains by
+    kernel definition. It could NOT be constructed against CURRENT RSS on this host:
+    glibc returned ~97-100% of the payload however the allocations were shaped.
+ 5. The fetcher slope measures the daemon's whole-NAR buffer under a client that
+    drains as fast as it can. It is NOT a backpressure measurement; TASK-62 still
+    has to build the slow-reading client for its AC#2.
 <!-- SECTION:NOTES:END -->
