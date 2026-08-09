@@ -97,6 +97,12 @@ test: build _python fixtures
     # mutation (a report stripped of its labels must be REJECTED).
     "${NIX_P2P_PYTHON}/bin/python3" scripts/scalefit.py --self-test
     "${NIX_P2P_PYTHON}/bin/python3" scripts/scale_sweep.py --self-test
+    # task-42: the profiler's unit gate (NarSize vs FileSize can never share an
+    # unlabelled `_bytes` key), its S9 class-recovery bite (a known-O(n^2) law is
+    # NEVER fitted linear), the disk walk and the arm scoring are all
+    # container-free, so the honesty machinery is covered on EVERY cycle. Every
+    # rule is proven by mutation.
+    "${NIX_P2P_PYTHON}/bin/python3" scripts/profile_p2p.py --self-test
     # task-49: real nix accepts the daemon's rewritten narinfo + raw nar
     # (none/xz/zstd) and rejects a signed-field mutation. Needs the `daemon`
     # binary (hence the `build` dep) and the fast-tier fixtures.
@@ -192,6 +198,23 @@ measure *ARGS: _python fixtures-large
 # Run the S5 scale sweep and emit the fitted/extrapolated report.
 scale-sweep *ARGS: _python fixtures-large
     "${NIX_P2P_PYTHON}/bin/python3" scripts/scale_sweep.py {{ ARGS }}
+
+# The owner-goal profiling instrument (task-42): RAM / disk / latency /
+# throughput / speedup over the p2p testbed. Two arms. (1) A real SWARM of n
+# holder peers (n+1 daemon processes in one pod, each an iroh provider) swept
+# over 1,2,4,8,16 - the peer axis with REAL points, since two nodes cannot
+# discriminate O(n) from O(n log n) - fitted by scripts/scalefit.py and
+# extrapolated to 10/100/1000 as labelled MODEL OUTPUT. (2) A peers-ON vs
+# peers-OFF speedup arm scored by the FROZEN counting rule (net-upstream-egress-v2,
+# via measure.classify_run), over the 110 MiB payload so throughput is a real
+# number. Every `*_bytes` key carries its unit - NarSize and FileSize are
+# different units and the report refuses to name either one plain `_bytes`.
+# Full-tier fixtures + the fail-closed check-fixtures gate. SLOW tier: ~20
+# minutes of container runs at the default grid (the fast-tier half is the
+# --self-test wired into `just test`). Label-scoped cleanup on exit and SIGTERM.
+# Run the p2p profile (RAM/disk/latency/throughput/speedup) and emit the report.
+profile *ARGS: _python fixtures-large
+    "${NIX_P2P_PYTHON}/bin/python3" scripts/profile_p2p.py {{ ARGS }}
 
 # Reuses the e2e Pod seam (scripts/e2e_harness.py) as its driver and asserts the
 # two operator oracles - the daemon's per-substitution log story (AC#1) and the
