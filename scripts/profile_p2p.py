@@ -86,6 +86,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 import random
 import shutil
@@ -184,6 +185,15 @@ GATE_EXACT_RATE = {
 # THE bite: a known-superlinear generator must be classified superlinear, and
 # must NEVER be classified linear. `linear_rate` is gated at exactly 0.0.
 GATE_SUPERLINEAR_RATE = {"quadratic": 1.0, "linearithmic": 0.95}
+
+# The rate at which the LINEAR-vs-SUPERLINEAR split must hold, in both
+# directions, for a noise level to count as a regime where the S9 bite is
+# demonstrated (`bite_applicability`). 0.90 rather than 0.95 because the
+# `constant` generator tops out near 0.93 on pure noise - AICc occasionally buys
+# a second parameter - and a floor no generator can reach would make the block
+# report "unknown" forever, which is worse than a slightly loose but reachable
+# one. It is a floor on the INSTRUMENT, not on the product.
+DISCRIMINATION_FLOOR = 0.90
 
 # Which selected classes count as "the same family" as a generated class, for the
 # wrong-model rule. The split that matters (and that TESTING.md S9 names) is
@@ -469,27 +479,55 @@ SWARM_METRICS = (
 )
 
 
-def swarm_metrics_from(resources: dict, disks: dict, realise_s: list[float]) -> dict:
-    """Map the reused aggregate + the disk walk onto this report's UNIT-LABELLED
-    metric names. The renaming is not cosmetic: `scale_sweep.aggregate_samples`
-    returns bare `*_bytes` keys, and this report's unit gate rejects those, so the
-    translation happens once, here, where both sides are visible."""
+def label_resources(resources: dict) -> dict:
+    """THE translation from `scale_sweep.aggregate_samples` keys to this report's
+    UNIT-LABELLED names. One function, used by every caller.
+
+    The renaming is not cosmetic: `aggregate_samples` returns bare `*_bytes`
+    keys and this report's unit gate rejects those. It is also the ONLY place
+    the mapping exists on purpose - three near-copies of it had already drifted
+    into `swarm_total_rss_hwm_bytes_ram` in one and `total_rss_hwm_bytes_ram` in
+    another, which is exactly how a report grows two names for one measurement.
+    """
     return {
         "peer_rss_hwm_bytes_ram": resources["daemon_rss_hwm_bytes"],
         "peer_rss_point_max_bytes_ram": resources["daemon_rss_point_max_bytes"],
         "swarm_total_rss_hwm_bytes_ram": resources["chain_total_rss_hwm_bytes"],
         "peer_fd_max": resources["daemon_fd_max"],
-        "peer_disk_apparent_bytes_ondisk": max(
-            (d.apparent_bytes_ondisk for d in disks.values()), default=0
-        ),
-        "peer_disk_allocated_bytes_ondisk": max(
-            (d.allocated_bytes_ondisk for d in disks.values()), default=0
-        ),
-        "swarm_total_disk_allocated_bytes_ondisk": sum(
-            d.allocated_bytes_ondisk for d in disks.values()
-        ),
-        "realise_p95_s": percentile(realise_s, 95) if realise_s else None,
+        "per_role": {
+            role: {
+                "rss_hwm_bytes_ram": row["rss_hwm_bytes"],
+                "rss_point_max_bytes_ram": row["rss_point_max_bytes"],
+                "rss_point_last_bytes_ram": row["rss_point_last_bytes"],
+                "fd_max": row["fd_max"],
+                "ticks": row["ticks"],
+            }
+            for role, row in resources["per_role"].items()
+        },
     }
+
+
+def swarm_metrics_from(resources: dict, disks: dict, realise_s: list[float]) -> dict:
+    """The FITTABLE scalar metrics of one swarm point: the labelled aggregate
+    (minus its per-role detail, which is not a scalar) plus the disk walk and the
+    client's latency."""
+    labelled = label_resources(resources)
+    labelled.pop("per_role")
+    labelled.update(
+        {
+            "peer_disk_apparent_bytes_ondisk": max(
+                (d.apparent_bytes_ondisk for d in disks.values()), default=0
+            ),
+            "peer_disk_allocated_bytes_ondisk": max(
+                (d.allocated_bytes_ondisk for d in disks.values()), default=0
+            ),
+            "swarm_total_disk_allocated_bytes_ondisk": sum(
+                d.allocated_bytes_ondisk for d in disks.values()
+            ),
+            "realise_p95_s": percentile(realise_s, 95) if realise_s else None,
+        }
+    )
+    return labelled
 
 
 def hwm_gap_summary(pairs, *, source: str) -> dict:
@@ -871,15 +909,7 @@ def sweep_swarm(ctx, fixtures, sizes, repeats: int, state_root: Path) -> ss.Axis
                         "per_role_disk": {
                             role: vars(footprint) for role, footprint in disks.items()
                         },
-                        "per_role_resources": {
-                            role: {
-                                "rss_hwm_bytes_ram": row["rss_hwm_bytes"],
-                                "rss_point_max_bytes_ram": row["rss_point_max_bytes"],
-                                "fd_max": row["fd_max"],
-                                "ticks": row["ticks"],
-                            }
-                            for role, row in resources["per_role"].items()
-                        },
+                        "per_role_resources": label_resources(resources)["per_role"],
                     },
                 )
             except (RuntimeError, ss.SampleError, OSError, ValueError) as error:
@@ -1027,8 +1057,8 @@ def run_speedup_arms(ctx, fixtures, runs: int, state_root: Path) -> dict:
         workload_bytes_uncompressed_nar=nar_total,
         min_valid=min_valid,
     )
-    peers_on["resources"] = _labelled_resources(on_resources)
-    peers_off["resources"] = _labelled_resources(off_resources)
+    peers_on["resources"] = label_resources(on_resources)
+    peers_off["resources"] = label_resources(off_resources)
     peers_on["disk"] = on_disk
     peers_off["disk"] = off_disk
     peers_on["sampler_errors"] = on_sampler_errors
@@ -1056,26 +1086,6 @@ def run_speedup_arms(ctx, fixtures, runs: int, state_root: Path) -> dict:
         "peers_on": peers_on,
         "peers_off": peers_off,
         "speedup": speedup_block(peers_on, peers_off, unit_evidence),
-    }
-
-
-def _labelled_resources(resources: dict) -> dict:
-    """`scale_sweep.aggregate_samples` output with this report's unit suffixes."""
-    return {
-        "peer_rss_hwm_bytes_ram": resources["daemon_rss_hwm_bytes"],
-        "peer_rss_point_max_bytes_ram": resources["daemon_rss_point_max_bytes"],
-        "total_rss_hwm_bytes_ram": resources["chain_total_rss_hwm_bytes"],
-        "peer_fd_max": resources["daemon_fd_max"],
-        "per_role": {
-            role: {
-                "rss_hwm_bytes_ram": row["rss_hwm_bytes"],
-                "rss_point_max_bytes_ram": row["rss_point_max_bytes"],
-                "rss_point_last_bytes_ram": row["rss_point_last_bytes"],
-                "fd_max": row["fd_max"],
-                "ticks": row["ticks"],
-            }
-            for role, row in resources["per_role"].items()
-        },
     }
 
 
@@ -1229,6 +1239,12 @@ def build_report(
         # AC#2 travels WITH the report: a profile whose grid was too short to
         # demonstrate the S9 bite must not read as one that demonstrated it.
         "s9_bite_demonstrated": bool(study.get("ran")),
+        # Derived from two measured blocks, so it cannot drift from them. NOT a
+        # usability gate: a metric whose noise exceeds the demonstrated regime is
+        # a finding about that metric, not a broken instrument.
+        "bite_applicability": bite_applicability(
+            study, measured["swarm"]["observed_replicate_spread"], models
+        ),
         "usable": (
             problems == []
             and report["honesty"]["compliant"]
@@ -1241,6 +1257,101 @@ def build_report(
         ),
     }
     return report
+
+
+def bite_applicability(study: dict, spread: dict, models: dict) -> dict:
+    """Per fitted metric: is the REAL data inside the regime where the S9 bite
+    was demonstrated?
+
+    Without this the report states two true things far apart - "a known-O(n^2)
+    law is never fitted linear at 2% noise" and "here is a fitted latency law" -
+    and lets a reader join them. They do not always join: task-42's measured
+    latency spread was 8-20% while the bite is demonstrated at 2-5%, and that
+    same latency axis selected THREE different classes across three runs. The
+    number that saves a reader from the wrong conclusion is the comparison, so
+    the report computes it instead of leaving it as an exercise.
+
+    Derived, never stored: both inputs are measurements that already live in the
+    report, so this cannot drift from them.
+    """
+    if not study.get("ran"):
+        return {"available": False, "why": "the S9 study did not run on this grid"}
+    # The regime is defined by the split TESTING.md S9 actually names:
+    # LINEAR-vs-SUPERLINEAR, in BOTH directions. At noise v the bite holds iff
+    # every superlinear generator is flagged superlinear at >= floor AND every
+    # non-superlinear generator is NOT flagged at >= floor (i.e. the false-flag
+    # rate stays below 1-floor). Deliberately NOT exact-class recovery: n log n
+    # vs n^2 is not identifiable below n~30, and gating on that would declare the
+    # instrument broken over a distinction it never claimed to make.
+    floor = DISCRIMINATION_FLOOR
+    # `study["per_class"]` is {class: {noise-as-string: row}}; every class was
+    # studied at the same noise levels with the same replicate count, so one
+    # class's rows describe the whole grid.
+    any_class_rows = next(iter(study["per_class"].values()))
+    noise_levels = sorted(float(key) for key in any_class_rows)
+    replicates = max(1, any_class_rows[str(noise_levels[0])]["replicates"])
+    # A rate that lands ON the floor is a coin flip about whether the regime is
+    # declared: this study measured the O(n log n) flag rate at EXACTLY 0.900 at
+    # 5% noise, so with a bare `>= floor` the reported regime would oscillate
+    # between 0.02 and 0.05 from run to run - and a number that flips is not a
+    # number. Require the rate to clear the floor by two Monte-Carlo standard
+    # errors, which errs toward NOT declaring a marginal regime.
+    margin = 2.0 * math.sqrt(floor * (1.0 - floor) / replicates)
+    threshold = min(1.0, floor + margin)
+    proven_to = None
+    for noise in noise_levels:
+        ok = True
+        for model, rows in study["per_class"].items():
+            rate = rows[str(noise)]["superlinear_rate"]
+            if scalefit.BASIS_BY_NAME[model].superlinear:
+                ok = ok and rate >= threshold
+            else:
+                ok = ok and (1.0 - rate) >= threshold
+        if ok:
+            proven_to = noise
+    per_metric = {}
+    for fit_id, fit in models.items():
+        key = fit_id.split(".", 1)[-1]
+        observed = (spread.get(key) or {}).get("median_relative_spread")
+        if observed is None or proven_to is None:
+            verdict = "unknown (no replicates at any n, or no proven regime)"
+            inside = None
+        elif observed <= proven_to:
+            verdict = "inside the demonstrated regime"
+            inside = True
+        else:
+            verdict = (
+                "OUTSIDE the demonstrated regime - at this metric's observed "
+                "noise the linear-vs-superlinear split is not demonstrated on "
+                "this grid, so read `identifiable`, R^2 and the interval width; "
+                "do NOT read the class name as a law"
+            )
+            inside = False
+        per_metric[fit_id] = {
+            "observed_median_relative_spread": observed,
+            "identifiable": fit.get("identifiable"),
+            "r_squared": fit.get("r_squared"),
+            "inside_demonstrated_regime": inside,
+            "verdict": verdict,
+        }
+    return {
+        "available": True,
+        "rule": (
+            "the regime is the largest studied noise at which the "
+            "LINEAR-vs-SUPERLINEAR split holds in BOTH directions at >= the "
+            "floor: superlinear generators flagged, non-superlinear ones not"
+        ),
+        "discrimination_floor": floor,
+        "monte_carlo_replicates": replicates,
+        "effective_threshold": threshold,
+        "threshold_note": (
+            "floor + 2 Monte-Carlo standard errors, so a rate landing ON the "
+            "floor does not make the declared regime flip between runs"
+        ),
+        "bite_demonstrated_up_to_relative_noise": proven_to,
+        "studied_noise_levels": noise_levels,
+        "per_metric": per_metric,
+    }
 
 
 def replicate_spread(points) -> dict:
@@ -1460,6 +1571,17 @@ def print_human_summary(report: dict) -> None:
             ),
             file=out,
         )
+        applicability = report["verdict"].get("bite_applicability", {})
+        row = (applicability.get("per_metric") or {}).get(fit_id)
+        if row and row.get("inside_demonstrated_regime") is False:
+            print(
+                f"        NOISE: observed replicate spread "
+                f"{row['observed_median_relative_spread']:.1%} exceeds the "
+                f"{applicability['bite_demonstrated_up_to_relative_noise']:.0%} "
+                "at which class recovery is demonstrated - do not read the "
+                "class name as a law",
+                file=out,
+            )
     print(
         "\n  CAVEAT: resource scaling laws only. Emergent network effects (DHT "
         "k-buckets,\n  gossip fan-out, thundering herds) are NOT predictable from "
@@ -1959,6 +2081,44 @@ def run_self_test() -> int:  # noqa: C901 - a flat list of checks reads better h
         hwm_vs_point(burst.points)["exercised"]
         and hwm_vs_point(burst.points)["max_gap_bytes_ram"] == 200,
     )
+    # ONE translation from the reused aggregate to this report's names, shared by
+    # the swarm axis and both speedup arms. Asserted here because the previous
+    # three copies had already drifted to two different names for the same
+    # measurement, and because every key it emits must survive the unit gate.
+    raw = {
+        "daemon_rss_hwm_bytes": 300,
+        "daemon_rss_point_max_bytes": 100,
+        "chain_total_rss_hwm_bytes": 400,
+        "daemon_fd_max": 12,
+        "per_role": {
+            "node-b": {
+                "rss_hwm_bytes": 300,
+                "rss_point_max_bytes": 100,
+                "rss_point_last_bytes": 90,
+                "fd_max": 12,
+                "ticks": 5,
+            }
+        },
+    }
+    labelled = label_resources(raw)
+    check(
+        "label_resources is the ONE translation and its output passes the unit gate",
+        unit_violations(labelled) == []
+        and labelled["peer_rss_hwm_bytes_ram"] == 300
+        and labelled["swarm_total_rss_hwm_bytes_ram"] == 400
+        and labelled["per_role"]["node-b"]["rss_hwm_bytes_ram"] == 300,
+        str(labelled),
+    )
+    scalars = swarm_metrics_from(raw, {}, [1.0])
+    check(
+        "the swarm point's metrics are SCALARS only (no per_role dict reaches "
+        "the fitter) and use the same names",
+        "per_role" not in scalars
+        and scalars["peer_rss_hwm_bytes_ram"] == labelled["peer_rss_hwm_bytes_ram"]
+        and unit_violations(scalars) == [],
+        str(scalars),
+    )
+
     roles = {
         "node-a": {"rss_hwm_bytes_ram": 100, "rss_point_max_bytes_ram": 100},
         "node-b": {"rss_hwm_bytes_ram": 300, "rss_point_max_bytes_ram": 100},
@@ -2022,6 +2182,49 @@ def run_self_test() -> int:  # noqa: C901 - a flat list of checks reads better h
         "a single draw yields NO spread claim (None, not 0)",
         replicate_spread(single.points)["peer_fd_max"]["median_relative_spread"]
         is None,
+    )
+
+    # --- does the REAL data sit where the bite was demonstrated? -------------
+    print("\n  -- bite applicability (measured noise vs demonstrated regime) --")
+    fake_models = {
+        "swarm.peer_rss_hwm_bytes_ram": {
+            "identifiable": True,
+            "r_squared": 0.99,
+        },
+        "swarm.realise_p95_s": {"identifiable": False, "r_squared": 0.31},
+    }
+    fake_spread = {
+        "peer_rss_hwm_bytes_ram": {"median_relative_spread": 0.01},
+        "realise_p95_s": {"median_relative_spread": 0.20},
+    }
+    applicability = bite_applicability(study, fake_spread, fake_models)
+    check(
+        "a quiet metric is reported INSIDE the demonstrated regime",
+        applicability["per_metric"]["swarm.peer_rss_hwm_bytes_ram"][
+            "inside_demonstrated_regime"
+        ]
+        is True,
+        str(applicability["per_metric"]["swarm.peer_rss_hwm_bytes_ram"]),
+    )
+    check(
+        "a NOISY metric (20% spread) is reported OUTSIDE it - the class name is "
+        "explicitly not a law there",
+        applicability["per_metric"]["swarm.realise_p95_s"]["inside_demonstrated_regime"]
+        is False
+        and "OUTSIDE" in applicability["per_metric"]["swarm.realise_p95_s"]["verdict"],
+        str(applicability["per_metric"]["swarm.realise_p95_s"]),
+    )
+    check(
+        "the demonstrated regime is DERIVED from the study, not hardcoded "
+        f"(={applicability['bite_demonstrated_up_to_relative_noise']})",
+        applicability["bite_demonstrated_up_to_relative_noise"]
+        in applicability["studied_noise_levels"],
+        str(applicability),
+    )
+    check(
+        "with no study, applicability says so rather than guessing",
+        bite_applicability({"ran": False}, fake_spread, fake_models)["available"]
+        is False,
     )
 
     print(f"\nprofile_p2p --self-test: {'ALL PASS' if ok else 'FAILURES PRESENT'}")

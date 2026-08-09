@@ -150,6 +150,10 @@ Measurement discipline (S3/S4 are decision inputs, so extra rigor):
   version. **The J2 baseline (task-12) is what records numbers here** by running
   `just measure` after `just fixtures-large` + `just fixtures-verify-rebuild`;
   this task delivers the instrument, not the baseline.
+  The p2p profiling instrument (`just profile`, task-42) EXECUTES this
+  same rule via `measure.classify_run` rather than restating it, and
+  marks any arm below the 10-valid-run floor `dev_smoke_below_n10`
+  instead of presenting it as a baseline.
 - **Sample discipline**: N ≥ 10 runs per arm, variance reported.
 - **A/A calibration**: daemon-off vs daemon-off must show a noise
   floor below the 10% S4 threshold, else S4 is reported as unusable
@@ -721,6 +725,50 @@ a synthetic workload with known O(n) RAM growth recovers a linear fit;
 a superlinear RAM/latency fit is surfaced as a red flag, not buried. A
 model that reports plausible-but-unfalsifiable numbers is the worst
 outcome (wave-1 oracle-bite lesson applies).
+
+**S9 as built (task-42, `scripts/profile_p2p.py`, `just profile`).** The
+instrument sweeps a REAL swarm — n holder peers plus a fetching node,
+n+1 daemon *processes* in one pod, over n ∈ {1,2,4,8,16} — and runs a
+peers-ON vs peers-OFF speedup arm scored by the frozen
+`net-upstream-egress-v2` rule (`measure.classify_run`, not a second
+definition). Three rules are mechanical, not editorial:
+
+- **Units.** Every `*_bytes` key must end in `_ram`, `_ondisk`,
+  `_uncompressed_nar` or `_bytes_compressed_wire`; `unit_violations()`
+  fails the run otherwise. NarSize (uncompressed, signed) and FileSize
+  (compressed, on-wire) are different units and this project has
+  confused them three times — a reader cannot mix what the schema will
+  not let the writer spell. The speedup arm additionally ASSERTS
+  `file_size == nar_size` from the manifest for its payloads, so the two
+  coincide by *checked precondition*; a fixture regenerated to xz makes
+  the arm refuse to run rather than emit a cross-unit ratio.
+- **The bite is MEASURED, not asserted.** `class_recovery_study()` runs
+  a Monte-Carlo over known-class generators *on the swept grid*, under
+  multiplicative noise, and the self-test gates on RATES — one lucky
+  seed is a coin flip, not an oracle. Measured at 2% noise on
+  {1,2,4,8,16}: O(n²) is fitted linear **0.000** of the time (the bite),
+  O(n) recovers linear 0.967, O(1) recovers constant 0.933. The
+  instrument's own limits are REPORTED, not hidden: a genuinely linear
+  law is falsely flagged superlinear 3.3% of the time, and O(n log n) is
+  mistaken for linear 10% of the time at 5% noise. The report puts the
+  sweep's OBSERVED replicate spread beside those numbers, so a reader
+  can see whether the real data sits inside the regime where the bite
+  holds. A grid too short to demonstrate the bite sets
+  `s9_bite_demonstrated=false` and makes the report UNUSABLE.
+- **A red flag means superlinear GROWTH.** The first real run fitted the
+  peer fd series (11,11,…,10,10,10) as quadratic with a *negative* slope
+  and flagged it, extrapolating to −4015 descriptors. `scalefit` now
+  requires `slope > 0` for the superlinear flag; a false flag on a
+  metric that went DOWN is what teaches a reader to skip the section.
+
+Honest scope of this instrument: it characterizes RESOURCE LAWS and
+does not pre-hardcode any policy (see "Policy derivation" below); its
+"upstream" is a loopback testproxy, so the latency speedup it reports is
+a lower bound and the egress offload is the transferable number; and
+node A's claims all name one holder (`InMemoryDiscovery::announce`
+replaces on key), so the swarm axis measures the cost of n peer
+processes plus an n-entry address book, not holder selection or dial
+fan-out.
 
 ## Policy derivation (findings -> tasks, do NOT pre-hardcode)
 
