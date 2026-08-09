@@ -794,4 +794,59 @@ mod tests {
         assert_eq!(config.iroh_peers.len(), 1);
         assert_eq!(config.p2p_claims.len(), 1);
     }
+
+    #[test]
+    fn the_serve_budget_defaults_are_the_library_constants() {
+        // The daemon must not carry a SECOND copy of the numbers the library
+        // documents and the tests reason about. If these ever diverge, an operator
+        // reading the constants would be reading a different bound than the one
+        // running.
+        let config = Config::default();
+        assert_eq!(config.iroh_max_serve_nar_bytes, DEFAULT_MAX_SERVE_NAR_BYTES);
+        assert_eq!(
+            config.iroh_max_inflight_nar_bytes,
+            DEFAULT_MAX_INFLIGHT_NAR_BYTES
+        );
+        // The per-NAR default must fit under the in-flight default, or the second
+        // bound could never bind and one of the two knobs would be decorative.
+        assert!(config.iroh_max_serve_nar_bytes < config.iroh_max_inflight_nar_bytes);
+    }
+
+    #[test]
+    fn serve_budget_flags_parse_and_reject_zero() {
+        let config = Config::from_args(
+            [
+                "--iroh-max-serve-nar-bytes",
+                "1048576",
+                "--iroh-max-inflight-nar-bytes",
+                "4194304",
+                "--iroh-sweep-interval-ms",
+                "250",
+            ]
+            .map(String::from),
+        )
+        .unwrap();
+        assert_eq!(config.iroh_max_serve_nar_bytes, 1_048_576);
+        assert_eq!(config.iroh_max_inflight_nar_bytes, 4_194_304);
+        assert_eq!(config.iroh_sweep_interval_ms, 250);
+
+        // 0 is rejected on every one of them. A zero serve budget declines every
+        // peer and a zero sweep interval spins the collector: both are daemons
+        // that look healthy and do nothing, the same failure `--header-timeout-ms
+        // 0` is rejected for.
+        for flag in [
+            "--iroh-max-serve-nar-bytes",
+            "--iroh-max-inflight-nar-bytes",
+            "--iroh-sweep-interval-ms",
+        ] {
+            assert!(
+                Config::from_args([flag.to_string(), "0".to_string()]).is_err(),
+                "{flag} 0 must be rejected"
+            );
+            assert!(
+                Config::from_args([flag.to_string(), "not-a-number".to_string()]).is_err(),
+                "{flag} must fail fast on a non-number"
+            );
+        }
+    }
 }
