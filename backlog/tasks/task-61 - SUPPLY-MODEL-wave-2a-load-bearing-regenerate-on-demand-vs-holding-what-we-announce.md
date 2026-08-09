@@ -7,7 +7,7 @@ status: Done
 assignee:
   - '@me'
 created_date: '2026-08-09 13:24'
-updated_date: '2026-08-09 23:20'
+updated_date: '2026-08-09 23:23'
 labels: []
 dependencies: []
 priority: high
@@ -33,7 +33,7 @@ ORACLE WARNING for whoever implements the outcome: peak RSS ALONE cannot verify 
 <!-- AC:BEGIN -->
 - [x] #1 The supply-model DECISION is written down with its cost: regenerate-on-demand + persisted bao outboards vs a bounded evicting content store. Records what it does to the PRD's 'no second copy of the store' position and to the seeding gap / re-hash cost
 - [x] #2 Whatever is chosen, holder RSS is gated on a FITTED SLOPE over >=5 NAR sizes with CI (TASK-65's axis), not a single-point comparison, and the residency oracle is not VmHWM alone
-- [ ] #3 If an on-disk store is chosen: a numeric budget knob, an eviction bite (fill past budget -> evicts rather than grows), and a kill-9-mid-serve-then-restart bite proving reclamation. 'Bounded' without a budget and an eviction rule is not an acceptance criterion
+- [ ] #3 N/A BY DECISION (recorded, not skipped): this criterion was conditional on choosing an on-disk store, and arm (a) regenerate-on-demand was chosen, so nothing is on disk to evict or reclaim after a kill -9. Its RAM analogue WAS delivered and is gated under TASK-72 AC#1: a numeric ServeBudget (max NAR size / max concurrent bytes / max serve duration) with the decline proven by mutation (bounded: 0 supplier calls, VmRSS rise 720,896 B; unbounded: 1 call, 156,946,432 B). If a future wave adopts an on-disk store, restore this criterion verbatim rather than treating it as settled
 <!-- AC:END -->
 
 ## Implementation Plan
