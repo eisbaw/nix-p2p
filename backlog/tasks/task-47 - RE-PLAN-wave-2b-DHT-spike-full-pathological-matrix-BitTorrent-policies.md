@@ -4,7 +4,7 @@ title: 'RE-PLAN wave-2b: DHT spike, full pathological matrix, BitTorrent, polici
 status: To Do
 assignee: []
 created_date: '2026-08-08 20:13'
-updated_date: '2026-08-08 20:30'
+updated_date: '2026-08-09 21:03'
 labels:
   - replan
 dependencies:
@@ -29,5 +29,5 @@ Re-plan task - NOT feature code. Re-invoke phase2-backlog-snowball with: PRD.md 
 ## Implementation Notes
 
 <!-- SECTION:NOTES:BEGIN -->
-REVIEW REVISION (codex#3): the DHT-key-derivation SPIKE (mainline get_peers vs BEP44 vs iroh-native) is the deferred FROZEN surface - it must choose a mechanism that carries NodeId-rendezvous keyed on a NarHash-derived key (claims stay peer-to-peer per task-37). Also wave-2b: real store seeding at scale (task-50 is the wave-2a index), the chosen slow-HIT policy IMPLEMENTATION (task-44 only models), full pathological matrix (NAT/relay, herd/single-flight, lying-claim scoring, churn), BitTorrent transport (2nd backend - needs an infohash/piece-layout locator per task-48), scale to 1000s, chunked/castore, v2 signed-narinfo-relay.
+SCOPE UPDATE 2026-08-09 (owner: 'file the gaps as backlog tasks if not already'): the items this re-plan bundled in its description are now FILED as real tasks, so the re-plan's job narrows from 'invent the wave-2b list' to 'order, scope and gate what already exists'. Filed: TASK-73 (DHT-authoritative resolution - the discovery gap, incl. the DHT-key-derivation freeze this task's spike must feed), TASK-74 (gossip accelerant, must remain non-required), TASK-75 (BitTorrent second transport, doubles as a falsification test of the claim-schema freeze), TASK-76 (speculative prefetch - tail-only per task-35), TASK-77 (announce-after-fetch + budget), TASK-78 (leech mode), TASK-79 (pathological suite v2: NAT/relay, thundering herd, lying claim, seeder churn), TASK-80 (real-network validation - the one thing the single-host testbed structurally cannot answer), TASK-81 (verify the Candidate C castore seam is still open). Policy IMPLEMENTATION is deliberately NOT filed - TASK-44 files it as its own output once the data justifies a choice.
 <!-- SECTION:NOTES:END -->
