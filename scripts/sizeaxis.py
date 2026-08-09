@@ -1271,6 +1271,11 @@ def human_lines(measured: dict, models: dict) -> list[str]:
     INTERVALS and never a bare per-byte number."""
     lines = ["", "SIZE AXIS (peak RSS vs held/served NAR bytes) - task-65"]
     size = measured.get("size", {})
+    if size.get("ran") is False:
+        # An arm that RAISED must say so in one line rather than rendering as a
+        # tidy 0/0. "It did not run" and "it ran and found nothing" are different
+        # findings and the summary is where they get confused.
+        return lines + [f"  DID NOT RUN: {size.get('reason')}", ""]
     valid = sum(1 for p in size.get("points", []) if p["valid"])
     total = len(size.get("points", []))
     lines.append(
@@ -1641,6 +1646,18 @@ def run_self_test() -> int:  # noqa: C901 - a flat list of checks reads better h
     check(
         "the size axis still gets a slope interval through build_blocks",
         long_models["size.holder_rss_hwm_bytes_ram"]["slope_ci95"] is not None,
+    )
+    check(
+        "a size arm that RAISED prints 'DID NOT RUN', not a tidy 0/0",
+        any(
+            "DID NOT RUN" in line
+            for line in human_lines({"size": {"ran": False, "reason": "boom"}}, {})
+        ),
+    )
+    check(
+        "a summary of a real arm quotes both slopes WITH their intervals",
+        sum("95% CI" in line for line in human_lines(long_measured, long_models)) == 2,
+        str(human_lines(long_measured, long_models)),
     )
 
     print(f"\nsizeaxis --self-test: {'ALL PASS' if ok else 'FAILURES PRESENT'}")
