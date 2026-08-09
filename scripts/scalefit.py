@@ -407,6 +407,37 @@ def _interval(
     return (centre - crit * width, centre + crit * width)
 
 
+def slope_interval(fit: CandidateFit) -> tuple[float, float, float] | None:
+    """`(std_error, low, high)` for the SLOPE of `fit`, at `CONFIDENCE`.
+
+    Why a slope interval is a separate, first-class thing (task-65): the axis
+    that actually binds a deployment is peak RSS against the SIZE of what a node
+    serves, and the number a reader quotes off that axis is a SLOPE - "bytes of
+    RSS per byte of NAR" - not an extrapolated point. A slope stated without an
+    interval is a claim tested at one size wearing a fitted-law costume; two
+    successive changes can then both "reduce the slope" without either being
+    distinguishable from noise. TASK-61's and TASK-62's RSS criteria are written
+    against this interval, so it lives in the fitter with the rest of the OLS
+    algebra rather than being re-derived by each consumer.
+
+    Textbook OLS: `se(b) = s / sqrt(Sxx)`, `b +/- t_(1-a/2, dof) * se(b)`, where
+    `s` is the residual standard error and `Sxx` the transformed design's total
+    sum of squares - both already computed for the prediction intervals.
+
+    Returns None when the slope is not ESTIMABLE (a constant model, a design
+    with no spread in the transform, or no residual degrees of freedom). None
+    means "this fit does not constrain a slope" and every caller must render it
+    that way; a zero-width interval would say the opposite.
+    """
+    if fit.dof <= 0 or fit.t_ss <= 0.0 or not math.isfinite(fit.residual_std_error):
+        return None
+    if BASIS_BY_NAME[fit.model].n_params == 1:
+        return None
+    std_error = fit.residual_std_error / math.sqrt(fit.t_ss)
+    crit = student_t_ppf(1.0 - (1.0 - CONFIDENCE) / 2.0, fit.dof)
+    return (std_error, fit.slope - crit * std_error, fit.slope + crit * std_error)
+
+
 def extrapolate(fit: CandidateFit, n: float, max_measured_n: float) -> dict:
     """One extrapolated point, STRUCTURALLY labelled as a model output.
 
@@ -518,6 +549,7 @@ def fit_scaling(
     competitive = sorted(within, key=lambda c: c.aicc)
 
     max_n = max(xs)
+    slope_ci = slope_interval(selected)
     return {
         "kind": MODEL_OUTPUT_KIND,
         "fitter_version": FITTER_VERSION,
@@ -530,6 +562,19 @@ def fit_scaling(
         "superlinear": selected.superlinear,
         "intercept": selected.intercept,
         "slope": selected.slope,
+        # The slope WITH its uncertainty (task-65). None means the selected model
+        # has no estimable slope (O(1)) or the design has no residual dof - which
+        # is a statement, not a missing value, and callers must print it as one.
+        "slope_std_error": None if slope_ci is None else slope_ci[0],
+        "slope_ci95": None if slope_ci is None else [slope_ci[1], slope_ci[2]],
+        "slope_unit": f"{unit} per unit of n",
+        # DERIVED here so no consumer re-derives it differently: does the interval
+        # exclude zero? A slope whose interval spans zero has not been shown to be
+        # a slope at all, and a report that quotes such a number as a per-byte cost
+        # is quoting noise.
+        "slope_distinguishable_from_zero": (
+            None if slope_ci is None else (slope_ci[1] > 0.0 or slope_ci[2] < 0.0)
+        ),
         "r_squared": selected.r_squared,
         "adjusted_r_squared": selected.adjusted_r_squared,
         "residuals": selected.residuals,
@@ -791,6 +836,79 @@ def run_self_test() -> int:  # noqa: C901 - a flat list of checks reads better h
             report["superlinear"] is expect_superlinear,
             f"got {report['superlinear']}",
         )
+
+    # --- 2b. the SLOPE interval (task-65) ----------------------------------
+    # The size axis quotes a SLOPE ("bytes of RSS per byte of NAR"), so the
+    # interval on that slope is the number TASK-61 and TASK-62 are gated on. It
+    # is checked three ways: it must cover the truth, it must WIDEN with noise
+    # (an interval that ignores the data is decoration), and its COVERAGE is
+    # measured by Monte Carlo rather than asserted - a wrong critical value or a
+    # wrong standard error passes a "contains the truth once" check about 95% of
+    # the time, which is exactly how a broken interval survives.
+    true_slope = 8.0
+    tight = fit_scaling(
+        ns,
+        _synthetic("linear", ns, a=64.0, b=true_slope, noise=0.01, seed=41),
+        metric="slope-tight",
+        unit="MiB",
+    )
+    loose = fit_scaling(
+        ns,
+        _synthetic("linear", ns, a=64.0, b=true_slope, noise=0.20, seed=41),
+        metric="slope-loose",
+        unit="MiB",
+    )
+    check(
+        "slope CI covers the generating slope",
+        tight["slope_ci95"] is not None
+        and tight["slope_ci95"][0] <= true_slope <= tight["slope_ci95"][1],
+        f"slope={tight['slope']:.4f} ci={tight['slope_ci95']}",
+    )
+    tight_width = tight["slope_ci95"][1] - tight["slope_ci95"][0]
+    loose_width = loose["slope_ci95"][1] - loose["slope_ci95"][0]
+    check(
+        "slope CI WIDENS with noise (it reads the data, not the model name)",
+        loose_width > tight_width * 2.0,
+        f"tight={tight_width:.5f} loose={loose_width:.5f}",
+    )
+    check(
+        "a tight linear slope is distinguishable from zero",
+        tight["slope_distinguishable_from_zero"] is True,
+    )
+    flat = fit_scaling(
+        ns,
+        _synthetic("constant", ns, a=64.0, b=0.0, noise=0.02, seed=42),
+        metric="slope-flat",
+        unit="MiB",
+    )
+    check(
+        "an O(1) fit reports NO slope interval rather than a zero-width one",
+        flat["selected_model"] == "constant"
+        and flat["slope_ci95"] is None
+        and flat["slope_distinguishable_from_zero"] is None,
+        f"selected={flat['selected_model']} ci={flat['slope_ci95']}",
+    )
+
+    # MEASURED coverage. Additive gaussian noise on purpose: the OLS interval
+    # assumes constant residual variance, and `_synthetic`'s MULTIPLICATIVE noise
+    # violates that (the spread grows with the mean), which is a property of the
+    # real resource data and is already stated as a caveat on `fit_scaling`. The
+    # question here is whether the ALGEBRA is right, so it is asked under the
+    # algebra's own assumptions.
+    covered = 0
+    coverage_trials = 400
+    rng = random.Random(20650)
+    for _ in range(coverage_trials):
+        ys = [64.0 + true_slope * n + rng.gauss(0.0, 6.0) for n in ns]
+        interval = fit_scaling(ns, ys, metric="coverage", unit="MiB")["slope_ci95"]
+        if interval is not None and interval[0] <= true_slope <= interval[1]:
+            covered += 1
+    rate = covered / coverage_trials
+    check(
+        f"95% slope CI covers the truth ~95% of the time ({coverage_trials} draws)",
+        0.88 <= rate <= 0.99,
+        f"measured coverage {rate:.3f}",
+    )
 
     # The specific dangerous confusion, asserted on its own so a regression
     # names itself: O(n^2) memory growth must NEVER be reported as linear.

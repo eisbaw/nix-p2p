@@ -209,9 +209,19 @@ scale-sweep *ARGS: _python fixtures-large
 # via measure.classify_run), over the 110 MiB payload so throughput is a real
 # number. Every `*_bytes` key carries its unit - NarSize and FileSize are
 # different units and the report refuses to name either one plain `_bytes`.
-# Full-tier fixtures + the fail-closed check-fixtures gate. SLOW tier: ~20
+# (3) The task-65 SIZE and CONCURRENCY axes (scripts/sizeaxis.py): peak RSS
+# against the SIZE of what a node holds and serves, over >= 5 distinct NAR sizes,
+# fitted to a SLOPE WITH A CONFIDENCE INTERVAL for the holder and the fetcher
+# separately - the axis TASK-61/TASK-62 gate their RSS criteria on, since a slope
+# tested at one size is unfalsifiable. Plus k overlapping serves whose overlap is
+# MEASURED at the holder (a point whose measured overlap is not k is INVALID), and
+# a residency oracle that is NOT peak RSS: what the holder's blob store says it
+# HOLDS. Its payloads are synthesised into a scratch cache and deleted with it.
+# Full-tier fixtures + the fail-closed check-fixtures gate. SLOW tier: ~45
 # minutes of container runs at the default grid (the fast-tier half is the
-# --self-test wired into `just test`). Label-scoped cleanup on exit and SIGTERM.
+# --self-test wired into `just test`, which now covers sizeaxis too). Use
+# `--skip-size` / `--skip-speedup` for a dev loop. Label-scoped cleanup on exit
+# and SIGTERM.
 # Do NOT run this concurrently with `e2e`/`measure`/`scale-sweep`: they share one
 # podman label and would tear down each other's pods mid-run (TASK-58).
 # Run the p2p profile (RAM/disk/latency/throughput/speedup) and emit the report.

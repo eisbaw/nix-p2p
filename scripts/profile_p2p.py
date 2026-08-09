@@ -131,6 +131,12 @@ import scalefit
 # "peak RSS" whose first divergence would be invisible. `measure` owns the frozen
 # egress counting rule. Both are import-clean (no side effects at import).
 import scale_sweep as ss
+
+# task-65's SIZE and CONCURRENCY axes. Its own module because this one is already
+# 4.5k lines and because the two arms share nothing but the Pod seam; it is driven
+# from `main` and folded into the report here, so `just profile` grows the axis
+# without this file growing a second sweep.
+import sizeaxis as sz
 from measure import BASELINE_MIN_VALID_RUNS, classify_run, percentile, stat_block
 
 # ---- frozen constants (this instrument's counting rule) ---------------------
@@ -2346,7 +2352,13 @@ DISK_FINDING = {
 
 
 def build_report(
-    axis, speedup: dict | None, study: dict, provenance: dict, config: dict, targets
+    axis,
+    speedup: dict | None,
+    study: dict,
+    provenance: dict,
+    config: dict,
+    targets,
+    size: tuple[dict, dict, list[str]] | None = None,
 ) -> dict:
     """Assemble the report. PURE: takes collected measurements, touches nothing.
 
@@ -2363,6 +2375,12 @@ def build_report(
     fits, fit_problems = ss.fit_axis(axis, SWARM_METRICS, targets)
     models.update(fits)
     problems += fit_problems
+    # task-65: the size/concurrency arms arrive pre-assembled from `sizeaxis`
+    # (measured, models, fit problems) so this function stays what it says it is -
+    # pure assembly over collected measurements.
+    size_measured, size_models, size_problems = size or ({}, {}, [])
+    models.update(size_models)
+    problems += size_problems
 
     measured = {
         "swarm": {
@@ -2391,6 +2409,7 @@ def build_report(
             "observed_replicate_spread": replicate_spread(axis.points),
         }
     }
+    measured.update(size_measured)
     if speedup is not None:
         measured["speedup"] = speedup
 
@@ -2433,6 +2452,22 @@ def build_report(
                 "a point with a failed client, an unreadable /proc, a missing "
                 "in-container timing, or a holder that did not actually serve the "
                 "workload is INVALID: excluded with a reason, never recorded as 0"
+            ),
+            "residency": (
+                "task-65: what a holder HOLDS is read from its blob store "
+                "(IROH-STORE-RESIDENT), never inferred from peak RSS. VmHWM is "
+                "monotone so it can never observe a release, and glibc need not "
+                "return a freed arena so VmRSS need not either - an RSS-only "
+                "residency oracle fails on a correct fix and passes on a wrong "
+                "one. Discrimination proven by mutation in "
+                "daemon/tests/store_residency_oracle.rs"
+            ),
+            "size_axis_concurrency": (
+                "task-65: k overlapping serves are counted from the HOLDER's own "
+                "per-transfer windows (IROH-SERVE-WINDOW) and a point whose "
+                "MEASURED overlap is not k is INVALID. Counting at the fetching "
+                "HTTP client would be vacuous - k client windows overlap even if "
+                "the daemon served them one at a time"
             ),
         },
         "disk_finding": DISK_FINDING,
@@ -2501,7 +2536,25 @@ def build_report(
                     or block["peers_on"]["dev_smoke_below_n10"]
                     or block["peers_off"]["dev_smoke_below_n10"]
                 )
+    # task-65: an arm that ran and produced a report which cannot be quoted must
+    # not be able to make the WHOLE profile read as quotable. A size arm that was
+    # never asked for (`--skip-size`) is a different statement from one that ran
+    # and failed, so the two are distinguished.
+    size_ran = bool(size_measured)
+    size_usable = True
+    size_independence = (
+        size_measured.get("size", {}).get("derived_quantity_independence", {})
+        if size_ran
+        else {}
+    )
+    if size_ran:
+        size_usable = size_problems == [] and not size_independence.get(
+            "algebraically_identical", False
+        )
     report["verdict"] = {
+        "size_axis_ran": size_ran,
+        "size_axis_usable": size_usable,
+        "size_axis_derived_quantity_independence": size_independence,
         "swarm_valid_observations": valid_points,
         "swarm_total_observations": len(axis.points),
         "swarm_distinct_valid_n": distinct_valid,
@@ -2525,6 +2578,7 @@ def build_report(
             and report["honesty"]["compliant"]
             and speedup_usable
             and not speedup_dev_smoke
+            and size_usable
             and bool(study.get("ran"))
         ),
         "note": (
@@ -3029,6 +3083,9 @@ def human_summary_lines(report: dict) -> list[str]:  # noqa: C901 - a flat repor
         f"s9_bite_demonstrated={verdict['s9_bite_demonstrated']} "
         f"red_flags={verdict['red_flag_count']})"
     )
+    if verdict.get("size_axis_ran"):
+        lines += sz.human_lines(report["measured"], report["models"])
+        lines.append("")
     for problem in verdict["fit_problems"]:
         lines.append(f"    PROBLEM: {problem}")
     for violation in (
@@ -4326,8 +4383,73 @@ def run_self_test() -> int:  # noqa: C901 - a flat list of checks reads better h
         is False,
     )
 
+    # task-65's pure logic lives in its own module; run it here so `just test`
+    # keeps ONE entry point for this instrument's honesty machinery.
+    print()
+    ok = sz.run_self_test() == 0 and ok
+
     print(f"\nprofile_p2p --self-test: {'ALL PASS' if ok else 'FAILURES PRESENT'}")
     return 0 if ok else 1
+
+
+# ---- the task-65 size + concurrency arms -------------------------------------
+
+
+def run_size_axes(
+    ctx, scratch: Path, state_root: Path, fixtures, size_plan, concurrency_plan, args
+) -> tuple[dict, dict, list[str]]:
+    """Build the graded cache, run both task-65 axes, and return the report blocks.
+
+    The graded cache is SYNTHESISED here rather than added to `gen-fixtures.py`
+    deliberately. The size axis needs >= 5 NAR sizes that exist only to move a
+    known number of bytes through the peer path; adding five payloads to the
+    fixture plan would put them in the lock, in `check-fixtures`, in the e2e image
+    and in every other instrument's disk budget, for the benefit of one arm. It is
+    torn down with the rest of `scratch` in `main`'s `finally`.
+
+    HONEST COST of that choice, stated here so it is not discovered in review: the
+    graded payloads never pass through real nix, so this arm proves nothing about
+    nix's acceptance of what the daemon serves. That is `check-rewrite-realnix.py`
+    and the S6 scenario's job, and both already run against the REAL fixtures.
+    """
+    graded_root = scratch / "graded"
+    graded_root.mkdir(parents=True, exist_ok=True)
+    # The real fixture tree's cache-info verbatim, so the synthetic origin answers
+    # the same `StoreDir`/`Priority` the rest of the harness expects. Copied rather
+    # than re-invented: a second definition of the cache's own metadata is a
+    # second thing to forget.
+    nix_cache_info = (fixtures.cache / "nix-cache-info").read_text()
+    graded, payloads = sz.build_graded_cache(
+        graded_root, size_plan + concurrency_plan, nix_cache_info
+    )
+    sz.unit_coincidence(payloads, graded.manifest)
+
+    by_attr = {p.attr: p for p in payloads}
+    by_size = {size: by_attr[attr] for attr, size in size_plan}
+    concurrency_payloads = [by_attr[attr] for attr, _size in concurrency_plan]
+
+    size_axis = sz.sweep_size(ctx, graded, by_size, args.size_repeats, state_root)
+    concurrency_axis = None
+    if concurrency_payloads and args.concurrency:
+        concurrency_axis = sz.sweep_concurrency(
+            ctx,
+            graded,
+            concurrency_payloads,
+            args.concurrency,
+            args.size_repeats,
+            state_root,
+        )
+    measured, models, problems = sz.build_blocks(
+        size_axis, concurrency_axis, sz.SIZE_EXTRAPOLATION_TARGETS_BYTES
+    )
+    measured["size"]["unit_coincidence"] = sz.unit_coincidence(
+        payloads, graded.manifest
+    )
+    # Free the graded NARs as soon as the arms are done: on a host at 95% used the
+    # cache is the largest thing this run created, and holding it through the
+    # report assembly buys nothing.
+    shutil.rmtree(graded_root, ignore_errors=True)
+    return measured, models, problems
 
 
 # ---- main --------------------------------------------------------------------
@@ -4359,6 +4481,32 @@ def main() -> int:
         "--skip-speedup",
         action="store_true",
         help="run only the fitted swarm axis (dev loop)",
+    )
+    parser.add_argument(
+        "--size-grid",
+        type=ss.int_list,
+        default=sz.DEFAULT_SIZE_GRID_MIB,
+        help="task-65 size axis: NAR sizes in MiB of UNCOMPRESSED NAR (default: "
+        "%(default)s). Needs >= scalefit.MIN_POINTS distinct values or the fitter "
+        "refuses to fit",
+    )
+    parser.add_argument(
+        "--size-repeats",
+        type=int,
+        default=sz.DEFAULT_SIZE_REPEATS,
+        help="replicates per size point (default: %(default)s)",
+    )
+    parser.add_argument(
+        "--concurrency",
+        type=ss.int_list,
+        default=sz.DEFAULT_CONCURRENCY,
+        help="task-65 concurrency axis: numbers of OVERLAPPING serves at "
+        f"{sz.CONCURRENCY_SIZE_MIB} MiB (default: %(default)s)",
+    )
+    parser.add_argument(
+        "--skip-size",
+        action="store_true",
+        help="skip the task-65 size and concurrency axes (dev loop)",
     )
     parser.add_argument(
         "--wan-rtt-ms",
@@ -4490,7 +4638,40 @@ def main() -> int:
             print(f"profile: SHAPING NOT VERIFIED: {problem}", file=sys.stderr)
         return 1 if problems else 0
 
+    size_plan = [
+        (f"size-{mib}mib", mib * 1024**2) for mib in sorted(set(args.size_grid))
+    ]
+    concurrency_plan = [
+        (f"conc-{i}", sz.CONCURRENCY_SIZE_MIB * 1024**2)
+        for i in range(max(args.concurrency) if args.concurrency else 0)
+    ]
+    full_plan = size_plan + concurrency_plan
+    if not args.skip_size:
+        # PRECONDITION, before anything expensive and BEFORE the graded cache is
+        # written: this arm's disk appetite is a function of the grid, so someone
+        # widening --size-grid must be told the new number rather than checked
+        # against `MIN_FREE_DISK_BYTES`, which was sized for a different arm.
+        for problem in sz.disk_precondition_violations(free, full_plan):
+            e2e.die(f"profile: {problem}")
+        if len(size_plan) < scalefit.MIN_POINTS:
+            e2e.die(
+                f"--size-grid has {len(size_plan)} distinct sizes; scalefit needs "
+                f">= {scalefit.MIN_POINTS} or it refuses to fit. This is an "
+                "argument error, not a data point."
+            )
+
     config = {
+        "size_grid_bytes_uncompressed_nar": [size for _attr, size in size_plan],
+        "size_repeats": args.size_repeats,
+        "concurrency_values": list(args.concurrency),
+        "concurrency_size_bytes_uncompressed_nar": sz.CONCURRENCY_SIZE_MIB * 1024**2,
+        "size_axis_skipped": bool(args.skip_size),
+        "size_axis_disk_requirement_bytes_ondisk": (
+            sz.graded_disk_requirement_bytes_ondisk(full_plan)
+        ),
+        "size_extrapolation_targets_bytes_uncompressed_nar": list(
+            sz.SIZE_EXTRAPOLATION_TARGETS_BYTES
+        ),
         "swarm_sizes": list(args.swarm),
         "repeats_per_point": args.repeats,
         "speedup_runs": args.speedup_runs,
@@ -4506,8 +4687,39 @@ def main() -> int:
 
     axis = ss.Axis(name="swarm", variable="peer holder count", description="not run")
     speedup = None
+    size_blocks = None
     try:
         axis = sweep_swarm(ctx, fixtures, args.swarm, args.repeats, state_root)
+        if not args.skip_size:
+            # Its own try/except for the same reason the speedup arm has one: this
+            # runs after ~15 minutes of swarm sweeping, and a holder that failed to
+            # announce must not discard the completed axis and write no report.
+            try:
+                size_blocks = run_size_axes(
+                    ctx,
+                    scratch,
+                    state_root,
+                    fixtures,
+                    size_plan,
+                    concurrency_plan,
+                    args,
+                )
+            except (RuntimeError, ss.SampleError, OSError, ValueError) as error:
+                print(
+                    f"profile: size axis FAILED: {error!r}",
+                    file=sys.stderr,
+                )
+                size_blocks = (
+                    {
+                        "size": {
+                            "ran": False,
+                            "reason": f"{error!r}",
+                            "traceback": traceback.format_exc(),
+                        }
+                    },
+                    {},
+                    [f"size axis raised: {error!r}"],
+                )
         if not args.skip_speedup:
             # The speedup arm gets its OWN handler: it runs after ~15 minutes of
             # swarm sweeping, and letting a holder that failed to announce (or
@@ -4558,6 +4770,7 @@ def main() -> int:
         provenance(fixtures, out_root),
         config,
         args.extrapolate_to,
+        size=size_blocks,
     )
     # PERSIST BEFORE PRETTY-PRINTING. The human summary is a formatter over a
     # report that cost ~20 minutes of container runs to produce; a KeyError in
