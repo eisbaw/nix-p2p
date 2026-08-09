@@ -4,7 +4,7 @@ title: 'HARDENING (wave-2a): claim-schema conformance + NarSize-abort spam defen
 status: To Do
 assignee: []
 created_date: '2026-08-08 20:13'
-updated_date: '2026-08-09 14:03'
+updated_date: '2026-08-09 17:21'
 labels:
   - hardening
 dependencies:
@@ -46,4 +46,36 @@ own cost. `blake3_oneshot` in the same run is 49 ms over the same bytes, which
 is roughly what the outboard's hashing must cost - so the clone is plausibly
 most of the remainder, but that split is not measured and you should measure it
 rather than quote 141 ms as the clone.
+
+## Forward-carried from TASK-65: the before/after measurement for the to_vec clone
+
+You own removing `self.store.add_bytes(raw_nar.to_vec())` in
+daemon/src/transport_iroh.rs (IrohProvider::seed) - a borrowed slice CLONED into
+the store, on top of the file buffer read at main.rs.
+
+THE BEFORE NUMBER, and how to reproduce it. `just profile` now fits HOLDER peak
+RSS against >=5 uncompressed NAR sizes and returns a slope with a 95% CI. On a
+five-size smoke grid (8/16/24/32/40 MiB, one replicate each):
+
+    holder  2.0363 bytes RSS per byte of NAR  [95% CI 1.9852 .. 2.0873]  R^2 0.9998
+
+Dev loop: `nix develop -c just profile --skip-speedup --swarm 1 --repeats 1
+--size-repeats 1 --concurrency 1,2`. The slope is at
+models['size.holder_rss_hwm_bytes_ram']['slope_ci95'].
+
+WHAT TO CLAIM. The clone is worth ~1.0x of the payload, so removing it should
+move the holder slope from ~2.04 toward ~1.04. Judge it by whether the two
+CONFIDENCE INTERVALS SEPARATE, not by two point estimates: the interval is
+narrow (+/-0.026 at one replicate per size, narrower at three), so a real 1.0
+shift is unmissable and a fake one is not claimable. That is the whole reason
+this axis exists.
+
+TASK-64 already timed the same code path: provider_seed runs at 819 MB/s for
+110 MiB, i.e. ~141 ms and a full extra copy. So there is a LATENCY claim
+available too, but it is holder-side seeding, not fetch latency.
+
+DO NOT use peak RSS to argue the store 'released' anything - VmHWM is monotone
+and cannot. If you need a residency statement, IrohProvider::store_residency()
+is the oracle (task-65), proven by mutation in
+daemon/tests/store_residency_oracle.rs.
 <!-- SECTION:NOTES:END -->

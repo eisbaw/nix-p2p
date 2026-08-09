@@ -4,7 +4,7 @@ title: 'Bound the disk footprint (target/, fixtures, podman images, blob stores)
 status: To Do
 assignee: []
 created_date: '2026-08-08 22:11'
-updated_date: '2026-08-09 12:27'
+updated_date: '2026-08-09 17:21'
 labels:
   - tooling
 dependencies:
@@ -87,4 +87,36 @@ The report block `disk_finding` states all of this in-band, and
 `held_content_ram_cost` reports RSS per held NarSize byte per node - a NAMED
 cross-unit ratio (the report's unit gate forbids unlabelled `_bytes` keys
 precisely so NarSize and FileSize can never be silently compared).
+
+## Forward-carried from TASK-65: a THIRD disk consumer, and the precondition shape that worked
+
+`just profile` grew a size + concurrency axis (scripts/sizeaxis.py) that
+SYNTHESISES its own graded binary cache. What it costs, so this task can bound it
+deliberately rather than discover it:
+
+ * default grid: NAR sizes 8/16/32/64/128 MiB (248 MiB) + 5 concurrency payloads
+   of 32 MiB (160 MiB) = ~408 MiB of NAR, written once into a scratch cache and
+   once more into a PER-POINT seed dir (e2e.build_p2p_seed_dir copies the raw NAR
+   out of the cache). Requirement is computed as 3x the grid + 2 GiB slack, so
+   ~3.2 GiB at defaults.
+ * 30 pods per full run at the default grid (5 sizes x 3 repeats + 5 k x 3
+   repeats), each with a state dir under the run's scratch. All label-scoped and
+   torn down in a finally, same contract as e2e-clean.
+ * the graded cache is rmtree'd as soon as the arms finish, before report
+   assembly, rather than at the end of the run.
+ * the whole default `just profile` is now ~45 minutes.
+
+WHAT WORKED, and is worth generalising for AC#2: the disk precondition is a
+FUNCTION OF THE GRID, not a flat constant. `sizeaxis.disk_precondition_violations`
+computes the requirement from the actual --size-grid and fails BEFORE anything is
+written, with a message that states the number, where it came from, and that
+shrinking coverage silently is not the answer. profile_p2p's older flat
+MIN_FREE_DISK_BYTES = 8 GiB is still there for the swarm arm and is exactly the
+kind of constant that goes stale when someone widens a grid - AC#2 should
+probably replace it with the same derived shape.
+
+HOST AT THE TIME: 44 GiB free / 95% used. The grid fit; nothing had to be cut.
+If a future widening does not fit, the instruction in the failure message is to
+file it here rather than quietly reduce the size grid below scalefit.MIN_POINTS
+(5), which would make the fitted slope unfittable rather than merely coarse.
 <!-- SECTION:NOTES:END -->

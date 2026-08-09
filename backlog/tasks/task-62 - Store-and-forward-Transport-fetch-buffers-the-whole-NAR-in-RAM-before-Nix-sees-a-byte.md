@@ -6,7 +6,7 @@ title: >-
 status: To Do
 assignee: []
 created_date: '2026-08-09 13:24'
-updated_date: '2026-08-09 14:20'
+updated_date: '2026-08-09 17:20'
 labels: []
 dependencies:
   - TASK-65
@@ -94,4 +94,56 @@ and fixed. The load-bearing conclusion for YOU is unchanged but the figures are:
 Upper bound if streaming removed ALL of our overhead: 188.5 -> 274.1 MB/s =
 1.45x (1.36x on the prior run). Still nowhere near 3.6x, so the guidance stands:
 claim TIME-TO-FIRST-BYTE and MEMORY, not throughput.
+
+## Forward-carried from TASK-65: the axis your AC#2 and AC#5 are built on
+
+YOUR BEFORE-NUMBER, measured. Fetcher (node-a) peak RSS per byte of uncompressed
+NAR, fitted over 5 sizes with 95% CI: see the size axis in `just profile`
+(measured on a five-size smoke grid at 1.0322 [0.9928 .. 1.0717], R^2 0.9996,
+selected model O(n)). Holder was 2.0363 [1.9852 .. 2.0873]. AC#5 is now
+falsifiable: re-run `just profile` and compare the fetcher SLOPE INTERVAL, not
+a single point. If streaming works, the fetcher slope's CI should exclude 1.0.
+
+HOW TO USE IT:
+ * `scripts/sizeaxis.py` is the module. `nix develop -c just profile` runs it;
+   `--skip-speedup --swarm 1 --repeats 1 --size-repeats 1` is the dev loop.
+ * the fitted slope with its interval is at
+   `models['size.fetcher_rss_hwm_bytes_ram']['slope_ci95']`.
+ * scalefit now returns slope_std_error / slope_ci95 /
+   slope_distinguishable_from_zero on EVERY fit. Its coverage is Monte-Carlo
+   verified in scalefit --self-test.
+
+AC#2 (BACKPRESSURE) - what the axis gives you and what it does NOT. The axis
+drives a host-side streaming HTTP reader that reads as fast as it can, so it is
+NOT a slow-reading client. You still have to build that. What you get for free:
+the residency oracle (below) and the fitted-slope machinery to gate it, plus a
+CONCURRENCY arm (k overlapping serves, overlap MEASURED at the holder) which is
+the right shape for 'k slow readers'.
+
+THE RESIDENCY ORACLE - use it, do not rebuild it. Peak RSS cannot verify that a
+buffer moved rather than vanished: VmHWM is monotone so it never observes a
+release, and glibc need not return a freed arena so VmRSS need not either.
+IrohProvider::store_residency() asks the blob store what it HOLDS; the daemon
+logs it as IROH-STORE-RESIDENT and the profiler consumes it. Discrimination
+proven by mutation in daemon/tests/store_residency_oracle.rs.
+
+CAUTION, measured: on this host glibc returned ~97-100% of a freed payload to
+the OS whether it was one 32 MiB blob or 512 fragmented 64 KiB ones. So VmRSS
+HAPPENED to track release here. Do not conclude VmRSS is a fine oracle - nothing
+guarantees it, and VmHWM (what this project FITS) provably never tracks it.
+
+TRAP for streaming specifically: the residency oracle currently reads the
+HOLDER's store. Your change is on the FETCHER side, where the buffer is a plain
+Vec<u8> in transport_fetch.rs and NOT in any store - so store residency will not
+see it. You need a fetcher-side equivalent (an accounting counter around the
+in-flight buffer) or the AC#2 oracle will be vacuous. This is the single most
+likely way TASK-62 ships a green-for-the-wrong-reason gate.
+
+ALSO: task-68's peer-side half is closed. holder_send_bytes_uncompressed_nar_per_s
+is bytes served / the union of the holder's own serve windows - a real
+denominator. It is NOT comparable with task-64's 204 MB/s (that is the fetcher's
+end-to-end fetch including bao verify; this is the send side only, measured at
+447 MB/s at one serve). And sizeaxis.derived_quantity_independence() is the
+mechanical gate: two quoted rates that are one quantity restated have a ratio
+with ~zero variance. Run any new derived quantity through it.
 <!-- SECTION:NOTES:END -->

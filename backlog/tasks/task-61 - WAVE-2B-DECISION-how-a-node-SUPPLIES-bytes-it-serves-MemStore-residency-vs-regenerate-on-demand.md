@@ -6,7 +6,7 @@ title: >-
 status: To Do
 assignee: []
 created_date: '2026-08-09 13:24'
-updated_date: '2026-08-09 13:32'
+updated_date: '2026-08-09 17:21'
 labels: []
 dependencies: []
 ---
@@ -33,3 +33,52 @@ ORACLE WARNING for whoever implements the outcome: peak RSS ALONE cannot verify 
 - [ ] #2 Whatever is chosen, holder RSS is gated on a FITTED SLOPE over >=5 NAR sizes with CI (TASK-65's axis), not a single-point comparison, and the residency oracle is not VmHWM alone
 - [ ] #3 If an on-disk store is chosen: a numeric budget knob, an eviction bite (fill past budget -> evicts rather than grows), and a kill-9-mid-serve-then-restart bite proving reclamation. 'Bounded' without a budget and an eviction rule is not an acceptance criterion
 <!-- AC:END -->
+
+## Implementation Notes
+
+<!-- SECTION:NOTES:BEGIN -->
+## Forward-carried from TASK-65: your AC#2 oracle exists now, and one upstream trap
+
+AC#2 IS SATISFIABLE NOW. `just profile` fits holder peak RSS against >=5 NAR
+sizes and returns a SLOPE WITH A 95% CI
+(models['size.holder_rss_hwm_bytes_ram']['slope_ci95']). Measured on a five-size
+smoke grid: 2.0363 [1.9852 .. 2.0873] bytes of RSS per byte of uncompressed NAR,
+R^2 0.9998 - consistent with task-42's single-point 2.15x and now falsifiable.
+Whatever supply model you choose, gate it on that interval moving, not on a
+single size.
+
+THE RESIDENCY ORACLE THE TASK ASKED FOR: IrohProvider::store_residency() asks the
+blob store what it currently HOLDS (blobs().list() + status(), in NarSize units),
+logged as IROH-STORE-RESIDENT. It is NOT VmHWM and NOT VmRSS, and the
+discrimination is proven by mutation in daemon/tests/store_residency_oracle.rs.
+Rejected alternatives, with reasons, are in that file's module doc - note
+especially that malloc_trim is NOT available: the workspace sets
+unsafe_code = 'forbid'.
+
+STATED LIMIT that bears directly on your decision: store residency answers 'does
+the STORE hold this'. With MemStore that IS RAM residency by construction. If you
+choose option (b) - a bounded evicting FsStore - that equivalence BREAKS and the
+oracle stops being a RAM oracle. You would need to re-derive the mapping, and the
+AC#3 'kill-9-mid-serve-then-restart proves reclamation' bite is about DISK, not
+RAM, under that choice. Say which one each criterion is about.
+
+THE PRIMITIVE FOR EVICTION, and the upstream race that shapes it. Landed:
+StoreRetention::ReleaseOnRequest { sweep_interval } plus
+IrohProvider::release_all(). The daemon default is UNCHANGED (RetainAll) - the
+supply-model decision is yours, not made here.
+
+  MEASURED TRAP: the sweep is ARMED BY release_all(), one sweep per request, NOT
+  by the clock, and that is not a style choice. iroh-blobs' gc calls
+  clear_protected() before it marks, so a free-running sweep can delete a blob
+  whose named tag is not written yet. Measured: a 50 ms gc alongside 512
+  concurrent seeds kept 501 of them - i.e. it silently ate 11 blobs. A BACKGROUND
+  EVICTOR for this store is therefore not a policy option until that race is
+  solved. iroh-blobs itself keeps Blobs::delete private for exactly this reason
+  ('it does not work as expected when called manually').
+
+BUDGET KNOB (your AC#3): if you go with a bounded store, the residency reading is
+what the eviction bite should assert on - fill past budget, then residency must
+DROP rather than the process growing. The profiler deliberately does NOT assert
+'residency == seeded' precisely so a correct eviction change does not fail
+`just profile`; it RECORDS resident_over_seeded_ratio instead.
+<!-- SECTION:NOTES:END -->
