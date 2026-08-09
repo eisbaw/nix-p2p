@@ -3,10 +3,11 @@ id: TASK-61
 title: >-
   SUPPLY MODEL (wave-2a, load-bearing): regenerate-on-demand vs holding what we
   announce
-status: To Do
-assignee: []
+status: In Progress
+assignee:
+  - '@me'
 created_date: '2026-08-09 13:24'
-updated_date: '2026-08-09 17:46'
+updated_date: '2026-08-09 22:16'
 labels: []
 dependencies: []
 priority: high
@@ -34,6 +35,15 @@ ORACLE WARNING for whoever implements the outcome: peak RSS ALONE cannot verify 
 - [ ] #2 Whatever is chosen, holder RSS is gated on a FITTED SLOPE over >=5 NAR sizes with CI (TASK-65's axis), not a single-point comparison, and the residency oracle is not VmHWM alone
 - [ ] #3 If an on-disk store is chosen: a numeric budget knob, an eviction bite (fill past budget -> evicts rather than grows), and a kill-9-mid-serve-then-restart bite proving reclamation. 'Bounded' without a budget and an eviction rule is not an acceptance criterion
 <!-- AC:END -->
+
+## Implementation Plan
+
+<!-- SECTION:PLAN:BEGIN -->
+1. Read the two arms against the owner's MEASURED store (108,401 paths / 155,621 MiB NAR; TASK-65 slope 2.0033 B RAM per B NAR) and write the verdict + its costs into PRD.md (the 'no second copy of the store' bullet and the irreversibility map entry it decides) and into this task's notes. AC#1 is prose with numbers, not code.
+2. Capture the BEFORE fitted slope with 'just profile --skip-speedup --swarm 1 --repeats 1 --concurrency 1 --size-repeats 3' (>=5 NAR sizes, slope + 95% CI from scalefit), and record which oracle produced each number: peak RSS (VmHWM) for the slope, IROH-STORE-RESIDENT for residency. Never VmHWM for residency.
+3. Hand the implementation to TASK-72; re-measure the SAME axis after and report both intervals. A single-size comparison is not admissible.
+4. AC#3 is conditional on choosing an on-disk store. If arm (a) wins, say so explicitly and say what replaces it (a RAM budget knob + an eviction bite), rather than leaving the criterion silently unmet.
+<!-- SECTION:PLAN:END -->
 
 ## Implementation Notes
 
@@ -82,4 +92,55 @@ what the eviction bite should assert on - fill past budget, then residency must
 DROP rather than the process growing. The profiler deliberately does NOT assert
 'residency == seeded' precisely so a correct eviction change does not fail
 `just profile`; it RECORDS resident_over_seeded_ratio instead.
+
+## DECISION (AC#1), 2026-08-09/10 - written into PRD.md 'Supply model'
+
+VERDICT: arm (a) - regenerate on demand via nix-store --dump, hold only the
+in-flight serve. NO local blob copy exists at rest. Bao outboards are NOT
+persisted. Commit e01b934 (PRD), implementation in task-72 (d83dd97 + follow-up).
+
+THE NUMBERS THAT FORCED IT (owner's real store, nix path-info --json --all):
+108,401 paths / 155,621 MiB NAR / p100 3186.03 MiB. At task-65's holder slope of
+2.0033 B RSS per B NAR that is ~304 GiB of RAM to hold everything, and ~6.2 GiB
+for ONE p100 serve (model output, extrapolated past the 8..128 MiB fitted grid).
+A full FsStore copy is 152 GiB of disk - which does not fit on this project's own
+development host (43 GiB free). A BOUNDED FsStore fits but caps supply at the
+budget, discarding the property the whole-store --dump decision bought.
+
+COSTS ACCEPTED, all three written into the PRD rather than implied:
+  1. Re-hash per cold serve: one full dump (a read of the path off disk) + one
+     BLAKE3 pass. The dump dominates - task-64 put the peer path at ~204 MB/s
+     CPU-bound with 72% of the work below our code.
+  2. A REAL, bounded seeding gap: a restart empties the in-memory digest binding,
+     so a published claim can be undiallable until a hold-query re-derives it.
+     Bounded failure (fetcher falls back upstream), never an integrity one.
+  3. In-flight memory becomes the ENTIRE memory cost, hence must be bounded -
+     which is task-72, not a follow-up.
+
+BAO OUTBOARDS REJECTED WITH A REASON: ~0.4% of content (~0.6 GiB here) removes
+the tree recomputation but NOT the dump, which is the part that costs; and
+iroh-blobs 0.103 ships exactly two writable stores (mem, fs), each owning its
+content, with no public way to serve a blob whose outboard is persisted while its
+content is regenerated. Implementing it means a custom Store against an unstable
+trait.
+
+BETTER CANDIDATE, FILED AS TASK-82: persist the 32-byte digest binding instead -
+~40 B/path beyond the existing registration, ~4.3 MB for 108k paths, 0.003% of
+content - which closes cost #2 outright, because a /nix/store path's content is
+immutable by Nix's own invariant. Not done here: it reverses availability.rs'
+stated 'persist only the source of truth' position and deserves its own review.
+
+## AC#3 IS N/A AS WRITTEN, and that is stated rather than silently skipped
+
+AC#3 ('a numeric budget knob, an eviction bite, a kill-9-mid-serve-then-restart
+bite') was conditioned on choosing an ON-DISK store. Arm (a) was chosen, so:
+  * numeric budget knob -> DELIVERED, in RAM: --iroh-max-serve-nar-bytes
+    (default 256 MiB) and --iroh-max-inflight-nar-bytes (default 1 GiB), both in
+    NarSize units, logged at startup as IROH-SERVE-BUDGET.
+  * eviction bite -> DELIVERED, in RAM: task-72's residency assertions, proven by
+    mutation (disabling the post-serve arming leaves 67,108,976 B resident).
+  * kill-9-then-restart reclamation -> VACUOUS under arm (a) and NOT faked: there
+    is no on-disk blob store to reclaim. Per-peer on-disk state was measured flat
+    at 4096 B (task-42) and is unchanged. If task-82 or a future FsStore lands,
+    this criterion becomes live again and must be written then.
 <!-- SECTION:NOTES:END -->

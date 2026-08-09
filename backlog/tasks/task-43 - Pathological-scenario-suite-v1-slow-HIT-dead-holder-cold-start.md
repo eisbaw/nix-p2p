@@ -4,7 +4,7 @@ title: 'Pathological scenario suite v1: slow-HIT, dead-holder, cold-start'
 status: To Do
 assignee: []
 created_date: '2026-08-08 20:13'
-updated_date: '2026-08-09 17:46'
+updated_date: '2026-08-09 22:10'
 labels: []
 dependencies:
   - TASK-42
@@ -133,4 +133,33 @@ FOR THIS SUITE, three concrete consequences:
    different, or a cell where the throttle silently did not arm passes green.
    Proven here by live mutation (stub the fault-arming -> exit 1, two named
    violations), not by reading the code.
+
+## Forward-carried from TASK-72: your largest-NAR pathological row is IMPLEMENTED, but not as a container scenario
+
+TASK-72 AC#4 asked for exactly one of your rows - 'a peer requests the largest
+announced NAR; the node must degrade rather than OOM'. It is done and proven by
+mutation, but IN-PROCESS, in
+`daemon/tests/serve_budget_and_supply.rs::the_serve_bound_declines_a_large_nar_and_removing_it_restores_the_allocation`.
+Measured on this host: with a 16 MiB bound a 64 MiB NAR is DECLINED, the supplier
+is never called, and VmHWM rises 581,632 B; with `ServeBudget::unbounded()` the
+same request is served and VmHWM rises 137,904,128 B (2.055x the NAR).
+
+WHAT IS STILL MISSING FOR YOUR SUITE, and it is the harder half: the container
+version, where the hostile request comes from a real peer over a real network
+namespace rather than an in-process client. The daemon-side knobs are there -
+`--iroh-max-serve-nar-bytes`, `--iroh-max-inflight-nar-bytes` - and the holder
+logs `IROH-SERVE-COUNTERS admitted=.. declined_too_large=.. declined_busy=..`,
+which is a machine-readable oracle you can assert on. `IROH-SERVE-BUDGET` on
+startup tells the harness what the node agreed to.
+
+TWO TRAPS FOR THIS ROW:
+  * VmHWM is a valid oracle for 'did we allocate' (monotone, cannot miss an
+    allocation) and an INVALID one for 'did we release'. Use IROH-STORE-RESIDENT
+    for the second question. Task-65 proved two states with identical VmHWM and
+    opposite ground truth.
+  * A test asserting only 'the fetch failed' is vacuous - it passes when the node
+    OOMs too. Assert the COUNTER and the reason (`declined_too_large` vs
+    `declined_busy` vs `declined_unknown`). The in-process mutation sweep found
+    that removing the per-NAR bound was still caught, but as `declined_busy` -
+    the reason-specific assertion is what made it non-vacuous.
 <!-- SECTION:NOTES:END -->

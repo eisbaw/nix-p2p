@@ -6,7 +6,7 @@ title: >-
 status: To Do
 assignee: []
 created_date: '2026-08-09 13:24'
-updated_date: '2026-08-09 17:20'
+updated_date: '2026-08-09 22:08'
 labels: []
 dependencies:
   - TASK-65
@@ -146,4 +146,38 @@ end-to-end fetch including bao verify; this is the send side only, measured at
 447 MB/s at one serve). And sizeaxis.derived_quantity_independence() is the
 mechanical gate: two quoted rates that are one quantity restated have a ratio
 with ~zero variance. Run any new derived quantity through it.
+
+## Forward-carried from TASK-61/TASK-72: the supply path you are about to stream through
+
+THE HOLDER SIDE IS NO LONGER A STARTUP SEED. `IrohProvider` now regenerates on
+demand: an admission gate (iroh-blobs `RequestMode::InterceptLog`) answers each
+get-request BEFORE it is served, materialises the blob via a `NarSupplier`, holds
+a `TempTag` for the serve, and releases afterwards. Your streaming change lands
+in the FETCHER, but it shares this surface and there are three things you need.
+
+1. THE FETCHER SLOPE IS STILL 1.0156-1.02 B RAM per B NAR and it is still the
+   whole-NAR buffer at `transport_fetch.rs fetch(..) -> Result<Vec<u8>>`. TASK-72
+   did NOT touch it - measure `size.fetcher_rss_hwm_bytes_ram` before/after with
+   the same reduced profile grid task-72 used (see its notes) so the numbers are
+   comparable.
+
+2. THE HOLDER PATH ALREADY TAKES ITS Vec BY VALUE. `materialise` calls
+   `add_bytes(raw)` with an owned `Vec<u8>`, so the supply path costs ~1x the NAR,
+   not 2x. `IrohProvider::seed` still pays the `to_vec` (TASK-46 owns that). Do
+   not attribute a holder-slope change to your streaming work without splitting
+   those two.
+
+3. STREAMING INTO THE STORE IS THE HARDER HALF, and the reason is the collector.
+   `iroh_blobs::api::blobs::add_stream` exists, but the ReleaseAfterServe race
+   argument in `StoreRetention`'s docs depends on the hash being known and
+   registered in the in-flight table BEFORE the add starts. With a stream you do
+   not know the hash until the end. Either keep the digest-first admission (you
+   do know it - the peer asked for it by digest) or re-derive the race argument;
+   do not silently drop it. A blob swept mid-add is a failed serve, not corruption,
+   but it is exactly the flake that is impossible to reproduce later.
+
+4. `STREAM_CHUNK_BYTES` (content_id.rs, 64 KiB) and
+   `Blake3Digest::stream_raw_nar` are already there if you need a bounded-memory
+   pass over a NAR. The recipe stays in content_id.rs - there is a unit test that
+   the streaming and one-shot constructors agree across the chunk boundary.
 <!-- SECTION:NOTES:END -->

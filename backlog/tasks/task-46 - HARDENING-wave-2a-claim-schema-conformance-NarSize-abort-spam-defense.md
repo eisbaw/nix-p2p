@@ -4,7 +4,7 @@ title: 'HARDENING (wave-2a): claim-schema conformance + NarSize-abort spam defen
 status: To Do
 assignee: []
 created_date: '2026-08-08 20:13'
-updated_date: '2026-08-09 17:21'
+updated_date: '2026-08-09 22:09'
 labels:
   - hardening
 dependencies:
@@ -78,4 +78,22 @@ DO NOT use peak RSS to argue the store 'released' anything - VmHWM is monotone
 and cannot. If you need a residency statement, IrohProvider::store_residency()
 is the oracle (task-65), proven by mutation in
 daemon/tests/store_residency_oracle.rs.
+
+## Forward-carried from TASK-72: the to_vec is still yours, and the boundary is now sharp
+
+TASK-72 rewrote the SUPPLY path and it takes its buffer by value:
+`materialise()` in transport_iroh.rs calls `store.blobs().add_bytes(raw)` with an
+owned `Vec<u8>`, so that call site never had a borrowed slice and pays no copy.
+
+`IrohProvider::seed(&self, raw_nar: &[u8])` is UNCHANGED and still does
+`add_bytes(raw_nar.to_vec())`. Its `&[u8]` signature is what forces the copy, so
+your fix is exactly: change the signature (or add an owned-Vec sibling) and move
+the callers. There is no overlap with task-72 and no risk of both claiming the
+same win - the site is now commented to say so.
+
+MEASUREMENT NOTE: `seed` is only on the in-process test path now (the daemon uses
+the supplier), so removing its clone will NOT move the profiler's holder slope.
+If you want a number, measure it where `seed` is actually called - or state
+plainly that the fix is a code-quality one whose runtime effect is confined to
+tests. Do not quote the size-axis slope as evidence for it.
 <!-- SECTION:NOTES:END -->

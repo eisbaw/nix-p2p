@@ -6,6 +6,7 @@ title: >-
 status: To Do
 assignee: []
 created_date: '2026-08-09 21:01'
+updated_date: '2026-08-09 22:09'
 labels:
   - wave-2b
 dependencies: []
@@ -33,3 +34,38 @@ Honest scale caveat: TESTING.md S5 explicitly excludes emergent network effects 
 - [ ] #4 The bounded yes/no fan-out to known peers reaches UNANNOUNCED content (the whole-store supply case), with the fan-out bounded and the no-enumeration property preserved and tested
 - [ ] #5 Honest limit stated: what the local testbed can and cannot say about real DHT behaviour at swarm scale
 <!-- AC:END -->
+
+## Implementation Notes
+
+<!-- SECTION:NOTES:BEGIN -->
+## Forward-carried from TASK-61/TASK-72: what a resolved claim now promises
+
+DHT resolution hands a fetcher a `Blake3Digest` + a holder `NodeId`. As of
+task-72 that digest is servable if and only if the holder's availability index
+has ANSWERED a hold-query for it in this process lifetime - `hold()` is what
+records the `BLAKE3 -> entry` binding the supply path reads back.
+
+TWO CONSEQUENCES FOR YOUR DESIGN, both real:
+
+1. A CLAIM OUTLIVES THE BINDING THAT MAKES IT SERVABLE. Claims persist in the
+   DHT; the reverse map is in-memory and empty after a restart. So a resolution
+   can legitimately return a holder that will decline. The decline is NAMED and
+   counted (`ServeDecline::Unknown`, `IROH-SERVE-COUNTERS declined_unknown`), not
+   an opaque mid-stream failure - use it. The permanent fix is task-82 (persist
+   the immutable digest binding, ~40 B/path); until then your resolution logic
+   must treat 'holder declines' as an ordinary outcome and try the next offer.
+
+2. A HOLDER CAN NOW ALSO DECLINE FOR CAPACITY, not only for absence. A serve
+   larger than `--iroh-max-serve-nar-bytes` (default 256 MiB) or arriving when
+   `--iroh-max-inflight-nar-bytes` (default 1 GiB) is exhausted is refused with
+   `AbortReason::RateLimited` (busy) rather than `Permission`. Those are different
+   findings: 'not from me, ever' vs 'try later'. If discovery caches negative
+   results, do NOT cache a busy the way you cache an unknown, or a momentarily
+   loaded peer disappears from the swarm for the cache TTL.
+
+3. NO ENUMERATION, still. The supply path added a reverse index but exposes only
+   per-digest probes (`supply_size`/`supply_raw_nar`, both private-by-shape:
+   nothing returns the map, its keys or its length). Whatever wire endpoint you
+   add for peer yes/no queries must keep that. It is an owner constraint from
+   phase 1 and it is easy to regress while adding a lookup.
+<!-- SECTION:NOTES:END -->

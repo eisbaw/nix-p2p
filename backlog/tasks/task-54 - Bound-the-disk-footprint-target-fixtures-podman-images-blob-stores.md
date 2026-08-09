@@ -4,7 +4,7 @@ title: 'Bound the disk footprint (target/, fixtures, podman images, blob stores)
 status: To Do
 assignee: []
 created_date: '2026-08-08 22:11'
-updated_date: '2026-08-09 17:21'
+updated_date: '2026-08-09 22:10'
 labels:
   - tooling
 dependencies:
@@ -119,4 +119,27 @@ HOST AT THE TIME: 44 GiB free / 95% used. The grid fit; nothing had to be cut.
 If a future widening does not fit, the instruction in the failure message is to
 file it here rather than quietly reduce the size grid below scalefit.MIN_POINTS
 (5), which would make the fitted slope unfittable rather than merely coarse.
+
+## Forward-carried from TASK-61/TASK-72: the blob store's footprint is now zero at rest
+
+The disk/RAM footprint question changed shape. Measured BEFORE (task-65 axis,
+fitted over 5 NAR sizes): holder store residency 1.0000 bytes held per byte
+announced, forever - the node held everything it announced for the life of the
+process. AFTER task-72 an idle node holds NOTHING: it regenerates on demand and
+releases after the serve.
+
+So for your footprint accounting:
+  * BLOB STORE AT REST: 0 bytes, by construction (StoreRetention::ReleaseAfterServe).
+    Per-peer on-disk state was already 4096 B flat (task-42) and is unchanged -
+    the store is a MemStore and nothing was moved to disk.
+  * BLOB STORE IN FLIGHT: bounded by an explicit number, not by hope.
+    `--iroh-max-inflight-nar-bytes` (default 1 GiB) is the ceiling on
+    concurrently-held NAR bytes, and `--iroh-max-serve-nar-bytes` (default
+    256 MiB) the per-serve one. Quote the KNOB, not a measurement, for the
+    worst case - that is what makes it a bound.
+  * WHAT THE PROJECT DECIDED NOT TO STORE: task-61 rejected persisting bao
+    outboards (~0.4% of content, ~0.6 GiB for a 152 GiB store) with a reason;
+    task-82 proposes persisting the 32-byte digest binding instead (~40 B/path,
+    ~4.3 MB for 108k paths). If task-82 lands, that is the only on-disk growth
+    the supply model introduces, and it is 0.003% of content.
 <!-- SECTION:NOTES:END -->

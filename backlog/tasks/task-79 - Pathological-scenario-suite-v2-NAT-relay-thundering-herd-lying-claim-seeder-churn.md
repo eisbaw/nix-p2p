@@ -6,7 +6,7 @@ title: >-
 status: To Do
 assignee: []
 created_date: '2026-08-09 21:02'
-updated_date: '2026-08-09 21:02'
+updated_date: '2026-08-09 22:10'
 labels:
   - wave-2b
 dependencies:
@@ -34,3 +34,45 @@ Severity calibration: the daemon and peers are OUTSIDE the trust base and nix re
 - [ ] #3 Single-flight per path on the p2p fetch path: N concurrent requests for the same NarHash produce ONE peer fetch, proven by a provider-side counter
 - [ ] #4 Each scenario emits its cost (added latency, wasted bytes, RAM) into the profiling report, and honest limits name what the single-host testbed could not exercise (esp. real NAT/relay - see TASK-80)
 <!-- AC:END -->
+
+## Implementation Notes
+
+<!-- SECTION:NOTES:BEGIN -->
+## Forward-carried from TASK-61/TASK-72: the serve path your lying-claim and herd rows now hit
+
+The holder no longer holds what it announces; it regenerates on demand behind an
+admission gate. Two of your rows land squarely on it.
+
+THUNDERING HERD. Single flight is implemented and proven: 8 concurrent peers
+asking for one absent digest cost ONE regeneration, not 8
+(`concurrent_requests_for_one_absent_digest_regenerate_it_exactly_once`). Removing
+it makes the count go 1 -> 8, which is 8x the memory the budget charged for once.
+Your container-scale herd row should assert the SAME invariant at the holder:
+`IROH-SERVE-COUNTERS regenerated` must be far below `admitted` under a herd. If
+they track each other, single flight has regressed and the budget is no longer a
+bound. NOTE the follower path is a `tokio::sync::watch`, so a follower arriving
+after the leader published cannot miss the wakeup - but a herd row that never
+actually overlaps would not test any of this. MEASURE the overlap at the holder
+(the task-18 rule, and `IROH-SERVE-WINDOW` gives you the intervals).
+
+LYING CLAIM. There is now a second place a lie can be told, and it is on OUR
+side: a supplier that declares one size and produces another. `materialise`
+re-checks the produced length against the per-NAR bound and re-checks
+`tag.hash() == requested hash`, declining as `supply_failed` rather than serving
+the wrong blob under the right name. Worth a row: a holder whose store path has
+been REPLACED since it was announced must decline, not serve. (The fetcher-side
+lie - a peer serving more bytes than the signed NarSize - is task-51's streaming
+abort and is unchanged.)
+
+SEEDER CHURN gets easier and more interesting: a restart now empties the digest
+binding, so a peer that was serving a digest a second ago legitimately answers
+`declined_unknown` after a restart until a hold-query re-derives it (task-61's
+accepted seeding gap; task-82 would close it). Model that explicitly rather than
+treating it as a failure.
+
+ORACLES AVAILABLE TO YOU, all machine-readable on the holder's stdout:
+`IROH-SERVE-BUDGET` (what it agreed to), `IROH-SERVE-COUNTERS` (admitted /
+regenerated / declined_too_large / declined_busy / declined_unknown /
+declined_supply_failed), `IROH-STORE-RESIDENT` (what it holds NOW - not VmHWM),
+`IROH-SERVE-WINDOW` (per-serve intervals on the holder's clock).
+<!-- SECTION:NOTES:END -->
