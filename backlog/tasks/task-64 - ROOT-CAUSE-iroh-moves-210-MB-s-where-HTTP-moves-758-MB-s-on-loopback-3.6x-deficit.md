@@ -3,7 +3,7 @@ id: TASK-64
 title: >-
   ROOT-CAUSE: iroh moves 210 MB/s where HTTP moves 758 MB/s on loopback (3.6x
   deficit)
-status: In Progress
+status: Done
 assignee:
   - '@me'
 created_date: '2026-08-09 13:31'
@@ -364,3 +364,62 @@ however many decimal places the numbers carry.
     single-threaded bottleneck" and NOT "no serialization point", and the module
     doc now says so at the column.
 <!-- SECTION:NOTES:END -->
+
+## Final Summary
+
+<!-- SECTION:FINAL_SUMMARY:BEGIN -->
+The deficit is TRANSPORT-SIDE: peer-to-peer iroh with the daemon's HTTP server
+and real nix out of the path measures ~204 MB/s at 110 MiB on loopback - the
+same number the in-daemon profiler reported, not faster. The planned wave order
+(63 -> 65 -> 62 -> 43 -> 52 -> 44) stands; TASK-62 does not jump the queue.
+
+UNIT CHECK: the 758-vs-210 comparison SURVIVES it. Both arms count the same
+NarSize bytes and `assert_unit_coincidence` proves file_size == nar_size for the
+speedup attrs, so the trap that has recurred three times did not recur. It fails
+a DIFFERENT check: the numerator is the same constant in both arms, so the
+"throughput ratio 3.61" and "latency ratio 3.53" are one measurement counted
+twice, and both denominators are the whole `nix-store --realise`. Neither figure
+is a transport rate. Filed as TASK-68.
+
+NAMED CAUSE, with the control that pins it: the peer path does ~13x TCP's CPU
+work per byte (13.20 vs 0.98 cpu-ns/B) and one connection recruits only ~2.7 of
+14 cores. Per-SYSCALL granularity and handoff COUNT are REFUTED by a
+single-variable control - `tcp_write_1452` hands the same socket the same bytes
+in ~79 000 QUIC-sized writes instead of one, and throughput does not move (1154
+vs 1165 MB/s) while context switches rise 3.6x for free. What binds is
+per-PACKET work, now measured via TCP OutSegs rather than inferred: those 79 000
+TCP writes coalesce into 3 723 segments of ~31 KB, while the UDP arm's become
+79 492 real 1451 B packets, costing +3.6 cpu-ns/B (~5.5 us CPU per extra packet).
+iroh-blobs+bao adds ~3.8 cpu-ns/B of per-byte work on top at unchanged packet
+count.
+
+72% of the per-byte cost sits BELOW our code (68-73% across runs), so deleting
+ALL of our own overhead buys 1.4-1.6x, not 3.6x. NO PRODUCT CODE WAS CHANGED:
+the dominant term is inherent to the transport, and the one candidate fix
+(pre-sizing the receive buffer) was measured IN SITU before being written, found
+worth 0-3% against 12% in isolation, and rejected - it would also have let an
+unverified narinfo NarSize trigger a huge eager allocation, and allocation
+failure in Rust aborts. Carried into PRD risks entry 11 with its bands, its
+honest limits, and the WAN regime handed to TASK-63 as explicitly UNMEASURED.
+
+ONE LARGE LEVER FOUND, not taken: aggregate throughput is still climbing at 4
+connections (306 / 433 / 643 MB/s at N=1/2/4), so the limit is per-connection.
+Filed as TASK-67 and deliberately blocked on TASK-63 - if a realistic link binds
+first it should be closed, not built.
+
+PROCESS, recorded because it is the lesson: THREE causes were proposed and TWO
+were refuted by measurement before the third stood. The first died to a
+measurement bug in its own load-bearing arm (a 200 ms idle timeout billed as
+transfer time, ~35-40% understatement, which INVERTED the conclusion) - and the
+instrument had already printed the tell, a non-monotonic size sweep, which
+nobody read. The second died to the absence of a single-variable control. The
+rule that would have saved both rounds is now in the notes: before naming a
+cause from a set of arms, ask which arm varies ONLY the thing you are about to
+blame, and if none does, build it.
+
+Deliverables: `daemon/examples/iroh_throughput.rs` + `just iroh-bench` (16 arms
+x 3 sizes, four oracles each proven to bite by mutation with recorded numbers);
+PRD risks entry 11; TASK-67/68/69 filed; lessons forward-carried into TASK-46,
+62, 63, 65 and 67. Gates: build/lint/test/e2e all exit 0, 209 cargo tests, e2e
+ALL SCENARIOS PASSED.
+<!-- SECTION:FINAL_SUMMARY:END -->
