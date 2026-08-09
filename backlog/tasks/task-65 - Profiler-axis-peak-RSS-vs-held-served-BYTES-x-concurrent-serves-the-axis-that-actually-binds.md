@@ -6,7 +6,7 @@ title: >-
 status: To Do
 assignee: []
 created_date: '2026-08-09 13:31'
-updated_date: '2026-08-09 14:02'
+updated_date: '2026-08-09 15:47'
 labels: []
 dependencies:
   - TASK-42
@@ -49,4 +49,38 @@ Also relevant to a bytes-axis: `provider_seed` (IrohProvider::seed, which
 `to_vec()`s the caller's slice and computes the bao outboard) runs at 819 MB/s
 for 110 MiB - i.e. ~141 ms and a full extra copy of the payload on the holder
 side. That is the TASK-46 clone, now with a number attached.
+
+## Forward-carried from TASK-63: what changed under you in profile_p2p.py
+
+1. `run_speedup_arms` now takes `condition` + `shaping` and is driven by
+   `run_speedup_conditions`, which runs it once per upstream condition. The
+   report's speedup subtree is indexed `measured.speedup.by_upstream_condition`
+   and each condition's block is keyed `speedup_<condition>`. If your size axis
+   grows a speedup-like ratio, it must carry a condition suffix -
+   `speedup_qualifier_violations` rejects a bare one, and
+   `human_summary_violations` rejects an unqualified line in the PRINTED
+   summary. Both are proven by mutation in `--self-test`.
+
+2. `print_human_summary` is now `human_summary_lines(report) -> list[str]` plus
+   a thin printer. Build your lines there; `main()` gates the returned text and
+   a violation makes the run exit non-zero.
+
+3. `throughput_bytes_uncompressed_nar_per_s` is GONE. It is
+   `realise_rate_bytes_uncompressed_nar_per_s` and it says in its own key that
+   it is 1/realise_s rescaled and NOT a transport rate (TASK-68). A real link
+   rate now sits beside it: `upstream_nar_transport_bytes_compressed_wire_per_s`,
+   derived from the testproxy's own per-record bytes_sent/duration_ms. Measured
+   977.8 MB/s unshaped vs 19.9 MB/s shaped, so it tracks the link, not the CPU.
+   THE PEER side still has no equivalent counter - if your axis can produce one
+   (bytes served / time the provider was actually serving), that closes the open
+   half of TASK-68 and is worth more than another RSS number.
+
+4. Every speedup pod is now PREWARMED host-side (`prewarm_upstream_cache`) so no
+   run carries an origin fetch the others do not. If you add an arm, prewarm it
+   too or your first point differs from the rest for a reason that has nothing
+   to do with your axis.
+
+5. RSS numbers unchanged by all of this: per-peer VmHWM 19.8-21.8 MiB flat over
+   n=1..16, RAM per held NarSize byte 2.16x on node-b. Both conditions agree,
+   which is itself evidence that the shaping touched the link and not the memory.
 <!-- SECTION:NOTES:END -->

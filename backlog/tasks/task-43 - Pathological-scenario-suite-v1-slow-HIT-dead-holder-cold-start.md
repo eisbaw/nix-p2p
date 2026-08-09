@@ -4,7 +4,7 @@ title: 'Pathological scenario suite v1: slow-HIT, dead-holder, cold-start'
 status: To Do
 assignee: []
 created_date: '2026-08-08 20:13'
-updated_date: '2026-08-09 13:33'
+updated_date: '2026-08-09 15:47'
 labels: []
 dependencies:
   - TASK-42
@@ -101,4 +101,35 @@ MEASURED BASELINE YOUR PATHOLOGICAL CASES DEVIATE FROM (this host, 110 MiB
 - swarm size 1..16 had NO measurable effect on client latency (fitted O(1), class
   not identifiable) and none on per-peer RSS/fds (O(1), 19-21 MiB, 10-11 fds).
   Only the HOST total grows: O(n), R^2=0.9996.
+
+## Forward-carried from TASK-63: which upstream your pathological cells run against
+
+TASK-63 made the upstream a NAMED variable, not an assumption. `just profile`
+now has `UPSTREAM_CONDITIONS = ("loopback_control", "wan_shaped")` and the
+report refuses to state a speedup without one.
+
+FOR THIS SUITE, three concrete consequences:
+
+1. Your slow-HIT cell is a comparison against an ALTERNATIVE SOURCE, so its
+   verdict depends on how fast that source is. Against `loopback_control` the
+   upstream serves 110 MiB at 977.8 MB/s, so ANY peer looks slow and
+   "abort to cache" always wins; against `wan_shaped` the upstream serves at
+   19.9 MB/s and a "slow" peer can still be the faster option. Run the cell
+   under BOTH, or state which one it is - a single-condition slow-HIT trace
+   would hand TASK-44 a policy input fitted to a machine no user owns.
+
+2. Reuse, do not re-express, the shaping: `profile_p2p.UpstreamShaping` +
+   `probe_upstream_link` + the pure `shaping_violations`. It arms the SAME
+   testproxy fault modes your suite already uses for throttling (mode 8), plus
+   mode 1 for RTT. `--wan-probe-only` checks a shaping point cheaply.
+
+3. THE ORACLE LESSON, which is the transferable part: TASK-63's shaping is
+   asserted from OUTSIDE the shaper, unshaped-then-shaped over the same channel,
+   and the check FAILS when the unshaped control cannot be told from the shaped
+   one. That anti-vacuity clause is what makes it an oracle rather than a
+   reading. Your throttled-peer cells need the same shape: measure the injected
+   slowness independently and require the fault-off baseline to be materially
+   different, or a cell where the throttle silently did not arm passes green.
+   Proven here by live mutation (stub the fault-arming -> exit 1, two named
+   violations), not by reading the code.
 <!-- SECTION:NOTES:END -->

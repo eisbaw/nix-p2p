@@ -6,7 +6,7 @@ title: >-
 status: To Do
 assignee: []
 created_date: '2026-08-08 20:13'
-updated_date: '2026-08-09 14:02'
+updated_date: '2026-08-09 15:47'
 labels: []
 dependencies:
   - TASK-43
@@ -116,4 +116,51 @@ THREE things this should change in the model:
 Also: the provisional SafetyEnvelope's BODY_IDLE_TIMEOUT of 10 s is enormous
 relative to these numbers - a healthy 110 MiB fetch completes in ~0.6 s. That
 is fine as a floor but it is not a policy, exactly as task-51 said.
+
+## Forward-carried from TASK-63: the two regimes your AC#4 names now EXIST, with their fidelity limits
+
+`scripts/profile_p2p.py` has `UPSTREAM_CONDITIONS = ("loopback_control",
+"wan_shaped")`. Reuse them; do not invent a third yardstick.
+
+WHAT YOU INHERIT
+  * `UpstreamShaping(rtt_ms, bandwidth_bytes_compressed_wire_per_s)` and
+    `.fault_params()` - arms testproxy fault modes 1 + 8 through the Pod seam.
+    CLI: `--wan-rtt-ms`, `--wan-bandwidth-mib-s`, so you can SWEEP the upstream
+    the way your AC#6 crossover curve needs.
+  * `probe_upstream_link()` + the PURE `shaping_violations()` - measures the
+    shaping host-side, outside the shaper, unshaped then shaped over the same
+    channel, and FAILS when the unshaped control cannot be told from the shaped
+    one. Any arm you add at a new (RTT, bandwidth) point must run this, or the
+    threshold you fit is fitted to an unverified shaper.
+  * `--wan-probe-only`: one pod, arm, assert, exit. The cheap way to check a new
+    shaping point actually bites before spending a sweep on it.
+  * Frozen defaults with their derivation in the constants: RTT 50 ms (bottom of
+    task-35's measured 50-110 ms), cap 20 MiB/s (this host's sustained
+    single-stream 21.4 MB/s from cache.nixos.org; task-35's tail gaps imply
+    6.8-9.8 MB/s). BOTH at the upstream-favourable end deliberately.
+
+THE MEASURED BASELINE YOUR MODEL FITS AGAINST (n=10/arm, 110 MiB):
+  loopback_control  peers-off 0.1915 s / peers-on 0.6446 s -> speedup 0.297
+  wan_shaped        peers-off 5.9189 s / peers-on 0.6255 s -> speedup 9.46
+  upstream link 977.8 MB/s vs 19.9 MB/s. Ranking FLIPS between conditions.
+
+WHAT THE SHAPING DOES NOT MODEL - this bounds what your thresholds can claim:
+  * NO per-round-trip RTT inside a transfer, NO TCP slow start, NO
+    receive-window-over-RTT ceiling. The bandwidth-delay product is absent by
+    construction, so a real high-BDP link degrades WORSE than this arm shows and
+    a hedge trigger tuned here will fire LATER than it should on a real link.
+  * NO TLS handshake cost (task-22/24), no loss/jitter, no CDN shielding.
+  * The PEER side is NOT shaped (pod loopback, 187-255 MB/s). Your hedge-delay
+    vs offload-retention crossover is therefore fitted against a peer that is
+    unrealistically FAST, which biases the crossover toward "hedge later".
+    TASK-70 owns shaping the peer link; if it lands before you fit, use it.
+  * The daemon's narinfo disk cache is enabled in both arms, so the injected
+    per-request RTT is paid in full only on the first run of a pod. A model that
+    depends on narinfo RTT must control for that.
+
+ONE MORE TRAP, on the counting side. The bandwidth cap is applied to bytes on
+the WIRE (FileSize units). It coincides with NarSize only because the speedup
+arm's payloads are `Compression: none` and `assert_unit_coincidence` CHECKS it.
+If you add a compressed payload, the cap and any NarSize-denominated rate stop
+being the same number - that is the unit trap this project has hit three times.
 <!-- SECTION:NOTES:END -->

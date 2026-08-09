@@ -6,7 +6,7 @@ title: >-
 status: To Do
 assignee: []
 created_date: '2026-08-09 14:00'
-updated_date: '2026-08-09 15:00'
+updated_date: '2026-08-09 15:46'
 labels:
   - performance
   - transport
@@ -51,4 +51,42 @@ UNIT would attack the cause directly rather than hiding it behind concurrency -
 larger receive batches, or a transport-config change if iroh exposes one. That
 alternative should be costed in this task before N connections are built, since
 it would not multiply CPU by N the way striping does.
+
+## Forward-carried from TASK-63: your prerequisite has an answer, and it is "close this"
+
+TASK-63 shaped the upstream arm and re-ran `just profile` (n=10/arm, 110 MiB
+`Compression: none` payload). The numbers your AC#4 was waiting for:
+
+  loopback_control (~0 RTT, unshaped): peers-off 0.1915 s vs peers-on 0.6446 s
+      -> speedup 0.297; upstream link rate 977.8 MB/s
+  wan_shaped (50 ms RTT, 20 MiB/s cap, both ASSERTED from outside the shaper):
+      peers-off 5.9189 s vs peers-on 0.6255 s
+      -> speedup 9.46; upstream link rate 19.9 MB/s
+  RANKING FLIPPED = True. Egress offload 1.00 in both conditions.
+
+The shaping parameters are at the UPSTREAM-FAVOURABLE end of the measured
+evidence: 20 MiB/s is this host's sustained single-stream rate from
+cache.nixos.org (21.4 MB/s over a 56.6 MB NAR), while task-35's own tail gaps
+imply only 6.8-9.8 MB/s. So the realistic upstream is, if anything, SLOWER than
+the one modelled here.
+
+READ FOR THIS TASK. The peer path already moves ~9x the shaped upstream link.
+Striping buys aggregate throughput on the PEER side - the side that is not the
+constraint on any realistic link, exactly as your own description item (4)
+anticipated ("on any link at or below ~2 Gb/s it buys NOTHING"). 20 MiB/s is
+0.17 Gb/s. The recommendation this task's AC#4 asks for is therefore CLOSE AS
+NOT-WORTH-IT, and the evidence is above.
+
+TWO HONEST QUALIFICATIONS before you act on that, because neither is small:
+
+1. The PEER side is still pod loopback (187-255 MB/s, TASK-64). No real peer
+   link reaches that - 1 GbE is 125 MB/s. TASK-70 owns shaping it. If the peer
+   link is ALSO ~20 MB/s then striping across N DIFFERENT peers (not N
+   connections to one peer) becomes an aggregation-of-uplinks argument rather
+   than a CPU-ceiling argument - a DIFFERENT and possibly live case. If you
+   reopen this, reopen it as that, not as the per-connection-ceiling case.
+2. TASK-63's shaper models per-REQUEST latency and an egress rate cap; it does
+   NOT model the receive-window-over-RTT ceiling. A striped fetch's advantage on
+   a real high-BDP link partly comes from running N windows in parallel, and
+   that effect is invisible to this arm by construction.
 <!-- SECTION:NOTES:END -->
