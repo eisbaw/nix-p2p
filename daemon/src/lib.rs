@@ -25,6 +25,7 @@ pub mod cacheinfo;
 pub mod catalog;
 pub mod claim;
 pub mod content_id;
+pub mod discovery;
 mod hexfmt;
 pub mod narinfo_cache;
 mod nixbase32;
@@ -51,6 +52,10 @@ pub use claim::{
 };
 pub use content_id::{
     BLAKE3_DIGEST_LEN, BLAKE3_DOMAIN_SEPARATION, BLAKE3_PREFIX, Blake3Digest, DigestParseError,
+};
+pub use discovery::{
+    DirectDiscovery, Discovery, FallbackNarSource, InMemoryDiscovery, InProcessPeerQuery,
+    PROBE_TIMEOUT, PeerQuery, PeerQueryError,
 };
 pub use narinfo_cache::{Clock, NarinfoDiskCache, SystemClock};
 pub use rewrite::{NoRawServe, RawRewrite, RawServeDecision, RewriteError, to_raw};

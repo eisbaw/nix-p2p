@@ -56,14 +56,16 @@
 
 use std::collections::HashMap;
 use std::fmt;
+use std::sync::Arc;
 
 use async_trait::async_trait;
 use bytes::Bytes;
 use http::HeaderMap;
 use http_body_util::{BodyExt, Full};
 
-use crate::claim::{Claim, KnownTransport};
+use crate::claim::{KnownTransport, NarHashKey};
 use crate::content_id::Blake3Digest;
+use crate::discovery::Discovery;
 use crate::source::{NarKey, NarSource, SourceError, UpstreamResponse};
 
 // -------------------------------------------------------------------------
@@ -332,32 +334,27 @@ pub async fn fetch_via_offers(
 
 /// A [`NarSource`] that resolves a signed `NarHash` by fetching over the transport
 /// layer - URL-less, keyed on content identity. task-39 registers the real iroh
-/// [`Transport`]; task-40 replaces the in-memory claim map below with the
-/// discovery layer. Neither touches the frozen [`NarSource`] seam.
+/// [`Transport`]; task-40 supplies the [`Discovery`] layer that maps a `NarHash`
+/// to a holder's complete claim. Neither touches the frozen [`NarSource`] seam.
+///
+/// Composition (task-40): `resolve` converts the seam's loose [`crate::source::NarHash`]
+/// to the canonical [`NarHashKey`] (so discovery, the index and the claim all agree
+/// on ONE key), asks [`Discovery::resolve`] for the holder's claim, then hands its
+/// content id + offers to [`fetch_via_offers`]. A discovery MISS is a
+/// [`SourceError::Unreachable`] - the fast, clean signal a [`crate::discovery::FallbackNarSource`]
+/// (or the wave-1 serving layer's 502) turns into upstream fallback (S2).
 pub struct TransportNarSource {
     registry: TransportRegistry,
-    /// Discovery STAND-IN (task-40 replaces this with the real index/DHT lookup):
-    /// the signed NarHash (canonical string) -> the claim describing the content
-    /// id and the fetch offers. Keyed on the canonical [`crate::claim::NarHashKey`]
-    /// string via [`crate::claim::NarHashKey::to_nar_hash`].
-    claims: HashMap<String, Claim>,
+    discovery: Arc<dyn Discovery>,
 }
 
 impl TransportNarSource {
-    /// A source over `registry` with no claims known yet.
-    pub fn new(registry: TransportRegistry) -> Self {
+    /// A source that fetches over `registry`, resolving holders via `discovery`.
+    pub fn new(registry: TransportRegistry, discovery: Arc<dyn Discovery>) -> Self {
         Self {
             registry,
-            claims: HashMap::new(),
+            discovery,
         }
-    }
-
-    /// Record a claim (discovery stand-in): keys it on its canonical signed
-    /// NarHash so a `SignedNarHash` request resolves to it. task-40 supplies these
-    /// from the real discovery layer instead.
-    pub fn announce(&mut self, claim: Claim) {
-        let key = claim.key.to_nar_hash().as_str().to_string();
-        self.claims.insert(key, claim);
     }
 }
 
@@ -385,9 +382,20 @@ impl NarSource for TransportNarSource {
             }
         };
 
-        // Discovery stand-in: signed NarHash -> claim.
-        let claim = self.claims.get(hash.as_str()).ok_or_else(|| {
-            SourceError::Unreachable(format!("no claim known for {}", hash.as_str()))
+        // Canonicalise the loose seam hash to the strict wire key, so discovery,
+        // the availability index and the claim all agree on ONE key. A genuine
+        // narinfo NarHash always canonicalises; a non-canonical seam value cannot
+        // be a p2p key, so it is a miss the caller falls back on (never a panic).
+        let canonical = NarHashKey::try_from(hash).map_err(|e| {
+            SourceError::Unreachable(format!(
+                "NarHash {} is not a canonical p2p key: {e}",
+                hash.as_str()
+            ))
+        })?;
+
+        // Discovery: signed NarHash -> a holder's complete claim, or a bounded MISS.
+        let claim = self.discovery.resolve(&canonical).await.ok_or_else(|| {
+            SourceError::Unreachable(format!("no peer holds {canonical} (discovery miss)"))
         })?;
 
         // The addressed unit: the claim's single BLAKE3 content identity.
@@ -494,9 +502,23 @@ impl Transport for FakeTransport {
 mod tests {
     use super::*;
 
-    use crate::claim::{CLAIM_SCHEMA_VERSION, KnownPayload, NarHashKey};
+    use std::sync::Arc;
+
+    use crate::claim::{CLAIM_SCHEMA_VERSION, Claim, KnownPayload, NarHashKey};
+    use crate::discovery::InMemoryDiscovery;
     use crate::source::{NarHash, NarPathToken};
     use crate::transport::{BitTorrentInfoHash, NodeId};
+
+    /// A `TransportNarSource` over `registry` whose discovery already knows
+    /// `claims` (the task-40 `InMemoryDiscovery` stand-in replacing the old inline
+    /// map). With no claims it resolves every key to a miss.
+    fn source_with(registry: TransportRegistry, claims: Vec<Claim>) -> TransportNarSource {
+        let discovery = InMemoryDiscovery::new();
+        for claim in claims {
+            discovery.announce(claim);
+        }
+        TransportNarSource::new(registry, Arc::new(discovery))
+    }
 
     // A canonical signed NarHash (borrowed from the claim.rs fixtures) and a
     // holder NodeId. The raw NAR is arbitrary bytes - BLAKE3 addresses whatever
@@ -573,11 +595,13 @@ mod tests {
 
         let mut registry = TransportRegistry::new();
         registry.register(Box::new(fake));
-        let mut source = TransportNarSource::new(registry);
-        source.announce(claim_with(
-            content,
-            vec![KnownTransport::Iroh { node: node() }],
-        ));
+        let source = source_with(
+            registry,
+            vec![claim_with(
+                content,
+                vec![KnownTransport::Iroh { node: node() }],
+            )],
+        );
 
         // resolve() takes the signed NarHash (NOT a URL). The fake fetched purely
         // by content id, ignoring the iroh NodeId locator.
@@ -615,11 +639,13 @@ mod tests {
 
         let mut registry = TransportRegistry::new();
         registry.register(Box::new(fake));
-        let mut source = TransportNarSource::new(registry);
-        source.announce(claim_with(
-            content,
-            vec![KnownTransport::Iroh { node: node() }],
-        ));
+        let source = source_with(
+            registry,
+            vec![claim_with(
+                content,
+                vec![KnownTransport::Iroh { node: node() }],
+            )],
+        );
 
         // passes-after: gate 1 fires, the offer fails, resolution is exhausted and
         // fails closed (Nix falls back) - the wrong bytes NEVER reach the client.
@@ -717,7 +743,7 @@ mod tests {
     async fn upstream_path_is_rejected_by_the_p2p_source() {
         // Mirror of the nar_source_seam contract: a URL-less p2p source cannot
         // resolve the cold-start UpstreamPath fallback.
-        let source = TransportNarSource::new(TransportRegistry::new());
+        let source = source_with(TransportRegistry::new(), vec![]);
         let key = NarKey::UpstreamPath(NarPathToken::new("nar/1abc.nar.xz"));
         match source.resolve(&key, None).await {
             Err(SourceError::Unreachable(why)) => assert!(why.contains("UpstreamPath")),
@@ -730,13 +756,12 @@ mod tests {
     async fn a_claim_with_no_usable_content_id_is_a_clean_error() {
         // An unknown payload kind -> content_id() is None -> resolve errors cleanly
         // (never a panic, never a fetch of nothing).
-        let mut source = TransportNarSource::new(TransportRegistry::new());
         let mut claim = claim_with(
             Blake3Digest::from_raw_nar(RAW_NAR),
             vec![KnownTransport::Iroh { node: node() }],
         );
         claim.payload = None; // as if decoded from an unknown-kind wire payload
-        source.announce(claim);
+        let source = source_with(TransportRegistry::new(), vec![claim]);
         match source.resolve(&signed_key(), None).await {
             Err(SourceError::Upstream(why)) => assert!(why.contains("content id")),
             Err(other) => panic!("expected a clean content-id error, got {other:?}"),
