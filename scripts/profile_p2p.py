@@ -2373,6 +2373,23 @@ def build_report(
     distinct_valid = len({p.n for p in axis.points if p.valid})
 
     fits, fit_problems = ss.fit_axis(axis, SWARM_METRICS, targets)
+    # TASK-65: the swarm HOST-TOTAL extrapolation is not a deployment figure and
+    # must not be readable as one. task-42's "18.75 GB at n=1000" is the RSS of a
+    # thousand daemon PROCESSES PACKED ON ONE HOST, a topology nobody deploys; the
+    # per-PEER figure beside it is the one that means something, and the size axis
+    # is where the number a deployment actually needs comes from. Attached to the
+    # fit itself, not written in prose somewhere else, so it travels with the
+    # number a reader quotes.
+    host_total = "swarm.swarm_total_rss_hwm_bytes_ram"
+    if host_total in fits:
+        fits[host_total]["not_a_deployment_figure"] = (
+            "HOST TOTAL for n daemon processes packed on ONE host. This is a "
+            "harness-topology figure, not a fleet's memory: real peers each run on "
+            "their own machine, so the quantity a deployment budgets is the "
+            "PER-PEER figure - and how it grows with the SIZE of what a node "
+            "serves, which is the `size.*` axis, not this one. Do not quote this "
+            "extrapolation as a scaling result (task-42 review, TASK-65)."
+        )
     models.update(fits)
     problems += fit_problems
     # task-65: the size/concurrency arms arrive pre-assembled from `sizeaxis`
@@ -3045,6 +3062,10 @@ def human_summary_lines(report: dict) -> list[str]:  # noqa: C901 - a flat repor
                 else ""
             )
         )
+        if fit.get("not_a_deployment_figure"):
+            lines.append(
+                f"        NOT A DEPLOYMENT FIGURE: {fit['not_a_deployment_figure']}"
+            )
         applicability = report["verdict"].get("bite_applicability", {})
         row = (applicability.get("per_metric") or {}).get(fit_id)
         if row and row.get("inside_demonstrated_regime") is False:
@@ -3606,6 +3627,41 @@ def run_self_test() -> int:  # noqa: C901 - a flat list of checks reads better h
             + report["honesty"]["unit_violations"]
             + report["honesty"]["speedup_qualifier_violations"]
         ),
+    )
+
+    # --- task-65: the host-total extrapolation must not read as a deployment --
+    # task-42 published "18.75 GB at n=1000" off this metric. It is the RSS of a
+    # thousand daemon PROCESSES PACKED ON ONE HOST - a harness topology, not a
+    # fleet - and it was quoted as a scaling result. The qualifier has to travel
+    # WITH the number, in the JSON and in the printed summary, or it will be
+    # quoted again.
+    host_total_axis = _synthetic_swarm_axis(
+        "linear", metric="swarm_total_rss_hwm_bytes_ram"
+    )
+    host_total_report = build_report(
+        host_total_axis, None, study, prov, config, (10, 100, 1000)
+    )
+    host_total_fit = host_total_report["models"].get(
+        "swarm.swarm_total_rss_hwm_bytes_ram"
+    )
+    check(
+        "the swarm HOST-TOTAL fit carries its not-a-deployment-figure qualifier",
+        bool(host_total_fit and host_total_fit.get("not_a_deployment_figure")),
+    )
+    check(
+        "the PRINTED summary states it too (a JSON-only caveat is not read)",
+        any(
+            "NOT A DEPLOYMENT FIGURE" in line
+            for line in human_summary_lines(host_total_report)
+        ),
+    )
+    check(
+        "the PER-PEER fit is NOT qualified that way (the qualifier is targeted, "
+        "not sprayed over every model)",
+        "not_a_deployment_figure"
+        not in build_report(linear, None, study, prov, config, (10, 100, 1000))[
+            "models"
+        ]["swarm.peer_rss_hwm_bytes_ram"],
     )
 
     # --- task-63: the shaping assertion, proven to BITE by mutation ----------
