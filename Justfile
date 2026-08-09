@@ -184,8 +184,11 @@ measure *ARGS: _python fixtures-large
 # extrapolates to 10/100/1000 with confidence intervals. Every extrapolated
 # number is structurally labelled a model output and a superlinear fit is a RED
 # FLAG printed first; the honesty rules are asserted, and a violating report
-# fails the run. SLOW tier: minutes of container runs (the fast-tier half is the
-# --self-test wired into `just test`). Cleans up label-scoped, like `e2e-clean`.
+# fails the run. Each point is run 3x (--repeats) and the replicates are fitted
+# as separate observations: single-draw sweeps picked a DIFFERENT growth class
+# for the same metric on consecutive runs. SLOW tier: ~12 minutes of container
+# runs at the default grid (the fast-tier half is the --self-test wired into
+# `just test`). Cleans up label-scoped, like `e2e-clean`, on exit and SIGTERM.
 # Run the S5 scale sweep and emit the fitted/extrapolated report.
 scale-sweep *ARGS: _python fixtures-large
     "${NIX_P2P_PYTHON}/bin/python3" scripts/scale_sweep.py {{ ARGS }}

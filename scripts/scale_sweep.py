@@ -45,10 +45,17 @@ WHAT IS MEASURED, precisely (the counting rule for this instrument):
   * BYTES, when reported, are COMPRESSED ON-WIRE bytes (file_size). NarSize
     (uncompressed, signed) is a different unit and is never mixed in.
 
+REPLICATES. Each sweep point is run `--repeats` times (default 3) and the
+replicates are handed to the fitter as SEPARATE observations at the same n,
+never averaged: three consecutive single-draw sweeps selected O(log n),
+O(log n) not-identifiable and O(n) for the same metric, and a class that changes
+between runs is not a law. Keeping the replicates lets the residual variance -
+and therefore every interval - absorb run-to-run noise instead of hiding it.
+
 FAIL-CLOSED. A node whose /proc could not be read, or a client that exited
 nonzero, INVALIDATES that sweep point: it is excluded with a logged reason and
-never recorded as 0. An axis left with fewer than `scalefit.MIN_POINTS` valid
-points is reported as unfitted with the reason, never fitted on what survived.
+never recorded as 0. An axis left with fewer than `scalefit.MIN_POINTS` DISTINCT
+valid n is reported as unfitted with the reason, never fitted on what survived.
 
 `--self-test` runs the pure logic (proc parsing, point validity, report
 assembly, the red-flag wiring) with NO containers, so `just test` covers the
@@ -61,6 +68,7 @@ import argparse
 import json
 import os
 import shutil
+import signal
 import statistics
 import subprocess
 import sys
@@ -112,6 +120,15 @@ SWEEP_ATTRS = ("lib", "app", "zstd")
 # bounding the footprint properly; this is the guard that keeps a sweep from
 # being the thing that fills the disk.
 MIN_FREE_DISK_BYTES = 8 * 1024**3
+
+# Replicates per sweep point. NOT cosmetic: with one observation per N the
+# daemon's peak RSS is a single noisy draw (allocator behaviour, chunking), and
+# three consecutive full sweeps selected O(log n), O(log n) NOT-identifiable and
+# O(n) for the SAME metric. A class that changes between runs is not a law. The
+# replicates are fed to the fitter as SEPARATE observations at the same n rather
+# than averaged, so the residual variance - and therefore every interval -
+# absorbs run-to-run noise instead of hiding it behind a mean.
+DEFAULT_REPEATS = 3
 
 # Concurrency barrier budget: how long to allow for every client container of
 # one sweep point to reach the shared realise instant. Container start costs a
@@ -358,6 +375,15 @@ def build_report(axes: list[Axis], provenance: dict, config: dict, targets) -> d
             "description": axis.description,
             "fitted": axis.fitted,
             "notes": axis.notes,
+            # Replicates are separate OBSERVATIONS at the same n, never averaged
+            # (see DEFAULT_REPEATS): the fitter needs the spread to size its
+            # intervals honestly, and a reader needs to see how many draws each
+            # n actually got.
+            "distinct_n": sorted({p.n for p in axis.points}),
+            "valid_observations_per_n": {
+                str(n): sum(1 for p in axis.points if p.n == n and p.valid)
+                for n in sorted({p.n for p in axis.points})
+            },
             "points": [
                 {
                     "n": p.n,
@@ -382,8 +408,9 @@ def build_report(axes: list[Axis], provenance: dict, config: dict, targets) -> d
                 {
                     "axis": axis.name,
                     "fitted": False,
-                    "valid_points": valid_points,
-                    "total_points": len(axis.points),
+                    "valid_observations": valid_points,
+                    "total_observations": len(axis.points),
+                    "distinct_valid_n": len({p.n for p in axis.points if p.valid}),
                     "usable": valid_points == len(axis.points) and valid_points > 0,
                     "why": "reported per value; usable iff every point is valid",
                 }
@@ -398,8 +425,9 @@ def build_report(axes: list[Axis], provenance: dict, config: dict, targets) -> d
             {
                 "axis": axis.name,
                 "fitted": True,
-                "valid_points": valid_points,
-                "total_points": len(axis.points),
+                "valid_observations": valid_points,
+                "total_observations": len(axis.points),
+                "distinct_valid_n": len({p.n for p in axis.points if p.valid}),
                 "usable": axis_problems == [],
                 "why": (
                     "usable iff every metric fitted; a point lost to a flaky "
@@ -753,7 +781,7 @@ def _point_from_arm(
     )
 
 
-def sweep_clients(ctx, fixtures, counts, jobs: int, conns: int) -> Axis:
+def sweep_clients(ctx, fixtures, counts, jobs: int, conns: int, repeats: int) -> Axis:
     """Axis 1: N concurrent clients against ONE daemon."""
     axis = Axis(
         name="clients",
@@ -772,46 +800,50 @@ def sweep_clients(ctx, fixtures, counts, jobs: int, conns: int) -> Axis:
     substituter = ctx.substituter_daemon_only()
     targets = [fixtures.store_path(a) for a in SWEEP_ATTRS]
     for count in counts:
-        print(f"scale-sweep: clients axis, N={count}", file=sys.stderr)
-        point = SweepPoint(n=count, valid=False)
-        try:
-            with e2e.Pod(
-                ctx,
-                f"scale-clients-{count}",
-                fixtures.cache,
-                with_daemon=True,
-                expect=_silent_expect([]),
-            ) as pod:
-                with NodeSampler(pod, pod.roles()) as sampler:
-                    arm = _drive_clients(
-                        pod,
-                        substituter,
-                        fixtures.public_key,
-                        targets,
-                        count,
-                        jobs,
-                        conns,
-                    )
-                resources = aggregate_samples(sampler.samples, pod.daemon_roles())
-            point = _point_from_arm(
-                count,
-                arm,
-                sampler.errors,
-                resources,
-                metric_keys=(
-                    "daemon_rss_hwm_bytes",
-                    "daemon_rss_point_max_bytes",
-                    "daemon_fd_max",
-                ),
-                require_concurrency=True,
+        for rep in range(repeats):
+            print(
+                f"scale-sweep: clients axis, N={count} (replicate {rep + 1}/{repeats})",
+                file=sys.stderr,
             )
-        except (RuntimeError, SampleError, OSError) as error:
-            point.reason = f"sweep point raised: {error!r}"
-        axis.points.append(point)
+            point = SweepPoint(n=count, valid=False)
+            try:
+                with e2e.Pod(
+                    ctx,
+                    f"scale-clients-{count}-{rep}",
+                    fixtures.cache,
+                    with_daemon=True,
+                    expect=_silent_expect([]),
+                ) as pod:
+                    with NodeSampler(pod, pod.roles()) as sampler:
+                        arm = _drive_clients(
+                            pod,
+                            substituter,
+                            fixtures.public_key,
+                            targets,
+                            count,
+                            jobs,
+                            conns,
+                        )
+                    resources = aggregate_samples(sampler.samples, pod.daemon_roles())
+                point = _point_from_arm(
+                    count,
+                    arm,
+                    sampler.errors,
+                    resources,
+                    metric_keys=(
+                        "daemon_rss_hwm_bytes",
+                        "daemon_rss_point_max_bytes",
+                        "daemon_fd_max",
+                    ),
+                    require_concurrency=True,
+                )
+            except (RuntimeError, SampleError, OSError) as error:
+                point.reason = f"sweep point raised: {error!r}"
+            axis.points.append(point)
     return axis
 
 
-def sweep_chain(ctx, fixtures, depths) -> Axis:
+def sweep_chain(ctx, fixtures, depths, repeats: int) -> Axis:
     """Axis 2: proxy-chain depth (client -> daemon-1 -> .. -> daemon-N -> proxy)."""
     axis = Axis(
         name="chain",
@@ -826,43 +858,47 @@ def sweep_chain(ctx, fixtures, depths) -> Axis:
     substituter = f"http://127.0.0.1:{e2e.DAEMON_PORT}?priority=10"
     targets = [fixtures.store_path(a) for a in SWEEP_ATTRS]
     for depth in depths:
-        print(f"scale-sweep: chain axis, depth={depth}", file=sys.stderr)
-        point = SweepPoint(n=depth, valid=False)
-        try:
-            with e2e.Pod(
-                ctx,
-                f"scale-chain-{depth}",
-                fixtures.cache,
-                with_daemon=False,
-                daemon_chain=depth,
-                expect=_silent_expect([]),
-            ) as pod:
-                with NodeSampler(pod, pod.roles()) as sampler:
-                    arm = _drive_clients(
-                        pod, substituter, fixtures.public_key, targets, 1, 1, 1
-                    )
-                resources = aggregate_samples(sampler.samples, pod.daemon_roles())
-            # One client per depth, so there is no concurrency to enforce; the
-            # variable here is the topology, not the load.
-            point = _point_from_arm(
-                depth,
-                arm,
-                sampler.errors,
-                resources,
-                metric_keys=(
-                    "daemon_rss_hwm_bytes",
-                    "chain_total_rss_hwm_bytes",
-                    "daemon_fd_max",
-                ),
-                require_concurrency=False,
+        for rep in range(repeats):
+            print(
+                f"scale-sweep: chain axis, depth={depth} (replicate {rep + 1}/{repeats})",
+                file=sys.stderr,
             )
-        except (RuntimeError, SampleError, OSError) as error:
-            point.reason = f"sweep point raised: {error!r}"
-        axis.points.append(point)
+            point = SweepPoint(n=depth, valid=False)
+            try:
+                with e2e.Pod(
+                    ctx,
+                    f"scale-chain-{depth}-{rep}",
+                    fixtures.cache,
+                    with_daemon=False,
+                    daemon_chain=depth,
+                    expect=_silent_expect([]),
+                ) as pod:
+                    with NodeSampler(pod, pod.roles()) as sampler:
+                        arm = _drive_clients(
+                            pod, substituter, fixtures.public_key, targets, 1, 1, 1
+                        )
+                    resources = aggregate_samples(sampler.samples, pod.daemon_roles())
+                # One client per depth, so there is no concurrency to enforce; the
+                # variable here is the topology, not the load.
+                point = _point_from_arm(
+                    depth,
+                    arm,
+                    sampler.errors,
+                    resources,
+                    metric_keys=(
+                        "daemon_rss_hwm_bytes",
+                        "chain_total_rss_hwm_bytes",
+                        "daemon_fd_max",
+                    ),
+                    require_concurrency=False,
+                )
+            except (RuntimeError, SampleError, OSError) as error:
+                point.reason = f"sweep point raised: {error!r}"
+            axis.points.append(point)
     return axis
 
 
-def sweep_knobs(ctx, fixtures, values, clients: int) -> Axis:
+def sweep_knobs(ctx, fixtures, values, clients: int, repeats: int) -> Axis:
     """Axis 3: the client concurrency knobs, REPORTED PER VALUE, never fitted.
 
     TESTING.md's client-knobs rule requires {1, 16, 128} be swept and reported
@@ -894,59 +930,64 @@ def sweep_knobs(ctx, fixtures, values, clients: int) -> Axis:
     substituter = ctx.substituter_daemon_only()
     targets = [fixtures.store_path(a) for a in SWEEP_ATTRS]
     for value in values:
-        print(f"scale-sweep: knobs axis, jobs=conns={value}", file=sys.stderr)
-        point = SweepPoint(n=value, valid=False)
-        try:
-            with e2e.Pod(
-                ctx,
-                f"scale-knobs-{value}",
-                fixtures.cache,
-                with_daemon=True,
-                expect=_silent_expect([]),
-            ) as pod:
-                with NodeSampler(pod, pod.roles()) as sampler:
-                    arm = _drive_clients(
-                        pod,
-                        substituter,
-                        fixtures.public_key,
-                        targets,
-                        clients,
-                        value,
-                        value,
-                    )
-                resources = aggregate_samples(sampler.samples, pod.daemon_roles())
-            point = _point_from_arm(
-                value,
-                arm,
-                sampler.errors,
-                resources,
-                metric_keys=("daemon_rss_hwm_bytes", "daemon_fd_max"),
-                require_concurrency=True,
+        for rep in range(repeats):
+            print(
+                f"scale-sweep: knobs axis, jobs=conns={value} "
+                f"(replicate {rep + 1}/{repeats})",
+                file=sys.stderr,
             )
-            # PRECONDITION, asserted: the knob must be confirmed to have LANDED,
-            # read back from nix itself. Without this the arm is three identical
-            # runs wearing different labels - the vacuous shape this project has
-            # been burned by three times.
-            confirmed = arm.effective_knobs.get("max-substitution-jobs") == value
-            if not confirmed:
-                point.valid = False
-                point.reason = "; ".join(
-                    filter(
-                        None,
-                        [
-                            point.reason,
-                            f"knob not confirmed by nix: readback "
-                            f"{arm.effective_knobs or '{}'} != "
-                            f"max-substitution-jobs={value} (arm unusable, not assumed)",
-                        ],
-                    )
+            point = SweepPoint(n=value, valid=False)
+            try:
+                with e2e.Pod(
+                    ctx,
+                    f"scale-knobs-{value}-{rep}",
+                    fixtures.cache,
+                    with_daemon=True,
+                    expect=_silent_expect([]),
+                ) as pod:
+                    with NodeSampler(pod, pod.roles()) as sampler:
+                        arm = _drive_clients(
+                            pod,
+                            substituter,
+                            fixtures.public_key,
+                            targets,
+                            clients,
+                            value,
+                            value,
+                        )
+                    resources = aggregate_samples(sampler.samples, pod.daemon_roles())
+                point = _point_from_arm(
+                    value,
+                    arm,
+                    sampler.errors,
+                    resources,
+                    metric_keys=("daemon_rss_hwm_bytes", "daemon_fd_max"),
+                    require_concurrency=True,
                 )
-            point.detail["knob_confirmed"] = confirmed
-            point.detail["above_workload_ceiling"] = value > len(SWEEP_ATTRS)
-            point.detail["concurrent_clients"] = clients
-        except (RuntimeError, SampleError, OSError) as error:
-            point.reason = f"sweep point raised: {error!r}"
-        axis.points.append(point)
+                # PRECONDITION, asserted: the knob must be confirmed to have LANDED,
+                # read back from nix itself. Without this the arm is three identical
+                # runs wearing different labels - the vacuous shape this project has
+                # been burned by three times.
+                confirmed = arm.effective_knobs.get("max-substitution-jobs") == value
+                if not confirmed:
+                    point.valid = False
+                    point.reason = "; ".join(
+                        filter(
+                            None,
+                            [
+                                point.reason,
+                                f"knob not confirmed by nix: readback "
+                                f"{arm.effective_knobs or '{}'} != "
+                                f"max-substitution-jobs={value} (arm unusable, not assumed)",
+                            ],
+                        )
+                    )
+                point.detail["knob_confirmed"] = confirmed
+                point.detail["above_workload_ceiling"] = value > len(SWEEP_ATTRS)
+                point.detail["concurrent_clients"] = clients
+            except (RuntimeError, SampleError, OSError) as error:
+                point.reason = f"sweep point raised: {error!r}"
+            axis.points.append(point)
     return axis
 
 
@@ -1040,8 +1081,10 @@ def print_human_summary(report: dict) -> None:
     )
     for name, axis in report["measured"].items():
         valid = sum(1 for p in axis["points"] if p["valid"])
+        distinct = len({p["n"] for p in axis["points"] if p["valid"]})
         print(
-            f"  axis {name:<8}: {valid}/{len(axis['points'])} valid points"
+            f"  axis {name:<8}: {valid}/{len(axis['points'])} valid observations "
+            f"over {distinct} distinct n"
             f"{'' if axis['fitted'] else '  (reported per value, NOT fitted)'}",
             file=out,
         )
@@ -1382,6 +1425,40 @@ def run_self_test() -> int:  # noqa: C901 - a flat list of checks reads better h
         len(starved_report["measured"]["clients"]["invalid_points"]) == 3,
     )
 
+    # --- replicates are observations, not an average --------------------------
+    replicated = _synthetic_axis(
+        "clients", "concurrent clients", "linear", "daemon_rss_hwm_bytes"
+    )
+    jitter = 0.0
+    for extra in list(replicated.points):
+        jitter += 1.0e5
+        clone = SweepPoint(
+            n=extra.n, valid=True, metrics=dict(extra.metrics), detail={}
+        )
+        clone.metrics["daemon_rss_hwm_bytes"] += jitter
+        replicated.points.append(clone)
+    rep_report = build_report([replicated], prov, config, (10, 100, 1000))
+    rep_fit = rep_report["models"]["clients.daemon_rss_hwm_bytes"]
+    check(
+        "replicates reach the fitter as SEPARATE observations (not averaged)",
+        len(rep_fit["n_values"]) == 12,
+        f"{len(rep_fit['n_values'])} observations",
+    )
+    check(
+        "duplicate n still counts as ONE distinct n for the MIN_POINTS rule",
+        len(set(rep_fit["n_values"])) == 6,
+    )
+    check(
+        "replicate spread shows up in the residual std error (intervals widen)",
+        rep_fit["residual_std_error"]
+        > report["models"]["clients.daemon_rss_hwm_bytes"]["residual_std_error"],
+    )
+    check(
+        "the report says how many valid observations each n got",
+        rep_report["measured"]["clients"]["valid_observations_per_n"]["12"] == 2,
+        str(rep_report["measured"]["clients"]["valid_observations_per_n"]),
+    )
+
     # An unfitted axis (the knobs arm) must not silently become fitted.
     knob_axis = Axis(
         name="knobs", variable="knob", description="synthetic", fitted=False
@@ -1402,6 +1479,21 @@ def run_self_test() -> int:  # noqa: C901 - a flat list of checks reads better h
 
 def _int_list(raw: str) -> tuple[int, ...]:
     return tuple(int(x) for x in raw.replace(",", " ").split())
+
+
+def _install_sigterm_cleanup() -> None:
+    """Tear the pods down on SIGTERM too, not only on Ctrl-C.
+
+    Learned the hard way: a `timeout`-killed sweep left a pod running, because
+    only KeyboardInterrupt was handled and SIGTERM kills the process outright.
+    On a host at 95% disk a leaked pod is not a tidiness issue. `just e2e-clean`
+    remains the manual counterpart; this makes the common case automatic."""
+
+    def handler(_signum, _frame):
+        e2e.cleanup_pods("(SIGTERM)")
+        raise SystemExit(143)
+
+    signal.signal(signal.SIGTERM, handler)
 
 
 def main() -> int:
@@ -1438,6 +1530,14 @@ def main() -> int:
         help="n values to extrapolate to (default: %(default)s)",
     )
     parser.add_argument(
+        "--repeats",
+        type=int,
+        default=DEFAULT_REPEATS,
+        help="replicate runs per sweep point, fed to the fitter as separate "
+        "observations at the same n (default: %(default)s). 1 is a dev smoke: "
+        "a single draw per n let the selected class change between sweeps.",
+    )
+    parser.add_argument(
         "--report", type=Path, default=None, help="also write the JSON report here"
     )
     parser.add_argument(
@@ -1456,6 +1556,7 @@ def main() -> int:
     if args.self_test:
         return run_self_test()
 
+    _install_sigterm_cleanup()
     free = shutil.disk_usage(fx.repo_root()).free
     if free < MIN_FREE_DISK_BYTES:
         e2e.die(
@@ -1480,6 +1581,7 @@ def main() -> int:
         "chain_depths": list(args.chain_depths),
         "knob_values": list(args.knobs),
         "knob_arm_clients": KNOB_ARM_CLIENTS,
+        "repeats_per_point": args.repeats,
         "axes": sorted(wanted),
         "poll_interval_s": POLL_INTERVAL_S,
         "extrapolation_targets": list(args.extrapolate_to),
@@ -1489,12 +1591,24 @@ def main() -> int:
     axes: list[Axis] = []
     try:
         if "clients" in wanted:
-            axes.append(sweep_clients(ctx, fixtures, args.clients, jobs=1, conns=1))
+            axes.append(
+                sweep_clients(
+                    ctx, fixtures, args.clients, jobs=1, conns=1, repeats=args.repeats
+                )
+            )
         if "chain" in wanted:
-            axes.append(sweep_chain(ctx, fixtures, args.chain_depths))
+            axes.append(
+                sweep_chain(ctx, fixtures, args.chain_depths, repeats=args.repeats)
+            )
         if "knobs" in wanted:
             axes.append(
-                sweep_knobs(ctx, fixtures, args.knobs, clients=KNOB_ARM_CLIENTS)
+                sweep_knobs(
+                    ctx,
+                    fixtures,
+                    args.knobs,
+                    clients=KNOB_ARM_CLIENTS,
+                    repeats=args.repeats,
+                )
             )
     finally:
         # Label-scoped teardown, same contract as `just e2e-clean`: a sweep that
