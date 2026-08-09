@@ -1,29 +1,70 @@
 # nix-p2p
 
 > **Work in progress — nothing here is stable.** The name "nix-p2p" is
-> tentative. The p2p protocol is not settled: the DHT mechanism, the claim
-> schema freeze, and the transport details are open wave-2 design work.
-> Expect interfaces, on-disk formats, and claims in this README to change.
+> tentative. Peer *transfer* works; peer *discovery* does not exist yet — the
+> DHT mechanism and its key derivation are still open design work, and nodes
+> currently learn about each other from the command line. The claim wire
+> schema and the addressed unit are frozen; everything else may change.
 
 A decentralized Nix binary cache: a localhost substituter daemon that serves
 the standard binary-cache HTTP API, passes signed metadata through from
-cache.nixos.org, and (wave 2) fetches NAR payloads from a p2p swarm,
-hash-verified against the signed NarHash. An unmodified Nix client re-verifies
-signature and NarHash itself, so the daemon and all peers stay outside the
-trusted computing base.
+cache.nixos.org, and fetches NAR payloads from peers over iroh, hash-verified
+against the signed NarHash. An unmodified Nix client re-verifies signature and
+NarHash itself, so the daemon and all peers stay outside the trusted computing
+base.
 
 The goal is bandwidth offload for cache.nixos.org — decentralizing the bytes,
 not the trust. Metadata and signatures remain the cache's job.
 
 ## Status
 
-**Wave 1 complete, wave 2 (p2p) in planning.** The daemon today is a
-transparent proxy: correct `nix-cache-info` semantics, narinfo disk cache,
-NAR correlation catalog, and a measurement instrument — no peer transfer yet.
-The `NarSource`/`NarinfoSource` trait seams it grows behind are frozen; wave 2
-adds an iroh whole-NAR transport (and later BitTorrent) as new implementations,
-not serving-layer changes. See `PRD.md` for the full design record and
-`backlog/` for task state.
+**Wave 1 complete; wave 2a (peer transfer) working; discovery not started.**
+
+A real `nix build` is served from a peer over iroh, across container network
+namespaces, verified twice: BLAKE3/bao on arrival and Nix's own signature +
+NarHash check. A corrupt peer fails the build rather than poisoning the store;
+a dead peer falls back to upstream.
+
+What works:
+
+- Transparent substituter proxy — `nix-cache-info` semantics, narinfo disk
+  cache, NAR correlation catalog, multi-daemon chains, NixOS module + VM test.
+- iroh whole-NAR transport behind `NarSource`, with a frozen claim wire schema,
+  an announce-on-demand availability index that never allows enumeration, and a
+  conservative safety envelope (dial/idle/fetch timeouts, streaming NarSize
+  abort).
+- A measurement and profiling stack: frozen egress counting rule, regression
+  fitter with model selection and confidence intervals, and a p2p profiler
+  covering RAM, disk, latency, throughput and speedup.
+
+What does **not** work yet — the honest headline:
+
+- **Peers cannot find each other.** There is no DHT and no gossip. Nodes
+  connect because `--iroh-peer` and `--p2p-claim` were passed on the command
+  line, so today this decentralizes *transfer*, not *discovery*.
+- A node cannot serve the store it advertises: the availability index answers
+  for every local path, but the provider only serves what was eagerly seeded.
+- No serve-side size bound, no multi-holder failover, no streaming (the whole
+  NAR is buffered), and no policies at all — no hedge, prefetch, announce
+  budget, or leech mode.
+- Nothing has run on a real network: no NAT, no relay, no residential uplink.
+
+Measured on the container testbed (single host, so read the caveats):
+
+| Measurement | Result |
+|---|---|
+| Upstream NAR-payload egress offloaded | **1.00** (all of it) |
+| vs. a WAN-shaped upstream (50 ms RTT, 20 MiB/s) | peer path **9.3× faster** |
+| vs. a zero-latency loopback upstream | peer path **3.6× slower** |
+| Holder RAM per byte served | **2.00 B/B** (its blob store holds 1.00) |
+
+The two speedup figures are the same system against different upstreams — the
+ranking flips, so neither is quotable alone. The 9.3× magnitude is linear in
+the bandwidth cap; the *flip* is the robust part. `TESTING.md` forbids claiming
+emergent network effects from single-host sweeps, and the peer link is still
+loopback, so peer-side numbers are upper bounds.
+
+See `PRD.md` for the full design record and `backlog/` for task state.
 
 ## Architecture
 
@@ -35,6 +76,10 @@ Two strictly separated Rust binaries (no shared crates, enforced by
   and `NarSource` (resolve a typed `NarKey` — the signed NarHash on the normal
   path — to a verified NAR stream). The seam carries the exact identity a
   DHT/claims index resolves, so the p2p swap needs no HTTP-layer change.
+  The iroh transport plugs in here as one `NarSource` implementation behind a
+  `Transport` trait, with a `TransportRegistry` dispatching on the transport
+  tag each claim offer carries — so a second transport (BitTorrent) is a new
+  implementation, not a network fork.
 - **`testproxy/`** — the permanent test fixture. A simple caching proxy that
   fronts the upstream (real or mock) and owns all fault injection: latency,
   errors, corruption, throttling. Adversarial-upstream logic never lives in
@@ -61,6 +106,19 @@ Key invariants, tested end-to-end (see `TESTING.md`):
   "bytes from peers" is not the metric.
 - **S4 latency bound**: p95 build wall-clock with the daemon ≤ 110% of
   daemon-off.
+- **S6 peer-served build**: a real `nix build` whose NAR came from a peer, with
+  the bytes counted at the *provider* (the fetching daemon's own claim to have
+  used a peer is untrusted narration), plus a peers-off contrast arm proving
+  the upstream channel was live.
+- **S9 models bite**: the profiler's fits are proven by mutation — a known
+  superlinear workload must be classified superlinear and must not fit as
+  linear, and extrapolations are structurally labelled model output, never
+  measurement.
+
+Two frozen surfaces, deep-reviewed because changing them splits the network:
+the **claim wire schema** and the **addressed unit** (`RawNarV1` — the exact
+`nix-store --dump` bytes, keyed by plain BLAKE3, which equals the iroh-blobs
+hash by construction). DHT key derivation is the third and is not settled.
 
 ## Development
 
@@ -83,12 +141,16 @@ just test       # cargo test + fixture gate + measurement self-test
 Slow tier (minutes, containers/VMs; not part of the fast loop):
 
 ```sh
-just e2e        # podman-pod scenario suite (needs rootless podman)
-just e2e-vm     # NixOS VM test (needs /dev/kvm)
-just measure    # egress/latency/gap measurement report
-just profile    # p2p RAM/disk/latency/throughput/speedup report (peer swarm)
-just journey    # J1 operator journey
+just e2e         # podman-pod scenario suite (needs rootless podman)
+just e2e-vm      # NixOS VM test (needs /dev/kvm)
+just measure     # egress/latency/gap measurement report
+just scale-sweep # scaling sweep + regression fit (clients, chain depth, knobs)
+just profile     # p2p RAM/disk/latency/throughput/speedup report (peer swarm)
+just journey     # J1 operator journey
 ```
+
+These are hours, not minutes: `just profile` runs a peer swarm, a NAR-size
+axis, a concurrency axis and both upstream conditions.
 
 `nix flake check` re-runs build/lint/test in the sandbox for CI.
 
@@ -100,7 +162,8 @@ just journey    # J1 operator journey
   enforce.
 - `backlog/` — task tracker (use the `backlog` CLI, not direct file edits).
 - `figures/` — architecture overviews: `fig-arch-1` (wave-1 daemon seams),
-  `fig-arch-2` (test harness), `fig-arch-3` (wave-2 target, planned).
+  `fig-arch-2` (test harness), `fig-arch-3` (wave-2 target — the transport
+  half is now built, the discovery half is not).
   The `fig-candidate-*` originals predate the settled design and are stale
   until task-17 revises them.
 
