@@ -3,11 +3,11 @@ id: TASK-61
 title: >-
   SUPPLY MODEL (wave-2a, load-bearing): regenerate-on-demand vs holding what we
   announce
-status: In Progress
+status: Done
 assignee:
   - '@me'
 created_date: '2026-08-09 13:24'
-updated_date: '2026-08-09 23:12'
+updated_date: '2026-08-09 23:20'
 labels: []
 dependencies: []
 priority: high
@@ -31,8 +31,8 @@ ORACLE WARNING for whoever implements the outcome: peak RSS ALONE cannot verify 
 
 ## Acceptance Criteria
 <!-- AC:BEGIN -->
-- [ ] #1 The supply-model DECISION is written down with its cost: regenerate-on-demand + persisted bao outboards vs a bounded evicting content store. Records what it does to the PRD's 'no second copy of the store' position and to the seeding gap / re-hash cost
-- [ ] #2 Whatever is chosen, holder RSS is gated on a FITTED SLOPE over >=5 NAR sizes with CI (TASK-65's axis), not a single-point comparison, and the residency oracle is not VmHWM alone
+- [x] #1 The supply-model DECISION is written down with its cost: regenerate-on-demand + persisted bao outboards vs a bounded evicting content store. Records what it does to the PRD's 'no second copy of the store' position and to the seeding gap / re-hash cost
+- [x] #2 Whatever is chosen, holder RSS is gated on a FITTED SLOPE over >=5 NAR sizes with CI (TASK-65's axis), not a single-point comparison, and the residency oracle is not VmHWM alone
 - [ ] #3 If an on-disk store is chosen: a numeric budget knob, an eviction bite (fill past budget -> evicts rather than grows), and a kill-9-mid-serve-then-restart bite proving reclamation. 'Bounded' without a budget and an eviction rule is not an acceptance criterion
 <!-- AC:END -->
 
@@ -188,3 +188,21 @@ scalefit's MIN_POINTS of 5, so it refuses to fit and marks the whole report
 `just profile` should be run before anything OTHER than these size-axis slopes is
 quoted.
 <!-- SECTION:NOTES:END -->
+
+## Final Summary
+
+<!-- SECTION:FINAL_SUMMARY:BEGIN -->
+DECIDED: regenerate on demand via nix-store --dump; NO local blob copy exists at rest. Written into PRD.md's new 'Supply model' section, which also decides the irreversibility-map entry it was blocking.
+
+WHY: on the owner's measured store (108,401 paths / 155,621 MiB NAR / p100 3186 MiB) holding everything would be ~304 GiB of RAM at task-65's 2.0033 B/B, and ONE p100 serve ~6.2 GiB. A full FsStore copy is 152 GiB of disk, which does not fit on this project's own dev host; a bounded one caps supply at the budget and throws away the whole-store property the --dump decision bought.
+
+THE THREE COSTS ARE WRITTEN DOWN, not implied: a re-hash (a full dump) per cold serve; a REAL bounded seeding gap across restart (a published claim can be undiallable until a hold-query re-derives its digest - task-82 closes it for ~40 B/path); and in-flight memory becoming the entire memory cost, hence task-72's bound.
+
+BAO OUTBOARDS REJECTED WITH A REASON: ~0.4% of content removes the tree recomputation but not the dump, which is the part that costs, and iroh-blobs 0.103 has no store that serves a blob whose outboard is persisted while its content is regenerated. The artifact actually worth persisting is the 32-byte digest (0.003% of content), filed as task-82.
+
+AC#1 met (the decision + its costs, in PRD.md and these notes).
+AC#2 met, and it MOVED: holder peak RSS 2.004426 [2.000129 .. 2.008723] -> 1.020232 [1.009284 .. 1.031180], DISJOINT intervals, fitted over 5 NAR sizes x 3 replicates; holder STORE RESIDENCY (IROH-STORE-RESIDENT, never VmHWM) 1.000000 [1.0 .. 1.0] -> 0.000000. The fetcher slope is unchanged as a control.
+AC#3 is N/A AS WRITTEN and says so rather than being silently ticked: it was conditional on choosing an on-disk store. Its RAM analogue was delivered by task-72 (numeric budget knobs, an eviction bite proven by mutation); the kill-9 reclamation bite is vacuous by construction when nothing is on disk, and is NOT faked.
+
+LIMIT: both profile runs exit 1 because --swarm 1 makes the SWARM axis unfittable, so the report is marked unusable-for-quoting. That verdict is about the swarm axis; the size axis is usable, honesty-compliant and red-flag-free in both. Run a full profile before quoting anything else.
+<!-- SECTION:FINAL_SUMMARY:END -->

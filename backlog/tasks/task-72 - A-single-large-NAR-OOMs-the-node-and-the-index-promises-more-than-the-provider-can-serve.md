@@ -3,11 +3,11 @@ id: TASK-72
 title: >-
   A single large NAR OOMs the node, and the index promises more than the
   provider can serve
-status: In Progress
+status: Done
 assignee:
   - '@me'
 created_date: '2026-08-09 17:45'
-updated_date: '2026-08-09 23:12'
+updated_date: '2026-08-09 23:21'
 labels: []
 dependencies:
   - TASK-65
@@ -28,10 +28,10 @@ Both gaps have the same root: the provider has no on-demand supply path. The fix
 
 ## Acceptance Criteria
 <!-- AC:BEGIN -->
-- [ ] #1 Serving is bounded: a configurable maximum served-NAR size (and/or a maximum total in-flight serve bytes) above which the node declines to serve rather than allocating. Prove by mutation that removing the bound restores the unbounded allocation
-- [ ] #2 A hold-answer is only positive for content the provider can actually SERVE - index coverage and provider coverage are the same set, or the difference is explicit and tested (a claim for an unseeded path must not produce a dial-then-fail)
-- [ ] #3 The eager startup seed is replaced by, or supplemented with, an on-demand supply path so that announcing does not require holding; measured with TASK-65's residency oracle (store residency after an idle period, not peak RSS)
-- [ ] #4 Pathological row for TASK-43: a peer requests the largest announced NAR - the node must degrade (decline / bounded memory) rather than OOM. Bites: without the bound, RSS tracks the NAR size
+- [x] #1 Serving is bounded: a configurable maximum served-NAR size (and/or a maximum total in-flight serve bytes) above which the node declines to serve rather than allocating. Prove by mutation that removing the bound restores the unbounded allocation
+- [x] #2 A hold-answer is only positive for content the provider can actually SERVE - index coverage and provider coverage are the same set, or the difference is explicit and tested (a claim for an unseeded path must not produce a dial-then-fail)
+- [x] #3 The eager startup seed is replaced by, or supplemented with, an on-demand supply path so that announcing does not require holding; measured with TASK-65's residency oracle (store residency after an idle period, not peak RSS)
+- [x] #4 Pathological row for TASK-43: a peer requests the largest announced NAR - the node must degrade (decline / bounded memory) rather than OOM. Bites: without the bound, RSS tracks the NAR size
 <!-- AC:END -->
 
 ## Implementation Plan
@@ -203,4 +203,85 @@ flags, size_axis_usable true. Both runs exit 1 for the SAME reason - --swarm 1
 leaves the swarm axis with one distinct n, below scalefit's MIN_POINTS, so the
 whole report is marked unusable-for-quoting. That verdict is about the swarm axis;
 run a full profile before quoting anything but these size-axis slopes.
+
+## Why AC#2 is checked, stated plainly so it can be argued with
+
+The AC allows two ways to pass: the sets are IDENTICAL, or the difference is
+EXPLICIT AND TESTED with no dial-then-fail. Both branches are satisfied, at
+different levels, and it matters which is which:
+
+  * WHERE BOTH SETS EXIST IN ONE PROCESS (AvailabilityIndex + IndexNarSupplier +
+    IrohProvider) they are IDENTICAL, proven in both directions by mutation: a
+    positive hold-answer implies a servable blob, and a GC'd path leaves hold and
+    supply at the same instant (M5), and an un-registered path is pruned from
+    supply too.
+  * IN THE SHIPPED DAEMON the sets are also identical, but the set is smaller than
+    the ambition: it is the --iroh-seed-nar files, not /nix/store. That difference
+    is explicit (task-83) and is not a dial-then-fail - it is 'this node never
+    announced that'.
+  * ACROSS A RESTART the binding is lost and a stale claim gets
+    ServeDecline::Unknown - a NAMED, counted, immediate refusal that falls back to
+    upstream, not a hung dial or a truncated stream. Explicit, tested (M6), filed
+    (task-82).
+
+WHAT WOULD MAKE THIS WRONG: if the daemon ever answers hold-queries over the wire
+(task-73) while supplying from a different set, this AC silently regresses. The
+equality lives in AvailabilityIndex::hold and supply_size, and both must stay the
+only producers of a yes.
 <!-- SECTION:NOTES:END -->
+
+## Final Summary
+
+<!-- SECTION:FINAL_SUMMARY:BEGIN -->
+Both gaps closed, and two MORE remotely-triggerable defects found by architecture review and closed with them.
+
+AC#1 MET. Three numeric knobs, all in NarSize units and all fail-fast on 0:
+--iroh-max-serve-nar-bytes (256 MiB), --iroh-max-inflight-nar-bytes (1 GiB),
+--iroh-max-serve-duration-ms (120 s), logged at startup as IROH-SERVE-BUDGET. The
+bound is checked BEFORE anything is produced - iroh-blobs blocks on our verdict
+(RequestMode::InterceptLog) and only then reads the store - so a 3 GiB request
+costs a stat. Proven by mutation FOUR ways (M1 bound removed, M2 bytes produced
+before deciding, M8 deadline removed, M10 produced size checked against the cap
+rather than the reservation). Measured: 64 MiB NAR, 16 MiB bound -> declined,
+supplier never called, VmRSS rise 720,896 B; unbounded -> served, VmRSS rise
+156,946,432 B.
+
+AC#2 MET IN-PROCESS, with its boundary stated. A positive hold-answer records the
+BLAKE3->entry binding and supply_size repeats hold's materialisation check, so the
+two sets change together in BOTH directions (M5 proves a GC'd path leaves both;
+by_digest is pruned with the registration so supply cannot outgrow hold). An
+unknown digest is a NAMED, counted decline, not a dial-then-fail (M6). NOT met at
+the daemon level in the sense of serving /nix/store: the shipped binary supplies
+from raw-NAR files, and there is no wire endpoint for hold-queries yet - task-83
+and task-73. The restart gap (in-memory binding) is stated and filed as task-82.
+
+AC#3 MET, on the right oracle: store residency after an idle period, fitted over 5
+NAR sizes - 1.000000 [1.0 .. 1.0] -> 0.000000. Holder peak RSS 2.004426 [2.000129
+.. 2.008723] -> 1.020232 [1.009284 .. 1.031180], disjoint. Fetcher unchanged
+(control).
+
+AC#4 MET in-process with numbers, and the CONTAINER row is forward-carried to
+task-43 with the oracles it needs (IROH-SERVE-COUNTERS, IROH-SERVE-BUDGET).
+
+WHAT THE REVIEW CAUGHT THAT THE TESTS DID NOT: a peer could permanently exhaust the
+budget by hanging up mid-admission (the release was tied to the update stream, and
+an early return skipped it); and 'holds nothing at rest' held only when idle,
+because the collector refused to run while anything was in flight - one slow reader
+could make a node retain everything it ever served. Both now have oracles that bite
+(M8, M9). Along the way the mutation sweep caught TWO VACUOUS ORACLES OF MY OWN and
+one mutation that silently failed to apply; all three are written up in the notes,
+because a vacuous oracle is this project's most frequent defect.
+
+NOT DONE, filed with reasons: task-83 (supply from a real /nix/store), task-85
+(move the transport-agnostic supply/admission types out of transport_iroh),
+task-86 (the iroh-blobs collector loop exits permanently on its first error and
+nothing here can see it - which silently turns the supply model back into
+retain-everything), task-84 (a suite flake under the new load), task-82 (persist
+the digest binding). Task-46 gained the serve-side decline log as a second spam
+surface it should solve alongside the abort spam.
+
+GATES: build 0, lint 0, test 0 (twice, 26 binaries), e2e 0 with 26/26 scenarios
+including all four p2p ones, profile size axis 15/15 valid points, honesty
+compliant, 0 red flags. Both profile runs exit 1 for the same swarm-axis reason;
+see the git note on abdda0e.
+<!-- SECTION:FINAL_SUMMARY:END -->
