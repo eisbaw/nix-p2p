@@ -477,6 +477,48 @@ class Pod:
     def _c(self, role: str) -> str:
         return f"{self.pod}-{role}"
 
+    def container(self, role: str) -> str:
+        """The podman container name for `role`. Public because the task-18
+        scale sweep resolves each node's HOST pid from it; reaching into `_c`
+        from another module would make a private name load-bearing."""
+        return self._c(role)
+
+    def roles(self) -> list[str]:
+        """Every long-lived role in this pod, in topology order. Clients are
+        NOT here: they are ephemeral `--rm` containers, not pod members."""
+        return ["origin", "proxy", *self._daemon_roles()]
+
+    def daemon_roles(self) -> list[str]:
+        """The product-daemon roles only (public view of `_daemon_roles`), so a
+        resource sweep can tell a daemon apart from the fixture infrastructure
+        it is measured against."""
+        return self._daemon_roles()
+
+    def host_pid(self, role: str) -> int:
+        """The HOST pid of `role`'s init process (rootless podman runs it as our
+        own uid, so /proc/<pid>/status and /proc/<pid>/fd are readable directly -
+        no binary needs to exist inside the image, which is what killed an
+        earlier in-container oracle that silently returned rc=127).
+
+        FAIL-CLOSED: a missing or zero pid raises. 'Could not observe' must never
+        be reportable as a resource sample."""
+        result = run(
+            [self._pm, "inspect", "-f", "{{.State.Pid}}", self._c(role)], check=False
+        )
+        raw = (result.stdout or "").strip()
+        try:
+            pid = int(raw)
+        except ValueError:
+            raise RuntimeError(
+                f"host_pid({role!r}): podman inspect returned {raw!r} "
+                f"(rc={result.returncode}, stderr={result.stderr.strip()!r})"
+            ) from None
+        if pid <= 0:
+            raise RuntimeError(
+                f"host_pid({role!r}): pid {pid} - the container is not running"
+            )
+        return pid
+
     def _daemon_roles(self) -> list[str]:
         """The daemon container roles this pod runs, in chain order (the FIRST
         is the chain head the client substitutes against). One "daemon" for the
@@ -852,17 +894,33 @@ class Pod:
     # -- client invocations (inside the pod netns) --
 
     def client_run(
-        self, targets: list[str], substituters: str, keys: str
+        self,
+        targets: list[str],
+        substituters: str,
+        keys: str,
+        *,
+        jobs: int = 1,
+        conns: int = 1,
+        start_at_ns: int = 0,
     ) -> ClientResult:
         """Substitute `targets` with a FRESH client (empty store + wiped
         narinfo cache, per the oracle-pairing rule) in single-user root nix.
 
         A fresh `podman run` container gives a clean /nix/store (image paths
         only, no fixtures) and an empty XDG cache, so counting is not made
-        vacuous by a warm client. max-substitution-jobs=1 pins the counts.
+        vacuous by a warm client. `jobs`/`conns` are max-substitution-jobs /
+        http-connections; they DEFAULT to 1 because every counting scenario
+        needs them pinned there (TESTING.md oracle-pairing rule). Only the
+        task-18 scale sweep, which asserts no exact counts, moves them.
+        `start_at_ns` is the concurrency barrier (0 = start immediately).
         """
         script = _CLIENT_SCRIPT.format(
-            subs=substituters, keys=keys, targets=" ".join(targets)
+            subs=substituters,
+            keys=keys,
+            targets=" ".join(targets),
+            jobs=jobs,
+            conns=conns,
+            start_at_ns=int(start_at_ns),
         )
         result = run(
             [
@@ -917,6 +975,55 @@ class Pod:
             timeout=300,
         )
         return _parse_client(result)
+
+    def client_run_bg(
+        self,
+        targets: list[str],
+        substituters: str,
+        keys: str,
+        *,
+        jobs: int = 1,
+        conns: int = 1,
+        start_at_ns: int = 0,
+    ) -> BackgroundClient:
+        """`client_run` started WITHOUT waiting, so N of them can be in flight at
+        once (the task-18 concurrent-client sweep axis). Deliberately the SAME
+        `_CLIENT_SCRIPT` as the synchronous path - a sweep that measured a
+        different client script from the one the scenarios use would be
+        measuring the harness, not the product. Distinct from
+        `client_run_async`, which runs the crash-suite script (orphan scan,
+        crash-specific option slot) and belongs to task-7.
+
+        `start_at_ns` is the shared start instant (host epoch ns) that makes N
+        clients actually overlap; the caller must still VERIFY the overlap from
+        the reported REALISE_T0_NS/REALISE_T1_NS rather than assume it."""
+        script = _CLIENT_SCRIPT.format(
+            subs=substituters,
+            keys=keys,
+            targets=" ".join(targets),
+            jobs=jobs,
+            conns=conns,
+            start_at_ns=int(start_at_ns),
+        )
+        popen = subprocess.Popen(
+            [
+                self._pm,
+                "run",
+                "--rm",
+                "--pod",
+                self.pod,
+                "--label",
+                PROJECT_LABEL,
+                self.ctx.image,
+                "bash",
+                "-c",
+                script,
+            ],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        return BackgroundClient(popen)
 
     def exec(self, role: str, argv: list[str], check: bool = False):
         return run([self._pm, "exec", self._c(role), *argv], check=check)
@@ -1018,16 +1125,54 @@ common=(
   --option substituters "{subs}"
   --option trusted-public-keys "{keys}"
   --option require-sigs true
-  --option max-substitution-jobs 1
-  --option http-connections 1
+  --option max-substitution-jobs {jobs}
+  --option http-connections {conns}
   --option narinfo-cache-positive-ttl 0
   --option narinfo-cache-negative-ttl 0
   --option substitute true
 )
+# CONCURRENCY BARRIER (task-18). Every client of one sweep point waits for the
+# same host wall-clock instant before realising. MEASURED rationale, not an
+# assumed one: launching the fleet is already asynchronous, and a mutation run
+# with the barrier disabled still saw full overlap at N=6 - so the barrier is
+# JITTER insurance, not a fix for serialised launches. It matters because the
+# workload itself is ~150 ms while container start varies by hundreds of ms, so
+# without a shared instant a slow-starting container can miss the window
+# entirely. What actually GUARANTEES the concurrency is the sweep's measured
+# overlap of the T0/T1 epochs below (all containers share the host clock), which
+# invalidates the point when the fleet did not really run at once.
+# `{start_at_ns}` = 0 (every non-sweep caller) exits the loop immediately, so
+# existing scenarios are untouched.
+while [ {start_at_ns} -gt "$(date +%s%N)" ]; do sleep 0.02; done
+T0=$(date +%s%N)
 nix-store --realise "${{common[@]}}" {targets} >/tmp/realised 2>/tmp/err
 RC=$?
+T1=$(date +%s%N)
 echo "REALISE_RC=$RC"
+# IN-CONTAINER realise duration. The host-side wall clock of `podman run`
+# includes container create/start/teardown (~0.5-1 s, and it grows with how
+# many containers are starting at once) - folding that into a latency-vs-N
+# scaling law would fit the CONTAINER RUNTIME's scaling, not the product's.
+# task-18 fits this number and reports the host-side one beside it. T0/T1 are
+# absolute so overlap between concurrent clients is computable host-side.
+echo "REALISE_NS=$((T1-T0))"
+echo "REALISE_T0_NS=$T0"
+echo "REALISE_T1_NS=$T1"
 cat /tmp/err >&2
+# The knobs nix ACTUALLY resolved, not the ones we passed (TESTING.md
+# client-knobs rule: a knob sweep whose knob never landed is a vacuous sweep,
+# so task-18 asserts this section as the axis PRECONDITION). One `config show
+# <name>` per knob, filtered by NOTHING: `grep` is NOT in this image (the same
+# missing-binary trap that made an earlier in-container oracle return rc=127 and
+# pass unconditionally), so the selection happens through nix itself and the
+# parsing happens host-side. A failed query yields an empty value, which the
+# sweep reads as UNCONFIRMED - never as "the knob took".
+echo "===KNOBS_BEGIN==="
+echo "max-substitution-jobs = $(nix --extra-experimental-features nix-command \
+  config show max-substitution-jobs "${{common[@]}}" 2>/dev/null)"
+echo "http-connections = $(nix --extra-experimental-features nix-command \
+  config show http-connections "${{common[@]}}" 2>/dev/null)"
+echo "===KNOBS_END==="
 # path-info per target, tolerating the ones that did NOT realise (the absent
 # path in the 404 scenario): a realised sibling must still be measurable even
 # when the overall realise exits nonzero. Local paths need no substituter opts.

@@ -90,6 +90,13 @@ test: build _python fixtures
     "${NIX_P2P_PYTHON}/bin/python3" scripts/check-fixtures.py
     "${NIX_P2P_PYTHON}/bin/python3" scripts/check-golden-vectors.py
     "${NIX_P2P_PYTHON}/bin/python3" scripts/measure.py --self-test
+    # task-18: the S5 fitter and the sweep's honesty logic are container-free by
+    # design, so the machinery that decides "is this growth superlinear" and
+    # "is this number labelled as a model output" is covered on EVERY cycle -
+    # not only when someone runs the slow sweep. Both prove their oracles by
+    # mutation (a report stripped of its labels must be REJECTED).
+    "${NIX_P2P_PYTHON}/bin/python3" scripts/scalefit.py --self-test
+    "${NIX_P2P_PYTHON}/bin/python3" scripts/scale_sweep.py --self-test
     # task-49: real nix accepts the daemon's rewritten narinfo + raw nar
     # (none/xz/zstd) and rejects a signed-field mutation. Needs the `daemon`
     # binary (hence the `build` dep) and the fast-tier fixtures.
@@ -169,6 +176,19 @@ e2e-vm:
 # Run the egress/latency/gap measurement and emit the report (S3/S4).
 measure *ARGS: _python fixtures-large
     "${NIX_P2P_PYTHON}/bin/python3" scripts/measure.py {{ ARGS }}
+
+# The S5 scale-sweep instrument (task-18): runs the real system at N over the
+# axes that exist - concurrent clients, proxy-chain depth, and the client
+# concurrency knobs {1,16,128} - samples per-node peak RSS (VmHWM), fds and
+# latency, fits O(1)/O(log n)/O(n)/O(n log n)/O(n^2) via scripts/scalefit.py and
+# extrapolates to 10/100/1000 with confidence intervals. Every extrapolated
+# number is structurally labelled a model output and a superlinear fit is a RED
+# FLAG printed first; the honesty rules are asserted, and a violating report
+# fails the run. SLOW tier: minutes of container runs (the fast-tier half is the
+# --self-test wired into `just test`). Cleans up label-scoped, like `e2e-clean`.
+# Run the S5 scale sweep and emit the fitted/extrapolated report.
+scale-sweep *ARGS: _python fixtures-large
+    "${NIX_P2P_PYTHON}/bin/python3" scripts/scale_sweep.py {{ ARGS }}
 
 # Reuses the e2e Pod seam (scripts/e2e_harness.py) as its driver and asserts the
 # two operator oracles - the daemon's per-substitution log story (AC#1) and the
