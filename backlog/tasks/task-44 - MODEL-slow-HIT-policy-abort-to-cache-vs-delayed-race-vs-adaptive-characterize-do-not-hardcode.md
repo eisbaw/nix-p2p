@@ -6,11 +6,13 @@ title: >-
 status: To Do
 assignee: []
 created_date: '2026-08-08 20:13'
-updated_date: '2026-08-09 12:27'
+updated_date: '2026-08-09 13:33'
 labels: []
 dependencies:
   - TASK-43
   - TASK-52
+  - TASK-63
+  - TASK-62
 ---
 
 ## Description
@@ -24,6 +26,9 @@ The owner-named policy archetype. Do NOT hardcode a policy - MODEL the three can
 - [ ] #1 The 3 candidates measured under the slow-peer scenario: wall-clock + net egress (incl hedge_waste) reported per candidate, with the threshold sensitivity (T, X) swept
 - [ ] #2 A recommendation with the data behind it; the chosen policy filed as a NEW implementation task (not implemented here)
 - [ ] #3 Honest limit: loopback/container throughput is not residential-uplink; the model states what real-network validation it still needs
+- [ ] #4 BOTH REGIMES: every candidate measured against the loopback control AND the TASK-63 WAN-shaped upstream. A recommendation valid only on loopback is not a recommendation - the sign of this whole question is set by upstream speed, which the loopback arm fakes at 758 MB/s and ~0 RTT
+- [ ] #5 The STREAMING COMMIT DEADLINE is an explicit modeled constraint (post-TASK-62): abort-to-cache is only free BEFORE the first body byte is committed to Nix. Model hedge as 'hold the response head until first-past-the-gate, then commit and stream' with its bounded-buffer cost - not as 'run both to completion and pick a winner'
+- [ ] #6 The headline deliverable is the HEDGE-DELAY vs OFFLOAD-RETENTION curve with the crossover as a function of upstream bandwidth/RTT - not a winner. Hedging immediately against a fast upstream makes the cache always win, collapsing offload toward 0 with hedge_waste = the entire NAR every time; 'no candidate justified' is a legitimate outcome
 <!-- AC:END -->
 
 ## Implementation Notes

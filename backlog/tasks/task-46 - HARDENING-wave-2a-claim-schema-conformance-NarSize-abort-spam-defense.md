@@ -4,7 +4,7 @@ title: 'HARDENING (wave-2a): claim-schema conformance + NarSize-abort spam defen
 status: To Do
 assignee: []
 created_date: '2026-08-08 20:13'
-updated_date: '2026-08-08 20:30'
+updated_date: '2026-08-09 13:33'
 labels:
   - hardening
 dependencies:
@@ -23,6 +23,7 @@ Wave-2a hardening block, deep-gated (runs against stabilized wave-2a surfaces). 
 - [ ] #1 Claim-schema fuzz: malformed/version-skewed/unknown-variant claims handled per spec (forward-compat parses, malformed fail-closed) - each bite shown
 - [ ] #2 NarSize-abort: a claim pointing at a blob exceeding the signed NarSize is aborted before full download (bite: without the abort, the huge blob downloads; with it, aborted early)
 - [ ] #3 deferred-finding label for wave-2a is empty (closed or converted to explicit tasks)
+- [ ] #4 Cheap measured win pulled in from TASK-61: remove the gratuitous clone at transport_iroh.rs:350 (add_bytes(raw_nar.to_vec()) takes a borrowed slice and copies it into the store, on top of the file buffer read at main.rs:243). Take Vec<u8> by value or use add_path/add_stream. This is roughly HALF the measured 2.15x holder multiplier and is NOT the architecture question (that is TASK-61); measure the before/after
 <!-- AC:END -->
 
 ## Implementation Notes

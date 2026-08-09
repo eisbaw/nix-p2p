@@ -4,11 +4,13 @@ title: 'Pathological scenario suite v1: slow-HIT, dead-holder, cold-start'
 status: To Do
 assignee: []
 created_date: '2026-08-08 20:13'
-updated_date: '2026-08-09 12:26'
+updated_date: '2026-08-09 13:33'
 labels: []
 dependencies:
   - TASK-42
   - TASK-51
+  - TASK-62
+  - TASK-66
 ---
 
 ## Description
