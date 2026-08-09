@@ -267,9 +267,10 @@ async fn the_serve_bound_declines_a_large_nar_and_removing_it_restores_the_alloc
     // ---- ARM 2: THE MUTATION - the bound is REMOVED. ---------------------
     // Same NAR, same peer, same request. The only change is the budget.
     let supplier2 = Arc::new(CountingSupplier::new([nar.clone()]));
-    let unbounded = IrohProvider::spawn_supplying(supplier2.clone(), ServeBudget::unbounded(), SWEEP)
-        .await
-        .expect("provider spawns");
+    let unbounded =
+        IrohProvider::spawn_supplying(supplier2.clone(), ServeBudget::unbounded(), SWEEP)
+            .await
+            .expect("provider spawns");
     let client2 = client_wired_to(&unbounded).await;
 
     let hwm_before_unbounded = vm_bytes("VmHWM");
@@ -336,10 +337,9 @@ async fn admission_reads_the_declared_size_and_never_the_bytes() {
     supplier.lie = Some((content, 100 * 1024 * 1024 * 1024));
     let supplier = Arc::new(supplier);
 
-    let provider =
-        IrohProvider::spawn_supplying(supplier.clone(), ServeBudget::default(), SWEEP)
-            .await
-            .expect("provider spawns");
+    let provider = IrohProvider::spawn_supplying(supplier.clone(), ServeBudget::default(), SWEEP)
+        .await
+        .expect("provider spawns");
     let client = client_wired_to(&provider).await;
 
     assert!(
@@ -528,6 +528,62 @@ async fn a_retaining_provider_still_holds_what_it_seeded() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn release_on_request_does_not_release_just_because_a_serve_finished() {
+    // The two releasing retentions must stay DIFFERENT. `ReleaseOnRequest` promises
+    // "hold everything until `release_all` is called"; if a completed serve armed a
+    // sweep by itself, that promise would silently become `ReleaseAfterServe` and a
+    // caller relying on it would lose content it had been told was held. Caught
+    // while adding the supply model, which is exactly when the two variants started
+    // sharing an arming flag.
+    let nar = nar_of(4 * 1024 * 1024, 0xbb);
+    let content = Blake3Digest::from_raw_nar(&nar);
+    let nar_len = nar.len() as u64;
+    let supplier = Arc::new(CountingSupplier::new([nar]));
+
+    let provider = IrohProvider::spawn_with(
+        StoreRetention::ReleaseOnRequest {
+            sweep_interval: SWEEP,
+        },
+        ServeBudget::default(),
+        Some(supplier),
+    )
+    .await
+    .expect("provider spawns");
+    let client = client_wired_to(&provider).await;
+
+    fetch(&client, &provider, &content)
+        .await
+        .expect("the NAR is served on demand");
+    // Several sweep intervals: a store that was going to collect it would have.
+    tokio::time::sleep(SWEEP * 6).await;
+    let held = provider
+        .store_residency()
+        .await
+        .expect("store residency is queryable");
+    assert_eq!(
+        held,
+        StoreResidency {
+            blobs: 1,
+            bytes_uncompressed_nar: nar_len
+        },
+        "ReleaseOnRequest must still HOLD after a completed serve - only \
+         release_all releases it"
+    );
+
+    // ...and the request still does.
+    provider.release_all().await.expect("release_all succeeds");
+    let released = poll_until_empty(&provider).await;
+    assert_eq!(
+        released,
+        StoreResidency::default(),
+        "release_all must still release, got {released:?}"
+    );
+
+    client.shutdown().await;
+    provider.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn concurrent_requests_for_one_absent_digest_regenerate_it_exactly_once() {
     // The herd. Without single flight each concurrent request would either dump
     // the NAR again (k times the memory the budget charged for once) or be told
@@ -663,7 +719,10 @@ async fn a_positive_hold_answer_implies_a_servable_blob() {
     let served = fetch(&client, &provider, &blake3)
         .await
         .expect("a held digest is servable over the real transport");
-    assert_eq!(served, held, "the peer must receive the exact announced NAR");
+    assert_eq!(
+        served, held,
+        "the peer must receive the exact announced NAR"
+    );
 
     // THE MUTATION: GC the store path. The index's answer and the provider's
     // ability must move TOGETHER - a set equality that only held while nothing

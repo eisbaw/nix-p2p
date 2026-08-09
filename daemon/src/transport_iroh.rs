@@ -585,8 +585,17 @@ struct ServeGate {
     /// for". In-flight BYTES are summed from it rather than tracked in a parallel
     /// counter: two representations of one fact is how they drift.
     inflight: Mutex<HashMap<Hash, Inflight>>,
-    /// One-shot arming for the post-serve sweep (see [`StoreRetention`]).
+    /// One-shot arming for a sweep (see [`StoreRetention`]). `None` under
+    /// [`StoreRetention::RetainAll`], where nothing sweeps.
     gc_armed: Option<Arc<AtomicBool>>,
+    /// Whether finishing the last in-flight serve arms a sweep by itself.
+    ///
+    /// TRUE only under [`StoreRetention::ReleaseAfterServe`]. Under
+    /// [`StoreRetention::ReleaseOnRequest`] the contract is "hold everything until
+    /// `release_all` is called", and arming from a completed serve would quietly
+    /// collapse the two variants into one - a store that released content its
+    /// caller had been promised would be held.
+    release_after_serve: bool,
     admitted: AtomicU64,
     regenerated: AtomicU64,
     declined_too_large: AtomicU64,
@@ -694,7 +703,8 @@ impl ServeGate {
                 inflight.remove(&hash);
             }
         }
-        if inflight.is_empty()
+        if self.release_after_serve
+            && inflight.is_empty()
             && let Some(armed) = &self.gc_armed
         {
             armed.store(true, Ordering::SeqCst);
@@ -736,7 +746,24 @@ async fn admit(gate: &Arc<ServeGate>, store: &MemStore, hash: Hash) -> Result<()
 
     // 2. THE BOUND, and the reservation, before the allocation.
     match gate.reserve(hash, size, must_regenerate)? {
-        Reservation::Ready => {}
+        Reservation::Ready => {
+            // A blob that was RESIDENT when its size was read can still be taken
+            // by a sweep that was already past its protect callback when this
+            // request arrived - the same one-sweep window `materialise` retries
+            // against. Under a releasing retention, re-check and fall back to
+            // regenerating rather than admitting a serve of a blob that is gone.
+            // Skipped entirely when nothing sweeps, so the RetainAll path pays no
+            // extra round trip.
+            if !must_regenerate
+                && gate.release_after_serve
+                && !store.blobs().has(hash).await.unwrap_or(false)
+                && let Err(why) = materialise(gate, store, &content, hash).await
+            {
+                gate.publish(hash, None);
+                gate.release(hash);
+                return Err(why);
+            }
+        }
         Reservation::Materialise => match materialise(gate, store, &content, hash).await {
             Ok(()) => {
                 gate.regenerated.fetch_add(1, Ordering::Relaxed);
@@ -1010,6 +1037,7 @@ impl IrohProvider {
             supplier,
             inflight: Mutex::new(HashMap::new()),
             gc_armed: sweeps.then(|| Arc::new(AtomicBool::new(false))),
+            release_after_serve: matches!(retention, StoreRetention::ReleaseAfterServe { .. }),
             admitted: AtomicU64::new(0),
             regenerated: AtomicU64::new(0),
             declined_too_large: AtomicU64::new(0),
