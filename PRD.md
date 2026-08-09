@@ -163,6 +163,9 @@ In scope (MVP, in delivery order):
   built ones — is safe *by construction*: the consumer's NarHash gate
   is the arbiter, not the producer's provenance. (Reversed from
   round 2 after architect review; final scope = open question 2.)
+  **SETTLED by task-61, 2026-08-09 — see "Supply model" below: this
+  bullet is now implemented, not aspirational, and its costs are
+  written down.**
 - Linux first. NixOS module for deployment.
 
 Non-goals (explicit):
@@ -232,12 +235,118 @@ Fixed externally (cannot change, must conform):
   semantics and rate norms.
 
 Tentative / replaceable (velocity surfaces):
-- Whether a local blob copy exists at all (`--dump`-on-demand vs
+- ~~Whether a local blob copy exists at all (`--dump`-on-demand vs
   stored blobs — but note: switching *from* stored blobs later means
-  re-hashing and a seeding gap; decide deliberately in phase 2).
+  re-hashing and a seeding gap; decide deliberately in phase 2).~~
+  **DECIDED (task-61, 2026-08-09): no local blob copy exists at rest.
+  See "Supply model" below for the arms, the numbers, and the costs
+  paid — the re-hash and the seeding gap are now REAL, accepted and
+  quantified, not hypothetical.**
 - Narinfo/claims disk-cache format; gossip accelerant (optional by
   design); hedge/prefetch/announce policies; NixOS module interface;
   metrics; the container harness internals.
+
+## Supply model (task-61, settled 2026-08-09) — how a node produces the bytes it serves
+
+The question the owner asked: *must a node publish and hold in memory what it
+has cached locally?* **No.** This section records the decision, the arms that
+lost, and what the winner costs. It decides the irreversibility-map entry
+"whether a local blob copy exists at all".
+
+### The measurement that forced the decision
+
+Measured on the owner's real store (`nix path-info --json --all`):
+
+| Quantity | Value |
+|---|---|
+| Store paths | 108,401 |
+| Total NAR (NarSize, uncompressed) | 155,621 MiB ≈ 152 GiB |
+| Mean NAR | 1.44 MiB |
+| p50 / p90 / p95 / p99 | ~0 / 0.04 / 0.59 / 10.92 MiB |
+| **p100** | **3186.03 MiB** |
+
+Against task-65's fitted holder cost of **2.0033 bytes of peak RSS per byte of
+uncompressed NAR** (95% CI 2.0021..2.0046, R² 1.0000, ≥5 NAR sizes):
+
+- Holding the whole store in the iroh-blobs `MemStore` would cost **~304 GiB of
+  RAM**. Disqualifying, and not by a small factor.
+- The tail is the sharper problem: **one** p100 path costs **~6.2 GiB of RAM to
+  serve** (model output, extrapolated past the 8..128 MiB fitted grid — label it
+  as such). The daemon is outside the trust base, so *any* peer can ask for the
+  largest NAR we announce.
+
+### The arms
+
+**(a) Regenerate on demand via `nix-store --dump`; hold only the in-flight
+serve.** Optionally persist bao outboards (~0.4% of content ≈ 0.6 GiB) rather
+than content.
+
+**(b) A bounded, evicting on-disk content store (`FsStore`).** An unbounded one
+is a full second copy of /nix/store — 152 GiB, which does not even fit on this
+project's development host (43 GiB free). A *bounded* one fits, but then supply
+is capped at the budget, which throws away the exact property the "Seeding
+scope: whole /nix/store via `--dump`" decision bought: **largest supply at zero
+storage cost**.
+
+### Decision: arm (a). No local blob copy exists at rest.
+
+A copy of a NAR exists only for the duration of a serve, and its size is now
+bounded by an explicit budget (task-72). The PRD's "no second copy of the store,
+no retention policy problem" position is **upheld and implemented**, not
+weakened.
+
+### What arm (a) costs — stated, not hand-waved
+
+1. **Re-hash on demand.** Every serve of a path whose `BLAKE3(RawNarV1)` is not
+   already cached in memory costs one full `nix-store --dump` (a read of the
+   whole path off disk) plus one BLAKE3 pass, and iroh-blobs recomputes the bao
+   outboard on add. Task-64 measured the peer path at ~204 MB/s CPU-bound with
+   72% of the work below our code, so the hash is not the bottleneck — the dump
+   is. Repeat serves inside one process pay it once (the availability index
+   caches the digest under a single-flight lock).
+2. **A real, bounded seeding gap.** A restart empties the blob store *and* the
+   in-memory digest cache. Until a hold-query re-derives a path's digest, a
+   claim already published to the DHT naming that digest is undiallable: the
+   fetching peer gets a bounded `Unavailable` and falls back to upstream. This
+   is an AVAILABILITY cost, never an integrity one (Nix re-verifies sig +
+   NarHash; the daemon is outside the TCB). Warming the whole cache at boot is
+   NOT an option — it would re-dump and re-hash 152 GiB.
+3. **In-flight memory becomes the whole memory cost, so it must be bounded.**
+   With nothing held at rest, the only RAM the supply path costs is the NAR
+   being served right now. Bounding it is task-72 and is a hard requirement of
+   this decision, not a follow-up.
+
+### Rejected sub-option: persisting bao outboards
+
+The brief's candidate was the outboard (~0.4% of content, ~0.6 GiB for this
+store) as the artifact worth keeping. Rejected, for two reasons:
+
+- **It does not buy the thing that hurts.** The outboard removes the *tree*
+  recomputation, not the dump — bao still verifies against the content, so the
+  content must still be regenerated. Cost #1 above is dominated by the dump.
+- **The pinned API cannot express it.** iroh-blobs 0.103 ships exactly two
+  writable stores (`mem`, `fs`), and each owns its content; there is no public
+  way to serve a blob whose outboard is persisted while its content is produced
+  on demand. Implementing it means a custom `Store` impl against an unstable
+  trait. Re-openable if that is ever justified; not justified now.
+
+**What IS worth persisting is the 32-byte digest, not the 620 MiB outboard.**
+Binding `NarHashKey -> (StorePath, Blake3Digest, NarSize)` on disk costs about
+40 bytes per path beyond the registration already persisted — **~4.3 MB for
+108,401 paths, 0.003% of content** — and closes cost #2 (the seeding gap)
+outright, because a store path's content is immutable by Nix's own invariant, so
+the digest cannot go stale. It is deliberately NOT done in task-61/72 (the
+availability index's stated design is to persist only the source of truth, and
+reversing that is its own reviewable change); it is filed as task-82.
+
+### What is NOT in this decision
+
+Task-61 AC#3 (a numeric disk budget, an eviction bite, a kill-9 reclamation
+bite) was written **conditional on choosing an on-disk store**. Arm (a) was
+chosen, so it does not apply as written, and it is not silently dropped: its
+RAM analogue is a hard requirement of task-72 — a numeric served-bytes budget,
+an eviction bite proving the store releases after a serve, and a residency
+oracle that is not peak RSS.
 
 ## Weak assumptions & risks
 
