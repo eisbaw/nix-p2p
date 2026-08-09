@@ -1,14 +1,15 @@
 ---
 id: TASK-61
 title: >-
-  WAVE-2B DECISION: how a node SUPPLIES bytes it serves (MemStore residency vs
-  regenerate-on-demand)
+  SUPPLY MODEL (wave-2a, load-bearing): regenerate-on-demand vs holding what we
+  announce
 status: To Do
 assignee: []
 created_date: '2026-08-09 13:24'
-updated_date: '2026-08-09 17:21'
+updated_date: '2026-08-09 17:46'
 labels: []
 dependencies: []
+priority: high
 ---
 
 ## Description
