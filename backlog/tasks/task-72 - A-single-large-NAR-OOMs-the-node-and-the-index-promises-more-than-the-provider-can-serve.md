@@ -7,7 +7,7 @@ status: In Progress
 assignee:
   - '@me'
 created_date: '2026-08-09 17:45'
-updated_date: '2026-08-09 23:02'
+updated_date: '2026-08-09 23:12'
 labels: []
 dependencies:
   - TASK-65
@@ -182,4 +182,25 @@ used instead.
 
   BOUNDED   -> declined, supplier calls 0, VmRSS rise         720,896 B
   UNBOUNDED -> served 67,108,976 B, supplier calls 1, VmRSS rise 156,946,432 B
+
+## AC#3 measured: the residency oracle, fitted, before and after
+
+  size.holder_store_resident_bytes_uncompressed_nar (IROH-STORE-RESIDENT, asked of
+  the blob store - NOT peak RSS, which is monotone and cannot observe a release)
+    BEFORE  slope 1.000000 [1.000000 .. 1.000000], resident_over_seeded_ratio 1.0
+    AFTER   slope 0.000000,                        resident_over_seeded_ratio 0.0
+
+  size.holder_rss_hwm_bytes_ram (peak RSS, the memory the node actually costs)
+    BEFORE  2.004426 [2.000129 .. 2.008723] R2 0.999987
+    AFTER   1.020232 [1.009284 .. 1.031180] R2 0.999679   <- DISJOINT intervals
+
+  size.fetcher_rss_hwm_bytes_ram (CONTROL - TASK-62's territory, untouched)
+    BEFORE  1.018814 [1.009204 .. 1.028424]
+    AFTER   1.018838 [1.007846 .. 1.029831]
+
+15/15 valid points in both runs (5 sizes x 3 replicates), honesty compliant, 0 red
+flags, size_axis_usable true. Both runs exit 1 for the SAME reason - --swarm 1
+leaves the swarm axis with one distinct n, below scalefit's MIN_POINTS, so the
+whole report is marked unusable-for-quoting. That verdict is about the swarm axis;
+run a full profile before quoting anything but these size-axis slopes.
 <!-- SECTION:NOTES:END -->

@@ -33,6 +33,11 @@ What works:
   an announce-on-demand availability index that never allows enumeration, and a
   conservative safety envelope (dial/idle/fetch timeouts, streaming NarSize
   abort).
+- A **regenerate-on-demand supply model**: a node announces what it can serve
+  without holding it, regenerates on request inside an explicit serve budget
+  (max NAR size, max concurrent bytes, max serve duration), and releases
+  afterwards. What it answers "yes" about and what it can actually serve are
+  the same set.
 - A measurement and profiling stack: frozen egress counting rule, regression
   fitter with model selection and confidence intervals, and a p2p profiler
   covering RAM, disk, latency, throughput and speedup.
@@ -42,11 +47,15 @@ What does **not** work yet — the honest headline:
 - **Peers cannot find each other.** There is no DHT and no gossip. Nodes
   connect because `--iroh-peer` and `--p2p-claim` were passed on the command
   line, so today this decentralizes *transfer*, not *discovery*.
-- A node cannot serve the store it advertises: the availability index answers
-  for every local path, but the provider only serves what was eagerly seeded.
-- No serve-side size bound, no multi-holder failover, no streaming (the whole
-  NAR is buffered), and no policies at all — no hedge, prefetch, announce
-  budget, or leech mode.
+- A node supplies from raw-NAR *files* it was pointed at, not from
+  `/nix/store`. The index-backed supplier that dumps real store paths exists
+  and is tested, but nothing wires it into the daemon yet.
+- No multi-holder failover, no streaming (the fetching side still buffers the
+  whole NAR), and no policies at all — no hedge, prefetch, announce budget, or
+  leech mode.
+- A published claim does not survive a restart: the digest→path binding is
+  in-memory, so a peer holding an old claim gets a clean decline until some
+  hold-query re-derives it.
 - Nothing has run on a real network: no NAT, no relay, no residential uplink.
 
 Measured on the container testbed (single host, so read the caveats):
@@ -56,9 +65,13 @@ Measured on the container testbed (single host, so read the caveats):
 | Upstream NAR-payload egress offloaded | **1.00** (all of it) |
 | vs. a WAN-shaped upstream (50 ms RTT, 20 MiB/s) | peer path **9.3× faster** |
 | vs. a zero-latency loopback upstream | peer path **3.6× slower** |
-| Holder RAM per byte served | **2.00 B/B** (its blob store holds 1.00) |
+| Holder RAM per byte served | **1.02 B/B** [1.009 .. 1.031] |
+| Holder RAM held per byte *announced*, at rest | **0.00** |
 
-The two speedup figures are the same system against different upstreams — the
+Holder RAM is a slope fitted over five NAR sizes with a 95% confidence interval,
+not a single-point ratio; it was **2.004 [2.000 .. 2.009]** before the supply
+model, with the blob store holding 1.00 bytes per byte announced *forever*. The
+two speedup figures are the same system against different upstreams — the
 ranking flips, so neither is quotable alone. The 9.3× magnitude is linear in
 the bandwidth cap; the *flip* is the robust part. `TESTING.md` forbids claiming
 emergent network effects from single-host sweeps, and the peer link is still

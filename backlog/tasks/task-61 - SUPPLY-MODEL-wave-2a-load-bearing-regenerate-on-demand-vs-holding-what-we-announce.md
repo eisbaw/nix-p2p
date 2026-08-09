@@ -7,7 +7,7 @@ status: In Progress
 assignee:
   - '@me'
 created_date: '2026-08-09 13:24'
-updated_date: '2026-08-09 22:16'
+updated_date: '2026-08-09 23:12'
 labels: []
 dependencies: []
 priority: high
@@ -143,4 +143,48 @@ bite') was conditioned on choosing an ON-DISK store. Arm (a) was chosen, so:
     is no on-disk blob store to reclaim. Per-peer on-disk state was measured flat
     at 4096 B (task-42) and is unchanged. If task-82 or a future FsStore lands,
     this criterion becomes live again and must be written then.
+
+## AC#2: the FITTED SLOPES, before and after, with 95% CIs and the oracle named
+
+Instrument: `just profile --skip-speedup --swarm 1 --repeats 1 --concurrency 1
+--size-repeats 3` (TASK-65's size axis). Five NAR sizes (8/16/32/64/128 MiB) x 3
+replicates = 15 points, 15/15 VALID in both runs, honesty.compliant true,
+red_flags 0, size_axis_usable true in both.
+
+  size.holder_rss_hwm_bytes_ram        (oracle: VmHWM, peak RSS)
+    BEFORE  2.004426  [2.000129 .. 2.008723]  R2 0.999987
+    AFTER   1.020232  [1.009284 .. 1.031180]  R2 0.999679
+    -> THE INTERVALS ARE DISJOINT. Not a single-point comparison, and not a
+       claim that could have been made either way.
+
+  size.holder_store_resident_bytes_uncompressed_nar  (oracle: IROH-STORE-RESIDENT,
+    what the blob store SAYS IT HOLDS - NOT VmHWM, which is monotone and cannot
+    observe a release at all)
+    BEFORE  1.000000  [1.000000 .. 1.000000]  (resident_over_seeded_ratio 1.0)
+    AFTER   0.000000                          (resident_over_seeded_ratio 0.0)
+    -> a node held one byte for every byte it announced, for the life of the
+       process; it now holds none.
+
+  size.fetcher_rss_hwm_bytes_ram       (the CONTROL)
+    BEFORE  1.018814  [1.009204 .. 1.028424]
+    AFTER   1.018838  [1.007846 .. 1.029831]
+    -> UNCHANGED, as it must be: the fetcher's whole-NAR buffer is TASK-62 and
+       this cycle did not touch it. A holder-side change that had moved the
+       fetcher slope would have been evidence of something unintended.
+
+ATTRIBUTION, and it needs care. The holder drop from ~2.00 to ~1.02 is NOT the
+supply model saving memory by itself - it is that the supply path hands the store
+an OWNED Vec, so there is no separate file buffer and no clone, where the old
+eager path did `std::fs::read` then `add_bytes(raw_nar.to_vec())`. TASK-46 still
+owns removing the `to_vec` from `IrohProvider::seed`, which is a DIFFERENT call
+site (its `&[u8]` signature forces the copy) and is now test-only. Task-46's notes
+say so, and say not to quote this slope as evidence for that fix.
+
+HONEST LIMIT ON THE RUN ITSELF: `just profile` exited 1 in BOTH runs, and for the
+same reason in both - `--swarm 1` gives the swarm axis one distinct n, below
+scalefit's MIN_POINTS of 5, so it refuses to fit and marks the whole report
+`usable: false`. That verdict is about the SWARM axis; the size axis is
+`size_axis_usable: true`, honesty-compliant and red-flag-free in both. A full
+`just profile` should be run before anything OTHER than these size-axis slopes is
+quoted.
 <!-- SECTION:NOTES:END -->
