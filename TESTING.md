@@ -528,50 +528,80 @@ second**, the bytes actually on the wire.
 | RTT | **50 ms**/request | bottom of task-35's measured 50–110 ms to the Fastly PoP; this host measures 27–78 ms per TCP round trip (2026-08-09) |
 | Bandwidth | **20 MiB/s** wire | this host sustained **21.4 MB/s** on a single-stream 56.6 MB `.nar.zst` GET from cache.nixos.org; task-35's tail gaps imply only 6.8–9.8 MB/s aggregate |
 
-Both knobs sit at the **upstream-favourable** end of the measured
-evidence, so the arm understates real upstream cost and any peer
-advantage it reports is a lower bound.
+Both knob *values* sit at the **upstream-favourable** end of the measured
+evidence. The *model* is not uniformly so, and that has to be said rather
+than waved at: the delay is charged **per request**, and a real client on
+a reused keep-alive connection does not pay a fresh round trip for each
+one — worth ~5 × 50 ms = ~0.25 s of a 5.92 s `peers-off` realise, about
+**4%**, in the upstream's disfavour. So this arm is **not** a clean lower
+bound on the peer advantage. The bound that *is* clean runs the other way:
+the peer side is unshaped loopback, so the peer advantage is an **upper**
+bound on the peer side.
 
-**The shaping is ASSERTED, not assumed** (`probe_upstream_link`): the
-proxy is timed **host-side through the published port — outside the
-shaper**, unshaped and then shaped over the same channel, so the
-channel's own cost cancels out of the latency delta and the unshaped rate
-is a negative control. Measured this run:
+**The shaping is ASSERTED, not assumed, in two places.**
+`probe_upstream_link` times the proxy **host-side through the published
+port — outside the shaper**, unshaped and then shaped over the same
+channel, so the channel's own cost cancels out of the latency delta and
+the unshaped rate is a negative control. The latency is checked **per
+request kind**: the narinfo GET *and* the NAR's time-to-first-byte, because
+`latency_nar_ms` applies to the arm's dominant request and a probe that
+only timed narinfos never looked at it. Measured this run:
 
 | | unshaped (control) | shaped | injected |
 |---|---|---|---|
-| per-request latency (median) | 0.63 ms | 51.18 ms | 50 ms (recovered **50.55 ms**) |
-| NAR rate | 1408.7 MB/s | **20.00 MB/s** | 20.97 MB/s cap (0.954×) |
+| narinfo latency (median of 7) | 1.20 ms | 51.47 ms | 50 ms (recovered **50.27 ms**) |
+| NAR time-to-first-byte | 1.35 ms | 51.69 ms | 50 ms (recovered **50.34 ms**) |
+| NAR rate | 1394.6 MB/s | **20.00 MB/s** | 20.97 MB/s cap (0.954×) |
 
-The unshaped control is **67× the cap**, so the measurement channel is
+The unshaped control is **66.5× the cap**, so the measurement channel is
 nowhere near the limiter — that anti-vacuity check is asserted, not
 assumed, and a probe whose control is not materially faster is a *named*
-failure. **Bite proven by mutation:** with `fault_params()` stubbed to
-arm nothing, the same probe reports recovered RTT 0.03 ms and 3055 MB/s
-(145× the cap) and exits 1 with both violations named.
+failure. The margin itself is recorded, so channel drift is visible while
+it is still passing.
+
+The probe is a point-in-time claim about the *host*→proxy path, so a
+**second** assertion covers the path that was actually measured: the arm's
+own link rate at the cache boundary (the testproxy's per-record
+`bytes_sent`/`duration_ms`, over the scored runs) must land in the same
+band. That closes both the temporal gap and the path gap. It is applied to
+the CONTROL too — a control that quietly ran shaped would erase the
+contrast this section claims.
+
+**Both bites proven by mutation**, not by reading: stubbing
+`fault_params()` to arm nothing gives recovered RTT 0.03 ms and 3055 MB/s
+(145× the cap), exit 1 with both violations named; dropping only
+`latency_nar_ms` still hits the cap and still recovers the narinfo RTT,
+and is caught solely by the NAR-first-byte check (`recovered −0.78 ms`,
+exit 1).
 
 **Result — the ranking flips.**
 
 | Upstream condition | peers-off realise | peers-on realise | speedup | upstream link rate | egress offload |
 |---|---|---|---|---|---|
-| `loopback_control` (~0 RTT, unshaped) | 0.191 s (σ 0.038) | 0.645 s (σ 0.077) | **0.297** (peers 3.4× *slower*) | 977.8 MB/s | 1.00 |
-| `wan_shaped` (50 ms, 20 MiB/s) | 5.919 s (σ 0.030) | 0.625 s (σ 0.085) | **9.46** (peers 9.5× faster) | 19.9 MB/s | 1.00 |
+| `loopback_control` (~0 RTT, unshaped) | 0.171 s (σ 0.040) | 0.617 s (σ 0.038) | **0.276** (peers 3.6× *slower*) | 1073.3 MB/s | 1.00 |
+| `wan_shaped` (50 ms, 20 MiB/s) | 5.919 s (σ 0.047) | 0.638 s (σ 0.086) | **9.27** (peers 9.3× faster) | 19.9 MB/s | 1.00 |
 
-Observed range (min/max of the runs themselves, not a CI): 0.196–0.549
-for `loopback_control`, 7.86–13.47 for `wan_shaped`. The pinned task-42
+Observed range (min/max of the runs themselves, not a CI): 0.18–0.48 for
+`loopback_control`, 7.66–12.67 for `wan_shaped`. The pinned task-42
 control (peers-on 0.562 s, peers-off 0.159 s, speedup 0.283) reproduces
-within noise.
+within noise, and so does an earlier run of this same arm (0.297 / 9.46).
 
 **Reading.** The task-42 3.5× deficit is a property of the *upstream*,
 not of the peer transport. Task-64's per-connection ceiling (187 MB/s for
 the product's fetch path, 255 MB/s for iroh-blobs) only binds against an
 upstream faster than ~2 Gb/s, which on this testbed means exactly one
 machine: the loopback testproxy. Against a 20 MiB/s upstream the peer
-path is ~9× the link and the link binds first.
+path is ~9× the link and the link binds first. Note what the 9.27× *is*,
+though: with the peer arm unshaped, it is approximately (peer-path rate ÷
+cap), so its **magnitude is linear in a knob** and was sampled at one cap.
+The *flip* is robust — it happens anywhere below ~187 MB/s — but the
+number is not a property of the system alone. Sweeping the cap is
+task-44's crossover curve, and `--wan-bandwidth-mib-s` exists for it.
 
 **Honest limits of the shaping** (`shaping_fidelity` in the report). This
 is a **service-latency and egress-rate shaper, not a link emulator**: one
-delay per *request* plus body pacing. It does **not** model per-round-trip
+delay per *request* plus body pacing. `shaping_fidelity.bias_directions`
+in the report lists both signs and their magnitudes. It does **not** model per-round-trip
 RTT inside a transfer, TCP slow start, or the
 receive-window-over-RTT ceiling — so the bandwidth-delay product that
 binds a real WAN transfer is **absent by construction**, and the WAN arm
