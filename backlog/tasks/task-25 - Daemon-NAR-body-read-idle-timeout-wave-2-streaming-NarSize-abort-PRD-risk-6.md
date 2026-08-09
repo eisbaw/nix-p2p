@@ -6,7 +6,7 @@ title: >-
 status: To Do
 assignee: []
 created_date: '2026-08-08 08:16'
-updated_date: '2026-08-08 12:38'
+updated_date: '2026-08-08 23:40'
 labels:
   - wave1-followup
   - daemon
@@ -45,4 +45,6 @@ client's setting. Repro tools already exist: testproxy fault `throttle_nar_bps`
 (paces the NAR so the freeze lands mid-body) + Pod.pause()/unpause() +
 Pod.nar_tmp_bytes() in scripts/e2e_harness.py. When this task lands, add a bound
 assertion at the DAEMON boundary, not just the pinned client timeout.
+
+FROM task-39 (commit 120463e): the iroh fetch path (daemon::IrohTransport, transport_iroh.rs) currently assembles the whole blob via iroh_blobs get_blob(...).bytes() with NO NarSize bound - a lying holder could stream a huge blob. TransportNarSource::resolve receives _expected_size but forward-carries it (frozen seam). Enforcing the signed NarSize bound DURING streaming is this task: iroh-blobs exposes get_verified_size (a pre-check) and a streaming GetBlobResult (BaoContentItem leaves) so the bound can be enforced incrementally as bytes arrive, not post-hoc. The Transport::fetch trait carries no size today - wiring the bound likely needs a trait/seam extension coordinated with task-51.
 <!-- SECTION:NOTES:END -->
