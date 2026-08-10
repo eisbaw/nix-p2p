@@ -946,3 +946,40 @@ counting rule reserves.
 These freeze the moment two independent daemons interoperate; changing
 them splits the network. Everything else (transport internals, the
 profiler, policy thresholds, gossip) is a velocity surface.
+
+**How the claim-wire freeze is ENFORCED (task-91).** It used to be
+enforced by round-trip tests, which are blind to exactly the change that
+splits a network: rename a field or retag a variant and encode+decode
+still agree with each other, just not with the other node. The bytes are
+now pinned in `daemon/tests/golden/claim_wire_v1.json` and checked in
+both directions — what we emit and what we accept — by
+`daemon/tests/claim_wire_golden.rs`. Proven to bite: renaming
+`HoldAnswer::Absent`'s tag and renaming `Claim::holders` on the wire each
+turn a named vector red. Changing a vector is a RE-FREEZE; the correct
+response to a failure is a `schema_version` bump or a revert, never an
+updated vector. The one legitimate re-pin is the planned move off the
+JSON draft codec.
+
+**Batched hold-query (task-91), added ALONGSIDE the frozen types.**
+`BatchHoldQuery`/`BatchHoldAnswer`/`BatchHoldResponse` ask about a whole
+closure in one round trip. Two properties are gated rather than
+described:
+
+- **No enumeration**, which matters more here than anywhere because a
+  batch answer is the first message whose SHAPE resembles a listing. The
+  answer is positional over keys the asker named and carries no keys of
+  its own — the golden bytes contain no `sha256:` string at all — and
+  `daemon/tests/no_enumeration.rs` makes it structural: across
+  `claim`/`availability`/`discovery`, plural holdings out requires named
+  keys in. That guard proves it bites against a synthetic
+  `all_holdings() -> Vec<NarHashKey>`.
+- **Bounded**: `MAX_BATCH_HOLD_KEYS = 256`, chosen against the 64 KiB
+  wire gate rather than beside it (a full query is ~16 KiB, a full
+  all-`Have` response ~26 KiB) and asserted, so raising it to 1024 fails
+  the build. Over-cap is rejected, never truncated.
+
+The measured win lives in `just discovery` (or `profile_p2p.py
+--discovery-only`), whose honesty rules — both arms must ask about the
+same number of keys; the injected RTT must be recovered from the
+measurement, not trusted from the knob — are proven by mutation in
+`discoveryaxis --self-test`, which `just test` runs every cycle.
