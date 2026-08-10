@@ -22,8 +22,26 @@ fn short_origin() -> std::net::SocketAddr {
         for incoming in listener.incoming() {
             let Ok(mut stream) = incoming else { continue };
             std::thread::spawn(move || {
-                let mut buf = [0u8; 1024];
-                let _ = stream.read(&mut buf); // drain the request head
+                // Drain the request head TO ITS TERMINATOR, not "whatever one
+                // read() happened to return" (task-109). One read() is not a
+                // request head: it returns what has arrived so far. Responding and
+                // then dropping the stream while the peer is still writing its
+                // request hands that peer EPIPE, and the peer here is the code
+                // under test. Measured: 3 of the 10 failing instances in the
+                // task-109 baseline (45% gate failure rate at N=20) were this
+                // origin breaking the proxy's pipe - the proxy then correctly
+                // returned 502, which the test below misread as cache poisoning.
+                //
+                // Byte-at-a-time is deliberate: it is obviously correct and this is
+                // a 2-line-per-request test origin, not a hot path.
+                let mut head = Vec::new();
+                let mut byte = [0u8; 1];
+                while !head.ends_with(b"\r\n\r\n") {
+                    match stream.read(&mut byte) {
+                        Ok(0) | Err(_) => break, // peer gave up; nothing to answer
+                        Ok(_) => head.push(byte[0]),
+                    }
+                }
                 // Declares 10 bytes, sends 2, then closes: premature EOF.
                 let _ = stream.write_all(
                     b"HTTP/1.1 200 OK\r\nContent-Length: 10\r\nConnection: close\r\n\r\nhe",
@@ -76,6 +94,25 @@ fn premature_eof_nar_is_not_committed_or_served_complete() {
     // Second request: because nothing was cached, it is a MISS that refetches
     // upstream (again short) - it is NOT served as a complete cached 200.
     let second = get(proxy.addr, "/nar/x.nar").unwrap();
+    // State the property MEANT, not merely "the transfer was not complete"
+    // (task-109). `complete()` asks whether the body matched the advertised
+    // Content-Length - and a 502 error page matches ITS OWN Content-Length, so it
+    // is "complete" too. The bare `!complete()` check therefore could not tell
+    // "served a poisoned cache entry" (the defect this test guards) from "the
+    // upstream fetch failed" (an unrelated accident), and when the origin above
+    // raced it reported the former while the latter had happened. Pinning the
+    // status first makes a 502 fail AS a 502, naming the right component.
+    assert_eq!(
+        second.status,
+        Some(200),
+        "the second request must reach the origin and receive its (short) 200 - an \
+         upstream error here means the ORIGIN or the fetch broke, not the cache"
+    );
+    assert_eq!(
+        second.content_length,
+        Some(10),
+        "the second response must still advertise the origin's Content-Length"
+    );
     assert!(
         !second.complete(),
         "the second request must not be served a complete 200 from a poisoned cache"

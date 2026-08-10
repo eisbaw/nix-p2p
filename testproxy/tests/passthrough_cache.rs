@@ -6,8 +6,38 @@ mod common;
 use common::{Fixture, get};
 use std::sync::Arc;
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use testproxy::kind::Kind;
+use testproxy::record::Stats;
+
+/// Bounds a HANG while the server thread catches up; not a timing assertion.
+const LOG_VISIBILITY_DEADLINE: Duration = Duration::from_secs(10);
+
+/// Read the proxy's stats once it has recorded at least `want` requests.
+///
+/// WHY THE WAIT (task-109). The proxy pushes each log record AFTER it has already
+/// written the response, so a `get()` that has returned does NOT imply the request
+/// has been counted. Reading `stats()` straight after a `get()` is a race that
+/// silently under-counts on a loaded host. The same defect, measured in
+/// `faults.rs`, produced 6 of the 10 failing instances in the task-109 baseline.
+///
+/// This waits for a count the design guarantees will arrive and gives up after
+/// `LOG_VISIBILITY_DEADLINE`, returning whatever it has so the CALLER's assertions
+/// produce the real diagnostic. It never re-issues a request.
+///
+/// Note this can only wait for counts to REACH `want`. Assertions that something
+/// stayed at ZERO (a cache hit not touching upstream) cannot be waited for - see
+/// the call site in `repeat_served_from_cache_with_zero_upstream_hits`.
+fn await_stats(fx: &Fixture, want: u64) -> Stats {
+    let deadline = Instant::now() + LOG_VISIBILITY_DEADLINE;
+    loop {
+        let stats = fx.state.log.lock().unwrap().stats();
+        if stats.received_total() >= want || Instant::now() >= deadline {
+            return stats;
+        }
+        thread::sleep(Duration::from_millis(5));
+    }
+}
 
 /// AC#1: a repeat request is served from disk with ZERO upstream hits, PAIRED
 /// with a nonzero testproxy received-count (TESTING.md oracle-pairing rule).
@@ -21,7 +51,7 @@ fn repeat_served_from_cache_with_zero_upstream_hits() {
     let first_nar = get(fx.proxy_addr, "/nar/testnar.nar").unwrap();
     assert_eq!(first_nar.status, Some(200));
     {
-        let stats = fx.state.log.lock().unwrap().stats();
+        let stats = await_stats(&fx, 2);
         assert_eq!(
             stats.upstream_of(Kind::Narinfo),
             1,
@@ -37,7 +67,13 @@ fn repeat_served_from_cache_with_zero_upstream_hits() {
     assert_eq!(repeat_info.status, Some(200));
     assert_eq!(repeat_nar.status, Some(200));
 
-    let stats = fx.state.log.lock().unwrap().stats();
+    // Wait for BOTH repeat requests to be recorded before judging them. A zero
+    // cannot be waited for directly, but it does not need to be: each request's
+    // record carries its received AND upstream fields and is pushed as one unit,
+    // so once received_total reaches 2 the upstream counts for those same two
+    // requests are final. Without this wait, `upstream_total() == 0` could pass
+    // vacuously by reading the log before either request had been recorded at all.
+    let stats = await_stats(&fx, 2);
     // The paired assertion: 0 upstream hits AND a nonzero received count.
     assert_eq!(stats.upstream_total(), 0, "repeat must not touch upstream");
     assert!(
@@ -57,7 +93,7 @@ fn repeat_served_from_cache_with_zero_upstream_hits() {
 fn cold_request_hits_upstream() {
     let fx = Fixture::with_nar(4096);
     let _ = get(fx.proxy_addr, "/nar/testnar.nar").unwrap();
-    let stats = fx.state.log.lock().unwrap().stats();
+    let stats = await_stats(&fx, 1);
     assert_eq!(stats.upstream_of(Kind::Nar), 1);
     assert_eq!(stats.received_of(Kind::Nar), 1);
 }
@@ -73,6 +109,10 @@ fn request_log_records_fields_and_gap() {
     thread::sleep(injected);
     get(fx.proxy_addr, "/nar/testnar.nar").unwrap();
 
+    // Same race as the stats readers above, with a nastier failure mode: the
+    // `.find(..).unwrap()`s below would panic with an unhelpful "called `unwrap()`
+    // on a `None`" if either record had not been pushed yet. Wait for both first.
+    await_stats(&fx, 2);
     let log = fx.state.log.lock().unwrap();
     let records = log.records();
 

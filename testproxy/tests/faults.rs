@@ -6,7 +6,22 @@
 mod common;
 
 use common::{Fixture, get};
-use std::time::Instant;
+use std::time::{Duration, Instant};
+
+/// How long [`await_fault_count`] will wait for the server thread to catch up.
+/// This bounds a HANG - it is not a timing assertion, and the value is not a
+/// tuned constant: any value large enough to survive scheduling noise does.
+const LOG_VISIBILITY_DEADLINE: Duration = Duration::from_secs(10);
+
+/// The latency the mode-1 fault injects. Referenced rather than repeated so the
+/// fault query and the assertion that reads it can never drift apart.
+const LATENCY_FAULT: Duration = Duration::from_millis(400);
+
+/// How many narinfo samples the scoping assertion takes the MINIMUM of. More
+/// samples cost ~one loopback round-trip each and make a spurious failure require
+/// every sample to be slow at once; see the assertion for why the minimum is the
+/// right statistic for a fault that imposes a floor.
+const NARINFO_SAMPLES: usize = 5;
 
 /// Count how many log records carry a given fault tag.
 fn fault_count(fx: &Fixture, name: &str) -> u64 {
@@ -21,6 +36,38 @@ fn fault_count(fx: &Fixture, name: &str) -> u64 {
         .unwrap_or(0)
 }
 
+/// Wait for `name` to have been counted `want` times, then assert it.
+///
+/// WHY THIS IS NOT `assert_eq!(fault_count(..), want)` (task-109). The client and
+/// the proxy's bookkeeping are not ordered with respect to each other: the proxy
+/// pushes its log record in `proxy.rs` AFTER `serve()` has already written the
+/// response - or, for a reset, after it has already dropped the connection. So
+/// `get()` can return, having fully observed the fault, while the server thread
+/// has not yet reached the push. Measured consequence: 6 of 10 failing instances
+/// in the task-109 baseline (45% gate failure rate at N=20) were this, split
+/// across `connection-reset` and `truncated-nar`.
+///
+/// This is a WAIT, not a retry: it re-reads a counter that the design guarantees
+/// will be written, and FAILS if the deadline passes. It never re-runs the request
+/// and never re-rolls the fault, so a fault that genuinely never fired still fails
+/// the test - just `LOG_VISIBILITY_DEADLINE` later than it would have.
+///
+/// It asserts EQUALITY at the end, not `>=`, so an over-count (the same fault
+/// recorded twice) still fails exactly as it did before.
+#[track_caller]
+fn await_fault_count(fx: &Fixture, name: &str, want: u64) {
+    let deadline = Instant::now() + LOG_VISIBILITY_DEADLINE;
+    while fault_count(fx, name) < want && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    assert_eq!(
+        fault_count(fx, name),
+        want,
+        "fault {name:?} count after waiting up to {LOG_VISIBILITY_DEADLINE:?} for the \
+         proxy to record it"
+    );
+}
+
 /// Mode 1: added latency per path-kind.
 #[test]
 fn latency_fault_delays_only_the_targeted_kind() {
@@ -31,32 +78,50 @@ fn latency_fault_delays_only_the_targeted_kind() {
     let t0 = Instant::now();
     get(fx.proxy_addr, "/nar/testnar.nar").unwrap();
     let baseline = t0.elapsed();
-    assert!(
-        baseline.as_millis() < 150,
-        "baseline unexpectedly slow: {baseline:?}"
-    );
 
-    // Fault on: 400 ms added latency to NAR requests only.
+    // Fault on: LATENCY_FAULT adds a known floor to NAR requests only.
     fx.reset_log();
-    fx.set_faults("latency_nar_ms=400");
+    fx.set_faults(&format!("latency_nar_ms={}", LATENCY_FAULT.as_millis()));
     let t1 = Instant::now();
     get(fx.proxy_addr, "/nar/testnar.nar").unwrap();
     let delayed = t1.elapsed();
+    // A LOWER bound, so CPU contention can only make it more true - a loaded host
+    // makes the request slower, never faster. Safe to state in absolute time.
     assert!(
-        delayed.as_millis() >= 350,
-        "latency fault not felt: {delayed:?}"
+        delayed >= LATENCY_FAULT - Duration::from_millis(50),
+        "latency fault not felt: {delayed:?} (baseline {baseline:?})"
     );
 
-    // A narinfo request is NOT delayed (per-kind scoping) and is fast.
-    let t2 = Instant::now();
-    get(fx.proxy_addr, "/test.narinfo").unwrap();
-    assert!(t2.elapsed().as_millis() < 150, "narinfo wrongly delayed");
-
-    assert_eq!(
-        fault_count(&fx, "latency-nar"),
-        1,
-        "latency tagged in the log"
+    // A narinfo request is NOT delayed: the fault is scoped to the nar kind.
+    //
+    // THE MINIMUM OF SEVERAL SAMPLES, not one sample, and compared against the
+    // INJECTED FLOOR rather than a hand-picked constant (task-109, second
+    // attempt). Two earlier forms of this assertion were both wrong:
+    //   `narinfo < 150ms`          - a claim about how fast the HOST is.
+    //   `narinfo + 200ms < delayed` - my first fix. Still two SINGLE samples, so
+    //     one scheduling hiccup beats it: the task-109 AFTER run caught it at
+    //     narinfo 278ms vs nar 405ms, a spurious failure on correct code.
+    // The sound formulation uses what the fault actually does: it imposes a FLOOR
+    // on every request of the targeted kind. So if scoping were broken, EVERY
+    // narinfo sample would be >= LATENCY_FAULT and so would their minimum. Taking
+    // the min means a spurious failure needs ALL samples to be independently
+    // slow, while a genuine scoping break is still caught by construction.
+    // The threshold is not tuned - it IS the injected latency.
+    let mut fastest_narinfo = Duration::MAX;
+    for _ in 0..NARINFO_SAMPLES {
+        let t2 = Instant::now();
+        get(fx.proxy_addr, "/test.narinfo").unwrap();
+        fastest_narinfo = fastest_narinfo.min(t2.elapsed());
+    }
+    assert!(
+        fastest_narinfo < LATENCY_FAULT,
+        "narinfo wrongly delayed: the fastest of {NARINFO_SAMPLES} narinfo requests \
+         took {fastest_narinfo:?}, at or above the {LATENCY_FAULT:?} floor the fault \
+         injects into the nar kind - so narinfo is receiving a fault scoped to nar \
+         (nar sample {delayed:?}, unfaulted baseline {baseline:?})"
     );
+
+    await_fault_count(&fx, "latency-nar", 1);
 }
 
 /// Mode 2: HTTP 500/503.
@@ -79,7 +144,7 @@ fn http_error_fault_returns_the_status() {
         get(fx.proxy_addr, "/test.narinfo").unwrap().status,
         Some(200)
     );
-    assert_eq!(fault_count(&fx, "http-error-503"), 1);
+    await_fault_count(&fx, "http-error-503", 1);
 }
 
 /// Mode 3: connection reset - no valid HTTP response at all.
@@ -100,7 +165,7 @@ fn connection_reset_fault_yields_no_response() {
         "reset must not produce a valid HTTP response"
     );
     assert!(resp.body.is_empty() || resp.short);
-    assert_eq!(fault_count(&fx, "connection-reset"), 1);
+    await_fault_count(&fx, "connection-reset", 1);
 }
 
 /// Mode 4: truncated NAR at N%.
@@ -130,7 +195,7 @@ fn truncated_nar_fault_short_reads() {
         "truncated at ~40%: got {} want ~{expected}",
         resp.body.len()
     );
-    assert_eq!(fault_count(&fx, "truncated-nar"), 1);
+    await_fault_count(&fx, "truncated-nar", 1);
 
     // The CACHE is NOT corrupted by the fault: the stored NAR is whole+correct.
     assert_eq!(fx.cached_nar().as_deref(), Some(fx.origin_nar().as_slice()));
@@ -156,7 +221,7 @@ fn corrupt_nar_fault_alters_bytes_not_length() {
         "length unchanged (Content-Length matches)"
     );
     assert_ne!(resp.body, origin, "bytes corrupted");
-    assert_eq!(fault_count(&fx, "corrupt-nar"), 1);
+    await_fault_count(&fx, "corrupt-nar", 1);
 
     // Cache integrity holds even though the fault served corrupt bytes.
     assert_eq!(fx.cached_nar().as_deref(), Some(origin.as_slice()));
@@ -183,7 +248,7 @@ fn wrong_narinfo_fault_mutates_the_metadata() {
         !served.contains("1111111111111111111111111111111111111111111111111111"),
         "the original NarHash value is gone"
     );
-    assert_eq!(fault_count(&fx, "wrong-narinfo"), 1);
+    await_fault_count(&fx, "wrong-narinfo", 1);
 
     // Cache keeps the correct narinfo.
     assert!(fx.cached_nar().is_none()); // nar not fetched
@@ -211,5 +276,5 @@ fn unreachable_fault_fails_fast_with_502() {
         elapsed.as_millis() < 500,
         "must fail fast, took {elapsed:?}"
     );
-    assert_eq!(fault_count(&fx, "unreachable"), 1);
+    await_fault_count(&fx, "unreachable", 1);
 }
