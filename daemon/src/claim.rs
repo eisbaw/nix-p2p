@@ -307,6 +307,22 @@ pub enum KnownTransport {
     BitTorrent { infohash: BitTorrentInfoHash },
 }
 
+impl KnownTransport {
+    /// The `transport` tag this offer serialises as.
+    ///
+    /// Exists so the batch binding rules can ask "which KIND is this?" without
+    /// re-serialising. It must agree with [`KNOWN_TRANSPORT_TAGS`] and with the
+    /// serde attributes above; `known_transport_tags_agree_with_the_wire_tags`
+    /// asserts all three against each other, because three hand-maintained lists
+    /// of the same fact is exactly how a tag drifts.
+    pub(crate) fn wire_tag(&self) -> &'static str {
+        match self {
+            KnownTransport::Iroh { .. } => "iroh",
+            KnownTransport::BitTorrent { .. } => "bittorrent",
+        }
+    }
+}
+
 /// Field deserializer for a transport-offer list: TOLERATE-BUT-DROP unknown
 /// transports. Each element is peeked; a KNOWN transport is strict-parsed (a
 /// malformed known transport ERRORS the whole decode), an unknown transport tag
@@ -519,6 +535,27 @@ pub const MAX_BATCH_HOLD_KEYS: usize = 256;
 /// Both are enforced: this cap, and `check_size` on the encoder's OUTPUT.
 pub const MAX_BATCH_HOLD_OFFERS: usize = 2 * MAX_BATCH_HOLD_KEYS;
 
+/// Maximum number of offers ONE answer may name, and therefore the number of
+/// dictionary entries each ANSWERED key can justify.
+///
+/// This is the bound that makes the dictionary a function of what was ANSWERED
+/// rather than of the mere existence of one `Have`. Without it, "every entry is
+/// referenced by at least one `Have`" is satisfied by a SINGLE `Have` naming the
+/// whole dictionary: a one-key question could be answered with 512 BitTorrent
+/// infohashes - 511 content identities the asker never named - at 613.8x wire
+/// amplification. Measured, not hypothesised: see
+/// `a_single_have_cannot_legitimise_a_pile_of_content_locators`.
+///
+/// Why 4 and not 2: a locator is meaningful once per transport KIND (the content
+/// has one identity, so a second infohash for the same key names a second blob),
+/// and this build knows 2 kinds. The extra headroom is for FORWARD
+/// COMPATIBILITY: a future peer offering two transports this build has never
+/// heard of must still be able to answer, because unknown kinds occupy
+/// dictionary slots until compaction. A peer needing more than 4 locators for
+/// one key is refused, which is a pinned, reviewable limit rather than an
+/// accident.
+pub const MAX_OFFERS_PER_ANSWER: usize = 4;
+
 /// A probe about MANY content identities at once: "of these N NarHashes, which do
 /// you hold?". One round trip replaces N.
 ///
@@ -560,30 +597,59 @@ pub struct BatchHoldQuery {
 /// audit (`git diff | grep '^-'` returning nothing) stays meaningful. The shared
 /// rule - which tags are known - lives once, in [`KNOWN_TRANSPORT_TAGS`], and
 /// `slot_and_drop_decoders_agree` asserts the two functions do not diverge.
-fn deserialize_transport_slots<'de, D>(
-    deserializer: D,
-) -> Result<Vec<Option<KnownTransport>>, D::Error>
+fn deserialize_transport_slots<'de, D>(deserializer: D) -> Result<Vec<OfferSlot>, D::Error>
 where
     D: serde::Deserializer<'de>,
 {
     let raw = Vec::<Value>::deserialize(deserializer)?;
     let mut slots = Vec::with_capacity(raw.len());
     for value in raw {
-        let is_known = value
-            .get("transport")
-            .and_then(Value::as_str)
-            .is_some_and(|tag| KNOWN_TRANSPORT_TAGS.contains(&tag));
+        let tag = value.get("transport").and_then(Value::as_str);
+        let is_known = tag.is_some_and(|tag| KNOWN_TRANSPORT_TAGS.contains(&tag));
         if is_known {
             // A malformed KNOWN transport is a hard error, exactly as on a claim.
-            slots.push(Some(
+            slots.push(OfferSlot::Known(
                 serde_json::from_value::<KnownTransport>(value)
                     .map_err(serde::de::Error::custom)?,
             ));
         } else {
-            slots.push(None);
+            // An absent or non-string `transport` has no kind at all; it still
+            // occupies a slot (indices must not shift) and is still dropped.
+            slots.push(OfferSlot::Unknown(tag.unwrap_or_default().to_string()));
         }
     }
     Ok(slots)
+}
+
+/// One position in a decoded offer dictionary, BEFORE compaction.
+///
+/// A slot exists for every element the peer sent so that `Have` indices mean the
+/// same thing on both nodes. An unknown kind is dropped on compaction, but its
+/// wire TAG survives validation: the one-locator-per-kind rule has to tell two
+/// DIFFERENT future transports apart from the same one repeated, and a slot that
+/// forgot its tag makes those two cases indistinguishable - which would either
+/// reject a legal forward-compatible response or admit a padded one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum OfferSlot {
+    Known(KnownTransport),
+    Unknown(String),
+}
+
+impl OfferSlot {
+    /// The transport tag at this position, known or not.
+    fn wire_tag(&self) -> &str {
+        match self {
+            OfferSlot::Known(offer) => offer.wire_tag(),
+            OfferSlot::Unknown(tag) => tag.as_str(),
+        }
+    }
+}
+
+/// View an already-decoded dictionary as slots, so the ENCODE side runs the very
+/// same [`check_batch_offer_bindings`] as the decode side. Every entry is `Known`
+/// by construction: a value we hold in memory has no unknown kinds left in it.
+pub(crate) fn as_offer_slots(offers: &[KnownTransport]) -> Vec<OfferSlot> {
+    offers.iter().cloned().map(OfferSlot::Known).collect()
 }
 
 /// An index into a [`BatchHoldResponse`]'s offer dictionary. `u16` rather than
@@ -665,13 +731,42 @@ pub struct BatchHoldResponse {
     pub schema_version: u16,
     /// The offer DICTIONARY: every pure locator this response uses, each named by
     /// index from the `Have` it belongs to. Always emitted, empty included, so the
-    /// encoding has exactly one canonical form. Every entry MUST be referenced by
-    /// at least one `Have`, so a locator can never float free of the keys it
-    /// describes - which is also why an all-`Absent` response is required to carry
-    /// an EMPTY dictionary and therefore cannot volunteer anything.
+    /// encoding has exactly one canonical form.
+    ///
+    /// The dictionary is bounded by what was ANSWERED. Every entry must be
+    /// referenced by at least one `Have`; each `Have` may name at most
+    /// [`MAX_OFFERS_PER_ANSWER`] entries, and at most ONE per transport kind. So
+    /// an all-`Absent` response must carry an EMPTY dictionary, and - the part
+    /// "every entry is referenced" alone did NOT give - a ONE-key response cannot
+    /// carry more than [`MAX_OFFERS_PER_ANSWER`] locators either. Referencing
+    /// alone let a single `Have` legitimise the whole 512-entry dictionary, i.e.
+    /// 511 content identities the asker never named.
     pub offers: Vec<KnownTransport>,
     /// Positionally aligned with the query's `keys`. Carries no keys of its own.
     pub answers: Vec<BatchHoldAnswer>,
+}
+
+/// COMPILE-TIME PROOF that [`BatchHoldResponse`] does not implement `Deserialize`.
+///
+/// The whole index-remap safety argument rests on `decode_batch_hold_response`
+/// being the only way to build one from bytes. That was enforced by nothing but
+/// the absence of a word: re-adding `Deserialize` to the derive list compiled
+/// cleanly and left the entire suite GREEN, silently reopening the rebinding
+/// hazard the position-preserving slots exist to close.
+///
+/// Rust has no negative trait bound, so the proof is by COHERENCE: the blanket
+/// impl below covers every `Deserialize` type, and the specific impl covers
+/// `BatchHoldResponse`. They overlap if and only if `BatchHoldResponse` is
+/// `Deserialize`, and an overlap is E0119 - a build error, not a test failure.
+/// There is deliberately no accompanying #[test]: a test would document the fact,
+/// and this enforces it.
+mod not_deserialize {
+    use super::BatchHoldResponse;
+
+    #[allow(dead_code)] // a coherence vehicle, never called: see the module doc
+    pub(super) trait NotDeserialize {}
+    impl<T> NotDeserialize for T where T: for<'de> serde::Deserialize<'de> {}
+    impl NotDeserialize for BatchHoldResponse {}
 }
 
 /// The wire twin of [`BatchHoldResponse`] used ONLY by
@@ -685,7 +780,7 @@ pub struct BatchHoldResponse {
 struct BatchHoldResponseWire {
     schema_version: u16,
     #[serde(deserialize_with = "deserialize_transport_slots")]
-    offers: Vec<Option<KnownTransport>>,
+    offers: Vec<OfferSlot>,
     answers: Vec<BatchHoldAnswer>,
 }
 
@@ -706,10 +801,20 @@ struct BatchHoldResponseWire {
 ///     volunteered rather than answered, which is both meaningless and a
 ///     no-enumeration leak: it lets an all-`Absent` response say something about
 ///     content the asker never named.
+///   * ONE LOCATOR PER KIND inside one `Have`, and at most
+///     [`MAX_OFFERS_PER_ANSWER`] of them. "Every entry is referenced" bounds the
+///     dictionary against the existence of a `Have`, NOT against what was
+///     answered - one `Have` could name all 512 entries, so a one-key question
+///     could be answered with 511 content identities the asker never named.
+///     These two rules make the dictionary a function of the ANSWERED keys: the
+///     content behind a key has ONE identity per transport, so a second
+///     `bittorrent` offer on the same answer names a second blob, which the
+///     whole single-identity design exists to forbid.
 pub(crate) fn check_batch_offer_bindings(
-    offer_count: usize,
+    offers: &[OfferSlot],
     answers: &[BatchHoldAnswer],
 ) -> Result<(), ClaimCodecError> {
+    let offer_count = offers.len();
     if answers.is_empty() {
         return Err(ClaimCodecError::Malformed(
             "a batch hold-response must answer at least one key".to_string(),
@@ -727,12 +832,29 @@ pub(crate) fn check_batch_offer_bindings(
             cap: MAX_BATCH_HOLD_OFFERS,
         });
     }
+    // NOTE WHAT IS *NOT* HERE: an explicit `offers.len() <= have_count * N` check.
+    // It was written, and it could not be made to fail: with every entry required
+    // to be referenced (below) and each answer capped at MAX_OFFERS_PER_ANSWER
+    // distinct indices, `offers.len() <= have_count * MAX_OFFERS_PER_ANSWER` is a
+    // THEOREM of the two rules, not a third rule. Shipping it would have been an
+    // unfalsifiable check that only masked the two real ones - the mutation that
+    // deleted each of them came back GREEN because the other caught the same wire.
+    // The theorem is asserted where it belongs, in
+    // `a_single_have_cannot_legitimise_a_pile_of_content_locators`.
     let mut referenced = vec![false; offer_count];
     for (position, answer) in answers.iter().enumerate() {
         let BatchHoldAnswer::Have { offer_indices, .. } = answer else {
             continue;
         };
+        if offer_indices.len() > MAX_OFFERS_PER_ANSWER {
+            return Err(ClaimCodecError::Malformed(format!(
+                "batch answer {position} names {} offers; at most {MAX_OFFERS_PER_ANSWER} \
+                 locators can describe one key",
+                offer_indices.len()
+            )));
+        }
         let mut seen = std::collections::HashSet::with_capacity(offer_indices.len());
+        let mut kinds = std::collections::HashSet::with_capacity(offer_indices.len());
         for index in offer_indices {
             let at = usize::from(*index);
             if at >= offer_count {
@@ -745,6 +867,14 @@ pub(crate) fn check_batch_offer_bindings(
                 return Err(ClaimCodecError::Malformed(format!(
                     "batch answer {position} names offer {at} twice (ambiguous response \
                      is rejected)"
+                )));
+            }
+            let kind = offers[at].wire_tag();
+            if !kinds.insert(kind) {
+                return Err(ClaimCodecError::Malformed(format!(
+                    "batch answer {position} names two `{kind}` offers; the content behind \
+                     one key has ONE identity per transport, so the second names a \
+                     different blob"
                 )));
             }
             referenced[at] = true;
@@ -767,7 +897,7 @@ pub(crate) fn check_batch_offer_bindings(
 /// `offer_indices`: the holding is still asserted, but this build cannot fetch it.
 /// That is the tolerate-but-drop rule applied per key instead of per response.
 fn compact_offer_slots(
-    slots: Vec<Option<KnownTransport>>,
+    slots: Vec<OfferSlot>,
     answers: &mut [BatchHoldAnswer],
 ) -> Vec<KnownTransport> {
     // `remap[old] == Some(new)` for a kept slot, `None` for a dropped one.
@@ -775,11 +905,11 @@ fn compact_offer_slots(
     let mut kept: Vec<KnownTransport> = Vec::with_capacity(slots.len());
     for slot in slots {
         match slot {
-            Some(offer) => {
+            OfferSlot::Known(offer) => {
                 remap.push(Some(kept.len() as OfferIndex));
                 kept.push(offer);
             }
-            None => remap.push(None),
+            OfferSlot::Unknown(_) => remap.push(None),
         }
     }
     for answer in answers.iter_mut() {
@@ -1100,7 +1230,7 @@ pub fn decode_batch_hold_query(bytes: &[u8]) -> Result<BatchHoldQuery, ClaimCode
 pub fn encode_batch_hold_response(
     response: &BatchHoldResponse,
 ) -> Result<Vec<u8>, ClaimCodecError> {
-    check_batch_offer_bindings(response.offers.len(), &response.answers)?;
+    check_batch_offer_bindings(&as_offer_slots(&response.offers), &response.answers)?;
     encode_checked(response)
 }
 
@@ -1154,7 +1284,7 @@ pub fn decode_batch_hold_response(
         });
     }
     let mut answers = wire.answers;
-    check_batch_offer_bindings(wire.offers.len(), &answers)?;
+    check_batch_offer_bindings(&wire.offers, &answers)?;
     let offers = compact_offer_slots(wire.offers, &mut answers);
     Ok(BatchHoldResponse {
         schema_version: wire.schema_version,
@@ -2268,15 +2398,29 @@ mod tests {
     /// A one-answer response naming `indices` over a dictionary of `offer_count`
     /// iroh locators, as raw wire bytes - so the test can express wires our own
     /// encoder would refuse to build.
+    /// A one-answer batch response whose dictionary has `offer_count` entries of
+    /// DISTINCT kinds. Distinct because one answer may name at most one locator
+    /// per transport kind (the content behind a key has one identity per
+    /// transport), so a dictionary of N same-kind offers is not a legal shape to
+    /// test the INDEX rules against - it would be rejected for the wrong reason.
+    /// Positions past the two known kinds are distinct UNKNOWN kinds, which is the
+    /// forward-compatible shape and keeps the slot path exercised.
     fn batch_wire(offer_count: usize, indices: &[u16]) -> Vec<u8> {
         let offers: Vec<Value> = (0..offer_count)
             .map(|i| {
                 let mut raw = [0u8; 32];
                 raw[0] = i as u8;
-                serde_json::json!({
-                    "transport": "iroh",
-                    "node": NodeId::from_bytes(raw).to_string()
-                })
+                match i {
+                    0 => serde_json::json!({
+                        "transport": "iroh",
+                        "node": NodeId::from_bytes(raw).to_string()
+                    }),
+                    1 => serde_json::json!({
+                        "transport": "bittorrent",
+                        "infohash": INFOHASH_HEX
+                    }),
+                    other => serde_json::json!({ "transport": format!("future_{other}") }),
+                }
             })
             .collect();
         serde_json::to_vec(&serde_json::json!({
@@ -2317,11 +2461,155 @@ mod tests {
         // Duplicated state with two readings (one offer, or two identical ones).
         // Same argument as the duplicate-JSON-key guard: exactly one canonical
         // meaning, fail-closed rather than last-wins.
-        assert!(matches!(
-            decode_batch_hold_response(&batch_wire(2, &[0, 1, 0]), 1),
-            Err(ClaimCodecError::Malformed(_))
-        ));
+        //
+        // The MESSAGE is asserted, not just the variant. A repeated index is
+        // necessarily a repeated KIND, so the one-locator-per-kind rule would
+        // refuse this wire too - and with only `matches!(.., Malformed(_))` here,
+        // deleting the repeat rule left the suite GREEN. Pinning the message pins
+        // WHICH rule spoke, which is the whole point of keeping both: the repeat
+        // rule gives the precise diagnostic and runs first.
+        match decode_batch_hold_response(&batch_wire(2, &[0, 1, 0]), 1) {
+            Err(ClaimCodecError::Malformed(why)) => assert!(
+                why.contains("names offer 0 twice"),
+                "the repeat rule must be the one that refuses this: {why}"
+            ),
+            other => panic!("a repeated offer index must be rejected: {other:?}"),
+        }
         assert!(decode_batch_hold_response(&batch_wire(2, &[0, 1]), 1).is_ok());
+    }
+
+    #[test]
+    fn a_single_have_cannot_legitimise_a_pile_of_content_locators() {
+        // ROUND 7. "Every entry is referenced by at least one `Have`" bounds the
+        // dictionary against the EXISTENCE of a Have, not against what was
+        // ANSWERED - so one Have could name the whole dictionary. Three
+        // independent reviews measured the same hole: a 91 B one-key query
+        // answered with 512 BitTorrent infohashes, 557.6x / 578x / 613.8x wire
+        // amplification depending on the locator mix. An infohash IS a content
+        // identity, so 511 of those name content the asker never asked about.
+        let offers: Vec<Value> = (0..MAX_BATCH_HOLD_OFFERS)
+            .map(|i| {
+                let mut raw = [0u8; 32];
+                raw[..8].copy_from_slice(&(i as u64).to_be_bytes());
+                serde_json::json!({
+                    "transport": "bittorrent",
+                    "infohash": BitTorrentInfoHash::v2(raw).to_string()
+                })
+            })
+            .collect();
+        let indices: Vec<OfferIndex> = (0..offers.len() as OfferIndex).collect();
+        let wire = serde_json::to_vec(&serde_json::json!({
+            "schema_version": QUERY_SCHEMA_VERSION,
+            "offers": offers,
+            "answers": [
+                { "answer": "have", "blake3": BLAKE3_HEX, "offer_indices": indices }
+            ]
+        }))
+        .unwrap();
+        match decode_batch_hold_response(&wire, 1) {
+            Err(ClaimCodecError::Malformed(why)) => assert!(
+                why.contains("locators may bind") || why.contains("locators can describe"),
+                "the refusal must name the answered-keys bound, not something else: {why}"
+            ),
+            other => panic!(
+                "a one-key question must not be answerable with a pile of content \
+                 identities: {other:?}"
+            ),
+        }
+        // ISOLATING CASE for the one-locator-per-kind rule. Deliberately TINY: two
+        // offers, one answer, both referenced, two indices (under the per-answer
+        // cap), in range, not repeated. Every other rule is satisfied, so only the
+        // kind rule can refuse it - and the MESSAGE is asserted, not just the
+        // error variant. An earlier draft of this control used 512 offers and
+        // passed because the SIZE gate refused it; deleting the kind rule left the
+        // suite green. Asserting the variant alone is how that happened.
+        let two_of_a_kind = BatchHoldResponse {
+            schema_version: QUERY_SCHEMA_VERSION,
+            offers: vec![
+                KnownTransport::BitTorrent {
+                    infohash: BitTorrentInfoHash::v2([1u8; 32]),
+                },
+                KnownTransport::BitTorrent {
+                    infohash: BitTorrentInfoHash::v2([2u8; 32]),
+                },
+            ],
+            answers: vec![BatchHoldAnswer::Have {
+                blake3: blake3_id(),
+                offer_indices: vec![0, 1],
+            }],
+        };
+        match encode_batch_hold_response(&two_of_a_kind) {
+            Err(ClaimCodecError::Malformed(why)) => assert!(
+                why.contains("two `bittorrent` offers"),
+                "the refusal must name the one-identity-per-transport rule: {why}"
+            ),
+            other => panic!("one key must not carry two content identities: {other:?}"),
+        }
+        // ...and the decoder refuses the same shape, not just the encoder.
+        let wire_two = serde_json::to_vec(&serde_json::json!({
+            "schema_version": QUERY_SCHEMA_VERSION,
+            "offers": [
+                { "transport": "bittorrent", "infohash": INFOHASH_HEX },
+                { "transport": "bittorrent", "infohash": BitTorrentInfoHash::v2([9u8; 32]).to_string() }
+            ],
+            "answers": [
+                { "answer": "have", "blake3": BLAKE3_HEX, "offer_indices": [0, 1] }
+            ]
+        }))
+        .unwrap();
+        match decode_batch_hold_response(&wire_two, 1) {
+            Err(ClaimCodecError::Malformed(why)) => assert!(
+                why.contains("two `bittorrent` offers"),
+                "the decoder must refuse it for the same reason: {why}"
+            ),
+            other => panic!("the decoder accepted two identities for one key: {other:?}"),
+        }
+        // The CONTROL: two offers of DIFFERENT kinds on one answer is legal, so
+        // this test cannot pass by rejecting every multi-offer answer.
+        let two_kinds = BatchHoldResponse {
+            schema_version: QUERY_SCHEMA_VERSION,
+            offers: vec![
+                KnownTransport::Iroh { node: node_a() },
+                KnownTransport::BitTorrent {
+                    infohash: BitTorrentInfoHash::v2([3u8; 32]),
+                },
+            ],
+            answers: vec![BatchHoldAnswer::Have {
+                blake3: blake3_id(),
+                offer_indices: vec![0, 1],
+            }],
+        };
+        assert!(encode_batch_hold_response(&two_kinds).is_ok());
+    }
+
+    #[test]
+    fn known_transport_tags_agree_with_the_wire_tags() {
+        // Three hand-maintained statements of one fact: KNOWN_TRANSPORT_TAGS, the
+        // serde attributes, and `wire_tag`. Asserted against each other so a new
+        // transport cannot land in two of the three.
+        for offer in [
+            KnownTransport::Iroh { node: node_a() },
+            KnownTransport::BitTorrent {
+                infohash: BitTorrentInfoHash::v2([7u8; 32]),
+            },
+        ] {
+            let tag = offer.wire_tag();
+            assert!(
+                KNOWN_TRANSPORT_TAGS.contains(&tag),
+                "`{tag}` is not in KNOWN_TRANSPORT_TAGS"
+            );
+            let encoded = serde_json::to_value(&offer).unwrap();
+            assert_eq!(
+                encoded.get("transport").and_then(Value::as_str),
+                Some(tag),
+                "`wire_tag` disagrees with what serde emits for {offer:?}"
+            );
+        }
+        assert_eq!(
+            KNOWN_TRANSPORT_TAGS.len(),
+            2,
+            "a new transport kind must update MAX_OFFERS_PER_ANSWER's derivation too"
+        );
     }
 
     #[test]
@@ -2449,9 +2737,15 @@ mod tests {
              along with it"
         );
 
-        // And a dictionary UNDER the count cap that is still over the byte gate is
-        // refused by the size check - the count cap alone is not a byte budget.
-        let heavy: Vec<KnownTransport> = (0..MAX_BATCH_HOLD_OFFERS)
+        // The SIZE gate is a separate bound from the count caps, and it has to be
+        // exercised somewhere it is REACHABLE. It no longer is on a batch response:
+        // the per-answer bound plus the key cap now hold the worst legal batch at
+        // 58 910 B under the 65 536 B gate by construction (asserted in
+        // `a_full_batch_fits_the_wire_cap_with_headroom`). A frozen `Claim` has no
+        // offer-COUNT cap at all, so that is where an encoder can still build a
+        // message its own decoder would refuse.
+        let mut oversize = sample_claim();
+        oversize.transports = (0..2_000)
             .map(|i| {
                 let mut raw = [0u8; 32];
                 raw[..8].copy_from_slice(&(i as u64).to_be_bytes());
@@ -2460,24 +2754,17 @@ mod tests {
                 }
             })
             .collect();
-        let indices: Vec<OfferIndex> = (0..heavy.len() as OfferIndex).collect();
-        let heavy_response = BatchHoldResponse {
-            schema_version: QUERY_SCHEMA_VERSION,
-            offers: heavy,
-            answers: (0..MAX_BATCH_HOLD_KEYS)
-                .map(|_| BatchHoldAnswer::Have {
-                    blake3: blake3_id(),
-                    offer_indices: indices.clone(),
-                })
-                .collect(),
-        };
-        match encode_batch_hold_response(&heavy_response) {
+        match encode_claim(&oversize) {
             Err(ClaimCodecError::Malformed(why)) => assert!(
                 why.contains("exceeds"),
                 "the size gate must say what it refused: {why}"
             ),
-            other => panic!("an over-size batch response must not be emitted: {other:?}"),
+            other => panic!("an over-size claim must not be emitted: {other:?}"),
         }
+        // The control: the same claim under the gate still encodes, so this test
+        // cannot pass by refusing everything.
+        oversize.transports.truncate(1);
+        assert!(encode_claim(&oversize).is_ok());
     }
 
     #[test]
@@ -2494,7 +2781,7 @@ mod tests {
         #[derive(Deserialize)]
         struct Slotted {
             #[serde(deserialize_with = "deserialize_transport_slots")]
-            offers: Vec<Option<KnownTransport>>,
+            offers: Vec<OfferSlot>,
         }
         let inputs = [
             serde_json::json!({ "offers": [] }),
@@ -2512,7 +2799,14 @@ mod tests {
             let slotted: Slotted = serde_json::from_slice(&bytes).unwrap();
             assert_eq!(
                 dropped.offers,
-                slotted.offers.into_iter().flatten().collect::<Vec<_>>(),
+                slotted
+                    .offers
+                    .into_iter()
+                    .filter_map(|slot| match slot {
+                        OfferSlot::Known(offer) => Some(offer),
+                        OfferSlot::Unknown(_) => None,
+                    })
+                    .collect::<Vec<_>>(),
                 "the two decoders disagree on {input}"
             );
         }

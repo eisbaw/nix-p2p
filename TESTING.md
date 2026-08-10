@@ -998,11 +998,22 @@ described:
   infohash (per CONTENT). The response therefore carries an offer
   DICTIONARY and each `Have` names its own entries BY INDEX. Enforced at
   both boundaries: every index in range, no index repeated inside one
-  answer, and every dictionary entry referenced by at least one `Have` —
-  so an all-`Absent` response cannot carry a locator at all. Dropping an
-  unknown transport kind compacts and RE-INDEXES together, which is why
-  `BatchHoldResponse` has no derived `Deserialize`:
-  `decode_batch_hold_response` is the only way to build one from bytes.
+  answer, every dictionary entry referenced by at least one `Have`, at
+  most `MAX_OFFERS_PER_ANSWER` (4) entries per answer, and at most one
+  per transport KIND — because the content behind a key has one identity
+  per transport, so a second `bittorrent` offer on the same answer names
+  a second blob. The last two rules are what bound the dictionary against
+  what was ANSWERED. Referencing alone bounds it against the mere
+  EXISTENCE of a `Have`: one `Have` could name all 512 entries, so a 91 B
+  one-key query could be answered with 512 infohashes — 511 content
+  identities the asker never named, at ~600x wire amplification. Three
+  independent reviews measured that hole (578x, 613.8x, 557.6x) before it
+  was closed; `a_single_have_cannot_legitimise_a_pile_of_content_locators`
+  is the bite. Dropping an unknown transport kind compacts and RE-INDEXES
+  together, which is why `BatchHoldResponse` has no derived `Deserialize`:
+  `decode_batch_hold_response` is the only way to build one from bytes,
+  and `claim.rs`'s `not_deserialize` coherence proof makes re-adding the
+  derive an E0119 BUILD error rather than a silently green suite.
 - **Bounded**: `MAX_BATCH_HOLD_KEYS = 256`, chosen against the 64 KiB
   wire gate rather than beside it — measured, not estimated: a full query
   is 15 901 B, a full all-`Have` response sharing one iroh locator is

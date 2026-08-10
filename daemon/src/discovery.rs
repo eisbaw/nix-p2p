@@ -77,10 +77,10 @@ use crate::availability::AvailabilityIndex;
 use crate::claim::{
     BatchHoldAnswer, BatchHoldQuery, BatchHoldResponse, CLAIM_SCHEMA_VERSION, Claim, HoldAnswer,
     HoldQuery, HoldResponse, KnownPayload, KnownTransport, MAX_BATCH_HOLD_KEYS,
-    MAX_BATCH_HOLD_OFFERS, NarHashKey, OfferIndex, QUERY_SCHEMA_VERSION, check_batch_keys,
-    check_batch_offer_bindings, decode_batch_hold_query, decode_batch_hold_response,
-    decode_hold_query, decode_hold_response, encode_batch_hold_query, encode_batch_hold_response,
-    encode_hold_query, encode_hold_response,
+    MAX_BATCH_HOLD_OFFERS, NarHashKey, OfferIndex, QUERY_SCHEMA_VERSION, as_offer_slots,
+    check_batch_keys, check_batch_offer_bindings, decode_batch_hold_query,
+    decode_batch_hold_response, decode_hold_query, decode_hold_response, encode_batch_hold_query,
+    encode_batch_hold_response, encode_hold_query, encode_hold_response,
 };
 use crate::source::{NarKey, NarSource, SourceError, UpstreamResponse};
 use crate::transport::NodeId;
@@ -331,7 +331,7 @@ pub trait PeerQuery: Send + Sync {
             offers,
             answers,
         };
-        check_batch_offer_bindings(response.offers.len(), &response.answers)
+        check_batch_offer_bindings(&as_offer_slots(&response.offers), &response.answers)
             .map_err(|e| PeerQueryError::Codec(e.to_string()))?;
         Ok(response)
     }
