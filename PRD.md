@@ -255,25 +255,43 @@ lost, and what the winner costs. It decides the irreversibility-map entry
 
 ### The measurement that forced the decision
 
-Measured on the owner's real store (`nix path-info --json --all`):
+Measured on the owner's real store. **Corrected 2026-08-10** — the first
+version of this table used `nix path-info --all`, which counts `.drv` files.
+Those are local evaluation artifacts that cache.nixos.org does not serve, and
+they are 85.6% of all paths while holding 0.2% of the bytes, so they dragged
+the path count up ~7× and the mean NAR *down* ~6×. Re-derived directly from
+`/nix/var/nix/db/db.sqlite`:
 
 | Quantity | Value |
 |---|---|
-| Store paths | 108,401 |
-| Total NAR (NarSize, uncompressed) | 155,621 MiB ≈ 152 GiB |
-| Mean NAR | 1.44 MiB |
-| p50 / p90 / p95 / p99 | ~0 / 0.04 / 0.59 / 10.92 MiB |
+| Valid paths (all) | 85,808 |
+| — of which `.drv` | 73,412 (85.6%), only 263 MiB |
+| **Servable output paths** | **12,396** |
+| Total NAR (NarSize, uncompressed) | 105,713 MiB ≈ 103 GiB |
+| — signed by cache.nixos.org | 6,769 paths / 53,854 MiB (**50.9% of bytes**) |
+| — locally built (`ultimate`) | 2,250 paths / 35,870 MiB |
+| Mean NAR (servable) | 8.53 MiB |
+| p50 / p90 / p99 | 0.10 / 4.48 / 151.06 MiB |
 | **p100** | **3186.03 MiB** |
+| Byte concentration | top 151 paths = 73.5%, top 691 = 91.7% |
+
+Two consequences the earlier table obscured. **Half the servable bytes carry no
+upstream signature**, so under the no-enumeration rule they can never be
+*published* and stay reachable only by direct hold-query — which makes the
+batched hold-query load-bearing rather than an optimization. And the
+distribution is far more extreme than "mean 1.44 MiB" suggested: the median is
+100 KiB while 151 paths hold three quarters of all bytes.
 
 Against task-65's fitted holder cost of **2.0033 bytes of peak RSS per byte of
 uncompressed NAR** (95% CI 2.0021..2.0046, R² 1.0000, ≥5 NAR sizes):
 
-- Holding the whole store in the iroh-blobs `MemStore` would cost **~304 GiB of
-  RAM**. Disqualifying, and not by a small factor.
+- Holding the whole servable store in the iroh-blobs `MemStore` would cost
+  **~206 GiB of RAM** (~105 GiB at the post-supply-model 1.02 slope).
+  Disqualifying either way, and not by a small factor.
 - The tail is the sharper problem: **one** p100 path costs **~6.2 GiB of RAM to
-  serve** (model output, extrapolated past the 8..128 MiB fitted grid — label it
-  as such). The daemon is outside the trust base, so *any* peer can ask for the
-  largest NAR we announce.
+  serve** at the old slope (~3.2 GiB at the new one) — model output,
+  extrapolated past the 8..128 MiB fitted grid, label it as such. The daemon is
+  outside the trust base, so *any* peer can ask for the largest NAR we announce.
 
 ### The arms
 
@@ -332,8 +350,8 @@ store) as the artifact worth keeping. Rejected, for two reasons:
 
 **What IS worth persisting is the 32-byte digest, not the 620 MiB outboard.**
 Binding `NarHashKey -> (StorePath, Blake3Digest, NarSize)` on disk costs about
-40 bytes per path beyond the registration already persisted — **~4.3 MB for
-108,401 paths, 0.003% of content** — and closes cost #2 (the seeding gap)
+40 bytes per path beyond the registration already persisted — **~0.5 MB for the
+12,396 servable paths, 0.0005% of content** — and closes cost #2 (the seeding gap)
 outright, because a store path's content is immutable by Nix's own invariant, so
 the digest cannot go stale. It is deliberately NOT done in task-61/72 (the
 availability index's stated design is to persist only the source of truth, and

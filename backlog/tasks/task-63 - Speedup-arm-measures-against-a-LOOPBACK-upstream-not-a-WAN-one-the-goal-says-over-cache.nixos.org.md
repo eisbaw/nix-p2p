@@ -7,7 +7,7 @@ status: Done
 assignee:
   - '@me'
 created_date: '2026-08-09 13:26'
-updated_date: '2026-08-09 16:26'
+updated_date: '2026-08-10 09:30'
 labels: []
 dependencies: []
 ---
@@ -82,187 +82,27 @@ WORK:
 ## Implementation Notes
 
 <!-- SECTION:NOTES:BEGIN -->
-## Forward-carried from TASK-64: your arm is what decides whether the deficit matters
+## WIRE-COST CORRECTION 2026-08-10: every peer-vs-cache number in this task is invalid until TASK-99 lands
 
-TASK-64 root-caused the 3.6x. The finding hands you a specific number to test.
+MEASURED on 20 signed paths >10 MiB from the live cache.nixos.org: FileSize/NarSize = 0.278 aggregate
+(median 0.216). cache.nixos.org serves xz; our peers serve RAW nar (daemon/src/rewrite.rs rewrites
+Compression:none with FileHash=NarHash and FileSize=NarSize, asserted in daemon/tests/narinfo_rewrite.rs).
+So a peer moves ~3.6x the bytes upstream moves for the same store path, and must sustain
+>75 MB/s (604 Mbit/s) upload merely to BREAK EVEN before any discovery latency is counted. A home
+uplink is 1.25-5 MB/s. Below that threshold NO NAR size wins, and the deficit GROWS with size.
 
-The peer transport's ceiling is ~255 MB/s per connection for iroh-blobs and
-187 MB/s for the product's full fetch path (110 MiB loopback, medians,
-`just iroh-bench`). 255 MB/s is ~2.0 Gb/s. So:
+WHY THIS INVALIDATES PUBLISHED NUMBERS: every speedup figure this project has produced was measured
+against a FIXTURE upstream that also served uncompressed - task-64 added assert_unit_coincidence
+which proves file_size == nar_size for exactly the speedup attrs. So none of them include the
+asymmetry a real cache has. That includes the 6.1x WAN and 0.248 loopback figures.
 
-  * On 1 GbE (125 MB/s), Wi-Fi, or any WAN link, the LINK is the binding
-    constraint and the peer transport is nowhere near it. The 3.6x deficit
-    simply does not exist on a realistic network.
-  * The deficit only binds where the alternative source is faster than about
-    2 Gb/s - which on this testbed means exactly one thing: the loopback
-    testproxy, which does 1042 MB/s of TCP with 64 KiB writes.
+This is the FOURTH recurrence of the NarSize-vs-FileSize unit trap in this project, and this time it
+was in the orchestrator reasoning rather than in the code.
 
-So the task-42 3.6x is mostly a statement about YOUR arm being unrealistic, not
-about iroh being slow. That is the single most valuable thing your WAN-shaped
-upstream can establish, and it is worth an explicit AC: once the upstream arm is
-shaped like a real cache, REPORT whether the peer path is still slower, and by
-how much. The likely answer is that peers win, and the whole task-64 deficit
-becomes a footnote.
-
-Please also carry this into how you report: state the upstream arm's achieved
-BYTES PER SECOND next to the peer path's, so the comparison is link-vs-link.
-And note that `nix-store --realise` seconds carry unpack + sha256 NarHash +
-store registration, so a realise-rate is NOT a transport rate (that confusion is
-TASK-68).
-
-TASK-67 (parallel/striped peer fetch, 2.54x measured headroom) is deliberately
-BLOCKED on your number: if the link binds, TASK-67 should be closed as
-not-worth-it rather than implemented.
-
-## Progress: shaping landed and ASSERTED (AC#1 evidence)
-
-Route (a). Shaping injected in the TESTPROXY via its existing fault modes 1
-(per-kind added latency) and 8 (throttle_nar_bps) - the fixture is where
-environment behaviour belongs (PRD: never in the product daemon), the
-primitives were already unit-tested, and the proxy port is published to the
-host, which is what makes the shaping observable from OUTSIDE the shaper.
-Rejected: a Python TCP relay (an extra hop + CPU on the path whose throughput
-is in question), and `tc netem` (needs NET_ADMIN; not available rootless).
-
-Injected: RTT 50 ms per request (cache-info/narinfo/nar), cap 20 MiB/s in
-bytes_compressed_wire per second.
-
-MEASURED, host-side through the published proxy port, `--wan-probe-only`:
-  unshaped median request  1.115 ms   ->  shaped  51.388 ms   (recovered 50.27 ms)
-  unshaped NAR rate  1522.8 MB/s      ->  shaped  20.013 MB/s (0.954 x cap)
-The unshaped control is 72x the cap, so the measurement channel is nowhere near
-the limiter - that is the anti-vacuity half of the check, and it is asserted,
-not assumed.
-
-BITE PROVEN BY LIVE MUTATION. `UpstreamShaping.fault_params()` was temporarily
-made to return "" (shaping configured but never armed) and the same probe rerun:
-  recovered RTT 0.03 ms, shaped rate 3055.2 MB/s (145.7 x cap)
-  -> exit 1 with two NAMED violations:
-     "injected RTT NOT recovered: ... 0.0 ms, outside [40.0, 80.0] ms"
-     "injected bandwidth cap NOT achieved: ... outside [14680064, 23068672]"
-Mutation reverted; self-test ALL PASS afterwards.
-
-The pure `shaping_violations` is additionally mutation-proven in --self-test
-(shaped==unshaped, cap-only failure, slow-channel vacuity, slow-unshaped-latency
-vacuity, missing measurement).
-
-## RESULT: the ranking flips. `just profile` rc=0, usable=True
-
-Full run, defaults (swarm 1,2,4,8,16 x3 replicates; 10 runs x 2 arms x 2
-upstream conditions; workload lib + big = 110 MiB, `Compression: none`):
-
-  loopback_control (~0 RTT, unshaped - the CONTROL, kept deliberately)
-      peers-off 0.1915 s (sd 0.0376, p95 0.2388)
-      peers-on  0.6446 s (sd 0.0774, p95 0.6981)
-      speedup 0.297 (peers 3.4x SLOWER); observed range 0.196-0.549
-      upstream link rate 977.8 MB/s (wire)
-  wan_shaped (50 ms/request, 20 MiB/s wire cap, both ASSERTED)
-      peers-off 5.9189 s (sd 0.0303, p95 5.9642)
-      peers-on  0.6255 s (sd 0.0850, p95 0.7243)
-      speedup 9.46 (peers 9.5x FASTER); observed range 7.86-13.47
-      upstream link rate 19.9 MB/s (wire)
-  egress offload = 1.00 in BOTH conditions. RANKING FLIPPED = True.
-  PINNED task-42 control (0.562 / 0.159 / 0.283) reproduces within noise.
-
-Swarm axis unchanged and still green: 15/15 valid, per-peer VmHWM 19.8-21.8 MiB
-flat, swarm total O(n) R^2=0.9981, no red flags.
-
-ANSWER TO TASK-64's FORWARD-CARRIED QUESTION: the 3.5x peer deficit is a
-property of the upstream, not of the peer transport. It only binds against an
-alternative source faster than ~2 Gb/s, which on this testbed is exactly one
-machine. Against a 20 MiB/s upstream the peer path runs ~9x the link and the
-LINK binds first. Carried to TASK-67 with the recommendation to close it.
-
-## GOTCHAS AND REJECTED APPROACHES (feed-forward)
-
-* Route (b) - fronting the real cache.nixos.org - NOT built, as directed. It
-  needs TASK-22 + TASK-24 and is rate-limit-sensitive. Keep it as a spot-check.
-* REJECTED: a Python TCP relay between daemon and testproxy. It adds a hop and
-  CPU to the exact path whose throughput is under measurement, and would have to
-  re-implement pacing the testproxy already does.
-* REJECTED: `tc netem`. Needs NET_ADMIN; rootless podman does not have it. This
-  is also why the PEER link could not be shaped -> TASK-70.
-* The shaper is a SERVICE-LATENCY + EGRESS-RATE shaper, not a link emulator: one
-  delay per REQUEST plus body pacing. No slow start, no
-  receive-window-over-RTT ceiling, so the bandwidth-delay product is absent BY
-  CONSTRUCTION and the WAN arm still flatters the upstream. TASK-64's point that
-  WAN is window-over-RTT bound is therefore only PARTLY exercised.
-* The bandwidth cap is in bytes_compressed_wire per second. It coincides with
-  NarSize only because the speedup payloads are `Compression: none` and
-  `assert_unit_coincidence` CHECKS it. Add a compressed payload and the cap and
-  any NarSize rate stop being the same number.
-* The daemon's narinfo disk cache is on in both arms, so the injected
-  per-request RTT is paid in full only on a pod's first run. Realistic, but it
-  means the RTT knob moves the WAN result far less than the bandwidth knob does.
-* `prewarm_upstream_cache` was added to EVERY speedup pod in EVERY condition on
-  purpose: the WAN condition has to probe the proxy anyway, so probing only
-  there would have left the WAN arm warm and the CONTROL cold - a confound that
-  DIFFERS between the two things being compared, which is worse than one present
-  in both.
-* Timeouts were checked, not assumed: 110 MiB at 20 MiB/s is ~5.9 s, well inside
-  FETCH_TIMEOUT 60 s, and the pacing sleeps every 64 KiB so BODY_IDLE_TIMEOUT
-  10 s is never approached. The arm is not sitting on a timeout ceiling.
-* `--wan-probe-only` exists precisely so the shaping oracle can be re-proven in
-  ~40 s instead of ~30 minutes. Use it after touching the shaping.
-
-## REVIEW ROUND (mped-architect + qa-test-runner) - what it found, all fixed
-
-The reviewers found two HIGH findings that were real holes in the oracle, not
-presentation. Recording them because both are reusable lessons.
-
-1. A FAILED CONDITION DISCARDED THE ONE THAT SUCCEEDED. `run_speedup_arms`
-   raises on an unverified shaper; `run_speedup_conditions` had no per-condition
-   guard, so a WAN failure unwound the loop and threw away ten minutes of valid
-   loopback CONTROL runs. Tell: every downstream consumer already handled a
-   non-ran condition and NOTHING at runtime could produce that shape - only the
-   self-test could. Dead handling code for a state the producer cannot reach is
-   a reliable smell that the producer is wrong.
-2. THE SHAPING WAS JUDGED IN THE WRONG PLACE, TWICE. Verified once, at pod
-   creation, on the HOST->proxy path - then 20 runs were scored on the IN-POD
-   daemon->proxy path with nothing re-checking. Fixed by judging each probe at
-   probe time AND adding a second, independent assertion over the SCORED runs'
-   own link rate at the cache boundary (data the report already carried). That
-   is the transferable lesson: an oracle beside the measurement is weaker than
-   an oracle over it.
-
-MOST VALUABLE FINDING, and it was mine-plus-theirs: the probe only ever observed
-the NARINFO latency. `latency_nar_ms` was armed on the arm's DOMINANT request
-and never looked at. Proven by live mutation: drop `latency_nar_ms` from the
-query string and the cap still fires (0.96x) and the narinfo RTT is still
-recovered - the round-1 checker went GREEN on a half-armed shaper. The fix
-measures NAR time-to-first-byte and checks per request KIND; the same mutation
-now exits 1 naming the NAR. A per-knob oracle must observe EVERY knob, not the
-easiest one.
-
-Also fixed: prewarm warmed only `big` while claiming to warm the workload;
-`ranking_flipped: false` was emitted when fewer than two conditions produced a
-number (now null); the human-summary gate's verdict never reached the persisted
-JSON (the artifact said compliant:true while the process exited 1); the JSON
-gate read only KEYS while the summary gate read TEXT, so "peers measured 3.5x
-SLOWER" in a prose field passed one and would have been rejected verbatim by the
-other; "any peer advantage this shows is a lower bound" was an OVERCLAIM (see
-below); ~758 MB/s was quoted five times as the loopback link rate when it was
-task-42's REALISE rate (the TASK-68 confusion), measured link rate is ~1073
-MB/s; the self-test hand-rolled its own condition block, already four keys
-adrift, so the gates were proven against a shape the real run does not produce.
-
-## THE OVERCLAIM, kept visible because it is the kind that recurs
-
-"Both knobs are upstream-favourable, so any peer advantage is a lower bound" is
-FALSE as stated. The knob VALUES are upstream-favourable; the MODEL is not
-uniformly so. The delay is charged per REQUEST and a real client on a reused
-keep-alive connection does not pay a fresh round trip for each one - ~5 x 50 ms
-= ~0.25 s of a 5.92 s peers-off realise, about 4%, in the upstream's disfavour.
-Only the PEER-side bound is clean (peer arm unshaped => upper bound on the peer
-side). `shaping_fidelity.bias_directions` now lists both signs and magnitudes.
-
-## AND THE ONE ABOUT THE HEADLINE NUMBER
-
-With the peer arm unshaped, `latency_speedup_mean_wan_shaped` is approximately
-(peer-path rate / cap). Its MAGNITUDE is therefore linear in a knob, sampled at
-exactly one cap. The FLIP is robust - it happens anywhere below ~187 MB/s - but
-9.27x is not a property of the system alone. Do not quote it as one. Sweeping
-the cap is TASK-44's crossover curve; `--wan-bandwidth-mib-s` exists for it.
+FIX AND ORDER: TASK-94 measures the inequality; TASK-99 fixes it by compressing the LINK (not the
+content - the addressed unit must stay BLAKE3(raw nar) or peers compressing with different settings
+produce different blob ids and lose all sharing). Do not re-derive any policy threshold, speedup, or
+peer-vs-upstream ranking from this task until TASK-99 has landed and TASK-99 AC#4 has re-measured.
 <!-- SECTION:NOTES:END -->
 
 ## Final Summary

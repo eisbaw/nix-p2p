@@ -4,7 +4,7 @@ title: Set-digest exchange (Bloom/GCS) so most content lookups need ZERO round t
 status: To Do
 assignee: []
 created_date: '2026-08-10 07:24'
-updated_date: '2026-08-10 07:24'
+updated_date: '2026-08-10 09:29'
 labels:
   - wave-2b
 dependencies:
@@ -32,3 +32,36 @@ Note this also gives leech mode (TASK-78) a precise meaning: publish no digest.
 - [ ] #3 False-positive cost is measured as wasted dials per lookup and reported; the rate is tuned against that cost, not guessed
 - [ ] #4 Digest staleness is handled: a hash absent from a stale digest must still be reachable via the batched hold-query path, so the digest is strictly an accelerant and never the authority
 <!-- AC:END -->
+
+## Implementation Notes
+
+<!-- SECTION:NOTES:BEGIN -->
+## CENSUS CORRECTION 2026-08-10 (re-derived by the orchestrator from /nix/var/nix/db/db.sqlite)
+
+Any figure in this task quoting 108,401 paths / 155,621 MiB / "mean NAR 1.44 MiB" is WRONG and must
+not be used. The original numbers came from `nix path-info --all`, which counts .drv files. Those are
+local evaluation artifacts cache.nixos.org does not serve; they are 85.6% of all paths while holding
+0.2% of the bytes, so they inflated the path count ~7x and deflated the mean NAR ~6x.
+
+AUTHORITATIVE (measured 2026-08-10, independently re-derived - not taken from a subagent report):
+  valid paths                85,808
+    .drv                     73,412 (85.6%), only 263 MiB   <- never publish these: useless AND a privacy leak
+    SERVABLE output paths    12,396, 105,713 MiB
+      signed by cache.nixos.org   6,769 paths / 53,854 MiB = 50.9% of bytes
+      locally built (ultimate)    2,250 paths / 35,870 MiB
+  size distribution (servable): mean 8.53 MiB, p50 0.10 MiB, p90 4.48 MiB, p99 151.06 MiB, p100 3186.03 MiB
+  byte concentration: top 151 paths = 73.5% of bytes, top 691 = 91.7%, top 1,243 = 95.5%
+
+THREE CONSEQUENCES that change reasoning, not just arithmetic:
+1. The publishable set (signed, hence already-public) is ~6,769 paths, not 108,401 - a ~16x reduction.
+   Every per-path cost model shrinks by that factor.
+2. HALF THE SERVABLE BYTES (49.1%) carry no upstream signature and therefore can NEVER be published
+   under the no-enumeration rule. They stay reachable only by direct hold-query, which makes TASK-91
+   (batched hold-query) load-bearing rather than an optimization.
+3. The distribution is far more extreme than "mean 1.44 MiB" implied: the MEDIAN is 100 KiB (~5 ms
+   from a 21 MB/s upstream) while 151 paths hold three quarters of all bytes. Any claim that a
+   discovery round trip amortises against a download must be checked against the MEDIAN, not the mean.
+
+Note also 1.44 MiB was a MEAN misdescribed as a median in places; the servable mean is 8.53 MiB.
+Canonical source of truth going forward: TASK-95 (reproducible store census).
+<!-- SECTION:NOTES:END -->

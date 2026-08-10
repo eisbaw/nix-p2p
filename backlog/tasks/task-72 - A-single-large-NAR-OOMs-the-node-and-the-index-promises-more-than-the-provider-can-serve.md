@@ -7,7 +7,7 @@ status: Done
 assignee:
   - '@me'
 created_date: '2026-08-09 17:45'
-updated_date: '2026-08-09 23:21'
+updated_date: '2026-08-10 09:29'
 labels: []
 dependencies:
   - TASK-65
@@ -47,187 +47,34 @@ Both gaps have the same root: the provider has no on-demand supply path. The fix
 ## Implementation Notes
 
 <!-- SECTION:NOTES:BEGIN -->
-## Progress: implementation landed (d83dd97) + two follow-up defects found by self-review
+## CENSUS CORRECTION 2026-08-10 (re-derived by the orchestrator from /nix/var/nix/db/db.sqlite)
 
-WHAT SHIPPED
-  * NarSupplier seam + FileNarSupplier (the daemon's --iroh-seed-nar path) +
-    IndexNarSupplier (AvailabilityIndex -> nix-store --dump).
-  * Blake3Digest::stream_raw_nar - the frozen recipe over a byte STREAM in 64 KiB
-    slices, so announcing a 3 GiB path costs 64 KiB of peak allocation. Unit test
-    asserts it equals the one-shot recipe across the chunk boundary.
-  * ServeBudget + the admission gate on iroh-blobs RequestMode::InterceptLog. The
-    verdict is answered BEFORE handle_get_impl touches the store (upstream:
-    handle_get calls get_request first; EventSender::request does rx.await??), so
-    the bound is checked before anything is produced.
-  * StoreRetention::ReleaseAfterServe - hold only the in-flight serve.
-  * Single flight via tokio::sync::watch (state, not just an edge, so a late
-    follower cannot miss the wakeup and hang).
-  * availability.rs: DerivedNar {blake3, nar_size} from ONE dump; a by_digest
-    reverse map populated by hold(); supply_size/supply_raw_nar as per-digest
-    probes only.
+Any figure in this task quoting 108,401 paths / 155,621 MiB / "mean NAR 1.44 MiB" is WRONG and must
+not be used. The original numbers came from `nix path-info --all`, which counts .drv files. Those are
+local evaluation artifacts cache.nixos.org does not serve; they are 85.6% of all paths while holding
+0.2% of the bytes, so they inflated the path count ~7x and deflated the mean NAR ~6x.
 
-TWO DEFECTS I INTRODUCED AND THEN FOUND BY SELF-REVIEW - recording them because
-both are the kind that pass every test until they do not:
-  1. ReleaseOnRequest and ReleaseAfterServe shared one arming flag, so a completed
-     serve silently released a store whose documented contract is 'hold everything
-     until release_all'. Fixed with an explicit release_after_serve flag and a
-     regression test proven by mutation (M7).
-  2. The Reservation::Ready path took no TempTag, so a blob that was resident at
-     admission could be swept by a run already past its protect callback. Now
-     re-checked and re-materialised under a releasing retention only.
+AUTHORITATIVE (measured 2026-08-10, independently re-derived - not taken from a subagent report):
+  valid paths                85,808
+    .drv                     73,412 (85.6%), only 263 MiB   <- never publish these: useless AND a privacy leak
+    SERVABLE output paths    12,396, 105,713 MiB
+      signed by cache.nixos.org   6,769 paths / 53,854 MiB = 50.9% of bytes
+      locally built (ultimate)    2,250 paths / 35,870 MiB
+  size distribution (servable): mean 8.53 MiB, p50 0.10 MiB, p90 4.48 MiB, p99 151.06 MiB, p100 3186.03 MiB
+  byte concentration: top 151 paths = 73.5% of bytes, top 691 = 91.7%, top 1,243 = 95.5%
 
-## MUTATION SWEEP - every oracle broken, watched go red on a NAMED check, restored
+THREE CONSEQUENCES that change reasoning, not just arithmetic:
+1. The publishable set (signed, hence already-public) is ~6,769 paths, not 108,401 - a ~16x reduction.
+   Every per-path cost model shrinks by that factor.
+2. HALF THE SERVABLE BYTES (49.1%) carry no upstream signature and therefore can NEVER be published
+   under the no-enumeration rule. They stay reachable only by direct hold-query, which makes TASK-91
+   (batched hold-query) load-bearing rather than an optimization.
+3. The distribution is far more extreme than "mean 1.44 MiB" implied: the MEDIAN is 100 KiB (~5 ms
+   from a 21 MB/s upstream) while 151 paths hold three quarters of all bytes. Any claim that a
+   discovery round trip amortises against a download must be checked against the MEDIAN, not the mean.
 
-  M1 per-NAR bound removed from reserve()        -> declined_too_large 1 -> 0
-     (NOTE: the request was still refused, as declined_busy. A test asserting only
-     'the fetch failed' would have PASSED. The reason-specific assertion is what
-     makes this bite.)
-  M2 admission produces bytes before deciding    -> supplier calls 0 -> 1
-  M3 single flight removed                       -> regenerations 1 -> 8
-  M4 post-serve sweep never armed                -> residency 0 -> 67,108,976 B
-  M5 supply drops the materialisation check      -> None -> Some(2,097,264) for a GC'd path
-  M6 unknown digest admitted not declined        -> declined_unknown 1 -> 0, admitted 0 -> 1
-  M7 the two releasing retentions collapsed      -> ReleaseOnRequest released after a serve
-
-MEASURED, in-process (the AC#1/AC#4 bite):
-  NAR 67,108,976 B, per-NAR bound 16,777,216 B
-  BOUNDED   -> declined, supplier calls 0, VmHWM rise      581,632 B (0.87% of the NAR)
-  UNBOUNDED -> served,   supplier calls 1, VmHWM rise 137,904,128 B (2.055x the NAR)
-The 2.055x is task-65's 2.0033 slope arriving on cue, which is a useful check that
-the mutated arm really did reproduce the old behaviour.
-
-ORACLE DISCIPLINE: VmHWM is used ONLY for 'did we allocate' (monotone, so it
-cannot miss an allocation). Every release claim is on IROH-STORE-RESIDENT /
-store_residency(). Stated in the test file's module docs.
-
-## Architecture review (mped-architect) found TWO remotely-triggerable defects the tests did not cover
-
-Recorded in full: both defeated the property this task claims, and both were
-invisible to a suite that only ran the happy configuration.
-
-S1 - PERMANENT BUDGET EXHAUSTION BY HANGING UP. The reservation was released where
-the transfer's update stream ended, and an early return skipped it when the verdict
-could not be delivered - which is what happens when the peer disconnects, across a
-window spanning the whole regeneration. Now an RAII guard (five release sites -> one).
-
-  MEASURED WHILE WRITING THE ORACLE, and worth carrying forward: when a peer
-  vanishes the provider's update stream does NOT end. The connection stays live
-  from our side until QUIC's idle timeout, and nothing at our layer distinguishes
-  an abandoned peer from a slow one. So a SERVE DEADLINE is the bound that actually
-  does the work: --iroh-max-serve-duration-ms, default 120 s, PROVISIONAL. Too long
-  and abandoned requests hold the budget; too short and a slow peer loses a real
-  transfer. Deriving it from a minimum-throughput policy is task-44's territory.
-
-S2 - 'HOLDS NOTHING AT REST' HELD ONLY WHEN IDLE. The protect callback ABORTED the
-sweep whenever anything was in flight, so under sustained traffic nothing was ever
-collected; a MemStore has no capacity of its own, so resident bytes would grow to
-the whole announced corpus while the budget bounded only concurrently-ADMITTED
-bytes. ONE SLOW READER is enough. The callback now PROTECTS in-flight hashes
-instead of refusing to run - safer (the hash is registered before the add) and
-stronger. This also supersedes the task-65 warning that a background evictor was
-not a policy option: it is, once the protect callback is used for protection.
-
-Smaller, all fixed: produced bytes reconciled against the CAP not the RESERVATION;
-the Ready re-check gated on the caller's own status read (skipping it for the
-caller with the freshest evidence of absence); by_digest never pruned, so supply
-outgrew hold - AC#2 failing in the direction that matters; a FAILED store query
-reported as 'we do not have it', which this module's own docs forbid; declines
-dropping the cause string; a supplier PANIC indistinguishable from a missing file;
-two booleans projected from one enum.
-
-## THE MUTATION SWEEP CAUGHT TWO VACUOUS ORACLES OF MY OWN
-
-This is the reason to run it, and it is the third cycle in a row this project has
-shipped a vacuous oracle - so the pattern is worth naming rather than the instance.
-
-  1. The collector test served its NAR BEFORE anything was in flight, so the
-     collector got a quiet moment and the test passed under the broken callback
-     too. ORDER was the whole experiment and I had it backwards.
-  2. Its 'ceiling' allowed one in-flight serve's worth of residency - but the
-     blocked serve is stuck INSIDE its supplier, so it occupies no store bytes at
-     all and the ceiling could never be exceeded. A ceiling that cannot be exceeded
-     is not a ceiling.
-
-Also: a mutation patch that FAILS TO APPLY looks exactly like a passing oracle. One
-of mine did (a string that had changed), and all three tests in that batch 'passed'
-against unmutated code. Every patch now asserts it applied before the test runs.
-
-And: an unbounded spin in a spawn_blocking supplier makes a FAILING test hang
-forever, because dropping a tokio runtime waits for blocking tasks.
-
-## FULL MUTATION LEDGER (each broken, watched go red on a NAMED check, restored)
-
-  M1 per-NAR bound removed              -> declined_too_large 1 -> 0 (still refused as
-     busy, so a test asserting only 'it failed' would have PASSED)
-  M2 admission produces bytes first     -> supplier calls 0 -> 1
-  M3 single flight removed              -> regenerations 1 -> 8
-  M4 post-serve sweep never armed       -> residency 0 -> 67,108,976 B
-  M5 supply drops the exists() check    -> None -> Some(2,097,264) for a GC'd path
-  M6 unknown digest admitted            -> declined_unknown 1 -> 0, admitted 0 -> 1
-  M7 the two releasing retentions merged-> ReleaseOnRequest released after a serve
-  M8 serve deadline removed             -> honest peer still refused after 20 s
-  M9 collector aborts while in flight   -> store still holding 4,194,416 B
-  M10 produced size vs cap not reservation -> a 4 MiB body admitted on a 1 KiB
-     reservation
-
-## AC#4 INSTRUMENT CHANGED, and the reason is a measurement
-
-VmHWM is a high-water mark over the whole PROCESS and cargo runs these tests as
-threads of one, so once any test allocated 64 MiB the next identical allocation
-produced NO RISE - the assertion failed on correct code (measured: 8,359,936 B of
-rise for a 67,108,976 B NAR that really was allocated). It now reads VmRSS WHILE
-THE PAYLOAD IS LIVE: sound in that one direction (live touched pages are resident
-by definition), and stated to be unsound in the other, where store residency is
-used instead.
-
-  BOUNDED   -> declined, supplier calls 0, VmRSS rise         720,896 B
-  UNBOUNDED -> served 67,108,976 B, supplier calls 1, VmRSS rise 156,946,432 B
-
-## AC#3 measured: the residency oracle, fitted, before and after
-
-  size.holder_store_resident_bytes_uncompressed_nar (IROH-STORE-RESIDENT, asked of
-  the blob store - NOT peak RSS, which is monotone and cannot observe a release)
-    BEFORE  slope 1.000000 [1.000000 .. 1.000000], resident_over_seeded_ratio 1.0
-    AFTER   slope 0.000000,                        resident_over_seeded_ratio 0.0
-
-  size.holder_rss_hwm_bytes_ram (peak RSS, the memory the node actually costs)
-    BEFORE  2.004426 [2.000129 .. 2.008723] R2 0.999987
-    AFTER   1.020232 [1.009284 .. 1.031180] R2 0.999679   <- DISJOINT intervals
-
-  size.fetcher_rss_hwm_bytes_ram (CONTROL - TASK-62's territory, untouched)
-    BEFORE  1.018814 [1.009204 .. 1.028424]
-    AFTER   1.018838 [1.007846 .. 1.029831]
-
-15/15 valid points in both runs (5 sizes x 3 replicates), honesty compliant, 0 red
-flags, size_axis_usable true. Both runs exit 1 for the SAME reason - --swarm 1
-leaves the swarm axis with one distinct n, below scalefit's MIN_POINTS, so the
-whole report is marked unusable-for-quoting. That verdict is about the swarm axis;
-run a full profile before quoting anything but these size-axis slopes.
-
-## Why AC#2 is checked, stated plainly so it can be argued with
-
-The AC allows two ways to pass: the sets are IDENTICAL, or the difference is
-EXPLICIT AND TESTED with no dial-then-fail. Both branches are satisfied, at
-different levels, and it matters which is which:
-
-  * WHERE BOTH SETS EXIST IN ONE PROCESS (AvailabilityIndex + IndexNarSupplier +
-    IrohProvider) they are IDENTICAL, proven in both directions by mutation: a
-    positive hold-answer implies a servable blob, and a GC'd path leaves hold and
-    supply at the same instant (M5), and an un-registered path is pruned from
-    supply too.
-  * IN THE SHIPPED DAEMON the sets are also identical, but the set is smaller than
-    the ambition: it is the --iroh-seed-nar files, not /nix/store. That difference
-    is explicit (task-83) and is not a dial-then-fail - it is 'this node never
-    announced that'.
-  * ACROSS A RESTART the binding is lost and a stale claim gets
-    ServeDecline::Unknown - a NAMED, counted, immediate refusal that falls back to
-    upstream, not a hung dial or a truncated stream. Explicit, tested (M6), filed
-    (task-82).
-
-WHAT WOULD MAKE THIS WRONG: if the daemon ever answers hold-queries over the wire
-(task-73) while supplying from a different set, this AC silently regresses. The
-equality lives in AvailabilityIndex::hold and supply_size, and both must stay the
-only producers of a yes.
+Note also 1.44 MiB was a MEAN misdescribed as a median in places; the servable mean is 8.53 MiB.
+Canonical source of truth going forward: TASK-95 (reproducible store census).
 <!-- SECTION:NOTES:END -->
 
 ## Final Summary

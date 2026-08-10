@@ -4,6 +4,7 @@ title: 'The PEER link is still loopback: every peer-advantage number is an upper
 status: To Do
 assignee: []
 created_date: '2026-08-09 15:35'
+updated_date: '2026-08-10 09:29'
 labels:
   - measurement
   - finding
@@ -26,3 +27,29 @@ FOUND BY TASK-63. Task-63 shaped the UPSTREAM arm (per-request RTT + NAR egress 
 - [ ] #3 The wan_shaped speedup is re-stated with BOTH sides shaped, next to the peer-loopback number, and the report says which of the two is the upper bound
 - [ ] #4 Honest limit recorded: what the chosen route still does not model (loss, jitter, competing flows, NAT traversal cost)
 <!-- AC:END -->
+
+## Implementation Notes
+
+<!-- SECTION:NOTES:BEGIN -->
+## WIRE-COST CORRECTION 2026-08-10: every peer-vs-cache number in this task is invalid until TASK-99 lands
+
+MEASURED on 20 signed paths >10 MiB from the live cache.nixos.org: FileSize/NarSize = 0.278 aggregate
+(median 0.216). cache.nixos.org serves xz; our peers serve RAW nar (daemon/src/rewrite.rs rewrites
+Compression:none with FileHash=NarHash and FileSize=NarSize, asserted in daemon/tests/narinfo_rewrite.rs).
+So a peer moves ~3.6x the bytes upstream moves for the same store path, and must sustain
+>75 MB/s (604 Mbit/s) upload merely to BREAK EVEN before any discovery latency is counted. A home
+uplink is 1.25-5 MB/s. Below that threshold NO NAR size wins, and the deficit GROWS with size.
+
+WHY THIS INVALIDATES PUBLISHED NUMBERS: every speedup figure this project has produced was measured
+against a FIXTURE upstream that also served uncompressed - task-64 added assert_unit_coincidence
+which proves file_size == nar_size for exactly the speedup attrs. So none of them include the
+asymmetry a real cache has. That includes the 6.1x WAN and 0.248 loopback figures.
+
+This is the FOURTH recurrence of the NarSize-vs-FileSize unit trap in this project, and this time it
+was in the orchestrator reasoning rather than in the code.
+
+FIX AND ORDER: TASK-94 measures the inequality; TASK-99 fixes it by compressing the LINK (not the
+content - the addressed unit must stay BLAKE3(raw nar) or peers compressing with different settings
+produce different blob ids and lose all sharing). Do not re-derive any policy threshold, speedup, or
+peer-vs-upstream ranking from this task until TASK-99 has landed and TASK-99 AC#4 has re-measured.
+<!-- SECTION:NOTES:END -->
