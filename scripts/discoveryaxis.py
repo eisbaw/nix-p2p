@@ -482,11 +482,11 @@ def human_lines(block: dict) -> list[str]:
         f"it confirms the emulation, it is NOT a second result. Both arms' counts "
         f"are recovered from their own wall clocks, so a count that was not what "
         f"was timed FAILS this arm",
-        f"  honest floor, unshaped and unemulated: {low:.0f}-{high:.0f}x across "
+        f"  honest floor, unshaped and unemulated: {low:.1f}-{high:.1f}x across "
         f"{len(block['unshaped_replicates'])} replicates (single-digit ms and noisy "
         f"- run to run this has spanned roughly 4x to 12x while the round-trip "
-        f"counts did not move, so it is quoted as a RANGE and never to one "
-        f"decimal; the serial "
+        f"counts did not move, so it is quoted as a RANGE and never as a "
+        f"single number; the serial "
         f"baseline is strictly sequential across peers, i.e. the most naive one "
         f"available)",
     ]
