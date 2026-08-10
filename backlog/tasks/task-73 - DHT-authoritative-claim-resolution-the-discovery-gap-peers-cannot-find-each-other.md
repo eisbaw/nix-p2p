@@ -6,10 +6,11 @@ title: >-
 status: To Do
 assignee: []
 created_date: '2026-08-09 21:01'
-updated_date: '2026-08-09 22:09'
+updated_date: '2026-08-10 07:09'
 labels:
   - wave-2b
-dependencies: []
+dependencies:
+  - TASK-89
 ---
 
 ## Description
@@ -38,34 +39,56 @@ Honest scale caveat: TESTING.md S5 explicitly excludes emergent network effects 
 ## Implementation Notes
 
 <!-- SECTION:NOTES:BEGIN -->
-## Forward-carried from TASK-61/TASK-72: what a resolved claim now promises
+## Research 2026-08-10 (iroh docs + n0 experiments) - READ BEFORE THE SPIKE
 
-DHT resolution hands a fetcher a `Blake3Digest` + a holder `NodeId`. As of
-task-72 that digest is servable if and only if the holder's availability index
-has ANSWERED a hold-query for it in this process lifetime - `hold()` is what
-records the `BLAKE3 -> entry` binding the supply path reads back.
+THE LOAD-BEARING DISTINCTION: iroh's 'discovery' is NODE discovery (EndpointId -> relay URL +
+direct socket addrs). It is NOT content discovery. Confirmed in docs.iroh.computer/concepts/discovery:
+none of its mechanisms map a blob hash to holders. So this task is really TWO problems and they
+have different answers.
 
-TWO CONSEQUENCES FOR YOUR DESIGN, both real:
+(1) NODE DISCOVERY - essentially free, we just have it switched off.
+    iroh ships three, and daemon/src/transport_iroh.rs bind_loopback_endpoint currently binds with
+    'the relay DISABLED and NO discovery':
+      * DNS/pkarr - DEFAULT ON upstream; publishes signed records to an iroh-dns-server, resolved
+        over DNS. Infra is RUN BY n0 (a third-party dependency to declare, not decentralized).
+      * Local/mDNS-like address lookup - default OFF, no infra, LAN only. Cheap win for the
+        office/CI/home-lab case, which is also the case where the peer path actually beats a CDN.
+      * DHT address lookup - default OFF, publishes the SAME signed pkarr records to the BitTorrent
+        Mainline DHT. Crate iroh-mainline-address-lookup (0.4+), wired via Endpoint::builder.
+        Fully distributed; documented tradeoff is 'slower lookups than DNS'.
 
-1. A CLAIM OUTLIVES THE BINDING THAT MAKES IT SERVABLE. Claims persist in the
-   DHT; the reverse map is in-memory and empty after a restart. So a resolution
-   can legitimately return a holder that will decline. The decline is NAMED and
-   counted (`ServeDecline::Unknown`, `IROH-SERVE-COUNTERS declined_unknown`), not
-   an opaque mid-stream failure - use it. The permanent fix is task-82 (persist
-   the immutable digest binding, ~40 B/path); until then your resolution logic
-   must treat 'holder declines' as an ordinary outcome and try the next offer.
+(2) CONTENT DISCOVERY - the actual open problem. n0 explored it in iroh-experiments/content-discovery
+    (repo self-describes as 'very low level and unpolished'; 'most will not' graduate - do NOT depend
+    on it, but DO mine its design). Their findings, which pre-empt our spike:
+      * MAINLINE DHT CANNOT HOLD OUR RECORD, and this is the killer: the classic get_peers path
+        stores only IPv4/IPv6 + port, NOT an iroh NodeId - so a NAT'd node cannot be a provider.
+        Also 20-byte SHA1 keys vs our 32-byte BLAKE3; their workaround is 'just SHA1 hash the BLAKE3
+        hash, or take the first 20 bytes'. This is the single most important input to our FROZEN
+        'NarHash -> DHT key derivation' decision, and it argues that plain mainline get_peers is the
+        WRONG substrate for holder records. BEP44 mutable/immutable items are the alternative to
+        evaluate (they carry arbitrary signed payloads) - the spike must compare get_peers vs BEP44
+        explicitly, not treat 'mainline' as one option.
+      * TRACKER: a small server holding 'a set of signed node ids for each piece of content'; announce
+        by hash or ticket, query by hash / ticket / hash+format. n0's recommended hybrid is to use the
+        mainline DHT to FIND TRACKERS rather than to store content locations.
+      * A tracker is far less dangerous for US than for most projects: our daemon and peers sit OUTSIDE
+        the trust base and nix re-verifies sig+NarHash, so a tracker is a HINT PROVIDER, not an
+        authority. A lying tracker costs a wasted dial, never a bad store path. Weigh it accordingly
+        instead of rejecting it reflexively for being a server.
+      * ANTI-SPAM BY PROBE (steal this - see TASK-90): before trusting an announce, their tracker
+        downloads a RANDOM 2 KiB blake3 chunk from the announcer and verifies it; for partial content
+        it asks only for unverified size; for hash sequences it probes a random chunk of a random
+        child. bao lets us verify any chunk against the root, so this is cheap and directly applicable.
+      * GOSSIP: iroh-gossip is epidemic broadcast trees (HyParView + PlumTree) over topics - what
+        Delta Chat uses. Ecosystem prior art worth reading: distributed-topic-tracker ('auto discovery,
+        no servers') and iroh-gossip-discovery. Feeds TASK-74.
 
-2. A HOLDER CAN NOW ALSO DECLINE FOR CAPACITY, not only for absence. A serve
-   larger than `--iroh-max-serve-nar-bytes` (default 256 MiB) or arriving when
-   `--iroh-max-inflight-nar-bytes` (default 1 GiB) is exhausted is refused with
-   `AbortReason::RateLimited` (busy) rather than `Permission`. Those are different
-   findings: 'not from me, ever' vs 'try later'. If discovery caches negative
-   results, do NOT cache a busy the way you cache an unknown, or a momentarily
-   loaded peer disappears from the swarm for the cache TTL.
+(3) PRIVACY TENSION WE HAVE NOT RECORDED ANYWHERE. Our no-enumeration rule (owner, phase 1) stops a
+    peer LISTING what we hold. But ANNOUNCING to a public tracker or a global DHT publishes exactly
+    that, at internet scale and durably. Announce-on-demand + bounded yes/no probing is privacy-
+    preserving; DHT/tracker announce is not. The spike must state, per option, what it leaks. This
+    also bears on TASK-77 (announce-after-fetch) and TASK-78 (leech mode).
 
-3. NO ENUMERATION, still. The supply path added a reverse index but exposes only
-   per-digest probes (`supply_size`/`supply_raw_nar`, both private-by-shape:
-   nothing returns the map, its keys or its length). Whatever wire endpoint you
-   add for peer yes/no queries must keep that. It is an owner constraint from
-   phase 1 and it is easy to regress while adding a lookup.
+Sources: docs.iroh.computer/concepts/discovery, docs.iroh.computer/connecting/dht-discovery,
+iroh.computer/blog/iroh-content-discovery, github.com/n0-computer/iroh-experiments.
 <!-- SECTION:NOTES:END -->

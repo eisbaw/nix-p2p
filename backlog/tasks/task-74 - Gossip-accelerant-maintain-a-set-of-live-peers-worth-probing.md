@@ -4,11 +4,12 @@ title: 'Gossip accelerant: maintain a set of live peers worth probing'
 status: To Do
 assignee: []
 created_date: '2026-08-09 21:01'
-updated_date: '2026-08-09 21:02'
+updated_date: '2026-08-10 07:09'
 labels:
   - wave-2b
 dependencies:
   - TASK-73
+  - TASK-90
 ---
 
 ## Description
