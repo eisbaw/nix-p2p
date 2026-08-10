@@ -71,8 +71,8 @@ Measured on the container testbed (single host, so read the caveats):
 | Measurement | Result |
 |---|---|
 | Upstream NAR-payload egress offloaded | **1.00**, both conditions — but see below |
-| vs. a WAN-shaped upstream (50 ms RTT, 20 MiB/s) | peer path **6.1× faster** |
-| vs. a zero-latency loopback upstream | peer path **4.0× slower** |
+| vs. a WAN-shaped upstream (50 ms RTT, 20 MiB/s) | peer path 6.1× faster — **withdrawn, see below** |
+| vs. a zero-latency loopback upstream | peer path 4.0× slower — **withdrawn, see below** |
 | Holder RAM per byte served | **1.018 B/B** [1.007 .. 1.028] |
 | Holder RAM held per byte *announced*, at rest | **0.00** |
 | Holder RAM per concurrent serve | **38.4 MB** [38.0 .. 38.8] |
@@ -90,11 +90,23 @@ offload is ~0. What a real swarm achieves is a curve between those, and this
 project has not measured it (tasks 87/88). Announce-after-fetch, the mechanism
 that would let a swarm warm up at all, is not implemented either (task 77).
 
-The two speedup figures are the same system against different upstreams — the
-ranking flips, so neither is quotable alone, and the magnitude is roughly peer
-rate ÷ bandwidth cap, sampled at one cap. The *flip* is the robust part, not
-the number. Both are means over 10 runs; the WAN condition's observed runs span
-5.3–8.3×.
+**Both speedup figures are withdrawn.** They were measured against a fixture
+upstream that serves NAR data *uncompressed*, exactly as our peers do. The real
+cache.nixos.org serves xz: measured on 20 signed paths over 10 MiB from the live
+cache, `FileSize/NarSize` is **0.278** (median 0.216). A peer therefore moves
+about **3.6× the bytes** upstream moves for the same store path, and would need
+to sustain roughly **75 MB/s (604 Mbit/s) upload just to break even** — before
+any discovery cost. A home uplink is 1.25–5 MB/s.
+
+So the honest position on speed is: **unknown, and probably unfavourable for a
+remote peer until the peer link is compressed.** The fix does not touch anything
+frozen (compression is an unsigned transport field, and the addressed unit stays
+the raw NAR), it just has not been built yet. The numbers above will be
+re-measured against a compressed upstream once it is.
+
+What survives unchanged is the offload result, which does not depend on relative
+speed — and the observation that the *ranking* between the two conditions flips,
+which is why no single speedup number was ever quotable alone.
 
 The supply model **cost latency to buy the memory guarantee**: regenerating a
 NAR per serve moved peers-on from 0.638 s to 0.964 s under WAN shaping (6.1×
