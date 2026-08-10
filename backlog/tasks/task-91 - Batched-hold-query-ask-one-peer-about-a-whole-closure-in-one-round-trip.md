@@ -5,7 +5,7 @@ status: Done
 assignee:
   - '@me'
 created_date: '2026-08-10 07:23'
-updated_date: '2026-08-10 17:09'
+updated_date: '2026-08-10 17:11'
 labels:
   - wave-2b
 dependencies:
@@ -73,87 +73,31 @@ TIMING OPPORTUNITY worth taking here: the daemon knows every NarHash the moment 
 ## Implementation Notes
 
 <!-- SECTION:NOTES:BEGIN -->
-## ROUND-7 FIX LANDED (implementer). A CODEX RE-GATE IS REQUIRED - I DO NOT SELF-CERTIFY.
+## ORCHESTRATOR RULING on the round-7 freeze question (implementer correctly escalated rather than deciding alone)
 
-Commits: c5daf6f (offer-dictionary bound), 9a4cecd (discovery oracle), 32f8d2c
-(no-enumeration guard), 8de9d12 (must-REJECT golden class + sibling strictness),
-cf06e45 (doc drifts + citation gate), a15bd3f (floor formatting).
-Full evidence in `git notes --ref=verification show a15bd3f`.
+QUESTION: deny_unknown_fields on KnownTransport/KnownPayload tightens what the FROZEN Claim.transports
+and HoldAnswer::Have.offers ACCEPT - a v1 wire carrying an extra field inside a KNOWN transport no
+longer decodes. Nothing emitted changes; unknown transport KINDS are still tolerated and dropped.
 
-THE HEADLINE NUMBER. One-key wire amplification 613.8x -> 4.0x. Three reviewers
-measured the same unfixed bound three ways (578x / 613.8x / 557.6x); a 91 B
-query can now elicit at most a 366 B response carrying at most ONE content
-identity.
+RULING: APPROVED. Reasoning, in order of weight:
+1. IT ALIGNS THE CODE WITH THE RULE THE FILE ALREADY DOCUMENTS. The established, written contract is
+   'unknown-kind tolerated-but-inert, malformed-known errors'. A known kind carrying an unexpected
+   field IS malformed-known. The code was not implementing its own stated policy; this closes that
+   gap rather than inventing a new policy.
+2. FORWARD COMPATIBILITY IS PRESERVED WHERE IT MATTERS. Unknown transport kinds still decode inertly,
+   so a future transport still ships without a wire break. Only unknown FIELDS inside a kind we claim
+   to understand are refused - which is precisely the surface the smuggling attacks used.
+3. IT CLOSES A CLASS THREE REVIEWERS INDEPENDENTLY FLAGGED. codex demonstrated a 60,489 B dictionary
+   entry carrying also_held, blake3 and a 60 KB pad decoding successfully through exactly this gap.
+4. NO DEPLOYED PEERS EXIST. There is no released network to break; the cost of tightening is zero
+   today and rises monotonically from here. Tightening later is a real break; tightening now is not.
+This is recorded as a DELIBERATE FREEZE AMENDMENT, not an oversight: the accept-set narrowed, the
+emit-set did not. Anyone auditing the freeze later should find this note rather than infer a slip.
 
-1. AC#4 WAS NOT MET AND NOW IS. "Every dictionary entry is referenced by at
-   least one Have" bounds the dictionary against the EXISTENCE of a Have, not
-   against what was ANSWERED - one Have could name all 512 entries, so a one-key
-   question could be answered with 511 BitTorrent infohashes, which ARE content
-   identities. Closed by two semantic rules: at most MAX_OFFERS_PER_ANSWER (4)
-   offers per answer, and at most ONE per transport KIND (the content behind a
-   key has one identity per transport). The arithmetic bound
-   `offers.len() <= have_count * 4` is now a THEOREM of those, and the explicit
-   check for it was REMOVED after mutation showed it and the per-answer cap were
-   masking each other.
-
-2. AC#3's INSTRUMENT COULD NOT DETECT AN 8x INFLATION OF ITS OWN HEADLINE. Only
-   the serial arm's count was recovered from its wall clock. Both arms are now
-   recovered; the reduction factor is RECOMPUTED from the counts rather than
-   relayed; and the hardcoded `..._is_derived: True` (an assertion no run could
-   falsify) is replaced by the measured discrepancy. The honest floor is now a
-   RANGE over replicates - it was quoted to one decimal across a 2.2x run-to-run
-   spread (3.88x to 11.68x on one build).
-
-3. THE NO-ENUMERATION GUARD COULD BE DEFEATED BY POSITION. Its line filter
-   truncated the ENTIRE source at the first `#[cfg(test)]`, and claim.rs has one
-   early - so `pub fn harvest_every_key_i_know() -> Vec<NarHashKey>` appended to
-   the real file passed at exit 0. The `checked > 60` floor could not notice
-   because the other two modules still supplied 57. Fixed as a CLASS: brace-
-   matched cfg(test) skipping, grammar-derived declaration detection (11 forms
-   asserted, 4 benign controls), PER-FILE floors, (file, impl, name) exemptions,
-   Vec<BatchHoldAnswer> as a listing, transport_iroh.rs in scope - and its stated
-   scope limit corrected, since the claim that unscanned modules "do not answer
-   peer messages" was false of exactly that module.
-
-4. THE GOLDEN FILE COULD NOT SAY "REJECT THIS". Every acceptance-widening change
-   passed by construction. Six `direction: "reject"` vectors added, class
-   asserted non-empty; plus the empty-offer_indices encoding vector.
-   `deny_unknown_fields` extended to KnownTransport and KnownPayload (C2 landed
-   at 1 of 4 internally-tagged enums, and KnownTransport sits inside the very
-   dictionary C2 hardened - an offer carrying `also_held:["sha256:..."]` and a
-   60 KB pad decoded cleanly).
-
-5. RE-ADDING `Deserialize` TO BatchHoldResponse IS NOW AN E0119 BUILD ERROR. The
-   whole index-remap safety argument rested on that derive's absence and was
-   enforced by nothing.
-
-6. DOC DRIFTS, plus a gate for the recurring one. Two dangling test citations in
-   claim.rs (both load-bearing, both introduced while fixing a review finding);
-   a justification that paid for a code duplication with a "freeze audit" that
-   does not exist and whose property is false; TESTING.md naming `just build`
-   for a failure that occurs in `just test`. daemon/tests/doc_citations.rs now
-   fails the suite on any dangling citation - and its own first version scanned
-   too few files and reported a real test as missing, which is the mistake it
-   exists to catch.
-
-GATES (serial, idle machine): build 0, lint 0, test 0 (290 passing), discovery 0,
-e2e 0 (26/26). cargo test --workspace 5x consecutively: all 0.
-
-FREEZE, RE-DERIVED FROM SCRATCH: the five frozen vectors are byte-identical to
-da74e47 where the golden file was introduced (6 vectors -> 21); no frozen TYPE
-definition is touched. THE ONE SUBSTANTIVE FREEZE CHANGE, flagged for an explicit
-reviewer yes/no: deny_unknown_fields on KnownTransport/KnownPayload tightens what
-the frozen Claim.transports and HoldAnswer::Have.offers ACCEPT. Nothing emitted
-changes; unknown transport KINDS are still tolerated and dropped.
-
-NOT CLOSED, DELIBERATELY: the frozen single-key HoldAnswer::Have.offers still has
-no count cap (622 offers = 65,440 B against an 88 B query = 743.6x). Capping it
-is a decoder-acceptance change to a frozen type beyond this round's scope and
-should be its own task. Gate non-determinism is TASK-109's.
-
-FIVE MUTATIONS CAME BACK GREEN DURING THIS ROUND and were fixed rather than
-written off; the mutation harness also caught its own defect (cargo returns 101
-for a COMPILE failure too, so three "bites" were mutants that did not build).
+REMAINING, NOT CLOSED THIS ROUND (correctly deferred): the frozen single-key HoldAnswer::Have.offers
+still has NO count cap - 622 offers = 65,440 B against an 88 B query = 743.6x amplification. That is
+the SAME defect class just fixed for the batch path, on the frozen single-key path, and it needs the
+same decoder-acceptance decision I just ruled on. Filed as its own task.
 <!-- SECTION:NOTES:END -->
 
 ## Final Summary
