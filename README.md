@@ -70,7 +70,7 @@ Measured on the container testbed (single host, so read the caveats):
 
 | Measurement | Result |
 |---|---|
-| Upstream NAR-payload egress offloaded | **1.00** (all of it), both conditions |
+| Upstream NAR-payload egress offloaded | **1.00**, both conditions — but see below |
 | vs. a WAN-shaped upstream (50 ms RTT, 20 MiB/s) | peer path **6.1× faster** |
 | vs. a zero-latency loopback upstream | peer path **4.0× slower** |
 | Holder RAM per byte served | **1.018 B/B** [1.007 .. 1.028] |
@@ -81,6 +81,14 @@ Every figure above is from one full profiling run on the current tree. Holder
 RAM is a slope fitted over five NAR sizes with a 95% confidence interval, not a
 single-point ratio; before the supply model it was **2.004 [2.000 .. 2.009]**
 with the blob store holding 1.00 bytes per byte announced *forever*.
+
+**The offload figure is steady-state by construction and must not be read as a
+swarm result.** It is measured with a holder pre-seeded with exactly what the
+client asks for — one peer that already has it. A *cold* swarm cannot offload
+anything: at t=0 nobody holds anything, every path comes from upstream, and
+offload is ~0. What a real swarm achieves is a curve between those, and this
+project has not measured it (tasks 87/88). Announce-after-fetch, the mechanism
+that would let a swarm warm up at all, is not implemented either (task 77).
 
 The two speedup figures are the same system against different upstreams — the
 ranking flips, so neither is quotable alone, and the magnitude is roughly peer

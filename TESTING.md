@@ -825,6 +825,41 @@ observable good/bad:
 | Lying / spam claim | NarHash gate rejects; wasted-dial bounded; peer scored down | attacker-chosen huge blob downloaded in full before the gate |
 | Seeder churn | resolution tolerates holders joining/leaving; no wrong bytes | churn causes a wrong-bytes serve or a crash |
 
+S10. **A real swarm, cold then warm (owner requirement, 2026-08-10).**
+Everything up to S9 measures either two nodes or a swarm of daemon
+*processes* fed synthetic payloads with a host-side HTTP reader standing
+in for nix. S10 is the deployment-shaped case: **≥10 containers, each a
+real nix client plus a daemon, substituting a real closure, with NAR
+bytes actually crossing iroh.**
+
+The load-bearing distinction is **cold-start vs steady state**, and it
+invalidates a naive reading of every offload number published so far. At
+t=0 no peer holds anything, so every path comes from upstream and offload
+is **~0** — a cold swarm *cannot* offload. Offload rises only as peers
+fetch and announce. Therefore:
+
+- The result is a **curve** (offload vs how much the swarm has already
+  seen) plus a time/volume to plateau — never a single figure.
+- Every offload number measured with a **pre-seeded holder** — which is
+  all of them, including the 1.00 in S3/S7 arms and in `README.md` — is
+  **steady-state by construction** and must be labelled so. It answers
+  "can a peer that has it serve it", not "does a swarm offload".
+- Good: the plateau is materially above 0 and the swarm's total upstream
+  egress is materially below N independent nodes', in uncompressed-NAR
+  units under the frozen counting rule. Bad: a single offload figure
+  quoted without its position on the curve.
+
+BITE: the cold arm must actually be cold — assert the swarm holds nothing
+at t=0 and that offload measured there is ~0. A "cold" arm that starts
+warm passes trivially and proves nothing, which is the vacuous-oracle
+shape this document exists to prevent. Thundering-herd cost (N peers
+wanting one path at once) is counted, not assumed to be 1.
+
+Honest limits that travel with any S10 result: one host, loopback peer
+links (so peer throughput is an **upper** bound), no NAT or relay, and a
+residential uplink would plausibly invert the latency finding. Claims
+about 100s/1000s of peers remain model output per S5.
+
 S9. **Profiling models bite (resource/perf estimation).** The scenario
 models estimate RAM, disk, latency, throughput, speedup and extrapolate
 to 10s/100s/1000s of peers (S5 machinery: measure 1..30, regression-fit,
