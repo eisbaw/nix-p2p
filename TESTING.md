@@ -79,8 +79,18 @@ Gates (all must pass; `just` recipes are the canonical entry points):
 1. `just build` — workspace compiles.
 2. `just lint` — clippy, `-D warnings`.
 3. `just test` — unit + integration (in-process, mock upstream).
-4. `just e2e` — container harness: scripted scenarios with oracles
-   below. E2E failures BLOCK commits (repo policy).
+4. `just e2e` — container harness, FAST subset: five scenarios, one
+   per distinct path (S1 byte/counts, S2 fallback, the tamper-narhash
+   safety bite, depth-3 chain composition, S6 p2p). Sized for the
+   common pre-commit loop.
+   `just e2e-full` — every scenario, including the crash suite, the
+   fault × depth matrix and the timeout boundary. Those are where
+   regressions hide, so **`e2e-full` is the gate that must be green
+   before shipping a serving-path change**; a green `just e2e` is a
+   smoke signal, not that gate. E2E failures BLOCK commits (repo
+   policy). Both print per-scenario seconds, so the split stays
+   defensible from timings rather than from an impression of which
+   scenario feels slow.
 5. `just e2e-vm` — NixOS VM test (real nix-daemon + systemd
    semantics; slower; standing, and required before wave exit). It
    builds ONE dedicated flake output, `packages.x86_64-linux.vm-test`
@@ -687,6 +697,48 @@ the label there.
 Go/no-go: an explicit owner-facing checkpoint task sits between the
 J2 baseline and the hardening block — hardening a product whose
 prefetch-window premise just died would be planned waste.
+
+## Gate honesty — "tests: 0 failures" is a claim about a DISTRIBUTION (task-109)
+
+The verification gate is not a truth oracle. It is a sampler, and until
+task-109 nobody knew its variance. Measured on 2026-08-10, at the commit
+that opened that task: `cargo test --locked --workspace`, N=20 runs of
+**identical binaries** under a stated load (14 CPU burners on a 14-core
+host), failed **9 times — a 45% failure rate**. Not one of those failures
+was a product defect. Every one was a test making a load-sensitive
+assumption: reading a counter the server had not yet written, asserting a
+wall-clock upper bound, or measuring whole-process RSS while a sibling
+test allocated 32 MiB in the same process.
+
+The consequence is uncomfortable and must not be softened: **every "tests:
+0 failures" this project certified before that date was a single sample
+from a distribution that produced a green ~55% of the time.** The code was
+very likely fine. The *evidence* was worth about half of what it was
+quoted as being.
+
+THE RULE, binding on every cycle, Final Summary, git note and task closure:
+
+1. A cycle MUST NOT certify "test 0" from one green run while a known
+   flake rate is outstanding. Quote the rate, or state plainly that it is
+   unmeasured. "Unmeasured" is an acceptable, honest answer; silence is
+   not.
+2. A flake rate quoted WITHOUT its N and its load definition is
+   meaningless and MUST be rejected in review. The load is part of the
+   measurement, not context for it.
+3. Re-measure with `scripts/flake_rate.py` after any change to test
+   harness synchronisation, process/thread layout, or timeouts. It sorts
+   every run into PASS / TEST_FAILED / BUILD_FAILED / HARNESS and ABORTS
+   on the last two, because cargo returns exit 101 both for a failed test
+   and for a crate that did not compile — a harness here once read exit
+   127 as green, and another counted compile failures as mutation kills.
+4. Fix a flake at its MECHANISM. `--test-threads=1` and retry-until-green
+   are rejected: the first buys determinism by deleting the parallel
+   coverage that catches concurrency defects, and the second re-rolls the
+   dice until the answer is convenient.
+5. A single green run is NOT evidence that a flake is fixed. That
+   assumption is precisely what let a 45% failure rate go unnoticed.
+   Demonstrate the fix at the same N and load that demonstrated the
+   defect.
 
 ## Fixture workload (pinned; task-3)
 

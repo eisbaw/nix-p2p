@@ -7,7 +7,7 @@ status: Done
 assignee:
   - '@me'
 created_date: '2026-08-09 13:31'
-updated_date: '2026-08-09 17:37'
+updated_date: '2026-08-10 20:32'
 labels: []
 dependencies:
   - TASK-42
@@ -238,4 +238,29 @@ HONEST LIMITS a reader should carry forward:
  5. The fetcher slope measures the daemon's whole-NAR buffer under a client that
     drains as fast as it can. It is NOT a backpressure measurement; TASK-62 still
     has to build the slow-reading client for its AC#2.
+
+## TASK-109 FOLLOW-UP: the oracle's own test binary was corrupting its measurements
+
+The residency oracle this task built is sound; its TEST HARNESS was not. All three tests lived in
+one binary, and libtest runs a binary's tests concurrently IN THE SAME PROCESS, while vm_bytes()
+reads whole-process /proc/self/status. Each test moves ~32 MiB, so readings were taken while
+siblings allocated. Measured: 13/64 failures under 8 concurrent processes (qa), 1/20 under CPU load
+(task-109), and - more damning than the failures - corrupted numbers in runs that PASSED:
+'allocator returned = 298.4%' and '-1.0%', and a VmRSS baseline HIGHER than the same test's seeded
+reading.
+
+task-109 split the file into three test targets sharing tests/residency_support/mod.rs. Cargo runs
+targets sequentially and /proc/self/status is per-process, so each RSS test is now the only
+allocator in the process it measures. The numbers became coherent: baseline 37261312 -> seeded
+71290880 (34.0 MB rise for a 33.5 MB payload), allocator returned 99.2% and 96.8%, matching this
+task's documented ~97%. The ~97% figure this task RECORDED was therefore right, but some of the
+runs that produced it were not measuring what they claimed.
+
+DO NOT merge those targets back together. One RSS-measuring test per target is the invariant.
+
+CHECKED AND CLEAR (feed-forward from task-109's inventory): scripts/profile_p2p.py does NOT carry
+this defect. Its RSS metric is per-peer peak RSS sampled per-PID against separate daemon
+processes, not /proc/self read while siblings run in the same process. Stated as 'no evidence of
+the defect, and per-PID by construction' rather than 'audited clean' - I did not read the sampler
+line by line.
 <!-- SECTION:NOTES:END -->

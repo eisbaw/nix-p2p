@@ -5,7 +5,7 @@ status: Done
 assignee:
   - '@me'
 created_date: '2026-08-10 07:23'
-updated_date: '2026-08-10 17:11'
+updated_date: '2026-08-10 20:32'
 labels:
   - wave-2b
 dependencies:
@@ -98,6 +98,22 @@ REMAINING, NOT CLOSED THIS ROUND (correctly deferred): the frozen single-key Hol
 still has NO count cap - 622 offers = 65,440 B against an 88 B query = 743.6x amplification. That is
 the SAME defect class just fixed for the batch path, on the frozen single-key path, and it needs the
 same decoder-acceptance decision I just ruled on. Filed as its own task.
+
+## GATE-REGIME WARNING FROM TASK-109 (2026-08-10)
+
+task-109 measured the verification gate at the commit that opened it: cargo test --locked
+--workspace, N=20 IDENTICAL binaries, 14 CPU burners on a 14-core host -> 9/20 = 45% failure rate.
+Zero of those failures were product defects; all were load-sensitive test assumptions.
+
+CONSEQUENCE FOR THIS TASK: round-7's gate numbers were taken under that regime. A single green
+'test 0' from that period is one sample from a distribution that was green about 55% of the time,
+so it is NOT the evidence it was quoted as. This does not imply round-7's fix is wrong - the
+observed flakes were in testproxy faults/premature_eof and the residency oracle, none of which is
+task-91's subject - but the CERTIFICATION is weaker than recorded.
+
+WHAT TO DO AT THE RE-GATE: re-run the gate on this task's head after task-109's fixes land, and
+quote the rate with its N and load per the new TESTING.md 'Gate honesty' rules. Do not carry the
+old single-run green forward as if it were equivalent.
 <!-- SECTION:NOTES:END -->
 
 ## Final Summary
