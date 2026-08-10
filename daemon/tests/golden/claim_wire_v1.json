@@ -1,5 +1,6 @@
 {
   "_comment": "FROZEN golden wire vectors for the claim/hold-query surface (daemon/src/claim.rs). Filed by task-91, which ADDS the batched hold-query alongside these types: the freeze on HoldQuery/HoldAnswer/HoldResponse/Claim was stated in prose and enforced only by round-trip tests, which pass just as happily after a field is renamed on both sides. These vectors pin the exact BYTES, so a change to the frozen encodings fails here instead of splitting the network silently. Changing any `wire` string is a deliberate, reviewed re-freeze that requires a `schema_version` bump. `daemon/tests/claim_wire_golden.rs` asserts each `wire` is what our encoder EMITS and what our decoder ACCEPTS.",
+  "_direction": "Each vector declares a `direction`. `both` = our encoder must EMIT exactly these bytes AND our decoder must ACCEPT them. `decode-only` = a legal input we must keep ACCEPTING but do not emit (an omitted defaulted field, a dropped unknown kind). The second class exists because an encoding vector is blind to a change in what we TOLERATE: adding `skip_serializing_if`, or removing `serde(default)`, left every pre-existing vector in this file green.",
   "codec": "JSON draft codec (claim.rs `Codec` note): the field order is the struct declaration order, so the byte string is stable. The final binary codec is a velocity surface and will re-pin these vectors under a new file.",
   "identities": {
     "_note": "The exact canonical strings the vectors are built from. The test asserts its own typed constructors produce these, so a vector can never be pinned against an identity encoding that has itself drifted.",
@@ -9,38 +10,93 @@
     "node_b": "2222222222222222222222222222222222222222222222222222222222222222",
     "blake3": "blake3:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
     "blake3_2": "blake3:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
-    "infohash": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+    "infohash": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+    "infohash_2": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
   },
   "vectors": [
     {
       "name": "claim_full",
+      "direction": "both",
       "note": "A fully-populated v1 claim: known payload (the ONE content identity), both holders, both transports. `relay`/`signatures` are absent from the wire because they are None/empty in v1.",
       "wire": "{\"schema_version\":1,\"key\":\"sha256:06rgb4vfjsg365xwwdjz12qhjnvg3w0agfvyqfp977hp3yk2bczb\",\"payload\":{\"kind\":\"whole_nar\",\"blake3\":\"blake3:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"},\"holders\":[\"1111111111111111111111111111111111111111111111111111111111111111\",\"2222222222222222222222222222222222222222222222222222222222222222\"],\"transports\":[{\"transport\":\"iroh\",\"node\":\"1111111111111111111111111111111111111111111111111111111111111111\"},{\"transport\":\"bittorrent\",\"infohash\":\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\"}]}"
     },
     {
+      "name": "claim_v2_reserved_fields",
+      "direction": "both",
+      "note": "The RESERVED v2 fields, POPULATED. `claim_full` leaves relay=None/signatures=[], which means their field names were unpinned - `relay.blob`, `signatures[].key_id` and `signatures[].sig` could all be renamed with every golden test still green. Those fields exist precisely so that v2 needs no wire break, so their names are part of the freeze and are pinned here.",
+      "wire": "{\"schema_version\":1,\"key\":\"sha256:06rgb4vfjsg365xwwdjz12qhjnvg3w0agfvyqfp977hp3yk2bczb\",\"payload\":{\"kind\":\"whole_nar\",\"blake3\":\"blake3:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"},\"holders\":[\"1111111111111111111111111111111111111111111111111111111111111111\"],\"transports\":[{\"transport\":\"iroh\",\"node\":\"1111111111111111111111111111111111111111111111111111111111111111\"}],\"relay\":{\"blob\":\"opaque-v2-narinfo-blob\"},\"signatures\":[{\"key_id\":\"opaque-v2-key-id\",\"sig\":\"opaque-v2-signature\"}]}"
+    },
+    {
+      "name": "claim_transports_omitted",
+      "direction": "decode-only",
+      "note": "ACCEPTED LEGACY INPUT: a claim with no `transports` field at all decodes to an empty offer set (`serde(default)`). Pinning what we ACCEPT is a separate obligation from pinning what we emit: removing the `default` would keep every encoding vector green while making this legal wire un-decodable.",
+      "wire": "{\"schema_version\":1,\"key\":\"sha256:06rgb4vfjsg365xwwdjz12qhjnvg3w0agfvyqfp977hp3yk2bczb\",\"payload\":{\"kind\":\"whole_nar\",\"blake3\":\"blake3:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"},\"holders\":[\"1111111111111111111111111111111111111111111111111111111111111111\"]}"
+    },
+    {
+      "name": "claim_unknown_transport_dropped",
+      "direction": "decode-only",
+      "note": "ACCEPTED LEGACY INPUT: an unknown transport KIND between two known ones is TOLERATED and DROPPED (never carried, never re-serialised), while the known ones survive in order. This is the rule that lets a future transport ship without a network fork, so it is pinned on bytes.",
+      "wire": "{\"schema_version\":1,\"key\":\"sha256:06rgb4vfjsg365xwwdjz12qhjnvg3w0agfvyqfp977hp3yk2bczb\",\"payload\":{\"kind\":\"whole_nar\",\"blake3\":\"blake3:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"},\"holders\":[\"1111111111111111111111111111111111111111111111111111111111111111\"],\"transports\":[{\"transport\":\"iroh\",\"node\":\"1111111111111111111111111111111111111111111111111111111111111111\"},{\"transport\":\"carrier_pigeon\",\"coop\":\"loft-7\"},{\"transport\":\"bittorrent\",\"infohash\":\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\"}]}"
+    },
+    {
       "name": "hold_query",
+      "direction": "both",
       "note": "The single-key probe. task-91 adds a BATCHED query alongside it; this vector is what proves the single-key form was not mutated in the process.",
       "wire": "{\"schema_version\":1,\"key\":\"sha256:06rgb4vfjsg365xwwdjz12qhjnvg3w0agfvyqfp977hp3yk2bczb\"}"
     },
     {
       "name": "hold_response_have",
+      "direction": "both",
       "note": "`answer` is FLATTENED into the envelope, so the tag sits next to schema_version. The blake3 appears exactly once; the offer is a pure locator.",
       "wire": "{\"schema_version\":1,\"answer\":\"have\",\"blake3\":\"blake3:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"offers\":[{\"transport\":\"iroh\",\"node\":\"1111111111111111111111111111111111111111111111111111111111111111\"}]}"
     },
     {
+      "name": "hold_response_have_empty_offers",
+      "direction": "both",
+      "note": "A Have with an EMPTY offer list, which is legal and reachable (a holder whose only locator kind this build cannot express). It is pinned because the non-empty vector above cannot see a `skip_serializing_if = \"Vec::is_empty\"` being added: that mutation changes THESE bytes to `{...\"blake3\":...}` and nothing else. It survived the whole golden suite before this vector existed.",
+      "wire": "{\"schema_version\":1,\"answer\":\"have\",\"blake3\":\"blake3:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"offers\":[]}"
+    },
+    {
+      "name": "hold_response_have_offers_omitted",
+      "direction": "decode-only",
+      "note": "ACCEPTED LEGACY INPUT: `offers` omitted entirely decodes to an empty offer set. Pins the DECODER's tolerance, which no encoding vector can see - removing `serde(default)` leaves every emitted byte identical and silently stops accepting this wire.",
+      "wire": "{\"schema_version\":1,\"answer\":\"have\",\"blake3\":\"blake3:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"}"
+    },
+    {
       "name": "hold_response_absent",
+      "direction": "both",
       "note": "A no. It carries no blake3 and no offers - there is nothing on this wire that could enumerate what the peer DOES hold.",
       "wire": "{\"schema_version\":1,\"answer\":\"absent\"}"
     },
     {
       "name": "batch_hold_query",
+      "direction": "both",
       "note": "task-91 ADDITION. The same question as `hold_query`, asked about many keys at once. The keys are the asker's own, in the asker's own order, and that order is what the answer vector is aligned to.",
       "wire": "{\"schema_version\":1,\"keys\":[\"sha256:06rgb4vfjsg365xwwdjz12qhjnvg3w0agfvyqfp977hp3yk2bczb\",\"sha256:08i248i248i248i248i248i248i248i248i248i248i248i248i2\"]}"
     },
     {
       "name": "batch_hold_response",
-      "note": "task-91 ADDITION. One positional answer per queried key; the transport offers are hoisted out of the answers because one peer answers one batch. NOTE WHAT IS ABSENT: no `sha256:` string appears anywhere on this wire. A batch answer is meaningless detached from the asker's query, which is exactly why it is not an enumeration - `claim_wire_golden.rs::batch_hold_response_carries_no_keys_of_its_own` asserts that on these bytes.",
-      "wire": "{\"schema_version\":1,\"offers\":[{\"transport\":\"iroh\",\"node\":\"2222222222222222222222222222222222222222222222222222222222222222\"}],\"answers\":[{\"answer\":\"have\",\"blake3\":\"blake3:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"},{\"answer\":\"absent\"},{\"answer\":\"have\",\"blake3\":\"blake3:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc\"}]}"
+      "direction": "both",
+      "note": "task-91 ADDITION. One positional answer per queried key. The offers form a DICTIONARY and each Have names its own by INDEX - here one peer-scoped iroh locator shared by both Haves, which is the common case and the reason the dictionary exists (256 keys cost one copy of the locator, not 256). NOTE WHAT IS ABSENT: no `sha256:` string appears anywhere on this wire.",
+      "wire": "{\"schema_version\":1,\"offers\":[{\"transport\":\"iroh\",\"node\":\"2222222222222222222222222222222222222222222222222222222222222222\"}],\"answers\":[{\"answer\":\"have\",\"blake3\":\"blake3:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"offer_indices\":[0]},{\"answer\":\"absent\"},{\"answer\":\"have\",\"blake3\":\"blake3:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc\",\"offer_indices\":[0]}]}"
+    },
+    {
+      "name": "batch_hold_response_all_absent",
+      "direction": "both",
+      "note": "task-91 ADDITION. An all-absent answer MUST carry an empty dictionary: an offer no answer references is rejected by the codec, so a peer cannot attach a content-specific locator to a response that answered nothing. The empty `offers` is emitted, not omitted - one canonical form.",
+      "wire": "{\"schema_version\":1,\"offers\":[],\"answers\":[{\"answer\":\"absent\"},{\"answer\":\"absent\"}]}"
+    },
+    {
+      "name": "batch_hold_response_distinct_locators",
+      "direction": "both",
+      "note": "task-91 ADDITION, and the regression vector for the defect that sent this task back: two keys, each with its OWN content-specific BitTorrent infohash, sharing one peer-scoped iroh locator. Under the earlier response-wide offer list this was inexpressible and key 2's claim silently received key 1's infohash.",
+      "wire": "{\"schema_version\":1,\"offers\":[{\"transport\":\"iroh\",\"node\":\"2222222222222222222222222222222222222222222222222222222222222222\"},{\"transport\":\"bittorrent\",\"infohash\":\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\"},{\"transport\":\"bittorrent\",\"infohash\":\"dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd\"}],\"answers\":[{\"answer\":\"have\",\"blake3\":\"blake3:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"offer_indices\":[0,1]},{\"answer\":\"have\",\"blake3\":\"blake3:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc\",\"offer_indices\":[0,2]}]}"
+    },
+    {
+      "name": "batch_hold_response_unknown_transport_slot",
+      "direction": "decode-only",
+      "note": "ACCEPTED INPUT, and the subtlest rule in this file: an unknown transport kind is tolerated-but-dropped, but the offers are INDEXED, so dropping element 1 in place would rebind the second Have's index 2 onto the wrong locator. The decoder keeps a SLOT for every element the peer sent, validates the indices against those RAW positions, then compacts and REWRITES the indices together. Note the unknown slot IS referenced (by answer 0) - it has to be, because an offer no answer references is rejected - so this also pins that dropping it leaves answer 0 with a SHORTER index list rather than a dangling one. Must decode to offers [iroh, bittorrent] with the Haves naming [0] and [1].",
+      "wire": "{\"schema_version\":1,\"offers\":[{\"transport\":\"iroh\",\"node\":\"2222222222222222222222222222222222222222222222222222222222222222\"},{\"transport\":\"carrier_pigeon\",\"coop\":\"loft-7\"},{\"transport\":\"bittorrent\",\"infohash\":\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\"}],\"answers\":[{\"answer\":\"have\",\"blake3\":\"blake3:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"offer_indices\":[0,1]},{\"answer\":\"have\",\"blake3\":\"blake3:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc\",\"offer_indices\":[2]}]}"
     }
   ]
 }

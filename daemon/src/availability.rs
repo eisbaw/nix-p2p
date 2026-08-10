@@ -98,9 +98,9 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use crate::claim::{
-    BatchHoldAnswer, BatchHoldQuery, BatchHoldResponse, CLAIM_SCHEMA_VERSION, Claim, HoldAnswer,
-    HoldQuery, HoldResponse, KnownPayload, KnownTransport, MAX_BATCH_HOLD_KEYS, NarHashKey,
-    QUERY_SCHEMA_VERSION,
+    BatchHoldAnswer, BatchHoldQuery, BatchHoldResponse, CLAIM_SCHEMA_VERSION, Claim,
+    ClaimCodecError, HoldAnswer, HoldQuery, HoldResponse, KnownPayload, KnownTransport,
+    MAX_BATCH_HOLD_KEYS, NarHashKey, QUERY_SCHEMA_VERSION, check_batch_keys,
 };
 use crate::content_id::Blake3Digest;
 use crate::transport::NodeId;
@@ -707,14 +707,24 @@ impl AvailabilityIndex {
     /// what batching must not do. `Absent` is also the SAFE direction: it can only
     /// cost a p2p hit (the fetch falls back upstream), never a wrong byte.
     ///
-    /// PRECONDITION: `query` is a decoded, version- and cap-checked probe (the
-    /// wire path gates it in [`crate::claim::decode_batch_hold_query`]). The
-    /// answer allocation is bounded by [`MAX_BATCH_HOLD_KEYS`] regardless, so a
-    /// caller that hands in an over-cap query cannot make this node pre-allocate
-    /// an unbounded vector.
-    pub fn answer_batch(&self, query: &BatchHoldQuery) -> BatchHoldResponse {
+    /// THE CAP IS ENFORCED HERE, NOT ASSUMED. It used to be a `debug_assert`, i.e.
+    /// a caller precondition that vanishes in a release build - so a single wrong
+    /// call site could make this node do 12 000 `nix-store --dump`s for one
+    /// message. It is now a hard refusal reusing the wire's own rule
+    /// ([`crate::claim::check_batch_keys`] via `encode_batch_hold_query`'s error
+    /// type), because the bound belongs to the message, not to the politeness of
+    /// whoever calls this. There is no truncation: answering the first 256 keys of
+    /// a 300-key batch would be a silent wrong "no" for the other 44.
+    ///
+    /// The per-KEY fault policy above is unchanged and is deliberately NOT this
+    /// error channel: a broken store path degrades one key to `Absent`, while a
+    /// malformed batch is refused whole.
+    pub fn answer_batch(
+        &self,
+        query: &BatchHoldQuery,
+    ) -> Result<BatchHoldResponse, ClaimCodecError> {
         debug_assert_eq!(query.schema_version, QUERY_SCHEMA_VERSION);
-        debug_assert!(query.keys.len() <= MAX_BATCH_HOLD_KEYS);
+        check_batch_keys(&query.keys)?;
 
         let mut answers = Vec::with_capacity(query.keys.len().min(MAX_BATCH_HOLD_KEYS));
         let mut any_have = false;
@@ -722,9 +732,17 @@ impl AvailabilityIndex {
             match self.hold(key) {
                 Ok(HoldAnswer::Have { blake3, .. }) => {
                     any_have = true;
-                    answers.push(BatchHoldAnswer::Have { blake3 });
+                    // This node speaks exactly one transport, so every Have points
+                    // at the single dictionary entry below. The INDEX is what binds
+                    // a locator to a key: when a second transport arrives (task-75
+                    // BitTorrent, whose infohash is per-CONTENT, not per-peer) each
+                    // Have gains its own entry here and nothing else changes.
+                    answers.push(BatchHoldAnswer::Have {
+                        blake3,
+                        offer_indices: vec![0],
+                    });
                 }
-                Ok(HoldAnswer::Absent) => answers.push(BatchHoldAnswer::Absent),
+                Ok(HoldAnswer::Absent) => answers.push(BatchHoldAnswer::Absent {}),
                 Err(err) => {
                     // Loud, not silent: the operator sees exactly which key
                     // degraded and why.
@@ -732,22 +750,24 @@ impl AvailabilityIndex {
                         "daemon: batch hold-query: {key} could not be answered ({err}); \
                          answering Absent for it"
                     );
-                    answers.push(BatchHoldAnswer::Absent);
+                    answers.push(BatchHoldAnswer::Absent {});
                 }
             }
         }
-        BatchHoldResponse {
+        Ok(BatchHoldResponse {
             schema_version: QUERY_SCHEMA_VERSION,
-            // The offers describe THIS node, so they are emitted once - and only
-            // when at least one answer is a Have, so an all-absent response says
-            // nothing at all about this node beyond "no".
+            // This node's iroh locator is genuinely peer-scoped, so it appears
+            // ONCE and every Have indexes it - and only when at least one answer is
+            // a Have, because a dictionary entry no answer references is rejected
+            // by the codec precisely so an all-absent response cannot volunteer a
+            // locator for content the asker never named.
             offers: if any_have {
                 vec![self.iroh_offer()]
             } else {
                 Vec::new()
             },
             answers,
-        }
+        })
     }
 
     /// Produce the COMPLETE claim for `key` if this node holds it: the BLAKE3 to

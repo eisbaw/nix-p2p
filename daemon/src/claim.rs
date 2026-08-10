@@ -491,10 +491,15 @@ pub struct HoldResponse {
 ///     in ONE round trip instead of ~200. Bigger closures chunk (a 1000-path
 ///     closure is 4 probes per peer, not 1000).
 ///   * It keeps BOTH directions inside the existing [`MAX_CLAIM_WIRE_BYTES`]
-///     pre-parse gate with real headroom: a full 256-key query is ~16 KiB and a
-///     full 256-`Have` response is ~26 KiB, both under 64 KiB. That is asserted,
-///     not assumed - see `a_full_batch_fits_the_wire_cap_with_headroom`. Raising
-///     the cap to 1024 would put the response over the gate, i.e. the wire size
+///     pre-parse gate. MEASURED, not estimated (and asserted by
+///     `a_full_batch_fits_the_wire_cap_with_headroom`): a full 256-key query is
+///     15 901 B; a full 256-`Have` response sharing ONE iroh locator is 31 114 B;
+///     the same response with a DISTINCT per-content locator for every key is
+///     58 910 B. All three fit the 64 KiB gate, but the last has only ~10% spare -
+///     that is the honest limit of this cap, and the reason the offers are indexed
+///     rather than inlined (inlining that case costs ~79 KiB, OVER the gate, so a
+///     peer holding all 256 keys over two transports could not answer at all).
+///     Raising the cap to 1024 puts the response over the gate: the wire size
 ///     bound and the key cap must be chosen together.
 ///   * It bounds the WORK one message can demand: at most 256 index probes, each
 ///     of which may cost one `nix-store --dump`. Note this is not NEW work - it
@@ -502,6 +507,17 @@ pub struct HoldResponse {
 ///     removes round trips; it does not add per-key cost. A per-batch work/time
 ///     budget (so one message cannot monopolise a responder) is TASK-104.
 pub const MAX_BATCH_HOLD_KEYS: usize = 256;
+
+/// Maximum number of DISTINCT transport offers one [`BatchHoldResponse`]'s offer
+/// dictionary may carry.
+///
+/// Two transports per answered key is the most this build can express (`iroh` +
+/// `bittorrent`), so `2 * MAX_BATCH_HOLD_KEYS` is the largest dictionary a legal
+/// full batch could ever need. It is an EXPLICIT bound rather than a derived one
+/// because the real binding constraint - [`MAX_CLAIM_WIRE_BYTES`] - is a byte
+/// count, and a byte count is not a thing a reviewer can check a decoder against.
+/// Both are enforced: this cap, and `check_size` on the encoder's OUTPUT.
+pub const MAX_BATCH_HOLD_OFFERS: usize = 2 * MAX_BATCH_HOLD_KEYS;
 
 /// A probe about MANY content identities at once: "of these N NarHashes, which do
 /// you hold?". One round trip replaces N.
@@ -531,6 +547,51 @@ pub struct BatchHoldQuery {
     pub keys: Vec<NarHashKey>,
 }
 
+/// Field deserializer for an INDEXED offer dictionary: the same tolerate-but-drop
+/// rule as [`deserialize_known_transports`], except an unknown transport leaves a
+/// `None` SLOT behind instead of vanishing. The slot matters because the `Have`s
+/// index into this list: dropping an element in place would silently rebind every
+/// later index. [`compact_offer_slots`] removes the `None`s and rewrites the
+/// indices together, which is the only safe order.
+///
+/// It is a SEPARATE function rather than a refactor of
+/// [`deserialize_known_transports`] on purpose: that one decodes FROZEN types, and
+/// this change is required to be textually additive to `claim.rs` so the freeze
+/// audit (`git diff | grep '^-'` returning nothing) stays meaningful. The shared
+/// rule - which tags are known - lives once, in [`KNOWN_TRANSPORT_TAGS`], and
+/// `slot_and_drop_decoders_agree` asserts the two functions do not diverge.
+fn deserialize_transport_slots<'de, D>(
+    deserializer: D,
+) -> Result<Vec<Option<KnownTransport>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let raw = Vec::<Value>::deserialize(deserializer)?;
+    let mut slots = Vec::with_capacity(raw.len());
+    for value in raw {
+        let is_known = value
+            .get("transport")
+            .and_then(Value::as_str)
+            .is_some_and(|tag| KNOWN_TRANSPORT_TAGS.contains(&tag));
+        if is_known {
+            // A malformed KNOWN transport is a hard error, exactly as on a claim.
+            slots.push(Some(
+                serde_json::from_value::<KnownTransport>(value)
+                    .map_err(serde::de::Error::custom)?,
+            ));
+        } else {
+            slots.push(None);
+        }
+    }
+    Ok(slots)
+}
+
+/// An index into a [`BatchHoldResponse`]'s offer dictionary. `u16` rather than
+/// `usize` so the wire representation is bounded by the type as well as by the
+/// range check; the value is additionally required to be `< offers.len()`, which
+/// is itself `<= MAX_BATCH_HOLD_OFFERS`.
+pub type OfferIndex = u16;
+
 /// One positional answer inside a [`BatchHoldResponse`]: the peer's yes/no about
 /// the key at the SAME INDEX in the [`BatchHoldQuery`].
 ///
@@ -538,51 +599,215 @@ pub struct BatchHoldQuery {
 /// answer from being a listing: detached from the asker's query it is a row of
 /// bare yes/no, meaningless on its own.
 ///
-/// It also does not carry transport offers - those are hoisted to the response
-/// ([`BatchHoldResponse::offers`]), because one peer answers one batch and its
-/// locators are a property of the PEER, not of each key. Repeating an identical
-/// offer set 256 times would be duplicated state on the wire and would blow the
-/// size budget the cap is chosen against.
+/// ## Why the offers are INDICES and not inline transports
+///
+/// A transport offer is not always peer-scoped. `Iroh`'s locator is the holder's
+/// `NodeId`, one value for the whole batch; `BitTorrent`'s is an `infohash`, which
+/// is a PER-CONTENT coordinate. An earlier revision of this type hoisted ONE offer
+/// list to the response and let every `Have` share it; that silently bound key 2's
+/// claim to key 1's infohash, and let an all-`Absent` response carry a
+/// content-specific locator bound to nothing at all. So each `Have` names its OWN
+/// locators - but by INDEX into a shared dictionary, so the common case (one iroh
+/// offer for all 256 keys) costs one copy of the locator plus 256 small integers
+/// instead of 256 copies of the locator. That is not a micro-optimisation: a full
+/// 256-key answer carrying an iroh locator AND a per-content infohash measures
+/// 58 910 B indexed and ~79 912 B inlined, and the pre-parse gate is 65 536 B - so
+/// the inline form makes a legal, fully-populated answer UNSENDABLE. It also keeps
+/// the resolver from retaining one copy of the whole dictionary per answered key.
+///
+/// The binding rules are enforced at BOTH boundaries (see
+/// [`check_batch_offer_bindings`]): every index in range, no index repeated inside
+/// one `Have`, and every dictionary entry referenced by at least one `Have`.
+///
+/// `Absent` is an EMPTY STRUCT variant, not a unit variant, and that is load
+/// bearing: `deny_unknown_fields` on an internally-tagged enum is honoured for
+/// struct variants but is SILENTLY INERT for unit variants, so a unit `Absent`
+/// would happily decode `{"answer":"absent","blake3":"..."}`. Verified by
+/// experiment, and pinned by `an_absent_answer_rejects_any_field`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "answer", rename_all = "snake_case")]
+#[serde(deny_unknown_fields)]
 pub enum BatchHoldAnswer {
-    /// "Yes, I hold the key at this position": its single content identity.
-    Have { blake3: Blake3Digest },
-    /// "No, I do not hold the key at this position."
-    Absent,
+    /// "Yes, I hold the key at this position": its single content identity, plus
+    /// the offers - by index into [`BatchHoldResponse::offers`] - that locate
+    /// THIS key. May be empty: a peer can assert a holding whose only locator
+    /// this build cannot speak (the unknown transport was dropped on decode), in
+    /// which case the claim has no usable fetch coordinate and the fetch falls
+    /// back upstream. That is a miss, never a wrong byte.
+    Have {
+        blake3: Blake3Digest,
+        offer_indices: Vec<OfferIndex>,
+    },
+    /// "No, I do not hold the key at this position." Carries nothing - and, being
+    /// a struct variant, REJECTS anything a peer tries to attach.
+    Absent {},
 }
 
 /// The answer to a [`BatchHoldQuery`]: one [`BatchHoldAnswer`] per queried key, in
-/// the query's order, plus the responder's transport offers.
+/// the query's order, plus the offer dictionary those answers index into.
 ///
 /// `answers.len()` MUST equal the number of keys asked. That is not a courtesy -
 /// it is the whole safety argument, so it is checked at the decode boundary
 /// ([`decode_batch_hold_response`] takes the asked count and rejects a mismatch)
 /// rather than left to each caller. A short answer would silently re-index every
 /// later key onto the wrong hash.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
+///
+/// NOTE THE MISSING `Deserialize`, which is deliberate. Unknown transport kinds
+/// are TOLERATED-BUT-DROPPED, and dropping an element of an INDEXED dictionary
+/// would shift every later index onto the wrong locator - the exact defect the
+/// index space exists to prevent. So the dictionary is parsed into
+/// position-preserving slots, validated against the RAW positions, and only then
+/// compacted and re-indexed. That happens in [`decode_batch_hold_response`], and
+/// making this type non-`Deserialize` means no caller can bypass it by parsing the
+/// struct directly.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct BatchHoldResponse {
     pub schema_version: u16,
-    /// HOW to fetch anything answered `Have` (pure per-transport locators, exactly
-    /// as in a [`Claim`]). Hoisted out of the per-key answers: see
-    /// [`BatchHoldAnswer`]. Empty when the responder holds none of the keys.
-    /// Unknown transports are dropped on decode (tolerated but inert).
-    #[serde(
-        default,
-        skip_serializing_if = "Vec::is_empty",
-        deserialize_with = "deserialize_known_transports"
-    )]
+    /// The offer DICTIONARY: every pure locator this response uses, each named by
+    /// index from the `Have` it belongs to. Always emitted, empty included, so the
+    /// encoding has exactly one canonical form. Every entry MUST be referenced by
+    /// at least one `Have`, so a locator can never float free of the keys it
+    /// describes - which is also why an all-`Absent` response is required to carry
+    /// an EMPTY dictionary and therefore cannot volunteer anything.
     pub offers: Vec<KnownTransport>,
     /// Positionally aligned with the query's `keys`. Carries no keys of its own.
     pub answers: Vec<BatchHoldAnswer>,
+}
+
+/// The wire twin of [`BatchHoldResponse`] used ONLY by
+/// [`decode_batch_hold_response`]. It differs in exactly one way: the offer
+/// dictionary keeps a SLOT for every element the peer sent, with an unknown
+/// transport kind decoding to `None` instead of vanishing. Keeping the slot is
+/// what makes the `Have` indices mean the same thing on both nodes; the compaction
+/// that removes the `None`s also rewrites the indices.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct BatchHoldResponseWire {
+    schema_version: u16,
+    #[serde(deserialize_with = "deserialize_transport_slots")]
+    offers: Vec<Option<KnownTransport>>,
+    answers: Vec<BatchHoldAnswer>,
+}
+
+/// Reject a batch response whose offer dictionary and `Have` indices do not bind
+/// to each other. Applied on BOTH encode and decode, and on decode against the RAW
+/// (pre-compaction) dictionary, so an out-of-range index is a hard error rather
+/// than something compaction quietly renumbers away.
+///
+/// The three rules, and why each is a rule and not a nicety:
+///   * IN RANGE - an index past the dictionary has no meaning, and the safe
+///     reading of it is not "ignore that offer" but "this response is not
+///     interpretable".
+///   * NO REPEAT inside one `Have` - a repeated index is duplicated state with two
+///     possible readings (one offer, or two identical offers); rejecting it leaves
+///     exactly one canonical meaning, the same argument as the duplicate-key guard.
+///   * EVERY ENTRY REFERENCED - an unreferenced locator is bound to no answered
+///     key. Content-specific locators (`BitTorrent`'s infohash) would then be
+///     volunteered rather than answered, which is both meaningless and a
+///     no-enumeration leak: it lets an all-`Absent` response say something about
+///     content the asker never named.
+pub(crate) fn check_batch_offer_bindings(
+    offer_count: usize,
+    answers: &[BatchHoldAnswer],
+) -> Result<(), ClaimCodecError> {
+    if answers.is_empty() {
+        return Err(ClaimCodecError::Malformed(
+            "a batch hold-response must answer at least one key".to_string(),
+        ));
+    }
+    if answers.len() > MAX_BATCH_HOLD_KEYS {
+        return Err(ClaimCodecError::BatchTooLarge {
+            found: answers.len(),
+            cap: MAX_BATCH_HOLD_KEYS,
+        });
+    }
+    if offer_count > MAX_BATCH_HOLD_OFFERS {
+        return Err(ClaimCodecError::BatchTooLarge {
+            found: offer_count,
+            cap: MAX_BATCH_HOLD_OFFERS,
+        });
+    }
+    let mut referenced = vec![false; offer_count];
+    for (position, answer) in answers.iter().enumerate() {
+        let BatchHoldAnswer::Have { offer_indices, .. } = answer else {
+            continue;
+        };
+        let mut seen = std::collections::HashSet::with_capacity(offer_indices.len());
+        for index in offer_indices {
+            let at = usize::from(*index);
+            if at >= offer_count {
+                return Err(ClaimCodecError::Malformed(format!(
+                    "batch answer {position} names offer {at}, but the response carries \
+                     {offer_count} offers"
+                )));
+            }
+            if !seen.insert(at) {
+                return Err(ClaimCodecError::Malformed(format!(
+                    "batch answer {position} names offer {at} twice (ambiguous response \
+                     is rejected)"
+                )));
+            }
+            referenced[at] = true;
+        }
+    }
+    if let Some(orphan) = referenced.iter().position(|seen| !seen) {
+        return Err(ClaimCodecError::Malformed(format!(
+            "batch response offer {orphan} is referenced by no answer - a locator must \
+             bind to a key the asker named"
+        )));
+    }
+    Ok(())
+}
+
+/// Drop the unknown-transport slots and RE-INDEX every `Have` onto the compacted
+/// dictionary, so the value handed to a caller has no holes and its indices still
+/// point at the same locators the peer meant.
+///
+/// A `Have` whose only offers were unknown transports ends up with an empty
+/// `offer_indices`: the holding is still asserted, but this build cannot fetch it.
+/// That is the tolerate-but-drop rule applied per key instead of per response.
+fn compact_offer_slots(
+    slots: Vec<Option<KnownTransport>>,
+    answers: &mut [BatchHoldAnswer],
+) -> Vec<KnownTransport> {
+    // `remap[old] == Some(new)` for a kept slot, `None` for a dropped one.
+    let mut remap: Vec<Option<OfferIndex>> = Vec::with_capacity(slots.len());
+    let mut kept: Vec<KnownTransport> = Vec::with_capacity(slots.len());
+    for slot in slots {
+        match slot {
+            Some(offer) => {
+                remap.push(Some(kept.len() as OfferIndex));
+                kept.push(offer);
+            }
+            None => remap.push(None),
+        }
+    }
+    for answer in answers.iter_mut() {
+        if let BatchHoldAnswer::Have { offer_indices, .. } = answer {
+            // `get`, not `[]`: an out-of-range index is already rejected by
+            // `check_batch_offer_bindings` before this runs, so this arm is
+            // unreachable by contract - but this function's input comes off the
+            // wire, and a decoder that PANICS on hostile input is a denial of
+            // service even when the panic is technically a fail-fast. Dropping is
+            // the safe direction here: it can cost a fetch coordinate, never bind
+            // one to the wrong key.
+            offer_indices.retain_mut(|index| match remap.get(usize::from(*index)) {
+                Some(Some(new)) => {
+                    *index = *new;
+                    true
+                }
+                Some(None) | None => false,
+            });
+        }
+    }
+    kept
 }
 
 /// Reject a batch key list that is empty, over the cap, or contains a repeated
 /// key. Applied on BOTH encode and decode, so this node can neither send nor
 /// accept a batch that violates the bound - a sender-side check alone would let a
 /// bug here become a peer's problem.
-fn check_batch_keys(keys: &[NarHashKey]) -> Result<(), ClaimCodecError> {
+pub(crate) fn check_batch_keys(keys: &[NarHashKey]) -> Result<(), ClaimCodecError> {
     if keys.is_empty() {
         return Err(ClaimCodecError::Malformed(
             "a batch hold-query must name at least one key".to_string(),
@@ -659,7 +884,27 @@ impl std::error::Error for ClaimCodecError {}
 
 /// Encode a claim to its wire bytes (JSON draft codec).
 pub fn encode_claim(claim: &Claim) -> Result<Vec<u8>, ClaimCodecError> {
-    serde_json::to_vec(claim).map_err(|e| ClaimCodecError::Malformed(e.to_string()))
+    encode_checked(claim)
+}
+
+/// Serialize a wire value, refusing to EMIT anything the decode side would refuse
+/// to ACCEPT.
+///
+/// Every decoder in this module runs [`check_size`] on its input as its very first
+/// act; until now no encoder ran it on its output, so this node could construct
+/// and send a message that no node - including itself - would take. That
+/// asymmetry is exactly the amplification surface a batched response opens: a
+/// 91-byte query could draw a 52 KiB answer, and a caller that hands in a
+/// thousand offers could push it past 64 KiB and only find out at the far end.
+/// Bounding the sender means the bug fails HERE, loudly, at the point of the
+/// mistake - the same fail-fast rationale as the encode-side key cap.
+///
+/// The gate is on the SERIALIZED length, because that is the quantity the wire
+/// cap is about; a field-count check cannot stand in for it.
+fn encode_checked<T: Serialize>(value: &T) -> Result<Vec<u8>, ClaimCodecError> {
+    let bytes = serde_json::to_vec(value).map_err(|e| ClaimCodecError::Malformed(e.to_string()))?;
+    check_size(bytes.len())?;
+    Ok(bytes)
 }
 
 /// Reject an oversize wire input BEFORE parsing (freeze round 3). A claim is
@@ -787,7 +1032,7 @@ pub fn decode_claim(bytes: &[u8]) -> Result<Claim, ClaimCodecError> {
 
 /// Encode a hold query to its wire bytes.
 pub fn encode_hold_query(query: &HoldQuery) -> Result<Vec<u8>, ClaimCodecError> {
-    serde_json::to_vec(query).map_err(|e| ClaimCodecError::Malformed(e.to_string()))
+    encode_checked(query)
 }
 
 /// Decode + validate a hold query (size-, duplicate-key- and version-checked).
@@ -802,7 +1047,7 @@ pub fn decode_hold_query(bytes: &[u8]) -> Result<HoldQuery, ClaimCodecError> {
 
 /// Encode a hold response to its wire bytes.
 pub fn encode_hold_response(response: &HoldResponse) -> Result<Vec<u8>, ClaimCodecError> {
-    serde_json::to_vec(response).map_err(|e| ClaimCodecError::Malformed(e.to_string()))
+    encode_checked(response)
 }
 
 /// Decode + validate a hold response (size-, duplicate-key- and version-checked).
@@ -821,7 +1066,7 @@ pub fn decode_hold_response(bytes: &[u8]) -> Result<HoldResponse, ClaimCodecErro
 /// point of the mistake - not as a peer's rejection three hops later.
 pub fn encode_batch_hold_query(query: &BatchHoldQuery) -> Result<Vec<u8>, ClaimCodecError> {
     check_batch_keys(&query.keys)?;
-    serde_json::to_vec(query).map_err(|e| ClaimCodecError::Malformed(e.to_string()))
+    encode_checked(query)
 }
 
 /// Decode + validate a batched hold query.
@@ -844,19 +1089,19 @@ pub fn decode_batch_hold_query(bytes: &[u8]) -> Result<BatchHoldQuery, ClaimCode
     Ok(query)
 }
 
-/// Encode a batched hold response to its wire bytes. The answer count is capped
-/// by the same [`MAX_BATCH_HOLD_KEYS`] bound as the query it answers, so a
-/// responder cannot emit more answers than any legal query could have asked for.
+/// Encode a batched hold response to its wire bytes.
+///
+/// Three bounds, all of them the SENDER refusing to create a problem rather than
+/// exporting it: the answer count is capped by the same [`MAX_BATCH_HOLD_KEYS`]
+/// bound as the query it answers; the offer dictionary must be capped and bound to
+/// the answers ([`check_batch_offer_bindings`]); and the SERIALIZED length must
+/// fit the wire gate ([`encode_checked`]), because neither of the first two is a
+/// byte count and the amplification budget is measured in bytes.
 pub fn encode_batch_hold_response(
     response: &BatchHoldResponse,
 ) -> Result<Vec<u8>, ClaimCodecError> {
-    if response.answers.len() > MAX_BATCH_HOLD_KEYS {
-        return Err(ClaimCodecError::BatchTooLarge {
-            found: response.answers.len(),
-            cap: MAX_BATCH_HOLD_KEYS,
-        });
-    }
-    serde_json::to_vec(response).map_err(|e| ClaimCodecError::Malformed(e.to_string()))
+    check_batch_offer_bindings(response.offers.len(), &response.answers)?;
+    encode_checked(response)
 }
 
 /// Decode + validate a batched hold response against the number of keys THIS node
@@ -871,22 +1116,51 @@ pub fn encode_batch_hold_response(
 /// Allocation is bounded before that check by [`MAX_CLAIM_WIRE_BYTES`]: the
 /// smallest legal answer element is ~19 bytes, so a 64 KiB response cannot parse
 /// into more than a few thousand answers even before the count is compared.
+///
+/// `keys_asked` IS NOT TRUSTED. It says what this node asked, and a caller that
+/// passes 257 (or 0) is as much a bug as a peer that answers 257 times, so the
+/// protocol cap is applied to it FIRST and independently. Otherwise the cap would
+/// be a caller precondition rather than a property of the decoder, and a single
+/// wrong call site would re-open the amplification the cap exists to close.
+///
+/// The offer dictionary is validated against the RAW, pre-drop positions and only
+/// then compacted, so an unknown transport kind cannot renumber a later index onto
+/// a different locator - see [`BatchHoldResponse`] for why this type has no
+/// derived `Deserialize` at all.
 pub fn decode_batch_hold_response(
     bytes: &[u8],
     keys_asked: usize,
 ) -> Result<BatchHoldResponse, ClaimCodecError> {
     check_size(bytes.len())?;
-    reject_duplicate_keys(bytes)?;
-    let response: BatchHoldResponse =
-        serde_json::from_slice(bytes).map_err(|e| ClaimCodecError::Malformed(e.to_string()))?;
-    check_version(response.schema_version, QUERY_SCHEMA_VERSION)?;
-    if response.answers.len() != keys_asked {
-        return Err(ClaimCodecError::BatchAnswerCount {
-            expected: keys_asked,
-            found: response.answers.len(),
+    if keys_asked == 0 {
+        return Err(ClaimCodecError::Malformed(
+            "a batch hold-response was awaited for zero keys; no legal query asks none".to_string(),
+        ));
+    }
+    if keys_asked > MAX_BATCH_HOLD_KEYS {
+        return Err(ClaimCodecError::BatchTooLarge {
+            found: keys_asked,
+            cap: MAX_BATCH_HOLD_KEYS,
         });
     }
-    Ok(response)
+    reject_duplicate_keys(bytes)?;
+    let wire: BatchHoldResponseWire =
+        serde_json::from_slice(bytes).map_err(|e| ClaimCodecError::Malformed(e.to_string()))?;
+    check_version(wire.schema_version, QUERY_SCHEMA_VERSION)?;
+    if wire.answers.len() != keys_asked {
+        return Err(ClaimCodecError::BatchAnswerCount {
+            expected: keys_asked,
+            found: wire.answers.len(),
+        });
+    }
+    let mut answers = wire.answers;
+    check_batch_offer_bindings(wire.offers.len(), &answers)?;
+    let offers = compact_offer_slots(wire.offers, &mut answers);
+    Ok(BatchHoldResponse {
+        schema_version: wire.schema_version,
+        offers,
+        answers,
+    })
 }
 
 /// The one place the version gate lives, so claim and envelope share exactly one
@@ -1524,8 +1798,9 @@ mod tests {
             answers: vec![
                 BatchHoldAnswer::Have {
                     blake3: blake3_id(),
+                    offer_indices: vec![0],
                 },
-                BatchHoldAnswer::Absent,
+                BatchHoldAnswer::Absent {},
             ],
         };
         let bytes = encode_batch_hold_response(&response).expect("encode");
@@ -1632,10 +1907,49 @@ mod tests {
             answers: (0..MAX_BATCH_HOLD_KEYS)
                 .map(|_| BatchHoldAnswer::Have {
                     blake3: blake3_id(),
+                    offer_indices: vec![0, 1],
                 })
                 .collect(),
         };
         let response_bytes = encode_batch_hold_response(&response).expect("encode");
+
+        // The WORST REALISTIC case: every key answered Have with its own
+        // content-specific locator plus the shared peer-scoped one. This is the
+        // shape a BitTorrent-capable peer produces (task-75), and it is the case
+        // that decides between an indexed dictionary and inline per-answer offers.
+        let mut per_content = vec![KnownTransport::Iroh { node: node_a() }];
+        for i in 0..MAX_BATCH_HOLD_KEYS {
+            let mut raw = [0u8; 32];
+            raw[..8].copy_from_slice(&(i as u64).to_be_bytes());
+            per_content.push(KnownTransport::BitTorrent {
+                infohash: BitTorrentInfoHash::v2(raw),
+            });
+        }
+        let per_content_response = BatchHoldResponse {
+            schema_version: QUERY_SCHEMA_VERSION,
+            offers: per_content,
+            answers: (0..MAX_BATCH_HOLD_KEYS)
+                .map(|i| BatchHoldAnswer::Have {
+                    blake3: blake3_id(),
+                    offer_indices: vec![0, (i + 1) as OfferIndex],
+                })
+                .collect(),
+        };
+        let per_content_bytes = encode_batch_hold_response(&per_content_response).expect("encode");
+        assert!(
+            per_content_bytes.len() < MAX_CLAIM_WIRE_BYTES,
+            "a full batch with a per-content locator for every key is {} bytes and              does not fit the {MAX_CLAIM_WIRE_BYTES}-byte gate - a peer that holds              everything could not answer at all",
+            per_content_bytes.len()
+        );
+        // HONEST LIMIT, asserted so it cannot rot into an assumption: that case has
+        // only ~10% spare, not the 25% the common cases keep. The same answer with
+        // the offers INLINED instead of indexed measures ~79 KiB, i.e. over the
+        // gate - which is why they are indexed.
+        assert!(
+            per_content_bytes.len() > MAX_CLAIM_WIRE_BYTES * 3 / 4,
+            "if the per-content worst case now fits in 3/4 of the gate, the size              arithmetic in the MAX_BATCH_HOLD_KEYS doc is stale ({} bytes)",
+            per_content_bytes.len()
+        );
 
         // 25% headroom, so adding one field to an answer does not silently push
         // the worst case over the gate.
@@ -1696,7 +2010,7 @@ mod tests {
         let short = BatchHoldResponse {
             schema_version: QUERY_SCHEMA_VERSION,
             offers: vec![],
-            answers: vec![BatchHoldAnswer::Absent, BatchHoldAnswer::Absent],
+            answers: vec![BatchHoldAnswer::Absent {}, BatchHoldAnswer::Absent {}],
         };
         let bytes = encode_batch_hold_response(&short).expect("encode");
         match decode_batch_hold_response(&bytes, 3) {
@@ -1726,8 +2040,9 @@ mod tests {
             answers: vec![
                 BatchHoldAnswer::Have {
                     blake3: blake3_id(),
+                    offer_indices: vec![0],
                 },
-                BatchHoldAnswer::Absent,
+                BatchHoldAnswer::Absent {},
             ],
         };
         let on_wire: Value =
@@ -1746,6 +2061,7 @@ mod tests {
         // `deny_unknown_fields` on both the envelope and the answer entries.
         let smuggled = serde_json::json!({
             "schema_version": QUERY_SCHEMA_VERSION,
+            "offers": [],
             "answers": [ { "answer": "absent" } ],
             "also_held": [ KEY_HEX ]
         });
@@ -1768,8 +2084,10 @@ mod tests {
                 expected: QUERY_SCHEMA_VERSION
             })
         ));
+        // Shape-valid but version-wrong: the version gate is what must speak.
         let response = serde_json::json!({
             "schema_version": 999,
+            "offers": [],
             "answers": [ { "answer": "absent" } ]
         });
         assert!(matches!(
@@ -1778,6 +2096,21 @@ mod tests {
                 found: 999,
                 expected: QUERY_SCHEMA_VERSION
             })
+        ));
+        // HONEST LIMIT, shared with the frozen decoders: the version is read from
+        // the PARSED value, so a future version whose SHAPE also differs is
+        // reported as Malformed rather than UnsupportedVersion. It is still
+        // rejected - which is the safety property - but the diagnostic is the
+        // less useful of the two. Peeking the version before the typed parse would
+        // fix that for all five decoders at once and is deliberately not done
+        // piecemeal here.
+        let future_shape = serde_json::json!({
+            "schema_version": 999,
+            "answers": [ { "answer": "absent" } ]
+        });
+        assert!(matches!(
+            decode_batch_hold_response(&serde_json::to_vec(&future_shape).unwrap(), 1),
+            Err(ClaimCodecError::Malformed(_))
         ));
     }
 
@@ -1788,10 +2121,12 @@ mod tests {
         let wire = serde_json::json!({
             "schema_version": QUERY_SCHEMA_VERSION,
             "offers": [
-                { "transport": "iroh", "node": NODE_A_HEX },
-                { "transport": "webseed", "url": "https://x.invalid" }
+                { "transport": "webseed", "url": "https://x.invalid" },
+                { "transport": "iroh", "node": NODE_A_HEX }
             ],
-            "answers": [ { "answer": "have", "blake3": BLAKE3_HEX } ]
+            "answers": [
+                { "answer": "have", "blake3": BLAKE3_HEX, "offer_indices": [0, 1] }
+            ]
         });
         let decoded =
             decode_batch_hold_response(&serde_json::to_vec(&wire).unwrap(), 1).expect("decode");
@@ -1800,11 +2135,23 @@ mod tests {
             vec![KnownTransport::Iroh { node: node_a() }],
             "the unknown transport is dropped, not carried"
         );
+        // ...and the SURVIVING locator is still the one the answer meant. The
+        // unknown slot sat at index 0, so a naive drop would leave this Have
+        // pointing at [0, 1] over a one-element dictionary. The decoder compacts
+        // and re-indexes together, which is the whole reason it parses slots.
+        assert_eq!(
+            decoded.answers,
+            vec![BatchHoldAnswer::Have {
+                blake3: blake3_id(),
+                offer_indices: vec![0],
+            }],
+            "dropping an unknown offer must renumber the surviving indices"
+        );
 
         let malformed = serde_json::json!({
             "schema_version": QUERY_SCHEMA_VERSION,
             "offers": [ { "transport": "iroh", "node": "not-hex" } ],
-            "answers": [ { "answer": "absent" } ]
+            "answers": [ { "answer": "have", "blake3": BLAKE3_HEX, "offer_indices": [0] } ]
         });
         assert!(
             matches!(
@@ -1850,5 +2197,332 @@ mod tests {
                 expected: QUERY_SCHEMA_VERSION
             })
         ));
+    }
+
+    // ---- the freeze-round-6 rules: strict answers, bound offers, bound caller ----
+
+    #[test]
+    fn an_absent_batch_answer_rejects_any_field_attached_to_it() {
+        // C2. `deny_unknown_fields` on an internally-tagged enum is honoured for
+        // STRUCT variants and is SILENTLY INERT for UNIT variants - established by
+        // experiment, not read off the documentation. `Absent` is therefore an
+        // EMPTY STRUCT variant (`Absent {}`), which emits the same bytes and is
+        // strict. This test is what stops someone "simplifying" it back.
+        let smuggled = serde_json::json!({
+            "schema_version": QUERY_SCHEMA_VERSION,
+            "offers": [],
+            "answers": [ { "answer": "absent", "blake3": BLAKE3_HEX } ]
+        });
+        assert!(
+            matches!(
+                decode_batch_hold_response(&serde_json::to_vec(&smuggled).unwrap(), 1),
+                Err(ClaimCodecError::Malformed(_))
+            ),
+            "an Absent answer carrying a content identity must be rejected"
+        );
+        // ...and the encoding really is unchanged by the empty-struct form.
+        let absent = BatchHoldResponse {
+            schema_version: QUERY_SCHEMA_VERSION,
+            offers: vec![],
+            answers: vec![BatchHoldAnswer::Absent {}],
+        };
+        assert_eq!(
+            String::from_utf8(encode_batch_hold_response(&absent).unwrap()).unwrap(),
+            "{\"schema_version\":1,\"offers\":[],\"answers\":[{\"answer\":\"absent\"}]}"
+        );
+    }
+
+    #[test]
+    fn a_have_answer_rejects_a_second_identity_like_field() {
+        // The two-blob-claim class, on the type being frozen now: a Have with a
+        // valid blake3 AND a blake3_shadow, or with a smuggled also_held listing,
+        // decoded happily before `deny_unknown_fields` reached the answer entries.
+        for extra in [
+            serde_json::json!({
+                "answer": "have", "blake3": BLAKE3_HEX, "offer_indices": [],
+                "blake3_shadow": BLAKE3_HEX
+            }),
+            serde_json::json!({
+                "answer": "have", "blake3": BLAKE3_HEX, "offer_indices": [],
+                "also_held": [ KEY_HEX ]
+            }),
+            serde_json::json!({
+                "answer": "have", "blake3": BLAKE3_HEX, "offer_indices": [], "key": KEY_HEX
+            }),
+        ] {
+            let wire = serde_json::json!({
+                "schema_version": QUERY_SCHEMA_VERSION,
+                "offers": [],
+                "answers": [ extra ]
+            });
+            assert!(
+                matches!(
+                    decode_batch_hold_response(&serde_json::to_vec(&wire).unwrap(), 1),
+                    Err(ClaimCodecError::Malformed(_))
+                ),
+                "an unknown field on a Have answer must be rejected: {wire}"
+            );
+        }
+    }
+
+    /// A one-answer response naming `indices` over a dictionary of `offer_count`
+    /// iroh locators, as raw wire bytes - so the test can express wires our own
+    /// encoder would refuse to build.
+    fn batch_wire(offer_count: usize, indices: &[u16]) -> Vec<u8> {
+        let offers: Vec<Value> = (0..offer_count)
+            .map(|i| {
+                let mut raw = [0u8; 32];
+                raw[0] = i as u8;
+                serde_json::json!({
+                    "transport": "iroh",
+                    "node": NodeId::from_bytes(raw).to_string()
+                })
+            })
+            .collect();
+        serde_json::to_vec(&serde_json::json!({
+            "schema_version": QUERY_SCHEMA_VERSION,
+            "offers": offers,
+            "answers": [
+                { "answer": "have", "blake3": BLAKE3_HEX, "offer_indices": indices }
+            ]
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn an_offer_index_outside_the_dictionary_is_rejected() {
+        assert!(matches!(
+            decode_batch_hold_response(&batch_wire(1, &[1]), 1),
+            Err(ClaimCodecError::Malformed(_))
+        ));
+        assert!(matches!(
+            decode_batch_hold_response(&batch_wire(0, &[0]), 1),
+            Err(ClaimCodecError::Malformed(_))
+        ));
+        // An out-of-range index ALONGSIDE valid ones, so the rejection cannot be
+        // credited to the every-offer-referenced rule: here both dictionary
+        // entries ARE referenced and the wire must still be refused.
+        assert!(matches!(
+            decode_batch_hold_response(&batch_wire(2, &[0, 1, 5]), 1),
+            Err(ClaimCodecError::Malformed(_))
+        ));
+        // The in-range case is the control: without it this test could pass by
+        // rejecting everything.
+        assert!(decode_batch_hold_response(&batch_wire(1, &[0]), 1).is_ok());
+        assert!(decode_batch_hold_response(&batch_wire(2, &[0, 1]), 1).is_ok());
+    }
+
+    #[test]
+    fn a_repeated_offer_index_inside_one_answer_is_rejected() {
+        // Duplicated state with two readings (one offer, or two identical ones).
+        // Same argument as the duplicate-JSON-key guard: exactly one canonical
+        // meaning, fail-closed rather than last-wins.
+        assert!(matches!(
+            decode_batch_hold_response(&batch_wire(2, &[0, 1, 0]), 1),
+            Err(ClaimCodecError::Malformed(_))
+        ));
+        assert!(decode_batch_hold_response(&batch_wire(2, &[0, 1]), 1).is_ok());
+    }
+
+    #[test]
+    fn an_offer_bound_to_no_answered_key_is_rejected() {
+        // The no-enumeration half of the offer-hoisting defect: a locator that no
+        // Have references is bound to nothing the asker named. For a per-CONTENT
+        // locator (a BitTorrent infohash) that is a peer VOLUNTEERING content, in
+        // a message whose whole safety argument is that it cannot.
+        assert!(matches!(
+            decode_batch_hold_response(&batch_wire(2, &[0]), 1),
+            Err(ClaimCodecError::Malformed(_))
+        ));
+        // The sharpest case: an ALL-ABSENT response carrying a content-specific
+        // locator. It answered nothing, so it may say nothing.
+        let all_absent_with_offer = serde_json::to_vec(&serde_json::json!({
+            "schema_version": QUERY_SCHEMA_VERSION,
+            "offers": [ { "transport": "bittorrent", "infohash": INFOHASH_HEX } ],
+            "answers": [ { "answer": "absent" } ]
+        }))
+        .unwrap();
+        assert!(matches!(
+            decode_batch_hold_response(&all_absent_with_offer, 1),
+            Err(ClaimCodecError::Malformed(_))
+        ));
+        // ...and our own encoder refuses to BUILD one, so this node cannot be the
+        // peer that does it either.
+        assert!(matches!(
+            encode_batch_hold_response(&BatchHoldResponse {
+                schema_version: QUERY_SCHEMA_VERSION,
+                offers: vec![KnownTransport::BitTorrent {
+                    infohash: infohash()
+                }],
+                answers: vec![BatchHoldAnswer::Absent {}],
+            }),
+            Err(ClaimCodecError::Malformed(_))
+        ));
+    }
+
+    #[test]
+    fn the_decoder_applies_the_key_cap_to_the_caller_too() {
+        // C3. `keys_asked` used to be TRUSTED, so a 257-answer response decoded
+        // cleanly when a caller passed 257 - the cap was a caller precondition,
+        // not a property of the decoder. One wrong call site re-opened the whole
+        // amplification budget.
+        let over = MAX_BATCH_HOLD_KEYS + 1;
+        let answers: Vec<Value> = (0..over)
+            .map(|_| serde_json::json!({ "answer": "absent" }))
+            .collect();
+        let wire = serde_json::to_vec(&serde_json::json!({
+            "schema_version": QUERY_SCHEMA_VERSION,
+            "offers": [],
+            "answers": answers
+        }))
+        .unwrap();
+        assert!(
+            matches!(
+                decode_batch_hold_response(&wire, over),
+                Err(ClaimCodecError::BatchTooLarge { found, cap })
+                    if found == over && cap == MAX_BATCH_HOLD_KEYS
+            ),
+            "an over-cap answer count must be refused however confidently the \
+             caller asks for it"
+        );
+        // Zero is equally impossible: no legal query names no keys, so a caller
+        // awaiting zero answers is a bug, not an empty result.
+        assert!(matches!(
+            decode_batch_hold_response(&batch_wire(1, &[0]), 0),
+            Err(ClaimCodecError::Malformed(_))
+        ));
+
+        // ...and the check is on the CALLER, applied before the response is
+        // parsed at all - not a side effect of validating what came back. Asserted
+        // by handing in bytes that are not JSON: if `keys_asked` were still
+        // trusted, the parse would fail first and the caller's own illegal count
+        // would never be named. A mutation removing the keys_asked cap survived an
+        // earlier version of this test, because the ANSWER-count cap downstream
+        // caught the same wire and produced an indistinguishable error.
+        let garbage = b"this is not JSON";
+        assert!(
+            matches!(
+                decode_batch_hold_response(garbage, over),
+                Err(ClaimCodecError::BatchTooLarge { found, cap })
+                    if found == over && cap == MAX_BATCH_HOLD_KEYS
+            ),
+            "an over-cap keys_asked must be refused before the response is parsed"
+        );
+        match decode_batch_hold_response(garbage, 0) {
+            Err(ClaimCodecError::Malformed(why)) => assert!(
+                why.contains("zero keys"),
+                "a zero keys_asked must be named as such, not reported as a parse                  failure: {why}"
+            ),
+            other => panic!("awaiting zero answers must be refused: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn an_encoder_refuses_to_emit_what_no_decoder_would_accept() {
+        // C3, encode side. Every decoder gates its INPUT at MAX_CLAIM_WIRE_BYTES;
+        // until now no encoder gated its OUTPUT, so this node could build a message
+        // it would itself reject. Two bounds close it: the offer-dictionary cap and
+        // the serialized size.
+        let too_many_offers: Vec<KnownTransport> = (0..=MAX_BATCH_HOLD_OFFERS)
+            .map(|i| {
+                let mut raw = [0u8; 32];
+                raw[..8].copy_from_slice(&(i as u64).to_be_bytes());
+                KnownTransport::Iroh {
+                    node: NodeId::from_bytes(raw),
+                }
+            })
+            .collect();
+        let indices: Vec<OfferIndex> = (0..too_many_offers.len() as OfferIndex).collect();
+        assert!(
+            matches!(
+                encode_batch_hold_response(&BatchHoldResponse {
+                    schema_version: QUERY_SCHEMA_VERSION,
+                    offers: too_many_offers,
+                    answers: vec![BatchHoldAnswer::Have {
+                        blake3: blake3_id(),
+                        offer_indices: indices,
+                    }],
+                }),
+                Err(ClaimCodecError::BatchTooLarge { .. })
+            ),
+            "one answer must not be able to drag an unbounded offer dictionary \
+             along with it"
+        );
+
+        // And a dictionary UNDER the count cap that is still over the byte gate is
+        // refused by the size check - the count cap alone is not a byte budget.
+        let heavy: Vec<KnownTransport> = (0..MAX_BATCH_HOLD_OFFERS)
+            .map(|i| {
+                let mut raw = [0u8; 32];
+                raw[..8].copy_from_slice(&(i as u64).to_be_bytes());
+                KnownTransport::Iroh {
+                    node: NodeId::from_bytes(raw),
+                }
+            })
+            .collect();
+        let indices: Vec<OfferIndex> = (0..heavy.len() as OfferIndex).collect();
+        let heavy_response = BatchHoldResponse {
+            schema_version: QUERY_SCHEMA_VERSION,
+            offers: heavy,
+            answers: (0..MAX_BATCH_HOLD_KEYS)
+                .map(|_| BatchHoldAnswer::Have {
+                    blake3: blake3_id(),
+                    offer_indices: indices.clone(),
+                })
+                .collect(),
+        };
+        match encode_batch_hold_response(&heavy_response) {
+            Err(ClaimCodecError::Malformed(why)) => assert!(
+                why.contains("exceeds"),
+                "the size gate must say what it refused: {why}"
+            ),
+            other => panic!("an over-size batch response must not be emitted: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn the_slot_and_drop_transport_decoders_agree() {
+        // `deserialize_transport_slots` duplicates the tolerate-but-drop rule of
+        // `deserialize_known_transports` (the frozen one is left untouched so the
+        // freeze audit over this file stays meaningful). Duplicated logic drifts,
+        // so the agreement is asserted rather than asserted-in-a-comment.
+        #[derive(Deserialize)]
+        struct Dropped {
+            #[serde(deserialize_with = "deserialize_known_transports")]
+            offers: Vec<KnownTransport>,
+        }
+        #[derive(Deserialize)]
+        struct Slotted {
+            #[serde(deserialize_with = "deserialize_transport_slots")]
+            offers: Vec<Option<KnownTransport>>,
+        }
+        let inputs = [
+            serde_json::json!({ "offers": [] }),
+            serde_json::json!({ "offers": [ { "transport": "iroh", "node": NODE_A_HEX } ] }),
+            serde_json::json!({ "offers": [
+                { "transport": "webseed", "url": "x" },
+                { "transport": "iroh", "node": NODE_A_HEX },
+                { "transport": "carrier_pigeon" },
+                { "transport": "bittorrent", "infohash": INFOHASH_HEX }
+            ] }),
+        ];
+        for input in inputs {
+            let bytes = serde_json::to_vec(&input).unwrap();
+            let dropped: Dropped = serde_json::from_slice(&bytes).unwrap();
+            let slotted: Slotted = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(
+                dropped.offers,
+                slotted.offers.into_iter().flatten().collect::<Vec<_>>(),
+                "the two decoders disagree on {input}"
+            );
+        }
+        // ...including on the hard-error case: a malformed KNOWN transport must
+        // fail both, not be quietly slotted as unknown.
+        let malformed = serde_json::to_vec(
+            &serde_json::json!({ "offers": [ { "transport": "iroh", "node": "nope" } ] }),
+        )
+        .unwrap();
+        assert!(serde_json::from_slice::<Dropped>(&malformed).is_err());
+        assert!(serde_json::from_slice::<Slotted>(&malformed).is_err());
     }
 }

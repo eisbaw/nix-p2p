@@ -76,10 +76,11 @@ use async_trait::async_trait;
 use crate::availability::AvailabilityIndex;
 use crate::claim::{
     BatchHoldAnswer, BatchHoldQuery, BatchHoldResponse, CLAIM_SCHEMA_VERSION, Claim, HoldAnswer,
-    HoldQuery, HoldResponse, KnownPayload, KnownTransport, MAX_BATCH_HOLD_KEYS, NarHashKey,
-    QUERY_SCHEMA_VERSION, decode_batch_hold_query, decode_batch_hold_response, decode_hold_query,
-    decode_hold_response, encode_batch_hold_query, encode_batch_hold_response, encode_hold_query,
-    encode_hold_response,
+    HoldQuery, HoldResponse, KnownPayload, KnownTransport, MAX_BATCH_HOLD_KEYS,
+    MAX_BATCH_HOLD_OFFERS, NarHashKey, OfferIndex, QUERY_SCHEMA_VERSION, check_batch_keys,
+    check_batch_offer_bindings, decode_batch_hold_query, decode_batch_hold_response,
+    decode_hold_query, decode_hold_response, encode_batch_hold_query, encode_batch_hold_response,
+    encode_hold_query, encode_hold_response,
 };
 use crate::source::{NarKey, NarSource, SourceError, UpstreamResponse};
 use crate::transport::NodeId;
@@ -256,7 +257,19 @@ pub trait PeerQuery: Send + Sync {
         node: &NodeId,
         query: &BatchHoldQuery,
     ) -> Result<BatchHoldResponse, PeerQueryError> {
+        // The cap applies to the SHIM too, and before any probe is issued. Its
+        // return value is a wire message: constructing an over-cap one would build
+        // something no decoder on the network accepts, and doing so only AFTER 257
+        // single round trips would spend the cost first and refuse afterwards.
+        check_batch_keys(&query.keys).map_err(|e| PeerQueryError::Codec(e.to_string()))?;
         let mut answers = Vec::with_capacity(query.keys.len().min(MAX_BATCH_HOLD_KEYS));
+        // The offer DICTIONARY built up as the per-key answers arrive. Each key's
+        // own locators are interned here and referenced BY INDEX, so a locator that
+        // is content-specific (a BitTorrent infohash belongs to one NAR, not to the
+        // peer) stays bound to the key it came from. An earlier revision kept the
+        // FIRST Have's offers and gave them to every Have, which bound key 2's
+        // claim to key 1's infohash - a wrong dial, and a locator volunteered for
+        // content the asker never asked about.
         let mut offers: Vec<KnownTransport> = Vec::new();
         for key in &query.keys {
             let single = HoldQuery {
@@ -269,30 +282,58 @@ pub trait PeerQuery: Send + Sync {
                         blake3,
                         offers: key_offers,
                     } => {
-                        // The batch form hoists offers to the response; in the shim
-                        // they come per-key, so the first Have's offers become the
-                        // peer's. They are the same peer's locators by construction
-                        // (one node answered every probe).
-                        if offers.is_empty() {
-                            offers = key_offers;
+                        let mut offer_indices = Vec::with_capacity(key_offers.len());
+                        for offer in key_offers {
+                            // Intern: an identical locator (the common case - one
+                            // iroh NodeId for every key) is stored once.
+                            let at = match offers.iter().position(|known| *known == offer) {
+                                Some(at) => at,
+                                None => {
+                                    if offers.len() >= MAX_BATCH_HOLD_OFFERS {
+                                        return Err(PeerQueryError::Codec(format!(
+                                            "peer {node} offered more than \
+                                             {MAX_BATCH_HOLD_OFFERS} distinct locators \
+                                             across one batch"
+                                        )));
+                                    }
+                                    offers.push(offer);
+                                    offers.len() - 1
+                                }
+                            };
+                            let at = at as OfferIndex;
+                            // The wire rejects a repeated index inside one answer,
+                            // and a peer may legally repeat an offer within one
+                            // single-key answer, so dedupe here.
+                            if !offer_indices.contains(&at) {
+                                offer_indices.push(at);
+                            }
                         }
-                        answers.push(BatchHoldAnswer::Have { blake3 });
+                        answers.push(BatchHoldAnswer::Have {
+                            blake3,
+                            offer_indices,
+                        });
                     }
-                    HoldAnswer::Absent => answers.push(BatchHoldAnswer::Absent),
+                    HoldAnswer::Absent => answers.push(BatchHoldAnswer::Absent {}),
                 },
                 Err(err @ PeerQueryError::Answer(_)) => {
                     eprintln!("daemon: batch probe of {node}: {key} failed ({err}); Absent");
-                    answers.push(BatchHoldAnswer::Absent);
+                    answers.push(BatchHoldAnswer::Absent {});
                 }
                 // A peer-level fault is true of every key; do not burn N-1 more.
                 Err(err) => return Err(err),
             }
         }
-        Ok(BatchHoldResponse {
+        // Interning can leave an entry no surviving answer references only if a
+        // Have was later replaced - it cannot happen above, but the codec's rule is
+        // the authority, so assemble and let the shared check speak if it ever does.
+        let response = BatchHoldResponse {
             schema_version: QUERY_SCHEMA_VERSION,
             offers,
             answers,
-        })
+        };
+        check_batch_offer_bindings(response.offers.len(), &response.answers)
+            .map_err(|e| PeerQueryError::Codec(e.to_string()))?;
+        Ok(response)
     }
 }
 
@@ -390,7 +431,8 @@ impl PeerQuery for InProcessPeerQuery {
         let keys_asked = decoded.keys.len();
         let response = tokio::task::spawn_blocking(move || index.answer_batch(&decoded))
             .await
-            .map_err(|e| PeerQueryError::Answer(format!("batch query task panicked: {e}")))?;
+            .map_err(|e| PeerQueryError::Answer(format!("batch query task panicked: {e}")))?
+            .map_err(|e| PeerQueryError::Codec(e.to_string()))?;
 
         // Node B -> A: back across the envelope, with the positional length
         // checked against what THIS node asked - never against what B claims.
@@ -586,15 +628,45 @@ impl Discovery for DirectDiscovery {
                     continue;
                 }
                 for (key, answer) in chunk.iter().zip(response.answers.iter()) {
-                    let BatchHoldAnswer::Have { blake3 } = answer else {
+                    let BatchHoldAnswer::Have {
+                        blake3,
+                        offer_indices,
+                    } = answer
+                    else {
                         continue;
                     };
+                    // THIS key's own locators, selected from the response's offer
+                    // dictionary - not the whole dictionary. Two things follow:
+                    // a content-specific locator (a BitTorrent infohash) stays bound
+                    // to the key it was offered for, and a 256-key answer retains
+                    // 256 small vectors rather than 256 clones of the dictionary.
+                    //
+                    // Defence in depth: the codec already proved every index is in
+                    // range. A missing one is therefore a bug on THIS side, so it is
+                    // logged and the whole answer is dropped rather than silently
+                    // producing a claim with a partial offer set.
+                    let mut offers = Vec::with_capacity(offer_indices.len());
+                    let mut out_of_range = false;
+                    for index in offer_indices {
+                        match response.offers.get(usize::from(*index)) {
+                            Some(offer) => offers.push(offer.clone()),
+                            None => out_of_range = true,
+                        }
+                    }
+                    if out_of_range {
+                        eprintln!(
+                            "daemon: peer {peer} answered {key} with an offer index outside \
+                             its own dictionary of {}; discarding that answer",
+                            response.offers.len()
+                        );
+                        continue;
+                    }
                     let claim = Self::claim_from_have(
                         key,
                         *peer,
                         HoldAnswer::Have {
                             blake3: *blake3,
-                            offers: response.offers.clone(),
+                            offers,
                         },
                     );
                     for i in positions.get(key).into_iter().flatten() {
@@ -1102,7 +1174,7 @@ mod tests {
             response
                 .answers
                 .iter()
-                .all(|a| *a == BatchHoldAnswer::Absent),
+                .all(|a| matches!(a, BatchHoldAnswer::Absent {})),
             "B holds none of the asked keys"
         );
         assert!(
@@ -1169,6 +1241,7 @@ mod tests {
                 answers: (0..query.keys.len().saturating_sub(1))
                     .map(|_| BatchHoldAnswer::Have {
                         blake3: Blake3Digest::from_bytes([0x99; 32]),
+                        offer_indices: vec![0],
                     })
                     .collect(),
             })
@@ -1266,10 +1339,12 @@ mod tests {
              probes and every round-trip count taken over it is wrong"
         );
 
-        // The shim, by contrast, sends N separate LEGAL single-key messages, so
-        // the per-message cap does not apply to it and it answers happily. That
-        // difference is deliberate: the cap bounds one message's size and one
-        // message's work, not a caller's total curiosity.
+        // The SHIM refuses it too, and refuses it BEFORE issuing any probe. An
+        // earlier revision let the shim through on the reasoning that it sends N
+        // separate legal single-key messages - true, but its RETURN VALUE is a
+        // wire message, and an over-cap BatchHoldResponse is one no decoder on the
+        // network would accept. The cap is a property of the message, not a
+        // courtesy the caller may opt out of by picking a different transport.
         struct SingleOnly(InProcessPeerQuery);
         #[async_trait]
         impl PeerQuery for SingleOnly {
@@ -1286,10 +1361,40 @@ mod tests {
         inner.add_index(node_b(), index);
         let shim = SingleOnly(inner).query_batch(&node_b(), &over_cap).await;
         assert!(
-            shim.is_ok(),
-            "the compatibility shim sends N legal single-key messages; the \
-             per-message cap does not apply to it"
+            matches!(shim, Err(PeerQueryError::Codec(_))),
+            "the shim must refuse an over-cap batch as well: got {shim:?}"
         );
+    }
+
+    #[test]
+    fn the_responder_enforces_the_key_cap_itself() {
+        // The RESPONDER's own refusal, reached without the wire in front of it.
+        // The wire path already rejects an over-cap query in `decode_batch_hold_
+        // query`, so every test that goes through a transport proves the DECODER's
+        // check and says nothing about the index's. That check used to be a
+        // `debug_assert` - absent in a release build - which made "at most 256
+        // `nix-store --dump`s per message" a caller precondition rather than a
+        // property of the responder.
+        let all = keys(MAX_BATCH_HOLD_KEYS + 1);
+        let (index, _dir) = index_holding_many(node_b(), &all[..1]);
+        let over_cap = BatchHoldQuery {
+            schema_version: QUERY_SCHEMA_VERSION,
+            keys: all,
+        };
+        assert!(
+            matches!(
+                index.answer_batch(&over_cap),
+                Err(crate::claim::ClaimCodecError::BatchTooLarge { .. })
+            ),
+            "answer_batch must refuse an over-cap batch, not probe 257 keys"
+        );
+        // The control: one key under the cap is answered normally, so the refusal
+        // above is the cap speaking and not a blanket failure.
+        let legal = BatchHoldQuery {
+            schema_version: QUERY_SCHEMA_VERSION,
+            keys: over_cap.keys[..1].to_vec(),
+        };
+        assert!(index.answer_batch(&legal).is_ok());
     }
 
     #[tokio::test]
@@ -1441,5 +1546,149 @@ mod tests {
             Ok(_) => panic!("a size abort must NOT be papered over by an upstream fetch"),
             Err(other) => panic!("a size abort must propagate unchanged, got {other}"),
         }
+    }
+
+    // ---- the defect that sent task-91 back: locators must bind to their key ----
+
+    /// A peer that answers every key `Have`, giving each key its OWN
+    /// content-specific BitTorrent locator plus one shared peer-scoped iroh
+    /// locator. Only the SINGLE-key method is implemented, so a `resolve_many`
+    /// over it exercises the default batch SHIM - which is where the misbinding
+    /// lived.
+    struct PerContentLocatorPeer;
+
+    /// A cheap, collision-free-enough digest of a key's canonical string, so each
+    /// stand-in locator below is DISTINCT per key and the expected binding is
+    /// computable in the assertions (FNV-1a; this is test scaffolding, not a
+    /// security primitive).
+    fn key_fingerprint(key: &NarHashKey) -> [u8; 32] {
+        let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+        for byte in key.to_string().as_bytes() {
+            hash ^= u64::from(*byte);
+            hash = hash.wrapping_mul(0x1000_0000_01b3);
+        }
+        let mut raw = [0u8; 32];
+        for chunk in 0..4 {
+            raw[chunk * 8..chunk * 8 + 8]
+                .copy_from_slice(&hash.wrapping_add(chunk as u64).to_be_bytes());
+        }
+        raw
+    }
+
+    /// The infohash this stand-in peer assigns to `key`: a pure function of the
+    /// key, so the expected binding is computable in the assertions.
+    fn infohash_for(key: &NarHashKey) -> crate::transport::BitTorrentInfoHash {
+        crate::transport::BitTorrentInfoHash::v2(key_fingerprint(key))
+    }
+
+    #[async_trait]
+    impl PeerQuery for PerContentLocatorPeer {
+        async fn query(
+            &self,
+            _node: &NodeId,
+            query: &HoldQuery,
+        ) -> Result<HoldResponse, PeerQueryError> {
+            Ok(HoldResponse {
+                schema_version: QUERY_SCHEMA_VERSION,
+                answer: HoldAnswer::Have {
+                    blake3: Blake3Digest::from_bytes(key_fingerprint(&query.key)),
+                    offers: vec![
+                        KnownTransport::Iroh { node: node_b() },
+                        KnownTransport::BitTorrent {
+                            infohash: infohash_for(&query.key),
+                        },
+                    ],
+                },
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn each_key_keeps_its_own_content_specific_locator() {
+        // THE regression test whose absence let the defect ship. A BitTorrent
+        // infohash addresses one piece of CONTENT, not a peer, so a response-wide
+        // offer list cannot express two keys with different infohashes. The old
+        // shim kept the FIRST Have's offers and the resolver cloned them onto every
+        // Have, so key 2's claim received key 1's infohash: a wrong dial, and a
+        // locator that binds to a key the asker never asked about.
+        let all = keys(3);
+        let discovery = DirectDiscovery::new(vec![node_b()], Arc::new(PerContentLocatorPeer));
+        let resolved = discovery.resolve_many(&all).await;
+
+        assert_eq!(resolved.len(), 3);
+        for (i, key) in all.iter().enumerate() {
+            let claim = resolved[i]
+                .as_ref()
+                .unwrap_or_else(|| panic!("key {i} must resolve"));
+            let mine = KnownTransport::BitTorrent {
+                infohash: infohash_for(key),
+            };
+            assert!(
+                claim.transports.contains(&mine),
+                "claim {i} must carry ITS OWN infohash; got {:?}",
+                claim.transports
+            );
+            // ...and NOT any other key's. This is the half that actually failed.
+            for (j, other) in all.iter().enumerate() {
+                if i == j {
+                    continue;
+                }
+                let theirs = KnownTransport::BitTorrent {
+                    infohash: infohash_for(other),
+                };
+                assert!(
+                    !claim.transports.contains(&theirs),
+                    "claim {i} received key {j}'s infohash - locators are not bound \
+                     to their key: {:?}",
+                    claim.transports
+                );
+            }
+            // The genuinely peer-scoped locator is shared, which is the whole
+            // reason the dictionary exists rather than per-answer inline offers.
+            assert!(
+                claim
+                    .transports
+                    .contains(&KnownTransport::Iroh { node: node_b() }),
+                "the peer-scoped iroh locator must reach every claim"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn the_shim_interns_a_shared_locator_instead_of_repeating_it() {
+        // The reason the offers are INDICES and not inline copies: one iroh
+        // locator answering N keys must cost one copy on the wire, or a full
+        // 256-key answer with two transports per key does not fit the 64 KiB gate
+        // that MAX_BATCH_HOLD_KEYS was chosen against.
+        let all = keys(4);
+        let query = BatchHoldQuery {
+            schema_version: QUERY_SCHEMA_VERSION,
+            keys: all.clone(),
+        };
+        let response = PerContentLocatorPeer
+            .query_batch(&node_b(), &query)
+            .await
+            .expect("probe");
+        assert_eq!(
+            response
+                .offers
+                .iter()
+                .filter(|o| matches!(o, KnownTransport::Iroh { .. }))
+                .count(),
+            1,
+            "the shared iroh locator must be interned once: {:?}",
+            response.offers
+        );
+        assert_eq!(
+            response.offers.len(),
+            1 + all.len(),
+            "one shared iroh locator plus one infohash per key"
+        );
+        // And it survives a real encode/decode with its bindings intact.
+        let bytes = encode_batch_hold_response(&response).expect("encode");
+        assert_eq!(
+            decode_batch_hold_response(&bytes, all.len()).expect("decode"),
+            response
+        );
     }
 }
