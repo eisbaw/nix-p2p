@@ -1,11 +1,11 @@
 ---
 id: TASK-91
 title: 'Batched hold-query: ask one peer about a whole closure in one round trip'
-status: Done
+status: In Progress
 assignee:
   - '@me'
 created_date: '2026-08-10 07:23'
-updated_date: '2026-08-10 12:22'
+updated_date: '2026-08-10 13:08'
 labels:
   - wave-2b
 dependencies:
@@ -73,102 +73,63 @@ TIMING OPPORTUNITY worth taking here: the daemon knows every NarHash the moment 
 ## Implementation Notes
 
 <!-- SECTION:NOTES:BEGIN -->
-## What landed (commits da74e47, 44e0df7, f421ee5, 922323a, 96b2834, 4da9eca)
+## CROSS-MODEL DEEP GATE: NO-GO (codex gpt-5.6, read-only, 2026-08-10) - and it is WORSE than the architect found
 
-FROZEN SURFACE, unchanged: HoldQuery / HoldAnswer / HoldResponse / Claim keep
-their exact bytes, now PINNED in daemon/tests/golden/claim_wire_v1.json. Those
-four vectors were written and verified green BEFORE any new type existed.
+Codex ran on retry after its first invocation died with an internal router error (recorded in git notes).
+It independently confirmed G1/G2/G3 AND found four things the architecture review did not. All by
+mutation under /tmp; no repository edits.
 
-ADDED alongside: BatchHoldQuery / BatchHoldAnswer / BatchHoldResponse on the same
-QUERY_SCHEMA_VERSION envelope.
+C1 (CRITICAL, ESCALATES G2 FROM A DOC GAP TO A LIVE BUG). Response-wide offer hoisting MISBINDS
+   content-specific locators - this is not a future limitation, it is a present correctness defect.
+   BatchHoldResponse has ONE global offers list (claim.rs:541) but BitTorrent{infohash} is
+   content-specific (claim.rs:301). The compatibility shim retains only the FIRST Have's offers
+   (discovery.rs:272), then the resolver CLONES those onto EVERY Have (discovery.rs:588).
+   RUNTIME TEST: two keys with distinct BLAKE3s and distinct BitTorrent infohashes -> KEY 2'S CLAIM
+   RECEIVED KEY 1'S INFOHASH. Also: an all-Absent response can legally carry arbitrary BitTorrent
+   offers, so locators need not bind to any asked key and can VOLUNTEER content-specific holdings -
+   which is a no-enumeration vector as well. Verdict: needs a schema redesign BEFORE freezing -
+   per-Have offers, an indexed offer dictionary, or a separate global type restricted to genuinely
+   peer-scoped locators.
 
-CAPS: MAX_BATCH_HOLD_KEYS = 256 (a real closure is ~200 paths; larger closures
-chunk). Chosen so BOTH directions fit the existing 64 KiB MAX_CLAIM_WIRE_BYTES
-pre-parse gate with >=25% headroom - a full query is ~15.9 KiB, a full all-Have
-response ~26 KiB - and that arithmetic is a TEST, so raising the cap to 1024
-fails the build (proven: mutation M5).
+C2 (CRITICAL, = G1 confirmed, with more attack surface). BatchHoldAnswer lacks deny_unknown_fields
+   (claim.rs:546). Wires that decode successfully today: Have with a valid blake3 PLUS a different
+   blake3_shadow; Have with an also_held list containing an UNASKED key; Absent carrying a blake3 or
+   key. So an accepted wire can carry two identity-like values while the decoder silently picks one -
+   the two-blob-claim class the round-3 freeze closed, reappearing. Codex independently reached the
+   same conclusion as the architect that C1 and C2 must be fixed TOGETHER.
 
-MEASURED (200-path closure, 8 peers, hit-rate 0.6 -> 120 resolved):
-  0 ms RTT   serial 1180 round trips (9.83/substitution)  6.1 ms
-             batched   8 round trips (0.07/substitution)  1.1 ms
-  50 ms RTT  serial 1180 round trips                  60 434 ms
-             batched   8 round trips                     412 ms
-  = 147.5x fewer round trips, 146.5x faster discovery wall clock.
-The 1180 (not 1600) is because a hit stops at the first holder; 1600 is the
-all-miss worst case.
+C3 (HIGH, NEW - the decode side has no cap at all). encode_batch_hold_response checks only
+   answers.len() (claim.rs:850) and bounds neither offers nor final serialized size;
+   decode_batch_hold_response TRUSTS keys_asked and never independently enforces MAX_BATCH_HOLD_KEYS
+   (claim.rs:874). Reproduced: 1 answer + 1,000 iroh offers encoded to 95,144 B (over the 64 KiB gate);
+   a 257-answer response DECODED when passed keys_asked=257; a 91-byte one-key query can receive an
+   accepted 52,644-byte response = 578.5x WIRE AMPLIFICATION. AvailabilityIndex::answer_batch has only
+   debug assertions (availability.rs:715), so the cap is a caller precondition, not a type invariant.
 
-## Gotchas and rejected approaches (feed-forward)
+C4 (HIGH, NEW - the golden freeze has a specific hole, proven by surviving mutation). The change IS
+   textually additive (585 insertions, zero deletions) and the golden DOES catch a renamed
+   HoldQuery.key (exit 101). BUT its only Have vector uses NON-EMPTY offers
+   (claim_wire_golden.rs:159), so adding skip_serializing_if="Vec::is_empty" - which CHANGES the legal
+   legacy Have{offers:[]} bytes - left all 7 golden tests GREEN. Removing #[serde(default)], which
+   changes decoder acceptance of omitted offers, also survives. Needs an explicit empty-offers encoding
+   vector plus decode-only vectors for accepted noncanonical legacy inputs.
 
-* PER-ANSWER OFFERS WERE REJECTED. Mirroring HoldAnswer exactly (offers inside
-  each Have) costs ~207 B/entry, so 256 all-Have answers would be ~53 KiB -
-  inside the 64 KiB gate but with no room for a future field. Hoisting offers to
-  the response is both smaller (~26 KiB) and TRUER: one peer answers one batch,
-  so its locators are a property of the peer, not of each key. Duplicated state
-  on the wire is the thing to avoid, not the thing to mirror.
-* THE RESPONSE DELIBERATELY ECHOES NO KEYS. Echoing them would have made the
-  answer self-describing - and would have created the one place a peer could
-  name a hash the asker did not. Positional-only makes 'volunteer a holding'
-  inexpressible rather than merely unanswered.
-* DUPLICATE KEYS IN A BATCH ARE REJECTED, not deduplicated, so a request has one
-  canonical meaning (same reasoning as the duplicate-JSON-key guard). The
-  RESOLVER de-duplicates before probing, because a caller's closure list may
-  legitimately repeat a hash.
-* PER-KEY FAULTS ANSWER Absent, they do not propagate. Propagating would let one
-  broken store path deny a peer a whole 200-path closure - a strictly worse
-  outcome CREATED by batching. Per-PEER faults (no route, wire fault) do
-  propagate: they are true of every key. This 'batching must not enlarge a blast
-  radius' rule is the general principle, not a local choice.
-* decode_batch_hold_response TAKES the asked count. A courtesy check a caller
-  might forget was not enough: a short answer silently re-indexes every later
-  key onto the wrong hash, which is the only way this message shape can produce
-  confident wrong answers.
+C5 (MEDIUM, NEW - the no-enumeration guard is demonstrably bypassable, not merely narrow). A /tmp
+   mutation added a NO-ARGUMENT method returning every derived holding's BLAKE3 wrapped in
+   BatchHoldResponse; BOTH no_enumeration tests still passed (exit 0). The honest responder does derive
+   answers from caller-supplied keys, but the GUARD does not enforce it.
 
-## Two oracles that were VACUOUS until a mutation said so
+VERIFIED GOOD by codex (independent of the architect): both batch decoders run the 64 KiB size gate
+BEFORE duplicate scanning and typed parsing; empty / over-256 / repeated semantic query keys rejected
+without truncation; 256 copies of one key rejected; a malformed NarHash mid-batch rejects the whole
+query; whole-tree duplicate JSON fields including nested answer fields rejected; unknown transport kinds
+dropped inertly while malformed known transports fail hard; positional answer length re-checked at the
+mapping site.
 
-1. The batched-vs-serial equivalence test ran against ONE peer, so mutating the
-   resolver to `&self.peers[..1]` (stop after the first peer) left it GREEN. Now
-   three peers hold disjoint slices and each claim's attribution is checked.
-2. Round trips are counted at the PeerQuery seam, so a transport that implemented
-   query_batch by internally looping the single-key form would be counted as ONE
-   exchange while costing N on the wire. Added
-   `the_in_process_batch_really_crosses_the_wire_not_the_shim`, which tells them
-   apart from OUTSIDE: only the encoding (native) path can refuse an over-cap
-   batch.
-
-## Mutation evidence: 10/10 oracles bite
-
-Each mutation asserted to have APPLIED (exact-once anchor + post-write check)
-before its result was trusted, then reverted and re-run green:
-  M1 HoldAnswer tag -> SCREAMING_SNAKE ................ golden hold_response RED
-  M2 Claim.holders renamed on the wire ................ golden claim RED
-  M3 BatchHoldResponse drops deny_unknown_fields ...... smuggled-listing test RED
-  M4 the key cap stops rejecting ...................... over-cap test RED
-  M4b same mutation .................................. native-vs-shim test RED
-  M5 MAX_BATCH_HOLD_KEYS 256 -> 1024 .................. wire-budget test RED
-  M6 codec answer-count check removed ................. wrong-length test RED
-  M7 resolver alignment check removed ................. misaligned test RED
-  M8 resolver probes only the first peer .............. equivalence test RED
-  M9 all_holdings() added to the index ................ no-enumeration guard RED
-
-## Honest limits (all stated in code, not only here)
-
-* NOT WIRED INTO THE SERVING PATH. Production still builds InMemoryDiscovery from
-  --p2p-claim config (daemon/src/main.rs), so nothing in the daemon calls
-  resolve_many yet and the ~300 ms narinfo->NAR window (task-35) is NOT yet used
-  to issue the batch. That wiring needs the closure correlation (TASK-93) and the
-  discovery seam v2 (TASK-100); doing it here would have meant designing both.
-* The measurement is CONTAINER-FREE for the same reason: there is no
-  peer-probing container path to run it over. It measures the library resolver
-  over the real wire codec, which is where the round trips are decided, with the
-  network emulated by an injected per-round-trip delay.
-* A chunk probe carries the same PROBE_TIMEOUT as a single probe, so a cold peer
-  that must hash 256 large NARs can time out and be treated as a miss. Safe
-  direction, but it under-reports. Filed as TASK-104 (do NOT fix by raising the
-  timeout).
-* The measured topology is uniform (key i held by peer i % peers). A skewed real
-  distribution would make the SERIAL arm cheaper (hits found at the first peer),
-  so this is not the batched arm's best case, but it is not a worst case for
-  serial either.
+Codex gates from a pristine HEAD copy under /tmp: build 0, lint 0, test 0 (257 cargo tests + script
+gates). Its adversarial suite reproduced 8/8 asserted bad behaviours. Note a preliminary just test
+exited 1 only because redirected cargo output hid ./target/debug/daemon from check-rewrite-realnix -
+an artifact of its own redirection, not a product fault.
 <!-- SECTION:NOTES:END -->
 
 ## Final Summary
