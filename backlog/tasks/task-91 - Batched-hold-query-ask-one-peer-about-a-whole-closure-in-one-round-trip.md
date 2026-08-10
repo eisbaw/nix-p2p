@@ -1,11 +1,11 @@
 ---
 id: TASK-91
 title: 'Batched hold-query: ask one peer about a whole closure in one round trip'
-status: In Progress
+status: Done
 assignee:
   - '@me'
 created_date: '2026-08-10 07:23'
-updated_date: '2026-08-10 14:08'
+updated_date: '2026-08-10 14:36'
 labels:
   - wave-2b
 dependencies:
@@ -288,47 +288,88 @@ HONEST LIMITS OF THIS ROUND
 FOLLOW-UPS FILED: TASK-106 (M1 total deadline + the per-peer-fault contradiction),
 TASK-107 (M3 log flood, M4 test name, M5 or_insert_with side effect), TASK-108
 (the testproxy flake). Forward-carried to TASK-100/101/103/75.
+
+## G3 WAS WIDER THAN THE GATE SCOPED IT (found while fixing it)
+
+The finding was handed over as prose-only, on the reading that the harness emits
+no wall-clock speedup factor and TESTING.md quotes none. The second half is true;
+the first is not. scripts/discoveryaxis.py emits wall_clock_reduction_factor_shaped
+in its JSON and PRINTED both factors in one semicolon-joined sentence every run:
+'round trips 147.5x fewer; discovery wall clock under emulated latency 146.2x
+faster'. That is the doubled claim, produced by the instrument. Correcting only the
+task notes would have left the machine still saying it.
+Fixed in e8a8175: the printer names the round-trip count as THE result, labels the
+shaped factor as confirming the emulation rather than corroborating the count, and
+prints the unshaped floor (5.5x this run) with its caveats; the JSON gains
+wall_clock_reduction_factor_shaped_is_derived and ..._unshaped. Both rules bite by
+mutation against discoveryaxis --self-test (M18, M19).
+This is the fifth-round pattern holding: assume one more hole remains.
 <!-- SECTION:NOTES:END -->
 
 ## Final Summary
 
 <!-- SECTION:FINAL_SUMMARY:BEGIN -->
 Batched hold-query landed as an ADDITION to the frozen claim wire, with the
-frozen bytes pinned first.
+frozen bytes pinned first - and then landed AGAIN after a three-reviewer DEEP
+gate returned NO-GO on the first attempt. This summary describes the second,
+corrected shape.
 
 WHAT: BatchHoldQuery / BatchHoldAnswer / BatchHoldResponse on the same
 QUERY_SCHEMA_VERSION envelope; HoldQuery / HoldAnswer / HoldResponse / Claim
-byte-identical and now pinned in daemon/tests/golden/claim_wire_v1.json (both
-directions - what we emit and what we accept). Seam: AvailabilityIndex::
-answer_batch, PeerQuery::query_batch, Discovery::resolve_many, each with a
-default that loops the single-key form so no existing impl changed.
+byte-identical and pinned in daemon/tests/golden/claim_wire_v1.json in both
+directions. Seam: AvailabilityIndex::answer_batch, PeerQuery::query_batch,
+Discovery::resolve_many, each with a default that loops the single-key form.
+
+LOCATORS BIND TO THEIR KEY, which is the design question the first attempt got
+wrong. A transport offer is not always peer-scoped: iroh's is a NodeId (one per
+PEER), BitTorrent's is an infohash (one per CONTENT). The response carries an
+offer DICTIONARY and each Have names its own entries BY INDEX, with every index
+in range, no index repeated inside one answer, and every dictionary entry
+referenced by at least one Have - so an all-Absent response cannot carry a
+locator at all. Chosen over inline per-answer offers on a measurement, not a
+preference: a full 256-key answer with an iroh locator plus a per-content
+infohash is 58 910 B indexed and ~79 912 B inlined against a 65 536 B gate, so
+inlining makes a legal, fully-populated answer unsendable once a second
+transport exists.
+
+NO ENUMERATION: the answer is positional over keys the asker named and carries
+no keys of its own - the golden response bytes contain no `sha256:` string at
+all - so volunteering a holding is inexpressible rather than merely unanswered.
+Made structural in daemon/tests/no_enumeration.rs, which now also sees a listing
+hidden in a WRAPPER return type and scopes its exemptions per file.
+
+BOUNDED, as a property of the messages rather than of their callers:
+MAX_BATCH_HOLD_KEYS = 256 and MAX_BATCH_HOLD_OFFERS = 512, applied on encode, on
+decode, to the caller-supplied asked count itself, in the responder, and in the
+compatibility shim. Every encoder gates its OUTPUT length, so this node cannot
+emit a message it would itself refuse. Over-cap is rejected, never truncated.
 
 MEASURED (200-path closure, 8 peers, 120 resolved): 1180 -> 8 round trips
-(147.5x), and 60 434 ms -> 412 ms discovery wall clock (146.5x) with a 50 ms
-per-round-trip delay injected. Round trips are a pure count; the wall clock is
-measured under an emulated network, stated as such. `just discovery` re-runs it
-in ~1 minute.
+(147.5x). Round trips are a pure COUNT and that is the result. The wall-clock
+figure is NOT a second, corroborating result: the harness computes the expected
+shaped time as round_trips x the injected RTT and invalidates a run outside the
+recovery band, so under a 50 ms injected delay the 60 483 ms -> 413 ms figure is
+that same count restated. The honest floor is the UNSHAPED arm, ~5.5x (single-digit
+milliseconds, so noisy run to run), against the most naive baseline available:
+strictly sequential across the 8 peers, no pipelining. The harness itself was
+printing both factors in one sentence and emitting the derived one in its JSON,
+so the correction is in the INSTRUMENT, not only in this text - it now names the
+round-trip count as the result, labels the shaped factor as confirming the
+emulation, and prints the unshaped floor. `just discovery` re-runs it in ~1 min.
 
-NO ENUMERATION, which is the design question this task really turns on: the
-answer is positional over keys the asker named and carries no keys of its own -
-the golden response bytes contain no `sha256:` string at all - so volunteering a
-holding is inexpressible rather than merely unanswered. Made structural in
-daemon/tests/no_enumeration.rs: across claim/availability/discovery, plural
-holdings out requires named keys in.
+Gates: build/lint/test/e2e/discovery all exit 0; 279 cargo tests; 26/26 e2e
+scenarios. 19/19 mutations bit a NAMED check, each verified to have APPLIED and
+to have been RESTORED - one of which (the caller-side key cap) came back GREEN
+first time because the oracle asserted the outcome rather than the boundary, and
+was rewritten until it bit.
 
-BOUNDED: MAX_BATCH_HOLD_KEYS = 256, chosen against the existing 64 KiB wire gate
-rather than beside it (full query ~15.9 KiB, full all-Have response ~26 KiB) and
-asserted, so raising it to 1024 fails the build. Over-cap is rejected on encode
-AND decode, never truncated.
-
-Gates: build/lint/test/e2e all exit 0; 257 cargo tests; 26/26 e2e scenarios.
-10/10 oracles proven to bite by mutation, each mutation asserted to have applied
-- one of which (M8) exposed a genuinely vacuous equivalence test that had been
-running against a single peer, now fixed.
-
-NOT DONE, deliberately: resolve_many is not yet called from the serving path
-(production still wires InMemoryDiscovery from config), so the ~300 ms
-narinfo->NAR window is not exploited - that needs TASK-93 + TASK-100. A chunk
-probe keeps the 5 s single-probe bound, so a cold peer can under-report;
-TASK-104. This is a DEEP-gated task and independent review has NOT run yet.
+NOT DONE, deliberately: resolve_many is not yet called from the serving path, so
+the ~300 ms narinfo->NAR window is not exploited (TASK-93 + TASK-100); a chunk
+probe keeps the 5 s single-probe bound so a cold peer can under-report
+(TASK-104); resolve_many has no TOTAL deadline (TASK-106); the batch path can
+log up to 256 lines per message (TASK-107). Three lines were removed from
+claim.rs - the bodies of three pre-existing encoders gaining the output size
+gate - and none is in a type definition, a serde attribute, a const or a
+decoder. THIS ROUND HAS NOT BEEN INDEPENDENTLY REVIEWED: the DEEP gate must be
+re-run by the orchestrator; the implementer does not self-certify.
 <!-- SECTION:FINAL_SUMMARY:END -->
