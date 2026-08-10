@@ -6,6 +6,7 @@ title: >-
 status: To Do
 assignee: []
 created_date: '2026-08-10 09:10'
+updated_date: '2026-08-10 09:16'
 labels:
   - wave-2b
 dependencies:
@@ -38,3 +39,9 @@ MEASURE, DO NOT ASSUME: zstd on nar data may not reach xz's ratio. Report the ac
 - [ ] #3 Gate-2 still holds: nix accepts the result byte-identically, and a corrupt or truncated compressed stream still FAILS rather than yielding a short nar - proven by mutation at the new boundary
 - [ ] #4 TASK-94's peer-wins inequality is re-evaluated with compression ON, and the README's speedup figures are re-measured or withdrawn - the current ones were taken against an uncompressed fixture upstream and overstate the peer path
 <!-- AC:END -->
+
+## Implementation Notes
+
+<!-- SECTION:NOTES:BEGIN -->
+ORDERING (orchestrator, 2026-08-10): this is the FIRST thing to build. Nothing about peer-vs-cache performance is measurable until it lands, and every published speedup figure is invalid until AC#4 re-measures them. TASK-94 measures the problem; this fixes it; TASK-67 (parallel/striped fetch) is only worth pricing afterwards, because four slow peers only add up to a CDN once each peer stops shipping 3.6x the bytes. Owner's plain-language summary of the sequence: compress the wire -> turn on LAN discovery (TASK-89) -> re-measure honestly -> multi-peer fetch -> only then decide internet-scale discovery.
+<!-- SECTION:NOTES:END -->
