@@ -518,7 +518,7 @@ impl Discovery for DirectDiscovery {
     ///     be treated as a miss. That is the safe direction (the fetch falls back
     ///     upstream), but it does mean a first batch against a cold peer can
     ///     under-report. A responder-side "answer with what is already derived"
-    ///     policy is TASK-102.
+    ///     policy is TASK-104.
     async fn resolve_many(&self, keys: &[NarHashKey]) -> Vec<Option<Claim>> {
         let mut results: Vec<Option<Claim>> = vec![None; keys.len()];
         if keys.is_empty() {

@@ -500,7 +500,7 @@ pub struct HoldResponse {
 ///     of which may cost one `nix-store --dump`. Note this is not NEW work - it
 ///     is exactly what the same 256 single-key probes cost today. Batching
 ///     removes round trips; it does not add per-key cost. A per-batch work/time
-///     budget (so one message cannot monopolise a responder) is TASK-102.
+///     budget (so one message cannot monopolise a responder) is TASK-104.
 pub const MAX_BATCH_HOLD_KEYS: usize = 256;
 
 /// A probe about MANY content identities at once: "of these N NarHashes, which do
