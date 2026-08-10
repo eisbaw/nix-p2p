@@ -1,0 +1,128 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1180" height="930" viewBox="0 0 1180 930" font-family="Helvetica,Arial,sans-serif">
+  <defs>
+    <marker id="arr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M0,0 L10,5 L0,10 z" fill="#555"/>
+    </marker>
+    <marker id="arrg" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M0,0 L10,5 L0,10 z" fill="#2e7d32"/>
+    </marker>
+  </defs>
+  <rect width="1180" height="930" fill="#ffffff"/>
+
+  <text x="20" y="32" font-size="18" font-weight="bold" fill="#222">nix-p2p — what is signed, what is compressed, and why that lets a peer re-encode freely</text>
+  <text x="20" y="52" font-size="12" fill="#666">The signature covers the UNCOMPRESSED nar. Compression is an unsigned transport detail, so the bytes on the wire may be encoded any way at all — the client decompresses and re-checks the signed hash.</text>
+
+  <!-- ================= SECTION A : narinfo anatomy ================= -->
+  <rect x="20" y="72" width="1140" height="182" rx="8" fill="#fbfcfe" stroke="#4a6fa5"/>
+  <text x="32" y="92" font-size="13" font-weight="bold" fill="#4a6fa5">A · the narinfo, as served by cache.nixos.org (fetched over TLS)</text>
+
+  <!-- signed -->
+  <rect x="36" y="104" width="546" height="136" rx="6" fill="#e8f5e9" stroke="#2e7d32"/>
+  <text x="48" y="123" font-size="12" font-weight="bold" fill="#2e7d32">SIGNED — the trust anchor. Must pass through byte-for-byte.</text>
+  <text x="48" y="143" font-size="11" font-family="monospace" fill="#1b5e20">StorePath:  /nix/store/2n1…-hello-2.12.1<tspan x="48" dy="15">NarHash:    sha256:1a7b…    ← of the UNCOMPRESSED nar</tspan><tspan x="48" dy="15">NarSize:    1441792         ← uncompressed length</tspan><tspan x="48" dy="15">References: glibc-2.40 bash-5.2</tspan><tspan x="48" dy="15">Sig:        cache.nixos.org-1:BASE64…</tspan></text>
+  <text x="48" y="231" font-size="10.5" fill="#2e7d32">Sig covers exactly:  1;StorePath;NarHash;NarSize;References</text>
+
+  <!-- unsigned -->
+  <rect x="600" y="104" width="546" height="136" rx="6" fill="#fff8e1" stroke="#f9a825"/>
+  <text x="612" y="123" font-size="12" font-weight="bold" fill="#a67c00">UNSIGNED — transport only. The daemon MAY rewrite these.</text>
+  <text x="612" y="143" font-size="11" font-family="monospace" fill="#7a5b00">Compression: xz<tspan x="612" dy="15">URL:         nar/0f3a….nar.xz</tspan><tspan x="612" dy="15">FileHash:    sha256:9de4…   ← of the COMPRESSED file</tspan><tspan x="612" dy="15">FileSize:    400823         ← compressed length</tspan></text>
+  <text x="612" y="216" font-size="10.5" fill="#a67c00">These describe how the bytes travel, not what they are.</text>
+  <text x="612" y="231" font-size="10.5" fill="#a67c00">They are the REWRITE_ALLOWLIST — the only fields we may touch.</text>
+
+  <!-- ================= SECTION B : where each hash is taken ================= -->
+  <rect x="20" y="270" width="1140" height="196" rx="8" fill="#fbfcfe" stroke="#4a6fa5"/>
+  <text x="32" y="290" font-size="13" font-weight="bold" fill="#4a6fa5">B · the byte pipeline — the signed hash is taken BEFORE any compression</text>
+
+  <rect x="38" y="306" width="140" height="58" rx="6" fill="#f2f2f2" stroke="#777"/>
+  <text x="48" y="330" font-size="11" fill="#333">store path<tspan x="48" dy="14" font-family="monospace" font-size="10">/nix/store/2n1…</tspan></text>
+
+  <line x1="178" y1="335" x2="222" y2="335" stroke="#555" marker-end="url(#arr)"/>
+
+  <rect x="222" y="306" width="150" height="58" rx="6" fill="#f2f2f2" stroke="#777"/>
+  <text x="232" y="330" font-size="11" fill="#333">nix-store --dump<tspan x="232" dy="14" font-size="10" fill="#666">deterministic</tspan></text>
+
+  <line x1="372" y1="335" x2="416" y2="335" stroke="#555" marker-end="url(#arr)"/>
+
+  <rect x="416" y="300" width="200" height="70" rx="6" fill="#e8f5e9" stroke="#2e7d32" stroke-width="2"/>
+  <text x="428" y="322" font-size="12" font-weight="bold" fill="#1b5e20">RAW NAR</text>
+  <text x="428" y="339" font-size="10.5" fill="#1b5e20">the canonical artifact —<tspan x="428" dy="13">identical on every machine</tspan></text>
+
+  <line x1="616" y1="335" x2="660" y2="335" stroke="#555" marker-end="url(#arr)"/>
+
+  <rect x="660" y="306" width="150" height="58" rx="6" fill="#fff8e1" stroke="#f9a825"/>
+  <text x="670" y="330" font-size="11" fill="#7a5b00">encode for wire<tspan x="670" dy="14" font-size="10">xz / none / zstd</tspan></text>
+
+  <line x1="810" y1="335" x2="854" y2="335" stroke="#555" marker-end="url(#arr)"/>
+
+  <rect x="854" y="306" width="150" height="58" rx="6" fill="#fff8e1" stroke="#f9a825"/>
+  <text x="864" y="330" font-size="11" fill="#7a5b00">wire bytes<tspan x="864" dy="14" font-size="10">whatever we chose</tspan></text>
+
+  <!-- hash callouts -->
+  <line x1="500" y1="370" x2="500" y2="396" stroke="#2e7d32" marker-end="url(#arrg)"/>
+  <rect x="330" y="396" width="470" height="56" rx="5" fill="#e8f5e9" stroke="#2e7d32"/>
+  <text x="342" y="414" font-size="11" font-weight="bold" fill="#1b5e20">NarHash = sha256(RAW NAR)   —   SIGNED, taken HERE</text>
+  <text x="342" y="430" font-size="10.5" fill="#1b5e20">BLAKE3(RAW NAR) = the iroh blob id — our content address. Because the raw</text>
+  <text x="342" y="443" font-size="10.5" fill="#1b5e20">nar is deterministic, every peer computes the SAME id, so a blob is shareable.</text>
+
+  <line x1="929" y1="364" x2="929" y2="396" stroke="#f9a825" marker-end="url(#arr)"/>
+  <rect x="820" y="396" width="326" height="56" rx="5" fill="#fff8e1" stroke="#f9a825"/>
+  <text x="832" y="414" font-size="11" font-weight="bold" fill="#7a5b00">FileHash = sha256(wire bytes) — UNSIGNED</text>
+  <text x="832" y="430" font-size="10.5" fill="#7a5b00">Differs for every encoding. Nothing depends on it but the</text>
+  <text x="832" y="443" font-size="10.5" fill="#7a5b00">transport check, so we are free to choose the encoding.</text>
+
+  <!-- ================= SECTION C : three encodings ================= -->
+  <rect x="20" y="482" width="1140" height="216" rx="8" fill="#fbfcfe" stroke="#4a6fa5"/>
+  <text x="32" y="502" font-size="13" font-weight="bold" fill="#4a6fa5">C · three ways to encode the same signed content — same NarHash, same Sig, very different wire cost</text>
+
+  <!-- c1 upstream -->
+  <rect x="36" y="516" width="360" height="166" rx="6" fill="#eef3fa" stroke="#4a6fa5"/>
+  <text x="48" y="536" font-size="12" font-weight="bold" fill="#2c4a72">1 · cache.nixos.org today</text>
+  <text x="48" y="556" font-size="11" font-family="monospace" fill="#2c4a72">Compression: xz</text>
+  <text x="48" y="578" font-size="11" fill="#333">wire = <tspan font-weight="bold">0.278 ×</tspan> NarSize</text>
+  <text x="48" y="596" font-size="10.5" fill="#555">measured on 20 signed paths &gt; 10 MiB<tspan x="48" dy="13">from the live cache (median 0.216)</tspan></text>
+  <text x="48" y="640" font-size="10.5" fill="#555">The CDN sustains ~21 MB/s, so the median<tspan x="48" dy="13">96 KiB path arrives in about 5 ms.</tspan></text>
+
+  <!-- c2 peer today -->
+  <rect x="410" y="516" width="360" height="166" rx="6" fill="#fdecea" stroke="#c62828"/>
+  <text x="422" y="536" font-size="12" font-weight="bold" fill="#b71c1c">2 · peer today — the problem</text>
+  <text x="422" y="556" font-size="11" font-family="monospace" fill="#b71c1c">Compression: none  (rewritten)</text>
+  <text x="422" y="571" font-size="11" font-family="monospace" fill="#b71c1c">FileHash = NarHash, FileSize = NarSize</text>
+  <text x="422" y="593" font-size="11" fill="#333">wire = <tspan font-weight="bold">1.00 ×</tspan> NarSize  →  <tspan font-weight="bold">3.6 ×</tspan> upstream</text>
+  <text x="422" y="615" font-size="10.5" fill="#b71c1c">To merely BREAK EVEN a peer must sustain<tspan x="422" dy="13" font-weight="bold">&gt; 75 MB/s (604 Mbit/s) upload.</tspan><tspan x="422" dy="13">A home uplink is 1.25–5 MB/s. Below that</tspan><tspan x="422" dy="13">threshold no NAR size wins, and the deficit</tspan><tspan x="422" dy="13">grows with size.</tspan></text>
+
+  <!-- c3 proposed -->
+  <rect x="784" y="516" width="360" height="166" rx="6" fill="#e8f5e9" stroke="#2e7d32"/>
+  <text x="796" y="536" font-size="12" font-weight="bold" fill="#1b5e20">3 · peer proposed — compress the link</text>
+  <text x="796" y="556" font-size="11" font-family="monospace" fill="#1b5e20">addressed unit UNCHANGED:</text>
+  <text x="796" y="571" font-size="11" font-family="monospace" fill="#1b5e20">BLAKE3(RAW NAR) — still shareable</text>
+  <text x="796" y="593" font-size="11" fill="#333">zstd on the QUIC stream, not on the content</text>
+  <text x="796" y="615" font-size="10.5" fill="#1b5e20">wire ≈ <tspan font-weight="bold">0.3 ×</tspan> NarSize → parity with the CDN,<tspan x="796" dy="13">while every peer still computes the same</tspan><tspan x="796" dy="13">blob id, so multi-peer fanout survives.</tspan><tspan x="796" dy="13">PRD round 3 reserved exactly this:</tspan><tspan x="796" dy="13">“a policy surface, not frozen”.</tspan></text>
+
+  <!-- ================= SECTION D : gates + trust boundary ================= -->
+  <rect x="20" y="726" width="1140" height="188" rx="8" fill="#fbfcfe" stroke="#4a6fa5"/>
+  <text x="32" y="746" font-size="13" font-weight="bold" fill="#4a6fa5">D · why any encoding is safe — the client re-checks the signed hash itself</text>
+
+  <!-- outside TCB -->
+  <rect x="36" y="760" width="470" height="138" rx="6" fill="#fdecea" stroke="#c62828" stroke-dasharray="6 4"/>
+  <text x="48" y="780" font-size="12" font-weight="bold" fill="#b71c1c">OUTSIDE the trusted computing base</text>
+  <text x="48" y="800" font-size="11" fill="#7f1d1d">the nix-p2p daemon · every peer · any tracker or DHT</text>
+  <text x="48" y="822" font-size="10.5" fill="#7f1d1d">None of these is trusted with content. They choose the<tspan x="48" dy="14">encoding, the route and the source — never the bytes.</tspan></text>
+  <text x="48" y="868" font-size="10.5" fill="#7f1d1d">A lying peer, a poisoned claim, a corrupt stream or a<tspan x="48" dy="14">wrong FileHash all end the same way: a failed gate, a retry.</tspan></text>
+
+  <line x1="506" y1="828" x2="552" y2="828" stroke="#555" marker-end="url(#arr)"/>
+
+  <!-- client gates -->
+  <rect x="552" y="760" width="592" height="138" rx="6" fill="#f2f2f2" stroke="#777"/>
+  <text x="564" y="780" font-size="12" font-weight="bold" fill="#222">unmodified Nix client — inside the trust base</text>
+
+  <rect x="564" y="790" width="568" height="42" rx="4" fill="#fff8e1" stroke="#f9a825"/>
+  <text x="574" y="806" font-size="11" font-weight="bold" fill="#a67c00">gate 1 · transport</text>
+  <text x="574" y="822" font-size="10.5" font-family="monospace" fill="#7a5b00">sha256(downloaded bytes) == FileHash   &amp;&amp;   len == FileSize</text>
+
+  <rect x="564" y="838" width="568" height="52" rx="4" fill="#e8f5e9" stroke="#2e7d32"/>
+  <text x="574" y="854" font-size="11" font-weight="bold" fill="#1b5e20">gate 2 · TRUST</text>
+  <text x="574" y="870" font-size="10.5" font-family="monospace" fill="#1b5e20">decompress per Compression → sha256(nar) == NarHash &amp;&amp; len == NarSize</text>
+  <text x="574" y="884" font-size="10.5" font-family="monospace" fill="#1b5e20">&amp;&amp; Sig verifies over 1;StorePath;NarHash;NarSize;References</text>
+
+  <text x="20" y="924" font-size="10.5" fill="#666">Gate 2 is computed over the UNCOMPRESSED nar, which is why the wire encoding is free to vary: change it and the signature still verifies. Wire-cost figures measured 2026-08-10; see TASK-94.</text>
+</svg>
