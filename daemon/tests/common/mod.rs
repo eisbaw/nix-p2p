@@ -20,6 +20,7 @@ use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
+use std::time::Duration;
 
 use daemon::{
     App, CacheInfo, NarCatalog, NarSource, NarinfoSource, NullCorrelation, RawUpstream,
@@ -223,6 +224,26 @@ pub async fn spawn_daemon(upstream_url: &str) -> (SocketAddr, DaemonHandle) {
     spawn_daemon_with(upstream_url, CacheInfo::default()).await
 }
 
+/// The upstream header timeout the in-process HARNESS runs with.
+///
+/// TASK-109. `UpstreamHttp::new` defaults to 1000 ms, which is a PRODUCTION
+/// default chosen so a down upstream fails clean and fast (upstream.rs AC#6). It
+/// is the wrong number for a test harness: on a loaded CI box or a developer
+/// machine building in another terminal, a perfectly healthy loopback upstream can
+/// take longer than a second to return headers, and the daemon then - correctly by
+/// its own rules - answers 502. The test that asserted 200 fails, and it looks
+/// like a passthrough defect instead of a scheduling artifact.
+///
+/// Ten seconds is not a tuned value. It is "long enough that only a genuine hang
+/// reaches it", which is the only property the harness needs. Tests that want to
+/// exercise the timeout ITSELF must set their own value explicitly rather than
+/// leaning on this one.
+///
+/// NOT changed here: the PRODUCT default. Whether 1000 ms is right for real users
+/// on a WAN link is a separate question, filed rather than silently answered under
+/// cover of a flake fix.
+pub const HARNESS_HEADER_TIMEOUT: Duration = Duration::from_secs(10);
+
 /// As [`spawn_daemon`] but with a caller-chosen cache-info (for AC#5 priority).
 pub async fn spawn_daemon_with(
     upstream_url: &str,
@@ -230,7 +251,11 @@ pub async fn spawn_daemon_with(
 ) -> (SocketAddr, DaemonHandle) {
     // The catalog is the server's correlation state; UpstreamHttp needs none.
     let catalog = Arc::new(NarCatalog::new());
-    let upstream = Arc::new(UpstreamHttp::new(upstream_url).expect("valid upstream"));
+    let upstream = Arc::new(
+        UpstreamHttp::new(upstream_url)
+            .expect("valid upstream")
+            .with_header_timeout(HARNESS_HEADER_TIMEOUT),
+    );
     let app = app_from_upstream(upstream, catalog, cache_info);
     spawn_app(app).await
 }

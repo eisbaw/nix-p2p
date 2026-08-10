@@ -183,7 +183,21 @@ async fn fault_mode_loop() {
     let start = Instant::now();
     let resp = get(daemon, "/nar/testnar.nar").await;
     assert_eq!(resp.status, Some(502));
-    assert!(start.elapsed() < Duration::from_secs(2), "must not hang");
+    // Bounded by the harness's own upstream timeout, not by a wall-clock constant
+    // (task-109). The property this guards is "the daemon failed FAST instead of
+    // waiting out its upstream deadline"; stating it as `< 2s` also asserted that
+    // the HOST could schedule a loopback round-trip within two seconds, which is a
+    // claim about the machine and fails on correct code under load. Comparing
+    // against HARNESS_HEADER_TIMEOUT states the real invariant and stays true
+    // however slow the box is. A regression that DID wait out the timeout takes
+    // >= HARNESS_HEADER_TIMEOUT and still fails here, which is the bite.
+    assert!(
+        start.elapsed() < common::HARNESS_HEADER_TIMEOUT,
+        "must not hang: failed after {:?}, i.e. it waited out the {:?} upstream \
+         header timeout rather than failing fast",
+        start.elapsed(),
+        common::HARNESS_HEADER_TIMEOUT
+    );
     clear_faults(proxy.addr).await;
 
     // ---- fault 3: connection reset -> clean gateway error, no hang ----
@@ -195,7 +209,21 @@ async fn fault_mode_loop() {
         "reset yields a clean failure, got {:?}",
         resp.status
     );
-    assert!(start.elapsed() < Duration::from_secs(2), "must not hang");
+    // Bounded by the harness's own upstream timeout, not by a wall-clock constant
+    // (task-109). The property this guards is "the daemon failed FAST instead of
+    // waiting out its upstream deadline"; stating it as `< 2s` also asserted that
+    // the HOST could schedule a loopback round-trip within two seconds, which is a
+    // claim about the machine and fails on correct code under load. Comparing
+    // against HARNESS_HEADER_TIMEOUT states the real invariant and stays true
+    // however slow the box is. A regression that DID wait out the timeout takes
+    // >= HARNESS_HEADER_TIMEOUT and still fails here, which is the bite.
+    assert!(
+        start.elapsed() < common::HARNESS_HEADER_TIMEOUT,
+        "must not hang: failed after {:?}, i.e. it waited out the {:?} upstream \
+         header timeout rather than failing fast",
+        start.elapsed(),
+        common::HARNESS_HEADER_TIMEOUT
+    );
     clear_faults(proxy.addr).await;
 
     // ---- fault 4: truncated NAR -> client sees a SHORT transfer ----
