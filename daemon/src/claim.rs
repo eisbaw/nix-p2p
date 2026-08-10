@@ -615,11 +615,20 @@ pub struct BatchHoldQuery {
 /// indices together, which is the only safe order.
 ///
 /// It is a SEPARATE function rather than a refactor of
-/// [`deserialize_known_transports`] on purpose: that one decodes FROZEN types, and
-/// this change is required to be textually additive to `claim.rs` so the freeze
-/// audit (`git diff | grep '^-'` returning nothing) stays meaningful. The shared
-/// rule - which tags are known - lives once, in [`KNOWN_TRANSPORT_TAGS`], and
-/// `slot_and_drop_decoders_agree` asserts the two functions do not diverge.
+/// [`deserialize_known_transports`] because the two return DIFFERENT types: the
+/// frozen one yields the offers it kept, this one yields a slot per wire element
+/// including the dropped ones. Collapsing them would mean the frozen decoder
+/// allocating slots it has no use for.
+///
+/// It previously justified itself by saying the change had to be textually
+/// additive so a "freeze audit (`git diff | grep '^-'` returning nothing)" stayed
+/// meaningful. That argument was doubly wrong and is retracted: no such gate
+/// exists anywhere in the Justfile or scripts, and the property is false - this
+/// file has since had lines removed for good reasons. A duplication has to be
+/// paid for with a real guarantee, not an imagined one. The real one: the shared
+/// rule (which tags are known) lives once, in [`KNOWN_TRANSPORT_TAGS`], and
+/// `the_slot_and_drop_transport_decoders_agree` asserts the two do not diverge
+/// on the same inputs, including the hard-error case.
 fn deserialize_transport_slots<'de, D>(deserializer: D) -> Result<Vec<OfferSlot>, D::Error>
 where
     D: serde::Deserializer<'de>,
@@ -712,7 +721,7 @@ pub type OfferIndex = u16;
 /// bearing: `deny_unknown_fields` on an internally-tagged enum is honoured for
 /// struct variants but is SILENTLY INERT for unit variants, so a unit `Absent`
 /// would happily decode `{"answer":"absent","blake3":"..."}`. Verified by
-/// experiment, and pinned by `an_absent_answer_rejects_any_field`.
+/// experiment, and pinned by `an_absent_batch_answer_rejects_any_field_attached_to_it`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "answer", rename_all = "snake_case")]
 #[serde(deny_unknown_fields)]
@@ -2818,9 +2827,10 @@ mod tests {
     #[test]
     fn the_slot_and_drop_transport_decoders_agree() {
         // `deserialize_transport_slots` duplicates the tolerate-but-drop rule of
-        // `deserialize_known_transports` (the frozen one is left untouched so the
-        // freeze audit over this file stays meaningful). Duplicated logic drifts,
-        // so the agreement is asserted rather than asserted-in-a-comment.
+        // `deserialize_known_transports` because the two return different types.
+        // Duplicated logic drifts, so the agreement is ASSERTED rather than
+        // asserted-in-a-comment - which is the only thing that actually pays for
+        // the duplication.
         #[derive(Deserialize)]
         struct Dropped {
             #[serde(deserialize_with = "deserialize_known_transports")]

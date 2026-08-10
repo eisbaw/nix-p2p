@@ -1019,7 +1019,10 @@ described:
   is 15 901 B, a full all-`Have` response sharing one iroh locator is
   31 114 B, and the same response with a distinct per-content locator for
   every key is 58 910 B (~10% spare, the honest limit). Raising the cap
-  to 1024 fails the build. Over-cap is rejected, never truncated — on
+  to 1024 fails the TEST `a_full_batch_fits_the_wire_cap_with_headroom`
+  — `cargo build` still exits 0, so this is caught by `just test`, not
+  by `just build`. (It was documented as "fails the build", which sends
+  a reader to the wrong gate.) Over-cap is rejected, never truncated — on
   encode, on decode, in the responder, and in the compatibility shim.
   The cap is applied to `keys_asked` itself, so it is a property of the
   decoder rather than a caller precondition, and every encoder gates its
