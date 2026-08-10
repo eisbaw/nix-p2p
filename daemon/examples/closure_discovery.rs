@@ -25,6 +25,16 @@
 //! `scripts/profile_p2p.py::WAN_RTT_MS`, which derives it from task-35's real
 //! measurements against cache.nixos.org.
 //!
+//! WHERE THE ROUND TRIPS ARE COUNTED, and why that is only valid for this
+//! transport: the counter sits at the [`PeerQuery`] seam, so it observes the
+//! exchanges the RESOLVER initiates. A transport that implemented `query_batch`
+//! by internally looping the single-key form would be counted as one exchange
+//! while costing N on a real network. The transport measured here
+//! ([`InProcessPeerQuery`]) natively batches, and that is asserted from outside
+//! rather than assumed - `discovery.rs::the_in_process_batch_really_crosses_the_wire_not_the_shim`
+//! tells the two apart by handing both an over-cap batch, which only the encoding
+//! (native) path can refuse.
+//!
 //! NOT MEASURED HERE: bytes moved, throughput, speedup of a build. This arm is
 //! about DISCOVERY - the cost of finding out who has what - and deliberately
 //! reports no byte figure, so nothing from it can be confused with the transport
@@ -384,6 +394,8 @@ async fn main() {
                     "injected_rtt_ms": config.rtt.as_millis() as u64,
                     "repeats": config.repeats,
                     "nar_bytes_uncompressed_nar": config.nar_bytes_uncompressed_nar,
+                    "transport": "InProcessPeerQuery (native batch; asserted, \
+                                  see the_in_process_batch_really_crosses_the_wire_not_the_shim)",
                 },
                 "resolved_paths": serial_resolved,
                 "arms": {

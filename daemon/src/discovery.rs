@@ -941,13 +941,28 @@ mod tests {
     #[tokio::test]
     async fn a_batched_resolve_agrees_with_the_serial_one_key_for_key() {
         // The EQUIVALENCE oracle: batching is only allowed to change the number of
-        // round trips, never the answers. B holds 3 of 5 keys.
-        let all = keys(5);
-        let held = vec![all[0], all[2], all[4]];
-        let (index, _dir) = index_holding_many(node_b(), &held);
+        // round trips, never the answers.
+        //
+        // THREE peers, each holding a different slice, plus keys nobody holds -
+        // deliberately, because a single-peer version of this test is vacuous
+        // against the failure that matters most here. A resolver that stopped
+        // after the first peer would still agree with itself on one peer; it is
+        // only a spread holding set that makes "batched found what serial found"
+        // a real claim. (Proven: mutating the peer loop to `&self.peers[..1]`
+        // left the one-peer version GREEN.)
+        let all = keys(9);
+        let nodes: Vec<NodeId> = (1..=3u8).map(|i| NodeId::from_bytes([i; 32])).collect();
         let mut rendezvous = InProcessPeerQuery::new();
-        rendezvous.add_index(node_b(), index);
-        let discovery = DirectDiscovery::new(vec![node_b()], Arc::new(rendezvous));
+        let mut dirs = Vec::new();
+        // Peer 0 holds keys 0,3; peer 1 holds 1,4; peer 2 holds 2,5. Keys 6..9
+        // are held by nobody, so they cost every peer a probe in both arms.
+        for (p, node) in nodes.iter().enumerate() {
+            let held = vec![all[p], all[p + 3]];
+            let (index, dir) = index_holding_many(*node, &held);
+            rendezvous.add_index(*node, index);
+            dirs.push(dir);
+        }
+        let discovery = DirectDiscovery::new(nodes.clone(), Arc::new(rendezvous));
 
         let mut serial = Vec::new();
         for key in &all {
@@ -959,13 +974,17 @@ mod tests {
             batched, serial,
             "the batched answer must equal the one-at-a-time answer, position for position"
         );
-        // ...and it is a real mixture, so the equality is not vacuous.
-        assert_eq!(batched.iter().filter(|c| c.is_some()).count(), 3);
-        assert!(batched[1].is_none() && batched[3].is_none());
+        // ...and it is a real mixture across peers, so the equality is not vacuous.
+        assert_eq!(batched.iter().filter(|c| c.is_some()).count(), 6);
+        assert!(batched[6..].iter().all(Option::is_none));
         for (i, claim) in batched.iter().enumerate() {
-            if let Some(claim) = claim {
-                assert_eq!(claim.key, all[i], "position {i} must answer about all[{i}]");
-            }
+            let Some(claim) = claim else { continue };
+            assert_eq!(claim.key, all[i], "position {i} must answer about all[{i}]");
+            assert_eq!(
+                claim.holders,
+                vec![nodes[i % 3]],
+                "position {i} must be attributed to the peer that actually holds it"
+            );
         }
     }
 
@@ -1217,6 +1236,60 @@ mod tests {
                 "the shim hoists the peer's offers onto the batch response"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn the_in_process_batch_really_crosses_the_wire_not_the_shim() {
+        // WHY THIS TEST EXISTS. Round trips are counted at the `PeerQuery` seam
+        // (that is what the measurement instrument observes), and a transport that
+        // implemented `query_batch` by internally looping the single-key form
+        // would be counted as ONE exchange while costing N on a real network. So
+        // the count is only meaningful if the transport under measurement NATIVELY
+        // batches - and "it does, look at the source" is not an oracle.
+        //
+        // The discriminator: the native path ENCODES a BatchHoldQuery, so it
+        // enforces the wire bounds; the shim never encodes one, so it does not.
+        // Handing both an over-cap batch therefore tells them apart from outside.
+        let over_cap = BatchHoldQuery {
+            schema_version: QUERY_SCHEMA_VERSION,
+            keys: keys(MAX_BATCH_HOLD_KEYS + 1),
+        };
+        let (index, _dir) = index_holding_many(node_b(), &over_cap.keys[..1]);
+        let mut inner = InProcessPeerQuery::new();
+        inner.add_index(node_b(), index);
+
+        let native = inner.query_batch(&node_b(), &over_cap).await;
+        assert!(
+            matches!(native, Err(PeerQueryError::Codec(_))),
+            "the in-process transport must really encode the batch (and so refuse \
+             an over-cap one); if this passes the batch, it is looping single \
+             probes and every round-trip count taken over it is wrong"
+        );
+
+        // The shim, by contrast, sends N separate LEGAL single-key messages, so
+        // the per-message cap does not apply to it and it answers happily. That
+        // difference is deliberate: the cap bounds one message's size and one
+        // message's work, not a caller's total curiosity.
+        struct SingleOnly(InProcessPeerQuery);
+        #[async_trait]
+        impl PeerQuery for SingleOnly {
+            async fn query(
+                &self,
+                node: &NodeId,
+                query: &HoldQuery,
+            ) -> Result<HoldResponse, PeerQueryError> {
+                self.0.query(node, query).await
+            }
+        }
+        let (index, _dir) = index_holding_many(node_b(), &over_cap.keys[..1]);
+        let mut inner = InProcessPeerQuery::new();
+        inner.add_index(node_b(), index);
+        let shim = SingleOnly(inner).query_batch(&node_b(), &over_cap).await;
+        assert!(
+            shim.is_ok(),
+            "the compatibility shim sends N legal single-key messages; the \
+             per-message cap does not apply to it"
+        );
     }
 
     #[tokio::test]
