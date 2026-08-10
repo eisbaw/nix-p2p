@@ -5,7 +5,7 @@ status: Done
 assignee:
   - '@me'
 created_date: '2026-08-10 07:23'
-updated_date: '2026-08-10 14:36'
+updated_date: '2026-08-10 16:00'
 labels:
   - wave-2b
 dependencies:
@@ -73,237 +73,102 @@ TIMING OPPORTUNITY worth taking here: the daemon knows every NarHash the moment 
 ## Implementation Notes
 
 <!-- SECTION:NOTES:BEGIN -->
-## CROSS-MODEL DEEP GATE: NO-GO (codex gpt-5.6, read-only, 2026-08-10) - and it is WORSE than the architect found
+## DEEP RE-GATE #2: NO-GO (mped-architect, read-only, 2026-08-10). Sixth-hole prediction CONFIRMED.
 
-Codex ran on retry after its first invocation died with an internal router error (recorded in git notes).
-It independently confirmed G1/G2/G3 AND found four things the architecture review did not. All by
-mutation under /tmp; no repository edits.
+PRIORITY-1 LEAD FROM THE STALLED RUN: CONFIRMED, and it is a gate-breaker.
+The discoveryaxis self-test is NOT vacuous in general - disabling each of its five substantive rules
+produced FAIL lines and rc=1. But THE RULE SET IS EMPTY EXACTLY WHERE ROUND 6 PUT THE CLAIM.
+arm_violations recovers the injected RTT for the SERIAL arm only (expected_ms = serial_rt * rtt_ms,
+discoveryaxis.py:238). The BATCHED arm - the numerator of the headline reduction factor - is
+constrained by nothing but >0 and <serial. Mutating the real Rust instrument
+(closure_discovery.rs, let batched_rt = 1) produced:
+    RESULT: 1180.0x fewer round trips   (truth is 147.5x - an 8x INFLATION)
+    batched: 1 round trips, 420.1 ms    (1 round trip timed at 420 ms under a 50 ms/rt knob)
+    problems: []   exit 0
+Six further attacks ALL passed with problems==[]: batched count understated 8x; unshaped says
+batched=8 while shaped says 800; serial inflated 85x with wall clock scaled to match (the band
+validates a RATIO, and both operands come from the same instrument); unshaped batched arm 1e8 x
+slower than serial (the unshaped arm has NO wall-clock rule at all); a passed-through
+round_trip_reduction_factor of 99999 contradicting the instrument's own counts (never recomputed
+from serial_rt/batched_rt); unshaped batched wall clock set to 1 ns -> prints 'honest floor 6200000.0x'.
+Of the three assertions round 6 added, two check that the DISCLAIMER WORDING is printed and the third
+asserts a hardcoded True literal is True. The invariant is stated in prose at discoveryaxis.py:394 and
+NOT ENCODED. Also: the promoted '~5.5x honest floor' is quoted to one decimal with no interval, while
+five runs gave 5.26 / 8.33 / 11.68 / 6.96 / 7.85 - a 2.2x spread (round-trip counts were rock stable).
 
-C1 (CRITICAL, ESCALATES G2 FROM A DOC GAP TO A LIVE BUG). Response-wide offer hoisting MISBINDS
-   content-specific locators - this is not a future limitation, it is a present correctness defect.
-   BatchHoldResponse has ONE global offers list (claim.rs:541) but BitTorrent{infohash} is
-   content-specific (claim.rs:301). The compatibility shim retains only the FIRST Have's offers
-   (discovery.rs:272), then the resolver CLONES those onto EVERY Have (discovery.rs:588).
-   RUNTIME TEST: two keys with distinct BLAKE3s and distinct BitTorrent infohashes -> KEY 2'S CLAIM
-   RECEIVED KEY 1'S INFOHASH. Also: an all-Absent response can legally carry arbitrary BitTorrent
-   offers, so locators need not bind to any asked key and can VOLUNTEER content-specific holdings -
-   which is a no-enumeration vector as well. Verdict: needs a schema redesign BEFORE freezing -
-   per-Have offers, an indexed offer dictionary, or a separate global type restricted to genuinely
-   peer-scoped locators.
+AC#4 IS NOT MET (gate-breaker). R3 bounds the dictionary against '>=1 Have', NOT against the number of
+ASKED keys. Verified, and reproduced independently by a second agent: A 1-KEY QUESTION RETURNED 512
+CONTENT-SPECIFIC INFOHASHES, 55,860 B response vs a 91 B query = 613.8x. A BitTorrent infohash IS a
+content identity, so a peer asked about one key may volunteer 511 content identities the asker never
+named. C1 moved the leak from 'zero Haves' to 'one Have', which for a per-CONTENT locator kind is not
+a bound. This falsifies the Final Summary's 'volunteering a holding is inexpressible rather than
+merely unanswered' and TESTING.md's AC#4 claim.
 
-C2 (CRITICAL, = G1 confirmed, with more attack surface). BatchHoldAnswer lacks deny_unknown_fields
-   (claim.rs:546). Wires that decode successfully today: Have with a valid blake3 PLUS a different
-   blake3_shadow; Have with an also_held list containing an UNASKED key; Absent carrying a blake3 or
-   key. So an accepted wire can carry two identity-like values while the decoder silently picks one -
-   the two-blob-claim class the round-3 freeze closed, reappearing. Codex independently reached the
-   same conclusion as the architect that C1 and C2 must be fixed TOGETHER.
+C3's THIRD REPRODUCTION IS NOT FIXED: amplification ROSE to 613.8x (from 578x). MAX_BATCH_HOLD_OFFERS
+=512 is the binding constraint; the byte gate alone would have allowed 720x. And the FROZEN single-key
+path is worse and untouched: HoldAnswer::Have.offers has no count cap at all - 622 offers = 65,440 B
+against an 88 B query = 743.6x.
 
-C3 (HIGH, NEW - the decode side has no cap at all). encode_batch_hold_response checks only
-   answers.len() (claim.rs:850) and bounds neither offers nor final serialized size;
-   decode_batch_hold_response TRUSTS keys_asked and never independently enforces MAX_BATCH_HOLD_KEYS
-   (claim.rs:874). Reproduced: 1 answer + 1,000 iroh offers encoded to 95,144 B (over the 64 KiB gate);
-   a 257-answer response DECODED when passed keys_asked=257; a 91-byte one-key query can receive an
-   accepted 52,644-byte response = 578.5x WIRE AMPLIFICATION. AvailabilityIndex::answer_batch has only
-   debug assertions (availability.rs:715), so the cap is a caller precondition, not a type invariant.
+SIX SURVIVING MUTATIONS in a round that certified '19/19 bit a NAMED check':
+  M2  remove the answer-count cap from check_batch_offer_bindings -> the encoder emits a 257-answer
+      message no legal decoder accepts. That is EXACTLY the property C3 asserts, unguarded.
+  M10 remove the shim's key-cap check -> the shim still refuses, but only AFTER issuing all 257
+      probes. Code comment and test name both claim 'before issuing any probe'; no test asserts
+      probe count.
+  M9  the shim's MAX_BATCH_HOLD_OFFERS guard is unreachable by any test.
+  re-adding Deserialize to #[derive] on BatchHoldResponse (claim.rs:663) COMPILES and leaves the whole
+      -p daemon suite GREEN - the entire index-rebinding argument rests on a property no test asserts.
+  golden: #[serde(default, skip_serializing_if="Vec::is_empty")] on Have::offer_indices survives -
+      the exact hole just closed for offers, left open one type over (no vector has an empty
+      offer_indices, which is legal and reachable per claim.rs:766).
+  golden: removing deny_unknown_fields from BatchHoldQuery survives - zero coverage anywhere.
 
-C4 (HIGH, NEW - the golden freeze has a specific hole, proven by surviving mutation). The change IS
-   textually additive (585 insertions, zero deletions) and the golden DOES catch a renamed
-   HoldQuery.key (exit 101). BUT its only Have vector uses NON-EMPTY offers
-   (claim_wire_golden.rs:159), so adding skip_serializing_if="Vec::is_empty" - which CHANGES the legal
-   legacy Have{offers:[]} bytes - left all 7 golden tests GREEN. Removing #[serde(default)], which
-   changes decoder acceptance of omitted offers, also survives. Needs an explicit empty-offers encoding
-   vector plus decode-only vectors for accepted noncanonical legacy inputs.
+C2 landed at 1 of 4 internally-tagged enums. KnownTransport (claim.rs:296) - which sits INSIDE the
+offer dictionary C2 hardened - is still lax: a 60,489 B dictionary entry carrying also_held, blake3
+and a 60 KB pad DECODED. KnownPayload (line 245) has the same gap.
 
-C5 (MEDIUM, NEW - the no-enumeration guard is demonstrably bypassable, not merely narrow). A /tmp
-   mutation added a NO-ARGUMENT method returning every derived holding's BLAKE3 wrapped in
-   BatchHoldResponse; BOTH no_enumeration tests still passed (exit 0). The honest responder does derive
-   answers from caller-supplied keys, but the GUARD does not enforce it.
+GOLDEN CENSUS is name-matching against a hand-maintained EXERCISED list, not against actual test
+usage: adding a vector AND its name yields exit 0 with a wire asserted by nothing. Defeated also by a
+sibling top-level array, a nested vectors array, and a new identities entry. CLASS STATEMENT: the file
+pins EMITTED bytes well but has NO vector class for 'this wire must be REJECTED', so every
+acceptance-widening mutation passes by construction.
 
-VERIFIED GOOD by codex (independent of the architect): both batch decoders run the 64 KiB size gate
-BEFORE duplicate scanning and typed parsing; empty / over-256 / repeated semantic query keys rejected
-without truncation; 256 copies of one key rejected; a malformed NarHash mid-batch rejects the whole
-query; whole-tree duplicate JSON fields including nested answer fields rejected; unknown transport kinds
-dropped inertly while malformed known transports fail hard; positional answer length re-checked at the
-mapping site.
+C5 GUARD: the pub(crate) parse bug is real but its SEVERITY WAS INVERTED in the round-6 report - the
+mis-parse made plural-detection a superset and keyed permanently false, so it produced false
+POSITIVES (it would be RED on today's legitimate pub(crate) fn check_batch_keys). A fail-loud bug that
+had not yet fired, not a silent-pass defect. The wrapper bypass IS genuinely fixed. But 11 LIVE
+BYPASSES remain: pub(crate) async fn (discovery.rs is async-heavy), pub(super) fn, pub const fn (two
+real claim.rs fns unchecked today), a type alias, Vec<BatchHoldAnswer> (every Have carries a blake3 -
+a holdings listing built from the project's own types), BTreeSet/VecDeque/arrays,
+PhantomData<NarHashKey> as a vacuous 'key in', a COMMENT in the parameter list satisfying the key
+rule, and anything after #[cfg(test)]. Exemptions are reusable WITHIN a file, so
+impl Harvester { pub fn load(&self) -> Vec<NarHashKey> } in availability.rs inherits IndexStore::load's
+exemption. AND THE GUARD'S STATED HONEST LIMIT IS FACTUALLY WRONG: it says unscanned modules 'do not
+answer peer messages today', but transport_iroh.rs is the module that accepts peer QUIC connections,
+imports AvailabilityIndex, and its own doc points at the index that 'enumerates a node's held NARs'.
+An enumeration method placed there passes at exit 0.
 
-Codex gates from a pristine HEAD copy under /tmp: build 0, lint 0, test 0 (257 cargo tests + script
-gates). Its adversarial suite reproduced 8/8 asserted bad behaviours. Note a preliminary just test
-exited 1 only because redirected cargo output hid ./target/debug/daemon from check-rewrite-realnix -
-an artifact of its own redirection, not a product fault.
+VERIFIED GOOD, do not relitigate: the R1/R2/R3 binding machinery and the position-preserving remap
+(all five rule-removal mutations went RED; a 20,000-case differential fuzz over mixed known/unknown
+dictionaries found zero rebindings and zero panics; every rebinding attack failed, including an index
+pointing at a dropped slot); the regression test the prompt asked for ALREADY EXISTS
+(discovery.rs:1606 + a byte-level twin at claim_wire_golden.rs:428); the C2 serde finding and
+byte-identity (Absent {} and unit Absent both emit 19 identical bytes; all 11 smuggling attacks
+rejected); the rewritten M8 genuinely isolates the pre-parse boundary; answer_batch's hard check; the
+58,910 B / 10.1% headroom figure, asserted in both directions; and the WIRE FREEZE ITSELF (the four
+frozen vectors are byte-identical since the golden file was introduced; frozen type definitions diff
+empty against fc31b74).
 
-## IMPLEMENTER PLAN (fixing the DEEP-gate NO-GO, 2026-08-10)
+TWO DOC DRIFTS: TESTING.md says 'raising the cap to 1024 fails the build' - it does NOT (cargo build
+rc=0); it fails the test a_full_batch_fits_the_wire_cap_with_headroom. And claim.rs:~559 justifies a
+design choice by 'the freeze audit (git diff | grep ^- returning nothing)' - NO SUCH GATE EXISTS in
+the Justfile or scripts.
 
-C1 SCHEMA DECISION: option (b), an INDEXED OFFER DICTIONARY.
-  BatchHoldResponse keeps ONE response-level `offers: Vec<KnownTransport>` (the
-  dictionary); every `BatchHoldAnswer::Have` carries `offer_indices: Vec<u16>`
-  naming ITS OWN locators inside it. Decode enforces referential integrity:
-  every index in range, no index repeated inside one Have, and EVERY dictionary
-  entry referenced by at least one Have (so an all-Absent response can no longer
-  carry a locator at all - the no-enumeration half of C1).
-  WHY (b) OVER (a) per-Have offers: (a) is simpler, but it duplicates the same
-  locator up to 256x on the wire and breaks the cap's own headroom argument as
-  soon as a second transport exists - a 256-Have answer with iroh+bittorrent per
-  key is ~68 KiB under (a), OVER the 64 KiB pre-parse gate, i.e. that peer could
-  not answer a legal full batch at all. Under (b) the same case is ~30 KiB.
-  (b) also fixes H2: the resolver selects each claim's own small offer vector
-  instead of cloning the whole dictionary 256 times.
-  COST of (b), stated honestly: an index space is a re-binding hazard, and the
-  tolerate-but-drop rule for unknown transports would SHIFT indices. So decode
-  parses the dictionary into POSITION-PRESERVING slots (unknown -> None), checks
-  bindings against the RAW positions, then compacts and REMAPS. BatchHoldResponse
-  therefore no longer derives Deserialize: decode_batch_hold_response is the only
-  way to get one from bytes, so the remap cannot be bypassed.
-
-C2 SERDE FACT ESTABLISHED BY EXPERIMENT (not by prose): `deny_unknown_fields`
-  on an internally-tagged enum DOES bite on STRUCT variants but is SILENTLY
-  INERT on UNIT variants (`{"answer":"absent","blake3":"x"}` decoded fine).
-  Fix: `Absent` becomes an EMPTY STRUCT variant `Absent {}` - identical wire
-  bytes `{"answer":"absent"}`, now strict. HoldAnswer is NOT touched (frozen).
-
-C3 decode enforces MAX_BATCH_HOLD_KEYS on keys_asked itself; MAX_BATCH_HOLD_OFFERS
-  caps the dictionary; check_size() runs on the OUTPUT of every encoder.
-  answer_batch returns Result and hard-checks the cap.
-
-C4 golden gains: empty-offers ENCODING vector, decode-only noncanonical vectors,
-  the reserved v2 field names (relay.blob / signatures.key_id+sig), a
-  distinct-locator batch vector, and a test that every vector in the file is
-  exercised by name.
-
-C5 no_enumeration: ALLOWED becomes (file, name); wrapper types (BatchHoldResponse)
-  count as plural holdings; key-bearing PARAM types (HoldQuery/BatchHoldQuery)
-  count as named keys in; honest-limits states the three-module scope.
-
-G3 prose only: AC#3's wall-clock figure is the round-trip count times the knob by
-  harness construction. Honest floor is the 0 ms arm.
-
-## ROUND-6 FIX LANDED (implementer, 2026-08-10). A RE-GATE IS REQUIRED - I DO NOT SELF-CERTIFY.
-
-Commits: d6ea284 (C5 guard), 20357ce (C1-C4 schema + codec + wiring + golden).
-
-C1 - RESOLVED BY SCHEMA CHANGE, option (b), an INDEXED OFFER DICTIONARY.
-  BatchHoldResponse keeps ONE response-level `offers: Vec<KnownTransport>`; every
-  `Have` carries `offer_indices: Vec<u16>` naming ITS OWN entries. Three binding
-  rules, enforced on encode AND decode: every index in range, no index repeated
-  inside one answer, every dictionary entry referenced by at least one Have. The
-  last one is what kills the no-enumeration half - an all-Absent response is now
-  REQUIRED to carry an empty dictionary, so a content-specific locator can never
-  be volunteered.
-  WHY (b) AND NOT (a) PER-HAVE INLINE OFFERS, on measurement not preference: a
-  full 256-key answer carrying an iroh locator plus a per-content infohash is
-  58 910 B indexed and ~79 912 B inlined, against a 65 536 B pre-parse gate. The
-  inline form makes a legal, fully-populated answer UNSENDABLE the moment a second
-  transport exists (TASK-75) - it does not merely waste bytes, it breaks the cap's
-  own headroom argument. (b) also fixes H2: the resolver selects each claim's own
-  small offer vector instead of cloning the dictionary per answered key.
-  THE COST OF (b), STATED: an index space is itself a rebinding hazard, and the
-  tolerate-but-drop rule for unknown transports would SHIFT indices. So the
-  decoder parses the dictionary into POSITION-PRESERVING slots, validates against
-  the RAW positions, then compacts and RE-INDEXES together - and BatchHoldResponse
-  no longer derives Deserialize at all, so decode_batch_hold_response is the only
-  way to build one from bytes and the remap cannot be bypassed. Pinned by a
-  decode-only golden vector and by a mutation (M5).
-  compact_offer_slots uses `get`, not `[]`: an out-of-range index is already
-  rejected upstream, but a decoder that PANICS on hostile input is a DoS even when
-  the panic is technically fail-fast.
-
-C2 - RESOLVED, and the serde fact was established BY EXPERIMENT, not by reading.
-  `deny_unknown_fields` on an internally-tagged enum IS honoured for STRUCT
-  variants and is SILENTLY INERT for UNIT variants: `{"answer":"absent","blake3":
-  "..."}` decoded cleanly with the attribute present. `Absent` is therefore an
-  EMPTY STRUCT variant `Absent {}` - byte-identical encoding, strict decoding.
-  The prose now states the real behaviour. HoldAnswer is NOT touched: it has the
-  same laxity and is already frozen, so tightening it would itself be a wire
-  change. C1 and C2 landed together, so no future per-answer field is welded shut
-  by C2's strictness - the per-answer offer binding is IN the schema now.
-
-C3 - RESOLVED at four sites. decode_batch_hold_response applies the key cap to
-  `keys_asked` ITSELF, before the parse; MAX_BATCH_HOLD_OFFERS caps the
-  dictionary; `encode_checked` gates the SERIALIZED length of all five encoders
-  (claim, hold query, hold response, batch query, batch response);
-  AvailabilityIndex::answer_batch returns Result and hard-checks the cap instead
-  of debug_asserting it, and the compatibility shim checks before issuing any
-  probe. Note the shim's behaviour CHANGED deliberately: it used to answer an
-  over-cap batch happily on the reasoning that it sends N legal single-key
-  messages. True, but its RETURN VALUE is a wire message, and an over-cap
-  BatchHoldResponse is one no decoder on the network accepts.
-
-C4 - RESOLVED. Golden gains an empty-offers ENCODING vector, decode-only vectors
-  for legal inputs we accept but never emit (omitted `transports`, omitted
-  `offers`, a dropped unknown transport kind, the unknown-slot re-index), the
-  RESERVED v2 fields pinned POPULATED (M2: `relay.blob`, `signatures[].key_id`,
-  `signatures[].sig` were renameable with the whole suite green), an all-absent
-  batch vector, a distinct-locator batch vector, and a census test so a vector in
-  the file that nothing asserts fails the suite. 6 vectors -> 14.
-
-C5 - RESOLVED, and the guard had a THIRD defect nobody had reported: its parser
-  silently mis-read `pub(crate) fn` (it split the parameter list at the paren in
-  `pub(crate)`, giving name "", params "crate", and the entire real signature as
-  the return type). Every `pub(crate)` function in the three modules was being
-  checked against the wrong text. Plus the two reported: PLURAL_WRAPPERS so a bare
-  `BatchHoldResponse` return counts as plural holdings, and (file, name) ALLOWED
-  scoping. Honest limits now state the three-module scope and that the wrapper
-  list is hand-maintained.
-
-G3 - the AC#3 double-count is corrected in the Final Summary below.
-
-MUTATION EVIDENCE: 17/17 mutations bit a NAMED check, each verified to have
-APPLIED (file sha compared before/after) and each verified RESTORED (sha back to
-HEAD) before the next. One mutation (M8, removing the keys_asked cap) came back
-GREEN on the first pass - the answer-count cap downstream caught the same wire
-and produced an indistinguishable error, so the test was asserting the OUTCOME
-rather than the BOUNDARY. The oracle was rewritten to hand in non-JSON bytes with
-an illegal count, which can only be refused if the count is checked before the
-parse; it then bit. That is exactly the class of vacuous oracle this repo keeps
-finding, and it was found by mutating rather than by reading.
-
-GATES (all inside `nix develop`): build 0, lint 0, test 0, e2e 0 (26/26
-scenarios), discovery 0. 131 daemon lib tests + 14 golden + 6 no-enumeration.
-
-HONEST LIMITS OF THIS ROUND
-  * Three lines were REMOVED from claim.rs: the bodies of encode_claim,
-    encode_hold_query and encode_hold_response, each gaining the output size gate.
-    `git diff da74e47^..HEAD -- daemon/src/claim.rs | grep '^-' | grep -v '^---'`
-    returns exactly those three `serde_json::to_vec(...)` lines. NONE is in a type
-    definition, a serde attribute, a const or a decoder, and the golden byte
-    vectors prove no encoding changed. This is a deliberate trade: leaving a known
-    encode-side amplification gap unfixed on a DEEP-gated task is worse than a
-    non-zero (and precisely characterised) removed-line count.
-  * The per-content worst case has only ~10% headroom under the wire gate, not
-    the 25% the common cases keep. Asserted in both directions so it cannot rot
-    into an assumption, but it is thin, and a third per-content locator kind would
-    need the cap re-derived.
-  * The version gate still reads the version from the PARSED value, so a future
-    version whose SHAPE also differs is reported as Malformed rather than
-    UnsupportedVersion. Still rejected; the diagnostic is the weaker of the two.
-    Shared with all five decoders; fixing it piecemeal here would be inconsistent.
-  * `deserialize_transport_slots` DUPLICATES the tolerate-but-drop loop of the
-    frozen `deserialize_known_transports` rather than refactoring it, to keep the
-    freeze audit over claim.rs meaningful. The shared rule (which tags are known)
-    lives once; a test asserts the two decoders agree on the same inputs.
-  * One test failure was observed and is NOT mine: testproxy
-    truncated_nar_fault_short_reads failed once under the full parallel run and
-    passed 3/3 in isolation. testproxy is crate-independent from daemon and this
-    change touches daemon only. Filed as TASK-108.
-
-FOLLOW-UPS FILED: TASK-106 (M1 total deadline + the per-peer-fault contradiction),
-TASK-107 (M3 log flood, M4 test name, M5 or_insert_with side effect), TASK-108
-(the testproxy flake). Forward-carried to TASK-100/101/103/75.
-
-## G3 WAS WIDER THAN THE GATE SCOPED IT (found while fixing it)
-
-The finding was handed over as prose-only, on the reading that the harness emits
-no wall-clock speedup factor and TESTING.md quotes none. The second half is true;
-the first is not. scripts/discoveryaxis.py emits wall_clock_reduction_factor_shaped
-in its JSON and PRINTED both factors in one semicolon-joined sentence every run:
-'round trips 147.5x fewer; discovery wall clock under emulated latency 146.2x
-faster'. That is the doubled claim, produced by the instrument. Correcting only the
-task notes would have left the machine still saying it.
-Fixed in e8a8175: the printer names the round-trip count as THE result, labels the
-shaped factor as confirming the emulation rather than corroborating the count, and
-prints the unshaped floor (5.5x this run) with its caveats; the JSON gains
-wall_clock_reduction_factor_shaped_is_derived and ..._unshaped. Both rules bite by
-mutation against discoveryaxis --self-test (M18, M19).
-This is the fifth-round pattern holding: assume one more hole remains.
+MINIMUM BEFORE THE NEXT RE-GATE: bound the offer dictionary against ANSWERED keys rather than >=1
+Have; add the batched-arm RTT recovery check AND recompute the reduction factor from the counts;
+add the empty-offer_indices golden vector and a must-REJECT vector class; make the no-Deserialize
+property a compile-time assertion; extend the guard's is_fn prefixes and bring transport_iroh.rs into
+scope; land deny_unknown_fields on KnownTransport and KnownPayload.
 <!-- SECTION:NOTES:END -->
 
 ## Final Summary
