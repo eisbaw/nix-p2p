@@ -3,11 +3,11 @@ id: TASK-109
 title: >-
   The verification gate is ~30% non-deterministic under load, so every certified
   "test 0" is one green roll
-status: In Progress
+status: Done
 assignee:
   - '@me'
 created_date: '2026-08-10 16:00'
-updated_date: '2026-08-10 21:32'
+updated_date: '2026-08-10 21:35'
 labels:
   - hardening
 dependencies:
@@ -482,4 +482,39 @@ The five kept: s1-byte-and-counts (core S1), s2-fallback (additive invariant), t
 safety bite - a fast gate that cannot catch a verification regression is the wrong gate at any
 speed), chain-s1-and-counts (depth composition), s6-p2p (wave-2 acceptance). One per distinct path;
 e2e-full remains the gate that must be green before shipping a serving-path change.
+
+## CLOSED 2026-08-10. All four ACs met; limits stated rather than smoothed over.
+
+AC#1 rate measured: 9/20 = 45%, N=20, load = 14 CPU burners on a 14-core host, per-test breakdown
+       recorded. Worse than the ~30% this task's title assumed.
+AC#2 each load-sensitive test classified by MECHANISM and fixed there: 5 species, 18 sites, of
+       which only 5 had ever fired. No --test-threads=1, no retry-until-green.
+AC#3 re-measured at the SAME N and load: 0/20, exit codes {0} only.
+AC#4 TESTING.md 'Gate honesty' section with five binding rules.
+
+Subsumed and closed: TASK-84 (species D), TASK-105 (species E), TASK-108 (species C).
+Filed: TASK-111 (the PRODUCT 1000 ms timeout, deliberately not changed here).
+Fed forward: TASK-91 (round-7 certified under the 45% regime), TASK-65 (its oracle was sound; its
+test binary was corrupting its own measurements), TASK-54 (disk/scratch).
+
+WHAT THIS TASK DID NOT FIND: no product defects. All five mechanisms were defects in tests and test
+infrastructure; the daemon and proxy behaved correctly in every failure examined. The value is not
+a bug fixed, it is that a gate failing 45% of the time could not have distinguished a real
+intermittent product defect from its own noise - it was loud enough to hide the class of bug it
+exists to catch.
+
+THREE THINGS THE MEASUREMENT CORRECTED, worth keeping because each was an assumption held
+confidently:
+  1. The task was written around store_residency_oracle. That caused 1 of 10 failing instances; the
+     dominant cause (6) was in the testproxy crate that TASK-108 had dismissed as 'not mine'.
+  2. My first fix for the latency assertion was itself load-sensitive. It passed locally, in
+     isolation, and for 13 consecutive full-suite runs under load before the re-measurement caught
+     it. The AFTER run was discarded and redone rather than carried forward.
+  3. I told the owner fault-depth-matrix was the e2e long pole. It is 11.8s of 439.2s - among the
+     fastest. The cost is in scenarios that wait on process death, plus a ~11s per-scenario floor.
+
+NOT CLOSED, and not to be read as cleared: species A and B never fired in either measurement, so
+their fixes rest on reading plus an earlier QA report; the latent sites in serve_budget_and_supply
+and header_hygiene remain unfixed and unfired; and 0/20 bounds the residual rate at ~14% (95%), it
+does not prove zero.
 <!-- SECTION:NOTES:END -->

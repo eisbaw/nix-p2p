@@ -3,9 +3,10 @@ id: TASK-84
 title: >-
   cargo test --workspace flaked once under load after task-72 added a heavier
   test binary
-status: To Do
+status: Done
 assignee: []
 created_date: '2026-08-09 22:24'
+updated_date: '2026-08-10 21:35'
 labels:
   - flake
 dependencies: []
@@ -30,3 +31,11 @@ CANDIDATE REMEDIES, in order of preference: make testproxy's test server's accep
 - [ ] #1 The failure mode is REPRODUCED deliberately and named (starvation vs backlog vs memory) before any change is made
 - [ ] #2 The chosen remedy is justified against the reproduction, and 'retry on failure' is not it
 <!-- AC:END -->
+
+## Implementation Notes
+
+<!-- SECTION:NOTES:BEGIN -->
+CLOSED BY TASK-109 (2026-08-10). The symptom recorded here - premature_eof.rs failing with 'upstream fetch failed: Connection reset by peer' during a full just test, passing in isolation immediately after - is task-109's species D, and its cause is NOT task-72's heavier binary. The fake origin in premature_eof.rs drained the request head with ONE read() and then closed the socket; under load it closed while the proxy was still writing its request, so the proxy took ECONNRESET/EPIPE. The origin, not the proxy, was breaking the protocol.
+
+This was not a one-off: at N=20 under 14 CPU burners it failed 3 times, the second-largest contributor to a measured 45% gate failure rate. Fixed by draining to the CRLFCRLF terminator, plus tightening the assertion that had been misattributing the resulting 502 to cache poisoning. Re-measured 0/20 at the same N and load.
+<!-- SECTION:NOTES:END -->

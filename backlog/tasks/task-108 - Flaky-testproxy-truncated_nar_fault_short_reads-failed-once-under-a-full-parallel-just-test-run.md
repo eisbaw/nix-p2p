@@ -3,9 +3,10 @@ id: TASK-108
 title: >-
   Flaky: testproxy truncated_nar_fault_short_reads failed once under a full
   parallel just test run
-status: To Do
+status: Done
 assignee: []
 created_date: '2026-08-10 14:07'
+updated_date: '2026-08-10 21:35'
 labels:
   - flaky
 dependencies: []
@@ -34,3 +35,11 @@ A flaky negative-feedback gate is worse than a missing one: it trains the reader
 - [ ] #2 The oracle observes the truncation at a boundary that does not depend on how the bytes happen to be chunked
 - [ ] #3 The full parallel just test run is green across at least 20 consecutive runs after the fix
 <!-- AC:END -->
+
+## Implementation Notes
+
+<!-- SECTION:NOTES:BEGIN -->
+CLOSED BY TASK-109 (2026-08-10). Confirmed as a happens-before race, not anything to do with the task-91 cycle it was observed in - the note here that it is unrelated to that change was correct. fault_count() reads the in-process Mutex<Log>, but the proxy pushes its record at proxy.rs:108 AFTER serve() has written the response, so get() can return having fully observed the fault while the server thread has not yet counted it.
+
+At N=20 under load this species (truncated_nar 2, connection_reset 4) was the DOMINANT cause: 6 of 10 failing instances in a measured 45% gate failure rate - not the once-observed curiosity this task recorded. Fixed by await_fault_count/await_stats across 11 sites, which wait for the guaranteed record and then assert the original equality. Re-measured 0/20 at the same N and load.
+<!-- SECTION:NOTES:END -->

@@ -1,10 +1,10 @@
 ---
 id: TASK-105
 title: 'Flaky: store_residency_oracle failed once under a full parallel just test run'
-status: To Do
+status: Done
 assignee: []
 created_date: '2026-08-10 12:25'
-updated_date: '2026-08-10 13:11'
+updated_date: '2026-08-10 21:35'
 labels: []
 dependencies: []
 priority: high
@@ -76,4 +76,10 @@ around the residency tests, or an oracle that does not rest on whole-process RSS
 
 AND: '3/3 green' is not evidence of determinism. QA got 3 clean just test runs and then reproduced 13
 failures under load.
+
+CLOSED BY TASK-109 (2026-08-10). Root cause confirmed as diagnosed: vm_bytes() reads whole-process /proc/self/status while libtest runs the binary's three tests concurrently in the SAME process, each moving ~32 MiB. Fixed by splitting into three test targets sharing tests/residency_support/mod.rs - cargo runs targets sequentially and /proc/self/status is per-process, so each RSS test is now the only allocator in the process it measures. --test-threads=1 was rejected: it would buy determinism by deleting parallel coverage everywhere.
+
+AC#1's 'no papering over' is met by evidence beyond the pass rate: the split repaired the MEASUREMENTS. Runs that previously PASSED were printing 'allocator returned = 298.4%' and '-1.0%' and a VmRSS baseline higher than the same test's seeded reading. Now baseline 37261312 -> seeded 71290880 (34.0 MB rise for a 33.5 MB payload) and 99.2%/96.8% returned, matching task-65's documented ~97%.
+
+HONEST LIMIT: it fired only 1/20 in task-109's CPU-burner harness. The stronger evidence remains qa's 13/64 under 8 CONCURRENT PROCESSES, a stressor that harness does not reproduce, so 0/20 after is weaker evidence here than for the testproxy species.
 <!-- SECTION:NOTES:END -->
