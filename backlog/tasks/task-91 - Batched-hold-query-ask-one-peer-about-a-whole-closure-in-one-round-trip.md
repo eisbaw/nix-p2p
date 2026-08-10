@@ -5,7 +5,7 @@ status: Done
 assignee:
   - '@me'
 created_date: '2026-08-10 07:23'
-updated_date: '2026-08-10 16:00'
+updated_date: '2026-08-10 17:09'
 labels:
   - wave-2b
 dependencies:
@@ -73,102 +73,87 @@ TIMING OPPORTUNITY worth taking here: the daemon knows every NarHash the moment 
 ## Implementation Notes
 
 <!-- SECTION:NOTES:BEGIN -->
-## DEEP RE-GATE #2: NO-GO (mped-architect, read-only, 2026-08-10). Sixth-hole prediction CONFIRMED.
+## ROUND-7 FIX LANDED (implementer). A CODEX RE-GATE IS REQUIRED - I DO NOT SELF-CERTIFY.
 
-PRIORITY-1 LEAD FROM THE STALLED RUN: CONFIRMED, and it is a gate-breaker.
-The discoveryaxis self-test is NOT vacuous in general - disabling each of its five substantive rules
-produced FAIL lines and rc=1. But THE RULE SET IS EMPTY EXACTLY WHERE ROUND 6 PUT THE CLAIM.
-arm_violations recovers the injected RTT for the SERIAL arm only (expected_ms = serial_rt * rtt_ms,
-discoveryaxis.py:238). The BATCHED arm - the numerator of the headline reduction factor - is
-constrained by nothing but >0 and <serial. Mutating the real Rust instrument
-(closure_discovery.rs, let batched_rt = 1) produced:
-    RESULT: 1180.0x fewer round trips   (truth is 147.5x - an 8x INFLATION)
-    batched: 1 round trips, 420.1 ms    (1 round trip timed at 420 ms under a 50 ms/rt knob)
-    problems: []   exit 0
-Six further attacks ALL passed with problems==[]: batched count understated 8x; unshaped says
-batched=8 while shaped says 800; serial inflated 85x with wall clock scaled to match (the band
-validates a RATIO, and both operands come from the same instrument); unshaped batched arm 1e8 x
-slower than serial (the unshaped arm has NO wall-clock rule at all); a passed-through
-round_trip_reduction_factor of 99999 contradicting the instrument's own counts (never recomputed
-from serial_rt/batched_rt); unshaped batched wall clock set to 1 ns -> prints 'honest floor 6200000.0x'.
-Of the three assertions round 6 added, two check that the DISCLAIMER WORDING is printed and the third
-asserts a hardcoded True literal is True. The invariant is stated in prose at discoveryaxis.py:394 and
-NOT ENCODED. Also: the promoted '~5.5x honest floor' is quoted to one decimal with no interval, while
-five runs gave 5.26 / 8.33 / 11.68 / 6.96 / 7.85 - a 2.2x spread (round-trip counts were rock stable).
+Commits: c5daf6f (offer-dictionary bound), 9a4cecd (discovery oracle), 32f8d2c
+(no-enumeration guard), 8de9d12 (must-REJECT golden class + sibling strictness),
+cf06e45 (doc drifts + citation gate), a15bd3f (floor formatting).
+Full evidence in `git notes --ref=verification show a15bd3f`.
 
-AC#4 IS NOT MET (gate-breaker). R3 bounds the dictionary against '>=1 Have', NOT against the number of
-ASKED keys. Verified, and reproduced independently by a second agent: A 1-KEY QUESTION RETURNED 512
-CONTENT-SPECIFIC INFOHASHES, 55,860 B response vs a 91 B query = 613.8x. A BitTorrent infohash IS a
-content identity, so a peer asked about one key may volunteer 511 content identities the asker never
-named. C1 moved the leak from 'zero Haves' to 'one Have', which for a per-CONTENT locator kind is not
-a bound. This falsifies the Final Summary's 'volunteering a holding is inexpressible rather than
-merely unanswered' and TESTING.md's AC#4 claim.
+THE HEADLINE NUMBER. One-key wire amplification 613.8x -> 4.0x. Three reviewers
+measured the same unfixed bound three ways (578x / 613.8x / 557.6x); a 91 B
+query can now elicit at most a 366 B response carrying at most ONE content
+identity.
 
-C3's THIRD REPRODUCTION IS NOT FIXED: amplification ROSE to 613.8x (from 578x). MAX_BATCH_HOLD_OFFERS
-=512 is the binding constraint; the byte gate alone would have allowed 720x. And the FROZEN single-key
-path is worse and untouched: HoldAnswer::Have.offers has no count cap at all - 622 offers = 65,440 B
-against an 88 B query = 743.6x.
+1. AC#4 WAS NOT MET AND NOW IS. "Every dictionary entry is referenced by at
+   least one Have" bounds the dictionary against the EXISTENCE of a Have, not
+   against what was ANSWERED - one Have could name all 512 entries, so a one-key
+   question could be answered with 511 BitTorrent infohashes, which ARE content
+   identities. Closed by two semantic rules: at most MAX_OFFERS_PER_ANSWER (4)
+   offers per answer, and at most ONE per transport KIND (the content behind a
+   key has one identity per transport). The arithmetic bound
+   `offers.len() <= have_count * 4` is now a THEOREM of those, and the explicit
+   check for it was REMOVED after mutation showed it and the per-answer cap were
+   masking each other.
 
-SIX SURVIVING MUTATIONS in a round that certified '19/19 bit a NAMED check':
-  M2  remove the answer-count cap from check_batch_offer_bindings -> the encoder emits a 257-answer
-      message no legal decoder accepts. That is EXACTLY the property C3 asserts, unguarded.
-  M10 remove the shim's key-cap check -> the shim still refuses, but only AFTER issuing all 257
-      probes. Code comment and test name both claim 'before issuing any probe'; no test asserts
-      probe count.
-  M9  the shim's MAX_BATCH_HOLD_OFFERS guard is unreachable by any test.
-  re-adding Deserialize to #[derive] on BatchHoldResponse (claim.rs:663) COMPILES and leaves the whole
-      -p daemon suite GREEN - the entire index-rebinding argument rests on a property no test asserts.
-  golden: #[serde(default, skip_serializing_if="Vec::is_empty")] on Have::offer_indices survives -
-      the exact hole just closed for offers, left open one type over (no vector has an empty
-      offer_indices, which is legal and reachable per claim.rs:766).
-  golden: removing deny_unknown_fields from BatchHoldQuery survives - zero coverage anywhere.
+2. AC#3's INSTRUMENT COULD NOT DETECT AN 8x INFLATION OF ITS OWN HEADLINE. Only
+   the serial arm's count was recovered from its wall clock. Both arms are now
+   recovered; the reduction factor is RECOMPUTED from the counts rather than
+   relayed; and the hardcoded `..._is_derived: True` (an assertion no run could
+   falsify) is replaced by the measured discrepancy. The honest floor is now a
+   RANGE over replicates - it was quoted to one decimal across a 2.2x run-to-run
+   spread (3.88x to 11.68x on one build).
 
-C2 landed at 1 of 4 internally-tagged enums. KnownTransport (claim.rs:296) - which sits INSIDE the
-offer dictionary C2 hardened - is still lax: a 60,489 B dictionary entry carrying also_held, blake3
-and a 60 KB pad DECODED. KnownPayload (line 245) has the same gap.
+3. THE NO-ENUMERATION GUARD COULD BE DEFEATED BY POSITION. Its line filter
+   truncated the ENTIRE source at the first `#[cfg(test)]`, and claim.rs has one
+   early - so `pub fn harvest_every_key_i_know() -> Vec<NarHashKey>` appended to
+   the real file passed at exit 0. The `checked > 60` floor could not notice
+   because the other two modules still supplied 57. Fixed as a CLASS: brace-
+   matched cfg(test) skipping, grammar-derived declaration detection (11 forms
+   asserted, 4 benign controls), PER-FILE floors, (file, impl, name) exemptions,
+   Vec<BatchHoldAnswer> as a listing, transport_iroh.rs in scope - and its stated
+   scope limit corrected, since the claim that unscanned modules "do not answer
+   peer messages" was false of exactly that module.
 
-GOLDEN CENSUS is name-matching against a hand-maintained EXERCISED list, not against actual test
-usage: adding a vector AND its name yields exit 0 with a wire asserted by nothing. Defeated also by a
-sibling top-level array, a nested vectors array, and a new identities entry. CLASS STATEMENT: the file
-pins EMITTED bytes well but has NO vector class for 'this wire must be REJECTED', so every
-acceptance-widening mutation passes by construction.
+4. THE GOLDEN FILE COULD NOT SAY "REJECT THIS". Every acceptance-widening change
+   passed by construction. Six `direction: "reject"` vectors added, class
+   asserted non-empty; plus the empty-offer_indices encoding vector.
+   `deny_unknown_fields` extended to KnownTransport and KnownPayload (C2 landed
+   at 1 of 4 internally-tagged enums, and KnownTransport sits inside the very
+   dictionary C2 hardened - an offer carrying `also_held:["sha256:..."]` and a
+   60 KB pad decoded cleanly).
 
-C5 GUARD: the pub(crate) parse bug is real but its SEVERITY WAS INVERTED in the round-6 report - the
-mis-parse made plural-detection a superset and keyed permanently false, so it produced false
-POSITIVES (it would be RED on today's legitimate pub(crate) fn check_batch_keys). A fail-loud bug that
-had not yet fired, not a silent-pass defect. The wrapper bypass IS genuinely fixed. But 11 LIVE
-BYPASSES remain: pub(crate) async fn (discovery.rs is async-heavy), pub(super) fn, pub const fn (two
-real claim.rs fns unchecked today), a type alias, Vec<BatchHoldAnswer> (every Have carries a blake3 -
-a holdings listing built from the project's own types), BTreeSet/VecDeque/arrays,
-PhantomData<NarHashKey> as a vacuous 'key in', a COMMENT in the parameter list satisfying the key
-rule, and anything after #[cfg(test)]. Exemptions are reusable WITHIN a file, so
-impl Harvester { pub fn load(&self) -> Vec<NarHashKey> } in availability.rs inherits IndexStore::load's
-exemption. AND THE GUARD'S STATED HONEST LIMIT IS FACTUALLY WRONG: it says unscanned modules 'do not
-answer peer messages today', but transport_iroh.rs is the module that accepts peer QUIC connections,
-imports AvailabilityIndex, and its own doc points at the index that 'enumerates a node's held NARs'.
-An enumeration method placed there passes at exit 0.
+5. RE-ADDING `Deserialize` TO BatchHoldResponse IS NOW AN E0119 BUILD ERROR. The
+   whole index-remap safety argument rested on that derive's absence and was
+   enforced by nothing.
 
-VERIFIED GOOD, do not relitigate: the R1/R2/R3 binding machinery and the position-preserving remap
-(all five rule-removal mutations went RED; a 20,000-case differential fuzz over mixed known/unknown
-dictionaries found zero rebindings and zero panics; every rebinding attack failed, including an index
-pointing at a dropped slot); the regression test the prompt asked for ALREADY EXISTS
-(discovery.rs:1606 + a byte-level twin at claim_wire_golden.rs:428); the C2 serde finding and
-byte-identity (Absent {} and unit Absent both emit 19 identical bytes; all 11 smuggling attacks
-rejected); the rewritten M8 genuinely isolates the pre-parse boundary; answer_batch's hard check; the
-58,910 B / 10.1% headroom figure, asserted in both directions; and the WIRE FREEZE ITSELF (the four
-frozen vectors are byte-identical since the golden file was introduced; frozen type definitions diff
-empty against fc31b74).
+6. DOC DRIFTS, plus a gate for the recurring one. Two dangling test citations in
+   claim.rs (both load-bearing, both introduced while fixing a review finding);
+   a justification that paid for a code duplication with a "freeze audit" that
+   does not exist and whose property is false; TESTING.md naming `just build`
+   for a failure that occurs in `just test`. daemon/tests/doc_citations.rs now
+   fails the suite on any dangling citation - and its own first version scanned
+   too few files and reported a real test as missing, which is the mistake it
+   exists to catch.
 
-TWO DOC DRIFTS: TESTING.md says 'raising the cap to 1024 fails the build' - it does NOT (cargo build
-rc=0); it fails the test a_full_batch_fits_the_wire_cap_with_headroom. And claim.rs:~559 justifies a
-design choice by 'the freeze audit (git diff | grep ^- returning nothing)' - NO SUCH GATE EXISTS in
-the Justfile or scripts.
+GATES (serial, idle machine): build 0, lint 0, test 0 (290 passing), discovery 0,
+e2e 0 (26/26). cargo test --workspace 5x consecutively: all 0.
 
-MINIMUM BEFORE THE NEXT RE-GATE: bound the offer dictionary against ANSWERED keys rather than >=1
-Have; add the batched-arm RTT recovery check AND recompute the reduction factor from the counts;
-add the empty-offer_indices golden vector and a must-REJECT vector class; make the no-Deserialize
-property a compile-time assertion; extend the guard's is_fn prefixes and bring transport_iroh.rs into
-scope; land deny_unknown_fields on KnownTransport and KnownPayload.
+FREEZE, RE-DERIVED FROM SCRATCH: the five frozen vectors are byte-identical to
+da74e47 where the golden file was introduced (6 vectors -> 21); no frozen TYPE
+definition is touched. THE ONE SUBSTANTIVE FREEZE CHANGE, flagged for an explicit
+reviewer yes/no: deny_unknown_fields on KnownTransport/KnownPayload tightens what
+the frozen Claim.transports and HoldAnswer::Have.offers ACCEPT. Nothing emitted
+changes; unknown transport KINDS are still tolerated and dropped.
+
+NOT CLOSED, DELIBERATELY: the frozen single-key HoldAnswer::Have.offers still has
+no count cap (622 offers = 65,440 B against an 88 B query = 743.6x). Capping it
+is a decoder-acceptance change to a frozen type beyond this round's scope and
+should be its own task. Gate non-determinism is TASK-109's.
+
+FIVE MUTATIONS CAME BACK GREEN DURING THIS ROUND and were fixed rather than
+written off; the mutation harness also caught its own defect (cargo returns 101
+for a COMPILE failure too, so three "bites" were mutants that did not build).
 <!-- SECTION:NOTES:END -->
 
 ## Final Summary
