@@ -7,12 +7,11 @@ title: >-
 status: To Do
 assignee: []
 created_date: '2026-08-10 08:43'
+updated_date: '2026-08-10 11:25'
 labels:
   - wave-2b
 dependencies:
   - TASK-73
-  - TASK-78
-  - TASK-89
 priority: high
 ---
 
@@ -40,3 +39,9 @@ OUTPUT is a decision record with measurements attached, not code we keep.
 - [ ] #4 A written decision record answering, with the above measurements attached: (a) do we ship a mainline dependency in the NixOS module at all; (b) client-only or server, and how is that enforced rather than defaulted; (c) does the get_peers lookup-side leak change TASK-78's leech-mode privacy claim, and if so what text in PRD.md's privacy invariant changes. BITE: TASK-73's key-derivation freeze carries a tracker dependency on this record; verify the edge exists and that TASK-73 cannot be marked done without it.
 - [ ] #5 The task's notes correct three factual claims currently circulating in the backlog: that `mainline`/`pkarr` are already in our dependency graph (they are not — Cargo.lock has zero occurrences), that n0 solved NodeId recovery with identify-on-announced-port (they did not), and that iroh-mainline-content-discovery 0.6.0 is recent and actively developed (crates.io dates it 2025-04-04 and upstream deleted its mainline layer weeks later). BITE: grep the backlog for those three claims and confirm each surviving occurrence is annotated.
 <!-- AC:END -->
+
+## Implementation Notes
+
+<!-- SECTION:NOTES:BEGIN -->
+DEPENDENCIES CORRECTED 2026-08-10: previously depended on TASK-78 (leech mode) and TASK-89 (LAN discovery). Neither is a prerequisite for DECIDING mainline participation, and TASK-89 was just demoted to low priority by owner directive, so those edges blocked the DHT critical path for no reason. This is a decision task; the research it needs is already recorded in TASK-73's notes (BEP5/BEP44 semantics, the NodeId impasse, BEP51 sweep exposure, server-mode promotion, the crawler hazard).
+<!-- SECTION:NOTES:END -->

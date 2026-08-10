@@ -6,10 +6,10 @@ title: >-
 status: To Do
 assignee: []
 created_date: '2026-08-10 08:43'
+updated_date: '2026-08-10 11:25'
 labels:
   - wave-2b
 dependencies:
-  - TASK-87
   - TASK-9
 priority: high
 ---
@@ -40,3 +40,17 @@ CHURN. A one-day sample shows 763 signed paths registered in the last 24 hours =
 - [ ] #4 Signed-set insert and delete rates are recorded over >=14 days from registrationTime and reported as both a daily rate and a burst maximum. BITE: the report must surface the burst — today's sample is 763 signed paths in 24h against 963 in 7 days; a tool that reports only a smooth weekly average hides the channel-bump burst and fails.
 - [ ] #5 PRD.md's measured-distribution table is replaced with dated figures carrying a provenance line naming the exact command, and every backlog task quoting 108,401 or 155,621 gets a correction note. BITE: `grep -rn '108,\?401\|155,\?621' backlog/ PRD.md` returns only corrected/annotated references.
 <!-- AC:END -->
+
+## Implementation Notes
+
+<!-- SECTION:NOTES:BEGIN -->
+DEPENDENCY CORRECTED 2026-08-10: this task previously depended on TASK-87 (the >=10-peer container harness). That was wrong and it blocked the whole DHT chain (95 -> 102 -> 103) behind a large unrelated build. The census is a script that reads /nix/var/nix/db/db.sqlite; the orchestrator produced the full numbers in seconds with no harness at all. Making it reproducible + gated is the task; a peer swarm is not required.
+
+ORCHESTRATOR MEASUREMENT 2026-08-10 to reproduce and gate (independently derived, not from a subagent):
+  valid paths 85,808 | .drv 73,412 (85.6%, 263 MiB) | servable output 12,396 (105,713 MiB)
+  signed by cache.nixos.org 6,769 (53,854 MiB = 50.9% of servable bytes)
+  locally built (ultimate) 2,250 (35,870 MiB)
+  servable size distribution: mean 8.53 MiB, p50 0.10, p90 4.48, p99 151.06, p100 3186.03 MiB
+  concentration: top 151 = 73.5% of bytes, top 691 = 91.7%, top 1,243 = 95.5%
+The PRD table has been corrected to these. This task makes them REPRODUCIBLE and keeps them from going stale.
+<!-- SECTION:NOTES:END -->
