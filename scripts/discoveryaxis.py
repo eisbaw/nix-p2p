@@ -338,9 +338,24 @@ def build_block(unshaped: dict, shaped: dict) -> tuple[dict, list[str]]:
             "shaped": arms(shaped)
             | {"injected_rtt_ms": shaped["config"]["injected_rtt_ms"]},
             "round_trip_reduction_factor": unshaped["round_trip_reduction_factor"],
+            # DERIVED, NOT A SECOND RESULT. The shaped wall clock is validated
+            # against round_trips * injected_rtt_ms and the run is marked INVALID
+            # outside the recovery band, so within a valid run this ratio IS the
+            # round-trip ratio restated in milliseconds. It is emitted because it
+            # shows the emulation behaved, and it is named `..._is_derived` beside
+            # it so nothing downstream can quote it as corroboration.
             "wall_clock_reduction_factor_shaped": (
                 shaped["arms"]["serial"]["wall_clock_ms_median"]
                 / max(shaped["arms"]["batched"]["wall_clock_ms_median"], 1e-9)
+            ),
+            "wall_clock_reduction_factor_shaped_is_derived": True,
+            # The UNSHAPED arm is the one wall-clock number that is not determined
+            # by the knob. It is also small in absolute terms (single-digit
+            # milliseconds) and therefore noisy run to run, which is exactly why it
+            # is reported as the honest FLOOR rather than as the headline.
+            "wall_clock_reduction_factor_unshaped": (
+                unshaped["arms"]["serial"]["wall_clock_ms_median"]
+                / max(unshaped["arms"]["batched"]["wall_clock_ms_median"], 1e-9)
             ),
             "problems": problems,
         },
@@ -373,11 +388,22 @@ def human_lines(block: dict) -> list[str]:
             f"({arm['round_trips_per_substitution_batched']:.2f}/substitution), "
             f"{arm['wall_clock_ms_median_batched']:.1f} ms",
         ]
-    lines.append(
-        f"  round trips {block['round_trip_reduction_factor']:.1f}x fewer; "
-        f"discovery wall clock under emulated latency "
-        f"{block['wall_clock_reduction_factor_shaped']:.1f}x faster"
-    )
+    # ONE result, stated once. The previous wording put the round-trip factor and
+    # the shaped wall-clock factor in one sentence joined by a semicolon, which
+    # reads as two corroborating measurements. It is one: the shaped wall clock is
+    # round_trips x the injected delay by construction of this harness, and a run
+    # where it is not is marked INVALID above.
+    lines += [
+        f"  RESULT: {block['round_trip_reduction_factor']:.1f}x fewer round trips "
+        f"(a count, not a timing)",
+        f"  the shaped wall clock ({block['wall_clock_reduction_factor_shaped']:.1f}x) "
+        f"is that same count times the {block['shaped']['injected_rtt_ms']} ms knob - "
+        f"it confirms the emulation, it is NOT a second result",
+        f"  honest floor, unshaped and unemulated: "
+        f"{block['wall_clock_reduction_factor_unshaped']:.1f}x "
+        f"(single-digit ms, noisy; the serial baseline is strictly sequential "
+        f"across peers, i.e. the most naive one available)",
+    ]
     if block["problems"]:
         lines.append("  PROBLEMS (the arm is INVALID):")
         lines += [f"    - {problem}" for problem in block["problems"]]
@@ -544,6 +570,27 @@ def run_self_test() -> int:
         "the human lines name both arms and the condition",
         any("in-process floor" in line for line in human_lines(block))
         and any("emulated network" in line for line in human_lines(block)),
+    )
+    check(
+        # AC#3 stated ONE measurement twice: the round-trip count and the shaped
+        # wall clock were printed in one sentence joined by a semicolon, which
+        # reads as two corroborating results. The shaped wall clock is
+        # round_trips x the injected knob BY CONSTRUCTION of this harness (a run
+        # where it is not is marked INVALID above), so the printer must say so and
+        # must print the one wall-clock number that is NOT determined by the knob.
+        "the shaped wall clock is printed as DERIVED, not as a second result",
+        any("NOT a second result" in line for line in human_lines(block))
+        and any("honest floor" in line for line in human_lines(block))
+        and block["wall_clock_reduction_factor_shaped_is_derived"] is True,
+    )
+    check(
+        "the unshaped floor is reported as its own factor, not left to a reader",
+        # ~1180/8 would be the shaped answer; the unshaped one is far smaller,
+        # because without an injected delay the round trips are nearly free.
+        block["wall_clock_reduction_factor_unshaped"]
+        < block["wall_clock_reduction_factor_shaped"] / 10,
+        f"unshaped={block['wall_clock_reduction_factor_unshaped']:.2f} "
+        f"shaped={block['wall_clock_reduction_factor_shaped']:.2f}",
     )
     broken_block, _ = build_block(clean_unshaped, _valid_run(0))
     check(
