@@ -6,7 +6,7 @@ title: >-
 status: To Do
 assignee: []
 created_date: '2026-08-09 21:01'
-updated_date: '2026-08-10 09:27'
+updated_date: '2026-08-10 10:04'
 labels:
   - wave-2b
 dependencies:
@@ -39,14 +39,5 @@ Honest scale caveat: TESTING.md S5 explicitly excludes emergent network effects 
 ## Implementation Notes
 
 <!-- SECTION:NOTES:BEGIN -->
-## FACT CORRECTION 2026-08-10 (second): the 'iroh crates are unusable' note above is PARTLY WRONG.
-
-It conflated two different things. The crates.io crate iroh-mainline-content-discovery 0.6.0 IS old
-(published 2025-04-04, pins iroh 0.34). But the CURRENT iroh-experiments/content-discovery directory
-- the one the owner linked - is a different, newer workspace. Verified from its Cargo.toml today:
-iroh 1.0.0-rc.1, iroh-base 1.0.0-rc.1, iroh-blobs 0.102, iroh-mainline-address-lookup 0.3.
-We run iroh 1.0.3 / iroh-blobs 0.103, so the gap is an rc-to-release bump plus one minor version.
-It is ADOPTABLE. Filed as TASK-101 (vendor it). What remains true: it is tracker-only (the DHT layer
-was deliberately removed upstream), ships no default tracker, and lives in an explicitly unpolished
-experiments repo - hence vendor rather than depend.
+OWNER DIRECTIVE 2026-08-10: global/DHT decentralization is HIGH priority; LAN and tiered discovery are LOW priority (TASK-89 demoted). Privacy resolved by decision: a node publishes ONLY NARs already public at cache.nixos.org, which acts as the filter - filed as TASK-102 and enforced in code, not convention. Substrate choice and build are TASK-103 (own Kademlia over iroh vs mainline + identify responder). This task stays the umbrella; TASK-103 carries the work.
 <!-- SECTION:NOTES:END -->
