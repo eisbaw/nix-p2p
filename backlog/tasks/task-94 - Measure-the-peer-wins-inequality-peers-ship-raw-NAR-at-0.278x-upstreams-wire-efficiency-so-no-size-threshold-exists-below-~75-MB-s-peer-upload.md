@@ -6,6 +6,7 @@ title: >-
 status: To Do
 assignee: []
 created_date: '2026-08-10 08:43'
+updated_date: '2026-08-10 09:10'
 labels:
   - wave-2b
 dependencies:
@@ -38,3 +39,9 @@ WHAT FALSIFIES IT. If measured median B_peer between real WAN hosts exceeds 75.5
 - [ ] #4 A per-connection zstd prototype on the iroh leg is measured end-to-end and reported as an effective r_peer. BITE: r_peer must be computed from byte counters AT THE SOCKET under the TASK-52 counting rule, not inferred from a compressor's reported ratio — verify by confirming the socket-counted bytes exceed the compressor-reported bytes by the QUIC/framing overhead.
 - [ ] #5 The task closes with a written go/no-go recorded in the tracker: if measured median B_peer < B_up/r_effective, the record must state that latency-amortised discovery is disproved for WAN peers and name which backlog items are thereby invalidated (at minimum the size-gating direction in TASK-73 and the amortisation argument in TASK-93). BITE: TASK-73's key-derivation freeze must be blocked on this record via a tracker dependency edge, verified by the edge existing, not by convention.
 <!-- AC:END -->
+
+## Implementation Notes
+
+<!-- SECTION:NOTES:BEGIN -->
+FORWARD-CARRY: TASK-99 is the FIX for the asymmetry this task measures. Sequence them deliberately - measure the inequality first (it is the honest baseline and the cheap disproof), but do NOT conclude 'peers cannot win' from a measurement taken with compression OFF. The PRD reserved per-connection zstd at round 3 as a policy surface; the 3.6x is a deferred feature gap, not a property of the design.
+<!-- SECTION:NOTES:END -->
