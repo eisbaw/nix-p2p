@@ -34,6 +34,9 @@
 //!   * [`AvailabilityIndex::hold`] answers "do I hold this ONE NarHash?" -> a
 //!     [`HoldAnswer`] (`Have{blake3, offers}` or `Absent`). [`AvailabilityIndex::answer`]
 //!     wraps it in the versioned [`HoldResponse`] envelope for the wire.
+//!     [`AvailabilityIndex::answer_batch`] (task-91) answers the same question
+//!     about MANY caller-named keys in one call - a positional yes/no vector, not
+//!     a listing: every element is about a key the caller supplied.
 //!   * [`AvailabilityIndex::claim`] / [`AvailabilityIndex::publish`] produce the
 //!     COMPLETE [`Claim`] a peer needs to FETCH: the BLAKE3 to address the blob
 //!     (`payload = WholeNar`) AND the holder [`NodeId`] to dial (`holders` +
@@ -95,8 +98,9 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use crate::claim::{
-    CLAIM_SCHEMA_VERSION, Claim, HoldAnswer, HoldQuery, HoldResponse, KnownPayload, KnownTransport,
-    NarHashKey, QUERY_SCHEMA_VERSION,
+    BatchHoldAnswer, BatchHoldQuery, BatchHoldResponse, CLAIM_SCHEMA_VERSION, Claim, HoldAnswer,
+    HoldQuery, HoldResponse, KnownPayload, KnownTransport, MAX_BATCH_HOLD_KEYS, NarHashKey,
+    QUERY_SCHEMA_VERSION,
 };
 use crate::content_id::Blake3Digest;
 use crate::transport::NodeId;
@@ -682,6 +686,68 @@ impl AvailabilityIndex {
             schema_version: QUERY_SCHEMA_VERSION,
             answer: self.hold(&query.key)?,
         })
+    }
+
+    /// Answer a BATCHED probe (task-91): one positional yes/no per key asked, in
+    /// the asker's order, plus this node's transport offers hoisted out of them.
+    ///
+    /// NO ENUMERATION, and it is worth being explicit because the shape resembles
+    /// a listing: every element of the returned vector is derived from a key the
+    /// CALLER supplied, and the vector carries no keys of its own. There is still
+    /// no method here - or on any type this module exposes - that yields the
+    /// index's keys, its length, or any holding the caller did not name.
+    ///
+    /// WHY THERE IS NO ERROR CHANNEL. A per-key fault (a `nix-store --dump`
+    /// failure, a persist failure while pruning a GC'd path) answers `Absent` for
+    /// THAT key and is logged. This is deliberate and it is not error-swallowing:
+    /// it keeps the blast radius of a fault exactly what it is on the single-key
+    /// path, where a failed probe costs that one key and no other. Propagating
+    /// instead would let one broken store path deny a peer a whole 200-path
+    /// closure - a strictly worse outcome created by batching, which is precisely
+    /// what batching must not do. `Absent` is also the SAFE direction: it can only
+    /// cost a p2p hit (the fetch falls back upstream), never a wrong byte.
+    ///
+    /// PRECONDITION: `query` is a decoded, version- and cap-checked probe (the
+    /// wire path gates it in [`crate::claim::decode_batch_hold_query`]). The
+    /// answer allocation is bounded by [`MAX_BATCH_HOLD_KEYS`] regardless, so a
+    /// caller that hands in an over-cap query cannot make this node pre-allocate
+    /// an unbounded vector.
+    pub fn answer_batch(&self, query: &BatchHoldQuery) -> BatchHoldResponse {
+        debug_assert_eq!(query.schema_version, QUERY_SCHEMA_VERSION);
+        debug_assert!(query.keys.len() <= MAX_BATCH_HOLD_KEYS);
+
+        let mut answers = Vec::with_capacity(query.keys.len().min(MAX_BATCH_HOLD_KEYS));
+        let mut any_have = false;
+        for key in &query.keys {
+            match self.hold(key) {
+                Ok(HoldAnswer::Have { blake3, .. }) => {
+                    any_have = true;
+                    answers.push(BatchHoldAnswer::Have { blake3 });
+                }
+                Ok(HoldAnswer::Absent) => answers.push(BatchHoldAnswer::Absent),
+                Err(err) => {
+                    // Loud, not silent: the operator sees exactly which key
+                    // degraded and why.
+                    eprintln!(
+                        "daemon: batch hold-query: {key} could not be answered ({err}); \
+                         answering Absent for it"
+                    );
+                    answers.push(BatchHoldAnswer::Absent);
+                }
+            }
+        }
+        BatchHoldResponse {
+            schema_version: QUERY_SCHEMA_VERSION,
+            // The offers describe THIS node, so they are emitted once - and only
+            // when at least one answer is a Have, so an all-absent response says
+            // nothing at all about this node beyond "no".
+            offers: if any_have {
+                vec![self.iroh_offer()]
+            } else {
+                Vec::new()
+            },
+            answers,
+        }
     }
 
     /// Produce the COMPLETE claim for `key` if this node holds it: the BLAKE3 to

@@ -49,11 +49,14 @@
 //!
 //! ## No-enumeration (PRD privacy invariant, preserved)
 //!
-//! Every query names ONE concrete [`NarHashKey`] and gets a yes/no answer. There
+//! Every query names concrete [`NarHashKey`]s - one ([`HoldQuery`]) or many
+//! ([`BatchHoldQuery`], task-91) - and gets back yes/no about exactly those. There
 //! is, by construction, no method on [`Discovery`] or [`PeerQuery`] that lists a
-//! peer's holdings - the probe reuses task-50's [`HoldQuery`]/[`HoldAnswer`],
-//! which already forbid enumeration. Probing key X reveals nothing about a key Y
-//! the peer also holds (proven by test).
+//! peer's holdings - the probes reuse task-50's [`HoldQuery`]/[`HoldAnswer`] and
+//! the positional batch form, which forbid enumeration in their SHAPE: a batch
+//! answer carries no keys of its own and is meaningless detached from the asker's
+//! own query. Probing X (alone or in a batch) reveals nothing about a key Y the
+//! peer also holds (proven by test, for both forms).
 //!
 //! ## Bounded miss (the real correctness point)
 //!
@@ -72,8 +75,10 @@ use async_trait::async_trait;
 
 use crate::availability::AvailabilityIndex;
 use crate::claim::{
-    CLAIM_SCHEMA_VERSION, Claim, HoldAnswer, HoldQuery, HoldResponse, KnownPayload, NarHashKey,
-    QUERY_SCHEMA_VERSION, decode_hold_query, decode_hold_response, encode_hold_query,
+    BatchHoldAnswer, BatchHoldQuery, BatchHoldResponse, CLAIM_SCHEMA_VERSION, Claim, HoldAnswer,
+    HoldQuery, HoldResponse, KnownPayload, KnownTransport, MAX_BATCH_HOLD_KEYS, NarHashKey,
+    QUERY_SCHEMA_VERSION, decode_batch_hold_query, decode_batch_hold_response, decode_hold_query,
+    decode_hold_response, encode_batch_hold_query, encode_batch_hold_response, encode_hold_query,
     encode_hold_response,
 };
 use crate::source::{NarKey, NarSource, SourceError, UpstreamResponse};
@@ -107,6 +112,34 @@ pub const PROBE_TIMEOUT: Duration = Duration::from_secs(5);
 pub trait Discovery: Send + Sync {
     /// Resolve `key` to a holder's complete claim, or `None` for a bounded miss.
     async fn resolve(&self, key: &NarHashKey) -> Option<Claim>;
+
+    /// Resolve a WHOLE CLOSURE at once (task-91): one `Option<Claim>` per key, in
+    /// the caller's order, `None` where no known peer holds it.
+    ///
+    /// This exists because Nix resolves a closure, not a path: it knows every
+    /// signed `NarHash` in a build's closure before it asks for any NAR, so the
+    /// natural question is "of these 200 hashes, which can I get from a peer?".
+    /// Asking it one key at a time costs one round trip per key PER PEER, each
+    /// with its own dial and timeout exposure - the wrong granularity, not a
+    /// tuning problem.
+    ///
+    /// POSITIONAL, like the wire it rides on: the result has exactly `keys.len()`
+    /// elements and element `i` is about `keys[i]`. Duplicate keys in `keys` are
+    /// the CALLER's business and are handled (each position gets its own answer);
+    /// the wire form forbids duplicates, so an implementation must de-duplicate
+    /// before it probes.
+    ///
+    /// The DEFAULT implementation is the pre-task-91 behaviour - one
+    /// [`resolve`](Self::resolve) per key - so every existing [`Discovery`] impl
+    /// keeps working unchanged and a batching impl is an override, not a rewrite.
+    /// It is also the honest baseline the measurement compares against.
+    async fn resolve_many(&self, keys: &[NarHashKey]) -> Vec<Option<Claim>> {
+        let mut out = Vec::with_capacity(keys.len());
+        for key in keys {
+            out.push(self.resolve(key).await);
+        }
+        out
+    }
 }
 
 // -------------------------------------------------------------------------
@@ -189,13 +222,78 @@ impl std::error::Error for PeerQueryError {}
 /// [`DirectDiscovery`].
 ///
 /// The method takes exactly one key (inside the [`HoldQuery`]) and returns exactly
-/// one yes/no answer: there is deliberately NO "list holdings" method, so the
-/// no-enumeration invariant is structural at this seam, not just at the index.
+/// one yes/no answer; [`query_batch`](PeerQuery::query_batch) takes N keys the
+/// caller named and returns N positional yes/no answers. There is deliberately NO
+/// "list holdings" method in either form, so the no-enumeration invariant is
+/// structural at this seam, not just at the index.
 #[async_trait]
 pub trait PeerQuery: Send + Sync {
     /// Probe `node` for the key named in `query`.
     async fn query(&self, node: &NodeId, query: &HoldQuery)
     -> Result<HoldResponse, PeerQueryError>;
+
+    /// Probe `node` for EVERY key named in `query`, in ONE exchange (task-91).
+    ///
+    /// The returned response is positionally aligned with `query.keys` and that is
+    /// checked, not trusted - see [`decode_batch_hold_response`], which takes the
+    /// asked count.
+    ///
+    /// The DEFAULT implementation is a COMPATIBILITY SHIM: it issues one
+    /// single-key [`query`](PeerQuery::query) per key, so an existing transport
+    /// that has not learned the batch message still answers correctly - at N round
+    /// trips, which is exactly the cost this task removes. A transport that really
+    /// batches overrides this. (The measurement arm uses the shim as its
+    /// one-at-a-time baseline, so the two arms differ in ONE thing: whether the
+    /// peer is asked once or N times.)
+    ///
+    /// Fault handling matches the index's: a per-KEY fault
+    /// ([`PeerQueryError::Answer`]) answers `Absent` for that key, while a
+    /// per-PEER fault (no route, a wire fault - both true of every key alike)
+    /// propagates, because retrying the other 255 keys against a peer we cannot
+    /// reach is pure waste.
+    async fn query_batch(
+        &self,
+        node: &NodeId,
+        query: &BatchHoldQuery,
+    ) -> Result<BatchHoldResponse, PeerQueryError> {
+        let mut answers = Vec::with_capacity(query.keys.len().min(MAX_BATCH_HOLD_KEYS));
+        let mut offers: Vec<KnownTransport> = Vec::new();
+        for key in &query.keys {
+            let single = HoldQuery {
+                schema_version: QUERY_SCHEMA_VERSION,
+                key: *key,
+            };
+            match self.query(node, &single).await {
+                Ok(response) => match response.answer {
+                    HoldAnswer::Have {
+                        blake3,
+                        offers: key_offers,
+                    } => {
+                        // The batch form hoists offers to the response; in the shim
+                        // they come per-key, so the first Have's offers become the
+                        // peer's. They are the same peer's locators by construction
+                        // (one node answered every probe).
+                        if offers.is_empty() {
+                            offers = key_offers;
+                        }
+                        answers.push(BatchHoldAnswer::Have { blake3 });
+                    }
+                    HoldAnswer::Absent => answers.push(BatchHoldAnswer::Absent),
+                },
+                Err(err @ PeerQueryError::Answer(_)) => {
+                    eprintln!("daemon: batch probe of {node}: {key} failed ({err}); Absent");
+                    answers.push(BatchHoldAnswer::Absent);
+                }
+                // A peer-level fault is true of every key; do not burn N-1 more.
+                Err(err) => return Err(err),
+            }
+        }
+        Ok(BatchHoldResponse {
+            schema_version: QUERY_SCHEMA_VERSION,
+            offers,
+            answers,
+        })
+    }
 }
 
 /// The wave-2a query transport: a shared, in-process rendezvous mapping each peer
@@ -257,6 +355,49 @@ impl PeerQuery for InProcessPeerQuery {
         let back =
             encode_hold_response(&response).map_err(|e| PeerQueryError::Codec(e.to_string()))?;
         decode_hold_response(&back).map_err(|e| PeerQueryError::Codec(e.to_string()))
+    }
+
+    /// The REAL batched probe (task-91): ONE exchange carrying every key, answered
+    /// from the peer's real index in one pass. This overrides the compatibility
+    /// shim on [`PeerQuery`], so a `DirectDiscovery` over this transport really
+    /// does spend one round trip per peer per chunk instead of one per key.
+    ///
+    /// The wire is real in both directions, exactly as the single-key path is: the
+    /// batch query is ENCODED, DECODED on the peer side, answered from that peer's
+    /// [`AvailabilityIndex`], then encoded and decoded back - so the cap checks,
+    /// the duplicate-key guard and the positional length check all actually run.
+    async fn query_batch(
+        &self,
+        node: &NodeId,
+        query: &BatchHoldQuery,
+    ) -> Result<BatchHoldResponse, PeerQueryError> {
+        let index = self
+            .peers
+            .get(node)
+            .cloned()
+            .ok_or(PeerQueryError::UnknownPeer(*node))?;
+
+        // Node A side: serialise the batch probe (this REFUSES an over-cap,
+        // empty or duplicate-bearing batch before it ever reaches the peer).
+        let on_wire =
+            encode_batch_hold_query(query).map_err(|e| PeerQueryError::Codec(e.to_string()))?;
+
+        // Node B side: decode (size gate, then key cap, then the answer), and
+        // answer from the REAL index on a blocking thread - the batch may cost up
+        // to MAX_BATCH_HOLD_KEYS `nix-store --dump`s under the digest locks.
+        let decoded =
+            decode_batch_hold_query(&on_wire).map_err(|e| PeerQueryError::Codec(e.to_string()))?;
+        let keys_asked = decoded.keys.len();
+        let response = tokio::task::spawn_blocking(move || index.answer_batch(&decoded))
+            .await
+            .map_err(|e| PeerQueryError::Answer(format!("batch query task panicked: {e}")))?;
+
+        // Node B -> A: back across the envelope, with the positional length
+        // checked against what THIS node asked - never against what B claims.
+        let back = encode_batch_hold_response(&response)
+            .map_err(|e| PeerQueryError::Codec(e.to_string()))?;
+        decode_batch_hold_response(&back, keys_asked)
+            .map_err(|e| PeerQueryError::Codec(e.to_string()))
     }
 }
 
@@ -356,6 +497,113 @@ impl Discovery for DirectDiscovery {
             }
         }
         None
+    }
+
+    /// Resolve a whole closure with ONE probe per peer per chunk (task-91).
+    ///
+    /// The shape of the work, and why it is this shape:
+    ///   * The DISTINCT still-unresolved keys are collected per peer, so a peer is
+    ///     never asked about a key an earlier peer already answered `Have` for, and
+    ///     never asked the same key twice (the wire forbids duplicates; a caller's
+    ///     closure list may legitimately contain them).
+    ///   * The batch is chunked at [`MAX_BATCH_HOLD_KEYS`], so a 1000-path closure
+    ///     is 4 probes per peer rather than 1000 - and the cap is enforced by
+    ///     construction here, never discovered as a peer's rejection.
+    ///   * Peers are tried in order and the loop STOPS as soon as every key is
+    ///     resolved, so the common case (the first peer holds the closure) really
+    ///     is one round trip.
+    ///   * Each chunk probe carries the same [`PROBE_TIMEOUT`] bound as a single
+    ///     probe, so a wedged peer still yields a fast miss. STATED LIMIT: a cold
+    ///     peer that must hash 256 large NARs to answer may exceed that bound and
+    ///     be treated as a miss. That is the safe direction (the fetch falls back
+    ///     upstream), but it does mean a first batch against a cold peer can
+    ///     under-report. A responder-side "answer with what is already derived"
+    ///     policy is TASK-102.
+    async fn resolve_many(&self, keys: &[NarHashKey]) -> Vec<Option<Claim>> {
+        let mut results: Vec<Option<Claim>> = vec![None; keys.len()];
+        if keys.is_empty() {
+            return results;
+        }
+
+        for peer in &self.peers {
+            // The distinct keys still unanswered, and where each one's answer goes.
+            let mut positions: HashMap<NarHashKey, Vec<usize>> = HashMap::new();
+            let mut pending: Vec<NarHashKey> = Vec::new();
+            for (i, key) in keys.iter().enumerate() {
+                if results[i].is_some() {
+                    continue;
+                }
+                positions.entry(*key).or_insert_with(|| {
+                    pending.push(*key);
+                    Vec::new()
+                });
+                positions.get_mut(key).expect("just inserted").push(i);
+            }
+            if pending.is_empty() {
+                break; // every key resolved; no further peer is worth a round trip
+            }
+
+            for chunk in pending.chunks(MAX_BATCH_HOLD_KEYS) {
+                let query = BatchHoldQuery {
+                    schema_version: QUERY_SCHEMA_VERSION,
+                    keys: chunk.to_vec(),
+                };
+                let response = match tokio::time::timeout(
+                    self.probe_timeout,
+                    self.query.query_batch(peer, &query),
+                )
+                .await
+                {
+                    Ok(Ok(response)) => response,
+                    Ok(Err(err)) => {
+                        eprintln!(
+                            "daemon: batched discovery probe of {peer} ({} keys) failed: {err}",
+                            chunk.len()
+                        );
+                        continue;
+                    }
+                    Err(_elapsed) => {
+                        eprintln!(
+                            "daemon: batched discovery probe of {peer} ({} keys) exceeded {:?}; \
+                             treating as a miss",
+                            chunk.len(),
+                            self.probe_timeout
+                        );
+                        continue;
+                    }
+                };
+                // Defence in depth: the transport already checked this against the
+                // asked count, but a mis-aligned answer would silently bind every
+                // later key to the wrong hash, so it is re-checked at the one place
+                // the mapping is actually performed.
+                if response.answers.len() != chunk.len() {
+                    eprintln!(
+                        "daemon: peer {peer} answered {} of {} batched keys; discarding the \
+                         whole answer (positional alignment is not recoverable)",
+                        response.answers.len(),
+                        chunk.len()
+                    );
+                    continue;
+                }
+                for (key, answer) in chunk.iter().zip(response.answers.iter()) {
+                    let BatchHoldAnswer::Have { blake3 } = answer else {
+                        continue;
+                    };
+                    let claim = Self::claim_from_have(
+                        key,
+                        *peer,
+                        HoldAnswer::Have {
+                            blake3: *blake3,
+                            offers: response.offers.clone(),
+                        },
+                    );
+                    for i in positions.get(key).into_iter().flatten() {
+                        results[*i] = Some(claim.clone());
+                    }
+                }
+            }
+        }
+        results
     }
 }
 
@@ -596,6 +844,396 @@ mod tests {
         assert_eq!(
             claim.transports,
             vec![KnownTransport::Iroh { node: node_b() }]
+        );
+    }
+
+    // ---- task-91: the BATCHED probe ---------------------------------------
+
+    /// An index for `node` holding several keys, each backed by its own real file
+    /// whose NAR bytes are derived from the key (so every key has a DISTINCT
+    /// blake3 and a mis-mapped answer is detectable, not a coincidence).
+    fn index_holding_many(node: NodeId, keys: &[NarHashKey]) -> (Arc<AvailabilityIndex>, TempDir) {
+        let dir = TempDir::new("idx-many");
+        let index = AvailabilityIndex::open(
+            node,
+            // Per-path bytes: the dumper reads the file it is pointed at, so each
+            // registration derives its own digest.
+            Arc::new(FileDumper),
+            Arc::new(NullStore),
+            Arc::new(NullAnnounce),
+        )
+        .expect("open index");
+        for (i, key) in keys.iter().enumerate() {
+            let path = dir.path.join(format!("nar-{i}"));
+            std::fs::write(&path, format!("NAR bytes for {key}")).expect("write");
+            index
+                .register(*key, StorePath::new(path))
+                .expect("register");
+        }
+        (Arc::new(index), dir)
+    }
+
+    /// A dumper that returns the file's own bytes - distinct content per path.
+    struct FileDumper;
+    impl NarDumper for FileDumper {
+        fn dump(&self, path: &StorePath) -> Result<Vec<u8>, DumpError> {
+            std::fs::read(path.as_path()).map_err(|e| DumpError(e.to_string()))
+        }
+    }
+
+    /// `n` distinct canonical keys.
+    fn keys(n: usize) -> Vec<NarHashKey> {
+        (0..n)
+            .map(|i| {
+                let mut raw = [0u8; 32];
+                raw[..8].copy_from_slice(&(i as u64 + 1).to_be_bytes());
+                NarHashKey::from_sha256_bytes(raw)
+            })
+            .collect()
+    }
+
+    /// Wraps a real transport and COUNTS how many times each shape was asked. This
+    /// is the AC#3 instrument at unit scale: the win claimed by this task is a
+    /// reduction in ROUND TRIPS, so the test observes round trips directly rather
+    /// than inferring them from wall-clock (which on an in-process transport would
+    /// measure almost nothing).
+    struct CountingQuery {
+        inner: Arc<dyn PeerQuery>,
+        singles: AtomicUsize,
+        batches: AtomicUsize,
+        keys_in_batches: AtomicUsize,
+    }
+
+    impl CountingQuery {
+        fn wrap(inner: Arc<dyn PeerQuery>) -> Arc<Self> {
+            Arc::new(CountingQuery {
+                inner,
+                singles: AtomicUsize::new(0),
+                batches: AtomicUsize::new(0),
+                keys_in_batches: AtomicUsize::new(0),
+            })
+        }
+    }
+
+    #[async_trait]
+    impl PeerQuery for CountingQuery {
+        async fn query(
+            &self,
+            node: &NodeId,
+            query: &HoldQuery,
+        ) -> Result<HoldResponse, PeerQueryError> {
+            self.singles.fetch_add(1, Ordering::Relaxed);
+            self.inner.query(node, query).await
+        }
+
+        async fn query_batch(
+            &self,
+            node: &NodeId,
+            query: &BatchHoldQuery,
+        ) -> Result<BatchHoldResponse, PeerQueryError> {
+            self.batches.fetch_add(1, Ordering::Relaxed);
+            self.keys_in_batches
+                .fetch_add(query.keys.len(), Ordering::Relaxed);
+            self.inner.query_batch(node, query).await
+        }
+    }
+
+    #[tokio::test]
+    async fn a_batched_resolve_agrees_with_the_serial_one_key_for_key() {
+        // The EQUIVALENCE oracle: batching is only allowed to change the number of
+        // round trips, never the answers. B holds 3 of 5 keys.
+        let all = keys(5);
+        let held = vec![all[0], all[2], all[4]];
+        let (index, _dir) = index_holding_many(node_b(), &held);
+        let mut rendezvous = InProcessPeerQuery::new();
+        rendezvous.add_index(node_b(), index);
+        let discovery = DirectDiscovery::new(vec![node_b()], Arc::new(rendezvous));
+
+        let mut serial = Vec::new();
+        for key in &all {
+            serial.push(discovery.resolve(key).await);
+        }
+        let batched = discovery.resolve_many(&all).await;
+
+        assert_eq!(
+            batched, serial,
+            "the batched answer must equal the one-at-a-time answer, position for position"
+        );
+        // ...and it is a real mixture, so the equality is not vacuous.
+        assert_eq!(batched.iter().filter(|c| c.is_some()).count(), 3);
+        assert!(batched[1].is_none() && batched[3].is_none());
+        for (i, claim) in batched.iter().enumerate() {
+            if let Some(claim) = claim {
+                assert_eq!(claim.key, all[i], "position {i} must answer about all[{i}]");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn batching_collapses_n_round_trips_into_one() {
+        // AC#1/AC#3 at unit scale: same peer, same keys, same answers - the ONLY
+        // difference is how many times the peer was asked.
+        let all = keys(20);
+        let (index, _dir) = index_holding_many(node_b(), &all);
+        let mut rendezvous = InProcessPeerQuery::new();
+        rendezvous.add_index(node_b(), index);
+        let counting = CountingQuery::wrap(Arc::new(rendezvous));
+        let discovery = DirectDiscovery::new(vec![node_b()], counting.clone());
+
+        for key in &all {
+            discovery.resolve(key).await;
+        }
+        let serial_probes = counting.singles.load(Ordering::Relaxed);
+
+        let batched = discovery.resolve_many(&all).await;
+        let batch_probes = counting.batches.load(Ordering::Relaxed);
+
+        assert_eq!(serial_probes, 20, "one-at-a-time costs one probe per key");
+        assert_eq!(batch_probes, 1, "batched costs ONE probe for the whole set");
+        assert_eq!(
+            counting.singles.load(Ordering::Relaxed),
+            serial_probes,
+            "the batched arm must not have fallen back to single-key probes"
+        );
+        assert!(
+            batched.iter().all(Option::is_some),
+            "and it still resolved every key"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_closure_larger_than_the_cap_is_chunked_not_rejected() {
+        // A 1000-path closure is 4 probes per peer, not 1000 and not an error.
+        let all = keys(MAX_BATCH_HOLD_KEYS * 3 + 7);
+        let (index, _dir) = index_holding_many(node_b(), &all[..5]);
+        let mut rendezvous = InProcessPeerQuery::new();
+        rendezvous.add_index(node_b(), index);
+        let counting = CountingQuery::wrap(Arc::new(rendezvous));
+        let discovery = DirectDiscovery::new(vec![node_b()], counting.clone());
+
+        let resolved = discovery.resolve_many(&all).await;
+        assert_eq!(resolved.len(), all.len());
+        assert_eq!(
+            resolved.iter().filter(|c| c.is_some()).count(),
+            5,
+            "the 5 held keys resolve; the rest miss"
+        );
+        assert_eq!(
+            counting.batches.load(Ordering::Relaxed),
+            4,
+            "ceil({} / {MAX_BATCH_HOLD_KEYS}) chunks",
+            all.len()
+        );
+        assert_eq!(
+            counting.keys_in_batches.load(Ordering::Relaxed),
+            all.len(),
+            "every key is asked exactly once - chunking must not drop or repeat any"
+        );
+    }
+
+    #[tokio::test]
+    async fn repeated_keys_in_a_closure_are_asked_once_and_answered_everywhere() {
+        // A caller's closure list may repeat a hash; the WIRE forbids duplicates.
+        // The resolver de-duplicates before probing and fans the answer back out.
+        let all = keys(3);
+        let with_repeats = vec![all[0], all[1], all[0], all[2], all[0]];
+        let (index, _dir) = index_holding_many(node_b(), &[all[0]]);
+        let mut rendezvous = InProcessPeerQuery::new();
+        rendezvous.add_index(node_b(), index);
+        let counting = CountingQuery::wrap(Arc::new(rendezvous));
+        let discovery = DirectDiscovery::new(vec![node_b()], counting.clone());
+
+        let resolved = discovery.resolve_many(&with_repeats).await;
+        assert_eq!(
+            counting.keys_in_batches.load(Ordering::Relaxed),
+            3,
+            "5 positions, 3 distinct keys - the peer is asked 3 things"
+        );
+        for (i, claim) in resolved.iter().enumerate() {
+            match with_repeats[i] == all[0] {
+                true => assert!(claim.is_some(), "every position of the held key resolves"),
+                false => assert!(claim.is_none()),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn a_batch_never_reveals_a_holding_the_asker_did_not_name() {
+        // AC#4, at the discovery seam. B holds Y and Z; A asks about V, W, X.
+        // A learns three noes and NOTHING about Y or Z - not their existence, not
+        // their count. There is no method to ask, and the answer has no room to
+        // volunteer: it is positional over V, W, X.
+        let all = keys(5);
+        let (asked, held) = (&all[..3], &all[3..]);
+        let (index, _dir) = index_holding_many(node_b(), held);
+        let mut rendezvous = InProcessPeerQuery::new();
+        rendezvous.add_index(node_b(), index);
+
+        let query = BatchHoldQuery {
+            schema_version: QUERY_SCHEMA_VERSION,
+            keys: asked.to_vec(),
+        };
+        let response = rendezvous
+            .query_batch(&node_b(), &query)
+            .await
+            .expect("probe");
+
+        assert_eq!(response.answers.len(), asked.len());
+        assert!(
+            response
+                .answers
+                .iter()
+                .all(|a| *a == BatchHoldAnswer::Absent),
+            "B holds none of the asked keys"
+        );
+        assert!(
+            response.offers.is_empty(),
+            "an all-absent batch says nothing at all about the responder"
+        );
+        // The serialised answer contains no NarHash whatsoever - so even a peer
+        // that WANTED to leak its holdings has nowhere to put them.
+        let on_wire =
+            String::from_utf8(crate::claim::encode_batch_hold_response(&response).expect("encode"))
+                .expect("utf8");
+        assert!(
+            !on_wire.contains("sha256:"),
+            "no key on the wire: {on_wire}"
+        );
+        for key in held {
+            assert!(
+                !on_wire.contains(&key.to_string()),
+                "a held-but-unasked key must not appear: {on_wire}"
+            );
+        }
+
+        // And the control: asking about what B DOES hold works, so the negative
+        // above is not "the index is empty".
+        let control = BatchHoldQuery {
+            schema_version: QUERY_SCHEMA_VERSION,
+            keys: held.to_vec(),
+        };
+        let response = rendezvous
+            .query_batch(&node_b(), &control)
+            .await
+            .expect("probe");
+        assert!(
+            response
+                .answers
+                .iter()
+                .all(|a| matches!(a, BatchHoldAnswer::Have { .. })),
+            "the same index answers Have for keys the asker named"
+        );
+    }
+
+    /// A peer that answers a DIFFERENT number of keys than it was asked - the
+    /// failure that would silently bind every later key to the wrong hash.
+    struct MisalignedPeer;
+    #[async_trait]
+    impl PeerQuery for MisalignedPeer {
+        async fn query(
+            &self,
+            _node: &NodeId,
+            _query: &HoldQuery,
+        ) -> Result<HoldResponse, PeerQueryError> {
+            unreachable!("this test only drives the batch path")
+        }
+        async fn query_batch(
+            &self,
+            _node: &NodeId,
+            query: &BatchHoldQuery,
+        ) -> Result<BatchHoldResponse, PeerQueryError> {
+            // One answer too few, with a Have first: a naive zip would bind key[0]
+            // to this blake3 and then shift everything.
+            Ok(BatchHoldResponse {
+                schema_version: QUERY_SCHEMA_VERSION,
+                offers: vec![KnownTransport::Iroh { node: node_b() }],
+                answers: (0..query.keys.len().saturating_sub(1))
+                    .map(|_| BatchHoldAnswer::Have {
+                        blake3: Blake3Digest::from_bytes([0x99; 32]),
+                    })
+                    .collect(),
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn a_misaligned_batch_answer_is_discarded_whole() {
+        // Positional alignment is not recoverable from a short answer, so the
+        // resolver must throw the WHOLE answer away rather than use its prefix.
+        let all = keys(4);
+        let discovery = DirectDiscovery::new(vec![node_b()], Arc::new(MisalignedPeer));
+        let resolved = discovery.resolve_many(&all).await;
+        assert_eq!(resolved.len(), 4);
+        assert!(
+            resolved.iter().all(Option::is_none),
+            "a mis-aligned answer must resolve NOTHING, not a shifted prefix"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_default_batch_shim_answers_correctly_at_n_round_trips() {
+        // A transport that has not learned the batch message still answers - via
+        // the trait's default shim - at N round trips. This is what makes the
+        // seam addition backwards-compatible, and it is the honest baseline the
+        // measurement arm compares the real batch against.
+        // The counter sits INSIDE the shim (the shim calls `query` on ITSELF, so a
+        // counter wrapped around the outside would observe nothing - which is
+        // exactly what the first cut of this test did, and it "passed" by counting
+        // zero of everything).
+        struct SingleOnly(Arc<CountingQuery>);
+        #[async_trait]
+        impl PeerQuery for SingleOnly {
+            async fn query(
+                &self,
+                node: &NodeId,
+                query: &HoldQuery,
+            ) -> Result<HoldResponse, PeerQueryError> {
+                self.0.query(node, query).await
+            }
+            // NOTE: no query_batch override - the default shim is under test.
+        }
+
+        let all = keys(6);
+        let (index, _dir) = index_holding_many(node_b(), &all[..2]);
+        let mut inner = InProcessPeerQuery::new();
+        inner.add_index(node_b(), index);
+        let counting = CountingQuery::wrap(Arc::new(inner));
+        let discovery =
+            DirectDiscovery::new(vec![node_b()], Arc::new(SingleOnly(counting.clone())));
+
+        let resolved = discovery.resolve_many(&all).await;
+        assert_eq!(
+            counting.singles.load(Ordering::Relaxed),
+            6,
+            "the shim really does cost one round trip per key"
+        );
+        assert_eq!(resolved.iter().filter(|c| c.is_some()).count(), 2);
+        for (i, claim) in resolved.iter().enumerate().take(2) {
+            let claim = claim.as_ref().expect("held");
+            assert_eq!(claim.key, all[i]);
+            assert_eq!(
+                claim.transports,
+                vec![KnownTransport::Iroh { node: node_b() }],
+                "the shim hoists the peer's offers onto the batch response"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_hanging_peer_yields_a_bounded_batched_miss() {
+        // The AC#2 bounded-miss guarantee must survive batching: a wedged peer
+        // cannot stall a whole closure resolution either.
+        let probe_bound = Duration::from_millis(150);
+        let discovery =
+            DirectDiscovery::with_timeout(vec![node_b()], Arc::new(HangingQuery), probe_bound);
+        let all = keys(4);
+        let started = std::time::Instant::now();
+        let resolved = discovery.resolve_many(&all).await;
+        let elapsed = started.elapsed();
+        assert!(resolved.iter().all(Option::is_none));
+        assert!(
+            elapsed < Duration::from_secs(5),
+            "a batched miss must be bounded too, took {elapsed:?}"
         );
     }
 
