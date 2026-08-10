@@ -6,13 +6,11 @@ title: >-
 status: To Do
 assignee: []
 created_date: '2026-08-10 16:00'
-updated_date: '2026-08-10 16:00'
+updated_date: '2026-08-10 19:34'
 labels:
   - hardening
 dependencies:
-  - TASK-105
-  - TASK-108
-  - TASK-84
+  - TASK-9
 priority: high
 ---
 
@@ -45,3 +43,11 @@ Reference: TASK-105's reproduction method (N concurrent processes x M rounds) is
 - [ ] #3 After the fixes, the same N>=20 run reports ZERO failures; a single green run is explicitly NOT accepted as evidence (that is what created this problem)
 - [ ] #4 The project's honesty convention is updated: a cycle may not certify 'test 0' from one run while a known flake rate is outstanding - state the rate or state that it is unmeasured
 <!-- AC:END -->
+
+## Implementation Notes
+
+<!-- SECTION:NOTES:BEGIN -->
+DEPENDENCY CORRECTED 2026-08-10: this task previously depended on TASK-105/108/84, i.e. on the very flake instances it exists to fix - the umbrella was blocked behind its own instances. They are now handled AS PART OF this task (same defect family, batched deliberately), not as prerequisites.
+
+DISK NOTE for whoever runs this: a prior review filled the filesystem to 0 MB by building inside a /tmp worktree, which killed all shell access. 20+ full suite runs is disk-heavy. There is 53 GB free as of this correction; clean scratch dirs as you go and check headroom before starting.
+<!-- SECTION:NOTES:END -->
