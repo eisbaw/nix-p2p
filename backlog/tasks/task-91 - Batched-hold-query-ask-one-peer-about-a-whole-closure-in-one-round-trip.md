@@ -1,11 +1,11 @@
 ---
 id: TASK-91
 title: 'Batched hold-query: ask one peer about a whole closure in one round trip'
-status: In Progress
+status: Done
 assignee:
   - '@me'
 created_date: '2026-08-10 07:23'
-updated_date: '2026-08-10 12:20'
+updated_date: '2026-08-10 12:22'
 labels:
   - wave-2b
 dependencies:
@@ -170,3 +170,46 @@ before its result was trusted, then reverted and re-run green:
   so this is not the batched arm's best case, but it is not a worst case for
   serial either.
 <!-- SECTION:NOTES:END -->
+
+## Final Summary
+
+<!-- SECTION:FINAL_SUMMARY:BEGIN -->
+Batched hold-query landed as an ADDITION to the frozen claim wire, with the
+frozen bytes pinned first.
+
+WHAT: BatchHoldQuery / BatchHoldAnswer / BatchHoldResponse on the same
+QUERY_SCHEMA_VERSION envelope; HoldQuery / HoldAnswer / HoldResponse / Claim
+byte-identical and now pinned in daemon/tests/golden/claim_wire_v1.json (both
+directions - what we emit and what we accept). Seam: AvailabilityIndex::
+answer_batch, PeerQuery::query_batch, Discovery::resolve_many, each with a
+default that loops the single-key form so no existing impl changed.
+
+MEASURED (200-path closure, 8 peers, 120 resolved): 1180 -> 8 round trips
+(147.5x), and 60 434 ms -> 412 ms discovery wall clock (146.5x) with a 50 ms
+per-round-trip delay injected. Round trips are a pure count; the wall clock is
+measured under an emulated network, stated as such. `just discovery` re-runs it
+in ~1 minute.
+
+NO ENUMERATION, which is the design question this task really turns on: the
+answer is positional over keys the asker named and carries no keys of its own -
+the golden response bytes contain no `sha256:` string at all - so volunteering a
+holding is inexpressible rather than merely unanswered. Made structural in
+daemon/tests/no_enumeration.rs: across claim/availability/discovery, plural
+holdings out requires named keys in.
+
+BOUNDED: MAX_BATCH_HOLD_KEYS = 256, chosen against the existing 64 KiB wire gate
+rather than beside it (full query ~15.9 KiB, full all-Have response ~26 KiB) and
+asserted, so raising it to 1024 fails the build. Over-cap is rejected on encode
+AND decode, never truncated.
+
+Gates: build/lint/test/e2e all exit 0; 257 cargo tests; 26/26 e2e scenarios.
+10/10 oracles proven to bite by mutation, each mutation asserted to have applied
+- one of which (M8) exposed a genuinely vacuous equivalence test that had been
+running against a single peer, now fixed.
+
+NOT DONE, deliberately: resolve_many is not yet called from the serving path
+(production still wires InMemoryDiscovery from config), so the ~300 ms
+narinfo->NAR window is not exploited - that needs TASK-93 + TASK-100. A chunk
+probe keeps the 5 s single-probe bound, so a cold peer can under-report;
+TASK-104. This is a DEEP-gated task and independent review has NOT run yet.
+<!-- SECTION:FINAL_SUMMARY:END -->
