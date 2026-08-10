@@ -6,7 +6,7 @@ title: >-
 status: To Do
 assignee: []
 created_date: '2026-08-09 21:01'
-updated_date: '2026-08-10 07:09'
+updated_date: '2026-08-10 07:25'
 labels:
   - wave-2b
 dependencies:
@@ -39,56 +39,49 @@ Honest scale caveat: TESTING.md S5 explicitly excludes emergent network effects 
 ## Implementation Notes
 
 <!-- SECTION:NOTES:BEGIN -->
-## Research 2026-08-10 (iroh docs + n0 experiments) - READ BEFORE THE SPIKE
+## Why a DHT is the FALLBACK layer, not the primary path (owner question 2026-08-10)
 
-THE LOAD-BEARING DISTINCTION: iroh's 'discovery' is NODE discovery (EndpointId -> relay URL +
-direct socket addrs). It is NOT content discovery. Confirmed in docs.iroh.computer/concepts/discovery:
-none of its mechanisms map a blob hash to holders. So this task is really TWO problems and they
-have different answers.
+A DHT is the textbook answer to 'who has hash X' and it stays in scope - but the arithmetic says it
+cannot carry the COMMON case, for two independent reasons. Record these before the spike so it is
+not re-litigated.
 
-(1) NODE DISCOVERY - essentially free, we just have it switched off.
-    iroh ships three, and daemon/src/transport_iroh.rs bind_loopback_endpoint currently binds with
-    'the relay DISABLED and NO discovery':
-      * DNS/pkarr - DEFAULT ON upstream; publishes signed records to an iroh-dns-server, resolved
-        over DNS. Infra is RUN BY n0 (a third-party dependency to declare, not decentralized).
-      * Local/mDNS-like address lookup - default OFF, no infra, LAN only. Cheap win for the
-        office/CI/home-lab case, which is also the case where the peer path actually beats a CDN.
-      * DHT address lookup - default OFF, publishes the SAME signed pkarr records to the BitTorrent
-        Mainline DHT. Crate iroh-mainline-address-lookup (0.4+), wired via Endpoint::builder.
-        Fully distributed; documented tradeoff is 'slower lookups than DNS'.
+(1) A DHT MAKES LOOKUP CHEAP BY MAKING PUBLICATION EXPENSIVE, and publication is our expensive side.
+    To be findable you must ANNOUNCE. Our node holds 108,401 paths. Verified against the specs:
+      * BEP44 values are capped at 1000 BYTES and entries expire in ~1-2h, requiring periodic
+        re-put. 108k paths republished hourly is ~30 puts/second sustained, forever, per node - and
+        each put needs an iterative closest-node lookup (~8 round trips), so ~240 RTT/s of DHT
+        traffic per idle node. That is not a tuning problem.
+      * announce_peer/get_peers has the RIGHT multi-writer set semantics (many holders per infohash)
+        but its value type is fixed to IP+port and cannot carry an iroh NodeId - so NAT'd nodes
+        cannot be providers (n0's own finding). BEP44 has arbitrary values but the WRONG write
+        semantics: immutable items are keyed by hash-of-value, mutable items by publisher pubkey.
+        Neither gives 'many independent writers append to one content-derived key'.
+      => mainline has exactly one multi-writer set primitive and its value type is unusable for us.
+         This is a specific impasse, not a preference. The spike must confirm or refute it FIRST.
+      * And announcing 108k paths publishes our entire holdings list to a global network - the
+        privacy tension already recorded above, at its worst.
+    Contrast: the probe path (TASK-91) costs work proportional to what is actually REQUESTED and
+    zero for everything else. Announce-on-demand exists precisely because publication does not scale.
 
-(2) CONTENT DISCOVERY - the actual open problem. n0 explored it in iroh-experiments/content-discovery
-    (repo self-describes as 'very low level and unpolished'; 'most will not' graduate - do NOT depend
-    on it, but DO mine its design). Their findings, which pre-empt our spike:
-      * MAINLINE DHT CANNOT HOLD OUR RECORD, and this is the killer: the classic get_peers path
-        stores only IPv4/IPv6 + port, NOT an iroh NodeId - so a NAT'd node cannot be a provider.
-        Also 20-byte SHA1 keys vs our 32-byte BLAKE3; their workaround is 'just SHA1 hash the BLAKE3
-        hash, or take the first 20 bytes'. This is the single most important input to our FROZEN
-        'NarHash -> DHT key derivation' decision, and it argues that plain mainline get_peers is the
-        WRONG substrate for holder records. BEP44 mutable/immutable items are the alternative to
-        evaluate (they carry arbitrary signed payloads) - the spike must compare get_peers vs BEP44
-        explicitly, not treat 'mainline' as one option.
-      * TRACKER: a small server holding 'a set of signed node ids for each piece of content'; announce
-        by hash or ticket, query by hash / ticket / hash+format. n0's recommended hybrid is to use the
-        mainline DHT to FIND TRACKERS rather than to store content locations.
-      * A tracker is far less dangerous for US than for most projects: our daemon and peers sit OUTSIDE
-        the trust base and nix re-verifies sig+NarHash, so a tracker is a HINT PROVIDER, not an
-        authority. A lying tracker costs a wasted dial, never a bad store path. Weigh it accordingly
-        instead of rejecting it reflexively for being a server.
-      * ANTI-SPAM BY PROBE (steal this - see TASK-90): before trusting an announce, their tracker
-        downloads a RANDOM 2 KiB blake3 chunk from the announcer and verifies it; for partial content
-        it asks only for unverified size; for hash sequences it probes a random chunk of a random
-        child. bao lets us verify any chunk against the root, so this is cheap and directly applicable.
-      * GOSSIP: iroh-gossip is epidemic broadcast trees (HyParView + PlumTree) over topics - what
-        Delta Chat uses. Ecosystem prior art worth reading: distributed-topic-tracker ('auto discovery,
-        no servers') and iroh-gossip-discovery. Feeds TASK-74.
+(2) DHT LOOKUP IS SLOWER THAN JUST FETCHING THE THING. TESTING.md's S8 row already flags '1-4s DHT
+    latency leaks into every build'. The MEDIAN NAR on the owner's store is 1.44 MiB; cache.nixos.org
+    sustained ~21 MB/s in task-63's probe, so the median NAR downloads in ~70 ms. A 1-4 s DHT lookup
+    is 15-60x the cost of not bothering. For the median path a DHT lookup is strictly worse than
+    going to the CDN, and a 200-path closure makes it catastrophic unless fully parallel/prefetched.
 
-(3) PRIVACY TENSION WE HAVE NOT RECORDED ANYWHERE. Our no-enumeration rule (owner, phase 1) stops a
-    peer LISTING what we hold. But ANNOUNCING to a public tracker or a global DHT publishes exactly
-    that, at internet scale and durably. Announce-on-demand + bounded yes/no probing is privacy-
-    preserving; DHT/tracker announce is not. The spike must state, per option, what it leaks. This
-    also bears on TASK-77 (announce-after-fetch) and TASK-78 (leech mode).
+WHERE A DHT IS STILL RIGHT, and why this task keeps it: the COLD, GLOBAL, RARE case - a node with no
+peer set, or content no known peer has. That is exactly the long tail the PRD already concedes is
+where a CDN is strong and swarms are weak. So the DHT earns its place as the fallback that makes
+bootstrapping possible, not as the thing every build waits on.
 
-Sources: docs.iroh.computer/concepts/discovery, docs.iroh.computer/connecting/dht-discovery,
-iroh.computer/blog/iroh-content-discovery, github.com/n0-computer/iroh-experiments.
+RESULTING LAYERING (cheapest first; each layer only handles what the one above missed):
+  0. node discovery: iroh's own, incl. mDNS on LAN (TASK-89)
+  1. peer set: gossip / config / LAN (TASK-74)
+  2. local answer, zero round trips: set digest over PUBLIC paths (TASK-92)
+  3. one round trip per closure per peer: batched hold-query (TASK-91)
+  4. peer ordering prior: closure/revision correlation (TASK-93)
+  5. cold/global fallback: THIS TASK - tracker and/or DHT, latency-tolerant because it is off the
+     hot path
+The spike should size how often layers 0-4 miss, because that miss rate is what layer 5 must serve -
+and if it is small, a tracker may beat a DHT on every axis that matters here.
 <!-- SECTION:NOTES:END -->
