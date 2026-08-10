@@ -6,7 +6,7 @@ title: >-
 status: To Do
 assignee: []
 created_date: '2026-08-10 10:04'
-updated_date: '2026-08-10 10:04'
+updated_date: '2026-08-10 12:21'
 labels:
   - wave-2b
 dependencies:
@@ -47,3 +47,21 @@ Everything published here MUST pass TASK-102's filter. Build behind TASK-100's s
 - [ ] #5 Cold start and republish are MEASURED not modelled: time from a cold daemon to first successful resolve, and the sustained query rate and bandwidth to keep the publishable set alive
 - [ ] #6 Honest limits: what an eclipse or Sybil majority costs us (availability, NOT integrity - say so precisely), and what fraction of peers are unreachable under the chosen path
 <!-- AC:END -->
+
+## Implementation Notes
+
+<!-- SECTION:NOTES:BEGIN -->
+## Forward-carried from TASK-91 (batched hold-query)
+
+* Design the DHT lookup for a CLOSURE, not a path. A 200-path closure means 200
+  key lookups unless the substrate supports batching or the client pipelines
+  them; that is the same order-of-magnitude mistake TASK-91 just removed from the
+  direct-probe path (measured 1180 -> 8 round trips, 60.4 s -> 0.41 s at a 50 ms
+  RTT). Whatever substrate is chosen, state its per-lookup cost and multiply by
+  200 before calling it viable.
+* Once the DHT returns candidate NodeIds, the CONFIRMATION step is the batched
+  hold-query, not N single probes - that is what BatchHoldQuery exists for.
+* The claim wire is byte-pinned in daemon/tests/golden/claim_wire_v1.json. If a
+  DHT record type needs a wire change, bump schema_version and pin new vectors;
+  the existing four must still pass untouched.
+<!-- SECTION:NOTES:END -->

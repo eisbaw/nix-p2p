@@ -6,6 +6,7 @@ title: >-
 status: To Do
 assignee: []
 created_date: '2026-08-09 13:31'
+updated_date: '2026-08-10 12:21'
 labels: []
 dependencies: []
 ---
@@ -22,3 +23,23 @@ InMemoryDiscovery::announce replaces on key, so a NarHash resolves to at most ON
 - [ ] #2 A dead-holder test bites at the RIGHT boundary: with 2 holders and the first one dead, the fetch reaches the SECOND HOLDER (not upstream) - proven by a provider-side counter on holder 2, and proven non-vacuous by mutation
 - [ ] #3 The claim wire schema is unchanged (frozen surface untouched); assert this explicitly
 <!-- AC:END -->
+
+## Implementation Notes
+
+<!-- SECTION:NOTES:BEGIN -->
+## Forward-carried from TASK-91 (batched hold-query)
+
+DirectDiscovery::resolve_many has the same first-Have-wins behaviour as
+resolve(): the first peer that answers Have for a key claims it, later peers are
+never asked about it (deliberately - it is what makes the common case one round
+trip). So multi-holder aggregation has to be decided at the BATCH level too, and
+the shapes are not the same:
+
+* aggregating means continuing to probe peers for keys already resolved, i.e.
+  paying round trips for redundancy. Quantify that against the measured cost
+  (`just discovery`) rather than assuming it is free.
+* BatchHoldResponse hoists `offers` to the response because ONE peer answers one
+  batch. A multi-holder Claim assembled from several batch responses must merge
+  offers per KEY across responses - do not assume a claim's offers all came from
+  one peer once aggregation exists.
+<!-- SECTION:NOTES:END -->

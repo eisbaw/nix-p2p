@@ -6,7 +6,7 @@ title: >-
 status: To Do
 assignee: []
 created_date: '2026-08-10 09:27'
-updated_date: '2026-08-10 09:27'
+updated_date: '2026-08-10 12:21'
 labels:
   - wave-2b
 dependencies:
@@ -47,3 +47,27 @@ Slot it behind TASK-100's seam as one mechanism among several; it must not becom
 - [ ] #4 The announce verification (random 2 KiB blake3 chunk) is retained and shown to bite: a node announcing content it does not have is rejected at the probe - this closes TASK-90 or explicitly supersedes it, say which
 - [ ] #5 Honest limits recorded: no default tracker (we run one), no DHT announce, and what our exposure is if upstream abandons the experiment
 <!-- AC:END -->
+
+## Implementation Notes
+
+<!-- SECTION:NOTES:BEGIN -->
+## Forward-carried from TASK-91 (batched hold-query)
+
+* A tracker answers "who has X". The unit of the QUESTION is now a closure, not a
+  path (TASK-91): the daemon knows every NarHash the moment it has proxied the
+  narinfos, ~300 ms before Nix asks for any NAR (task-35). If n0's tracker
+  protocol only accepts one hash per request, the adapter should batch at OUR
+  seam and pipeline, and the round-trip cost of doing so should be MEASURED with
+  `just discovery`'s instrument rather than assumed - it is exactly the cost
+  TASK-91 removed from direct probes and it would be a shame to reintroduce it
+  one layer up.
+* NO-ENUMERATION IS A PROPERTY OF THE MECHANISM, not just of our types. A tracker
+  that can be asked "what does node N have" (or that returns holdings the asker
+  did not name) violates the invariant even if our own API cannot express it.
+  Check that explicitly against the vendored protocol before adopting, and record
+  the finding either way.
+* Half the servable bytes here carry no upstream signature, so they can never be
+  published to a tracker/DHT under the publication rule (TASK-102) and are
+  reachable ONLY by direct hold-query. The batched direct probe is therefore not
+  a fallback the tracker replaces - both are load-bearing.
+<!-- SECTION:NOTES:END -->

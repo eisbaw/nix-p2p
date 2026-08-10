@@ -6,7 +6,7 @@ title: >-
 status: To Do
 assignee: []
 created_date: '2026-08-10 09:26'
-updated_date: '2026-08-10 09:26'
+updated_date: '2026-08-10 12:21'
 labels:
   - wave-2b
 dependencies:
@@ -43,3 +43,38 @@ Mechanisms to slot behind it: InProcess (tests, exists), DirectPeerProbe (exists
 - [ ] #4 No-enumeration remains STRUCTURAL: there is no list-holdings method on the trait or any implementation, and a test asserts a peer cannot be asked what it holds - only whether it holds keys the asker named
 - [ ] #5 The layered resolver tries mechanisms cheapest-first and stops early once satisfied; measured: probes issued and wall-clock for a multi-path closure with LAN-only, tracker-only, and layered configurations
 <!-- AC:END -->
+
+## Implementation Notes
+
+<!-- SECTION:NOTES:BEGIN -->
+## Forward-carried from TASK-91 (batched hold-query) - read before designing the trait
+
+TASK-91 landed the batch CALL SHAPE this seam has to carry. Take it as given
+rather than re-deriving it:
+
+* The plural method is `resolve_many(&self, keys: &[NarHashKey]) ->
+  Vec<Option<Claim>>`, POSITIONAL: result[i] is about keys[i], length equal,
+  duplicates in the caller's list handled by the impl. Positional (rather than a
+  map keyed by hash) is not a style choice - it is what makes the ANSWER unable
+  to name a key the asker did not, which is the no-enumeration invariant in
+  structural form. A `HashMap<NarHashKey, Claim>` return would quietly re-open it.
+* Give the plural method a DEFAULT implementation that loops the singular one.
+  That is what let TASK-91 add batching without touching any existing impl, and
+  it doubles as the honest one-at-a-time baseline the measurement compares to.
+* A mechanism that natively batches must be DISTINGUISHABLE from one that loops
+  internally, or every round-trip count taken over the seam is wrong. TASK-91's
+  trick: only the encoding path can refuse an over-cap batch, so handing both an
+  over-cap batch tells them apart from outside
+  (`the_in_process_batch_really_crosses_the_wire_not_the_shim`). Provide an
+  equivalent discriminator per mechanism.
+* Blast-radius rule, and it generalises to every mechanism here: a per-KEY fault
+  must degrade that key only (answer Absent, log it), while a per-MECHANISM fault
+  (no route, wire fault) propagates. Batching must never make one bad path deny a
+  whole closure.
+* MAX_BATCH_HOLD_KEYS = 256 is a WIRE bound (message size and per-message work),
+  not a caller bound. A caller with a 1000-path closure chunks; the seam should
+  chunk for it rather than making every caller remember.
+* Whatever this seam returns, keep `daemon/tests/no_enumeration.rs` passing - it
+  is a source-shape rule (plural holdings out requires named keys in) over
+  claim/availability/discovery. Add this module to its SOURCES list.
+<!-- SECTION:NOTES:END -->
