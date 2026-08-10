@@ -372,6 +372,13 @@ async fn main() {
     let batched_rt = batched[0].round_trips;
     let serial_ms = median(serial.iter().map(|a| a.wall_clock_ms).collect());
     let batched_ms = median(batched.iter().map(|a| a.wall_clock_ms).collect());
+    // EVERY replicate, not just the median. The unshaped arm is the one wall-clock
+    // number the injected-delay knob does not determine, so it is the honest floor
+    // - and it is single-digit milliseconds and therefore noisy. Reporting only a
+    // median invites quoting a 2.2x run-to-run spread to one decimal place, which
+    // is what happened. The reader gets the spread or does not get the number.
+    let serial_all: Vec<f64> = serial.iter().map(|a| a.wall_clock_ms).collect();
+    let batched_all: Vec<f64> = batched.iter().map(|a| a.wall_clock_ms).collect();
     let per_sub = |rt: usize| {
         if serial_resolved == 0 {
             0.0
@@ -404,12 +411,14 @@ async fn main() {
                         "keys_asked": serial[0].keys_asked,
                         "round_trips_per_substitution": per_sub(serial_rt),
                         "wall_clock_ms_median": serial_ms,
+                        "wall_clock_ms_replicates": serial_all,
                     },
                     "batched": {
                         "round_trips": batched_rt,
                         "keys_asked": batched[0].keys_asked,
                         "round_trips_per_substitution": per_sub(batched_rt),
                         "wall_clock_ms_median": batched_ms,
+                        "wall_clock_ms_replicates": batched_all,
                     },
                 },
                 "round_trip_reduction_factor":

@@ -190,6 +190,7 @@ def arm_violations(report: dict, *, expect_shaped: bool) -> list[str]:
             "about what was measured"
         )
 
+    reported_factor = _number(report, "round_trip_reduction_factor", problems)
     serial_rt = _number(report, "arms.serial.round_trips", problems)
     batched_rt = _number(report, "arms.batched.round_trips", problems)
     serial_keys = _number(report, "arms.serial.keys_asked", problems)
@@ -225,6 +226,18 @@ def arm_violations(report: dict, *, expect_shaped: bool) -> list[str]:
         )
     if batched_rt < 1:
         problems.append("the batched arm made no round trips at all - it did nothing")
+    else:
+        # The headline factor is RECOMPUTED from the two counts and the
+        # instrument's own figure is checked against it, rather than quoted. A
+        # number this report calls THE result must not be one it merely relayed.
+        recomputed = serial_rt / batched_rt
+        if abs(reported_factor - recomputed) > 0.01 * max(recomputed, 1.0):
+            problems.append(
+                f"the instrument reports a reduction factor of {reported_factor:.1f}x "
+                f"but its own counts give {serial_rt:.0f}/{batched_rt:.0f} = "
+                f"{recomputed:.1f}x; the headline number does not follow from the "
+                "measurement it is supposed to summarise"
+            )
 
     if expect_shaped:
         if rtt_ms <= 0:
@@ -234,16 +247,26 @@ def arm_violations(report: dict, *, expect_shaped: bool) -> list[str]:
             )
         else:
             # RECOVER the injection from the measurement rather than trusting the
-            # knob: the serial arm's wall clock must be its round trips x the RTT.
-            expected_ms = serial_rt * rtt_ms
+            # knob, FOR BOTH ARMS. Checking only the serial arm left the batched
+            # count - the numerator of the headline reduction factor - bound to
+            # nothing: an instrument reporting 1 batched round trip while timing 8
+            # of them inflated the headline 8x with `problems` empty and exit 0.
+            # The count is the result, so the count is what must be recoverable.
             low, high = RTT_RECOVERY_BAND
-            if not low * expected_ms <= serial_ms <= high * expected_ms:
-                problems.append(
-                    f"injected RTT NOT recovered: {serial_rt:.0f} round trips at "
-                    f"{rtt_ms:.0f} ms should be ~{expected_ms:.0f} ms, measured "
-                    f"{serial_ms:.0f} ms (outside [{low * expected_ms:.0f}, "
-                    f"{high * expected_ms:.0f}] ms). The shaper is not armed"
-                )
+            for arm, round_trips, measured_ms in (
+                ("serial", serial_rt, serial_ms),
+                ("batched", batched_rt, batched_ms),
+            ):
+                expected_ms = round_trips * rtt_ms
+                if not low * expected_ms <= measured_ms <= high * expected_ms:
+                    problems.append(
+                        f"injected RTT NOT recovered on the {arm} arm: "
+                        f"{round_trips:.0f} round trips at {rtt_ms:.0f} ms should be "
+                        f"~{expected_ms:.0f} ms, measured {measured_ms:.0f} ms "
+                        f"(outside [{low * expected_ms:.0f}, {high * expected_ms:.0f}] "
+                        "ms). Either the shaper is not armed or the reported "
+                        "round-trip count is not what was timed"
+                    )
             if batched_ms >= serial_ms:
                 problems.append(
                     f"the batched arm ({batched_ms:.0f} ms) was not faster than the "
@@ -288,6 +311,29 @@ def cross_run_violations(unshaped: dict, shaped: dict) -> list[str]:
 
 
 # ---- report assembly --------------------------------------------------------
+
+
+def unshaped_floor_range(run: dict) -> list[float]:
+    """The unshaped speedup across REPLICATES, as [min, max].
+
+    The unshaped arm is the one wall-clock number the injected-delay knob does
+    not determine, which is exactly why it is the honest floor - and it is
+    single-digit milliseconds, so it is noisy. Pairing replicate i of one arm
+    with replicate i of the other keeps each ratio a within-run comparison; the
+    range is then what the instrument can actually support.
+
+    Falls back to the median-only pair when an instrument predating
+    `wall_clock_ms_replicates` is read, so an old report degrades to a point
+    rather than to a crash.
+    """
+    serial = run["arms"]["serial"].get("wall_clock_ms_replicates") or [
+        run["arms"]["serial"]["wall_clock_ms_median"]
+    ]
+    batched = run["arms"]["batched"].get("wall_clock_ms_replicates") or [
+        run["arms"]["batched"]["wall_clock_ms_median"]
+    ]
+    ratios = [s / max(b, 1e-9) for s, b in zip(serial, batched)]
+    return [min(ratios), max(ratios)]
 
 
 def build_block(unshaped: dict, shaped: dict) -> tuple[dict, list[str]]:
@@ -337,7 +383,13 @@ def build_block(unshaped: dict, shaped: dict) -> tuple[dict, list[str]]:
             "unshaped": arms(unshaped),
             "shaped": arms(shaped)
             | {"injected_rtt_ms": shaped["config"]["injected_rtt_ms"]},
-            "round_trip_reduction_factor": unshaped["round_trip_reduction_factor"],
+            # RECOMPUTED from the counts, not relayed from the instrument. The
+            # instrument's own figure is separately asserted to agree (see
+            # `arm_violations`), so this cannot silently diverge from it.
+            "round_trip_reduction_factor": (
+                unshaped["arms"]["serial"]["round_trips"]
+                / max(unshaped["arms"]["batched"]["round_trips"], 1)
+            ),
             # DERIVED, NOT A SECOND RESULT. The shaped wall clock is validated
             # against round_trips * injected_rtt_ms and the run is marked INVALID
             # outside the recovery band, so within a valid run this ratio IS the
@@ -348,7 +400,24 @@ def build_block(unshaped: dict, shaped: dict) -> tuple[dict, list[str]]:
                 shaped["arms"]["serial"]["wall_clock_ms_median"]
                 / max(shaped["arms"]["batched"]["wall_clock_ms_median"], 1e-9)
             ),
-            "wall_clock_reduction_factor_shaped_is_derived": True,
+            # NOT a flag saying "trust me, this is derived" - that was a hardcoded
+            # `True` that no run could falsify. This is the DISCREPANCY between the
+            # derived factor and the round-trip count it is supposed to restate.
+            # `arm_violations` recovers both arms' counts from their wall clocks,
+            # so within a valid run this is bounded by the recovery band; a run
+            # where it is not is INVALID, which is the invariant the prose used to
+            # merely assert.
+            "wall_clock_shaped_vs_round_trip_factor_ratio": (
+                (
+                    shaped["arms"]["serial"]["wall_clock_ms_median"]
+                    / max(shaped["arms"]["batched"]["wall_clock_ms_median"], 1e-9)
+                )
+                / max(
+                    shaped["arms"]["serial"]["round_trips"]
+                    / max(shaped["arms"]["batched"]["round_trips"], 1),
+                    1e-9,
+                )
+            ),
             # The UNSHAPED arm is the one wall-clock number that is not determined
             # by the knob. It is also small in absolute terms (single-digit
             # milliseconds) and therefore noisy run to run, which is exactly why it
@@ -356,6 +425,17 @@ def build_block(unshaped: dict, shaped: dict) -> tuple[dict, list[str]]:
             "wall_clock_reduction_factor_unshaped": (
                 unshaped["arms"]["serial"]["wall_clock_ms_median"]
                 / max(unshaped["arms"]["batched"]["wall_clock_ms_median"], 1e-9)
+            ),
+            # ...and its SPREAD across the replicates. Quoting this number to one
+            # decimal was overprecision by more than a factor of two: runs of the
+            # same build have given 3.88x, 5.26x, 6.38x, 6.96x, 7.85x, 8.33x and
+            # 11.68x while the round-trip counts did not move at all. A point
+            # estimate here is a claim the instrument cannot support.
+            "wall_clock_reduction_factor_unshaped_range": unshaped_floor_range(
+                unshaped
+            ),
+            "unshaped_replicates": (
+                unshaped["arms"]["serial"].get("wall_clock_ms_replicates") or [None]
             ),
             "problems": problems,
         },
@@ -393,16 +473,22 @@ def human_lines(block: dict) -> list[str]:
     # reads as two corroborating measurements. It is one: the shaped wall clock is
     # round_trips x the injected delay by construction of this harness, and a run
     # where it is not is marked INVALID above.
+    low, high = block["wall_clock_reduction_factor_unshaped_range"]
     lines += [
         f"  RESULT: {block['round_trip_reduction_factor']:.1f}x fewer round trips "
         f"(a count, not a timing)",
         f"  the shaped wall clock ({block['wall_clock_reduction_factor_shaped']:.1f}x) "
         f"is that same count times the {block['shaped']['injected_rtt_ms']} ms knob - "
-        f"it confirms the emulation, it is NOT a second result",
-        f"  honest floor, unshaped and unemulated: "
-        f"{block['wall_clock_reduction_factor_unshaped']:.1f}x "
-        f"(single-digit ms, noisy; the serial baseline is strictly sequential "
-        f"across peers, i.e. the most naive one available)",
+        f"it confirms the emulation, it is NOT a second result. Both arms' counts "
+        f"are recovered from their own wall clocks, so a count that was not what "
+        f"was timed FAILS this arm",
+        f"  honest floor, unshaped and unemulated: {low:.0f}-{high:.0f}x across "
+        f"{len(block['unshaped_replicates'])} replicates (single-digit ms and noisy "
+        f"- run to run this has spanned roughly 4x to 12x while the round-trip "
+        f"counts did not move, so it is quoted as a RANGE and never to one "
+        f"decimal; the serial "
+        f"baseline is strictly sequential across peers, i.e. the most naive one "
+        f"available)",
     ]
     if block["problems"]:
         lines.append("  PROBLEMS (the arm is INVALID):")
@@ -434,12 +520,14 @@ def _valid_run(rtt_ms: int, serial_rt: int = 1180, batched_rt: int = 8) -> dict:
                 "keys_asked": 1180,
                 "round_trips_per_substitution": serial_rt / 120,
                 "wall_clock_ms_median": serial_ms,
+                "wall_clock_ms_replicates": [serial_ms],
             },
             "batched": {
                 "round_trips": batched_rt,
                 "keys_asked": 1180,
                 "round_trips_per_substitution": batched_rt / 120,
                 "wall_clock_ms_median": batched_ms,
+                "wall_clock_ms_replicates": [batched_ms],
             },
         },
         "round_trip_reduction_factor": serial_rt / batched_rt,
@@ -572,16 +660,14 @@ def run_self_test() -> int:
         and any("emulated network" in line for line in human_lines(block)),
     )
     check(
-        # AC#3 stated ONE measurement twice: the round-trip count and the shaped
-        # wall clock were printed in one sentence joined by a semicolon, which
-        # reads as two corroborating results. The shaped wall clock is
-        # round_trips x the injected knob BY CONSTRUCTION of this harness (a run
-        # where it is not is marked INVALID above), so the printer must say so and
-        # must print the one wall-clock number that is NOT determined by the knob.
+        # The printer must SAY the shaped wall clock is derived. Saying it is not
+        # the same as it being true, which is why the two mutations below exist:
+        # the previous round asserted the disclaimer's WORDING and a hardcoded
+        # `True`, and an instrument that inflated the headline 8x printed the
+        # disclaimer while contradicting it.
         "the shaped wall clock is printed as DERIVED, not as a second result",
         any("NOT a second result" in line for line in human_lines(block))
-        and any("honest floor" in line for line in human_lines(block))
-        and block["wall_clock_reduction_factor_shaped_is_derived"] is True,
+        and any("honest floor" in line for line in human_lines(block)),
     )
     check(
         "the unshaped floor is reported as its own factor, not left to a reader",
@@ -591,6 +677,60 @@ def run_self_test() -> int:
         < block["wall_clock_reduction_factor_shaped"] / 10,
         f"unshaped={block['wall_clock_reduction_factor_unshaped']:.2f} "
         f"shaped={block['wall_clock_reduction_factor_shaped']:.2f}",
+    )
+    # The range must come from the REPLICATES, not be a point dressed as a range.
+    spread = _valid_run(0)
+    spread["arms"]["serial"]["wall_clock_ms_replicates"] = [20.0, 40.0, 60.0]
+    spread["arms"]["batched"]["wall_clock_ms_replicates"] = [4.0, 4.0, 4.0]
+    low_ratio, high_ratio = unshaped_floor_range(spread)
+    check(
+        "the floor range spans the replicates, pairing them within a run",
+        (low_ratio, high_ratio) == (5.0, 15.0),
+        f"got {low_ratio}-{high_ratio}, expected 5.0-15.0",
+    )
+    check(
+        "the honest floor is printed as a RANGE, never as one decimal place",
+        any(
+            "honest floor" in line and "-" in line and "across" in line
+            for line in human_lines(block)
+        ),
+        str([line for line in human_lines(block) if "honest floor" in line]),
+    )
+
+    # MUTATION 10: THE ONE THAT MATTERED. The instrument understates its batched
+    # round trips, inflating the headline 8x, while its wall clock still reflects
+    # the real count. Under the round-6 oracle this produced `problems == []` and
+    # exit 0, because only the SERIAL arm's count was recovered from its timing.
+    mutant = _valid_run(50)
+    mutant["arms"]["batched"]["round_trips"] = 1
+    mutant["round_trip_reduction_factor"] = 1180.0
+    problems = arm_violations(mutant, expect_shaped=True)
+    check(
+        "a batched count that is not what was timed is REJECTED",
+        any("NOT recovered on the batched arm" in p for p in problems),
+        str(problems),
+    )
+
+    # MUTATION 11: the instrument's self-reported headline disagrees with its own
+    # counts. The factor used to be relayed verbatim into the report.
+    mutant = _valid_run(0)
+    mutant["round_trip_reduction_factor"] = 99999.0
+    problems = arm_violations(mutant, expect_shaped=False)
+    check(
+        "a headline factor that does not follow from the counts is REJECTED",
+        any("does not follow from the measurement" in p for p in problems),
+        str(problems),
+    )
+
+    # MUTATION 12: the block must RECOMPUTE the factor rather than quote it, so a
+    # lying instrument cannot get its number printed even if it were not caught.
+    lying = _valid_run(0)
+    lying["round_trip_reduction_factor"] = 99999.0
+    lying_block, _ = build_block(lying, _valid_run(50))
+    check(
+        "the reported factor is RECOMPUTED from the counts, not relayed",
+        abs(lying_block["round_trip_reduction_factor"] - 1180 / 8) < 0.01,
+        str(lying_block["round_trip_reduction_factor"]),
     )
     broken_block, _ = build_block(clean_unshaped, _valid_run(0))
     check(
