@@ -44,11 +44,13 @@ pub use availability::{
 pub use cacheinfo::CacheInfo;
 pub use catalog::{CorrelationStore, NarCatalog, NarMeta, NullCorrelation};
 pub use claim::{
-    CLAIM_SCHEMA_VERSION, Claim, ClaimCodecError, ClaimSignature, HoldAnswer, HoldQuery,
-    HoldResponse, KnownPayload, KnownTransport, MAX_CLAIM_WIRE_BYTES, NAR_HASH_LEN,
-    NAR_HASH_PREFIX, NarHashKey, NarHashKeyParseError, QUERY_SCHEMA_VERSION, SignedNarinfoRelay,
-    decode_claim, decode_hold_query, decode_hold_response, encode_claim, encode_hold_query,
-    encode_hold_response,
+    BatchHoldAnswer, BatchHoldQuery, BatchHoldResponse, CLAIM_SCHEMA_VERSION, Claim,
+    ClaimCodecError, ClaimSignature, HoldAnswer, HoldQuery, HoldResponse, KnownPayload,
+    KnownTransport, MAX_BATCH_HOLD_KEYS, MAX_CLAIM_WIRE_BYTES, NAR_HASH_LEN, NAR_HASH_PREFIX,
+    NarHashKey, NarHashKeyParseError, QUERY_SCHEMA_VERSION, SignedNarinfoRelay,
+    decode_batch_hold_query, decode_batch_hold_response, decode_claim, decode_hold_query,
+    decode_hold_response, encode_batch_hold_query, encode_batch_hold_response, encode_claim,
+    encode_hold_query, encode_hold_response,
 };
 pub use content_id::{
     BLAKE3_DIGEST_LEN, BLAKE3_DOMAIN_SEPARATION, BLAKE3_PREFIX, Blake3Digest, DigestParseError,

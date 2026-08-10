@@ -1,0 +1,46 @@
+{
+  "_comment": "FROZEN golden wire vectors for the claim/hold-query surface (daemon/src/claim.rs). Filed by task-91, which ADDS the batched hold-query alongside these types: the freeze on HoldQuery/HoldAnswer/HoldResponse/Claim was stated in prose and enforced only by round-trip tests, which pass just as happily after a field is renamed on both sides. These vectors pin the exact BYTES, so a change to the frozen encodings fails here instead of splitting the network silently. Changing any `wire` string is a deliberate, reviewed re-freeze that requires a `schema_version` bump. `daemon/tests/claim_wire_golden.rs` asserts each `wire` is what our encoder EMITS and what our decoder ACCEPTS.",
+  "codec": "JSON draft codec (claim.rs `Codec` note): the field order is the struct declaration order, so the byte string is stable. The final binary codec is a velocity surface and will re-pin these vectors under a new file.",
+  "identities": {
+    "_note": "The exact canonical strings the vectors are built from. The test asserts its own typed constructors produce these, so a vector can never be pinned against an identity encoding that has itself drifted.",
+    "key": "sha256:06rgb4vfjsg365xwwdjz12qhjnvg3w0agfvyqfp977hp3yk2bczb",
+    "key_2": "sha256:08i248i248i248i248i248i248i248i248i248i248i248i248i2",
+    "node_a": "1111111111111111111111111111111111111111111111111111111111111111",
+    "node_b": "2222222222222222222222222222222222222222222222222222222222222222",
+    "blake3": "blake3:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "blake3_2": "blake3:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+    "infohash": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+  },
+  "vectors": [
+    {
+      "name": "claim_full",
+      "note": "A fully-populated v1 claim: known payload (the ONE content identity), both holders, both transports. `relay`/`signatures` are absent from the wire because they are None/empty in v1.",
+      "wire": "{\"schema_version\":1,\"key\":\"sha256:06rgb4vfjsg365xwwdjz12qhjnvg3w0agfvyqfp977hp3yk2bczb\",\"payload\":{\"kind\":\"whole_nar\",\"blake3\":\"blake3:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"},\"holders\":[\"1111111111111111111111111111111111111111111111111111111111111111\",\"2222222222222222222222222222222222222222222222222222222222222222\"],\"transports\":[{\"transport\":\"iroh\",\"node\":\"1111111111111111111111111111111111111111111111111111111111111111\"},{\"transport\":\"bittorrent\",\"infohash\":\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\"}]}"
+    },
+    {
+      "name": "hold_query",
+      "note": "The single-key probe. task-91 adds a BATCHED query alongside it; this vector is what proves the single-key form was not mutated in the process.",
+      "wire": "{\"schema_version\":1,\"key\":\"sha256:06rgb4vfjsg365xwwdjz12qhjnvg3w0agfvyqfp977hp3yk2bczb\"}"
+    },
+    {
+      "name": "hold_response_have",
+      "note": "`answer` is FLATTENED into the envelope, so the tag sits next to schema_version. The blake3 appears exactly once; the offer is a pure locator.",
+      "wire": "{\"schema_version\":1,\"answer\":\"have\",\"blake3\":\"blake3:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"offers\":[{\"transport\":\"iroh\",\"node\":\"1111111111111111111111111111111111111111111111111111111111111111\"}]}"
+    },
+    {
+      "name": "hold_response_absent",
+      "note": "A no. It carries no blake3 and no offers - there is nothing on this wire that could enumerate what the peer DOES hold.",
+      "wire": "{\"schema_version\":1,\"answer\":\"absent\"}"
+    },
+    {
+      "name": "batch_hold_query",
+      "note": "task-91 ADDITION. The same question as `hold_query`, asked about many keys at once. The keys are the asker's own, in the asker's own order, and that order is what the answer vector is aligned to.",
+      "wire": "{\"schema_version\":1,\"keys\":[\"sha256:06rgb4vfjsg365xwwdjz12qhjnvg3w0agfvyqfp977hp3yk2bczb\",\"sha256:08i248i248i248i248i248i248i248i248i248i248i248i248i2\"]}"
+    },
+    {
+      "name": "batch_hold_response",
+      "note": "task-91 ADDITION. One positional answer per queried key; the transport offers are hoisted out of the answers because one peer answers one batch. NOTE WHAT IS ABSENT: no `sha256:` string appears anywhere on this wire. A batch answer is meaningless detached from the asker's query, which is exactly why it is not an enumeration - `claim_wire_golden.rs::batch_hold_response_carries_no_keys_of_its_own` asserts that on these bytes.",
+      "wire": "{\"schema_version\":1,\"offers\":[{\"transport\":\"iroh\",\"node\":\"2222222222222222222222222222222222222222222222222222222222222222\"}],\"answers\":[{\"answer\":\"have\",\"blake3\":\"blake3:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"},{\"answer\":\"absent\"},{\"answer\":\"have\",\"blake3\":\"blake3:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc\"}]}"
+    }
+  ]
+}
