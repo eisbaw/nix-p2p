@@ -228,6 +228,16 @@ scale-sweep *ARGS: _python fixtures-large
 profile *ARGS: _python fixtures-large
     "${NIX_P2P_PYTHON}/bin/python3" scripts/profile_p2p.py {{ ARGS }}
 
+# The task-91 closure-discovery arm of the profiler, ALONE. It is the profiler's
+# only container-free arm - production still wires InMemoryDiscovery from config,
+# so there is no peer-probing container path to run it over - which is why it does
+# NOT depend on `fixtures-large` the way `profile` does. ~1 minute: it measures
+# what finding the holders of a 200-path closure costs, one-at-a-time vs batched,
+# at 0 ms and at the profiler's WAN RTT. Non-zero exit if the arm is INVALID.
+# Measure closure-discovery cost, batched vs one-at-a-time (task-91).
+discovery: _toolchain _python
+    "${NIX_P2P_PYTHON}/bin/python3" scripts/profile_p2p.py --discovery-only
+
 # The task-64 transport decomposition: a layered loopback throughput bench
 # (memcpy / TCP / raw UDP / raw QUIC / iroh-blobs / the product's own fetch)
 # that attributes the peer-path per-byte cost to a LAYER, so "iroh is slow" is

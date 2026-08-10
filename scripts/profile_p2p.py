@@ -137,6 +137,13 @@ import scale_sweep as ss
 # from `main` and folded into the report here, so `just profile` grows the axis
 # without this file growing a second sweep.
 import sizeaxis as sz
+
+# task-91's CLOSURE-DISCOVERY axis - the cost of finding holders, before any byte
+# moves. Its own module for the same reason as sizeaxis, and container-free: there
+# is no peer-probing container path to run it over (production still wires
+# InMemoryDiscovery from config), so it drives the library resolver over the real
+# wire codec, which is where the round trips are decided.
+import discoveryaxis as da
 from measure import BASELINE_MIN_VALID_RUNS, classify_run, percentile, stat_block
 
 # ---- frozen constants (this instrument's counting rule) ---------------------
@@ -2359,6 +2366,7 @@ def build_report(
     config: dict,
     targets,
     size: tuple[dict, dict, list[str]] | None = None,
+    discovery: dict | None = None,
 ) -> dict:
     """Assemble the report. PURE: takes collected measurements, touches nothing.
 
@@ -2398,6 +2406,15 @@ def build_report(
     size_measured, size_models, size_problems = size or ({}, {}, [])
     models.update(size_models)
     problems += size_problems
+    # task-91: the discovery arm fits nothing (a round-trip count is a count, not
+    # a growth law), so it contributes only MEASURED values and its own validity
+    # problems - which gate the whole report exactly like the others', because an
+    # arm that ran and cannot be quoted must not leave the profile reading as
+    # quotable.
+    problems += [
+        f"discovery axis: {problem}"
+        for problem in (discovery or {}).get("problems", [])
+    ]
 
     measured = {
         "swarm": {
@@ -2427,6 +2444,10 @@ def build_report(
         }
     }
     measured.update(size_measured)
+    measured["discovery"] = discovery or {
+        "ran": False,
+        "reason": "not run (--skip-discovery, or the arm raised; see stderr)",
+    }
     if speedup is not None:
         measured["speedup"] = speedup
 
@@ -2569,6 +2590,7 @@ def build_report(
             "algebraically_identical", False
         )
     report["verdict"] = {
+        "discovery_axis_ran": bool(discovery and discovery.get("rule_version")),
         "size_axis_ran": size_ran,
         "size_axis_usable": size_usable,
         "size_axis_derived_quantity_independence": size_independence,
@@ -3106,6 +3128,9 @@ def human_summary_lines(report: dict) -> list[str]:  # noqa: C901 - a flat repor
     )
     if verdict.get("size_axis_ran"):
         lines += sz.human_lines(report["measured"], report["models"])
+        lines.append("")
+    if verdict.get("discovery_axis_ran"):
+        lines += da.human_lines(report["measured"]["discovery"])
         lines.append("")
     for problem in verdict["fit_problems"]:
         lines.append(f"    PROBLEM: {problem}")
@@ -4443,6 +4468,10 @@ def run_self_test() -> int:  # noqa: C901 - a flat list of checks reads better h
     # keeps ONE entry point for this instrument's honesty machinery.
     print()
     ok = sz.run_self_test() == 0 and ok
+    # task-91's oracles, same rule: the honesty machinery of every arm is covered
+    # on EVERY cycle, not only when the slow sweep runs.
+    print()
+    ok = da.run_self_test() == 0 and ok
 
     print(f"\nprofile_p2p --self-test: {'ALL PASS' if ok else 'FAILURES PRESENT'}")
     return 0 if ok else 1
@@ -4506,6 +4535,27 @@ def run_size_axes(
     # report assembly buys nothing.
     shutil.rmtree(graded_root, ignore_errors=True)
     return measured, models, problems
+
+
+def run_discovery_axis() -> dict:
+    """task-91's closure-discovery arm: two instrument passes, validated.
+
+    Never raises: a failed arm is recorded as a failed arm (with the reason and a
+    problem that gates the report), because a raise here would discard the rest of
+    a ~45-minute profile.
+    """
+    try:
+        unshaped = da.run_instrument(rtt_ms=0, repeats=da.UNSHAPED_REPEATS)
+        shaped = da.run_instrument(rtt_ms=WAN_RTT_MS, repeats=da.SHAPED_REPEATS)
+    except (RuntimeError, OSError, ValueError) as error:
+        print(f"profile: discovery axis FAILED: {error!r}", file=sys.stderr)
+        return {
+            "ran": False,
+            "reason": f"{error!r}",
+            "problems": [f"discovery instrument raised: {error!r}"],
+        }
+    block, _problems = da.build_block(unshaped, shaped)
+    return block
 
 
 # ---- main --------------------------------------------------------------------
@@ -4601,6 +4651,19 @@ def main() -> int:
         help="fixture publication root",
     )
     parser.add_argument(
+        "--skip-discovery",
+        action="store_true",
+        help="skip the task-91 closure-discovery axis (dev loop)",
+    )
+    parser.add_argument(
+        "--discovery-only",
+        action="store_true",
+        help="run ONLY the task-91 closure-discovery arm and exit. It needs no "
+        "containers, no fixtures and no nix, so this is the ~1-minute way to "
+        "re-measure the batched-vs-serial discovery cost without paying for the "
+        "whole profile",
+    )
+    parser.add_argument(
         "--self-test",
         action="store_true",
         help="run the pure logic tests (no containers, no nix) and exit",
@@ -4609,6 +4672,16 @@ def main() -> int:
 
     if args.self_test:
         return run_self_test()
+
+    # Container-free and fixture-free, so it is answered BEFORE the disk, podman
+    # and fixture preconditions - none of which it needs.
+    if args.discovery_only:
+        block = run_discovery_axis()
+        print("\n".join(da.human_lines(block)) if block.get("rule_version") else "")
+        print(json.dumps(block, indent=2, sort_keys=True))
+        for problem in block.get("problems", []):
+            print(f"profile: DISCOVERY ARM INVALID: {problem}", file=sys.stderr)
+        return 1 if block.get("problems") else 0
 
     # Reused, not re-declared: `scale_sweep` already owns the SIGTERM->teardown
     # contract, and two copies of "how a sweep cleans up when killed" is two
@@ -4722,6 +4795,7 @@ def main() -> int:
         "concurrency_values": list(args.concurrency),
         "concurrency_size_bytes_uncompressed_nar": sz.CONCURRENCY_SIZE_MIB * 1024**2,
         "size_axis_skipped": bool(args.skip_size),
+        "discovery_axis_skipped": bool(args.skip_discovery),
         "size_axis_disk_requirement_bytes_ondisk": (
             sz.graded_disk_requirement_bytes_ondisk(full_plan)
         ),
@@ -4744,6 +4818,9 @@ def main() -> int:
     axis = ss.Axis(name="swarm", variable="peer holder count", description="not run")
     speedup = None
     size_blocks = None
+    # task-91: FIRST, because it is the only container-free arm - a broken
+    # instrument should say so in a minute rather than after the swarm sweep.
+    discovery_block = None if args.skip_discovery else run_discovery_axis()
     try:
         axis = sweep_swarm(ctx, fixtures, args.swarm, args.repeats, state_root)
         if not args.skip_size:
@@ -4827,6 +4904,7 @@ def main() -> int:
         config,
         args.extrapolate_to,
         size=size_blocks,
+        discovery=discovery_block,
     )
     # PERSIST BEFORE PRETTY-PRINTING. The human summary is a formatter over a
     # report that cost ~20 minutes of container runs to produce; a KeyError in
