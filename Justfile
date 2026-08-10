@@ -146,18 +146,60 @@ fmt: _toolchain
 package:
     nix build --no-link --print-out-paths .#daemon .#testproxy
 
-# The canonical e2e gate (task-5): rootless-podman-pod scenario runner driving
+# The e2e gate (task-5): rootless-podman-pod scenario runner driving
 # client(real nix) -> daemon -> testproxy -> mock-origin, asserting the
 # TESTING.md oracles. Depends on the full-tier fixtures (the 110 MiB payload is
 # part of S1's byte/egress oracles) and on the fail-closed check-fixtures gate,
 # which the harness itself invokes before serving anything. SLOW tier: container
 # runs are minutes, deliberately out of the fast `build lint test` loop.
-# Run the containerized e2e scenario suite (rootless podman pods).
+#
+# ONE BREADTH-FIRST SCENARIO PER DISTINCT PATH, not a random sample. Each entry
+# below is here because NOTHING ELSE in the fast set covers its path, so dropping
+# any one of them makes a whole capability unguarded in the common loop:
+#   s1-byte-and-counts    the core S1 acceptance signal - byte identity + the
+#                         upstream-hit counts every other oracle is paired against
+#   s2-fallback           daemon down -> nix still resolves (the additive invariant)
+#   tamper-narhash        THE SAFETY BITE. Deliberately kept in the fast set: it
+#                         proves nix REJECTS mutated content, and a fast gate that
+#                         cannot catch a verification regression is the one gap
+#                         worth paying seconds for.
+#   chain-s1-and-counts   depth-3 composition - proves the daemon composes with
+#                         itself, which single-hop scenarios cannot show
+#   s6-p2p                the wave-2 peer-served-NAR acceptance signal
+#
+# NOT covered here, and the reason `e2e-full` still exists as the real gate: the
+# crash suite (6 scenarios), the 7-fault x depth matrix, the timeout boundary,
+# and the remaining tamper/s6 variants. Those are where regressions HIDE, so
+# `e2e-full` is what must pass before a commit that touches the serving path.
+#
+# MEASURED 2026-08-10 (the harness prints per-scenario seconds, so this is data
+# and not an impression): full 26 scenarios = 439.2s; this subset = 83.3s, about
+# a 5x cut, 1m41s wall including fixtures and preflight.
+# Two things that measurement CORRECTED, recorded so the next person tuning this
+# list does not repeat them:
+#   * fault-depth-matrix is NOT the long pole. It runs 29 checks in 11.8s because
+#     it reuses one pod. The expensive scenarios are the ones that wait on real
+#     process death: chain-kill-middle-daemon 37.3s, crash-kill-mid-nar 32.6s,
+#     crash-sigstop-stall 28.9s, chain-timeout-boundary 26.0s.
+#   * There is a ~11s floor per scenario (pod setup), so the COUNT of scenarios
+#     dominates the cost far more than which ones are chosen. Adding a sixth
+#     "cheap" scenario here costs ~11s, not ~1s.
+E2E_FAST := "--only s1-byte-and-counts --only s2-fallback --only tamper-narhash --only chain-s1-and-counts --only s6-p2p"
+
+# Run the fast breadth-first e2e subset (5 scenarios) - the common pre-commit loop.
 e2e: _python fixtures-large
+    "${NIX_P2P_PYTHON}/bin/python3" scripts/e2e_harness.py {{E2E_FAST}}
+
+# Required before shipping a serving-path change: it is the only run whose green
+# means what `just e2e` used to mean, since the fast subset omits the crash
+# suite, the fault x depth matrix and the timeout boundary.
+# Run EVERY e2e scenario (the real gate; slower than `just e2e`).
+e2e-full: _python fixtures-large
     "${NIX_P2P_PYTHON}/bin/python3" scripts/e2e_harness.py
 
-# Tear down every pod/container the e2e harness created (its label only - never
-# the fixture tree). Also the Ctrl-C leak trap's manual counterpart.
+# Scoped to the harness's own label - never the fixture tree. Also the manual
+# counterpart of the Ctrl-C leak trap.
+# Tear down every pod/container the e2e harness created.
 e2e-clean:
     "${NIX_P2P_PYTHON}/bin/python3" scripts/e2e_harness.py --clean
 

@@ -1,10 +1,11 @@
 # nix-p2p
 
 > **Work in progress — nothing here is stable.** The name "nix-p2p" is
-> tentative. Peer *transfer* works; peer *discovery* does not exist yet — the
-> DHT mechanism and its key derivation are still open design work, and nodes
-> currently learn about each other from the command line. The claim wire
-> schema and the addressed unit are frozen; everything else may change.
+> tentative. Peer *transfer* works; peer *discovery* does not — the query
+> protocol exists and is measured, but the DHT mechanism and its key derivation
+> are still open design work, and nodes currently learn about each other from
+> the command line. The claim wire schema and the addressed unit are frozen;
+> everything else may change.
 
 A decentralized Nix binary cache: a localhost substituter daemon that serves
 the standard binary-cache HTTP API, passes signed metadata through from an
@@ -24,7 +25,8 @@ mock cache behind a test proxy. Fronting the real thing needs TLS on both
 
 ## Status
 
-**Wave 1 complete; wave 2a (peer transfer) working; discovery not started.**
+**Wave 1 complete; wave 2a (peer transfer) working; discovery is a protocol
+without a mechanism.**
 
 A real `nix build` is served from a peer over iroh, across container network
 namespaces, verified twice: BLAKE3/bao on arrival and Nix's own signature +
@@ -40,12 +42,17 @@ What works:
   listing call at all (enumeration is prevented by construction, not by a
   filter), and a conservative safety envelope (dial/idle/fetch timeouts,
   streaming NarSize abort).
+- A **hold-query protocol**, single-key and batched: one bounded message asks a
+  peer about a whole closure and gets back positional yes/nos, so discovery
+  costs a round trip per peer rather than per NAR. It is still not a listing —
+  the answer names nothing the asker did not ask about.
 - A **regenerate-on-demand supply model**: a node announces what it can serve
   without holding it, regenerates on request inside an explicit serve budget
   (max NAR size, max concurrent bytes, max serve duration), and releases
   afterwards. What it answers "yes" about and what it can actually serve are
-  the same set — proven where both sets exist in one process; there is no wire
-  hold-query endpoint yet, so this is not yet demonstrated between two nodes.
+  the same set — proven where both sets exist in one process; no node has yet
+  answered another's hold-query over a network, so this is not yet demonstrated
+  between two hosts.
 - A measurement and profiling stack: frozen egress counting rule, regression
   fitter with model selection and confidence intervals, and a p2p profiler
   covering RAM, disk, latency, throughput and speedup.
@@ -54,7 +61,9 @@ What does **not** work yet — the honest headline:
 
 - **Peers cannot find each other.** There is no DHT and no gossip. Nodes
   connect because `--iroh-peer` and `--p2p-claim` were passed on the command
-  line, so today this decentralizes *transfer*, not *discovery*.
+  line, so today this decentralizes *transfer*, not *discovery*. The hold-query
+  that will do the asking runs only over an in-process rendezvous: nothing
+  carries it over iroh yet, and the serving path does not call it.
 - A node supplies from raw-NAR *files* it was pointed at, not from
   `/nix/store`. The index-backed supplier that dumps real store paths exists
   and is tested, but nothing wires it into the daemon yet.
@@ -77,10 +86,12 @@ Measured on the container testbed (single host, so read the caveats):
 | Holder RAM held per byte *announced*, at rest | **0.00** |
 | Holder RAM per concurrent serve | **38.4 MB** [38.0 .. 38.8] |
 
-Every figure above is from one full profiling run on the current tree. Holder
-RAM is a slope fitted over five NAR sizes with a 95% confidence interval, not a
-single-point ratio; before the supply model it was **2.004 [2.000 .. 2.009]**
-with the blob store holding 1.00 bytes per byte announced *forever*.
+Every figure above is from one full profiling run at commit `63caca2`, and the
+transport and discovery code has changed since without being re-measured — read
+them as of that commit, not of `HEAD`. Holder RAM is a slope fitted over five
+NAR sizes with a 95% confidence interval, not a single-point ratio; before the
+supply model it was **2.004 [2.000 .. 2.009]** with the blob store holding 1.00
+bytes per byte announced *forever*.
 
 **The offload figure is steady-state by construction and must not be read as a
 swarm result.** It is measured with a holder pre-seeded with exactly what the
@@ -112,6 +123,11 @@ The supply model **cost latency to buy the memory guarantee**: regenerating a
 NAR per serve moved peers-on from 0.638 s to 0.964 s under WAN shaping (6.1×
 rather than the 9.3× the retain-everything build reached). That trade is stated
 rather than buried — holding nothing at rest is not free.
+
+Discovery is measured separately (`just discovery`): finding the holders of a
+200-path closure across 8 peers costs **1180 → 8 round trips**. That is a count,
+not a speedup — the wall-clock gain depends entirely on the RTT the round trips
+would have crossed, and these peers were in one process.
 
 `TESTING.md` forbids claiming emergent network effects from single-host sweeps,
 and the peer link is still loopback, so peer-side numbers are upper bounds.
@@ -175,7 +191,9 @@ Key invariants, tested end-to-end (see `TESTING.md`):
 Two frozen surfaces, deep-reviewed because changing them splits the network:
 the **claim wire schema** and the **addressed unit** (`RawNarV1` — the exact
 `nix-store --dump` bytes, keyed by plain BLAKE3, which equals the iroh-blobs
-hash by construction). DHT key derivation is the third and is not settled.
+hash by construction). Both are pinned in bytes by golden vectors, so a rename
+or a retag fails a test rather than a deployment. DHT key derivation is the
+third frozen surface and is not settled.
 
 ## Development
 
@@ -195,19 +213,26 @@ just lint       # clippy -D warnings, rustfmt, ruff, source-policy guards
 just test       # cargo test + fixture gate + measurement self-test
 ```
 
+A green `just test` is one sample, not a proof: the gate's own flake rate is
+something this project measures (`scripts/flake_rate.py`) rather than assumes.
+`TESTING.md` states the rule.
+
 Slow tier (containers/VMs; not part of the fast loop — minutes to hours):
 
 ```sh
-just e2e         # podman-pod scenario suite (needs rootless podman)
+just e2e         # FAST podman-pod subset: 5 scenarios, one per path
+just e2e-full    # every e2e scenario - the real gate before shipping
 just e2e-vm      # NixOS VM test (needs /dev/kvm)
 just measure     # egress/latency/gap measurement report
 just scale-sweep # scaling sweep + regression fit (clients, chain depth, knobs)
 just profile     # p2p RAM/disk/latency/throughput/speedup report (peer swarm)
+just discovery   # closure-discovery cost, batched vs one-at-a-time (~1 min)
 just journey     # J1 operator journey
 ```
 
-These are hours, not minutes: `just profile` runs a peer swarm, a NAR-size
-axis, a concurrency axis and both upstream conditions.
+Most are hours, not minutes: `just profile` runs a peer swarm, a NAR-size
+axis, a concurrency axis and both upstream conditions. `just discovery` is the
+exception — it needs no containers, because discovery has no container path yet.
 
 `nix flake check` re-runs build/lint/test in the sandbox for CI.
 

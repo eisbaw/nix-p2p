@@ -3594,10 +3594,11 @@ def run_scenarios(ctx: Ctx, selected) -> int:
         print(STUB_MARKER)
         return 1
     print(f"e2e: {len(selected)} scenarios registered")
-    results: list[tuple[str, bool, list[Check]]] = []
+    results: list[tuple[str, bool, list[Check], float]] = []
     for name, fn in selected:
         print(f"\n=== scenario: {name} ===")
         checks: list[Check] = []
+        started = time.monotonic()
         try:
             fn(ctx, make_expect(checks))
         except SystemExit:
@@ -3606,8 +3607,13 @@ def run_scenarios(ctx: Ctx, selected) -> int:
             checks.append(Check(False, "scenario raised", repr(error)))
         finally:
             cleanup_pods()  # never leak a pod between scenarios
+        # Measured INSIDE the cleanup, so a scenario is charged for the pods it
+        # leaves behind. `just e2e` selects a subset of these by name, and that
+        # selection has to be defensible from timings rather than from a guess
+        # about which scenario "feels" slow.
+        elapsed = time.monotonic() - started
         passed = bool(checks) and all(c.ok for c in checks)
-        results.append((name, passed, checks))
+        results.append((name, passed, checks, elapsed))
         for check in checks:
             mark = "ok  " if check.ok else "FAIL"
             extra = f"  [{check.detail}]" if check.detail and not check.ok else ""
@@ -3616,10 +3622,15 @@ def run_scenarios(ctx: Ctx, selected) -> int:
 
     print("\n=== summary ===")
     all_pass = True
-    for name, passed, checks in results:
+    for name, passed, checks, elapsed in results:
         n_ok = sum(1 for c in checks if c.ok)
-        print(f"  {'PASS' if passed else 'FAIL'} {name} ({n_ok}/{len(checks)} checks)")
+        print(
+            f"  {'PASS' if passed else 'FAIL'} {name} "
+            f"({n_ok}/{len(checks)} checks, {elapsed:.1f}s)"
+        )
         all_pass = all_pass and passed
+    total = sum(elapsed for _, _, _, elapsed in results)
+    print(f"  ---- {len(results)} scenarios, {total:.1f}s total")
     print(f"\ne2e: {'ALL SCENARIOS PASSED' if all_pass else 'FAILURES PRESENT'}")
     return 0 if all_pass else 1
 
