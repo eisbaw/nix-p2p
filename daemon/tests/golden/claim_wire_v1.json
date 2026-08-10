@@ -1,6 +1,6 @@
 {
   "_comment": "FROZEN golden wire vectors for the claim/hold-query surface (daemon/src/claim.rs). Filed by task-91, which ADDS the batched hold-query alongside these types: the freeze on HoldQuery/HoldAnswer/HoldResponse/Claim was stated in prose and enforced only by round-trip tests, which pass just as happily after a field is renamed on both sides. These vectors pin the exact BYTES, so a change to the frozen encodings fails here instead of splitting the network silently. Changing any `wire` string is a deliberate, reviewed re-freeze that requires a `schema_version` bump. `daemon/tests/claim_wire_golden.rs` asserts each `wire` is what our encoder EMITS and what our decoder ACCEPTS.",
-  "_direction": "Each vector declares a `direction`. `both` = our encoder must EMIT exactly these bytes AND our decoder must ACCEPT them. `decode-only` = a legal input we must keep ACCEPTING but do not emit (an omitted defaulted field, a dropped unknown kind). The second class exists because an encoding vector is blind to a change in what we TOLERATE: adding `skip_serializing_if`, or removing `serde(default)`, left every pre-existing vector in this file green.",
+  "_direction": "Each vector declares a `direction`. `both` = our encoder must EMIT exactly these bytes AND our decoder must ACCEPT them. `decode-only` = a legal input we must keep ACCEPTING but do not emit (an omitted defaulted field, a dropped unknown kind). The second class exists because an encoding vector is blind to a change in what we TOLERATE: adding `skip_serializing_if`, or removing `serde(default)`, left every pre-existing vector in this file green. `reject` = a wire we must REFUSE. That class exists because the file pinned emitted bytes well and had NO way to say \"this must not decode\", so every acceptance-widening change passed by construction: removing `deny_unknown_fields` from BatchHoldQuery, or from a KnownTransport, left every vector green.",
   "codec": "JSON draft codec (claim.rs `Codec` note): the field order is the struct declaration order, so the byte string is stable. The final binary codec is a velocity surface and will re-pin these vectors under a new file.",
   "identities": {
     "_note": "The exact canonical strings the vectors are built from. The test asserts its own typed constructors produce these, so a vector can never be pinned against an identity encoding that has itself drifted.",
@@ -97,6 +97,48 @@
       "direction": "decode-only",
       "note": "ACCEPTED INPUT, and the subtlest rule in this file: an unknown transport kind is tolerated-but-dropped, but the offers are INDEXED, so dropping element 1 in place would rebind the second Have's index 2 onto the wrong locator. The decoder keeps a SLOT for every element the peer sent, validates the indices against those RAW positions, then compacts and REWRITES the indices together. Note the unknown slot IS referenced (by answer 0) - it has to be, because an offer no answer references is rejected - so this also pins that dropping it leaves answer 0 with a SHORTER index list rather than a dangling one. Must decode to offers [iroh, bittorrent] with the Haves naming [0] and [1].",
       "wire": "{\"schema_version\":1,\"offers\":[{\"transport\":\"iroh\",\"node\":\"2222222222222222222222222222222222222222222222222222222222222222\"},{\"transport\":\"carrier_pigeon\",\"coop\":\"loft-7\"},{\"transport\":\"bittorrent\",\"infohash\":\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\"}],\"answers\":[{\"answer\":\"have\",\"blake3\":\"blake3:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"offer_indices\":[0,1]},{\"answer\":\"have\",\"blake3\":\"blake3:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc\",\"offer_indices\":[2]}]}"
+    },
+    {
+      "name": "batch_hold_response_have_empty_offer_indices",
+      "direction": "both",
+      "note": "A `Have` with an EMPTY `offer_indices`: legal and reachable (a holder whose only locators were unknown transport kinds, which are dropped on decode). Pinned because no other vector has one - so `skip_serializing_if = \"Vec::is_empty\"` added to `offer_indices` changed THESE bytes and nothing else, exactly the hole that the `offers` field had before an empty-offers vector existed.",
+      "wire": "{\"schema_version\":1,\"offers\":[],\"answers\":[{\"answer\":\"have\",\"blake3\":\"blake3:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"offer_indices\":[]}]}"
+    },
+    {
+      "name": "reject_claim_known_transport_with_stray_blake3",
+      "direction": "reject",
+      "note": "MUST REJECT. A KNOWN `iroh` transport carrying a second identity-like field. This DECODED before round 7 - the stray was ignored because the typed offer has no digest field - so the bytes carried two identity-like values and were accepted. That is a property of this build, not of the wire: another implementation could read it differently. `KnownTransport` is `deny_unknown_fields` now.",
+      "wire": "{\"schema_version\":1,\"key\":\"sha256:06rgb4vfjsg365xwwdjz12qhjnvg3w0agfvyqfp977hp3yk2bczb\",\"payload\":{\"kind\":\"whole_nar\",\"blake3\":\"blake3:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"},\"holders\":[\"1111111111111111111111111111111111111111111111111111111111111111\"],\"transports\":[{\"transport\":\"iroh\",\"node\":\"1111111111111111111111111111111111111111111111111111111111111111\",\"blake3\":\"blake3:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc\"}]}"
+    },
+    {
+      "name": "reject_claim_known_payload_with_unknown_field",
+      "direction": "reject",
+      "note": "MUST REJECT. A KNOWN `whole_nar` payload with an extra field. Same rule as the transport above, one level up: a kind we DO understand must mean exactly what we think it means.",
+      "wire": "{\"schema_version\":1,\"key\":\"sha256:06rgb4vfjsg365xwwdjz12qhjnvg3w0agfvyqfp977hp3yk2bczb\",\"payload\":{\"kind\":\"whole_nar\",\"blake3\":\"blake3:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"blake3_shadow\":\"blake3:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc\"},\"holders\":[\"1111111111111111111111111111111111111111111111111111111111111111\"]}"
+    },
+    {
+      "name": "reject_batch_hold_query_unknown_field",
+      "direction": "reject",
+      "note": "MUST REJECT. `BatchHoldQuery` carries `deny_unknown_fields`, and NOTHING asserted it: removing the attribute left the whole suite green. An encoding vector cannot see a decoder becoming more permissive, which is what this whole vector class is for.",
+      "wire": "{\"schema_version\":1,\"keys\":[\"sha256:06rgb4vfjsg365xwwdjz12qhjnvg3w0agfvyqfp977hp3yk2bczb\"],\"also_tell_me\":[\"everything\"]}"
+    },
+    {
+      "name": "reject_batch_response_offer_bound_to_no_answer",
+      "direction": "reject",
+      "note": "MUST REJECT. An all-`Absent` answer set with a non-empty offer dictionary: a locator bound to no answered key. This is the no-enumeration half of the offer-hoisting defect, pinned on BYTES rather than only in a unit test.",
+      "wire": "{\"schema_version\":1,\"offers\":[{\"transport\":\"bittorrent\",\"infohash\":\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\"}],\"answers\":[{\"answer\":\"absent\"}]}"
+    },
+    {
+      "name": "reject_batch_response_two_locators_of_one_kind",
+      "direction": "reject",
+      "note": "MUST REJECT. One answer naming TWO `bittorrent` offers. The content behind a key has ONE identity per transport, so the second names a different blob. This is the rule that bounds the dictionary against ANSWERED keys; without it a single `Have` could legitimise all 512 entries.",
+      "wire": "{\"schema_version\":1,\"offers\":[{\"transport\":\"bittorrent\",\"infohash\":\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\"},{\"transport\":\"bittorrent\",\"infohash\":\"dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd\"}],\"answers\":[{\"answer\":\"have\",\"blake3\":\"blake3:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"offer_indices\":[0,1]}]}"
+    },
+    {
+      "name": "reject_batch_answer_absent_with_a_field",
+      "direction": "reject",
+      "note": "MUST REJECT. An `Absent` answer carrying a content identity. `Absent` is an empty STRUCT variant precisely so `deny_unknown_fields` bites; as a UNIT variant the attribute was silently inert and this wire decoded.",
+      "wire": "{\"schema_version\":1,\"offers\":[],\"answers\":[{\"answer\":\"absent\",\"blake3\":\"blake3:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"}]}"
     }
   ]
 }

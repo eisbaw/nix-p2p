@@ -149,6 +149,13 @@ const EXERCISED: &[&str] = &[
     "batch_hold_response_all_absent",
     "batch_hold_response_distinct_locators",
     "batch_hold_response_unknown_transport_slot",
+    "batch_hold_response_have_empty_offer_indices",
+    "reject_claim_known_transport_with_stray_blake3",
+    "reject_claim_known_payload_with_unknown_field",
+    "reject_batch_hold_query_unknown_field",
+    "reject_batch_response_offer_bound_to_no_answer",
+    "reject_batch_response_two_locators_of_one_kind",
+    "reject_batch_answer_absent_with_a_field",
 ];
 
 #[test]
@@ -170,11 +177,79 @@ fn every_golden_vector_is_exercised() {
     for vector in doc["vectors"].as_array().expect("array") {
         let direction = vector["direction"].as_str().expect("a direction");
         assert!(
-            direction == "both" || direction == "decode-only",
+            direction == "both" || direction == "decode-only" || direction == "reject",
             "vector {} declares an unknown direction {direction:?}",
             vector["name"]
         );
     }
+    // The reject class must be NON-EMPTY. Without it this file could only pin what
+    // we emit, so every acceptance-widening change - dropping a
+    // `deny_unknown_fields`, loosening a binding rule - passed by construction.
+    assert!(
+        doc["vectors"]
+            .as_array()
+            .expect("array")
+            .iter()
+            .filter(|v| v["direction"] == "reject")
+            .count()
+            >= 6,
+        "the must-REJECT vector class must not be emptied"
+    );
+}
+
+/// Every `reject` vector, decoded by the codec entry point its shape names. A
+/// wire we must refuse is as much part of the freeze as one we must accept, and
+/// nothing in this file could express it before.
+#[test]
+fn every_reject_vector_is_refused() {
+    for vector in golden()["vectors"].as_array().expect("array") {
+        if vector["direction"] != "reject" {
+            continue;
+        }
+        let name = vector["name"].as_str().expect("a name");
+        let bytes = vector["wire"].as_str().expect("a wire").as_bytes().to_vec();
+        let outcome: Result<(), String> = if name.starts_with("reject_claim") {
+            decode_claim(&bytes)
+                .map(|_| ())
+                .map_err(|e| format!("{e:?}"))
+        } else if name.starts_with("reject_batch_hold_query") {
+            decode_batch_hold_query(&bytes)
+                .map(|_| ())
+                .map_err(|e| format!("{e:?}"))
+        } else {
+            // Every remaining reject vector is a batch RESPONSE with one answer.
+            decode_batch_hold_response(&bytes, 1)
+                .map(|_| ())
+                .map_err(|e| format!("{e:?}"))
+        };
+        assert!(
+            outcome.is_err(),
+            "golden vector `{name}` must be REFUSED and was accepted: {}",
+            vector["note"].as_str().unwrap_or("")
+        );
+    }
+}
+
+#[test]
+fn batch_hold_response_have_empty_offer_indices_is_pinned() {
+    // An empty `offer_indices` is legal and reachable, and no other vector has
+    // one - so `skip_serializing_if` on that field changed only THESE bytes.
+    let response = BatchHoldResponse {
+        schema_version: QUERY_SCHEMA_VERSION,
+        offers: vec![],
+        answers: vec![BatchHoldAnswer::Have {
+            blake3: blake3_id(),
+            offer_indices: vec![],
+        }],
+    };
+    let expected = wire("batch_hold_response_have_empty_offer_indices");
+    assert_eq!(
+        String::from_utf8(encode_batch_hold_response(&response).expect("encode")).unwrap(),
+        expected,
+        "the empty-offer_indices encoding drifted"
+    );
+    let decoded = decode_batch_hold_response(expected.as_bytes(), 1).expect("decode");
+    assert_eq!(decoded, response);
 }
 
 // ---- the FROZEN four, pinned in both directions ----------------------------

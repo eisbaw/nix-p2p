@@ -241,8 +241,17 @@ const KNOWN_PAYLOAD_KINDS: &[&str] = &["whole_nar"];
 /// wave-2 kind; `CastoreRoot` (Candidate C chunked) lands here as a new variant
 /// later. A claim whose payload kind is NOT known decodes to `payload == None`
 /// (inert, no usable content id) - never an error, never carried.
+/// STRICT: an unknown FIELD inside a KNOWN kind is rejected. That is a different
+/// rule from the tolerate-but-drop applied to an unknown KIND, and both are
+/// deliberate - a kind we do not understand is inert, but a kind we DO understand
+/// must mean exactly what we think it means. Without this, a payload could carry a
+/// second identity-like field beside its `blake3` and be silently accepted, which
+/// is the two-blob-claim class the freeze closed for `Claim` itself and left open
+/// one type down. Struct variants only, so `deny_unknown_fields` is honoured (it
+/// is silently inert on unit variants - see `BatchHoldAnswer`).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
+#[serde(deny_unknown_fields)]
 pub enum KnownPayload {
     /// A whole raw-NAR blob, addressed by the claim's single BLAKE3 (the
     /// universal content identity, `blake3:<hex>` on the wire).
@@ -292,8 +301,22 @@ const KNOWN_TRANSPORT_TAGS: &[&str] = &["iroh", "bittorrent"];
 /// The transports THIS build can represent. Only `Iroh` has a fetch backend
 /// (task-38); `BitTorrent` is representable to prove the schema admits a 2nd
 /// transport without a network fork. Each is a PURE LOCATOR (no content digest).
+/// STRICT, for the same reason as [`KnownPayload`] and with more exposure: a
+/// `KnownTransport` sits inside the batch offer DICTIONARY, so an accepted junk
+/// field there is a padding channel bounded only by the 64 KiB wire gate, and an
+/// `also_held: ["sha256:..."]` was accepted on the wire (dropped, but accepted) by
+/// the very message type whose docs say no field can name an unasked key.
+///
+/// THE TRADE-OFF, STATED: this tightens what the FROZEN `Claim.transports` and
+/// `HoldAnswer::Have.offers` accept - a v1 wire carrying an extra field inside a
+/// KNOWN transport used to decode and now does not. It is not a change to
+/// anything we EMIT (the golden encoding vectors are byte-identical), and it is
+/// consistent with the existing rule that a MALFORMED known transport is a hard
+/// error rather than a dropped one. Unknown transport KINDS are still tolerated
+/// and dropped; that is the forward-compatibility seam and it is untouched.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "transport", rename_all = "snake_case")]
+#[serde(deny_unknown_fields)]
 pub enum KnownTransport {
     /// iroh whole-blob (Candidate B, FIRST priority). The locator is the holder
     /// `NodeId`; the blob to fetch is the claim/Have's single `blake3`.
@@ -1467,8 +1490,18 @@ mod tests {
 
     #[test]
     fn a_stray_offer_blake3_cannot_introduce_a_second_identity() {
-        // A known iroh offer with a DIFFERENT stray blake3: the typed offer has no
-        // digest field, so it is ignored and the claim still has ONE identity.
+        // A KNOWN iroh offer with a DIFFERENT stray blake3.
+        //
+        // This used to DECODE, on the reasoning that the typed offer has no digest
+        // field so the stray was ignored and the claim still had one identity.
+        // True of this build, and not a property of the wire: the bytes carried
+        // two identity-like values and were accepted, so two implementations could
+        // disagree about what they meant. Round 7 made `KnownTransport` strict, so
+        // the wire is now REFUSED outright - a stronger guarantee than "ignored",
+        // and the same argument `deny_unknown_fields` on `Claim` already made one
+        // level up. This is a decoder-acceptance change on a frozen type; it
+        // changes nothing we EMIT, and it is pinned in the golden file as a
+        // must-REJECT vector.
         let wire = serde_json::json!({
             "schema_version": CLAIM_SCHEMA_VERSION,
             "key": KEY_HEX,
@@ -1478,12 +1511,27 @@ mod tests {
                 { "transport": "iroh", "node": NODE_A_HEX, "blake3": OTHER_BLAKE3_HEX }
             ]
         });
-        let claim = decode_claim(&serde_json::to_vec(&wire).unwrap()).expect("decode");
+        assert!(
+            matches!(
+                decode_claim(&serde_json::to_vec(&wire).unwrap()),
+                Err(ClaimCodecError::Malformed(_))
+            ),
+            "a known transport carrying a second identity-like field must be refused"
+        );
+        // The CONTROL: the same claim without the stray field still decodes, so
+        // this is strictness and not breakage.
+        let clean = serde_json::json!({
+            "schema_version": CLAIM_SCHEMA_VERSION,
+            "key": KEY_HEX,
+            "payload": { "kind": "whole_nar", "blake3": BLAKE3_HEX },
+            "holders": [NODE_A_HEX],
+            "transports": [ { "transport": "iroh", "node": NODE_A_HEX } ]
+        });
+        let claim = decode_claim(&serde_json::to_vec(&clean).unwrap()).expect("decode");
         assert_eq!(claim.content_id(), Some(&blake3_id()));
         assert_eq!(
             claim.transports,
-            vec![KnownTransport::Iroh { node: node_a() }],
-            "the stray offer blake3 is not part of the typed offer - no 2nd identity"
+            vec![KnownTransport::Iroh { node: node_a() }]
         );
     }
 
