@@ -960,6 +960,20 @@ response to a failure is a `schema_version` bump or a revert, never an
 updated vector. The one legitimate re-pin is the planned move off the
 JSON draft codec.
 
+That first version had a HOLE, found by a cross-model review and fixed in
+the same task: every vector populated its optional fields, so a mutation
+that only changes the DEFAULTED encoding survived it. Adding
+`skip_serializing_if = "Vec::is_empty"` to `HoldAnswer::Have::offers`
+(which rewrites the legal bytes of an empty-offers Have) and removing
+`serde(default)` (which changes what we still accept) both left all seven
+tests green. The file now also carries an EMPTY-value encoding vector
+wherever an optional field exists, `decode-only` vectors for legal inputs
+we accept but never emit, and the RESERVED v2 fields POPULATED — those
+exist so v2 needs no wire break, so `relay.blob`, `signatures[].key_id`
+and `signatures[].sig` are part of the freeze and were previously
+renameable with the whole suite green. `every_golden_vector_is_exercised`
+stops the data file and the assertions from drifting apart.
+
 **Batched hold-query (task-91), added ALONGSIDE the frozen types.**
 `BatchHoldQuery`/`BatchHoldAnswer`/`BatchHoldResponse` ask about a whole
 closure in one round trip. Two properties are gated rather than
@@ -970,13 +984,35 @@ described:
   answer is positional over keys the asker named and carries no keys of
   its own — the golden bytes contain no `sha256:` string at all — and
   `daemon/tests/no_enumeration.rs` makes it structural: across
-  `claim`/`availability`/`discovery`, plural holdings out requires named
-  keys in. That guard proves it bites against a synthetic
-  `all_holdings() -> Vec<NarHashKey>`.
+  `claim`/`availability`/`discovery` — three modules, and NO others — a
+  plural holdings return requires named keys in its parameters. That
+  guard proves it bites against a synthetic
+  `all_holdings() -> Vec<NarHashKey>` AND against the bypass a
+  cross-model review actually built: a no-argument method returning the
+  WRAPPER type `BatchHoldResponse`, which carries a whole vector of
+  holdings without a container in its return type. Exemptions are scoped
+  `(file, name)`, so an argument written for `availability.rs::load`
+  cannot be inherited by a `load` added to `discovery.rs`.
+- **Locators bind to their key.** A transport offer is not always
+  peer-scoped: iroh's is a `NodeId` (per PEER), BitTorrent's is an
+  infohash (per CONTENT). The response therefore carries an offer
+  DICTIONARY and each `Have` names its own entries BY INDEX. Enforced at
+  both boundaries: every index in range, no index repeated inside one
+  answer, and every dictionary entry referenced by at least one `Have` —
+  so an all-`Absent` response cannot carry a locator at all. Dropping an
+  unknown transport kind compacts and RE-INDEXES together, which is why
+  `BatchHoldResponse` has no derived `Deserialize`:
+  `decode_batch_hold_response` is the only way to build one from bytes.
 - **Bounded**: `MAX_BATCH_HOLD_KEYS = 256`, chosen against the 64 KiB
-  wire gate rather than beside it (a full query is ~16 KiB, a full
-  all-`Have` response ~26 KiB) and asserted, so raising it to 1024 fails
-  the build. Over-cap is rejected, never truncated.
+  wire gate rather than beside it — measured, not estimated: a full query
+  is 15 901 B, a full all-`Have` response sharing one iroh locator is
+  31 114 B, and the same response with a distinct per-content locator for
+  every key is 58 910 B (~10% spare, the honest limit). Raising the cap
+  to 1024 fails the build. Over-cap is rejected, never truncated — on
+  encode, on decode, in the responder, and in the compatibility shim.
+  The cap is applied to `keys_asked` itself, so it is a property of the
+  decoder rather than a caller precondition, and every encoder gates its
+  OUTPUT size so this node cannot emit a message it would itself refuse.
 
 The measured win lives in `just discovery` (or `profile_p2p.py
 --discovery-only`), whose honesty rules — both arms must ask about the

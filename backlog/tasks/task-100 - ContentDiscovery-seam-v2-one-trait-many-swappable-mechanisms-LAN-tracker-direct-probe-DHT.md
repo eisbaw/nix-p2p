@@ -6,7 +6,7 @@ title: >-
 status: To Do
 assignee: []
 created_date: '2026-08-10 09:26'
-updated_date: '2026-08-10 12:21'
+updated_date: '2026-08-10 14:07'
 labels:
   - wave-2b
 dependencies:
@@ -77,4 +77,39 @@ rather than re-deriving it:
 * Whatever this seam returns, keep `daemon/tests/no_enumeration.rs` passing - it
   is a source-shape rule (plural holdings out requires named keys in) over
   claim/availability/discovery. Add this module to its SOURCES list.
+
+## CARRIED FORWARD from TASK-91 round 6 (the batch call shape you inherit)
+
+A TRANSPORT OFFER IS NOT ALWAYS PEER-SCOPED, and assuming it is produced a live
+bug. Iroh's locator is the holder NodeId - one value for a whole batch -
+but BitTorrent's is an infohash, which addresses one piece of CONTENT. The
+first batch response hoisted ONE offer list to the envelope and let every Have
+share it; key 2's claim silently received key 1's infohash. The fix:
+BatchHoldResponse carries an offer DICTIONARY and each Have names its own entries
+BY INDEX (claim.rs BatchHoldAnswer::Have::offer_indices), with every index in
+range, no index repeated inside one answer, and every dictionary entry referenced
+by at least one Have - so an all-Absent response cannot carry a locator at all.
+DO NOT re-introduce a response-wide offer list in any new mechanism.
+
+TWO RULES THAT COST NOTHING TO KEEP AND ARE EXPENSIVE TO RE-DISCOVER:
+  * Unknown transport kinds are tolerate-but-drop. On an INDEXED list that means
+    the decoder must keep position-preserving SLOTS, validate against the RAW
+    positions, then compact and RE-INDEX together. BatchHoldResponse deliberately
+    has no derived Deserialize so this cannot be bypassed.
+  * serde deny_unknown_fields on an internally-tagged enum is honoured for STRUCT
+    variants and SILENTLY INERT for UNIT variants. Any new answer enum must use
+    empty struct variants (`Absent {}`), which emit identical bytes.
+
+BOUNDS ARE TYPE INVARIANTS, NOT CALLER PRECONDITIONS: the cap is applied to the
+caller-supplied asked-count itself, the responder hard-checks it (it was a
+debug_assert, i.e. absent in release), the compatibility shim checks it before
+issuing any probe, and every encoder gates its OUTPUT length so this node cannot
+emit a message it would itself refuse.
+
+ALSO INHERITED, and it is a defect not a style note: DirectDiscovery::resolve_many
+has NO TOTAL DEADLINE (per-probe only; 8 peers x 4 chunks x 5 s = ~31 min worst
+case) and it CONTRADICTS the per-peer-fault rule query_batch itself documents.
+Filed as TASK-106 and deliberately not fixed inside task-91's fix cycle. This task
+re-shapes the same call - do not inherit the assumption that a per-probe bound is
+a bound.
 <!-- SECTION:NOTES:END -->

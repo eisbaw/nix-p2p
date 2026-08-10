@@ -6,6 +6,7 @@ title: >-
 status: To Do
 assignee: []
 created_date: '2026-08-09 21:01'
+updated_date: '2026-08-10 14:08'
 labels:
   - wave-2b
 dependencies: []
@@ -28,3 +29,43 @@ Note the addressing mismatch that makes this non-trivial: our addressed unit is 
 - [ ] #3 Both transports coexist: a claim carrying both an iroh and a BitTorrent offer resolves via either, and the registry's selection is deterministic and tested
 - [ ] #4 Honest limits: what BitTorrent adds that iroh does not (and vice versa) - swarm size, NAT behaviour, tracker/DHT dependency, and whether piece-level integrity buys anything given our whole-NAR BLAKE3 gate
 <!-- AC:END -->
+
+## Implementation Notes
+
+<!-- SECTION:NOTES:BEGIN -->
+## CARRIED FORWARD from TASK-91 round 6 (the batch call shape you inherit)
+
+A TRANSPORT OFFER IS NOT ALWAYS PEER-SCOPED, and assuming it is produced a live
+bug. Iroh's locator is the holder NodeId - one value for a whole batch -
+but BitTorrent's is an infohash, which addresses one piece of CONTENT. The
+first batch response hoisted ONE offer list to the envelope and let every Have
+share it; key 2's claim silently received key 1's infohash. The fix:
+BatchHoldResponse carries an offer DICTIONARY and each Have names its own entries
+BY INDEX (claim.rs BatchHoldAnswer::Have::offer_indices), with every index in
+range, no index repeated inside one answer, and every dictionary entry referenced
+by at least one Have - so an all-Absent response cannot carry a locator at all.
+DO NOT re-introduce a response-wide offer list in any new mechanism.
+
+TWO RULES THAT COST NOTHING TO KEEP AND ARE EXPENSIVE TO RE-DISCOVER:
+  * Unknown transport kinds are tolerate-but-drop. On an INDEXED list that means
+    the decoder must keep position-preserving SLOTS, validate against the RAW
+    positions, then compact and RE-INDEX together. BatchHoldResponse deliberately
+    has no derived Deserialize so this cannot be bypassed.
+  * serde deny_unknown_fields on an internally-tagged enum is honoured for STRUCT
+    variants and SILENTLY INERT for UNIT variants. Any new answer enum must use
+    empty struct variants (`Absent {}`), which emit identical bytes.
+
+BOUNDS ARE TYPE INVARIANTS, NOT CALLER PRECONDITIONS: the cap is applied to the
+caller-supplied asked-count itself, the responder hard-checks it (it was a
+debug_assert, i.e. absent in release), the compatibility shim checks it before
+issuing any probe, and every encoder gates its OUTPUT length so this node cannot
+emit a message it would itself refuse.
+
+THIS TASK IS THE REASON C1 WAS A BUG AND NOT A STYLE POINT: BitTorrent's locator
+is the thing that is per-content. When the backend lands, a peer answering a full
+256-key batch with iroh + a distinct infohash per key measures 58 910 B against
+the 65 536 B pre-parse gate - it FITS, with ~10% spare, only because the offers
+are indexed. The same answer with the offers inlined per Have is ~79 912 B, i.e.
+UNSENDABLE. If this task ever needs a third per-content locator kind, re-measure
+before assuming the cap still holds.
+<!-- SECTION:NOTES:END -->
