@@ -6,7 +6,7 @@ title: >-
 status: To Do
 assignee: []
 created_date: '2026-08-09 21:01'
-updated_date: '2026-08-10 07:25'
+updated_date: '2026-08-10 07:27'
 labels:
   - wave-2b
 dependencies:
@@ -39,49 +39,43 @@ Honest scale caveat: TESTING.md S5 explicitly excludes emergent network effects 
 ## Implementation Notes
 
 <!-- SECTION:NOTES:BEGIN -->
-## Why a DHT is the FALLBACK layer, not the primary path (owner question 2026-08-10)
+## CORRECTION 2026-08-10 (owner pushback: 'iroh provides libs for content discovery' / 'why cant we afford DHT publication')
 
-A DHT is the textbook answer to 'who has hash X' and it stays in scope - but the arithmetic says it
-cannot carry the COMMON case, for two independent reasons. Record these before the spike so it is
-not re-litigated.
+Two things I got wrong above. Both correct the record; do NOT design from scratch.
 
-(1) A DHT MAKES LOOKUP CHEAP BY MAKING PUBLICATION EXPENSIVE, and publication is our expensive side.
-    To be findable you must ANNOUNCE. Our node holds 108,401 paths. Verified against the specs:
-      * BEP44 values are capped at 1000 BYTES and entries expire in ~1-2h, requiring periodic
-        re-put. 108k paths republished hourly is ~30 puts/second sustained, forever, per node - and
-        each put needs an iterative closest-node lookup (~8 round trips), so ~240 RTT/s of DHT
-        traffic per idle node. That is not a tuning problem.
-      * announce_peer/get_peers has the RIGHT multi-writer set semantics (many holders per infohash)
-        but its value type is fixed to IP+port and cannot carry an iroh NodeId - so NAT'd nodes
-        cannot be providers (n0's own finding). BEP44 has arbitrary values but the WRONG write
-        semantics: immutable items are keyed by hash-of-value, mutable items by publisher pubkey.
-        Neither gives 'many independent writers append to one content-derived key'.
-      => mainline has exactly one multi-writer set primitive and its value type is unusable for us.
-         This is a specific impasse, not a preference. The spike must confirm or refute it FIRST.
-      * And announcing 108k paths publishes our entire holdings list to a global network - the
-        privacy tension already recorded above, at its worst.
-    Contrast: the probe path (TASK-91) costs work proportional to what is actually REQUESTED and
-    zero for everything else. Announce-on-demand exists precisely because publication does not scale.
+CORRECTION 1 - IROH DOES SHIP CONTENT-DISCOVERY CRATES. The claim 'none of iroh's mechanisms do
+content discovery' is true only of CORE iroh's discovery module (node addresses). Adjacent crates
+exist and one is current:
+  * iroh-mainline-content-discovery 0.6.0, released 2026-06-20, actively developed. TWO-TIER:
+    query_dht() 'queries the mainline DHT for trackers for the given content, then queries each
+    tracker for peers'. Provider sets live in TRACKERS; the DHT stores tracker locations. Its
+    TrackerId is 'either a node id or an address', which is how it bridges mainline's IP:port to
+    iroh NodeIds - i.e. they did NOT solve NodeId-in-mainline, they routed around it.
+  * iroh-content-discovery - protocol + client + tracker + CLI (iroh-experiments).
+  * iroh-dht-experiment - a KADEMLIA DHT over iroh connections, 32-byte keyspace, maps BLAKE3
+    hashes -> providers, responses carry NodeAddr. This solves the NodeId problem NATIVELY because
+    the DHT nodes are iroh nodes. Explicitly NOT production ready.
+  => The spike is now mostly EVALUATION, not design: try iroh-mainline-content-discovery first
+     (real, current, maintained), and read iroh-dht-experiment for the native-keyspace design.
+     Only build something ourselves if both are shown unsuitable, and say why.
 
-(2) DHT LOOKUP IS SLOWER THAN JUST FETCHING THE THING. TESTING.md's S8 row already flags '1-4s DHT
-    latency leaks into every build'. The MEDIAN NAR on the owner's store is 1.44 MiB; cache.nixos.org
-    sustained ~21 MB/s in task-63's probe, so the median NAR downloads in ~70 ms. A 1-4 s DHT lookup
-    is 15-60x the cost of not bothering. For the median path a DHT lookup is strictly worse than
-    going to the CDN, and a 200-path closure makes it catastrophic unless fully parallel/prefetched.
+CORRECTION 2 - 'CANNOT AFFORD PUBLICATION' WAS OVERSTATED, and the note above should be read with
+this. The 30 puts/sec figure assumed the WORST granularity: all 108,401 paths, per-path, hourly.
+That case is infeasible. Other granularities are not:
+    every store path              108,401 keys   ~30 puts/sec   infeasible
+    recently fetched/served only   ~2-10k keys   ~0.5-3/sec     fine
+    one key per (rev, system)      ~1 key        trivial
+  A BitTorrent seeder announcing a few thousand infohashes does exactly this routinely. So the
+  honest statement is: PER-PATH PUBLICATION OF A WHOLE STORE is infeasible; publication at the
+  right GRANULARITY is cheap. This makes TASK-93 (closure/revision correlation) load-bearing for a
+  new reason - it is the granularity fix that makes DHT publication affordable, not merely a
+  peer-ordering prior.
 
-WHERE A DHT IS STILL RIGHT, and why this task keeps it: the COLD, GLOBAL, RARE case - a node with no
-peer set, or content no known peer has. That is exactly the long tail the PRD already concedes is
-where a CDN is strong and swarms are weak. So the DHT earns its place as the fallback that makes
-bootstrapping possible, not as the thing every build waits on.
-
-RESULTING LAYERING (cheapest first; each layer only handles what the one above missed):
-  0. node discovery: iroh's own, incl. mDNS on LAN (TASK-89)
-  1. peer set: gossip / config / LAN (TASK-74)
-  2. local answer, zero round trips: set digest over PUBLIC paths (TASK-92)
-  3. one round trip per closure per peer: batched hold-query (TASK-91)
-  4. peer ordering prior: closure/revision correlation (TASK-93)
-  5. cold/global fallback: THIS TASK - tracker and/or DHT, latency-tolerant because it is off the
-     hot path
-The spike should size how often layers 0-4 miss, because that miss rate is what layer 5 must serve -
-and if it is small, a tracker may beat a DHT on every axis that matters here.
+WHAT SURVIVES, and it is narrower than the note above implies. Neither point argues against a DHT;
+both argue about WHEN it is consulted and WHAT is published:
+  * LOOKUP LATENCY ON THE HOT PATH. 1-4 s lookup vs ~70 ms to fetch the median 1.44 MiB NAR from a
+    ~21 MB/s cache. So resolve OFF the critical path - inside the ~300 ms narinfo->NAR window
+    (task-35), or only after a local probe/digest missed - never in front of every substitution.
+  * PUBLISHING REVEALS HOLDINGS (the privacy tension recorded above), which is a granularity and
+    opt-out question (TASK-78), not a blocker.
 <!-- SECTION:NOTES:END -->
