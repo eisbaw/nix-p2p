@@ -6,7 +6,7 @@ title: >-
 status: To Do
 assignee: []
 created_date: '2026-08-09 21:01'
-updated_date: '2026-08-10 10:04'
+updated_date: '2026-08-10 11:26'
 labels:
   - wave-2b
 dependencies:
@@ -39,5 +39,5 @@ Honest scale caveat: TESTING.md S5 explicitly excludes emergent network effects 
 ## Implementation Notes
 
 <!-- SECTION:NOTES:BEGIN -->
-OWNER DIRECTIVE 2026-08-10: global/DHT decentralization is HIGH priority; LAN and tiered discovery are LOW priority (TASK-89 demoted). Privacy resolved by decision: a node publishes ONLY NARs already public at cache.nixos.org, which acts as the filter - filed as TASK-102 and enforced in code, not convention. Substrate choice and build are TASK-103 (own Kademlia over iroh vs mainline + identify responder). This task stays the umbrella; TASK-103 carries the work.
+GRAPH NOTE 2026-08-10: the TASK-96 -> TASK-73 dependency direction is INVERTED and the CLI cannot clear a dependency (--dep only SETS, and --dep "" is a no-op). TASK-96 (decide mainline participation) must come BEFORE this task freezes anything, not after. Read the edge as 'TASK-96 needs the research recorded in TASK-73's notes', which is already complete - not as 'TASK-73 must finish first'. When TASK-96 is picked up, treat it as UNBLOCKED. The build half of this umbrella now lives in TASK-103.
 <!-- SECTION:NOTES:END -->
