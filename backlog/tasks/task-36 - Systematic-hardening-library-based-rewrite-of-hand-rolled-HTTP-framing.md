@@ -4,10 +4,12 @@ title: Systematic hardening / library-based rewrite of hand-rolled HTTP framing
 status: To Do
 assignee: []
 created_date: '2026-08-08 19:46'
-updated_date: '2026-08-08 19:55'
+updated_date: '2026-08-10 22:58'
 labels:
   - hardening
-dependencies: []
+dependencies:
+  - TASK-113
+priority: high
 ---
 
 ## Description

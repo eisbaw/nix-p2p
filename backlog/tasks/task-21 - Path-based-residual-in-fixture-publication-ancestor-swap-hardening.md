@@ -4,11 +4,12 @@ title: Path-based residual in fixture publication (ancestor-swap hardening)
 status: To Do
 assignee: []
 created_date: '2026-08-08 06:32'
-updated_date: '2026-08-08 17:59'
+updated_date: '2026-08-10 22:58'
 labels:
   - hardening
-dependencies: []
-priority: low
+dependencies:
+  - TASK-113
+priority: high
 ---
 
 ## Description

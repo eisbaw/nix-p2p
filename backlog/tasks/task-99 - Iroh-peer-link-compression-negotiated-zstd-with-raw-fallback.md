@@ -1,17 +1,22 @@
 ---
 id: TASK-99
-title: >-
-  Compress the peer link (zstd on the stream), so a peer stops shipping 3.6x the
-  bytes upstream ships
+title: 'Iroh peer-link compression: negotiated zstd with raw fallback'
 status: To Do
 assignee: []
 created_date: '2026-08-10 09:10'
-updated_date: '2026-08-10 09:16'
+updated_date: '2026-08-10 22:54'
 labels:
   - wave-2b
 dependencies:
-  - TASK-94
+  - TASK-24
   - TASK-62
+  - TASK-89
+  - TASK-94
+  - TASK-101
+  - TASK-103
+  - TASK-114
+  - TASK-115
+  - TASK-116
 priority: high
 ---
 
@@ -38,10 +43,12 @@ MEASURE, DO NOT ASSUME: zstd on nar data may not reach xz's ratio. Report the ac
 - [ ] #2 Achieved ratio and CPU cost measured on real NAR data across >=5 sizes, reported against the 0.278x upstream baseline; the net effect on end-to-end throughput is measured, not inferred from the ratio (compression CPU competes with the transport's own CPU-bound path, PRD risk 11)
 - [ ] #3 Gate-2 still holds: nix accepts the result byte-identically, and a corrupt or truncated compressed stream still FAILS rather than yielding a short nar - proven by mutation at the new boundary
 - [ ] #4 TASK-94's peer-wins inequality is re-evaluated with compression ON, and the README's speedup figures are re-measured or withdrawn - the current ones were taken against an uncompressed fixture upstream and overstate the peer path
+- [ ] #5 Codec/version is negotiated explicitly per connection; raw remains available, mixed-version peers interoperate, and unsupported codec negotiation falls back to raw or upstream with a named reason.
+- [ ] #6 Decode is streaming and bounded by signed NarSize, zstd window, CPU/time and memory limits; decompression bombs, corruption and truncation fail closed with bounded resource use.
 <!-- AC:END -->
 
 ## Implementation Notes
 
 <!-- SECTION:NOTES:BEGIN -->
-ORDERING (orchestrator, 2026-08-10): this is the FIRST thing to build. Nothing about peer-vs-cache performance is measurable until it lands, and every published speedup figure is invalid until AC#4 re-measures them. TASK-94 measures the problem; this fixes it; TASK-67 (parallel/striped fetch) is only worth pricing afterwards, because four slow peers only add up to a CDN once each peer stops shipping 3.6x the bytes. Owner's plain-language summary of the sequence: compress the wire -> turn on LAN discovery (TASK-89) -> re-measure honestly -> multi-peer fetch -> only then decide internet-scale discovery.
+Authoritative wave-2c order: operational Iroh node/content discovery (TASK-89/101/103/116) and authenticated HTTPS land first; this task then adds negotiated Iroh zstd; TASK-87/88 exercise raw and compressed Iroh; comparative raw Stage A is TASK-125; BitTorrent starts only at TASK-117/75. Raw fallback remains mandatory.
 <!-- SECTION:NOTES:END -->

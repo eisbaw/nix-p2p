@@ -4,13 +4,13 @@ title: 'testproxy: single-flight concurrent same-path cache misses'
 status: To Do
 assignee: []
 created_date: '2026-08-08 07:31'
-updated_date: '2026-08-08 17:59'
+updated_date: '2026-08-10 22:36'
 labels:
   - testproxy
   - follow-up
   - wave-hardening
 dependencies: []
-priority: low
+priority: high
 ---
 
 ## Description

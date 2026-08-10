@@ -4,13 +4,13 @@ title: 'Narinfo disk cache: bounds/eviction + restart-scan cost'
 status: To Do
 assignee: []
 created_date: '2026-08-08 11:24'
-updated_date: '2026-08-08 17:59'
+updated_date: '2026-08-10 22:35'
 labels:
   - wave1-followup
   - daemon
   - hardening
 dependencies: []
-priority: medium
+priority: high
 ---
 
 ## Description

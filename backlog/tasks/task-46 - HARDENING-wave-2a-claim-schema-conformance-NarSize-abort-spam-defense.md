@@ -4,12 +4,17 @@ title: 'HARDENING (wave-2a): claim-schema conformance + NarSize-abort spam defen
 status: To Do
 assignee: []
 created_date: '2026-08-08 20:13'
-updated_date: '2026-08-09 23:07'
+updated_date: '2026-08-10 22:36'
 labels:
   - hardening
 dependencies:
   - TASK-41
-  - TASK-44
+  - TASK-51
+  - TASK-53
+  - TASK-104
+  - TASK-110
+  - TASK-114
+priority: high
 ---
 
 ## Description

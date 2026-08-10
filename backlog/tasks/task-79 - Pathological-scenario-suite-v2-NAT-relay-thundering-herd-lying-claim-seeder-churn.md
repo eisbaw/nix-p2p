@@ -6,12 +6,17 @@ title: >-
 status: To Do
 assignee: []
 created_date: '2026-08-09 21:02'
-updated_date: '2026-08-09 22:10'
+updated_date: '2026-08-10 22:37'
 labels:
   - wave-2b
 dependencies:
+  - TASK-23
   - TASK-43
   - TASK-66
+  - TASK-89
+  - TASK-118
+  - TASK-125
+priority: high
 ---
 
 ## Description
@@ -75,4 +80,6 @@ ORACLES AVAILABLE TO YOU, all machine-readable on the holder's stdout:
 regenerated / declined_too_large / declined_busy / declined_unknown /
 declined_supply_failed), `IROH-STORE-RESIDENT` (what it holds NOW - not VmHWM),
 `IROH-SERVE-WINDOW` (per-serve intervals on the holder's clock).
+
+For Stage B, apply each pathology to both backends where the mechanism exists and report backend-specific unsupported cells; do not assume an Iroh failure mode maps to BitTorrent.
 <!-- SECTION:NOTES:END -->

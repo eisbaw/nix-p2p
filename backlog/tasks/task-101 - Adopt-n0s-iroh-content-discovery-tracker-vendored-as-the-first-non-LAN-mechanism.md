@@ -6,11 +6,15 @@ title: >-
 status: To Do
 assignee: []
 created_date: '2026-08-10 09:27'
-updated_date: '2026-08-10 14:07'
+updated_date: '2026-08-10 22:44'
 labels:
   - wave-2b
 dependencies:
+  - TASK-82
+  - TASK-89
   - TASK-100
+  - TASK-102
+  - TASK-115
 priority: high
 ---
 
@@ -46,6 +50,8 @@ Slot it behind TASK-100's seam as one mechanism among several; it must not becom
 - [ ] #3 It is one mechanism behind the TASK-100 seam, not a special case: with the tracker stopped, resolution reports UNAVAILABLE and the build falls back to upstream; bites by mutation (a test fails if a dead tracker reads as a clean miss)
 - [ ] #4 The announce verification (random 2 KiB blake3 chunk) is retained and shown to bite: a node announcing content it does not have is rejected at the probe - this closes TASK-90 or explicitly supersedes it, say which
 - [ ] #5 Honest limits recorded: no default tracker (we run one), no DHT announce, and what our exposure is if upstream abandons the experiment
+- [ ] #6 The tracker is operable as a configured service with health, rate/work limits, restart persistence and explicit endpoint ownership; daemon restart preserves offers and a tracker outage remains visible.
+- [ ] #7 The end-to-end proof supplies no peer address, claim or per-content locator; all currently known transport offers round-trip exactly. Unknown future-offer byte preservation is explicitly deferred to TASK-55 once real relay/storage paths exist.
 <!-- AC:END -->
 
 ## Implementation Notes

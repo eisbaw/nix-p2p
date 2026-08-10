@@ -4,11 +4,14 @@ title: Set-digest exchange (Bloom/GCS) so most content lookups need ZERO round t
 status: To Do
 assignee: []
 created_date: '2026-08-10 07:24'
-updated_date: '2026-08-10 09:29'
+updated_date: '2026-08-10 22:58'
 labels:
   - wave-2b
+  - deferred-post-holdout
 dependencies:
   - TASK-91
+  - TASK-124
+priority: low
 ---
 
 ## Description

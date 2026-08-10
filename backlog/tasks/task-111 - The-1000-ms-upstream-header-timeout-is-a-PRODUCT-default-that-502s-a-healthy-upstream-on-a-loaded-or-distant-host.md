@@ -6,10 +6,12 @@ title: >-
 status: To Do
 assignee: []
 created_date: '2026-08-10 20:30'
-updated_date: '2026-08-10 20:31'
+updated_date: '2026-08-10 22:55'
 labels: []
 dependencies:
+  - TASK-33
   - TASK-109
+priority: high
 ---
 
 ## Description
@@ -32,9 +34,9 @@ EVIDENCE TO GATHER FIRST - do not change the constant without it: measure real h
 
 ## Acceptance Criteria
 <!-- AC:BEGIN -->
-- [ ] #1 The 1000 ms connect and header deadlines are justified against MEASURED real-upstream header latency, or changed to a value that is
-- [ ] #2 The decision explicitly separates connect_timeout from header_timeout rather than treating them as one number
-- [ ] #3 connect_timeout is either made configurable like header_timeout, or its fixedness is justified in a comment
-- [ ] #4 The interaction with the known non-composition across a daemon chain (TESTING.md task-33 note) is stated
-- [ ] #5 If the default changes, the e2e boundary pin and any depth/fault matrix expectations are re-derived, not assumed unchanged
+- [ ] #1 The decision explicitly separates connect_timeout from header_timeout rather than treating them as one number
+- [ ] #2 connect_timeout is either made configurable like header_timeout, or its fixedness is justified in a comment
+- [ ] #3 The interaction with the known non-composition across a daemon chain (TESTING.md task-33 note) is stated
+- [ ] #4 If the default changes, the e2e boundary pin and any depth/fault matrix expectations are re-derived, not assumed unchanged
+- [ ] #5 At least 100 authenticated-HTTPS observations in each idle, loaded and WAN/RTT profile report connect/header distributions; chosen numeric defaults are recorded, replay yields zero timeout-induced 502s for those healthy observations, and a response delayed beyond the configured bound fails within 10% of that bound.
 <!-- AC:END -->

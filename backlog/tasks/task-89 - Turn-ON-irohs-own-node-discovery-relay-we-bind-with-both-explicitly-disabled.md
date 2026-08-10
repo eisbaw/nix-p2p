@@ -6,12 +6,14 @@ title: >-
 status: To Do
 assignee: []
 created_date: '2026-08-10 07:09'
-updated_date: '2026-08-10 10:04'
+updated_date: '2026-08-10 23:06'
 labels:
   - wave-2b
 dependencies:
-  - TASK-39
-priority: low
+  - TASK-96
+  - TASK-114
+  - TASK-115
+priority: high
 ---
 
 ## Description
@@ -38,8 +40,9 @@ Keep the current no-discovery/no-relay mode as an explicit TEST profile - the e2
 
 ## Acceptance Criteria
 <!-- AC:BEGIN -->
-- [ ] #1 Node discovery and relay are configurable per-profile: the deterministic test profile keeps them OFF by default, and a deployment profile can enable mDNS-local, DNS/pkarr and/or mainline address lookup independently
-- [ ] #2 LAN case demonstrated: two daemons on the same network find each other and complete a peer-served nix build with NO address passed on the command line (only mDNS-like local discovery enabled)
-- [ ] #3 Any reliance on n0-run infrastructure (the default iroh-dns-server) is a deliberate, documented, switchable choice - stated in the README's honest-limits, not inherited silently
-- [ ] #4 Whichever mechanisms are enabled, what each one PUBLISHES about this node is written down (see the privacy tension recorded on TASK-73: announcing is not the same as answering yes/no)
+- [ ] #1 LAN case demonstrated: two daemons on the same network find each other and complete a peer-served nix build with NO address passed on the command line (only mDNS-like local discovery enabled)
+- [ ] #2 Any reliance on n0-run infrastructure (the default iroh-dns-server) is a deliberate, documented, switchable choice - stated in the README's honest-limits, not inherited silently
+- [ ] #3 Node discovery and relay are configurable per-profile: the deterministic test profile keeps them OFF by default; deployment profiles can independently enable mDNS-local and DNS/pkarr, and can enable Mainline address lookup only if TASK-96 approves it. If TASK-96 rejects Mainline, status/capability output records evidenced unsupported and the build has no Mainline dependency.
+- [ ] #4 For every enabled mechanism, documentation states exactly what it publishes about this node; announcing is distinguished from answering a bounded content yes/no query.
+- [ ] #5 NodeId remains stable across restart via TASK-115, and direct/hole-punched/relay selection plus discovery source is operator-visible; a no-address-flags restart scenario still reconnects.
 <!-- AC:END -->

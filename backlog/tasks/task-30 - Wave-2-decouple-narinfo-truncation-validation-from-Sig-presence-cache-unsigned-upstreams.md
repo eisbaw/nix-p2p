@@ -6,11 +6,13 @@ title: >-
 status: To Do
 assignee: []
 created_date: '2026-08-08 11:24'
-updated_date: '2026-08-08 17:59'
+updated_date: '2026-08-10 22:58'
 labels:
   - wave2
   - daemon
-dependencies: []
+  - deferred-post-holdout
+dependencies:
+  - TASK-124
 priority: low
 ---
 

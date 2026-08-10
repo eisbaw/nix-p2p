@@ -6,14 +6,16 @@ title: >-
 status: To Do
 assignee: []
 created_date: '2026-08-09 14:00'
-updated_date: '2026-08-10 09:30'
+updated_date: '2026-08-10 22:57'
 labels:
   - performance
   - transport
+  - deferred-post-holdout
 dependencies:
-  - TASK-99
   - TASK-63
-priority: medium
+  - TASK-99
+  - TASK-124
+priority: low
 ---
 
 ## Description

@@ -3,14 +3,16 @@ id: TASK-73
 title: >-
   DHT-authoritative claim resolution (the discovery gap: peers cannot find each
   other)
-status: To Do
+status: Done
 assignee: []
 created_date: '2026-08-09 21:01'
-updated_date: '2026-08-10 11:26'
+updated_date: '2026-08-10 22:57'
 labels:
   - wave-2b
+  - superseded
 dependencies:
-  - TASK-89
+  - TASK-40
+  - TASK-47
 ---
 
 ## Description
@@ -41,3 +43,9 @@ Honest scale caveat: TESTING.md S5 explicitly excludes emergent network effects 
 <!-- SECTION:NOTES:BEGIN -->
 GRAPH NOTE 2026-08-10: the TASK-96 -> TASK-73 dependency direction is INVERTED and the CLI cannot clear a dependency (--dep only SETS, and --dep "" is a no-op). TASK-96 (decide mainline participation) must come BEFORE this task freezes anything, not after. Read the edge as 'TASK-96 needs the research recorded in TASK-73's notes', which is already complete - not as 'TASK-73 must finish first'. When TASK-96 is picked up, treat it as UNBLOCKED. The build half of this umbrella now lives in TASK-103.
 <!-- SECTION:NOTES:END -->
+
+## Final Summary
+
+<!-- SECTION:FINAL_SUMMARY:BEGIN -->
+Closed by supersession on 2026-08-11, not by feature completion. The original umbrella mixed discovery decisions and implementation and contained an inverted dependency. Ownership is now split across TASK-96 (Mainline/privacy decision), TASK-100 (mechanism seam), TASK-103 (global announced-content DHT), TASK-116 (bounded unannounced-content query) and TASK-115/TASK-89 (dialable Iroh nodes).
+<!-- SECTION:FINAL_SUMMARY:END -->

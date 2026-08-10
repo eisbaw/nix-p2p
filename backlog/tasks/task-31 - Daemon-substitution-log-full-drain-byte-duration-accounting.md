@@ -4,10 +4,11 @@ title: 'Daemon substitution log: full-drain byte + duration accounting'
 status: To Do
 assignee: []
 created_date: '2026-08-08 11:35'
-updated_date: '2026-08-08 17:59'
+updated_date: '2026-08-10 22:27'
 labels:
   - journey-finding
 dependencies: []
+priority: high
 ---
 
 ## Description

@@ -7,18 +7,18 @@ title: >-
 status: To Do
 assignee: []
 created_date: '2026-08-10 08:43'
-updated_date: '2026-08-10 11:25'
+updated_date: '2026-08-10 22:58'
 labels:
   - wave-2b
 dependencies:
-  - TASK-73
+  - TASK-114
 priority: high
 ---
 
 ## Description
 
 <!-- SECTION:DESCRIPTION:BEGIN -->
-This is the irreversibility gate in front of TASK-73's frozen key-derivation surface. It does not duplicate TASK-73's evaluation of iroh-mainline-content-discovery 0.6.0 / iroh-dht-experiment; it answers three questions that must be settled BEFORE a key derivation is committed, two of which are owner decisions rather than engineering defaults.
+This is the owner/privacy decision gate in front of TASK-89's optional Mainline address lookup and TASK-126's global content-DHT freeze. It supplies evidence to TASK-126 rather than implementing or freezing a key derivation itself; it answers three questions that must be settled BEFORE a key derivation is committed, two of which are owner decisions rather than engineering defaults.
 
 FACT 1 — THE DEPENDENCY IS NEW, AND ITS DEFAULT ENROLLS USERS IN BITTORRENT INFRASTRUCTURE. `grep -c 'pkarr\|mainline' Cargo.lock` returns 0. We are on iroh 1.0.3, whose iroh-dns pulls hickory-resolver + simple-dns; iroh's mainline usage lives in a separate crate (n0-mainline). So adding the `mainline` crate (pubky/mainline, 8.x) is a new ~6.6k-LOC DHT dependency, and running two mainline implementations in one process if iroh's own DHT discovery is later enabled (TASK-89). Critically, pubky/mainline's DEFAULT is Adaptive mode: client-only, then automatic promotion to SERVER after 15 minutes with a publicly reachable address, at which point the node stores and serves peer records for arbitrary third-party torrent infohashes. Shipped in a NixOS module that is opt-out-only enrollment of every reachable nix-p2p user as BitTorrent DHT infrastructure — an incident on a corporate, university or CI network, and an owner decision.
 
@@ -36,8 +36,8 @@ OUTPUT is a decision record with measurements attached, not code we keep.
 - [ ] #1 A two-host experiment where host A announces N keys via the `mainline` crate and host B runs a BEP51 sample_infohashes sweep, reporting the fraction of A's key set recovered and the wall-clock time to recover it. BITE: A must derive its keys from a seed B does not have, and the harness must self-check that B had no prior knowledge — a run where B is handed the key list is vacuous and must fail its own assertion.
 - [ ] #2 Client-only mode is verified by OBSERVATION, not configuration: run for >=30 minutes with a publicly reachable address and assert zero inbound DHT queries were served, counted at the request handler. BITE: flip the same node to adaptive mode and confirm the identical assertion FAILS after the 15-minute promotion window — if the assertion passes in both modes it is not observing the promotion boundary and proves nothing.
 - [ ] #3 Announced-endpoint reachability measured over >=20 trials across two different ISPs, reporting the fraction of announced IP:port endpoints dialable by a THIRD host on a third network. BITE: the probing host must not be on the announcer's LAN or NAT — demonstrate that a same-LAN probe reports a materially higher success rate, so the number being trusted is the off-net one.
-- [ ] #4 A written decision record answering, with the above measurements attached: (a) do we ship a mainline dependency in the NixOS module at all; (b) client-only or server, and how is that enforced rather than defaulted; (c) does the get_peers lookup-side leak change TASK-78's leech-mode privacy claim, and if so what text in PRD.md's privacy invariant changes. BITE: TASK-73's key-derivation freeze carries a tracker dependency on this record; verify the edge exists and that TASK-73 cannot be marked done without it.
-- [ ] #5 The task's notes correct three factual claims currently circulating in the backlog: that `mainline`/`pkarr` are already in our dependency graph (they are not — Cargo.lock has zero occurrences), that n0 solved NodeId recovery with identify-on-announced-port (they did not), and that iroh-mainline-content-discovery 0.6.0 is recent and actively developed (crates.io dates it 2025-04-04 and upstream deleted its mainline layer weeks later). BITE: grep the backlog for those three claims and confirm each surviving occurrence is annotated.
+- [ ] #4 The task's notes correct three factual claims currently circulating in the backlog: that `mainline`/`pkarr` are already in our dependency graph (they are not — Cargo.lock has zero occurrences), that n0 solved NodeId recovery with identify-on-announced-port (they did not), and that iroh-mainline-content-discovery 0.6.0 is recent and actively developed (crates.io dates it 2025-04-04 and upstream deleted its mainline layer weeks later). BITE: grep the backlog for those three claims and confirm each surviving occurrence is annotated.
+- [ ] #5 A written decision answers whether Mainline ships at all, enforced client-only/server behavior, and lookup/publication privacy effects. BITE: TASK-89 and TASK-126 carry dependencies on this record and cannot complete without it.
 <!-- AC:END -->
 
 ## Implementation Notes

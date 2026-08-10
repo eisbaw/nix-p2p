@@ -4,10 +4,13 @@ title: Standing home for the full-tier fixture gate
 status: To Do
 assignee: []
 created_date: '2026-08-08 00:28'
-updated_date: '2026-08-08 17:59'
+updated_date: '2026-08-10 22:58'
 labels:
   - wave2
-dependencies: []
+  - deferred-post-holdout
+dependencies:
+  - TASK-124
+priority: low
 ---
 
 ## Description

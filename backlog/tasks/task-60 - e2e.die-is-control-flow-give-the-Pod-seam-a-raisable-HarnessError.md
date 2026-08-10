@@ -4,10 +4,12 @@ title: 'e2e.die is control flow: give the Pod seam a raisable HarnessError'
 status: To Do
 assignee: []
 created_date: '2026-08-09 13:02'
+updated_date: '2026-08-10 22:36'
 labels:
   - harness
   - refactor
 dependencies: []
+priority: high
 ---
 
 ## Description

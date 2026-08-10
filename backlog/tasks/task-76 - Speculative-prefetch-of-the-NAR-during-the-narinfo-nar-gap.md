@@ -4,9 +4,13 @@ title: Speculative prefetch of the NAR during the narinfo->nar gap
 status: To Do
 assignee: []
 created_date: '2026-08-09 21:01'
+updated_date: '2026-08-10 22:57'
 labels:
   - wave-2b
-dependencies: []
+  - deferred-post-holdout
+dependencies:
+  - TASK-124
+priority: low
 ---
 
 ## Description

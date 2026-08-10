@@ -4,12 +4,13 @@ title: Daemon upstream header_timeout does not compose across chain hops
 status: To Do
 assignee: []
 created_date: '2026-08-08 14:29'
-updated_date: '2026-08-08 18:41'
+updated_date: '2026-08-10 22:36'
 labels:
   - finding
   - wave-2
   - hardening
 dependencies: []
+priority: high
 ---
 
 ## Description

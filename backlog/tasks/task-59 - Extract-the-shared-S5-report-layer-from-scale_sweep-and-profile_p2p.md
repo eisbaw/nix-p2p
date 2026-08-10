@@ -4,10 +4,12 @@ title: Extract the shared S5 report layer from scale_sweep and profile_p2p
 status: To Do
 assignee: []
 created_date: '2026-08-09 13:01'
+updated_date: '2026-08-10 22:36'
 labels:
   - refactor
   - harness
 dependencies: []
+priority: high
 ---
 
 ## Description

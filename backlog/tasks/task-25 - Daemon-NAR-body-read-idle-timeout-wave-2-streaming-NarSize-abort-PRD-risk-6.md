@@ -6,13 +6,13 @@ title: >-
 status: To Do
 assignee: []
 created_date: '2026-08-08 08:16'
-updated_date: '2026-08-08 23:40'
+updated_date: '2026-08-10 22:35'
 labels:
   - wave1-followup
   - daemon
   - hardening
 dependencies: []
-priority: medium
+priority: high
 ---
 
 ## Description

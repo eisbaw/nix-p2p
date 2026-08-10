@@ -1,15 +1,17 @@
 ---
 id: TASK-47
 title: 'RE-PLAN wave-2b: DHT spike, full pathological matrix, BitTorrent, policies'
-status: To Do
+status: Done
 assignee: []
 created_date: '2026-08-08 20:13'
-updated_date: '2026-08-09 21:03'
+updated_date: '2026-08-10 22:57'
 labels:
   - replan
+  - superseded
 dependencies:
-  - TASK-45
-  - TASK-46
+  - TASK-15
+  - TASK-42
+priority: high
 ---
 
 ## Description
@@ -31,3 +33,9 @@ Re-plan task - NOT feature code. Re-invoke phase2-backlog-snowball with: PRD.md 
 <!-- SECTION:NOTES:BEGIN -->
 SCOPE UPDATE 2026-08-09 (owner: 'file the gaps as backlog tasks if not already'): the items this re-plan bundled in its description are now FILED as real tasks, so the re-plan's job narrows from 'invent the wave-2b list' to 'order, scope and gate what already exists'. Filed: TASK-73 (DHT-authoritative resolution - the discovery gap, incl. the DHT-key-derivation freeze this task's spike must feed), TASK-74 (gossip accelerant, must remain non-required), TASK-75 (BitTorrent second transport, doubles as a falsification test of the claim-schema freeze), TASK-76 (speculative prefetch - tail-only per task-35), TASK-77 (announce-after-fetch + budget), TASK-78 (leech mode), TASK-79 (pathological suite v2: NAT/relay, thundering herd, lying claim, seeder churn), TASK-80 (real-network validation - the one thing the single-host testbed structurally cannot answer), TASK-81 (verify the Candidate C castore seam is still open). Policy IMPLEMENTATION is deliberately NOT filed - TASK-44 files it as its own output once the data justifies a choice.
 <!-- SECTION:NOTES:END -->
+
+## Final Summary
+
+<!-- SECTION:FINAL_SUMMARY:BEGIN -->
+Closed by supersession on 2026-08-11: the wave-2b candidates were already decomposed into TASK-73 through TASK-81 and follow-on discovery tasks. This records planning completion only, not feature completion.
+<!-- SECTION:FINAL_SUMMARY:END -->

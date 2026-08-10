@@ -6,11 +6,12 @@ title: >-
 status: To Do
 assignee: []
 created_date: '2026-08-09 14:01'
-updated_date: '2026-08-09 15:47'
+updated_date: '2026-08-10 22:36'
 labels:
   - honesty
   - measurement
 dependencies: []
+priority: high
 ---
 
 ## Description

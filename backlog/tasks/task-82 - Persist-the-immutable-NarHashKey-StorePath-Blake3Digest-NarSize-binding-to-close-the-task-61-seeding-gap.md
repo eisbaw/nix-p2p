@@ -6,11 +6,12 @@ title: >-
 status: To Do
 assignee: []
 created_date: '2026-08-09 21:25'
-updated_date: '2026-08-10 09:29'
+updated_date: '2026-08-10 22:27'
 labels:
   - forward-carried-from-task-61
 dependencies:
   - TASK-72
+priority: high
 ---
 
 ## Description

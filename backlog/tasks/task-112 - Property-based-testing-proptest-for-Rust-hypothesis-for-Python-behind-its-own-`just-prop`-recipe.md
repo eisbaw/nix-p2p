@@ -6,10 +6,13 @@ title: >-
 status: To Do
 assignee: []
 created_date: '2026-08-10 21:39'
-updated_date: '2026-08-10 21:39'
+updated_date: '2026-08-10 22:55'
 labels: []
 dependencies:
-  - TASK-109
+  - TASK-46
+  - TASK-55
+  - TASK-119
+priority: high
 ---
 
 ## Description
@@ -49,4 +52,6 @@ PREREQUISITES, both real:
 - [ ] #4 Every property failure prints a reproducer, and the shrunk counterexample is committed as a named example test
 - [ ] #5 proptest checked against check-independence.py's denylist; hypothesis added to flake.nix pythonEnv without pulling in pytest
 - [ ] #6 STATED HONESTLY: which properties were considered and REJECTED as restatements of the implementation rather than independent claims
+- [ ] #7 Cross-backend properties generate claims/discovery outcomes/offers containing Iroh and BitTorrent kinds and assert bounded round-trip, at-most-one-offer-per-frozen-kind, explicit registry dispatch and unknown-kind behavior.
+- [ ] #8 BitTorrent properties cover NarHash/RawNar-to-metainfo/infohash determinism, piece partition boundaries and malformed/oversized metadata; Iroh properties cover codec negotiation/raw fallback and decompressed-size bounds.
 <!-- AC:END -->

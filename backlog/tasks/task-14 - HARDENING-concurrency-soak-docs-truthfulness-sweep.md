@@ -4,11 +4,14 @@ title: 'HARDENING: concurrency soak + docs truthfulness sweep'
 status: To Do
 assignee: []
 created_date: '2026-08-07 21:56'
-updated_date: '2026-08-08 20:59'
+updated_date: '2026-08-10 22:58'
 labels:
   - hardening
 dependencies:
-  - TASK-13
+  - TASK-21
+  - TASK-36
+  - TASK-113
+priority: high
 ---
 
 ## Description
@@ -22,6 +25,8 @@ Wave-end hardening block, part 2. Soak: max-substitution-jobs=16 storm of parall
 - [ ] #1 Concurrency soak parameterized by client knobs (TESTING.md): max-substitution-jobs and http-connections swept over {1, 16, 128}; at each point: no deadlock, fd/memory bounds asserted, S1 holds; restart-under-load recovers; results reported per knob value
 - [ ] #2 Same-path dogpile at the harshest swept setting (128 jobs): concurrent cold-cache requests for ONE large NAR -> single upstream fetch (or explicitly documented safe alternative); never a partial/corrupt byte served
 - [ ] #3 README quickstart executed verbatim in a clean container - every command works as written; TESTING.md drift corrected in the same commit
+- [ ] #4 A repeated cross-backend soak exercises zero-injection Iroh and raw BitTorrent discovery/transfer, holder churn, dependency outages and upstream fallback; provider/upstream counters prove both backends actually ran.
+- [ ] #5 Docs/PRD/status examples for Iroh, BitTorrent, participation defaults, codec arms and known unsupported cells are checked against live configuration/output; stale backend or tournament claims fail the sweep.
 <!-- AC:END -->
 
 ## Implementation Notes

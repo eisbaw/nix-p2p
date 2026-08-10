@@ -6,7 +6,7 @@ title: >-
 status: To Do
 assignee: []
 created_date: '2026-08-10 10:03'
-updated_date: '2026-08-10 10:03'
+updated_date: '2026-08-10 22:58'
 labels:
   - wave-2b
 dependencies:
@@ -19,7 +19,7 @@ priority: high
 <!-- SECTION:DESCRIPTION:BEGIN -->
 OWNER DECISION 2026-08-10, and it is the gate that unblocks global publication: a node publishes ONLY content that is already public at cache.nixos.org. That resolves the no-enumeration tension directly - anyone with the same nixpkgs can already derive these hashes, so publishing them discloses no secret. Locally built and private paths are NEVER published and stay reachable only by direct hold-query.
 
-This is a PREREQUISITE for TASK-73 / TASK-102 (global DHT publication) and must be enforced in code, not by convention, because every publishing mechanism downstream inherits it.
+This is a prerequisite for every public publisher, including TASK-101, TASK-103 and TASK-118 and must be enforced in code, not by convention, because every publishing mechanism downstream inherits it.
 
 MEASURED SET (orchestrator, /nix/var/nix/db/db.sqlite, 2026-08-10): 12,396 servable output paths holding 105,713 MiB; 6,769 of them carry a cache.nixos.org signature (53,854 MiB = 50.9% of bytes); 2,250 are locally built (ultimate) holding 35,870 MiB. So the publishable set is ~6,769 paths and roughly half the servable bytes are NOT publishable by construction.
 

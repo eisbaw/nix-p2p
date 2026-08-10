@@ -1,14 +1,15 @@
 ---
 id: TASK-15
 title: 'RE-PLAN: wave 2 planning via phase2-backlog-snowball (not feature code)'
-status: To Do
+status: Done
 assignee: []
 created_date: '2026-08-07 21:56'
-updated_date: '2026-08-08 20:14'
+updated_date: '2026-08-10 22:57'
 labels:
   - replan
+  - superseded
 dependencies:
-  - TASK-14
+  - TASK-16
 ---
 
 ## Description
@@ -31,3 +32,9 @@ Re-plan task - not feature code. Re-invoke phase2-backlog-snowball with: the PRD
 <!-- SECTION:NOTES:BEGIN -->
 task-35 real-upstream gap measured (2026-08-08, scripts/measure_real_gap.py vs real cache.nixos.org; see TESTING.md 'Real-upstream gap (task-35)'). Result feeding the prefetch-vs-hedge design: real narinfo->nar gap is 500-5000x the loopback sub-ms gap and SCALES with closure download duration. hello (5 paths): median 298ms, max 1.1s. curl (21 paths): median 1.4s, max 3.08s (tail inside the 1-4s DHT window). Two-phase: narinfos first, then NARs; per-path gap = narinfo-seen -> NAR-demanded. Design consequence: (1) prefetch VIABLE for the TAIL of large closures IF the daemon triggers DHT resolve on the narinfo request; (2) prefetch CANNOT cover any closure's HEAD nor small closures at all (gap < DHT-resolve floor); (3) hedge must carry offload, prefetch is a tail optimisation on top. Loopback 'prefetch is dead' verdict was an artifact - do NOT carry forward. Caveat: favourable Nordic RTT ~50-110ms (near-lower-bound); distant clients see larger gaps.
 <!-- SECTION:NOTES:END -->
+
+## Final Summary
+
+<!-- SECTION:FINAL_SUMMARY:BEGIN -->
+Superseded on 2026-08-11. Earlier wave-2 planning was already materialized. TASK-114 now owns the test-first two-stage tournament contract and TASK-124 is the next evidence-driven terminal re-plan. No feature completion is claimed by closing this stale planning task.
+<!-- SECTION:FINAL_SUMMARY:END -->

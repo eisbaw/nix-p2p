@@ -4,10 +4,14 @@ title: Lossless forward-compat preservation for RELAYED/gossiped/DHT-stored clai
 status: To Do
 assignee: []
 created_date: '2026-08-08 22:15'
+updated_date: '2026-08-10 22:27'
 labels:
   - wave-2
 dependencies:
-  - TASK-47
+  - TASK-101
+  - TASK-103
+  - TASK-118
+priority: high
 ---
 
 ## Description
