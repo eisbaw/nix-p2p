@@ -7,14 +7,20 @@
 > schema and the addressed unit are frozen; everything else may change.
 
 A decentralized Nix binary cache: a localhost substituter daemon that serves
-the standard binary-cache HTTP API, passes signed metadata through from
-cache.nixos.org, and fetches NAR payloads from peers over iroh, hash-verified
+the standard binary-cache HTTP API, passes signed metadata through from an
+upstream cache, and fetches NAR payloads from peers over iroh, hash-verified
 against the signed NarHash. An unmodified Nix client re-verifies signature and
 NarHash itself, so the daemon and all peers stay outside the trusted computing
 base.
 
 The goal is bandwidth offload for cache.nixos.org — decentralizing the bytes,
 not the trust. Metadata and signatures remain the cache's job.
+
+**It has never been pointed at the real cache.nixos.org.** The daemon speaks
+plain HTTP only and rejects an `https://` upstream outright
+(`daemon/src/upstream.rs`), so every result below was produced against a local
+mock cache behind a test proxy. Fronting the real thing needs TLS on both
+(tracked as tasks 22 and 24).
 
 ## Status
 
@@ -30,14 +36,16 @@ What works:
 - Transparent substituter proxy — `nix-cache-info` semantics, narinfo disk
   cache, NAR correlation catalog, multi-daemon chains, NixOS module + VM test.
 - iroh whole-NAR transport behind `NarSource`, with a frozen claim wire schema,
-  an announce-on-demand availability index that never allows enumeration, and a
-  conservative safety envelope (dial/idle/fetch timeouts, streaming NarSize
-  abort).
+  an announce-on-demand availability index that answers yes/no and has no
+  listing call at all (enumeration is prevented by construction, not by a
+  filter), and a conservative safety envelope (dial/idle/fetch timeouts,
+  streaming NarSize abort).
 - A **regenerate-on-demand supply model**: a node announces what it can serve
   without holding it, regenerates on request inside an explicit serve budget
   (max NAR size, max concurrent bytes, max serve duration), and releases
   afterwards. What it answers "yes" about and what it can actually serve are
-  the same set.
+  the same set — proven where both sets exist in one process; there is no wire
+  hold-query endpoint yet, so this is not yet demonstrated between two nodes.
 - A measurement and profiling stack: frozen egress counting rule, regression
   fitter with model selection and confidence intervals, and a p2p profiler
   covering RAM, disk, latency, throughput and speedup.
@@ -107,7 +115,9 @@ Two strictly separated Rust binaries (no shared crates, enforced by
 - **`testproxy/`** — the permanent test fixture. A simple caching proxy that
   fronts the upstream (real or mock) and owns all fault injection: latency,
   errors, corruption, throttling. Adversarial-upstream logic never lives in
-  the product. It also shields cache.nixos.org from test load.
+  the product. It is *intended* to also shield cache.nixos.org from test load,
+  but it is plain-HTTP only today (task-22), so it currently fronts a local
+  mock origin rather than the real cache.
 
 Supporting pieces:
 
@@ -129,7 +139,10 @@ Key invariants, tested end-to-end (see `TESTING.md`):
   a frozen counting rule (`scripts/MEASUREMENT_COUNTING_RULE.md`). Gross
   "bytes from peers" is not the metric.
 - **S4 latency bound**: p95 build wall-clock with the daemon ≤ 110% of
-  daemon-off.
+  daemon-off. This was defined for the wave-1 transparent proxy and holds
+  there. It is **not** met by the p2p path: peers-on against the loopback
+  control is ~4× daemon-off. Whether that matters depends entirely on how
+  fast the real upstream is, which is exactly what has not been measured.
 - **S6 peer-served build**: a real `nix build` whose NAR came from a peer, with
   the bytes counted at the *provider* (the fetching daemon's own claim to have
   used a peer is untrusted narration), plus a peers-off contrast arm proving
@@ -162,7 +175,7 @@ just lint       # clippy -D warnings, rustfmt, ruff, source-policy guards
 just test       # cargo test + fixture gate + measurement self-test
 ```
 
-Slow tier (minutes, containers/VMs; not part of the fast loop):
+Slow tier (containers/VMs; not part of the fast loop — minutes to hours):
 
 ```sh
 just e2e         # podman-pod scenario suite (needs rootless podman)
@@ -194,8 +207,8 @@ axis, a concurrency axis and both upstream conditions.
 ## References
 
 Prior art and the problem this exists to address. Both threads are from June
-2023 and neither has produced a shipped implementation, which is part of why
-this project is deliberately measurement-first.
+2023; this project is not aware of a shipped implementation coming out of
+either, though that is an impression from reading them rather than a survey.
 
 - [Peer-to-peer binary cache RFC/working group/poll](https://discourse.nixos.org/t/peer-to-peer-binary-cache-rfc-working-group-poll/29568)
   (NixOS Discourse, Nabile-Rahmani) — polls the community on a decentralized
