@@ -4,7 +4,7 @@ title: 'Iroh BatchHoldQuery ALPN: networked bounded discovery of unannounced NAR
 status: To Do
 assignee: []
 created_date: '2026-08-10 22:23'
-updated_date: '2026-08-10 22:55'
+updated_date: '2026-08-11 03:31'
 labels:
   - iroh
   - discovery
@@ -12,13 +12,13 @@ labels:
   - wave-2c
 dependencies:
   - TASK-83
-  - TASK-89
   - TASK-100
   - TASK-104
   - TASK-106
   - TASK-107
   - TASK-110
   - TASK-115
+  - TASK-130
 priority: high
 ---
 
@@ -34,7 +34,7 @@ Put the existing batched yes/no hold-query protocol on the real shared Iroh endp
 - [ ] #2 The wire path preserves structural no-enumeration, caps keys/offers/work, enforces one total caller deadline, abandons the remainder after a peer fault, and exposes miss separately from unavailable.
 - [ ] #3 Unknown protocol versions and malformed/oversized requests fail closed without killing the router; a supported older version continues to interoperate.
 - [ ] #4 Bites prove that removing the total deadline, offer cap, or named-key restriction makes a test fail; provider-side bytes plus Nix gate-2 prove the success path is non-vacuous.
-- [ ] #5 An unannounced store-backed NAR is found among candidate NodeIds supplied by a recorded LAN/prior-rendezvous/tracker/DHT source, with no peer address or p2p-claim injection; the report states candidate-source coverage and never calls the probe global discovery.
+- [ ] #5 A store-backed unannounced NAR is found through candidate NodeIds supplied only by TASK-130 LAN discovery while DNS/pkarr, relay, Mainline and tracker mechanisms are disabled. With no peer address, p2p claim or content locator injected, a real Nix substitution completes over Iroh; provider bytes and Nix gate-2 make the vertical slice non-vacuous. The report names LAN candidate coverage and never calls bounded probing global discovery.
 <!-- AC:END -->
 
 ## Implementation Notes

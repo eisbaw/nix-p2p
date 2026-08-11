@@ -618,12 +618,20 @@ inventory enumeration.
 The build order is a gate, not a preference inside the eventual policy:
 
 1. Complete an **operational, zero-content-injection Iroh build** using the
-   persistent shared runtime and real node/content discovery (TASK-115,
-   TASK-101, TASK-103's supported-or-unsupported branch, and TASK-116). The
-   requester may receive operator-level bootstrap configuration, but no peer
-   address, claim, per-content locator, magnet or equivalent test injection.
+   persistent shared runtime (TASK-115), then LAN-local address discovery
+   (TASK-130), then the content-discovery seam and LAN BatchHoldQuery vertical
+   slice (TASK-100/TASK-116). Add explicit DNS/pkarr and relay discovery plus the
+   tracker path next (TASK-89/TASK-101). In parallel, TASK-96 feeds the global
+   content-DHT decision (TASK-126) and its supported-or-unsupported implementation
+   branch (TASK-103). The requester may receive operator-level bootstrap
+   configuration, but no peer address, claim, per-content locator, magnet or
+   equivalent test injection. Endpoint bind scope alone never activates
+   discovery or public participation.
 2. Land authenticated HTTPS upstream support (TASK-22/TASK-24) and negotiated,
-   bounded Iroh raw/zstd operation (TASK-99). Raw fallback stays explicit.
+   bounded Iroh raw/zstd operation (TASK-99). Raw fallback stays explicit. Then
+   TASK-120 makes the operator-mode mapping authoritative and TASK-131 consumes
+   TASK-96/TASK-120 to add approved Mainline address lookup or record it
+   unsupported; both are hard prerequisites for the production-shaped harness.
 3. Exercise the production-shaped 10+ node Iroh harness (TASK-87), measure Iroh
    raw and compressed from cold discovery through real-Nix completion (TASK-88),
    then close the fresh-host operator journey (TASK-45). These artifacts are an

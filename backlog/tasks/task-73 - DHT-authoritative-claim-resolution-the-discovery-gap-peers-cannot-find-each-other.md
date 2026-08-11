@@ -6,7 +6,7 @@ title: >-
 status: Done
 assignee: []
 created_date: '2026-08-09 21:01'
-updated_date: '2026-08-10 22:57'
+updated_date: '2026-08-11 03:34'
 labels:
   - wave-2b
   - superseded
@@ -42,10 +42,12 @@ Honest scale caveat: TESTING.md S5 explicitly excludes emergent network effects 
 
 <!-- SECTION:NOTES:BEGIN -->
 GRAPH NOTE 2026-08-10: the TASK-96 -> TASK-73 dependency direction is INVERTED and the CLI cannot clear a dependency (--dep only SETS, and --dep "" is a no-op). TASK-96 (decide mainline participation) must come BEFORE this task freezes anything, not after. Read the edge as 'TASK-96 needs the research recorded in TASK-73's notes', which is already complete - not as 'TASK-73 must finish first'. When TASK-96 is picked up, treat it as UNBLOCKED. The build half of this umbrella now lives in TASK-103.
+
+Iroh-first graph split 2026-08-11 further refines the supersession: TASK-115 owns shared identity/runtime/scopes, TASK-130 owns LAN address discovery, TASK-89 owns DNS/pkarr and relay, and TASK-131 owns conditional Mainline address lookup. TASK-100/101/103/116 retain content-discovery ownership.
 <!-- SECTION:NOTES:END -->
 
 ## Final Summary
 
 <!-- SECTION:FINAL_SUMMARY:BEGIN -->
-Closed by supersession on 2026-08-11, not by feature completion. The original umbrella mixed discovery decisions and implementation and contained an inverted dependency. Ownership is now split across TASK-96 (Mainline/privacy decision), TASK-100 (mechanism seam), TASK-103 (global announced-content DHT), TASK-116 (bounded unannounced-content query) and TASK-115/TASK-89 (dialable Iroh nodes).
+Closed by supersession on 2026-08-11, not by feature completion. The original umbrella mixed discovery decisions and implementation and contained an inverted dependency. Ownership is now split across TASK-96 (Mainline/privacy evidence), TASK-115 (shared runtime), TASK-130 (LAN address discovery), TASK-89 (DNS/pkarr and relay), TASK-131 (conditional Mainline address lookup), TASK-100 (mechanism seam), TASK-101 (tracker), TASK-103 (global announced-content DHT) and TASK-116 (bounded unannounced-content query).
 <!-- SECTION:FINAL_SUMMARY:END -->
