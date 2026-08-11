@@ -1,0 +1,31 @@
+[package]
+name = "peer-fabric"
+description = "nix-p2p intention-level P2P seam: what the daemon wants of any peer substrate, with ZERO iroh/libp2p dependencies"
+version.workspace = true
+edition.workspace = true
+
+[lib]
+name = "peer_fabric"
+path = "src/lib.rs"
+
+# THE WHOLE POINT of this crate (AC#8): the seam names WHAT the daemon wants of a
+# peer substrate, never HOW a stack does it, so it carries NO p2p stack. iroh and
+# libp2p live only in the future `fabric-iroh` / `fabric-libp2p` backend crates
+# (TASK-141+), never here. `just independence`'s HTTP-stack denylist is unaffected
+# (this is neither an HTTP-stack crate nor reachable from testproxy).
+[dependencies]
+# The traits are async and object-safe (`Arc<dyn ProviderDirectory>`), exactly like
+# the daemon's `NarSource`/`Transport` seams. `async-trait` boxes each call; that is
+# also why the dispatch model is dynamic (docs/peer-fabric-seam.md) - every axis is
+# I/O-bound, so a vtable hop is unmeasurable. No runtime is a *normal* dep: the one
+# piece of shared state, the ExposureLedger, uses `std::sync::Mutex`.
+async-trait = "0.1"
+
+[dev-dependencies]
+# Only the tests need an async runtime, to `.await` the trait methods. `macros` for
+# `#[tokio::test]`, `rt` for a current-thread executor. No `net`, no `process`: the
+# seam is substrate-free and so are its tests (FakeFabric is the only backend).
+tokio = { version = "1", features = ["macros", "rt"] }
+
+[lints]
+workspace = true
