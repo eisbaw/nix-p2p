@@ -4,7 +4,7 @@ title: Integrate Iroh public node discovery and prove no-address connection
 status: To Do
 assignee: []
 created_date: '2026-08-10 07:09'
-updated_date: '2026-08-11 20:01'
+updated_date: '2026-08-11 23:03'
 labels:
   - wave-2b
   - discovery
@@ -43,4 +43,14 @@ Integrate independently implemented node-address publication TASK-137 NodeId loo
 Atomic split 2026-08-11: TASK-137 owns node/address publication and crash-safe record state; TASK-138 owns NodeId lookup; TASK-139 owns relay transport; TASK-89 owns only their typed matrix and no-peer-address connection proof. TASK-101/103 own content discovery, TASK-132 the combined global Nix journey, TASK-133 the reviewed verdict and TASK-136 sole LAN admission/re-plan.
 
 Forward-carried from TASK-138 review: Iroh 1.0.3 address_lookup::Item carries last_updated sequence but no TTL/expiry, and an Endpoint may retain resolved remote paths without another lookup. TASK-138 proves freshness only at its narrow resolver API. TASK-89 connection composition must explicitly enforce re-resolution and expiry/withdrawal invalidation (including any Iroh remote-path cache) before claiming stale-address rejection end to end; the current product fetch path still requires explicit --iroh-peer address injection until TASK-89 removes that dependency.
+
+## forward-carried from TASK-139 (relay transport capability)
+
+TASK-89 composes 137 (publish) + 138 (lookup) + 139 (relay) into the no-address connection proof. From landing the 139 relay cornerstone (daemon/src/iroh_relay.rs, commit 5f750cc):
+
+- Use daemon::RelayTransportConfig to turn ON relay for the shared endpoint: it yields RelayCapability::Enabled(RelayMode::Custom(map)) built from ONE explicit local relay URL and never inherits presets::N0 / RelayMode::Default. Do NOT hand-build a RelayMode elsewhere — go through this so the "no implicit public default" invariant holds.
+- Relay attribution gotcha (important for the no-address proof): iroh's remote_addr is on Connecting/Accepting, and an established Connection can upgrade relay->direct after holepunching. So "the peer was reached with NO direct address, via relay" is only unfalsifiable when the direct path is BLOCKED (routed namespaces / L3). Reuse daemon::classify_connection_path(&IncomingAddr) -> RelayConnectionPath; only Relayed.is_relay_attributed()==true. A direct-positive control must stay Direct and must NOT be credited to relay.
+- Typed outcomes to expect/propagate: daemon::RelayTransportUnavailableKind {disabled, untrusted_configuration, external_relay_unsupported, wrong_relay_url, relay_outage, wrong_certificate, wrong_identity, half_open_stream, forced_direct_failure, deadline, no_relay_candidate, closed}. Deadline bound: RELAY_CONNECT_DEADLINE 10000ms + RELAY_SCHEDULER_GRACE 1000ms (11000ms admissible). NOTE: as of 139 the live connect path + most typed producers are NOT yet wired — TASK-142 (routed relay evidence harness) owns that; 89 depends on 142's real relayed connection, not just 139's config layer.
+- External/public (n0) relay is out of scope: only a locally operated routed relay is enabled; evidence is labelled production-shaped. Do NOT reach n0 default relays in the 89 proof.
+- The routed harness setup that 89 needs already exists as a template: scripts/iroh_node_lookup_evidence.py (two rootless-podman internal networks + a tiny L3 router; tcpdump in the resolver netns). TASK-142 adapts it to block the direct path and force relay.
 <!-- SECTION:NOTES:END -->

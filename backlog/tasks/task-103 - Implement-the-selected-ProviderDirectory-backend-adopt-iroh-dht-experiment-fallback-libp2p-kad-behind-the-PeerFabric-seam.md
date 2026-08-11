@@ -6,7 +6,7 @@ title: >-
 status: To Do
 assignee: []
 created_date: '2026-08-10 10:04'
-updated_date: '2026-08-11 21:22'
+updated_date: '2026-08-11 22:40'
 labels:
   - iroh
   - discovery
@@ -22,6 +22,7 @@ dependencies:
   - TASK-115
   - TASK-126
   - TASK-140
+  - TASK-141
 priority: high
 ---
 
