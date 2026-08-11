@@ -6,7 +6,7 @@ title: >-
 status: In Progress
 assignee: []
 created_date: '2026-08-10 22:51'
-updated_date: '2026-08-11 22:32'
+updated_date: '2026-08-11 23:58'
 labels:
   - iroh
   - discovery
@@ -52,4 +52,6 @@ Forward-carried from TASK-140 (peer-fabric seam landed, commit 9073806) - data-d
 - ProviderRecord.content (Blake3Digest): OPEN whether it is LEARNED from the record or already KNOWN by an asker who possessed the NarHash to derive ContentKey and run gate-1. If already known, it may be redundant (drop it); if a record is discoverable by key alone without knowing the content digest, it must stay. Same question for HoldAnswer::Have{content,offers}. Freeze the answer with the codec.
 - ContentKey privacy: the seam doc was corrected to state honestly that the key/NarHash separation only hides the signed hash from ROUTING nodes; the k closest STORING nodes still learn ProviderRecord.content. Keep this framing; the adversarial exposure analysis is TASK-132's.
 - ContentKey derivation (NarHash -> 32 bytes) and ProviderRecord codec/size-cap and expiry-vs-substrate-TTL reconciliation (AC#6) are all still TASK-126's to freeze; peer-fabric names only the field SHAPE (from_bytes is the only ContentKey constructor until you pin the derivation).
+
+Forward-carry from TASK-141 inc 1 (commit d01fb42): ContentKey + ProviderRecord live in peer_fabric::content and are still serde-FREE by design - this task's freeze chooses their codec inside an opaque DHT value against the adopted backend, without a churn dep on peer-fabric. CONTRAST with the ids (peer_fabric::ids): NodeId/Blake3Digest/InfoHash now DO carry frozen serde/FromStr string codecs (moved out of the daemon in inc 1, forced by the orphan rule since the daemon claim wire needs them). So when freezing ProviderRecord, its embedded content Blake3Digest / provider NodeId already have frozen canonical string forms (blake3:<hex> / bare 64-hex) - reuse those, do not re-invent. The golden-value SSOT pattern to mirror: hardcode the golden bytes ONCE (committed golden JSON, cross-checked by scripts/check-golden-vectors.py against a stock tool) rather than re-hardcoding literals across crates.
 <!-- SECTION:NOTES:END -->

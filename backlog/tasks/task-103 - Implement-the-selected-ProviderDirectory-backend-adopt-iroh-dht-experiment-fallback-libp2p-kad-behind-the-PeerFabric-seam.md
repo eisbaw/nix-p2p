@@ -6,7 +6,7 @@ title: >-
 status: To Do
 assignee: []
 created_date: '2026-08-10 10:04'
-updated_date: '2026-08-11 22:40'
+updated_date: '2026-08-11 23:58'
 labels:
   - iroh
   - discovery
@@ -50,4 +50,6 @@ Implement TASK-126s frozen decentralized exact-key content discovery behind Cont
 
 <!-- SECTION:NOTES:BEGIN -->
 Mandatory production capability. There is no unsupported-completion branch. This task ends at content key to provider NodeId and offer resolution; TASK-89 owns NodeId to address and TASK-132 owns connection transfer and real-Nix proof.
+
+Forward-carry from TASK-141 inc 1 (commit d01fb42): the shared value types are now single-sourced in the peer-fabric seam crate (peer_fabric::ids: NodeId, Blake3Digest incl the frozen BLAKE3(RawNarV1) recipe, TransportTag, InfoHash/TransportOffer; peer_fabric::content: ContentKey, ProviderRecord, DialInfo). The selected ProviderDirectory backend this task implements will live in the fabric-iroh crate (extracted by TASK-144), behind peer_fabric::ProviderDirectory, and construct into IrohFabric's Option<Arc<dyn ProviderDirectory>> field. It depends ONLY on peer-fabric value types - do not reach for daemon-internal types. NOTE: peer_fabric::content (ContentKey/ProviderRecord) is deliberately serde-FREE precisely so THIS task/TASK-126 choose the opaque-value codec against the adopted backend without a churn dep; the ids DO carry frozen serde codecs. Backend crate = fabric-iroh (peer-fabric + iroh + iroh-blobs), never in peer-fabric or daemon-core.
 <!-- SECTION:NOTES:END -->
