@@ -1,0 +1,1 @@
+{"attempt_count":1,"attempts":[{"attempt":1,"detail":"connecting to pinned recipient 10.202.145.10:18080: Connection refused (os error 111)","elapsed_micros":336,"reason":"authority_connection_refused","verdict":"unavailable"}],"node_id":"c20d68e77a1013679896609bf52c47a71f0f4059e3fc797b0b1c1919aa9258eb","schema":"iroh-node-lookup-v1","shutdown":"graceful","verdict":"unavailable"}

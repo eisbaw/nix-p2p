@@ -1,0 +1,2 @@
+iroh_node_authority_ready listen=10.202.145.10:18080 namespace="task138-evidence-r1b9786-9b4cd124428b" owner="nix-p2p-task138-evidence" admitted_signers=1
+iroh_node_authority_stopped signal=sigterm requests=4

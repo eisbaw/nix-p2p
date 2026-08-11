@@ -1,0 +1,1 @@
+{"attempt_count":1,"attempts":[{"attempt":1,"detail":"pkarr response rejected: Invalid signature","elapsed_micros":577,"reason":"bad_signature","verdict":"unavailable"}],"node_id":"654b0c90aa8d1bd981520f2b63cb53209f3e252acf1238769db8a709885b78c1","schema":"iroh-node-lookup-v1","shutdown":"graceful","verdict":"unavailable"}

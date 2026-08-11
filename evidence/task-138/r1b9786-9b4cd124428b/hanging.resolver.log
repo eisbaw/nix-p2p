@@ -1,0 +1,1 @@
+{"attempt_count":1,"attempts":[{"attempt":1,"detail":"node lookup exceeded its absolute 10000 ms deadline","elapsed_micros":10001279,"reason":"deadline","verdict":"unavailable"}],"node_id":"3b1a4366624e8f1ce7ed6ef2142540d9942d469f94c1a712ce506200a39c08fe","schema":"iroh-node-lookup-v1","shutdown":"graceful","verdict":"unavailable"}

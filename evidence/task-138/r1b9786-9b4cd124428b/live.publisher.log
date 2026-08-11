@@ -1,0 +1,8 @@
+daemon 0.0.1
+IROH-NODE-PUBLICATION-CONFIG enabled=true authority_class=production-shaped-local owner_json="nix-p2p-task138-evidence" recipient_label=task138-authority:v1 locations=1 ttl_seconds=120 refresh_seconds=60
+IROH-SERVE-BUDGET max_nar_bytes_uncompressed_nar=268435456 max_inflight_bytes_uncompressed_nar=1073741824 max_serve_duration_ms=120000 sweep_interval_ms=500
+IROH-NODE-PUBLICATION state=Live sequence=1786477226831343 ttl_seconds=120 expires_unix_micros=1786477346831343 locations=1 recipient_label=task138-authority:v1
+IROH-PROVIDER-ADDR node_id=b8711d1cf380a3f6ce82ffe2d61a8b6ae2ff9bec767ab6b35f650f92a01170ab sockets=10.202.145.30:44330
+daemon: listening on 0.0.0.0:8082 -> upstream http://127.0.0.1:9
+IROH-STORE-RESIDENT blobs=0 bytes_uncompressed_nar=0
+IROH-SERVE-COUNTERS admitted=0 regenerated=0 declined=0 declined_too_large=0 declined_busy=0 declined_unknown=0 declined_supply_failed=0 declined_store_unreadable=0 reservations_timed_out=0

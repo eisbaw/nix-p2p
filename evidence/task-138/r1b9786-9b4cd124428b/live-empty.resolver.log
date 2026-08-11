@@ -1,0 +1,1 @@
+{"attempt_count":1,"attempts":[{"attempt":1,"detail":"signed node record rejected: live record has no locations","elapsed_micros":1249,"reason":"no_dialable_candidate","verdict":"unavailable"}],"node_id":"76894d8dc4b416f9b7cc9bdfc8c1a5d8f1641822f7860bc077a38440f5ff6ba4","schema":"iroh-node-lookup-v1","shutdown":"graceful","verdict":"unavailable"}

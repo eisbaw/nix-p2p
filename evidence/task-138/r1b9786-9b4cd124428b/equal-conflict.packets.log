@@ -1,0 +1,24 @@
+1786477253.944079 ?     Out IP 10.202.144.10.45158 > 10.202.145.10.18080: Flags [S], seq 1281856314, win 65480, options [mss 65480,sackOK,TS val 3883234140 ecr 0,nop,wscale 10], length 0
+1786477253.944133 ?     In  IP 10.202.145.10.18080 > 10.202.144.10.45158: Flags [S.], seq 1584712738, ack 1281856315, win 65468, options [mss 65480,sackOK,TS val 1144421867 ecr 3883234140,nop,wscale 10], length 0
+1786477253.944168 ?     Out IP 10.202.144.10.45158 > 10.202.145.10.18080: Flags [.], ack 1, win 64, options [nop,nop,TS val 3883234141 ecr 1144421867], length 0
+1786477253.944234 ?     Out IP 10.202.144.10.45158 > 10.202.145.10.18080: Flags [P.], seq 1:197, ack 1, win 64, options [nop,nop,TS val 3883234141 ecr 1144421867], length 196
+1786477253.944251 ?     In  IP 10.202.145.10.18080 > 10.202.144.10.45158: Flags [.], ack 197, win 64, options [nop,nop,TS val 1144421867 ecr 3883234141], length 0
+1786477253.944327 ?     In  IP 10.202.145.10.18080 > 10.202.144.10.45158: Flags [P.], seq 1:60, ack 197, win 64, options [nop,nop,TS val 1144421867 ecr 3883234141], length 59
+1786477253.944345 ?     Out IP 10.202.144.10.45158 > 10.202.145.10.18080: Flags [.], ack 60, win 64, options [nop,nop,TS val 3883234141 ecr 1144421867], length 0
+1786477253.944365 ?     In  IP 10.202.145.10.18080 > 10.202.144.10.45158: Flags [P.], seq 60:690, ack 197, win 64, options [nop,nop,TS val 1144421867 ecr 3883234141], length 630
+1786477253.944369 ?     Out IP 10.202.144.10.45158 > 10.202.145.10.18080: Flags [.], ack 690, win 64, options [nop,nop,TS val 3883234141 ecr 1144421867], length 0
+1786477253.944380 ?     In  IP 10.202.145.10.18080 > 10.202.144.10.45158: Flags [F.], seq 690, ack 197, win 64, options [nop,nop,TS val 1144421867 ecr 3883234141], length 0
+1786477253.944404 ?     Out IP 10.202.144.10.45158 > 10.202.145.10.18080: Flags [F.], seq 197, ack 691, win 64, options [nop,nop,TS val 3883234141 ecr 1144421867], length 0
+1786477253.944438 ?     In  IP 10.202.145.10.18080 > 10.202.144.10.45158: Flags [.], ack 198, win 64, options [nop,nop,TS val 1144421867 ecr 3883234141], length 0
+1786477253.945001 ?     Out IP 10.202.144.10.45160 > 10.202.145.10.18080: Flags [S], seq 370762048, win 65480, options [mss 65480,sackOK,TS val 3883234141 ecr 0,nop,wscale 10], length 0
+1786477253.945023 ?     In  IP 10.202.145.10.18080 > 10.202.144.10.45160: Flags [S.], seq 599747911, ack 370762049, win 65468, options [mss 65480,sackOK,TS val 1144421867 ecr 3883234141,nop,wscale 10], length 0
+1786477253.945036 ?     Out IP 10.202.144.10.45160 > 10.202.145.10.18080: Flags [.], ack 1, win 64, options [nop,nop,TS val 3883234141 ecr 1144421867], length 0
+1786477253.945120 ?     Out IP 10.202.144.10.45160 > 10.202.145.10.18080: Flags [P.], seq 1:197, ack 1, win 64, options [nop,nop,TS val 3883234142 ecr 1144421867], length 196
+1786477253.945144 ?     In  IP 10.202.145.10.18080 > 10.202.144.10.45160: Flags [.], ack 197, win 64, options [nop,nop,TS val 1144421868 ecr 3883234142], length 0
+1786477253.945183 ?     In  IP 10.202.145.10.18080 > 10.202.144.10.45160: Flags [P.], seq 1:60, ack 197, win 64, options [nop,nop,TS val 1144421868 ecr 3883234142], length 59
+1786477253.945191 ?     Out IP 10.202.144.10.45160 > 10.202.145.10.18080: Flags [.], ack 60, win 64, options [nop,nop,TS val 3883234142 ecr 1144421868], length 0
+1786477253.945202 ?     In  IP 10.202.145.10.18080 > 10.202.144.10.45160: Flags [P.], seq 60:690, ack 197, win 64, options [nop,nop,TS val 1144421868 ecr 3883234142], length 630
+1786477253.945209 ?     In  IP 10.202.145.10.18080 > 10.202.144.10.45160: Flags [F.], seq 690, ack 197, win 64, options [nop,nop,TS val 1144421868 ecr 3883234142], length 0
+1786477253.945210 ?     Out IP 10.202.144.10.45160 > 10.202.145.10.18080: Flags [.], ack 690, win 64, options [nop,nop,TS val 3883234142 ecr 1144421868], length 0
+1786477253.945242 ?     Out IP 10.202.144.10.45160 > 10.202.145.10.18080: Flags [F.], seq 197, ack 691, win 64, options [nop,nop,TS val 3883234142 ecr 1144421868], length 0
+1786477253.945261 ?     In  IP 10.202.145.10.18080 > 10.202.144.10.45160: Flags [.], ack 198, win 64, options [nop,nop,TS val 1144421868 ecr 3883234142], length 0

@@ -1,0 +1,8 @@
+1786477237.660263 ?     Out IP 10.202.144.10.57860 > 10.202.145.10.18080: Flags [S], seq 1421148325, win 65480, options [mss 65480,sackOK,TS val 3883217857 ecr 0,nop,wscale 10], length 0
+1786477237.660326 ?     In  IP 10.202.145.10.18080 > 10.202.144.10.57860: Flags [S.], seq 349540602, ack 1421148326, win 65468, options [mss 65480,sackOK,TS val 1144405583 ecr 3883217857,nop,wscale 10], length 0
+1786477237.660354 ?     Out IP 10.202.144.10.57860 > 10.202.145.10.18080: Flags [.], ack 1, win 64, options [nop,nop,TS val 3883217857 ecr 1144405583], length 0
+1786477237.660533 ?     Out IP 10.202.144.10.57860 > 10.202.145.10.18080: Flags [P.], seq 1:197, ack 1, win 64, options [nop,nop,TS val 3883217857 ecr 1144405583], length 196
+1786477237.660558 ?     In  IP 10.202.145.10.18080 > 10.202.144.10.57860: Flags [.], ack 197, win 64, options [nop,nop,TS val 1144405583 ecr 3883217857], length 0
+1786477247.661220 ?     Out IP 10.202.144.10.57860 > 10.202.145.10.18080: Flags [F.], seq 197, ack 1, win 64, options [nop,nop,TS val 3883227858 ecr 1144405583], length 0
+1786477247.661499 ?     In  IP 10.202.145.10.18080 > 10.202.144.10.57860: Flags [F.], seq 1, ack 198, win 64, options [nop,nop,TS val 1144415584 ecr 3883227858], length 0
+1786477247.661514 ?     Out IP 10.202.144.10.57860 > 10.202.145.10.18080: Flags [.], ack 2, win 64, options [nop,nop,TS val 3883227858 ecr 1144415584], length 0

@@ -1,0 +1,12 @@
+1786477249.627615 ?     Out IP 10.202.144.10.45124 > 10.202.145.10.18080: Flags [S], seq 925069902, win 65480, options [mss 65480,sackOK,TS val 3883229824 ecr 0,nop,wscale 10], length 0
+1786477249.627666 ?     In  IP 10.202.145.10.18080 > 10.202.144.10.45124: Flags [S.], seq 4024746256, ack 925069903, win 65468, options [mss 65480,sackOK,TS val 1144417550 ecr 3883229824,nop,wscale 10], length 0
+1786477249.627689 ?     Out IP 10.202.144.10.45124 > 10.202.145.10.18080: Flags [.], ack 1, win 64, options [nop,nop,TS val 3883229824 ecr 1144417550], length 0
+1786477249.627760 ?     Out IP 10.202.144.10.45124 > 10.202.145.10.18080: Flags [P.], seq 1:197, ack 1, win 64, options [nop,nop,TS val 3883229824 ecr 1144417550], length 196
+1786477249.627799 ?     In  IP 10.202.145.10.18080 > 10.202.144.10.45124: Flags [.], ack 197, win 64, options [nop,nop,TS val 1144417550 ecr 3883229824], length 0
+1786477249.627849 ?     In  IP 10.202.145.10.18080 > 10.202.144.10.45124: Flags [P.], seq 1:60, ack 197, win 64, options [nop,nop,TS val 1144417550 ecr 3883229824], length 59
+1786477249.627861 ?     Out IP 10.202.144.10.45124 > 10.202.145.10.18080: Flags [.], ack 60, win 64, options [nop,nop,TS val 3883229824 ecr 1144417550], length 0
+1786477249.627875 ?     In  IP 10.202.145.10.18080 > 10.202.144.10.45124: Flags [P.], seq 60:690, ack 197, win 64, options [nop,nop,TS val 1144417550 ecr 3883229824], length 630
+1786477249.627880 ?     Out IP 10.202.144.10.45124 > 10.202.145.10.18080: Flags [.], ack 690, win 64, options [nop,nop,TS val 3883229824 ecr 1144417550], length 0
+1786477249.627890 ?     In  IP 10.202.145.10.18080 > 10.202.144.10.45124: Flags [F.], seq 690, ack 197, win 64, options [nop,nop,TS val 1144417550 ecr 3883229824], length 0
+1786477249.627929 ?     Out IP 10.202.144.10.45124 > 10.202.145.10.18080: Flags [F.], seq 197, ack 691, win 64, options [nop,nop,TS val 3883229824 ecr 1144417550], length 0
+1786477249.627957 ?     In  IP 10.202.145.10.18080 > 10.202.144.10.45124: Flags [.], ack 198, win 64, options [nop,nop,TS val 1144417550 ecr 3883229824], length 0

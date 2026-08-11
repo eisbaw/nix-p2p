@@ -1,0 +1,5 @@
+{"expected_host":"task138-authority.invalid","image_revision":"b46bbba2fe9e4f67a49afa299f6bf35ea4063afb","namespace":"task138-evidence-r1b9786-9b4cd124428b","node_id":"3b1a4366624e8f1ce7ed6ef2142540d9942d469f94c1a712ce506200a39c08fe","owner":"nix-p2p-task138-evidence","recipient":"task138-authority:v1","responses":[{"expires_unix_micros":null,"hang":true,"locations":[],"ordinal":1,"relay_payload_blake3_hex":null,"relay_payload_bytes":null,"relay_payload_hex":null,"sequence":null,"state":null,"status":null,"ttl_seconds":null}],"run_id":"r1b9786-9b4cd124428b","scenario":"hanging","schema":"iroh-node-lookup-fixture-plan-v1","signer":"8cprg3unj48t339pp53bejky5gkn4tw91uy4qrsqkbtybehhbd9y"}
+iroh_node_lookup_fixture_ready scenario=hanging listen=10.202.145.10:18080 node_id=3b1a4366624e8f1ce7ed6ef2142540d9942d469f94c1a712ce506200a39c08fe signer=8cprg3unj48t339pp53bejky5gkn4tw91uy4qrsqkbtybehhbd9y requests=1
+iroh_node_lookup_fixture_request scenario=hanging attempt=1
+iroh_node_lookup_fixture_cancelled scenario=hanging attempt=1 observed_after_ms=10000
+iroh_node_lookup_fixture_complete scenario=hanging observed_requests=1 expected_requests=1 surplus_observation_ms=250
