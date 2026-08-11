@@ -138,9 +138,11 @@ operation.
 
 Routed evidence places resolver and authority on two separate internal Podman
 networks created with `--disable-dns`; an explicit L3 router joins both. Capture
-inside the resolver network namespace records all IPv4 and IPv6 traffic. The
-finalizer admits only resolver↔authority TCP on port 18080 and rejects DNS or
-any other destination. The positive, empty-namespace, and signed-withdrawal
+inside the resolver network namespace records every TCP or UDP packet. This
+product-transport scope includes DNS over UDP or TCP, pkarr HTTP, Iroh QUIC
+direct/relay/content traffic, DHT UDP, and LAN mDNS. The finalizer admits only
+resolver↔authority IPv4 TCP on port 18080 and rejects UDP, IPv6 transport, DNS,
+or any other destination. The positive, empty-namespace, and signed-withdrawal
 arms use the real Task137 authority; the live and withdrawal outcomes are bound
 to the exact preserved signed packet hash and sequence. The publisher is absent
 during lookup capture. A feature-gated fixture is limited to responses that the
@@ -149,13 +151,23 @@ lower sequence, conflicting equal sequence, expired, validly signed live-empty,
 and a hanging response whose client-side cancellation is observed. A separate
 inert routed recipient proves typed connection refusal.
 
+Autonomous kernel control-plane traffic is outside this product-transport
+claim: fresh namespaces can emit ICMP/ICMPv6 neighbor discovery and router
+solicitations, IGMP, or IPv6 MLD independently of daemon behavior. The harness
+does not mislabel those packets as application discovery, wait an arbitrary
+interval hoping they stop, or silently allowlist individual control messages.
+It scopes the claim at the capture filter itself and records that exact closed
+scope in raw evidence and the artifact. All TCP and UDP traffic during the
+actual application measurement remains captured.
+
 Every network arm sends only the canonical zero-body GET for its one signer.
-The finalizer independently parses classic pcap bytes and rejects surplus TCP
-connection attempts as well as publication PUT, content paths, relay
-connections, LAN discovery, DNS, or unrelated egress. Default-off,
-offline-disabled, and offline-enabled controls each require zero captured IP
-packets. Every attempt must complete within the 10,000 ms deadline plus at most
-1,000 ms observer grace; the hanging arm must also consume at least 9,000 ms.
+The finalizer independently parses classic pcap bytes and rejects every UDP or
+IPv6 transport packet, surplus TCP connection attempts, publication PUT,
+content paths, relay connections, LAN discovery, DNS, or unrelated egress.
+Default-off, offline-disabled, and offline-enabled controls each require zero
+captured TCP/UDP packets. Every attempt must complete within the 10,000 ms
+deadline plus at most 1,000 ms observer grace; the hanging arm must also consume
+at least 9,000 ms.
 
 The finalizer in `scripts/finalize_iroh_node_lookup.py` emits
 `iroh-node-lookup-artifact-v1`, validated against

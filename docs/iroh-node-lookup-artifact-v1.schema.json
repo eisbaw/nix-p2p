@@ -66,9 +66,9 @@
       "additionalProperties": false,
       "properties": {
         "dns_enabled": { "const": false },
-        "filter": { "const": "ip or ip6" },
+        "filter": { "const": "tcp or udp" },
         "interface": { "const": "any" },
-        "scope": { "const": "all-ip-in-resolver-netns-v1" }
+        "scope": { "const": "all-tcp-udp-in-resolver-netns-v1" }
       },
       "required": ["scope", "interface", "filter", "dns_enabled"],
       "type": "object"
@@ -103,7 +103,7 @@
     "control": {
       "additionalProperties": false,
       "properties": {
-        "captured_ip_packets": { "const": 0 },
+        "captured_transport_packets": { "const": 0 },
         "elapsed_ns": { "minimum": 0, "type": "integer" },
         "fail_closed": { "type": "boolean" },
         "lookup_enabled": { "type": "boolean" },
@@ -118,7 +118,7 @@
         "offline",
         "fail_closed",
         "elapsed_ns",
-        "captured_ip_packets"
+        "captured_transport_packets"
       ],
       "type": "object"
     },

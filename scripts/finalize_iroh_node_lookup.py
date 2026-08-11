@@ -608,8 +608,8 @@ def validate_run_header(
     expected_constants = {
         "schema": RAW_SCHEMA,
         "profile": "production-shaped-local",
-        "capture_scope": "all-ip-in-resolver-netns-v1",
-        "capture_filter": "ip or ip6",
+        "capture_scope": "all-tcp-udp-in-resolver-netns-v1",
+        "capture_filter": "tcp or udp",
         "capture_interface": "any",
         "dns_enabled": False,
         "relay_enabled": False,
@@ -768,7 +768,7 @@ def validate_capture_bytes(
     frames = parse_classic_pcap(data, scenario)
     if expected_attempts == 0:
         if frames:
-            fail(f"{scenario} control emitted {len(frames)} IP packets")
+            fail(f"{scenario} control emitted {len(frames)} TCP/UDP packets")
         return CaptureFacts(0, 0, 0, 0)
     if node_id is None:
         fail(f"{scenario} lookup capture has no NodeId binding")
@@ -875,7 +875,9 @@ def validate_capture_files(
         node_id=node_id,
         expected_attempts=expected_attempts,
     )
-    observed_count = require_int(recorded_count, f"{scenario}.captured_ip_packet_count")
+    observed_count = require_int(
+        recorded_count, f"{scenario}.captured_transport_packet_count"
+    )
     if facts.packet_count != observed_count:
         fail(f"{scenario} observation and independently decoded pcap counts differ")
     packets_log = read_evidence(root, index, f"{scenario}.packets.log")
@@ -913,7 +915,7 @@ CONTROL_KEYS = {
     "process_elapsed_ns",
     "process_exit_code",
     "capture_exit_code",
-    "captured_ip_packet_count",
+    "captured_transport_packet_count",
     "outcome",
 }
 
@@ -943,8 +945,11 @@ def validate_control(
     )
     if control["scenario"] != scenario or observed != expected:
         fail(f"{scenario} control flags/outcome drifted: {observed!r}")
-    if control["capture_exit_code"] != 0 or control["captured_ip_packet_count"] != 0:
-        fail(f"{scenario} did not produce a complete zero-packet capture")
+    if (
+        control["capture_exit_code"] != 0
+        or control["captured_transport_packet_count"] != 0
+    ):
+        fail(f"{scenario} did not produce a complete zero-transport-packet capture")
     gate = require_int(control["gate_release_monotonic_ns"], f"{scenario}.gate")
     completed = require_int(
         control["process_completed_monotonic_ns"], f"{scenario}.completed"
@@ -970,7 +975,7 @@ def validate_control(
         authority_ip=authority_ip,
         node_id=None,
         expected_attempts=0,
-        recorded_count=control["captured_ip_packet_count"],
+        recorded_count=control["captured_transport_packet_count"],
     )
     return control
 
@@ -987,7 +992,7 @@ BASE_LOOKUP_KEYS = {
     "postprocessing_completed_monotonic_ns",
     "resolver_exit_code",
     "capture_exit_code",
-    "captured_ip_packet_count",
+    "captured_transport_packet_count",
     "outcome",
 }
 LOOKUP_EXTRA_KEYS = {
@@ -1267,7 +1272,7 @@ def validate_lookup_observation(
         authority_ip=authority_ip,
         node_id=node_id,
         expected_attempts=ATTEMPTS[scenario],
-        recorded_count=observation["captured_ip_packet_count"],
+        recorded_count=observation["captured_transport_packet_count"],
     )
     del outcome
     return observation, facts
@@ -1991,7 +1996,9 @@ def summarize(
             "offline": observations[scenario]["offline"],
             "fail_closed": observations[scenario]["expected_fail_closed"],
             "elapsed_ns": observations[scenario]["process_elapsed_ns"],
-            "captured_ip_packets": observations[scenario]["captured_ip_packet_count"],
+            "captured_transport_packets": observations[scenario][
+                "captured_transport_packet_count"
+            ],
         }
         for scenario in CONTROL_SCENARIOS
     ]
@@ -2032,9 +2039,9 @@ def summarize(
             "external_contact_authorized": False,
         },
         "capture": {
-            "scope": "all-ip-in-resolver-netns-v1",
+            "scope": "all-tcp-udp-in-resolver-netns-v1",
             "interface": "any",
-            "filter": "ip or ip6",
+            "filter": "tcp or udp",
             "dns_enabled": False,
         },
         "boundaries": {
@@ -2411,7 +2418,20 @@ def self_test() -> None:
             node_id=node_id,
             expected_attempts=1,
         ),
-        "IPv6-egress",
+        "IPv6-transport-egress",
+    )
+    udp = bytearray(_selftest_capture(request))
+    udp[first_frame + 20 + 9] = 17
+    _expect_rejected(
+        lambda: validate_capture_bytes(
+            bytes(udp),
+            scenario="live",
+            resolver_ip="10.192.1.10",
+            authority_ip="10.192.2.20",
+            node_id=node_id,
+            expected_attempts=1,
+        ),
+        "UDP-egress",
     )
     _expect_rejected(
         lambda: validate_capture_bytes(

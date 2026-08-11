@@ -3,9 +3,10 @@
 
 The resolver and authority live on different rootless-Podman internal networks
 with DNS disabled.  A deliberately tiny L3 router is the only route between
-them.  tcpdump joins the resolver network namespace and captures *all* IPv4 and
-IPv6 traffic, so the finalizer can reject DNS, relay, content, publication, or
-any destination other than the pinned authority.
+them. tcpdump joins the resolver network namespace and captures every TCP or
+UDP packet, so the finalizer can reject DNS, relay, content, publication, or any
+destination other than the pinned authority. Autonomous kernel ICMP/IGMP/MLD
+network convergence is explicitly outside this product-transport scope.
 
 The positive, empty-namespace, and withdrawal arms use the production Task137
 authority/publisher. The feature-gated fixture is used only for records a
@@ -45,7 +46,7 @@ IROH_PORT = 44330
 DAEMON_HTTP_PORT = 8082
 REAL_RECORD_TTL_SECONDS = 120
 REAL_RECORD_REFRESH_SECONDS = 60
-CAPTURE_FILTER = "ip or ip6"
+CAPTURE_FILTER = "tcp or udp"
 CAPTURE_INTERFACE = "any"
 DEADLINE_NS = 10_000_000_000
 OBSERVER_GRACE_NS = 1_000_000_000
@@ -466,6 +467,27 @@ def fixture_command(
         config.owner,
         "--image-revision",
         image_revision,
+    ]
+
+
+def inert_refusal_command(config: RunConfig, topology: Topology) -> list[str]:
+    """Run a no-listener authority-IP owner whose PID 1 handles shutdown."""
+
+    return [
+        *routed_container_prefix(
+            config,
+            topology,
+            name=topology.fixture("refused"),
+            network=topology.authority_network,
+            address=topology.authority_ip,
+        ),
+        config.image,
+        *route_wrapper(topology.resolver_subnet, topology.router_authority_ip),
+        "/bin/bash",
+        "-euc",
+        'child=; trap \'test -z "$child" || '
+        'kill "$child" 2>/dev/null || true; exit 0\' TERM INT; '
+        'while :; do /bin/sleep 3600 & child=$!; wait "$child" || true; done',
     ]
 
 
@@ -977,7 +999,7 @@ def run_zero_control(
     packet_count = sum(1 for line in result.stdout.splitlines() if line.strip())
     publication.validate_complete_capture(scenario, capture_log, packet_count)
     if packet_count != 0 or capture_exit != 0:
-        fail(f"{scenario} emitted {packet_count} IP packet(s) or lost capture")
+        fail(f"{scenario} emitted {packet_count} TCP/UDP packet(s) or lost capture")
     if scenario == "offline-enabled":
         if (
             process_exit != 1
@@ -1000,7 +1022,7 @@ def run_zero_control(
         "process_elapsed_ns": completed_monotonic_ns - released_monotonic_ns,
         "process_exit_code": process_exit,
         "capture_exit_code": capture_exit,
-        "captured_ip_packet_count": packet_count,
+        "captured_transport_packet_count": packet_count,
         "outcome": "fail-before-bind"
         if scenario == "offline-enabled"
         else "inert-no-query",
@@ -1139,7 +1161,7 @@ def capture_and_resolve(
         "postprocessing_completed_monotonic_ns": time.monotonic_ns(),
         "resolver_exit_code": resolver_exit,
         "capture_exit_code": capture_exit,
-        "captured_ip_packet_count": packet_count,
+        "captured_transport_packet_count": packet_count,
         "outcome": outcome,
     }
 
@@ -1628,21 +1650,7 @@ def run_refused_arm(
     node_id: str,
 ) -> dict[str, object]:
     inert = topology.fixture("refused")
-    runner.run(
-        [
-            *routed_container_prefix(
-                config,
-                topology,
-                name=inert,
-                network=topology.authority_network,
-                address=topology.authority_ip,
-            ),
-            config.image,
-            *route_wrapper(topology.resolver_subnet, topology.router_authority_ip),
-            "/bin/sleep",
-            "infinity",
-        ]
-    )
+    runner.run(inert_refusal_command(config, topology))
     outcome, observation = capture_and_resolve(
         runner,
         config,
@@ -1776,7 +1784,7 @@ def run_evidence(config: RunConfig) -> None:
             run = {
                 "schema": SCHEMA,
                 "profile": "production-shaped-local",
-                "capture_scope": "all-ip-in-resolver-netns-v1",
+                "capture_scope": "all-tcp-udp-in-resolver-netns-v1",
                 "capture_filter": CAPTURE_FILTER,
                 "capture_interface": CAPTURE_INTERFACE,
                 "dns_enabled": False,
@@ -1844,6 +1852,7 @@ def command_plan(
             publication_enabled=True,
         ),
         "fixture": fixture_command(config, topology, "bad-signature", "1" * 40),
+        "inert_refusal": inert_refusal_command(config, topology),
         "control_default_off": control_command(
             config, topology, "default-off", root, root
         ),
@@ -1941,7 +1950,7 @@ def self_test() -> None:
         for label in ("network_resolver", "network_authority"):
             assert "--internal" in commands[label]
             assert "--disable-dns" in commands[label]
-        assert commands["capture"][-1] == "ip or ip6"
+        assert commands["capture"][-1] == "tcp or udp"
         assert f"container:{topology.resolver('bad-signature')}" in commands["capture"]
         resolver = commands["resolver"]
         assert resolver.count("--node-id") == 1
@@ -1954,6 +1963,9 @@ def self_test() -> None:
         assert "/bin/iroh-node-lookup-fixture" in commands["fixture"]
         assert "--run-id" in commands["fixture"]
         assert "--image-revision" in commands["fixture"]
+        assert "/bin/bash" in commands["inert_refusal"]
+        assert "TERM INT" in commands["inert_refusal"][-1]
+        assert "sleep infinity" not in commands["inert_refusal"][-1]
         assert "--iroh-enable-node-lookup" not in commands["control_default_off"]
         assert "offline-test" in commands["control_offline_disabled"]
         assert "--iroh-enable-node-lookup" in commands["control_offline_enabled"]
