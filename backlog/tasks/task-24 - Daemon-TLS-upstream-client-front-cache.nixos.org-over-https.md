@@ -4,7 +4,7 @@ title: Daemon TLS upstream client (front cache.nixos.org over https)
 status: To Do
 assignee: []
 created_date: '2026-08-08 08:16'
-updated_date: '2026-08-10 22:55'
+updated_date: '2026-08-11 06:00'
 labels:
   - wave1-followup
   - daemon
@@ -25,5 +25,5 @@ TASK-4 shipped the daemon upstream client (UpstreamHttp) as plain HTTP only (dae
 - [ ] #2 verbatim byte forwarding + no auto-decompression preserved over TLS (AC#6 property holds)
 - [ ] #3 TLS validates the certificate chain against configured/system roots and validates hostname/SNI; production mode has no insecure-skip-verify path.
 - [ ] #4 End-to-end negative bites reject untrusted self-signed, wrong-hostname and expired certificates before forwarding/caching bytes, while a fixture-CA valid hostname and real cache.nixos.org succeed.
-- [ ] #5 DNS/connect/TLS handshake obey numeric connect/total deadlines and a stalled handshake fails within the asserted bound without disabling HTTPS fallback behavior.
+- [ ] #5 The daemon consumes tls-upstream-v1 unchanged: one 10000 ms total covers DNS, TCP connect and TLS handshake, with connect and handshake each capped at 5000 ms inside that total. Stalled stages fail within the bound and preserve fallback behavior; monotonic tests allow at most 1000 ms scheduler grace without extending configuration.
 <!-- AC:END -->
