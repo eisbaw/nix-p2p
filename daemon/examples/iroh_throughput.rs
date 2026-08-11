@@ -131,13 +131,14 @@
 //! iroh).
 
 use std::collections::HashMap;
-use std::net::SocketAddr;
 use std::time::Instant;
 
 use bao_tree::io::BaoContentItem;
+use daemon::transport_iroh::endpoint_support::{
+    DAEMON_ENDPOINT_PROFILE, EndpointProfile, bind_endpoint, endpoint_addr, provider_addr,
+};
 use daemon::{Blake3Digest, IrohProvider, IrohTransport, KnownTransport, Transport};
-use iroh::endpoint::{RelayMode, presets};
-use iroh::{Endpoint, EndpointAddr, PublicKey};
+use iroh::{Endpoint, EndpointAddr};
 use iroh_blobs::Hash;
 use iroh_blobs::get::request::{GetBlobItem, get_blob};
 use n0_future::StreamExt;
@@ -149,6 +150,19 @@ const SIZES_MIB: &[usize] = &[8, 32, 110];
 /// Repeats per (arm, size). The spread across repeats is reported, because a
 /// single draw on a loaded host is an anecdote.
 const REPEATS: usize = 5;
+
+/// The endpoint profile selected by every raw-QUIC and raw-iroh arm.
+///
+/// Keep this selector distinct from the daemon selector: the compile-time guard
+/// below is what turns a one-sided mutation into a deterministic failure rather
+/// than silently changing the `iroh_collect -> daemon_fetch` residual.
+const BENCHMARK_ENDPOINT_PROFILE: EndpointProfile =
+    EndpointProfile::MinimalIpv4LoopbackNoRelay { port: 0 };
+
+const _: () = assert!(
+    BENCHMARK_ENDPOINT_PROFILE.same_configuration(DAEMON_ENDPOINT_PROFILE),
+    "TASK-69: benchmark and daemon selected different Iroh endpoint profiles",
+);
 
 /// The bite `dial_and_stream` takes when copying leaf data, and the bite this
 /// bench's `memcpy_16k` arm uses so the two are comparable.
@@ -509,29 +523,12 @@ where
 // bench can drive `get_blob` with NO timeouts, NO accumulation and NO re-hash.
 // ---------------------------------------------------------------------------
 
-/// Bind a bare loopback endpoint (relay disabled, no discovery) - the same
-/// configuration `transport_iroh::bind_loopback_endpoint` uses, restated here
-/// because that helper is private to the daemon.
+/// Bind through the daemon-owned endpoint constructor. The explicit benchmark
+/// selector is compile-time checked against the daemon selector above.
 async fn bare_endpoint() -> Endpoint {
-    let loopback: SocketAddr = "127.0.0.1:0".parse().expect("loopback literal parses");
-    Endpoint::builder(presets::Minimal)
-        .relay_mode(RelayMode::Disabled)
-        .bind_addr(loopback)
-        .expect("bind addr accepted")
-        .bind()
+    bind_endpoint(BENCHMARK_ENDPOINT_PROFILE)
         .await
-        .expect("endpoint binds")
-}
-
-/// The provider's dialable address, built for the bare endpoint (which cannot
-/// take the daemon's opaque `IrohPeerAddr`).
-fn provider_endpoint_addr(provider: &IrohProvider) -> EndpointAddr {
-    let key = PublicKey::from_bytes(provider.node_id().as_bytes()).expect("provider key on curve");
-    let mut addr = EndpointAddr::new(key);
-    for socket in provider.socket_addrs() {
-        addr = addr.with_ip_addr(socket);
-    }
-    addr
+        .expect("daemon-owned benchmark endpoint profile binds")
 }
 
 /// What the fetch arms do with each arriving leaf.
@@ -884,13 +881,8 @@ async fn main() {
 
         // --- raw QUIC: the SAME endpoint stack with blobs/bao removed ------
         let raw_provider_endpoint = bare_endpoint().await;
-        let raw_provider_addr = {
-            let mut addr = EndpointAddr::new(raw_provider_endpoint.id());
-            for socket in raw_provider_endpoint.bound_sockets() {
-                addr = addr.with_ip_addr(socket);
-            }
-            addr
-        };
+        let raw_provider_addr =
+            endpoint_addr(&raw_provider_endpoint).expect("raw provider has a dialable address");
         let raw_router = iroh::protocol::Router::builder(raw_provider_endpoint.clone())
             .accept(RAW_QUIC_ALPN, RawQuicResponder { payload: data })
             .spawn();
@@ -929,7 +921,7 @@ async fn main() {
         // --- the provider the fetch arms read from -------------------------
         let provider = IrohProvider::spawn().await.expect("provider spawns");
         let digest = provider.seed(data).await.expect("seed succeeds");
-        let addr = provider_endpoint_addr(&provider);
+        let addr = provider_addr(&provider).expect("provider has a dialable address");
 
         // --- the transport alone, then + copy, then the product path -------
         let bare = bare_endpoint().await;
@@ -1023,5 +1015,18 @@ async fn main() {
         bare.close().await;
         client.shutdown().await;
         provider.shutdown().await;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn benchmark_endpoint_profile_matches_daemon() {
+        assert_eq!(
+            BENCHMARK_ENDPOINT_PROFILE, DAEMON_ENDPOINT_PROFILE,
+            "TASK-69: raw benchmark arms and daemon transport must select one endpoint profile"
+        );
     }
 }

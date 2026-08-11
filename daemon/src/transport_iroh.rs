@@ -35,12 +35,16 @@
 //!
 //! ## Relay / discovery (honest scope)
 //!
-//! Both endpoints are built with the n0 relay DISABLED ([`RelayMode::Disabled`])
-//! and NO discovery (the `Minimal` preset), so this transport - and its test - need
-//! no external relay server: the client dials the peer's DIRECT address on
-//! loopback. In production a discovery layer (task-40) resolves a `NodeId` to an
-//! address; here [`IrohTransport::add_peer`] stands in for that resolution (an
-//! in-memory address book keyed by `NodeId`). n0 relay dependence for WAN
+//! Both endpoints use the `Minimal` preset, disable n0 relay
+//! ([`iroh::endpoint::RelayMode::Disabled`]), and replace the default IPv4 bind
+//! with `127.0.0.1`. The cross-process test harness selects that concrete direct
+//! IPv4 address without an address-lookup service or relay. This is NOT an
+//! offline or loopback-only profile: pinned iroh retains its default IPv6
+//! wildcard transport plus port-mapper and net-report defaults. TASK-115 owns
+//! genuinely offline test isolation. In production a discovery layer (task-40)
+//! resolves a `NodeId` to an address; here [`IrohTransport::add_peer`] stands in
+//! for that resolution with an in-memory address book keyed by `NodeId`. n0 relay
+//! dependence for WAN
 //! holepunch is a known soft-centralization limit (PRD); solving it is out of
 //! scope. A coarse dial/fetch TIMEOUT ([`FETCH_TIMEOUT`]) guards against an
 //! unbounded hang; the full safety envelope (per-request abort, the signed NarSize
@@ -56,7 +60,6 @@ use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use bao_tree::io::BaoContentItem;
-use iroh::endpoint::{RelayMode, presets};
 use iroh::protocol::Router;
 use iroh::{Endpoint, EndpointAddr, PublicKey};
 use iroh_blobs::api::TempTag;
@@ -1171,9 +1174,12 @@ pub struct IrohProvider {
 }
 
 impl IrohProvider {
-    /// Bind a provider endpoint on loopback with the relay DISABLED and NO
-    /// discovery, and start serving its (initially empty) blob store under the
-    /// iroh-blobs ALPN. Seed blobs with [`Self::seed`].
+    /// Bind a provider with the `Minimal` preset, relay disabled, and the default
+    /// IPv4 bind replaced by `127.0.0.1`, then start serving its initially empty
+    /// blob store under the iroh-blobs ALPN. Seed blobs with [`Self::seed`].
+    /// Pinned iroh still retains its IPv6 wildcard transport, port mapper and
+    /// net-report defaults, so this constructor is not offline or loopback-only;
+    /// TASK-115 owns genuine offline isolation.
     ///
     /// Retention is [`StoreRetention::RetainAll`] and there is NO on-demand
     /// supplier: this is the "a test seeds a blob and fetches it" constructor, not
@@ -1215,7 +1221,8 @@ impl IrohProvider {
         budget: ServeBudget,
         supplier: Option<Arc<dyn NarSupplier>>,
     ) -> Result<Self, IrohError> {
-        let endpoint = bind_loopback_endpoint().await?;
+        let endpoint =
+            endpoint_support::bind_endpoint(endpoint_support::DAEMON_ENDPOINT_PROFILE).await?;
         let gate = Arc::new(ServeGate {
             budget,
             supplier,
@@ -1603,27 +1610,27 @@ impl IrohProvider {
         NodeId::from_bytes(*self.endpoint.id().as_bytes())
     }
 
-    /// The concrete direct sockets this provider is bound to. In the wave-2a pod
-    /// these are loopback (`127.0.0.1:PORT`), reachable by a peer in the SAME
-    /// (shared) pod network namespace. node B prints these so node A can dial it
-    /// with no relay/discovery; a real discovery/DHT (task-47) resolves them.
+    /// Every concrete socket reported by iroh for this provider. The current
+    /// profile overrides the IPv4 bind to `127.0.0.1:PORT`, but pinned iroh also
+    /// retains its default IPv6 wildcard socket. Callers must therefore not assume
+    /// every returned address is loopback or externally dialable. In the wave-2a
+    /// shared pod, the harness selects the concrete IPv4 loopback address from
+    /// this list so node A can dial it without relay/address lookup; a real
+    /// discovery/DHT (task-47) resolves deployment addresses.
     pub fn socket_addrs(&self) -> Vec<SocketAddr> {
         self.endpoint.bound_sockets()
     }
 
-    /// This provider's dialable address (node id + bound loopback sockets), for a
-    /// client to reach it directly with no relay/discovery. Stands in for what a
-    /// discovery layer (task-40) resolves a `NodeId` to.
+    /// This provider's endpoint address, assembled from its node id and every
+    /// socket iroh reports as bound. Under the current profile that includes the
+    /// requested IPv4 loopback socket and may include iroh's inherited IPv6
+    /// wildcard socket; it is not proof of offline or loopback-only binding. This
+    /// in-process stand-in carries the complete endpoint address. A publisher
+    /// crossing a process/network boundary must discard unspecified sockets and
+    /// publish only reachable addresses, as the e2e harness does; task-40 owns the
+    /// discovery result for a real `NodeId`.
     pub async fn addr(&self) -> Result<IrohPeerAddr, IrohError> {
-        let sockets = self.endpoint.bound_sockets();
-        if sockets.is_empty() {
-            return Err(IrohError::NoBoundAddress);
-        }
-        let mut addr = EndpointAddr::new(self.endpoint.id());
-        for socket in sockets {
-            addr = addr.with_ip_addr(socket);
-        }
-        Ok(IrohPeerAddr(addr))
+        endpoint_support::endpoint_addr(&self.endpoint).map(IrohPeerAddr)
     }
 
     /// Stop serving and close the endpoint (best-effort).
@@ -1653,11 +1660,15 @@ pub struct IrohTransport {
 }
 
 impl IrohTransport {
-    /// Bind a client endpoint on loopback with the relay DISABLED and NO
-    /// discovery. Register the peers it may dial with [`Self::add_peer`]. Uses the
-    /// default (PROVISIONAL) [`SafetyEnvelope`]; override with [`Self::with_envelope`].
+    /// Bind a client with the `Minimal` preset, relay disabled, and the default
+    /// IPv4 bind replaced by `127.0.0.1`. Pinned iroh retains its IPv6 wildcard
+    /// transport, port mapper and net-report defaults, so this is not an offline
+    /// or loopback-only bind; TASK-115 owns genuine offline isolation. Register
+    /// peers with [`Self::add_peer`]. Uses the default (PROVISIONAL)
+    /// [`SafetyEnvelope`]; override with [`Self::with_envelope`].
     pub async fn spawn() -> Result<Self, IrohError> {
-        let endpoint = bind_loopback_endpoint().await?;
+        let endpoint =
+            endpoint_support::bind_endpoint(endpoint_support::DAEMON_ENDPOINT_PROFILE).await?;
         Ok(Self {
             endpoint,
             peers: Mutex::new(HashMap::new()),
@@ -1863,21 +1874,114 @@ impl Transport for IrohTransport {
 }
 
 // -------------------------------------------------------------------------
-// Shared: bind a loopback endpoint with relay disabled and no discovery.
+// Shared endpoint construction and address conversion.
 // -------------------------------------------------------------------------
 
-/// Bind an iroh endpoint on `127.0.0.1:0` (an OS-assigned loopback port) with the
-/// relay DISABLED and the `Minimal` preset (no discovery/address-lookup), so two
-/// in-process endpoints connect by DIRECT address with no external relay. Binding
-/// to loopback explicitly (not the default `0.0.0.0`) makes `bound_sockets()`
-/// return a deterministically dialable `127.0.0.1:PORT`.
-async fn bind_loopback_endpoint() -> Result<Endpoint, IrohError> {
-    let loopback: SocketAddr = "127.0.0.1:0".parse().expect("loopback literal parses");
-    Endpoint::builder(presets::Minimal)
-        .relay_mode(RelayMode::Disabled)
-        .bind_addr(loopback)
-        .map_err(|e| IrohError::Bind(e.to_string()))?
-        .bind()
-        .await
-        .map_err(|e| IrohError::Bind(e.to_string()))
+/// The narrow integration seam shared with the raw-QUIC throughput example.
+///
+/// # Deliberate boundary exception
+///
+/// Product callers normally use [`IrohPeerAddr`], [`IrohProvider`] and
+/// [`IrohTransport`] so iroh types remain opaque. Cargo examples are separate
+/// crates, however, and the TASK-64 raw-QUIC arm must install a private ALPN on
+/// the exact [`Endpoint`] construction path used by the daemon. This hidden
+/// module therefore exposes [`Endpoint`] and [`EndpointAddr`] deliberately and
+/// only for that measurement integration. Keeping the exception here makes the
+/// endpoint builder and address conversion single sources of truth; it is not a
+/// general transport API.
+#[doc(hidden)]
+pub mod endpoint_support {
+    use std::net::{Ipv4Addr, SocketAddrV4};
+
+    use iroh::endpoint::{RelayMode, presets};
+    use iroh::{Endpoint, EndpointAddr};
+
+    use super::{IrohError, IrohProvider};
+
+    /// A typed selection of the daemon-owned endpoint builder overrides.
+    ///
+    /// Adding a future deployment profile extends this enum and the one
+    /// [`bind_endpoint`] match instead of creating another builder chain. Iroh
+    /// defaults not named by a variant remain in effect. Port zero requests an
+    /// OS-assigned ephemeral port.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum EndpointProfile {
+        /// Minimal preset, relay disabled, and the default IPv4 bind replaced by
+        /// `127.0.0.1`. This deliberately preserves the TASK-69 behavior: iroh's
+        /// other defaults, including its IPv6 transport, port mapper and net-report
+        /// configuration, remain in effect. TASK-115 owns a genuinely offline
+        /// test profile.
+        MinimalIpv4LoopbackNoRelay { port: u16 },
+    }
+
+    impl EndpointProfile {
+        /// Const equality for the benchmark's compile-time parity guard.
+        ///
+        /// This is deliberately exhaustive: adding a profile variant cannot
+        /// leave the guard with an implicit or wildcard notion of equivalence.
+        pub const fn same_configuration(self, other: Self) -> bool {
+            match (self, other) {
+                (
+                    Self::MinimalIpv4LoopbackNoRelay { port: left },
+                    Self::MinimalIpv4LoopbackNoRelay { port: right },
+                ) => left == right,
+            }
+        }
+    }
+
+    /// The endpoint profile selected by daemon providers and fetchers.
+    ///
+    /// The benchmark has its own explicit selector and a compile-time assertion
+    /// that it equals this value. That assertion makes a one-sided selection
+    /// change fail rather than silently contaminating a subtraction-ladder arm.
+    pub const DAEMON_ENDPOINT_PROFILE: EndpointProfile =
+        EndpointProfile::MinimalIpv4LoopbackNoRelay { port: 0 };
+
+    /// Bind one endpoint through the daemon-owned construction path.
+    ///
+    /// This is public only through the hidden measurement seam documented on
+    /// this module. Returning [`Endpoint`] is the deliberate Iroh-boundary breach
+    /// required for the raw-QUIC benchmark to register its private ALPN.
+    pub async fn bind_endpoint(profile: EndpointProfile) -> Result<Endpoint, IrohError> {
+        match profile {
+            EndpointProfile::MinimalIpv4LoopbackNoRelay { port } => {
+                let loopback = SocketAddrV4::new(Ipv4Addr::LOCALHOST, port);
+                Endpoint::builder(presets::Minimal)
+                    .relay_mode(RelayMode::Disabled)
+                    .bind_addr(loopback)
+                    .map_err(|error| {
+                        IrohError::Bind(format!("accepting endpoint profile {profile:?}: {error}"))
+                    })?
+                    .bind()
+                    .await
+                    .map_err(|error| {
+                        IrohError::Bind(format!("binding endpoint profile {profile:?}: {error}"))
+                    })
+            }
+        }
+    }
+
+    /// Build the canonical directly dialable address for a bound endpoint.
+    ///
+    /// This is public only through the hidden measurement seam documented on
+    /// this module. Its [`Endpoint`] and [`EndpointAddr`] types are the deliberate
+    /// Iroh-boundary breach required by the raw benchmark arms.
+    pub fn endpoint_addr(endpoint: &Endpoint) -> Result<EndpointAddr, IrohError> {
+        let sockets = endpoint.bound_sockets();
+        if sockets.is_empty() {
+            return Err(IrohError::NoBoundAddress);
+        }
+        let mut addr = EndpointAddr::new(endpoint.id());
+        for socket in sockets {
+            addr = addr.with_ip_addr(socket);
+        }
+        Ok(addr)
+    }
+
+    /// Return a provider's canonical address in the raw Iroh type the benchmark
+    /// needs. Product callers use [`IrohProvider::addr`] and its opaque
+    /// [`super::IrohPeerAddr`] instead.
+    pub fn provider_addr(provider: &IrohProvider) -> Result<EndpointAddr, IrohError> {
+        endpoint_addr(&provider.endpoint)
+    }
 }
