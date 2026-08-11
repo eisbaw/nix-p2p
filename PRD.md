@@ -212,7 +212,7 @@ Non-goals (explicit):
 | **Announce policy** | **On-demand only**: publish a claim only when a path is fetched through the daemon (round 3, owner) | Demand-proven records; minimal DHT load; supply lags demand — un-announced holdings reachable via peer yes/no queries |
 | **Kill criterion (historical; superseded by TASK-114)** | **<20% net cache-egress cut on the favorable testbed kills the p2p thesis**; p95 build latency regression must stay <10% (round 3, owner) | Preserved provenance; Wave 2c now applies profile-specific margins plus hard latency/privacy/resource constraints rather than killing every context at once |
 | Transport | iroh / iroh-blobs | BLAKE3 incremental verified streaming, QUIC + holepunching |
-| Discovery (historical; superseded by TASK-114/TASK-126) | DHT-authoritative, gossip as accelerant (round 1, owner) | Preserved provenance; the current substrate is evidence-gated and a global-DHT no-go is valid |
+| Discovery (historical; superseded by TASK-114/TASK-126) | DHT-authoritative, gossip as accelerant (round 1, owner) | Preserved provenance; the chosen substrate remains evidence-gated, but production now requires a passing decentralized exact-key mechanism |
 | Latency guardrails | Prefetch + hedge (throughput-abort) | The only thing keeping DHT seconds off the user path — load-bearing |
 | Metadata | cache.nixos.org only + daemon disk cache | Bandwidth offload MVP (round 1, owner) |
 | Privacy (historical; superseded by TASK-114/TASK-120) | Public swarm, documented risk, leech opt-out (round 1, owner) | Preserved provenance; fresh installs are upstream-only/private and LAN/public participation is explicit opt-in |
@@ -246,7 +246,8 @@ Frozen once peers exist (deep-review surfaces):
   fields).
 - **Any selected global discovery mechanism & key derivation** (substrate,
   NarHash→key mapping, record contents). Historically this assumed a DHT;
-  TASK-126 now freezes it only if supported, or records a no-go.
+  TASK-126 now selects and freezes one viable decentralized substrate. Failure
+  to find one blocks production qualification rather than completing the gate.
 - **Trust invariant**: signed narinfo fields untouched + NarHash
   gate. Changes here are security events, not refactors.
 
@@ -504,17 +505,19 @@ oracle that is not peak RSS.
 12. **Stale figures, twice superseded**: fig-candidate-B/C SVGs show
     gossip-first with tracker cold-start. Round 1 superseded that with a
     DHT-authoritative decision; TASK-114 has now superseded both with an
-    evidence-gated mechanism set and explicit unsupported cells. The figures
-    are provenance only until revised to the current contract.
+    evidence-gated mechanism set. Tournament reports may retain unsupported
+    cells, but the product gate requires a passing decentralized global cell.
+    The figures are provenance only until revised to the current contract.
 
 ## Open questions (remaining — deferred to phase 2 unless grilled further)
 
 1. **Global DHT mechanism (historical question, now owned by TASK-126)**
    (frozen surface, needs a spike not a guess):
-   mainline get_peers/announce on a NarHash-derived key vs BEP44
-   records vs iroh-native tracker/content-discovery. Decides
-   NodeId-vs-IP:port dialability (risk 8) and what an announce
-   actually costs. Planned as the first spike of the p2p wave.
+   an Iroh-native decentralized content mechanism if one exists vs a dedicated
+   Kademlia/DHT substrate vs Mainline only after TASK-96. A centralized tracker
+   is an optional comparator, not a candidate for this gate. The decision pins
+   provider NodeId records, bootstrap independence, privacy and announce cost;
+   TASK-89 separately owns NodeId-to-address dialability.
 2. **Peer-query protocol details**: fan-out bound, timeout, how the
    known-peer set is maintained (gossip membership vs past-peer
    cache), and rate-limiting so yes/no probes do not become the new
@@ -578,12 +581,15 @@ public P2P candidate is the correct result.
 
 The invariant boundary remains narrow: signed metadata and trust stay upstream;
 only NAR payload bytes may be decentralized; Nix still enforces signature and
-NarHash. Discovery is now **evidence-gated**, not pre-set DHT-authoritative.
-Tracker, global DHT, bounded direct hold-query and local discovery are
-independent mechanisms behind `ContentDiscovery`. TASK-126 may freeze a global
-Iroh DHT contract or record an evidenced no-go; TASK-103 implements only the
-supported branch and must otherwise expose an explicit unsupported cell. The
-tracker and named-candidate hold-query must not masquerade as a global DHT.
+NarHash. Discovery is **evidence-gated**, but production qualification now
+requires decentralized global exact-key discovery. Global DHT, bounded direct
+hold-query, local discovery and the optional centralized tracker comparator are
+independent mechanisms behind `ContentDiscovery`. TASK-126 must freeze a viable
+decentralized NAR-identity-to-provider-NodeId contract and TASK-103 must
+implement and pass it. An unsupported or central-only result leaves the product
+gate blocked; it is not a completed discovery capability. Tracker and
+named-candidate hold-query must never masquerade as the decentralized global
+path.
 
 The following operations are distinct configuration and evidence axes; enabling
 one never implies another:
@@ -617,21 +623,38 @@ inventory enumeration.
 
 The build order is a gate, not a preference inside the eventual policy:
 
-1. Complete an **operational, zero-content-injection Iroh build** using the
-   persistent shared runtime (TASK-115), then LAN-local address discovery
-   (TASK-130), then the content-discovery seam and LAN BatchHoldQuery vertical
-   slice (TASK-100/TASK-116). Add explicit DNS/pkarr and relay discovery plus the
-   tracker path next (TASK-89/TASK-101). In parallel, TASK-96 feeds the global
-   content-DHT decision (TASK-126) and its supported-or-unsupported implementation
-   branch (TASK-103). The requester may receive operator-level bootstrap
-   configuration, but no peer address, claim, per-content locator, magnet or
+1. Complete the persistent shared runtime (TASK-115), then prove **global Iroh
+   peer and decentralized content discovery before LAN discovery**. TASK-137,
+   TASK-138, TASK-139 and TASK-89 separately own signed NodeId/address
+   publication, exact NodeId lookup, relay transport and their no-address
+   connection proof. TASK-100 and TASK-102 establish the typed content seam and
+   single publication-eligibility gate. TASK-126 freezes a mandatory
+   decentralized exact-key contract and TASK-103 implements NAR identity to
+   bounded provider NodeIds without a central tracker. Native Iroh support is
+   preferred; if Iroh has no suitable content DHT, the selected decentralized
+   discovery substrate remains separate from Iroh identity and transfer.
+   Unsupported or central-only discovery blocks production qualification rather
+   than completing this milestone. TASK-132 runs the cold, zero-peer-injection
+   global real-Nix journey and TASK-133 binds independent review to that exact
+   evidence and code. The requester may receive operator-level bootstrap
+   configuration for multiple independent DHT/routing nodes, but no peer
+   address, claim, per-content locator, magnet, prior peer rendezvous state or
    equivalent test injection. Endpoint bind scope alone never activates
-   discovery or public participation.
-2. Land authenticated HTTPS upstream support (TASK-22/TASK-24) and negotiated,
+   discovery or public participation. TASK-134/TASK-135/TASK-101 are optional
+   centralized tournament comparators after the decentralized path passes; they
+   never satisfy this gate. TASK-96 is consumed only if TASK-126 explicitly
+   selects Mainline as a candidate.
+2. Only TASK-136's versioned admission artifact, derived from a passing global
+   verdict, admits the later LAN component (TASK-130) and LAN BatchHoldQuery
+   vertical slice (TASK-116). A whole-global no-go re-enters phase-2 planning
+   and leaves LAN blocked rather than silently changing the experiment. After
+   both Iroh discovery scopes work, land
+   authenticated HTTPS upstream support (TASK-22/TASK-24) and negotiated,
    bounded Iroh raw/zstd operation (TASK-99). Raw fallback stays explicit. Then
-   TASK-120 makes the operator-mode mapping authoritative and TASK-131 consumes
-   TASK-96/TASK-120 to add approved Mainline address lookup or record it
-   unsupported; both are hard prerequisites for the production-shaped harness.
+   TASK-120 makes the operator-mode mapping authoritative and is a hard
+   prerequisite for the production-shaped harness. TASK-131 may later consume
+   TASK-96/TASK-120 as an optional Mainline address adapter and comparison cell;
+   it does not block or qualify the Iroh harness.
 3. Exercise the production-shaped 10+ node Iroh harness (TASK-87), measure Iroh
    raw and compressed from cold discovery through real-Nix completion (TASK-88),
    then close the fresh-host operator journey (TASK-45). These artifacts are an

@@ -4,7 +4,7 @@ title: 'Iroh peer-link compression: negotiated zstd with raw fallback'
 status: To Do
 assignee: []
 created_date: '2026-08-10 09:10'
-updated_date: '2026-08-10 22:54'
+updated_date: '2026-08-11 20:08'
 labels:
   - wave-2b
 dependencies:
@@ -12,7 +12,6 @@ dependencies:
   - TASK-62
   - TASK-89
   - TASK-94
-  - TASK-101
   - TASK-103
   - TASK-114
   - TASK-115
@@ -50,5 +49,5 @@ MEASURE, DO NOT ASSUME: zstd on nar data may not reach xz's ratio. Report the ac
 ## Implementation Notes
 
 <!-- SECTION:NOTES:BEGIN -->
-Authoritative wave-2c order: operational Iroh node/content discovery (TASK-89/101/103/116) and authenticated HTTPS land first; this task then adds negotiated Iroh zstd; TASK-87/88 exercise raw and compressed Iroh; comparative raw Stage A is TASK-125; BitTorrent starts only at TASK-117/75. Raw fallback remains mandatory.
+Authoritative order: mandatory decentralized Iroh node and content discovery TASK-89/TASK-103/TASK-116 and authenticated HTTPS land first. This task then adds negotiated Iroh zstd; TASK-87/88 exercise raw and compressed Iroh; comparative raw Stage A is TASK-125; BitTorrent starts only at TASK-117/75. Tracker work is optional tournament comparison and is not a prerequisite. Raw fallback remains mandatory.
 <!-- SECTION:NOTES:END -->

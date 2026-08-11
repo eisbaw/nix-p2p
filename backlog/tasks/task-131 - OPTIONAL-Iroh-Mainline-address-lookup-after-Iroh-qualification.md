@@ -1,22 +1,22 @@
 ---
 id: TASK-131
-title: >-
-  Iroh Mainline address lookup: implement approved capability or record
-  unsupported
+title: OPTIONAL Iroh Mainline address lookup after Iroh qualification
 status: To Do
 assignee: []
 created_date: '2026-08-11 03:31'
+updated_date: '2026-08-11 20:08'
 labels:
   - iroh
   - discovery
   - mainline
   - privacy
   - wave-2c
+  - optional
 dependencies:
   - TASK-89
   - TASK-96
   - TASK-120
-priority: high
+priority: medium
 ---
 
 ## Description
@@ -34,3 +34,9 @@ Consume TASK-96 public-Mainline evidence and TASK-120 authoritative operator con
 - [ ] #5 In either branch, runtime capability output is machine-readable supported or evidenced-unsupported and includes decision/code/dependency hashes. Unsupported means no Mainline crate or silent substitute; TASK-87 and tournaments retain an explicit unsupported cell.
 - [ ] #6 This task does not freeze NarHash-to-DHT keys or records and cannot satisfy TASK-126/TASK-103 by address lookup. Bites reject content keys/records, hidden default activation, injected addresses and any configuration path not derived from TASK-120.
 <!-- AC:END -->
+
+## Implementation Notes
+
+<!-- SECTION:NOTES:BEGIN -->
+Deferred until the mandatory Iroh discovery path and operator contract pass. TASK-96 is unconditional only for this optional Mainline capability; it is conditional and dynamically added if TASK-126 itself selects Mainline.
+<!-- SECTION:NOTES:END -->

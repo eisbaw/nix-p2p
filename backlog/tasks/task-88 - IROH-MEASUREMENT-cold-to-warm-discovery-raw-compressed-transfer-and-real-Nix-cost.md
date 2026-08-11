@@ -6,7 +6,7 @@ title: >-
 status: To Do
 assignee: []
 created_date: '2026-08-10 05:55'
-updated_date: '2026-08-10 22:59'
+updated_date: '2026-08-11 20:12'
 labels:
   - wave-2b
 dependencies:
@@ -39,7 +39,7 @@ Measure the complete Iroh implementation before starting BitTorrent work. Using 
 - [ ] #5 All earlier pre-seeded/loopback offload or speedup figures are relabelled; the versioned artifact records manifest/config/code hashes and explicitly makes no cross-backend or production-default claim.
 - [ ] #6 TASK-117 is blocked on this artifact so BitTorrent design starts from measured Iroh behavior rather than parallel speculation.
 - [ ] #7 Only development/training scenario namespaces are accepted; the holdout generator/material is unavailable, and a deliberate attempt to load a holdout namespace fails and invalidates the run.
-- [ ] #8 Bootstrap/content-resolve latency is reported for tracker and named-candidate direct query; global DHT is measured only when TASK-126/103 support it and otherwise remains evidenced unsupported. Candidate source, MISS/UNAVAILABLE and direct/hole-punched/relay path stay distinct.
+- [ ] #8 Bootstrap and exact-key content-resolution latency is always reported for the passing decentralized TASK-103 path with tracker and LAN disabled. Named-candidate direct query is a separate bounded non-global cell. Tracker and Mainline measurements run only when optional artifacts exist and can never replace the decentralized result; MISS UNAVAILABLE and direct hole-punched or relay paths stay distinct.
 <!-- AC:END -->
 
 ## Implementation Notes
