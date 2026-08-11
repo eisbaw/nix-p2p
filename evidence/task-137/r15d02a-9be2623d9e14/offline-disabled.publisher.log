@@ -1,0 +1,8 @@
+daemon 0.0.1
+IROH-SERVE-BUDGET max_nar_bytes_uncompressed_nar=268435456 max_inflight_bytes_uncompressed_nar=1073741824 max_serve_duration_ms=120000 sweep_interval_ms=500
+IROH-PROVIDER-ADDR node_id=5e79fc2ac63f6a4d1a3f42bcd1255e203af37e49d51123a812ddef759ef9997a sockets=127.0.0.1:44330,[::1]:44330
+daemon: listening on 0.0.0.0:8082 -> upstream http://127.0.0.1:9
+IROH-STORE-RESIDENT blobs=0 bytes_uncompressed_nar=0
+IROH-SERVE-COUNTERS admitted=0 regenerated=0 declined=0 declined_too_large=0 declined_busy=0 declined_unknown=0 declined_supply_failed=0 declined_store_unreadable=0 reservations_timed_out=0
+daemon: received SIGTERM; shutting down
+IROH-NODE-SHUTDOWN outcome=Graceful

@@ -1,0 +1,12 @@
+daemon 0.0.1
+IROH-NODE-PUBLICATION-CONFIG enabled=true authority_class=production-shaped-local owner_json="nix-p2p-task137-evidence" recipient_label=task137-authority:v1 locations=1 ttl_seconds=12 refresh_seconds=4
+IROH-SERVE-BUDGET max_nar_bytes_uncompressed_nar=268435456 max_inflight_bytes_uncompressed_nar=1073741824 max_serve_duration_ms=120000 sweep_interval_ms=500
+IROH-NODE-PUBLICATION state=Live sequence=1786464177754913 ttl_seconds=12 expires_unix_micros=1786464189754913 locations=1 recipient_label=task137-authority:v1
+IROH-PROVIDER-ADDR node_id=5e79fc2ac63f6a4d1a3f42bcd1255e203af37e49d51123a812ddef759ef9997a sockets=10.231.135.10:44330
+daemon: listening on 0.0.0.0:8082 -> upstream http://127.0.0.1:9
+IROH-STORE-RESIDENT blobs=0 bytes_uncompressed_nar=0
+IROH-SERVE-COUNTERS admitted=0 regenerated=0 declined=0 declined_too_large=0 declined_busy=0 declined_unknown=0 declined_supply_failed=0 declined_store_unreadable=0 reservations_timed_out=0
+daemon: received SIGTERM; shutting down
+IROH-NODE-SHUTDOWN outcome=Graceful
+IROH-NODE-PUBLICATION-REFRESH state=Live sequence=1786464181766824 reused=false locations=1 visibility_ms=0
+IROH-NODE-PUBLICATION-WITHDRAWN sequence=1786464181898487 locations=0 visibility_ms=0

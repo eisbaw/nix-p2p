@@ -1,0 +1,3 @@
+daemon 0.0.1
+IROH-NODE-PUBLICATION-CONFIG enabled=true authority_class=production-shaped-local owner_json="nix-p2p-task137-evidence" recipient_label=task137-authority:v1 locations=1 ttl_seconds=12 refresh_seconds=4
+daemon: Iroh node setup failed: Iroh node runtime failed: invalid Iroh endpoint configuration: offline-test rejects node-publication capability injection
