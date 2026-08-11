@@ -35,13 +35,13 @@
       cargoVersion =
         (builtins.fromTOML (builtins.readFile ./Cargo.toml)).workspace.package.version;
 
-      # Bind the publication-evidence image to the exact source revision used
-      # to build it. Dirty trees remain buildable for development, but their
-      # `-dirty` label is rejected by the artifact finalizer.
+      # Bind routed evidence images to the exact source revision used to build
+      # them. Dirty trees remain buildable for development, but their `-dirty`
+      # label is rejected by the artifact finalizers.
       implementationRevision =
         if self ? rev then self.rev
         else if self ? dirtyRev then self.dirtyRev
-        else throw "iroh publication evidence image requires a Git revision";
+        else throw "Iroh evidence images require a Git revision";
 
       # cleanCargoSource keeps only Cargo manifests and *.rs. Task-1 left a
       # note here to widen it once fixtures existed; task-3 did not, because
@@ -120,6 +120,17 @@
 
       daemon = memberPackage "daemon";
       testproxy = memberPackage "testproxy";
+
+      # TASK-138's adversarial authority is deliberately absent from the
+      # production daemon package. Build a separate derivation with the narrow
+      # evidence feature so only the routed lookup image contains that binary.
+      lookupEvidenceDaemonArgs = commonArgs // {
+        pname = "daemon-iroh-lookup-evidence";
+        cargoExtraArgs = "--locked --package daemon --features evidence-fixture";
+      };
+      daemonLookupEvidence = craneLib.buildPackage (lookupEvidenceDaemonArgs // {
+        cargoArtifacts = craneLib.buildDepsOnly lookupEvidenceDaemonArgs;
+      });
 
       # Static /etc for the e2e image. A real /etc/passwd is what lets the
       # AC#3 scenarios drop from the container root (which runs nix-daemon) to
@@ -238,6 +249,37 @@
           };
         };
       };
+
+      # TASK-138 proves query-only lookup over a routed boundary. Its image is
+      # separate from both production and TASK-137 publication evidence so the
+      # feature-gated adversarial responder cannot leak into either closure.
+      irohLookupEvidenceImage = pkgs.dockerTools.buildImage {
+        name = "nix-p2p-iroh-lookup-evidence";
+        tag = "latest";
+        copyToRoot = pkgs.buildEnv {
+          name = "nix-p2p-iroh-lookup-evidence-root";
+          paths = with pkgs; [
+            bash
+            coreutils
+            iproute2
+            tcpdump
+            daemonLookupEvidence
+            e2eEtc
+          ];
+          pathsToLink = [ "/bin" "/etc" "/share" ];
+        };
+        extraCommands = ''
+          mkdir -p tmp var/tmp root run
+          chmod 1777 tmp var/tmp
+        '';
+        config = {
+          Cmd = [ "/bin/bash" ];
+          Env = [ "PATH=/bin" ];
+          Labels = {
+            "org.nix-p2p.implementation-revision" = implementationRevision;
+          };
+        };
+      };
     in
     {
       # The NixOS module (task-10). System-independent, so it lives outside the
@@ -258,6 +300,9 @@
         # Separate routed-network evidence image for TASK-137. Kept out of
         # checks because packet capture requires rootless Podman capabilities.
         iroh-publication-evidence-image = irohPublicationEvidenceImage;
+        # Separate feature-gated routed lookup image for TASK-138. The fixture
+        # executable exists here and nowhere in the production package.
+        iroh-lookup-evidence-image = irohLookupEvidenceImage;
 
         # The NixOS VM test (task-10): real nix-daemon + systemd, the S2 truth
         # layer. A PACKAGE, not a check, on purpose (task-1 codex finding 4):
@@ -291,9 +336,31 @@
           cargoClippyExtraArgs = "--workspace --all-targets -- -D warnings";
         });
 
+        iroh-lookup-fixture-clippy = craneLib.cargoClippy (commonArgs // {
+          pname = "nix-p2p-iroh-lookup-fixture-clippy";
+          cargoArtifacts = workspaceArtifacts;
+          cargoClippyExtraArgs = "--package daemon --all-targets --features evidence-fixture -- -D warnings";
+        });
+
         fmt = craneLib.cargoFmt { inherit src; pname = "nix-p2p-workspace"; version = cargoVersion; };
 
-        test = craneLib.cargoTest (commonArgs // { cargoArtifacts = workspaceArtifacts; });
+        test = craneLib.cargoTest (commonArgs // {
+          cargoArtifacts = workspaceArtifacts;
+          # buildDepsOnly leaves dependency-shaped dummy binaries in the
+          # restored target tree. Point the cross-package fault-loop test at
+          # the real packaged fixture instead of letting it mistake that dummy
+          # for a runnable testproxy.
+          TESTPROXY_BIN = "${self.packages.${system}.testproxy}/bin/testproxy";
+        });
+
+        # Compile and test the feature-gated adversarial lookup fixture on the
+        # ordinary sandboxed gate. Only packet capture stays outside checks.
+        iroh-lookup-fixture = craneLib.cargoTest (commonArgs // {
+          pname = "nix-p2p-iroh-lookup-fixture";
+          cargoArtifacts = workspaceArtifacts;
+          cargoExtraArgs = "--locked --package daemon --all-targets --features evidence-fixture";
+          TESTPROXY_BIN = "${self.packages.${system}.testproxy}/bin/testproxy";
+        });
 
         # The independence guard is safety-critical and cargo will never lint
         # it, so it gets the same treatment the Rust gets.

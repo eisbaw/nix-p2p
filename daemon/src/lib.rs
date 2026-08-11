@@ -27,6 +27,7 @@ pub mod claim;
 pub mod content_id;
 pub mod discovery;
 mod hexfmt;
+pub mod iroh_node_lookup;
 pub mod iroh_node_record;
 pub mod iroh_publication;
 pub mod iroh_publication_authority;
@@ -67,10 +68,16 @@ pub use discovery::{
     DirectDiscovery, Discovery, FallbackNarSource, InMemoryDiscovery, InProcessPeerQuery,
     PROBE_TIMEOUT, PeerQuery, PeerQueryError,
 };
+pub use iroh_node_lookup::{
+    MAX_NODE_LOOKUP_TRACKED_IDS, NODE_LOOKUP_DEADLINE, NODE_LOOKUP_PROVENANCE,
+    NODE_LOOKUP_SCHEDULER_GRACE, NODE_LOOKUP_SCHEMA, NODE_LOOKUP_SOURCE,
+    NodeLookupAuthorityAuthorization, NodeLookupConfig, NodeLookupHandle, NodeLookupProvenance,
+    NodeLookupResult, NodeLookupUnavailable, NodeLookupUnavailableKind,
+};
 pub use iroh_node_record::{
     IROH_RECORD_NAME, MAX_NODE_LOCATIONS, METADATA_RECORD_NAME, NODE_PUBLICATION_SCHEMA,
-    NodeLocation, NodeRecord, NodeRecordError, PublicationState, decode_node_record,
-    encode_node_record,
+    NodeLocation, NodeRecord, NodeRecordError, NodeRecordErrorKind, PublicationState,
+    decode_node_record, encode_node_record, validate_namespace, validate_recipient,
 };
 pub use iroh_publication::{
     NodePublicationCapability, NodePublicationConfig, NodePublicationHandle,

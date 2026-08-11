@@ -174,7 +174,7 @@ impl NodePublicationConfig {
         validate_namespace(&namespace).map_err(PublicationError::record)?;
         validate_recipient(&signed_recipient).map_err(PublicationError::record)?;
         let endpoint = PinnedHttpEndpoint::new(authority_recipient, authority_host.clone())
-            .map_err(PublicationError::transport)?;
+            .map_err(|error| PublicationError::configuration(error.to_string()))?;
         authorization.validate(endpoint.recipient())?;
         if ttl.as_secs() == 0 || ttl.subsec_nanos() != 0 || ttl.as_secs() > u32::MAX as u64 {
             return Err(PublicationError::configuration(
@@ -1315,7 +1315,7 @@ impl PublisherInner {
         let node_id = NodeId::from_bytes(*key.public().as_bytes());
         let client =
             PinnedHttpEndpoint::new(config.authority_recipient, config.authority_host.clone())
-                .map_err(PublicationError::transport)?;
+                .map_err(|error| PublicationError::configuration(error.to_string()))?;
         let (store, state) = PublicationStateStore::open(state_dir, node_id, &config)?;
         let desired_locations = state.desired_locations()?;
         let desired_revision = state.desired_revision;
@@ -2353,6 +2353,22 @@ mod tests {
             [NodeLocation::direct("127.0.0.1:4433".parse().unwrap()).unwrap()],
         )
         .expect("TTL 12s is the first safe whole-second evidence boundary");
+
+        let malformed_host = NodePublicationConfig::new(
+            "run-1",
+            "authority.test:v1",
+            "127.0.0.1:8080".parse().unwrap(),
+            ":",
+            PublicationAuthorityAuthorization::LocalProductionShaped {
+                owner: "operator".into(),
+            },
+            Duration::from_secs(30),
+            Duration::from_secs(10),
+            Duration::from_secs(2),
+            [NodeLocation::direct("127.0.0.1:4433".parse().unwrap()).unwrap()],
+        )
+        .unwrap_err();
+        assert_eq!(malformed_host.kind, PublicationErrorKind::Configuration);
     }
 
     #[test]

@@ -1,6 +1,6 @@
 //! AC#5 (the compile-time seam): all Nix cache-upstream HTTP access goes through
 //! the traits, so cache-client calls are confined to `upstream.rs`. The separate
-//! `pinned_http.rs` client is an explicit pkarr publication exception: its only
+//! `pinned_http.rs` client is an explicit pkarr publication/lookup exception: its only
 //! recipient is a validated numeric socket and its only path is `/pkarr/<key>`.
 //! This test greps the daemon's own source to keep both boundaries honest - a
 //! new cache client in the serving layer (or any other module) still fails here.
@@ -25,7 +25,7 @@ const PINNED_PKARR_REQUIRED: &[&str] = &[
     "const RECORD_PATH_PREFIX: &str = \"/pkarr/\";",
     "validate_recipient_socket(recipient)?;",
     "validate_signer_path(signer_z32)?;",
-    "tokio::time::timeout(total_deadline",
+    "tokio::time::timeout_at(absolute_deadline",
     "TcpStream::connect(self.recipient)",
     "redirect status {} rejected; pinned recipients are never widened",
     "Transfer-Encoding is rejected; exact bounded Content-Length is required",
@@ -99,7 +99,7 @@ fn assert_pinned_pkarr_exception_is_narrow(src: &Path, files: &[PathBuf], source
         "pinned pkarr transport must not become a general public HTTP client"
     );
 
-    let endpoint_consumers = files
+    let mut endpoint_consumers = files
         .iter()
         .filter(|file| {
             file.file_name()
@@ -116,10 +116,11 @@ fn assert_pinned_pkarr_exception_is_narrow(src: &Path, files: &[PathBuf], source
             }
         })
         .collect::<Vec<_>>();
+    endpoint_consumers.sort();
     assert_eq!(
         endpoint_consumers,
-        ["iroh_publication.rs"],
-        "PinnedHttpEndpoint must remain private to node publication, not become a cache HTTP escape"
+        ["iroh_node_lookup.rs", "iroh_publication.rs"],
+        "PinnedHttpEndpoint must remain private to explicit node publication/lookup, not become a cache HTTP escape"
     );
 }
 

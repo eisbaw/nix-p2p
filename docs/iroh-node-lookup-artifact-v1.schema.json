@@ -1,0 +1,746 @@
+{
+  "$comment": "Canonical artifacts are emitted by scripts/finalize_iroh_node_lookup.py from a clean committed implementation tree and a complete routed raw-evidence directory. The bundled finalizer emits pass only; missing or invalid evidence is a fatal validation error, never no_go. A no_go producer requires a separately reviewed capability constraint. Iroh 1.0.3 expiry/path-cache and runtime replay-state limitations are mandatory artifact fields rather than hidden qualifications.",
+  "$defs": {
+    "authority": {
+      "additionalProperties": false,
+      "properties": {
+        "expected_host": { "const": "task138-authority.invalid" },
+        "external_contact_authorized": { "const": false },
+        "kind": { "const": "local-routed-pkarr-relay" },
+        "namespace": {
+          "pattern": "^task138-evidence-[a-z0-9][a-z0-9-]{7,47}$",
+          "type": "string"
+        },
+        "owner": { "const": "nix-p2p-task138-evidence" },
+        "recipient": { "const": "task138-authority:v1" },
+        "socket": {
+          "pattern": "^(?:[0-9]{1,3}\\.){3}[0-9]{1,3}:18080$",
+          "type": "string"
+        }
+      },
+      "required": [
+        "kind",
+        "namespace",
+        "recipient",
+        "expected_host",
+        "socket",
+        "owner",
+        "external_contact_authorized"
+      ],
+      "type": "object"
+    },
+    "boundaries": {
+      "additionalProperties": false,
+      "properties": {
+        "content_discovery": { "const": false },
+        "lan_discovery": { "const": false },
+        "peer_enumeration": { "const": false },
+        "publication_from_resolver": { "const": false },
+        "query_only": { "const": true },
+        "relay_transport": { "const": false }
+      },
+      "required": [
+        "query_only",
+        "peer_enumeration",
+        "content_discovery",
+        "publication_from_resolver",
+        "relay_transport",
+        "lan_discovery"
+      ],
+      "type": "object"
+    },
+    "capabilityConstraint": {
+      "additionalProperties": false,
+      "properties": {
+        "description": { "minLength": 1, "type": "string" },
+        "evidence_sha256": { "$ref": "#/$defs/sha256" },
+        "id": {
+          "pattern": "^[a-z0-9][a-z0-9._-]{2,127}$",
+          "type": "string"
+        }
+      },
+      "required": ["id", "description", "evidence_sha256"],
+      "type": "object"
+    },
+    "capture": {
+      "additionalProperties": false,
+      "properties": {
+        "dns_enabled": { "const": false },
+        "filter": { "const": "ip or ip6" },
+        "interface": { "const": "any" },
+        "scope": { "const": "all-ip-in-resolver-netns-v1" }
+      },
+      "required": ["scope", "interface", "filter", "dns_enabled"],
+      "type": "object"
+    },
+    "captureFacts": {
+      "additionalProperties": false,
+      "properties": {
+        "client_syns": { "minimum": 1, "type": "integer" },
+        "connections": { "minimum": 1, "type": "integer" },
+        "packet_count": { "minimum": 1, "type": "integer" },
+        "server_resets": { "minimum": 0, "type": "integer" }
+      },
+      "required": [
+        "packet_count",
+        "connections",
+        "client_syns",
+        "server_resets"
+      ],
+      "type": "object"
+    },
+    "committedFile": {
+      "additionalProperties": false,
+      "properties": {
+        "bytes": { "minimum": 1, "type": "integer" },
+        "git_blob": { "$ref": "#/$defs/gitObject" },
+        "path": { "minLength": 1, "type": "string" },
+        "sha256": { "$ref": "#/$defs/sha256" }
+      },
+      "required": ["path", "git_blob", "bytes", "sha256"],
+      "type": "object"
+    },
+    "control": {
+      "additionalProperties": false,
+      "properties": {
+        "captured_ip_packets": { "const": 0 },
+        "elapsed_ns": { "minimum": 0, "type": "integer" },
+        "fail_closed": { "type": "boolean" },
+        "lookup_enabled": { "type": "boolean" },
+        "offline": { "type": "boolean" },
+        "scenario": {
+          "enum": ["default-off", "offline-disabled", "offline-enabled"]
+        }
+      },
+      "required": [
+        "scenario",
+        "lookup_enabled",
+        "offline",
+        "fail_closed",
+        "elapsed_ns",
+        "captured_ip_packets"
+      ],
+      "type": "object"
+    },
+    "evidenceFile": {
+      "additionalProperties": false,
+      "properties": {
+        "bytes": { "minimum": 0, "type": "integer" },
+        "path": { "minLength": 1, "type": "string" },
+        "sha256": { "$ref": "#/$defs/sha256" }
+      },
+      "required": ["path", "bytes", "sha256"],
+      "type": "object"
+    },
+    "fixtureBadSignature": {
+      "allOf": [
+        { "$ref": "#/$defs/lookup" },
+        {
+          "properties": {
+            "attempt_count": { "const": 1 },
+            "authority_kind": { "const": "feature-gated-adversarial-fixture" },
+            "provenance": { "type": "null" },
+            "reason": { "const": "bad_signature" },
+            "scenario": { "const": "bad-signature" },
+            "sequence": { "type": "null" },
+            "signed_packet_blake3_hex": { "type": "null" },
+            "verdict": { "const": "unavailable" }
+          }
+        }
+      ]
+    },
+    "fixtureEqualConflict": {
+      "allOf": [
+        { "$ref": "#/$defs/lookup" },
+        {
+          "properties": {
+            "attempt_count": { "const": 2 },
+            "authority_kind": { "const": "feature-gated-adversarial-fixture" },
+            "provenance": { "const": "network_validated" },
+            "reason": { "const": "conflicting_replay" },
+            "scenario": { "const": "equal-conflict" },
+            "sequence": { "minimum": 1, "type": "integer" },
+            "signed_packet_blake3_hex": { "$ref": "#/$defs/sha256" },
+            "verdict": { "const": "unavailable" }
+          }
+        }
+      ]
+    },
+    "fixtureExpired": {
+      "allOf": [
+        { "$ref": "#/$defs/lookup" },
+        {
+          "properties": {
+            "attempt_count": { "const": 1 },
+            "authority_kind": { "const": "feature-gated-adversarial-fixture" },
+            "provenance": { "const": "network_validated" },
+            "reason": { "const": "expired" },
+            "scenario": { "const": "expired" },
+            "sequence": { "minimum": 1, "type": "integer" },
+            "signed_packet_blake3_hex": { "$ref": "#/$defs/sha256" },
+            "verdict": { "const": "unavailable" }
+          }
+        }
+      ]
+    },
+    "fixtureHanging": {
+      "allOf": [
+        { "$ref": "#/$defs/lookup" },
+        {
+          "properties": {
+            "attempt_count": { "const": 1 },
+            "authority_kind": { "const": "feature-gated-adversarial-fixture" },
+            "provenance": { "type": "null" },
+            "reason": { "const": "deadline" },
+            "scenario": { "const": "hanging" },
+            "sequence": { "type": "null" },
+            "signed_packet_blake3_hex": { "type": "null" },
+            "verdict": { "const": "unavailable" }
+          }
+        }
+      ]
+    },
+    "fixtureLiveEmpty": {
+      "allOf": [
+        { "$ref": "#/$defs/lookup" },
+        {
+          "properties": {
+            "attempt_count": { "const": 1 },
+            "authority_kind": { "const": "feature-gated-adversarial-fixture" },
+            "provenance": { "type": "null" },
+            "reason": { "const": "no_dialable_candidate" },
+            "scenario": { "const": "live-empty" },
+            "sequence": { "type": "null" },
+            "signed_packet_blake3_hex": { "type": "null" },
+            "verdict": { "const": "unavailable" }
+          }
+        }
+      ]
+    },
+    "fixtureStale": {
+      "allOf": [
+        { "$ref": "#/$defs/lookup" },
+        {
+          "properties": {
+            "attempt_count": { "const": 2 },
+            "authority_kind": { "const": "feature-gated-adversarial-fixture" },
+            "provenance": { "const": "network_validated" },
+            "reason": { "const": "stale_sequence" },
+            "scenario": { "const": "stale" },
+            "sequence": { "minimum": 1, "type": "integer" },
+            "signed_packet_blake3_hex": { "$ref": "#/$defs/sha256" },
+            "verdict": { "const": "unavailable" }
+          }
+        }
+      ]
+    },
+    "gitObject": {
+      "pattern": "^(?:[0-9a-f]{40}|[0-9a-f]{64})$",
+      "type": "string"
+    },
+    "image": {
+      "additionalProperties": false,
+      "properties": {
+        "implementation_revision": { "$ref": "#/$defs/gitObject" },
+        "podman_digest": {
+          "oneOf": [
+            { "type": "null" },
+            { "pattern": "^sha256:[0-9a-f]{64}$", "type": "string" }
+          ]
+        },
+        "podman_image_id": {
+          "pattern": "^(?:sha256:)?[0-9a-f]{64}$",
+          "type": "string"
+        },
+        "podman_repo_digests": {
+          "items": {
+            "pattern": "@sha256:[0-9a-f]{64}$",
+            "type": "string"
+          },
+          "type": "array",
+          "uniqueItems": true
+        },
+        "reference": { "minLength": 1, "type": "string" }
+      },
+      "required": [
+        "reference",
+        "podman_image_id",
+        "podman_digest",
+        "podman_repo_digests",
+        "implementation_revision"
+      ],
+      "type": "object"
+    },
+    "limitation": {
+      "additionalProperties": false,
+      "properties": {
+        "consequence": { "minLength": 1, "type": "string" },
+        "description": { "minLength": 1, "type": "string" },
+        "id": { "minLength": 1, "type": "string" },
+        "owner_task": { "minLength": 1, "type": "string" }
+      },
+      "required": ["id", "description", "consequence", "owner_task"],
+      "type": "object"
+    },
+    "lookup": {
+      "additionalProperties": false,
+      "properties": {
+        "attempt_count": { "maximum": 2, "minimum": 1, "type": "integer" },
+        "authority_kind": {
+          "enum": [
+            "production-task137",
+            "production-task137-empty-state",
+            "production-task137-persisted-withdrawal",
+            "feature-gated-adversarial-fixture",
+            "inert-rst-control"
+          ]
+        },
+        "capture": { "$ref": "#/$defs/captureFacts" },
+        "node_id": { "$ref": "#/$defs/sha256" },
+        "provenance": {
+          "oneOf": [
+            { "const": "network_validated" },
+            { "type": "null" }
+          ]
+        },
+        "reason": {
+          "oneOf": [
+            {
+              "enum": [
+                "empty_namespace",
+                "withdrawn",
+                "deadline",
+                "bad_signature",
+                "stale_sequence",
+                "conflicting_replay",
+                "expired",
+                "no_dialable_candidate",
+                "authority_connection_refused"
+              ]
+            },
+            { "type": "null" }
+          ]
+        },
+        "resolver_elapsed_ns": { "minimum": 0, "type": "integer" },
+        "scenario": {
+          "enum": [
+            "live",
+            "not-found",
+            "withdrawal",
+            "hanging",
+            "bad-signature",
+            "stale",
+            "equal-conflict",
+            "expired",
+            "live-empty",
+            "refused"
+          ]
+        },
+        "sequence": {
+          "oneOf": [
+            { "minimum": 1, "type": "integer" },
+            { "type": "null" }
+          ]
+        },
+        "signed_packet_blake3_hex": {
+          "oneOf": [
+            { "$ref": "#/$defs/sha256" },
+            { "type": "null" }
+          ]
+        },
+        "verdict": { "enum": ["pass", "unavailable"] }
+      },
+      "required": [
+        "scenario",
+        "node_id",
+        "attempt_count",
+        "verdict",
+        "reason",
+        "provenance",
+        "sequence",
+        "signed_packet_blake3_hex",
+        "resolver_elapsed_ns",
+        "authority_kind",
+        "capture"
+      ],
+      "type": "object"
+    },
+    "recordBinding": {
+      "additionalProperties": false,
+      "properties": {
+        "node_id": { "$ref": "#/$defs/sha256" },
+        "sequence": { "minimum": 1, "type": "integer" },
+        "signed_packet_blake3_hex": { "$ref": "#/$defs/sha256" },
+        "signed_packet_sha256": { "$ref": "#/$defs/sha256" },
+        "state": { "enum": ["live", "withdrawn"] },
+        "ttl_seconds": { "const": 120 }
+      },
+      "required": [
+        "node_id",
+        "sequence",
+        "signed_packet_blake3_hex",
+        "signed_packet_sha256",
+        "ttl_seconds",
+        "state"
+      ],
+      "type": "object"
+    },
+    "sha256": {
+      "pattern": "^[0-9a-f]{64}$",
+      "type": "string"
+    },
+    "topology": {
+      "additionalProperties": false,
+      "properties": {
+        "authority_ip": { "format": "ipv4", "type": "string" },
+        "authority_network": { "minLength": 1, "type": "string" },
+        "authority_port": { "const": 18080 },
+        "authority_subnet": { "minLength": 1, "type": "string" },
+        "publisher_ip": { "format": "ipv4", "type": "string" },
+        "resolver_ip": { "format": "ipv4", "type": "string" },
+        "resolver_network": { "minLength": 1, "type": "string" },
+        "resolver_subnet": { "minLength": 1, "type": "string" },
+        "router_authority_ip": { "format": "ipv4", "type": "string" },
+        "router_resolver_ip": { "format": "ipv4", "type": "string" },
+        "run_id": {
+          "pattern": "^[a-z0-9][a-z0-9-]{7,47}$",
+          "type": "string"
+        }
+      },
+      "required": [
+        "run_id",
+        "resolver_network",
+        "authority_network",
+        "resolver_subnet",
+        "authority_subnet",
+        "resolver_ip",
+        "router_resolver_ip",
+        "authority_ip",
+        "router_authority_ip",
+        "publisher_ip",
+        "authority_port"
+      ],
+      "type": "object"
+    }
+  },
+  "$id": "https://nix-p2p.invalid/schema/iroh-node-lookup-artifact-v1.schema.json",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "allOf": [
+    {
+      "if": {
+        "properties": { "verdict": { "const": "pass" } },
+        "required": ["verdict"]
+      },
+      "then": {
+        "properties": { "failed_constraints": { "maxItems": 0 } }
+      }
+    },
+    {
+      "if": {
+        "properties": { "verdict": { "const": "no_go" } },
+        "required": ["verdict"]
+      },
+      "then": {
+        "properties": { "failed_constraints": { "minItems": 1 } }
+      }
+    }
+  ],
+  "properties": {
+    "capability": { "const": "iroh-node-lookup-v1" },
+    "evidence_summary": {
+      "additionalProperties": false,
+      "properties": {
+        "authority": { "$ref": "#/$defs/authority" },
+        "boundaries": { "$ref": "#/$defs/boundaries" },
+        "capture": { "$ref": "#/$defs/capture" },
+        "controls": {
+          "items": false,
+          "maxItems": 3,
+          "minItems": 3,
+          "prefixItems": [
+            {
+              "allOf": [
+                { "$ref": "#/$defs/control" },
+                {
+                  "properties": {
+                    "fail_closed": { "const": false },
+                    "lookup_enabled": { "const": false },
+                    "offline": { "const": false },
+                    "scenario": { "const": "default-off" }
+                  }
+                }
+              ]
+            },
+            {
+              "allOf": [
+                { "$ref": "#/$defs/control" },
+                {
+                  "properties": {
+                    "fail_closed": { "const": false },
+                    "lookup_enabled": { "const": false },
+                    "offline": { "const": true },
+                    "scenario": { "const": "offline-disabled" }
+                  }
+                }
+              ]
+            },
+            {
+              "allOf": [
+                { "$ref": "#/$defs/control" },
+                {
+                  "properties": {
+                    "fail_closed": { "const": true },
+                    "lookup_enabled": { "const": true },
+                    "offline": { "const": true },
+                    "scenario": { "const": "offline-enabled" }
+                  }
+                }
+              ]
+            }
+          ],
+          "type": "array"
+        },
+        "image": { "$ref": "#/$defs/image" },
+        "limitations": {
+          "items": false,
+          "maxItems": 4,
+          "minItems": 4,
+          "prefixItems": [
+            {
+              "allOf": [
+                { "$ref": "#/$defs/limitation" },
+                {
+                  "properties": {
+                    "id": { "const": "iroh-address-lookup-item-omits-expiry" },
+                    "owner_task": { "const": "TASK-89" }
+                  }
+                }
+              ]
+            },
+            {
+              "allOf": [
+                { "$ref": "#/$defs/limitation" },
+                {
+                  "properties": {
+                    "id": {
+                      "const": "iroh-remote-path-cache-expiry-invalidation-deferred"
+                    },
+                    "owner_task": { "const": "TASK-89" }
+                  }
+                }
+              ]
+            },
+            {
+              "allOf": [
+                { "$ref": "#/$defs/limitation" },
+                {
+                  "properties": {
+                    "id": { "const": "runtime-replay-table-non-reclaiming" },
+                    "owner_task": { "const": "policy-after-tournament" }
+                  }
+                }
+              ]
+            },
+            {
+              "allOf": [
+                { "$ref": "#/$defs/limitation" },
+                {
+                  "properties": {
+                    "id": { "const": "replay-continuity-not-persisted" },
+                    "owner_task": { "const": "policy-after-tournament" }
+                  }
+                }
+              ]
+            }
+          ],
+          "type": "array"
+        },
+        "lookups": {
+          "items": false,
+          "maxItems": 10,
+          "minItems": 10,
+          "prefixItems": [
+            {
+              "allOf": [
+                { "$ref": "#/$defs/lookup" },
+                {
+                  "properties": {
+                    "attempt_count": { "const": 1 },
+                    "authority_kind": { "const": "production-task137" },
+                    "provenance": { "const": "network_validated" },
+                    "reason": { "type": "null" },
+                    "scenario": { "const": "live" },
+                    "verdict": { "const": "pass" }
+                  }
+                }
+              ]
+            },
+            {
+              "allOf": [
+                { "$ref": "#/$defs/lookup" },
+                {
+                  "properties": {
+                    "attempt_count": { "const": 1 },
+                    "authority_kind": {
+                      "const": "production-task137-empty-state"
+                    },
+                    "reason": { "const": "empty_namespace" },
+                    "scenario": { "const": "not-found" },
+                    "verdict": { "const": "unavailable" }
+                  }
+                }
+              ]
+            },
+            {
+              "allOf": [
+                { "$ref": "#/$defs/lookup" },
+                {
+                  "properties": {
+                    "attempt_count": { "const": 1 },
+                    "authority_kind": {
+                      "const": "production-task137-persisted-withdrawal"
+                    },
+                    "provenance": { "const": "network_validated" },
+                    "reason": { "const": "withdrawn" },
+                    "scenario": { "const": "withdrawal" },
+                    "verdict": { "const": "unavailable" }
+                  }
+                }
+              ]
+            },
+            {
+              "$ref": "#/$defs/fixtureHanging"
+            },
+            {
+              "$ref": "#/$defs/fixtureBadSignature"
+            },
+            {
+              "$ref": "#/$defs/fixtureStale"
+            },
+            {
+              "$ref": "#/$defs/fixtureEqualConflict"
+            },
+            {
+              "$ref": "#/$defs/fixtureExpired"
+            },
+            {
+              "$ref": "#/$defs/fixtureLiveEmpty"
+            },
+            {
+              "allOf": [
+                { "$ref": "#/$defs/lookup" },
+                {
+                  "properties": {
+                    "attempt_count": { "const": 1 },
+                    "authority_kind": { "const": "inert-rst-control" },
+                    "reason": { "const": "authority_connection_refused" },
+                    "scenario": { "const": "refused" },
+                    "verdict": { "const": "unavailable" }
+                  }
+                }
+              ]
+            }
+          ],
+          "type": "array"
+        },
+        "profile": { "const": "production-shaped-local" },
+        "raw_schema": { "const": "iroh-node-lookup-evidence-v1" },
+        "record_bindings": {
+          "additionalProperties": false,
+          "properties": {
+            "live": {
+              "allOf": [
+                { "$ref": "#/$defs/recordBinding" },
+                { "properties": { "state": { "const": "live" } } }
+              ]
+            },
+            "withdrawal": {
+              "allOf": [
+                { "$ref": "#/$defs/recordBinding" },
+                { "properties": { "state": { "const": "withdrawn" } } }
+              ]
+            }
+          },
+          "required": ["live", "withdrawal"],
+          "type": "object"
+        },
+        "run_id": {
+          "pattern": "^[a-z0-9][a-z0-9-]{7,47}$",
+          "type": "string"
+        },
+        "topology": { "$ref": "#/$defs/topology" }
+      },
+      "required": [
+        "raw_schema",
+        "profile",
+        "run_id",
+        "image",
+        "authority",
+        "capture",
+        "boundaries",
+        "topology",
+        "controls",
+        "lookups",
+        "record_bindings",
+        "limitations"
+      ],
+      "type": "object"
+    },
+    "failed_constraints": {
+      "items": { "$ref": "#/$defs/capabilityConstraint" },
+      "type": "array"
+    },
+    "implementation": {
+      "additionalProperties": false,
+      "properties": {
+        "commit": { "$ref": "#/$defs/gitObject" },
+        "files": {
+          "items": { "$ref": "#/$defs/committedFile" },
+          "minItems": 22,
+          "type": "array"
+        },
+        "git_object_format": { "enum": ["sha1", "sha256"] },
+        "tree": { "$ref": "#/$defs/gitObject" }
+      },
+      "required": ["git_object_format", "commit", "tree", "files"],
+      "type": "object"
+    },
+    "raw_evidence": {
+      "additionalProperties": false,
+      "properties": {
+        "file_count": { "const": 89 },
+        "files": {
+          "items": { "$ref": "#/$defs/evidenceFile" },
+          "maxItems": 89,
+          "minItems": 89,
+          "type": "array"
+        },
+        "manifest_sha256": { "$ref": "#/$defs/sha256" },
+        "schema": { "const": "iroh-node-lookup-raw-evidence-manifest-v1" },
+        "total_bytes": { "minimum": 1, "type": "integer" }
+      },
+      "required": [
+        "schema",
+        "files",
+        "file_count",
+        "total_bytes",
+        "manifest_sha256"
+      ],
+      "type": "object"
+    },
+    "schema": { "const": "iroh-node-lookup-artifact-v1" },
+    "verdict": { "enum": ["pass", "no_go"] }
+  },
+  "required": [
+    "schema",
+    "capability",
+    "verdict",
+    "failed_constraints",
+    "implementation",
+    "raw_evidence",
+    "evidence_summary"
+  ],
+  "title": "iroh-node-lookup-artifact-v1",
+  "type": "object"
+}

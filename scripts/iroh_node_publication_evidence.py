@@ -1007,6 +1007,7 @@ def read_strict_authority_snapshot(
     namespace: str,
     recipient: str,
     expected_address: str,
+    expected_ttl_seconds: int = PUBLICATION_TTL_SECONDS,
 ) -> tuple[dict[str, object], bytes] | None:
     state_path = state_dir / "iroh-node-publication-authority.json"
     if not state_path.exists():
@@ -1052,7 +1053,7 @@ def read_strict_authority_snapshot(
         raise RuntimeError(
             "signed record namespace/recipient drifted from configuration"
         )
-    if record["ttl_seconds"] != PUBLICATION_TTL_SECONDS:
+    if record["ttl_seconds"] != expected_ttl_seconds:
         raise RuntimeError(f"signed record TTL drifted: {record['ttl_seconds']!r}")
     if entry.get("high_water_sequence") != record["sequence"]:
         raise RuntimeError("authority high-water does not match signed sequence")
@@ -1099,6 +1100,7 @@ def wait_for_authority_snapshot(
     expected_state: str,
     minimum_sequence_exclusive: int,
     deadline_monotonic_ns: int,
+    expected_ttl_seconds: int = PUBLICATION_TTL_SECONDS,
 ) -> tuple[dict[str, object], bytes, int]:
     while True:
         observed_monotonic_ns = time.monotonic_ns()
@@ -1108,6 +1110,7 @@ def wait_for_authority_snapshot(
             namespace=namespace,
             recipient=recipient,
             expected_address=expected_address,
+            expected_ttl_seconds=expected_ttl_seconds,
         )
         if snapshot is not None:
             decoded, raw = snapshot

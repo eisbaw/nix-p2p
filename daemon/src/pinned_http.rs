@@ -6,7 +6,7 @@
 //! separately validated [`SocketAddr`].
 
 use std::fmt;
-use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::time::Duration;
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -85,6 +85,20 @@ impl PinnedHttpEndpoint {
         })
     }
 
+    /// Fetch one relay payload for an already-typed signer without interpreting
+    /// it.  Node lookup must verify the response against the asker-supplied key
+    /// itself so signature failures remain distinct from signed-record failures.
+    /// The caller supplies the absolute operation deadline; DNS decoding and
+    /// replay validation therefore consume the same ten-second budget as TCP.
+    pub(crate) async fn get_record_raw_until(
+        &self,
+        signer: &iroh::PublicKey,
+        absolute_deadline: Instant,
+    ) -> Result<PinnedHttpResponse, PinnedHttpError> {
+        self.request_until("GET", &signer.to_z32(), &[], absolute_deadline)
+            .await
+    }
+
     async fn request(
         &self,
         method: &'static str,
@@ -93,18 +107,41 @@ impl PinnedHttpEndpoint {
         total_deadline: Duration,
     ) -> Result<PinnedHttpResponse, PinnedHttpError> {
         if total_deadline.is_zero() {
-            return Err(PinnedHttpError::new("HTTP deadline must be positive"));
+            return Err(PinnedHttpError::configuration(
+                "HTTP deadline must be positive",
+            ));
+        }
+        let absolute_deadline = Instant::now()
+            .checked_add(total_deadline)
+            .ok_or_else(|| PinnedHttpError::configuration("HTTP deadline overflows Instant"))?;
+        self.request_until(method, signer_z32, body, absolute_deadline)
+            .await
+    }
+
+    async fn request_until(
+        &self,
+        method: &'static str,
+        signer_z32: &str,
+        body: &[u8],
+        absolute_deadline: Instant,
+    ) -> Result<PinnedHttpResponse, PinnedHttpError> {
+        if absolute_deadline <= Instant::now() {
+            return Err(PinnedHttpError::deadline(format!(
+                "{method} to pinned recipient {} has no remaining deadline",
+                self.recipient
+            )));
         }
         validate_signer_path(signer_z32)?;
         let endpoint = self.clone();
+        let signer_z32 = signer_z32.to_string();
         let body = body.to_vec();
-        tokio::time::timeout(total_deadline, async move {
-            endpoint.request_inner(method, signer_z32, &body).await
+        tokio::time::timeout_at(absolute_deadline, async move {
+            endpoint.request_inner(method, &signer_z32, &body).await
         })
         .await
         .map_err(|_| {
-            PinnedHttpError::new(format!(
-                "{method} to pinned recipient {} exceeded {total_deadline:?}",
+            PinnedHttpError::deadline(format!(
+                "{method} to pinned recipient {} exceeded its absolute deadline",
                 self.recipient
             ))
         })?
@@ -118,10 +155,15 @@ impl PinnedHttpEndpoint {
     ) -> Result<PinnedHttpResponse, PinnedHttpError> {
         let started = Instant::now();
         let mut stream = TcpStream::connect(self.recipient).await.map_err(|error| {
-            PinnedHttpError::new(format!(
-                "connecting to pinned recipient {}: {error}",
-                self.recipient
-            ))
+            let kind = if error.kind() == std::io::ErrorKind::ConnectionRefused {
+                PinnedHttpErrorKind::ConnectionRefused
+            } else {
+                PinnedHttpErrorKind::Connect
+            };
+            PinnedHttpError::with_kind(
+                kind,
+                format!("connecting to pinned recipient {}: {error}", self.recipient),
+            )
         })?;
         let path = format!("{RECORD_PATH_PREFIX}{signer_z32}");
         let request = format!(
@@ -132,17 +174,16 @@ impl PinnedHttpEndpoint {
         stream
             .write_all(request.as_bytes())
             .await
-            .map_err(|error| PinnedHttpError::new(format!("writing request headers: {error}")))?;
+            .map_err(|error| PinnedHttpError::write(format!("writing request headers: {error}")))?;
         if !body.is_empty() {
-            stream
-                .write_all(body)
-                .await
-                .map_err(|error| PinnedHttpError::new(format!("writing request body: {error}")))?;
+            stream.write_all(body).await.map_err(|error| {
+                PinnedHttpError::write(format!("writing request body: {error}"))
+            })?;
         }
         stream
             .flush()
             .await
-            .map_err(|error| PinnedHttpError::new(format!("flushing request: {error}")))?;
+            .map_err(|error| PinnedHttpError::write(format!("flushing request: {error}")))?;
 
         let mut received = Vec::with_capacity(2048);
         let header_end = loop {
@@ -161,7 +202,7 @@ impl PinnedHttpEndpoint {
             }
             let mut chunk = [0u8; 1024];
             let read = stream.read(&mut chunk).await.map_err(|error| {
-                PinnedHttpError::new(format!("reading response headers: {error}"))
+                PinnedHttpError::read(format!("reading response headers: {error}"))
             })?;
             if read == 0 {
                 return Err(PinnedHttpError::new(
@@ -198,7 +239,9 @@ impl PinnedHttpEndpoint {
             let read = stream
                 .read(&mut chunk[..chunk_len])
                 .await
-                .map_err(|error| PinnedHttpError::new(format!("reading response body: {error}")))?;
+                .map_err(|error| {
+                    PinnedHttpError::read(format!("reading response body: {error}"))
+                })?;
             if read == 0 {
                 return Err(PinnedHttpError::new(format!(
                     "response body ended at {} of {} bytes",
@@ -209,10 +252,9 @@ impl PinnedHttpEndpoint {
             response_body.extend_from_slice(&chunk[..read]);
         }
         let mut proof = [0u8; 1];
-        let extra = stream
-            .read(&mut proof)
-            .await
-            .map_err(|error| PinnedHttpError::new(format!("checking response framing: {error}")))?;
+        let extra = stream.read(&mut proof).await.map_err(|error| {
+            PinnedHttpError::read(format!("checking response framing: {error}"))
+        })?;
         if extra != 0 {
             return Err(PinnedHttpError::new(
                 "response carried bytes beyond Content-Length",
@@ -233,26 +275,79 @@ fn validate_recipient_socket(recipient: SocketAddr) -> Result<(), PinnedHttpErro
         || matches!(recipient.ip(), IpAddr::V4(ip) if ip == Ipv4Addr::BROADCAST)
         || matches!(recipient, SocketAddr::V6(address) if address.ip().is_unicast_link_local() && address.scope_id() == 0)
     {
-        return Err(PinnedHttpError::new(format!(
+        return Err(PinnedHttpError::configuration(format!(
             "HTTP recipient {recipient} must be a concrete unicast socket with nonzero port"
         )));
     }
     Ok(())
 }
 
-fn validate_host(host: &str) -> Result<(), PinnedHttpError> {
-    if host.is_empty()
-        || host.len() > 253
-        || !host.bytes().all(|byte| {
-            byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'-' | b'[' | b']' | b':')
-        })
-        || host.contains("..")
-        || host.starts_with('.')
-        || host.ends_with('.')
+pub(crate) fn validate_host(host: &str) -> Result<(), PinnedHttpError> {
+    fn invalid() -> PinnedHttpError {
+        PinnedHttpError::configuration(
+            "HTTP Host must be a canonical lowercase ASCII hostname, IPv4, or bracketed IPv6, optionally followed by a canonical nonzero numeric port",
+        )
+    }
+
+    fn validate_port(raw: &str) -> Result<(), PinnedHttpError> {
+        let port = raw.parse::<u16>().map_err(|_| invalid())?;
+        if port == 0 || port.to_string() != raw {
+            return Err(invalid());
+        }
+        Ok(())
+    }
+
+    if host.is_empty() || host.len() > 253 || !host.is_ascii() {
+        return Err(invalid());
+    }
+    if let Some(bracketed) = host.strip_prefix('[') {
+        let Some((literal, suffix)) = bracketed.split_once(']') else {
+            return Err(invalid());
+        };
+        if literal.is_empty() || suffix.contains(']') {
+            return Err(invalid());
+        }
+        let address = literal.parse::<Ipv6Addr>().map_err(|_| invalid())?;
+        if address.to_string() != literal {
+            return Err(invalid());
+        }
+        match suffix.strip_prefix(':') {
+            Some(port) => validate_port(port)?,
+            None if suffix.is_empty() => {}
+            None => return Err(invalid()),
+        }
+        return Ok(());
+    }
+    if host.contains(['[', ']']) || host.matches(':').count() > 1 {
+        return Err(invalid());
+    }
+    let (name, port) = match host.split_once(':') {
+        Some((name, port)) => (name, Some(port)),
+        None => (host, None),
+    };
+    if let Some(port) = port {
+        validate_port(port)?;
+    }
+    if name
+        .parse::<Ipv4Addr>()
+        .is_ok_and(|ip| ip.to_string() == name)
     {
-        return Err(PinnedHttpError::new(
-            "HTTP Host must be a canonical ASCII hostname or host:port without path/userinfo",
-        ));
+        return Ok(());
+    }
+    if name.is_empty()
+        || name.starts_with('.')
+        || name.ends_with('.')
+        || name.split('.').any(|label| {
+            label.is_empty()
+                || label.len() > 63
+                || label.starts_with('-')
+                || label.ends_with('-')
+                || !label
+                    .bytes()
+                    .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
+        })
+    {
+        return Err(invalid());
     }
     Ok(())
 }
@@ -337,18 +432,59 @@ fn find_header_end(bytes: &[u8]) -> Option<usize> {
     bytes.windows(4).position(|window| window == b"\r\n\r\n")
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PinnedHttpErrorKind {
+    Configuration,
+    ConnectionRefused,
+    Connect,
+    Write,
+    Read,
+    Protocol,
+    Deadline,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct PinnedHttpError(String);
+pub(crate) struct PinnedHttpError {
+    kind: PinnedHttpErrorKind,
+    message: String,
+}
 
 impl PinnedHttpError {
     pub(crate) fn new(message: impl Into<String>) -> Self {
-        Self(message.into())
+        Self::with_kind(PinnedHttpErrorKind::Protocol, message)
+    }
+
+    pub(crate) fn with_kind(kind: PinnedHttpErrorKind, message: impl Into<String>) -> Self {
+        Self {
+            kind,
+            message: message.into(),
+        }
+    }
+
+    pub(crate) fn configuration(message: impl Into<String>) -> Self {
+        Self::with_kind(PinnedHttpErrorKind::Configuration, message)
+    }
+
+    pub(crate) fn write(message: impl Into<String>) -> Self {
+        Self::with_kind(PinnedHttpErrorKind::Write, message)
+    }
+
+    pub(crate) fn read(message: impl Into<String>) -> Self {
+        Self::with_kind(PinnedHttpErrorKind::Read, message)
+    }
+
+    pub(crate) fn deadline(message: impl Into<String>) -> Self {
+        Self::with_kind(PinnedHttpErrorKind::Deadline, message)
+    }
+
+    pub(crate) fn kind(&self) -> PinnedHttpErrorKind {
+        self.kind
     }
 }
 
 impl fmt::Display for PinnedHttpError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str(&self.0)
+        formatter.write_str(&self.message)
     }
 }
 
@@ -357,6 +493,7 @@ impl std::error::Error for PinnedHttpError {}
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::iroh_publication_authority::{AuthoritySignerAdmission, PublicationAuthorityConfig};
     use tokio::net::TcpListener;
 
     async fn serve_once(
@@ -416,6 +553,35 @@ mod tests {
                 .is_err()
         );
         assert!(PinnedHttpEndpoint::new("127.0.0.1:80".parse().unwrap(), "a..test").is_err());
+        for host in [
+            ":",
+            "[]",
+            "authority.test:abc",
+            "authority.test:0",
+            "authority.test:080",
+            "2001:db8::1",
+            "[2001:db8::1",
+            "2001:db8::1]",
+            "[2001:0db8::1]",
+            "Authority.test",
+            "-authority.test",
+            "authority-.test",
+        ] {
+            assert!(
+                PinnedHttpEndpoint::new("127.0.0.1:80".parse().unwrap(), host).is_err(),
+                "malformed/noncanonical Host {host:?} was accepted"
+            );
+        }
+        for host in [
+            "authority.test",
+            "authority.test:8443",
+            "127.0.0.1",
+            "127.0.0.1:8443",
+            "[2001:db8::1]",
+            "[2001:db8::1]:8443",
+        ] {
+            PinnedHttpEndpoint::new("127.0.0.1:80".parse().unwrap(), host).unwrap();
+        }
         assert!(
             PinnedHttpEndpoint::new("[::ffff:0.0.0.0]:80".parse().unwrap(), "authority.test")
                 .is_err()
@@ -426,6 +592,49 @@ mod tests {
                 .recipient(),
             "192.0.2.1:80".parse().unwrap()
         );
+    }
+
+    #[test]
+    fn authority_and_pinned_client_share_the_exact_host_grammar() {
+        let config_for = |host: &str| PublicationAuthorityConfig {
+            listen: "127.0.0.1:18080".parse().unwrap(),
+            state_dir: std::path::PathBuf::from("unused-host-validation-state"),
+            namespace: "run-host-validation".into(),
+            signed_recipient: "authority.test:v1".into(),
+            expected_host: host.into(),
+            owner: "test operator".into(),
+            signer_admission: AuthoritySignerAdmission::TestOnlyUnrestricted,
+        };
+        for host in [
+            "authority.test",
+            "authority.test:8443",
+            "127.0.0.1:8443",
+            "[2001:db8::1]:8443",
+        ] {
+            config_for(host).validate().unwrap();
+            PinnedHttpEndpoint::new("127.0.0.1:18080".parse().unwrap(), host).unwrap();
+        }
+        for host in [
+            ":",
+            "[]",
+            "authority.test:not-a-port",
+            "authority.test:0",
+            "authority.test:080",
+            "2001:db8::1",
+            "[2001:db8::1",
+            "Authority.test",
+        ] {
+            assert!(
+                config_for(host).validate().is_err(),
+                "authority accepted {host:?}"
+            );
+            assert_eq!(
+                PinnedHttpEndpoint::new("127.0.0.1:18080".parse().unwrap(), host)
+                    .unwrap_err()
+                    .kind(),
+                PinnedHttpErrorKind::Configuration
+            );
+        }
     }
 
     #[test]

@@ -24,7 +24,8 @@ use daemon::{
     FileNarSupplier, IdentitySource, InMemoryDiscovery, IrohNode, IrohNodeBuilder, IrohPeerAddr,
     IrohProviderConfig, IrohTransport, KnownPayload, KnownTransport, NarCatalog, NarHashKey,
     NarSource, NarinfoDiskCache, NarinfoSource, NoRawServe, NodeId, NodeLocation,
-    NodePublicationCapability, NodePublicationConfig, NodePublicationHandle, NullCorrelation,
+    NodeLookupAuthorityAuthorization, NodeLookupConfig, NodePublicationCapability,
+    NodePublicationConfig, NodePublicationHandle, NullCorrelation,
     PublicationAuthorityAuthorization, RawServeDecision, RelayCapability, ServeBudget, SystemClock,
     TaskSupervisor, TransportNarSource, TransportRegistry, UpstreamHttp, serve,
 };
@@ -229,6 +230,15 @@ struct Config {
     iroh_publication_locations: Vec<NodeLocation>,
     iroh_publication_ttl_seconds: Option<u64>,
     iroh_publication_refresh_seconds: Option<u64>,
+    /// Explicit resolve-only NodeId lookup capability. Companion fields are
+    /// rejected unless this switch is present, and enabling it performs no GET.
+    iroh_enable_node_lookup: bool,
+    iroh_lookup_namespace: Option<String>,
+    iroh_lookup_recipient: Option<String>,
+    iroh_lookup_authority_socket: Option<SocketAddr>,
+    iroh_lookup_authority_host: Option<String>,
+    iroh_lookup_owner: Option<String>,
+    iroh_lookup_external_authorization: Option<String>,
     /// Raw-NAR files this node ANNOUNCES it can serve (node B). Each is served by
     /// its `BLAKE3(RawNarV1)` content id, printed on startup so the harness can
     /// wire node A's claim to it. Under the task-61 supply model the file is
@@ -289,6 +299,13 @@ impl Default for Config {
             iroh_publication_locations: Vec::new(),
             iroh_publication_ttl_seconds: None,
             iroh_publication_refresh_seconds: None,
+            iroh_enable_node_lookup: false,
+            iroh_lookup_namespace: None,
+            iroh_lookup_recipient: None,
+            iroh_lookup_authority_socket: None,
+            iroh_lookup_authority_host: None,
+            iroh_lookup_owner: None,
+            iroh_lookup_external_authorization: None,
             iroh_seed_nar: Vec::new(),
             iroh_max_serve_nar_bytes: DEFAULT_MAX_SERVE_NAR_BYTES,
             iroh_max_inflight_nar_bytes: DEFAULT_MAX_INFLIGHT_NAR_BYTES,
@@ -466,6 +483,58 @@ impl Config {
                         return Err("duplicate --iroh-publication-refresh-seconds".into());
                     }
                 }
+                "--iroh-enable-node-lookup" => {
+                    if config.iroh_enable_node_lookup {
+                        return Err("duplicate --iroh-enable-node-lookup".into());
+                    }
+                    config.iroh_enable_node_lookup = true;
+                }
+                "--iroh-lookup-namespace" => {
+                    if config.iroh_lookup_namespace.replace(value()?).is_some() {
+                        return Err("duplicate --iroh-lookup-namespace".into());
+                    }
+                }
+                "--iroh-lookup-recipient" => {
+                    if config.iroh_lookup_recipient.replace(value()?).is_some() {
+                        return Err("duplicate --iroh-lookup-recipient".into());
+                    }
+                }
+                "--iroh-lookup-authority-socket" => {
+                    let raw = value()?;
+                    let parsed = raw.parse().map_err(|error| {
+                        format!("bad --iroh-lookup-authority-socket {raw:?}: {error}")
+                    })?;
+                    if config
+                        .iroh_lookup_authority_socket
+                        .replace(parsed)
+                        .is_some()
+                    {
+                        return Err("duplicate --iroh-lookup-authority-socket".into());
+                    }
+                }
+                "--iroh-lookup-authority-host" => {
+                    if config
+                        .iroh_lookup_authority_host
+                        .replace(value()?)
+                        .is_some()
+                    {
+                        return Err("duplicate --iroh-lookup-authority-host".into());
+                    }
+                }
+                "--iroh-lookup-owner" => {
+                    if config.iroh_lookup_owner.replace(value()?).is_some() {
+                        return Err("duplicate --iroh-lookup-owner".into());
+                    }
+                }
+                "--iroh-lookup-external-authorization" => {
+                    if config
+                        .iroh_lookup_external_authorization
+                        .replace(value()?)
+                        .is_some()
+                    {
+                        return Err("duplicate --iroh-lookup-external-authorization".into());
+                    }
+                }
                 "--iroh-seed-nar" => config.iroh_seed_nar.push(value()?),
                 "--iroh-max-serve-nar-bytes" => {
                     config.iroh_max_serve_nar_bytes =
@@ -502,8 +571,21 @@ impl Config {
                 "Iroh publication companion flags require explicit --iroh-publish-node".into(),
             );
         }
+        let lookup_companion_configured = config.iroh_lookup_namespace.is_some()
+            || config.iroh_lookup_recipient.is_some()
+            || config.iroh_lookup_authority_socket.is_some()
+            || config.iroh_lookup_authority_host.is_some()
+            || config.iroh_lookup_owner.is_some()
+            || config.iroh_lookup_external_authorization.is_some();
+        if lookup_companion_configured && !config.iroh_enable_node_lookup {
+            return Err(
+                "Iroh node-lookup companion flags require explicit --iroh-enable-node-lookup"
+                    .into(),
+            );
+        }
         let iroh_enabled = config.iroh_provider
             || config.iroh_publish_node
+            || config.iroh_enable_node_lookup
             || !config.iroh_peers.is_empty()
             || !config.p2p_claims.is_empty();
         if iroh_enabled && config.iroh_port.is_none() {
@@ -552,6 +634,7 @@ async fn setup_iroh_node_with_deadline(
 ) -> Result<Option<IrohNode>, String> {
     let enabled = config.iroh_provider
         || config.iroh_publish_node
+        || config.iroh_enable_node_lookup
         || !config.iroh_peers.is_empty()
         || !config.p2p_claims.is_empty();
     if !enabled {
@@ -570,13 +653,57 @@ async fn setup_iroh_node_with_deadline(
             .to_string()
     })?;
     let scope = endpoint_scope_with_port(scope, port);
+    let address_lookup = if config.iroh_enable_node_lookup {
+        let namespace = config.iroh_lookup_namespace.clone().ok_or_else(|| {
+            "--iroh-enable-node-lookup requires --iroh-lookup-namespace".to_string()
+        })?;
+        let signed_recipient = config.iroh_lookup_recipient.clone().ok_or_else(|| {
+            "--iroh-enable-node-lookup requires --iroh-lookup-recipient".to_string()
+        })?;
+        let authority_socket = config.iroh_lookup_authority_socket.ok_or_else(|| {
+            "--iroh-enable-node-lookup requires --iroh-lookup-authority-socket".to_string()
+        })?;
+        let authority_host = config.iroh_lookup_authority_host.clone().ok_or_else(|| {
+            "--iroh-enable-node-lookup requires --iroh-lookup-authority-host".to_string()
+        })?;
+        let owner = config
+            .iroh_lookup_owner
+            .clone()
+            .ok_or_else(|| "--iroh-enable-node-lookup requires --iroh-lookup-owner".to_string())?;
+        let authorization = match &config.iroh_lookup_external_authorization {
+            Some(reference) => NodeLookupAuthorityAuthorization::ExternalAuthorized {
+                owner: owner.clone(),
+                authorization_reference: reference.clone(),
+            },
+            None => NodeLookupAuthorityAuthorization::LocalProductionShaped {
+                owner: owner.clone(),
+            },
+        };
+        let lookup = NodeLookupConfig::new(
+            namespace,
+            signed_recipient.clone(),
+            authority_socket,
+            authority_host,
+            authorization.clone(),
+        )
+        .map_err(|error| error.to_string())?;
+        println!(
+            "IROH-NODE-LOOKUP-CONFIG enabled=true authority_class={} owner_json={} recipient_label={} requests=0",
+            authorization.evidence_label(),
+            serde_json::to_string(&owner).expect("a String always serializes as JSON"),
+            signed_recipient,
+        );
+        AddressLookupCapability::PinnedPkarr(lookup)
+    } else {
+        AddressLookupCapability::Disabled
+    };
     let mut builder = IrohNodeBuilder::new(
         EndpointProfile { scope },
         IdentitySource::Persistent {
             state_dir: state_dir.clone(),
         },
         RelayCapability::Disabled,
-        AddressLookupCapability::Disabled,
+        address_lookup,
     )
     .map_err(|error| error.to_string())?;
 
@@ -1559,6 +1686,71 @@ mod tests {
             )
             .unwrap_err()
             .contains("duplicate --iroh-publish-node")
+        );
+    }
+
+    #[test]
+    fn node_lookup_is_default_off_and_companion_flags_are_inert_without_switch() {
+        let config = Config::from_args(Vec::<String>::new()).unwrap();
+        assert!(!config.iroh_enable_node_lookup);
+        assert!(config.iroh_lookup_namespace.is_none());
+        assert!(config.iroh_lookup_recipient.is_none());
+        assert!(config.iroh_lookup_authority_socket.is_none());
+        assert!(config.iroh_lookup_authority_host.is_none());
+        assert!(config.iroh_lookup_owner.is_none());
+        for (flag, value) in [
+            ("--iroh-lookup-namespace", "run-1"),
+            ("--iroh-lookup-recipient", "authority.test:v1"),
+            ("--iroh-lookup-authority-socket", "127.0.0.1:8080"),
+            ("--iroh-lookup-authority-host", "authority.test"),
+            ("--iroh-lookup-owner", "operator"),
+            ("--iroh-lookup-external-authorization", "ticket-1"),
+        ] {
+            let error = Config::from_args([flag.to_string(), value.to_string()]).unwrap_err();
+            assert!(error.contains("require explicit --iroh-enable-node-lookup"));
+        }
+    }
+
+    #[test]
+    fn node_lookup_flags_parse_only_as_one_explicit_capability() {
+        let config = Config::from_args(
+            [
+                "--iroh-enable-node-lookup",
+                "--iroh-port",
+                "41004",
+                "--iroh-lookup-namespace",
+                "run-1",
+                "--iroh-lookup-recipient",
+                "authority.test:v1",
+                "--iroh-lookup-authority-socket",
+                "127.0.0.1:8080",
+                "--iroh-lookup-authority-host",
+                "authority.test",
+                "--iroh-lookup-owner",
+                "operator",
+            ]
+            .map(String::from),
+        )
+        .unwrap();
+        assert!(config.iroh_enable_node_lookup);
+        assert_eq!(config.iroh_port, Some(41004));
+        assert_eq!(config.iroh_lookup_namespace.as_deref(), Some("run-1"));
+        assert_eq!(
+            config.iroh_lookup_authority_socket,
+            Some("127.0.0.1:8080".parse().unwrap())
+        );
+        assert!(
+            Config::from_args(
+                [
+                    "--iroh-enable-node-lookup",
+                    "--iroh-enable-node-lookup",
+                    "--iroh-port",
+                    "41004"
+                ]
+                .map(String::from)
+            )
+            .unwrap_err()
+            .contains("duplicate --iroh-enable-node-lookup")
         );
     }
 

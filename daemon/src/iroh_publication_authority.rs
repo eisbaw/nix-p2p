@@ -31,7 +31,7 @@ use crate::iroh_node_record::{
     validate_recipient,
 };
 use crate::iroh_runtime::{open_state_directory, validate_directory};
-use crate::pinned_http::{MAX_RELAY_PAYLOAD_BYTES, RECORD_PATH_PREFIX};
+use crate::pinned_http::{MAX_RELAY_PAYLOAD_BYTES, RECORD_PATH_PREFIX, validate_host};
 
 pub const AUTHORITY_STATE_FILENAME: &str = "iroh-node-publication-authority.json";
 const AUTHORITY_LOCK_FILENAME: &str = "iroh-node-publication-authority.lock";
@@ -155,7 +155,8 @@ impl PublicationAuthorityConfig {
             .map_err(|error| AuthorityError::configuration(error.to_string()))?;
         validate_recipient(&self.signed_recipient)
             .map_err(|error| AuthorityError::configuration(error.to_string()))?;
-        validate_host(&self.expected_host)?;
+        validate_host(&self.expected_host)
+            .map_err(|error| AuthorityError::configuration(error.to_string()))?;
         self.signer_admission.validate()?;
         if self.owner.trim().is_empty()
             || self.owner.len() > 128
@@ -1470,23 +1471,6 @@ async fn write_response(
         .shutdown()
         .await
         .map_err(|error| AuthorityError::new(format!("closing authority response: {error}")))
-}
-
-fn validate_host(host: &str) -> Result<(), AuthorityError> {
-    if host.is_empty()
-        || host.len() > 253
-        || host.starts_with('.')
-        || host.ends_with('.')
-        || host.contains("..")
-        || !host.bytes().all(|byte| {
-            byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'-' | b'[' | b']' | b':')
-        })
-    {
-        return Err(AuthorityError::configuration(
-            "expected Host must be canonical ASCII without path/userinfo",
-        ));
-    }
-    Ok(())
 }
 
 fn unix_micros() -> Result<u64, AuthorityError> {

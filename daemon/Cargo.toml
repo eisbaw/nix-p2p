@@ -10,6 +10,12 @@ edition.workspace = true
 name = "daemon"
 path = "src/lib.rs"
 
+[features]
+default = []
+# Adversarial signed-record server used only inside the routed TASK-138 image.
+# Production packages do not build or install this binary.
+evidence-fixture = []
+
 [[bin]]
 name = "daemon"
 path = "src/main.rs"
@@ -17,6 +23,15 @@ path = "src/main.rs"
 [[bin]]
 name = "iroh-node-authority"
 path = "src/bin/iroh_node_authority.rs"
+
+[[bin]]
+name = "iroh-node-lookup"
+path = "src/bin/iroh_node_lookup.rs"
+
+[[bin]]
+name = "iroh-node-lookup-fixture"
+path = "src/bin/iroh_node_lookup_fixture.rs"
+required-features = ["evidence-fixture"]
 
 # HTTP stack (task-4 decision): tokio + hyper 1.x LOW-LEVEL client/server, plus
 # body/util helpers. NOT axum/tower (a framework the wave-0 skeleton does not
@@ -103,7 +118,7 @@ rustix = { version = "1", features = ["fs", "process"] }
 
 [dev-dependencies]
 # process: spawn the real testproxy binary for the fault-mode loop (AC#2).
-tokio = { version = "1", features = ["rt-multi-thread", "net", "macros", "io-util", "time", "process"] }
+tokio = { version = "1", features = ["rt-multi-thread", "net", "macros", "io-util", "time", "process", "test-util"] }
 # flate2: build a real gzip body for the AC#6 verbatim-forwarding bite.
 flate2 = "1"
 # sha2: model NIX's sha256==NarHash TRUST gate (gate 2) in the iroh transfer test.

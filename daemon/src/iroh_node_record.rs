@@ -99,18 +99,41 @@ impl NodeRecord {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NodeRecordErrorKind {
+    MalformedOrUntrusted,
+    NoDialableCandidate,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct NodeRecordError(String);
+pub struct NodeRecordError {
+    kind: NodeRecordErrorKind,
+    message: String,
+}
 
 impl NodeRecordError {
     fn new(message: impl Into<String>) -> Self {
-        Self(message.into())
+        Self {
+            kind: NodeRecordErrorKind::MalformedOrUntrusted,
+            message: message.into(),
+        }
+    }
+
+    fn no_dialable_candidate(message: impl Into<String>) -> Self {
+        Self {
+            kind: NodeRecordErrorKind::NoDialableCandidate,
+            message: message.into(),
+        }
+    }
+
+    pub fn kind(&self) -> NodeRecordErrorKind {
+        self.kind
     }
 }
 
 impl fmt::Display for NodeRecordError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str(&self.0)
+        formatter.write_str(&self.message)
     }
 }
 
@@ -222,6 +245,11 @@ fn validate_relay_url(raw: &str) -> Result<(), NodeRecordError> {
             "relay URL {raw:?} must use https with an explicit host"
         )));
     }
+    if url.port() == Some(0) {
+        return Err(NodeRecordError::new(format!(
+            "relay URL {raw:?} uses port zero"
+        )));
+    }
     if !url.username().is_empty()
         || url.password().is_some()
         || url.query().is_some()
@@ -237,14 +265,14 @@ fn validate_relay_url(raw: &str) -> Result<(), NodeRecordError> {
         }
         Some(Host::Ipv6(ip)) => match ip.to_ipv4_mapped() {
             Some(ip) => ip.is_unspecified() || ip.is_multicast() || ip == Ipv4Addr::BROADCAST,
-            None => ip.is_unspecified() || ip.is_multicast(),
+            None => ip.is_unspecified() || ip.is_multicast() || ip.is_unicast_link_local(),
         },
         Some(Host::Domain(_)) => false,
         None => unreachable!("explicit relay host was checked above"),
     };
     if forbidden_ip_literal {
         return Err(NodeRecordError::new(format!(
-            "relay URL {raw:?} uses a non-unicast IP-literal host"
+            "relay URL {raw:?} uses an IP-literal host that is not concretely dialable without ambient interface context"
         )));
     }
     if url.as_str() != raw {
@@ -575,7 +603,9 @@ pub fn decode_node_record(bytes: &[u8]) -> Result<NodeRecord, NodeRecordError> {
     };
     match state {
         PublicationState::Live if locations.is_empty() => {
-            return Err(NodeRecordError::new("live record has no locations"));
+            return Err(NodeRecordError::no_dialable_candidate(
+                "live record has no locations",
+            ));
         }
         PublicationState::Withdrawn if !locations.is_empty() => {
             return Err(NodeRecordError::new("withdrawal record contains locations"));
@@ -799,16 +829,18 @@ mod tests {
             "https://[::ffff:0.0.0.0]/",
             "https://[::ffff:224.0.0.1]/",
             "https://[::ffff:255.255.255.255]/",
+            "https://[fe80::1]/",
         ] {
             let error = NodeLocation::relay(raw).unwrap_err();
             assert!(
-                error.to_string().contains("non-unicast IP-literal"),
+                error.to_string().contains("not concretely dialable"),
                 "unexpected error for {raw}: {error}"
             );
         }
         NodeLocation::relay("https://relay.example.test/").unwrap();
         NodeLocation::relay("https://192.0.2.1/").unwrap();
         NodeLocation::relay("https://[2001:db8::1]/").unwrap();
+        assert!(NodeLocation::relay("https://relay.example.test:0/").is_err());
     }
 
     #[test]

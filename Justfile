@@ -61,6 +61,9 @@ _python:
 # Compile the whole workspace, tests and benches included.
 build: _toolchain
     cargo build --locked --workspace --all-targets
+    # TASK-138 keeps its adversarial authority out of production builds, so
+    # compile the evidence-only feature explicitly on every normal build gate.
+    cargo build --locked --package daemon --all-targets --features evidence-fixture
 
 # scripts/ is linted too: the gate scripts are safety-critical and would
 # otherwise be the only unchecked files in a repo gated at -D warnings. The
@@ -69,6 +72,7 @@ build: _toolchain
 # Clippy (warnings are errors), rustfmt drift, and the source-policy guards.
 lint: _toolchain _python independence
     cargo clippy --locked --workspace --all-targets -- -D warnings
+    cargo clippy --locked --package daemon --all-targets --features evidence-fixture -- -D warnings
     cargo fmt --all --check
     ruff check scripts
     ruff format --check scripts
@@ -83,10 +87,13 @@ independence: _toolchain
 # live in scripts/, not in cargo (rationale: scripts/check-fixtures.py).
 # Unit and integration tests plus the fixture gate (in-process, no containers).
 # measure.py --self-test unit-tests the egress validator (classify_run) and the
-# provenance fail-closed path with synthetic inputs - no containers, so it runs in
-# the fast tier alongside the fixture gate.
+# provenance fail-closed path with synthetic inputs - no containers, so it runs
+# in the fast tier alongside the fixture gate.
+# Run the fast unit, integration, fixture, and evidence self-test suite.
 test: build _python fixtures
     cargo test --locked --workspace
+    # The evidence fixture is feature-gated out of the workspace-default suite.
+    cargo test --locked --package daemon --bin iroh-node-lookup-fixture --features evidence-fixture
     "${NIX_P2P_PYTHON}/bin/python3" scripts/check-fixtures.py
     "${NIX_P2P_PYTHON}/bin/python3" scripts/check-golden-vectors.py
     "${NIX_P2P_PYTHON}/bin/python3" scripts/measure.py --self-test
@@ -100,6 +107,9 @@ test: build _python fixtures
     # task-137: exercise routed-publication command safety and artifact mutation bites.
     "${NIX_P2P_PYTHON}/bin/python3" scripts/iroh_node_publication_evidence.py --self-test
     "${NIX_P2P_PYTHON}/bin/python3" scripts/finalize_iroh_node_publication.py --self-test
+    # task-138: query-only routed lookup command safety and artifact mutation bites.
+    "${NIX_P2P_PYTHON}/bin/python3" scripts/iroh_node_lookup_evidence.py --self-test
+    "${NIX_P2P_PYTHON}/bin/python3" scripts/finalize_iroh_node_lookup.py --self-test
     # task-42: the profiler's unit gate (NarSize vs FileSize can never share an
     # unlabelled `_bytes` key), its S9 class-recovery bite (a known-O(n^2) law is
     # NEVER fitted linear), the disk walk and the arm scoring are all
@@ -311,3 +321,11 @@ iroh-publication-evidence image output="artifacts/iroh-publication" *ARGS: _pyth
 # Finalize one passing raw publication run against its reviewed implementation commit.
 iroh-publication-artifact raw_run implementation_commit output="artifacts/iroh-node-publication-v1.json" *ARGS: _python
     "${NIX_P2P_PYTHON}/bin/python3" scripts/finalize_iroh_node_publication.py --raw-run {{ quote(raw_run) }} --implementation-commit {{ quote(implementation_commit) }} --output {{ quote(output) }} {{ ARGS }}
+
+# Capture isolated routed Iroh NodeId-lookup evidence with an immutable image.
+iroh-lookup-evidence image output="artifacts/iroh-lookup" *ARGS: _python
+    "${NIX_P2P_PYTHON}/bin/python3" scripts/iroh_node_lookup_evidence.py --image {{ quote(image) }} --output {{ quote(output) }} {{ ARGS }}
+
+# Finalize one passing raw lookup run against its reviewed implementation commit.
+iroh-lookup-artifact raw_run implementation_commit output="artifacts/iroh-node-lookup-v1.json" *ARGS: _python
+    "${NIX_P2P_PYTHON}/bin/python3" scripts/finalize_iroh_node_lookup.py --raw-run {{ quote(raw_run) }} --implementation-commit {{ quote(implementation_commit) }} --output {{ quote(output) }} {{ ARGS }}

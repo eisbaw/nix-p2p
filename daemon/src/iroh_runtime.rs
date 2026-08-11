@@ -38,6 +38,7 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::{mpsc, oneshot, watch};
 use tokio::task::{AbortHandle, Id, JoinHandle, JoinSet};
 
+use crate::iroh_node_lookup::{NodeLookupConfig, NodeLookupHandle, NodeLookupRuntime};
 use crate::iroh_node_record::{NodeLocation, normalize_socket_addr};
 use crate::iroh_publication::{
     NodePublicationCapability, NodePublicationHandle, NodePublicationRuntime,
@@ -184,13 +185,16 @@ impl fmt::Debug for RelayCapability {
 }
 
 /// Address lookup is separately authorized from bind scope.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AddressLookupCapability {
     Disabled,
     /// Daemon-owned in-memory resolver used by non-network capability tests.
-    /// Future DNS/pkarr tasks add named variants here; arbitrary builders never
+    /// Networked resolvers use named variants here; arbitrary builders never
     /// receive `&Endpoint` and therefore cannot clone/export the runtime socket.
     Memory,
+    /// Resolve only asker-supplied NodeIds through one pinned, locally operated
+    /// Task137 pkarr authority. This variant does not publish endpoint data.
+    PinnedPkarr(NodeLookupConfig),
 }
 
 /// Observable network capabilities selected explicitly for one endpoint.
@@ -198,6 +202,7 @@ pub enum AddressLookupCapability {
 pub struct EndpointCapabilityState {
     pub relay_enabled: bool,
     pub address_lookup_services: usize,
+    pub node_lookup_enabled: bool,
     pub node_publication_enabled: bool,
 }
 
@@ -632,7 +637,7 @@ impl TaskSupervisorHandle {
         self.spawn_inner(name.into(), future, true)
     }
 
-    async fn execute<T>(
+    pub(crate) async fn execute<T>(
         &self,
         name: impl Into<String>,
         future: impl Future<Output = T> + Send + 'static,
@@ -644,10 +649,11 @@ impl TaskSupervisorHandle {
         self.spawn(name, async move {
             let mut result_tx = result_tx;
             tokio::select! {
+                biased;
+                _ = result_tx.closed() => {}
                 result = future => {
                     let _ = result_tx.send(result);
                 }
-                _ = result_tx.closed() => {}
             }
         })?;
         result_rx.await.map_err(|_| IrohRuntimeError::Closed)
@@ -832,7 +838,7 @@ impl IrohRuntimeBuilder {
                     "offline-test rejects relay capability injection".to_string(),
                 ));
             }
-            if address_lookup != AddressLookupCapability::Disabled {
+            if !matches!(&address_lookup, AddressLookupCapability::Disabled) {
                 return Err(IrohRuntimeError::Configuration(
                     "offline-test rejects address-lookup capability injection".to_string(),
                 ));
@@ -862,9 +868,13 @@ impl IrohRuntimeBuilder {
         EndpointCapabilityState {
             relay_enabled: matches!(self.relay, RelayCapability::Enabled(_)),
             address_lookup_services: usize::from(matches!(
-                self.address_lookup,
-                AddressLookupCapability::Memory
+                &self.address_lookup,
+                AddressLookupCapability::Memory | AddressLookupCapability::PinnedPkarr(_)
             )),
+            node_lookup_enabled: matches!(
+                &self.address_lookup,
+                AddressLookupCapability::PinnedPkarr(_)
+            ),
             node_publication_enabled: matches!(
                 self.node_publication,
                 NodePublicationCapability::Enabled(_)
@@ -995,8 +1005,25 @@ impl IrohRuntimeBuilder {
                 ));
             }
         };
+        let (installed_lookup, node_lookup) = match self.address_lookup {
+            AddressLookupCapability::Disabled => (InstalledAddressLookup::Disabled, None),
+            AddressLookupCapability::Memory => (InstalledAddressLookup::Memory, None),
+            AddressLookupCapability::PinnedPkarr(config) => {
+                let lookup = NodeLookupRuntime::start(config, self.supervisor.handle()).map_err(
+                    |error| {
+                        IrohRuntimeError::Configuration(format!(
+                            "initializing pinned node lookup: {error}"
+                        ))
+                    },
+                )?;
+                (
+                    InstalledAddressLookup::PinnedPkarr(lookup.handle()),
+                    Some(lookup),
+                )
+            }
+        };
         let endpoint =
-            bind_endpoint_with_secret(self.profile, secret_key, self.relay, self.address_lookup)
+            bind_endpoint_with_secret(self.profile, secret_key, self.relay, installed_lookup)
                 .await?;
         let supervisor_handle = self.supervisor.handle();
         let owner = Arc::new(EndpointOwner {
@@ -1076,6 +1103,7 @@ impl IrohRuntimeBuilder {
             supervisor: Some(self.supervisor),
             publication,
             publication_address_watch,
+            node_lookup,
         })
     }
 }
@@ -1334,6 +1362,7 @@ pub struct IrohNodeRuntime {
     supervisor: Option<TaskSupervisor>,
     publication: Option<NodePublicationRuntime>,
     publication_address_watch: Option<JoinHandle<()>>,
+    node_lookup: Option<NodeLookupRuntime>,
 }
 
 impl Drop for IrohNodeRuntime {
@@ -1343,6 +1372,9 @@ impl Drop for IrohNodeRuntime {
         // fail-safe for crashes; explicit `shutdown` performs the tombstone.
         if let Some(watcher) = self.publication_address_watch.take() {
             watcher.abort();
+        }
+        if let Some(lookup) = &self.node_lookup {
+            lookup.close();
         }
         self.publication.take();
         if let Some(supervisor) = &self.supervisor {
@@ -1357,6 +1389,7 @@ impl fmt::Debug for IrohNodeRuntime {
             .field("alive", &self.owner.is_some())
             .field("shutdown_deadline", &self.shutdown_deadline)
             .field("publication_enabled", &self.publication.is_some())
+            .field("node_lookup_enabled", &self.node_lookup.is_some())
             .finish()
     }
 }
@@ -1391,12 +1424,50 @@ impl IrohNodeRuntime {
             .map(NodePublicationRuntime::handle)
     }
 
+    pub fn node_lookup_handle(&self) -> Option<NodeLookupHandle> {
+        self.node_lookup.as_ref().map(NodeLookupRuntime::handle)
+    }
+
+    /// Resolve one typed identity through the exact lookup registry installed
+    /// on this endpoint. This diagnostic seam proves the adapter returns a real
+    /// Iroh `Item`; it adds no peer-list or inventory operation.
+    #[doc(hidden)]
+    pub async fn resolve_registered_node_lookup(
+        &self,
+        node_id: NodeId,
+    ) -> Result<iroh::address_lookup::Item, IrohRuntimeError> {
+        let owner = self.owner.as_ref().ok_or(IrohRuntimeError::Closed)?.clone();
+        let endpoint_id = iroh::PublicKey::from_bytes(node_id.as_bytes()).map_err(|error| {
+            IrohRuntimeError::Operation(format!("invalid typed lookup NodeId: {error}"))
+        })?;
+        let lookups = owner
+            .endpoint
+            .address_lookup()
+            .map_err(|_| IrohRuntimeError::Closed)?;
+        let mut results = lookups.resolve(endpoint_id);
+        match results.next().await {
+            Some(Ok(Ok(item))) => Ok(item),
+            Some(Ok(Err(error))) => Err(IrohRuntimeError::Operation(format!(
+                "registered node lookup failed: {error}"
+            ))),
+            Some(Err(error)) => Err(IrohRuntimeError::Operation(format!(
+                "registered node lookup produced no result: {error}"
+            ))),
+            None => Err(IrohRuntimeError::Operation(
+                "registered node lookup stream ended without a result".into(),
+            )),
+        }
+    }
+
     pub async fn shutdown(mut self) -> Result<ShutdownOutcome, IrohRuntimeError> {
         let started_at = tokio::time::Instant::now();
         let absolute_deadline = started_at + self.shutdown_deadline;
         let force_reserve = std::cmp::min(self.shutdown_deadline / 2, Duration::from_millis(100));
         let graceful_deadline = absolute_deadline - force_reserve;
         let mut task_errors = Vec::new();
+        if let Some(lookup) = &self.node_lookup {
+            lookup.close();
+        }
         if let Some(watcher) = self.publication_address_watch.take() {
             if watcher.is_finished() {
                 if let Err(error) = watcher.await {
@@ -1597,8 +1668,8 @@ pub async fn bind_endpoint(
     address_lookup: AddressLookupCapability,
 ) -> Result<Endpoint, IrohRuntimeError> {
     if matches!(profile.scope, EndpointScope::OfflineTest { .. })
-        && (!matches!(relay, RelayCapability::Disabled)
-            || address_lookup != AddressLookupCapability::Disabled)
+        && (!matches!(&relay, RelayCapability::Disabled)
+            || !matches!(&address_lookup, AddressLookupCapability::Disabled))
     {
         return Err(IrohRuntimeError::Configuration(
             "offline-test rejects relay/address-lookup capability injection".to_string(),
@@ -1614,14 +1685,30 @@ async fn bind_endpoint_with_lookups(
     address_lookup: AddressLookupCapability,
 ) -> Result<Endpoint, IrohRuntimeError> {
     let secret_key = load_identity(identity)?;
-    bind_endpoint_with_secret(profile, secret_key, relay, address_lookup).await
+    let installed = match address_lookup {
+        AddressLookupCapability::Disabled => InstalledAddressLookup::Disabled,
+        AddressLookupCapability::Memory => InstalledAddressLookup::Memory,
+        AddressLookupCapability::PinnedPkarr(_) => {
+            return Err(IrohRuntimeError::Configuration(
+                "pinned node lookup requires IrohRuntimeBuilder ownership and a narrow lookup handle"
+                    .into(),
+            ));
+        }
+    };
+    bind_endpoint_with_secret(profile, secret_key, relay, installed).await
+}
+
+enum InstalledAddressLookup {
+    Disabled,
+    Memory,
+    PinnedPkarr(NodeLookupHandle),
 }
 
 async fn bind_endpoint_with_secret(
     profile: EndpointProfile,
     secret_key: SecretKey,
     relay: RelayCapability,
-    address_lookup: AddressLookupCapability,
+    address_lookup: InstalledAddressLookup,
 ) -> Result<Endpoint, IrohRuntimeError> {
     // Snapshot at the last point before materialising Iroh configuration. A
     // Custom RelayMap has shared interior upstream; passing it through would let
@@ -1665,8 +1752,14 @@ async fn bind_endpoint_with_secret(
     if let RelayCapability::Enabled(mode) = relay {
         builder = builder.relay_mode(mode);
     }
-    if address_lookup == AddressLookupCapability::Memory {
-        builder = builder.address_lookup(iroh::address_lookup::memory::MemoryLookup::new());
+    match address_lookup {
+        InstalledAddressLookup::Disabled => {}
+        InstalledAddressLookup::Memory => {
+            builder = builder.address_lookup(iroh::address_lookup::memory::MemoryLookup::new());
+        }
+        InstalledAddressLookup::PinnedPkarr(lookup) => {
+            builder = builder.address_lookup(lookup.adapter());
+        }
     }
     builder
         .bind()
@@ -2440,6 +2533,35 @@ mod tests {
     fn daemon_test_profile_is_const_self_equal() {
         const _: () =
             assert!(DAEMON_TEST_ENDPOINT_PROFILE.same_configuration(DAEMON_TEST_ENDPOINT_PROFILE));
+    }
+
+    #[tokio::test]
+    async fn abandoned_execute_is_observed_before_the_operation_is_first_polled() {
+        let supervisor = TaskSupervisor::new();
+        let handle = supervisor.handle();
+        let polls = Arc::new(AtomicUsize::new(0));
+        {
+            let operation_polls = polls.clone();
+            let never = poll_fn(move |_context| {
+                operation_polls.fetch_add(1, Ordering::SeqCst);
+                std::task::Poll::<()>::Pending
+            });
+            let mut execution = Box::pin(handle.execute("pre-cancelled-execute", never));
+            poll_fn(|context| {
+                assert!(execution.as_mut().poll(context).is_pending());
+                std::task::Poll::Ready(())
+            })
+            .await;
+            // Registration happened during the manual poll above. Dropping the
+            // caller now closes result_rx before the manager can first poll the
+            // registered operation on this current-thread executor.
+            drop(execution);
+        }
+        tokio::task::yield_now().await;
+        assert_eq!(polls.load(Ordering::SeqCst), 0);
+        let mut tasks = supervisor.begin_shutdown().expect("begin shutdown");
+        let errors = wait_for_owned_work(&mut tasks, &supervisor.process_jobs(), &supervisor).await;
+        assert!(errors.is_empty(), "tracked task errors: {errors:?}");
     }
 
     #[tokio::test]

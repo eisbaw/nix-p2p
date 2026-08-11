@@ -77,6 +77,7 @@ use tokio::sync::watch;
 
 use crate::claim::KnownTransport;
 use crate::content_id::Blake3Digest;
+use crate::iroh_node_lookup::NodeLookupHandle;
 use crate::iroh_publication::{NodePublicationCapability, NodePublicationHandle};
 use crate::iroh_runtime::{
     AddressLookupCapability, DAEMON_TEST_ENDPOINT_PROFILE, EndpointCapabilityState,
@@ -2231,6 +2232,12 @@ impl IrohNode {
 
     pub fn node_publication_handle(&self) -> Option<NodePublicationHandle> {
         self.runtime.node_publication_handle()
+    }
+
+    /// Narrow NodeId resolver owned by this node runtime. It is deliberately
+    /// not exposed through [`IrohTransport`], which remains content transport.
+    pub fn node_lookup_handle(&self) -> Option<NodeLookupHandle> {
+        self.runtime.node_lookup_handle()
     }
 
     /// Attach daemon-side work whose lifetime must not exceed the node.

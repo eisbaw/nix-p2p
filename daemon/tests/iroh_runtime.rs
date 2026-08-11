@@ -501,6 +501,7 @@ async fn global_wildcard_binds_are_observable_but_never_publishable() {
         daemon::EndpointCapabilityState {
             relay_enabled: false,
             address_lookup_services: 1,
+            node_lookup_enabled: false,
             node_publication_enabled: false,
         }
     );
@@ -534,6 +535,7 @@ async fn lan_and_global_scopes_do_not_imply_lookup_or_relay() {
             daemon::EndpointCapabilityState {
                 relay_enabled: false,
                 address_lookup_services: 0,
+                node_lookup_enabled: false,
                 node_publication_enabled: false,
             }
         );
@@ -557,6 +559,7 @@ fn explicit_relay_capability_is_observable_before_any_network_bind() {
         daemon::EndpointCapabilityState {
             relay_enabled: true,
             address_lookup_services: 0,
+            node_lookup_enabled: false,
             node_publication_enabled: false,
         }
     );
