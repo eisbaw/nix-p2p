@@ -6,7 +6,7 @@ title: >-
 status: To Do
 assignee: []
 created_date: '2026-08-11 21:22'
-updated_date: '2026-08-11 21:38'
+updated_date: '2026-08-11 22:32'
 labels:
   - iroh
   - seam
@@ -44,4 +44,11 @@ NarTransfer/NarServer wrap iroh-blobs on the shared TASK-115 endpoint; NodeLocat
 
 <!-- SECTION:NOTES:BEGIN -->
 Crate topology (owner directive 2026-08-11: exactly one P2P backend compiled in, never both required): peer-fabric (seam, TASK-140) <- daemon-core (frontend, no p2p) <- fabric-iroh (this task) / fabric-libp2p (later, TASK-103 if selected) <- daemon bin (one backend, optional-dep + mutually-exclusive feature). fabric-libp2p is not a workspace member until libp2p is chosen. testproxy independence is unaffected (it depends on none of these). See docs/peer-fabric-seam.md.
+
+Forward-carried from TASK-140 (peer-fabric seam landed, commit 9073806):
+- peer-fabric is now the CANONICAL HOME of NodeId (32 ed25519 bytes), Blake3Digest (32 bytes), TransportTag, TransportOffer/InfoHash, ContentKey, ProviderRecord, DialInfo, Lookup, Exposure*, budgets. TASK-141 MUST delete the daemon's duplicate NodeId (daemon::transport), Blake3Digest (daemon::content_id), TransportTag (daemon::transport_fetch) and re-point the daemon at peer-fabric's copies. They are byte-compatible by construction (same lengths, same lowercase-hex canonical form) but are DISTINCT TYPES today.
+- No cross-crate equivalence guard exists (peer-fabric cannot depend on daemon). Until the daemon copies are deleted, treat any edit to peer-fabric's NodeId/Blake3Digest/TransportTag/TransportOffer as requiring a mirrored daemon edit; ideally TASK-141 lands a test proving the wire encodings agree, then removes the duplicates. TransportTag::as_str()/TransportOffer variants were written to match daemon::claim::KnownTransport serde tags ('iroh','bittorrent') - verify on merge.
+- Composition root is TASK-141's: the two thin binaries (daemon-iroh/daemon-libp2p), each daemon_core::run(fabric), must assert the selected profile's REQUIRED axes are Some and FAIL FAST otherwise (the peer-fabric doc's Unsupported-ZST-dilemma resolution). peer-fabric only provides the Option<Arc<dyn>> shape; it does not assert requiredness.
+- peer-fabric's SafetyEnvelope/ServeBudget mirror daemon::transport_iroh's shapes; NarTransfer::fetch was given expected_size:Option<u64> to match daemon::transport_fetch::Transport::fetch (the seam doc had dropped it). Reconcile the daemon's real IrohTransport onto peer-fabric::NarTransfer without losing the mid-stream NarSize abort.
+- peer-fabric::ServeHandle now owns an opaque Box<dyn Send+Sync> teardown guard; the IrohFabric NarServer impl must attach its real listener/task-abort there so drop = teardown.
 <!-- SECTION:NOTES:END -->

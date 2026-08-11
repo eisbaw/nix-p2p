@@ -6,7 +6,7 @@ title: >-
 status: In Progress
 assignee: []
 created_date: '2026-08-10 22:51'
-updated_date: '2026-08-11 21:21'
+updated_date: '2026-08-11 22:32'
 labels:
   - iroh
   - discovery
@@ -46,4 +46,10 @@ Implement the cornerstone decentralized exact-key discovery core now. Build a bo
 
 <!-- SECTION:NOTES:BEGIN -->
 Re-scoped 2026-08-11 per mped-architect + owner: adopt a proven prior DHT, do not hand-roll. AC#3 (implement PING/FIND_NODE/FIND_PROVIDERS/STORE_PROVIDER) DROPPED - the adopted substrate provides routing/RPCs. Surviving ACs freeze OUR schema as an opaque value inside the substrate. AC#6/#8 (bootstrap, cold multi-node proof) now target the adopted substrate. Must land AFTER TASK-140 (seam) so the ProviderRecord shape and the frozen codec agree on the opaque-value model. See docs/peer-fabric-seam.md.
+
+Forward-carried from TASK-140 (peer-fabric seam landed, commit 9073806) - data-design questions the codec freeze MUST settle (raised by mped-architect review of the seam):
+- ProviderRecord.key vs the DHT storage key: peer-fabric documents the SSOT invariant record.key == put_record storage key, signature binds it, codec validates fail-fast on read. TASK-126 decides whether to keep the field (so the signature covers it) or reconstruct it for signing. State which key wins; do not leave both independently mutable.
+- ProviderRecord.content (Blake3Digest): OPEN whether it is LEARNED from the record or already KNOWN by an asker who possessed the NarHash to derive ContentKey and run gate-1. If already known, it may be redundant (drop it); if a record is discoverable by key alone without knowing the content digest, it must stay. Same question for HoldAnswer::Have{content,offers}. Freeze the answer with the codec.
+- ContentKey privacy: the seam doc was corrected to state honestly that the key/NarHash separation only hides the signed hash from ROUTING nodes; the k closest STORING nodes still learn ProviderRecord.content. Keep this framing; the adversarial exposure analysis is TASK-132's.
+- ContentKey derivation (NarHash -> 32 bytes) and ProviderRecord codec/size-cap and expiry-vs-substrate-TTL reconciliation (AC#6) are all still TASK-126's to freeze; peer-fabric names only the field SHAPE (from_bytes is the only ContentKey constructor until you pin the derivation).
 <!-- SECTION:NOTES:END -->

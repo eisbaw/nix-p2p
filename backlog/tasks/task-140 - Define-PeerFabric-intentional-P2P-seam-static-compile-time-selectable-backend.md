@@ -3,11 +3,11 @@ id: TASK-140
 title: >-
   Define PeerFabric intentional P2P seam (static, compile-time-selectable
   backend)
-status: In Progress
+status: Done
 assignee:
   - '@claude'
 created_date: '2026-08-11 21:11'
-updated_date: '2026-08-11 22:09'
+updated_date: '2026-08-11 22:33'
 labels:
   - seam
   - p2p
@@ -61,4 +61,20 @@ Implementation plan (TASK-140, standalone peer-fabric crate; consumed by nobody 
 9. FakeFabric + per-axis fakes; unit tests: MISS!=UNAVAILABLE representable, ledger records, find_providers->Vec<ProviderRecord>, upstream_only(all None) exposes no axis.
 10. Gate: just build/lint/test all green incl. independence. e2e UNAFFECTED (peer-fabric consumed by nobody).
 Deferred to TASK-141 (noted in code+notes): feature-gated type alias / two-binaries composition root; daemon-core depends on peer-fabric; delete daemon's duplicate NodeId/Blake3Digest and re-point at peer-fabric.
+
+DONE (commit 9073806). Gate green inside nix develop: just build exit 0, just lint exit 0 (clippy -D warnings clean, rustfmt clean, ruff clean, independence self-test green + no daemon<->testproxy edge / no shared crate, source guards ok), just test exit 0 (workspace 210 daemon + 19 peer-fabric unit tests, all fixture/measurement self-tests pass). just e2e was NOT run: this task changes NO daemon behavior (peer-fabric is consumed by nobody), so the fast gate is sufficient and e2e is unaffected - noted rather than skipped silently.
+
+Reviews: mped-architect pressure-tested the seam (verdict: strong, 7/8 ACs clean). Three must-fix findings in the frozen trait surface were folded in BEFORE commit: (1) NarTransfer::fetch gained expected_size:Option<u64> so the documented TooLarge abort has a real input path; (2) ServeHandle now owns an opaque teardown guard so its RAII contract is real (a bare String tore nothing down); (3) PeerHoldReply::aligned_with fail-fast-checks the positional invariant across the trust boundary. Data-design findings #4/#5 (ProviderRecord.key SSOT vs storage key; whether .content is redundant; ContentKey privacy honesty) were documented in-code and forward-carried to TASK-126 (codec freeze). Cross-crate type-duplication guard forward-carried to TASK-141. (qa-test-runner subagent was interrupted by an API error mid-run; the gate numbers above are from direct runs and are authoritative.)
+
+Per-AC status (TASK-140's own scope; the owner's task note carves the binary/daemon-core wiring out to TASK-141 and the codec numbers out to TASK-126):
+- AC#1 seven traits + intention docs + 6-axis mapping (non-overlapping): MET.
+- AC#2 Lookup 3-way, reasons cover bootstrap/partition/deadline/insufficient-routing: MET (exemplary).
+- AC#3 single ExposureLedger sink + declared_exposure() + cooperative caveat: MET.
+- AC#4 Option<Arc<dyn>> object-safe/None==off/no perf claim: MET. Feature-gated type alias + composition-root required-axis assertion: DEFERRED to TASK-141 (superseded by two-binaries decision, per task note).
+- AC#5 capability-vs-profile distinct, upstream_only exposes no axis, runtime tag-keyed TransferRegistry: MET.
+- AC#6 find_providers -> Vec<ProviderRecord> value-store shape, signed record learnable offline: MET at the type/shape level. Record size cap + store-TTL-vs-expiry reconciliation: TASK-126's freeze (documented).
+- AC#7 policy above seam; FakeFabric substrate-free; seven-axis iroh/libp2p + dual-stack mapping: MET (mapping table in docs/peer-fabric-seam.md; FakeFabric exercises every axis).
+- AC#8 standalone crate, ZERO iroh/libp2p deps: MET, verified (only async-trait normal dep, tokio dev-only). daemon-core-depends-on-peer-fabric: TASK-141.
+
+Gotchas/subtleties: (a) no serde on the value types - deliberate, the wire codec is TASK-126's freeze, so peer-fabric carries the field SHAPE not a codec; (b) no blake3/hashing dep - the FakeNarTransfer is content-addressed by the key it was seeded under, the frozen BLAKE3(RawNarV1) recipe stays the daemon's content_id; (c) FakeFabric is public API (NOT cfg(test)) because daemon-core tests in TASK-141 consume it; (d) ExposureLedger uses std::sync::Mutex not tokio, so tokio is a dev-only dep.
 <!-- SECTION:NOTES:END -->
