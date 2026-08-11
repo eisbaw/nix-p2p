@@ -633,7 +633,8 @@ The build order is a gate, not a preference inside the eventual policy:
 5. After both backends exist, run cross-backend property/fuzz rigor and the
    preregistered sequence: diagnostic raw Stage A (TASK-125), real-network
    development/training evidence (TASK-80), Stage-B training (TASK-122),
-   training-only fitting (TASK-44), and one later holdout (TASK-123).
+   training-only fitting (TASK-44), sealed-A2 validation (TASK-129), and one
+   later holdout (TASK-123).
 
 “Iroh first” above is implementation risk ordering only. Transport registries,
 policy artifacts and tournament scoring contain no implicit Iroh-first,
@@ -765,7 +766,7 @@ TASK-44 uses canonical A1 only to choose the deterministic best-static arm and
 one already-enumerated artifact whose exact matching contrast is eligible. It
 cannot synthesize a threshold or swap to a comparator whose contrast happened
 to pass. With no eligible match the profile has no candidate. After candidate
-and comparator hashes freeze, a separate TASK-122 reader replays the same
+and comparator hashes freeze, the separate TASK-129 reader replays the same
 selector independently on A2 for validation and sends only its hashed
 validated/no-go artifact to the TASK-123 freeze input. TASK-44 receives no A2
 feedback and cannot nominate a runner-up; failure means no candidate for that
@@ -809,16 +810,16 @@ not license public publication; a public loss does not erase a consume-only win.
   calibration, TASK-128 owns and freezes the generic causal-trace schema, replay
   interpreter and complete exact selector/comparator contrast plus numeric
   injection catalog; it may not tune them from training. TASK-122 owns
-  execution, exclusions, fixed-class
-  replay parity, centered joint planning and post-freeze A2 validation for
-  Stage-B **training only**. It releases only the immutable eligibility
-  mask/global N/hashes before selection, sends the final hashed validation/no-go
-  artifact directly to TASK-123, and keeps raw A2 and every directional value
-  outside the TASK-44 fitting surface.
+  execution, exclusions, fixed-class replay parity and centered joint planning
+  for Stage-B **training only**. It releases only the immutable eligibility
+  mask/global N/hashes before selection and seals raw A2 and every directional
+  value outside the TASK-44 fitting surface.
   TASK-44 owns deterministic A1-only selection: the best-static comparator and
   at most one exact eligible catalog artifact per profile. It may not create a
   parameter, substitute a comparator, receive A2 feedback or alter a selector
-  after A2 validation. TASK-123 owns the
+  after A2 validation. TASK-129 owns the post-freeze A2 reader and sends exactly
+  one hashed validated/validation-no-go/no-candidate slot per selectable profile
+  directly to TASK-123 without returning feedback to TASK-44. TASK-123 owns the
   freeze/execution/verdict protocol with the independent entropy witnesses
   required by TESTING.md.
 - TASK-123 may begin only with frozen hashes for code, experiment contract,

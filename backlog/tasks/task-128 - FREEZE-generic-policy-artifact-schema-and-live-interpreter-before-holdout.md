@@ -4,6 +4,7 @@ title: 'FREEZE: generic policy artifact schema and live interpreter before holdo
 status: To Do
 assignee: []
 created_date: '2026-08-10 22:51'
+updated_date: '2026-08-11 02:36'
 labels:
   - policy
   - irreversible
@@ -34,6 +35,8 @@ Build and freeze the mechanism-neutral executor that will run candidate policies
 - [ ] #4 Unknown schema versions, missing fields, invalid thresholds and unavailable selected mechanisms fail to a named safe fallback within a total deadline; S1/S2 and resource ceilings remain outside policy override.
 - [ ] #5 The interpreter records artifact hash, decision inputs, selected action and fallback reason with privacy-safe bounded labels, enough for holdout adjudication without post-hoc inference.
 - [ ] #6 No holdout IDs/seeds/topologies are generated or readable, no tuned candidate/default is shipped, and mutation of interpreter semantics changes a pinned version/golden trace before TASK-44 can fit against it.
+- [ ] #7 Before any Stage-B calibration, freeze and hash the causal decision-trace schema, replay interpreter, complete bounded JCS planning catalog for each of the three selectable profiles, exact numeric planning-injection contract, and linked-coordinate solver. Each catalog has at most 16 fully specified selector/hyperparameter artifacts crossed with every capable best-static comparator; families, ranges, training-filled values, comparator substitution, and post-calibration selector invention are forbidden, and any semantic or catalog mutation creates a new experiment version.
+- [ ] #8 Development parity qualification covers every frozen dynamic selector across the four preregistered scenario classes with distinct independently fresh A1 and A2 live executions, each compared only with replay of its matching base-arm-label trace. Static one-arm selectors are exempt. The fixed parity catalog and result hashes are inputs to TASK-122; failed parity makes every contrast containing that selector ineligible.
 <!-- AC:END -->
 
 ## Implementation Notes

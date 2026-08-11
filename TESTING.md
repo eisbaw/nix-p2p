@@ -1838,7 +1838,7 @@ dynamic replay derives its ordered actions and provenance-attributed combined
 outcome. Primary policy effects use
 `pi/A1`; `pi/A2` only validates that selection. Selecting an unsupported arm in
 any required opportunity cluster makes the policy ineligible and yields no
-numeric clone. TASK-44 fits/selects using A1 only; raw A2 values are withheld
+numeric clone. TASK-44 selects using A1 only; raw A2 values are withheld
 from its fitting interface until the candidate and best-static hashes freeze.
 The planning reader may use sealed A1/A2 solely for the preregistered centered
 power/null eligibility test at fixed `N_required=100`; it cannot calculate a
@@ -2090,7 +2090,7 @@ An ineligible contrast does not poison other catalog entries. If no eligible
 contrast matches the A1-selected best-static comparator, that profile has no
 candidate; upstream/no acceptable candidate remains the honest result.
 
-After candidate and best-static hashes freeze, a separate TASK-122 validation
+After candidate and best-static hashes freeze, the separate TASK-129 validation
 reader receives the sealed A1/A2 evidence and those hashes, replays the exact
 selector independently on A2, and applies the preregistered training A/A and
 hard-validation gates. It emits only a hashed `validated` or terminal
@@ -2099,7 +2099,7 @@ no raw A2, residual, per-label statistic or refitting response. A no-go cannot
 reopen A1 selection or nominate a runner-up, so the profile has no candidate for
 that experiment version.
 
-TASK-122 emits exactly one hashed `validation_slot_artifact` per selectable
+TASK-129 emits exactly one hashed `validation_slot_artifact` per selectable
 profile. It is a closed tagged union. `validated` and `validation_no_go` require
 `candidate_ref={presence:"present",sha256:...}` and
 `comparator_ref={presence:"present",sha256:...}`. If TASK-44 produced no
@@ -2229,7 +2229,7 @@ network endpoint or topology; none may exist elsewhere yet.
 
 The generator API requires a typed `HoldoutRevealPermit` for
 `partition=holdout`. Before TASK-123 that type can be verified but no permit can
-be issued. TASK-88, TASK-125, TASK-80, TASK-122 and TASK-44 runners compile/run
+be issued. TASK-88, TASK-125, TASK-80, TASK-122, TASK-44 and TASK-129 runners compile/run
 with development/training capabilities only. A request to generate, enumerate,
 open or infer a holdout namespace fails atomically with
 `HOLDOUT_FORBIDDEN_BEFORE_FREEZE` before a path, ID or PRNG is created; the
@@ -2381,9 +2381,10 @@ never repairs a result by tuning on its holdout.
 | TASK-88 | Iroh-only development/training reference | Make a cross-backend/default claim or read holdout |
 | TASK-117/TASK-121 | BitTorrent identity and compressed supported/no-go evidence | Impute an unsupported cell or select policy |
 | TASK-125 | Stage-A `diagnostic-tournament-v1` artifact | Emit candidate/score/default fields or read holdout |
-| TASK-122 | Stage-B `policy-training-v1` A1/A2 evidence, all invalid/unsupported rows, fixed-class parity results, centered joint eligibility mask and one hashed validated/validation-no-go/no-candidate slot artifact per profile | Expose raw A2 or directional planning detail to TASK-44, return A2 feedback for refitting, fabricate hashes in an absent slot, change the frozen catalog, choose a default, fit on holdout, or omit losing cells |
+| TASK-122 | Stage-B `policy-training-v1` A1/A2 evidence, all invalid/unsupported rows, fixed-class parity results and centered joint eligibility mask; raw A2 remains sealed for TASK-129 | Expose raw A2 or directional planning detail to TASK-44, change the frozen catalog, choose a default, fit on holdout or omit losing cells |
 | TASK-128 | Pre-calibration causal-trace schema/replay interpreter, complete exact planning-contrast/injection catalog and development parity traces | Tune/add a selector, numeric target or parameter after calibration starts, embed a default, or include holdout data |
-| TASK-44 | Deterministic A1-only best-static and at most one exact eligible catalog artifact/profile; its frozen output is later validated by the TASK-122 A2 reader | Read raw A2 or receive validation feedback while fitting/selecting, synthesize parameters, swap comparators to obtain eligibility, alter a selector after A2 validation, file a product implementation/default task or access holdout |
+| TASK-44 | Deterministic A1-only best-static and at most one exact eligible catalog artifact/profile; its frozen output is later validated by the TASK-129 A2 reader | Read raw A2 or receive validation feedback while fitting/selecting, synthesize parameters, swap comparators to obtain eligibility, alter a selector after A2 validation, file a product implementation/default task or access holdout |
+| TASK-129 | Post-fit sealed-A2 validation and exactly one hashed validated/validation-no-go/no-candidate slot artifact per selectable profile | Return A2 feedback for refitting, nominate a runner-up, fabricate hashes in an absent slot, narrow the three-profile family, generate holdout material or execute a no-go/no-candidate slot |
 | TASK-123 freeze/verdict custodian + independent entropy witnesses | One reserved commit/reveal, atomic permit/manifest, unchanged execution and signed/versioned verdict | Reroll/reuse, contribute custodian entropy, tune, promote an exploratory result, or hide no-go |
 | TASK-124 | Post-verdict production/pilot re-plan | Reinterpret or overwrite TASK-123 evidence |
 

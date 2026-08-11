@@ -6,7 +6,7 @@ title: >-
 status: To Do
 assignee: []
 created_date: '2026-08-10 22:24'
-updated_date: '2026-08-10 22:57'
+updated_date: '2026-08-11 02:36'
 labels:
   - tournament
   - measurement
@@ -50,6 +50,8 @@ Execute only the TRAINING partition defined by TASK-114 using the transport-neut
 - [ ] #5 Privacy/participation evidence records published/query data and third-party dependencies for every arm; missing measurements fail closed rather than reading as zero.
 - [ ] #6 The artifact contains the manifest/config/code hashes and a structural assertion that no holdout scenario ID, seed, topology or result was accessed.
 - [ ] #7 The holdout generator is not invoked and no holdout material exists; a bite attempting generation/read from the Stage-B runner fails before scoring.
+- [ ] #8 Run the frozen TASK-128 parity qualification and the exact centered joint N=100 eligibility planner over all preregistered workload strata and exact selector-versus-best-static contrasts. The training artifact exposed to TASK-44 contains only the eligibility mask, global N, catalog/interpreter/planner/config/code hashes and permitted A1 training evidence; raw A2 observations, residuals, effects and uncentered statistics remain inaccessible.
+- [ ] #9 Seal A1/A2 evidence behind distinct readers after centered planning. TASK-44 receives only permitted A1 evidence plus the eligibility mask, global N and frozen hashes. Raw A2, residuals, effects and uncentered statistics are available only to the later TASK-129 validation reader after TASK-44 freezes candidate and comparator hashes; this task does not emit post-fit validation slots.
 <!-- AC:END -->
 
 ## Implementation Notes
