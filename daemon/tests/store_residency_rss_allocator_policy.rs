@@ -8,7 +8,7 @@ mod residency_support;
 
 use std::time::Duration;
 
-use daemon::{IrohProvider, StoreResidency, StoreRetention};
+use daemon::{IrohProviderNode, StoreResidency, StoreRetention};
 use residency_support::{
     poll_until_released, rss_hwm_says_released, store_says_released, synth_raw_nar, vm_bytes,
 };
@@ -35,7 +35,7 @@ async fn current_rss_after_release_is_an_allocator_policy_not_an_oracle() {
     // host-specific accident a later reader would otherwise generalise into "VmRSS
     // is a fine residency oracle". It is not: nothing in glibc promises it, and the
     // reading that this project actually fits - VmHWM - provably never tracks it.
-    let provider = IrohProvider::spawn_with_retention(StoreRetention::ReleaseOnRequest {
+    let provider = IrohProviderNode::spawn_with_retention(StoreRetention::ReleaseOnRequest {
         sweep_interval: Duration::from_millis(50),
     })
     .await
@@ -144,5 +144,5 @@ async fn current_rss_after_release_is_an_allocator_policy_not_an_oracle() {
     // arena coalesce and dissolve the case this test constructs.
     assert_eq!(pins.len(), RETAINED_CHUNKS);
     drop(pins);
-    provider.shutdown().await;
+    provider.shutdown().await.unwrap();
 }

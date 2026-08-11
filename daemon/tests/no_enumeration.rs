@@ -19,8 +19,9 @@
 //!
 //! ## The rule, precisely
 //!
-//! For every function signature in the three modules that make up the discovery
-//! surface (`claim`, `availability`, `discovery`):
+//! For every function signature in the five modules that make up the discovery
+//! surface (`claim`, `availability`, `supply_catalog`, `discovery`, and
+//! `transport_iroh`):
 //!
 //!   if the RETURN type contains a multi-valued container of an identity type
 //!   (`NarHashKey`, `Blake3Digest`, `Claim`, `StorePath`), OR is one of the
@@ -52,12 +53,12 @@
 //!
 //! ## Honest limits of this guard
 //!
-//!   * ITS SCOPE IS FOUR MODULES: `claim`, `availability`, `discovery` and
+//!   * ITS SCOPE IS FIVE MODULES: `claim`, `availability`, `supply_catalog`, `discovery` and
 //!     `transport_iroh`. A listing added to any OTHER module is invisible to it.
 //!     The previous note justified the narrower scope by saying the unscanned
 //!     modules "do not answer peer messages today". That was FALSE of
 //!     `transport_iroh`, which is precisely the module that accepts peer
-//!     connections and holds an `AvailabilityIndex` - and whose own docs
+//!     connections and probes the inert supply catalog - and whose own docs
 //!     anticipate an index that enumerates a node's held NARs (task-50). It is
 //!     now in scope. The remaining unscanned modules are the HTTP/proxy and
 //!     fixture surfaces; that is a real limit, stated rather than argued away.
@@ -76,9 +77,13 @@
 const SOURCES: &[(&str, &str)] = &[
     ("claim.rs", include_str!("../src/claim.rs")),
     ("availability.rs", include_str!("../src/availability.rs")),
+    (
+        "supply_catalog.rs",
+        include_str!("../src/supply_catalog.rs"),
+    ),
     ("discovery.rs", include_str!("../src/discovery.rs")),
-    // transport_iroh.rs is the module that ACCEPTS peer connections and holds an
-    // `AvailabilityIndex`. The scope note used to say the unscanned modules "do
+    // transport_iroh.rs is the module that ACCEPTS peer connections and probes an
+    // inert supply catalog. The scope note used to say the unscanned modules "do
     // not answer peer messages today", which was simply false of this one - and
     // the enumeration API its own docs anticipate (task-50) would have landed
     // exactly here, outside the guard.
@@ -111,8 +116,11 @@ const KEY_BEARING_PARAMS: &[&str] = &["NarHashKey", "Blake3Digest", "HoldQuery",
 
 /// Per-FILE floor on how many signatures the parser must find. Deliberately low
 /// enough that adding or removing a few functions does not churn it, and high
-/// enough that a file which failed to parse at all cannot slip through.
-const MIN_SIGNATURES_PER_FILE: usize = 8;
+/// enough that a file which failed to parse at all cannot slip through. Seven is
+/// the real minimum among the governed modules (`supply_catalog.rs`); inflating
+/// it by adding a no-op API would weaken the production boundary to satisfy a
+/// test implementation detail.
+const MIN_SIGNATURES_PER_FILE: usize = 7;
 
 /// Container shapes that make a return value plural.
 const CONTAINERS: &[&str] = &[

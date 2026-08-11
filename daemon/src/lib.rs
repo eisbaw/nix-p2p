@@ -27,11 +27,14 @@ pub mod claim;
 pub mod content_id;
 pub mod discovery;
 mod hexfmt;
+pub mod iroh_runtime;
 pub mod narinfo_cache;
 mod nixbase32;
+mod process_group;
 pub mod rewrite;
 pub mod server;
 pub mod source;
+mod supply_catalog;
 pub mod transport;
 pub mod transport_fetch;
 pub mod transport_iroh;
@@ -39,7 +42,8 @@ pub mod upstream;
 
 pub use availability::{
     AnnounceSink, AvailabilityError, AvailabilityIndex, CommandNarDumper, DerivedNar, DumpError,
-    IndexStore, JsonFileStore, NarDumper, NullAnnounce, NullStore, PersistError, StorePath,
+    IndexStore, JsonFileStore, MemoryNarDumper, NarDumper, NullAnnounce, NullStore, PersistError,
+    RegularFileNarDumper, StorePath,
 };
 pub use cacheinfo::CacheInfo;
 pub use catalog::{CorrelationStore, NarCatalog, NarMeta, NullCorrelation};
@@ -59,6 +63,12 @@ pub use discovery::{
     DirectDiscovery, Discovery, FallbackNarSource, InMemoryDiscovery, InProcessPeerQuery,
     PROBE_TIMEOUT, PeerQuery, PeerQueryError,
 };
+pub use iroh_runtime::{
+    AddressLookupCapability, EndpointCapabilityState, EndpointProfile, EndpointScope,
+    IROH_IDENTITY_FILENAME, IROH_SHUTDOWN_DEADLINE, IdentitySource, IrohEndpointHandle,
+    IrohNodeRuntime, IrohRuntimeBuilder, IrohRuntimeError, RelayCapability, ShutdownOutcome,
+    TaskSupervisor, TaskSupervisorHandle,
+};
 pub use narinfo_cache::{Clock, NarinfoDiskCache, SystemClock};
 pub use rewrite::{
     AllowlistRawServe, NoRawServe, RawRewrite, RawServeDecision, RewriteError, to_raw,
@@ -68,6 +78,7 @@ pub use source::{
     NarBody, NarHash, NarKey, NarPathToken, NarSource, NarinfoSource, RawUpstream, SourceError,
     StoreHash, UpstreamResponse,
 };
+pub use supply_catalog::SupplyCatalogHandle;
 pub use transport::{BitTorrentInfoHash, IROH_BLOBS_ALPN, NODE_ID_LEN, NodeId, NodeIdParseError};
 pub use transport_fetch::{
     FakeTransport, FetchError, Transport, TransportError, TransportNarSource, TransportRegistry,
@@ -76,8 +87,9 @@ pub use transport_fetch::{
 pub use transport_iroh::{
     BODY_IDLE_TIMEOUT, DEFAULT_MAX_INFLIGHT_NAR_BYTES, DEFAULT_MAX_SERVE_DURATION,
     DEFAULT_MAX_SERVE_NAR_BYTES, DIAL_TIMEOUT, FETCH_TIMEOUT, FileNarSupplier, IndexNarSupplier,
-    IrohError, IrohPeerAddr, IrohProvider, IrohTransport, NarSupplier, SafetyEnvelope, ServeBudget,
-    ServeCounters, ServeDecline, ServeWindow, StoreResidency, StoreRetention, SupplyError,
-    iroh_blobs_alpn,
+    IrohClientNode, IrohError, IrohNode, IrohNodeBuilder, IrohPeerAddr, IrohProvider,
+    IrohProviderConfig, IrohProviderNode, IrohTransport, MemoryNarSupplier, NarSupplier,
+    SafetyEnvelope, ServeBudget, ServeCounters, ServeDecline, ServeWindow, StoreResidency,
+    StoreRetention, SupplyError, copy_regular_raw_nar, iroh_blobs_alpn, raw_nar_helper_authorized,
 };
 pub use upstream::UpstreamHttp;

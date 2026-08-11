@@ -35,33 +35,34 @@
 //!
 //! ## Relay / discovery (honest scope)
 //!
-//! Both endpoints use the `Minimal` preset, disable n0 relay
-//! ([`iroh::endpoint::RelayMode::Disabled`]), and replace the default IPv4 bind
-//! with `127.0.0.1`. The cross-process test harness selects that concrete direct
-//! IPv4 address without an address-lookup service or relay. This is NOT an
-//! offline or loopback-only profile: pinned iroh retains its default IPv6
-//! wildcard transport plus port-mapper and net-report defaults. TASK-115 owns
-//! genuinely offline test isolation. In production a discovery layer (task-40)
-//! resolves a `NodeId` to an address; here [`IrohTransport::add_peer`] stands in
-//! for that resolution with an in-memory address book keyed by `NodeId`. n0 relay
-//! dependence for WAN
-//! holepunch is a known soft-centralization limit (PRD); solving it is out of
-//! scope. A coarse dial/fetch TIMEOUT ([`FETCH_TIMEOUT`]) guards against an
-//! unbounded hang; the full safety envelope (per-request abort, the signed NarSize
-//! streaming bound) is task-51 / task-25.
+//! [`IrohNodeBuilder`] owns the single endpoint/router lifecycle for provider and
+//! fetch capabilities. Tests use its closed `offline-test` scope: explicit IPv4
+//! and IPv6 loopback binds, no relay, no address lookup, no port mapper, and
+//! minimal network reporting. The daemon requires an explicit persistent identity
+//! directory and endpoint scope instead of inheriting preset defaults. A discovery
+//! layer resolves a `NodeId` to an address; until that layer is wired,
+//! [`IrohTransport::add_peer`] is the explicit in-memory address book used by the
+//! harness. Relay policy remains an injected capability, never an implicit n0
+//! service dependency. A coarse dial/fetch timeout ([`FETCH_TIMEOUT`]) guards
+//! against an unbounded hang; the signed NarSize streaming bound lives in the
+//! safety envelope.
 
 use std::collections::HashMap;
+use std::ffi::OsString;
 use std::fmt;
+use std::fs::File;
+use std::io::{Read, Write};
 use std::net::SocketAddr;
-use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use bao_tree::io::BaoContentItem;
-use iroh::protocol::Router;
-use iroh::{Endpoint, EndpointAddr, PublicKey};
+use iroh::endpoint::{Accepting, Connection};
+use iroh::protocol::{AcceptError, ProtocolHandler};
+use iroh::{EndpointAddr, PublicKey};
 use iroh_blobs::api::TempTag;
 use iroh_blobs::api::blobs::BlobStatus;
 use iroh_blobs::get::request::{GetBlobItem, get_blob};
@@ -74,9 +75,14 @@ use iroh_blobs::{BlobsProtocol, Hash};
 use n0_future::StreamExt;
 use tokio::sync::watch;
 
-use crate::availability::AvailabilityIndex;
 use crate::claim::KnownTransport;
 use crate::content_id::Blake3Digest;
+use crate::iroh_runtime::{
+    AddressLookupCapability, DAEMON_TEST_ENDPOINT_PROFILE, EndpointCapabilityState,
+    EndpointProfile, IdentitySource, IrohEndpointHandle, IrohNodeRuntime, IrohRuntimeBuilder,
+    IrohRuntimeError, RelayCapability, ShutdownOutcome, TaskSupervisorHandle,
+};
+use crate::supply_catalog::{NarProductionSource, SupplyCatalogHandle};
 use crate::transport::{IROH_BLOBS_ALPN, NodeId};
 use crate::transport_fetch::{Transport, TransportError, TransportTag, verify_blake3};
 
@@ -198,6 +204,9 @@ pub enum IrohError {
     /// reported as "holds nothing": a residency oracle that answers 0 when it
     /// could not look would pass every future eviction change (task-65).
     StoreQuery(String),
+    /// The shared node runtime rejected configuration, identity state, endpoint
+    /// access or shutdown.
+    Runtime(String),
 }
 
 impl fmt::Display for IrohError {
@@ -208,11 +217,18 @@ impl fmt::Display for IrohError {
             IrohError::InvalidNodeId(why) => write!(f, "invalid iroh node id: {why}"),
             IrohError::NoBoundAddress => f.write_str("iroh endpoint has no bound address yet"),
             IrohError::StoreQuery(why) => write!(f, "iroh-blobs store query failed: {why}"),
+            IrohError::Runtime(why) => write!(f, "Iroh node runtime failed: {why}"),
         }
     }
 }
 
 impl std::error::Error for IrohError {}
+
+impl From<IrohRuntimeError> for IrohError {
+    fn from(error: IrohRuntimeError) -> Self {
+        Self::Runtime(error.to_string())
+    }
+}
 
 // -------------------------------------------------------------------------
 // A peer's dialable address (opaque wrapper so callers/tests never touch iroh).
@@ -295,27 +311,132 @@ impl std::error::Error for SupplyError {}
 /// supply model). The implementation for a real node dumps the store path; the
 /// one here reads back the exact raw NAR file the node announced.
 ///
-/// The two methods are separate ON PURPOSE, and the split is the security
-/// property: [`Self::declared_size`] must answer the admission question -
-/// "how big is this, and do we even have it?" - **without producing a single
-/// byte**, so a request for a 3 GiB NAR is declined at zero allocation cost.
-/// [`Self::supply`] is called only after admission has already agreed to pay.
+/// The closed plan separates admission metadata from production. Planning must
+/// answer "how big is this, and do we even have it?" without producing bytes;
+/// its process or memory source is consumed only after admission agrees to pay.
 ///
 /// NO ENUMERATION (PRD privacy invariant, owner constraint from phase 1). Both
 /// methods are per-digest probes. There is deliberately no `list`, no `iter` and
 /// no `len`: a peer may learn yes/no about a digest it can already name, never
 /// what a node holds.
-pub trait NarSupplier: Send + Sync {
-    /// The uncompressed NAR size (NarSize units - never a compressed FileSize)
-    /// this digest would produce, answered WITHOUT producing the bytes. `None`
-    /// means this node cannot supply it at all.
-    fn declared_size(&self, content: &Blake3Digest) -> Option<u64>;
+mod nar_supplier_sealed {
+    use super::{Blake3Digest, SupplyError, SupplyPlan};
 
-    /// Produce the exact `RawNarV1` bytes for `content`. Called only after the
-    /// serve budget has admitted the request. Blocking: the caller runs it off
-    /// the async runtime.
-    fn supply(&self, content: &Blake3Digest) -> Result<Vec<u8>, SupplyError>;
+    pub trait Sealed {
+        fn plan(&self, content: &Blake3Digest) -> Result<Option<SupplyPlan>, SupplyError>;
+    }
 }
+
+/// Closed, cancellation-aware NAR supply boundary.
+///
+/// Downstream code can hold this trait but cannot implement it. That is a
+/// shutdown property, not API taste: accepting an arbitrary synchronous
+/// implementation would admit an unkillable `spawn_blocking` worker that an
+/// absolute async shutdown deadline cannot stop.
+pub trait NarSupplier: nar_supplier_sealed::Sealed + Send + Sync {}
+
+/// A closed, inert supply description. It is produced synchronously without IO
+/// and consumed only after the serve budget reserves `declared_size`.
+#[doc(hidden)]
+#[derive(Clone)]
+pub struct SupplyPlan {
+    declared_size: u64,
+    source: SupplySource,
+}
+
+#[derive(Clone)]
+enum SupplySource {
+    Process {
+        program: PathBuf,
+        args: Vec<OsString>,
+        environment: Vec<(OsString, OsString)>,
+    },
+    Memory {
+        bytes: Arc<Vec<u8>>,
+        released: Option<Arc<AtomicBool>>,
+        metrics: Arc<MemorySupplierMetrics>,
+    },
+}
+
+#[derive(Default)]
+struct MemorySupplierMetrics {
+    supplied: AtomicUsize,
+    active_operations: AtomicUsize,
+    activity_ticks: AtomicUsize,
+    cancelled_operations: AtomicUsize,
+}
+
+/// Closed in-memory supplier used by behavioral tests.
+///
+/// Its delay seam is cancellation-aware and its copy proceeds in chunks, so it
+/// can model a never-released materialisation without creating an arbitrary or
+/// detached worker implementation.
+pub struct MemoryNarSupplier {
+    nars: HashMap<Blake3Digest, Arc<Vec<u8>>>,
+    declared_size_overrides: HashMap<Blake3Digest, u64>,
+    blocked: HashMap<Blake3Digest, Arc<AtomicBool>>,
+    metrics: Arc<MemorySupplierMetrics>,
+}
+
+impl MemoryNarSupplier {
+    pub fn new(nars: impl IntoIterator<Item = Vec<u8>>) -> Self {
+        Self {
+            nars: nars
+                .into_iter()
+                .map(|nar| (Blake3Digest::from_raw_nar(&nar), Arc::new(nar)))
+                .collect(),
+            declared_size_overrides: HashMap::new(),
+            blocked: HashMap::new(),
+            metrics: Arc::new(MemorySupplierMetrics::default()),
+        }
+    }
+
+    pub fn set_declared_size(&mut self, content: Blake3Digest, bytes: u64) {
+        self.declared_size_overrides.insert(content, bytes);
+    }
+
+    pub fn block_until(&mut self, content: Blake3Digest, released: Arc<AtomicBool>) {
+        self.blocked.insert(content, released);
+    }
+
+    pub fn supplied(&self) -> usize {
+        self.metrics.supplied.load(Ordering::Acquire)
+    }
+
+    pub fn active_operations(&self) -> usize {
+        self.metrics.active_operations.load(Ordering::Acquire)
+    }
+
+    pub fn activity_ticks(&self) -> usize {
+        self.metrics.activity_ticks.load(Ordering::Acquire)
+    }
+
+    pub fn cancelled_operations(&self) -> usize {
+        self.metrics.cancelled_operations.load(Ordering::Acquire)
+    }
+}
+
+impl nar_supplier_sealed::Sealed for MemoryNarSupplier {
+    fn plan(&self, content: &Blake3Digest) -> Result<Option<SupplyPlan>, SupplyError> {
+        let Some(bytes) = self.nars.get(content) else {
+            return Ok(None);
+        };
+        Ok(Some(SupplyPlan {
+            declared_size: self
+                .declared_size_overrides
+                .get(content)
+                .copied()
+                .unwrap_or(bytes.len() as u64),
+            source: SupplySource::Memory {
+                bytes: Arc::clone(bytes),
+                released: self.blocked.get(content).cloned(),
+                metrics: Arc::clone(&self.metrics),
+            },
+        }))
+    }
+}
+
+impl NarSupplier for MemoryNarSupplier {}
 
 /// A [`NarSupplier`] backed by raw-NAR FILES on disk: the shape the wave-2a
 /// harness and the `--iroh-seed-nar` flag speak. A real node's supplier dumps
@@ -330,20 +451,48 @@ pub struct FileNarSupplier {
     /// `BLAKE3(RawNarV1) -> the file holding exactly those bytes`. Behind a
     /// `Mutex` because announcing happens on the startup path while serving reads
     /// it from the provider's tasks.
-    by_digest: Mutex<HashMap<Blake3Digest, PathBuf>>,
+    by_digest: Mutex<HashMap<Blake3Digest, FileNarRecord>>,
+    helper_program: PathBuf,
 }
 
-impl Default for FileNarSupplier {
-    fn default() -> Self {
-        Self::new()
+#[derive(Clone)]
+struct FileNarRecord {
+    path: PathBuf,
+    size: u64,
+}
+
+fn open_regular_raw_nar(path: &Path) -> Result<(File, u64), SupplyError> {
+    use rustix::fs::{FileType, Mode, OFlags};
+
+    let fd = rustix::fs::open(
+        path,
+        OFlags::RDONLY | OFlags::NONBLOCK | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        Mode::empty(),
+    )
+    .map_err(|error| SupplyError(format!("opening raw NAR {}: {error}", path.display())))?;
+    let stat = rustix::fs::fstat(&fd)
+        .map_err(|error| SupplyError(format!("inspecting raw NAR {}: {error}", path.display())))?;
+    if FileType::from_raw_mode(stat.st_mode) != FileType::RegularFile {
+        return Err(SupplyError(format!(
+            "raw NAR {} is not a regular file",
+            path.display()
+        )));
     }
+    let size = u64::try_from(stat.st_size).map_err(|_| {
+        SupplyError(format!(
+            "raw NAR {} reported a negative size",
+            path.display()
+        ))
+    })?;
+    Ok((File::from(fd), size))
 }
 
 impl FileNarSupplier {
     /// An empty supplier: it can supply nothing until something is announced.
-    pub fn new() -> Self {
+    pub fn new(helper_program: impl Into<PathBuf>) -> Self {
         FileNarSupplier {
             by_digest: Mutex::new(HashMap::new()),
+            helper_program: helper_program.into(),
         }
     }
 
@@ -355,47 +504,105 @@ impl FileNarSupplier {
     /// that must stop startup, not a node that silently announces nothing.
     pub fn announce(&self, path: impl Into<PathBuf>) -> Result<(Blake3Digest, u64), SupplyError> {
         let path = path.into();
-        let file = std::fs::File::open(&path)
-            .map_err(|e| SupplyError(format!("opening raw NAR {}: {e}", path.display())))?;
+        let (file, _) = open_regular_raw_nar(&path)?;
         let (digest, nar_size) = Blake3Digest::stream_raw_nar(std::io::BufReader::new(file))
             .map_err(|e| SupplyError(format!("hashing raw NAR {}: {e}", path.display())))?;
-        self.by_digest
-            .lock()
-            .expect("supplier mutex")
-            .insert(digest, path);
+        self.by_digest.lock().expect("supplier mutex").insert(
+            digest,
+            FileNarRecord {
+                path,
+                size: nar_size,
+            },
+        );
         Ok((digest, nar_size))
     }
 }
 
-impl NarSupplier for FileNarSupplier {
-    fn declared_size(&self, content: &Blake3Digest) -> Option<u64> {
-        let path = self
-            .by_digest
-            .lock()
-            .expect("supplier mutex")
-            .get(content)?
-            .clone();
-        // The file's LENGTH is the NarSize, because the announced file IS the raw
-        // NAR. Metadata only - no read, no allocation: this runs before the
-        // budget has agreed to anything.
-        std::fs::metadata(&path).ok().map(|meta| meta.len())
-    }
-
-    fn supply(&self, content: &Blake3Digest) -> Result<Vec<u8>, SupplyError> {
-        let path = self
+impl nar_supplier_sealed::Sealed for FileNarSupplier {
+    fn plan(&self, content: &Blake3Digest) -> Result<Option<SupplyPlan>, SupplyError> {
+        let Some(record) = self
             .by_digest
             .lock()
             .expect("supplier mutex")
             .get(content)
             .cloned()
-            .ok_or_else(|| SupplyError(format!("no announced source for {content}")))?;
-        std::fs::read(&path)
-            .map_err(|e| SupplyError(format!("reading raw NAR {}: {e}", path.display())))
+        else {
+            return Ok(None);
+        };
+        Ok(Some(SupplyPlan {
+            declared_size: record.size,
+            source: SupplySource::Process {
+                program: self.helper_program.clone(),
+                args: vec![
+                    OsString::from("__dump-raw-nar"),
+                    record.path.as_os_str().to_owned(),
+                ],
+                environment: raw_nar_helper_environment(),
+            },
+        }))
     }
 }
 
-/// The [`NarSupplier`] a REAL node uses: its own [`AvailabilityIndex`], which
-/// regenerates a raw NAR from `/nix/store` with `nix-store --dump`.
+impl NarSupplier for FileNarSupplier {}
+
+const RAW_NAR_HELPER_ENV: &str = "DAEMON_INTERNAL_RAW_NAR_HELPER";
+const RAW_NAR_HELPER_VALUE: &str = "v1";
+
+fn raw_nar_helper_environment() -> Vec<(OsString, OsString)> {
+    vec![(
+        OsString::from(RAW_NAR_HELPER_ENV),
+        OsString::from(RAW_NAR_HELPER_VALUE),
+    )]
+}
+
+#[doc(hidden)]
+pub fn raw_nar_helper_authorized() -> bool {
+    std::env::var_os(RAW_NAR_HELPER_ENV).as_deref()
+        == Some(std::ffi::OsStr::new(RAW_NAR_HELPER_VALUE))
+}
+
+/// Copy one raw-NAR regular file to a writer for the hidden helper process.
+///
+/// Linux can leave a task uninterruptible in kernel IO (D-state) on a broken
+/// FUSE/NFS mount; no userspace shutdown contract can defeat that. Running this
+/// operation in an owned process group still closes every ordinary userspace
+/// callback/thread escape: shutdown kills and reaps the helper and descendants.
+#[doc(hidden)]
+pub fn copy_regular_raw_nar(
+    path: impl AsRef<Path>,
+    mut output: impl Write,
+) -> Result<u64, SupplyError> {
+    let path = path.as_ref();
+    let (mut file, expected_size) = open_regular_raw_nar(path)?;
+    let mut copied = 0u64;
+    let mut chunk = [0u8; 64 * 1024];
+    loop {
+        let read = file
+            .read(&mut chunk)
+            .map_err(|error| SupplyError(format!("reading raw NAR {}: {error}", path.display())))?;
+        if read == 0 {
+            break;
+        }
+        output.write_all(&chunk[..read]).map_err(|error| {
+            SupplyError(format!(
+                "writing raw NAR {} to stdout: {error}",
+                path.display()
+            ))
+        })?;
+        copied = copied
+            .checked_add(read as u64)
+            .ok_or_else(|| SupplyError(format!("raw NAR {} exceeded u64 bytes", path.display())))?;
+    }
+    if copied != expected_size {
+        return Err(SupplyError(format!(
+            "raw NAR {} changed while reading: stat said {expected_size} B, read {copied} B",
+            path.display()
+        )));
+    }
+    Ok(copied)
+}
+
+/// The [`NarSupplier`] a real node uses: an inert read-only supply catalog.
 ///
 /// THIS IS THE FIX FOR TASK-72 GAP 2, and the direction of the dependency is the
 /// point. The transport consumes the index; the index knows nothing about
@@ -405,27 +612,51 @@ impl NarSupplier for FileNarSupplier {
 /// registrations it can also produce bytes for, and this adapter is how the
 /// provider reaches those bytes.
 pub struct IndexNarSupplier {
-    index: Arc<AvailabilityIndex>,
+    catalog: SupplyCatalogHandle,
+    helper_program: PathBuf,
 }
 
 impl IndexNarSupplier {
-    /// Serve from this node's availability index.
-    pub fn new(index: Arc<AvailabilityIndex>) -> Self {
-        IndexNarSupplier { index }
+    /// Serve only records already published by the availability writer. The
+    /// provider cannot derive, persist, announce, or lock the index itself.
+    pub fn new(catalog: SupplyCatalogHandle, helper_program: impl Into<PathBuf>) -> Self {
+        IndexNarSupplier {
+            catalog,
+            helper_program: helper_program.into(),
+        }
     }
 }
 
-impl NarSupplier for IndexNarSupplier {
-    fn declared_size(&self, content: &Blake3Digest) -> Option<u64> {
-        self.index.supply_size(content)
-    }
-
-    fn supply(&self, content: &Blake3Digest) -> Result<Vec<u8>, SupplyError> {
-        self.index
-            .supply_raw_nar(content)
-            .map_err(|e| SupplyError(e.to_string()))
+impl nar_supplier_sealed::Sealed for IndexNarSupplier {
+    fn plan(&self, content: &Blake3Digest) -> Result<Option<SupplyPlan>, SupplyError> {
+        let Some(record) = self.catalog.probe(content) else {
+            return Ok(None);
+        };
+        let source = match record.source {
+            NarProductionSource::Process { program, args } => SupplySource::Process {
+                program,
+                args,
+                environment: Vec::new(),
+            },
+            NarProductionSource::RegularFile(path) => SupplySource::Process {
+                program: self.helper_program.clone(),
+                args: vec![OsString::from("__dump-raw-nar"), path.into_os_string()],
+                environment: raw_nar_helper_environment(),
+            },
+            NarProductionSource::Memory(bytes) => SupplySource::Memory {
+                bytes,
+                released: None,
+                metrics: Arc::new(MemorySupplierMetrics::default()),
+            },
+        };
+        Ok(Some(SupplyPlan {
+            declared_size: record.declared_size,
+            source,
+        }))
     }
 }
+
+impl NarSupplier for IndexNarSupplier {}
 
 /// Largest single NAR the node agrees to serve, in NarSize bytes. PROVISIONAL,
 /// like the [`SafetyEnvelope`] time bounds, and chosen against the owner's
@@ -662,6 +893,7 @@ struct SweepPolicy {
 struct ServeGate {
     budget: ServeBudget,
     supplier: Option<Arc<dyn NarSupplier>>,
+    supervisor: TaskSupervisorHandle,
     /// The SINGLE SOURCE OF TRUTH for "what is this node currently on the hook
     /// for". In-flight BYTES are summed from it rather than tracked in a parallel
     /// counter: two representations of one fact is how they drift.
@@ -737,8 +969,8 @@ impl ServeGate {
     /// accounting, so a 3 GiB request is refused having allocated nothing.
     ///
     /// The insert also happens HERE, before any `add_bytes`, and THAT ordering is
-    /// load-bearing for the collector race - see the `ProtectCb` in
-    /// [`IrohProvider::spawn_with`].
+    /// load-bearing for the collector race - see the `ProtectCb` installed while
+    /// preparing [`IrohProviderConfig`].
     fn reserve(
         &self,
         hash: Hash,
@@ -866,14 +1098,19 @@ async fn admit(gate: &Arc<ServeGate>, store: &MemStore, hash: Hash) -> Result<Ad
         Ok(_) => (None, true),
         Err(_) => (None, false),
     };
+    // The supplier returns inert data only. This call performs no filesystem IO,
+    // process spawn, lazy digest derivation, or arbitrary callback dispatch.
+    let supplied_plan = gate
+        .supplier
+        .as_ref()
+        .map(|supplier| nar_supplier_sealed::Sealed::plan(supplier.as_ref(), &content))
+        .transpose()
+        .map_err(|error| Declined::new(ServeDecline::SupplyFailed, error.to_string()))?
+        .flatten();
     let (size, must_regenerate) = match resident {
         Some(size) => (size, false),
-        None => match gate
-            .supplier
-            .as_ref()
-            .and_then(|supplier| supplier.declared_size(&content))
-        {
-            Some(size) => (size, true),
+        None => match supplied_plan.as_ref() {
+            Some(plan) => (plan.declared_size, true),
             None if store_readable => {
                 return Err(Declined::new(
                     ServeDecline::Unknown,
@@ -939,7 +1176,9 @@ async fn admit(gate: &Arc<ServeGate>, store: &MemStore, hash: Hash) -> Result<Ad
                 // to do MORE work, never to tell a peer we hold nothing.
                 || store.blobs().has(hash).await.unwrap_or(false);
             if !present {
-                if let Err(declined) = materialise(gate, store, &content, hash, size).await {
+                if let Err(declined) =
+                    materialise(gate, store, &content, hash, size, supplied_plan.as_ref()).await
+                {
                     // Tell the followers BEFORE the guard drops the entry.
                     gate.publish(hash, None);
                     return Err(declined);
@@ -962,30 +1201,16 @@ async fn materialise(
     content: &Blake3Digest,
     hash: Hash,
     reserved: u64,
+    plan: Option<&SupplyPlan>,
 ) -> Result<(), Declined> {
-    let supplier = gate.supplier.clone().ok_or_else(|| {
+    let plan = plan.ok_or_else(|| {
         Declined::new(
             ServeDecline::Unknown,
-            format!("no supplier configured to regenerate {content}"),
+            format!("no closed supply plan can regenerate {content}"),
         )
     })?;
     for _attempt in 0..MATERIALISE_ATTEMPTS {
-        let supplier = supplier.clone();
-        let content_owned = *content;
-        // `spawn_blocking`: a supplier reads a file or shells out to
-        // `nix-store --dump`. Running that on a runtime worker would stall every
-        // other task on this thread for the length of a whole-NAR read.
-        let raw = tokio::task::spawn_blocking(move || supplier.supply(&content_owned))
-            .await
-            // A join error is a PANIC in our own supplier - a bug in this node, not
-            // a missing file - and must not be indistinguishable from one.
-            .map_err(|joined| {
-                Declined::new(
-                    ServeDecline::SupplyFailed,
-                    format!("the supplier task for {content} panicked: {joined}"),
-                )
-            })?
-            .map_err(|supply| Declined::new(ServeDecline::SupplyFailed, supply.to_string()))?;
+        let raw = execute_supply_plan(gate, plan, content, reserved).await?;
         // RECONCILE AGAINST WHAT WAS RESERVED, not merely against the per-NAR cap.
         // Comparing to the cap would let a source that declared 1 MiB and produced
         // 200 MiB through (200 < the 256 MiB default) while the in-flight ledger
@@ -1044,6 +1269,116 @@ async fn materialise(
     ))
 }
 
+struct ActiveMemoryOperation {
+    metrics: Arc<MemorySupplierMetrics>,
+    completed: bool,
+}
+
+impl Drop for ActiveMemoryOperation {
+    fn drop(&mut self) {
+        self.metrics
+            .active_operations
+            .fetch_sub(1, Ordering::AcqRel);
+        if !self.completed {
+            self.metrics
+                .cancelled_operations
+                .fetch_add(1, Ordering::AcqRel);
+        }
+    }
+}
+
+async fn execute_supply_plan(
+    gate: &Arc<ServeGate>,
+    plan: &SupplyPlan,
+    content: &Blake3Digest,
+    reserved: u64,
+) -> Result<Vec<u8>, Declined> {
+    let retained_limit = usize::try_from(reserved).map_err(|_| {
+        Declined::new(
+            ServeDecline::TooLarge,
+            format!(
+                "{content} reservation {reserved} B exceeds this process's addressable output cap"
+            ),
+        )
+    })?;
+
+    match &plan.source {
+        SupplySource::Process {
+            program,
+            args,
+            environment,
+        } => {
+            let output = gate
+                .supervisor
+                .execute_process(
+                    "iroh-supplier-process",
+                    program.clone(),
+                    args.clone(),
+                    environment.clone(),
+                    retained_limit,
+                )
+                .await
+                .map_err(|error| {
+                    Declined::new(
+                        ServeDecline::SupplyFailed,
+                        format!("supervising source process for {content}: {error}"),
+                    )
+                })?;
+            if output.stdout_exceeded_limit {
+                return Err(Declined::new(
+                    ServeDecline::TooLarge,
+                    format!("{content} source exceeded its reserved output cap of {reserved} B"),
+                ));
+            }
+            if !output.status.success() {
+                return Err(Declined::new(
+                    ServeDecline::SupplyFailed,
+                    format!(
+                        "source process for {content} exited {}: {}",
+                        output.status,
+                        String::from_utf8_lossy(&output.stderr).trim()
+                    ),
+                ));
+            }
+            Ok(output.stdout)
+        }
+        SupplySource::Memory {
+            bytes,
+            released,
+            metrics,
+        } => {
+            metrics.supplied.fetch_add(1, Ordering::AcqRel);
+            metrics.active_operations.fetch_add(1, Ordering::AcqRel);
+            let mut active = ActiveMemoryOperation {
+                metrics: Arc::clone(metrics),
+                completed: false,
+            };
+            if let Some(released) = released {
+                while !released.load(Ordering::Acquire) {
+                    metrics.activity_ticks.fetch_add(1, Ordering::AcqRel);
+                    tokio::time::sleep(Duration::from_millis(2)).await;
+                }
+            }
+            if bytes.len() > retained_limit {
+                return Err(Declined::new(
+                    ServeDecline::TooLarge,
+                    format!(
+                        "{content} memory source exceeded its reserved output cap of {reserved} B"
+                    ),
+                ));
+            }
+            let retained = bytes.len().min(retained_limit);
+            let mut raw = Vec::with_capacity(retained);
+            for chunk in bytes[..retained].chunks(64 * 1024) {
+                raw.extend_from_slice(chunk);
+                tokio::task::yield_now().await;
+            }
+            active.completed = true;
+            Ok(raw)
+        }
+    }
+}
+
 // -------------------------------------------------------------------------
 // Provider (node B): serve this node's NARs by BLAKE3 over iroh-blobs.
 // -------------------------------------------------------------------------
@@ -1055,8 +1390,8 @@ async fn materialise(
 /// regenerate on demand, hold only the in-flight serve. That decision is expressed
 /// by [`StoreRetention::ReleaseAfterServe`], which the daemon uses whenever a
 /// [`NarSupplier`] is configured. [`StoreRetention::RetainAll`] remains the default
-/// of the bare [`IrohProvider::spawn`] constructor, because the in-process tests
-/// that seed a blob and fetch it are not modelling a node's supply policy.
+/// of the bare [`IrohProviderNode::spawn`] constructor, because the in-process
+/// tests that seed a blob and fetch it are not modelling a node's supply policy.
 #[derive(Debug, Clone)]
 pub enum StoreRetention {
     /// Hold every seeded blob for the life of the process. No collector runs at
@@ -1144,13 +1479,15 @@ pub struct ServeWindow {
     pub bytes_uncompressed_nar: u64,
 }
 
-/// An iroh-blobs PROVIDER: an endpoint + an in-memory blob store served under the
-/// iroh-blobs ALPN. It answers a client's get-request for a blob addressed by
-/// `BLAKE3(RawNarV1)`.
+/// An iroh-blobs provider handle attached to a shared [`IrohNodeRuntime`].
+///
+/// This handle does not own a router or a strong endpoint reference. It can
+/// seed/query the store and inspect the live runtime endpoint, but it cannot
+/// bind or close network resources independently.
 pub struct IrohProvider {
-    endpoint: Endpoint,
+    endpoint: IrohEndpointHandle,
+    lifecycle: Arc<AtomicU8>,
     store: MemStore,
-    router: Router,
     /// Per-transfer serve windows on this provider's own clock (see [`ServeWindow`]).
     serve_windows: Arc<Mutex<Vec<ServeWindow>>>,
     /// The task-72 admission gate: the serve budget, the on-demand supplier, and
@@ -1173,59 +1510,77 @@ pub struct IrohProvider {
     transfers_completed: Arc<AtomicU64>,
 }
 
-impl IrohProvider {
-    /// Bind a provider with the `Minimal` preset, relay disabled, and the default
-    /// IPv4 bind replaced by `127.0.0.1`, then start serving its initially empty
-    /// blob store under the iroh-blobs ALPN. Seed blobs with [`Self::seed`].
-    /// Pinned iroh still retains its IPv6 wildcard transport, port mapper and
-    /// net-report defaults, so this constructor is not offline or loopback-only;
-    /// TASK-115 owns genuine offline isolation.
-    ///
-    /// Retention is [`StoreRetention::RetainAll`] and there is NO on-demand
-    /// supplier: this is the "a test seeds a blob and fetches it" constructor, not
-    /// a node's supply policy. The serve budget is nevertheless the DEFAULT one and
-    /// not [`ServeBudget::unbounded`] - a provider that will serve anything at any
-    /// size has to be asked for explicitly (see [`Self::spawn_with`]).
-    pub async fn spawn() -> Result<Self, IrohError> {
-        Self::spawn_with_retention(StoreRetention::RetainAll).await
+/// Provider-side store, admission and retention inputs. Endpoint identity and
+/// network scope belong to the node runtime, not to this configuration.
+pub struct IrohProviderConfig {
+    retention: StoreRetention,
+    budget: ServeBudget,
+    supplier: Option<Arc<dyn NarSupplier>>,
+}
+
+impl fmt::Debug for IrohProviderConfig {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("IrohProviderConfig")
+            .field("retention", &self.retention)
+            .field("budget", &self.budget)
+            .field("has_supplier", &self.supplier.is_some())
+            .finish()
+    }
+}
+
+impl IrohProviderConfig {
+    pub fn retaining(retention: StoreRetention) -> Self {
+        Self {
+            retention,
+            budget: ServeBudget::default(),
+            supplier: None,
+        }
     }
 
-    /// [`Self::spawn`] with an explicit store [`StoreRetention`], no supplier.
-    pub async fn spawn_with_retention(retention: StoreRetention) -> Result<Self, IrohError> {
-        Self::spawn_with(retention, ServeBudget::default(), None).await
-    }
-
-    /// THE TASK-61 SUPPLY-MODEL CONSTRUCTOR: a provider that holds nothing at rest
-    /// and REGENERATES what a peer asks for, inside `budget`.
-    ///
-    /// This is what the daemon uses. `supplier` answers "can I produce this digest,
-    /// and how big is it" without producing anything, so the budget can refuse
-    /// before a byte is allocated.
-    pub async fn spawn_supplying(
+    pub fn supplying(
         supplier: Arc<dyn NarSupplier>,
         budget: ServeBudget,
         sweep_interval: Duration,
-    ) -> Result<Self, IrohError> {
-        Self::spawn_with(
-            StoreRetention::ReleaseAfterServe { sweep_interval },
+    ) -> Self {
+        Self {
+            retention: StoreRetention::ReleaseAfterServe { sweep_interval },
             budget,
-            Some(supplier),
-        )
-        .await
+            supplier: Some(supplier),
+        }
     }
 
-    /// The one real constructor. Everything else is a named shorthand for a
-    /// (retention, budget, supplier) triple.
-    pub async fn spawn_with(
+    pub fn new(
         retention: StoreRetention,
         budget: ServeBudget,
         supplier: Option<Arc<dyn NarSupplier>>,
-    ) -> Result<Self, IrohError> {
-        let endpoint =
-            endpoint_support::bind_endpoint(endpoint_support::DAEMON_ENDPOINT_PROFILE).await?;
-        let gate = Arc::new(ServeGate {
+    ) -> Self {
+        Self {
+            retention,
             budget,
             supplier,
+        }
+    }
+}
+
+struct PreparedProvider {
+    store: MemStore,
+    serve_windows: Arc<Mutex<Vec<ServeWindow>>>,
+    gate: Arc<ServeGate>,
+    bytes_served: Arc<AtomicU64>,
+    transfers_completed: Arc<AtomicU64>,
+    protocol: ManagedBlobsProtocol,
+}
+
+impl PreparedProvider {
+    fn prepare(
+        config: IrohProviderConfig,
+        supervisor: TaskSupervisorHandle,
+    ) -> Result<Self, IrohError> {
+        let retention = config.retention;
+        let gate = Arc::new(ServeGate {
+            budget: config.budget,
+            supplier: config.supplier,
+            supervisor: supervisor.clone(),
             inflight: Mutex::new(HashMap::new()),
             sweep: match retention {
                 StoreRetention::RetainAll => None,
@@ -1234,8 +1589,6 @@ impl IrohProvider {
                     free_running: false,
                 }),
                 StoreRetention::ReleaseAfterServe { .. } => Some(SweepPolicy {
-                    // Free-running, so `armed` is never read; kept so the two
-                    // policies are ONE type rather than two shapes.
                     armed: AtomicBool::new(true),
                     free_running: true,
                 }),
@@ -1255,39 +1608,12 @@ impl IrohProvider {
             StoreRetention::ReleaseOnRequest { sweep_interval }
             | StoreRetention::ReleaseAfterServe { sweep_interval } => {
                 let gate_for_cb = gate.clone();
-                // THE COLLECTOR'S PRE-MARK HOOK - and it PROTECTS rather than
-                // refuses, which is the whole difference between a node that
-                // reclaims under load and one that only reclaims when idle.
-                //
-                // The first cut aborted the whole sweep whenever anything was in
-                // flight. That is safe but STARVING: under sustained traffic the
-                // in-flight table is never empty at a tick, so nothing is ever
-                // collected, every distinct NAR served accumulates in a `MemStore`
-                // that has no capacity bound of its own, and a single slow reader
-                // is enough to hold the door open. The serve budget would then
-                // bound concurrently-ADMITTED bytes while RESIDENT bytes grew to
-                // the whole announced corpus - the same remote-triggerable OOM
-                // task-72 exists to close, one step removed.
-                //
-                // Protecting instead is both safer and stronger: an admission puts
-                // its hash in the table BEFORE it adds, so every callback that runs
-                // after that insert marks it live and no sweep can take it. The one
-                // remaining window - a sweep already past its callback when the
-                // insert lands - is what `MATERIALISE_ATTEMPTS` retries against,
-                // and `run_gc` is a single sequential loop so at most one sweep can
-                // be in it.
-                //
-                // `free_running` distinguishes the two retentions.
-                // `ReleaseOnRequest` promises "hold everything until `release_all`",
-                // so there the arming flag still gates every run.
                 let add_protected: ProtectCb = Arc::new(move |live| {
                     let gate = gate_for_cb.clone();
                     Box::pin(async move {
                         let Some(sweep) = &gate.sweep else {
                             return ProtectOutcome::Abort;
                         };
-                        // `swap(false)` on the request-driven store makes each
-                        // arming release exactly ONE sweep.
                         if !sweep.free_running && !sweep.armed.swap(false, Ordering::SeqCst) {
                             return ProtectOutcome::Abort;
                         }
@@ -1306,182 +1632,295 @@ impl IrohProvider {
             }
         };
 
-        // `InterceptLog`, not `NotifyLog`: the provider now ANSWERS each
-        // get-request before it is served. That answer is the whole of task-72
-        // AC#1 - iroh-blobs blocks on our verdict (`rx.await??` in
-        // `provider::events::EventSender::request`) and only then reads the store
-        // (`handle_get` calls `get_request` before `handle_get_impl`), so both the
-        // size bound and the on-demand materialisation happen BEFORE any bytes
-        // exist. `Log` keeps the per-transfer updates the S6 byte oracle and the
-        // task-65 serve windows are built from.
         let mask = EventMask {
             get: RequestMode::InterceptLog,
             ..EventMask::DEFAULT
         };
-        let (events, mut rx) = EventSender::channel(64, mask);
+        let (events, rx) = EventSender::channel(64, mask);
         let bytes_served = Arc::new(AtomicU64::new(0));
         let transfers_completed = Arc::new(AtomicU64::new(0));
-        // The zero of this provider's serve-window clock. Windows are reported
-        // RELATIVE to it because the only question asked of them - did k serves
-        // overlap, and for how long was this provider actually serving - is answered
-        // entirely within one provider. An absolute wall clock would invite a
-        // cross-host comparison the measurement does not support.
         let serve_origin = Instant::now();
         let serve_windows = Arc::new(Mutex::new(Vec::<ServeWindow>::new()));
-        {
-            let bytes_served = bytes_served.clone();
-            let transfers_completed = transfers_completed.clone();
-            let serve_windows = serve_windows.clone();
-            let gate = gate.clone();
-            let store = store.clone();
-            tokio::spawn(async move {
-                // One outer message per get-request; each carries an update
-                // sub-stream (Started -> [Progress] -> Completed/Aborted).
-                while let Some(msg) = rx.recv().await {
-                    if let ProviderMessage::GetRequestReceived(msg) = msg {
-                        let bytes_served = bytes_served.clone();
-                        let transfers_completed = transfers_completed.clone();
-                        let serve_windows = serve_windows.clone();
-                        let gate = gate.clone();
-                        let store = store.clone();
-                        // One task PER REQUEST. Admission can block for as long as a
-                        // `nix-store --dump` takes, and doing that on the receive
-                        // loop would make one large regeneration stall every other
-                        // peer's admission.
-                        tokio::spawn(async move {
-                            let hash = msg.request.hash;
-                            let mut updates = msg.rx;
-                            let verdict = admit(&gate, &store, hash).await;
-                            // FAIL VERBOSELY. A category alone ("declined 12") is
-                            // not actionable; the cause is the sentence an operator
-                            // needs, and `SupplyError` went to the trouble of
-                            // building it. One line per decline, never per serve.
-                            let (admission, answer) = match verdict {
-                                Ok(admission) => (Some(admission), Ok(())),
-                                Err(declined) => {
-                                    gate.count_decline(declined.reason);
-                                    eprintln!(
-                                        "IROH-SERVE-DECLINED reason={} hash={hash} why={}",
-                                        declined.reason.reason(),
-                                        declined.why
-                                    );
-                                    (None, Err(declined.reason.abort_reason()))
-                                }
-                            };
-                            // ANSWER FIRST: iroh-blobs is blocked on this oneshot
-                            // and no update can arrive until it is sent.
-                            //
-                            // A SEND THAT FAILS MEANS THE PEER IS ALREADY GONE, and
-                            // that is the case worth naming: the verdict can take as
-                            // long as a whole `nix-store --dump`, so this is a wide
-                            // window and a peer can enter it deliberately. Returning
-                            // here drops `_admission` immediately; without it the
-                            // reservation would sit in the drain below until
-                            // `max_serve_duration` - not leaked forever, but five
-                            // minutes of a budget nobody is using is still a peer
-                            // choosing how much of this node's capacity to remove.
-                            // MEASURED: without this return, an honest peer arriving
-                            // ~300 ms later is refused `busy`.
-                            let answered = msg.tx.send(answer).await;
-                            // The reservation now lives and dies with `_admission`.
-                            // Nothing below needs to remember to give it back -
-                            // which is the point, because the peer can disappear at
-                            // any line and an early return that forgot would leak
-                            // the budget for the life of the process.
-                            let Some(_admission) = admission else {
-                                return;
-                            };
-                            if answered.is_err() {
-                                return;
-                            }
-
-                            // THE SERVE DEADLINE. Without it a peer that opens a
-                            // get-request and then reads nothing holds its slice of
-                            // the in-flight budget forever - the client-side
-                            // envelope at `SafetyEnvelope` bounds a stalled HOLDER,
-                            // not a stalled READER, so nothing on this side was
-                            // watching. Four such peers exhaust the default budget
-                            // and every honest peer is told `busy` from then on.
-                            //
-                            // When it fires the reservation is dropped, so the blob
-                            // becomes collectible and the hog's transfer fails. That
-                            // is the intended degradation: a peer that will not read
-                            // loses its serve, not the node.
-                            let drained =
-                                tokio::time::timeout(gate.budget.max_serve_duration, async {
-                                    let mut blob_size: u64 = 0;
-                                    let mut started_ms: Option<f64> = None;
-                                    while let Ok(Some(update)) = updates.recv().await {
-                                        match update {
-                                            RequestUpdate::Started(started) => {
-                                                blob_size = started.size;
-                                                started_ms = Some(
-                                                    serve_origin.elapsed().as_secs_f64() * 1000.0,
-                                                );
-                                            }
-                                            RequestUpdate::Completed(_) => {
-                                                bytes_served
-                                                    .fetch_add(blob_size, Ordering::Relaxed);
-                                                transfers_completed.fetch_add(1, Ordering::Relaxed);
-                                                // A Completed with no Started would
-                                                // be a window with no beginning;
-                                                // dropped rather than back-dated to
-                                                // zero, which would make every
-                                                // transfer look maximally
-                                                // overlapping.
-                                                if let Some(start_ms) = started_ms.take() {
-                                                    let end_ms =
-                                                        serve_origin.elapsed().as_secs_f64()
-                                                            * 1000.0;
-                                                    serve_windows
-                                                        .lock()
-                                                        .expect("serve windows mutex")
-                                                        .push(ServeWindow {
-                                                            start_ms,
-                                                            end_ms,
-                                                            bytes_uncompressed_nar: blob_size,
-                                                        });
-                                                }
-                                            }
-                                            // Progress is redundant with
-                                            // Started.size for a whole-blob serve;
-                                            // an Aborted transfer is NOT counted (no
-                                            // bytes credited to a failed serve, and
-                                            // no window recorded for one).
-                                            _ => {}
-                                        }
-                                    }
-                                })
-                                .await;
-                            if drained.is_err() {
-                                gate.timed_out.fetch_add(1, Ordering::Relaxed);
-                                eprintln!(
-                                    "IROH-SERVE-TIMEOUT hash={hash} after={:?} - the \
-                                     reservation is reclaimed and the transfer will fail",
-                                    gate.budget.max_serve_duration
-                                );
-                            }
-                        });
-                    }
-                }
-            });
-        }
-
-        // BlobsProtocol serves get-requests from `store`; MemStore is a cheap
-        // shared handle, so blobs seeded AFTER spawn are served by the same store.
+        let tasks = ProviderEventTasks::new(
+            rx,
+            bytes_served.clone(),
+            transfers_completed.clone(),
+            serve_windows.clone(),
+            gate.clone(),
+            store.clone(),
+            serve_origin,
+        );
         let blobs = BlobsProtocol::new(&store, Some(events));
-        let router = Router::builder(endpoint.clone())
-            .accept(iroh_blobs::ALPN, blobs)
-            .spawn();
         Ok(Self {
-            endpoint,
             store,
-            router,
             serve_windows,
             gate,
             bytes_served,
             transfers_completed,
+            protocol: ManagedBlobsProtocol { blobs, tasks },
         })
+    }
+
+    fn attach(self, endpoint: IrohEndpointHandle) -> IrohProvider {
+        IrohProvider {
+            endpoint,
+            lifecycle: Arc::clone(&self.protocol.tasks.lifecycle),
+            store: self.store,
+            serve_windows: self.serve_windows,
+            gate: self.gate,
+            bytes_served: self.bytes_served,
+            transfers_completed: self.transfers_completed,
+        }
+    }
+}
+
+struct ProviderEventTasks {
+    driver: Mutex<Option<ProviderEventDriver>>,
+    lifecycle: Arc<AtomicU8>,
+}
+
+const PROVIDER_CREATED: u8 = 0;
+const PROVIDER_READY: u8 = 1;
+const PROVIDER_STOPPED: u8 = 2;
+
+struct ProviderEventDriver {
+    rx: tokio::sync::mpsc::Receiver<ProviderMessage>,
+    bytes_served: Arc<AtomicU64>,
+    transfers_completed: Arc<AtomicU64>,
+    serve_windows: Arc<Mutex<Vec<ServeWindow>>>,
+    gate: Arc<ServeGate>,
+    store: MemStore,
+    serve_origin: Instant,
+}
+
+impl fmt::Debug for ProviderEventTasks {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ProviderEventTasks").finish_non_exhaustive()
+    }
+}
+
+impl ProviderEventTasks {
+    fn new(
+        rx: tokio::sync::mpsc::Receiver<ProviderMessage>,
+        bytes_served: Arc<AtomicU64>,
+        transfers_completed: Arc<AtomicU64>,
+        serve_windows: Arc<Mutex<Vec<ServeWindow>>>,
+        gate: Arc<ServeGate>,
+        store: MemStore,
+        serve_origin: Instant,
+    ) -> Arc<Self> {
+        Arc::new(Self {
+            driver: Mutex::new(Some(ProviderEventDriver {
+                rx,
+                bytes_served,
+                transfers_completed,
+                serve_windows,
+                gate,
+                store,
+                serve_origin,
+            })),
+            lifecycle: Arc::new(AtomicU8::new(PROVIDER_CREATED)),
+        })
+    }
+
+    fn is_ready(&self) -> bool {
+        self.lifecycle.load(Ordering::Acquire) == PROVIDER_READY
+    }
+
+    fn require_ready(&self) -> Result<(), AcceptError> {
+        if self.is_ready() {
+            Ok(())
+        } else {
+            Err(AcceptError::from(std::io::Error::other(
+                "Iroh blobs provider event driver is not ready",
+            )))
+        }
+    }
+
+    async fn start(&self, supervisor: TaskSupervisorHandle) -> Result<(), IrohError> {
+        let Some(mut driver) = self
+            .driver
+            .lock()
+            .map_err(|_| IrohError::Runtime("provider event-driver mutex poisoned".into()))?
+            .take()
+        else {
+            return Err(IrohError::Runtime(
+                "provider event driver was already started".into(),
+            ));
+        };
+        let request_supervisor = supervisor.clone();
+        let lifecycle = Arc::clone(&self.lifecycle);
+        let lifecycle_for_task = Arc::clone(&lifecycle);
+        let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+        if let Err(error) = supervisor.spawn("iroh-provider-events", async move {
+            struct MarkStopped(Arc<AtomicU8>);
+            impl Drop for MarkStopped {
+                fn drop(&mut self) {
+                    self.0.store(PROVIDER_STOPPED, Ordering::Release);
+                }
+            }
+            let _stopped = MarkStopped(Arc::clone(&lifecycle_for_task));
+            // This statement runs on the driver's first poll. The builder awaits
+            // its acknowledgement before returning a usable node.
+            lifecycle_for_task.store(PROVIDER_READY, Ordering::Release);
+            let _ = ready_tx.send(());
+            while let Some(message) = driver.rx.recv().await {
+                let ProviderMessage::GetRequestReceived(message) = message else {
+                    continue;
+                };
+                let request_hash = message.request.hash;
+                let bytes_served = driver.bytes_served.clone();
+                let transfers_completed = driver.transfers_completed.clone();
+                let serve_windows = driver.serve_windows.clone();
+                let gate = driver.gate.clone();
+                let gate_for_registration = driver.gate.clone();
+                let store = driver.store.clone();
+                let serve_origin = driver.serve_origin;
+                if let Err(error) = request_supervisor.spawn("iroh-provider-request", async move {
+                    let hash = request_hash;
+                    let serve_deadline = gate.budget.max_serve_duration;
+                    let request = async {
+                        let mut updates = message.rx;
+                        let verdict = admit(&gate, &store, hash).await;
+                        let (admission, answer) = match verdict {
+                            Ok(admission) => (Some(admission), Ok(())),
+                            Err(declined) => {
+                                gate.count_decline(declined.reason);
+                                eprintln!(
+                                    "IROH-SERVE-DECLINED reason={} hash={hash} why={}",
+                                    declined.reason.reason(),
+                                    declined.why
+                                );
+                                (None, Err(declined.reason.abort_reason()))
+                            }
+                        };
+                        let answered = message.tx.send(answer).await;
+                        let Some(_admission) = admission else {
+                            return;
+                        };
+                        if answered.is_err() {
+                            return;
+                        }
+
+                        let mut blob_size: u64 = 0;
+                        let mut started_ms: Option<f64> = None;
+                        while let Ok(Some(update)) = updates.recv().await {
+                            match update {
+                                RequestUpdate::Started(started) => {
+                                    blob_size = started.size;
+                                    started_ms =
+                                        Some(serve_origin.elapsed().as_secs_f64() * 1000.0);
+                                }
+                                RequestUpdate::Completed(_) => {
+                                    bytes_served.fetch_add(blob_size, Ordering::Relaxed);
+                                    transfers_completed.fetch_add(1, Ordering::Relaxed);
+                                    if let Some(start_ms) = started_ms.take() {
+                                        serve_windows
+                                            .lock()
+                                            .expect("serve windows mutex")
+                                            .push(ServeWindow {
+                                                start_ms,
+                                                end_ms: serve_origin.elapsed().as_secs_f64()
+                                                    * 1000.0,
+                                                bytes_uncompressed_nar: blob_size,
+                                            });
+                                    }
+                                }
+                                _ => {}
+                            }
+                        }
+                    };
+                    if tokio::time::timeout(serve_deadline, request).await.is_err() {
+                        gate.timed_out.fetch_add(1, Ordering::Relaxed);
+                        eprintln!(
+                            "IROH-SERVE-TIMEOUT hash={hash} after={serve_deadline:?} - the reservation is reclaimed and the transfer will fail"
+                        );
+                    }
+                }) {
+                    if error.is_capacity_exhausted() {
+                        // `spawn` owns and drops the rejected future, including
+                        // the response channel in `message`. The requesting
+                        // peer therefore observes an immediate failed request
+                        // rather than waiting for a provider reply that can no
+                        // longer be supervised. Capacity is transient: keep
+                        // the event driver alive so later requests can recover.
+                        gate_for_registration
+                            .declined_busy
+                            .fetch_add(1, Ordering::Relaxed);
+                        eprintln!(
+                            "IROH-SERVE-DECLINED reason=busy hash={request_hash} why={error}"
+                        );
+                        continue;
+                    }
+                    eprintln!("IROH-SERVE-TASK-REGISTRATION-FAILED error={error}");
+                    break;
+                }
+            }
+        }) {
+            lifecycle.store(PROVIDER_STOPPED, Ordering::Release);
+            return Err(error.into());
+        }
+        ready_rx.await.map_err(|_| {
+            lifecycle.store(PROVIDER_STOPPED, Ordering::Release);
+            IrohError::Runtime(
+                "provider event driver stopped before acknowledging its first poll".into(),
+            )
+        })?;
+        if !self.is_ready() {
+            return Err(IrohError::Runtime(
+                "provider event driver acknowledged startup without entering ready state".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    fn stop(&self) {
+        self.lifecycle.store(PROVIDER_STOPPED, Ordering::Release);
+    }
+}
+
+#[derive(Clone)]
+struct ManagedBlobsProtocol {
+    blobs: BlobsProtocol,
+    tasks: Arc<ProviderEventTasks>,
+}
+
+impl fmt::Debug for ManagedBlobsProtocol {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ManagedBlobsProtocol")
+            .finish_non_exhaustive()
+    }
+}
+
+impl ManagedBlobsProtocol {
+    async fn start(&self, supervisor: TaskSupervisorHandle) -> Result<(), IrohError> {
+        self.tasks.start(supervisor).await
+    }
+}
+
+impl ProtocolHandler for ManagedBlobsProtocol {
+    async fn on_accepting(&self, accepting: Accepting) -> Result<Connection, AcceptError> {
+        self.tasks.require_ready()?;
+        let connection = accepting.await?;
+        self.tasks.require_ready()?;
+        Ok(connection)
+    }
+
+    async fn accept(&self, connection: Connection) -> Result<(), AcceptError> {
+        self.tasks.require_ready()?;
+        ProtocolHandler::accept(&self.blobs, connection).await
+    }
+
+    async fn shutdown(&self) {
+        self.tasks.stop();
+        ProtocolHandler::shutdown(&self.blobs).await;
+    }
+}
+
+impl IrohProvider {
+    #[doc(hidden)]
+    pub fn event_driver_ready(&self) -> bool {
+        self.lifecycle.load(Ordering::Acquire) == PROVIDER_READY
     }
 
     /// What the admission gate has admitted, regenerated and declined so far.
@@ -1578,7 +2017,8 @@ impl IrohProvider {
     /// frozen addressed unit).
     ///
     /// THIS IS NOT THE SUPPLY MODEL. Task-61 decided a node regenerates on demand
-    /// and holds nothing at rest ([`Self::spawn_supplying`] + [`NarSupplier`]);
+    /// and holds nothing at rest ([`IrohProviderNode::spawn_supplying`] +
+    /// [`NarSupplier`]);
     /// `seed` is the eager PUT that in-process tests use to put a known blob in
     /// front of a fetch. Under [`StoreRetention::ReleaseAfterServe`] a blob seeded
     /// this way is collectible once anything has been served, because it holds no
@@ -1606,37 +2046,287 @@ impl IrohProvider {
     }
 
     /// This provider's node identity (the locator a claim's `Iroh` offer carries).
-    pub fn node_id(&self) -> NodeId {
-        NodeId::from_bytes(*self.endpoint.id().as_bytes())
+    pub fn node_id(&self) -> Result<NodeId, IrohError> {
+        self.endpoint.node_id().map_err(Into::into)
     }
 
-    /// Every concrete socket reported by iroh for this provider. The current
-    /// profile overrides the IPv4 bind to `127.0.0.1:PORT`, but pinned iroh also
-    /// retains its default IPv6 wildcard socket. Callers must therefore not assume
-    /// every returned address is loopback or externally dialable. In the wave-2a
-    /// shared pod, the harness selects the concrete IPv4 loopback address from
-    /// this list so node A can dial it without relay/address lookup; a real
-    /// discovery/DHT (task-47) resolves deployment addresses.
-    pub fn socket_addrs(&self) -> Vec<SocketAddr> {
-        self.endpoint.bound_sockets()
+    /// Every concrete socket reported by iroh for this provider. The addresses
+    /// are exactly those selected by the node's explicit [`EndpointProfile`]. The
+    /// harness selects IPv4 loopback from the closed offline-test profile; a real
+    /// discovery mechanism must publish only addresses reachable in its network
+    /// scope.
+    pub fn bound_socket_addrs(&self) -> Result<Vec<SocketAddr>, IrohError> {
+        self.endpoint.bound_socket_addrs().map_err(Into::into)
+    }
+
+    /// Concrete non-wildcard sockets suitable for direct discovery records.
+    pub fn reachable_socket_addrs(&self) -> Result<Vec<SocketAddr>, IrohError> {
+        self.endpoint.reachable_socket_addrs().map_err(Into::into)
     }
 
     /// This provider's endpoint address, assembled from its node id and every
-    /// socket iroh reports as bound. Under the current profile that includes the
-    /// requested IPv4 loopback socket and may include iroh's inherited IPv6
-    /// wildcard socket; it is not proof of offline or loopback-only binding. This
-    /// in-process stand-in carries the complete endpoint address. A publisher
-    /// crossing a process/network boundary must discard unspecified sockets and
+    /// socket iroh reports as bound. This in-process stand-in carries the complete
+    /// endpoint address selected by the explicit profile. A publisher crossing a
+    /// process/network boundary must discard unspecified sockets and
     /// publish only reachable addresses, as the e2e harness does; task-40 owns the
     /// discovery result for a real `NodeId`.
     pub async fn addr(&self) -> Result<IrohPeerAddr, IrohError> {
-        endpoint_support::endpoint_addr(&self.endpoint).map(IrohPeerAddr)
+        self.endpoint
+            .endpoint_addr()
+            .map(IrohPeerAddr)
+            .map_err(Into::into)
+    }
+}
+
+// -------------------------------------------------------------------------
+// One node: shared runtime + optional provider + fetch handle.
+// -------------------------------------------------------------------------
+
+/// Composes provider/fetch/application protocols onto one runtime endpoint.
+pub struct IrohNodeBuilder {
+    runtime: IrohRuntimeBuilder,
+    provider: Option<IrohProviderConfig>,
+    envelope: SafetyEnvelope,
+}
+
+impl IrohNodeBuilder {
+    pub fn new(
+        profile: EndpointProfile,
+        identity: IdentitySource,
+        relay: RelayCapability,
+        address_lookup: AddressLookupCapability,
+    ) -> Result<Self, IrohError> {
+        Ok(Self {
+            runtime: IrohRuntimeBuilder::new(profile, identity, relay, address_lookup)?,
+            provider: None,
+            envelope: SafetyEnvelope::default(),
+        })
     }
 
-    /// Stop serving and close the endpoint (best-effort).
-    pub async fn shutdown(self) {
-        let _ = self.router.shutdown().await;
-        self.endpoint.close().await;
+    /// The hermetic default for unit/integration tests and the benchmark.
+    pub fn offline_ephemeral() -> Result<Self, IrohError> {
+        Self::new(
+            DAEMON_TEST_ENDPOINT_PROFILE,
+            IdentitySource::Ephemeral,
+            RelayCapability::Disabled,
+            AddressLookupCapability::Disabled,
+        )
+    }
+
+    pub fn provider(mut self, provider: IrohProviderConfig) -> Self {
+        self.provider = Some(provider);
+        self
+    }
+
+    pub fn safety_envelope(mut self, envelope: SafetyEnvelope) -> Self {
+        self.envelope = envelope;
+        self
+    }
+
+    /// Add an application handler to the same duplicate-checked router as
+    /// iroh-blobs.
+    pub fn accept(
+        mut self,
+        alpn: impl AsRef<[u8]>,
+        handler: impl ProtocolHandler,
+    ) -> Result<Self, IrohError> {
+        self.runtime = self.runtime.accept(alpn, handler)?;
+        Ok(self)
+    }
+
+    #[doc(hidden)]
+    pub fn shutdown_deadline(mut self, deadline: Duration) -> Result<Self, IrohError> {
+        self.runtime = self.runtime.shutdown_deadline(deadline)?;
+        Ok(self)
+    }
+
+    pub async fn spawn(mut self) -> Result<IrohNode, IrohError> {
+        let supervisor = self.runtime.task_supervisor_handle();
+        let prepared = self
+            .provider
+            .take()
+            .map(|provider| PreparedProvider::prepare(provider, supervisor))
+            .transpose()?;
+        if let Some(provider) = &prepared {
+            self.runtime = self
+                .runtime
+                .accept(iroh_blobs::ALPN, provider.protocol.clone())?;
+        }
+        let runtime = self.runtime.spawn().await?;
+        if let Some(provider) = &prepared
+            && let Err(error) = provider
+                .protocol
+                .start(runtime.task_supervisor_handle())
+                .await
+        {
+            let shutdown = runtime.shutdown().await;
+            return Err(IrohError::Runtime(format!(
+                "starting provider event driver after successful bind: {error}; cleanup={shutdown:?}"
+            )));
+        }
+        let endpoint = runtime.endpoint_handle();
+        let provider = prepared.map(|provider| Arc::new(provider.attach(endpoint.clone())));
+        let transport = IrohTransport::attached(endpoint, self.envelope);
+        Ok(IrohNode {
+            provider,
+            transport,
+            runtime,
+        })
+    }
+}
+
+/// One long-lived Iroh node. All protocol handles share its identity and socket
+/// set; only this owner can shut the runtime down.
+pub struct IrohNode {
+    provider: Option<Arc<IrohProvider>>,
+    transport: IrohTransport,
+    runtime: IrohNodeRuntime,
+}
+
+impl IrohNode {
+    pub fn provider(&self) -> Option<&IrohProvider> {
+        self.provider.as_deref()
+    }
+
+    pub fn provider_handle(&self) -> Option<Arc<IrohProvider>> {
+        self.provider.clone()
+    }
+
+    pub fn transport(&self) -> &IrohTransport {
+        &self.transport
+    }
+
+    pub fn transport_handle(&self) -> IrohTransport {
+        self.transport.clone()
+    }
+
+    pub fn node_id(&self) -> Result<NodeId, IrohError> {
+        self.runtime.node_id().map_err(Into::into)
+    }
+
+    pub fn bound_socket_addrs(&self) -> Result<Vec<SocketAddr>, IrohError> {
+        self.runtime.bound_socket_addrs().map_err(Into::into)
+    }
+
+    pub fn task_supervisor_handle(&self) -> TaskSupervisorHandle {
+        self.runtime.task_supervisor_handle()
+    }
+
+    /// Attach daemon-side work whose lifetime must not exceed the node.
+    pub fn spawn_task(
+        &self,
+        name: impl Into<String>,
+        future: impl std::future::Future<Output = ()> + Send + 'static,
+    ) -> Result<(), IrohError> {
+        self.task_supervisor_handle()
+            .spawn(name, future)
+            .map_err(Into::into)
+    }
+
+    pub async fn shutdown(self) -> Result<ShutdownOutcome, IrohError> {
+        let Self {
+            provider,
+            transport,
+            runtime,
+        } = self;
+        drop(provider);
+        drop(transport);
+        runtime.shutdown().await.map_err(Into::into)
+    }
+}
+
+/// Explicit test/benchmark owner for a node with the blobs provider installed.
+/// Deref preserves the provider-focused test API while endpoint ownership stays
+/// visibly on this node wrapper, never on [`IrohProvider`].
+pub struct IrohProviderNode(IrohNode);
+
+impl IrohProviderNode {
+    pub async fn spawn() -> Result<Self, IrohError> {
+        Self::spawn_with_retention(StoreRetention::RetainAll).await
+    }
+
+    pub async fn spawn_with_retention(retention: StoreRetention) -> Result<Self, IrohError> {
+        let node = IrohNodeBuilder::offline_ephemeral()?
+            .provider(IrohProviderConfig::retaining(retention))
+            .spawn()
+            .await?;
+        Ok(Self(node))
+    }
+
+    pub async fn spawn_supplying(
+        supplier: Arc<dyn NarSupplier>,
+        budget: ServeBudget,
+        sweep_interval: Duration,
+    ) -> Result<Self, IrohError> {
+        let node = IrohNodeBuilder::offline_ephemeral()?
+            .provider(IrohProviderConfig::supplying(
+                supplier,
+                budget,
+                sweep_interval,
+            ))
+            .spawn()
+            .await?;
+        Ok(Self(node))
+    }
+
+    pub async fn spawn_with(
+        retention: StoreRetention,
+        budget: ServeBudget,
+        supplier: Option<Arc<dyn NarSupplier>>,
+    ) -> Result<Self, IrohError> {
+        let node = IrohNodeBuilder::offline_ephemeral()?
+            .provider(IrohProviderConfig::new(retention, budget, supplier))
+            .spawn()
+            .await?;
+        Ok(Self(node))
+    }
+
+    pub fn transport(&self) -> &IrohTransport {
+        self.0.transport()
+    }
+
+    pub async fn shutdown(self) -> Result<ShutdownOutcome, IrohError> {
+        self.0.shutdown().await
+    }
+}
+
+impl std::ops::Deref for IrohProviderNode {
+    type Target = IrohProvider;
+
+    fn deref(&self) -> &Self::Target {
+        self.0
+            .provider()
+            .expect("provider-node construction always installs a provider")
+    }
+}
+
+/// Explicit test owner for a fetch-only node.
+pub struct IrohClientNode(IrohNode);
+
+impl IrohClientNode {
+    pub async fn spawn() -> Result<Self, IrohError> {
+        Ok(Self(IrohNodeBuilder::offline_ephemeral()?.spawn().await?))
+    }
+
+    pub fn with_envelope(mut self, envelope: SafetyEnvelope) -> Self {
+        self.0.transport.envelope = envelope;
+        self
+    }
+
+    pub fn transport_handle(&self) -> IrohTransport {
+        self.0.transport_handle()
+    }
+
+    pub async fn shutdown(self) -> Result<ShutdownOutcome, IrohError> {
+        self.0.shutdown().await
+    }
+}
+
+impl std::ops::Deref for IrohClientNode {
+    type Target = IrohTransport;
+
+    fn deref(&self) -> &Self::Target {
+        self.0.transport()
     }
 }
 
@@ -1644,15 +2334,16 @@ impl IrohProvider {
 // Client (node A): the Transport impl that fetches by BLAKE3 from a peer.
 // -------------------------------------------------------------------------
 
-/// The real iroh [`Transport`]: fetches a NAR by [`Blake3Digest`] from a peer
-/// [`NodeId`] over iroh-blobs. Holds a client endpoint and an address book keyed
-/// by `NodeId` (the discovery stand-in - task-40 supplies these resolutions).
+/// The real iroh [`Transport`]: fetches through a shared node runtime endpoint.
+/// It holds only a weak endpoint capability and cannot bind, retain or close the
+/// node's socket independently.
+#[derive(Clone)]
 pub struct IrohTransport {
-    endpoint: Endpoint,
+    endpoint: IrohEndpointHandle,
     /// `NodeId` -> dialable address. In production a discovery lookup fills this;
     /// here a test wires it via [`Self::add_peer`]. Behind a `Mutex` because
     /// [`Transport::fetch`] takes `&self`.
-    peers: Mutex<HashMap<NodeId, EndpointAddr>>,
+    peers: Arc<Mutex<HashMap<NodeId, EndpointAddr>>>,
     /// The task-51 safety envelope (dial / body-idle / total bounds). Default is
     /// the PROVISIONAL production envelope; a test pins short bounds via
     /// [`Self::with_envelope`].
@@ -1660,20 +2351,12 @@ pub struct IrohTransport {
 }
 
 impl IrohTransport {
-    /// Bind a client with the `Minimal` preset, relay disabled, and the default
-    /// IPv4 bind replaced by `127.0.0.1`. Pinned iroh retains its IPv6 wildcard
-    /// transport, port mapper and net-report defaults, so this is not an offline
-    /// or loopback-only bind; TASK-115 owns genuine offline isolation. Register
-    /// peers with [`Self::add_peer`]. Uses the default (PROVISIONAL)
-    /// [`SafetyEnvelope`]; override with [`Self::with_envelope`].
-    pub async fn spawn() -> Result<Self, IrohError> {
-        let endpoint =
-            endpoint_support::bind_endpoint(endpoint_support::DAEMON_ENDPOINT_PROFILE).await?;
-        Ok(Self {
+    fn attached(endpoint: IrohEndpointHandle, envelope: SafetyEnvelope) -> Self {
+        Self {
             endpoint,
-            peers: Mutex::new(HashMap::new()),
-            envelope: SafetyEnvelope::default(),
-        })
+            peers: Arc::new(Mutex::new(HashMap::new())),
+            envelope,
+        }
     }
 
     /// Replace the safety envelope (dial / body-idle / total time bounds). A test
@@ -1682,6 +2365,30 @@ impl IrohTransport {
     pub fn with_envelope(mut self, envelope: SafetyEnvelope) -> Self {
         self.envelope = envelope;
         self
+    }
+
+    /// Observability only: the identity is owned by the runtime and disappears
+    /// when that runtime shuts down.
+    pub fn node_id(&self) -> Result<NodeId, IrohError> {
+        self.endpoint.node_id().map_err(Into::into)
+    }
+
+    pub fn bound_socket_addrs(&self) -> Result<Vec<SocketAddr>, IrohError> {
+        self.endpoint.bound_socket_addrs().map_err(Into::into)
+    }
+
+    pub fn reachable_socket_addrs(&self) -> Result<Vec<SocketAddr>, IrohError> {
+        self.endpoint.reachable_socket_addrs().map_err(Into::into)
+    }
+
+    #[doc(hidden)]
+    pub fn address_lookup_count(&self) -> Result<usize, IrohError> {
+        self.endpoint.address_lookup_count().map_err(Into::into)
+    }
+
+    #[doc(hidden)]
+    pub fn endpoint_capabilities(&self) -> Result<EndpointCapabilityState, IrohError> {
+        self.endpoint.capability_state().map_err(Into::into)
     }
 
     /// Register a peer's dialable address (the discovery stand-in): a subsequent
@@ -1704,11 +2411,6 @@ impl IrohTransport {
             .map_err(|e| IrohError::InvalidNodeId(e.to_string()))
     }
 
-    /// Close the client endpoint (best-effort).
-    pub async fn shutdown(self) {
-        self.endpoint.close().await;
-    }
-
     /// The dial+stream, with the full task-51 envelope:
     ///   1. DIAL bounded by `envelope.dial_timeout` (dead-holder guard).
     ///   2. The body is STREAMED leaf-by-leaf (never buffered whole first), with:
@@ -1723,35 +2425,15 @@ impl IrohTransport {
     /// The whole thing is additionally wrapped in `envelope.total_timeout` by the
     /// caller as a coarse backstop.
     async fn dial_and_stream(
-        &self,
-        content: &Blake3Digest,
-        addr: EndpointAddr,
-        node: &NodeId,
+        envelope: SafetyEnvelope,
+        content: Blake3Digest,
+        connection: Connection,
+        node: NodeId,
         expected_size: Option<u64>,
     ) -> Result<Vec<u8>, TransportError> {
-        // 1. DIAL, bounded: a NodeId that never answers the QUIC handshake is cut
-        //    off here rather than hanging the resolution.
-        let connection = match tokio::time::timeout(
-            self.envelope.dial_timeout,
-            self.endpoint.connect(addr, iroh_blobs::ALPN),
-        )
-        .await
-        {
-            Ok(Ok(conn)) => conn,
-            Ok(Err(e)) => {
-                return Err(TransportError::Unavailable(format!(
-                    "iroh dial to {node} failed: {e}"
-                )));
-            }
-            Err(_elapsed) => {
-                return Err(TransportError::Unavailable(format!(
-                    "iroh dial to {node} exceeded {:?} (dead holder)",
-                    self.envelope.dial_timeout
-                )));
-            }
-        };
-
-        // 2. STREAM by the exact BLAKE3 addressed unit. iroh-blobs' bao decode
+        // STREAM by the exact BLAKE3 addressed unit. The runtime has already
+        // bounded the dial and dropped its endpoint clone; this continuation can
+        // own only the connection.
         //    verifies each leaf against `hash` as it arrives (gate 1, incremental).
         //    We drive it as a STREAM (not `.bytes()`, which buffers everything) so
         //    the NarSize cap can abort mid-transfer.
@@ -1760,22 +2442,21 @@ impl IrohTransport {
         let mut raw: Vec<u8> = Vec::new();
         loop {
             // Body-idle guard: no forward progress within the bound => stalled peer.
-            let item =
-                match tokio::time::timeout(self.envelope.body_idle_timeout, stream.next()).await {
-                    Ok(Some(item)) => item,
-                    Ok(None) => {
-                        return Err(TransportError::Unavailable(format!(
-                            "iroh stream from {node} ended before the blob completed"
-                        )));
-                    }
-                    Err(_elapsed) => {
-                        // Dropping `stream` (and its connection) here aborts the transfer.
-                        return Err(TransportError::Unavailable(format!(
-                            "iroh transfer from {node} stalled: no bytes for {:?}",
-                            self.envelope.body_idle_timeout
-                        )));
-                    }
-                };
+            let item = match tokio::time::timeout(envelope.body_idle_timeout, stream.next()).await {
+                Ok(Some(item)) => item,
+                Ok(None) => {
+                    return Err(TransportError::Unavailable(format!(
+                        "iroh stream from {node} ended before the blob completed"
+                    )));
+                }
+                Err(_elapsed) => {
+                    // Dropping `stream` (and its connection) here aborts the transfer.
+                    return Err(TransportError::Unavailable(format!(
+                        "iroh transfer from {node} stalled: no bytes for {:?}",
+                        envelope.body_idle_timeout
+                    )));
+                }
+            };
 
             match item {
                 GetBlobItem::Item(BaoContentItem::Leaf(leaf)) => {
@@ -1807,7 +2488,7 @@ impl IrohTransport {
         // Re-assert gate 1 with the daemon's single-source-of-truth recipe. bao
         // already enforced it on the wire; this makes the trait contract explicit
         // and non-vacuous (never return unverified bytes).
-        verify_blake3(content, &raw)?;
+        verify_blake3(&content, &raw)?;
         Ok(raw)
     }
 }
@@ -1858,16 +2539,26 @@ impl Transport for IrohTransport {
         // dial and body-idle bounds inside `dial_and_stream`. A TooLarge abort from
         // the streaming cap propagates through unchanged (it is a deliberate abort,
         // not a hang the backstop should mask).
-        match tokio::time::timeout(
-            self.envelope.total_timeout,
-            self.dial_and_stream(content, addr, node, expected_size),
-        )
-        .await
-        {
-            Ok(result) => result,
+        let node = *node;
+        let content = *content;
+        let envelope = self.envelope;
+        let operation = self.endpoint.run_connected(
+            "iroh-outbound-fetch",
+            addr,
+            iroh_blobs::ALPN.to_vec(),
+            envelope.dial_timeout,
+            move |connection| async move {
+                Self::dial_and_stream(envelope, content, connection, node, expected_size).await
+            },
+        );
+        match tokio::time::timeout(envelope.total_timeout, operation).await {
+            Ok(Ok(result)) => result,
+            Ok(Err(error)) => Err(TransportError::Unavailable(format!(
+                "shared Iroh runtime is unavailable: {error}"
+            ))),
             Err(_elapsed) => Err(TransportError::Unavailable(format!(
                 "iroh fetch from {node} exceeded total bound {:?}",
-                self.envelope.total_timeout
+                envelope.total_timeout
             ))),
         }
     }
@@ -1891,97 +2582,64 @@ impl Transport for IrohTransport {
 /// general transport API.
 #[doc(hidden)]
 pub mod endpoint_support {
-    use std::net::{Ipv4Addr, SocketAddrV4};
-
-    use iroh::endpoint::{RelayMode, presets};
     use iroh::{Endpoint, EndpointAddr};
 
     use super::{IrohError, IrohProvider};
+    use crate::iroh_runtime::{self, AddressLookupCapability, IdentitySource, RelayCapability};
 
-    /// A typed selection of the daemon-owned endpoint builder overrides.
-    ///
-    /// Adding a future deployment profile extends this enum and the one
-    /// [`bind_endpoint`] match instead of creating another builder chain. Iroh
-    /// defaults not named by a variant remain in effect. Port zero requests an
-    /// OS-assigned ephemeral port.
-    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-    pub enum EndpointProfile {
-        /// Minimal preset, relay disabled, and the default IPv4 bind replaced by
-        /// `127.0.0.1`. This deliberately preserves the TASK-69 behavior: iroh's
-        /// other defaults, including its IPv6 transport, port mapper and net-report
-        /// configuration, remain in effect. TASK-115 owns a genuinely offline
-        /// test profile.
-        MinimalIpv4LoopbackNoRelay { port: u16 },
-    }
+    pub use crate::iroh_runtime::{
+        DAEMON_TEST_ENDPOINT_PROFILE as DAEMON_ENDPOINT_PROFILE, EndpointProfile, EndpointScope,
+    };
 
-    impl EndpointProfile {
-        /// Const equality for the benchmark's compile-time parity guard.
-        ///
-        /// This is deliberately exhaustive: adding a profile variant cannot
-        /// leave the guard with an implicit or wildcard notion of equivalence.
-        pub const fn same_configuration(self, other: Self) -> bool {
-            match (self, other) {
-                (
-                    Self::MinimalIpv4LoopbackNoRelay { port: left },
-                    Self::MinimalIpv4LoopbackNoRelay { port: right },
-                ) => left == right,
-            }
-        }
-    }
-
-    /// The endpoint profile selected by daemon providers and fetchers.
-    ///
-    /// The benchmark has its own explicit selector and a compile-time assertion
-    /// that it equals this value. That assertion makes a one-sided selection
-    /// change fail rather than silently contaminating a subtraction-ladder arm.
-    pub const DAEMON_ENDPOINT_PROFILE: EndpointProfile =
-        EndpointProfile::MinimalIpv4LoopbackNoRelay { port: 0 };
-
-    /// Bind one endpoint through the daemon-owned construction path.
-    ///
-    /// This is public only through the hidden measurement seam documented on
-    /// this module. Returning [`Endpoint`] is the deliberate Iroh-boundary breach
-    /// required for the raw-QUIC benchmark to register its private ALPN.
+    /// Bind through the same fully-explicit constructor as the node runtime,
+    /// using an explicit ephemeral identity for the measurement process.
     pub async fn bind_endpoint(profile: EndpointProfile) -> Result<Endpoint, IrohError> {
-        match profile {
-            EndpointProfile::MinimalIpv4LoopbackNoRelay { port } => {
-                let loopback = SocketAddrV4::new(Ipv4Addr::LOCALHOST, port);
-                Endpoint::builder(presets::Minimal)
-                    .relay_mode(RelayMode::Disabled)
-                    .bind_addr(loopback)
-                    .map_err(|error| {
-                        IrohError::Bind(format!("accepting endpoint profile {profile:?}: {error}"))
-                    })?
-                    .bind()
-                    .await
-                    .map_err(|error| {
-                        IrohError::Bind(format!("binding endpoint profile {profile:?}: {error}"))
-                    })
-            }
-        }
+        iroh_runtime::bind_endpoint(
+            profile,
+            IdentitySource::Ephemeral,
+            RelayCapability::Disabled,
+            AddressLookupCapability::Disabled,
+        )
+        .await
+        .map_err(Into::into)
     }
 
-    /// Build the canonical directly dialable address for a bound endpoint.
-    ///
-    /// This is public only through the hidden measurement seam documented on
-    /// this module. Its [`Endpoint`] and [`EndpointAddr`] types are the deliberate
-    /// Iroh-boundary breach required by the raw benchmark arms.
     pub fn endpoint_addr(endpoint: &Endpoint) -> Result<EndpointAddr, IrohError> {
-        let sockets = endpoint.bound_sockets();
-        if sockets.is_empty() {
-            return Err(IrohError::NoBoundAddress);
-        }
-        let mut addr = EndpointAddr::new(endpoint.id());
-        for socket in sockets {
-            addr = addr.with_ip_addr(socket);
-        }
-        Ok(addr)
+        iroh_runtime::endpoint_addr(endpoint).map_err(Into::into)
     }
 
-    /// Return a provider's canonical address in the raw Iroh type the benchmark
-    /// needs. Product callers use [`IrohProvider::addr`] and its opaque
-    /// [`super::IrohPeerAddr`] instead.
     pub fn provider_addr(provider: &IrohProvider) -> Result<EndpointAddr, IrohError> {
-        endpoint_addr(&provider.endpoint)
+        provider.endpoint.endpoint_addr().map_err(Into::into)
+    }
+}
+
+#[cfg(test)]
+mod lifecycle_tests {
+    use super::*;
+    use crate::iroh_runtime::TaskSupervisor;
+
+    #[tokio::test]
+    async fn provider_is_fail_closed_until_driver_first_poll_acknowledges_ready() {
+        let supervisor = TaskSupervisor::new();
+        let prepared = PreparedProvider::prepare(
+            IrohProviderConfig::retaining(StoreRetention::RetainAll),
+            supervisor.handle(),
+        )
+        .expect("prepare provider");
+        assert!(!prepared.protocol.tasks.is_ready());
+        assert!(prepared.protocol.tasks.require_ready().is_err());
+        assert_eq!(prepared.gate.counters().admitted, 0);
+        assert_eq!(prepared.gate.counters().declined(), 0);
+
+        prepared
+            .protocol
+            .start(supervisor.handle())
+            .await
+            .expect("first poll acknowledged");
+        assert!(prepared.protocol.tasks.require_ready().is_ok());
+
+        supervisor.cancel_now();
+        tokio::task::yield_now().await;
+        assert!(!prepared.protocol.tasks.is_ready());
     }
 }

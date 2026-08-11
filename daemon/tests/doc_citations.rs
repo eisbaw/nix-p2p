@@ -43,6 +43,10 @@ const SOURCES: &[(&str, &str)] = &[
     ("rewrite.rs", include_str!("../src/rewrite.rs")),
     ("server.rs", include_str!("../src/server.rs")),
     ("source.rs", include_str!("../src/source.rs")),
+    (
+        "supply_catalog.rs",
+        include_str!("../src/supply_catalog.rs"),
+    ),
     ("transport.rs", include_str!("../src/transport.rs")),
     (
         "transport_fetch.rs",

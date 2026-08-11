@@ -59,9 +59,9 @@ use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use daemon::{
-    AvailabilityIndex, BatchHoldQuery, BatchHoldResponse, DirectDiscovery, Discovery, DumpError,
-    HoldQuery, HoldResponse, InProcessPeerQuery, NarDumper, NarHashKey, NodeId, NullAnnounce,
-    NullStore, PeerQuery, PeerQueryError, StorePath,
+    AvailabilityIndex, BatchHoldQuery, BatchHoldResponse, DirectDiscovery, Discovery, HoldQuery,
+    HoldResponse, InProcessPeerQuery, NarHashKey, NodeId, NullAnnounce, NullStore, PeerQuery,
+    PeerQueryError, RegularFileNarDumper, StorePath,
 };
 
 /// Defaults chosen from the measured store census (orchestrator, 2026-08-10) and
@@ -96,16 +96,6 @@ impl Default for Config {
             nar_bytes_uncompressed_nar: 100 * 1024,
             json: false,
         }
-    }
-}
-
-/// A dumper that returns each store path's own bytes, so every key derives a
-/// DISTINCT digest (a shared digest would make a mis-mapped answer invisible).
-struct FileDumper;
-
-impl NarDumper for FileDumper {
-    fn dump(&self, path: &StorePath) -> Result<Vec<u8>, DumpError> {
-        std::fs::read(path.as_path()).map_err(|e| DumpError(e.to_string()))
     }
 }
 
@@ -215,7 +205,7 @@ fn build_world(
     for (p, node) in nodes.iter().enumerate() {
         let index = AvailabilityIndex::open(
             *node,
-            Arc::new(FileDumper),
+            Arc::new(RegularFileNarDumper),
             Arc::new(NullStore),
             Arc::new(NullAnnounce),
         )

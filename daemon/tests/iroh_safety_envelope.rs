@@ -16,9 +16,8 @@
 //! we only assert the FLOOR (never unbounded-hang, never OOM, never wrong bytes).
 //!
 //! Bounds 1 and 3 drive the daemon's PUBLIC API (IrohProvider / IrohTransport). The
-//! body-idle bite needs a hostile provider that establishes the connection then
-//! stalls - which the friendly public API deliberately cannot express - so ONLY
-//! that test reaches for `iroh` directly to build a custom stalling ProtocolHandler.
+//! body-idle bite needs a hostile protocol handler, but it still installs that
+//! handler through the daemon-owned offline runtime constructor.
 //!
 //! Nothing here names the generated fixture tree (the source guard forbids it): the
 //! NARs are synthesised in memory.
@@ -30,9 +29,9 @@ use std::time::{Duration, Instant};
 use async_trait::async_trait;
 use bytes::Bytes;
 use daemon::{
-    Blake3Digest, FallbackNarSource, IROH_BLOBS_ALPN, IrohPeerAddr, IrohProvider, IrohTransport,
-    KnownTransport, NarKey, NarPathToken, NarSource, NodeId, SafetyEnvelope, SourceError,
-    Transport, TransportError, UpstreamResponse,
+    Blake3Digest, FallbackNarSource, IROH_BLOBS_ALPN, IrohClientNode, IrohNode, IrohNodeBuilder,
+    IrohPeerAddr, IrohProviderNode, KnownTransport, NarKey, NarPathToken, NarSource, NodeId,
+    SafetyEnvelope, SourceError, Transport, TransportError, UpstreamResponse,
 };
 use http::HeaderMap;
 use http_body_util::{BodyExt, Full};
@@ -89,10 +88,10 @@ async fn a_blob_larger_than_the_signed_nar_size_is_aborted_early_during_streamin
     let big_nar = synth_raw_nar(&vec![0xABu8; 4 * 1024 * 1024]);
     let big_len = big_nar.len() as u64;
 
-    let provider = IrohProvider::spawn().await.expect("provider binds");
+    let provider = IrohProviderNode::spawn().await.expect("provider binds");
     let content = provider.seed(&big_nar).await.expect("seed the big blob");
 
-    let client = IrohTransport::spawn().await.expect("client binds");
+    let client = IrohClientNode::spawn().await.expect("client binds");
     client.add_peer(&provider.addr().await.expect("provider addr"));
 
     // The SIGNED NarSize the (honest) narinfo would carry for the small real NAR.
@@ -105,7 +104,7 @@ async fn a_blob_larger_than_the_signed_nar_size_is_aborted_early_during_streamin
     match client
         .fetch(
             &content,
-            &iroh_offer(provider.node_id()),
+            &iroh_offer(provider.node_id().unwrap()),
             Some(SIGNED_NAR_SIZE),
         )
         .await
@@ -136,8 +135,8 @@ async fn a_blob_larger_than_the_signed_nar_size_is_aborted_early_during_streamin
         Err(other) => panic!("expected a TooLarge size abort, got {other:?}"),
     }
 
-    provider.shutdown().await;
-    client.shutdown().await;
+    provider.shutdown().await.unwrap();
+    client.shutdown().await.unwrap();
 }
 
 #[tokio::test]
@@ -146,24 +145,24 @@ async fn a_blob_within_the_signed_nar_size_streams_to_completion() {
     // the exact signed NarSize; an honest blob is exactly that size, so cumulative
     // bytes never EXCEED it and the transfer completes byte-identical.
     let nar = synth_raw_nar(b"a normal, honest NAR well within its signed size");
-    let provider = IrohProvider::spawn().await.expect("provider binds");
+    let provider = IrohProviderNode::spawn().await.expect("provider binds");
     let content = provider.seed(&nar).await.expect("seed");
 
-    let client = IrohTransport::spawn().await.expect("client binds");
+    let client = IrohClientNode::spawn().await.expect("client binds");
     client.add_peer(&provider.addr().await.expect("provider addr"));
 
     let got = client
         .fetch(
             &content,
-            &iroh_offer(provider.node_id()),
+            &iroh_offer(provider.node_id().unwrap()),
             Some(nar.len() as u64),
         )
         .await
         .expect("an honest transfer within the signed NarSize must complete");
     assert_eq!(got, nar, "byte-identical, the cap never tripped");
 
-    provider.shutdown().await;
-    client.shutdown().await;
+    provider.shutdown().await.unwrap();
+    client.shutdown().await.unwrap();
 }
 
 // =====================================================================
@@ -176,8 +175,8 @@ async fn a_dead_holder_is_bounded_by_the_dial_timeout_not_a_hang() {
     // curve-point check) pointed at a BLACK HOLE: a UDP port we bind and hold but
     // never answer, so the QUIC handshake gets no reply and would retransmit for
     // many seconds. The dial timeout must cut it off fast.
-    let borrowed = IrohProvider::spawn().await.expect("provider binds");
-    let valid_node = borrowed.node_id();
+    let borrowed = IrohProviderNode::spawn().await.expect("provider binds");
+    let valid_node = borrowed.node_id().unwrap();
 
     // Hold the socket for the whole test so the port stays "open" (no ICMP
     // port-unreachable that would let the dial fail fast for the wrong reason) -
@@ -185,7 +184,7 @@ async fn a_dead_holder_is_bounded_by_the_dial_timeout_not_a_hang() {
     let black_hole: UdpSocket = UdpSocket::bind("127.0.0.1:0").expect("bind black hole");
     let dead_addr: SocketAddr = black_hole.local_addr().expect("black hole addr");
 
-    let client = IrohTransport::spawn()
+    let client = IrohClientNode::spawn()
         .await
         .expect("client binds")
         .with_envelope(short_envelope());
@@ -213,8 +212,8 @@ async fn a_dead_holder_is_bounded_by_the_dial_timeout_not_a_hang() {
     );
 
     drop(black_hole);
-    borrowed.shutdown().await;
-    client.shutdown().await;
+    borrowed.shutdown().await.unwrap();
+    client.shutdown().await.unwrap();
 }
 
 // =====================================================================
@@ -240,31 +239,25 @@ impl iroh::protocol::ProtocolHandler for StallingHandler {
     }
 }
 
-/// Bind a loopback iroh endpoint (relay disabled, no discovery) whose only protocol
-/// under the iroh-blobs ALPN is the stalling handler. Returns (router, node id,
-/// bound sockets). The router owns the endpoint and keeps it serving.
-async fn spawn_stalling_provider() -> (iroh::protocol::Router, NodeId, Vec<SocketAddr>) {
-    let loopback: SocketAddr = "127.0.0.1:0".parse().expect("loopback literal");
-    let endpoint = iroh::Endpoint::builder(iroh::endpoint::presets::Minimal)
-        .relay_mode(iroh::endpoint::RelayMode::Disabled)
-        .bind_addr(loopback)
-        .expect("bind_addr")
-        .bind()
-        .await
-        .expect("stalling endpoint binds");
-    let node = NodeId::from_bytes(*endpoint.id().as_bytes());
-    let sockets = endpoint.bound_sockets();
-    let router = iroh::protocol::Router::builder(endpoint)
+/// Install a hostile blobs handler on the shared hermetic constructor.
+async fn spawn_stalling_provider() -> (IrohNode, NodeId, Vec<SocketAddr>) {
+    let node = IrohNodeBuilder::offline_ephemeral()
+        .expect("offline constructor")
         .accept(IROH_BLOBS_ALPN, StallingHandler)
-        .spawn();
-    (router, node, sockets)
+        .expect("unique hostile ALPN")
+        .spawn()
+        .await
+        .expect("stalling endpoint binds through shared runtime");
+    let node_id = node.node_id().unwrap();
+    let sockets = node.bound_socket_addrs().unwrap();
+    (node, node_id, sockets)
 }
 
 #[tokio::test]
 async fn a_peer_that_connects_then_stalls_is_aborted_by_the_body_idle_bound() {
-    let (router, node, sockets) = spawn_stalling_provider().await;
+    let (provider, node, sockets) = spawn_stalling_provider().await;
 
-    let client = IrohTransport::spawn()
+    let client = IrohClientNode::spawn()
         .await
         .expect("client binds")
         .with_envelope(short_envelope());
@@ -291,8 +284,8 @@ async fn a_peer_that_connects_then_stalls_is_aborted_by_the_body_idle_bound() {
         "the stall must be bounded (~body_idle_timeout), took {elapsed:?}"
     );
 
-    let _ = router.shutdown().await;
-    client.shutdown().await;
+    provider.shutdown().await.unwrap();
+    client.shutdown().await.unwrap();
 }
 
 // =====================================================================

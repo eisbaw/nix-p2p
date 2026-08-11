@@ -746,7 +746,9 @@ mod tests {
     use http::HeaderMap;
     use http_body_util::{BodyExt, Full};
 
-    use crate::availability::{DumpError, NarDumper, NullAnnounce, NullStore, StorePath};
+    use crate::availability::{
+        MemoryNarDumper, NullAnnounce, NullStore, RegularFileNarDumper, StorePath,
+    };
     use crate::claim::KnownTransport;
     use crate::content_id::Blake3Digest;
     use crate::source::{NarHash, NarPathToken};
@@ -789,15 +791,6 @@ mod tests {
         }
     }
 
-    /// A dumper returning FIXED bytes (no nix needed); the addressed unit is
-    /// `BLAKE3` of exactly these bytes.
-    struct FixedDumper(Vec<u8>);
-    impl NarDumper for FixedDumper {
-        fn dump(&self, _path: &StorePath) -> Result<Vec<u8>, DumpError> {
-            Ok(self.0.clone())
-        }
-    }
-
     /// Two distinct canonical NarHash keys, built from real sha256-shaped bytes.
     fn key_x() -> NarHashKey {
         NarHashKey::from_sha256_bytes([0x11; 32])
@@ -821,7 +814,7 @@ mod tests {
         let store_path = dir.store_file("nar");
         let index = AvailabilityIndex::open(
             node,
-            Arc::new(FixedDumper(nar)),
+            Arc::new(MemoryNarDumper::new(nar)),
             Arc::new(NullStore),
             Arc::new(NullAnnounce),
         )
@@ -930,7 +923,7 @@ mod tests {
             node,
             // Per-path bytes: the dumper reads the file it is pointed at, so each
             // registration derives its own digest.
-            Arc::new(FileDumper),
+            Arc::new(RegularFileNarDumper),
             Arc::new(NullStore),
             Arc::new(NullAnnounce),
         )
@@ -943,14 +936,6 @@ mod tests {
                 .expect("register");
         }
         (Arc::new(index), dir)
-    }
-
-    /// A dumper that returns the file's own bytes - distinct content per path.
-    struct FileDumper;
-    impl NarDumper for FileDumper {
-        fn dump(&self, path: &StorePath) -> Result<Vec<u8>, DumpError> {
-            std::fs::read(path.as_path()).map_err(|e| DumpError(e.to_string()))
-        }
     }
 
     /// `n` distinct canonical keys.

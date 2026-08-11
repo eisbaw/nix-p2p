@@ -8,7 +8,8 @@
 //! an oversight (task-1 note): factoring it into a shared crate is exactly the
 //! coupling the PRD forbids until a second consumer genuinely earns it.
 
-use std::net::{Ipv4Addr, SocketAddr};
+use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::path::PathBuf;
 use std::process::ExitCode;
 use std::str::FromStr;
 use std::sync::Arc;
@@ -16,12 +17,14 @@ use std::sync::Arc;
 use daemon::cacheinfo::DEFAULT_PRIORITY;
 use daemon::claim::CLAIM_SCHEMA_VERSION;
 use daemon::{
-    AllowlistRawServe, App, Blake3Digest, CacheInfo, Claim, CorrelationStore,
-    DEFAULT_MAX_INFLIGHT_NAR_BYTES, DEFAULT_MAX_SERVE_DURATION, DEFAULT_MAX_SERVE_NAR_BYTES,
-    FallbackNarSource, FileNarSupplier, InMemoryDiscovery, IrohPeerAddr, IrohProvider,
-    IrohTransport, KnownPayload, KnownTransport, NarCatalog, NarHashKey, NarSource,
-    NarinfoDiskCache, NarinfoSource, NoRawServe, NodeId, NullCorrelation, RawServeDecision,
-    ServeBudget, SystemClock, TransportNarSource, TransportRegistry, UpstreamHttp, serve,
+    AddressLookupCapability, AllowlistRawServe, App, Blake3Digest, CacheInfo, Claim,
+    CorrelationStore, DEFAULT_MAX_INFLIGHT_NAR_BYTES, DEFAULT_MAX_SERVE_DURATION,
+    DEFAULT_MAX_SERVE_NAR_BYTES, EndpointProfile, EndpointScope, FallbackNarSource,
+    FileNarSupplier, IdentitySource, InMemoryDiscovery, IrohNode, IrohNodeBuilder, IrohPeerAddr,
+    IrohProviderConfig, IrohTransport, KnownPayload, KnownTransport, NarCatalog, NarHashKey,
+    NarSource, NarinfoDiskCache, NarinfoSource, NoRawServe, NodeId, NullCorrelation,
+    RawServeDecision, RelayCapability, ServeBudget, SystemClock, TaskSupervisor,
+    TransportNarSource, TransportRegistry, UpstreamHttp, serve,
 };
 use tokio::net::TcpListener;
 
@@ -119,6 +122,54 @@ fn parse_positive_u64(flag: &str, raw: &str) -> Result<u64, String> {
     Ok(value)
 }
 
+/// Parse the lower-level bind scope. This selects sockets only; it never turns
+/// on relay or address lookup. Public discovery/participation remains owned by
+/// later capability tasks.
+fn parse_iroh_endpoint_scope(raw: &str) -> Result<EndpointScope, String> {
+    match raw {
+        "offline-test" => Ok(EndpointScope::OfflineTest { port: 0 }),
+        "global" => Ok(EndpointScope::Global { port: 0 }),
+        _ => {
+            let addresses = raw.strip_prefix("lan:").ok_or_else(|| {
+                format!(
+                    "bad --iroh-endpoint-scope {raw:?}: expected offline-test, global, or lan:<ipv4>[,<ipv6>]"
+                )
+            })?;
+            let mut parts = addresses.split(',');
+            let ipv4 = parts
+                .next()
+                .filter(|part| !part.is_empty())
+                .ok_or_else(|| format!("bad LAN scope {raw:?}: missing IPv4 address"))?
+                .parse::<Ipv4Addr>()
+                .map_err(|error| format!("bad LAN IPv4 in {raw:?}: {error}"))?;
+            let ipv6 = parts
+                .next()
+                .filter(|part| !part.is_empty())
+                .map(|part| {
+                    part.parse::<Ipv6Addr>()
+                        .map_err(|error| format!("bad LAN IPv6 in {raw:?}: {error}"))
+                })
+                .transpose()?;
+            if parts.next().is_some() {
+                return Err(format!("bad LAN scope {raw:?}: too many addresses"));
+            }
+            Ok(EndpointScope::Lan {
+                ipv4,
+                ipv6,
+                port: 0,
+            })
+        }
+    }
+}
+
+fn endpoint_scope_with_port(scope: EndpointScope, port: u16) -> EndpointScope {
+    match scope {
+        EndpointScope::OfflineTest { .. } => EndpointScope::OfflineTest { port },
+        EndpointScope::Lan { ipv4, ipv6, .. } => EndpointScope::Lan { ipv4, ipv6, port },
+        EndpointScope::Global { .. } => EndpointScope::Global { port },
+    }
+}
+
 /// Human- and machine-readable identity of this build.
 fn banner() -> String {
     format!("{} {}", env!("CARGO_PKG_NAME"), env!("CARGO_PKG_VERSION"))
@@ -150,6 +201,20 @@ struct Config {
     /// stays readiness-pollable and is a real peer). Off by default. The S6 harness
     /// sets it on node B only.
     iroh_provider: bool,
+    /// Explicit status/test output capability. Stable NodeIds are not written to
+    /// routine logs; the container harness opts into the machine-readable peer
+    /// address it needs to wire its second process.
+    iroh_print_peer_address: bool,
+    /// Persistent identity state. Required whenever any Iroh provider/fetch
+    /// capability is configured; absence fails startup rather than generating an
+    /// ephemeral NodeId that invalidates discovery records after restart.
+    iroh_state_dir: Option<PathBuf>,
+    /// Closed lower-level socket scope. Also required for Iroh startup so a
+    /// daemon never inherits a public bind from a library preset.
+    iroh_endpoint_scope: Option<EndpointScope>,
+    /// Fixed UDP port for the persistent Iroh identity. Required whenever Iroh
+    /// is enabled so restart and discovery records describe the same endpoint.
+    iroh_port: Option<u16>,
     /// Raw-NAR files this node ANNOUNCES it can serve (node B). Each is served by
     /// its `BLAKE3(RawNarV1)` content id, printed on startup so the harness can
     /// wire node A's claim to it. Under the task-61 supply model the file is
@@ -196,6 +261,10 @@ impl Default for Config {
             narinfo_cache_dir: None,
             header_timeout_ms: 1000,
             iroh_provider: false,
+            iroh_print_peer_address: false,
+            iroh_state_dir: None,
+            iroh_endpoint_scope: None,
+            iroh_port: None,
             iroh_seed_nar: Vec::new(),
             iroh_max_serve_nar_bytes: DEFAULT_MAX_SERVE_NAR_BYTES,
             iroh_max_inflight_nar_bytes: DEFAULT_MAX_INFLIGHT_NAR_BYTES,
@@ -261,6 +330,21 @@ impl Config {
                     };
                 }
                 "--iroh-provider" => config.iroh_provider = true,
+                "--iroh-print-peer-address" => config.iroh_print_peer_address = true,
+                "--iroh-state-dir" => config.iroh_state_dir = Some(PathBuf::from(value()?)),
+                "--iroh-endpoint-scope" => {
+                    config.iroh_endpoint_scope = Some(parse_iroh_endpoint_scope(&value()?)?);
+                }
+                "--iroh-port" => {
+                    let raw = value()?;
+                    let port = raw
+                        .parse::<u16>()
+                        .map_err(|error| format!("bad --iroh-port {raw:?}: {error}"))?;
+                    if port == 0 {
+                        return Err("bad --iroh-port 0: must be 1..=65535".into());
+                    }
+                    config.iroh_port = Some(port);
+                }
                 "--iroh-seed-nar" => config.iroh_seed_nar.push(value()?),
                 "--iroh-max-serve-nar-bytes" => {
                     config.iroh_max_serve_nar_bytes =
@@ -283,6 +367,11 @@ impl Config {
                 other => return Err(format!("unknown flag {other:?}")),
             }
         }
+        let iroh_enabled =
+            config.iroh_provider || !config.iroh_peers.is_empty() || !config.p2p_claims.is_empty();
+        if iroh_enabled && config.iroh_port.is_none() {
+            return Err("Iroh is configured but --iroh-port is missing; refusing an ephemeral discovery address".into());
+        }
         Ok(config)
     }
 
@@ -295,11 +384,14 @@ impl Config {
     }
 }
 
-/// Node B: spawn an iroh-blobs provider under the TASK-61 SUPPLY MODEL, ANNOUNCE
+/// Build the daemon's one Iroh node runtime. Provider and fetch capabilities
+/// attach to the same persistent identity, endpoint and router.
+///
+/// Node B: attach an iroh-blobs provider under the TASK-61 SUPPLY MODEL, ANNOUNCE
 /// each configured raw NAR without holding it, print the dialable identity + each
 /// blob's content id (machine-readable lines the harness parses), and start a
 /// monitor that logs the ground-truth served-bytes counter as it changes. Returns
-/// the provider so `main` keeps it (and its router) alive.
+/// the node owner so `main` keeps every attached capability and its router alive.
 ///
 /// WHAT CHANGED IN TASK-72, and why the flag name still says "seed": the flag
 /// names raw-NAR FILES this node can serve, and it still does. What no longer
@@ -308,13 +400,50 @@ impl Config {
 /// now costs one streamed BLAKE3 pass in 64 KiB slices; the bytes are produced
 /// only when a peer actually asks, inside the serve budget, and released after.
 /// The `IROH-SEED` line is byte-identical, so the harness contract is unchanged.
-async fn setup_iroh_provider(config: &Config) -> Result<Arc<IrohProvider>, String> {
-    // FILE-BACKED, not store-backed. `IndexNarSupplier` (an `AvailabilityIndex`
-    // over `nix-store --dump`) is the supplier a real node wants and is proven in
+async fn setup_iroh_node(config: &Config) -> Result<Option<IrohNode>, String> {
+    let enabled =
+        config.iroh_provider || !config.iroh_peers.is_empty() || !config.p2p_claims.is_empty();
+    if !enabled {
+        return Ok(None);
+    }
+    let state_dir = config.iroh_state_dir.clone().ok_or_else(|| {
+        "Iroh is configured but --iroh-state-dir is missing; refusing an ephemeral daemon identity"
+            .to_string()
+    })?;
+    let scope = config.iroh_endpoint_scope.ok_or_else(|| {
+        "Iroh is configured but --iroh-endpoint-scope is missing; refusing an implicit network bind"
+            .to_string()
+    })?;
+    let port = config.iroh_port.ok_or_else(|| {
+        "Iroh is configured but --iroh-port is missing; refusing an ephemeral discovery address"
+            .to_string()
+    })?;
+    let scope = endpoint_scope_with_port(scope, port);
+    let builder = IrohNodeBuilder::new(
+        EndpointProfile { scope },
+        IdentitySource::Persistent { state_dir },
+        RelayCapability::Disabled,
+        AddressLookupCapability::Disabled,
+    )
+    .map_err(|error| error.to_string())?;
+
+    if !config.iroh_provider {
+        return builder
+            .spawn()
+            .await
+            .map(Some)
+            .map_err(|error| error.to_string());
+    }
+
+    // FILE-BACKED, not store-backed. `IndexNarSupplier` (an inert supply-catalog
+    // reader) is the supplier a real node wants and is proven in
     // `daemon/tests/serve_budget_and_supply.rs`, but nothing here opens an index
     // yet - so the shipped daemon regenerates from the raw-NAR files it was
     // pointed at, not from /nix/store. TASK-83 wires the real one.
-    let supplier = Arc::new(FileNarSupplier::new());
+    let helper_program = std::env::current_exe().map_err(|error| {
+        format!("resolving daemon executable for supervised NAR reads: {error}")
+    })?;
+    let supplier = Arc::new(FileNarSupplier::new(helper_program));
     let budget = ServeBudget {
         max_nar_bytes_uncompressed_nar: config.iroh_max_serve_nar_bytes,
         max_inflight_bytes_uncompressed_nar: config.iroh_max_inflight_nar_bytes,
@@ -330,14 +459,6 @@ async fn setup_iroh_provider(config: &Config) -> Result<Arc<IrohProvider>, Strin
             budget.max_inflight_bytes_uncompressed_nar, budget.max_nar_bytes_uncompressed_nar
         ));
     }
-    let provider = IrohProvider::spawn_supplying(
-        supplier.clone(),
-        budget,
-        std::time::Duration::from_millis(config.iroh_sweep_interval_ms),
-    )
-    .await
-    .map_err(|e| e.to_string())?;
-
     for path in &config.iroh_seed_nar {
         // Fails fast at STARTUP: a raw NAR we cannot read is a configuration error,
         // not a node that quietly announces nothing and dial-then-fails later.
@@ -371,22 +492,64 @@ async fn setup_iroh_provider(config: &Config) -> Result<Arc<IrohProvider>, Strin
         config.iroh_sweep_interval_ms
     );
 
-    let sockets = provider.socket_addrs();
-    if sockets.is_empty() {
-        return Err("iroh provider bound no sockets".to_string());
-    }
-    let sockets_csv = sockets
-        .iter()
-        .map(|s| s.to_string())
-        .collect::<Vec<_>>()
-        .join(",");
-    // The dialable address for node A's --iroh-peer <node_id>@<sockets>.
-    println!(
-        "IROH-PROVIDER-ADDR node_id={} sockets={sockets_csv}",
-        provider.node_id().to_hex()
-    );
+    let node = builder
+        .provider(IrohProviderConfig::supplying(
+            supplier,
+            budget,
+            std::time::Duration::from_millis(config.iroh_sweep_interval_ms),
+        ))
+        .spawn()
+        .await
+        .map_err(|error| error.to_string())?;
+    let provider = node
+        .provider_handle()
+        .expect("provider configuration installs the provider before spawn");
 
-    let provider = Arc::new(provider);
+    if config.iroh_print_peer_address {
+        let sockets = match provider.reachable_socket_addrs() {
+            Ok(sockets) => sockets,
+            Err(error) => {
+                drop(provider);
+                return Err(shutdown_after_setup_error(
+                    node,
+                    format!("reading provider's reachable sockets: {error}"),
+                )
+                .await);
+            }
+        };
+        if sockets.is_empty() {
+            drop(provider);
+            let shutdown = node
+                .shutdown()
+                .await
+                .map(|outcome| format!("shutdown outcome {outcome:?}"))
+                .unwrap_or_else(|error| format!("shutdown also failed: {error}"));
+            return Err(format!(
+                "--iroh-print-peer-address requested but the provider has no concrete reachable sockets; {shutdown}"
+            ));
+        }
+        let sockets_csv = sockets
+            .iter()
+            .map(|s| s.to_string())
+            .collect::<Vec<_>>()
+            .join(",");
+        let node_id = match provider.node_id() {
+            Ok(node_id) => node_id,
+            Err(error) => {
+                drop(provider);
+                return Err(shutdown_after_setup_error(
+                    node,
+                    format!("reading provider identity: {error}"),
+                )
+                .await);
+            }
+        };
+        println!(
+            "IROH-PROVIDER-ADDR node_id={} sockets={sockets_csv}",
+            node_id.to_hex()
+        );
+    }
+
     // Ground-truth served-bytes monitor: poll the provider's own byte counter and
     // log it whenever it advances, so the harness reads node B's SENT bytes (not
     // node A's self-report) as the peer-served oracle.
@@ -402,9 +565,9 @@ async fn setup_iroh_provider(config: &Config) -> Result<Arc<IrohProvider>, Strin
     //     start/end of the transfer. The concurrency precondition is measured from
     //     these, not from the fetching client's request windows, which would overlap
     //     even if the serves had taken turns.
-    {
+    let monitor = {
         let provider = provider.clone();
-        tokio::spawn(async move {
+        async move {
             let mut last = 0u64;
             let mut windows_logged = 0usize;
             let mut last_residency: Option<daemon::StoreResidency> = None;
@@ -466,10 +629,27 @@ async fn setup_iroh_provider(config: &Config) -> Result<Arc<IrohProvider>, Strin
                     );
                 }
             }
-        });
+        }
+    };
+    if let Err(error) = node.spawn_task("provider-observability", monitor) {
+        drop(provider);
+        return Err(shutdown_after_setup_error(
+            node,
+            format!("starting provider observability: {error}"),
+        )
+        .await);
     }
 
-    Ok(provider)
+    Ok(Some(node))
+}
+
+async fn shutdown_after_setup_error(node: IrohNode, error: String) -> String {
+    let cleanup = node
+        .shutdown()
+        .await
+        .map(|outcome| format!("shutdown outcome {outcome:?}"))
+        .unwrap_or_else(|cleanup_error| format!("shutdown failed: {cleanup_error}"));
+    format!("{error}; cleanup={cleanup}")
 }
 
 /// Node A: assemble the p2p `NarSource` (iroh transport wired to the configured
@@ -479,6 +659,7 @@ async fn setup_iroh_provider(config: &Config) -> Result<Arc<IrohProvider>, Strin
 async fn setup_p2p_source(
     config: &Config,
     upstream: Arc<UpstreamHttp>,
+    transport: IrohTransport,
 ) -> Result<(Arc<dyn NarSource>, Arc<dyn RawServeDecision>), String> {
     // Fail fast (config-time, not first-request): every claim's holder MUST have a
     // configured dialable address. Without this a typo'd/omitted `--iroh-peer`
@@ -497,7 +678,6 @@ async fn setup_p2p_source(
         }
     }
 
-    let transport = IrohTransport::spawn().await.map_err(|e| e.to_string())?;
     for peer in &config.iroh_peers {
         transport.add_peer(&IrohPeerAddr::new(peer.node, peer.sockets.iter().copied()));
     }
@@ -562,8 +742,108 @@ fn run_rewrite_narinfo_filter() -> ExitCode {
     }
 }
 
+/// Installed synchronously before any readiness output, closing the startup
+/// race where a supervisor could signal immediately after observing readiness.
+#[cfg(unix)]
+struct ShutdownSignals {
+    interrupt: tokio::signal::unix::Signal,
+    terminate: tokio::signal::unix::Signal,
+}
+
+#[cfg(unix)]
+fn install_shutdown_signals() -> Result<ShutdownSignals, String> {
+    let interrupt = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())
+        .map_err(|error| format!("installing SIGINT handler: {error}"))?;
+    let terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+        .map_err(|error| format!("installing SIGTERM handler: {error}"))?;
+    Ok(ShutdownSignals {
+        interrupt,
+        terminate,
+    })
+}
+
+#[cfg(unix)]
+impl ShutdownSignals {
+    async fn recv(mut self) -> Result<&'static str, String> {
+        tokio::select! {
+            received = self.interrupt.recv() => {
+                received.ok_or_else(|| "SIGINT signal stream closed unexpectedly".to_string())?;
+                Ok("SIGINT")
+            }
+            received = self.terminate.recv() => {
+                received.ok_or_else(|| "SIGTERM signal stream closed unexpectedly".to_string())?;
+                Ok("SIGTERM")
+            }
+        }
+    }
+}
+
+#[cfg(not(unix))]
+struct ShutdownSignals;
+
+#[cfg(not(unix))]
+fn install_shutdown_signals() -> Result<ShutdownSignals, String> {
+    Ok(ShutdownSignals)
+}
+
+#[cfg(not(unix))]
+impl ShutdownSignals {
+    async fn recv(self) -> Result<&'static str, String> {
+        tokio::signal::ctrl_c()
+            .await
+            .map_err(|error| format!("waiting for shutdown signal: {error}"))?;
+        Ok("interrupt")
+    }
+}
+
+/// Consume the sole runtime owner and report whether shutdown completed through
+/// its bounded graceful/forced path.
+async fn shutdown_iroh_node(node: Option<IrohNode>) -> bool {
+    let Some(node) = node else {
+        return true;
+    };
+    match node.shutdown().await {
+        Ok(outcome) => {
+            println!("IROH-NODE-SHUTDOWN outcome={outcome:?}");
+            true
+        }
+        Err(error) => {
+            eprintln!("IROH-NODE-SHUTDOWN-FAILED error={error}");
+            false
+        }
+    }
+}
+
 #[tokio::main]
 async fn main() -> ExitCode {
+    // Internal process-isolation boundary for raw-file supply. It is intentionally
+    // handled before normal configuration: the parent owns this process group,
+    // caps stdout, and kills/reaps it on request cancellation or node shutdown.
+    let mut raw_os_args = std::env::args_os().skip(1);
+    if raw_os_args.next().as_deref() == Some(std::ffi::OsStr::new("__dump-raw-nar")) {
+        if !daemon::raw_nar_helper_authorized() {
+            eprintln!("daemon: __dump-raw-nar is an internal supervised subprocess mode");
+            return ExitCode::from(2);
+        }
+        let Some(path) = raw_os_args.next() else {
+            eprintln!("daemon: __dump-raw-nar requires exactly one path");
+            return ExitCode::from(2);
+        };
+        if raw_os_args.next().is_some() {
+            eprintln!("daemon: __dump-raw-nar accepts exactly one path");
+            return ExitCode::from(2);
+        }
+        let stdout = std::io::stdout();
+        let mut locked = stdout.lock();
+        return match daemon::copy_regular_raw_nar(PathBuf::from(path), &mut locked) {
+            Ok(_) => ExitCode::SUCCESS,
+            Err(error) => {
+                eprintln!("daemon: __dump-raw-nar failed: {error}");
+                ExitCode::FAILURE
+            }
+        };
+    }
+
     // A tiny subcommand surface: `rewrite-narinfo` is a synchronous stdin->stdout
     // filter, handled before any flag parsing or the async serve loop.
     let mut raw_args = std::env::args().skip(1).peekable();
@@ -576,6 +856,13 @@ async fn main() -> ExitCode {
         Err(err) => {
             eprintln!("daemon: {err}");
             return ExitCode::from(2);
+        }
+    };
+    let shutdown_signals = match install_shutdown_signals() {
+        Ok(signals) => signals,
+        Err(error) => {
+            eprintln!("daemon: shutdown signal setup failed: {error}");
+            return ExitCode::FAILURE;
         }
     };
 
@@ -617,20 +904,14 @@ async fn main() -> ExitCode {
         None => (upstream.clone(), Arc::new(NullCorrelation)),
     };
 
-    // Node B (provider) mode: stand up an iroh-blobs provider seeded with the raw
-    // NARs, so this node serves peers over iroh ALONGSIDE its HTTP surface (it stays
-    // readiness-pollable). Held for the process lifetime (its router serves while it
-    // is alive); dropping it would stop serving peers.
-    let _iroh_provider = if config.iroh_provider {
-        match setup_iroh_provider(&config).await {
-            Ok(provider) => Some(provider),
-            Err(err) => {
-                eprintln!("daemon: iroh provider setup failed: {err}");
-                return ExitCode::FAILURE;
-            }
+    // One persistent Iroh node owns provider and fetch capabilities. Keeping it
+    // alive for the process lifetime keeps the shared router/socket alive.
+    let iroh_node = match setup_iroh_node(&config).await {
+        Ok(node) => node,
+        Err(err) => {
+            eprintln!("daemon: Iroh node setup failed: {err}");
+            return ExitCode::FAILURE;
         }
-    } else {
-        None
     };
 
     // Node A (client) mode: put the p2p NarSource (iroh transport + configured
@@ -642,10 +923,18 @@ async fn main() -> ExitCode {
         if config.iroh_peers.is_empty() && config.p2p_claims.is_empty() {
             (upstream.clone(), Arc::new(NoRawServe))
         } else {
-            match setup_p2p_source(&config, upstream.clone()).await {
+            let transport = match &iroh_node {
+                Some(node) => node.transport_handle(),
+                None => {
+                    eprintln!("daemon: p2p source requested without an Iroh node runtime");
+                    return ExitCode::FAILURE;
+                }
+            };
+            match setup_p2p_source(&config, upstream.clone(), transport).await {
                 Ok(pair) => pair,
                 Err(err) => {
                     eprintln!("daemon: p2p source setup failed: {err}");
+                    shutdown_iroh_node(iroh_node).await;
                     return ExitCode::FAILURE;
                 }
             }
@@ -666,6 +955,7 @@ async fn main() -> ExitCode {
         Ok(listener) => listener,
         Err(err) => {
             eprintln!("daemon: cannot bind {}: {err}", config.listen);
+            shutdown_iroh_node(iroh_node).await;
             return ExitCode::FAILURE;
         }
     };
@@ -678,11 +968,51 @@ async fn main() -> ExitCode {
         config.upstream
     );
 
-    if let Err(err) = serve(listener, app).await {
-        eprintln!("daemon: serve error: {err}");
-        return ExitCode::FAILURE;
+    // HTTP connection tasks share the Iroh node's supervisor when present, so
+    // endpoint, inbound/outbound Iroh work and active HTTP responses all stop
+    // inside the same absolute shutdown deadline. A pure HTTP daemon retains a
+    // standalone RAII supervisor for the same no-detach property.
+    let standalone_http_supervisor = iroh_node.is_none().then(TaskSupervisor::new);
+    let http_supervisor = iroh_node
+        .as_ref()
+        .map(IrohNode::task_supervisor_handle)
+        .or_else(|| {
+            standalone_http_supervisor
+                .as_ref()
+                .map(TaskSupervisor::handle)
+        })
+        .expect("one HTTP task supervisor is always constructed");
+
+    let mut success = true;
+    tokio::select! {
+        result = serve(listener, app, http_supervisor) => {
+            match result {
+                Ok(()) => println!("daemon: HTTP serve loop ended"),
+                Err(error) => {
+                    eprintln!("daemon: serve error: {error}");
+                    success = false;
+                }
+            }
+        }
+        signal = shutdown_signals.recv() => {
+            match signal {
+                Ok(signal) => println!("daemon: received {signal}; shutting down"),
+                Err(error) => {
+                    eprintln!("daemon: shutdown signal error: {error}");
+                    success = false;
+                }
+            }
+        }
     }
-    ExitCode::SUCCESS
+    if let Some(supervisor) = &standalone_http_supervisor {
+        supervisor.cancel_now();
+    }
+    success &= shutdown_iroh_node(iroh_node).await;
+    if success {
+        ExitCode::SUCCESS
+    } else {
+        ExitCode::FAILURE
+    }
 }
 
 #[cfg(test)]
@@ -810,6 +1140,12 @@ mod tests {
         let config = Config::from_args(
             [
                 "--iroh-provider",
+                "--iroh-state-dir",
+                "/var/lib/nix-p2p/iroh",
+                "--iroh-endpoint-scope",
+                "offline-test",
+                "--iroh-port",
+                "41001",
                 "--iroh-seed-nar",
                 "/srv/seed/a.nar",
                 "--iroh-peer",
@@ -821,9 +1157,83 @@ mod tests {
         )
         .unwrap();
         assert!(config.iroh_provider);
+        assert_eq!(
+            config.iroh_state_dir,
+            Some(PathBuf::from("/var/lib/nix-p2p/iroh"))
+        );
+        assert_eq!(
+            config.iroh_endpoint_scope,
+            Some(EndpointScope::OfflineTest { port: 0 })
+        );
+        assert_eq!(config.iroh_port, Some(41001));
         assert_eq!(config.iroh_seed_nar, vec!["/srv/seed/a.nar".to_string()]);
         assert_eq!(config.iroh_peers.len(), 1);
         assert_eq!(config.p2p_claims.len(), 1);
+    }
+
+    #[test]
+    fn endpoint_scope_parser_covers_closed_offline_lan_and_global_variants() {
+        assert_eq!(
+            parse_iroh_endpoint_scope("offline-test").unwrap(),
+            EndpointScope::OfflineTest { port: 0 }
+        );
+        assert_eq!(
+            parse_iroh_endpoint_scope("lan:192.0.2.4,2001:db8::4").unwrap(),
+            EndpointScope::Lan {
+                ipv4: "192.0.2.4".parse().unwrap(),
+                ipv6: Some("2001:db8::4".parse().unwrap()),
+                port: 0,
+            }
+        );
+        assert_eq!(
+            parse_iroh_endpoint_scope("global").unwrap(),
+            EndpointScope::Global { port: 0 }
+        );
+        assert!(parse_iroh_endpoint_scope("lan:").is_err());
+        assert!(parse_iroh_endpoint_scope("lan:127.0.0.1,::1,extra").is_err());
+        assert!(parse_iroh_endpoint_scope("n0").is_err());
+        assert_eq!(
+            endpoint_scope_with_port(EndpointScope::Global { port: 0 }, 41002),
+            EndpointScope::Global { port: 41002 }
+        );
+    }
+
+    #[test]
+    fn configured_iroh_requires_a_nonzero_fixed_port() {
+        assert!(
+            Config::from_args(["--iroh-provider".into(), "--iroh-port".into(), "0".into()])
+                .unwrap_err()
+                .contains("must be 1..=65535")
+        );
+        assert!(
+            Config::from_args(["--iroh-provider".into()])
+                .unwrap_err()
+                .contains("--iroh-port")
+        );
+    }
+
+    #[tokio::test]
+    async fn configured_iroh_refuses_implicit_identity_or_bind_scope() {
+        let missing_both = Config {
+            iroh_provider: true,
+            ..Config::default()
+        };
+        let error = setup_iroh_node(&missing_both)
+            .await
+            .err()
+            .expect("configured Iroh must reject an ephemeral identity");
+        assert!(error.contains("--iroh-state-dir"), "got {error}");
+
+        let missing_scope = Config {
+            iroh_provider: true,
+            iroh_state_dir: Some(PathBuf::from("/unused/identity/state")),
+            ..Config::default()
+        };
+        let error = setup_iroh_node(&missing_scope)
+            .await
+            .err()
+            .expect("configured Iroh must reject an implicit bind scope");
+        assert!(error.contains("--iroh-endpoint-scope"), "got {error}");
     }
 
     #[test]

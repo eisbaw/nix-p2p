@@ -24,7 +24,7 @@ use std::time::Duration;
 
 use daemon::{
     App, CacheInfo, NarCatalog, NarSource, NarinfoSource, NullCorrelation, RawUpstream,
-    UpstreamHttp, serve,
+    TaskSupervisor, UpstreamHttp, serve,
 };
 use flate2::Compression;
 use flate2::read::{GzDecoder, GzEncoder};
@@ -198,11 +198,15 @@ fn reason(status: u16) -> &'static str {
 // ---- running the real daemon ------------------------------------------------
 
 /// A running daemon; aborts its serve task on drop.
-pub struct DaemonHandle(tokio::task::JoinHandle<()>);
+pub struct DaemonHandle {
+    serve: tokio::task::JoinHandle<()>,
+    supervisor: TaskSupervisor,
+}
 
 impl Drop for DaemonHandle {
     fn drop(&mut self) {
-        self.0.abort();
+        self.supervisor.cancel_now();
+        self.serve.abort();
     }
 }
 
@@ -212,10 +216,18 @@ pub async fn spawn_app(app: Arc<App>) -> (SocketAddr, DaemonHandle) {
         .await
         .expect("daemon binds");
     let addr = listener.local_addr().unwrap();
+    let supervisor = TaskSupervisor::new();
+    let task_handle = supervisor.handle();
     let handle = tokio::spawn(async move {
-        let _ = serve(listener, app).await;
+        let _ = serve(listener, app, task_handle).await;
     });
-    (addr, DaemonHandle(handle))
+    (
+        addr,
+        DaemonHandle {
+            serve: handle,
+            supervisor,
+        },
+    )
 }
 
 /// Run a daemon whose three sources are all the real `UpstreamHttp` for

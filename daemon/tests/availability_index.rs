@@ -21,8 +21,8 @@ use std::sync::{Arc, Barrier, Mutex};
 use std::time::Duration;
 
 use daemon::{
-    AnnounceSink, AvailabilityIndex, Blake3Digest, Claim, DumpError, HoldAnswer, HoldQuery,
-    JsonFileStore, KnownPayload, KnownTransport, NarDumper, NarHashKey, NodeId, NullAnnounce,
+    AnnounceSink, AvailabilityIndex, Blake3Digest, Claim, HoldAnswer, HoldQuery, JsonFileStore,
+    KnownPayload, KnownTransport, MemoryNarDumper, NarDumper, NarHashKey, NodeId, NullAnnounce,
     NullStore, QUERY_SCHEMA_VERSION, StorePath,
 };
 
@@ -71,45 +71,81 @@ impl Drop for TempDir {
 /// A dumper that returns FIXED bytes, counts how many times it is invoked, and can
 /// sleep to widen the single-flight contention window. The count is the bite: if
 /// single-flight holds, it is 1 no matter how many callers raced.
-struct CountingDumper {
-    bytes: Vec<u8>,
-    calls: Arc<AtomicUsize>,
-    delay: Option<Duration>,
-}
+struct CountingDumper;
 
 impl CountingDumper {
-    fn new(bytes: Vec<u8>) -> (Arc<Self>, Arc<AtomicUsize>) {
-        let calls = Arc::new(AtomicUsize::new(0));
-        (
-            Arc::new(CountingDumper {
-                bytes,
-                calls: calls.clone(),
-                delay: None,
-            }),
-            calls,
-        )
+    fn pair(bytes: Vec<u8>) -> (Arc<MemoryNarDumper>, Arc<MemoryNarDumper>) {
+        let dumper = Arc::new(MemoryNarDumper::new(bytes));
+        (dumper.clone(), dumper)
     }
 
-    fn with_delay(bytes: Vec<u8>, delay: Duration) -> (Arc<Self>, Arc<AtomicUsize>) {
-        let calls = Arc::new(AtomicUsize::new(0));
-        (
-            Arc::new(CountingDumper {
-                bytes,
-                calls: calls.clone(),
-                delay: Some(delay),
-            }),
-            calls,
-        )
+    fn with_delay(bytes: Vec<u8>, delay: Duration) -> (Arc<MemoryNarDumper>, Arc<MemoryNarDumper>) {
+        let dumper = Arc::new(MemoryNarDumper::with_delay(bytes, delay));
+        (dumper.clone(), dumper)
     }
 }
 
-impl NarDumper for CountingDumper {
-    fn dump(&self, _path: &StorePath) -> Result<Vec<u8>, DumpError> {
-        self.calls.fetch_add(1, Ordering::SeqCst);
-        if let Some(delay) = self.delay {
-            std::thread::sleep(delay);
+struct AtomicCancellation(Arc<std::sync::atomic::AtomicBool>);
+
+impl daemon::availability::CancellationCheck for AtomicCancellation {
+    fn is_cancelled(&self) -> bool {
+        self.0.load(Ordering::Acquire)
+    }
+}
+
+#[test]
+fn command_dumper_cancellation_kills_and_reaps_its_process_group() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let temp = TempDir::new("command-cancel");
+    let program = temp.join("fake-nix-store");
+    let pid_file = temp.join("pids");
+    std::fs::write(
+        &program,
+        br#"#!/bin/sh
+child_loop() {
+  trap '' TERM
+  while :; do sleep 1; done
+}
+child_loop &
+child_pid=$!
+echo "$$ $child_pid" > "$2"
+trap '' TERM
+wait
+"#,
+    )
+    .unwrap();
+    std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let cancelled = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let cancellation = AtomicCancellation(cancelled.clone());
+    let path = StorePath::new(pid_file.clone());
+    let worker = std::thread::spawn(move || {
+        daemon::CommandNarDumper::with_program(program).dump(&path, &cancellation)
+    });
+    let deadline = std::time::Instant::now() + Duration::from_secs(2);
+    while !pid_file.exists() && std::time::Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    let pids = std::fs::read_to_string(&pid_file).expect("fake dumper recorded its process group");
+    cancelled.store(true, Ordering::Release);
+    let error = worker
+        .join()
+        .expect("dumper thread")
+        .expect_err("cancellation must fail the dump loudly");
+    assert!(error.to_string().contains("cancelled"), "{error}");
+
+    for raw_pid in pids.split_whitespace() {
+        let pid = rustix::process::Pid::from_raw(raw_pid.parse::<i32>().unwrap()).unwrap();
+        let reaped_by = std::time::Instant::now() + Duration::from_secs(2);
+        while rustix::process::test_kill_process(pid).is_ok()
+            && std::time::Instant::now() < reaped_by
+        {
+            std::thread::sleep(Duration::from_millis(10));
         }
-        Ok(self.bytes.clone())
+        assert!(
+            rustix::process::test_kill_process(pid).is_err(),
+            "cancelled process {pid} survived its dumper"
+        );
     }
 }
 
@@ -160,7 +196,7 @@ fn key_from(byte: u8) -> NarHashKey {
 fn unregistered_key_is_absent_and_there_is_no_listing_call() {
     // The ONLY probe is per-key hold(); the API has no "list holdings" method, so a
     // node can only ever be asked yes/no about a concrete NarHash it already names.
-    let (dumper, _calls) = CountingDumper::new(synth_raw_nar(b"unused"));
+    let (dumper, _calls) = CountingDumper::pair(synth_raw_nar(b"unused"));
     let index =
         AvailabilityIndex::open(node(), dumper, Arc::new(NullStore), Arc::new(NullAnnounce))
             .expect("open");
@@ -178,7 +214,7 @@ fn a_held_key_yields_the_complete_offer_from_the_real_store() {
     let nar = synth_raw_nar(b"the payload this node actually holds");
     let expected = Blake3Digest::from_raw_nar(&nar);
 
-    let (dumper, calls) = CountingDumper::new(nar);
+    let (dumper, calls) = CountingDumper::pair(nar);
     let index =
         AvailabilityIndex::open(node(), dumper, Arc::new(NullStore), Arc::new(NullAnnounce))
             .expect("open");
@@ -232,11 +268,7 @@ fn a_held_key_yields_the_complete_offer_from_the_real_store() {
 
     // All of the above shared ONE computed digest (single-flight cache), so the
     // dump ran once across hold + claim + answer, not three times.
-    assert_eq!(
-        calls.load(Ordering::SeqCst),
-        1,
-        "digest computed once, then cached"
-    );
+    assert_eq!(calls.calls(), 1, "digest computed once, then cached");
 }
 
 // ---------------------------------------------------------------- single-flight
@@ -276,7 +308,7 @@ fn concurrent_probes_hash_the_nar_exactly_once() {
     let answers: Vec<HoldAnswer> = handles.into_iter().map(|h| h.join().unwrap()).collect();
 
     assert_eq!(
-        calls.load(Ordering::SeqCst),
+        calls.calls(),
         1,
         "single-flight FAILED: {N} concurrent callers dumped/hashed the NAR more than once"
     );
@@ -301,7 +333,7 @@ fn registrations_survive_a_restart() {
 
     // Boot 1: register, then drop the whole index (simulated shutdown).
     {
-        let (dumper, _calls) = CountingDumper::new(nar.clone());
+        let (dumper, _calls) = CountingDumper::pair(nar.clone());
         let index = AvailabilityIndex::open(
             node(),
             dumper,
@@ -318,7 +350,7 @@ fn registrations_survive_a_restart() {
 
     // Boot 2: a fresh index loads the file and still answers Have, recomputing the
     // derived digest (which is deliberately NOT persisted).
-    let (dumper, calls) = CountingDumper::new(nar);
+    let (dumper, calls) = CountingDumper::pair(nar);
     let index = AvailabilityIndex::open(
         node(),
         dumper,
@@ -331,7 +363,7 @@ fn registrations_survive_a_restart() {
         HoldAnswer::Absent => panic!("a persisted registration must survive restart"),
     }
     assert_eq!(
-        calls.load(Ordering::SeqCst),
+        calls.calls(),
         1,
         "the derived digest is recomputed once after restart (not persisted)"
     );
@@ -344,7 +376,7 @@ fn a_corrupt_index_file_fails_loud_not_silently_empty() {
 
     // Not JSON at all.
     std::fs::write(&index_file, b"this is not json").unwrap();
-    let (dumper, _calls) = CountingDumper::new(vec![]);
+    let (dumper, _calls) = CountingDumper::pair(vec![]);
     assert!(
         AvailabilityIndex::open(
             node(),
@@ -380,7 +412,7 @@ fn a_removed_store_path_drops_from_availability_and_is_pruned() {
     let store_path = tmp.store_file("gc-me.nar");
     let key = key_from(0x05);
 
-    let (dumper, _calls) = CountingDumper::new(synth_raw_nar(b"soon to be GC'd"));
+    let (dumper, _calls) = CountingDumper::pair(synth_raw_nar(b"soon to be GC'd"));
     let index = AvailabilityIndex::open(
         node(),
         dumper,
@@ -408,7 +440,7 @@ fn a_removed_store_path_drops_from_availability_and_is_pruned() {
 
     // And the stale registration was pruned + persisted: a fresh index does not
     // resurrect it.
-    let (dumper2, _c) = CountingDumper::new(vec![]);
+    let (dumper2, _c) = CountingDumper::pair(vec![]);
     let reopened = AvailabilityIndex::open(
         node(),
         dumper2,
@@ -423,6 +455,93 @@ fn a_removed_store_path_drops_from_availability_and_is_pruned() {
     );
 }
 
+#[test]
+fn retiring_one_same_digest_registration_preserves_its_sibling() {
+    let tmp = TempDir::new("same-digest-siblings");
+    let nar = synth_raw_nar(b"shared payload");
+    let digest = Blake3Digest::from_raw_nar(&nar);
+    let (dumper, _calls) = CountingDumper::pair(nar);
+    let index =
+        AvailabilityIndex::open(node(), dumper, Arc::new(NullStore), Arc::new(NullAnnounce))
+            .unwrap();
+    let first = key_from(0x51);
+    let second = key_from(0x52);
+    index.register(first, tmp.store_file("first")).unwrap();
+    index.register(second, tmp.store_file("second")).unwrap();
+    assert!(matches!(
+        index.hold(&first).unwrap(),
+        HoldAnswer::Have { .. }
+    ));
+    assert!(matches!(
+        index.hold(&second).unwrap(),
+        HoldAnswer::Have { .. }
+    ));
+
+    index.unregister(&second).unwrap();
+    index.unregister(&second).unwrap(); // retirement is explicitly idempotent
+    let cancellation = AtomicCancellation(Arc::new(std::sync::atomic::AtomicBool::new(false)));
+    assert_eq!(
+        index
+            .supply_size_cancellable(&digest, &cancellation)
+            .unwrap(),
+        Some(synth_raw_nar(b"shared payload").len() as u64),
+        "the first registration still owns an independent catalog record"
+    );
+
+    index.unregister(&first).unwrap();
+    index.unregister(&first).unwrap();
+    assert_eq!(
+        index
+            .supply_size_cancellable(&digest, &cancellation)
+            .unwrap(),
+        None,
+        "the digest disappears only after its final owner retires"
+    );
+}
+
+#[test]
+fn stale_derivation_cannot_resurrect_a_replaced_registration() {
+    let tmp = TempDir::new("stale-derive-replacement");
+    let nar = synth_raw_nar(b"replacement race payload");
+    let digest = Blake3Digest::from_raw_nar(&nar);
+    let (dumper, calls) = CountingDumper::with_delay(nar, Duration::from_millis(100));
+    let index = Arc::new(
+        AvailabilityIndex::open(node(), dumper, Arc::new(NullStore), Arc::new(NullAnnounce))
+            .unwrap(),
+    );
+    let key = key_from(0x53);
+    index.register(key, tmp.store_file("old")).unwrap();
+    let holding = {
+        let index = Arc::clone(&index);
+        std::thread::spawn(move || index.hold(&key))
+    };
+    let deadline = std::time::Instant::now() + Duration::from_secs(1);
+    while calls.calls() == 0 && std::time::Instant::now() < deadline {
+        std::thread::yield_now();
+    }
+    assert_eq!(calls.calls(), 1, "old derivation entered its slow dump");
+    index.register(key, tmp.store_file("new")).unwrap();
+    assert!(matches!(
+        holding.join().unwrap().unwrap(),
+        HoldAnswer::Have { .. }
+    ));
+    assert_eq!(
+        calls.calls(),
+        2,
+        "stale hold retries and derives the current registration"
+    );
+
+    index.unregister(&key).unwrap();
+    let cancellation = AtomicCancellation(Arc::new(std::sync::atomic::AtomicBool::new(false)));
+    assert_eq!(
+        index
+            .supply_size_cancellable(&digest, &cancellation)
+            .unwrap(),
+        None,
+        "retiring the replacement must not reveal the stale old entry"
+    );
+}
+
 // ---------------------------------------------------------- announce-on-demand
 
 #[test]
@@ -432,7 +551,7 @@ fn publish_announces_the_complete_claim_only_when_held() {
     let expected = Blake3Digest::from_raw_nar(&nar);
     let sink = Arc::new(RecordingAnnounce::default());
 
-    let (dumper, _calls) = CountingDumper::new(nar);
+    let (dumper, _calls) = CountingDumper::pair(nar);
     let index =
         AvailabilityIndex::open(node(), dumper, Arc::new(NullStore), sink.clone()).expect("open");
 
@@ -492,7 +611,7 @@ fn computed_digest_reproduces_the_task48_golden_recipe_vectors() {
         let expected_str = vector["blake3"].as_str().expect("blake3");
 
         // A fresh index whose dumper yields exactly these golden bytes.
-        let (dumper, _calls) = CountingDumper::new(input.clone());
+        let (dumper, _calls) = CountingDumper::pair(input.clone());
         let index =
             AvailabilityIndex::open(node(), dumper, Arc::new(NullStore), Arc::new(NullAnnounce))
                 .expect("open");

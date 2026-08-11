@@ -23,8 +23,8 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use daemon::{
-    AvailabilityIndex, Blake3Digest, DirectDiscovery, DumpError, FallbackNarSource,
-    InProcessPeerQuery, IrohProvider, IrohTransport, NarDumper, NarHash, NarHashKey, NarKey,
+    AvailabilityIndex, Blake3Digest, DirectDiscovery, FallbackNarSource, InProcessPeerQuery,
+    IrohClientNode, IrohProvider, IrohProviderNode, MemoryNarDumper, NarHash, NarHashKey, NarKey,
     NarPathToken, NarSource, NullAnnounce, NullStore, SourceError, StorePath, TransportNarSource,
     TransportRegistry, UpstreamResponse, verify_blake3,
 };
@@ -64,13 +64,6 @@ fn nar_hash_key(nar: &[u8]) -> NarHashKey {
 
 // ---- a fixed dumper + a self-cleaning temp store path ------------------------
 
-struct FixedDumper(Vec<u8>);
-impl NarDumper for FixedDumper {
-    fn dump(&self, _path: &StorePath) -> Result<Vec<u8>, DumpError> {
-        Ok(self.0.clone())
-    }
-}
-
 struct TempDir {
     path: PathBuf,
 }
@@ -107,8 +100,8 @@ impl Drop for TempDir {
 async fn spawn_holder(
     nar: &[u8],
     key: NarHashKey,
-) -> (IrohProvider, Arc<AvailabilityIndex>, TempDir) {
-    let provider = IrohProvider::spawn().await.expect("provider binds");
+) -> (IrohProviderNode, Arc<AvailabilityIndex>, TempDir) {
+    let provider = IrohProviderNode::spawn().await.expect("provider binds");
     let content = provider.seed(nar).await.expect("seed the raw NAR");
     assert_eq!(
         content,
@@ -119,8 +112,8 @@ async fn spawn_holder(
     let dir = TempDir::new("holder");
     let store_path = dir.store_file("nar");
     let index = AvailabilityIndex::open(
-        provider.node_id(),
-        Arc::new(FixedDumper(nar.to_vec())),
+        provider.node_id().unwrap(),
+        Arc::new(MemoryNarDumper::new(nar.to_vec())),
         Arc::new(NullStore),
         Arc::new(NullAnnounce),
     )
@@ -138,19 +131,22 @@ async fn spawn_holder(
 async fn spawn_seeker(
     provider: &IrohProvider,
     index: Arc<AvailabilityIndex>,
-) -> TransportNarSource {
+) -> (TransportNarSource, IrohClientNode) {
     // The fetch transport: an iroh client that knows how to dial B directly.
-    let client = IrohTransport::spawn().await.expect("client binds");
+    let client = IrohClientNode::spawn().await.expect("client binds");
     client.add_peer(&provider.addr().await.expect("provider addr"));
     let mut registry = TransportRegistry::new();
-    registry.register(Box::new(client));
+    registry.register(Box::new(client.transport_handle()));
 
     // The query rendezvous: A asks B (by NodeId) and B answers from its real index.
     let mut rendezvous = InProcessPeerQuery::new();
-    rendezvous.add_index(provider.node_id(), index);
-    let discovery = DirectDiscovery::new(vec![provider.node_id()], Arc::new(rendezvous));
+    rendezvous.add_index(provider.node_id().unwrap(), index);
+    let discovery = DirectDiscovery::new(vec![provider.node_id().unwrap()], Arc::new(rendezvous));
 
-    TransportNarSource::new(registry, Arc::new(discovery))
+    (
+        TransportNarSource::new(registry, Arc::new(discovery)),
+        client,
+    )
 }
 
 async fn collect(resp: UpstreamResponse) -> Vec<u8> {
@@ -165,7 +161,7 @@ async fn node_a_resolves_and_fetches_from_node_b_over_real_iroh() {
     let key = nar_hash_key(&nar);
 
     let (provider, index, _dir) = spawn_holder(&nar, key).await;
-    let source = spawn_seeker(&provider, index).await;
+    let (source, client) = spawn_seeker(&provider, index).await;
 
     // The seam key the serving layer would build from the narinfo: the SIGNED
     // NarHash (what discovery resolves on) plus the URL token a p2p source ignores.
@@ -196,7 +192,8 @@ async fn node_a_resolves_and_fetches_from_node_b_over_real_iroh() {
         "gate 2 (sha256 == NarHash) holds - what we fetched is what we asked for"
     );
 
-    provider.shutdown().await;
+    client.shutdown().await.unwrap();
+    provider.shutdown().await.unwrap();
 }
 
 // ---- AC#2: a NarHash NO peer holds misses FAST over the real stack, then the
@@ -235,7 +232,7 @@ async fn an_unheld_nar_hash_misses_fast_then_falls_back_to_upstream() {
     assert_ne!(held_key, wanted_key);
 
     let (provider, index, _dir) = spawn_holder(&held, held_key).await;
-    let p2p_source = spawn_seeker(&provider, index).await;
+    let (p2p_source, client) = spawn_seeker(&provider, index).await;
 
     let seam_key = NarKey::SignedNarHash {
         hash: NarHash::new(wanted_key.to_string()),
@@ -274,5 +271,6 @@ async fn an_unheld_nar_hash_misses_fast_then_falls_back_to_upstream() {
         "S2 fallback served the NAR"
     );
 
-    provider.shutdown().await;
+    client.shutdown().await.unwrap();
+    provider.shutdown().await.unwrap();
 }

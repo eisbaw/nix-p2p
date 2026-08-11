@@ -135,9 +135,10 @@ use std::time::Instant;
 
 use bao_tree::io::BaoContentItem;
 use daemon::transport_iroh::endpoint_support::{
-    DAEMON_ENDPOINT_PROFILE, EndpointProfile, bind_endpoint, endpoint_addr, provider_addr,
+    DAEMON_ENDPOINT_PROFILE, EndpointProfile, EndpointScope, bind_endpoint, endpoint_addr,
+    provider_addr,
 };
-use daemon::{Blake3Digest, IrohProvider, IrohTransport, KnownTransport, Transport};
+use daemon::{Blake3Digest, IrohClientNode, IrohProviderNode, KnownTransport, Transport};
 use iroh::{Endpoint, EndpointAddr};
 use iroh_blobs::Hash;
 use iroh_blobs::get::request::{GetBlobItem, get_blob};
@@ -156,8 +157,9 @@ const REPEATS: usize = 5;
 /// Keep this selector distinct from the daemon selector: the compile-time guard
 /// below is what turns a one-sided mutation into a deterministic failure rather
 /// than silently changing the `iroh_collect -> daemon_fetch` residual.
-const BENCHMARK_ENDPOINT_PROFILE: EndpointProfile =
-    EndpointProfile::MinimalIpv4LoopbackNoRelay { port: 0 };
+const BENCHMARK_ENDPOINT_PROFILE: EndpointProfile = EndpointProfile {
+    scope: EndpointScope::OfflineTest { port: 0 },
+};
 
 const _: () = assert!(
     BENCHMARK_ENDPOINT_PROFILE.same_configuration(DAEMON_ENDPOINT_PROFILE),
@@ -900,7 +902,7 @@ async fn main() {
         .await
         .report(bytes);
         raw_client.close().await;
-        let _ = raw_router.shutdown().await;
+        raw_router.shutdown().await.unwrap();
 
         // --- the holder-side seed cost, on a THROWAWAY provider ------------
         // Its own provider because `seed` is repeated: five 110 MiB blobs would
@@ -908,18 +910,18 @@ async fn main() {
         // bench must not be the reason a later RSS measurement (TASK-65) reads
         // high.
         {
-            let scratch = IrohProvider::spawn().await.expect("provider spawns");
+            let scratch = IrohProviderNode::spawn().await.expect("provider spawns");
             time_arm("provider_seed", || async {
                 scratch.seed(data).await.expect("seed succeeds");
                 Detail::default()
             })
             .await
             .report(bytes);
-            scratch.shutdown().await;
+            scratch.shutdown().await.unwrap();
         }
 
         // --- the provider the fetch arms read from -------------------------
-        let provider = IrohProvider::spawn().await.expect("provider spawns");
+        let provider = IrohProviderNode::spawn().await.expect("provider spawns");
         let digest = provider.seed(data).await.expect("seed succeeds");
         let addr = provider_addr(&provider).expect("provider has a dialable address");
 
@@ -996,10 +998,10 @@ async fn main() {
             }
         }
 
-        let client = IrohTransport::spawn().await.expect("client spawns");
+        let client = IrohClientNode::spawn().await.expect("client spawns");
         client.add_peer(&provider.addr().await.expect("provider addr"));
         let offer = KnownTransport::Iroh {
-            node: provider.node_id(),
+            node: provider.node_id().expect("live provider identity"),
         };
         time_arm("daemon_fetch", || async {
             let got = client
@@ -1013,8 +1015,8 @@ async fn main() {
         .report(bytes);
 
         bare.close().await;
-        client.shutdown().await;
-        provider.shutdown().await;
+        client.shutdown().await.expect("client shutdown");
+        provider.shutdown().await.expect("provider shutdown");
     }
 }
 

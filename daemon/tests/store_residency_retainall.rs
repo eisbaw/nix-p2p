@@ -10,7 +10,7 @@ mod residency_support;
 
 use std::time::Duration;
 
-use daemon::{IrohProvider, StoreResidency, StoreRetention};
+use daemon::{IrohProviderNode, StoreResidency, StoreRetention};
 use residency_support::{PAYLOAD_BYTES, synth_raw_nar};
 
 #[tokio::test(flavor = "multi_thread")]
@@ -22,7 +22,7 @@ async fn residency_oracle_reads_the_store_not_the_release_request() {
     let nar = synth_raw_nar(&vec![0x33u8; PAYLOAD_BYTES]);
     let nar_len = nar.len() as u64;
 
-    let provider = IrohProvider::spawn_with_retention(StoreRetention::RetainAll)
+    let provider = IrohProviderNode::spawn_with_retention(StoreRetention::RetainAll)
         .await
         .expect("provider spawns");
     provider.seed(&nar).await.expect("seed succeeds");
@@ -46,5 +46,5 @@ async fn residency_oracle_reads_the_store_not_the_release_request() {
          what the STORE holds, not what the caller asked for"
     );
 
-    provider.shutdown().await;
+    provider.shutdown().await.unwrap();
 }

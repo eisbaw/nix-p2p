@@ -32,6 +32,7 @@ use tokio::net::TcpListener;
 use crate::body::{empty, full};
 use crate::cacheinfo::CacheInfo;
 use crate::catalog::{CorrelationStore, NarCatalog, parse_correlation};
+use crate::iroh_runtime::TaskSupervisorHandle;
 use crate::rewrite;
 use crate::source::{
     NarBody, NarHash, NarKey, NarPathToken, NarSource, NarinfoSource, RawUpstream, SourceError,
@@ -73,12 +74,16 @@ pub struct App {
 
 /// Serve on an already-bound listener until it errors. Binding is the caller's
 /// job so tests can grab an OS-assigned port (`127.0.0.1:0`) and read it back.
-pub async fn serve(listener: TcpListener, app: Arc<App>) -> std::io::Result<()> {
+pub async fn serve(
+    listener: TcpListener,
+    app: Arc<App>,
+    supervisor: TaskSupervisorHandle,
+) -> std::io::Result<()> {
     loop {
         let (stream, _peer) = listener.accept().await?;
         let io = TokioIo::new(stream);
         let app = Arc::clone(&app);
-        tokio::spawn(async move {
+        let registration = supervisor.spawn("http-connection", async move {
             let service = service_fn(move |req| {
                 let app = Arc::clone(&app);
                 async move { Ok::<_, Infallible>(handle(req, app).await) }
@@ -91,6 +96,19 @@ pub async fn serve(listener: TcpListener, app: Arc<App>) -> std::io::Result<()> 
                 }
             }
         });
+        if let Err(error) = registration {
+            if error.is_capacity_exhausted() {
+                // The accepted stream is owned by the rejected future and is
+                // dropped here, giving this connection an immediate EOF while
+                // keeping the listener available for recovery.
+                eprintln!("HTTP-CONNECTION-DECLINED reason=busy error={error}");
+                continue;
+            }
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::BrokenPipe,
+                format!("HTTP task supervisor is unavailable: {error}"),
+            ));
+        }
     }
 }
 

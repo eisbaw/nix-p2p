@@ -63,10 +63,11 @@
 //!
 //! Answering "yes" used to be free of any obligation - the provider could only
 //! serve blobs that had been eagerly seeded into it, so a positive answer for one
-//! of 108k registered paths meant dial-then-fail. [`AvailabilityIndex::supply_size`]
-//! and [`AvailabilityIndex::supply_raw_nar`] close that: a yes now implies a
-//! regenerable NAR, because both are answered from the same registration through
-//! the same materialisation check. Both are per-digest probes; nothing lists.
+//! of 108k registered paths meant dial-then-fail. The inert [`SupplyCatalogHandle`]
+//! closes that: a yes publishes a regenerable provider record before it returns.
+//! [`AvailabilityIndex::supply_size_cancellable`] and
+//! [`AvailabilityIndex::supply_raw_nar_cancellable`] expose the same mapping to
+//! synchronous availability consumers.
 //!
 //! ## Honest limits (forward-carried)
 //!
@@ -93,9 +94,13 @@
 
 use std::collections::BTreeMap;
 use std::collections::HashMap;
+use std::ffi::OsString;
 use std::fmt;
+use std::io::Read;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use crate::claim::{
     BatchHoldAnswer, BatchHoldQuery, BatchHoldResponse, CLAIM_SCHEMA_VERSION, Claim,
@@ -103,6 +108,11 @@ use crate::claim::{
     MAX_BATCH_HOLD_KEYS, NarHashKey, QUERY_SCHEMA_VERSION, check_batch_keys,
 };
 use crate::content_id::Blake3Digest;
+use crate::process_group::{ProcessJob, ProcessJobSpec};
+use crate::supply_catalog::{
+    NarProductionSource, SupplyCatalog, SupplyCatalogHandle, SupplyCatalogRecord,
+    SupplyRegistration,
+};
 use crate::transport::NodeId;
 
 // -------------------------------------------------------------------------
@@ -211,9 +221,40 @@ impl From<PersistError> for AvailabilityError {
 /// It returns the RAW bytes rather than a digest on purpose: the frozen recipe
 /// [`Blake3Digest::from_raw_nar`] is then applied in EXACTLY ONE place (the index),
 /// so the addressed-unit recipe is never re-implemented per dumper.
-pub trait NarDumper: Send + Sync {
+pub trait CancellationCheck: Send + Sync {
+    fn is_cancelled(&self) -> bool;
+}
+
+struct NeverCancelled;
+
+impl CancellationCheck for NeverCancelled {
+    fn is_cancelled(&self) -> bool {
+        false
+    }
+}
+
+mod nar_dumper_sealed {
+    use super::{NarProductionSource, StorePath};
+
+    pub trait Sealed {
+        fn production_source(&self, path: &StorePath) -> NarProductionSource;
+    }
+}
+
+/// Closed NAR-production boundary.
+///
+/// This trait is public so callers can pass daemon-owned dumpers through the
+/// availability API, but it is sealed: arbitrary in-process implementations
+/// cannot enter the provider's supervised blocking pool. Every implementation
+/// below either checks cancellation while doing bounded regular-file reads or
+/// owns a killable process group and reaps it before returning.
+pub trait NarDumper: nar_dumper_sealed::Sealed + Send + Sync {
     /// Dump the store path's uncompressed NAR (the addressed unit's input bytes).
-    fn dump(&self, path: &StorePath) -> Result<Vec<u8>, DumpError>;
+    fn dump(
+        &self,
+        path: &StorePath,
+        cancellation: &dyn CancellationCheck,
+    ) -> Result<Vec<u8>, DumpError>;
 }
 
 /// The REAL dumper: shells out to `nix-store --dump <path>` and returns its stdout
@@ -226,6 +267,15 @@ pub trait NarDumper: Send + Sync {
 /// recipe change.
 pub struct CommandNarDumper {
     program: PathBuf,
+}
+
+impl nar_dumper_sealed::Sealed for CommandNarDumper {
+    fn production_source(&self, path: &StorePath) -> NarProductionSource {
+        NarProductionSource::Process {
+            program: self.program.clone(),
+            args: vec![OsString::from("--dump"), path.as_path().as_os_str().into()],
+        }
+    }
 }
 
 impl CommandNarDumper {
@@ -245,18 +295,51 @@ impl CommandNarDumper {
 }
 
 impl NarDumper for CommandNarDumper {
-    fn dump(&self, path: &StorePath) -> Result<Vec<u8>, DumpError> {
-        let output = std::process::Command::new(&self.program)
-            .arg("--dump")
-            .arg(path.as_path())
-            .output()
-            .map_err(|e| {
-                DumpError(format!(
-                    "could not spawn {} --dump {}: {e}",
+    fn dump(
+        &self,
+        path: &StorePath,
+        cancellation: &dyn CancellationCheck,
+    ) -> Result<Vec<u8>, DumpError> {
+        if cancellation.is_cancelled() {
+            return Err(DumpError(format!(
+                "{} --dump {} cancelled before spawn",
+                self.program.display(),
+                path
+            )));
+        }
+        let job = ProcessJob::standalone(
+            format!("{} --dump {}", self.program.display(), path),
+            ProcessJobSpec {
+                program: self.program.clone(),
+                args: vec![OsString::from("--dump"), path.as_path().as_os_str().into()],
+                environment: Vec::new(),
+                stdout_limit: None,
+                stderr_limit: 64 * 1024,
+            },
+        )
+        .map_err(|error| DumpError(format!("starting supervised dump: {error}")))?;
+        let output = loop {
+            if cancellation.is_cancelled() {
+                job.cancel();
+                let cleaned = job.wait().map_err(|error| {
+                    DumpError(format!(
+                        "{} --dump {} cancellation cleanup failed: {error}",
+                        self.program.display(),
+                        path
+                    ))
+                })?;
+                return Err(DumpError(format!(
+                    "{} --dump {} cancelled; process group killed and reaped (status {})",
                     self.program.display(),
-                    path
-                ))
-            })?;
+                    path,
+                    cleaned.status
+                )));
+            }
+            if let Some(result) = job.try_take_result() {
+                break result.map_err(|error| DumpError(error.to_string()))?;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        };
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
             return Err(DumpError(format!(
@@ -268,6 +351,119 @@ impl NarDumper for CommandNarDumper {
             )));
         }
         Ok(output.stdout)
+    }
+}
+
+/// Deterministic, cancellation-aware dumper for tests and in-memory probes.
+///
+/// Keeping this implementation in the closed set lets integration tests ground
+/// single-flight behavior without reopening the arbitrary-worker escape hatch.
+pub struct MemoryNarDumper {
+    bytes: Arc<Vec<u8>>,
+    calls: AtomicUsize,
+    delay: Duration,
+}
+
+impl MemoryNarDumper {
+    pub fn new(bytes: Vec<u8>) -> Self {
+        Self {
+            bytes: Arc::new(bytes),
+            calls: AtomicUsize::new(0),
+            delay: Duration::ZERO,
+        }
+    }
+
+    pub fn with_delay(bytes: Vec<u8>, delay: Duration) -> Self {
+        Self {
+            bytes: Arc::new(bytes),
+            calls: AtomicUsize::new(0),
+            delay,
+        }
+    }
+
+    pub fn calls(&self) -> usize {
+        self.calls.load(Ordering::Acquire)
+    }
+}
+
+impl nar_dumper_sealed::Sealed for MemoryNarDumper {
+    fn production_source(&self, _path: &StorePath) -> NarProductionSource {
+        NarProductionSource::Memory(Arc::clone(&self.bytes))
+    }
+}
+
+impl NarDumper for MemoryNarDumper {
+    fn dump(
+        &self,
+        _path: &StorePath,
+        cancellation: &dyn CancellationCheck,
+    ) -> Result<Vec<u8>, DumpError> {
+        self.calls.fetch_add(1, Ordering::AcqRel);
+        let deadline = std::time::Instant::now() + self.delay;
+        while std::time::Instant::now() < deadline {
+            if cancellation.is_cancelled() {
+                return Err(DumpError("in-memory NAR dump cancelled".into()));
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        if cancellation.is_cancelled() {
+            return Err(DumpError("in-memory NAR dump cancelled".into()));
+        }
+        Ok(self.bytes.as_ref().clone())
+    }
+}
+
+/// Read a store path that is itself a raw-NAR regular file.
+///
+/// The descriptor is opened nonblocking and no-follow, then validated before
+/// any read. A path replaced with a FIFO, device, socket or symlink therefore
+/// fails immediately instead of parking an unkillable in-process worker.
+pub struct RegularFileNarDumper;
+
+impl nar_dumper_sealed::Sealed for RegularFileNarDumper {
+    fn production_source(&self, path: &StorePath) -> NarProductionSource {
+        NarProductionSource::RegularFile(path.as_path().to_path_buf())
+    }
+}
+
+impl NarDumper for RegularFileNarDumper {
+    fn dump(
+        &self,
+        path: &StorePath,
+        cancellation: &dyn CancellationCheck,
+    ) -> Result<Vec<u8>, DumpError> {
+        use rustix::fs::{FileType, Mode, OFlags};
+
+        if cancellation.is_cancelled() {
+            return Err(DumpError(format!("reading {path} cancelled before open")));
+        }
+        let fd = rustix::fs::open(
+            path.as_path(),
+            OFlags::RDONLY | OFlags::NONBLOCK | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+            Mode::empty(),
+        )
+        .map_err(|error| DumpError(format!("opening raw NAR {path}: {error}")))?;
+        let stat = rustix::fs::fstat(&fd)
+            .map_err(|error| DumpError(format!("inspecting raw NAR {path}: {error}")))?;
+        if FileType::from_raw_mode(stat.st_mode) != FileType::RegularFile {
+            return Err(DumpError(format!("raw NAR {path} is not a regular file")));
+        }
+        let mut file = std::fs::File::from(fd);
+        let mut bytes = Vec::new();
+        let mut chunk = [0u8; 64 * 1024];
+        loop {
+            if cancellation.is_cancelled() {
+                return Err(DumpError(format!("reading raw NAR {path} cancelled")));
+            }
+            let read = file
+                .read(&mut chunk)
+                .map_err(|error| DumpError(format!("reading raw NAR {path}: {error}")))?;
+            if read == 0 {
+                break;
+            }
+            bytes.extend_from_slice(&chunk[..read]);
+        }
+        Ok(bytes)
     }
 }
 
@@ -425,6 +621,9 @@ pub struct DerivedNar {
 /// cache of what its dump derives.
 struct Entry {
     store_path: StorePath,
+    /// Scalar writer capability for this exact registration. It is never
+    /// cloned into a provider record.
+    supply_registration: SupplyRegistration,
     /// The derived [`DerivedNar`], computed UNDER this lock exactly once. The
     /// lock IS the single-flight guard: concurrent callers block here while the
     /// first one dumps + hashes.
@@ -445,9 +644,9 @@ pub struct AvailabilityIndex {
     /// mutation's disk write briefly serialises other mutations - an accepted
     /// latency-coupling limit for a small index (see the module-level honest limits).
     entries: Mutex<HashMap<NarHashKey, Arc<Entry>>>,
-    /// `Blake3Digest -> Entry`: the SUPPLY direction (task-72 AC#2). It is the
-    /// same entries, indexed the other way, and it is DERIVED - populated as a
-    /// side effect of computing a digest, never persisted, rebuilt on demand.
+    /// Provider-facing SUPPLY direction (task-72 AC#2). The catalog contains
+    /// inert records keyed by digest and scalar registration identity. It never
+    /// contains `Arc<Entry>` or an index callback, and is rebuilt on demand.
     ///
     /// WHY IT EXISTS AT ALL. Before task-72 the index could answer "do you hold
     /// NarHash k?" for every registered path while the provider could only serve
@@ -458,7 +657,7 @@ pub struct AvailabilityIndex {
     /// the caller already has, exactly like [`AvailabilityIndex::hold`], so the
     /// no-enumeration invariant is unchanged.
     ///
-    /// It is PRUNED with the registration it came from ([`Self::forget_supply_bindings`]),
+    /// It is PRUNED with the registration it came from ([`Self::retire_supply_registration`]),
     /// so supply can never outlive hold. Without that, a store path that was
     /// un-registered but still present on disk stayed fully servable - supply
     /// strictly larger than hold, which is AC#2 failing in the one direction that
@@ -468,7 +667,7 @@ pub struct AvailabilityIndex {
     /// in-memory, so after a restart a digest is unsuppliable until some
     /// hold-query re-derives it. Warming it at boot would mean re-dumping the
     /// whole store.
-    by_digest: Mutex<HashMap<Blake3Digest, Arc<Entry>>>,
+    supply_catalog: SupplyCatalog,
     dumper: Arc<dyn NarDumper>,
     store: Arc<dyn IndexStore>,
     announce: Arc<dyn AnnounceSink>,
@@ -484,12 +683,14 @@ impl AvailabilityIndex {
         announce: Arc<dyn AnnounceSink>,
     ) -> Result<Self, PersistError> {
         let loaded = store.load()?;
+        let supply_catalog = SupplyCatalog::default();
         let mut entries = HashMap::with_capacity(loaded.len());
         for (key, store_path) in loaded {
             entries.insert(
                 key,
                 Arc::new(Entry {
                     store_path,
+                    supply_registration: supply_catalog.register(),
                     digest: Mutex::new(None),
                 }),
             );
@@ -497,7 +698,7 @@ impl AvailabilityIndex {
         Ok(AvailabilityIndex {
             node_id,
             entries: Mutex::new(entries),
-            by_digest: Mutex::new(HashMap::new()),
+            supply_catalog,
             dumper,
             store,
             announce,
@@ -544,6 +745,7 @@ impl AvailabilityIndex {
                 key,
                 Arc::new(Entry {
                     store_path,
+                    supply_registration: self.supply_catalog.register(),
                     digest: Mutex::new(None),
                 }),
             );
@@ -553,7 +755,7 @@ impl AvailabilityIndex {
             // the AC#2 equality failing in the direction that matters (announcing a
             // serve for content the index has disowned).
             if let Some(replaced) = replaced {
-                self.forget_supply_bindings(&replaced);
+                self.retire_supply_registration(&replaced);
             }
             self.persist_locked(&entries)?;
         }
@@ -565,38 +767,76 @@ impl AvailabilityIndex {
     /// resolves to `Absent` and is pruned (materialisation/cleanup). There is no
     /// enumeration counterpart - only this per-key probe.
     pub fn hold(&self, key: &NarHashKey) -> Result<HoldAnswer, AvailabilityError> {
-        let entry = {
-            let entries = self.entries.lock().expect("entries mutex");
-            match entries.get(key) {
-                Some(entry) => Arc::clone(entry),
-                None => return Ok(HoldAnswer::Absent),
+        loop {
+            let entry = {
+                let entries = self.entries.lock().expect("entries mutex");
+                match entries.get(key) {
+                    Some(entry) => Arc::clone(entry),
+                    None => return Ok(HoldAnswer::Absent),
+                }
+            };
+
+            // Materialisation check: a GC'd path is no longer available. Prune the
+            // stale registration lazily. If a concurrent registration won, retry
+            // that new entry instead of returning a stale answer about the old one.
+            if !entry.store_path.exists() {
+                self.drop_if_same(key, &entry)?;
+                let entries = self.entries.lock().expect("entries mutex");
+                if entries.get(key).is_none() {
+                    return Ok(HoldAnswer::Absent);
+                }
+                continue;
             }
-        };
 
-        // Materialisation check: a GC'd path is no longer available. Prune the stale
-        // registration lazily and answer Absent. The prune is guarded by pointer
-        // identity: if a concurrent `register` replaced this key's entry (a fresh,
-        // possibly-materialised path) between the clone above and here, we must NOT
-        // delete that newer registration on the strength of the OLD entry's absence.
-        if !entry.store_path.exists() {
-            self.drop_if_same(key, &entry)?;
-            return Ok(HoldAnswer::Absent);
+            let derived = match self.derive(&entry) {
+                Ok(derived) => derived,
+                Err(error) => {
+                    let entries = self.entries.lock().expect("entries mutex");
+                    if entries
+                        .get(key)
+                        .is_some_and(|current| Arc::ptr_eq(current, &entry))
+                    {
+                        return Err(error);
+                    }
+                    drop(entries);
+                    continue;
+                }
+            };
+            let record = SupplyCatalogRecord {
+                declared_size: derived.nar_size_uncompressed_nar,
+                source: nar_dumper_sealed::Sealed::production_source(
+                    self.dumper.as_ref(),
+                    &entry.store_path,
+                ),
+                store_path: entry.store_path.as_path().to_path_buf(),
+            };
+
+            // Reacquire the registration map after the potentially slow dump.
+            // Replacement/prune and publication all use entries->catalog order.
+            // Pointer identity prevents a stale derivation from resurrecting a
+            // retired provider record.
+            let entries = self.entries.lock().expect("entries mutex");
+            let still_current = entries
+                .get(key)
+                .is_some_and(|current| Arc::ptr_eq(current, &entry));
+            if !still_current {
+                drop(entries);
+                continue;
+            }
+            if !self
+                .supply_catalog
+                .publish(&entry.supply_registration, derived.blake3, record)
+            {
+                return Err(AvailabilityError::Dump(DumpError(format!(
+                    "active registration for {key} was retired before supply publication"
+                ))));
+            }
+            drop(entries);
+            return Ok(HoldAnswer::Have {
+                blake3: derived.blake3,
+                offers: vec![self.iroh_offer()],
+            });
         }
-
-        let derived = self.derive(&entry)?;
-        // THE SUPPLY BINDING (task-72 AC#2). A positive hold-answer now also makes
-        // the content SERVABLE: the provider fetches by BLAKE3, and this is the
-        // only way back from that digest to the path it is regenerated from. The
-        // two sets - "what I answer yes about" and "what I can serve" - are made
-        // equal HERE, at the single place a yes is produced.
-        self.by_digest
-            .lock()
-            .expect("by-digest mutex")
-            .insert(derived.blake3, Arc::clone(&entry));
-        Ok(HoldAnswer::Have {
-            blake3: derived.blake3,
-            offers: vec![self.iroh_offer()],
-        })
     }
 
     /// The NarSize this node would produce for `blake3`, answered WITHOUT
@@ -608,16 +848,35 @@ impl AvailabilityIndex {
     /// SUPPLY at the same instant it drops out of [`Self::hold`], or the two sets
     /// diverge again in the one direction that matters (we would promise a serve
     /// we cannot perform).
-    pub fn supply_size(&self, blake3: &Blake3Digest) -> Option<u64> {
-        let entry = self.entry_for_digest(blake3)?;
-        if !entry.store_path.exists() {
-            return None;
+    pub fn supply_size_cancellable(
+        &self,
+        blake3: &Blake3Digest,
+        cancellation: &dyn CancellationCheck,
+    ) -> Result<Option<u64>, AvailabilityError> {
+        if cancellation.is_cancelled() {
+            return Err(AvailabilityError::Dump(DumpError(
+                "NAR size probe cancelled".into(),
+            )));
         }
-        entry
-            .digest
-            .lock()
-            .expect("digest mutex")
-            .map(|derived| derived.nar_size_uncompressed_nar)
+        let Some(record) = self.supply_catalog.read_handle().probe(blake3) else {
+            return Ok(None);
+        };
+        match std::fs::metadata(&record.store_path) {
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => {
+                return Err(AvailabilityError::Dump(DumpError(format!(
+                    "checking store path {} for supply: {error}",
+                    record.store_path.display()
+                ))));
+            }
+        }
+        if cancellation.is_cancelled() {
+            return Err(AvailabilityError::Dump(DumpError(
+                "NAR size probe cancelled".into(),
+            )));
+        }
+        Ok(Some(record.declared_size))
     }
 
     /// Regenerate the exact `RawNarV1` bytes for `blake3` from the real store.
@@ -628,18 +887,37 @@ impl AvailabilityIndex {
     /// it was announced under is not "close enough" - serving it would hand a peer
     /// the wrong blob under the right name, and the caller must decline rather
     /// than let iroh-blobs discover it mid-stream.
-    pub fn supply_raw_nar(&self, blake3: &Blake3Digest) -> Result<Vec<u8>, AvailabilityError> {
-        let entry = self.entry_for_digest(blake3).ok_or_else(|| {
-            AvailabilityError::Dump(DumpError(format!(
-                "no registered holding supplies {blake3}"
-            )))
-        })?;
-        let raw_nar = self.dumper.dump(&entry.store_path)?;
+    pub fn supply_raw_nar_cancellable(
+        &self,
+        blake3: &Blake3Digest,
+        cancellation: &dyn CancellationCheck,
+    ) -> Result<Vec<u8>, AvailabilityError> {
+        if cancellation.is_cancelled() {
+            return Err(AvailabilityError::Dump(DumpError(
+                "NAR supply cancelled".into(),
+            )));
+        }
+        let record = self
+            .supply_catalog
+            .read_handle()
+            .probe(blake3)
+            .ok_or_else(|| {
+                AvailabilityError::Dump(DumpError(format!(
+                    "no registered holding supplies {blake3}"
+                )))
+            })?;
+        let store_path = StorePath::new(record.store_path);
+        let raw_nar = self.dumper.dump(&store_path, cancellation)?;
+        if cancellation.is_cancelled() {
+            return Err(AvailabilityError::Dump(DumpError(
+                "NAR supply cancelled".into(),
+            )));
+        }
         let actual = Blake3Digest::from_raw_nar(&raw_nar);
         if actual != *blake3 {
             return Err(AvailabilityError::Dump(DumpError(format!(
                 "{} now dumps to {actual}, not the announced {blake3}",
-                entry.store_path
+                store_path
             ))));
         }
         Ok(raw_nar)
@@ -652,23 +930,14 @@ impl AvailabilityIndex {
     /// was removed, and matching on the digest would mean recomputing it (a dump)
     /// on a path whose whole purpose is to forget. Called with the `entries` lock
     /// held, which fixes the lock order as entries-then-by_digest everywhere.
-    fn forget_supply_bindings(&self, gone: &Arc<Entry>) {
-        self.by_digest
-            .lock()
-            .expect("by-digest mutex")
-            .retain(|_, entry| !Arc::ptr_eq(entry, gone));
+    fn retire_supply_registration(&self, gone: &Arc<Entry>) {
+        self.supply_catalog.retire(&gone.supply_registration);
     }
 
-    /// The reverse lookup, and the ONLY way into `by_digest`. Deliberately private
-    /// and deliberately per-digest: there is no method that yields the map, its
-    /// keys or its length, so the no-enumeration invariant survives the addition
-    /// of a supply path.
-    fn entry_for_digest(&self, blake3: &Blake3Digest) -> Option<Arc<Entry>> {
-        self.by_digest
-            .lock()
-            .expect("by-digest mutex")
-            .get(blake3)
-            .map(Arc::clone)
+    /// Return the inert, read-only provider catalog. It cannot derive, mutate,
+    /// persist, announce, or reach an [`AvailabilityIndex`] entry.
+    pub fn supply_catalog(&self) -> SupplyCatalogHandle {
+        self.supply_catalog.read_handle()
     }
 
     /// The versioned wire envelope for a [`HoldQuery`] probe: the same yes/no
@@ -808,10 +1077,10 @@ impl AvailabilityIndex {
     /// re-registered entry. Persist-ordering caveat as in [`register`](Self::register):
     /// on a save failure the in-memory removal has already happened while disk still
     /// has the entry, so a restart reloads it; the caller sees the `Err`.
-    pub fn drop(&self, key: &NarHashKey) -> Result<(), PersistError> {
+    pub fn unregister(&self, key: &NarHashKey) -> Result<(), PersistError> {
         let mut entries = self.entries.lock().expect("entries mutex");
         if let Some(removed) = entries.remove(key) {
-            self.forget_supply_bindings(&removed);
+            self.retire_supply_registration(&removed);
             self.persist_locked(&entries)?;
         }
         Ok(())
@@ -826,7 +1095,7 @@ impl AvailabilityIndex {
         match entries.get(key) {
             Some(current) if Arc::ptr_eq(current, observed) => {
                 entries.remove(key);
-                self.forget_supply_bindings(observed);
+                self.retire_supply_registration(observed);
                 self.persist_locked(&entries)?;
             }
             // A concurrent register replaced (or a concurrent drop already removed)
@@ -846,7 +1115,7 @@ impl AvailabilityIndex {
         if let Some(derived) = *slot {
             return Ok(derived);
         }
-        let raw_nar = self.dumper.dump(&entry.store_path)?;
+        let raw_nar = self.dumper.dump(&entry.store_path, &NeverCancelled)?;
         // The frozen recipe, applied in exactly one place: BLAKE3(RawNarV1), plain
         // and unkeyed, over the uncompressed dump - matches the task-48 golden. The
         // NarSize is read off the SAME buffer rather than stat'ed separately, so it
@@ -875,5 +1144,20 @@ impl AvailabilityIndex {
             .map(|(key, entry)| (*key, entry.store_path.clone()))
             .collect();
         self.store.save(&snapshot)
+    }
+}
+
+impl Drop for AvailabilityIndex {
+    fn drop(&mut self) {
+        // A provider may retain a read handle after the index owner is dropped.
+        // Explicitly retire every current registration so that handle becomes
+        // inert instead of extending availability state by accident.
+        let entries = match self.entries.lock() {
+            Ok(entries) => entries,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        for entry in entries.values() {
+            self.supply_catalog.retire(&entry.supply_registration);
+        }
     }
 }

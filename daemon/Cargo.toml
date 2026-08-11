@@ -29,7 +29,10 @@ path = "src/main.rs"
 # edge, so a follower arriving after the leader published cannot miss the wakeup
 # and hang. A bare notification has that lost-wakeup window; a poll loop does not,
 # but spends latency to avoid it. No new crate - tokio is already here.
-tokio = { version = "1", features = ["rt-multi-thread", "net", "macros", "io-util", "time", "sync"] }
+# `signal` (TASK-115): SIGINT/SIGTERM must drive the daemon-owned Iroh runtime's
+# bounded shutdown path; dropping the runtime at process teardown would bypass
+# handler cancellation and the named deadline.
+tokio = { version = "1", features = ["rt-multi-thread", "net", "macros", "io-util", "time", "sync", "signal", "process"] }
 hyper = { version = "1", features = ["http1", "server", "client"] }
 hyper-util = { version = "0.1", features = ["tokio"] }
 http = "1"
@@ -80,6 +83,12 @@ iroh-blobs = "0.103"
 # convergence denylist is unaffected).
 bao-tree = "0.16"
 n0-future = "0.3"
+# TASK-115 identity persistence uses descriptor-relative, no-follow filesystem
+# operations. `std::fs::rename` may overwrite a concurrently-created identity,
+# and path-based validation has a symlink-swap window. rustix is already in the
+# locked Iroh closure; making it direct lets us use openat + renameat2(NOREPLACE)
+# without unsafe code or a second implementation of the race-sensitive parts.
+rustix = { version = "1", features = ["fs", "process"] }
 
 [dev-dependencies]
 # process: spawn the real testproxy binary for the fault-mode loop (AC#2).

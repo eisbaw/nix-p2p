@@ -66,7 +66,7 @@ mod residency_support;
 
 use std::time::Duration;
 
-use daemon::{IrohProvider, StoreResidency, StoreRetention};
+use daemon::{IrohProviderNode, StoreResidency, StoreRetention};
 use residency_support::{
     PAYLOAD_BYTES, poll_until_released, rss_hwm_says_released, store_says_released, synth_raw_nar,
     vm_bytes,
@@ -74,7 +74,7 @@ use residency_support::{
 
 #[tokio::test(flavor = "multi_thread")]
 async fn residency_oracle_discriminates_release_from_allocator_retention() {
-    let provider = IrohProvider::spawn_with_retention(StoreRetention::ReleaseOnRequest {
+    let provider = IrohProviderNode::spawn_with_retention(StoreRetention::ReleaseOnRequest {
         sweep_interval: Duration::from_millis(50),
     })
     .await
@@ -217,5 +217,5 @@ async fn residency_oracle_discriminates_release_from_allocator_retention() {
         store_says_released(retained),
     );
 
-    provider.shutdown().await;
+    provider.shutdown().await.unwrap();
 }

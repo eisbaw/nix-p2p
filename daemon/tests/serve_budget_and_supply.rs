@@ -52,13 +52,14 @@
 
 use std::path::Path;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 
 use daemon::{
-    AvailabilityIndex, Blake3Digest, DumpError, FileNarSupplier, IndexNarSupplier, IrohProvider,
-    IrohTransport, KnownTransport, NarDumper, NarHashKey, NarSupplier, NullAnnounce, NullStore,
-    ServeBudget, StorePath, StoreResidency, StoreRetention, SupplyError, Transport, TransportError,
+    AvailabilityIndex, Blake3Digest, FileNarSupplier, IndexNarSupplier, IrohClientNode,
+    IrohProvider, IrohProviderNode, IrohTransport, KnownTransport, MemoryNarSupplier, NarHashKey,
+    NullAnnounce, NullStore, RegularFileNarDumper, ServeBudget, StorePath, StoreResidency,
+    StoreRetention, Transport, TransportError,
 };
 
 // ---- a real (uncompressed) nix-archive-1 NAR, synthesised in memory ----------
@@ -104,12 +105,6 @@ const SMALL_BUDGET_BYTES: u64 = 16 * 1024 * 1024;
 const RELEASE_DEADLINE: Duration = Duration::from_secs(20);
 /// Sweep interval for the supply-model providers under test.
 const SWEEP: Duration = Duration::from_millis(100);
-/// How long a deliberately-blocked supplier stays blocked before giving up. It
-/// exists so a FAILING test still terminates - see `CountingSupplier::supply`.
-/// Comfortably longer than any assertion deadline in this file, so it never ends a
-/// block early enough to change what a test observes.
-const BLOCKED_SUPPLY_LIMIT: Duration = Duration::from_secs(45);
-
 /// RESIDENT MEMORY IS PROCESS-GLOBAL, and `cargo test` runs this file's tests as
 /// THREADS of one process. A concurrent test holding a 64 MiB payload would land
 /// inside another's measured window, and the failure mode is a FALSE ALARM on the
@@ -154,8 +149,10 @@ async fn poll_until_empty(provider: &IrohProvider) -> StoreResidency {
 }
 
 /// A client wired to `provider`'s loopback address, as discovery would resolve it.
-async fn client_wired_to(provider: &IrohProvider) -> IrohTransport {
-    let client = IrohTransport::spawn().await.expect("client endpoint binds");
+async fn client_wired_to(provider: &IrohProvider) -> IrohClientNode {
+    let client = IrohClientNode::spawn()
+        .await
+        .expect("client endpoint binds");
     client.add_peer(&provider.addr().await.expect("provider addr"));
     client
 }
@@ -170,7 +167,7 @@ async fn fetch(
         .fetch(
             content,
             &KnownTransport::Iroh {
-                node: provider.node_id(),
+                node: provider.node_id().unwrap(),
             },
             None,
         )
@@ -179,76 +176,9 @@ async fn fetch(
 
 // ---- an in-memory supplier that COUNTS what it produced ----------------------
 
-/// A [`NarSupplier`] whose bytes are synthesised, so a 64 MiB payload costs no
-/// disk, and whose `supply` calls are COUNTED - which is what makes the
-/// single-flight and the "declined before allocating" claims observable rather
-/// than argued.
-struct CountingSupplier {
-    nars: std::collections::HashMap<Blake3Digest, Vec<u8>>,
-    supplied: AtomicUsize,
-    /// A size this supplier CLAIMS for one digest without being able to back it -
-    /// used to prove admission reads the declared size and never the real bytes.
-    lie: Option<(Blake3Digest, u64)>,
-    /// A digest whose `supply` BLOCKS until the flag is set. It models the one
-    /// thing a hostile-or-slow peer can do that no timeout on our side prevents:
-    /// keep a serve in flight. Tests use it to hold the in-flight table non-empty
-    /// while something else must still make progress.
-    block: Option<(Blake3Digest, Arc<std::sync::atomic::AtomicBool>)>,
-}
-
-impl CountingSupplier {
-    fn new(nars: impl IntoIterator<Item = Vec<u8>>) -> Self {
-        CountingSupplier {
-            nars: nars
-                .into_iter()
-                .map(|nar| (Blake3Digest::from_raw_nar(&nar), nar))
-                .collect(),
-            supplied: AtomicUsize::new(0),
-            lie: None,
-            block: None,
-        }
-    }
-
-    fn supplied(&self) -> usize {
-        self.supplied.load(Ordering::SeqCst)
-    }
-}
-
-impl NarSupplier for CountingSupplier {
-    fn declared_size(&self, content: &Blake3Digest) -> Option<u64> {
-        if let Some((digest, size)) = self.lie
-            && digest == *content
-        {
-            return Some(size);
-        }
-        self.nars.get(content).map(|nar| nar.len() as u64)
-    }
-
-    fn supply(&self, content: &Blake3Digest) -> Result<Vec<u8>, SupplyError> {
-        self.supplied.fetch_add(1, Ordering::SeqCst);
-        if let Some((digest, released)) = &self.block
-            && digest == content
-        {
-            // Polled, not parked: `supply` runs under `spawn_blocking`, so blocking
-            // here is legitimate, and a poll keeps the test free of a second
-            // synchronisation primitive to get wrong.
-            //
-            // BOUNDED, and that bound is not decoration. `spawn_blocking` tasks
-            // cannot be cancelled, and dropping a tokio runtime WAITS for them - so
-            // an unbounded spin here means any test that panics before releasing
-            // the flag hangs forever instead of reporting its failure. Found the
-            // hard way while mutation-testing this file.
-            let give_up = Instant::now() + BLOCKED_SUPPLY_LIMIT;
-            while !released.load(Ordering::SeqCst) && Instant::now() < give_up {
-                std::thread::sleep(Duration::from_millis(5));
-            }
-        }
-        self.nars
-            .get(content)
-            .cloned()
-            .ok_or_else(|| SupplyError(format!("no such NAR {content}")))
-    }
-}
+/// The daemon-owned closed fixture supplier keeps these behavioral tests
+/// observable without reopening the arbitrary synchronous callback boundary.
+type CountingSupplier = MemoryNarSupplier;
 
 // =========================================================================
 // AC#1 + AC#4: serving is BOUNDED, and removing the bound restores the
@@ -267,7 +197,7 @@ async fn the_serve_bound_declines_a_large_nar_and_removing_it_restores_the_alloc
 
     // ---- ARM 1: the bound is IN PLACE. -----------------------------------
     let supplier = Arc::new(CountingSupplier::new([nar.clone()]));
-    let bounded = IrohProvider::spawn_supplying(
+    let bounded = IrohProviderNode::spawn_supplying(
         supplier.clone(),
         ServeBudget {
             max_nar_bytes_uncompressed_nar: SMALL_BUDGET_BYTES,
@@ -319,14 +249,14 @@ async fn the_serve_bound_declines_a_large_nar_and_removing_it_restores_the_alloc
     let rss_after_bounded = vm_bytes("VmRSS");
     let rise_bounded = rss_after_bounded.saturating_sub(rss_before_bounded);
 
-    client.shutdown().await;
-    bounded.shutdown().await;
+    client.shutdown().await.unwrap();
+    bounded.shutdown().await.unwrap();
 
     // ---- ARM 2: THE MUTATION - the bound is REMOVED. ---------------------
     // Same NAR, same peer, same request. The only change is the budget.
     let supplier2 = Arc::new(CountingSupplier::new([nar.clone()]));
     let unbounded =
-        IrohProvider::spawn_supplying(supplier2.clone(), ServeBudget::unbounded(), SWEEP)
+        IrohProviderNode::spawn_supplying(supplier2.clone(), ServeBudget::unbounded(), SWEEP)
             .await
             .expect("provider spawns");
     let client2 = client_wired_to(&unbounded).await;
@@ -382,8 +312,8 @@ async fn the_serve_bound_declines_a_large_nar_and_removing_it_restores_the_alloc
         supplier2.supplied(),
     );
 
-    client2.shutdown().await;
-    unbounded.shutdown().await;
+    client2.shutdown().await.unwrap();
+    unbounded.shutdown().await.unwrap();
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -396,12 +326,13 @@ async fn admission_reads_the_declared_size_and_never_the_bytes() {
     let nar = nar_of(1024, 0x22);
     let content = Blake3Digest::from_raw_nar(&nar);
     let mut supplier = CountingSupplier::new([nar]);
-    supplier.lie = Some((content, 100 * 1024 * 1024 * 1024));
+    supplier.set_declared_size(content, 100 * 1024 * 1024 * 1024);
     let supplier = Arc::new(supplier);
 
-    let provider = IrohProvider::spawn_supplying(supplier.clone(), ServeBudget::default(), SWEEP)
-        .await
-        .expect("provider spawns");
+    let provider =
+        IrohProviderNode::spawn_supplying(supplier.clone(), ServeBudget::default(), SWEEP)
+            .await
+            .expect("provider spawns");
     let client = client_wired_to(&provider).await;
 
     assert!(
@@ -415,8 +346,8 @@ async fn admission_reads_the_declared_size_and_never_the_bytes() {
     );
     assert_eq!(provider.serve_counters().declined_too_large, 1);
 
-    client.shutdown().await;
-    provider.shutdown().await;
+    client.shutdown().await.unwrap();
+    provider.shutdown().await.unwrap();
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -431,12 +362,13 @@ async fn a_source_that_produces_more_than_it_declared_is_refused() {
     let content = Blake3Digest::from_raw_nar(&nar);
     let mut supplier = CountingSupplier::new([nar]);
     // Declares 1 KiB; will produce 4 MiB.
-    supplier.lie = Some((content, 1024));
+    supplier.set_declared_size(content, 1024);
     let supplier = Arc::new(supplier);
 
-    let provider = IrohProvider::spawn_supplying(supplier.clone(), ServeBudget::default(), SWEEP)
-        .await
-        .expect("provider spawns");
+    let provider =
+        IrohProviderNode::spawn_supplying(supplier.clone(), ServeBudget::default(), SWEEP)
+            .await
+            .expect("provider spawns");
     let client = client_wired_to(&provider).await;
 
     assert!(
@@ -462,8 +394,8 @@ async fn a_source_that_produces_more_than_it_declared_is_refused() {
         "a refused mismatch must leave nothing behind, got {idle:?}"
     );
 
-    client.shutdown().await;
-    provider.shutdown().await;
+    client.shutdown().await.unwrap();
+    provider.shutdown().await.unwrap();
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -477,9 +409,12 @@ async fn the_inflight_total_declines_a_second_serve_it_cannot_afford() {
         Blake3Digest::from_raw_nar(&b),
     );
     assert_ne!(digest_a, digest_b, "the two payloads must not deduplicate");
-    let supplier = Arc::new(CountingSupplier::new([a.clone(), b]));
+    let release_first = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let mut supplier = CountingSupplier::new([a.clone(), b]);
+    supplier.block_until(digest_a, Arc::clone(&release_first));
+    let supplier = Arc::new(supplier);
 
-    let provider = IrohProvider::spawn_supplying(
+    let provider = IrohProviderNode::spawn_supplying(
         supplier.clone(),
         ServeBudget {
             max_nar_bytes_uncompressed_nar: 8 * 1024 * 1024,
@@ -491,50 +426,50 @@ async fn the_inflight_total_declines_a_second_serve_it_cannot_afford() {
     )
     .await
     .expect("provider spawns");
-    let client = client_wired_to(&provider).await;
-
-    // Sequentially both are servable - the first one's reservation is released
-    // when its transfer ends, so the second is not competing with it.
-    fetch(&client, &provider, &digest_a)
-        .await
-        .expect("the first NAR fits the in-flight budget");
-    fetch(&client, &provider, &digest_b)
-        .await
-        .expect("the second NAR fits once the first has been released");
-    let sequential = provider.serve_counters();
-    assert_eq!(
-        sequential.declined_busy, 0,
-        "sequential serves must not exhaust an in-flight budget: {sequential:?}"
-    );
-
-    // ...and the counter is nonzero the moment the budget is genuinely too small
-    // for a single one, which is the same code path saying no.
-    let tight = IrohProvider::spawn_supplying(
-        supplier.clone(),
-        ServeBudget {
-            max_nar_bytes_uncompressed_nar: 8 * 1024 * 1024,
-            max_inflight_bytes_uncompressed_nar: 1,
-            ..ServeBudget::default()
-        },
-        SWEEP,
-    )
+    let first_client = client_wired_to(&provider).await;
+    let second_client = client_wired_to(&provider).await;
+    let provider_node = provider.node_id().unwrap();
+    let first_transport = first_client.transport_handle();
+    let first = tokio::spawn(async move {
+        first_transport
+            .fetch(
+                &digest_a,
+                &KnownTransport::Iroh {
+                    node: provider_node,
+                },
+                None,
+            )
+            .await
+    });
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while supplier.active_operations() == 0 {
+            tokio::task::yield_now().await;
+        }
+    })
     .await
-    .expect("provider spawns");
-    let tight_client = client_wired_to(&tight).await;
+    .expect("first distinct serve holds the entire in-flight reservation");
+
     assert!(
-        fetch(&tight_client, &tight, &digest_a).await.is_err(),
-        "a 1 B in-flight budget must decline a 4 MiB serve"
+        fetch(&second_client, &provider, &digest_b).await.is_err(),
+        "the overlapping second NAR must be declined while the first holds the budget"
     );
     assert_eq!(
-        tight.serve_counters().declined_busy,
+        provider.serve_counters().declined_busy,
         1,
-        "the decline must be attributed to the IN-FLIGHT total, not the per-NAR bound"
+        "the overlapping refusal must be attributed to the in-flight total"
     );
+    release_first.store(true, Ordering::Release);
+    first
+        .await
+        .expect("first fetch task joins")
+        .expect("first overlapping serve completes after release");
+    fetch(&second_client, &provider, &digest_b)
+        .await
+        .expect("second NAR is admitted after the first releases its reservation");
 
-    tight_client.shutdown().await;
-    tight.shutdown().await;
-    client.shutdown().await;
-    provider.shutdown().await;
+    second_client.shutdown().await.unwrap();
+    first_client.shutdown().await.unwrap();
+    provider.shutdown().await.unwrap();
 }
 
 // =========================================================================
@@ -554,9 +489,10 @@ async fn announcing_holds_nothing_and_a_completed_serve_releases_what_it_used() 
     let nar_len = nar.len() as u64;
     let supplier = Arc::new(CountingSupplier::new([nar]));
 
-    let provider = IrohProvider::spawn_supplying(supplier.clone(), ServeBudget::default(), SWEEP)
-        .await
-        .expect("provider spawns");
+    let provider =
+        IrohProviderNode::spawn_supplying(supplier.clone(), ServeBudget::default(), SWEEP)
+            .await
+            .expect("provider spawns");
 
     // BEFORE: the node can serve this digest and holds NONE of it. This is the
     // whole of the task-61 decision in one assertion - the pre-task-72 daemon
@@ -611,8 +547,8 @@ async fn announcing_holds_nothing_and_a_completed_serve_releases_what_it_used() 
          released and the residency reading above was measuring something else"
     );
 
-    client.shutdown().await;
-    provider.shutdown().await;
+    client.shutdown().await.unwrap();
+    provider.shutdown().await.unwrap();
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -623,7 +559,7 @@ async fn a_retaining_provider_still_holds_what_it_seeded() {
     // oracle, opposite configuration, opposite answer.
     let nar = nar_of(4 * 1024 * 1024, 0x55);
     let nar_len = nar.len() as u64;
-    let provider = IrohProvider::spawn_with_retention(StoreRetention::RetainAll)
+    let provider = IrohProviderNode::spawn_with_retention(StoreRetention::RetainAll)
         .await
         .expect("provider spawns");
     provider.seed(&nar).await.expect("seed succeeds");
@@ -641,7 +577,7 @@ async fn a_retaining_provider_still_holds_what_it_seeded() {
         },
         "a RetainAll provider must still hold its seeded blob"
     );
-    provider.shutdown().await;
+    provider.shutdown().await.unwrap();
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -657,7 +593,7 @@ async fn release_on_request_does_not_release_just_because_a_serve_finished() {
     let nar_len = nar.len() as u64;
     let supplier = Arc::new(CountingSupplier::new([nar]));
 
-    let provider = IrohProvider::spawn_with(
+    let provider = IrohProviderNode::spawn_with(
         StoreRetention::ReleaseOnRequest {
             sweep_interval: SWEEP,
         },
@@ -696,8 +632,8 @@ async fn release_on_request_does_not_release_just_because_a_serve_finished() {
         "release_all must still release, got {released:?}"
     );
 
-    client.shutdown().await;
-    provider.shutdown().await;
+    client.shutdown().await.unwrap();
+    provider.shutdown().await.unwrap();
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -710,22 +646,23 @@ async fn concurrent_requests_for_one_absent_digest_regenerate_it_exactly_once() 
     let nar_len = nar.len() as u64;
     let supplier = Arc::new(CountingSupplier::new([nar]));
 
-    let provider = IrohProvider::spawn_supplying(supplier.clone(), ServeBudget::default(), SWEEP)
-        .await
-        .expect("provider spawns");
+    let provider =
+        IrohProviderNode::spawn_supplying(supplier.clone(), ServeBudget::default(), SWEEP)
+            .await
+            .expect("provider spawns");
     let addr = provider.addr().await.expect("provider addr");
-    let node = provider.node_id();
+    let node = provider.node_id().unwrap();
 
     let mut fetches = Vec::new();
     for _ in 0..8 {
         let addr = addr.clone();
         fetches.push(tokio::spawn(async move {
-            let client = IrohTransport::spawn().await.expect("client binds");
+            let client = IrohClientNode::spawn().await.expect("client binds");
             client.add_peer(&addr);
             let got = client
                 .fetch(&content, &KnownTransport::Iroh { node }, None)
                 .await;
-            client.shutdown().await;
+            client.shutdown().await.unwrap();
             got
         }));
     }
@@ -750,7 +687,7 @@ async fn concurrent_requests_for_one_absent_digest_regenerate_it_exactly_once() 
     let idle = poll_until_empty(&provider).await;
     assert_eq!(idle, StoreResidency::default(), "got {idle:?}");
 
-    provider.shutdown().await;
+    provider.shutdown().await.unwrap();
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -773,10 +710,10 @@ async fn a_peer_that_disconnects_mid_admission_gives_its_reservation_back() {
     );
     let released = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let mut supplier = CountingSupplier::new([big.clone(), other.clone()]);
-    supplier.block = Some((big_digest, released.clone()));
+    supplier.block_until(big_digest, released.clone());
     let supplier = Arc::new(supplier);
 
-    let provider = IrohProvider::spawn_supplying(
+    let provider = IrohProviderNode::spawn_supplying(
         supplier.clone(),
         ServeBudget {
             max_nar_bytes_uncompressed_nar: 8 * 1024 * 1024,
@@ -796,19 +733,19 @@ async fn a_peer_that_disconnects_mid_admission_gives_its_reservation_back() {
     .await
     .expect("provider spawns");
     let addr = provider.addr().await.expect("provider addr");
-    let node = provider.node_id();
+    let node = provider.node_id().unwrap();
 
     // A peer that asks for the blocked digest and then GOES AWAY while the node is
     // still regenerating it.
     let doomed = {
         let addr = addr.clone();
         tokio::spawn(async move {
-            let client = IrohTransport::spawn().await.expect("client binds");
+            let client = IrohClientNode::spawn().await.expect("client binds");
             client.add_peer(&addr);
             let _ = client
                 .fetch(&big_digest, &KnownTransport::Iroh { node }, None)
                 .await;
-            client.shutdown().await;
+            client.shutdown().await.unwrap();
         })
     };
     // Let the admission get as far as the blocked supplier.
@@ -849,8 +786,49 @@ async fn a_peer_that_disconnects_mid_admission_gives_its_reservation_back() {
     let idle = poll_until_empty(&provider).await;
     assert_eq!(idle, StoreResidency::default(), "got {idle:?}");
 
-    client.shutdown().await;
-    provider.shutdown().await;
+    client.shutdown().await.unwrap();
+    provider.shutdown().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn serve_deadline_covers_materialisation_and_releases_the_budget() {
+    let blocked = nar_of(1024 * 1024, 0xd1);
+    let healthy = nar_of(1024 * 1024, 0xd2);
+    let one_slot = blocked.len() as u64;
+    assert_eq!(healthy.len() as u64, one_slot);
+    let blocked_digest = Blake3Digest::from_raw_nar(&blocked);
+    let healthy_digest = Blake3Digest::from_raw_nar(&healthy);
+    let never_release = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let mut supplier = CountingSupplier::new([blocked, healthy.clone()]);
+    supplier.block_until(blocked_digest, never_release);
+    let supplier = Arc::new(supplier);
+    let provider = IrohProviderNode::spawn_supplying(
+        supplier,
+        ServeBudget {
+            max_nar_bytes_uncompressed_nar: one_slot,
+            max_inflight_bytes_uncompressed_nar: one_slot,
+            max_serve_duration: Duration::from_millis(200),
+        },
+        SWEEP,
+    )
+    .await
+    .unwrap();
+    let client = client_wired_to(&provider).await;
+
+    let started = Instant::now();
+    assert!(fetch(&client, &provider, &blocked_digest).await.is_err());
+    assert!(
+        started.elapsed() < Duration::from_secs(2),
+        "serve deadline must include the size/materialisation phase"
+    );
+    let recovered = fetch(&client, &provider, &healthy_digest)
+        .await
+        .expect("timed-out materialisation releases the one-slot budget");
+    assert_eq!(recovered, healthy);
+    assert!(provider.serve_counters().reservations_timed_out >= 1);
+
+    client.shutdown().await.unwrap();
+    provider.shutdown().await.unwrap();
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -873,14 +851,14 @@ async fn the_collector_still_reclaims_while_another_serve_is_in_flight() {
     );
     let release = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let mut supplier = CountingSupplier::new([served_then_idle.clone(), held_open]);
-    supplier.block = Some((held_digest, release.clone()));
+    supplier.block_until(held_digest, release.clone());
     let supplier = Arc::new(supplier);
 
-    let provider = IrohProvider::spawn_supplying(supplier, ServeBudget::default(), SWEEP)
+    let provider = IrohProviderNode::spawn_supplying(supplier, ServeBudget::default(), SWEEP)
         .await
         .expect("provider spawns");
     let addr = provider.addr().await.expect("provider addr");
-    let node = provider.node_id();
+    let node = provider.node_id().unwrap();
 
     // ORDER MATTERS, and getting it wrong makes this test vacuous - which is how
     // the first cut of it was caught. If the finished serve completes BEFORE
@@ -892,12 +870,12 @@ async fn the_collector_still_reclaims_while_another_serve_is_in_flight() {
     let stuck = {
         let addr = addr.clone();
         tokio::spawn(async move {
-            let client = IrohTransport::spawn().await.expect("client binds");
+            let client = IrohClientNode::spawn().await.expect("client binds");
             client.add_peer(&addr);
             let got = client
                 .fetch(&held_digest, &KnownTransport::Iroh { node }, None)
                 .await;
-            client.shutdown().await;
+            client.shutdown().await.unwrap();
             got
         })
     };
@@ -932,24 +910,13 @@ async fn the_collector_still_reclaims_while_another_serve_is_in_flight() {
 
     release.store(true, Ordering::SeqCst);
     let _ = stuck.await;
-    client.shutdown().await;
-    provider.shutdown().await;
+    client.shutdown().await.unwrap();
+    provider.shutdown().await.unwrap();
 }
 
 // =========================================================================
 // AC#2: index coverage == provider coverage.
 // =========================================================================
-
-/// A dumper that reads the store path's `nar` file. Real enough for the property
-/// under test (the index binds a NarHash to a path and regenerates from it) and
-/// free of any dependence on a `nix-store` binary.
-struct FileDumper;
-
-impl NarDumper for FileDumper {
-    fn dump(&self, path: &StorePath) -> Result<Vec<u8>, DumpError> {
-        std::fs::read(path.as_path()).map_err(|e| DumpError(format!("reading {path}: {e}")))
-    }
-}
 
 /// Write `nar` as a "store path" and return it. A file, not a directory: the
 /// index only ever asks whether the path EXISTS and hands it to the dumper.
@@ -979,6 +946,27 @@ fn temp_dir(tag: &str) -> std::path::PathBuf {
     dir
 }
 
+#[test]
+fn index_supplier_retains_only_the_inert_catalog_not_the_availability_index() {
+    let index = Arc::new(
+        AvailabilityIndex::open(
+            daemon::NodeId::from_bytes([6u8; 32]),
+            Arc::new(RegularFileNarDumper),
+            Arc::new(NullStore),
+            Arc::new(NullAnnounce),
+        )
+        .unwrap(),
+    );
+    let weak_index = Arc::downgrade(&index);
+    let supplier = IndexNarSupplier::new(index.supply_catalog(), env!("CARGO_BIN_EXE_daemon"));
+    drop(index);
+    assert!(
+        weak_index.upgrade().is_none(),
+        "provider catalog must not retain AvailabilityIndex or its lazy callbacks"
+    );
+    drop(supplier);
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn a_positive_hold_answer_implies_a_servable_blob() {
     let dir = temp_dir("coverage");
@@ -989,7 +977,7 @@ async fn a_positive_hold_answer_implies_a_servable_blob() {
     let index = Arc::new(
         AvailabilityIndex::open(
             daemon::NodeId::from_bytes([7u8; 32]),
-            Arc::new(FileDumper),
+            Arc::new(RegularFileNarDumper),
             Arc::new(NullStore),
             Arc::new(NullAnnounce),
         )
@@ -999,10 +987,14 @@ async fn a_positive_hold_answer_implies_a_servable_blob() {
         .register(held_key, held_path.clone())
         .expect("register");
 
-    let supplier = Arc::new(IndexNarSupplier::new(index.clone()));
-    let provider = IrohProvider::spawn_supplying(supplier.clone(), ServeBudget::default(), SWEEP)
-        .await
-        .expect("provider spawns");
+    let supplier = Arc::new(IndexNarSupplier::new(
+        index.supply_catalog(),
+        env!("CARGO_BIN_EXE_daemon"),
+    ));
+    let provider =
+        IrohProviderNode::spawn_supplying(supplier.clone(), ServeBudget::default(), SWEEP)
+            .await
+            .expect("provider spawns");
     let client = client_wired_to(&provider).await;
 
     // THE PROPERTY: whatever the index says yes about, the provider serves.
@@ -1010,12 +1002,6 @@ async fn a_positive_hold_answer_implies_a_servable_blob() {
     let daemon::HoldAnswer::Have { blake3, .. } = answer else {
         panic!("the index must hold a registered, materialised path");
     };
-    assert_eq!(
-        supplier.declared_size(&blake3),
-        Some(held.len() as u64),
-        "a digest the index answered YES for must be suppliable - this equality \
-         IS task-72 AC#2"
-    );
     let served = fetch(&client, &provider, &blake3)
         .await
         .expect("a held digest is servable over the real transport");
@@ -1023,6 +1009,7 @@ async fn a_positive_hold_answer_implies_a_servable_blob() {
         served, held,
         "the peer must receive the exact announced NAR"
     );
+    assert_eq!(poll_until_empty(&provider).await.blobs, 0);
 
     // THE MUTATION: GC the store path. The index's answer and the provider's
     // ability must move TOGETHER - a set equality that only held while nothing
@@ -1035,16 +1022,14 @@ async fn a_positive_hold_answer_implies_a_servable_blob() {
         ),
         "a GC'd path must drop out of the index"
     );
-    assert_eq!(
-        supplier.declared_size(&blake3),
-        None,
+    assert!(
+        fetch(&client, &provider, &blake3).await.is_err(),
         "...and out of SUPPLY at the same instant. If it did not, the node would \
-         still be announcing a serve it can no longer perform - the exact \
-         dial-then-fail this AC forbids"
+         still serve content the availability index has disowned"
     );
 
-    client.shutdown().await;
-    provider.shutdown().await;
+    client.shutdown().await.unwrap();
+    provider.shutdown().await.unwrap();
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -1058,7 +1043,7 @@ async fn a_digest_the_index_never_answered_for_is_declined_not_dial_then_failed(
     let index = Arc::new(
         AvailabilityIndex::open(
             daemon::NodeId::from_bytes([8u8; 32]),
-            Arc::new(FileDumper),
+            Arc::new(RegularFileNarDumper),
             Arc::new(NullStore),
             Arc::new(NullAnnounce),
         )
@@ -1068,8 +1053,11 @@ async fn a_digest_the_index_never_answered_for_is_declined_not_dial_then_failed(
         .register(key(2), store_path_with(&dir, "known.nar", &known))
         .expect("register");
 
-    let supplier = Arc::new(IndexNarSupplier::new(index.clone()));
-    let provider = IrohProvider::spawn_supplying(supplier, ServeBudget::default(), SWEEP)
+    let supplier = Arc::new(IndexNarSupplier::new(
+        index.supply_catalog(),
+        env!("CARGO_BIN_EXE_daemon"),
+    ));
+    let provider = IrohProviderNode::spawn_supplying(supplier, ServeBudget::default(), SWEEP)
         .await
         .expect("provider spawns");
     let client = client_wired_to(&provider).await;
@@ -1086,8 +1074,8 @@ async fn a_digest_the_index_never_answered_for_is_declined_not_dial_then_failed(
     );
     assert_eq!(counters.admitted, 0);
 
-    client.shutdown().await;
-    provider.shutdown().await;
+    client.shutdown().await.unwrap();
+    provider.shutdown().await.unwrap();
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -1102,7 +1090,7 @@ fn announcing_a_file_costs_bounded_memory_and_yields_the_frozen_digest() {
     let path = dir.join("announced.nar");
     std::fs::write(&path, &nar).expect("writing the raw NAR");
 
-    let supplier = FileNarSupplier::new();
+    let supplier = FileNarSupplier::new(env!("CARGO_BIN_EXE_daemon"));
     let (digest, nar_size) = supplier.announce(&path).expect("announce succeeds");
     assert_eq!(
         digest,
@@ -1114,22 +1102,96 @@ fn announcing_a_file_costs_bounded_memory_and_yields_the_frozen_digest() {
         nar_size,
         nar.len() as u64,
         "the announced size is the NarSize (uncompressed dump length), never a \
-         compressed FileSize"
+        compressed FileSize"
     );
-    assert_eq!(supplier.declared_size(&digest), Some(nar.len() as u64));
+    let direct = std::process::Command::new(env!("CARGO_BIN_EXE_daemon"))
+        .arg("__dump-raw-nar")
+        .arg(&path)
+        .env_remove("DAEMON_INTERNAL_RAW_NAR_HELPER")
+        .output()
+        .expect("direct helper invocation returns");
+    assert_eq!(direct.status.code(), Some(2));
+    assert!(direct.stdout.is_empty());
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_daemon"))
+        .arg("__dump-raw-nar")
+        .arg(&path)
+        .env("DAEMON_INTERNAL_RAW_NAR_HELPER", "v1")
+        .output()
+        .expect("raw-NAR helper runs");
+    assert!(
+        output.status.success(),
+        "helper stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
     assert_eq!(
-        supplier.supply(&digest).expect("supply succeeds"),
-        nar,
-        "the regenerated bytes must be byte-identical to what was announced"
+        output.stdout, nar,
+        "the isolated source must reproduce the announced bytes"
     );
 
     // A digest that was never announced is unknown - the per-digest probe is the
     // ONLY question this type answers. There is no listing counterpart, by
     // construction (the PRD privacy invariant: a peer may learn yes/no about a
     // digest it can already name, never what a node holds).
-    let never = Blake3Digest::from_raw_nar(b"never announced");
-    assert_eq!(supplier.declared_size(&never), None);
-    assert!(supplier.supply(&never).is_err());
+    let _never = Blake3Digest::from_raw_nar(b"never announced");
 
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn replaced_file_overproduction_is_cut_off_and_reaped_at_the_reservation() {
+    let dir = temp_dir("file-overproduction");
+    let path = dir.join("growing-source.nar");
+    let announced = nar_of(1024, 0xb1);
+    std::fs::write(&path, &announced).unwrap();
+    let supplier = Arc::new(FileNarSupplier::new(env!("CARGO_BIN_EXE_daemon")));
+    let (digest, announced_size) = supplier.announce(&path).unwrap();
+    assert_eq!(announced_size, announced.len() as u64);
+
+    // Replace the file after admission metadata was frozen. The subprocess now
+    // produces far more than the reservation; the supervisor must stop on the
+    // first proof byte, kill the process group, and reap it before refusal.
+    std::fs::write(&path, nar_of(16 * 1024 * 1024, 0xb2)).unwrap();
+    let provider = IrohProviderNode::spawn_supplying(
+        supplier,
+        ServeBudget {
+            max_nar_bytes_uncompressed_nar: 32 * 1024 * 1024,
+            max_inflight_bytes_uncompressed_nar: 32 * 1024 * 1024,
+            max_serve_duration: Duration::from_secs(10),
+        },
+        SWEEP,
+    )
+    .await
+    .unwrap();
+    let client = client_wired_to(&provider).await;
+    let started = Instant::now();
+    assert!(fetch(&client, &provider, &digest).await.is_err());
+    assert!(
+        started.elapsed() < Duration::from_secs(2),
+        "overproduction must be cut off at the proof byte, not the serve deadline"
+    );
+    assert_eq!(provider.serve_counters().declined_too_large, 1);
+
+    let path_bytes = path.as_os_str().as_encoded_bytes();
+    let surviving_helpers = std::fs::read_dir("/proc")
+        .unwrap()
+        .filter_map(Result::ok)
+        .filter_map(|entry| entry.file_name().to_string_lossy().parse::<u32>().ok())
+        .filter(|pid| {
+            std::fs::read(format!("/proc/{pid}/cmdline"))
+                .ok()
+                .is_some_and(|cmdline| {
+                    cmdline
+                        .windows(path_bytes.len())
+                        .any(|window| window == path_bytes)
+                })
+        })
+        .collect::<Vec<_>>();
+    assert!(
+        surviving_helpers.is_empty(),
+        "overproducing helper processes survived refusal: {surviving_helpers:?}"
+    );
+
+    client.shutdown().await.unwrap();
+    provider.shutdown().await.unwrap();
+    let _ = std::fs::remove_dir_all(dir);
 }

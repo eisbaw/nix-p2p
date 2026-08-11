@@ -27,8 +27,9 @@
 //! each test synthesises its own valid `nix-archive-1` NAR in memory.
 
 use daemon::{
-    Blake3Digest, IROH_BLOBS_ALPN, IrohProvider, IrohTransport, KnownTransport, NodeId, Transport,
-    TransportError, TransportTag, iroh_blobs_alpn, verify_blake3,
+    Blake3Digest, IROH_BLOBS_ALPN, IrohClientNode, IrohProvider, IrohProviderNode, IrohTransport,
+    KnownTransport, NodeId, Transport, TransportError, TransportTag, iroh_blobs_alpn,
+    verify_blake3,
 };
 use sha2::{Digest, Sha256};
 
@@ -72,15 +73,17 @@ fn sha256_hex(bytes: &[u8]) -> String {
 
 /// Build a client transport already wired to `provider`'s loopback address, as a
 /// discovery layer (task-40) would resolve the provider's `NodeId` to an address.
-async fn client_wired_to(provider: &IrohProvider) -> IrohTransport {
-    let client = IrohTransport::spawn().await.expect("client endpoint binds");
+async fn client_wired_to(provider: &IrohProvider) -> IrohClientNode {
+    let client = IrohClientNode::spawn()
+        .await
+        .expect("client endpoint binds");
     client.add_peer(&provider.addr().await.expect("provider addr"));
     client
 }
 
 fn iroh_offer(provider: &IrohProvider) -> KnownTransport {
     KnownTransport::Iroh {
-        node: provider.node_id(),
+        node: provider.node_id().unwrap(),
     }
 }
 
@@ -91,7 +94,7 @@ async fn honest_iroh_fetch_passes_both_gates() {
     let nar = synth_raw_nar(b"AC#1: the honest whole-NAR payload node B holds");
 
     // PROVIDER (node B): content-addressed put -> the digest is BLAKE3(RawNarV1).
-    let provider = IrohProvider::spawn()
+    let provider = IrohProviderNode::spawn()
         .await
         .expect("provider endpoint binds");
     let content = provider.seed(&nar).await.expect("seed the raw NAR");
@@ -124,8 +127,8 @@ async fn honest_iroh_fetch_passes_both_gates() {
         "gate 2 (sha256==NarHash) holds on the fetched bytes"
     );
 
-    provider.shutdown().await;
-    client.shutdown().await;
+    provider.shutdown().await.unwrap();
+    client.shutdown().await.unwrap();
 }
 
 // ---- S6 oracle: the PROVIDER-side byte counter grounds "peer-served" --------
@@ -138,7 +141,7 @@ async fn honest_iroh_fetch_passes_both_gates() {
 #[tokio::test]
 async fn provider_byte_counter_grounds_the_peer_served_bytes() {
     let nar = synth_raw_nar(b"S6: the whole-NAR node B actually serves node A");
-    let provider = IrohProvider::spawn().await.expect("provider binds");
+    let provider = IrohProviderNode::spawn().await.expect("provider binds");
     let content = provider.seed(&nar).await.expect("seed the raw NAR");
 
     // Before any fetch: nothing served (the absent-before analogue for the counter).
@@ -180,8 +183,8 @@ async fn provider_byte_counter_grounds_the_peer_served_bytes() {
         "exactly one completed transfer served"
     );
 
-    provider.shutdown().await;
-    client.shutdown().await;
+    provider.shutdown().await.unwrap();
+    client.shutdown().await.unwrap();
 }
 
 // ---- AC#2 bite (a): a holder that cannot honestly serve the requested id ----
@@ -195,7 +198,7 @@ async fn provider_byte_counter_grounds_the_peer_served_bytes() {
 #[tokio::test]
 async fn wrong_content_id_fails_closed_over_real_iroh() {
     let held = synth_raw_nar(b"bite(a): the only NAR node B actually holds");
-    let provider = IrohProvider::spawn().await.expect("provider binds");
+    let provider = IrohProviderNode::spawn().await.expect("provider binds");
     let held_id = provider.seed(&held).await.expect("seed");
 
     // The client asks for a DIFFERENT identity the provider does NOT hold.
@@ -210,8 +213,8 @@ async fn wrong_content_id_fails_closed_over_real_iroh() {
         Err(other) => panic!("expected a fail-closed transport error, got {other:?}"),
     }
 
-    provider.shutdown().await;
-    client.shutdown().await;
+    provider.shutdown().await.unwrap();
+    client.shutdown().await.unwrap();
 }
 
 // ---- AC#2 bite (b): a DIFFERENT valid NAR passes gate 1 but fails gate 2 -----
@@ -229,7 +232,7 @@ async fn a_different_valid_nar_passes_gate1_but_fails_gate2() {
     let sub_content = Blake3Digest::from_raw_nar(&substituted);
 
     // The lying holder serves the substituted (but internally valid) blob.
-    let provider = IrohProvider::spawn().await.expect("provider binds");
+    let provider = IrohProviderNode::spawn().await.expect("provider binds");
     let seeded = provider.seed(&substituted).await.expect("seed substituted");
     assert_eq!(seeded, sub_content);
 
@@ -254,8 +257,8 @@ async fn a_different_valid_nar_passes_gate1_but_fails_gate2() {
     // and it is not the wanted bytes.
     assert_ne!(got, wanted);
 
-    provider.shutdown().await;
-    client.shutdown().await;
+    provider.shutdown().await.unwrap();
+    client.shutdown().await.unwrap();
 }
 
 // ---- AC#4: ALPN cross-check + NodeId ed25519 curve-point validation ---------
@@ -279,13 +282,13 @@ fn frozen_alpn_equals_the_real_iroh_blobs_constant() {
 async fn a_real_provider_node_id_is_a_valid_ed25519_point() {
     // The task-48 freeze deferred ed25519 curve-point validation to here (it
     // needs the iroh key constructor). A real provider's NodeId must validate...
-    let provider = IrohProvider::spawn().await.expect("provider binds");
-    let id = provider.node_id();
+    let provider = IrohProviderNode::spawn().await.expect("provider binds");
+    let id = provider.node_id().unwrap();
     assert!(
         IrohTransport::validate_node_id(&id).is_ok(),
         "a live iroh endpoint id must be a valid curve point"
     );
-    provider.shutdown().await;
+    provider.shutdown().await.unwrap();
 
     // ...and a NodeId whose 32 bytes are NOT a valid ed25519 curve point is
     // rejected. Roughly half of all 32-byte strings fail point decompression, so

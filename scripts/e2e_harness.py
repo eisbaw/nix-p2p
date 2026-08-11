@@ -618,6 +618,29 @@ class Pod:
             return []
         return ["--narinfo-cache-dir", DAEMON_STATE_MOUNT]
 
+    def _iroh_runtime_flags(self, role: str) -> list[str]:
+        """Hermetic Iroh runtime inputs for p2p scenarios.
+
+        Each daemon container has its own filesystem/state mount, so the same
+        in-container path is node-local. The explicit offline scope is part of
+        the test contract: no relay, address lookup, port mapping or public bind.
+        """
+        parent = DAEMON_STATE_MOUNT if self.state_root is not None else "/tmp"
+        try:
+            role_offset = self._daemon_roles().index(role)
+        except ValueError as error:
+            raise RuntimeError(
+                f"unknown daemon role for Iroh port: {role!r}"
+            ) from error
+        return [
+            "--iroh-state-dir",
+            f"{parent}/iroh",
+            "--iroh-endpoint-scope",
+            "offline-test",
+            "--iroh-port",
+            str(36000 + role_offset),
+        ]
+
     def _assert_no_secret_key_served(self) -> None:
         """AC#5, observed at the RIGHT boundary: walk the exact host tree that
         gets bind-mounted into the origin and assert no *.sec is under it.
@@ -819,6 +842,8 @@ class Pod:
                     "--upstream",
                     proxy,
                     "--iroh-provider",
+                    "--iroh-print-peer-address",
+                    *self._iroh_runtime_flags(role),
                     *self._daemon_state_flags(),
                     *seed_args,
                 ]
@@ -865,6 +890,7 @@ class Pod:
                 f"0.0.0.0:{node_a_port}",
                 "--upstream",
                 proxy,
+                *self._iroh_runtime_flags("node-a"),
                 *peer_args,
                 *claim_args,
                 *self._daemon_state_flags(),
@@ -877,8 +903,9 @@ class Pod:
     ) -> tuple[str, str, dict[str, str]]:
         """Poll `role`'s log for the provider's announced identity + seed content
         ids. Returns (node_id, dialable_sockets_csv, {seed_path: blake3}). Filters
-        the announced sockets to loopback IPv4 (the reliable in-pod address; the
-        codex-flagged IPv6 wildcard `[::]` is dropped)."""
+        the announced sockets to loopback IPv4 because the harness' peer format
+        uses that deterministic in-pod address; the offline profile's IPv6
+        loopback address is intentionally not needed here."""
         deadline = time.time() + READY_TIMEOUT_S
         addr_re = re.compile(r"IROH-PROVIDER-ADDR node_id=(\S+) sockets=(\S+)")
         seed_re = re.compile(r"IROH-SEED path=(\S+) bytes=\d+ blake3=(\S+)")
@@ -1380,12 +1407,96 @@ def _parse_client(result) -> ClientResult:
 # client script (base realise + optional post-crash integrity/orphan/verify
 # trailer). The scenarios themselves live in the SCENARIOS block below.
 
-# Sum the sizes of every in-progress NAR cache tmp file at the proxy. `stat`
-# ships in the image's coreutils; `find` does NOT, so the glob loop is bash.
-_TMP_SIZE_SNIPPET = (
-    "s=0; for f in /tmp/proxy-cache/.tmp/*; do "
-    '[ -f "$f" ] && s=$((s+$(stat -c %s "$f"))); done; echo "$s"'
-)
+# Sum every regular in-progress cache file without a shell test/stat race.
+# ENOENT between directory enumeration and stat is benign (the proxy completed
+# or discarded that file); every other metadata error is fatal and contextual.
+_TMP_SIZE_SNIPPET = r"""python3 - <<'PY'
+import os
+import stat
+import sys
+
+root = os.environ.get("NIX_P2P_TMP_PROBE_ROOT", "/tmp/proxy-cache/.tmp")
+test_mode = os.environ.get("NIX_P2P_TMP_PROBE_TEST", "")
+try:
+    entries = list(os.scandir(root))
+except FileNotFoundError:
+    entries = []
+except OSError as error:
+    print(f"tmp-byte probe cannot scan {root!r}: {error}", file=sys.stderr)
+    raise SystemExit(2)
+
+total = 0
+for entry in entries:
+    try:
+        if test_mode == "disappear":
+            os.unlink(entry.path)
+        elif test_mode == "permission":
+            raise PermissionError("injected metadata denial")
+        metadata = entry.stat(follow_symlinks=False)
+    except FileNotFoundError:
+        continue
+    except OSError as error:
+        print(f"tmp-byte probe cannot stat {entry.path!r}: {error}", file=sys.stderr)
+        raise SystemExit(2)
+    if stat.S_ISREG(metadata.st_mode):
+        total += metadata.st_size
+print(total)
+PY
+"""
+
+
+def _self_test_tmp_size_snippet() -> None:
+    """Exercise the exact production snippet's normal, ENOENT and hard-error paths."""
+    root = Path(os.environ.get("TMPDIR", "/tmp")) / (
+        f"nix-p2p-tmp-probe-selftest-{os.getpid()}"
+    )
+    with contextlib.suppress(FileNotFoundError):
+        shutil.rmtree(root)
+    root.mkdir(parents=True)
+
+    def probe(mode: str = "") -> subprocess.CompletedProcess[str]:
+        environment = os.environ.copy()
+        environment["NIX_P2P_TMP_PROBE_ROOT"] = str(root)
+        if mode:
+            environment["NIX_P2P_TMP_PROBE_TEST"] = mode
+        else:
+            environment.pop("NIX_P2P_TMP_PROBE_TEST", None)
+        return subprocess.run(
+            ["bash", "-c", _TMP_SIZE_SNIPPET],
+            text=True,
+            capture_output=True,
+            check=False,
+            env=environment,
+        )
+
+    try:
+        (root / "normal.tmp").write_bytes(b"abc")
+        normal = probe()
+        if normal.returncode != 0 or normal.stdout.strip() != "3":
+            die(
+                "tmp-byte probe self-test normal path failed: "
+                f"rc={normal.returncode} stdout={normal.stdout!r} stderr={normal.stderr!r}"
+            )
+
+        disappearing = probe("disappear")
+        if disappearing.returncode != 0 or disappearing.stdout.strip() != "0":
+            die(
+                "tmp-byte probe self-test ENOENT path failed: "
+                f"rc={disappearing.returncode} stdout={disappearing.stdout!r} "
+                f"stderr={disappearing.stderr!r}"
+            )
+
+        (root / "denied.tmp").write_bytes(b"x")
+        denied = probe("permission")
+        if denied.returncode == 0 or "injected metadata denial" not in denied.stderr:
+            die(
+                "tmp-byte probe self-test hard-error path did not fail closed: "
+                f"rc={denied.returncode} stdout={denied.stdout!r} stderr={denied.stderr!r}"
+            )
+    finally:
+        with contextlib.suppress(FileNotFoundError):
+            shutil.rmtree(root)
+
 
 # The crash client: same knobs as `_CLIENT_SCRIPT` plus a per-scenario
 # `{extra_opts}` slot (e.g. a pinned `stalled-download-timeout`), and an ORPHANS
@@ -3652,6 +3763,9 @@ def main() -> int:
         help="fixture publication root",
     )
     args = parser.parse_args()
+
+    _self_test_tmp_size_snippet()
+    print("e2e: tmp-byte probe self-test passed", file=sys.stderr)
 
     if args.list:
         for name, _ in SCENARIOS:
