@@ -14,6 +14,10 @@ path = "src/lib.rs"
 name = "daemon"
 path = "src/main.rs"
 
+[[bin]]
+name = "iroh-node-authority"
+path = "src/bin/iroh_node_authority.rs"
+
 # HTTP stack (task-4 decision): tokio + hyper 1.x LOW-LEVEL client/server, plus
 # body/util helpers. NOT axum/tower (a framework the wave-0 skeleton does not
 # need) and NOT reqwest (whose default gzip feature is the auto-decompression
@@ -74,6 +78,13 @@ blake3 = "1"
 # limit (PRD); the daemon dials direct addresses where it has them.
 iroh = "1"
 iroh-blobs = "0.103"
+# TASK-137 node-address publication reuses Iroh's pkarr signed-packet wire
+# format, but deliberately owns durability, acknowledgement and lifecycle.
+# `simple-dns` is needed because the interoperable `_iroh` address records and
+# the stricter nix-p2p metadata live at different names inside one signature.
+iroh-dns = "1"
+simple-dns = "0.11"
+url = "2.5"
 # task-51 safety envelope: the signed-NarSize abort must fire DURING the transfer,
 # so we drive `get_blob` as a STREAM (leaf-by-leaf) and stop the moment cumulative
 # bytes exceed the signed NarSize - never buffer a huge lying blob then check.

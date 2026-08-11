@@ -598,12 +598,15 @@ dependencies = [
  "hyper-util",
  "iroh",
  "iroh-blobs",
+ "iroh-dns",
  "n0-future",
  "rustix",
  "serde",
  "serde_json",
  "sha2 0.10.9",
+ "simple-dns",
  "tokio",
+ "url",
 ]
 
 [[package]]

@@ -27,9 +27,13 @@ pub mod claim;
 pub mod content_id;
 pub mod discovery;
 mod hexfmt;
+pub mod iroh_node_record;
+pub mod iroh_publication;
+pub mod iroh_publication_authority;
 pub mod iroh_runtime;
 pub mod narinfo_cache;
 mod nixbase32;
+mod pinned_http;
 mod process_group;
 pub mod rewrite;
 pub mod server;
@@ -62,6 +66,20 @@ pub use content_id::{
 pub use discovery::{
     DirectDiscovery, Discovery, FallbackNarSource, InMemoryDiscovery, InProcessPeerQuery,
     PROBE_TIMEOUT, PeerQuery, PeerQueryError,
+};
+pub use iroh_node_record::{
+    IROH_RECORD_NAME, MAX_NODE_LOCATIONS, METADATA_RECORD_NAME, NODE_PUBLICATION_SCHEMA,
+    NodeLocation, NodeRecord, NodeRecordError, PublicationState, decode_node_record,
+    encode_node_record,
+};
+pub use iroh_publication::{
+    NodePublicationCapability, NodePublicationConfig, NodePublicationHandle,
+    PUBLICATION_STARTUP_DEADLINE, PUBLICATION_STATE_FILENAME, PUBLICATION_TRANSITION_DEADLINE,
+    PublicationAuthorityAuthorization, PublicationError, PublicationErrorKind, PublicationReceipt,
+};
+pub use iroh_publication_authority::{
+    AUTHORITY_STATE_FILENAME, AuthorityError, AuthoritySignerAdmission, PublicationAuthority,
+    PublicationAuthorityConfig,
 };
 pub use iroh_runtime::{
     AddressLookupCapability, EndpointCapabilityState, EndpointProfile, EndpointScope,

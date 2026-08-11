@@ -97,6 +97,9 @@ test: build _python fixtures
     # mutation (a report stripped of its labels must be REJECTED).
     "${NIX_P2P_PYTHON}/bin/python3" scripts/scalefit.py --self-test
     "${NIX_P2P_PYTHON}/bin/python3" scripts/scale_sweep.py --self-test
+    # task-137: exercise routed-publication command safety and artifact mutation bites.
+    "${NIX_P2P_PYTHON}/bin/python3" scripts/iroh_node_publication_evidence.py --self-test
+    "${NIX_P2P_PYTHON}/bin/python3" scripts/finalize_iroh_node_publication.py --self-test
     # task-42: the profiler's unit gate (NarSize vs FileSize can never share an
     # unlabelled `_bytes` key), its S9 class-recovery bite (a known-O(n^2) law is
     # NEVER fitted linear), the disk walk and the arm scoring are all
@@ -300,3 +303,11 @@ iroh-bench: _toolchain
 # J1 operator journey (task-6): substitute through the daemon, then lose it.
 journey: _python fixtures-large
     "${NIX_P2P_PYTHON}/bin/python3" scripts/journey.py
+
+# Capture isolated routed Iroh node-publication evidence with an immutable image.
+iroh-publication-evidence image output="artifacts/iroh-publication" *ARGS: _python
+    "${NIX_P2P_PYTHON}/bin/python3" scripts/iroh_node_publication_evidence.py --image {{ quote(image) }} --output {{ quote(output) }} {{ ARGS }}
+
+# Finalize one passing raw publication run against its reviewed implementation commit.
+iroh-publication-artifact raw_run implementation_commit output="artifacts/iroh-node-publication-v1.json" *ARGS: _python
+    "${NIX_P2P_PYTHON}/bin/python3" scripts/finalize_iroh_node_publication.py --raw-run {{ quote(raw_run) }} --implementation-commit {{ quote(implementation_commit) }} --output {{ quote(output) }} {{ ARGS }}

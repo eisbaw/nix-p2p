@@ -30,13 +30,19 @@ use std::time::Duration;
 
 use iroh::endpoint::{Connection, NetReportConfig, PortmapperConfig, RelayMode, presets};
 use iroh::protocol::{DynProtocolHandler, ProtocolHandler, Router};
-use iroh::{Endpoint, EndpointAddr, SecretKey};
+use iroh::{Endpoint, EndpointAddr, SecretKey, Watcher};
+use n0_future::StreamExt;
 use rustix::fs::{self, AtFlags, FileType, Mode, OFlags};
 use rustix::io::Errno;
 use serde::{Deserialize, Serialize};
 use tokio::sync::{mpsc, oneshot, watch};
 use tokio::task::{AbortHandle, Id, JoinHandle, JoinSet};
 
+use crate::iroh_node_record::{NodeLocation, normalize_socket_addr};
+use crate::iroh_publication::{
+    NodePublicationCapability, NodePublicationHandle, NodePublicationRuntime,
+    PUBLICATION_STARTUP_DEADLINE, PUBLICATION_TRANSITION_DEADLINE,
+};
 use crate::process_group::{ProcessJobRegistry, ProcessJobSpec};
 use crate::transport::NodeId;
 
@@ -192,6 +198,7 @@ pub enum AddressLookupCapability {
 pub struct EndpointCapabilityState {
     pub relay_enabled: bool,
     pub address_lookup_services: usize,
+    pub node_publication_enabled: bool,
 }
 
 /// Fail-fast runtime construction and shutdown errors.
@@ -748,14 +755,17 @@ pub struct IrohRuntimeBuilder {
     identity: IdentitySource,
     relay: RelayCapability,
     address_lookup: AddressLookupCapability,
+    node_publication: NodePublicationCapability,
     protocols: BTreeMap<Vec<u8>, Box<dyn DynProtocolHandler>>,
     shutdown_deadline: Duration,
+    publication_startup_deadline: Option<tokio::time::Instant>,
     supervisor: TaskSupervisor,
 }
 
 impl fmt::Debug for IrohRuntimeBuilder {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("IrohRuntimeBuilder")
+        let mut debug = f.debug_struct("IrohRuntimeBuilder");
+        debug
             .field("profile", &self.profile)
             .field("identity", &self.identity)
             .field("relay", &self.relay)
@@ -766,8 +776,27 @@ impl fmt::Debug for IrohRuntimeBuilder {
             )
             .field("alpns", &self.protocols.keys().collect::<Vec<_>>())
             .field("shutdown_deadline", &self.shutdown_deadline)
-            .field("supervisor", &self.supervisor)
-            .finish()
+            .field(
+                "publication_startup_deadline_set",
+                &self.publication_startup_deadline.is_some(),
+            )
+            .field("supervisor", &self.supervisor);
+        match &self.node_publication {
+            NodePublicationCapability::Disabled => {
+                debug.field("node_publication", &"disabled");
+            }
+            NodePublicationCapability::Enabled(config) => {
+                // The external authorization reference is deliberately not
+                // formatted.  It is operator-supplied audit material and may
+                // contain identifiers unsuitable for generic Debug sinks.
+                debug
+                    .field("node_publication", &"enabled")
+                    .field("publication_namespace", &config.namespace())
+                    .field("publication_recipient", &config.authority_recipient())
+                    .field("publication_owner", &config.authorization().owner());
+            }
+        }
+        debug.finish()
     }
 }
 
@@ -815,8 +844,10 @@ impl IrohRuntimeBuilder {
             identity,
             relay,
             address_lookup,
+            node_publication: NodePublicationCapability::Disabled,
             protocols: BTreeMap::new(),
             shutdown_deadline: IROH_SHUTDOWN_DEADLINE,
+            publication_startup_deadline: None,
             supervisor: TaskSupervisor::new(),
         })
     }
@@ -834,7 +865,50 @@ impl IrohRuntimeBuilder {
                 self.address_lookup,
                 AddressLookupCapability::Memory
             )),
+            node_publication_enabled: matches!(
+                self.node_publication,
+                NodePublicationCapability::Enabled(_)
+            ),
         }
+    }
+
+    /// Attach only the separately authorized node-address publisher.  This
+    /// does not add an address lookup, relay, LAN, or content capability.
+    pub fn node_publication(
+        mut self,
+        capability: NodePublicationCapability,
+    ) -> Result<Self, IrohRuntimeError> {
+        let mut capability = capability;
+        if matches!(capability, NodePublicationCapability::Enabled(_)) {
+            if matches!(self.profile.scope, EndpointScope::OfflineTest { .. }) {
+                return Err(IrohRuntimeError::Configuration(
+                    "offline-test rejects node-publication capability injection".into(),
+                ));
+            }
+            if !matches!(self.identity, IdentitySource::Persistent { .. }) {
+                return Err(IrohRuntimeError::Configuration(
+                    "node publication requires a persistent identity/state directory".into(),
+                ));
+            }
+            if let NodePublicationCapability::Enabled(config) = &capability
+                && config.initial_locations().iter().any(|location| {
+                    matches!(location, crate::iroh_node_record::NodeLocation::Relay(_))
+                })
+                && !matches!(self.relay, RelayCapability::Enabled(_))
+            {
+                return Err(IrohRuntimeError::Configuration(
+                    "a published relay location requires the endpoint relay capability to be enabled explicitly"
+                        .into(),
+                ));
+            }
+            if matches!(self.relay, RelayCapability::Enabled(_))
+                && let NodePublicationCapability::Enabled(config) = &mut capability
+            {
+                config.authorize_relay_locations();
+            }
+        }
+        self.node_publication = capability;
+        Ok(self)
     }
 
     /// Register an application protocol, rejecting the silent replacement that
@@ -870,15 +944,60 @@ impl IrohRuntimeBuilder {
         Ok(self)
     }
 
+    /// Propagate a process-level publication deadline captured before product
+    /// configuration and provider preparation. Without this explicit input,
+    /// library callers receive the standard budget starting at `spawn`.
+    pub fn publication_startup_deadline(
+        mut self,
+        deadline: tokio::time::Instant,
+    ) -> Result<Self, IrohRuntimeError> {
+        if deadline <= tokio::time::Instant::now() {
+            return Err(IrohRuntimeError::Configuration(
+                "publication startup deadline has already elapsed".into(),
+            ));
+        }
+        self.publication_startup_deadline = Some(deadline);
+        Ok(self)
+    }
+
     pub async fn spawn(self) -> Result<IrohNodeRuntime, IrohRuntimeError> {
+        let startup_deadline = self
+            .publication_startup_deadline
+            .unwrap_or_else(|| tokio::time::Instant::now() + PUBLICATION_STARTUP_DEADLINE);
         let capabilities = self.capability_state();
-        let endpoint = bind_endpoint_with_lookups(
-            self.profile,
-            self.identity,
-            self.relay,
-            self.address_lookup,
-        )
-        .await?;
+        let publication_state_dir = match (&self.node_publication, &self.identity) {
+            (NodePublicationCapability::Enabled(_), IdentitySource::Persistent { state_dir }) => {
+                Some(state_dir.clone())
+            }
+            (NodePublicationCapability::Enabled(_), IdentitySource::Ephemeral) => {
+                return Err(IrohRuntimeError::Configuration(
+                    "node publication requires persistent identity state".into(),
+                ));
+            }
+            (NodePublicationCapability::Disabled, _) => None,
+        };
+        let secret_key = load_identity(self.identity)?;
+        let publication_key =
+            matches!(self.node_publication, NodePublicationCapability::Enabled(_))
+                .then(|| secret_key.clone());
+        let publication_plan = match (
+            self.node_publication,
+            publication_key,
+            publication_state_dir,
+        ) {
+            (NodePublicationCapability::Disabled, None, None) => None,
+            (NodePublicationCapability::Enabled(config), Some(key), Some(state_dir)) => {
+                Some((config, key, state_dir))
+            }
+            _ => {
+                return Err(IrohRuntimeError::Configuration(
+                    "node-publication capability state was internally inconsistent".into(),
+                ));
+            }
+        };
+        let endpoint =
+            bind_endpoint_with_secret(self.profile, secret_key, self.relay, self.address_lookup)
+                .await?;
         let supervisor_handle = self.supervisor.handle();
         let owner = Arc::new(EndpointOwner {
             endpoint,
@@ -894,14 +1013,188 @@ impl IrohRuntimeBuilder {
             router_builder = router_builder.accept(alpn, handler);
         }
         let router = router_builder.spawn();
+        let (publication, publication_address_watch) =
+            if let Some((config, key, state_dir)) = publication_plan {
+                let allowed_locations = config.initial_locations().to_vec();
+                let publication_start = async {
+                    let effective_locations = wait_for_initial_publication_locations(
+                        &owner.endpoint,
+                        &allowed_locations,
+                        startup_deadline,
+                    )
+                    .await?;
+                    NodePublicationRuntime::start_with_effective_locations(
+                        &state_dir,
+                        key,
+                        config,
+                        effective_locations,
+                        startup_deadline,
+                    )
+                    .await
+                };
+                match publication_start.await {
+                    Ok((publication, receipt)) => {
+                        let watcher = spawn_publication_address_watch(
+                            &owner.endpoint,
+                            publication.handle(),
+                            allowed_locations,
+                            receipt.record.locations.clone(),
+                        );
+                        (Some(publication), Some(watcher))
+                    }
+                    Err(error) => {
+                        self.supervisor.cancel_now();
+                        let endpoint = owner.endpoint.clone();
+                        let cleanup_deadline = tokio::time::Instant::now() + self.shutdown_deadline;
+                        let cleanup = tokio::time::timeout_at(cleanup_deadline, async {
+                            endpoint.close().await;
+                            router
+                                .shutdown()
+                                .await
+                                .map_err(|cleanup| cleanup.to_string())
+                        })
+                        .await;
+                        drop(owner);
+                        let cleanup = match cleanup {
+                            Ok(Ok(())) => "cleanup completed".to_string(),
+                            Ok(Err(cleanup)) => format!("router cleanup failed: {cleanup}"),
+                            Err(_) => format!("cleanup exceeded {:?}", self.shutdown_deadline),
+                        };
+                        return Err(IrohRuntimeError::Operation(format!(
+                            "starting node-address publication: {error}; {cleanup}"
+                        )));
+                    }
+                }
+            } else {
+                (None, None)
+            };
         Ok(IrohNodeRuntime {
             owner: Some(owner),
             router: Some(router),
             handle,
             shutdown_deadline: self.shutdown_deadline,
             supervisor: Some(self.supervisor),
+            publication,
+            publication_address_watch,
         })
     }
+}
+
+async fn wait_for_initial_publication_locations(
+    endpoint: &Endpoint,
+    allowed: &[NodeLocation],
+    absolute_deadline: tokio::time::Instant,
+) -> Result<Vec<NodeLocation>, crate::iroh_publication::PublicationError> {
+    let current = effective_publication_locations(allowed, &endpoint.addr());
+    if !current.is_empty() {
+        return Ok(current);
+    }
+    let mut updates = endpoint.watch_addr().stream();
+    loop {
+        let observed = tokio::time::timeout_at(absolute_deadline, updates.next())
+            .await
+            .map_err(|_| {
+                crate::iroh_publication::PublicationError::configuration(
+                    "startup deadline elapsed before any declared publication address was observed; refusing withdrawal-as-readiness",
+                )
+            })?
+            .ok_or_else(|| {
+                crate::iroh_publication::PublicationError::configuration(
+                    "endpoint address watch ended before any declared publication address was observed",
+                )
+            })?;
+        let effective = effective_publication_locations(allowed, &observed);
+        if !effective.is_empty() {
+            return Ok(effective);
+        }
+    }
+}
+
+fn effective_publication_locations(
+    allowed: &[NodeLocation],
+    observed: &EndpointAddr,
+) -> Vec<NodeLocation> {
+    let observed_ips = observed
+        .ip_addrs()
+        .copied()
+        .map(normalize_socket_addr)
+        .collect::<Vec<_>>();
+    let observed_relays = observed
+        .relay_urls()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>();
+    allowed
+        .iter()
+        .filter(|location| match location {
+            NodeLocation::Direct(address) => observed_ips.contains(address),
+            NodeLocation::Relay(url) => observed_relays.contains(url),
+        })
+        .cloned()
+        .collect()
+}
+
+fn publication_location_update_needed(
+    last_effective: &[NodeLocation],
+    next_effective: &[NodeLocation],
+) -> bool {
+    last_effective != next_effective
+}
+
+pub(crate) fn spawn_publication_address_watch(
+    endpoint: &Endpoint,
+    publication: NodePublicationHandle,
+    allowed: Vec<NodeLocation>,
+    initial_effective: Vec<NodeLocation>,
+) -> JoinHandle<()> {
+    let mut updates = endpoint.watch_addr().stream();
+    let closed = endpoint.closed();
+    tokio::spawn(async move {
+        tokio::pin!(closed);
+        let mut last_effective = initial_effective;
+        loop {
+            tokio::select! {
+                biased;
+                _ = &mut closed => {
+                    let error = crate::iroh_publication::PublicationError::new(
+                        crate::iroh_publication::PublicationErrorKind::Closed,
+                        "Iroh endpoint closed while node publication was still enabled",
+                    );
+                    eprintln!("IROH-NODE-PUBLICATION-FATAL source=endpoint-closed error={error}");
+                    publication.mark_fatal(error);
+                    break;
+                },
+                observed = updates.next() => {
+                    let Some(observed) = observed else {
+                        publication.mark_fatal(crate::iroh_publication::PublicationError::new(
+                            crate::iroh_publication::PublicationErrorKind::State,
+                            "endpoint address watch ended unexpectedly while publication was enabled",
+                        ));
+                        break;
+                    };
+                    let effective = effective_publication_locations(&allowed, &observed);
+                    if !publication_location_update_needed(&last_effective, &effective) {
+                        continue;
+                    }
+                    match publication.update_locations(effective).await {
+                        Err(error) => {
+                            eprintln!("IROH-NODE-PUBLICATION-FATAL source=address-watch error={error}");
+                            publication.mark_fatal(error);
+                            break;
+                        }
+                        Ok(receipt) => {
+                            last_effective = receipt.record.locations.clone();
+                            eprintln!(
+                                "IROH-NODE-PUBLICATION-ADDRESS-CHANGE state={:?} sequence={} locations={}",
+                                receipt.record.state,
+                                receipt.record.sequence,
+                                receipt.record.locations.len(),
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    })
 }
 
 fn format_alpn(alpn: &[u8]) -> String {
@@ -1039,10 +1332,19 @@ pub struct IrohNodeRuntime {
     handle: IrohEndpointHandle,
     shutdown_deadline: Duration,
     supervisor: Option<TaskSupervisor>,
+    publication: Option<NodePublicationRuntime>,
+    publication_address_watch: Option<JoinHandle<()>>,
 }
 
 impl Drop for IrohNodeRuntime {
     fn drop(&mut self) {
+        // A hard drop cannot promise a network withdrawal, but it does stop the
+        // refresh owner before endpoint/task cancellation. The signed TTL is the
+        // fail-safe for crashes; explicit `shutdown` performs the tombstone.
+        if let Some(watcher) = self.publication_address_watch.take() {
+            watcher.abort();
+        }
+        self.publication.take();
         if let Some(supervisor) = &self.supervisor {
             supervisor.cancel_now();
         }
@@ -1054,6 +1356,7 @@ impl fmt::Debug for IrohNodeRuntime {
         f.debug_struct("IrohNodeRuntime")
             .field("alive", &self.owner.is_some())
             .field("shutdown_deadline", &self.shutdown_deadline)
+            .field("publication_enabled", &self.publication.is_some())
             .finish()
     }
 }
@@ -1082,11 +1385,48 @@ impl IrohNodeRuntime {
         self.handle.capability_state()
     }
 
+    pub fn node_publication_handle(&self) -> Option<NodePublicationHandle> {
+        self.publication
+            .as_ref()
+            .map(NodePublicationRuntime::handle)
+    }
+
     pub async fn shutdown(mut self) -> Result<ShutdownOutcome, IrohRuntimeError> {
         let started_at = tokio::time::Instant::now();
         let absolute_deadline = started_at + self.shutdown_deadline;
         let force_reserve = std::cmp::min(self.shutdown_deadline / 2, Duration::from_millis(100));
         let graceful_deadline = absolute_deadline - force_reserve;
+        let mut task_errors = Vec::new();
+        if let Some(watcher) = self.publication_address_watch.take() {
+            if watcher.is_finished() {
+                if let Err(error) = watcher.await {
+                    task_errors.push(format!(
+                        "node-publication address watch terminated unexpectedly: {error}"
+                    ));
+                }
+            } else {
+                watcher.abort();
+                let _ = watcher.await;
+            }
+        }
+        if let Some(publication) = self.publication.take() {
+            if let Some(error) = publication.fatal_error() {
+                task_errors.push(format!("node-publication fatal health failure: {error}"));
+            }
+            let withdrawal_deadline = std::cmp::min(
+                graceful_deadline,
+                tokio::time::Instant::now() + PUBLICATION_TRANSITION_DEADLINE,
+            );
+            match publication.shutdown(withdrawal_deadline).await {
+                Ok(receipt) => eprintln!(
+                    "IROH-NODE-PUBLICATION-WITHDRAWN sequence={} locations={} visibility_ms={}",
+                    receipt.record.sequence,
+                    receipt.record.locations.len(),
+                    receipt.visibility_elapsed.as_millis(),
+                ),
+                Err(error) => task_errors.push(format!("node-publication withdrawal: {error}")),
+            }
+        }
         let router = self.router.take().ok_or_else(|| {
             IrohRuntimeError::Shutdown("runtime router was already taken".to_string())
         })?;
@@ -1143,7 +1483,6 @@ impl IrohNodeRuntime {
             }),
         });
 
-        let mut task_errors = Vec::new();
         if !forced {
             match tokio::time::timeout_at(
                 graceful_deadline,
@@ -1274,13 +1613,21 @@ async fn bind_endpoint_with_lookups(
     relay: RelayCapability,
     address_lookup: AddressLookupCapability,
 ) -> Result<Endpoint, IrohRuntimeError> {
+    let secret_key = load_identity(identity)?;
+    bind_endpoint_with_secret(profile, secret_key, relay, address_lookup).await
+}
+
+async fn bind_endpoint_with_secret(
+    profile: EndpointProfile,
+    secret_key: SecretKey,
+    relay: RelayCapability,
+    address_lookup: AddressLookupCapability,
+) -> Result<Endpoint, IrohRuntimeError> {
     // Snapshot at the last point before materialising Iroh configuration. A
     // Custom RelayMap has shared interior upstream; passing it through would let
     // an external alias silently change recipients after capability_state was
     // frozen. The endpoint receives only this fresh daemon-owned map.
     let relay = snapshot_relay_capability(relay)?;
-    let secret_key = load_identity(identity)?;
-
     // Minimal supplies the pinned crypto provider only. Every network-affecting
     // default is cleared/disabled here before the closed scope is applied.
     let mut builder = Endpoint::builder(presets::Minimal)
@@ -1479,7 +1826,7 @@ pub fn load_or_create_identity_with_hooks(
     Ok(key)
 }
 
-fn open_state_directory(state_dir: &Path) -> Result<(OwnedFd, bool), IrohRuntimeError> {
+pub(crate) fn open_state_directory(state_dir: &Path) -> Result<(OwnedFd, bool), IrohRuntimeError> {
     let name = state_dir.file_name().ok_or_else(|| {
         IrohRuntimeError::Identity(format!(
             "{} has no final directory component",
@@ -1530,7 +1877,10 @@ fn open_state_directory(state_dir: &Path) -> Result<(OwnedFd, bool), IrohRuntime
     Ok((dirfd, created))
 }
 
-fn validate_directory(dirfd: &OwnedFd, state_dir: &Path) -> Result<(), IrohRuntimeError> {
+pub(crate) fn validate_directory(
+    dirfd: &OwnedFd,
+    state_dir: &Path,
+) -> Result<(), IrohRuntimeError> {
     let stat = fs::fstat(dirfd)
         .map_err(|error| identity_io(state_dir, "inspecting state directory", error))?;
     if FileType::from_raw_mode(stat.st_mode) != FileType::Directory {
@@ -1890,6 +2240,8 @@ fn identity_io(state_dir: &Path, operation: &str, error: Errno) -> IrohRuntimeEr
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::iroh_publication::{NodePublicationConfig, PublicationAuthorityAuthorization};
+    use iroh::TransportAddr;
     use iroh::endpoint::Connection;
     use iroh::protocol::AcceptError;
 
@@ -1937,6 +2289,150 @@ mod tests {
                 AddressLookupCapability::Memory,
             )
             .is_err()
+        );
+
+        let publication = NodePublicationConfig::new(
+            "run-1",
+            "authority.test:v1",
+            "127.0.0.1:8080".parse().unwrap(),
+            "authority.test",
+            PublicationAuthorityAuthorization::LocalProductionShaped {
+                owner: "operator".into(),
+            },
+            Duration::from_secs(30),
+            Duration::from_secs(10),
+            Duration::from_secs(2),
+            [NodeLocation::direct("127.0.0.1:4433".parse().unwrap()).unwrap()],
+        )
+        .unwrap();
+        let builder = IrohRuntimeBuilder::new(
+            DAEMON_TEST_ENDPOINT_PROFILE,
+            IdentitySource::Ephemeral,
+            RelayCapability::Disabled,
+            AddressLookupCapability::Disabled,
+        )
+        .unwrap();
+        assert!(
+            builder
+                .node_publication(NodePublicationCapability::Enabled(publication))
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn publication_candidates_follow_observed_endpoint_addresses() {
+        let key = SecretKey::generate();
+        let matching = NodeLocation::direct("192.0.2.10:4433".parse().unwrap()).unwrap();
+        let removed = NodeLocation::direct("192.0.2.11:4433".parse().unwrap()).unwrap();
+        let relay = NodeLocation::relay("https://relay.example.test").unwrap();
+        let observed = EndpointAddr::from_parts(
+            key.public(),
+            [TransportAddr::Ip("192.0.2.10:4433".parse().unwrap())],
+        );
+        assert_eq!(
+            effective_publication_locations(
+                &[matching.clone(), removed.clone(), relay.clone()],
+                &observed,
+            ),
+            vec![matching.clone()]
+        );
+        assert!(
+            effective_publication_locations(
+                &[matching.clone(), removed, relay],
+                &EndpointAddr::from(key.public()),
+            )
+            .is_empty(),
+            "empty intersection drives a signed withdrawal"
+        );
+
+        let mapped = EndpointAddr::from_parts(
+            key.public(),
+            [TransportAddr::Ip(
+                "[::ffff:192.0.2.10]:4433".parse().unwrap(),
+            )],
+        );
+        assert_eq!(
+            effective_publication_locations(std::slice::from_ref(&matching), &mapped),
+            vec![matching]
+        );
+    }
+
+    #[test]
+    fn identical_publication_watch_observation_is_a_no_op() {
+        let location = NodeLocation::direct("192.0.2.10:4433".parse().unwrap()).unwrap();
+        assert!(!publication_location_update_needed(
+            std::slice::from_ref(&location),
+            std::slice::from_ref(&location),
+        ));
+        assert!(publication_location_update_needed(
+            std::slice::from_ref(&location),
+            &[],
+        ));
+        assert!(!publication_location_update_needed(&[], &[]));
+    }
+
+    #[tokio::test]
+    async fn publication_startup_deadline_requires_an_actually_observed_location() {
+        let endpoint = bind_endpoint(
+            DAEMON_TEST_ENDPOINT_PROFILE,
+            IdentitySource::Ephemeral,
+            RelayCapability::Disabled,
+            AddressLookupCapability::Disabled,
+        )
+        .await
+        .unwrap();
+        let declared_but_unobserved =
+            NodeLocation::direct("192.0.2.10:4433".parse().unwrap()).unwrap();
+        let error = wait_for_initial_publication_locations(
+            &endpoint,
+            &[declared_but_unobserved],
+            tokio::time::Instant::now() + Duration::from_millis(50),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(
+            error.kind,
+            crate::iroh_publication::PublicationErrorKind::Configuration
+        );
+        assert!(error.to_string().contains("withdrawal-as-readiness"));
+        endpoint.close().await;
+    }
+
+    #[test]
+    fn relay_candidate_requires_runtime_relay_capability() {
+        let publication = NodePublicationConfig::new(
+            "run-1",
+            "authority.test:v1",
+            "127.0.0.1:8080".parse().unwrap(),
+            "authority.test",
+            PublicationAuthorityAuthorization::LocalProductionShaped {
+                owner: "operator".into(),
+            },
+            Duration::from_secs(30),
+            Duration::from_secs(10),
+            Duration::from_secs(2),
+            [NodeLocation::relay("https://relay.example.test").unwrap()],
+        )
+        .unwrap();
+        let builder = IrohRuntimeBuilder::new(
+            EndpointProfile {
+                scope: EndpointScope::Lan {
+                    ipv4: Ipv4Addr::LOCALHOST,
+                    ipv6: None,
+                    port: 4433,
+                },
+            },
+            IdentitySource::Persistent {
+                state_dir: PathBuf::from("unused-test-state"),
+            },
+            RelayCapability::Disabled,
+            AddressLookupCapability::Disabled,
+        )
+        .unwrap();
+        assert!(
+            builder
+                .node_publication(NodePublicationCapability::Enabled(publication))
+                .is_err()
         );
     }
 

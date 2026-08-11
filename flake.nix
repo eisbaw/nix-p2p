@@ -35,6 +35,14 @@
       cargoVersion =
         (builtins.fromTOML (builtins.readFile ./Cargo.toml)).workspace.package.version;
 
+      # Bind the publication-evidence image to the exact source revision used
+      # to build it. Dirty trees remain buildable for development, but their
+      # `-dirty` label is rejected by the artifact finalizer.
+      implementationRevision =
+        if self ? rev then self.rev
+        else if self ? dirtyRev then self.dirtyRev
+        else throw "iroh publication evidence image requires a Git revision";
+
       # cleanCargoSource keeps only Cargo manifests and *.rs. Task-1 left a
       # note here to widen it once fixtures existed; task-3 did not, because
       # the fixture cache is a GENERATED, gitignored artifact and is invisible
@@ -72,7 +80,7 @@
       # fixture and so cannot live in a sandboxed cargo test. The independence
       # check below keeps plain python3 - it needs no third-party module and
       # should not wait on one.
-      pythonEnv = pkgs.python3.withPackages (ps: [ ps.cryptography ps.blake3 ]);
+      pythonEnv = pkgs.python3.withPackages (ps: [ ps.cryptography ps.blake3 ps.jsonschema ]);
 
       commonArgs = {
         inherit src;
@@ -197,6 +205,39 @@
           ];
         };
       };
+
+      # TASK-137's routed publication proof runs the authority and publisher in
+      # separate containers (never an e2e Pod/shared network namespace) and
+      # captures only pkarr/DNS traffic inside the publisher namespace. Keep
+      # tcpdump/iproute2 out of the normal e2e image: they are evidence tools,
+      # not runtime dependencies of nix-p2p.
+      irohPublicationEvidenceImage = pkgs.dockerTools.buildImage {
+        name = "nix-p2p-iroh-publication-evidence";
+        tag = "latest";
+        copyToRoot = pkgs.buildEnv {
+          name = "nix-p2p-iroh-publication-evidence-root";
+          paths = with pkgs; [
+            bash
+            coreutils
+            iproute2
+            tcpdump
+            daemon
+            e2eEtc
+          ];
+          pathsToLink = [ "/bin" "/etc" "/share" ];
+        };
+        extraCommands = ''
+          mkdir -p tmp var/tmp root run
+          chmod 1777 tmp var/tmp
+        '';
+        config = {
+          Cmd = [ "/bin/bash" ];
+          Env = [ "PATH=/bin" ];
+          Labels = {
+            "org.nix-p2p.implementation-revision" = implementationRevision;
+          };
+        };
+      };
     in
     {
       # The NixOS module (task-10). System-independent, so it lives outside the
@@ -214,6 +255,9 @@
         # out of `checks` so `nix flake check` and the devshell closure stay
         # lean (like the 110 MiB fixture payload).
         e2e-image = e2eImage;
+        # Separate routed-network evidence image for TASK-137. Kept out of
+        # checks because packet capture requires rootless Podman capabilities.
+        iroh-publication-evidence-image = irohPublicationEvidenceImage;
 
         # The NixOS VM test (task-10): real nix-daemon + systemd, the S2 truth
         # layer. A PACKAGE, not a check, on purpose (task-1 codex finding 4):

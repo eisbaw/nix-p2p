@@ -1,0 +1,462 @@
+{
+  "$comment": "Canonical artifacts are emitted by scripts/finalize_iroh_node_publication.py. The two schema descriptors are read from the recorded implementation commit, never the dirty worktree. raw_evidence.manifest_sha256 hashes canonical compact JSON plus LF containing exactly {schema,files}; the artifact does not hash itself. The bundled finalizer emits pass only. Any independent no_go producer must receive explicit capability constraints and must never translate missing or invalid test evidence into no_go.",
+  "$defs": {
+    "authority": {
+      "additionalProperties": false,
+      "properties": {
+        "expected_host": { "minLength": 1, "type": "string" },
+        "external_contact_authorized": { "const": false },
+        "kind": { "const": "local-routed-pkarr-relay" },
+        "namespace": { "minLength": 1, "type": "string" },
+        "owner": { "minLength": 1, "type": "string" },
+        "recipient": { "minLength": 1, "type": "string" },
+        "socket": { "minLength": 1, "type": "string" }
+      },
+      "required": [
+        "kind",
+        "namespace",
+        "recipient",
+        "expected_host",
+        "socket",
+        "owner",
+        "external_contact_authorized"
+      ],
+      "type": "object"
+    },
+    "capabilityConstraint": {
+      "additionalProperties": false,
+      "properties": {
+        "description": { "minLength": 1, "type": "string" },
+        "evidence_sha256": { "$ref": "#/$defs/sha256" },
+        "id": {
+          "pattern": "^[a-z0-9][a-z0-9._-]{2,127}$",
+          "type": "string"
+        }
+      },
+      "required": ["id", "description", "evidence_sha256"],
+      "type": "object"
+    },
+    "capture": {
+      "additionalProperties": false,
+      "properties": {
+        "bpf_filter": {
+          "pattern": "^\\(host (?:[0-9]{1,3}\\.){3}[0-9]{1,3} and tcp port 18080\\) or udp port 53 or tcp port 53$",
+          "type": "string"
+        },
+        "count_semantics": { "const": "packets-matching-bpf" },
+        "interface": { "const": "any" },
+        "scope": { "const": "publisher-netns-authority-or-dns-bpf-v1" }
+      },
+      "required": ["scope", "interface", "bpf_filter", "count_semantics"],
+      "type": "object"
+    },
+    "committedFile": {
+      "additionalProperties": false,
+      "properties": {
+        "bytes": { "minimum": 1, "type": "integer" },
+        "git_blob": { "$ref": "#/$defs/gitObject" },
+        "path": { "minLength": 1, "type": "string" },
+        "sha256": { "$ref": "#/$defs/sha256" }
+      },
+      "required": ["path", "git_blob", "bytes", "sha256"],
+      "type": "object"
+    },
+    "control": {
+      "additionalProperties": false,
+      "properties": {
+        "authority_requests": { "const": 0 },
+        "captured_in_scope_packets": { "const": 0 },
+        "fail_closed": { "type": "boolean" },
+        "hold_elapsed_ns": {
+          "oneOf": [
+            { "exclusiveMinimum": 4000000000, "type": "integer" },
+            { "type": "null" }
+          ]
+        },
+        "offline": { "type": "boolean" },
+        "outcome_elapsed_ns": { "minimum": 0, "type": "integer" },
+        "publication_enabled": { "type": "boolean" },
+        "scenario": {
+          "enum": ["default-off", "offline-disabled", "offline-enabled"]
+        }
+      },
+      "required": [
+        "scenario",
+        "publication_enabled",
+        "offline",
+        "fail_closed",
+        "hold_elapsed_ns",
+        "outcome_elapsed_ns",
+        "captured_in_scope_packets",
+        "authority_requests"
+      ],
+      "type": "object"
+    },
+    "evidenceFile": {
+      "additionalProperties": false,
+      "properties": {
+        "bytes": { "minimum": 0, "type": "integer" },
+        "path": { "minLength": 1, "type": "string" },
+        "sha256": { "$ref": "#/$defs/sha256" }
+      },
+      "required": ["path", "bytes", "sha256"],
+      "type": "object"
+    },
+    "gitObject": {
+      "pattern": "^(?:[0-9a-f]{40}|[0-9a-f]{64})$",
+      "type": "string"
+    },
+    "image": {
+      "additionalProperties": false,
+      "properties": {
+        "podman_digest": {
+          "oneOf": [
+            { "type": "null" },
+            { "pattern": "^sha256:[0-9a-f]{64}$", "type": "string" }
+          ]
+        },
+        "podman_image_id": {
+          "pattern": "^(?:sha256:)?[0-9a-f]{64}$",
+          "type": "string"
+        },
+        "podman_repo_digests": {
+          "items": {
+            "pattern": "@sha256:[0-9a-f]{64}$",
+            "type": "string"
+          },
+          "type": "array",
+          "uniqueItems": true
+        },
+        "implementation_revision": { "$ref": "#/$defs/gitObject" },
+        "reference": { "minLength": 1, "type": "string" }
+      },
+      "required": [
+        "reference",
+        "podman_image_id",
+        "podman_digest",
+        "podman_repo_digests",
+        "implementation_revision"
+      ],
+      "type": "object"
+    },
+    "publication": {
+      "additionalProperties": false,
+      "properties": {
+        "published_address": { "minLength": 1, "type": "string" },
+        "record_schema": { "const": "iroh-node-publication-v1" },
+        "refresh_interval_ns": { "const": 4000000000 },
+        "ttl_ns": { "const": 12000000000 }
+      },
+      "required": [
+        "record_schema",
+        "published_address",
+        "ttl_ns",
+        "refresh_interval_ns"
+      ],
+      "type": "object"
+    },
+    "sha256": {
+      "pattern": "^[0-9a-f]{64}$",
+      "type": "string"
+    },
+    "positiveCounts": {
+      "additionalProperties": false,
+      "properties": {
+        "authority_requests": { "const": 6 },
+        "captured_in_scope_packets": { "minimum": 1, "type": "integer" }
+      },
+      "required": ["authority_requests", "captured_in_scope_packets"],
+      "type": "object"
+    },
+    "topology": {
+      "additionalProperties": false,
+      "properties": {
+        "authority_ip": { "minLength": 1, "type": "string" },
+        "authority_network": { "minLength": 1, "type": "string" },
+        "authority_network_internal": { "const": true },
+        "authority_subnet": { "minLength": 1, "type": "string" },
+        "dns_enabled": { "const": false },
+        "kind": { "const": "two-internal-networks-explicit-l3-router" },
+        "network_count": { "const": 2 },
+        "publication_network": { "minLength": 1, "type": "string" },
+        "publication_network_internal": { "const": true },
+        "publication_subnet": { "minLength": 1, "type": "string" },
+        "publisher_ip": { "minLength": 1, "type": "string" },
+        "router_authority_ip": { "minLength": 1, "type": "string" },
+        "router_publication_ip": { "minLength": 1, "type": "string" }
+      },
+      "required": [
+        "kind",
+        "network_count",
+        "publication_network_internal",
+        "authority_network_internal",
+        "publication_network",
+        "authority_network",
+        "publication_subnet",
+        "authority_subnet",
+        "publisher_ip",
+        "router_publication_ip",
+        "authority_ip",
+        "router_authority_ip",
+        "dns_enabled"
+      ],
+      "type": "object"
+    },
+    "transition": {
+      "additionalProperties": false,
+      "properties": {
+        "address": {
+          "oneOf": [
+            { "minLength": 1, "type": "string" },
+            { "type": "null" }
+          ]
+        },
+        "observed_elapsed_ns": {
+          "maximum": 11000000000,
+          "minimum": 0,
+          "type": "integer"
+        },
+        "completed_elapsed_ns": {
+          "maximum": 6000000000,
+          "minimum": 0,
+          "type": "integer"
+        },
+        "packet_sha256": { "$ref": "#/$defs/sha256" },
+        "sequence": { "minimum": 1, "type": "integer" },
+        "state": { "enum": ["live", "withdrawn"] }
+      },
+      "required": [
+        "state",
+        "sequence",
+        "packet_sha256",
+        "address",
+        "observed_elapsed_ns"
+      ],
+      "type": "object"
+    }
+  },
+  "$id": "https://nix-p2p.invalid/schema/iroh-node-publication-artifact-v1.schema.json",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "allOf": [
+    {
+      "if": {
+        "properties": { "verdict": { "const": "pass" } },
+        "required": ["verdict"]
+      },
+      "then": {
+        "properties": { "failed_constraints": { "maxItems": 0 } }
+      }
+    },
+    {
+      "if": {
+        "properties": { "verdict": { "const": "no_go" } },
+        "required": ["verdict"]
+      },
+      "then": {
+        "properties": { "failed_constraints": { "minItems": 1 } }
+      }
+    }
+  ],
+  "properties": {
+    "capability": { "const": "iroh-node-publication-v1" },
+    "evidence_summary": {
+      "additionalProperties": false,
+      "properties": {
+        "authority": { "$ref": "#/$defs/authority" },
+        "capture": { "$ref": "#/$defs/capture" },
+        "controls": {
+          "items": false,
+          "maxItems": 3,
+          "minItems": 3,
+          "prefixItems": [
+            {
+              "allOf": [
+                { "$ref": "#/$defs/control" },
+                {
+                  "properties": {
+                    "fail_closed": { "const": false },
+                    "offline": { "const": false },
+                    "publication_enabled": { "const": false },
+                    "scenario": { "const": "default-off" }
+                  }
+                }
+              ]
+            },
+            {
+              "allOf": [
+                { "$ref": "#/$defs/control" },
+                {
+                  "properties": {
+                    "fail_closed": { "const": false },
+                    "offline": { "const": true },
+                    "publication_enabled": { "const": false },
+                    "scenario": { "const": "offline-disabled" }
+                  }
+                }
+              ]
+            },
+            {
+              "allOf": [
+                { "$ref": "#/$defs/control" },
+                {
+                  "properties": {
+                    "fail_closed": { "const": true },
+                    "hold_elapsed_ns": { "type": "null" },
+                    "offline": { "const": true },
+                    "publication_enabled": { "const": true },
+                    "scenario": { "const": "offline-enabled" }
+                  }
+                }
+              ]
+            }
+          ],
+          "type": "array"
+        },
+        "image": { "$ref": "#/$defs/image" },
+        "lifecycle": {
+          "additionalProperties": false,
+          "properties": {
+            "refresh": {
+              "allOf": [
+                { "$ref": "#/$defs/transition" },
+                {
+                  "properties": {
+                    "observed_elapsed_ns": { "maximum": 6000000000 },
+                    "state": { "const": "live" }
+                  }
+                }
+              ]
+            },
+            "startup": {
+              "allOf": [
+                { "$ref": "#/$defs/transition" },
+                { "properties": { "state": { "const": "live" } } }
+              ]
+            },
+            "withdrawal": {
+              "allOf": [
+                { "$ref": "#/$defs/transition" },
+                {
+                  "properties": {
+                    "address": { "type": "null" },
+                    "completed_elapsed_ns": { "maximum": 6000000000 },
+                    "observed_elapsed_ns": { "maximum": 6000000000 },
+                    "state": { "const": "withdrawn" }
+                  },
+                  "required": ["completed_elapsed_ns"]
+                }
+              ]
+            }
+          },
+          "required": ["startup", "refresh", "withdrawal"],
+          "type": "object"
+        },
+        "node_id": { "$ref": "#/$defs/sha256" },
+        "positive_counts": { "$ref": "#/$defs/positiveCounts" },
+        "profile": { "const": "production-shaped-local" },
+        "publication": { "$ref": "#/$defs/publication" },
+        "run_id": {
+          "pattern": "^[a-z0-9][a-z0-9-]{7,47}$",
+          "type": "string"
+        },
+        "timing_schema": { "const": "iroh-node-publication-evidence-v1" },
+        "topology": { "$ref": "#/$defs/topology" }
+      },
+      "required": [
+        "timing_schema",
+        "run_id",
+        "profile",
+        "node_id",
+        "image",
+        "authority",
+        "publication",
+        "capture",
+        "topology",
+        "controls",
+        "lifecycle",
+        "positive_counts"
+      ],
+      "type": "object"
+    },
+    "failed_constraints": {
+      "items": { "$ref": "#/$defs/capabilityConstraint" },
+      "type": "array"
+    },
+    "implementation": {
+      "additionalProperties": false,
+      "properties": {
+        "artifact_schema": {
+          "allOf": [
+            { "$ref": "#/$defs/committedFile" },
+            {
+              "properties": {
+                "path": {
+                  "const": "docs/iroh-node-publication-artifact-v1.schema.json"
+                }
+              }
+            }
+          ]
+        },
+        "commit": { "$ref": "#/$defs/gitObject" },
+        "git_object_format": { "enum": ["sha1", "sha256"] },
+        "record_schema": {
+          "allOf": [
+            { "$ref": "#/$defs/committedFile" },
+            {
+              "properties": {
+                "path": { "const": "docs/iroh-node-publication-v1.md" }
+              }
+            }
+          ]
+        },
+        "tree": { "$ref": "#/$defs/gitObject" }
+      },
+      "required": [
+        "git_object_format",
+        "commit",
+        "tree",
+        "record_schema",
+        "artifact_schema"
+      ],
+      "type": "object"
+    },
+    "raw_evidence": {
+      "additionalProperties": false,
+      "properties": {
+        "file_count": { "minimum": 1, "type": "integer" },
+        "files": {
+          "items": { "$ref": "#/$defs/evidenceFile" },
+          "minItems": 1,
+          "type": "array"
+        },
+        "manifest_sha256": { "$ref": "#/$defs/sha256" },
+        "schema": {
+          "const": "iroh-node-publication-raw-evidence-manifest-v1"
+        },
+        "total_bytes": { "minimum": 1, "type": "integer" }
+      },
+      "required": [
+        "schema",
+        "files",
+        "file_count",
+        "total_bytes",
+        "manifest_sha256"
+      ],
+      "type": "object"
+    },
+    "schema": { "const": "iroh-node-publication-artifact-v1" },
+    "verdict": { "enum": ["pass", "no_go"] }
+  },
+  "required": [
+    "schema",
+    "capability",
+    "verdict",
+    "failed_constraints",
+    "implementation",
+    "raw_evidence",
+    "evidence_summary"
+  ],
+  "title": "iroh-node-publication-artifact-v1",
+  "type": "object"
+}

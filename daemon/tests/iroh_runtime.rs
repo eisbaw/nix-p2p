@@ -501,6 +501,7 @@ async fn global_wildcard_binds_are_observable_but_never_publishable() {
         daemon::EndpointCapabilityState {
             relay_enabled: false,
             address_lookup_services: 1,
+            node_publication_enabled: false,
         }
     );
     node.shutdown().await.unwrap();
@@ -533,6 +534,7 @@ async fn lan_and_global_scopes_do_not_imply_lookup_or_relay() {
             daemon::EndpointCapabilityState {
                 relay_enabled: false,
                 address_lookup_services: 0,
+                node_publication_enabled: false,
             }
         );
         node.shutdown().await.unwrap();
@@ -555,6 +557,7 @@ fn explicit_relay_capability_is_observable_before_any_network_bind() {
         daemon::EndpointCapabilityState {
             relay_enabled: true,
             address_lookup_services: 0,
+            node_publication_enabled: false,
         }
     );
 }
@@ -768,8 +771,10 @@ fn shutdown_signal_receivers_are_installed_before_readiness_can_be_printed() {
         .find("let shutdown_signals = match install_shutdown_signals()")
         .expect("startup installs signal receivers");
     let iroh_setup = main
-        .find("let iroh_node = match setup_iroh_node(&config).await")
-        .expect("Iroh readiness setup site");
+        .find(
+            "let iroh_node = match setup_iroh_node_with_deadline(&config, publication_startup_deadline).await",
+        )
+        .expect("deadline-aware Iroh readiness setup site");
     let http_readiness = main
         .find("daemon: listening on {local}")
         .expect("HTTP readiness site");

@@ -77,6 +77,7 @@ use tokio::sync::watch;
 
 use crate::claim::KnownTransport;
 use crate::content_id::Blake3Digest;
+use crate::iroh_publication::{NodePublicationCapability, NodePublicationHandle};
 use crate::iroh_runtime::{
     AddressLookupCapability, DAEMON_TEST_ENDPOINT_PROFILE, EndpointCapabilityState,
     EndpointProfile, IdentitySource, IrohEndpointHandle, IrohNodeRuntime, IrohRuntimeBuilder,
@@ -2123,6 +2124,22 @@ impl IrohNodeBuilder {
         self
     }
 
+    pub fn node_publication(
+        mut self,
+        capability: NodePublicationCapability,
+    ) -> Result<Self, IrohError> {
+        self.runtime = self.runtime.node_publication(capability)?;
+        Ok(self)
+    }
+
+    pub fn publication_startup_deadline(
+        mut self,
+        deadline: tokio::time::Instant,
+    ) -> Result<Self, IrohError> {
+        self.runtime = self.runtime.publication_startup_deadline(deadline)?;
+        Ok(self)
+    }
+
     /// Add an application handler to the same duplicate-checked router as
     /// iroh-blobs.
     pub fn accept(
@@ -2210,6 +2227,10 @@ impl IrohNode {
 
     pub fn task_supervisor_handle(&self) -> TaskSupervisorHandle {
         self.runtime.task_supervisor_handle()
+    }
+
+    pub fn node_publication_handle(&self) -> Option<NodePublicationHandle> {
+        self.runtime.node_publication_handle()
     }
 
     /// Attach daemon-side work whose lifetime must not exceed the node.

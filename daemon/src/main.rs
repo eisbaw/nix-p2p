@@ -8,6 +8,7 @@
 //! an oversight (task-1 note): factoring it into a shared crate is exactly the
 //! coupling the PRD forbids until a second consumer genuinely earns it.
 
+use std::future::pending;
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -22,9 +23,10 @@ use daemon::{
     DEFAULT_MAX_SERVE_NAR_BYTES, EndpointProfile, EndpointScope, FallbackNarSource,
     FileNarSupplier, IdentitySource, InMemoryDiscovery, IrohNode, IrohNodeBuilder, IrohPeerAddr,
     IrohProviderConfig, IrohTransport, KnownPayload, KnownTransport, NarCatalog, NarHashKey,
-    NarSource, NarinfoDiskCache, NarinfoSource, NoRawServe, NodeId, NullCorrelation,
-    RawServeDecision, RelayCapability, ServeBudget, SystemClock, TaskSupervisor,
-    TransportNarSource, TransportRegistry, UpstreamHttp, serve,
+    NarSource, NarinfoDiskCache, NarinfoSource, NoRawServe, NodeId, NodeLocation,
+    NodePublicationCapability, NodePublicationConfig, NodePublicationHandle, NullCorrelation,
+    PublicationAuthorityAuthorization, RawServeDecision, RelayCapability, ServeBudget, SystemClock,
+    TaskSupervisor, TransportNarSource, TransportRegistry, UpstreamHttp, serve,
 };
 use tokio::net::TcpListener;
 
@@ -215,6 +217,18 @@ struct Config {
     /// Fixed UDP port for the persistent Iroh identity. Required whenever Iroh
     /// is enabled so restart and discovery records describe the same endpoint.
     iroh_port: Option<u16>,
+    /// Explicit node-address publication capability. Every companion field is
+    /// inert and rejected unless this switch is present.
+    iroh_publish_node: bool,
+    iroh_publication_namespace: Option<String>,
+    iroh_publication_recipient: Option<String>,
+    iroh_publication_authority_socket: Option<SocketAddr>,
+    iroh_publication_authority_host: Option<String>,
+    iroh_publication_owner: Option<String>,
+    iroh_publication_external_authorization: Option<String>,
+    iroh_publication_locations: Vec<NodeLocation>,
+    iroh_publication_ttl_seconds: Option<u64>,
+    iroh_publication_refresh_seconds: Option<u64>,
     /// Raw-NAR files this node ANNOUNCES it can serve (node B). Each is served by
     /// its `BLAKE3(RawNarV1)` content id, printed on startup so the harness can
     /// wire node A's claim to it. Under the task-61 supply model the file is
@@ -265,6 +279,16 @@ impl Default for Config {
             iroh_state_dir: None,
             iroh_endpoint_scope: None,
             iroh_port: None,
+            iroh_publish_node: false,
+            iroh_publication_namespace: None,
+            iroh_publication_recipient: None,
+            iroh_publication_authority_socket: None,
+            iroh_publication_authority_host: None,
+            iroh_publication_owner: None,
+            iroh_publication_external_authorization: None,
+            iroh_publication_locations: Vec::new(),
+            iroh_publication_ttl_seconds: None,
+            iroh_publication_refresh_seconds: None,
             iroh_seed_nar: Vec::new(),
             iroh_max_serve_nar_bytes: DEFAULT_MAX_SERVE_NAR_BYTES,
             iroh_max_inflight_nar_bytes: DEFAULT_MAX_INFLIGHT_NAR_BYTES,
@@ -345,6 +369,103 @@ impl Config {
                     }
                     config.iroh_port = Some(port);
                 }
+                "--iroh-publish-node" => {
+                    if config.iroh_publish_node {
+                        return Err("duplicate --iroh-publish-node".into());
+                    }
+                    config.iroh_publish_node = true;
+                }
+                "--iroh-publication-namespace" => {
+                    let parsed = value()?;
+                    if config.iroh_publication_namespace.replace(parsed).is_some() {
+                        return Err("duplicate --iroh-publication-namespace".into());
+                    }
+                }
+                "--iroh-publication-recipient" => {
+                    let parsed = value()?;
+                    if config.iroh_publication_recipient.replace(parsed).is_some() {
+                        return Err("duplicate --iroh-publication-recipient".into());
+                    }
+                }
+                "--iroh-publication-authority-socket" => {
+                    let raw = value()?;
+                    let parsed = raw.parse().map_err(|error| {
+                        format!("bad --iroh-publication-authority-socket {raw:?}: {error}")
+                    })?;
+                    if config
+                        .iroh_publication_authority_socket
+                        .replace(parsed)
+                        .is_some()
+                    {
+                        return Err("duplicate --iroh-publication-authority-socket".into());
+                    }
+                }
+                "--iroh-publication-authority-host" => {
+                    let parsed = value()?;
+                    if config
+                        .iroh_publication_authority_host
+                        .replace(parsed)
+                        .is_some()
+                    {
+                        return Err("duplicate --iroh-publication-authority-host".into());
+                    }
+                }
+                "--iroh-publication-owner" => {
+                    let parsed = value()?;
+                    if config.iroh_publication_owner.replace(parsed).is_some() {
+                        return Err("duplicate --iroh-publication-owner".into());
+                    }
+                }
+                "--iroh-publication-external-authorization" => {
+                    let parsed = value()?;
+                    if config
+                        .iroh_publication_external_authorization
+                        .replace(parsed)
+                        .is_some()
+                    {
+                        return Err("duplicate --iroh-publication-external-authorization".into());
+                    }
+                }
+                "--iroh-publication-address" => {
+                    let raw = value()?;
+                    let address = raw.parse::<SocketAddr>().map_err(|error| {
+                        format!("bad --iroh-publication-address {raw:?}: {error}")
+                    })?;
+                    config
+                        .iroh_publication_locations
+                        .push(NodeLocation::direct(address).map_err(|error| {
+                            format!("bad --iroh-publication-address {raw:?}: {error}")
+                        })?);
+                }
+                "--iroh-publication-relay" => {
+                    let raw = value()?;
+                    config.iroh_publication_locations.push(
+                        NodeLocation::relay(raw.clone()).map_err(|error| {
+                            format!("bad --iroh-publication-relay {raw:?}: {error}")
+                        })?,
+                    );
+                }
+                "--iroh-publication-ttl-seconds" => {
+                    let parsed = parse_positive_u64("--iroh-publication-ttl-seconds", &value()?)?;
+                    if config
+                        .iroh_publication_ttl_seconds
+                        .replace(parsed)
+                        .is_some()
+                    {
+                        return Err("duplicate --iroh-publication-ttl-seconds".into());
+                    }
+                }
+                "--iroh-publication-refresh-seconds" => {
+                    let parsed =
+                        parse_positive_u64("--iroh-publication-refresh-seconds", &value()?)?;
+                    if config
+                        .iroh_publication_refresh_seconds
+                        .replace(parsed)
+                        .is_some()
+                    {
+                        return Err("duplicate --iroh-publication-refresh-seconds".into());
+                    }
+                }
                 "--iroh-seed-nar" => config.iroh_seed_nar.push(value()?),
                 "--iroh-max-serve-nar-bytes" => {
                     config.iroh_max_serve_nar_bytes =
@@ -367,8 +488,24 @@ impl Config {
                 other => return Err(format!("unknown flag {other:?}")),
             }
         }
-        let iroh_enabled =
-            config.iroh_provider || !config.iroh_peers.is_empty() || !config.p2p_claims.is_empty();
+        let publication_companion_configured = config.iroh_publication_namespace.is_some()
+            || config.iroh_publication_recipient.is_some()
+            || config.iroh_publication_authority_socket.is_some()
+            || config.iroh_publication_authority_host.is_some()
+            || config.iroh_publication_owner.is_some()
+            || config.iroh_publication_external_authorization.is_some()
+            || !config.iroh_publication_locations.is_empty()
+            || config.iroh_publication_ttl_seconds.is_some()
+            || config.iroh_publication_refresh_seconds.is_some();
+        if publication_companion_configured && !config.iroh_publish_node {
+            return Err(
+                "Iroh publication companion flags require explicit --iroh-publish-node".into(),
+            );
+        }
+        let iroh_enabled = config.iroh_provider
+            || config.iroh_publish_node
+            || !config.iroh_peers.is_empty()
+            || !config.p2p_claims.is_empty();
         if iroh_enabled && config.iroh_port.is_none() {
             return Err("Iroh is configured but --iroh-port is missing; refusing an ephemeral discovery address".into());
         }
@@ -400,9 +537,23 @@ impl Config {
 /// now costs one streamed BLAKE3 pass in 64 KiB slices; the bytes are produced
 /// only when a peer actually asks, inside the serve budget, and released after.
 /// The `IROH-SEED` line is byte-identical, so the harness contract is unchanged.
+#[cfg(test)]
 async fn setup_iroh_node(config: &Config) -> Result<Option<IrohNode>, String> {
-    let enabled =
-        config.iroh_provider || !config.iroh_peers.is_empty() || !config.p2p_claims.is_empty();
+    setup_iroh_node_with_deadline(
+        config,
+        tokio::time::Instant::now() + daemon::PUBLICATION_STARTUP_DEADLINE,
+    )
+    .await
+}
+
+async fn setup_iroh_node_with_deadline(
+    config: &Config,
+    publication_startup_deadline: tokio::time::Instant,
+) -> Result<Option<IrohNode>, String> {
+    let enabled = config.iroh_provider
+        || config.iroh_publish_node
+        || !config.iroh_peers.is_empty()
+        || !config.p2p_claims.is_empty();
     if !enabled {
         return Ok(None);
     }
@@ -419,20 +570,93 @@ async fn setup_iroh_node(config: &Config) -> Result<Option<IrohNode>, String> {
             .to_string()
     })?;
     let scope = endpoint_scope_with_port(scope, port);
-    let builder = IrohNodeBuilder::new(
+    let mut builder = IrohNodeBuilder::new(
         EndpointProfile { scope },
-        IdentitySource::Persistent { state_dir },
+        IdentitySource::Persistent {
+            state_dir: state_dir.clone(),
+        },
         RelayCapability::Disabled,
         AddressLookupCapability::Disabled,
     )
     .map_err(|error| error.to_string())?;
 
+    if config.iroh_publish_node {
+        let namespace = config.iroh_publication_namespace.clone().ok_or_else(|| {
+            "--iroh-publish-node requires --iroh-publication-namespace".to_string()
+        })?;
+        let signed_recipient = config.iroh_publication_recipient.clone().ok_or_else(|| {
+            "--iroh-publish-node requires --iroh-publication-recipient".to_string()
+        })?;
+        let authority_socket = config.iroh_publication_authority_socket.ok_or_else(|| {
+            "--iroh-publish-node requires --iroh-publication-authority-socket".to_string()
+        })?;
+        let authority_host = config
+            .iroh_publication_authority_host
+            .clone()
+            .ok_or_else(|| {
+                "--iroh-publish-node requires --iroh-publication-authority-host".to_string()
+            })?;
+        let owner = config
+            .iroh_publication_owner
+            .clone()
+            .ok_or_else(|| "--iroh-publish-node requires --iroh-publication-owner".to_string())?;
+        if config.iroh_publication_locations.is_empty() {
+            return Err(
+                "--iroh-publish-node requires at least one --iroh-publication-address or --iroh-publication-relay"
+                    .into(),
+            );
+        }
+        // Direct locations are an operator allowlist, not sufficient proof of
+        // reachability by themselves. Runtime publication intersects them with
+        // addresses actually observed on the endpoint. Static NAT provenance is
+        // not a v1 capability, so unobserved declarations never become records.
+        // Relay declarations are rejected below while relay transport is off.
+        let authorization = match &config.iroh_publication_external_authorization {
+            Some(reference) => PublicationAuthorityAuthorization::ExternalAuthorized {
+                owner: owner.clone(),
+                authorization_reference: reference.clone(),
+            },
+            None => PublicationAuthorityAuthorization::LocalProductionShaped {
+                owner: owner.clone(),
+            },
+        };
+        let publication_ttl_seconds = config.iroh_publication_ttl_seconds.unwrap_or(30);
+        let publication_refresh_seconds = config.iroh_publication_refresh_seconds.unwrap_or(10);
+        let publication = NodePublicationConfig::new(
+            namespace,
+            signed_recipient.clone(),
+            authority_socket,
+            authority_host,
+            authorization.clone(),
+            std::time::Duration::from_secs(publication_ttl_seconds),
+            std::time::Duration::from_secs(publication_refresh_seconds),
+            std::time::Duration::from_secs(2),
+            config.iroh_publication_locations.clone(),
+        )
+        .map_err(|error| error.to_string())?;
+        println!(
+            "IROH-NODE-PUBLICATION-CONFIG enabled=true authority_class={} owner_json={} recipient_label={} locations={} ttl_seconds={} refresh_seconds={}",
+            authorization.evidence_label(),
+            serde_json::to_string(&owner).expect("a String always serializes as JSON"),
+            signed_recipient,
+            config.iroh_publication_locations.len(),
+            publication_ttl_seconds,
+            publication_refresh_seconds,
+        );
+        builder = builder
+            .publication_startup_deadline(publication_startup_deadline)
+            .map_err(|error| error.to_string())?
+            .node_publication(NodePublicationCapability::Enabled(publication))
+            .map_err(|error| error.to_string())?;
+    }
+
     if !config.iroh_provider {
-        return builder
-            .spawn()
-            .await
-            .map(Some)
-            .map_err(|error| error.to_string());
+        let node = builder.spawn().await.map_err(|error| error.to_string());
+        let node = node?;
+        if let Err(error) = log_publication_status(&node).await {
+            return Err(shutdown_after_setup_error(node, error).await);
+        }
+        return Ok(Some(node));
     }
 
     // FILE-BACKED, not store-backed. `IndexNarSupplier` (an inert supply-catalog
@@ -501,6 +725,9 @@ async fn setup_iroh_node(config: &Config) -> Result<Option<IrohNode>, String> {
         .spawn()
         .await
         .map_err(|error| error.to_string())?;
+    if let Err(error) = log_publication_status(&node).await {
+        return Err(shutdown_after_setup_error(node, error).await);
+    }
     let provider = node
         .provider_handle()
         .expect("provider configuration installs the provider before spawn");
@@ -641,6 +868,34 @@ async fn setup_iroh_node(config: &Config) -> Result<Option<IrohNode>, String> {
     }
 
     Ok(Some(node))
+}
+
+async fn log_publication_status(node: &IrohNode) -> Result<(), String> {
+    let Some(publication) = node.node_publication_handle() else {
+        return Ok(());
+    };
+    let record = publication
+        .current_record()
+        .await
+        .map_err(|error| format!("reading publication status: {error}"))?
+        .ok_or_else(|| "publication startup returned without a committed record".to_string())?;
+    if record.state != daemon::PublicationState::Live || record.locations.is_empty() {
+        return Err(format!(
+            "publication startup returned {:?} with {} locations; readiness requires a visible live record",
+            record.state,
+            record.locations.len()
+        ));
+    }
+    println!(
+        "IROH-NODE-PUBLICATION state={:?} sequence={} ttl_seconds={} expires_unix_micros={} locations={} recipient_label={}",
+        record.state,
+        record.sequence,
+        record.ttl_seconds,
+        record.expires_unix_micros,
+        record.locations.len(),
+        record.recipient,
+    );
+    Ok(())
 }
 
 async fn shutdown_after_setup_error(node: IrohNode, error: String) -> String {
@@ -814,8 +1069,19 @@ async fn shutdown_iroh_node(node: Option<IrohNode>) -> bool {
     }
 }
 
+async fn wait_for_publication_fatal(
+    publication: Option<NodePublicationHandle>,
+) -> daemon::PublicationError {
+    match publication {
+        Some(publication) => publication.wait_for_fatal().await,
+        None => pending().await,
+    }
+}
+
 #[tokio::main]
 async fn main() -> ExitCode {
+    let process_started = tokio::time::Instant::now();
+    let publication_startup_deadline = process_started + daemon::PUBLICATION_STARTUP_DEADLINE;
     // Internal process-isolation boundary for raw-file supply. It is intentionally
     // handled before normal configuration: the parent owns this process group,
     // caps stdout, and kills/reaps it on request cancellation or node shutdown.
@@ -906,7 +1172,8 @@ async fn main() -> ExitCode {
 
     // One persistent Iroh node owns provider and fetch capabilities. Keeping it
     // alive for the process lifetime keeps the shared router/socket alive.
-    let iroh_node = match setup_iroh_node(&config).await {
+    let iroh_node = match setup_iroh_node_with_deadline(&config, publication_startup_deadline).await
+    {
         Ok(node) => node,
         Err(err) => {
             eprintln!("daemon: Iroh node setup failed: {err}");
@@ -984,6 +1251,9 @@ async fn main() -> ExitCode {
         .expect("one HTTP task supervisor is always constructed");
 
     let mut success = true;
+    let publication_health = iroh_node
+        .as_ref()
+        .and_then(IrohNode::node_publication_handle);
     tokio::select! {
         result = serve(listener, app, http_supervisor) => {
             match result {
@@ -1002,6 +1272,10 @@ async fn main() -> ExitCode {
                     success = false;
                 }
             }
+        }
+        error = wait_for_publication_fatal(publication_health) => {
+            eprintln!("daemon: fatal Iroh node-publication health failure: {error}");
+            success = false;
         }
     }
     if let Some(supervisor) = &standalone_http_supervisor {
@@ -1209,6 +1483,82 @@ mod tests {
             Config::from_args(["--iroh-provider".into()])
                 .unwrap_err()
                 .contains("--iroh-port")
+        );
+    }
+
+    #[test]
+    fn node_publication_is_default_off_and_companions_are_inert_without_switch() {
+        let config = Config::from_args(Vec::<String>::new()).unwrap();
+        assert!(!config.iroh_publish_node);
+        assert!(config.iroh_publication_namespace.is_none());
+        assert!(config.iroh_publication_recipient.is_none());
+        assert!(config.iroh_publication_authority_socket.is_none());
+        assert!(config.iroh_publication_authority_host.is_none());
+        assert!(config.iroh_publication_owner.is_none());
+        assert!(config.iroh_publication_locations.is_empty());
+
+        for (flag, value) in [
+            ("--iroh-publication-namespace", "run-1"),
+            ("--iroh-publication-recipient", "authority.test:v1"),
+            ("--iroh-publication-authority-socket", "127.0.0.1:8080"),
+            ("--iroh-publication-authority-host", "authority.test"),
+            ("--iroh-publication-owner", "operator"),
+            ("--iroh-publication-external-authorization", "ticket-1"),
+            ("--iroh-publication-address", "127.0.0.1:4433"),
+            ("--iroh-publication-relay", "https://relay.example"),
+            ("--iroh-publication-ttl-seconds", "30"),
+            ("--iroh-publication-refresh-seconds", "10"),
+        ] {
+            let error = Config::from_args([flag.to_string(), value.to_string()]).unwrap_err();
+            assert!(error.contains("require explicit --iroh-publish-node"));
+        }
+    }
+
+    #[test]
+    fn node_publication_flags_parse_only_as_an_explicit_complete_capability() {
+        let config = Config::from_args(
+            [
+                "--iroh-publish-node",
+                "--iroh-port",
+                "41003",
+                "--iroh-publication-namespace",
+                "run-1",
+                "--iroh-publication-recipient",
+                "authority.test:v1",
+                "--iroh-publication-authority-socket",
+                "127.0.0.1:8080",
+                "--iroh-publication-authority-host",
+                "authority.test",
+                "--iroh-publication-owner",
+                "operator",
+                "--iroh-publication-address",
+                "127.0.0.1:4433",
+                "--iroh-publication-ttl-seconds",
+                "30",
+                "--iroh-publication-refresh-seconds",
+                "10",
+            ]
+            .map(String::from),
+        )
+        .unwrap();
+        assert!(config.iroh_publish_node);
+        assert_eq!(config.iroh_port, Some(41003));
+        assert_eq!(config.iroh_publication_locations.len(), 1);
+        assert_eq!(config.iroh_publication_ttl_seconds, Some(30));
+        assert_eq!(config.iroh_publication_refresh_seconds, Some(10));
+
+        assert!(
+            Config::from_args(
+                [
+                    "--iroh-publish-node",
+                    "--iroh-publish-node",
+                    "--iroh-port",
+                    "41003"
+                ]
+                .map(String::from)
+            )
+            .unwrap_err()
+            .contains("duplicate --iroh-publish-node")
         );
     }
 
