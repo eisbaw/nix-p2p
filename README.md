@@ -136,18 +136,28 @@ See `PRD.md` for the full design record and `backlog/` for task state.
 
 ## Architecture
 
-Two strictly separated Rust binaries (no shared crates, enforced by
-`just independence`):
+A stack-neutral **frontend** with a swappable P2P **backend**, plus a separate
+test fixture. `just independence` enforces that the product and the fixture
+never share code, so the fixture stays an independent witness of wire behaviour.
+See `figures/fig-arch-5-peer-fabric.svg` for the whole picture and
+`docs/peer-fabric-seam.md` for the seam.
 
-- **`daemon/`** — the product. Modular; all capability behind two traits:
-  `NarinfoSource` (narinfo lookup: upstream HTTP, disk cache; p2p relay in v2)
-  and `NarSource` (resolve a typed `NarKey` — the signed NarHash on the normal
-  path — to a verified NAR stream). The seam carries the exact identity a
-  DHT/claims index resolves, so the p2p swap needs no HTTP-layer change.
-  The iroh transport plugs in here as one `NarSource` implementation behind a
-  `Transport` trait, with a `TransportRegistry` dispatching on the transport
-  tag each claim offer carries — so a second transport (BitTorrent) is a new
-  implementation, not a network fork.
+- **`daemon/`** — the product. All *serving* behaviour sits behind two frozen
+  seams: `NarinfoSource` (narinfo lookup: upstream HTTP, disk cache; p2p relay
+  in v2) and `NarSource` (resolve a typed `NarKey` — the signed NarHash on the
+  normal path — to a verified NAR stream), so the p2p swap needs no HTTP-layer
+  change. All *P2P* behaviour sits behind a third, intention-level seam,
+  **`PeerFabric`** (find providers · announce · locate · fetch · serve ·
+  hold-query · LAN): iroh and libp2p are *backends* behind it, not the
+  architecture, and the content-routing DHT is an **adopted** prior solution
+  (`iroh-dht-experiment` / `libp2p-kad`), not hand-rolled. Target packaging is a
+  stack-neutral `daemon-core` frontend over one backend crate (`fabric-iroh` /
+  `fabric-libp2p`), shipped as **one binary per backend** (`daemon-iroh` /
+  `daemon-libp2p`) so exactly one stack ever links. *Today the daemon is a single
+  crate with iroh welded in; the seam and crate split are the target, not yet
+  built.* A NAR transport plugs in as one `NarSource`/`Transport` impl with a
+  `TransportRegistry` dispatching on each claim offer's tag — so a second
+  transport (BitTorrent) is a new implementation, not a network fork.
 - **`testproxy/`** — the permanent test fixture. A simple caching proxy that
   fronts the upstream (real or mock) and owns all fault injection: latency,
   errors, corruption, throttling. Adversarial-upstream logic never lives in
@@ -192,8 +202,11 @@ Two frozen surfaces, deep-reviewed because changing them splits the network:
 the **claim wire schema** and the **addressed unit** (`RawNarV1` — the exact
 `nix-store --dump` bytes, keyed by plain BLAKE3, which equals the iroh-blobs
 hash by construction). Both are pinned in bytes by golden vectors, so a rename
-or a retag fails a test rather than a deployment. DHT key derivation is the
-third frozen surface and is not settled.
+or a retag fails a test rather than a deployment. The global discovery key
+derivation is the third frozen surface: the *model* is settled — our schema
+frozen as an opaque value inside an adopted DHT substrate, so the substrate's own
+wire format can churn without touching the freeze — while the substrate itself
+(`iroh-dht-experiment` / `libp2p-kad`) is chosen by the TASK-126 spike.
 
 ## Development
 
@@ -243,11 +256,12 @@ exception — it needs no containers, because discovery has no container path ye
 - `TESTING.md` — what good and bad observably mean; the oracles the gates
   enforce.
 - `backlog/` — task tracker (use the `backlog` CLI, not direct file edits).
-- `figures/` — architecture overviews: `fig-arch-1` (wave-1 daemon seams),
-  `fig-arch-2` (test harness), `fig-arch-3` (wave-2 target — the transport
-  half is now built, the discovery half is not).
-  The `fig-candidate-*` originals predate the settled design and are stale
-  until task-17 revises them.
+- `figures/` — architecture overviews: **`fig-arch-5-peer-fabric`** (the whole
+  system: the three seams, iroh/libp2p as swappable backends behind
+  `PeerFabric`, the trust boundary, and the crate topology), `fig-arch-1`
+  (wave-1 daemon seams), `fig-arch-2` (test harness), `fig-arch-3` (wave-2
+  target). The `fig-candidate-*` originals and `fig-arch-3` predate the
+  PeerFabric decision and are stale until task-17 revises them.
 
 ## References
 

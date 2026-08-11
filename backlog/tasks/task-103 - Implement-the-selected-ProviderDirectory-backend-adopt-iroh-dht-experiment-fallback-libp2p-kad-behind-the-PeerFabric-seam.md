@@ -1,10 +1,12 @@
 ---
 id: TASK-103
-title: Implement mandatory decentralized NAR-to-provider-NodeId discovery
+title: >-
+  Implement the selected ProviderDirectory backend (adopt iroh-dht-experiment /
+  fallback libp2p-kad) behind the PeerFabric seam
 status: To Do
 assignee: []
 created_date: '2026-08-10 10:04'
-updated_date: '2026-08-11 19:51'
+updated_date: '2026-08-11 21:22'
 labels:
   - iroh
   - discovery
@@ -19,6 +21,7 @@ dependencies:
   - TASK-102
   - TASK-115
   - TASK-126
+  - TASK-140
 priority: high
 ---
 
