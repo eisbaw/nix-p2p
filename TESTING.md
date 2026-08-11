@@ -30,10 +30,12 @@ yet); it requires the *instrument* to be trustworthy: the measured
 delta must be provably nonzero in a scenario engineered to have one
 (test-proxy cache on vs off).
 
-S4. **Latency bound.** p95 wall-clock of the scripted build with the
+S4. **Historical Wave-1 latency bound.** p95 wall-clock of the scripted build with the
 daemon enabled ≤ 110% of daemon-off, in the harness. (PRD kill
 criterion: this bound plus, in later waves, ≥20% net egress cut on
-the favorable testbed — else the p2p thesis dies.)
+the favorable testbed — else the p2p thesis dies.) TASK-114 supersedes that
+project-wide reading with per-profile rules while preserving this 10% value as
+a hard normal-latency ceiling.
 
 S5. **Scaling laws, measured then modeled (owner requirement, post-
 review).** Behavior at 10s/100s/1000s of peers must be characterized,
@@ -1085,3 +1087,1306 @@ The measured win lives in `just discovery` (or `profile_p2p.py
 same number of keys; the injected RTT must be recovered from the
 measurement, not trusted from the knob — are proven by mutation in
 `discoveryaxis --self-test`, which `just test` runs every cycle.
+
+## Wave-2c experiment contract: two stages, training, then sealed holdout
+
+This section supersedes earlier Wave-2 policy-grounding prose where it
+conflicts, while preserving the measurements and provenance above. Its contract
+version is **`nix-p2p-tournament-v1`** and its scenario generator version is
+**`nix-p2p-scenarios-v1`**. The profile objectives, margins, inherited hard
+bounds and prerequisite budget ownership are defined exactly once in PRD.md,
+“Wave 2c reconciliation and tournament decision contract”; every artifact
+records that section's content hash and the two version strings. A backend,
+codec or public-discovery no-go is evidence, not a missing row.
+
+Before Stage-B manifest generation, the reader validates the inherited numeric
+safety caps named in PRD.md and requires the complete, owner-reviewed TASK-120
+artifact with numeric upload/RAM/disk/fd/discovery/announcement budgets for
+every profile. Missing content, owner review, a profile entry, a number or its
+hash fails before execution with `PROFILE_BUDGET_ARTIFACT_MISSING`; no field is
+filled with a calibration observation or “unbounded.” Frozen caps are checked
+in every opportunity and qualification observation. This preflight is distinct
+from the generator's technical matrix/compute ceilings below.
+
+### Four strongest Wave-2c signals
+
+All four signals require fresh requester store, Nix narinfo cache, daemon cache,
+daemon identity/discovery state as declared by the scenario; provider state is
+created only by the declared store-placement rule. Every peer success requires
+provider-side socket bytes, requester source attribution, upstream-byte
+contrast, S1, and the bounded S2 fault row. An exit-zero build by itself is
+never peer evidence.
+
+1. **Zero-injection Iroh build.** A fresh real Nix requester begins with only an
+   operator participation profile and mechanism-level bootstrap configuration.
+   It receives no `--iroh-peer`, peer address, `--p2p-claim`, claim record or
+   per-content locator. Operational node/address discovery and content
+   discovery find a store-backed provider; provider bytes are nonzero and the
+   upstream payload crossing is absent or reduced as declared. Tracker,
+   named-candidate direct query and supported global DHT results remain
+   separately attributed; an unsupported global DHT remains visible.
+2. **Zero-injection BitTorrent build.** A fresh requester begins with NarHash /
+   StorePath plus operator-level tracker/Mainline bootstrap only. No peer
+   address, magnet, infohash, torrent file, claim, or Iroh discovery result is
+   injected. A standard/evidenced-extension BitTorrent path supplies a real Nix
+   build and records provider bytes, or the exact TASK-117 unsupported branch is
+   emitted. Disabling BitTorrent discovery must restore upstream behavior.
+3. **Stage A raw diagnostic.** Upstream-only, raw Iroh and raw BitTorrent run as
+   paired `diagnostic_uncompressed` arms. It qualifies discovery, attribution,
+   transport correctness and failure behavior; it cannot fit or select policy.
+4. **Stage-B training, followed later by sealed holdout.** Training contains
+   upstream-only, Iroh raw/zstd and BitTorrent raw/compressed-or-evidenced-
+   unsupported. TASK-44 may fit training only. TASK-123 later generates the
+   hitherto nonexistent holdout and adjudicates frozen candidates unchanged.
+
+### Layers are separate evidence, never synthetic end-to-end
+
+Every scenario record has exactly one `measurement_layer`:
+
+- `component_discovery`: starts without a content locator, ends at a bounded set
+  of offers, and records local discovery, node/address bootstrap and named-key
+  content resolve separately. It transfers no NAR payload.
+- `component_transfer`: starts from a recorded explicit offer solely to isolate
+  the transport/codec. Discovery is disabled and the report says that the offer
+  was injected at this layer; this result cannot support a zero-injection claim.
+- `full_real_nix`: starts from the declared fresh state, uses operational
+  discovery with no content-specific injection, and ends at a real Nix store
+  path plus S1/provider/upstream oracles.
+
+Adding component discovery time to component transfer time is a model output,
+not `full_real_nix`. It must never be relabelled end-to-end.
+
+### Stage schemas and arm matrices
+
+Stage A uses schema **`diagnostic-tournament-v1`** with the required closed
+discriminators:
+
+```text
+purpose = "diagnostic_uncompressed"
+diagnostic_uncompressed = true
+policy_training_eligible = false
+base_arms = ["upstream_only", "iroh_raw", "bittorrent_raw"]
+execution_labels = [
+  "upstream_only/A1", "upstream_only/A2",
+  "iroh_raw/A1", "iroh_raw/A2",
+  "bittorrent_raw/A1", "bittorrent_raw/A2"
+]
+```
+
+The schema forbids `policy_candidate`, `objective_score`, fitted thresholds and
+compressed arm records. Its component-transfer and `full_real_nix` records run
+both labels of all three supported base arms; component-discovery has explicit
+`not_applicable` label slots for upstream and a supported/unsupported record for
+each P2P mechanism. Compression being available in the implementation does not
+enable it here.
+
+Stage B uses a different closed schema, **`policy-training-v1`**:
+
+```text
+purpose = "stage_b_training"
+diagnostic_uncompressed = false
+policy_training_eligible = true
+base_arms = ["upstream_only", "iroh_raw", "iroh_zstd",
+             "bittorrent_raw", "bittorrent_compressed"]
+execution_labels = [
+  "upstream_only/A1", "upstream_only/A2",
+  "iroh_raw/A1", "iroh_raw/A2",
+  "iroh_zstd/A1", "iroh_zstd/A2",
+  "bittorrent_raw/A1", "bittorrent_raw/A2",
+  "bittorrent_compressed/A1", "bittorrent_compressed/A2"
+]
+```
+
+`bittorrent_compressed` is either measured or has
+`cell_status=evidenced_unsupported` plus TASK-117/TASK-121 artifact hashes.
+Every matrix cell has one of `measured`, `evidenced_unsupported`, `invalid`,
+`excluded`, or `failed`; omission and numeric imputation are schema errors. The
+same applies to backend-specific NAT, relay, tracker, Mainline and global-DHT
+cells. Stage B does not choose a default.
+
+`A1` and `A2` are indistinguishable configurations with separate fresh-state
+executions; the suffix is a blinded experimental label, not a policy variant.
+Both labels for every supported base arm execute throughout calibration and
+extension, before best-static or adaptive policy selection exists. For an
+unsupported or `not_applicable` base-arm cell, the base cell remains explicit
+and both label slots record the same nonnumeric status/evidence; neither label
+executes and no A/A metric is fabricated. Primary effects use only the
+canonical `A1` dataset. `A2` is validation-only and never counts as another
+cluster or increases N.
+
+The TASK-44 reader accepts only `policy-training-v1` with
+`policy_training_eligible=true`. Feeding it Stage A must fail before parsing any
+metric with **`STAGE_A_POLICY_INPUT_FORBIDDEN`**. A mutation that flips/removes
+any discriminator or adds a policy field is a required bite. File extensions,
+directory names and caller assertions are not the boundary; the closed typed
+schema is.
+
+### Versioned scenario-generation contract
+
+`nix-p2p-scenarios-v1` is a pure manifest function. Its typed input is
+`{experiment_version, partition, seed_256, workload_catalog,
+network_catalog, supported_capabilities, execution_label_contract, profiles,
+planning_contrast_catalog, generation_plan, exclusion_registry}`. `partition`
+is exactly `development`, `training`, or `holdout`; the last value additionally
+requires the permit described below. `execution_label_contract` is the complete closed
+base-arm-to-`[A1,A2]` mapping printed in the selected Stage schema; bytewise JCS
+inequality, a missing label or an extra label rejects generation.
+`profiles` is exactly the ordered list
+`[upstream_only,consume_only,lan_share,public_share]`, so one invocation can
+enforce the cross-profile partition ceilings rather than relying on four
+uncoordinated per-profile calls.
+`generation_plan` is the following closed tagged union (fields from another tag
+are forbidden):
+
+```text
+{"phase":"calibration","replicates_per_opportunity_stratum":20}
+{"phase":"extension","calibration_manifest":complete_jcs_object,
+ "calibration_manifest_hash":sha256,"calibration_results_hash":sha256,
+ "planning_artifact":complete_jcs_object,"planning_artifact_hash":sha256}
+{"phase":"fixed","source_training_plan":complete_jcs_object,
+ "source_training_plan_hash":sha256}
+```
+
+Training uses `calibration` and then, if calibration is usable, one `extension`;
+holdout uses only `fixed` with the training-frozen target map. Development may
+use `fixed`, but cannot supply a holdout permit. Development/training seeds are
+32 bytes rendered as 64 lowercase hexadecimal digits. No holdout seed or
+holdout input exists yet. Every complete object above is canonicalized and its
+declared hash verified; a hash without its content is rejected. Calibration and
+fixed phases emit all qualification rows once. Extension emits only opportunity
+ordinals 20 onward, so qualification rows are not accidentally multiplied by
+the two training phases.
+
+#### Canonical bytes, catalogs and identifiers
+
+Every hash and equality check uses RFC 8785 JSON Canonicalization Scheme (JCS)
+UTF-8 bytes, not a language's default JSON printer. Contract objects use only
+objects, arrays, booleans, strings and integers in `[-(2^53-1), 2^53-1]`;
+floating point, `null`, duplicate object keys, invalid UTF-8 and non-ASCII
+schema keys/IDs are rejected before hashing. JCS does not normalize strings, so
+catalog production must emit NFC and the reader rejects a string that changes
+under NFC. A `*_hash` is lowercase hexadecimal SHA-256 of the complete JCS byte
+sequence. Distinct JCS rows with the same digest fail `HASH_COLLISION`; they are
+never collapsed.
+
+The workload catalog is the complete, immutable list of candidates available to
+this experiment version. Each entry has a unique ASCII `candidate_id`, an
+ordered list of store-path tokens, exact path count, total and maximum NarSize,
+and the upstream FileSize/NarSize quartile labels needed below. The network
+catalog is likewise the complete list of topology templates, each with a unique
+ASCII `topology_id`, sorted ASCII `node_id`s, designated requester/provider
+roles, physical-network labels, and an explicit ordered list of supported NAT
+paths. Its node count must be exactly the count named by its topology stratum;
+a mismatch rejects the catalog. Entries are sorted by the unsigned UTF-8 bytes
+of their ID before use; input order is not evidence. The catalogs contain no
+sampling weight. Catalog hashes, not abbreviated summaries, travel in every
+manifest.
+
+`exclusion_registry` is the complete immutable JCS object
+`{registry_version, previous_entry_hash, concrete_tuple_ids}`. The listed IDs
+are exactly the full concrete identities defined below, not symbolic-row or
+catalog-pair aliases. IDs are unique, lowercase SHA-256 hex sorted by raw digest
+bytes; duplicate, unsorted or invalid IDs reject the input. The generator
+verifies and records
+`exclusion_registry_hash=SHA256(JCS(exclusion_registry))`; a hash without the
+content is not a usable input. Development/training supply their frozen registry
+snapshot, while holdout supplies the exact independently witnessed snapshot
+named by its permit.
+
+`supported_capabilities` is a closed map keyed by stage arm, topology stratum,
+NAT/path and discovery mechanism. A value is `measured_capable` or
+`evidenced_unsupported` with a nonempty evidence hash. It may label a generated
+cell unsupported but cannot remove the row from the inventory. An absent key is
+`CAPABILITY_UNDECLARED` and invalidates generation.
+
+#### Frozen planning-contrast catalog
+
+Before the first calibration cluster, TASK-128 freezes the selector schema,
+pure interpreter and enumeration code hashes. The complete
+`planning_contrast_catalog` is a JCS object containing those hashes and, for
+each selectable profile, sorted arrays of `selector_artifacts`,
+`best_static_comparators`, and `contrasts`. Each selector artifact contains a
+full closed selector AST, its exact integer/string hyperparameters, required
+causal-trace fields, allowed base arms and
+`selector_id=SHA256(JCS(selector_artifact))`. It must be total and deterministic
+on every logical opportunity trace. Ranges, wildcards, training-filled fields
+and unspecified defaults are forbidden: choosing parameters later means TASK-44
+chooses one already enumerated exact artifact using A1, not that it creates a
+new parameter value.
+
+TASK-128 also freezes the closed causal trace schema and replay interpreter.
+One label-local trace bundle contains pre-execution context plus only
+observations available by each decision timestamp: discovery/offer state,
+elapsed monotonic time, source-attributed bytes, rolling throughput, integrity
+or terminal state, timers and confirmed path events. It contains no future
+event, other-label field or post-hoc outcome summary. `Replay(selector,trace)`
+emits the ordered start/abort/hedge/race/fallback actions and derives latency,
+bytes, upload and waste from provenance; a static one-arm selector is merely a
+special AST. Replay is run independently on A1 and A2 trace bundles. Every
+dynamic selector class needs hashed development replay-versus-live parity
+evidence before catalog freeze, with the same A1/A2-by-class matrix,
+independent fresh states and label-matched traces required below. Each dynamic
+artifact's immutable catalog entry also names blinded
+`training_parity_qualification_id`s that the calibration manifest must execute;
+their hashed pass result is required before TASK-44 nomination. Missing/failed
+training parity marks every catalog contrast containing that selector
+`replay_parity_ineligible` without rewriting or removing any catalog entry. A
+whole-arm `selector(context)`
+shortcut cannot qualify abort, hedge, race, throughput-adaptive or layered
+behavior.
+
+Every dynamic selector artifact names exactly eight blinded
+`selector_parity_qualification_id`s, one for each Cartesian pair of label
+`A1,A2` and closed scenario class:
+`clean_early_choice`, `slow_hit_abort`, `delayed_alternate_hedge_race`, and
+`throughput_drop_layered_fallback`. Their frozen predicates respectively require
+a healthy prompt source; an advertised source that stalls before completion
+with a healthy alternate; an incomplete first path at the frozen hedge timer
+with a usable delayed alternate; and initial payload progress followed by a
+rate collapse/terminal event with a healthy next-layer or upstream fallback.
+From the bounded `full_real_nix` qualification targets, the generator takes the
+raw-`target_row_id`-first feasible row for each predicate before calibration;
+outcomes and human-supplied row overrides are forbidden. The catalog freezes
+the exact rows and
+`selector_parity_qualification_id=SHA256(JCS({profile,selector_id,class,label,
+target_row_id}))`. The four underlying rows are included within that profile's
+64-row qualification ceiling and may be shared as scenarios, but every
+`(selector_id,class,label)` has a distinct execution ID and live slot. A
+missing class/label pair or duplicate ID is `CONTRAST_CATALOG_INCOMPLETE`.
+
+For each selector and class, the live policy runs twice from independently
+fresh state: once as A1 and once as A2. Each replay consumes only the matching
+already-recorded base-arm label trace bundle and adds no live execution; an A1
+live result can be compared only with A1 replay, and likewise for A2. Live
+executions run in raw parity-execution-ID order after a seeded Fisher-Yates
+relabeling, with a fresh reset between them. Parity compares the
+ordered causal action/provenance trace and exact byte/source/terminal fields;
+the schema names any timing tolerance. These qualification-only executions are
+closed `parity_execution` records keyed by qualification ID, selector ID,
+class and label; they are not base-arm `execution_labels`, do not enter the Williams
+schedule, A/A, N or an estimand, and cannot carry an objective score. Static
+one-arm artifacts need no dynamic live-parity slot. The budget nevertheless
+assumes all 16 artifacts are dynamic: at most `4*2*16=128` live slots per
+profile and 384 across the three selectable profiles.
+
+The catalog also has a closed `required_selector_class_inventory` covering
+static raw/compressed Iroh and BitTorrent where capable, slow-HIT abort,
+delayed hedge/race, throughput-adaptive selection and layered alternate/fallback.
+Each class is either represented by at least one exact selector artifact or has
+an `evidenced_unsupported` record and nonempty evidence hash. Omitting a class,
+exact artifact or supported base arm is `CONTRAST_CATALOG_INCOMPLETE`, never an
+implicit narrowing of the tournament.
+
+Possible best-static comparators are the complete sorted set of capable P2P
+base arms (`iroh_raw`, `iroh_zstd`, `bittorrent_raw`, and
+`bittorrent_compressed`, at most four); upstream remains the fixed external
+comparator. For each profile, `contrasts` is the exact Cartesian product of its
+selector artifacts and possible best-static comparators, with
+`contrast_id=SHA256(JCS({profile,selector_id,best_static_base_arm}))`. The
+reader recomputes that product and rejects omissions, additions, duplicate IDs
+or unequal JCS objects.
+
+##### Frozen numeric planning injections
+
+The catalog contains the complete `planning_injection_contract` object and
+`planning_injection_contract_hash=SHA256(JCS(planning_injection_contract))`.
+Every contrast and hypothesis case names that hash. The object includes
+`solver_version="linked-coordinate-v1"`, the ordered solver operations and all
+physical-domain predicates below,
+`arithmetic="ieee754-binary64-round-to-nearest-ties-even"`, and the reduced
+rational transform-unit tolerance `1/1099511627776` (`2^-40`). The frozen
+analysis binary and Nix closure supply the logged `ln`/`exp` implementation. It
+encodes numbers without JSON floats: a rational is
+`{"form":"rational","num":n,"den":d}` and a scaled natural logarithm is
+`{"form":"scaled_ln_ratio","scale_num":s_n,"scale_den":s_d,
+"ratio_num":r_n,"ratio_den":r_d}`. Denominators and ratio terms are positive,
+fractions are reduced, and zero is the rational `0/1`. Any other encoding,
+missing rule or unequal recomputed hash is `PLANNING_INJECTION_CONTRACT_INVALID`
+before calibration.
+
+The following is the exact semantic table serialized in that object; `t` is
+the injected statistic in one stratum, `a` is the candidate, `b` best-static,
+`u` upstream, `f[x]=U[x]/U[u]`, and
+`R[x]=sum(U[u]-U[x])/sum(P[x])`:
+
+| Rule ID | Decision direction and boundary | Joint-power alternative | Exact coordinate equation |
+|---|---|---|---|
+| `consume_benefit` | lower, `1/20 = 0.05` | `3/40 = 0.075` | `mean(f[b/A1]-f[a/A1])=t` |
+| `p2p_egress_cut` | lower, `1/5 = 0.20` | `3/10 = 0.30` | `mean(1-f[a/A1])=t` |
+| `lan_log_benefit` | lower, `ln(20/19) = -ln(0.95)` | `(3/2)*ln(20/19)` | `Q95(L[a/A1])/Q95(L[b/A1])=exp(-t)` |
+| `public_log_relief_improvement` | lower, `ln(11/10)` | `(3/2)*ln(11/10)` | `R[a/A1]/R[b/A1]=exp(t)` |
+| `public_absolute_log_relief` | lower, `0/1` | `ln(11/10)` | `R[a/A1]=exp(t)` |
+| `p2p_latency_guard` | upper, `ln(11/10)` | `0/1` (no regression) | `Q95(L[a/A1])/Q95(L[u/A1])=exp(t)` |
+| `aa_egress` | equivalence boundaries `-(1/20), +(1/20)` | `0/1` | `mean(f[x/A1]-f[x/A2])=t` |
+| `aa_latency` | equivalence boundaries `-ln(21/20), +ln(21/20)` | `0/1` | `Q95(L[x/A2])/Q95(L[x/A1])=exp(t)` |
+| `aa_relief` | equivalence boundaries `-ln(11/10), +ln(11/10)` | `0/1` | `R[x/A2]/R[x/A1]=exp(t)` |
+
+The contract records the applicable profile and candidate/comparator/upstream
+series for every row. A joint-power case assigns every applicable performance
+row its displayed alternative and every required A/A row zero. A performance
+boundary case changes only the named rule and boundary stratum; an A/A boundary
+case changes only the named series, sign and boundary stratum. Thus a case
+cannot silently substitute a more favorable alternative.
+
+The frozen consistent-coordinate solver applies those targets to the centered
+whole-cluster vector in this order, using a single shared coordinate graph for
+all aliases of an underlying field:
+
+1. Keep each positive upstream denominator `U[u/d,c]` fixed. Apply one additive
+   constant to each required fraction series. Candidate A1 is shifted to solve
+   the egress equation; for consume-only, comparator A1 is then shifted to solve
+   its benefit equation. For public-share, where comparator egress is a nuisance
+   rather than a rule, shift comparator A1 so its upstream-byte-weighted avoided
+   numerator equals the candidate's. Recompute `U[x/d,c]=f[x/d,c]*U[u/d,c]`
+   and `D[x/d,c]=U[u/d,c]-U[x/d,c]`; fraction, byte and relief-numerator views
+   may not diverge.
+2. Multiply each complete positive latency series by one positive scalar.
+   Candidate A1 first solves the upstream guard; LAN comparator A1 then solves
+   the candidate/comparator ratio. Type-7 Q95 is scale-equivariant, so the
+   displayed equations are exact without changing within-series ranks.
+3. For public relief, require positive candidate and comparator sums of `D` and
+   positive centered upload sums. Scale each complete nonnegative upload series
+   by one positive scalar so candidate absolute relief is `exp(t_abs)` and
+   comparator relief is `R[a]*exp(-t_relative)`.
+4. Inject A/A last. An additive A2 fraction shift solves its displayed A1-A2
+   mean; a positive A2 latency scale solves its Q95 ratio. For relief A/A, derive
+   the A2 numerator from its already-linked fraction/byte coordinates, give an
+   otherwise-unconstrained comparator A2 numerator the same positive total as
+   comparator A1, then scale A2 upload to `R[A1]*exp(t_aa)`. All other required
+   A/A targets remain exactly zero.
+
+Each operation preserves cluster indices and residual ordering; the complete
+joint vector is still resampled as one unit. After solving, recompute every
+target from the linked coordinates. Nonfinite/nonpositive denominators or
+latencies, a negative implied payload/upload byte count, a nonpositive required
+relief numerator/upload sum, an inconsistent shared view, or target mismatch is
+`PLANNING_INJECTION_PHYSICAL_DOMAIN` for that contrast. Clipping, projection,
+replacement and retry are forbidden; the contrast becomes
+`injection_domain_ineligible`, while unrelated contrasts remain usable.
+
+The finite planning limits are:
+
+```text
+MAX_SELECTOR_ARTIFACTS_PER_PROFILE = 16
+MAX_BEST_STATIC_COMPARATORS_PER_PROFILE = 4
+MAX_PLANNING_CONTRASTS_PER_PROFILE = 64
+MAX_PLANNING_CONTRASTS_TOTAL = 192
+MAX_PLANNING_HYPOTHESIS_CASES_PER_CONTRAST = 64
+PLANNING_SYNTHETIC_EXPERIMENTS_PER_CASE = 128
+PLANNING_BOOTSTRAP_DRAWS_PER_EXPERIMENT = 10000
+MAX_TOTAL_PLANNING_CONTRAST_DECISIONS_U64 = 15728640000
+```
+
+The 64 cases include the power alternative. The worst public-share contrast is
+exactly `1 + 4*4 + 4*2*5 = 57`: one joint alternative; four possible boundary
+strata for each of primary, egress, absolute-relief and latency-guard rules; and
+two signs in four strata for five required A/A series/transforms (candidate and
+comparator relief, candidate egress, candidate latency and upstream latency).
+Other profiles require fewer cases. The checked-u64 worst-case total is exactly
+`192*64*128*10000 = 15728640000` authoritative-N contrast-decision evaluations.
+Catalog counts, case counts and checked multiplication are recorded before
+calibration; overflow or exceeding a bound fails
+`CONTRAST_CATALOG_BUDGET_EXCEEDED`. More policy space requires a new experiment
+version and an explicitly raised reviewed ceiling, not pruning selectors after
+seeing data. N=125 is not simulated in v1; it may be added only as labeled
+diagnostic work under a new compute artifact and can never rescue N=100.
+
+After centered planning below and before TASK-44 sees training A1, the planning
+custodian releases only a JCS eligibility mask containing catalog hash, global
+`N_required=100`, planning-artifact hash and one
+`{contrast_id,status,reason_code}` per contrast. Status is `eligible_at_100`,
+`structurally_ineligible`, `replay_parity_ineligible`, or
+`injection_domain_ineligible`, or `underpowered_at_100`. Structural status uses
+only the frozen catalogs/capabilities, parity status only the predeclared
+qualification oracle, injection status only the frozen solver's physical-domain
+checks, and underpower status only centered power/null criteria. The mask exposes no
+raw A2, residual, per-label effect,
+uncentered statistic, boundary rate or directional result. Full planning bytes
+remain sealed until candidate and best-static hashes freeze, then an
+independent reader may verify them. This coarse mask/global-N interface is not
+an A2 outcome channel.
+
+The factor domains are frozen below in their displayed order. `MiB`/`KiB` mean
+powers of two; bandwidth is payload octets per second at the named socket, not
+NarSize per second. The eight cache/peer link dimensions are atomic factors;
+they are never collapsed into a 144-level tuple.
+
+| Factor | v1 levels / generation rule |
+|---|---|
+| Workload | `small_head`: 1–8 paths and 1–32 MiB total NarSize; `wide_closure`: 128–512 paths and 256 MiB–2 GiB total NarSize; `large_tail`: at least one 64–256 MiB NarSize and at most 4 GiB total; `compression_mix`: at least 20 paths spanning all available upstream FileSize/NarSize quartiles. Complete workload candidates, not individual paths, are selected from the versioned catalog by the partition seed; a catalog unable to satisfy a stratum emits unsupported, never a hand-picked substitute. |
+| Topology stratum/template binding | Logical levels are `component_2_namespace`, `swarm_10_namespace`, `swarm_30_process`, and `real_3_network`. `component_2_namespace` supports `component_discovery` and `component_transfer`; `swarm_10_namespace` supports all three layers; `swarm_30_process` supports **only** `component_discovery` resource-law qualification and can never emit `component_transfer` or `full_real_nix`; `real_3_network` supports only `full_real_nix`. Once a topology-stratum and NAT/path pair is chosen, the seeded binding rule below selects one compatible concrete `topology_id` before any capacity-dependent factor. Unsupported backend/topology cells stay present, but a layer mismatch is structurally invalid. |
+| Requester/store state | Requester Nix store, XDG/Nix narinfo cache and daemon cache are fresh for every scored pair. Swarm seen fraction is `0`, `2500`, `5000`, or `10000` basis points. Provider identity persistence is `false` or `true`, never inherited accidentally. |
+| Holder selector | The fixed five-level domain is `none`, `one`, `two`, `half`, `all`. After `topology_id` is bound with exact provider capacity `P>=1`, resolve respectively to `0`, `min(1,P)`, `min(2,P)`, `ceil(P/2)`, and `P` holders. Placement is seed-derived and recorded, not inferred from either selector or count. |
+| NAT/path | `same_l2_direct`, `public_direct`, `cone_nat_hole_punched`, `symmetric_nat_relay_required`, `relay_unavailable`. Confirmed observed path is required; configuration narration does not select the level. A backend without a relay cell emits evidenced unsupported. |
+| Dependency state | Ordered levels are `available`, `dns_unavailable`, `tracker_unavailable`, `relay_service_unavailable`, `mainline_bootstrap_unavailable`, and `iroh_seed_unavailable`. `available` schedules no outage. Every other level creates exactly one event from monotonic offset 0 through `trial_window_ns` for the named dependency. The row remains for every arm; an arm that does not use that dependency records `not_applicable`, never silently removes it. |
+| Cache RTT | `cache_rtt_ms` = `0`, `25`, `75`, `150`. |
+| Cache bandwidth | `cache_bandwidth_bytes_compressed_wire_per_s` = `unshaped`, `5*2^20`, `20*2^20`, `100*2^20`. |
+| Cache loss | `cache_loss_basis_points` = `0`, `100`, `500`. |
+| Cache jitter | `cache_jitter_p95_ms` = `0`, `5`, `25`. |
+| Peer RTT | `peer_rtt_ms` = `0`, `25`, `75`, `150`. |
+| Peer bandwidth | `peer_bandwidth_bytes_compressed_wire_per_s` = `unshaped`, `5*2^20`, `20*2^20`, `100*2^20`. |
+| Peer loss | `peer_loss_basis_points` = `0`, `100`, `500`. |
+| Peer jitter | `peer_jitter_p95_ms` = `0`, `5`, `25`. Direction and measured application point are recorded for every link factor. |
+| Nix concurrency | `(max-substitution-jobs,http-connections)` = `(1,1)`, `(16,25)`, `(128,128)`. Readback and measured overlap must equal the requested level. |
+| Churn | `holder_churn_basis_points_per_minute` = `0, 1000, 5000`; seeded join/leave times and the actually observed live-holder series are recorded. |
+| Herd selector | The fixed three-level domain is `one`, `ten`, `all_requesters`. After binding exact requester capacity `R>=1`, resolve respectively to `min(1,R)`, `min(10,R)`, and `R` concurrent requesters. Measured first-request start skew must be at most **100 ms**; otherwise the row is invalid. |
+| Liar selector/kind | The fixed `liar_selector` domain is `none`, `one`, `half_holders`; after holder resolution to `H`, these resolve to `0`, `min(1,H)`, and `ceil(H/2)`. `lie_kind_offset` is `not_applicable` when the realized count is zero and otherwise one of `wrong_locator`, `corrupt_bytes`, or `oversized_slow_body`. Assigned liars cycle through the three kinds starting at that offset. A realized one-liar anchor exists at each offset, so every kind is generated and hits its named integrity/resource oracle. |
+| Slow holders | `slow_mode` = `unshaped`, `cap_64k`, `cap_1m`, or `stall_at_2500bp`; caps mean respectively `64*2^10` and `1*2^20 bytes_compressed_wire/s`, and the stall point is basis points of signed NarSize. Measured rate/stall point, not the knob, defines validity. |
+| Leeching | `leech_fraction_basis_points` = `0`, `5000`, `9000`, or fault-only `10000`. The `10000` level selects every available provider and supplies the mandatory all-leech anchor. Publication-disabled and serve-disabled are two recorded booleans; lookup leakage is measured independently rather than inferred from “leech”. |
+
+Selector resolution has one canonical alias rule. For holder, herd and liar
+selectors separately, group all symbolic selectors that resolve to the same
+integer under the bound template/`H`; the first selector in the displayed
+domain order is canonical and the ordered full group is `selector_aliases`.
+Construct physical rows from realized integers plus the canonical selector and
+alias list, then merge JCS-identical physical rows before target IDs, row counts
+or execution. IPOG coverage expands the alias lists, so one physical execution
+covers every logically identical selector pair; aliases never become duplicate
+scenarios or extra statistical weight.
+
+#### Exact PRF and unbiased selection
+
+For a 32-byte seed, partition and an ASCII domain matching
+`[a-z0-9/_-]+`, byte block `c` is:
+
+```text
+HMAC-SHA256(
+  key = seed_256,
+  data = ASCII("nix-p2p-scenarios-v1") || 0x00 || ASCII(partition) ||
+         0x00 || ASCII(domain) || 0x00 || U64BE(c))
+```
+
+Each operation owns one uniquely named domain and a stream formed by
+concatenating blocks for counters `0,1,...`; counters and stream cursors never
+cross domains. `uniform(m)` reads the next eight bytes as unsigned big-endian
+`x`, sets `limit = 2^64 - (2^64 mod m)`, rejects `x >= limit`, and otherwise
+returns `x mod m`; `m=0` is an error. A permutation is unbiased Fisher-Yates,
+iterating `i=n-1` down to `1` and swapping `a[i]` with
+`a[uniform(i+1)]`. There is no modulo bias, implicit platform RNG, hash-map
+iteration or relative weight.
+
+Normative development-only test vectors (they contain no holdout material):
+
+```text
+JCS input:       {"z":1,"a":[3,true,"x"]}
+JCS bytes:       {"a":[3,true,"x"],"z":1}
+SHA-256:         9a69ee35dfc4bdc6e0d09549c9dfb36b2b0fc7df880abd98c0465bdfff58436b
+
+seed_256:        000102030405060708090a0b0c0d0e0f
+                 101112131415161718191a1b1c1d1e1f
+partition:       development
+domain:          test/vector
+block 0:         fb7d84fff1dc00caf59d4d883b38de5c
+                 719cf1f5b2505063df3b0944e5ff16d7
+shuffle a,b,c,d: d,b,a,c
+```
+
+An implementation that misses any vector cannot emit a manifest.
+
+#### Bounded target construction; no Cartesian universe
+
+The generator constructs opportunity targets once per coarse
+`(profile, full_real_nix, workload_stratum)` decision stratum. It constructs
+the **entire** qualification target set once per `(profile, measurement_layer)`;
+workload stratum is an IPOG factor there, so the 64-row qualification cap is not
+multiplied by four workloads. For opportunity construction, topology stratum
+and NAT/path are the first two varying factors; for qualification they follow
+workload stratum. They never create nested per-template target sets. When
+topology and NAT are both assigned, sort the compatible catalog
+templates by raw `topology_id`, shuffle with domain
+`template/<partition>/<profile>/<layer>/<workload-stratum>/<topology-stratum>/<nat-path>`,
+and bind the first concrete `topology_id`. That binding occurs before fixed
+holder/herd/liar selectors are resolved, canonicalized, assigned target-row IDs
+or placed, so all capacity-dependent values use exact catalog capacities
+without multiplying rows by catalog size. A
+workload candidate must satisfy every inclusive bound of its named workload
+stratum; a candidate satisfying multiple strata is independently eligible in
+each. A selected topology must list the NAT/path. These checks, the table's
+layer allow-list, and the following ordered local rules are the complete
+feasibility predicate:
+
+1. the already-bound template must have `P>=1` and `R>=1`; holder and herd
+   selectors resolve and canonicalize by the rule above, then the liar selector
+   resolves from the realized `H`. A zero liar count forces
+   `lie_kind_offset=not_applicable`; a positive count requires exactly one of
+   the three declared offsets;
+2. `H=0` forces zero churn and `slow_mode=unshaped`;
+   `component_discovery` forces `slow_mode=unshaped`; and
+   `component_transfer` forces seen fraction `0` and persistence `false`;
+3. the herd selector resolves against the bound requester capacity; and
+4. `relay_unavailable` and every dependency state other than `available` are
+   deliberate fault rows, never normal paths. A non-applicable dependency/arm
+   cell is retained with that status.
+
+Backend capability does not remove a target. Every target is crossed with every
+stage arm; an incapable cell is retained as `evidenced_unsupported` with its
+evidence hash. Upstream `component_discovery` is explicit `not_applicable`.
+
+Each target row carries exactly one `decision_use`. A row is
+`performance_opportunity` only when its layer is `full_real_nix`, `H>0`, NAT is
+not `relay_unavailable`, churn/lying/leech are zero, `slow_mode=unshaped`, and
+dependency state is `available`. All component rows and every zero-holder,
+all-leech or serve-disabled, unavailable/unsupported selected mechanism,
+corrupt/lying, slow/stalled, churn, relay/dependency outage, or deliberately
+forced-fallback row are `fault_qualification`. Classification uses only the
+frozen manifest, candidate selector, capability map and scheduled events before
+results are read. A frozen candidate must have a measured capable selection in
+every required normal opportunity target; reclassifying one because its chosen
+mechanism is unsupported fails `OPPORTUNITY_COVERAGE_INCOMPLETE` rather than
+shrinking the estimand. Every workload stratum has cold and warm honest
+one-holder normal anchors. If those anchors cannot be built, generation fails
+`OPPORTUNITY_SET_EMPTY`.
+
+Targets are constructed without enumerating a Cartesian product:
+
+Before growth, enumerate only unordered factor-name pairs and their ordered
+symbolic-level pairs. `pair_feasible` first applies this closed conditional
+closure: nonzero churn, a liar selector that realizes positive or a non-default
+slow mode requires a holder selector that realizes positive; a concrete
+lie-kind offset defaults an unset liar selector to `one`; a realized zero-holder
+selection conflicts with any of those; and all remaining unset conditional
+fields take their declared normal selector/level. It then scans the
+precomputed, PRF-ranked compatible `(topology-stratum,NAT/path,topology_id)`
+bindings (at most `3*5*16=240` for any layer) and returns the first binding that
+satisfies fixed topology/NAT plus the resolved holder/herd/liar selectors. No
+binding means the pair is infeasible. The returned binding and all canonical
+aliases are recorded as the pair's completion witness. Because every structural
+dependency is in that closure or the earlier topology binding, this is a
+bounded scan with no recursive search/backtracking.
+
+1. Add the cold/warm opportunity anchors. Add fault anchors for zero holders,
+   all providers leeching with publication/serve disabled, each lying kind,
+   every non-default slow mode, each nonzero churn level, relay unavailable,
+   every non-available dependency state, and selected-mechanism unsupported.
+   Add first/last-level OFAT rows from the
+   appropriate cold opportunity or fault anchor. Merge exact JCS duplicates and
+   retain the sorted role union.
+2. Run deterministic IPOG-style pairwise growth independently for opportunity
+   and qualification factors. Opportunity factor order is topology stratum,
+   normal NAT/path, seen fraction, identity persistence, a holder selector that resolves positive, the eight
+   atomic link factors in table order, Nix concurrency and herd selector; dependency,
+   churn, liar selector/kind, slow and leech are fixed at their normal levels.
+   Qualification prepends workload stratum and then uses the full order
+   including dependency, churn, liar selector, lie-kind offset, slow and leech.
+   Seed the table
+   with every feasible pair of the first two factors. For each later factor,
+   visit existing rows in their fixed PRF rank and choose the locally feasible
+   level covering the most uncovered pairs; ties use domain
+   `ipog/level/<profile>/<layer>/<coarse-id>/<factor>/<row-id>`. Then visit
+   uncovered feasible pairs in domain `ipog/vertical/...` rank, create a
+   partial row containing that pair, and fill unset earlier factors in order
+   with the feasible level covering most remaining pairs using the same tie
+   rule. A partial assignment that violates an ordered local rule is discarded
+   immediately; the algorithm never scans or materializes full combinations.
+3. Directly verify that every declared feasible pair occurs in the result and
+   that no infeasible pair does. An uncovered feasible pair, a row without a
+   completion, or any ceiling below is `MATRIX_BUDGET_EXCEEDED`; rows are never
+   sampled, truncated, or silently dropped to fit.
+
+Normative development-only IPOG vector: factors `a,b,c`, each with ordered
+levels `0,1`, have no constraints; initial-row rank is `00,01,10,11` and level
+tie rank is `0,1`. Horizontal growth must produce, in order,
+`000,011,101,110`; all 12 cross-factor value pairs are then covered and vertical
+growth adds no row. A different result cannot emit a manifest.
+
+The following technical ceilings bound generator and execution work; they are
+not substitutes for TASK-120 product resource budgets:
+
+```text
+MAX_TOPOLOGY_TEMPLATES_PER_TOPOLOGY_STRATUM = 16
+MAX_WORKLOAD_CANDIDATES_PER_WORKLOAD_STRATUM = 64
+MAX_OPPORTUNITY_ROWS_PER_DECISION_STRATUM = 48
+MAX_QUALIFICATION_ROWS_PER_PROFILE_LAYER = 64
+MAX_TARGET_ROWS_PER_PROFILE_LAYER = 256
+MAX_OPPORTUNITY_CLUSTERS_PER_DECISION_STRATUM = 100
+MAX_SCENARIO_CLUSTERS_PER_PROFILE = 592
+MAX_SCENARIO_CLUSTERS_PER_PARTITION = 2368
+MAX_BASE_EXECUTION_LABEL_SLOTS_PER_PARTITION = 23680
+TRAINING_SELECTOR_PARITY_SCENARIO_CLASSES_PER_ARTIFACT = 4
+TRAINING_SELECTOR_PARITY_LABELS_PER_SCENARIO_CLASS = 2
+MAX_TRAINING_PARITY_EXECUTION_SLOTS_PER_PROFILE = 128
+MAX_TRAINING_PARITY_EXECUTION_SLOTS_PER_PARTITION = 384
+MAX_STAGE_B_EXECUTION_SLOTS_PER_PARTITION = 24064
+MAX_PAIR_FEASIBILITY_BINDING_PROBES_PER_PROFILE_LAYER = 2000000
+MAX_CONCRETE_ID_PROBES_PER_PARTITION = 100000
+```
+
+There are exactly four opportunity decision strata per profile, keyed only by
+`(profile, full_real_nix, workload_stratum)`. Thus the computable worst case is
+`4*100 + 3*64 = 592` clusters per profile and `4*592 = 2368` per partition.
+Stage B has at most ten execution-label slots per cluster (five base arms times
+two labels), hence `2368*10 = 23680` base slots; Stage A has at most six. The
+four selector-parity classes reuse four qualification scenarios already
+counted in each profile's 64-row ceiling, so they add no scenario cluster, but
+up to 16 dynamic selector artifacts execute fresh A1 and A2 live parity in each
+class. They therefore add at most `3*16*4*2 = 384` live slots, for a total
+Stage-B ceiling of `23680+384 = 24064`. Unsupported and not-applicable
+base-label slots remain
+explicit but do not execute, so they cannot exceed the declared base maximum
+or masquerade as clone observations.
+Full-real-Nix target rows are at most `4*48 + 64 = 256` per profile/layer;
+component layers have at most 64 each. The generator records all these counts
+before execution. It also records every pair-feasibility binding probe and
+concrete-identity probe. Exceeding any bound fails `MATRIX_BUDGET_EXCEEDED`;
+enumeration never continues unbounded and execution never starts.
+The largest qualification domain has 22 atomic factors and 81 total levels, so
+direct level-pair enumeration has at most
+`(81^2 - sum(level_count^2))/2 = 3123` pairs and at most
+`3123*240 = 749520` binding probes, below the declared ceiling.
+
+No row count or catalog frequency is a weight. Changing a domain/order,
+feasibility rule, classification, anchor, pair definition, IPOG mechanics,
+ceiling, PRF or catalog eligibility is a generator-version change.
+
+#### Coarse decision strata, concrete placement and IDs
+
+`decision_stratum_id` is SHA-256 of JCS
+`{experiment_version,profile,measurement_layer:"full_real_nix",
+decision_use:"performance_opportunity",workload_stratum}`; it is deliberately
+not a target-row ID. Within each decision stratum, sort the unique opportunity
+target rows by raw `target_row_id=SHA256(JCS(target_row))`. Put the cold anchor
+then warm anchor first; shuffle all remaining rows once with domain
+`row-schedule/<partition>/<decision-stratum-id>` and append them. Assign cluster
+ordinal `i` row `i mod row_count`. `N_required` must be at least `row_count`, so
+every nuisance row runs, repetition counts differ by at most one, and the pilot
+always contains both anchors. Fault and component qualification rows run
+exactly one cluster each and have `qualification_row_id`, not an inferential N.
+
+The calibration manifest always contains exactly ordinals `0..19` in every
+opportunity stratum. If `row_count>20`, these are the first 20 entries of the
+already-frozen cyclic schedule, not a regenerated or favorable subset; the
+extension continues at ordinal 20 and `N_required>=row_count` guarantees that
+the final inferential sample covers every target. The pilot is used only for
+power planning, never for candidate direction or row selection. Unseen
+nuisance interactions can therefore reduce realized power and yield no winner,
+but cannot be dropped from the final interval or create a favorable resample;
+the final A/A and decision intervals use the complete calibration-plus-extension
+sample.
+
+For an assigned row, the already-bound topology supplies exact capacities.
+Shuffle its eligible workload candidates with domain
+`catalog/<partition>/<target-row-id>`. For each candidate in that order, derive
+up to eight finite placement variants with domains containing
+`candidate_id/variant-0` through `candidate_id/variant-7`; select the first full
+concrete tuple whose ID is neither already selected nor in the exclusion
+registry. Exhausting this bounded list emits the finite counts and
+`METRIC_UNUSABLE_CATALOG_EXHAUSTED`; there is no reroll, cycling, catalog
+substitution, or relaxed exclusion.
+
+For each variant, independently permute the bound template's provider and
+requester IDs. Take the realized `H` holders and realized herd requesters; select exact
+liar, slow and leech placements from independent domains. `slow_mode=unshaped`
+selects no slow holder and another mode selects one when `H>0`; leech count is
+`floor((fraction_basis_points * provider_count + 5000) / 10000)`. Record the
+leech nodes' publication-enabled and serve-enabled booleans explicitly. Overlap
+is allowed and recorded. Assign liar kinds in cyclic order
+`wrong_locator,corrupt_bytes,oversized_slow_body`, beginning at the target row's
+declared `lie_kind_offset`. For every nonzero churn
+minute and holder, draw `uniform(10000)`; a draw below the basis-point rate
+schedules one toggle at
+`minute_start_ns + uniform(min(60_000_000_000, remaining_trial_ns))`. Events
+start from recorded state and sort by timestamp then ASCII node ID. A zero or
+too-short catalog `trial_window_ns` is invalid.
+
+The *complete identity object* is
+`{target_row,candidate_id,topology_id,provider_roles,requester_roles,
+holder_placement,liar_placement_and_kind,slow_placement_and_mode,
+leech_placement_publish_serve_flags,scheduled_events,dependency_events,
+initial_node_states}`. `concrete_tuple_id=SHA256(JCS(identity_object))`;
+variant numbers, cluster ordinals and arm presentation order do not create a new
+underlying identity. The exclusion registry contains these exact IDs, so a
+counterbalance change cannot make a training tuple eligible for holdout.
+`scenario_id=SHA256(JCS({generator_version,experiment_version,partition,
+decision_or_qualification_id,cluster_ordinal,concrete_tuple_id,
+arm_order_and_schedule}))`. The manifest sorts by raw scenario-ID bytes and
+records the full identity object and arm schedule, seed, PRF domains, complete
+catalogs, `planning_contrast_catalog_hash`,
+`execution_label_contract_hash`, exact selector-parity schedules,
+target/registry hashes, unsupported cells, rejected rows/reasons, and all
+finite selected/unselected counts. Any duplicate or excluded concrete identity
+is a hard error.
+
+### Closed profile estimands and conservative aggregation
+
+For a profile `p`, `O_p` is the closed, nonempty set of its four coarse
+`performance_opportunity` decision strata, one per workload stratum. The
+pairwise/anchor/OFAT nuisance targets are deterministically distributed across
+cluster ordinals inside those strata; they do not each receive an inferential
+N. `Q_p` is every generated `fault_qualification` observation, including all
+component rows and full-real-Nix fault rows. No `Q_p` row contributes a benefit,
+normal-latency, egress or relief margin. It instead must pass every applicable
+S1, bounded-S2, privacy, resource, fallback, attribution and anti-vacuity gate.
+There is no post-hoc subset, workload/topology weight or average across strata,
+and a candidate cannot move a bad measurement from `O_p` to `Q_p`.
+
+One independent `scenario_cluster` is one concrete generated tuple with fresh
+state and both counterbalanced labels of every supported base arm. It still
+contributes exactly one primary observation per arm: for any field `X`, define
+`X[a,c]=X[a/A1,c]`; `a/A2` is validation-only and never another sample.
+Request-level observations remain diagnostic and never increase N. For cluster
+`c` in stratum `s`, let `U[a,c]` be upstream cache payload bytes, `P[a,c]`
+provider upload bytes and `L[a,c]` full-build wall time under that canonical
+definition; `u` is upstream-only and `b` is the later training-selected
+best-static comparator. Every denominator below must be positive and every
+required field observed, otherwise the whole cluster is invalid.
+
+Selection cannot create an A/A series after seeing results. For any frozen
+static or adaptive selector `pi` and label `d` in `A1,A2`, derive
+`X[pi/d,c]` by running the **same frozen** TASK-128 replay interpreter on only
+cluster c's label-d causal trace bundle. Static replay reads one base arm;
+dynamic replay derives its ordered actions and provenance-attributed combined
+outcome. Primary policy effects use
+`pi/A1`; `pi/A2` only validates that selection. Selecting an unsupported arm in
+any required opportunity cluster makes the policy ineligible and yields no
+numeric clone. TASK-44 fits/selects using A1 only; raw A2 values are withheld
+from its fitting interface until the candidate and best-static hashes freeze.
+The planning reader may use sealed A1/A2 solely for the preregistered centered
+power/null eligibility test at fixed `N_required=100`; it cannot calculate a
+different N or expose a directional result.
+
+All sample quantiles use Hyndman-Fan type 7: for sorted `x[0..n-1]`,
+`h=(n-1)*q`, interpolate linearly between `floor(h)` and `ceil(h)`. The exact
+per-opportunity-stratum primary transforms are:
+
+- **`upstream_only`:** its two indistinguishable labels give
+  `aa_latency_s[u] = log(Q95(L[u/A2])/Q95(L[u/A1]))`. This is an equivalence/validity
+  estimand, not a P2P score.
+- **`consume_only`:** define `f[a,c]=U[a,c]/U[u,c]`.
+  `benefit_s = mean_c(f[b,c]-f[a,c])`, an absolute upstream-egress fraction
+  improvement over best-static. `egress_cut_s=mean_c(1-f[a,c])` is retained
+  separately against upstream-only.
+- **`lan_share`:**
+  `benefit_s=log(Q95(L[b])/Q95(L[a]))`; positive is faster. Egress eligibility
+  uses the same `egress_cut_s` as consume-only.
+- **`public_share`:**
+  `relief[a,s]=sum_c(U[u,c]-U[a,c])/sum_c(P[a,c])`, using signed avoided bytes
+  and all provider upload bytes. Zero/negative delivery, nonpositive avoided
+  bytes, or a nonpositive denominator is ineligible, never infinity.
+  `benefit_s=log(relief[a,s]/relief[b,s])`. A public candidate requires a
+  frozen eligible best-static with positive relief; if none exists,
+  upstream-only remains the result rather than manufacturing a zero comparator.
+
+For a base arm or a post-freeze policy `x`, define label-specific
+`f[x/d,c]=U[x/d,c]/U[u/d,c]` and label-specific relief using the matching
+upstream label. Its recorded A/A transforms are
+`aa_egress_s[x]=mean_c(f[x/A1,c]-f[x/A2,c])`,
+`aa_latency_s[x]=log(Q95(L[x/A2])/Q95(L[x/A1]))`, and
+`aa_relief_s[x]=log(relief[x/A2,s]/relief[x/A1,s])`. Relief validation requires
+both labels to have positive delivery/relief. A latency A/A cannot validate
+egress or relief; every registered inference uses the selected policy's own
+pre-existing label pair.
+
+The profile statistics recomputed on every resample are deliberately
+worst-stratum:
+
+```text
+profile_benefit[p] = min(s in O_p, benefit_s)
+profile_egress_cut[p] = min(s in O_p, egress_cut_s)
+profile_relief[public_share] = min(s in O_p, log(relief[a,s]))
+profile_latency_guard[p] = max(s in O_p,
+    log(Q95(L[a])/Q95(L[u])))
+aa_min[p,metric] = min(s in O_p, aa_<metric>_s[a])
+aa_max[p,metric] = max(s in O_p, aa_<metric>_s[a])
+```
+
+On the simultaneous intervals defined below, every P2P profile also requires
+the upper `profile_latency_guard` endpoint to be at most `log(1.10)`.
+Consume-only passes only when the
+lower bound of `profile_benefit` is strictly greater than `0.05` and the lower
+bound of `profile_egress_cut` is at least `0.20`. LAN-share uses a primary
+margin `-log(0.95)` and the same `0.20` egress bite. Public-share uses a primary
+margin `log(1.10)`, lower `profile_relief` bound at least `0`, and the `0.20`
+egress bite. Reports may back-transform log effects to percentages, but
+comparison happens on the registered transform.
+
+S1, bounded S2, privacy and every frozen numeric budget must pass in every
+mandatory observation in both `O_p` and `Q_p`; one actual violation rejects the
+candidate. Every `Q_p` observation must reach its declared terminal oracle, so
+a fault row cannot pass merely because it produced no numeric performance
+effect. An unknown hard-constraint observation makes the profile
+`METRIC_UNUSABLE`. An `evidenced_unsupported` arm cell has no numeric value. A
+frozen policy may qualify a fault row only by executing and measuring its
+predeclared supported alternate or upstream fallback; imputing or dropping the
+row rejects it. Candidate and static comparator must both have valid measured
+coverage of every required `O_p` cluster, and the comparator must pass all
+applicable `Q_p` gates. Too few valid opportunity clusters or any missing
+qualification row makes the whole profile unusable. The unsupported/no-go
+record remains in the matrix in all cases.
+
+### Paired trial validity and statistical contract
+
+- A scenario cluster runs both labels of every supported base arm from independently reset
+  requester state and identical workload, topology, provider placement and
+  event schedule. Remove nonexecuting unsupported/not-applicable label slots,
+  preserving their explicit records; for the remaining `k` execution labels in
+  Stage-schema order, the Williams schedule
+  starts with `row[0]=0`; for `j=1..k-1`,
+  `row[j]=(j+1)/2` when j is odd and `row[j]=k-j/2` when j is even. It adds
+  `i` to every value modulo k for rows `i=0..k-1` and, when k is odd, appends each
+  row's reverse. One
+  Fisher-Yates permutation from domain
+  `arm-labels/<partition>/<profile>/<decision-or-qualification-id>/<supported-label-set-hash>`
+  relabels the columns;
+  cluster ordinal selects the schedule row modulo its length. Across completed
+  cycles every execution label appears in every position equally and each predecessor is
+  balanced. Check the at-most-one position-count difference separately within
+  each exact supported-label-set group; labels evidenced unsupported in a row
+  have no execution position. A violation makes the stratum unusable. Reusing
+  one warm state or changing placement in a later label invalidates the whole
+  cluster.
+- Training seed, order, reset evidence, config/code/fixture/topology hashes and
+  all raw observations are stored. A paired cluster is valid only when all
+  required supported execution labels are valid. Unsupported labels remain
+  nonnumeric with evidence and are not invalid partners. Invalid executed
+  partners remain with reason; they are not
+  counted as zero, rerun or replaced within that manifest; falling below N in
+  an opportunity stratum or losing the sole observation of a qualification row
+  makes the profile unusable. Exclusion codes are `HARNESS_START`,
+  `STATE_RESET`, `ORACLE_MISSING`, `SHAPER_NOT_RECOVERED`,
+  `PATH_NOT_CONFIRMED`, `RESOURCE_UNKNOWN`, and `EXTERNAL_OUTAGE`; the last is
+  an unrelated undeclared dependency failure, never a planned outage row. Any
+  other code requires a new experiment version.
+
+#### Deterministic cluster bootstrap and multiplicity
+
+The analysis seed for one profile/metric is exactly:
+
+```text
+HMAC-SHA256(
+  key = partition seed_256,
+  data = ASCII("nix-p2p-analysis-v1") || 0x00 ||
+         ASCII(experiment_version) || 0x00 || ASCII(partition) || 0x00 ||
+         ASCII(profile) || 0x00 || ASCII(metric_id) || 0x00 ||
+         raw_bytes(SHA256(JCS(manifest))))
+```
+
+Use that digest as `seed_256` with the generator's exact HMAC stream and
+`uniform()` algorithm. For bootstrap replicate `r` and stratum `s`, domain
+`analysis/<profile>/<metric-id>/<r>/<decision-stratum-id>` samples `|C_s|`
+cluster indexes with replacement. A draw carries the **whole paired cluster and
+all arms**; individual requests, paths or arms are never resampled. Each of
+10,000 replicates recomputes the per-stratum quantile/ratio, then the
+cross-stratum minimum/maximum above. CI endpoints use the same type-7 quantile
+of the bootstrap statistics.
+
+The sole potential primary holdout family reserves exactly the three selectable
+profile slots `consume_only`, `lan_share`, and `public_share`, with zero or one
+frozen candidate in each. A no-candidate slot stays explicit and is never
+reassigned or used to narrow the multiplicity denominator.
+Bonferroni controls two-sided familywise alpha at `0.05`: each primary profile
+uses the central `1-0.05/3 = 0.983333...` interval, with endpoints at `1/120`
+and `119/120`. Taking the minimum/maximum inside every replicate makes the
+strata a single intersection-union profile claim; no favorable stratum is
+selected afterward. The upstream A/A gate uses the same interval level as a
+shared validity precondition. Exploratory effects use labeled unadjusted 95%
+intervals and can never select a default; adding another primary candidate or
+hypothesis requires a new experiment version and holdout.
+
+For every inferential metric, apply the A/A gate separately to the frozen
+candidate, its best-static comparator and upstream where that transform is
+used; failure of any required selected series rejects the comparison. The
+entire simultaneous interval must be inside its own equivalence band: the lower
+endpoint for `aa_min[p,metric]` must
+be strictly above `-m_aa` and the upper endpoint for
+`aa_max[p,metric]` strictly below `+m_aa`. `m_aa` is `log(1.05)` for the
+latency transform in every profile, `0.05` for the additive egress transform in
+every P2P profile, and `log(1.10)` for public log relief. Thus the separately
+inferred 20-point egress eligibility, LAN latency objective and 1.10
+normal-latency guard reuse a transform-specific A/A only after that narrower
+band is satisfied. A point estimate, interval half-width, a latency-only A/A or
+one-sided overlap is not enough. Missing/non-finite output fails closed.
+
+Latency p50 and p99 remain descriptive. p95 is the registered decision
+quantile, but the adjusted `1/120` tail is not authorized at a smaller sample
+size: every p95-dependent objective, guard and A/A requires exactly 100 valid
+independent clusters and an exact planning pass at n=100. One invalid cluster
+therefore makes p95 inference unusable; it is never analyzed at achieved n=99.
+A distribution-free two-sided 95% p99 interval needs at least 367 independent
+valid clusters in every decision stratum; because v1 permits at most 100, p99
+is always `METRIC_UNUSABLE` for inference and cannot reject or select a
+candidate.
+
+#### A/A-grounded N without a formula mismatch
+
+Training is an exact two-phase flow. First, one `calibration` manifest freezes
+the complete nuisance-row schedule and exactly 20 planned clusters (ordinals
+`0..19`) in **each** opportunity decision stratum. Every supported base arm
+already has both A1/A2 labels; there is no selected comparator or policy at
+this point. All 20 terminal records remain. An invalid/failed execution label
+is not replaced; because calibration requires 20 valid paired clusters across
+every supported label, one invalid cluster yields `CALIBRATION_UNUSABLE` and no
+extension or candidate claim for that experiment version. Unsupported base
+arms keep their evidenced status and are not treated as missing calibration.
+The calibration retains the **whole** joint vector for every base arm/label in
+each cluster. Hash the complete manifest/results before planning. For every
+catalog contrast `q=(pi,b)`, planning is one four-stratum procedure, never four
+isolated arm or stratum screens:
+
+1. Replay candidate selector `pi` independently on every cluster's A1 and A2
+   causal trace bundles, deriving ordered actions and provenance-attributed
+   outcomes; read best-static `b/A1,b/A2` and upstream `u/A1,u/A2` from the same
+   joint cluster vectors. If replay or the comparator uses a capability-declared
+   missing/unsupported label in any required opportunity context, mark only q
+   `structurally_ineligible`; do not impute or invalidate another contrast.
+   An actually invalid/missing calibration observation has already made the
+   calibration globally unusable above and cannot become a contrast-specific
+   mask bit.
+2. Before any power/null injection, deterministically center away **all**
+   observed direction for q. After selector application, form a planning-only
+   shared coordinate graph containing every final fraction, latency series,
+   avoided-byte/upload pair and candidate/comparator/upstream label pair with
+   its original cluster index. Multiple estimand views of one raw field are
+   aliases in that graph, never independent values. The joint solver subtracts
+   observed additive offsets, divides out observed Q95 ratios, normalizes relief
+   residuals around the symbolic reference `R=1`, and centers every required
+   A1/A2 transform. Its algebraic residual statistic for every registered rule
+   must be zero within the frozen tolerance before a target is applied; failure
+   is `PLANNING_CENTERING_ERROR` for the entire artifact. It then immediately
+   applies one numeric target case using the frozen injection contract above and
+   materializes linked physical coordinates; no unlinked intermediate vector is
+   simulated. Keeping the graph in one cluster vector preserves its empirical
+   copula/covariance. Centering constants, coordinates and uncentered statistics
+   remain sealed.
+3. Freeze q's hypothesis-case inventory before simulation. It contains one
+   **joint power alternative** with every performance/eligibility rule at its
+   registered alternative and every A/A at zero. For each one-sided primary,
+   egress, absolute-relief or latency-guard rule, add one least-favorable null
+   case for each of the four possible boundary strata, leaving the other rules
+   at the joint alternative. For every required candidate/comparator/upstream
+   A/A transform, add both `-m_aa` and `+m_aa` cases for each possible boundary
+   stratum, with all other A/A coordinates zero. Every value and injection
+   equation comes from the catalog-bound `planning_injection_contract`; a case
+   may only reference its hash, rule ID, boundary stratum and optional A/A sign.
+   The generator records and hashes the complete set including the joint
+   alternative; more than 64 makes the catalog fail its compute ceiling.
+4. For every hypothesis case, first materialize q's linked coordinate vector
+   with the frozen solver. A physical-domain failure marks only q
+   `injection_domain_ineligible` and runs no simulation for it. Otherwise
+   generate exactly 128 synthetic experiments at authoritative N=100. One
+   synthetic experiment resamples 100 **whole** pilot
+   cluster vectors within each of all four coarse strata. Each of its 10,000 inner
+   bootstrap replicates again resamples whole cluster vectors in all four
+   strata, applies `pi` and `b` to matching A1/A2 data, and recomputes the exact
+   final candidate-vs-b benefit, upstream egress, absolute relief, p95 latency
+   guard, selected candidate/comparator/upstream A/A, and cross-stratum
+   min/max. Only then does it take type-7 `1/120,119/120` endpoints and execute
+   the final conjunction of decision rules. Candidate/comparator covariance and
+   arm-by-context mixing therefore remain inside every draw.
+5. Set q `eligible_at_100` only when the exact Clopper-Pearson 95% lower bound
+   on the joint-alternative decision power is at least `0.80` and every
+   least-favorable boundary case has at most `floor(128/120)=1` false-positive
+   decision. A missing case, nonfinite statistic or failed boundary marks only
+   q `underpowered_at_100`. HMAC domains contain catalog/contrast/case hashes,
+   synthetic index, bootstrap index and stratum, so scheduling cannot alter the
+   mask. The full loop is bounded by the catalog-wide 15,728,640,000 evaluations
+   declared above. No uncentered effect or direction participates in status.
+
+TASK-44 later computes the deterministic A1 best-static winner from the
+catalog's complete comparator set, then may score/nominate only a pre-enumerated
+selector artifact whose exact `(selector_id,best_static_base_arm)` contrast is
+`eligible_at_100`. It cannot choose a different comparator because that
+contrast happened to pass, and cannot synthesize a threshold after seeing A1.
+An ineligible contrast does not poison other catalog entries. If no eligible
+contrast matches the A1-selected best-static comparator, that profile has no
+candidate; upstream/no acceptable candidate remains the honest result.
+
+After candidate and best-static hashes freeze, a separate TASK-122 validation
+reader receives the sealed A1/A2 evidence and those hashes, replays the exact
+selector independently on A2, and applies the preregistered training A/A and
+hard-validation gates. It emits only a hashed `validated` or terminal
+`validation_no_go` artifact directly to the TASK-123 freeze input; TASK-44 gets
+no raw A2, residual, per-label statistic or refitting response. A no-go cannot
+reopen A1 selection or nominate a runner-up, so the profile has no candidate for
+that experiment version.
+
+TASK-122 emits exactly one hashed `validation_slot_artifact` per selectable
+profile. It is a closed tagged union. `validated` and `validation_no_go` require
+`candidate_ref={presence:"present",sha256:...}` and
+`comparator_ref={presence:"present",sha256:...}`. If TASK-44 produced no
+candidate, the only legal object has `status="no_candidate"`,
+`candidate_ref={presence:"absent",hash_status:"not_applicable"}` and
+`comparator_ref={presence:"absent",hash_status:"not_applicable"}`, plus the
+reason code `no_capable_best_static`, `no_eligible_matching_contrast`, or
+`a1_selection_unusable`; candidate/comparator hash keys are forbidden. Its
+`a2_validation_status` is explicitly `not_applicable`. All variants record
+`validation_slot_artifact_hash=SHA256(JCS(validation_slot_artifact))`. TASK-123
+runs a holdout profile only for `validated`; `validation_no_go` and
+`no_candidate` remain witnessed terminal slots and cannot be reassigned or used
+to narrow the three-profile multiplicity family.
+
+The one `extension` manifest receives and verifies the complete calibration and
+planning artifacts named by its tagged input. It uses the same
+experiment/partition seed and catalog/capability/target hashes, plus the
+successor exclusion-registry head that contains every calibration concrete ID.
+It contains exactly the precomputed ordinals `20..99` for each stratum and
+records their ordered concrete IDs and hashes before execution. The union hash
+of calibration and extension is the training manifest hash. Invalid extension
+clusters remain and are never replaced; fewer than 100 valid clusters makes
+that stratum unusable. The fixed holdout plan verifies the complete training
+planning artifact and imports its frozen global `N_required=100`, catalog and
+eligibility-mask hashes. It generates one manifest after reveal and does not
+recalibrate on holdout.
+
+This bounded planning asks whether the exact selector-derived joint decision is
+recognizable at N=100. Candidate direction is not an input, and later
+best-static/adaptive selection cannot introduce an uncataloged or underpowered
+contrast. The final evidence still uses the exact 10,000-resample cross-stratum
+procedure and selected policy A/A gates above.
+TASK-122 may parallelize or memoize identical deterministic draws, but may not
+change the catalog, counts, estimator, ordinals or manifest hashes without a new
+experiment version.
+
+Bottleneck isolation is mandatory. Injected RTT must be recovered within
+`max(2 ms, 10%)`; bandwidth within **10%**; loss within **25 basis points**;
+jitter p95 within `max(2 ms, 20%)`; the unshaped rate control must be at least
+**2×** the shaped cap. Nix knob readback and measured concurrency must match,
+NAT/relay path must be observed, and CPU/disk saturation must be reported. A
+neutralized or non-binding shaper makes the row invalid, never “fast”.
+
+Stage A is diagnostic but follows the same pairing, whole-cluster resampling,
+A/A and invalid-run rules with labeled unadjusted 95% intervals; it
+cannot make a primary selection. Stage B must use TASK-52's hedge-aware
+`net-upstream-egress-v3`; Stage A, which forbids hedging, may use frozen
+`net-upstream-egress-v2`. Reports always carry the exact counting-rule version.
+
+### Metric schema: distinct quantities, explicit units
+
+No report may derive one byte quantity from another merely because a raw fixture
+makes their values coincide. `_bytes_compressed_wire` means octets of the named
+wire representation (`Compression:none` is a valid representation); it is not
+NarSize. `_bytes_uncompressed_nar`, `_bytes_ram`, and `_bytes_ondisk` retain the
+existing `profile_p2p.py` meanings. At minimum every measured cell records:
+
+| Field | Meaning / unit |
+|---|---|
+| `upstream_cache_payload_bytes_compressed_wire` | Testproxy/cache-boundary NAR body bytes, FileSize representation, per the named counting rule. |
+| `peer_socket_total_bytes_compressed_wire` | All octets actually observed on peer sockets, separately per requester/provider, direction, transport and codec. Never substituted for cache egress. |
+| `peer_socket_payload_bytes_compressed_wire`, `peer_socket_protocol_control_bytes_compressed_wire` | The total's payload and transfer-protocol/control decomposition; missing framing attribution is unknown, not silently assigned to payload. |
+| `payload_bytes_uncompressed_nar` | Signed NarSize / raw NAR length successfully delivered. It is not added to either wire-byte field. |
+| `hedge_waste_upstream_bytes_compressed_wire`, `hedge_waste_peer_bytes_compressed_wire` | Losing hedge bytes by source, attributed by request provenance. |
+| `prefetch_waste_peer_bytes_compressed_wire`, `prefetch_waste_upstream_bytes_compressed_wire` | Prefetched bytes not consumed by the build, by source. |
+| `discovery_control_bytes_compressed_wire` | Tracker/DHT/Mainline/hold-query/node-discovery/relay control octets, broken down by mechanism and direction. |
+| `provider_upload_bytes_compressed_wire` | All provider peer-socket upload octets; payload and protocol/control subfields remain separate. |
+| `full_build_wall_ns`, `nar_ttfb_ns`, `bootstrap_ns`, `node_resolve_ns`, `content_resolve_ns` | Monotonic-clock durations; bootstrap, node/address resolve, content resolve, transfer TTFB and full build never collapse into one number. |
+| `requester_cpu_ns`, `provider_cpu_ns` | Process CPU time; report CPU-ns per `payload_bytes_uncompressed_nar` only as an explicitly named ratio. |
+| `rss_hwm_bytes_ram`, `rss_idle_60s_bytes_ram` | Per-node high-water and post-60-second residency, not interchangeable point samples. |
+| `disk_apparent_bytes_ondisk`, `disk_allocated_bytes_ondisk` | Per-node state/metadata/content footprint; both reported. |
+| `open_fds_count`, `success_count`, `failure_count`, `fallback_count`, `serve_decline_count` | Integer counts with denominators; missing is unknown, never zero. |
+| `confirmed_network_path` | Closed enum `upstream`, `lan_direct`, `direct`, `hole_punched`, `relay`, `unsupported`, confirmed from trace/socket evidence. |
+| `fallback_reason`, `cell_status`, `invalid_reason` | Closed, versioned reason codes; success plus fallback is distinguishable from pure peer success. |
+
+Compression ratio is a named ratio of two separately retained fields. Cache
+wire bytes, peer socket bytes, NarSize, discovery/control, waste and provider
+upload remain available independently in raw results even when a profile score
+uses two of them.
+
+### Discovery privacy and participation observables
+
+Configuration narration is insufficient. Per mechanism, a boundary trace or
+packet/application event log records:
+
+- local discovery enabled, node/address source and content-discovery source;
+- count and restricted-capture SHA-256 of every published key/record, its schema
+  version, publishability class and run-keyed HMAC token (normal reports do not
+  export StorePath/NarHash); published record wire bytes remain in the
+  access-controlled audit artifact;
+- every query recipient class/count, the queried-key token count, and whether
+  requester IP and full/partial NodeId were exposed to LAN peers, tracker, DNS,
+  relay, DHT/Mainline nodes, bootstrap seeds or payload peers;
+- exact configured tracker/DNS/relay/Mainline/bootstrap dependencies and which
+  were contacted; dependency outage is `unavailable`, not an empty `miss`;
+- `client_only`, inbound listener/server participation, publication enabled,
+  serving enabled, payload bytes served, and lookup enabled as independent
+  booleans/counters.
+
+The consume-only assertion is therefore three assertions: **zero publication**,
+**zero serving**, and a separately measured lookup-leakage result. It must never
+claim “private” merely because the first two are zero. `lan_share` additionally
+asserts zero packets to public dependencies. `public_share` requires explicit
+preflight and proves TASK-102 blocked every non-signed-public key. Absence of a
+capture/recipient oracle invalidates the privacy cell.
+
+### Anti-vacuity matrix
+
+Every supported arm must demonstrate the negative control appropriate to its
+layer before its positive result is publishable:
+
+| Bite | Required observable failure/change |
+|---|---|
+| Disable the selected discovery mechanism(s) from identical fresh state | Peer provider bytes become 0 and upstream payload egress returns to the upstream-only amount; a warm Nix store/cache is not allowed to satisfy the build. |
+| Kill the provider after a positive result, before dial and again mid-body | Named unavailable/timeout, bounded S2 fallback and successful S1 build; no unbounded hang and no false clean miss. |
+| Corrupt/truncate provider bytes (and corrupt upstream in its control arm) | BLAKE3 gate 1 and/or Nix signature/NarHash gate 2 rejects; the corrupted path is never installed. Neutralizing the gate makes the bite fail. |
+| Neutralize delay/rate/loss/jitter shaping | Recovery checks above fail and the row becomes invalid; configuration values alone cannot keep it green. |
+| Feed a Stage-A artifact to TASK-44 | Closed-schema rejection `STAGE_A_POLICY_INPUT_FORBIDDEN` before fitting; changing a filename must not bypass it. |
+| Call any pre-TASK-123 holdout API/namespace | `HOLDOUT_FORBIDDEN_BEFORE_FREEZE`, no scenario object/file emitted, and the attempted run is invalid with an audit event. |
+
+### Sealed holdout generation and reveal protocol
+
+Only `development` and `training` partitions can be materialized before
+TASK-123. This document freezes the **procedure and distribution only**. It
+contains no exact holdout ID, seed, workload selection, holder placement,
+network endpoint or topology; none may exist elsewhere yet.
+
+The generator API requires a typed `HoldoutRevealPermit` for
+`partition=holdout`. Before TASK-123 that type can be verified but no permit can
+be issued. TASK-88, TASK-125, TASK-80, TASK-122 and TASK-44 runners compile/run
+with development/training capabilities only. A request to generate, enumerate,
+open or infer a holdout namespace fails atomically with
+`HOLDOUT_FORBIDDEN_BEFORE_FREEZE` before a path, ID or PRNG is created; the
+attempt is audit-logged and invalidates that run. TASK-128 likewise contains no
+holdout material while freezing interpreter semantics.
+
+#### Roles and append-only registry
+
+- The **freeze custodian** (TASK-123) assembles the freeze record and executes
+  the already-frozen generator/interpreter. The custodian cannot contribute or
+  replace entropy and cannot own a candidate implementation.
+- At least **two entropy witnesses**, independent of the custodian and of every
+  candidate owner, each control their own signing key and append-only receipt
+  location. Witness identities/keys are named in the freeze record before any
+  commitment. A witness supplies randomness but cannot run, tune or interpret
+  the experiment.
+- The **verdict custodian** verifies the immutable results and applies the
+  preregistered rules. It may be the TASK-123 freeze custodian because the
+  generator and interpretation are already hashed, but it cannot edit either.
+
+`holdout-registry-v1` is a content-addressed, fast-forward-only Git sequence,
+kept beside the code rather than in a mutable database. Every JCS entry contains
+`previous_entry_hash`; publication uses compare-and-swap against a protected
+registry ref. Each entropy witness signs and independently retains the new head
+hash, so rewriting only the repository copy is detectable. The registry starts
+with hashes of every development/training manifest and every
+`concrete_tuple_id`.
+It retains every reservation, commitment, reveal, generated manifest, selected
+tuple and terminal outcome from **all** later revealed holdouts, including
+failed/invalid attempts and superseded experiment versions. A missing previous
+entry, signature or independent receipt is a hard stop.
+
+There is exactly one reserved attempt for an `experiment_version`; registry CAS
+rejects a second reservation even if the freeze hash differs. The reservation
+is the point of no return. A process crash, witness refusal, invalid reveal,
+catalog exhaustion, generator failure or infrastructure failure after it
+consumes that version's holdout and produces a failed/`METRIC_UNUSABLE` verdict,
+not a fresh seed. A new attempt requires a new experiment version, fresh
+training/fitting and a newly frozen candidate.
+
+#### Freeze, commit/reveal and exact seed
+
+TASK-123 performs the one reveal in this order:
+
+1. Create a JCS `freeze_record` containing hashes for experiment/generator and
+   analysis contracts, generator/interpreter code and golden traces, Nix closure
+   and container images, workload/network catalogs, complete development and
+   training manifests/results, the execution-label contract, complete
+   planning-contrast catalog, causal-trace schema/replay interpreter, centered
+   planning artifact, released eligibility mask, fixed-class training-parity
+   results and exactly one hashed `validation_slot_artifact` for each selectable
+   profile, the current
+   exclusion-registry head, all profile
+   rules/margins/budgets and `N_required`. A `validated` or
+   `validation_no_go` slot requires its frozen candidate/comparator hashes; a
+   `no_candidate` slot requires the explicit absent/not-applicable references
+   above and TASK-123 must not demand or invent either hash. Append a signed
+   reservation containing `freeze_hash=SHA256(JCS(freeze_record))`, the witness
+   IDs/keys and previous registry head. Any absent hash or bytewise catalog/mask
+   mismatch aborts before reservation; after reservation it consumes the attempt.
+2. Each witness independently draws a 32-byte OS-CSPRNG nonce. For witness `w`,
+   append and sign only this lowercase-hex commitment:
+
+   ```text
+   SHA256(JCS({
+     "domain":"nix-p2p-holdout-commit-v1",
+     "experiment_version": experiment_version,
+     "freeze_hash": freeze_hash,
+     "witness_id": w,
+     "nonce_256": lowercase_hex(nonce)
+   }))
+   ```
+
+   Every commitment and independent receipt must exist before any nonce is
+   revealed. A duplicate witness, changed key, early reveal or missing receipt
+   consumes the attempt as invalid.
+3. Witnesses reveal their nonces and signatures. Verify each commitment, sort
+   the records by unsigned UTF-8 `witness_id`, reject duplicates, and derive the
+   only holdout seed as:
+
+   ```text
+   seed_256 = SHA256(JCS({
+     "domain":"nix-p2p-holdout-seed-v1",
+     "experiment_version": experiment_version,
+     "freeze_hash": freeze_hash,
+     "reservation_hash": SHA256(JCS(reservation)),
+     "witnesses":[
+       {"witness_id": id, "commitment": hex_digest,
+        "nonce_256": lowercase_hex(nonce)}, ...
+     ]
+   }))
+   ```
+
+   This post-freeze derivation is the first moment the seed exists. No witness
+   can choose a nonce after seeing another's reveal; withholding one cannot
+   induce a retry.
+4. Build the exclusion input from the witnessed registry head: it is the union
+   of every `concrete_tuple_id` in development, training and **all previously
+   revealed holdouts**, plus the IDs already selected earlier in this manifest.
+   Run the exact without-replacement generator. Any duplicate within the
+   manifest or match in that immutable set is `HOLDOUT_DUPLICATE`; exhaustion
+   records the finite counts and consumes the attempt without substituting,
+   reusing or relaxing a stratum.
+5. There is no reusable permit file. Inside one compare-and-swap transaction,
+   TASK-123 mints a permit bound to `freeze_hash`, `reservation_hash`, seed hash,
+   registry head and exact generator binary; the generator returns the complete
+   manifest to that transaction, which validates it and atomically appends both
+   `permit_consumed` and the manifest bytes/hash to the registry. Neither may
+   become visible alone. A crash or CAS loss before publication still leaves the
+   witnessed reservation/reveals and consumes the attempt; it does not authorize
+   regeneration. On success, byte-for-byte manifest copies may be recovered by
+   hash, but a second generation call is forbidden.
+
+#### Execution has no reroll path
+
+Manifest scenarios execute in sorted `scenario_id` order. The append-only state
+machine is `unstarted -> started -> terminal`; `terminal` is one of `measured`,
+`evidenced_unsupported`, `invalid`, or `failed`. A scenario marked `started`
+before a harness/process/host crash becomes terminal `invalid` with the exact
+reason and is never rerun. Execution may resume only the still-`unstarted` rows
+from the same manifest with identical hashes. Invalid partners remain and the
+profile becomes unusable if N falls short; there is no replacement ordinal,
+seed, topology, workload or arm order in holdout. Planned dead-provider and
+dependency-outage rows remain ordinary test rows, not retry permission.
+
+Only a `validated` slot materializes candidate execution rows. A
+`validation_no_go` or `no_candidate` slot is copied into manifest metadata with
+zero candidate executions; that is its witnessed terminal result, not generator
+failure. Each validated frozen primary is compared with upstream-only and
+best-static under its one profile rule and the unchanged three-profile family.
+Exploratory output is
+descriptive and cannot become a default. The manifest, raw results, audit
+events, analysis output and terminal verdict are appended and independently
+witnessed whether the result is a winner, upstream-only, no candidate, invalid
+or `METRIC_UNUSABLE`.
+
+Any objective, constraint, generator/distribution, profile or interpretation
+change after Stage-B training begins bumps the experiment version, restarts
+training/fitting and requires a fresh never-generated holdout. Any code,
+interpreter, candidate or comparator change after the reveal freeze does the
+same. The failed/no-candidate/upstream-only verdict remains recorded; TASK-123
+never repairs a result by tuning on its holdout.
+
+### Artifact and decision boundaries
+
+| Owner | May produce | Must not do |
+|---|---|---|
+| TASK-114 assignee; repository product owner | Experimental contract/generator version; retained authority over later production intent/defaults | Claim new production approval, materialize holdout or choose a backend |
+| TASK-88 | Iroh-only development/training reference | Make a cross-backend/default claim or read holdout |
+| TASK-117/TASK-121 | BitTorrent identity and compressed supported/no-go evidence | Impute an unsupported cell or select policy |
+| TASK-125 | Stage-A `diagnostic-tournament-v1` artifact | Emit candidate/score/default fields or read holdout |
+| TASK-122 | Stage-B `policy-training-v1` A1/A2 evidence, all invalid/unsupported rows, fixed-class parity results, centered joint eligibility mask and one hashed validated/validation-no-go/no-candidate slot artifact per profile | Expose raw A2 or directional planning detail to TASK-44, return A2 feedback for refitting, fabricate hashes in an absent slot, change the frozen catalog, choose a default, fit on holdout, or omit losing cells |
+| TASK-128 | Pre-calibration causal-trace schema/replay interpreter, complete exact planning-contrast/injection catalog and development parity traces | Tune/add a selector, numeric target or parameter after calibration starts, embed a default, or include holdout data |
+| TASK-44 | Deterministic A1-only best-static and at most one exact eligible catalog artifact/profile; its frozen output is later validated by the TASK-122 A2 reader | Read raw A2 or receive validation feedback while fitting/selecting, synthesize parameters, swap comparators to obtain eligibility, alter a selector after A2 validation, file a product implementation/default task or access holdout |
+| TASK-123 freeze/verdict custodian + independent entropy witnesses | One reserved commit/reveal, atomic permit/manifest, unchanged execution and signed/versioned verdict | Reroll/reuse, contribute custodian entropy, tune, promote an exploratory result, or hide no-go |
+| TASK-124 | Post-verdict production/pilot re-plan | Reinterpret or overwrite TASK-123 evidence |
+
+The registry only dispatches an explicitly selected mechanism/offer from an
+artifact. No schema, generator, fitter or interpreter may encode Iroh-first,
+BitTorrent-first, cheapest-first or “winner must exist.”

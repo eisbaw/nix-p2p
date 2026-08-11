@@ -3,6 +3,19 @@
 Status: **ACCEPTED (round 6) — owner declared good enough; handed to phase 2**
 Tentative-vs-Committed: **experimental** (confirmed by owner, round 1)
 
+> **Current authority (TASK-114, Wave 2c, experiment contract
+> `nix-p2p-tournament-v1`).** This PRD deliberately retains the earlier owner
+> decisions as provenance. The Wave-2c reconciliation at the end of this file
+> supersedes, for this wave, the older phrases **“DHT-authoritative”**, **“public
+> global swarm / announcing opt-out”**, and both historical forms of the
+> project-wide **20% egress / 10% latency kill criterion**. Those statements are
+> not silently deleted: they explain how the project arrived here, but they are
+> no longer implementation instructions. Discovery is evidence-gated; a fresh
+> install is upstream-only and joins/publishes to no public network; and
+> performance is adjudicated per deployment profile against preregistered
+> margins and hard constraints. When old and new prose conflict, the TASK-114
+> section is normative.
+
 ## Essence / problem
 
 cache.nixos.org is a single point of failure for the entire Nix
@@ -29,7 +42,13 @@ all argue against; the implementation strategy below is deliberately
 measurement-first so this thesis is tested before any DHT code
 exists.
 
-**SCOPE CHANGE (owner directive, 2026-08-08): the kill criterion is DESCOPED to a non-blocking metric.** The project proceeds to the p2p wave regardless of the wave-1 measurement outcome. The measurement instrument (task-9) is still built and kept honest (it informs tuning, hedge design, and the prefetch-window question), but a <20% net-egress result no longer stops the project. Consequently the task-16 checkpoint is recast from GO/NO-GO to 'read the baseline, then proceed to wave-2 planning', and task-9's counting rule is a useful comparison basis rather than an irreversible project gate.
+**HISTORICAL SCOPE CHANGE (owner directive, 2026-08-08; superseded as a
+Wave-2c decision rule by TASK-114): the kill criterion was DESCOPED to a
+non-blocking metric.** The project proceeded to the p2p wave regardless of the
+wave-1 measurement outcome. That remains the provenance for task-16 and for why
+the p2p implementation exists; it no longer means “performance cannot reject a
+deployment profile.” The measurement instrument (task-9) remains the stable
+comparison basis. See the current, context-specific profile rules below.
 
 
 ## Implementation strategy (settled, round 2, owner)
@@ -95,8 +114,10 @@ Standing test topologies (settled, round 4, owner):
   sources, DHT publishers, optional gossip participants.
 - **cache.nixos.org**: unchanged; sole metadata/trust authority and
   HTTP fallback.
-- **Deployment model (settled, round 1): public global swarm,
-  documented privacy risk.** Announcing is opt-out (leech mode).
+- **HISTORICAL deployment model (round 1; superseded for Wave 2c): public
+  global swarm, documented privacy risk.** Announcing was opt-out (leech mode).
+  The provenance is retained, but current installs are upstream-only/private
+  and every LAN or public participation mode is explicit opt-in; see TASK-114.
 - **Privacy invariant (settled, round 3): no enumeration, ever.**
   Peers answer yes/no to a concrete NarHash query and serve bytes on
   request; there is no endpoint that lists holdings. Precisely: this
@@ -146,7 +167,8 @@ In scope (MVP, in delivery order):
   semantics + narinfo/claims disk cache + measurement + container/VM
   e2e harness with mock upstream, long-chain, and multi-node
   topologies.
-- **Then**: iroh-blobs whole-NAR transfer (client + provider) behind
+- **Then (historical round-3 discovery plan; superseded by TASK-114)**:
+  iroh-blobs whole-NAR transfer (client + provider) behind
   `NarSource`; DHT-authoritative claim resolution **plus bounded
   fan-out yes/no queries to known peers** (this is how un-announced
   whole-store supply becomes reachable, and the gossip accelerant's
@@ -188,12 +210,12 @@ Non-goals (explicit):
 | **Addressed unit** | **Raw (uncompressed) NAR**, BLAKE3 (round 3, owner) | Enables `--dump` seeding + C dedup; narinfo transport fields rewritten (unsigned, legal); ~3x wire bytes until per-connection zstd (a policy surface, not frozen) |
 | **Seeding scope** | **Whole /nix/store via `--dump`**, but strictly **query-answer only: yes/no per NarHash, no enumeration** (round 3, owner) | Largest supply at zero storage cost; listing endpoint would leak secret path names — see privacy invariant below |
 | **Announce policy** | **On-demand only**: publish a claim only when a path is fetched through the daemon (round 3, owner) | Demand-proven records; minimal DHT load; supply lags demand — un-announced holdings reachable via peer yes/no queries |
-| **Kill criterion** | **<20% net cache-egress cut on the favorable testbed kills the p2p thesis**; p95 build latency regression must stay <10% (round 3, owner) | If controlled always-on peers cannot hit 20%, the real world never will |
+| **Kill criterion (historical; superseded by TASK-114)** | **<20% net cache-egress cut on the favorable testbed kills the p2p thesis**; p95 build latency regression must stay <10% (round 3, owner) | Preserved provenance; Wave 2c now applies profile-specific margins plus hard latency/privacy/resource constraints rather than killing every context at once |
 | Transport | iroh / iroh-blobs | BLAKE3 incremental verified streaming, QUIC + holepunching |
-| Discovery | DHT-authoritative, gossip as accelerant (round 1, owner) | Must work from empty state; warm map is an optimization, never a requirement |
+| Discovery (historical; superseded by TASK-114/TASK-126) | DHT-authoritative, gossip as accelerant (round 1, owner) | Preserved provenance; the current substrate is evidence-gated and a global-DHT no-go is valid |
 | Latency guardrails | Prefetch + hedge (throughput-abort) | The only thing keeping DHT seconds off the user path — load-bearing |
 | Metadata | cache.nixos.org only + daemon disk cache | Bandwidth offload MVP (round 1, owner) |
-| Privacy | Public swarm, documented risk, leech opt-out (round 1, owner) | Network effect; risk stated plainly |
+| Privacy (historical; superseded by TASK-114/TASK-120) | Public swarm, documented risk, leech opt-out (round 1, owner) | Preserved provenance; fresh installs are upstream-only/private and LAN/public participation is explicit opt-in |
 | Trust | Signed fields untouched; Nix verifies sig + NarHash | Daemon/peers outside TCB. Note: passthrough is **not byte-verbatim** — see compression, open question 1 |
 | Language / toolchain | **Everything in Rust** (tokio); **nix flakes** for the dev/build environment (round 4, owner) | iroh is Rust; nix-compat crates exist; flakes pin the toolchain and feed the NixOS VM tests directly |
 | Test upstream shield | Separate simple local caching proxy, permanent fixture, fault injection lives there — never in the product (round 4, owner) | Protects cache.nixos.org from test load; keeps adversarial logic out of the modular daemon |
@@ -222,8 +244,9 @@ Frozen once peers exist (deep-review surfaces):
   least be versioned.
 - **Claim record schema** (version field, payload enum, reserved
   fields).
-- **DHT mechanism & key derivation** (which DHT, NarHash→key mapping,
-  record contents).
+- **Any selected global discovery mechanism & key derivation** (substrate,
+  NarHash→key mapping, record contents). Historically this assumed a DHT;
+  TASK-126 now freezes it only if supported, or records a no-go.
 - **Trust invariant**: signed narinfo fields untouched + NarHash
   gate. Changes here are security events, not refactors.
 
@@ -478,14 +501,16 @@ oracle that is not peak RSS.
     noise), against 12% for the same change in isolation. Not shipped;
     it would also let an unverified narinfo NarSize trigger a huge
     eager allocation, and allocation failure in Rust aborts.
-12. **Stale figures**: fig-candidate-B/C SVGs still show gossip-first
-    with tracker cold-start; superseded by DHT-authoritative
-    decision. Revise before phase 2 or implementers will build the
-    wrong discovery layer.
+12. **Stale figures, twice superseded**: fig-candidate-B/C SVGs show
+    gossip-first with tracker cold-start. Round 1 superseded that with a
+    DHT-authoritative decision; TASK-114 has now superseded both with an
+    evidence-gated mechanism set and explicit unsupported cells. The figures
+    are provenance only until revised to the current contract.
 
 ## Open questions (remaining — deferred to phase 2 unless grilled further)
 
-1. **DHT mechanism** (frozen surface, needs a spike not a guess):
+1. **Global DHT mechanism (historical question, now owned by TASK-126)**
+   (frozen surface, needs a spike not a guess):
    mainline get_peers/announce on a NarHash-derived key vs BEP44
    records vs iroh-native tracker/content-discovery. Decides
    NodeId-vs-IP:port dialability (risk 8) and what an announce
@@ -494,12 +519,12 @@ oracle that is not peak RSS.
    known-peer set is maintained (gossip membership vs past-peer
    cache), and rate-limiting so yes/no probes do not become the new
    enumeration vector (an attacker sweeping queries at high rate).
-3. **Figure revision** (housekeeping, blocks phase-2 onboarding):
-   fig-candidate-B/C still show gossip-first + tracker cold-start;
-   must be redrawn to DHT-authoritative + peer-probe before
-   implementers use them.
+3. **Figure revision** (housekeeping): fig-candidate-B/C still show
+   gossip-first + tracker cold-start. The intermediate instruction to redraw
+   them as DHT-authoritative is itself superseded; any revision must show the
+   TASK-114 evidence-gated mechanism/profile contract.
 
-## Wave 2 scope (owner goal, 2026-08-08)
+## Wave 2 scope (owner goal, 2026-08-08; historical framing)
 
 Build the actual decentralization and CHARACTERIZE it. Not just "make
 iroh work" — model and profile the resource/performance envelope, then
@@ -511,8 +536,8 @@ derive policies from what the models show.
   the claim schema must admit it without a network fork.
 - (chunked/castore = Candidate C, later.)
 
-**Discovery/claims:** DHT-authoritative (mainline vs BEP44 vs
-iroh-native — a spike, first frozen surface), gossip accelerant,
+**Discovery/claims (historical 2026-08-08 plan; superseded by TASK-114):**
+DHT-authoritative (mainline vs BEP44 vs iroh-native — a spike, first frozen surface), gossip accelerant,
 announce-on-demand, no-enumeration privacy (yes/no peer probes),
 NodeId->addr via iroh discovery. Keyed on `NarKey::SignedNarHash`
 (seam already frozen wave-1) via the correlation catalog.
@@ -539,3 +564,277 @@ hasn't justified.
 which already counts a peer hit as a valid 0-egress crossing) is the
 speedup/offload yardstick; task-35's real-upstream narinfo->nar gap is
 the prefetch-vs-hedge design input.
+
+## Wave 2c reconciliation and tournament decision contract (TASK-114)
+
+This section is the current product/experiment authority. It reconciles the
+historical decisions above without erasing them. The contract version is
+**`nix-p2p-tournament-v1`**; TESTING.md pins the executable scenario and report
+semantics. The experiment remains allowed to conclude that upstream-only, a
+LAN-only deployment, consume-only operation, a static backend, or no acceptable
+public P2P candidate is the correct result.
+
+### Current product and privacy contract
+
+The invariant boundary remains narrow: signed metadata and trust stay upstream;
+only NAR payload bytes may be decentralized; Nix still enforces signature and
+NarHash. Discovery is now **evidence-gated**, not pre-set DHT-authoritative.
+Tracker, global DHT, bounded direct hold-query and local discovery are
+independent mechanisms behind `ContentDiscovery`. TASK-126 may freeze a global
+Iroh DHT contract or record an evidenced no-go; TASK-103 implements only the
+supported branch and must otherwise expose an explicit unsupported cell. The
+tracker and named-candidate hold-query must not masquerade as a global DHT.
+
+The following operations are distinct configuration and evidence axes; enabling
+one never implies another:
+
+1. **Local discovery** — LAN-scoped presence/address discovery such as mDNS.
+2. **Node/address discovery** — learning a NodeId and dialable direct/relay
+   locations from an explicit peer list, prior rendezvous, tracker, DNS or DHT.
+3. **Content discovery** — asking which named NarHash has an offer; direct
+   hold-query remains named-key-only and is not global discovery.
+4. **Publication** — emitting a content key/record to LAN, tracker, DHT or
+   Mainline infrastructure.
+5. **Serving** — accepting inbound requests and uploading payload bytes.
+6. **Lookup leakage** — disclosing an IP, NodeId or queried content key to a LAN
+   peer, tracker, DNS resolver, relay, DHT/Mainline participant or bootstrap
+   service even when publication and serving are off.
+
+A fresh installation selects **`upstream_only`**. Local/P2P discovery, inbound
+serving, publication, public trackers, public DHT/Mainline server participation,
+and public relay/network joining are all off. Merely installing or starting the
+daemon therefore emits no P2P discovery traffic. `consume_only`, `lan_share`
+and `public_share` require explicit operator selection; public lookup itself is
+public-network participation and is not smuggled into consume-only. A
+consume-only configuration can suppress publication and serving yet still leak
+lookups if the operator explicitly enables a public lookup mechanism; preflight
+must say so. TASK-120 owns the single typed configuration, budgets, preflight
+and status proof. TASK-102 remains the publication gate: a public record may
+name only content established as signed-public upstream. No mode permits
+inventory enumeration.
+
+### Iroh-first execution order
+
+The build order is a gate, not a preference inside the eventual policy:
+
+1. Complete an **operational, zero-content-injection Iroh build** using the
+   persistent shared runtime and real node/content discovery (TASK-115,
+   TASK-101, TASK-103's supported-or-unsupported branch, and TASK-116). The
+   requester may receive operator-level bootstrap configuration, but no peer
+   address, claim, per-content locator, magnet or equivalent test injection.
+2. Land authenticated HTTPS upstream support (TASK-22/TASK-24) and negotiated,
+   bounded Iroh raw/zstd operation (TASK-99). Raw fallback stays explicit.
+3. Exercise the production-shaped 10+ node Iroh harness (TASK-87), measure Iroh
+   raw and compressed from cold discovery through real-Nix completion (TASK-88),
+   then close the fresh-host operator journey (TASK-45). These artifacts are an
+   Iroh reference, not a default-policy verdict.
+4. Only after that evidence freezes may BitTorrent grounding and implementation
+   begin (TASK-117, TASK-75, TASK-118, TASK-119, then conditional TASK-121).
+5. After both backends exist, run cross-backend property/fuzz rigor and the
+   preregistered sequence: diagnostic raw Stage A (TASK-125), real-network
+   development/training evidence (TASK-80), Stage-B training (TASK-122),
+   training-only fitting (TASK-44), and one later holdout (TASK-123).
+
+“Iroh first” above is implementation risk ordering only. Transport registries,
+policy artifacts and tournament scoring contain no implicit Iroh-first,
+BitTorrent-first, fastest-first or cheapest-first preference.
+
+### Evidence-grounded eligibility constraints
+
+S1 and S2 remain hard constraints, never objective terms that a fast candidate
+can trade away. This contract makes the numeric safety ceilings already
+implemented and reviewed in the repository hard constraints now; it does not
+invent absent operator budgets. The repository product owner has accepted this
+split for TASK-114: the evidence-backed numbers below govern the current
+contract, while the complete operator-budget artifact remains a fail-closed
+TASK-120 prerequisite. For every supported arm/profile:
+
+- **S1:** zero accepted byte/signature/NarHash deviations. Corruption must fail
+  gate 1 or Nix gate 2; one violation rejects the candidate.
+- **S2:** every declared dead/slow/unavailable mechanism row completes through
+  upstream fallback with the correct store path. TASK-51's provisional fetch
+  safety floor is the v1 bound: **10 s dial**, **10 s body idle**, and **60 s
+  total per peer attempt**. The experiment observes both the bounded abort and
+  final fallback success; it does not add an unevidenced aggregate full-build
+  allowance. TASK-44 may replace this provisional policy only in a new frozen
+  candidate/version that is at least as safe.
+- **Normal full-build latency:** the retained owner-accepted Wave-1 guard is
+  paired p95 at most **1.10×** upstream. p99 is reported descriptively but is
+  not a v1 decision bound: the v1 cap of 100 independent clusters cannot
+  support a distribution-free two-sided 95% p99 interval (which needs at least
+  367); it is `METRIC_UNUSABLE` for selection rather than silently promoted.
+- **Serve resources:** TASK-72's existing admission envelope is inherited by
+  every sharing profile: maximum single served NarSize **256 MiB**, maximum
+  aggregate in-flight served NarSize **1 GiB**, and maximum serve duration
+  **120 s**. Admission happens before bytes are produced; a decline is explicit
+  and cannot be reported as a peer success.
+- **Persistent content and query shape:** TASK-61's selected supply model keeps
+  **0 B of a second blob/content copy at rest**; separately measured metadata,
+  caches and transient allocations are not mislabeled as content. TASK-91's
+  batch contract admits at most **256 named keys**, **512 dictionary offers**,
+  **4 offers per positive answer** with at most one per transport kind, and a
+  **64 KiB encoded-message** gate. Until TASK-110 closes the single-key offer
+  amplification, a single-key hold-query cell is unsupported for training.
+- **Privacy:** `upstream_only` emits zero P2P publication/query/serve records;
+  `consume_only` emits zero publication and serve records and reports each
+  opted-in lookup recipient/exposure; `lan_share` emits zero packets/records to
+  public tracker, DNS discovery, relay, DHT or Mainline infrastructure;
+  `public_share` publishes zero unsigned/private-path records and uses only the
+  explicitly preflighted dependencies. Any inventory-listing response or
+  unrecorded recipient rejects the candidate.
+
+TASK-42's measured 110 MiB raw-Iroh calibration cell -- holder VmHWM
+**236.7 MiB**, requester VmHWM **135.9 MiB**, peers-off daemon VmHWM
+**10.7 MiB**, per-peer allocated state **4096 B**, and **10--11 fds** -- is an
+instrument/testbed drift reference, not a universal ceiling. A candidate is not
+rejected merely for exceeding a calibration observation.
+
+Four unresolved safety surfaces are fail-closed prerequisites for Stage-B
+training, not values this document may guess:
+
+- TASK-104 must freeze bounded responder work for a 256-key batch.
+- TASK-106 must freeze a total discovery deadline and concurrency bound rather
+  than relying on a per-probe timeout.
+- TASK-110 must close the single-key offer amplification or keep that path
+  unsupported.
+- TASK-120 must freeze a hashed, typed, **complete and owner-reviewed** budget
+  artifact for every profile with numeric upload bytes/rate, concurrent serves,
+  transient RAM, metadata/disk, fd, discovery work/traffic/deadline and
+  announcement bounds. It may tighten or recalibrate the inherited values
+  above before any public-network trial.
+
+A missing TASK-120 artifact prevents Stage-B training from starting with
+`PROFILE_BUDGET_ARTIFACT_MISSING`. A missing observation or an unknown/exceeded
+mandatory value after freeze yields `METRIC_UNUSABLE` (or an explicit
+unsupported cell where the mechanism cannot run), never zero or “unbounded.”
+Once TASK-104/106/110/120 are frozen, their hashes and values are experiment
+inputs; changing one after training starts creates a new experiment version.
+The only historical owner-accepted performance thresholds reused here are p95
+**1.10×** and the **20 percentage point** egress bite. The profile comparison
+margins below are TASK-114 preregistration choices, not claims about production
+defaults.
+
+### Exactly one primary rule per operator profile
+
+Every rule uses the paired, familywise-95% procedure in TESTING.md: the three
+selectable profiles each receive a Bonferroni-adjusted 98.333% interval, with
+the worst mandatory stratum computed inside every resample. “Beats” means the
+whole interval strictly clears the stated comparison margin; an interval
+touching it is a tie and retains the comparator. Eligibility thresholds stated
+as “at least” include equality. All hard constraints above are checked first.
+Unsupported cells are never imputed, and no acceptable candidate is a valid
+outcome.
+
+No training-selected comparator is named during calibration. Before the first
+calibration cluster, TASK-128 freezes the closed causal-trace schema, replay
+interpreter and complete planning-contrast catalog. Each selectable profile has
+at most 16 fully specified selector artifacts and the complete capable
+best-static set of at most four base arms, hence at most 64 exact contrasts per
+profile and 192 total. Selector families, parameter ranges and fields filled
+from training are forbidden: every threshold and fallback order is already in
+one hashed artifact. A dynamic artifact may consume pre-execution context and
+only its own label-local observations available by the decision timestamp; it
+cannot read future, other-label or post-hoc outcome fields. Four fixed-class
+training replay-versus-live parity rows per dynamic artifact are predeclared,
+with two independently fresh live executions on each row: A1 live is checked
+only against A1 replay and A2 live only against A2 replay. Failure makes every
+catalog contrast containing that artifact ineligible without changing the
+catalog. The worst case is `3*16*4*2 = 384` parity live slots; with 23,680 base
+Stage-B label slots the total ceiling is 24,064.
+
+The same catalog hashes an exact integer/expression-encoded planning-injection
+table before calibration. Power alternatives are consume benefit `0.075`,
+egress cut `0.30`, LAN log benefit `1.5*(-log(0.95))`, public relative log
+relief `1.5*log(1.10)`, public absolute log relief `log(1.10)`, and latency
+guard `0` (no regression). Their null boundaries remain respectively `0.05`,
+`0.20`, `-log(0.95)`, `log(1.10)`, `0`, and `log(1.10)`; every A/A power
+alternative is zero with both predeclared `+/-m_aa` boundary injections. A
+single linked-coordinate solver shifts fraction/byte, latency-ratio and relief
+numerator/upload coordinates without splitting shared views. It never clips or
+retries: inability to materialize a finite physical target makes only that
+contrast ineligible.
+
+Every supported Stage-B base arm runs indistinguishable A1/A2 labels from the
+first calibration cluster through extension and the fixed holdout. TASK-122
+plans every catalog contrast jointly across all four strata at authoritative
+N=100, using the final 10,000-draw selector-derived candidate-versus-comparator
+procedure. Planning centers away observed direction and exposes to TASK-44 only
+the immutable contrast eligibility mask, global N and hashes: no raw A2,
+residual, per-label effect or uncentered statistic crosses that boundary.
+TASK-44 uses canonical A1 only to choose the deterministic best-static arm and
+one already-enumerated artifact whose exact matching contrast is eligible. It
+cannot synthesize a threshold or swap to a comparator whose contrast happened
+to pass. With no eligible match the profile has no candidate. After candidate
+and comparator hashes freeze, a separate TASK-122 reader replays the same
+selector independently on A2 for validation and sends only its hashed
+validated/no-go artifact to the TASK-123 freeze input. TASK-44 receives no A2
+feedback and cannot nominate a runner-up; failure means no candidate for that
+experiment version. Unsupported arms remain explicit and have no fabricated
+clone metric. Every p95-dependent rule, guard or A/A below requires exactly 100
+valid independent clusters per opportunity stratum and an exact planning pass
+at N=100; p99 stays descriptive.
+
+Each selectable profile always produces one hashed validation-slot artifact.
+A present candidate uses `validated` or `validation_no_go` and binds its
+candidate/comparator hashes. A training no-candidate result instead uses
+`status=no_candidate`, explicit absent candidate/comparator references and
+`a2_validation_status=not_applicable`; hash fields are forbidden rather than
+fabricated. TASK-123 requires hashes only for present references and executes
+only validated slots. No-go/no-candidate slots remain witnessed, are not
+reassigned, and do not narrow the three-profile multiplicity family.
+
+| Operator profile | One primary decision rule and margin |
+|---|---|
+| `upstream_only` | This is the fixed comparator, not a fitted P2P candidate. Its sole scalar validity rule is paired upstream A/A full-build p95 agreement within **5%**; outside that margin the profile metric is `METRIC_UNUSABLE`, not a P2P win. Provider upload is 0 B and upstream payload egress defines fraction 1.0. |
+| `consume_only` | Minimize requester **upstream cache payload bytes (compressed-wire)**. A nominee displaces the training-selected best-static comparator only when its adjusted lower bound clears an absolute **5 percentage-point** reduction, and its lower bound against upstream-only must be at least **20 percentage points**. Local provider upload remains exactly 0 B; latency and privacy remain hard constraints. |
+| `lan_share` | Minimize **p95 full-real-Nix build latency**. A nominee displaces best-static only when its adjusted lower bound clears a **5%** reduction. It is eligible only if its lower bound on upstream compressed-wire payload-egress reduction is at least **20 percentage points** and provider upload stays under its frozen TASK-120 profile budget. |
+| `public_share` | Maximize **cache-relief efficiency** = `avoided_upstream_payload_bytes_compressed_wire / provider_upload_bytes_compressed_wire`, computed only from separately reported source fields. A nominee's adjusted lower bound must clear a **10%** improvement over best-static and its lower adjusted efficiency bound must be at least **1.00**; its lower egress-reduction bound must also reach **20 percentage points**, and it must satisfy latency/privacy/resource constraints. Zero peer delivery is ineligible, never an infinite score. |
+
+These rules intentionally differ by operator context. The old “<20% and >10%
+kills the whole P2P thesis” statement is therefore superseded: 20 percentage
+points remains an eligibility bite for sharing/consuming profiles, while latency,
+upload, privacy and resources can independently reject a profile. A LAN win does
+not license public publication; a public loss does not erase a consume-only win.
+
+### Decision ownership, artifacts and version changes
+
+- The **repository product owner** retains authority to accept production
+  profile intent, defaults and budgets. TASK-114 freezes the experimental
+  contract and generator version without claiming that its new technical
+  margins are production-approved. TASK-120 freezes the reviewed numeric
+  profile-budget artifact before Stage-B training. No role may change either by
+  editing a result artifact.
+- TASK-88 owns the Iroh-only reference. TASK-117 owns BitTorrent identity and
+  representation feasibility. TASK-125 owns diagnostic Stage A. Before
+  calibration, TASK-128 owns and freezes the generic causal-trace schema, replay
+  interpreter and complete exact selector/comparator contrast plus numeric
+  injection catalog; it may not tune them from training. TASK-122 owns
+  execution, exclusions, fixed-class
+  replay parity, centered joint planning and post-freeze A2 validation for
+  Stage-B **training only**. It releases only the immutable eligibility
+  mask/global N/hashes before selection, sends the final hashed validation/no-go
+  artifact directly to TASK-123, and keeps raw A2 and every directional value
+  outside the TASK-44 fitting surface.
+  TASK-44 owns deterministic A1-only selection: the best-static comparator and
+  at most one exact eligible catalog artifact per profile. It may not create a
+  parameter, substitute a comparator, receive A2 feedback or alter a selector
+  after A2 validation. TASK-123 owns the
+  freeze/execution/verdict protocol with the independent entropy witnesses
+  required by TESTING.md.
+- TASK-123 may begin only with frozen hashes for code, experiment contract,
+  training manifest/results, causal-trace/replay interpreter, complete contrast
+  catalog, centered planning artifact and eligibility mask, fixed-class parity
+  results and exactly one hashed validated/validation-no-go/no-candidate slot
+  artifact per selectable profile. Candidate/comparator hashes are required
+  only for a present reference and forbidden for an explicit absent/not-applicable
+  reference. It generates the hitherto nonexistent holdout material and runs
+  each validated candidate unchanged; an absent/no-go profile stays
+  no-candidate. TASK-124 alone plans a production default/rollout from the
+  verdict.
+- The first accepted Stage-B training run freezes
+  `nix-p2p-tournament-v1`. Any later change to an objective, margin, hard
+  constraint, scenario generator/distribution, or profile semantics creates a
+  **new experiment version**, restarts training/fitting, and requires a fresh
+  never-before-generated holdout. The old artifact and failed/no-go verdict stay
+  recorded. Implementation/interpreter changes after their freeze likewise
+  require new hashes and new evidence; holdout-driven tuning is forbidden.
