@@ -600,6 +600,7 @@ dependencies = [
  "iroh-blobs",
  "iroh-dns",
  "n0-future",
+ "peer-fabric",
  "rustix",
  "serde",
  "serde_json",
@@ -2564,6 +2565,9 @@ name = "peer-fabric"
 version = "0.0.1"
 dependencies = [
  "async-trait",
+ "blake3",
+ "serde",
+ "serde_json",
  "tokio",
 ]
 

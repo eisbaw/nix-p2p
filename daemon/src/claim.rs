@@ -94,6 +94,7 @@ use serde_json::Value;
 use crate::content_id::Blake3Digest;
 use crate::source::NarHash;
 use crate::transport::{BitTorrentInfoHash, NodeId};
+use crate::transport_fetch::TransportTag;
 
 /// Wire schema version of [`Claim`]. Bumped only on a breaking change; a decoder
 /// rejects any other version cleanly (network-split boundary).
@@ -342,6 +343,21 @@ impl KnownTransport {
         match self {
             KnownTransport::Iroh { .. } => "iroh",
             KnownTransport::BitTorrent { .. } => "bittorrent",
+        }
+    }
+
+    /// The seam [`TransportTag`] this daemon-wire offer dispatches on. The daemon's
+    /// wire offer enum and the seam's `peer_fabric::TransportOffer` are DIFFERENT
+    /// representations of the same intent, so each maps to the shared tag on its
+    /// own type (the seam's `TransportTag::of` takes the seam's offer). Both agree
+    /// on the frozen `"iroh"`/`"bittorrent"` wire tags: that `TransportTag::as_str`
+    /// equals this offer's [`KnownTransport::wire_tag`] is asserted directly in
+    /// `known_transport_tags_agree_with_the_wire_tags` (via `offer.tag().as_str()`),
+    /// so the seam string cannot silently drift from what the daemon emits.
+    pub(crate) fn tag(&self) -> TransportTag {
+        match self {
+            KnownTransport::Iroh { .. } => TransportTag::Iroh,
+            KnownTransport::BitTorrent { .. } => TransportTag::BitTorrent,
         }
     }
 }
@@ -2641,9 +2657,17 @@ mod tests {
 
     #[test]
     fn known_transport_tags_agree_with_the_wire_tags() {
-        // Three hand-maintained statements of one fact: KNOWN_TRANSPORT_TAGS, the
-        // serde attributes, and `wire_tag`. Asserted against each other so a new
-        // transport cannot land in two of the three.
+        // FOUR hand-maintained statements of one fact, asserted against each other
+        // so a new transport (or a rename) cannot land in only some of them:
+        //   1. KNOWN_TRANSPORT_TAGS
+        //   2. the serde attributes (what `to_value` emits)
+        //   3. `KnownTransport::wire_tag`
+        //   4. the seam's `peer_fabric::TransportTag::as_str`, reached via the
+        //      `KnownTransport::tag()` bridge this module owns. Without this last
+        //      assertion the seam string was an UNGUARDED 4th copy: renaming
+        //      `TransportTag::as_str` to "bt" would compile and pass, yet the
+        //      bridge would silently disagree with what the daemon emits on the
+        //      wire (mped-architect finding, TASK-141).
         for offer in [
             KnownTransport::Iroh { node: node_a() },
             KnownTransport::BitTorrent {
@@ -2660,6 +2684,12 @@ mod tests {
                 encoded.get("transport").and_then(Value::as_str),
                 Some(tag),
                 "`wire_tag` disagrees with what serde emits for {offer:?}"
+            );
+            assert_eq!(
+                offer.tag().as_str(),
+                tag,
+                "the seam TransportTag string disagrees with the daemon wire tag \
+                 for {offer:?}"
             );
         }
         assert_eq!(

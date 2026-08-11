@@ -26,7 +26,6 @@ pub mod catalog;
 pub mod claim;
 pub mod content_id;
 pub mod discovery;
-mod hexfmt;
 pub mod iroh_node_lookup;
 pub mod iroh_node_record;
 pub mod iroh_publication;

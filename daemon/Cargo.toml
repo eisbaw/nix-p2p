@@ -42,6 +42,14 @@ required-features = ["evidence-fixture"]
 # wire behaviour (PRD round 5); the hyper-stack crate names are in
 # scripts/check-independence.py's denylist so convergence is a mechanical gate.
 [dependencies]
+# peer-fabric (TASK-140/141): the intention-level P2P seam and the CANONICAL HOME
+# of the shared value types (NodeId, Blake3Digest, TransportTag, InfoHash,
+# TransportOffer). TASK-141 deleted the daemon's former duplicate definitions of
+# these and re-points here; the daemon's `content_id`/`transport`/`transport_fetch`
+# modules now re-export peer-fabric's copies, keeping their freeze narratives and
+# conformance tests as the cross-crate equivalence guard. This is a daemon-SIDE
+# crate (testproxy depends on none of it), so `just independence` stays green.
+peer-fabric = { path = "../peer-fabric" }
 # `sync` (task-72): the on-demand supply path needs SINGLE FLIGHT - when two peers
 # ask for the same absent digest at once, exactly one regenerates and the other
 # waits for its verdict. `tokio::sync::watch` carries the state as well as the

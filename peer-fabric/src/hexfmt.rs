@@ -1,32 +1,26 @@
-//! Lowercase-hex codec for the frozen fixed-width byte identities (task-48).
+//! Lowercase-hex codec for the fixed-width byte identities the seam names.
 //!
-//! The canonical string form of every 32-byte identity this freeze pins - the
-//! raw-NAR [`crate::content_id::Blake3Digest`], the iroh [`crate::transport::NodeId`],
-//! a v2 BitTorrent infohash - is lowercase hex. Hex is chosen over nix-base32
-//! deliberately: it is reproducible by any second implementation with no shared
-//! table (a stock `b3sum` prints exactly this), it is fixed-width so a length
-//! check alone rejects a truncated value, and it does not couple our wire form to
-//! any transport crate's `Display` choice (iroh's own string form is a transport
-//! detail we convert to/from via raw bytes, never depend on).
+//! The canonical string form of every 32-byte identity here - the raw-NAR
+//! [`crate::Blake3Digest`], the [`crate::NodeId`], a v2 BitTorrent infohash - is
+//! lowercase hex. This is the SAME frozen codec the daemon pinned in its
+//! `hexfmt` module (task-48): hex is reproducible by any second implementation
+//! with no shared table (`b3sum` prints exactly this), fixed-width so a length
+//! check alone rejects a truncated value, and independent of any transport
+//! crate's `Display`. TASK-141 moved the value types here (their canonical home),
+//! so their codec moved with them.
 //!
-//! FROZEN RULE (task-48 re-gate, codex finding 5): the canonical encoding is
-//! LOWERCASE hex, and decode REJECTS uppercase. One string encodes each value, so
-//! two implementations cannot disagree about a canonical identity and a
-//! byte-for-byte wire comparison is exact. (nix-base32 for `NarHash` is likewise
-//! lowercase-only - see [`crate::nixbase32`].)
-//!
-//! Kept tiny and dependency-free on purpose: a `hex` crate would be one more
-//! thing the daemon and testproxy could accidentally converge on, and this is six
-//! lines. `pub(crate)` - it is an encoding utility, not part of the frozen API.
+//! FROZEN RULE: the canonical encoding is LOWERCASE hex, and decode REJECTS
+//! uppercase - exactly one string encodes each value, so a byte-for-byte wire
+//! comparison is exact. Kept tiny and dependency-free on purpose; `pub(crate)` -
+//! an encoding utility, not part of the seam's public API.
 
-/// Encode bytes as lowercase hex (2 chars per byte, no separators).
+/// Encode bytes as lowercase hex (2 chars per byte, no separators). Lowercase by
+/// construction, so the canonical string form of every identity is unambiguous.
 pub(crate) fn encode(bytes: &[u8]) -> String {
     let mut out = String::with_capacity(bytes.len() * 2);
     for byte in bytes {
-        // Fixed two-nibble width per byte; `{:02x}` never emits an uppercase
-        // digit, so the output is canonical lowercase by construction.
-        out.push(char::from_digit((byte >> 4) as u32, 16).unwrap());
-        out.push(char::from_digit((byte & 0x0f) as u32, 16).unwrap());
+        out.push(char::from_digit((byte >> 4) as u32, 16).expect("high nibble is 0..16"));
+        out.push(char::from_digit((byte & 0x0f) as u32, 16).expect("low nibble is 0..16"));
     }
     out
 }
@@ -39,8 +33,8 @@ pub(crate) enum HexError {
     /// The string was not exactly `2 * expected_len` characters.
     WrongLength { expected_chars: usize, found: usize },
     /// A character outside `[0-9a-f]` appeared at `index`. Uppercase is
-    /// deliberately rejected: the frozen canonical form is lowercase (see module
-    /// docs), so exactly one string encodes each value.
+    /// deliberately rejected: the frozen canonical form is lowercase, so exactly
+    /// one string encodes each value.
     NonHexChar { index: usize },
 }
 
@@ -122,7 +116,6 @@ mod tests {
 
     #[test]
     fn rejects_wrong_length_before_content() {
-        // A truncated 32-byte digest is a length error, not a partial decode.
         assert_eq!(
             decode_fixed::<32>("aa"),
             Err(HexError::WrongLength {
@@ -133,17 +126,21 @@ mod tests {
     }
 
     #[test]
-    fn rejects_non_hex() {
+    fn rejects_non_hex_and_reports_a_non_zero_index() {
+        // The only test pinning NonHexChar reporting at a NON-zero offset, so a
+        // mutation to the `i*2` / `i*2+1` index arithmetic that every frozen
+        // identity's FromStr routes through would be caught (not just a bad char
+        // at index 0, which `rejects_uppercase_*` already covers).
         assert_eq!(
             decode_fixed::<2>("00zz"),
             Err(HexError::NonHexChar { index: 2 })
         );
+        // decode_var walks the same index arithmetic; pin it at a non-zero offset.
+        assert_eq!(decode_var("00zz"), Err(HexError::NonHexChar { index: 2 }));
     }
 
     #[test]
     fn rejects_uppercase_so_canonical_is_lowercase_only() {
-        // Frozen rule: decode is lowercase-only, so exactly one string encodes a
-        // value and a wire comparison is exact.
         assert_eq!(
             decode_fixed::<2>("AABB"),
             Err(HexError::NonHexChar { index: 0 })

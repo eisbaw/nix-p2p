@@ -72,47 +72,22 @@ use crate::source::{NarKey, NarSource, SourceError, UpstreamResponse};
 // Transport selection tag.
 // -------------------------------------------------------------------------
 
-/// Which transport a [`KnownTransport`] offer selects. This is the dispatch key a
-/// [`TransportRegistry`] maps to a [`Transport`] impl.
-///
-/// It mirrors the wire tags of [`KnownTransport`], but note the layering: the
-/// claim decoder already DROPS genuinely-unknown wire transports (tolerated but
-/// inert - see [`crate::claim`]), so by the time an offer reaches this module it
-/// is always a KNOWN wire variant. "Unknown/unimplemented" AT THIS LAYER therefore
-/// means a known wire transport with NO registered backend (e.g. `bittorrent`,
-/// representable but not implemented until a backend exists) - that offer is
-/// SKIPPED, never a crash.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum TransportTag {
-    /// iroh whole-blob (Candidate B). The locator is a `NodeId`.
-    Iroh,
-    /// BitTorrent - representable, no backend yet. The locator is an infohash.
-    BitTorrent,
-}
-
-impl TransportTag {
-    /// The tag that dispatches a given offer.
-    pub fn of(offer: &KnownTransport) -> Self {
-        match offer {
-            KnownTransport::Iroh { .. } => TransportTag::Iroh,
-            KnownTransport::BitTorrent { .. } => TransportTag::BitTorrent,
-        }
-    }
-
-    /// The wire-tag string (matches [`KnownTransport`]'s serde tags).
-    pub fn as_str(&self) -> &'static str {
-        match self {
-            TransportTag::Iroh => "iroh",
-            TransportTag::BitTorrent => "bittorrent",
-        }
-    }
-}
-
-impl fmt::Display for TransportTag {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(self.as_str())
-    }
-}
+// The dispatch key a [`TransportRegistry`] maps to a [`Transport`] impl now lives
+// in `peer-fabric` (the canonical home of every value type that crosses the P2P
+// seam; TASK-141 deleted the daemon's former duplicate). Re-exported so this
+// module's use-sites (`TransportTag::Iroh`, ...) are unchanged.
+//
+// Note the layering, unchanged: the claim decoder already DROPS genuinely-unknown
+// wire transports (tolerated but inert - see [`crate::claim`]), so by the time an
+// offer reaches this module it is always a KNOWN wire variant. "Unknown" AT THIS
+// LAYER means a known wire transport with NO registered backend (e.g. `bittorrent`,
+// representable but not implemented) - that offer is SKIPPED, never a crash.
+//
+// The seam's `TransportTag::of` maps the SEAM's offer type (`TransportOffer`); the
+// daemon's own wire offer enum maps to the tag via [`KnownTransport::tag`], since
+// the two offer representations differ. Both agree on the frozen `"iroh"` /
+// `"bittorrent"` wire tags.
+pub use peer_fabric::TransportTag;
 
 // -------------------------------------------------------------------------
 // The transport-integrity gate (single source of truth).
@@ -362,7 +337,7 @@ pub async fn fetch_via_offers(
     let mut skipped = Vec::new();
     let mut failed = Vec::new();
     for offer in offers {
-        let tag = TransportTag::of(offer);
+        let tag = offer.tag();
         match registry.get(tag) {
             None => {
                 // Unknown/unimplemented transport: skip, do not crash.
@@ -550,7 +525,7 @@ impl Transport for FakeTransport {
     ) -> Result<Vec<u8>, TransportError> {
         // Defensive: the registry dispatches by tag, but a wrong variant is a bug
         // worth surfacing rather than silently mis-serving.
-        let got = TransportTag::of(offer);
+        let got = offer.tag();
         if got != self.tag {
             return Err(TransportError::WrongOffer {
                 expected: self.tag,
@@ -776,13 +751,14 @@ mod tests {
     #[test]
     fn transport_tag_maps_each_offer_variant() {
         assert_eq!(
-            TransportTag::of(&KnownTransport::Iroh { node: node() }),
+            KnownTransport::Iroh { node: node() }.tag(),
             TransportTag::Iroh
         );
         assert_eq!(
-            TransportTag::of(&KnownTransport::BitTorrent {
+            KnownTransport::BitTorrent {
                 infohash: BitTorrentInfoHash::v1([0xaa; 20]),
-            }),
+            }
+            .tag(),
             TransportTag::BitTorrent
         );
     }

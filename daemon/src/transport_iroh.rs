@@ -2540,7 +2540,7 @@ impl Transport for IrohTransport {
             other => {
                 return Err(TransportError::WrongOffer {
                     expected: TransportTag::Iroh,
-                    got: TransportTag::of(other),
+                    got: other.tag(),
                 });
             }
         };

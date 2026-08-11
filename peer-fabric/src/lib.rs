@@ -42,6 +42,7 @@ mod content;
 mod exposure;
 mod fabric;
 mod fake;
+mod hexfmt;
 mod ids;
 mod outcome;
 
@@ -62,7 +63,8 @@ pub use fake::{
     FakeNodeLocator, FakePeerHoldQuery, FakeProviderDirectory,
 };
 pub use ids::{
-    BLAKE3_DIGEST_LEN, BLAKE3_PREFIX, Blake3Digest, InfoHash, NODE_ID_LEN, NodeId, TransportOffer,
-    TransportTag,
+    BLAKE3_DIGEST_LEN, BLAKE3_DOMAIN_SEPARATION, BLAKE3_PREFIX, Blake3Digest, DigestParseError,
+    InfoHash, InfoHashParseError, NODE_ID_LEN, NodeId, NodeIdParseError, STREAM_CHUNK_BYTES,
+    TransportOffer, TransportTag,
 };
 pub use outcome::{Lookup, Unavailable};

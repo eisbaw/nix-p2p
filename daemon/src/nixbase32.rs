@@ -3,8 +3,10 @@
 //! Nix writes content hashes as `<algo>:<base32>` using its OWN base-32 alphabet
 //! (`0123456789abcdfghijklmnpqrsvwxyz` - 32 chars, deliberately omitting `e o u t`
 //! to avoid rendering rude words and ambiguous glyphs). This is NOT RFC 4648
-//! base32, and NOT hex, so we cannot reuse [`crate::hexfmt`]: a `NarHash` is the
-//! value Nix SIGNS and a narinfo carries verbatim, so the claim wire key must be
+//! base32, and NOT hex, so we cannot reuse a plain-hex codec (the lowercase-hex
+//! codec for the fixed-width byte identities now lives in the `peer-fabric` seam
+//! crate): a `NarHash` is the value Nix SIGNS and a narinfo carries verbatim, so
+//! the claim wire key must be
 //! byte-identical to what Nix produced. A sha256 is 32 bytes -> exactly 52 base-32
 //! chars.
 //!

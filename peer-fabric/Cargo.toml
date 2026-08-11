@@ -20,12 +20,29 @@ path = "src/lib.rs"
 # I/O-bound, so a vtable hop is unmeasurable. No runtime is a *normal* dep: the one
 # piece of shared state, the ExposureLedger, uses `std::sync::Mutex`.
 async-trait = "0.1"
+# TASK-141: the canonical value types moved here (this crate is their home), and
+# they carry the FROZEN wire behaviour the daemon used to own - so their codec deps
+# come with them. NEITHER is a p2p stack (the AC#8 "no iroh/libp2p" invariant is
+# intact); iroh/libp2p still live only in the future fabric-* backend crates.
+#   * blake3: `Blake3Digest::from_raw_nar` IS the frozen BLAKE3(RawNarV1) content
+#     identity recipe (was daemon::content_id). It must equal the iroh-blobs blob
+#     hash, so the recipe is plain unkeyed BLAKE3 - see ids.rs.
+#   * serde: NodeId/Blake3Digest/InfoHash serialise to their canonical string forms
+#     on the claim wire; the daemon's claim codec consumes these impls, and the
+#     orphan rule forbids the daemon adding them to a foreign type - so they must
+#     live at the type's home. content.rs (ContentKey/ProviderRecord) stays
+#     serde-FREE: TASK-126 freezes that codec against the adopted backend.
+blake3 = "1"
+serde = { version = "1", features = ["derive"] }
 
 [dev-dependencies]
 # Only the tests need an async runtime, to `.await` the trait methods. `macros` for
 # `#[tokio::test]`, `rt` for a current-thread executor. No `net`, no `process`: the
 # seam is substrate-free and so are its tests (FakeFabric is the only backend).
 tokio = { version = "1", features = ["macros", "rt"] }
+# The ids codec tests round-trip the canonical string forms through JSON, exactly
+# as the daemon's claim wire does, so the frozen encodings are pinned here too.
+serde_json = "1"
 
 [lints]
 workspace = true

@@ -35,7 +35,6 @@ const SOURCES: &[(&str, &str)] = &[
     ("claim.rs", include_str!("../src/claim.rs")),
     ("content_id.rs", include_str!("../src/content_id.rs")),
     ("discovery.rs", include_str!("../src/discovery.rs")),
-    ("hexfmt.rs", include_str!("../src/hexfmt.rs")),
     ("lib.rs", include_str!("../src/lib.rs")),
     ("main.rs", include_str!("../src/main.rs")),
     ("narinfo_cache.rs", include_str!("../src/narinfo_cache.rs")),
