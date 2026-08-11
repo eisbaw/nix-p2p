@@ -1,21 +1,24 @@
 ---
 id: TASK-95
-title: 'STATIC CENSUS: reproducible servable and publishable store distribution'
+title: OPTIONAL offline store census for later policy analysis
 status: To Do
 assignee: []
 created_date: '2026-08-10 08:43'
-updated_date: '2026-08-10 22:53'
+updated_date: '2026-08-11 20:19'
 labels:
+  - optional
+  - measurement
+  - policy
   - wave-2b
 dependencies:
   - TASK-9
-priority: high
+priority: low
 ---
 
 ## Description
 
 <!-- SECTION:DESCRIPTION:BEGIN -->
-Produce the early deterministic denominator needed by publication and wire-cost work. The census separates derivations, servable outputs, local/ultimate content, locally signed content and content proven public by bounded upstream-narinfo widening; reports both path and byte distributions; and emits a dated reproducible snapshot. Live-machine numbers are observations that change after GC/channel updates, never acceptance constants. Request-weighted coverage and insert/delete churn require running/longitudinal evidence and belong to TASK-127.
+Optional later measurement of aggregate store composition and size distribution. It is not part of the publication privacy gate and no production discovery task depends on it. Keep prior dated figures as observations only; request-weighted and longitudinal analysis remains TASK-127.
 <!-- SECTION:DESCRIPTION:END -->
 
 ## Acceptance Criteria
@@ -30,5 +33,5 @@ Produce the early deterministic denominator needed by publication and wire-cost 
 ## Implementation Notes
 
 <!-- SECTION:NOTES:BEGIN -->
-Earlier 82k/108k path and 6.3k/6.7k publishable figures are retained only as dated observations. Do not require a future swarm here and do not infer deletions from registrationTime.
+Superseded on the discovery critical path by the owner-selected KISS design on 2026-08-11: TASK-102 maintains an append-only allowlist learned from requested NARs proven public by cache.nixos.org. Do not schedule this census before decentralized NAR discovery.
 <!-- SECTION:NOTES:END -->
