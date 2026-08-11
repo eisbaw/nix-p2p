@@ -31,6 +31,7 @@ pub mod iroh_node_lookup;
 pub mod iroh_node_record;
 pub mod iroh_publication;
 pub mod iroh_publication_authority;
+pub mod iroh_relay;
 pub mod iroh_runtime;
 pub mod narinfo_cache;
 mod nixbase32;
@@ -87,6 +88,12 @@ pub use iroh_publication::{
 pub use iroh_publication_authority::{
     AUTHORITY_STATE_FILENAME, AuthorityError, AuthoritySignerAdmission, PublicationAuthority,
     PublicationAuthorityConfig,
+};
+pub use iroh_relay::{
+    RELAY_CONNECT_DEADLINE, RELAY_SCHEDULER_GRACE, RelayConnectionPath, RelayHealth,
+    RelayPreflightStatus, RelayTransportAuthorization, RelayTransportConfig,
+    RelayTransportUnavailable, RelayTransportUnavailableKind, classify_connection_path,
+    redact_fingerprint,
 };
 pub use iroh_runtime::{
     AddressLookupCapability, EndpointCapabilityState, EndpointProfile, EndpointScope,
