@@ -7,7 +7,7 @@ status: In Progress
 assignee:
   - '@claude'
 created_date: '2026-08-11 22:55'
-updated_date: '2026-08-12 13:37'
+updated_date: '2026-08-12 14:14'
 labels:
   - iroh
   - discovery
@@ -49,10 +49,5 @@ inc1: feature-gated relay evidence binaries (server+peer) DONE, committed 99376b
 ## Implementation Notes
 
 <!-- SECTION:NOTES:BEGIN -->
-inc3 landed (pending DEEP gate). The routed relay artifact is produced from a REAL rootless-podman routed run, not fabricated. Three root-cause harness bugs were found and fixed while getting the run to complete + satisfy the finalizer:
-  (1) e04d6e9: /control + /evidence bind mounts passed a relative source -> podman treated it as a named volume (slashes rejected). Fixed with .resolve(), matching the node-lookup idiom.
-  (2) e04d6e9: the per-acceptor-arm acceptor uses a run-scoped name; signal_and_wait only stops it, so it collided with the next acceptor-arm create. Added rm -f after stop.
-  (3) 9257988: the acceptor always routed to the whole connector subnet, so on a relay-only arm its OWN iroh hole-punch probe reached the connector directly (1 captured direct-peer packet). The finalizer zero-direct guard CORRECTLY rejected that as falsifiable. Fixed: open the acceptor->connector route ONLY for the direct-positive control; relay arms keep it closed. The oracle bit by mutation.
-Artifact (220c6b3): artifacts/iroh-relay-capability-v1.json verdict=pass, failed_constraints=[], bound to implementation commit 9257988, sha256=971d4f71...2359b14. Arms: relay-success=relayed relay_attributed 124/0 relay/direct; direct-positive control=direct 0/37 (NOT relay-credited); wrong-url typed at 56ms; relay-outage/wrong-cert/wrong-identity/half-open fail closed within the 11s deadline. production-shaped-local, no n0/public relay.
-AC status: #1 (real routed artifact verdict=pass) MET; #2 (self-tests wired into just test L118-120 + green) MET; #3 (production-shaped, no public relay) MET. DEEP gate (qa + mped-architect + codex cross-model) running before marking Done.
+DEEP gate returned: core relay-attribution proof CONFIRMED genuine + non-circular (mped-architect). One gate-breaking finding F1 = TASK-166 (elapsed_ms measures container wall-clock + is clamped, so the deadline oracle cannot bite). F1 is an evidence-instrument honesty defect, NOT a relay-transport bug. Follow-ups F2=TASK-165, F3=TASK-167. Decision: TASK-142 stays In Progress (not falsely Done) on the timing axis; F1 (TASK-166) is deferred and gates TASK-89's use of the artifact, so it lands when the iroh relay evidence is finalized rather than being hardened now while the core path is the priority.
 <!-- SECTION:NOTES:END -->

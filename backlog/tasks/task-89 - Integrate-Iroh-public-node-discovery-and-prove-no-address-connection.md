@@ -4,7 +4,7 @@ title: Integrate Iroh public node discovery and prove no-address connection
 status: To Do
 assignee: []
 created_date: '2026-08-10 07:09'
-updated_date: '2026-08-11 23:03'
+updated_date: '2026-08-12 14:13'
 labels:
   - wave-2b
   - discovery
@@ -15,6 +15,7 @@ dependencies:
   - TASK-137
   - TASK-138
   - TASK-139
+  - TASK-166
 priority: high
 ---
 
