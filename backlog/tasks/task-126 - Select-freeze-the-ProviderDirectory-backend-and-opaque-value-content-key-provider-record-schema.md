@@ -4,9 +4,10 @@ title: >-
   Select + freeze the ProviderDirectory backend and opaque-value
   content-key/provider-record schema
 status: In Progress
-assignee: []
+assignee:
+  - '@claude'
 created_date: '2026-08-10 22:51'
-updated_date: '2026-08-12 00:02'
+updated_date: '2026-08-12 00:11'
 labels:
   - iroh
   - discovery
@@ -42,4 +43,32 @@ Implement the cornerstone decentralized exact-key discovery core now. Build a bo
 
 <!-- SECTION:NOTES:BEGIN -->
 2026-08-12 orchestrator re-scope: removed the runtime-DHT ACs (old #3 exact-key lookup, #5 bootstrap nodes, #7 cold multi-node test, #8 dht-core-v1 evidence) — they are redundant with TASK-103 (#3/#4/#5/#7/#10, the RUNNING adopted DHT) and the dht-core-v1 artifact is obsolete now we adopt not hand-roll. TASK-126 is now SPIKE + CODEC FREEZE only: freeze the peer-fabric ProviderRecord/ContentKey codec + golden vectors + fail-closed decode + record-validation rules, and decide primary/fallback backend. Freeze is safe even if the iroh-dht-experiment eval is inconclusive because libp2p-kad put_record guarantees opaque-value storage (the fallback); the spike refines primary vs fallback, it does not block the freeze.
+
+## Implementation Plan (2026-08-12)
+
+SPIKE (AC#5) — DONE, evidence-based, FLIPS primary/fallback:
+- iroh-dht-experiment (github.com/n0-computer/iroh-dht-experiment) stores a FIXED
+  typed `Value` enum { Blake3Provider, ED25519SignedMessage, Blake3Immutable }, NOT
+  a generic opaque Vec<u8> store. Its opaque carriers bind the STORAGE KEY to the
+  value: Blake3Immutable key MUST == blake3(data) (immutable, no refresh/sequence);
+  ED25519SignedMessage key == SIGNER PUBKEY (keyed by provider identity, not by
+  content); Blake3Provider is a bare {timestamp,node_id} (no offers/sig/sequence).
+  None can key `content-derived ContentKey -> mutable multi-provider signed record`.
+  Also experimental (validation TODO), data<=1024B.
+  => DECISION: libp2p-kad put_record/get_record is PRIMARY freeze target (Record
+  { key: arbitrary, value: opaque Vec<u8> } is exactly our model). iroh-dht-experiment
+  = FALLBACK/future candidate (blocked today for our keying model). Freeze is SAFE
+  regardless: our codec emits ContentKey -> signed opaque bytes; libp2p-kad guarantees
+  opaque-value storage. 1024B record cap chosen to also fit iroh-dht-experiment's
+  ED25519SignedMessage.data carrier, keeping the fallback viable if it matures.
+
+FREEZE (AC#1-4):
+- ContentKey::derive_from_signed_nar_hash = BLAKE3 derive_key(context="nix-p2p/discovery/ContentKey/v1", sha256 NarHash). DOMAIN-SEPARATED (opposite of Blake3Digest's plain-unkeyed recipe) + compile-assert + golden + namespace-mutation control + independent python-blake3 cross-check script.
+- ProviderRecord/ProviderWithdrawal: versioned CANONICAL fixed-layout BINARY opaque value (record_codec.rs). Fields: version,kind,key,provider,seq,issued_at,expiry,[content,offers],sig64. ed25519 sig over domain||body; provider NodeId IS the verifying key (self-verifying). NO ip/port/relay/StorePath/unasked field possible (fixed layout).
+- Fail-closed decode: Oversized/Malformed/TrailingBytes/UnknownVersion/UnknownKind/WrongKey/BadSignature/Stale/TooManyOffers, each a surgical negative test that BITES.
+- Validation oracle (record_store.rs, salvaged FakeProviderDirectory logic): monotonic sequence, idempotent refresh, signed withdrawal, expiry, replay rejection, concurrent-provider merge, no expired/withdrawn resurrection.
+
+FORWARD-CARRIED NOTES resolved: (1) key SSOT — keep record.key, sig binds it, decode rejects WrongKey vs storage key. (2) .content NOT redundant — content is BLAKE3 (fetch id), ContentKey derives from sha256 NarHash; asker cannot derive one from other, so content is LEARNED; keep. (3) privacy — routing-only nodes see only derived key; storing nodes learn content BLAKE3 (narrows not hides); full analysis = TASK-132.
+
+New dep: ed25519-dalek 3 (already in lock via iroh; not a p2p stack). Gate + golden byte-pin + bite-proof before commit.
 <!-- SECTION:NOTES:END -->
