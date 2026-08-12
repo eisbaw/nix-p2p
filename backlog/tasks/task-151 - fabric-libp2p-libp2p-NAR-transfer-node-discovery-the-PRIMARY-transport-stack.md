@@ -3,10 +3,11 @@ id: TASK-151
 title: >-
   fabric-libp2p: libp2p NAR transfer + node discovery (the PRIMARY transport
   stack)
-status: To Do
-assignee: []
+status: In Progress
+assignee:
+  - '@claude'
 created_date: '2026-08-12 07:22'
-updated_date: '2026-08-12 07:56'
+updated_date: '2026-08-12 08:21'
 labels:
   - libp2p
   - fabric
