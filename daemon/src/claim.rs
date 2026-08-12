@@ -360,6 +360,24 @@ impl KnownTransport {
             KnownTransport::BitTorrent { .. } => TransportTag::BitTorrent,
         }
     }
+
+    /// Convert this daemon-wire offer into the seam's
+    /// [`peer_fabric::TransportOffer`] - the pure locator a
+    /// [`peer_fabric::NarTransfer`] backend fetches from. This is the ONE place the
+    /// daemon's claim-wire offer representation crosses into the stack-neutral seam
+    /// representation (TASK-148 de-weld): a backend below the seam never sees
+    /// `KnownTransport`, only `TransportOffer`. The value carries over unchanged -
+    /// `NodeId` and `BitTorrentInfoHash` ARE the seam's `NodeId`/`InfoHash` (the
+    /// daemon re-exports them from `peer_fabric`), so no locator information is lost
+    /// or reinterpreted.
+    pub(crate) fn to_offer(&self) -> peer_fabric::TransportOffer {
+        match self {
+            KnownTransport::Iroh { node } => peer_fabric::TransportOffer::Iroh { node: *node },
+            KnownTransport::BitTorrent { infohash } => peer_fabric::TransportOffer::BitTorrent {
+                infohash: *infohash,
+            },
+        }
+    }
 }
 
 /// Field deserializer for a transport-offer list: TOLERATE-BUT-DROP unknown

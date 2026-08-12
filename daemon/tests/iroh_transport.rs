@@ -304,3 +304,61 @@ async fn a_real_provider_node_id_is_a_valid_ed25519_point() {
         "a non-canonical (off-curve) NodeId must be rejected, not silently dialled"
     );
 }
+
+// ---- TASK-148 AC#1: the SAME iroh fetch is reachable through the seam ---------
+// The transfer axis is de-welded onto `peer_fabric::NarTransfer`: `IrohTransport`
+// is the NATIVE impl and the daemon `Transport` is a thin bridge over it. This
+// exercises the SEAM trait directly (a `TransportOffer`, a seam `SafetyEnvelope`,
+// UFCS to avoid the two `fetch` methods colliding), proving the de-welded impl is
+// real and behaviourally identical - not vacuous scaffolding. It also asserts the
+// signed-NarSize abort fires through the seam path.
+
+#[tokio::test]
+async fn iroh_transfer_is_reachable_through_the_seam_nartransfer() {
+    use peer_fabric::{NarTransfer, SafetyEnvelope as SeamEnvelope, TransferError, TransportOffer};
+
+    let nar = synth_raw_nar(b"TASK-148: the seam NarTransfer fetches the same NAR");
+    let provider = IrohProviderNode::spawn().await.expect("provider binds");
+    let content = provider.seed(&nar).await.expect("seed the raw NAR");
+
+    let client = client_wired_to(&provider).await;
+    let transport = client.transport_handle();
+    let offer = TransportOffer::Iroh {
+        node: provider.node_id().unwrap(),
+    };
+    let envelope = SeamEnvelope::default();
+
+    // gate 1 verified bytes, byte-identical to the fixture - through the seam trait.
+    let got = NarTransfer::fetch(
+        &transport,
+        &content,
+        &offer,
+        Some(nar.len() as u64),
+        &envelope,
+    )
+    .await
+    .expect("a real two-endpoint iroh fetch through peer_fabric::NarTransfer");
+    assert_eq!(
+        got, nar,
+        "the seam-fetched NAR is byte-identical to the fixture"
+    );
+    assert_eq!(NarTransfer::tag(&transport), TransportTag::Iroh);
+
+    // The signed-NarSize bound is WIRED through the seam: a limit below the served
+    // size aborts with TooLarge (the real mid-stream cap), never oversized bytes.
+    let aborted = NarTransfer::fetch(
+        &transport,
+        &content,
+        &offer,
+        Some((nar.len() as u64).saturating_sub(1)),
+        &envelope,
+    )
+    .await;
+    assert!(
+        matches!(aborted, Err(TransferError::TooLarge { .. })),
+        "expected a TooLarge abort through the seam, got {aborted:?}"
+    );
+
+    provider.shutdown().await.unwrap();
+    client.shutdown().await.unwrap();
+}

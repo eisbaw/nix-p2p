@@ -213,7 +213,7 @@ Non-goals (explicit):
 | **Kill criterion (historical; superseded by TASK-114)** | **<20% net cache-egress cut on the favorable testbed kills the p2p thesis**; p95 build latency regression must stay <10% (round 3, owner) | Preserved provenance; Wave 2c now applies profile-specific margins plus hard latency/privacy/resource constraints rather than killing every context at once |
 | Transport | iroh / iroh-blobs (one `NarTransfer` backend behind the `PeerFabric` seam) | BLAKE3 incremental verified streaming, QUIC + holepunching; not the fixed stack — see P2P substrate row |
 | Discovery (historical; superseded by TASK-114/TASK-126) | DHT-authoritative, gossip as accelerant (round 1, owner) | Preserved provenance; the chosen substrate remains evidence-gated, but production now requires a passing decentralized exact-key mechanism |
-| **P2P substrate** (2026-08-12) | **Pluggable behind the `PeerFabric` intention seam; backends adopted not invented; default is DUAL-STACK — libp2p-kad directory + iroh-blobs transfer** | iroh and libp2p are backends, not the architecture; the content-routing directory is `libp2p-kad` `put_record`/`get_record` (the only opaque-value store — TASK-126 spike), NAR transfer stays iroh-blobs, unified by a shared ed25519 identity (`PeerId == NodeId`); serving core stays stack-neutral. See `docs/peer-fabric-seam.md` |
+| **P2P substrate** (2026-08-12) | **Pluggable behind the `PeerFabric` intention seam; backends adopted not invented; ONE stack per binary (single-stack) — `daemon-iroh` all-iroh, `daemon-libp2p` all-libp2p** | content discovery differs by stack: `daemon-libp2p` uses `libp2p-kad` `put_record`/`get_record` (opaque-value global DHT storing the frozen ProviderRecord); `daemon-iroh` has no opaque-value DHT (TASK-126 spike) so uses bounded hold-query (TASK-116) / may be an unsupported global cell — a tournament finding, not a hybrid. Serving core stays stack-neutral. See `docs/peer-fabric-seam.md` |
 | Latency guardrails | Prefetch + hedge (throughput-abort) | The only thing keeping DHT seconds off the user path — load-bearing |
 | Metadata | cache.nixos.org only + daemon disk cache | Bandwidth offload MVP (round 1, owner) |
 | Privacy (historical; superseded by TASK-114/TASK-120) | Public swarm, documented risk, leech opt-out (round 1, owner) | Preserved provenance; fresh installs are upstream-only/private and LAN/public participation is explicit opt-in |
@@ -633,42 +633,42 @@ it. iroh and libp2p are **backends behind that seam**, not the architecture. The
 API and its churn-prone detail live in `docs/peer-fabric-seam.md`; the durable
 decisions are:
 
-- **Adopt, do not invent.** The content-routing DHT (NarHash→provider) is an
-  *adopted* prior solution — `libp2p-kad` `put_record`/`get_record` **primary**,
-  `iroh-dht-experiment` a **future candidate** (blocked today). TASK-126's
-  opaque-value spike **flipped** the earlier iroh-first ordering on evidence:
+- **Adopt, do not invent — and per-stack (single-stack binaries, no hybrid).**
+  The content-routing DHT (NarHash→provider) is an *adopted* prior solution, and
+  each binary uses its own stack's: `daemon-libp2p` uses `libp2p-kad`
+  `put_record`/`get_record` (the opaque-value store for the frozen
+  `ProviderRecord`). `daemon-iroh` has **no** such store — TASK-126's spike found
   `iroh-dht-experiment` stores a fixed typed enum, not opaque bytes, so it cannot
-  key our content-derived, mutable, multi-provider signed `ProviderRecord`;
-  `libp2p-kad`'s `Record{key, value: Vec<u8>}` is the only opaque-value model that
-  can. Hand-rolling a Kademlia is superseded. iroh already solves NodeId→address
-  decentrally (pkarr/Mainline) and serves the NAR bytes (iroh-blobs), but ships no
-  usable content-routing value store — that is the one primitive we adopt from
-  libp2p, and it is *why the default ships dual-stack* (see below).
+  key our content-derived, mutable, multi-provider signed record — so the iroh
+  binary's content discovery is bounded hold-query (TASK-116) and/or iroh-dht's
+  `Blake3Provider`, and whether it clears the decentralized-global-exact-key bar
+  is a **tournament finding** (an unsupported iroh cell is a valid TASK-114
+  outcome). Hand-rolling a Kademlia is superseded. iroh solves NodeId→address
+  decentrally (pkarr/Mainline) and serves the bytes (iroh-blobs); it simply lacks
+  an opaque-value content store — a gap the tournament exposes rather than the
+  design hides.
 - **The frozen discovery surface is our schema as an opaque value inside the
   substrate** (`ContentKey → signed ProviderRecord bytes`), so substrate wire
   churn never touches the freeze (see the irreversibility map).
-- **Backend selection is per-binary; the default binary is dual-stack.** The
-  frontend stays stack-neutral (crates: `peer-fabric` seam ← `daemon-core`
-  frontend ← `fabric-iroh` / `fabric-libp2p`), and the serving core holds zero p2p
-  types by construction. The **default** composition (`daemon-iroh`) is a
-  dual-stack fabric — iroh-blobs transfer + iroh NodeLocator/mDNS **and** a
-  libp2p-kad directory — so its dependency closure links **both** stacks; the
-  earlier "exactly one stack's closure per binary" invariant holds only for the
-  pure single-stack fallback (`daemon-libp2p`, directory *and* transfer on
-  libp2p). Tests and the transport tournament still bind to a named binary, never
-  a feature combination. A single ed25519 keypair makes `PeerId == NodeId` (both
-  derived from one secret), so the two stacks share identity though not
-  connectivity.
+- **One backend per binary (single-stack).** The frontend stays stack-neutral
+  (crates: `peer-fabric` seam ← `daemon-core` frontend ← `fabric-iroh` /
+  `fabric-libp2p`), and the serving core holds zero p2p types by construction.
+  `daemon-iroh` = daemon-core + fabric-iroh (all iroh); `daemon-libp2p` =
+  daemon-core + fabric-libp2p (all libp2p). Exactly one stack's dependency closure
+  links per binary; neither links the other's stack. Tests and the transport
+  tournament bind to a named binary, never a feature combination — and the two
+  single-stack binaries are the head-to-head the tournament compares.
 - **The seam changes packaging, not the gates.** Production still requires a
   passing decentralized exact-key mechanism (TASK-132/133/136); a backend swap is
   never a shortcut around evidence.
 
 This reconciles the earlier "Transport: iroh/iroh-blobs" and "everything in Rust,
-iroh is Rust" lines: still Rust, iroh still serves and transfers the bytes, but
-**content discovery is libp2p-kad** and iroh is now one backend behind the seam
-rather than the substrate itself. The default is therefore **dual-stack** — an
-evidence-forced flip of the original iroh-first single-stack preference, not an
-aesthetic choice.
+iroh is Rust" lines: still Rust, iroh still serves and transfers the bytes and
+does node/LAN discovery, but iroh is now one backend behind the seam rather than
+the substrate itself, and **content discovery is per-stack** — libp2p-kad's
+opaque-value DHT in the libp2p binary, iroh's bounded hold-query (or an
+unsupported global cell) in the iroh binary. The two stacks stay separate, one
+per binary; the tournament, not a hybrid, decides which wins content discovery.
 
 ### Iroh-first execution order
 
