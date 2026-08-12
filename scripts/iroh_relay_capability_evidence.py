@@ -333,7 +333,10 @@ def relay_command(
 
 
 def acceptor_command(
-    config: RunConfig, topology: Topology, scenario: str = "relay-success"
+    config: RunConfig,
+    topology: Topology,
+    scenario: str = "relay-success",
+    route_to_connector: bool = False,
 ) -> list[str]:
     inner = [
         "/bin/iroh-relay-evidence-peer",
@@ -350,9 +353,17 @@ def acceptor_command(
         "--owner",
         OWNER,
     ]
-    # The acceptor reaches the relay on its own subnet; the connector subnet
-    # route lets relay-brokered return traffic flow. It has NO route TO the
-    # connector peer's endpoint beyond the relay path.
+    # The acceptor always reaches the relay on its own subnet, so a relayed
+    # connection needs NO route to the connector: the relay brokers it. Only the
+    # direct arm opens a route to the connector subnet, and only then. Without
+    # it, the acceptor's own hole-punch probe to the connector is unroutable, so
+    # a relay-only arm cannot leak a single direct peer packet in EITHER
+    # direction — which is exactly what the finalizer's zero-direct guard needs.
+    routes = (
+        [(topology.connector_subnet, topology.router_acceptor_ip)]
+        if route_to_connector
+        else []
+    )
     return [
         config.podman,
         "run",
@@ -368,9 +379,7 @@ def acceptor_command(
         "--ip",
         topology.acceptor_ip,
         config.image,
-        *route_wrapper(
-            [(topology.connector_subnet, topology.router_acceptor_ip)], None, inner
-        ),
+        *route_wrapper(routes, None, inner),
     ]
 
 
@@ -753,7 +762,16 @@ def run_arm(
         acceptor_scenario = (
             "half-open-stream" if scenario == "half-open-stream" else "relay-success"
         )
-        runner.run(acceptor_command(config, topology, acceptor_scenario))
+        # Only the direct-positive control opens the acceptor->connector route;
+        # relay-only arms keep it closed so neither peer can send a direct packet.
+        runner.run(
+            acceptor_command(
+                config,
+                topology,
+                acceptor_scenario,
+                route_to_connector=(scenario == "direct-positive"),
+            )
+        )
         match, _, _ = publication.wait_for_log(
             runner, config.podman, topology.acceptor, READY_ACCEPTOR, 20.0
         )
