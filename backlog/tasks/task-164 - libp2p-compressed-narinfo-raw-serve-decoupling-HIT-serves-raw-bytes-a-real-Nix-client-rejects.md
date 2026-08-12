@@ -3,9 +3,11 @@ id: TASK-164
 title: >-
   libp2p compressed-narinfo raw-serve decoupling: HIT serves raw bytes a real
   Nix client rejects
-status: To Do
-assignee: []
+status: In Progress
+assignee:
+  - '@claude'
 created_date: '2026-08-12 11:27'
+updated_date: '2026-08-12 11:51'
 labels:
   - libp2p
   - daemon
@@ -28,3 +30,21 @@ BLOCKING correctness gap found in TASK-162 review (mped-architect). For iroh, th
 - [ ] #1 libp2p HIT never serves bytes whose compression domain disagrees with the narinfo the client received
 - [ ] #2 an oracle bites by mutation: a Nix-client-style FileHash/Compression check (or documented non-modeling) covers the libp2p serve path
 <!-- AC:END -->
+
+## Implementation Plan
+
+<!-- SECTION:PLAN:BEGIN -->
+Root cause: raw_serve (RawServeDecision) is built ONLY from iroh --p2p-claim (static AllowlistRawServe). libp2p discovery is DYNAMIC (kad find_providers), so a libp2p HIT under a compressed (xz) upstream narinfo is NOT in the allowlist -> narinfo served verbatim (Compression: xz) while the correlated GET /nar/<token> resolves via Libp2pNarSource to RAW bytes -> a real Nix client rejects (FileHash/Compression mismatch).
+
+Fix (option a: dynamically couple the libp2p discovery HIT to the narinfo rewrite, mirroring how iroh's static claim allowlist couples to its discovery):
+1. rewrite.rs: make RawServeDecision::will_serve_raw ASYNC (#[async_trait]). The decision "will I serve raw" was always an availability question; async lets it consult the network. Update NoRawServe + AllowlistRawServe. Add AnyRawServe combinator (serve raw iff ANY inner decision says so; short-circuits).
+2. source_libp2p.rs: add Libp2pRawServe { fabric, discovery_budget } impl RawServeDecision: probe the SAME kad find_providers as resolve()'s discovery leg; true iff Found & non-empty. build_libp2p_nar_source ALSO returns the Libp2pRawServe (one builder -> source + its raw-serve from ONE fabric+budget, so they cannot drift).
+3. server.rs: await the decision.
+4. main.rs setup_p2p_source: compose raw_serve = AnyRawServe(iroh AllowlistRawServe, libp2p Libp2pRawServe) so a libp2p HIT triggers the same task-49 rewrite. Iroh-only and pure-HTTP paths unchanged.
+
+Invariant restored: libp2p-serves-raw(h) <=> narinfo-rewritten-to-raw(h), both gated on the same find_providers probe. TOCTOU (provider vanishes narinfo->nar) fails closed: rewrite-to-raw then miss -> 502 -> nix falls back (same as AllowlistRawServe's documented dead-holder behaviour). No corruption.
+
+Pass bar test (new tests/libp2p_raw_serve.rs): COMPRESSED upstream narinfo (xz, FileHash!=NarHash, NarHash = REAL sha256 of the raw NAR), libp2p HIT -> narinfo rewritten to raw, served bytes ACCEPTED by a modeled Nix client (gate1 sha256(served)==FileHash & len==FileSize; gate2 decompress-none sha256==NarHash & len==NarSize). Oracle bites by mutation: proves it REJECTS the raw bytes under the ORIGINAL compressed narinfo. MISS arm: narinfo byte-verbatim (xz). Iroh path proven unchanged by existing narinfo_rewrite.rs + s6-p2p e2e 5/5.
+
+Known follow-ups: probe = 2 kad lookups per served path (narinfo + nar); discovery-outcome caching deferred (TASK-163). Compose precedence unchanged.
+<!-- SECTION:PLAN:END -->
