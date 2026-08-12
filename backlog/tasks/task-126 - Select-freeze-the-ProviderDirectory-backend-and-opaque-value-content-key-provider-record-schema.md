@@ -7,7 +7,7 @@ status: In Progress
 assignee:
   - '@claude'
 created_date: '2026-08-10 22:51'
-updated_date: '2026-08-12 02:05'
+updated_date: '2026-08-12 02:25'
 labels:
   - iroh
   - discovery
@@ -42,23 +42,5 @@ Implement the cornerstone decentralized exact-key discovery core now. Build a bo
 ## Implementation Notes
 
 <!-- SECTION:NOTES:BEGIN -->
-DEEP gate (Workflow wiba389dr) = NO_GO via cross-model codex (qa+mped were GO). Round-2 fixes required before this irreversible freeze counts. Freeze-blocking: (1) pin ed25519 canonicality policy + add malleable S+L negative vector; (2) canonicalize offer ordering (or explicitly pin order-significant + reject dup tags); (3) resolve provider-vs-offer-locator identity (require iroh offer node==provider, or document delegation; validate offer node is a valid point); (6) replace debug_assert! in provide_body with a real fail-closed check (release must not sign over-cap/>255 offers). Proof-hardening: (4) python anchor must reject unknown infohash versions {only 1,2}, parse no_offers, add a rejection vector; (5) golden rejection tests must assert the SPECIFIC typed error (not just is_err) with each vector's ONLY fault being the guard under test + a positive BitTorrent-v1 vector + BadInfoHash bite. Fixing #2/#3 may change frozen bytes/goldens - that is correct NOW (nothing consumes them; freeze is v1 pre-adoption).
-
-## ROUND 2 - codex NO_GO (6 findings) resolved
-
-Frozen POSITIVE bytes did NOT move (ContentKey unchanged 4e61db15...; full/no_offers/withdrawal wire unchanged - they were already canonical + self-serve). Added enforcement, new negative/positive vectors, and an independent decoder. peer-fabric: 67 unit + 8 golden; anchor: 4 records decoded + 7 rejects independently reproduced. build/lint/test/e2e (5/5, 74.9s) all green.
-
-#1 Ed25519 canonicality/malleability -- FIXED + honest correction. codex's premise ("verify_strict only does the cheap S<2^253 check, would ACCEPT S+L") is OUTDATED for ed25519-dalek v3: I empirically confirmed v3 verify_strict ENFORCES S<L and REJECTS S+L (my first "load-bearing" test asserting verify_strict accepts S+L FAILED, proving dalek rejects). So the malleability was already foreclosed by the verifier. I nonetheless added an EXPLICIT signature_scalar_is_canonical (S<L) check with L pinned in-code -> distinct typed NonCanonicalSignature, version-independent, documents the policy for a second impl. DOCUMENTED the canonical-signature policy (S<L; cofactorless verify; reject small-order A/R). Added golden reject_malleable_signature (S+L) vector; python anchor re-derives L from RFC 8032 and rejects S>=L AND fails cryptography verify. Corrected all my round-1 false "load-bearing / dalek would accept" claims in code+docs.
-
-#2 Non-canonical offer ordering -- FIXED (option a). Offers MUST be STRICTLY ASCENDING by wire encoding (forbids duplicates -> one signed encoding per set). encode rejects OffersNotCanonical; sign_* canonicalizes (sorts) + asserts no dups; decode rejects OffersNotCanonical. Bites: offers_out_of_canonical_order, duplicate_offers, golden reject_offers_not_canonical.
-
-#3 provider-vs-offer identity -- FIXED. v1 iroh offers are SELF-SERVE: an iroh offer node MUST equal provider (decode -> IrohNodeNotProvider; encode + sign enforce). This transitively validates the node is a valid point (provider is validated, node==it). Delegation deferred to a later version, documented. Bites: iroh_offer_node_not_provider, golden reject_iroh_node_not_provider.
-
-#6 provide_body debug_assert -> real assert! -- FIXED. The offers-cap narrowing is now a real assert! (release too); encode returns typed TooManyOffers before reaching it, so only the raw signing-bytes path can trip, and only on the signer's own over-cap input.
-
-#4 python anchor -- FIXED (now a COMPLETE independent decoder). Accepts ONLY infohash versions {1,2} (was silently treating unknown as 32 bytes); parses ALL 4 positives (incl bittorrent_v1) asserting fields; INDEPENDENTLY re-derives every reject vector's fault and asserts it matches reject_reason; re-derives L from RFC 8032. Proven to bite by mutation (wrong reject_reason -> FAIL; wrong positive field -> FAIL). Missing vector/field -> KeyError or coverage-floor fail.
-
-#5 golden reject tests -- FIXED. every_reject_vector_is_refused_for_its_named_reason asserts the SPECIFIC typed error (error_tag == reject_reason), not just is_err(). Each negative is re-signed so its ONLY fault is the guard under test (reject_wrong_version now re-signs the version-2 body, etc.). Added positive provider_record_bittorrent_v1 (byte-pinned) and a BadInfoHash bite.
-
-New RecordDecodeError variants: OffersNotCanonical, IrohNodeNotProvider, NonCanonicalSignature. New RecordEncodeError: OffersNotCanonical, IrohNodeNotProvider. Every new guard has a biting test (disable it -> a test's exact-match fails).
+Re-gate round-2 (Workflow wsgcxn3uy): qa GO, codex NO_GO but confirms frozen bytes SOUND + all 6 prior findings resolved. Round-3 (FINAL freeze-proof hardening) queued: (1) fix release-red test (cfg-gate the debug-only assert; cargo test --release must be green); (2) python anchor must reject small-order A and R to match Rust verify_strict + add an identity-forgery reject vector exercised by BOTH impls + document the normative canonical-signature policy so a second implementation agrees; (3) golden error_tag must compare FULL typed error payload not variant name; (4) reject_iroh_node_not_provider must use a VALID alt ed25519 key (genuine offer!=provider). Positive frozen bytes must NOT change (codex confirms sound). After round-3: mark Done on GO, or accept-with-justification if only minor proof-nits remain (bytes sound across 3 rounds).
 <!-- SECTION:NOTES:END -->
