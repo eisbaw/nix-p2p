@@ -865,6 +865,106 @@ mod tests {
         }
     }
 
+    // --- task-66: genuine MULTI-HOLDER failover (holder -> next holder) -------
+
+    /// A content-addressed transport that is AWARE of which holder it is dialing
+    /// (unlike [`FakeTransport`], which ignores the locator). It serves the seeded
+    /// bytes for a LIVE holder and refuses for a DEAD one, and COUNTS attempts per
+    /// holder - so a test can prove the fetch reached the SECOND holder only after
+    /// the FIRST (dead) one was tried. This is what distinguishes real
+    /// holder->holder failover from "the last announce happened to work".
+    struct NodeAwareTransport {
+        content: Blake3Digest,
+        bytes: Vec<u8>,
+        dead: Vec<NodeId>,
+        attempts: Arc<std::sync::Mutex<Vec<NodeId>>>,
+    }
+
+    #[async_trait]
+    impl Transport for NodeAwareTransport {
+        fn tag(&self) -> TransportTag {
+            TransportTag::Iroh
+        }
+        async fn fetch(
+            &self,
+            content: &Blake3Digest,
+            offer: &KnownTransport,
+            _expected_size: Option<u64>,
+        ) -> Result<Vec<u8>, TransportError> {
+            let node = match offer {
+                KnownTransport::Iroh { node } => *node,
+                other => {
+                    return Err(TransportError::WrongOffer {
+                        expected: TransportTag::Iroh,
+                        got: other.tag(),
+                    });
+                }
+            };
+            // Record the dial so the test can see the ORDER holders were tried in.
+            self.attempts.lock().expect("attempts").push(node);
+            if self.dead.contains(&node) {
+                // A dead holder: dial refused. The driver must try the NEXT offer.
+                return Err(TransportError::Unavailable(format!("holder {node} is dead")));
+            }
+            if content != &self.content {
+                return Err(TransportError::NotHeld(*content));
+            }
+            verify_blake3(content, &self.bytes)?;
+            Ok(self.bytes.clone())
+        }
+    }
+
+    #[tokio::test]
+    async fn a_dead_first_holder_fails_over_to_the_second_holder() {
+        // The task-66 acceptance signal. TWO holders announce the SAME NarHash;
+        // holder A (announced first) is DEAD, holder B is live. The resolve path
+        // accumulates BOTH (multimap) and the fetch driver tries A, fails, and
+        // reaches B - a genuine holder->holder failover, NOT the peer->upstream S6.
+        //
+        // Bite by mutation: revert `announce` to the old replace-on-key and only
+        // B's claim survives, so A is NEVER dialed - `attempts == [A, B]` becomes
+        // `[B]` and this fails. (The bytes would still arrive from B, which is
+        // exactly why asserting only success is vacuous; the attempt ORDER is the
+        // oracle that bites.)
+        let content = Blake3Digest::from_raw_nar(RAW_NAR);
+        let a = NodeId::from_bytes([0xaa; 32]);
+        let b = NodeId::from_bytes([0xbb; 32]);
+        let attempts = Arc::new(std::sync::Mutex::new(Vec::new()));
+
+        let mut registry = TransportRegistry::new();
+        registry.register(Box::new(NodeAwareTransport {
+            content,
+            bytes: RAW_NAR.to_vec(),
+            dead: vec![a],
+            attempts: attempts.clone(),
+        }));
+
+        // A announces FIRST (so it is the dead holder tried first), then B.
+        let holder_claim = |holder: NodeId| Claim {
+            schema_version: CLAIM_SCHEMA_VERSION,
+            key: key(),
+            payload: Some(KnownPayload::WholeNar { blake3: content }),
+            holders: vec![holder],
+            transports: vec![KnownTransport::Iroh { node: holder }],
+            relay: None,
+            signatures: vec![],
+        };
+        let source = source_with(registry, vec![holder_claim(a), holder_claim(b)]);
+
+        let resp = source
+            .resolve(&signed_key(), Some(RAW_NAR.len() as u64))
+            .await
+            .expect("the dead first holder fails over to the live second holder");
+        assert_eq!(collect(resp).await, RAW_NAR, "the second holder served the NAR");
+
+        // The oracle: A was dialed FIRST (and failed), THEN B - real failover.
+        assert_eq!(
+            *attempts.lock().expect("attempts"),
+            vec![a, b],
+            "the fetch must try the dead first holder, then fail over to the second"
+        );
+    }
+
     #[tokio::test]
     async fn upstream_path_is_rejected_by_the_p2p_source() {
         // Mirror of the nar_source_seam contract: a URL-less p2p source cannot

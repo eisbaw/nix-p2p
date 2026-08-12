@@ -145,15 +145,38 @@ pub trait Discovery: Send + Sync {
 
 // -------------------------------------------------------------------------
 // InMemoryDiscovery: the wave-1/test stand-in (was TransportNarSource's inline
-// map). One announced claim per key; last announce wins.
+// map). A MULTIMAP: a NarHash accumulates every distinct holder that announces
+// it, so resolve can offer more than one holder and the fetch driver can fail
+// over from a dead holder to the next (task-66).
 // -------------------------------------------------------------------------
 
-/// A discovery source backed by an in-memory map of announced claims, keyed on the
-/// canonical [`NarHashKey`]. This is the task-38 "discovery stand-in" made a
+/// A discovery source backed by an in-memory MULTIMAP of announced claims, keyed on
+/// the canonical [`NarHashKey`]. This is the task-38 "discovery stand-in" made a
 /// first-class [`Discovery`] impl: a test (or a wave-1 seed) [`announce`]s claims
 /// and `resolve` returns them. It shares the [`Discovery`] contract with
 /// [`DirectDiscovery`], so the same [`crate::transport_fetch::TransportNarSource`]
 /// drives either without change.
+///
+/// ## Multi-holder (task-66): accumulate, do not replace
+///
+/// A single `NarHash` can be held by MANY peers, and the whole point of a decentral
+/// cache is that a DEAD holder fails over to the NEXT one. So `announce` ACCUMULATES
+/// distinct holders under a key (it used to REPLACE, which capped every key at one
+/// holder and collapsed failover into the peer->upstream fallback S6 already covers).
+/// `resolve` then MERGES the accumulated claims into ONE [`Claim`] whose `transports`
+/// is the UNION of every holder's fetch offers, in ANNOUNCE ORDER. That is exactly
+/// the shape [`crate::transport_fetch::fetch_via_offers`] already iterates and fails
+/// over across - so multi-holder failover falls out of the EXISTING fetch driver
+/// with no change to it and, critically, NO change to the FROZEN claim wire schema:
+/// `holders`/`transports` are already `Vec` on [`Claim`]; this constructs an
+/// in-memory value with several entries, it does not grow the on-wire surface.
+///
+/// The merged claim's content id ([`Claim::content_id`]) is taken from the FIRST
+/// accumulated claim. Honest holders of one `NarHash` agree on its `BLAKE3` (it is
+/// `BLAKE3(RawNarV1)`, a pure function of the same bytes), so the union is sound; a
+/// holder that disagrees only contributes an offer whose bytes fail the gate-1
+/// integrity check downstream and is skipped (the daemon is outside the TCB - a
+/// lying offer never yields wrong bytes, see [`crate::transport_fetch`]).
 ///
 /// Keyed on [`NarHashKey`] (not a loose string) so it agrees BY CONSTRUCTION with
 /// the availability index and the claim wire - the canonical-key discipline the
@@ -161,7 +184,10 @@ pub trait Discovery: Send + Sync {
 /// the claim already carries a strict `NarHashKey`).
 #[derive(Default)]
 pub struct InMemoryDiscovery {
-    claims: Mutex<HashMap<NarHashKey, Claim>>,
+    /// key -> holders, in ANNOUNCE ORDER. A `Vec` (not a set) so the resolve order
+    /// is the deterministic announce order; de-duplication of an identical
+    /// re-announce is done in [`announce`](Self::announce).
+    claims: Mutex<HashMap<NarHashKey, Vec<Claim>>>,
 }
 
 impl InMemoryDiscovery {
@@ -170,21 +196,64 @@ impl InMemoryDiscovery {
         Self::default()
     }
 
-    /// Record a claim, keyed on its own canonical [`NarHashKey`], so a later
-    /// `resolve` of that key returns it. Idempotent-ish: re-announcing a key
-    /// replaces the prior claim (a fresh holder/offer set).
+    /// Record a claim under its own canonical [`NarHashKey`], ACCUMULATING it
+    /// alongside any holders already announced for that key (task-66) so a later
+    /// `resolve` can offer every holder. IDEMPOTENT: re-announcing a FULLY IDENTICAL
+    /// claim (same holder, same offers) does not duplicate it - a holder refreshing
+    /// its announce stays one entry. A claim that differs in any field (a new holder,
+    /// a changed offer set) is a distinct entry and accumulates.
     pub fn announce(&self, claim: Claim) {
-        self.claims
-            .lock()
-            .expect("claims mutex")
-            .insert(claim.key, claim);
+        let mut claims = self.claims.lock().expect("claims mutex");
+        let holders = claims.entry(claim.key).or_default();
+        if !holders.contains(&claim) {
+            holders.push(claim);
+        }
+    }
+
+    /// Merge the claims accumulated for one key into a SINGLE claim whose `holders`
+    /// and `transports` are the UNION across all of them, preserving ANNOUNCE ORDER
+    /// and de-duplicating repeats. `claims` is non-empty (the caller only calls this
+    /// for a populated key). The merged content id / relay come from the first claim
+    /// (see the type-level note on why the union is sound).
+    fn merge(claims: &[Claim]) -> Claim {
+        let first = &claims[0];
+        let mut holders: Vec<NodeId> = Vec::new();
+        let mut transports: Vec<KnownTransport> = Vec::new();
+        let mut signatures: Vec<crate::claim::ClaimSignature> = Vec::new();
+        for claim in claims {
+            for holder in &claim.holders {
+                if !holders.contains(holder) {
+                    holders.push(*holder);
+                }
+            }
+            for transport in &claim.transports {
+                if !transports.contains(transport) {
+                    transports.push(transport.clone());
+                }
+            }
+            for signature in &claim.signatures {
+                if !signatures.contains(signature) {
+                    signatures.push(signature.clone());
+                }
+            }
+        }
+        Claim {
+            schema_version: first.schema_version,
+            key: first.key,
+            payload: first.payload.clone(),
+            holders,
+            transports,
+            relay: first.relay.clone(),
+            signatures,
+        }
     }
 }
 
 #[async_trait]
 impl Discovery for InMemoryDiscovery {
     async fn resolve(&self, key: &NarHashKey) -> Option<Claim> {
-        self.claims.lock().expect("claims mutex").get(key).cloned()
+        let claims = self.claims.lock().expect("claims mutex");
+        claims.get(key).map(|holders| Self::merge(holders))
     }
 }
 
@@ -909,6 +978,96 @@ mod tests {
         assert_eq!(
             claim.transports,
             vec![KnownTransport::Iroh { node: node_b() }]
+        );
+    }
+
+    // ---- task-66: InMemoryDiscovery accumulates holders (multimap) ---------
+
+    /// A whole-NAR claim for `key`, held by `holder`, offering the iroh locator for
+    /// that holder. `blake3` is shared across holders of the same key (honest
+    /// holders of one NarHash agree on it) so the merge is over ONE content id.
+    fn claim_held_by(key: NarHashKey, holder: NodeId, blake3: Blake3Digest) -> Claim {
+        Claim {
+            schema_version: CLAIM_SCHEMA_VERSION,
+            key,
+            payload: Some(KnownPayload::WholeNar { blake3 }),
+            holders: vec![holder],
+            transports: vec![KnownTransport::Iroh { node: holder }],
+            relay: None,
+            signatures: vec![],
+        }
+    }
+
+    #[tokio::test]
+    async fn announce_accumulates_holders_instead_of_replacing_them() {
+        // The task-66 core: two DISTINCT holders announce the SAME NarHash. The
+        // in-process index must resolve to BOTH (a multimap), not just the last one
+        // (the replace-on-key bug). With the old `insert(key, claim)`, holder A is
+        // gone the instant B announces and this bites: holders == [B] only.
+        let content = Blake3Digest::from_raw_nar(b"one NAR, two holders");
+        let a = NodeId::from_bytes([0xaa; 32]);
+        let b = NodeId::from_bytes([0xbb; 32]);
+
+        let discovery = InMemoryDiscovery::new();
+        discovery.announce(claim_held_by(key_x(), a, content));
+        discovery.announce(claim_held_by(key_x(), b, content));
+
+        let claim = discovery.resolve(&key_x()).await.expect("a hit");
+        assert_eq!(
+            claim.holders,
+            vec![a, b],
+            "both holders survive, in announce order - not replace-on-key"
+        );
+        assert_eq!(
+            claim.transports,
+            vec![
+                KnownTransport::Iroh { node: a },
+                KnownTransport::Iroh { node: b },
+            ],
+            "the merged claim offers BOTH holders' locators, in announce order, so \
+             the fetch driver can fail over from the first to the second"
+        );
+        // The content id is single and shared (the merge is over one NAR).
+        assert_eq!(claim.content_id(), Some(&content));
+    }
+
+    #[tokio::test]
+    async fn re_announcing_an_existing_holder_does_not_duplicate_it() {
+        // Idempotency: a holder refreshing its identical announce stays ONE entry,
+        // so a chatty holder does not inflate the offer list (and does not get
+        // itself tried twice by the fetch driver).
+        let content = Blake3Digest::from_raw_nar(b"idempotent announce");
+        let a = NodeId::from_bytes([0xaa; 32]);
+        let b = NodeId::from_bytes([0xbb; 32]);
+
+        let discovery = InMemoryDiscovery::new();
+        discovery.announce(claim_held_by(key_x(), a, content));
+        discovery.announce(claim_held_by(key_x(), b, content));
+        // A re-announces the SAME claim twice more.
+        discovery.announce(claim_held_by(key_x(), a, content));
+        discovery.announce(claim_held_by(key_x(), a, content));
+
+        let claim = discovery.resolve(&key_x()).await.expect("a hit");
+        assert_eq!(
+            claim.holders,
+            vec![a, b],
+            "a re-announced holder is not duplicated"
+        );
+        assert_eq!(claim.transports.len(), 2, "no duplicate offers");
+    }
+
+    #[tokio::test]
+    async fn resolve_misses_an_unannounced_key() {
+        // Control: the multimap still misses cleanly on a key nobody announced.
+        let discovery = InMemoryDiscovery::new();
+        discovery.announce(claim_held_by(
+            key_x(),
+            node_b(),
+            Blake3Digest::from_raw_nar(b"x"),
+        ));
+        assert!(
+            discovery.resolve(&key_y()).await.is_none(),
+            "an unannounced key is a clean miss"
         );
     }
 
