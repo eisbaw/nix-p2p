@@ -4,6 +4,7 @@ title: daemon-iroh thin binary + no-libp2p build guard (TASK-141 inc 3)
 status: To Do
 assignee: []
 created_date: '2026-08-11 23:58'
+updated_date: '2026-08-12 04:17'
 labels:
   - iroh
   - seam
@@ -26,3 +27,9 @@ Increment 3 of the TASK-141 de-welding. Add the daemon-iroh thin binary crate = 
 - [ ] #2 build guard asserts daemon-iroh's dependency closure contains no libp2p
 - [ ] #3 just e2e s6-p2p passes driving the daemon-iroh binary
 <!-- AC:END -->
+
+## Implementation Notes
+
+<!-- SECTION:NOTES:BEGIN -->
+FORWARD-CARRY from TASK-144 inc 1 (commit 2394bee): the fabric-iroh backend crate now EXISTS and holds the iroh node-discovery/runtime/publication cluster. Remaining for the daemon-core split: (1) the serving core (server/source/upstream/catalog/rewrite/narinfo_cache + availability/discovery/claim/transport/transport_fetch/content_id/supply_catalog) is still in the 'daemon' crate together with transport_iroh; (2) topology requires daemon-core to depend on peer-fabric ONLY, but today the daemon depends on fabric-iroh for BOTH the iroh cluster AND process_group (availability uses ProcessJob/ProcessJobSpec). So daemon-core split is blocked on TASK-148 (move transport_iroh out) AND on relocating process_group to a shared util or into daemon-core (it is generic, not iroh - it only rides in fabric-iroh now to keep the cut acyclic). The composition root (this task's thin binary) is where TASK-144's IrohFabric::new(cfg) is constructed and where the required-axis assertion lives.
+<!-- SECTION:NOTES:END -->
