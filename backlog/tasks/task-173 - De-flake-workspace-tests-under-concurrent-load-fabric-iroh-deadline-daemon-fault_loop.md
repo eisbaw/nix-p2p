@@ -6,6 +6,7 @@ title: >-
 status: To Do
 assignee: []
 created_date: '2026-08-12 18:12'
+updated_date: '2026-08-12 19:00'
 labels:
   - testing
   - flaky
@@ -25,3 +26,9 @@ Surfaced during TASK-66 gating (qa-test-runner + orchestrator). 'cargo test --wo
 - [ ] #2 fault_mode_loop is made robust to concurrent-load timing (or its timing assumptions documented + bounded), so it does not fail under 'cargo test --workspace'
 - [ ] #3 N consecutive full 'cargo test --workspace' runs are green (pin N, e.g. 10)
 <!-- AC:END -->
+
+## Implementation Notes
+
+<!-- SECTION:NOTES:BEGIN -->
+TASK-153's new bootstrap_independence test (3 kad bootstraps, ~9s) adds concurrent workspace load that EXPOSES these deadline flakes more often (2/3 fail-fast workspace runs hit it vs ~1/5 before). Root cause unchanged: wall-clock-deadline assertions fail under CPU contention. Fix here (robust deadlines / serialize / mark load-sensitive), not by blocking feature tasks. Both suspects pass in isolation; a --no-fail-fast workspace run was fully green (51/0).
+<!-- SECTION:NOTES:END -->

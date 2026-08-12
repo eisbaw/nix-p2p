@@ -3,10 +3,11 @@ id: TASK-153
 title: >-
   fabric-libp2p: bootstrap independence (>=3 independent bootstrap nodes; loss
   of one still resolves)
-status: To Do
-assignee: []
+status: Done
+assignee:
+  - mped
 created_date: '2026-08-12 07:55'
-updated_date: '2026-08-12 08:12'
+updated_date: '2026-08-12 19:00'
 labels:
   - libp2p
   - fabric
@@ -35,5 +36,7 @@ Follow-up to TASK-103 (AC#5). The cornerstone test uses a single bootstrap. Make
 ## Implementation Notes
 
 <!-- SECTION:NOTES:BEGIN -->
-Also carries the TASK-103 mped-architect S3 finding (code comment in directory.rs points here): raise InsufficientRouting from a TOTAL-routing-count bar (routing_peers()==0) to a near-key / query-stats bar - a node holding only a bootstrap can currently report a healthy Miss where InsufficientRouting is the more honest answer. Use the kad query stats (peers contacted near the key) to gate Miss-authority.
+Done. >=3 independent bootstraps configurable + a standard join-through-the-set (join_bootstraps); a bootstrap-independence test PAIR proves an already-admitted network keeps resolving when any single bootstrap is lost. Commits 89cbb61 + 628773b + 5b87223.
+Oracle (mutation-verified by orchestrator + a spawned mped-architect re-review that re-ran the mutations itself): the discrimination rests on the NEGATIVE CONTROL single_bootstrap_join_does_not_survive_its_only_bootstrap - forcing the provider onto all 3 bootstraps makes it Found (test fails as required); the positive test alone is non-discriminating (documented). AC#1/#2 met; AC#3 BootstrapOutage-vs-Partition is honestly documented as non-detectable at the read path (empty routing -> InsufficientRouting asserts neither).
+Gate: build 0, lint 0, bootstrap_independence 2/2 stable x3, workspace --no-fail-fast 51/0. A pre-existing load-sensitive deadline flake (TASK-173, fabric-iroh/daemon - unrelated crates) surfaces under concurrent workspace load; both suspects pass in isolation. Filed TASK-174 (raise InsufficientRouting from total-routing count to a near-key query-stats bar).
 <!-- SECTION:NOTES:END -->
