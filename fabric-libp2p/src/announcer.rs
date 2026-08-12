@@ -10,9 +10,29 @@
 //! libp2p identity IS the ed25519 secret that signs its records, so the announcer holds
 //! the exact key material to sign a withdrawal of ITS OWN record - and it only ever
 //! withdraws records it itself announced. The tombstone is `put_record`-ed on the SAME
-//! composite value key the record lives under, so other nodes' cached value records are
-//! ACTIVELY retracted (a resolver's `get_record` now returns the tombstone, not the
-//! record) rather than left to age out on TTL.
+//! composite value key the record lives under, so a resolver's `get_record` returns the
+//! tombstone, the frozen record_store applies it as Withdrawn, and the provider stops
+//! being returned.
+//!
+//! ## Honest limits of the retraction (do not over-read "actively retracted")
+//!
+//! The retraction is EFFECTIVE, not unconditional. It is bounded by the in-memory
+//! sequence tracking (below):
+//!   * A withdrawal is only network-effective if it lands at a sequence STRICTLY NEWER
+//!     than the record every consumer already observed. In the SAME process as the
+//!     announce this holds (the tracked sequence + 1). After a RESTART the announcer's
+//!     tracking is empty, so it mints sequence 1, which LOSES to any consumer whose floor
+//!     is already at the record's real sequence - the withdrawal is silently ineffective.
+//!     A restart-durable per-key counter is the fix and is deferred (TASK-176).
+//!   * The tombstone only SUPPRESSES resurrection for its own `expiry` window. When the
+//!     retracted record's sequence/expiry are KNOWN (same-process), the tombstone is given
+//!     an expiry `>=` the record's, so it outlives it. When they are UNKNOWN (post-restart,
+//!     or a key this process never announced) the tombstone gets only a fixed floor TTL;
+//!     against a record published with a LONGER TTL there is a RESURRECTION WINDOW between
+//!     the tombstone lapsing and the record's own expiry. Record TTLs are unbounded today,
+//!     so no fixed floor can close this; bounding record TTL at announce is the real fix
+//!     (TASK-176). `withdraw` returns `Ok` in all these cases - success means "the
+//!     tombstone was published", NOT "every cache is provably retracted".
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -30,11 +50,14 @@ use peer_fabric::{
 use crate::keys::{provider_index_key, provider_value_key};
 use crate::swarm::SwarmHandle;
 
-/// The floor lifetime, in seconds, a minted withdrawal tombstone is given when the
-/// retracted record's own remaining TTL is shorter (or the record is unknown to this
-/// announcer). A tombstone must OUTLIVE the record it retracts, or a cache could resurrect
-/// the record after the tombstone lapsed but before the record's own expiry; giving the
-/// tombstone at least this long keeps the retraction effective for a meaningful window.
+/// The FLOOR lifetime, in seconds, a minted withdrawal tombstone is given when the
+/// retracted record's own remaining TTL is shorter or unknown. A tombstone should ideally
+/// outlive the record it retracts (else a cache resurrects the record after the tombstone
+/// lapses but before the record's own expiry). When the record's expiry is KNOWN we use
+/// MAX(that, now + this) and the tombstone outlives it; when UNKNOWN (post-restart) this
+/// is only a best-effort floor and a longer-TTL record has a resurrection window (see the
+/// module doc). This is NOT a guaranteed bound - closing it needs a record-TTL cap
+/// (TASK-176), which does not exist yet.
 const MIN_TOMBSTONE_TTL_SECS: u64 = 3600;
 
 /// The kad-backed [`AvailabilityAnnouncer`].
@@ -77,7 +100,12 @@ impl Libp2pAvailabilityAnnouncer {
         peer_id: PeerId,
         signing_key: SigningKey,
     ) -> Self {
-        debug_assert_eq!(
+        // HARD assert (not debug_assert): this is a signing surface on a data-integrity
+        // path. A mismatched key would sign tombstones whose `provider` does not derive to
+        // the composite value key's PeerId, so every consumer's binding check rejects them
+        // and withdrawals SILENTLY never work - a fail-closed we must catch in release too,
+        // at construction, not discover as an inexplicable non-retraction in the field.
+        assert_eq!(
             NodeId::from_bytes(signing_key.verifying_key().to_bytes()),
             node_id,
             "announcer signing key must be this node's identity (self-serve v1)"
@@ -109,10 +137,13 @@ impl Libp2pAvailabilityAnnouncer {
 /// published for `key`, or `None` if never published). PURE over its inputs, so the
 /// sequence/expiry choice is unit-testable without a live DHT or a swarm handle:
 ///   * sequence = `last.sequence + 1` (or 1 if never published), which the frozen
-///     record_store requires to be strictly newer than the record it retracts;
+///     record_store requires to be strictly newer than the record it retracts. Note the
+///     `None` case (post-restart) mints sequence 1, which is NOT newer than a record a
+///     consumer already observed at a higher sequence - see the module-doc limit;
 ///   * expiry = MAX(the retracted record's own expiry, `now + MIN_TOMBSTONE_TTL_SECS`),
-///     so the tombstone both OUTLIVES the record it retracts AND is never itself
-///     already-expired (which the frozen decode/apply would reject as Stale).
+///     so the tombstone is never itself already-expired (the frozen decode/apply would
+///     reject a stale one) AND, when `last` is known, outlives the record it retracts.
+///     When `last` is `None` this is only the best-effort floor (module-doc limit).
 fn mint_withdrawal(
     signing_key: &SigningKey,
     key: &ContentKey,
@@ -230,14 +261,14 @@ impl AvailabilityAnnouncer for Libp2pAvailabilityAnnouncer {
     async fn withdraw(&self, key: &ContentKey) -> Result<Receipt, AnnounceError> {
         // AC#1: propagate a SIGNED withdrawal tombstone, not just a local stop_providing.
         // Two acts, in this order:
-        //   1. put_record the signed ProviderWithdrawal on the SAME composite value key
-        //      the record lives under, so other nodes' cached value records are ACTIVELY
-        //      retracted before their natural TTL - a resolver's get_record returns the
-        //      tombstone, the frozen record_store applies it as Withdrawn, and the
-        //      provider stops being returned (and cannot be resurrected by a replay of
-        //      the old record, whose sequence is now below the tombstone floor).
-        //   2. stop_providing our multi-provider INDEX entry so get_providers stops
-        //      naming us (the index has no signed value; this is the local retraction).
+        //   1. put_record the signed ProviderWithdrawal on the SAME composite value key the
+        //      record lives under - a resolver's get_record returns the tombstone, the
+        //      frozen record_store applies it as Withdrawn, and the provider stops being
+        //      returned (a replay of the old record is now below the tombstone floor). This
+        //      is EFFECTIVE within the same process; see the module doc for the post-restart
+        //      / long-TTL limits (Ok = "tombstone published", not "provably retracted").
+        //   2. stop_providing our multi-provider INDEX entry so get_providers stops naming
+        //      us (the index has no signed value; this is the local retraction).
         let now = crate::unix_now();
         let withdrawal = self.mint_withdrawal(key, now);
         let value = encode_provider_withdrawal(&withdrawal)
@@ -257,6 +288,27 @@ impl AvailabilityAnnouncer for Libp2pAvailabilityAnnouncer {
             .put_record(value_key, value, expires)
             .await
             .map_err(AnnounceError::Unreachable)?;
+        // Advance our own per-key floor to the tombstone, so a LATER same-process withdraw
+        // mints something strictly newer still and never regresses. `announce` deliberately
+        // does NOT gate on this map (the caller owns record sequencing above the seam - the
+        // rollback test relies on a stale re-put being admitted at the substrate); this map
+        // is a WITHDRAWAL-sequencing helper, not an announce-monotonicity guard.
+        {
+            let mut announced = self
+                .announced
+                .lock()
+                .expect("announced-sequence mutex poisoned");
+            let slot = announced.entry(*key).or_insert(LastPublished {
+                sequence: withdrawal.sequence,
+                expiry: withdrawal.expiry,
+            });
+            if withdrawal.sequence >= slot.sequence {
+                *slot = LastPublished {
+                    sequence: withdrawal.sequence,
+                    expiry: withdrawal.expiry,
+                };
+            }
+        }
         self.handle.stop_providing(provider_index_key(key)).await;
         Ok(Receipt::new("libp2p-kad-withdraw"))
     }

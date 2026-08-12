@@ -20,15 +20,30 @@ use crate::swarm::{QueryFail, SwarmHandle, absence_from_reach};
 pub struct Libp2pProviderDirectory {
     handle: SwarmHandle,
     ledger: Arc<ExposureLedger>,
-    /// The DURABLE per-`(ContentKey, provider)` monotonic floor (TASK-152, AC#3), wired
+    /// The IN-PROCESS per-`(ContentKey, provider)` monotonic floor (TASK-152, AC#3), wired
     /// from the frozen `peer_fabric::record_store` oracle. EVERY fetched, decoded,
     /// provider-bound assertion is `apply`-ed here before it can be returned, so a
     /// replayed-old / rolled-back / stale / withdrawn record that passes the codec but
-    /// LOSES to the floor is never surfaced as a live provider. Kept ACROSS queries - the
-    /// floor only moves forward - so a value the DHT rolled back between two lookups is
-    /// caught by the sequence this node already saw. A std Mutex is fine: it is only ever
-    /// held for the SYNCHRONOUS apply loop, never across an `.await` (all `get_record`
-    /// fetches complete first).
+    /// LOSES to the floor is never surfaced as a live provider. Kept ACROSS queries within
+    /// this process - the floor only moves forward - so a value the DHT rolled back between
+    /// two lookups is caught by the sequence this node ALREADY SAW.
+    ///
+    /// HONEST LIMITS (do not over-read this as global or persistent anti-rollback):
+    ///   * NOT PERSISTED. This map lives only for the process lifetime; a restart starts
+    ///     empty. A restarted consumer that has not yet re-observed the newer sequence can
+    ///     be served a still-unexpired stale/rolled-back record as fresh. Cross-restart
+    ///     durability is the backend obligation the frozen `record_store` module names
+    ///     (persist the counter) and is deferred (TASK-176).
+    ///   * SESSION-SCOPED, not global. The guarantee is "no rollback BELOW a sequence THIS
+    ///     node observed", not "no rollback the network ever saw": a fresh consumer that
+    ///     never saw the newer record cannot detect a rollback to an older-but-valid one.
+    ///   * UNBOUNDED. The set never evicts, and `provider` is attacker-choosable (anyone
+    ///     may announce under any key), so resolving attacker-chosen keys grows it without
+    ///     bound - a memory/DoS vector. Bounded/TTL eviction is a filed follow-up
+    ///     (TASK-176); the frozen module explicitly leaves GC to the backend.
+    ///
+    /// A std Mutex is fine: it is only ever held for the SYNCHRONOUS apply loop, never
+    /// across an `.await` (all `get_record` fetches complete first).
     store: Mutex<ProviderRecordSet>,
 }
 
