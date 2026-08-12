@@ -19,11 +19,14 @@
 //!     real `App` stack.
 //!
 //! What it proves (TASK-169): `C`, configured only with `B` as bootstrap and NO injected
-//! provider address, DISCOVERS `P` via libp2p-kad (record kad-produced, NOT injected),
-//! RESOLVES `P`'s dial address THROUGH kad peer-routing (`node_locator().locate()`, no
-//! injection), fetches the raw NAR, gate-1 BLAKE3-verifies, and the daemon serves
-//! BYTE-IDENTICAL bytes (0 upstream fallbacks); an un-announced NarHash is a clean kad
-//! miss that falls back to HTTP (1 fallback).
+//! provider address, DISCOVERS `P` via libp2p-kad (record kad-produced, NOT injected), then
+//! its libp2p TRANSFER resolves `P`'s dial address THROUGH kad peer-routing INSIDE the
+//! fabric (the `node_locator` machinery, no injection) and dials off that resolution before
+//! fetching the raw NAR, gate-1 BLAKE3-verifies, and the daemon serves BYTE-IDENTICAL bytes
+//! (0 upstream fallbacks); an un-announced NarHash is a clean kad miss that falls back to
+//! HTTP (1 fallback). The daemon `resolve()` itself no longer calls `locate()` - the
+//! resolve-then-dial lives inside the transfer, where the `DialInfo` is allowed to be (the
+//! seam keeps it out of this serving layer).
 //!
 //! HONEST SCOPE (documented, not faked, carried from TASK-159's node_locator test): the
 //! dial address is NOT injected - `provider_addrs` is empty and the test's readiness gate
@@ -33,8 +36,8 @@
 //! self-lookup / get_providers) already opened to `P`, so isolating `locate()` as the only
 //! dial path is not robust (whether an iterative query dials `P` depends on XOR distance).
 //! What is proven is (a) NO provider address was injected out of band, and (b) the
-//! production `resolve` consults `node_locator` and it resolves `P`'s address independently.
-//! A full podman multi-daemon libp2p e2e is TASK-161.
+//! production fetch transport consults `node_locator` inside the fabric and it resolves
+//! `P`'s address independently. A full podman multi-daemon libp2p e2e is TASK-161.
 //!
 //! This test does NOT model the Nix client's transport gate. The consumer uses
 //! `NoRawServe` and an `.nar.xz` token with `Compression: xz`, yet asserts the served
@@ -344,12 +347,12 @@ async fn production_config_builds_libp2p_source_that_discovers_and_serves_with_c
     }
 
     // ---- Readiness + no-injection oracle: C resolves P's dial address via kad ----
-    // The production `resolve` calls `node_locator().locate(record.provider, ..)` before
-    // fetching. Poll the SAME locate here so the subsequent served request finds it Found
-    // (absorbing DHT propagation) AND assert the resolved address is P's REAL listen
-    // address - which C was never told (provider_addrs empty). A resolver that never
-    // learned P's address could only get it from the DHT, so this is the no-injection
-    // proof (the same oracle as fabric-libp2p/tests/node_locator_discovery.rs).
+    // The production fetch transport calls `node_locator().locate(record.provider, ..)`
+    // INSIDE the fabric before dialing. Poll the SAME locate here so the subsequent served
+    // request finds it Found (absorbing DHT propagation) AND assert the resolved address is
+    // P's REAL listen address - which C was never told (provider_addrs empty). A resolver
+    // that never learned P's address could only get it from the DHT, so this is the
+    // no-injection proof (the same oracle as fabric-libp2p/tests/node_locator_discovery.rs).
     let locator = consumer
         .node_locator()
         .expect("consumer has a node_locator");
@@ -415,12 +418,12 @@ async fn production_config_builds_libp2p_source_that_discovers_and_serves_with_c
         "narinfo served (token correlated)"
     );
 
-    // Snapshot C's exposure ledger around the served NAR request. `resolve` discloses to
-    // the DHT twice on a HIT: `find_providers` (discover WHO) records ContentKey+OurNodeId,
-    // then `node_locator().locate` (resolve WHERE) records a further OurNodeId disclosure.
-    // The served request is synchronous and nothing else drives the ledger, so this delta
-    // is attributable to `resolve`'s two DHT consultations. (See the HIT-vs-MISS oracle
-    // below - this is why it bites the peer-routing consult specifically.)
+    // Snapshot C's exposure ledger around the served NAR request. A HIT discloses to the
+    // DHT twice: `find_providers` (discover WHO, in `resolve`) records ContentKey+OurNodeId,
+    // then the transport's `node_locator().locate` (resolve WHERE, inside the fetch) records
+    // a further OurNodeId disclosure. The served request is synchronous and nothing else
+    // drives the ledger, so this delta is attributable to those two DHT consultations. (See
+    // the HIT-vs-MISS oracle below - this is why it bites the peer-routing consult.)
     let hit_ledger_before = consumer.exposure_ledger().len();
     let served = common::get(addr, &format!("/nar/{hit_token}")).await;
     let hit_ledger_delta = consumer.exposure_ledger().len() - hit_ledger_before;
@@ -444,8 +447,9 @@ async fn production_config_builds_libp2p_source_that_discovers_and_serves_with_c
     assert_eq!(miss_narinfo.status, Some(200), "miss narinfo correlated");
 
     // Same ledger snapshot on the MISS path. Here `find_providers` returns `Miss`, so
-    // `resolve` bails BEFORE the record loop and NEVER reaches `node_locator().locate` -
-    // only the discovery disclosure is recorded, not the peer-routing one.
+    // `resolve` bails BEFORE the record loop and NEVER reaches the transfer (whose fetch is
+    // where `node_locator().locate` now runs) - only the discovery disclosure is recorded,
+    // not the peer-routing one.
     let miss_ledger_before = consumer.exposure_ledger().len();
     let miss_served = common::get(addr, &format!("/nar/{miss_token}")).await;
     let miss_ledger_delta = consumer.exposure_ledger().len() - miss_ledger_before;
@@ -464,20 +468,21 @@ async fn production_config_builds_libp2p_source_that_discovers_and_serves_with_c
         "exactly one fallback: the miss arm, not the hit arm"
     );
 
-    // ---- ORACLE: `resolve` CONSULTED node_locator on the HIT path ----
+    // ---- ORACLE: the fetch path CONSULTED node_locator on the HIT path ----
     // This is the robust proof (the byte-path arms alone do NOT bite it: a small loopback
     // kad lets the fetch reuse a connection an earlier discovery query opened to P, so the
-    // HIT would serve byte-identical EVEN IF `resolve` skipped `locate` - verified by
-    // mutation, TASK-169 notes). The peer-routing consult IS observable through the frozen
-    // exposure-ledger seam.
+    // HIT would serve byte-identical EVEN IF the transport skipped `locate` - verified by
+    // mutation, TASK-169 notes). The peer-routing consult (now inside the transfer's fetch)
+    // IS observable through the frozen exposure-ledger seam.
     //
     // LOAD-BEARING ASSUMPTION (pinned deliberately, per the TASK-169 mped review F2): the
     // directory's `find_providers` records a PROVIDER-COUNT-INDEPENDENT 2 disclosures
     // (ContentKey + OurNodeId, `fabric-libp2p/src/directory.rs`) up front on any DHT
-    // consultation, and `node_locator().locate` records EXACTLY 1 more (OurNodeId,
-    // `fabric-libp2p/src/locator.rs`); the transfer path records none. So a HIT (discovery
-    // Found -> record loop -> locate) discloses `find_providers`(2) + `locate`(1) = 3, and a
-    // MISS (discovery Miss -> returns BEFORE the record loop, no locate) discloses only
+    // consultation, and the transport's `node_locator().locate` records EXACTLY 1 more
+    // (OurNodeId, `fabric-libp2p/src/locator.rs`) inside the fetch; the byte path itself
+    // records none. So a HIT (discovery Found -> record loop -> transfer.fetch -> locate)
+    // discloses `find_providers`(2) + `locate`(1) = 3, and a MISS (discovery Miss -> returns
+    // BEFORE the record loop, no fetch, no locate) discloses only
     // `find_providers`(2). The EXACT `+1` form is intentional: were discovery ever changed
     // to record a per-provider disclosure, a HIT would out-disclose a MISS for the WRONG
     // reason (more providers, not a peer-routing consult) - a strict `>` would silently pass
@@ -488,8 +493,8 @@ async fn production_config_builds_libp2p_source_that_discovers_and_serves_with_c
         miss_ledger_delta + 1,
         "a p2p HIT must disclose to the DHT via peer-routing (node_locator) EXACTLY one \
          disclosure beyond the discovery lookup a MISS does; got hit_delta={hit_ledger_delta}, \
-         miss_delta={miss_ledger_delta}. hit != miss+1 means either resolve did not consult \
-         node_locator on the HIT, or discovery's exposure accounting changed (revisit this \
-         oracle - see the load-bearing assumption above)"
+         miss_delta={miss_ledger_delta}. hit != miss+1 means either the transport did not \
+         consult node_locator on the HIT, or discovery's exposure accounting changed (revisit \
+         this oracle - see the load-bearing assumption above)"
     );
 }

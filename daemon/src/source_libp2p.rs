@@ -64,9 +64,7 @@ use fabric_libp2p::{Libp2pFabric, Multiaddr, NodeConfig, PeerId};
 use http::HeaderMap;
 use http_body_util::{BodyExt, Full};
 
-use peer_fabric::{
-    ContentKey, DiscoveryBudget, Lookup, PeerFabric, SafetyEnvelope, TransferError,
-};
+use peer_fabric::{ContentKey, DiscoveryBudget, Lookup, PeerFabric, SafetyEnvelope, TransferError};
 
 use std::str::FromStr;
 

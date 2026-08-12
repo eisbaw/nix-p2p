@@ -22,8 +22,8 @@ use fabric_libp2p::{
     Libp2pNodeLocator, Libp2pServer, Libp2pTransport, MemoryNarSupplier, Node, NodeConfig,
 };
 use peer_fabric::{
-    Blake3Digest, ExposureLedger, Lookup, NarServer, NarTransfer, ResolutionPolicy, SafetyEnvelope,
-    ServeBudget, TransferError, TransportOffer,
+    Blake3Digest, ExposureLedger, Lookup, NarServer, NarTransfer, NodeLocator, ResolutionPolicy,
+    SafetyEnvelope, ServeBudget, TransferError, TransportOffer,
 };
 
 /// A generous per-call envelope: loopback finishes in milliseconds, so a multi-second
@@ -63,31 +63,55 @@ async fn wait_for_listen_addr(node: &Node) -> fabric_libp2p::Multiaddr {
     panic!("node never reported a listen address");
 }
 
-/// Build a consumer transport for `consumer` that can dial `provider` at `addr`.
+/// Stand up a shared bootstrap `B` for `scope`. Both the provider `A` and the consumer
+/// `B'` join it. Why a bootstrap at all: since TASK-169 the transport drives its dial off
+/// an EXPLICIT kad peer-routing resolution of the provider, and a bare two-node
+/// `add_address` does NOT make the provider resolvable - kad `get_closest_peers` returns
+/// the target with NO address unless a SHARED peer learned that address via identify. So
+/// the consumer must reach the provider's address through the DHT via `B`, exactly the
+/// production topology (`node_locator_discovery.rs`). The old "basic dial shim" (fetch
+/// auto-dialing off an injected `add_address`) is precisely what this task removes.
+async fn start_bootstrap(scope: &str) -> (Node, fabric_libp2p::Multiaddr) {
+    start_listening([200u8; 32], scope).await
+}
+
+/// Join `node` to the DHT THROUGH `boot`, waiting until its routing table is non-empty (so
+/// identify has run and the shared bootstrap has learned this node's listen address).
+async fn join(node: &Node, boot_peer: fabric_libp2p::PeerId, boot_addr: fabric_libp2p::Multiaddr) {
+    node.handle.add_address(boot_peer, boot_addr.clone()).await;
+    let _ = node.handle.dial(boot_addr).await;
+    let _ = node.handle.bootstrap().await;
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        if node.handle.routing_peers().await >= 1 {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "routing table never populated through the bootstrap"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+/// Join `consumer` to the DHT through `boot` and build a transport that resolves + dials
+/// `provider` through kad peer-routing. Polls `locate(provider)` until Found so the
+/// byte-path assertions below are deterministic rather than racing DHT propagation.
 async fn wire_consumer(
     consumer: &Node,
     provider: &Node,
-    addr: fabric_libp2p::Multiaddr,
+    boot_peer: fabric_libp2p::PeerId,
+    boot_addr: fabric_libp2p::Multiaddr,
 ) -> Libp2pTransport {
-    // Teach the consumer's swarm how to reach the provider. `add_address` seeds kad's
-    // routing table with this EXPLICIT (override / test-injected) address, which is what
-    // the transport's kad peer-routing resolution (TASK-169) resolves the provider's dial
-    // address from before the request-response fetch dials it. The decentralized
-    // NO-injection resolution (address learned purely through the DHT) is proven separately
-    // in `node_locator_discovery.rs`; here the injected address is legitimate.
-    consumer.handle.add_address(provider.peer_id, addr.clone()).await;
-    let _ = consumer.handle.dial(addr).await;
+    join(consumer, boot_peer, boot_addr).await;
 
-    // The transport now drives its dial off an EXPLICIT in-fabric resolution (TASK-169), so
-    // it holds the same kind of `Libp2pNodeLocator` the fabric wires it with. A standalone
+    // The transport drives its dial off an EXPLICIT in-fabric resolution (TASK-169), so it
+    // holds the same kind of `Libp2pNodeLocator` the fabric wires it with. A standalone
     // ledger is fine here - these tests assert byte-path behaviour, not exposure counts.
     let ledger = Arc::new(ExposureLedger::new());
     let locator = Arc::new(Libp2pNodeLocator::new(consumer.handle.clone(), ledger));
 
-    // Wait until kad peer-routing can Found the provider's dial address, so the byte-path
-    // fetches below are deterministic rather than racing the resolution readiness the
-    // transport now performs on every fetch.
-    let deadline = Instant::now() + Duration::from_secs(10);
+    let deadline = Instant::now() + Duration::from_secs(15);
     loop {
         match locator
             .locate(&provider.node_id, &ResolutionPolicy::PublicInfrastructure)
@@ -100,7 +124,7 @@ async fn wire_consumer(
                     "consumer never resolved the provider's dial address via kad peer-routing \
                      (last: {other:?})"
                 );
-                tokio::time::sleep(Duration::from_millis(50)).await;
+                tokio::time::sleep(Duration::from_millis(100)).await;
             }
         }
     }
@@ -114,18 +138,23 @@ async fn fetch_is_byte_identical_and_blake3_verified_across_two_nodes() {
     let nar = b"raw NAR bytes served over a real libp2p swarm, byte for byte".to_vec();
     let content = Blake3Digest::from_raw_nar(&nar);
 
+    // Shared bootstrap B; the serving provider A joins it so its address is DHT-resolvable.
+    let (boot, boot_addr) = start_bootstrap(scope).await;
+    let boot_peer = boot.peer_id;
+
     // Node A: serve the NAR.
-    let (node_a, addr_a) = start_listening([1u8; 32], scope).await;
+    let (node_a, _addr_a) = start_listening([1u8; 32], scope).await;
     let supplier = Arc::new(MemoryNarSupplier::new([nar.clone()]));
     let server = Libp2pServer::new(node_a.handle.clone(), supplier);
     let _serve = server
         .serve(ServeBudget::default())
         .await
         .expect("serve starts");
+    join(&node_a, boot_peer, boot_addr.clone()).await;
 
-    // Node B: fetch it.
+    // Node B: fetch it (resolves A's dial address through the DHT via B).
     let (node_b, _addr_b) = start_listening([2u8; 32], scope).await;
-    let transport = wire_consumer(&node_b, &node_a, addr_a).await;
+    let transport = wire_consumer(&node_b, &node_a, boot_peer, boot_addr.clone()).await;
     let offer = TransportOffer::Iroh {
         node: node_a.node_id,
     };
@@ -154,15 +183,19 @@ async fn corrupt_provider_is_rejected_by_gate1_blake3_verify() {
     let mut supplier = MemoryNarSupplier::new([]);
     supplier.insert_raw(requested, corrupt_bytes);
 
-    let (node_a, addr_a) = start_listening([3u8; 32], scope).await;
+    let (boot, boot_addr) = start_bootstrap(scope).await;
+    let boot_peer = boot.peer_id;
+
+    let (node_a, _addr_a) = start_listening([3u8; 32], scope).await;
     let server = Libp2pServer::new(node_a.handle.clone(), Arc::new(supplier));
     let _serve = server
         .serve(ServeBudget::default())
         .await
         .expect("serve starts");
+    join(&node_a, boot_peer, boot_addr.clone()).await;
 
     let (node_b, _addr_b) = start_listening([4u8; 32], scope).await;
-    let transport = wire_consumer(&node_b, &node_a, addr_a).await;
+    let transport = wire_consumer(&node_b, &node_a, boot_peer, boot_addr.clone()).await;
     let offer = TransportOffer::Iroh {
         node: node_a.node_id,
     };
@@ -186,7 +219,10 @@ async fn signed_bound_smaller_than_served_bytes_trips_size_abort() {
     let nar = b"a NAR that is bigger than the size bound the consumer will allow".to_vec();
     let content = Blake3Digest::from_raw_nar(&nar);
 
-    let (node_a, addr_a) = start_listening([5u8; 32], scope).await;
+    let (boot, boot_addr) = start_bootstrap(scope).await;
+    let boot_peer = boot.peer_id;
+
+    let (node_a, _addr_a) = start_listening([5u8; 32], scope).await;
     let server = Libp2pServer::new(
         node_a.handle.clone(),
         Arc::new(MemoryNarSupplier::new([nar.clone()])),
@@ -195,9 +231,10 @@ async fn signed_bound_smaller_than_served_bytes_trips_size_abort() {
         .serve(ServeBudget::default())
         .await
         .expect("serve starts");
+    join(&node_a, boot_peer, boot_addr.clone()).await;
 
     let (node_b, _addr_b) = start_listening([6u8; 32], scope).await;
-    let transport = wire_consumer(&node_b, &node_a, addr_a).await;
+    let transport = wire_consumer(&node_b, &node_a, boot_peer, boot_addr.clone()).await;
     let offer = TransportOffer::Iroh {
         node: node_a.node_id,
     };
@@ -223,7 +260,10 @@ async fn serve_budget_declines_over_per_nar_request() {
     let nar = vec![0xABu8; 4096]; // 4 KiB
     let content = Blake3Digest::from_raw_nar(&nar);
 
-    let (node_a, addr_a) = start_listening([7u8; 32], scope).await;
+    let (boot, boot_addr) = start_bootstrap(scope).await;
+    let boot_peer = boot.peer_id;
+
+    let (node_a, _addr_a) = start_listening([7u8; 32], scope).await;
     let server = Libp2pServer::new(
         node_a.handle.clone(),
         Arc::new(MemoryNarSupplier::new([nar.clone()])),
@@ -235,9 +275,10 @@ async fn serve_budget_declines_over_per_nar_request() {
         max_serve_duration: Duration::from_secs(120),
     };
     let _serve = server.serve(tight).await.expect("serve starts");
+    join(&node_a, boot_peer, boot_addr.clone()).await;
 
     let (node_b, _addr_b) = start_listening([8u8; 32], scope).await;
-    let transport = wire_consumer(&node_b, &node_a, addr_a).await;
+    let transport = wire_consumer(&node_b, &node_a, boot_peer, boot_addr.clone()).await;
     let offer = TransportOffer::Iroh {
         node: node_a.node_id,
     };
@@ -260,14 +301,18 @@ async fn dropping_the_serve_handle_stops_admission() {
     let nar = b"served only while the handle is held".to_vec();
     let content = Blake3Digest::from_raw_nar(&nar);
 
-    let (node_a, addr_a) = start_listening([9u8; 32], scope).await;
+    let (boot, boot_addr) = start_bootstrap(scope).await;
+    let boot_peer = boot.peer_id;
+
+    let (node_a, _addr_a) = start_listening([9u8; 32], scope).await;
     let server = Libp2pServer::new(
         node_a.handle.clone(),
         Arc::new(MemoryNarSupplier::new([nar.clone()])),
     );
+    join(&node_a, boot_peer, boot_addr.clone()).await;
 
     let (node_b, _addr_b) = start_listening([10u8; 32], scope).await;
-    let transport = wire_consumer(&node_b, &node_a, addr_a).await;
+    let transport = wire_consumer(&node_b, &node_a, boot_peer, boot_addr.clone()).await;
     let offer = TransportOffer::Iroh {
         node: node_a.node_id,
     };
@@ -307,14 +352,18 @@ async fn a_stale_teardown_does_not_clobber_a_live_successor_session() {
     let nar = b"served by the successor session".to_vec();
     let content = Blake3Digest::from_raw_nar(&nar);
 
-    let (node_a, addr_a) = start_listening([11u8; 32], scope).await;
+    let (boot, boot_addr) = start_bootstrap(scope).await;
+    let boot_peer = boot.peer_id;
+
+    let (node_a, _addr_a) = start_listening([11u8; 32], scope).await;
     let server = Libp2pServer::new(
         node_a.handle.clone(),
         Arc::new(MemoryNarSupplier::new([nar.clone()])),
     );
+    join(&node_a, boot_peer, boot_addr.clone()).await;
 
     let (node_b, _addr_b) = start_listening([12u8; 32], scope).await;
-    let transport = wire_consumer(&node_b, &node_a, addr_a).await;
+    let transport = wire_consumer(&node_b, &node_a, boot_peer, boot_addr.clone()).await;
     let offer = TransportOffer::Iroh {
         node: node_a.node_id,
     };
