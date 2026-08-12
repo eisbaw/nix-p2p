@@ -213,10 +213,15 @@ impl InMemoryDiscovery {
     /// Merge the claims accumulated for one key into a SINGLE claim whose `holders`
     /// and `transports` are the UNION across all of them, preserving ANNOUNCE ORDER
     /// and de-duplicating repeats. `claims` is non-empty (the caller only calls this
-    /// for a populated key). The merged content id / relay come from the first claim
-    /// (see the type-level note on why the union is sound).
+    /// for a populated key). The merged content id / relay come from the FIRST claim
+    /// that actually carries one (`find_map`, not `claims[0]` unconditionally): a
+    /// first holder whose payload decoded to an unknown, inert kind
+    /// (`payload == None`) must not blind the whole key when a later holder does
+    /// carry a usable `WholeNar`. See the type-level note on why the union is sound.
     fn merge(claims: &[Claim]) -> Claim {
         let first = &claims[0];
+        let payload = claims.iter().find_map(|c| c.payload.clone());
+        let relay = claims.iter().find_map(|c| c.relay.clone());
         let mut holders: Vec<NodeId> = Vec::new();
         let mut transports: Vec<KnownTransport> = Vec::new();
         let mut signatures: Vec<crate::claim::ClaimSignature> = Vec::new();
@@ -240,10 +245,10 @@ impl InMemoryDiscovery {
         Claim {
             schema_version: first.schema_version,
             key: first.key,
-            payload: first.payload.clone(),
+            payload,
             holders,
             transports,
-            relay: first.relay.clone(),
+            relay,
             signatures,
         }
     }
@@ -1054,6 +1059,36 @@ mod tests {
             "a re-announced holder is not duplicated"
         );
         assert_eq!(claim.transports.len(), 2, "no duplicate offers");
+    }
+
+    #[tokio::test]
+    async fn merge_takes_the_content_id_from_the_first_holder_that_carries_one() {
+        // Hardening (mped review): a FIRST holder whose payload decoded to an
+        // unknown, inert kind (payload == None - tolerated but inert per claim.rs)
+        // must not blind the whole key. resolve takes the content id from the first
+        // holder that actually carries one, so a later holder's usable WholeNar is
+        // still fetchable. (With an unconditional `claims[0].payload` this returns
+        // None and the key becomes an unfetchable no-content-id miss.)
+        let content = Blake3Digest::from_raw_nar(b"the usable payload arrives second");
+        let a = NodeId::from_bytes([0xaa; 32]);
+        let b = NodeId::from_bytes([0xbb; 32]);
+
+        let mut inert = claim_held_by(key_x(), a, content);
+        inert.payload = None; // as if decoded from an unknown-kind wire payload
+
+        let discovery = InMemoryDiscovery::new();
+        discovery.announce(inert);
+        discovery.announce(claim_held_by(key_x(), b, content));
+
+        let claim = discovery.resolve(&key_x()).await.expect("a hit");
+        assert_eq!(
+            claim.content_id(),
+            Some(&content),
+            "the usable content id from the second holder is not masked by the first \
+             holder's inert payload"
+        );
+        // Both holders' offers are still present for failover.
+        assert_eq!(claim.holders, vec![a, b]);
     }
 
     #[tokio::test]

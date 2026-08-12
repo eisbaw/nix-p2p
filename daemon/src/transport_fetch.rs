@@ -876,7 +876,11 @@ mod tests {
     struct NodeAwareTransport {
         content: Blake3Digest,
         bytes: Vec<u8>,
+        /// Holders whose dial is refused (a dead holder → try the next offer).
         dead: Vec<NodeId>,
+        /// Holders that SERVE but serve tampered bytes not hashing to `content`
+        /// (a lying holder → gate-1 fails closed → try the next offer).
+        liars: Vec<NodeId>,
         attempts: Arc<std::sync::Mutex<Vec<NodeId>>>,
     }
 
@@ -908,6 +912,14 @@ mod tests {
                     "holder {node} is dead"
                 )));
             }
+            if self.liars.contains(&node) {
+                // A lying holder serves bytes that do NOT hash to the requested
+                // identity; gate-1 (verify_blake3) rejects them, fails closed, and
+                // the driver moves to the next offer - a lying offer never yields
+                // wrong bytes (the daemon is outside the TCB).
+                verify_blake3(content, b"WRONG bytes a lying holder serves")?;
+                unreachable!("gate-1 must reject the lying holder's bytes");
+            }
             if content != &self.content {
                 return Err(TransportError::NotHeld(*content));
             }
@@ -938,6 +950,7 @@ mod tests {
             content,
             bytes: RAW_NAR.to_vec(),
             dead: vec![a],
+            liars: vec![],
             attempts: attempts.clone(),
         }));
 
@@ -968,6 +981,63 @@ mod tests {
             *attempts.lock().expect("attempts"),
             vec![a, b],
             "the fetch must try the dead first holder, then fail over to the second"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_lying_holder_in_the_merged_set_fails_gate1_and_an_honest_holder_serves() {
+        // The safety claim the multi-holder MERGE rests on, pinned by a test (it was
+        // prose-only before): when several holders are accumulated under one key and
+        // merged into one claim, a holder that SERVES WRONG BYTES cannot poison the
+        // result - gate-1 (BLAKE3) rejects it and the driver fails over to an honest
+        // holder. So the union of offers is sound: a lying offer only costs a bounded
+        // retry, never wrong bytes (the daemon is outside the TCB).
+        //
+        // Order: honest-but-DEAD A (tried first, dial refused) -> LIAR B (serves
+        // tampered bytes, gate-1 rejects) -> honest live C (serves). Proven by the
+        // attempt order [A, B, C] AND by the honest bytes coming back from C.
+        let content = Blake3Digest::from_raw_nar(RAW_NAR);
+        let a = NodeId::from_bytes([0xaa; 32]);
+        let b = NodeId::from_bytes([0xbb; 32]);
+        let c = NodeId::from_bytes([0xcc; 32]);
+        let attempts = Arc::new(std::sync::Mutex::new(Vec::new()));
+
+        let mut registry = TransportRegistry::new();
+        registry.register(Box::new(NodeAwareTransport {
+            content,
+            bytes: RAW_NAR.to_vec(),
+            dead: vec![a],
+            liars: vec![b],
+            attempts: attempts.clone(),
+        }));
+
+        let holder_claim = |holder: NodeId| Claim {
+            schema_version: CLAIM_SCHEMA_VERSION,
+            key: key(),
+            payload: Some(KnownPayload::WholeNar { blake3: content }),
+            holders: vec![holder],
+            transports: vec![KnownTransport::Iroh { node: holder }],
+            relay: None,
+            signatures: vec![],
+        };
+        let source = source_with(
+            registry,
+            vec![holder_claim(a), holder_claim(b), holder_claim(c)],
+        );
+
+        let resp = source
+            .resolve(&signed_key(), Some(RAW_NAR.len() as u64))
+            .await
+            .expect("the honest holder still serves despite a liar in the merged set");
+        assert_eq!(
+            collect(resp).await,
+            RAW_NAR,
+            "the bytes are the honest NAR - the liar contributed nothing"
+        );
+        assert_eq!(
+            *attempts.lock().expect("attempts"),
+            vec![a, b, c],
+            "dead A, then liar B (rejected by gate-1), then honest C served"
         );
     }
 
