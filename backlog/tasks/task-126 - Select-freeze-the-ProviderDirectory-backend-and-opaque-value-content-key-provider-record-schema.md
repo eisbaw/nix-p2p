@@ -3,11 +3,11 @@ id: TASK-126
 title: >-
   Select + freeze the ProviderDirectory backend and opaque-value
   content-key/provider-record schema
-status: In Progress
+status: Done
 assignee:
   - '@claude'
 created_date: '2026-08-10 22:51'
-updated_date: '2026-08-12 02:45'
+updated_date: '2026-08-12 02:47'
 labels:
   - iroh
   - discovery
@@ -60,3 +60,9 @@ Frozen POSITIVE bytes verified BYTE-IDENTICAL (ContentKey 4e61db15...; full/no_o
 
 Vectors changed: positives UNCHANGED (byte-identical). Negatives: added reject_identity_forgery; reject_iroh_node_not_provider now uses a valid alt key; reject_debug added to all 8 negatives; alt_provider_hex added to identities. 12 vectors total (4 positive + 8 reject). Every new/changed guard has a biting test in BOTH Rust and Python.
 <!-- SECTION:NOTES:END -->
+
+## Final Summary
+
+<!-- SECTION:FINAL_SUMMARY:BEGIN -->
+Spike + freeze DONE across 3 DEEP-gate rounds. SPIKE: iroh-dht-experiment stores a fixed typed enum (not opaque bytes) -> libp2p-kad put_record is PRIMARY, iroh-dht-experiment fallback; the freeze is backend-agnostic (no frozen byte depends on the choice). FROZE in peer-fabric/src/{content,record_codec,record_store}.rs: ContentKey=blake3 derive_key('nix-p2p/discovery/ContentKey/v1', sha256_narhash) + fixed-layout ed25519-signed ProviderRecord (S<L, reject small-order A/R cofactorless, canonical strict-ascending offers, iroh offer node==provider self-serve, 1024B cap, fail-closed decode with distinct typed errors). Byte-pinned golden vectors (4 positive + 8 reject, each single-fault asserting the FULL typed error) + an independent pure-python ed25519 anchor (scripts/check-content-key-derivation.py). DEEP gate: qa GO + mped GO + codex 3 rounds (r1 byte-canonicality, r2 proof/oracle, r3 anchor-fidelity + release-red); orchestrator independently verified debug 68+8 + release 67+8 green, anchor rejects identity forgery, positives byte-identical. Commits 0d67282,4941ab3,14d2a23. Forward-carried to TASK-103 (consumer). Dual-stack-default implication -> TASK-147 (owner decision).
+<!-- SECTION:FINAL_SUMMARY:END -->
