@@ -415,7 +415,15 @@ async fn production_config_builds_libp2p_source_that_discovers_and_serves_with_c
         "narinfo served (token correlated)"
     );
 
+    // Snapshot C's exposure ledger around the served NAR request. `resolve` discloses to
+    // the DHT twice on a HIT: `find_providers` (discover WHO) records ContentKey+OurNodeId,
+    // then `node_locator().locate` (resolve WHERE) records a further OurNodeId disclosure.
+    // The served request is synchronous and nothing else drives the ledger, so this delta
+    // is attributable to `resolve`'s two DHT consultations. (See the HIT-vs-MISS oracle
+    // below - this is why it bites the peer-routing consult specifically.)
+    let hit_ledger_before = consumer.exposure_ledger().len();
     let served = common::get(addr, &format!("/nar/{hit_token}")).await;
+    let hit_ledger_delta = consumer.exposure_ledger().len() - hit_ledger_before;
     assert_eq!(
         served.status,
         Some(200),
@@ -435,7 +443,12 @@ async fn production_config_builds_libp2p_source_that_discovers_and_serves_with_c
     let miss_narinfo = common::get(addr, "/miss.narinfo").await;
     assert_eq!(miss_narinfo.status, Some(200), "miss narinfo correlated");
 
+    // Same ledger snapshot on the MISS path. Here `find_providers` returns `Miss`, so
+    // `resolve` bails BEFORE the record loop and NEVER reaches `node_locator().locate` -
+    // only the discovery disclosure is recorded, not the peer-routing one.
+    let miss_ledger_before = consumer.exposure_ledger().len();
     let miss_served = common::get(addr, &format!("/nar/{miss_token}")).await;
+    let miss_ledger_delta = consumer.exposure_ledger().len() - miss_ledger_before;
     assert_eq!(
         miss_served.status,
         Some(200),
@@ -449,5 +462,21 @@ async fn production_config_builds_libp2p_source_that_discovers_and_serves_with_c
         fallback_hits.load(Ordering::SeqCst),
         1,
         "exactly one fallback: the miss arm, not the hit arm"
+    );
+
+    // ---- ORACLE: `resolve` CONSULTED node_locator on the HIT path ----
+    // This is the robust proof (the byte-path arms alone do NOT bite it: a small loopback
+    // kad lets the fetch reuse a connection an earlier discovery query opened to P, so the
+    // HIT would serve byte-identical EVEN IF `resolve` skipped `locate` - verified by
+    // mutation, TASK-169 notes). The peer-routing consult IS observable through the frozen
+    // exposure-ledger seam: a HIT drives BOTH `find_providers` AND `locate` (an extra DHT
+    // disclosure), a MISS drives ONLY `find_providers` (it returns before the record loop).
+    // So a HIT must disclose strictly MORE than a MISS; deleting the `locate` consult
+    // collapses the two deltas and trips this assertion.
+    assert!(
+        hit_ledger_delta > miss_ledger_delta,
+        "a p2p HIT must disclose to the DHT via peer-routing (node_locator) beyond the \
+         discovery lookup a MISS does; got hit_delta={hit_ledger_delta}, \
+         miss_delta={miss_ledger_delta} (resolve did not consult node_locator on the HIT)"
     );
 }
