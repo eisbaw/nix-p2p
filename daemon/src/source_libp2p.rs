@@ -57,14 +57,19 @@
 //! offer addresses the same oversized content.
 
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use bytes::Bytes;
-use fabric_libp2p::{Libp2pFabric, Multiaddr, NodeConfig, PeerId};
+use fabric_libp2p::{Libp2pFabric, Libp2pNarSupplier, Multiaddr, NodeConfig, PeerId};
 use http::HeaderMap;
 use http_body_util::{BodyExt, Full};
 
-use peer_fabric::{ContentKey, DiscoveryBudget, Lookup, PeerFabric, SafetyEnvelope, TransferError};
+use ed25519_dalek::SigningKey;
+use peer_fabric::{
+    Blake3Digest, ContentKey, DiscoveryBudget, Lookup, NodeId, PeerFabric, ProviderRecord,
+    SafetyEnvelope, TransferError, TransportOffer, sign_provider_record,
+};
 
 use std::str::FromStr;
 
@@ -384,10 +389,144 @@ pub async fn build_libp2p_nar_source(
     ),
     String,
 > {
-    let fabric = Libp2pFabric::start(NodeConfig {
+    let fabric = start_and_join_libp2p(&cfg, None).await?;
+    Ok(wrap_consumer_source(fabric, &cfg))
+}
+
+/// The SERVING sibling of [`build_libp2p_nar_source`] (TASK-178): start the fabric WITH
+/// a `supplier`, so the fabric exposes the serve axis (`server()` is `Some`) and can
+/// answer inbound NAR requests. It runs the SAME connectivity join as the consumer
+/// builder ([`start_and_join_libp2p`]), so a serving node is reachable in the DHT, and
+/// returns the running fabric PLUS its own consumer source/raw-serve (a provider is also
+/// a consumer - it can discover+fetch what it does not hold). The composition root then
+/// installs the serve gate (`fabric.server().serve(budget)`) and announces the signed
+/// provider records; that stays in the caller because the records are minted from the
+/// caller's seed catalog (raw NAR + its NarHash), which the fabric does not know.
+///
+/// ONE fabric serves AND consumes on ONE identity/listen, so there is no second
+/// same-identity swarm to collide with (the footgun a separate provider node would
+/// create). The returned `Arc<Libp2pFabric>` is what the caller drives to serve/announce
+/// and MUST keep alive for the process (the source holds its own clone too).
+pub async fn build_libp2p_provider_source(
+    cfg: Libp2pSourceConfig,
+    supplier: Arc<dyn Libp2pNarSupplier>,
+) -> Result<
+    (
+        Arc<Libp2pFabric>,
+        Arc<dyn NarSource>,
+        Arc<dyn RawServeDecision>,
+    ),
+    String,
+> {
+    let fabric = start_and_join_libp2p(&cfg, Some(supplier)).await?;
+
+    // Unlike a CONSUMER (whose find_providers RETRIES until the routing table fills), a
+    // provider's announce is a ONE-SHOT at startup and needs a non-empty kad routing table
+    // to reach the k-closest nodes - an announce against an empty table fails
+    // `Unavailable(InsufficientRouting)`. So WAIT (bounded) for the bootstrap join to
+    // populate at least one routing peer before the caller announces. Fail-fast with a
+    // clear message on timeout rather than letting the caller's announce fail obscurely.
+    // Only relevant when a bootstrap set was configured (the join target).
+    if !cfg.bootstrap.is_empty() {
+        let deadline = Instant::now() + Duration::from_secs(20);
+        loop {
+            if fabric.handle().routing_peers().await >= 1 {
+                break;
+            }
+            if Instant::now() >= deadline {
+                return Err(
+                    "libp2p provider: kad routing table stayed empty after joining the \
+                     bootstrap peer(s); cannot announce into an unreachable DHT"
+                        .to_string(),
+                );
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    }
+
+    Ok(wrap_consumer_source(fabric, &cfg))
+}
+
+/// Build + SIGN a [`ProviderRecord`] for one seeded NAR (TASK-178), signed by the node's
+/// ed25519 identity `seed`. SELF-SERVE v1: the record's `provider` is `NodeId(verifying
+/// key of seed)`, which equals the fabric's own `node_id` (both derive from the same
+/// seed) - the announcer REJECTS a record it did not sign, so this identity match is
+/// load-bearing. The discovery [`ContentKey`] is derived from the Nix `NarHash`, so a
+/// consumer that derived the SAME key from a narinfo discovers this provider; the
+/// `content` [`Blake3Digest`] is the raw NAR's hash, the axis the transfer/serve keys on
+/// and gate-1 BLAKE3-verifies. The lone offer carries the libp2p NAR transport (registered
+/// under [`TransportOffer::Iroh`], per fabric-libp2p's ADR).
+///
+/// This is the SINGLE SOURCE OF TRUTH for a provider record's construction: the daemon
+/// binary's `--libp2p-provider` path and the integration test both mint records here, so
+/// the two cannot drift on the key-derivation / signing recipe.
+pub fn sign_libp2p_provider_record(
+    seed: [u8; 32],
+    nar_hash: &NarHashKey,
+    nar_bytes: &[u8],
+    ttl_secs: u64,
+    now: u64,
+) -> ProviderRecord {
+    let signing_key = SigningKey::from_bytes(&seed);
+    let provider = NodeId::from_bytes(signing_key.verifying_key().to_bytes());
+    let key = ContentKey::derive_from_signed_nar_hash(nar_hash.as_bytes());
+    let content = Blake3Digest::from_raw_nar(nar_bytes);
+    let record = ProviderRecord {
+        key,
+        content,
+        provider,
+        offers: vec![TransportOffer::Iroh { node: provider }],
+        sequence: 1,
+        issued_at: now,
+        expiry: now + ttl_secs,
+        signature: [0u8; 64],
+    };
+    sign_provider_record(&signing_key, &record)
+}
+
+/// Wrap a running `fabric` in the consumer [`Libp2pNarSource`] + its paired
+/// [`Libp2pRawServe`], both holding the SAME fabric and discovery budget so the
+/// rewrite-to-raw decision and the fetch can never drift (TASK-164). Shared by the
+/// consumer and provider builders (single source of truth for the wrapping).
+fn wrap_consumer_source(
+    fabric: Arc<Libp2pFabric>,
+    cfg: &Libp2pSourceConfig,
+) -> (
+    Arc<Libp2pFabric>,
+    Arc<dyn NarSource>,
+    Arc<dyn RawServeDecision>,
+) {
+    let raw_serve: Arc<dyn RawServeDecision> = Arc::new(Libp2pRawServe::new(
+        fabric.clone() as Arc<dyn PeerFabric>,
+        cfg.discovery_budget,
+    ));
+    let source: Arc<dyn NarSource> = Arc::new(Libp2pNarSource::new(
+        fabric.clone() as Arc<dyn PeerFabric>,
+        cfg.discovery_budget,
+        cfg.envelope,
+    ));
+    (fabric, source, raw_serve)
+}
+
+/// Start a [`Libp2pFabric`] for `cfg` and JOIN the DHT: bind the listener, dial the
+/// bootstrap peers (fatal only if EVERY dial fails), run the kad self-lookup, and seed
+/// any optional `provider_addrs` into the routing table. With `supplier` `Some` the
+/// fabric ALSO serves (`start_with_supplier`); `None` is a pure consumer. This is the
+/// ONE connectivity sequence both [`build_libp2p_nar_source`] and
+/// [`build_libp2p_provider_source`] run - extracted so the join discipline (fail-fast on
+/// a total bootstrap outage, tolerant of a partial one) has a single source of truth.
+async fn start_and_join_libp2p(
+    cfg: &Libp2pSourceConfig,
+    supplier: Option<Arc<dyn Libp2pNarSupplier>>,
+) -> Result<Arc<Libp2pFabric>, String> {
+    let node_config = NodeConfig {
         identity_seed: cfg.identity_seed,
-        network_scope: cfg.network_scope,
-    })
+        network_scope: cfg.network_scope.clone(),
+    };
+    let fabric = match supplier {
+        Some(supplier) => Libp2pFabric::start_with_supplier(node_config, supplier),
+        None => Libp2pFabric::start(node_config),
+    }
     .map_err(|e| format!("libp2p fabric start failed: {e}"))?;
     let fabric = Arc::new(fabric);
 
@@ -451,17 +590,5 @@ pub async fn build_libp2p_nar_source(
         fabric.handle().add_address(*peer, addr.clone()).await;
     }
 
-    // Both the fetch source and the raw-serve decision hold the SAME running fabric and
-    // the SAME discovery budget, so a rewrite-to-raw decision and the fetch that backs it
-    // consult one mechanism (DiscoveryBudget is Copy).
-    let raw_serve: Arc<dyn RawServeDecision> = Arc::new(Libp2pRawServe::new(
-        fabric.clone() as Arc<dyn PeerFabric>,
-        cfg.discovery_budget,
-    ));
-    let source: Arc<dyn NarSource> = Arc::new(Libp2pNarSource::new(
-        fabric.clone() as Arc<dyn PeerFabric>,
-        cfg.discovery_budget,
-        cfg.envelope,
-    ));
-    Ok((fabric, source, raw_serve))
+    Ok(fabric)
 }

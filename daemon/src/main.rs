@@ -28,9 +28,10 @@ use daemon::{
     NodePublicationConfig, NodePublicationHandle, NullCorrelation,
     PublicationAuthorityAuthorization, RawServeDecision, RelayCapability, ServeBudget, SystemClock,
     TaskSupervisor, TransportNarSource, TransportRegistry, UpstreamHttp, build_libp2p_nar_source,
-    serve,
+    build_libp2p_provider_source, serve, sign_libp2p_provider_record,
 };
-use fabric_libp2p::{Multiaddr, PeerId};
+use fabric_libp2p::{Libp2pFabric, MemoryNarSupplier, Multiaddr, PeerId};
+use peer_fabric::{AnnounceBudget, PeerFabric, ServeHandle};
 use tokio::net::TcpListener;
 
 /// A configured peer's iroh address: its `NodeId` and one-or-more direct sockets
@@ -147,6 +148,27 @@ fn parse_libp2p_seed(raw: &str) -> Result<[u8; 32], String> {
             .map_err(|e| format!("bad --libp2p-identity-seed hex at byte {i}: {e}"))?;
     }
     Ok(seed)
+}
+
+/// Parse a `--libp2p-seed-nar <narhash>=<path>` pair: the Nix `NarHash` (canonical
+/// `sha256:<nix-base32>`) of a raw NAR and the FILE holding those raw NAR bytes. The
+/// NarHash is REQUIRED because the discovery [`ContentKey`](peer_fabric::ContentKey) a
+/// consumer derives from a narinfo is
+/// `ContentKey::derive_from_signed_nar_hash(NarHash)`; the provider must ANNOUNCE under
+/// that same key, and the raw file's own `BLAKE3` content id is a DIFFERENT axis (it
+/// keys the transfer/serve, not discovery). So both halves are needed and neither is
+/// derivable from the other.
+fn parse_libp2p_seed_nar(raw: &str) -> Result<(NarHashKey, String), String> {
+    let (nar_hash, path) = raw.split_once('=').ok_or_else(|| {
+        format!("bad --libp2p-seed-nar {raw:?}: expected <narhash>=<path/to/raw.nar>")
+    })?;
+    let key: NarHashKey = nar_hash
+        .parse()
+        .map_err(|e| format!("bad --libp2p-seed-nar NarHash {nar_hash:?}: {e}"))?;
+    if path.is_empty() {
+        return Err(format!("bad --libp2p-seed-nar {raw:?}: empty file path"));
+    }
+    Ok((key, path.to_string()))
 }
 
 /// Generate a fresh 32-byte libp2p identity seed from `/dev/urandom`. Used when
@@ -347,6 +369,26 @@ struct Config {
     /// Optional 32-byte ed25519 identity seed (64 hex chars). When omitted the
     /// composition root generates a fresh one from `/dev/urandom`.
     libp2p_identity_seed: Option<[u8; 32]>,
+    // ---- libp2p Node B (SERVING/provider) config (TASK-178) -----------------
+    // The SERVING half of the libp2p primary path: this node ANNOUNCES + SERVES
+    // NARs over libp2p so a consumer daemon can discover it via kad. Mirrors the
+    // iroh `--iroh-provider`/`--iroh-seed-nar`/`--iroh-print-peer-address` mode.
+    /// libp2p PROVIDER mode: start the libp2p fabric WITH a supplier serving the
+    /// `--libp2p-seed-nar` NARs, install the serve gate, and announce a signed
+    /// `ProviderRecord` for each. Off by default (a bare consumer/HTTP node).
+    libp2p_provider: bool,
+    /// Raw-NAR files this node SERVES + ANNOUNCES over libp2p, each paired with its
+    /// Nix `NarHash` (`<narhash>=<path>`, repeatable). The NarHash is REQUIRED because
+    /// the discovery key a consumer derives from a narinfo is
+    /// `ContentKey::derive_from_signed_nar_hash(NarHash)`; the provider must announce
+    /// under that SAME key, and the raw file alone does not carry it (unlike the iroh
+    /// `--iroh-seed-nar`, whose NarHash is supplied out of band by node A's `--p2p-claim`).
+    libp2p_seed_nar: Vec<(NarHashKey, String)>,
+    /// Print the provider's `PeerId` + bound listen multiaddr(s) on startup
+    /// (`LIBP2P-PROVIDER-ADDR ...`), so a harness can wire another daemon's
+    /// `--libp2p-bootstrap <PeerId>@<multiaddr>` to this provider. Like
+    /// `--iroh-print-peer-address`.
+    libp2p_print_peer_address: bool,
 }
 
 impl Default for Config {
@@ -398,6 +440,9 @@ impl Default for Config {
             libp2p_listen: None,
             libp2p_scope: None,
             libp2p_identity_seed: None,
+            libp2p_provider: false,
+            libp2p_seed_nar: Vec::new(),
+            libp2p_print_peer_address: false,
         }
     }
 }
@@ -652,6 +697,11 @@ impl Config {
                 "--libp2p-identity-seed" => {
                     config.libp2p_identity_seed = Some(parse_libp2p_seed(&value()?)?)
                 }
+                "--libp2p-provider" => config.libp2p_provider = true,
+                "--libp2p-seed-nar" => config
+                    .libp2p_seed_nar
+                    .push(parse_libp2p_seed_nar(&value()?)?),
+                "--libp2p-print-peer-address" => config.libp2p_print_peer_address = true,
                 other => return Err(format!("unknown flag {other:?}")),
             }
         }
@@ -689,10 +739,34 @@ impl Config {
         if iroh_enabled && config.iroh_port.is_none() {
             return Err("Iroh is configured but --iroh-port is missing; refusing an ephemeral discovery address".into());
         }
+        // libp2p PROVIDER companion validation (TASK-178), mirroring the iroh provider
+        // companions. `--libp2p-seed-nar` / `--libp2p-print-peer-address` are inert
+        // without the mode switch, so reject them without `--libp2p-provider` rather than
+        // silently ignoring. And a provider with nothing to serve, or with no listener to
+        // be dialed on, is a node that announces then cannot deliver - fail fast naming
+        // the missing flag rather than shipping a dead-on-arrival provider.
+        if (!config.libp2p_seed_nar.is_empty() || config.libp2p_print_peer_address)
+            && !config.libp2p_provider
+        {
+            return Err(
+                "libp2p provider companion flags (--libp2p-seed-nar / --libp2p-print-peer-address) require explicit --libp2p-provider".into(),
+            );
+        }
+        if config.libp2p_provider && config.libp2p_seed_nar.is_empty() {
+            return Err(
+                "--libp2p-provider requires at least one --libp2p-seed-nar <narhash>=<path>; a provider with nothing to serve is a no-op".into(),
+            );
+        }
+        if config.libp2p_provider && config.libp2p_listen.is_none() {
+            return Err(
+                "--libp2p-provider requires --libp2p-listen <multiaddr>; a provider that binds no listener cannot be dialed by a consumer".into(),
+            );
+        }
         // libp2p companion validation: any libp2p flag REQUIRES a bootstrap entry
         // peer (kad cannot discover a provider without one). A `--libp2p-listen`/
         // `--libp2p-provider-addr` with no bootstrap would be a consumer that can
-        // never find anyone - a silently-useless config, so fail fast.
+        // never find anyone - a silently-useless config, so fail fast. A PROVIDER
+        // equally needs one: its announce only propagates once it has joined the DHT.
         if config.libp2p_requested() && config.libp2p_bootstrap.is_empty() {
             return Err(
                 "libp2p is configured but --libp2p-bootstrap is missing; kad cannot discover a provider without an entry peer".into(),
@@ -708,13 +782,19 @@ impl Config {
         Ok(config)
     }
 
-    /// Any libp2p Node-A flag present (so the daemon should wire the libp2p source).
+    /// Any libp2p flag present (so the daemon should wire the libp2p node). Covers BOTH
+    /// the Node-A consumer flags and the Node-B provider flags (TASK-178): a
+    /// provider-only invocation still needs the identity seed resolved and the fabric
+    /// started, so it must count as "requested".
     fn libp2p_requested(&self) -> bool {
         !self.libp2p_bootstrap.is_empty()
             || !self.libp2p_provider_addrs.is_empty()
             || self.libp2p_listen.is_some()
             || self.libp2p_scope.is_some()
             || self.libp2p_identity_seed.is_some()
+            || self.libp2p_provider
+            || !self.libp2p_seed_nar.is_empty()
+            || self.libp2p_print_peer_address
     }
 
     /// Build the production [`Libp2pSourceConfig`] this `Config` describes. PURE and
@@ -1181,6 +1261,160 @@ async fn shutdown_after_setup_error(node: IrohNode, error: String) -> String {
     format!("{error}; cleanup={cleanup}")
 }
 
+/// Held for the process lifetime by `main`: keeps the libp2p PROVIDER fabric AND its
+/// installed serve gate alive. Dropping the [`ServeHandle`] stops admitting new serves
+/// (peer_fabric's teardown contract), and dropping the fabric stops its swarm worker - so
+/// both MUST outlive the HTTP server. The libp2p NarSource layer holds its own
+/// `Arc<Libp2pFabric>` clone, but the serve gate lives ONLY here, so this guard is what
+/// keeps the node SERVING.
+struct Libp2pProviderGuard {
+    _fabric: Arc<Libp2pFabric>,
+    _serve: ServeHandle,
+}
+
+/// Node B (libp2p PROVIDER, TASK-178): start the libp2p fabric WITH a supplier serving
+/// the `--libp2p-seed-nar` NARs, install the serve gate under the daemon's serve budget,
+/// and announce a signed [`ProviderRecord`] for each seed so a consumer discovers it via
+/// kad. Returns the fabric's OWN consumer source/raw-serve (a provider also consumes -
+/// ONE fabric/identity/listen does both) plus the [`Libp2pProviderGuard`] `main` holds.
+///
+/// Fail-fast: an unreadable seed file, a seed over the per-NAR budget, or a serve/announce
+/// error is a loud startup error, never a provider that announces then cannot deliver.
+async fn install_libp2p_provider(
+    config: &Config,
+    cfg: Libp2pSourceConfig,
+) -> Result<
+    (
+        Arc<dyn NarSource>,
+        Arc<dyn RawServeDecision>,
+        Libp2pProviderGuard,
+    ),
+    String,
+> {
+    // Read every seeded raw NAR up front: a NAR we cannot read is a configuration error,
+    // not a provider that quietly announces nothing and dial-then-fails at serve time.
+    let mut seeds: Vec<(NarHashKey, Vec<u8>)> = Vec::with_capacity(config.libp2p_seed_nar.len());
+    for (nar_hash, path) in &config.libp2p_seed_nar {
+        let bytes =
+            std::fs::read(path).map_err(|e| format!("reading --libp2p-seed-nar {path:?}: {e}"))?;
+        seeds.push((*nar_hash, bytes));
+    }
+
+    // The serve budget REUSES the daemon's existing serve-budget knobs (the `--iroh-max-*`
+    // flags), which are backend-neutral `ServeBudget` numbers in UNCOMPRESSED NAR bytes -
+    // NOT a new unbounded serving path. Backend-specific `--libp2p-max-*` knobs are a
+    // follow-up once TASK-161 pins the operating numbers. The two guards below are the
+    // SAME "healthy but does nothing" footguns the iroh provider path rejects: an inflight
+    // bound below the per-NAR bound declines every serve as busy, and announcing a NAR
+    // larger than the per-NAR bound publishes a claim this node would then decline.
+    // NOTE: the daemon's own `ServeBudget` (transport_iroh) and `peer_fabric::ServeBudget`
+    // are DISTINCT types with the same fields; the libp2p `NarServer::serve` wants the
+    // peer_fabric one, so build that explicitly.
+    let serve_budget = peer_fabric::ServeBudget {
+        max_nar_bytes_uncompressed_nar: config.iroh_max_serve_nar_bytes,
+        max_inflight_bytes_uncompressed_nar: config.iroh_max_inflight_nar_bytes,
+        max_serve_duration: std::time::Duration::from_millis(config.iroh_max_serve_duration_ms),
+    };
+    if serve_budget.max_inflight_bytes_uncompressed_nar
+        < serve_budget.max_nar_bytes_uncompressed_nar
+    {
+        return Err(format!(
+            "--iroh-max-inflight-nar-bytes {} is below --iroh-max-serve-nar-bytes {}: every \
+             libp2p serve at the per-NAR bound would be declined as busy",
+            serve_budget.max_inflight_bytes_uncompressed_nar,
+            serve_budget.max_nar_bytes_uncompressed_nar
+        ));
+    }
+    for (nar_hash, bytes) in &seeds {
+        if bytes.len() as u64 > serve_budget.max_nar_bytes_uncompressed_nar {
+            return Err(format!(
+                "seeded NAR {nar_hash} is {} B (uncompressed NAR) but --iroh-max-serve-nar-bytes \
+                 is {}: announcing it would publish a claim this node would then decline to serve",
+                bytes.len(),
+                serve_budget.max_nar_bytes_uncompressed_nar
+            ));
+        }
+    }
+
+    let identity_seed = cfg.identity_seed;
+    let supplier = Arc::new(MemoryNarSupplier::new(seeds.iter().map(|(_, b)| b.clone())));
+
+    // Start the fabric WITH the supplier (serve axis present) + join the DHT, and get its
+    // consumer source/raw-serve from the SAME fabric (one identity, one listen).
+    let (fabric, source, raw_serve) = build_libp2p_provider_source(cfg, supplier).await?;
+
+    // Install the serve gate (bounded by the serve budget). The returned ServeHandle MUST
+    // live for the process; it goes in the guard `main` holds.
+    let serve = fabric
+        .server()
+        .ok_or_else(|| {
+            "internal: libp2p provider fabric has no serve axis (start_with_supplier)".to_string()
+        })?
+        .serve(serve_budget)
+        .await
+        .map_err(|e| format!("libp2p serve gate failed to install: {e}"))?;
+
+    // Announce a signed ProviderRecord for each seed so a consumer's kad get_providers
+    // finds this node under the ContentKey it derives from the narinfo's NarHash.
+    let announce_budget = AnnounceBudget::new(std::time::Duration::from_secs(10), 20);
+    let announcer = fabric
+        .announcer()
+        .ok_or_else(|| "internal: libp2p provider fabric exposes no announcer".to_string())?;
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    for (nar_hash, bytes) in &seeds {
+        let record = sign_libp2p_provider_record(identity_seed, nar_hash, bytes, 3600, now);
+        announcer
+            .announce(&record, &announce_budget)
+            .await
+            .map_err(|e| format!("announcing libp2p provider record for {nar_hash}: {e}"))?;
+        // Machine-readable: path/NarHash -> the derived ContentKey + raw BLAKE3 content id.
+        println!(
+            "LIBP2P-SEED narhash={nar_hash} content={} content_key={} bytes={}",
+            record.content.to_hex(),
+            record.key,
+            bytes.len()
+        );
+    }
+    println!(
+        "LIBP2P-SERVE-BUDGET max_nar_bytes_uncompressed_nar={} max_inflight_bytes_uncompressed_nar={} max_serve_duration_ms={}",
+        serve_budget.max_nar_bytes_uncompressed_nar,
+        serve_budget.max_inflight_bytes_uncompressed_nar,
+        config.iroh_max_serve_duration_ms
+    );
+
+    // The harness reads this to wire another daemon's `--libp2p-bootstrap <PeerId>@<addr>`.
+    if config.libp2p_print_peer_address {
+        let listen_addrs = fabric.handle().listen_addrs().await;
+        if listen_addrs.is_empty() {
+            return Err(
+                "--libp2p-print-peer-address requested but the provider bound no listen address"
+                    .into(),
+            );
+        }
+        let addrs_csv = listen_addrs
+            .iter()
+            .map(|a| a.to_string())
+            .collect::<Vec<_>>()
+            .join(",");
+        println!(
+            "LIBP2P-PROVIDER-ADDR peer_id={} listen={addrs_csv}",
+            fabric.peer_id()
+        );
+    }
+
+    Ok((
+        source,
+        raw_serve,
+        Libp2pProviderGuard {
+            _fabric: fabric,
+            _serve: serve,
+        },
+    ))
+}
+
 /// Node A: assemble the p2p `NarSource` (iroh transport wired to the configured
 /// peers + an in-memory discovery seeded from the configured claims) IN FRONT of
 /// the HTTP upstream, plus the matching raw-serve allowlist. Both are built from
@@ -1189,7 +1423,14 @@ async fn setup_p2p_source(
     config: &Config,
     upstream: Arc<UpstreamHttp>,
     transport: Option<IrohTransport>,
-) -> Result<(Arc<dyn NarSource>, Arc<dyn RawServeDecision>), String> {
+) -> Result<
+    (
+        Arc<dyn NarSource>,
+        Arc<dyn RawServeDecision>,
+        Option<Libp2pProviderGuard>,
+    ),
+    String,
+> {
     let iroh_configured = !config.iroh_peers.is_empty() || !config.p2p_claims.is_empty();
 
     // Build each p2p LAYER as an optional source; the pure `compose_nar_chain` helper
@@ -1256,20 +1497,40 @@ async fn setup_p2p_source(
     // decision that probes kad provider discovery, paired with the fetch source so the
     // two consult one mechanism (TASK-164).
     let mut libp2p_raw_serve: Option<Arc<dyn RawServeDecision>> = None;
+    // The PROVIDER guard (serve gate + fabric) when `--libp2p-provider` is set. `main`
+    // keeps it alive for the process; here it rides out via the return value.
+    let mut libp2p_provider_guard: Option<Libp2pProviderGuard> = None;
     let libp2p_layer: Option<Arc<dyn NarSource>> = if config.libp2p_requested() {
-        // Build + START the libp2p fabric (listen/bootstrap/dial) and wrap it in the
-        // Libp2pNarSource. The returned fabric handle is dropped here: the source holds
-        // its own Arc clone, keeping the node alive for the process lifetime. The raw-serve
-        // decision is captured so a libp2p HIT rewrites its narinfo to raw (see below).
-        let (_fabric, libp2p_source, raw_serve) =
-            build_libp2p_nar_source(config.libp2p_source_config()?).await?;
-        libp2p_raw_serve = Some(raw_serve);
-        println!(
-            "daemon: libp2p p2p source started, discovery converging ({} bootstrap peer(s), {} optional provider dial-addr override hint(s); dial addresses resolved via kad peer-routing)",
-            config.libp2p_bootstrap.len(),
-            config.libp2p_provider_addrs.len()
-        );
-        Some(libp2p_source)
+        if config.libp2p_provider {
+            // Node B (SERVING, TASK-178): ONE fabric that SERVES + ANNOUNCES the seeded
+            // NARs AND consumes (build_libp2p_provider_source returns the same fabric's
+            // consumer source). The serve gate + fabric live in the guard `main` holds.
+            let (libp2p_source, raw_serve, guard) =
+                install_libp2p_provider(config, config.libp2p_source_config()?).await?;
+            libp2p_raw_serve = Some(raw_serve);
+            libp2p_provider_guard = Some(guard);
+            println!(
+                "daemon: libp2p PROVIDER started, serving + announcing {} seeded NAR(s) ({} bootstrap peer(s))",
+                config.libp2p_seed_nar.len(),
+                config.libp2p_bootstrap.len()
+            );
+            Some(libp2p_source)
+        } else {
+            // Node A (CONSUMER): build + START the libp2p fabric (listen/bootstrap/dial)
+            // and wrap it in the Libp2pNarSource. The returned fabric handle is dropped
+            // here: the source holds its own Arc clone, keeping the node alive for the
+            // process lifetime. The raw-serve decision is captured so a libp2p HIT
+            // rewrites its narinfo to raw (see below).
+            let (_fabric, libp2p_source, raw_serve) =
+                build_libp2p_nar_source(config.libp2p_source_config()?).await?;
+            libp2p_raw_serve = Some(raw_serve);
+            println!(
+                "daemon: libp2p p2p source started, discovery converging ({} bootstrap peer(s), {} optional provider dial-addr override hint(s); dial addresses resolved via kad peer-routing)",
+                config.libp2p_bootstrap.len(),
+                config.libp2p_provider_addrs.len()
+            );
+            Some(libp2p_source)
+        }
     } else {
         None
     };
@@ -1295,7 +1556,7 @@ async fn setup_p2p_source(
         None => iroh_allowlist,
     };
 
-    Ok((chain, raw_serve))
+    Ok((chain, raw_serve, libp2p_provider_guard))
 }
 
 /// Nest the optional p2p layers in front of `upstream` in the documented PRECEDENCE
@@ -1544,32 +1805,37 @@ async fn main() -> ExitCode {
     // AND gets the task-49 raw narinfo rewrite. Absent any peer/claim config the
     // node stays a pure HTTP substituter (the wave-1 S2 path, NoRawServe).
     let iroh_p2p = !config.iroh_peers.is_empty() || !config.p2p_claims.is_empty();
-    let (nar, raw_serve): (Arc<dyn NarSource>, Arc<dyn RawServeDecision>) =
-        if !iroh_p2p && !config.libp2p_requested() {
-            (upstream.clone(), Arc::new(NoRawServe))
-        } else {
-            // The Iroh transport is only needed for the iroh p2p layer; a libp2p-only
-            // node runs with no Iroh node runtime (None here).
-            let transport = if iroh_p2p {
-                match &iroh_node {
-                    Some(node) => Some(node.transport_handle()),
-                    None => {
-                        eprintln!("daemon: iroh p2p source requested without an Iroh node runtime");
-                        return ExitCode::FAILURE;
-                    }
-                }
-            } else {
-                None
-            };
-            match setup_p2p_source(&config, upstream.clone(), transport).await {
-                Ok(pair) => pair,
-                Err(err) => {
-                    eprintln!("daemon: p2p source setup failed: {err}");
-                    shutdown_iroh_node(iroh_node).await;
+    // `_libp2p_provider` keeps the libp2p PROVIDER's serve gate + fabric alive for the
+    // process (TASK-178); dropping it would stop serving. `None` for a non-provider node.
+    let (nar, raw_serve, _libp2p_provider): (
+        Arc<dyn NarSource>,
+        Arc<dyn RawServeDecision>,
+        Option<Libp2pProviderGuard>,
+    ) = if !iroh_p2p && !config.libp2p_requested() {
+        (upstream.clone(), Arc::new(NoRawServe), None)
+    } else {
+        // The Iroh transport is only needed for the iroh p2p layer; a libp2p-only
+        // node runs with no Iroh node runtime (None here).
+        let transport = if iroh_p2p {
+            match &iroh_node {
+                Some(node) => Some(node.transport_handle()),
+                None => {
+                    eprintln!("daemon: iroh p2p source requested without an Iroh node runtime");
                     return ExitCode::FAILURE;
                 }
             }
+        } else {
+            None
         };
+        match setup_p2p_source(&config, upstream.clone(), transport).await {
+            Ok(triple) => triple,
+            Err(err) => {
+                eprintln!("daemon: p2p source setup failed: {err}");
+                shutdown_iroh_node(iroh_node).await;
+                return ExitCode::FAILURE;
+            }
+        }
+    };
 
     let app = Arc::new(App {
         narinfo,
@@ -1844,6 +2110,88 @@ mod tests {
         ])
         .unwrap_err();
         assert!(err.contains("libp2p-bootstrap"), "got {err}");
+    }
+
+    #[test]
+    fn parse_libp2p_seed_nar_splits_narhash_and_path() {
+        // A canonical Nix NarHash (sha256:<nix-base32>) + a file path.
+        let nar_hash = NarHashKey::from_sha256_bytes([0x33u8; 32]);
+        let raw = format!("{nar_hash}=/srv/seed/a.nar");
+        let (key, path) = parse_libp2p_seed_nar(&raw).unwrap();
+        assert_eq!(key, nar_hash);
+        assert_eq!(path, "/srv/seed/a.nar");
+        // A path can legitimately contain '=' (only the FIRST '=' splits).
+        let raw2 = format!("{nar_hash}=/srv/a=b.nar");
+        assert_eq!(parse_libp2p_seed_nar(&raw2).unwrap().1, "/srv/a=b.nar");
+        // Missing '=', a bad NarHash, and an empty path are all rejected (fail fast).
+        assert!(parse_libp2p_seed_nar("no-equals").is_err());
+        assert!(parse_libp2p_seed_nar("not-a-narhash=/x.nar").is_err());
+        assert!(parse_libp2p_seed_nar(&format!("{nar_hash}=")).is_err());
+    }
+
+    #[test]
+    fn parses_libp2p_provider_flags() {
+        let peer = PeerId::random();
+        let nar_hash = NarHashKey::from_sha256_bytes([0x33u8; 32]);
+        let config = Config::from_args(vec![
+            "--libp2p-provider".to_string(),
+            "--libp2p-bootstrap".to_string(),
+            format!("{peer}@/ip4/127.0.0.1/tcp/4001"),
+            "--libp2p-listen".to_string(),
+            "/ip4/0.0.0.0/tcp/0".to_string(),
+            "--libp2p-seed-nar".to_string(),
+            format!("{nar_hash}=/srv/seed/a.nar"),
+            "--libp2p-print-peer-address".to_string(),
+        ])
+        .unwrap();
+        assert!(config.libp2p_provider);
+        assert!(config.libp2p_requested());
+        assert!(config.libp2p_print_peer_address);
+        assert_eq!(config.libp2p_seed_nar.len(), 1);
+        assert_eq!(config.libp2p_seed_nar[0].0, nar_hash);
+        assert_eq!(config.libp2p_seed_nar[0].1, "/srv/seed/a.nar");
+    }
+
+    #[test]
+    fn libp2p_provider_companions_require_the_mode_switch() {
+        // --libp2p-seed-nar without --libp2p-provider is inert -> rejected.
+        let nar_hash = NarHashKey::from_sha256_bytes([0x33u8; 32]);
+        let peer = PeerId::random();
+        let err = Config::from_args(vec![
+            "--libp2p-bootstrap".to_string(),
+            format!("{peer}@/ip4/127.0.0.1/tcp/4001"),
+            "--libp2p-seed-nar".to_string(),
+            format!("{nar_hash}=/srv/seed/a.nar"),
+        ])
+        .unwrap_err();
+        assert!(err.contains("--libp2p-provider"), "got {err}");
+    }
+
+    #[test]
+    fn libp2p_provider_requires_a_seed_and_a_listener() {
+        let peer = PeerId::random();
+        // Provider with no seed: a no-op provider.
+        let err = Config::from_args(vec![
+            "--libp2p-provider".to_string(),
+            "--libp2p-bootstrap".to_string(),
+            format!("{peer}@/ip4/127.0.0.1/tcp/4001"),
+            "--libp2p-listen".to_string(),
+            "/ip4/0.0.0.0/tcp/0".to_string(),
+        ])
+        .unwrap_err();
+        assert!(err.contains("--libp2p-seed-nar"), "got {err}");
+
+        // Provider with a seed but no listener: cannot be dialed.
+        let nar_hash = NarHashKey::from_sha256_bytes([0x33u8; 32]);
+        let err = Config::from_args(vec![
+            "--libp2p-provider".to_string(),
+            "--libp2p-bootstrap".to_string(),
+            format!("{peer}@/ip4/127.0.0.1/tcp/4001"),
+            "--libp2p-seed-nar".to_string(),
+            format!("{nar_hash}=/srv/seed/a.nar"),
+        ])
+        .unwrap_err();
+        assert!(err.contains("--libp2p-listen"), "got {err}");
     }
 
     #[test]

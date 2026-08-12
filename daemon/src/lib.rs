@@ -118,6 +118,7 @@ pub use source::{
 };
 pub use source_libp2p::{
     Libp2pNarSource, Libp2pRawServe, Libp2pSourceConfig, build_libp2p_nar_source,
+    build_libp2p_provider_source, sign_libp2p_provider_record,
 };
 pub use supply_catalog::SupplyCatalogHandle;
 pub use transport::{BitTorrentInfoHash, IROH_BLOBS_ALPN, NODE_ID_LEN, NodeId, NodeIdParseError};
