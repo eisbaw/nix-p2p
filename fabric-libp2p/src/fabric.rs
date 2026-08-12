@@ -1,7 +1,8 @@
-//! [`Libp2pFabric`] - the concrete [`PeerFabric`] for the libp2p backend. This cycle
-//! it exposes the content-discovery axes (directory + announcer); the transport /
-//! locator / serve / hold-query / LAN axes are `None` until TASK-151 wires the libp2p
-//! NAR transfer + node discovery over the SAME swarm.
+//! [`Libp2pFabric`] - the concrete [`PeerFabric`] for the libp2p backend. It exposes
+//! the content-discovery axes (directory + announcer) AND, from TASK-151, the transport
+//! (always) and the serve axis (when built with a supplier), all over the SAME swarm.
+//! The node-locator / hold-query / LAN axes remain `None` (NAT traversal + node
+//! discovery is TASK-159; hold-query is unimplemented).
 
 use std::sync::Arc;
 
@@ -13,7 +14,10 @@ use peer_fabric::{
 
 use crate::announcer::Libp2pAvailabilityAnnouncer;
 use crate::directory::Libp2pProviderDirectory;
+use crate::nar::Libp2pNarSupplier;
+use crate::server::Libp2pServer;
 use crate::swarm::{Node, NodeConfig, NodeError, SwarmHandle};
+use crate::transport::Libp2pTransport;
 
 /// The libp2p [`PeerFabric`]. Holds the running [`Node`] (its worker stays alive as
 /// long as the fabric does) and the kad-backed capabilities.
@@ -25,12 +29,31 @@ pub struct Libp2pFabric {
     directory: Arc<dyn ProviderDirectory>,
     announcer: Arc<dyn AvailabilityAnnouncer>,
     transfers: TransferRegistry,
+    server: Option<Arc<dyn NarServer>>,
     _node: Node,
 }
 
 impl Libp2pFabric {
-    /// Start a libp2p node for `config` and assemble its content-discovery fabric.
+    /// Start a libp2p node for `config` with discovery + the fetch transport, but NOT
+    /// serving (no supplier). A pure CONSUMER fabric: `server()` is `None`.
     pub fn start(config: NodeConfig) -> Result<Libp2pFabric, NodeError> {
+        Self::assemble(config, None)
+    }
+
+    /// Start a libp2p node that ALSO serves NARs from `supplier` (a substrate-internal
+    /// supply seam; the daemon's real catalog-backed supplier is TASK-146). `server()`
+    /// is `Some`.
+    pub fn start_with_supplier(
+        config: NodeConfig,
+        supplier: Arc<dyn Libp2pNarSupplier>,
+    ) -> Result<Libp2pFabric, NodeError> {
+        Self::assemble(config, Some(supplier))
+    }
+
+    fn assemble(
+        config: NodeConfig,
+        supplier: Option<Arc<dyn Libp2pNarSupplier>>,
+    ) -> Result<Libp2pFabric, NodeError> {
         let node = Node::start(config)?;
         let ledger = Arc::new(ExposureLedger::new());
 
@@ -45,6 +68,15 @@ impl Libp2pFabric {
             node.peer_id,
         ));
 
+        // The fetch transport is always available (a consumer needs it); it registers
+        // under the NodeId-locator tag (see transport.rs ADR).
+        let mut transfers = TransferRegistry::new();
+        transfers.register(Arc::new(Libp2pTransport::new(node.handle.clone())));
+
+        // The serve axis exists only when a supplier was provided (a serving node).
+        let server: Option<Arc<dyn NarServer>> = supplier
+            .map(|supplier| Arc::new(Libp2pServer::new(node.handle.clone(), supplier)) as _);
+
         Ok(Libp2pFabric {
             node_id: node.node_id,
             peer_id: node.peer_id,
@@ -52,7 +84,8 @@ impl Libp2pFabric {
             ledger,
             directory,
             announcer,
-            transfers: TransferRegistry::new(),
+            transfers,
+            server,
             _node: node,
         })
     }
@@ -85,19 +118,21 @@ impl PeerFabric for Libp2pFabric {
     }
 
     fn node_locator(&self) -> Option<&Arc<dyn NodeLocator>> {
-        // TASK-151: libp2p node discovery / NAT traversal (Identify + AutoNAT/DCUtR +
-        // kad peer-routing) yields the NodeLocator.
+        // TASK-159: libp2p node discovery / NAT traversal (Identify + AutoNAT/DCUtR +
+        // kad peer-routing) yields the NodeLocator. kad peer-routing already carries
+        // addresses for a basic dial; the gate-able NodeLocator axis is not wired yet.
         None
     }
 
     fn transfer(&self, tag: TransportTag) -> Option<&dyn NarTransfer> {
-        // TASK-151: the libp2p NarTransfer (request-response / stream, BLAKE3-verified)
-        // registers here. Empty registry today -> None for every tag.
+        // The libp2p NarTransfer (request-response, BLAKE3-verified) is registered under
+        // the NodeId-locator tag (TransportTag::Iroh; see transport.rs ADR).
         self.transfers.get(tag)
     }
 
     fn server(&self) -> Option<&Arc<dyn NarServer>> {
-        None // TASK-151
+        // `Some` iff this fabric was built with a supplier (start_with_supplier).
+        self.server.as_ref()
     }
 
     fn hold_query(&self) -> Option<&Arc<dyn PeerHoldQuery>> {

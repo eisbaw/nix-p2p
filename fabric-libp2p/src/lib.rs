@@ -98,13 +98,21 @@ mod announcer;
 mod directory;
 mod fabric;
 mod keys;
+mod nar;
+mod server;
 mod swarm;
+mod transport;
 
 pub use announcer::Libp2pAvailabilityAnnouncer;
 pub use directory::Libp2pProviderDirectory;
 pub use fabric::Libp2pFabric;
 pub use keys::VALUE_KEY_CONTEXT;
+pub use nar::{
+    Libp2pNarSupplier, MemoryNarSupplier, NarCodec, NarSupplyPlan, ServeCounters, ServeGate,
+};
+pub use server::Libp2pServer;
 pub use swarm::{Node, NodeConfig, NodeError, SwarmHandle};
+pub use transport::Libp2pTransport;
 
 // Re-export libp2p's address/peer types the composition root and tests need to drive
 // connectivity, so a consumer does not depend on libp2p directly for the seam-level

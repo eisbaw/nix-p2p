@@ -5,16 +5,19 @@
 //! of the swarm's single-threaded ownership.
 
 use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use futures::StreamExt;
 use libp2p::kad::store::MemoryStore;
+use libp2p::request_response::{self, OutboundRequestId};
 use libp2p::swarm::SwarmEvent;
 use libp2p::{Multiaddr, PeerId, StreamProtocol, Swarm, identify, kad, noise, tcp, yamux};
 use tokio::sync::{mpsc, oneshot};
 
 use crate::keys::{keypair_from_seed, node_id_of};
-use peer_fabric::NodeId;
+use crate::nar::{NarCodec, NarRequest, NarResponse, ServeGate};
+use peer_fabric::{Blake3Digest, NodeId};
 
 /// Why a kad query did not return a healthy answer. Mapped to
 /// [`peer_fabric::Unavailable`] by the directory.
@@ -26,12 +29,14 @@ pub enum QueryFail {
     Backend(String),
 }
 
-/// The combined behaviour: Kademlia (the DHT that does the work) plus Identify (so
-/// peers learn each other's listen addresses and feed them into kad routing).
+/// The combined behaviour: Kademlia (the DHT content discovery) plus Identify (so peers
+/// learn each other's listen addresses and feed them into kad routing) plus the NAR
+/// request-response protocol (TASK-151: the byte-transfer half, over the SAME swarm).
 #[derive(libp2p::swarm::NetworkBehaviour)]
 pub struct Behaviour {
     pub kad: kad::Behaviour<MemoryStore>,
     pub identify: identify::Behaviour,
+    pub nar: request_response::Behaviour<NarCodec>,
 }
 
 /// A command sent to the swarm worker. Each carries a oneshot the worker replies on
@@ -81,6 +86,22 @@ pub enum Command {
         key: kad::RecordKey,
         reply: oneshot::Sender<Result<Option<Vec<u8>>, QueryFail>>,
     },
+    /// Fetch a NAR by digest from `peer` over the request-response protocol. The reply
+    /// carries the peer's [`NarResponse`], or a transport-level failure string.
+    FetchNar {
+        peer: PeerId,
+        content: Blake3Digest,
+        reply: oneshot::Sender<Result<NarResponse, String>>,
+    },
+    /// Install (or replace) the serve gate: from now on inbound NAR requests are
+    /// admitted and answered through it. Sent by [`crate::server::Libp2pServer::serve`].
+    InstallServe {
+        gate: Arc<ServeGate>,
+    },
+    /// Remove the serve gate: inbound NAR requests are answered `NotHeld`. Sent
+    /// best-effort by the serve teardown guard (the synchronous stop is the gate's own
+    /// `active` flag; this just lets the worker drop its `Arc`).
+    UninstallServe,
 }
 
 /// A cloneable handle to the worker. Every capability holds one of these; a dropped
@@ -187,6 +208,42 @@ impl SwarmHandle {
         rx.await
             .unwrap_or_else(|_| Err(QueryFail::Backend("worker gone".into())))
     }
+
+    /// Request `content` from `peer` over the NAR request-response protocol, resolving
+    /// with the peer's [`NarResponse`] (or a transport-level failure string). The swarm
+    /// auto-dials `peer` if an address for it is known (fed in via `add_address` /
+    /// identify). Time-bounding and BLAKE3 verification are the transport's job.
+    pub async fn fetch_nar(
+        &self,
+        peer: PeerId,
+        content: Blake3Digest,
+    ) -> Result<NarResponse, String> {
+        let (reply, rx) = oneshot::channel();
+        self.send(Command::FetchNar {
+            peer,
+            content,
+            reply,
+        })
+        .await;
+        rx.await.unwrap_or_else(|_| Err("worker gone".into()))
+    }
+
+    /// Install (or replace) the serve gate on the worker; inbound NAR requests are then
+    /// admitted and answered through it.
+    pub async fn install_serve(&self, gate: Arc<ServeGate>) {
+        self.send(Command::InstallServe { gate }).await;
+    }
+
+    /// Best-effort, non-blocking uninstall of the serve gate, callable from a `Drop`
+    /// (which cannot await). The AUTHORITATIVE stop-admitting signal is the gate's own
+    /// `active` flag (flipped synchronously by the teardown guard); this command only
+    /// lets the worker drop its `Arc<ServeGate>`, so a full channel or a gone worker is
+    /// harmless.
+    pub fn uninstall_serve_nonblocking(&self) {
+        if self.tx.try_send(Command::UninstallServe).is_err() {
+            tracing::debug!("fabric-libp2p: serve uninstall not delivered (worker busy or gone)");
+        }
+    }
 }
 
 /// A query awaiting its terminal kad event.
@@ -208,6 +265,11 @@ struct Worker {
     swarm: Swarm<Behaviour>,
     commands: mpsc::Receiver<Command>,
     pending: HashMap<kad::QueryId, Pending>,
+    /// Outbound NAR fetches awaiting their response, keyed by request-response id.
+    nar_pending: HashMap<OutboundRequestId, oneshot::Sender<Result<NarResponse, String>>>,
+    /// The installed serve gate, or `None` when this node is not serving (inbound NAR
+    /// requests are then answered `NotHeld`). Set by `InstallServe`.
+    serve: Option<Arc<ServeGate>>,
 }
 
 impl Worker {
@@ -227,7 +289,9 @@ impl Worker {
     }
 
     fn on_command(&mut self, command: Command) {
-        let kad = &mut self.swarm.behaviour_mut().kad;
+        // `kad` is reborrowed per-arm (not bound once at the top) so the arms that drive
+        // OTHER behaviours (the NAR request-response) or plain swarm ops do not conflict
+        // with a long-lived `&mut kad` borrow of the swarm.
         match command {
             Command::Listen { addr, reply } => {
                 let result = self
@@ -248,13 +312,13 @@ impl Worker {
                 let _ = reply.send(self.swarm.listeners().cloned().collect());
             }
             Command::AddAddress { peer, addr } => {
-                kad.add_address(&peer, addr);
+                self.swarm.behaviour_mut().kad.add_address(&peer, addr);
             }
             Command::Dial { addr, reply } => {
                 let result = self.swarm.dial(addr).map_err(|e| e.to_string());
                 let _ = reply.send(result);
             }
-            Command::Bootstrap { reply } => match kad.bootstrap() {
+            Command::Bootstrap { reply } => match self.swarm.behaviour_mut().kad.bootstrap() {
                 Ok(id) => {
                     self.pending.insert(id, Pending::Bootstrap(reply));
                 }
@@ -263,19 +327,27 @@ impl Worker {
                 }
             },
             Command::RoutingPeers { reply } => {
-                let count: usize = kad.kbuckets().map(|bucket| bucket.num_entries()).sum();
+                let count: usize = self
+                    .swarm
+                    .behaviour_mut()
+                    .kad
+                    .kbuckets()
+                    .map(|bucket| bucket.num_entries())
+                    .sum();
                 let _ = reply.send(count);
             }
-            Command::StartProviding { key, reply } => match kad.start_providing(key) {
-                Ok(id) => {
-                    self.pending.insert(id, Pending::Simple(reply));
+            Command::StartProviding { key, reply } => {
+                match self.swarm.behaviour_mut().kad.start_providing(key) {
+                    Ok(id) => {
+                        self.pending.insert(id, Pending::Simple(reply));
+                    }
+                    Err(e) => {
+                        let _ = reply.send(Err(e.to_string()));
+                    }
                 }
-                Err(e) => {
-                    let _ = reply.send(Err(e.to_string()));
-                }
-            },
+            }
             Command::StopProviding { key } => {
-                kad.stop_providing(&key);
+                self.swarm.behaviour_mut().kad.stop_providing(&key);
             }
             Command::PutRecord {
                 key,
@@ -287,7 +359,12 @@ impl Worker {
                 // Reconcile the record's own expiry with the store TTL (AC#6): setting
                 // `expires` makes the store hold it no longer than the provider signed.
                 record.expires = expires;
-                match kad.put_record(record, kad::Quorum::One) {
+                match self
+                    .swarm
+                    .behaviour_mut()
+                    .kad
+                    .put_record(record, kad::Quorum::One)
+                {
                     Ok(id) => {
                         self.pending.insert(id, Pending::Simple(reply));
                     }
@@ -297,7 +374,7 @@ impl Worker {
                 }
             }
             Command::GetProviders { key, reply } => {
-                let id = kad.get_providers(key);
+                let id = self.swarm.behaviour_mut().kad.get_providers(key);
                 self.pending.insert(
                     id,
                     Pending::GetProviders {
@@ -307,8 +384,28 @@ impl Worker {
                 );
             }
             Command::GetRecord { key, reply } => {
-                let id = kad.get_record(key);
+                let id = self.swarm.behaviour_mut().kad.get_record(key);
                 self.pending.insert(id, Pending::GetRecord { reply });
+            }
+            Command::FetchNar {
+                peer,
+                content,
+                reply,
+            } => {
+                let id = self
+                    .swarm
+                    .behaviour_mut()
+                    .nar
+                    .send_request(&peer, NarRequest(content));
+                self.nar_pending.insert(id, reply);
+            }
+            Command::InstallServe { gate } => {
+                tracing::debug!("fabric-libp2p: NAR serve gate installed");
+                self.serve = Some(gate);
+            }
+            Command::UninstallServe => {
+                tracing::debug!("fabric-libp2p: NAR serve gate uninstalled");
+                self.serve = None;
             }
         }
     }
@@ -336,7 +433,63 @@ impl Worker {
                 step,
                 ..
             })) => self.on_query(id, result, step.last),
+            SwarmEvent::Behaviour(BehaviourEvent::Nar(event)) => self.on_nar_event(event),
             _ => {}
+        }
+    }
+
+    /// Handle a NAR request-response event: serve an inbound request through the
+    /// installed [`ServeGate`], or route an outbound response/failure back to the
+    /// waiting `fetch_nar` caller.
+    fn on_nar_event(&mut self, event: request_response::Event<NarRequest, NarResponse>) {
+        use request_response::{Event, Message};
+        match event {
+            Event::Message {
+                message:
+                    Message::Request {
+                        request, channel, ..
+                    },
+                ..
+            } => {
+                // Compute the response first (this drops the `&self.serve` borrow) so the
+                // subsequent `&mut swarm` borrow to send it does not conflict.
+                let response = match &self.serve {
+                    Some(gate) => gate.respond(&request.0),
+                    None => NarResponse::NotHeld,
+                };
+                if self
+                    .swarm
+                    .behaviour_mut()
+                    .nar
+                    .send_response(channel, response)
+                    .is_err()
+                {
+                    tracing::debug!("fabric-libp2p: NAR response channel closed before send");
+                }
+            }
+            Event::Message {
+                message:
+                    Message::Response {
+                        request_id,
+                        response,
+                    },
+                ..
+            } => {
+                if let Some(reply) = self.nar_pending.remove(&request_id) {
+                    let _ = reply.send(Ok(response));
+                }
+            }
+            Event::OutboundFailure {
+                request_id, error, ..
+            } => {
+                if let Some(reply) = self.nar_pending.remove(&request_id) {
+                    let _ = reply.send(Err(error.to_string()));
+                }
+            }
+            Event::InboundFailure { error, .. } => {
+                tracing::debug!(%error, "fabric-libp2p: NAR inbound request failed");
+            }
+            Event::ResponseSent { .. } => {}
         }
     }
 
@@ -488,6 +641,8 @@ impl Node {
         let kad_protocol = StreamProtocol::try_from_owned(format!("/nix-p2p/{scope}/kad/1.0.0"))
             .map_err(|e| NodeError::Build(format!("invalid kad protocol name: {e:?}")))?;
         let id_protocol = format!("/nix-p2p/{scope}/id/1.0.0");
+        let nar_protocol = StreamProtocol::try_from_owned(format!("/nix-p2p/{scope}/nar/1"))
+            .map_err(|e| NodeError::Build(format!("invalid nar protocol name: {e:?}")))?;
 
         let swarm = libp2p::SwarmBuilder::with_existing_identity(keypair)
             .with_tokio()
@@ -511,7 +666,14 @@ impl Node {
                     kad.set_mode(Some(kad::Mode::Server));
                     let identify =
                         identify::Behaviour::new(identify::Config::new(id_protocol, key.public()));
-                    Ok(Behaviour { kad, identify })
+                    // The NAR byte-transfer protocol shares this swarm (TASK-151). Both
+                    // ends support it (Full): a node both fetches and serves.
+                    let nar = request_response::Behaviour::with_codec(
+                        NarCodec,
+                        [(nar_protocol, request_response::ProtocolSupport::Full)],
+                        request_response::Config::default(),
+                    );
+                    Ok(Behaviour { kad, identify, nar })
                 },
             )
             .map_err(|e| NodeError::Build(e.to_string()))?
@@ -523,6 +685,8 @@ impl Node {
             swarm,
             commands: rx,
             pending: HashMap::new(),
+            nar_pending: HashMap::new(),
+            serve: None,
         };
         let join = tokio::spawn(worker.run());
 
