@@ -64,13 +64,17 @@ impl Libp2pProviderDirectory {
     ///     so we map the whole empty-routing case to `InsufficientRouting` - the honest
     ///     "not authoritative for this key" reason, and the one the cornerstone test
     ///     pins. (Where the JOIN itself fails, `SwarmHandle::join_bootstraps` returns a
-    ///     bootstrap-outage error at the connectivity layer, which IS where that signal
-    ///     lives - not here on the read path.)
+    ///     join error at the connectivity layer - a stringly-typed "every bootstrap dial
+    ///     failed" today, not the typed `BootstrapOutage`; that connectivity boundary is
+    ///     where a bootstrap-outage signal belongs, not here on the read path. Promoting
+    ///     it to the typed `Unavailable::BootstrapOutage` is a connectivity-layer
+    ///     follow-up, not a read-path detection.)
     ///   * A query `Timeout` over a POPULATED table (mapped to `DeadlineExceeded` below)
     ///     is indistinguishable, at this layer, between a genuine partition, transient
     ///     congestion, and a too-tight budget. Emitting `Partition` there would MISLABEL
     ///     a slow-but-healthy network, so we do not. A real partition detector would need
     ///     reachability/connection-liveness signals this directory does not have.
+    ///
     /// This is the AC's sanctioned "not distinguishable here, here is why" outcome.
     ///
     /// A lookup over an empty routing table is not authoritative: a `Miss` would be a

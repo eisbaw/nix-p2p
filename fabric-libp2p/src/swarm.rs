@@ -184,16 +184,23 @@ impl SwarmHandle {
     /// bootstrap after a successful join still leaves the node routable - that is the
     /// bootstrap-independence property (TASK-153; `tests/bootstrap_independence.rs`).
     ///
-    /// This is the standard, reusable "join through all of them" the composition root and
-    /// tests share; it composes the same [`add_address`](Self::add_address) +
-    /// [`dial`](Self::dial) + [`bootstrap`](Self::bootstrap) + poll-`routing_peers` idiom
-    /// the single-bootstrap join used, generalized to a set.
+    /// It composes the same [`add_address`](Self::add_address) + [`dial`](Self::dial) +
+    /// [`bootstrap`](Self::bootstrap) + poll-`routing_peers` idiom the single-bootstrap
+    /// join used, generalized to a set. This is the reusable helper the multi-node tests
+    /// use; the daemon composition root (`daemon/src/source_libp2p.rs`) currently
+    /// hand-rolls a COLD-START variant of the same idiom that returns BEFORE the routing
+    /// table converges (it starts serving immediately and falls back to HTTP until kad
+    /// fills; TASK-163). Unifying the two behind one readiness contract is that task's
+    /// job - until then this helper deliberately WAITS for `min_peers`, which the daemon's
+    /// path intentionally does not.
     ///
-    /// Fail-fast, never a silent stall: an EMPTY set is a caller error (`Err`); a dial
-    /// that fails to INITIATE is logged but not fatal on its own (another bootstrap may
-    /// still admit us - the routing-table poll is the real readiness oracle); and if the
-    /// routing table never reaches `min_peers` within `timeout` that is a real join
-    /// failure returned as `Err` with context.
+    /// Fail-fast, never a silent stall: an EMPTY set is a caller error (`Err`); if EVERY
+    /// dial fails to INITIATE the join is doomed and returns `Err` immediately with the
+    /// aggregated per-dial reasons (rather than spinning the poll for the full `timeout`);
+    /// a PARTIAL dial failure is logged and tolerated (another bootstrap may still admit
+    /// us - the routing-table poll is the real readiness oracle); and if the routing table
+    /// never reaches `min_peers` within `timeout` that is a real join failure returned as
+    /// `Err` with context.
     pub async fn join_bootstraps(
         &self,
         bootstraps: &[(PeerId, Multiaddr)],
@@ -205,20 +212,44 @@ impl SwarmHandle {
         }
 
         // Teach kad every bootstrap address and dial them ALL, so the join does not funnel
-        // through a single entry node.
+        // through a single entry node. A dial only INITIATES the connection; collect the
+        // ones that failed to even initiate so an all-dead set fails fast and loud.
+        let mut dial_errors = Vec::new();
         for (peer, addr) in bootstraps {
             self.add_address(*peer, addr.clone()).await;
             if let Err(why) = self.dial(addr.clone()).await {
-                tracing::warn!(
-                    %peer, %addr, %why,
-                    "fabric-libp2p: a bootstrap dial failed to initiate; continuing with the rest"
-                );
+                dial_errors.push(format!("{peer} @ {addr}: {why}"));
             }
+        }
+        if dial_errors.len() == bootstraps.len() {
+            // Every dial failed to initiate: the join cannot make progress. Fail now with
+            // the real root cause instead of misattributing it to slow convergence after a
+            // full-timeout poll.
+            return Err(format!(
+                "every bootstrap dial failed to initiate ({} peer(s)); cannot join: {}",
+                bootstraps.len(),
+                dial_errors.join("; ")
+            ));
+        }
+        if !dial_errors.is_empty() {
+            tracing::warn!(
+                failed = dial_errors.len(),
+                total = bootstraps.len(),
+                reasons = %dial_errors.join("; "),
+                "fabric-libp2p: some bootstrap dials failed to initiate; continuing on the rest"
+            );
         }
 
         // One bootstrap self-lookup populates the routing table from whichever bootstraps
-        // answered; tolerate its immediate result and rely on the poll below as readiness.
-        let _ = self.bootstrap().await;
+        // answered. The poll below is the authoritative readiness signal, but the
+        // self-lookup error is logged (not swallowed) so a failure stays traceable.
+        if let Err(why) = self.bootstrap().await {
+            tracing::debug!(
+                %why,
+                "fabric-libp2p: kad bootstrap self-lookup returned an error; \
+                 relying on the routing-table poll for readiness"
+            );
+        }
 
         let deadline = Instant::now() + timeout;
         loop {
