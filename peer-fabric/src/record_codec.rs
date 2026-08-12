@@ -52,10 +52,18 @@
 //!     ([`signature_scalar_is_canonical`]) so the policy is pinned independently of the
 //!     dalek version and gets a distinct typed rejection; the golden
 //!     `reject_malleable_signature` vector proves `S+L` is refused.
-//!   * REJECT small-order / torsion public keys `A` and commitments `R`. `verify_strict`
-//!     rejects a small-order `A` and uses cofactorless verification (`[S]B = R + [k]A`);
-//!     a cofactored verifier could disagree on a torsion `R`. A conformant re-implementation
-//!     MUST verify cofactorlessly and reject small-order `A`, matching `verify_strict`.
+//!   * REJECT small-order / torsion public keys `A` AND commitments `R`, using
+//!     COFACTORLESS verification (`[S]B = R + [k]A`, no cofactor multiplication). This is
+//!     NORMATIVE, and it is the exact point where a permissive library verifier diverges
+//!     from `verify_strict`: with `A = R =` the small-order IDENTITY point and `S = 0`,
+//!     the equation `[0]B = R + [k]A` holds as `identity = identity`, so a verifier that
+//!     skips the small-order check ACCEPTS a record "signed" by the identity key WITH NO
+//!     SECRET - a full identity forgery. `verify_strict` rejects it (small-order `A`); a
+//!     conformant second implementation MUST reject small-order `A` and `R` too, or it
+//!     will accept records this codec rejects. The golden `reject_identity_forgery`
+//!     vector pins this, and `scripts/check-content-key-derivation.py` re-checks it with
+//!     a from-scratch ed25519 verifier (NOT a library) so the two agree byte-for-byte on
+//!     which signatures are valid.
 //!
 //! ## Canonical offer list + iroh self-serve identity
 //!
@@ -1268,9 +1276,12 @@ mod tests {
     }
 
     #[test]
+    #[cfg(debug_assertions)]
     fn sign_helpers_reject_a_mismatched_provider_in_debug() {
-        // Finding #2: signing a record built for a DIFFERENT identity is a caller bug.
-        // In debug builds (where these tests run) the guard fires.
+        // The mismatched-provider guard in sign_* is a `debug_assert!` (the provider is
+        // overwritten regardless, so it is a caller-hygiene check, not a security gate).
+        // `debug_assert!` is a no-op under `--release`, so this test is compiled in ONLY
+        // for debug builds - otherwise it fails under `cargo test --release` (round-3 #1).
         let sk = signer();
         let key = a_key();
         let built_for_someone_else = ProviderRecord {
@@ -1493,6 +1504,38 @@ mod tests {
             )
             .is_err(),
             "dalek verify_strict must also reject S+L (it enforces S<L)"
+        );
+    }
+
+    #[test]
+    fn identity_forgery_small_order_key_is_rejected() {
+        // Round-3 #2: a no-secret-key forgery. provider A = the small-order IDENTITY
+        // point (01||00x31), signature R = identity, S = 0. The cofactorless equation
+        // [0]B = R + [k]A holds (identity == identity), so a verifier that SKIPS the
+        // small-order check ACCEPTS a record "signed" by an identity nobody controls.
+        // verify_strict rejects small-order A -> BadSignature. VerifyingKey::from_bytes
+        // accepts the identity encoding (it is a valid point), so this reaches - and is
+        // caught by - the signature check, not BadProviderKey.
+        let key = a_key();
+        let mut identity = [0u8; NODE_ID_LEN];
+        identity[0] = 0x01;
+        let body = provide_body(&ProviderRecord {
+            key,
+            content: Blake3Digest::from_bytes([0xaa; BLAKE3_DIGEST_LEN]),
+            provider: NodeId::from_bytes(identity),
+            offers: vec![],
+            sequence: 1,
+            issued_at: 0,
+            expiry: 1_000,
+            signature: [0u8; PROVIDER_SIGNATURE_LEN],
+        });
+        let mut forged_sig = [0u8; PROVIDER_SIGNATURE_LEN];
+        forged_sig[0] = 0x01; // R = identity, S = 0
+        let mut wire = body;
+        wire.extend_from_slice(&forged_sig);
+        assert_eq!(
+            decode_provider_assertion(&wire, &key, 500),
+            Err(RecordDecodeError::BadSignature)
         );
     }
 }

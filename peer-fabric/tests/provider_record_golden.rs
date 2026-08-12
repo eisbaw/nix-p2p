@@ -28,33 +28,9 @@
 use ed25519_dalek::SigningKey;
 use peer_fabric::{
     Blake3Digest, ContentKey, InfoHash, NodeId, ProviderAssertion, ProviderRecord,
-    ProviderWithdrawal, RecordDecodeError, TransportOffer, decode_provider_assertion,
-    encode_provider_record, encode_provider_withdrawal, sign_provider_record,
-    sign_provider_withdrawal,
+    ProviderWithdrawal, TransportOffer, decode_provider_assertion, encode_provider_record,
+    encode_provider_withdrawal, sign_provider_record, sign_provider_withdrawal,
 };
-
-/// The variant NAME of a decode error, so a golden `reject_reason` string can be
-/// asserted against the ACTUAL typed rejection (finding #5: a reject vector must fail
-/// for the SPECIFIC reason under test, not merely be `is_err()`).
-fn error_tag(e: &RecordDecodeError) -> &'static str {
-    match e {
-        RecordDecodeError::Oversized { .. } => "Oversized",
-        RecordDecodeError::Truncated { .. } => "Truncated",
-        RecordDecodeError::TrailingBytes { .. } => "TrailingBytes",
-        RecordDecodeError::UnknownVersion { .. } => "UnknownVersion",
-        RecordDecodeError::UnknownKind { .. } => "UnknownKind",
-        RecordDecodeError::UnknownOffer { .. } => "UnknownOffer",
-        RecordDecodeError::BadInfoHash { .. } => "BadInfoHash",
-        RecordDecodeError::TooManyOffers { .. } => "TooManyOffers",
-        RecordDecodeError::OffersNotCanonical => "OffersNotCanonical",
-        RecordDecodeError::IrohNodeNotProvider { .. } => "IrohNodeNotProvider",
-        RecordDecodeError::BadProviderKey => "BadProviderKey",
-        RecordDecodeError::NonCanonicalSignature => "NonCanonicalSignature",
-        RecordDecodeError::BadSignature => "BadSignature",
-        RecordDecodeError::WrongKey { .. } => "WrongKey",
-        RecordDecodeError::Stale { .. } => "Stale",
-    }
-}
 
 const GOLDEN: &str = include_str!("golden/provider_record_v1.json");
 
@@ -295,7 +271,7 @@ fn provider_withdrawal_is_byte_for_byte_pinned() {
 // ---- the reject vectors: every must-reject wire is REFUSED --------------------
 
 #[test]
-fn every_reject_vector_is_refused_for_its_named_reason() {
+fn every_reject_vector_is_refused_with_its_exact_typed_error() {
     let mut rejects = 0;
     for v in golden()["vectors"].as_array().expect("array") {
         if v["direction"] != "reject" {
@@ -303,23 +279,23 @@ fn every_reject_vector_is_refused_for_its_named_reason() {
         }
         rejects += 1;
         let name = v["name"].as_str().unwrap();
-        let reason = v["reject_reason"]
+        let expected_debug = v["reject_debug"]
             .as_str()
-            .unwrap_or_else(|| panic!("reject vector `{name}` has no reject_reason"));
+            .unwrap_or_else(|| panic!("reject vector `{name}` has no reject_debug"));
         let bytes = hexd(v["wire_hex"].as_str().unwrap());
         // Each vector is crafted so its ONLY fault is the guard under test (re-signed
-        // after the mutation where needed), so it must fail with EXACTLY that error -
-        // not merely be rejected (e.g. reject_wrong_version stays valid-signature-over
-        // -a-version-2-body, so it can only be caught by the version guard).
+        // after the mutation where needed). Compare the FULL typed error - variant AND
+        // fields (round-3 #3) - so a BadInfoHash{version:4} cannot satisfy a vector that
+        // pins version 3, and the specific rejection reason is truly frozen.
         let err = decode_provider_assertion(&bytes, &key(), 500)
             .expect_err(&format!("golden reject vector `{name}` was ACCEPTED"));
         assert_eq!(
-            error_tag(&err),
-            reason,
-            "reject vector `{name}` failed for the wrong reason: got {err:?}, expected {reason}"
+            format!("{err:?}"),
+            expected_debug,
+            "reject vector `{name}` failed with the wrong typed error"
         );
     }
-    assert!(rejects >= 7, "the must-reject class must not be emptied");
+    assert!(rejects >= 8, "the must-reject class must not be emptied");
 }
 
 // ---- the file and the tests that consume it cannot drift apart ----------------
@@ -336,6 +312,7 @@ const EXERCISED: &[&str] = &[
     "reject_malleable_signature",
     "reject_offers_not_canonical",
     "reject_iroh_node_not_provider",
+    "reject_identity_forgery",
 ];
 
 #[test]
