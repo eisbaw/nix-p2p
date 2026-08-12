@@ -30,6 +30,28 @@ use tokio::time::timeout;
 
 const NAR_LEN: usize = 4096;
 
+/// Safety margin below the upstream header deadline for the fast-fallback bound.
+///
+/// A *fast* fallback - connection refused, a `connection_reset`, or the proxy's
+/// own `unreachable` 502 with no upstream contacted - returns in MILLISECONDS; it
+/// never waits on the daemon's upstream header timeout. So the "failed fast, did
+/// not wait the deadline out" property is asserted as `elapsed <
+/// HARNESS_HEADER_TIMEOUT - FAST_FALLBACK_MARGIN`, i.e. keyed off the real
+/// upstream deadline rather than a tight absolute wall clock:
+///
+///   * Load-tolerant. The fast path is milliseconds, so a 10 s - 2 s = 8 s bound
+///     leaves ~8 s of slack. Scheduler jitter on a loaded box moves the fast
+///     path by milliseconds-to-hundreds-of-ms, nowhere near 8 s, so correct code
+///     never trips it. (The pre-task-109 `< 2 s` form instead asserted the HOST
+///     could schedule a loopback round-trip within 2 s - a claim about the
+///     machine, not the daemon - and that is what flaked under load.)
+///   * Still bites, with margin. A regression that WAITS OUT the deadline instead
+///     of failing fast elapses to >= HARNESS_HEADER_TIMEOUT (10 s), which exceeds
+///     the 8 s bound by the full 2 s margin. That is a robust bite, not the
+///     photo-finish at the exact 10 s boundary that the previous `< 10 s` bound
+///     gave (where a header-timeout firing a hair early could slip under).
+const FAST_FALLBACK_MARGIN: Duration = Duration::from_secs(2);
+
 fn nar_bytes() -> Vec<u8> {
     (0..NAR_LEN).map(|i| (i % 251) as u8).collect()
 }
@@ -183,19 +205,24 @@ async fn fault_mode_loop() {
     let start = Instant::now();
     let resp = get(daemon, "/nar/testnar.nar").await;
     assert_eq!(resp.status, Some(502));
-    // Bounded by the harness's own upstream timeout, not by a wall-clock constant
-    // (task-109). The property this guards is "the daemon failed FAST instead of
-    // waiting out its upstream deadline"; stating it as `< 2s` also asserted that
-    // the HOST could schedule a loopback round-trip within two seconds, which is a
-    // claim about the machine and fails on correct code under load. Comparing
-    // against HARNESS_HEADER_TIMEOUT states the real invariant and stays true
-    // however slow the box is. A regression that DID wait out the timeout takes
-    // >= HARNESS_HEADER_TIMEOUT and still fails here, which is the bite.
+    // Bounded by the harness's own upstream timeout MINUS a margin, not by a
+    // wall-clock constant (task-109 introduced the timeout key; task-173 added
+    // the margin). The property this guards is "the daemon failed FAST instead of
+    // waiting out its upstream deadline". Stating it as `< 2s` also asserted the
+    // HOST could schedule a loopback round-trip within two seconds - a claim about
+    // the machine that fails on correct code under load. Keying the bound off
+    // HARNESS_HEADER_TIMEOUT states the real invariant; subtracting
+    // FAST_FALLBACK_MARGIN turns the bite from a photo-finish at the exact
+    // deadline into a robust one: a regression that DID wait the timeout out takes
+    // >= HARNESS_HEADER_TIMEOUT, exceeding this bound by the full margin, while a
+    // millisecond-scale fast path clears it with ~8s of slack. See
+    // FAST_FALLBACK_MARGIN.
+    let elapsed = start.elapsed();
     assert!(
-        start.elapsed() < common::HARNESS_HEADER_TIMEOUT,
-        "must not hang: failed after {:?}, i.e. it waited out the {:?} upstream \
-         header timeout rather than failing fast",
-        start.elapsed(),
+        elapsed < common::HARNESS_HEADER_TIMEOUT - FAST_FALLBACK_MARGIN,
+        "must not hang: failed after {elapsed:?}, within {FAST_FALLBACK_MARGIN:?} \
+         of the {:?} upstream header timeout - it waited the deadline out rather \
+         than failing fast",
         common::HARNESS_HEADER_TIMEOUT
     );
     clear_faults(proxy.addr).await;
@@ -209,19 +236,24 @@ async fn fault_mode_loop() {
         "reset yields a clean failure, got {:?}",
         resp.status
     );
-    // Bounded by the harness's own upstream timeout, not by a wall-clock constant
-    // (task-109). The property this guards is "the daemon failed FAST instead of
-    // waiting out its upstream deadline"; stating it as `< 2s` also asserted that
-    // the HOST could schedule a loopback round-trip within two seconds, which is a
-    // claim about the machine and fails on correct code under load. Comparing
-    // against HARNESS_HEADER_TIMEOUT states the real invariant and stays true
-    // however slow the box is. A regression that DID wait out the timeout takes
-    // >= HARNESS_HEADER_TIMEOUT and still fails here, which is the bite.
+    // Bounded by the harness's own upstream timeout MINUS a margin, not by a
+    // wall-clock constant (task-109 introduced the timeout key; task-173 added
+    // the margin). The property this guards is "the daemon failed FAST instead of
+    // waiting out its upstream deadline". Stating it as `< 2s` also asserted the
+    // HOST could schedule a loopback round-trip within two seconds - a claim about
+    // the machine that fails on correct code under load. Keying the bound off
+    // HARNESS_HEADER_TIMEOUT states the real invariant; subtracting
+    // FAST_FALLBACK_MARGIN turns the bite from a photo-finish at the exact
+    // deadline into a robust one: a regression that DID wait the timeout out takes
+    // >= HARNESS_HEADER_TIMEOUT, exceeding this bound by the full margin, while a
+    // millisecond-scale fast path clears it with ~8s of slack. See
+    // FAST_FALLBACK_MARGIN.
+    let elapsed = start.elapsed();
     assert!(
-        start.elapsed() < common::HARNESS_HEADER_TIMEOUT,
-        "must not hang: failed after {:?}, i.e. it waited out the {:?} upstream \
-         header timeout rather than failing fast",
-        start.elapsed(),
+        elapsed < common::HARNESS_HEADER_TIMEOUT - FAST_FALLBACK_MARGIN,
+        "must not hang: failed after {elapsed:?}, within {FAST_FALLBACK_MARGIN:?} \
+         of the {:?} upstream header timeout - it waited the deadline out rather \
+         than failing fast",
         common::HARNESS_HEADER_TIMEOUT
     );
     clear_faults(proxy.addr).await;
