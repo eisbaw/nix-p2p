@@ -3,11 +3,11 @@ id: TASK-169
 title: >-
   daemon consumes Libp2pFabric::node_locator - drop the --libp2p-provider-addr
   injection shim
-status: In Progress
+status: Done
 assignee:
   - mped
 created_date: '2026-08-12 15:32'
-updated_date: '2026-08-12 16:57'
+updated_date: '2026-08-12 17:20'
 labels:
   - libp2p
   - daemon
@@ -36,10 +36,24 @@ TASK-159 landed Libp2pFabric::node_locator (kad peer-routing resolves a provider
 ## Implementation Notes
 
 <!-- SECTION:NOTES:BEGIN -->
-REOPENED design (owner: no side effects). Implementation:
-1. Libp2pTransport now holds Arc<Libp2pNodeLocator> (the SAME instance the node_locator() axis exposes - single source, shared ExposureLedger). In fetch(), BEFORE fetch_nar: locator.locate(node, PublicInfrastructure); Found -> parse each DialInfo location back to Multiaddr and add_address(peer, addr) EXPLICITLY (DHT-resolved, not injection); Miss/Unavailable/zero-parseable -> typed TransferError::Unavailable (fall through to next offer/record -> upstream). Exposure (OurNodeId->DhtNode) recorded by the reused locator, not re-threaded.
-2. fabric.rs assemble: build one Arc<Libp2pNodeLocator>, clone into both the transport and the node_locator() axis. Libp2pNodeLocator + node_locator() STAY (TASK-159).
-3. daemon source_libp2p.rs resolve(): REMOVE the node_locator().locate() block; daemon goes back to discover(find_providers) -> for each record/offer -> transfer.fetch(). DialInfo never reaches the serving layer. Update stale doc comments.
-4. Tests stay green. Ledger oracle in libp2p_production_path.rs (hit_delta == miss_delta+1) STILL holds: the +1 OurNodeId disclosure just moves from daemon into the transport's fetch (same shared ledger); MISS still bails at find_providers before any fetch. Update stale comments that said resolve() calls locate.
-HONEST LIMIT preserved: loopback DHT can reuse an earlier query's connection, so byte-path arms alone do not prove resolution is load-bearing; carry real-network proof to TASK-161.
+DONE (reopened design implemented). The resolve-then-dial now lives INSIDE the fabric; the daemon no longer calls locate() and no longer relies on any locate side effect.
+
+WHAT LANDED
+- Libp2pTransport now holds Arc<Libp2pNodeLocator> (the SAME instance the fabric exposes on node_locator(), one shared ExposureLedger). Libp2pTransport::fetch, BEFORE fetch_nar, calls locator.locate(node, PublicInfrastructure); Found -> parse each DialInfo location back to Multiaddr and add_address(peer, addr) EXPLICITLY; Miss / Unavailable / Found-with-zero-parseable -> typed TransferError::Unavailable (fall through to next offer/record -> upstream). No silent dial on stale routing state.
+- fabric.rs builds ONE Arc<Libp2pNodeLocator>, clones it into the transport and into the node_locator() axis (single source of truth; exposure accounting preserved, not re-threaded). Libp2pNodeLocator + node_locator() axis STAY (TASK-159).
+- daemon/src/source_libp2p.rs resolve(): REMOVED the node_locator().locate() block. Daemon = discover (find_providers) -> for each record/offer -> transfer.fetch(). DialInfo never crosses the seam into the serving layer.
+- Tests: fabric-libp2p/tests/nar_transport.rs reworked onto a shared-bootstrap DHT topology (the old bare 2-node add_address no longer resolves: get_closest_peers returns the target with no address unless a SHARED peer learned it via identify - this is the "basic dial shim" the task removes). node_locator_discovery.rs + libp2p_production_path.rs kept green; the latter's hit_delta==miss_delta+1 ledger oracle STILL holds and now bites the transport's locate on the shared ledger.
+
+GATE (pinned dev shell, all ACTUAL): cargo build -p fabric-libp2p -p daemon = ok. just lint = ok (clippy -D + rustfmt + ruff + independence + source-guard). cargo test -p fabric-libp2p = 19 passed / 0 failed (nar_transport 6/6, node_locator_discovery 1/1, lib 11, decentralized_discovery 1). cargo test -p daemon = all suites 0 failed (libp2p_production_path 1/1). cargo test --workspace = green on re-run; one flake seen once: fabric-iroh iroh_node_lookup::tests::synchronous_replay_validation_cannot_return_success_after_absolute_deadline (10ms real-time deadline test, passes 5/5 in isolation, unrelated - fabric-iroh does not depend on fabric-libp2p/daemon).
+
+REVIEW: mped-architect (Mark-emulator) + qa-test-runner both ran. QA all green. mped raised one BLOCKING honesty finding: provider_addrs override doc overclaimed. FIXED (commit c156eea): since the transport dials only off a successful resolution, provider_addrs (add_address) only seeds the local kad routing table and does NOT independently enable a dial to a provider the DHT cannot resolve; corrected the field + builder + in-body docs and pointed the real static per-peer dial override (ExplicitPeersOnly book) at TASK-168. Also softened the overstated transport sentence to match the honest-limit note.
+
+HONEST LIMITS (do not overclaim)
+- Loopback: add_address feeds the SAME shared kad routing table fetch_nar auto-dials off, so the byte path cannot attribute the dial to THIS resolution. Proven: no injection, resolution CONSULTED before every dial, typed fall-through on no-address. NOT proven: resolution is the sole/load-bearing dial mechanism (real-network proof carried to TASK-161).
+- Resolution runs per-fetch (per-offer). libp2p is one offer per record today, so once-per-provider in practice.
+- Transport hard-codes ResolutionPolicy::PublicInfrastructure (same as the old daemon path). Threading policy down + honouring an ExplicitPeersOnly static address book (so provider_addrs becomes a real transfer-honoured dial override, and a zero-disclosure explicit-peers fetch becomes possible) is TASK-168.
+
+FORWARD-CARRIED to TASK-161 (real-network load-bearing proof): on a real multi-node (podman) network where the fetch cannot reuse a discovery connection, assert the DHT-resolved address is the load-bearing dial. AND drop --libp2p-provider-addr from the consumer container (provider_addrs should be empty in production; it is now only a kad-convergence seed, not a dial override).
+
+COMMITS: edbb554 (core move), 1426b56 (nar_transport topology + truthful comments), c156eea (provider_addrs honesty + transport tightening). Committed, NOT pushed.
 <!-- SECTION:NOTES:END -->
