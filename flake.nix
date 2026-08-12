@@ -280,6 +280,41 @@
           };
         };
       };
+
+      # TASK-142 proves the relay TRANSPORT carries a real connection across an
+      # L3-blocked routed boundary. It reuses the same feature-gated daemon
+      # derivation (daemonLookupEvidence builds every bin under
+      # --features evidence-fixture, including iroh-relay-evidence-server /
+      # iroh-relay-evidence-peer), and adds the packet-capture tooling. Kept a
+      # SEPARATE image so the relay-server dependency tree stays out of both
+      # production and the other evidence closures.
+      irohRelayEvidenceImage = pkgs.dockerTools.buildImage {
+        name = "nix-p2p-iroh-relay-evidence";
+        tag = "latest";
+        copyToRoot = pkgs.buildEnv {
+          name = "nix-p2p-iroh-relay-evidence-root";
+          paths = with pkgs; [
+            bash
+            coreutils
+            iproute2
+            tcpdump
+            daemonLookupEvidence
+            e2eEtc
+          ];
+          pathsToLink = [ "/bin" "/etc" "/share" ];
+        };
+        extraCommands = ''
+          mkdir -p tmp var/tmp root run
+          chmod 1777 tmp var/tmp
+        '';
+        config = {
+          Cmd = [ "/bin/bash" ];
+          Env = [ "PATH=/bin" ];
+          Labels = {
+            "org.nix-p2p.implementation-revision" = implementationRevision;
+          };
+        };
+      };
     in
     {
       # The NixOS module (task-10). System-independent, so it lives outside the
@@ -303,6 +338,10 @@
         # Separate feature-gated routed lookup image for TASK-138. The fixture
         # executable exists here and nowhere in the production package.
         iroh-lookup-evidence-image = irohLookupEvidenceImage;
+        # Separate feature-gated routed RELAY-transport evidence image for
+        # TASK-142. Carries the relay server + relay peer evidence binaries and
+        # the packet-capture tooling; the relay-server closure lives only here.
+        iroh-relay-evidence-image = irohRelayEvidenceImage;
 
         # The NixOS VM test (task-10): real nix-daemon + systemd, the S2 truth
         # layer. A PACKAGE, not a check, on purpose (task-1 codex finding 4):

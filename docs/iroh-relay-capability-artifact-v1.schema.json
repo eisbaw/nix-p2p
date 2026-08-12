@@ -1,0 +1,256 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://nix-p2p.invalid/schemas/iroh-relay-capability-artifact-v1.json",
+  "title": "iroh-relay-capability-artifact-v1",
+  "$comment": "Canonical relay-capability artifacts are emitted by scripts/finalize_iroh_relay_capability.py from a clean committed implementation tree and a complete routed raw-evidence directory (TASK-142). The finalizer emits verdict=pass only; missing or invalid evidence is a fatal validation error, never no_go. Evidence is production-shaped-local: a locally operated routed relay, never an n0/public relay. Relay attribution is proven by an L3-blocked direct path plus packet capture, not by a single classifier reading.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema",
+    "capability",
+    "verdict",
+    "failed_constraints",
+    "implementation",
+    "raw_evidence",
+    "evidence_summary"
+  ],
+  "properties": {
+    "schema": { "const": "iroh-relay-capability-artifact-v1" },
+    "capability": { "const": "iroh-relay-capability-v1" },
+    "verdict": { "const": "pass" },
+    "failed_constraints": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/capabilityConstraint" }
+    },
+    "implementation": { "$ref": "#/$defs/implementation" },
+    "raw_evidence": { "$ref": "#/$defs/rawEvidence" },
+    "evidence_summary": { "$ref": "#/$defs/evidenceSummary" }
+  },
+  "$defs": {
+    "sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+    "gitObject": { "type": "string", "pattern": "^[0-9a-f]{40}(?:[0-9a-f]{24})?$" },
+    "capabilityConstraint": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "description", "evidence_sha256"],
+      "properties": {
+        "id": { "type": "string", "pattern": "^[a-z0-9][a-z0-9._-]{2,127}$" },
+        "description": { "type": "string", "minLength": 1 },
+        "evidence_sha256": { "$ref": "#/$defs/sha256" }
+      }
+    },
+    "committedFile": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["path", "git_blob", "bytes", "sha256"],
+      "properties": {
+        "path": { "type": "string", "minLength": 1 },
+        "git_blob": { "$ref": "#/$defs/gitObject" },
+        "bytes": { "type": "integer", "minimum": 0 },
+        "sha256": { "$ref": "#/$defs/sha256" }
+      }
+    },
+    "implementation": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["git_object_format", "commit", "tree", "files"],
+      "properties": {
+        "git_object_format": { "enum": ["sha1", "sha256"] },
+        "commit": { "$ref": "#/$defs/gitObject" },
+        "tree": { "$ref": "#/$defs/gitObject" },
+        "files": {
+          "type": "array",
+          "minItems": 1,
+          "items": { "$ref": "#/$defs/committedFile" }
+        }
+      }
+    },
+    "evidenceFile": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["path", "bytes", "sha256"],
+      "properties": {
+        "path": { "type": "string", "minLength": 1 },
+        "bytes": { "type": "integer", "minimum": 0 },
+        "sha256": { "$ref": "#/$defs/sha256" }
+      }
+    },
+    "rawEvidence": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["schema", "files", "file_count", "total_bytes", "manifest_sha256"],
+      "properties": {
+        "schema": { "const": "iroh-relay-capability-raw-evidence-manifest-v1" },
+        "files": {
+          "type": "array",
+          "minItems": 1,
+          "items": { "$ref": "#/$defs/evidenceFile" }
+        },
+        "file_count": { "type": "integer", "minimum": 1 },
+        "total_bytes": { "type": "integer", "minimum": 1 },
+        "manifest_sha256": { "$ref": "#/$defs/sha256" }
+      }
+    },
+    "relay": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "kind",
+        "relay_url",
+        "owner",
+        "authorization_class",
+        "external_contact_authorized"
+      ],
+      "properties": {
+        "kind": { "const": "local-routed-iroh-relay" },
+        "relay_url": { "type": "string", "pattern": "^https://" },
+        "owner": { "type": "string", "minLength": 1, "maxLength": 128 },
+        "authorization_class": { "const": "production-shaped-local" },
+        "external_contact_authorized": { "const": false }
+      }
+    },
+    "capture": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["scope", "interface", "filter"],
+      "properties": {
+        "scope": { "const": "all-tcp-udp-in-peer-netns-v1" },
+        "interface": { "const": "any" },
+        "filter": { "const": "tcp or udp" }
+      }
+    },
+    "boundaries": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "relay_only_when_direct_blocked",
+        "direct_positive_not_credited",
+        "no_public_relay",
+        "no_discovery",
+        "no_publication"
+      ],
+      "properties": {
+        "relay_only_when_direct_blocked": { "const": true },
+        "direct_positive_not_credited": { "const": true },
+        "no_public_relay": { "const": true },
+        "no_discovery": { "const": true },
+        "no_publication": { "const": true }
+      }
+    },
+    "arm": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "scenario",
+        "verdict",
+        "relay_attributed",
+        "captured_relay_packets",
+        "captured_direct_peer_packets",
+        "elapsed_ms"
+      ],
+      "properties": {
+        "scenario": {
+          "enum": [
+            "relay-success",
+            "direct-positive",
+            "relay-outage",
+            "wrong-url",
+            "wrong-certificate",
+            "wrong-identity",
+            "half-open-stream",
+            "forced-direct-failure"
+          ]
+        },
+        "verdict": { "enum": ["connected", "unavailable"] },
+        "connection_path": { "enum": ["relayed", "direct", "custom"] },
+        "reason": {
+          "enum": [
+            "disabled",
+            "untrusted_configuration",
+            "external_relay_unsupported",
+            "wrong_relay_url",
+            "relay_outage",
+            "wrong_certificate",
+            "wrong_identity",
+            "half_open_stream",
+            "forced_direct_failure",
+            "deadline",
+            "no_relay_candidate",
+            "closed"
+          ]
+        },
+        "relay_attributed": { "type": "boolean" },
+        "captured_relay_packets": { "type": "integer", "minimum": 0 },
+        "captured_direct_peer_packets": { "type": "integer", "minimum": 0 },
+        "elapsed_ms": { "type": "integer", "minimum": 0, "maximum": 11000 }
+      }
+    },
+    "limitation": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "description"],
+      "properties": {
+        "id": { "type": "string", "pattern": "^[a-z0-9][a-z0-9._-]{2,127}$" },
+        "description": { "type": "string", "minLength": 1 }
+      }
+    },
+    "topology": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "run_id",
+        "connector_network",
+        "acceptor_network",
+        "connector_subnet",
+        "acceptor_subnet",
+        "relay_ip"
+      ],
+      "properties": {
+        "run_id": { "type": "string", "pattern": "^[a-z0-9][a-z0-9-]{7,47}$" },
+        "connector_network": { "type": "string", "minLength": 1 },
+        "acceptor_network": { "type": "string", "minLength": 1 },
+        "connector_subnet": { "type": "string", "minLength": 1 },
+        "acceptor_subnet": { "type": "string", "minLength": 1 },
+        "relay_ip": { "type": "string", "minLength": 1 }
+      }
+    },
+    "evidenceSummary": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "raw_schema",
+        "profile",
+        "run_id",
+        "relay",
+        "capture",
+        "boundaries",
+        "topology",
+        "deadline_ms",
+        "grace_ms",
+        "arms",
+        "limitations"
+      ],
+      "properties": {
+        "raw_schema": { "const": "iroh-relay-capability-evidence-v1" },
+        "profile": { "const": "production-shaped-local" },
+        "run_id": { "type": "string", "pattern": "^[a-z0-9][a-z0-9-]{7,47}$" },
+        "relay": { "$ref": "#/$defs/relay" },
+        "capture": { "$ref": "#/$defs/capture" },
+        "boundaries": { "$ref": "#/$defs/boundaries" },
+        "topology": { "$ref": "#/$defs/topology" },
+        "deadline_ms": { "const": 10000 },
+        "grace_ms": { "const": 1000 },
+        "arms": {
+          "type": "array",
+          "minItems": 8,
+          "items": { "$ref": "#/$defs/arm" }
+        },
+        "limitations": {
+          "type": "array",
+          "minItems": 1,
+          "items": { "$ref": "#/$defs/limitation" }
+        }
+      }
+    }
+  }
+}

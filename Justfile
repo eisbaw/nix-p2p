@@ -115,6 +115,9 @@ test: build _python fixtures
     # task-138: query-only routed lookup command safety and artifact mutation bites.
     "${NIX_P2P_PYTHON}/bin/python3" scripts/iroh_node_lookup_evidence.py --self-test
     "${NIX_P2P_PYTHON}/bin/python3" scripts/finalize_iroh_node_lookup.py --self-test
+    # task-142: routed relay-capability command safety and artifact mutation bites.
+    "${NIX_P2P_PYTHON}/bin/python3" scripts/iroh_relay_capability_evidence.py --self-test
+    "${NIX_P2P_PYTHON}/bin/python3" scripts/finalize_iroh_relay_capability.py --self-test
     # task-42: the profiler's unit gate (NarSize vs FileSize can never share an
     # unlabelled `_bytes` key), its S9 class-recovery bite (a known-O(n^2) law is
     # NEVER fitted linear), the disk walk and the arm scoring are all
@@ -334,3 +337,11 @@ iroh-lookup-evidence image output="artifacts/iroh-lookup" *ARGS: _python
 # Finalize one passing raw lookup run against its reviewed implementation commit.
 iroh-lookup-artifact raw_run implementation_commit output="artifacts/iroh-node-lookup-v1.json" *ARGS: _python
     "${NIX_P2P_PYTHON}/bin/python3" scripts/finalize_iroh_node_lookup.py --raw-run {{ quote(raw_run) }} --implementation-commit {{ quote(implementation_commit) }} --output {{ quote(output) }} {{ ARGS }}
+
+# Capture isolated routed Iroh relay-capability evidence with an immutable image.
+iroh-relay-evidence image output="artifacts/iroh-relay" *ARGS: _python
+    "${NIX_P2P_PYTHON}/bin/python3" scripts/iroh_relay_capability_evidence.py --image {{ quote(image) }} --output {{ quote(output) }} {{ ARGS }}
+
+# Finalize one passing raw relay-capability run against its reviewed implementation commit.
+iroh-relay-artifact raw_run implementation_commit output="artifacts/iroh-relay-capability-v1.json" *ARGS: _python
+    "${NIX_P2P_PYTHON}/bin/python3" scripts/finalize_iroh_relay_capability.py --raw-run {{ quote(raw_run) }} --implementation-commit {{ quote(implementation_commit) }} --output {{ quote(output) }} {{ ARGS }}
