@@ -295,7 +295,7 @@ loops / two holepunchers; the shared-ed25519 `PeerId == NodeId` trick unifies
 *identity, not connectivity*. Sound but heavy — **fallback posture, never
 default.**
 
-## The freeze surface (resolve in TASK-126's spike, before committing)
+## The freeze surface (RESOLVED by TASK-126's spike + freeze)
 
 TASK-126 freezes `ContentKey` + `ProviderRecord` under deep review. You cannot
 freeze a codec on top of an experimental substrate whose *own* record format
@@ -304,6 +304,72 @@ merely stores** (`ContentKey → signed opaque bytes`). If iroh-dht-experiment o
 exposes its *own typed* records (no opaque value store), the freeze leaks into
 it and **libp2p-kad's stable `put_record`/`get_record` becomes the safer freeze
 target — flipping primary/fallback.** Decide empirically; do not freeze on faith.
+
+### SPIKE DECISION (2026-08-12) — primary/fallback FLIPPED, evidence-based
+
+Read `iroh-dht-experiment`'s source (github.com/n0-computer/iroh-dht-experiment,
+`src/lib.rs`). It stores a **fixed typed `Value` enum**, NOT a generic opaque
+`Vec<u8>`:
+
+```rust
+pub enum Value { Blake3Provider(..), ED25519SignedMessage(..), Blake3Immutable(..) }
+```
+
+Its opaque-carrier variants each **bind the storage key to the value**, none of
+which is our content-derived `ContentKey → mutable, multi-provider, signed record`:
+- `Blake3Immutable { timestamp, data }` — key MUST equal `blake3(data)`; immutable,
+  so no sequence / refresh / withdrawal.
+- `ED25519SignedMessage { timestamp, signature, data<=1024B }` — key IS the signer's
+  **public key**, i.e. keyed by *provider identity*, not by content (multiple
+  providers of one content cannot share a key). Wrong lookup axis.
+- `Blake3Provider { timestamp, node_id }` — a bare provider tuple, no
+  offers/sequence/signature.
+
+Also experimental (record validation is a `TODO`). **Conclusion: it cannot store
+`ContentKey → signed ProviderRecord` as an opaque value under a content-derived,
+mutable, multi-provider key.**
+
+**→ libp2p-kad `put_record`/`get_record` is the PRIMARY freeze target** — its
+`Record { key: arbitrary, value: opaque Vec<u8> }` is exactly the opaque-value
+model. **iroh-dht-experiment is the FALLBACK / future candidate** (blocked today
+for our keying model; if it later grows a content-keyed opaque value, our record
+already fits its 1024-byte `ED25519SignedMessage.data` carrier — which is why
+`MAX_PROVIDER_RECORD_BYTES = 1024`). The **freeze is safe regardless**: the codec
+emits `ContentKey → signed opaque bytes`, and libp2p-kad *guarantees* opaque-value
+storage, so the opaque-value model holds no matter which backend TASK-103 adopts.
+
+### What is now FROZEN (peer-fabric)
+
+- **`ContentKey` recipe** (`content.rs`): `BLAKE3 derive_key(CONTENT_KEY_CONTEXT,
+  signed_sha256_NarHash)`, domain-separated ON PURPOSE (the inverse of
+  `Blake3Digest`'s plain unkeyed recipe), pinned by a compile-assert + golden
+  vectors + a one-byte namespace-mutation control + an independent python
+  `blake3 derive_key` anchor (`scripts/check-content-key-derivation.py`).
+- **`ProviderRecord` / `ProviderWithdrawal` codec** (`record_codec.rs`): a versioned,
+  canonical **fixed-layout binary** opaque value, ed25519-signed over
+  `SIGNING_DOMAIN || body`; the `provider` `NodeId` **is** the verifying key
+  (self-verifying). A fixed layout structurally forecloses any IP/port/relay/
+  StorePath/second-digest/unasked field (AC#2). Fail-closed decode
+  (`decode_provider_assertion`) with a distinct typed rejection — oversized,
+  truncated, trailing-bytes, unknown-version, unknown-kind, unknown-offer,
+  too-many-offers, bad-provider-key, bad-signature, **wrong-key (SSOT)**, stale —
+  each with a bite test. Byte-pinned goldens in
+  `peer-fabric/tests/golden/provider_record_v1.json`.
+- **Validation rules** (`record_store.rs`, the salvaged `FakeProviderDirectory`
+  oracle — NOT a running DHT, which is TASK-103): monotonic sequence, idempotent
+  refresh, explicit signed withdrawal, expiry, replay rejection, concurrent-provider
+  merge, no expired/withdrawn resurrection.
+
+### Forward-carried notes (TASK-140/141) — RESOLVED
+- **key SSOT**: `record.key` is kept AND signature-bound; `decode_provider_assertion`
+  takes the storage key as `expected_key` and rejects `WrongKey`. Duplication is a
+  checked invariant, not an accident.
+- **`.content` redundancy**: NOT redundant — `content` is the plain-BLAKE3 *fetch*
+  identity, `ContentKey` derives from the *sha256* NarHash; neither is derivable from
+  the other, so `content` is LEARNED from the record and STAYS.
+- **privacy framing**: routing-only nodes see an opaque key in a separate keyspace;
+  a k-closest *storing* node learns `content` (narrows, does not hide). Full
+  adversarial analysis remains TASK-132.
 
 ## Backlog surgery (done)
 

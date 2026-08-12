@@ -16,6 +16,37 @@ pub const CONTENT_KEY_LEN: usize = 32;
 /// The algorithm tag prefixing the canonical string form (`contentkey:<hex>`).
 pub const CONTENT_KEY_PREFIX: &str = "contentkey:";
 
+/// Length in bytes of the signed SHA-256 `NarHash` a [`ContentKey`] is derived
+/// from. Nix signs a `sha256` NarHash, so the derivation input is 32 raw bytes.
+pub const NAR_HASH_LEN: usize = 32;
+
+/// The BLAKE3 `derive_key` CONTEXT string that domain-separates the discovery key
+/// (TASK-126 FREEZE). This is the DELIBERATE OPPOSITE of the content identity's
+/// recipe: [`Blake3Digest`] is PLAIN, UNKEYED BLAKE3 with NO domain separation
+/// (`BLAKE3_DOMAIN_SEPARATION == None`) so it EQUALS the iroh-blobs blob hash a peer
+/// fetches by; the discovery [`ContentKey`] MUST be domain-separated so a node merely
+/// ROUTING a lookup toward the key sees a value in a DISTINCT keyspace, not the signed
+/// `NarHash` and not the BLAKE3 content hash. The `/v1` suffix is the schema version:
+/// a future recipe bumps it, which lands every key on a fresh point (the
+/// cross-version golden vector proves this). Reproducible by any second
+/// implementation with `blake3::derive_key` / `b3sum --derive-key` / python
+/// `blake3(..., derive_key_context=...)` — see `scripts/check-content-key-derivation.py`.
+pub const CONTENT_KEY_CONTEXT: &str = "nix-p2p/discovery/ContentKey/v1";
+
+/// The recipe pin, as a COMPILE-TIME assertion (mirror of
+/// `BLAKE3_DOMAIN_SEPARATION`'s assert in `ids.rs`, but the INVERSE decision). An
+/// empty context would collapse the domain separation and leak the signed `NarHash`
+/// keyspace into the DHT routing layer; this fails the BUILD in every profile the
+/// moment someone empties it, so the freeze is greppable and a reviewer sees the
+/// decision, not its absence.
+const _: () = assert!(
+    !CONTENT_KEY_CONTEXT.is_empty(),
+    "the discovery ContentKey is DELIBERATELY domain-separated (unlike Blake3Digest, \
+     which must be plain unkeyed BLAKE3 to equal the iroh-blobs blob hash); an empty \
+     derive_key context would collapse that separation and leak the signed NarHash \
+     into the DHT keyspace"
+);
+
 /// A domain-separated discovery key derived from the signed `NarHash`: the key a
 /// [`ProviderDirectory`](crate::ProviderDirectory) looks up and an
 /// [`AvailabilityAnnouncer`](crate::AvailabilityAnnouncer) publishes under.
@@ -29,21 +60,51 @@ pub const CONTENT_KEY_PREFIX: &str = "contentkey:";
 /// does not hide the content identity from a storing node. The adversarial exposure
 /// analysis is TASK-132's, not this key's.
 ///
-/// The exact derivation (`NarHash -> ContentKey`) is FROZEN by TASK-126 against the
-/// adopted backend; that freeze also decides whether the record's `content` field is
-/// LEARNED from the record or already KNOWN by the asker (see
-/// [`ProviderRecord::content`]). This type is the 32-byte opaque result, with a
-/// canonical `contentkey:<hex>` string for logs. `from_bytes` is the only
-/// constructor until TASK-126 pins the derivation.
+/// PRIVACY FRAMING — RESOLVED (TASK-126, forward-carried note 3): the freeze AFFIRMS
+/// this narrows-not-hides posture and makes it structural. Because
+/// [`ContentKey::derive_from_signed_nar_hash`] is a domain-separated `derive_key`
+/// (not a plain hash of the `NarHash`), a node that only ROUTES toward the key
+/// (never in the k-closest storing set) learns neither the signed `NarHash` nor the
+/// content [`Blake3Digest`] - it sees an opaque point in a separate keyspace. A
+/// STORING node unavoidably learns `content` (it holds the record). No further
+/// privacy machinery is frozen here; the adversarial exposure ledger is TASK-132.
+///
+/// The derivation (`signed NarHash -> ContentKey`) is FROZEN by TASK-126
+/// ([`ContentKey::derive_from_signed_nar_hash`]): `BLAKE3 derive_key` in the
+/// versioned [`CONTENT_KEY_CONTEXT`] domain. This type is the 32-byte opaque result,
+/// with a canonical `contentkey:<hex>` string for logs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct ContentKey([u8; CONTENT_KEY_LEN]);
 
 impl ContentKey {
-    /// Wrap the 32 raw derived-key bytes. The `NarHash -> ContentKey` derivation
-    /// that PRODUCES these bytes is TASK-126's freeze; this crate carries the
-    /// result, not the recipe.
+    /// Wrap 32 raw derived-key bytes (e.g. a key read off the wire / a DHT storage
+    /// key). Does NOT derive anything; for the frozen recipe use
+    /// [`ContentKey::derive_from_signed_nar_hash`].
     pub const fn from_bytes(bytes: [u8; CONTENT_KEY_LEN]) -> Self {
         ContentKey(bytes)
+    }
+
+    /// THE FROZEN DISCOVERY-KEY RECIPE (TASK-126): domain-separated `BLAKE3`
+    /// `derive_key` over the signed SHA-256 `NarHash`, in the versioned
+    /// [`CONTENT_KEY_CONTEXT`].
+    ///
+    /// This is a KDF, not a plain hash, and that is the point: `derive_key` mixes the
+    /// context string into BLAKE3's key-derivation mode (a distinct internal flag from
+    /// `hash` mode), so the result is CRYPTOGRAPHICALLY SEPARATED from both the signed
+    /// `NarHash` (SHA-256) and the content [`Blake3Digest`] (plain unkeyed BLAKE3) -
+    /// separated in the sense that recovering one from another is a preimage break,
+    /// not that collision is impossible (it is ~2^-256). A node routing a lookup
+    /// toward this key therefore learns neither the trust anchor nor the fetch
+    /// identity from the key alone (the honest privacy caveat — a k-closest STORING
+    /// node still holds the record and its `content` — is documented on the type).
+    ///
+    /// FROZEN and reproducible: `blake3::derive_key(CONTENT_KEY_CONTEXT, nar_hash)`,
+    /// equal to `b3sum --derive-key "<context>"` over the 32 hash bytes and to python
+    /// `blake3(nar_hash, derive_key_context=CONTENT_KEY_CONTEXT)`. The golden vectors
+    /// pin it; `scripts/check-content-key-derivation.py` is the independent
+    /// second-implementation anchor.
+    pub fn derive_from_signed_nar_hash(nar_hash_sha256: &[u8; NAR_HASH_LEN]) -> Self {
+        ContentKey(blake3::derive_key(CONTENT_KEY_CONTEXT, nar_hash_sha256))
     }
 
     /// The raw 32 bytes (the opaque DHT key).
@@ -79,31 +140,41 @@ pub const PROVIDER_SIGNATURE_LEN: usize = 64;
 /// The content identity ([`Blake3Digest`]) appears EXACTLY ONCE (in `content`); the
 /// `offers` are pure locators, so a record can never name two blobs.
 ///
-/// The exact byte codec, the record-size cap, and how `expiry` reconciles with the
-/// substrate's own record TTL (AC#6) are FROZEN by TASK-126 - this is the field
-/// shape that freeze must realise, not the codec itself. TASK-126 must also settle
-/// two SSOT questions this shape raises (see the field docs): the `key` field vs the
-/// DHT storage key, and whether `content` is redundant with what the asker already
-/// holds.
+/// The byte codec, the record-size cap ([`MAX_PROVIDER_RECORD_BYTES`]), the
+/// bounded-offers cap ([`MAX_OFFERS_PER_RECORD`]) and the signing preimage are FROZEN
+/// by TASK-126 in [`crate::record_codec`]; the validation rules (monotonic sequence,
+/// idempotent refresh, signed withdrawal, expiry, replay/resurrection rejection,
+/// concurrent-provider merge) are frozen in [`crate::record_store`]. This struct is
+/// the field shape those realise. The two SSOT questions this shape raised are now
+/// RESOLVED (see the `key` and `content` field docs).
+///
+/// `expiry` reconciles with the substrate's own record TTL (AC#6) at the effective
+/// lifetime = MIN(this, what the store holds); the codec pins the field, the backend
+/// (TASK-103) enforces the MIN.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProviderRecord {
     /// The discovery key this record answers.
     ///
-    /// SSOT INVARIANT (TASK-126 to enforce in the codec): `key` MUST equal the DHT
-    /// storage key the record is stored under, and the `signature` MUST bind it (so
-    /// a record cannot be replayed under another key). It is carried IN the record so
-    /// the signature covers it; the codec validates `record.key == storage_key`
-    /// fail-fast on read. Whether to keep the field or reconstruct it for signing is
-    /// TASK-126's call - stated here so the duplication is a decision, not an
-    /// accident.
+    /// SSOT INVARIANT — RESOLVED (TASK-126, forward-carried note 1): `key` is KEPT in
+    /// the record AND covered by the `signature`, and [`crate::record_codec`]'s decode
+    /// takes the DHT storage key as `expected_key` and REJECTS
+    /// (`RecordDecodeError::WrongKey`) any record whose `key` differs. Keeping the
+    /// field (rather than reconstructing it for signing) is deliberate: the signature
+    /// must BIND the key so a stored value cannot be replayed under a different
+    /// storage key, and carrying it makes the opaque value self-describing and
+    /// verifiable standalone. The duplication with the storage key is therefore a
+    /// checked invariant, not an accident.
     pub key: ContentKey,
     /// The content identity being offered (single, by construction).
     ///
-    /// OPEN (TASK-126): is this LEARNED from the record, or already KNOWN by an asker
-    /// who possessed the `NarHash` to derive `key` and to run gate-1 verification? If
-    /// the latter, it may be redundant and droppable; if a record can be discovered
-    /// by `key` alone without the asker knowing the content digest, it must stay.
-    /// Frozen with the codec, not guessed here.
+    /// RESOLVED (TASK-126, forward-carried note 2): this is LEARNED from the record
+    /// and is NOT redundant, so it STAYS. The asker possesses the signed SHA-256
+    /// `NarHash` (that is what it derives `key` from), but `content` is the
+    /// [`Blake3Digest`] = plain unkeyed `BLAKE3(RawNarV1)`, the iroh-blobs FETCH
+    /// identity - an INDEPENDENT hash of the same NAR. Neither hash is derivable from
+    /// the other, so an asker who found the record by `key` alone still needs this
+    /// field to know what blob to fetch and stream-verify (gate 1). It appears EXACTLY
+    /// ONCE (offers are pure locators), so a record can never name two blobs.
     pub content: Blake3Digest,
     /// The provider's node identity (the holder to dial, via [`NodeLocator`]).
     pub provider: NodeId,
@@ -113,15 +184,21 @@ pub struct ProviderRecord {
     /// Monotonic per-provider version, so a fresher record supersedes a stale one
     /// for the same `(key, provider)`.
     pub sequence: u64,
-    /// When the provider signed it (seconds since the Unix epoch).
+    /// When the provider signed it (seconds since the Unix epoch). INFORMATIONAL
+    /// ONLY: validation NEVER orders on `issued_at` (the monotonic `sequence` orders,
+    /// `expiry` gates liveness). Trusting a wall-clock field for ordering would
+    /// reintroduce a clock-skew replay bug, so a future consumer must not.
     pub issued_at: u64,
     /// When it stops being valid (seconds since the Unix epoch). Reconciled against
     /// the substrate's record TTL by TASK-126 (AC#6): the effective lifetime is the
     /// MIN of this and what the store will hold.
     pub expiry: u64,
-    /// The ed25519 signature over the record, so a consumer can attribute it to
-    /// `provider` (claim-spam mitigation, PRD risk 6). Verification lives at the
-    /// backend/policy boundary, not in this shape.
+    /// The ed25519 signature over the frozen signing preimage (TASK-126;
+    /// [`crate::record_codec::provider_record_signing_bytes`]), so a consumer can
+    /// attribute it to `provider` (claim-spam mitigation, PRD risk 6). The `provider`
+    /// [`NodeId`] IS the ed25519 verifying key, so the record is SELF-VERIFYING:
+    /// [`crate::record_codec::decode_provider_assertion`] checks this signature with no
+    /// external key material.
     pub signature: [u8; PROVIDER_SIGNATURE_LEN],
 }
 
@@ -193,6 +270,45 @@ mod tests {
     fn content_key_renders_with_prefix() {
         let key = ContentKey::from_bytes([0xcd; CONTENT_KEY_LEN]);
         assert_eq!(key.to_string(), format!("contentkey:{}", "cd".repeat(32)));
+    }
+
+    #[test]
+    fn content_key_derivation_is_domain_separated_from_the_content_hash() {
+        // The DISCOVERY key and the CONTENT identity are the SAME 32 bytes hashed two
+        // deliberately different ways: the discovery key is a domain-separated
+        // derive_key, the content id would be plain BLAKE3. They MUST NOT collide, or
+        // the domain separation that keeps routing nodes from seeing the content id
+        // (and the signed NarHash) is vacuous.
+        let nar_hash = [0x11u8; NAR_HASH_LEN];
+        let key = ContentKey::derive_from_signed_nar_hash(&nar_hash);
+        assert_ne!(
+            key.as_bytes(),
+            &nar_hash,
+            "the ContentKey must not be the NarHash passed through"
+        );
+        assert_ne!(
+            key.as_bytes(),
+            blake3::hash(&nar_hash).as_bytes(),
+            "the domain-separated derive_key must not equal plain BLAKE3 of the same \
+             bytes (that plain hash is the content-identity keyspace)"
+        );
+        // Deterministic: the frozen recipe is a pure function of its input.
+        assert_eq!(key, ContentKey::derive_from_signed_nar_hash(&nar_hash));
+    }
+
+    #[test]
+    fn content_key_context_bump_moves_every_key() {
+        // The `/v1` in CONTENT_KEY_CONTEXT is the schema version; a bump must land on
+        // a fresh point (proven here by simulating a v2 context). This is the
+        // cross-version guarantee stated as a property; the byte-pinned cross-version
+        // vector lives in tests/provider_record_golden.rs.
+        let nar_hash = [0x11u8; NAR_HASH_LEN];
+        let v1 = ContentKey::derive_from_signed_nar_hash(&nar_hash);
+        let v2 = ContentKey::from_bytes(blake3::derive_key(
+            "nix-p2p/discovery/ContentKey/v2",
+            &nar_hash,
+        ));
+        assert_ne!(v1, v2, "a context/version bump must not collide with v1");
     }
 
     #[test]

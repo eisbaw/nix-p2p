@@ -96,6 +96,11 @@ test: build _python fixtures
     cargo test --locked --package daemon --bin iroh-node-lookup-fixture --features evidence-fixture
     "${NIX_P2P_PYTHON}/bin/python3" scripts/check-fixtures.py
     "${NIX_P2P_PYTHON}/bin/python3" scripts/check-golden-vectors.py
+    # TASK-126: the INDEPENDENT second-implementation half of the ProviderRecord /
+    # ContentKey freeze - recompute the discovery key with stock blake3 derive_key and
+    # re-verify the record signature with stock ed25519, against the same golden JSON
+    # the Rust byte-pin test reads. A wrong recipe or a moved preimage fails here.
+    "${NIX_P2P_PYTHON}/bin/python3" scripts/check-content-key-derivation.py
     "${NIX_P2P_PYTHON}/bin/python3" scripts/measure.py --self-test
     # task-18: the S5 fitter and the sweep's honesty logic are container-free by
     # design, so the machinery that decides "is this growth superlinear" and

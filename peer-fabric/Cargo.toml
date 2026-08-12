@@ -34,6 +34,13 @@ async-trait = "0.1"
 #     serde-FREE: TASK-126 freezes that codec against the adopted backend.
 blake3 = "1"
 serde = { version = "1", features = ["derive"] }
+# TASK-126: the frozen ProviderRecord opaque value is an ed25519-SIGNED byte blob,
+# and its fail-closed decode VERIFIES the signature in-crate (the provider NodeId IS
+# the verifying key), so the "bad-signature fails closed" freeze rule is real and
+# testable here rather than deferred. ed25519-dalek is NOT a p2p stack (the AC#8
+# "no iroh/libp2p" invariant is intact); it is already in the workspace lock via
+# iroh, so this direct dep reuses the pinned version with no new source.
+ed25519-dalek = "3"
 
 [dev-dependencies]
 # Only the tests need an async runtime, to `.await` the trait methods. `macros` for

@@ -45,6 +45,8 @@ mod fake;
 mod hexfmt;
 mod ids;
 mod outcome;
+mod record_codec;
+mod record_store;
 
 pub use budget::{AnnounceBudget, DiscoveryBudget, SafetyEnvelope, ServeBudget};
 pub use capabilities::{
@@ -53,8 +55,8 @@ pub use capabilities::{
     PeerHoldRequest, ProviderDirectory, Receipt, ServeError, ServeHandle, TransferError,
 };
 pub use content::{
-    CONTENT_KEY_LEN, CONTENT_KEY_PREFIX, ContentKey, DialInfo, PROVIDER_SIGNATURE_LEN,
-    ProviderRecord, ResolutionPolicy,
+    CONTENT_KEY_CONTEXT, CONTENT_KEY_LEN, CONTENT_KEY_PREFIX, ContentKey, DialInfo, NAR_HASH_LEN,
+    PROVIDER_SIGNATURE_LEN, ProviderRecord, ResolutionPolicy,
 };
 pub use exposure::{Disclosed, Exposure, ExposureLedger, ExposureSurface, Recipient};
 pub use fabric::{PeerFabric, TransferRegistry};
@@ -68,3 +70,11 @@ pub use ids::{
     TransportOffer, TransportTag,
 };
 pub use outcome::{Lookup, Unavailable};
+pub use record_codec::{
+    MAX_OFFERS_PER_RECORD, MAX_PROVIDER_RECORD_BYTES, PROVIDER_RECORD_SCHEMA_VERSION,
+    ProviderAssertion, ProviderWithdrawal, RecordDecodeError, RecordEncodeError,
+    decode_provider_assertion, encode_provider_assertion, encode_provider_record,
+    encode_provider_withdrawal, provider_record_signing_bytes, provider_withdrawal_signing_bytes,
+    sign_provider_record, sign_provider_withdrawal,
+};
+pub use record_store::{ApplyOutcome, ProviderRecordSet};
