@@ -14,6 +14,7 @@ use peer_fabric::{
 
 use crate::announcer::Libp2pAvailabilityAnnouncer;
 use crate::directory::Libp2pProviderDirectory;
+use crate::locator::Libp2pNodeLocator;
 use crate::nar::Libp2pNarSupplier;
 use crate::server::Libp2pServer;
 use crate::swarm::{Node, NodeConfig, NodeError, SwarmHandle};
@@ -28,6 +29,7 @@ pub struct Libp2pFabric {
     ledger: Arc<ExposureLedger>,
     directory: Arc<dyn ProviderDirectory>,
     announcer: Arc<dyn AvailabilityAnnouncer>,
+    locator: Arc<dyn NodeLocator>,
     transfers: TransferRegistry,
     server: Option<Arc<dyn NarServer>>,
     _node: Node,
@@ -67,6 +69,10 @@ impl Libp2pFabric {
             node.node_id,
             node.peer_id,
         ));
+        // The node-locator resolves a provider's dial address THROUGH kad peer-routing, so
+        // the transport no longer needs it injected out of band (TASK-159 AC#1).
+        let locator: Arc<dyn NodeLocator> =
+            Arc::new(Libp2pNodeLocator::new(node.handle.clone(), ledger.clone()));
 
         // The fetch transport is always available (a consumer needs it); it registers
         // under the NodeId-locator tag (see transport.rs ADR).
@@ -84,6 +90,7 @@ impl Libp2pFabric {
             ledger,
             directory,
             announcer,
+            locator,
             transfers,
             server,
             _node: node,
@@ -118,10 +125,10 @@ impl PeerFabric for Libp2pFabric {
     }
 
     fn node_locator(&self) -> Option<&Arc<dyn NodeLocator>> {
-        // TASK-159: libp2p node discovery / NAT traversal (Identify + AutoNAT/DCUtR +
-        // kad peer-routing) yields the NodeLocator. kad peer-routing already carries
-        // addresses for a basic dial; the gate-able NodeLocator axis is not wired yet.
-        None
+        // TASK-159 AC#1: the kad peer-routing NodeLocator - resolves a provider's dial
+        // address THROUGH the DHT (get_closest_peers), so the address is no longer
+        // injected. NAT traversal (AutoNAT/DCUtR/relay) for residential peers is TASK-168.
+        Some(&self.locator)
     }
 
     fn transfer(&self, tag: TransportTag) -> Option<&dyn NarTransfer> {

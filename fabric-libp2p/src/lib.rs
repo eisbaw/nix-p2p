@@ -98,6 +98,7 @@ mod announcer;
 mod directory;
 mod fabric;
 mod keys;
+mod locator;
 mod nar;
 mod server;
 mod swarm;
@@ -107,6 +108,7 @@ pub use announcer::Libp2pAvailabilityAnnouncer;
 pub use directory::Libp2pProviderDirectory;
 pub use fabric::Libp2pFabric;
 pub use keys::VALUE_KEY_CONTEXT;
+pub use locator::Libp2pNodeLocator;
 pub use nar::{
     Libp2pNarSupplier, MemoryNarSupplier, NarCodec, NarSupplyPlan, ServeCounters, ServeGate,
 };

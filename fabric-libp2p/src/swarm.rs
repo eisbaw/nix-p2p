@@ -86,6 +86,17 @@ pub enum Command {
         key: kad::RecordKey,
         reply: oneshot::Sender<Result<Option<Vec<u8>>, QueryFail>>,
     },
+    /// Resolve `peer`'s dialable addresses THROUGH kad peer-routing: an iterative
+    /// `get_closest_peers` to the `peer`'s own key. The k-closest set the query converges
+    /// on carries the addresses intermediate nodes (a shared bootstrap that learned them
+    /// via identify) reported for `peer`, so the reply is the addresses the DHT knows -
+    /// no address was injected out of band. `Ok(empty)` means the query completed but the
+    /// DHT knows no address (a healthy `Miss`); `Err` means it could not be consulted.
+    /// TASK-159: the [`crate::locator::Libp2pNodeLocator`] active-resolution path.
+    LocatePeer {
+        peer: PeerId,
+        reply: oneshot::Sender<Result<Vec<Multiaddr>, QueryFail>>,
+    },
     /// Fetch a NAR by digest from `peer` over the request-response protocol. The reply
     /// carries the peer's [`NarResponse`], or a transport-level failure string.
     FetchNar {
@@ -213,6 +224,17 @@ impl SwarmHandle {
             .unwrap_or_else(|_| Err(QueryFail::Backend("worker gone".into())))
     }
 
+    /// Resolve `peer`'s dialable addresses through kad peer-routing (an active
+    /// `get_closest_peers` query). The addresses reach us through the DHT/identify, never
+    /// injected. Drives the [`crate::locator::Libp2pNodeLocator`] PublicInfrastructure
+    /// path. `Ok(empty)` = the DHT knows no address (Miss); `Err` = could-not-consult.
+    pub async fn locate_peer(&self, peer: PeerId) -> Result<Vec<Multiaddr>, QueryFail> {
+        let (reply, rx) = oneshot::channel();
+        self.send(Command::LocatePeer { peer, reply }).await;
+        rx.await
+            .unwrap_or_else(|_| Err(QueryFail::Backend("worker gone".into())))
+    }
+
     /// Request `content` from `peer` over the NAR request-response protocol, resolving
     /// with the peer's [`NarResponse`] (or a transport-level failure string). The swarm
     /// auto-dials `peer` if an address for it is known (fed in via `add_address` /
@@ -260,6 +282,13 @@ enum Pending {
     },
     GetRecord {
         reply: oneshot::Sender<Result<Option<Vec<u8>>, QueryFail>>,
+    },
+    /// A kad peer-routing lookup awaiting its terminal `GetClosestPeers` event. `target`
+    /// is the PeerId we are resolving; on completion we return the addresses the query
+    /// learned for exactly that peer.
+    GetClosestPeers {
+        target: PeerId,
+        reply: oneshot::Sender<Result<Vec<Multiaddr>, QueryFail>>,
     },
 }
 
@@ -391,6 +420,20 @@ impl Worker {
                 let id = self.swarm.behaviour_mut().kad.get_record(key);
                 self.pending.insert(id, Pending::GetRecord { reply });
             }
+            Command::LocatePeer { peer, reply } => {
+                // Iterative peer-routing to `peer`'s own key: the query walks the DHT and
+                // the k-closest set it converges on carries the addresses a shared
+                // bootstrap reported for `peer` (learned via identify). This is what lets
+                // the resolver dial without an injected address.
+                let id = self.swarm.behaviour_mut().kad.get_closest_peers(peer);
+                self.pending.insert(
+                    id,
+                    Pending::GetClosestPeers {
+                        target: peer,
+                        reply,
+                    },
+                );
+            }
             Command::FetchNar {
                 peer,
                 content,
@@ -512,7 +555,10 @@ impl Worker {
     }
 
     fn on_query(&mut self, id: kad::QueryId, result: kad::QueryResult, last: bool) {
-        use kad::{AddProviderOk, GetProvidersOk, GetRecordOk, PutRecordOk, QueryResult};
+        use kad::{
+            AddProviderOk, GetClosestPeersError, GetClosestPeersOk, GetProvidersOk, GetRecordOk,
+            PutRecordOk, QueryResult,
+        };
         match result {
             QueryResult::StartProviding(res) => {
                 if let Some(Pending::Simple(reply)) = self.pending.remove(&id) {
@@ -580,6 +626,28 @@ impl Worker {
                     }
                 }
             },
+            QueryResult::GetClosestPeers(res) => {
+                // Peer-routing terminates in a single terminal event (`get_closest_peers`
+                // has no per-step progress), so resolve on the first (and only) result.
+                if let Some(Pending::GetClosestPeers { target, reply }) = self.pending.remove(&id) {
+                    let result = match res {
+                        // The converged closest set: pull out the addresses the DHT learned
+                        // for EXACTLY the target peer. If the target is absent from the set,
+                        // or present with no address, that is a healthy "no address known"
+                        // (empty Vec) - the locator maps it to Miss, never Unavailable.
+                        Ok(GetClosestPeersOk { peers, .. }) => Ok(peers
+                            .into_iter()
+                            .find(|info| info.peer_id == target)
+                            .map(|info| info.addrs)
+                            .unwrap_or_default()),
+                        // A timed-out query could not be consulted: the lookup was not
+                        // authoritative, so this must surface as Unavailable, never an
+                        // (empty) Miss.
+                        Err(GetClosestPeersError::Timeout { .. }) => Err(QueryFail::Timeout),
+                    };
+                    let _ = reply.send(result);
+                }
+            }
             _ => {}
         }
     }
