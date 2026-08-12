@@ -3,11 +3,11 @@ id: TASK-126
 title: >-
   Select + freeze the ProviderDirectory backend and opaque-value
   content-key/provider-record schema
-status: In Progress
+status: Done
 assignee:
   - '@claude'
 created_date: '2026-08-10 22:51'
-updated_date: '2026-08-12 00:11'
+updated_date: '2026-08-12 01:13'
 labels:
   - iroh
   - discovery
@@ -71,4 +71,22 @@ FREEZE (AC#1-4):
 FORWARD-CARRIED NOTES resolved: (1) key SSOT — keep record.key, sig binds it, decode rejects WrongKey vs storage key. (2) .content NOT redundant — content is BLAKE3 (fetch id), ContentKey derives from sha256 NarHash; asker cannot derive one from other, so content is LEARNED; keep. (3) privacy — routing-only nodes see only derived key; storing nodes learn content BLAKE3 (narrows not hides); full analysis = TASK-132.
 
 New dep: ed25519-dalek 3 (already in lock via iroh; not a p2p stack). Gate + golden byte-pin + bite-proof before commit.
+
+## FINAL SUMMARY — freeze complete (commits 0d67282 code, b6d34b4 lock, 14d5799 tracker)
+
+FROZEN (byte-pinned, every rule bites, independently anchored):
+- ContentKey::derive_from_signed_nar_hash = blake3::derive_key("nix-p2p/discovery/ContentKey/v1", sha256 NarHash); compile-assert + golden + one-byte namespace-mutation + cross-version controls.
+- ProviderRecord/ProviderWithdrawal: canonical fixed-layout binary opaque value, ed25519 over SIGNING_DOMAIN(b"nix-p2p/discovery/ProviderRecord/v1\0")||body; provider NodeId IS the verifying key. decode_provider_assertion is fail-closed (11 typed rejections, each proven to bite by guard removal).
+- record_store ProviderRecordSet oracle: monotonic seq, idempotent refresh (record + withdrawal), signed withdrawal, expiry, replay rejection, concurrent-provider merge, no resurrection.
+- Goldens: peer-fabric/tests/golden/provider_record_v1.json + tests/provider_record_golden.rs (encode-emits/decode-accepts/reject); scripts/check-content-key-derivation.py = INDEPENDENT second impl (python blake3 derive_key + independent layout parse of every field + ed25519 verify), wired into `just test` and proven to bite.
+
+SPIKE DECISION: iroh-dht-experiment exposes only fixed typed records (opaque carriers bind key to value-hash or signer-pubkey) -> cannot key content-derived ContentKey -> PRIMARY = libp2p-kad put_record/get_record; FALLBACK = iroh-dht-experiment. Freeze is backend-agnostic (opaque-value model).
+
+FORWARD-CARRIED NOTES resolved: key SSOT (kept + sig-bound + WrongKey check); .content non-redundant (BLAKE3 fetch id vs sha256-derived key; LEARNED, kept); privacy (routing-only nodes see separate keyspace; storing nodes learn content; TASK-132 owns adversarial analysis).
+
+REVIEW: qa-test-runner GREEN; mped-architect NO network-splitting blocker. All mped should-fix applied: (#1) hardened python anchor to independently PARSE the layout field-by-field (was self-referential); (#2) sign_* fail-fast on mismatched provider; (#3) provide_body offers-cap debug_assert on the signed preimage; (#4) version-consistency test; (#5) SIGNING_DOMAIN NUL-terminated per repo convention; (#6) softened "provably disjoint" wording; (#7) idempotent re-broadcast withdrawal. Forward-carried to TASK-103: (#8) durable monotonic sequence, (#9) per-key provider DoS cap, plus expiry-TTL MIN reconciliation and issued_at-informational.
+
+GATES (actual): just build OK; just lint OK; just test OK (workspace 512 tests; peer-fabric 61 unit + 7 golden; check-content-key-derivation OK); just e2e ALL 5 scenarios PASSED (74.4s). Cross-model DEEP review remains the orchestrator's gate.
+
+HONEST LIMITS: (a) unknown-offer-tag / new-transport is FAIL-CLOSED (versioned evolution, not tolerated) — deliberate for a signed opaque value, unlike the daemon claim wire. (b) The iroh-dht-experiment fallback fit is size-only-plausible (1024B carrier) but blocked by its keying model today; does not affect any frozen byte. (c) e2e is unaffected by this change (peer-fabric is consumed by nobody yet); the one earlier e2e failure was the pre-existing TASK-143-class flaky fixed-port bind in daemon/tests/iroh_node_lookup.rs, which passed on re-run.
 <!-- SECTION:NOTES:END -->
