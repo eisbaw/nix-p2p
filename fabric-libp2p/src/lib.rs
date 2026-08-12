@@ -67,6 +67,19 @@
 //! (withdrawal/expiry/replay/partition, sybil/eclipse bounds, packet guards, the
 //! `decentralized-content-discovery-v1` artifact, TASK-132 cold journey).
 
-// Modules land in the next increment (the swarm worker + directory + announcer +
-// fabric). The skeleton commits first so the compiling crate and the large
-// rust-libp2p Cargo.lock are banked.
+mod announcer;
+mod directory;
+mod fabric;
+mod keys;
+mod swarm;
+
+pub use announcer::Libp2pAvailabilityAnnouncer;
+pub use directory::Libp2pProviderDirectory;
+pub use fabric::Libp2pFabric;
+pub use keys::VALUE_KEY_CONTEXT;
+pub use swarm::{Node, NodeConfig, NodeError, SwarmHandle};
+
+// Re-export libp2p's address/peer types the composition root and tests need to drive
+// connectivity, so a consumer does not depend on libp2p directly for the seam-level
+// wiring.
+pub use libp2p::{Multiaddr, PeerId};
