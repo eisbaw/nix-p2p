@@ -84,7 +84,6 @@ use crate::iroh_runtime::{
     EndpointProfile, IdentitySource, IrohEndpointHandle, IrohNodeRuntime, IrohRuntimeBuilder,
     IrohRuntimeError, RelayCapability, ShutdownOutcome, TaskSupervisorHandle,
 };
-use crate::supply_catalog::{NarProductionSource, SupplyCatalogHandle};
 use crate::transport::{IROH_BLOBS_ALPN, NodeId};
 use crate::transport_fetch::{Transport, TransportError};
 use peer_fabric::{
@@ -621,26 +620,67 @@ pub fn copy_regular_raw_nar(
     Ok(copied)
 }
 
-/// The [`NarSupplier`] a real node uses: an inert read-only supply catalog.
+/// An inert supply record answered by a [`CatalogProbe`] for one named digest: the
+/// admission `declared_size` and a source the provider can regenerate from, WITHOUT
+/// producing bytes. This is the PUBLIC, substrate-neutral shape the catalog owner
+/// fills; it deliberately mirrors the sealed [`SupplyPlan`] without exposing it.
+pub struct ProbedSupply {
+    /// Uncompressed NAR size for admission (task-72 GAP-1: size before production).
+    pub declared_size: u64,
+    /// How to regenerate the bytes on demand.
+    pub source: ProbedSource,
+}
+
+/// Where a probed digest is regenerated from. Data only - no callback, lock guard,
+/// lazy derivation or index handle (the same inert-data rule the daemon catalog
+/// keeps), so the provider can consume it without reaching back into the catalog.
+pub enum ProbedSource {
+    /// Run this program with these args; its stdout is the raw NAR.
+    Process {
+        program: PathBuf,
+        args: Vec<OsString>,
+    },
+    /// Dump this regular file verbatim (via the daemon's `__dump-raw-nar` helper).
+    RegularFile(PathBuf),
+    /// The raw NAR is already in memory (test/inline supply).
+    Memory(Arc<Vec<u8>>),
+}
+
+/// A read-only, caller-named-digest probe of a supply catalog (TASK-150 AC#3 /
+/// TASK-148 AC#3). The provider holds `Arc<dyn CatalogProbe>` and NEVER names the
+/// daemon's `supply_catalog` concrete types, so `transport_iroh` can move to
+/// `fabric-iroh` with no edge back to the daemon serving core. The daemon
+/// availability index implements it over its inert `SupplyCatalogHandle`.
+///
+/// NO ENUMERATION (PRD privacy invariant): one caller-supplied digest -> optional
+/// record, deliberately no `list`/`iter`/`len`.
+pub trait CatalogProbe: Send + Sync {
+    /// Probe `content`; `Some` iff this node can currently regenerate it.
+    fn probe(&self, content: &Blake3Digest) -> Option<ProbedSupply>;
+}
+
+/// The [`NarSupplier`] a real node uses: an inert read-only supply catalog, reached
+/// through the [`CatalogProbe`] seam (never the daemon `supply_catalog` types).
 ///
 /// THIS IS THE FIX FOR TASK-72 GAP 2, and the direction of the dependency is the
-/// point. The transport consumes the index; the index knows nothing about
+/// point. The transport consumes the probe; the catalog owner knows nothing about
 /// transports (its module docs are explicit that seeding is external), so adding a
 /// supply path did not turn the index into a transport-aware module. What it did
 /// was make one set out of two: the index answers "yes, I hold NarHash k" only for
 /// registrations it can also produce bytes for, and this adapter is how the
-/// provider reaches those bytes.
+/// provider reaches those bytes - now behind the [`CatalogProbe`] trait so the edge
+/// is `daemon -> transport_iroh`, never `transport_iroh -> daemon` (AC#3).
 pub struct IndexNarSupplier {
-    catalog: SupplyCatalogHandle,
+    catalog: Arc<dyn CatalogProbe>,
     helper_program: PathBuf,
 }
 
 impl IndexNarSupplier {
     /// Serve only records already published by the availability writer. The
     /// provider cannot derive, persist, announce, or lock the index itself.
-    pub fn new(catalog: SupplyCatalogHandle, helper_program: impl Into<PathBuf>) -> Self {
+    pub fn new(catalog: impl CatalogProbe + 'static, helper_program: impl Into<PathBuf>) -> Self {
         IndexNarSupplier {
-            catalog,
+            catalog: Arc::new(catalog),
             helper_program: helper_program.into(),
         }
     }
@@ -652,17 +692,17 @@ impl nar_supplier_sealed::Sealed for IndexNarSupplier {
             return Ok(None);
         };
         let source = match record.source {
-            NarProductionSource::Process { program, args } => SupplySource::Process {
+            ProbedSource::Process { program, args } => SupplySource::Process {
                 program,
                 args,
                 environment: Vec::new(),
             },
-            NarProductionSource::RegularFile(path) => SupplySource::Process {
+            ProbedSource::RegularFile(path) => SupplySource::Process {
                 program: self.helper_program.clone(),
                 args: vec![OsString::from("__dump-raw-nar"), path.into_os_string()],
                 environment: raw_nar_helper_environment(),
             },
-            NarProductionSource::Memory(bytes) => SupplySource::Memory {
+            ProbedSource::Memory(bytes) => SupplySource::Memory {
                 bytes,
                 released: None,
                 metrics: Arc::new(MemorySupplierMetrics::default()),

@@ -60,6 +60,27 @@ impl SupplyCatalogHandle {
     }
 }
 
+/// The daemon fills the provider's [`CatalogProbe`] seam (TASK-150 AC#3): the
+/// availability index's inert read handle IS the catalog probe. The edge points
+/// `daemon -> transport_iroh` (soon `fabric-iroh`) - the provider names this trait,
+/// never this module's `SupplyCatalogRecord`/`NarProductionSource` concrete types -
+/// so the transport can move below the seam with no edge back to the serving core.
+impl crate::transport_iroh::CatalogProbe for SupplyCatalogHandle {
+    fn probe(&self, content: &Blake3Digest) -> Option<crate::transport_iroh::ProbedSupply> {
+        use crate::transport_iroh::{ProbedSource, ProbedSupply};
+        self.probe(content).map(|record| ProbedSupply {
+            declared_size: record.declared_size,
+            source: match record.source {
+                NarProductionSource::Process { program, args } => {
+                    ProbedSource::Process { program, args }
+                }
+                NarProductionSource::RegularFile(path) => ProbedSource::RegularFile(path),
+                NarProductionSource::Memory(bytes) => ProbedSource::Memory(bytes),
+            },
+        })
+    }
+}
+
 /// Availability-side writer. This type is crate-private so transport code
 /// cannot activate or retire provider records.
 #[derive(Default)]
