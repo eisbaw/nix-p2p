@@ -29,8 +29,6 @@
 //! incurs are first-class, so an operator can turn address discovery off
 //! independently of everything else.
 
-use std::sync::Arc;
-
 use async_trait::async_trait;
 
 use crate::budget::{AnnounceBudget, DiscoveryBudget, SafetyEnvelope, ServeBudget};
@@ -262,17 +260,31 @@ pub trait NarTransfer: Send + Sync {
 // Axis 5 - serving.
 // -------------------------------------------------------------------------
 
-/// The source of raw NAR bytes a [`NarServer`] hands out: given a content identity
-/// it may hold or regenerate, produce the exact `RawNarV1` bytes. The seam names
-/// only the intention; a backend/daemon supplies the concrete implementation (a
-/// blob store, an on-demand `nix-store --dump`). Object-safe so a server takes
-/// `Arc<dyn NarSupplier>`.
-#[async_trait]
-pub trait NarSupplier: Send + Sync {
-    /// Produce the raw NAR bytes for `content`, or `None` if this node cannot supply
-    /// it. Returning `None` is a clean "not served here", never wrong bytes.
-    async fn supply(&self, content: &Blake3Digest) -> Option<Vec<u8>>;
-}
+// ADR (TASK-150): WHERE THE SUPPLY OF SERVED BYTES LIVES - BELOW THIS SEAM.
+//
+// An earlier draft of this seam carried a `NarSupplier { async fn supply(content)
+// -> Option<Vec<u8>> }` and had [`NarServer::serve`] take `Arc<dyn NarSupplier>`.
+// That shape is UNSAFE for a real serving backend and has been removed:
+//
+//   * It produces bytes EAGERLY and declares no size, so a faithful iroh
+//     [`NarServer`] could not preserve the task-72 GAP-1 defense (learn a NAR's
+//     declared_size WITHOUT producing its bytes, so a 3 GiB request costs a `stat`,
+//     not a 3 GiB allocation - the peer-triggerable-OOM guard). Wrapping `supply()`
+//     and allocating first REINTRODUCES exactly that OOM.
+//   * It admits an arbitrary synchronous producer, which an absolute async shutdown
+//     deadline cannot kill (an unkillable `spawn_blocking`) - it cannot express the
+//     cancellation-safety the real supply path needs (owned process group,
+//     `TaskSupervisor::execute_process`).
+//
+// Both properties (declared-size-before-production, cancellation-safe production)
+// belong to the RUNTIME layer that can actually enforce them. So the supplier is
+// bound to the concrete server AT CONSTRUCTION and stays a substrate-internal detail
+// (the backend's own SEALED, plan-based supplier, e.g. `fabric-iroh`'s
+// `SupplyPlan{declared_size, Process/Memory/RegularFile source}`), never a type that
+// crosses this seam. [`NarServer::serve`] therefore takes no supplier: the server it
+// is called on already holds one. This keeps `peer_fabric` substrate-neutral (no
+// process/memory/plan/size machinery leaks up) while the invariants stay provable
+// where they are enforced.
 
 /// A live serve session's handle: dropping it tears the session down (RAII). A
 /// lifecycle, returned by [`NarServer::serve`], not a per-request value.
@@ -342,18 +354,20 @@ impl std::fmt::Display for ServeError {
 impl std::error::Error for ServeError {}
 
 /// "Hand out bytes to whoever asks, within budget." A lifecycle, not a call: it
-/// starts a session serving from `supplier` under `budget` and returns a
-/// [`ServeHandle`] that keeps it alive. Admission (declining an over-budget request
-/// BEFORE any bytes are produced) is the [`ServeBudget`]'s job; eligibility of WHAT
-/// may be served is decided above the seam.
+/// starts a session serving under `budget` and returns a [`ServeHandle`] that keeps
+/// it alive; dropping the handle tears the session down. Admission (declining an
+/// over-budget request BEFORE any bytes are produced) is the [`ServeBudget`]'s job;
+/// eligibility of WHAT may be served is decided above the seam.
+///
+/// The SOURCE of served bytes is bound to the concrete server at construction and is
+/// NOT passed here - see the ADR above [`ServeHandle`] for why the supply seam lives
+/// below this trait (declared-size-before-production + cancellation-safety are
+/// runtime-layer invariants).
 #[async_trait]
 pub trait NarServer: Send + Sync {
-    /// Start serving from `supplier`, bounded by `budget`.
-    async fn serve(
-        &self,
-        supplier: Arc<dyn NarSupplier>,
-        budget: ServeBudget,
-    ) -> Result<ServeHandle, ServeError>;
+    /// Start serving, bounded by `budget`, from the supplier the server was built
+    /// with. Returns a [`ServeHandle`] whose `Drop` tears the session down.
+    async fn serve(&self, budget: ServeBudget) -> Result<ServeHandle, ServeError>;
 }
 
 // -------------------------------------------------------------------------

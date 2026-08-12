@@ -15,9 +15,9 @@ use async_trait::async_trait;
 
 use crate::budget::{AnnounceBudget, DiscoveryBudget, SafetyEnvelope, ServeBudget};
 use crate::capabilities::{
-    AnnounceError, AvailabilityAnnouncer, HoldAnswer, LocalPeerDiscovery, NarServer, NarSupplier,
-    NarTransfer, NodeLocator, PeerHoldQuery, PeerHoldReply, PeerHoldRequest, ProviderDirectory,
-    Receipt, ServeError, ServeHandle, TransferError,
+    AnnounceError, AvailabilityAnnouncer, HoldAnswer, LocalPeerDiscovery, NarServer, NarTransfer,
+    NodeLocator, PeerHoldQuery, PeerHoldReply, PeerHoldRequest, ProviderDirectory, Receipt,
+    ServeError, ServeHandle, TransferError,
 };
 use crate::content::{ContentKey, DialInfo, ProviderRecord, ResolutionPolicy};
 use crate::exposure::{Exposure, ExposureLedger, ExposureSurface};
@@ -231,16 +231,14 @@ impl NarTransfer for FakeNarTransfer {
     }
 }
 
-/// A [`NarServer`] that starts a no-op session and returns a labelled handle.
+/// A [`NarServer`] that starts a no-op session and returns a labelled handle. Its
+/// supply source is bound at construction (here: nothing to serve), per the TASK-150
+/// seam ADR - `serve` takes only the budget.
 pub struct FakeNarServer;
 
 #[async_trait]
 impl NarServer for FakeNarServer {
-    async fn serve(
-        &self,
-        _supplier: Arc<dyn NarSupplier>,
-        _budget: ServeBudget,
-    ) -> Result<ServeHandle, ServeError> {
+    async fn serve(&self, _budget: ServeBudget) -> Result<ServeHandle, ServeError> {
         Ok(ServeHandle::new("fake-serve"))
     }
 }
@@ -796,21 +794,14 @@ mod tests {
         assert!(surface.recipients().contains(&Recipient::DhtNode));
         assert!(surface.recipients().contains(&Recipient::LanPeer));
 
-        // The server axis is enabled and usable substrate-free.
+        // The server axis is enabled and usable substrate-free. Its supply source is
+        // bound at construction (TASK-150 seam ADR), so `serve` takes only the budget.
         let handle = fabric
             .server()
             .unwrap()
-            .serve(Arc::new(NoOpSupplier), ServeBudget::default())
+            .serve(ServeBudget::default())
             .await
             .expect("fake serve starts");
         assert_eq!(handle.label, "fake-serve");
-    }
-
-    struct NoOpSupplier;
-    #[async_trait]
-    impl NarSupplier for NoOpSupplier {
-        async fn supply(&self, _content: &Blake3Digest) -> Option<Vec<u8>> {
-            None
-        }
     }
 }

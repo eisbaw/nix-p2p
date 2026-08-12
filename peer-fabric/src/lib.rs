@@ -51,8 +51,8 @@ mod record_store;
 pub use budget::{AnnounceBudget, DiscoveryBudget, SafetyEnvelope, ServeBudget};
 pub use capabilities::{
     AnnounceError, AvailabilityAnnouncer, HoldAnswer, HoldMisalignment, LocalPeerDiscovery,
-    NarServer, NarSupplier, NarTransfer, NodeLocator, PeerHoldQuery, PeerHoldReply,
-    PeerHoldRequest, ProviderDirectory, Receipt, ServeError, ServeHandle, TransferError,
+    NarServer, NarTransfer, NodeLocator, PeerHoldQuery, PeerHoldReply, PeerHoldRequest,
+    ProviderDirectory, Receipt, ServeError, ServeHandle, TransferError,
 };
 pub use content::{
     CONTENT_KEY_CONTEXT, CONTENT_KEY_LEN, CONTENT_KEY_PREFIX, ContentKey, DialInfo, NAR_HASH_LEN,

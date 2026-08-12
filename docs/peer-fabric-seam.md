@@ -153,8 +153,7 @@ protects against a miswiring that cannot occur).
 
 ```rust
 use crate::{Blake3Digest, NodeId, KnownTransport, TransportTag,
-            BatchHoldQuery, BatchHoldResponse, SafetyEnvelope, ServeBudget,
-            NarSupplier};
+            BatchHoldQuery, BatchHoldResponse, SafetyEnvelope, ServeBudget};
 
 /// Domain-separated discovery key derived from the signed NarHash. NEW.
 pub struct ContentKey([u8; 32]);
@@ -236,10 +235,13 @@ pub trait NarTransfer: Send + Sync {
 }
 
 /// "Hand out bytes to whoever asks, within budget." A lifecycle, not a call.
+/// TASK-150: the supply SOURCE is bound to the concrete server at construction, not
+/// passed here — declared-size-before-production (task-72 GAP-1) and
+/// cancellation-safety are runtime-layer invariants the backend's own sealed,
+/// plan-based supplier enforces below this seam (see the ADR in capabilities.rs).
 #[async_trait]
 pub trait NarServer: Send + Sync {
-    async fn serve(&self, supplier: Arc<dyn NarSupplier>, budget: ServeBudget)
-        -> Result<ServeHandle, ServeError>;
+    async fn serve(&self, budget: ServeBudget) -> Result<ServeHandle, ServeError>;
 }
 
 /// "Ask THIS peer, directly, whether it holds these NARs." Named-key only.
