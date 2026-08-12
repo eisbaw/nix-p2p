@@ -26,6 +26,16 @@
 //! decentralized; `P`'s byte-transfer DIAL address is supplied to `C` out of band via
 //! the config's `provider_addrs` (the TASK-159 basic-dial shim; `node_locator()` is
 //! still `None`). A full podman multi-daemon libp2p e2e is TASK-161.
+//!
+//! This test does NOT model the Nix client's transport gate. The consumer uses
+//! `NoRawServe` and an `.nar.xz` token with `Compression: xz`, yet asserts the served
+//! bytes equal the RAW NAR - because `common::get` is a plain HTTP client, not a Nix
+//! client checking FileHash/Compression. A real Nix client would REJECT raw bytes under
+//! a compressed narinfo. That mismatch (libp2p's dynamic kad discovery is decoupled from
+//! the iroh-claim-keyed raw-serve allowlist, so a libp2p HIT under a compressed upstream
+//! narinfo serves raw bytes without the narinfo being rewritten to raw) is a BLOCKING
+//! correctness follow-up: TASK-164. What THIS test proves is the discover->fetch->serve
+//! plumbing of the production config path, not real-Nix compression-domain correctness.
 
 mod common;
 

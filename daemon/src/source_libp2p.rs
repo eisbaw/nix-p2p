@@ -273,22 +273,41 @@ pub async fn build_libp2p_nar_source(
             .map_err(|e| format!("libp2p listen on {listen} failed: {e}"))?;
     }
 
-    // Join the DHT through each bootstrap peer: add_address seeds kad's routing table
+    // Join the DHT through the bootstrap peers: add_address seeds kad's routing table
     // (so the subsequent bootstrap self-lookup has a peer to query) and dial opens the
-    // connection. A failed dial is fatal - a mistyped/unreachable bootstrap must be a
-    // startup error, not a runtime "why does nothing discover" mystery.
-    for (peer, addr) in &cfg.bootstrap {
-        fabric.handle().add_address(*peer, addr.clone()).await;
-        fabric
-            .handle()
-            .dial(addr.clone())
-            .await
-            .map_err(|e| format!("libp2p dial bootstrap {peer} @ {addr} failed: {e}"))?;
-    }
+    // connection. A bootstrap SET is plural for RESILIENCE - the invariant is "at least
+    // one dial succeeds", not "all succeed": a single mistyped/down entry among several
+    // must not brick startup. So dial errors are collected and only fatal when EVERY
+    // bootstrap dial failed (then it is a loud startup error, not a silent no-discovery).
     if !cfg.bootstrap.is_empty() {
+        let mut dial_errors = Vec::new();
+        for (peer, addr) in &cfg.bootstrap {
+            fabric.handle().add_address(*peer, addr.clone()).await;
+            if let Err(e) = fabric.handle().dial(addr.clone()).await {
+                dial_errors.push(format!("{peer} @ {addr}: {e}"));
+            }
+        }
+        if dial_errors.len() == cfg.bootstrap.len() {
+            return Err(format!(
+                "libp2p: every bootstrap dial failed ({} peer(s)); cannot join the DHT: {}",
+                cfg.bootstrap.len(),
+                dial_errors.join("; ")
+            ));
+        }
+        if !dial_errors.is_empty() {
+            eprintln!(
+                "daemon: libp2p {}/{} bootstrap dial(s) failed (continuing on the rest): {}",
+                dial_errors.len(),
+                cfg.bootstrap.len(),
+                dial_errors.join("; ")
+            );
+        }
         // The kad self-lookup that populates the routing table. Not fatal on error:
-        // add_address already seeded routing, and propagation is polled by the caller
-        // before the first serve; a transient bootstrap error must not brick startup.
+        // add_address already seeded routing; a transient self-lookup error must not
+        // brick startup. NOTE: this returns before discovery has CONVERGED - the daemon
+        // starts serving immediately and early requests simply miss libp2p and fall back
+        // to HTTP until the routing table fills (a benign cold-start window). A gate-able
+        // readiness signal on the source seam is a follow-up (TASK-163).
         if let Err(e) = fabric.handle().bootstrap().await {
             eprintln!("daemon: libp2p kad bootstrap self-lookup returned: {e}");
         }

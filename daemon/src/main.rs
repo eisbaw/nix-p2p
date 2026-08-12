@@ -696,6 +696,13 @@ impl Config {
                 "libp2p is configured but --libp2p-bootstrap is missing; kad cannot discover a provider without an entry peer".into(),
             );
         }
+        // Resolve the libp2p identity seed ONCE, here, when libp2p is requested and no
+        // explicit seed was given: mint a fresh one from /dev/urandom and store it, so
+        // `libp2p_source_config()` is a pure, idempotent read (two calls -> one identity)
+        // rather than minting new entropy on each call.
+        if config.libp2p_requested() && config.libp2p_identity_seed.is_none() {
+            config.libp2p_identity_seed = Some(random_identity_seed()?);
+        }
         Ok(config)
     }
 
@@ -708,16 +715,16 @@ impl Config {
             || self.libp2p_identity_seed.is_some()
     }
 
-    /// Build the production [`Libp2pSourceConfig`] this `Config` describes, resolving
-    /// the identity seed (a fresh `/dev/urandom` one when `--libp2p-identity-seed` was
-    /// omitted) and the network scope (default `v1`). The discovery budget and fetch
-    /// envelope use the peer-fabric v1 defaults; per-flag budget knobs are a follow-up
-    /// (TASK-162 note) once the podman e2e (TASK-161) pins the operating numbers.
+    /// Build the production [`Libp2pSourceConfig`] this `Config` describes. PURE and
+    /// idempotent: the identity seed was resolved once in [`Config::from_args`] (a fresh
+    /// `/dev/urandom` one when `--libp2p-identity-seed` was omitted), so this only reads
+    /// it. The network scope defaults to `v1`; the discovery budget and fetch envelope
+    /// use the peer-fabric v1 defaults; per-flag budget knobs are a follow-up (TASK-162
+    /// note) once the podman e2e (TASK-161) pins the operating numbers.
     fn libp2p_source_config(&self) -> Result<Libp2pSourceConfig, String> {
-        let identity_seed = match self.libp2p_identity_seed {
-            Some(seed) => seed,
-            None => random_identity_seed()?,
-        };
+        let identity_seed = self.libp2p_identity_seed.ok_or_else(|| {
+            "internal: libp2p identity seed unresolved (from_args resolves it when libp2p is requested)".to_string()
+        })?;
         Ok(Libp2pSourceConfig {
             identity_seed,
             network_scope: self
@@ -1183,17 +1190,11 @@ async fn setup_p2p_source(
 ) -> Result<(Arc<dyn NarSource>, Arc<dyn RawServeDecision>), String> {
     let iroh_configured = !config.iroh_peers.is_empty() || !config.p2p_claims.is_empty();
 
-    // The fallback chain is built tail-first, so the outermost (primary) source is
-    // tried first. PRECEDENCE (TASK-162, documented): libp2p (decentralized kad
-    // discovery, PRD-primary) -> iroh (configured address book) -> HTTP upstream.
-    // Each layer wraps the one below via FallbackNarSource, so a clean miss/unreachable
-    // at one layer falls through to the next (a TooLarge abort still propagates). The
-    // iroh path is untouched and purely additive; whether libp2p-first is the RIGHT
-    // composition (vs. a transport tournament / dual-stack race) is a follow-up
-    // (TASK-145/146 clean split) - see the filed compose question.
-    let mut chain: Arc<dyn NarSource> = upstream.clone();
-
-    if iroh_configured {
+    // Build each p2p LAYER as an optional source; the pure `compose_nar_chain` helper
+    // nests them in the documented precedence. Separating "build the layers" (I/O,
+    // fallible) from "order the layers" (pure) makes the precedence a unit-testable
+    // oracle (see `compose_nar_chain`'s tests) rather than an un-probed inline decision.
+    let iroh_layer: Option<Arc<dyn NarSource>> = if iroh_configured {
         // Fail fast (config-time, not first-request): every claim's holder MUST have a
         // configured dialable address. Without this a typo'd/omitted `--iroh-peer`
         // node silently degrades to upstream fallback (raw paths) or a fail-closed 404
@@ -1236,38 +1237,75 @@ async fn setup_p2p_source(
             });
         }
 
-        let transport_source = Arc::new(TransportNarSource::new(registry, Arc::new(discovery)));
-        chain = Arc::new(FallbackNarSource::new(transport_source, chain));
         println!(
             "daemon: iroh p2p source wired ({} peer(s), {} claim(s))",
             config.iroh_peers.len(),
             config.p2p_claims.len()
         );
-    }
+        Some(Arc::new(TransportNarSource::new(
+            registry,
+            Arc::new(discovery),
+        )))
+    } else {
+        None
+    };
 
-    if config.libp2p_requested() {
+    let libp2p_layer: Option<Arc<dyn NarSource>> = if config.libp2p_requested() {
         // Build + START the libp2p fabric (listen/bootstrap/dial) and wrap it in the
         // Libp2pNarSource. The returned fabric handle is dropped here: the source holds
         // its own Arc clone, keeping the node alive for the process lifetime.
         let (_fabric, libp2p_source) =
             build_libp2p_nar_source(config.libp2p_source_config()?).await?;
-        chain = Arc::new(FallbackNarSource::new(libp2p_source, chain));
         println!(
-            "daemon: libp2p p2p source wired ({} bootstrap peer(s), {} provider dial addr(s))",
+            "daemon: libp2p p2p source started, discovery converging ({} bootstrap peer(s), {} provider dial addr(s))",
             config.libp2p_bootstrap.len(),
             config.libp2p_provider_addrs.len()
         );
-    }
+        Some(libp2p_source)
+    } else {
+        None
+    };
+
+    let chain = compose_nar_chain(libp2p_layer, iroh_layer, upstream.clone());
 
     // The raw-serve allowlist is keyed on the iroh claim set (the task-49 compressed
     // rewrite). libp2p-served paths resolve via the SignedNarHash correlation and do
     // NOT currently participate in the raw-serve allowlist; unifying raw-serve across
-    // both backends is part of the compose follow-up (TASK-145/146).
+    // both backends is a BLOCKING correctness follow-up (TASK-164): a libp2p HIT under
+    // a compressed upstream narinfo would serve RAW bytes a real Nix client rejects.
     let raw_serve: Arc<dyn RawServeDecision> = Arc::new(AllowlistRawServe::new(
         config.p2p_claims.iter().map(|c| c.nar_hash.clone()),
     ));
 
     Ok((chain, raw_serve))
+}
+
+/// Nest the optional p2p layers in front of `upstream` in the documented PRECEDENCE
+/// (TASK-162): libp2p (decentralized kad discovery, PRD-primary) -> iroh (configured
+/// address book) -> HTTP upstream. Each present layer wraps the one below via
+/// [`FallbackNarSource`], so a clean miss/`Unreachable` at one layer falls through to
+/// the next (a `TooLarge` abort still propagates). Built tail-first so the outermost
+/// (primary) source is tried first.
+///
+/// This is a PURE function (no I/O) so the precedence is a unit-testable oracle: the
+/// tests below drive it with fake sources and assert which layer answers, so swapping
+/// the layer order (or dropping a layer) is caught by a failing test. Whether
+/// libp2p-first is the RIGHT composition (vs. a transport tournament / dual-stack race)
+/// is the open compose question deferred to the clean daemon-core split (TASK-145/146,
+/// TASK-163).
+fn compose_nar_chain(
+    libp2p: Option<Arc<dyn NarSource>>,
+    iroh: Option<Arc<dyn NarSource>>,
+    upstream: Arc<dyn NarSource>,
+) -> Arc<dyn NarSource> {
+    let mut chain = upstream;
+    if let Some(iroh) = iroh {
+        chain = Arc::new(FallbackNarSource::new(iroh, chain));
+    }
+    if let Some(libp2p) = libp2p {
+        chain = Arc::new(FallbackNarSource::new(libp2p, chain));
+    }
+    chain
 }
 
 /// The `rewrite-narinfo` filter subcommand: read a narinfo on stdin, apply the
@@ -1802,6 +1840,125 @@ mod tests {
         assert_eq!(src.network_scope, "v1", "default scope");
         // Omitted seed is filled by a fresh /dev/urandom one (not a fixed default).
         assert_ne!(src.identity_seed, [0u8; 32]);
+        // The PRODUCTION default budget/envelope must be non-degenerate (a zero deadline
+        // or peer cap would make the binary's libp2p source silently answer nothing).
+        assert!(src.discovery_budget.deadline > std::time::Duration::ZERO);
+        assert!(src.discovery_budget.max_peers > 0);
+        assert!(src.envelope.total_timeout > std::time::Duration::ZERO);
+    }
+
+    #[test]
+    fn libp2p_source_config_is_idempotent_in_identity() {
+        // Two builds of the config yield the SAME identity (the seed is resolved ONCE in
+        // from_args, not minted per call) - the SSOT/idempotency fix.
+        let peer = PeerId::random();
+        let config = Config::from_args(vec![
+            "--libp2p-bootstrap".to_string(),
+            format!("{peer}@/ip4/127.0.0.1/tcp/4001"),
+        ])
+        .unwrap();
+        let a = config.libp2p_source_config().unwrap();
+        let b = config.libp2p_source_config().unwrap();
+        assert_eq!(
+            a.identity_seed, b.identity_seed,
+            "one config -> one identity"
+        );
+    }
+
+    // ---- compose_nar_chain precedence oracle (bites by mutation) -------------
+    // A fake NarSource that either ANSWERS (Ok, body = its tag) or MISSES
+    // (Unreachable, so FallbackNarSource falls through to the next layer).
+    struct TaggedSource {
+        tag: &'static str,
+        answer: bool,
+    }
+
+    #[async_trait::async_trait]
+    impl daemon::NarSource for TaggedSource {
+        async fn resolve(
+            &self,
+            _key: &daemon::NarKey,
+            _expected_size: Option<u64>,
+        ) -> Result<daemon::UpstreamResponse, daemon::SourceError> {
+            use http_body_util::{BodyExt, Full};
+            if self.answer {
+                Ok(daemon::UpstreamResponse {
+                    status: 200,
+                    headers: http::HeaderMap::new(),
+                    body: Full::new(bytes::Bytes::from_static(self.tag.as_bytes()))
+                        .map_err(|never| match never {})
+                        .boxed(),
+                })
+            } else {
+                Err(daemon::SourceError::Unreachable(format!(
+                    "{} miss",
+                    self.tag
+                )))
+            }
+        }
+    }
+
+    async fn answering_layer(chain: &Arc<dyn NarSource>) -> String {
+        let key = daemon::NarKey::UpstreamPath(daemon::NarPathToken::new("probe.nar"));
+        let resp = chain.resolve(&key, None).await.expect("some layer answers");
+        let bytes = http_body_util::BodyExt::collect(resp.body)
+            .await
+            .expect("body collects")
+            .to_bytes();
+        String::from_utf8(bytes.to_vec()).expect("tag is utf8")
+    }
+
+    fn tagged(tag: &'static str, answer: bool) -> Arc<dyn NarSource> {
+        Arc::new(TaggedSource { tag, answer })
+    }
+
+    #[tokio::test]
+    async fn compose_nar_chain_precedence_libp2p_then_iroh_then_upstream() {
+        // All three present, all would answer: libp2p (primary) wins. Swapping the two
+        // layer blocks in compose_nar_chain flips this to "iroh" - the mutation bites.
+        let chain = compose_nar_chain(
+            Some(tagged("libp2p", true)),
+            Some(tagged("iroh", true)),
+            tagged("upstream", true),
+        );
+        assert_eq!(answering_layer(&chain).await, "libp2p");
+
+        // libp2p MISSES -> falls through to iroh (NOT straight to upstream).
+        let chain = compose_nar_chain(
+            Some(tagged("libp2p", false)),
+            Some(tagged("iroh", true)),
+            tagged("upstream", true),
+        );
+        assert_eq!(answering_layer(&chain).await, "iroh");
+
+        // libp2p and iroh both MISS -> HTTP upstream (the S2 tail).
+        let chain = compose_nar_chain(
+            Some(tagged("libp2p", false)),
+            Some(tagged("iroh", false)),
+            tagged("upstream", true),
+        );
+        assert_eq!(answering_layer(&chain).await, "upstream");
+    }
+
+    #[tokio::test]
+    async fn compose_nar_chain_each_layer_optional_and_additive() {
+        // libp2p-only (no iroh): libp2p primary, upstream tail; iroh layer absent.
+        let chain = compose_nar_chain(Some(tagged("libp2p", true)), None, tagged("upstream", true));
+        assert_eq!(answering_layer(&chain).await, "libp2p");
+        let chain = compose_nar_chain(
+            Some(tagged("libp2p", false)),
+            None,
+            tagged("upstream", true),
+        );
+        assert_eq!(answering_layer(&chain).await, "upstream");
+
+        // iroh-only (no libp2p): the pre-existing iroh path is untouched/additive.
+        let chain = compose_nar_chain(None, Some(tagged("iroh", true)), tagged("upstream", true));
+        assert_eq!(answering_layer(&chain).await, "iroh");
+
+        // Neither: bare HTTP upstream.
+        let chain = compose_nar_chain(None, None, tagged("upstream", true));
+        assert_eq!(answering_layer(&chain).await, "upstream");
     }
 
     #[test]
