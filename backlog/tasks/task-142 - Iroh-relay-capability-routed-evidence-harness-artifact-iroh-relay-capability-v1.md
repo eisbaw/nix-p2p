@@ -7,7 +7,7 @@ status: In Progress
 assignee:
   - '@claude'
 created_date: '2026-08-11 22:55'
-updated_date: '2026-08-12 03:40'
+updated_date: '2026-08-12 13:37'
 labels:
   - iroh
   - discovery
@@ -49,5 +49,10 @@ inc1: feature-gated relay evidence binaries (server+peer) DONE, committed 99376b
 ## Implementation Notes
 
 <!-- SECTION:NOTES:BEGIN -->
-CORRECTION 2026-08-12: inc3 orchestration ALSO landed (783873c - scripts/iroh_relay_capability_evidence.py +308 lines wiring the 8-arm routed run + per-arm pcaps the finalizer consumes; peer binary tweak). cargo build --workspace GREEN at HEAD. So all THREE code increments (binaries 99376b9, harness 2359220, orchestration 783873c + half-open b91ea42) are committed and buildable. The ONLY remaining step is executing the routed run to PRODUCE artifacts/iroh-relay-capability-v1.json - which needs 'nix build .#iroh-relay-evidence-image' + live podman/tcpdump debugging of the routed topology. The agent spin-looped re-launching that image build across resumes (eating disk); orchestrator TaskStopped it and killed the builds. NEXT SESSION: build the image once, run scripts/iroh_relay_capability_evidence.py, verify+finalize the artifact -> then TASK-89.
+inc3 landed (pending DEEP gate). The routed relay artifact is produced from a REAL rootless-podman routed run, not fabricated. Three root-cause harness bugs were found and fixed while getting the run to complete + satisfy the finalizer:
+  (1) e04d6e9: /control + /evidence bind mounts passed a relative source -> podman treated it as a named volume (slashes rejected). Fixed with .resolve(), matching the node-lookup idiom.
+  (2) e04d6e9: the per-acceptor-arm acceptor uses a run-scoped name; signal_and_wait only stops it, so it collided with the next acceptor-arm create. Added rm -f after stop.
+  (3) 9257988: the acceptor always routed to the whole connector subnet, so on a relay-only arm its OWN iroh hole-punch probe reached the connector directly (1 captured direct-peer packet). The finalizer zero-direct guard CORRECTLY rejected that as falsifiable. Fixed: open the acceptor->connector route ONLY for the direct-positive control; relay arms keep it closed. The oracle bit by mutation.
+Artifact (220c6b3): artifacts/iroh-relay-capability-v1.json verdict=pass, failed_constraints=[], bound to implementation commit 9257988, sha256=971d4f71...2359b14. Arms: relay-success=relayed relay_attributed 124/0 relay/direct; direct-positive control=direct 0/37 (NOT relay-credited); wrong-url typed at 56ms; relay-outage/wrong-cert/wrong-identity/half-open fail closed within the 11s deadline. production-shaped-local, no n0/public relay.
+AC status: #1 (real routed artifact verdict=pass) MET; #2 (self-tests wired into just test L118-120 + green) MET; #3 (production-shaped, no public relay) MET. DEEP gate (qa + mped-architect + codex cross-model) running before marking Done.
 <!-- SECTION:NOTES:END -->
