@@ -89,8 +89,8 @@ are already `dyn` today (`Arc<dyn NarSource>`, `Box<dyn Transport>`).
 never appear. The fabric is a *concrete struct* whose capabilities are
 `Option<Arc<dyn …>>` — dynamic dispatch, chosen deliberately: every axis is
 I/O-bound so the vtable hop is unmeasurable, while trait objects keep the
-frontend non-generic (no viral `<F>`), make per-axis test doubles trivial, and
-let a dual-stack fabric mix a libp2p directory with an iroh transfer.
+frontend non-generic (no viral `<F>`) and make per-axis test doubles trivial
+(fake one capability, not a whole generic fabric).
 `#[async_trait]` already boxes every call, so "static is faster" is moot anyway.
 
 ```rust
@@ -120,7 +120,7 @@ protects against a miswiring that cannot occur).
 > two per-backend binaries. Associated-type static dispatch was considered and
 > rejected: separate binaries already remove its only real upside
 > (monomorphisation bloat), leaving only its costs — viral generics, all-axes
-> test doubles, no dual-stack mixing.
+> test doubles.
 
 ## Design principles
 
