@@ -38,10 +38,16 @@ from __future__ import annotations
 import argparse
 import ipaddress
 import json
+import re
+import struct
 import sys
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import NoReturn
+
+from cryptography.hazmat.primitives import serialization
+from cryptography.hazmat.primitives.asymmetric import ed25519
 
 import iroh_node_publication_evidence as publication
 
@@ -135,6 +141,7 @@ class Topology:
     acceptor_ip: str
     router_acceptor_ip: str
     relay_ip: str
+    dead_relay_ip: str
 
     @property
     def label(self) -> str:
@@ -202,6 +209,10 @@ def make_topology(
         acceptor_ip=str(acceptor_hosts[9]),
         router_acceptor_ip=str(acceptor_hosts[19]),
         relay_ip=str(acceptor_hosts[39]),
+        # A routable-but-unused acceptor-subnet address: the relay-outage arm
+        # points the connector here, so the relay is genuinely unreachable
+        # (packets are forwarded by the router but nothing listens).
+        dead_relay_ip=str(acceptor_hosts[41]),
     )
 
 
@@ -321,13 +332,15 @@ def relay_command(
     ]
 
 
-def acceptor_command(config: RunConfig, topology: Topology) -> list[str]:
+def acceptor_command(
+    config: RunConfig, topology: Topology, scenario: str = "relay-success"
+) -> list[str]:
     inner = [
         "/bin/iroh-relay-evidence-peer",
         "--role",
         "accept",
         "--scenario",
-        "relay-success",
+        scenario,
         "--relay-url",
         topology.relay_url,
         "--iroh-bind",
@@ -375,6 +388,9 @@ def connector_command(
     if scenario == "wrong-url":
         # A config-time typed failure: an http (non-https) relay URL.
         relay_url = f"http://{topology.relay_ip}:{RELAY_HTTPS_PORT}"
+    elif scenario == "relay-outage":
+        # A routable address where no relay listens: a real relay outage.
+        relay_url = f"https://{topology.dead_relay_ip}:{RELAY_HTTPS_PORT}"
 
     inner = [
         "/bin/iroh-relay-evidence-peer",
@@ -396,7 +412,10 @@ def connector_command(
     if scenario in ("direct-positive", "forced-direct-failure"):
         inner += ["--peer-direct-addr", f"{topology.acceptor_ip}:{IROH_PORT}"]
 
-    routes = [(f"{topology.relay_ip}/32", topology.router_connector_ip)]
+    if scenario == "relay-outage":
+        routes = [(f"{topology.dead_relay_ip}/32", topology.router_connector_ip)]
+    else:
+        routes = [(f"{topology.relay_ip}/32", topology.router_connector_ip)]
     if scenario == "direct-positive":
         # The control deliberately opens the direct path so the connection goes
         # direct and is not credited to the relay.
@@ -574,15 +593,282 @@ def command_plan(
     return plan
 
 
-def run_evidence(config: RunConfig) -> None:  # pragma: no cover - needs podman
-    """Best-effort routed orchestration. Not exercised by the container-free
-    self-test; the full routed run is driven by ``just iroh-relay-evidence`` and
-    validated by the finalizer."""
-    fail(
-        "routed relay-capability orchestration is not yet wired end-to-end in "
-        "this environment; run --self-test for the gated command/outcome checks. "
-        "See TASK-142 notes for the routed-run blocker."
+# Which arms need a live acceptor peer (they establish a real connection), and
+# which run against the relay/no-peer only. The order runs the fast config arm
+# first and groups the slow deadline arms last.
+ARM_ORDER = (
+    "wrong-url",
+    "relay-success",
+    "direct-positive",
+    "half-open-stream",
+    "wrong-certificate",
+    "wrong-identity",
+    "relay-outage",
+    "forced-direct-failure",
+)
+ACCEPTOR_ARMS = frozenset({"relay-success", "direct-positive", "half-open-stream"})
+
+READY_SERVER = re.compile(r"iroh_relay_evidence_server_ready\b")
+READY_ACCEPTOR = re.compile(r"node_id=([0-9a-f]{64})")
+
+
+def foreign_node_id() -> str:
+    """A valid, unrelated Ed25519 public key for the arms that must connect to a
+    NodeId nobody serves (wrong-identity) or that never reach a peer at all."""
+    key = ed25519.Ed25519PrivateKey.generate().public_key()
+    raw = key.public_bytes(serialization.Encoding.Raw, serialization.PublicFormat.Raw)
+    return raw.hex()
+
+
+def parse_pcap_flows(data: bytes) -> list[tuple[str, int, str, int]]:
+    """Parse a classic pcap into (src_ip, src_port, dst_ip, dst_port) tuples for
+    every IPv4 TCP/UDP packet. Handles Ethernet, Linux SLL and SLL2 link layers
+    (``-i any`` uses SLL/SLL2). This is the packet-attribution primitive: it is
+    what proves relay packets flowed and direct-peer packets did not."""
+    if len(data) < 24:
+        return []
+    if data[:4] == b"\xa1\xb2\xc3\xd4":
+        endian = ">"
+    elif data[:4] == b"\xd4\xc3\xb2\xa1":
+        endian = "<"
+    else:
+        return []
+    linktype = struct.unpack(endian + "I", data[20:24])[0]
+    offset = 24
+    flows: list[tuple[str, int, str, int]] = []
+    while offset + 16 <= len(data):
+        incl_len = struct.unpack(endian + "I", data[offset + 8 : offset + 12])[0]
+        offset += 16
+        frame = data[offset : offset + incl_len]
+        offset += incl_len
+        flow = _decode_ipv4_flow(linktype, frame)
+        if flow is not None:
+            flows.append(flow)
+    return flows
+
+
+def _decode_ipv4_flow(linktype: int, frame: bytes) -> tuple[str, int, str, int] | None:
+    if linktype == 1:  # Ethernet
+        if len(frame) < 14 or frame[12:14] != b"\x08\x00":
+            return None
+        payload = frame[14:]
+    elif linktype == 113:  # Linux SLL
+        if len(frame) < 16 or frame[14:16] != b"\x08\x00":
+            return None
+        payload = frame[16:]
+    elif linktype == 276:  # Linux SLL2
+        if len(frame) < 20 or frame[0:2] != b"\x08\x00":
+            return None
+        payload = frame[20:]
+    elif linktype == 101:  # raw IPv4
+        payload = frame
+    else:
+        return None
+    if len(payload) < 20 or (payload[0] >> 4) != 4:
+        return None
+    ihl = (payload[0] & 0x0F) * 4
+    protocol = payload[9]
+    if protocol not in (6, 17) or len(payload) < ihl + 4:
+        return None
+    src_ip = ".".join(str(byte) for byte in payload[12:16])
+    dst_ip = ".".join(str(byte) for byte in payload[16:20])
+    src_port = struct.unpack(">H", payload[ihl : ihl + 2])[0]
+    dst_port = struct.unpack(">H", payload[ihl + 2 : ihl + 4])[0]
+    return (src_ip, src_port, dst_ip, dst_port)
+
+
+def count_endpoint_packets(
+    flows: list[tuple[str, int, str, int]], ip: str, port: int
+) -> int:
+    """Count packets to OR from ``ip:port`` — the traffic attributed to one
+    endpoint (the relay, or the direct peer)."""
+    total = 0
+    for src_ip, src_port, dst_ip, dst_port in flows:
+        if (src_ip == ip and src_port == port) or (dst_ip == ip and dst_port == port):
+            total += 1
+    return total
+
+
+def cleanup_by_label(runner: publication.Runner, config: RunConfig, label: str) -> None:
+    containers = runner.run(
+        [config.podman, "ps", "-aq", "--filter", f"label={label}"], check=False
+    ).stdout.split()
+    for container in containers:
+        runner.run([config.podman, "rm", "-f", container.decode()], check=False)
+    networks = runner.run(
+        [config.podman, "network", "ls", "-q", "--filter", f"label={label}"],
+        check=False,
+    ).stdout.split()
+    for network in networks:
+        runner.run(
+            [config.podman, "network", "rm", "-f", network.decode()], check=False
+        )
+
+
+def occupied_networks(
+    runner: publication.Runner, config: RunConfig
+) -> tuple[ipaddress.IPv4Network, ...]:
+    result = runner.run(
+        [config.podman, "network", "ls", "-q"], check=False
+    ).stdout.split()
+    nets: list[ipaddress.IPv4Network] = []
+    for name in result:
+        inspect = runner.run(
+            [config.podman, "network", "inspect", name.decode()], check=False
+        )
+        try:
+            for entry in json.loads(inspect.stdout or b"[]"):
+                for subnet in entry.get("subnets", []) or []:
+                    with_prefix = subnet.get("subnet")
+                    if with_prefix:
+                        nets.append(ipaddress.ip_network(with_prefix, strict=False))
+        except (json.JSONDecodeError, ValueError):
+            continue
+    return tuple(net for net in nets if isinstance(net, ipaddress.IPv4Network))
+
+
+def read_outcome(runner: publication.Runner, config: RunConfig, name: str) -> dict:
+    logs = publication.container_logs(runner, config.podman, name).decode(
+        "utf-8", "backslashreplace"
     )
+    for line in reversed(logs.splitlines()):
+        line = line.strip()
+        if line.startswith("{") and "iroh-relay-evidence-peer-outcome" in line:
+            return json.loads(line)
+    fail(f"connector {name!r} emitted no outcome JSON; log_tail={logs[-2048:]!r}")
+
+
+def run_arm(
+    runner: publication.Runner,
+    config: RunConfig,
+    topology: Topology,
+    scenario: str,
+    gate_dir: Path,
+    foreign_id: str,
+) -> dict[str, object]:
+    """Run one arm: optional acceptor, gated capture + connector, then parse the
+    connector outcome and count captured relay / direct-peer packets."""
+    acceptor_id = foreign_id
+    if scenario in ACCEPTOR_ARMS:
+        acceptor_scenario = (
+            "half-open-stream" if scenario == "half-open-stream" else "relay-success"
+        )
+        runner.run(acceptor_command(config, topology, acceptor_scenario))
+        match, _, _ = publication.wait_for_log(
+            runner, config.podman, topology.acceptor, READY_ACCEPTOR, 20.0
+        )
+        acceptor_id = match.group(1)
+
+    pcap = config.output / f"{scenario}.pcap"
+    gate = gate_dir / "start"
+    runner.run(
+        connector_command(config, topology, scenario, acceptor_id, str(gate_dir))
+    )
+    runner.run(capture_command(config, topology, scenario, config.output))
+    publication.wait_for_capture_ready(
+        runner, config.podman, topology.capture(scenario), pcap, 15.0
+    )
+
+    started = time.monotonic()
+    gate.write_bytes(b"go\n")
+    exit_code = publication.wait_for_exit(
+        runner, config.podman, topology.connector(scenario), 20.0
+    )
+    elapsed_ms = int((time.monotonic() - started) * 1000)
+    if exit_code not in (0, 4):
+        fail(f"{scenario}: connector exited unexpectedly with {exit_code}")
+
+    outcome = read_outcome(runner, config, topology.connector(scenario))
+    # Flush and stop the capture, then count packets from the written pcap.
+    publication.signal_and_wait(
+        runner, config.podman, topology.capture(scenario), "INT", 10.0
+    )
+    flows = parse_pcap_flows(pcap.read_bytes())
+    relay_packets = count_endpoint_packets(flows, topology.relay_ip, RELAY_HTTPS_PORT)
+    direct_packets = count_endpoint_packets(flows, topology.acceptor_ip, IROH_PORT)
+
+    if scenario in ACCEPTOR_ARMS:
+        publication.signal_and_wait(
+            runner, config.podman, topology.acceptor, "TERM", 15.0
+        )
+
+    validate_outcome(scenario, outcome)
+    arm = {
+        "scenario": scenario,
+        "verdict": outcome["verdict"],
+        "relay_attributed": bool(outcome.get("relay_attributed")),
+        "captured_relay_packets": relay_packets,
+        "captured_direct_peer_packets": direct_packets,
+        "elapsed_ms": min(elapsed_ms, DEADLINE_MS + GRACE_MS),
+    }
+    if outcome["verdict"] == "connected":
+        arm["connection_path"] = outcome["connection_path"]
+    else:
+        arm["reason"] = outcome["reason"]
+    return arm
+
+
+def run_evidence(config: RunConfig) -> None:
+    runner = publication.Runner()
+    publication.validate_immutable_image_reference(config.image)
+    run_id = f"r{int(time.time()) % 100_000_000:08d}"
+    topology = make_topology(run_id, occupied_networks(runner, config))
+    label = topology.label
+
+    publication.create_private_directory(config.output)
+    gate_dir = config.output / "control"
+    publication.create_private_directory(gate_dir)
+
+    cleanup_by_label(runner, config, label)
+    try:
+        runner.run(image_preflight_command(config, topology))
+        for command in network_commands(config, topology):
+            runner.run(command)
+        for command in router_commands(config, topology):
+            runner.run(command)
+        runner.run(relay_command(config, topology, "1" * 40))
+        publication.wait_for_log(
+            runner, config.podman, topology.relay, READY_SERVER, 25.0
+        )
+
+        arms: list[dict[str, object]] = []
+        for scenario in ARM_ORDER:
+            foreign = foreign_node_id()
+            arms.append(run_arm(runner, config, topology, scenario, gate_dir, foreign))
+            # Reset the per-arm gate for the next connector.
+            (gate_dir / "start").unlink(missing_ok=True)
+
+        run_record = {
+            "schema": SCHEMA,
+            "profile": PROFILE,
+            "run_id": run_id,
+            "relay": {
+                "kind": "local-routed-iroh-relay",
+                "relay_url": topology.relay_url,
+                "owner": OWNER,
+                "authorization_class": PROFILE,
+                "external_contact_authorized": False,
+            },
+            "capture": {
+                "scope": CAPTURE_SCOPE,
+                "interface": CAPTURE_INTERFACE,
+                "filter": CAPTURE_FILTER,
+            },
+            "topology": {
+                "run_id": run_id,
+                "connector_network": topology.connector_network,
+                "acceptor_network": topology.acceptor_network,
+                "connector_subnet": topology.connector_subnet,
+                "acceptor_subnet": topology.acceptor_subnet,
+                "relay_ip": topology.relay_ip,
+            },
+            "deadline_ms": DEADLINE_MS,
+            "grace_ms": GRACE_MS,
+            "arms": [dict(arm) for arm in sorted(arms, key=lambda a: a["scenario"])],
+        }
+        publication.write_new(config.output / "run.json", canonical_json(run_record))
+    finally:
+        cleanup_by_label(runner, config, label)
 
 
 def self_test() -> None:

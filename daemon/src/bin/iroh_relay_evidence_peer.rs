@@ -426,10 +426,13 @@ async fn run_connect(config: &Config, relay: &RelayTransportConfig) -> serde_jso
     };
 
     // Build the target address. Relay-only arms carry NO direct address, so a
-    // successful connection can only be relayed. The direct arms additionally
-    // offer the peer's direct socket.
+    // successful connection can only be relayed. The DIRECT arms
+    // (direct-positive control, forced-direct-failure) carry ONLY a direct
+    // socket and NO relay URL, so the path can never start relayed and upgrade:
+    // a direct-positive connection is unambiguously `direct` (and never credited
+    // to the relay), and forced-direct-failure genuinely has no relay fallback.
     let mut endpoint_addr = EndpointAddr::new(peer_node_id);
-    if !matches!(config.scenario, Scenario::ForcedDirectFailure) {
+    if !config.scenario.offers_direct() {
         endpoint_addr = endpoint_addr.with_relay_url(relay.relay_url().clone());
     }
     if config.scenario.offers_direct()
