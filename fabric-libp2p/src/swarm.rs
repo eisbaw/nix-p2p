@@ -177,6 +177,65 @@ impl SwarmHandle {
         rx.await.unwrap_or(0)
     }
 
+    /// Join the network through a SET of independently-operated bootstrap peers. Pass
+    /// `>=3` so NO single bootstrap is load-bearing: this teaches kad every bootstrap's
+    /// address, dials them all (not just the first), runs ONE bootstrap self-lookup, then
+    /// waits until the routing table holds at least `min_peers`. Losing any single
+    /// bootstrap after a successful join still leaves the node routable - that is the
+    /// bootstrap-independence property (TASK-153; `tests/bootstrap_independence.rs`).
+    ///
+    /// This is the standard, reusable "join through all of them" the composition root and
+    /// tests share; it composes the same [`add_address`](Self::add_address) +
+    /// [`dial`](Self::dial) + [`bootstrap`](Self::bootstrap) + poll-`routing_peers` idiom
+    /// the single-bootstrap join used, generalized to a set.
+    ///
+    /// Fail-fast, never a silent stall: an EMPTY set is a caller error (`Err`); a dial
+    /// that fails to INITIATE is logged but not fatal on its own (another bootstrap may
+    /// still admit us - the routing-table poll is the real readiness oracle); and if the
+    /// routing table never reaches `min_peers` within `timeout` that is a real join
+    /// failure returned as `Err` with context.
+    pub async fn join_bootstraps(
+        &self,
+        bootstraps: &[(PeerId, Multiaddr)],
+        min_peers: usize,
+        timeout: Duration,
+    ) -> Result<(), String> {
+        if bootstraps.is_empty() {
+            return Err("join_bootstraps needs at least one bootstrap peer".to_string());
+        }
+
+        // Teach kad every bootstrap address and dial them ALL, so the join does not funnel
+        // through a single entry node.
+        for (peer, addr) in bootstraps {
+            self.add_address(*peer, addr.clone()).await;
+            if let Err(why) = self.dial(addr.clone()).await {
+                tracing::warn!(
+                    %peer, %addr, %why,
+                    "fabric-libp2p: a bootstrap dial failed to initiate; continuing with the rest"
+                );
+            }
+        }
+
+        // One bootstrap self-lookup populates the routing table from whichever bootstraps
+        // answered; tolerate its immediate result and rely on the poll below as readiness.
+        let _ = self.bootstrap().await;
+
+        let deadline = Instant::now() + timeout;
+        loop {
+            if self.routing_peers().await >= min_peers {
+                return Ok(());
+            }
+            if Instant::now() >= deadline {
+                return Err(format!(
+                    "routing table did not reach {min_peers} peer(s) within {timeout:?} \
+                     after dialing {} bootstrap(s)",
+                    bootstraps.len()
+                ));
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    }
+
     /// Announce this node as a provider of `key` (the multi-provider index).
     pub async fn start_providing(&self, key: kad::RecordKey) -> Result<(), String> {
         let (reply, rx) = oneshot::channel();
