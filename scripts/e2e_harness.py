@@ -117,14 +117,23 @@ LIBP2P_SCOPE = "e2e-s7"
 # Base TCP port for the in-pod libp2p listeners; role i (in `_daemon_roles` order)
 # listens on LIBP2P_BASE_PORT + i. Deliberately far from the HTTP 808x band.
 LIBP2P_BASE_PORT = 37000
-# A syntactically valid but UNREACHABLE ed25519 PeerId used as the GENESIS node's
-# `--libp2p-bootstrap` entry. Every libp2p daemon requires a bootstrap peer, but the
-# first node has no one to point at; kad's self-lookup against an unreachable entry
-# fails best-effort (source_libp2p.rs), so the node still binds + announces. Computed
-# once from a fixed seed (identity-multihash of an ed25519 pubkey -> base58btc); it
-# only needs to PARSE, never to answer. If a libp2p version bump ever rejects it, the
-# genesis node fails LOUD at CLI parse (not silently), so this cannot rot unnoticed.
+# A syntactically valid but UNREACHABLE ed25519 PeerId used as the GENESIS (BOOT)
+# node's `--libp2p-bootstrap` entry. Every libp2p daemon requires a bootstrap peer, but
+# the first node has no one to point at; kad's self-lookup against an unreachable entry
+# fails best-effort (source_libp2p.rs), so the node still binds and joins as a lone kad
+# router. Computed once from a fixed seed (identity-multihash of an ed25519 pubkey ->
+# base58btc); it only needs to PARSE, never to answer. If a libp2p version bump ever
+# rejects it, BOOT fails LOUD at CLI parse (not silently), so this cannot rot unnoticed.
 LIBP2P_DUMMY_PEER = "12D3KooWPMRVzCGYHwfnPZAWzDX2A7YvyESXGYZx5WrBvc4vgsze"
+# The dedicated BOOTSTRAP node's FIXED identity: a PURE kad router (NOT a provider, so
+# it never announces and never hits the put-provider quorum a lone genesis provider
+# cannot satisfy). Its identity seed is fixed so its PeerId is DERIVABLE offline - the
+# provider and consumer bootstrap to `<LIBP2P_BOOT_PEER_ID>@/ip4/127.0.0.1/tcp/<port>`
+# with no printed-address round-trip (a non-provider node cannot print its address).
+# PeerId is the identity-multihash base58btc of the ed25519 pubkey of the seed; a drift
+# between the two is caught at the first S7 run (P cannot reach BOOT -> announce fails).
+LIBP2P_BOOT_SEED_HEX = "1b" * 32
+LIBP2P_BOOT_PEER_ID = "12D3KooWBr7cTGxmMhdiGNcbesEusWMR1VG26jEQQgFr6wwZkNNf"
 # Seconds to let the 3-node kad DHT converge (BOOT<->P<->C identify + routing) AFTER
 # the consumer is up, BEFORE the measured build. A per-NAR `find_providers` that races
 # an unconverged DHT would miss -> upstream fallback and a FALSE negative on the
@@ -462,7 +471,6 @@ class Pod:
         state_root: Path | None = None,
         libp2p_seed_dir: Path | None = None,
         libp2p_provider_seeds: tuple[P2pSeed, ...] = (),
-        libp2p_boot_seeds: tuple[P2pSeed, ...] = (),
     ):
         self.ctx = ctx
         self.pod = f"{POD_PREFIX}-{name}"
@@ -499,32 +507,27 @@ class Pod:
                 f"Pod: p2p_holders={self.p2p_holders} outside 1..{MAX_P2P_HOLDERS} "
                 "(higher counts collide with other published host ports)"
             )
-        # libp2p (S7, TASK-161): a THREE-daemon decentralized topology - a genesis
-        # BOOT node (a provider seeding only a DECOY nar, so it prints its address
-        # and joins the DHT but does NOT hold the target), a PROVIDER `P` that seeds
-        # the real target NAR and joins the DHT through BOOT, and a CONSUMER `C` wired
-        # to bootstrap off BOOT ALONE - never told P's dial address. C discovers P via
-        # libp2p-kad get_providers and resolves P's dial address via kad peer-routing
-        # (both inside the fabric, TASK-159/169). Mutually exclusive with the iroh p2p
-        # and the plain daemon/chain paths. All three share the pod's loopback netns
-        # (an HONEST scope limit vs a separate-netns routed network - see
-        # `_create_libp2p`). `libp2p_boot_seeds` holding a DIFFERENT nar from
-        # `libp2p_provider_seeds` is what makes the F1 load-bearing control clean:
-        # BOOT (C's only direct peer) cannot serve the target, so peer-served bytes
-        # can ONLY have come from a DHT-discovered+resolved dial to P.
+        # libp2p (S7, TASK-161): a THREE-daemon decentralized topology - a dedicated
+        # BOOT node (a PURE kad router, FIXED identity, holds NO content and never
+        # announces), a PROVIDER `P` that seeds the real target NAR and joins the DHT
+        # through BOOT (so its put-provider reaches quorum against a reachable BOOT -
+        # a lone genesis provider cannot), and a CONSUMER `C` wired to bootstrap off
+        # BOOT ALONE - never told P's dial address. C discovers P via libp2p-kad
+        # get_providers and resolves P's dial address via kad peer-routing (both inside
+        # the fabric, TASK-159/169). Mutually exclusive with the iroh p2p and the plain
+        # daemon/chain paths. All three share the pod's loopback netns (an HONEST scope
+        # limit vs a separate-netns routed network - see `_create_libp2p`). BOOT (C's
+        # only direct peer) holding NO content is what makes the F1 load-bearing
+        # control clean: peer-served target bytes can ONLY have come from a
+        # DHT-discovered+resolved dial to P.
         self.libp2p = bool(libp2p_provider_seeds)
         self.libp2p_seed_dir = libp2p_seed_dir
         self.libp2p_provider_seeds = tuple(libp2p_provider_seeds)
-        self.libp2p_boot_seeds = tuple(libp2p_boot_seeds)
         # Parsed once the provider announces; the positive oracle reads it to assert C
         # was NEVER configured with it (no-injection).
         self.libp2p_provider_identity: tuple[str, str] | None = None
         if self.libp2p and (with_daemon or daemon_chain or bool(p2p_seeds)):
             die("Pod: libp2p is mutually exclusive with with_daemon/daemon_chain/p2p")
-        if self.libp2p and not self.libp2p_boot_seeds:
-            die(
-                "Pod: libp2p topology needs libp2p_boot_seeds (BOOT must serve >=1 nar)"
-            )
         # Optional HOST directory under which each daemon role gets its own
         # bind-mounted state dir (used as `--narinfo-cache-dir`). Present so
         # task-42 can measure a node's on-disk footprint by walking the host side
@@ -620,9 +623,9 @@ class Pod:
         if self.libp2p:
             # lp-consumer (index 0 -> DAEMON_PORT) is the client's substituter, so the
             # generic publish/await/HTTP loops map it to the standard daemon ports.
-            # lp-provider (+1) holds the target NAR; lp-boot (+2) is the genesis
-            # bootstrap + decoy provider. Bring-up order (BOOT, then P, then C) is
-            # handled in `_create_libp2p`; this list is the PORT/HTTP order.
+            # lp-provider (+1) holds the target NAR; lp-boot (+2) is the dedicated
+            # bootstrap (a pure kad router, no content). Bring-up order (BOOT, then P,
+            # then C) is handled in `_create_libp2p`; this list is the PORT/HTTP order.
             return ["lp-consumer", "lp-provider", "lp-boot"]
         if self.p2p:
             # node-a (index 0 -> DAEMON_PORT, the client's substituter) first so
@@ -962,18 +965,22 @@ class Pod:
     def _create_libp2p(self) -> None:
         """Three-daemon decentralized libp2p bring-up (S7, TASK-161).
 
-        Order matters and CANNOT use a single-shot loop: each node's
-        `--libp2p-bootstrap` needs the PRIOR node's announced PeerId+address.
+        Order matters: P (and C) must bootstrap to a REACHABLE BOOT, or P's
+        put-provider announce cannot reach quorum (a lone genesis provider fails with
+        "the quorum failed; needed 1 peers").
 
-          1. BOOT (genesis): a `--libp2p-provider` seeding only the DECOY nar. Every
-             libp2p daemon requires a bootstrap peer, but the genesis has none - so it
-             points at LIBP2P_DUMMY_PEER (valid format, unreachable); kad's self-lookup
-             fails best-effort and BOOT still binds + announces. We read its
-             LIBP2P-PROVIDER-ADDR.
+          1. BOOT: a PURE kad router - a consumer-shaped daemon (NOT a provider, so it
+             never announces) with the FIXED LIBP2P_BOOT_SEED_HEX identity, so its
+             PeerId (LIBP2P_BOOT_PEER_ID) is known offline without a printed-address
+             round-trip. It requires a bootstrap peer like any libp2p daemon, so it
+             points at LIBP2P_DUMMY_PEER (valid format, unreachable); its self-lookup
+             fails best-effort and it still binds as a lone router. We wait for its HTTP
+             readiness (a proxy for "kad listener bound") BEFORE starting P.
           2. P (provider): seeds the REAL target NAR, bootstraps to BOOT, joins the DHT
-             (identify tells BOOT P's dial address - the address C later resolves via
-             kad peer-routing). We read its LIBP2P-PROVIDER-ADDR and stash it so the
-             oracle can assert C was NEVER configured with it.
+             and ANNOUNCES (quorum satisfied by the reachable BOOT). identify tells BOOT
+             P's dial address - the address C later resolves via kad peer-routing. We
+             read P's LIBP2P-PROVIDER-ADDR and stash it so the oracle can assert C was
+             NEVER configured with it.
           3. C (consumer): bootstraps to BOOT ALONE. NO --libp2p-provider-addr. Its
              libp2p NarSource discovers P (get_providers) and resolves P's dial address
              (peer-routing) with zero injection.
@@ -985,67 +992,83 @@ class Pod:
         not exercise NAT/routable-address handling, and it cannot fully isolate the
         peer-ROUTING (address-resolution) leg from an address an earlier kad query may
         have populated in the shared routing table (transport.rs's stated limit). The
-        F1 load-bearing arm is discharged by BOOT NOT holding the target: peer-served
-        target bytes can only have come from a DHT-mediated dial to P.
+        F1 load-bearing arm is discharged by BOOT holding NO content: peer-served target
+        bytes can only have come from a DHT-mediated dial to P.
         """
         if self.libp2p_seed_dir is None:
             die("Pod: libp2p topology given seeds without libp2p_seed_dir")
         proxy = f"http://127.0.0.1:{PROXY_PORT}"
-        seed_mount = f"{self.libp2p_seed_dir}:/srv/seed:ro"
+        boot_peer = f"{LIBP2P_BOOT_PEER_ID}@/ip4/127.0.0.1/tcp/{LIBP2P_BASE_PORT + 2}"
 
-        def seed_flags(seeds: tuple[P2pSeed, ...]) -> list[str]:
-            args: list[str] = []
-            for s in seeds:
-                args += ["--libp2p-seed-nar", f"{s.nar_hash}=/srv/seed/{s.filename}"]
-            return args
-
-        def provider_container(
-            role: str, http_index: int, seeds: tuple[P2pSeed, ...], bootstrap: str
-        ) -> None:
-            listen = f"/ip4/127.0.0.1/tcp/{LIBP2P_BASE_PORT + http_index}"
-            run(
-                [
-                    self._pm,
-                    "run",
-                    "-d",
-                    "--pod",
-                    self.pod,
-                    "--name",
-                    self._c(role),
-                    "--label",
-                    PROJECT_LABEL,
-                    "--volume",
-                    seed_mount,
-                    *self._state_args(role),
-                    self.ctx.image,
-                    "/bin/daemon",
-                    "--listen",
-                    f"0.0.0.0:{DAEMON_PORT + http_index}",
-                    "--upstream",
-                    proxy,
-                    "--libp2p-provider",
-                    "--libp2p-listen",
-                    listen,
-                    "--libp2p-bootstrap",
-                    bootstrap,
-                    "--libp2p-scope",
-                    LIBP2P_SCOPE,
-                    "--libp2p-print-peer-address",
-                    *seed_flags(seeds),
-                    *self._daemon_state_flags(),
-                ]
-            )
-
-        # 1. BOOT (genesis): decoy provider, unreachable dummy bootstrap.
-        dummy = f"{LIBP2P_DUMMY_PEER}@/ip4/127.0.0.1/tcp/1"
-        provider_container("lp-boot", 2, self.libp2p_boot_seeds, dummy)
-        boot_id, boot_listen = self._await_libp2p_identity(
-            "lp-boot", len(self.libp2p_boot_seeds)
+        # 1. BOOT: a pure kad router (fixed identity, no provider, no announce).
+        run(
+            [
+                self._pm,
+                "run",
+                "-d",
+                "--pod",
+                self.pod,
+                "--name",
+                self._c("lp-boot"),
+                "--label",
+                PROJECT_LABEL,
+                *self._state_args("lp-boot"),
+                self.ctx.image,
+                "/bin/daemon",
+                "--listen",
+                f"0.0.0.0:{DAEMON_PORT + 2}",
+                "--upstream",
+                proxy,
+                "--libp2p-listen",
+                f"/ip4/127.0.0.1/tcp/{LIBP2P_BASE_PORT + 2}",
+                "--libp2p-bootstrap",
+                f"{LIBP2P_DUMMY_PEER}@/ip4/127.0.0.1/tcp/1",
+                "--libp2p-identity-seed",
+                LIBP2P_BOOT_SEED_HEX,
+                "--libp2p-scope",
+                LIBP2P_SCOPE,
+                *self._daemon_state_flags(),
+            ]
         )
-        boot_peer = f"{boot_id}@{boot_listen}"
+        # BOOT must be reachable before P announces; its HTTP readiness is our gate.
+        self._await_http_ready("lp-boot", 2)
 
-        # 2. P (provider): real target, bootstraps to BOOT.
-        provider_container("lp-provider", 1, self.libp2p_provider_seeds, boot_peer)
+        # 2. P (provider): seeds the real target, bootstraps to BOOT, announces.
+        seed_args: list[str] = []
+        for s in self.libp2p_provider_seeds:
+            seed_args += ["--libp2p-seed-nar", f"{s.nar_hash}=/srv/seed/{s.filename}"]
+        run(
+            [
+                self._pm,
+                "run",
+                "-d",
+                "--pod",
+                self.pod,
+                "--name",
+                self._c("lp-provider"),
+                "--label",
+                PROJECT_LABEL,
+                "--volume",
+                f"{self.libp2p_seed_dir}:/srv/seed:ro",
+                *self._state_args("lp-provider"),
+                self.ctx.image,
+                "/bin/daemon",
+                "--listen",
+                f"0.0.0.0:{DAEMON_PORT + 1}",
+                "--upstream",
+                proxy,
+                "--libp2p-provider",
+                "--libp2p-listen",
+                f"/ip4/127.0.0.1/tcp/{LIBP2P_BASE_PORT + 1}",
+                "--libp2p-bootstrap",
+                boot_peer,
+                "--libp2p-scope",
+                LIBP2P_SCOPE,
+                "--libp2p-print-peer-address",
+                *seed_args,
+                *self._daemon_state_flags(),
+            ]
+        )
         prov_id, prov_listen = self._await_libp2p_identity(
             "lp-provider", len(self.libp2p_provider_seeds)
         )
@@ -1111,6 +1134,27 @@ class Pod:
             if time.time() > deadline:
                 self._dump_logs()
                 die(f"{role} never announced its libp2p identity + {n_seeds} seed(s)")
+            time.sleep(0.25)
+
+    def _await_http_ready(self, role: str, http_index: int) -> None:
+        """Block until `role`'s HTTP daemon answers /nix-cache-info on its host port.
+
+        Used to gate BOOT before the provider starts: the daemon binds its libp2p
+        listener before it serves HTTP, so a 200 here means BOOT is dialable and P's
+        announce can reach quorum against it. Fail-closed: dies if `role` never becomes
+        ready (a provider that then fails announce would be the misleading symptom)."""
+        url = f"http://127.0.0.1:{HOST_DAEMON + http_index}/nix-cache-info"
+        deadline = time.time() + READY_TIMEOUT_S
+        while True:
+            try:
+                status, _ = http_get(url, timeout=2.0)
+                if status == 200:
+                    return
+            except OSError:
+                pass
+            if time.time() > deadline:
+                self._dump_logs()
+                die(f"{role} did not become HTTP-ready at {url}")
             time.sleep(0.25)
 
     def _await_iroh_identity(
@@ -3822,24 +3866,23 @@ def scenario_s6_compressed_fail_closed(ctx: Ctx, expect) -> None:
 # S7 (task-161): the libp2p arm - a real 3-daemon decentralized discover->resolve->
 # fetch->serve across containers. The target NAR is `lib` (an ALREADY-RAW upstream
 # path), so byte-identity is proven without the compressed->raw narinfo rewrite (that
-# path is exercised by S6's `app`; a libp2p xz target is a documented follow-up). BOOT
-# seeds a DECOY (`app`) so it can never serve the target - the F1 load-bearing lever.
+# path is exercised by S6's `app`; a libp2p xz target is a documented follow-up). The
+# dedicated BOOT node holds NO content, so target bytes can only reach C via a
+# DHT-resolved dial to the provider - the F1 load-bearing lever. `app` is the MISS-arm
+# decoy the provider seeds while C builds `lib` (which no peer announces).
 S7_TARGET = "lib"
 S7_DECOY = "app"
 
 
-def _s7_seed_split(ctx: Ctx, tag: str):
-    """Materialise the raw NARs and split them: (seed_dir, provider_seeds, boot_seeds,
-    target_store_path). The provider holds ONLY the target; BOOT holds ONLY the decoy."""
+def _s7_seeds(ctx: Ctx, tag: str, attr: str):
+    """Materialise `attr`'s raw NAR into a fresh seed dir; return
+    (seed_dir, (that_seed,), target_store_path). The provider is given exactly this
+    seed. The dedicated BOOT node holds NO content in either arm, so a peer-served
+    target can only have come from a DHT-resolved dial to the provider."""
     seed_dir, seeds = build_p2p_seed_dir(
-        ctx.fixtures, ctx.scratch / f"s7-{tag}-seed", [S7_TARGET, S7_DECOY]
+        ctx.fixtures, ctx.scratch / f"s7-{tag}-seed", [attr]
     )
-    by_attr = {
-        ctx.fixtures.store_path(a): s for a, s in zip([S7_TARGET, S7_DECOY], seeds)
-    }
-    target_sp = ctx.fixtures.store_path(S7_TARGET)
-    decoy_sp = ctx.fixtures.store_path(S7_DECOY)
-    return seed_dir, (by_attr[target_sp],), (by_attr[decoy_sp],), target_sp
+    return seed_dir, (seeds[0],), ctx.fixtures.store_path(S7_TARGET)
 
 
 def scenario_s7_libp2p(ctx: Ctx, expect) -> None:
@@ -3848,13 +3891,13 @@ def scenario_s7_libp2p(ctx: Ctx, expect) -> None:
     load-bearing control (kill the provider -> the DHT-mediated peer path is the only
     route to the target -> the build falls back to upstream).
 
-    Topology (3 real daemon containers): BOOT (genesis provider seeding the DECOY),
+    Topology (3 real daemon containers): BOOT (a pure kad router holding NO content),
     PROVIDER P (seeds the target), CONSUMER C (bootstraps to BOOT ALONE). C is NEVER
     told P's dial address; it discovers P via kad get_providers and resolves P's
     address via kad peer-routing (inside the fabric).
     """
     fixtures = ctx.fixtures
-    seed_dir, prov_seeds, boot_seeds, target_sp = _s7_seed_split(ctx, "core")
+    seed_dir, prov_seeds, target_sp = _s7_seeds(ctx, "core", S7_TARGET)
     target_size = prov_seeds[0].nar_size
 
     with Pod(
@@ -3865,7 +3908,6 @@ def scenario_s7_libp2p(ctx: Ctx, expect) -> None:
         expect=expect,
         libp2p_seed_dir=seed_dir,
         libp2p_provider_seeds=prov_seeds,
-        libp2p_boot_seeds=boot_seeds,
     ) as pod:
         # -- no-injection oracle: C's argv proves it was never handed P's address --
         prov_id = (
@@ -3905,7 +3947,7 @@ def scenario_s7_libp2p(ctx: Ctx, expect) -> None:
         nar_up = stats["upstream"].get("nar", 0)
         ninfo_up = stats["upstream"].get("narinfo", 0)
         # THE oracle: 0 upstream NAR egress. Attribution to the peer is by construction
-        # here - BOOT (C's only direct peer) holds only the DECOY, so target bytes could
+        # here - BOOT (C's only direct peer) holds NO content, so target bytes could
         # only have come from a DHT-discovered+resolved dial to P. (There is no libp2p
         # provider-side served-bytes counter yet - the LIBP2P-SERVED-TOTAL analogue of
         # IROH-SERVED-TOTAL is a follow-up; the proxy egress ledger is the ground truth.)
@@ -3922,7 +3964,7 @@ def scenario_s7_libp2p(ctx: Ctx, expect) -> None:
         )
 
         # -- ARM B (F1 load-bearing control): kill P; the target is now unreachable via
-        # any peer (BOOT holds only the decoy), so C must fall back to upstream. This
+        # any peer (BOOT holds no content), so C must fall back to upstream. This
         # proves the DHT-mediated peer path (discover P -> resolve P's address -> dial P)
         # is LOAD-BEARING: remove P and the same build's NAR comes from the cache. --
         pod.kill("lp-provider")
@@ -3953,12 +3995,12 @@ def scenario_s7_libp2p(ctx: Ctx, expect) -> None:
 
 def scenario_s7_libp2p_miss(ctx: Ctx, expect) -> None:
     """S7 MISS arm: a NAR that NO peer announces -> a clean libp2p kad miss -> upstream
-    fallback, build still succeeds. Both peers seed only the DECOY; the consumer builds
-    the target, which no provider holds, so `find_providers` misses and the daemon
-    serves it from the cache."""
+    fallback, build still succeeds. The provider seeds only the DECOY (`app`); the
+    consumer builds the target (`lib`), which no provider holds, so `find_providers`
+    misses and the daemon serves it from the cache."""
     fixtures = ctx.fixtures
-    # Both P and BOOT seed the DECOY only; neither announces the target.
-    seed_dir, _prov_target, boot_seeds, target_sp = _s7_seed_split(ctx, "miss")
+    # The provider seeds the DECOY only; neither it nor BOOT announces the target.
+    seed_dir, decoy_seeds, target_sp = _s7_seeds(ctx, "miss", S7_DECOY)
     with Pod(
         ctx,
         "s7-miss",
@@ -3966,8 +4008,7 @@ def scenario_s7_libp2p_miss(ctx: Ctx, expect) -> None:
         with_daemon=False,
         expect=expect,
         libp2p_seed_dir=seed_dir,
-        libp2p_provider_seeds=boot_seeds,  # provider also holds only the decoy
-        libp2p_boot_seeds=boot_seeds,
+        libp2p_provider_seeds=decoy_seeds,
     ) as pod:
         time.sleep(LIBP2P_CONVERGE_S)
         pod.proxy_reset()
