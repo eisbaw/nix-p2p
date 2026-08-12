@@ -3,9 +3,11 @@ id: TASK-142
 title: >-
   Iroh relay-capability routed evidence harness + artifact
   (iroh-relay-capability-v1)
-status: To Do
-assignee: []
+status: In Progress
+assignee:
+  - '@claude'
 created_date: '2026-08-11 22:55'
+updated_date: '2026-08-12 03:28'
 labels:
   - iroh
   - discovery
@@ -37,3 +39,15 @@ Scope (mirror TASK-137/138 exactly):
 - [ ] #2 The two new scripts' --self-test hooks are wired into 'just test' and are green
 - [ ] #3 Evidence is labelled production-shaped; no n0/public relay is contacted
 <!-- AC:END -->
+
+## Implementation Plan
+
+<!-- SECTION:PLAN:BEGIN -->
+inc1: feature-gated relay evidence binaries (server+peer) DONE, committed 99376b9. inc2: python harness+finalize+schema+doc+flake image+Justfile self-test wiring. inc3: routed run producing artifacts/iroh-relay-capability-v1.json verdict=pass (or honest blocker).
+<!-- SECTION:PLAN:END -->
+
+## Implementation Notes
+
+<!-- SECTION:NOTES:BEGIN -->
+2026-08-12 orchestrator gate: increments 1-2 landed and committed (99376b9 evidence binaries iroh_relay_evidence_{server,peer}.rs; 2359220 scripts/iroh_relay_capability_evidence.py + finalize + docs schema/md; b91ea42 half-open acceptor). cargo build --workspace green at HEAD. Increment 3 (the routed podman run producing artifacts/iroh-relay-capability-v1.json verdict=pass) is NOT done - the implementer hit budget mid-run and correctly did not fake the artifact; it needs a fresh session with live podman/tcpdump debugging of the 8-arm routed topology. The implementer left an orphaned 'nix build .#iroh-relay-evidence-image' running (disk 74->56G); orchestrator killed it - nix store caches the sub-builds so a re-run resumes cheaply. NEXT SESSION: build the image, then run scripts/iroh_relay_capability_evidence.py to produce the artifact; then TASK-89 can compose 137/138/139/142.
+<!-- SECTION:NOTES:END -->
