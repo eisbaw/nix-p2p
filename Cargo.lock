@@ -2566,6 +2566,7 @@ version = "0.0.1"
 dependencies = [
  "async-trait",
  "blake3",
+ "ed25519-dalek",
  "serde",
  "serde_json",
  "tokio",
