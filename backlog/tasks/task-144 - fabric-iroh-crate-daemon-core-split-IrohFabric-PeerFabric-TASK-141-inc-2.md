@@ -7,7 +7,7 @@ status: In Progress
 assignee:
   - '@claude'
 created_date: '2026-08-11 23:57'
-updated_date: '2026-08-12 04:17'
+updated_date: '2026-08-12 05:18'
 labels:
   - iroh
   - seam
@@ -66,4 +66,6 @@ PER-AC STATUS (all still open - inc1 is groundwork):
 #6 guard test + s6-p2p: s6-p2p GREEN; guard-that-core-holds-no-iroh not added (core still holds transport_iroh).
 
 FORWARD-CARRY: (a) process_group is generic, not iroh - it rides in fabric-iroh only to keep the cut acyclic (iroh_runtime needs it AND daemon availability needs it); move to a shared util or daemon-core when the frontend splits (TASK-145). (b) daemon/tests/iroh_runtime.rs cites fabric-iroh source by RELATIVE path (../../fabric-iroh/src/...) - fragile cross-crate citation; consider moving the endpoint-construction guard into fabric-iroh's own tests. (c) provenance manifests in the finalize_*.py could also bind fabric-iroh/Cargo.toml+lib.rs (added deps materially define the capability) - only existing .rs paths were repointed to avoid the exact-match self-test fixtures.
+
+TASK-148 inc 1 landed (commit 9c0472d): the iroh TRANSFER axis is de-welded - IrohTransport IS peer_fabric::NarTransfer (native), daemon Transport is a bridge over it. So IrohFabric can now wire its NarTransfer axis (register IrohTransport into peer_fabric::TransferRegistry). The SERVE axis (NarServer/ServeHandle) is still blocked - filed as TASK-150 (peer_fabric::NarSupplier too weak for the task-72 admission + cancellation-safety invariants; provider lifecycle baked into IrohNodeBuilder.spawn). transport_iroh has NOT moved yet (AC#3 of 148 open), so a full IrohFabric still cannot wire transfer/server from fabric-iroh; NodeLocator remains the only cleanly-wireable axis (iroh_node_lookup is already in fabric-iroh).
 <!-- SECTION:NOTES:END -->

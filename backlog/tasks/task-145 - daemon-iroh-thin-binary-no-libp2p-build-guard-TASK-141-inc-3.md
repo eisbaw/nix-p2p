@@ -4,7 +4,7 @@ title: daemon-iroh thin binary + no-libp2p build guard (TASK-141 inc 3)
 status: To Do
 assignee: []
 created_date: '2026-08-11 23:58'
-updated_date: '2026-08-12 04:17'
+updated_date: '2026-08-12 05:18'
 labels:
   - iroh
   - seam
@@ -32,4 +32,6 @@ Increment 3 of the TASK-141 de-welding. Add the daemon-iroh thin binary crate = 
 
 <!-- SECTION:NOTES:BEGIN -->
 FORWARD-CARRY from TASK-144 inc 1 (commit 2394bee): the fabric-iroh backend crate now EXISTS and holds the iroh node-discovery/runtime/publication cluster. Remaining for the daemon-core split: (1) the serving core (server/source/upstream/catalog/rewrite/narinfo_cache + availability/discovery/claim/transport/transport_fetch/content_id/supply_catalog) is still in the 'daemon' crate together with transport_iroh; (2) topology requires daemon-core to depend on peer-fabric ONLY, but today the daemon depends on fabric-iroh for BOTH the iroh cluster AND process_group (availability uses ProcessJob/ProcessJobSpec). So daemon-core split is blocked on TASK-148 (move transport_iroh out) AND on relocating process_group to a shared util or into daemon-core (it is generic, not iroh - it only rides in fabric-iroh now to keep the cut acyclic). The composition root (this task's thin binary) is where TASK-144's IrohFabric::new(cfg) is constructed and where the required-axis assertion lives.
+
+TASK-148 inc 1 (commit 9c0472d): iroh transfer axis de-welded onto peer_fabric::NarTransfer via a daemon Transport bridge. When splitting daemon-core: the composition root's fetch-path adoption of peer_fabric::NarTransfer + TransferRegistry (retiring the bridge) is tracked with the transport_iroh move under TASK-150/TASK-148 AC#3. KnownTransport::to_offer() (claim.rs) is the wire->seam offer boundary the core will call at the daemon side.
 <!-- SECTION:NOTES:END -->
