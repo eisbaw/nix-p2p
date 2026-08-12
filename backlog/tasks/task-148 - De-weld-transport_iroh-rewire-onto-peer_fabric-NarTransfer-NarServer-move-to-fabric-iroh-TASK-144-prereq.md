@@ -3,11 +3,9 @@ id: TASK-148
 title: >-
   De-weld transport_iroh: rewire onto peer_fabric NarTransfer/NarServer + move
   to fabric-iroh (TASK-144 prereq)
-status: In Progress
-assignee:
-  - '@claude'
+status: To Do
+assignee: []
 created_date: '2026-08-12 04:16'
-updated_date: '2026-08-12 04:32'
 labels:
   - iroh
   - seam

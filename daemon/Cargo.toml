@@ -161,12 +161,6 @@ n0-future = "0.3"
 rustix = { version = "1", features = ["fs", "process"] }
 
 [dev-dependencies]
-# peer-fabric (TASK-148): integration tests name the seam directly to fetch an
-# IrohTransport through the `peer_fabric::NarTransfer` trait (not the daemon
-# `Transport` bridge), proving the de-welded transfer axis is reachable stack-
-# neutrally. peer-fabric is already a normal dependency; a test crate is a separate
-# crate, so it must also be a dev-dependency to be nameable in tests/.
-peer-fabric = { path = "../peer-fabric" }
 # process: spawn the real testproxy binary for the fault-mode loop (AC#2).
 tokio = { version = "1", features = ["rt-multi-thread", "net", "macros", "io-util", "time", "process", "test-util"] }
 # flate2: build a real gzip body for the AC#6 verbatim-forwarding bite.

@@ -43,16 +43,23 @@ daemon-core      the FRONTEND: serving core, correlation, policy, budgets,
       |   +-- fabric-iroh     IrohFabric   = peer-fabric + iroh + iroh-blobs
       |   +-- fabric-libp2p   Libp2pFabric = peer-fabric + libp2p   (added only
       |                       when TASK-103 selects libp2p; absent until then)
-   daemon-iroh   two thin bins, each = daemon-core + ONE fabric-* (single-stack).
-   daemon-libp2p The binary IS the backend choice: no features, no cfg.
-                 daemon-iroh's closure = iroh only; daemon-libp2p's = libp2p only.
+   daemon-iroh   thin bins over daemon-core.  daemon-libp2p = daemon-core + ONE
+   daemon-libp2p fabric (pure libp2p, single-stack fallback).  daemon-iroh is the
+                 DEFAULT and is DUAL-STACK (fabric-iroh transfer/locator +
+                 fabric-libp2p directory), so its closure links BOTH; the binary,
+                 not a feature, IS the composition.
 ```
 
-Why this satisfies "never both, never require both":
-- Each binary depends on exactly one `fabric-*`, so its dependency closure
-  contains exactly one stack. `cargo build -p daemon-iroh` never fetches or
-  compiles `libp2p`, and `daemon-libp2p` never links iroh. No feature, no `cfg`,
-  no `compile_error!` — the two closures are simply disjoint.
+Why this satisfies "never both, never require both" **for the single-stack
+build** — and how the dual-stack default relaxes it (amended 2026-08-12, TASK-147):
+- A single-stack binary depends on exactly one `fabric-*`, so its closure
+  contains exactly one stack — this is `daemon-libp2p` (libp2p directory *and*
+  transfer, no iroh). **The default `daemon-iroh` is the deliberate exception: it
+  is dual-stack** (iroh transfer/locator + libp2p-kad directory), so its closure
+  links both. The disjoint-closure guarantee holds for the pure fallback, not for
+  the default. No feature, no `cfg`, no `compile_error!` — composition is by which
+  `fabric-*` crates the binary's `fn main()` assembles, and the default assembles
+  two.
 - `daemon-core` and `peer-fabric` carry **zero** p2p-lib deps, so the frontend
   compiles and unit-tests without either stack — which also *proves*
   stack-neutrality by construction: a `FakeFabric` is the only backend the core
@@ -60,11 +67,12 @@ Why this satisfies "never both, never require both":
 - `libp2p` is not even a workspace member until it is chosen, so today nothing in
   the tree pulls it.
 
-Final wiring (DECIDED, owner 2026-08-11; reaffirmed single-stack 2026-08-12):
-**two thin binaries** `daemon-iroh` and `daemon-libp2p`, each = `daemon-core` +
-ONE backend crate, each `fn main()` constructing its single-stack fabric and
-calling `daemon_core::run(fabric)`. No features, no `cfg`. Neither binary links
-the other's stack. Rationale beyond dep-exclusion: it keeps **tests and tournament runs from
+Final wiring (DECIDED, owner 2026-08-11; **amended 2026-08-12, TASK-147**): **two
+thin binaries** `daemon-iroh` and `daemon-libp2p`, each a `fn main()` constructing
+its fabric and calling `daemon_core::run(fabric)` — no features, no `cfg`.
+`daemon-libp2p` = `daemon-core` + one backend crate (pure libp2p, single-stack
+fallback). `daemon-iroh` is the **default and dual-stack**: its `fn main()`
+assembles an iroh transfer/locator with a libp2p-kad directory into one `Fabric`. Rationale beyond dep-exclusion: it keeps **tests and tournament runs from
 conflating backends** — each backend is a distinct build artifact, so Stage-B
 tournament evidence (TASK-122) and every test bind to a named binary, never to an
 ambiguous feature combination.
@@ -289,27 +297,23 @@ exercises the whole daemon substrate-free.
 `ContentKey → signed ProviderRecord` via `put_record`/`get_record` on *both*
 backends and keep `find_providers → Vec<ProviderRecord>` honest.
 
-**Each binary is SINGLE-STACK** (owner directive 2026-08-12, superseding the
-briefly-adopted dual-stack): `daemon-iroh` is all-iroh, `daemon-libp2p` is
-all-libp2p — one stack's dependency closure each, so the two are a clean
-head-to-head for the tournament. A dual-stack fabric mixing both is explicitly
-**not** the design.
-
-Content discovery therefore differs by stack, and that difference is the point:
-- **`daemon-libp2p`** stores the frozen opaque `ContentKey → signed
-  ProviderRecord` in **libp2p-kad** (`put_record`/`get_record`) — a decentralized
-  global exact-key directory.
-- **`daemon-iroh`** has **no opaque-value global DHT** (TASK-126 spike:
-  iroh-dht-experiment stores a fixed typed enum, not opaque bytes, so it cannot
-  key our signed record). Its content discovery is **bounded hold-query to known
-  peers** (TASK-116, decentralized but not global) and/or iroh-dht-experiment's
-  `Blake3Provider` (research-grade, no rich record). Whether iroh clears the
-  *decentralized global exact-key* bar is a **tournament finding** — TASK-114
-  explicitly permits an unsupported iroh cell rather than forcing a win.
-
-The frozen `ProviderRecord` codec stays stack-neutral (libp2p-kad stores it; iroh
-simply has no equivalent store — the spike's honest "no"). We do **not**
-hybridize to hide that gap; the tournament reveals it.
+A **dual-stack** arrangement (iroh-blobs transfer + libp2p-kad directory) is one
+`Fabric` returning impls from two libraries — the core never knows. This is **the
+default** (Mark-emulator decision 2026-08-12, TASK-147), forced by the TASK-126
+spike: `libp2p-kad` is the only substrate that stores our opaque `ContentKey →
+signed ProviderRecord`, while iroh-blobs is the proven, green NAR transfer — so
+the shipping fabric mixes them. The honest cost: there is **no `NodeRuntime`
+abstraction beneath the fabric**, so dual-stack runs two event loops / two
+holepunchers and links two dependency closures; the shared-ed25519 `PeerId ==
+NodeId` derivation unifies *identity, not connectivity* (a peer is dialable once
+per stack). This is acceptable because the directory is **untrusted,
+availability-only hint infrastructure** — a bad or missing record costs an
+upstream fallback, never a bad store path (Nix re-verifies) — so we buy the
+second stack for the *one* primitive iroh lacks, not for trust. The pure
+single-stack `daemon-libp2p` (directory *and* transfer on libp2p) remains the
+coherence fallback. Collapsing back to one stack is a future option, gated on
+either iroh growing a content-keyed opaque value store **or** libp2p transfer
+proving equal to iroh-blobs — tracked as a follow-up, not a blocker.
 
 ## The freeze surface (RESOLVED by TASK-126's spike + freeze)
 
