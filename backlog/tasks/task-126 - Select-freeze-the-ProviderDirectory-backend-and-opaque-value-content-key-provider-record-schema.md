@@ -7,7 +7,7 @@ status: In Progress
 assignee:
   - '@claude'
 created_date: '2026-08-10 22:51'
-updated_date: '2026-08-12 01:18'
+updated_date: '2026-08-12 01:32'
 labels:
   - iroh
   - discovery
@@ -42,5 +42,5 @@ Implement the cornerstone decentralized exact-key discovery core now. Build a bo
 ## Implementation Notes
 
 <!-- SECTION:NOTES:BEGIN -->
-2026-08-12: implementer completed the freeze + spike and self-reviewed, but per deep-gate protocol an IRREVERSIBLE freeze is not Done until the orchestrator's independent DEEP gate returns GO. DEEP gate running as Workflow wiba389dr (qa-test-runner re-run + fresh mped-architect + codex cross-model, parallel, read-only). Will mark Done on GO, or revert to fixes on NO_GO. Spike outcome to reconcile: primary FLIPPED to libp2p-kad (iroh-dht-experiment stores a typed enum, not opaque bytes), which makes dual-stack the default and needs PRD/doc reconciliation.
+DEEP gate (Workflow wiba389dr) = NO_GO via cross-model codex (qa+mped were GO). Round-2 fixes required before this irreversible freeze counts. Freeze-blocking: (1) pin ed25519 canonicality policy + add malleable S+L negative vector; (2) canonicalize offer ordering (or explicitly pin order-significant + reject dup tags); (3) resolve provider-vs-offer-locator identity (require iroh offer node==provider, or document delegation; validate offer node is a valid point); (6) replace debug_assert! in provide_body with a real fail-closed check (release must not sign over-cap/>255 offers). Proof-hardening: (4) python anchor must reject unknown infohash versions {only 1,2}, parse no_offers, add a rejection vector; (5) golden rejection tests must assert the SPECIFIC typed error (not just is_err) with each vector's ONLY fault being the guard under test + a positive BitTorrent-v1 vector + BadInfoHash bite. Fixing #2/#3 may change frozen bytes/goldens - that is correct NOW (nothing consumes them; freeze is v1 pre-adoption).
 <!-- SECTION:NOTES:END -->
