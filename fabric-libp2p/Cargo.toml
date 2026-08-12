@@ -1,0 +1,55 @@
+[package]
+name = "fabric-libp2p"
+description = "nix-p2p libp2p BACKEND behind the peer-fabric seam: the MANDATORY decentralized content-discovery layer (libp2p-kad ProviderDirectory / AvailabilityAnnouncer over the frozen ContentKey/ProviderRecord codec). Depends on peer-fabric, never on daemon-core. The libp2p NAR transfer/serve + node discovery is TASK-151."
+version.workspace = true
+edition.workspace = true
+
+[lib]
+name = "fabric_libp2p"
+path = "src/lib.rs"
+
+[dependencies]
+# peer-fabric (TASK-140/141): the seam this backend implements, and the canonical
+# home of the FROZEN value types (ContentKey, ProviderRecord, record_codec, NodeId,
+# Blake3Digest). This crate NEVER depends on the daemon; the only cross edge is
+# daemon -> fabric-libp2p.
+peer-fabric = { path = "../peer-fabric" }
+# rust-libp2p (TASK-103, owner libp2p-PRIMARY): the robust existing Kademlia
+# implementation. We do NOT hand-roll Kademlia and do NOT run kad-over-iroh. Feature
+# set per the task: kad (the DHT), tcp+quic (transports), identify (so peers learn
+# each other's listen addrs for kad routing), request-response (the record/transfer
+# carrier, wired in TASK-151), tokio+macros (the runtime + NetworkBehaviour derive),
+# noise (auth) + yamux (mux over tcp).
+libp2p = { version = "0.54", default-features = false, features = [
+    "kad",
+    "tcp",
+    "quic",
+    "identify",
+    "request-response",
+    "tokio",
+    "macros",
+    "noise",
+    "yamux",
+] }
+# The single-threaded Swarm is driven from a dedicated worker task; the directory /
+# announcer talk to it over tokio channels (mpsc command in, oneshot reply out).
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "sync", "time"] }
+# The capability traits are async; async_trait boxes every call (the seam already
+# pays this, see fabric.rs).
+async-trait = "0.1"
+# The Swarm is a Stream/futures object; StreamExt::select_next_some is how libp2p's
+# own examples drive it. Already in the libp2p closure.
+futures = "0.3"
+# The composite value-record key is a domain-separated derive_key over
+# ContentKey||PeerId (see the crate ADR); blake3 is already in the peer-fabric
+# closure (the ContentKey recipe itself is blake3 derive_key).
+blake3 = "1"
+# Structured, level-appropriate logging of swarm/kad events (fail verbosely).
+tracing = "0.1"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time"] }
+tracing-subscriber = "0.3"
+
+[lints]
+workspace = true
