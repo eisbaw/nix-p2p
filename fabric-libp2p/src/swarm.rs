@@ -955,3 +955,28 @@ impl Node {
         })
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // The pure near-key mapping (TASK-174), deterministic and network-free. The
+    // integration test `tests/near_key_routing_bar.rs` proves the same boundary end to
+    // end (a live query that reaches nobody) and bites the OLD total-routing bar.
+    #[test]
+    fn absence_from_reach_maps_answered_to_miss_and_zero_to_insufficient_routing() {
+        // Reached >=1 responding peer near the key -> an empty result is authoritative.
+        assert!(matches!(
+            absence_from_reach::<()>(QueryReach { answered: 1 }),
+            Lookup::Miss
+        ));
+        // Reached nobody -> could-not-consult, never a (false) Miss.
+        assert!(matches!(
+            absence_from_reach::<()>(QueryReach { answered: 0 }),
+            Lookup::Unavailable(Unavailable::InsufficientRouting)
+        ));
+        // `reached_neighborhood` is the same predicate the classifier is built on.
+        assert!(QueryReach { answered: 1 }.reached_neighborhood());
+        assert!(!QueryReach { answered: 0 }.reached_neighborhood());
+    }
+}
