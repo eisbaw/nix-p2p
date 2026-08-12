@@ -6,6 +6,7 @@ title: >-
 status: To Do
 assignee: []
 created_date: '2026-08-12 07:55'
+updated_date: '2026-08-12 08:12'
 labels:
   - libp2p
   - fabric
@@ -32,3 +33,9 @@ Follow-up to TASK-103 (cornerstone landed the crate + directory + announcer + mu
 - [ ] #4 the discovered PeerId is bound to record.provider so a re-stored third-party record under a foreign composite key is rejected
 - [ ] #5 multi-node tests: concurrent providers, explicit withdrawal, expiry, restart, replay, rollback, corrupted state, partition+rejoin - no lost updates, no resurrection
 <!-- AC:END -->
+
+## Implementation Notes
+
+<!-- SECTION:NOTES:BEGIN -->
+PARTIALLY PRE-EMPTED by TASK-103 review round (commit 5979aef): (a) the FORWARD PeerId<->record.provider binding is DONE (directory rejects a record whose provider does not derive to the index PeerId); (b) expiry<->store-TTL reconciliation is DONE (put_record sets kad::Record.expires from record.expiry; announce rejects an already-expired record). REMAINING here: signed ProviderWithdrawal tombstone propagation; monotonic-sequence/idempotent-refresh/replay/rollback/no-resurrection wired via peer_fabric::record_store at the get_record decode boundary; concurrent-providers/restart/corrupted-state/partition+rejoin multi-node tests; end-to-end spoof/withdraw/expiry BITE tests (mped N5).
+<!-- SECTION:NOTES:END -->

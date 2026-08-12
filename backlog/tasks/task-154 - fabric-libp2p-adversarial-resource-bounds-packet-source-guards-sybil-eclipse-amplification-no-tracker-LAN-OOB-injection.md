@@ -6,6 +6,7 @@ title: >-
 status: To Do
 assignee: []
 created_date: '2026-08-12 07:55'
+updated_date: '2026-08-12 08:12'
 labels:
   - libp2p
   - fabric
@@ -30,3 +31,9 @@ Follow-up to TASK-103 (AC#8 + AC#9). Enforce record/provider/request/response/st
 - [ ] #2 sybil/eclipse/amplification/poisoning assumptions documented and bounded without compromising integrity
 - [ ] #3 packet/source guard proves no tracker/LAN/implicit-public/OOB injection during qualification; a mutation enabling any substitute makes the proof fail
 <!-- AC:END -->
+
+## Implementation Notes
+
+<!-- SECTION:NOTES:BEGIN -->
+Includes the TASK-103 mped-architect S4 finding: find_providers enforces the deadline at the async boundary but does NOT cancel the underlying kad query (it runs to its own query_timeout, replying into a dropped receiver - bounded wasted work). Add a Cancel(QueryId) command threading the QueryId back out of SwarmHandle, as part of the work/rate bounds.
+<!-- SECTION:NOTES:END -->
