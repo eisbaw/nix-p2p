@@ -12,9 +12,15 @@ path = "src/lib.rs"
 
 [features]
 default = []
-# Adversarial signed-record server used only inside the routed TASK-138 image.
-# Production packages do not build or install this binary.
-evidence-fixture = []
+# Adversarial signed-record server used only inside the routed TASK-138 image,
+# plus the TASK-142 relay evidence binaries (a locally operated iroh relay
+# server runner and a relay-only peer). Production packages do not build or
+# install these binaries. `iroh/test-utils` (enabled ONLY here) turns on
+# iroh-relay's `server` + `test-utils` features so the relay server can be run
+# in-process against a self-signed cert and the peer can trust it with
+# `CaTlsConfig::insecure_skip_verify()`. Kept feature-gated so the heavy relay
+# server dependency tree (rcgen/axum/...) never enters the production closure.
+evidence-fixture = ["dep:iroh-relay", "iroh/test-utils"]
 
 [[bin]]
 name = "daemon"
@@ -31,6 +37,21 @@ path = "src/bin/iroh_node_lookup.rs"
 [[bin]]
 name = "iroh-node-lookup-fixture"
 path = "src/bin/iroh_node_lookup_fixture.rs"
+required-features = ["evidence-fixture"]
+
+# TASK-142 routed relay-capability evidence binaries. Both are feature-gated out
+# of production: `iroh-relay-evidence-server` runs a locally operated iroh relay
+# (self-signed cert), and `iroh-relay-evidence-peer` drives one relay-only
+# connect/accept across L3-blocked namespaces, classifying the path via
+# `daemon::classify_connection_path`.
+[[bin]]
+name = "iroh-relay-evidence-server"
+path = "src/bin/iroh_relay_evidence_server.rs"
+required-features = ["evidence-fixture"]
+
+[[bin]]
+name = "iroh-relay-evidence-peer"
+path = "src/bin/iroh_relay_evidence_peer.rs"
 required-features = ["evidence-fixture"]
 
 # HTTP stack (task-4 decision): tokio + hyper 1.x LOW-LEVEL client/server, plus
@@ -108,6 +129,13 @@ iroh-blobs = "0.103"
 iroh-dns = "1"
 simple-dns = "0.11"
 url = "2.5"
+# TASK-142: a locally operated iroh relay SERVER for the routed relay-capability
+# evidence. OPTIONAL and enabled only by the `evidence-fixture` feature, so the
+# relay-server dependency tree (rcgen/dashmap/axum/tokio-websockets/...) is
+# entirely absent from the production daemon closure. Pinned to the exact 1.0.3
+# already in Cargo.lock alongside iroh; enabling `server`/`test-utils` only turns
+# on features of that same version.
+iroh-relay = { version = "1", optional = true, features = ["server", "test-utils"] }
 # task-51 safety envelope: the signed-NarSize abort must fire DURING the transfer,
 # so we drive `get_blob` as a STREAM (leaf-by-leaf) and stop the moment cumulative
 # bytes exceed the signed NarSize - never buffer a huge lying blob then check.
