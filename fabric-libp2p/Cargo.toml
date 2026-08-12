@@ -48,8 +48,12 @@ blake3 = "1"
 tracing = "0.1"
 
 [dev-dependencies]
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "net"] }
 tracing-subscriber = "0.3"
+# The multi-node test signs ProviderRecords with the SAME ed25519 the node identity is
+# built from (self-serve); ed25519-dalek "3" matches peer-fabric's, so SigningKey is
+# the one shared type across the seam.
+ed25519-dalek = "3"
 
 [lints]
 workspace = true
