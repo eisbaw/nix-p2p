@@ -147,7 +147,7 @@ async fn corrupt_provider_is_rejected_by_gate1_blake3_verify() {
 }
 
 #[tokio::test]
-async fn oversized_response_trips_the_size_abort() {
+async fn signed_bound_smaller_than_served_bytes_trips_size_abort() {
     let scope = "nar-oversize";
     let nar = b"a NAR that is bigger than the size bound the consumer will allow".to_vec();
     let content = Blake3Digest::from_raw_nar(&nar);
@@ -262,4 +262,41 @@ async fn dropping_the_serve_handle_stops_admission() {
         matches!(err, TransferError::NotHeld(_)),
         "expected NotHeld after teardown, got {err}"
     );
+}
+
+#[tokio::test]
+async fn a_stale_teardown_does_not_clobber_a_live_successor_session() {
+    // Regression for the re-serve handoff race: install a SECOND serve session before
+    // dropping the FIRST handle. The stale first-handle teardown must NOT uninstall the
+    // live successor (the worker clears the slot only if it still holds THAT gate).
+    let scope = "nar-reserve";
+    let nar = b"served by the successor session".to_vec();
+    let content = Blake3Digest::from_raw_nar(&nar);
+
+    let (node_a, addr_a) = start_listening([11u8; 32], scope).await;
+    let server = Libp2pServer::new(
+        node_a.handle.clone(),
+        Arc::new(MemoryNarSupplier::new([nar.clone()])),
+    );
+
+    let (node_b, _addr_b) = start_listening([12u8; 32], scope).await;
+    let transport = wire_consumer(&node_b, node_a.peer_id, addr_a).await;
+    let offer = TransportOffer::Iroh {
+        node: node_a.node_id,
+    };
+
+    let handle1 = server.serve(ServeBudget::default()).await.expect("serve 1");
+    // Install the successor BEFORE dropping handle1 (the exact handoff order the fix
+    // guards): the worker command queue is [InstallServe(g2), UninstallServe(g1)].
+    let _handle2 = server.serve(ServeBudget::default()).await.expect("serve 2");
+    drop(handle1);
+    // Let the stale UninstallServe(g1) be processed and ignored.
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    // The successor session (handle2) is still held and must still serve.
+    let bytes = transport
+        .fetch(&content, &offer, Some(nar.len() as u64), &envelope())
+        .await
+        .expect("the live successor session must still serve after a stale teardown");
+    assert_eq!(bytes, nar);
 }

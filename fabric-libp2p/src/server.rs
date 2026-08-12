@@ -56,8 +56,10 @@ impl Drop for ServeTeardown {
         // and is answered NotHeld.
         self.gate.stop();
         // Best-effort cleanup so a subsequent serve() replaces cleanly and the worker
-        // drops its gate Arc. Non-blocking: safe to call from Drop.
-        self.handle.uninstall_serve_nonblocking();
+        // drops its gate Arc. Non-blocking: safe to call from Drop. Carries THIS gate's
+        // identity so a stale teardown cannot clobber a live successor session.
+        self.handle
+            .uninstall_serve_nonblocking(Arc::clone(&self.gate));
         tracing::debug!("fabric-libp2p: NAR serve session torn down (stopped admitting)");
     }
 }

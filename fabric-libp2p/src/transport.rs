@@ -2,25 +2,34 @@
 //! over the shared swarm's `/nix-p2p/<scope>/nar/1` request-response protocol, gate-1
 //! BLAKE3-verify it, and honour the [`SafetyEnvelope`] and the signed NarSize bound.
 //!
-//! # ADR (TASK-151): the offer locator, and why this services the `Iroh` tag
+//! # ADR (TASK-151): why this services the `Iroh` tag (offer-driven dispatch)
 //!
-//! A [`ProviderRecord`](peer_fabric::ProviderRecord) already carries its provider's
-//! reachability as a self-serve [`TransportOffer::Iroh`]`{ node: NodeId }` - the
-//! provider's ed25519 identity (TASK-103/126, the FROZEN record). A libp2p node's
-//! `PeerId` is derived from that SAME ed25519 key (see [`crate::keys`]), so a
-//! libp2p-primary daemon fetches content discovered through those records by servicing
-//! the NodeId-locator offer with its OWN transport - deriving the `PeerId` and dialing
-//! over the swarm. The `TransportTag` names the offer's LOCATOR SHAPE (a NodeId), and
-//! the single-stack build's registry maps it to exactly one transport, so there is no
-//! collision within a libp2p-only fabric.
+//! Two facts force `tag() == TransportTag::Iroh` this cycle:
 //!
-//! A DISTINCT `TransportTag::Libp2p` + `TransportOffer::Libp2p` (and the additive frozen
-//! record-codec `OFFER_LIBP2P` tag) is only needed for a DUAL-STACK process that runs
-//! BOTH the iroh and libp2p transfers at once under the same discovery (the transport
-//! tournament). That touches the FROZEN `peer_fabric` seam + its freeze guards and is a
-//! deliberate change of its own - filed as TASK-156, NOT bolted onto this transport
-//! cycle. Until then, reusing the NodeId-locator offer is what lets a libp2p daemon
-//! consume the existing record format at all.
+//!   1. A [`ProviderRecord`](peer_fabric::ProviderRecord) can only carry the FROZEN
+//!      offer variants, and the only reachability offer is self-serve
+//!      [`TransportOffer::Iroh`]`{ node: NodeId }` - the provider's ed25519 identity
+//!      (TASK-103/126). `NodeId` is transport-blind, and a libp2p `PeerId` derives from
+//!      that SAME ed25519 key ([`crate::keys::peer_id_of_provider`]), so a libp2p daemon
+//!      MUST consume that offer to fetch anything discovered through existing records.
+//!   2. Dispatch is OFFER-DRIVEN: the fetch driver computes `offer.tag()`
+//!      (= `TransportTag::of(offer)`) and looks up the registry by it. For an `Iroh`
+//!      offer that is always `TransportTag::Iroh`. So a transport that wants to be
+//!      dispatched for the existing offer has NO CHOICE but to register under `Iroh` -
+//!      this is mechanical, not a claim that the tag "means a NodeId locator".
+//!
+//! In a SINGLE-STACK libp2p build there is exactly one transport per tag, so no
+//! collision arises. The tag string still literally reads `"iroh"` (the frozen type's
+//! own SSOT), which is a known cosmetic wart in a libp2p-only process; it is not
+//! reinterpreted here.
+//!
+//! DUAL-STACK LIMITATION (the transport tournament, both transfers in one process):
+//! because dispatch is offer-driven, a bare `TransportTag::Libp2p` would NEVER be
+//! selected for an `Iroh` offer - the tournament genuinely needs a distinct
+//! `TransportOffer::Libp2p` on the FROZEN wire (additive `OFFER_LIBP2P` in the record
+//! codec), and until then registering both transfers would SILENTLY clobber one under
+//! the shared `Iroh` tag ([`peer_fabric::TransferRegistry::register`] overwrites).
+//! Filed as TASK-156 (frozen-seam change with wire review); NOT attempted here.
 
 use async_trait::async_trait;
 

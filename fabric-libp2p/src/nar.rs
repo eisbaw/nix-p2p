@@ -25,11 +25,21 @@
 //!
 //! ## Honest scope (filed as follow-ups, not faked)
 //!
-//!   * BUFFERED, NOT STREAMED. `read_response` caps the wire read at
-//!     [`MAX_NAR_RESPONSE_BYTES`] (bounded, never unbounded), and the per-call
-//!     `expected_size` abort fires in [`Libp2pTransport::fetch`] on that bounded
-//!     buffer. A TRUE mid-stream, per-call size abort (and off-worker streamed
-//!     production) needs the raw-stream transport — TASK-157.
+//!   * BUFFERED, NOT STREAMED — and the buffer is bounded at the 256 MiB
+//!     [`MAX_NAR_RESPONSE_BYTES`] hard cap, NOT at the per-call signed size. `fetch`
+//!     reads the whole response (up to the cap) and then compares its length to
+//!     `expected_size`, so a lying provider CAN force up to ~256 MiB of allocation and
+//!     transfer regardless of the signed NarSize. The guarantee here is "never
+//!     UNBOUNDED" (bounded at the cap), NOT "never buffers more than the signed size".
+//!     A TRUE mid-stream abort at exactly `expected_size` needs the raw-stream transport
+//!     — TASK-157.
+//!   * INLINE PRODUCTION blocks the swarm poll loop. `ServeGate::respond` runs on the
+//!     single worker and `produce()` is synchronous, so a serve does a full-NAR
+//!     allocation/copy ON the poll thread — up to the per-NAR budget (256 MiB by
+//!     default) — stalling kad/identify/every connection for its duration. Fine while
+//!     the daemon wiring is absent and NARs are small; off-worker streamed production is
+//!     TASK-157. Consequently the in-flight ceiling is vestigial this cycle (see
+//!     [`ServeGate::respond`]) and `max_serve_duration` is not yet enforced.
 //!   * The supplier's only source this cycle is in-memory bytes
 //!     ([`MemoryNarSupplier`]); a real node's store-dump / regular-file supplier
 //!     (mirroring `fabric-iroh`'s process-group producer) is TASK-158.
@@ -45,11 +55,17 @@ use libp2p::request_response;
 use peer_fabric::{Blake3Digest, ServeBudget};
 
 /// The absolute ceiling on a single NAR response the FETCH side will read off the
-/// wire, whatever the per-call `expected_size`. It is the peer-triggerable-OOM floor:
-/// a lying provider that declares a huge length is aborted BEFORE allocation. Set to
-/// the `peer_fabric` serve default single-NAR ceiling (256 MiB) so an honest node can
-/// always serve what it may legitimately announce; the precise per-call bound is
-/// enforced on top of this by the transport.
+/// wire, whatever the per-call `expected_size`. It is the peer-triggerable-OOM floor: a
+/// lying provider that declares a length over this is aborted BEFORE allocation.
+///
+/// It is pinned to the `peer_fabric` serve default single-NAR ceiling
+/// ([`ServeBudget::default().max_nar_bytes_uncompressed_nar`] = 256 MiB), asserted by
+/// `max_response_cap_tracks_the_serve_default` so the two cannot silently drift when
+/// TASK-120 moves the authoritative ceiling. CAVEAT: because it is a FIXED const, it is
+/// also a hard FUNCTIONAL ceiling on the fetch side - a node configured (via a larger
+/// [`ServeBudget`]) to serve NARs bigger than this cannot be fetched over libp2p, and a
+/// cold-start fetch (`expected_size == None`) of a > 256 MiB NAR hard-fails the codec.
+/// Deriving the fetch cap from the negotiated per-call bound is part of TASK-157.
 pub const MAX_NAR_RESPONSE_BYTES: u64 = 256 * 1024 * 1024;
 
 // Response status bytes.
@@ -367,6 +383,17 @@ pub struct ServeGate {
 impl ServeGate {
     /// A gate serving `supplier` under `budget`, admitting until [`stop`](Self::stop).
     pub fn new(budget: ServeBudget, supplier: Arc<dyn Libp2pNarSupplier>) -> Self {
+        // Destructure the seam budget EXHAUSTIVELY (mirroring fabric-iroh's
+        // ServeBudget::from_seam) so a new `peer_fabric::ServeBudget` field fails THIS
+        // build rather than being silently unenforced by the gate. NOTE (honest scope):
+        // `max_serve_duration` is NOT yet enforced here - inline production is
+        // instantaneous, so there is no long-lived reservation to time out; it comes
+        // alive with off-worker streamed production (TASK-157).
+        let ServeBudget {
+            max_nar_bytes_uncompressed_nar: _,
+            max_inflight_bytes_uncompressed_nar: _,
+            max_serve_duration: _,
+        } = budget;
         ServeGate {
             budget,
             supplier,
@@ -416,6 +443,16 @@ impl ServeGate {
             self.declined_too_large.fetch_add(1, Ordering::Relaxed);
             return NarResponse::Declined(DeclineReason::TooLarge);
         }
+        // The in-flight ceiling. HONEST LIMIT: this cycle `respond` runs only on the
+        // single swarm worker and `produce()` is synchronous, so requests are strictly
+        // serialized and `held` is always 0 here - the in-flight decline is effectively
+        // vestigial (it reduces to a weaker restatement of the per-NAR check). It is
+        // written as a real reservation so it BINDS the moment TASK-157 moves production
+        // off the worker.
+        // TASK-157: this load-then-add is NOT an atomic reserve; it is a TOCTOU that is
+        // safe ONLY because respond() is serialized on the worker. When production moves
+        // off-worker, replace it with a CAS loop or a mutex-guarded reserve (the iroh
+        // model) or two concurrent admits will both pass and blow past the ceiling.
         let held = self.inflight_bytes.load(Ordering::Acquire);
         if held.saturating_add(declared) > self.budget.max_inflight_bytes_uncompressed_nar {
             self.declined_busy.fetch_add(1, Ordering::Relaxed);
@@ -451,6 +488,17 @@ mod tests {
             max_inflight_bytes_uncompressed_nar: max_inflight,
             max_serve_duration: Duration::from_secs(120),
         }
+    }
+
+    #[test]
+    fn max_response_cap_tracks_the_serve_default() {
+        // SSOT tripwire: the fetch-side hard cap must equal the authoritative serve
+        // per-NAR default, or an honest node could serve a NAR a peer cannot fetch.
+        // If TASK-120 moves the default, this fails until MAX_NAR_RESPONSE_BYTES follows.
+        assert_eq!(
+            MAX_NAR_RESPONSE_BYTES,
+            ServeBudget::default().max_nar_bytes_uncompressed_nar
+        );
     }
 
     #[test]

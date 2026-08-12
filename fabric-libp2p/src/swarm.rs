@@ -98,10 +98,14 @@ pub enum Command {
     InstallServe {
         gate: Arc<ServeGate>,
     },
-    /// Remove the serve gate: inbound NAR requests are answered `NotHeld`. Sent
-    /// best-effort by the serve teardown guard (the synchronous stop is the gate's own
-    /// `active` flag; this just lets the worker drop its `Arc`).
-    UninstallServe,
+    /// Remove the serve gate IFF the worker still holds exactly `gate`. Sent best-effort
+    /// by the serve teardown guard (the synchronous stop is the gate's own `active` flag;
+    /// this just lets the worker drop its `Arc`). Carries the gate identity so a STALE
+    /// teardown cannot clobber a live SUCCESSOR session that was installed before the old
+    /// handle dropped (re-serve handoff).
+    UninstallServe {
+        gate: Arc<ServeGate>,
+    },
 }
 
 /// A cloneable handle to the worker. Every capability holds one of these; a dropped
@@ -239,8 +243,8 @@ impl SwarmHandle {
     /// `active` flag (flipped synchronously by the teardown guard); this command only
     /// lets the worker drop its `Arc<ServeGate>`, so a full channel or a gone worker is
     /// harmless.
-    pub fn uninstall_serve_nonblocking(&self) {
-        if self.tx.try_send(Command::UninstallServe).is_err() {
+    pub fn uninstall_serve_nonblocking(&self, gate: Arc<ServeGate>) {
+        if self.tx.try_send(Command::UninstallServe { gate }).is_err() {
             tracing::debug!("fabric-libp2p: serve uninstall not delivered (worker busy or gone)");
         }
     }
@@ -403,9 +407,23 @@ impl Worker {
                 tracing::debug!("fabric-libp2p: NAR serve gate installed");
                 self.serve = Some(gate);
             }
-            Command::UninstallServe => {
-                tracing::debug!("fabric-libp2p: NAR serve gate uninstalled");
-                self.serve = None;
+            Command::UninstallServe { gate } => {
+                // Clear ONLY if the worker still holds exactly this gate: a stale
+                // teardown from a superseded session must not drop a live successor
+                // (which was installed before the old handle dropped). Identity is the
+                // Arc, not a value compare.
+                if self
+                    .serve
+                    .as_ref()
+                    .is_some_and(|held| Arc::ptr_eq(held, &gate))
+                {
+                    tracing::debug!("fabric-libp2p: NAR serve gate uninstalled");
+                    self.serve = None;
+                } else {
+                    tracing::debug!(
+                        "fabric-libp2p: stale serve uninstall ignored (a successor session owns the slot)"
+                    );
+                }
             }
         }
     }
