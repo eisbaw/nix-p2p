@@ -140,6 +140,10 @@ LIBP2P_BOOT_PEER_ID = "12D3KooWBr7cTGxmMhdiGNcbesEusWMR1VG26jEQQgFr6wwZkNNf"
 # 0-egress oracle; this bounded settle makes the positive arm deterministic. Bounded
 # (not a retry loop) so a genuinely broken discovery still fails the oracle, not hides.
 LIBP2P_CONVERGE_S = 12.0
+# The separate-netns S7 (TASK-179) adds a routed inter-network hop (C on net-c ->
+# podman host routing -> BOOT/P on net-p, SNAT'd), so give the DHT a slightly larger
+# bounded settle than the shared-pod path. Still bounded (not a retry loop).
+LIBP2P_NETNS_CONVERGE_S = 16.0
 
 
 def die(message: str, code: int = 2) -> None:
@@ -1519,6 +1523,460 @@ class Pod:
         except ValueError:
             die(f"proxy tmp-byte probe returned non-integer: {result.stdout!r}")
             raise AssertionError  # unreachable; satisfies type checkers
+
+
+class Libp2pNetnsTopology:
+    """S7 SEPARATE-NETNS libp2p topology (TASK-179): the F1 discharge.
+
+    Unlike the shared-loopback `Pod._create_libp2p` (all daemons in one pod netns),
+    every daemon here runs as its OWN standalone `--network` container, so each has
+    its OWN network namespace and therefore its OWN `127.0.0.1`. Consumer C sits on a
+    DIFFERENT podman bridge network (`net-c`) from provider P / bootstrap BOOT /
+    proxy / origin (`net-p`); rootless podman's host routing joins the two /24s (the
+    e2e image ships NO iproute2, so there is no in-container `ip route` L3 router -
+    inter-network reachability is podman's, verified by probe). The routed hop is
+    real: C reaches P by P's ROUTABLE net-p IP, never a shared loopback.
+
+    Separate loopbacks are exactly what let the address-RESOLUTION leg be isolated
+    (the F1 caveat TASK-161 could not discharge on a shared pod netns). Two arms,
+    a MINIMAL PAIR differing only in P's `--libp2p-listen`:
+
+      * positive (`provider_loopback_only=False`): P listens on its routable net-p
+        IP, so kad peer-routing resolves a DIALABLE address; C fetches from P; 0
+        upstream NAR egress.
+      * resolution-only-broken control (`provider_loopback_only=True`): P listens on
+        `/ip4/127.0.0.1/tcp/<port>` ONLY. P is alive, announces the same content,
+        and is reachable at its routable net-p IP (proven by an HTTP probe from
+        INSIDE C's netns). But the address C RESOLVES for P via kad is `127.0.0.1`,
+        which in C's own separate netns is C's empty loopback - the dial fails and C
+        falls back to upstream (`upstream.nar>=1`). On a shared-loopback pod that
+        very address would have reached P; here it cannot, so the peer-serve failure
+        is attributable to RESOLUTION specifically - not to P being down, and not to
+        an unroutable network path.
+    """
+
+    NET_C = f"{POD_PREFIX}-netns-c"
+    NET_P = f"{POD_PREFIX}-netns-p"
+    # Fixed /24s + IPs. The e2e runner is serialised (the Justfile warns against
+    # running e2e/measure concurrently), so fixed names + a rm-first are
+    # collision-safe; a stale network from a crashed run is torn down in `_create`.
+    SUBNET_C = "10.211.31.0/24"
+    SUBNET_P = "10.211.32.0/24"
+    IP_CONSUMER = "10.211.31.10"
+    IP_BOOT = "10.211.32.10"
+    IP_PROVIDER = "10.211.32.11"
+    IP_PROXY = "10.211.32.12"
+    IP_ORIGIN = "10.211.32.13"
+
+    def __init__(
+        self,
+        ctx: Ctx,
+        name: str,
+        served_cache: Path,
+        seed_dir: Path,
+        provider_seeds: tuple[P2pSeed, ...],
+        expect,
+        *,
+        provider_loopback_only: bool = False,
+    ):
+        self.ctx = ctx
+        self._pm = ctx.podman
+        self.prefix = f"{POD_PREFIX}-{name}"
+        self.served_cache = served_cache
+        self.seed_dir = seed_dir
+        self.provider_seeds = tuple(provider_seeds)
+        self._expect = expect
+        self.provider_loopback_only = provider_loopback_only
+        self.provider_identity: tuple[str, str] | None = None
+
+    def __enter__(self) -> "Libp2pNetnsTopology":
+        # AC#5, observed at the boundary the origin serves (host-side walk), same
+        # invariant every `Pod` asserts - a separate topology must not become a hole.
+        leaked = secret_key_problems(self.served_cache)
+        self._expect(
+            not leaked,
+            "AC#5 (netns): no *.sec under the served cache tree (host-side walk)",
+            f"leaked: {leaked}",
+        )
+        if leaked:
+            raise RuntimeError(f"AC#5 abort (netns): secret key(s) {leaked} present")
+        self._create()
+        return self
+
+    def __exit__(self, *_exc) -> None:
+        self.stop()
+
+    def _c(self, role: str) -> str:
+        return f"{self.prefix}-{role}"
+
+    def roles(self) -> list[str]:
+        return ["origin", "proxy", "lp-boot", "lp-provider", "lp-consumer"]
+
+    def _create(self) -> None:
+        pm = self._pm
+        # Tear down any stragglers from a crashed prior run (containers BEFORE the
+        # networks they attach to, or the network rm fails on an in-use network).
+        for role in self.roles():
+            run([pm, "rm", "-f", "--ignore", self._c(role)], check=False)
+        for net in (self.NET_C, self.NET_P):
+            run([pm, "network", "rm", "-f", net], check=False)
+        for subnet, net in ((self.SUBNET_C, self.NET_C), (self.SUBNET_P, self.NET_P)):
+            run(
+                [
+                    pm,
+                    "network",
+                    "create",
+                    "--label",
+                    PROJECT_LABEL,
+                    "--subnet",
+                    subnet,
+                    net,
+                ]
+            )
+
+        proxy_upstream = f"http://{self.IP_ORIGIN}:{ORIGIN_PORT}"
+        proxy_url = f"http://{self.IP_PROXY}:{PROXY_PORT}"
+        boot_peer = (
+            f"{LIBP2P_BOOT_PEER_ID}@/ip4/{self.IP_BOOT}/tcp/{LIBP2P_BASE_PORT + 2}"
+        )
+
+        # origin: static file server over the served cache, on net-p.
+        run(
+            [
+                pm,
+                "run",
+                "-d",
+                "--label",
+                PROJECT_LABEL,
+                "--name",
+                self._c("origin"),
+                "--network",
+                self.NET_P,
+                "--ip",
+                self.IP_ORIGIN,
+                "--volume",
+                f"{self.served_cache}:/srv/cache:ro",
+                self.ctx.image,
+                "python3",
+                "-m",
+                "http.server",
+                str(ORIGIN_PORT),
+                "--bind",
+                "0.0.0.0",
+                "--directory",
+                "/srv/cache",
+            ]
+        )
+        # testproxy: caching proxy fronting origin; its request log is the oracle.
+        run(
+            [
+                pm,
+                "run",
+                "-d",
+                "--label",
+                PROJECT_LABEL,
+                "--name",
+                self._c("proxy"),
+                "--network",
+                self.NET_P,
+                "--ip",
+                self.IP_PROXY,
+                self.ctx.image,
+                "/bin/testproxy",
+                "--listen",
+                f"0.0.0.0:{PROXY_PORT}",
+                "--upstream",
+                proxy_upstream,
+                "--cache-dir",
+                "/tmp/proxy-cache",
+            ]
+        )
+        # BOOT: a pure kad router (fixed identity, no provider, no announce), on net-p.
+        run(
+            [
+                pm,
+                "run",
+                "-d",
+                "--label",
+                PROJECT_LABEL,
+                "--name",
+                self._c("lp-boot"),
+                "--network",
+                self.NET_P,
+                "--ip",
+                self.IP_BOOT,
+                self.ctx.image,
+                "/bin/daemon",
+                "--listen",
+                f"0.0.0.0:{DAEMON_PORT}",
+                "--upstream",
+                proxy_url,
+                "--libp2p-listen",
+                f"/ip4/{self.IP_BOOT}/tcp/{LIBP2P_BASE_PORT + 2}",
+                "--libp2p-bootstrap",
+                f"{LIBP2P_DUMMY_PEER}@/ip4/127.0.0.1/tcp/1",
+                "--libp2p-identity-seed",
+                LIBP2P_BOOT_SEED_HEX,
+                "--libp2p-scope",
+                LIBP2P_SCOPE,
+            ]
+        )
+        self._await_http_ready("origin", self.IP_ORIGIN)
+        self._await_http_ready("proxy", self.IP_PROXY)
+        # BOOT must be dialable before P announces (a lone genesis provider cannot
+        # reach put-provider quorum); HTTP readiness is the proxy for "kad bound".
+        self._await_http_ready("lp-boot", self.IP_BOOT)
+
+        # P (provider): seeds the target, bootstraps to BOOT, announces. The SINGLE
+        # knob between the two arms: a routable listen (resolution SUCCEEDS) vs a
+        # loopback-only listen (resolution yields a non-dialable address).
+        prov_listen = (
+            f"/ip4/127.0.0.1/tcp/{LIBP2P_BASE_PORT + 1}"
+            if self.provider_loopback_only
+            else f"/ip4/{self.IP_PROVIDER}/tcp/{LIBP2P_BASE_PORT + 1}"
+        )
+        seed_args: list[str] = []
+        for s in self.provider_seeds:
+            seed_args += ["--libp2p-seed-nar", f"{s.nar_hash}=/srv/seed/{s.filename}"]
+        run(
+            [
+                pm,
+                "run",
+                "-d",
+                "--label",
+                PROJECT_LABEL,
+                "--name",
+                self._c("lp-provider"),
+                "--network",
+                self.NET_P,
+                "--ip",
+                self.IP_PROVIDER,
+                "--volume",
+                f"{self.seed_dir}:/srv/seed:ro",
+                self.ctx.image,
+                "/bin/daemon",
+                "--listen",
+                f"0.0.0.0:{DAEMON_PORT}",
+                "--upstream",
+                proxy_url,
+                "--libp2p-provider",
+                "--libp2p-listen",
+                prov_listen,
+                "--libp2p-bootstrap",
+                boot_peer,
+                "--libp2p-scope",
+                LIBP2P_SCOPE,
+                "--libp2p-print-peer-address",
+                *seed_args,
+            ]
+        )
+        self.provider_identity = self._await_provider_identity(
+            "lp-provider", len(self.provider_seeds)
+        )
+        # C (consumer): on net-c, bootstraps to BOOT ALONE (no --libp2p-provider-addr).
+        run(
+            [
+                pm,
+                "run",
+                "-d",
+                "--label",
+                PROJECT_LABEL,
+                "--name",
+                self._c("lp-consumer"),
+                "--network",
+                self.NET_C,
+                "--ip",
+                self.IP_CONSUMER,
+                self.ctx.image,
+                "/bin/daemon",
+                "--listen",
+                f"0.0.0.0:{DAEMON_PORT}",
+                "--upstream",
+                proxy_url,
+                "--libp2p-listen",
+                f"/ip4/{self.IP_CONSUMER}/tcp/{LIBP2P_BASE_PORT}",
+                "--libp2p-bootstrap",
+                boot_peer,
+                "--libp2p-scope",
+                LIBP2P_SCOPE,
+            ]
+        )
+        self._await_http_ready("lp-consumer", self.IP_CONSUMER, network=self.NET_C)
+
+    def _exec_get(self, container: str, url: str, timeout: float = 5.0):
+        """HTTP GET `url` from INSIDE `container`'s netns via python3 (the image has
+        no curl). Returns (status:int|None, body:str). status None = the request
+        never completed (connection refused / timeout / unreachable)."""
+        py = (
+            "import sys,urllib.request\n"
+            "try:\n"
+            f"    r=urllib.request.urlopen('{url}',timeout={timeout})\n"
+            "    sys.stdout.write(str(r.status)+'\\n'+r.read().decode('utf-8','replace'))\n"
+            "except Exception as e:\n"
+            "    sys.stdout.write('ERR '+type(e).__name__+' '+str(e))\n"
+        )
+        res = run([self._pm, "exec", container, "python3", "-c", py], check=False)
+        out = res.stdout or ""
+        first, _, rest = out.partition("\n")
+        try:
+            return int(first.strip()), rest
+        except ValueError:
+            return None, out
+
+    def _post(self, container: str, url: str, timeout: float = 5.0):
+        py = (
+            "import sys,urllib.request\n"
+            f"req=urllib.request.Request('{url}',method='POST',data=b'')\n"
+            f"r=urllib.request.urlopen(req,timeout={timeout})\n"
+            "sys.stdout.write(str(r.status))\n"
+        )
+        res = run([self._pm, "exec", container, "python3", "-c", py], check=False)
+        try:
+            return int((res.stdout or "").strip())
+        except ValueError:
+            return None
+
+    def _await_http_ready(self, role: str, ip: str, network: str | None = None) -> None:
+        """Block until `role`'s HTTP daemon answers /nix-cache-info. Probed from a
+        throwaway container ON THE SAME network as `role` (default net-p) - the
+        container's port is not host-published, so the probe runs in-network."""
+        net = network or self.NET_P
+        url = f"http://{ip}:{ORIGIN_PORT if role == 'origin' else PROXY_PORT if role == 'proxy' else DAEMON_PORT}/nix-cache-info"
+        deadline = time.time() + READY_TIMEOUT_S
+        while True:
+            res = run(
+                [
+                    self._pm,
+                    "run",
+                    "--rm",
+                    "--label",
+                    PROJECT_LABEL,
+                    "--network",
+                    net,
+                    self.ctx.image,
+                    "python3",
+                    "-c",
+                    f"import urllib.request;print(urllib.request.urlopen('{url}',timeout=2).status)",
+                ],
+                check=False,
+            )
+            if (res.stdout or "").strip() == "200":
+                return
+            if time.time() > deadline:
+                self._dump_logs()
+                die(f"netns {role} did not become HTTP-ready at {url}")
+            time.sleep(0.4)
+
+    def _await_provider_identity(self, role: str, n_seeds: int) -> tuple[str, str]:
+        """Poll `role`'s log for LIBP2P-PROVIDER-ADDR + `n_seeds` LIBP2P-SEED lines;
+        return (peer_id, announced_listen_csv). Fail-closed: dies if it never
+        announces (never wires a dead peer)."""
+        deadline = time.time() + READY_TIMEOUT_S
+        addr_re = re.compile(r"LIBP2P-PROVIDER-ADDR peer_id=(\S+) listen=(\S+)")
+        seed_re = re.compile(r"LIBP2P-SEED narhash=(\S+) ")
+        while True:
+            log = self.logs(role)
+            addr = addr_re.search(log)
+            seeds = seed_re.findall(log)
+            if addr and len(seeds) >= n_seeds:
+                return addr.group(1), addr.group(2)
+            if time.time() > deadline:
+                self._dump_logs()
+                die(
+                    f"netns {role} never announced its libp2p identity + {n_seeds} seed(s)"
+                )
+            time.sleep(0.25)
+
+    def logs(self, role: str) -> str:
+        res = run([self._pm, "logs", self._c(role)], check=False)
+        return res.stdout + res.stderr
+
+    def _dump_logs(self) -> None:
+        for role in self.roles():
+            res = run([self._pm, "logs", self._c(role)], check=False)
+            if res.stdout or res.stderr:
+                print(f"--- logs {self._c(role)} ---", file=sys.stderr)
+                print(res.stdout, res.stderr, file=sys.stderr)
+
+    def consumer_argv(self) -> list[str]:
+        """The exact argv `lp-consumer` was launched with (the no-injection oracle)."""
+        res = run(
+            [self._pm, "inspect", "-f", "{{json .Config.Cmd}}", self._c("lp-consumer")],
+            check=False,
+        )
+        raw = (res.stdout or "").strip()
+        try:
+            argv = json.loads(raw)
+        except json.JSONDecodeError:
+            raise RuntimeError(f"consumer_argv: non-JSON {raw!r}") from None
+        return [str(a) for a in argv]
+
+    def proxy_reset(self) -> None:
+        status = self._post(
+            self._c("proxy"), f"http://127.0.0.1:{PROXY_PORT}/__testproxy/reset"
+        )
+        if status != 200:
+            die(f"netns proxy reset returned {status}")
+
+    def proxy_stats(self) -> dict:
+        status, body = self._exec_get(
+            self._c("proxy"), f"http://127.0.0.1:{PROXY_PORT}/__testproxy/stats"
+        )
+        if status != 200:
+            die(f"netns proxy stats returned {status}: {body!r}")
+        return json.loads(body)
+
+    def provider_reachable_from_consumer(self) -> tuple[int | None, str]:
+        """Prove, FROM INSIDE C's netns, that P is alive and its routable net-p IP is
+        reachable - an HTTP GET of P's /nix-cache-info at its ROUTABLE address. This
+        is the control arm's load-bearing evidence: the peer-serve failed while P was
+        up and the path existed, so RESOLUTION (not liveness/reachability) is what
+        broke."""
+        return self._exec_get(
+            self._c("lp-consumer"),
+            f"http://{self.IP_PROVIDER}:{DAEMON_PORT}/nix-cache-info",
+        )
+
+    def client_run(self, targets: list[str], keys: str) -> "ClientResult":
+        """Realise `targets` with a FRESH client on net-c, substituting ONLY from C's
+        daemon (at C's routable net-c IP). Same `_CLIENT_SCRIPT` + `_parse_client` the
+        pod path uses, so the byte oracle is identical."""
+        subs = f"http://{self.IP_CONSUMER}:{DAEMON_PORT}?priority=10"
+        script = _CLIENT_SCRIPT.format(
+            subs=subs,
+            keys=keys,
+            targets=" ".join(targets),
+            jobs=1,
+            conns=1,
+            start_at_ns=0,
+        )
+        res = run(
+            [
+                self._pm,
+                "run",
+                "--rm",
+                "--label",
+                PROJECT_LABEL,
+                "--network",
+                self.NET_C,
+                self.ctx.image,
+                "bash",
+                "-c",
+                script,
+            ],
+            check=False,
+            timeout=300,
+        )
+        return _parse_client(res)
+
+    def kill(self, role: str) -> None:
+        run([self._pm, "kill", self._c(role)], check=False)
+
+    def stop(self) -> None:
+        for role in self.roles():
+            run([self._pm, "rm", "-f", "--ignore", self._c(role)], check=False)
+        for net in (self.NET_C, self.NET_P):
+            run([self._pm, "network", "rm", "-f", net], check=False)
 
 
 # Single-user client: realise into the container's own store, then report
@@ -4035,6 +4493,167 @@ def scenario_s7_libp2p_miss(ctx: Ctx, expect) -> None:
         )
 
 
+def scenario_s7_libp2p_netns(ctx: Ctx, expect) -> None:
+    """S7 on a SEPARATE-NETNS routed topology - fully discharge the F1 caveat that
+    the shared-pod S7 (scenario_s7_libp2p) could not: that address-RESOLUTION (kad
+    peer-routing) is load-bearing INDEPENDENTLY of a shared-loopback shortcut / a
+    kad-query pre-open.
+
+    Each daemon is its OWN `--network` container (own netns, own 127.0.0.1); C sits
+    on net-c, P/BOOT/proxy/origin on net-p, joined by podman host routing. Two arms,
+    a MINIMAL PAIR whose ONLY difference is P's `--libp2p-listen`:
+
+      * POSITIVE: P announces its ROUTABLE net-p IP. C - told ONLY BOOT - discovers P
+        via kad get_providers and RESOLVES P's dial address via kad peer-routing, then
+        fetches the NAR byte-identical with 0 upstream NAR egress.
+      * RESOLUTION-ONLY-BROKEN CONTROL: P announces ONLY `/ip4/127.0.0.1`. P is alive,
+        announces the SAME content, and is reachable at its routable net-p IP (PROVEN
+        by an HTTP probe from inside C's netns). But the address C resolves for P is
+        `127.0.0.1`, which in C's own separate netns is C's empty loopback -> the dial
+        fails -> upstream fallback (`upstream.nar>=1`). RESOLUTION was load-bearing:
+        break only it, with P up and the path present, and the peer-serve vanishes.
+
+    The oracle BITES: positive 0-egress vs control >=1 egress, the sole delta being
+    which address P published for C to resolve.
+    """
+    fixtures = ctx.fixtures
+
+    # -- ARM A (positive): resolution succeeds, peer serves, 0 upstream NAR egress --
+    seed_dir, prov_seeds, target_sp = _s7_seeds(ctx, "netns", S7_TARGET)
+    with Libp2pNetnsTopology(
+        ctx,
+        "s7netns",
+        fixtures.cache,
+        seed_dir,
+        prov_seeds,
+        expect,
+        provider_loopback_only=False,
+    ) as topo:
+        prov_id = topo.provider_identity[0] if topo.provider_identity else ""
+        prov_listen = topo.provider_identity[1] if topo.provider_identity else ""
+        argv = topo.consumer_argv()
+        joined = " ".join(argv)
+        expect(
+            bool(prov_id) and prov_id not in joined,
+            "S7-netns no-injection: consumer argv omits the provider's PeerId",
+            f"prov_id={prov_id!r} argv={joined!r}",
+        )
+        expect(
+            "--libp2p-provider-addr" not in argv,
+            "S7-netns no-injection: consumer has NO --libp2p-provider-addr",
+            f"argv={joined!r}",
+        )
+        # The positive arm's provider announced a ROUTABLE (non-loopback) address -
+        # the very thing the control withholds. Pin it so the minimal pair is honest.
+        expect(
+            "/ip4/127.0.0.1/" not in prov_listen
+            and Libp2pNetnsTopology.IP_PROVIDER in prov_listen,
+            "S7-netns positive: provider announced its ROUTABLE net-p address",
+            f"listen={prov_listen!r}",
+        )
+
+        time.sleep(LIBP2P_NETNS_CONVERGE_S)
+        topo.proxy_reset()
+        res = topo.client_run([target_sp], fixtures.public_key)
+        expect(
+            res.exit_code == 0,
+            "S7-netns positive: nix build completes with the NAR served by P over libp2p",
+            res.stderr[-800:],
+        )
+        got = res.narhash(target_sp)
+        expect(
+            got == fixtures.nar_hash(S7_TARGET),
+            "S7-netns positive byte-identity: NarHash matches the signed upstream",
+            f"got={got} want={fixtures.nar_hash(S7_TARGET)}",
+        )
+        stats = topo.proxy_stats()
+        nar_up = stats["upstream"].get("nar", 0)
+        ninfo_up = stats["upstream"].get("narinfo", 0)
+        expect(
+            nar_up == 0,
+            "S7-netns positive oracle: 0 upstream NAR egress (peer-served across the "
+            "routed netns via a kad-RESOLVED routable address)",
+            f"upstream.nar={nar_up}",
+        )
+        expect(
+            ninfo_up > 0,
+            "S7-netns positive context: narinfo egress is NONZERO (served upstream)",
+            f"upstream.narinfo={ninfo_up}",
+        )
+
+    # -- ARM B (resolution-only-broken control): P alive + reachable, but publishes a
+    # non-routable loopback address -> C cannot resolve a dialable address -> fallback.
+    seed_dir2, prov_seeds2, target_sp2 = _s7_seeds(ctx, "netns-ctl", S7_TARGET)
+    with Libp2pNetnsTopology(
+        ctx,
+        "s7netnsctl",
+        fixtures.cache,
+        seed_dir2,
+        prov_seeds2,
+        expect,
+        provider_loopback_only=True,
+    ) as topo:
+        prov_listen = topo.provider_identity[1] if topo.provider_identity else ""
+        # The control's SINGLE knob: P published ONLY a loopback address.
+        expect(
+            "/ip4/127.0.0.1/" in prov_listen
+            and Libp2pNetnsTopology.IP_PROVIDER not in prov_listen,
+            "S7-netns control: provider announced ONLY a non-routable loopback address "
+            "(the resolution leg's input is now unusable from C's separate netns)",
+            f"listen={prov_listen!r}",
+        )
+        # LOAD-BEARING EVIDENCE: from INSIDE C's netns, P's ROUTABLE net-p IP answers
+        # HTTP. So P is UP and the net-c -> net-p path EXISTS; only the RESOLVED libp2p
+        # address is broken. Without this, a fallback could be blamed on P being down.
+        status, body = topo.provider_reachable_from_consumer()
+        expect(
+            status == 200,
+            "S7-netns control: P is ALIVE + REACHABLE from C's netns at its routable "
+            "net-p IP (so the fallback below isolates RESOLUTION, not liveness/path)",
+            f"status={status} body={body[:200]!r}",
+        )
+
+        time.sleep(LIBP2P_NETNS_CONVERGE_S)
+        topo.proxy_reset()
+        res = topo.client_run([target_sp2], fixtures.public_key)
+        expect(
+            res.exit_code == 0,
+            "S7-netns control: build still succeeds via upstream fallback",
+            res.stderr[-800:],
+        )
+        got = res.narhash(target_sp2)
+        expect(
+            got == fixtures.nar_hash(S7_TARGET),
+            "S7-netns control: still byte-identical (served by upstream fallback)",
+            f"got={got}",
+        )
+        nar_up = topo.proxy_stats()["upstream"].get("nar", 0)
+        expect(
+            nar_up >= 1,
+            "S7-netns control ORACLE BITE: upstream served the FULL NAR because C could "
+            "not RESOLVE a dialable address for P (P alive + reachable) - resolution is "
+            "load-bearing, discharging the F1 caveat that the shared-pod S7 could not",
+            f"upstream.nar={nar_up}",
+        )
+        # Corroboration that the fallback isolates RESOLUTION, not DISCOVERY: C's daemon
+        # log shows it DISCOVERED provider record(s) via kad but none yielded bytes
+        # (the dial to the loopback-resolved address failed) - NOT the "libp2p-kad miss"
+        # that a discovery failure would log. So get_providers (discovery) succeeded and
+        # only the address-resolution/dial leg broke. (Distinct code paths in
+        # daemon/src/source_libp2p.rs: Lookup::Miss vs the "discovered ... but none
+        # yielded verified bytes" per-offer-failure return.)
+        clog = topo.logs("lp-consumer")
+        expect(
+            "provider record(s) for" in clog
+            and "none yielded verified bytes" in clog
+            and "libp2p-kad miss" not in clog,
+            "S7-netns control: consumer DISCOVERED P via kad (found provider record(s)) "
+            "but could not resolve a dialable address - the fallback is a RESOLUTION "
+            "failure, NOT a discovery miss",
+            f"consumer log tail: {clog[-700:]!r}",
+        )
+
+
 SCENARIOS = [
     ("topology", scenario_topology),
     ("s1-byte-and-counts", scenario_s1_byte_and_counts),
@@ -4071,6 +4690,7 @@ SCENARIOS = [
     # fetch->serve across containers, with the F1 load-bearing control + a MISS arm.
     ("s7-libp2p", scenario_s7_libp2p),
     ("s7-libp2p-miss", scenario_s7_libp2p_miss),
+    ("s7-libp2p-netns", scenario_s7_libp2p_netns),
 ]
 
 
@@ -4144,12 +4764,21 @@ def cleanup_pods(reason: str = "") -> int:
     for pod_id in listing:
         run([pm, "pod", "rm", "-f", pod_id], check=False)
         removed += 1
-    # Any stray labelled containers not in a pod.
+    # Any stray labelled containers not in a pod (the S7 separate-netns topology
+    # runs its daemons as standalone --network containers, not pod members).
     stray = run(
         [pm, "ps", "-a", "--filter", f"label={PROJECT_LABEL}", "-q"], check=False
     ).stdout.split()
     for cid in stray:
         run([pm, "rm", "-f", cid], check=False)
+    # Labelled networks (the S7 separate-netns topology creates two bridge
+    # networks per arm). Removed AFTER the containers that attach to them, so the
+    # rm cannot fail on an in-use network. Label-scoped like everything else here.
+    nets = run(
+        [pm, "network", "ls", "--filter", f"label={PROJECT_LABEL}", "-q"], check=False
+    ).stdout.split()
+    for net in nets:
+        run([pm, "network", "rm", "-f", net], check=False)
     if reason:
         print(f"e2e-clean: removed {removed} pod(s) {reason}")
     return removed
