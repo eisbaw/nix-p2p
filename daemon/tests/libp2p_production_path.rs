@@ -469,14 +469,27 @@ async fn production_config_builds_libp2p_source_that_discovers_and_serves_with_c
     // kad lets the fetch reuse a connection an earlier discovery query opened to P, so the
     // HIT would serve byte-identical EVEN IF `resolve` skipped `locate` - verified by
     // mutation, TASK-169 notes). The peer-routing consult IS observable through the frozen
-    // exposure-ledger seam: a HIT drives BOTH `find_providers` AND `locate` (an extra DHT
-    // disclosure), a MISS drives ONLY `find_providers` (it returns before the record loop).
-    // So a HIT must disclose strictly MORE than a MISS; deleting the `locate` consult
-    // collapses the two deltas and trips this assertion.
-    assert!(
-        hit_ledger_delta > miss_ledger_delta,
-        "a p2p HIT must disclose to the DHT via peer-routing (node_locator) beyond the \
-         discovery lookup a MISS does; got hit_delta={hit_ledger_delta}, \
-         miss_delta={miss_ledger_delta} (resolve did not consult node_locator on the HIT)"
+    // exposure-ledger seam.
+    //
+    // LOAD-BEARING ASSUMPTION (pinned deliberately, per the TASK-169 mped review F2): the
+    // directory's `find_providers` records a PROVIDER-COUNT-INDEPENDENT 2 disclosures
+    // (ContentKey + OurNodeId, `fabric-libp2p/src/directory.rs`) up front on any DHT
+    // consultation, and `node_locator().locate` records EXACTLY 1 more (OurNodeId,
+    // `fabric-libp2p/src/locator.rs`); the transfer path records none. So a HIT (discovery
+    // Found -> record loop -> locate) discloses `find_providers`(2) + `locate`(1) = 3, and a
+    // MISS (discovery Miss -> returns BEFORE the record loop, no locate) discloses only
+    // `find_providers`(2). The EXACT `+1` form is intentional: were discovery ever changed
+    // to record a per-provider disclosure, a HIT would out-disclose a MISS for the WRONG
+    // reason (more providers, not a peer-routing consult) - a strict `>` would silently pass
+    // and stop guarding the locate call. Exact equality trips loudly instead, forcing this
+    // oracle to be revisited alongside any change to discovery's exposure accounting.
+    assert_eq!(
+        hit_ledger_delta,
+        miss_ledger_delta + 1,
+        "a p2p HIT must disclose to the DHT via peer-routing (node_locator) EXACTLY one \
+         disclosure beyond the discovery lookup a MISS does; got hit_delta={hit_ledger_delta}, \
+         miss_delta={miss_ledger_delta}. hit != miss+1 means either resolve did not consult \
+         node_locator on the HIT, or discovery's exposure accounting changed (revisit this \
+         oracle - see the load-bearing assumption above)"
     );
 }

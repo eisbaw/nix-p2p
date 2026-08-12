@@ -254,10 +254,15 @@ impl NarSource for Libp2pNarSource {
             }
         }
 
-        // Every offer of every discovered provider was skipped or failed: a clean miss the
-        // FallbackNarSource turns into upstream fallback (S2).
+        // No discovered provider yielded verified bytes: every record was either
+        // UNLOCATABLE (node_locator Miss/Unavailable -> the record loop never reached its
+        // offers) or had all offers skipped/failed. `last_failure` carries the specific
+        // cause (a `node_locator: ...` prefix means the dial address could not be resolved,
+        // distinct from an offer/transfer failure), so the summary stays truthful either
+        // way. A clean miss the FallbackNarSource turns into upstream fallback (S2).
         Err(SourceError::Unreachable(format!(
-            "discovered {} provider record(s) for {content_key} but no offer yielded verified bytes: {}",
+            "discovered {} provider record(s) for {content_key} but none yielded verified bytes \
+             (unlocatable provider or offer failure): {}",
             records.len(),
             last_failure.unwrap_or_else(|| "no usable offer".to_string())
         )))
