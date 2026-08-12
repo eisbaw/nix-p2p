@@ -69,7 +69,7 @@
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 
@@ -145,81 +145,220 @@ pub trait Discovery: Send + Sync {
 
 // -------------------------------------------------------------------------
 // InMemoryDiscovery: the wave-1/test stand-in (was TransportNarSource's inline
-// map). A MULTIMAP: a NarHash accumulates every distinct holder that announces
-// it, so resolve can offer more than one holder and the fetch driver can fail
-// over from a dead holder to the next (task-66).
+// map). A per-HOLDER index: a NarHash maps to every distinct holder that
+// announces it (that holder's LATEST offer set), so resolve can offer more than
+// one holder and the fetch driver can fail over from a dead holder to the next
+// (task-66), while an untrusted or stale announce cannot poison the key
+// (task-170/171).
 // -------------------------------------------------------------------------
 
-/// A discovery source backed by an in-memory MULTIMAP of announced claims, keyed on
-/// the canonical [`NarHashKey`]. This is the task-38 "discovery stand-in" made a
-/// first-class [`Discovery`] impl: a test (or a wave-1 seed) [`announce`]s claims
-/// and `resolve` returns them. It shares the [`Discovery`] contract with
+/// How long a holder's announce stays live in [`InMemoryDiscovery`] before it is
+/// evicted as stale. A holder that stops re-announcing (crashed, retired, or lied
+/// once and moved on) must not be dialed forever: without a TTL the index is
+/// grow-only and every dead locator costs a dial timeout on every fetch (task-171).
+///
+/// One hour is deliberately COARSE: this is a wave-1/test stand-in and re-announce
+/// cadence is not yet a tuned parameter (a real push/gossip layer picks its own
+/// refresh interval, task-47). It is long enough that a normally-refreshing holder
+/// never falls out mid-session, short enough that a dead holder is reaped within a
+/// bounded window. Eviction is LAZY - performed on `announce`/`resolve`, not by a
+/// background task - so an idle index simply keeps stale entries until next touched
+/// (harmless: nothing dials an untouched key).
+pub const ANNOUNCE_TTL: Duration = Duration::from_secs(3600);
+
+/// The time source for [`InMemoryDiscovery`] TTL accounting. A SEAM only so a test
+/// can drive eviction by advancing a logical clock instead of sleeping a real
+/// [`ANNOUNCE_TTL`] (which would be a multi-second, flake-prone test). Production
+/// uses [`SystemClock`] and never sees this.
+pub trait Clock: Send + Sync {
+    /// The current instant, monotonic per the platform's [`Instant`].
+    fn now(&self) -> Instant;
+}
+
+/// The real clock: [`Instant::now`]. The only [`Clock`] outside tests.
+#[derive(Default)]
+pub struct SystemClock;
+
+impl Clock for SystemClock {
+    fn now(&self) -> Instant {
+        Instant::now()
+    }
+}
+
+/// A holder's LATEST announce for a key, plus WHEN it was recorded (for TTL). One
+/// per holder identity under a key - a re-announce REPLACES this in place
+/// (per-holder last-writer-wins, task-171), it does not accumulate a second entry.
+struct HeldClaim {
+    claim: Claim,
+    /// When this holder last (re-)announced. Reset on every announce (LWW), read by
+    /// eviction to reap a holder that stopped refreshing past [`ANNOUNCE_TTL`].
+    announced_at: Instant,
+    /// A per-key monotonic sequence stamped at announce time, so resolve can order
+    /// holders by ANNOUNCE ORDER deterministically even though the per-key store is
+    /// a `HashMap` (whose iteration order is not). Preserves the task-66 "offers in
+    /// announce order, so failover tries the first-announced holder first" contract.
+    seq: u64,
+}
+
+/// The identity a holder is keyed by within one `NarHash`. It is the announce's
+/// `holders` set: every REAL announce is a single self-holder (`vec![node]`, see
+/// `AvailabilityIndex::claim` and the daemon's config-claim wiring), so this is
+/// per-`NodeId` last-writer-wins in practice; a (rare, hand-built) multi-holder
+/// claim is simply its own identity. Using the whole set - rather than picking an
+/// arbitrary element - is a TOTAL function over any [`Claim`] (an empty-holders
+/// claim collapses to one degenerate bucket, never a panic).
+type HolderId = Vec<NodeId>;
+
+/// A discovery source backed by an in-memory per-HOLDER index of announced claims,
+/// keyed on the canonical [`NarHashKey`]. This is the task-38 "discovery stand-in"
+/// made a first-class [`Discovery`] impl: a test (or a wave-1 seed) [`announce`]s
+/// claims and `resolve` returns them. It shares the [`Discovery`] contract with
 /// [`DirectDiscovery`], so the same [`crate::transport_fetch::TransportNarSource`]
 /// drives either without change.
 ///
-/// ## Multi-holder (task-66): accumulate, do not replace
+/// ## Multi-holder (task-66): index by holder, do not replace the KEY
 ///
 /// A single `NarHash` can be held by MANY peers, and the whole point of a decentral
-/// cache is that a DEAD holder fails over to the NEXT one. So `announce` ACCUMULATES
-/// distinct holders under a key (it used to REPLACE, which capped every key at one
-/// holder and collapsed failover into the peer->upstream fallback S6 already covers).
-/// `resolve` then MERGES the accumulated claims into ONE [`Claim`] whose `transports`
-/// is the UNION of every holder's fetch offers, in ANNOUNCE ORDER. That is exactly
+/// cache is that a DEAD holder fails over to the NEXT one. So the index accumulates
+/// distinct HOLDERS under a key (it used to REPLACE the whole key, which capped it at
+/// one holder and collapsed failover into the peer->upstream fallback S6 already
+/// covers). `resolve` merges the live holders into ONE [`Claim`] whose `transports`
+/// is the UNION of the winning partition's fetch offers, in ANNOUNCE ORDER - exactly
 /// the shape [`crate::transport_fetch::fetch_via_offers`] already iterates and fails
-/// over across - so multi-holder failover falls out of the EXISTING fetch driver
-/// with no change to it and, critically, NO change to the FROZEN claim wire schema:
-/// `holders`/`transports` are already `Vec` on [`Claim`]; this constructs an
-/// in-memory value with several entries, it does not grow the on-wire surface.
+/// over across, so multi-holder failover falls out of the EXISTING fetch driver with
+/// NO change to the FROZEN claim wire schema (`holders`/`transports` are already
+/// `Vec` on [`Claim`]; this constructs an in-memory value with several entries, it
+/// does not grow the on-wire surface).
 ///
-/// The merged claim's content id ([`Claim::content_id`]) is taken from the FIRST
-/// accumulated claim. Honest holders of one `NarHash` agree on its `BLAKE3` (it is
-/// `BLAKE3(RawNarV1)`, a pure function of the same bytes), so the union is sound; a
-/// holder that disagrees only contributes an offer whose bytes fail the gate-1
-/// integrity check downstream and is skipped (the daemon is outside the TCB - a
-/// lying offer never yields wrong bytes, see [`crate::transport_fetch`]).
+/// ## Per-holder last-writer-wins + eviction (task-171)
+///
+/// The natural unit of an announce is the HOLDER: a holder is the single source of
+/// truth for ITS OWN offers, so its latest announce must REPLACE its prior offer set,
+/// not accumulate alongside it. The index therefore keys each key's holders by
+/// [`HolderId`] and stores each holder's LATEST [`HeldClaim`]. A holder correcting or
+/// shrinking its offers RETRACTS the stale ones (the old full-`Claim` dedup could
+/// only ever GROW: an updated announce was a distinct value that piled on, so a dead
+/// locator was dialed forever). Entries past [`ANNOUNCE_TTL`] are evicted lazily on
+/// `announce`/`resolve`, so the index is not grow-only.
+///
+/// ## Partition-by-content-id: one lying announce cannot collapse the key (task-170)
+///
+/// `resolve` PARTITIONS the live holders by their claimed content id
+/// ([`Claim::content_id`], the `BLAKE3(RawNarV1)`) and surfaces only the partition
+/// with the MOST corroborating live holders (ties broken by earliest announce, so it
+/// is deterministic). Honest holders of one `NarHash` agree on its `BLAKE3` (a pure
+/// function of the same bytes), so they land in one partition; a holder announcing a
+/// WRONG blake3 forms its OWN, minority partition and is segregated, NOT unioned in -
+/// so it cannot make every honest holder be dialed for the wrong content and collapse
+/// the key to a discovery-exhausted miss. Inert announces (`payload == None`, an
+/// unknown/undecodable payload kind) assert NO content id, so they are folded into the
+/// winning partition rather than forming a rival one - their offers still fail over,
+/// exactly as before. HONEST LIMIT: this is a MAJORITY vote with no trust or
+/// reputation, so a sybil that announces MORE (fake) holders than the honest set could
+/// still win; stopping ONE lying announce from collapsing the key is the bounded claim
+/// (task-170 AC#3). The daemon is outside the TCB regardless - a surfaced-but-lying
+/// offer only ever yields bytes that fail the downstream gate-1 integrity check, never
+/// wrong bytes (see [`crate::transport_fetch`]).
 ///
 /// Keyed on [`NarHashKey`] (not a loose string) so it agrees BY CONSTRUCTION with
 /// the availability index and the claim wire - the canonical-key discipline the
 /// task-38/48 notes call out (a non-canonical key can never be inserted, because
 /// the claim already carries a strict `NarHashKey`).
-#[derive(Default)]
 pub struct InMemoryDiscovery {
-    /// key -> holders, in ANNOUNCE ORDER. A `Vec` (not a set) so the resolve order
-    /// is the deterministic announce order; de-duplication of an identical
-    /// re-announce is done in [`announce`](Self::announce).
-    claims: Mutex<HashMap<NarHashKey, Vec<Claim>>>,
+    /// key -> (holder identity -> that holder's latest claim + announce time). The
+    /// inner map is per-holder so a re-announce REPLACES in place (task-171 LWW);
+    /// announce order for resolve is reconstructed from [`HeldClaim::seq`].
+    claims: Mutex<HashMap<NarHashKey, HashMap<HolderId, HeldClaim>>>,
+    /// A per-instance monotonic announce counter, stamped onto every NEW holder's
+    /// [`HeldClaim`] so resolve can recover a deterministic FIRST-SEEN announce order
+    /// across the `HashMap`. A re-announce KEEPS its holder's original `seq`, so a
+    /// refresh does not reshuffle failover order.
+    seq: std::sync::atomic::AtomicU64,
+    /// How long a holder's announce stays live before eviction (default
+    /// [`ANNOUNCE_TTL`]; a short one in tests).
+    ttl: Duration,
+    /// The time source (real [`SystemClock`] in production; a manual clock in tests
+    /// so eviction is provable without sleeping).
+    clock: Arc<dyn Clock>,
+}
+
+impl Default for InMemoryDiscovery {
+    fn default() -> Self {
+        Self {
+            claims: Mutex::new(HashMap::new()),
+            seq: std::sync::atomic::AtomicU64::new(0),
+            ttl: ANNOUNCE_TTL,
+            clock: Arc::new(SystemClock),
+        }
+    }
 }
 
 impl InMemoryDiscovery {
-    /// An empty discovery source.
+    /// An empty discovery source with the default [`ANNOUNCE_TTL`] and the real clock.
     pub fn new() -> Self {
         Self::default()
     }
 
-    /// Record a claim under its own canonical [`NarHashKey`], ACCUMULATING it
-    /// alongside any holders already announced for that key (task-66) so a later
-    /// `resolve` can offer every holder. IDEMPOTENT: re-announcing a FULLY IDENTICAL
-    /// claim (same holder, same offers) does not duplicate it - a holder refreshing
-    /// its announce stays one entry. A claim that differs in any field (a new holder,
-    /// a changed offer set) is a distinct entry and accumulates.
-    pub fn announce(&self, claim: Claim) {
-        let mut claims = self.claims.lock().expect("claims mutex");
-        let holders = claims.entry(claim.key).or_default();
-        if !holders.contains(&claim) {
-            holders.push(claim);
+    /// As [`new`](Self::new) but with an explicit eviction TTL and time source. Used
+    /// by tests to prove eviction without sleeping a real hour; production takes the
+    /// [`Default`] (a [`SystemClock`] and [`ANNOUNCE_TTL`]).
+    #[cfg(test)]
+    fn with_ttl_and_clock(ttl: Duration, clock: Arc<dyn Clock>) -> Self {
+        Self {
+            claims: Mutex::new(HashMap::new()),
+            seq: std::sync::atomic::AtomicU64::new(0),
+            ttl,
+            clock,
         }
     }
 
-    /// Merge the claims accumulated for one key into a SINGLE claim whose `holders`
-    /// and `transports` are the UNION across all of them, preserving ANNOUNCE ORDER
-    /// and de-duplicating repeats. `claims` is non-empty (the caller only calls this
-    /// for a populated key). The merged content id / relay come from the FIRST claim
-    /// that actually carries one (`find_map`, not `claims[0]` unconditionally): a
-    /// first holder whose payload decoded to an unknown, inert kind
-    /// (`payload == None`) must not blind the whole key when a later holder does
-    /// carry a usable `WholeNar`. See the type-level note on why the union is sound.
-    fn merge(claims: &[Claim]) -> Claim {
-        let first = &claims[0];
+    /// The identity a claim is keyed by within a `NarHash` (its `holders` set). See
+    /// [`HolderId`] for why the whole set, not an arbitrary element.
+    fn holder_id(claim: &Claim) -> HolderId {
+        claim.holders.clone()
+    }
+
+    /// Record a claim under its own canonical [`NarHashKey`], as the LATEST announce
+    /// from its holder identity (task-171 per-holder last-writer-wins): a re-announce
+    /// from the same holder REPLACES that holder's prior offer set in place (so a
+    /// corrected/shrunk offer set retracts the stale locators), while a DIFFERENT
+    /// holder accumulates alongside it (task-66 multi-holder). Refreshing the same
+    /// offers is idempotent as to the holder set and simply resets the holder's TTL.
+    /// Stale holders (past [`ANNOUNCE_TTL`]) for the touched key are evicted here.
+    pub fn announce(&self, claim: Claim) {
+        let now = self.clock.now();
+        let mut claims = self.claims.lock().expect("claims mutex");
+        let holders = claims.entry(claim.key).or_default();
+        // Reap this key's dead holders while we hold the lock, so an updated announce
+        // also gc's the neighbours that stopped refreshing.
+        holders.retain(|_, held| now.duration_since(held.announced_at) < self.ttl);
+        let id = Self::holder_id(&claim);
+        // FIRST-SEEN order: a re-announce keeps the holder's original sequence (it is
+        // the same holder failing over in the same slot); only a genuinely new holder
+        // takes the next sequence. This keeps the deterministic announce order the
+        // task-66 tests pin, while LWW still replaces the offers and refreshes the TTL.
+        let seq = match holders.get(&id) {
+            Some(existing) => existing.seq,
+            None => self.seq.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+        };
+        holders.insert(
+            id,
+            HeldClaim {
+                claim,
+                announced_at: now,
+                seq,
+            },
+        );
+    }
+
+    /// Merge one content-id PARTITION's live claims (already selected as the winner by
+    /// [`resolve`]) into a SINGLE claim whose `holders`/`transports`/`signatures` are
+    /// the UNION across them in ANNOUNCE ORDER, de-duplicating repeats. `claims` is
+    /// non-empty. The content id / relay come from the first claim that actually
+    /// carries one (`find_map`): the inert (`payload == None`) claims folded into the
+    /// winner carry none, and must not blind a partition whose honest holders do.
+    fn merge(claims: &[&Claim]) -> Claim {
+        let first = claims[0];
         let payload = claims.iter().find_map(|c| c.payload.clone());
         let relay = claims.iter().find_map(|c| c.relay.clone());
         let mut holders: Vec<NodeId> = Vec::new();
@@ -252,13 +391,88 @@ impl InMemoryDiscovery {
             signatures,
         }
     }
+
+    /// Choose the content-id partition to surface for a key and merge it, or `None`
+    /// if the key has no live holders. Steps (task-170):
+    ///   1. Order the live holders by announce order ([`HeldClaim::seq`]).
+    ///   2. Partition by claimed content id (`Option<Blake3Digest>`). The inert
+    ///      (`None`) group asserts no content id and is not a rival - it is folded
+    ///      into whichever real partition wins.
+    ///   3. Pick the real partition with the MOST holders (ties: earliest announce),
+    ///      fold in the inert claims, and [`merge`](Self::merge). If there is NO real
+    ///      partition (every announce inert), fall back to merging the inert group so
+    ///      an all-inert key still surfaces its holders (its content id is `None`,
+    ///      i.e. unfetchable - unchanged from before).
+    fn resolve_key(holders: &HashMap<HolderId, HeldClaim>) -> Option<Claim> {
+        if holders.is_empty() {
+            return None;
+        }
+        // Announce order across the HashMap: sort the live claims by their sequence.
+        let mut ordered: Vec<&HeldClaim> = holders.values().collect();
+        ordered.sort_by_key(|held| held.seq);
+
+        // Partition indices of `ordered` by claimed content id; keep inert separate.
+        let mut partitions: Vec<(crate::content_id::Blake3Digest, Vec<&Claim>)> = Vec::new();
+        let mut inert: Vec<&Claim> = Vec::new();
+        for held in &ordered {
+            match held.claim.content_id() {
+                Some(cid) => match partitions.iter_mut().find(|(id, _)| id == cid) {
+                    Some((_, group)) => group.push(&held.claim),
+                    None => partitions.push((*cid, vec![&held.claim])),
+                },
+                None => inert.push(&held.claim),
+            }
+        }
+
+        // The winning real partition: MOST holders, ties -> EARLIEST announce.
+        // `partitions` is already in first-announce order (it was built by scanning
+        // `ordered`), so the winner is the one that is longer, and on equal length
+        // the one with the smaller index. The comparator returns `Greater` for the
+        // claim that should win: longer length, then (on a tie) the smaller index -
+        // `b_idx.cmp(a_idx)` is `Greater` exactly when `a_idx < b_idx`.
+        let winner = partitions
+            .iter()
+            .enumerate()
+            .max_by(|(a_idx, (_, a)), (b_idx, (_, b))| {
+                a.len().cmp(&b.len()).then_with(|| b_idx.cmp(a_idx))
+            })
+            .map(|(_, (_, group))| group.clone());
+
+        let mut winning: Vec<&Claim> = match winner {
+            Some(group) => group,
+            // No real partition at all: every announce was inert. Surface the inert
+            // holders (content id stays None, i.e. unfetchable - unchanged behaviour).
+            None => return Some(Self::merge(&inert)),
+        };
+        // Fold the inert (no-content-id) announces into the winner so their offers
+        // still fail over; they assert no conflicting content id.
+        winning.extend(inert);
+        // Re-sort the folded set into announce order so the merged offer list stays
+        // in deterministic announce order (the fold appended the inert group).
+        winning.sort_by_key(|claim| {
+            ordered
+                .iter()
+                .position(|held| std::ptr::eq(&held.claim, *claim))
+                .unwrap_or(usize::MAX)
+        });
+        Some(Self::merge(&winning))
+    }
 }
 
 #[async_trait]
 impl Discovery for InMemoryDiscovery {
     async fn resolve(&self, key: &NarHashKey) -> Option<Claim> {
-        let claims = self.claims.lock().expect("claims mutex");
-        claims.get(key).map(|holders| Self::merge(holders))
+        let now = self.clock.now();
+        let mut claims = self.claims.lock().expect("claims mutex");
+        let holders = claims.get_mut(key)?;
+        // Evict this key's stale holders before resolving, so a dead locator is not
+        // dialed (task-171) and a key whose every holder has expired misses cleanly.
+        holders.retain(|_, held| now.duration_since(held.announced_at) < self.ttl);
+        if holders.is_empty() {
+            claims.remove(key);
+            return None;
+        }
+        Self::resolve_key(holders)
     }
 }
 
@@ -1103,6 +1317,213 @@ mod tests {
         assert!(
             discovery.resolve(&key_y()).await.is_none(),
             "an unannounced key is a clean miss"
+        );
+    }
+
+    // ---- task-170/171: harden the per-holder index -------------------------
+
+    /// A manual, monotonic clock so TTL eviction is provable WITHOUT sleeping a real
+    /// [`ANNOUNCE_TTL`] (a multi-second, flake-prone test). It advances only when the
+    /// test advances it, so eviction is deterministic.
+    struct ManualClock {
+        base: Instant,
+        offset_nanos: AtomicUsize,
+    }
+    impl ManualClock {
+        fn new() -> Arc<Self> {
+            Arc::new(ManualClock {
+                base: Instant::now(),
+                offset_nanos: AtomicUsize::new(0),
+            })
+        }
+        fn advance(&self, by: Duration) {
+            self.offset_nanos
+                .fetch_add(by.as_nanos() as usize, Ordering::Relaxed);
+        }
+    }
+    impl Clock for ManualClock {
+        fn now(&self) -> Instant {
+            self.base + Duration::from_nanos(self.offset_nanos.load(Ordering::Relaxed) as u64)
+        }
+    }
+
+    /// A whole-NAR claim for `key`, held by `holder`, carrying an EXPLICIT offer set
+    /// (so a test can drive a holder that changes its offers between announces).
+    fn claim_with(
+        key: NarHashKey,
+        holder: NodeId,
+        blake3: Blake3Digest,
+        transports: Vec<KnownTransport>,
+    ) -> Claim {
+        Claim {
+            schema_version: CLAIM_SCHEMA_VERSION,
+            key,
+            payload: Some(KnownPayload::WholeNar { blake3 }),
+            holders: vec![holder],
+            transports,
+            relay: None,
+            signatures: vec![],
+        }
+    }
+
+    #[tokio::test]
+    async fn a_poisoning_announce_is_partitioned_off_not_merged_into_honest_holders() {
+        // TASK-170. Honest holders of one NarHash AGREE on its blake3 (a pure function
+        // of the same bytes); a liar announcing a WRONG blake3 forms its OWN partition
+        // and must not be unioned under the honest content id. Here the poisoning
+        // announce is FIRST - exactly the case the old merge broke on, because it took
+        // the merged content id from the first holder that carried one.
+        let honest = Blake3Digest::from_raw_nar(b"the content every honest holder agrees on");
+        let poison = Blake3Digest::from_raw_nar(b"a WRONG blake3 that one liar announces");
+        assert_ne!(honest, poison, "the two content ids must genuinely differ");
+
+        let liar = NodeId::from_bytes([0x66; 32]);
+        let h1 = NodeId::from_bytes([0xa1; 32]);
+        let h2 = NodeId::from_bytes([0xa2; 32]);
+
+        let discovery = InMemoryDiscovery::new();
+        // FIRST: the poisoning announce (honest key, wrong blake3).
+        discovery.announce(claim_held_by(key_x(), liar, poison));
+        // Then two honest holders, agreeing on the real content id.
+        discovery.announce(claim_held_by(key_x(), h1, honest));
+        discovery.announce(claim_held_by(key_x(), h2, honest));
+
+        let claim = discovery.resolve(&key_x()).await.expect("a hit");
+        // The honest MAJORITY partition is surfaced, not the first (poison) content id.
+        assert_eq!(
+            claim.content_id(),
+            Some(&honest),
+            "the honest majority content id is surfaced; a first wrong-blake3 announce \
+             is segregated, not merged in (a union-under-first merge yields the poison here)"
+        );
+        // The honest holders remain dialable for the correct content...
+        assert_eq!(
+            claim.holders,
+            vec![h1, h2],
+            "the honest holders resolve; the poison holder is not unioned into their partition"
+        );
+        assert_eq!(
+            claim.transports,
+            vec![
+                KnownTransport::Iroh { node: h1 },
+                KnownTransport::Iroh { node: h2 },
+            ]
+        );
+        // ...and the liar's offer is NOT present (dialing it would be for wrong content).
+        assert!(
+            !claim.holders.contains(&liar),
+            "the poisoning holder must not appear in the honest partition"
+        );
+        assert!(
+            !claim
+                .transports
+                .contains(&KnownTransport::Iroh { node: liar }),
+            "the poisoning holder's locator must not be dialed under the honest content id"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_holder_reannouncing_an_updated_offer_set_retracts_its_stale_locator() {
+        // TASK-171 AC#1: a holder is the single source of truth for its OWN offers, so
+        // its latest announce REPLACES its prior offer set (per-holder LWW). Under the
+        // old full-Claim dedup the two announces below (they differ) BOTH accumulated
+        // and merge unioned them, so a holder could never retract a dead locator.
+        let content = Blake3Digest::from_raw_nar(b"one holder, an evolving offer set");
+        let a = NodeId::from_bytes([0xaa; 32]);
+        let fresh = KnownTransport::Iroh { node: a };
+        let stale = KnownTransport::BitTorrent {
+            infohash: crate::transport::BitTorrentInfoHash::v2([0x5a; 32]),
+        };
+
+        let discovery = InMemoryDiscovery::new();
+        // First announce carries a locator that will later go dead.
+        discovery.announce(claim_with(
+            key_x(),
+            a,
+            content,
+            vec![fresh.clone(), stale.clone()],
+        ));
+        // The SAME holder re-announces a CORRECTED offer set, without the stale locator.
+        discovery.announce(claim_with(key_x(), a, content, vec![fresh.clone()]));
+
+        let claim = discovery.resolve(&key_x()).await.expect("a hit");
+        assert_eq!(claim.holders, vec![a], "still exactly one holder");
+        assert_eq!(
+            claim.transports,
+            vec![fresh.clone()],
+            "the holder's UPDATED offer set is authoritative"
+        );
+        assert!(
+            !claim.transports.contains(&stale),
+            "the stale locator is RETRACTED by the holder's updated announce, not accumulated \
+             (a full-Claim-dedup merge would still union it in and dial it forever)"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_holder_past_the_ttl_is_evicted_not_dialed_forever() {
+        // TASK-171 AC#2: the index is not grow-only. A holder that stops re-announcing
+        // is evicted past ANNOUNCE_TTL, so its dead locator is not dialed on every
+        // fetch. A manual clock proves it without sleeping a real hour.
+        let content = Blake3Digest::from_raw_nar(b"a holder that later goes silent");
+        let a = NodeId::from_bytes([0xaa; 32]);
+        let b = NodeId::from_bytes([0xbb; 32]);
+        let ttl = Duration::from_secs(100);
+        let clock = ManualClock::new();
+        let discovery = InMemoryDiscovery::with_ttl_and_clock(ttl, clock.clone());
+
+        discovery.announce(claim_held_by(key_x(), a, content));
+        assert_eq!(
+            discovery.resolve(&key_x()).await.expect("hit").holders,
+            vec![a],
+            "control: A resolves while its announce is fresh"
+        );
+
+        // Time passes beyond the TTL; A never refreshed. A fresh holder B then announces.
+        clock.advance(ttl + Duration::from_secs(1));
+        discovery.announce(claim_held_by(key_x(), b, content));
+
+        let claim = discovery.resolve(&key_x()).await.expect("hit");
+        assert_eq!(
+            claim.holders,
+            vec![b],
+            "the silent holder A is evicted past the TTL; only fresh B remains (no eviction \
+             would leave A dialable forever)"
+        );
+        assert!(
+            !claim.transports.contains(&KnownTransport::Iroh { node: a }),
+            "A's dead locator is not offered for dialing"
+        );
+
+        // Once EVERY holder is past the TTL the key is a clean miss, not a stale dial.
+        clock.advance(ttl + Duration::from_secs(1));
+        assert!(
+            discovery.resolve(&key_x()).await.is_none(),
+            "a key whose every holder has aged out misses cleanly, not a stale hit"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_refreshing_holder_stays_live_across_the_ttl() {
+        // The other side of eviction: a holder that KEEPS re-announcing within the TTL
+        // must never fall out. LWW resets its announce time on every refresh.
+        let content = Blake3Digest::from_raw_nar(b"a holder that keeps refreshing");
+        let a = NodeId::from_bytes([0xaa; 32]);
+        let ttl = Duration::from_secs(100);
+        let clock = ManualClock::new();
+        let discovery = InMemoryDiscovery::with_ttl_and_clock(ttl, clock.clone());
+
+        // Announce, then re-announce every 60s (< TTL) across 5 minutes of logical time.
+        discovery.announce(claim_held_by(key_x(), a, content));
+        for _ in 0..5 {
+            clock.advance(Duration::from_secs(60));
+            discovery.announce(claim_held_by(key_x(), a, content));
+        }
+        let claim = discovery.resolve(&key_x()).await.expect("hit");
+        assert_eq!(
+            claim.holders,
+            vec![a],
+            "a holder refreshing inside the TTL never ages out"
         );
     }
 
