@@ -99,24 +99,31 @@ impl NarTransfer for Libp2pTransport {
         })?;
 
         // TASK-169: resolve WHERE the provider is dialable THROUGH the DHT (kad
-        // peer-routing) and seed the resolved address(es) into the swarm's address book
-        // EXPLICITLY, so the fetch below dials off THIS resolution - not off whatever a
-        // prior, unrelated query happened to leave in the shared routing table. This is
-        // the root-cause fix for the rejected side-effect design: the resolve-then-dial
-        // lives INSIDE the fabric, where the `DialInfo` is allowed to be (the seam keeps
-        // it out of the serving layer). `add_address` of a DHT-RESOLVED address is NOT
-        // injection - the address came from the DHT, not from the caller - and the shared
+        // peer-routing) and seed this resolution's address(es) into the swarm's kad routing
+        // table EXPLICITLY before dialing. This is the root-cause fix for the rejected
+        // side-effect design (the daemon calling locate() only for its routing-table side
+        // effect and discarding the DialInfo): the resolve-then-dial now lives INSIDE the
+        // fabric, where the `DialInfo` is allowed to be (the seam keeps it out of the
+        // serving layer), and the address is fed to the dial EXPLICITLY rather than left to
+        // whatever an earlier query incidentally populated. `add_address` of a DHT-RESOLVED
+        // address is NOT injection - it came from the DHT, not the caller - and the shared
         // locator records the OurNodeId->DhtNode disclosure to the fabric ledger.
         //
-        // HONEST LIMIT (carried to TASK-161): on a small loopback DHT the request-response
-        // fetch can reuse a connection an earlier discovery query already opened to the
-        // provider, so this resolution being present does not PROVE it is the load-bearing
-        // dial mechanism. What it does establish: no address was injected out of band, and
-        // the dial is DRIVEN by an explicit in-fabric resolution. A Miss (healthy, no
-        // address known), an Unavailable (could-not-consult / empty routing), or a Found
-        // whose addresses are all unparseable all map to a typed `Unavailable` so the
-        // fetch driver falls through to the next offer/record (ultimately upstream) rather
-        // than silently dialing on stale routing state.
+        // HONEST LIMIT (carried to TASK-161): `add_address` feeds the SAME shared kad
+        // routing table that prior queries also feed, and `fetch_nar` auto-dials off that
+        // shared table - so on a small loopback DHT the request-response fetch can reuse a
+        // connection an earlier discovery query already opened to the provider, and the
+        // byte path cannot attribute the dial to THIS resolution. What is established here:
+        // no address was injected out of band, resolution is CONSULTED before every dial,
+        // and a failed resolution refuses the dial. A Miss (healthy, no address known), an
+        // Unavailable (could-not-consult / empty routing), or a Found whose addresses are
+        // all unparseable all map to a typed `Unavailable` so the fetch driver falls
+        // through to the next offer/record (ultimately upstream) rather than silently
+        // dialing on stale routing state.
+        //
+        // Resolution runs per FETCH (i.e. per offer), so a record with N libp2p offers
+        // would record N OurNodeId disclosures for the same provider; libp2p is one offer
+        // per record today, so this is once-per-provider in practice.
         match self
             .locator
             .locate(&node, &ResolutionPolicy::PublicInfrastructure)

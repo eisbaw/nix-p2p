@@ -335,14 +335,22 @@ pub struct Libp2pSourceConfig {
     /// kad bootstrap/entry peers (`PeerId` + dial `Multiaddr`). MUST be non-empty for
     /// discovery to work - an empty set is a consumer that can never find anyone.
     pub bootstrap: Vec<(PeerId, Multiaddr)>,
-    /// OPTIONAL provider dial-address override hint (TASK-169). The production path no
-    /// longer needs this: `Libp2pNarSource::resolve` resolves a discovered provider's
-    /// dial address THROUGH kad peer-routing (`Libp2pFabric::node_locator()`, TASK-159),
-    /// so BOTH legs are decentralized (discover WHO via kad get_providers, resolve WHERE
-    /// via kad peer-routing) with zero injection. Any entries here are still seeded into
-    /// the swarm's address book as an explicit out-of-band hint (e.g. to reach a peer the
-    /// DHT has not yet propagated, or in a test), but an EMPTY set is the normal
-    /// production shape. Keep it empty to prove no-injection.
+    /// OPTIONAL address-book seed for the swarm's kad routing table (TASK-169). The
+    /// production path does NOT need this: the libp2p transfer resolves a discovered
+    /// provider's dial address THROUGH kad peer-routing INSIDE the fabric
+    /// (`Libp2pFabric::node_locator()`, TASK-159) and dials off that resolution, so BOTH
+    /// legs are decentralized (discover WHO via kad get_providers, resolve WHERE via kad
+    /// peer-routing) with zero injection. Keep it EMPTY - that is the normal production
+    /// shape and it proves no-injection.
+    ///
+    /// HONEST LIMIT (do not overclaim): since TASK-169 the transport DIALS only off a
+    /// successful peer-routing resolution, so entries here do NOT independently enable a
+    /// dial to a provider the DHT cannot resolve - `add_address` only seeds the local kad
+    /// routing table (a bootstrap/entry hint), and kad `get_closest_peers` will not report
+    /// a target's address unless a SHARED peer learned it via identify. A real static
+    /// per-peer address book that the transfer honours for a dial (the `ExplicitPeersOnly`
+    /// policy) is the locator's job and is TASK-168; until then these entries only help kad
+    /// converge, they are not a per-provider dial override.
     pub provider_addrs: Vec<(PeerId, Multiaddr)>,
     /// The bound on each `find_providers` consultation.
     pub discovery_budget: DiscoveryBudget,
@@ -352,9 +360,10 @@ pub struct Libp2pSourceConfig {
 
 /// Build the PRODUCTION libp2p [`NarSource`] from `cfg`: start a [`Libp2pFabric`],
 /// bind the listener, join the DHT through the configured bootstrap peers (kad
-/// self-lookup), seed any OPTIONAL provider dial-address override hints (normally none -
-/// the fetch path resolves dial addresses via kad peer-routing, TASK-169), and wrap the
-/// running fabric in a [`Libp2pNarSource`].
+/// self-lookup), seed any OPTIONAL `provider_addrs` into the kad routing table (normally
+/// none - the fetch path resolves dial addresses via kad peer-routing INSIDE the transfer,
+/// TASK-169; these seeds only help kad converge, they are not a per-provider dial
+/// override - see the field doc), and wrap the running fabric in a [`Libp2pNarSource`].
 ///
 /// Returns the `Arc<Libp2pFabric>`, the `NarSource`, AND its paired
 /// [`Libp2pRawServe`] decision. Building all three from the ONE running fabric and the
@@ -430,11 +439,14 @@ pub async fn build_libp2p_nar_source(
         }
     }
 
-    // OPTIONAL dial-address override hint (TASK-169): normally EMPTY. The production
-    // fetch path resolves a discovered provider's dial address through kad peer-routing
-    // (`Libp2pNarSource::resolve` -> `node_locator().locate()`), so no address needs
-    // injecting here. Any entries are an explicit out-of-band override (e.g. reach a peer
-    // the DHT has not yet propagated) - legitimate, but not required for a dial.
+    // OPTIONAL kad routing-table seed (TASK-169): normally EMPTY. The production fetch
+    // path resolves a discovered provider's dial address through kad peer-routing INSIDE
+    // the transfer and dials off that resolution, so no address needs injecting here.
+    // HONEST LIMIT (see the `provider_addrs` field doc): these `add_address` seeds only
+    // populate the local kad routing table (a bootstrap/entry hint); since the transport
+    // dials only off a successful resolution, they do NOT independently enable a dial to a
+    // provider the DHT cannot resolve. A transfer-honoured static per-peer dial override
+    // (`ExplicitPeersOnly`) is the locator's job, TASK-168.
     for (peer, addr) in &cfg.provider_addrs {
         fabric.handle().add_address(*peer, addr.clone()).await;
     }
