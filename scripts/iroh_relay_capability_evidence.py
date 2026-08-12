@@ -812,9 +812,7 @@ def run_arm(
         # The acceptor is recreated per acceptor-arm under a run-scoped name;
         # signal_and_wait only stops it, so remove the exited container or the
         # next acceptor-arm collides on the name.
-        runner.run(
-            [config.podman, "rm", "-f", topology.acceptor], check=False
-        )
+        runner.run([config.podman, "rm", "-f", topology.acceptor], check=False)
 
     validate_outcome(scenario, outcome)
     arm = {

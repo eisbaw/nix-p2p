@@ -25,3 +25,9 @@ __pycache__/
 # The publication flock, taken beside the root it serialises.
 /fixtures/.out.*
 
+
+# Raw routed-evidence run outputs (pcaps + run.json). The finalized
+# artifacts/*-v1.json are tracked; these regenerable raw trees are not.
+/artifacts/iroh-relay/
+/artifacts/iroh-lookup/
+/artifacts/iroh-publication/
