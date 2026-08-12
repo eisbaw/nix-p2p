@@ -904,7 +904,9 @@ mod tests {
             self.attempts.lock().expect("attempts").push(node);
             if self.dead.contains(&node) {
                 // A dead holder: dial refused. The driver must try the NEXT offer.
-                return Err(TransportError::Unavailable(format!("holder {node} is dead")));
+                return Err(TransportError::Unavailable(format!(
+                    "holder {node} is dead"
+                )));
             }
             if content != &self.content {
                 return Err(TransportError::NotHeld(*content));
@@ -955,7 +957,11 @@ mod tests {
             .resolve(&signed_key(), Some(RAW_NAR.len() as u64))
             .await
             .expect("the dead first holder fails over to the live second holder");
-        assert_eq!(collect(resp).await, RAW_NAR, "the second holder served the NAR");
+        assert_eq!(
+            collect(resp).await,
+            RAW_NAR,
+            "the second holder served the NAR"
+        );
 
         // The oracle: A was dialed FIRST (and failed), THEN B - real failover.
         assert_eq!(
