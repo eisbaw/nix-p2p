@@ -6,7 +6,7 @@ title: >-
 status: To Do
 assignee: []
 created_date: '2026-08-12 04:16'
-updated_date: '2026-08-12 05:18'
+updated_date: '2026-08-12 06:55'
 labels:
   - iroh
   - seam
@@ -48,4 +48,6 @@ PER-AC STATUS:
 REJECTED APPROACH / GOTCHA: replacing the daemon Transport trait outright (not bridging) forces the whole daemon fetch path + ~6 test files onto NarTransfer in one step - high churn, high risk per increment, no safe green stopping point. The bridge (AC#1's 'or bridged') gives a green, verified, non-vacuous stopping point that makes the seam impl the PRODUCTION fetch core today.
 
 ENVIRONMENT HAZARD (forward-carry to the loop): a concurrent sibling process cleaned the working tree (git checkout/stash of uncommitted changes) mid-run and wiped a full green increment once; redone and committed FAST. Commit each green increment immediately; do not leave work uncommitted across a long e2e.
+
+SERVE AXIS UNBLOCKED by TASK-150 (commits 306bc3f AC#1, 4402a50 AC#3, c39b200 AC#2). AC#2 of THIS task (IrohProvider serve path implements peer_fabric::NarServer with a real ServeHandle whose Drop aborts the serve task, teardown-proven) is now DONE via IrohNodeBuilder::defer_serve() + IrohProvider::serve (daemon/tests/iroh_serve_teardown.rs). AC#3's sub-blocker 'sever IndexNarSupplier->supply_catalog' is DONE via the CatalogProbe trait (daemon SupplyCatalogHandle impls it; edge inverted to daemon->transport_iroh). REMAINING for 148: (a) retire the daemon Transport bridge = adopt peer_fabric::NarTransfer + TransferRegistry across the daemon fetch path (transport_fetch.rs, main.rs::setup_p2p_source, ~6 test files); (b) move IROH_BLOBS_ALPN + the iroh_blobs::ALPN assertion into fabric-iroh; (c) move transport_iroh.rs into fabric-iroh with no edge back to the daemon serving core. These are the AC#3/#4 'move' steps, not the seam design - the seam is now in place.
 <!-- SECTION:NOTES:END -->

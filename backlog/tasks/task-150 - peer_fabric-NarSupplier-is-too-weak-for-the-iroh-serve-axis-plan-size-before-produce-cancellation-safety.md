@@ -7,7 +7,7 @@ status: In Progress
 assignee:
   - '@claude'
 created_date: '2026-08-12 05:17'
-updated_date: '2026-08-12 05:54'
+updated_date: '2026-08-12 06:54'
 labels:
   - iroh
   - seam
@@ -59,4 +59,9 @@ GATE: build + lint (clippy -D + independence + source/lock guards) green; just t
 INCREMENT 2 LANDED (commit 4402a50) - AC#3 catalog-probe seam.
 IndexNarSupplier no longer names daemon supply_catalog types. New CatalogProbe trait + substrate-neutral ProbedSupply{declared_size, ProbedSource::{Process,RegularFile,Memory}} in transport_iroh; IndexNarSupplier holds Arc<dyn CatalogProbe>. daemon SupplyCatalogHandle impls CatalogProbe (in supply_catalog.rs), inverting the edge to daemon->transport_iroh. new() now takes impl CatalogProbe+'static (call sites unchanged - SupplyCatalogHandle passes by value). Preserves GAP-1 declared-size-before-produce and no-enumeration.
 GATE: build/lint green; task-72 oracles green (serve_budget_and_supply 16; store_residency_oracle/retainall/rss 1/1/1; iroh_runtime 37 incl provider_boundary sealing + AvailabilityIndex-non-retention guards); full just test green; just e2e 5/5 incl s6-p2p 11/11.
+
+INCREMENT 3 LANDED (commit c39b200) - AC#2 de-welded serve axis.
+IrohProvider now impls peer_fabric::NarServer. New IrohNodeBuilder::defer_serve() registers the provider handler WITHOUT starting the driver (fail-closed via require_ready); IrohProvider::serve starts the driver on an INDEPENDENT tokio task and returns a peer_fabric::ServeHandle whose Drop (AbortOnDrop) aborts JUST that task - de-welding the serve loop lifetime from the node runtime supervisor. Request sub-tasks still spawn on the runtime supervisor, preserving cancellation-safe execute_process/process-group reaping. Serve budget arrives THROUGH the seam: ServeGate.budget is a set-once OnceLock installed before the driver admits (task-72 declared-size-before-produce preserved). Auto-serve path (IrohProviderNode::spawn*, production main.rs) installs at prepare - behaviorally unchanged (risk isolated). Shared driver body extracted to run_provider_event_driver() used by both start (supervisor) and start_abortable (tokio+JoinHandle).
+TEARDOWN TEST (daemon/tests/iroh_serve_teardown.rs, 2/2): deferred provider fail-closed until serve(); serve()->ready; drop(handle)->driver aborted (lifecycle leaves READY, the only way a recv()-blocked loop stops) while node runtime stays alive + shuts down clean; auto-serve provider refuses a 2nd serve() with a named error.
+GATE: build/lint green; serve_budget_and_supply 16, store_residency_oracle/retainall/rss 1/1/1, iroh_runtime 37, iroh_serve_teardown 2, iroh_transport 7; full just test green; just e2e 5/5 incl s6-p2p 11/11.
 <!-- SECTION:NOTES:END -->
