@@ -79,6 +79,15 @@ peer-fabric = { path = "../peer-fabric" }
 # on none of it), so `just independence` stays green. The edge is one-way:
 # daemon -> fabric-iroh, never back.
 fabric-iroh = { path = "../fabric-iroh" }
+# fabric-libp2p (TASK-160): the libp2p BACKEND crate - the MANDATORY decentralized
+# content-discovery layer (libp2p-kad ProviderDirectory / AvailabilityAnnouncer)
+# plus the libp2p NAR transfer/serve (TASK-151), all behind the peer-fabric seam.
+# Wired into the p2p NarSource (`source_libp2p::Libp2pNarSource`) so the daemon can
+# discover a provider via kad and fetch+BLAKE3-verify the NAR. This is the INTERIM
+# both-backends link ahead of the clean per-binary daemon-core split (TASK-145/146);
+# the edge is one-way (daemon -> fabric-libp2p) and daemon-SIDE, so `just
+# independence` stays green (testproxy depends on none of it).
+fabric-libp2p = { path = "../fabric-libp2p" }
 # `sync` (task-72): the on-demand supply path needs SINGLE FLIGHT - when two peers
 # ask for the same absent digest at once, exactly one regenerates and the other
 # waits for its verdict. `tokio::sync::watch` carries the state as well as the
