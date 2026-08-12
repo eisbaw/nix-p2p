@@ -3,11 +3,11 @@ id: TASK-164
 title: >-
   libp2p compressed-narinfo raw-serve decoupling: HIT serves raw bytes a real
   Nix client rejects
-status: In Progress
+status: Done
 assignee:
   - '@claude'
 created_date: '2026-08-12 11:27'
-updated_date: '2026-08-12 11:51'
+updated_date: '2026-08-12 12:25'
 labels:
   - libp2p
   - daemon
@@ -48,3 +48,11 @@ Pass bar test (new tests/libp2p_raw_serve.rs): COMPRESSED upstream narinfo (xz, 
 
 Known follow-ups: probe = 2 kad lookups per served path (narinfo + nar); discovery-outcome caching deferred (TASK-163). Compose precedence unchanged.
 <!-- SECTION:PLAN:END -->
+
+## Implementation Notes
+
+<!-- SECTION:NOTES:BEGIN -->
+Green + Done. A libp2p HIT now rewrites the upstream narinfo to declare the raw NAR it serves (Compression:none, FileHash/FileSize = raw), mirroring the iroh allowlist path; passthrough stays byte-verbatim. Root fix in daemon/src/rewrite.rs (to_raw/RawServeDecision) wired through server.rs + source_libp2p.rs.
+Gate (orchestrator-verified): cargo build -p daemon exit 0; just lint GREEN; cargo test --workspace = 49 test-binaries ok / 0 failed; new bar daemon libp2p_raw_serve 1/1 (compressed-narinfo -> raw), narinfo_rewrite 1/1, passthrough 3/3, libp2p_production_path 8/8; just e2e = 5 scenarios PASS incl s6-p2p 11/11 (iroh peer-served real nix build stayed green -> no serving-layer regression). Provenance in git notes ref=verification on 51c70c3.
+Commits: a3dec79 (code) + 51c70c3 (tracker).
+<!-- SECTION:NOTES:END -->
