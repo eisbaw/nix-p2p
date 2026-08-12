@@ -3,11 +3,11 @@ id: TASK-161
 title: >-
   Podman multi-daemon libp2p e2e: decentralized discover->fetch->serve across
   real containers
-status: In Progress
+status: Done
 assignee:
   - mped
 created_date: '2026-08-12 10:22'
-updated_date: '2026-08-12 23:05'
+updated_date: '2026-08-12 23:12'
 labels:
   - libp2p
   - daemon
