@@ -176,10 +176,16 @@ pub struct ProviderRecord {
     /// field to know what blob to fetch and stream-verify (gate 1). It appears EXACTLY
     /// ONCE (offers are pure locators), so a record can never name two blobs.
     pub content: Blake3Digest,
-    /// The provider's node identity (the holder to dial, via [`NodeLocator`]).
+    /// The provider's ed25519 identity: BOTH the key that signs the record AND, for a
+    /// self-serve iroh offer, the node to dial (an iroh NodeId is an ed25519 key). The
+    /// codec REQUIRES an [`crate::ids::TransportOffer::Iroh`] `node` to equal this
+    /// `provider` (v1 self-serve; no delegation), so "the holder" and "the signer" are
+    /// the same identity by enforcement, not by convention.
     pub provider: NodeId,
-    /// HOW to fetch it: pure per-transport locators. Several offers let the fetch
-    /// side pick a [`TransportTag`](crate::TransportTag) at request time.
+    /// HOW to fetch it: pure per-transport locators, held in CANONICAL order (strictly
+    /// ascending by wire encoding; the codec rejects any other order or a duplicate).
+    /// Several offers let the fetch side pick a [`TransportTag`](crate::TransportTag) at
+    /// request time.
     pub offers: Vec<TransportOffer>,
     /// Monotonic per-provider version, so a fresher record supersedes a stale one
     /// for the same `(key, provider)`.

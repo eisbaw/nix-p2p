@@ -28,9 +28,33 @@
 use ed25519_dalek::SigningKey;
 use peer_fabric::{
     Blake3Digest, ContentKey, InfoHash, NodeId, ProviderAssertion, ProviderRecord,
-    ProviderWithdrawal, TransportOffer, decode_provider_assertion, encode_provider_record,
-    encode_provider_withdrawal, sign_provider_record, sign_provider_withdrawal,
+    ProviderWithdrawal, RecordDecodeError, TransportOffer, decode_provider_assertion,
+    encode_provider_record, encode_provider_withdrawal, sign_provider_record,
+    sign_provider_withdrawal,
 };
+
+/// The variant NAME of a decode error, so a golden `reject_reason` string can be
+/// asserted against the ACTUAL typed rejection (finding #5: a reject vector must fail
+/// for the SPECIFIC reason under test, not merely be `is_err()`).
+fn error_tag(e: &RecordDecodeError) -> &'static str {
+    match e {
+        RecordDecodeError::Oversized { .. } => "Oversized",
+        RecordDecodeError::Truncated { .. } => "Truncated",
+        RecordDecodeError::TrailingBytes { .. } => "TrailingBytes",
+        RecordDecodeError::UnknownVersion { .. } => "UnknownVersion",
+        RecordDecodeError::UnknownKind { .. } => "UnknownKind",
+        RecordDecodeError::UnknownOffer { .. } => "UnknownOffer",
+        RecordDecodeError::BadInfoHash { .. } => "BadInfoHash",
+        RecordDecodeError::TooManyOffers { .. } => "TooManyOffers",
+        RecordDecodeError::OffersNotCanonical => "OffersNotCanonical",
+        RecordDecodeError::IrohNodeNotProvider { .. } => "IrohNodeNotProvider",
+        RecordDecodeError::BadProviderKey => "BadProviderKey",
+        RecordDecodeError::NonCanonicalSignature => "NonCanonicalSignature",
+        RecordDecodeError::BadSignature => "BadSignature",
+        RecordDecodeError::WrongKey { .. } => "WrongKey",
+        RecordDecodeError::Stale { .. } => "Stale",
+    }
+}
 
 const GOLDEN: &str = include_str!("golden/provider_record_v1.json");
 
@@ -179,6 +203,24 @@ fn no_offers_record() -> ProviderRecord {
     )
 }
 
+fn bittorrent_v1_record() -> ProviderRecord {
+    sign_provider_record(
+        &signer(),
+        &ProviderRecord {
+            key: key(),
+            content: content(),
+            provider: NodeId::from_bytes([0; 32]),
+            offers: vec![TransportOffer::BitTorrent {
+                infohash: InfoHash::V1([0xcc; 20]),
+            }],
+            sequence: 3,
+            issued_at: 0,
+            expiry: 1_000,
+            signature: [0; 64],
+        },
+    )
+}
+
 fn withdrawal() -> ProviderWithdrawal {
     sign_provider_withdrawal(
         &signer(),
@@ -223,6 +265,20 @@ fn provider_record_no_offers_is_byte_for_byte_pinned() {
 }
 
 #[test]
+fn provider_record_bittorrent_v1_is_byte_for_byte_pinned() {
+    let record = bittorrent_v1_record();
+    let expected = wire_hex("provider_record_bittorrent_v1");
+    assert_eq!(
+        hexe(&encode_provider_record(&record).expect("encode")),
+        expected
+    );
+    assert_eq!(
+        decode_provider_assertion(&hexd(&expected), &key(), 500).expect("decode"),
+        ProviderAssertion::Provide(record)
+    );
+}
+
+#[test]
 fn provider_withdrawal_is_byte_for_byte_pinned() {
     let w = withdrawal();
     let expected = wire_hex("provider_withdrawal");
@@ -239,7 +295,7 @@ fn provider_withdrawal_is_byte_for_byte_pinned() {
 // ---- the reject vectors: every must-reject wire is REFUSED --------------------
 
 #[test]
-fn every_reject_vector_is_refused() {
+fn every_reject_vector_is_refused_for_its_named_reason() {
     let mut rejects = 0;
     for v in golden()["vectors"].as_array().expect("array") {
         if v["direction"] != "reject" {
@@ -247,14 +303,23 @@ fn every_reject_vector_is_refused() {
         }
         rejects += 1;
         let name = v["name"].as_str().unwrap();
+        let reason = v["reject_reason"]
+            .as_str()
+            .unwrap_or_else(|| panic!("reject vector `{name}` has no reject_reason"));
         let bytes = hexd(v["wire_hex"].as_str().unwrap());
-        assert!(
-            decode_provider_assertion(&bytes, &key(), 500).is_err(),
-            "golden reject vector `{name}` was ACCEPTED: {}",
-            v["note"].as_str().unwrap_or("")
+        // Each vector is crafted so its ONLY fault is the guard under test (re-signed
+        // after the mutation where needed), so it must fail with EXACTLY that error -
+        // not merely be rejected (e.g. reject_wrong_version stays valid-signature-over
+        // -a-version-2-body, so it can only be caught by the version guard).
+        let err = decode_provider_assertion(&bytes, &key(), 500)
+            .expect_err(&format!("golden reject vector `{name}` was ACCEPTED"));
+        assert_eq!(
+            error_tag(&err),
+            reason,
+            "reject vector `{name}` failed for the wrong reason: got {err:?}, expected {reason}"
         );
     }
-    assert!(rejects >= 3, "the must-reject class must not be emptied");
+    assert!(rejects >= 7, "the must-reject class must not be emptied");
 }
 
 // ---- the file and the tests that consume it cannot drift apart ----------------
@@ -262,10 +327,15 @@ fn every_reject_vector_is_refused() {
 const EXERCISED: &[&str] = &[
     "provider_record_full",
     "provider_record_no_offers",
+    "provider_record_bittorrent_v1",
     "provider_withdrawal",
     "reject_wrong_version",
     "reject_bad_signature",
     "reject_trailing_bytes",
+    "reject_bad_infohash",
+    "reject_malleable_signature",
+    "reject_offers_not_canonical",
+    "reject_iroh_node_not_provider",
 ];
 
 #[test]

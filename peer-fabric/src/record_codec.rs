@@ -37,15 +37,53 @@
 //! the ed25519 verifying key, so a record is SELF-VERIFYING: decode needs no external
 //! key material.
 //!
+//! ## Signature canonicality policy (must match across implementations)
+//!
+//! "The signature is over the bytes" is only sound if a signature has exactly ONE
+//! acceptable encoding, or a second implementation could accept a MALLEABLE variant the
+//! first rejects. This codec verifies with ed25519-dalek v3 `verify_strict`; the FROZEN
+//! policy a conformant re-implementation MUST match is:
+//!
+//!   * REJECT a non-canonical scalar `S` (require `S < L`, the group order). Adding `L`
+//!     to a valid `S` yields `S+L` with `[S+L]B = [S]B`, so a verifier that SKIPS the
+//!     range check accepts it - the classic ed25519 malleability. ed25519-dalek v3
+//!     `verify_strict`, libsodium's `crypto_sign_verify_detached`, and OpenSSL/`cryptography`
+//!     all enforce `S < L` and reject `S+L`. This codec ALSO checks `S < L` explicitly
+//!     ([`signature_scalar_is_canonical`]) so the policy is pinned independently of the
+//!     dalek version and gets a distinct typed rejection; the golden
+//!     `reject_malleable_signature` vector proves `S+L` is refused.
+//!   * REJECT small-order / torsion public keys `A` and commitments `R`. `verify_strict`
+//!     rejects a small-order `A` and uses cofactorless verification (`[S]B = R + [k]A`);
+//!     a cofactored verifier could disagree on a torsion `R`. A conformant re-implementation
+//!     MUST verify cofactorlessly and reject small-order `A`, matching `verify_strict`.
+//!
+//! ## Canonical offer list + iroh self-serve identity
+//!
+//!   * OFFERS ARE CANONICALLY ORDERED. The offer list is STRICTLY ASCENDING by each
+//!     offer's wire encoding, which forbids duplicates and gives ONE signed encoding per
+//!     logical set (findings #2). Both encode and decode enforce it; a non-canonical
+//!     order - even one whose signature verifies - is a distinct rejected value
+//!     ([`RecordDecodeError::OffersNotCanonical`]).
+//!   * IROH OFFERS ARE SELF-SERVE (v1). An [`crate::ids::TransportOffer::Iroh`] `node`
+//!     MUST equal the record's `provider`: a provider vouches for content reachable at
+//!     ITS OWN iroh NodeId (an ed25519 identity it controls), so an offer cannot point
+//!     discovery at an unauthorized third party. Decode rejects a mismatch
+//!     ([`RecordDecodeError::IrohNodeNotProvider`]); this also validates the node is a
+//!     valid curve point, since `provider` is validated and the node equals it.
+//!     Delegation (offering a DIFFERENT node) would need that node's authorization and
+//!     is deferred to a later schema version.
+//!
 //! ## Fail-closed decode (AC#4)
 //!
 //! [`decode_provider_assertion`] rejects, with a distinct typed
 //! [`RecordDecodeError`], every one of: oversized, truncated/malformed, trailing
-//! bytes, unknown version, unknown kind, unknown offer tag, too many offers, a
-//! provider id that is not a valid ed25519 point, a bad signature, a record whose
-//! carried `key` does not match the DHT storage key it was fetched under (the SSOT
-//! invariant), and a stale (expired) record. Each rule has a negative test that
-//! BITES: remove the guard and the corresponding test fails.
+//! bytes, unknown version, unknown kind, unknown offer tag, a bad infohash version,
+//! too many offers, offers not in canonical order, an iroh offer whose node is not the
+//! provider, a provider id that is not a valid ed25519 point, a NON-CANONICAL
+//! signature scalar (`S >= L`), a bad signature, a record whose carried `key` does not
+//! match the DHT storage key it was fetched under (the SSOT invariant), and a stale
+//! (expired) record. Each rule has a negative test that BITES: remove the guard and
+//! the corresponding test fails.
 
 use ed25519_dalek::{Signature, Signer, SigningKey, VerifyingKey};
 
@@ -179,6 +217,20 @@ pub enum RecordEncodeError {
     TooManyOffers { found: usize, cap: usize },
     /// The serialized value exceeds [`MAX_PROVIDER_RECORD_BYTES`].
     Oversized { len: usize, cap: usize },
+    /// The offer list is not in CANONICAL order: offers must be STRICTLY ASCENDING by
+    /// their wire encoding (which also forbids exact duplicates). One logical offer set
+    /// then has exactly ONE signed encoding - mandatory for a content-addressed,
+    /// signature-over-bytes record. Refused on the sender so a peer never receives a
+    /// non-canonical value (which decode would reject anyway).
+    OffersNotCanonical,
+    /// An Iroh offer advertises a `node` that is not the record's `provider`. In v1 an
+    /// Iroh offer is SELF-SERVE: the provider vouches for content reachable at ITS OWN
+    /// iroh NodeId (which is its ed25519 identity). Delegating to a different node would
+    /// require that node's authorization and is deferred to a later version.
+    IrohNodeNotProvider {
+        offer_node: NodeId,
+        provider: NodeId,
+    },
 }
 
 impl std::fmt::Display for RecordEncodeError {
@@ -196,6 +248,21 @@ impl std::fmt::Display for RecordEncodeError {
                     "provider record is {len} bytes, exceeds the {cap}-byte cap"
                 )
             }
+            RecordEncodeError::OffersNotCanonical => {
+                write!(
+                    f,
+                    "provider record offers are not strictly ascending by encoding \
+                     (non-canonical order or a duplicate offer)"
+                )
+            }
+            RecordEncodeError::IrohNodeNotProvider {
+                offer_node,
+                provider,
+            } => write!(
+                f,
+                "iroh offer node {offer_node} is not the provider {provider} \
+                 (v1 iroh offers are self-serve; delegation is not permitted)"
+            ),
         }
     }
 }
@@ -224,8 +291,27 @@ pub enum RecordDecodeError {
     BadInfoHash { version: u8 },
     /// The record names more than [`MAX_OFFERS_PER_RECORD`] offers.
     TooManyOffers { found: usize, cap: usize },
+    /// The offer list is not STRICTLY ASCENDING by wire encoding: either out of
+    /// canonical order or containing an exact-duplicate offer. A signature-over-bytes
+    /// record must have exactly one encoding per logical offer set, so a non-canonical
+    /// order is a distinct malformed value even though its signature may verify.
+    OffersNotCanonical,
+    /// An Iroh offer's `node` is not the record's `provider`. v1 Iroh offers are
+    /// self-serve (provider serves its own content at its own iroh NodeId); a mismatch
+    /// is rejected rather than silently trusting an unauthorized third-party locator.
+    IrohNodeNotProvider {
+        offer_node: NodeId,
+        provider: NodeId,
+    },
     /// The `provider` field is not a valid ed25519 verifying key (curve point).
     BadProviderKey,
+    /// The signature's scalar `S` is NON-CANONICAL (`S >= L`, the group order). This is
+    /// the ed25519 `S+L` malleability: `[S+L]B = [S]B`, so a verifier that skips the
+    /// range check accepts it. Our verifier (ed25519-dalek v3 `verify_strict`) already
+    /// enforces `S < L`, as do libsodium/OpenSSL; we ALSO check it explicitly so this
+    /// distinct classification is pinned independently of the dalek version, keeping the
+    /// signature-over-bytes wire single-encoding across implementations.
+    NonCanonicalSignature,
     /// The signature did not verify against `provider` over the frozen preimage.
     BadSignature,
     /// The record's own `key` does not equal the DHT storage key it was fetched
@@ -280,8 +366,29 @@ impl std::fmt::Display for RecordDecodeError {
                     "provider record names {found} offers, exceeds the {cap} cap"
                 )
             }
+            RecordDecodeError::OffersNotCanonical => {
+                write!(
+                    f,
+                    "provider record offers are not strictly ascending by encoding \
+                     (non-canonical order or a duplicate offer)"
+                )
+            }
+            RecordDecodeError::IrohNodeNotProvider {
+                offer_node,
+                provider,
+            } => write!(
+                f,
+                "iroh offer node {offer_node} is not the provider {provider} \
+                 (v1 iroh offers are self-serve; delegation is not permitted)"
+            ),
             RecordDecodeError::BadProviderKey => {
                 write!(f, "provider id is not a valid ed25519 verifying key")
+            }
+            RecordDecodeError::NonCanonicalSignature => {
+                write!(
+                    f,
+                    "signature scalar S is non-canonical (S >= L; the S+L malleability)"
+                )
             }
             RecordDecodeError::BadSignature => {
                 write!(
@@ -329,17 +436,62 @@ fn write_offer(out: &mut Vec<u8>, offer: &TransportOffer) {
     }
 }
 
+/// The canonical wire encoding of a single offer, used ONLY to order and de-duplicate
+/// offers (see [`offers_are_canonical`]). It is the exact bytes [`write_offer`] emits.
+fn offer_encoding(offer: &TransportOffer) -> Vec<u8> {
+    let mut v = Vec::new();
+    write_offer(&mut v, offer);
+    v
+}
+
+/// Whether an offer list is in CANONICAL order: STRICTLY ASCENDING by wire encoding.
+/// Strictness forbids exact duplicates too, so one logical offer set has exactly one
+/// valid signed encoding. Empty and single-offer lists are trivially canonical.
+fn offers_are_canonical(offers: &[TransportOffer]) -> bool {
+    offers
+        .windows(2)
+        .all(|w| offer_encoding(&w[0]) < offer_encoding(&w[1]))
+}
+
+/// The offer-list structural invariants a Provide must satisfy to be ENCODED, checked
+/// on the sender (fail fast): the cap, canonical order, and iroh-offer self-serve
+/// identity. Decode re-checks all of these on untrusted bytes.
+fn check_provide_invariants(record: &ProviderRecord) -> Result<(), RecordEncodeError> {
+    if record.offers.len() > MAX_OFFERS_PER_RECORD {
+        return Err(RecordEncodeError::TooManyOffers {
+            found: record.offers.len(),
+            cap: MAX_OFFERS_PER_RECORD,
+        });
+    }
+    if !offers_are_canonical(&record.offers) {
+        return Err(RecordEncodeError::OffersNotCanonical);
+    }
+    for offer in &record.offers {
+        if let TransportOffer::Iroh { node } = offer
+            && node != &record.provider
+        {
+            return Err(RecordEncodeError::IrohNodeNotProvider {
+                offer_node: *node,
+                provider: record.provider,
+            });
+        }
+    }
+    Ok(())
+}
+
 /// The `body` (everything but the trailing signature) of a Provide value.
 ///
 /// The offer count is narrowed to a `u8` length byte; this is reached by the PUBLIC
-/// [`provider_record_signing_bytes`] and [`sign_provider_record`] as well as by
-/// [`encode_provider_record`], so the cap is asserted HERE too. Without it a record
-/// with more than 255 offers would produce a length byte that disagrees with the
-/// appended offers - a corrupted SIGNED preimage. `encode_provider_record` still
-/// returns a typed error for a caller; this `debug_assert` catches the can't-reach-the-
-/// wire path (signing a bad record) at the point of the mistake.
+/// [`provider_record_signing_bytes`] as well as by [`encode_provider_record`], so the
+/// cap is a REAL `assert!` here (release too, finding #6): without it a record with
+/// more than 255 offers would produce a length byte that disagrees with the appended
+/// offers - a corrupted SIGNED preimage. A panic here is fail-closed (no bytes are
+/// produced); the fallible [`encode_provider_record`] returns a typed `TooManyOffers`
+/// BEFORE reaching this point, so only the raw signing-bytes path can trip the assert,
+/// and only on the signer's OWN over-cap input (never attacker bytes, which go through
+/// decode).
 fn provide_body(record: &ProviderRecord) -> Vec<u8> {
-    debug_assert!(
+    assert!(
         record.offers.len() <= MAX_OFFERS_PER_RECORD,
         "provide_body narrows offers.len() to a u8 on a SIGNED preimage; the {MAX_OFFERS_PER_RECORD}-offer cap must hold before signing"
     );
@@ -408,12 +560,7 @@ fn check_encoded_size(len: usize) -> Result<(), RecordEncodeError> {
 /// the `signature` field is written verbatim, so a caller signs
 /// [`provider_record_signing_bytes`] first (or uses [`sign_provider_record`]).
 pub fn encode_provider_record(record: &ProviderRecord) -> Result<Vec<u8>, RecordEncodeError> {
-    if record.offers.len() > MAX_OFFERS_PER_RECORD {
-        return Err(RecordEncodeError::TooManyOffers {
-            found: record.offers.len(),
-            cap: MAX_OFFERS_PER_RECORD,
-        });
-    }
+    check_provide_invariants(record)?;
     let mut out = provide_body(record);
     out.extend_from_slice(&record.signature);
     check_encoded_size(out.len())?;
@@ -463,8 +610,28 @@ pub fn sign_provider_record(signing_key: &SigningKey, record: &ProviderRecord) -
          non-zero provider that is not the signer is a caller bug (built for one \
          identity, signed by another)"
     );
+    // Establish the offer-list invariants the decoder REQUIRES so the convenience path
+    // cannot silently sign a record a peer would reject: iroh offers must be self-serve
+    // (node == this signer), and offers are put in canonical (ascending) order. A
+    // duplicate or a delegated iroh node is a caller bug and fails fast here.
+    let mut offers = record.offers.clone();
+    for offer in &offers {
+        if let TransportOffer::Iroh { node } = offer {
+            assert!(
+                *node == provider,
+                "sign_provider_record: an iroh offer must advertise the signer's own \
+                 node id (v1 self-serve); delegation is not permitted"
+            );
+        }
+    }
+    offers.sort_by_key(offer_encoding);
+    assert!(
+        offers_are_canonical(&offers),
+        "sign_provider_record: duplicate offers (identical wire encoding) are not permitted"
+    );
     let mut signed = ProviderRecord {
         provider,
+        offers,
         signature: [0u8; PROVIDER_SIGNATURE_LEN],
         ..record.clone()
     };
@@ -574,7 +741,44 @@ fn read_offer(r: &mut Reader) -> Result<TransportOffer, RecordDecodeError> {
     }
 }
 
+/// The ed25519 group order `L` in LITTLE-ENDIAN bytes (RFC 8032:
+/// `L = 2^252 + 27742317777372353535851937790883648493`). A canonical signature scalar
+/// `S` satisfies `S < L`.
+const ED25519_ORDER_LE: [u8; 32] = [
+    0xed, 0xd3, 0xf5, 0x5c, 0x1a, 0x63, 0x12, 0x58, 0xd6, 0x9c, 0xf7, 0xa2, 0xde, 0xf9, 0xde, 0x14,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x10,
+];
+
+/// Whether the signature's scalar `S` (the high 32 bytes, little-endian) is CANONICAL
+/// (`S < L`). ed25519-dalek v3 `verify_strict` ALSO enforces `S < L` (so it rejects the
+/// `S+L` malleability), as do libsodium and OpenSSL/`cryptography`. We check it EXPLICITLY
+/// here anyway - defense in depth for an irreversible wire freeze: it PINS the canonical-S
+/// policy in our own code (independent of the dalek version), gives a DISTINCT typed
+/// rejection ([`RecordDecodeError::NonCanonicalSignature`]) separate from a plain bad
+/// signature, and documents the invariant a second, non-dalek implementation must match.
+/// Operates on public bytes, so a plain compare (not constant-time) is fine.
+fn signature_scalar_is_canonical(sig_bytes: &[u8; 64]) -> bool {
+    let s = &sig_bytes[32..64];
+    // Little-endian compare S < L: scan from the most-significant byte down.
+    for i in (0..32).rev() {
+        if s[i] < ED25519_ORDER_LE[i] {
+            return true;
+        }
+        if s[i] > ED25519_ORDER_LE[i] {
+            return false;
+        }
+    }
+    false // S == L is non-canonical.
+}
+
 fn verify(provider: &NodeId, body: &[u8], sig_bytes: &[u8; 64]) -> Result<(), RecordDecodeError> {
+    // Explicit canonical-S check FIRST, so a non-canonical scalar gets its own precise
+    // classification. `verify_strict` (below) also enforces S<L in dalek v3, so this is
+    // defense in depth, not the sole guard - it pins the policy independently of the
+    // dalek version and distinguishes "malleable scalar" from "wrong signature" in logs.
+    if !signature_scalar_is_canonical(sig_bytes) {
+        return Err(RecordDecodeError::NonCanonicalSignature);
+    }
     let vk = VerifyingKey::from_bytes(provider.as_bytes())
         .map_err(|_| RecordDecodeError::BadProviderKey)?;
     let sig = Signature::from_bytes(sig_bytes);
@@ -588,8 +792,9 @@ fn verify(provider: &NodeId, body: &[u8], sig_bytes: &[u8; 64]) -> Result<(), Re
 ///
 /// ORDER IS DELIBERATE and each step is a fail-closed guard with a bite test:
 /// oversize (before any parse / allocation) -> version -> kind -> fields -> offer cap
-/// -> no trailing bytes -> signature verify (self-verifying via `provider`) -> key
-/// SSOT match -> expiry. Parsing alone is never acceptance.
+/// -> offers (iroh self-serve identity, then canonical order) -> no trailing bytes ->
+/// canonical-S check -> signature verify (self-verifying via `provider`) -> key SSOT
+/// match -> expiry. Parsing alone is never acceptance.
 pub fn decode_provider_assertion(
     bytes: &[u8],
     expected_key: &ContentKey,
@@ -641,6 +846,26 @@ pub fn decode_provider_assertion(
             let mut offers = Vec::with_capacity(offers_len);
             for _ in 0..offers_len {
                 offers.push(read_offer(&mut r)?);
+            }
+            // Finding #3: an iroh offer must advertise the provider's OWN node id
+            // (self-serve; v1 forbids delegation). This also transitively validates the
+            // node is a valid ed25519 point, because `provider` is validated as a
+            // verifying key below (BadProviderKey) and the node equals it.
+            for offer in &offers {
+                if let TransportOffer::Iroh { node } = offer
+                    && node != &provider
+                {
+                    return Err(RecordDecodeError::IrohNodeNotProvider {
+                        offer_node: *node,
+                        provider,
+                    });
+                }
+            }
+            // Finding #2: offers must be STRICTLY ASCENDING by encoding (one signed
+            // encoding per logical set; forbids duplicates). A non-canonical order whose
+            // signature happens to verify is still a distinct malformed value.
+            if !offers_are_canonical(&offers) {
+                return Err(RecordDecodeError::OffersNotCanonical);
             }
             ProviderAssertion::Provide(ProviderRecord {
                 key,
@@ -1063,6 +1288,211 @@ mod tests {
         assert!(
             caught.is_err(),
             "signing a record naming a non-signer provider must fail fast in debug"
+        );
+    }
+
+    #[test]
+    fn bittorrent_v1_offer_round_trips() {
+        // Finding #5: a positive BitTorrent-v1 vector (20-byte infohash), so the v1
+        // branch of the codec is exercised, not only v2.
+        let sk = signer();
+        let key = a_key();
+        let record = sign_provider_record(
+            &sk,
+            &ProviderRecord {
+                key,
+                content: Blake3Digest::from_bytes([0xaa; BLAKE3_DIGEST_LEN]),
+                provider: provider_of(&sk),
+                offers: vec![TransportOffer::BitTorrent {
+                    infohash: InfoHash::V1([0xcc; 20]),
+                }],
+                sequence: 3,
+                issued_at: 0,
+                expiry: 1_000,
+                signature: [0u8; PROVIDER_SIGNATURE_LEN],
+            },
+        );
+        let bytes = encode_provider_record(&record).expect("encode");
+        assert_eq!(
+            decode_provider_assertion(&bytes, &key, 500).expect("decode"),
+            ProviderAssertion::Provide(record)
+        );
+    }
+
+    #[test]
+    fn bad_infohash_version_is_rejected() {
+        // A bittorrent offer with an unknown infohash version byte (3), correctly signed
+        // so the ONLY fault is the infohash-version guard (finding #5 bite).
+        let sk = signer();
+        let key = a_key();
+        let mut body = provide_body(&ProviderRecord {
+            key,
+            content: Blake3Digest::from_bytes([0xaa; BLAKE3_DIGEST_LEN]),
+            provider: provider_of(&sk),
+            offers: vec![],
+            sequence: 1,
+            issued_at: 0,
+            expiry: 1_000,
+            signature: [0u8; PROVIDER_SIGNATURE_LEN],
+        });
+        *body.last_mut().unwrap() = 1; // offers_len = 1
+        body.push(OFFER_BITTORRENT);
+        body.push(3); // unknown infohash version
+        body.extend_from_slice(&[0u8; 32]);
+        let sig = sk.sign(&signing_preimage(&body));
+        let mut wire = body;
+        wire.extend_from_slice(&sig.to_bytes());
+        assert_eq!(
+            decode_provider_assertion(&wire, &key, 500),
+            Err(RecordDecodeError::BadInfoHash { version: 3 })
+        );
+    }
+
+    #[test]
+    fn offers_out_of_canonical_order_are_rejected() {
+        // Two offers SIGNED in descending order (bittorrent tag 0x01 before iroh tag
+        // 0x00). The iroh node is the provider (identity guard passes) and the signature
+        // is valid, so ONLY the canonical-order guard (finding #2) rejects it.
+        let sk = signer();
+        let key = a_key();
+        let p = provider_of(&sk);
+        let body = provide_body(&ProviderRecord {
+            key,
+            content: Blake3Digest::from_bytes([0xaa; BLAKE3_DIGEST_LEN]),
+            provider: p,
+            offers: vec![
+                TransportOffer::BitTorrent {
+                    infohash: InfoHash::V2([0xbb; 32]),
+                },
+                TransportOffer::Iroh { node: p },
+            ],
+            sequence: 1,
+            issued_at: 0,
+            expiry: 1_000,
+            signature: [0u8; PROVIDER_SIGNATURE_LEN],
+        });
+        let sig = sk.sign(&signing_preimage(&body));
+        let mut wire = body;
+        wire.extend_from_slice(&sig.to_bytes());
+        assert_eq!(
+            decode_provider_assertion(&wire, &key, 500),
+            Err(RecordDecodeError::OffersNotCanonical)
+        );
+    }
+
+    #[test]
+    fn duplicate_offers_are_rejected_as_non_canonical() {
+        // Two IDENTICAL iroh offers: not strictly ascending, so rejected (finding #2).
+        let sk = signer();
+        let key = a_key();
+        let p = provider_of(&sk);
+        let body = provide_body(&ProviderRecord {
+            key,
+            content: Blake3Digest::from_bytes([0xaa; BLAKE3_DIGEST_LEN]),
+            provider: p,
+            offers: vec![
+                TransportOffer::Iroh { node: p },
+                TransportOffer::Iroh { node: p },
+            ],
+            sequence: 1,
+            issued_at: 0,
+            expiry: 1_000,
+            signature: [0u8; PROVIDER_SIGNATURE_LEN],
+        });
+        let sig = sk.sign(&signing_preimage(&body));
+        let mut wire = body;
+        wire.extend_from_slice(&sig.to_bytes());
+        assert_eq!(
+            decode_provider_assertion(&wire, &key, 500),
+            Err(RecordDecodeError::OffersNotCanonical)
+        );
+    }
+
+    #[test]
+    fn iroh_offer_node_not_provider_is_rejected() {
+        // A single iroh offer whose node is NOT the provider, correctly signed, so ONLY
+        // the self-serve identity guard (finding #3) rejects it.
+        let sk = signer();
+        let key = a_key();
+        let stranger = NodeId::from_bytes([0x07; NODE_ID_LEN]);
+        let body = provide_body(&ProviderRecord {
+            key,
+            content: Blake3Digest::from_bytes([0xaa; BLAKE3_DIGEST_LEN]),
+            provider: provider_of(&sk),
+            offers: vec![TransportOffer::Iroh { node: stranger }],
+            sequence: 1,
+            issued_at: 0,
+            expiry: 1_000,
+            signature: [0u8; PROVIDER_SIGNATURE_LEN],
+        });
+        let sig = sk.sign(&signing_preimage(&body));
+        let mut wire = body;
+        wire.extend_from_slice(&sig.to_bytes());
+        assert_eq!(
+            decode_provider_assertion(&wire, &key, 500),
+            Err(RecordDecodeError::IrohNodeNotProvider {
+                offer_node: stranger,
+                provider: provider_of(&sk),
+            })
+        );
+    }
+
+    #[test]
+    fn malleable_s_plus_l_signature_is_rejected_as_non_canonical() {
+        // Finding #1: the S+L malleability. Adding L to a valid signature's scalar S
+        // yields S+L with [S+L]B = [S]B, which a verifier that SKIPS the S<L range check
+        // would accept. We add L to a valid signature and prove:
+        //   (a) our decoder rejects it with the DISTINCT typed NonCanonicalSignature -
+        //       our explicit S<L check fires before verify_strict. This is the BITE:
+        //       remove `signature_scalar_is_canonical` and the classification changes to
+        //       BadSignature (dalek's verifier catches it), failing this exact-match.
+        //   (b) ed25519-dalek v3 verify_strict ALSO rejects S+L (it enforces S<L), so
+        //       the malleable form is foreclosed at BOTH layers. Our explicit check pins
+        //       the policy independently of the dalek version and gives the precise
+        //       error, rather than being the sole line of defence.
+        let sk = signer();
+        let key = a_key();
+        let rec = sign_provider_record(
+            &sk,
+            &ProviderRecord {
+                key,
+                content: Blake3Digest::from_bytes([0xaa; BLAKE3_DIGEST_LEN]),
+                provider: provider_of(&sk),
+                offers: vec![],
+                sequence: 5,
+                issued_at: 0,
+                expiry: 1_000,
+                signature: [0u8; PROVIDER_SIGNATURE_LEN],
+            },
+        );
+        let wire = encode_provider_record(&rec).unwrap();
+        let body_len = wire.len() - PROVIDER_SIGNATURE_LEN;
+        let mut mal = wire.clone();
+        let mut carry = 0u16;
+        for i in 0..32 {
+            let sum = rec.signature[32 + i] as u16 + ED25519_ORDER_LE[i] as u16 + carry;
+            mal[body_len + 32 + i] = (sum & 0xff) as u8;
+            carry = sum >> 8;
+        }
+        assert_eq!(carry, 0, "S+L overflowed 256 bits");
+        assert_ne!(mal, wire, "S+L must differ from S");
+
+        // (a) distinct typed rejection from our explicit canonical-S guard.
+        assert_eq!(
+            decode_provider_assertion(&mal, &key, 500),
+            Err(RecordDecodeError::NonCanonicalSignature)
+        );
+        // (b) dalek verify_strict also rejects it (S<L is enforced by the verifier too).
+        let vk = VerifyingKey::from_bytes(provider_of(&sk).as_bytes()).unwrap();
+        let mut malsig = [0u8; 64];
+        malsig.copy_from_slice(&mal[body_len..]);
+        assert!(
+            vk.verify_strict(
+                &signing_preimage(&mal[..body_len]),
+                &Signature::from_bytes(&malsig)
+            )
+            .is_err(),
+            "dalek verify_strict must also reject S+L (it enforces S<L)"
         );
     }
 }
