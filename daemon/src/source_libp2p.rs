@@ -27,7 +27,10 @@
 //!     -> NarHashKey::try_from(hash)                 (canonical 32-byte sha256 NarHash)
 //!     -> ContentKey::derive_from_signed_nar_hash    (FROZEN peer-fabric content.rs recipe)
 //!     -> fabric.provider_directory().find_providers(ContentKey)   (libp2p-kad, NOT injected)
-//!     -> pick a ProviderRecord: its content Blake3Digest + offers
+//!     -> pick a ProviderRecord: its provider NodeId, content Blake3Digest + offers
+//!     -> fabric.node_locator().locate(record.provider, PublicInfrastructure)   (kad
+//!         peer-routing resolves WHERE the provider is dialable, THROUGH the DHT - no
+//!         injected address; a Miss/Unavailable skips this record to upstream fallback)
 //!     -> for each offer: fabric.transfer(offer.tag()).fetch(content, offer, size, envelope)
 //!         (gate-1 BLAKE3 verify lives INSIDE the transfer; a lying holder fails closed)
 //!     -> hand the raw NAR up; Nix re-verifies sig + sha256==NarHash (gate 2, the TCB)
@@ -61,7 +64,10 @@ use fabric_libp2p::{Libp2pFabric, Multiaddr, NodeConfig, PeerId};
 use http::HeaderMap;
 use http_body_util::{BodyExt, Full};
 
-use peer_fabric::{ContentKey, DiscoveryBudget, Lookup, PeerFabric, SafetyEnvelope, TransferError};
+use peer_fabric::{
+    ContentKey, DiscoveryBudget, Lookup, PeerFabric, ResolutionPolicy, SafetyEnvelope,
+    TransferError,
+};
 
 use std::str::FromStr;
 
@@ -177,6 +183,47 @@ impl NarSource for Libp2pNarSource {
         let mut last_failure: Option<String> = None;
         for record in &records {
             let content = &record.content;
+
+            // Resolve WHERE this provider is dialable THROUGH the DHT (kad peer-routing),
+            // so the production path needs NO injected dial address (the TASK-159 shim is
+            // gone). `locate` is the side-effecting consult: an iterative `get_closest_peers`
+            // teaches THIS node's shared kad routing table the provider's address (which a
+            // shared bootstrap learned via identify), so the request-response `fetch` below -
+            // driven off the SAME swarm - dials the provider with nothing injected out of
+            // band. A `Miss` (healthy query, no address known) or `Unavailable`
+            // (could-not-consult / empty routing) means we cannot learn a dial address for
+            // THIS provider right now: record it and try the next record, ultimately folding
+            // to a clean upstream fallback (S2). A fabric with no locator axis
+            // (`node_locator() == None`) proceeds unchanged - it must have its dial address
+            // supplied another way (the optional `provider_addrs` override hint), so this is
+            // a no-op for it rather than a hard skip.
+            if let Some(locator) = self.fabric.node_locator() {
+                match locator
+                    .locate(&record.provider, &ResolutionPolicy::PublicInfrastructure)
+                    .await
+                {
+                    // The routing table now knows an address for the provider; the fetch
+                    // below can dial it. We do NOT feed the returned Multiaddr strings to the
+                    // swarm explicitly (no `add_address`): they arrived via the DHT as a
+                    // side effect of this query, which is exactly the no-injection property.
+                    Lookup::Found(_dial_info) => {}
+                    Lookup::Miss => {
+                        last_failure = Some(format!(
+                            "node_locator: no DHT-known dial address for provider {} (kad miss)",
+                            record.provider
+                        ));
+                        continue;
+                    }
+                    Lookup::Unavailable(why) => {
+                        last_failure = Some(format!(
+                            "node_locator: could not resolve provider {}: {why}",
+                            record.provider
+                        ));
+                        continue;
+                    }
+                }
+            }
+
             for offer in &record.offers {
                 let tag = offer.tag();
                 let Some(transfer) = self.fabric.transfer(tag) else {
@@ -316,9 +363,14 @@ pub struct Libp2pSourceConfig {
     /// kad bootstrap/entry peers (`PeerId` + dial `Multiaddr`). MUST be non-empty for
     /// discovery to work - an empty set is a consumer that can never find anyone.
     pub bootstrap: Vec<(PeerId, Multiaddr)>,
-    /// TASK-159 basic-dial shim: provider byte-transfer dial addresses fed into the
-    /// swarm out of band (`Libp2pFabric::node_locator()` is still `None`). The
-    /// DISCOVERY leg stays a real kad lookup; this only supplies the dial.
+    /// OPTIONAL provider dial-address override hint (TASK-169). The production path no
+    /// longer needs this: `Libp2pNarSource::resolve` resolves a discovered provider's
+    /// dial address THROUGH kad peer-routing (`Libp2pFabric::node_locator()`, TASK-159),
+    /// so BOTH legs are decentralized (discover WHO via kad get_providers, resolve WHERE
+    /// via kad peer-routing) with zero injection. Any entries here are still seeded into
+    /// the swarm's address book as an explicit out-of-band hint (e.g. to reach a peer the
+    /// DHT has not yet propagated, or in a test), but an EMPTY set is the normal
+    /// production shape. Keep it empty to prove no-injection.
     pub provider_addrs: Vec<(PeerId, Multiaddr)>,
     /// The bound on each `find_providers` consultation.
     pub discovery_budget: DiscoveryBudget,
@@ -328,8 +380,9 @@ pub struct Libp2pSourceConfig {
 
 /// Build the PRODUCTION libp2p [`NarSource`] from `cfg`: start a [`Libp2pFabric`],
 /// bind the listener, join the DHT through the configured bootstrap peers (kad
-/// self-lookup), teach the swarm the provider dial addresses (TASK-159 shim), and
-/// wrap the running fabric in a [`Libp2pNarSource`].
+/// self-lookup), seed any OPTIONAL provider dial-address override hints (normally none -
+/// the fetch path resolves dial addresses via kad peer-routing, TASK-169), and wrap the
+/// running fabric in a [`Libp2pNarSource`].
 ///
 /// Returns the `Arc<Libp2pFabric>`, the `NarSource`, AND its paired
 /// [`Libp2pRawServe`] decision. Building all three from the ONE running fabric and the
@@ -405,8 +458,11 @@ pub async fn build_libp2p_nar_source(
         }
     }
 
-    // TASK-159 basic-dial shim: teach the swarm each provider's byte-transfer dial
-    // address out of band (discovery above is still a real kad lookup).
+    // OPTIONAL dial-address override hint (TASK-169): normally EMPTY. The production
+    // fetch path resolves a discovered provider's dial address through kad peer-routing
+    // (`Libp2pNarSource::resolve` -> `node_locator().locate()`), so no address needs
+    // injecting here. Any entries are an explicit out-of-band override (e.g. reach a peer
+    // the DHT has not yet propagated) - legitimate, but not required for a dial.
     for (peer, addr) in &cfg.provider_addrs {
         fabric.handle().add_address(*peer, addr.clone()).await;
     }

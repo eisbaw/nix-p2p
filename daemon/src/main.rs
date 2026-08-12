@@ -111,10 +111,12 @@ fn parse_claim_spec(raw: &str) -> Result<ClaimSpec, String> {
 }
 
 /// Parse a libp2p `<PeerId>@<multiaddr>` pair, used by both `--libp2p-bootstrap`
-/// (a kad entry peer) and `--libp2p-provider-addr` (the TASK-159 basic-dial shim:
-/// a provider's byte-transfer dial address fed into the swarm out of band, because
-/// `Libp2pFabric::node_locator()` is still `None`). The DISCOVERY leg stays a real,
-/// injection-free kad lookup; only the dial is supplied here.
+/// (a REQUIRED kad entry peer) and `--libp2p-provider-addr` (an OPTIONAL provider
+/// dial-address override hint, TASK-169). The production path no longer needs the latter:
+/// the daemon resolves a discovered provider's dial address THROUGH kad peer-routing
+/// (`Libp2pFabric::node_locator()`, TASK-159), so both the discovery and the dial legs are
+/// injection-free. `--libp2p-provider-addr` only seeds an explicit out-of-band override
+/// (e.g. reach a peer the DHT has not yet propagated); it is not required to dial.
 fn parse_libp2p_peer(flag: &str, raw: &str) -> Result<(PeerId, Multiaddr), String> {
     let (peer_str, addr_str) = raw
         .split_once('@')
@@ -1263,7 +1265,7 @@ async fn setup_p2p_source(
             build_libp2p_nar_source(config.libp2p_source_config()?).await?;
         libp2p_raw_serve = Some(raw_serve);
         println!(
-            "daemon: libp2p p2p source started, discovery converging ({} bootstrap peer(s), {} provider dial addr(s))",
+            "daemon: libp2p p2p source started, discovery converging ({} bootstrap peer(s), {} optional provider dial-addr override hint(s); dial addresses resolved via kad peer-routing)",
             config.libp2p_bootstrap.len(),
             config.libp2p_provider_addrs.len()
         );
