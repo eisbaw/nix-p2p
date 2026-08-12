@@ -5,7 +5,7 @@
 //! of the swarm's single-threaded ownership.
 
 use std::collections::{HashMap, HashSet};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use futures::StreamExt;
 use libp2p::kad::store::MemoryStore;
@@ -68,6 +68,9 @@ pub enum Command {
     PutRecord {
         key: kad::RecordKey,
         value: Vec<u8>,
+        /// When the stored record expires (the record's own `expiry`, so the store
+        /// enforces MIN(record.expiry, its own TTL) - the AC#6 reconciliation).
+        expires: Option<Instant>,
         reply: oneshot::Sender<Result<(), String>>,
     },
     GetProviders {
@@ -150,10 +153,22 @@ impl SwarmHandle {
         self.send(Command::StopProviding { key }).await;
     }
 
-    /// Store `value` under `key` in the DHT value store (the signed record).
-    pub async fn put_record(&self, key: kad::RecordKey, value: Vec<u8>) -> Result<(), String> {
+    /// Store `value` under `key` in the DHT value store (the signed record), expiring
+    /// at `expires` (the record's own expiry, reconciled with the store TTL).
+    pub async fn put_record(
+        &self,
+        key: kad::RecordKey,
+        value: Vec<u8>,
+        expires: Option<Instant>,
+    ) -> Result<(), String> {
         let (reply, rx) = oneshot::channel();
-        self.send(Command::PutRecord { key, value, reply }).await;
+        self.send(Command::PutRecord {
+            key,
+            value,
+            expires,
+            reply,
+        })
+        .await;
         rx.await.unwrap_or_else(|_| Err("worker gone".into()))
     }
 
@@ -193,7 +208,6 @@ struct Worker {
     swarm: Swarm<Behaviour>,
     commands: mpsc::Receiver<Command>,
     pending: HashMap<kad::QueryId, Pending>,
-    listen_addrs: Vec<Multiaddr>,
 }
 
 impl Worker {
@@ -228,7 +242,10 @@ impl Worker {
                 let _ = reply.send(result);
             }
             Command::ListenAddrs { reply } => {
-                let _ = reply.send(self.listen_addrs.clone());
+                // Derive from the swarm's own listener set rather than a parallel Vec:
+                // it is always current (pruned on ListenerClosed/ExpiredListenAddr) and
+                // is the single source of truth for what is bound.
+                let _ = reply.send(self.swarm.listeners().cloned().collect());
             }
             Command::AddAddress { peer, addr } => {
                 kad.add_address(&peer, addr);
@@ -260,8 +277,16 @@ impl Worker {
             Command::StopProviding { key } => {
                 kad.stop_providing(&key);
             }
-            Command::PutRecord { key, value, reply } => {
-                let record = kad::Record::new(key, value);
+            Command::PutRecord {
+                key,
+                value,
+                expires,
+                reply,
+            } => {
+                let mut record = kad::Record::new(key, value);
+                // Reconcile the record's own expiry with the store TTL (AC#6): setting
+                // `expires` makes the store hold it no longer than the provider signed.
+                record.expires = expires;
                 match kad.put_record(record, kad::Quorum::One) {
                     Ok(id) => {
                         self.pending.insert(id, Pending::Simple(reply));
@@ -292,7 +317,6 @@ impl Worker {
         match event {
             SwarmEvent::NewListenAddr { address, .. } => {
                 tracing::debug!(%address, "fabric-libp2p: listening");
-                self.listen_addrs.push(address);
             }
             SwarmEvent::Behaviour(BehaviourEvent::Identify(identify::Event::Received {
                 peer_id,
@@ -499,7 +523,6 @@ impl Node {
             swarm,
             commands: rx,
             pending: HashMap::new(),
-            listen_addrs: Vec::new(),
         };
         let join = tokio::spawn(worker.run());
 

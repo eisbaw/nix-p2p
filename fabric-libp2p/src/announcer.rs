@@ -4,6 +4,7 @@
 //! the announcer only encodes the frozen record and publishes it under its budget.
 
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use libp2p::PeerId;
@@ -62,6 +63,18 @@ impl AvailabilityAnnouncer for Libp2pAvailabilityAnnouncer {
             )));
         }
 
+        // Reconcile the record's expiry with the store TTL (AC#6): the stored value
+        // must not outlive what the provider signed. Reject an already-expired record
+        // on the sender (fail fast) - publishing a stale value is a caller bug.
+        let now = crate::unix_now();
+        if record.expiry <= now {
+            return Err(AnnounceError::Rejected(format!(
+                "record already expired (expiry {} <= now {})",
+                record.expiry, now
+            )));
+        }
+        let expires = Some(Instant::now() + Duration::from_secs(record.expiry - now));
+
         // Encode the FROZEN wire form (rejects an over-cap / non-canonical record on
         // the sender - fail fast before publishing).
         let value =
@@ -83,9 +96,10 @@ impl AvailabilityAnnouncer for Libp2pAvailabilityAnnouncer {
                 .start_providing(index_key)
                 .await
                 .map_err(AnnounceError::Unreachable)?;
-            // The signed record in the value store (learnable offline).
+            // The signed record in the value store (learnable offline), expiring no
+            // later than the provider signed.
             self.handle
-                .put_record(value_key, value)
+                .put_record(value_key, value, expires)
                 .await
                 .map_err(AnnounceError::Unreachable)?;
             Ok(Receipt::new("libp2p-kad"))

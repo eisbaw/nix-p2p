@@ -56,3 +56,62 @@ pub fn provider_value_key(content_key: &ContentKey, provider: &PeerId) -> kad::R
     hasher.update(&provider.to_bytes());
     kad::RecordKey::new(hasher.finalize().as_bytes())
 }
+
+/// The libp2p `PeerId` a `peer_fabric` [`NodeId`] (an ed25519 verifying key) MUST
+/// correspond to. `None` if the bytes are not a valid ed25519 point. Used to BIND a
+/// signed record's `provider` to the `PeerId` it was indexed under: a resolver rejects
+/// a record whose `provider` does not derive to the queried provider (a peer re-storing
+/// a third party's record under its own composite key). This is the FORWARD direction
+/// (verifying key -> PeerId), always computable - the reverse (PeerId -> key) is the
+/// extraction the composite key was designed to avoid.
+pub fn peer_id_of_provider(provider: &NodeId) -> Option<PeerId> {
+    let public = libp2p::identity::ed25519::PublicKey::try_from_bytes(provider.as_bytes()).ok()?;
+    Some(PeerId::from_public_key(&libp2p::identity::PublicKey::from(
+        public,
+    )))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn identity_node_id_and_peer_id_agree_across_the_seam() {
+        // The node identity (libp2p) and the record provider (ed25519 verifying key)
+        // are ONE key: node_id_of(keypair) must derive to the same PeerId that
+        // keypair.public() yields, or the S1 provider<->PeerId binding would reject a
+        // node's own honest records.
+        let keypair = keypair_from_seed(&[7u8; 32]);
+        let node_id = node_id_of(&keypair);
+        assert_eq!(
+            peer_id_of_provider(&node_id),
+            Some(keypair.public().to_peer_id()),
+            "a node's provider NodeId must derive to its own PeerId"
+        );
+    }
+
+    #[test]
+    fn peer_id_of_provider_rejects_a_non_point() {
+        // 0xdf..df is a y-coordinate ed25519 cannot decompress to a point (the same
+        // non-point the frozen record_codec test uses); the binding must fail closed
+        // (None) rather than fabricate a PeerId. Note this is defense-in-depth: the
+        // frozen decode already rejects a non-point provider (BadProviderKey) before the
+        // binding check ever runs, so in the real path the bytes are always valid.
+        assert_eq!(peer_id_of_provider(&NodeId::from_bytes([0xdf; 32])), None);
+    }
+
+    #[test]
+    fn distinct_providers_get_distinct_value_keys() {
+        // The composite key must separate providers of the SAME content, or the value
+        // store would collide - the whole reason for the hybrid mapping.
+        let key = ContentKey::from_bytes([0x01; 32]);
+        let a = keypair_from_seed(&[1u8; 32]).public().to_peer_id();
+        let b = keypair_from_seed(&[2u8; 32]).public().to_peer_id();
+        assert_ne!(provider_value_key(&key, &a), provider_value_key(&key, &b));
+        // And the index key (raw ContentKey) is distinct from any value key.
+        assert_ne!(
+            provider_index_key(&key).to_vec(),
+            provider_value_key(&key, &a).to_vec()
+        );
+    }
+}

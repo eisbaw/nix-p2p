@@ -1,12 +1,13 @@
 //! The CORNERSTONE test: prove DECENTRALIZED, exact-key content discovery over a real
 //! in-process libp2p-kad network, with NO out-of-band injection of the answer.
 //!
-//! Topology: a bootstrap node `B`, an extra routing node `R`, a provider `P`, and a
-//! consumer `C`. `P` and `C` and `R` know ONLY `B`'s address - they never learn each
-//! other's addresses out of band. `P` announces a `ProviderRecord` for a `ContentKey`
-//! derived from a NarHash via the FROZEN `content.rs` recipe; `C` resolves it back to
-//! `P` purely through the DHT (get_providers -> get_record -> frozen decode). The
-//! answer is therefore produced by Kademlia, not handed to `C`.
+//! Topology: a bootstrap node `B`, two provider nodes `P` and `Q`, and a consumer `C`.
+//! `P`, `Q` and `C` know ONLY `B`'s address - they never learn each other's addresses
+//! out of band. `P` and `Q` each announce their OWN signed `ProviderRecord` for one
+//! `ContentKey` derived from a NarHash via the FROZEN `content.rs` recipe (the
+//! MULTI-PROVIDER case); `C` resolves BOTH back purely through the DHT (get_providers ->
+//! per-provider get_record -> frozen decode). The answer is produced by Kademlia, not
+//! handed to `C`.
 //!
 //! Also exercises the two non-Found `Lookup` arms: `Miss` (a healthy empty lookup for
 //! an un-announced key) and `Unavailable` (InsufficientRouting for a node not on the
@@ -138,18 +139,31 @@ async fn decentralized_discovery_found_miss_and_unavailable() {
         "a node with an empty routing table must be Unavailable(InsufficientRouting), got {unavailable:?}"
     );
 
-    // ---- The Found arm: P announces, C resolves it through the DHT ----
+    // ---- The Found arm: TWO providers announce the SAME key; C resolves BOTH ----
+    // This is the MULTI-PROVIDER proof (AC#5): P (seed 3) and Q (seed 2, the "router")
+    // each announce their OWN signed record for one ContentKey, and C - which knows only
+    // B - resolves both through the DHT with no injected answer.
     let nar_hash = [0x11u8; 32];
-    let (key, record, provider_id) = signed_record(3, nar_hash);
+    let (key, record_p, provider_p) = signed_record(3, nar_hash);
+    let (key_q, record_q, provider_q) = signed_record(2, nar_hash);
+    assert_eq!(key, key_q, "same NarHash derives to one ContentKey");
+    assert_ne!(provider_p, provider_q, "two distinct providers");
+
     provider
         .announcer()
         .unwrap()
-        .announce(&record, &AnnounceBudget::new(Duration::from_secs(10), 20))
+        .announce(&record_p, &AnnounceBudget::new(Duration::from_secs(10), 20))
         .await
-        .expect("announce admitted");
+        .expect("P announce admitted");
+    router
+        .announcer()
+        .unwrap()
+        .announce(&record_q, &AnnounceBudget::new(Duration::from_secs(10), 20))
+        .await
+        .expect("Q announce admitted");
 
     // C resolves the key. Retry within a bounded window to absorb DHT propagation; each
-    // call is a real, injection-free lookup.
+    // call is a real, injection-free lookup. Wait until BOTH providers are visible.
     let budget = DiscoveryBudget::new(Duration::from_secs(10), 32);
     let deadline = Instant::now() + Duration::from_secs(20);
     let found = loop {
@@ -159,28 +173,31 @@ async fn decentralized_discovery_found_miss_and_unavailable() {
             .find_providers(&key, &budget)
             .await
         {
-            Lookup::Found(records) => break records,
+            Lookup::Found(records) if records.len() >= 2 => break records,
             other => {
                 assert!(
                     Instant::now() < deadline,
-                    "consumer never resolved the announced key (last: {other:?})"
+                    "consumer never resolved both announced providers (last: {other:?})"
                 );
                 tokio::time::sleep(Duration::from_millis(150)).await;
             }
         }
     };
 
-    assert_eq!(found.len(), 1, "exactly the one announced provider");
-    let resolved = &found[0];
-    assert_eq!(
-        resolved.provider, provider_id,
-        "resolved to the announcer P"
-    );
-    assert_eq!(resolved.provider, provider.node_id());
-    assert_eq!(resolved.key, key, "record answers the queried key (SSOT)");
-    assert_eq!(
-        resolved, &record,
-        "the exact signed record round-tripped the DHT"
+    assert_eq!(found.len(), 2, "exactly the two announced providers");
+    // Every resolved record answers the queried key (SSOT) and is one of the two exact
+    // signed records that round-tripped the DHT - the answer was produced by Kademlia.
+    for resolved in &found {
+        assert_eq!(resolved.key, key, "record answers the queried key (SSOT)");
+        assert!(
+            resolved == &record_p || resolved == &record_q,
+            "resolved record is one of the two exact signed records"
+        );
+    }
+    let providers: std::collections::HashSet<_> = found.iter().map(|r| r.provider).collect();
+    assert!(
+        providers.contains(&provider_p) && providers.contains(&provider_q),
+        "both P and Q resolved as distinct providers of the one key"
     );
 
     // ---- The Miss arm: a healthy lookup for a key nobody announced ----
