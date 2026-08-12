@@ -858,7 +858,7 @@ impl AvailabilityIndex {
                 "NAR size probe cancelled".into(),
             )));
         }
-        let Some(record) = self.supply_catalog.read_handle().probe(blake3) else {
+        let Some(record) = self.supply_catalog.read_handle().probe_record(blake3) else {
             return Ok(None);
         };
         match std::fs::metadata(&record.store_path) {
@@ -900,7 +900,7 @@ impl AvailabilityIndex {
         let record = self
             .supply_catalog
             .read_handle()
-            .probe(blake3)
+            .probe_record(blake3)
             .ok_or_else(|| {
                 AvailabilityError::Dump(DumpError(format!(
                     "no registered holding supplies {blake3}"

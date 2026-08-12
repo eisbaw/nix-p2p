@@ -785,12 +785,20 @@ impl Default for ServeBudget {
 impl ServeBudget {
     /// Build the local budget from the seam's [`peer_fabric::ServeBudget`], which
     /// mirrors it field-for-field (TASK-150 AC#2: the serve axis receives its bound
-    /// through `peer_fabric::NarServer::serve` - policy above the seam).
+    /// through `peer_fabric::NarServer::serve` - policy above the seam). TASK-141 owns
+    /// unifying the two identically-shaped `ServeBudget` types; until then the seam is
+    /// destructured EXHAUSTIVELY so a new field on `peer_fabric::ServeBudget` fails
+    /// THIS build rather than being silently dropped.
     fn from_seam(budget: &SeamServeBudget) -> Self {
+        let SeamServeBudget {
+            max_nar_bytes_uncompressed_nar,
+            max_inflight_bytes_uncompressed_nar,
+            max_serve_duration,
+        } = *budget;
         ServeBudget {
-            max_nar_bytes_uncompressed_nar: budget.max_nar_bytes_uncompressed_nar,
-            max_inflight_bytes_uncompressed_nar: budget.max_inflight_bytes_uncompressed_nar,
-            max_serve_duration: budget.max_serve_duration,
+            max_nar_bytes_uncompressed_nar,
+            max_inflight_bytes_uncompressed_nar,
+            max_serve_duration,
         }
     }
 
@@ -2251,6 +2259,14 @@ impl IrohProvider {
     ///
     /// The budget is installed into the admission gate BEFORE the driver starts, so
     /// the task-72 declared-size-before-production bound holds from the first request.
+    ///
+    /// SINGLE-SHOT AND TERMINAL (deliberate). The deferred driver is a one-shot: this
+    /// consumes it, so a provider serves at most ONE session in its lifetime. Once the
+    /// handle is dropped (teardown) OR `start_abortable` fails, `serve_tasks` is empty
+    /// and every later `serve` returns a `Backend` error - even a TRANSIENT start
+    /// failure is unrecoverable without rebuilding the node. Re-opening a serve window
+    /// or re-budgeting a live provider is out of scope here (it would need the driver
+    /// to be rebuildable); if that is ever wanted, this is where it changes.
     async fn serve_session(&self, budget: ServeBudget) -> Result<SeamServeHandle, SeamServeError> {
         let tasks = self
             .serve_tasks
@@ -2277,22 +2293,40 @@ impl IrohProvider {
             .start_abortable(self.gate.supervisor.clone())
             .await
             .map_err(|error| SeamServeError::Backend(error.to_string()))?;
+        // Trace the lifecycle START (the per-serve events already log; the session
+        // boundaries did not). Its teardown is traced by `AbortOnDrop::drop`.
+        eprintln!("IROH-SERVE-STARTED session={label}");
         Ok(SeamServeHandle::with_teardown(
-            label,
-            Box::new(AbortOnDrop(join)),
+            label.clone(),
+            Box::new(AbortOnDrop { join, label }),
         ))
     }
 }
 
 /// The teardown guard behind a deferred serve [`SeamServeHandle`]: dropping it aborts
-/// the independently-owned serve driver task (TASK-150 AC#2). Aborting runs the
-/// driver's `MarkStopped` guard, moving the provider lifecycle to STOPPED so
-/// `require_ready` refuses further connections.
-struct AbortOnDrop(tokio::task::JoinHandle<()>);
+/// the independently-owned serve driver task (TASK-150 AC#2).
+///
+/// Teardown is BEST-EFFORT and ASYNCHRONOUS: `abort()` only SCHEDULES cancellation,
+/// so between this drop and the driver's `MarkStopped` guard actually running the
+/// provider is still `require_ready`, and any connection accepted in that narrow
+/// window fails closed downstream (its answer channel is dropped) rather than serving
+/// bytes. There is no happens-before "stopped" signal to callers; a caller that needs
+/// to observe the stop must poll `IrohProvider::event_driver_ready`. On completion the
+/// driver's `MarkStopped` moves the lifecycle to STOPPED so `require_ready` then
+/// refuses further connections.
+struct AbortOnDrop {
+    join: tokio::task::JoinHandle<()>,
+    /// The session label, only so teardown can be traced symmetrically with start.
+    label: String,
+}
 
 impl Drop for AbortOnDrop {
     fn drop(&mut self) {
-        self.0.abort();
+        self.join.abort();
+        eprintln!(
+            "IROH-SERVE-STOPPED session={} (teardown scheduled)",
+            self.label
+        );
     }
 }
 

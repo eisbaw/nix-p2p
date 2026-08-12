@@ -47,7 +47,14 @@ pub struct SupplyCatalogHandle {
 }
 
 impl SupplyCatalogHandle {
-    pub(crate) fn probe(&self, digest: &Blake3Digest) -> Option<SupplyCatalogRecord> {
+    /// The inherent digest probe over the raw catalog record. Named `probe_record`,
+    /// NOT `probe`, on purpose: this type also implements
+    /// [`crate::transport_iroh::CatalogProbe`], whose method IS `probe`, and whose
+    /// body calls this one. Sharing the name would compile only by the inherent-beats-
+    /// trait resolution rule, so a later rename/removal of this method would silently
+    /// rebind `self.probe(..)` to the trait method - unbounded recursion with no
+    /// compile error. Distinct names make the call in the trait impl unambiguous.
+    pub(crate) fn probe_record(&self, digest: &Blake3Digest) -> Option<SupplyCatalogRecord> {
         self.state
             .lock()
             .expect("supply-catalog mutex")
@@ -68,7 +75,7 @@ impl SupplyCatalogHandle {
 impl crate::transport_iroh::CatalogProbe for SupplyCatalogHandle {
     fn probe(&self, content: &Blake3Digest) -> Option<crate::transport_iroh::ProbedSupply> {
         use crate::transport_iroh::{ProbedSource, ProbedSupply};
-        self.probe(content).map(|record| ProbedSupply {
+        self.probe_record(content).map(|record| ProbedSupply {
             declared_size: record.declared_size,
             source: match record.source {
                 NarProductionSource::Process { program, args } => {

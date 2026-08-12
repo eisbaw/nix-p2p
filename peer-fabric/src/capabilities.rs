@@ -286,15 +286,30 @@ pub trait NarTransfer: Send + Sync {
 // process/memory/plan/size machinery leaks up) while the invariants stay provable
 // where they are enforced.
 
-/// A live serve session's handle: dropping it tears the session down (RAII). A
+/// A live serve session's handle: dropping it INITIATES teardown (RAII). A
 /// lifecycle, returned by [`NarServer::serve`], not a per-request value.
+///
+/// ## What "teardown" guarantees (and what it does not)
+///
+/// Dropping the handle stops the session ADMITTING new requests. It does NOT
+/// promise that transfers ALREADY in flight are cancelled: whether they are aborted
+/// or allowed to DRAIN is backend-defined, and teardown is BEST-EFFORT and
+/// ASYNCHRONOUS - dropping the handle does not block until the session has quiesced,
+/// nor does it hand back a "stopped" signal. A frontend that needs to know serving
+/// has fully stopped must observe the backend, not the drop.
+///
+/// The concrete `fabric-iroh` backend, for one, aborts its serve DRIVER on drop (no
+/// new admissions) while any in-flight transfer keeps running under the node runtime
+/// until it completes or hits its serve-duration bound - so a caller must not treat
+/// drop as an immediate hard stop or as reclaiming in-flight budget.
 ///
 /// The `label` is for logs/status; the teardown is carried by an OPAQUE guard the
 /// backend attaches with [`with_teardown`](ServeHandle::with_teardown) - a task
 /// abort-handle, a listener, a `Drop`-guard. It is boxed and type-erased so the seam
 /// stays stack-neutral: the frontend holds the handle alive and drops it to stop
-/// serving, without naming what the guard is. A bare label alone would tear nothing
-/// down; the guard slot is what makes the "dropping tears it down" contract real.
+/// accepting work, without naming what the guard is. A bare label alone would tear
+/// nothing down; the guard slot is what makes the "dropping stops admission" contract
+/// real.
 pub struct ServeHandle {
     /// A backend-specific label for the running session (for logs/status).
     pub label: String,
@@ -324,7 +339,9 @@ impl ServeHandle {
     }
 
     /// A handle labelled `label` owning `guard`; dropping the handle drops the guard
-    /// and so tears the session down. A backend passes its listener/task-abort here.
+    /// and so initiates teardown (stops admitting new requests; see the type doc for
+    /// the best-effort/asynchronous semantics). A backend passes its
+    /// listener/task-abort here.
     pub fn with_teardown(label: impl Into<String>, guard: Box<dyn Send + Sync>) -> Self {
         ServeHandle {
             label: label.into(),
@@ -355,9 +372,11 @@ impl std::error::Error for ServeError {}
 
 /// "Hand out bytes to whoever asks, within budget." A lifecycle, not a call: it
 /// starts a session serving under `budget` and returns a [`ServeHandle`] that keeps
-/// it alive; dropping the handle tears the session down. Admission (declining an
-/// over-budget request BEFORE any bytes are produced) is the [`ServeBudget`]'s job;
-/// eligibility of WHAT may be served is decided above the seam.
+/// it alive; dropping the handle stops the session admitting new requests (see
+/// [`ServeHandle`] for the exact - best-effort, asynchronous, in-flight may drain -
+/// teardown semantics). Admission (declining an over-budget request BEFORE any bytes
+/// are produced) is the [`ServeBudget`]'s job; eligibility of WHAT may be served is
+/// decided above the seam.
 ///
 /// The SOURCE of served bytes is bound to the concrete server at construction and is
 /// NOT passed here - see the ADR above [`ServeHandle`] for why the supply seam lives
@@ -366,7 +385,8 @@ impl std::error::Error for ServeError {}
 #[async_trait]
 pub trait NarServer: Send + Sync {
     /// Start serving, bounded by `budget`, from the supplier the server was built
-    /// with. Returns a [`ServeHandle`] whose `Drop` tears the session down.
+    /// with. Returns a [`ServeHandle`] whose `Drop` stops the session admitting new
+    /// requests (teardown is best-effort/asynchronous; in-flight transfers may drain).
     async fn serve(&self, budget: ServeBudget) -> Result<ServeHandle, ServeError>;
 }
 
