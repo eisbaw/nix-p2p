@@ -86,7 +86,10 @@ use crate::iroh_runtime::{
 };
 use crate::supply_catalog::{NarProductionSource, SupplyCatalogHandle};
 use crate::transport::{IROH_BLOBS_ALPN, NodeId};
-use crate::transport_fetch::{Transport, TransportError, TransportTag, verify_blake3};
+use crate::transport_fetch::{Transport, TransportError};
+use peer_fabric::{
+    NarTransfer, SafetyEnvelope as SeamSafetyEnvelope, TransferError, TransportOffer, TransportTag,
+};
 
 // -------------------------------------------------------------------------
 // AC#4: the ALPN cross-check, as a COMPILE-TIME assertion.
@@ -179,6 +182,20 @@ impl Default for SafetyEnvelope {
             dial_timeout: DIAL_TIMEOUT,
             body_idle_timeout: BODY_IDLE_TIMEOUT,
             total_timeout: FETCH_TIMEOUT,
+        }
+    }
+}
+
+impl SafetyEnvelope {
+    /// Build the local envelope from the seam's [`peer_fabric::SafetyEnvelope`],
+    /// which mirrors it field-for-field. TASK-148: the seam's [`NarTransfer::fetch`]
+    /// hands the fetch envelope per call (policy above the seam), so this is the one
+    /// conversion point where the seam envelope becomes this module's local one.
+    fn from_seam(envelope: &SeamSafetyEnvelope) -> Self {
+        Self {
+            dial_timeout: envelope.dial_timeout,
+            body_idle_timeout: envelope.body_idle_timeout,
+            total_timeout: envelope.total_timeout,
         }
     }
 }
@@ -2458,7 +2475,7 @@ impl IrohTransport {
         connection: Connection,
         node: NodeId,
         expected_size: Option<u64>,
-    ) -> Result<Vec<u8>, TransportError> {
+    ) -> Result<Vec<u8>, TransferError> {
         // STREAM by the exact BLAKE3 addressed unit. The runtime has already
         // bounded the dial and dropped its endpoint clone; this continuation can
         // own only the connection.
@@ -2473,13 +2490,13 @@ impl IrohTransport {
             let item = match tokio::time::timeout(envelope.body_idle_timeout, stream.next()).await {
                 Ok(Some(item)) => item,
                 Ok(None) => {
-                    return Err(TransportError::Unavailable(format!(
+                    return Err(TransferError::Unavailable(format!(
                         "iroh stream from {node} ended before the blob completed"
                     )));
                 }
                 Err(_elapsed) => {
                     // Dropping `stream` (and its connection) here aborts the transfer.
-                    return Err(TransportError::Unavailable(format!(
+                    return Err(TransferError::Unavailable(format!(
                         "iroh transfer from {node} stalled: no bytes for {:?}",
                         envelope.body_idle_timeout
                     )));
@@ -2496,7 +2513,7 @@ impl IrohTransport {
                     if let Some(limit) = expected_size
                         && raw.len() as u64 > limit
                     {
-                        return Err(TransportError::TooLarge {
+                        return Err(TransferError::TooLarge {
                             limit,
                             streamed: raw.len() as u64,
                         });
@@ -2506,21 +2523,143 @@ impl IrohTransport {
                 GetBlobItem::Item(BaoContentItem::Parent(_)) => {}
                 GetBlobItem::Done(_stats) => break,
                 GetBlobItem::Error(cause) => {
-                    return Err(TransportError::Unavailable(format!(
+                    return Err(TransferError::Unavailable(format!(
                         "iroh get_blob failed (holder cannot honestly serve {content}): {cause}"
                     )));
                 }
             }
         }
 
-        // Re-assert gate 1 with the daemon's single-source-of-truth recipe. bao
-        // already enforced it on the wire; this makes the trait contract explicit
-        // and non-vacuous (never return unverified bytes).
-        verify_blake3(&content, &raw)?;
+        // Re-assert gate 1 with the frozen plain-unkeyed BLAKE3 recipe. bao already
+        // enforced it on the wire; this makes the seam contract explicit and
+        // non-vacuous (never return unverified bytes). Kept as a local check
+        // returning the seam's `TransferError` so the transfer path names no daemon
+        // serving-core type (TASK-148 de-weld); the recipe itself is the frozen
+        // `Blake3Digest::from_raw_nar` single source of truth.
+        let actual = Blake3Digest::from_raw_nar(&raw);
+        if actual != content {
+            return Err(TransferError::IntegrityMismatch {
+                expected: content,
+                actual,
+            });
+        }
         Ok(raw)
     }
 }
 
+impl IrohTransport {
+    /// The stack-neutral fetch core shared by the seam [`NarTransfer`] impl and the
+    /// daemon [`Transport`] bridge: resolve `offer` to a dialable address, dial under
+    /// `envelope`, and stream the blob by its exact BLAKE3, gate-1 verified.
+    ///
+    /// It names ONLY seam types ([`TransportOffer`], [`TransferError`],
+    /// [`SafetyEnvelope`]) - the point of the TASK-148 de-weld: the iroh transfer
+    /// logic no longer reaches into the daemon's claim-wire `KnownTransport` or the
+    /// serving core's `Transport` trait. The `Transport` bridge below converts its
+    /// wire offer and maps the error back, so the existing fetch path is unchanged.
+    async fn fetch_inner(
+        &self,
+        content: &Blake3Digest,
+        offer: &TransportOffer,
+        expected_size: Option<u64>,
+        envelope: SafetyEnvelope,
+    ) -> Result<Vec<u8>, TransferError> {
+        // Defensive: the registry dispatches by tag, but a wrong variant is a bug
+        // worth surfacing rather than silently mis-serving.
+        let node = match offer {
+            TransportOffer::Iroh { node } => node,
+            other => {
+                return Err(TransferError::WrongOffer {
+                    expected: TransportTag::Iroh,
+                    got: other.tag(),
+                });
+            }
+        };
+
+        // Reject a NodeId that is not a valid ed25519 curve point (it is structurally
+        // 32 bytes, so only the curve check catches it) before dialing.
+        Self::validate_node_id(node).map_err(|e| TransferError::Unavailable(e.to_string()))?;
+
+        // Resolve the locator to a dialable address (discovery stand-in). No entry
+        // means "no address known for this NodeId" - task-40 supplies it.
+        let addr = self
+            .peers
+            .lock()
+            .expect("peers mutex")
+            .get(node)
+            .cloned()
+            .ok_or_else(|| {
+                TransferError::Unavailable(format!(
+                    "no known address for {node}; discovery (task-40) resolves NodeId->addr"
+                ))
+            })?;
+
+        // Coarse total backstop over dial+transfer, on top of the finer-grained dial
+        // and body-idle bounds inside `dial_and_stream`. A TooLarge abort from the
+        // streaming cap propagates through unchanged (it is a deliberate abort, not a
+        // hang the backstop should mask).
+        let node = *node;
+        let content = *content;
+        let operation = self.endpoint.run_connected(
+            "iroh-outbound-fetch",
+            addr,
+            iroh_blobs::ALPN.to_vec(),
+            envelope.dial_timeout,
+            move |connection| async move {
+                Self::dial_and_stream(envelope, content, connection, node, expected_size).await
+            },
+        );
+        match tokio::time::timeout(envelope.total_timeout, operation).await {
+            Ok(Ok(result)) => result,
+            Ok(Err(error)) => Err(TransferError::Unavailable(format!(
+                "shared Iroh runtime is unavailable: {error}"
+            ))),
+            Err(_elapsed) => Err(TransferError::Unavailable(format!(
+                "iroh fetch from {node} exceeded total bound {:?}",
+                envelope.total_timeout
+            ))),
+        }
+    }
+}
+
+/// The seam transfer axis (TASK-148 AC#1): `IrohTransport` IS a
+/// [`peer_fabric::NarTransfer`]. This is the NATIVE impl - the daemon [`Transport`]
+/// bridge below delegates to the same [`IrohTransport::fetch_inner`] core - so the
+/// iroh-blobs whole-NAR fetch is reachable through the stack-neutral seam without
+/// naming a single daemon serving-core type.
+#[async_trait]
+impl NarTransfer for IrohTransport {
+    fn tag(&self) -> TransportTag {
+        TransportTag::Iroh
+    }
+
+    async fn fetch(
+        &self,
+        content: &Blake3Digest,
+        offer: &TransportOffer,
+        expected_size: Option<u64>,
+        envelope: &SeamSafetyEnvelope,
+    ) -> Result<Vec<u8>, TransferError> {
+        // The seam hands the envelope per call (policy above the seam); the local
+        // envelope type mirrors it field-for-field.
+        self.fetch_inner(
+            content,
+            offer,
+            expected_size,
+            SafetyEnvelope::from_seam(envelope),
+        )
+        .await
+    }
+}
+
+/// The daemon-side [`Transport`] bridge (TASK-148 AC#1: "removed OR bridged"). It
+/// converts the daemon claim-wire [`KnownTransport`] offer into the seam
+/// [`TransportOffer`], uses this transport's configured [`SafetyEnvelope`], and maps
+/// the seam [`TransferError`] back to the daemon [`TransportError`]. This keeps the
+/// existing daemon fetch path (`TransportRegistry`/`fetch_via_offers`/
+/// `TransportNarSource`) working unchanged while the transfer LOGIC lives entirely
+/// behind the seam. Retiring this bridge (moving the daemon fetch path onto
+/// `NarTransfer`) is what lets `transport_iroh` move to `fabric-iroh` - TASK-148 AC#3.
 #[async_trait]
 impl Transport for IrohTransport {
     fn tag(&self) -> TransportTag {
@@ -2533,62 +2672,25 @@ impl Transport for IrohTransport {
         offer: &KnownTransport,
         expected_size: Option<u64>,
     ) -> Result<Vec<u8>, TransportError> {
-        // Defensive: the registry dispatches by tag, but a wrong variant is a bug
-        // worth surfacing rather than silently mis-serving.
-        let node = match offer {
-            KnownTransport::Iroh { node } => node,
-            other => {
-                return Err(TransportError::WrongOffer {
-                    expected: TransportTag::Iroh,
-                    got: other.tag(),
-                });
-            }
-        };
+        self.fetch_inner(content, &offer.to_offer(), expected_size, self.envelope)
+            .await
+            .map_err(transfer_error_to_transport_error)
+    }
+}
 
-        // AC#4: reject a NodeId that is not a valid ed25519 curve point (it is
-        // structurally 32 bytes, so only the curve check catches it) before dialing.
-        Self::validate_node_id(node).map_err(|e| TransportError::Unavailable(e.to_string()))?;
-
-        // Resolve the locator to a dialable address (discovery stand-in). No entry
-        // means "no address known for this NodeId" - task-40 supplies it.
-        let addr = self
-            .peers
-            .lock()
-            .expect("peers mutex")
-            .get(node)
-            .cloned()
-            .ok_or_else(|| {
-                TransportError::Unavailable(format!(
-                    "no known address for {node}; discovery (task-40) resolves NodeId->addr"
-                ))
-            })?;
-
-        // Coarse total backstop over dial+transfer, on top of the finer-grained
-        // dial and body-idle bounds inside `dial_and_stream`. A TooLarge abort from
-        // the streaming cap propagates through unchanged (it is a deliberate abort,
-        // not a hang the backstop should mask).
-        let node = *node;
-        let content = *content;
-        let envelope = self.envelope;
-        let operation = self.endpoint.run_connected(
-            "iroh-outbound-fetch",
-            addr,
-            iroh_blobs::ALPN.to_vec(),
-            envelope.dial_timeout,
-            move |connection| async move {
-                Self::dial_and_stream(envelope, content, connection, node, expected_size).await
-            },
-        );
-        match tokio::time::timeout(envelope.total_timeout, operation).await {
-            Ok(Ok(result)) => result,
-            Ok(Err(error)) => Err(TransportError::Unavailable(format!(
-                "shared Iroh runtime is unavailable: {error}"
-            ))),
-            Err(_elapsed) => Err(TransportError::Unavailable(format!(
-                "iroh fetch from {node} exceeded total bound {:?}",
-                envelope.total_timeout
-            ))),
+/// Map the seam [`TransferError`] to the daemon [`TransportError`]. The two enums are
+/// variant-for-variant identical (same names, fields and `Display`); this is the
+/// mechanical bridge that lets the seam-native fetch core report through the daemon
+/// trait until the daemon fetch path itself adopts `NarTransfer` (TASK-148 AC#3).
+fn transfer_error_to_transport_error(error: TransferError) -> TransportError {
+    match error {
+        TransferError::NotHeld(id) => TransportError::NotHeld(id),
+        TransferError::IntegrityMismatch { expected, actual } => {
+            TransportError::IntegrityMismatch { expected, actual }
         }
+        TransferError::WrongOffer { expected, got } => TransportError::WrongOffer { expected, got },
+        TransferError::Unavailable(why) => TransportError::Unavailable(why),
+        TransferError::TooLarge { limit, streamed } => TransportError::TooLarge { limit, streamed },
     }
 }
 
