@@ -37,7 +37,7 @@ use crate::iroh_node_record::{
 };
 use crate::iroh_runtime::{open_state_directory, validate_directory};
 use crate::pinned_http::PinnedHttpEndpoint;
-use crate::transport::NodeId;
+use peer_fabric::NodeId;
 
 pub const PUBLICATION_STATE_FILENAME: &str = "iroh-node-publication-state.json";
 const PUBLICATION_LOCK_FILENAME: &str = "iroh-node-publication.lock";

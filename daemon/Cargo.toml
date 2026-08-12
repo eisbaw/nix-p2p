@@ -71,6 +71,14 @@ required-features = ["evidence-fixture"]
 # conformance tests as the cross-crate equivalence guard. This is a daemon-SIDE
 # crate (testproxy depends on none of it), so `just independence` stays green.
 peer-fabric = { path = "../peer-fabric" }
+# fabric-iroh (TASK-144 inc 1): the iroh BACKEND crate. The node-discovery /
+# runtime / publication cluster (iroh_runtime, iroh_node_*, iroh_publication*,
+# iroh_relay, pinned_http) and the generic process supervisor moved here behind
+# the peer-fabric seam; the daemon re-exports them (src/lib.rs) so existing
+# use-sites and the evidence bins are untouched. Daemon-SIDE (testproxy depends
+# on none of it), so `just independence` stays green. The edge is one-way:
+# daemon -> fabric-iroh, never back.
+fabric-iroh = { path = "../fabric-iroh" }
 # `sync` (task-72): the on-demand supply path needs SINGLE FLIGHT - when two peers
 # ask for the same absent digest at once, exactly one regenerates and the other
 # waits for its verdict. `tokio::sync::watch` carries the state as well as the

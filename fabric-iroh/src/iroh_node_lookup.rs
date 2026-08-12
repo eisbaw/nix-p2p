@@ -27,7 +27,7 @@ use crate::iroh_node_record::{
 };
 use crate::iroh_runtime::{IrohRuntimeError, TaskSupervisorHandle};
 use crate::pinned_http::{PinnedHttpEndpoint, PinnedHttpError, PinnedHttpErrorKind};
-use crate::transport::NodeId;
+use peer_fabric::NodeId;
 
 pub const NODE_LOOKUP_SCHEMA: &str = "iroh-node-lookup-v1";
 pub const NODE_LOOKUP_SOURCE: &str = "pinned-pkarr-http";

@@ -103,7 +103,7 @@ IMPLEMENTATION_PATHS = (
     "Justfile",
     "flake.nix",
     "daemon/Cargo.toml",
-    "daemon/src/iroh_relay.rs",
+    "fabric-iroh/src/iroh_relay.rs",
     "daemon/src/bin/iroh_relay_evidence_server.rs",
     "daemon/src/bin/iroh_relay_evidence_peer.rs",
     ARTIFACT_SCHEMA_PATH,
@@ -487,7 +487,7 @@ def _good_implementation(schema: dict[str, object]) -> dict[str, object]:
         "tree": "b" * 40,
         "files": [
             {
-                "path": "daemon/src/iroh_relay.rs",
+                "path": "fabric-iroh/src/iroh_relay.rs",
                 "git_blob": "c" * 40,
                 "bytes": 1,
                 "sha256": "d" * 64,

@@ -738,6 +738,7 @@ dependencies = [
  "bao-tree",
  "blake3",
  "bytes",
+ "fabric-iroh",
  "flate2",
  "http",
  "http-body",
@@ -984,6 +985,23 @@ checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
  "windows-sys 0.61.2",
+]
+
+[[package]]
+name = "fabric-iroh"
+version = "0.0.1"
+dependencies = [
+ "blake3",
+ "iroh",
+ "iroh-dns",
+ "n0-future",
+ "peer-fabric",
+ "rustix",
+ "serde",
+ "serde_json",
+ "simple-dns",
+ "tokio",
+ "url",
 ]
 
 [[package]]

@@ -45,7 +45,7 @@ use crate::iroh_publication::{
     PUBLICATION_STARTUP_DEADLINE, PUBLICATION_TRANSITION_DEADLINE,
 };
 use crate::process_group::{ProcessJobRegistry, ProcessJobSpec};
-use crate::transport::NodeId;
+use peer_fabric::NodeId;
 
 /// Stable on-disk name. The schema version lives inside the record so an
 /// upgrade cannot accidentally interpret new bytes using old rules.
@@ -457,7 +457,7 @@ impl fmt::Debug for TaskSupervisorHandle {
     }
 }
 
-pub(crate) struct SupervisedProcessOutput {
+pub struct SupervisedProcessOutput {
     pub status: ExitStatus,
     pub stdout: Vec<u8>,
     pub stderr: Vec<u8>,
@@ -666,7 +666,7 @@ impl TaskSupervisorHandle {
     /// SIGKILLed and the direct child is waited/reaped before this tracked task
     /// completes. Stdout is capped while reading, so a replaced/growing source
     /// cannot allocate beyond the serve reservation before validation.
-    pub(crate) async fn execute_process(
+    pub async fn execute_process(
         &self,
         name: impl Into<String>,
         program: PathBuf,
@@ -1260,7 +1260,7 @@ impl IrohEndpointHandle {
     /// Connect under runtime ownership, then give the continuation only the
     /// resulting connection. The owning endpoint clone is dropped before any
     /// protocol work starts and can never escape through a generic callback.
-    pub(crate) async fn run_connected<T, F, Fut>(
+    pub async fn run_connected<T, F, Fut>(
         &self,
         name: impl Into<String>,
         addr: EndpointAddr,
@@ -1800,7 +1800,7 @@ fn snapshot_relay_capability(relay: RelayCapability) -> Result<RelayCapability, 
     )))
 }
 
-pub(crate) fn endpoint_addr(endpoint: &Endpoint) -> Result<EndpointAddr, IrohRuntimeError> {
+pub fn endpoint_addr(endpoint: &Endpoint) -> Result<EndpointAddr, IrohRuntimeError> {
     let sockets = endpoint
         .bound_sockets()
         .into_iter()

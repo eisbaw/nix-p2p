@@ -1,0 +1,63 @@
+[package]
+name = "fabric-iroh"
+description = "nix-p2p iroh BACKEND behind the peer-fabric seam: the iroh node runtime, node/address discovery (pkarr) and publication welded to iroh, plus (TASK-144 inc 2+) the iroh-blobs NAR transfer/serve. Depends on peer-fabric, never on daemon-core."
+version.workspace = true
+edition.workspace = true
+
+[lib]
+name = "fabric_iroh"
+path = "src/lib.rs"
+
+# TASK-144 increment 1 scope: this crate currently houses ONLY the
+# node-discovery / runtime / publication cluster (iroh_runtime, iroh_node_lookup,
+# iroh_node_record, iroh_publication, iroh_publication_authority, iroh_relay,
+# pinned_http) plus the generic process supervisor (process_group). The
+# iroh-blobs NAR transfer (transport_iroh) is still welded to the daemon serving
+# core (claim/transport_fetch/source/discovery) and moves here in increment 2
+# once it is rewired onto peer_fabric::{NarTransfer, NarServer}; that is why
+# iroh-blobs is NOT a dependency yet. See docs/peer-fabric-seam.md "Crate
+# topology". This crate depends on peer-fabric (for the value types, chiefly
+# NodeId) and never on the daemon: the only cross edge is daemon -> fabric-iroh.
+[dependencies]
+# peer-fabric (TASK-141): the canonical home of NodeId and the other cross-seam
+# value types. The moved modules used to reach these via the daemon's
+# `crate::transport::NodeId` re-export; here they name `peer_fabric::NodeId`
+# directly, which severs the last daemon-ward edge from the cluster.
+peer-fabric = { path = "../peer-fabric" }
+# iroh (task-39/115/137/138): the node runtime (Endpoint/SecretKey), the pkarr
+# address discovery (address_lookup) and the signed node-record publication all
+# speak iroh directly - that is exactly the weld this crate isolates from the
+# stack-neutral frontend.
+iroh = "1"
+# TASK-137/138 node-address publication reuses iroh's pkarr signed-packet wire
+# format; simple-dns builds the interoperable `_iroh` address records and the
+# stricter nix-p2p metadata at different names inside one signature.
+iroh-dns = "1"
+simple-dns = "0.11"
+url = "2.5"
+# TASK-115 identity persistence + process_group use descriptor-relative,
+# no-follow filesystem ops and process-group signalling (openat / renameat2 /
+# killpg) without unsafe code. Already in the locked iroh closure.
+rustix = { version = "1", features = ["fs", "process"] }
+# The publication/lookup schedulers drive iroh streams leaf-by-leaf; n0-future's
+# StreamExt is the exact Stream driver iroh itself uses. Already transitive under
+# iroh (no new closure).
+n0-future = "0.3"
+tokio = { version = "1", features = ["rt-multi-thread", "net", "macros", "io-util", "time", "sync", "process"] }
+# serde derives on the node-record wire types; serde_json is the draft codec and
+# the fail-closed discriminator peek (not test-only).
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# BLAKE3 of the addressed unit is reused by the node-record schema hashing.
+blake3 = "1"
+
+[dev-dependencies]
+# The moved tests `.await` iroh calls and drive time; `test-util` for the paused
+# clock, `rt-multi-thread` for the runtime the schedulers spawn onto.
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "sync", "test-util"] }
+# Several publication/authority tests reach for iroh directly to build a
+# pathological or hand-constructed endpoint the friendly API cannot express.
+iroh = "1"
+
+[lints]
+workspace = true

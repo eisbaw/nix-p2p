@@ -15,7 +15,7 @@ use iroh_dns::pkarr::{SignedPacket, Timestamp};
 use simple_dns::{CLASS, Name, Packet, ResourceRecord, rdata::RData};
 use url::{Host, Url};
 
-use crate::transport::NodeId;
+use peer_fabric::NodeId;
 
 pub const NODE_PUBLICATION_SCHEMA: &str = "iroh-node-publication-v1";
 pub const IROH_RECORD_NAME: &str = "_iroh";

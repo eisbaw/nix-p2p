@@ -26,17 +26,23 @@ pub mod catalog;
 pub mod claim;
 pub mod content_id;
 pub mod discovery;
-pub mod iroh_node_lookup;
-pub mod iroh_node_record;
-pub mod iroh_publication;
-pub mod iroh_publication_authority;
-pub mod iroh_relay;
-pub mod iroh_runtime;
 pub mod narinfo_cache;
 mod nixbase32;
-mod pinned_http;
-mod process_group;
 pub mod rewrite;
+
+// TASK-144 increment 1: the node-discovery / runtime / publication cluster and
+// the generic process supervisor MOVED to the `fabric-iroh` backend crate (the
+// iroh weld isolated behind the peer-fabric seam). They are re-exported here as
+// crate-root modules so every existing `crate::iroh_runtime::...`,
+// `crate::process_group::...` and `crate::pinned_http::...` path inside the
+// daemon - and the flat `daemon::AddressLookupCapability`-style re-exports below
+// (which name `iroh_runtime::{...}` etc.) - keep resolving unchanged. The only
+// cross edge is daemon -> fabric-iroh; `transport_iroh` (the iroh-blobs transfer,
+// still welded to the serving core) stays in this crate until increment 2.
+pub use fabric_iroh::{
+    iroh_node_lookup, iroh_node_record, iroh_publication, iroh_publication_authority, iroh_relay,
+    iroh_runtime, pinned_http, process_group,
+};
 pub mod server;
 pub mod source;
 mod supply_catalog;

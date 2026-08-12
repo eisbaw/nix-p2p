@@ -29,7 +29,7 @@ use rustix::process::{Pid, Signal, WaitOptions};
 static JOB_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct ProcessJobError {
+pub struct ProcessJobError {
     message: String,
     report_to_registry: bool,
 }
@@ -59,7 +59,7 @@ impl fmt::Display for ProcessJobError {
 impl std::error::Error for ProcessJobError {}
 
 #[derive(Debug)]
-pub(crate) struct ProcessJobSpec {
+pub struct ProcessJobSpec {
     pub program: PathBuf,
     pub args: Vec<OsString>,
     pub environment: Vec<(OsString, OsString)>,
@@ -70,7 +70,7 @@ pub(crate) struct ProcessJobSpec {
 }
 
 #[derive(Debug)]
-pub(crate) struct ProcessJobOutput {
+pub struct ProcessJobOutput {
     pub status: ExitStatus,
     pub stdout: Vec<u8>,
     pub stderr: Vec<u8>,
@@ -212,12 +212,12 @@ impl ProcessJobRegistry {
 }
 
 /// A control/observation ticket for one non-abortable worker.
-pub(crate) struct ProcessJob {
+pub struct ProcessJob {
     control: Arc<ProcessJobControl>,
 }
 
 impl ProcessJob {
-    pub(crate) fn standalone(
+    pub fn standalone(
         label: impl Into<String>,
         spec: ProcessJobSpec,
     ) -> Result<Self, ProcessJobError> {
@@ -263,15 +263,15 @@ impl ProcessJob {
         Ok(Self { control })
     }
 
-    pub(crate) fn cancel(&self) {
+    pub fn cancel(&self) {
         self.control.cancel();
     }
 
-    pub(crate) fn try_take_result(&self) -> Option<Result<ProcessJobOutput, ProcessJobError>> {
+    pub fn try_take_result(&self) -> Option<Result<ProcessJobOutput, ProcessJobError>> {
         self.control.try_take_result()
     }
 
-    pub(crate) fn wait(self) -> Result<ProcessJobOutput, ProcessJobError> {
+    pub fn wait(self) -> Result<ProcessJobOutput, ProcessJobError> {
         loop {
             if let Some(result) = self.try_take_result() {
                 return result;

@@ -8,10 +8,13 @@ resolver = "3"
 # to low-level pure-data crates, and only once a second consumer actually
 # exists. `just lint` asserts that independence mechanically.
 # peer-fabric (TASK-140) is a daemon-SIDE seam crate: the intention-level P2P
-# abstraction the future daemon-core/fabric-* crates build on (TASK-141). It is
-# consumed by nobody yet and carries ZERO p2p deps. testproxy still shares nothing
-# with it, so `just independence` stays green.
-members = ["daemon", "peer-fabric", "testproxy"]
+# abstraction the daemon-core/fabric-* crates build on (TASK-141). It carries ZERO
+# p2p deps. fabric-iroh (TASK-144) is the iroh BACKEND behind that seam - the iroh
+# node-runtime/discovery/publication weld isolated out of the daemon; it depends on
+# peer-fabric (never on the daemon) and the daemon depends on it (one-way edge).
+# Both are shared only AMONG the daemon's own components; testproxy shares nothing
+# with either, so `just independence` stays green.
+members = ["daemon", "fabric-iroh", "peer-fabric", "testproxy"]
 
 [workspace.package]
 version = "0.0.1"
