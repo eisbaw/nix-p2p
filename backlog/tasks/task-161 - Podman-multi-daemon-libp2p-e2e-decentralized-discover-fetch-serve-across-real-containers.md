@@ -3,10 +3,11 @@ id: TASK-161
 title: >-
   Podman multi-daemon libp2p e2e: decentralized discover->fetch->serve across
   real containers
-status: To Do
-assignee: []
+status: In Progress
+assignee:
+  - mped
 created_date: '2026-08-12 10:22'
-updated_date: '2026-08-12 21:49'
+updated_date: '2026-08-12 22:05'
 labels:
   - libp2p
   - daemon
@@ -23,6 +24,16 @@ dependencies:
 <!-- SECTION:DESCRIPTION:BEGIN -->
 Follow-up to TASK-160 (which proved the in-process daemon<->libp2p integration test). Stand up >=3 real daemon containers on a podman pod (a bootstrap, a serving provider that announces a known NAR, and a consumer daemon): the consumer discovers the provider via libp2p-kad (NOT injected) and fetches+serves the NAR byte-identical through its serving stack, with a MISS arm falling back to upstream. Extends the existing s6-p2p iroh e2e with a libp2p arm. Depends on the production main.rs libp2p config wiring.
 <!-- SECTION:DESCRIPTION:END -->
+
+## Implementation Plan
+
+<!-- SECTION:PLAN:BEGIN -->
+1. Harness plumbing: add a 3-daemon libp2p topology to Pod (_create_libp2p): BOOT (genesis provider seeding a DECOY nar, dummy bootstrap, prints addr), PROVIDER P (seeds the real target NAR, bootstraps to BOOT, prints addr), CONSUMER C (bootstraps to BOOT ONLY, no --libp2p-provider-addr). Parse LIBP2P-PROVIDER-ADDR/LIBP2P-SEED. All on shared pod loopback (documented scope limit vs separate-netns).
+2. scenario_s7_libp2p (positive + load-bearing control): C builds the target NAR held ONLY by P (BOOT holds a decoy) -> discovers P via kad through BOOT (never injected), fetches byte-identical, 0 upstream NAR egress. Control: kill P -> no peer serves -> upstream fallback (proves the DHT-mediated peer path is load-bearing; BOOT cannot serve the target).
+3. scenario_s7_libp2p_miss: build a NAR no peer announces -> clean upstream fallback.
+4. Rebuild .#e2e-image (carries TASK-178 daemon). Run targeted: s7-libp2p, s7-libp2p-miss, plus s6-p2p regression. Bounded runs. Clean pods.
+5. Honest scope: no LIBP2P-SERVED-TOTAL counter (attribution via proxy upstream.nar==0 + byte-identity); shared-loopback not a separate-netns routed net; F1 control conflates discovery+resolution legs (documented, matches transport.rs stated limit). NO Rust changes.
+<!-- SECTION:PLAN:END -->
 
 ## Implementation Notes
 
