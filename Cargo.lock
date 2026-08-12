@@ -1262,6 +1262,7 @@ version = "0.0.1"
 dependencies = [
  "async-trait",
  "blake3",
+ "ed25519-dalek 3.0.0",
  "futures",
  "libp2p",
  "peer-fabric",
