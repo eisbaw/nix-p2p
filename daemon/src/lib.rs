@@ -45,6 +45,7 @@ pub use fabric_iroh::{
 };
 pub mod server;
 pub mod source;
+pub mod source_libp2p;
 mod supply_catalog;
 pub mod transport;
 pub mod transport_fetch;
@@ -115,6 +116,7 @@ pub use source::{
     NarBody, NarHash, NarKey, NarPathToken, NarSource, NarinfoSource, RawUpstream, SourceError,
     StoreHash, UpstreamResponse,
 };
+pub use source_libp2p::Libp2pNarSource;
 pub use supply_catalog::SupplyCatalogHandle;
 pub use transport::{BitTorrentInfoHash, IROH_BLOBS_ALPN, NODE_ID_LEN, NodeId, NodeIdParseError};
 pub use transport_fetch::{
