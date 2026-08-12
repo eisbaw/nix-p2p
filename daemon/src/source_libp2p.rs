@@ -57,6 +57,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use bytes::Bytes;
+use fabric_libp2p::{Libp2pFabric, Multiaddr, NodeConfig, PeerId};
 use http::HeaderMap;
 use http_body_util::{BodyExt, Full};
 
@@ -211,4 +212,98 @@ impl NarSource for Libp2pNarSource {
             last_failure.unwrap_or_else(|| "no usable offer".to_string())
         )))
     }
+}
+
+/// The composition-root numbers for the PRODUCTION libp2p `NarSource` (TASK-162).
+///
+/// The daemon binary parses its CLI flags (`--libp2p-bootstrap`, `--libp2p-listen`,
+/// `--libp2p-scope`, `--libp2p-provider-addr`, `--libp2p-identity-seed`) into this
+/// shape and hands it to [`build_libp2p_nar_source`]; the in-process production-path
+/// integration test drives the SAME builder from an equivalent config, so the two
+/// exercise one construction path (the CLI parse is unit-tested separately in the
+/// binary). This is the interim both-backends wiring ahead of the clean daemon-core
+/// split (TASK-145/146); the numbers are owned here (the composition root), not baked
+/// into the seam types.
+#[derive(Debug, Clone)]
+pub struct Libp2pSourceConfig {
+    /// 32-byte ed25519 identity seed for this node.
+    pub identity_seed: [u8; 32],
+    /// The kad/identify protocol network scope (`/nix-p2p/<scope>/kad/1.0.0`).
+    pub network_scope: String,
+    /// The multiaddr to listen on, if any (a pure dial-out consumer may omit it).
+    pub listen: Option<Multiaddr>,
+    /// kad bootstrap/entry peers (`PeerId` + dial `Multiaddr`). MUST be non-empty for
+    /// discovery to work - an empty set is a consumer that can never find anyone.
+    pub bootstrap: Vec<(PeerId, Multiaddr)>,
+    /// TASK-159 basic-dial shim: provider byte-transfer dial addresses fed into the
+    /// swarm out of band (`Libp2pFabric::node_locator()` is still `None`). The
+    /// DISCOVERY leg stays a real kad lookup; this only supplies the dial.
+    pub provider_addrs: Vec<(PeerId, Multiaddr)>,
+    /// The bound on each `find_providers` consultation.
+    pub discovery_budget: DiscoveryBudget,
+    /// The fetch time envelope handed to each transfer.
+    pub envelope: SafetyEnvelope,
+}
+
+/// Build the PRODUCTION libp2p [`NarSource`] from `cfg`: start a [`Libp2pFabric`],
+/// bind the listener, join the DHT through the configured bootstrap peers (kad
+/// self-lookup), teach the swarm the provider dial addresses (TASK-159 shim), and
+/// wrap the running fabric in a [`Libp2pNarSource`].
+///
+/// Returns BOTH the `Arc<Libp2pFabric>` and the `NarSource`. In production the binary
+/// keeps only the source (which itself holds an `Arc` clone of the fabric, so the
+/// node stays alive); the returned fabric handle lets a test poll discovery readiness
+/// before serving. Connectivity setup is fail-fast: a listen or bootstrap-dial error
+/// is a loud startup error, never a silent degrade to upstream-only.
+pub async fn build_libp2p_nar_source(
+    cfg: Libp2pSourceConfig,
+) -> Result<(Arc<Libp2pFabric>, Arc<dyn NarSource>), String> {
+    let fabric = Libp2pFabric::start(NodeConfig {
+        identity_seed: cfg.identity_seed,
+        network_scope: cfg.network_scope,
+    })
+    .map_err(|e| format!("libp2p fabric start failed: {e}"))?;
+    let fabric = Arc::new(fabric);
+
+    if let Some(listen) = &cfg.listen {
+        fabric
+            .handle()
+            .listen(listen.clone())
+            .await
+            .map_err(|e| format!("libp2p listen on {listen} failed: {e}"))?;
+    }
+
+    // Join the DHT through each bootstrap peer: add_address seeds kad's routing table
+    // (so the subsequent bootstrap self-lookup has a peer to query) and dial opens the
+    // connection. A failed dial is fatal - a mistyped/unreachable bootstrap must be a
+    // startup error, not a runtime "why does nothing discover" mystery.
+    for (peer, addr) in &cfg.bootstrap {
+        fabric.handle().add_address(*peer, addr.clone()).await;
+        fabric
+            .handle()
+            .dial(addr.clone())
+            .await
+            .map_err(|e| format!("libp2p dial bootstrap {peer} @ {addr} failed: {e}"))?;
+    }
+    if !cfg.bootstrap.is_empty() {
+        // The kad self-lookup that populates the routing table. Not fatal on error:
+        // add_address already seeded routing, and propagation is polled by the caller
+        // before the first serve; a transient bootstrap error must not brick startup.
+        if let Err(e) = fabric.handle().bootstrap().await {
+            eprintln!("daemon: libp2p kad bootstrap self-lookup returned: {e}");
+        }
+    }
+
+    // TASK-159 basic-dial shim: teach the swarm each provider's byte-transfer dial
+    // address out of band (discovery above is still a real kad lookup).
+    for (peer, addr) in &cfg.provider_addrs {
+        fabric.handle().add_address(*peer, addr.clone()).await;
+    }
+
+    let source: Arc<dyn NarSource> = Arc::new(Libp2pNarSource::new(
+        fabric.clone() as Arc<dyn PeerFabric>,
+        cfg.discovery_budget,
+        cfg.envelope,
+    ));
+    Ok((fabric, source))
 }

@@ -116,7 +116,7 @@ pub use source::{
     NarBody, NarHash, NarKey, NarPathToken, NarSource, NarinfoSource, RawUpstream, SourceError,
     StoreHash, UpstreamResponse,
 };
-pub use source_libp2p::Libp2pNarSource;
+pub use source_libp2p::{Libp2pNarSource, Libp2pSourceConfig, build_libp2p_nar_source};
 pub use supply_catalog::SupplyCatalogHandle;
 pub use transport::{BitTorrentInfoHash, IROH_BLOBS_ALPN, NODE_ID_LEN, NodeId, NodeIdParseError};
 pub use transport_fetch::{

@@ -22,13 +22,15 @@ use daemon::{
     CorrelationStore, DEFAULT_MAX_INFLIGHT_NAR_BYTES, DEFAULT_MAX_SERVE_DURATION,
     DEFAULT_MAX_SERVE_NAR_BYTES, EndpointProfile, EndpointScope, FallbackNarSource,
     FileNarSupplier, IdentitySource, InMemoryDiscovery, IrohNode, IrohNodeBuilder, IrohPeerAddr,
-    IrohProviderConfig, IrohTransport, KnownPayload, KnownTransport, NarCatalog, NarHashKey,
-    NarSource, NarinfoDiskCache, NarinfoSource, NoRawServe, NodeId, NodeLocation,
-    NodeLookupAuthorityAuthorization, NodeLookupConfig, NodePublicationCapability,
+    IrohProviderConfig, IrohTransport, KnownPayload, KnownTransport, Libp2pSourceConfig,
+    NarCatalog, NarHashKey, NarSource, NarinfoDiskCache, NarinfoSource, NoRawServe, NodeId,
+    NodeLocation, NodeLookupAuthorityAuthorization, NodeLookupConfig, NodePublicationCapability,
     NodePublicationConfig, NodePublicationHandle, NullCorrelation,
     PublicationAuthorityAuthorization, RawServeDecision, RelayCapability, ServeBudget, SystemClock,
-    TaskSupervisor, TransportNarSource, TransportRegistry, UpstreamHttp, serve,
+    TaskSupervisor, TransportNarSource, TransportRegistry, UpstreamHttp, build_libp2p_nar_source,
+    serve,
 };
+use fabric_libp2p::{Multiaddr, PeerId};
 use tokio::net::TcpListener;
 
 /// A configured peer's iroh address: its `NodeId` and one-or-more direct sockets
@@ -106,6 +108,55 @@ fn parse_claim_spec(raw: &str) -> Result<ClaimSpec, String> {
         blake3,
         node,
     })
+}
+
+/// Parse a libp2p `<PeerId>@<multiaddr>` pair, used by both `--libp2p-bootstrap`
+/// (a kad entry peer) and `--libp2p-provider-addr` (the TASK-159 basic-dial shim:
+/// a provider's byte-transfer dial address fed into the swarm out of band, because
+/// `Libp2pFabric::node_locator()` is still `None`). The DISCOVERY leg stays a real,
+/// injection-free kad lookup; only the dial is supplied here.
+fn parse_libp2p_peer(flag: &str, raw: &str) -> Result<(PeerId, Multiaddr), String> {
+    let (peer_str, addr_str) = raw
+        .split_once('@')
+        .ok_or_else(|| format!("bad {flag} {raw:?}: expected <PeerId>@<multiaddr>"))?;
+    let peer: PeerId = peer_str
+        .parse()
+        .map_err(|e| format!("bad {flag} PeerId {peer_str:?}: {e}"))?;
+    let addr: Multiaddr = addr_str
+        .parse()
+        .map_err(|e| format!("bad {flag} multiaddr {addr_str:?}: {e}"))?;
+    Ok((peer, addr))
+}
+
+/// Parse a 32-byte libp2p identity seed as exactly 64 lowercase/uppercase hex chars.
+/// The seed is the node's ed25519 identity material; a fixed default is deliberately
+/// NOT provided (two consumers sharing an identity is a footgun) - when absent the
+/// composition root generates a fresh one from `/dev/urandom`.
+fn parse_libp2p_seed(raw: &str) -> Result<[u8; 32], String> {
+    if raw.len() != 64 {
+        return Err(format!(
+            "bad --libp2p-identity-seed: expected 64 hex chars (32 bytes), got {}",
+            raw.len()
+        ));
+    }
+    let mut seed = [0u8; 32];
+    for (i, byte) in seed.iter_mut().enumerate() {
+        *byte = u8::from_str_radix(&raw[2 * i..2 * i + 2], 16)
+            .map_err(|e| format!("bad --libp2p-identity-seed hex at byte {i}: {e}"))?;
+    }
+    Ok(seed)
+}
+
+/// Generate a fresh 32-byte libp2p identity seed from `/dev/urandom`. Used when
+/// `--libp2p-identity-seed` is omitted; fails fast (never a fixed fallback seed) so a
+/// missing entropy source is a loud startup error, not a silent shared identity.
+fn random_identity_seed() -> Result<[u8; 32], String> {
+    use std::io::Read;
+    let mut seed = [0u8; 32];
+    std::fs::File::open("/dev/urandom")
+        .and_then(|mut f| f.read_exact(&mut seed))
+        .map_err(|e| format!("generating libp2p identity seed from /dev/urandom: {e}"))?;
+    Ok(seed)
 }
 
 /// Parse a byte/millisecond budget that must be POSITIVE.
@@ -271,6 +322,29 @@ struct Config {
     /// holder). Seeds BOTH the in-memory discovery and the raw-serve allowlist, so a
     /// peer-served path both resolves over iroh and gets the task-49 raw rewrite.
     p2p_claims: Vec<ClaimSpec>,
+    // ---- libp2p Node A (consumer) config (TASK-162) -------------------------
+    // The libp2p decentralized discovery+transfer path, wired ADDITIVELY in front
+    // of iroh/HTTP. Distinct from the iroh flags above: iroh resolves from a
+    // configured address book (`--iroh-peer`/`--p2p-claim`), libp2p DISCOVERS the
+    // provider via libp2p-kad given only a bootstrap entry peer.
+    /// libp2p kad bootstrap/entry peers (`<PeerId>@<multiaddr>`, repeatable). At
+    /// least one is REQUIRED for libp2p (kad cannot discover without an entry point).
+    libp2p_bootstrap: Vec<(PeerId, Multiaddr)>,
+    /// TASK-159 basic-dial shim: provider byte-transfer dial addresses fed into the
+    /// swarm out of band (`<PeerId>@<multiaddr>`, repeatable). DISCOVERY is still the
+    /// decentralized kad lookup; this only supplies the dial leg until the gate-able
+    /// libp2p NodeLocator/NAT axis lands (TASK-159).
+    libp2p_provider_addrs: Vec<(PeerId, Multiaddr)>,
+    /// The multiaddr this node listens on (e.g. `/ip4/0.0.0.0/tcp/0`). Optional; a
+    /// pure consumer that only dials out may omit it, but kad connectivity is more
+    /// robust with a bound listener.
+    libp2p_listen: Option<Multiaddr>,
+    /// The kad/identify protocol network scope (`/nix-p2p/<scope>/kad/1.0.0`).
+    /// Defaults to `v1` (matching `NodeConfig::new`).
+    libp2p_scope: Option<String>,
+    /// Optional 32-byte ed25519 identity seed (64 hex chars). When omitted the
+    /// composition root generates a fresh one from `/dev/urandom`.
+    libp2p_identity_seed: Option<[u8; 32]>,
 }
 
 impl Default for Config {
@@ -317,6 +391,11 @@ impl Default for Config {
             iroh_sweep_interval_ms: 500,
             iroh_peers: Vec::new(),
             p2p_claims: Vec::new(),
+            libp2p_bootstrap: Vec::new(),
+            libp2p_provider_addrs: Vec::new(),
+            libp2p_listen: None,
+            libp2p_scope: None,
+            libp2p_identity_seed: None,
         }
     }
 }
@@ -554,6 +633,23 @@ impl Config {
                 }
                 "--iroh-peer" => config.iroh_peers.push(parse_peer_spec(&value()?)?),
                 "--p2p-claim" => config.p2p_claims.push(parse_claim_spec(&value()?)?),
+                "--libp2p-bootstrap" => config
+                    .libp2p_bootstrap
+                    .push(parse_libp2p_peer("--libp2p-bootstrap", &value()?)?),
+                "--libp2p-provider-addr" => config
+                    .libp2p_provider_addrs
+                    .push(parse_libp2p_peer("--libp2p-provider-addr", &value()?)?),
+                "--libp2p-listen" => {
+                    let raw = value()?;
+                    config.libp2p_listen = Some(
+                        raw.parse()
+                            .map_err(|e| format!("bad --libp2p-listen {raw:?}: {e}"))?,
+                    );
+                }
+                "--libp2p-scope" => config.libp2p_scope = Some(value()?),
+                "--libp2p-identity-seed" => {
+                    config.libp2p_identity_seed = Some(parse_libp2p_seed(&value()?)?)
+                }
                 other => return Err(format!("unknown flag {other:?}")),
             }
         }
@@ -591,7 +687,49 @@ impl Config {
         if iroh_enabled && config.iroh_port.is_none() {
             return Err("Iroh is configured but --iroh-port is missing; refusing an ephemeral discovery address".into());
         }
+        // libp2p companion validation: any libp2p flag REQUIRES a bootstrap entry
+        // peer (kad cannot discover a provider without one). A `--libp2p-listen`/
+        // `--libp2p-provider-addr` with no bootstrap would be a consumer that can
+        // never find anyone - a silently-useless config, so fail fast.
+        if config.libp2p_requested() && config.libp2p_bootstrap.is_empty() {
+            return Err(
+                "libp2p is configured but --libp2p-bootstrap is missing; kad cannot discover a provider without an entry peer".into(),
+            );
+        }
         Ok(config)
+    }
+
+    /// Any libp2p Node-A flag present (so the daemon should wire the libp2p source).
+    fn libp2p_requested(&self) -> bool {
+        !self.libp2p_bootstrap.is_empty()
+            || !self.libp2p_provider_addrs.is_empty()
+            || self.libp2p_listen.is_some()
+            || self.libp2p_scope.is_some()
+            || self.libp2p_identity_seed.is_some()
+    }
+
+    /// Build the production [`Libp2pSourceConfig`] this `Config` describes, resolving
+    /// the identity seed (a fresh `/dev/urandom` one when `--libp2p-identity-seed` was
+    /// omitted) and the network scope (default `v1`). The discovery budget and fetch
+    /// envelope use the peer-fabric v1 defaults; per-flag budget knobs are a follow-up
+    /// (TASK-162 note) once the podman e2e (TASK-161) pins the operating numbers.
+    fn libp2p_source_config(&self) -> Result<Libp2pSourceConfig, String> {
+        let identity_seed = match self.libp2p_identity_seed {
+            Some(seed) => seed,
+            None => random_identity_seed()?,
+        };
+        Ok(Libp2pSourceConfig {
+            identity_seed,
+            network_scope: self
+                .libp2p_scope
+                .clone()
+                .unwrap_or_else(|| "v1".to_string()),
+            listen: self.libp2p_listen.clone(),
+            bootstrap: self.libp2p_bootstrap.clone(),
+            provider_addrs: self.libp2p_provider_addrs.clone(),
+            discovery_budget: peer_fabric::DiscoveryBudget::default(),
+            envelope: peer_fabric::SafetyEnvelope::default(),
+        })
     }
 
     fn cache_info(&self) -> CacheInfo {
@@ -1041,59 +1179,95 @@ async fn shutdown_after_setup_error(node: IrohNode, error: String) -> String {
 async fn setup_p2p_source(
     config: &Config,
     upstream: Arc<UpstreamHttp>,
-    transport: IrohTransport,
+    transport: Option<IrohTransport>,
 ) -> Result<(Arc<dyn NarSource>, Arc<dyn RawServeDecision>), String> {
-    // Fail fast (config-time, not first-request): every claim's holder MUST have a
-    // configured dialable address. Without this a typo'd/omitted `--iroh-peer`
-    // node silently degrades to upstream fallback (raw paths) or a fail-closed 404
-    // (compressed-rewritten paths) at the first request - a confusing runtime miss
-    // instead of a loud startup error.
-    let peer_nodes: std::collections::HashSet<NodeId> =
-        config.iroh_peers.iter().map(|p| p.node).collect();
-    for claim in &config.p2p_claims {
-        if !peer_nodes.contains(&claim.node) {
-            return Err(format!(
-                "claim for {} names holder {} but no --iroh-peer supplies its address",
-                claim.nar_hash,
-                claim.node.to_hex()
-            ));
+    let iroh_configured = !config.iroh_peers.is_empty() || !config.p2p_claims.is_empty();
+
+    // The fallback chain is built tail-first, so the outermost (primary) source is
+    // tried first. PRECEDENCE (TASK-162, documented): libp2p (decentralized kad
+    // discovery, PRD-primary) -> iroh (configured address book) -> HTTP upstream.
+    // Each layer wraps the one below via FallbackNarSource, so a clean miss/unreachable
+    // at one layer falls through to the next (a TooLarge abort still propagates). The
+    // iroh path is untouched and purely additive; whether libp2p-first is the RIGHT
+    // composition (vs. a transport tournament / dual-stack race) is a follow-up
+    // (TASK-145/146 clean split) - see the filed compose question.
+    let mut chain: Arc<dyn NarSource> = upstream.clone();
+
+    if iroh_configured {
+        // Fail fast (config-time, not first-request): every claim's holder MUST have a
+        // configured dialable address. Without this a typo'd/omitted `--iroh-peer`
+        // node silently degrades to upstream fallback (raw paths) or a fail-closed 404
+        // (compressed-rewritten paths) at the first request - a confusing runtime miss
+        // instead of a loud startup error.
+        let peer_nodes: std::collections::HashSet<NodeId> =
+            config.iroh_peers.iter().map(|p| p.node).collect();
+        for claim in &config.p2p_claims {
+            if !peer_nodes.contains(&claim.node) {
+                return Err(format!(
+                    "claim for {} names holder {} but no --iroh-peer supplies its address",
+                    claim.nar_hash,
+                    claim.node.to_hex()
+                ));
+            }
         }
+
+        let transport = transport.ok_or_else(|| {
+            "iroh peers/claims configured but no Iroh transport was supplied".to_string()
+        })?;
+        for peer in &config.iroh_peers {
+            transport.add_peer(&IrohPeerAddr::new(peer.node, peer.sockets.iter().copied()));
+        }
+        let mut registry = TransportRegistry::new();
+        registry.register(Box::new(transport));
+
+        let discovery = InMemoryDiscovery::new();
+        for claim in &config.p2p_claims {
+            // Reuse the key canonicalised once at parse time (SSOT for the parsed form).
+            discovery.announce(Claim {
+                schema_version: CLAIM_SCHEMA_VERSION,
+                key: claim.key,
+                payload: Some(KnownPayload::WholeNar {
+                    blake3: claim.blake3,
+                }),
+                holders: vec![claim.node],
+                transports: vec![KnownTransport::Iroh { node: claim.node }],
+                relay: None,
+                signatures: vec![],
+            });
+        }
+
+        let transport_source = Arc::new(TransportNarSource::new(registry, Arc::new(discovery)));
+        chain = Arc::new(FallbackNarSource::new(transport_source, chain));
+        println!(
+            "daemon: iroh p2p source wired ({} peer(s), {} claim(s))",
+            config.iroh_peers.len(),
+            config.p2p_claims.len()
+        );
     }
 
-    for peer in &config.iroh_peers {
-        transport.add_peer(&IrohPeerAddr::new(peer.node, peer.sockets.iter().copied()));
-    }
-    let mut registry = TransportRegistry::new();
-    registry.register(Box::new(transport));
-
-    let discovery = InMemoryDiscovery::new();
-    for claim in &config.p2p_claims {
-        // Reuse the key canonicalised once at parse time (SSOT for the parsed form).
-        discovery.announce(Claim {
-            schema_version: CLAIM_SCHEMA_VERSION,
-            key: claim.key,
-            payload: Some(KnownPayload::WholeNar {
-                blake3: claim.blake3,
-            }),
-            holders: vec![claim.node],
-            transports: vec![KnownTransport::Iroh { node: claim.node }],
-            relay: None,
-            signatures: vec![],
-        });
+    if config.libp2p_requested() {
+        // Build + START the libp2p fabric (listen/bootstrap/dial) and wrap it in the
+        // Libp2pNarSource. The returned fabric handle is dropped here: the source holds
+        // its own Arc clone, keeping the node alive for the process lifetime.
+        let (_fabric, libp2p_source) =
+            build_libp2p_nar_source(config.libp2p_source_config()?).await?;
+        chain = Arc::new(FallbackNarSource::new(libp2p_source, chain));
+        println!(
+            "daemon: libp2p p2p source wired ({} bootstrap peer(s), {} provider dial addr(s))",
+            config.libp2p_bootstrap.len(),
+            config.libp2p_provider_addrs.len()
+        );
     }
 
-    let transport_source = Arc::new(TransportNarSource::new(registry, Arc::new(discovery)));
-    let nar: Arc<dyn NarSource> = Arc::new(FallbackNarSource::new(transport_source, upstream));
+    // The raw-serve allowlist is keyed on the iroh claim set (the task-49 compressed
+    // rewrite). libp2p-served paths resolve via the SignedNarHash correlation and do
+    // NOT currently participate in the raw-serve allowlist; unifying raw-serve across
+    // both backends is part of the compose follow-up (TASK-145/146).
     let raw_serve: Arc<dyn RawServeDecision> = Arc::new(AllowlistRawServe::new(
         config.p2p_claims.iter().map(|c| c.nar_hash.clone()),
     ));
 
-    println!(
-        "daemon: p2p source wired ({} peer(s), {} claim(s))",
-        config.iroh_peers.len(),
-        config.p2p_claims.len()
-    );
-    Ok((nar, raw_serve))
+    Ok((chain, raw_serve))
 }
 
 /// The `rewrite-narinfo` filter subcommand: read a narinfo on stdin, apply the
@@ -1313,16 +1487,23 @@ async fn main() -> ExitCode {
     // with the raw-serve allowlist so a peer-served path is both resolved over iroh
     // AND gets the task-49 raw narinfo rewrite. Absent any peer/claim config the
     // node stays a pure HTTP substituter (the wave-1 S2 path, NoRawServe).
+    let iroh_p2p = !config.iroh_peers.is_empty() || !config.p2p_claims.is_empty();
     let (nar, raw_serve): (Arc<dyn NarSource>, Arc<dyn RawServeDecision>) =
-        if config.iroh_peers.is_empty() && config.p2p_claims.is_empty() {
+        if !iroh_p2p && !config.libp2p_requested() {
             (upstream.clone(), Arc::new(NoRawServe))
         } else {
-            let transport = match &iroh_node {
-                Some(node) => node.transport_handle(),
-                None => {
-                    eprintln!("daemon: p2p source requested without an Iroh node runtime");
-                    return ExitCode::FAILURE;
+            // The Iroh transport is only needed for the iroh p2p layer; a libp2p-only
+            // node runs with no Iroh node runtime (None here).
+            let transport = if iroh_p2p {
+                match &iroh_node {
+                    Some(node) => Some(node.transport_handle()),
+                    None => {
+                        eprintln!("daemon: iroh p2p source requested without an Iroh node runtime");
+                        return ExitCode::FAILURE;
+                    }
                 }
+            } else {
+                None
             };
             match setup_p2p_source(&config, upstream.clone(), transport).await {
                 Ok(pair) => pair,
@@ -1534,6 +1715,93 @@ mod tests {
         assert!(parse_claim_spec(&format!("not-a-narhash={BLAKE3_HEX}@{NODE_HEX}")).is_err());
         assert!(parse_claim_spec(&format!("{NARHASH}=dead@{NODE_HEX}")).is_err());
         assert!(parse_claim_spec(&format!("{NARHASH}={BLAKE3_HEX}@zzzz")).is_err());
+    }
+
+    #[test]
+    fn parse_libp2p_peer_round_trips_peerid_and_multiaddr() {
+        let peer = PeerId::random();
+        let raw = format!("{peer}@/ip4/127.0.0.1/tcp/4001");
+        let (parsed_peer, addr) = parse_libp2p_peer("--libp2p-bootstrap", &raw).unwrap();
+        assert_eq!(parsed_peer, peer, "PeerId round-trips through base58 parse");
+        assert_eq!(addr.to_string(), "/ip4/127.0.0.1/tcp/4001");
+    }
+
+    #[test]
+    fn parse_libp2p_peer_fails_fast_on_malformed_input() {
+        // No '@'; a non-base58 PeerId; a garbage multiaddr.
+        assert!(parse_libp2p_peer("--libp2p-bootstrap", "no-at-sign").is_err());
+        assert!(parse_libp2p_peer("--libp2p-bootstrap", "notapeer@/ip4/127.0.0.1/tcp/1").is_err());
+        let peer = PeerId::random();
+        assert!(
+            parse_libp2p_peer("--libp2p-bootstrap", &format!("{peer}@not-a-multiaddr")).is_err()
+        );
+    }
+
+    #[test]
+    fn parse_libp2p_seed_requires_exactly_64_hex() {
+        assert_eq!(parse_libp2p_seed(&"ab".repeat(32)).unwrap(), [0xabu8; 32]);
+        assert!(parse_libp2p_seed("abcd").is_err(), "short seed rejected");
+        assert!(
+            parse_libp2p_seed(&"zz".repeat(32)).is_err(),
+            "non-hex rejected"
+        );
+    }
+
+    #[test]
+    fn parses_libp2p_flags_and_resolves_source_config() {
+        let peer = PeerId::random();
+        let prov = PeerId::random();
+        let config = Config::from_args(vec![
+            "--libp2p-bootstrap".to_string(),
+            format!("{peer}@/ip4/127.0.0.1/tcp/4001"),
+            "--libp2p-provider-addr".to_string(),
+            format!("{prov}@/ip4/127.0.0.1/tcp/4002"),
+            "--libp2p-listen".to_string(),
+            "/ip4/0.0.0.0/tcp/0".to_string(),
+            "--libp2p-scope".to_string(),
+            "task162".to_string(),
+            "--libp2p-identity-seed".to_string(),
+            "11".repeat(32),
+        ])
+        .unwrap();
+        assert!(config.libp2p_requested());
+        assert_eq!(config.libp2p_bootstrap.len(), 1);
+        assert_eq!(config.libp2p_provider_addrs.len(), 1);
+        assert_eq!(config.libp2p_scope.as_deref(), Some("task162"));
+        assert_eq!(config.libp2p_identity_seed, Some([0x11u8; 32]));
+
+        // The production source config resolves the seed + scope the builder consumes.
+        let src = config.libp2p_source_config().unwrap();
+        assert_eq!(src.identity_seed, [0x11u8; 32]);
+        assert_eq!(src.network_scope, "task162");
+        assert_eq!(src.bootstrap.len(), 1);
+        assert_eq!(src.provider_addrs.len(), 1);
+        assert!(src.listen.is_some());
+    }
+
+    #[test]
+    fn libp2p_flag_without_bootstrap_fails_fast() {
+        // A consumer that can never discover anyone is a silently-useless config.
+        let err = Config::from_args(vec![
+            "--libp2p-listen".to_string(),
+            "/ip4/0.0.0.0/tcp/0".to_string(),
+        ])
+        .unwrap_err();
+        assert!(err.contains("libp2p-bootstrap"), "got {err}");
+    }
+
+    #[test]
+    fn libp2p_scope_defaults_to_v1_when_omitted() {
+        let peer = PeerId::random();
+        let config = Config::from_args(vec![
+            "--libp2p-bootstrap".to_string(),
+            format!("{peer}@/ip4/127.0.0.1/tcp/4001"),
+        ])
+        .unwrap();
+        let src = config.libp2p_source_config().unwrap();
+        assert_eq!(src.network_scope, "v1", "default scope");
+        // Omitted seed is filled by a fresh /dev/urandom one (not a fixed default).
+        assert_ne!(src.identity_seed, [0u8; 32]);
     }
 
     #[test]
