@@ -7,7 +7,7 @@ status: In Progress
 assignee:
   - '@claude'
 created_date: '2026-08-11 22:55'
-updated_date: '2026-08-12 14:14'
+updated_date: '2026-08-12 14:18'
 labels:
   - iroh
   - discovery
@@ -49,5 +49,10 @@ inc1: feature-gated relay evidence binaries (server+peer) DONE, committed 99376b
 ## Implementation Notes
 
 <!-- SECTION:NOTES:BEGIN -->
-DEEP gate returned: core relay-attribution proof CONFIRMED genuine + non-circular (mped-architect). One gate-breaking finding F1 = TASK-166 (elapsed_ms measures container wall-clock + is clamped, so the deadline oracle cannot bite). F1 is an evidence-instrument honesty defect, NOT a relay-transport bug. Follow-ups F2=TASK-165, F3=TASK-167. Decision: TASK-142 stays In Progress (not falsely Done) on the timing axis; F1 (TASK-166) is deferred and gates TASK-89's use of the artifact, so it lands when the iroh relay evidence is finalized rather than being hardened now while the core path is the priority.
+DEEP gate reconciled (qa-test-runner + mped-architect + codex cross-model):
+- CORE relay-attribution proof CONFIRMED genuine + non-circular by BOTH mped and codex (forced-path experiment: with no route either direction, a live bidirectional echo can only be relayed). The topology fix (9257988) is the correct independent intervention.
+- qa: tests green (560/0 x2, relay self-tests pass); lint fixed (ruff format + gitignore raw dirs, aa4f509).
+- BLOCKERS (both reviewers NO-GO): F1=TASK-166 (elapsed_ms clamped container wall-clock, deadline oracle cannot bite). F2=TASK-165 (codex DEMONSTRATED verdict=pass from a hand-authored run.json with zero pcaps; pcaps not re-parsed, not preserved, counts unverifiable). F3=TASK-167 (typed-reason deadline-collapse).
+- ACTION: withdrew the premature verdict=pass artifact (d22fcb7) rather than leave non-evidence-bound fake-green in the tree. TASK-142 stays In Progress. Artifact is regenerable from the harness at HEAD once F1/F2 land.
+- The container-plumbing + topology fixes (e04d6e9, 9257988) are correct and RETAINED - they are what makes a future honest run possible.
 <!-- SECTION:NOTES:END -->
