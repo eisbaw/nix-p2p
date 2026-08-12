@@ -3,11 +3,11 @@ id: TASK-150
 title: >-
   peer_fabric::NarSupplier is too weak for the iroh serve axis
   (plan/size-before-produce + cancellation-safety)
-status: In Progress
+status: Done
 assignee:
   - '@claude'
 created_date: '2026-08-12 05:17'
-updated_date: '2026-08-12 06:54'
+updated_date: '2026-08-12 07:18'
 labels:
   - iroh
   - seam
@@ -64,4 +64,14 @@ INCREMENT 3 LANDED (commit c39b200) - AC#2 de-welded serve axis.
 IrohProvider now impls peer_fabric::NarServer. New IrohNodeBuilder::defer_serve() registers the provider handler WITHOUT starting the driver (fail-closed via require_ready); IrohProvider::serve starts the driver on an INDEPENDENT tokio task and returns a peer_fabric::ServeHandle whose Drop (AbortOnDrop) aborts JUST that task - de-welding the serve loop lifetime from the node runtime supervisor. Request sub-tasks still spawn on the runtime supervisor, preserving cancellation-safe execute_process/process-group reaping. Serve budget arrives THROUGH the seam: ServeGate.budget is a set-once OnceLock installed before the driver admits (task-72 declared-size-before-produce preserved). Auto-serve path (IrohProviderNode::spawn*, production main.rs) installs at prepare - behaviorally unchanged (risk isolated). Shared driver body extracted to run_provider_event_driver() used by both start (supervisor) and start_abortable (tokio+JoinHandle).
 TEARDOWN TEST (daemon/tests/iroh_serve_teardown.rs, 2/2): deferred provider fail-closed until serve(); serve()->ready; drop(handle)->driver aborted (lifecycle leaves READY, the only way a recv()-blocked loop stops) while node runtime stays alive + shuts down clean; auto-serve provider refuses a 2nd serve() with a named error.
 GATE: build/lint green; serve_budget_and_supply 16, store_residency_oracle/retainall/rss 1/1/1, iroh_runtime 37, iroh_serve_teardown 2, iroh_transport 7; full just test green; just e2e 5/5 incl s6-p2p 11/11.
+
+REVIEW ROUND (mped-architect, Mark-emulator) LANDED (commit d7fade2). The core safety story was CLEARED: OnceLock 'budget before any admit' is structural (no reachable .expect panic); teardown is fail-closed (aborted driver drops its answer channel -> iroh-blobs InterceptLog request aborts, no bytes served post-teardown); no EventSender/protocol leak; serve_tasks take is not a TOCTOU; removing peer_fabric::NarSupplier + CatalogProbe (no-enumeration preserved) endorsed. Fixes applied: #1(major) reworded the ServeHandle/NarServer seam doc - drop stops NEW admissions only; in-flight drains under the node runtime and its budget is not reclaimed until then (best-effort, async, no happens-before stop signal); #3(footgun) renamed inherent SupplyCatalogHandle::probe -> probe_record so the CatalogProbe trait  can't silently rebind to unbounded recursion; #2/#4 documented deferred serve as single-shot/terminal + async teardown; #6 from_seam destructures peer_fabric::ServeBudget exhaustively (compile-time drift catch); #7 IROH-SERVE-STARTED/-STOPPED session traces. #5(nit budget() expect vs fail-closed) left as documented-unreachable (structural ordering).
+
+NOTE (typo fix): in the review-round note above, the phrase 'the CatalogProbe trait can-t silently rebind' lost the word 'probe' (a shell backtick ate it). Full meaning: renaming the inherent method to probe_record ensures the CatalogProbe trait method named probe cannot be silently rebound to by a future refactor - which would cause unbounded recursion with no compile error.
 <!-- SECTION:NOTES:END -->
+
+## Final Summary
+
+<!-- SECTION:FINAL_SUMMARY:BEGIN -->
+All 3 ACs GREEN. SEAM DECISION (AC#1, option c refined): the plan-based SEALED NarSupplier/SupplyPlan stays substrate-internal (below the seam); the supplier is bound to the concrete server at CONSTRUCTION, so peer_fabric::NarServer::serve carries only the budget and the weak peer_fabric::NarSupplier (eager, sizeless) is removed - declared-size-before-produce (task-72 GAP-1) and cancellation-safety stay in the runtime layer that enforces them. AC#2: IrohProvider impls peer_fabric::NarServer; IrohNodeBuilder::defer_serve() registers the handler without starting the driver, IrohProvider::serve starts it on an independent tokio task and returns a ServeHandle whose Drop aborts JUST that task (de-welding the serve axis from the shared runtime supervisor while keeping cancellation-safe execute_process and the OnceLock budget-before-admit bound); teardown-proven by daemon/tests/iroh_serve_teardown.rs (2/2). AC#3: IndexNarSupplier severed from daemon supply_catalog via the CatalogProbe trait + neutral ProbedSupply (edge inverted to daemon->transport_iroh). Commits: 306bc3f AC#1, 4402a50 AC#3, c39b200 AC#2, d7fade2 review fixes. GATE: build/lint green; serve_budget_and_supply 16, store_residency oracle/retainall/rss 1/1/1, iroh_runtime 37, iroh_serve_teardown 2; full test green; e2e 5/5 incl s6-p2p 11/11. TASK-148 remainder (retire daemon Transport bridge -> NarTransfer+TransferRegistry; move transport_iroh + IROH_BLOBS_ALPN into fabric-iroh) NOT attempted here - large/high-blast-radius, tracked under TASK-148 (serve axis + IndexNarSupplier sub-blocker now unblocked).
+<!-- SECTION:FINAL_SUMMARY:END -->
