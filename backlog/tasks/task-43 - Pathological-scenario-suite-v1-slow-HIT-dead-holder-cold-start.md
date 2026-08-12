@@ -4,7 +4,7 @@ title: 'Pathological scenario suite v1: slow-HIT, dead-holder, cold-start'
 status: To Do
 assignee: []
 created_date: '2026-08-08 20:13'
-updated_date: '2026-08-10 22:26'
+updated_date: '2026-08-12 17:58'
 labels: []
 dependencies:
   - TASK-42
@@ -164,4 +164,13 @@ TWO TRAPS FOR THIS ROW:
     `declined_busy` vs `declined_unknown`). The in-process mutation sweep found
     that removing the per-NAR bound was still caught, but as `declined_busy` -
     the reason-specific assertion is what made it non-vacuous.
+
+## Forward-carried from TASK-66 (multi-holder index — DONE)
+
+The replace-on-key limitation is FIXED: InMemoryDiscovery is now a multimap (accumulate holders, not replace). So the dead-holder scenario can now bite at the RIGHT boundary — a genuine holder->holder failover, NOT the peer->upstream fallback S6 already covers.
+
+Mechanics available to the suite:
+- Announce >=2 claims for the SAME NarHash (distinct holders/offers). resolve() merges them into ONE Claim whose transports is the UNION in ANNOUNCE ORDER, which is exactly what fetch_via_offers() iterates and fails over across. So a dead FIRST holder (dial refused / envelope abort) is retried against the NEXT holder within the same claim — no upstream needed.
+- Oracle pattern proven at unit scale in daemon/src/transport_fetch.rs::a_dead_first_holder_fails_over_to_the_second_holder: a node-aware transport records per-holder dial ATTEMPTS; assert the attempt ORDER is [dead_first, live_second]. That attempt-order is the bite (asserting only that bytes arrived is vacuous — the live holder would serve regardless). Reverting to replace-on-key drops the first holder and the order becomes [live_second], which fails.
+- For the e2e/iroh arm: give the claim two holders where holder A = IrohPeerAddr::new(validNode, deadAddr) (black-hole) and holder B live; assert B is reached (provider-side counter on B) after A's bounded dial-timeout, and that no upstream fetch happened. This is the holder->next-holder path TASK-66 unblocked; before it, the dead-holder cell could only degenerate to peer->upstream.
 <!-- SECTION:NOTES:END -->
