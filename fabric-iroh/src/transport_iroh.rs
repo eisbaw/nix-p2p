@@ -1,7 +1,9 @@
-//! The REAL iroh whole-NAR [`Transport`] (task-39): the FIRST peer-to-peer byte
-//! transfer in the project. It fills the task-38 [`Transport`] trait for the
-//! [`TransportTag::Iroh`] tag, replacing the in-memory `FakeTransport` with two
-//! genuine iroh endpoints exchanging bytes over a real QUIC connection.
+//! The REAL iroh whole-NAR transfer/serve (task-39): the FIRST peer-to-peer byte
+//! transfer in the project. [`IrohTransport`] IS the [`peer_fabric::NarTransfer`] for
+//! the [`TransportTag::Iroh`] tag (TASK-148) - two genuine iroh endpoints exchanging
+//! bytes over a real QUIC connection, replacing the in-memory `FakeTransport`. The
+//! daemon's own `Transport` trait is bridged onto this seam impl from the daemon side
+//! (`daemon/src/transport_iroh_bridge.rs`); this module names ONLY seam types.
 //!
 //! ## Provider + client
 //!
@@ -10,7 +12,7 @@
 //!     serves them under the stock iroh-blobs ALPN via an [`iroh::protocol::Router`].
 //!     ([`IrohProvider::seed`] models the content-addressed "put"; the real
 //!     seeding index that enumerates a node's held NARs is task-50.)
-//!   * [`IrohTransport`] (node A) is the [`Transport`] impl: given a
+//!   * [`IrohTransport`] (node A) is the [`peer_fabric::NarTransfer`] impl: given a
 //!     [`Blake3Digest`] and a peer [`NodeId`] (from a claim's `Iroh` offer), it
 //!     dials the peer and fetches the blob by that exact digest. iroh-blobs' `bao`
 //!     streaming decode verifies BLAKE3 incrementally against the requested hash
@@ -27,10 +29,10 @@
 //!
 //! ## The TWO gates (kept distinct)
 //!
-//! Gate 1 (transport BLAKE3/bao) is owned here and re-asserted with the daemon's
-//! own [`verify_blake3`] single-source-of-truth recipe before any bytes are
+//! Gate 1 (transport BLAKE3/bao) is owned here and re-asserted with the
+//! single-source-of-truth [`Blake3Digest::from_raw_nar`] recipe before any bytes are
 //! returned. Gate 2 (`sha256 == NarHash`, Nix's signed trust anchor) is downstream
-//! and NOT re-implemented here - the daemon is outside the TCB (see
+//! and NOT re-implemented here - the daemon is outside the TCB (see the daemon's
 //! `transport_fetch` module docs).
 //!
 //! ## Relay / discovery (honest scope)
@@ -75,8 +77,6 @@ use iroh_blobs::{BlobsProtocol, Hash};
 use n0_future::StreamExt;
 use tokio::sync::watch;
 
-use crate::claim::KnownTransport;
-use crate::content_id::Blake3Digest;
 use crate::iroh_node_lookup::NodeLookupHandle;
 use crate::iroh_publication::{NodePublicationCapability, NodePublicationHandle};
 use crate::iroh_runtime::{
@@ -84,17 +84,36 @@ use crate::iroh_runtime::{
     EndpointProfile, IdentitySource, IrohEndpointHandle, IrohNodeRuntime, IrohRuntimeBuilder,
     IrohRuntimeError, RelayCapability, ShutdownOutcome, TaskSupervisorHandle,
 };
-use crate::transport::{IROH_BLOBS_ALPN, NodeId};
-use crate::transport_fetch::{Transport, TransportError};
 use peer_fabric::{
-    NarServer, NarTransfer, SafetyEnvelope as SeamSafetyEnvelope, ServeBudget as SeamServeBudget,
-    ServeError as SeamServeError, ServeHandle as SeamServeHandle, TransferError, TransportOffer,
-    TransportTag,
+    Blake3Digest, NarServer, NarTransfer, NodeId, SafetyEnvelope as SeamSafetyEnvelope,
+    ServeBudget as SeamServeBudget, ServeError as SeamServeError, ServeHandle as SeamServeHandle,
+    TransferError, TransportOffer, TransportTag,
 };
 
 // -------------------------------------------------------------------------
-// AC#4: the ALPN cross-check, as a COMPILE-TIME assertion.
+// AC#4: the iroh-blobs ALPN + its COMPILE-TIME cross-check.
 // -------------------------------------------------------------------------
+
+/// The iroh-blobs application-layer protocol negotiated over QUIC ALPN. Frozen:
+/// two nix-p2p daemons MUST present the identical ALPN or they never connect;
+/// changing it splits the network at the connection layer.
+///
+/// This is the stock iroh-blobs protocol identifier (PRD: "Transfer uses stock
+/// iroh-blobs ALPN"), so a nix-p2p node speaks the same get-protocol as any
+/// iroh-blobs node and gets BLAKE3-verified streaming for free.
+///
+/// FREEZE-RISK NOTE, stated honestly: the compile-time assertion below cross-checks
+/// `IROH_BLOBS_ALPN == iroh_blobs::ALPN`. Unlike the hash recipe, a wrong ALPN fails
+/// LOUDLY and early (peers simply fail to connect at S6 interop, no bytes are
+/// corrupted and no held blob is invalidated), so it is reconcilable at S6 - which
+/// is the design intent: S6 CONFIRMS, and an ALPN mismatch is the one freeze surface
+/// S6 can still safely realign because no data is addressed by it.
+///
+/// TASK-148 increment 2: this iroh-specific constant MOVED here from
+/// `daemon/src/transport.rs` (TASK-141 inc 1 left it in the daemon on purpose until
+/// the iroh-blobs dependency landed in this crate). The daemon re-exports it as
+/// `daemon::IROH_BLOBS_ALPN` so its use-sites are untouched.
+pub const IROH_BLOBS_ALPN: &[u8] = b"/iroh-bytes/4";
 
 /// Const byte-slice equality (the stdlib `==` on `&[u8]` is not const), so the
 /// assertion below fails at COMPILE time rather than only in a test.
@@ -120,7 +139,7 @@ const fn alpn_bytes_eq(a: &[u8], b: &[u8]) -> bool {
 const _: () = assert!(
     alpn_bytes_eq(IROH_BLOBS_ALPN, iroh_blobs::ALPN),
     "frozen IROH_BLOBS_ALPN diverged from iroh_blobs::ALPN - realign the constant \
-     in transport.rs to the pinned iroh version",
+     above to the pinned iroh version",
 );
 
 /// The real iroh-blobs ALPN, exposed so a test can cross-check the frozen constant
@@ -164,8 +183,8 @@ pub const BODY_IDLE_TIMEOUT: Duration = Duration::from_secs(10);
 pub const FETCH_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// The three time bounds of the safety envelope, injectable so a test can pin
-/// SHORT bounds and prove a dead/stalled peer yields a bounded abort (mirrors
-/// [`crate::discovery::DirectDiscovery::with_timeout`]). [`Default`] is the
+/// SHORT bounds and prove a dead/stalled peer yields a bounded abort (mirrors the
+/// daemon's `discovery::DirectDiscovery::with_timeout`). [`Default`] is the
 /// PROVISIONAL production envelope above.
 #[derive(Debug, Clone, Copy)]
 pub struct SafetyEnvelope {
@@ -205,10 +224,10 @@ impl SafetyEnvelope {
 // Errors.
 // -------------------------------------------------------------------------
 
-/// Why an iroh provider/transport operation failed. Kept separate from
-/// [`TransportError`] (the trait's per-offer failure) so setup failures
-/// (bind/seed) are distinguishable from a fetch that should just try the next
-/// offer; [`IrohTransport::fetch`] maps the fetch-path ones into [`TransportError`].
+/// Why an iroh provider/transport operation failed. Kept separate from the seam
+/// [`TransferError`] (the per-offer fetch failure) so setup failures (bind/seed) are
+/// distinguishable from a fetch that should just try the next offer; the
+/// [`NarTransfer::fetch`] path yields [`TransferError`].
 #[derive(Debug)]
 pub enum IrohError {
     /// Binding the iroh endpoint failed (socket/config).
@@ -2652,7 +2671,7 @@ impl std::ops::Deref for IrohClientNode {
 // Client (node A): the Transport impl that fetches by BLAKE3 from a peer.
 // -------------------------------------------------------------------------
 
-/// The real iroh [`Transport`]: fetches through a shared node runtime endpoint.
+/// The real iroh [`NarTransfer`]: fetches through a shared node runtime endpoint.
 /// It holds only a weak endpoint capability and cannot bind, retain or close the
 /// node's socket independently.
 #[derive(Clone)]
@@ -2734,7 +2753,7 @@ impl IrohTransport {
     ///   2. The body is STREAMED leaf-by-leaf (never buffered whole first), with:
     ///      - each stream step bounded by `envelope.body_idle_timeout` (stall guard);
     ///      - a running NarSize CAP: the moment cumulative bytes exceed
-    ///        `expected_size` the stream is dropped and [`TransportError::TooLarge`]
+    ///        `expected_size` the stream is dropped and [`TransferError::TooLarge`]
     ///        returned, so a lying holder claiming a small NarSize but serving a huge
     ///        blob is cut off at ~NarSize, memory bounded (risk 6). The bound is the
     ///        SIGNED NarSize (uncompressed raw NAR) - the exact unit of the streamed
@@ -2821,15 +2840,30 @@ impl IrohTransport {
 }
 
 impl IrohTransport {
-    /// The stack-neutral fetch core shared by the seam [`NarTransfer`] impl and the
-    /// daemon [`Transport`] bridge: resolve `offer` to a dialable address, dial under
-    /// `envelope`, and stream the blob by its exact BLAKE3, gate-1 verified.
+    /// The configured fetch envelope as the seam [`peer_fabric::SafetyEnvelope`]. The
+    /// daemon-side `Transport` bridge (which lives ABOVE this crate, in the daemon,
+    /// since TASK-148 inc 2 moved this module below the seam) has no per-call envelope;
+    /// it fetches with the transport's configured one. This accessor hands it that
+    /// envelope through the seam type so the bridge can call [`NarTransfer::fetch`]
+    /// without naming this module's private [`SafetyEnvelope`] field.
+    pub fn seam_envelope(&self) -> SeamSafetyEnvelope {
+        SeamSafetyEnvelope {
+            dial_timeout: self.envelope.dial_timeout,
+            body_idle_timeout: self.envelope.body_idle_timeout,
+            total_timeout: self.envelope.total_timeout,
+        }
+    }
+
+    /// The stack-neutral fetch core behind the seam [`NarTransfer`] impl: resolve
+    /// `offer` to a dialable address, dial under `envelope`, and stream the blob by its
+    /// exact BLAKE3, gate-1 verified.
     ///
     /// It names ONLY seam types ([`TransportOffer`], [`TransferError`],
-    /// [`SafetyEnvelope`]) - the point of the TASK-148 de-weld: the iroh transfer
-    /// logic no longer reaches into the daemon's claim-wire `KnownTransport` or the
-    /// serving core's `Transport` trait. The `Transport` bridge below converts its
-    /// wire offer and maps the error back, so the existing fetch path is unchanged.
+    /// [`SafetyEnvelope`]) - the point of the TASK-148 de-weld: the iroh transfer logic
+    /// no longer reaches into the daemon's claim-wire `KnownTransport` or the serving
+    /// core's `Transport` trait. The daemon's `Transport` bridge (now in the daemon,
+    /// `transport_iroh_bridge.rs`) converts its wire offer and maps the error back by
+    /// calling [`NarTransfer::fetch`], so the existing daemon fetch path is unchanged.
     async fn fetch_inner(
         &self,
         content: &Blake3Digest,
@@ -2896,10 +2930,11 @@ impl IrohTransport {
 }
 
 /// The seam transfer axis (TASK-148 AC#1): `IrohTransport` IS a
-/// [`peer_fabric::NarTransfer`]. This is the NATIVE impl - the daemon [`Transport`]
-/// bridge below delegates to the same [`IrohTransport::fetch_inner`] core - so the
-/// iroh-blobs whole-NAR fetch is reachable through the stack-neutral seam without
-/// naming a single daemon serving-core type.
+/// [`peer_fabric::NarTransfer`]. This is the NATIVE impl - so the iroh-blobs whole-NAR
+/// fetch is reachable through the stack-neutral seam without naming a single daemon
+/// serving-core type. The daemon-side `Transport` bridge (now in the daemon,
+/// `transport_iroh_bridge.rs`, since this module moved below the seam in TASK-148 inc
+/// 2) delegates to THIS impl via [`NarTransfer::fetch`].
 #[async_trait]
 impl NarTransfer for IrohTransport {
     fn tag(&self) -> TransportTag {
@@ -2925,47 +2960,15 @@ impl NarTransfer for IrohTransport {
     }
 }
 
-/// The daemon-side [`Transport`] bridge (TASK-148 AC#1: "removed OR bridged"). It
-/// converts the daemon claim-wire [`KnownTransport`] offer into the seam
-/// [`TransportOffer`], uses this transport's configured [`SafetyEnvelope`], and maps
-/// the seam [`TransferError`] back to the daemon [`TransportError`]. This keeps the
-/// existing daemon fetch path (`TransportRegistry`/`fetch_via_offers`/
-/// `TransportNarSource`) working unchanged while the transfer LOGIC lives entirely
-/// behind the seam. Retiring this bridge (moving the daemon fetch path onto
-/// `NarTransfer`) is what lets `transport_iroh` move to `fabric-iroh` - TASK-148 AC#3.
-#[async_trait]
-impl Transport for IrohTransport {
-    fn tag(&self) -> TransportTag {
-        TransportTag::Iroh
-    }
-
-    async fn fetch(
-        &self,
-        content: &Blake3Digest,
-        offer: &KnownTransport,
-        expected_size: Option<u64>,
-    ) -> Result<Vec<u8>, TransportError> {
-        self.fetch_inner(content, &offer.to_offer(), expected_size, self.envelope)
-            .await
-            .map_err(transfer_error_to_transport_error)
-    }
-}
-
-/// Map the seam [`TransferError`] to the daemon [`TransportError`]. The two enums are
-/// variant-for-variant identical (same names, fields and `Display`); this is the
-/// mechanical bridge that lets the seam-native fetch core report through the daemon
-/// trait until the daemon fetch path itself adopts `NarTransfer` (TASK-148 AC#3).
-fn transfer_error_to_transport_error(error: TransferError) -> TransportError {
-    match error {
-        TransferError::NotHeld(id) => TransportError::NotHeld(id),
-        TransferError::IntegrityMismatch { expected, actual } => {
-            TransportError::IntegrityMismatch { expected, actual }
-        }
-        TransferError::WrongOffer { expected, got } => TransportError::WrongOffer { expected, got },
-        TransferError::Unavailable(why) => TransportError::Unavailable(why),
-        TransferError::TooLarge { limit, streamed } => TransportError::TooLarge { limit, streamed },
-    }
-}
+// The daemon-side `Transport` bridge (which converts a claim-wire `KnownTransport`
+// into a seam `TransportOffer` and maps `TransferError` -> the daemon's
+// `TransportError`) MOVED to the daemon in TASK-148 inc 2 - it names daemon
+// serving-core types (`crate::transport_fetch::{Transport, TransportError}`,
+// `crate::claim::KnownTransport`) that must NOT be reachable from this crate, so it
+// cannot live here. It now sits in `daemon/src/transport_iroh_bridge.rs` and delegates
+// to the native `NarTransfer` impl above via [`IrohTransport::seam_envelope`] +
+// [`NarTransfer::fetch`]. Retiring that bridge entirely (the daemon fetch path onto a
+// PeerFabric `IrohNarSource`, as libp2p already does) is TASK-144.
 
 // -------------------------------------------------------------------------
 // Shared endpoint construction and address conversion.

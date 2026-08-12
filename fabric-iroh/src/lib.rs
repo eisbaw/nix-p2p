@@ -26,14 +26,25 @@
 //!     acyclic. It should migrate to a shared util / `daemon-core` when the
 //!     frontend is split - see TASK-145).
 //!
-//! ## What is NOT here yet (TASK-144 increment 2)
+//! ## The iroh-blobs NAR transfer/serve (TASK-148 increment 2)
 //!
-//! The iroh-blobs NAR transfer/serve (`transport_iroh`) and the `IROH_BLOBS_ALPN`
-//! constant are still in the daemon: `transport_iroh` is welded to the serving
-//! core (`claim`/`transport_fetch`/`source`/`discovery`) and must be rewired onto
-//! `peer_fabric::{NarTransfer, NarServer}` before it can move without dragging the
-//! serving core along. The concrete `IrohFabric: PeerFabric` composition also
-//! lands in increment 2.
+//! [`transport_iroh`] - the iroh-blobs whole-NAR transfer + provider serve - now
+//! lives here too. It was the last iroh module welded to the daemon serving core;
+//! TASK-148/150 rewired it onto `peer_fabric::{NarTransfer, NarServer}` (with a real
+//! [`ServeHandle`](peer_fabric::ServeHandle) whose drop tears the serve driver down),
+//! severed its edges to `claim`/`transport_fetch`/`source`/`discovery`/`supply_catalog`
+//! (the last via the CatalogProbe seam), and moved it below the seam. The iroh-specific
+//! [`IROH_BLOBS_ALPN`] constant and its compile-time `iroh_blobs::ALPN` equality
+//! assertion moved with it. The daemon keeps a thin `Transport`-trait BRIDGE onto this
+//! module's native [`NarTransfer`](peer_fabric::NarTransfer) impl
+//! (`daemon/src/transport_iroh_bridge.rs`), so the daemon fetch path is unchanged;
+//! retiring that bridge for a PeerFabric `IrohNarSource` (as libp2p already does) is
+//! TASK-144.
+//!
+//! ## What is NOT here yet
+//!
+//! The concrete `IrohFabric: PeerFabric` composition (wiring these axes into an
+//! `Option<Arc<dyn Capability>>` struct) lands in TASK-144.
 
 pub mod iroh_node_lookup;
 pub mod iroh_node_record;
@@ -43,3 +54,9 @@ pub mod iroh_relay;
 pub mod iroh_runtime;
 pub mod pinned_http;
 pub mod process_group;
+pub mod transport_iroh;
+
+// The frozen iroh-blobs ALPN + its compile-time `iroh_blobs::ALPN` cross-check live
+// in `transport_iroh` (co-located with the iroh-blobs get-protocol that uses them);
+// re-exported here so the daemon can name `fabric_iroh::IROH_BLOBS_ALPN` (TASK-148).
+pub use transport_iroh::IROH_BLOBS_ALPN;

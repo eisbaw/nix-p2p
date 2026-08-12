@@ -52,8 +52,11 @@ const SOURCES: &[(&str, &str)] = &[
         include_str!("../src/transport_fetch.rs"),
     ),
     (
+        // MOVED below the seam into fabric-iroh (TASK-148 inc 2); cited by relative
+        // path so this daemon citation-integrity gate still scans its comments and
+        // supplies its `fn`/`const` definitions to the resolver.
         "transport_iroh.rs",
-        include_str!("../src/transport_iroh.rs"),
+        include_str!("../../fabric-iroh/src/transport_iroh.rs"),
     ),
     ("upstream.rs", include_str!("../src/upstream.rs")),
 ];

@@ -113,7 +113,7 @@ IMPLEMENTATION_PATHS = (
     "daemon/src/lib.rs",
     "daemon/src/main.rs",
     "fabric-iroh/src/pinned_http.rs",
-    "daemon/src/transport_iroh.rs",
+    "fabric-iroh/src/transport_iroh.rs",
     "daemon/tests/iroh_node_lookup.rs",
     "daemon/tests/iroh_runtime.rs",
     "daemon/tests/no_direct_upstream.rs",

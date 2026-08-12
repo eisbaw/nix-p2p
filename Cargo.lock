@@ -1245,8 +1245,11 @@ dependencies = [
 name = "fabric-iroh"
 version = "0.0.1"
 dependencies = [
+ "async-trait",
+ "bao-tree",
  "blake3",
  "iroh",
+ "iroh-blobs",
  "iroh-dns",
  "n0-future",
  "peer-fabric",

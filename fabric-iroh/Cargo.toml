@@ -24,6 +24,18 @@ path = "src/lib.rs"
 # `crate::transport::NodeId` re-export; here they name `peer_fabric::NodeId`
 # directly, which severs the last daemon-ward edge from the cluster.
 peer-fabric = { path = "../peer-fabric" }
+# TASK-148 increment 2: the iroh-blobs NAR transfer/serve (transport_iroh) now
+# lives here behind peer_fabric::{NarTransfer, NarServer}. iroh-blobs speaks
+# plain-unkeyed BLAKE3 (bao) so the addressed unit IS the blob hash of the raw
+# NAR; `bao-tree` names the leaf item the get-stream yields. Both are already in
+# the daemon's locked closure (transitive under iroh-blobs), so this adds no new
+# source to the lockfile. The `IROH_BLOBS_ALPN` const + its compile-time
+# `iroh_blobs::ALPN` equality assertion moved here with the module (AC#4).
+iroh-blobs = "0.103"
+bao-tree = "0.16"
+# The seam impls (NarTransfer/NarServer) and the daemon Transport bridge that
+# used to sit inline here are `#[async_trait]`; the trait methods are async.
+async-trait = "0.1"
 # iroh (task-39/115/137/138): the node runtime (Endpoint/SecretKey), the pkarr
 # address discovery (address_lookup) and the signed node-record publication all
 # speak iroh directly - that is exactly the weld this crate isolates from the

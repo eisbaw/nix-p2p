@@ -88,8 +88,11 @@ const SOURCES: &[(&str, &str)] = &[
     // the enumeration API its own docs anticipate (task-50) would have landed
     // exactly here, outside the guard.
     (
+        // MOVED below the seam into fabric-iroh (TASK-148 inc 2); cited by relative
+        // path so this no-enumeration guard still scans the module that accepts peer
+        // connections.
         "transport_iroh.rs",
-        include_str!("../src/transport_iroh.rs"),
+        include_str!("../../fabric-iroh/src/transport_iroh.rs"),
     ),
 ];
 

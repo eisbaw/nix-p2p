@@ -751,7 +751,7 @@ async fn shutdown_deadline_forces_abort_and_still_releases_fixed_port() {
 #[test]
 fn provider_boundary_has_no_generic_blocking_or_endpoint_callback_escape() {
     let runtime = include_str!("../../fabric-iroh/src/iroh_runtime.rs");
-    let transport = include_str!("../src/transport_iroh.rs");
+    let transport = include_str!("../../fabric-iroh/src/transport_iroh.rs");
     assert!(!runtime.contains("execute_blocking"));
     assert!(!runtime.contains("BlockingCancellation"));
     assert!(!runtime.contains("endpoint_operation"));
@@ -1636,7 +1636,10 @@ fn benchmark_endpoint_construction_cannot_bypass_the_shared_runtime_constructor(
 
     let consumers = [
         ("benchmark", include_str!("../examples/iroh_throughput.rs")),
-        ("transport", include_str!("../src/transport_iroh.rs")),
+        (
+            "transport",
+            include_str!("../../fabric-iroh/src/transport_iroh.rs"),
+        ),
         ("daemon", include_str!("../src/main.rs")),
         ("safety test", include_str!("iroh_safety_envelope.rs")),
     ];

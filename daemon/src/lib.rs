@@ -39,9 +39,13 @@ pub mod rewrite;
 // (which name `iroh_runtime::{...}` etc.) - keep resolving unchanged. The only
 // cross edge is daemon -> fabric-iroh; `transport_iroh` (the iroh-blobs transfer,
 // still welded to the serving core) stays in this crate until increment 2.
+// TASK-148 inc 2: `transport_iroh` (the iroh-blobs NAR transfer/serve) also MOVED
+// below the seam into `fabric-iroh` and is re-exported here, so every
+// `crate::transport_iroh::...` path and the flat `daemon::Foo` re-exports below keep
+// resolving unchanged. The only cross edge is daemon -> fabric-iroh.
 pub use fabric_iroh::{
     iroh_node_lookup, iroh_node_record, iroh_publication, iroh_publication_authority, iroh_relay,
-    iroh_runtime, pinned_http, process_group,
+    iroh_runtime, pinned_http, process_group, transport_iroh,
 };
 pub mod server;
 pub mod source;
@@ -49,7 +53,10 @@ pub mod source_libp2p;
 mod supply_catalog;
 pub mod transport;
 pub mod transport_fetch;
-pub mod transport_iroh;
+// The daemon-side `Transport`-trait bridge over `fabric_iroh::IrohTransport`'s native
+// `peer_fabric::NarTransfer` (TASK-148 inc 2). Private: it exports no items, only the
+// trait impl that keeps the daemon fetch path (TransportRegistry) driving iroh.
+mod transport_iroh_bridge;
 pub mod upstream;
 
 pub use availability::{

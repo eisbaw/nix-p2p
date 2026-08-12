@@ -62,16 +62,19 @@ pub use peer_fabric::{
 /// iroh-blobs ALPN"), so a nix-p2p node speaks the same get-protocol as any
 /// iroh-blobs node and gets BLAKE3-verified streaming for free.
 ///
-/// FREEZE-RISK NOTE, stated honestly: `transport_iroh` adds a compile/test
-/// assertion that `IROH_BLOBS_ALPN == iroh_blobs::ALPN` (the pinned version's
-/// equivalent). Unlike the hash recipe, a wrong ALPN fails LOUDLY and early (peers
-/// simply fail to connect at S6 interop, no bytes are corrupted and no held blob is
-/// invalidated), so it is reconcilable at S6 - which is the design intent: S6
-/// CONFIRMS, and an ALPN mismatch is the one freeze surface S6 can still safely
-/// realign because no data is addressed by it. This constant is iroh-specific, so
-/// TASK-141 increment 2 moves it into the `fabric-iroh` backend crate; it stays
-/// here for now so the transport modules that reference it are untouched.
-pub const IROH_BLOBS_ALPN: &[u8] = b"/iroh-bytes/4";
+/// MOVED (TASK-148 increment 2): this iroh-specific constant now LIVES in the
+/// `fabric-iroh` backend crate (co-located with the iroh-blobs get-protocol that uses
+/// it and the compile-time `IROH_BLOBS_ALPN == iroh_blobs::ALPN` assertion, which needs
+/// the iroh-blobs dependency that landed there). TASK-141 increment 1 deliberately left
+/// it here until then; it is now re-exported so every daemon use-site
+/// (`crate::transport::IROH_BLOBS_ALPN`, `daemon::IROH_BLOBS_ALPN`) is untouched.
+///
+/// FREEZE-RISK NOTE, stated honestly: a wrong ALPN fails LOUDLY and early (peers simply
+/// fail to connect at S6 interop, no bytes are corrupted and no held blob is
+/// invalidated), so it is reconcilable at S6 - which is the design intent: S6 CONFIRMS,
+/// and an ALPN mismatch is the one freeze surface S6 can still safely realign because no
+/// data is addressed by it.
+pub use fabric_iroh::IROH_BLOBS_ALPN;
 
 #[cfg(test)]
 mod tests {

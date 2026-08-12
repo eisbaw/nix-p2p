@@ -71,7 +71,7 @@ WHAT IS MEASURED, precisely (this instrument's counting rule):
     e2e image - an in-container probe returns rc=127 and passes unconditionally,
     which is the dead-oracle trap this repo has shipped three times.
     FINDING, not an omission: the iroh blob store is `MemStore`
-    (`daemon/src/transport_iroh.rs`), so held content costs RAM, not disk. The
+    (`fabric-iroh/src/transport_iroh.rs`), so held content costs RAM, not disk. The
     on-disk figure is therefore small and the RAM figure carries the content -
     see `disk_finding` in the report. (TASK-54 owns bounding the footprint.)
   * LATENCY: the IN-CONTAINER `nix-store --realise` duration (REALISE_NS). The
@@ -2345,7 +2345,7 @@ DISK_FINDING = {
     ),
     "blob_store_is_in_ram": (
         "FINDING, not an omission: the iroh blob store is `MemStore` "
-        "(daemon/src/transport_iroh.rs `IrohProvider::spawn`), so a holder's "
+        "(fabric-iroh/src/transport_iroh.rs `IrohProvider::spawn`), so a holder's "
         "content costs RESIDENT MEMORY, not disk. There is no castore/on-disk "
         "blob store to measure in wave-2a. Read the per-peer RSS figure as the "
         "cost of held content, and the on-disk figure as metadata only."
