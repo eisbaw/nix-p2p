@@ -55,7 +55,7 @@ use std::io::{Read, Write};
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
@@ -87,7 +87,9 @@ use crate::iroh_runtime::{
 use crate::transport::{IROH_BLOBS_ALPN, NodeId};
 use crate::transport_fetch::{Transport, TransportError};
 use peer_fabric::{
-    NarTransfer, SafetyEnvelope as SeamSafetyEnvelope, TransferError, TransportOffer, TransportTag,
+    NarServer, NarTransfer, SafetyEnvelope as SeamSafetyEnvelope, ServeBudget as SeamServeBudget,
+    ServeError as SeamServeError, ServeHandle as SeamServeHandle, TransferError, TransportOffer,
+    TransportTag,
 };
 
 // -------------------------------------------------------------------------
@@ -781,6 +783,17 @@ impl Default for ServeBudget {
 }
 
 impl ServeBudget {
+    /// Build the local budget from the seam's [`peer_fabric::ServeBudget`], which
+    /// mirrors it field-for-field (TASK-150 AC#2: the serve axis receives its bound
+    /// through `peer_fabric::NarServer::serve` - policy above the seam).
+    fn from_seam(budget: &SeamServeBudget) -> Self {
+        ServeBudget {
+            max_nar_bytes_uncompressed_nar: budget.max_nar_bytes_uncompressed_nar,
+            max_inflight_bytes_uncompressed_nar: budget.max_inflight_bytes_uncompressed_nar,
+            max_serve_duration: budget.max_serve_duration,
+        }
+    }
+
     /// The PRE-task-72 behaviour: serve whatever is asked, allocate whatever that
     /// costs. It exists so the bound can be proven by MUTATION - a test removes
     /// the bound with this and shows the allocation come back - and for no other
@@ -950,7 +963,14 @@ struct SweepPolicy {
 
 /// The admission gate: the budget, what can be regenerated, and what is in flight.
 struct ServeGate {
-    budget: ServeBudget,
+    /// Installed exactly once BEFORE the serve driver starts - at provider
+    /// preparation for the auto-serve path, or at [`IrohProvider::serve`] time for
+    /// the deferred `peer_fabric::NarServer` path, where the bound arrives through
+    /// the seam (TASK-150 AC#2). Read only inside the driver/admission, which run
+    /// strictly after the install (connections are refused via `require_ready` until
+    /// the driver is up), so a lock-free `OnceLock` suffices and "budget before any
+    /// request is admitted" is structural, not hoped-for.
+    budget: OnceLock<ServeBudget>,
     supplier: Option<Arc<dyn NarSupplier>>,
     supervisor: TaskSupervisorHandle,
     /// The SINGLE SOURCE OF TRUTH for "what is this node currently on the hook
@@ -973,6 +993,17 @@ struct ServeGate {
 }
 
 impl ServeGate {
+    /// The installed serve budget. Panics only if a request is admitted before the
+    /// budget was installed - unreachable, since the event driver (the sole path to
+    /// [`admit`]) is spawned strictly after the install and connections are refused
+    /// via `require_ready` until then.
+    fn budget(&self) -> ServeBudget {
+        *self
+            .budget
+            .get()
+            .expect("serve budget is installed before the serve driver admits any request")
+    }
+
     fn counters(&self) -> ServeCounters {
         ServeCounters {
             admitted: self.admitted.load(Ordering::Relaxed),
@@ -1036,7 +1067,8 @@ impl ServeGate {
         size: u64,
         must_regenerate: bool,
     ) -> Result<Reservation, ServeDecline> {
-        if size > self.budget.max_nar_bytes_uncompressed_nar {
+        let budget = self.budget();
+        if size > budget.max_nar_bytes_uncompressed_nar {
             return Err(ServeDecline::TooLarge);
         }
         let mut inflight = self.inflight.lock().expect("inflight mutex");
@@ -1051,7 +1083,7 @@ impl ServeGate {
             .values()
             .map(|e| e.bytes_uncompressed_nar)
             .sum::<u64>();
-        if held.saturating_add(size) > self.budget.max_inflight_bytes_uncompressed_nar {
+        if held.saturating_add(size) > budget.max_inflight_bytes_uncompressed_nar {
             return Err(ServeDecline::Busy);
         }
         // A resident blob is published READY at insert time: there is nothing to
@@ -1567,6 +1599,15 @@ pub struct IrohProvider {
     /// client). Paired with [`Self::bytes_served`] so a nonzero byte count is
     /// attributable to real transfers, not a spurious event.
     transfers_completed: Arc<AtomicU64>,
+    /// The not-yet-started serve driver, present ONLY when the node was built for the
+    /// deferred `peer_fabric::NarServer` path ([`IrohNodeBuilder::defer_serve`]).
+    /// `None` for the auto-serve path, whose driver the builder already started on
+    /// the node runtime supervisor. [`IrohProvider::serve`] consumes it to start an
+    /// INDEPENDENTLY-abortable driver owned by the returned [`ServeHandle`], which is
+    /// how the serve axis is de-welded from the shared runtime lifecycle (TASK-150
+    /// AC#2). Behind a `Mutex<Option<..>>` so `serve` (which takes `&self`) can take
+    /// it exactly once.
+    serve_tasks: Mutex<Option<Arc<ProviderEventTasks>>>,
 }
 
 /// Provider-side store, admission and retention inputs. Endpoint identity and
@@ -1634,10 +1675,16 @@ impl PreparedProvider {
     fn prepare(
         config: IrohProviderConfig,
         supervisor: TaskSupervisorHandle,
+        install_budget: bool,
     ) -> Result<Self, IrohError> {
         let retention = config.retention;
+        let config_budget = config.budget;
         let gate = Arc::new(ServeGate {
-            budget: config.budget,
+            // Installed now for the auto-serve path; left empty for the deferred
+            // `peer_fabric::NarServer` path, where `IrohProvider::serve` installs the
+            // bound that came through the seam (TASK-150 AC#2). Either way it is set
+            // before the driver admits a request.
+            budget: OnceLock::new(),
             supplier: config.supplier,
             supervisor: supervisor.clone(),
             inflight: Mutex::new(HashMap::new()),
@@ -1661,6 +1708,9 @@ impl PreparedProvider {
             declined_store_unreadable: AtomicU64::new(0),
             timed_out: AtomicU64::new(0),
         });
+        if install_budget {
+            let _ = gate.budget.set(config_budget);
+        }
 
         let store = match retention {
             StoreRetention::RetainAll => MemStore::new(),
@@ -1720,7 +1770,11 @@ impl PreparedProvider {
         })
     }
 
-    fn attach(self, endpoint: IrohEndpointHandle) -> IrohProvider {
+    fn attach(
+        self,
+        endpoint: IrohEndpointHandle,
+        serve_tasks: Option<Arc<ProviderEventTasks>>,
+    ) -> IrohProvider {
         IrohProvider {
             endpoint,
             lifecycle: Arc::clone(&self.protocol.tasks.lifecycle),
@@ -1729,6 +1783,7 @@ impl PreparedProvider {
             gate: self.gate,
             bytes_served: self.bytes_served,
             transfers_completed: self.transfers_completed,
+            serve_tasks: Mutex::new(serve_tasks),
         }
     }
 }
@@ -1796,131 +1851,23 @@ impl ProviderEventTasks {
         }
     }
 
-    async fn start(&self, supervisor: TaskSupervisorHandle) -> Result<(), IrohError> {
-        let Some(mut driver) = self
-            .driver
+    /// Take the one-shot driver out for starting, or fail if already started.
+    fn take_driver(&self) -> Result<ProviderEventDriver, IrohError> {
+        self.driver
             .lock()
             .map_err(|_| IrohError::Runtime("provider event-driver mutex poisoned".into()))?
             .take()
-        else {
-            return Err(IrohError::Runtime(
-                "provider event driver was already started".into(),
-            ));
-        };
-        let request_supervisor = supervisor.clone();
-        let lifecycle = Arc::clone(&self.lifecycle);
-        let lifecycle_for_task = Arc::clone(&lifecycle);
-        let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
-        if let Err(error) = supervisor.spawn("iroh-provider-events", async move {
-            struct MarkStopped(Arc<AtomicU8>);
-            impl Drop for MarkStopped {
-                fn drop(&mut self) {
-                    self.0.store(PROVIDER_STOPPED, Ordering::Release);
-                }
-            }
-            let _stopped = MarkStopped(Arc::clone(&lifecycle_for_task));
-            // This statement runs on the driver's first poll. The builder awaits
-            // its acknowledgement before returning a usable node.
-            lifecycle_for_task.store(PROVIDER_READY, Ordering::Release);
-            let _ = ready_tx.send(());
-            while let Some(message) = driver.rx.recv().await {
-                let ProviderMessage::GetRequestReceived(message) = message else {
-                    continue;
-                };
-                let request_hash = message.request.hash;
-                let bytes_served = driver.bytes_served.clone();
-                let transfers_completed = driver.transfers_completed.clone();
-                let serve_windows = driver.serve_windows.clone();
-                let gate = driver.gate.clone();
-                let gate_for_registration = driver.gate.clone();
-                let store = driver.store.clone();
-                let serve_origin = driver.serve_origin;
-                if let Err(error) = request_supervisor.spawn("iroh-provider-request", async move {
-                    let hash = request_hash;
-                    let serve_deadline = gate.budget.max_serve_duration;
-                    let request = async {
-                        let mut updates = message.rx;
-                        let verdict = admit(&gate, &store, hash).await;
-                        let (admission, answer) = match verdict {
-                            Ok(admission) => (Some(admission), Ok(())),
-                            Err(declined) => {
-                                gate.count_decline(declined.reason);
-                                eprintln!(
-                                    "IROH-SERVE-DECLINED reason={} hash={hash} why={}",
-                                    declined.reason.reason(),
-                                    declined.why
-                                );
-                                (None, Err(declined.reason.abort_reason()))
-                            }
-                        };
-                        let answered = message.tx.send(answer).await;
-                        let Some(_admission) = admission else {
-                            return;
-                        };
-                        if answered.is_err() {
-                            return;
-                        }
+            .ok_or_else(|| IrohError::Runtime("provider event driver was already started".into()))
+    }
 
-                        let mut blob_size: u64 = 0;
-                        let mut started_ms: Option<f64> = None;
-                        while let Ok(Some(update)) = updates.recv().await {
-                            match update {
-                                RequestUpdate::Started(started) => {
-                                    blob_size = started.size;
-                                    started_ms =
-                                        Some(serve_origin.elapsed().as_secs_f64() * 1000.0);
-                                }
-                                RequestUpdate::Completed(_) => {
-                                    bytes_served.fetch_add(blob_size, Ordering::Relaxed);
-                                    transfers_completed.fetch_add(1, Ordering::Relaxed);
-                                    if let Some(start_ms) = started_ms.take() {
-                                        serve_windows
-                                            .lock()
-                                            .expect("serve windows mutex")
-                                            .push(ServeWindow {
-                                                start_ms,
-                                                end_ms: serve_origin.elapsed().as_secs_f64()
-                                                    * 1000.0,
-                                                bytes_uncompressed_nar: blob_size,
-                                            });
-                                    }
-                                }
-                                _ => {}
-                            }
-                        }
-                    };
-                    if tokio::time::timeout(serve_deadline, request).await.is_err() {
-                        gate.timed_out.fetch_add(1, Ordering::Relaxed);
-                        eprintln!(
-                            "IROH-SERVE-TIMEOUT hash={hash} after={serve_deadline:?} - the reservation is reclaimed and the transfer will fail"
-                        );
-                    }
-                }) {
-                    if error.is_capacity_exhausted() {
-                        // `spawn` owns and drops the rejected future, including
-                        // the response channel in `message`. The requesting
-                        // peer therefore observes an immediate failed request
-                        // rather than waiting for a provider reply that can no
-                        // longer be supervised. Capacity is transient: keep
-                        // the event driver alive so later requests can recover.
-                        gate_for_registration
-                            .declined_busy
-                            .fetch_add(1, Ordering::Relaxed);
-                        eprintln!(
-                            "IROH-SERVE-DECLINED reason=busy hash={request_hash} why={error}"
-                        );
-                        continue;
-                    }
-                    eprintln!("IROH-SERVE-TASK-REGISTRATION-FAILED error={error}");
-                    break;
-                }
-            }
-        }) {
-            lifecycle.store(PROVIDER_STOPPED, Ordering::Release);
-            return Err(error.into());
-        }
+    /// Wait for the driver's first-poll acknowledgement and confirm it entered the
+    /// ready state, so a returned handle/node genuinely means "serving".
+    async fn await_ready(
+        &self,
+        ready_rx: tokio::sync::oneshot::Receiver<()>,
+    ) -> Result<(), IrohError> {
         ready_rx.await.map_err(|_| {
-            lifecycle.store(PROVIDER_STOPPED, Ordering::Release);
+            self.lifecycle.store(PROVIDER_STOPPED, Ordering::Release);
             IrohError::Runtime(
                 "provider event driver stopped before acknowledging its first poll".into(),
             )
@@ -1933,8 +1880,167 @@ impl ProviderEventTasks {
         Ok(())
     }
 
+    /// AUTO-SERVE start: the driver is owned by the node runtime supervisor and torn
+    /// down with the node (the pre-TASK-150 behaviour, unchanged).
+    async fn start(&self, supervisor: TaskSupervisorHandle) -> Result<(), IrohError> {
+        let driver = self.take_driver()?;
+        let lifecycle_for_task = Arc::clone(&self.lifecycle);
+        let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+        let request_supervisor = supervisor.clone();
+        if let Err(error) = supervisor.spawn(
+            "iroh-provider-events",
+            run_provider_event_driver(driver, request_supervisor, lifecycle_for_task, ready_tx),
+        ) {
+            self.lifecycle.store(PROVIDER_STOPPED, Ordering::Release);
+            return Err(error.into());
+        }
+        self.await_ready(ready_rx).await
+    }
+
+    /// DEFERRED-SERVE start (TASK-150 AC#2): the driver runs on an INDEPENDENT tokio
+    /// task whose abort handle the caller owns, so dropping the returned
+    /// [`SeamServeHandle`] tears down JUST the serve loop - de-welding the serve axis
+    /// from the shared node runtime lifecycle. Request sub-tasks still spawn on
+    /// `request_supervisor` (the node runtime supervisor), so cancellation-safe
+    /// process-group execution (`TaskSupervisor::execute_process`) and node-shutdown
+    /// reaping are preserved.
+    async fn start_abortable(
+        &self,
+        request_supervisor: TaskSupervisorHandle,
+    ) -> Result<tokio::task::JoinHandle<()>, IrohError> {
+        let driver = self.take_driver()?;
+        let lifecycle_for_task = Arc::clone(&self.lifecycle);
+        let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+        let join = tokio::spawn(run_provider_event_driver(
+            driver,
+            request_supervisor,
+            lifecycle_for_task,
+            ready_tx,
+        ));
+        match self.await_ready(ready_rx).await {
+            Ok(()) => Ok(join),
+            Err(error) => {
+                join.abort();
+                Err(error)
+            }
+        }
+    }
+
     fn stop(&self) {
         self.lifecycle.store(PROVIDER_STOPPED, Ordering::Release);
+    }
+}
+
+/// The provider event-driver loop, shared by [`ProviderEventTasks::start`] (owned by
+/// the node runtime supervisor) and [`ProviderEventTasks::start_abortable`] (owned by
+/// a caller-held abort handle - TASK-150 AC#2). It marks the lifecycle READY on its
+/// first poll, acknowledges via `ready_tx`, then dispatches each get-request onto
+/// `request_supervisor` (the node runtime supervisor), so the cancellation-safe
+/// process-group execution and node-shutdown reaping are identical on both paths.
+/// Dropping/aborting this task runs the `MarkStopped` guard, moving the lifecycle to
+/// STOPPED so `require_ready` refuses further connections.
+async fn run_provider_event_driver(
+    mut driver: ProviderEventDriver,
+    request_supervisor: TaskSupervisorHandle,
+    lifecycle_for_task: Arc<AtomicU8>,
+    ready_tx: tokio::sync::oneshot::Sender<()>,
+) {
+    struct MarkStopped(Arc<AtomicU8>);
+    impl Drop for MarkStopped {
+        fn drop(&mut self) {
+            self.0.store(PROVIDER_STOPPED, Ordering::Release);
+        }
+    }
+    let _stopped = MarkStopped(Arc::clone(&lifecycle_for_task));
+    // This statement runs on the driver's first poll. The starter awaits its
+    // acknowledgement before returning a usable node/handle.
+    lifecycle_for_task.store(PROVIDER_READY, Ordering::Release);
+    let _ = ready_tx.send(());
+    while let Some(message) = driver.rx.recv().await {
+        let ProviderMessage::GetRequestReceived(message) = message else {
+            continue;
+        };
+        let request_hash = message.request.hash;
+        let bytes_served = driver.bytes_served.clone();
+        let transfers_completed = driver.transfers_completed.clone();
+        let serve_windows = driver.serve_windows.clone();
+        let gate = driver.gate.clone();
+        let gate_for_registration = driver.gate.clone();
+        let store = driver.store.clone();
+        let serve_origin = driver.serve_origin;
+        if let Err(error) = request_supervisor.spawn("iroh-provider-request", async move {
+            let hash = request_hash;
+            let serve_deadline = gate.budget().max_serve_duration;
+            let request = async {
+                let mut updates = message.rx;
+                let verdict = admit(&gate, &store, hash).await;
+                let (admission, answer) = match verdict {
+                    Ok(admission) => (Some(admission), Ok(())),
+                    Err(declined) => {
+                        gate.count_decline(declined.reason);
+                        eprintln!(
+                            "IROH-SERVE-DECLINED reason={} hash={hash} why={}",
+                            declined.reason.reason(),
+                            declined.why
+                        );
+                        (None, Err(declined.reason.abort_reason()))
+                    }
+                };
+                let answered = message.tx.send(answer).await;
+                let Some(_admission) = admission else {
+                    return;
+                };
+                if answered.is_err() {
+                    return;
+                }
+
+                let mut blob_size: u64 = 0;
+                let mut started_ms: Option<f64> = None;
+                while let Ok(Some(update)) = updates.recv().await {
+                    match update {
+                        RequestUpdate::Started(started) => {
+                            blob_size = started.size;
+                            started_ms = Some(serve_origin.elapsed().as_secs_f64() * 1000.0);
+                        }
+                        RequestUpdate::Completed(_) => {
+                            bytes_served.fetch_add(blob_size, Ordering::Relaxed);
+                            transfers_completed.fetch_add(1, Ordering::Relaxed);
+                            if let Some(start_ms) = started_ms.take() {
+                                serve_windows.lock().expect("serve windows mutex").push(
+                                    ServeWindow {
+                                        start_ms,
+                                        end_ms: serve_origin.elapsed().as_secs_f64() * 1000.0,
+                                        bytes_uncompressed_nar: blob_size,
+                                    },
+                                );
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            };
+            if tokio::time::timeout(serve_deadline, request).await.is_err() {
+                gate.timed_out.fetch_add(1, Ordering::Relaxed);
+                eprintln!(
+                    "IROH-SERVE-TIMEOUT hash={hash} after={serve_deadline:?} - the reservation is reclaimed and the transfer will fail"
+                );
+            }
+        }) {
+            if error.is_capacity_exhausted() {
+                // `spawn` owns and drops the rejected future, including the response
+                // channel in `message`. The requesting peer therefore observes an
+                // immediate failed request rather than waiting for a provider reply
+                // that can no longer be supervised. Capacity is transient: keep the
+                // event driver alive so later requests can recover.
+                gate_for_registration
+                    .declined_busy
+                    .fetch_add(1, Ordering::Relaxed);
+                eprintln!("IROH-SERVE-DECLINED reason=busy hash={request_hash} why={error}");
+                continue;
+            }
+            eprintln!("IROH-SERVE-TASK-REGISTRATION-FAILED error={error}");
+            break;
+        }
     }
 }
 
@@ -2135,6 +2241,70 @@ impl IrohProvider {
             .map(IrohPeerAddr)
             .map_err(Into::into)
     }
+
+    /// TASK-150 AC#2: start this provider's serve session on the ALREADY-RUNNING node
+    /// runtime, bounded by `budget`, returning a [`SeamServeHandle`] whose `Drop`
+    /// aborts the serve driver task (the de-welded serve axis). Only a provider built
+    /// via [`IrohNodeBuilder::defer_serve`] can serve this way; the auto-serve
+    /// constructors already started their driver on the runtime supervisor and return
+    /// [`SeamServeError::Backend`] here.
+    ///
+    /// The budget is installed into the admission gate BEFORE the driver starts, so
+    /// the task-72 declared-size-before-production bound holds from the first request.
+    async fn serve_session(&self, budget: ServeBudget) -> Result<SeamServeHandle, SeamServeError> {
+        let tasks = self
+            .serve_tasks
+            .lock()
+            .expect("serve-tasks mutex")
+            .take()
+            .ok_or_else(|| {
+                SeamServeError::Backend(
+                    "provider was not built for deferred serve, or is already serving \
+                     (use IrohNodeBuilder::defer_serve)"
+                        .into(),
+                )
+            })?;
+        // Install the seam-provided bound before the driver can admit anything.
+        self.gate
+            .budget
+            .set(budget)
+            .map_err(|_| SeamServeError::Backend("serve budget was already installed".into()))?;
+        let label = match self.node_id() {
+            Ok(node) => format!("iroh-nar-serve {node}"),
+            Err(_) => "iroh-nar-serve".to_string(),
+        };
+        let join = tasks
+            .start_abortable(self.gate.supervisor.clone())
+            .await
+            .map_err(|error| SeamServeError::Backend(error.to_string()))?;
+        Ok(SeamServeHandle::with_teardown(
+            label,
+            Box::new(AbortOnDrop(join)),
+        ))
+    }
+}
+
+/// The teardown guard behind a deferred serve [`SeamServeHandle`]: dropping it aborts
+/// the independently-owned serve driver task (TASK-150 AC#2). Aborting runs the
+/// driver's `MarkStopped` guard, moving the provider lifecycle to STOPPED so
+/// `require_ready` refuses further connections.
+struct AbortOnDrop(tokio::task::JoinHandle<()>);
+
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
+/// The serve axis (TASK-150 AC#2): [`IrohProvider`] IS a [`peer_fabric::NarServer`].
+/// The supply source is bound at construction (the sealed plan-based [`NarSupplier`]
+/// in the provider's gate), so `serve` takes only the seam budget - see the seam ADR
+/// in `peer-fabric`. Dropping the returned handle aborts the serve driver.
+#[async_trait]
+impl NarServer for IrohProvider {
+    async fn serve(&self, budget: SeamServeBudget) -> Result<SeamServeHandle, SeamServeError> {
+        self.serve_session(ServeBudget::from_seam(&budget)).await
+    }
 }
 
 // -------------------------------------------------------------------------
@@ -2146,6 +2316,11 @@ pub struct IrohNodeBuilder {
     runtime: IrohRuntimeBuilder,
     provider: Option<IrohProviderConfig>,
     envelope: SafetyEnvelope,
+    /// When true, `spawn` registers the provider handler but does NOT start its serve
+    /// driver; the caller starts it later via `peer_fabric::NarServer::serve` on the
+    /// running provider, owning the returned abortable [`SeamServeHandle`] (TASK-150
+    /// AC#2). Default false: the driver auto-starts on the node runtime supervisor.
+    defer_serve: bool,
 }
 
 impl IrohNodeBuilder {
@@ -2159,6 +2334,7 @@ impl IrohNodeBuilder {
             runtime: IrohRuntimeBuilder::new(profile, identity, relay, address_lookup)?,
             provider: None,
             envelope: SafetyEnvelope::default(),
+            defer_serve: false,
         })
     }
 
@@ -2174,6 +2350,15 @@ impl IrohNodeBuilder {
 
     pub fn provider(mut self, provider: IrohProviderConfig) -> Self {
         self.provider = Some(provider);
+        self
+    }
+
+    /// Register the provider but DEFER starting its serve driver, so it is started
+    /// later through `peer_fabric::NarServer::serve` and torn down by the returned
+    /// abortable handle (TASK-150 AC#2). The serve budget then comes through the seam
+    /// at serve time rather than from the provider config. Requires a `provider`.
+    pub fn defer_serve(mut self) -> Self {
+        self.defer_serve = true;
         self
     }
 
@@ -2217,10 +2402,14 @@ impl IrohNodeBuilder {
 
     pub async fn spawn(mut self) -> Result<IrohNode, IrohError> {
         let supervisor = self.runtime.task_supervisor_handle();
+        let defer_serve = self.defer_serve;
+        // The provider config carries a budget; install it into the gate at prepare
+        // time ONLY for the auto-serve path. The deferred path installs the seam
+        // budget in `NarServer::serve` instead.
         let prepared = self
             .provider
             .take()
-            .map(|provider| PreparedProvider::prepare(provider, supervisor))
+            .map(|provider| PreparedProvider::prepare(provider, supervisor, !defer_serve))
             .transpose()?;
         if let Some(provider) = &prepared {
             self.runtime = self
@@ -2228,7 +2417,11 @@ impl IrohNodeBuilder {
                 .accept(iroh_blobs::ALPN, provider.protocol.clone())?;
         }
         let runtime = self.runtime.spawn().await?;
-        if let Some(provider) = &prepared
+        // Auto-serve path: start the driver on the node runtime supervisor now. The
+        // deferred path leaves it unstarted (the handler refuses connections via
+        // `require_ready` until `NarServer::serve` starts it).
+        if !defer_serve
+            && let Some(provider) = &prepared
             && let Err(error) = provider
                 .protocol
                 .start(runtime.task_supervisor_handle())
@@ -2240,7 +2433,13 @@ impl IrohNodeBuilder {
             )));
         }
         let endpoint = runtime.endpoint_handle();
-        let provider = prepared.map(|provider| Arc::new(provider.attach(endpoint.clone())));
+        let provider = prepared.map(|provider| {
+            // The deferred path hands the not-yet-started driver to `IrohProvider` so
+            // `serve` can start an independently-abortable session; the auto path
+            // already started it, so there is nothing to defer.
+            let serve_tasks = defer_serve.then(|| Arc::clone(&provider.protocol.tasks));
+            Arc::new(provider.attach(endpoint.clone(), serve_tasks))
+        });
         let transport = IrohTransport::attached(endpoint, self.envelope);
         Ok(IrohNode {
             provider,
@@ -2794,6 +2993,7 @@ mod lifecycle_tests {
         let prepared = PreparedProvider::prepare(
             IrohProviderConfig::retaining(StoreRetention::RetainAll),
             supervisor.handle(),
+            true,
         )
         .expect("prepare provider");
         assert!(!prepared.protocol.tasks.is_ready());
