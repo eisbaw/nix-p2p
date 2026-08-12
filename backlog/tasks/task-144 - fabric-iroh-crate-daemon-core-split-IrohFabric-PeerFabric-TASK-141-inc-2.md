@@ -7,7 +7,7 @@ status: In Progress
 assignee:
   - '@claude'
 created_date: '2026-08-11 23:57'
-updated_date: '2026-08-12 06:55'
+updated_date: '2026-08-12 23:36'
 labels:
   - iroh
   - seam
@@ -70,4 +70,6 @@ FORWARD-CARRY: (a) process_group is generic, not iroh - it rides in fabric-iroh 
 TASK-148 inc 1 landed (commit 9c0472d): the iroh TRANSFER axis is de-welded - IrohTransport IS peer_fabric::NarTransfer (native), daemon Transport is a bridge over it. So IrohFabric can now wire its NarTransfer axis (register IrohTransport into peer_fabric::TransferRegistry). The SERVE axis (NarServer/ServeHandle) is still blocked - filed as TASK-150 (peer_fabric::NarSupplier too weak for the task-72 admission + cancellation-safety invariants; provider lifecycle baked into IrohNodeBuilder.spawn). transport_iroh has NOT moved yet (AC#3 of 148 open), so a full IrohFabric still cannot wire transfer/server from fabric-iroh; NodeLocator remains the only cleanly-wireable axis (iroh_node_lookup is already in fabric-iroh).
 
 SERVE WIRING UNBLOCKED (TASK-150 c39b200): IrohProvider now impls peer_fabric::NarServer::serve(budget)->ServeHandle (abortable, teardown-proven). When IrohFabric wires the serve axis, build the provider node with IrohNodeBuilder::defer_serve() and expose IrohProvider as the fabric's Option<Arc<dyn NarServer>>; call serve(budget) to start and hold the ServeHandle for the fabric's lifetime (drop = teardown). Supply source is bound below the seam at construction (the sealed plan-based NarSupplier in the provider gate); NarServer::serve carries only the budget (peer_fabric seam ADR in capabilities.rs).
+
+UNBLOCKED by TASK-148 (commit f4c00a7): the iroh transfer/serve axes AND the ALPN are now ALL below the peer_fabric seam in fabric-iroh. transport_iroh.rs physically MOVED daemon/src -> fabric-iroh/src (AC#3 of 148 done); IROH_BLOBS_ALPN + its iroh_blobs::ALPN assertion moved into fabric-iroh (AC#4 of 148 done). fabric-iroh now owns: fabric_iroh::transport_iroh::{IrohTransport (peer_fabric::NarTransfer), IrohProvider (peer_fabric::NarServer, real ServeHandle teardown), IROH_BLOBS_ALPN}. So TASK-144 AC#2/#3/#5 are now WIREABLE from fabric-iroh: IrohFabric can hold Option<Arc<dyn NarTransfer>> = Arc<IrohTransport> and Option<Arc<dyn NarServer>> = Arc<IrohProvider> (build the provider node with IrohNodeBuilder::defer_serve(), call serve(budget), hold the ServeHandle for the fabric lifetime = drop teardown), alongside the already-wireable NodeLocator (iroh_node_lookup). NOTE the daemon still drives iroh through a Transport-trait BRIDGE (daemon/src/transport_iroh_bridge.rs) delegating to NarTransfer::fetch; TASK-144's job of replacing that bridge with a PeerFabric IrohNarSource (the source_libp2p.rs sibling) is now the remaining daemon-side wiring - all the below-seam prerequisites are in place. No frozen surface touched; daemon->fabric-iroh edge only (check-independence green).
 <!-- SECTION:NOTES:END -->
