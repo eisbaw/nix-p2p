@@ -51,13 +51,35 @@ impl Libp2pProviderDirectory {
 
     /// The two-phase resolve, WITHOUT the outer deadline (the trait method wraps this
     /// in the budget timeout). Returns the same [`Lookup`] arms.
+    ///
+    /// AC#3 - BootstrapOutage vs Partition (TASK-153): the [`Unavailable`] enum carries
+    /// both a [`Unavailable::BootstrapOutage`] ("never entered the network") and a
+    /// [`Unavailable::Partition`] ("was on the network, now cut off from the answering
+    /// keyspace") reason, and the AC asks to distinguish them WHERE DETECTABLE. At THIS
+    /// layer they are NOT cleanly detectable, and we deliberately do not fake the
+    /// distinction:
+    ///   * An empty routing table (below) is ambiguous between "bootstrap never admitted
+    ///     us" (BootstrapOutage) and "we were admitted and every peer has since aged out"
+    ///     (a total Partition). kad exposes only the k-bucket count, not WHY it is empty,
+    ///     so we map the whole empty-routing case to `InsufficientRouting` - the honest
+    ///     "not authoritative for this key" reason, and the one the cornerstone test
+    ///     pins. (Where the JOIN itself fails, `SwarmHandle::join_bootstraps` returns a
+    ///     bootstrap-outage error at the connectivity layer, which IS where that signal
+    ///     lives - not here on the read path.)
+    ///   * A query `Timeout` over a POPULATED table (mapped to `DeadlineExceeded` below)
+    ///     is indistinguishable, at this layer, between a genuine partition, transient
+    ///     congestion, and a too-tight budget. Emitting `Partition` there would MISLABEL
+    ///     a slow-but-healthy network, so we do not. A real partition detector would need
+    ///     reachability/connection-liveness signals this directory does not have.
+    /// This is the AC's sanctioned "not distinguishable here, here is why" outcome.
+    ///
+    /// A lookup over an empty routing table is not authoritative: a `Miss` would be a
+    /// lie (we simply are not on the network for this key). Fail it as Unavailable,
+    /// distinct from a healthy empty result. NOTE (honest limit): this is a TOTAL-routing
+    /// bar, not a "peers near the key" bar - a node holding only a bootstrap could still
+    /// report Miss where InsufficientRouting is more honest. Raising it to a
+    /// near-key/query-stats bar is TASK-174 (deferred from TASK-153 to keep it minimal).
     async fn resolve(&self, key: &ContentKey) -> Lookup<Vec<ProviderRecord>> {
-        // A lookup over an empty routing table is not authoritative: a `Miss` would be
-        // a lie (we simply are not on the network for this key). Fail it as
-        // Unavailable, distinct from a healthy empty result. NOTE (honest limit): this
-        // is a TOTAL-routing bar, not a "peers near the key" bar - a node holding only
-        // a bootstrap could still report Miss where InsufficientRouting is more honest.
-        // Raising it to a near-key/query-stats bar is TASK-153.
         if self.handle.routing_peers().await == 0 {
             return Lookup::Unavailable(Unavailable::InsufficientRouting);
         }

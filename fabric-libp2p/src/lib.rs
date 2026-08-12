@@ -80,7 +80,10 @@
 //!     were all withdrawn / expired / absent (`Ok(None)`). Authoritative absence.
 //!   * `Unavailable(reason)` = the lookup could not be trusted: `InsufficientRouting`
 //!     (empty k-buckets - see the honest limit that this is a TOTAL-routing bar, not a
-//!     near-the-key bar; TASK-153), `DeadlineExceeded` (budget), or `Backend` when the
+//!     near-the-key bar; TASK-174. TASK-153 added the >=3-bootstrap join set + proved an
+//!     admitted network survives losing any one bootstrap, and documents in `directory.rs`
+//!     why BootstrapOutage vs Partition is not cleanly detectable at the read path),
+//!     `DeadlineExceeded` (budget), or `Backend` when the
 //!     index named providers but their value records could not be CONSULTED (a
 //!     `get_record` failure), which must never collapse to `Miss`.
 //!
