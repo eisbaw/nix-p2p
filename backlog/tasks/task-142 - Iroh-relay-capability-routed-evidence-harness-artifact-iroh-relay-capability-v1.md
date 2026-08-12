@@ -7,7 +7,7 @@ status: In Progress
 assignee:
   - '@claude'
 created_date: '2026-08-11 22:55'
-updated_date: '2026-08-12 03:28'
+updated_date: '2026-08-12 03:40'
 labels:
   - iroh
   - discovery
@@ -49,5 +49,5 @@ inc1: feature-gated relay evidence binaries (server+peer) DONE, committed 99376b
 ## Implementation Notes
 
 <!-- SECTION:NOTES:BEGIN -->
-2026-08-12 orchestrator gate: increments 1-2 landed and committed (99376b9 evidence binaries iroh_relay_evidence_{server,peer}.rs; 2359220 scripts/iroh_relay_capability_evidence.py + finalize + docs schema/md; b91ea42 half-open acceptor). cargo build --workspace green at HEAD. Increment 3 (the routed podman run producing artifacts/iroh-relay-capability-v1.json verdict=pass) is NOT done - the implementer hit budget mid-run and correctly did not fake the artifact; it needs a fresh session with live podman/tcpdump debugging of the 8-arm routed topology. The implementer left an orphaned 'nix build .#iroh-relay-evidence-image' running (disk 74->56G); orchestrator killed it - nix store caches the sub-builds so a re-run resumes cheaply. NEXT SESSION: build the image, then run scripts/iroh_relay_capability_evidence.py to produce the artifact; then TASK-89 can compose 137/138/139/142.
+CORRECTION 2026-08-12: inc3 orchestration ALSO landed (783873c - scripts/iroh_relay_capability_evidence.py +308 lines wiring the 8-arm routed run + per-arm pcaps the finalizer consumes; peer binary tweak). cargo build --workspace GREEN at HEAD. So all THREE code increments (binaries 99376b9, harness 2359220, orchestration 783873c + half-open b91ea42) are committed and buildable. The ONLY remaining step is executing the routed run to PRODUCE artifacts/iroh-relay-capability-v1.json - which needs 'nix build .#iroh-relay-evidence-image' + live podman/tcpdump debugging of the routed topology. The agent spin-looped re-launching that image build across resumes (eating disk); orchestrator TaskStopped it and killed the builds. NEXT SESSION: build the image once, run scripts/iroh_relay_capability_evidence.py, verify+finalize the artifact -> then TASK-89.
 <!-- SECTION:NOTES:END -->
