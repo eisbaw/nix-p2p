@@ -109,14 +109,16 @@ pub use iroh_runtime::{
 };
 pub use narinfo_cache::{Clock, NarinfoDiskCache, SystemClock};
 pub use rewrite::{
-    AllowlistRawServe, NoRawServe, RawRewrite, RawServeDecision, RewriteError, to_raw,
+    AllowlistRawServe, AnyRawServe, NoRawServe, RawRewrite, RawServeDecision, RewriteError, to_raw,
 };
 pub use server::{App, serve};
 pub use source::{
     NarBody, NarHash, NarKey, NarPathToken, NarSource, NarinfoSource, RawUpstream, SourceError,
     StoreHash, UpstreamResponse,
 };
-pub use source_libp2p::{Libp2pNarSource, Libp2pSourceConfig, build_libp2p_nar_source};
+pub use source_libp2p::{
+    Libp2pNarSource, Libp2pRawServe, Libp2pSourceConfig, build_libp2p_nar_source,
+};
 pub use supply_catalog::SupplyCatalogHandle;
 pub use transport::{BitTorrentInfoHash, IROH_BLOBS_ALPN, NODE_ID_LEN, NodeId, NodeIdParseError};
 pub use transport_fetch::{

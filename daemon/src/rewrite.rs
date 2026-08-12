@@ -88,6 +88,9 @@
 
 use std::borrow::Cow;
 use std::fmt;
+use std::sync::Arc;
+
+use async_trait::async_trait;
 
 /// The UNSIGNED transport fields [`to_raw`] may rewrite. This is the single
 /// source of truth for "what may change"; everything else is byte-verbatim.
@@ -338,10 +341,21 @@ fn ascii_trim(bytes: &[u8]) -> &[u8] {
 /// `true` while the NAR path can only fetch the COMPRESSED upstream would hand the
 /// client a raw narinfo the daemon cannot back. See the module docs' peer-miss
 /// section. The wave-1 default is [`NoRawServe`].
+///
+/// ASYNC because the decision is fundamentally an AVAILABILITY question, and for a
+/// decentralized backend "is this raw NAR reachable?" is a NETWORK probe, not a
+/// static lookup (TASK-164). The iroh path answers it from a CONFIGURED claim set
+/// ([`AllowlistRawServe`], a pure in-memory `HashSet` read that never awaits); the
+/// libp2p path answers it by probing the SAME kad `find_providers` its fetch uses
+/// (`crate::source_libp2p::Libp2pRawServe`), so the narinfo-rewrite decision and the
+/// NAR serve agree by construction rather than by two independent guesses. The pure
+/// rewrite itself ([`to_raw`]) stays a synchronous, side-effect-free function; only
+/// this POLICY seam is async.
+#[async_trait]
 pub trait RawServeDecision: Send + Sync {
     /// `true` iff the daemon will serve `nar_hash`'s raw nar, so its narinfo
     /// should be rewritten to raw transport fields.
-    fn will_serve_raw(&self, nar_hash: &str) -> bool;
+    async fn will_serve_raw(&self, nar_hash: &str) -> bool;
 }
 
 /// The wave-1 default: never serve raw, so every narinfo is relayed verbatim and
@@ -350,8 +364,43 @@ pub trait RawServeDecision: Send + Sync {
 #[derive(Debug, Default, Clone, Copy)]
 pub struct NoRawServe;
 
+#[async_trait]
 impl RawServeDecision for NoRawServe {
-    fn will_serve_raw(&self, _nar_hash: &str) -> bool {
+    async fn will_serve_raw(&self, _nar_hash: &str) -> bool {
+        false
+    }
+}
+
+/// Compose several raw-serve decisions: serve raw IFF ANY of them says so.
+///
+/// The integration site (`main.rs::setup_p2p_source`) builds this from the iroh
+/// claim allowlist ([`AllowlistRawServe`], static) AND the libp2p dynamic provider
+/// probe (`crate::source_libp2p::Libp2pRawServe`), so a libp2p discovery HIT
+/// triggers the SAME task-49 narinfo rewrite the iroh claim path gets (TASK-164):
+/// a compressed upstream narinfo is rewritten to raw before a real Nix client
+/// validates `FileHash`/`Compression` against the raw bytes the daemon serves.
+///
+/// Short-circuits on the first `true`, so a cheap static allowlist hit never pays
+/// for a network probe. Composition (not a monolithic multi-backend decision) keeps
+/// each decision independently testable and the ordering owned by the caller.
+pub struct AnyRawServe(Vec<Arc<dyn RawServeDecision>>);
+
+impl AnyRawServe {
+    /// Serve raw iff any of `decisions` does. An empty set never serves raw (the
+    /// same behaviour as [`NoRawServe`]).
+    pub fn new(decisions: Vec<Arc<dyn RawServeDecision>>) -> Self {
+        Self(decisions)
+    }
+}
+
+#[async_trait]
+impl RawServeDecision for AnyRawServe {
+    async fn will_serve_raw(&self, nar_hash: &str) -> bool {
+        for decision in &self.0 {
+            if decision.will_serve_raw(nar_hash).await {
+                return true;
+            }
+        }
         false
     }
 }
@@ -388,8 +437,11 @@ impl AllowlistRawServe {
     }
 }
 
+#[async_trait]
 impl RawServeDecision for AllowlistRawServe {
-    fn will_serve_raw(&self, nar_hash: &str) -> bool {
+    async fn will_serve_raw(&self, nar_hash: &str) -> bool {
+        // A pure in-memory set read: the CONFIGURED claim set already names every
+        // NarHash this node will serve raw, so no network probe (no await) is needed.
         self.hashes.contains(nar_hash)
     }
 }
@@ -706,8 +758,28 @@ FileHash: sha256:a\nFileSize: 1\nNarHash: sha256:abc\nNarSize: not-a-number\nRef
         ));
     }
 
-    #[test]
-    fn no_raw_serve_never_rewrites() {
-        assert!(!NoRawServe.will_serve_raw("sha256:anything"));
+    #[tokio::test]
+    async fn no_raw_serve_never_rewrites() {
+        assert!(!NoRawServe.will_serve_raw("sha256:anything").await);
+    }
+
+    #[tokio::test]
+    async fn allowlist_serves_only_configured_hashes() {
+        let allow = AllowlistRawServe::new(["sha256:aaa".to_string()]);
+        assert!(allow.will_serve_raw("sha256:aaa").await);
+        assert!(!allow.will_serve_raw("sha256:bbb").await);
+    }
+
+    #[tokio::test]
+    async fn any_raw_serve_is_the_or_of_its_decisions() {
+        // Empty -> never (same as NoRawServe).
+        assert!(!AnyRawServe::new(vec![]).will_serve_raw("sha256:aaa").await);
+        // Any member saying yes wins; short-circuits on the first true.
+        let yes: Arc<dyn RawServeDecision> =
+            Arc::new(AllowlistRawServe::new(["sha256:aaa".to_string()]));
+        let no: Arc<dyn RawServeDecision> = Arc::new(NoRawServe);
+        let any = AnyRawServe::new(vec![no, yes]);
+        assert!(any.will_serve_raw("sha256:aaa").await);
+        assert!(!any.will_serve_raw("sha256:zzz").await);
     }
 }

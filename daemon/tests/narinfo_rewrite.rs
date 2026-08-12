@@ -54,8 +54,9 @@ fn upstream_narinfo() -> Vec<u8> {
 
 /// A `RawServeDecision` that always says "yes, I will serve this raw".
 struct AlwaysRaw;
+#[async_trait]
 impl RawServeDecision for AlwaysRaw {
-    fn will_serve_raw(&self, _nar_hash: &str) -> bool {
+    async fn will_serve_raw(&self, _nar_hash: &str) -> bool {
         true
     }
 }

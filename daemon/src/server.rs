@@ -276,9 +276,13 @@ async fn respond_narinfo(
     // back to UpstreamPath - safe, never a hard failure. The rewrite decision is
     // keyed on the SIGNED NarHash the correlation carries.
     let correlation = parse_correlation(&bytes);
-    let rewrite_to_raw = correlation
-        .as_ref()
-        .is_some_and(|(_, nar_hash, _)| raw_serve.will_serve_raw(nar_hash.as_str()));
+    // The rewrite decision is ASYNC: for a decentralized backend "will I serve this
+    // raw?" is a discovery probe (TASK-164), not a static lookup. Await it only when
+    // the narinfo actually correlated (a malformed narinfo is never rewritten).
+    let rewrite_to_raw = match correlation.as_ref() {
+        Some((_, nar_hash, _)) => raw_serve.will_serve_raw(nar_hash.as_str()).await,
+        None => false,
+    };
 
     let (out_bytes, rewrote) = if rewrite_to_raw {
         match rewrite::to_raw(&bytes) {

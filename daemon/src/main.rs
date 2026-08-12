@@ -18,7 +18,7 @@ use std::sync::Arc;
 use daemon::cacheinfo::DEFAULT_PRIORITY;
 use daemon::claim::CLAIM_SCHEMA_VERSION;
 use daemon::{
-    AddressLookupCapability, AllowlistRawServe, App, Blake3Digest, CacheInfo, Claim,
+    AddressLookupCapability, AllowlistRawServe, AnyRawServe, App, Blake3Digest, CacheInfo, Claim,
     CorrelationStore, DEFAULT_MAX_INFLIGHT_NAR_BYTES, DEFAULT_MAX_SERVE_DURATION,
     DEFAULT_MAX_SERVE_NAR_BYTES, EndpointProfile, EndpointScope, FallbackNarSource,
     FileNarSupplier, IdentitySource, InMemoryDiscovery, IrohNode, IrohNodeBuilder, IrohPeerAddr,
@@ -1250,12 +1250,18 @@ async fn setup_p2p_source(
         None
     };
 
+    // Captured from the libp2p builder (when libp2p is requested): the DYNAMIC raw-serve
+    // decision that probes kad provider discovery, paired with the fetch source so the
+    // two consult one mechanism (TASK-164).
+    let mut libp2p_raw_serve: Option<Arc<dyn RawServeDecision>> = None;
     let libp2p_layer: Option<Arc<dyn NarSource>> = if config.libp2p_requested() {
         // Build + START the libp2p fabric (listen/bootstrap/dial) and wrap it in the
         // Libp2pNarSource. The returned fabric handle is dropped here: the source holds
-        // its own Arc clone, keeping the node alive for the process lifetime.
-        let (_fabric, libp2p_source) =
+        // its own Arc clone, keeping the node alive for the process lifetime. The raw-serve
+        // decision is captured so a libp2p HIT rewrites its narinfo to raw (see below).
+        let (_fabric, libp2p_source, raw_serve) =
             build_libp2p_nar_source(config.libp2p_source_config()?).await?;
+        libp2p_raw_serve = Some(raw_serve);
         println!(
             "daemon: libp2p p2p source started, discovery converging ({} bootstrap peer(s), {} provider dial addr(s))",
             config.libp2p_bootstrap.len(),
@@ -1268,14 +1274,24 @@ async fn setup_p2p_source(
 
     let chain = compose_nar_chain(libp2p_layer, iroh_layer, upstream.clone());
 
-    // The raw-serve allowlist is keyed on the iroh claim set (the task-49 compressed
-    // rewrite). libp2p-served paths resolve via the SignedNarHash correlation and do
-    // NOT currently participate in the raw-serve allowlist; unifying raw-serve across
-    // both backends is a BLOCKING correctness follow-up (TASK-164): a libp2p HIT under
-    // a compressed upstream narinfo would serve RAW bytes a real Nix client rejects.
-    let raw_serve: Arc<dyn RawServeDecision> = Arc::new(AllowlistRawServe::new(
+    // Compose the raw-serve decision so BOTH backends trigger the task-49 narinfo
+    // rewrite (TASK-164):
+    //   * iroh: the STATIC claim allowlist (discovery + allowlist seeded from one
+    //     `--p2p-claim`, so a discovery HIT is already an allowlist HIT);
+    //   * libp2p: the DYNAMIC provider probe (rewrite to raw iff kad discovers a
+    //     provider for the NarHash right now), mirroring iroh's coupling but keyed on
+    //     the live discovery result rather than a static claim.
+    // `AnyRawServe` serves raw iff EITHER says so, so a libp2p HIT under a compressed
+    // upstream narinfo is rewritten to raw (Compression: none, FileHash/FileSize = raw)
+    // before a real Nix client validates the bytes - the gap TASK-164 closes. Iroh-only
+    // and pure-HTTP nodes keep exactly their prior decision.
+    let iroh_allowlist: Arc<dyn RawServeDecision> = Arc::new(AllowlistRawServe::new(
         config.p2p_claims.iter().map(|c| c.nar_hash.clone()),
     ));
+    let raw_serve: Arc<dyn RawServeDecision> = match libp2p_raw_serve {
+        Some(libp2p) => Arc::new(AnyRawServe::new(vec![iroh_allowlist, libp2p])),
+        None => iroh_allowlist,
+    };
 
     Ok((chain, raw_serve))
 }

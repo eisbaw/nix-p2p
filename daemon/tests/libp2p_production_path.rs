@@ -297,7 +297,10 @@ async fn production_config_builds_libp2p_source_that_discovers_and_serves_with_c
         discovery_budget: DiscoveryBudget::new(Duration::from_secs(10), 32),
         envelope: SafetyEnvelope::default(),
     };
-    let (consumer, libp2p_source) = build_libp2p_nar_source(cfg)
+    // The builder also returns a Libp2pRawServe (TASK-164); this NoRawServe test does
+    // not wire it (the compression-domain correctness it enables is covered by
+    // `libp2p_raw_serve.rs`), so it is intentionally dropped here.
+    let (consumer, libp2p_source, _libp2p_raw_serve) = build_libp2p_nar_source(cfg)
         .await
         .expect("production builder constructs a running libp2p NarSource from config");
 

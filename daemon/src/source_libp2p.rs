@@ -63,7 +63,10 @@ use http_body_util::{BodyExt, Full};
 
 use peer_fabric::{ContentKey, DiscoveryBudget, Lookup, PeerFabric, SafetyEnvelope, TransferError};
 
+use std::str::FromStr;
+
 use crate::claim::NarHashKey;
+use crate::rewrite::RawServeDecision;
 use crate::source::{NarKey, NarSource, SourceError, UpstreamResponse};
 
 /// A [`NarSource`] backed by a libp2p [`PeerFabric`]: discover via kad, fetch over the
@@ -214,6 +217,84 @@ impl NarSource for Libp2pNarSource {
     }
 }
 
+/// A [`RawServeDecision`] that DYNAMICALLY probes the libp2p provider directory:
+/// the daemon will serve `nar_hash`'s RAW nar IFF a libp2p provider is discoverable
+/// for it right now (TASK-164).
+///
+/// ## Why this exists (the correctness gap it closes)
+///
+/// The iroh path seeds its discovery AND its raw-serve allowlist from ONE static
+/// `--p2p-claim` set, so a discovery HIT implies an allowlist HIT and the narinfo is
+/// rewritten to raw (`Compression: none`, `FileHash`/`FileSize` = the raw NAR's
+/// hash/size) before a Nix client validates the served bytes. libp2p discovery is
+/// DYNAMIC (kad `find_providers`) with no static claim, so without this a libp2p HIT
+/// under a COMPRESSED (xz) upstream narinfo would serve RAW bytes while the narinfo
+/// still declared `Compression: xz` -> a real Nix client rejects on the
+/// `FileHash`/`Compression` gate (TASK-162 finding).
+///
+/// This closes the gap by answering the rewrite decision with the SAME kad probe
+/// [`Libp2pNarSource::resolve`] uses for the fetch. So the invariant
+/// `libp2p-serves-raw(h) <=> narinfo-rewritten-to-raw(h)` holds by construction, the
+/// dynamic mirror of the iroh path's static coupling.
+///
+/// ## Fail-safe on ambiguity, fail-closed on a stale hit
+///
+/// A NarHash that is not a canonical p2p key, a fabric with no directory axis, and a
+/// kad `Miss`/`Unavailable` all return `false`: the narinfo is served VERBATIM
+/// (compressed) and its NAR request fetches the actual compressed bytes over HTTP - a
+/// safe non-regression, never a raw narinfo the daemon cannot back. If a provider is
+/// found here but has VANISHED by the time the correlated NAR request runs (TOCTOU),
+/// the rewrite-to-raw stands but the NAR fetch misses -> a fast clean 502 -> Nix falls
+/// back to the next substituter (S2), exactly the documented dead-holder behaviour of
+/// [`crate::rewrite::AllowlistRawServe`]. Never wrong bytes.
+///
+/// COST (documented, not hidden): this runs a kad `find_providers` at narinfo time, and
+/// the correlated NAR request runs it AGAIN at fetch time - two lookups per served path.
+/// Caching a discovery outcome across the two is deferred (TASK-163); correctness, not
+/// probe economy, is what this type buys.
+pub struct Libp2pRawServe {
+    fabric: Arc<dyn PeerFabric>,
+    /// The bound on the narinfo-time `find_providers` probe. The daemon (composition
+    /// root) owns the numbers; the same budget the paired [`Libp2pNarSource`] uses.
+    discovery_budget: DiscoveryBudget,
+}
+
+impl Libp2pRawServe {
+    /// A decision probing `fabric` under `discovery_budget`.
+    pub fn new(fabric: Arc<dyn PeerFabric>, discovery_budget: DiscoveryBudget) -> Self {
+        Libp2pRawServe {
+            fabric,
+            discovery_budget,
+        }
+    }
+}
+
+#[async_trait]
+impl RawServeDecision for Libp2pRawServe {
+    async fn will_serve_raw(&self, nar_hash: &str) -> bool {
+        // Not a canonical NarHash -> cannot be a libp2p key -> never rewrite to raw.
+        let Ok(canonical) = NarHashKey::from_str(nar_hash) else {
+            return false;
+        };
+        let content_key = ContentKey::derive_from_signed_nar_hash(canonical.as_bytes());
+        // No directory axis: this fabric cannot answer, so do NOT rewrite (serve the
+        // verbatim compressed narinfo, which the HTTP path can still back).
+        let Some(directory) = self.fabric.provider_directory() else {
+            return false;
+        };
+        // The SAME kad probe the paired Libp2pNarSource fetch uses. Only an
+        // authoritative, non-empty Found rewrites to raw; a Miss (healthy absence) or
+        // an Unavailable (could-not-consult) both leave the narinfo verbatim.
+        match directory
+            .find_providers(&content_key, &self.discovery_budget)
+            .await
+        {
+            Lookup::Found(records) => !records.is_empty(),
+            Lookup::Miss | Lookup::Unavailable(_) => false,
+        }
+    }
+}
+
 /// The composition-root numbers for the PRODUCTION libp2p `NarSource` (TASK-162).
 ///
 /// The daemon binary parses its CLI flags (`--libp2p-bootstrap`, `--libp2p-listen`,
@@ -250,14 +331,25 @@ pub struct Libp2pSourceConfig {
 /// self-lookup), teach the swarm the provider dial addresses (TASK-159 shim), and
 /// wrap the running fabric in a [`Libp2pNarSource`].
 ///
-/// Returns BOTH the `Arc<Libp2pFabric>` and the `NarSource`. In production the binary
-/// keeps only the source (which itself holds an `Arc` clone of the fabric, so the
-/// node stays alive); the returned fabric handle lets a test poll discovery readiness
-/// before serving. Connectivity setup is fail-fast: a listen or bootstrap-dial error
-/// is a loud startup error, never a silent degrade to upstream-only.
+/// Returns the `Arc<Libp2pFabric>`, the `NarSource`, AND its paired
+/// [`Libp2pRawServe`] decision. Building all three from the ONE running fabric and the
+/// ONE `discovery_budget` here is deliberate: it makes the narinfo-rewrite decision and
+/// the NAR fetch impossible to drift apart (they share the exact discovery mechanism),
+/// the libp2p analogue of the iroh path seeding discovery + allowlist from one claim
+/// set (TASK-164). In production the binary keeps the source and the raw-serve; the
+/// returned fabric handle lets a test poll discovery readiness before serving.
+/// Connectivity setup is fail-fast: a listen or bootstrap-dial error is a loud startup
+/// error, never a silent degrade to upstream-only.
 pub async fn build_libp2p_nar_source(
     cfg: Libp2pSourceConfig,
-) -> Result<(Arc<Libp2pFabric>, Arc<dyn NarSource>), String> {
+) -> Result<
+    (
+        Arc<Libp2pFabric>,
+        Arc<dyn NarSource>,
+        Arc<dyn RawServeDecision>,
+    ),
+    String,
+> {
     let fabric = Libp2pFabric::start(NodeConfig {
         identity_seed: cfg.identity_seed,
         network_scope: cfg.network_scope,
@@ -319,10 +411,17 @@ pub async fn build_libp2p_nar_source(
         fabric.handle().add_address(*peer, addr.clone()).await;
     }
 
+    // Both the fetch source and the raw-serve decision hold the SAME running fabric and
+    // the SAME discovery budget, so a rewrite-to-raw decision and the fetch that backs it
+    // consult one mechanism (DiscoveryBudget is Copy).
+    let raw_serve: Arc<dyn RawServeDecision> = Arc::new(Libp2pRawServe::new(
+        fabric.clone() as Arc<dyn PeerFabric>,
+        cfg.discovery_budget,
+    ));
     let source: Arc<dyn NarSource> = Arc::new(Libp2pNarSource::new(
         fabric.clone() as Arc<dyn PeerFabric>,
         cfg.discovery_budget,
         cfg.envelope,
     ));
-    Ok((fabric, source))
+    Ok((fabric, source, raw_serve))
 }
