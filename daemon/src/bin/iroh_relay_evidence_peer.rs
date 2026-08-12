@@ -371,16 +371,21 @@ async fn run_accept(config: &Config, relay: &RelayTransportConfig) -> serde_json
     };
 
     let path_after = classify_connect_path(&conn);
-    // The accept side echoes one bounded message; a half-open peer never sends,
-    // which the connect side observes.
+    // The accept side echoes one bounded message, EXCEPT in the half-open-stream
+    // arm: there it accepts the connection and reads the request but never
+    // writes the echo back, so the connecting peer observes a typed
+    // `half_open_stream` when its stream read stalls past the grace bound.
+    let half_open = config.scenario == Scenario::HalfOpenStream;
     if let Ok((mut send, mut recv)) = conn.accept_bi().await {
         let mut buf = vec![0u8; EVIDENCE_MESSAGE.len()];
-        if recv.read_exact(&mut buf).await.is_ok() {
+        if recv.read_exact(&mut buf).await.is_ok() && !half_open {
             let _ = send.write_all(&buf).await;
             let _ = send.finish();
         }
     }
-    conn.closed().await;
+    if !half_open {
+        conn.closed().await;
+    }
     endpoint.close().await;
 
     success_json(config, path_before, path_after, &hex_public(&node_id))
