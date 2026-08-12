@@ -28,11 +28,11 @@
 //!     -> ContentKey::derive_from_signed_nar_hash    (FROZEN peer-fabric content.rs recipe)
 //!     -> fabric.provider_directory().find_providers(ContentKey)   (libp2p-kad, NOT injected)
 //!     -> pick a ProviderRecord: its provider NodeId, content Blake3Digest + offers
-//!     -> fabric.node_locator().locate(record.provider, PublicInfrastructure)   (kad
-//!         peer-routing resolves WHERE the provider is dialable, THROUGH the DHT - no
-//!         injected address; a Miss/Unavailable skips this record to upstream fallback)
 //!     -> for each offer: fabric.transfer(offer.tag()).fetch(content, offer, size, envelope)
-//!         (gate-1 BLAKE3 verify lives INSIDE the transfer; a lying holder fails closed)
+//!         (the transfer resolves WHERE the provider is dialable THROUGH kad peer-routing
+//!         INSIDE the fabric before dialing - TASK-169, no injected address, DialInfo never
+//!         reaches this serving layer; gate-1 BLAKE3 verify also lives INSIDE the transfer,
+//!         so a lying holder fails closed and the next offer/record is tried)
 //!     -> hand the raw NAR up; Nix re-verifies sig + sha256==NarHash (gate 2, the TCB)
 //! ```
 //!
@@ -65,8 +65,7 @@ use http::HeaderMap;
 use http_body_util::{BodyExt, Full};
 
 use peer_fabric::{
-    ContentKey, DiscoveryBudget, Lookup, PeerFabric, ResolutionPolicy, SafetyEnvelope,
-    TransferError,
+    ContentKey, DiscoveryBudget, Lookup, PeerFabric, SafetyEnvelope, TransferError,
 };
 
 use std::str::FromStr;
@@ -184,46 +183,17 @@ impl NarSource for Libp2pNarSource {
         for record in &records {
             let content = &record.content;
 
-            // Resolve WHERE this provider is dialable THROUGH the DHT (kad peer-routing),
-            // so the production path needs NO injected dial address (the TASK-159 shim is
-            // gone). `locate` is the side-effecting consult: an iterative `get_closest_peers`
-            // teaches THIS node's shared kad routing table the provider's address (which a
-            // shared bootstrap learned via identify), so the request-response `fetch` below -
-            // driven off the SAME swarm - dials the provider with nothing injected out of
-            // band. A `Miss` (healthy query, no address known) or `Unavailable`
-            // (could-not-consult / empty routing) means we cannot learn a dial address for
-            // THIS provider right now: record it and try the next record, ultimately folding
-            // to a clean upstream fallback (S2). A fabric with no locator axis
-            // (`node_locator() == None`) proceeds unchanged - it must have its dial address
-            // supplied another way (the optional `provider_addrs` override hint), so this is
-            // a no-op for it rather than a hard skip.
-            if let Some(locator) = self.fabric.node_locator() {
-                match locator
-                    .locate(&record.provider, &ResolutionPolicy::PublicInfrastructure)
-                    .await
-                {
-                    // The routing table now knows an address for the provider; the fetch
-                    // below can dial it. We do NOT feed the returned Multiaddr strings to the
-                    // swarm explicitly (no `add_address`): they arrived via the DHT as a
-                    // side effect of this query, which is exactly the no-injection property.
-                    Lookup::Found(_dial_info) => {}
-                    Lookup::Miss => {
-                        last_failure = Some(format!(
-                            "node_locator: no DHT-known dial address for provider {} (kad miss)",
-                            record.provider
-                        ));
-                        continue;
-                    }
-                    Lookup::Unavailable(why) => {
-                        last_failure = Some(format!(
-                            "node_locator: could not resolve provider {}: {why}",
-                            record.provider
-                        ));
-                        continue;
-                    }
-                }
-            }
-
+            // WHERE this provider is dialable is resolved INSIDE the fabric, by the transfer
+            // itself (TASK-169): the libp2p transport runs kad peer-routing and seeds the
+            // DHT-resolved address before dialing, so the daemon needs NO injected dial
+            // address and the `DialInfo` never crosses the `NodeLocator` seam into this
+            // serving layer (peer-fabric/src/capabilities.rs). This layer therefore just
+            // discovers WHO holds the NAR (above) and hands each offer to its transfer; a
+            // provider whose address cannot be resolved surfaces here as an ordinary
+            // per-offer `TransferError::Unavailable` (recorded in `last_failure`, next
+            // record tried), folding to a clean upstream fallback (S2). The daemon does not
+            // consult `node_locator()` directly - it holds only `Arc<dyn PeerFabric>` and
+            // must not lean on a routing-table side effect to dial.
             for offer in &record.offers {
                 let tag = offer.tag();
                 let Some(transfer) = self.fabric.transfer(tag) else {
@@ -254,12 +224,11 @@ impl NarSource for Libp2pNarSource {
             }
         }
 
-        // No discovered provider yielded verified bytes: every record was either
-        // UNLOCATABLE (node_locator Miss/Unavailable -> the record loop never reached its
-        // offers) or had all offers skipped/failed. `last_failure` carries the specific
-        // cause (a `node_locator: ...` prefix means the dial address could not be resolved,
-        // distinct from an offer/transfer failure), so the summary stays truthful either
-        // way. A clean miss the FallbackNarSource turns into upstream fallback (S2).
+        // No discovered provider yielded verified bytes: every record's offers were all
+        // skipped or failed (a transfer that could not resolve the provider's dial address
+        // surfaces here as a per-offer `Unavailable`, an integrity gate fired, the holder
+        // was absent, etc.). `last_failure` carries the specific cause, so the summary stays
+        // truthful. A clean miss the FallbackNarSource turns into upstream fallback (S2).
         Err(SourceError::Unreachable(format!(
             "discovered {} provider record(s) for {content_key} but none yielded verified bytes \
              (unlocatable provider or offer failure): {}",

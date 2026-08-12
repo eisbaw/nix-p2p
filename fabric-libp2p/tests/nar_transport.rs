@@ -16,12 +16,14 @@
 //! with NO in-process shortcut for the byte path.
 
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
-use fabric_libp2p::{Libp2pServer, Libp2pTransport, MemoryNarSupplier, Node, NodeConfig};
+use fabric_libp2p::{
+    Libp2pNodeLocator, Libp2pServer, Libp2pTransport, MemoryNarSupplier, Node, NodeConfig,
+};
 use peer_fabric::{
-    Blake3Digest, NarServer, NarTransfer, SafetyEnvelope, ServeBudget, TransferError,
-    TransportOffer,
+    Blake3Digest, ExposureLedger, Lookup, NarServer, NarTransfer, ResolutionPolicy, SafetyEnvelope,
+    ServeBudget, TransferError, TransportOffer,
 };
 
 /// A generous per-call envelope: loopback finishes in milliseconds, so a multi-second
@@ -64,14 +66,46 @@ async fn wait_for_listen_addr(node: &Node) -> fabric_libp2p::Multiaddr {
 /// Build a consumer transport for `consumer` that can dial `provider` at `addr`.
 async fn wire_consumer(
     consumer: &Node,
-    provider_peer: fabric_libp2p::PeerId,
+    provider: &Node,
     addr: fabric_libp2p::Multiaddr,
 ) -> Libp2pTransport {
-    // Teach the consumer's swarm how to reach the provider (request-response auto-dials
-    // a peer whose address is known to the swarm). This is the basic dial the task
-    // scopes in; kad peer-routing / NAT traversal is the TASK-159 follow-up.
-    consumer.handle.add_address(provider_peer, addr).await;
-    Libp2pTransport::new(consumer.handle.clone())
+    // Teach the consumer's swarm how to reach the provider. `add_address` seeds kad's
+    // routing table with this EXPLICIT (override / test-injected) address, which is what
+    // the transport's kad peer-routing resolution (TASK-169) resolves the provider's dial
+    // address from before the request-response fetch dials it. The decentralized
+    // NO-injection resolution (address learned purely through the DHT) is proven separately
+    // in `node_locator_discovery.rs`; here the injected address is legitimate.
+    consumer.handle.add_address(provider.peer_id, addr.clone()).await;
+    let _ = consumer.handle.dial(addr).await;
+
+    // The transport now drives its dial off an EXPLICIT in-fabric resolution (TASK-169), so
+    // it holds the same kind of `Libp2pNodeLocator` the fabric wires it with. A standalone
+    // ledger is fine here - these tests assert byte-path behaviour, not exposure counts.
+    let ledger = Arc::new(ExposureLedger::new());
+    let locator = Arc::new(Libp2pNodeLocator::new(consumer.handle.clone(), ledger));
+
+    // Wait until kad peer-routing can Found the provider's dial address, so the byte-path
+    // fetches below are deterministic rather than racing the resolution readiness the
+    // transport now performs on every fetch.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        match locator
+            .locate(&provider.node_id, &ResolutionPolicy::PublicInfrastructure)
+            .await
+        {
+            Lookup::Found(_) => break,
+            other => {
+                assert!(
+                    Instant::now() < deadline,
+                    "consumer never resolved the provider's dial address via kad peer-routing \
+                     (last: {other:?})"
+                );
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        }
+    }
+
+    Libp2pTransport::new(consumer.handle.clone(), locator)
 }
 
 #[tokio::test]
@@ -91,7 +125,7 @@ async fn fetch_is_byte_identical_and_blake3_verified_across_two_nodes() {
 
     // Node B: fetch it.
     let (node_b, _addr_b) = start_listening([2u8; 32], scope).await;
-    let transport = wire_consumer(&node_b, node_a.peer_id, addr_a).await;
+    let transport = wire_consumer(&node_b, &node_a, addr_a).await;
     let offer = TransportOffer::Iroh {
         node: node_a.node_id,
     };
@@ -128,7 +162,7 @@ async fn corrupt_provider_is_rejected_by_gate1_blake3_verify() {
         .expect("serve starts");
 
     let (node_b, _addr_b) = start_listening([4u8; 32], scope).await;
-    let transport = wire_consumer(&node_b, node_a.peer_id, addr_a).await;
+    let transport = wire_consumer(&node_b, &node_a, addr_a).await;
     let offer = TransportOffer::Iroh {
         node: node_a.node_id,
     };
@@ -163,7 +197,7 @@ async fn signed_bound_smaller_than_served_bytes_trips_size_abort() {
         .expect("serve starts");
 
     let (node_b, _addr_b) = start_listening([6u8; 32], scope).await;
-    let transport = wire_consumer(&node_b, node_a.peer_id, addr_a).await;
+    let transport = wire_consumer(&node_b, &node_a, addr_a).await;
     let offer = TransportOffer::Iroh {
         node: node_a.node_id,
     };
@@ -203,7 +237,7 @@ async fn serve_budget_declines_over_per_nar_request() {
     let _serve = server.serve(tight).await.expect("serve starts");
 
     let (node_b, _addr_b) = start_listening([8u8; 32], scope).await;
-    let transport = wire_consumer(&node_b, node_a.peer_id, addr_a).await;
+    let transport = wire_consumer(&node_b, &node_a, addr_a).await;
     let offer = TransportOffer::Iroh {
         node: node_a.node_id,
     };
@@ -233,7 +267,7 @@ async fn dropping_the_serve_handle_stops_admission() {
     );
 
     let (node_b, _addr_b) = start_listening([10u8; 32], scope).await;
-    let transport = wire_consumer(&node_b, node_a.peer_id, addr_a).await;
+    let transport = wire_consumer(&node_b, &node_a, addr_a).await;
     let offer = TransportOffer::Iroh {
         node: node_a.node_id,
     };
@@ -280,7 +314,7 @@ async fn a_stale_teardown_does_not_clobber_a_live_successor_session() {
     );
 
     let (node_b, _addr_b) = start_listening([12u8; 32], scope).await;
-    let transport = wire_consumer(&node_b, node_a.peer_id, addr_a).await;
+    let transport = wire_consumer(&node_b, &node_a, addr_a).await;
     let offer = TransportOffer::Iroh {
         node: node_a.node_id,
     };

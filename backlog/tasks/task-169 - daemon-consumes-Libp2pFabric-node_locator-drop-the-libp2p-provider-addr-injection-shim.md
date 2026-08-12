@@ -7,7 +7,7 @@ status: In Progress
 assignee:
   - mped
 created_date: '2026-08-12 15:32'
-updated_date: '2026-08-12 16:54'
+updated_date: '2026-08-12 16:57'
 labels:
   - libp2p
   - daemon
@@ -36,7 +36,10 @@ TASK-159 landed Libp2pFabric::node_locator (kad peer-routing resolves a provider
 ## Implementation Notes
 
 <!-- SECTION:NOTES:BEGIN -->
-REOPENED on owner feedback: the committed design (daemon resolve() calls node_locator().locate() for its ROUTING-TABLE SIDE EFFECT and discards the returned DialInfo) relies on a side effect - rejected. Owner: no side effects.
-Root cause + correct design: the seam doc (peer-fabric/src/capabilities.rs:146-148) says the NodeLocator DialInfo STAYS INSIDE THE FABRIC and never reaches the serving layer - which is exactly why the daemon could only lean on a side effect (it holds Arc<dyn PeerFabric> and cannot add_address through the seam). So the resolve-then-dial belongs INSIDE the fabric, not the daemon.
-Fix: Libp2pTransport::fetch (fabric-libp2p/src/transport.rs; holds a SwarmHandle) must, before self.handle.fetch_nar(peer, content), resolve the provider address via kad peer-routing (self.handle.locate_peer(peer)) and add_address the resolved Multiaddr(s) EXPLICITLY, so the dial is driven by the resolved address. A no-address/empty-routing result -> typed TransferError (fall through, not a silent dial). Record the OurNodeId->DHT exposure to the ledger (preserve what Libp2pNodeLocator accounts). REMOVE the daemon resolve() locate() call (source_libp2p.rs) - the daemon just discovers + fetches; DialInfo stays in the fabric. Libp2pNodeLocator + node_locator() axis STAY (TASK-159, gate-able + tested).
+REOPENED design (owner: no side effects). Implementation:
+1. Libp2pTransport now holds Arc<Libp2pNodeLocator> (the SAME instance the node_locator() axis exposes - single source, shared ExposureLedger). In fetch(), BEFORE fetch_nar: locator.locate(node, PublicInfrastructure); Found -> parse each DialInfo location back to Multiaddr and add_address(peer, addr) EXPLICITLY (DHT-resolved, not injection); Miss/Unavailable/zero-parseable -> typed TransferError::Unavailable (fall through to next offer/record -> upstream). Exposure (OurNodeId->DhtNode) recorded by the reused locator, not re-threaded.
+2. fabric.rs assemble: build one Arc<Libp2pNodeLocator>, clone into both the transport and the node_locator() axis. Libp2pNodeLocator + node_locator() STAY (TASK-159).
+3. daemon source_libp2p.rs resolve(): REMOVE the node_locator().locate() block; daemon goes back to discover(find_providers) -> for each record/offer -> transfer.fetch(). DialInfo never reaches the serving layer. Update stale doc comments.
+4. Tests stay green. Ledger oracle in libp2p_production_path.rs (hit_delta == miss_delta+1) STILL holds: the +1 OurNodeId disclosure just moves from daemon into the transport's fetch (same shared ledger); MISS still bails at find_providers before any fetch. Update stale comments that said resolve() calls locate.
+HONEST LIMIT preserved: loopback DHT can reuse an earlier query's connection, so byte-path arms alone do not prove resolution is load-bearing; carry real-network proof to TASK-161.
 <!-- SECTION:NOTES:END -->

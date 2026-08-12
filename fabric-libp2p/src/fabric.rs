@@ -1,8 +1,10 @@
 //! [`Libp2pFabric`] - the concrete [`PeerFabric`] for the libp2p backend. It exposes
 //! the content-discovery axes (directory + announcer) AND, from TASK-151, the transport
 //! (always) and the serve axis (when built with a supplier), all over the SAME swarm.
-//! The node-locator / hold-query / LAN axes remain `None` (NAT traversal + node
-//! discovery is TASK-159; hold-query is unimplemented).
+//! From TASK-159 the node-locator axis resolves a provider's dial address through kad
+//! peer-routing; TASK-169 has the transport drive its dial off that SAME locator (the
+//! resolve-then-dial lives inside the fabric). The hold-query / LAN axes remain `None`
+//! (hold-query is unimplemented; NAT traversal for residential peers is TASK-168).
 
 use std::sync::Arc;
 
@@ -69,15 +71,23 @@ impl Libp2pFabric {
             node.node_id,
             node.peer_id,
         ));
-        // The node-locator resolves a provider's dial address THROUGH kad peer-routing, so
-        // the transport no longer needs it injected out of band (TASK-159 AC#1).
-        let locator: Arc<dyn NodeLocator> =
-            Arc::new(Libp2pNodeLocator::new(node.handle.clone(), ledger.clone()));
+        // The node-locator resolves a provider's dial address THROUGH kad peer-routing.
+        // ONE concrete instance is shared (TASK-169): the fetch transport drives its dial
+        // off this SAME locator (so the resolve-then-dial lives inside the fabric, and its
+        // OurNodeId->DhtNode disclosure lands on the fabric's single `ledger`), and the
+        // `node_locator()` axis (TASK-159, gate-able + unit-tested) exposes it too.
+        let node_locator = Arc::new(Libp2pNodeLocator::new(node.handle.clone(), ledger.clone()));
 
         // The fetch transport is always available (a consumer needs it); it registers
-        // under the NodeId-locator tag (see transport.rs ADR).
+        // under the NodeId-locator tag (see transport.rs ADR). It resolves the provider's
+        // dial address through the shared locator BEFORE dialing (TASK-169).
         let mut transfers = TransferRegistry::new();
-        transfers.register(Arc::new(Libp2pTransport::new(node.handle.clone())));
+        transfers.register(Arc::new(Libp2pTransport::new(
+            node.handle.clone(),
+            node_locator.clone(),
+        )));
+
+        let locator: Arc<dyn NodeLocator> = node_locator;
 
         // The serve axis exists only when a supplier was provided (a serving node).
         let server: Option<Arc<dyn NarServer>> = supplier

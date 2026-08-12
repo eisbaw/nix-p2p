@@ -31,26 +31,39 @@
 //! the shared `Iroh` tag ([`peer_fabric::TransferRegistry::register`] overwrites).
 //! Filed as TASK-156 (frozen-seam change with wire review); NOT attempted here.
 
+use std::sync::Arc;
+
 use async_trait::async_trait;
+use libp2p::Multiaddr;
 
 use peer_fabric::{
-    Blake3Digest, NarTransfer, SafetyEnvelope, TransferError, TransportOffer, TransportTag,
+    Blake3Digest, Lookup, NarTransfer, NodeLocator, ResolutionPolicy, SafetyEnvelope,
+    TransferError, TransportOffer, TransportTag,
 };
 
 use crate::keys::peer_id_of_provider;
+use crate::locator::Libp2pNodeLocator;
 use crate::nar::NarResponse;
 use crate::swarm::SwarmHandle;
 
 /// The libp2p [`NarTransfer`]. Holds a [`SwarmHandle`] to drive the shared swarm's NAR
-/// request-response protocol.
+/// request-response protocol, and the in-fabric [`Libp2pNodeLocator`] so the dial is
+/// driven by an EXPLICIT DHT resolution (TASK-169), never by whatever addresses an
+/// earlier, unrelated query happened to leave in the shared routing table.
 pub struct Libp2pTransport {
     handle: SwarmHandle,
+    /// The SAME locator instance the fabric exposes on its `node_locator()` axis (a
+    /// shared [`Arc`], so it appends to the fabric's ONE [`peer_fabric::ExposureLedger`]).
+    /// Reusing it keeps the `DialInfo` inside the fabric (the seam keeps it out of the
+    /// serving layer, `peer-fabric/src/capabilities.rs`) and keeps the OurNodeId->DhtNode
+    /// exposure accounting in one place rather than re-threading the ledger here.
+    locator: Arc<Libp2pNodeLocator>,
 }
 
 impl Libp2pTransport {
-    /// A transport driving `handle`.
-    pub fn new(handle: SwarmHandle) -> Self {
-        Libp2pTransport { handle }
+    /// A transport driving `handle`, resolving provider dial addresses through `locator`.
+    pub fn new(handle: SwarmHandle, locator: Arc<Libp2pNodeLocator>) -> Self {
+        Libp2pTransport { handle, locator }
     }
 }
 
@@ -84,6 +97,70 @@ impl NarTransfer for Libp2pTransport {
                 "provider {node} is not a valid ed25519 peer id, cannot dial over libp2p"
             ))
         })?;
+
+        // TASK-169: resolve WHERE the provider is dialable THROUGH the DHT (kad
+        // peer-routing) and seed the resolved address(es) into the swarm's address book
+        // EXPLICITLY, so the fetch below dials off THIS resolution - not off whatever a
+        // prior, unrelated query happened to leave in the shared routing table. This is
+        // the root-cause fix for the rejected side-effect design: the resolve-then-dial
+        // lives INSIDE the fabric, where the `DialInfo` is allowed to be (the seam keeps
+        // it out of the serving layer). `add_address` of a DHT-RESOLVED address is NOT
+        // injection - the address came from the DHT, not from the caller - and the shared
+        // locator records the OurNodeId->DhtNode disclosure to the fabric ledger.
+        //
+        // HONEST LIMIT (carried to TASK-161): on a small loopback DHT the request-response
+        // fetch can reuse a connection an earlier discovery query already opened to the
+        // provider, so this resolution being present does not PROVE it is the load-bearing
+        // dial mechanism. What it does establish: no address was injected out of band, and
+        // the dial is DRIVEN by an explicit in-fabric resolution. A Miss (healthy, no
+        // address known), an Unavailable (could-not-consult / empty routing), or a Found
+        // whose addresses are all unparseable all map to a typed `Unavailable` so the
+        // fetch driver falls through to the next offer/record (ultimately upstream) rather
+        // than silently dialing on stale routing state.
+        match self
+            .locator
+            .locate(&node, &ResolutionPolicy::PublicInfrastructure)
+            .await
+        {
+            Lookup::Found(dial_info) => {
+                let mut added = 0usize;
+                for location in &dial_info.locations {
+                    match location.parse::<Multiaddr>() {
+                        Ok(addr) => {
+                            self.handle.add_address(peer, addr).await;
+                            added += 1;
+                        }
+                        Err(why) => {
+                            // A DHT-reported location that does not parse as a Multiaddr is
+                            // anomalous (the locator built each from a real Multiaddr's
+                            // `to_string`); log and skip it rather than dial a malformed
+                            // address.
+                            tracing::warn!(
+                                %location, %why,
+                                "fabric-libp2p: skipping unparseable DHT-resolved dial address"
+                            );
+                        }
+                    }
+                }
+                if added == 0 {
+                    return Err(TransferError::Unavailable(format!(
+                        "libp2p resolved provider {node} but none of its DHT-reported \
+                         addresses parsed as a dialable Multiaddr"
+                    )));
+                }
+            }
+            Lookup::Miss => {
+                return Err(TransferError::Unavailable(format!(
+                    "libp2p node-locator knows no DHT dial address for provider {node} \
+                     right now (kad peer-routing miss)"
+                )));
+            }
+            Lookup::Unavailable(why) => {
+                return Err(TransferError::Unavailable(format!(
+                    "libp2p node-locator could not resolve provider {node}: {why}"
+                )));
+            }
+        }
 
         // Time-bound the whole dial+transfer by the envelope's TOTAL bound. The per-call
         // dial/idle split is a follow-up (request-response carries a single
