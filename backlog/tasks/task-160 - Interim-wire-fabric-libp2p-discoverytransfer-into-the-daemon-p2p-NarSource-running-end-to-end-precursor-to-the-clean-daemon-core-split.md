@@ -3,11 +3,11 @@ id: TASK-160
 title: >-
   Interim: wire fabric-libp2p discovery+transfer into the daemon p2p NarSource
   (running end-to-end, precursor to the clean daemon-core split)
-status: In Progress
+status: Done
 assignee:
   - '@claude'
 created_date: '2026-08-12 09:30'
-updated_date: '2026-08-12 10:23'
+updated_date: '2026-08-12 10:28'
 labels:
   - libp2p
   - daemon
@@ -59,3 +59,9 @@ FLAKE (not a regression): fabric-iroh iroh_node_lookup::synchronous_replay_valid
 
 FORWARD-CARRY: TASK-132 (cold-journey exposure of the kad path), TASK-145/146 (clean daemon-core/two-binary split - this interim both-backends link is deleted there), TASK-159 (real-network NAT for the dial). Follow-ups filed: TASK-161, TASK-162.
 <!-- SECTION:NOTES:END -->
+
+## Final Summary
+
+<!-- SECTION:FINAL_SUMMARY:BEGIN -->
+Interim daemon libp2p wiring DONE (in-process bar met). daemon links fabric-libp2p; Libp2pNarSource (daemon/src/source_libp2p.rs) implements the NarSource seam: NarHash->ContentKey (frozen recipe)->libp2p-kad find_providers->fetch raw NAR by content Blake3Digest->gate-1 BLAKE3 verify. Integration test (daemon/tests/libp2p_nar_source.rs): 3 in-process libp2p nodes, consumer knows only bootstrap, discovers provider via kad (NOT injected; asserts discovered==provider signed record), serves byte-identical via the real App stack (0 upstream fallbacks), MISS arm clean upstream fallback. Commits 2b075c6/311a8e3/e8b9f47/c91a747. Gate: workspace tests green (daemon lib 126, main 19); iroh e2e 5/5 STILL PASSES (no regression). MILESTONE: the daemon does decentralized content discovery+fetch+serve end-to-end (in-process). Follow-ups: TASK-161 podman multi-daemon libp2p e2e, TASK-162 production setup_p2p_source config, TASK-159 NodeLocator/NAT (byte-dial injected out-of-band today; discovery is the decentralized part).
+<!-- SECTION:FINAL_SUMMARY:END -->
