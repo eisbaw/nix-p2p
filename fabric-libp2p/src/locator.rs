@@ -24,11 +24,14 @@
 //!   * [`ResolutionPolicy::PublicInfrastructure`] - the active kad peer-routing query
 //!     above. It discloses this node's identity to the DHT nodes / bootstrap it contacts
 //!     (recorded to the ledger). Returns [`Lookup::Found`] with the learned Multiaddr
-//!     strings, [`Lookup::Miss`] when a query that REACHED the key's neighborhood knows
-//!     no address, and [`Lookup::Unavailable`] when the mechanism could not be consulted
-//!     (`InsufficientRouting` when the peer-routing walk reached no responding peer -
-//!     either an empty routing table or one of only dead entries, gated on the near-key
-//!     [`crate::QueryReach`], TASK-174; `DeadlineExceeded` on timeout).
+//!     strings, [`Lookup::Miss`] when a query that reached responding peers near the key
+//!     knows no address, and [`Lookup::Unavailable`] when the mechanism could not be
+//!     consulted (`InsufficientRouting` when the peer-routing walk reached NO responding
+//!     peer - either an empty routing table or one of only dead entries, gated on the
+//!     near-key [`crate::QueryReach`], TASK-174; `DeadlineExceeded` on timeout). See
+//!     [`crate::QueryReach`] for the honest limit of the `Miss` direction: reaching this
+//!     node's REACHABLE subgraph is not proof of reaching the target's global custodians
+//!     (an inherent single-node-view partition/eclipse residue).
 //!   * [`ResolutionPolicy::ExplicitPeersOnly`] - consult ONLY a statically configured peer
 //!     address book, disclosing nothing. This backend has no such book yet, so an
 //!     explicit-peers-only resolution has no source to answer from and returns
@@ -97,9 +100,10 @@ impl Libp2pNodeLocator {
                 ))
             }
             // A completed query that learned no address for the target. Whether that is
-            // an authoritative "no address known right now" (Miss) or a could-not-consult
+            // "no address known right now" (Miss) or a could-not-consult
             // (InsufficientRouting) turns on the NEAR-KEY bar: did the peer-routing walk
-            // actually reach any responding peer? (TASK-174.)
+            // actually reach any responding peer? (TASK-174; the Miss direction carries
+            // the partition/eclipse limit QueryReach documents.)
             Ok((_, reach)) => absence_from_reach(reach),
             Err(QueryFail::Timeout) => Lookup::Unavailable(Unavailable::DeadlineExceeded),
             Err(QueryFail::Backend(why)) => Lookup::Unavailable(Unavailable::Backend(why)),

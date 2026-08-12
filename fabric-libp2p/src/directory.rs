@@ -90,7 +90,10 @@ impl Libp2pProviderDirectory {
     /// only DEAD entries passes the pre-check (`routing_peers() > 0`) yet reaches nobody
     /// (`answered == 0`), so its empty result is the honest `InsufficientRouting`, not a
     /// false `Miss`. A completed query that DID reach responding peers near the key and
-    /// still found no provider is an authoritative `Miss`.
+    /// still found no provider is classified as a `Miss` - subject to the partition /
+    /// eclipse false-`Miss` limit `crate::QueryReach` documents (reaching this node's
+    /// REACHABLE subgraph is not proof of reaching the key's global custodians; that
+    /// residue is inherent to a single-node view and is not newly introduced here).
     async fn resolve(&self, key: &ContentKey) -> Lookup<Vec<ProviderRecord>> {
         if self.handle.routing_peers().await == 0 {
             return Lookup::Unavailable(Unavailable::InsufficientRouting);

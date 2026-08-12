@@ -32,22 +32,33 @@ pub enum QueryFail {
 /// How far a completed kad iterative query actually REACHED into the DHT (TASK-174).
 ///
 /// `answered` is `kad::QueryStats::num_successes()` at the terminal step: the number of
-/// peers that SUCCESSFULLY responded to our query messages during the walk toward the
-/// key. Because an iterative Kademlia lookup always walks TOWARD the key, this is the
-/// honest near-key signal:
+/// DISTINCT peers that SUCCESSFULLY responded to our query messages during the walk
+/// toward the key (kad only counts a peer's first real response). Because an iterative
+/// Kademlia lookup always walks TOWARD the key, this is the near-key signal:
 ///
 ///   * `answered > 0` - at least one peer answered, so the walk reached as close to the
-///     key as the network holds; an EMPTY result is then an authoritative absence
-///     ([`Lookup::Miss`]).
+///     key as THIS NODE'S REACHABLE subgraph holds; an EMPTY result is then classified
+///     as an absence ([`Lookup::Miss`]).
 ///   * `answered == 0` - NO peer ever answered (an empty routing table, or a table whose
-///     entries are all dead / unreachable), so we never consulted the key's
-///     neighborhood; an empty result is a could-not-consult
+///     entries are all dead / unreachable), so we never consulted ANY peer near the
+///     key; an empty result is a could-not-consult
 ///     ([`Unavailable::InsufficientRouting`]), never a `Miss`.
 ///
 /// This is strictly tighter than the old `routing_peers() == 0` bar: a routing table
 /// full of DEAD entries has `routing_peers() > 0` (which the old bar read as "on the
 /// network", yielding a false `Miss`) yet `answered == 0` here (the honest
 /// `InsufficientRouting`).
+///
+/// HONEST LIMIT (do not over-read the `Miss` direction): `answered > 0` proves the walk
+/// reached responding peers in this node's REACHABLE subgraph, NOT that it reached the
+/// key's true global k-custodians. A node PARTITIONED or ECLIPSED from those custodians
+/// can get `answered > 0` from the peers it CAN reach and still see an empty result -
+/// which this bar reports as `Miss` though the truth is "cannot reach the custodians".
+/// That false-`Miss` is inherent to a single-node DHT view (indistinguishable from
+/// global absence without global knowledge) and is the SAME class of limit
+/// `directory.rs` documents for the empty-table BootstrapOutage-vs-Partition case. This
+/// bar is strictly better than the old total-routing one; it does not - and at this
+/// layer cannot - eliminate the partition false-`Miss`.
 #[derive(Debug, Clone, Copy)]
 pub struct QueryReach {
     /// Peers that successfully answered the iterative query (`num_successes`).
@@ -66,8 +77,9 @@ impl QueryReach {
 /// Classify an EMPTY, completed kad query by how far it actually reached (TASK-174):
 /// the SHARED near-key bar both the directory (provider-index lookup) and the locator
 /// (peer-routing) gate Miss-vs-Unavailable on. An empty result that reached responding
-/// peers near the key is an authoritative absence ([`Lookup::Miss`]); one that reached
+/// peers near the key is treated as an absence ([`Lookup::Miss`]); one that reached
 /// nobody is a could-not-consult ([`Unavailable::InsufficientRouting`]), never a `Miss`.
+/// See [`QueryReach`] for the honest limit of the `Miss` direction (partition/eclipse).
 pub fn absence_from_reach<T>(reach: QueryReach) -> Lookup<T> {
     if reach.reached_neighborhood() {
         Lookup::Miss
