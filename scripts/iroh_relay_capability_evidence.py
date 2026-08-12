@@ -436,7 +436,7 @@ def connector_command(
         "--ip",
         topology.connector_ip,
         "--volume",
-        f"{gate}:/control:ro,Z",
+        f"{Path(gate).resolve()}:/control:ro,Z",
         config.image,
         *route_wrapper(routes, "/control/start", inner),
     ]
@@ -458,7 +458,7 @@ def capture_command(
         "--network",
         f"container:{topology.connector(scenario)}",
         "--volume",
-        f"{out}:/evidence:Z",
+        f"{out.resolve()}:/evidence:Z",
         config.image,
         "/bin/tcpdump",
         "-i",
@@ -790,6 +790,12 @@ def run_arm(
     if scenario in ACCEPTOR_ARMS:
         publication.signal_and_wait(
             runner, config.podman, topology.acceptor, "TERM", 15.0
+        )
+        # The acceptor is recreated per acceptor-arm under a run-scoped name;
+        # signal_and_wait only stops it, so remove the exited container or the
+        # next acceptor-arm collides on the name.
+        runner.run(
+            [config.podman, "rm", "-f", topology.acceptor], check=False
         )
 
     validate_outcome(scenario, outcome)
