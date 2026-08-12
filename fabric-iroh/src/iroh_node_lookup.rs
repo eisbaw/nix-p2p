@@ -1156,13 +1156,24 @@ mod tests {
         monotonic: MonotonicInstant,
     }
 
+    /// A clock whose SECOND read blocks for `post_validation_sleep`. In
+    /// `resolve` the first read happens in preflight and the second is the
+    /// post-validation observation (`read_and_observe_clock`, after the signed
+    /// record has been fetched, decoded and validated and its sequence
+    /// recorded). Sleeping strictly longer than the absolute deadline on that
+    /// second read drives the deadline breach to the post-validation
+    /// checkpoint deterministically - never to a pre-validation network check,
+    /// which would report no validated sequence.
     #[derive(Debug)]
-    struct SlowSecondClock(std::sync::atomic::AtomicUsize);
+    struct SlowSecondClock {
+        reads: std::sync::atomic::AtomicUsize,
+        post_validation_sleep: Duration,
+    }
 
     impl LookupClock for SlowSecondClock {
         fn read(&self) -> Result<ClockReading, NodeLookupUnavailable> {
-            if self.0.fetch_add(1, Ordering::SeqCst) == 1 {
-                std::thread::sleep(Duration::from_millis(50));
+            if self.reads.fetch_add(1, Ordering::SeqCst) == 1 {
+                std::thread::sleep(self.post_validation_sleep);
             }
             SystemLookupClock.read()
         }
@@ -1359,18 +1370,41 @@ mod tests {
             },
         )
         .unwrap();
+        // This test deliberately drives resolve() against a REAL loopback TCP
+        // authority, so tokio's paused clock is unusable here: with time paused
+        // the runtime would auto-advance to the deadline timer and fire the
+        // fetch's `timeout_at` mid-read, aborting the transfer before validation
+        // ever runs. The absolute deadline is therefore real wall time, and
+        // determinism comes from the relationship between two real durations
+        // rather than from a tight race against I/O:
+        //
+        //   * DEADLINE is generous relative to a loopback round-trip, so the
+        //     pre-validation network checks (which run before the record's
+        //     sequence is recorded) never trip under CPU contention. That early
+        //     trip was the original ~1/5 -> 2/3 flake: a 10ms deadline racing a
+        //     real TCP round-trip, so validated_sequence() saw None under load.
+        //   * POST_VALIDATION_SLEEP > DEADLINE, and it is consumed only on the
+        //     SECOND clock read, which resolve() performs AFTER the record is
+        //     fetched and validated. So the deadline is always breached at the
+        //     post-validation checkpoint, with the validated sequence recorded,
+        //     regardless of how long the fetch actually took.
+        //
+        // The oracle still bites: remove resolve()'s post-validation deadline
+        // guard and it returns success -> unwrap_err() panics; stop recording
+        // the validated sequence and validated_sequence() != Some(sequence).
+        const DEADLINE: Duration = Duration::from_millis(300);
+        const POST_VALIDATION_SLEEP: Duration = Duration::from_millis(400);
         let core = NodeLookupCore::new_with_clock_and_capacity(
             config,
-            Arc::new(SlowSecondClock(std::sync::atomic::AtomicUsize::new(0))),
+            Arc::new(SlowSecondClock {
+                reads: std::sync::atomic::AtomicUsize::new(0),
+                post_validation_sleep: POST_VALIDATION_SLEEP,
+            }),
             1,
         )
         .unwrap();
         let error = core
-            .resolve(
-                node_id,
-                key.public(),
-                Instant::now() + Duration::from_millis(10),
-            )
+            .resolve(node_id, key.public(), Instant::now() + DEADLINE)
             .await
             .unwrap_err();
         assert_eq!(error.kind(), NodeLookupUnavailableKind::Deadline);
