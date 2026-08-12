@@ -3,13 +3,14 @@
 //! [`ProviderRecord`]s of every provider, purely through the DHT, and distinguishes a
 //! healthy `Miss` from a could-not-consult `Unavailable`.
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
+use libp2p::PeerId;
 use peer_fabric::{
-    ContentKey, Disclosed, DiscoveryBudget, Exposure, ExposureLedger, ExposureSurface, Lookup,
-    ProviderAssertion, ProviderDirectory, ProviderRecord, Recipient, RecordDecodeError,
-    Unavailable, decode_provider_assertion,
+    ApplyOutcome, ContentKey, Disclosed, DiscoveryBudget, Exposure, ExposureLedger,
+    ExposureSurface, Lookup, ProviderAssertion, ProviderDirectory, ProviderRecord,
+    ProviderRecordSet, Recipient, RecordDecodeError, Unavailable, decode_provider_assertion,
 };
 
 use crate::keys::{peer_id_of_provider, provider_index_key, provider_value_key};
@@ -19,6 +20,68 @@ use crate::swarm::{QueryFail, SwarmHandle, absence_from_reach};
 pub struct Libp2pProviderDirectory {
     handle: SwarmHandle,
     ledger: Arc<ExposureLedger>,
+    /// The DURABLE per-`(ContentKey, provider)` monotonic floor (TASK-152, AC#3), wired
+    /// from the frozen `peer_fabric::record_store` oracle. EVERY fetched, decoded,
+    /// provider-bound assertion is `apply`-ed here before it can be returned, so a
+    /// replayed-old / rolled-back / stale / withdrawn record that passes the codec but
+    /// LOSES to the floor is never surfaced as a live provider. Kept ACROSS queries - the
+    /// floor only moves forward - so a value the DHT rolled back between two lookups is
+    /// caught by the sequence this node already saw. A std Mutex is fine: it is only ever
+    /// held for the SYNCHRONOUS apply loop, never across an `.await` (all `get_record`
+    /// fetches complete first).
+    store: Mutex<ProviderRecordSet>,
+}
+
+/// Apply one fetched, decoded `assertion` (from the DHT provider `peer`) against the
+/// durable floor and the PeerId<->provider binding, returning the live record IFF it is
+/// admitted. `None` when the assertion is a foreign-provider spoof (AC#4), a withdrawal
+/// tombstone, or LOSES to the monotonic floor (replay / rollback / stale / already-expired,
+/// AC#3). PURE over `store`, so the whole lifecycle decision is unit-testable without a
+/// live DHT.
+fn admit(
+    store: &mut ProviderRecordSet,
+    peer: PeerId,
+    assertion: ProviderAssertion,
+    now: u64,
+) -> Option<ProviderRecord> {
+    // AC#4: bind the signed record's provider to the index entry it was fetched under -
+    // reject a peer that re-stored a THIRD party's record at its own composite key (index
+    // spoofing). The forward derivation (verifying key -> PeerId) is always available.
+    // Done BEFORE apply so a spoof never even reaches the durable floor.
+    if peer_id_of_provider(assertion.provider()) != Some(peer) {
+        tracing::warn!(
+            %peer, provider = %assertion.provider(),
+            "record provider does not derive to the index PeerId; \
+             rejecting (possible index spoof)"
+        );
+        return None;
+    }
+    match store.apply(&assertion, now) {
+        // A positive record that is new/strictly-newer (Applied) or the byte-identical
+        // current one re-fetched (Idempotent) is the live record for the slot.
+        ApplyOutcome::Applied | ApplyOutcome::Idempotent => match assertion {
+            ProviderAssertion::Provide(record) => Some(record),
+            // A withdrawal never becomes a positive record; an Idempotent re-broadcast of
+            // the current tombstone stays withdrawn.
+            ProviderAssertion::Withdraw(_) => None,
+        },
+        ApplyOutcome::Withdrawn => {
+            tracing::debug!(%peer, "provider withdrawal tombstoned the slot; not returning");
+            None
+        }
+        ApplyOutcome::RejectedStale { current, offered } => {
+            tracing::debug!(
+                %peer, current, offered,
+                "provider record lost to the monotonic floor \
+                 (replay / rollback / stale); skipping"
+            );
+            None
+        }
+        ApplyOutcome::RejectedExpired { expiry, now } => {
+            tracing::debug!(%peer, expiry, now, "provider record already expired; skipping");
+            None
+        }
+    }
 }
 
 /// Classify the outcome of the value-store phase (a PURE decision, unit-tested to bite
@@ -46,7 +109,11 @@ fn classify(records: Vec<ProviderRecord>, consult_failed: bool) -> Lookup<Vec<Pr
 impl Libp2pProviderDirectory {
     /// A directory driving `handle`, recording disclosures to `ledger`.
     pub fn new(handle: SwarmHandle, ledger: Arc<ExposureLedger>) -> Self {
-        Libp2pProviderDirectory { handle, ledger }
+        Libp2pProviderDirectory {
+            handle,
+            ledger,
+            store: Mutex::new(ProviderRecordSet::new()),
+        }
     }
 
     /// The two-phase resolve, WITHOUT the outer deadline (the trait method wraps this
@@ -139,43 +206,38 @@ impl Libp2pProviderDirectory {
 
         let mut records = Vec::new();
         let mut consult_failed = false;
-        for (peer, outcome) in results {
-            match outcome {
-                Ok(Some(bytes)) => match decode_provider_assertion(&bytes, key, now) {
-                    Ok(ProviderAssertion::Provide(record)) => {
-                        // Bind the signed record's provider to the index entry it was
-                        // fetched under: reject a peer that re-stored a THIRD party's
-                        // record at its own composite key (index spoofing). The forward
-                        // derivation (verifying key -> PeerId) is always available.
-                        if peer_id_of_provider(&record.provider) == Some(peer) {
-                            records.push(record);
-                        } else {
-                            tracing::warn!(
-                                %peer, provider = %record.provider,
-                                "record provider does not derive to the index PeerId; \
-                                 rejecting (possible index spoof)"
-                            );
+        {
+            // Lock the durable floor for the whole SYNCHRONOUS apply loop (no `.await`
+            // inside - every fetch already completed above). Each fetched assertion is
+            // decoded by the FROZEN codec, then run through `admit`, which enforces the
+            // PeerId<->provider binding (AC#4) and the monotonic/withdrawal/expiry floor
+            // (AC#3) before it can contribute a live record.
+            let mut store = self.store.lock().expect("record-store mutex poisoned");
+            for (peer, outcome) in results {
+                match outcome {
+                    Ok(Some(bytes)) => match decode_provider_assertion(&bytes, key, now) {
+                        Ok(assertion) => {
+                            if let Some(record) = admit(&mut store, peer, assertion, now) {
+                                records.push(record);
+                            }
                         }
+                        Err(RecordDecodeError::Stale { expiry, now }) => {
+                            tracing::debug!(%peer, expiry, now, "provider record expired, skipping");
+                        }
+                        Err(why) => {
+                            // Untrusted hint infrastructure: a malformed/forged value costs
+                            // skipping this provider, never a bad answer (Nix re-verifies).
+                            tracing::warn!(%peer, %why, "rejecting invalid provider record");
+                        }
+                    },
+                    Ok(None) => {
+                        tracing::debug!(%peer, "no value record for indexed provider, skipping");
                     }
-                    Ok(ProviderAssertion::Withdraw(_)) => {
-                        tracing::debug!(%peer, "provider record is a withdrawal, skipping");
+                    Err(fail) => {
+                        // Could-not-consult: this must NOT let an empty result become Miss.
+                        consult_failed = true;
+                        tracing::debug!(%peer, ?fail, "value-record consultation failed");
                     }
-                    Err(RecordDecodeError::Stale { expiry, now }) => {
-                        tracing::debug!(%peer, expiry, now, "provider record expired, skipping");
-                    }
-                    Err(why) => {
-                        // Untrusted hint infrastructure: a malformed/forged value costs
-                        // skipping this provider, never a bad answer (Nix re-verifies).
-                        tracing::warn!(%peer, %why, "rejecting invalid provider record");
-                    }
-                },
-                Ok(None) => {
-                    tracing::debug!(%peer, "no value record for indexed provider, skipping");
-                }
-                Err(fail) => {
-                    // Could-not-consult: this must NOT let an empty result become Miss.
-                    consult_failed = true;
-                    tracing::debug!(%peer, ?fail, "value-record consultation failed");
                 }
             }
         }
@@ -254,5 +316,151 @@ mod tests {
             Lookup::Unavailable(Unavailable::Backend(_)) => {}
             other => panic!("expected Unavailable(Backend), got {other:?}"),
         }
+    }
+
+    // --- `admit` lifecycle-floor tests (TASK-152 AC#3/#4/#1-consume). Each crafts the
+    // assertions a fetch would yield and drives the SAME durable `ProviderRecordSet` the
+    // resolver keeps across queries, so a mutation to the guard under test changes the
+    // returned record and fails the test.
+
+    use ed25519_dalek::SigningKey;
+    use peer_fabric::{
+        ProviderRecordSet, ProviderWithdrawal, TransportOffer, sign_provider_record,
+        sign_provider_withdrawal,
+    };
+
+    fn a_key() -> ContentKey {
+        ContentKey::derive_from_signed_nar_hash(&[0x11; 32])
+    }
+    fn signer(seed: u8) -> SigningKey {
+        SigningKey::from_bytes(&[seed; 32])
+    }
+    fn provider_of(sk: &SigningKey) -> NodeId {
+        NodeId::from_bytes(sk.verifying_key().to_bytes())
+    }
+    /// A signed provide from `sk` over `key`, self-serve iroh offer at its own node.
+    fn signed_provide(
+        sk: &SigningKey,
+        key: ContentKey,
+        sequence: u64,
+        expiry: u64,
+    ) -> ProviderAssertion {
+        let provider = provider_of(sk);
+        let record = ProviderRecord {
+            key,
+            content: Blake3Digest::from_bytes([0xaa; 32]),
+            provider,
+            offers: vec![TransportOffer::Iroh { node: provider }],
+            sequence,
+            issued_at: 0,
+            expiry,
+            signature: [0u8; 64],
+        };
+        ProviderAssertion::Provide(sign_provider_record(sk, &record))
+    }
+    fn signed_withdraw(
+        sk: &SigningKey,
+        key: ContentKey,
+        sequence: u64,
+        expiry: u64,
+    ) -> ProviderAssertion {
+        ProviderAssertion::Withdraw(sign_provider_withdrawal(
+            sk,
+            &ProviderWithdrawal {
+                key,
+                provider: provider_of(sk),
+                sequence,
+                issued_at: 0,
+                expiry,
+                signature: [0u8; 64],
+            },
+        ))
+    }
+    fn peer_of(sk: &SigningKey) -> PeerId {
+        peer_id_of_provider(&provider_of(sk)).expect("valid ed25519 identity")
+    }
+
+    #[test]
+    fn admit_returns_a_fresh_provider_record() {
+        let mut store = ProviderRecordSet::new();
+        let sk = signer(3);
+        let key = a_key();
+        let record = admit(
+            &mut store,
+            peer_of(&sk),
+            signed_provide(&sk, key, 1, 1_000),
+            0,
+        );
+        assert_eq!(record.expect("admitted").sequence, 1);
+    }
+
+    #[test]
+    fn admit_rejects_a_foreign_provider_spoof() {
+        // AC#4 BITE: a record legitimately signed by A, but fetched under B's index entry
+        // (B re-stored A's record at B's own composite key). admit must reject it -
+        // remove the peer<->provider binding and the spoofed record would be returned.
+        let mut store = ProviderRecordSet::new();
+        let alice = signer(3);
+        let bob = signer(4);
+        let key = a_key();
+        let foreign = signed_provide(&alice, key, 1, 1_000); // signed by Alice
+        assert!(
+            admit(&mut store, peer_of(&bob), foreign, 0).is_none(),
+            "a third-party record stored under the wrong provider key is rejected"
+        );
+    }
+
+    #[test]
+    fn admit_rejects_a_replayed_or_rolled_back_record() {
+        // AC#3 BITE: the durable floor advances to seq 5; a later fetch of the OLD seq-3
+        // record (a replay / rollback the DHT served) loses to the floor and is not
+        // returned. Remove the store.apply gate and the stale record would be returned.
+        let mut store = ProviderRecordSet::new();
+        let sk = signer(3);
+        let peer = peer_of(&sk);
+        let key = a_key();
+        assert!(admit(&mut store, peer, signed_provide(&sk, key, 5, 1_000), 0).is_some());
+        assert!(
+            admit(&mut store, peer, signed_provide(&sk, key, 3, 1_000), 0).is_none(),
+            "a replayed / rolled-back older record must lose to the monotonic floor"
+        );
+        // And the newer record's floor persists: re-fetching seq 5 (identical) is still live.
+        assert!(admit(&mut store, peer, signed_provide(&sk, key, 5, 1_000), 0).is_some());
+    }
+
+    #[test]
+    fn admit_tombstones_on_withdrawal_and_blocks_resurrection() {
+        // AC#1-consume + AC#3 BITE: after a fetched withdrawal (seq 2) tombstones the slot,
+        // the provider is no longer returned AND a replay of the old seq-1 record cannot
+        // resurrect it. Mutation: make the Withdrawn arm return the record and the
+        // withdrawn provider is still Found; drop the floor and the replay resurrects.
+        let mut store = ProviderRecordSet::new();
+        let sk = signer(3);
+        let peer = peer_of(&sk);
+        let key = a_key();
+        assert!(admit(&mut store, peer, signed_provide(&sk, key, 1, 10_000), 0).is_some());
+        assert!(
+            admit(&mut store, peer, signed_withdraw(&sk, key, 2, 10_000), 0).is_none(),
+            "a withdrawal is a tombstone, not a live record"
+        );
+        assert!(
+            admit(&mut store, peer, signed_provide(&sk, key, 1, 10_000), 0).is_none(),
+            "a replay of the pre-withdrawal record must NOT resurrect the provider"
+        );
+    }
+
+    #[test]
+    fn admit_is_idempotent_on_refresh() {
+        // A provider periodically re-announcing the byte-identical current record keeps
+        // being returned (Idempotent -> live), not dropped as a conflict.
+        let mut store = ProviderRecordSet::new();
+        let sk = signer(3);
+        let peer = peer_of(&sk);
+        let key = a_key();
+        assert!(admit(&mut store, peer, signed_provide(&sk, key, 4, 1_000), 0).is_some());
+        assert!(
+            admit(&mut store, peer, signed_provide(&sk, key, 4, 1_000), 0).is_some(),
+            "an idempotent refresh stays live"
+        );
     }
 }

@@ -3,10 +3,11 @@ id: TASK-152
 title: >-
   fabric-libp2p: DHT record-lifecycle hardening (withdrawal tombstone,
   expiry/TTL, replay/rollback, partition/rejoin)
-status: To Do
-assignee: []
+status: In Progress
+assignee:
+  - mped
 created_date: '2026-08-12 07:55'
-updated_date: '2026-08-12 08:12'
+updated_date: '2026-08-12 19:35'
 labels:
   - libp2p
   - fabric

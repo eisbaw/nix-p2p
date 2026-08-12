@@ -46,6 +46,11 @@ futures = "0.3"
 blake3 = "1"
 # Structured, level-appropriate logging of swarm/kad events (fail verbosely).
 tracing = "0.1"
+# The announcer SIGNS its own ProviderWithdrawal tombstones (TASK-152, AC#1) with the
+# SAME ed25519 secret that IS this node's identity (self-serve v1: a node only ever
+# withdraws records it itself signed). `sign_provider_withdrawal` takes an
+# ed25519-dalek `SigningKey`; "3" matches peer-fabric's, so it is the one shared type.
+ed25519-dalek = "3"
 
 [dev-dependencies]
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "net"] }

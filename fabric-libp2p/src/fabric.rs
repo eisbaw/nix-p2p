@@ -58,6 +58,10 @@ impl Libp2pFabric {
         config: NodeConfig,
         supplier: Option<Arc<dyn Libp2pNarSupplier>>,
     ) -> Result<Libp2pFabric, NodeError> {
+        // The node identity IS the record-signing secret (self-serve v1). Capture it
+        // BEFORE `Node::start` consumes `config`, so the announcer can sign its own
+        // withdrawal tombstones (TASK-152, AC#1) with the same key `node_id` derives from.
+        let signing_key = ed25519_dalek::SigningKey::from_bytes(&config.identity_seed);
         let node = Node::start(config)?;
         let ledger = Arc::new(ExposureLedger::new());
 
@@ -70,6 +74,7 @@ impl Libp2pFabric {
             ledger.clone(),
             node.node_id,
             node.peer_id,
+            signing_key,
         ));
         // The node-locator resolves a provider's dial address THROUGH kad peer-routing.
         // ONE concrete instance is shared (TASK-169): the fetch transport drives its dial
