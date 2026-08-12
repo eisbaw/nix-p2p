@@ -1,12 +1,12 @@
 ---
 id: TASK-103
 title: >-
-  Implement the selected ProviderDirectory backend (adopt iroh-dht-experiment /
-  fallback libp2p-kad) behind the PeerFabric seam
+  Implement the libp2p-kad ProviderDirectory backend (fabric-libp2p) behind the
+  PeerFabric seam
 status: To Do
 assignee: []
 created_date: '2026-08-10 10:04'
-updated_date: '2026-08-12 04:17'
+updated_date: '2026-08-12 04:29'
 labels:
   - iroh
   - discovery
@@ -49,5 +49,5 @@ Implement TASK-126s frozen decentralized exact-key content discovery behind Cont
 ## Implementation Notes
 
 <!-- SECTION:NOTES:BEGIN -->
-FORWARD-CARRY from TASK-144 inc 1 (commit 2394bee): the fabric-iroh backend crate now EXISTS (peer-fabric + iroh; never depends on the daemon). The iroh TRANSFER (iroh-blobs, in transport_iroh - TASK-148 moves it here) and the iroh NodeLocator (pkarr, iroh_node_lookup - already here) live in fabric-iroh. Per docs/peer-fabric-seam.md SPIKE DECISION the ProviderDirectory PRIMARY freeze target is libp2p-kad's opaque put_record/get_record (iroh-dht-experiment is fallback), so the ProviderDirectory impl belongs in a fabric-libp2p crate (not yet a workspace member), NOT in fabric-iroh - a dual-stack IrohFabric would return an iroh transfer + a libp2p directory. A backend plugs in by implementing the peer_fabric capability traits and being assembled into a concrete Fabric struct (Option<Arc<dyn>> fields) at the composition root.
+TASK-147 (Mark-emulator, 2026-08-12) DECIDED dual-stack default: this task implements the libp2p-kad ProviderDirectory (put_record/get_record carrying the frozen opaque ContentKey->signed ProviderRecord codec) in a NEW fabric-libp2p crate (not iroh-dht-experiment - the spike proved it stores a fixed typed enum, not opaque bytes). Dual-stack wiring: the default daemon-iroh composition root assembles fabric-iroh (transfer+NodeLocator+NarServer+mDNS) AND fabric-libp2p (ProviderDirectory+AvailabilityAnnouncer) into one Fabric. Shared identity: ONE ed25519 secret constructs both iroh NodeId and libp2p PeerId, and the AvailabilityAnnouncer signs each ProviderRecord with that key so provider==the iroh identity that serves. CAVEAT (self-critical): PeerId==NodeId is SAME-KEYPAIR/mutually-derivable, NOT byte-equality - iroh NodeId is the raw 32B ed25519 pubkey, libp2p PeerId is a multihash wrapper; carry a BITE TEST proving both round-trip to the same pubkey; assume no string/byte identity. Resource tests (AC#8) must budget BOTH event loops/holepunchers.
 <!-- SECTION:NOTES:END -->
