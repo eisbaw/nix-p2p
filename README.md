@@ -1,301 +1,208 @@
 # nix-p2p
 
-> **Work in progress — nothing here is stable.** The name "nix-p2p" is
-> tentative. Peer *transfer* works; peer *discovery* does not — the query
-> protocol exists and is measured, but the DHT mechanism and its key derivation
-> are still open design work, and nodes currently learn about each other from
-> the command line. The claim wire schema and the addressed unit are frozen;
-> everything else may change.
+A decentralized Nix binary cache: a localhost substituter daemon that speaks the
+standard binary-cache HTTP API, passes signed metadata through from
+cache.nixos.org, and fetches NAR payloads **from peers it discovers over a
+decentralized DHT** — every payload hash-verified against the signed NarHash. An
+unmodified Nix client re-verifies the signature and NarHash itself, so the daemon
+and every peer stay **outside the trusted computing base**: a hostile or broken
+peer costs a retry, never a bad store path.
 
-A decentralized Nix binary cache: a localhost substituter daemon that serves
-the standard binary-cache HTTP API, passes signed metadata through from an
-upstream cache, and fetches NAR payloads from peers over iroh, hash-verified
-against the signed NarHash. An unmodified Nix client re-verifies signature and
-NarHash itself, so the daemon and all peers stay outside the trusted computing
-base.
+The goal is **bandwidth offload for cache.nixos.org — decentralizing the bytes,
+not the trust.** Signing stays the cache's job.
 
-The goal is bandwidth offload for cache.nixos.org — decentralizing the bytes,
-not the trust. Metadata and signatures remain the cache's job.
+> **Research prototype — not production, and not on a real network yet.** It has
+> never been pointed at the real cache.nixos.org (the daemon is plain-HTTP only;
+> TLS is tasks 22/24), and every result below is from loopback / in-process /
+> rootless-container testbeds — **no NAT, no relay, no residential uplink.** The
+> addressed unit, the claim wire schema, and the discovery key/record are frozen;
+> much else is still moving.
 
-**It has never been pointed at the real cache.nixos.org.** The daemon speaks
-plain HTTP only and rejects an `https://` upstream outright
-(`daemon/src/upstream.rs`), so every result below was produced against a local
-mock cache behind a test proxy. Fronting the real thing needs TLS on both
-(tracked as tasks 22 and 24).
+## What works today
 
-## Status
+The core decentralized path **runs and is verified end-to-end (in-process)** — the
+big recent change is that discovery is no longer a protocol without a mechanism:
 
-**Wave 1 complete; wave 2a (peer transfer) working; discovery is a protocol
-without a mechanism.**
+- **Decentralized content discovery.** `fabric-libp2p` runs **libp2p-kad**: a node
+  announces a signed provider record under a NarHash-derived key, and another node
+  resolves *"who has this NAR?"* through the Kademlia DHT with **no injected
+  answer**. Proven by multi-node tests (a bootstrap + providers + a consumer that
+  knows only the bootstrap's address) covering the *found / miss / unavailable*
+  arms. A custom protocol keeps it off the public IPFS DHT.
+- **Peer transfer, two backends** — the fetched NAR is BLAKE3/bao-verified on
+  arrival:
+  - **iroh-blobs** (whole-NAR over QUIC): a real `nix build` served from a peer
+    across container network namespaces (the s6 e2e); a corrupt peer fails the
+    build, a dead peer falls back to upstream.
+  - **libp2p** (request-response over the same swarm as discovery): multi-node
+    byte-identical, BLAKE3-verified fetch with streaming size-abort and serve-budget
+    bites.
+- **The daemon actually uses it.** An integration test drives the real serving
+  stack: given a NarHash the daemon derives the discovery key, finds a provider via
+  libp2p-kad (not injected), fetches + verifies the NAR over libp2p, and serves
+  byte-identical bytes to Nix — with a clean upstream fallback on a miss.
+- **Transparent substituter proxy** (solid): `nix-cache-info` semantics, narinfo
+  disk cache, NAR correlation catalog, multi-daemon chains, additive-invariant
+  crash tests, a NixOS module + 3-VM test.
+- **Regenerate-on-demand supply.** A node announces what it can serve without
+  holding it, regenerates from `/nix/store` on request inside a serve budget (max
+  NAR size, max in-flight bytes, max duration), and holds **0 bytes at rest**.
+- **No enumeration, by construction.** There is no "list my holdings" call at all;
+  discovery answers only about keys the asker named.
 
-A real `nix build` is served from a peer over iroh, across container network
-namespaces, verified twice: BLAKE3/bao on arrival and Nix's own signature +
-NarHash check. A corrupt peer fails the build rather than poisoning the store;
-a dead peer falls back to upstream.
+## What does not work yet (the honest headline)
 
-What works:
+- **Nothing has run on a real network.** All of the above is loopback / in-process
+  / single-host containers. No NAT traversal, relay, or residential uplink — the
+  libp2p `NodeLocator` (AutoNAT/DCUtR/relay) is TASK-159, and the byte-transfer
+  dial address is still injected out-of-band (only the *discovery* is decentralized
+  today).
+- **No cold-journey PoC yet.** A real *cold* `nix build` that discovers and fetches
+  fully decentrally with zero injection (TASK-132), and a multi-daemon podman e2e
+  for the libp2p path (TASK-161), are not built.
+- **The clean packaging isn't done.** One `daemon` crate still links everything; the
+  `daemon-core` split into separate `daemon-iroh` / `daemon-libp2p` binaries is the
+  target (TASK-145/146). Production CLI wiring for libp2p is landing (TASK-162).
+- **The value thesis is unproven** (see below) and **no swarm dynamics are
+  measured**: cold warm-up, announce-after-fetch, multi-holder failover, and
+  hedge/prefetch policies do not exist yet.
+- **Provider records don't survive a restart**, and the DHT hardening — signed
+  withdrawal tombstones, replay/eclipse/sybil bounds, true streaming — is filed but
+  not done (TASK-152–159).
 
-- Transparent substituter proxy — `nix-cache-info` semantics, narinfo disk
-  cache, NAR correlation catalog, multi-daemon chains, NixOS module + VM test.
-- iroh whole-NAR transport behind `NarSource`, with a frozen claim wire schema,
-  an announce-on-demand availability index that answers yes/no and has no
-  listing call at all (enumeration is prevented by construction, not by a
-  filter), and a conservative safety envelope (dial/idle/fetch timeouts,
-  streaming NarSize abort).
-- A **hold-query protocol**, single-key and batched: one bounded message asks a
-  peer about a whole closure and gets back positional yes/nos, so discovery
-  costs a round trip per peer rather than per NAR. It is still not a listing —
-  the answer names nothing the asker did not ask about.
-- A **regenerate-on-demand supply model**: a node announces what it can serve
-  without holding it, regenerates on request inside an explicit serve budget
-  (max NAR size, max concurrent bytes, max serve duration), and releases
-  afterwards. What it answers "yes" about and what it can actually serve are
-  the same set — proven where both sets exist in one process; no node has yet
-  answered another's hold-query over a network, so this is not yet demonstrated
-  between two hosts.
-- A measurement and profiling stack: frozen egress counting rule, regression
-  fitter with model selection and confidence intervals, and a p2p profiler
-  covering RAM, disk, latency, throughput and speedup.
+## The catch you should know up front: will peers actually beat a CDN?
 
-What does **not** work yet — the honest headline:
+This is the project's weakest point, and it's stated plainly rather than assumed
+away. A peer ships the **raw** NAR; cache.nixos.org ships **xz** (`FileSize/NarSize
+≈ 0.278`, measured on 20 live paths), so a peer moves ~**3.6× the bytes** and would
+need to sustain ~**75 MB/s upload just to break even** — against a 1.25–5 MB/s home
+uplink. Compressing the peer link (an *unsigned* transport field; the addressed
+unit stays the raw NAR) can claw this back but isn't built. **So on speed the
+honest answer is: unknown, and probably unfavourable for a remote peer until the
+link is compressed.** The long tail is where a CDN is strong and swarms are weak,
+and the PRD does not pretend otherwise. What *is* solid is the trust model and the
+offload accounting (a peer hit is a genuine 0-egress crossing at the cache).
 
-- **Peers cannot find each other.** There is no DHT and no gossip. Nodes
-  connect because `--iroh-peer` and `--p2p-claim` were passed on the command
-  line, so today this decentralizes *transfer*, not *discovery*. The hold-query
-  that will do the asking runs only over an in-process rendezvous: nothing
-  carries it over iroh yet, and the serving path does not call it.
-- A node supplies from raw-NAR *files* it was pointed at, not from
-  `/nix/store`. The index-backed supplier that dumps real store paths exists
-  and is tested, but nothing wires it into the daemon yet.
-- No multi-holder failover, no streaming (the fetching side still buffers the
-  whole NAR), and no policies at all — no hedge, prefetch, announce budget, or
-  leech mode.
-- A published claim does not survive a restart: the digest→path binding is
-  in-memory, so a peer holding an old claim gets a clean decline until some
-  hold-query re-derives it.
-- Nothing has run on a real network: no NAT, no relay, no residential uplink.
-
-Measured on the container testbed (single host, so read the caveats):
-
-| Measurement | Result |
-|---|---|
-| Upstream NAR-payload egress offloaded | **1.00**, both conditions — but see below |
-| vs. a WAN-shaped upstream (50 ms RTT, 20 MiB/s) | peer path 6.1× faster — **withdrawn, see below** |
-| vs. a zero-latency loopback upstream | peer path 4.0× slower — **withdrawn, see below** |
-| Holder RAM per byte served | **1.018 B/B** [1.007 .. 1.028] |
-| Holder RAM held per byte *announced*, at rest | **0.00** |
-| Holder RAM per concurrent serve | **38.4 MB** [38.0 .. 38.8] |
-
-Every figure above is from one full profiling run at commit `63caca2`, and the
-transport and discovery code has changed since without being re-measured — read
-them as of that commit, not of `HEAD`. Holder RAM is a slope fitted over five
-NAR sizes with a 95% confidence interval, not a single-point ratio; before the
-supply model it was **2.004 [2.000 .. 2.009]** with the blob store holding 1.00
-bytes per byte announced *forever*.
-
-**The offload figure is steady-state by construction and must not be read as a
-swarm result.** It is measured with a holder pre-seeded with exactly what the
-client asks for — one peer that already has it. A *cold* swarm cannot offload
-anything: at t=0 nobody holds anything, every path comes from upstream, and
-offload is ~0. What a real swarm achieves is a curve between those, and this
-project has not measured it (tasks 87/88). Announce-after-fetch, the mechanism
-that would let a swarm warm up at all, is not implemented either (task 77).
-
-**Both speedup figures are withdrawn.** They were measured against a fixture
-upstream that serves NAR data *uncompressed*, exactly as our peers do. The real
-cache.nixos.org serves xz: measured on 20 signed paths over 10 MiB from the live
-cache, `FileSize/NarSize` is **0.278** (median 0.216). A peer therefore moves
-about **3.6× the bytes** upstream moves for the same store path, and would need
-to sustain roughly **75 MB/s (604 Mbit/s) upload just to break even** — before
-any discovery cost. A home uplink is 1.25–5 MB/s.
-
-So the honest position on speed is: **unknown, and probably unfavourable for a
-remote peer until the peer link is compressed.** The fix does not touch anything
-frozen (compression is an unsigned transport field, and the addressed unit stays
-the raw NAR), it just has not been built yet. The numbers above will be
-re-measured against a compressed upstream once it is.
-
-What survives unchanged is the offload result, which does not depend on relative
-speed — and the observation that the *ranking* between the two conditions flips,
-which is why no single speedup number was ever quotable alone.
-
-The supply model **cost latency to buy the memory guarantee**: regenerating a
-NAR per serve moved peers-on from 0.638 s to 0.964 s under WAN shaping (6.1×
-rather than the 9.3× the retain-everything build reached). That trade is stated
-rather than buried — holding nothing at rest is not free.
-
-Discovery is measured separately (`just discovery`): finding the holders of a
-200-path closure across 8 peers costs **1180 → 8 round trips**. That is a count,
-not a speedup — the wall-clock gain depends entirely on the RTT the round trips
-would have crossed, and these peers were in one process.
-
-`TESTING.md` forbids claiming emergent network effects from single-host sweeps,
-and the peer link is still loopback, so peer-side numbers are upper bounds.
-
-See `PRD.md` for the full design record and `backlog/` for task state.
+*Measurements* (iroh transport, commit `63caca2`, single-host — upper bounds only;
+`TESTING.md` forbids reading swarm effects into single-host sweeps): upstream
+NAR-payload egress offload **1.00** steady-state (one pre-seeded holder — a *cold*
+swarm offloads ~0); holder RAM **1.018 B/B** while serving, **0.00** at rest;
+**38.4 MB** per concurrent serve. The libp2p transfer and discovery are newer and
+not yet throughput-profiled.
 
 ## Architecture
 
-A stack-neutral **frontend** with a swappable P2P **backend**, plus a separate
-test fixture. `just independence` enforces that the product and the fixture
-never share code, so the fixture stays an independent witness of wire behaviour.
-See `figures/fig-arch-5-peer-fabric.svg` for the whole picture and
-`docs/peer-fabric-seam.md` for the seam.
+A stack-neutral **frontend** over a swappable P2P **backend**, plus a separate test
+fixture (`just independence` keeps the product and the fixture from sharing code,
+so the fixture stays an independent witness of wire behaviour). See
+`figures/fig-arch-5-peer-fabric.svg` and `docs/peer-fabric-seam.md`.
 
-- **`daemon/`** — the product. All *serving* behaviour sits behind two frozen
-  seams: `NarinfoSource` (narinfo lookup: upstream HTTP, disk cache; p2p relay
-  in v2) and `NarSource` (resolve a typed `NarKey` — the signed NarHash on the
-  normal path — to a verified NAR stream), so the p2p swap needs no HTTP-layer
-  change. All *P2P* behaviour sits behind a third, intention-level seam,
-  **`PeerFabric`** (find providers · announce · locate · fetch · serve ·
-  hold-query · LAN). **libp2p is the primary stack; iroh is an optional
-  transport.** iroh is a connectivity substrate — superb at *EndpointId → QUIC
-  bytes* — but it has **no content-provider routing** ("who has hash X?"), only
-  address lookup, so a decentralized cache cannot *discover* on iroh alone.
-  Discovery is therefore **`libp2p-kad`** (`get_providers`/`start_providing`, the
-  robust IPFS-proven provider DHT), *adopted* not hand-rolled (no
-  Kademlia-over-iroh). iroh-blobs is kept as an **optional** `NarTransfer` for its
-  NAT traversal, measured against libp2p's transport in the tournament; discovery
-  is libp2p-kad regardless. Target packaging: a stack-neutral `daemon-core`
-  frontend over `fabric-libp2p` (kad + libp2p transport) plus the optional
-  `fabric-iroh` (iroh transport). *Today the daemon is a single crate with iroh
-  welded in and no discovery yet; the seam/crate-split and libp2p-kad are the
-  target, not built.* A NAR transport plugs in as one `NarSource`/`Transport` impl with a
-  `TransportRegistry` dispatching on each claim offer's tag — so a second
-  transport (BitTorrent) is a new implementation, not a network fork.
-- **`testproxy/`** — the permanent test fixture. A simple caching proxy that
-  fronts the upstream (real or mock) and owns all fault injection: latency,
-  errors, corruption, throttling. Adversarial-upstream logic never lives in
-  the product. It is *intended* to also shield cache.nixos.org from test load,
-  but it is plain-HTTP only today (task-22), so it currently fronts a local
-  mock origin rather than the real cache.
+**Three seams.** Serving sits behind `NarinfoSource` (narinfo lookup) and
+`NarSource` (resolve a signed NarHash to a verified byte stream). All P2P sits
+behind the intention-level **`PeerFabric`** seam — *find providers · announce ·
+locate · fetch · serve · hold-query · LAN* — so the serving core holds **zero** p2p
+types.
 
-Supporting pieces:
+**libp2p-primary; iroh optional.** iroh is a superb *connectivity* substrate ("dial
+an `EndpointId`, get authenticated QUIC bytes") but has **no content-provider
+routing** — it answers "*where is this node?*", never "*who has hash X?*". So
+**discovery is always `libp2p-kad`** (adopted, IPFS-mainnet-proven; not hand-rolled,
+no Kademlia-over-iroh), and **iroh-blobs is an *optional* transport** kept for its
+NAT traversal and measured against libp2p's own transport. See "iroh's shortcomings"
+in `PRD.md`.
 
-- **`fixtures/`** — a signed mock binary cache, generated deterministically
-  and published via atomic generation flips (`scripts/gen-fixtures.py`).
-- **`scripts/`** — the e2e harness (rootless podman pods:
-  client → daemon → testproxy → mock origin), the measurement instrument, and
-  fail-closed policy gates.
-- **`nixos/`** — NixOS module plus a 3-VM test (real nix-daemon + systemd).
+Crates:
 
-Key invariants, tested end-to-end (see `TESTING.md`):
+- **`peer-fabric/`** — the seam: capability traits, `Lookup`/`Exposure`, and the
+  frozen `ContentKey`/`ProviderRecord` codec. **Zero** p2p-library deps.
+- **`fabric-libp2p/`** — the **primary** backend: libp2p-kad `ProviderDirectory` +
+  `AvailabilityAnnouncer`, and libp2p `NarTransfer`/`NarServer` over the same swarm.
+- **`fabric-iroh/`** — the **optional** iroh transport (iroh-blobs) + pkarr node
+  lookup, behind the same seam.
+- **`daemon/`** — the product; wires a `NarSource` to fabric discovery→transfer.
+- **`testproxy/`** — the permanent test fixture: a caching proxy that owns all
+  fault injection (latency, errors, corruption, throttling). Plain-HTTP only today.
+- Supporting: `fixtures/` (signed mock cache), `scripts/` (rootless-podman e2e +
+  the measurement instrument), `nixos/` (module + 3-VM test).
 
-- **S1 byte-identity**: paths substituted through the daemon chain are
-  bit-identical to upstream-served ones (NarHash gate).
-- **S2 additive invariant**: with the daemon dead, killed mid-transfer, or
-  erroring, `nix build` still succeeds via substituter fallback and the local
-  store is never corrupted.
-- **S3 honest measurement**: net upstream egress with-daemon vs without, under
-  a frozen counting rule (`scripts/MEASUREMENT_COUNTING_RULE.md`). Gross
-  "bytes from peers" is not the metric.
-- **S4 latency bound**: p95 build wall-clock with the daemon ≤ 110% of
-  daemon-off. This was defined for the wave-1 transparent proxy and holds
-  there. It is **not** met by the p2p path: peers-on against the loopback
-  control is ~4× daemon-off. Whether that matters depends entirely on how
-  fast the real upstream is, which is exactly what has not been measured.
-- **S6 peer-served build**: a real `nix build` whose NAR came from a peer, with
-  the bytes counted at the *provider* (the fetching daemon's own claim to have
-  used a peer is untrusted narration), plus a peers-off contrast arm proving
-  the upstream channel was live.
-- **S9 models bite**: the profiler's fits are proven by mutation — a known
-  superlinear workload must be classified superlinear and must not fit as
-  linear, and extrapolations are structurally labelled model output, never
-  measurement.
+**Frozen surfaces** — deep-reviewed because changing them splits the network, and
+pinned in bytes by golden vectors so a rename fails a test rather than a deployment:
 
-Two frozen surfaces, deep-reviewed because changing them splits the network:
-the **claim wire schema** and the **addressed unit** (`RawNarV1` — the exact
-`nix-store --dump` bytes, keyed by plain BLAKE3, which equals the iroh-blobs
-hash by construction). Both are pinned in bytes by golden vectors, so a rename
-or a retag fails a test rather than a deployment. The global discovery key
-derivation is the third frozen surface: our schema is frozen as an opaque value
-inside the DHT substrate, so the substrate's own wire format can churn without
-touching the freeze. The substrate is settled: **`libp2p-kad`** (the TASK-126
-spike found iroh has no usable content-provider store — see "iroh's shortcomings"
-in `PRD.md`), stored via `put_record`/`get_record`.
+- **Addressed unit** — `RawNarV1`, the exact `nix-store --dump` bytes keyed by plain
+  BLAKE3 (equals the iroh-blobs hash by construction).
+- **Claim wire schema** and the **discovery key + provider record** — `ContentKey =
+  BLAKE3-derive(domain, signed NarHash)` and an ed25519-signed `ProviderRecord`
+  stored as an **opaque value**, so the DHT substrate's own wire format can churn
+  without touching the freeze. Verified by golden vectors *and* an independent
+  from-scratch Python verifier; the record freeze cleared a 3-round cross-model
+  review.
+
+**Trust & invariants** (`TESTING.md`): signed narinfo fields are untouched, Nix
+re-verifies signature + NarHash, and the daemon + peers are outside the TCB. Tested
+end-to-end: **S1** byte-identity · **S2** additive invariant (daemon dead / killed
+mid-transfer → `nix build` still succeeds via fallback, store never corrupted) ·
+**S3** honest egress accounting (a peer hit counted at the provider, not the
+fetcher's self-report) · **S6** peer-served build · **S9** models-bite.
 
 ## Development
 
-Everything runs inside the pinned flake devshell; the Justfile refuses any
-other toolchain.
+Everything runs in the pinned flake devshell; the Justfile refuses any other
+toolchain.
 
 ```sh
 nix develop
 just            # list gates
+
+just build      # cargo build, all targets
+just lint       # clippy -D warnings, rustfmt, ruff, independence + source guards
+just test       # cargo test — incl. the multi-node discovery + transfer +
+                # daemon-integration tests — + the fixture and measurement gates
 ```
 
-Fast tier (seconds):
+Slow tier (containers / VMs — minutes to hours):
 
 ```sh
-just build      # cargo build, all targets
-just lint       # clippy -D warnings, rustfmt, ruff, source-policy guards
-just test       # cargo test + fixture gate + measurement self-test
+just e2e         # rootless-podman subset (incl. the s6 peer-served build)
+just e2e-full    # every e2e scenario
+just e2e-vm      # NixOS VM test (needs /dev/kvm)
+just measure     # egress / latency / gap report
+just profile     # p2p RAM / disk / latency / throughput report
 ```
 
 A green `just test` is one sample, not a proof: the gate's own flake rate is
-something this project measures (`scripts/flake_rate.py`) rather than assumes.
-`TESTING.md` states the rule.
-
-Slow tier (containers/VMs; not part of the fast loop — minutes to hours):
-
-```sh
-just e2e         # FAST podman-pod subset: 5 scenarios, one per path
-just e2e-full    # every e2e scenario - the real gate before shipping
-just e2e-vm      # NixOS VM test (needs /dev/kvm)
-just measure     # egress/latency/gap measurement report
-just scale-sweep # scaling sweep + regression fit (clients, chain depth, knobs)
-just profile     # p2p RAM/disk/latency/throughput/speedup report (peer swarm)
-just discovery   # closure-discovery cost, batched vs one-at-a-time (~1 min)
-just journey     # J1 operator journey
-```
-
-Most are hours, not minutes: `just profile` runs a peer swarm, a NAR-size
-axis, a concurrency axis and both upstream conditions. `just discovery` is the
-exception — it needs no containers, because discovery has no container path yet.
-
-`nix flake check` re-runs build/lint/test in the sandbox for CI.
+something this project *measures* (`scripts/flake_rate.py`) rather than assumes.
+`nix flake check` re-runs build/lint/test in the CI sandbox.
 
 ## Documents
 
-- `PRD.md` — accepted design record: decisions, irreversibility map, risks,
-  wave-2 scope.
-- `TESTING.md` — what good and bad observably mean; the oracles the gates
+- **`PRD.md`** — the durable design record: essence, key decisions, iroh's
+  shortcomings, the irreversibility map, risks, and the two-stage tournament
+  contract.
+- **`docs/peer-fabric-seam.md`** — the `PeerFabric` seam design.
+- **`TESTING.md`** — what "good" and "bad" observably mean; the oracles the gates
   enforce.
-- `backlog/` — task tracker (use the `backlog` CLI, not direct file edits).
-- `figures/` — architecture overviews: **`fig-arch-5-peer-fabric`** (the whole
-  system: the three seams, iroh/libp2p as swappable backends behind
-  `PeerFabric`, the trust boundary, and the crate topology), `fig-arch-1`
-  (wave-1 daemon seams), `fig-arch-2` (test harness), `fig-arch-3` (wave-2
-  target). The `fig-candidate-*` originals and `fig-arch-3` predate the
-  PeerFabric decision and are stale until task-17 revises them.
+- **`figures/fig-arch-5-peer-fabric.svg`** — the one-glance architecture overview.
+- **`backlog/`** — the task tracker (use the `backlog` CLI, never edit the files
+  directly).
 
 ## References
 
-Prior art and the problem this exists to address. Both threads are from June
-2023; this project is not aware of a shipped implementation coming out of
-either, though that is an impression from reading them rather than a survey.
+Prior art and the problem this exists to address (both threads June 2023; no shipped
+implementation is known to have come out of either):
 
-- [Peer-to-peer binary cache RFC/working group/poll](https://discourse.nixos.org/t/peer-to-peer-binary-cache-rfc-working-group-poll/29568)
-  (NixOS Discourse, Nabile-Rahmani) — polls the community on a decentralized
-  binary cache, motivated by CDN costs cited in the thread as exceeding
-  €50k/month, and sketches a `services.nix-serve-p2p` where users seed. The
-  discussion is largely BitTorrent-vs-IPFS, and the objections raised there —
-  availability of the long tail, untrusted peers, sharding and rebalancing —
-  are the ones this design has to answer rather than assume away.
+- [Peer-to-peer binary cache RFC / working-group poll](https://discourse.nixos.org/t/peer-to-peer-binary-cache-rfc-working-group-poll/29568)
+  (NixOS Discourse) — polls the community on a decentralized binary cache, motivated
+  by CDN costs cited as exceeding €50k/month; the availability / untrusted-peer /
+  sharding objections raised there are the ones this design answers rather than
+  assumes away.
 - [Migration of S3 bucket payments to the Foundation](https://github.com/NixOS/foundation/issues/86)
-  (NixOS/foundation, refroni) — the storage-cost side of the same problem,
-  cataloguing ~11 alternatives from distributed stores (Tahoe-LAFS, Garage,
-  Ceph) to decentralized mirror networks and outright deletion.
+  (NixOS/foundation) — the storage-cost side of the same problem, cataloguing ~11
+  alternatives from distributed stores to decentralized mirrors.
 
-Where this project differs from most of those proposals: it decentralizes the
-**bytes only** and leaves trust exactly where it is. cache.nixos.org keeps
-signing narinfos, an unmodified Nix client re-verifies the signature and
-NarHash, and every peer stays outside the trusted computing base — so a hostile
-or broken peer costs a retry, never a bad store path. It also targets
-*bandwidth* rather than storage: `PRD.md` treats the long tail as a case where
-a CDN is strong and swarms are weak, and does not pretend otherwise. Whether
-peers actually beat a CDN as a byte source is treated as a thesis to measure,
-not a premise — see the numbers and their caveats under Status.
+Where this differs from most such proposals: it decentralizes the **bytes only** and
+leaves trust exactly where it is (cache.nixos.org keeps signing; Nix re-verifies;
+peers stay outside the TCB), and it targets *bandwidth*, not storage — treating
+"do peers beat a CDN?" as a thesis to measure, not a premise.
 
 ## License
 
