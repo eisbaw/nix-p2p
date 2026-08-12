@@ -7,7 +7,7 @@ status: In Progress
 assignee:
   - mped
 created_date: '2026-08-12 10:22'
-updated_date: '2026-08-12 22:05'
+updated_date: '2026-08-12 22:29'
 labels:
   - libp2p
   - daemon
@@ -38,30 +38,15 @@ Follow-up to TASK-160 (which proved the in-process daemon<->libp2p integration t
 ## Implementation Notes
 
 <!-- SECTION:NOTES:BEGIN -->
-Forward-carried from TASK-169 (F1, MEDIUM/HIGH): the daemon production path now consults Libp2pFabric::node_locator().locate() in Libp2pNarSource::resolve and no longer REQUIRES an injected --libp2p-provider-addr, but it DISCARDS locate()s returned DialInfo (source_libp2p.rs Found(_dial_info) => {}) and relies on locate()s routing-table SIDE EFFECT for the actual dial. Verified by mutation on loopback: bypassing locate entirely still serves byte-identical, because an earlier kad discovery query already opened the connection to the provider - so locate is NOT provably load-bearing on loopback (only the exposure-ledger oracle proves it is CALLED).
-This real multi-container e2e must: (1) make resolve USE the resolved DialInfo - parse the DHT-resolved Multiaddr string(s) and add_address(provider_peer, addr) so the dial is driven by the RESOLUTION, not an incidental side effect. NOTE the implementer conflated this with injection: add_address of a DHT-RESOLVED address is NOT injection (injection = an operator-supplied out-of-band address); using the resolved address is the correct consumption of the seam. (2) PROVE locate is load-bearing on a real network where discovery does not pre-open the provider connection: a broken/empty locate MUST break the dial (fall to upstream), not silently succeed. Watch for silent degradation. (3) Drop --libp2p-provider-addr from the consumer container entirely (it is now only an optional override hint).
+LANDED GREEN (commits 1919d78 plumbing, 9d97329 fix+green). scripts/e2e_harness.py: Pod._create_libp2p + _await_libp2p_identity + _await_http_ready + libp2p_consumer_argv; scenarios scenario_s7_libp2p (+ SCENARIOS 's7-libp2p') and scenario_s7_libp2p_miss ('s7-libp2p-miss'). NO Rust changes: TASK-169 already moved resolve-then-dial INSIDE fabric-libp2p transport (transport.rs), so the daemon layer needs no add_address of a resolved DialInfo - the F1 code item (1) is satisfied by the existing architecture.
 
-FORWARD NOTE from TASK-178 (DONE, commit 38d5d5b): the daemon now has a REAL libp2p SERVING/provider mode - the PROVIDER container has a serving daemon to run.
+TOPOLOGY (3 real daemon containers, one pod): lp-boot (a PURE kad router, FIXED identity seed so its PeerId is derived offline, holds NO content, never announces) + lp-provider P (seeds the target, bootstraps to BOOT, announces) + lp-consumer C (bootstraps to BOOT ALONE, NO --libp2p-provider-addr). C discovers P via kad get_providers and resolves P's dial address via kad peer-routing, both inside the fabric.
 
-PROVIDER invocation:
-  daemon --libp2p-provider \
-         --libp2p-listen /ip4/0.0.0.0/tcp/<port> \
-         --libp2p-bootstrap <PeerId>@<multiaddr>  (>=1 REQUIRED: join to announce) \
-         --libp2p-seed-nar <narhash>=<path/to/raw.nar>  (>=1 REQUIRED, repeatable) \
-         [--libp2p-print-peer-address]  (machine-readable addr for wiring) \
-         [--libp2p-identity-seed <64hex>]  (else fresh /dev/urandom) \
-         [--libp2p-scope <scope>]  (default v1; must match the consumer)
-  <narhash> is the canonical Nix NarHash (sha256:<nix-base32>) of the RAW nar in <path>.
+RESULTS (nix develop -c, targeted --only, TWO bounded runs each; s6-p2p regression run alongside): s7-libp2p 11/11 PASS, s7-libp2p-miss 5/5 PASS, s6-p2p 11/11 PASS (regression green). Pods+containers clean after (podman pod ps / ps -a empty), disk 67G free, load calm. just lint fully green (clippy/fmt/ruff/source-guard/independence).
 
-PRINTED CONTRACT (stdout, machine-readable) for the harness:
-  LIBP2P-PROVIDER-ADDR peer_id=<PeerId> listen=<multiaddr1,multiaddr2>   (when --libp2p-print-peer-address)
-  LIBP2P-SEED narhash=<narhash> content=<blake3hex> content_key=<..> bytes=<n>   (one per seed)
-  LIBP2P-SERVE-BUDGET max_nar_bytes_uncompressed_nar=.. max_inflight_bytes_uncompressed_nar=.. max_serve_duration_ms=..
-  -> wire the CONSUMER daemon's --libp2p-bootstrap <peer_id>@<one of the listen multiaddrs> (pick a routable one; container-internal it is the container IP, not 127.0.0.1).
+WHAT THE ARMS PROVE: positive = C serves the NAR byte-identical (NarHash==signed upstream) with 0 upstream NAR egress and narinfo egress>0, discovered via kad (no-injection asserted from C's actual container argv - provider PeerId absent, no --libp2p-provider-addr). MISS = a NAR no peer announces -> clean upstream fallback (upstream.nar>=1). Load-bearing control = kill P -> the target (held ONLY by P; BOOT holds nothing) is unreachable via any peer -> upstream fallback (upstream.nar>=1). ORACLE BITE: the MISS + control arms both flip upstream.nar to >=1, so the positive 0-egress oracle genuinely discriminates (a silently-broken libp2p would fall to upstream and fail it).
 
-CONSUMER invocation (unchanged, TASK-162): daemon --libp2p-bootstrap <provider-or-shared-bootstrap PeerId>@<addr> [--libp2p-scope <same scope>]; NO --libp2p-provider-addr (dial resolved via kad peer-routing). Same --libp2p-scope on both or kad protocol names differ and they never meet.
+GOTCHAS (for the next implementer): (1) A LONE genesis PROVIDER cannot announce - put-provider needs >=1 reachable peer for quorum ('the quorum failed; needed 1 peers'). Fix: a separate PURE kad node (non-provider) must be up and reachable BEFORE the provider starts; gate it on HTTP readiness (_await_http_ready). (2) Only a --libp2p-provider prints LIBP2P-PROVIDER-ADDR, so a non-provider bootstrap node cannot advertise its address - use a FIXED --libp2p-identity-seed and derive its PeerId offline (ed25519 pubkey -> protobuf 08 01 12 20 <32B> -> identity-multihash 00 24 <..> -> base58btc; a drift is caught at the first run when P cannot reach BOOT). (3) Every libp2p daemon REQUIRES --libp2p-bootstrap; the genesis points at a valid-format UNREACHABLE dummy PeerId (self-lookup fails best-effort, node still binds). (4) --libp2p-scope must MATCH across all three or kad protocol names differ and they never meet. (5) Bounded LIBP2P_CONVERGE_S sleep (12s) before the measured build lets the 3-node DHT settle; a per-NAR find_providers racing an unconverged DHT would false-negative the 0-egress oracle.
 
-Both provider and consumer also run the normal HTTP daemon on --listen, so readiness is HTTP-pollable as usual. Serve budget currently reuses --iroh-max-serve-nar-bytes / --iroh-max-inflight-nar-bytes / --iroh-max-serve-duration-ms (backend-neutral ServeBudget); set them if seeding large NARs.
-
-The in-process discover->fetch->byte-identical path is proven (daemon/tests/libp2p_provider_path.rs). What remains for TASK-161 is the two-real-process/container topology + a routable (non-loopback) listen addr + the compression-domain narinfo correctness a real Nix client checks.
+HONEST SCOPE / DEFERRED (why NOT marked Done): the pod shares ONE loopback netns, so this is NOT the 'REAL routed container network' the F1 arm specified. On shared loopback a kad query MAY pre-open a connection to P, so the load-bearing control proves the DHT-mediated peer PATH to P is load-bearing (BOOT holds no content, no injection) but does NOT fully ISOLATE the address-RESOLUTION leg from a pre-populated shared routing table / pre-open (transport.rs's own stated HONEST LIMIT). Fully discharging the TASK-159/169 caveat needs a separate-netns podman BRIDGE topology + a resolution-only-broken control -> filed as TASK-179. Also: libp2p target is 'lib' (already-raw), so the compressed->raw narinfo rewrite is NOT exercised on the libp2p path (S6's app covers it on iroh) - a libp2p xz target is a follow-up. And there is no LIBP2P-SERVED-TOTAL provider counter yet (the IROH-SERVED-TOTAL analogue); peer-served bytes are attributed via the proxy egress ledger, not provider-side (also TASK-179).
 <!-- SECTION:NOTES:END -->
