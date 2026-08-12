@@ -24,9 +24,11 @@
 //!   * [`ResolutionPolicy::PublicInfrastructure`] - the active kad peer-routing query
 //!     above. It discloses this node's identity to the DHT nodes / bootstrap it contacts
 //!     (recorded to the ledger). Returns [`Lookup::Found`] with the learned Multiaddr
-//!     strings, [`Lookup::Miss`] when a healthy query knows no address, and
-//!     [`Lookup::Unavailable`] when the mechanism could not be consulted
-//!     (`InsufficientRouting` over an empty routing table, `DeadlineExceeded` on timeout).
+//!     strings, [`Lookup::Miss`] when a query that REACHED the key's neighborhood knows
+//!     no address, and [`Lookup::Unavailable`] when the mechanism could not be consulted
+//!     (`InsufficientRouting` when the peer-routing walk reached no responding peer -
+//!     either an empty routing table or one of only dead entries, gated on the near-key
+//!     [`crate::QueryReach`], TASK-174; `DeadlineExceeded` on timeout).
 //!   * [`ResolutionPolicy::ExplicitPeersOnly`] - consult ONLY a statically configured peer
 //!     address book, disclosing nothing. This backend has no such book yet, so an
 //!     explicit-peers-only resolution has no source to answer from and returns
@@ -48,7 +50,7 @@ use peer_fabric::{
 };
 
 use crate::keys::peer_id_of_provider;
-use crate::swarm::{QueryFail, SwarmHandle};
+use crate::swarm::{QueryFail, SwarmHandle, absence_from_reach};
 
 /// The kad-backed [`NodeLocator`]. Holds a [`SwarmHandle`] to drive peer-routing and the
 /// shared [`ExposureLedger`] every capability appends to.
@@ -67,10 +69,11 @@ impl Libp2pNodeLocator {
     /// routing-bar short-circuit and the ledger disclosure live in one place.
     async fn locate_via_dht(&self, peer: PeerId) -> Lookup<DialInfo> {
         // A peer-routing query over an EMPTY routing table is not authoritative: a Miss
-        // would be a lie (we simply are not on the network to ask). Fail it as Unavailable,
-        // distinct from a healthy "the DHT knows no address" - mirrors the directory's
-        // total-routing bar (and shares its honest limit: this is a total-routing bar, not
-        // a peers-near-the-key bar; TASK-153 tracks tightening it).
+        // would be a lie (we simply are not on the network to ask). This cheap pre-check
+        // short-circuits it to Unavailable before issuing a doomed query or recording a
+        // spurious ledger disclosure. The FINER near-key bar is applied below, on the
+        // QueryReach the walk actually achieved (TASK-174), so a routing table of only
+        // DEAD entries - which passes this pre-check - is still classified honestly.
         if self.handle.routing_peers().await == 0 {
             return Lookup::Unavailable(Unavailable::InsufficientRouting);
         }
@@ -86,16 +89,18 @@ impl Libp2pNodeLocator {
             .record(Exposure::new(Recipient::DhtNode, Disclosed::OurNodeId));
 
         match self.handle.locate_peer(peer).await {
-            Ok(addrs) if !addrs.is_empty() => {
+            Ok((addrs, _)) if !addrs.is_empty() => {
                 // The frozen seam treats DialInfo locations as OPAQUE strings; for libp2p
                 // they are Multiaddr strings, reparsed inside the fabric when dialing.
                 Lookup::Found(DialInfo::new(
                     addrs.into_iter().map(|addr| addr.to_string()),
                 ))
             }
-            // A healthy, completed query that learned no address for the target: an
-            // authoritative "no address known right now", distinct from could-not-consult.
-            Ok(_) => Lookup::Miss,
+            // A completed query that learned no address for the target. Whether that is
+            // an authoritative "no address known right now" (Miss) or a could-not-consult
+            // (InsufficientRouting) turns on the NEAR-KEY bar: did the peer-routing walk
+            // actually reach any responding peer? (TASK-174.)
+            Ok((_, reach)) => absence_from_reach(reach),
             Err(QueryFail::Timeout) => Lookup::Unavailable(Unavailable::DeadlineExceeded),
             Err(QueryFail::Backend(why)) => Lookup::Unavailable(Unavailable::Backend(why)),
         }

@@ -13,7 +13,7 @@ use peer_fabric::{
 };
 
 use crate::keys::{peer_id_of_provider, provider_index_key, provider_value_key};
-use crate::swarm::{QueryFail, SwarmHandle};
+use crate::swarm::{QueryFail, SwarmHandle, absence_from_reach};
 
 /// The kad-backed [`ProviderDirectory`]. See the crate ADR for the HYBRID mapping.
 pub struct Libp2pProviderDirectory {
@@ -77,12 +77,20 @@ impl Libp2pProviderDirectory {
     ///
     /// This is the AC's sanctioned "not distinguishable here, here is why" outcome.
     ///
-    /// A lookup over an empty routing table is not authoritative: a `Miss` would be a
-    /// lie (we simply are not on the network for this key). Fail it as Unavailable,
-    /// distinct from a healthy empty result. NOTE (honest limit): this is a TOTAL-routing
-    /// bar, not a "peers near the key" bar - a node holding only a bootstrap could still
-    /// report Miss where InsufficientRouting is more honest. Raising it to a
-    /// near-key/query-stats bar is TASK-174 (deferred from TASK-153 to keep it minimal).
+    /// The Miss-vs-`InsufficientRouting` boundary is gated on TWO signals (TASK-174):
+    ///
+    ///   1. a cheap PRE-CHECK `routing_peers() == 0` short-circuits a TOTALLY empty
+    ///      routing table to `InsufficientRouting` before issuing any query - it avoids a
+    ///      doomed query and a spurious ledger disclosure; and
+    ///   2. after the index query, an EMPTY provider set is classified on the NEAR-KEY
+    ///      [`QueryReach`] the query actually achieved (how many peers answered the walk
+    ///      toward the key), NOT on the total routing count.
+    ///
+    /// (2) is what raises the old TOTAL-routing bar: a node whose routing table holds
+    /// only DEAD entries passes the pre-check (`routing_peers() > 0`) yet reaches nobody
+    /// (`answered == 0`), so its empty result is the honest `InsufficientRouting`, not a
+    /// false `Miss`. A completed query that DID reach responding peers near the key and
+    /// still found no provider is an authoritative `Miss`.
     async fn resolve(&self, key: &ContentKey) -> Lookup<Vec<ProviderRecord>> {
         if self.handle.routing_peers().await == 0 {
             return Lookup::Unavailable(Unavailable::InsufficientRouting);
@@ -97,15 +105,18 @@ impl Libp2pProviderDirectory {
         ]);
 
         // Phase 1: the multi-provider index.
-        let providers = match self.handle.get_providers(provider_index_key(key)).await {
-            Ok(set) => set,
+        let (providers, reach) = match self.handle.get_providers(provider_index_key(key)).await {
+            Ok(found) => found,
             Err(QueryFail::Timeout) => return Lookup::Unavailable(Unavailable::DeadlineExceeded),
             Err(QueryFail::Backend(why)) => return Lookup::Unavailable(Unavailable::Backend(why)),
         };
         if providers.is_empty() {
-            // A healthy, completed index lookup that found no provider: authoritative
-            // absence (AC#7 "MISS only after a healthy completed lookup").
-            return Lookup::Miss;
+            // A completed index lookup that named no provider. Whether that is an
+            // authoritative absence (Miss) or a could-not-consult (InsufficientRouting)
+            // turns on the NEAR-KEY bar: did the iterative walk actually reach any
+            // responding peer near the key? (TASK-174, AC#7 "MISS only after a healthy
+            // completed lookup" - a lookup that reached nobody is NOT healthy.)
+            return absence_from_reach(reach);
         }
 
         // Phase 2: fetch each provider's signed record from the value store CONCURRENTLY

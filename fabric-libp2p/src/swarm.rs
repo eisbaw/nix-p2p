@@ -17,7 +17,7 @@ use tokio::sync::{mpsc, oneshot};
 
 use crate::keys::{keypair_from_seed, node_id_of};
 use crate::nar::{NarCodec, NarRequest, NarResponse, ServeGate};
-use peer_fabric::{Blake3Digest, NodeId};
+use peer_fabric::{Blake3Digest, Lookup, NodeId, Unavailable};
 
 /// Why a kad query did not return a healthy answer. Mapped to
 /// [`peer_fabric::Unavailable`] by the directory.
@@ -27,6 +27,53 @@ pub enum QueryFail {
     Timeout,
     /// A backend-specific failure, carried verbatim for the log.
     Backend(String),
+}
+
+/// How far a completed kad iterative query actually REACHED into the DHT (TASK-174).
+///
+/// `answered` is `kad::QueryStats::num_successes()` at the terminal step: the number of
+/// peers that SUCCESSFULLY responded to our query messages during the walk toward the
+/// key. Because an iterative Kademlia lookup always walks TOWARD the key, this is the
+/// honest near-key signal:
+///
+///   * `answered > 0` - at least one peer answered, so the walk reached as close to the
+///     key as the network holds; an EMPTY result is then an authoritative absence
+///     ([`Lookup::Miss`]).
+///   * `answered == 0` - NO peer ever answered (an empty routing table, or a table whose
+///     entries are all dead / unreachable), so we never consulted the key's
+///     neighborhood; an empty result is a could-not-consult
+///     ([`Unavailable::InsufficientRouting`]), never a `Miss`.
+///
+/// This is strictly tighter than the old `routing_peers() == 0` bar: a routing table
+/// full of DEAD entries has `routing_peers() > 0` (which the old bar read as "on the
+/// network", yielding a false `Miss`) yet `answered == 0` here (the honest
+/// `InsufficientRouting`).
+#[derive(Debug, Clone, Copy)]
+pub struct QueryReach {
+    /// Peers that successfully answered the iterative query (`num_successes`).
+    pub answered: u32,
+}
+
+impl QueryReach {
+    /// Whether the query reached at least one responding peer in the key's
+    /// neighborhood, so an empty result is an authoritative absence rather than a
+    /// could-not-consult.
+    pub fn reached_neighborhood(self) -> bool {
+        self.answered > 0
+    }
+}
+
+/// Classify an EMPTY, completed kad query by how far it actually reached (TASK-174):
+/// the SHARED near-key bar both the directory (provider-index lookup) and the locator
+/// (peer-routing) gate Miss-vs-Unavailable on. An empty result that reached responding
+/// peers near the key is an authoritative absence ([`Lookup::Miss`]); one that reached
+/// nobody is a could-not-consult ([`Unavailable::InsufficientRouting`]), never a `Miss`.
+pub fn absence_from_reach<T>(reach: QueryReach) -> Lookup<T> {
+    if reach.reached_neighborhood() {
+        Lookup::Miss
+    } else {
+        Lookup::Unavailable(Unavailable::InsufficientRouting)
+    }
 }
 
 /// The combined behaviour: Kademlia (the DHT content discovery) plus Identify (so peers
@@ -80,7 +127,7 @@ pub enum Command {
     },
     GetProviders {
         key: kad::RecordKey,
-        reply: oneshot::Sender<Result<HashSet<PeerId>, QueryFail>>,
+        reply: oneshot::Sender<Result<(HashSet<PeerId>, QueryReach), QueryFail>>,
     },
     GetRecord {
         key: kad::RecordKey,
@@ -95,7 +142,7 @@ pub enum Command {
     /// TASK-159: the [`crate::locator::Libp2pNodeLocator`] active-resolution path.
     LocatePeer {
         peer: PeerId,
-        reply: oneshot::Sender<Result<Vec<Multiaddr>, QueryFail>>,
+        reply: oneshot::Sender<Result<(Vec<Multiaddr>, QueryReach), QueryFail>>,
     },
     /// Fetch a NAR by digest from `peer` over the request-response protocol. The reply
     /// carries the peer's [`NarResponse`], or a transport-level failure string.
@@ -298,8 +345,14 @@ impl SwarmHandle {
         rx.await.unwrap_or_else(|_| Err("worker gone".into()))
     }
 
-    /// Resolve the set of providers of `key` from the DHT.
-    pub async fn get_providers(&self, key: kad::RecordKey) -> Result<HashSet<PeerId>, QueryFail> {
+    /// Resolve the set of providers of `key` from the DHT, together with the
+    /// [`QueryReach`] the iterative query achieved (so an EMPTY provider set can be
+    /// classified as an authoritative `Miss` vs a could-not-consult
+    /// `InsufficientRouting` - TASK-174).
+    pub async fn get_providers(
+        &self,
+        key: kad::RecordKey,
+    ) -> Result<(HashSet<PeerId>, QueryReach), QueryFail> {
         let (reply, rx) = oneshot::channel();
         self.send(Command::GetProviders { key, reply }).await;
         rx.await
@@ -317,8 +370,14 @@ impl SwarmHandle {
     /// Resolve `peer`'s dialable addresses through kad peer-routing (an active
     /// `get_closest_peers` query). The addresses reach us through the DHT/identify, never
     /// injected. Drives the [`crate::locator::Libp2pNodeLocator`] PublicInfrastructure
-    /// path. `Ok(empty)` = the DHT knows no address (Miss); `Err` = could-not-consult.
-    pub async fn locate_peer(&self, peer: PeerId) -> Result<Vec<Multiaddr>, QueryFail> {
+    /// path. `Ok((empty, reach))` = the query knew no address; the [`QueryReach`] then
+    /// separates an authoritative `Miss` (reached responding peers) from a
+    /// could-not-consult `InsufficientRouting` (reached nobody). `Err` = could not be
+    /// consulted at all (timeout / backend). TASK-174.
+    pub async fn locate_peer(
+        &self,
+        peer: PeerId,
+    ) -> Result<(Vec<Multiaddr>, QueryReach), QueryFail> {
         let (reply, rx) = oneshot::channel();
         self.send(Command::LocatePeer { peer, reply }).await;
         rx.await
@@ -368,17 +427,17 @@ enum Pending {
     Bootstrap(oneshot::Sender<Result<(), String>>),
     GetProviders {
         found: HashSet<PeerId>,
-        reply: oneshot::Sender<Result<HashSet<PeerId>, QueryFail>>,
+        reply: oneshot::Sender<Result<(HashSet<PeerId>, QueryReach), QueryFail>>,
     },
     GetRecord {
         reply: oneshot::Sender<Result<Option<Vec<u8>>, QueryFail>>,
     },
     /// A kad peer-routing lookup awaiting its terminal `GetClosestPeers` event. `target`
     /// is the PeerId we are resolving; on completion we return the addresses the query
-    /// learned for exactly that peer.
+    /// learned for exactly that peer, plus the [`QueryReach`] (TASK-174).
     GetClosestPeers {
         target: PeerId,
-        reply: oneshot::Sender<Result<Vec<Multiaddr>, QueryFail>>,
+        reply: oneshot::Sender<Result<(Vec<Multiaddr>, QueryReach), QueryFail>>,
     },
 }
 
@@ -581,9 +640,10 @@ impl Worker {
             SwarmEvent::Behaviour(BehaviourEvent::Kad(kad::Event::OutboundQueryProgressed {
                 id,
                 result,
+                stats,
                 step,
                 ..
-            })) => self.on_query(id, result, step.last),
+            })) => self.on_query(id, result, stats, step.last),
             SwarmEvent::Behaviour(BehaviourEvent::Nar(event)) => self.on_nar_event(event),
             _ => {}
         }
@@ -644,7 +704,13 @@ impl Worker {
         }
     }
 
-    fn on_query(&mut self, id: kad::QueryId, result: kad::QueryResult, last: bool) {
+    fn on_query(
+        &mut self,
+        id: kad::QueryId,
+        result: kad::QueryResult,
+        stats: kad::QueryStats,
+        last: bool,
+    ) {
         use kad::{
             AddProviderOk, GetClosestPeersError, GetClosestPeersOk, GetProvidersOk, GetRecordOk,
             PutRecordOk, QueryResult,
@@ -685,8 +751,14 @@ impl Worker {
                 if (last || failed)
                     && let Some(Pending::GetProviders { found, reply }) = self.pending.remove(&id)
                 {
+                    // The terminal-step stats are cumulative for the whole query, so
+                    // `num_successes` is how many peers answered the walk toward the key
+                    // (TASK-174: the near-key bar for an EMPTY provider set).
+                    let reach = QueryReach {
+                        answered: stats.num_successes(),
+                    };
                     let _ = reply.send(match res {
-                        Ok(_) => Ok(found),
+                        Ok(_) => Ok((found, reach)),
                         Err(kad::GetProvidersError::Timeout { .. }) => Err(QueryFail::Timeout),
                     });
                 }
@@ -720,16 +792,25 @@ impl Worker {
                 // Peer-routing terminates in a single terminal event (`get_closest_peers`
                 // has no per-step progress), so resolve on the first (and only) result.
                 if let Some(Pending::GetClosestPeers { target, reply }) = self.pending.remove(&id) {
+                    // How far the peer-routing walk reached (TASK-174): an EMPTY address
+                    // result with `answered == 0` is a could-not-consult, not a Miss.
+                    let reach = QueryReach {
+                        answered: stats.num_successes(),
+                    };
                     let result = match res {
                         // The converged closest set: pull out the addresses the DHT learned
                         // for EXACTLY the target peer. If the target is absent from the set,
-                        // or present with no address, that is a healthy "no address known"
-                        // (empty Vec) - the locator maps it to Miss, never Unavailable.
-                        Ok(GetClosestPeersOk { peers, .. }) => Ok(peers
-                            .into_iter()
-                            .find(|info| info.peer_id == target)
-                            .map(|info| info.addrs)
-                            .unwrap_or_default()),
+                        // or present with no address, that is "no address known" (empty
+                        // Vec); the locator then maps it to Miss vs InsufficientRouting on
+                        // `reach`, never guessing.
+                        Ok(GetClosestPeersOk { peers, .. }) => Ok((
+                            peers
+                                .into_iter()
+                                .find(|info| info.peer_id == target)
+                                .map(|info| info.addrs)
+                                .unwrap_or_default(),
+                            reach,
+                        )),
                         // A timed-out query could not be consulted: the lookup was not
                         // authoritative, so this must surface as Unavailable, never an
                         // (empty) Miss.

@@ -116,7 +116,7 @@ pub use nar::{
     Libp2pNarSupplier, MemoryNarSupplier, NarCodec, NarSupplyPlan, ServeCounters, ServeGate,
 };
 pub use server::Libp2pServer;
-pub use swarm::{Node, NodeConfig, NodeError, SwarmHandle};
+pub use swarm::{Node, NodeConfig, NodeError, QueryReach, SwarmHandle};
 pub use transport::Libp2pTransport;
 
 // Re-export libp2p's address/peer types the composition root and tests need to drive
