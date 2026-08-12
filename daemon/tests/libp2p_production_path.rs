@@ -13,19 +13,28 @@
 //!   * `P` - a SERVING provider: holds a raw NAR, serves it over the libp2p NAR
 //!     request-response protocol, announces its signed [`ProviderRecord`].
 //!   * `C` - the CONSUMER: its p2p `NarSource` is built by the PRODUCTION builder from a
-//!     `Libp2pSourceConfig` (bootstrap = B, provider dial addr = P, a listen addr and a
-//!     scope), then wrapped in a `FallbackNarSource` in front of a fake HTTP upstream
-//!     behind the real `App` stack.
+//!     `Libp2pSourceConfig` whose ONLY injected address is `B` (bootstrap) - `provider_addrs`
+//!     is EMPTY, so `C` is NEVER told `P`'s dial address. Plus a listen addr and a scope.
+//!     Then wrapped in a `FallbackNarSource` in front of a fake HTTP upstream behind the
+//!     real `App` stack.
 //!
-//! What it proves: `C`, configured only with `B` as bootstrap, DISCOVERS `P` via
-//! libp2p-kad (record kad-produced, NOT injected), fetches the raw NAR, gate-1
-//! BLAKE3-verifies, and the daemon serves BYTE-IDENTICAL bytes (0 upstream fallbacks);
-//! an un-announced NarHash is a clean kad miss that falls back to HTTP (1 fallback).
+//! What it proves (TASK-169): `C`, configured only with `B` as bootstrap and NO injected
+//! provider address, DISCOVERS `P` via libp2p-kad (record kad-produced, NOT injected),
+//! RESOLVES `P`'s dial address THROUGH kad peer-routing (`node_locator().locate()`, no
+//! injection), fetches the raw NAR, gate-1 BLAKE3-verifies, and the daemon serves
+//! BYTE-IDENTICAL bytes (0 upstream fallbacks); an un-announced NarHash is a clean kad
+//! miss that falls back to HTTP (1 fallback).
 //!
-//! HONEST SCOPE (documented, not faked): identical to TASK-160 - discovery is genuinely
-//! decentralized; `P`'s byte-transfer DIAL address is supplied to `C` out of band via
-//! the config's `provider_addrs` (the TASK-159 basic-dial shim; `node_locator()` is
-//! still `None`). A full podman multi-daemon libp2p e2e is TASK-161.
+//! HONEST SCOPE (documented, not faked, carried from TASK-159's node_locator test): the
+//! dial address is NOT injected - `provider_addrs` is empty and the test's readiness gate
+//! asserts `locate()` independently returns `P`'s REAL listen address via the DHT. It does
+//! NOT claim `locate()` is the SOLE connectivity path: in a small loopback kad network the
+//! request-response fetch can reuse a connection an earlier kad query (bootstrap
+//! self-lookup / get_providers) already opened to `P`, so isolating `locate()` as the only
+//! dial path is not robust (whether an iterative query dials `P` depends on XOR distance).
+//! What is proven is (a) NO provider address was injected out of band, and (b) the
+//! production `resolve` consults `node_locator` and it resolves `P`'s address independently.
+//! A full podman multi-daemon libp2p e2e is TASK-161.
 //!
 //! This test does NOT model the Nix client's transport gate. The consumer uses
 //! `NoRawServe` and an `.nar.xz` token with `Compression: xz`, yet asserts the served
@@ -57,7 +66,8 @@ use daemon::{
 use fabric_libp2p::{Libp2pFabric, MemoryNarSupplier, Multiaddr, NodeConfig, PeerId};
 use peer_fabric::{
     AnnounceBudget, Blake3Digest, ContentKey, DiscoveryBudget, Lookup, NodeId, PeerFabric,
-    ProviderRecord, SafetyEnvelope, ServeBudget, TransportOffer, sign_provider_record,
+    ProviderRecord, ResolutionPolicy, SafetyEnvelope, ServeBudget, TransportOffer,
+    sign_provider_record,
 };
 
 // -------------------------------------------------------------------------
@@ -252,7 +262,7 @@ async fn production_config_builds_libp2p_source_that_discovers_and_serves_with_c
     let boot_peer = bootstrap.peer_id();
 
     let provider_seed = [3u8; 32];
-    let (provider, provider_addr) = start_fabric(
+    let (provider, provider_listen_addr) = start_fabric(
         Libp2pFabric::start_with_supplier(
             NodeConfig {
                 identity_seed: provider_seed,
@@ -263,7 +273,6 @@ async fn production_config_builds_libp2p_source_that_discovers_and_serves_with_c
         .expect("provider starts"),
     )
     .await;
-    let provider_peer = provider.peer_id();
 
     join(&provider, boot_peer, boot_addr.clone(), 1).await;
 
@@ -285,15 +294,16 @@ async fn production_config_builds_libp2p_source_that_discovers_and_serves_with_c
         .expect("announce admitted");
 
     // ---- Build C through the PRODUCTION builder from a config ----
-    // C is CONFIGURED with B as its only bootstrap peer and P's dial address (the
-    // TASK-159 basic-dial shim). This is exactly what main.rs::setup_p2p_source runs
-    // after parsing --libp2p-bootstrap/--libp2p-provider-addr/--libp2p-listen/-scope.
+    // C is CONFIGURED with B as its ONLY injected address. `provider_addrs` is EMPTY:
+    // C is NEVER told P's dial address - it must resolve it through kad peer-routing
+    // (node_locator, TASK-169). This is exactly what main.rs::setup_p2p_source runs
+    // after parsing --libp2p-bootstrap/--libp2p-listen/-scope (no --libp2p-provider-addr).
     let cfg = Libp2pSourceConfig {
         identity_seed: [4u8; 32],
         network_scope: scope.to_string(),
         listen: Some("/ip4/127.0.0.1/tcp/0".parse().unwrap()),
         bootstrap: vec![(boot_peer, boot_addr.clone())],
-        provider_addrs: vec![(provider_peer, provider_addr)],
+        provider_addrs: vec![],
         discovery_budget: DiscoveryBudget::new(Duration::from_secs(10), 32),
         envelope: SafetyEnvelope::default(),
     };
@@ -327,6 +337,42 @@ async fn production_config_builds_libp2p_source_that_discovers_and_serves_with_c
                 assert!(
                     Instant::now() < deadline,
                     "consumer never discovered P through kad (last: {other:?})"
+                );
+                tokio::time::sleep(Duration::from_millis(150)).await;
+            }
+        }
+    }
+
+    // ---- Readiness + no-injection oracle: C resolves P's dial address via kad ----
+    // The production `resolve` calls `node_locator().locate(record.provider, ..)` before
+    // fetching. Poll the SAME locate here so the subsequent served request finds it Found
+    // (absorbing DHT propagation) AND assert the resolved address is P's REAL listen
+    // address - which C was never told (provider_addrs empty). A resolver that never
+    // learned P's address could only get it from the DHT, so this is the no-injection
+    // proof (the same oracle as fabric-libp2p/tests/node_locator_discovery.rs).
+    let locator = consumer
+        .node_locator()
+        .expect("consumer has a node_locator");
+    let provider_listen = provider_listen_addr.to_string();
+    let deadline = Instant::now() + Duration::from_secs(25);
+    loop {
+        match locator
+            .locate(&provider.node_id(), &ResolutionPolicy::PublicInfrastructure)
+            .await
+        {
+            Lookup::Found(dial_info)
+                if dial_info
+                    .locations
+                    .iter()
+                    .any(|loc| loc.starts_with(&provider_listen)) =>
+            {
+                break;
+            }
+            other => {
+                assert!(
+                    Instant::now() < deadline,
+                    "consumer never resolved P's dial address via kad peer-routing \
+                     (no injected address); last: {other:?}"
                 );
                 tokio::time::sleep(Duration::from_millis(150)).await;
             }
