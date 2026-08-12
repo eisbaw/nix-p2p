@@ -6,7 +6,7 @@ title: >-
 status: To Do
 assignee: []
 created_date: '2026-08-12 10:22'
-updated_date: '2026-08-12 16:00'
+updated_date: '2026-08-12 21:21'
 labels:
   - libp2p
   - daemon
@@ -15,6 +15,7 @@ labels:
 dependencies:
   - TASK-160
   - TASK-164
+  - TASK-178
 ---
 
 ## Description
