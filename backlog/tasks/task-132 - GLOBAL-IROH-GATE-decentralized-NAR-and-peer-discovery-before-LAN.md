@@ -4,7 +4,7 @@ title: GLOBAL-IROH GATE decentralized NAR and peer discovery before LAN
 status: To Do
 assignee: []
 created_date: '2026-08-11 05:31'
-updated_date: '2026-08-11 19:52'
+updated_date: '2026-08-12 11:00'
 labels:
   - iroh
   - discovery
@@ -45,4 +45,6 @@ Prove the mandatory global Iroh journey before LAN using decentralized content d
 
 <!-- SECTION:NOTES:BEGIN -->
 Mandatory decentralized qualification gate. TASK-101 tracker artifacts may be attached later only as comparison data and are neither dependencies nor valid substitutes.
+
+TASK-162 (64d0779) landed the production libp2p CONSUMER config path (build_libp2p_nar_source from Libp2pSourceConfig; CLI --libp2p-bootstrap/-provider-addr/-listen/-scope/-identity-seed), proven by an in-process integration test through the real serving stack (discover via kad NOT injected -> fetch -> gate-1 BLAKE3 -> serve byte-identical). This is the consumer half of the cold decentralized journey. Still injected per TASK-159: provider byte-transfer dial address (node_locator() is None) - the DISCOVERY is decentralized, the DIAL is out-of-band. A libp2p SERVING daemon from the real catalog is not yet CLI-exposed (TASK-146).
 <!-- SECTION:NOTES:END -->
