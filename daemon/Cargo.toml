@@ -176,6 +176,17 @@ rustix = { version = "1", features = ["fs", "process"] }
 # neutrally. peer-fabric is already a normal dependency; a test crate is a separate
 # crate, so it must also be a dev-dependency to be nameable in tests/.
 peer-fabric = { path = "../peer-fabric" }
+# fabric-libp2p (TASK-160): the daemon<->libp2p integration test stands up real
+# in-process libp2p nodes (bootstrap + serving provider + consumer) to prove the
+# Libp2pNarSource discovers a provider via kad and fetches through the daemon
+# serving stack. A regular dependency too (the daemon links it), but named directly
+# in tests/, so it is also a dev-dependency (mirroring peer-fabric above).
+fabric-libp2p = { path = "../fabric-libp2p" }
+# ed25519-dalek (TASK-160): the integration test signs the provider's
+# ProviderRecord with the SAME ed25519 seed the provider node's identity is built
+# from (self-serve), via `peer_fabric::sign_provider_record`. Version "3" matches
+# peer-fabric's, so `SigningKey` is the one shared type across the seam.
+ed25519-dalek = "3"
 # process: spawn the real testproxy binary for the fault-mode loop (AC#2).
 tokio = { version = "1", features = ["rt-multi-thread", "net", "macros", "io-util", "time", "process", "test-util"] }
 # flate2: build a real gzip body for the AC#6 verbatim-forwarding bite.

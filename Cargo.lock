@@ -923,6 +923,7 @@ dependencies = [
  "bao-tree",
  "blake3",
  "bytes",
+ "ed25519-dalek 3.0.0",
  "fabric-iroh",
  "fabric-libp2p",
  "flate2",
