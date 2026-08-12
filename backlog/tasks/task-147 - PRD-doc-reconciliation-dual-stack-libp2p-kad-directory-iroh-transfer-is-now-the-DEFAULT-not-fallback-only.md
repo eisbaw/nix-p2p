@@ -6,7 +6,7 @@ title: >-
 status: Done
 assignee: []
 created_date: '2026-08-12 01:31'
-updated_date: '2026-08-12 05:04'
+updated_date: '2026-08-12 07:22'
 labels:
   - architecture
   - docs
@@ -26,7 +26,7 @@ TASK-126 spike found iroh-dht-experiment stores a FIXED TYPED enum, not opaque b
 ## Implementation Notes
 
 <!-- SECTION:NOTES:BEGIN -->
-OWNER RATIFIED (informed) 2026-08-12: after I surfaced that single-stack means daemon-iroh CANNOT do global content discovery (iroh has no opaque-value DHT), the owner chose dual-stack — 'if iroh is so limited, I'll let it borrow from libp2p.' So daemon-iroh = iroh-blobs transfer + iroh node/LAN discovery (pkarr/Mainline/mDNS) + BORROWED libp2p-kad content directory (dual-stack, the default). daemon-libp2p (pure libp2p, incl its own transfer) remains an optional single-stack comparator/fallback, not on the MVP critical path. This supersedes the brief single-stack reversal (git-reverted). Shared ed25519 identity (PeerId==NodeId, same-keypair not byte-equal — TASK-103 carries the bite test). Decision trail: mped proposed dual-stack -> owner questioned -> single-stack cost surfaced -> owner ratified dual-stack informed. TASK-149 (consolidation debt) stays open; the pure-libp2p transfer gap is noted here rather than as a separate MVP task.
+DIRECTION UPDATE 2026-08-12 (owner): libp2p-PRIMARY, iroh OPTIONAL. Supersedes the dual-stack 'iroh borrows libp2p' framing. iroh is a connectivity substrate with NO content-provider routing ('who has hash X?') - only address lookup - so libp2p-kad is the MANDATORY discovery layer (robust, IPFS-proven, ADOPTED: no hand-roll, no Kademlia-over-iroh). iroh-blobs is kept as an OPTIONAL NarTransfer for its NAT traversal, measured vs libp2p's own transport in the tournament; if iroh doesn't win, the product collapses to pure libp2p. Discovery is always libp2p-kad regardless of transport. dig-dht (v0.11) is a comparison arm at most, never a dependency. PRD + docs/peer-fabric-seam.md + README updated with iroh's shortcomings.
 <!-- SECTION:NOTES:END -->
 
 ## Final Summary

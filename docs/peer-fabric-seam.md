@@ -5,6 +5,16 @@ pressure-test (verdict: REVISE) and the owner's decisions: **dynamic dispatch
 (trait objects)** and **two per-backend binaries**. Supersedes the
 hand-rolled-Kademlia framing of TASK-126.
 
+> **SUPERSEDED DIRECTION (owner 2026-08-12): libp2p-PRIMARY, iroh OPTIONAL.**
+> The "dual-stack default / daemon-iroh borrows libp2p" prose below is
+> **historical** — retained for the seam mechanics, not the stack policy. Current
+> authority is `PRD.md` ("Pluggable P2P substrate" + the P2P-substrate decision
+> row): iroh is a connectivity substrate with **no content-provider routing**, so
+> **`libp2p-kad` is the mandatory discovery layer** and **iroh is an optional
+> `NarTransfer`** measured against libp2p's transport in the tournament.
+> `ProviderDirectory` is always libp2p-kad; the seam traits, `Lookup`/`Exposure`,
+> dispatch, and crate topology below remain accurate.
+
 ## Why this exists
 
 The daemon is iroh-native below the `NarSource`/`Transport` seam: the serving

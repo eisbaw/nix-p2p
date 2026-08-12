@@ -6,7 +6,7 @@ title: >-
 status: To Do
 assignee: []
 created_date: '2026-08-10 10:04'
-updated_date: '2026-08-12 05:18'
+updated_date: '2026-08-12 07:22'
 labels:
   - iroh
   - discovery
@@ -49,7 +49,5 @@ Implement TASK-126s frozen decentralized exact-key content discovery behind Cont
 ## Implementation Notes
 
 <!-- SECTION:NOTES:BEGIN -->
-TASK-147 (Mark-emulator, 2026-08-12) DECIDED dual-stack default: this task implements the libp2p-kad ProviderDirectory (put_record/get_record carrying the frozen opaque ContentKey->signed ProviderRecord codec) in a NEW fabric-libp2p crate (not iroh-dht-experiment - the spike proved it stores a fixed typed enum, not opaque bytes). Dual-stack wiring: the default daemon-iroh composition root assembles fabric-iroh (transfer+NodeLocator+NarServer+mDNS) AND fabric-libp2p (ProviderDirectory+AvailabilityAnnouncer) into one Fabric. Shared identity: ONE ed25519 secret constructs both iroh NodeId and libp2p PeerId, and the AvailabilityAnnouncer signs each ProviderRecord with that key so provider==the iroh identity that serves. CAVEAT (self-critical): PeerId==NodeId is SAME-KEYPAIR/mutually-derivable, NOT byte-equality - iroh NodeId is the raw 32B ed25519 pubkey, libp2p PeerId is a multihash wrapper; carry a BITE TEST proving both round-trip to the same pubkey; assume no string/byte identity. Resource tests (AC#8) must budget BOTH event loops/holepunchers.
-
-TASK-148 inc 1 (commit 9c0472d): the transfer seam is now live - IrohTransport IS peer_fabric::NarTransfer. For dual-stack/libp2p wiring, a Libp2pTransfer implements the SAME peer_fabric::NarTransfer trait and registers into peer_fabric::TransferRegistry alongside (or instead of) the iroh one; the daemon fetch path adopting NarTransfer directly (retiring the daemon Transport bridge) is TASK-150/TASK-148 AC#3.
+ELEVATED to critical-path PRIMARY 2026-08-12 (owner: libp2p-primary): libp2p-kad ProviderDirectory in fabric-libp2p is THE mandatory decentralized content-discovery cornerstone. get_providers/start_providing storing the frozen ContentKey->signed ProviderRecord (TASK-126) as an opaque value. Discovery is libp2p-kad regardless of which transport (libp2p or iroh) a build uses. Pair with TASK-151 (libp2p transport) to make daemon-libp2p a full pure-libp2p product.
 <!-- SECTION:NOTES:END -->

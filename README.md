@@ -148,14 +148,19 @@ See `figures/fig-arch-5-peer-fabric.svg` for the whole picture and
   normal path — to a verified NAR stream), so the p2p swap needs no HTTP-layer
   change. All *P2P* behaviour sits behind a third, intention-level seam,
   **`PeerFabric`** (find providers · announce · locate · fetch · serve ·
-  hold-query · LAN): iroh and libp2p are *backends* behind it, not the
-  architecture, and the content-routing DHT is an **adopted** prior solution
-  (`iroh-dht-experiment` / `libp2p-kad`), not hand-rolled. Target packaging is a
-  stack-neutral `daemon-core` frontend over one backend crate (`fabric-iroh` /
-  `fabric-libp2p`), shipped as **one binary per backend** (`daemon-iroh` /
-  `daemon-libp2p`) so exactly one stack ever links. *Today the daemon is a single
-  crate with iroh welded in; the seam and crate split are the target, not yet
-  built.* A NAR transport plugs in as one `NarSource`/`Transport` impl with a
+  hold-query · LAN). **libp2p is the primary stack; iroh is an optional
+  transport.** iroh is a connectivity substrate — superb at *EndpointId → QUIC
+  bytes* — but it has **no content-provider routing** ("who has hash X?"), only
+  address lookup, so a decentralized cache cannot *discover* on iroh alone.
+  Discovery is therefore **`libp2p-kad`** (`get_providers`/`start_providing`, the
+  robust IPFS-proven provider DHT), *adopted* not hand-rolled (no
+  Kademlia-over-iroh). iroh-blobs is kept as an **optional** `NarTransfer` for its
+  NAT traversal, measured against libp2p's transport in the tournament; discovery
+  is libp2p-kad regardless. Target packaging: a stack-neutral `daemon-core`
+  frontend over `fabric-libp2p` (kad + libp2p transport) plus the optional
+  `fabric-iroh` (iroh transport). *Today the daemon is a single crate with iroh
+  welded in and no discovery yet; the seam/crate-split and libp2p-kad are the
+  target, not built.* A NAR transport plugs in as one `NarSource`/`Transport` impl with a
   `TransportRegistry` dispatching on each claim offer's tag — so a second
   transport (BitTorrent) is a new implementation, not a network fork.
 - **`testproxy/`** — the permanent test fixture. A simple caching proxy that
@@ -203,10 +208,11 @@ the **claim wire schema** and the **addressed unit** (`RawNarV1` — the exact
 `nix-store --dump` bytes, keyed by plain BLAKE3, which equals the iroh-blobs
 hash by construction). Both are pinned in bytes by golden vectors, so a rename
 or a retag fails a test rather than a deployment. The global discovery key
-derivation is the third frozen surface: the *model* is settled — our schema
-frozen as an opaque value inside an adopted DHT substrate, so the substrate's own
-wire format can churn without touching the freeze — while the substrate itself
-(`iroh-dht-experiment` / `libp2p-kad`) is chosen by the TASK-126 spike.
+derivation is the third frozen surface: our schema is frozen as an opaque value
+inside the DHT substrate, so the substrate's own wire format can churn without
+touching the freeze. The substrate is settled: **`libp2p-kad`** (the TASK-126
+spike found iroh has no usable content-provider store — see "iroh's shortcomings"
+in `PRD.md`), stored via `put_record`/`get_record`.
 
 ## Development
 

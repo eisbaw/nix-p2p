@@ -213,7 +213,7 @@ Non-goals (explicit):
 | **Kill criterion (historical; superseded by TASK-114)** | **<20% net cache-egress cut on the favorable testbed kills the p2p thesis**; p95 build latency regression must stay <10% (round 3, owner) | Preserved provenance; Wave 2c now applies profile-specific margins plus hard latency/privacy/resource constraints rather than killing every context at once |
 | Transport | iroh / iroh-blobs (one `NarTransfer` backend behind the `PeerFabric` seam) | BLAKE3 incremental verified streaming, QUIC + holepunching; not the fixed stack — see P2P substrate row |
 | Discovery (historical; superseded by TASK-114/TASK-126) | DHT-authoritative, gossip as accelerant (round 1, owner) | Preserved provenance; the chosen substrate remains evidence-gated, but production now requires a passing decentralized exact-key mechanism |
-| **P2P substrate** (2026-08-12) | **Pluggable behind the `PeerFabric` intention seam; backends adopted not invented; default is DUAL-STACK — libp2p-kad directory + iroh-blobs transfer** | iroh and libp2p are backends, not the architecture; the content-routing directory is `libp2p-kad` `put_record`/`get_record` (the only opaque-value store — TASK-126 spike), NAR transfer stays iroh-blobs, unified by a shared ed25519 identity (`PeerId == NodeId`); serving core stays stack-neutral. See `docs/peer-fabric-seam.md` |
+| **P2P substrate** (2026-08-12) | **libp2p-PRIMARY behind the `PeerFabric` seam: libp2p-kad is the mandatory discovery layer; iroh is an OPTIONAL transport** | iroh is a connectivity substrate with NO content-provider routing ("who has hash X?") — only address lookup; so discovery is `libp2p-kad` `get_providers`/`start_providing` (robust, IPFS-proven), adopted not invented (no hand-roll, no Kademlia-over-iroh). iroh-blobs is kept as an optional `NarTransfer` for its NAT traversal, measured vs libp2p transport in the tournament; discovery is libp2p-kad regardless. Serving core stays stack-neutral. See `docs/peer-fabric-seam.md` |
 | Latency guardrails | Prefetch + hedge (throughput-abort) | The only thing keeping DHT seconds off the user path — load-bearing |
 | Metadata | cache.nixos.org only + daemon disk cache | Bandwidth offload MVP (round 1, owner) |
 | Privacy (historical; superseded by TASK-114/TASK-120) | Public swarm, documented risk, leech opt-out (round 1, owner) | Preserved provenance; fresh installs are upstream-only/private and LAN/public participation is explicit opt-in |
@@ -625,40 +625,60 @@ inventory enumeration.
 
 ### Pluggable P2P substrate — the PeerFabric seam (2026-08-11)
 
-The peer-to-peer stack is **not fixed to iroh.** All p2p behaviour sits behind
-one intention-level internal seam, `PeerFabric`, which names *what the daemon
-wants* of any substrate — find providers, announce availability, locate a node,
-fetch a NAR, serve a NAR, ask a peer, discover LAN peers — never how a stack does
-it. iroh and libp2p are **backends behind that seam**, not the architecture. The
-API and its churn-prone detail live in `docs/peer-fabric-seam.md`; the durable
-decisions are:
+All p2p behaviour sits behind one intention-level internal seam, `PeerFabric`,
+which names *what the daemon wants* of any substrate — find providers, announce
+availability, locate a node, fetch a NAR, serve a NAR, ask a peer, discover LAN
+peers — never how a stack does it. The API and its churn-prone detail live in
+`docs/peer-fabric-seam.md`.
 
-- **Adopt, do not invent.** The content-routing DHT (NarHash→provider) is an
-  *adopted* prior solution — `libp2p-kad` `put_record`/`get_record` **primary**,
-  `iroh-dht-experiment` a **future candidate** (blocked today). TASK-126's
-  opaque-value spike **flipped** the earlier iroh-first ordering on evidence:
-  `iroh-dht-experiment` stores a fixed typed enum, not opaque bytes, so it cannot
-  key our content-derived, mutable, multi-provider signed `ProviderRecord`;
-  `libp2p-kad`'s `Record{key, value: Vec<u8>}` is the only opaque-value model that
-  can. Hand-rolling a Kademlia is superseded. iroh already solves NodeId→address
-  decentrally (pkarr/Mainline) and serves the NAR bytes (iroh-blobs), but ships no
-  usable content-routing value store — that is the one primitive we adopt from
-  libp2p, and it is *why the default ships dual-stack* (see below).
+**Why libp2p is the primary stack and iroh is optional — iroh's shortcomings
+(owner direction 2026-08-12).** iroh is a *connectivity substrate*, not a general
+P2P framework. Its whole API is "give me a cryptographic `EndpointId` and I will
+establish a good QUIC connection to it" — excellent NAT traversal, relay fallback,
+QUIC multipath. What it does **not** provide is the thing a decentralized cache
+most needs:
+- **No content-provider routing.** iroh has no "who has hash X?" query — no
+  Kademlia `GET_PROVIDERS`/`ADD_PROVIDER`, no generic content DHT. Its only DHT is
+  an *address-lookup* mechanism (`EndpointId → signed pkarr record → addresses`,
+  optionally via the BitTorrent Mainline DHT); you must already know the
+  EndpointId. (TASK-126 spike: `iroh-dht-experiment` stores a fixed typed enum,
+  not opaque bytes, so it cannot even be bent into our provider record.)
+- **No generic distributed key/value store, no provider records, no rendezvous
+  for unknown peers.** iroh's own docs say how peers learn about one another is an
+  application concern (QR code, tracker, gossip, DHT — your problem, not iroh's).
+
+So iroh gets you *from an EndpointId to bytes* superbly, but not *from a store-path
+to an EndpointId*. A global, permissionless Nix cache needs the latter, and no
+iroh project delivers it at Nix scale — so we do not build on iroh's discovery, we
+adopt libp2p's. Durable decisions:
+
+- **libp2p-kad is the discovery layer — mandatory, robust, adopted.**
+  `start_providing`/`get_providers` is exactly our store-path→providers query, and
+  it is IPFS-mainnet-proven (years of sybil/eclipse/republish hardening — an
+  availability property that matters for a permissionless global DHT and that iroh
+  and any fresh Kademlia lack). We **use the robust existing library**; we do NOT
+  hand-roll a Kademlia and do NOT run Kademlia-over-iroh (rejected as fundamental
+  research). `dig-dht` is an interesting standalone-Kad reference but is
+  v0.11/unproven — a comparison arm at most, never the primary dependency.
+- **iroh is an OPTIONAL transport, not the architecture.** iroh-blobs whole-NAR
+  transfer works today (the s6-p2p peer-served build is green) and iroh's NAT
+  traversal is genuinely strong for residential peers — so iroh is kept as a
+  swappable `NarTransfer`/`NarServer` backend. Whether it beats libp2p's own
+  transport (request-response/stream over AutoNAT/DCUtR/relay) on real NATs is what
+  the transport tournament measures; if it does not, the product collapses to pure
+  libp2p. **Discovery is always libp2p-kad regardless of transport.**
 - **The frozen discovery surface is our schema as an opaque value inside the
-  substrate** (`ContentKey → signed ProviderRecord bytes`), so substrate wire
-  churn never touches the freeze (see the irreversibility map).
-- **Backend selection is per-binary; the default binary is dual-stack.** The
-  frontend stays stack-neutral (crates: `peer-fabric` seam ← `daemon-core`
-  frontend ← `fabric-iroh` / `fabric-libp2p`), and the serving core holds zero p2p
-  types by construction. The **default** composition (`daemon-iroh`) is a
-  dual-stack fabric — iroh-blobs transfer + iroh NodeLocator/mDNS **and** a
-  libp2p-kad directory — so its dependency closure links **both** stacks; the
-  earlier "exactly one stack's closure per binary" invariant holds only for the
-  pure single-stack fallback (`daemon-libp2p`, directory *and* transfer on
-  libp2p). Tests and the transport tournament still bind to a named binary, never
-  a feature combination. A single ed25519 keypair makes `PeerId == NodeId` (both
-  derived from one secret), so the two stacks share identity though not
-  connectivity.
+  substrate** (`ContentKey → signed ProviderRecord bytes`); the multi-transport
+  `offers` in that record are exactly right now that libp2p and iroh transports
+  coexist. Substrate wire churn never touches the freeze (see the irreversibility
+  map).
+- **Seam packaging.** The frontend stays stack-neutral (crates: `peer-fabric` seam
+  ← `daemon-core` frontend ← `fabric-libp2p` / `fabric-iroh`); the serving core
+  holds zero p2p types. `ProviderDirectory` is always libp2p-kad; `NarTransfer` is
+  libp2p (default) or iroh (optional). A pure `daemon-libp2p` links one stack; an
+  iroh-transport build additionally links iroh for the data plane only. A single
+  ed25519 keypair derives both the libp2p `PeerId` and the iroh `EndpointId`
+  (same-keypair, not byte-equal).
 - **The seam changes packaging, not the gates.** Production still requires a
   passing decentralized exact-key mechanism (TASK-132/133/136); a backend swap is
   never a shortcut around evidence.
