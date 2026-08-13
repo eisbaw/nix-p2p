@@ -6,6 +6,7 @@ title: >-
 status: To Do
 assignee: []
 created_date: '2026-08-12 08:38'
+updated_date: '2026-08-13 14:56'
 labels:
   - libp2p
   - fabric
@@ -30,3 +31,9 @@ TASK-151's libp2p transport uses request-response, which BUFFERS the whole NAR. 
 - [ ] #2 the SafetyEnvelope body_idle_timeout is enforced as a real inter-chunk stall guard (not just total_timeout)
 - [ ] #3 serve production runs OFF the swarm worker so a large serve does not block kad/discovery
 <!-- AC:END -->
+
+## Implementation Notes
+
+<!-- SECTION:NOTES:BEGIN -->
+COMPASS 2026-08-13: this is a VALUE-THESIS PRECONDITION, not streaming polish. request-response buffers the whole NAR and caps a single NAR at 256 MiB; TASK-72 admission also declines >256 MiB. The byte-dominant tail (the largest store paths hold the majority of bytes) is therefore STRUCTURALLY UNSERVABLE by the primary transport, so peers could only supply the small-NAR head while the CDN keeps the byte tail. TASK-193 (off-loop async serve seam) is now landed as this task's prerequisite; what remains here is the request-response->stream rewrite + mid-stream size abort + a serve deadline. Must land before any honest break-even measurement over the real size distribution.
+<!-- SECTION:NOTES:END -->

@@ -3,11 +3,11 @@ id: TASK-193
 title: >-
   fabric-libp2p: off-worker async serve production reachable from the swarm
   serve loop (unblocks store-dump serve)
-status: In Progress
+status: Done
 assignee:
   - '@claude'
 created_date: '2026-08-13 13:15'
-updated_date: '2026-08-13 14:50'
+updated_date: '2026-08-13 14:56'
 labels:
   - libp2p
   - fabric
@@ -33,9 +33,9 @@ SCOPE: within request-response (no stream rewrite), make async supervised produc
 
 ## Acceptance Criteria
 <!-- AC:BEGIN -->
-- [ ] #1 async supervised production (produce_supervised) is reachable from the swarm serve loop: a NarSource::Process (store-dump) inbound request is served with correct bytes, NOT Declined(SupplyFailed)
-- [ ] #2 production runs OFF the poll loop (spawned task owns the ResponseChannel) so a serve does not block kad/identify; proven by a bite test that discovery still answers during an in-flight serve
-- [ ] #3 the serve-time BLAKE3(RawNarV1)==announced content recheck + len==declared_size guard (TASK-158) fire on the wired path; a rebuilt/mismatched source fails the serve loud, never ships wrong bytes
+- [x] #1 async supervised production (produce_supervised) is reachable from the swarm serve loop: a NarSource::Process (store-dump) inbound request is served with correct bytes, NOT Declined(SupplyFailed)
+- [x] #2 production runs OFF the poll loop (spawned task owns the ResponseChannel) so a serve does not block kad/identify; proven by a bite test that discovery still answers during an in-flight serve
+- [x] #3 the serve-time BLAKE3(RawNarV1)==announced content recheck + len==declared_size guard (TASK-158) fire on the wired path; a rebuilt/mismatched source fails the serve loud, never ships wrong bytes
 <!-- AC:END -->
 
 ## Implementation Notes
@@ -210,3 +210,9 @@ recheck ordering, fabric-owned supervisor.
 Left In Progress for the codex re-gate. README.md remains modified-uncommitted by the
 orchestrator (unrelated); NOT staged.
 <!-- SECTION:NOTES:END -->
+
+## Final Summary
+
+<!-- SECTION:FINAL_SUMMARY:BEGIN -->
+Carved the off-worker async serve production out of TASK-157 (no stream rewrite): the shipped libp2p serve loop was sync + Memory-only, so a NarSource::Process (store-dump) was Declined on every serve. Now on_nar_event spawns an off-poll-loop task that owns the request-response ResponseChannel across the await, runs produce_supervised (supervised process group, len==declared_size AND BLAKE3(RawNarV1)==content recheck), and hands (channel,response) back over an mpsc backchannel the poll loop selects and replies on. Cancellation-safe: a dropped/closed channel reaps the process group; the in-flight ceiling is a CAS reserve whose InflightReservation guard is created at admit and owned by the future, so even a pre-first-poll drop releases it exactly once (the codex NO-GO, fixed). Borrow-split preserved (task holds only owned clones, never the swarm). fabric-libp2p owns the TaskSupervisor. DEEP-gated: codex NO-GO (pre-first-poll reservation leak) -> guard-owned-from-admit -> codex GO. fabric-libp2p 55/0. Deferred to TASK-157: true stream transfer + mid-stream size abort + serve deadline (still buffers whole NAR, bounded by the ~10s request-response inbound timeout). This UNBLOCKS TASK-191.
+<!-- SECTION:FINAL_SUMMARY:END -->

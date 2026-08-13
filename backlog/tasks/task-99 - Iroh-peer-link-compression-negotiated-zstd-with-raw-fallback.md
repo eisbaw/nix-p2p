@@ -4,7 +4,7 @@ title: 'Iroh peer-link compression: negotiated zstd with raw fallback'
 status: To Do
 assignee: []
 created_date: '2026-08-10 09:10'
-updated_date: '2026-08-11 20:08'
+updated_date: '2026-08-13 14:56'
 labels:
   - wave-2b
 dependencies:
@@ -50,4 +50,6 @@ MEASURE, DO NOT ASSUME: zstd on nar data may not reach xz's ratio. Report the ac
 
 <!-- SECTION:NOTES:BEGIN -->
 Authoritative order: mandatory decentralized Iroh node and content discovery TASK-89/TASK-103/TASK-116 and authenticated HTTPS land first. This task then adds negotiated Iroh zstd; TASK-87/88 exercise raw and compressed Iroh; comparative raw Stage A is TASK-125; BitTorrent starts only at TASK-117/75. Tracker work is optional tournament comparison and is not a prerequisite. Raw fallback remains mandatory.
+
+COMPASS 2026-08-13: link compression is THE break-even lever (raw NAR vs compressed CDN) - the single feature that most determines whether the value thesis passes. It is filed IROH-ONLY and blocked behind the iroh discovery chain (89/116/103), but the shipped primary transport is libp2p (PRD Wave-2c). Re-scope: generalise compression to the transport-agnostic NarTransfer/NarServer seam (both backends) OR file a libp2p sibling, and re-audit the iroh-89/116 deps for staleness under libp2p-primary. As filed, the most thesis-critical feature is pinned to a non-shipped stack.
 <!-- SECTION:NOTES:END -->

@@ -4,14 +4,14 @@ title: 'The PEER link is still loopback: every peer-advantage number is an upper
 status: To Do
 assignee: []
 created_date: '2026-08-09 15:35'
-updated_date: '2026-08-10 09:29'
+updated_date: '2026-08-13 14:56'
 labels:
   - measurement
   - finding
   - transport
 dependencies:
   - TASK-63
-priority: medium
+priority: high
 ---
 
 ## Description
