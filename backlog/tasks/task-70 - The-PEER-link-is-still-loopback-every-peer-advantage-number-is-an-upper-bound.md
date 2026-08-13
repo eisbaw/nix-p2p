@@ -1,11 +1,11 @@
 ---
 id: TASK-70
 title: 'The PEER link is still loopback: every peer-advantage number is an upper bound'
-status: In Progress
+status: Done
 assignee:
   - '@me'
 created_date: '2026-08-09 15:35'
-updated_date: '2026-08-13 21:03'
+updated_date: '2026-08-13 21:48'
 labels:
   - measurement
   - finding
@@ -72,4 +72,6 @@ AC#3 (re-state wan_shaped speedup with BOTH ends shaped): DEFERRED to TASK-198 (
 REAL SPIKE (this box, 10 MiB, delay 20ms, cap 100mbit): shaped RTT 48.2ms throughput 77.4mbit; unshaped RTT 0.1ms throughput 56294mbit (loopback veth). Oracle PASS. Clean teardown, no orphan netns/processes. (77mbit vs 100 cap = short-transfer TCP ramp at 40ms RTT; well inside the 'capped, not collapsed' band. The default 40 MiB runs closer to the cap.)
 
 GOTCHA for TASK-198: profile_p2p.py + daemon/examples/iroh_throughput.rs are iroh-worded; the shipped primary transport is now libp2p-stream. AC#3 must run the REAL libp2p two-node NAR transfer through this shaped-link primitive (not the raw-TCP probe that validates the primitive itself).
+
+DONE 2026-08-13: AC#1/#2/#4 met and verified on-box (commit be8dc3d) — the shaped-link measurement primitive landed, oracle bites by mutation, shaping kept out of the shipped binary (gate-enforced). AC#3 (re-state the wan_shaped speedup with both link ends shaped) is NOT completable within this task: it is blocked on TASK-99 (link compression changes the peer byte-volume) and is now OWNED by TASK-198. This is a scope TRANSFER to a dependency-tracked follow-up, not an AC re-game — 3 of 4 ACs are genuinely met; the 4th cannot be honestly measured until 99 exists.
 <!-- SECTION:NOTES:END -->
