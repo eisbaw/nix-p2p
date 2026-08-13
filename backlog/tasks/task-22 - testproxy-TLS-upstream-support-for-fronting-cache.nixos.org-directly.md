@@ -1,11 +1,11 @@
 ---
 id: TASK-22
 title: 'testproxy: TLS upstream support for fronting cache.nixos.org directly'
-status: In Progress
+status: Done
 assignee:
   - Mark Ruvald Pedersen
 created_date: '2026-08-08 07:30'
-updated_date: '2026-08-13 12:56'
+updated_date: '2026-08-13 13:03'
 labels:
   - testproxy
   - follow-up
@@ -23,11 +23,11 @@ After the global-first and LAN Iroh discovery vertical slices are complete, add 
 
 ## Acceptance Criteria
 <!-- AC:BEGIN -->
-- [ ] #1 testproxy can fetch from an https:// upstream base URL
-- [ ] #2 chosen TLS/client crate added to HTTP_STACK_CRATES denylist and stays disjoint from the daemon's stack
-- [ ] #3 The HTTPS client validates certificate chains against configured/system trust roots and validates DNS hostname/SNI; production configuration exposes no verification-disabled mode.
-- [ ] #4 A fixture CA proves a valid hostname succeeds while untrusted self-signed, wrong-hostname and expired certificates are rejected before any response bytes are cached; neutralizing verification makes the test fail.
-- [ ] #5 The frozen tls-upstream-v1 qualification budget is one 10000 ms total covering DNS, TCP connect and TLS handshake, with connect and handshake each capped at 5000 ms inside the same total. Deliberately stalled DNS/connect/handshake cases fail within the configured bound; monotonic tests allow at most 1000 ms scheduler grace and cannot extend the deadline in-run.
+- [x] #1 testproxy can fetch from an https:// upstream base URL
+- [x] #2 chosen TLS/client crate added to HTTP_STACK_CRATES denylist and stays disjoint from the daemon's stack
+- [x] #3 The HTTPS client validates certificate chains against configured/system trust roots and validates DNS hostname/SNI; production configuration exposes no verification-disabled mode.
+- [x] #4 A fixture CA proves a valid hostname succeeds while untrusted self-signed, wrong-hostname and expired certificates are rejected before any response bytes are cached; neutralizing verification makes the test fail.
+- [x] #5 The frozen tls-upstream-v1 qualification budget is one 10000 ms total covering DNS, TCP connect and TLS handshake, with connect and handshake each capped at 5000 ms inside the same total. Deliberately stalled DNS/connect/handshake cases fail within the configured bound; monotonic tests allow at most 1000 ms scheduler grace and cannot extend the deadline in-run.
 <!-- AC:END -->
 
 ## Implementation Plan
@@ -74,3 +74,9 @@ SELF-TEST PIN (codex minor): added 4 must-fail HTTP_SELF_TEST_CASES pinning nati
 KEPT (codex-confirmed sound, unchanged): no-prod-skip-verify, load-bearing URL-host name check, verbatim bytes, disjoint denylist+flake (daemon rustls-only), DNS-worker-orphan honest limit.
 RE-GATE BOUNDED (nix develop): fmt --check OK; clippy -p testproxy -D warnings clean; build -p testproxy --locked OK; check-independence.py green (6 convergences caught in self-test, 22 denied); cargo test -p testproxy = lib 32 +1 ignored(network), +2+7+6+1+0 integration, all pass. df ~115G. Ready for codex re-gate.
 <!-- SECTION:NOTES:END -->
+
+## Final Summary
+
+<!-- SECTION:FINAL_SUMMARY:BEGIN -->
+testproxy can now front the real https://cache.nixos.org over VERIFIED TLS, using native-tls (openssl) chosen DISJOINT from the daemon's rustls so the two remain independent wire witnesses. Hand-rolled blocking upstream_get gained a scheme-aware parse_authority (https->443) + an https path; production verifier is native_tls::TlsConnector::new() (system roots, full chain + hostname/SNI via the URL host as the load-bearing name); NO production skip-verify (only accept-invalid is #[cfg(test)]). Frozen tls-upstream-v1 budget (10000 total / 5000 connect / 5000 handshake / 1000 grace) enforced ABSOLUTELY: TcpStream::connect_timeout for connect, and a WATCHDOG thread (cloned fd + shutdown(Both) at min(handshake_cap,total-remaining)) for the handshake, cancelled+joined before any body read - so a slow-drip TLS peer fails within bound instead of retaining the thread (the codex NO-GO, fixed; mirrors TASK-24's absolute async deadline on the blocking port). Verbatim bytes preserved. Independence MECHANIZED: rustls/tokio-rustls/native-tls/openssl added to the HTTP_STACK_CRATES denylist (daemon={rustls,tokio-rustls} vs testproxy={native-tls,openssl} disjoint), with self-test cases pinning each TLS name. flake.nix gained pkg-config+openssl (build-time; not linked into the daemon). DEEP-gated: codex NO-GO (per-read idle timeout evadable by slow-drip) -> absolute watchdog deadline -> codex GO. Bites: cert-validation (accept-invalid->negatives connect), slow-drip handshake (200ms drip->fail at deadline). rcgen fixture-CA with an in-process native-tls server.
+<!-- SECTION:FINAL_SUMMARY:END -->
