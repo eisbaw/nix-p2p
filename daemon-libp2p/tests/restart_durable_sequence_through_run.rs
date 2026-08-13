@@ -1,0 +1,454 @@
+//! TASK-185 AC#4 - RESTART-DURABILITY through the SHIPPED path, biting by mutation.
+//!
+//! The defect (F3): the durable floor + per-key announce sequence were built + unit-tested
+//! but NOT wired into the shipped daemon, and positive records were minted at a hardcoded
+//! `sequence: 1`, so a restarted provider re-minted an already-published sequence and
+//! self-rolled-back. This test exercises the PRODUCTION provider construction the binary's
+//! `--libp2p-provider` path runs - `build_libp2p_provider_source` with a `state_dir`, then
+//! `Libp2pFabric::next_announce_sequence` + `sign_libp2p_provider_record` - across a restart,
+//! and serves the post-restart record through the exact `daemon_core::run` glue the binary
+//! calls.
+//!
+//! Topology (all in-process, real loopback-TCP libp2p swarms):
+//! - `B` - bootstrap (the only injected address for P and C).
+//! - `P1` - a serving provider built by the PRODUCTION `build_libp2p_provider_source` with a
+//!   durable `state_dir`; announces its NAR at a durably-allocated sequence, then is DROPPED
+//!   (== a process restart; the state dir persists).
+//! - `P2` - the RESTARTED provider: a fresh fabric on the SAME identity seed + SAME
+//!   state_dir, built by the SAME production builder; its allocator re-seeds from disk, so its
+//!   record carries a STRICTLY-NEWER sequence. Stays up to serve.
+//! - `C` - the CONSUMER built by the production `build_libp2p_nar_source`, handed to
+//!   `daemon_core::run`, which serves P2's NAR byte-identical over the libp2p path.
+//!
+//! What BITES BY MUTATION (the two halves of F3):
+//!   * Revert the daemon wiring to the NON-durable `start*` (drop the `state_dir` routing):
+//!     P2's re-seeded floor is EMPTY, so `next_announce_sequence` returns 1 and P2's record
+//!     carries sequence 1 - the strict-monotonicity assertion fails, and the announce-seq
+//!     file is never written (no `seq_path`) - the floor-survival assertion fails too.
+//!   * Revert `sign_libp2p_provider_record` to hardcode `sequence: 1`: P2's record carries 1
+//!     regardless of the allocator - the strict-monotonicity assertion fails.
+
+use std::net::SocketAddr;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+use async_trait::async_trait;
+use bytes::Bytes;
+use daemon_core::{
+    CacheInfo, NarHashKey, NarKey, NarSource, NarinfoSource, NullCorrelation, RawUpstream,
+    RunConfig, SourceError, StoreHash, UpstreamResponse, run,
+};
+use daemon_libp2p::{
+    Libp2pSourceConfig, build_libp2p_nar_source, build_libp2p_provider_source,
+    provider_content_key, sign_libp2p_provider_record,
+};
+use fabric_libp2p::{Libp2pFabric, MemoryNarSupplier, Multiaddr, NodeConfig, PeerId};
+use http::HeaderMap;
+use http_body_util::{BodyExt, Full};
+use peer_fabric::{
+    AnnounceBudget, Axis, DiscoveryBudget, PeerFabric, ProviderRecord, SafetyEnvelope, ServeBudget,
+    TransportTag,
+};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+fn unix_now() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("clock after epoch")
+        .as_secs()
+}
+
+/// Bring a raw fabric up on an ephemeral loopback port; return it + its dial address.
+async fn start_fabric(fabric: Libp2pFabric) -> (Arc<Libp2pFabric>, Multiaddr) {
+    fabric
+        .handle()
+        .listen("/ip4/127.0.0.1/tcp/0".parse().unwrap())
+        .await
+        .expect("listen bound");
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let addr = loop {
+        if let Some(addr) = fabric.handle().listen_addrs().await.into_iter().next() {
+            break addr;
+        }
+        assert!(Instant::now() < deadline, "no listen address bound in time");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    };
+    (Arc::new(fabric), addr)
+}
+
+/// Build the production PROVIDER config for seed `seed` joined to `boot`, durable under
+/// `state_dir`. This is exactly what the binary's `source_config` produces for a provider
+/// with `--libp2p-state-dir`.
+fn provider_cfg(
+    seed: [u8; 32],
+    scope: &str,
+    boot: (PeerId, Multiaddr),
+    state_dir: std::path::PathBuf,
+) -> Libp2pSourceConfig {
+    Libp2pSourceConfig {
+        identity_seed: seed,
+        network_scope: scope.to_string(),
+        listen: Some("/ip4/127.0.0.1/tcp/0".parse().unwrap()),
+        bootstrap: vec![boot],
+        provider_addrs: vec![],
+        discovery_budget: DiscoveryBudget::new(Duration::from_secs(10), 32),
+        envelope: SafetyEnvelope::default(),
+        state_dir: Some(state_dir),
+    }
+}
+
+/// Stand up a serving provider through the PRODUCTION builder, install its serve gate, and
+/// announce `nar` at a DURABLY-ALLOCATED sequence (the shipped `install_provider` sequence).
+/// Returns the running fabric, the serve guard (kept alive by the caller), and the record
+/// that was announced (so the test can assert its sequence).
+async fn start_provider_and_announce(
+    cfg: Libp2pSourceConfig,
+    nar: &[u8],
+    nar_hash: &NarHashKey,
+) -> (Arc<Libp2pFabric>, peer_fabric::ServeHandle, ProviderRecord) {
+    let seed = cfg.identity_seed;
+    let supplier = Arc::new(MemoryNarSupplier::new([nar.to_vec()]));
+    let (fabric, _source, _raw) = build_libp2p_provider_source(cfg, supplier)
+        .await
+        .expect("production provider builder starts a serving fabric joined to the DHT");
+    let serve = fabric
+        .server()
+        .expect("provider fabric exposes a serve axis")
+        .serve(ServeBudget::default())
+        .await
+        .expect("serve gate installs");
+
+    // The shipped install_provider allocation: durable sequence -> sign -> announce.
+    let sequence = fabric.next_announce_sequence(&provider_content_key(nar_hash));
+    let record = sign_libp2p_provider_record(seed, nar_hash, nar, 3600, unix_now(), sequence);
+    fabric
+        .announcer()
+        .expect("provider announces")
+        .announce(&record, &AnnounceBudget::new(Duration::from_secs(10), 20))
+        .await
+        .expect("announce admitted (provider is DHT-joined)");
+    (fabric, serve, record)
+}
+
+fn nar_hash_string(bytes: [u8; 32]) -> String {
+    NarHashKey::from_sha256_bytes(bytes).to_string()
+}
+
+fn narinfo_body(token: &str, nar_hash: &str, nar_size: usize) -> Vec<u8> {
+    format!(
+        "StorePath: /nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-x\n\
+         URL: nar/{token}\n\
+         Compression: xz\n\
+         FileHash: sha256:0000000000000000000000000000000000000000000000000000\n\
+         FileSize: 100\n\
+         NarHash: {nar_hash}\n\
+         NarSize: {nar_size}\n\
+         References: \n\
+         Sig: nix-p2p-test-1:AAAA==\n"
+    )
+    .into_bytes()
+}
+
+struct OneNarinfo(Vec<u8>);
+
+#[async_trait]
+impl NarinfoSource for OneNarinfo {
+    async fn fetch(&self, hash: &StoreHash) -> Result<UpstreamResponse, SourceError> {
+        if hash.as_str() != "hit" {
+            return Err(SourceError::Unreachable(format!("no narinfo for {hash:?}")));
+        }
+        let body = self.0.clone();
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            http::header::CONTENT_TYPE,
+            "text/x-nix-narinfo".parse().unwrap(),
+        );
+        headers.insert(http::header::CONTENT_LENGTH, body.len().into());
+        Ok(UpstreamResponse {
+            status: 200,
+            headers,
+            body: Full::new(Bytes::from(body))
+                .map_err(|never| match never {})
+                .boxed(),
+        })
+    }
+}
+
+/// The HTTP-upstream fallback `run` layers behind the p2p source. Counts hits so the test
+/// can assert the p2p HIT (the restarted provider's durably-sequenced record) never touched
+/// it.
+struct CountingUpstreamNar {
+    body: Vec<u8>,
+    hits: Arc<AtomicUsize>,
+}
+
+#[async_trait]
+impl NarSource for CountingUpstreamNar {
+    async fn resolve(
+        &self,
+        _key: &NarKey,
+        _expected_size: Option<u64>,
+    ) -> Result<UpstreamResponse, SourceError> {
+        self.hits.fetch_add(1, Ordering::SeqCst);
+        let mut headers = HeaderMap::new();
+        headers.insert(http::header::CONTENT_LENGTH, self.body.len().into());
+        Ok(UpstreamResponse {
+            status: 200,
+            headers,
+            body: Full::new(Bytes::from(self.body.clone()))
+                .map_err(|never| match never {})
+                .boxed(),
+        })
+    }
+}
+
+struct DeadPassthrough;
+
+#[async_trait]
+impl RawUpstream for DeadPassthrough {
+    async fn get(&self, _: &str) -> Result<UpstreamResponse, SourceError> {
+        Err(SourceError::Unreachable("passthrough unused".into()))
+    }
+}
+
+struct Resp {
+    status: Option<u16>,
+    body: Vec<u8>,
+}
+
+fn url_token(narinfo_body: &[u8]) -> String {
+    let text = String::from_utf8_lossy(narinfo_body);
+    for line in text.lines() {
+        if let Some(rest) = line.strip_prefix("URL:") {
+            return rest.trim().to_string();
+        }
+    }
+    panic!("served narinfo carried no URL line:\n{text}");
+}
+
+async fn get(addr: SocketAddr, path: &str) -> Resp {
+    let mut stream = tokio::net::TcpStream::connect(addr)
+        .await
+        .expect("connect to run() server");
+    let req = format!("GET {path} HTTP/1.1\r\nHost: {addr}\r\nConnection: close\r\n\r\n");
+    stream
+        .write_all(req.as_bytes())
+        .await
+        .expect("write request");
+    stream.flush().await.ok();
+    let mut raw = Vec::new();
+    let _ = stream.read_to_end(&mut raw).await;
+    let Some(split) = raw.windows(4).position(|w| w == b"\r\n\r\n") else {
+        return Resp {
+            status: None,
+            body: raw,
+        };
+    };
+    let head = String::from_utf8_lossy(&raw[..split]);
+    let status = head
+        .split("\r\n")
+        .next()
+        .and_then(|line| line.split(' ').nth(1))
+        .and_then(|code| code.parse().ok());
+    Resp {
+        status,
+        body: raw[split + 4..].to_vec(),
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn restart_durable_sequence_serves_through_run() {
+    let scope = "task185-restart-durable";
+    let provider_seed = [3u8; 32];
+
+    // A unique per-run state dir (process + thread keyed), removed up front.
+    let state_dir = std::env::temp_dir().join(format!(
+        "nix-p2p-task185-{}-{:?}",
+        std::process::id(),
+        std::thread::current().id()
+    ));
+    let _ = std::fs::remove_dir_all(&state_dir);
+
+    let nar = b"nix-archive-1 raw NAR served post-restart at a durable sequence".to_vec();
+    let nar_hash_bytes = [0x77u8; 32];
+    let nar_hash: NarHashKey = nar_hash_string(nar_hash_bytes).parse().expect("nar hash");
+    let content_key = provider_content_key(&nar_hash);
+
+    // ---- B (bootstrap) ----
+    let (bootstrap, boot_addr) = start_fabric(
+        Libp2pFabric::start(NodeConfig {
+            identity_seed: [1u8; 32],
+            network_scope: scope.to_string(),
+        })
+        .expect("bootstrap starts"),
+    )
+    .await;
+    let boot_peer = bootstrap.peer_id();
+
+    // ---- P1: provider via the production builder, announces at the durable sequence ----
+    let first_sequence;
+    {
+        let (p1, _serve1, record1) = start_provider_and_announce(
+            provider_cfg(
+                provider_seed,
+                scope,
+                (boot_peer, boot_addr.clone()),
+                state_dir.clone(),
+            ),
+            &nar,
+            &nar_hash,
+        )
+        .await;
+        first_sequence = record1.sequence;
+        assert_eq!(
+            first_sequence, 1,
+            "a first-ever announce on a fresh state dir allocates sequence 1"
+        );
+        assert_eq!(record1.key, content_key, "one NarHash -> one ContentKey");
+        // Drop p1 (and its serve guard) == a process restart. The state dir persists.
+        drop(p1);
+    }
+
+    // The floor SURVIVED to disk (proof of durable persistence, not just an in-memory map).
+    // The persisted line keys on the lowercase hex of the ContentKey bytes (persist.rs), so
+    // match that exactly rather than the Display form.
+    let seq_file = state_dir.join("announce-seq-v1.txt");
+    let seq_text = std::fs::read_to_string(&seq_file)
+        .expect("the durable announce-sequence file must exist after the first announce");
+    let key_hex: String = content_key
+        .as_bytes()
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect();
+    assert!(
+        seq_text.contains(&key_hex),
+        "the persisted announce-sequence file must record the announced key {key_hex}; \
+         file was:\n{seq_text}"
+    );
+
+    // ---- P2: RESTART (same seed + same state_dir), announces STRICTLY NEWER ----
+    let (p2, _serve2, record2) = start_provider_and_announce(
+        provider_cfg(
+            provider_seed,
+            scope,
+            (boot_peer, boot_addr.clone()),
+            state_dir.clone(),
+        ),
+        &nar,
+        &nar_hash,
+    )
+    .await;
+    assert!(
+        record2.sequence > first_sequence,
+        "the restarted provider must mint a STRICTLY NEWER sequence (got {} <= {}); a revert \
+         to the non-durable start* or to a hardcoded sequence:1 makes this fail",
+        record2.sequence,
+        first_sequence
+    );
+    assert_eq!(
+        record2.sequence, 2,
+        "the durable allocator mints last+1 after exactly one prior announce"
+    );
+
+    // ---- C: consumer via the production builder, served through daemon_core::run ----
+    let discovery_budget = DiscoveryBudget::new(Duration::from_secs(10), 32);
+    let consumer_cfg = Libp2pSourceConfig {
+        identity_seed: [4u8; 32],
+        network_scope: scope.to_string(),
+        listen: Some("/ip4/127.0.0.1/tcp/0".parse().unwrap()),
+        bootstrap: vec![(boot_peer, boot_addr.clone())],
+        provider_addrs: vec![],
+        discovery_budget,
+        envelope: SafetyEnvelope::default(),
+        state_dir: None,
+    };
+    let (consumer, _c_source, _c_raw) = build_libp2p_nar_source(consumer_cfg)
+        .await
+        .expect("production consumer builder constructs a running libp2p fabric");
+
+    // Wait until C can DISCOVER the restarted provider P2 purely through kad.
+    let deadline = Instant::now() + Duration::from_secs(25);
+    loop {
+        let found = matches!(
+            consumer
+                .provider_directory()
+                .expect("consumer has a directory")
+                .find_providers(&content_key, &discovery_budget)
+                .await,
+            peer_fabric::Lookup::Found(records)
+                if records.iter().any(|r| r.provider == p2.node_id() && r.sequence == record2.sequence)
+        );
+        if found {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "consumer never discovered the restarted provider's durably-sequenced record"
+        );
+        tokio::time::sleep(Duration::from_millis(150)).await;
+    }
+
+    // Serve the discovered NAR through the exact `run` glue the binary calls.
+    let fallback_hits = Arc::new(AtomicUsize::new(0));
+    let hit_token = "1hitnaaaaaaaaaaaaaaaaaaaaaaaaaaaa.nar.xz";
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("run() binds");
+    let addr = listener.local_addr().unwrap();
+    let run_cfg = RunConfig {
+        listener,
+        upstream: Arc::new(CountingUpstreamNar {
+            body: b"UPSTREAM FALLBACK (must not appear on a p2p hit)".to_vec(),
+            hits: fallback_hits.clone(),
+        }) as Arc<dyn NarSource>,
+        narinfo: Arc::new(OneNarinfo(narinfo_body(
+            hit_token,
+            &nar_hash.to_string(),
+            nar.len(),
+        ))),
+        passthrough: Arc::new(DeadPassthrough),
+        correlation: Arc::new(NullCorrelation),
+        cache_info: CacheInfo::default(),
+        upstream_label: "task185-run-upstream".to_string(),
+        discovery_budget,
+        envelope: SafetyEnvelope::default(),
+        required_axes: vec![
+            Axis::ProviderDirectory,
+            Axis::NodeLocator,
+            Axis::Transfer(TransportTag::Iroh),
+        ],
+        extra_raw_serve: Vec::new(),
+    };
+    let fabric_dyn: Arc<dyn PeerFabric> = consumer.clone();
+    let run_task = tokio::spawn(run(fabric_dyn, run_cfg));
+
+    // The provider announced this NAR, so run's dynamic raw-serve rewrites the narinfo to raw;
+    // follow the advertised URL, which the daemon serves from the p2p HIT byte-identically.
+    let narinfo = get(addr, "/hit.narinfo").await;
+    assert_eq!(narinfo.status, Some(200), "narinfo served through run()");
+    let hit_url = url_token(&narinfo.body);
+    assert_ne!(
+        hit_url,
+        format!("nar/{hit_token}"),
+        "run's production raw-serve must have REWRITTEN the announced narinfo to a raw URL"
+    );
+    let served = get(addr, &format!("/{hit_url}")).await;
+    assert_eq!(
+        served.status,
+        Some(200),
+        "run() served the NAR discovered over the libp2p path from the RESTARTED provider"
+    );
+    assert_eq!(
+        served.body, nar,
+        "run() served BYTE-IDENTICAL bytes to the NAR the restarted provider holds"
+    );
+    assert_eq!(
+        fallback_hits.load(Ordering::SeqCst),
+        0,
+        "the durably-sequenced record served over p2p; the HTTP fallback was not consulted"
+    );
+
+    run_task.abort();
+    let _ = std::fs::remove_dir_all(&state_dir);
+}

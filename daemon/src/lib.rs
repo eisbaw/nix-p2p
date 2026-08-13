@@ -94,7 +94,7 @@ pub use iroh_runtime::{
 // `daemon::build_libp2p_nar_source`, etc. and the integration tests are unchanged.
 pub use daemon_libp2p::{
     Libp2pNarSource, Libp2pRawServe, Libp2pSourceConfig, build_libp2p_nar_source,
-    build_libp2p_provider_source, sign_libp2p_provider_record,
+    build_libp2p_provider_source, provider_content_key, sign_libp2p_provider_record,
 };
 pub use transport_iroh::{
     BODY_IDLE_TIMEOUT, DEFAULT_MAX_INFLIGHT_NAR_BYTES, DEFAULT_MAX_SERVE_DURATION,

@@ -309,6 +309,7 @@ async fn production_config_builds_libp2p_source_that_discovers_and_serves_with_c
         provider_addrs: vec![],
         discovery_budget: DiscoveryBudget::new(Duration::from_secs(10), 32),
         envelope: SafetyEnvelope::default(),
+        state_dir: None,
     };
     // The builder also returns a Libp2pRawServe (TASK-164); this NoRawServe test does
     // not wire it (the compression-domain correctness it enables is covered by

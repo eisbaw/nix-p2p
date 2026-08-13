@@ -28,7 +28,7 @@ use daemon::{
     NodePublicationConfig, NodePublicationHandle, NullCorrelation,
     PublicationAuthorityAuthorization, RawServeDecision, RelayCapability, ServeBudget, SystemClock,
     TaskSupervisor, TransportNarSource, TransportRegistry, UpstreamHttp, build_libp2p_nar_source,
-    build_libp2p_provider_source, serve, sign_libp2p_provider_record,
+    build_libp2p_provider_source, provider_content_key, serve, sign_libp2p_provider_record,
 };
 use fabric_libp2p::{Libp2pFabric, MemoryNarSupplier, Multiaddr, PeerId};
 use peer_fabric::{AnnounceBudget, PeerFabric, ServeHandle};
@@ -389,6 +389,9 @@ struct Config {
     /// `--libp2p-bootstrap <PeerId>@<multiaddr>` to this provider. Like
     /// `--iroh-print-peer-address`.
     libp2p_print_peer_address: bool,
+    /// Per-node durable state directory (TASK-185): when set, the libp2p fabric persists its
+    /// anti-rollback floor + per-key announce sequence here and re-seeds them on restart.
+    libp2p_state_dir: Option<std::path::PathBuf>,
 }
 
 impl Default for Config {
@@ -443,6 +446,7 @@ impl Default for Config {
             libp2p_provider: false,
             libp2p_seed_nar: Vec::new(),
             libp2p_print_peer_address: false,
+            libp2p_state_dir: None,
         }
     }
 }
@@ -694,6 +698,7 @@ impl Config {
                     );
                 }
                 "--libp2p-scope" => config.libp2p_scope = Some(value()?),
+                "--libp2p-state-dir" => config.libp2p_state_dir = Some(value()?.into()),
                 "--libp2p-identity-seed" => {
                     config.libp2p_identity_seed = Some(parse_libp2p_seed(&value()?)?)
                 }
@@ -818,6 +823,7 @@ impl Config {
             provider_addrs: self.libp2p_provider_addrs.clone(),
             discovery_budget: peer_fabric::DiscoveryBudget::default(),
             envelope: peer_fabric::SafetyEnvelope::default(),
+            state_dir: self.libp2p_state_dir.clone(),
         })
     }
 
@@ -1336,6 +1342,19 @@ async fn install_libp2p_provider(
         }
     }
 
+    // A PROVIDER without a durable state dir silently re-enables the F3 self-rollback (it
+    // re-mints sequence 1 and its withdrawals can lose after a restart). Warn loudly - a
+    // silent non-durable PROVIDER is exactly the defect TASK-185 fixed (the iroh path fails
+    // loud on a missing identity dir for the analogous reason).
+    if cfg.state_dir.is_none() {
+        eprintln!(
+            "daemon: WARNING: --libp2p-state-dir is not set; this libp2p PROVIDER runs \
+             NON-DURABLE. Its announce sequences and withdrawals will NOT survive a restart \
+             (a restarted provider re-mints sequence 1 and a withdrawal can silently lose). \
+             Set --libp2p-state-dir <dir> for restart-durable operation."
+        );
+    }
+
     let identity_seed = cfg.identity_seed;
     let supplier = Arc::new(MemoryNarSupplier::new(seeds.iter().map(|(_, b)| b.clone())));
 
@@ -1365,7 +1384,12 @@ async fn install_libp2p_provider(
         .map(|d| d.as_secs())
         .unwrap_or(0);
     for (nar_hash, bytes) in &seeds {
-        let record = sign_libp2p_provider_record(identity_seed, nar_hash, bytes, 3600, now);
+        // AC#2 (TASK-185): allocate the sequence DURABLY from the announcer's per-key floor
+        // (reseeded from `--libp2p-state-dir` on restart) rather than the old hardcoded `1`
+        // that self-rolled-back after a restart. Session-fresh (1) when no state dir is set.
+        let sequence = fabric.next_announce_sequence(&provider_content_key(nar_hash));
+        let record =
+            sign_libp2p_provider_record(identity_seed, nar_hash, bytes, 3600, now, sequence);
         announcer
             .announce(&record, &announce_budget)
             .await

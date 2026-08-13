@@ -29,6 +29,7 @@
 //! A discovery miss / exhausted offer set folds to a fast fallback to HTTP upstream (S2); a
 //! deliberate size abort propagates (every offer addresses the same oversized content).
 
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -96,6 +97,17 @@ pub struct Libp2pSourceConfig {
     pub discovery_budget: DiscoveryBudget,
     /// The fetch time envelope handed to each transfer.
     pub envelope: SafetyEnvelope,
+    /// PER-NODE durable state directory (TASK-185, AC#1). When `Some`, the fabric is started
+    /// through [`Libp2pFabric::start_durable`] / `start_with_supplier_durable`, so the
+    /// consumer's anti-rollback FLOOR and the provider's per-key announce SEQUENCE are
+    /// persisted here and re-seeded on restart - the shipped daemon then genuinely runs in the
+    /// restart-durable mode the README describes. When `None` the fabric is session-scoped
+    /// (the historical non-durable behaviour), for a throwaway/ephemeral node.
+    ///
+    /// EACH NODE NEEDS ITS OWN DIRECTORY: the files are keyed by directory, not by identity,
+    /// so two nodes sharing one `state_dir` corrupt each other's floor/sequence. A fail-loud
+    /// advisory lock is the TASK-185 hardening follow-up.
+    pub state_dir: Option<PathBuf>,
 }
 
 /// Build the PRODUCTION libp2p [`NarSource`] from `cfg`: start a [`Libp2pFabric`],
@@ -195,12 +207,22 @@ pub async fn build_libp2p_provider_source(
 /// This is the SINGLE SOURCE OF TRUTH for a provider record's construction: the daemon
 /// binary's `--libp2p-provider` path and the integration test both mint records here, so
 /// the two cannot drift on the key-derivation / signing recipe.
+///
+/// `sequence` is DURABLY ALLOCATED by the caller from the fabric's announcer
+/// ([`Libp2pFabric::next_announce_sequence`]) - NOT a hardcoded `1` (TASK-185, AC#2). Because
+/// the record is signed above the seam (the sequence is inside the signed bytes, and the
+/// frozen wire/codec forbids the backend clamping it), the sequence must be chosen BEFORE
+/// signing; the durable announcer is the monotonic source, so a restarted provider mints
+/// `last + 1` and its record is strictly newer than every record it previously published.
+/// The frozen record recipe is otherwise untouched: same `provider`/`content`/`offers`/expiry
+/// derivation, only the sequence field now comes from durable state instead of the constant.
 pub fn sign_libp2p_provider_record(
     seed: [u8; 32],
     nar_hash: &NarHashKey,
     nar_bytes: &[u8],
     ttl_secs: u64,
     now: u64,
+    sequence: u64,
 ) -> ProviderRecord {
     let signing_key = SigningKey::from_bytes(&seed);
     let provider = NodeId::from_bytes(signing_key.verifying_key().to_bytes());
@@ -211,12 +233,20 @@ pub fn sign_libp2p_provider_record(
         content,
         provider,
         offers: vec![TransportOffer::Iroh { node: provider }],
-        sequence: 1,
+        sequence,
         issued_at: now,
         expiry: now + ttl_secs,
         signature: [0u8; 64],
     };
     sign_provider_record(&signing_key, &record)
+}
+
+/// Derive the discovery [`ContentKey`] for `nar_hash` exactly as
+/// [`sign_libp2p_provider_record`] does, so the provider path can look up the durable
+/// announce sequence for the record it is about to mint (TASK-185, AC#2). Kept here, next to
+/// the record construction, so the two cannot drift on the derivation recipe.
+pub fn provider_content_key(nar_hash: &NarHashKey) -> ContentKey {
+    ContentKey::derive_from_signed_nar_hash(nar_hash.as_bytes())
 }
 
 /// Wrap a running `fabric` in the consumer [`Libp2pNarSource`] + its paired
@@ -259,9 +289,16 @@ async fn start_and_join_libp2p(
         network_scope: cfg.network_scope.clone(),
     };
     let serving = supplier.is_some();
-    let fabric = match supplier {
-        Some(supplier) => Libp2pFabric::start_with_supplier(node_config, supplier),
-        None => Libp2pFabric::start(node_config),
+    // TASK-185, AC#1: a configured `state_dir` routes to the DURABLE constructors, so the
+    // shipped daemon reloads its anti-rollback floor + per-key announce sequence on restart.
+    // Without a `state_dir` the historical session-scoped (non-durable) path is used.
+    let fabric = match (supplier, &cfg.state_dir) {
+        (Some(supplier), Some(dir)) => {
+            Libp2pFabric::start_with_supplier_durable(node_config, supplier, dir.clone())
+        }
+        (Some(supplier), None) => Libp2pFabric::start_with_supplier(node_config, supplier),
+        (None, Some(dir)) => Libp2pFabric::start_durable(node_config, dir.clone()),
+        (None, None) => Libp2pFabric::start(node_config),
     }
     .map_err(|e| format!("libp2p fabric start failed: {e}"))?;
     let fabric = Arc::new(fabric);

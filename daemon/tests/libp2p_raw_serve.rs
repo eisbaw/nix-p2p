@@ -362,6 +362,7 @@ async fn libp2p_hit_under_compressed_narinfo_is_rewritten_to_raw_and_a_nix_clien
         provider_addrs: vec![(provider_peer, provider_addr)],
         discovery_budget: DiscoveryBudget::new(Duration::from_secs(10), 32),
         envelope: SafetyEnvelope::default(),
+        state_dir: None,
     };
     let (consumer, libp2p_source, libp2p_raw_serve) = build_libp2p_nar_source(cfg)
         .await

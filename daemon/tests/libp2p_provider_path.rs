@@ -107,6 +107,7 @@ async fn provider_serves_and_announces_a_nar_a_consumer_discovers_and_fetches_wi
         provider_addrs: vec![],
         discovery_budget: DiscoveryBudget::new(Duration::from_secs(10), 32),
         envelope: SafetyEnvelope::default(),
+        state_dir: None,
     };
     let supplier = Arc::new(MemoryNarSupplier::new([nar.clone()]));
     let (provider_fabric, _p_source, _p_raw_serve) =
@@ -131,8 +132,15 @@ async fn provider_serves_and_announces_a_nar_a_consumer_discovers_and_fetches_wi
         .serve(ServeBudget::default())
         .await
         .expect("serve gate installs");
-    let record: ProviderRecord =
-        sign_libp2p_provider_record(provider_seed, &nar_hash_key, &nar, 3600, unix_now());
+    let sequence = provider_fabric.next_announce_sequence(&content_key);
+    let record: ProviderRecord = sign_libp2p_provider_record(
+        provider_seed,
+        &nar_hash_key,
+        &nar,
+        3600,
+        unix_now(),
+        sequence,
+    );
     assert_eq!(
         record.provider,
         provider_fabric.node_id(),
@@ -162,6 +170,7 @@ async fn provider_serves_and_announces_a_nar_a_consumer_discovers_and_fetches_wi
         provider_addrs: vec![], // NEVER told P's address.
         discovery_budget: DiscoveryBudget::new(Duration::from_secs(10), 32),
         envelope: SafetyEnvelope::default(),
+        state_dir: None,
     };
     let (consumer_fabric, libp2p_source, _c_raw_serve) = build_libp2p_nar_source(consumer_cfg)
         .await
