@@ -582,10 +582,15 @@ pub async fn announce_provider_seeds(
 /// It is a CAPABILITY, not a plain record: its fields are private and it has NO public
 /// constructor, so the ONLY way to obtain one is [`verify_store_provisions`], which mints it
 /// only after the availability index's TASK-56 `sha256(--dump) == nar_hash` check passed.
-/// [`announce_store_provisions`] consumes `&[StoreProvision]`, so - by the type system - a
-/// record can never be announced for a store path that was not verification-gated. This is the
-/// store analogue of the `verify_provider_seeds`-before-`announce_provider_seeds` discipline,
-/// made un-bypassable rather than merely conventional.
+/// [`announce_store_provisions`] consumes `&[StoreProvision]`, so - by the type system - the
+/// SHIPPED store-announce path can never announce a record for a store path that was not
+/// verification-gated. This is the store analogue of the
+/// `verify_provider_seeds`-before-`announce_provider_seeds` discipline, made gated-by-construction
+/// on the shipped path rather than merely conventional. NOTE (not absolute): the lower-level
+/// [`sign_libp2p_store_record`] takes a raw caller-supplied digest and is NOT itself
+/// `StoreProvision`-gated - a direct library caller could sign an unverified record (a footgun no
+/// shipped call site uses). Generic record-signing makes library-wide prevention impossible; the
+/// guarantee is that the `--libp2p-provide-store` announce path is type-gated.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StoreProvision {
     nar_hash: NarHashKey,

@@ -7,7 +7,7 @@ status: In Progress
 assignee:
   - '@claude'
 created_date: '2026-08-13 11:29'
-updated_date: '2026-08-13 15:04'
+updated_date: '2026-08-13 15:41'
 labels:
   - libp2p
   - daemon
@@ -30,8 +30,8 @@ Consumer of TASK-158. TASK-158 added fabric_libp2p::CatalogNarSupplier + the Cat
 
 ## Acceptance Criteria
 <!-- AC:BEGIN -->
-- [ ] #1 install_libp2p_provider can build a CatalogNarSupplier over a daemon impl of fabric_libp2p::CatalogProbe backed by the AvailabilityIndex, so an announced store path is served by nix-store --dump on demand, holding no .nar at rest
-- [ ] #2 the store-dump produced bytes still flow through the announce SSOT NarHash verification (verify_provider_seeds / sign-site guard, TASK-56) - no new announce path bypasses it
+- [x] #1 install_libp2p_provider can build a CatalogNarSupplier over a daemon impl of fabric_libp2p::CatalogProbe backed by the AvailabilityIndex, so an announced store path is served by nix-store --dump on demand, holding no .nar at rest
+- [x] #2 the store-dump produced bytes still flow through the announce SSOT NarHash verification (verify_provider_seeds / sign-site guard, TASK-56) - no new announce path bypasses it
 - [ ] #3 container e2e: a provider peer serves a /nix/store path it never held as a .nar file; a consumer discovers via kad and fetches byte-identical bytes; the produced bytes BLAKE3-match the announced content
 <!-- AC:END -->
 
@@ -89,4 +89,6 @@ existing TaskSupervisor (unified capacity ceiling), thread the daemon handle thr
 serving constructor rather than the fabric-owned default; the seam already accepts a handle.
 The BLOCKED-PENDING-TASK-193 guards at daemon/src/main.rs:1296 and daemon-libp2p/src/main.rs:213
 can be lifted once the store supplier is wired. TASK-193 is In Progress pending its DEEP gate.
+
+DEEP gate 2026-08-13: codex GO on the store-serve MVP capability (commit 62dfc36). AC#1 (CatalogProbe over the AvailabilityIndex -> CatalogNarSupplier, store path served on demand, nothing at rest) and AC#2 (store announce verification-gated by verify_store_provisions -> TASK-56 index.hold; content from the VERIFIED blake3; fail-fast on quarantine/absent; no shipped bypass) are MET. AC#3's byte-identical integrity proof is met by the loopback two-swarm bite (mutation-proven: wrong-same-length -> Declined -> consumer IntegrityMismatch); the literal CONTAINER e2e is DEFERRED to TASK-194 (shared box + TASK-190 hang) - 191 stays In Progress until that lands (no AC-gaming). Comment overclaim ('un-bypassable by type system') corrected to scope the guarantee to the shipped path + flag the sign_libp2p_store_record footgun (codex finding).
 <!-- SECTION:NOTES:END -->
