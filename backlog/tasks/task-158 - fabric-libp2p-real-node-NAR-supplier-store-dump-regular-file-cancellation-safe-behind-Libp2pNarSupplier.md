@@ -6,7 +6,7 @@ title: >-
 status: To Do
 assignee: []
 created_date: '2026-08-12 08:38'
-updated_date: '2026-08-13 09:07'
+updated_date: '2026-08-13 09:42'
 labels:
   - libp2p
   - fabric
@@ -29,3 +29,9 @@ TASK-151's Libp2pNarSupplier has only an in-memory source (MemoryNarSupplier, te
 - [ ] #1 Libp2pNarSupplier has Process and RegularFile sources that regenerate on demand without holding the NAR at rest, preserving declared-size-before-produce
 - [ ] #2 production is cancellation-safe (process group reaped on shutdown), no unkillable worker
 <!-- AC:END -->
+
+## Implementation Notes
+
+<!-- SECTION:NOTES:BEGIN -->
+Forward-carried from TASK-56 (commit 5ed5e72): the daemon-core AvailabilityIndex now asserts sha256(--dump)==registered NarHash at first serve and quarantines a mismatch (typed NarHashMismatch; hold!=Have, not announced, not in supply_catalog). For the fabric-libp2p real-node NAR supplier: the SERVE path must likewise never hand a peer bytes that do not match the announced identity. daemon-core's supply_raw_nar_cancellable already re-checks Blake3Digest::from_raw_nar(dump)==announced blake3 and FAILS LOUD on drift - mirror that discipline (verify-before-serve, cancellation-safe) rather than trusting the catalog record. Reuse the single-dump pattern (one --dump feeds the hash check; do not dump twice; bound per-serve RSS - streaming is still a documented honest limit, CommandNarDumper buffers).
+<!-- SECTION:NOTES:END -->

@@ -6,7 +6,7 @@ title: >-
 status: To Do
 assignee: []
 created_date: '2026-08-09 21:25'
-updated_date: '2026-08-10 22:27'
+updated_date: '2026-08-13 09:42'
 labels:
   - forward-carried-from-task-61
 dependencies:
@@ -38,32 +38,5 @@ TRAP: the registration binding is NOT verified at the source (availability.rs re
 ## Implementation Notes
 
 <!-- SECTION:NOTES:BEGIN -->
-## CENSUS CORRECTION 2026-08-10 (re-derived by the orchestrator from /nix/var/nix/db/db.sqlite)
-
-Any figure in this task quoting 108,401 paths / 155,621 MiB / "mean NAR 1.44 MiB" is WRONG and must
-not be used. The original numbers came from `nix path-info --all`, which counts .drv files. Those are
-local evaluation artifacts cache.nixos.org does not serve; they are 85.6% of all paths while holding
-0.2% of the bytes, so they inflated the path count ~7x and deflated the mean NAR ~6x.
-
-AUTHORITATIVE (measured 2026-08-10, independently re-derived - not taken from a subagent report):
-  valid paths                85,808
-    .drv                     73,412 (85.6%), only 263 MiB   <- never publish these: useless AND a privacy leak
-    SERVABLE output paths    12,396, 105,713 MiB
-      signed by cache.nixos.org   6,769 paths / 53,854 MiB = 50.9% of bytes
-      locally built (ultimate)    2,250 paths / 35,870 MiB
-  size distribution (servable): mean 8.53 MiB, p50 0.10 MiB, p90 4.48 MiB, p99 151.06 MiB, p100 3186.03 MiB
-  byte concentration: top 151 paths = 73.5% of bytes, top 691 = 91.7%, top 1,243 = 95.5%
-
-THREE CONSEQUENCES that change reasoning, not just arithmetic:
-1. The publishable set (signed, hence already-public) is ~6,769 paths, not 108,401 - a ~16x reduction.
-   Every per-path cost model shrinks by that factor.
-2. HALF THE SERVABLE BYTES (49.1%) carry no upstream signature and therefore can NEVER be published
-   under the no-enumeration rule. They stay reachable only by direct hold-query, which makes TASK-91
-   (batched hold-query) load-bearing rather than an optimization.
-3. The distribution is far more extreme than "mean 1.44 MiB" implied: the MEDIAN is 100 KiB (~5 ms
-   from a 21 MB/s upstream) while 151 paths hold three quarters of all bytes. Any claim that a
-   discovery round trip amortises against a download must be checked against the MEDIAN, not the mean.
-
-Note also 1.44 MiB was a MEAN misdescribed as a median in places; the servable mean is 8.53 MiB.
-Canonical source of truth going forward: TASK-95 (reproducible store census).
+Forward-carried from TASK-56 (commit 5ed5e72): the key->store_path binding is now VERIFIED at first serve (derive re-derives sha256(--dump)==registration key; mismatch -> quarantined typed NarHashMismatch, never a false Have). When persisting the immutable NarHashKey->(StorePath,Blake3Digest,NarSize) binding: (1) persist ONLY what is VERIFIED - do not persist a binding that was never derived/checked, or you re-open the mis-registration gap across restart; consider persisting the quarantine verdict too (TASK-56 leaves it in-memory-only, re-checked on first post-restart probe). (2) The two content identities come from ONE dump of the SAME uncompressed RawNarV1 bytes: Blake3Digest::from_raw_nar (blake3) and NarHashKey::from_raw_nar (sha256, new in TASK-56). Persist both from that single pass; never recompute one from a compressed form (NarSize-vs-FileSize / unit trap). (3) NarHashKey stores 32 RAW sha256 bytes - persist canonically (sha256:<nix-base32>, JsonFileStore already does) and compare in raw-byte space.
 <!-- SECTION:NOTES:END -->
