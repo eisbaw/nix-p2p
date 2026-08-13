@@ -1,19 +1,18 @@
-# `PeerFabric` — intention-level P2P seam (proposal v2, for review)
+# `PeerFabric` — intention-level P2P seam
 
-Status: **PROPOSAL — not implemented.** v2 folds in the mped-architect
-pressure-test (verdict: REVISE) and the owner's decisions: **dynamic dispatch
-(trait objects)** and **two per-backend binaries**. Supersedes the
+Status: **IMPLEMENTED.** The seam (`peer-fabric`), both backends (`fabric-libp2p`,
+`fabric-iroh`), the stack-neutral frontend (`daemon-core`), and the primary thin
+binary (`daemon-libp2p`) exist and are gated. The realised decisions: **dynamic
+dispatch (trait objects)** and **per-backend binaries**; this supersedes the
 hand-rolled-Kademlia framing of TASK-126.
 
-> **SUPERSEDED DIRECTION (owner 2026-08-12): libp2p-PRIMARY, iroh OPTIONAL.**
-> The "dual-stack default / daemon-iroh borrows libp2p" prose below is
-> **historical** — retained for the seam mechanics, not the stack policy. Current
-> authority is `PRD.md` ("Pluggable P2P substrate" + the P2P-substrate decision
-> row): iroh is a connectivity substrate with **no content-provider routing**, so
-> **`libp2p-kad` is the mandatory discovery layer** and **iroh is an optional
-> `NarTransfer`** measured against libp2p's transport in the tournament.
-> `ProviderDirectory` is always libp2p-kad; the seam traits, `Lookup`/`Exposure`,
-> dispatch, and crate topology below remain accurate.
+> **Direction: libp2p-PRIMARY, iroh OPTIONAL.** iroh is a connectivity substrate
+> with **no content-provider routing** ("who has hash X?" — it answers only
+> "where is this node?"), so **`libp2p-kad` is the mandatory discovery layer** and
+> **iroh is an optional `NarTransfer`** measured against libp2p's transport in the
+> tournament. `ProviderDirectory` is always libp2p-kad. `PRD.md` ("Pluggable P2P
+> substrate" + the P2P-substrate decision row) is the durable authority; this note
+> records how the seam realises it.
 
 ## Why this exists
 
@@ -51,41 +50,43 @@ daemon-core      the FRONTEND: serving core, correlation, policy, budgets,
       |   |      orchestration.  Depends on peer-fabric only.  NO iroh, NO libp2p.
       |   |
       |   +-- fabric-iroh     IrohFabric   = peer-fabric + iroh + iroh-blobs
-      |   +-- fabric-libp2p   Libp2pFabric = peer-fabric + libp2p   (added only
-      |                       when TASK-103 selects libp2p; absent until then)
-   daemon-iroh   thin bins over daemon-core.  daemon-libp2p = daemon-core + ONE
-   daemon-libp2p fabric (pure libp2p, single-stack fallback).  daemon-iroh is the
-                 DEFAULT and is DUAL-STACK (fabric-iroh transfer/locator +
-                 fabric-libp2p directory), so its closure links BOTH; the binary,
-                 not a feature, IS the composition.
+      |   +-- fabric-libp2p   Libp2pFabric = peer-fabric + libp2p  (the PRIMARY backend)
+   daemon-libp2p thin bins over daemon-core.  daemon-libp2p (PRIMARY, shipped) =
+   daemon-iroh   daemon-core + fabric-libp2p — ONE fabric, pure libp2p, single
+                 stack, proven by a crate-graph guard to link no iroh.  daemon-iroh
+                 (DEFERRED) is the optional tournament binary and is DUAL-STACK
+                 (fabric-iroh transfer/locator + fabric-libp2p directory, since iroh
+                 has no directory), so its closure links BOTH.  The binary, not a
+                 feature, IS the composition.
 ```
 
-Why this satisfies "never both, never require both" **for the single-stack
-build** — and how the dual-stack default relaxes it (amended 2026-08-12, TASK-147):
-- A single-stack binary depends on exactly one `fabric-*`, so its closure
-  contains exactly one stack — this is `daemon-libp2p` (libp2p directory *and*
-  transfer, no iroh). **The default `daemon-iroh` is the deliberate exception: it
-  is dual-stack** (iroh transfer/locator + libp2p-kad directory), so its closure
-  links both. The disjoint-closure guarantee holds for the pure fallback, not for
-  the default. No feature, no `cfg`, no `compile_error!` — composition is by which
-  `fabric-*` crates the binary's `fn main()` assembles, and the default assembles
-  two.
+Why this satisfies "never both, never require both" **for the primary build** —
+and how the deferred dual-stack binary relaxes it:
+- A single-stack binary depends on exactly one `fabric-*`, so its closure contains
+  exactly one stack — this is `daemon-libp2p` (libp2p directory *and* transfer, no
+  iroh), enforced by a crate-graph guard that fails if iroh appears in its closure.
+  **The deferred `daemon-iroh` is the deliberate exception: it is dual-stack**
+  (iroh transfer/locator + libp2p-kad directory, because iroh has no
+  content-provider routing), so its closure links both. The disjoint-closure
+  guarantee holds for the primary binary, not for the dual-stack one. No feature,
+  no `cfg`, no `compile_error!` — composition is by which `fabric-*` crates the
+  binary's `fn main()` assembles.
 - `daemon-core` and `peer-fabric` carry **zero** p2p-lib deps, so the frontend
   compiles and unit-tests without either stack — which also *proves*
   stack-neutrality by construction: a `FakeFabric` is the only backend the core
   tests ever link.
-- `libp2p` is not even a workspace member until it is chosen, so today nothing in
-  the tree pulls it.
+- `daemon-libp2p` pulls libp2p; `daemon-core` and `peer-fabric` never do — so the
+  frontend's stack-neutrality is a dependency-graph fact, not a convention.
 
-Final wiring (DECIDED, owner 2026-08-11; **amended 2026-08-12, TASK-147**): **two
-thin binaries** `daemon-iroh` and `daemon-libp2p`, each a `fn main()` constructing
-its fabric and calling `daemon_core::run(fabric)` — no features, no `cfg`.
-`daemon-libp2p` = `daemon-core` + one backend crate (pure libp2p, single-stack
-fallback). `daemon-iroh` is the **default and dual-stack**: its `fn main()`
-assembles an iroh transfer/locator with a libp2p-kad directory into one `Fabric`. Rationale beyond dep-exclusion: it keeps **tests and tournament runs from
-conflating backends** — each backend is a distinct build artifact, so Stage-B
-tournament evidence (TASK-122) and every test bind to a named binary, never to an
-ambiguous feature combination.
+Final wiring: **two thin binaries** `daemon-libp2p` and `daemon-iroh`, each a
+`fn main()` constructing its fabric and calling `daemon_core::run(fabric)` — no
+features, no `cfg`. `daemon-libp2p` (the primary, shipped) = `daemon-core` + one
+backend crate (pure libp2p). `daemon-iroh` (deferred) is dual-stack: its
+`fn main()` assembles an iroh transfer/locator with a libp2p-kad directory into
+one `Fabric`. Rationale beyond dep-exclusion: it keeps **tests and tournament runs
+from conflating backends** — each backend is a distinct build artifact, so
+tournament evidence and every test bind to a named binary, never to an ambiguous
+feature combination.
 
 Independence guard unaffected: these crates are shared **among the daemon's own
 components**, never with `testproxy` (which stays an independent wire witness and
@@ -124,8 +125,8 @@ pub struct IrohFabric {                     // a plain struct, not a generic umb
 }
 
 // each backend crate constructs its own fabric; the binary IS the choice:
-// daemon-iroh   bin:  fn main() { daemon_core::run(fabric_iroh::IrohFabric::new(cfg)) }
-// daemon-libp2p bin:  fn main() { daemon_core::run(fabric_libp2p::Libp2pFabric::new(cfg)) }
+// daemon-libp2p bin (primary):  fn main() { daemon_core::run(fabric_libp2p::Libp2pFabric::new(cfg)) }
+// daemon-iroh   bin (deferred): fn main() { daemon_core::run(fabric_iroh::IrohFabric::new(cfg)) }
 ```
 
 `None` then means exactly one thing — "this profile turned this axis off." The
