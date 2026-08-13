@@ -4,18 +4,12 @@ title: 'Iroh peer-link compression: negotiated zstd with raw fallback'
 status: To Do
 assignee: []
 created_date: '2026-08-10 09:10'
-updated_date: '2026-08-13 14:56'
+updated_date: '2026-08-13 20:39'
 labels:
   - wave-2b
 dependencies:
-  - TASK-24
-  - TASK-62
-  - TASK-89
   - TASK-94
-  - TASK-103
-  - TASK-114
-  - TASK-115
-  - TASK-116
+  - TASK-157
 priority: high
 ---
 
@@ -52,4 +46,6 @@ MEASURE, DO NOT ASSUME: zstd on nar data may not reach xz's ratio. Report the ac
 Authoritative order: mandatory decentralized Iroh node and content discovery TASK-89/TASK-103/TASK-116 and authenticated HTTPS land first. This task then adds negotiated Iroh zstd; TASK-87/88 exercise raw and compressed Iroh; comparative raw Stage A is TASK-125; BitTorrent starts only at TASK-117/75. Tracker work is optional tournament comparison and is not a prerequisite. Raw fallback remains mandatory.
 
 COMPASS 2026-08-13: link compression is THE break-even lever (raw NAR vs compressed CDN) - the single feature that most determines whether the value thesis passes. It is filed IROH-ONLY and blocked behind the iroh discovery chain (89/116/103), but the shipped primary transport is libp2p (PRD Wave-2c). Re-scope: generalise compression to the transport-agnostic NarTransfer/NarServer seam (both backends) OR file a libp2p sibling, and re-audit the iroh-89/116 deps for staleness under libp2p-primary. As filed, the most thesis-critical feature is pinned to a non-shipped stack.
+
+COMPASS backlog surgery 2026-08-13 (F2): RE-SCOPED from 'Iroh peer-link compression' to TRANSPORT-AGNOSTIC negotiated zstd-with-raw-fallback on the peer-fabric NarTransfer/NarServer seam (both backends), because link compression is THE break-even lever (a peer serves the RAW NAR vs the CDN's compressed file) and the shipped primary transport is libp2p (PRD Wave-2c), NOT iroh. Was blocked behind the iroh discovery chain (deps included TASK-89 iroh no-address + TASK-116 iroh BatchHoldQuery + 103/114/115/24/62) — that pinned the most thesis-critical feature to a non-shipped stack. Deps reset to the MEANINGFUL on-ramp: TASK-94 (measure the RAW break-even baseline FIRST — the honest disproof) then compression, over TASK-157 (the shipped libp2p streaming transport it rides on, now Done). The compressed bytes are an UNSIGNED TRANSPORT field; the addressed unit stays the raw NAR (frozen). Wire the negotiation at the seam so both libp2p and iroh transports get it. A future impl may re-add a specific dep if genuinely needed; the iroh-discovery blockers were the stale part.
 <!-- SECTION:NOTES:END -->

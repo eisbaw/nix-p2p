@@ -4,7 +4,7 @@ title: REVIEW decentralized global Iroh discovery before LAN
 status: To Do
 assignee: []
 created_date: '2026-08-11 05:43'
-updated_date: '2026-08-11 19:52'
+updated_date: '2026-08-13 20:39'
 labels:
   - iroh
   - discovery
@@ -16,7 +16,7 @@ labels:
   - wave-2c
 dependencies:
   - TASK-132
-priority: high
+priority: medium
 ---
 
 ## Description
@@ -34,3 +34,9 @@ Independently review the exact TASK-89 TASK-103 and TASK-132 implementation and 
 - [ ] #5 Any feature fix is a separately implemented reviewed dependency and forces affected TASK-132 scenarios and mutations to rerun on the fixed tree.
 - [ ] #6 Emit global-iroh-review-v1 pass bound to final tree TASK-132 evidence reviewer verdicts and mutation results. Missing dirty mismatched tracker-substituted or no-go inputs fail closed.
 <!-- AC:END -->
+
+## Implementation Notes
+
+<!-- SECTION:NOTES:BEGIN -->
+COMPASS backlog surgery 2026-08-13 (F3): DEFERRED-STACK. Per PRD Wave-2c the PRODUCTION stack is libp2p-PRIMARY (iroh OPTIONAL). The production-qualifying DECENTRALIZED-DISCOVERY gate is therefore the LIBP2P one — already proven by the landed routed-separate-netns e2e (TASK-179) + the multi-daemon container journey (TASK-161), both Done. This task certifies the OPTIONAL iroh global-discovery path (the tournament arm), so it must NOT consume primary-cornerstone budget: lowered to Medium and marked deferred-stack. Revisit only when the iroh transport tournament is actually run (needs the budget-freeze + evidence forge-resistance TASK-187).
+<!-- SECTION:NOTES:END -->
