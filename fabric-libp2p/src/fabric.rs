@@ -41,8 +41,14 @@ pub struct Libp2pFabric {
 impl Libp2pFabric {
     /// Start a libp2p node for `config` with discovery + the fetch transport, but NOT
     /// serving (no supplier). A pure CONSUMER fabric: `server()` is `None`. The
-    /// anti-rollback floor is IN-MEMORY (session-scoped); use [`start_durable`] to persist
-    /// it across restart.
+    /// anti-rollback floor is IN-MEMORY (session-scoped); [`start_durable`] persists it
+    /// across restart.
+    ///
+    /// PRODUCTION PATH TODAY: `daemon-libp2p` builds its fabric through THIS
+    /// (non-durable) constructor, so the shipped daemon's floor + announce sequence do
+    /// NOT survive a restart. Wiring the daemon onto [`start_durable`] (and minting
+    /// durable POSITIVE sequences rather than the current `sequence: 1`) is TASK-185; the
+    /// durable path below is built and unit-tested but not yet used in the binary.
     ///
     /// [`start_durable`]: Self::start_durable
     pub fn start(config: NodeConfig) -> Result<Libp2pFabric, NodeError> {
@@ -53,6 +59,14 @@ impl Libp2pFabric {
     /// DURABLY persisted under `state_dir` (TASK-176 #1), so a restarted node still
     /// rejects a rolled-back record and mints a network-effective withdrawal. Each node
     /// needs its OWN `state_dir` (the files are keyed by directory, not identity).
+    ///
+    /// BUILT AND UNIT-TESTED, NOT WIRED: no production binary calls this yet - the
+    /// `daemon-libp2p` composition root uses the non-durable [`start`]. Wiring it (and the
+    /// durable positive-sequence source that makes a restarted PROVIDER's re-announce win)
+    /// is TASK-185. So restart-durability is proven by tests, not yet delivered by the
+    /// shipped daemon.
+    ///
+    /// [`start`]: Self::start
     pub fn start_durable(
         config: NodeConfig,
         state_dir: PathBuf,

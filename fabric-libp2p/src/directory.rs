@@ -21,34 +21,29 @@ use crate::swarm::{QueryFail, SwarmHandle, absence_from_reach};
 pub struct Libp2pProviderDirectory {
     handle: SwarmHandle,
     ledger: Arc<ExposureLedger>,
-    /// The IN-PROCESS per-`(ContentKey, provider)` monotonic floor (TASK-152, AC#3), wired
-    /// from the frozen `peer_fabric::record_store` oracle. EVERY fetched, decoded,
-    /// provider-bound assertion is `apply`-ed here before it can be returned, so a
-    /// replayed-old / rolled-back / stale / withdrawn record that passes the codec but
-    /// LOSES to the floor is never surfaced as a live provider. Kept ACROSS queries within
-    /// this process - the floor only moves forward - so a value the DHT rolled back between
-    /// two lookups is caught by the sequence this node ALREADY SAW.
+    /// The per-`(ContentKey, provider)` monotonic floor (TASK-152, AC#3), wired from the
+    /// frozen `peer_fabric::record_store` oracle. EVERY fetched, decoded, provider-bound
+    /// assertion is `apply`-ed here before it can be returned, so a replayed-old /
+    /// rolled-back / stale / withdrawn record that passes the codec but LOSES to a floor
+    /// this node HOLDS is never surfaced as a live provider - catching a value the DHT
+    /// rolled back between two lookups by the sequence this node already saw.
     ///
-    /// HONEST LIMITS (do not over-read this as global or persistent anti-rollback):
-    ///   * NOT PERSISTED. This map lives only for the process lifetime; a restart starts
-    ///     empty. A restarted consumer that has not yet re-observed the newer sequence can
-    ///     be served a still-unexpired stale/rolled-back record as fresh. Cross-restart
-    ///     durability is the backend obligation the frozen `record_store` module names
-    ///     (persist the counter) and is deferred (TASK-176).
+    /// HONEST LIMITS (do not over-read this as global, permanent, or production-durable
+    /// anti-rollback):
+    ///   * THE FLOOR DOES NOT ONLY MOVE FORWARD. It is BOUNDED (TASK-176 #3): [`FloorStore`]
+    ///     caps the retained slots and EVICTS by TTL/LRU. An evicted slot's floor is
+    ///     FORGOTTEN, so a later replay below it is admitted again (a rollback if the
+    ///     evicted floor was Active, a resurrection if it was a live tombstone) - a bounded
+    ///     session-fresh residue, the price of the hard memory bound. A fail-closed bound
+    ///     that never drops a live floor is TASK-185.
     ///   * SESSION-SCOPED, not global. The guarantee is "no rollback BELOW a sequence THIS
-    ///     node observed", not "no rollback the network ever saw": a fresh consumer that
+    ///     node still holds", not "no rollback the network ever saw": a fresh consumer that
     ///     never saw the newer record cannot detect a rollback to an older-but-valid one.
-    ///   * SESSION-SCOPED per PROCESS unless a durable floor is configured. The floor is
-    ///     kept across queries within this process; cross-restart durability is provided
-    ///     by [`FloorStore`]'s optional on-disk persistence (TASK-176 #1) when a state
-    ///     directory is configured, and is otherwise session-scoped (a fresh consumer
-    ///     that never saw the newer record cannot detect a rollback to an older-but-valid
-    ///     one).
-    ///
-    /// The set is now BOUNDED (TASK-176 #3): [`FloorStore`] caps the retained
-    /// `(key, provider)` slots and evicts by TTL/LRU, so resolving attacker-chosen keys
-    /// can no longer grow it without bound. The frozen module leaves GC to the backend;
-    /// [`FloorStore`] is that backend GC.
+    ///   * CROSS-RESTART DURABILITY IS OPTIONAL AND NOT PRODUCTION-WIRED. [`FloorStore`] can
+    ///     persist the floor on disk ([`FloorStore::durable`], TASK-176 #1), and that path
+    ///     is unit-tested - but the `daemon-libp2p` production binary builds the fabric via
+    ///     the NON-durable [`crate::Libp2pFabric::start`], so the shipped consumer's floor
+    ///     starts EMPTY on restart. Wiring the daemon onto the durable path is TASK-185.
     ///
     /// A std Mutex is fine: it is only ever held for the SYNCHRONOUS apply loop, never
     /// across an `.await` (all `get_record` fetches complete first).

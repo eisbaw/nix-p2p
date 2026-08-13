@@ -14,22 +14,27 @@
 //! tombstone, the frozen record_store applies it as Withdrawn, and the provider stops
 //! being returned.
 //!
-//! ## Retraction guarantees (TASK-176 closed the TASK-152 limits)
+//! ## Retraction: what TASK-176 built, and what it does NOT yet guarantee
 //!
-//! The retraction is EFFECTIVE. Two properties, each once an honest limit, now hold:
-//!   * DURABLE SEQUENCE (TASK-176 #1). A withdrawal is network-effective only if it lands
-//!     at a sequence STRICTLY NEWER than the record every consumer already observed. The
-//!     per-key sequence floor is now persisted (the `durable` constructor), so a restarted
-//!     provider re-seeds it and mints `last.sequence + 1` rather than losing at sequence 1.
-//!     An in-memory (non-durable) announcer still loses its counter on restart - the
-//!     documented cost of running without a state dir.
-//!   * TOMBSTONE OUTLIVES THE RECORD (TASK-176 #2). Record TTL is now CAPPED at announce
-//!     ([`MAX_RECORD_TTL_SECS`]), and the tombstone floor ([`MIN_TOMBSTONE_TTL_SECS`]) is
-//!     `>=` that cap (compile-time-pinned). So a withdrawal at `now` mints a tombstone with
-//!     `expiry >= now + cap >= any record's expiry` - even POST-RESTART, when the retracted
-//!     record's own expiry is unknown. The resurrection window is closed, not merely
-//!     narrowed. `withdraw` still returns `Ok` meaning "the tombstone was published"; DHT
-//!     propagation delay (not a resurrection window) remains the only gap.
+//! Two MECHANISMS were added; read their scope precisely (the TASK-152 limits are
+//! narrowed on the SENDER side, not closed end-to-end on the network):
+//!   * DURABLE SEQUENCE (TASK-176 #1) - BUILT, NOT PRODUCTION-WIRED. The per-key sequence
+//!     floor CAN be persisted (the `durable` constructor) so a restarted provider re-seeds
+//!     it and mints `last.sequence + 1` rather than losing at sequence 1. But the shipped
+//!     `daemon-libp2p` builds its announcer through the NON-durable path AND mints positive
+//!     records at `sequence: 1`, so in the delivered binary a restarted provider's
+//!     withdrawal still loses. Production-wiring + a durable positive-sequence source is
+//!     TASK-185; here it is proven by unit test, not by the daemon.
+//!   * TTL CAP + TOMBSTONE ARITHMETIC (TASK-176 #2) - a SENDER POLICY + a LOCAL pin, NOT a
+//!     network invariant. `announce` REJECTS a record whose own TTL exceeds
+//!     [`MAX_RECORD_TTL_SECS`], and a compile-time assert pins
+//!     `MIN_TOMBSTONE_TTL_SECS >= MAX_RECORD_TTL_SECS`, so a tombstone THIS announcer mints
+//!     outlives any record THIS announcer published. That is the whole guarantee. It is NOT
+//!     an end-to-end no-resurrection invariant: CONSUMERS do not enforce the cap, so a
+//!     non-conforming (or malicious) provider can `put_record` a value with a `>cap` expiry
+//!     that this node's fixed tombstone floor does NOT outlive. Consumer-side cap
+//!     enforcement is TASK-185. `withdraw` returns `Ok` meaning "the tombstone was
+//!     published", never "every cache is provably retracted".
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -48,34 +53,33 @@ use peer_fabric::{
 use crate::keys::{provider_index_key, provider_value_key};
 use crate::swarm::SwarmHandle;
 
-/// The maximum record TTL (`expiry - now`) an announce will publish, in seconds
-/// (TASK-176 #2). Record expiry is provider-chosen; left unbounded, a record with a
-/// very long TTL creates a RESURRECTION WINDOW a fixed-TTL tombstone cannot cover (and
-/// keeps a floor pinned in the consumer store far longer than steady state needs). 24h
-/// is a generous refresh cadence for a stable provider - well above kad's own record
-/// republish interval - while making the tombstone floor below able to guarantee it
-/// outlives any record. `announce` REJECTS (fail fast on the sender) a record whose TTL
-/// exceeds this: the record is SIGNED above the seam, so the backend cannot clamp its
-/// expiry without invalidating the signature - the honest move is to refuse it and let
-/// the caller sign a shorter-lived record.
+/// The maximum record TTL (`expiry - now`) THIS announce will publish, in seconds
+/// (TASK-176 #2). This is a SENDER-SIDE policy only: `announce` REJECTS (fail fast) a
+/// record whose TTL exceeds it, because the record is SIGNED above the seam and the
+/// backend cannot clamp its expiry without invalidating the signature. 24h is a generous
+/// refresh cadence for a stable provider (well above kad's own republish interval). It
+/// makes the tombstone floor below outlive any record THIS announcer published - it does
+/// NOT bind other providers: a CONSUMER does not enforce this cap, so a non-conforming
+/// provider can still `put_record` a `>cap` expiry (consumer-side enforcement is TASK-185).
 pub const MAX_RECORD_TTL_SECS: u64 = 86_400;
 
 /// The FLOOR lifetime, in seconds, a minted withdrawal tombstone is given when the
-/// retracted record's own remaining TTL is shorter or unknown. A tombstone MUST outlive
+/// retracted record's own remaining TTL is shorter or unknown. A tombstone should outlive
 /// the record it retracts, else a cache resurrects the record after the tombstone lapses
-/// but before the record's own expiry. Set to [`MAX_RECORD_TTL_SECS`] so the bound is
-/// UNCONDITIONAL: a record announced at `t0` has `expiry <= t0 + MAX_RECORD_TTL_SECS`,
-/// and a withdrawal at `now >= t0` mints a tombstone with `expiry >= now +
-/// MAX_RECORD_TTL_SECS >= t0 + MAX_RECORD_TTL_SECS >= record.expiry` - even POST-RESTART,
-/// when the retracted record's own expiry is unknown. This closes the resurrection window
-/// TASK-152 documented as an honest limit; it works ONLY because record TTL is now capped.
+/// but before the record's own expiry. Set to [`MAX_RECORD_TTL_SECS`] so that FOR RECORDS
+/// THIS ANNOUNCER PUBLISHED the bound holds: such a record announced at `t0` has
+/// `expiry <= t0 + MAX_RECORD_TTL_SECS` (the announce cap), and a withdrawal at `now >= t0`
+/// mints a tombstone with `expiry >= now + MAX_RECORD_TTL_SECS >= record.expiry` - even
+/// POST-RESTART. This narrows the TASK-152 resurrection window ON THE SENDER SIDE. It does
+/// NOT close it network-wide: a record put by a provider that did NOT honor the cap has an
+/// expiry this fixed floor need not outlive (TASK-185).
 const MIN_TOMBSTONE_TTL_SECS: u64 = MAX_RECORD_TTL_SECS;
 
-/// COMPILE-TIME pin of the tombstone-outlives-the-record invariant (TASK-176 #2): the
-/// tombstone floor must be `>=` the record-TTL cap, or a max-TTL record announced just
-/// before a post-restart withdrawal would outlive its own tombstone and resurrect. This
-/// fails the build the moment someone lowers the tombstone floor below the record cap, so
-/// the invariant is greppable and enforced, not merely documented.
+/// COMPILE-TIME pin of the LOCAL tombstone-arithmetic invariant (TASK-176 #2): the
+/// tombstone floor must be `>=` the record-TTL cap, or a max-TTL record THIS announcer
+/// published just before a post-restart withdrawal would outlive its own tombstone. This
+/// pins the SENDER-SIDE arithmetic (not a network guarantee - consumers do not enforce the
+/// cap; TASK-185); it fails the build the moment someone lowers the floor below the cap.
 const _: () = assert!(
     MIN_TOMBSTONE_TTL_SECS >= MAX_RECORD_TTL_SECS,
     "the withdrawal tombstone floor must outlive the longest record TTL, or a \
@@ -284,8 +288,9 @@ impl AvailabilityAnnouncer for Libp2pAvailabilityAnnouncer {
         // Bound the record TTL (TASK-176 #2): an over-cap expiry is REJECTED, not clamped
         // - the record is signed above the seam, so clamping would invalidate the
         // signature. Fail fast on the sender with the cap, so the caller re-signs a
-        // shorter-lived record. This is what makes the tombstone floor (>= the cap) able
-        // to guarantee "tombstone outlives the record" even post-restart.
+        // shorter-lived record. This SENDER-SIDE bound is what lets the tombstone floor
+        // (>= the cap) outlive any record THIS node published; it does NOT bind other
+        // providers (consumers do not enforce the cap - TASK-185).
         if record.expiry - now > MAX_RECORD_TTL_SECS {
             return Err(AnnounceError::Rejected(format!(
                 "record TTL {}s exceeds the {}s cap (expiry {} at now {}); \

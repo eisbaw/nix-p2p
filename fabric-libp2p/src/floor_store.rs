@@ -13,14 +13,19 @@
 //! ## The bound, and what it costs
 //!
 //! `slot_count()` is capped at [`DEFAULT_STORE_CAP`]. A NEW slot that would exceed the
-//! cap first triggers a TTL sweep (expired slots guard nothing - the frozen decode
-//! rejects any at-or-below-sequence replay of an expired record as `Stale`), then, if
-//! still over, evicts the LEAST-recently-touched live slot. Evicting a live floor
-//! DEGRADES that one `(key, provider)` to session-fresh - the SAME anti-rollback residue
-//! a restart has (a rollback below it is not caught until the newer sequence is
-//! re-observed). That residue is the price of a hard memory bound against an attacker who
-//! controls keys, providers, sequences AND TTLs; a pure TTL sweep cannot bound memory
-//! within the TTL window, so the hard cap + LRU is load-bearing, not decorative.
+//! cap first triggers a TTL sweep, then, if still over, evicts the LEAST-recently-touched
+//! live slot. Evicting ANY live floor DEGRADES that one `(key, provider)` to session-fresh:
+//! a subsequent replay below the forgotten floor is admitted again, a ROLLBACK if the
+//! evicted floor was Active and a RESURRECTION of the withdrawn provider if it was a live
+//! TOMBSTONE. The TTL sweep is NOT a clean "guards nothing" reclaim either: because
+//! sequence and expiry are independent signed fields, an expired active/tombstone slot
+//! dropped by the sweep can be rolled back / resurrected by a replay of an older record
+//! carrying a longer still-valid expiry (see `ProviderRecordSet::evict_expired`). This
+//! residue is BOUNDED (the same window a restart has) and is the price of a hard memory
+//! bound against an attacker who controls keys, providers, sequences AND TTLs; a pure TTL
+//! sweep cannot bound memory within the TTL window, so the hard cap + LRU is load-bearing.
+//! A FAIL-CLOSED bound that never drops a live floor/tombstone (a guard window) is TASK-185;
+//! this store makes the DoS/memory guarantee (#3), not a fail-closed anti-rollback one.
 
 use std::collections::VecDeque;
 use std::path::PathBuf;

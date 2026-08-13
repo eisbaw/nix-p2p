@@ -104,10 +104,21 @@ impl Slot {
     }
 
     /// When this slot stops being valid (a live record's own expiry, or the
-    /// tombstone's own expiry). The moment `now >= expiry`, the slot no longer
-    /// serves anything AND any assertion at-or-below its sequence is itself expired
-    /// (decode rejects it as `Stale`), so a GC that drops an expired slot cannot
-    /// reopen a rollback the slot was still guarding.
+    /// tombstone's own expiry). The moment `now >= expiry` the slot no longer serves
+    /// anything.
+    ///
+    /// EVICTION SAFETY IS CONDITIONAL. `sequence` and `expiry` are INDEPENDENT signed
+    /// fields (nothing forces a higher sequence to carry a later expiry), so dropping an
+    /// expired slot is only rollback-safe UNDER MONOTONIC EXPIRY. In general it is not:
+    ///   * an expired ACTIVE floor at `(seqN, expiry<=now)` can be replaced by a replay of
+    ///     an OLDER `(seqM<N, expiry>now)` record (a lower sequence with a longer, still
+    ///     valid expiry) -> `Applied` -> a ROLLBACK the dropped floor was guarding;
+    ///   * an expired TOMBSTONE floor dropped the same way lets a replayed older record
+    ///     RESURRECT the withdrawn provider.
+    ///
+    /// Both are a BOUNDED session-fresh residue (the same window a restart has), not a
+    /// clean guarantee. A fail-closed floor bound (retain the sequence past `expiry` for a
+    /// guard window) is TASK-185; this method is just the liveness cutoff.
     fn expiry(&self) -> u64 {
         match self {
             Slot::Active(r) => r.expiry,
@@ -264,11 +275,16 @@ impl ProviderRecordSet {
             .is_some_and(|providers| providers.contains_key(provider))
     }
 
-    /// Drop every slot whose own expiry has passed (`expiry <= now`), returning how
-    /// many were removed. SAFE against rollback: an expired slot's sequence can only be
-    /// re-offered by an assertion that is ITSELF expired (decode rejects it as `Stale`),
-    /// so forgetting the floor cannot reopen a rollback it was still guarding. Empty key
-    /// maps are pruned so `slot_count` reflects only live state.
+    /// Drop every slot whose own expiry has passed (`expiry <= now`), returning how many
+    /// were removed. Empty key maps are pruned so `slot_count` reflects only live state.
+    ///
+    /// NOT unconditionally rollback-safe (see [`Slot::expiry`]): because `sequence` and
+    /// `expiry` are independent signed fields, dropping an expired ACTIVE floor can let a
+    /// replayed lower-sequence-but-longer-expiry record roll it back, and dropping an
+    /// expired TOMBSTONE can let a replayed record resurrect the withdrawn provider. The
+    /// residue is BOUNDED (session-fresh, like a restart) and closing it fail-closed is
+    /// TASK-185. GC is still the backend's job (the frozen rules leave it here); this just
+    /// reclaims lapsed slots.
     pub fn evict_expired(&mut self, now: u64) -> usize {
         let mut removed = 0;
         self.by_key.retain(|_key, providers| {
@@ -282,10 +298,12 @@ impl ProviderRecordSet {
 
     /// Forcibly forget one `(key, provider)` slot, returning whether it existed. This is
     /// the backend's eviction primitive (e.g. LRU when a hard entry cap is hit).
-    /// Forgetting a still-live floor DEGRADES that slot to session-fresh (a subsequent
-    /// rollback below it would no longer be caught until the newer sequence is
-    /// re-observed) - the SAME anti-rollback residue a restart has - so a backend evicts
-    /// expired slots first and live floors only under memory pressure.
+    /// Forgetting a still-live floor DEGRADES that slot: a subsequent replay below it is no
+    /// longer caught until the newer sequence is re-observed - a ROLLBACK if the evicted
+    /// floor was Active, a RESURRECTION if it was a live TOMBSTONE (the withdrawn provider
+    /// can come back). This is the SAME bounded anti-rollback residue a restart has, so a
+    /// backend evicts expired slots first and live floors only under memory pressure. A
+    /// fail-closed bound that never drops a live tombstone/floor is TASK-185.
     pub fn remove_slot(&mut self, key: &ContentKey, provider: &NodeId) -> bool {
         let Some(providers) = self.by_key.get_mut(key) else {
             return false;
