@@ -144,14 +144,18 @@ first-class part of the project, and the real-network and swarm results are not 
   public-node discovery / no-address connection, and the iroh-versus-libp2p transport
   tournament that decides whether iroh's NAT traversal earns its place, are in progress.
 - **Restart-durable state in the shipped daemon — now wired, gated on a state dir.**
-  With `--libp2p-state-dir <dir>` the shipped daemon runs in durable mode: it reloads its
-  anti-rollback floor on restart, allocates provider-record sequences durably (a restarted
-  provider mints a strictly-newer sequence instead of re-minting `1` and self-rolling-back),
-  and persists the sequence fail-closed *before* publishing (save-before-publish, parent-dir
-  fsynced). Without the flag a node stays session-scoped (re-earns its floor) by choice.
+  With `--libp2p-state-dir <dir>` the shipped daemon runs in durable mode: the directory is
+  the single anchor for both the node's **identity** (a state-dir-only restart comes back as
+  the *same* NodeId, so it can still supersede and withdraw its own records) and its
+  **sequence floor** — it reloads the anti-rollback floor on restart and allocates
+  provider-record sequences durably (a restarted provider mints a strictly-newer sequence
+  instead of re-minting `1` and self-rolling-back), persisting the sequence fail-closed
+  *before* publishing (save-before-publish, parent-dir fsynced). Without the flag a node is
+  session-scoped by choice (fresh identity, re-earned floor) and providers say so loudly.
   What remains is *hardening* the durable floor (fail-closed eviction bound, consumer-side
-  TTL-cap enforcement, durable-reload sweep/cap, a shared-state-dir advisory lock, and
-  per-line persistence integrity) — tracked as the record-lifecycle hardening follow-up.
+  TTL-cap enforcement, durable-reload sweep/cap, fail-closed consumer durability, a
+  shared-state-dir advisory lock, save-before-publish for withdrawals, and per-line
+  persistence integrity) — tracked as the record-lifecycle hardening follow-up.
 - **Deeper swarm dynamics:** true streaming transfer with mid-stream size abort,
   hedged/prefetch fetches, and eclipse/sybil bounds beyond the current
   replay/rollback/DoS guards.
