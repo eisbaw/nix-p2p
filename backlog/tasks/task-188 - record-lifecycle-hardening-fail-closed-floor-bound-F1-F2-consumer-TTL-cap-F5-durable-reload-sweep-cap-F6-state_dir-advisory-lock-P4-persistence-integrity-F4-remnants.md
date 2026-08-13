@@ -7,7 +7,7 @@ title: >-
 status: To Do
 assignee: []
 created_date: '2026-08-13 06:13'
-updated_date: '2026-08-13 07:31'
+updated_date: '2026-08-13 08:10'
 labels:
   - fabric-libp2p
   - daemon-libp2p
@@ -57,4 +57,6 @@ F6 (consumer durable mode is fail-OPEN): FloorStore::durable turns a load failur
 PLAUSIBLE-a (parent-of-state-dir fsync): first-ever creation of the state dir fsyncs the file and the immediate parent (the state dir) but NOT the state dir's PARENT, so a power loss right after the first announce can lose the state dir's directory entry. Fsync up one more level on first creation.
 
 PLAUSIBLE-b (sequence overflow): next_sequence does last.sequence + 1 and withdrawal minting does last+1 with no overflow guard; a corrupted seq file carrying u64::MAX wraps to 0 in release (a silent rollback) or panics in debug. Handle fail-closed (reject a u64::MAX-or-corrupt floor line on load, or saturate + refuse to publish).
+
+TASK-185 re-gate #2 addendum: the state-dir CONSISTENCY invariant (partial-sidecar-set = corruption) is now PARTLY closed in TASK-185 - the cleanly-detectable direction (floor/seq file present while identity ABSENT -> fail-closed rekey guard) is done. The SYMMETRIC direction (identity present, floor lost -> silent self-rollback) is NOT cleanly detectable under the current lazily-created separate sidecars and is deliberately NOT special-cased; it is root-caused in the NEW TASK-189 (single atomic durable-state file with an init marker), which SUBSUMES this F6 item (consumer/provider durable-mode fail-open) plus the concurrent-save race, parent-of-state-dir fsync, and sequence-overflow. Treat F6 here as covered-by-TASK-189 to avoid overlap; leave the non-durable-default consumer-warning (F5) and the F1/F2/F5 record-lifecycle items in this task.
 <!-- SECTION:NOTES:END -->
