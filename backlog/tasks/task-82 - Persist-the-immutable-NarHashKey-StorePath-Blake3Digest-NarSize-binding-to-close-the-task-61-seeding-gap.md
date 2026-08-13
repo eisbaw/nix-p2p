@@ -3,11 +3,11 @@ id: TASK-82
 title: >-
   Persist the immutable NarHashKey -> (StorePath, Blake3Digest, NarSize) binding
   to close the task-61 seeding gap
-status: In Progress
+status: Done
 assignee:
   - '@me'
 created_date: '2026-08-09 21:25'
-updated_date: '2026-08-13 11:07'
+updated_date: '2026-08-13 11:09'
 labels:
   - forward-carried-from-task-61
 dependencies:
@@ -31,9 +31,9 @@ TRAP: the registration binding is NOT verified at the source (availability.rs re
 
 ## Acceptance Criteria
 <!-- AC:BEGIN -->
-- [ ] #1 The NarHashKey -> (StorePath, Blake3Digest, NarSize) binding survives a restart, so a node can serve a previously-announced digest immediately after boot with no hold-query first
-- [ ] #2 The immutability argument (Nix store paths are content-immutable, so the digest cannot go stale) is written at the site, and a bite proves a CHANGED path invalidates rather than serving stale bytes
-- [ ] #3 The on-disk cost is measured, not asserted: bytes per path, and the total for a 108k-path store
+- [x] #1 The NarHashKey -> (StorePath, Blake3Digest, NarSize) binding survives a restart, so a node can serve a previously-announced digest immediately after boot with no hold-query first
+- [x] #2 The immutability argument (Nix store paths are content-immutable, so the digest cannot go stale) is written at the site, and a bite proves a CHANGED path invalidates rather than serving stale bytes
+- [x] #3 The on-disk cost is measured, not asserted: bytes per path, and the total for a 108k-path store
 <!-- AC:END -->
 
 ## Implementation Plan
@@ -90,3 +90,9 @@ DEEP-GATE FOLLOW-UP (GO-with-fixes) — addressed, READY FOR LIGHT RE-GATE:
 
 RE-GATE (bounded): fmt --check OK; build -p daemon-core OK; clippy -p daemon-core --all-targets -Dwarnings CLEAN; check-independence green; test -p daemon-core 139 passed / 0 failed (126 unit + narhash_verify 5 + persisted_digest 6 + run_gate 2). Disk ~122G free.
 <!-- SECTION:NOTES:END -->
+
+## Final Summary
+
+<!-- SECTION:FINAL_SUMMARY:BEGIN -->
+Persisted the VERIFIED NarHashKey->(StorePath,Blake3Digest,NarSize) binding and warm-load it at boot, closing the TASK-61 restart seeding gap: a restarted node reverse-maps a previously-announced digest and serves with no hold-query/re-dump. Persist-only-VERIFIED (never a quarantined mismatch). Immutability argument written at the site (/nix/store content-immutable => BLAKE3(dump) time-invariant); a changed raw-file-backed path fails loud at the serve-time BLAKE3 recheck (bite, mutation-proven). On-disk cost MEASURED against the real census (89,475 valid paths from db.sqlite): ~155 B/path pretty-JSON = ~13 MiB = 0.012% of content. DEEP-gated: codex NO-GO on warm-load trust (a tampered local snapshot could put a mismatched NAR on the wire) -> mped-architect ARBITRATION ruled GO-with-fixes: codex's 'no wrong bytes on the wire' boundary is stricter than the project's guarantee (README:8-9 'hostile peer costs a retry, never a bad store path'; PRD:157 daemon-trusted-for-integrity IS the design bug to avoid). Warm-load trusts the node's OWN prior verified verdict on its OWN local disk; byte-integrity stays anchored on serve-time BLAKE3 recheck + consumer Nix gate; worst case = wasted dial, never a bad store path. Must-fix applied: JsonFileStore::save now genuinely fsyncs (temp before rename + parent dir after), matching its own durability claim. Defense-in-depth (per-binding integrity/tamper-detection, downgrade guard, fold snapshot into atomic state file) filed to TASK-189. Precedent close-out in-code: task-82 makes only AVAILABILITY depend on local state, never byte-integrity. Frozen wire untouched; sha2 already daemon-side (independence green).
+<!-- SECTION:FINAL_SUMMARY:END -->
