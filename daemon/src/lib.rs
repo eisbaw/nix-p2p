@@ -93,8 +93,9 @@ pub use iroh_runtime::{
 // the primary thin binary); re-exported here so `daemon::Libp2pSourceConfig`,
 // `daemon::build_libp2p_nar_source`, etc. and the integration tests are unchanged.
 pub use daemon_libp2p::{
-    Libp2pNarSource, Libp2pRawServe, Libp2pSourceConfig, build_libp2p_nar_source,
-    build_libp2p_provider_source, provider_content_key, sign_libp2p_provider_record,
+    IDENTITY_SEED_FILENAME, Libp2pNarSource, Libp2pRawServe, Libp2pSourceConfig,
+    announce_provider_seeds, build_libp2p_nar_source, build_libp2p_provider_source,
+    provider_content_key, resolve_durable_identity_seed, sign_libp2p_provider_record,
 };
 pub use transport_iroh::{
     BODY_IDLE_TIMEOUT, DEFAULT_MAX_INFLIGHT_NAR_BYTES, DEFAULT_MAX_SERVE_DURATION,

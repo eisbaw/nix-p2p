@@ -29,7 +29,7 @@
 //! A discovery miss / exhausted offer set folds to a fast fallback to HTTP upstream (S2); a
 //! deliberate size abort propagates (every offer addresses the same oversized content).
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -37,8 +37,9 @@ use fabric_libp2p::{Libp2pFabric, Libp2pNarSupplier, Multiaddr, NodeConfig, Peer
 
 use ed25519_dalek::SigningKey;
 use peer_fabric::{
-    Axis, Blake3Digest, ContentKey, DiscoveryBudget, NodeId, PeerFabric, ProviderRecord,
-    SafetyEnvelope, TransportOffer, TransportTag, require_axes, sign_provider_record,
+    AnnounceBudget, Axis, Blake3Digest, ContentKey, DiscoveryBudget, NodeId, PeerFabric,
+    ProviderRecord, SafetyEnvelope, TransportOffer, TransportTag, require_axes,
+    sign_provider_record,
 };
 
 use daemon_core::claim::NarHashKey;
@@ -249,6 +250,183 @@ pub fn provider_content_key(nar_hash: &NarHashKey) -> ContentKey {
     ContentKey::derive_from_signed_nar_hash(nar_hash.as_bytes())
 }
 
+/// The file under a `state_dir` that durably anchors this node's libp2p IDENTITY seed
+/// (TASK-185 GB1), the companion to the `announce-seq-v1.txt` / `provider-floor-v1.txt` the
+/// fabric writes there. A STABLE identity is what makes the durable sequence floor matter at
+/// all: the anti-rollback floor and the record's `provider` are keyed by `NodeId(seed)`, so a
+/// fresh random seed on every restart would announce in a DIFFERENT namespace and permanently
+/// orphan every pre-restart record (it could neither supersede nor withdraw them). Persisting
+/// the seed next to the sequence floor makes a plain identical-argv restart with only
+/// `--libp2p-state-dir` come back as the SAME node.
+pub const IDENTITY_SEED_FILENAME: &str = "identity-seed-v1";
+
+/// Generate a fresh 32-byte libp2p identity seed from `/dev/urandom`.
+fn random_identity_seed() -> Result<[u8; 32], String> {
+    use std::io::Read;
+    let mut seed = [0u8; 32];
+    std::fs::File::open("/dev/urandom")
+        .and_then(|mut f| f.read_exact(&mut seed))
+        .map_err(|e| format!("generating libp2p identity seed from /dev/urandom: {e}"))?;
+    Ok(seed)
+}
+
+/// Parse 64 lowercase-hex chars into a 32-byte seed (the `--libp2p-identity-seed` wire form).
+fn parse_seed_hex(hex: &str) -> Result<[u8; 32], String> {
+    if hex.len() != 64 {
+        return Err(format!(
+            "expected 64 hex chars (32 bytes), got {}",
+            hex.len()
+        ));
+    }
+    let mut seed = [0u8; 32];
+    for (i, byte) in seed.iter_mut().enumerate() {
+        *byte = u8::from_str_radix(&hex[2 * i..2 * i + 2], 16)
+            .map_err(|e| format!("bad hex at byte {i}: {e}"))?;
+    }
+    Ok(seed)
+}
+
+/// Load the seed persisted at `path`, or `None` if the file does not exist. A file that
+/// exists but is MALFORMED is a hard error, NOT a silent regenerate: regenerating a different
+/// random identity here would orphan this state dir's anti-rollback floor (the exact GB1
+/// hazard), so we refuse and make the operator fix or remove the file.
+fn load_identity_seed(path: &Path) -> Result<Option<[u8; 32]>, String> {
+    match std::fs::read_to_string(path) {
+        Ok(text) => parse_seed_hex(text.trim()).map(Some).map_err(|e| {
+            format!(
+                "the persisted libp2p identity seed {} is malformed ({e}); refusing to start \
+                 with a DIFFERENT random identity that would orphan this state dir's \
+                 anti-rollback floor - fix or remove the file",
+                path.display()
+            )
+        }),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(format!(
+            "reading persisted libp2p identity seed {}: {e}",
+            path.display()
+        )),
+    }
+}
+
+/// Persist `seed` to `path` as 64 lowercase-hex chars, mode 0600, with the SAME atomic +
+/// fsync discipline the sequence floor uses (write a sibling temp, fsync it, rename, fsync the
+/// parent directory) so a crash right after first announce cannot leave a torn or lost
+/// identity file.
+fn save_identity_seed(path: &Path, seed: &[u8; 32]) -> Result<(), String> {
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
+    let parent = path.parent();
+    if let Some(parent) = parent {
+        std::fs::create_dir_all(parent)
+            .map_err(|e| format!("creating libp2p state dir {}: {e}", parent.display()))?;
+    }
+    let hex: String = seed.iter().map(|b| format!("{b:02x}")).collect();
+    let tmp = path.with_extension("tmp");
+    {
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(&tmp)
+            .map_err(|e| format!("creating identity-seed temp {}: {e}", tmp.display()))?;
+        f.write_all(hex.as_bytes())
+            .and_then(|()| f.write_all(b"\n"))
+            .and_then(|()| f.sync_all())
+            .map_err(|e| format!("writing identity-seed temp {}: {e}", tmp.display()))?;
+    }
+    std::fs::rename(&tmp, path)
+        .map_err(|e| format!("renaming identity-seed into place {}: {e}", path.display()))?;
+    if let Some(parent) = parent {
+        std::fs::File::open(parent)
+            .and_then(|d| d.sync_all())
+            .map_err(|e| format!("fsync libp2p state dir {}: {e}", parent.display()))?;
+    }
+    Ok(())
+}
+
+/// Resolve this node's 32-byte libp2p identity seed, anchoring it to `state_dir` when given
+/// (TASK-185 GB1) so a plain identical-argv restart with only `--libp2p-state-dir` yields a
+/// STABLE identity - and therefore a usable durable sequence floor (both are keyed to the
+/// same directory). Precedence, fail-safe:
+///   * No `state_dir`: `explicit` if given, else a fresh `/dev/urandom` seed - the historical
+///     session-scoped behaviour (the caller warns that a provider here is non-durable).
+///   * `state_dir`, no `explicit`: load the persisted seed if present, else generate one and
+///     PERSIST it so the next restart reloads the SAME identity.
+///   * `state_dir` AND `explicit`: the explicit seed WINS but must be CONSISTENT with any
+///     persisted seed - a mismatch is a hard ERROR (fail-safe), because an explicit seed that
+///     disagrees with the dir's identity would silently orphan that dir's floor. When nothing
+///     is persisted yet, the explicit seed is persisted so later state-dir-only restarts match.
+pub fn resolve_durable_identity_seed(
+    state_dir: Option<&Path>,
+    explicit: Option<[u8; 32]>,
+) -> Result<[u8; 32], String> {
+    let Some(dir) = state_dir else {
+        return match explicit {
+            Some(seed) => Ok(seed),
+            None => random_identity_seed(),
+        };
+    };
+    let path = dir.join(IDENTITY_SEED_FILENAME);
+    match (explicit, load_identity_seed(&path)?) {
+        (Some(seed), Some(disk)) if seed != disk => Err(format!(
+            "--libp2p-identity-seed disagrees with the identity already persisted in {}; \
+             refusing to start (an explicit seed that differs from the state dir's identity \
+             would orphan its anti-rollback floor). Remove the flag to use the persisted \
+             identity, or point --libp2p-state-dir at a fresh directory.",
+            path.display()
+        )),
+        (Some(seed), Some(_consistent)) => Ok(seed),
+        (Some(seed), None) => {
+            save_identity_seed(&path, &seed)?;
+            Ok(seed)
+        }
+        (None, Some(disk)) => Ok(disk),
+        (None, None) => {
+            let seed = random_identity_seed()?;
+            save_identity_seed(&path, &seed)?;
+            Ok(seed)
+        }
+    }
+}
+
+/// Announce a signed provider record for each `(nar_hash, nar_bytes)` seed through `fabric`,
+/// DURABLY allocating each record's sequence (TASK-185 AC#2) from the fabric's announcer floor,
+/// signing with `identity_seed` (self-serve: must be the fabric's own identity), and
+/// publishing under `budget`. Returns the announced records (index-aligned with `seeds`) so a
+/// caller can log their keys/sequences.
+///
+/// This is THE shipped provider announce path (SSOT): BOTH thin binaries' `--libp2p-provider`
+/// install AND the TASK-185 restart-durability integration test call this exact function, so a
+/// mutation here (e.g. a hardcoded `sequence`) is caught by the test rather than hiding in a
+/// binary `fn main` no test exercises.
+pub async fn announce_provider_seeds(
+    fabric: &Libp2pFabric,
+    identity_seed: [u8; 32],
+    seeds: &[(NarHashKey, Vec<u8>)],
+    ttl_secs: u64,
+    now: u64,
+    budget: &AnnounceBudget,
+) -> Result<Vec<ProviderRecord>, String> {
+    let announcer = fabric
+        .announcer()
+        .ok_or_else(|| "internal: libp2p provider fabric exposes no announcer".to_string())?;
+    let mut records = Vec::with_capacity(seeds.len());
+    for (nar_hash, bytes) in seeds {
+        // Allocate the durable sequence, then sign, then announce - in that order, per key
+        // (the allocation is a non-reserving read finalised by announce's save-before-publish).
+        let sequence = fabric.next_announce_sequence(&provider_content_key(nar_hash));
+        let record =
+            sign_libp2p_provider_record(identity_seed, nar_hash, bytes, ttl_secs, now, sequence);
+        announcer
+            .announce(&record, budget)
+            .await
+            .map_err(|e| format!("announcing libp2p provider record for {nar_hash}: {e}"))?;
+        records.push(record);
+    }
+    Ok(records)
+}
+
 /// Wrap a running `fabric` in the consumer [`Libp2pNarSource`] + its paired
 /// [`Libp2pRawServe`], both holding the SAME fabric and discovery budget so the
 /// rewrite-to-raw decision and the fetch can never drift (TASK-164). Shared by the
@@ -385,4 +563,108 @@ async fn start_and_join_libp2p(
     }
 
     Ok(fabric)
+}
+
+#[cfg(test)]
+mod identity_seed_tests {
+    //! TASK-185 GB1: `resolve_durable_identity_seed` is the anchor that makes durability real -
+    //! a state-dir-only restart must come back as the SAME node. These are fast, network-free
+    //! unit tests of that contract (the end-to-end restart bite is
+    //! `tests/restart_durable_sequence_through_run.rs`).
+    use super::{IDENTITY_SEED_FILENAME, resolve_durable_identity_seed};
+
+    /// A unique, empty temp dir for one test (process + thread + counter keyed).
+    fn fresh_dir(tag: &str) -> std::path::PathBuf {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static N: AtomicU64 = AtomicU64::new(0);
+        let dir = std::env::temp_dir().join(format!(
+            "nix-p2p-identtest-{tag}-{}-{:?}-{}",
+            std::process::id(),
+            std::thread::current().id(),
+            N.fetch_add(1, Ordering::Relaxed)
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        dir
+    }
+
+    #[test]
+    fn state_dir_only_is_stable_across_boots() {
+        // The GB1 property: two boots with only a state dir resolve the SAME identity, and it
+        // is persisted. If persistence were a no-op these would differ.
+        let dir = fresh_dir("stable");
+        let first = resolve_durable_identity_seed(Some(&dir), None).expect("first boot");
+        assert!(
+            dir.join(IDENTITY_SEED_FILENAME).exists(),
+            "the identity seed must be persisted under the state dir"
+        );
+        let second = resolve_durable_identity_seed(Some(&dir), None).expect("second boot");
+        assert_eq!(
+            first, second,
+            "a state-dir-only restart is the SAME identity"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn no_state_dir_honours_explicit_and_is_session_scoped_otherwise() {
+        // Without a state dir: explicit wins verbatim; None is random (session-scoped) - two
+        // calls need not agree (and almost never will).
+        let seed = [9u8; 32];
+        assert_eq!(
+            resolve_durable_identity_seed(None, Some(seed)).unwrap(),
+            seed
+        );
+        let a = resolve_durable_identity_seed(None, None).unwrap();
+        let b = resolve_durable_identity_seed(None, None).unwrap();
+        assert_ne!(
+            a, b,
+            "session-scoped random seeds are (overwhelmingly) distinct"
+        );
+    }
+
+    #[test]
+    fn explicit_seed_is_persisted_then_reused_by_a_state_dir_only_restart() {
+        let dir = fresh_dir("explicit-persist");
+        let seed = [7u8; 32];
+        assert_eq!(
+            resolve_durable_identity_seed(Some(&dir), Some(seed)).unwrap(),
+            seed
+        );
+        // A later state-dir-only boot reuses the persisted explicit seed.
+        assert_eq!(
+            resolve_durable_identity_seed(Some(&dir), None).unwrap(),
+            seed,
+            "the explicit seed was persisted and is reused on a state-dir-only restart"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn explicit_seed_conflicting_with_persisted_is_fail_closed() {
+        // Fail-safe: an explicit seed that disagrees with the state dir's persisted identity is
+        // a hard error (else it would orphan the dir's anti-rollback floor).
+        let dir = fresh_dir("conflict");
+        resolve_durable_identity_seed(Some(&dir), None).expect("persist a random identity");
+        let err = resolve_durable_identity_seed(Some(&dir), Some([0xAB; 32]))
+            .expect_err("a conflicting explicit seed must be rejected");
+        assert!(
+            err.contains("disagrees"),
+            "error must name the conflict: {err}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_malformed_persisted_seed_is_fail_closed_not_silently_regenerated() {
+        // A corrupt identity file must NOT be silently replaced with a fresh random identity
+        // (that would orphan the floor) - it is a hard error the operator must resolve.
+        let dir = fresh_dir("malformed");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join(IDENTITY_SEED_FILENAME), b"not-hex\n").unwrap();
+        assert!(
+            resolve_durable_identity_seed(Some(&dir), None).is_err(),
+            "a malformed persisted identity must fail closed, not regenerate a new one"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

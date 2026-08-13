@@ -27,8 +27,8 @@ use daemon::{
     NodeLocation, NodeLookupAuthorityAuthorization, NodeLookupConfig, NodePublicationCapability,
     NodePublicationConfig, NodePublicationHandle, NullCorrelation,
     PublicationAuthorityAuthorization, RawServeDecision, RelayCapability, ServeBudget, SystemClock,
-    TaskSupervisor, TransportNarSource, TransportRegistry, UpstreamHttp, build_libp2p_nar_source,
-    build_libp2p_provider_source, provider_content_key, serve, sign_libp2p_provider_record,
+    TaskSupervisor, TransportNarSource, TransportRegistry, UpstreamHttp, announce_provider_seeds,
+    build_libp2p_nar_source, build_libp2p_provider_source, resolve_durable_identity_seed, serve,
 };
 use fabric_libp2p::{Libp2pFabric, MemoryNarSupplier, Multiaddr, PeerId};
 use peer_fabric::{AnnounceBudget, PeerFabric, ServeHandle};
@@ -169,18 +169,6 @@ fn parse_libp2p_seed_nar(raw: &str) -> Result<(NarHashKey, String), String> {
         return Err(format!("bad --libp2p-seed-nar {raw:?}: empty file path"));
     }
     Ok((key, path.to_string()))
-}
-
-/// Generate a fresh 32-byte libp2p identity seed from `/dev/urandom`. Used when
-/// `--libp2p-identity-seed` is omitted; fails fast (never a fixed fallback seed) so a
-/// missing entropy source is a loud startup error, not a silent shared identity.
-fn random_identity_seed() -> Result<[u8; 32], String> {
-    use std::io::Read;
-    let mut seed = [0u8; 32];
-    std::fs::File::open("/dev/urandom")
-        .and_then(|mut f| f.read_exact(&mut seed))
-        .map_err(|e| format!("generating libp2p identity seed from /dev/urandom: {e}"))?;
-    Ok(seed)
 }
 
 /// Parse a byte/millisecond budget that must be POSITIVE.
@@ -777,12 +765,17 @@ impl Config {
                 "libp2p is configured but --libp2p-bootstrap is missing; kad cannot discover a provider without an entry peer".into(),
             );
         }
-        // Resolve the libp2p identity seed ONCE, here, when libp2p is requested and no
-        // explicit seed was given: mint a fresh one from /dev/urandom and store it, so
-        // `libp2p_source_config()` is a pure, idempotent read (two calls -> one identity)
-        // rather than minting new entropy on each call.
-        if config.libp2p_requested() && config.libp2p_identity_seed.is_none() {
-            config.libp2p_identity_seed = Some(random_identity_seed()?);
+        // Resolve the libp2p identity seed ONCE, here, so `libp2p_source_config()` is a pure,
+        // idempotent read (two calls -> one identity). TASK-185 GB1: anchor it to the state dir
+        // when `--libp2p-state-dir` is given, so a plain identical-argv restart comes back as
+        // the SAME node (stable identity + stable sequence floor); an explicit
+        // `--libp2p-identity-seed` still wins but must agree with any persisted one. Without a
+        // state dir this is a fresh `/dev/urandom` seed, session-scoped as before.
+        if config.libp2p_requested() {
+            config.libp2p_identity_seed = Some(resolve_durable_identity_seed(
+                config.libp2p_state_dir.as_deref(),
+                config.libp2p_identity_seed,
+            )?);
         }
         Ok(config)
     }
@@ -790,13 +783,16 @@ impl Config {
     /// Any libp2p flag present (so the daemon should wire the libp2p node). Covers BOTH
     /// the Node-A consumer flags and the Node-B provider flags (TASK-178): a
     /// provider-only invocation still needs the identity seed resolved and the fabric
-    /// started, so it must count as "requested".
+    /// started, so it must count as "requested". `--libp2p-state-dir` counts too (TASK-185
+    /// GB4): a state-dir-only invocation must be honored - it is the durable-identity anchor,
+    /// not an inert flag to be silently dropped into the upstream-only branch.
     fn libp2p_requested(&self) -> bool {
         !self.libp2p_bootstrap.is_empty()
             || !self.libp2p_provider_addrs.is_empty()
             || self.libp2p_listen.is_some()
             || self.libp2p_scope.is_some()
             || self.libp2p_identity_seed.is_some()
+            || self.libp2p_state_dir.is_some()
             || self.libp2p_provider
             || !self.libp2p_seed_nar.is_empty()
             || self.libp2p_print_peer_address
@@ -1342,16 +1338,18 @@ async fn install_libp2p_provider(
         }
     }
 
-    // A PROVIDER without a durable state dir silently re-enables the F3 self-rollback (it
-    // re-mints sequence 1 and its withdrawals can lose after a restart). Warn loudly - a
-    // silent non-durable PROVIDER is exactly the defect TASK-185 fixed (the iroh path fails
-    // loud on a missing identity dir for the analogous reason).
+    // A PROVIDER without a durable state dir re-enables the F3 self-rollback (fresh random
+    // identity + sequence 1 after a restart). WARN loudly rather than silently - but this
+    // warns-and-continues, it is NOT fail-closed (a hard refusal is arguably right now that GB1
+    // makes the state dir load-bearing, but the podman/netns e2e harness starts providers
+    // without --libp2p-state-dir, so fail-closed is deferred to TASK-188 with the harness fix).
     if cfg.state_dir.is_none() {
         eprintln!(
             "daemon: WARNING: --libp2p-state-dir is not set; this libp2p PROVIDER runs \
-             NON-DURABLE. Its announce sequences and withdrawals will NOT survive a restart \
-             (a restarted provider re-mints sequence 1 and a withdrawal can silently lose). \
-             Set --libp2p-state-dir <dir> for restart-durable operation."
+             NON-DURABLE. Its identity is regenerated each start and its announce sequences and \
+             withdrawals will NOT survive a restart (a restarted provider announces under a NEW \
+             identity at sequence 1 and cannot supersede or withdraw its old records). Set \
+             --libp2p-state-dir <dir> for restart-durable operation."
         );
     }
 
@@ -1373,27 +1371,19 @@ async fn install_libp2p_provider(
         .await
         .map_err(|e| format!("libp2p serve gate failed to install: {e}"))?;
 
-    // Announce a signed ProviderRecord for each seed so a consumer's kad get_providers
-    // finds this node under the ContentKey it derives from the narinfo's NarHash.
+    // Announce a signed ProviderRecord for each seed (durable-allocate -> sign -> announce)
+    // through the SSOT provider loop the restart-durability test also exercises (TASK-185 GB2),
+    // so a consumer's kad get_providers finds this node under the ContentKey it derives from
+    // the narinfo's NarHash.
     let announce_budget = AnnounceBudget::new(std::time::Duration::from_secs(10), 20);
-    let announcer = fabric
-        .announcer()
-        .ok_or_else(|| "internal: libp2p provider fabric exposes no announcer".to_string())?;
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0);
-    for (nar_hash, bytes) in &seeds {
-        // AC#2 (TASK-185): allocate the sequence DURABLY from the announcer's per-key floor
-        // (reseeded from `--libp2p-state-dir` on restart) rather than the old hardcoded `1`
-        // that self-rolled-back after a restart. Session-fresh (1) when no state dir is set.
-        let sequence = fabric.next_announce_sequence(&provider_content_key(nar_hash));
-        let record =
-            sign_libp2p_provider_record(identity_seed, nar_hash, bytes, 3600, now, sequence);
-        announcer
-            .announce(&record, &announce_budget)
-            .await
-            .map_err(|e| format!("announcing libp2p provider record for {nar_hash}: {e}"))?;
+    let records =
+        announce_provider_seeds(&fabric, identity_seed, &seeds, 3600, now, &announce_budget)
+            .await?;
+    for (record, (nar_hash, bytes)) in records.iter().zip(&seeds) {
         // Machine-readable: path/NarHash -> the derived ContentKey + raw BLAKE3 content id.
         println!(
             "LIBP2P-SEED narhash={nar_hash} content={} content_key={} bytes={}",
