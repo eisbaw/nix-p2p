@@ -15,9 +15,9 @@ the trust.** Signing stays the cache's job.
 and drives a real `nix build` whose NAR is discovered, resolved, fetched, and
 served **from a peer** — no injected addresses, upstream untouched on a hit.
 
-> **Research prototype.** It has not been pointed at the real cache.nixos.org (the
-> daemon is plain-HTTP; TLS is future work) and has not faced a public network — no
-> NAT hole-punching, no relay, no residential uplink. It runs on loopback,
+> **Research prototype.** The daemon fronts cache.nixos.org over verified TLS, but has
+> not been run against the real cache in a deployment and has not faced a public
+> network — no NAT hole-punching, no relay, no residential uplink. It runs on loopback,
 > in-process, and single-host rootless-podman containers. Within that scope the
 > decentralized path is real end to end: separate daemon containers on isolated
 > network namespaces discover a provider, resolve its address, fetch, and serve a
@@ -131,15 +131,31 @@ first-class part of the project, and the real-network and swarm results are not 
   chains, the additive-invariant crash behaviour (daemon dead or killed mid-transfer →
   `nix build` still succeeds via fallback, the store never corrupted), a NixOS module +
   VM test.
-- **Regenerate-on-demand supply:** a node announces what it can serve without holding
-  it, regenerates from `/nix/store` on request inside a serve budget, and holds
-  nothing at rest.
+- **A supply-integrity floor.** Before a node will advertise that it holds a NAR it
+  verifies that `sha256(nix-store --dump <path>)` equals the signed NarHash — at the
+  index and again at the shipped announce site — so a mis-registered path is quarantined
+  rather than announced as a false claim; and produced bytes are BLAKE3-rechecked against
+  the announced content before they leave the node.
+- **Fronts the real cache.nixos.org over verified TLS.** The daemon speaks HTTPS to the
+  upstream cache with full certificate-chain and hostname verification and no skip-verify
+  path in a production build; the test fixture fronts it too, over a deliberately
+  *disjoint* TLS stack so the product and the fixture stay independent witnesses of wire
+  behaviour.
+- **Regenerate-on-demand supply (the supplier).** A store-dump supplier regenerates a raw
+  NAR from `/nix/store` on demand under a supervised, cancellation-safe process group,
+  declares its size before producing a byte, holds nothing at rest, and never enumerates
+  what it holds. (Driving it from the shipped serve loop is still landing — see below.)
 
 ## What is not yet
 
-- **A public network.** NAT hole-punching, relay for residential peers, TLS, and
-  actually pointing at cache.nixos.org are all future work; today it is single-host
-  loopback and containers.
+- **A public network.** NAT hole-punching, relay for residential peers, and running
+  against the real cache.nixos.org over a public network are future work; today it is
+  single-host loopback and containers.
+- **Serving from a live `/nix/store` on the shipped provider.** The on-demand supplier
+  above is built and verified in-process, but the shipped provider's serve loop does not
+  yet drive it — a provider serves prepared NAR files today. Wiring the supplier into the
+  serve path — an async serve seam so a `nix-store --dump` never blocks the swarm poll
+  loop — is in progress.
 - **The iroh optional-transport journey.** iroh transfer works; its decentralized
   public-node discovery / no-address connection, and the iroh-versus-libp2p transport
   tournament that decides whether iroh's NAT traversal earns its place, are in progress.
