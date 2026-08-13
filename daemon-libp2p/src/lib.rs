@@ -33,7 +33,10 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use fabric_libp2p::{Libp2pFabric, Libp2pNarSupplier, Multiaddr, NodeConfig, PeerId};
+use fabric_libp2p::{
+    ANNOUNCE_SEQ_FILENAME, Libp2pFabric, Libp2pNarSupplier, Multiaddr, NodeConfig,
+    PROVIDER_FLOOR_FILENAME, PeerId,
+};
 
 use ed25519_dalek::SigningKey;
 use peer_fabric::{
@@ -345,6 +348,16 @@ fn save_identity_seed(path: &Path, seed: &[u8; 32]) -> Result<(), String> {
     Ok(())
 }
 
+/// The durable floor/sequence sidecars a fabric writes under a state dir - the pieces that,
+/// if present while the identity file is ABSENT, mean the state dir is inconsistent (see
+/// [`resolve_durable_identity_seed`]). Returns which of them exist under `dir`.
+fn orphaned_floor_sidecars(dir: &Path) -> Vec<&'static str> {
+    [ANNOUNCE_SEQ_FILENAME, PROVIDER_FLOOR_FILENAME]
+        .into_iter()
+        .filter(|name| dir.join(name).exists())
+        .collect()
+}
+
 /// Resolve this node's 32-byte libp2p identity seed, anchoring it to `state_dir` when given
 /// (TASK-185 GB1) so a plain identical-argv restart with only `--libp2p-state-dir` yields a
 /// STABLE identity - and therefore a usable durable sequence floor (both are keyed to the
@@ -357,6 +370,20 @@ fn save_identity_seed(path: &Path, seed: &[u8; 32]) -> Result<(), String> {
 ///     persisted seed - a mismatch is a hard ERROR (fail-safe), because an explicit seed that
 ///     disagrees with the dir's identity would silently orphan that dir's floor. When nothing
 ///     is persisted yet, the explicit seed is persisted so later state-dir-only restarts match.
+///
+/// STATE-DIR CONSISTENCY (TASK-185 re-gate): the identity file is created EAGERLY (before any
+/// floor/sequence file), so a floor/sequence sidecar present while the identity is ABSENT can
+/// ONLY mean the identity was lost under partial corruption. Generating a fresh identity there
+/// would silently REKEY this node and orphan the records the surviving floor is bound to - the
+/// GB1 failure class, re-opened via partial loss. That direction is fail-closed here.
+///
+/// HONEST LIMIT (the symmetric direction is NOT cleanly detectable, and is deliberately NOT
+/// special-cased here - TASK-189): the floor/sequence files are created LAZILY (a pure consumer
+/// never writes an announce-seq file; a provider writes it only on its first announce), so
+/// "identity present, floor absent" is INDISTINGUISHABLE from a legitimate first boot / pure
+/// consumer / pre-first-announce provider. Fail-closing on it would break normal operation.
+/// Fully closing that direction (and the whole partial-corruption space) needs a single atomic
+/// durable-state file with an init marker, tracked as TASK-189.
 pub fn resolve_durable_identity_seed(
     state_dir: Option<&Path>,
     explicit: Option<[u8; 32]>,
@@ -368,7 +395,23 @@ pub fn resolve_durable_identity_seed(
         };
     };
     let path = dir.join(IDENTITY_SEED_FILENAME);
-    match (explicit, load_identity_seed(&path)?) {
+    let persisted = load_identity_seed(&path)?;
+    if persisted.is_none() {
+        // Identity absent: refuse to (re)generate one while a durable floor it would NOT own
+        // survives on disk. A false positive is impossible - the identity is written before any
+        // floor, so a floor without an identity is always loss, never a legitimate first boot.
+        let orphaned = orphaned_floor_sidecars(dir);
+        if !orphaned.is_empty() {
+            return Err(format!(
+                "libp2p state dir {} is INCONSISTENT: durable floor/sequence file(s) {orphaned:?} \
+                 exist but the identity file {IDENTITY_SEED_FILENAME} is missing. Regenerating an \
+                 identity would silently rekey this node and orphan its existing records. Refusing \
+                 to start: restore {IDENTITY_SEED_FILENAME}, or wipe the state dir to start fresh.",
+                dir.display()
+            ));
+        }
+    }
+    match (explicit, persisted) {
         (Some(seed), Some(disk)) if seed != disk => Err(format!(
             "--libp2p-identity-seed disagrees with the identity already persisted in {}; \
              refusing to start (an explicit seed that differs from the state dir's identity \
@@ -664,6 +707,46 @@ mod identity_seed_tests {
         assert!(
             resolve_durable_identity_seed(Some(&dir), None).is_err(),
             "a malformed persisted identity must fail closed, not regenerate a new one"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_floor_without_its_identity_is_fail_closed_corruption() {
+        // TASK-185 re-gate, case 1 (GB1 re-opened via PARTIAL loss): a floor/sequence file
+        // present while the identity file is GONE must FAIL-CLOSED, not silently regenerate a
+        // fresh identity (which would rekey the node and orphan the records the floor is bound
+        // to). BITE: remove the consistency check in resolve and this returns a fresh seed -> the
+        // expect_err goes red. Covered for BOTH floor sidecars.
+        use fabric_libp2p::{ANNOUNCE_SEQ_FILENAME, PROVIDER_FLOOR_FILENAME};
+        for orphan in [ANNOUNCE_SEQ_FILENAME, PROVIDER_FLOOR_FILENAME] {
+            let dir = fresh_dir("orphan-floor");
+            std::fs::create_dir_all(&dir).unwrap();
+            // A floor file exists but NO identity file (partial corruption).
+            std::fs::write(dir.join(orphan), b"# surviving floor state\n").unwrap();
+            let err = resolve_durable_identity_seed(Some(&dir), None).expect_err(
+                "a durable floor without its identity must fail closed, not silently rekey",
+            );
+            assert!(
+                err.contains("INCONSISTENT"),
+                "error must name the inconsistency (orphan {orphan}): {err}"
+            );
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+    }
+
+    #[test]
+    fn identity_present_without_a_floor_is_a_normal_boot_not_corruption() {
+        // The AMBIGUOUS direction is deliberately NOT fail-closed (TASK-189): a pure consumer or
+        // a pre-first-announce provider legitimately has an identity but no floor file yet, so a
+        // restart there is a normal SAME-identity boot, not corruption.
+        let dir = fresh_dir("ident-no-floor");
+        let first = resolve_durable_identity_seed(Some(&dir), None).expect("first boot");
+        let second =
+            resolve_durable_identity_seed(Some(&dir), None).expect("restart with no floor yet");
+        assert_eq!(
+            first, second,
+            "identity-present + floor-absent is a normal boot, not corruption"
         );
         let _ = std::fs::remove_dir_all(&dir);
     }

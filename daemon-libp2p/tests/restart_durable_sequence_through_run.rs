@@ -52,10 +52,12 @@ use daemon_core::{
     RunConfig, SourceError, StoreHash, UpstreamResponse, run,
 };
 use daemon_libp2p::{
-    Libp2pSourceConfig, announce_provider_seeds, build_libp2p_nar_source,
+    IDENTITY_SEED_FILENAME, Libp2pSourceConfig, announce_provider_seeds, build_libp2p_nar_source,
     build_libp2p_provider_source, provider_content_key, resolve_durable_identity_seed,
 };
-use fabric_libp2p::{Libp2pFabric, MemoryNarSupplier, Multiaddr, NodeConfig, PeerId};
+use fabric_libp2p::{
+    ANNOUNCE_SEQ_FILENAME, Libp2pFabric, MemoryNarSupplier, Multiaddr, NodeConfig, PeerId,
+};
 use http::HeaderMap;
 use http_body_util::{BodyExt, Full};
 use peer_fabric::{
@@ -482,5 +484,72 @@ async fn restart_durable_sequence_serves_through_run() {
     );
 
     run_task.abort();
+    let _ = std::fs::remove_dir_all(&state_dir);
+}
+
+/// TASK-185 re-gate: PARTIAL state-dir corruption (identity file lost, floor/sequence survives)
+/// must FAIL-CLOSED at the shipped identity resolution, not silently rekey the node. Driven
+/// through the REAL durable path: a durable provider boot writes both `identity-seed-v1` and
+/// `announce-seq-v1.txt`, then we delete ONLY the identity file and re-resolve the way the
+/// binary's `source_config`/`from_args` does.
+///
+/// BITE: with the consistency check, this errors ("INCONSISTENT"); remove the check in
+/// `resolve_durable_identity_seed` and it returns a FRESH seed (a different NodeId) -> the
+/// `expect_err` goes red. (The symmetric case - identity kept, floor deleted - is NOT a
+/// distinct fail-closed path: a fresh consumer / pre-first-announce provider legitimately has no
+/// floor file, so it is left to TASK-189's atomic state-file, see the AC4 test's module doc.)
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_partial_state_dir_with_lost_identity_fails_closed() {
+    let scope = "task185-partial-corrupt";
+    let state_dir = std::env::temp_dir().join(format!(
+        "nix-p2p-task185-partial-{}-{:?}",
+        std::process::id(),
+        std::thread::current().id()
+    ));
+    let _ = std::fs::remove_dir_all(&state_dir);
+
+    let nar = b"nix-archive-1 raw NAR for the partial-corruption oracle".to_vec();
+    let nar_hash: NarHashKey = nar_hash_string([0x5cu8; 32]).parse().expect("nar hash");
+
+    let (bootstrap, boot_addr) = start_fabric(
+        Libp2pFabric::start(NodeConfig {
+            identity_seed: [1u8; 32],
+            network_scope: scope.to_string(),
+        })
+        .expect("bootstrap starts"),
+    )
+    .await;
+    let boot_peer = bootstrap.peer_id();
+
+    // A real durable boot: identity + a genuine announce-seq (the sequence advanced on announce).
+    {
+        let (p1, _serve1, _record1) = start_provider_and_announce(
+            durable_provider_cfg(scope, (boot_peer, boot_addr.clone()), &state_dir),
+            &nar,
+            &nar_hash,
+        )
+        .await;
+        drop(p1);
+    }
+    assert!(
+        state_dir.join(IDENTITY_SEED_FILENAME).exists(),
+        "the durable boot must have persisted the identity"
+    );
+    assert!(
+        state_dir.join(ANNOUNCE_SEQ_FILENAME).exists(),
+        "the durable boot must have persisted the advanced announce sequence"
+    );
+
+    // PARTIAL CORRUPTION: lose ONLY the identity file; the sequence floor survives.
+    std::fs::remove_file(state_dir.join(IDENTITY_SEED_FILENAME)).expect("delete identity file");
+
+    // The shipped restart resolves identity from the state dir -> must FAIL CLOSED (not rekey).
+    let err = resolve_durable_identity_seed(Some(&state_dir), None)
+        .expect_err("a surviving floor with a lost identity must fail closed, not silently rekey");
+    assert!(
+        err.contains("INCONSISTENT"),
+        "the corruption error must name the inconsistency, got: {err}"
+    );
+
     let _ = std::fs::remove_dir_all(&state_dir);
 }

@@ -24,6 +24,14 @@ use crate::server::Libp2pServer;
 use crate::swarm::{Node, NodeConfig, NodeError, SwarmHandle};
 use crate::transport::Libp2pTransport;
 
+/// The durable sidecar filenames a fabric writes under its `state_dir` (TASK-185). Exposed as
+/// the SINGLE SOURCE for these names so the composition root can enforce STATE-DIR CONSISTENCY
+/// (a floor/sequence file present without its identity sidecar is corruption, not a first
+/// boot) without re-hardcoding the strings and drifting from what the fabric actually writes.
+pub const PROVIDER_FLOOR_FILENAME: &str = "provider-floor-v1.txt";
+/// See [`PROVIDER_FLOOR_FILENAME`].
+pub const ANNOUNCE_SEQ_FILENAME: &str = "announce-seq-v1.txt";
+
 /// The libp2p [`PeerFabric`]. Holds the running [`Node`] (its worker stays alive as
 /// long as the fabric does) and the kad-backed capabilities.
 pub struct Libp2pFabric {
@@ -123,7 +131,7 @@ impl Libp2pFabric {
             Some(dir) => Libp2pProviderDirectory::durable(
                 node.handle.clone(),
                 ledger.clone(),
-                dir.join("provider-floor-v1.txt"),
+                dir.join(PROVIDER_FLOOR_FILENAME),
             ),
             None => Libp2pProviderDirectory::new(node.handle.clone(), ledger.clone()),
         });
@@ -136,7 +144,7 @@ impl Libp2pFabric {
                 node.node_id,
                 node.peer_id,
                 signing_key,
-                dir.join("announce-seq-v1.txt"),
+                dir.join(ANNOUNCE_SEQ_FILENAME),
             ),
             None => Libp2pAvailabilityAnnouncer::new(
                 node.handle.clone(),

@@ -111,7 +111,7 @@ mod transport;
 
 pub use announcer::{Libp2pAvailabilityAnnouncer, MAX_RECORD_TTL_SECS};
 pub use directory::Libp2pProviderDirectory;
-pub use fabric::Libp2pFabric;
+pub use fabric::{ANNOUNCE_SEQ_FILENAME, Libp2pFabric, PROVIDER_FLOOR_FILENAME};
 pub use keys::VALUE_KEY_CONTEXT;
 pub use locator::Libp2pNodeLocator;
 pub use nar::{
