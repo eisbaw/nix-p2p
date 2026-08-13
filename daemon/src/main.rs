@@ -18,19 +18,21 @@ use std::sync::Arc;
 use daemon::cacheinfo::DEFAULT_PRIORITY;
 use daemon::claim::CLAIM_SCHEMA_VERSION;
 use daemon::{
-    AddressLookupCapability, AllowlistRawServe, AnyRawServe, App, Blake3Digest, CacheInfo, Claim,
-    CorrelationStore, DEFAULT_MAX_INFLIGHT_NAR_BYTES, DEFAULT_MAX_SERVE_DURATION,
-    DEFAULT_MAX_SERVE_NAR_BYTES, EndpointProfile, EndpointScope, FallbackNarSource,
-    FileNarSupplier, IdentitySource, InMemoryDiscovery, IrohNode, IrohNodeBuilder, IrohPeerAddr,
-    IrohProviderConfig, IrohTransport, KnownPayload, KnownTransport, Libp2pSourceConfig,
-    NarCatalog, NarHashKey, NarSource, NarinfoDiskCache, NarinfoSource, NoRawServe, NodeId,
-    NodeLocation, NodeLookupAuthorityAuthorization, NodeLookupConfig, NodePublicationCapability,
-    NodePublicationConfig, NodePublicationHandle, NullCorrelation,
-    PublicationAuthorityAuthorization, RawServeDecision, RelayCapability, ServeBudget, SystemClock,
-    TaskSupervisor, TransportNarSource, TransportRegistry, UpstreamHttp, announce_provider_seeds,
-    build_libp2p_nar_source, build_libp2p_provider_source, resolve_durable_identity_seed, serve,
+    AddressLookupCapability, AllowlistRawServe, AnyRawServe, App, AvailabilityIndex, Blake3Digest,
+    CacheInfo, Claim, CommandNarDumper, CorrelationStore, DEFAULT_MAX_INFLIGHT_NAR_BYTES,
+    DEFAULT_MAX_SERVE_DURATION, DEFAULT_MAX_SERVE_NAR_BYTES, EndpointProfile, EndpointScope,
+    FallbackNarSource, FileNarSupplier, IdentitySource, InMemoryDiscovery, IrohNode,
+    IrohNodeBuilder, IrohPeerAddr, IrohProviderConfig, IrohTransport, KnownPayload, KnownTransport,
+    Libp2pCatalogProbe, Libp2pSourceConfig, NarCatalog, NarDumper, NarHashKey, NarSource,
+    NarinfoDiskCache, NarinfoSource, NoRawServe, NodeId, NodeLocation,
+    NodeLookupAuthorityAuthorization, NodeLookupConfig, NodePublicationCapability,
+    NodePublicationConfig, NodePublicationHandle, NullAnnounce, NullCorrelation, NullStore,
+    PublicationAuthorityAuthorization, RawServeDecision, RelayCapability, ServeBudget, StorePath,
+    SystemClock, TaskSupervisor, TransportNarSource, TransportRegistry, UpstreamHttp,
+    announce_provider_seeds, announce_store_provisions, build_libp2p_nar_source,
+    build_libp2p_provider_source, resolve_durable_identity_seed, serve, verify_store_provisions,
 };
-use fabric_libp2p::{Libp2pFabric, MemoryNarSupplier, Multiaddr, PeerId};
+use fabric_libp2p::{CatalogNarSupplier, Libp2pFabric, MemoryNarSupplier, Multiaddr, PeerId};
 use peer_fabric::{AnnounceBudget, PeerFabric, ServeHandle};
 use tokio::net::TcpListener;
 
@@ -372,6 +374,11 @@ struct Config {
     /// under that SAME key, and the raw file alone does not carry it (unlike the iroh
     /// `--iroh-seed-nar`, whose NarHash is supplied out of band by node A's `--p2p-claim`).
     libp2p_seed_nar: Vec<(NarHashKey, String)>,
+    /// Real `/nix/store` paths this node SERVES on demand via `nix-store --dump` and ANNOUNCES
+    /// over libp2p (`<narhash>=<storepath>`, repeatable), holding NO .nar at rest (TASK-191).
+    /// The announce is verification-gated by the availability index (TASK-56); mutually
+    /// exclusive with `--libp2p-seed-nar` in one provider (MVP).
+    libp2p_provide_store: Vec<(NarHashKey, String)>,
     /// Print the provider's `PeerId` + bound listen multiaddr(s) on startup
     /// (`LIBP2P-PROVIDER-ADDR ...`), so a harness can wire another daemon's
     /// `--libp2p-bootstrap <PeerId>@<multiaddr>` to this provider. Like
@@ -433,6 +440,7 @@ impl Default for Config {
             libp2p_identity_seed: None,
             libp2p_provider: false,
             libp2p_seed_nar: Vec::new(),
+            libp2p_provide_store: Vec::new(),
             libp2p_print_peer_address: false,
             libp2p_state_dir: None,
         }
@@ -694,6 +702,9 @@ impl Config {
                 "--libp2p-seed-nar" => config
                     .libp2p_seed_nar
                     .push(parse_libp2p_seed_nar(&value()?)?),
+                "--libp2p-provide-store" => config
+                    .libp2p_provide_store
+                    .push(parse_libp2p_seed_nar(&value()?)?),
                 "--libp2p-print-peer-address" => config.libp2p_print_peer_address = true,
                 other => return Err(format!("unknown flag {other:?}")),
             }
@@ -738,16 +749,29 @@ impl Config {
         // silently ignoring. And a provider with nothing to serve, or with no listener to
         // be dialed on, is a node that announces then cannot deliver - fail fast naming
         // the missing flag rather than shipping a dead-on-arrival provider.
-        if (!config.libp2p_seed_nar.is_empty() || config.libp2p_print_peer_address)
+        if (!config.libp2p_seed_nar.is_empty()
+            || !config.libp2p_provide_store.is_empty()
+            || config.libp2p_print_peer_address)
             && !config.libp2p_provider
         {
             return Err(
-                "libp2p provider companion flags (--libp2p-seed-nar / --libp2p-print-peer-address) require explicit --libp2p-provider".into(),
+                "libp2p provider companion flags (--libp2p-seed-nar / --libp2p-provide-store / --libp2p-print-peer-address) require explicit --libp2p-provider".into(),
             );
         }
-        if config.libp2p_provider && config.libp2p_seed_nar.is_empty() {
+        if config.libp2p_provider
+            && config.libp2p_seed_nar.is_empty()
+            && config.libp2p_provide_store.is_empty()
+        {
             return Err(
-                "--libp2p-provider requires at least one --libp2p-seed-nar <narhash>=<path>; a provider with nothing to serve is a no-op".into(),
+                "--libp2p-provider requires at least one --libp2p-seed-nar <narhash>=<path> or --libp2p-provide-store <narhash>=<storepath>; a provider with nothing to serve is a no-op".into(),
+            );
+        }
+        // TASK-191 MVP: one supplier drives the fabric, so the in-memory seed path and the
+        // store-dump path are not combined in a single provider yet (a union supplier is a
+        // filed follow-up). Fail fast rather than silently serve only one.
+        if !config.libp2p_seed_nar.is_empty() && !config.libp2p_provide_store.is_empty() {
+            return Err(
+                "--libp2p-seed-nar and --libp2p-provide-store cannot be combined in one provider yet (TASK-191 MVP); use one supply mode".into(),
             );
         }
         if config.libp2p_provider && config.libp2p_listen.is_none() {
@@ -795,6 +819,7 @@ impl Config {
             || self.libp2p_state_dir.is_some()
             || self.libp2p_provider
             || !self.libp2p_seed_nar.is_empty()
+            || !self.libp2p_provide_store.is_empty()
             || self.libp2p_print_peer_address
     }
 
@@ -1272,6 +1297,10 @@ async fn shutdown_after_setup_error(node: IrohNode, error: String) -> String {
 struct Libp2pProviderGuard {
     _fabric: Arc<Libp2pFabric>,
     _serve: ServeHandle,
+    /// Present in the STORE-supply mode (TASK-191): the [`CatalogNarSupplier`] serves through
+    /// this index's supply catalog, and the index's `Drop` retires every registration, so the
+    /// served reverse-map must outlive the process.
+    _index: Option<Arc<AvailabilityIndex>>,
 }
 
 /// Node B (libp2p PROVIDER, TASK-178): start the libp2p fabric WITH a supplier serving
@@ -1293,17 +1322,13 @@ async fn install_libp2p_provider(
     ),
     String,
 > {
-    // BLOCKED-PENDING-TASK-193 (do NOT wire a `--libp2p-provide-store` store-dump CLI mode
-    // here yet): the shipped libp2p SERVE loop is synchronous + Memory-only
-    // (fabric-libp2p swarm on_nar_event -> ServeGate::respond -> NarSupplyPlan::produce,
-    // which handles only NarSource::Memory). A store-dump-backed `CatalogNarSupplier`
-    // (NarSource::Process) would ANNOUNCE store paths correctly but then DECLINE every serve
-    // with SupplyFailed - the exact announce-then-decline anti-pattern the seed budget checks
-    // below guard against. Serving a real /nix/store path on demand (TASK-191) requires
-    // off-worker async supervised production (produce_supervised) reachable from the serve
-    // loop, carved out as TASK-193; wire the store supplier + `--libp2p-provide-store` only
-    // once that lands.
-    //
+    // STORE-supply mode (TASK-191): serve real /nix/store paths on demand via `nix-store --dump`
+    // (no .nar at rest), with a verification-gated announce. Now reachable because TASK-193 lands
+    // off-loop supervised Process production on the serve loop (was BLOCKED before).
+    if !config.libp2p_provide_store.is_empty() {
+        return install_libp2p_store_provider(config, cfg).await;
+    }
+
     // Read every seeded raw NAR up front: a NAR we cannot read is a configuration error,
     // not a provider that quietly announces nothing and dial-then-fails at serve time.
     let mut seeds: Vec<(NarHashKey, Vec<u8>)> = Vec::with_capacity(config.libp2p_seed_nar.len());
@@ -1436,6 +1461,167 @@ async fn install_libp2p_provider(
         Libp2pProviderGuard {
             _fabric: fabric,
             _serve: serve,
+            _index: None,
+        },
+    ))
+}
+
+/// The STORE-supply mode of [`install_libp2p_provider`] (TASK-191): serve real `/nix/store`
+/// paths from a [`CatalogNarSupplier`] over the daemon's [`AvailabilityIndex`], regenerating
+/// each on demand via `nix-store --dump` and holding NO .nar at rest. The announce is
+/// verification-gated (AC#2): [`verify_store_provisions`] runs the index's TASK-56
+/// `sha256(--dump) == NarHash` check + quarantine for every path BEFORE any record is signed,
+/// and each announced `content` is the index's VERIFIED digest, never the operator's word.
+async fn install_libp2p_store_provider(
+    config: &Config,
+    cfg: Libp2pSourceConfig,
+) -> Result<
+    (
+        Arc<dyn NarSource>,
+        Arc<dyn RawServeDecision>,
+        Libp2pProviderGuard,
+    ),
+    String,
+> {
+    let serve_budget = peer_fabric::ServeBudget {
+        max_nar_bytes_uncompressed_nar: config.iroh_max_serve_nar_bytes,
+        max_inflight_bytes_uncompressed_nar: config.iroh_max_inflight_nar_bytes,
+        max_serve_duration: std::time::Duration::from_millis(config.iroh_max_serve_duration_ms),
+    };
+    if serve_budget.max_inflight_bytes_uncompressed_nar
+        < serve_budget.max_nar_bytes_uncompressed_nar
+    {
+        return Err(format!(
+            "--iroh-max-inflight-nar-bytes {} is below --iroh-max-serve-nar-bytes {}: every \
+             libp2p serve at the per-NAR bound would be declined as busy",
+            serve_budget.max_inflight_bytes_uncompressed_nar,
+            serve_budget.max_nar_bytes_uncompressed_nar
+        ));
+    }
+
+    if cfg.state_dir.is_none() {
+        eprintln!(
+            "daemon: WARNING: --libp2p-state-dir is not set; this libp2p PROVIDER runs \
+             NON-DURABLE. Its identity is regenerated each start and its announce sequences and \
+             withdrawals will NOT survive a restart. Set --libp2p-state-dir <dir> for \
+             restart-durable operation."
+        );
+    }
+
+    let identity_seed = cfg.identity_seed;
+    // The availability index over the REAL store: a `nix-store --dump` producer (CommandNarDumper
+    // -> a ProbedSource::Process source, so the CatalogNarSupplier regenerates on demand and holds
+    // nothing at rest). NullStore: the provided set is the CLI SSOT, re-registered + re-verified
+    // each boot. NullAnnounce: claims are announced through the libp2p announcer below. The
+    // `node_id` here is a PLACEHOLDER (the composite binary has no ed25519 dep to derive the real
+    // one); the libp2p ProviderRecord carries its OWN provider identity, so the index's iroh offer
+    // is never consulted on this path.
+    let index = AvailabilityIndex::open(
+        NodeId::from_bytes([0u8; 32]),
+        Arc::new(CommandNarDumper::from_path()) as Arc<dyn NarDumper>,
+        Arc::new(NullStore),
+        Arc::new(NullAnnounce),
+    )
+    .map_err(|e| format!("opening the availability index for store supply: {e}"))?;
+    let mut nar_hashes = Vec::with_capacity(config.libp2p_provide_store.len());
+    for (nar_hash, path) in &config.libp2p_provide_store {
+        index
+            .register(*nar_hash, StorePath::new(path))
+            .map_err(|e| format!("registering store path {path:?} under {nar_hash}: {e}"))?;
+        nar_hashes.push(*nar_hash);
+    }
+    let index = Arc::new(index);
+
+    // The supplier reads the index's inert reverse-map. The helper program is THIS binary's
+    // `__dump-raw-nar` mode, spawned ONLY for a ProbedSource::RegularFile; a real store path is a
+    // ProbedSource::Process (nix-store --dump) and never invokes it.
+    let helper_program = std::env::current_exe()
+        .map_err(|e| format!("resolving daemon executable for the raw-NAR helper: {e}"))?;
+    let supplier = Arc::new(CatalogNarSupplier::new(
+        Libp2pCatalogProbe::new(index.supply_catalog()),
+        helper_program,
+    ));
+    let (fabric, source, raw_serve) = build_libp2p_provider_source(cfg, supplier).await?;
+
+    let serve = fabric
+        .server()
+        .ok_or_else(|| {
+            "internal: libp2p provider fabric has no serve axis (start_with_supplier)".to_string()
+        })?
+        .serve(serve_budget)
+        .await
+        .map_err(|e| format!("libp2p serve gate failed to install: {e}"))?;
+
+    // AC#2 gate: verify EVERY provided store path through the index before any announce.
+    let provisions = verify_store_provisions(&index, &nar_hashes)?;
+    for provision in &provisions {
+        if provision.declared_size() > serve_budget.max_nar_bytes_uncompressed_nar {
+            return Err(format!(
+                "store path for {} dumps to {} B (uncompressed NAR) but --iroh-max-serve-nar-bytes \
+                 is {}: announcing it would publish a claim this node would then decline to serve",
+                provision.nar_hash(),
+                provision.declared_size(),
+                serve_budget.max_nar_bytes_uncompressed_nar
+            ));
+        }
+    }
+
+    let announce_budget = AnnounceBudget::new(std::time::Duration::from_secs(10), 20);
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let records = announce_store_provisions(
+        &fabric,
+        identity_seed,
+        &provisions,
+        3600,
+        now,
+        &announce_budget,
+    )
+    .await?;
+    for (record, provision) in records.iter().zip(&provisions) {
+        println!(
+            "LIBP2P-PROVIDE-STORE narhash={} content={} content_key={} nar_size={}",
+            provision.nar_hash(),
+            record.content.to_hex(),
+            record.key,
+            provision.declared_size(),
+        );
+    }
+    println!(
+        "LIBP2P-SERVE-BUDGET max_nar_bytes_uncompressed_nar={} max_inflight_bytes_uncompressed_nar={} max_serve_duration_ms={}",
+        serve_budget.max_nar_bytes_uncompressed_nar,
+        serve_budget.max_inflight_bytes_uncompressed_nar,
+        config.iroh_max_serve_duration_ms
+    );
+
+    if config.libp2p_print_peer_address {
+        let listen_addrs = fabric.handle().listen_addrs().await;
+        if listen_addrs.is_empty() {
+            return Err(
+                "--libp2p-print-peer-address requested but the provider bound no listen address"
+                    .into(),
+            );
+        }
+        let addrs_csv = listen_addrs
+            .iter()
+            .map(|a| a.to_string())
+            .collect::<Vec<_>>()
+            .join(",");
+        println!(
+            "LIBP2P-PROVIDER-ADDR peer_id={} listen={addrs_csv}",
+            fabric.peer_id()
+        );
+    }
+
+    Ok((
+        source,
+        raw_serve,
+        Libp2pProviderGuard {
+            _fabric: fabric,
+            _serve: serve,
+            _index: Some(index),
         },
     ))
 }

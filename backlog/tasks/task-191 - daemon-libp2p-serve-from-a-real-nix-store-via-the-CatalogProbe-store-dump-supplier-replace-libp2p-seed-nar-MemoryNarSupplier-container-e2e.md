@@ -3,11 +3,11 @@ id: TASK-191
 title: >-
   daemon-libp2p: serve from a real /nix/store via the CatalogProbe store-dump
   supplier (replace --libp2p-seed-nar MemoryNarSupplier), + container e2e
-status: To Do
+status: In Progress
 assignee:
   - '@claude'
 created_date: '2026-08-13 11:29'
-updated_date: '2026-08-13 13:56'
+updated_date: '2026-08-13 15:04'
 labels:
   - libp2p
   - daemon
@@ -34,6 +34,29 @@ Consumer of TASK-158. TASK-158 added fabric_libp2p::CatalogNarSupplier + the Cat
 - [ ] #2 the store-dump produced bytes still flow through the announce SSOT NarHash verification (verify_provider_seeds / sign-site guard, TASK-56) - no new announce path bypasses it
 - [ ] #3 container e2e: a provider peer serves a /nix/store path it never held as a .nar file; a consumer discovers via kad and fetches byte-identical bytes; the produced bytes BLAKE3-match the announced content
 <!-- AC:END -->
+
+## Implementation Plan
+
+<!-- SECTION:PLAN:BEGIN -->
+APPROACH (store-supply MVP; loopback bite is the accepted AC#3 proof, container e2e deferred per shared-box + TASK-190 hang):
+
+1. fabric-libp2p: export raw_nar_helper_authorized() (mirror fabric-iroh) so a thin binary can authorize the __dump-raw-nar helper for ProbedSource::RegularFile. Store paths use Process (nix-store --dump) and never invoke the helper; this only makes the RegularFile arm non-vestigial.
+
+2. daemon-libp2p lib: add Libp2pCatalogProbe(SupplyCatalogHandle) newtype bridging daemon-core NarProductionSource -> fabric_libp2p::ProbedSource (exact mirror of daemon/src/iroh_catalog_probe.rs; orphan-rule dodge). Same Blake3Digest type (peer_fabric re-export) so it type-checks.
+
+3. daemon-libp2p lib: refactor sign_libp2p_provider_record to delegate to a content-taking core sign_provider_record_for_content(seed,nar_hash,content,ttl,now,seq); the bytes variant computes content=from_raw_nar(bytes). Single SSOT for the record recipe.
+
+4. daemon-libp2p lib: AC#2 CRUX. Add verify_store_provisions(index,&[NarHashKey]) -> Result<Vec<(NarHashKey,Blake3Digest)>,String>: for each key, index.hold(key) runs the TASK-56 sha256(--dump)==key verify + quarantine; Have{blake3} -> provision carrying the VERIFIED blake3; a NarHashMismatch (quarantine) or Absent (GC'd) FAILS THE WHOLE BATCH (fail-fast, before any announce). This is the store analogue of verify_provider_seeds: the announce content is DERIVED FROM the verified index binding, never the operator's word. Add announce_store_provisions(fabric,index,seed,keys,ttl,now,budget) that calls verify_store_provisions first (all keys), then announces each verified provision (content=verified blake3). No announce path can bypass the gate.
+
+5. daemon-libp2p + daemon binaries: add --libp2p-provide-store <narhash>=<storepath>. install_provider/install_libp2p_provider: remove the BLOCKED-PENDING-TASK-193 guard; build AvailabilityIndex(node_id placeholder, CommandNarDumper::from_path, JsonFileStore under state_dir or NullStore, NullAnnounce); register each; build CatalogNarSupplier(Libp2pCatalogProbe(index.supply_catalog()), current_exe helper); start fabric WITH it; verify+announce via announce_store_provisions. KEEP the AvailabilityIndex ALIVE in the provider guard (its Drop retires the catalog). --libp2p-seed-nar (Memory) path unchanged and can coexist. Add the __dump-raw-nar subcommand to daemon-libp2p main via daemon-core RegularFileNarDumper (no iroh dep).
+
+TESTS (red-green):
+- AC#2 (daemon, no nix): verify_store_provisions ACCEPTS a MemoryNarDumper/RegularFileNarDumper path registered under its true NarHash (verified) and REJECTS one registered under a wrong key (quarantine->refused, never announced). Bite: skip the index gate -> unverified path announced.
+- AC#1 (daemon, no nix): index+MemoryNarDumper -> Libp2pCatalogProbe -> CatalogNarSupplier.plan(blake3) is Some (store path servable via supplier, nothing at rest); bridge maps a Process record to ProbedSource::Process{nix-store --dump path}. Bite: no register/verify -> probe None (not served).
+- AC#3 loopback (fabric two-swarm, extends nar_transport.rs): byte-identical Process serve already exists (process_source_is_served_across_two_nodes); ADD the mismatch bite: a Process source emitting same-length wrong bytes -> provider Declines(SupplyFailed) via produce_admitted BLAKE3 recheck -> consumer fetch fails, NEVER receives wrong bytes.
+
+GATE (bounded): fmt --check; build -p daemon-libp2p -p daemon; clippy -p daemon-libp2p -p daemon -D warnings; check-independence.py; test -p fabric-libp2p -p daemon-libp2p (+ -p daemon). df -h before/after. Commit AC#1/#2+loopback BEFORE any container e2e attempt. Container e2e DEFERRED (TASK-190 hang + shared box) -> file follow-up dep on 191+190. Leave 191 In Progress ready-for-gate; DEEP review (qa+codex).
+<!-- SECTION:PLAN:END -->
 
 ## Implementation Notes
 

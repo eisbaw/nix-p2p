@@ -561,3 +561,78 @@ async fn a_slow_process_serve_does_not_block_the_poll_loop() {
     assert_eq!(bytes, body);
     assert_eq!(Blake3Digest::from_raw_nar(&bytes), content);
 }
+
+/// AC#3 (TASK-191) - the byte-identity bite for the STORE-supply serve, at the two-swarm level.
+/// A Process source (the `nix-store --dump` analogue) whose bytes NO LONGER hash to the announced
+/// content - a store path REBUILT since it was announced, emitting DIFFERENT bytes of the SAME
+/// length so the declared-size admission passes and ONLY the serve-time BLAKE3 recheck can catch
+/// it - must fail the serve LOUD (the provider Declines, `SupplyFailed`), so the consumer's fetch
+/// FAILS and it NEVER receives the wrong bytes under the right name. BITE: drop the
+/// `BLAKE3(RawNarV1) == content` recheck in `produce_supervised` and the provider ships the
+/// rebuilt bytes; the fetch then either succeeds with wrong bytes or trips the consumer's gate-1
+/// IntegrityMismatch instead of this provider-side `Unavailable` decline.
+#[tokio::test]
+async fn a_rebuilt_store_source_is_declined_and_never_ships_wrong_bytes() {
+    let scope = "nar-process-rebuilt";
+    let announced = b"the exact raw NAR bytes announced under this content digest".to_vec();
+    let content = Blake3Digest::from_raw_nar(&announced);
+    // Same LENGTH, different bytes (flip every 'a'->'e', still quote-free ASCII): the size guard
+    // passes and ONLY the serve-time BLAKE3 recheck can catch the drift.
+    let rebuilt: Vec<u8> = announced
+        .iter()
+        .map(|&b| if b == b'a' { b'e' } else { b })
+        .collect();
+    assert_eq!(announced.len(), rebuilt.len(), "same length so only BLAKE3 bites");
+    assert_ne!(announced, rebuilt, "the rebuilt bytes must actually differ");
+    let rebuilt_str = String::from_utf8(rebuilt.clone()).unwrap();
+
+    let (boot, boot_addr) = start_bootstrap(scope).await;
+    let boot_peer = boot.peer_id;
+
+    let (node_a, _addr_a) = start_listening([25u8; 32], scope).await;
+    let supervisor = TaskSupervisor::new();
+    // The probe declares the ANNOUNCED content + size, but its Process regenerates the REBUILT
+    // bytes - exactly a store path whose content drifted since it was announced.
+    let probe = OneProbe {
+        content,
+        declared_size: announced.len() as u64,
+        make: Box::new(move || ProbedSource::Process {
+            program: PathBuf::from("sh"),
+            args: vec![
+                OsString::from("-c"),
+                OsString::from(format!("printf %s '{rebuilt_str}'")),
+            ],
+        }),
+    };
+    let server = Libp2pServer::new(
+        node_a.handle.clone(),
+        Arc::new(CatalogNarSupplier::new(probe, "unused-helper")),
+        supervisor.handle(),
+    );
+    let _serve = server
+        .serve(ServeBudget::default())
+        .await
+        .expect("serve starts");
+    join(&node_a, boot_peer, boot_addr.clone()).await;
+
+    let (node_b, _addr_b) = start_listening([26u8; 32], scope).await;
+    let transport = wire_consumer(&node_b, &node_a, boot_peer, boot_addr.clone()).await;
+    let offer = TransportOffer::Iroh {
+        node: node_a.node_id,
+    };
+
+    let err = transport
+        .fetch(&content, &offer, Some(announced.len() as u64), &envelope())
+        .await
+        .expect_err("a rebuilt store source must fail the fetch, never ship wrong bytes");
+    // The PROVIDER refused before shipping (serve-time recheck), so this is an `Unavailable`
+    // decline - NOT a consumer-side `IntegrityMismatch` (no bytes were shipped to verify) and
+    // certainly not a success. That is the whole point: the wrong bytes never left node A.
+    match err {
+        TransferError::Unavailable(why) => assert!(
+            why.contains("declined") || why.to_lowercase().contains("produce"),
+            "expected a supply-failed decline, got: {why}"
+        ),
+        other => panic!("expected an Unavailable decline (provider refused to ship), got {other}"),
+    }
+}

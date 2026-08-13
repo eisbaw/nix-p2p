@@ -15,14 +15,23 @@ use std::time::Duration;
 
 use daemon_core::cacheinfo::DEFAULT_PRIORITY;
 use daemon_core::{
+    AvailabilityIndex, CommandNarDumper, NarDumper, NodeId, NullAnnounce, NullStore,
+    RegularFileNarDumper, StorePath,
+};
+use daemon_core::{
     CacheInfo, CorrelationStore, NarSource, NarinfoDiskCache, NarinfoSource, NullCorrelation,
     RawUpstream, RunConfig, SystemClock, UpstreamHttp, run,
 };
 use daemon_libp2p::{
-    Libp2pSourceConfig, announce_provider_seeds, build_libp2p_nar_source,
-    build_libp2p_provider_source, resolve_durable_identity_seed,
+    Libp2pCatalogProbe, Libp2pSourceConfig, announce_provider_seeds, announce_store_provisions,
+    build_libp2p_nar_source, build_libp2p_provider_source, resolve_durable_identity_seed,
+    verify_store_provisions,
 };
-use fabric_libp2p::{Libp2pFabric, MemoryNarSupplier, Multiaddr, PeerId};
+use ed25519_dalek::SigningKey;
+use fabric_libp2p::{
+    CatalogNarSupplier, Libp2pFabric, MemoryNarSupplier, Multiaddr, PeerId,
+    raw_nar_helper_authorized,
+};
 use peer_fabric::{
     AnnounceBudget, Axis, DiscoveryBudget, PeerFabric, SafetyEnvelope, ServeBudget, ServeHandle,
     TransportTag,
@@ -51,6 +60,10 @@ struct Config {
     libp2p_identity_seed: Option<[u8; 32]>,
     libp2p_provider: bool,
     libp2p_seed_nar: Vec<(daemon_core::NarHashKey, String)>,
+    /// TASK-191: real `/nix/store` paths served on demand via `nix-store --dump`, holding no
+    /// .nar at rest (`<narhash>=<storepath>`). Verification-gated by the availability index
+    /// (TASK-56) before announce.
+    libp2p_provide_store: Vec<(daemon_core::NarHashKey, String)>,
     libp2p_print_peer_address: bool,
     /// Per-node durable state directory (TASK-185): when set, the fabric persists its
     /// anti-rollback floor + per-key announce sequence here and re-seeds them on restart.
@@ -114,6 +127,7 @@ fn parse_config<I: IntoIterator<Item = String>>(args: I) -> Result<Config, Strin
         libp2p_identity_seed: None,
         libp2p_provider: false,
         libp2p_seed_nar: Vec::new(),
+        libp2p_provide_store: Vec::new(),
         libp2p_print_peer_address: false,
         libp2p_state_dir: None,
     };
@@ -163,6 +177,9 @@ fn parse_config<I: IntoIterator<Item = String>>(args: I) -> Result<Config, Strin
             "--libp2p-provider" => cfg.libp2p_provider = true,
             "--libp2p-state-dir" => cfg.libp2p_state_dir = Some(value()?.into()),
             "--libp2p-seed-nar" => cfg.libp2p_seed_nar.push(parse_libp2p_seed_nar(&value()?)?),
+            "--libp2p-provide-store" => cfg
+                .libp2p_provide_store
+                .push(parse_libp2p_seed_nar(&value()?)?),
             "--libp2p-print-peer-address" => cfg.libp2p_print_peer_address = true,
             other => return Err(format!("unknown flag {other}")),
         }
@@ -171,8 +188,21 @@ fn parse_config<I: IntoIterator<Item = String>>(args: I) -> Result<Config, Strin
     // peer (an empty bootstrap set can never discover anyone) - fail fast, never a silent
     // node that does nothing.
     if cfg.libp2p_provider {
-        if cfg.libp2p_seed_nar.is_empty() {
-            return Err("--libp2p-provider requires at least one --libp2p-seed-nar".into());
+        if cfg.libp2p_seed_nar.is_empty() && cfg.libp2p_provide_store.is_empty() {
+            return Err(
+                "--libp2p-provider requires at least one --libp2p-seed-nar or --libp2p-provide-store"
+                    .into(),
+            );
+        }
+        // MVP scope (TASK-191): one supplier drives the fabric, so the in-memory seed path and
+        // the store-dump path are not combined in a single provider yet. Combining them (a union
+        // supplier) is a filed follow-up; fail fast rather than silently serve only one.
+        if !cfg.libp2p_seed_nar.is_empty() && !cfg.libp2p_provide_store.is_empty() {
+            return Err(
+                "--libp2p-seed-nar and --libp2p-provide-store cannot be combined in one provider \
+                 yet (TASK-191 MVP): use one supply mode"
+                    .into(),
+            );
         }
         if cfg.libp2p_listen.is_none() {
             return Err("--libp2p-provider requires --libp2p-listen".into());
@@ -203,53 +233,35 @@ fn source_config(cfg: &Config) -> Result<Libp2pSourceConfig, String> {
     })
 }
 
-/// Node B (PROVIDER): start the fabric WITH a supplier for the seeded NARs, install the serve
-/// gate under the serve budget, and announce a signed record per seed. Returns the fabric +
-/// the ServeHandle the caller must keep alive for the process (dropping either stops serving).
-async fn install_provider(
-    cfg: &Config,
-    source_cfg: Libp2pSourceConfig,
-) -> Result<(Arc<Libp2pFabric>, ServeHandle), String> {
-    // BLOCKED-PENDING-TASK-193 (do NOT wire a `--libp2p-provide-store` store-dump CLI mode
-    // here yet): the shipped libp2p SERVE loop is synchronous + Memory-only
-    // (fabric-libp2p swarm on_nar_event -> ServeGate::respond -> NarSupplyPlan::produce,
-    // Memory-only). A store-dump-backed `CatalogNarSupplier` (NarSource::Process) would
-    // ANNOUNCE store paths correctly but then DECLINE every serve with SupplyFailed - the
-    // announce-then-decline anti-pattern the seed budget check below guards against. Serving a
-    // real /nix/store path on demand (TASK-191) requires off-worker async supervised
-    // production reachable from the serve loop, carved out as TASK-193; wire the store
-    // supplier + `--libp2p-provide-store` only once that lands.
-    let mut seeds: Vec<(daemon_core::NarHashKey, Vec<u8>)> =
-        Vec::with_capacity(cfg.libp2p_seed_nar.len());
-    for (nar_hash, path) in &cfg.libp2p_seed_nar {
-        let bytes =
-            std::fs::read(path).map_err(|e| format!("reading --libp2p-seed-nar {path:?}: {e}"))?;
-        seeds.push((*nar_hash, bytes));
-    }
+/// What keeps a libp2p PROVIDER serving for the process. Dropping the [`ServeHandle`] stops
+/// admission; the optional [`AvailabilityIndex`] is present in the STORE-supply mode (TASK-191)
+/// because the [`CatalogNarSupplier`] serves through the index's supply catalog and the index's
+/// `Drop` retires every registration - so the served reverse-map must outlive the process.
+struct ProviderGuard {
+    _serve: ServeHandle,
+    _index: Option<Arc<AvailabilityIndex>>,
+}
 
-    let serve_budget = ServeBudget {
+/// The provider serve budget (PROVISIONAL defaults; shared by both supply modes).
+fn provider_serve_budget() -> ServeBudget {
+    ServeBudget {
         max_nar_bytes_uncompressed_nar: DEFAULT_MAX_SERVE_NAR_BYTES,
         max_inflight_bytes_uncompressed_nar: DEFAULT_MAX_INFLIGHT_NAR_BYTES,
         max_serve_duration: Duration::from_millis(DEFAULT_MAX_SERVE_DURATION_MS),
-    };
-    for (nar_hash, bytes) in &seeds {
-        if bytes.len() as u64 > serve_budget.max_nar_bytes_uncompressed_nar {
-            return Err(format!(
-                "seeded NAR {nar_hash} is {} B but the per-NAR serve bound is {}: announcing it \
-                 would publish a claim this node would then decline to serve",
-                bytes.len(),
-                serve_budget.max_nar_bytes_uncompressed_nar
-            ));
-        }
     }
+}
 
-    // A PROVIDER without a durable state dir re-enables the F3 self-rollback (it re-mints
-    // sequence 1 with a fresh random identity after a restart). "Session-scoped by choice" is
-    // fine for a throwaway node, but for a PROVIDER it must not be SILENT - so WARN loudly.
-    // (This warns and continues; it is NOT fail-closed. A hard refusal is the arguably-correct
-    // call now that GB1 makes the state dir load-bearing, but the podman/netns e2e harness and
-    // existing provider invocations start providers without --libp2p-state-dir, so fail-closed
-    // is deferred to TASK-188 alongside the harness updates.)
+/// UNIX seconds now (0 on a pre-epoch clock, matching the seed path).
+fn now_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// Warn loudly (not fail-closed) that a PROVIDER without a durable state dir re-enables the F3
+/// self-rollback. Shared by both supply modes; fail-closed is deferred to TASK-188.
+fn warn_if_non_durable_provider(source_cfg: &Libp2pSourceConfig) {
     if source_cfg.state_dir.is_none() {
         eprintln!(
             "daemon-libp2p: WARNING: --libp2p-state-dir is not set; this PROVIDER runs \
@@ -259,36 +271,23 @@ async fn install_provider(
              --libp2p-state-dir <dir> for restart-durable operation."
         );
     }
+}
 
-    let identity_seed = source_cfg.identity_seed;
-    let supplier = Arc::new(MemoryNarSupplier::new(seeds.iter().map(|(_, b)| b.clone())));
-    let (fabric, _source, _raw) = build_libp2p_provider_source(source_cfg, supplier).await?;
-
-    let serve = fabric
-        .server()
-        .ok_or_else(|| "internal: libp2p provider fabric has no serve axis".to_string())?
-        .serve(serve_budget)
-        .await
-        .map_err(|e| format!("libp2p serve gate failed to install: {e}"))?;
-
-    let announce_budget = AnnounceBudget::new(Duration::from_secs(10), 20);
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
-    // The shared SSOT provider announce loop (durable-allocate -> sign -> announce), the same
-    // one the restart-durability test exercises (TASK-185 GB2).
-    let records =
-        announce_provider_seeds(&fabric, identity_seed, &seeds, 3600, now, &announce_budget)
-            .await?;
-    for (record, (nar_hash, bytes)) in records.iter().zip(&seeds) {
-        println!(
-            "LIBP2P-SEED narhash={nar_hash} content={} content_key={} bytes={}",
-            record.content.to_hex(),
-            record.key,
-            bytes.len()
-        );
-    }
+/// Node B (PROVIDER): start the fabric WITH a supplier, install the serve gate, and announce.
+/// Two supply modes (mutually exclusive at the CLI, TASK-191 MVP): the in-memory `--libp2p-seed-nar`
+/// path (holds the .nar at rest) and the `--libp2p-provide-store` path (serves a real `/nix/store`
+/// path via `nix-store --dump` on demand, holding no .nar at rest). Returns the fabric + the
+/// [`ProviderGuard`] the caller must keep alive for the process.
+async fn install_provider(
+    cfg: &Config,
+    source_cfg: Libp2pSourceConfig,
+) -> Result<(Arc<Libp2pFabric>, ProviderGuard), String> {
+    warn_if_non_durable_provider(&source_cfg);
+    let (fabric, guard) = if !cfg.libp2p_provide_store.is_empty() {
+        install_store_provider(cfg, source_cfg).await?
+    } else {
+        install_seed_provider(cfg, source_cfg).await?
+    };
 
     if cfg.libp2p_print_peer_address {
         let listen_addrs = fabric.handle().listen_addrs().await;
@@ -307,11 +306,240 @@ async fn install_provider(
             fabric.peer_id()
         );
     }
-    Ok((fabric, serve))
+    Ok((fabric, guard))
+}
+
+/// The in-memory seed supply mode (TASK-178): serve the `--libp2p-seed-nar` raw NARs from a
+/// [`MemoryNarSupplier`] (holding them at rest) and announce a signed record per seed.
+async fn install_seed_provider(
+    cfg: &Config,
+    source_cfg: Libp2pSourceConfig,
+) -> Result<(Arc<Libp2pFabric>, ProviderGuard), String> {
+    let mut seeds: Vec<(daemon_core::NarHashKey, Vec<u8>)> =
+        Vec::with_capacity(cfg.libp2p_seed_nar.len());
+    for (nar_hash, path) in &cfg.libp2p_seed_nar {
+        let bytes =
+            std::fs::read(path).map_err(|e| format!("reading --libp2p-seed-nar {path:?}: {e}"))?;
+        seeds.push((*nar_hash, bytes));
+    }
+
+    let serve_budget = provider_serve_budget();
+    for (nar_hash, bytes) in &seeds {
+        if bytes.len() as u64 > serve_budget.max_nar_bytes_uncompressed_nar {
+            return Err(format!(
+                "seeded NAR {nar_hash} is {} B but the per-NAR serve bound is {}: announcing it \
+                 would publish a claim this node would then decline to serve",
+                bytes.len(),
+                serve_budget.max_nar_bytes_uncompressed_nar
+            ));
+        }
+    }
+
+    let identity_seed = source_cfg.identity_seed;
+    let supplier = Arc::new(MemoryNarSupplier::new(seeds.iter().map(|(_, b)| b.clone())));
+    let (fabric, _source, _raw) = build_libp2p_provider_source(source_cfg, supplier).await?;
+
+    let serve = fabric
+        .server()
+        .ok_or_else(|| "internal: libp2p provider fabric has no serve axis".to_string())?
+        .serve(serve_budget)
+        .await
+        .map_err(|e| format!("libp2p serve gate failed to install: {e}"))?;
+
+    let announce_budget = AnnounceBudget::new(Duration::from_secs(10), 20);
+    // The shared SSOT provider announce loop (durable-allocate -> sign -> announce), the same
+    // one the restart-durability test exercises (TASK-185 GB2).
+    let records = announce_provider_seeds(
+        &fabric,
+        identity_seed,
+        &seeds,
+        3600,
+        now_secs(),
+        &announce_budget,
+    )
+    .await?;
+    for (record, (nar_hash, bytes)) in records.iter().zip(&seeds) {
+        println!(
+            "LIBP2P-SEED narhash={nar_hash} content={} content_key={} bytes={}",
+            record.content.to_hex(),
+            record.key,
+            bytes.len()
+        );
+    }
+    Ok((
+        fabric,
+        ProviderGuard {
+            _serve: serve,
+            _index: None,
+        },
+    ))
+}
+
+/// The STORE-supply mode (TASK-191, the store-supply MVP): serve real `/nix/store` paths from a
+/// [`CatalogNarSupplier`] over the daemon's [`AvailabilityIndex`], regenerating each on demand
+/// via `nix-store --dump` and holding NO .nar at rest. The announce is verification-gated
+/// (AC#2): [`verify_store_provisions`] runs the index's TASK-56 `sha256(--dump) == NarHash`
+/// check + quarantine for every path BEFORE any record is signed, and each announced `content`
+/// is the index's VERIFIED digest, never the operator's word.
+async fn install_store_provider(
+    cfg: &Config,
+    source_cfg: Libp2pSourceConfig,
+) -> Result<(Arc<Libp2pFabric>, ProviderGuard), String> {
+    let serve_budget = provider_serve_budget();
+    let identity_seed = source_cfg.identity_seed;
+
+    // The availability index over the REAL store: a `nix-store --dump` producer (CommandNarDumper
+    // -> a ProbedSource::Process source, so the CatalogNarSupplier regenerates on demand and holds
+    // nothing at rest). NullStore: the provided set is the CLI SSOT, re-registered + re-verified
+    // each boot (persisting the store index across restarts is a TASK-82 follow-up). NullAnnounce:
+    // claims are announced through the libp2p announcer below, not the index's iroh sink. The
+    // `node_id` is this node's ed25519 identity for completeness; the libp2p ProviderRecord
+    // carries its OWN provider identity, so the index's iroh offer is never consulted here.
+    let node_id = NodeId::from_bytes(
+        SigningKey::from_bytes(&identity_seed)
+            .verifying_key()
+            .to_bytes(),
+    );
+    let index = AvailabilityIndex::open(
+        node_id,
+        Arc::new(CommandNarDumper::from_path()) as Arc<dyn NarDumper>,
+        Arc::new(NullStore),
+        Arc::new(NullAnnounce),
+    )
+    .map_err(|e| format!("opening the availability index for store supply: {e}"))?;
+    let mut nar_hashes = Vec::with_capacity(cfg.libp2p_provide_store.len());
+    for (nar_hash, path) in &cfg.libp2p_provide_store {
+        index
+            .register(*nar_hash, StorePath::new(path))
+            .map_err(|e| format!("registering store path {path:?} under {nar_hash}: {e}"))?;
+        nar_hashes.push(*nar_hash);
+    }
+    let index = Arc::new(index);
+
+    // The supplier reads the index's inert reverse-map (verified digest -> store path). The helper
+    // program is THIS binary's `__dump-raw-nar` mode, spawned ONLY for a ProbedSource::RegularFile;
+    // a real store path is a ProbedSource::Process (nix-store --dump) and never invokes it.
+    let helper_program = std::env::current_exe()
+        .map_err(|e| format!("resolving daemon-libp2p executable for the raw-NAR helper: {e}"))?;
+    let supplier = Arc::new(CatalogNarSupplier::new(
+        Libp2pCatalogProbe::new(index.supply_catalog()),
+        helper_program,
+    ));
+    let (fabric, _source, _raw) = build_libp2p_provider_source(source_cfg, supplier).await?;
+
+    let serve = fabric
+        .server()
+        .ok_or_else(|| "internal: libp2p provider fabric has no serve axis".to_string())?
+        .serve(serve_budget)
+        .await
+        .map_err(|e| format!("libp2p serve gate failed to install: {e}"))?;
+
+    // AC#2 gate: verify EVERY provided store path through the index (dump + sha256==NarHash +
+    // quarantine) before any announce; a quarantined/absent path fails the whole batch here.
+    let provisions = verify_store_provisions(&index, &nar_hashes)?;
+    // Store analogue of the seed-size guard: refuse to announce a path whose verified NarSize is
+    // over the per-NAR serve bound (it would publish a claim this node then declines TooLarge).
+    for provision in &provisions {
+        if provision.declared_size() > serve_budget.max_nar_bytes_uncompressed_nar {
+            return Err(format!(
+                "store path for {} dumps to {} B (uncompressed NAR) but the per-NAR serve bound \
+                 is {}: announcing it would publish a claim this node would then decline to serve",
+                provision.nar_hash(),
+                provision.declared_size(),
+                serve_budget.max_nar_bytes_uncompressed_nar
+            ));
+        }
+    }
+
+    let announce_budget = AnnounceBudget::new(Duration::from_secs(10), 20);
+    let records = announce_store_provisions(
+        &fabric,
+        identity_seed,
+        &provisions,
+        3600,
+        now_secs(),
+        &announce_budget,
+    )
+    .await?;
+    for (record, provision) in records.iter().zip(&provisions) {
+        println!(
+            "LIBP2P-PROVIDE-STORE narhash={} content={} content_key={} nar_size={}",
+            provision.nar_hash(),
+            record.content.to_hex(),
+            record.key,
+            provision.declared_size(),
+        );
+    }
+    Ok((
+        fabric,
+        ProviderGuard {
+            _serve: serve,
+            _index: Some(index),
+        },
+    ))
+}
+
+/// A never-cancelling [`daemon_core::availability::CancellationCheck`] for the one-shot
+/// `__dump-raw-nar` helper: the parent process owns the timeout/kill via the supervised process
+/// group, so the in-process read itself does not self-cancel.
+struct NeverCancel;
+
+impl daemon_core::availability::CancellationCheck for NeverCancel {
+    fn is_cancelled(&self) -> bool {
+        false
+    }
+}
+
+/// The internal raw-NAR helper subprocess mode (`daemon-libp2p __dump-raw-nar <path>`): dump a
+/// raw-NAR REGULAR FILE to stdout for a [`fabric_libp2p::ProbedSource::RegularFile`] serve, run in
+/// an owned, killable, stdout-capped process group by the [`CatalogNarSupplier`]'s supervisor. It
+/// is authorized ONLY by the env guard that supply path sets (`raw_nar_helper_authorized`), so it
+/// is not a user-invokable mode. Store paths are served by `nix-store --dump` (a Process source)
+/// and never reach this. Handled before any flag parsing, mirroring the `daemon` binary.
+fn run_raw_nar_helper() -> Option<ExitCode> {
+    use std::io::Write;
+    let mut raw = std::env::args_os().skip(1);
+    if raw.next().as_deref() != Some(std::ffi::OsStr::new(fabric_libp2p::RAW_NAR_HELPER_ARG)) {
+        return None;
+    }
+    if !raw_nar_helper_authorized() {
+        eprintln!("daemon-libp2p: __dump-raw-nar is an internal supervised subprocess mode");
+        return Some(ExitCode::from(2));
+    }
+    let Some(path) = raw.next() else {
+        eprintln!("daemon-libp2p: __dump-raw-nar requires exactly one path");
+        return Some(ExitCode::from(2));
+    };
+    if raw.next().is_some() {
+        eprintln!("daemon-libp2p: __dump-raw-nar accepts exactly one path");
+        return Some(ExitCode::from(2));
+    }
+    let bytes = match RegularFileNarDumper.dump(&StorePath::new(path), &NeverCancel) {
+        Ok(bytes) => bytes,
+        Err(error) => {
+            eprintln!("daemon-libp2p: __dump-raw-nar failed: {error}");
+            return Some(ExitCode::FAILURE);
+        }
+    };
+    let stdout = std::io::stdout();
+    let mut locked = stdout.lock();
+    match locked.write_all(&bytes).and_then(|()| locked.flush()) {
+        Ok(()) => Some(ExitCode::SUCCESS),
+        Err(error) => {
+            eprintln!("daemon-libp2p: __dump-raw-nar failed writing stdout: {error}");
+            Some(ExitCode::FAILURE)
+        }
+    }
 }
 
 #[tokio::main]
 async fn main() -> ExitCode {
+    // Internal process-isolation boundary for raw-file supply, handled before configuration:
+    // the parent owns this process group, caps stdout, and kills/reaps it on cancel/shutdown.
+    if let Some(code) = run_raw_nar_helper() {
+        return code;
+    }
+
     let cfg = match parse_config(std::env::args().skip(1)) {
         Ok(cfg) => cfg,
         Err(err) => {
@@ -359,18 +587,24 @@ async fn main() -> ExitCode {
         Axis::Transfer(TransportTag::Iroh),
     ];
 
-    // Keep the provider serve gate alive for the process (dropping it stops serving).
-    let _serve_guard: Option<ServeHandle>;
+    // Keep the provider serve gate (and, in store-supply mode, its availability index) alive for
+    // the process (dropping the guard stops serving / retires the served reverse-map).
+    let _serve_guard: Option<ProviderGuard>;
     let fabric: Arc<Libp2pFabric> = if cfg.libp2p_provider {
         required_axes.push(Axis::Server);
         required_axes.push(Axis::Announcer);
         match install_provider(&cfg, source_cfg).await {
-            Ok((fabric, serve)) => {
-                _serve_guard = Some(serve);
-                println!(
-                    "daemon-libp2p: PROVIDER serving + announcing {} seeded NAR(s)",
-                    cfg.libp2p_seed_nar.len()
-                );
+            Ok((fabric, guard)) => {
+                _serve_guard = Some(guard);
+                let supplied = if cfg.libp2p_provide_store.is_empty() {
+                    format!("{} seeded NAR(s)", cfg.libp2p_seed_nar.len())
+                } else {
+                    format!(
+                        "{} /nix/store path(s) on demand",
+                        cfg.libp2p_provide_store.len()
+                    )
+                };
+                println!("daemon-libp2p: PROVIDER serving + announcing {supplied}");
                 fabric
             }
             Err(err) => {

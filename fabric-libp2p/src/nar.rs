@@ -500,6 +500,17 @@ pub const RAW_NAR_HELPER_ARG: &str = "__dump-raw-nar";
 const RAW_NAR_HELPER_ENV: &str = "DAEMON_INTERNAL_RAW_NAR_HELPER";
 const RAW_NAR_HELPER_VALUE: &str = "v1";
 
+/// Whether THIS process was spawned as the daemon's raw-NAR helper (`helper __dump-raw-nar
+/// <path>`) by a [`CatalogNarSupplier`] serving a [`ProbedSource::RegularFile`] - i.e. the
+/// authorizing env guard set by [`raw_nar_helper_environment`] is present. A thin binary's
+/// `fn main` calls this to gate its `__dump-raw-nar` subcommand, so the raw-file dumper can
+/// only be reached through the supervised supply path, never as a user-invokable mode
+/// (mirrors `fabric-iroh`'s `raw_nar_helper_authorized`). Store paths are served by a
+/// [`ProbedSource::Process`] (`nix-store --dump`) and never spawn this helper.
+pub fn raw_nar_helper_authorized() -> bool {
+    std::env::var(RAW_NAR_HELPER_ENV).ok().as_deref() == Some(RAW_NAR_HELPER_VALUE)
+}
+
 fn raw_nar_helper_environment() -> Vec<(OsString, OsString)> {
     vec![(
         OsString::from(RAW_NAR_HELPER_ENV),

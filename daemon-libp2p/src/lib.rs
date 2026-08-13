@@ -48,6 +48,10 @@ use peer_fabric::{
 use daemon_core::claim::NarHashKey;
 use daemon_core::rewrite::RawServeDecision;
 use daemon_core::source::NarSource;
+use daemon_core::{AvailabilityIndex, HoldAnswer};
+
+mod store_probe;
+pub use store_probe::Libp2pCatalogProbe;
 
 // The generic PeerFabric-backed NarSource + raw-serve decision moved into `daemon-core`
 // (TASK-146): they were ALREADY generic over `Arc<dyn PeerFabric>` - only their
@@ -228,10 +232,54 @@ pub fn sign_libp2p_provider_record(
     now: u64,
     sequence: u64,
 ) -> ProviderRecord {
+    // The `--libp2p-seed-nar` (Memory) path holds the raw NAR bytes, so it derives the content
+    // digest FROM those bytes. The store-supply path (TASK-191) has no bytes at announce time;
+    // it takes the VERIFIED digest straight from the availability index (see
+    // [`sign_libp2p_store_record`]). Both funnel through the ONE record recipe below.
+    sign_libp2p_record_for_content(
+        seed,
+        nar_hash,
+        Blake3Digest::from_raw_nar(nar_bytes),
+        ttl_secs,
+        now,
+        sequence,
+    )
+}
+
+/// Build + SIGN a [`ProviderRecord`] for a store path this node serves on demand (TASK-191),
+/// taking the raw-NAR `content` [`Blake3Digest`] DIRECTLY rather than re-hashing bytes it does
+/// not hold. The `content` MUST be the availability index's VERIFIED
+/// (`sha256(--dump) == nar_hash`, TASK-56) `Blake3Digest` for `nar_hash` - see
+/// [`verify_store_provisions`], the store analogue of [`verify_provider_seeds`], which is the
+/// only sanctioned source of a `(nar_hash, content)` provision. This is the store-supply
+/// sign-site: it never mints a record from the operator's word, only from a verified binding.
+pub fn sign_libp2p_store_record(
+    seed: [u8; 32],
+    nar_hash: &NarHashKey,
+    content: Blake3Digest,
+    ttl_secs: u64,
+    now: u64,
+    sequence: u64,
+) -> ProviderRecord {
+    sign_libp2p_record_for_content(seed, nar_hash, content, ttl_secs, now, sequence)
+}
+
+/// The SINGLE record recipe both the seed (Memory) and store (dump-on-demand) announce paths
+/// share: derive the discovery [`ContentKey`] from the Nix `nar_hash`, carry the raw-NAR
+/// `content` digest the transfer/serve keys on and gate-1 BLAKE3-verifies, and self-serve under
+/// this node's own identity. Keeping it in one place means the two paths cannot drift on the
+/// key-derivation / signing / offer recipe.
+fn sign_libp2p_record_for_content(
+    seed: [u8; 32],
+    nar_hash: &NarHashKey,
+    content: Blake3Digest,
+    ttl_secs: u64,
+    now: u64,
+    sequence: u64,
+) -> ProviderRecord {
     let signing_key = SigningKey::from_bytes(&seed);
     let provider = NodeId::from_bytes(signing_key.verifying_key().to_bytes());
     let key = ContentKey::derive_from_signed_nar_hash(nar_hash.as_bytes());
-    let content = Blake3Digest::from_raw_nar(nar_bytes);
     let record = ProviderRecord {
         key,
         content,
@@ -523,6 +571,161 @@ pub async fn announce_provider_seeds(
             .announce(&record, budget)
             .await
             .map_err(|e| format!("announcing libp2p provider record for {nar_hash}: {e}"))?;
+        records.push(record);
+    }
+    Ok(records)
+}
+
+/// One VERIFIED store-supply provision: a `nar_hash` this node will announce, the availability
+/// index's VERIFIED raw-NAR [`Blake3Digest`] for it, and its declared (uncompressed) `NarSize`.
+///
+/// It is a CAPABILITY, not a plain record: its fields are private and it has NO public
+/// constructor, so the ONLY way to obtain one is [`verify_store_provisions`], which mints it
+/// only after the availability index's TASK-56 `sha256(--dump) == nar_hash` check passed.
+/// [`announce_store_provisions`] consumes `&[StoreProvision]`, so - by the type system - a
+/// record can never be announced for a store path that was not verification-gated. This is the
+/// store analogue of the `verify_provider_seeds`-before-`announce_provider_seeds` discipline,
+/// made un-bypassable rather than merely conventional.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StoreProvision {
+    nar_hash: NarHashKey,
+    content: Blake3Digest,
+    declared_size: u64,
+}
+
+impl StoreProvision {
+    /// The Nix NarHash the store path was registered under (the discovery key a consumer looks
+    /// this provider up by).
+    pub fn nar_hash(&self) -> &NarHashKey {
+        &self.nar_hash
+    }
+
+    /// The raw-NAR `BLAKE3(RawNarV1)` the index VERIFIED this path dumps to (TASK-56) - the
+    /// `content` the announced record advertises and the serve path gate-1 BLAKE3-verifies.
+    pub fn content(&self) -> Blake3Digest {
+        self.content
+    }
+
+    /// The declared UNCOMPRESSED NAR size (the index's persisted `NarSize`, NOT a compressed
+    /// FileSize), learned WITHOUT re-dumping - the admission size a serve budget checks. A
+    /// caller refuses to announce a provision over its per-NAR serve bound with this, so it does
+    /// not publish a claim it would then decline (the store analogue of the seed-size guard).
+    pub fn declared_size(&self) -> u64 {
+        self.declared_size
+    }
+}
+
+/// The STORE analogue of [`verify_provider_seeds`] (AC#2, TASK-191): gate the store-supply
+/// announce on the TASK-56 verification, deriving each provision's advertised content FROM the
+/// availability index's verified binding rather than the operator's word.
+///
+/// For each `nar_hash`, [`AvailabilityIndex::hold`] runs the TASK-56 index-side check - dump the
+/// store path, assert `sha256(--dump) == nar_hash`, QUARANTINE a mismatch - and, on success,
+/// publishes the reverse-map record into the supply catalog (so the [`Libp2pCatalogProbe`]-backed
+/// [`fabric_libp2p::CatalogNarSupplier`] can then serve it) and returns the VERIFIED
+/// `Blake3Digest`. The whole batch is refused (fail-fast, BEFORE any record is signed or
+/// announced) if ANY key:
+///   * QUARANTINED - the store path dumps to a different NarHash (a mis-registration); or
+///   * `Absent` - the store path is not materialised (never registered here, or GC'd); or
+///   * errors in the dump/persist.
+///
+/// So a store path the index quarantined or never verified is NEVER announced, and there is no
+/// parallel unverified announce path: the ONLY way to obtain a [`StoreProvision`] is through this
+/// gate. The returned provisions carry the verified digest, which [`sign_libp2p_store_record`]
+/// advertises as the record `content`.
+///
+/// BLOCKING NOTE: `hold` shells out to `nix-store --dump` under a per-entry lock (a blocking
+/// dump). This runs at provider STARTUP, once per provided path, before the serve loop begins,
+/// so the brief block is acceptable; a large provided set on an async runtime should drive this
+/// via `spawn_blocking` (a follow-up, not a correctness gap).
+pub fn verify_store_provisions(
+    index: &AvailabilityIndex,
+    nar_hashes: &[NarHashKey],
+) -> Result<Vec<StoreProvision>, String> {
+    let catalog = index.supply_catalog();
+    let mut provisions = Vec::with_capacity(nar_hashes.len());
+    for nar_hash in nar_hashes {
+        match index.hold(nar_hash).map_err(|e| {
+            format!(
+                "verifying store provision {nar_hash} against the availability index: {e}; \
+                 refusing to announce a store path the index has not verified"
+            )
+        })? {
+            HoldAnswer::Have { blake3, .. } => {
+                // `hold` just PUBLISHED the reverse-map record (verified digest -> store path)
+                // into the supply catalog, so its declared NarSize is now readable here without
+                // a re-dump. Its absence would mean the record was retired between hold and now
+                // (a concurrent unregister) - fail loud rather than announce a size we cannot
+                // confirm.
+                let declared_size = catalog
+                    .probe_record(&blake3)
+                    .map(|r| r.declared_size)
+                    .ok_or_else(|| {
+                        format!(
+                            "store provision {nar_hash} verified to {blake3} but its supply record \
+                         vanished before its size could be read; refusing to announce"
+                        )
+                    })?;
+                provisions.push(StoreProvision {
+                    nar_hash: *nar_hash,
+                    content: blake3,
+                    declared_size,
+                });
+            }
+            HoldAnswer::Absent => {
+                return Err(format!(
+                    "store provision {nar_hash} is not held by the availability index (the store \
+                     path is unregistered or no longer materialised); refusing to announce a \
+                     claim this node cannot serve"
+                ));
+            }
+        }
+    }
+    Ok(provisions)
+}
+
+/// Announce a signed [`ProviderRecord`] for each VERIFIED store [`StoreProvision`] this node
+/// serves on demand (AC#1/#2, TASK-191), the store analogue of [`announce_provider_seeds`].
+///
+/// It consumes only [`StoreProvision`]s, which - being an un-forgeable capability minted solely
+/// by [`verify_store_provisions`] - GUARANTEES every announced `content` came from the index's
+/// TASK-56-verified binding, never the operator's word. For each, it durably allocates the
+/// announce sequence, signs a record whose `content` is the verified digest (via
+/// [`sign_libp2p_store_record`]), and publishes it under `budget`. Returns the announced records
+/// (index-aligned with `provisions`).
+///
+/// The reverse-map the served bytes come from was published by `verify_store_provisions`'s
+/// `hold` call, so by the time this returns a consumer that discovers this node under the derived
+/// [`ContentKey`] can fetch it, and the `fabric-libp2p` serve path re-runs the len + BLAKE3
+/// recheck (TASK-158/193) as the last-line integrity anchor.
+pub async fn announce_store_provisions(
+    fabric: &Libp2pFabric,
+    identity_seed: [u8; 32],
+    provisions: &[StoreProvision],
+    ttl_secs: u64,
+    now: u64,
+    budget: &AnnounceBudget,
+) -> Result<Vec<ProviderRecord>, String> {
+    let announcer = fabric
+        .announcer()
+        .ok_or_else(|| "internal: libp2p provider fabric exposes no announcer".to_string())?;
+    let mut records = Vec::with_capacity(provisions.len());
+    for provision in provisions {
+        let sequence = fabric.next_announce_sequence(&provider_content_key(&provision.nar_hash));
+        let record = sign_libp2p_store_record(
+            identity_seed,
+            &provision.nar_hash,
+            provision.content,
+            ttl_secs,
+            now,
+            sequence,
+        );
+        announcer.announce(&record, budget).await.map_err(|e| {
+            format!(
+                "announcing libp2p store provider record for {}: {e}",
+                provision.nar_hash
+            )
+        })?;
         records.push(record);
     }
     Ok(records)
