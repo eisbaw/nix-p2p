@@ -7,7 +7,7 @@ title: >-
 status: To Do
 assignee: []
 created_date: '2026-08-13 06:13'
-updated_date: '2026-08-13 06:40'
+updated_date: '2026-08-13 07:31'
 labels:
   - fabric-libp2p
   - daemon-libp2p
@@ -43,4 +43,18 @@ FORWARD-CARRIED LESSONS from TASK-185 (do not rediscover):
 
 <!-- SECTION:NOTES:BEGIN -->
 MPED-review addendum (from TASK-185 review): F4(b) is NOT merely a fixed-.tmp clobber. The real hazard is a LOST-UPDATE / restart-rollback race in persist::write_atomic: the announcer snapshots its per-key map UNDER the lock but writes OUTSIDE the lock, so two concurrent announce calls (even for DIFFERENT keys) can each take a snapshot and then race the rename - a writer holding an OLDER snapshot can land AFTER a newer one and DROP the newer key's durable sequence advance from disk, even though that announce already returned Ok and published (a restart-rollback for that key). A unique per-write temp name does NOT close this (the lost update is at the rename, not the temp). The FIX is to make snapshot+write ONE serialized critical section (or a persistence mutex / an flock). SAFE TODAY only because the shipped provider announce loop (install_provider) is strictly sequential (one awaited announce per seed). Fold this into the P4 advisory-lock / F4 integrity work.
+
+TASK-185 DEEP-gate (codex) addenda — correct severities + new items:
+
+GB3 CORRECTION (withdraw ordering is NOT harmless): TASK-185's earlier note called the withdraw publish-before-save 'harmless since re-mint is idempotent'. That is FALSE. Real failure: disk floor N; withdraw publishes tombstone N+1; CRASH before the save; restart reloads N; the positive allocator (next_sequence) re-issues N+1 for a NEW announce; consumers that already hold the tombstone reject the new positive record as an equal-sequence conflict, while fresh consumers accept it -> the network SPLITS between a withdrawn view and an active view. Severity: genuine rollback/split integrity hole (not cosmetic). FIX (in 188): make withdraw SAVE-BEFORE-PUBLISH too (persist the advanced tombstone floor before the put_record), symmetric with announce.
+
+FAIL-CLOSED PROVIDER (deferred from GB3/L1): TASK-185 kept the provider WARN-and-continue (not fail-closed) when --libp2p-state-dir is absent, because scripts/e2e_harness.py starts libp2p providers WITHOUT --libp2p-state-dir (it only passes --iroh-state-dir). Flip the provider path to FAIL-CLOSED (refuse to start a provider without durable state, now that identity+sequence both need it) AND update e2e_harness.py to pass --libp2p-state-dir (add it next to --iroh-state-dir, using the existing per-role state_dir()).
+
+F5 (default is non-durable; only providers warn): a default CONSUMER that observed seq 10, restarts without --libp2p-state-dir, loses its floor and will admit a seq-1 replay/rollback with NO warning. Consider warning the consumer too, or a fail-closed durable default.
+
+F6 (consumer durable mode is fail-OPEN): FloorStore::durable turns a load failure into an EMPTY floor (floor_store.rs), a save failure only logs while STILL admitting the record (floor_store.rs persist path / persist.rs save_floors), and load_seqs/load_floors start fresh on a read error (persist.rs). So an unwritable/malformed state dir SILENTLY disables anti-rollback. In durable mode this should FAIL-CLOSED (refuse admission, or refuse to start) on a durable-mode IO/parse error, not degrade silently. (Contrast: TASK-185 already made the ANNOUNCE seq-save fail-closed and the persisted IDENTITY malformed-file fail-closed; the consumer floor is the remaining fail-open.)
+
+PLAUSIBLE-a (parent-of-state-dir fsync): first-ever creation of the state dir fsyncs the file and the immediate parent (the state dir) but NOT the state dir's PARENT, so a power loss right after the first announce can lose the state dir's directory entry. Fsync up one more level on first creation.
+
+PLAUSIBLE-b (sequence overflow): next_sequence does last.sequence + 1 and withdrawal minting does last+1 with no overflow guard; a corrupted seq file carrying u64::MAX wraps to 0 in release (a silent rollback) or panics in debug. Handle fail-closed (reject a u64::MAX-or-corrupt floor line on load, or saturate + refuse to publish).
 <!-- SECTION:NOTES:END -->
