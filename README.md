@@ -11,6 +11,10 @@ peer costs a retry, never a bad store path.
 The aim is **bandwidth offload for cache.nixos.org — decentralizing the bytes, not
 the trust.** Signing stays the cache's job.
 
+**See it run:** `nix develop` then `just e2e` stands up separate daemon containers
+and drives a real `nix build` whose NAR is discovered, resolved, fetched, and
+served **from a peer** — no injected addresses, upstream untouched on a hit.
+
 > **Research prototype.** It has not been pointed at the real cache.nixos.org (the
 > daemon is plain-HTTP; TLS is future work) and has not faced a public network — no
 > NAT hole-punching, no relay, no residential uplink. It runs on loopback,
