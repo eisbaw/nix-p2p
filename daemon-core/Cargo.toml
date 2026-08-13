@@ -35,6 +35,22 @@ async-trait = "0.1"
 # JSON as the draft codec, fail-closed decode. DAEMON-SIDE only (testproxy stays std-only).
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+# TLS upstream client (TASK-24): front cache.nixos.org over https on the SAME
+# `UpstreamHttp::send` path, preserving verbatim byte forwarding + no
+# auto-decompression. rustls over `ring` (the crypto provider iroh already locks;
+# `default-features = false` + `ring` keeps aws-lc-rs OUT of the closure and the
+# Cargo.lock unchanged). tokio-rustls wraps the TCP stream BEFORE hyper's http1
+# handshake. webpki-roots supplies the Mozilla public-CA trust anchors as a
+# COMPILED-IN, filesystem-free bundle (deterministic + Nix-sandbox-safe) that
+# reaches the real CDN; `UpstreamHttp::with_root_store` accepts operator/fixture
+# roots for the "configured roots" path. The default rustls WebPkiServerVerifier
+# validates the chain AND the hostname/SNI - there is NO insecure-skip-verify in
+# any production API (AC#3). DAEMON-SIDE and NOT an HTTP-logic crate, so the
+# independence HTTP-stack denylist is unaffected; TASK-22 (testproxy TLS) MUST
+# adopt a DIFFERENT TLS crate so the fixture stays an independent wire witness.
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12", "logging"] }
+webpki-roots = "1"
 # BLAKE3 of the addressed unit (task-48 freeze): the raw-NAR content identity recipe.
 blake3 = "1"
 # sha256 of the raw NAR = the Nix NarHash (task-56): the availability index re-derives
@@ -50,6 +66,14 @@ rustix = { version = "1", features = ["fs"] }
 # The serving-core in-process integration tests moved here with the modules; several stand
 # up fake NAR sources + drive time.
 tokio = { version = "1", features = ["rt-multi-thread", "net", "macros", "io-util", "time", "sync", "test-util"] }
+# TASK-24 TLS tests: a fixture CA (rcgen, ring backend - default features are
+# already ring-based, pinned explicit here so a future rcgen default cannot pull
+# aws-lc-rs) issues a valid-hostname leaf plus the wrong-hostname / expired /
+# untrusted-self-signed negatives, driven against an in-process tokio-rustls
+# server. flate2 builds a REAL gzip body for the verbatim-over-TLS bite (a
+# decoding layer would change the bytes; hyper's low-level client has none).
+rcgen = { version = "0.14", default-features = false, features = ["crypto", "ring", "pem"] }
+flate2 = "1"
 
 [lints]
 workspace = true

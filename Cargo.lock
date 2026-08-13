@@ -957,6 +957,7 @@ dependencies = [
  "async-trait",
  "blake3",
  "bytes",
+ "flate2",
  "http 1.5.0",
  "http-body 1.1.0",
  "http-body-util",
@@ -964,11 +965,15 @@ dependencies = [
  "hyper-util",
  "peer-fabric",
  "proc-supervisor",
+ "rcgen 0.14.8",
  "rustix",
+ "rustls",
  "serde",
  "serde_json",
  "sha2 0.10.9",
  "tokio",
+ "tokio-rustls",
+ "webpki-roots",
 ]
 
 [[package]]
