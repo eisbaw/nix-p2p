@@ -5,7 +5,7 @@ status: In Progress
 assignee:
   - Mark Ruvald Pedersen
 created_date: '2026-08-08 07:30'
-updated_date: '2026-08-13 12:38'
+updated_date: '2026-08-13 12:56'
 labels:
   - testproxy
   - follow-up
@@ -65,4 +65,12 @@ RED-GREEN bites PROVEN by mutation:
 - AC#5: neuter handshake deadline to 10x => stall test took 3.05s > 1.3s bound => FAIL.
 
 BOUNDED gate (in nix develop; did NOT run full just build/test per TASK-190 hang): fmt --check OK; clippy -p testproxy -D warnings clean; build -p testproxy --locked OK; check-independence.py green; cargo test -p testproxy 31+1(ignored network)+2+7+6+1+0 all pass. df ~115G free throughout.
+
+--- AC#5 re-fix (codex DEEP gate #1 NO-GO: idle-timeout regression) ---
+DEFECT: the handshake deadline was set_read_timeout(handshake_cap) - a PER-READ IDLE timeout, not the absolute tls-upstream-v1 deadline. A slow-drip TLS peer (a byte before each idle window) resets it forever and pins the thread indefinitely. TASK-24's async timeout(handshake_future) is absolute; the blocking port had regressed it.
+FIX: absolute deadline via a WATCHDOG thread - clone the TcpStream, spawn a thread that recv_timeout(min(handshake_cap, total-remaining)); on timeout it sets a `fired` flag and TcpStream::shutdown(Both), forcing the blocked/dripping handshake read to return at once so connect+handshake fail within the absolute bound. Watchdog is cancelled (channel send + join) on EITHER outcome BEFORE any body read, so it can never tear down a live response. `fired` distinguishes a deadline (TimedOut) from a real verification failure (InvalidData). Connect+handshake together still bounded by the total (stage_budget). Body timeout reset to 60s only after success (unchanged).
+NEW BITE (stronger oracle): spawn_tls_slow_drip serves a well-formed TLS record header then dribbles the body 1 byte/200ms (< the 500ms handshake cap) - an idle timeout would never fire. tls_slow_drip_handshake_fails_at_absolute_deadline asserts fail within handshake+grace. PROVEN: regressing the watchdog to a per-read idle timeout => drip runs to 4.01s > 1.5s bound => RED; absolute watchdog => ~500ms => GREEN. Existing full-stall bite kept.
+SELF-TEST PIN (codex minor): added 4 must-fail HTTP_SELF_TEST_CASES pinning native-tls/openssl/rustls/tokio-rustls + 1 disjoint control. PROVEN: removing "native-tls" from the denylist now FAILS the guard self-test ("should have been caught, was reported clean", exit 2). Was previously a silent weakening.
+KEPT (codex-confirmed sound, unchanged): no-prod-skip-verify, load-bearing URL-host name check, verbatim bytes, disjoint denylist+flake (daemon rustls-only), DNS-worker-orphan honest limit.
+RE-GATE BOUNDED (nix develop): fmt --check OK; clippy -p testproxy -D warnings clean; build -p testproxy --locked OK; check-independence.py green (6 convergences caught in self-test, 22 denied); cargo test -p testproxy = lib 32 +1 ignored(network), +2+7+6+1+0 integration, all pass. df ~115G. Ready for codex re-gate.
 <!-- SECTION:NOTES:END -->

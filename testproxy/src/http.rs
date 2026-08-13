@@ -29,11 +29,13 @@
 
 use std::io::{self, Read, Write};
 use std::net::{TcpStream, ToSocketAddrs};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, Instant};
 
-use native_tls::{HandshakeError, TlsConnector};
+use native_tls::TlsConnector;
 
 /// A parsed request line + headers. Bodies are intentionally not read.
 #[derive(Debug, Clone)]
@@ -336,14 +338,19 @@ fn fetch_https(
     let connect_cap = stage_budget(budget.total, Duration::ZERO, budget.connect);
     let tcp = connect_within(connect_host, port, connect_cap)?;
 
-    // Stage 2: TLS handshake, bounded by min(handshake cap, remaining total).
-    // native-tls handshakes with BLOCKING reads on the underlying socket, so a
-    // per-syscall read/write timeout caps the stage: against a stalled peer the
-    // ServerHello read blocks for `handshake_cap` then returns (as WouldBlock on
-    // Linux), which native-tls surfaces as a `HandshakeError` we treat as a
-    // failure and never retry - so a stalled handshake fails within the bound
-    // instead of hanging. A healthy peer's handshake reads each return in well
-    // under the cap, so this never false-fails a working server.
+    // Stage 2: TLS handshake, bounded by an ABSOLUTE deadline of
+    // min(handshake cap, remaining total) - NOT a per-read idle timeout.
+    //
+    // native-tls handshakes with BLOCKING reads on the underlying socket. A
+    // per-socket `set_read_timeout` is only an IDLE timeout: a SLOW-DRIP peer
+    // that emits a byte before each idle window resets the timer forever and
+    // pins this thread indefinitely (never reaching the frozen 5 s/10 s caps).
+    // So instead a watchdog thread holds a cloned socket handle and, at the
+    // absolute `handshake_cap` deadline, shuts the socket down - the blocked (or
+    // dripping) read returns at once and the handshake fails within the bound.
+    // This mirrors TASK-24's async `timeout(handshake_future)` absolute
+    // semantics on the blocking port. The watchdog is cancelled on either
+    // outcome BEFORE any body read, so it can never tear down a live response.
     let handshake_cap = stage_budget(budget.total, start.elapsed(), budget.handshake);
     if handshake_cap.is_zero() {
         return Err(io::Error::new(
@@ -351,30 +358,44 @@ fn fetch_https(
             "tls budget exhausted before handshake",
         ));
     }
-    tcp.set_read_timeout(Some(handshake_cap))?;
-    tcp.set_write_timeout(Some(handshake_cap))?;
-    let tls = match connector.connect(server_name, tcp) {
+    let watch = tcp.try_clone()?;
+    let fired = Arc::new(AtomicBool::new(false));
+    let fired_watch = Arc::clone(&fired);
+    let (cancel_tx, cancel_rx) = mpsc::channel::<()>();
+    let watchdog = thread::spawn(move || {
+        if matches!(
+            cancel_rx.recv_timeout(handshake_cap),
+            Err(mpsc::RecvTimeoutError::Timeout)
+        ) {
+            fired_watch.store(true, Ordering::SeqCst);
+            // Force the blocked/dripping handshake read to return immediately.
+            let _ = watch.shutdown(std::net::Shutdown::Both);
+        }
+    });
+
+    let handshake = connector.connect(server_name, tcp);
+    let _ = cancel_tx.send(());
+    let _ = watchdog.join();
+
+    let tls = match handshake {
         Ok(tls) => tls,
-        // A verification failure (untrusted/self-signed, wrong host, expired)
-        // surfaces HERE, before any request byte is sent or any response byte is
-        // read/cached.
-        Err(HandshakeError::Failure(e)) => {
+        Err(e) => {
+            // The deadline shutdown and a genuine verification failure both
+            // surface HERE, before any request byte is sent or any response byte
+            // is read/cached; `fired` distinguishes the two for the operator.
+            if fired.load(Ordering::SeqCst) {
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    format!("tls handshake to {server_name} exceeded budget"),
+                ));
+            }
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 format!("tls handshake to {server_name}: {e}"),
             ));
         }
-        // A stalled handshake trips the socket timeout as WouldBlock at the
-        // deadline; we do not retry, so it fails within the bound.
-        Err(HandshakeError::WouldBlock(_)) => {
-            return Err(io::Error::new(
-                io::ErrorKind::TimedOut,
-                format!("tls handshake to {server_name} stalled past budget"),
-            ));
-        }
     };
-    // Handshake done: restore the plain path's body-read bound (a dead-slow
-    // upstream must not hang the fixture) and drop the handshake write deadline.
+    // Handshake done: bound a dead-slow body the way the plain path does.
     tls.get_ref()
         .set_read_timeout(Some(Duration::from_secs(60)))?;
     tls.get_ref().set_write_timeout(None)?;
@@ -835,6 +856,46 @@ mod tls_tests {
         addr
     }
 
+    /// A SLOW-DRIP TLS peer: it reads the ClientHello, writes a WELL-FORMED TLS
+    /// record header announcing a large handshake record, then dribbles the
+    /// record body ONE byte per `interval` for `drips` bytes before closing. The
+    /// well-formed header keeps OpenSSL WAITING for the (never-completed) body
+    /// instead of erroring on a malformed record, and `interval < handshake_cap`
+    /// means a per-read IDLE timeout would reset on every byte and NEVER fire -
+    /// so only an ABSOLUTE deadline bounds it. This is the oracle that separates
+    /// an idle timeout (RED: fails only at the far-off EOF) from an absolute
+    /// deadline (GREEN: fails at the cap). Timing is server-controlled, so the
+    /// bite is deterministic, not load-flaky.
+    fn spawn_tls_slow_drip(interval: Duration, drips: usize) -> SocketAddr {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        thread::spawn(move || {
+            for sock in listener.incoming() {
+                let Ok(mut sock) = sock else { return };
+                thread::spawn(move || {
+                    // Consume (part of) the ClientHello so the client's write side
+                    // completes and it blocks reading our response.
+                    let mut buf = [0u8; 2048];
+                    let _ = sock.read(&mut buf);
+                    // TLS record: handshake (0x16), TLS 1.2 (0x0303), length 8192.
+                    // 8192 dwarfs anything we dribble, so OpenSSL keeps waiting.
+                    if sock.write_all(&[0x16, 0x03, 0x03, 0x20, 0x00]).is_err() {
+                        return;
+                    }
+                    let _ = sock.flush();
+                    for _ in 0..drips {
+                        thread::sleep(interval);
+                        if sock.write_all(&[0u8]).is_err() {
+                            return; // client already gave up (the absolute bound)
+                        }
+                        let _ = sock.flush();
+                    }
+                });
+            }
+        });
+        addr
+    }
+
     // --- helpers -----------------------------------------------------------
 
     fn get_over_tls(
@@ -986,6 +1047,46 @@ mod tls_tests {
         assert!(
             elapsed >= budget.handshake,
             "must actually wait out the handshake deadline (not fail instantly for another reason); took {elapsed:?}"
+        );
+    }
+
+    /// AC#5 (the stronger oracle): a SLOW-DRIP handshake - a peer that emits a
+    /// byte every 200 ms, each interval well INSIDE the 500 ms handshake cap -
+    /// must still fail at the ABSOLUTE deadline, not be kept alive forever by the
+    /// activity. With a per-read idle timeout this hangs until the server's EOF
+    /// (~4 s here, far past the bound); with the absolute watchdog it fails at the
+    /// cap. Load-tolerant: the upper bound includes the full 1000 ms grace, and
+    /// the drip timing is server-controlled so the bite is deterministic.
+    #[test]
+    fn tls_slow_drip_handshake_fails_at_absolute_deadline() {
+        let (ca, _issuer) = fixture_ca();
+        // 20 drips * 200 ms = 4 s of activity: an idle timeout (500 ms) would
+        // never fire (200 < 500), so only the absolute deadline bounds this.
+        let addr = spawn_tls_slow_drip(Duration::from_millis(200), 20);
+        let budget = TlsBudget {
+            total: Duration::from_millis(10_000),
+            connect: Duration::from_millis(5_000),
+            handshake: Duration::from_millis(500),
+        };
+        let secure = secure_connector(&ca);
+
+        let started = Instant::now();
+        let res = get_over_tls(addr, "valid.test", &secure, budget);
+        let elapsed = started.elapsed();
+
+        assert!(
+            res.is_err(),
+            "a slow-drip handshake must fail at the absolute deadline, not hang"
+        );
+        let grace = Duration::from_millis(TLS_UPSTREAM_SCHEDULER_GRACE_MS);
+        assert!(
+            elapsed <= budget.handshake + grace,
+            "absolute deadline must fire within handshake+grace ({:?}); took {elapsed:?} (a per-read idle timeout would let the drip run to ~4s)",
+            budget.handshake + grace
+        );
+        assert!(
+            elapsed >= budget.handshake,
+            "must wait out the absolute handshake deadline; took {elapsed:?}"
         );
     }
 

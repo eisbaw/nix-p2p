@@ -289,6 +289,52 @@ HTTP_SELF_TEST_CASES: list[tuple[str, dict[str, set[str]], bool]] = [
         },
         True,
     ),
+    # TLS-stack denial (TASK-22): pin each new TLS crate name so DELETING a
+    # denylist entry is caught by the self-test, not only by the real Cargo.lock
+    # graph staying disjoint. Without these, removing e.g. "native-tls" from the
+    # denylist would leave every self-test case green - a silent weakening.
+    (
+        "shared TLS stack - both reach native-tls directly",
+        {"daemon": {"native-tls"}, "testproxy": {"native-tls"}, "native-tls": set()},
+        True,
+    ),
+    (
+        "shared TLS backend - both reach openssl transitively",
+        {
+            "daemon": {"native-tls"},
+            "native-tls": {"openssl"},
+            "testproxy": {"helper"},
+            "helper": {"openssl"},
+            "openssl": set(),
+        },
+        True,
+    ),
+    (
+        "shared TLS stack - both reach rustls directly",
+        {"daemon": {"rustls"}, "testproxy": {"rustls"}, "rustls": set()},
+        True,
+    ),
+    (
+        "shared TLS stack - both reach tokio-rustls directly",
+        {
+            "daemon": {"tokio-rustls"},
+            "testproxy": {"tokio-rustls"},
+            "tokio-rustls": set(),
+        },
+        True,
+    ),
+    (
+        "disjoint TLS stacks - daemon rustls, testproxy native-tls (the real arrangement)",
+        {
+            "daemon": {"rustls", "tokio-rustls"},
+            "testproxy": {"native-tls", "openssl"},
+            "rustls": set(),
+            "tokio-rustls": set(),
+            "native-tls": set(),
+            "openssl": set(),
+        },
+        False,
+    ),
 ]
 
 
