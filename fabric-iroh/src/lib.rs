@@ -41,17 +41,25 @@
 //! retiring that bridge for a PeerFabric `IrohNarSource` (as libp2p already does) is
 //! TASK-144.
 //!
-//! ## What is NOT here yet
+//! ## The concrete `IrohFabric: PeerFabric` (TASK-144)
 //!
-//! The concrete `IrohFabric: PeerFabric` composition (wiring these axes into an
-//! `Option<Arc<dyn Capability>>` struct) lands in TASK-144.
+//! [`fabric::IrohFabric`] wires these axes into an `Option<Arc<dyn Capability>>` struct,
+//! symmetric with `fabric_libp2p::Libp2pFabric`: transfer (always), node_locator (iff
+//! pkarr lookup runs, via [`locator::IrohNodeLocator`]) and server (iff a provider was
+//! built) are `Some`; the content directory / announcer / hold-query / LAN axes are
+//! honestly `None` because iroh offers no content-provider routing (that asymmetry is why
+//! libp2p is the primary backend). The composition-root REQUIRED-axis assertion is
+//! `peer_fabric::require_axes`. Retiring the daemon's `transport_iroh_bridge` for an
+//! `IrohNarSource` over this fabric is the remaining daemon-side step (TASK-144 follow-up).
 
+pub mod fabric;
 pub mod iroh_node_lookup;
 pub mod iroh_node_record;
 pub mod iroh_publication;
 pub mod iroh_publication_authority;
 pub mod iroh_relay;
 pub mod iroh_runtime;
+pub mod locator;
 pub mod pinned_http;
 pub mod process_group;
 pub mod transport_iroh;
@@ -60,3 +68,8 @@ pub mod transport_iroh;
 // in `transport_iroh` (co-located with the iroh-blobs get-protocol that uses them);
 // re-exported here so the daemon can name `fabric_iroh::IROH_BLOBS_ALPN` (TASK-148).
 pub use transport_iroh::IROH_BLOBS_ALPN;
+
+// The concrete `IrohFabric: PeerFabric` composition (TASK-144) + its pkarr-backed
+// node-locator, so the daemon can name `fabric_iroh::{IrohFabric, IrohNodeLocator}`.
+pub use fabric::IrohFabric;
+pub use locator::IrohNodeLocator;

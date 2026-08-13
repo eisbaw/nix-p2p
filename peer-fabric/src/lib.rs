@@ -47,6 +47,7 @@ mod ids;
 mod outcome;
 mod record_codec;
 mod record_store;
+mod require;
 
 pub use budget::{AnnounceBudget, DiscoveryBudget, SafetyEnvelope, ServeBudget};
 pub use capabilities::{
@@ -78,3 +79,4 @@ pub use record_codec::{
     sign_provider_record, sign_provider_withdrawal,
 };
 pub use record_store::{ApplyOutcome, ProviderRecordSet};
+pub use require::{Axis, MissingAxes, require_axes};

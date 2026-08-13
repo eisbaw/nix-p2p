@@ -67,8 +67,9 @@ use http_body_util::{BodyExt, Full};
 
 use ed25519_dalek::SigningKey;
 use peer_fabric::{
-    Blake3Digest, ContentKey, DiscoveryBudget, Lookup, NodeId, PeerFabric, ProviderRecord,
-    SafetyEnvelope, TransferError, TransportOffer, sign_provider_record,
+    Axis, Blake3Digest, ContentKey, DiscoveryBudget, Lookup, NodeId, PeerFabric, ProviderRecord,
+    SafetyEnvelope, TransferError, TransportOffer, TransportTag, require_axes,
+    sign_provider_record,
 };
 
 use std::str::FromStr;
@@ -523,12 +524,34 @@ async fn start_and_join_libp2p(
         identity_seed: cfg.identity_seed,
         network_scope: cfg.network_scope.clone(),
     };
+    let serving = supplier.is_some();
     let fabric = match supplier {
         Some(supplier) => Libp2pFabric::start_with_supplier(node_config, supplier),
         None => Libp2pFabric::start(node_config),
     }
     .map_err(|e| format!("libp2p fabric start failed: {e}"))?;
     let fabric = Arc::new(fabric);
+
+    // Composition-root REQUIRED-axis assertion (TASK-144 AC#4, the "Unsupported-axis
+    // dilemma" resolution): fail fast HERE, at construction, if the selected profile needs
+    // an axis this fabric does not offer - never a silent runtime degrade (a fetch that
+    // always falls back, a provider that announces then cannot serve). A libp2p CONSUMER
+    // needs content discovery, node-address resolution and the fetch transport (registered
+    // under the Iroh tag per the fabric-libp2p ADR); a PROVIDER additionally needs the
+    // serve + announce axes. The single check lives in `peer_fabric::require_axes`, shared
+    // with the iroh composition root so the two cannot drift on what "required" means.
+    let mut required = vec![
+        Axis::ProviderDirectory,
+        Axis::NodeLocator,
+        Axis::Transfer(TransportTag::Iroh),
+    ];
+    if serving {
+        required.push(Axis::Server);
+        required.push(Axis::Announcer);
+    }
+    require_axes(fabric.as_ref(), &required).map_err(|missing| {
+        format!("libp2p fabric does not satisfy the required axes for this profile: {missing}")
+    })?;
 
     if let Some(listen) = &cfg.listen {
         fabric
