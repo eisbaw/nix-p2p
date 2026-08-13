@@ -6,6 +6,7 @@
 //! resolve-then-dial lives inside the fabric). The hold-query / LAN axes remain `None`
 //! (hold-query is unimplemented; NAT traversal for residential peers is TASK-168).
 
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use libp2p::PeerId;
@@ -39,9 +40,24 @@ pub struct Libp2pFabric {
 
 impl Libp2pFabric {
     /// Start a libp2p node for `config` with discovery + the fetch transport, but NOT
-    /// serving (no supplier). A pure CONSUMER fabric: `server()` is `None`.
+    /// serving (no supplier). A pure CONSUMER fabric: `server()` is `None`. The
+    /// anti-rollback floor is IN-MEMORY (session-scoped); use [`start_durable`] to persist
+    /// it across restart.
+    ///
+    /// [`start_durable`]: Self::start_durable
     pub fn start(config: NodeConfig) -> Result<Libp2pFabric, NodeError> {
-        Self::assemble(config, None)
+        Self::assemble(config, None, None)
+    }
+
+    /// Start a CONSUMER fabric whose anti-rollback floor + per-key announce sequence are
+    /// DURABLY persisted under `state_dir` (TASK-176 #1), so a restarted node still
+    /// rejects a rolled-back record and mints a network-effective withdrawal. Each node
+    /// needs its OWN `state_dir` (the files are keyed by directory, not identity).
+    pub fn start_durable(
+        config: NodeConfig,
+        state_dir: PathBuf,
+    ) -> Result<Libp2pFabric, NodeError> {
+        Self::assemble(config, None, Some(state_dir))
     }
 
     /// Start a libp2p node that ALSO serves NARs from `supplier` (a substrate-internal
@@ -51,12 +67,25 @@ impl Libp2pFabric {
         config: NodeConfig,
         supplier: Arc<dyn Libp2pNarSupplier>,
     ) -> Result<Libp2pFabric, NodeError> {
-        Self::assemble(config, Some(supplier))
+        Self::assemble(config, Some(supplier), None)
+    }
+
+    /// A serving fabric ([`start_with_supplier`]) whose floor + announce sequence are
+    /// DURABLY persisted under `state_dir` (TASK-176 #1).
+    ///
+    /// [`start_with_supplier`]: Self::start_with_supplier
+    pub fn start_with_supplier_durable(
+        config: NodeConfig,
+        supplier: Arc<dyn Libp2pNarSupplier>,
+        state_dir: PathBuf,
+    ) -> Result<Libp2pFabric, NodeError> {
+        Self::assemble(config, Some(supplier), Some(state_dir))
     }
 
     fn assemble(
         config: NodeConfig,
         supplier: Option<Arc<dyn Libp2pNarSupplier>>,
+        state_dir: Option<PathBuf>,
     ) -> Result<Libp2pFabric, NodeError> {
         // The node identity IS the record-signing secret (self-serve v1). Capture it
         // BEFORE `Node::start` consumes `config`, so the announcer can sign its own
@@ -65,17 +94,35 @@ impl Libp2pFabric {
         let node = Node::start(config)?;
         let ledger = Arc::new(ExposureLedger::new());
 
-        let directory: Arc<dyn ProviderDirectory> = Arc::new(Libp2pProviderDirectory::new(
-            node.handle.clone(),
-            ledger.clone(),
-        ));
-        let announcer: Arc<dyn AvailabilityAnnouncer> = Arc::new(Libp2pAvailabilityAnnouncer::new(
-            node.handle.clone(),
-            ledger.clone(),
-            node.node_id,
-            node.peer_id,
-            signing_key,
-        ));
+        // The durable-floor files (TASK-176 #1) live under `state_dir` when configured:
+        // the directory's anti-rollback floor and the announcer's per-key sequence, each
+        // in its own greppable text file. Without a `state_dir` both stay in-memory
+        // (session-scoped), exactly as before.
+        let directory: Arc<dyn ProviderDirectory> = Arc::new(match &state_dir {
+            Some(dir) => Libp2pProviderDirectory::durable(
+                node.handle.clone(),
+                ledger.clone(),
+                dir.join("provider-floor-v1.txt"),
+            ),
+            None => Libp2pProviderDirectory::new(node.handle.clone(), ledger.clone()),
+        });
+        let announcer: Arc<dyn AvailabilityAnnouncer> = Arc::new(match &state_dir {
+            Some(dir) => Libp2pAvailabilityAnnouncer::durable(
+                node.handle.clone(),
+                ledger.clone(),
+                node.node_id,
+                node.peer_id,
+                signing_key,
+                dir.join("announce-seq-v1.txt"),
+            ),
+            None => Libp2pAvailabilityAnnouncer::new(
+                node.handle.clone(),
+                ledger.clone(),
+                node.node_id,
+                node.peer_id,
+                signing_key,
+            ),
+        });
         // The node-locator resolves a provider's dial address THROUGH kad peer-routing.
         // ONE concrete instance is shared (TASK-169): the fetch transport drives its dial
         // off this SAME locator (so the resolve-then-dial lives inside the fabric, and its

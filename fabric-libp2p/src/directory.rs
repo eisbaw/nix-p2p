@@ -55,18 +55,30 @@ pub struct Libp2pProviderDirectory {
     store: Mutex<FloorStore>,
 }
 
+/// The outcome of [`admit`]: the live record IFF admitted, plus whether the durable
+/// floor ADVANCED (a strictly-newer positive record or a withdrawal tombstone), which is
+/// the signal a persistent backend uses to decide it must re-flush its on-disk floor. An
+/// idempotent refresh or a rejected replay leaves the floor unchanged, so it does not.
+pub(crate) struct Admitted {
+    /// The live record to return for this slot, or `None` (spoof / tombstone / lost to
+    /// the floor / expired).
+    pub record: Option<ProviderRecord>,
+    /// Whether this admit MOVED the monotonic floor forward (persist-worthy).
+    pub floor_advanced: bool,
+}
+
 /// Apply one fetched, decoded `assertion` (from the DHT provider `peer`) against the
 /// durable floor and the PeerId<->provider binding, returning the live record IFF it is
-/// admitted. `None` when the assertion is a foreign-provider spoof (AC#4), a withdrawal
-/// tombstone, or LOSES to the monotonic floor (replay / rollback / stale / already-expired,
-/// AC#3). PURE over `store`, so the whole lifecycle decision is unit-testable without a
-/// live DHT.
+/// admitted (see [`Admitted`]). `record` is `None` when the assertion is a
+/// foreign-provider spoof (AC#4), a withdrawal tombstone, or LOSES to the monotonic floor
+/// (replay / rollback / stale / already-expired, AC#3). PURE over `store`, so the whole
+/// lifecycle decision is unit-testable without a live DHT.
 pub(crate) fn admit(
     store: &mut ProviderRecordSet,
     peer: PeerId,
     assertion: ProviderAssertion,
     now: u64,
-) -> Option<ProviderRecord> {
+) -> Admitted {
     // AC#4: bind the signed record's provider to the index entry it was fetched under -
     // reject a peer that re-stored a THIRD party's record at its own composite key (index
     // spoofing). The forward derivation (verifying key -> PeerId) is always available.
@@ -77,20 +89,30 @@ pub(crate) fn admit(
             "record provider does not derive to the index PeerId; \
              rejecting (possible index spoof)"
         );
-        return None;
+        return Admitted {
+            record: None,
+            floor_advanced: false,
+        };
     }
     match store.apply(&assertion, now) {
         // A positive record that is new/strictly-newer (Applied) or the byte-identical
-        // current one re-fetched (Idempotent) is the live record for the slot.
-        ApplyOutcome::Applied | ApplyOutcome::Idempotent => match assertion {
-            ProviderAssertion::Provide(record) => Some(record),
-            // A withdrawal never becomes a positive record; an Idempotent re-broadcast of
-            // the current tombstone stays withdrawn.
-            ProviderAssertion::Withdraw(_) => None,
+        // current one re-fetched (Idempotent) is the live record for the slot. Only
+        // Applied ADVANCES the floor; Idempotent leaves it byte-identical.
+        outcome @ (ApplyOutcome::Applied | ApplyOutcome::Idempotent) => Admitted {
+            record: match assertion {
+                ProviderAssertion::Provide(record) => Some(record),
+                // A withdrawal never becomes a positive record; an Idempotent re-broadcast
+                // of the current tombstone stays withdrawn.
+                ProviderAssertion::Withdraw(_) => None,
+            },
+            floor_advanced: outcome == ApplyOutcome::Applied,
         },
         ApplyOutcome::Withdrawn => {
             tracing::debug!(%peer, "provider withdrawal tombstoned the slot; not returning");
-            None
+            Admitted {
+                record: None,
+                floor_advanced: true,
+            }
         }
         ApplyOutcome::RejectedStale { current, offered } => {
             tracing::debug!(
@@ -98,11 +120,17 @@ pub(crate) fn admit(
                 "provider record lost to the monotonic floor \
                  (replay / rollback / stale); skipping"
             );
-            None
+            Admitted {
+                record: None,
+                floor_advanced: false,
+            }
         }
         ApplyOutcome::RejectedExpired { expiry, now } => {
             tracing::debug!(%peer, expiry, now, "provider record already expired; skipping");
-            None
+            Admitted {
+                record: None,
+                floor_advanced: false,
+            }
         }
     }
 }
@@ -130,12 +158,32 @@ fn classify(records: Vec<ProviderRecord>, consult_failed: bool) -> Lookup<Vec<Pr
 }
 
 impl Libp2pProviderDirectory {
-    /// A directory driving `handle`, recording disclosures to `ledger`.
+    /// A directory driving `handle`, recording disclosures to `ledger`, with an
+    /// IN-MEMORY (session-scoped) anti-rollback floor.
     pub fn new(handle: SwarmHandle, ledger: Arc<ExposureLedger>) -> Self {
+        Self::with_floor(handle, ledger, FloorStore::new())
+    }
+
+    /// A directory whose anti-rollback floor is DURABLY backed by `floor_path`
+    /// (TASK-176 #1): the floor is re-seeded from disk at startup and re-flushed as it
+    /// advances, so a restarted consumer still rejects a rolled-back record.
+    pub fn durable(
+        handle: SwarmHandle,
+        ledger: Arc<ExposureLedger>,
+        floor_path: std::path::PathBuf,
+    ) -> Self {
+        Self::with_floor(
+            handle,
+            ledger,
+            FloorStore::durable(floor_path, crate::floor_store::DEFAULT_STORE_CAP),
+        )
+    }
+
+    fn with_floor(handle: SwarmHandle, ledger: Arc<ExposureLedger>, store: FloorStore) -> Self {
         Libp2pProviderDirectory {
             handle,
             ledger,
-            store: Mutex::new(FloorStore::new()),
+            store: Mutex::new(store),
         }
     }
 
@@ -408,13 +456,14 @@ mod tests {
         let mut store = ProviderRecordSet::new();
         let sk = signer(3);
         let key = a_key();
-        let record = admit(
+        let admitted = admit(
             &mut store,
             peer_of(&sk),
             signed_provide(&sk, key, 1, 1_000),
             0,
         );
-        assert_eq!(record.expect("admitted").sequence, 1);
+        assert!(admitted.floor_advanced, "a fresh record advances the floor");
+        assert_eq!(admitted.record.expect("admitted").sequence, 1);
     }
 
     #[test]
@@ -428,7 +477,9 @@ mod tests {
         let key = a_key();
         let foreign = signed_provide(&alice, key, 1, 1_000); // signed by Alice
         assert!(
-            admit(&mut store, peer_of(&bob), foreign, 0).is_none(),
+            admit(&mut store, peer_of(&bob), foreign, 0)
+                .record
+                .is_none(),
             "a third-party record stored under the wrong provider key is rejected"
         );
     }
@@ -442,13 +493,23 @@ mod tests {
         let sk = signer(3);
         let peer = peer_of(&sk);
         let key = a_key();
-        assert!(admit(&mut store, peer, signed_provide(&sk, key, 5, 1_000), 0).is_some());
         assert!(
-            admit(&mut store, peer, signed_provide(&sk, key, 3, 1_000), 0).is_none(),
+            admit(&mut store, peer, signed_provide(&sk, key, 5, 1_000), 0)
+                .record
+                .is_some()
+        );
+        assert!(
+            admit(&mut store, peer, signed_provide(&sk, key, 3, 1_000), 0)
+                .record
+                .is_none(),
             "a replayed / rolled-back older record must lose to the monotonic floor"
         );
         // And the newer record's floor persists: re-fetching seq 5 (identical) is still live.
-        assert!(admit(&mut store, peer, signed_provide(&sk, key, 5, 1_000), 0).is_some());
+        assert!(
+            admit(&mut store, peer, signed_provide(&sk, key, 5, 1_000), 0)
+                .record
+                .is_some()
+        );
     }
 
     #[test]
@@ -461,13 +522,21 @@ mod tests {
         let sk = signer(3);
         let peer = peer_of(&sk);
         let key = a_key();
-        assert!(admit(&mut store, peer, signed_provide(&sk, key, 1, 10_000), 0).is_some());
         assert!(
-            admit(&mut store, peer, signed_withdraw(&sk, key, 2, 10_000), 0).is_none(),
+            admit(&mut store, peer, signed_provide(&sk, key, 1, 10_000), 0)
+                .record
+                .is_some()
+        );
+        assert!(
+            admit(&mut store, peer, signed_withdraw(&sk, key, 2, 10_000), 0)
+                .record
+                .is_none(),
             "a withdrawal is a tombstone, not a live record"
         );
         assert!(
-            admit(&mut store, peer, signed_provide(&sk, key, 1, 10_000), 0).is_none(),
+            admit(&mut store, peer, signed_provide(&sk, key, 1, 10_000), 0)
+                .record
+                .is_none(),
             "a replay of the pre-withdrawal record must NOT resurrect the provider"
         );
     }
@@ -480,9 +549,15 @@ mod tests {
         let sk = signer(3);
         let peer = peer_of(&sk);
         let key = a_key();
-        assert!(admit(&mut store, peer, signed_provide(&sk, key, 4, 1_000), 0).is_some());
         assert!(
-            admit(&mut store, peer, signed_provide(&sk, key, 4, 1_000), 0).is_some(),
+            admit(&mut store, peer, signed_provide(&sk, key, 4, 1_000), 0)
+                .record
+                .is_some()
+        );
+        assert!(
+            admit(&mut store, peer, signed_provide(&sk, key, 4, 1_000), 0)
+                .record
+                .is_some(),
             "an idempotent refresh stays live"
         );
     }

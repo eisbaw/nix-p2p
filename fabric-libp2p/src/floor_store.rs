@@ -23,11 +23,13 @@
 //! within the TTL window, so the hard cap + LRU is load-bearing, not decorative.
 
 use std::collections::VecDeque;
+use std::path::PathBuf;
 
 use libp2p::PeerId;
 use peer_fabric::{ContentKey, NodeId, ProviderAssertion, ProviderRecord, ProviderRecordSet};
 
-use crate::directory::admit;
+use crate::directory::{Admitted, admit};
+use crate::persist;
 
 /// The hard cap on `(key, provider)` slots the consumer floor retains. A slot is a few
 /// fixed fields plus <= 4 small offers (worst case ~324 bytes in the frozen record), so
@@ -37,7 +39,9 @@ use crate::directory::admit;
 pub const DEFAULT_STORE_CAP: usize = 4096;
 
 /// The bounded anti-rollback floor. Wraps the frozen [`ProviderRecordSet`] and an LRU
-/// order over its live slots.
+/// order over its live slots, with OPTIONAL on-disk durability (TASK-176 #1): when a
+/// `path` is configured, the floor is loaded at construction and re-flushed whenever it
+/// advances, so a restarted consumer still rejects a rolled-back record.
 pub struct FloorStore {
     inner: ProviderRecordSet,
     /// LRU order of the live slots, LEAST-recently-touched at the front (the eviction
@@ -45,29 +49,49 @@ pub struct FloorStore {
     /// eviction pops the front, and a TTL sweep reconciles what it dropped.
     order: VecDeque<(ContentKey, NodeId)>,
     cap: usize,
+    /// The durable-floor file, or `None` for an in-memory (session-scoped) floor.
+    path: Option<PathBuf>,
 }
 
 impl FloorStore {
-    /// A bounded floor at [`DEFAULT_STORE_CAP`].
+    /// A bounded, IN-MEMORY floor at [`DEFAULT_STORE_CAP`] (no cross-restart durability).
     pub fn new() -> Self {
         Self::with_cap(DEFAULT_STORE_CAP)
     }
 
-    /// A bounded floor with an explicit cap (tests drive a small cap to prove the bound).
-    /// A cap of 0 is nonsensical for a floor that must hold at least the slot it just
-    /// admitted, so it is raised to 1.
+    /// A bounded in-memory floor with an explicit cap (tests drive a small cap to prove
+    /// the bound). A cap of 0 is nonsensical for a floor that must hold at least the slot
+    /// it just admitted, so it is raised to 1.
     pub fn with_cap(cap: usize) -> Self {
         FloorStore {
             inner: ProviderRecordSet::new(),
             order: VecDeque::new(),
             cap: cap.max(1),
+            path: None,
         }
+    }
+
+    /// A bounded floor DURABLY backed by `path`: any existing floor is loaded (so a
+    /// restart re-seeds its anti-rollback state), and every advance is re-flushed. Load
+    /// failures degrade to an empty (session-fresh) floor and are logged, never fatal.
+    pub fn durable(path: PathBuf, cap: usize) -> Self {
+        let mut store = FloorStore {
+            inner: ProviderRecordSet::new(),
+            order: VecDeque::new(),
+            cap: cap.max(1),
+            path: Some(path.clone()),
+        };
+        for (key, provider, floor) in persist::load_floors(&path) {
+            store.inner.restore_floor(key, provider, floor);
+            store.order.push_back((key, provider));
+        }
+        store
     }
 
     /// Apply one fetched, decoded `assertion` (from DHT provider `peer`) against the
     /// bounded floor, returning the live record IFF it is admitted (see [`admit`] for the
     /// per-assertion decision). Enforces the entry cap around the admit so the retained
-    /// set never exceeds `cap`.
+    /// set never exceeds `cap`, and re-flushes the durable floor when it advanced.
     pub fn admit(
         &mut self,
         peer: PeerId,
@@ -77,7 +101,10 @@ impl FloorStore {
         let key = *assertion.key();
         let provider = *assertion.provider();
 
-        let outcome = admit(&mut self.inner, peer, assertion, now);
+        let Admitted {
+            record,
+            floor_advanced,
+        } = admit(&mut self.inner, peer, assertion, now);
 
         // Track LRU position for whatever slot now exists at (key, provider): a fresh
         // apply created it, a refresh updated it, a spoof left a pre-existing one intact.
@@ -86,8 +113,15 @@ impl FloorStore {
         if self.inner.contains_slot(&key, &provider) {
             self.touch(key, provider);
         }
-        self.enforce_cap(now);
-        outcome
+        let evicted = self.enforce_cap(now);
+        // Persist only when the durable state actually changed: an advanced floor, or an
+        // eviction that dropped a persisted slot. Idempotent refreshes and rejected
+        // replays (the steady-state majority) leave the file untouched, so a busy
+        // consumer is not writing on every resolve.
+        if self.path.is_some() && (floor_advanced || evicted) {
+            self.persist();
+        }
+        record
     }
 
     /// Move `(key, provider)` to the MRU end of the LRU order (removing any stale copy).
@@ -98,23 +132,35 @@ impl FloorStore {
     }
 
     /// Bring `slot_count` back to `<= cap`: sweep expired slots first (they guard
-    /// nothing), then LRU-evict live floors from the front until under the cap.
-    fn enforce_cap(&mut self, now: u64) {
+    /// nothing), then LRU-evict live floors from the front until under the cap. Returns
+    /// whether anything was removed (so the caller knows a durable re-flush is due).
+    fn enforce_cap(&mut self, now: u64) -> bool {
         if self.inner.slot_count() <= self.cap {
-            return;
+            return false;
         }
-        if self.inner.evict_expired(now) > 0 {
+        let mut removed = self.inner.evict_expired(now) > 0;
+        if removed {
             self.order.retain(|(k, p)| self.inner.contains_slot(k, p));
         }
         while self.inner.slot_count() > self.cap {
             match self.order.pop_front() {
                 Some((k, p)) => {
                     self.inner.remove_slot(&k, &p);
+                    removed = true;
                 }
                 // Order desynced (should not happen): nothing left to evict by LRU, so
                 // stop rather than spin. The cap is still honored on the next admit.
                 None => break,
             }
+        }
+        removed
+    }
+
+    /// Flush the full (bounded) floor to disk atomically. Called only when a `path` is
+    /// set and the floor changed.
+    fn persist(&self) {
+        if let Some(path) = &self.path {
+            persist::save_floors(path, &self.inner.export_floors());
         }
     }
 }
@@ -226,5 +272,55 @@ mod tests {
             1,
             "a refresh updates, never grows"
         );
+    }
+
+    #[test]
+    fn a_durable_floor_survives_a_restart_and_still_rejects_a_rollback() {
+        // THE #1 RESTART BITE: a durable store admits seq 5 (its floor advances and is
+        // flushed to disk), is DROPPED (a process restart), then a fresh durable store on
+        // the SAME path re-seeds the floor from disk - so a rolled-back seq-3 record is
+        // still rejected. Mutation A: skip the persist() flush -> the file is empty ->
+        // the restart re-seeds nothing -> seq 3 is admitted. Mutation B: skip the
+        // load_floors re-seed in `durable` -> same. Either way the assertion fails.
+        let path = std::env::temp_dir().join(format!(
+            "nix-p2p-floor-restart-{}-{:?}.txt",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_file(&path);
+
+        let sk = signer(6);
+        let peer = peer_of(&sk);
+
+        {
+            let mut store = FloorStore::durable(path.clone(), 64);
+            assert!(
+                store
+                    .admit(peer, signed_provide(&sk, 0, 5, 1_000_000), 0)
+                    .is_some(),
+                "seq 5 is admitted and its floor persisted"
+            );
+        } // dropped == restart
+
+        let mut restarted = FloorStore::durable(path.clone(), 64);
+        // THE ROLLBACK IS TESTED FIRST, with NO re-observation this session: a seq-3
+        // record is rejected PURELY by the floor re-seeded from disk. (Re-observing seq 5
+        // first would rebuild the floor in-memory and mask a missing persist - the trap
+        // this ordering avoids.)
+        assert!(
+            restarted
+                .admit(peer, signed_provide(&sk, 0, 3, 1_000_000), 0)
+                .is_none(),
+            "a rollback below the persisted floor is rejected after a restart"
+        );
+        // And the current record still serves (idempotent against the restored floor).
+        assert!(
+            restarted
+                .admit(peer, signed_provide(&sk, 0, 5, 1_000_000), 0)
+                .is_some(),
+            "the current record is still served after a restart"
+        );
+
+        let _ = std::fs::remove_file(&path);
     }
 }

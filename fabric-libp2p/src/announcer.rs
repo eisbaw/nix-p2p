@@ -35,6 +35,7 @@
 //!     tombstone was published", NOT "every cache is provably retracted".
 
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -75,10 +76,14 @@ pub struct Libp2pAvailabilityAnnouncer {
     /// The last `(sequence, expiry)` this announcer published per key, so a withdrawal
     /// can be minted at a STRICTLY NEWER sequence than the record it retracts (the frozen
     /// monotonic rule) and given a tombstone lifetime that covers the record's remaining
-    /// TTL. In-memory: a restart loses it (the honest durability limit the record_store
-    /// module doc names - a restarted provider re-derives its floor from a fresh
-    /// announce). Guarded by a std Mutex; only ever held for the synchronous update.
+    /// TTL. DURABLY backed by `seq_path` when set (TASK-176 #1): a restarted provider
+    /// re-seeds this map from disk, so its withdrawal supersedes (rather than losing at
+    /// sequence 1 to) a consumer already at the record's real sequence. When `seq_path`
+    /// is `None` it is in-memory only (a restart loses it). Guarded by a std Mutex; only
+    /// ever held for the synchronous update.
     announced: Mutex<HashMap<ContentKey, LastPublished>>,
+    /// The durable per-key sequence file, or `None` for an in-memory announcer.
+    seq_path: Option<PathBuf>,
 }
 
 /// The `(sequence, expiry)` of the last positive record this announcer published for a
@@ -100,6 +105,39 @@ impl Libp2pAvailabilityAnnouncer {
         peer_id: PeerId,
         signing_key: SigningKey,
     ) -> Self {
+        Self::build(handle, ledger, node_id, peer_id, signing_key, None)
+    }
+
+    /// An announcer whose per-key sequence floor is DURABLY backed by `seq_path`
+    /// (TASK-176 #1): re-seeded at startup and re-flushed on every announce/withdraw, so
+    /// a restarted provider's withdrawal is network-effective instead of silently losing
+    /// at sequence 1.
+    pub fn durable(
+        handle: SwarmHandle,
+        ledger: Arc<ExposureLedger>,
+        node_id: NodeId,
+        peer_id: PeerId,
+        signing_key: SigningKey,
+        seq_path: PathBuf,
+    ) -> Self {
+        Self::build(
+            handle,
+            ledger,
+            node_id,
+            peer_id,
+            signing_key,
+            Some(seq_path),
+        )
+    }
+
+    fn build(
+        handle: SwarmHandle,
+        ledger: Arc<ExposureLedger>,
+        node_id: NodeId,
+        peer_id: PeerId,
+        signing_key: SigningKey,
+        seq_path: Option<PathBuf>,
+    ) -> Self {
         // HARD assert (not debug_assert): this is a signing surface on a data-integrity
         // path. A mismatched key would sign tombstones whose `provider` does not derive to
         // the composite value key's PeerId, so every consumer's binding check rejects them
@@ -110,14 +148,38 @@ impl Libp2pAvailabilityAnnouncer {
             node_id,
             "announcer signing key must be this node's identity (self-serve v1)"
         );
+        // Re-seed the per-key sequence floor from disk (empty if none / unreadable).
+        let mut announced = HashMap::new();
+        if let Some(path) = &seq_path {
+            for (key, sequence, expiry) in crate::persist::load_seqs(path) {
+                announced.insert(key, LastPublished { sequence, expiry });
+            }
+        }
         Libp2pAvailabilityAnnouncer {
             handle,
             ledger,
             node_id,
             peer_id,
             signing_key,
-            announced: Mutex::new(HashMap::new()),
+            announced: Mutex::new(announced),
+            seq_path,
         }
+    }
+
+    /// Flush the per-key sequence floor to disk (atomic) when durable. Called under no
+    /// lock; snapshots the map itself.
+    fn persist_announced(&self) {
+        let Some(path) = &self.seq_path else {
+            return;
+        };
+        let snapshot: Vec<(ContentKey, u64, u64)> = self
+            .announced
+            .lock()
+            .expect("announced-sequence mutex poisoned")
+            .iter()
+            .map(|(key, last)| (*key, last.sequence, last.expiry))
+            .collect();
+        crate::persist::save_seqs(path, &snapshot);
     }
 
     /// Mint a SIGNED withdrawal tombstone that STRICTLY SUPERSEDES the last record this
@@ -251,6 +313,9 @@ impl AvailabilityAnnouncer for Libp2pAvailabilityAnnouncer {
                         expiry: record.expiry,
                     };
                 }
+                drop(announced);
+                // Persist the advanced per-key floor so a restart re-seeds it (TASK-176 #1).
+                self.persist_announced();
                 Ok(receipt)
             }
             Ok(Err(e)) => Err(e),
@@ -309,6 +374,9 @@ impl AvailabilityAnnouncer for Libp2pAvailabilityAnnouncer {
                 };
             }
         }
+        // Persist the advanced per-key floor so a restart mints the NEXT withdrawal
+        // strictly newer still (TASK-176 #1).
+        self.persist_announced();
         self.handle.stop_providing(provider_index_key(key)).await;
         Ok(Receipt::new("libp2p-kad-withdraw"))
     }

@@ -104,6 +104,7 @@ mod floor_store;
 mod keys;
 mod locator;
 mod nar;
+mod persist;
 mod server;
 mod swarm;
 mod transport;
