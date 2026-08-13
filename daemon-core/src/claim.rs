@@ -90,6 +90,7 @@
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 
 use crate::content_id::Blake3Digest;
 use crate::source::NarHash;
@@ -170,6 +171,31 @@ impl std::error::Error for NarHashKeyParseError {}
 impl NarHashKey {
     /// Wrap the 32 raw SHA-256 bytes of a NarHash.
     pub const fn from_sha256_bytes(bytes: [u8; NAR_HASH_LEN]) -> Self {
+        NarHashKey(bytes)
+    }
+
+    /// The Nix `NarHash` of a raw NAR: `sha256(RawNarV1)` over the EXACT
+    /// `nix-store --dump <path>` byte stream (the uncompressed NAR), wrapped as the
+    /// strict key. This is the sha256 TWIN of [`Blake3Digest::from_raw_nar`],
+    /// computed from the IDENTICAL bytes, so a holder derives both content
+    /// identities from one dump - and the availability index can assert
+    /// `from_raw_nar(dump) == key` at the source (task-56), catching a
+    /// mis-registration before it becomes a false claim.
+    ///
+    /// The comparison the index does is in RAW-BYTE space (`NarHashKey ==
+    /// NarHashKey`), so there is no base32-vs-hex ambiguity to get wrong: both
+    /// sides are the 32 raw sha256 bytes.
+    ///
+    /// CARRIED UNIT TRAP (bitten the project 3x): the input MUST be the
+    /// UNCOMPRESSED dump, never a compressed `.nar.xz`/`.nar.zst`. That this recipe
+    /// reproduces Nix's OWN committed NarHash on a real store path is proven by
+    /// `scripts/check-golden-vectors.py`, which computes `sha256(real --dump)` over
+    /// the `lib` fixture and asserts it equals the golden/manifest `nar_hash`,
+    /// cross-checking the same nix-base32 encoding this key's `Display` uses.
+    pub fn from_raw_nar(raw_nar: &[u8]) -> Self {
+        let digest = Sha256::digest(raw_nar);
+        let mut bytes = [0u8; NAR_HASH_LEN];
+        bytes.copy_from_slice(&digest);
         NarHashKey(bytes)
     }
 

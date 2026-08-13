@@ -37,6 +37,11 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 # BLAKE3 of the addressed unit (task-48 freeze): the raw-NAR content identity recipe.
 blake3 = "1"
+# sha256 of the raw NAR = the Nix NarHash (task-56): the availability index re-derives
+# it from the SAME --dump bytes it BLAKE3s and asserts it equals the registered
+# NarHashKey, so a mis-registration is quarantined at the source rather than becoming a
+# false claim. DAEMON-SIDE only; the independence denylist is the HTTP stack, not this.
+sha2 = "0.10"
 # availability's NAR reader opens the raw store path with descriptor-relative, no-follow,
 # regular-file-checked filesystem ops (openat/fstat) without unsafe code. Not a p2p dep.
 rustix = { version = "1", features = ["fs"] }

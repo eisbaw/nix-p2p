@@ -926,16 +926,6 @@ fn store_path_with(dir: &Path, name: &str, nar: &[u8]) -> StorePath {
     StorePath::new(path)
 }
 
-/// The canonical NarHash key form. The index never verifies that a key really is
-/// `sha256(dump)` (a stated, deliberate gap in `availability.rs`), so any
-/// well-formed key registers - which is what lets this test stay free of a sha256
-/// dependency without weakening what it asserts.
-fn key(n: u8) -> NarHashKey {
-    let mut raw = [0u8; 32];
-    raw[0] = n;
-    NarHashKey::from_sha256_bytes(raw)
-}
-
 fn temp_dir(tag: &str) -> std::path::PathBuf {
     let dir = std::env::temp_dir().join(format!(
         "nix-p2p-task72-{tag}-{}-{:?}",
@@ -975,7 +965,9 @@ async fn a_positive_hold_answer_implies_a_servable_blob() {
     let dir = temp_dir("coverage");
     let held = nar_of(2 * 1024 * 1024, 0x77);
     let held_path = store_path_with(&dir, "held.nar", &held);
-    let held_key = key(1);
+    // task-56: RegularFileNarDumper serves the file's real bytes, so register under
+    // its TRUE NarHash - the index verifies sha256(--dump) == key at first serve.
+    let held_key = NarHashKey::from_raw_nar(&held);
 
     let index = Arc::new(
         AvailabilityIndex::open(
@@ -1053,7 +1045,10 @@ async fn a_digest_the_index_never_answered_for_is_declined_not_dial_then_failed(
         .expect("index opens"),
     );
     index
-        .register(key(2), store_path_with(&dir, "known.nar", &known))
+        .register(
+            NarHashKey::from_raw_nar(&known), // task-56: register under the real NarHash
+            store_path_with(&dir, "known.nar", &known),
+        )
         .expect("register");
 
     let supplier = Arc::new(IndexNarSupplier::new(

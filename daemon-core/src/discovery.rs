@@ -1091,15 +1091,14 @@ mod tests {
         NodeId::from_bytes([0xbb; 32])
     }
 
-    /// An index for `node`, holding `key -> a real (existing) store file` whose NAR
-    /// is `nar`. Returns the index and the temp dir (kept alive by the caller).
-    fn index_holding(
-        node: NodeId,
-        key: NarHashKey,
-        nar: Vec<u8>,
-    ) -> (Arc<AvailabilityIndex>, TempDir) {
+    /// An index for `node`, holding a real (existing) store file whose NAR is
+    /// `nar`, registered under its TRUE NarHash (`sha256(nar)`) - task-56 verifies
+    /// this at first serve, so a test must register the real key, not an arbitrary
+    /// one. Returns the index, the (true) key it holds, and the temp dir.
+    fn index_holding(node: NodeId, nar: Vec<u8>) -> (Arc<AvailabilityIndex>, NarHashKey, TempDir) {
         let dir = TempDir::new("idx");
         let store_path = dir.store_file("nar");
+        let key = NarHashKey::from_raw_nar(&nar);
         let index = AvailabilityIndex::open(
             node,
             Arc::new(MemoryNarDumper::new(nar)),
@@ -1108,7 +1107,7 @@ mod tests {
         )
         .expect("open index");
         index.register(key, store_path).expect("register");
-        (Arc::new(index), dir)
+        (Arc::new(index), key, dir)
     }
 
     // ---- the REAL query envelope, answered from the REAL index -------------
@@ -1116,13 +1115,13 @@ mod tests {
     #[tokio::test]
     async fn in_process_query_round_trips_the_envelope_and_answers_from_the_index() {
         let nar = b"the raw NAR node B holds".to_vec();
-        let (index, _dir) = index_holding(node_b(), key_x(), nar.clone());
+        let (index, key, _dir) = index_holding(node_b(), nar.clone());
         let mut rendezvous = InProcessPeerQuery::new();
         rendezvous.add_index(node_b(), index);
 
         let query = HoldQuery {
             schema_version: QUERY_SCHEMA_VERSION,
-            key: key_x(),
+            key,
         };
         let response = rendezvous
             .query(&node_b(), &query)
@@ -1148,13 +1147,20 @@ mod tests {
     async fn probing_one_key_never_reveals_another_holding() {
         // B holds Y but NOT X. A probes X: it learns only that X is Absent - the
         // response cannot enumerate that B also holds Y (there is no such method).
-        let (index, _dir) = index_holding(node_b(), key_y(), b"B holds only Y".to_vec());
+        // Y is the TRUE NarHash of B's held NAR (task-56); X is an arbitrary key B
+        // never registered, so it is Absent BEFORE any verification even runs.
+        let (index, key_y, _dir) = index_holding(node_b(), b"B holds only Y".to_vec());
+        let key_x = key_x();
+        assert_ne!(
+            key_x, key_y,
+            "X and Y must be distinct for the test to bite"
+        );
         let mut rendezvous = InProcessPeerQuery::new();
         rendezvous.add_index(node_b(), index);
 
         let probe_x = HoldQuery {
             schema_version: QUERY_SCHEMA_VERSION,
-            key: key_x(),
+            key: key_x,
         };
         let response = rendezvous.query(&node_b(), &probe_x).await.expect("probe");
         assert_eq!(
@@ -1167,11 +1173,11 @@ mod tests {
         // resolver is strictly per-key.
         let discovery = DirectDiscovery::new(vec![node_b()], Arc::new(rendezvous));
         assert!(
-            discovery.resolve(&key_x()).await.is_none(),
+            discovery.resolve(&key_x).await.is_none(),
             "X is not held; Y being held must not turn this into a hit"
         );
         assert!(
-            discovery.resolve(&key_y()).await.is_some(),
+            discovery.resolve(&key_y).await.is_some(),
             "Y is held; the same resolver finds it (control)"
         );
     }
@@ -1181,13 +1187,13 @@ mod tests {
     #[tokio::test]
     async fn resolve_returns_the_complete_offer_from_the_holder() {
         let nar = b"resolve me".to_vec();
-        let (index, _dir) = index_holding(node_b(), key_x(), nar.clone());
+        let (index, key, _dir) = index_holding(node_b(), nar.clone());
         let mut rendezvous = InProcessPeerQuery::new();
         rendezvous.add_index(node_b(), index);
         let discovery = DirectDiscovery::new(vec![node_b()], Arc::new(rendezvous));
 
-        let claim = discovery.resolve(&key_x()).await.expect("a hit");
-        assert_eq!(claim.key, key_x());
+        let claim = discovery.resolve(&key).await.expect("a hit");
+        assert_eq!(claim.key, key);
         assert_eq!(
             claim.content_id(),
             Some(&Blake3Digest::from_raw_nar(&nar)),
@@ -1529,10 +1535,20 @@ mod tests {
 
     // ---- task-91: the BATCHED probe ---------------------------------------
 
-    /// An index for `node` holding several keys, each backed by its own real file
-    /// whose NAR bytes are derived from the key (so every key has a DISTINCT
-    /// blake3 and a mis-mapped answer is detectable, not a coincidence).
-    fn index_holding_many(node: NodeId, keys: &[NarHashKey]) -> (Arc<AvailabilityIndex>, TempDir) {
+    /// The distinct raw NAR bytes for holding index `i`. The single source of the
+    /// content<->key coupling: `keys()[i] == NarHashKey::from_raw_nar(&nar_for(i))`,
+    /// and [`index_holding_many`] writes exactly these bytes to holding `i`'s file.
+    /// task-56 verifies `sha256(--dump) == key` at first serve, so a test's key MUST
+    /// be the true NarHash of the bytes the dumper yields - content is chosen first,
+    /// the key follows.
+    fn nar_for(i: usize) -> Vec<u8> {
+        format!("distinct raw NAR content for discovery holding #{i}").into_bytes()
+    }
+
+    /// An index for `node` holding the given holding INDICES, each backed by its own
+    /// real file whose bytes are [`nar_for`]`(i)` and registered under that content's
+    /// TRUE NarHash (so every key is genuinely servable and has a DISTINCT blake3).
+    fn index_holding_many(node: NodeId, held: &[usize]) -> (Arc<AvailabilityIndex>, TempDir) {
         let dir = TempDir::new("idx-many");
         let index = AvailabilityIndex::open(
             node,
@@ -1543,24 +1559,21 @@ mod tests {
             Arc::new(NullAnnounce),
         )
         .expect("open index");
-        for (i, key) in keys.iter().enumerate() {
+        for &i in held {
+            let content = nar_for(i);
+            let key = NarHashKey::from_raw_nar(&content);
             let path = dir.path.join(format!("nar-{i}"));
-            std::fs::write(&path, format!("NAR bytes for {key}")).expect("write");
-            index
-                .register(*key, StorePath::new(path))
-                .expect("register");
+            std::fs::write(&path, &content).expect("write");
+            index.register(key, StorePath::new(path)).expect("register");
         }
         (Arc::new(index), dir)
     }
 
-    /// `n` distinct canonical keys.
+    /// `n` distinct canonical keys, each the TRUE NarHash of its holding's content
+    /// ([`nar_for`]), so `keys()[i]` is what [`index_holding_many`]`(&[i])` registers.
     fn keys(n: usize) -> Vec<NarHashKey> {
         (0..n)
-            .map(|i| {
-                let mut raw = [0u8; 32];
-                raw[..8].copy_from_slice(&(i as u64 + 1).to_be_bytes());
-                NarHashKey::from_sha256_bytes(raw)
-            })
+            .map(|i| NarHashKey::from_raw_nar(&nar_for(i)))
             .collect()
     }
 
@@ -1629,7 +1642,7 @@ mod tests {
         // Peer 0 holds keys 0,3; peer 1 holds 1,4; peer 2 holds 2,5. Keys 6..9
         // are held by nobody, so they cost every peer a probe in both arms.
         for (p, node) in nodes.iter().enumerate() {
-            let held = vec![all[p], all[p + 3]];
+            let held = [p, p + 3];
             let (index, dir) = index_holding_many(*node, &held);
             rendezvous.add_index(*node, index);
             dirs.push(dir);
@@ -1665,7 +1678,7 @@ mod tests {
         // AC#1/AC#3 at unit scale: same peer, same keys, same answers - the ONLY
         // difference is how many times the peer was asked.
         let all = keys(20);
-        let (index, _dir) = index_holding_many(node_b(), &all);
+        let (index, _dir) = index_holding_many(node_b(), &(0..20).collect::<Vec<_>>());
         let mut rendezvous = InProcessPeerQuery::new();
         rendezvous.add_index(node_b(), index);
         let counting = CountingQuery::wrap(Arc::new(rendezvous));
@@ -1696,7 +1709,7 @@ mod tests {
     async fn a_closure_larger_than_the_cap_is_chunked_not_rejected() {
         // A 1000-path closure is 4 probes per peer, not 1000 and not an error.
         let all = keys(MAX_BATCH_HOLD_KEYS * 3 + 7);
-        let (index, _dir) = index_holding_many(node_b(), &all[..5]);
+        let (index, _dir) = index_holding_many(node_b(), &[0, 1, 2, 3, 4]);
         let mut rendezvous = InProcessPeerQuery::new();
         rendezvous.add_index(node_b(), index);
         let counting = CountingQuery::wrap(Arc::new(rendezvous));
@@ -1728,7 +1741,7 @@ mod tests {
         // The resolver de-duplicates before probing and fans the answer back out.
         let all = keys(3);
         let with_repeats = vec![all[0], all[1], all[0], all[2], all[0]];
-        let (index, _dir) = index_holding_many(node_b(), &[all[0]]);
+        let (index, _dir) = index_holding_many(node_b(), &[0]);
         let mut rendezvous = InProcessPeerQuery::new();
         rendezvous.add_index(node_b(), index);
         let counting = CountingQuery::wrap(Arc::new(rendezvous));
@@ -1756,7 +1769,7 @@ mod tests {
         // volunteer: it is positional over V, W, X.
         let all = keys(5);
         let (asked, held) = (&all[..3], &all[3..]);
-        let (index, _dir) = index_holding_many(node_b(), held);
+        let (index, _dir) = index_holding_many(node_b(), &[3, 4]);
         let mut rendezvous = InProcessPeerQuery::new();
         rendezvous.add_index(node_b(), index);
 
@@ -1886,7 +1899,7 @@ mod tests {
         }
 
         let all = keys(6);
-        let (index, _dir) = index_holding_many(node_b(), &all[..2]);
+        let (index, _dir) = index_holding_many(node_b(), &[0, 1]);
         let mut inner = InProcessPeerQuery::new();
         inner.add_index(node_b(), index);
         let counting = CountingQuery::wrap(Arc::new(inner));
@@ -1927,7 +1940,7 @@ mod tests {
             schema_version: QUERY_SCHEMA_VERSION,
             keys: keys(MAX_BATCH_HOLD_KEYS + 1),
         };
-        let (index, _dir) = index_holding_many(node_b(), &over_cap.keys[..1]);
+        let (index, _dir) = index_holding_many(node_b(), &[0]);
         let mut inner = InProcessPeerQuery::new();
         inner.add_index(node_b(), index);
 
@@ -1956,7 +1969,7 @@ mod tests {
                 self.0.query(node, query).await
             }
         }
-        let (index, _dir) = index_holding_many(node_b(), &over_cap.keys[..1]);
+        let (index, _dir) = index_holding_many(node_b(), &[0]);
         let mut inner = InProcessPeerQuery::new();
         inner.add_index(node_b(), index);
         let shim = SingleOnly(inner).query_batch(&node_b(), &over_cap).await;
@@ -1976,7 +1989,7 @@ mod tests {
         // `nix-store --dump`s per message" a caller precondition rather than a
         // property of the responder.
         let all = keys(MAX_BATCH_HOLD_KEYS + 1);
-        let (index, _dir) = index_holding_many(node_b(), &all[..1]);
+        let (index, _dir) = index_holding_many(node_b(), &[0]);
         let over_cap = BatchHoldQuery {
             schema_version: QUERY_SCHEMA_VERSION,
             keys: all,

@@ -23,7 +23,7 @@ use std::time::Duration;
 use daemon::{
     AnnounceSink, AvailabilityIndex, Blake3Digest, Claim, HoldAnswer, HoldQuery, JsonFileStore,
     KnownPayload, KnownTransport, MemoryNarDumper, NarDumper, NarHashKey, NodeId, NullAnnounce,
-    NullStore, QUERY_SCHEMA_VERSION, StorePath,
+    NullStore, QUERY_SCHEMA_VERSION, RegularFileNarDumper, StorePath,
 };
 
 // ------------------------------------------------------------------ helpers
@@ -213,13 +213,15 @@ fn a_held_key_yields_the_complete_offer_from_the_real_store() {
     let tmp = TempDir::new("offer");
     let nar = synth_raw_nar(b"the payload this node actually holds");
     let expected = Blake3Digest::from_raw_nar(&nar);
+    // task-56: register under the NAR's TRUE NarHash - the index now verifies
+    // sha256(--dump) == key at first serve, so an arbitrary key would be quarantined.
+    let key = NarHashKey::from_raw_nar(&nar);
 
     let (dumper, calls) = CountingDumper::pair(nar);
     let index =
         AvailabilityIndex::open(node(), dumper, Arc::new(NullStore), Arc::new(NullAnnounce))
             .expect("open");
 
-    let key = key_from(0x02);
     index
         .register(key, tmp.store_file("held.nar"))
         .expect("register");
@@ -280,6 +282,7 @@ fn concurrent_probes_hash_the_nar_exactly_once() {
     let tmp = TempDir::new("single-flight");
     let nar = synth_raw_nar(b"a big NAR that must be hashed exactly once");
     let expected = Blake3Digest::from_raw_nar(&nar);
+    let key = NarHashKey::from_raw_nar(&nar); // task-56: the real NarHash
 
     // A delay widens the window so a broken (check-then-compute) index would race
     // multiple dumps through it - making the count-once assertion a real bite.
@@ -288,8 +291,6 @@ fn concurrent_probes_hash_the_nar_exactly_once() {
         AvailabilityIndex::open(node(), dumper, Arc::new(NullStore), Arc::new(NullAnnounce))
             .expect("open"),
     );
-
-    let key = key_from(0x03);
     index
         .register(key, tmp.store_file("big.nar"))
         .expect("register");
@@ -329,7 +330,7 @@ fn registrations_survive_a_restart() {
     let store_path = tmp.store_file("kept.nar");
     let nar = synth_raw_nar(b"content served after a restart");
     let expected = Blake3Digest::from_raw_nar(&nar);
-    let key = key_from(0x04);
+    let key = NarHashKey::from_raw_nar(&nar); // task-56: the real NarHash
 
     // Boot 1: register, then drop the whole index (simulated shutdown).
     {
@@ -410,9 +411,10 @@ fn a_removed_store_path_drops_from_availability_and_is_pruned() {
     let tmp = TempDir::new("gc");
     let index_file = tmp.join("availability-index.json");
     let store_path = tmp.store_file("gc-me.nar");
-    let key = key_from(0x05);
+    let nar = synth_raw_nar(b"soon to be GC'd");
+    let key = NarHashKey::from_raw_nar(&nar); // task-56: the real NarHash
 
-    let (dumper, _calls) = CountingDumper::pair(synth_raw_nar(b"soon to be GC'd"));
+    let (dumper, _calls) = CountingDumper::pair(nar);
     let index = AvailabilityIndex::open(
         node(),
         dumper,
@@ -456,46 +458,77 @@ fn a_removed_store_path_drops_from_availability_and_is_pruned() {
 }
 
 #[test]
-fn retiring_one_same_digest_registration_preserves_its_sibling() {
-    let tmp = TempDir::new("same-digest-siblings");
-    let nar = synth_raw_nar(b"shared payload");
-    let digest = Blake3Digest::from_raw_nar(&nar);
-    let (dumper, _calls) = CountingDumper::pair(nar);
-    let index =
-        AvailabilityIndex::open(node(), dumper, Arc::new(NullStore), Arc::new(NullAnnounce))
-            .unwrap();
-    let first = key_from(0x51);
-    let second = key_from(0x52);
-    index.register(first, tmp.store_file("first")).unwrap();
-    index.register(second, tmp.store_file("second")).unwrap();
+fn retiring_one_registration_preserves_a_distinct_sibling() {
+    // task-56 NOTE: two DISTINCT registrations now necessarily have DISTINCT
+    // NarHashes and digests - the index verifies `sha256(--dump) == key`, so two
+    // holdings with identical NAR bytes are the SAME key, not siblings. The
+    // scalar-owner SAME-digest subtlety (two owners of one digest, retire one, the
+    // other survives) is therefore tested directly at its own layer in
+    // `daemon-core::supply_catalog::tests::retiring_one_same_digest_owner_preserves_its_sibling`.
+    // Here we prove the end-to-end behaviour with two genuinely distinct holdings:
+    // retiring one leaves the other servable and withdraws only its own record.
+    let tmp = TempDir::new("distinct-siblings");
+    let first_nar = synth_raw_nar(b"first holding payload");
+    let second_nar = synth_raw_nar(b"second holding payload");
+    let first_key = NarHashKey::from_raw_nar(&first_nar);
+    let second_key = NarHashKey::from_raw_nar(&second_nar);
+    let first_digest = Blake3Digest::from_raw_nar(&first_nar);
+    let second_digest = Blake3Digest::from_raw_nar(&second_nar);
+
+    // RegularFileNarDumper reads each path's real bytes, so each holding derives its
+    // own true NarHash from the file we write.
+    let first_path = tmp.join("first.nar");
+    std::fs::write(&first_path, &first_nar).unwrap();
+    let second_path = tmp.join("second.nar");
+    std::fs::write(&second_path, &second_nar).unwrap();
+
+    let index = AvailabilityIndex::open(
+        node(),
+        Arc::new(RegularFileNarDumper),
+        Arc::new(NullStore),
+        Arc::new(NullAnnounce),
+    )
+    .unwrap();
+    index
+        .register(first_key, StorePath::new(&first_path))
+        .unwrap();
+    index
+        .register(second_key, StorePath::new(&second_path))
+        .unwrap();
     assert!(matches!(
-        index.hold(&first).unwrap(),
+        index.hold(&first_key).unwrap(),
         HoldAnswer::Have { .. }
     ));
     assert!(matches!(
-        index.hold(&second).unwrap(),
+        index.hold(&second_key).unwrap(),
         HoldAnswer::Have { .. }
     ));
 
-    index.unregister(&second).unwrap();
-    index.unregister(&second).unwrap(); // retirement is explicitly idempotent
     let cancellation = AtomicCancellation(Arc::new(std::sync::atomic::AtomicBool::new(false)));
+    index.unregister(&second_key).unwrap();
+    index.unregister(&second_key).unwrap(); // retirement is explicitly idempotent
     assert_eq!(
         index
-            .supply_size_cancellable(&digest, &cancellation)
+            .supply_size_cancellable(&first_digest, &cancellation)
             .unwrap(),
-        Some(synth_raw_nar(b"shared payload").len() as u64),
-        "the first registration still owns an independent catalog record"
+        Some(first_nar.len() as u64),
+        "retiring the second registration must not withdraw the first"
     );
-
-    index.unregister(&first).unwrap();
-    index.unregister(&first).unwrap();
     assert_eq!(
         index
-            .supply_size_cancellable(&digest, &cancellation)
+            .supply_size_cancellable(&second_digest, &cancellation)
             .unwrap(),
         None,
-        "the digest disappears only after its final owner retires"
+        "the retired registration is no longer servable"
+    );
+
+    index.unregister(&first_key).unwrap();
+    assert_eq!(
+        index
+            .supply_size_cancellable(&first_digest, &cancellation)
+            .unwrap(),
+        None,
+        "and the first goes when it too retires"
     );
 }
 
@@ -504,12 +537,14 @@ fn stale_derivation_cannot_resurrect_a_replaced_registration() {
     let tmp = TempDir::new("stale-derive-replacement");
     let nar = synth_raw_nar(b"replacement race payload");
     let digest = Blake3Digest::from_raw_nar(&nar);
+    // task-56: both "old" and "new" dump to the SAME bytes (the memory dumper), so
+    // both legitimately verify against this one true NarHash.
+    let key = NarHashKey::from_raw_nar(&nar);
     let (dumper, calls) = CountingDumper::with_delay(nar, Duration::from_millis(100));
     let index = Arc::new(
         AvailabilityIndex::open(node(), dumper, Arc::new(NullStore), Arc::new(NullAnnounce))
             .unwrap(),
     );
-    let key = key_from(0x53);
     index.register(key, tmp.store_file("old")).unwrap();
     let holding = {
         let index = Arc::clone(&index);
@@ -549,19 +584,20 @@ fn publish_announces_the_complete_claim_only_when_held() {
     let tmp = TempDir::new("announce");
     let nar = synth_raw_nar(b"announced payload");
     let expected = Blake3Digest::from_raw_nar(&nar);
+    let key = NarHashKey::from_raw_nar(&nar); // task-56: the real NarHash
     let sink = Arc::new(RecordingAnnounce::default());
 
     let (dumper, _calls) = CountingDumper::pair(nar);
     let index =
         AvailabilityIndex::open(node(), dumper, Arc::new(NullStore), sink.clone()).expect("open");
 
-    // Not held yet -> nothing announced.
+    // Not held yet -> nothing announced. (An arbitrary key this node never
+    // registered is Absent BEFORE any verification runs.)
     let unheld = key_from(0x06);
     assert!(index.publish(&unheld).expect("publish").is_none());
     assert!(sink.claims.lock().unwrap().is_empty());
 
     // Held -> the complete claim is announced.
-    let key = key_from(0x07);
     index
         .register(key, tmp.store_file("ann.nar"))
         .expect("register");
@@ -615,7 +651,8 @@ fn computed_digest_reproduces_the_task48_golden_recipe_vectors() {
         let index =
             AvailabilityIndex::open(node(), dumper, Arc::new(NullStore), Arc::new(NullAnnounce))
                 .expect("open");
-        let key = key_from(0x40 + i as u8);
+        // task-56: register under the input's TRUE NarHash so verification passes.
+        let key = NarHashKey::from_raw_nar(&input);
         index
             .register(key, tmp.store_file(&format!("vec-{i}.nar")))
             .expect("register");

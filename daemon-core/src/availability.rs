@@ -80,11 +80,15 @@
 //!   * The index is synchronous and holds the entry lock across the (blocking) dump.
 //!     A caller on an async runtime should drive it via `spawn_blocking`. Making the
 //!     dump itself async is deferred with the streaming change.
-//!   * The `key -> store_path` binding is NOT verified at the source: `derive`
-//!     computes only the BLAKE3, never re-derives `sha256(dump)` to assert it equals
-//!     `key` (see [`AvailabilityIndex::register`]). Nix's gate 2 backstops it, but a
-//!     source-side check would make a mis-registration fail loud here. Forward-carried
-//!     (wants a sha256 pass over the NAR).
+//!   * The `key -> store_path` binding IS now verified at the source (task-56,
+//!     CLOSED). `derive` re-derives `sha256(--dump)` from the SAME buffer it
+//!     BLAKE3s and asserts it equals `key`; a mismatch QUARANTINES the entry (a
+//!     typed [`NarHashMismatch`], never a false `Have`). Nix's gate 2 still
+//!     backstops a bad INSTALL, but a mis-registration now fails loud HERE instead
+//!     of becoming a wasted-dial false claim. Remaining honest limit: the
+//!     quarantine verdict lives in the in-memory digest slot, so after a restart
+//!     the first probe re-dumps and re-checks (correct, just not persisted) - a
+//!     persisted quarantine is a possible optimisation, not a correctness gap.
 //!   * SEEDING (the eager kind) is external by design: producing a claim's `Iroh` offer does NOT put
 //!     the blob into this node's iroh-blobs store. task-39's [`crate::transport_iroh::IrohProvider::seed`]
 //!     is fed FROM this index (task-39/40/41 wire it); until then an announced offer
@@ -177,6 +181,41 @@ impl fmt::Display for PersistError {
 
 impl std::error::Error for PersistError {}
 
+/// A registered `key -> store_path` binding whose stored NAR does NOT hash to the
+/// key it was registered under: `sha256(nix-store --dump store_path)` differs from
+/// the registered [`NarHashKey`]. The path was MIS-REGISTERED - key X bound to a
+/// path whose real NarHash is Y (task-56).
+///
+/// This is surfaced LOUDLY, never as a silent `Absent`, because it is exactly the
+/// fault that would otherwise make this node answer a FALSE `Have` for X and then
+/// hand a peer Y: the consumer re-verifies at its own NarHash gate and rejects it,
+/// so the whole exchange is a WASTED DIAL that pollutes honest offload accounting
+/// and feeds the lying-claim pathological cost. The offending registration is
+/// QUARANTINED - never announced, never served, never a positive hold - until it
+/// is re-registered under the correct key.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NarHashMismatch {
+    /// The NarHash the caller CLAIMED this path has (the registration key).
+    pub registered: NarHashKey,
+    /// The NarHash the path ACTUALLY dumps to (sha256 of the real `--dump` bytes).
+    pub computed: NarHashKey,
+    /// The store path whose real content does not match its registered key.
+    pub store_path: StorePath,
+}
+
+impl fmt::Display for NarHashMismatch {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "NarHash mismatch: {} was registered under {} but its NAR dumps to {}; \
+             the binding is quarantined (never announced or served)",
+            self.store_path, self.registered, self.computed
+        )
+    }
+}
+
+impl std::error::Error for NarHashMismatch {}
+
 /// Aggregate error surfaced by the index query path.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AvailabilityError {
@@ -184,6 +223,10 @@ pub enum AvailabilityError {
     Dump(DumpError),
     /// The registration set could not be persisted.
     Persist(PersistError),
+    /// The registered path's real NarHash does not equal its registration key
+    /// (task-56): a mis-registration, quarantined rather than answered as a false
+    /// `Have`. Loud, never a silent `Absent`.
+    NarHashMismatch(NarHashMismatch),
 }
 
 impl fmt::Display for AvailabilityError {
@@ -191,6 +234,7 @@ impl fmt::Display for AvailabilityError {
         match self {
             AvailabilityError::Dump(e) => write!(f, "{e}"),
             AvailabilityError::Persist(e) => write!(f, "{e}"),
+            AvailabilityError::NarHashMismatch(e) => write!(f, "{e}"),
         }
     }
 }
@@ -200,6 +244,12 @@ impl std::error::Error for AvailabilityError {}
 impl From<DumpError> for AvailabilityError {
     fn from(e: DumpError) -> Self {
         AvailabilityError::Dump(e)
+    }
+}
+
+impl From<NarHashMismatch> for AvailabilityError {
+    fn from(e: NarHashMismatch) -> Self {
+        AvailabilityError::NarHashMismatch(e)
     }
 }
 
@@ -617,6 +667,22 @@ pub struct DerivedNar {
     pub nar_size_uncompressed_nar: u64,
 }
 
+/// The cached outcome of an entry's one-shot dump+hash. Either the VERIFIED
+/// derivation, or a QUARANTINE verdict because `sha256(--dump)` did not equal the
+/// registration key (task-56, a mis-registration).
+///
+/// A dump *failure* is deliberately NOT represented here: it leaves the slot
+/// `None` so the next caller retries (a transient nix error must not be cached).
+/// Only a COMPLETED dump with a definite verdict lands in the slot, so a
+/// deterministic mismatch is computed exactly once and then answered cheaply on
+/// every subsequent probe instead of re-dumping a NAR that can only fail again.
+enum DeriveOutcome {
+    /// The dump hashed to its registered NarHash; safe to serve/announce.
+    Verified(DerivedNar),
+    /// The dump did NOT hash to its registered NarHash; quarantined.
+    Quarantined(NarHashMismatch),
+}
+
 /// One registered holding: the store path (source of truth) and the single-flight
 /// cache of what its dump derives.
 struct Entry {
@@ -624,10 +690,10 @@ struct Entry {
     /// Scalar writer capability for this exact registration. It is never
     /// cloned into a provider record.
     supply_registration: SupplyRegistration,
-    /// The derived [`DerivedNar`], computed UNDER this lock exactly once. The
-    /// lock IS the single-flight guard: concurrent callers block here while the
-    /// first one dumps + hashes.
-    digest: Mutex<Option<DerivedNar>>,
+    /// The [`DeriveOutcome`], computed UNDER this lock exactly once. The lock IS
+    /// the single-flight guard: concurrent callers block here while the first one
+    /// dumps + hashes + verifies.
+    digest: Mutex<Option<DeriveOutcome>>,
 }
 
 /// A node's local availability index and claim producer. See the module docs.
@@ -715,16 +781,17 @@ impl AvailabilityIndex {
     /// content, which is exactly the binding this method does not verify. Dropping the
     /// carry is free: BLAKE3 is cheap-to-recompute derived state.)
     ///
-    /// TRUST ASSUMPTION (fail-fast-at-source gap, deliberately deferred): this binds
-    /// `key -> store_path` on the CALLER's word. `derive` later computes only the
-    /// BLAKE3 of the dump; it does NOT re-derive `sha256(dump)` and assert it equals
-    /// `key`. So a mis-registration yields a well-formed but FALSE claim. It cannot
-    /// cause a bad install - the Nix client re-verifies `sha256(nar) == NarHash`
-    /// (gate 2, the trust anchor; the daemon is outside the TCB, see `content_id`) -
-    /// but a node could advertise content it does not truly hold. Verifying the
-    /// sha256 alongside the blake3 from the same dump would close this at the source;
-    /// it is forward-carried (it wants a sha256 dep and a second hash pass over the
-    /// NAR, both out of scope for this feature cut).
+    /// TRUST NOTE (source-side verification, task-56): `register` binds
+    /// `key -> store_path` on the caller's word and does NOT dump here (it never
+    /// takes a digest lock, keeping the map lock cheap). The binding is instead
+    /// VERIFIED at first `derive`/serve: that path re-derives `sha256(--dump)` from
+    /// the same buffer it BLAKE3s and asserts it equals `key`, QUARANTINING a
+    /// mismatch (a typed [`NarHashMismatch`]) so a mis-registration can never become
+    /// a positive `Have`/announced claim. So a wrong `key` registers without error
+    /// but is caught the first time the content is actually derived - the false
+    /// claim is never emitted. (Nix's gate 2 still independently re-verifies
+    /// `sha256(nar) == NarHash` on the consumer, the trust anchor; the daemon is
+    /// outside the TCB, see `content_id`.)
     ///
     /// Persist ordering (Low): on a persist failure the in-memory map is already
     /// mutated while disk is not, so a restart reloads the pre-mutation set. The
@@ -788,7 +855,7 @@ impl AvailabilityIndex {
                 continue;
             }
 
-            let derived = match self.derive(&entry) {
+            let derived = match self.derive(key, &entry) {
                 Ok(derived) => derived,
                 Err(error) => {
                     let entries = self.entries.lock().expect("entries mutex");
@@ -1105,17 +1172,46 @@ impl AvailabilityIndex {
         Ok(())
     }
 
-    /// The single-flight compute: return the cached digest or, exactly once,
-    /// `dump` + hash it UNDER the entry lock. Concurrent callers for the same
-    /// uncomputed key block here and observe the cached `Some`; distinct keys use
-    /// distinct locks and hash in parallel. A dump failure leaves the slot `None`
-    /// so the next caller retries.
-    fn derive(&self, entry: &Entry) -> Result<DerivedNar, AvailabilityError> {
+    /// The single-flight compute: return the cached outcome or, exactly once,
+    /// `dump` + hash + VERIFY it UNDER the entry lock. Concurrent callers for the
+    /// same uncomputed key block here and observe the cached `Some`; distinct keys
+    /// use distinct locks and hash in parallel. A dump failure leaves the slot
+    /// `None` so the next caller retries; a definite verdict (verified OR
+    /// quarantined) is cached.
+    ///
+    /// task-56 SOURCE-SIDE VERIFICATION: `key` is the registered Nix NarHash. The
+    /// NarHash is `sha256(RawNarV1)` over the EXACT `--dump` bytes we already have
+    /// buffered for BLAKE3, so we re-derive it here IN THE SAME PASS (no second
+    /// dump - per-serve RSS is a concern, see task-72/157/158) and assert it equals
+    /// `key`. If it does not, the caller bound key X to a path whose real NarHash is
+    /// Y: we must NOT answer a positive `Have` for X (that is the false claim that
+    /// costs a peer a wasted dial), so the entry is QUARANTINED and every probe of
+    /// it fails loudly with a typed [`NarHashMismatch`]. The comparison is raw-byte
+    /// (`NarHashKey == NarHashKey`), so there is no encoding to get wrong.
+    fn derive(&self, key: &NarHashKey, entry: &Entry) -> Result<DerivedNar, AvailabilityError> {
         let mut slot = entry.digest.lock().expect("digest mutex");
-        if let Some(derived) = *slot {
-            return Ok(derived);
+        match &*slot {
+            Some(DeriveOutcome::Verified(derived)) => return Ok(*derived),
+            Some(DeriveOutcome::Quarantined(mismatch)) => {
+                return Err(AvailabilityError::NarHashMismatch(mismatch.clone()));
+            }
+            None => {}
         }
         let raw_nar = self.dumper.dump(&entry.store_path, &NeverCancelled)?;
+        // Verify the caller's binding BEFORE trusting the dump. sha256 of the same
+        // buffer that BLAKE3 will hash: honest registration => this equals `key`.
+        let computed = NarHashKey::from_raw_nar(&raw_nar);
+        if computed != *key {
+            let mismatch = NarHashMismatch {
+                registered: *key,
+                computed,
+                store_path: entry.store_path.clone(),
+            };
+            // Cache the QUARANTINE (a deterministic verdict), so a mis-registered
+            // key is not re-dumped on every probe. Loud, typed, never a false Have.
+            *slot = Some(DeriveOutcome::Quarantined(mismatch.clone()));
+            return Err(AvailabilityError::NarHashMismatch(mismatch));
+        }
         // The frozen recipe, applied in exactly one place: BLAKE3(RawNarV1), plain
         // and unkeyed, over the uncompressed dump - matches the task-48 golden. The
         // NarSize is read off the SAME buffer rather than stat'ed separately, so it
@@ -1124,7 +1220,7 @@ impl AvailabilityIndex {
             blake3: Blake3Digest::from_raw_nar(&raw_nar),
             nar_size_uncompressed_nar: raw_nar.len() as u64,
         };
-        *slot = Some(derived);
+        *slot = Some(DeriveOutcome::Verified(derived));
         Ok(derived)
     }
 

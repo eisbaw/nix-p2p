@@ -185,3 +185,72 @@ impl SupplyRegistration {
             .is_some_and(|owner| Arc::ptr_eq(&owner, state))
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::content_id::BLAKE3_DIGEST_LEN;
+
+    fn record(size: u64) -> SupplyCatalogRecord {
+        SupplyCatalogRecord {
+            declared_size: size,
+            source: NarProductionSource::Memory(Arc::new(vec![0u8; size as usize])),
+            store_path: PathBuf::from("/nix/store/stand-in"),
+        }
+    }
+
+    /// The scalar-owner invariant from the module docs, tested at its OWN layer:
+    /// two DIFFERENT registrations that publish the SAME digest each own an
+    /// independent record, so retiring one MUST NOT withdraw the sibling.
+    ///
+    /// This lives here rather than at the availability level because, once the
+    /// availability index verifies `sha256(--dump) == key` (task-56), two DISTINCT
+    /// NarHashKeys can no longer map to identical NAR bytes (hence identical
+    /// BLAKE3): key equality and digest equality now coincide. The catalog itself,
+    /// keyed by BLAKE3, still must uphold this refcount-like behaviour, so the
+    /// invariant is exercised directly here where two same-digest owners ARE
+    /// constructible.
+    #[test]
+    fn retiring_one_same_digest_owner_preserves_its_sibling() {
+        let catalog = SupplyCatalog::default();
+        let digest = Blake3Digest::from_bytes([0x5a; BLAKE3_DIGEST_LEN]);
+
+        let first = catalog.register();
+        let second = catalog.register();
+        assert!(catalog.publish(&first, digest, record(10)));
+        assert!(catalog.publish(&second, digest, record(20)));
+
+        // Both owners are live: the digest is servable.
+        assert!(catalog.read_handle().probe_record(&digest).is_some());
+
+        // Retire one (idempotently); the sibling keeps the digest servable.
+        catalog.retire(&second);
+        catalog.retire(&second);
+        assert!(
+            catalog.read_handle().probe_record(&digest).is_some(),
+            "a same-digest sibling must survive its peer's retirement"
+        );
+
+        // Retire the last owner: only now does the digest disappear.
+        catalog.retire(&first);
+        assert!(
+            catalog.read_handle().probe_record(&digest).is_none(),
+            "the digest disappears only after its FINAL owner retires"
+        );
+    }
+
+    /// A retired registration cannot publish (no zombie records), and belongs-to
+    /// is enforced so a token from another catalog is inert.
+    #[test]
+    fn a_retired_registration_cannot_publish() {
+        let catalog = SupplyCatalog::default();
+        let digest = Blake3Digest::from_bytes([0x11; BLAKE3_DIGEST_LEN]);
+        let reg = catalog.register();
+        catalog.retire(&reg);
+        assert!(
+            !catalog.publish(&reg, digest, record(1)),
+            "a retired registration must not resurrect a record"
+        );
+        assert!(catalog.read_handle().probe_record(&digest).is_none());
+    }
+}
