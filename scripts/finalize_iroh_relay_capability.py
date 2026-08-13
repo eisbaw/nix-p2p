@@ -27,6 +27,7 @@ synthesized good artifact, and bites the arm/verdict/capture logic by mutation.
 from __future__ import annotations
 
 import argparse
+import ipaddress
 import json
 import re
 import sys
@@ -58,8 +59,14 @@ MANIFEST_SCHEMA = "iroh-relay-capability-raw-evidence-manifest-v1"
 ARTIFACT_SCHEMA_PATH = "docs/iroh-relay-capability-artifact-v1.schema.json"
 CAPABILITY_DOCUMENT_PATH = "docs/iroh-relay-capability-v1.md"
 
-DEADLINE_MS = 10_000
-GRACE_MS = 1_000
+# Single source of truth: the deadline bounds and the per-arm spec live in the
+# harness; the finalizer imports them so the two instruments cannot drift (a DEEP
+# gate flagged the duplicated copies). The subnet host OFFSETS the attribution
+# coordinates must sit at are likewise the harness's, not re-guessed literals.
+DEADLINE_MS = harness.DEADLINE_MS
+GRACE_MS = harness.GRACE_MS
+ACCEPTOR_HOST_OFFSET = harness.ACCEPTOR_HOST_OFFSET
+RELAY_HOST_OFFSET = harness.RELAY_HOST_OFFSET
 PROFILE = "production-shaped-local"
 OWNER = "nix-p2p-task142-evidence"
 
@@ -67,36 +74,7 @@ RUN_ID_RE = re.compile(r"^[a-z0-9][a-z0-9-]{7,47}$")
 NODE_ID_RE = re.compile(r"^[0-9a-f]{64}$")
 
 # Every arm the routed run must produce, and the typed outcome each must show.
-ARM_SPECS: dict[str, dict[str, object]] = {
-    "relay-success": {
-        "verdict": "connected",
-        "path": "relayed",
-        "relay_attributed": True,
-    },
-    "direct-positive": {
-        "verdict": "connected",
-        "path": "direct",
-        "relay_attributed": False,
-    },
-    "relay-outage": {"verdict": "unavailable", "reasons": ("relay_outage", "deadline")},
-    "wrong-url": {"verdict": "unavailable", "reasons": ("wrong_relay_url",)},
-    "wrong-certificate": {
-        "verdict": "unavailable",
-        "reasons": ("wrong_certificate", "relay_outage", "deadline"),
-    },
-    "wrong-identity": {
-        "verdict": "unavailable",
-        "reasons": ("wrong_identity", "deadline"),
-    },
-    "half-open-stream": {
-        "verdict": "unavailable",
-        "reasons": ("half_open_stream", "deadline"),
-    },
-    "forced-direct-failure": {
-        "verdict": "unavailable",
-        "reasons": ("forced_direct_failure", "deadline"),
-    },
-}
+ARM_SPECS: dict[str, dict[str, object]] = harness.CONNECT_ARMS
 
 # The committed files whose git blob hashes are bound into the artifact, so the
 # reviewed implementation cannot be silently swapped under the evidence.
@@ -139,6 +117,26 @@ LIMITATIONS = (
             "bounded 'deadline' rather than a finer typed reason: the peer "
             "reports only what iroh's connect observes. Causal attribution is "
             "the harness topology and packet capture, not the peer self-report."
+        ),
+    },
+    {
+        "id": "ipv4-only-attribution",
+        "description": (
+            "Packet attribution is IPv4-only over IPv4-only internal podman "
+            "networks; the finalizer requires every captured record to decode to "
+            "an IPv4 TCP/UDP flow (records == IPv4-flow count), so a non-IPv4 "
+            "path cannot silently escape the zero-direct guard. The attribution "
+            "coordinates (relay_ip/acceptor_ip) are re-derived from the canonical "
+            "acceptor subnet offsets, not trusted from run.json."
+        ),
+    },
+    {
+        "id": "connect-ms-peer-self-report",
+        "description": (
+            "connect_ms is a peer self-report bounded by the peer's own 10000 ms "
+            "connect timeout; the finalizer's 11000 ms gate re-asserts the "
+            "deadline (no longer clamps it) rather than measuring latency "
+            "independently. Its anchor is the git-blob-pinned peer binary."
         ),
     },
 )
@@ -298,8 +296,17 @@ def validate_arm(scenario: str, arm: dict[str, object]) -> dict[str, object]:
                     "relay-success captured direct-peer packets: the direct path was "
                     "not blocked, so 'relay carried it' is falsifiable"
                 )
-        if scenario == "direct-positive" and attributed:
-            fail("direct-positive control was credited to the relay")
+        if scenario == "direct-positive":
+            if attributed:
+                fail("direct-positive control was credited to the relay")
+            # Capture-bind the positive control symmetric with relay-success: it
+            # must show REAL direct-peer traffic, not merely a peer self-report of
+            # a direct path. (Re-derivation binds this count to the bytes.)
+            if direct_packets <= 0:
+                fail(
+                    "direct-positive control captured no direct-peer packets: the "
+                    "direct path is unproven"
+                )
     else:
         reason = arm.get("reason")
         if reason not in spec["reasons"]:
@@ -307,6 +314,65 @@ def validate_arm(scenario: str, arm: dict[str, object]) -> dict[str, object]:
         if attributed:
             fail(f"{scenario}: an unavailable arm must not be relay-attributed")
     return dict(arm)
+
+
+def canonical_subnet_host(subnet: str, index: int, label: str) -> str:
+    """Return the ``index``-th usable host of a STRICT (canonical) subnet, or
+    fail. Used to re-derive the attribution coordinates from the acceptor subnet
+    instead of trusting them as free text from run.json."""
+    try:
+        network = ipaddress.ip_network(subnet, strict=True)
+    except ValueError as error:
+        fail(f"topology.{label} {subnet!r} is not a canonical network: {error}")
+    if not isinstance(network, ipaddress.IPv4Network):
+        fail(f"topology.{label} {subnet!r} is not an IPv4 network")
+    hosts = list(network.hosts())
+    if index >= len(hosts):
+        fail(f"topology.{label} {subnet!r} is too small for host offset {index}")
+    return str(hosts[index])
+
+
+def assert_topology_coordinates(
+    topology: dict[str, object], relay_ip: str, acceptor_ip: str, relay_url: str
+) -> None:
+    """B1: the packet-attribution coordinates (which IP is 'the relay' and which
+    is 'the acceptor peer') must not be trusted as free text from run.json. A
+    forged ``acceptor_ip`` pointed at a quiet address would let the IPv4 direct
+    counter re-derive zero while a REAL leak reached the true peer, masking it and
+    forging the artifact's central 'the relay carried it because direct was
+    L3-blocked' claim.
+
+    Both IPs are DETERMINISTIC host offsets of the acceptor subnet in the
+    harness's ``make_topology`` (acceptor = hosts[ACCEPTOR_HOST_OFFSET], relay =
+    hosts[RELAY_HOST_OFFSET]). Re-derive them from the strict subnet and reject
+    any drift. ``relay_ip`` is independently pinned to real traffic by the
+    relay-success relay>0 + zero-direct guards, so binding ``acceptor_ip`` to the
+    same subnet transitively pins it to the true peer."""
+    acceptor_subnet = require_string(
+        topology.get("acceptor_subnet"), "topology.acceptor_subnet"
+    )
+    expected_acceptor = canonical_subnet_host(
+        acceptor_subnet, ACCEPTOR_HOST_OFFSET, "acceptor_subnet"
+    )
+    expected_relay = canonical_subnet_host(
+        acceptor_subnet, RELAY_HOST_OFFSET, "acceptor_subnet"
+    )
+    if acceptor_ip != expected_acceptor:
+        fail(
+            f"topology.acceptor_ip {acceptor_ip!r} is not the canonical acceptor host "
+            f"{expected_acceptor!r} of {acceptor_subnet!r}; the direct-attribution "
+            "coordinate is unbound"
+        )
+    if relay_ip != expected_relay:
+        fail(
+            f"topology.relay_ip {relay_ip!r} is not the canonical relay host "
+            f"{expected_relay!r} of {acceptor_subnet!r}"
+        )
+    host = re.match(r"^https://([^:/?#]+)", relay_url)
+    if host is None or host.group(1) != relay_ip:
+        fail(
+            f"relay_url {relay_url!r} host does not match topology.relay_ip {relay_ip!r}"
+        )
 
 
 def rederive_and_bind_captures(
@@ -376,6 +442,15 @@ def rederive_and_bind_captures(
                 f"{scenario}: bound pcap holds {records} record(s) but tcpdump captured "
                 f"{stats.captured}; pcap is truncated or is not the captured evidence"
             )
+        # Every captured record must decode to an attributable IPv4 TCP/UDP flow.
+        # The relay/direct counters are IPv4-only, so a non-IPv4 record (e.g. an
+        # IPv6 direct leak) would be invisible to the zero-direct guard; requiring
+        # records == IPv4-flow count keeps attribution total, not partial.
+        if len(flows) != records:
+            fail(
+                f"{scenario}: {records - len(flows)} captured record(s) are not "
+                "attributable IPv4 TCP/UDP flows; packet attribution is incomplete"
+            )
         # The harness also records these counters into run.json; require they
         # match the capture log so a doctored run.json cannot mask a drop.
         for key, expected in (
@@ -435,6 +510,9 @@ def validate_raw_run(raw_root: Path, implementation_commit: str) -> dict[str, ob
     topology = require_mapping(run.get("topology"), "run.json.topology")
     relay_ip = require_string(topology.get("relay_ip"), "topology.relay_ip")
     acceptor_ip = require_string(topology.get("acceptor_ip"), "topology.acceptor_ip")
+    # B1: pin the attribution coordinates to the deterministic subnet offsets so a
+    # forged acceptor_ip cannot point the direct counter at a quiet address.
+    assert_topology_coordinates(topology, relay_ip, acceptor_ip, relay_url)
     # F2: bind the verdict to the captured bytes before trusting any of run.json's
     # self-reported packet counts.
     rederive_and_bind_captures(raw_root, seen, relay_ip, acceptor_ip)
@@ -557,7 +635,7 @@ def _good_summary() -> dict[str, object]:
         "run_id": "r1234567",
         "relay": {
             "kind": "local-routed-iroh-relay",
-            "relay_url": "https://10.208.1.40:44380",
+            "relay_url": "https://10.208.2.40:44380",
             "owner": OWNER,
             "authorization_class": PROFILE,
             "external_contact_authorized": False,
@@ -664,6 +742,15 @@ def self_test() -> None:
         lambda: validate_arm("direct-positive", arm), "direct-positive-credited"
     )
 
+    # 3b. direct-positive control with NO captured direct-peer packets (B1): the
+    # control is now capture-bound, not peer-self-report-bound.
+    arm = _good_arm("direct-positive")
+    arm["captured_direct_peer_packets"] = 0
+    _expect_rejected(
+        lambda: validate_arm("direct-positive", arm),
+        "direct-positive-no-direct-packets",
+    )
+
     # 4. an unavailable arm with a false connected verdict.
     arm = _good_arm("relay-outage")
     arm["verdict"] = "connected"
@@ -698,10 +785,49 @@ def self_test() -> None:
         lambda: validate_artifact_schema(bad, schema), "external-contact-authorized"
     )
 
+    # --- B1: the attribution coordinates are bound to the subnet (offline) ---
+    _self_test_topology_binding()
+
     # --- F2: the verdict is bound to the CAPTURED evidence (offline) ---
     _self_test_capture_binding()
 
     print("iroh-relay-capability artifact finalizer self-test: PASS")
+
+
+def _self_test_topology_binding() -> None:
+    subnet = "10.208.2.0/24"
+    relay_ip = canonical_subnet_host(subnet, RELAY_HOST_OFFSET, "acceptor_subnet")
+    acceptor_ip = canonical_subnet_host(subnet, ACCEPTOR_HOST_OFFSET, "acceptor_subnet")
+    url = f"https://{relay_ip}:44380"
+    topology = {"acceptor_subnet": subnet}
+    # The canonical coordinates pass.
+    assert_topology_coordinates(topology, relay_ip, acceptor_ip, url)
+
+    # B1 bite (the demonstrated forge): relocate acceptor_ip to a quiet host so a
+    # real direct leak to the TRUE acceptor would be counted against the decoy.
+    _expect_rejected(
+        lambda: assert_topology_coordinates(topology, relay_ip, "10.208.2.99", url),
+        "acceptor-ip-relocated",
+    )
+    # relay_ip drifted off its canonical offset.
+    _expect_rejected(
+        lambda: assert_topology_coordinates(topology, "10.208.2.41", acceptor_ip, url),
+        "relay-ip-relocated",
+    )
+    # relay_url host disagreeing with relay_ip.
+    _expect_rejected(
+        lambda: assert_topology_coordinates(
+            topology, relay_ip, acceptor_ip, "https://10.208.2.99:44380"
+        ),
+        "relay-url-host-mismatch",
+    )
+    # a non-canonical (host-bits-set) subnet.
+    _expect_rejected(
+        lambda: assert_topology_coordinates(
+            {"acceptor_subnet": "10.208.2.5/24"}, relay_ip, acceptor_ip, url
+        ),
+        "non-canonical-subnet",
+    )
 
 
 # Relay/acceptor endpoints for the synthetic capture-binding self-test. The
@@ -818,6 +944,44 @@ def _self_test_capture_binding() -> None:
             ),
             "kernel-drop",
         )
+        _synthetic_capture_tree_repair(root, arms, "direct-positive")
+
+        # Bite 5 (S2): a captured record that is NOT an attributable IPv4 TCP/UDP
+        # flow (an IPv6 direct leak would be invisible to the zero-direct guard).
+        # Everything else is kept consistent so ONLY the IPv4-completeness check
+        # can fire: capture.log and the counters are bumped to records, and the
+        # re-derived relay count still matches (the non-IPv4 record adds no flow).
+        packets = _synthetic_arm_packets("relay-success")
+        poisoned = _append_nonipv4_record(harness.build_pcap(packets))
+        records = harness.count_pcap_records(poisoned)
+        (root / "relay-success.pcap").write_bytes(poisoned)
+        (root / "relay-success.capture.log").write_bytes(
+            _capture_log(records, records, 0)
+        )
+        poisoned_arms = {s: dict(a) for s, a in arms.items()}
+        poisoned_arms["relay-success"].update(
+            {
+                "captured_packets": records,
+                "received_by_filter": records,
+                "captured_pcap_records": records,
+                "dropped_by_kernel": 0,
+            }
+        )
+        _expect_rejected(
+            lambda: rederive_and_bind_captures(
+                root, poisoned_arms, _ST_RELAY_IP, _ST_ACCEPTOR_IP
+            ),
+            "non-ipv4-record-unattributed",
+        )
+        _synthetic_capture_tree_repair(root, arms, "relay-success")
+
+
+def _append_nonipv4_record(data: bytes) -> bytes:
+    """Append one big-endian pcap record whose IP version nibble is 6, so
+    count_pcap_records counts it but parse_pcap_flows (IPv4-only) does not."""
+    frame = b"\x60" + b"\x00" * 39
+    header = (0).to_bytes(4, "big") * 2 + len(frame).to_bytes(4, "big") * 2
+    return data + header + frame
 
 
 def _synthetic_capture_tree_repair(

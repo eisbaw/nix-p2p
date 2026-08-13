@@ -60,6 +60,16 @@ NAME_PREFIX = "nix-p2p-task142"
 SUBNET_POOL = ipaddress.ip_network("10.208.0.0/12")
 SUBNET_PREFIX = 24
 
+# Deterministic host offsets within each /24 (index into subnet.hosts()). These
+# are the SINGLE SOURCE OF TRUTH for the packet-attribution coordinates: the
+# finalizer re-derives relay_ip / acceptor_ip from the acceptor subnet at these
+# exact offsets and rejects any run.json that relocates them, so the direct-block
+# claim cannot be masked by a forged coordinate.
+CONNECTOR_HOST_OFFSET = 9
+ACCEPTOR_HOST_OFFSET = 9
+RELAY_HOST_OFFSET = 39
+DEAD_RELAY_HOST_OFFSET = 41
+
 RELAY_HTTPS_PORT = 44380
 IROH_PORT = 44330
 DEADLINE_MS = 10_000
@@ -204,15 +214,15 @@ def make_topology(
         router=f"{NAME_PREFIX}-{run_id}-router",
         connector_subnet=str(connector_subnet),
         acceptor_subnet=str(acceptor_subnet),
-        connector_ip=str(connector_hosts[9]),
+        connector_ip=str(connector_hosts[CONNECTOR_HOST_OFFSET]),
         router_connector_ip=str(connector_hosts[19]),
-        acceptor_ip=str(acceptor_hosts[9]),
+        acceptor_ip=str(acceptor_hosts[ACCEPTOR_HOST_OFFSET]),
         router_acceptor_ip=str(acceptor_hosts[19]),
-        relay_ip=str(acceptor_hosts[39]),
+        relay_ip=str(acceptor_hosts[RELAY_HOST_OFFSET]),
         # A routable-but-unused acceptor-subnet address: the relay-outage arm
         # points the connector here, so the relay is genuinely unreachable
         # (packets are forwarded by the router but nothing listens).
-        dead_relay_ip=str(acceptor_hosts[41]),
+        dead_relay_ip=str(acceptor_hosts[DEAD_RELAY_HOST_OFFSET]),
     )
 
 
@@ -864,6 +874,14 @@ def run_arm(
         fail(
             f"{scenario}: pcap holds {pcap_records} record(s) but tcpdump captured "
             f"{stats.captured}; pcap is truncated"
+        )
+    # The direct-positive control must be CAPTURE-bound symmetric with
+    # relay-success: it has to show real direct-peer traffic, else its claim to
+    # exercise the direct path rests only on the peer self-report.
+    if scenario == "direct-positive" and direct_packets <= 0:
+        fail(
+            f"{scenario}: control captured no direct-peer packets to "
+            f"{topology.acceptor_ip}:{IROH_PORT}; the direct path is unproven"
         )
 
     if scenario in ACCEPTOR_ARMS:

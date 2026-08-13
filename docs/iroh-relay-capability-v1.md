@@ -22,9 +22,17 @@ driven.
 Each relayed connect attempt gets one absolute 10,000 ms deadline
 (`RELAY_CONNECT_DEADLINE`) with at most 1,000 ms scheduler grace
 (`RELAY_SCHEDULER_GRACE`). The peer measures the REAL connect duration
-(`connect_ms`) around its own bounded connect and emits it UNCLAMPED, so the
-finalizer's `connect_ms <= 11000 ms` deadline oracle can actually bite; the
-container wall-clock (`elapsed_ms`, which also covers connection close and the
+(`connect_ms`) around its own bounded connect and emits it UNCLAMPED; the
+finalizer gates `connect_ms <= 11000 ms` and, unlike the old container-wall-clock
+`elapsed_ms` (which was clamped to the schema max so an overrun was silently
+censored), it now REJECTS any value past the bound rather than hiding it.
+Honestly scoped: `connect_ms` is bounded by the peer's OWN 10000 ms connect
+timeout, so a healthy run tops out near 10000 — the finalizer's 11000 ms gate is
+a redundant re-assertion with grace slack, not an independent latency bound; and
+`connect_ms` is a peer self-report whose only anchor is the git-blob-pinned peer
+binary (it is not cross-checkable against the pcap). Its real signal is the
+sub-deadline arms (a relayed connect completing in ~3 s, a fast direct control).
+The container wall-clock `elapsed_ms` (which also covers connection close and the
 post-connect exchange) is retained as informational-only and is never gated. The
 sole config-time arm (`wrong-url`) is rejected before any network I/O and carries
 no `connect_ms`. Path attribution uses the pure
@@ -74,9 +82,15 @@ set plus each arm's `capture.log`, RE-PARSES every pcap to re-derive the relay
 and direct-peer packet counts (rejecting any disagreement with `run.json`), and
 re-checks tcpdump's own capture-completeness counters (zero kernel drops,
 captured == received-by-filter, and pcap records == captured) so a zero-direct
-assertion cannot hide a dropped or truncated capture. The raw pcaps + capture
-logs are retained alongside the artifact so the counts stay independently
-re-derivable. Missing or invalid evidence is a fatal validation error,
+assertion cannot hide a dropped or truncated capture. The attribution
+COORDINATES are not trusted as free text either: `relay_ip` and `acceptor_ip` are
+re-derived from the (strict, canonical) acceptor subnet at their deterministic
+`make_topology` offsets and the `relay_url` host must equal `relay_ip`, so a
+forged `acceptor_ip` cannot point the direct counter at a decoy while a real leak
+reaches the true peer. Attribution is IPv4-only, so every captured record must
+decode to an IPv4 TCP/UDP flow (records == IPv4-flow count) — a non-IPv4 packet
+would otherwise be unattributed. The raw pcaps + capture logs are retained
+alongside the artifact so the counts stay independently re-derivable. Missing or invalid evidence is a fatal validation error,
 never `no_go`; `no_go` is reserved for an evidenced capability constraint the
 reviewed implementation cannot provide, and TASK-89 must propagate that verdict.
 
@@ -89,3 +103,9 @@ reviewed implementation cannot provide, and TASK-89 must propagate that verdict.
   public-Internet / NAT-traversal proof.
 - Some adverse arms may report a bounded `deadline` rather than a finer typed
   reason; the topology and capture, not the peer, establish the cause.
+- Packet attribution is IPv4-only; the topology uses IPv4-only internal podman
+  networks and the finalizer requires every captured record to decode to an IPv4
+  TCP/UDP flow, so a non-IPv4 path cannot silently escape the zero-direct guard.
+- `connect_ms` is a peer self-report bounded by the peer's own 10000 ms connect
+  timeout; the finalizer's 11000 ms gate re-asserts the deadline (no longer
+  clamps it) but is not an independent latency measurement.
