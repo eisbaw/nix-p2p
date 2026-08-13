@@ -3,11 +3,11 @@ id: TASK-56
 title: >-
   Availability index: verify sha256(dump)==NarHash at register (not caller's
   word)
-status: In Progress
+status: Done
 assignee:
   - '@me'
 created_date: '2026-08-09 00:10'
-updated_date: '2026-08-13 10:11'
+updated_date: '2026-08-13 10:16'
 labels:
   - wave-2
 dependencies:
@@ -23,7 +23,7 @@ task-50 honest limit: register() binds NarHashKey->store_path on the CALLER's wo
 
 ## Acceptance Criteria
 <!-- AC:BEGIN -->
-- [ ] #1 register/first-serve asserts sha256(--dump)==NarHash; a mis-registered path is rejected/quarantined, never announced as a valid claim (bite: register key X for a path whose real NarHash is Y -> rejected)
+- [x] #1 register/first-serve asserts sha256(--dump)==NarHash; a mis-registered path is rejected/quarantined, never announced as a valid claim (bite: register key X for a path whose real NarHash is Y -> rejected)
 <!-- AC:END -->
 
 ## Implementation Plan
@@ -53,3 +53,9 @@ REGATE GATE (bounded, per coordinator): cargo build -p daemon-libp2p --locked OK
 
 HONEST LIMITS: sign_libp2p_provider_record itself stays pure/unguarded (returns ProviderRecord, not Result) - both SHIPPED binaries mint only via announce_provider_seeds so 100% of shipped mint paths are covered; a direct sign() caller (only daemon/tests/libp2p_provider_path.rs, a test) can still craft a record, which is test-only. No new tracker filed.
 <!-- SECTION:NOTES:END -->
+
+## Final Summary
+
+<!-- SECTION:FINAL_SUMMARY:BEGIN -->
+Closed the availability integrity floor: a node can no longer announce a claim whose bytes don't match the declared Nix NarHash. (1) AvailabilityIndex::derive re-derives sha256(nix-store --dump path) from the SAME buffered dump it BLAKE3s (new NarHashKey::from_raw_nar; no second dump) and asserts ==registered key; a mismatch is a typed NarHashMismatch cached as a sticky Quarantined slot so hold!=Have, claim/publish don't announce, answer_batch->Absent. (2) The SHIPPED libp2p provider (which announces from --libp2p-seed-nar, bypassing the index) now verifies at the announce SSOT announce_provider_seeds: verify_provider_seeds asserts NarHashKey::from_raw_nar(bytes)==declared for every seed and fail-fast rejects the whole batch (typed SeedNarHashMismatch) BEFORE any sign/put; both shipped binaries route through it, no bypass. DEEP-gated: qa GO (mechanics, 132/0 + independence green with new sha2), codex NO-GO (shipped provider bypassed the index - built-but-not-load-bearing) -> fixed at SSOT -> codex GO (all shipped mint paths guarded, 13/13). Representation proven correct (raw-byte compare; from_raw_nar and narinfo->NarHashKey both reduce to same 32 bytes, cross-checked vs Nix's own vector). Frozen wire untouched. Honest limit: cached Verified assumes immutable backing (moot for /nix/store; serving rechecks BLAKE3 so no wrong bytes reach a peer). sha2 added daemon-side (independence green).
+<!-- SECTION:FINAL_SUMMARY:END -->
