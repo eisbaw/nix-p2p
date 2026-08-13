@@ -1,10 +1,11 @@
 ---
 id: TASK-70
 title: 'The PEER link is still loopback: every peer-advantage number is an upper bound'
-status: To Do
-assignee: []
+status: In Progress
+assignee:
+  - '@me'
 created_date: '2026-08-09 15:35'
-updated_date: '2026-08-13 14:56'
+updated_date: '2026-08-13 21:03'
 labels:
   - measurement
   - finding
@@ -22,10 +23,10 @@ FOUND BY TASK-63. Task-63 shaped the UPSTREAM arm (per-request RTT + NAR egress 
 
 ## Acceptance Criteria
 <!-- AC:BEGIN -->
-- [ ] #1 The peer link is shaped with an RTT and a bandwidth cap, and the shaping is ASSERTED from outside the shaper with a negative control, the same discipline as TASK-63's upstream probe (a shaper that never fired must go red with a named failure)
-- [ ] #2 The shaping does NOT live in the product daemon, or if it must, it is compiled/feature-gated out of the shipped binary and that is proven
+- [x] #1 The peer link is shaped with an RTT and a bandwidth cap, and the shaping is ASSERTED from outside the shaper with a negative control, the same discipline as TASK-63's upstream probe (a shaper that never fired must go red with a named failure)
+- [x] #2 The shaping does NOT live in the product daemon, or if it must, it is compiled/feature-gated out of the shipped binary and that is proven
 - [ ] #3 The wan_shaped speedup is re-stated with BOTH sides shaped, next to the peer-loopback number, and the report says which of the two is the upper bound
-- [ ] #4 Honest limit recorded: what the chosen route still does not model (loss, jitter, competing flows, NAT traversal cost)
+- [x] #4 Honest limit recorded: what the chosen route still does not model (loss, jitter, competing flows, NAT traversal cost)
 <!-- AC:END -->
 
 ## Implementation Notes
@@ -52,4 +53,23 @@ FIX AND ORDER: TASK-94 measures the inequality; TASK-99 fixes it by compressing 
 content - the addressed unit must stay BLAKE3(raw nar) or peers compressing with different settings
 produce different blob ids and lose all sharing). Do not re-derive any policy threshold, speedup, or
 peer-vs-upstream ranking from this task until TASK-99 has landed and TASK-99 AC#4 has re-measured.
+
+## AC#1/#2/#4 LANDED; AC#3 DEFERRED to TASK-198 (2026-08-13)
+
+SETTLED ROUTE (c), proven on this box: `unshare -Urn` yields a user+net namespace whose map-root grants FULL caps (CapEff 000001ffffffffff) WITHOUT real root, so ip/tc work. The load-bearing detail the earlier spike missed: with BOTH veth ends in ONE netns the kernel short-circuits the pair locally and netem never shapes (the 100% 'loss' artifact). FIX: move the peer end into a SECOND netns via the child-pid pattern — fork `unshare -n sleep`, address it by /proc/<pid>/ns/net, `ip link set veth1 netns <pid>`, configure with `nsenter -t <pid> -n`. netem delay+rate applied to BOTH egress directions => symmetric RTT ~= 2*delay.
+
+ARTIFACTS (all on script/measurement surface, NEVER in the shipped daemon):
+  - scripts/shaped_link.py        — driver + PURE oracle assert_shaping() + --self-test + honest limits
+  - scripts/shaped_link_inner.sh  — in-namespace nested-netns/veth/netem setup (child-pid pattern), exact-pid cleanup trap
+  - scripts/shaped_link_xfer.py   — sender-timed bulk TCP (drain-ack => rate is an endpoint clock OUTSIDE netem's own accounting)
+  - scripts/check_shaping_out_of_daemon.py — AC#2 guard, wired into `just independence`
+
+AC#1 (shaping asserted host-side + negative control, oracle must bite): DONE. Oracle refuses the run unless the injected RTT is recovered on the shaped arm AND the unshaped control RTT is ~0 AND shaped throughput is near the cap (bit, not collapsed) AND the unshaped control is MEASURABLY faster (>=2x) — a shaper that never fired goes RED with a named cause (task-63 discipline). `shaped_link.py --self-test` proves non-vacuous: baseline accepted, all 6 mutations + 2 truncations bitten.
+AC#2 (not in the shipped binary, proven): DONE by construction (script-only) + gate-enforced: check_shaping_out_of_daemon.py scans the 7 shipped crate src/ trees for netem/veth/unshare/tc-qdisc/ip-netns/NET_ADMIN/shaped_link tokens — 80 src files clean — and runs in `just independence`.
+AC#4 (honest limits): DONE — HONEST_LIMITS block printed by the tool + here: models mean RTT + a rate cap only; does NOT model loss, jitter, competing/cross traffic, NAT-traversal cost, real-NIC offload/CPU; a veth pair over ONE host's shared kernel, not two machines.
+AC#3 (re-state wan_shaped speedup with BOTH ends shaped): DEFERRED to TASK-198 (blocked on TASK-70 + TASK-99). Per this task's own WIRE-COST CORRECTION, no peer-vs-upstream speedup may be re-derived until link compression (task-99) lands — the peer byte-volume depends on it. Producing a number now would be one task-99 invalidates. NOT faked.
+
+REAL SPIKE (this box, 10 MiB, delay 20ms, cap 100mbit): shaped RTT 48.2ms throughput 77.4mbit; unshaped RTT 0.1ms throughput 56294mbit (loopback veth). Oracle PASS. Clean teardown, no orphan netns/processes. (77mbit vs 100 cap = short-transfer TCP ramp at 40ms RTT; well inside the 'capped, not collapsed' band. The default 40 MiB runs closer to the cap.)
+
+GOTCHA for TASK-198: profile_p2p.py + daemon/examples/iroh_throughput.rs are iroh-worded; the shipped primary transport is now libp2p-stream. AC#3 must run the REAL libp2p two-node NAR transfer through this shaped-link primitive (not the raw-TCP probe that validates the primitive itself).
 <!-- SECTION:NOTES:END -->

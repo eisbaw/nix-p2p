@@ -82,6 +82,7 @@ lint: _toolchain _python independence
 # Assert daemon and testproxy stay strictly separated (PRD round 5/6).
 independence: _toolchain
     python3 scripts/check-independence.py
+    python3 scripts/check_shaping_out_of_daemon.py
 
 # Depends on the fast fixture tier because the signing and tamper assertions
 # live in scripts/, not in cargo (rationale: scripts/check-fixtures.py).
