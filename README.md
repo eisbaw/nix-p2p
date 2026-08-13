@@ -141,21 +141,26 @@ first-class part of the project, and the real-network and swarm results are not 
   path in a production build; the test fixture fronts it too, over a deliberately
   *disjoint* TLS stack so the product and the fixture stay independent witnesses of wire
   behaviour.
-- **Regenerate-on-demand supply (the supplier).** A store-dump supplier regenerates a raw
-  NAR from `/nix/store` on demand under a supervised, cancellation-safe process group,
-  declares its size before producing a byte, holds nothing at rest, and never enumerates
-  what it holds. (Driving it from the shipped serve loop is still landing — see below.)
+- **Regenerate-on-demand supply from a live `/nix/store`.** The shipped provider (with
+  `--libp2p-provide-store`) serves any announced store path by regenerating its raw NAR from
+  `/nix/store` on demand — a supervised, cancellation-safe process group, nothing held at rest,
+  no enumeration — and the announce is gated by the supply-integrity floor above, so it can only
+  advertise a path the index actually verified. Production runs off the swarm poll loop, so a
+  large serve never stalls discovery.
+- **True streaming transfer.** NARs move over a raw libp2p stream: the fetcher aborts the
+  instant a transfer exceeds its declared size — mid-stream, not after buffering — enforces an
+  inter-chunk idle bound, and a bounded in-flight ceiling caps concurrent serves, while every
+  byte is still BLAKE3/bao-verified before the build accepts it.
 
 ## What is not yet
 
 - **A public network.** NAT hole-punching, relay for residential peers, and running
   against the real cache.nixos.org over a public network are future work; today it is
   single-host loopback and containers.
-- **Serving from a live `/nix/store` on the shipped provider.** The on-demand supplier
-  above is built and verified in-process, but the shipped provider's serve loop does not
-  yet drive it — a provider serves prepared NAR files today. Wiring the supplier into the
-  serve path — an async serve seam so a `nix-store --dump` never blocks the swarm poll
-  loop — is in progress.
+- **The container-packaged store-serve proof.** Serving from a live `/nix/store` is proven
+  in-process and across two swarms; the multi-container end-to-end of that exact journey — a
+  provider serving a store path it never held as a file, fetched by a consumer over the DHT —
+  is the one deferred piece.
 - **The iroh optional-transport journey.** iroh transfer works; its decentralized
   public-node discovery / no-address connection, and the iroh-versus-libp2p transport
   tournament that decides whether iroh's NAT traversal earns its place, are in progress.
@@ -172,9 +177,10 @@ first-class part of the project, and the real-network and swarm results are not 
   TTL-cap enforcement, durable-reload sweep/cap, fail-closed consumer durability, a
   shared-state-dir advisory lock, save-before-publish for withdrawals, and per-line
   persistence integrity) — tracked as the record-lifecycle hardening follow-up.
-- **Deeper swarm dynamics:** true streaming transfer with mid-stream size abort,
-  hedged/prefetch fetches, and eclipse/sybil bounds beyond the current
-  replay/rollback/DoS guards.
+- **Deeper swarm dynamics:** per-chunk (bao) stream verification and true serve-side
+  passthrough (the stream currently verifies at completion and buffers before shipping),
+  hedged/prefetch fetches, and eclipse/sybil bounds beyond the current replay/rollback/DoS
+  guards.
 - **A verdict on the value thesis:** whether peers beat a CDN is unmeasured on a real
   network.
 
