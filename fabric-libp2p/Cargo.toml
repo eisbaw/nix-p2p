@@ -14,6 +14,13 @@ path = "src/lib.rs"
 # Blake3Digest). This crate NEVER depends on the daemon; the only cross edge is
 # daemon -> fabric-libp2p.
 peer-fabric = { path = "../peer-fabric" }
+# proc-supervisor (TASK-146/158): stack-neutral killable OS process groups +
+# TaskSupervisor, shared with fabric-iroh. The real-node NAR supplier regenerates a
+# raw NAR on demand by running `nix-store --dump` / a raw-NAR helper in an OWNED
+# process group so node shutdown reaps it (no unkillable worker). ZERO p2p deps and
+# NOT daemon-core, so the crate graph (daemon -> fabric-libp2p) and
+# scripts/check-independence.py stay green.
+proc-supervisor = { path = "../proc-supervisor" }
 # rust-libp2p (TASK-103, owner libp2p-PRIMARY): the robust existing Kademlia
 # implementation. We do NOT hand-roll Kademlia and do NOT run kad-over-iroh. Feature
 # set per the task: kad (the DHT), tcp+quic (transports), identify (so peers learn

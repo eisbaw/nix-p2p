@@ -1311,6 +1311,7 @@ dependencies = [
  "futures",
  "libp2p",
  "peer-fabric",
+ "proc-supervisor",
  "tokio",
  "tracing",
  "tracing-subscriber",
