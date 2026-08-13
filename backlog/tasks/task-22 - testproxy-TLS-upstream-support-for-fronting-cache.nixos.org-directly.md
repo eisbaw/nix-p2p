@@ -4,7 +4,7 @@ title: 'testproxy: TLS upstream support for fronting cache.nixos.org directly'
 status: To Do
 assignee: []
 created_date: '2026-08-08 07:30'
-updated_date: '2026-08-13 09:08'
+updated_date: '2026-08-13 12:10'
 labels:
   - testproxy
   - follow-up
@@ -32,7 +32,5 @@ After the global-first and LAN Iroh discovery vertical slices are complete, add 
 ## Implementation Notes
 
 <!-- SECTION:NOTES:BEGIN -->
-Ordering revision 2026-08-11: TASK-22 depends on TASK-116 so the user-selected sequence is mechanical: global Iroh discovery and review, later LAN/direct-query Iroh, then HTTPS and compression, all before BitTorrent.
-
-COMPASS/orchestrator 2026-08-13: the TASK-116 dependency is STALE and should be ignored for scheduling. A rustls TLS upstream connector has ZERO technical relationship to iroh BatchHoldQuery (and TASK-116 itself sits behind 8 tasks). The edge was an iroh-first ORDERING preference the project has since steered away from (core real-world CDN fronting over optional-iroh breadth). The backlog CLI would not clear the edge to empty, so THIS NOTE is the authority: treat TASK-22 (and its dependent TASK-24 daemon HTTPS) as UNBLOCKED. Do not wait on TASK-116.
+FORWARD-CARRY from TASK-24 (daemon TLS landed, ring-based rustls): the DAEMON side now uses rustls+tokio-rustls+webpki-roots (daemon-core). To preserve the daemon<->testproxy independence boundary (PRD round 5, an independent wire witness), TASK-22 MUST adopt a DIFFERENT TLS crate for testproxy - e.g. native-tls/openssl or a std/hand-rolled path - NOT rustls/tokio-rustls. check-independence.py currently passes because testproxy shares no crate with the daemon; picking rustls would still pass the HTTP-stack denylist (TLS != HTTP-logic) but would VIOLATE the intent. When TASK-22 lands, add a TLS-stack convergence entry to scripts/check-independence.py so the boundary is mechanical, mirroring HTTP_STACK_CRATES.
 <!-- SECTION:NOTES:END -->

@@ -6,7 +6,7 @@ title: >-
 status: To Do
 assignee: []
 created_date: '2026-08-10 20:30'
-updated_date: '2026-08-10 22:55'
+updated_date: '2026-08-13 12:10'
 labels: []
 dependencies:
   - TASK-33
@@ -40,3 +40,9 @@ EVIDENCE TO GATHER FIRST - do not change the constant without it: measure real h
 - [ ] #4 If the default changes, the e2e boundary pin and any depth/fault matrix expectations are re-derived, not assumed unchanged
 - [ ] #5 At least 100 authenticated-HTTPS observations in each idle, loaded and WAN/RTT profile report connect/header distributions; chosen numeric defaults are recorded, replay yields zero timeout-induced 502s for those healthy observations, and a response delayed beyond the configured bound fails within 10% of that bound.
 <!-- AC:END -->
+
+## Implementation Notes
+
+<!-- SECTION:NOTES:BEGIN -->
+FORWARD-CARRY from TASK-24: the TLS upstream path (daemon-core/src/upstream.rs) has a FROZEN tls-upstream-v1 CONNECT budget (10000ms total DNS+connect+handshake, connect/handshake<=5000 each) exposed as pub consts + TlsBudget, tunable via UpstreamHttp::with_tls_budget (default==v1). This is SEPARATE from the 1000ms header_timeout TASK-111 targets - the header-read deadline still governs response-header arrival AFTER connect on BOTH plain and TLS paths. When TASK-111 makes header_timeout WAN-aware, do it for both transports and take real-HTTPS observations via the #[ignore]d tls_real_cache_nixos_org_over_https smoke (production webpki-roots path, verified reachable).
+<!-- SECTION:NOTES:END -->
