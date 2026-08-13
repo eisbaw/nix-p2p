@@ -1,6 +1,7 @@
-//! [`Libp2pTransport`] - the libp2p [`NarTransfer`]: fetch a NAR from a provider peer
-//! over the shared swarm's `/nix-p2p/<scope>/nar/1` request-response protocol, gate-1
-//! BLAKE3-verify it, and honour the [`SafetyEnvelope`] and the signed NarSize bound.
+//! [`Libp2pTransport`] - the libp2p [`NarTransfer`]: fetch a NAR from a provider peer by
+//! STREAMING it over the shared swarm's `/nix-p2p/<scope>/nar/2` raw libp2p-stream protocol
+//! (TASK-157), gate-1 BLAKE3-verify it, and honour the [`SafetyEnvelope`] (dial / body-idle /
+//! total bounds) and the signed NarSize as a true mid-stream size abort.
 //!
 //! # ADR (TASK-151): why this services the `Iroh` tag (offer-driven dispatch)
 //!
@@ -43,7 +44,6 @@ use peer_fabric::{
 
 use crate::keys::peer_id_of_provider;
 use crate::locator::Libp2pNodeLocator;
-use crate::nar::NarResponse;
 use crate::swarm::SwarmHandle;
 
 /// The libp2p [`NarTransfer`]. Holds a [`SwarmHandle`] to drive the shared swarm's NAR
@@ -169,58 +169,27 @@ impl NarTransfer for Libp2pTransport {
             }
         }
 
-        // Time-bound the whole dial+transfer by the envelope's TOTAL bound. The per-call
-        // dial/idle split is a follow-up (request-response carries a single
-        // request_timeout; a raw-stream transport is needed for a true idle guard) -
-        // TASK-157. total_timeout is the never-hang backstop that matters here.
-        let fetch = self.handle.fetch_nar(peer, *content);
-        let response = match tokio::time::timeout(envelope.total_timeout, fetch).await {
-            Ok(Ok(response)) => response,
-            Ok(Err(why)) => return Err(TransferError::Unavailable(why)),
-            Err(_elapsed) => {
-                return Err(TransferError::Unavailable(format!(
-                    "libp2p fetch exceeded the total timeout {:?}",
-                    envelope.total_timeout
-                )));
-            }
-        };
-
-        let bytes = match response {
-            NarResponse::Nar(bytes) => bytes,
-            NarResponse::NotHeld => return Err(TransferError::NotHeld(*content)),
-            NarResponse::Declined(reason) => {
-                return Err(TransferError::Unavailable(format!(
-                    "provider declined to serve {content}: {reason}"
-                )));
-            }
-        };
-
-        // Size abort against the signed NarSize (uncompressed raw NAR, NEVER the
-        // compressed FileSize). The codec already capped the wire read at
-        // MAX_NAR_RESPONSE_BYTES so a lying length never allocated unbounded; here we
-        // reject a response that overran the PER-CALL signed bound. A true mid-stream
-        // abort at exactly `expected_size` is TASK-157.
-        if let Some(limit) = expected_size
-            && bytes.len() as u64 > limit
-        {
-            return Err(TransferError::TooLarge {
-                limit,
-                streamed: bytes.len() as u64,
-            });
+        // STREAM the NAR over a raw libp2p substream (TASK-157). The envelope's fine-grained
+        // bounds are enforced INSIDE `fetch_nar_streaming`: `dial_timeout` on opening the
+        // stream, `body_idle_timeout` as a real inter-chunk stall guard, and the running
+        // mid-stream SIZE abort at exactly `expected_size` (the signed uncompressed NarSize,
+        // NEVER the compressed FileSize) plus the gate-1 BLAKE3 verify - so a lying provider
+        // is cut off at ~expected_size mid-transfer, and a corrupt one fails gate-1, never
+        // wrong bytes handed upward (Nix's sha256 gate remains the trust anchor downstream).
+        // Here we add only the coarse TOTAL-timeout backstop over the whole dial+stream.
+        let fetch = self.handle.fetch_nar_streaming(
+            peer,
+            *content,
+            expected_size,
+            envelope.dial_timeout,
+            envelope.body_idle_timeout,
+        );
+        match tokio::time::timeout(envelope.total_timeout, fetch).await {
+            Ok(result) => result,
+            Err(_elapsed) => Err(TransferError::Unavailable(format!(
+                "libp2p fetch exceeded the total timeout {:?}",
+                envelope.total_timeout
+            ))),
         }
-
-        // Gate 1: BLAKE3-verify the bytes against the requested identity (SSOT recipe
-        // peer_fabric::Blake3Digest::from_raw_nar). A corrupt or lying provider yields an
-        // error here, never wrong bytes handed upward (Nix's sha256 gate remains the
-        // trust anchor downstream).
-        let actual = Blake3Digest::from_raw_nar(&bytes);
-        if &actual != content {
-            return Err(TransferError::IntegrityMismatch {
-                expected: *content,
-                actual,
-            });
-        }
-
-        Ok(bytes)
     }
 }

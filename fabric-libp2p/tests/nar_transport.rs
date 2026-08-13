@@ -2,8 +2,8 @@
 //! bar): a SERVING node A and a CONSUMER node B, two independent libp2p swarms over real
 //! loopback TCP, prove that:
 //!
-//!   * B fetches a NAR from A over the shared swarm's `/nix-p2p/<scope>/nar/1`
-//!     request-response protocol and gets BYTE-IDENTICAL, BLAKE3-verified bytes;
+//!   * B fetches a NAR from A over the shared swarm's `/nix-p2p/<scope>/nar/2` raw
+//!     libp2p-stream protocol (TASK-157) and gets BYTE-IDENTICAL, BLAKE3-verified bytes;
 //!   * a CORRUPT provider (bytes that do not hash to the requested digest) is rejected
 //!     by the fetch-side gate-1 BLAKE3 verify (`IntegrityMismatch`), never trusted;
 //!   * an OVERSIZED response (larger than the signed NarSize) trips the size abort
@@ -268,6 +268,66 @@ async fn signed_bound_smaller_than_served_bytes_trips_size_abort() {
 }
 
 #[tokio::test]
+async fn a_large_over_bound_serve_is_aborted_mid_stream_not_after_the_whole_nar() {
+    // AC#1 over the REAL two-node transport: a provider holds a 1 MiB NAR but the consumer
+    // signed a tiny 4 KiB bound. The streaming fetch must abort the INSTANT the running total
+    // crosses the bound - after ~one 64 KiB chunk - NOT after receiving all 1 MiB and NOT at
+    // the 256 MiB floor. BITE (pre-157): a post-receive buffer check reports streamed == the
+    // whole 1 MiB. The mid-stream property is `streamed << served_size`.
+    let scope = "nar-oversize-large";
+    let nar = vec![0x5au8; 1024 * 1024]; // 1 MiB, honestly hashed
+    let content = Blake3Digest::from_raw_nar(&nar);
+
+    let (boot, boot_addr) = start_bootstrap(scope).await;
+    let boot_peer = boot.peer_id;
+
+    let (node_a, _addr_a) = start_listening([31u8; 32], scope).await;
+    let server = Libp2pServer::new(
+        node_a.handle.clone(),
+        Arc::new(MemoryNarSupplier::new([nar.clone()])),
+        TaskSupervisorHandle::disconnected(),
+    );
+    let _serve = server
+        .serve(ServeBudget::default())
+        .await
+        .expect("serve starts");
+    join(&node_a, boot_peer, boot_addr.clone()).await;
+
+    let (node_b, _addr_b) = start_listening([32u8; 32], scope).await;
+    let transport = wire_consumer(&node_b, &node_a, boot_peer, boot_addr.clone()).await;
+    let offer = TransportOffer::Iroh {
+        node: node_a.node_id,
+    };
+
+    let signed_bound: u64 = 4 * 1024; // 4 KiB
+    let err = transport
+        .fetch(&content, &offer, Some(signed_bound), &envelope())
+        .await
+        .expect_err("a 1 MiB serve under a 4 KiB signed bound must abort mid-stream");
+    match err {
+        TransferError::TooLarge { limit, streamed } => {
+            assert_eq!(limit, signed_bound, "the abort limit is the signed bound");
+            assert!(
+                streamed > signed_bound,
+                "streamed ({streamed}) crossed the bound ({signed_bound})"
+            );
+            // Decisive: aborted far below the served 1 MiB, proving the read stopped
+            // mid-stream rather than buffering the whole NAR (or waiting for the 256 MiB cap).
+            assert!(
+                streamed < 256 * 1024,
+                "streamed ({streamed}) must be far below the served 1 MiB - it aborted mid-stream"
+            );
+            assert!(
+                (streamed as usize) < nar.len(),
+                "streamed ({streamed}) must be less than the full NAR ({})",
+                nar.len()
+            );
+        }
+        other => panic!("expected TooLarge, got {other}"),
+    }
+}
+
+#[tokio::test]
 async fn serve_budget_declines_over_per_nar_request() {
     let scope = "nar-budget";
     let nar = vec![0xABu8; 4096]; // 4 KiB
@@ -386,10 +446,11 @@ async fn a_stale_teardown_does_not_clobber_a_live_successor_session() {
 
     let handle1 = server.serve(ServeBudget::default()).await.expect("serve 1");
     // Install the successor BEFORE dropping handle1 (the exact handoff order the fix
-    // guards): the worker command queue is [InstallServe(g2), UninstallServe(g1)].
+    // guards): the shared serve slot is set to g2, then handle1's teardown does an
+    // identity-checked uninstall of g1 that must NOT clear the live g2 (TASK-157).
     let _handle2 = server.serve(ServeBudget::default()).await.expect("serve 2");
     drop(handle1);
-    // Let the stale UninstallServe(g1) be processed and ignored.
+    // Let the stale identity-checked uninstall of g1 run and be ignored.
     tokio::time::sleep(Duration::from_millis(50)).await;
 
     // The successor session (handle2) is still held and must still serve.

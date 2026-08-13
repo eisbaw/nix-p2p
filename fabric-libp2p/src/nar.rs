@@ -1,49 +1,49 @@
-//! The libp2p NAR byte-transfer protocol `/nix-p2p/<scope>/nar/1`: a libp2p
-//! `request-response` protocol carried over the SAME [`Swarm`](crate::swarm) as the
-//! kad+identify discovery behaviour (TASK-151). This module owns the WIRE codec, the
-//! substrate-internal supply seam the server produces bytes through, and the task-72
+//! The libp2p NAR byte-transfer protocol `/nix-p2p/<scope>/nar/2`: a RAW libp2p-stream
+//! protocol (`AsyncRead`/`AsyncWrite` per call, TASK-157) carried over the SAME
+//! [`Swarm`](crate::swarm) as the kad+identify discovery behaviour. It REPLACES the
+//! original request-response carrier (TASK-151, protocol `/nar/1`), which buffered the
+//! whole NAR: bytes now FLOW as a stream, so the fetcher aborts mid-transfer at exactly
+//! the signed size and the server streams produced bytes OFF the poll loop. This module
+//! owns the WIRE framing ([`write_request`] / [`read_response_streamed`] / [`serve_stream`]),
+//! the substrate-internal supply seam the server produces bytes through, and the task-72
 //! admission gate that bounds what serving may cost.
 //!
 //! ## Two halves, one protocol
 //!
-//!   * FETCH ([`crate::transport::Libp2pTransport`]): send a 32-byte
-//!     [`Blake3Digest`] request to a provider peer, receive the raw NAR bytes, and
-//!     gate-1 BLAKE3-verify them against the requested digest before handing them up.
-//!   * SERVE ([`crate::server::Libp2pServer`]): answer an inbound digest request from
-//!     a substrate-internal [`Libp2pNarSupplier`], admitting it against a
-//!     [`ServeBudget`] BEFORE producing any bytes (the peer-triggerable-OOM defense).
+//!   * FETCH ([`crate::transport::Libp2pTransport`]): open a stream to a provider peer,
+//!     send a 32-byte [`Blake3Digest`] request, then STREAM the raw NAR bytes back with a
+//!     mid-stream size abort ([`read_response_streamed`], AC#1) and an inter-chunk idle
+//!     bound (AC#2), gate-1 BLAKE3-verifying them against the requested digest.
+//!   * SERVE ([`crate::server::Libp2pServer`]): answer an inbound digest request from a
+//!     substrate-internal [`Libp2pNarSupplier`] on a task OFF the poll loop
+//!     ([`serve_stream`], AC#3), admitting it against a [`ServeBudget`] BEFORE producing
+//!     any bytes (the peer-triggerable-OOM defense).
 //!
-//! ## Wire form (deliberately trivial, self-describing, length-capped)
-//!
-//! Request  = 32 raw digest bytes.
-//! Response = 1 status byte, then:
-//!   * `0` NotHeld — nothing follows.
-//!   * `1` Nar — u64-LE length `n`, then `n` raw NAR bytes. `n` is rejected on the reader
-//!     BEFORE allocation if it exceeds [`MAX_NAR_RESPONSE_BYTES`], so a lying length can
-//!     never drive an unbounded allocation.
-//!   * `2` Declined — 1 reason byte (for the caller's log; the fetch still fails).
+//! The concrete wire form is documented on the raw-stream wire functions below.
 //!
 //! ## Honest scope (filed as follow-ups, not faked)
 //!
-//!   * BUFFERED, NOT STREAMED — and the buffer is bounded at the 256 MiB
-//!     [`MAX_NAR_RESPONSE_BYTES`] hard cap, NOT at the per-call signed size. `fetch`
-//!     reads the whole response (up to the cap) and then compares its length to
-//!     `expected_size`, so a lying provider CAN force up to ~256 MiB of allocation and
-//!     transfer regardless of the signed NarSize. The guarantee here is "never
-//!     UNBOUNDED" (bounded at the cap), NOT "never buffers more than the signed size".
-//!     A TRUE mid-stream abort at exactly `expected_size` needs the raw-stream transport
-//!     — TASK-157.
-//!   * PRODUCTION PLACEMENT (TASK-193). A [`NarSource::Process`] (store-dump / raw-NAR
-//!     helper) is now produced OFF the swarm poll loop: [`ServeGate::admit`] admits it on
-//!     the loop, a spawned task runs [`ServeGate::produce_admitted`] (supervised, with the
-//!     serve-time recheck) holding the request-response `ResponseChannel` across the
-//!     `.await`, and the loop delivers the response when the task hands it back over a
-//!     backchannel (`swarm.rs`). A [`NarSource::Memory`] still produces INLINE on the loop
-//!     (an already-resident clone, instantaneous). Because a Process reservation is now
-//!     held across an off-loop await, the in-flight ceiling BINDS (a CAS reserve replaced
-//!     the old serialized load-then-add). Still BUFFERED, not streamed, and
-//!     `max_serve_duration` is bounded only by the request-response inbound timeout; the
-//!     raw-stream transport + mid-stream abort + true serve deadline are TASK-157.
+//!   * GATE-1 GRANULARITY. The SIZE abort is truly mid-stream (AC#1), but per-CHUNK
+//!     byte-corruption detection (a flipped byte caught before EOF, as iroh-blobs' bao
+//!     does) needs a bao outboard tree interleaved on the wire; this transport carries the
+//!     raw NAR alone, so BYTE corruption is caught at stream completion via the frozen
+//!     [`Blake3Digest::from_raw_nar`] recipe (single pass, memory bounded to the size cap +
+//!     one chunk), never after a second full buffer-and-rehash. The trust property holds -
+//!     a corrupt peer fails the fetch - only the detection is at EOF, not per chunk. TASK-197.
+//!   * SERVE PRODUCTION still BUFFERS the produced NAR before streaming it out, because the
+//!     serve-time integrity recheck (`len == declared_size` AND `BLAKE3(RawNarV1) == content`,
+//!     "never ship the wrong bytes under the right name") must complete BEFORE any byte is
+//!     shipped. The bytes reach the fetcher as a true stream; producing them by piping a
+//!     `nix-store --dump` stdout STRAIGHT to the socket (no serve-side buffer) would need
+//!     the same bao outboard so the recheck can be incremental. TASK-197 (same follow-up).
+//!   * PRODUCTION PLACEMENT (TASK-193, now extended). A [`NarSource::Process`] (store-dump /
+//!     raw-NAR helper) is produced OFF the poll loop; with libp2p-stream the ENTIRE inbound
+//!     serve - including the Memory inline case - runs on a spawned per-stream task
+//!     ([`serve_stream`]), so nothing but connection muxing touches the poll loop. A Process
+//!     reservation is held across the off-loop await (the in-flight ceiling BINDS via a CAS
+//!     reserve), production is RACED against the consumer hanging up (a dropped stream reaps
+//!     the supervised group), and `max_serve_duration` is now ENFORCED as a real serve
+//!     deadline around production ([`ServeGate::produce_admitted`]).
 //!   * A REAL node's store-dump / regular-file supplier ([`CatalogNarSupplier`] over the
 //!     [`CatalogProbe`] digest->store-path seam, regenerating on demand via a supervised
 //!     process group, mirroring `fabric-iroh`'s producer) LANDED in TASK-158 and is
@@ -52,22 +52,21 @@
 //!     [`MemoryNarSupplier`] from `--libp2p-seed-nar` files (TASK-178). Replacing that
 //!     with the store-dump supplier so a peer serves a `/nix/store` path it never held
 //!     as a `.nar`, plus the container e2e, is TASK-191 (the daemon consumer of this
-//!     capability; iroh analogue TASK-83). Supervised Process production is now reachable
-//!     from the shipped serve loop OFF the poll thread (TASK-193); the request-response
-//!     body is still buffered whole (raw-stream transfer is TASK-157).
+//!     capability; iroh analogue TASK-83). Supervised Process production is reachable from
+//!     the shipped serve loop OFF the poll thread (TASK-193) and now streams to the fetcher
+//!     over the raw-stream transport (TASK-157).
 
 use std::ffi::OsString;
 use std::io;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::time::Duration;
 
-use async_trait::async_trait;
 use futures::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
-use libp2p::request_response;
 use proc_supervisor::TaskSupervisorHandle;
 
-use peer_fabric::{Blake3Digest, ServeBudget};
+use peer_fabric::{Blake3Digest, ServeBudget, TransferError};
 
 /// The absolute ceiling on a single NAR response the FETCH side will read off the
 /// wire, whatever the per-call `expected_size`. It is the peer-triggerable-OOM floor: a
@@ -79,8 +78,10 @@ use peer_fabric::{Blake3Digest, ServeBudget};
 /// TASK-120 moves the authoritative ceiling. CAVEAT: because it is a FIXED const, it is
 /// also a hard FUNCTIONAL ceiling on the fetch side - a node configured (via a larger
 /// [`ServeBudget`]) to serve NARs bigger than this cannot be fetched over libp2p, and a
-/// cold-start fetch (`expected_size == None`) of a > 256 MiB NAR hard-fails the codec.
-/// Deriving the fetch cap from the negotiated per-call bound is part of TASK-157.
+/// cold-start fetch (`expected_size == None`) of a > 256 MiB NAR hard-fails. Since TASK-157
+/// the fetch is a true stream: when the caller SIGNED an `expected_size` the running abort
+/// caps at exactly that (this const is only the floor for the cold-start `None` case), so a
+/// lying provider is cut off at the signed size, never at this 256 MiB const.
 pub const MAX_NAR_RESPONSE_BYTES: u64 = 256 * 1024 * 1024;
 
 // Response status bytes.
@@ -131,12 +132,9 @@ impl std::fmt::Display for DeclineReason {
     }
 }
 
-/// A fetch request: the exact content identity the requester wants.
-#[derive(Debug, Clone)]
-pub struct NarRequest(pub Blake3Digest);
-
-/// A fetch response. `Nar` carries the raw (uncompressed) NAR bytes; the requester
-/// gate-1 BLAKE3-verifies them before use.
+/// A fetch response the [`ServeGate`] produces for one inbound request. `Nar` carries the
+/// raw (uncompressed) NAR bytes; the requester gate-1 BLAKE3-verifies them before use.
+/// This is the SERVER-SIDE outcome type; on the wire it is framed by [`write_response`].
 #[derive(Debug, Clone)]
 pub enum NarResponse {
     /// The provider does not hold this content identity.
@@ -147,108 +145,298 @@ pub enum NarResponse {
     Nar(Vec<u8>),
 }
 
-/// The `request-response` codec for the NAR protocol. A unit struct: the protocol is
-/// stateless per request, and the size cap is a const, so there is nothing to carry.
-#[derive(Debug, Clone, Default)]
-pub struct NarCodec;
+// -------------------------------------------------------------------------
+// The RAW-STREAM NAR wire (TASK-157): replaces the request-response codec so bytes flow
+// as a stream, not a buffered request/response. The ADDRESSED UNIT on the wire is
+// unchanged - the exact `RawNarV1` bytes keyed by BLAKE3 - only the framing that MOVES
+// them peer to peer changed (the churnable transport layer, not a frozen surface).
+//
+// Wire form (over one raw substream of `/nix-p2p/<scope>/nar/2`):
+//   Request  = 32 raw digest bytes; the requester then KEEPS its write half OPEN for the
+//              whole transfer (it is the "still interested" signal the server races
+//              production against - see `serve_stream`), closing only when done reading.
+//   Response = 1 status byte, then:
+//     * `0` NotHeld  - nothing follows; the server closes its write half.
+//     * `1` Nar      - the raw NAR bytes STREAMED to EOF (NO length prefix, mirroring
+//                      fabric-iroh's bao stream): the reader counts bytes as they arrive
+//                      and aborts the INSTANT cumulative bytes exceed the per-call bound,
+//                      so a lying provider is cut off at ~expected_size, never after
+//                      buffering the whole thing. The server closes its write half at the
+//                      end; that EOF is how the reader knows the NAR is complete.
+//     * `2` Declined - 1 reason byte (for the caller's log; the fetch still fails).
+// -------------------------------------------------------------------------
 
-async fn read_u64<T: AsyncRead + Unpin + Send>(io: &mut T) -> io::Result<u64> {
-    let mut buf = [0u8; 8];
-    io.read_exact(&mut buf).await?;
-    Ok(u64::from_le_bytes(buf))
+/// The chunk the fetch read loop pulls per step. The running size cap is enforced AFTER
+/// each chunk, so peak fetch memory is bounded by `expected_size + NAR_STREAM_CHUNK` (the
+/// "bound + one chunk" property fabric-iroh states for its bao leaf).
+const NAR_STREAM_CHUNK: usize = 64 * 1024;
+
+/// The serve-side exchange deadline used when this node is NOT serving (no [`ServeGate`] to
+/// source `max_serve_duration` from): a slowloris guard so a peer that opens a `/nar/2`
+/// stream and then never sends its request digest - or never reads the `NotHeld` reply -
+/// cannot park a serve task forever. A serving node uses its
+/// [`ServeBudget::max_serve_duration`] instead (see [`serve_stream`]).
+const UNSERVED_STREAM_DEADLINE: Duration = Duration::from_secs(30);
+
+/// Send a fetch REQUEST on an opened outbound stream: the 32-byte content digest, flushed.
+/// Deliberately does NOT close the write half - the open write half is the requester's
+/// "still interested" signal the server watches, so closing it early would look like an
+/// abandoned request (see [`serve_stream`]).
+pub(crate) async fn write_request<W>(writer: &mut W, content: &Blake3Digest) -> io::Result<()>
+where
+    W: AsyncWrite + Unpin,
+{
+    writer.write_all(content.as_bytes()).await?;
+    writer.flush().await
 }
 
-#[async_trait]
-impl request_response::Codec for NarCodec {
-    type Protocol = libp2p::StreamProtocol;
-    type Request = NarRequest;
-    type Response = NarResponse;
-
-    async fn read_request<T>(&mut self, _: &Self::Protocol, io: &mut T) -> io::Result<Self::Request>
-    where
-        T: AsyncRead + Unpin + Send,
-    {
-        let mut digest = [0u8; 32];
-        io.read_exact(&mut digest).await?;
-        Ok(NarRequest(Blake3Digest::from_bytes(digest)))
+/// Read a fetch RESPONSE off an inbound stream with the full task-51 envelope, mirroring
+/// fabric-iroh's `dial_and_stream` (the gate-1 streaming-decode contract):
+///
+///   * INTER-CHUNK IDLE BOUND (AC#2): every read - the status byte and each body chunk -
+///     is bounded by `body_idle_timeout`; no forward progress within it is a stalled peer,
+///     aborted distinctly from the transport-level `total_timeout`.
+///   * MID-STREAM SIZE ABORT (AC#1): the body is streamed chunk by chunk and the moment
+///     cumulative bytes exceed the running cap - `expected_size` when the caller signed one,
+///     else the [`MAX_NAR_RESPONSE_BYTES`] unbounded-OOM floor - the stream is DROPPED and
+///     [`TransferError::TooLarge`] returned. A provider that streams MORE than declared is
+///     cut off at ~cap, never after 256 MiB and never after the whole (possibly huge) blob.
+///   * GATE-1 BLAKE3 VERIFY: the accumulated bytes are BLAKE3-verified against the requested
+///     identity with the frozen [`Blake3Digest::from_raw_nar`] recipe at completion, so a
+///     corrupt/lying provider yields [`TransferError::IntegrityMismatch`], never trusted
+///     bytes. HONEST LIMIT (TASK-197): the SIZE abort is truly mid-stream, but
+///     per-CHUNK byte-corruption detection (catching a flipped byte before EOF, as bao does)
+///     needs a bao outboard interleaved on the wire; this transport carries the raw NAR
+///     alone, so byte corruption is caught at stream completion (single pass, memory bounded
+///     to cap + one chunk), never after a second full buffer-and-rehash.
+pub(crate) async fn read_response_streamed<R>(
+    reader: &mut R,
+    expected_size: Option<u64>,
+    body_idle_timeout: Duration,
+    content: &Blake3Digest,
+) -> Result<Vec<u8>, TransferError>
+where
+    R: AsyncRead + Unpin,
+{
+    let mut status = [0u8; 1];
+    match tokio::time::timeout(body_idle_timeout, reader.read_exact(&mut status)).await {
+        Ok(Ok(())) => {}
+        Ok(Err(error)) => {
+            return Err(TransferError::Unavailable(format!(
+                "NAR stream for {content} closed before its status byte: {error}"
+            )));
+        }
+        Err(_elapsed) => {
+            return Err(TransferError::Unavailable(format!(
+                "NAR stream for {content} stalled before its status byte for {body_idle_timeout:?}"
+            )));
+        }
     }
-
-    async fn read_response<T>(
-        &mut self,
-        _: &Self::Protocol,
-        io: &mut T,
-    ) -> io::Result<Self::Response>
-    where
-        T: AsyncRead + Unpin + Send,
-    {
-        let mut status = [0u8; 1];
-        io.read_exact(&mut status).await?;
-        match status[0] {
-            STATUS_NOT_HELD => Ok(NarResponse::NotHeld),
-            STATUS_DECLINED => {
-                let mut reason = [0u8; 1];
-                io.read_exact(&mut reason).await?;
-                Ok(NarResponse::Declined(DeclineReason::from_wire(reason[0])))
-            }
-            STATUS_NAR => {
-                let len = read_u64(io).await?;
-                // Reject a lying/oversized length BEFORE allocating: this is the
-                // unbounded-OOM floor on the fetch side. The precise per-call
-                // `expected_size` abort is enforced by the transport on top of this.
-                if len > MAX_NAR_RESPONSE_BYTES {
-                    return Err(io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        format!(
-                            "NAR response declares {len} bytes, over the {MAX_NAR_RESPONSE_BYTES} \
-                             byte hard cap"
-                        ),
-                    ));
+    match status[0] {
+        STATUS_NOT_HELD => Err(TransferError::NotHeld(*content)),
+        STATUS_DECLINED => {
+            let mut reason = [0u8; 1];
+            // A declined response fails the fetch whatever the reason byte; an unreadable
+            // reason is coerced to the generic supply-failure category, never trusted.
+            let reason =
+                match tokio::time::timeout(body_idle_timeout, reader.read_exact(&mut reason)).await
+                {
+                    Ok(Ok(())) => DeclineReason::from_wire(reason[0]),
+                    _ => DeclineReason::SupplyFailed,
+                };
+            Err(TransferError::Unavailable(format!(
+                "provider declined to serve {content}: {reason}"
+            )))
+        }
+        STATUS_NAR => {
+            // The running cap: the signed per-call bound when present, else the fixed
+            // unbounded-OOM floor (a cold-start fetch of a > 256 MiB NAR hard-fails here).
+            let cap = expected_size.unwrap_or(MAX_NAR_RESPONSE_BYTES);
+            let mut raw: Vec<u8> = Vec::new();
+            let mut buf = vec![0u8; NAR_STREAM_CHUNK];
+            loop {
+                let read = tokio::time::timeout(body_idle_timeout, reader.read(&mut buf)).await;
+                let n = match read {
+                    Ok(Ok(0)) => break, // EOF: the server closed its write half - NAR complete.
+                    Ok(Ok(n)) => n,
+                    Ok(Err(error)) => {
+                        return Err(TransferError::Unavailable(format!(
+                            "NAR stream for {content} failed mid-transfer: {error}"
+                        )));
+                    }
+                    Err(_elapsed) => {
+                        // Dropping `reader` (its stream) at this return ABORTS the transfer.
+                        return Err(TransferError::Unavailable(format!(
+                            "NAR transfer for {content} stalled: no bytes for {body_idle_timeout:?}"
+                        )));
+                    }
+                };
+                raw.extend_from_slice(&buf[..n]);
+                // Abort the INSTANT the running total crosses the cap - before reading more.
+                if raw.len() as u64 > cap {
+                    return Err(TransferError::TooLarge {
+                        limit: cap,
+                        streamed: raw.len() as u64,
+                    });
                 }
-                let mut bytes = vec![0u8; len as usize];
-                io.read_exact(&mut bytes).await?;
-                Ok(NarResponse::Nar(bytes))
             }
-            other => Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!("unknown NAR response status byte {other}"),
-            )),
+            // Gate 1: BLAKE3-verify against the requested identity with the frozen SSOT
+            // recipe. A corrupt/lying provider errors here, never wrong bytes handed upward.
+            let actual = Blake3Digest::from_raw_nar(&raw);
+            if &actual != content {
+                return Err(TransferError::IntegrityMismatch {
+                    expected: *content,
+                    actual,
+                });
+            }
+            Ok(raw)
+        }
+        other => Err(TransferError::Unavailable(format!(
+            "unknown NAR response status byte {other} from the provider for {content}"
+        ))),
+    }
+}
+
+/// Frame a [`NarResponse`] onto a serve stream's write half and CLOSE it. The close is the
+/// EOF the fetcher's read loop terminates on (there is no length prefix on the NAR body).
+async fn write_response<W>(writer: &mut W, response: NarResponse) -> io::Result<()>
+where
+    W: AsyncWrite + Unpin,
+{
+    match response {
+        NarResponse::NotHeld => writer.write_all(&[STATUS_NOT_HELD]).await?,
+        NarResponse::Declined(reason) => {
+            writer.write_all(&[STATUS_DECLINED, reason.wire()]).await?
+        }
+        NarResponse::Nar(bytes) => {
+            writer.write_all(&[STATUS_NAR]).await?;
+            writer.write_all(&bytes).await?;
         }
     }
+    writer.flush().await?;
+    // Half-close: the FIN is how the fetcher knows the (length-prefix-free) NAR is complete.
+    writer.close().await
+}
 
-    async fn write_request<T>(
-        &mut self,
-        _: &Self::Protocol,
-        io: &mut T,
-        NarRequest(digest): Self::Request,
-    ) -> io::Result<()>
-    where
-        T: AsyncWrite + Unpin + Send,
-    {
-        io.write_all(digest.as_bytes()).await?;
-        io.flush().await
-    }
-
-    async fn write_response<T>(
-        &mut self,
-        _: &Self::Protocol,
-        io: &mut T,
-        response: Self::Response,
-    ) -> io::Result<()>
-    where
-        T: AsyncWrite + Unpin + Send,
-    {
-        match response {
-            NarResponse::NotHeld => io.write_all(&[STATUS_NOT_HELD]).await?,
-            NarResponse::Declined(reason) => {
-                io.write_all(&[STATUS_DECLINED, reason.wire()]).await?
-            }
-            NarResponse::Nar(bytes) => {
-                io.write_all(&[STATUS_NAR]).await?;
-                io.write_all(&(bytes.len() as u64).to_le_bytes()).await?;
-                io.write_all(&bytes).await?;
-            }
+/// Resolve once the CONSUMER hung up: after sending its 32-byte request the requester keeps
+/// its write half OPEN for the whole transfer, so a read on the server's read half PENDS
+/// while the consumer is still there and yields EOF/error the moment it drops or resets the
+/// stream. The server races this against off-loop production so an abandoned request REAPS
+/// the supervised producer instead of running a `nix-store --dump` to completion for nobody.
+async fn consumer_hung_up<R>(reader: &mut R)
+where
+    R: AsyncRead + Unpin,
+{
+    let mut scratch = [0u8; 1];
+    loop {
+        match reader.read(&mut scratch).await {
+            Ok(0) => return,   // EOF: the consumer closed/reset the stream - gone.
+            Ok(_) => continue, // The protocol sends nothing after the request; ignore + watch.
+            Err(_) => return,  // A read error is also "gone".
         }
-        io.flush().await
+    }
+}
+
+/// Serve ONE inbound NAR stream, entirely OFF the swarm poll loop (AC#3): this runs on a
+/// task the accept loop spawned, never touching the swarm, so a large or slow serve never
+/// stalls kad / identify / other transfers. It reads the 32-byte request digest, admits it
+/// through the installed [`ServeGate`] (or answers `NotHeld` when this node is not serving),
+/// and streams the response:
+///
+///   * a non-admit ([`Serve::Now`]) or an inline Memory NAR is written straight back;
+///   * an admitted process source ([`Serve::OffLoop`]) is produced under the gate's
+///     supervisor, RACED against the consumer hanging up so a dropped stream reaps the
+///     `nix-store --dump` group (cancellation-safety), with the in-flight [`InflightReservation`]
+///     guard held for the whole future so even a drop before the first poll releases the
+///     reserve.
+///
+/// EVERY phase is DEADLINE-BOUND so a stalled or non-reading consumer cannot park this task
+/// (nor, for a Process serve, pin its in-flight reservation) indefinitely - the raw-stream
+/// rewrite re-establishes the whole-exchange bound the replaced request-response carrier had
+/// as its single request timeout. The bound is the serving node's
+/// [`ServeBudget::max_serve_duration`], or [`UNSERVED_STREAM_DEADLINE`] when not serving.
+///
+/// Generic over the stream type purely so it is unit-testable over an in-memory mock; the
+/// swarm passes a `libp2p::Stream`.
+pub(crate) async fn serve_stream<S>(stream: S, gate: Option<Arc<ServeGate>>)
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    let (mut read_half, mut write_half) = stream.split();
+
+    // The per-phase deadline: a serving node bounds by its ServeBudget; a non-serving node
+    // (which only reads a digest and writes one NotHeld byte) uses the slowloris guard.
+    let deadline = gate
+        .as_ref()
+        .map(|gate| gate.max_serve_duration())
+        .unwrap_or(UNSERVED_STREAM_DEADLINE);
+
+    // The request digest, bounded: a peer that opens a stream and then stalls (sends a
+    // partial digest, or nothing) cannot park this task forever.
+    let mut digest = [0u8; 32];
+    match tokio::time::timeout(deadline, read_half.read_exact(&mut digest)).await {
+        Ok(Ok(())) => {}
+        Ok(Err(error)) => {
+            tracing::debug!(%error, "libp2p serve: inbound NAR stream closed before its request digest");
+            return;
+        }
+        Err(_elapsed) => {
+            tracing::debug!(
+                ?deadline,
+                "libp2p serve: inbound NAR request digest did not arrive within the serve deadline"
+            );
+            return;
+        }
+    }
+    let content = Blake3Digest::from_bytes(digest);
+
+    // The in-flight reservation (Process serve only) is held HERE, at serve_stream scope, so
+    // it lives through production AND the response write - the in-flight ceiling accounts for
+    // the produced NAR's memory while it is resident being written, not merely while
+    // producing. It was created synchronously at admit, so dropping this task at ANY point
+    // after admit - including a drop before the first poll - releases the reserve exactly once.
+    let mut _reservation: Option<InflightReservation> = None;
+
+    let response = match gate {
+        None => NarResponse::NotHeld,
+        Some(gate) => match gate.admit(&content) {
+            Serve::Now(response) => response,
+            Serve::OffLoop {
+                plan,
+                content,
+                reservation,
+            } => {
+                _reservation = Some(reservation);
+                tokio::select! {
+                    biased;
+                    // The consumer abandoned the transfer: drop the produce future, which
+                    // SIGKILL-reaps the supervised group. Nothing to deliver on a dead stream.
+                    () = consumer_hung_up(&mut read_half) => {
+                        tracing::debug!(
+                            %content,
+                            "libp2p serve: consumer hung up before off-loop NAR production finished; reaping"
+                        );
+                        return;
+                    }
+                    response = gate.produce_admitted(plan, content) => response,
+                }
+            }
+        },
+    };
+
+    // The response write, bounded: a consumer that never READS its response (but keeps the
+    // stream open, so `consumer_hung_up` above never fired) would otherwise block `write_all`
+    // on yamux backpressure forever, holding the reservation and parking this task. The
+    // deadline caps that; dropping `write_half` on return resets the substream, and
+    // `_reservation` releases as this function returns.
+    match tokio::time::timeout(deadline, write_response(&mut write_half, response)).await {
+        Ok(Ok(())) => {}
+        Ok(Err(error)) => {
+            tracing::debug!(%error, %content, "libp2p serve: failed to write NAR response (consumer gone?)");
+        }
+        Err(_elapsed) => {
+            tracing::debug!(?deadline, %content, "libp2p serve: response write exceeded the serve deadline (consumer not reading); dropping");
+        }
     }
 }
 
@@ -679,10 +867,10 @@ impl ServeGate {
     ) -> Self {
         // Destructure the seam budget EXHAUSTIVELY (mirroring fabric-iroh's
         // ServeBudget::from_seam) so a new `peer_fabric::ServeBudget` field fails THIS
-        // build rather than being silently unenforced by the gate. NOTE (honest scope):
-        // `max_serve_duration` is NOT yet enforced here - inline production is
-        // instantaneous, so there is no long-lived reservation to time out; it comes
-        // alive with off-worker streamed production (TASK-157).
+        // build rather than being silently unenforced by the gate. All three are now
+        // enforced: the per-NAR and in-flight ceilings in `admit_plan`, and (TASK-157)
+        // `max_serve_duration` as a real serve deadline around off-loop production in
+        // `produce_admitted`.
         let ServeBudget {
             max_nar_bytes_uncompressed_nar: _,
             max_inflight_bytes_uncompressed_nar: _,
@@ -852,20 +1040,43 @@ impl ServeGate {
     /// future is dropped BEFORE its first poll - the DEEP-gate leak an in-body guard missed.
     /// Dropping the returned future still SIGKILL-reaps the `nix-store --dump` group, because
     /// dropping the inner `produce_supervised` future signals caller-abandonment.
+    ///
+    /// SERVE DEADLINE (TASK-157): production is bounded by `budget.max_serve_duration`. A
+    /// source that has not produced its bytes within the deadline is `Declined(SupplyFailed)`
+    /// and, because the timeout DROPS the inner `produce_supervised` future, its supervised
+    /// process group is SIGKILL-reaped - a wedged / pathologically slow dump can never pin a
+    /// serve slot open forever now that production is a long-lived off-loop await.
+    /// The serve exchange deadline (`ServeBudget::max_serve_duration`): bounds off-loop
+    /// production ([`Self::produce_admitted`]) AND the serve-side request read / response
+    /// write ([`serve_stream`]), so no phase of an inbound serve can hang unbounded.
+    pub(crate) fn max_serve_duration(&self) -> Duration {
+        self.budget.max_serve_duration
+    }
+
     pub(crate) async fn produce_admitted(
         &self,
         plan: NarSupplyPlan,
         content: Blake3Digest,
     ) -> NarResponse {
-        match plan.produce_supervised(&self.supervisor, &content).await {
-            Ok(bytes) => {
+        let production = plan.produce_supervised(&self.supervisor, &content);
+        match tokio::time::timeout(self.budget.max_serve_duration, production).await {
+            Ok(Ok(bytes)) => {
                 self.admitted.fetch_add(1, Ordering::Relaxed);
                 NarResponse::Nar(bytes)
             }
-            Err(why) => {
+            Ok(Err(why)) => {
                 tracing::warn!(
                     %content, %why,
                     "libp2p serve: off-loop supplier failed to produce NAR"
+                );
+                self.declined_supply_failed.fetch_add(1, Ordering::Relaxed);
+                NarResponse::Declined(DeclineReason::SupplyFailed)
+            }
+            Err(_elapsed) => {
+                let deadline = self.budget.max_serve_duration;
+                tracing::warn!(
+                    %content, ?deadline,
+                    "libp2p serve: off-loop production exceeded the serve deadline; reaping"
                 );
                 self.declined_supply_failed.fetch_add(1, Ordering::Relaxed);
                 NarResponse::Declined(DeclineReason::SupplyFailed)
@@ -1539,6 +1750,276 @@ mod tests {
             gate.inflight_bytes.load(Ordering::Acquire),
             0,
             "the reservation is released after the declined serve"
+        );
+    }
+
+    // -------------------------------------------------------------------------
+    // TASK-157: the FETCH-side streaming read core (`read_response_streamed`), unit-bitten
+    // over in-memory readers. These are the crisp, load-tolerant bites for AC#1 (mid-stream
+    // size abort) and AC#2 (inter-chunk idle bound) - no wall-clock races, no live swarm.
+    // -------------------------------------------------------------------------
+
+    use std::pin::Pin;
+    use std::task::{Context, Poll};
+
+    /// A short body-idle bound for the unit bites: long enough not to flake on a scheduler
+    /// hiccup, short enough that the test finishes fast.
+    const IDLE: Duration = Duration::from_millis(150);
+
+    /// Frame a wire response as raw bytes: a status byte then (for Nar) the body verbatim,
+    /// exactly what a well-behaved server writes (no length prefix - EOF terminates the NAR).
+    fn wire_nar(body: &[u8]) -> Vec<u8> {
+        let mut v = vec![STATUS_NAR];
+        v.extend_from_slice(body);
+        v
+    }
+
+    /// A reader that yields the status byte once, then STALLS FOREVER (never another byte,
+    /// never EOF) - a provider that sent a status and then hung mid-body. The body-idle bound
+    /// must fire on it (AC#2), distinct from any total bound.
+    struct StatusThenStall {
+        sent_status: bool,
+    }
+
+    impl AsyncRead for StatusThenStall {
+        fn poll_read(
+            mut self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            buf: &mut [u8],
+        ) -> Poll<io::Result<usize>> {
+            if !self.sent_status && !buf.is_empty() {
+                self.sent_status = true;
+                buf[0] = STATUS_NAR;
+                Poll::Ready(Ok(1))
+            } else {
+                // No forward progress, ever: the inter-chunk idle guard must abort.
+                Poll::Pending
+            }
+        }
+    }
+
+    /// AC#1 the DECISIVE mid-stream bite: a provider streams a body far LARGER than the
+    /// signed `expected_size`. The read must abort the INSTANT the running total crosses the
+    /// cap - after ONE chunk - not after buffering the whole (here 512 KiB) blob, and not at
+    /// the 256 MiB floor. BITE: move the size check to AFTER the read loop (a post-receive
+    /// buffer check, the pre-157 behaviour) and `streamed` becomes the full 512 KiB.
+    #[tokio::test]
+    async fn read_aborts_mid_stream_when_body_exceeds_expected_size() {
+        let big = vec![0x5au8; 512 * 1024];
+        let content = Blake3Digest::from_raw_nar(&big); // honest hash; only SIZE is over
+        let cap: u64 = 4 * 1024; // the consumer signed 4 KiB
+        let wire = wire_nar(&big);
+        let mut reader = futures::io::Cursor::new(wire);
+
+        let err = read_response_streamed(&mut reader, Some(cap), IDLE, &content)
+            .await
+            .expect_err("an over-signed-size stream must abort");
+        match err {
+            TransferError::TooLarge { limit, streamed } => {
+                assert_eq!(limit, cap, "the abort limit is the signed expected_size");
+                assert!(
+                    streamed > cap,
+                    "streamed ({streamed}) must have crossed the cap ({cap})"
+                );
+                // The decisive mid-stream property: aborted after ONE chunk, NOT after the
+                // whole 512 KiB, and bounded by cap + one chunk.
+                assert!(
+                    streamed <= cap + NAR_STREAM_CHUNK as u64,
+                    "streamed ({streamed}) must be bounded by cap + one chunk, not the whole body"
+                );
+                assert!(
+                    (streamed as usize) < big.len(),
+                    "streamed ({streamed}) must be far less than the full body ({}) - proof the \
+                     read did NOT buffer the whole thing",
+                    big.len()
+                );
+            }
+            other => panic!("expected TooLarge, got {other}"),
+        }
+    }
+
+    /// AC#1 the cold-start floor: with NO signed size the running cap is the 256 MiB floor,
+    /// so a modest honest body still round-trips (the floor does not falsely abort it).
+    #[tokio::test]
+    async fn read_without_expected_size_uses_the_floor_and_accepts_a_modest_body() {
+        let body = b"a cold-start fetch with no signed size still streams fine".to_vec();
+        let content = Blake3Digest::from_raw_nar(&body);
+        let mut reader = futures::io::Cursor::new(wire_nar(&body));
+        let got = read_response_streamed(&mut reader, None, IDLE, &content)
+            .await
+            .expect("a modest body under the floor round-trips with no signed size");
+        assert_eq!(got, body);
+    }
+
+    /// AC#2 the DECISIVE inter-chunk idle bite: a provider sends the status byte then stalls
+    /// with no body forever. The read must fail on the BODY-IDLE bound (within it), not hang
+    /// - proving the idle guard is enforced per chunk, distinct from `total_timeout`. BITE:
+    /// drop the `timeout(body_idle_timeout, ...)` around the body read and this hangs forever.
+    #[tokio::test]
+    async fn read_aborts_on_inter_chunk_stall_within_the_idle_bound() {
+        let content = Blake3Digest::from_bytes([0x11; 32]);
+        let mut reader = StatusThenStall { sent_status: false };
+        let started = std::time::Instant::now();
+        let err = read_response_streamed(&mut reader, Some(1 << 20), IDLE, &content)
+            .await
+            .expect_err("a mid-body stall must abort on the idle bound");
+        let elapsed = started.elapsed();
+        match err {
+            TransferError::Unavailable(why) => assert!(
+                why.contains("stalled"),
+                "expected a body-idle stall abort, got: {why}"
+            ),
+            other => panic!("expected Unavailable(stalled), got {other}"),
+        }
+        // It fired on the idle bound, not after some far larger wall-clock wait.
+        assert!(
+            elapsed < IDLE * 20,
+            "the idle abort took {elapsed:?}, far past the {IDLE:?} bound - it did not fire on idle"
+        );
+    }
+
+    /// GATE-1 preserved: a provider whose streamed bytes do NOT hash to the requested
+    /// identity (same length, different bytes) fails the BLAKE3 verify at completion -
+    /// `IntegrityMismatch`, never trusted bytes. BITE: drop the final `from_raw_nar` check
+    /// and corrupt bytes are returned as if valid.
+    #[tokio::test]
+    async fn read_rejects_bytes_that_do_not_hash_to_the_requested_identity() {
+        let wanted = b"the honest bytes the consumer asked for".to_vec();
+        let requested = Blake3Digest::from_raw_nar(&wanted);
+        let corrupt = b"different bytes of the same length !!!!".to_vec();
+        assert_eq!(wanted.len(), corrupt.len());
+        let mut reader = futures::io::Cursor::new(wire_nar(&corrupt));
+        let err = read_response_streamed(&mut reader, Some(wanted.len() as u64), IDLE, &requested)
+            .await
+            .expect_err("corrupt bytes must fail gate-1");
+        match err {
+            TransferError::IntegrityMismatch { expected, actual } => {
+                assert_eq!(expected, requested);
+                assert_ne!(actual, requested);
+            }
+            other => panic!("expected IntegrityMismatch, got {other}"),
+        }
+    }
+
+    /// The status arms: NotHeld and Declined map to the right typed fetch failures.
+    #[tokio::test]
+    async fn read_maps_notheld_and_declined_status_bytes() {
+        let content = Blake3Digest::from_bytes([0x22; 32]);
+
+        let mut not_held = futures::io::Cursor::new(vec![STATUS_NOT_HELD]);
+        match read_response_streamed(&mut not_held, None, IDLE, &content).await {
+            Err(TransferError::NotHeld(got)) => assert_eq!(got, content),
+            other => panic!("expected NotHeld, got {other:?}"),
+        }
+
+        let mut declined =
+            futures::io::Cursor::new(vec![STATUS_DECLINED, DeclineReason::Busy.wire()]);
+        match read_response_streamed(&mut declined, None, IDLE, &content).await {
+            Err(TransferError::Unavailable(why)) => {
+                assert!(why.contains("declined"), "expected a decline, got: {why}")
+            }
+            other => panic!("expected Unavailable(declined), got {other:?}"),
+        }
+    }
+
+    // -------------------------------------------------------------------------
+    // TASK-157 serve-side deadline (the mped-architect finding): a consumer that opens a
+    // stream, sends its request, then never READS the response must not park the serve task
+    // or pin its in-flight reservation - every serve phase is deadline-bound.
+    // -------------------------------------------------------------------------
+
+    /// A stream that delivers a fixed 32-byte request digest on read, then STALLS its read
+    /// side (the consumer stays connected but sends nothing more - deliberately NOT EOF, so
+    /// the consumer-hung-up reap does not fire), and BLACK-HOLES its write side (the consumer
+    /// never reads, so writes never drain). Models the serve-side slowloris.
+    struct DigestThenUnreadable {
+        digest: [u8; 32],
+        read_pos: usize,
+    }
+
+    impl AsyncRead for DigestThenUnreadable {
+        fn poll_read(
+            mut self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            buf: &mut [u8],
+        ) -> Poll<io::Result<usize>> {
+            if self.read_pos < self.digest.len() && !buf.is_empty() {
+                let start = self.read_pos;
+                let n = (self.digest.len() - start).min(buf.len());
+                buf[..n].copy_from_slice(&self.digest[start..start + n]);
+                self.read_pos += n;
+                Poll::Ready(Ok(n))
+            } else {
+                // Connected but idle: NOT EOF (which would trip `consumer_hung_up`).
+                Poll::Pending
+            }
+        }
+    }
+
+    impl AsyncWrite for DigestThenUnreadable {
+        fn poll_write(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            _buf: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            Poll::Pending // the consumer never reads, so a real write would block on backpressure
+        }
+        fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Pending
+        }
+        fn poll_close(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Pending
+        }
+    }
+
+    /// FINDING-1 bite: a Process serve whose consumer sends the request then never reads the
+    /// response must NOT hang the serve task or pin its in-flight reservation - the serve
+    /// deadline caps the write, the reservation is released, and the task terminates. BITE:
+    /// drop the `timeout(deadline, write_response(..))` and the write blocks forever, so
+    /// `serve_stream` never returns (the 5 s guard trips) and the reservation stays charged.
+    #[tokio::test]
+    async fn serve_releases_the_reservation_when_the_consumer_never_reads_the_response() {
+        let body = b"a NAR whose consumer opens the stream then refuses to read".to_vec();
+        let content = Blake3Digest::from_raw_nar(&body);
+        let body_str = String::from_utf8(body.clone()).unwrap();
+        let probe = OneProbe {
+            content,
+            declared_size: body.len() as u64,
+            make: Box::new(move || ProbedSource::Process {
+                program: PathBuf::from("sh"),
+                args: vec![
+                    OsString::from("-c"),
+                    OsString::from(format!("printf %s '{body_str}'")),
+                ],
+            }),
+        };
+        let supervisor = TaskSupervisor::new();
+        let supplier = Arc::new(CatalogNarSupplier::new(probe, "unused-helper"));
+        // A SHORT serve deadline so the bounded write fires fast; the test passes whether
+        // production completes first (write then times out) or not (produce times out).
+        let short = ServeBudget {
+            max_nar_bytes_uncompressed_nar: 1 << 20,
+            max_inflight_bytes_uncompressed_nar: 1 << 30,
+            max_serve_duration: Duration::from_millis(500),
+        };
+        let gate = Arc::new(ServeGate::new(short, supplier, supervisor.handle()));
+
+        let mock = DigestThenUnreadable {
+            digest: *content.as_bytes(),
+            read_pos: 0,
+        };
+        let serve = tokio::spawn(serve_stream(mock, Some(Arc::clone(&gate))));
+
+        // Must TERMINATE within a small multiple of the deadline (not hang), and the in-flight
+        // reservation must be released - proof the non-reading consumer did not pin it.
+        tokio::time::timeout(Duration::from_secs(5), serve)
+            .await
+            .expect("serve_stream must terminate within the serve deadline, not hang forever")
+            .expect("serve task joins");
+        assert_eq!(
+            gate.inflight_bytes.load(Ordering::Acquire),
+            0,
+            "the in-flight reservation must be released after the bounded serve write"
         );
     }
 }

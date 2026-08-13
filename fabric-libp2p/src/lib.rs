@@ -115,8 +115,8 @@ pub use fabric::{ANNOUNCE_SEQ_FILENAME, Libp2pFabric, PROVIDER_FLOOR_FILENAME};
 pub use keys::VALUE_KEY_CONTEXT;
 pub use locator::Libp2pNodeLocator;
 pub use nar::{
-    CatalogNarSupplier, CatalogProbe, Libp2pNarSupplier, MemoryNarSupplier, NarCodec,
-    NarSupplyPlan, ProbedSource, ProbedSupply, RAW_NAR_HELPER_ARG, ServeCounters, ServeGate,
+    CatalogNarSupplier, CatalogProbe, Libp2pNarSupplier, MemoryNarSupplier, NarSupplyPlan,
+    ProbedSource, ProbedSupply, RAW_NAR_HELPER_ARG, ServeCounters, ServeGate,
     raw_nar_helper_authorized,
 };
 pub use server::Libp2pServer;

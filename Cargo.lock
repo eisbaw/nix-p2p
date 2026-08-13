@@ -1315,6 +1315,7 @@ dependencies = [
  "ed25519-dalek 3.0.0",
  "futures",
  "libp2p",
+ "libp2p-stream",
  "peer-fabric",
  "proc-supervisor",
  "tokio",
@@ -3035,6 +3036,21 @@ dependencies = [
  "tracing",
  "void",
  "web-time",
+]
+
+[[package]]
+name = "libp2p-stream"
+version = "0.2.0-alpha"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d454f6647bc9054e7fede2dc86e625786c4d1304bff7afc995285f53ef9091f0"
+dependencies = [
+ "futures",
+ "libp2p-core",
+ "libp2p-identity",
+ "libp2p-swarm",
+ "rand 0.8.7",
+ "tracing",
+ "void",
 ]
 
 [[package]]

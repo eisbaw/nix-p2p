@@ -5,19 +5,27 @@
 //! of the swarm's single-threaded ownership.
 
 use std::collections::{HashMap, HashSet};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use futures::StreamExt;
 use libp2p::kad::store::MemoryStore;
-use libp2p::request_response::{self, OutboundRequestId, ResponseChannel};
 use libp2p::swarm::SwarmEvent;
 use libp2p::{Multiaddr, PeerId, StreamProtocol, Swarm, identify, kad, noise, tcp, yamux};
+use libp2p_stream::{Control, IncomingStreams};
 use tokio::sync::{mpsc, oneshot};
 
 use crate::keys::{keypair_from_seed, node_id_of};
-use crate::nar::{NarCodec, NarRequest, NarResponse, Serve, ServeGate};
-use peer_fabric::{Blake3Digest, Lookup, NodeId, Unavailable};
+use crate::nar::{self, ServeGate};
+use peer_fabric::{Blake3Digest, Lookup, NodeId, TransferError, Unavailable};
+
+/// The shared serve-gate slot (TASK-157): the installed [`ServeGate`], or `None` when this
+/// node is not serving inbound NAR requests. Written by
+/// [`SwarmHandle::install_serve`] / [`SwarmHandle::uninstall_serve_nonblocking`] and read by
+/// the accept loop for each inbound stream. A brief `std::sync::Mutex` (never held across an
+/// `.await`, never on the swarm poll loop) is all it needs - the hot path is a single `Arc`
+/// clone per inbound stream, off the poll loop.
+type ServeSlot = Arc<Mutex<Option<Arc<ServeGate>>>>;
 
 /// Why a kad query did not return a healthy answer. Mapped to
 /// [`peer_fabric::Unavailable`] by the directory.
@@ -89,13 +97,17 @@ pub fn absence_from_reach<T>(reach: QueryReach) -> Lookup<T> {
 }
 
 /// The combined behaviour: Kademlia (the DHT content discovery) plus Identify (so peers
-/// learn each other's listen addresses and feed them into kad routing) plus the NAR
-/// request-response protocol (TASK-151: the byte-transfer half, over the SAME swarm).
+/// learn each other's listen addresses and feed them into kad routing) plus the RAW-STREAM
+/// NAR protocol (TASK-157: the byte-transfer half as a libp2p-stream substrate, over the
+/// SAME swarm - replacing the TASK-151 request-response carrier so bytes flow as a stream).
+///
+/// `stream` carries no swarm events we act on (its `ToSwarm` is `()`); the byte transfer is
+/// driven entirely through a [`libp2p_stream::Control`] on tasks OFF this poll loop.
 #[derive(libp2p::swarm::NetworkBehaviour)]
 pub struct Behaviour {
     pub kad: kad::Behaviour<MemoryStore>,
     pub identify: identify::Behaviour,
-    pub nar: request_response::Behaviour<NarCodec>,
+    pub stream: libp2p_stream::Behaviour,
 }
 
 /// A command sent to the swarm worker. Each carries a oneshot the worker replies on
@@ -156,33 +168,27 @@ pub enum Command {
         peer: PeerId,
         reply: oneshot::Sender<Result<(Vec<Multiaddr>, QueryReach), QueryFail>>,
     },
-    /// Fetch a NAR by digest from `peer` over the request-response protocol. The reply
-    /// carries the peer's [`NarResponse`], or a transport-level failure string.
-    FetchNar {
-        peer: PeerId,
-        content: Blake3Digest,
-        reply: oneshot::Sender<Result<NarResponse, String>>,
-    },
-    /// Install (or replace) the serve gate: from now on inbound NAR requests are
-    /// admitted and answered through it. Sent by [`crate::server::Libp2pServer::serve`].
-    InstallServe {
-        gate: Arc<ServeGate>,
-    },
-    /// Remove the serve gate IFF the worker still holds exactly `gate`. Sent best-effort
-    /// by the serve teardown guard (the synchronous stop is the gate's own `active` flag;
-    /// this just lets the worker drop its `Arc`). Carries the gate identity so a STALE
-    /// teardown cannot clobber a live SUCCESSOR session that was installed before the old
-    /// handle dropped (re-serve handoff).
-    UninstallServe {
-        gate: Arc<ServeGate>,
-    },
 }
 
 /// A cloneable handle to the worker. Every capability holds one of these; a dropped
 /// last handle ends the worker loop (the mpsc closes).
+///
+/// It also carries the byte-transfer surface (TASK-157), which does NOT go through the
+/// worker command loop: a [`libp2p_stream::Control`] to open outbound NAR streams, the NAR
+/// [`StreamProtocol`], and the shared [`ServeSlot`] the accept loop reads. Keeping the byte
+/// path off the command loop is what lets a large fetch/serve run without touching the swarm
+/// poll loop.
 #[derive(Clone)]
 pub struct SwarmHandle {
     tx: mpsc::Sender<Command>,
+    /// Opens outbound NAR substreams (auto-dialing the peer if not connected). Cloned per
+    /// fetch to satisfy `open_stream`'s `&mut self` one-stream-at-a-time backpressure.
+    control: Control,
+    /// The raw-stream NAR protocol name (`/nix-p2p/<scope>/nar/2`), for `open_stream`.
+    nar_protocol: StreamProtocol,
+    /// The installed serve gate (or `None`); read by the accept loop, written by install /
+    /// uninstall. See [`ServeSlot`].
+    serve_slot: ServeSlot,
 }
 
 impl SwarmHandle {
@@ -396,39 +402,74 @@ impl SwarmHandle {
             .unwrap_or_else(|_| Err(QueryFail::Backend("worker gone".into())))
     }
 
-    /// Request `content` from `peer` over the NAR request-response protocol, resolving
-    /// with the peer's [`NarResponse`] (or a transport-level failure string). The swarm
-    /// auto-dials `peer` if an address for it is known (fed in via `add_address` /
-    /// identify). Time-bounding and BLAKE3 verification are the transport's job.
-    pub async fn fetch_nar(
+    /// Fetch `content` from `peer` by STREAMING it over a raw NAR substream (TASK-157),
+    /// returning the gate-1 BLAKE3-verified bytes. The full envelope is enforced INSIDE:
+    ///
+    ///   * `dial_timeout` bounds opening the stream (`open_stream` auto-dials `peer` off the
+    ///     kad-known address the transport resolved and `add_address`'d before calling here);
+    ///   * `body_idle_timeout` bounds each inter-chunk read (a stalled peer aborts);
+    ///   * the running SIZE abort at `expected_size` (mid-stream) and the gate-1 verify live
+    ///     in [`nar::read_response_streamed`].
+    ///
+    /// The requester keeps its write half OPEN for the whole transfer (the server's
+    /// still-interested signal). The transport wraps this in the coarse `total_timeout`.
+    pub async fn fetch_nar_streaming(
         &self,
         peer: PeerId,
         content: Blake3Digest,
-    ) -> Result<NarResponse, String> {
-        let (reply, rx) = oneshot::channel();
-        self.send(Command::FetchNar {
-            peer,
-            content,
-            reply,
-        })
-        .await;
-        rx.await.unwrap_or_else(|_| Err("worker gone".into()))
+        expected_size: Option<u64>,
+        dial_timeout: Duration,
+        body_idle_timeout: Duration,
+    ) -> Result<Vec<u8>, TransferError> {
+        // Clone the Control per fetch: `open_stream` takes `&mut self` and opens one stream
+        // at a time, so a fresh clone is the natural unit of concurrency here.
+        let mut control = self.control.clone();
+        let open = control.open_stream(peer, self.nar_protocol.clone());
+        let mut stream = match tokio::time::timeout(dial_timeout, open).await {
+            Ok(Ok(stream)) => stream,
+            Ok(Err(error)) => {
+                return Err(TransferError::Unavailable(format!(
+                    "libp2p could not open a NAR stream to {peer}: {error}"
+                )));
+            }
+            Err(_elapsed) => {
+                return Err(TransferError::Unavailable(format!(
+                    "libp2p dialing/opening a NAR stream to {peer} exceeded the dial timeout \
+                     {dial_timeout:?}"
+                )));
+            }
+        };
+        nar::write_request(&mut stream, &content)
+            .await
+            .map_err(|error| {
+                TransferError::Unavailable(format!(
+                    "libp2p failed to send the NAR request to {peer}: {error}"
+                ))
+            })?;
+        nar::read_response_streamed(&mut stream, expected_size, body_idle_timeout, &content).await
     }
 
-    /// Install (or replace) the serve gate on the worker; inbound NAR requests are then
-    /// admitted and answered through it.
+    /// Install (or replace) the serve gate; inbound NAR requests are then admitted and
+    /// answered through it by the accept loop. Synchronous slot write (TASK-157): the byte
+    /// path no longer routes through the worker command loop.
     pub async fn install_serve(&self, gate: Arc<ServeGate>) {
-        self.send(Command::InstallServe { gate }).await;
+        *self.serve_slot.lock().expect("serve slot poisoned") = Some(gate);
     }
 
-    /// Best-effort, non-blocking uninstall of the serve gate, callable from a `Drop`
-    /// (which cannot await). The AUTHORITATIVE stop-admitting signal is the gate's own
-    /// `active` flag (flipped synchronously by the teardown guard); this command only
-    /// lets the worker drop its `Arc<ServeGate>`, so a full channel or a gone worker is
-    /// harmless.
+    /// Best-effort, non-blocking uninstall of the serve gate, callable from a `Drop` (which
+    /// cannot await). The AUTHORITATIVE stop-admitting signal is the gate's own `active` flag
+    /// (flipped synchronously by the teardown guard); this only clears the slot so a fresh
+    /// serve replaces cleanly. Clears ONLY if the slot still holds EXACTLY `gate` (`Arc`
+    /// identity), so a STALE teardown from a superseded session cannot clobber a live
+    /// successor installed before the old handle dropped (the re-serve handoff).
     pub fn uninstall_serve_nonblocking(&self, gate: Arc<ServeGate>) {
-        if self.tx.try_send(Command::UninstallServe { gate }).is_err() {
-            tracing::debug!("fabric-libp2p: serve uninstall not delivered (worker busy or gone)");
+        let mut slot = self.serve_slot.lock().expect("serve slot poisoned");
+        if slot.as_ref().is_some_and(|held| Arc::ptr_eq(held, &gate)) {
+            *slot = None;
+        } else {
+            tracing::debug!(
+                "fabric-libp2p: stale serve uninstall ignored (a successor session owns the slot)"
+            );
         }
     }
 }
@@ -454,22 +495,12 @@ enum Pending {
 }
 
 /// The worker: owns the swarm, drives it, and matches kad query terminals back to the
-/// oneshot the command carried.
+/// oneshot the command carried. The NAR byte transfer is NOT here (TASK-157): it runs on
+/// the accept loop + per-stream tasks through the [`libp2p_stream::Control`], off this loop.
 struct Worker {
     swarm: Swarm<Behaviour>,
     commands: mpsc::Receiver<Command>,
     pending: HashMap<kad::QueryId, Pending>,
-    /// Outbound NAR fetches awaiting their response, keyed by request-response id.
-    nar_pending: HashMap<OutboundRequestId, oneshot::Sender<Result<NarResponse, String>>>,
-    /// The installed serve gate, or `None` when this node is not serving (inbound NAR
-    /// requests are then answered `NotHeld`). Set by `InstallServe`.
-    serve: Option<Arc<ServeGate>>,
-    /// Backchannel for OFF-loop NAR production (TASK-193): a spawned task produces a
-    /// Process source's bytes then hands `(channel, response)` BACK here, so the poll loop
-    /// (which alone owns `&mut Behaviour`) performs `send_response`. The worker keeps a
-    /// `tx` clone, so `nar_response_rx` never closes while the worker runs.
-    nar_response_tx: mpsc::Sender<(ResponseChannel<NarResponse>, NarResponse)>,
-    nar_response_rx: mpsc::Receiver<(ResponseChannel<NarResponse>, NarResponse)>,
 }
 
 impl Worker {
@@ -484,15 +515,6 @@ impl Worker {
                     }
                 },
                 event = self.swarm.select_next_some() => self.on_event(event),
-                // A finished OFF-loop NAR production (TASK-193): deliver it now, on the
-                // poll loop, which alone owns `&mut Behaviour` for `send_response`. The
-                // worker holds a `nar_response_tx` clone, so `recv` cannot yield `None`
-                // while this loop runs; a `None` is ignored defensively.
-                produced = self.nar_response_rx.recv() => {
-                    if let Some((channel, response)) = produced {
-                        self.deliver_nar_response(channel, response);
-                    }
-                },
             }
         }
     }
@@ -610,40 +632,6 @@ impl Worker {
                     },
                 );
             }
-            Command::FetchNar {
-                peer,
-                content,
-                reply,
-            } => {
-                let id = self
-                    .swarm
-                    .behaviour_mut()
-                    .nar
-                    .send_request(&peer, NarRequest(content));
-                self.nar_pending.insert(id, reply);
-            }
-            Command::InstallServe { gate } => {
-                tracing::debug!("fabric-libp2p: NAR serve gate installed");
-                self.serve = Some(gate);
-            }
-            Command::UninstallServe { gate } => {
-                // Clear ONLY if the worker still holds exactly this gate: a stale
-                // teardown from a superseded session must not drop a live successor
-                // (which was installed before the old handle dropped). Identity is the
-                // Arc, not a value compare.
-                if self
-                    .serve
-                    .as_ref()
-                    .is_some_and(|held| Arc::ptr_eq(held, &gate))
-                {
-                    tracing::debug!("fabric-libp2p: NAR serve gate uninstalled");
-                    self.serve = None;
-                } else {
-                    tracing::debug!(
-                        "fabric-libp2p: stale serve uninstall ignored (a successor session owns the slot)"
-                    );
-                }
-            }
         }
     }
 
@@ -671,117 +659,9 @@ impl Worker {
                 step,
                 ..
             })) => self.on_query(id, result, stats, step.last),
-            SwarmEvent::Behaviour(BehaviourEvent::Nar(event)) => self.on_nar_event(event),
+            // The stream behaviour emits no events we act on (its `ToSwarm` is `()`); the
+            // NAR byte transfer is driven off this loop through the Control (TASK-157).
             _ => {}
-        }
-    }
-
-    /// Handle a NAR request-response event: serve an inbound request through the
-    /// installed [`ServeGate`], or route an outbound response/failure back to the
-    /// waiting `fetch_nar` caller.
-    fn on_nar_event(&mut self, event: request_response::Event<NarRequest, NarResponse>) {
-        use request_response::{Event, Message};
-        match event {
-            Event::Message {
-                message:
-                    Message::Request {
-                        request, channel, ..
-                    },
-                ..
-            } => {
-                // Admit on the poll loop; the `&self.serve` borrow ends here, BEFORE any
-                // `&mut swarm` use (the borrow-split invariant). A `Now` outcome answers
-                // inline; a Process source is produced OFF the loop so a slow
-                // `nix-store --dump` never stalls kad / identify / other requests (TASK-193).
-                let admission = match &self.serve {
-                    Some(gate) => gate.admit(&request.0),
-                    None => Serve::Now(NarResponse::NotHeld),
-                };
-                match admission {
-                    Serve::Now(response) => self.deliver_nar_response(channel, response),
-                    Serve::OffLoop {
-                        plan,
-                        content,
-                        reservation,
-                    } => {
-                        // The spawned task holds OWNED clones (the gate's Arc - its atomics
-                        // + supervisor handle - and the backchannel) and OWNS the
-                        // ResponseChannel across the `.await`. It NEVER touches `&mut self`
-                        // / the swarm; it hands the finished response back to the poll loop.
-                        let gate = Arc::clone(
-                            self.serve
-                                .as_ref()
-                                .expect("admit returned OffLoop, so a gate is installed"),
-                        );
-                        let tx = self.nar_response_tx.clone();
-                        tokio::spawn(async move {
-                            // OWN the reservation guard for the whole future: it was created
-                            // synchronously at admit and moved in here, so dropping this task
-                            // at ANY point - including BEFORE its first poll (a peer that
-                            // abandons the request instantly) - runs the guard's Drop and
-                            // releases the in-flight reserve exactly once (TASK-193 DEEP gate).
-                            let _reservation = reservation;
-                            let response = tokio::select! {
-                                biased;
-                                // The inbound request went away (peer disconnect / the
-                                // request-response inbound substream timed out): the channel
-                                // closes. Dropping the produce future signals caller-
-                                // abandonment, which SIGKILL-reaps the supervised process
-                                // group. Nothing left to deliver on a dead channel.
-                                () = wait_response_channel_closed(&channel) => return,
-                                response = gate.produce_admitted(plan, content) => response,
-                            };
-                            if tx.send((channel, response)).await.is_err() {
-                                tracing::debug!(
-                                    "fabric-libp2p: worker gone before off-loop NAR response delivered"
-                                );
-                            }
-                        });
-                    }
-                }
-            }
-            Event::Message {
-                message:
-                    Message::Response {
-                        request_id,
-                        response,
-                    },
-                ..
-            } => {
-                if let Some(reply) = self.nar_pending.remove(&request_id) {
-                    let _ = reply.send(Ok(response));
-                }
-            }
-            Event::OutboundFailure {
-                request_id, error, ..
-            } => {
-                if let Some(reply) = self.nar_pending.remove(&request_id) {
-                    let _ = reply.send(Err(error.to_string()));
-                }
-            }
-            Event::InboundFailure { error, .. } => {
-                tracing::debug!(%error, "fabric-libp2p: NAR inbound request failed");
-            }
-            Event::ResponseSent { .. } => {}
-        }
-    }
-
-    /// Send a NAR response on the poll loop, which alone owns `&mut Behaviour`. Used for
-    /// both the inline answer and an OFF-loop production handed back over the backchannel
-    /// (TASK-193). A closed channel (peer gone / timed out) is logged, not fatal.
-    fn deliver_nar_response(
-        &mut self,
-        channel: ResponseChannel<NarResponse>,
-        response: NarResponse,
-    ) {
-        if self
-            .swarm
-            .behaviour_mut()
-            .nar
-            .send_response(channel, response)
-            .is_err()
-        {
-            tracing::debug!("fabric-libp2p: NAR response channel closed before send");
         }
     }
 
@@ -905,15 +785,27 @@ impl Worker {
     }
 }
 
-/// Await the closing of an inbound request's [`ResponseChannel`] (TASK-193): the peer went
-/// away, or the request-response inbound substream timed out, so no response can be
-/// delivered. Polls `is_open` on a coarse interval; the off-loop producer races this so a
-/// dropped inbound request CANCELS (and thereby reaps) its supervised production instead of
-/// running to completion for a consumer that is no longer waiting.
-async fn wait_response_channel_closed(channel: &ResponseChannel<NarResponse>) {
-    while channel.is_open() {
-        tokio::time::sleep(Duration::from_millis(250)).await;
+/// The inbound-serve accept loop (TASK-157): pull each inbound NAR substream the
+/// [`libp2p_stream::Control`] accepts and hand it to a spawned per-stream task. This runs
+/// entirely OFF the swarm poll loop, so a large or slow serve never stalls kad / identify.
+/// Reads the CURRENT serve gate from the shared slot per stream, so an install/uninstall
+/// between requests takes effect without racing the poll loop. The loop ends when the swarm
+/// shuts down (the behaviour drops, closing `incoming`).
+///
+/// Task-count backpressure: each spawned [`nar::serve_stream`] is itself DEADLINE-BOUND in
+/// every phase (it self-terminates within the serve deadline), and inbound substreams are
+/// capped per connection by yamux, so parked tasks cannot accumulate without bound. A global
+/// concurrent-serve semaphore (a stricter cap than the request-response carrier's built-in
+/// inbound limit) is a possible future hardening, not needed for the current trust model.
+async fn run_accept_loop(mut incoming: IncomingStreams, serve_slot: ServeSlot) {
+    while let Some((peer, stream)) = incoming.next().await {
+        // A brief lock, off the poll loop, to snapshot the current gate (an `Arc` clone or
+        // `None`); never held across the serve `.await`.
+        let gate = serve_slot.lock().expect("serve slot poisoned").clone();
+        tracing::trace!(%peer, "fabric-libp2p: inbound NAR stream accepted");
+        tokio::spawn(nar::serve_stream(stream, gate));
     }
+    tracing::debug!("fabric-libp2p: NAR accept loop ended (swarm shut down)");
 }
 
 /// Configuration for one libp2p node.
@@ -960,6 +852,9 @@ pub struct Node {
     pub node_id: NodeId,
     pub peer_id: PeerId,
     _worker: abort::AbortOnDropHandle,
+    /// The inbound-serve accept loop (TASK-157), aborted on drop alongside the worker so a
+    /// dropped node tears down both its poll loop and its stream-accept task (RAII).
+    _accept: abort::AbortOnDropHandle,
 }
 
 /// A tokio JoinHandle wrapper that aborts the worker when the node is dropped, so a
@@ -990,7 +885,10 @@ impl Node {
         let kad_protocol = StreamProtocol::try_from_owned(format!("/nix-p2p/{scope}/kad/1.0.0"))
             .map_err(|e| NodeError::Build(format!("invalid kad protocol name: {e:?}")))?;
         let id_protocol = format!("/nix-p2p/{scope}/id/1.0.0");
-        let nar_protocol = StreamProtocol::try_from_owned(format!("/nix-p2p/{scope}/nar/1"))
+        // `/nar/2`: the raw-stream framing (TASK-157) is wire-incompatible with the old
+        // request-response `/nar/1` (TASK-151), so the version is bumped. The protocol NAME
+        // is a transport detail, not a frozen surface - the RawNarV1 bytes it carries are.
+        let nar_protocol = StreamProtocol::try_from_owned(format!("/nix-p2p/{scope}/nar/2"))
             .map_err(|e| NodeError::Build(format!("invalid nar protocol name: {e:?}")))?;
 
         let swarm = libp2p::SwarmBuilder::with_existing_identity(keypair)
@@ -1015,40 +913,52 @@ impl Node {
                     kad.set_mode(Some(kad::Mode::Server));
                     let identify =
                         identify::Behaviour::new(identify::Config::new(id_protocol, key.public()));
-                    // The NAR byte-transfer protocol shares this swarm (TASK-151). Both
-                    // ends support it (Full): a node both fetches and serves.
-                    let nar = request_response::Behaviour::with_codec(
-                        NarCodec,
-                        [(nar_protocol, request_response::ProtocolSupport::Full)],
-                        request_response::Config::default(),
-                    );
-                    Ok(Behaviour { kad, identify, nar })
+                    // The RAW-STREAM NAR byte-transfer substrate (TASK-157): opened and
+                    // accepted through a Control on tasks OFF this poll loop. It is
+                    // protocol-agnostic here; the concrete `/nar/2` name is registered on the
+                    // accept side below.
+                    let stream = libp2p_stream::Behaviour::new();
+                    Ok(Behaviour {
+                        kad,
+                        identify,
+                        stream,
+                    })
                 },
             )
             .map_err(|e| NodeError::Build(e.to_string()))?
             .with_swarm_config(|c| c.with_idle_connection_timeout(Duration::from_secs(60)))
             .build();
 
+        // The raw-stream NAR surface (TASK-157). One Control drives both directions: it
+        // registers the inbound `/nar/2` protocol (once) via `accept`, and opens outbound
+        // NAR streams for fetches. The accept loop runs the SERVE half entirely off the poll
+        // loop, reading the current gate from the shared slot.
+        let mut control = swarm.behaviour().stream.new_control();
+        let incoming = control.accept(nar_protocol.clone()).map_err(|e| {
+            NodeError::Build(format!("failed to register the NAR stream protocol: {e}"))
+        })?;
+        let serve_slot: ServeSlot = Arc::new(Mutex::new(None));
+        let accept_join = tokio::spawn(run_accept_loop(incoming, Arc::clone(&serve_slot)));
+
         let (tx, rx) = mpsc::channel(64);
-        // The OFF-loop NAR production backchannel (TASK-193): spawned producers hand their
-        // finished response back for the poll loop to `send_response`.
-        let (nar_response_tx, nar_response_rx) = mpsc::channel(64);
         let worker = Worker {
             swarm,
             commands: rx,
             pending: HashMap::new(),
-            nar_pending: HashMap::new(),
-            serve: None,
-            nar_response_tx,
-            nar_response_rx,
         };
         let join = tokio::spawn(worker.run());
 
         Ok(Node {
-            handle: SwarmHandle { tx },
+            handle: SwarmHandle {
+                tx,
+                control,
+                nar_protocol,
+                serve_slot,
+            },
             node_id,
             peer_id,
             _worker: abort::AbortOnDropHandle::new(join),
+            _accept: abort::AbortOnDropHandle::new(accept_join),
         })
     }
 }

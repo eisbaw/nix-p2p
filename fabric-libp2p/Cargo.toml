@@ -38,6 +38,16 @@ libp2p = { version = "0.54", default-features = false, features = [
     "noise",
     "yamux",
 ] }
+# libp2p-stream (TASK-157): the RAW-STREAM NAR transfer (AsyncRead/AsyncWrite per
+# call) that REPLACES the request-response NAR carrier. The libp2p 0.54 meta-crate
+# does not re-export a `stream` feature, so the crate is pulled directly; it is
+# pinned to the version whose libp2p-swarm/libp2p-core reqs match the locked
+# libp2p 0.54.1 (swarm 0.45 / core 0.42). This gives the swarm a `stream::Behaviour`
+# whose `Control` opens/accepts raw substreams OFF the poll loop, so the fetcher
+# aborts mid-stream at exactly the signed size, enforces a real inter-chunk idle
+# bound, and a large serve never blocks kad. Stays on the libp2p side
+# (check-independence green: testproxy shares none of it).
+libp2p-stream = "0.2.0-alpha"
 # The single-threaded Swarm is driven from a dedicated worker task; the directory /
 # announcer talk to it over tokio channels (mpsc command in, oneshot reply out).
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "sync", "time"] }
