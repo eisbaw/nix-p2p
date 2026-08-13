@@ -350,7 +350,12 @@ fn registrations_survive_a_restart() {
     );
 
     // Boot 2: a fresh index loads the file and still answers Have, recomputing the
-    // derived digest (which is deliberately NOT persisted).
+    // derived digest ONCE. Boot 1 only REGISTERED (it never served/derived), so
+    // there was no VERIFIED derivation to persist - task-82 persists the digest only
+    // after a serve verifies it, so this not-yet-served registration is stored as a
+    // bare path and re-derives here. (A path that HAD been served would warm from
+    // the persisted digest with NO re-dump; that is proven in
+    // daemon-core/tests/availability_persisted_digest.rs.)
     let (dumper, calls) = CountingDumper::pair(nar);
     let index = AvailabilityIndex::open(
         node(),
@@ -366,7 +371,7 @@ fn registrations_survive_a_restart() {
     assert_eq!(
         calls.calls(),
         1,
-        "the derived digest is recomputed once after restart (not persisted)"
+        "an unserved registration re-derives once after restart (nothing verified to persist)"
     );
 }
 

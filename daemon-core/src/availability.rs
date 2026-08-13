@@ -8,22 +8,38 @@
 //!
 //! ## What it maps, and what is derived (data design first)
 //!
-//! The ONE piece of durable state is a REGISTRATION:
+//! The durable state is a REGISTRATION plus, once verified, its derived binding:
 //!
 //! ```text
-//!   NarHashKey  ->  StorePath          (persisted: "I hold this NAR, here")
+//!   NarHashKey  ->  (StorePath, Blake3Digest, NarSize)   (persisted; task-82)
 //! ```
 //!
-//! Everything else is DERIVED from that registration plus the filesystem, and is
-//! therefore NOT stored (single source of truth, no duplicated derived state):
+//! The `StorePath` is the SOURCE OF TRUTH ("I hold this NAR, here"). The
+//! `Blake3Digest` + `NarSize` are DERIVED from it (`nix-store --dump` +
+//! [`Blake3Digest::from_raw_nar`]), and the general rule of this module is that
+//! derived state is NOT stored (single source of truth, no duplicated derived
+//! state). Task-82 makes ONE earned exception, spelled out where it is taken (see
+//! [`DerivedNar`] and [`AvailabilityIndex::open`]): persisting the digest+size is
+//! safe here ONLY because a `/nix/store` path's content is IMMUTABLE, so
+//! `BLAKE3(dump(path))` is time-invariant and cannot go stale for that path -
+//! the exception the "caching invites staleness" rule is deliberately violated
+//! under. Everything else stays derived-on-demand:
 //!
 //!   * the addressed unit `BLAKE3(RawNarV1)` is `nix-store --dump <path>` piped
 //!     through the frozen [`Blake3Digest::from_raw_nar`] recipe. It is a PURE
-//!     function of the NAR bytes, so it is computed ON DEMAND, cached in memory
-//!     under a single-flight lock, and simply recomputed after a restart. It is
-//!     deliberately not persisted: caching a derived value invites staleness, and
-//!     a warm-cache-on-disk is a later optimisation (see the honest limits below),
-//!     not a correctness requirement.
+//!     function of the NAR bytes, computed ON DEMAND under a single-flight lock.
+//!     Once a probe has VERIFIED it (task-56: `sha256(dump) == key`), that verified
+//!     digest+size is also written to disk (task-82) so a restarted node can serve
+//!     a previously-announced digest with NO re-dump and NO hold-query first
+//!     (closing the task-61 "seeding gap"). A pre-task-82 snapshot that lacks the
+//!     derived fields still loads and simply re-derives - the persisted binding is
+//!     an optimisation of WHEN the digest is available, never a second source of
+//!     truth: the serve path re-dumps and re-checks `BLAKE3 == announced` before
+//!     handing over bytes, so a persisted digest can only ever cost a wrong CLAIM
+//!     (a wasted dial), never a wrong BYTE. For an immutable `/nix/store` path even
+//!     the claim cannot go stale; the one case where a persisted claim CAN be wrong
+//!     (and durably so) is a rewritten raw-file-backed path, spelled out in honest
+//!     limit (b).
 //!   * AVAILABILITY (does the store path still exist?) is read from the filesystem
 //!     at query time. A GC'd path therefore DROPS from availability with no active
 //!     bookkeeping - the filesystem is the source of truth for existence, and a
@@ -75,8 +91,26 @@
 //!     frozen one-shot recipe as the single source of truth. For the wave-2 whole
 //!     `/nix/store` a streaming `blake3::Hasher` over the child's stdout would bound
 //!     memory; deferred as hardening (the recipe stays identical either way).
-//!   * [`JsonFileStore`] rewrites the whole snapshot on every mutation. Fine for a
-//!     test-scoped store; an append-log / sqlite is the scale answer.
+//!   * [`JsonFileStore`] rewrites the WHOLE snapshot (serialise + fsync + rename)
+//!     under the global map lock on every mutation, and task-82 adds the FIRST SERVE
+//!     of each key as one more mutation trigger (it persists the newly verified
+//!     derived binding once per key). Be honest about the magnitude: each write is
+//!     O(N_total entries), so warming a cold/legacy snapshot by serving a K-path
+//!     closure is K full rewrites of an N-entry file, serialised under the lock,
+//!     before the store stabilises (e.g. a 200-path closure over an 89k-entry index
+//!     = 200 rewrites of the whole file). It is bounded and ONCE-ever - a subsequent
+//!     boot warms every entry from disk, so `freshly_derived` is false and nothing
+//!     re-persists - but the constant is not free. This is the SAME scale limit the
+//!     whole-snapshot design already carries; an append-log / sqlite is the answer
+//!     for both. On-disk BYTE cost of the added derived fields is measured in
+//!     `tests/availability_persisted_digest.rs` (AC#3).
+//!   * The verified derived value is deliberately DUPLICATED in three places - the
+//!     `DeriveOutcome::Verified` digest slot, the `persisted_derived` leaf mirror,
+//!     and the disk snapshot. This is not free (it is derived state held thrice, the
+//!     smell this module usually avoids); it is the accepted price of NOT taking a
+//!     `digest` lock (which can be held across a dump) under the map lock during a
+//!     snapshot. The disk copy is the durable one; the two in-memory copies are
+//!     single-flight/serialisation caches of it and cannot outlive the process.
 //!   * The index is synchronous and holds the entry lock across the (blocking) dump.
 //!     A caller on an async runtime should drive it via `spawn_blocking`. Making the
 //!     dump itself async is deferred with the streaming change.
@@ -90,15 +124,30 @@
 //!     the first probe re-dumps and re-checks (correct, just not persisted) - a
 //!     persisted quarantine is a possible optimisation, not a correctness gap; and
 //!     (b) the cached `Verified` derivation assumes the backing bytes are IMMUTABLE
-//!     between verification and serve. For a real `/nix/store` path that holds (the
-//!     store is immutable and GC drops it to `Absent`), but a RAW-FILE-backed path
-//!     ([`RegularFileNarDumper`], a non-store file) could be REWRITTEN after
-//!     verification, leaving a stale positive `Have`. This is not a serve-integrity
-//!     hole - the supply path ([`AvailabilityIndex::supply_raw_nar_cancellable`])
-//!     re-dumps and re-checks `BLAKE3(dump) == announced` at serve time and fails
-//!     loud on drift, so a peer never receives wrong bytes under a right name - only
-//!     a transient false CLAIM until the next re-derivation. Store paths (the
-//!     production case) make it moot; the raw-file case is the stated exception.
+//!     between verification and serve - and task-82 now PERSISTS that verified
+//!     derivation and WARMS it at boot, so the assumption is relied on across a
+//!     restart too, not only in-process. For a real `/nix/store` path that holds
+//!     unconditionally (the store is immutable and GC only drops it to `Absent`,
+//!     never rewrites it), which is why persisting the digest is sound (see the
+//!     "data design" section) - the claim can never go stale. A RAW-FILE-backed path
+//!     ([`RegularFileNarDumper`], a non-store file, NON-PRODUCTION - only examples
+//!     and tests use it) COULD be rewritten after verification (or while the daemon
+//!     is down). When it is, the warmed `Verified` slot is NOT self-correcting:
+//!     [`Self::derive`] short-circuits on a `Verified` slot and nothing re-derives a
+//!     still-present path, so [`Self::hold`] keeps answering `Have{old digest}` and
+//!     [`Self::publish`] keeps RE-ANNOUNCING the old digest - a DURABLE wrong CLAIM
+//!     (now persisted across restarts, strictly worse than the pre-task-82 in-memory
+//!     window) that clears only on an explicit re-`register` or a GC. Its cost is
+//!     repeated WASTED DIALS + DHT pollution, bounded by the lying-claim accounting.
+//!     It is NOT a serve-integrity hole: the supply path
+//!     ([`AvailabilityIndex::supply_raw_nar_cancellable`]) re-dumps and re-checks
+//!     `BLAKE3(dump) == announced` at serve time and fails loud on drift, and the
+//!     consumer's Nix gate-2 independently re-verifies, so a peer NEVER receives
+//!     wrong bytes under a right name. Store paths (the production case) make the
+//!     whole hazard moot; the durable-wrong-claim raw-file case is the stated
+//!     exception, and it is exactly what task-82's AC#2 changed-path bite exercises.
+//!     (A size probe [`Self::supply_size_cancellable`] likewise trusts the persisted
+//!     `NarSize` for such a path without a recheck - see that method's note.)
 //!   * SEEDING (the eager kind) is external by design: producing a claim's `Iroh` offer does NOT put
 //!     the blob into this node's iroh-blobs store. task-39's [`crate::transport_iroh::IrohProvider::seed`]
 //!     is fed FROM this index (task-39/40/41 wire it); until then an announced offer
@@ -531,17 +580,135 @@ impl NarDumper for RegularFileNarDumper {
 // The IndexStore seam: persist the registration set (source of truth).
 // -------------------------------------------------------------------------
 
-/// Persists the registration set `NarHashKey -> StorePath` so the index survives a
-/// restart. Only the SOURCE OF TRUTH is stored; the derived BLAKE3 is not (it is
-/// recomputed on demand). A SEAM so a test can persist to a temp file (proving
-/// restart) or use a no-op store.
+/// One persisted holding: the SOURCE-OF-TRUTH `key -> store_path` binding, plus -
+/// once a probe has VERIFIED it (task-56/82) - the derived `Blake3Digest` + `NarSize`.
+///
+/// `derived` is `None` for a registration that has never been served (its digest
+/// is still uncomputed) and for a legacy pre-task-82 snapshot that predates the
+/// field; both simply re-derive on demand. It is written ONLY for a VERIFIED
+/// binding - never a quarantined one - so a mis-registration can never be made
+/// durable across a restart (the exact trap task-82's source note warned about).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PersistedRegistration {
+    pub key: NarHashKey,
+    pub store_path: StorePath,
+    pub derived: Option<DerivedNar>,
+}
+
+/// Persists the registration set so the index survives a restart. The SOURCE OF
+/// TRUTH is the `key -> store_path` binding; task-82 additionally persists the
+/// VERIFIED derived `Blake3Digest` + `NarSize` (see [`PersistedRegistration`] and
+/// the module docs for why caching that derived value on disk is safe HERE). A
+/// SEAM so a test can persist to a temp file (proving restart) or use a no-op store.
 pub trait IndexStore: Send + Sync {
     /// Load the persisted registrations (empty if none yet). A malformed store is
     /// an ERROR, not silently-empty: a corrupt index must fail loud, not lose data.
-    fn load(&self) -> Result<Vec<(NarHashKey, StorePath)>, PersistError>;
+    fn load(&self) -> Result<Vec<PersistedRegistration>, PersistError>;
 
     /// Atomically replace the persisted registrations with `entries`.
-    fn save(&self, entries: &[(NarHashKey, StorePath)]) -> Result<(), PersistError>;
+    fn save(&self, entries: &[PersistedRegistration]) -> Result<(), PersistError>;
+}
+
+/// The on-disk VALUE for one key. FORWARD/BACKWARD compatible by shape: a
+/// pre-task-82 snapshot wrote a bare path STRING (the [`StoredValue::PathOnly`] arm
+/// still loads it and re-derives), while task-82 writes the
+/// [`StoredValue::WithDerived`] OBJECT carrying the verified derived binding. A
+/// future reader that does not know a later field ignores it rather than crashing
+/// (the inner object is not `deny_unknown_fields`), and a future writer that omits
+/// the object still round-trips through `PathOnly`.
+///
+/// NarSize is stored under an explicitly-named `nar_size_uncompressed_nar` field:
+/// the persisted number is the UNCOMPRESSED `--dump` length, never a compressed
+/// narinfo `FileSize` (the unit trap this project has hit repeatedly).
+///
+/// `Deserialize` is HAND-WRITTEN rather than `#[serde(untagged)]` deliberately:
+/// untagged collapses a malformed object (a corrupt `blake3` string, an
+/// out-of-range size) into a useless "data did not match any variant" message,
+/// discarding the real cause - which would make the one corruption class task-82
+/// newly introduces fail the LEAST verbosely, against this module's fail-loud
+/// contract. The visitor below dispatches on the JSON shape (string vs object) and
+/// delegates the object to a derived inner struct, so a bad field surfaces its OWN
+/// error (e.g. the [`Blake3Digest`] parse error) all the way up.
+#[derive(Debug, Clone)]
+enum StoredValue {
+    /// Legacy / not-yet-derived: just the store path. Derived binding re-derived.
+    PathOnly(String),
+    /// The registration WITH its verified derived binding (task-82).
+    WithDerived {
+        store_path: String,
+        blake3: Blake3Digest,
+        nar_size_uncompressed_nar: u64,
+    },
+}
+
+impl serde::Serialize for StoredValue {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        match self {
+            // Legacy shape: a bare path string, byte-for-byte what a pre-82 node wrote.
+            StoredValue::PathOnly(path) => serializer.serialize_str(path),
+            StoredValue::WithDerived {
+                store_path,
+                blake3,
+                nar_size_uncompressed_nar,
+            } => {
+                use serde::ser::SerializeStruct;
+                let mut st = serializer.serialize_struct("StoredValue", 3)?;
+                st.serialize_field("store_path", store_path)?;
+                st.serialize_field("blake3", blake3)?;
+                st.serialize_field("nar_size_uncompressed_nar", nar_size_uncompressed_nar)?;
+                st.end()
+            }
+        }
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for StoredValue {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct StoredValueVisitor;
+
+        impl<'de> serde::de::Visitor<'de> for StoredValueVisitor {
+            type Value = StoredValue;
+
+            fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                f.write_str(
+                    "a store-path string (legacy) or an object \
+                     {store_path, blake3, nar_size_uncompressed_nar}",
+                )
+            }
+
+            fn visit_str<E: serde::de::Error>(self, value: &str) -> Result<StoredValue, E> {
+                Ok(StoredValue::PathOnly(value.to_string()))
+            }
+
+            fn visit_string<E: serde::de::Error>(self, value: String) -> Result<StoredValue, E> {
+                Ok(StoredValue::PathOnly(value))
+            }
+
+            fn visit_map<A: serde::de::MapAccess<'de>>(
+                self,
+                map: A,
+            ) -> Result<StoredValue, A::Error> {
+                // A derived inner struct so a corrupt field reports its REAL cause
+                // (the [`Blake3Digest`] / u64 parse error), not a generic message.
+                #[derive(serde::Deserialize)]
+                struct Derived {
+                    store_path: String,
+                    blake3: Blake3Digest,
+                    nar_size_uncompressed_nar: u64,
+                }
+                let derived = <Derived as serde::Deserialize>::deserialize(
+                    serde::de::value::MapAccessDeserializer::new(map),
+                )?;
+                Ok(StoredValue::WithDerived {
+                    store_path: derived.store_path,
+                    blake3: derived.blake3,
+                    nar_size_uncompressed_nar: derived.nar_size_uncompressed_nar,
+                })
+            }
+        }
+
+        deserializer.deserialize_any(StoredValueVisitor)
+    }
 }
 
 /// A no-op store: the index is in-memory only (does not survive restart). Useful
@@ -549,16 +716,17 @@ pub trait IndexStore: Send + Sync {
 pub struct NullStore;
 
 impl IndexStore for NullStore {
-    fn load(&self) -> Result<Vec<(NarHashKey, StorePath)>, PersistError> {
+    fn load(&self) -> Result<Vec<PersistedRegistration>, PersistError> {
         Ok(Vec::new())
     }
-    fn save(&self, _entries: &[(NarHashKey, StorePath)]) -> Result<(), PersistError> {
+    fn save(&self, _entries: &[PersistedRegistration]) -> Result<(), PersistError> {
         Ok(())
     }
 }
 
 /// The real store: a single JSON file mapping the canonical `sha256:<base32>` key
-/// to the store path. A `BTreeMap` so the on-disk form is SORTED and stable (a
+/// to its [`StoredValue`] (a bare path string, or the object carrying the verified
+/// derived binding). A `BTreeMap` so the on-disk form is SORTED and stable (a
 /// clean diff, greppable), and the write is ATOMIC (temp file + rename) so a crash
 /// mid-write never leaves a torn index.
 pub struct JsonFileStore {
@@ -573,7 +741,7 @@ impl JsonFileStore {
 }
 
 impl IndexStore for JsonFileStore {
-    fn load(&self) -> Result<Vec<(NarHashKey, StorePath)>, PersistError> {
+    fn load(&self) -> Result<Vec<PersistedRegistration>, PersistError> {
         let bytes = match std::fs::read(&self.path) {
             Ok(bytes) => bytes,
             // Absent file == an empty index (first boot), not an error.
@@ -585,14 +753,14 @@ impl IndexStore for JsonFileStore {
                 )));
             }
         };
-        let raw: BTreeMap<String, String> = serde_json::from_slice(&bytes).map_err(|e| {
+        let raw: BTreeMap<String, StoredValue> = serde_json::from_slice(&bytes).map_err(|e| {
             PersistError(format!(
                 "{} is not a valid index file: {e}",
                 self.path.display()
             ))
         })?;
         let mut out = Vec::with_capacity(raw.len());
-        for (key_str, path_str) in raw {
+        for (key_str, value) in raw {
             // Fail loud on a corrupt key rather than silently dropping a holding.
             let key: NarHashKey = key_str.parse().map_err(|e| {
                 PersistError(format!(
@@ -600,20 +768,55 @@ impl IndexStore for JsonFileStore {
                     self.path.display()
                 ))
             })?;
-            out.push((key, StorePath::new(path_str)));
+            let (path_str, derived) = match value {
+                StoredValue::PathOnly(path_str) => (path_str, None),
+                StoredValue::WithDerived {
+                    store_path,
+                    blake3,
+                    nar_size_uncompressed_nar,
+                } => (
+                    store_path,
+                    Some(DerivedNar {
+                        blake3,
+                        nar_size_uncompressed_nar,
+                    }),
+                ),
+            };
+            out.push(PersistedRegistration {
+                key,
+                store_path: StorePath::new(path_str),
+                derived,
+            });
         }
         Ok(out)
     }
 
-    fn save(&self, entries: &[(NarHashKey, StorePath)]) -> Result<(), PersistError> {
+    fn save(&self, entries: &[PersistedRegistration]) -> Result<(), PersistError> {
         let mut map = BTreeMap::new();
-        for (key, path) in entries {
+        for entry in entries {
             // A non-UTF8 store path fails loud rather than being lossily corrupted.
-            let path_str = path
+            let path_str = entry
+                .store_path
                 .as_path()
                 .to_str()
-                .ok_or_else(|| PersistError(format!("store path {path} is not valid UTF-8")))?;
-            map.insert(key.to_string(), path_str.to_string());
+                .ok_or_else(|| {
+                    PersistError(format!(
+                        "store path {} is not valid UTF-8",
+                        entry.store_path
+                    ))
+                })?
+                .to_string();
+            let value = match entry.derived {
+                // Persist the VERIFIED derived binding alongside the source path.
+                Some(derived) => StoredValue::WithDerived {
+                    store_path: path_str,
+                    blake3: derived.blake3,
+                    nar_size_uncompressed_nar: derived.nar_size_uncompressed_nar,
+                },
+                // Not yet derived (or a legacy holding): store only the source path.
+                None => StoredValue::PathOnly(path_str),
+            };
+            map.insert(entry.key.to_string(), value);
         }
         let json = serde_json::to_vec_pretty(&map)
             .map_err(|e| PersistError(format!("serialising the index: {e}")))?;
@@ -704,6 +907,16 @@ struct Entry {
     /// the single-flight guard: concurrent callers block here while the first one
     /// dumps + hashes + verifies.
     digest: Mutex<Option<DeriveOutcome>>,
+    /// The VERIFIED derived binding, mirrored out of the `digest` slot into a pure
+    /// LEAF mutex so [`AvailabilityIndex::persist_locked`] can snapshot it while
+    /// holding the entries map lock WITHOUT ever taking a `digest` lock there - a
+    /// `digest` lock can be held for a whole NAR dump, and blocking the map lock on
+    /// a dump is exactly the head-of-line stall this index is built to avoid. This
+    /// mutex is only ever locked to copy the small [`DerivedNar`] in or out; nothing
+    /// else is acquired while it is held, so it introduces no lock cycle. It holds
+    /// `Some` ONLY for a VERIFIED derivation (never a quarantine), which is the sole
+    /// thing task-82 persists.
+    persisted_derived: Mutex<Option<DerivedNar>>,
 }
 
 /// A node's local availability index and claim producer. See the module docs.
@@ -739,10 +952,12 @@ pub struct AvailabilityIndex {
     /// strictly larger than hold, which is AC#2 failing in the one direction that
     /// matters (announcing a serve the index has disowned).
     ///
-    /// STATED LIMIT (the task-61 seeding gap, filed as task-82): this map is
-    /// in-memory, so after a restart a digest is unsuppliable until some
-    /// hold-query re-derives it. Warming it at boot would mean re-dumping the
-    /// whole store.
+    /// TASK-82 (the task-61 seeding gap, RESOLVED): this map is still in-memory, but
+    /// it is now WARMED AT BOOT from the persisted VERIFIED derived binding (see
+    /// [`Self::open`]), WITHOUT re-dumping - a previously-announced digest is
+    /// suppliable immediately after a restart, no hold-query first. Only a
+    /// registration that was never served (its digest still uncomputed) is absent
+    /// until its first probe, exactly as before.
     supply_catalog: SupplyCatalog,
     dumper: Arc<dyn NarDumper>,
     store: Arc<dyn IndexStore>,
@@ -752,6 +967,48 @@ pub struct AvailabilityIndex {
 impl AvailabilityIndex {
     /// Build an index, loading any persisted registrations so it survives restart.
     /// `node_id` is this node's iroh identity (the locator its offers carry).
+    ///
+    /// WARMING THE DERIVED BINDING (task-82, AC#1). For every loaded registration
+    /// that carries a VERIFIED persisted `Blake3Digest` + `NarSize`, this pre-seeds
+    /// the single-flight `digest` slot with `Verified(..)` AND publishes the
+    /// supply-catalog record, so the node can REVERSE-MAP and serve a
+    /// previously-announced digest immediately - with NO hold-query and NO re-dump.
+    /// That closes the task-61 seeding gap: before task-82 the supply catalog was
+    /// empty at boot, so a claim already on the DHT naming a digest this node could
+    /// no longer reverse-map was undiallable until some hold-query re-derived it.
+    ///
+    /// WHY PRE-SEEDING A PERSISTED DERIVED VALUE IS SOUND (the earned exception to
+    /// this module's "do not persist derived state, it goes stale" rule). The digest
+    /// is `BLAKE3(nix-store --dump path)`. For a `/nix/store` path the content is
+    /// IMMUTABLE (write-once; GC only removes it, never rewrites it), so that digest
+    /// is a TIME-INVARIANT function of the path and CANNOT go stale - persisting it
+    /// is not caching a value that may drift, it is recording a value that provably
+    /// will not. The ONE case where a backing path CAN change is a raw-file-backed
+    /// non-store path ([`RegularFileNarDumper`], non-production), which could be
+    /// rewritten while the daemon is down; the WRONG BYTES that would then dump are
+    /// caught NOT here but at the serve boundary, where
+    /// [`Self::supply_raw_nar_cancellable`] re-dumps and asserts
+    /// `BLAKE3(dump) == announced` before handing over a byte, failing loud on drift.
+    /// So a warmed-but-since-changed binding never yields a wrong BYTE - but note
+    /// (honest limit (b)) that the wrong CLAIM itself is DURABLE for such a path (the
+    /// `Verified` slot is terminal until a re-`register`/GC), not self-healing.
+    /// Existence is likewise re-checked at every query, so a path GC'd during
+    /// downtime warms into the catalog but resolves to `Absent`/`None` the instant it
+    /// is probed.
+    ///
+    /// TRUSTED-STATE NOTE (what pre-seeding does NOT re-check). Seeding the slot with
+    /// `Verified` trusts the on-disk verdict WITHOUT re-running task-56's source check
+    /// `sha256(dump) == key` (doing so would mean re-dumping at boot, defeating the
+    /// whole point). This is sound because: (a) the record was written ONLY after that
+    /// check passed for a genuine dump (`derive` persists from its `Verified` branch
+    /// alone, never a quarantine); (b) the index file is LOCAL daemon state, inside the
+    /// trust boundary - an attacker who can rewrite it can do worse, and it is not the
+    /// p2p TCB; and (c) even a tampered `key -> blake3` binding cannot deliver wrong
+    /// bytes: the serve-time `BLAKE3(dump) == announced` recheck and the CONSUMER's Nix
+    /// gate-2 (`sha256(nar) == NarHash`) both still fire, so the worst reachable outcome
+    /// is a wasted dial, never an accepted wrong NAR. A persisted quarantine verdict is
+    /// therefore still an optional optimisation, not a correctness requirement (honest
+    /// limit (a)).
     pub fn open(
         node_id: NodeId,
         dumper: Arc<dyn NarDumper>,
@@ -761,13 +1018,30 @@ impl AvailabilityIndex {
         let loaded = store.load()?;
         let supply_catalog = SupplyCatalog::default();
         let mut entries = HashMap::with_capacity(loaded.len());
-        for (key, store_path) in loaded {
+        for reg in loaded {
+            let supply_registration = supply_catalog.register();
+            // Warm the supply direction from the persisted VERIFIED derivation so a
+            // previously-announced digest is suppliable with no hold-query first.
+            if let Some(derived) = reg.derived {
+                let record = SupplyCatalogRecord {
+                    declared_size: derived.nar_size_uncompressed_nar,
+                    source: nar_dumper_sealed::Sealed::production_source(
+                        dumper.as_ref(),
+                        &reg.store_path,
+                    ),
+                    store_path: reg.store_path.as_path().to_path_buf(),
+                };
+                supply_catalog.publish(&supply_registration, derived.blake3, record);
+            }
             entries.insert(
-                key,
+                reg.key,
                 Arc::new(Entry {
-                    store_path,
-                    supply_registration: supply_catalog.register(),
-                    digest: Mutex::new(None),
+                    store_path: reg.store_path,
+                    supply_registration,
+                    // Pre-seed the single-flight cache with the VERIFIED derivation
+                    // so the first post-restart probe answers Have without a re-dump.
+                    digest: Mutex::new(reg.derived.map(DeriveOutcome::Verified)),
+                    persisted_derived: Mutex::new(reg.derived),
                 }),
             );
         }
@@ -806,6 +1080,11 @@ impl AvailabilityIndex {
     /// Persist ordering (Low): on a persist failure the in-memory map is already
     /// mutated while disk is not, so a restart reloads the pre-mutation set. The
     /// caller sees the `Err` and can retry; the divergence is transient and bounded.
+    /// This HARD-errors on a persist failure because the `key -> store_path` binding
+    /// is the SOURCE OF TRUTH and losing it silently would be data loss; contrast the
+    /// first-serve derived-binding persist in [`Self::hold`], which is best-effort
+    /// (logs and continues) precisely because the derived value is an optimisation,
+    /// not a source of truth. The asymmetry is deliberate, not an oversight.
     pub fn register(&self, key: NarHashKey, store_path: StorePath) -> Result<(), PersistError> {
         {
             let mut entries = self.entries.lock().expect("entries mutex");
@@ -824,6 +1103,11 @@ impl AvailabilityIndex {
                     store_path,
                     supply_registration: self.supply_catalog.register(),
                     digest: Mutex::new(None),
+                    // A fresh (or moved-path) registration has no verified derivation
+                    // yet; it is computed + persisted on the first serve, and any old
+                    // persisted derived value for a replaced path is dropped by the
+                    // snapshot rebuild below (the new entry contributes `None`).
+                    persisted_derived: Mutex::new(None),
                 }),
             );
             // The supply direction must follow the registration. A replaced entry
@@ -865,7 +1149,7 @@ impl AvailabilityIndex {
                 continue;
             }
 
-            let derived = match self.derive(key, &entry) {
+            let (derived, freshly_derived) = match self.derive(key, &entry) {
                 Ok(derived) => derived,
                 Err(error) => {
                     let entries = self.entries.lock().expect("entries mutex");
@@ -908,6 +1192,21 @@ impl AvailabilityIndex {
                     "active registration for {key} was retired before supply publication"
                 ))));
             }
+            // Persist the newly VERIFIED derived binding (task-82) so a restart can
+            // serve this digest with no re-dump. Done ONCE, on the fresh transition,
+            // while we already hold the map lock (correct map->... order); it reads
+            // each entry's leaf `persisted_derived`, never a digest lock, so it never
+            // blocks the map lock on a dump. Best-effort: the derived value is an
+            // optimisation, not a source of truth, so a persist failure is logged
+            // LOUD but does NOT fail the serve - the node can still hand over these
+            // bytes; the only cost is a re-derive on the next boot (pre-task-82
+            // behaviour). The in-memory warm state is unaffected.
+            if freshly_derived && let Err(error) = self.persist_locked(&entries) {
+                eprintln!(
+                    "daemon: availability index: persisting the verified derived binding \
+                     for {key} failed ({error}); it will be re-derived after a restart"
+                );
+            }
             drop(entries);
             return Ok(HoldAnswer::Have {
                 blake3: derived.blake3,
@@ -925,6 +1224,19 @@ impl AvailabilityIndex {
     /// SUPPLY at the same instant it drops out of [`Self::hold`], or the two sets
     /// diverge again in the one direction that matters (we would promise a serve
     /// we cannot perform).
+    ///
+    /// STALE-SIZE NOTE (task-82, the honest-limit (b) envelope). Only EXISTENCE is
+    /// re-checked here; the returned size is the persisted/derived `declared_size`,
+    /// trusted WITHOUT a recheck - rechecking would mean a dump, defeating the whole
+    /// "answer without producing" point. For an immutable `/nix/store` path that is
+    /// always exact. For a rewritten raw-file-backed path (the non-production
+    /// exception) it can be a STALE size, so a serve budget could admit against the
+    /// wrong number. That stays inside the same envelope as the wrong-claim limit: it
+    /// never yields wrong BYTES, because the actual byte serve
+    /// ([`Self::supply_raw_nar_cancellable`]) re-dumps and fails loud on
+    /// `BLAKE3 != announced` before a byte leaves. Accepted for the prototype;
+    /// tightening it (an mtime guard / a bounded re-stat) is a follow-up, not a
+    /// correctness gap.
     pub fn supply_size_cancellable(
         &self,
         blake3: &Blake3Digest,
@@ -1198,10 +1510,19 @@ impl AvailabilityIndex {
     /// costs a peer a wasted dial), so the entry is QUARANTINED and every probe of
     /// it fails loudly with a typed [`NarHashMismatch`]. The comparison is raw-byte
     /// (`NarHashKey == NarHashKey`), so there is no encoding to get wrong.
-    fn derive(&self, key: &NarHashKey, entry: &Entry) -> Result<DerivedNar, AvailabilityError> {
+    /// Returns the derivation and whether it was FRESHLY computed on this call
+    /// (`true`) or served from the single-flight cache / a warmed persisted binding
+    /// (`false`). The caller ([`Self::hold`]) uses the flag to persist the verified
+    /// derived binding to disk exactly ONCE - on the fresh transition - rather than
+    /// rewriting the whole snapshot on every probe.
+    fn derive(
+        &self,
+        key: &NarHashKey,
+        entry: &Entry,
+    ) -> Result<(DerivedNar, bool), AvailabilityError> {
         let mut slot = entry.digest.lock().expect("digest mutex");
         match &*slot {
-            Some(DeriveOutcome::Verified(derived)) => return Ok(*derived),
+            Some(DeriveOutcome::Verified(derived)) => return Ok((*derived, false)),
             Some(DeriveOutcome::Quarantined(mismatch)) => {
                 return Err(AvailabilityError::NarHashMismatch(mismatch.clone()));
             }
@@ -1219,6 +1540,9 @@ impl AvailabilityIndex {
             };
             // Cache the QUARANTINE (a deterministic verdict), so a mis-registered
             // key is not re-dumped on every probe. Loud, typed, never a false Have.
+            // A quarantine is NEVER mirrored into `persisted_derived` and NEVER
+            // persisted (task-82): persisting an unverified binding would make a
+            // mis-registration durable across a restart, the exact trap to avoid.
             *slot = Some(DeriveOutcome::Quarantined(mismatch.clone()));
             return Err(AvailabilityError::NarHashMismatch(mismatch));
         }
@@ -1231,7 +1555,15 @@ impl AvailabilityIndex {
             nar_size_uncompressed_nar: raw_nar.len() as u64,
         };
         *slot = Some(DeriveOutcome::Verified(derived));
-        Ok(derived)
+        // Mirror the VERIFIED derivation into the leaf field so `persist_locked` can
+        // snapshot it under the map lock without ever taking a digest lock. Locking
+        // the leaf here (while holding `digest`) is the digest->leaf order; the leaf
+        // is a pure sink that acquires nothing, so no cycle is possible.
+        *entry
+            .persisted_derived
+            .lock()
+            .expect("persisted-derived mutex") = Some(derived);
+        Ok((derived, true))
     }
 
     /// This node's iroh transport offer (a pure locator: just the NodeId).
@@ -1239,15 +1571,28 @@ impl AvailabilityIndex {
         KnownTransport::Iroh { node: self.node_id }
     }
 
-    /// Persist the current registration set. Called with the entries lock held so a
-    /// concurrent register/drop cannot interleave a torn snapshot.
+    /// Persist the current registration set. Called with the entries map lock held
+    /// so a concurrent register/drop cannot interleave a torn snapshot.
+    ///
+    /// The VERIFIED derived binding for each entry is read from the LEAF
+    /// `persisted_derived` mutex - NEVER the `digest` slot - so this never blocks the
+    /// map lock on an in-flight NAR dump (a `digest` lock can be held for the whole
+    /// dump). An entry whose digest is still uncomputed, or was quarantined,
+    /// contributes `derived: None` and persists only its source path.
     fn persist_locked(
         &self,
         entries: &HashMap<NarHashKey, Arc<Entry>>,
     ) -> Result<(), PersistError> {
-        let snapshot: Vec<(NarHashKey, StorePath)> = entries
+        let snapshot: Vec<PersistedRegistration> = entries
             .iter()
-            .map(|(key, entry)| (*key, entry.store_path.clone()))
+            .map(|(key, entry)| PersistedRegistration {
+                key: *key,
+                store_path: entry.store_path.clone(),
+                derived: *entry
+                    .persisted_derived
+                    .lock()
+                    .expect("persisted-derived mutex"),
+            })
             .collect();
         self.store.save(&snapshot)
     }

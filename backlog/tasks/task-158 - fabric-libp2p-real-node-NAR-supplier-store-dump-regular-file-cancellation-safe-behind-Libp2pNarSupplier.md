@@ -6,7 +6,7 @@ title: >-
 status: To Do
 assignee: []
 created_date: '2026-08-12 08:38'
-updated_date: '2026-08-13 10:11'
+updated_date: '2026-08-13 10:38'
 labels:
   - libp2p
   - fabric
@@ -34,4 +34,6 @@ TASK-151's Libp2pNarSupplier has only an in-memory source (MemoryNarSupplier, te
 
 <!-- SECTION:NOTES:BEGIN -->
 Forward-carried from TASK-56 regate (commit 3155ed0): the SIGN-SITE seed verification is now IN PLACE at the libp2p announce SSOT - verify_provider_seeds(seeds) runs as the first statement of announce_provider_seeds and asserts NarHashKey::from_raw_nar(bytes)==declared before any ProviderRecord is signed. When 158 wires the verified AvailabilityIndex in as the store-dump supplier: do NOT duplicate or bypass this guard. The bytes 158 feeds the provider still flow through announce_provider_seeds (or must), so the declared NarHash is checked against the actual dump there regardless of supply source (seed-nar OR index dump). If 158 introduces a NEW announce path that does not go through announce_provider_seeds, it MUST call verify_provider_seeds itself (or route through the SSOT). The typed error is daemon_libp2p::SeedNarHashMismatch.
+
+Forward-carried from TASK-82 (persist derived binding): the availability index now PERSISTS the VERIFIED NarHashKey->(StorePath,Blake3Digest,NarSize) binding and WARMS the supply_catalog at open(), so a restarted supplier can reverse-map a previously-announced digest -> store_path WITHOUT a hold-query/re-dump first. When this libp2p supplier leans on the persisted binding: (1) it is safe to trust the persisted digest for a /nix/store path (content-immutable), but you MUST keep the serve-time BLAKE3(dump)==announced recheck (fabric-iroh has the analogue) - for a raw-file-backed non-store source the persisted digest can be stale and only that recheck stops shipping wrong bytes under a right name; (2) declared-size-before-produce is already satisfiable from the persisted NarSize (uncompressed NAR bytes; NOT a compressed FileSize - unit trap) without a dump; (3) persisted state is ONLY the verified binding - a not-yet-served or quarantined path has no persisted digest and must fall back to derive-on-demand. See daemon-core/src/availability.rs open()/derive()/persist_locked and daemon-core/tests/availability_persisted_digest.rs.
 <!-- SECTION:NOTES:END -->
