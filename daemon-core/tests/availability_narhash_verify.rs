@@ -34,8 +34,9 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use daemon_core::{
-    AvailabilityError, AvailabilityIndex, Blake3Digest, HoldAnswer, MemoryNarDumper, NarHashKey,
-    NodeId, NullAnnounce, NullStore, StorePath,
+    AvailabilityError, AvailabilityIndex, BatchHoldAnswer, BatchHoldQuery, Blake3Digest,
+    HoldAnswer, MemoryNarDumper, NarHashKey, NodeId, NullAnnounce, NullStore, QUERY_SCHEMA_VERSION,
+    StorePath,
 };
 
 // ------------------------------------------------------------------ helpers
@@ -172,39 +173,110 @@ fn mis_registration_is_quarantined_not_answered_as_have() {
     );
 }
 
-/// The mis-registered key is quarantined even under concurrent probes, and the
-/// dump happens at most a bounded number of times (the verdict is cached, not
-/// re-dumped on every probe) - a mismatch is deterministic, so caching it is safe.
+/// The mis-registered key is quarantined under CONCURRENT probes, and single-flight
+/// applies to the quarantine too: N callers racing the same uncomputed mis-registered
+/// key dump+hash it EXACTLY ONCE (the first computes the mismatch under the lock; the
+/// rest block, then observe the cached `Quarantined` verdict and error without a
+/// second dump). A mismatch is deterministic, so caching it is safe - and it stops a
+/// mis-registered key from being a per-probe re-dump (per-serve RSS matters).
 #[test]
-fn a_quarantined_key_stays_quarantined_and_is_not_re_dumped_each_probe() {
+fn a_quarantined_key_is_single_flight_under_concurrent_probes() {
+    use std::sync::Barrier;
+    use std::time::Duration;
+
     let tmp = TempDir::new("quarantine-cache");
     let real_nar = synth_raw_nar(b"content whose key was lied about");
     let lied_key = NarHashKey::from_sha256_bytes([0x7e; 32]);
     assert_ne!(lied_key, NarHashKey::from_raw_nar(&real_nar));
 
-    let dumper = Arc::new(MemoryNarDumper::new(real_nar));
-    let index = AvailabilityIndex::open(
-        node(),
-        dumper.clone(),
-        Arc::new(NullStore),
-        Arc::new(NullAnnounce),
-    )
-    .expect("open");
+    // A delay widens the contention window so a broken (check-then-compute) index
+    // would race multiple dumps through it - making "dumped exactly once" a real bite.
+    let dumper = Arc::new(MemoryNarDumper::with_delay(
+        real_nar,
+        Duration::from_millis(50),
+    ));
+    let index = Arc::new(
+        AvailabilityIndex::open(
+            node(),
+            dumper.clone(),
+            Arc::new(NullStore),
+            Arc::new(NullAnnounce),
+        )
+        .expect("open"),
+    );
     index
         .register(lied_key, tmp.store_file("lied.nar"))
         .expect("register");
 
-    for _ in 0..5 {
-        assert!(matches!(
-            index.hold(&lied_key),
-            Err(AvailabilityError::NarHashMismatch(_))
-        ));
+    const N: usize = 16;
+    let barrier = Arc::new(Barrier::new(N));
+    let mut handles = Vec::with_capacity(N);
+    for _ in 0..N {
+        let index = Arc::clone(&index);
+        let barrier = Arc::clone(&barrier);
+        handles.push(std::thread::spawn(move || {
+            barrier.wait(); // release all threads at once for maximum contention
+            matches!(
+                index.hold(&lied_key),
+                Err(AvailabilityError::NarHashMismatch(_))
+            )
+        }));
+    }
+    for handle in handles {
+        assert!(
+            handle.join().unwrap(),
+            "every concurrent probe of a mis-registered key must be a typed NarHashMismatch"
+        );
     }
     assert_eq!(
         dumper.calls(),
         1,
-        "the quarantine verdict is cached: a deterministic mismatch is dumped ONCE, \
-         not re-dumped on every probe (per-serve RSS matters)"
+        "single-flight quarantine FAILED: {N} concurrent callers dumped the NAR more than once"
+    );
+
+    // And a later probe still errors from the CACHED verdict (no further dump).
+    assert!(matches!(
+        index.hold(&lied_key),
+        Err(AvailabilityError::NarHashMismatch(_))
+    ));
+    assert_eq!(
+        dumper.calls(),
+        1,
+        "the cached quarantine verdict is not re-dumped"
+    );
+}
+
+/// A quarantined key degrades to `Absent` in a BATCHED probe, not an error and not a
+/// false `Have`: `answer_batch`'s per-key fault policy logs the mismatch and answers
+/// Absent for that key (the safe direction - a batch must not let one mis-registered
+/// path deny or falsify a whole closure). Asserted directly here rather than left
+/// structurally implied.
+#[test]
+fn a_quarantined_key_answers_absent_in_a_batch() {
+    let tmp = TempDir::new("quarantine-batch");
+    let real_nar = synth_raw_nar(b"batch content whose key was lied about");
+    let lied_key = NarHashKey::from_sha256_bytes([0x3c; 32]);
+    assert_ne!(lied_key, NarHashKey::from_raw_nar(&real_nar));
+
+    let index = index_with(real_nar);
+    index
+        .register(lied_key, tmp.store_file("lied.nar"))
+        .expect("register");
+
+    let response = index
+        .answer_batch(&BatchHoldQuery {
+            schema_version: QUERY_SCHEMA_VERSION,
+            keys: vec![lied_key],
+        })
+        .expect("a batch with a quarantined key still returns a well-formed response");
+    assert!(
+        matches!(response.answers.as_slice(), [BatchHoldAnswer::Absent {}]),
+        "a quarantined key must answer Absent in a batch (never a false Have): {:?}",
+        response.answers
+    );
+    assert!(
+        response.offers.is_empty(),
+        "an all-absent batch volunteers no locator"
     );
 }
 

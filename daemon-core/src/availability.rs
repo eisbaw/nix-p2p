@@ -85,10 +85,20 @@
 //!     BLAKE3s and asserts it equals `key`; a mismatch QUARANTINES the entry (a
 //!     typed [`NarHashMismatch`], never a false `Have`). Nix's gate 2 still
 //!     backstops a bad INSTALL, but a mis-registration now fails loud HERE instead
-//!     of becoming a wasted-dial false claim. Remaining honest limit: the
+//!     of becoming a wasted-dial false claim. Remaining honest limits: (a) the
 //!     quarantine verdict lives in the in-memory digest slot, so after a restart
 //!     the first probe re-dumps and re-checks (correct, just not persisted) - a
-//!     persisted quarantine is a possible optimisation, not a correctness gap.
+//!     persisted quarantine is a possible optimisation, not a correctness gap; and
+//!     (b) the cached `Verified` derivation assumes the backing bytes are IMMUTABLE
+//!     between verification and serve. For a real `/nix/store` path that holds (the
+//!     store is immutable and GC drops it to `Absent`), but a RAW-FILE-backed path
+//!     ([`RegularFileNarDumper`], a non-store file) could be REWRITTEN after
+//!     verification, leaving a stale positive `Have`. This is not a serve-integrity
+//!     hole - the supply path ([`AvailabilityIndex::supply_raw_nar_cancellable`])
+//!     re-dumps and re-checks `BLAKE3(dump) == announced` at serve time and fails
+//!     loud on drift, so a peer never receives wrong bytes under a right name - only
+//!     a transient false CLAIM until the next re-derivation. Store paths (the
+//!     production case) make it moot; the raw-file case is the stated exception.
 //!   * SEEDING (the eager kind) is external by design: producing a claim's `Iroh` offer does NOT put
 //!     the blob into this node's iroh-blobs store. task-39's [`crate::transport_iroh::IrohProvider::seed`]
 //!     is fed FROM this index (task-39/40/41 wire it); until then an announced offer

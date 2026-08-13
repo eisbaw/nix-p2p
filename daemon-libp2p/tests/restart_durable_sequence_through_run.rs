@@ -152,10 +152,6 @@ async fn start_provider_and_announce(
     (fabric, serve, record)
 }
 
-fn nar_hash_string(bytes: [u8; 32]) -> String {
-    NarHashKey::from_sha256_bytes(bytes).to_string()
-}
-
 fn narinfo_body(token: &str, nar_hash: &str, nar_size: usize) -> Vec<u8> {
     format!(
         "StorePath: /nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-x\n\
@@ -291,8 +287,9 @@ async fn restart_durable_sequence_serves_through_run() {
     let _ = std::fs::remove_dir_all(&state_dir);
 
     let nar = b"nix-archive-1 raw NAR served post-restart at a durable sequence".to_vec();
-    let nar_hash_bytes = [0x77u8; 32];
-    let nar_hash: NarHashKey = nar_hash_string(nar_hash_bytes).parse().expect("nar hash");
+    // TASK-56: the shipped announce path now verifies sha256(bytes)==declared NarHash,
+    // so the seed must declare the NAR's TRUE NarHash (not an arbitrary key).
+    let nar_hash = NarHashKey::from_raw_nar(&nar);
     let content_key = provider_content_key(&nar_hash);
 
     // ---- B (bootstrap) ----
@@ -509,7 +506,8 @@ async fn a_partial_state_dir_with_lost_identity_fails_closed() {
     let _ = std::fs::remove_dir_all(&state_dir);
 
     let nar = b"nix-archive-1 raw NAR for the partial-corruption oracle".to_vec();
-    let nar_hash: NarHashKey = nar_hash_string([0x5cu8; 32]).parse().expect("nar hash");
+    // TASK-56: declare the NAR's TRUE NarHash (the shipped announce path verifies it).
+    let nar_hash = NarHashKey::from_raw_nar(&nar);
 
     let (bootstrap, boot_addr) = start_fabric(
         Libp2pFabric::start(NodeConfig {

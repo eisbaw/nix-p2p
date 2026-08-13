@@ -253,6 +253,57 @@ pub fn provider_content_key(nar_hash: &NarHashKey) -> ContentKey {
     ContentKey::derive_from_signed_nar_hash(nar_hash.as_bytes())
 }
 
+/// A provider seed whose DECLARED Nix NarHash does not match its bytes: the operator
+/// gave `--libp2p-seed-nar <declared>=/path/to/bytes.nar` where
+/// `sha256(bytes) != declared`. Signing/announcing a [`ProviderRecord`] for `declared`
+/// over those bytes would mint a FALSE CLAIM - a consumer discovers this provider by
+/// `declared`, fetches, then rejects it at its OWN NarHash gate: a wasted dial that
+/// pollutes honest offload accounting (the very thing TASK-56 forbids, here on the
+/// path that actually ships). Refused at the announce SSOT BEFORE any record is signed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SeedNarHashMismatch {
+    /// The NarHash the operator DECLARED for this seed (the discovery key a consumer
+    /// would look this provider up by).
+    pub declared: NarHashKey,
+    /// The NarHash the seed BYTES actually hash to (`sha256` of the raw NAR).
+    pub actual: NarHashKey,
+}
+
+impl std::fmt::Display for SeedNarHashMismatch {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "provider seed NarHash mismatch: declared {} but the seed bytes hash to {}; \
+             refusing to sign or announce a false provider record",
+            self.declared, self.actual
+        )
+    }
+}
+
+impl std::error::Error for SeedNarHashMismatch {}
+
+/// Verify that every provider seed's bytes hash to its DECLARED NarHash BEFORE any
+/// record is signed (TASK-56): `NarHashKey::from_raw_nar(bytes) == declared`, reusing
+/// the EXACT `daemon-core` helper the availability index uses to close the same gap on
+/// the index-backed path. This is the site where a provider CLAIM is minted, so it is
+/// the architecturally correct place to assert the bytes match the identity the claim
+/// will advertise - regardless of whether the supply source is `--libp2p-seed-nar` or a
+/// future index-backed dump (TASK-158). The WHOLE batch is refused on the first
+/// mismatch (fail-fast), so a mis-specified seed fails the provider loudly at startup
+/// rather than announcing a false claim.
+pub fn verify_provider_seeds(seeds: &[(NarHashKey, Vec<u8>)]) -> Result<(), SeedNarHashMismatch> {
+    for (declared, bytes) in seeds {
+        let actual = NarHashKey::from_raw_nar(bytes);
+        if actual != *declared {
+            return Err(SeedNarHashMismatch {
+                declared: *declared,
+                actual,
+            });
+        }
+    }
+    Ok(())
+}
+
 /// The file under a `state_dir` that durably anchors this node's libp2p IDENTITY seed
 /// (TASK-185 GB1), the companion to the `announce-seq-v1.txt` / `provider-floor-v1.txt` the
 /// fabric writes there. A STABLE identity is what makes the durable sequence floor matter at
@@ -451,6 +502,13 @@ pub async fn announce_provider_seeds(
     now: u64,
     budget: &AnnounceBudget,
 ) -> Result<Vec<ProviderRecord>, String> {
+    // TASK-56: verify every seed's bytes hash to its declared NarHash BEFORE signing or
+    // announcing ANY record. This is the shipped SSOT where the provider CLAIM is minted
+    // (both thin binaries and the composite daemon call this exact loop), so a
+    // mis-specified `--libp2p-seed-nar <X>=/path/to/Y.nar` is refused here instead of
+    // advertising a false claim. Refusing the whole batch up front means no partial
+    // announce leaves a false record behind a later mismatch.
+    verify_provider_seeds(seeds).map_err(|e| e.to_string())?;
     let announcer = fabric
         .announcer()
         .ok_or_else(|| "internal: libp2p provider fabric exposes no announcer".to_string())?;
