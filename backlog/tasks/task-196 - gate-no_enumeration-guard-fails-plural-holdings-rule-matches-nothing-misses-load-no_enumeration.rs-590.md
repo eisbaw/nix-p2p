@@ -3,9 +3,11 @@ id: TASK-196
 title: >-
   gate: no_enumeration guard fails - plural-holdings rule matches nothing,
   misses load() (no_enumeration.rs:590)
-status: To Do
-assignee: []
+status: In Progress
+assignee:
+  - '@claude'
 created_date: '2026-08-13 16:01'
+updated_date: '2026-08-13 16:11'
 labels:
   - infra
   - verification

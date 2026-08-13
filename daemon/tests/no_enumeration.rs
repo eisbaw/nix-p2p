@@ -24,8 +24,9 @@
 //! `transport_iroh`):
 //!
 //!   if the RETURN type contains a multi-valued container of an identity type
-//!   (`NarHashKey`, `Blake3Digest`, `Claim`, `StorePath`), OR is one of the
-//!   WRAPPER types that carries such a collection inside it (`BatchHoldResponse`)
+//!   (`NarHashKey`, `Blake3Digest`, `Claim`, `StorePath`, `BatchHoldAnswer`,
+//!   `PersistedRegistration`), OR is one of the WRAPPER types that carries such a
+//!   collection inside it (`BatchHoldResponse`)
 //!   then the PARAMETERS must mention an identity type or a KEY-BEARING QUERY
 //!   type (`HoldQuery`, `BatchHoldQuery`).
 //!
@@ -111,6 +112,15 @@ const IDENTITY_TYPES: &[&str] = &[
     // Every `Have` carries a blake3, so a Vec of these IS a holdings listing -
     // built out of the project's own types, which is what made it easy to miss.
     "BatchHoldAnswer",
+    // One PersistedRegistration is a single `key -> store_path` holding record
+    // (task-82: plus its verified derived Blake3Digest); a Vec of them IS this
+    // node's whole registration set - the very listing the invariant forbids
+    // handing to a peer. task-82 changed `IndexStore::load`'s return from a bare
+    // key list to `Vec<PersistedRegistration>`, and because this type was not
+    // listed the guard stopped seeing `load` AT ALL - matching nothing where it
+    // once caught the local-persistence read. It is exempted below (a startup
+    // read of THIS node's own file, not wire-reachable), not invisible.
+    "PersistedRegistration",
 ];
 
 /// Types that CARRY a collection of holdings inside them, so returning one bare -
@@ -679,6 +689,56 @@ fn the_guard_bites_on_an_enumeration_hidden_in_a_wrapper_type() {
     assert!(
         mentions(&sigs[0].params, KEY_BEARING_PARAMS),
         "a BatchHoldQuery IS the caller's named keys"
+    );
+}
+
+#[test]
+fn the_guard_bites_on_an_enumeration_of_the_persisted_registration_set() {
+    // A regression bite for TASK-196. `IndexStore::load` returns
+    // `Vec<PersistedRegistration>` (task-82 changed it from a bare key list); one
+    // PersistedRegistration is a single holding record, so a Vec of them is this
+    // node's whole registration set. When that type was absent from IDENTITY_TYPES
+    // the rule stopped seeing `load` at all - it matched NOTHING. This proves the
+    // added arm fails-closed: an un-exempted method dumping the set with no key in
+    // is caught, and the honest per-key form is not.
+    let hostile = r#"
+        impl AvailabilityIndex {
+            pub fn dump_all_registrations(&self) -> Vec<PersistedRegistration> {
+            }
+        }
+    "#;
+    let sigs = signatures("discovery.rs", hostile);
+    assert_eq!(sigs.len(), 1);
+    assert_eq!(sigs[0].name, "dump_all_registrations");
+    assert!(
+        returns_plural_identity(&sigs[0].ret),
+        "a Vec<PersistedRegistration> return must count as plural holdings"
+    );
+    assert!(
+        !mentions(&sigs[0].params, KEY_BEARING_PARAMS),
+        "it is handed no keys, so the rule must reject it"
+    );
+    // It is caught only because it is NOT in the exemption list - unlike the three
+    // IndexStore::load impls, which are exempt as local-startup reads.
+    assert!(
+        !ALLOWED.iter().any(|(file, item, name, _)| {
+            *file == sigs[0].file && *item == sigs[0].item && *name == sigs[0].name
+        }),
+        "discovery.rs::dump_all_registrations must NOT be exempt"
+    );
+
+    // The per-key form, handed the caller's keys, is legitimate and passes.
+    let legitimate = r#"
+        impl AvailabilityIndex {
+            pub fn registrations_for(&self, keys: &[NarHashKey]) -> Vec<PersistedRegistration> {
+            }
+        }
+    "#;
+    let sigs = signatures("availability.rs", legitimate);
+    assert!(returns_plural_identity(&sigs[0].ret));
+    assert!(
+        mentions(&sigs[0].params, KEY_BEARING_PARAMS),
+        "a caller-supplied key list is what makes a plural answer legitimate"
     );
 }
 
