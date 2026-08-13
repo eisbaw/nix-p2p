@@ -6,6 +6,7 @@ title: >-
 status: To Do
 assignee: []
 created_date: '2026-08-13 08:10'
+updated_date: '2026-08-13 11:06'
 labels:
   - fabric-libp2p
   - daemon-libp2p
@@ -26,3 +27,14 @@ ROOT CAUSE: three independent sidecars with no atomic init marker and no cross-c
 
 BITING TEST: identity kept but the sequence/floor file deleted -> restart must FAIL-CLOSED (once an init marker exists to distinguish it from a true first boot). Plus the existing TASK-185 partial-corruption test (identity lost, floor kept) stays green.
 <!-- SECTION:DESCRIPTION:END -->
+
+## Implementation Notes
+
+<!-- SECTION:NOTES:BEGIN -->
+SCOPE EXTENSION collected from TASK-82 DEEP gate (2026-08-13): fold the availability-index (daemon-core) persistence-integrity items into this single atomic durable-state-file work. TASK-82 persists the VERIFIED NarHashKey->(StorePath,Blake3Digest,NarSize) binding in daemon-core/src/availability.rs (JsonFileStore) and WARMS it at boot; the DEEP arbitration ruled tamper of that LOCAL file is a bounded-wasted-dial (availability/claim-accuracy) risk, NOT a byte-integrity risk (byte-integrity stays on the serve-time BLAKE3(dump)==announced recheck + consumer Nix NarHash gate; PRD:157). These are DEFENSE-IN-DEPTH, explicitly NOT TASK-82 gates:
+1. Per-binding integrity check (checksum/MAC) over each persisted (key,digest,size) binding so tamper/corruption FAILS LOUD at load instead of warm-loading as Verified (beyond the TCB line).
+2. One-way downgrade-compat guard for the StoredValue shape (a new-format snapshot must not be silently mis-read by an old binary; today it is a hand-written serde enum: legacy bare-string | WithDerived object).
+3. Persisted quarantine verdict for the availability index (TASK-56 leaves it in-memory-only; re-checked on first post-restart probe) - an optimization, not a correctness need.
+4. Fold JsonFileStore's whole-snapshot O(N)-per-mutation rewrite (now also triggered once per key on first serve) into the single atomic durable-state file (the scale answer).
+NOTE: TASK-82 already added the atomic+DURABLE write to JsonFileStore::save (write+fsync temp -> rename -> fsync parent dir), mirroring TASK-185; this task subsumes the broader single-file consolidation. Code cross-references this task in a comment at availability.rs persist_locked().
+<!-- SECTION:NOTES:END -->

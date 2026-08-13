@@ -421,6 +421,52 @@ fn a_corrupt_persisted_blake3_fails_loud_with_the_real_cause() {
     );
 }
 
+// --------------------------------------------- atomic + durable write hygiene
+
+#[test]
+fn save_is_atomic_and_leaves_no_temp_litter() {
+    // The durable-write recipe (write+fsync temp -> rename -> fsync dir) cannot have
+    // its fsyncs observed in-process without fault injection, but the ATOMIC-rename
+    // half is observable: after a successful save the directory holds exactly the
+    // target file and NO `.tmp-*` sibling, and the content round-trips. A crash
+    // between write and rename would leave the OLD target intact (never a torn one),
+    // which is the property the rename provides; the fsyncs make that property
+    // survive a power loss (asserted by construction + the code comment in save()).
+    let tmp = TempDir::new("atomic");
+    let index_file = tmp.join("availability-index.json");
+    let store = JsonFileStore::new(&index_file);
+
+    let key = NarHashKey::from_sha256_bytes([0x33; 32]);
+    let regs = vec![PersistedRegistration {
+        key,
+        store_path: StorePath::new("/nix/store/whatever-1.0"),
+        derived: Some(DerivedNar {
+            blake3: Blake3Digest::from_bytes([0x44; 32]),
+            nar_size_uncompressed_nar: 4096,
+        }),
+    }];
+    store.save(&regs).expect("save");
+
+    // Exactly the target file exists; no temp sibling was left behind.
+    let mut names: Vec<String> = std::fs::read_dir(&tmp.path)
+        .expect("read dir")
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .collect();
+    names.sort();
+    assert_eq!(
+        names,
+        vec!["availability-index.json".to_string()],
+        "save must rename the temp file away, leaving no .tmp-* litter: {names:?}"
+    );
+
+    // And it round-trips through load (the durable bytes are the ones we wrote).
+    let loaded = store.load().expect("load");
+    assert_eq!(
+        loaded, regs,
+        "the persisted binding round-trips through disk"
+    );
+}
+
 // ------------------------------------------------------------- AC#3: measurement
 
 #[test]

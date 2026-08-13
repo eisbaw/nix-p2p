@@ -91,8 +91,10 @@
 //!     frozen one-shot recipe as the single source of truth. For the wave-2 whole
 //!     `/nix/store` a streaming `blake3::Hasher` over the child's stdout would bound
 //!     memory; deferred as hardening (the recipe stays identical either way).
-//!   * [`JsonFileStore`] rewrites the WHOLE snapshot (serialise + fsync + rename)
-//!     under the global map lock on every mutation, and task-82 adds the FIRST SERVE
+//!   * [`JsonFileStore`] rewrites the WHOLE snapshot (serialise -> write+fsync a temp
+//!     file -> atomic rename -> fsync the parent dir - the durable-write recipe, so a
+//!     crash never publishes a torn/zero-length index) under the global map lock on
+//!     every mutation, and task-82 adds the FIRST SERVE
 //!     of each key as one more mutation trigger (it persists the newly verified
 //!     derived binding once per key). Be honest about the magnitude: each write is
 //!     O(N_total entries), so warming a cold/legacy snapshot by serving a K-path
@@ -159,7 +161,7 @@ use std::collections::BTreeMap;
 use std::collections::HashMap;
 use std::ffi::OsString;
 use std::fmt;
-use std::io::Read;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -727,8 +729,9 @@ impl IndexStore for NullStore {
 /// The real store: a single JSON file mapping the canonical `sha256:<base32>` key
 /// to its [`StoredValue`] (a bare path string, or the object carrying the verified
 /// derived binding). A `BTreeMap` so the on-disk form is SORTED and stable (a
-/// clean diff, greppable), and the write is ATOMIC (temp file + rename) so a crash
-/// mid-write never leaves a torn index.
+/// clean diff, greppable), and the write is ATOMIC AND DURABLE (write + fsync a temp
+/// file, rename it over the target, then fsync the parent dir - see [`Self::save`]),
+/// so a crash mid-write never leaves a torn or zero-length index.
 pub struct JsonFileStore {
     path: PathBuf,
 }
@@ -821,16 +824,42 @@ impl IndexStore for JsonFileStore {
         let json = serde_json::to_vec_pretty(&map)
             .map_err(|e| PersistError(format!("serialising the index: {e}")))?;
 
-        if let Some(parent) = self.path.parent() {
-            std::fs::create_dir_all(parent)
-                .map_err(|e| PersistError(format!("creating {}: {e}", parent.display())))?;
-        }
-        // Atomic replace: write a sibling temp file, then rename over the target.
+        // The parent directory the file (and its temp sibling) live in. A bare
+        // filename has an empty parent, which means the current directory.
+        let parent = match self.path.parent() {
+            Some(parent) if !parent.as_os_str().is_empty() => parent.to_path_buf(),
+            _ => PathBuf::from("."),
+        };
+        std::fs::create_dir_all(&parent)
+            .map_err(|e| PersistError(format!("creating {}: {e}", parent.display())))?;
+
+        // ATOMIC + DURABLE replace (the standard fsync recipe; mirrors the task-185
+        // identity-seed write). Durability is LOAD-BEARING for task-82: warm-load's
+        // whole soundness argument is "trust what we DURABLY wrote", so the write
+        // must actually reach stable storage, not just the page cache.
+        //   1. write the temp file, then fsync ITS data+metadata;
+        //   2. rename it over the target (atomic on POSIX);
+        //   3. fsync the PARENT DIRECTORY so the rename (the name->inode link) is
+        //      itself durable.
+        // Skipping (1) lets a crash after the rename expose a zero-length / torn
+        // index on a delayed-allocation fs; skipping (3) lets the rename be lost
+        // even though the bytes hit the platter. A torn/empty file still fails LOUD
+        // at load (`PersistError`, never silently-empty), which bounds the blast
+        // radius. The whole-file rewrite + per-write fsync is O(N) per mutation;
+        // folding it into a single append/durable state file is task-189.
         let tmp = self
             .path
             .with_extension(format!("tmp-{}", std::process::id()));
-        std::fs::write(&tmp, &json)
-            .map_err(|e| PersistError(format!("writing {}: {e}", tmp.display())))?;
+        {
+            let mut file = std::fs::File::create(&tmp)
+                .map_err(|e| PersistError(format!("creating {}: {e}", tmp.display())))?;
+            file.write_all(&json)
+                .map_err(|e| PersistError(format!("writing {}: {e}", tmp.display())))?;
+            // fsync the temp file's contents BEFORE the rename so a crash can never
+            // publish a name that points at unflushed (zero/garbage) bytes.
+            file.sync_all()
+                .map_err(|e| PersistError(format!("fsyncing {}: {e}", tmp.display())))?;
+        }
         std::fs::rename(&tmp, &self.path).map_err(|e| {
             // Best-effort cleanup so a failed rename does not litter temp files.
             let _ = std::fs::remove_file(&tmp);
@@ -840,6 +869,12 @@ impl IndexStore for JsonFileStore {
                 self.path.display()
             ))
         })?;
+        // fsync the directory so the rename itself survives a crash (opening a dir
+        // read-only and `sync_all`ing it is the portable way to fsync a directory).
+        let dir = std::fs::File::open(&parent)
+            .map_err(|e| PersistError(format!("opening {} to fsync: {e}", parent.display())))?;
+        dir.sync_all()
+            .map_err(|e| PersistError(format!("fsyncing directory {}: {e}", parent.display())))?;
         Ok(())
     }
 }
@@ -1009,6 +1044,15 @@ impl AvailabilityIndex {
     /// is a wasted dial, never an accepted wrong NAR. A persisted quarantine verdict is
     /// therefore still an optional optimisation, not a correctness requirement (honest
     /// limit (a)).
+    ///
+    /// THE PRECEDENT, stated so it is not misread later: task-82 makes only
+    /// AVAILABILITY / claim-accuracy depend on local persisted state (a wrong local
+    /// binding costs bounded WASTED DIALS), NEVER byte-integrity. Byte-integrity stays
+    /// anchored where the design demands it - on the serve-time `BLAKE3(dump) ==
+    /// announced` recheck and the CONSUMER's unmodified-Nix NarHash gate - so that "a
+    /// hostile/corrupt input costs a retry, never a bad store path" (README) holds
+    /// even if this on-disk file is tampered. Integrity must never depend on the
+    /// daemon (PRD:157); this change does not move that line.
     pub fn open(
         node_id: NodeId,
         dumper: Arc<dyn NarDumper>,
@@ -1579,6 +1623,14 @@ impl AvailabilityIndex {
     /// map lock on an in-flight NAR dump (a `digest` lock can be held for the whole
     /// dump). An entry whose digest is still uncomputed, or was quarantined,
     /// contributes `derived: None` and persists only its source path.
+    ///
+    /// TASK-189 (durable-state-file hardening, defense-in-depth beyond the TCB line -
+    /// explicitly NOT a task-82 gate): a per-binding integrity check (checksum/MAC)
+    /// so tamper/corruption FAILS LOUD at load instead of warm-loading as `Verified`;
+    /// a one-way downgrade-compat guard for the [`StoredValue`] shape (a new-format
+    /// snapshot cannot be silently mis-read by an old binary); a persisted quarantine
+    /// verdict (currently in-memory only, an optimisation); and folding this whole-
+    /// snapshot O(N)-per-mutation rewrite into a single atomic durable-state file.
     fn persist_locked(
         &self,
         entries: &HashMap<NarHashKey, Arc<Entry>>,

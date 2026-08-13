@@ -7,7 +7,7 @@ status: In Progress
 assignee:
   - '@me'
 created_date: '2026-08-09 21:25'
-updated_date: '2026-08-13 10:46'
+updated_date: '2026-08-13 11:07'
 labels:
   - forward-carried-from-task-61
 dependencies:
@@ -81,4 +81,12 @@ MPED-ARCHITECT REVIEW ROUND (pre-commit, self-run) — 5 findings, all addressed
 Also added a one-line ack of the deliberate asymmetric persist-failure policy (register HARD-errors on SSOT path loss; first-serve derived persist is best-effort) to register's docstring.
 
 Re-gate after fixes (bounded): fmt OK; build -p daemon-core OK; clippy -p daemon-core --all-targets -Dwarnings CLEAN (fixed a doc_lazy_continuation from a '- ...' line); check-independence green; test -p daemon-core 138 passed / 0 failed (126 + narhash_verify 5 + persisted_digest 5 + run_gate 2). AC bites re-confirmed by mutation earlier (AC#1 red when save() never persists derived; AC#2 red - served 160 stale bytes - when serve-time recheck deleted).
+
+DEEP-GATE FOLLOW-UP (GO-with-fixes) — addressed, READY FOR LIGHT RE-GATE:
+- MUST-FIX (fsync doc-vs-code lie): JsonFileStore::save() now does the real atomic+DURABLE write, mirroring TASK-185: (1) write the temp file then file.sync_all() [fsync data+metadata] BEFORE the rename; (2) std::fs::rename over the target (atomic); (3) open the parent dir and dir.sync_all() [fsync the directory] AFTER the rename so the name->inode link is durable. Bare-filename parent resolves to '.'. Fixed the three doc sites that claimed fsync (module honest-limit, JsonFileStore struct doc, and the save() body comment) to describe the exact recipe. This makes warm-load's 'trust what we durably wrote' actually true; a torn/zero-length file still fails LOUD at load (PersistError), bounding blast radius.
+- Test: save_is_atomic_and_leaves_no_temp_litter asserts the rename leaves exactly the target file (no .tmp-* litter) and round-trips through load. fsync itself is not in-process observable without fault injection; documented that in the test + save() comment (per coordinator guidance).
+- KEEP+ADD docs: kept the trusted-local-state boundary block (it IS the disposition of codex's warm-load-trust finding); added THE PRECEDENT close-out - task-82 makes only AVAILABILITY/claim-accuracy depend on local persisted state (bounded wasted dials), NEVER byte-integrity, which stays anchored on the serve-time BLAKE3(dump)==announced recheck + consumer Nix NarHash gate (README; PRD:157 integrity must never depend on the daemon).
+- FILED to TASK-189 (not implemented): per-binding integrity check, one-way downgrade guard for StoredValue, persisted quarantine verdict, and folding the O(N) whole-snapshot rewrite into the single durable-state file; cross-referenced in a comment at availability.rs persist_locked().
+
+RE-GATE (bounded): fmt --check OK; build -p daemon-core OK; clippy -p daemon-core --all-targets -Dwarnings CLEAN; check-independence green; test -p daemon-core 139 passed / 0 failed (126 unit + narhash_verify 5 + persisted_digest 6 + run_gate 2). Disk ~122G free.
 <!-- SECTION:NOTES:END -->
