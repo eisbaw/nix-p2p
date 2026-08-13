@@ -1,11 +1,11 @@
 ---
 id: TASK-24
 title: Daemon TLS upstream client (front cache.nixos.org over https)
-status: In Progress
+status: Done
 assignee:
   - Mark Ruvald Pedersen
 created_date: '2026-08-08 08:16'
-updated_date: '2026-08-13 12:10'
+updated_date: '2026-08-13 12:21'
 labels:
   - wave1-followup
   - daemon
@@ -22,11 +22,11 @@ TASK-4 shipped the daemon upstream client (UpstreamHttp) as plain HTTP only (dae
 
 ## Acceptance Criteria
 <!-- AC:BEGIN -->
-- [ ] #1 https:// upstream base is accepted and connects over TLS
-- [ ] #2 verbatim byte forwarding + no auto-decompression preserved over TLS (AC#6 property holds)
-- [ ] #3 TLS validates the certificate chain against configured/system roots and validates hostname/SNI; production mode has no insecure-skip-verify path.
-- [ ] #4 End-to-end negative bites reject untrusted self-signed, wrong-hostname and expired certificates before forwarding/caching bytes, while a fixture-CA valid hostname and real cache.nixos.org succeed.
-- [ ] #5 The daemon consumes tls-upstream-v1 unchanged: one 10000 ms total covers DNS, TCP connect and TLS handshake, with connect and handshake each capped at 5000 ms inside that total. Stalled stages fail within the bound and preserve fallback behavior; monotonic tests allow at most 1000 ms scheduler grace without extending configuration.
+- [x] #1 https:// upstream base is accepted and connects over TLS
+- [x] #2 verbatim byte forwarding + no auto-decompression preserved over TLS (AC#6 property holds)
+- [x] #3 TLS validates the certificate chain against configured/system roots and validates hostname/SNI; production mode has no insecure-skip-verify path.
+- [x] #4 End-to-end negative bites reject untrusted self-signed, wrong-hostname and expired certificates before forwarding/caching bytes, while a fixture-CA valid hostname and real cache.nixos.org succeed.
+- [x] #5 The daemon consumes tls-upstream-v1 unchanged: one 10000 ms total covers DNS, TCP connect and TLS handshake, with connect and handshake each capped at 5000 ms inside that total. Stalled stages fail within the bound and preserve fallback behavior; monotonic tests allow at most 1000 ms scheduler grace without extending configuration.
 <!-- AC:END -->
 
 ## Implementation Plan
@@ -80,3 +80,9 @@ INDEPENDENCE / SIBLING: rustls is NOT added to the HTTP_STACK_CRATES denylist (i
 
 HONEST LIMITS: (1) HTTP/1.1 only over TLS - no ALPN/h2 (cache.nixos.org serves h1.1, so it works); h2-only still fails closed. (2) Body-stall after headers is still unbounded (pre-existing gap, task-25). (3) Roots are the compiled-in Mozilla bundle, not OS trust store (rustls-native-certs) - deterministic by choice; add native-certs if an operator needs a private OS-managed anchor. (4) The stall test shrinks the handshake cap to 300ms for speed on the shared box; the frozen 5000/10000 values are pinned separately by the constant test.
 <!-- SECTION:NOTES:END -->
+
+## Final Summary
+
+<!-- SECTION:FINAL_SUMMARY:BEGIN -->
+The daemon can now front the real cache.nixos.org over VERIFIED TLS. daemon-core UpstreamHttp gained a rustls(ring) TLS client behind the same send_over<IO> path: parse_authority is scheme-aware (https->443), the connection is wrapped in tokio-rustls with the URL host as the load-bearing ServerName, cert chain+hostname/SNI+validity verified against webpki-roots (or a supplied RootCertStore). NO production insecure-skip-verify (the only dangerous verifier is #[cfg(test)]-only, unreachable in a prod build; the sole prod config builder installs WebPki with no override). Verbatim bytes preserved (no auto-decompression; gzip magic survives over TLS == plain HTTP). Frozen tls-upstream-v1 budget (10000ms total covering DNS+connect+handshake, connect+handshake each <=5000, <=1000ms grace); a stalled stage -> SourceError::Unreachable, fallback-preserving 502, never a hang. Fixture-CA (rcgen) proves valid succeeds; untrusted-self-signed/wrong-hostname/expired rejected pre-forward (3 bites, mutation-proven incl. a real 30s hang when the handshake timeout is neutered). DEEP-gated: independent mechanics 146/0 + codex GO (no prod skip-verify, name-check load-bearing, verbatim, budget sound). rustls is daemon-side only (independence green); TASK-22 (testproxy TLS) MUST use a disjoint crate. Residuals filed. HTTP/1.1-only over TLS; roots=Mozilla bundle (OS-store = follow-up).
+<!-- SECTION:FINAL_SUMMARY:END -->
