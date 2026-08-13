@@ -33,13 +33,17 @@
 //!     UNBOUNDED" (bounded at the cap), NOT "never buffers more than the signed size".
 //!     A TRUE mid-stream abort at exactly `expected_size` needs the raw-stream transport
 //!     — TASK-157.
-//!   * INLINE PRODUCTION blocks the swarm poll loop. `ServeGate::respond` runs on the
-//!     single worker and `produce()` is synchronous, so a serve does a full-NAR
-//!     allocation/copy ON the poll thread — up to the per-NAR budget (256 MiB by
-//!     default) — stalling kad/identify/every connection for its duration. Fine while
-//!     the daemon wiring is absent and NARs are small; off-worker streamed production is
-//!     TASK-157. Consequently the in-flight ceiling is vestigial this cycle (see
-//!     [`ServeGate::respond`]) and `max_serve_duration` is not yet enforced.
+//!   * PRODUCTION PLACEMENT (TASK-193). A [`NarSource::Process`] (store-dump / raw-NAR
+//!     helper) is now produced OFF the swarm poll loop: [`ServeGate::admit`] admits it on
+//!     the loop, a spawned task runs [`ServeGate::produce_admitted`] (supervised, with the
+//!     serve-time recheck) holding the request-response `ResponseChannel` across the
+//!     `.await`, and the loop delivers the response when the task hands it back over a
+//!     backchannel (`swarm.rs`). A [`NarSource::Memory`] still produces INLINE on the loop
+//!     (an already-resident clone, instantaneous). Because a Process reservation is now
+//!     held across an off-loop await, the in-flight ceiling BINDS (a CAS reserve replaced
+//!     the old serialized load-then-add). Still BUFFERED, not streamed, and
+//!     `max_serve_duration` is bounded only by the request-response inbound timeout; the
+//!     raw-stream transport + mid-stream abort + true serve deadline are TASK-157.
 //!   * A REAL node's store-dump / regular-file supplier ([`CatalogNarSupplier`] over the
 //!     [`CatalogProbe`] digest->store-path seam, regenerating on demand via a supervised
 //!     process group, mirroring `fabric-iroh`'s producer) LANDED in TASK-158 and is
@@ -48,9 +52,9 @@
 //!     [`MemoryNarSupplier`] from `--libp2p-seed-nar` files (TASK-178). Replacing that
 //!     with the store-dump supplier so a peer serves a `/nix/store` path it never held
 //!     as a `.nar`, plus the container e2e, is TASK-191 (the daemon consumer of this
-//!     capability; iroh analogue TASK-83). Note also that supervised Process production
-//!     is async and does NOT run on the synchronous inline [`ServeGate::respond`] worker
-//!     path this cycle; moving production off the poll loop is TASK-157.
+//!     capability; iroh analogue TASK-83). Supervised Process production is now reachable
+//!     from the shipped serve loop OFF the poll thread (TASK-193); the request-response
+//!     body is still buffered whole (raw-stream transfer is TASK-157).
 
 use std::ffi::OsString;
 use std::io;
@@ -298,6 +302,16 @@ impl NarSupplyPlan {
     /// admission having produced nothing.
     pub fn declared_size(&self) -> u64 {
         self.declared_size
+    }
+
+    /// Whether producing this plan REQUIRES the off-poll-loop supervised path
+    /// ([`Self::produce_supervised`]) rather than the inline [`Self::produce`]: true for a
+    /// [`NarSource::Process`] (a `nix-store --dump` / raw-NAR helper that must ride in a
+    /// killable, reaped-on-shutdown process group), false for an already-resident
+    /// [`NarSource::Memory`]. The swarm serve loop routes Process sources OFF the poll
+    /// thread on this (TASK-193).
+    pub(crate) fn requires_supervised_production(&self) -> bool {
+        matches!(self.source, NarSource::Process { .. })
     }
 
     /// Produce the raw NAR bytes on the SYNCHRONOUS inline swarm-worker path
@@ -616,6 +630,13 @@ pub struct ServeCounters {
 pub struct ServeGate {
     budget: ServeBudget,
     supplier: Arc<dyn Libp2pNarSupplier>,
+    /// The supervisor OFF-loop Process production runs under (TASK-193): a
+    /// [`NarSource::Process`] source rides in a killable, reaped-on-shutdown process group
+    /// via [`NarSupplyPlan::produce_supervised`]. A [`TaskSupervisorHandle::disconnected`]
+    /// handle disables Process serving (every Process serve is `Declined(SupplyFailed)`),
+    /// which is exactly what a Memory-only server wants; a serving fabric threads a live
+    /// handle from the supervisor it owns.
+    supervisor: TaskSupervisorHandle,
     /// Cleared by the serve teardown guard's `Drop`: the SYNCHRONOUS stop-admitting
     /// signal. Once `false`, [`respond`](ServeGate::respond) answers `NotHeld` without
     /// consulting the supplier, so dropping the handle stops admission the instant it
@@ -634,7 +655,13 @@ pub struct ServeGate {
 
 impl ServeGate {
     /// A gate serving `supplier` under `budget`, admitting until [`stop`](Self::stop).
-    pub fn new(budget: ServeBudget, supplier: Arc<dyn Libp2pNarSupplier>) -> Self {
+    /// Off-loop [`NarSource::Process`] production runs under `supervisor` (TASK-193); pass
+    /// [`TaskSupervisorHandle::disconnected`] for a Memory-only server that never needs it.
+    pub fn new(
+        budget: ServeBudget,
+        supplier: Arc<dyn Libp2pNarSupplier>,
+        supervisor: TaskSupervisorHandle,
+    ) -> Self {
         // Destructure the seam budget EXHAUSTIVELY (mirroring fabric-iroh's
         // ServeBudget::from_seam) so a new `peer_fabric::ServeBudget` field fails THIS
         // build rather than being silently unenforced by the gate. NOTE (honest scope):
@@ -649,6 +676,7 @@ impl ServeGate {
         ServeGate {
             budget,
             supplier,
+            supervisor,
             active: AtomicBool::new(true),
             inflight_bytes: AtomicU64::new(0),
             admitted: AtomicU64::new(0),
@@ -677,55 +705,176 @@ impl ServeGate {
         }
     }
 
-    /// Admit and answer one inbound request. THE DECLARED SIZE IS CHECKED BEFORE ANY
-    /// BYTES ARE PRODUCED (task-72 GAP-1): a request over budget costs a plan lookup,
-    /// not an allocation. Runs on the swarm worker, so production is inline this cycle
-    /// (bounded by the per-NAR budget); off-worker streamed production is TASK-157.
-    pub fn respond(&self, content: &Blake3Digest) -> NarResponse {
+    /// The SHARED admission policy for one inbound request. THE DECLARED SIZE IS CHECKED
+    /// BEFORE ANY BYTES ARE PRODUCED (task-72 GAP-1): a request over budget costs a plan
+    /// lookup, not an allocation. Applies the stop / unknown / too-large / in-flight-ceiling
+    /// gates and, on admission, RESERVES `declared` bytes against the in-flight ceiling
+    /// (released by the inline path here, or by the [`InflightReservation`] the off-loop
+    /// task owns). `Err` carries the immediate non-admit response (nothing reserved). Runs
+    /// on the poll loop ([`Self::admit`]) or the synchronous test path ([`Self::respond`]).
+    fn admit_plan(&self, content: &Blake3Digest) -> Result<(NarSupplyPlan, u64), NarResponse> {
         if !self.active.load(Ordering::Acquire) {
             self.refused_stopped.fetch_add(1, Ordering::Relaxed);
-            return NarResponse::NotHeld;
+            return Err(NarResponse::NotHeld);
         }
         let Some(plan) = self.supplier.plan(content) else {
             self.declined_unknown.fetch_add(1, Ordering::Relaxed);
-            return NarResponse::NotHeld;
+            return Err(NarResponse::NotHeld);
         };
         let declared = plan.declared_size();
         if declared > self.budget.max_nar_bytes_uncompressed_nar {
             self.declined_too_large.fetch_add(1, Ordering::Relaxed);
-            return NarResponse::Declined(DeclineReason::TooLarge);
+            return Err(NarResponse::Declined(DeclineReason::TooLarge));
         }
-        // The in-flight ceiling. HONEST LIMIT: this cycle `respond` runs only on the
-        // single swarm worker and `produce()` is synchronous, so requests are strictly
-        // serialized and `held` is always 0 here - the in-flight decline is effectively
-        // vestigial (it reduces to a weaker restatement of the per-NAR check). It is
-        // written as a real reservation so it BINDS the moment TASK-157 moves production
-        // off the worker.
-        // TASK-157: this load-then-add is NOT an atomic reserve; it is a TOCTOU that is
-        // safe ONLY because respond() is serialized on the worker. When production moves
-        // off-worker, replace it with a CAS loop or a mutex-guarded reserve (the iroh
-        // model) or two concurrent admits will both pass and blow past the ceiling.
-        let held = self.inflight_bytes.load(Ordering::Acquire);
-        if held.saturating_add(declared) > self.budget.max_inflight_bytes_uncompressed_nar {
-            self.declined_busy.fetch_add(1, Ordering::Relaxed);
-            return NarResponse::Declined(DeclineReason::Busy);
+        // Reserve against the in-flight ceiling with a CAS loop (TASK-193). Before this
+        // task, production was inline and every admit was serialized on the swarm worker,
+        // so a plain load-then-add was safe and the ceiling was effectively vestigial.
+        // Now a Process reservation is HELD ACROSS an off-loop await and RELEASED from the
+        // producing task, so releases race admits: the compare-exchange makes the reserve
+        // correct under a concurrent release (and even a concurrent admit), so two admits
+        // can never both pass and blow past the ceiling.
+        loop {
+            let held = self.inflight_bytes.load(Ordering::Acquire);
+            let want = held.saturating_add(declared);
+            if want > self.budget.max_inflight_bytes_uncompressed_nar {
+                self.declined_busy.fetch_add(1, Ordering::Relaxed);
+                return Err(NarResponse::Declined(DeclineReason::Busy));
+            }
+            if self
+                .inflight_bytes
+                .compare_exchange_weak(held, want, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+            {
+                break;
+            }
         }
-        // Reserve before producing; release after. The reservation is what the
-        // in-flight ceiling is measured against.
-        self.inflight_bytes.fetch_add(declared, Ordering::AcqRel);
-        let response = match plan.produce() {
+        Ok((plan, declared))
+    }
+
+    /// Produce an admitted plan INLINE (the Memory fast path / the synchronous test path)
+    /// and update the counters. Does NOT touch the reservation (the caller releases it). A
+    /// [`NarSource::Process`] reaching here is `Declined(SupplyFailed)` - the sync
+    /// [`NarSupplyPlan::produce`] refuses to run a supervised process on the poll thread.
+    fn finish_inline(&self, plan: NarSupplyPlan, content: &Blake3Digest) -> NarResponse {
+        match plan.produce() {
             Ok(bytes) => {
                 self.admitted.fetch_add(1, Ordering::Relaxed);
                 NarResponse::Nar(bytes)
             }
             Err(why) => {
-                tracing::warn!(%content, %why, "libp2p serve: supplier failed to produce NAR");
+                tracing::warn!(%content, %why, "libp2p serve: supplier failed to produce NAR inline");
                 self.declined_supply_failed.fetch_add(1, Ordering::Relaxed);
                 NarResponse::Declined(DeclineReason::SupplyFailed)
             }
+        }
+    }
+
+    /// Admit and answer one inbound request on the SYNCHRONOUS path. Kept for the
+    /// in-memory/inline case and the unit tests; a [`NarSource::Process`] reaching here is
+    /// `Declined(SupplyFailed)` (the RED path) because [`NarSupplyPlan::produce`] cannot run
+    /// a supervised process - the swarm worker routes Process sources through
+    /// [`Self::admit`] + [`Self::produce_admitted`] off the poll loop instead (TASK-193).
+    pub fn respond(&self, content: &Blake3Digest) -> NarResponse {
+        let (plan, declared) = match self.admit_plan(content) {
+            Ok(admitted) => admitted,
+            Err(immediate) => return immediate,
         };
+        let response = self.finish_inline(plan, content);
         self.inflight_bytes.fetch_sub(declared, Ordering::AcqRel);
         response
+    }
+
+    /// Admit one inbound request on the swarm poll loop, deciding WHERE its bytes are
+    /// produced (TASK-193). A [`NarSource::Memory`] is produced inline on the spot
+    /// ([`Serve::Now`]); a [`NarSource::Process`] (store-dump / raw-NAR helper) is admitted
+    /// and its reservation HELD for OFF-loop supervised production ([`Serve::OffLoop`]), so
+    /// the poll loop is never blocked on a `nix-store --dump`. A non-admit (stopped /
+    /// unknown / over-budget) is an immediate [`Serve::Now`].
+    pub(crate) fn admit(&self, content: &Blake3Digest) -> Serve {
+        let (plan, declared) = match self.admit_plan(content) {
+            Ok(admitted) => admitted,
+            Err(immediate) => return Serve::Now(immediate),
+        };
+        if plan.requires_supervised_production() {
+            Serve::OffLoop {
+                plan,
+                content: *content,
+                declared,
+            }
+        } else {
+            let response = self.finish_inline(plan, content);
+            self.inflight_bytes.fetch_sub(declared, Ordering::AcqRel);
+            Serve::Now(response)
+        }
+    }
+
+    /// Produce an admitted [`Serve::OffLoop`] plan OFF the poll loop (TASK-193): run the
+    /// supervised process source under this gate's [`TaskSupervisorHandle`], keeping the
+    /// serve-time `len == declared_size` AND `BLAKE3(RawNarV1) == content` recheck
+    /// ([`NarSupplyPlan::produce_supervised`]), then release the in-flight reservation.
+    ///
+    /// CANCELLATION-SAFE: the reservation is an [`InflightReservation`] RAII guard, so
+    /// DROPPING this future (the inbound request went away / the node is shutting down)
+    /// releases the reservation AND - because dropping the inner `produce_supervised` future
+    /// signals caller-abandonment to the supervisor - SIGKILL-reaps the `nix-store --dump`
+    /// process group. No leaked reservation, no orphan worker.
+    pub(crate) async fn produce_admitted(
+        self: Arc<Self>,
+        plan: NarSupplyPlan,
+        content: Blake3Digest,
+        declared: u64,
+    ) -> NarResponse {
+        // RAII: released on EVERY exit path, including a drop mid-await (cancellation).
+        let _reservation = InflightReservation {
+            gate: Arc::clone(&self),
+            declared,
+        };
+        match plan.produce_supervised(&self.supervisor, &content).await {
+            Ok(bytes) => {
+                self.admitted.fetch_add(1, Ordering::Relaxed);
+                NarResponse::Nar(bytes)
+            }
+            Err(why) => {
+                tracing::warn!(
+                    %content, %why,
+                    "libp2p serve: off-loop supplier failed to produce NAR"
+                );
+                self.declined_supply_failed.fetch_add(1, Ordering::Relaxed);
+                NarResponse::Declined(DeclineReason::SupplyFailed)
+            }
+        }
+    }
+}
+
+/// Where an admitted inbound serve request's bytes are produced (TASK-193): the poll-loop
+/// decision returned by [`ServeGate::admit`].
+pub(crate) enum Serve {
+    /// Answer NOW from the poll loop: a non-admit (NotHeld / Declined) or an inline Memory
+    /// NAR produced on the spot.
+    Now(NarResponse),
+    /// An admitted process source to produce OFF the poll loop via
+    /// [`ServeGate::produce_admitted`]; the `declared`-byte reservation is already held.
+    OffLoop {
+        plan: NarSupplyPlan,
+        content: Blake3Digest,
+        declared: u64,
+    },
+}
+
+/// A RAII reservation against a [`ServeGate`]'s in-flight ceiling: the bytes are reserved
+/// by [`ServeGate::admit`] and released when this guard drops - on the normal completion of
+/// off-loop production OR on the producing future being dropped mid-flight (cancellation),
+/// so a cancelled serve never leaks its reservation (TASK-193).
+struct InflightReservation {
+    gate: Arc<ServeGate>,
+    declared: u64,
+}
+
+impl Drop for InflightReservation {
+    fn drop(&mut self) {
+        self.gate
+            .inflight_bytes
+            .fetch_sub(self.declared, Ordering::AcqRel);
     }
 }
 
@@ -740,6 +889,16 @@ mod tests {
             max_inflight_bytes_uncompressed_nar: max_inflight,
             max_serve_duration: Duration::from_secs(120),
         }
+    }
+
+    /// A serve gate over `supplier` (1 MiB per-NAR / 1 GiB in-flight) with a DISCONNECTED
+    /// supervisor: the Memory-only cases below never reach the supervised Process path.
+    fn memory_gate(supplier: Arc<dyn Libp2pNarSupplier>) -> ServeGate {
+        ServeGate::new(
+            budget(1 << 20, 1 << 30),
+            supplier,
+            TaskSupervisorHandle::disconnected(),
+        )
     }
 
     #[test]
@@ -758,7 +917,7 @@ mod tests {
         let nar = b"a small raw nar".to_vec();
         let content = Blake3Digest::from_raw_nar(&nar);
         let supplier = Arc::new(MemoryNarSupplier::new([nar.clone()]));
-        let gate = ServeGate::new(budget(1 << 20, 1 << 30), supplier);
+        let gate = memory_gate(supplier);
         match gate.respond(&content) {
             NarResponse::Nar(bytes) => assert_eq!(bytes, nar),
             other => panic!("expected Nar, got {other:?}"),
@@ -769,7 +928,7 @@ mod tests {
     #[test]
     fn respond_notheld_for_unknown_digest() {
         let supplier = Arc::new(MemoryNarSupplier::new([b"held".to_vec()]));
-        let gate = ServeGate::new(budget(1 << 20, 1 << 30), supplier);
+        let gate = memory_gate(supplier);
         let unknown = Blake3Digest::from_bytes([0x11; 32]);
         assert!(matches!(gate.respond(&unknown), NarResponse::NotHeld));
         assert_eq!(gate.counters().declined_unknown, 1);
@@ -784,7 +943,7 @@ mod tests {
         let content = Blake3Digest::from_raw_nar(&nar);
         let mut supplier = MemoryNarSupplier::new([nar]);
         supplier.set_declared_size(content, 10 * 1024 * 1024); // declares 10 MiB
-        let gate = ServeGate::new(budget(1 << 20, 1 << 30), Arc::new(supplier)); // 1 MiB cap
+        let gate = memory_gate(Arc::new(supplier)); // 1 MiB cap
         assert!(matches!(
             gate.respond(&content),
             NarResponse::Declined(DeclineReason::TooLarge)
@@ -798,10 +957,7 @@ mod tests {
     fn stopped_gate_refuses_admission() {
         let nar = b"held after stop".to_vec();
         let content = Blake3Digest::from_raw_nar(&nar);
-        let gate = ServeGate::new(
-            budget(1 << 20, 1 << 30),
-            Arc::new(MemoryNarSupplier::new([nar])),
-        );
+        let gate = memory_gate(Arc::new(MemoryNarSupplier::new([nar])));
         gate.stop();
         assert!(matches!(gate.respond(&content), NarResponse::NotHeld));
         assert_eq!(gate.counters().refused_stopped, 1);
@@ -1056,6 +1212,187 @@ mod tests {
             assert!(
                 !PathBuf::from(format!("/proc/{pid}")).exists(),
                 "supervised pid {pid} (or its grandchild) survived node cancel - an orphan"
+            );
+        }
+        let _ = std::fs::remove_file(&pid_file);
+    }
+
+    // -------------------------------------------------------------------------
+    // TASK-193: the off-loop serve seam - a Process source is served through
+    // admit()+produce_admitted(), where the synchronous respond() path declines it.
+    // -------------------------------------------------------------------------
+
+    /// A serve gate over a one-content Process source producing `body` via `sh -c 'printf'`,
+    /// with a LIVE supervisor. `body` must contain no single quote.
+    fn process_gate(body: &[u8], supervisor: &TaskSupervisor) -> (ServeGate, Blake3Digest) {
+        let content = Blake3Digest::from_raw_nar(body);
+        let body_str = String::from_utf8(body.to_vec()).expect("ascii test body");
+        let probe = OneProbe {
+            content,
+            declared_size: body.len() as u64,
+            make: Box::new(move || ProbedSource::Process {
+                program: PathBuf::from("sh"),
+                args: vec![
+                    OsString::from("-c"),
+                    OsString::from(format!("printf %s '{body_str}'")),
+                ],
+            }),
+        };
+        let supplier = Arc::new(CatalogNarSupplier::new(probe, "unused-helper"));
+        let gate = ServeGate::new(budget(1 << 20, 1 << 30), supplier, supervisor.handle());
+        (gate, content)
+    }
+
+    /// RED vs GREEN, the core unblock: the SYNC `respond()` path DECLINES a Process source
+    /// (it cannot run a supervised process on the poll thread), while the async
+    /// `admit()` + `produce_admitted()` path SERVES the exact bytes and the BLAKE3 of the
+    /// served bytes matches the announced content. BITE: route the Process source through
+    /// `respond()` (the old sync path) and it is `Declined(SupplyFailed)`.
+    #[tokio::test]
+    async fn process_source_is_declined_inline_but_served_off_loop() {
+        let body = b"raw nar produced by a process source, off the poll loop".to_vec();
+        let supervisor = TaskSupervisor::new();
+        let (gate, content) = process_gate(&body, &supervisor);
+        let gate = Arc::new(gate);
+
+        // RED: the synchronous inline path declines a Process source.
+        assert!(
+            matches!(
+                gate.respond(&content),
+                NarResponse::Declined(DeclineReason::SupplyFailed)
+            ),
+            "the sync respond() path must decline a Process source (the pre-193 behaviour)"
+        );
+
+        // GREEN: admit -> off-loop supervised production serves the exact bytes.
+        let (plan, admitted_content, declared) = match gate.admit(&content) {
+            Serve::OffLoop {
+                plan,
+                content,
+                declared,
+            } => (plan, content, declared),
+            Serve::Now(other) => panic!("expected OffLoop for a Process source, got {other:?}"),
+        };
+        assert_eq!(admitted_content, content);
+        assert_eq!(declared, body.len() as u64);
+        let response = Arc::clone(&gate)
+            .produce_admitted(plan, admitted_content, declared)
+            .await;
+        match response {
+            NarResponse::Nar(bytes) => {
+                assert_eq!(bytes, body, "off-loop production serves the exact bytes");
+                assert_eq!(Blake3Digest::from_raw_nar(&bytes), content);
+            }
+            other => panic!("expected Nar from the off-loop path, got {other:?}"),
+        }
+        assert_eq!(gate.counters().admitted, 1);
+        assert_eq!(
+            gate.inflight_bytes.load(Ordering::Acquire),
+            0,
+            "the reservation is released after off-loop production completes"
+        );
+    }
+
+    /// TASK-193 cancellation-safety THROUGH the gate: a slow Process serve admitted and
+    /// producing off-loop is REAPED (the process group is SIGKILLed and its job leaves the
+    /// registry) when the node's supervisor is cancelled, AND the in-flight reservation is
+    /// released - no orphan `nix-store --dump`, no leaked reservation. BITE: skip the reap
+    /// (an un-supervised spawn) and the grandchild survives in `/proc`; drop the RAII
+    /// reservation guard and the in-flight ledger stays non-zero. BOUNDED: one spawn + reap.
+    #[tokio::test]
+    async fn off_loop_serve_is_reaped_and_reservation_released_on_cancel() {
+        let pid_file = unique_temp("task193-reap-pids");
+        let _ = std::fs::remove_file(&pid_file);
+        let content = Blake3Digest::from_bytes([0x5b; 32]);
+        let declared: u64 = 1 << 20; // never produced; the serve is cancelled first
+        let script = "(while :; do sleep 0.05; done) & grand=$!; printf '%s %s' \"$$\" \"$grand\" > \"$1\"; wait";
+        let pid_file_arg = pid_file.clone();
+        let probe = OneProbe {
+            content,
+            declared_size: declared,
+            make: Box::new(move || ProbedSource::Process {
+                program: PathBuf::from("sh"),
+                args: vec![
+                    OsString::from("-c"),
+                    OsString::from(script),
+                    OsString::from("task193-reaper"),
+                    pid_file_arg.clone().into_os_string(),
+                ],
+            }),
+        };
+        let supervisor = TaskSupervisor::new();
+        let supplier = Arc::new(CatalogNarSupplier::new(probe, "unused-helper"));
+        let gate = Arc::new(ServeGate::new(
+            budget(1 << 30, 1 << 30),
+            supplier,
+            supervisor.handle(),
+        ));
+
+        // Admit on the "poll loop": this RESERVES `declared`. Then produce off-loop.
+        let (plan, admitted_content, admitted_declared) = match gate.admit(&content) {
+            Serve::OffLoop {
+                plan,
+                content,
+                declared,
+            } => (plan, content, declared),
+            Serve::Now(other) => panic!("expected OffLoop, got {other:?}"),
+        };
+        assert_eq!(admitted_declared, declared);
+        assert_eq!(
+            gate.inflight_bytes.load(Ordering::Acquire),
+            declared,
+            "admit reserved the declared bytes"
+        );
+        let gate_task = Arc::clone(&gate);
+        let op = tokio::spawn(async move {
+            gate_task
+                .produce_admitted(plan, admitted_content, admitted_declared)
+                .await
+        });
+
+        // Wait until the supervised group is live (pids published + one active job).
+        let pids = tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                if let Ok(raw) = std::fs::read_to_string(&pid_file)
+                    && raw.split_whitespace().count() == 2
+                    && supervisor.process_jobs().active_len() == 1
+                {
+                    break raw;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("the off-loop supervised group started and published its pids");
+        let pids = pids
+            .split_whitespace()
+            .map(|raw| raw.parse::<u32>().expect("decimal pid"))
+            .collect::<Vec<_>>();
+
+        // Node shutdown: SIGKILL + reap the group.
+        supervisor.cancel_now();
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while supervisor.process_jobs().active_len() != 0 {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("the off-loop process job was reaped and left the registry");
+
+        let response = op.await.expect("producer task joined");
+        assert!(
+            matches!(response, NarResponse::Declined(DeclineReason::SupplyFailed)),
+            "a cancelled off-loop serve declines rather than shipping bytes"
+        );
+        assert_eq!(
+            gate.inflight_bytes.load(Ordering::Acquire),
+            0,
+            "the in-flight reservation must be released on the cancelled path (no leak)"
+        );
+        for pid in pids {
+            assert!(
+                !PathBuf::from(format!("/proc/{pid}")).exists(),
+                "supervised pid {pid} (or its grandchild) survived cancel - an orphan"
             );
         }
         let _ = std::fs::remove_file(&pid_file);

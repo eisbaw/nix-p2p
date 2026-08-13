@@ -21,6 +21,7 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use proc_supervisor::TaskSupervisorHandle;
 
 use peer_fabric::{NarServer, ServeBudget, ServeError, ServeHandle};
 
@@ -33,12 +34,27 @@ use crate::swarm::SwarmHandle;
 pub struct Libp2pServer {
     handle: SwarmHandle,
     supplier: Arc<dyn Libp2pNarSupplier>,
+    /// The supervisor OFF-loop [`crate::nar::NarSource::Process`] production runs under
+    /// (TASK-193). Threaded into each [`ServeGate`] so a `nix-store --dump` rides in a
+    /// killable, reaped-on-shutdown process group. [`TaskSupervisorHandle::disconnected`]
+    /// disables Process serving (Memory-only servers pass it).
+    supervisor: TaskSupervisorHandle,
 }
 
 impl Libp2pServer {
-    /// A server driving `handle`, producing bytes through `supplier`.
-    pub fn new(handle: SwarmHandle, supplier: Arc<dyn Libp2pNarSupplier>) -> Self {
-        Libp2pServer { handle, supplier }
+    /// A server driving `handle`, producing bytes through `supplier`. Off-loop supervised
+    /// Process production runs under `supervisor`; pass
+    /// [`TaskSupervisorHandle::disconnected`] for a Memory-only server (TASK-193).
+    pub fn new(
+        handle: SwarmHandle,
+        supplier: Arc<dyn Libp2pNarSupplier>,
+        supervisor: TaskSupervisorHandle,
+    ) -> Self {
+        Libp2pServer {
+            handle,
+            supplier,
+            supervisor,
+        }
     }
 }
 
@@ -67,7 +83,11 @@ impl Drop for ServeTeardown {
 #[async_trait]
 impl NarServer for Libp2pServer {
     async fn serve(&self, budget: ServeBudget) -> Result<ServeHandle, ServeError> {
-        let gate = Arc::new(ServeGate::new(budget, Arc::clone(&self.supplier)));
+        let gate = Arc::new(ServeGate::new(
+            budget,
+            Arc::clone(&self.supplier),
+            self.supervisor.clone(),
+        ));
         self.handle.install_serve(Arc::clone(&gate)).await;
         tracing::info!("fabric-libp2p: NAR serve session started");
         let guard = ServeTeardown {

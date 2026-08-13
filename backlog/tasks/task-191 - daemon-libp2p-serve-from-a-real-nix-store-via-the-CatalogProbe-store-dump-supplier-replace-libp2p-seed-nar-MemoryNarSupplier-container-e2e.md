@@ -7,7 +7,7 @@ status: To Do
 assignee:
   - '@claude'
 created_date: '2026-08-13 11:29'
-updated_date: '2026-08-13 13:16'
+updated_date: '2026-08-13 13:56'
 labels:
   - libp2p
   - daemon
@@ -49,4 +49,21 @@ AC status now: AC#1 runtime-serve = BLOCKED on TASK-193. AC#3 e2e = BLOCKED on T
 CODE ARTIFACT landed this cycle: footgun-guard comments at both shipped provider install sites (daemon-libp2p/src/main.rs::install_provider and daemon/src/main.rs::install_libp2p_provider) - do NOT wire a --libp2p-provide-store CLI mode until TASK-193 lands (announces-then-declines). nar.rs already carries the produce-site note.
 
 RE-SEQUENCING: pick up TASK-193 next; TASK-191 completes immediately after and lands the probe bridge + supplier construction + verify gate + e2e TOGETHER with their live callers (zero uncalled interval; AC#2 becomes a real property of a real serve path).
+
+## Serve prerequisite MET (TASK-193, ready-for-gate)
+
+TASK-193 landed off-worker async supervised production reachable from the shipped libp2p
+serve loop: a NarSource::Process (store-dump) inbound request is now SERVED off the poll
+loop via ServeGate::admit -> produce_admitted (keeps len+BLAKE3 recheck), instead of
+Declined(SupplyFailed). So a store-dump-backed CatalogNarSupplier no longer announces then
+declines. This unblocks wiring the store supplier + `--libp2p-provide-store` here.
+
+Wiring note for TASK-191: fabric-libp2p Libp2pServer::new / ServeGate::new now take a
+TaskSupervisorHandle. Libp2pFabric::start_with_supplier(_durable) OWNS its own TaskSupervisor
+internally (public signature UNCHANGED — the daemon-libp2p caller needs no change to keep
+Memory serving working). If TASK-191 wants store-dump production to ride the daemon's
+existing TaskSupervisor (unified capacity ceiling), thread the daemon handle through a new
+serving constructor rather than the fabric-owned default; the seam already accepts a handle.
+The BLOCKED-PENDING-TASK-193 guards at daemon/src/main.rs:1296 and daemon-libp2p/src/main.rs:213
+can be lifted once the store supplier is wired. TASK-193 is In Progress pending its DEEP gate.
 <!-- SECTION:NOTES:END -->

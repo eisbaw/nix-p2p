@@ -10,13 +10,13 @@ use std::time::{Duration, Instant};
 
 use futures::StreamExt;
 use libp2p::kad::store::MemoryStore;
-use libp2p::request_response::{self, OutboundRequestId};
+use libp2p::request_response::{self, OutboundRequestId, ResponseChannel};
 use libp2p::swarm::SwarmEvent;
 use libp2p::{Multiaddr, PeerId, StreamProtocol, Swarm, identify, kad, noise, tcp, yamux};
 use tokio::sync::{mpsc, oneshot};
 
 use crate::keys::{keypair_from_seed, node_id_of};
-use crate::nar::{NarCodec, NarRequest, NarResponse, ServeGate};
+use crate::nar::{NarCodec, NarRequest, NarResponse, Serve, ServeGate};
 use peer_fabric::{Blake3Digest, Lookup, NodeId, Unavailable};
 
 /// Why a kad query did not return a healthy answer. Mapped to
@@ -464,6 +464,12 @@ struct Worker {
     /// The installed serve gate, or `None` when this node is not serving (inbound NAR
     /// requests are then answered `NotHeld`). Set by `InstallServe`.
     serve: Option<Arc<ServeGate>>,
+    /// Backchannel for OFF-loop NAR production (TASK-193): a spawned task produces a
+    /// Process source's bytes then hands `(channel, response)` BACK here, so the poll loop
+    /// (which alone owns `&mut Behaviour`) performs `send_response`. The worker keeps a
+    /// `tx` clone, so `nar_response_rx` never closes while the worker runs.
+    nar_response_tx: mpsc::Sender<(ResponseChannel<NarResponse>, NarResponse)>,
+    nar_response_rx: mpsc::Receiver<(ResponseChannel<NarResponse>, NarResponse)>,
 }
 
 impl Worker {
@@ -478,6 +484,15 @@ impl Worker {
                     }
                 },
                 event = self.swarm.select_next_some() => self.on_event(event),
+                // A finished OFF-loop NAR production (TASK-193): deliver it now, on the
+                // poll loop, which alone owns `&mut Behaviour` for `send_response`. The
+                // worker holds a `nar_response_tx` clone, so `recv` cannot yield `None`
+                // while this loop runs; a `None` is ignored defensively.
+                produced = self.nar_response_rx.recv() => {
+                    if let Some((channel, response)) = produced {
+                        self.deliver_nar_response(channel, response);
+                    }
+                },
             }
         }
     }
@@ -674,20 +689,51 @@ impl Worker {
                     },
                 ..
             } => {
-                // Compute the response first (this drops the `&self.serve` borrow) so the
-                // subsequent `&mut swarm` borrow to send it does not conflict.
-                let response = match &self.serve {
-                    Some(gate) => gate.respond(&request.0),
-                    None => NarResponse::NotHeld,
+                // Admit on the poll loop; the `&self.serve` borrow ends here, BEFORE any
+                // `&mut swarm` use (the borrow-split invariant). A `Now` outcome answers
+                // inline; a Process source is produced OFF the loop so a slow
+                // `nix-store --dump` never stalls kad / identify / other requests (TASK-193).
+                let admission = match &self.serve {
+                    Some(gate) => gate.admit(&request.0),
+                    None => Serve::Now(NarResponse::NotHeld),
                 };
-                if self
-                    .swarm
-                    .behaviour_mut()
-                    .nar
-                    .send_response(channel, response)
-                    .is_err()
-                {
-                    tracing::debug!("fabric-libp2p: NAR response channel closed before send");
+                match admission {
+                    Serve::Now(response) => self.deliver_nar_response(channel, response),
+                    Serve::OffLoop {
+                        plan,
+                        content,
+                        declared,
+                    } => {
+                        // The spawned task holds OWNED clones (the gate's Arc - its atomics
+                        // + supervisor handle - and the backchannel) and OWNS the
+                        // ResponseChannel across the `.await`. It NEVER touches `&mut self`
+                        // / the swarm; it hands the finished response back to the poll loop.
+                        let gate = Arc::clone(
+                            self.serve
+                                .as_ref()
+                                .expect("admit returned OffLoop, so a gate is installed"),
+                        );
+                        let tx = self.nar_response_tx.clone();
+                        tokio::spawn(async move {
+                            let response = tokio::select! {
+                                biased;
+                                // The inbound request went away (peer disconnect / the
+                                // request-response inbound substream timed out): the channel
+                                // closes. Dropping the produce future signals caller-
+                                // abandonment, which SIGKILL-reaps the supervised process
+                                // group. Nothing left to deliver on a dead channel.
+                                () = wait_response_channel_closed(&channel) => return,
+                                response = gate.produce_admitted(plan, content, declared) => {
+                                    response
+                                }
+                            };
+                            if tx.send((channel, response)).await.is_err() {
+                                tracing::debug!(
+                                    "fabric-libp2p: worker gone before off-loop NAR response delivered"
+                                );
+                            }
+                        });
+                    }
                 }
             }
             Event::Message {
@@ -713,6 +759,25 @@ impl Worker {
                 tracing::debug!(%error, "fabric-libp2p: NAR inbound request failed");
             }
             Event::ResponseSent { .. } => {}
+        }
+    }
+
+    /// Send a NAR response on the poll loop, which alone owns `&mut Behaviour`. Used for
+    /// both the inline answer and an OFF-loop production handed back over the backchannel
+    /// (TASK-193). A closed channel (peer gone / timed out) is logged, not fatal.
+    fn deliver_nar_response(
+        &mut self,
+        channel: ResponseChannel<NarResponse>,
+        response: NarResponse,
+    ) {
+        if self
+            .swarm
+            .behaviour_mut()
+            .nar
+            .send_response(channel, response)
+            .is_err()
+        {
+            tracing::debug!("fabric-libp2p: NAR response channel closed before send");
         }
     }
 
@@ -836,6 +901,17 @@ impl Worker {
     }
 }
 
+/// Await the closing of an inbound request's [`ResponseChannel`] (TASK-193): the peer went
+/// away, or the request-response inbound substream timed out, so no response can be
+/// delivered. Polls `is_open` on a coarse interval; the off-loop producer races this so a
+/// dropped inbound request CANCELS (and thereby reaps) its supervised production instead of
+/// running to completion for a consumer that is no longer waiting.
+async fn wait_response_channel_closed(channel: &ResponseChannel<NarResponse>) {
+    while channel.is_open() {
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+}
+
 /// Configuration for one libp2p node.
 pub struct NodeConfig {
     /// The 32-byte ed25519 secret that IS this node's identity and record-signing key.
@@ -950,12 +1026,17 @@ impl Node {
             .build();
 
         let (tx, rx) = mpsc::channel(64);
+        // The OFF-loop NAR production backchannel (TASK-193): spawned producers hand their
+        // finished response back for the poll loop to `send_response`.
+        let (nar_response_tx, nar_response_rx) = mpsc::channel(64);
         let worker = Worker {
             swarm,
             commands: rx,
             pending: HashMap::new(),
             nar_pending: HashMap::new(),
             serve: None,
+            nar_response_tx,
+            nar_response_rx,
         };
         let join = tokio::spawn(worker.run());
 

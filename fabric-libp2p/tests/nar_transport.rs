@@ -15,16 +15,20 @@
 //! These exercise the whole libp2p transfer/serve stack end to end across TWO nodes,
 //! with NO in-process shortcut for the byte path.
 
+use std::ffi::OsString;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use fabric_libp2p::{
-    Libp2pNodeLocator, Libp2pServer, Libp2pTransport, MemoryNarSupplier, Node, NodeConfig,
+    CatalogNarSupplier, CatalogProbe, Libp2pNodeLocator, Libp2pServer, Libp2pTransport,
+    MemoryNarSupplier, Node, NodeConfig, ProbedSource, ProbedSupply,
 };
 use peer_fabric::{
     Blake3Digest, ExposureLedger, Lookup, NarServer, NarTransfer, NodeLocator, ResolutionPolicy,
     SafetyEnvelope, ServeBudget, TransferError, TransportOffer,
 };
+use proc_supervisor::{TaskSupervisor, TaskSupervisorHandle};
 
 /// A generous per-call envelope: loopback finishes in milliseconds, so a multi-second
 /// total bound only guards against a hang.
@@ -145,7 +149,11 @@ async fn fetch_is_byte_identical_and_blake3_verified_across_two_nodes() {
     // Node A: serve the NAR.
     let (node_a, _addr_a) = start_listening([1u8; 32], scope).await;
     let supplier = Arc::new(MemoryNarSupplier::new([nar.clone()]));
-    let server = Libp2pServer::new(node_a.handle.clone(), supplier);
+    let server = Libp2pServer::new(
+        node_a.handle.clone(),
+        supplier,
+        TaskSupervisorHandle::disconnected(),
+    );
     let _serve = server
         .serve(ServeBudget::default())
         .await
@@ -187,7 +195,11 @@ async fn corrupt_provider_is_rejected_by_gate1_blake3_verify() {
     let boot_peer = boot.peer_id;
 
     let (node_a, _addr_a) = start_listening([3u8; 32], scope).await;
-    let server = Libp2pServer::new(node_a.handle.clone(), Arc::new(supplier));
+    let server = Libp2pServer::new(
+        node_a.handle.clone(),
+        Arc::new(supplier),
+        TaskSupervisorHandle::disconnected(),
+    );
     let _serve = server
         .serve(ServeBudget::default())
         .await
@@ -226,6 +238,7 @@ async fn signed_bound_smaller_than_served_bytes_trips_size_abort() {
     let server = Libp2pServer::new(
         node_a.handle.clone(),
         Arc::new(MemoryNarSupplier::new([nar.clone()])),
+        TaskSupervisorHandle::disconnected(),
     );
     let _serve = server
         .serve(ServeBudget::default())
@@ -267,6 +280,7 @@ async fn serve_budget_declines_over_per_nar_request() {
     let server = Libp2pServer::new(
         node_a.handle.clone(),
         Arc::new(MemoryNarSupplier::new([nar.clone()])),
+        TaskSupervisorHandle::disconnected(),
     );
     // A per-NAR budget SMALLER than the NAR: admission must decline it (task-72).
     let tight = ServeBudget {
@@ -308,6 +322,7 @@ async fn dropping_the_serve_handle_stops_admission() {
     let server = Libp2pServer::new(
         node_a.handle.clone(),
         Arc::new(MemoryNarSupplier::new([nar.clone()])),
+        TaskSupervisorHandle::disconnected(),
     );
     join(&node_a, boot_peer, boot_addr.clone()).await;
 
@@ -359,6 +374,7 @@ async fn a_stale_teardown_does_not_clobber_a_live_successor_session() {
     let server = Libp2pServer::new(
         node_a.handle.clone(),
         Arc::new(MemoryNarSupplier::new([nar.clone()])),
+        TaskSupervisorHandle::disconnected(),
     );
     join(&node_a, boot_peer, boot_addr.clone()).await;
 
@@ -382,4 +398,166 @@ async fn a_stale_teardown_does_not_clobber_a_live_successor_session() {
         .await
         .expect("the live successor session must still serve after a stale teardown");
     assert_eq!(bytes, nar);
+}
+
+// -------------------------------------------------------------------------
+// TASK-193: OFF-loop async serve production reachable from the swarm serve loop.
+// A `NarSource::Process` (the store-dump analogue) is now SERVED end to end - before this
+// task the synchronous serve loop Declined every Process source with SupplyFailed - and a
+// slow Process serve in flight does NOT block the poll loop.
+// -------------------------------------------------------------------------
+
+/// A one-content [`CatalogProbe`] returning a fixed [`ProbedSupply`], so a test can drive a
+/// Process-backed serve without the daemon catalog.
+struct OneProbe {
+    content: Blake3Digest,
+    declared_size: u64,
+    make: Box<dyn Fn() -> ProbedSource + Send + Sync>,
+}
+
+impl CatalogProbe for OneProbe {
+    fn probe(&self, content: &Blake3Digest) -> Option<ProbedSupply> {
+        (content == &self.content).then(|| ProbedSupply {
+            declared_size: self.declared_size,
+            source: (self.make)(),
+        })
+    }
+}
+
+/// A [`CatalogNarSupplier`] whose one digest regenerates `body` via `sh -c 'printf'` (a
+/// [`ProbedSource::Process`], the store-dump analogue: nothing held at rest). `sleep_secs`
+/// makes production deliberately SLOW so a test can prove the poll loop stays responsive.
+/// `body` must contain no single quote.
+fn process_supplier(content: Blake3Digest, body: &[u8], sleep_secs: u32) -> CatalogNarSupplier {
+    let body_str = String::from_utf8(body.to_vec()).expect("ascii test body");
+    let script = if sleep_secs > 0 {
+        format!("sleep {sleep_secs}; printf %s '{body_str}'")
+    } else {
+        format!("printf %s '{body_str}'")
+    };
+    let probe = OneProbe {
+        content,
+        declared_size: body.len() as u64,
+        make: Box::new(move || ProbedSource::Process {
+            program: PathBuf::from("sh"),
+            args: vec![OsString::from("-c"), OsString::from(script.clone())],
+        }),
+    };
+    CatalogNarSupplier::new(probe, "unused-helper")
+}
+
+#[tokio::test]
+async fn process_source_is_served_across_two_nodes() {
+    let scope = "nar-process";
+    let body = b"raw NAR regenerated on demand by a process source, served over libp2p".to_vec();
+    let content = Blake3Digest::from_raw_nar(&body);
+
+    let (boot, boot_addr) = start_bootstrap(scope).await;
+    let boot_peer = boot.peer_id;
+
+    // Node A serves via a Process source. A serving FABRIC would own its supervisor; here
+    // the server is built directly, so the test owns one and threads its handle in.
+    let (node_a, _addr_a) = start_listening([21u8; 32], scope).await;
+    let supervisor = TaskSupervisor::new();
+    let server = Libp2pServer::new(
+        node_a.handle.clone(),
+        Arc::new(process_supplier(content, &body, 0)),
+        supervisor.handle(),
+    );
+    let _serve = server
+        .serve(ServeBudget::default())
+        .await
+        .expect("serve starts");
+    join(&node_a, boot_peer, boot_addr.clone()).await;
+
+    let (node_b, _addr_b) = start_listening([22u8; 32], scope).await;
+    let transport = wire_consumer(&node_b, &node_a, boot_peer, boot_addr.clone()).await;
+    let offer = TransportOffer::Iroh {
+        node: node_a.node_id,
+    };
+
+    let bytes = transport
+        .fetch(&content, &offer, Some(body.len() as u64), &envelope())
+        .await
+        .expect("a Process source is now SERVED off the poll loop (was Declined pre-TASK-193)");
+    assert_eq!(
+        bytes, body,
+        "the served bytes are the process source's output"
+    );
+    assert_eq!(
+        Blake3Digest::from_raw_nar(&bytes),
+        content,
+        "the served bytes hash to the announced content"
+    );
+}
+
+#[tokio::test]
+async fn a_slow_process_serve_does_not_block_the_poll_loop() {
+    let scope = "nar-liveness";
+    let body = b"slowly regenerated NAR bytes".to_vec();
+    let content = Blake3Digest::from_raw_nar(&body);
+    let expected_len = body.len() as u64;
+
+    let (boot, boot_addr) = start_bootstrap(scope).await;
+    let boot_peer = boot.peer_id;
+
+    // A ~2s production: long enough that an INLINE (poll-loop-blocking) serve would clearly
+    // delay a concurrent poll-loop command.
+    let (node_a, _addr_a) = start_listening([23u8; 32], scope).await;
+    let supervisor = TaskSupervisor::new();
+    let server = Libp2pServer::new(
+        node_a.handle.clone(),
+        Arc::new(process_supplier(content, &body, 2)),
+        supervisor.handle(),
+    );
+    let _serve = server
+        .serve(ServeBudget::default())
+        .await
+        .expect("serve starts");
+    join(&node_a, boot_peer, boot_addr.clone()).await;
+
+    let (node_b, _addr_b) = start_listening([24u8; 32], scope).await;
+    let transport = wire_consumer(&node_b, &node_a, boot_peer, boot_addr.clone()).await;
+    let offer = TransportOffer::Iroh {
+        node: node_a.node_id,
+    };
+
+    // Kick off the SLOW fetch (drives the ~2s off-loop production on A) without awaiting it.
+    let fetch = tokio::spawn(async move {
+        transport
+            .fetch(&content, &offer, Some(expected_len), &envelope())
+            .await
+    });
+
+    // Wait until the off-loop dump is PROVABLY in flight on A (its process job is live), so
+    // the responsiveness check below is not a false pass on a request that has not arrived.
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        if supervisor.process_jobs().active_len() >= 1 {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the off-loop serve never started producing"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+
+    // With a serve provably in flight, A's poll loop must STILL answer a command promptly.
+    // If production ran inline on the loop, this would block for ~2s (the sleep).
+    let started = Instant::now();
+    let _addrs = node_a.handle.listen_addrs().await;
+    let elapsed = started.elapsed();
+    assert!(
+        elapsed < Duration::from_millis(500),
+        "poll loop was blocked by an in-flight serve: listen_addrs took {elapsed:?}"
+    );
+
+    // And the slow fetch still completes with correct, hash-verified bytes.
+    let bytes = fetch
+        .await
+        .expect("fetch task joins")
+        .expect("the slow off-loop serve completes");
+    assert_eq!(bytes, body);
+    assert_eq!(Blake3Digest::from_raw_nar(&bytes), content);
 }

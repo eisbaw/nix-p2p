@@ -15,6 +15,7 @@ use peer_fabric::{
     NodeId, NodeLocator, PeerFabric, PeerHoldQuery, ProviderDirectory, TransferRegistry,
     TransportTag,
 };
+use proc_supervisor::TaskSupervisor;
 
 use crate::announcer::Libp2pAvailabilityAnnouncer;
 use crate::directory::Libp2pProviderDirectory;
@@ -48,6 +49,10 @@ pub struct Libp2pFabric {
     locator: Arc<dyn NodeLocator>,
     transfers: TransferRegistry,
     server: Option<Arc<dyn NarServer>>,
+    /// The supervisor OFF-loop supervised NAR production runs under, owned by a SERVING
+    /// fabric so that dropping the fabric SIGKILL-reaps any in-flight `nix-store --dump`
+    /// production group (RAII cancellation-safety; TASK-193). `None` for a pure consumer.
+    _serve_supervisor: Option<TaskSupervisor>,
     _node: Node,
 }
 
@@ -173,9 +178,21 @@ impl Libp2pFabric {
 
         let locator: Arc<dyn NodeLocator> = node_locator;
 
-        // The serve axis exists only when a supplier was provided (a serving node).
-        let server: Option<Arc<dyn NarServer>> = supplier
-            .map(|supplier| Arc::new(Libp2pServer::new(node.handle.clone(), supplier)) as _);
+        // The serve axis exists only when a supplier was provided (a serving node). A
+        // serving fabric OWNS a TaskSupervisor (TASK-193): OFF-loop supervised Process
+        // production (a store-dump `nix-store --dump` regenerated on demand) runs under it,
+        // and dropping the fabric drops the supervisor -> SIGKILL-reaps any in-flight
+        // production group (RAII cancellation-safety). A pure consumer fabric owns none.
+        // (TASK-191 may instead thread the daemon's own supervisor handle for a unified
+        // capacity ceiling; the ServeGate/Libp2pServer seam already takes a handle.)
+        let serve_supervisor = supplier.as_ref().map(|_| TaskSupervisor::new());
+        let server: Option<Arc<dyn NarServer>> = supplier.map(|supplier| {
+            let supervisor = serve_supervisor
+                .as_ref()
+                .expect("a supplier implies a serve supervisor")
+                .handle();
+            Arc::new(Libp2pServer::new(node.handle.clone(), supplier, supervisor)) as _
+        });
 
         Ok(Libp2pFabric {
             node_id: node.node_id,
@@ -188,6 +205,7 @@ impl Libp2pFabric {
             locator,
             transfers,
             server,
+            _serve_supervisor: serve_supervisor,
             _node: node,
         })
     }
