@@ -4,8 +4,10 @@ title: >-
   daemon-libp2p: serve from a real /nix/store via the CatalogProbe store-dump
   supplier (replace --libp2p-seed-nar MemoryNarSupplier), + container e2e
 status: To Do
-assignee: []
+assignee:
+  - '@claude'
 created_date: '2026-08-13 11:29'
+updated_date: '2026-08-13 13:16'
 labels:
   - libp2p
   - daemon
@@ -17,6 +19,7 @@ dependencies:
   - TASK-158
   - TASK-178
   - TASK-161
+  - TASK-193
 ---
 
 ## Description
@@ -31,3 +34,19 @@ Consumer of TASK-158. TASK-158 added fabric_libp2p::CatalogNarSupplier + the Cat
 - [ ] #2 the store-dump produced bytes still flow through the announce SSOT NarHash verification (verify_provider_seeds / sign-site guard, TASK-56) - no new announce path bypasses it
 - [ ] #3 container e2e: a provider peer serves a /nix/store path it never held as a .nar file; a consumer discovers via kad and fetches byte-identical bytes; the produced bytes BLAKE3-match the announced content
 <!-- AC:END -->
+
+## Implementation Notes
+
+<!-- SECTION:NOTES:BEGIN -->
+BLOCKED on TASK-193 (2026-08-13). Root-cause investigation (verified in code + TASK-158 landing notes), ratified by mped-architect (Mark-emulator) ruling A+:
+
+HARD BLOCKER: the shipped libp2p SERVE loop is synchronous + Memory-only, so a store-dump source cannot be served at all this cycle. fabric-libp2p/src/swarm.rs:679 on_nar_event (sync &mut self poll-loop handler) -> ServeGate::respond(&digest) -> NarSupplyPlan::produce() (nar.rs ~310-321) handles ONLY NarSource::Memory; a NarSource::Process (nix-store --dump) returns a loud typed Err -> Declined(SupplyFailed). The async produce_supervised() has ZERO non-test callers; on_nar_event cannot .await it. So a CatalogNarSupplier wired into the shipped provider would ANNOUNCE store paths correctly but DECLINE every serve - the dial-then-fail anti-pattern install_libp2p_provider itself guards against (daemon/src/main.rs:1044-1057). This blocks AC#1 runtime-serve AND AC#3 e2e for a path of ANY size (a 4 KB store path included), not just large NARs.
+
+CORRECTION to this task description: it calls off-worker production a co-requisite "for large NARs" - that is WRONG. Off-worker async production reachable from the serve loop is a PREREQUISITE FOR ANY store-dump serve. Carved out as TASK-193 (focused: async supervised production reachable from the swarm serve loop, WITHIN request-response, no stream rewrite) and added as a dependency. TASK-157 proper (stream rewrite + mid-stream abort + idle bound) is left separate and depends on the TASK-193 seam.
+
+AC status now: AC#1 runtime-serve = BLOCKED on TASK-193. AC#3 e2e = BLOCKED on TASK-193 (cannot serve a store path). AC#2 (verification-gated store announce) = deliberately NOT landed ahead of the serve seam: per A+ ruling it would be a gate on an empty doorway (no serve-capable path, no produced bytes) and reporting it done would over-claim the integrity floor. It lands WITH its live caller once TASK-193 exists (probe bridge mirrors daemon/src/iroh_catalog_probe.rs; content-from-verified-index announce; verify_store_provisions gate - all proven-by-iroh-analogy, so no de-risking is lost by deferring).
+
+CODE ARTIFACT landed this cycle: footgun-guard comments at both shipped provider install sites (daemon-libp2p/src/main.rs::install_provider and daemon/src/main.rs::install_libp2p_provider) - do NOT wire a --libp2p-provide-store CLI mode until TASK-193 lands (announces-then-declines). nar.rs already carries the produce-site note.
+
+RE-SEQUENCING: pick up TASK-193 next; TASK-191 completes immediately after and lands the probe bridge + supplier construction + verify gate + e2e TOGETHER with their live callers (zero uncalled interval; AC#2 becomes a real property of a real serve path).
+<!-- SECTION:NOTES:END -->

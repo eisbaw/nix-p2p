@@ -210,6 +210,15 @@ async fn install_provider(
     cfg: &Config,
     source_cfg: Libp2pSourceConfig,
 ) -> Result<(Arc<Libp2pFabric>, ServeHandle), String> {
+    // BLOCKED-PENDING-TASK-193 (do NOT wire a `--libp2p-provide-store` store-dump CLI mode
+    // here yet): the shipped libp2p SERVE loop is synchronous + Memory-only
+    // (fabric-libp2p swarm on_nar_event -> ServeGate::respond -> NarSupplyPlan::produce,
+    // Memory-only). A store-dump-backed `CatalogNarSupplier` (NarSource::Process) would
+    // ANNOUNCE store paths correctly but then DECLINE every serve with SupplyFailed - the
+    // announce-then-decline anti-pattern the seed budget check below guards against. Serving a
+    // real /nix/store path on demand (TASK-191) requires off-worker async supervised
+    // production reachable from the serve loop, carved out as TASK-193; wire the store
+    // supplier + `--libp2p-provide-store` only once that lands.
     let mut seeds: Vec<(daemon_core::NarHashKey, Vec<u8>)> =
         Vec::with_capacity(cfg.libp2p_seed_nar.len());
     for (nar_hash, path) in &cfg.libp2p_seed_nar {
