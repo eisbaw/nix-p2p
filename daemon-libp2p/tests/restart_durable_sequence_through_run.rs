@@ -1,32 +1,44 @@
 //! TASK-185 AC#4 - RESTART-DURABILITY through the SHIPPED path, biting by mutation.
 //!
-//! The defect (F3): the durable floor + per-key announce sequence were built + unit-tested
-//! but NOT wired into the shipped daemon, and positive records were minted at a hardcoded
-//! `sequence: 1`, so a restarted provider re-minted an already-published sequence and
-//! self-rolled-back. This test exercises the PRODUCTION provider construction the binary's
-//! `--libp2p-provider` path runs - `build_libp2p_provider_source` with a `state_dir`, then
-//! `Libp2pFabric::next_announce_sequence` + `sign_libp2p_provider_record` - across a restart,
-//! and serves the post-restart record through the exact `daemon_core::run` glue the binary
-//! calls.
+//! The defect (F3): the durable floor + per-key announce sequence were built + unit-tested but
+//! NOT wired into the shipped daemon, and positive records were minted at a hardcoded
+//! `sequence: 1`. GB1 (found at the DEEP gate): the identity seed was ALSO ephemeral - a
+//! restart with only `--libp2p-state-dir` came back a NEW random NodeId, so the durable
+//! sequence floor was bound to an orphaned namespace and could not supersede or withdraw the
+//! pre-restart records. This test exercises the PRODUCTION provider path the binary's
+//! `--libp2p-provider` install runs - the identity resolved FROM the state dir
+//! (`resolve_durable_identity_seed`), `build_libp2p_provider_source` with that `state_dir`, and
+//! the SSOT announce loop `announce_provider_seeds` (NOT a hand-rolled reimplementation) -
+//! across a restart, then serves the post-restart record through the exact `daemon_core::run`
+//! glue the binary calls.
 //!
 //! Topology (all in-process, real loopback-TCP libp2p swarms):
 //! - `B` - bootstrap (the only injected address for P and C).
-//! - `P1` - a serving provider built by the PRODUCTION `build_libp2p_provider_source` with a
-//!   durable `state_dir`; announces its NAR at a durably-allocated sequence, then is DROPPED
-//!   (== a process restart; the state dir persists).
-//! - `P2` - the RESTARTED provider: a fresh fabric on the SAME identity seed + SAME
-//!   state_dir, built by the SAME production builder; its allocator re-seeds from disk, so its
-//!   record carries a STRICTLY-NEWER sequence. Stays up to serve.
+//! - `P1` - a serving provider whose identity is RESOLVED FROM the `state_dir` (the shipped
+//!   default: no explicit seed), built by the PRODUCTION `build_libp2p_provider_source`;
+//!   announces its NAR through the shipped `announce_provider_seeds` loop at a durably-allocated
+//!   sequence, then is DROPPED (== a process restart; the state dir persists).
+//! - `P2` - the RESTART: a fresh fabric configured with ONLY the SAME `state_dir` (identity
+//!   re-resolved from disk, not a seed passed twice), same production builder + announce loop;
+//!   it comes back as the SAME provider and its allocator re-seeds from disk, so its record
+//!   carries a STRICTLY-NEWER sequence. Stays up to serve.
 //! - `C` - the CONSUMER built by the production `build_libp2p_nar_source`, handed to
 //!   `daemon_core::run`, which serves P2's NAR byte-identical over the libp2p path.
 //!
-//! What BITES BY MUTATION (the two halves of F3):
-//!   * Revert the daemon wiring to the NON-durable `start*` (drop the `state_dir` routing):
-//!     P2's re-seeded floor is EMPTY, so `next_announce_sequence` returns 1 and P2's record
-//!     carries sequence 1 - the strict-monotonicity assertion fails, and the announce-seq
-//!     file is never written (no `seq_path`) - the floor-survival assertion fails too.
-//!   * Revert `sign_libp2p_provider_record` to hardcode `sequence: 1`: P2's record carries 1
-//!     regardless of the allocator - the strict-monotonicity assertion fails.
+//! What BITES BY MUTATION:
+//!   * GB1 (identity): stub the identity persistence in `resolve_durable_identity_seed` so P2
+//!     resolves a fresh random seed -> a different NodeId -> `record2.provider != first_provider`
+//!     -> the same-provider assertion fails. (Verified by the reviewer's requested stub.)
+//!   * F3 wiring: revert the daemon routing to the NON-durable `start*` -> P2's re-seeded floor
+//!     is EMPTY, `next_announce_sequence` returns 1, the announce-seq file is never written ->
+//!     both the strict-monotonicity and the floor-survival assertions fail.
+//!   * F3 sequence: hardcode `sequence: 1` in the shipped `announce_provider_seeds` /
+//!     `sign_libp2p_provider_record` -> P2's record carries 1 -> the monotonicity assertion fails.
+//!
+//! HONEST COVERAGE: this exercises the shipped PROVIDER construction + announce loop + the
+//! `run()` consumer serve; it does NOT spawn the actual binary process (argv parse ->
+//! `source_config`/`from_args` is unit-tested separately). The CONSUMER floor RELOAD across a
+//! restart is covered by the `FloorStore::durable` unit test, not here.
 
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -40,8 +52,8 @@ use daemon_core::{
     RunConfig, SourceError, StoreHash, UpstreamResponse, run,
 };
 use daemon_libp2p::{
-    Libp2pSourceConfig, build_libp2p_nar_source, build_libp2p_provider_source,
-    provider_content_key, sign_libp2p_provider_record,
+    Libp2pSourceConfig, announce_provider_seeds, build_libp2p_nar_source,
+    build_libp2p_provider_source, provider_content_key, resolve_durable_identity_seed,
 };
 use fabric_libp2p::{Libp2pFabric, MemoryNarSupplier, Multiaddr, NodeConfig, PeerId};
 use http::HeaderMap;
@@ -77,31 +89,36 @@ async fn start_fabric(fabric: Libp2pFabric) -> (Arc<Libp2pFabric>, Multiaddr) {
     (Arc::new(fabric), addr)
 }
 
-/// Build the production PROVIDER config for seed `seed` joined to `boot`, durable under
-/// `state_dir`. This is exactly what the binary's `source_config` produces for a provider
-/// with `--libp2p-state-dir`.
-fn provider_cfg(
-    seed: [u8; 32],
+/// Build the SHIPPED durable provider config under `state_dir`, joined to `boot`. The identity
+/// seed is resolved THE WAY THE BINARY DOES - from the state dir, no explicit seed
+/// ([`resolve_durable_identity_seed`], TASK-185 GB1) - so two boots on the SAME state_dir come
+/// back as the SAME node. This is the property the GB1 bite depends on: without durable
+/// identity, the restart would come back a different provider. Panics if the identity cannot be
+/// resolved (an unwritable state dir would be a test-setup bug).
+fn durable_provider_cfg(
     scope: &str,
     boot: (PeerId, Multiaddr),
-    state_dir: std::path::PathBuf,
+    state_dir: &std::path::Path,
 ) -> Libp2pSourceConfig {
+    let identity_seed = resolve_durable_identity_seed(Some(state_dir), None)
+        .expect("resolve the durable identity seed from the state dir (the shipped path)");
     Libp2pSourceConfig {
-        identity_seed: seed,
+        identity_seed,
         network_scope: scope.to_string(),
         listen: Some("/ip4/127.0.0.1/tcp/0".parse().unwrap()),
         bootstrap: vec![boot],
         provider_addrs: vec![],
         discovery_budget: DiscoveryBudget::new(Duration::from_secs(10), 32),
         envelope: SafetyEnvelope::default(),
-        state_dir: Some(state_dir),
+        state_dir: Some(state_dir.to_path_buf()),
     }
 }
 
 /// Stand up a serving provider through the PRODUCTION builder, install its serve gate, and
-/// announce `nar` at a DURABLY-ALLOCATED sequence (the shipped `install_provider` sequence).
-/// Returns the running fabric, the serve guard (kept alive by the caller), and the record
-/// that was announced (so the test can assert its sequence).
+/// announce `nar` through the SHIPPED SSOT announce loop ([`announce_provider_seeds`], the same
+/// function the binary's `--libp2p-provider` install calls - NOT a hand-rolled allocate/sign/
+/// announce, so a `sequence = 1` mutation in that shipped loop is caught here). Returns the
+/// running fabric, the serve guard (kept alive by the caller), and the announced record.
 async fn start_provider_and_announce(
     cfg: Libp2pSourceConfig,
     nar: &[u8],
@@ -119,15 +136,17 @@ async fn start_provider_and_announce(
         .await
         .expect("serve gate installs");
 
-    // The shipped install_provider allocation: durable sequence -> sign -> announce.
-    let sequence = fabric.next_announce_sequence(&provider_content_key(nar_hash));
-    let record = sign_libp2p_provider_record(seed, nar_hash, nar, 3600, unix_now(), sequence);
-    fabric
-        .announcer()
-        .expect("provider announces")
-        .announce(&record, &AnnounceBudget::new(Duration::from_secs(10), 20))
-        .await
-        .expect("announce admitted (provider is DHT-joined)");
+    let records = announce_provider_seeds(
+        &fabric,
+        seed,
+        &[(*nar_hash, nar.to_vec())],
+        3600,
+        unix_now(),
+        &AnnounceBudget::new(Duration::from_secs(10), 20),
+    )
+    .await
+    .expect("shipped announce loop admitted (provider is DHT-joined)");
+    let record = records.into_iter().next().expect("one announced record");
     (fabric, serve, record)
 }
 
@@ -260,7 +279,6 @@ async fn get(addr: SocketAddr, path: &str) -> Resp {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn restart_durable_sequence_serves_through_run() {
     let scope = "task185-restart-durable";
-    let provider_seed = [3u8; 32];
 
     // A unique per-run state dir (process + thread keyed), removed up front.
     let state_dir = std::env::temp_dir().join(format!(
@@ -286,21 +304,24 @@ async fn restart_durable_sequence_serves_through_run() {
     .await;
     let boot_peer = bootstrap.peer_id();
 
-    // ---- P1: provider via the production builder, announces at the durable sequence ----
+    // ---- P1: provider whose identity is resolved FROM the state dir (the shipped way),
+    // announces at the durable sequence. ----
     let first_sequence;
+    let first_provider;
     {
         let (p1, _serve1, record1) = start_provider_and_announce(
-            provider_cfg(
-                provider_seed,
-                scope,
-                (boot_peer, boot_addr.clone()),
-                state_dir.clone(),
-            ),
+            durable_provider_cfg(scope, (boot_peer, boot_addr.clone()), &state_dir),
             &nar,
             &nar_hash,
         )
         .await;
         first_sequence = record1.sequence;
+        first_provider = record1.provider;
+        assert_eq!(
+            first_provider,
+            p1.node_id(),
+            "self-serve: the record's provider is the fabric's own identity"
+        );
         assert_eq!(
             first_sequence, 1,
             "a first-ever announce on a fresh state dir allocates sequence 1"
@@ -327,22 +348,33 @@ async fn restart_durable_sequence_serves_through_run() {
          file was:\n{seq_text}"
     );
 
-    // ---- P2: RESTART (same seed + same state_dir), announces STRICTLY NEWER ----
+    // ---- P2: RESTART on the SAME state_dir ONLY (identity re-resolved from disk, no seed
+    // passed twice), announces STRICTLY NEWER as the SAME provider. ----
     let (p2, _serve2, record2) = start_provider_and_announce(
-        provider_cfg(
-            provider_seed,
-            scope,
-            (boot_peer, boot_addr.clone()),
-            state_dir.clone(),
-        ),
+        durable_provider_cfg(scope, (boot_peer, boot_addr.clone()), &state_dir),
         &nar,
         &nar_hash,
     )
     .await;
+    // GB1 BITE: the restart must come back as the SAME provider identity. Without durable
+    // identity (GB1), P2 would resolve a FRESH random seed -> a different NodeId -> a different
+    // `provider` -> it could neither supersede nor withdraw P1's records. If identity
+    // persistence is stubbed out, this assertion fails.
+    assert_eq!(
+        record2.provider, first_provider,
+        "the restarted provider (state-dir only, no seed) must be the SAME identity as before \
+         the restart - else its durable sequence is bound to an orphaned namespace"
+    );
+    assert_eq!(
+        p2.node_id(),
+        first_provider,
+        "the restarted fabric's own node_id must also match the pre-restart identity"
+    );
+    // AC2/GB2 BITE: strictly-newer sequence across the restart. A revert to non-durable
+    // start*, or a hardcoded sequence:1 in the shipped announce loop, makes this fail.
     assert!(
         record2.sequence > first_sequence,
-        "the restarted provider must mint a STRICTLY NEWER sequence (got {} <= {}); a revert \
-         to the non-durable start* or to a hardcoded sequence:1 makes this fail",
+        "the restarted provider must mint a STRICTLY NEWER sequence (got {} <= {})",
         record2.sequence,
         first_sequence
     );
