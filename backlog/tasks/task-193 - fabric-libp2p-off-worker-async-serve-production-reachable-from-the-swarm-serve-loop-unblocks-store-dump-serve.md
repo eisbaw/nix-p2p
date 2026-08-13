@@ -7,7 +7,7 @@ status: In Progress
 assignee:
   - '@claude'
 created_date: '2026-08-13 13:15'
-updated_date: '2026-08-13 13:55'
+updated_date: '2026-08-13 14:50'
 labels:
   - libp2p
   - fabric
@@ -155,4 +155,58 @@ Mutation-verified: neutering InflightReservation::drop -> the inflight==0 assert
   (instant clone); only Process goes off-loop.
 - NOTE: README.md is being modified by a CONCURRENT session (TLS/supply-integrity, unrelated
   to TASK-193); NOT staged in this commit.
+
+## DEEP-gate fix applied (inc2) — READY FOR RE-GATE (codex)
+
+Codex NO-GO was one real concurrency defect: pre-first-poll cancellation LEAKED the
+in-flight reservation (the InflightReservation guard was built INSIDE produce_admitted's
+async body, which only runs on first poll; a future dropped before first poll never built
+the guard, so the admit-time CAS increment was never decremented -> repeated leaks wedge
+the serve gate: an availability/DoS hole). Fixed.
+
+### Guard-ownership restructuring (reserve and guard are now atomic at ADMIT)
+- nar.rs: `inflight_bytes` is now `Arc<AtomicU64>`. `InflightReservation` holds a direct
+  `Arc<AtomicU64>` handle to that counter (NOT a back-ref to the gate) + declared; its Drop
+  does the single fetch_sub. `admit_plan` constructs the guard SYNCHRONOUSLY the instant the
+  CAS reserve succeeds and returns `(NarSupplyPlan, InflightReservation)`. `admit` hands the
+  guard out inside `Serve::OffLoop { plan, content, reservation }` (was `declared`).
+  `produce_admitted(&self, plan, content)` no longer touches the reservation (guard removed
+  from its body; `self: Arc<Self>` -> `&self`). `respond` binds `_reservation` for the call
+  (inline release). `Serve`/`InflightReservation` are `pub(crate)` so the enum can carry it.
+- swarm.rs worker OffLoop arm: `let _reservation = reservation;` is the FIRST line of the
+  spawned task's async block, so the guard is OWNED BY the future from creation. Dropping the
+  task at ANY point - including BEFORE its first poll (peer abandons instantly), mid-await
+  (channel closes), or on completion - runs the guard's Drop exactly once and releases. The
+  select still races wait_response_channel_closed vs produce_admitted (reap on channel drop).
+  Invariant now holds: reserve (admit) and release (guard Drop) are paired across every path.
+
+### Two new bites (both mutation-verified RED without their fix; reverted)
+1. dropping_an_unpolled_off_loop_future_releases_the_reservation (nar.rs unit, NO
+   ResponseChannel): admit an OffLoop, build the exact future the worker builds, DROP IT
+   UNPOLLED, assert inflight_bytes == 0 (and no process spawned). BITE: neutering
+   InflightReservation::Drop -> inflight stays == declared -> RED (this observably reproduces
+   the pre-fix in-body-guard leak: an unpolled future built pre-fix contained no guard, i.e.
+   equivalent to a no-op Drop). GREEN with the guard owned-from-admit.
+2. process_source_with_wrong_declared_length_is_declined (nar.rs unit): a Process dump that
+   emits FEWER bytes than declared_size (but whose bytes DO hash to the announced content, so
+   the BLAKE3 arm passes) must be Declined(SupplyFailed) via the exact-length arm. BITE:
+   removing the `bytes.len() != declared` check in produce_supervised -> the short dump is
+   served as Nar(...) -> RED.
+
+### Kept (codex-confirmed sound, unchanged): reap-after-poll, borrow-split, poll-loop
+off-loading, response pairing, backchannel awaits-not-drops, CAS ceiling logic, len+BLAKE3
+recheck ordering, fabric-owned supervisor.
+
+### BOUNDED GATE (nix develop; disk 114G > floor; no orphans, no leftover pids)
+- cargo fmt --all --check: OK
+- cargo build -p fabric-libp2p --locked: OK
+- cargo clippy -p fabric-libp2p --all-targets --locked -- -D warnings: clean
+- python3 scripts/check-independence.py: green
+- cargo test -p fabric-libp2p --locked: 55 passed / 0 failed
+  (lib 37 [+2 new bites], bootstrap_independence 2, decentralized_discovery 1,
+   nar_transport 8, near_key_routing_bar 1, node_locator_discovery 1, record_lifecycle 5,
+   doctests 0)
+
+Left In Progress for the codex re-gate. README.md remains modified-uncommitted by the
+orchestrator (unrelated); NOT staged.
 <!-- SECTION:NOTES:END -->

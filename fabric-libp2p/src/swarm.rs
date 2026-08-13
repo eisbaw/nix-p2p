@@ -702,7 +702,7 @@ impl Worker {
                     Serve::OffLoop {
                         plan,
                         content,
-                        declared,
+                        reservation,
                     } => {
                         // The spawned task holds OWNED clones (the gate's Arc - its atomics
                         // + supervisor handle - and the backchannel) and OWNS the
@@ -715,6 +715,12 @@ impl Worker {
                         );
                         let tx = self.nar_response_tx.clone();
                         tokio::spawn(async move {
+                            // OWN the reservation guard for the whole future: it was created
+                            // synchronously at admit and moved in here, so dropping this task
+                            // at ANY point - including BEFORE its first poll (a peer that
+                            // abandons the request instantly) - runs the guard's Drop and
+                            // releases the in-flight reserve exactly once (TASK-193 DEEP gate).
+                            let _reservation = reservation;
                             let response = tokio::select! {
                                 biased;
                                 // The inbound request went away (peer disconnect / the
@@ -723,9 +729,7 @@ impl Worker {
                                 // abandonment, which SIGKILL-reaps the supervised process
                                 // group. Nothing left to deliver on a dead channel.
                                 () = wait_response_channel_closed(&channel) => return,
-                                response = gate.produce_admitted(plan, content, declared) => {
-                                    response
-                                }
+                                response = gate.produce_admitted(plan, content) => response,
                             };
                             if tx.send((channel, response)).await.is_err() {
                                 tracing::debug!(

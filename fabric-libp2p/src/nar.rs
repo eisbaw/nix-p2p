@@ -643,8 +643,12 @@ pub struct ServeGate {
     /// runs, independent of the (best-effort, async) worker uninstall command.
     active: AtomicBool,
     /// The single source of truth for in-flight bytes. Reserved BEFORE production and
-    /// released after, so the in-flight ceiling is checked against real reservations.
-    inflight_bytes: AtomicU64,
+    /// released after, so the in-flight ceiling is checked against real reservations. Held
+    /// behind an [`Arc`] so an [`InflightReservation`] guard can own the decrement WITHOUT a
+    /// back-reference to the whole gate: the guard is constructed synchronously at admit and
+    /// moved into the production future, so dropping that future at ANY point - even before
+    /// its first poll - releases the reserve (TASK-193; the DEEP-gate pre-first-poll leak).
+    inflight_bytes: Arc<AtomicU64>,
     admitted: AtomicU64,
     declined_too_large: AtomicU64,
     declined_busy: AtomicU64,
@@ -678,7 +682,7 @@ impl ServeGate {
             supplier,
             supervisor,
             active: AtomicBool::new(true),
-            inflight_bytes: AtomicU64::new(0),
+            inflight_bytes: Arc::new(AtomicU64::new(0)),
             admitted: AtomicU64::new(0),
             declined_too_large: AtomicU64::new(0),
             declined_busy: AtomicU64::new(0),
@@ -708,11 +712,20 @@ impl ServeGate {
     /// The SHARED admission policy for one inbound request. THE DECLARED SIZE IS CHECKED
     /// BEFORE ANY BYTES ARE PRODUCED (task-72 GAP-1): a request over budget costs a plan
     /// lookup, not an allocation. Applies the stop / unknown / too-large / in-flight-ceiling
-    /// gates and, on admission, RESERVES `declared` bytes against the in-flight ceiling
-    /// (released by the inline path here, or by the [`InflightReservation`] the off-loop
-    /// task owns). `Err` carries the immediate non-admit response (nothing reserved). Runs
-    /// on the poll loop ([`Self::admit`]) or the synchronous test path ([`Self::respond`]).
-    fn admit_plan(&self, content: &Blake3Digest) -> Result<(NarSupplyPlan, u64), NarResponse> {
+    /// gates and, on admission, RESERVES `declared` bytes against the in-flight ceiling,
+    /// returning the plan together with the [`InflightReservation`] guard that OWNS the
+    /// release. `Err` carries the immediate non-admit response (nothing reserved). Runs on
+    /// the poll loop ([`Self::admit`]) or the synchronous test path ([`Self::respond`]).
+    ///
+    /// RESERVE-AND-GUARD ARE ATOMIC AT ADMIT (TASK-193, DEEP-gate fix): the guard is built
+    /// HERE, synchronously, the instant the CAS reserve succeeds - never later inside an
+    /// async body. So whatever the caller does with the returned guard (drop it, or move it
+    /// into a production future that is then dropped before its first poll), the reserve is
+    /// always paired with exactly one release; an abandoned request can never leak capacity.
+    fn admit_plan(
+        &self,
+        content: &Blake3Digest,
+    ) -> Result<(NarSupplyPlan, InflightReservation), NarResponse> {
         if !self.active.load(Ordering::Acquire) {
             self.refused_stopped.fetch_add(1, Ordering::Relaxed);
             return Err(NarResponse::NotHeld);
@@ -748,7 +761,13 @@ impl ServeGate {
                 break;
             }
         }
-        Ok((plan, declared))
+        // The reserve is now taken; bind its release to a guard in the SAME synchronous
+        // step, so there is no window in which the increment exists without an owning guard.
+        let reservation = InflightReservation {
+            inflight: Arc::clone(&self.inflight_bytes),
+            declared,
+        };
+        Ok((plan, reservation))
     }
 
     /// Produce an admitted plan INLINE (the Memory fast path / the synchronous test path)
@@ -775,13 +794,13 @@ impl ServeGate {
     /// a supervised process - the swarm worker routes Process sources through
     /// [`Self::admit`] + [`Self::produce_admitted`] off the poll loop instead (TASK-193).
     pub fn respond(&self, content: &Blake3Digest) -> NarResponse {
-        let (plan, declared) = match self.admit_plan(content) {
+        let (plan, _reservation) = match self.admit_plan(content) {
             Ok(admitted) => admitted,
             Err(immediate) => return immediate,
         };
-        let response = self.finish_inline(plan, content);
-        self.inflight_bytes.fetch_sub(declared, Ordering::AcqRel);
-        response
+        // `_reservation` releases when it drops at the end of this call, after the inline
+        // production - the reserve/release pairing the async path gets from the guard too.
+        self.finish_inline(plan, content)
     }
 
     /// Admit one inbound request on the swarm poll loop, deciding WHERE its bytes are
@@ -791,44 +810,42 @@ impl ServeGate {
     /// the poll loop is never blocked on a `nix-store --dump`. A non-admit (stopped /
     /// unknown / over-budget) is an immediate [`Serve::Now`].
     pub(crate) fn admit(&self, content: &Blake3Digest) -> Serve {
-        let (plan, declared) = match self.admit_plan(content) {
+        let (plan, reservation) = match self.admit_plan(content) {
             Ok(admitted) => admitted,
             Err(immediate) => return Serve::Now(immediate),
         };
         if plan.requires_supervised_production() {
+            // Hand the guard to the caller INSIDE the outcome: the swarm worker moves it
+            // into the production future, so the reserve is released whenever that future is
+            // dropped - including before its first poll (the DEEP-gate pre-first-poll leak).
             Serve::OffLoop {
                 plan,
                 content: *content,
-                declared,
+                reservation,
             }
         } else {
-            let response = self.finish_inline(plan, content);
-            self.inflight_bytes.fetch_sub(declared, Ordering::AcqRel);
-            Serve::Now(response)
+            // Memory produced inline on the poll loop; `reservation` releases as it drops
+            // at the end of this call.
+            Serve::Now(self.finish_inline(plan, content))
         }
     }
 
     /// Produce an admitted [`Serve::OffLoop`] plan OFF the poll loop (TASK-193): run the
     /// supervised process source under this gate's [`TaskSupervisorHandle`], keeping the
     /// serve-time `len == declared_size` AND `BLAKE3(RawNarV1) == content` recheck
-    /// ([`NarSupplyPlan::produce_supervised`]), then release the in-flight reservation.
+    /// ([`NarSupplyPlan::produce_supervised`]).
     ///
-    /// CANCELLATION-SAFE: the reservation is an [`InflightReservation`] RAII guard, so
-    /// DROPPING this future (the inbound request went away / the node is shutting down)
-    /// releases the reservation AND - because dropping the inner `produce_supervised` future
-    /// signals caller-abandonment to the supervisor - SIGKILL-reaps the `nix-store --dump`
-    /// process group. No leaked reservation, no orphan worker.
+    /// The in-flight reservation is NOT managed here: its [`InflightReservation`] guard was
+    /// constructed at admit and is owned by the caller's future (the swarm worker moves it
+    /// in alongside this call). That deliberately keeps the reserve released even when this
+    /// future is dropped BEFORE its first poll - the DEEP-gate leak an in-body guard missed.
+    /// Dropping the returned future still SIGKILL-reaps the `nix-store --dump` group, because
+    /// dropping the inner `produce_supervised` future signals caller-abandonment.
     pub(crate) async fn produce_admitted(
-        self: Arc<Self>,
+        &self,
         plan: NarSupplyPlan,
         content: Blake3Digest,
-        declared: u64,
     ) -> NarResponse {
-        // RAII: released on EVERY exit path, including a drop mid-await (cancellation).
-        let _reservation = InflightReservation {
-            gate: Arc::clone(&self),
-            declared,
-        };
         match plan.produce_supervised(&self.supervisor, &content).await {
             Ok(bytes) => {
                 self.admitted.fetch_add(1, Ordering::Relaxed);
@@ -853,28 +870,33 @@ pub(crate) enum Serve {
     /// NAR produced on the spot.
     Now(NarResponse),
     /// An admitted process source to produce OFF the poll loop via
-    /// [`ServeGate::produce_admitted`]; the `declared`-byte reservation is already held.
+    /// [`ServeGate::produce_admitted`]. Carries the [`InflightReservation`] guard that OWNS
+    /// the reserve's release: the swarm worker moves it into the production future, so
+    /// dropping that future - at any point, including before its first poll - releases it.
     OffLoop {
         plan: NarSupplyPlan,
         content: Blake3Digest,
-        declared: u64,
+        reservation: InflightReservation,
     },
 }
 
-/// A RAII reservation against a [`ServeGate`]'s in-flight ceiling: the bytes are reserved
-/// by [`ServeGate::admit`] and released when this guard drops - on the normal completion of
-/// off-loop production OR on the producing future being dropped mid-flight (cancellation),
-/// so a cancelled serve never leaks its reservation (TASK-193).
-struct InflightReservation {
-    gate: Arc<ServeGate>,
+/// A RAII reservation against a [`ServeGate`]'s in-flight ceiling. Constructed synchronously
+/// by [`ServeGate::admit`] the instant the CAS reserve succeeds, holding a direct handle to
+/// the shared counter (NOT a back-reference to the gate), and released when this guard drops.
+///
+/// It is deliberately handed to the caller AT ADMIT and moved into the production future, so
+/// the reserve is released on the guard's drop whatever happens to that future - normal
+/// completion, a mid-await cancellation, OR a drop BEFORE the future's first poll (a peer
+/// that abandons the request instantly). A guard built inside the async body would miss that
+/// last case and permanently leak the reserve, wedging the serve gate (TASK-193 DEEP gate).
+pub(crate) struct InflightReservation {
+    inflight: Arc<AtomicU64>,
     declared: u64,
 }
 
 impl Drop for InflightReservation {
     fn drop(&mut self) {
-        self.gate
-            .inflight_bytes
-            .fetch_sub(self.declared, Ordering::AcqRel);
+        self.inflight.fetch_sub(self.declared, Ordering::AcqRel);
     }
 }
 
@@ -1264,20 +1286,27 @@ mod tests {
             "the sync respond() path must decline a Process source (the pre-193 behaviour)"
         );
 
-        // GREEN: admit -> off-loop supervised production serves the exact bytes.
-        let (plan, admitted_content, declared) = match gate.admit(&content) {
+        // GREEN: admit -> off-loop supervised production serves the exact bytes. The
+        // reservation guard is created at admit; hold it across production (as the worker
+        // does by moving it into the future) and let it release on completion.
+        let (plan, admitted_content, reservation) = match gate.admit(&content) {
             Serve::OffLoop {
                 plan,
                 content,
-                declared,
-            } => (plan, content, declared),
+                reservation,
+            } => (plan, content, reservation),
             Serve::Now(other) => panic!("expected OffLoop for a Process source, got {other:?}"),
         };
         assert_eq!(admitted_content, content);
-        assert_eq!(declared, body.len() as u64);
-        let response = Arc::clone(&gate)
-            .produce_admitted(plan, admitted_content, declared)
-            .await;
+        assert_eq!(
+            gate.inflight_bytes.load(Ordering::Acquire),
+            body.len() as u64,
+            "admit reserved the declared bytes"
+        );
+        let response = {
+            let _reservation = reservation;
+            gate.produce_admitted(plan, admitted_content).await
+        };
         match response {
             NarResponse::Nar(bytes) => {
                 assert_eq!(bytes, body, "off-loop production serves the exact bytes");
@@ -1328,26 +1357,25 @@ mod tests {
             supervisor.handle(),
         ));
 
-        // Admit on the "poll loop": this RESERVES `declared`. Then produce off-loop.
-        let (plan, admitted_content, admitted_declared) = match gate.admit(&content) {
+        // Admit on the "poll loop": this RESERVES `declared` and hands back the guard.
+        let (plan, admitted_content, reservation) = match gate.admit(&content) {
             Serve::OffLoop {
                 plan,
                 content,
-                declared,
-            } => (plan, content, declared),
+                reservation,
+            } => (plan, content, reservation),
             Serve::Now(other) => panic!("expected OffLoop, got {other:?}"),
         };
-        assert_eq!(admitted_declared, declared);
         assert_eq!(
             gate.inflight_bytes.load(Ordering::Acquire),
             declared,
             "admit reserved the declared bytes"
         );
+        // Move the guard into the production future, exactly as the swarm worker does.
         let gate_task = Arc::clone(&gate);
         let op = tokio::spawn(async move {
-            gate_task
-                .produce_admitted(plan, admitted_content, admitted_declared)
-                .await
+            let _reservation = reservation;
+            gate_task.produce_admitted(plan, admitted_content).await
         });
 
         // Wait until the supervised group is live (pids published + one active job).
@@ -1396,5 +1424,110 @@ mod tests {
             );
         }
         let _ = std::fs::remove_file(&pid_file);
+    }
+
+    /// TASK-193 DEEP-gate bite (the decisive one): admitting an `OffLoop` reserves against
+    /// the in-flight ceiling, and DROPPING the production future WITHOUT EVER POLLING IT (a
+    /// peer that abandons the request before the task is scheduled) must still release the
+    /// reserve. No ResponseChannel is needed - this is the pure reservation-lifetime oracle.
+    ///
+    /// BITE: with the reservation guard constructed INSIDE `produce_admitted`'s async body
+    /// (the pre-fix code), the guard is never built for an unpolled future, so the reserve
+    /// LEAKS and the final `inflight == 0` assertion fails (RED). With the guard owned from
+    /// admit and moved into the future (the fix), the unpolled drop releases it (GREEN).
+    /// Repeated leaks would retire serve capacity - an availability/DoS hole.
+    #[tokio::test]
+    async fn dropping_an_unpolled_off_loop_future_releases_the_reservation() {
+        let body = b"an abandoned request must not leak the in-flight reserve".to_vec();
+        let supervisor = TaskSupervisor::new();
+        let (gate, content) = process_gate(&body, &supervisor);
+        let gate = Arc::new(gate);
+
+        let (plan, reservation) = match gate.admit(&content) {
+            Serve::OffLoop {
+                plan, reservation, ..
+            } => (plan, reservation),
+            Serve::Now(other) => panic!("expected OffLoop for a Process source, got {other:?}"),
+        };
+        assert_eq!(
+            gate.inflight_bytes.load(Ordering::Acquire),
+            body.len() as u64,
+            "admit reserved the declared bytes"
+        );
+
+        // Build the EXACT future the swarm worker builds (the guard moved in alongside the
+        // plan), then DROP it without ever polling it.
+        let gate_fut = Arc::clone(&gate);
+        let fut = async move {
+            let _reservation = reservation;
+            gate_fut.produce_admitted(plan, content).await
+        };
+        drop(fut);
+
+        assert_eq!(
+            gate.inflight_bytes.load(Ordering::Acquire),
+            0,
+            "dropping the unpolled production future must release the reserve (no leak)"
+        );
+        // Nothing was ever produced, so no supervised process was spawned.
+        assert_eq!(supervisor.process_jobs().active_len(), 0);
+    }
+
+    /// TASK-193 DEEP-gate bite (the declared-size / exact-length arm, distinct from the hash
+    /// arm): a Process source whose dump produces a DIFFERENT LENGTH than its declared size
+    /// must be `Declined(SupplyFailed)`, never served/mislabeled. Here the probe DECLARES
+    /// more bytes than the dump emits; the produced bytes DO hash to the announced content,
+    /// so ONLY the `len == declared_size` recheck can catch the lie.
+    ///
+    /// BITE: remove that exact-length check in `produce_supervised` and the short dump is
+    /// served under the wrong (larger) declared size - the `Declined` assertion goes RED.
+    #[tokio::test]
+    async fn process_source_with_wrong_declared_length_is_declined() {
+        let actual = b"short dump body".to_vec();
+        // The announced content is the honest hash of the ACTUAL bytes, so the BLAKE3 arm
+        // passes; the lie is purely in the declared size.
+        let content = Blake3Digest::from_raw_nar(&actual);
+        let declared = actual.len() as u64 + 100; // claim 100 more bytes than produced
+        let actual_str = String::from_utf8(actual.clone()).expect("ascii body");
+        let probe = OneProbe {
+            content,
+            declared_size: declared,
+            make: Box::new(move || ProbedSource::Process {
+                program: PathBuf::from("sh"),
+                args: vec![
+                    OsString::from("-c"),
+                    OsString::from(format!("printf %s '{actual_str}'")),
+                ],
+            }),
+        };
+        let supervisor = TaskSupervisor::new();
+        let supplier = Arc::new(CatalogNarSupplier::new(probe, "unused-helper"));
+        let gate = Arc::new(ServeGate::new(
+            budget(1 << 20, 1 << 30),
+            supplier,
+            supervisor.handle(),
+        ));
+
+        let (plan, admitted_content, reservation) = match gate.admit(&content) {
+            Serve::OffLoop {
+                plan,
+                content,
+                reservation,
+            } => (plan, content, reservation),
+            Serve::Now(other) => panic!("expected OffLoop, got {other:?}"),
+        };
+        let response = {
+            let _reservation = reservation;
+            gate.produce_admitted(plan, admitted_content).await
+        };
+        assert!(
+            matches!(response, NarResponse::Declined(DeclineReason::SupplyFailed)),
+            "a dump whose length != declared_size must be Declined, got {response:?}"
+        );
+        assert_eq!(
+            gate.inflight_bytes.load(Ordering::Acquire),
+            0,
+            "the reservation is released after the declined serve"
+        );
     }
 }
