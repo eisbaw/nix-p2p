@@ -720,8 +720,20 @@ async fn valid_signature_with_unsupported_schema_reaches_strict_decoder_and_fail
     assert_get_only(&server.await.unwrap(), node_id);
 }
 
-#[tokio::test(start_paused = true)]
+// The absolute deadline is exercised against a REAL iroh endpoint in REAL time
+// with a SHORT injected deadline (via `resolve_before`) rather than the 10 s
+// production default. Paused tokio time (`start_paused`) is INCOMPATIBLE with a
+// real endpoint: iroh's maintenance timers and the real socket readiness need
+// wall-clock progress that a frozen clock never delivers, so the lookup — and
+// the whole `cargo test --workspace` gate — hung indefinitely (TASK-190). The
+// short real-time deadline keeps the endpoint healthy while still firing the
+// deadline deterministically.
+#[tokio::test]
 async fn hanging_authority_is_cancelled_at_the_single_absolute_ten_second_deadline() {
+    // Short enough for a fast gate, long enough for a localhost GET to land
+    // before it fires even under shared-box load.
+    const SHORT_DEADLINE: Duration = Duration::from_millis(500);
+
     let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
     let authority = listener.local_addr().unwrap();
     let (accepted_tx, accepted_rx) = oneshot::channel();
@@ -736,18 +748,24 @@ async fn hanging_authority_is_cancelled_at_the_single_absolute_ten_second_deadli
     let node_id = NodeId::from_bytes(*key.public().as_bytes());
     let handle = runtime.node_lookup_handle().unwrap();
     let started = tokio::time::Instant::now();
-    let lookup = tokio::spawn(async move { handle.resolve(node_id).await });
-    let request = accepted_rx.await.unwrap();
-    let request = String::from_utf8(request).unwrap();
-    assert!(request.starts_with("GET /pkarr/"));
-    tokio::time::advance(daemon::NODE_LOOKUP_DEADLINE + Duration::from_millis(1)).await;
-    let error = lookup.await.unwrap().unwrap_err();
+    let deadline = started + SHORT_DEADLINE;
+
+    // OUTER oracle on a real (non-paused) clock: if the deadline mechanism is
+    // broken and never cancels, this bound FAILS the test rather than letting it
+    // hang forever. Neutering the cancellation must trip this timeout.
+    let error = tokio::time::timeout(SHORT_DEADLINE + Duration::from_secs(2), async {
+        let lookup = tokio::spawn(async move { handle.resolve_before(node_id, deadline).await });
+        let request = accepted_rx.await.unwrap();
+        let request = String::from_utf8(request).unwrap();
+        assert!(request.starts_with("GET /pkarr/"));
+        lookup.await.unwrap()
+    })
+    .await
+    .expect("the absolute deadline must cancel the hanging lookup, not hang")
+    .unwrap_err();
+
     assert_eq!(error.kind(), NodeLookupUnavailableKind::Deadline);
-    assert!(started.elapsed() >= daemon::NODE_LOOKUP_DEADLINE);
-    // Paused Tokio time may auto-advance through unrelated Iroh maintenance
-    // timers while the socket is becoming ready, so this mutation proves the
-    // named deadline fires but leaves the <=1 s observer bound to routed
-    // wall-clock evidence.
+    assert!(started.elapsed() >= SHORT_DEADLINE);
     server.abort();
     let _ = server.await;
     runtime.shutdown().await.unwrap();

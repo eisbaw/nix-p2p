@@ -1022,6 +1022,25 @@ impl NodeLookupHandle {
                     "node lookup deadline overflows monotonic clock",
                 )
             })?;
+        self.resolve_before(node_id, absolute_deadline).await
+    }
+
+    /// Resolve `node_id` under a caller-chosen absolute deadline instead of the
+    /// default [`NODE_LOOKUP_DEADLINE`] measured from now.
+    ///
+    /// This keeps the deadline policy at the integration site (composable): a
+    /// caller that wants a tighter bound — production callers layering their own
+    /// budget, or a test that must fire the deadline quickly and deterministically
+    /// against a real endpoint without freezing the tokio clock — passes the
+    /// absolute [`Instant`] directly. `resolve` is the thin default-policy wrapper.
+    ///
+    /// Fail-fast: the returned error carries a `Deadline` kind when the absolute
+    /// instant is reached, so a never-completing lookup is bounded, not hung.
+    pub async fn resolve_before(
+        &self,
+        node_id: NodeId,
+        absolute_deadline: Instant,
+    ) -> Result<NodeLookupResult, NodeLookupUnavailable> {
         let core = self
             .core
             .as_ref()
