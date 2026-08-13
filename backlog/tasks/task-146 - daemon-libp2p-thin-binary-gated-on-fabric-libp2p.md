@@ -4,6 +4,7 @@ title: daemon-libp2p thin binary (gated on fabric-libp2p)
 status: To Do
 assignee: []
 created_date: '2026-08-11 23:58'
+updated_date: '2026-08-13 00:17'
 labels:
   - seam
   - de-welding
@@ -24,3 +25,9 @@ The second product binary from docs/peer-fabric-seam.md's two-binary composition
 <!-- AC:BEGIN -->
 - [ ] #1 daemon-libp2p binary crate = daemon-core + fabric-libp2p; build guard proves its dep closure contains no iroh
 <!-- AC:END -->
+
+## Implementation Notes
+
+<!-- SECTION:NOTES:BEGIN -->
+UNBLOCKED (backend side) by TASK-144 (commit 4a4397c): peer_fabric::require_axes is the shared composition-root REQUIRED-axis gate and is already the live call site on the libp2p fabric (daemon start_and_join_libp2p asserts consumer axes provider_directory+node_locator+Transfer(Iroh), provider adds Server+Announcer). So the daemon-libp2p thin binary inherits the same require_axes assertion once daemon-core is split (TASK-145). No change needed to fabric-libp2p for this; the gate mechanism is in peer-fabric.
+<!-- SECTION:NOTES:END -->
