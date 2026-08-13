@@ -582,7 +582,11 @@ async fn a_rebuilt_store_source_is_declined_and_never_ships_wrong_bytes() {
         .iter()
         .map(|&b| if b == b'a' { b'e' } else { b })
         .collect();
-    assert_eq!(announced.len(), rebuilt.len(), "same length so only BLAKE3 bites");
+    assert_eq!(
+        announced.len(),
+        rebuilt.len(),
+        "same length so only BLAKE3 bites"
+    );
     assert_ne!(announced, rebuilt, "the rebuilt bytes must actually differ");
     let rebuilt_str = String::from_utf8(rebuilt.clone()).unwrap();
 
