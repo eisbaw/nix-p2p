@@ -3,9 +3,13 @@
 //! listener ever serves - never a silent runtime degrade.
 //!
 //! `run` composes already-tested pieces (`PeerFabricNarSource`, `FallbackNarSource`, `App` +
-//! `serve`, `require_axes`); this test pins the one NEW behaviour the composition root adds -
-//! that the axis assertion fires FIRST and names the gap, and that a satisfied profile passes
-//! the gate (the run then serves, which the libp2p integration tests exercise end to end).
+//! `serve`, `require_axes`); this test pins the axis-gate behaviour specifically - that the
+//! assertion fires FIRST and names the gap, and that a satisfied profile gets PAST the gate.
+//! It does NOT serve traffic. The `run` SERVING glue (gate -> PeerFabricNarSource + upstream
+//! fallback -> App -> serve) is exercised end to end - a real HTTP GET served through `run`
+//! from a discovered libp2p provider, byte-identical, plus the miss->upstream fallback - by
+//! `daemon-libp2p/tests/production_path_through_run.rs`, which needs the libp2p backend this
+//! stack-neutral crate deliberately does not depend on.
 
 use std::sync::Arc;
 

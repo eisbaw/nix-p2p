@@ -29,5 +29,17 @@ ed25519-dalek = "3"
 # The runtime + the serve loop; `signal` so the bin shuts down on SIGINT/SIGTERM.
 tokio = { version = "1", features = ["rt-multi-thread", "net", "macros", "time", "signal"] }
 
+[dev-dependencies]
+# `production_path_through_run.rs` drives the REAL binary path (build_libp2p_nar_source ->
+# daemon_core::run) end to end: it stands up a libp2p provider/bootstrap, builds the consumer
+# source from config, and serves a discovered NAR over HTTP through `run`. It needs the seam
+# fake sources (async-trait + the http body types), an ed25519 signing key for the provider
+# record, and tokio io-util for the raw HTTP/1.1 test client.
+async-trait = "0.1"
+bytes = "1"
+http = "1"
+http-body-util = "0.1"
+tokio = { version = "1", features = ["rt-multi-thread", "net", "macros", "io-util", "time"] }
+
 [lints]
 workspace = true

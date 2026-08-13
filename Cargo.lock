@@ -974,9 +974,13 @@ dependencies = [
 name = "daemon-libp2p"
 version = "0.0.1"
 dependencies = [
+ "async-trait",
+ "bytes",
  "daemon-core",
  "ed25519-dalek 3.0.0",
  "fabric-libp2p",
+ "http 1.5.0",
+ "http-body-util",
  "peer-fabric",
  "tokio",
 ]
