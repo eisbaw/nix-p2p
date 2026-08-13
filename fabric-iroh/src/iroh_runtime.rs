@@ -13,8 +13,7 @@
 //! relay/address lookup/port mapping are disabled, and all optional net-report
 //! probes are disabled. `presets::N0` is intentionally absent.
 
-use std::collections::{BTreeMap, HashMap};
-use std::ffi::OsString;
+use std::collections::BTreeMap;
 use std::fmt;
 use std::fs::File;
 use std::future::{Future, poll_fn};
@@ -22,9 +21,6 @@ use std::io::{Read, Write};
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6};
 use std::os::fd::OwnedFd;
 use std::path::{Path, PathBuf};
-use std::pin::Pin;
-use std::process::ExitStatus;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 use std::time::Duration;
 
@@ -35,8 +31,8 @@ use n0_future::StreamExt;
 use rustix::fs::{self, AtFlags, FileType, Mode, OFlags};
 use rustix::io::Errno;
 use serde::{Deserialize, Serialize};
-use tokio::sync::{mpsc, oneshot, watch};
-use tokio::task::{AbortHandle, Id, JoinHandle, JoinSet};
+use tokio::sync::oneshot;
+use tokio::task::JoinHandle;
 
 use crate::iroh_node_lookup::{NodeLookupConfig, NodeLookupHandle, NodeLookupRuntime};
 use crate::iroh_node_record::{NodeLocation, normalize_socket_addr};
@@ -44,8 +40,16 @@ use crate::iroh_publication::{
     NodePublicationCapability, NodePublicationHandle, NodePublicationRuntime,
     PUBLICATION_STARTUP_DEADLINE, PUBLICATION_TRANSITION_DEADLINE,
 };
-use crate::process_group::{ProcessJobRegistry, ProcessJobSpec};
 use peer_fabric::NodeId;
+use proc_supervisor::process_group::ProcessJobRegistry;
+// The generic task/subprocess supervisor moved to the stack-neutral `proc-supervisor`
+// crate (TASK-146) so `daemon-core` and this backend both build on it without a cycle.
+// Re-exported here so the daemon's existing `iroh_runtime::TaskSupervisor{,Handle}` /
+// `daemon::TaskSupervisor` paths keep resolving unchanged during the split.
+use proc_supervisor::SupervisorError;
+pub use proc_supervisor::{
+    MAX_OWNED_TASKS, SupervisedProcessOutput, TaskSupervisor, TaskSupervisorHandle, TrackedTask,
+};
 
 /// Stable on-disk name. The schema version lives inside the record so an
 /// upgrade cannot accidentally interpret new bytes using old rules.
@@ -61,18 +65,6 @@ const IDENTITY_FILE_MODE: u32 = 0o600;
 /// drops its last strong endpoint owner. This is a named product value rather
 /// than an unbounded await hidden in process teardown.
 pub const IROH_SHUTDOWN_DEADLINE: Duration = Duration::from_secs(10);
-
-/// Provisional hard safety ceiling on queued plus running daemon-owned async
-/// tasks. Remote peers can create HTTP connections and provider requests, so an
-/// unbounded registry would merely move the memory leak from completed joins to
-/// pending commands. This value establishes finite admission and recovery; it
-/// is not a measured production optimum. TASK-120 owns resource-policy tuning.
-pub const MAX_OWNED_TASKS: usize = 1024;
-
-// One additional slot is reserved for the FIFO shutdown marker. Since accepted
-// Spawn commands are bounded by MAX_OWNED_TASKS, shutdown cannot be starved by a
-// full registration queue.
-const TASK_COMMAND_CAPACITY: usize = MAX_OWNED_TASKS + 1;
 
 /// Which local IP sockets an endpoint may bind.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -247,511 +239,19 @@ impl IrohRuntimeError {
     }
 }
 
-struct TrackedTask {
-    name: String,
-    join: JoinHandle<()>,
-}
-
-#[derive(Default)]
-struct TaskFailureLatch {
-    first: Option<String>,
-    count: usize,
-}
-
-impl TaskFailureLatch {
-    fn record(&mut self, failure: String) {
-        self.count = self.count.saturating_add(1);
-        if self.first.is_none() {
-            self.first = Some(failure);
-        }
-    }
-
-    fn summary(&self) -> Option<String> {
-        self.first
-            .as_ref()
-            .map(|first| format!("{first} ({} owned-task failure(s) total)", self.count))
-    }
-}
-
-struct TaskSupervisorInner {
-    closing: AtomicBool,
-    cancel: watch::Sender<bool>,
-    commands: mpsc::Sender<SupervisorCommand>,
-    command_receiver: Mutex<Option<mpsc::Receiver<SupervisorCommand>>>,
-    manager: Mutex<Option<JoinHandle<()>>>,
-    spawn_gate: Mutex<()>,
-    abort_handles: Mutex<HashMap<Id, AbortHandle>>,
-    active_tasks: AtomicUsize,
-    failures: Mutex<TaskFailureLatch>,
-    process_jobs: ProcessJobRegistry,
-}
-
-type BoxedTask = Pin<Box<dyn Future<Output = ()> + Send + 'static>>;
-
-struct SpawnCommand {
-    name: String,
-    future: BoxedTask,
-    cancel_on_shutdown: bool,
-}
-
-enum SupervisorCommand {
-    Spawn(SpawnCommand),
-    Shutdown,
-}
-
-/// Owns daemon-side asynchronous work that must not outlive a node runtime.
-///
-/// Handles are weak capabilities. They can register work while the owner is
-/// alive, but cannot keep the supervisor alive or detach work from shutdown.
-/// Dropping the owner synchronously cancels and aborts every registered task;
-/// explicit runtime shutdown additionally joins them inside the node's single
-/// absolute deadline.
-pub struct TaskSupervisor {
-    inner: Arc<TaskSupervisorInner>,
-}
-
-impl Default for TaskSupervisor {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl TaskSupervisor {
-    pub fn new() -> Self {
-        let (cancel, _receiver) = watch::channel(false);
-        let (commands, command_receiver) = mpsc::channel(TASK_COMMAND_CAPACITY);
-        Self {
-            inner: Arc::new(TaskSupervisorInner {
-                closing: AtomicBool::new(false),
-                cancel,
-                commands,
-                command_receiver: Mutex::new(Some(command_receiver)),
-                manager: Mutex::new(None),
-                spawn_gate: Mutex::new(()),
-                abort_handles: Mutex::new(HashMap::new()),
-                active_tasks: AtomicUsize::new(0),
-                failures: Mutex::new(TaskFailureLatch::default()),
-                process_jobs: ProcessJobRegistry::default(),
-            }),
-        }
-    }
-
-    pub fn handle(&self) -> TaskSupervisorHandle {
-        TaskSupervisorHandle {
-            inner: Arc::downgrade(&self.inner),
-        }
-    }
-
-    fn begin_shutdown(&self) -> Result<Vec<TrackedTask>, IrohRuntimeError> {
-        let _gate = self.inner.spawn_gate.lock().map_err(|_| {
-            IrohRuntimeError::Shutdown("task-supervisor spawn gate was poisoned".to_string())
-        })?;
-        self.inner.closing.store(true, Ordering::Release);
-        let _ = self.inner.cancel.send(true);
-        self.inner
-            .commands
-            .try_send(SupervisorCommand::Shutdown)
-            .map_err(|error| {
-                IrohRuntimeError::Shutdown(format!(
-                    "task-supervisor could not enqueue its reserved shutdown marker: {error}"
-                ))
-            })?;
-        let manager = self
-            .inner
-            .manager
-            .lock()
-            .map_err(|_| {
-                IrohRuntimeError::Shutdown("task-supervisor manager mutex was poisoned".into())
-            })?
-            .take();
-        Ok(manager
-            .into_iter()
-            .map(|join| TrackedTask {
-                name: "owned-task-registry".to_string(),
-                join,
-            })
-            .collect())
-    }
-
-    /// Immediate RAII fallback for callers that omit explicit async shutdown.
-    pub fn cancel_now(&self) {
-        let _gate = match self.inner.spawn_gate.lock() {
-            Ok(gate) => gate,
-            Err(poisoned) => poisoned.into_inner(),
-        };
-        self.inner.closing.store(true, Ordering::Release);
-        let _ = self.inner.cancel.send(true);
-        let _ = self.inner.commands.try_send(SupervisorCommand::Shutdown);
-        let aborts = match self.inner.abort_handles.lock() {
-            Ok(aborts) => aborts,
-            Err(poisoned) => poisoned.into_inner(),
-        };
-        for abort in aborts.values() {
-            abort.abort();
-        }
-        drop(aborts);
-        self.inner.process_jobs.cancel_all();
-        let mut manager = match self.inner.manager.lock() {
-            Ok(manager) => manager,
-            Err(poisoned) => poisoned.into_inner(),
-        };
-        if let Some(manager) = manager.take() {
-            manager.abort();
-        }
-    }
-
-    fn abort_active(&self) -> Result<(), IrohRuntimeError> {
-        let aborts = self.inner.abort_handles.lock().map_err(|_| {
-            IrohRuntimeError::Shutdown("task-supervisor abort registry mutex was poisoned".into())
-        })?;
-        for abort in aborts.values() {
-            abort.abort();
-        }
-        drop(aborts);
-        self.inner.process_jobs.cancel_all();
-        Ok(())
-    }
-
-    fn process_jobs(&self) -> ProcessJobRegistry {
-        self.inner.process_jobs.clone()
-    }
-
-    fn recorded_failures(&self) -> Result<Vec<String>, IrohRuntimeError> {
-        let failures = self.inner.failures.lock().map_err(|_| {
-            IrohRuntimeError::Shutdown("task-supervisor failure mutex was poisoned".into())
-        })?;
-        Ok(failures.summary().into_iter().collect())
-    }
-
-    #[doc(hidden)]
-    pub fn active_task_count(&self) -> usize {
-        self.inner.active_tasks.load(Ordering::Acquire)
-    }
-}
-
-impl Drop for TaskSupervisor {
-    fn drop(&mut self) {
-        self.cancel_now();
-    }
-}
-
-impl fmt::Debug for TaskSupervisor {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("TaskSupervisor")
-            .field("closing", &self.inner.closing.load(Ordering::Acquire))
-            .finish_non_exhaustive()
-    }
-}
-
-/// Non-owning registration capability for [`TaskSupervisor`].
-#[derive(Clone)]
-pub struct TaskSupervisorHandle {
-    inner: Weak<TaskSupervisorInner>,
-}
-
-impl fmt::Debug for TaskSupervisorHandle {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("TaskSupervisorHandle")
-            .field("alive", &self.inner.strong_count().gt(&0))
-            .finish()
-    }
-}
-
-pub struct SupervisedProcessOutput {
-    pub status: ExitStatus,
-    pub stdout: Vec<u8>,
-    pub stderr: Vec<u8>,
-    pub stdout_exceeded_limit: bool,
-}
-
-async fn wait_for_supervisor_cancel(mut cancelled: watch::Receiver<bool>) {
-    if *cancelled.borrow() {
-        return;
-    }
-    let _ = cancelled.wait_for(|closing| *closing).await;
-}
-
-async fn task_registry_manager(
-    inner: Weak<TaskSupervisorInner>,
-    mut commands: mpsc::Receiver<SupervisorCommand>,
-) {
-    let mut tasks = JoinSet::new();
-    let mut names = HashMap::<Id, String>::new();
-    let mut shutting_down = false;
-
-    loop {
-        if shutting_down && tasks.is_empty() {
-            break;
-        }
-        tokio::select! {
-            biased;
-            joined = tasks.join_next_with_id(), if !tasks.is_empty() => {
-                let Some(joined) = joined else { continue };
-                let (id, failure) = match joined {
-                    Ok((id, ())) => (id, None),
-                    Err(error) => {
-                        let id = error.id();
-                        let failure = (!error.is_cancelled()).then(|| format!("join_error={error}"));
-                        (id, failure)
-                    }
-                };
-                let name = names.remove(&id).unwrap_or_else(|| "unknown-owned-task".into());
-                if let Some(inner) = inner.upgrade() {
-                    if let Some(failure) = failure {
-                        let failure = format!("task={name} {failure}");
-                        eprintln!("IROH-OWNED-TASK-FAILED {failure}");
-                        if let Ok(mut failures) = inner.failures.lock() {
-                            failures.record(failure);
-                        }
-                    }
-                    // Publish a panic before removing the task from the active
-                    // registry. Shutdown can therefore never observe zero
-                    // active work while its failure is still unlatched.
-                    if let Ok(mut aborts) = inner.abort_handles.lock() {
-                        aborts.remove(&id);
-                    }
-                    inner.active_tasks.fetch_sub(1, Ordering::AcqRel);
-                }
+/// The endpoint runtime drives the stack-neutral [`TaskSupervisor`] and propagates its
+/// failures as its own richer error (TASK-146): `?` on a supervisor call inside an
+/// endpoint fn that returns [`IrohRuntimeError`] maps through here. `Poisoned` (a broken
+/// shutdown-path invariant) folds into `Shutdown`; the other two are 1:1.
+impl From<SupervisorError> for IrohRuntimeError {
+    fn from(error: SupervisorError) -> Self {
+        match error {
+            SupervisorError::Closed => IrohRuntimeError::Closed,
+            SupervisorError::Capacity { active, limit } => {
+                IrohRuntimeError::Capacity { active, limit }
             }
-            command = commands.recv(), if !shutting_down => {
-                match command {
-                    Some(SupervisorCommand::Spawn(command)) => {
-                        let Some(inner) = inner.upgrade() else { break };
-                        let future: BoxedTask = if command.cancel_on_shutdown {
-                            let cancelled = inner.cancel.subscribe();
-                            Box::pin(async move {
-                                tokio::select! {
-                                    biased;
-                                    _ = wait_for_supervisor_cancel(cancelled) => {}
-                                    _ = command.future => {}
-                                }
-                            })
-                        } else {
-                            command.future
-                        };
-                        let abort = tasks.spawn(future);
-                        let id = abort.id();
-                        names.insert(id, command.name);
-                        inner
-                            .abort_handles
-                            .lock()
-                            .expect("task-supervisor abort registry mutex")
-                            .insert(id, abort);
-                    }
-                    Some(SupervisorCommand::Shutdown) => shutting_down = true,
-                    None => {
-                        shutting_down = true;
-                        tasks.abort_all();
-                    }
-                }
-            }
+            SupervisorError::Poisoned(why) => IrohRuntimeError::Shutdown(why),
         }
-    }
-}
-
-impl TaskSupervisorHandle {
-    fn ensure_manager(inner: &Arc<TaskSupervisorInner>) -> Result<(), IrohRuntimeError> {
-        let mut manager = inner.manager.lock().map_err(|_| {
-            IrohRuntimeError::Shutdown("task-supervisor manager mutex was poisoned".into())
-        })?;
-        if manager.is_some() {
-            return Ok(());
-        }
-        let receiver = inner
-            .command_receiver
-            .lock()
-            .map_err(|_| {
-                IrohRuntimeError::Shutdown(
-                    "task-supervisor command receiver mutex was poisoned".into(),
-                )
-            })?
-            .take()
-            .ok_or_else(|| {
-                IrohRuntimeError::Shutdown("task-supervisor manager stopped before shutdown".into())
-            })?;
-        let weak = Arc::downgrade(inner);
-        *manager = Some(tokio::spawn(task_registry_manager(weak, receiver)));
-        Ok(())
-    }
-
-    fn spawn_inner(
-        &self,
-        name: String,
-        future: impl Future<Output = ()> + Send + 'static,
-        cancel_on_shutdown: bool,
-    ) -> Result<(), IrohRuntimeError> {
-        let inner = self.inner.upgrade().ok_or(IrohRuntimeError::Closed)?;
-        let _gate = inner.spawn_gate.lock().map_err(|_| {
-            IrohRuntimeError::Shutdown("task-supervisor spawn gate was poisoned".into())
-        })?;
-        if inner.closing.load(Ordering::Acquire) {
-            return Err(IrohRuntimeError::Closed);
-        }
-        Self::ensure_manager(&inner)?;
-        let active = inner.active_tasks.load(Ordering::Acquire);
-        if active >= MAX_OWNED_TASKS {
-            return Err(IrohRuntimeError::Capacity {
-                active,
-                limit: MAX_OWNED_TASKS,
-            });
-        }
-        inner.active_tasks.fetch_add(1, Ordering::AcqRel);
-        match inner
-            .commands
-            .try_send(SupervisorCommand::Spawn(SpawnCommand {
-                name,
-                future: Box::pin(future),
-                cancel_on_shutdown,
-            })) {
-            Ok(()) => Ok(()),
-            Err(mpsc::error::TrySendError::Full(_)) => {
-                inner.active_tasks.fetch_sub(1, Ordering::AcqRel);
-                Err(IrohRuntimeError::Capacity {
-                    active: MAX_OWNED_TASKS,
-                    limit: MAX_OWNED_TASKS,
-                })
-            }
-            Err(mpsc::error::TrySendError::Closed(_)) => {
-                inner.active_tasks.fetch_sub(1, Ordering::AcqRel);
-                Err(IrohRuntimeError::Closed)
-            }
-        }
-    }
-
-    #[doc(hidden)]
-    pub fn active_task_count(&self) -> Result<usize, IrohRuntimeError> {
-        Ok(self
-            .inner
-            .upgrade()
-            .ok_or(IrohRuntimeError::Closed)?
-            .active_tasks
-            .load(Ordering::Acquire))
-    }
-
-    /// Register a task whose lifetime is bounded by its runtime owner.
-    pub fn spawn(
-        &self,
-        name: impl Into<String>,
-        future: impl Future<Output = ()> + Send + 'static,
-    ) -> Result<(), IrohRuntimeError> {
-        self.spawn_inner(name.into(), future, true)
-    }
-
-    pub(crate) async fn execute<T>(
-        &self,
-        name: impl Into<String>,
-        future: impl Future<Output = T> + Send + 'static,
-    ) -> Result<T, IrohRuntimeError>
-    where
-        T: Send + 'static,
-    {
-        let (result_tx, result_rx) = oneshot::channel();
-        self.spawn(name, async move {
-            let mut result_tx = result_tx;
-            tokio::select! {
-                biased;
-                _ = result_tx.closed() => {}
-                result = future => {
-                    let _ = result_tx.send(result);
-                }
-            }
-        })?;
-        result_rx.await.map_err(|_| IrohRuntimeError::Closed)
-    }
-
-    /// Execute one killable subprocess under node ownership.
-    ///
-    /// This deliberately accepts data, not an in-process callback. If the
-    /// caller disappears or node shutdown begins, the whole process group is
-    /// SIGKILLed and the direct child is waited/reaped before this tracked task
-    /// completes. Stdout is capped while reading, so a replaced/growing source
-    /// cannot allocate beyond the serve reservation before validation.
-    pub async fn execute_process(
-        &self,
-        name: impl Into<String>,
-        program: PathBuf,
-        args: Vec<OsString>,
-        environment: Vec<(OsString, OsString)>,
-        stdout_limit: usize,
-    ) -> Result<SupervisedProcessOutput, IrohRuntimeError> {
-        let inner = self.inner.upgrade().ok_or(IrohRuntimeError::Closed)?;
-        if inner.closing.load(Ordering::Acquire) {
-            return Err(IrohRuntimeError::Closed);
-        }
-        let cancelled = inner.cancel.subscribe();
-        let process_jobs = inner.process_jobs.clone();
-        let supervisor_inner = Arc::downgrade(&inner);
-
-        let (mut result_tx, result_rx) = oneshot::channel();
-        self.spawn_inner(
-            name.into(),
-            async move {
-                let result = async {
-                    let job = process_jobs
-                        .start(
-                            format!("{} (supervised supplier)", program.display()),
-                            ProcessJobSpec {
-                                program: program.clone(),
-                                args,
-                                environment,
-                                stdout_limit: Some(stdout_limit),
-                                stderr_limit: 64 * 1024,
-                            },
-                        )
-                        .map_err(|error| {
-                            IrohRuntimeError::Shutdown(format!(
-                                "starting supervised process {}: {error}",
-                                program.display()
-                            ))
-                        })?;
-                    if supervisor_inner
-                        .upgrade()
-                        .is_none_or(|inner| inner.closing.load(Ordering::Acquire))
-                    {
-                        job.cancel();
-                    }
-                    let cancellation = wait_for_supervisor_cancel(cancelled);
-                    let caller_closed = result_tx.closed();
-                    tokio::pin!(cancellation, caller_closed);
-                    let mut cancelled_or_abandoned = false;
-                    let output = loop {
-                        if let Some(result) = job.try_take_result() {
-                            break result.map_err(|error| {
-                                IrohRuntimeError::Shutdown(format!(
-                                    "supervised process {} failed: {error}",
-                                    program.display()
-                                ))
-                            })?;
-                        }
-                        tokio::select! {
-                            () = &mut cancellation, if !cancelled_or_abandoned => {
-                                cancelled_or_abandoned = true;
-                                job.cancel();
-                            }
-                            () = &mut caller_closed, if !cancelled_or_abandoned => {
-                                cancelled_or_abandoned = true;
-                                job.cancel();
-                            }
-                            () = tokio::time::sleep(Duration::from_millis(1)) => {}
-                        }
-                    };
-
-                    if cancelled_or_abandoned {
-                        return Err(IrohRuntimeError::Closed);
-                    }
-                    Ok(SupervisedProcessOutput {
-                        status: output.status,
-                        stdout: output.stdout,
-                        stderr: output.stderr,
-                        stdout_exceeded_limit: output.stdout_exceeded_limit,
-                    })
-                }
-                .await;
-                let _ = result_tx.send(result);
-            },
-            false,
-        )?;
-        result_rx.await.map_err(|_| IrohRuntimeError::Closed)?
     }
 }
 
@@ -1403,7 +903,7 @@ impl IrohNodeRuntime {
         self.supervisor
             .as_ref()
             .map(TaskSupervisor::handle)
-            .unwrap_or_else(|| TaskSupervisorHandle { inner: Weak::new() })
+            .unwrap_or_else(TaskSupervisorHandle::disconnected)
     }
 
     pub fn node_id(&self) -> Result<NodeId, IrohRuntimeError> {
@@ -2333,6 +1833,12 @@ fn identity_io(state_dir: &Path, operation: &str, error: Errno) -> IrohRuntimeEr
 #[cfg(test)]
 mod tests {
     use super::*;
+    // These were top-level imports until TASK-146 moved the task supervisor out; the
+    // remaining endpoint-runtime tests still build supervised-process specs and poke the
+    // active-task counter directly, so they are scoped to the test module now.
+    use std::ffi::OsString;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
     use crate::iroh_publication::{NodePublicationConfig, PublicationAuthorityAuthorization};
     use iroh::TransportAddr;
     use iroh::endpoint::Connection;

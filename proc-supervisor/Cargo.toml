@@ -1,0 +1,21 @@
+[package]
+name = "proc-supervisor"
+description = "Stack-neutral supervision of daemon-owned async tasks and killable OS subprocess groups (TaskSupervisor + process_group), extracted from fabric-iroh so daemon-core and fabric-iroh both depend on it without either depending on the other (docs/peer-fabric-seam.md). ZERO p2p deps."
+version.workspace = true
+edition.workspace = true
+
+[lib]
+name = "proc_supervisor"
+path = "src/lib.rs"
+
+[dependencies]
+# The async task registry is driven on the tokio runtime (JoinSet + channels);
+# process_group needs no async runtime (it owns dedicated OS threads) but shares
+# the crate. No p2p, no iroh, no libp2p - this is a generic runtime primitive.
+tokio = { version = "1", features = ["rt", "sync", "macros", "time"] }
+# process_group uses openat/renameat2/waitpid + process-group signalling without
+# unsafe code; rustix is the same dep the code used inside fabric-iroh.
+rustix = { version = "1", features = ["fs", "process"] }
+
+[lints]
+workspace = true

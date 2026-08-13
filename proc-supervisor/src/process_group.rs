@@ -147,12 +147,12 @@ struct ProcessJobRegistryInner {
 
 /// Runtime-owned set of workers that have not yet proved child-free completion.
 #[derive(Clone, Default)]
-pub(crate) struct ProcessJobRegistry {
+pub struct ProcessJobRegistry {
     inner: Arc<ProcessJobRegistryInner>,
 }
 
 impl ProcessJobRegistry {
-    pub(crate) fn start(
+    pub fn start(
         &self,
         label: impl Into<String>,
         spec: ProcessJobSpec,
@@ -171,7 +171,7 @@ impl ProcessJobRegistry {
 
     /// O(1) per live job: request kill without waiting. The workers remain the
     /// sole waiters and remove themselves only after actual cleanup.
-    pub(crate) fn cancel_all(&self) {
+    pub fn cancel_all(&self) {
         let jobs = match self.inner.jobs.lock() {
             Ok(jobs) => jobs.values().cloned().collect::<Vec<_>>(),
             Err(poisoned) => poisoned.into_inner().values().cloned().collect(),
@@ -181,14 +181,14 @@ impl ProcessJobRegistry {
         }
     }
 
-    pub(crate) fn active_len(&self) -> usize {
+    pub fn active_len(&self) -> usize {
         match self.inner.jobs.lock() {
             Ok(jobs) => jobs.len(),
             Err(poisoned) => poisoned.into_inner().len(),
         }
     }
 
-    pub(crate) fn active_labels(&self) -> Vec<String> {
+    pub fn active_labels(&self) -> Vec<String> {
         match self.inner.jobs.lock() {
             Ok(jobs) => jobs.values().map(|job| job.label.clone()).collect(),
             Err(poisoned) => poisoned
@@ -199,7 +199,7 @@ impl ProcessJobRegistry {
         }
     }
 
-    pub(crate) fn recorded_failures(&self) -> Vec<String> {
+    pub fn recorded_failures(&self) -> Vec<String> {
         let failures = match self.inner.failures.lock() {
             Ok(failures) => failures,
             Err(poisoned) => poisoned.into_inner(),

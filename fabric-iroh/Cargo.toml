@@ -24,6 +24,12 @@ path = "src/lib.rs"
 # `crate::transport::NodeId` re-export; here they name `peer_fabric::NodeId`
 # directly, which severs the last daemon-ward edge from the cluster.
 peer-fabric = { path = "../peer-fabric" }
+# proc-supervisor (TASK-146): the generic task/subprocess supervisor (TaskSupervisor +
+# process_group) moved OUT of iroh_runtime into its own stack-neutral leaf crate so
+# daemon-core and this backend both build on it without a cycle (docs/peer-fabric-seam.md
+# "Crate topology"). iroh_runtime drives it (endpoint work / node-lookup / supervised
+# supplier subprocess) and maps its SupervisorError into IrohRuntimeError.
+proc-supervisor = { path = "../proc-supervisor" }
 # TASK-148 increment 2: the iroh-blobs NAR transfer/serve (transport_iroh) now
 # lives here behind peer_fabric::{NarTransfer, NarServer}. iroh-blobs speaks
 # plain-unkeyed BLAKE3 (bao) so the addressed unit IS the blob hash of the raw

@@ -269,6 +269,16 @@ impl From<IrohRuntimeError> for IrohError {
     }
 }
 
+// TASK-146: the supervised provider request/serve work now calls the stack-neutral
+// `proc_supervisor::TaskSupervisorHandle`, whose spawn/execute_process return a
+// `SupervisorError`. Fold it into `IrohError` through the same `Runtime` variant as the
+// endpoint runtime error, so the transport's `.map_err(Into::into)` sites are unchanged.
+impl From<proc_supervisor::SupervisorError> for IrohError {
+    fn from(error: proc_supervisor::SupervisorError) -> Self {
+        Self::Runtime(error.to_string())
+    }
+}
+
 // -------------------------------------------------------------------------
 // A peer's dialable address (opaque wrapper so callers/tests never touch iroh).
 // -------------------------------------------------------------------------

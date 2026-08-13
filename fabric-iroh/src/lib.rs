@@ -61,8 +61,14 @@ pub mod iroh_relay;
 pub mod iroh_runtime;
 pub mod locator;
 pub mod pinned_http;
-pub mod process_group;
 pub mod transport_iroh;
+
+// TASK-146: `process_group` + the generic `TaskSupervisor` moved OUT of this backend
+// into the stack-neutral `proc-supervisor` leaf crate, so `daemon-core` can reach them
+// without depending on `fabric-iroh`. Re-exported here (and from `iroh_runtime`) so the
+// daemon's existing `fabric_iroh::process_group` / `daemon::process_group` paths keep
+// resolving unchanged until the daemon-core split repoints them at `proc_supervisor`.
+pub use proc_supervisor::process_group;
 
 // The frozen iroh-blobs ALPN + its compile-time `iroh_blobs::ALPN` cross-check live
 // in `transport_iroh` (co-located with the iroh-blobs get-protocol that uses them);

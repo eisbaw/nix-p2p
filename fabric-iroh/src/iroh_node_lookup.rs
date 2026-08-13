@@ -1059,7 +1059,7 @@ impl NodeLookupHandle {
                 "node lookup exceeded its absolute 10000 ms deadline",
             )
         })?
-        .map_err(map_runtime_error)?
+        .map_err(|error| map_runtime_error(error.into()))?
     }
 
     pub(crate) fn adapter(&self) -> NodeLookupAddressAdapter {
