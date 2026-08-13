@@ -92,6 +92,18 @@ HTTP_STACK_CRATES: frozenset[str] = frozenset(
         "tower",
         "tower-http",
         "tower-service",
+        # TLS transport stacks (TASK-24 daemon=rustls, TASK-22 testproxy=native-tls).
+        # Forward-carried from TASK-24/TASK-192: the denylist above forbids shared
+        # HTTP-LOGIC crates but said nothing about TLS, so nothing mechanically
+        # stopped the daemon's rustls from leaking into testproxy. Deny BOTH TLS
+        # stacks so the two independent wire witnesses cannot converge on one TLS
+        # implementation. The daemon reaches {rustls, tokio-rustls}; testproxy
+        # reaches {native-tls, openssl}; the two sets are disjoint, so no crate
+        # here is reachable by both - if a future change makes one so, this bites.
+        "rustls",
+        "tokio-rustls",
+        "native-tls",
+        "openssl",
     }
 )
 

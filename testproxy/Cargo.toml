@@ -4,12 +4,30 @@ description = "nix-p2p test fixture: local caching proxy fronting cache.nixos.or
 version.workspace = true
 edition.workspace = true
 
-# Deliberately dependency-free at scaffold time. The fixture must stay an
-# independent witness of wire behavior (PRD round 5), so it should not adopt
-# the daemon's HTTP stack. Note that `just independence` enforces "no shared
-# CRATE", not "no shared third-party dependency" - keeping these dependency
-# sets disjoint is task-2's and task-4's discipline, not a mechanical gate.
+# The fixture must stay an independent witness of wire behavior (PRD round 5),
+# so it must not adopt the daemon's HTTP stack. The HTTP surface stays
+# hand-rolled and std-only (see src/http.rs); the ONLY third-party dependency is
+# the TLS transport below, deliberately DISJOINT from the daemon's rustls.
 [dependencies]
+# TLS upstream transport (TASK-22): front cache.nixos.org over https. native-tls
+# is openssl-backed on Linux, giving a BLOCKING `TlsStream<TcpStream>` that
+# implements Read/Write - it slots straight into the hand-rolled blocking client
+# without pulling an async runtime. Chosen to stay DISJOINT from the daemon's
+# rustls (TASK-24): the two TLS stacks must never converge, since testproxy is
+# the independent wire-behavior witness. `scripts/check-independence.py` denies
+# BOTH native-tls and rustls and asserts the two components' TLS sets are
+# disjoint. Full chain + hostname/SNI verification is the default; there is NO
+# `danger_accept_invalid_*` on any production path (AC#3).
+native-tls = "0.2"
+
+[dev-dependencies]
+# Fixture-CA cert material for the TLS validation suite (AC#4), mirroring
+# TASK-24's approach: rcgen over the `ring` crypto backend (pinned so a future
+# rcgen default cannot pull aws-lc-rs) issues a valid-hostname leaf plus the
+# wrong-hostname / expired / untrusted-self-signed negatives. Certs are DATA; the
+# in-process TLS server AND client in the tests are native-tls, never rustls, so
+# the fixture stays disjoint from the daemon stack.
+rcgen = { version = "0.14", default-features = false, features = ["crypto", "ring", "pem"] }
 
 [lints]
 workspace = true

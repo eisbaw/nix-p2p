@@ -92,6 +92,14 @@
         version = cargoVersion;
         # A stale Cargo.lock is a hard error, never a silent regeneration.
         cargoExtraArgs = "--locked";
+        # native-tls (TASK-22): testproxy's TLS upstream uses the openssl-backed
+        # native-tls (a crate DISJOINT from the daemon's rustls). openssl-sys
+        # links the system openssl found via pkg-config, so both are build-time
+        # deps of the workspace. strictDeps keeps the split honest: pkg-config is
+        # a build tool (nativeBuildInputs), openssl a link target (buildInputs).
+        # The devShell inherits these via `checks`, so `nix develop` builds too.
+        nativeBuildInputs = [ pkgs.pkg-config ];
+        buildInputs = [ pkgs.openssl ];
       };
 
       # Workspace-wide dependency closure. Used ONLY by workspace-level checks
