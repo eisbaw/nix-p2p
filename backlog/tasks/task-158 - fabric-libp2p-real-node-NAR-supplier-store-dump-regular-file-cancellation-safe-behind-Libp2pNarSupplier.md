@@ -6,7 +6,7 @@ title: >-
 status: To Do
 assignee: []
 created_date: '2026-08-12 08:38'
-updated_date: '2026-08-13 09:42'
+updated_date: '2026-08-13 10:11'
 labels:
   - libp2p
   - fabric
@@ -33,5 +33,5 @@ TASK-151's Libp2pNarSupplier has only an in-memory source (MemoryNarSupplier, te
 ## Implementation Notes
 
 <!-- SECTION:NOTES:BEGIN -->
-Forward-carried from TASK-56 (commit 5ed5e72): the daemon-core AvailabilityIndex now asserts sha256(--dump)==registered NarHash at first serve and quarantines a mismatch (typed NarHashMismatch; hold!=Have, not announced, not in supply_catalog). For the fabric-libp2p real-node NAR supplier: the SERVE path must likewise never hand a peer bytes that do not match the announced identity. daemon-core's supply_raw_nar_cancellable already re-checks Blake3Digest::from_raw_nar(dump)==announced blake3 and FAILS LOUD on drift - mirror that discipline (verify-before-serve, cancellation-safe) rather than trusting the catalog record. Reuse the single-dump pattern (one --dump feeds the hash check; do not dump twice; bound per-serve RSS - streaming is still a documented honest limit, CommandNarDumper buffers).
+Forward-carried from TASK-56 regate (commit 3155ed0): the SIGN-SITE seed verification is now IN PLACE at the libp2p announce SSOT - verify_provider_seeds(seeds) runs as the first statement of announce_provider_seeds and asserts NarHashKey::from_raw_nar(bytes)==declared before any ProviderRecord is signed. When 158 wires the verified AvailabilityIndex in as the store-dump supplier: do NOT duplicate or bypass this guard. The bytes 158 feeds the provider still flow through announce_provider_seeds (or must), so the declared NarHash is checked against the actual dump there regardless of supply source (seed-nar OR index dump). If 158 introduces a NEW announce path that does not go through announce_provider_seeds, it MUST call verify_provider_seeds itself (or route through the SSOT). The typed error is daemon_libp2p::SeedNarHashMismatch.
 <!-- SECTION:NOTES:END -->

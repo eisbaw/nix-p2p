@@ -7,7 +7,7 @@ status: In Progress
 assignee:
   - '@me'
 created_date: '2026-08-09 00:10'
-updated_date: '2026-08-13 09:42'
+updated_date: '2026-08-13 10:11'
 labels:
   - wave-2
 dependencies:
@@ -40,20 +40,16 @@ task-50 honest limit: register() binds NarHashKey->store_path on the CALLER's wo
 ## Implementation Notes
 
 <!-- SECTION:NOTES:BEGIN -->
-READY FOR GATE (leaving In Progress; integrity surface -> DEEP review qa+codex). Landed in commit 5ed5e72 (10 files).
+REGATE READY (still In Progress; re-gates codex once more). Regate landed in commit 3155ed0 (6 files) on top of the original 5ed5e72.
 
-WHAT: AvailabilityIndex::derive re-derives sha256(--dump) from the SAME buffered bytes it BLAKE3s (no second dump) and asserts == the registration key. Mismatch -> DeriveOutcome::Quarantined(NarHashMismatch), cached in the per-entry digest slot (deterministic verdict computed ONCE, not re-dumped per probe; a dump FAILURE stays None -> retry). Typed AvailabilityError::NarHashMismatch: hold != Have, claim/publish do not announce, answer_batch -> logged Absent, never enters supply_catalog. sha2 added daemon-side (independence stays green - denylist is HTTP-only).
+GATE-BREAKER FIXED (codex NO-GO): the SHIPPED libp2p provider announced from --libp2p-seed-nar WITHOUT sha256(bytes)==declared-NarHash, so a mis-specified seed minted a FALSE CLAIM on the binary that ships (index check only guarded the future index-backed path). Now guarded at the mint SSOT: new verify_provider_seeds(seeds)->Result<(),SeedNarHashMismatch> (daemon-libp2p/src/lib.rs) reuses daemon_core::NarHashKey::from_raw_nar and runs as the FIRST statement of announce_provider_seeds (the loop BOTH thin binaries + the composite daemon call). Mismatch => typed error naming declared vs actual, whole batch refused before ANY record is signed/put. daemon re-exports verify_provider_seeds + SeedNarHashMismatch.
 
-REPRESENTATION (proved, not assumed): NarHashKey holds 32 RAW sha256 bytes; comparison is NarHashKey==NarHashKey in RAW-BYTE space, so there is NO base32-vs-hex trap in the check itself. New NarHashKey::from_raw_nar = sha256(RawNarV1), the sha256 twin of Blake3Digest::from_raw_nar. Two-part proof: (1) daemon-core KAT test vs published SHA-256 vectors (empty, "abc") proves recipe==standard sha256 + the nix-base32 Display round-trips; (2) scripts/check-golden-vectors.py ALREADY computes sha256(real nix-store --dump of the lib fixture) and asserts it == Nix's own committed nar_hash, cross-checking Rust vs Python nixbase32 - the real-path anchor.
+PROVIDER-LEVEL BITE (daemon-libp2p/tests/provider_seed_verification.rs): over a REAL DHT-joined provider, honest seed announces (Ok, signed record); mis-specified seed REFUSED (Err naming the mismatch). Mutation-proven RED: deleting verify_provider_seeds(seeds)? in announce_provider_seeds makes the mis-seed sign+announce a false record and return Ok (demonstrated: expect_err panics). Plus a cheap pure verify_provider_seeds bite. The restart-durable tests announced under ARBITRARY NarHashes (same closed gap) -> fixed to declare the NAR's true NarHash (removed the now-dead nar_hash_string helper).
 
-AC#1 BITE: daemon-core/tests/availability_narhash_verify.rs. Mutation-proven RED: deleting the  block in derive() makes hold(X) return Ok(Have{..}) (the false claim) - demonstrated locally (2 assertions flip). Honest positive path + quarantine-cache (dump once) also covered.
+LOW#3 fixed: a_quarantined_key test is now genuinely CONCURRENT (16 racing probes via Barrier+delay, single-flight dump-once) matching its description; added a direct answer_batch->Absent assertion for a quarantined key.
+LOW#2 fixed (doc): availability honest-limit note now states the RAW-FILE (non-store) immutability caveat explicitly - a RegularFileNarDumper path rewritten after Verified caching could give a stale positive CLAIM, but supply_raw_nar_cancellable re-checks BLAKE3 at serve so no wrong bytes reach a peer; /nix/store immutability makes it moot for store paths.
 
-GOTCHAS / carried lessons:
-- UNIT: hashed the UNCOMPRESSED --dump bytes (RawNarV1), same buffer as BLAKE3 - never a compressed form. (NarSize-vs-FileSize family.)
-- DUMP-ONCE: verification piggybacks the existing single-flight dump under the digest lock; the quarantine verdict is cached so a malicious/mis-registered key is NOT a per-probe re-dump (per-serve RSS, TASK-72/157/158).
-- TEST-DEBT REVEALED: many existing tests registered ARBITRARY keys (key_from(0xNN)) for synthetic NARs - only green because the binding was unverified. Fixed to register the TRUE NarHash (from_raw_nar). The 'same-digest siblings' scenario is now UNREACHABLE at the availability layer (key==digest once verified), so that invariant moved DOWN to a supply_catalog unit test where two same-digest owners are directly constructible.
+REGATE GATE (bounded, per coordinator): cargo build -p daemon-libp2p --locked OK; cargo clippy -p daemon-libp2p --all-targets -- -D warnings OK; cargo fmt --all --check OK; check-independence.py GREEN (sha2/daemon-libp2p fine); cargo test -p daemon-libp2p --locked = lib 7 + no_iroh_closure_guard 1 + production_path 1 + provider_seed_verification 2 + restart_durable 2, ALL PASS; cargo test -p daemon-core --locked = 126 lib + 5 narhash-verify + 2 run_gate, ALL PASS; cargo build -p daemon --lib --locked OK (re-export). Full just test NOT run (TASK-190 hang). Disk stayed ~122G (no cargo clean).
 
-GATE: just build OK; just lint OK (clippy -D warnings + fmt + independence GREEN with sha2 + ruff); cargo test -p daemon-core --locked = 126 lib + 4 narhash-verify + 2 run_gate, all pass. Also ran (not in the daemon-core gate) daemon --test availability_index (11 ok), the two touched serve_budget iroh tests (2 ok), discovery_resolve_fetch (2 ok). Full 'just test' NOT run (TASK-190 unrelated iroh hang). Disk fell to ~7G during iroh test builds - did not cargo clean (forbidden).
-
-HONEST LIMITS / follow-ups: quarantine verdict is in-memory only (re-checked after restart on first probe; correct, just not persisted) - persisted quarantine is an optimisation, not a correctness gap; noted in module docs. No new tracker filed (no deferred gap).
+HONEST LIMITS: sign_libp2p_provider_record itself stays pure/unguarded (returns ProviderRecord, not Result) - both SHIPPED binaries mint only via announce_provider_seeds so 100% of shipped mint paths are covered; a direct sign() caller (only daemon/tests/libp2p_provider_path.rs, a test) can still craft a record, which is test-only. No new tracker filed.
 <!-- SECTION:NOTES:END -->
