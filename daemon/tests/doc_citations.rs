@@ -144,10 +144,17 @@ const TEST_SOURCES: &[(&str, &str)] = &[
 const MIN_UNDERSCORES: usize = 3;
 
 /// Backticked snake_case words that are deliberately not item names.
-const NOT_ITEMS: &[(&str, &str)] = &[(
-    "nix_store_dump",
-    "Prose for the `nix-store --dump` command, not an item in this crate.",
-)];
+const NOT_ITEMS: &[(&str, &str)] = &[
+    (
+        "nix_store_dump",
+        "Prose for the `nix-store --dump` command, not an item in this crate.",
+    ),
+    (
+        "nar_size_uncompressed_nar",
+        "The persisted StoreProvision/registration field name (TASK-82 unit-trap doc), \
+         prose in a doc comment, not a test or item.",
+    ),
+];
 
 /// Every `fn`, `const`, `static` and `type` name defined anywhere we look.
 fn defined_items() -> BTreeSet<String> {
