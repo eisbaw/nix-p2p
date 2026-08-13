@@ -102,6 +102,14 @@ pub enum AnnounceError {
     Unreachable(String),
     /// The [`AnnounceBudget`] deadline elapsed before the publish completed.
     DeadlineExceeded,
+    /// The backend could not DURABLY persist the record's allocated sequence before
+    /// publishing, so it FAIL-CLOSED and did not announce (TASK-185, AC#3). Distinct from
+    /// [`Rejected`](AnnounceError::Rejected) (a record-level fault) and
+    /// [`Unreachable`](AnnounceError::Unreachable) (a network fault): here the record and the
+    /// network are fine, but announcing a record whose sequence is not on disk would let a
+    /// restart re-mint an already-published sequence and self-rollback, so the announce is
+    /// refused rather than made non-durable silently.
+    Persist(String),
 }
 
 impl std::fmt::Display for AnnounceError {
@@ -112,6 +120,9 @@ impl std::fmt::Display for AnnounceError {
                 write!(f, "publication substrate unreachable: {why}")
             }
             AnnounceError::DeadlineExceeded => f.write_str("announce deadline exceeded"),
+            AnnounceError::Persist(why) => {
+                write!(f, "durable sequence persist failed, not published: {why}")
+            }
         }
     }
 }
