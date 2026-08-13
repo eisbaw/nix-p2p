@@ -140,12 +140,17 @@
     "arm": {
       "type": "object",
       "additionalProperties": false,
+      "$comment": "connect_ms is the gated timing: the real pure-connect duration the peer measures around its bounded connect, injected UNCLAMPED so the finalizer's connect_ms<=11000 (deadline+grace) oracle can bite. It is absent only for the config-time wrong-url arm, which never reaches the network. elapsed_ms is the container wall-clock (connect+close+exchange) kept INFORMATIONAL and unbounded. captured_packets/received_by_filter/dropped_by_kernel/captured_pcap_records are tcpdump's own capture-completeness counters, re-derived from the bound capture.log + pcap by the finalizer so a zero-direct assertion cannot hide a kernel drop or a truncated pcap.",
       "required": [
         "scenario",
         "verdict",
         "relay_attributed",
         "captured_relay_packets",
         "captured_direct_peer_packets",
+        "captured_packets",
+        "received_by_filter",
+        "dropped_by_kernel",
+        "captured_pcap_records",
         "elapsed_ms"
       ],
       "properties": {
@@ -182,7 +187,12 @@
         "relay_attributed": { "type": "boolean" },
         "captured_relay_packets": { "type": "integer", "minimum": 0 },
         "captured_direct_peer_packets": { "type": "integer", "minimum": 0 },
-        "elapsed_ms": { "type": "integer", "minimum": 0, "maximum": 11000 }
+        "captured_packets": { "type": "integer", "minimum": 0 },
+        "received_by_filter": { "type": "integer", "minimum": 0 },
+        "dropped_by_kernel": { "type": "integer", "minimum": 0 },
+        "captured_pcap_records": { "type": "integer", "minimum": 0 },
+        "connect_ms": { "type": "integer", "minimum": 0, "maximum": 11000 },
+        "elapsed_ms": { "type": "integer", "minimum": 0 }
       }
     },
     "limitation": {
@@ -203,7 +213,8 @@
         "acceptor_network",
         "connector_subnet",
         "acceptor_subnet",
-        "relay_ip"
+        "relay_ip",
+        "acceptor_ip"
       ],
       "properties": {
         "run_id": { "type": "string", "pattern": "^[a-z0-9][a-z0-9-]{7,47}$" },
@@ -211,7 +222,8 @@
         "acceptor_network": { "type": "string", "minLength": 1 },
         "connector_subnet": { "type": "string", "minLength": 1 },
         "acceptor_subnet": { "type": "string", "minLength": 1 },
-        "relay_ip": { "type": "string", "minLength": 1 }
+        "relay_ip": { "type": "string", "minLength": 1 },
+        "acceptor_ip": { "type": "string", "minLength": 1 }
       }
     },
     "evidenceSummary": {

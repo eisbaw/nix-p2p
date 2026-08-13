@@ -27,7 +27,7 @@ use std::env;
 use std::io::Write as _;
 use std::net::SocketAddr;
 use std::process::ExitCode;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use daemon::{
     RELAY_CONNECT_DEADLINE, RELAY_SCHEDULER_GRACE, RelayConnectionPath,
@@ -442,8 +442,18 @@ async fn run_connect(config: &Config, relay: &RelayTransportConfig) -> serde_jso
     }
 
     let deadline = RELAY_CONNECT_DEADLINE;
-    let connect = tokio::time::timeout(deadline, endpoint.connect(endpoint_addr, EVIDENCE_ALPN));
-    let outcome = match connect.await {
+    // Measure the REAL connect duration: the wall time from just before the
+    // bounded connect starts polling to when it resolves (success, typed error,
+    // or the deadline elapsing). This is PURE connect time — it excludes
+    // endpoint.close, the post-connect message exchange and podman teardown, all
+    // of which contaminated the harness's old container-wall-clock `elapsed_ms`.
+    // It is injected UNCLAMPED so the finalizer's deadline oracle can actually
+    // bite (the old clamp censored 4 arms to exactly the schema max).
+    let connect_started = Instant::now();
+    let connect =
+        tokio::time::timeout(deadline, endpoint.connect(endpoint_addr, EVIDENCE_ALPN)).await;
+    let connect_ms = connect_started.elapsed().as_millis() as u64;
+    let mut outcome = match connect {
         Ok(Ok(conn)) => drive_connected(config, &endpoint, conn).await,
         Ok(Err(error)) => failure_json(config, map_connect_error(config, &error.to_string())),
         Err(_) => failure_json(
@@ -457,6 +467,9 @@ async fn run_connect(config: &Config, relay: &RelayTransportConfig) -> serde_jso
             ),
         ),
     };
+    if let Some(object) = outcome.as_object_mut() {
+        object.insert("connect_ms".to_string(), json!(connect_ms));
+    }
     endpoint.close().await;
     outcome
 }
@@ -737,6 +750,34 @@ mod tests {
             direct["relay_attributed"], false,
             "a direct-positive control must never be credited to the relay"
         );
+    }
+
+    #[test]
+    fn connect_outcomes_carry_an_injected_connect_ms() {
+        // run_connect injects the measured pure-connect duration into whatever
+        // outcome object it produces. Both a connected and an unavailable
+        // outcome are plain JSON objects, so the same injection applies; the
+        // finalizer gates this field UNCLAMPED, which is the whole point of F1.
+        let config = base(Role::Connect, Scenario::RelayOutage);
+        for mut outcome in [
+            success_json(
+                &config,
+                RelayConnectionPath::Relayed,
+                RelayConnectionPath::Relayed,
+                &"cd".repeat(32),
+            ),
+            failure_json(
+                &config,
+                RelayTransportUnavailable::new(RelayTransportUnavailableKind::Deadline, "deadline"),
+            ),
+        ] {
+            let connect_ms: u64 = 10_000;
+            outcome
+                .as_object_mut()
+                .unwrap()
+                .insert("connect_ms".to_string(), json!(connect_ms));
+            assert_eq!(outcome["connect_ms"], 10_000);
+        }
     }
 
     #[test]

@@ -21,7 +21,13 @@ driven.
 
 Each relayed connect attempt gets one absolute 10,000 ms deadline
 (`RELAY_CONNECT_DEADLINE`) with at most 1,000 ms scheduler grace
-(`RELAY_SCHEDULER_GRACE`). Path attribution uses the pure
+(`RELAY_SCHEDULER_GRACE`). The peer measures the REAL connect duration
+(`connect_ms`) around its own bounded connect and emits it UNCLAMPED, so the
+finalizer's `connect_ms <= 11000 ms` deadline oracle can actually bite; the
+container wall-clock (`elapsed_ms`, which also covers connection close and the
+post-connect exchange) is retained as informational-only and is never gated. The
+sole config-time arm (`wrong-url`) is rejected before any network I/O and carries
+no `connect_ms`. Path attribution uses the pure
 `daemon::classify_connection_path` on the accepting side and iroh's own per-path
 `is_relay()` on the selected path on the connecting side; only a `relayed` path
 is credited to the relay.
@@ -62,7 +68,15 @@ self-report.
 implementation commit and a canonical raw evidence directory. It binds the
 implementation commit/tree and committed blob hashes, the raw evidence manifest
 hash, the relay identity, per-arm typed outcomes and capture facts, and the
-limitations above. Missing or invalid evidence is a fatal validation error,
+limitations above. The verdict is bound to the CAPTURED bytes, not to the
+harness's self-reported numbers: the finalizer REQUIRES the exact per-arm pcap
+set plus each arm's `capture.log`, RE-PARSES every pcap to re-derive the relay
+and direct-peer packet counts (rejecting any disagreement with `run.json`), and
+re-checks tcpdump's own capture-completeness counters (zero kernel drops,
+captured == received-by-filter, and pcap records == captured) so a zero-direct
+assertion cannot hide a dropped or truncated capture. The raw pcaps + capture
+logs are retained alongside the artifact so the counts stay independently
+re-derivable. Missing or invalid evidence is a fatal validation error,
 never `no_go`; `no_go` is reserved for an evidenced capability constraint the
 reviewed implementation cannot provide, and TASK-89 must propagate that verdict.
 

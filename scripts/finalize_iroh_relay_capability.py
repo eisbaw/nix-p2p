@@ -37,6 +37,8 @@ from jsonschema import Draft202012Validator
 from jsonschema.exceptions import SchemaError
 
 import finalize_iroh_node_publication as publication
+import iroh_node_publication_evidence as capture_tools
+import iroh_relay_capability_evidence as harness
 
 ValidationError = publication.ValidationError
 canonical_json = publication.canonical_json
@@ -256,11 +258,20 @@ def validate_arm(scenario: str, arm: dict[str, object]) -> dict[str, object]:
     if verdict != spec["verdict"]:
         fail(f"{scenario}: expected verdict {spec['verdict']!r}, got {verdict!r}")
 
-    elapsed = require_int(arm.get("elapsed_ms"), f"{scenario}.elapsed_ms")
-    if elapsed > DEADLINE_MS + GRACE_MS:
-        fail(
-            f"{scenario}: elapsed {elapsed}ms exceeds the {DEADLINE_MS + GRACE_MS}ms bound"
-        )
+    # F1: gate the REAL connect duration, not the container wall-clock. The old
+    # elapsed_ms was clamped to the schema max by the harness, so the deadline
+    # oracle could never bite (4 arms reported exactly the bound). connect_ms is
+    # injected UNCLAMPED by the peer, so a connect that overran the deadline
+    # genuinely fails here. wrong-url is the sole config-time arm: it never
+    # reaches the network, so it legitimately carries no connect_ms.
+    require_int(arm.get("elapsed_ms"), f"{scenario}.elapsed_ms")  # informational
+    if scenario != "wrong-url":
+        connect_ms = require_int(arm.get("connect_ms"), f"{scenario}.connect_ms")
+        if connect_ms > DEADLINE_MS + GRACE_MS:
+            fail(
+                f"{scenario}: connect_ms {connect_ms}ms exceeds the "
+                f"{DEADLINE_MS + GRACE_MS}ms connect deadline+grace bound"
+            )
 
     relay_packets = require_int(
         arm.get("captured_relay_packets"), f"{scenario}.captured_relay_packets"
@@ -296,6 +307,89 @@ def validate_arm(scenario: str, arm: dict[str, object]) -> dict[str, object]:
         if attributed:
             fail(f"{scenario}: an unavailable arm must not be relay-attributed")
     return dict(arm)
+
+
+def rederive_and_bind_captures(
+    raw_root: Path,
+    arms_by_scenario: dict[str, dict[str, object]],
+    relay_ip: str,
+    acceptor_ip: str,
+) -> None:
+    """F2: bind the verdict to the CAPTURED evidence, not to run.json's numbers.
+
+    For every arm the finalizer REQUIRES its bound pcap + capture log, RE-PARSES
+    the pcap bytes to re-derive the relay/direct packet counts, and re-checks the
+    tcpdump capture-completeness counters. Any disagreement with run.json — a
+    missing pcap, a hand-authored count, a truncated capture, a kernel drop — is
+    rejected. This is what stops a plausible-looking run.json (or a text file
+    dressed up as a pcap) from ever finalizing to verdict=pass.
+    """
+    for scenario in ARM_SPECS:
+        arm = arms_by_scenario[scenario]
+        pcap_path = raw_root / f"{scenario}.pcap"
+        if not pcap_path.is_file():
+            fail(f"{scenario}: bound pcap {pcap_path.name} is missing")
+        log_path = raw_root / f"{scenario}.capture.log"
+        if not log_path.is_file():
+            fail(f"{scenario}: bound capture log {log_path.name} is missing")
+
+        data = pcap_path.read_bytes()
+        flows = harness.parse_pcap_flows(data)
+        records = harness.count_pcap_records(data)
+        relay_rederived = harness.count_endpoint_packets(
+            flows, relay_ip, harness.RELAY_HTTPS_PORT
+        )
+        direct_rederived = harness.count_endpoint_packets(
+            flows, acceptor_ip, harness.IROH_PORT
+        )
+        claimed_relay = require_int(
+            arm.get("captured_relay_packets"), f"{scenario}.captured_relay_packets"
+        )
+        claimed_direct = require_int(
+            arm.get("captured_direct_peer_packets"),
+            f"{scenario}.captured_direct_peer_packets",
+        )
+        if relay_rederived != claimed_relay:
+            fail(
+                f"{scenario}: run.json claims {claimed_relay} relay packet(s) but the "
+                f"bound pcap re-derives {relay_rederived}"
+            )
+        if direct_rederived != claimed_direct:
+            fail(
+                f"{scenario}: run.json claims {claimed_direct} direct-peer packet(s) "
+                f"but the bound pcap re-derives {direct_rederived}"
+            )
+
+        stats = capture_tools.parse_tcpdump_shutdown_stats(log_path.read_bytes())
+        if stats.dropped_by_kernel != 0:
+            fail(
+                f"{scenario}: tcpdump dropped {stats.dropped_by_kernel} packet(s) in "
+                "kernel; a zero-direct assertion is unsafe under capture loss"
+            )
+        if stats.captured != stats.received_by_filter:
+            fail(
+                f"{scenario}: tcpdump captured {stats.captured} but its filter received "
+                f"{stats.received_by_filter}; capture is incomplete"
+            )
+        if records != stats.captured:
+            fail(
+                f"{scenario}: bound pcap holds {records} record(s) but tcpdump captured "
+                f"{stats.captured}; pcap is truncated or is not the captured evidence"
+            )
+        # The harness also records these counters into run.json; require they
+        # match the capture log so a doctored run.json cannot mask a drop.
+        for key, expected in (
+            ("captured_packets", stats.captured),
+            ("received_by_filter", stats.received_by_filter),
+            ("dropped_by_kernel", stats.dropped_by_kernel),
+            ("captured_pcap_records", records),
+        ):
+            claimed = require_int(arm.get(key), f"{scenario}.{key}")
+            if claimed != expected:
+                fail(
+                    f"{scenario}: run.json {key}={claimed} disagrees with the bound "
+                    f"capture evidence {expected}"
+                )
 
 
 def validate_raw_run(raw_root: Path, implementation_commit: str) -> dict[str, object]:
@@ -337,6 +431,13 @@ def validate_raw_run(raw_root: Path, implementation_commit: str) -> dict[str, ob
     missing = set(ARM_SPECS) - set(seen)
     if missing:
         fail(f"raw run is missing arms: {sorted(missing)}")
+
+    topology = require_mapping(run.get("topology"), "run.json.topology")
+    relay_ip = require_string(topology.get("relay_ip"), "topology.relay_ip")
+    acceptor_ip = require_string(topology.get("acceptor_ip"), "topology.acceptor_ip")
+    # F2: bind the verdict to the captured bytes before trusting any of run.json's
+    # self-reported packet counts.
+    rederive_and_bind_captures(raw_root, seen, relay_ip, acceptor_ip)
 
     manifest = build_artifact_manifest(raw_root)
     summary = {
@@ -428,8 +529,16 @@ def _good_arm(scenario: str) -> dict[str, object]:
         "relay_attributed": spec.get("relay_attributed", False),
         "captured_relay_packets": 0,
         "captured_direct_peer_packets": 0,
+        "captured_packets": 0,
+        "received_by_filter": 0,
+        "dropped_by_kernel": 0,
+        "captured_pcap_records": 0,
         "elapsed_ms": 1200,
     }
+    # wrong-url is rejected at config time and never reaches the network, so it
+    # carries no measured connect_ms; every other arm does.
+    if scenario != "wrong-url":
+        arm["connect_ms"] = 1200
     if spec["verdict"] == "connected":
         arm["connection_path"] = spec["path"]
         if scenario == "relay-success":
@@ -472,6 +581,7 @@ def _good_summary() -> dict[str, object]:
             "connector_subnet": "10.208.1.0/24",
             "acceptor_subnet": "10.208.2.0/24",
             "relay_ip": "10.208.2.40",
+            "acceptor_ip": "10.208.2.10",
         },
         "deadline_ms": DEADLINE_MS,
         "grace_ms": GRACE_MS,
@@ -564,10 +674,18 @@ def self_test() -> None:
     arm["reason"] = "content_miss"
     _expect_rejected(lambda: validate_arm("wrong-url", arm), "wrong-url-bad-reason")
 
-    # 6. a deadline overrun.
+    # 6. a REAL connect-deadline overrun (F1): connect_ms past the bound now
+    # bites, where the old clamped elapsed_ms could never exceed the schema max.
     arm = _good_arm("half-open-stream")
-    arm["elapsed_ms"] = 11_001
-    _expect_rejected(lambda: validate_arm("half-open-stream", arm), "deadline-overrun")
+    arm["connect_ms"] = 11_001
+    _expect_rejected(
+        lambda: validate_arm("half-open-stream", arm), "connect-deadline-overrun"
+    )
+
+    # 6b. a network arm that drops connect_ms entirely must not dodge the gate.
+    arm = _good_arm("relay-outage")
+    del arm["connect_ms"]
+    _expect_rejected(lambda: validate_arm("relay-outage", arm), "missing-connect-ms")
 
     # 7. the schema rejects an n0/public relay URL and a non-pass verdict.
     bad = build_artifact(manifest, _good_summary(), implementation)
@@ -580,7 +698,136 @@ def self_test() -> None:
         lambda: validate_artifact_schema(bad, schema), "external-contact-authorized"
     )
 
+    # --- F2: the verdict is bound to the CAPTURED evidence (offline) ---
+    _self_test_capture_binding()
+
     print("iroh-relay-capability artifact finalizer self-test: PASS")
+
+
+# Relay/acceptor endpoints for the synthetic capture-binding self-test. The
+# ports come from the harness so the finalizer and the harness agree by
+# construction, not by a copied literal.
+_ST_RELAY_IP = "10.208.2.40"
+_ST_ACCEPTOR_IP = "10.208.2.10"
+_ST_CONNECTOR_IP = "10.208.1.10"
+
+
+def _capture_log(captured: int, received: int, dropped: int) -> bytes:
+    return (
+        f"tcpdump: listening on any\n{captured} packets captured\n"
+        f"{received} packets received by filter\n"
+        f"{dropped} packets dropped by kernel\n"
+    ).encode("ascii")
+
+
+def _synthetic_arm_packets(scenario: str) -> list[tuple[str, int, str, int, int]]:
+    """A per-scenario packet list whose relay/direct/total counts are internally
+    consistent, so a matching run.json + capture.log finalize cleanly and a
+    tampered one is caught by re-derivation."""
+    relay = (_ST_CONNECTOR_IP, 50000, _ST_RELAY_IP, harness.RELAY_HTTPS_PORT, 6)
+    direct = (_ST_CONNECTOR_IP, 50001, _ST_ACCEPTOR_IP, harness.IROH_PORT, 17)
+    noise = (_ST_CONNECTOR_IP, 50002, "10.208.2.42", harness.RELAY_HTTPS_PORT, 6)
+    return {
+        "relay-success": [relay] * 5,
+        "direct-positive": [direct] * 4,
+        "relay-outage": [noise] * 3,
+        "wrong-url": [],
+        "wrong-certificate": [noise] * 2,
+        "wrong-identity": [noise] * 2,
+        "half-open-stream": [relay] * 3,
+        "forced-direct-failure": [direct] * 2,
+    }[scenario]
+
+
+def _synthetic_capture_tree(root: Path) -> dict[str, dict[str, object]]:
+    """Write a consistent pcap + capture.log per arm and return the matching
+    run.json arm mapping."""
+    arms: dict[str, dict[str, object]] = {}
+    for scenario in ARM_SPECS:
+        packets = _synthetic_arm_packets(scenario)
+        relay_count = harness.count_endpoint_packets(
+            packets_to_flows(packets), _ST_RELAY_IP, harness.RELAY_HTTPS_PORT
+        )
+        direct_count = harness.count_endpoint_packets(
+            packets_to_flows(packets), _ST_ACCEPTOR_IP, harness.IROH_PORT
+        )
+        total = len(packets)
+        (root / f"{scenario}.pcap").write_bytes(harness.build_pcap(packets))
+        (root / f"{scenario}.capture.log").write_bytes(_capture_log(total, total, 0))
+        arm = _good_arm(scenario)
+        arm["captured_relay_packets"] = relay_count
+        arm["captured_direct_peer_packets"] = direct_count
+        arm["captured_packets"] = total
+        arm["received_by_filter"] = total
+        arm["dropped_by_kernel"] = 0
+        arm["captured_pcap_records"] = total
+        arms[scenario] = arm
+    return arms
+
+
+def packets_to_flows(
+    packets: list[tuple[str, int, str, int, int]],
+) -> list[tuple[str, int, str, int]]:
+    return [(src, sp, dst, dp) for src, sp, dst, dp, _proto in packets]
+
+
+def _self_test_capture_binding() -> None:
+    import tempfile
+
+    with tempfile.TemporaryDirectory() as raw:
+        root = Path(raw)
+        arms = _synthetic_capture_tree(root)
+        # A consistent tree re-derives cleanly.
+        rederive_and_bind_captures(root, arms, _ST_RELAY_IP, _ST_ACCEPTOR_IP)
+
+        # Bite 1: a hand-authored relay count that disagrees with the pcap.
+        tampered = {s: dict(a) for s, a in arms.items()}
+        tampered["relay-success"]["captured_relay_packets"] = 99
+        _expect_rejected(
+            lambda: rederive_and_bind_captures(
+                root, tampered, _ST_RELAY_IP, _ST_ACCEPTOR_IP
+            ),
+            "count-disagrees-with-pcap",
+        )
+
+        # Bite 2: a missing pcap (the withdrawn artifact hashed gitignored pcaps).
+        (root / "relay-success.pcap").unlink()
+        _expect_rejected(
+            lambda: rederive_and_bind_captures(
+                root, arms, _ST_RELAY_IP, _ST_ACCEPTOR_IP
+            ),
+            "missing-pcap",
+        )
+        _synthetic_capture_tree_repair(root, arms, "relay-success")
+
+        # Bite 3: a text file dressed up as a pcap (codex accepted this before).
+        (root / "relay-success.pcap").write_bytes(b"this is not a pcap file\n")
+        _expect_rejected(
+            lambda: rederive_and_bind_captures(
+                root, arms, _ST_RELAY_IP, _ST_ACCEPTOR_IP
+            ),
+            "text-file-as-pcap",
+        )
+        _synthetic_capture_tree_repair(root, arms, "relay-success")
+
+        # Bite 4: a capture that dropped packets in the kernel.
+        (root / "direct-positive.capture.log").write_bytes(_capture_log(4, 4, 1))
+        _expect_rejected(
+            lambda: rederive_and_bind_captures(
+                root, arms, _ST_RELAY_IP, _ST_ACCEPTOR_IP
+            ),
+            "kernel-drop",
+        )
+
+
+def _synthetic_capture_tree_repair(
+    root: Path, arms: dict[str, dict[str, object]], scenario: str
+) -> None:
+    packets = _synthetic_arm_packets(scenario)
+    (root / f"{scenario}.pcap").write_bytes(harness.build_pcap(packets))
+    (root / f"{scenario}.capture.log").write_bytes(
+        _capture_log(len(packets), len(packets), 0)
+    )
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:

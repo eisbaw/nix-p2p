@@ -521,6 +521,12 @@ def validate_outcome(scenario: str, outcome: dict[str, object]) -> None:
     if verdict != spec["verdict"]:
         fail(f"{scenario}: expected verdict {spec['verdict']!r}, got {verdict!r}")
 
+    # Every arm that reaches the network connect emits a measured connect_ms.
+    # wrong-url is rejected at CONFIG time (a non-https URL never touches the
+    # network), so it legitimately carries no connect_ms.
+    if scenario != "wrong-url" and not isinstance(outcome.get("connect_ms"), int):
+        fail(f"{scenario}: outcome is missing an integer connect_ms")
+
     if spec["verdict"] == "connected":
         path = outcome.get("connection_path")
         if path != spec["path"]:
@@ -558,6 +564,9 @@ def sample_outcome(scenario: str) -> dict[str, object]:
         "authorization_class": PROFILE,
         "external_contact_authorized": False,
     }
+    # Only the config-time wrong-url arm never reaches the network connect.
+    if scenario != "wrong-url":
+        base["connect_ms"] = 1200
     if spec["verdict"] == "connected":
         base.update(
             {
@@ -698,6 +707,31 @@ def count_endpoint_packets(
     return total
 
 
+def count_pcap_records(data: bytes) -> int:
+    """Count every complete record in a classic pcap, independent of link/L3
+    decode. This is the capture-completeness axis: it must equal tcpdump's
+    ``packets captured`` counter, so a truncated pcap (or a non-pcap file dressed
+    up as one) is caught. A trailing record whose body is cut short is NOT
+    counted, so truncation always undercounts and fails the equality check."""
+    if len(data) < 24:
+        return 0
+    if data[:4] == b"\xa1\xb2\xc3\xd4":
+        endian = ">"
+    elif data[:4] == b"\xd4\xc3\xb2\xa1":
+        endian = "<"
+    else:
+        return 0
+    offset = 24
+    count = 0
+    while offset + 16 <= len(data):
+        incl_len = struct.unpack(endian + "I", data[offset + 8 : offset + 12])[0]
+        if offset + 16 + incl_len > len(data):
+            break
+        offset += 16 + incl_len
+        count += 1
+    return count
+
+
 def cleanup_by_label(runner: publication.Runner, config: RunConfig, label: str) -> None:
     containers = runner.run(
         [config.podman, "ps", "-aq", "--filter", f"label={label}"], check=False
@@ -797,13 +831,40 @@ def run_arm(
         fail(f"{scenario}: connector exited unexpectedly with {exit_code}")
 
     outcome = read_outcome(runner, config, topology.connector(scenario))
-    # Flush and stop the capture, then count packets from the written pcap.
-    publication.signal_and_wait(
-        runner, config.podman, topology.capture(scenario), "INT", 10.0
-    )
-    flows = parse_pcap_flows(pcap.read_bytes())
+    # Flush and stop the capture, then read its shutdown log BEFORE any cleanup:
+    # tcpdump prints its captured/received/dropped counters to stderr on exit,
+    # and those counters are the capture-completeness evidence. A kernel drop or
+    # a filter/capture mismatch makes a zero-direct assertion unsafe, so the
+    # counters are preserved into the raw tree and re-checked by the finalizer.
+    capture_name = topology.capture(scenario)
+    publication.signal_and_wait(runner, config.podman, capture_name, "INT", 10.0)
+    capture_log = publication.container_logs(runner, config.podman, capture_name)
+    publication.write_new(config.output / f"{scenario}.capture.log", capture_log)
+    stats = publication.parse_tcpdump_shutdown_stats(capture_log)
+
+    pcap_bytes = pcap.read_bytes()
+    flows = parse_pcap_flows(pcap_bytes)
+    pcap_records = count_pcap_records(pcap_bytes)
     relay_packets = count_endpoint_packets(flows, topology.relay_ip, RELAY_HTTPS_PORT)
     direct_packets = count_endpoint_packets(flows, topology.acceptor_ip, IROH_PORT)
+
+    # Capture-completeness gate: only a complete, drop-free capture makes the
+    # zero-direct attribution trustworthy. The finalizer re-derives this exact
+    # check from the committed pcap + capture.log, so a run.json cannot claim it.
+    if stats.dropped_by_kernel != 0:
+        fail(
+            f"{scenario}: tcpdump dropped {stats.dropped_by_kernel} packet(s) in kernel"
+        )
+    if stats.captured != stats.received_by_filter:
+        fail(
+            f"{scenario}: tcpdump captured {stats.captured} but its filter received "
+            f"{stats.received_by_filter}; capture is incomplete"
+        )
+    if pcap_records != stats.captured:
+        fail(
+            f"{scenario}: pcap holds {pcap_records} record(s) but tcpdump captured "
+            f"{stats.captured}; pcap is truncated"
+        )
 
     if scenario in ACCEPTOR_ARMS:
         publication.signal_and_wait(
@@ -821,8 +882,19 @@ def run_arm(
         "relay_attributed": bool(outcome.get("relay_attributed")),
         "captured_relay_packets": relay_packets,
         "captured_direct_peer_packets": direct_packets,
-        "elapsed_ms": min(elapsed_ms, DEADLINE_MS + GRACE_MS),
+        "captured_packets": stats.captured,
+        "received_by_filter": stats.received_by_filter,
+        "dropped_by_kernel": stats.dropped_by_kernel,
+        "captured_pcap_records": pcap_records,
+        # elapsed_ms is the container wall-clock (gate-release -> connector exit):
+        # connect + close + exchange. Kept UNCLAMPED and INFORMATIONAL only. The
+        # gated timing is connect_ms below, the real pure-connect duration the
+        # peer measures around its bounded connect.
+        "elapsed_ms": elapsed_ms,
     }
+    connect_ms = outcome.get("connect_ms")
+    if isinstance(connect_ms, int):
+        arm["connect_ms"] = connect_ms
     if outcome["verdict"] == "connected":
         arm["connection_path"] = outcome["connection_path"]
     else:
@@ -883,6 +955,7 @@ def run_evidence(config: RunConfig) -> None:
                 "connector_subnet": topology.connector_subnet,
                 "acceptor_subnet": topology.acceptor_subnet,
                 "relay_ip": topology.relay_ip,
+                "acceptor_ip": topology.acceptor_ip,
             },
             "deadline_ms": DEADLINE_MS,
             "grace_ms": GRACE_MS,
@@ -1011,7 +1084,42 @@ def self_test() -> None:
             "unavailable-relay-attributed",
         )
 
+        # 6. A network arm that omits the measured connect_ms (F1): the gated
+        # timing must be present, so its absence is rejected.
+        mutated = sample_outcome("relay-outage")
+        del mutated["connect_ms"]
+        _expect_rejected(
+            lambda: validate_outcome("relay-outage", mutated), "missing-connect-ms"
+        )
+
+        # count_pcap_records must undercount a truncated tail (completeness bite).
+        whole = build_pcap([("10.0.0.1", 1, "10.0.0.2", 2, 6)] * 3)
+        assert count_pcap_records(whole) == 3, "a complete pcap counts every record"
+        assert count_pcap_records(whole[:-4]) == 2, (
+            "a truncated trailing record must not be counted"
+        )
+        assert count_pcap_records(b"not a pcap at all") == 0
+
     print("iroh-relay-capability evidence self-test: PASS")
+
+
+def build_pcap(packets: list[tuple[str, int, str, int, int]]) -> bytes:
+    """Build a minimal big-endian classic pcap (raw-IPv4 linktype 101) carrying
+    one IPv4 TCP/UDP packet per tuple ``(src_ip, src_port, dst_ip, dst_port,
+    proto)``. Shared by the harness completeness bite and, via re-parse, the
+    finalizer's evidence-binding self-test."""
+    header = b"\xa1\xb2\xc3\xd4" + struct.pack(">HHiIII", 2, 4, 0, 0, 65535, 101)
+    out = bytearray(header)
+    for src_ip, src_port, dst_ip, dst_port, proto in packets:
+        ip = bytearray(24)
+        ip[0] = 0x45
+        ip[9] = proto
+        ip[12:16] = bytes(int(octet) for octet in src_ip.split("."))
+        ip[16:20] = bytes(int(octet) for octet in dst_ip.split("."))
+        struct.pack_into(">H", ip, 20, src_port)
+        struct.pack_into(">H", ip, 22, dst_port)
+        out += struct.pack(">IIII", 0, 0, len(ip), len(ip)) + bytes(ip)
+    return bytes(out)
 
 
 def _expect_rejected(operation, label: str) -> None:
