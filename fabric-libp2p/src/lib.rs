@@ -109,7 +109,7 @@ mod server;
 mod swarm;
 mod transport;
 
-pub use announcer::Libp2pAvailabilityAnnouncer;
+pub use announcer::{Libp2pAvailabilityAnnouncer, MAX_RECORD_TTL_SECS};
 pub use directory::Libp2pProviderDirectory;
 pub use fabric::Libp2pFabric;
 pub use keys::VALUE_KEY_CONTEXT;

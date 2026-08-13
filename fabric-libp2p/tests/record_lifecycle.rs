@@ -24,10 +24,10 @@
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use ed25519_dalek::SigningKey;
-use fabric_libp2p::{Libp2pFabric, Multiaddr, NodeConfig, PeerId};
+use fabric_libp2p::{Libp2pFabric, MAX_RECORD_TTL_SECS, Multiaddr, NodeConfig, PeerId};
 use peer_fabric::{
-    AnnounceBudget, Blake3Digest, ContentKey, DiscoveryBudget, Lookup, NodeId, PeerFabric,
-    ProviderRecord, TransportOffer, sign_provider_record,
+    AnnounceBudget, AnnounceError, Blake3Digest, ContentKey, DiscoveryBudget, Lookup, NodeId,
+    PeerFabric, ProviderRecord, TransportOffer, sign_provider_record,
 };
 
 /// Bring up a node listening on an ephemeral loopback TCP port; returns the fabric and
@@ -107,6 +107,56 @@ fn signed_record(
         signature: [0u8; 64],
     };
     (key, sign_provider_record(&signing_key, &record))
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn announce_rejects_an_over_cap_record_ttl() {
+    // TASK-176 #2 BITE (announce-side policy): an over-cap record TTL is REJECTED on the
+    // sender, fail-fast, BEFORE any network op (no bootstrap needed). This is what lets
+    // the tombstone floor (>= the cap) guarantee it outlives any record. Mutation: remove
+    // the announce TTL-cap check and this record announces (or reaches the network) rather
+    // than being Rejected - the assertion fails.
+    let _ = tracing_subscriber::fmt::try_init();
+    let (node, _addr) = start_node(7, "lifecycle-ttl-cap").await;
+
+    // A record whose TTL exceeds the cap by an hour. The seed matches the node identity so
+    // it passes the self-serve provider check and reaches the TTL gate.
+    let over_cap_ttl = MAX_RECORD_TTL_SECS + 3600;
+    let (_key, record) = signed_record(7, [0x33u8; 32], 1, over_cap_ttl);
+    let result = node
+        .announcer()
+        .unwrap()
+        .announce(&record, &AnnounceBudget::new(Duration::from_secs(5), 20))
+        .await;
+    match result {
+        Err(AnnounceError::Rejected(why)) => {
+            assert!(
+                why.contains("cap"),
+                "the rejection must name the TTL cap, got: {why}"
+            );
+        }
+        other => panic!("an over-cap record TTL must be Rejected, got: {other:?}"),
+    }
+
+    // Control: a record exactly AT the cap passes the TTL gate (it does not reach the
+    // network here, but it is NOT rejected by the cap - it would proceed to publish). We
+    // assert the cap is the ONLY thing that changed by checking a within-cap record does
+    // not fail with the cap message.
+    let (_k2, ok_record) = signed_record(7, [0x34u8; 32], 1, MAX_RECORD_TTL_SECS);
+    if let Err(AnnounceError::Rejected(why)) = node
+        .announcer()
+        .unwrap()
+        .announce(
+            &ok_record,
+            &AnnounceBudget::new(Duration::from_millis(300), 20),
+        )
+        .await
+    {
+        assert!(
+            !why.contains("cap"),
+            "a record AT the cap must not be rejected for exceeding it, got: {why}"
+        );
+    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

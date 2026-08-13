@@ -14,25 +14,22 @@
 //! tombstone, the frozen record_store applies it as Withdrawn, and the provider stops
 //! being returned.
 //!
-//! ## Honest limits of the retraction (do not over-read "actively retracted")
+//! ## Retraction guarantees (TASK-176 closed the TASK-152 limits)
 //!
-//! The retraction is EFFECTIVE, not unconditional. It is bounded by the in-memory
-//! sequence tracking (below):
-//!   * A withdrawal is only network-effective if it lands at a sequence STRICTLY NEWER
-//!     than the record every consumer already observed. In the SAME process as the
-//!     announce this holds (the tracked sequence + 1). After a RESTART the announcer's
-//!     tracking is empty, so it mints sequence 1, which LOSES to any consumer whose floor
-//!     is already at the record's real sequence - the withdrawal is silently ineffective.
-//!     A restart-durable per-key counter is the fix and is deferred (TASK-176).
-//!   * The tombstone only SUPPRESSES resurrection for its own `expiry` window. When the
-//!     retracted record's sequence/expiry are KNOWN (same-process), the tombstone is given
-//!     an expiry `>=` the record's, so it outlives it. When they are UNKNOWN (post-restart,
-//!     or a key this process never announced) the tombstone gets only a fixed floor TTL;
-//!     against a record published with a LONGER TTL there is a RESURRECTION WINDOW between
-//!     the tombstone lapsing and the record's own expiry. Record TTLs are unbounded today,
-//!     so no fixed floor can close this; bounding record TTL at announce is the real fix
-//!     (TASK-176). `withdraw` returns `Ok` in all these cases - success means "the
-//!     tombstone was published", NOT "every cache is provably retracted".
+//! The retraction is EFFECTIVE. Two properties, each once an honest limit, now hold:
+//!   * DURABLE SEQUENCE (TASK-176 #1). A withdrawal is network-effective only if it lands
+//!     at a sequence STRICTLY NEWER than the record every consumer already observed. The
+//!     per-key sequence floor is now persisted (the `durable` constructor), so a restarted
+//!     provider re-seeds it and mints `last.sequence + 1` rather than losing at sequence 1.
+//!     An in-memory (non-durable) announcer still loses its counter on restart - the
+//!     documented cost of running without a state dir.
+//!   * TOMBSTONE OUTLIVES THE RECORD (TASK-176 #2). Record TTL is now CAPPED at announce
+//!     ([`MAX_RECORD_TTL_SECS`]), and the tombstone floor ([`MIN_TOMBSTONE_TTL_SECS`]) is
+//!     `>=` that cap (compile-time-pinned). So a withdrawal at `now` mints a tombstone with
+//!     `expiry >= now + cap >= any record's expiry` - even POST-RESTART, when the retracted
+//!     record's own expiry is unknown. The resurrection window is closed, not merely
+//!     narrowed. `withdraw` still returns `Ok` meaning "the tombstone was published"; DHT
+//!     propagation delay (not a resurrection window) remains the only gap.
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -51,15 +48,39 @@ use peer_fabric::{
 use crate::keys::{provider_index_key, provider_value_key};
 use crate::swarm::SwarmHandle;
 
+/// The maximum record TTL (`expiry - now`) an announce will publish, in seconds
+/// (TASK-176 #2). Record expiry is provider-chosen; left unbounded, a record with a
+/// very long TTL creates a RESURRECTION WINDOW a fixed-TTL tombstone cannot cover (and
+/// keeps a floor pinned in the consumer store far longer than steady state needs). 24h
+/// is a generous refresh cadence for a stable provider - well above kad's own record
+/// republish interval - while making the tombstone floor below able to guarantee it
+/// outlives any record. `announce` REJECTS (fail fast on the sender) a record whose TTL
+/// exceeds this: the record is SIGNED above the seam, so the backend cannot clamp its
+/// expiry without invalidating the signature - the honest move is to refuse it and let
+/// the caller sign a shorter-lived record.
+pub const MAX_RECORD_TTL_SECS: u64 = 86_400;
+
 /// The FLOOR lifetime, in seconds, a minted withdrawal tombstone is given when the
-/// retracted record's own remaining TTL is shorter or unknown. A tombstone should ideally
-/// outlive the record it retracts (else a cache resurrects the record after the tombstone
-/// lapses but before the record's own expiry). When the record's expiry is KNOWN we use
-/// MAX(that, now + this) and the tombstone outlives it; when UNKNOWN (post-restart) this
-/// is only a best-effort floor and a longer-TTL record has a resurrection window (see the
-/// module doc). This is NOT a guaranteed bound - closing it needs a record-TTL cap
-/// (TASK-176), which does not exist yet.
-const MIN_TOMBSTONE_TTL_SECS: u64 = 3600;
+/// retracted record's own remaining TTL is shorter or unknown. A tombstone MUST outlive
+/// the record it retracts, else a cache resurrects the record after the tombstone lapses
+/// but before the record's own expiry. Set to [`MAX_RECORD_TTL_SECS`] so the bound is
+/// UNCONDITIONAL: a record announced at `t0` has `expiry <= t0 + MAX_RECORD_TTL_SECS`,
+/// and a withdrawal at `now >= t0` mints a tombstone with `expiry >= now +
+/// MAX_RECORD_TTL_SECS >= t0 + MAX_RECORD_TTL_SECS >= record.expiry` - even POST-RESTART,
+/// when the retracted record's own expiry is unknown. This closes the resurrection window
+/// TASK-152 documented as an honest limit; it works ONLY because record TTL is now capped.
+const MIN_TOMBSTONE_TTL_SECS: u64 = MAX_RECORD_TTL_SECS;
+
+/// COMPILE-TIME pin of the tombstone-outlives-the-record invariant (TASK-176 #2): the
+/// tombstone floor must be `>=` the record-TTL cap, or a max-TTL record announced just
+/// before a post-restart withdrawal would outlive its own tombstone and resurrect. This
+/// fails the build the moment someone lowers the tombstone floor below the record cap, so
+/// the invariant is greppable and enforced, not merely documented.
+const _: () = assert!(
+    MIN_TOMBSTONE_TTL_SECS >= MAX_RECORD_TTL_SECS,
+    "the withdrawal tombstone floor must outlive the longest record TTL, or a \
+     post-restart withdrawal leaves a resurrection window against a max-TTL record"
+);
 
 /// The kad-backed [`AvailabilityAnnouncer`].
 pub struct Libp2pAvailabilityAnnouncer {
@@ -260,6 +281,21 @@ impl AvailabilityAnnouncer for Libp2pAvailabilityAnnouncer {
                 record.expiry, now
             )));
         }
+        // Bound the record TTL (TASK-176 #2): an over-cap expiry is REJECTED, not clamped
+        // - the record is signed above the seam, so clamping would invalidate the
+        // signature. Fail fast on the sender with the cap, so the caller re-signs a
+        // shorter-lived record. This is what makes the tombstone floor (>= the cap) able
+        // to guarantee "tombstone outlives the record" even post-restart.
+        if record.expiry - now > MAX_RECORD_TTL_SECS {
+            return Err(AnnounceError::Rejected(format!(
+                "record TTL {}s exceeds the {}s cap (expiry {} at now {}); \
+                 sign a shorter-lived record",
+                record.expiry - now,
+                MAX_RECORD_TTL_SECS,
+                record.expiry,
+                now
+            )));
+        }
         let expires = Some(Instant::now() + Duration::from_secs(record.expiry - now));
 
         // Encode the FROZEN wire form (rejects an over-cap / non-canonical record on
@@ -452,5 +488,32 @@ mod tests {
             decode_provider_assertion(&bytes, &k, now).is_ok(),
             "a minted tombstone must be fresh and self-verifying"
         );
+    }
+
+    #[test]
+    fn a_post_restart_tombstone_outlives_any_capped_record() {
+        // TASK-176 #2 BITE: the WORST case for resurrection is a post-restart withdrawal
+        // (`last` unknown -> the tombstone gets only the floor TTL) racing a record
+        // published at the MAXIMUM allowed TTL just before `now`. The tombstone must still
+        // outlive it. Because MIN_TOMBSTONE_TTL_SECS == MAX_RECORD_TTL_SECS, it does.
+        // Mutation: drop MIN_TOMBSTONE_TTL_SECS below MAX_RECORD_TTL_SECS and this fails
+        // (and the compile-time `const _` pin refuses to build) - the invariant bites two
+        // ways.
+        let sk = signer(9);
+        let k = key(3);
+        let now = 1_000_000;
+        // A max-TTL record published at t0 <= now: its expiry is at most t0 + cap <= now + cap.
+        let worst_case_record_expiry = now + MAX_RECORD_TTL_SECS;
+        let tombstone = mint_withdrawal(&sk, &k, None, now); // post-restart: last unknown
+        assert!(
+            tombstone.expiry >= worst_case_record_expiry,
+            "a post-restart tombstone (expiry {}) must outlive a max-TTL record \
+             (expiry {})",
+            tombstone.expiry,
+            worst_case_record_expiry
+        );
+        // (The MIN_TOMBSTONE_TTL_SECS >= MAX_RECORD_TTL_SECS invariant itself is pinned at
+        // COMPILE TIME by the `const _` assertion above, so it is not restated here as a
+        // runtime const-assert.)
     }
 }
