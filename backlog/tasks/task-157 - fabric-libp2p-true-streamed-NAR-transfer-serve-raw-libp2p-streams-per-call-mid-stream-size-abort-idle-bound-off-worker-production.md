@@ -3,11 +3,11 @@ id: TASK-157
 title: >-
   fabric-libp2p: true streamed NAR transfer/serve (raw libp2p streams) -
   per-call mid-stream size abort + idle bound + off-worker production
-status: In Progress
+status: Done
 assignee:
   - '@claude'
 created_date: '2026-08-12 08:38'
-updated_date: '2026-08-13 17:46'
+updated_date: '2026-08-13 18:02'
 labels:
   - libp2p
   - fabric
@@ -28,9 +28,9 @@ TASK-151's libp2p transport uses request-response, which BUFFERS the whole NAR. 
 
 ## Acceptance Criteria
 <!-- AC:BEGIN -->
-- [ ] #1 the fetch side aborts a transfer the instant cumulative bytes exceed the per-call expected_size (mid-stream), proven by a bite test
-- [ ] #2 the SafetyEnvelope body_idle_timeout is enforced as a real inter-chunk stall guard (not just total_timeout)
-- [ ] #3 serve production runs OFF the swarm worker so a large serve does not block kad/discovery
+- [x] #1 the fetch side aborts a transfer the instant cumulative bytes exceed the per-call expected_size (mid-stream), proven by a bite test
+- [x] #2 the SafetyEnvelope body_idle_timeout is enforced as a real inter-chunk stall guard (not just total_timeout)
+- [x] #3 serve production runs OFF the swarm worker so a large serve does not block kad/discovery
 <!-- AC:END -->
 
 ## Implementation Notes
@@ -88,3 +88,9 @@ BOUNDED GATE (inside nix develop, NOT full just test - orchestrator runs that): 
 
 RE-GATE: codex re-checks the Memory-path reservation-through-write (exactly-once release on all paths), the two strengthened bites, and the total_timeout scope.
 <!-- SECTION:NOTES:END -->
+
+## Final Summary
+
+<!-- SECTION:FINAL_SUMMARY:BEGIN -->
+Replaced the libp2p request-response NAR carrier (buffered whole NAR, 256 MiB cap, post-receive size check, inline serve on the poll thread) with a raw libp2p-stream protocol /nix-p2p/<scope>/nar/2. AC#1 the fetcher aborts MID-STREAM the instant cumulative bytes exceed the per-call expected_size (<= one 64KiB overshoot; two-node 1MiB-served/4KiB-bound bite). AC#2 a real inter-chunk body_idle_timeout (fresh per-read timeout, re-armed each chunk), distinct from total_timeout. AC#3 serve production streams off the swarm worker (per-stream tasks; kad stays responsive during a slow serve). The in-flight byte ceiling is a CAS reserve whose InflightReservation guard is held THROUGH the write for BOTH Memory and Process serves (released exactly once on every path), so a never-reading consumer cannot bypass it (mutation-proven ceiling bite). total_timeout now bounds the WHOLE fetch (resolution+dial+request+response). Gate-1 BLAKE3(RawNarV1) verified at stream completion (no bad store path); the serve side still rechecks len+BLAKE3 before shipping. Frozen wire untouched (only the transport protocol name /nar/1->/nar/2). DEEP-gated: codex NO-GO (Memory-path reservation dropped before write -> ceiling bypass) -> held-through-write on both paths -> codex GO; full just test 677/0. Honest limits (TASK-197): per-chunk verify (currently at completion) + serve-side buffer-before-ship both need a bao outboard on the stream wire. libp2p-stream stays disjoint from testproxy (independence green).
+<!-- SECTION:FINAL_SUMMARY:END -->
