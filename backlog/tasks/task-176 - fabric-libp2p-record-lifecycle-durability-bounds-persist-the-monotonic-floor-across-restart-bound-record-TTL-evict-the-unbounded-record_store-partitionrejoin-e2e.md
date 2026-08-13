@@ -4,9 +4,11 @@ title: >-
   fabric-libp2p record-lifecycle durability + bounds: persist the monotonic
   floor across restart, bound record TTL, evict the unbounded record_store,
   partition+rejoin e2e
-status: To Do
-assignee: []
+status: In Progress
+assignee:
+  - mped
 created_date: '2026-08-12 20:01'
+updated_date: '2026-08-13 02:52'
 labels:
   - libp2p
   - fabric
@@ -39,3 +41,14 @@ Also consider surfacing withdraw()'s 'published but not provably retracted' sema
 - [ ] #3 The consumer record_store is bounded (TTL/LRU eviction); resolving many attacker-chosen keys does not grow memory without bound
 - [ ] #4 Multi-node e2e for restart, corrupted-state-at-composite-key, and partition+rejoin - no lost updates, no resurrection; each mutation-bites
 <!-- AC:END -->
+
+## Implementation Plan
+
+<!-- SECTION:PLAN:BEGIN -->
+Land incrementally (commit each green), priority #3 then #1 then #2 then #4.
+INC-A (#3 DoS): extend frozen record_store with GC/query API (slot_count, contains_slot, evict_expired, remove_slot) + a SlotFloor export/restore; add fabric-libp2p FloorStore wrapping ProviderRecordSet with a hard entry CAP + TTL sweep + LRU eviction; wire into directory.rs. Prove: resolving many distinct keys never exceeds cap (mutation: drop eviction -> grows).
+INC-B (#1 restart-durable): on-disk text floor file (greppable, git-friendly) for the directory floors + announcer per-key seq map; thread state_dir Option<PathBuf> through NodeConfig -> fabric -> directory/announcer; load on construct, atomic-rewrite on change. Prove: FloorStore round-trip through a real file rejects a rolled-back seq post-restart (mutation: skip load/write -> admitted).
+INC-C (#2 TTL cap): announce-side reject expiry > now+MAX_RECORD_TTL_SECS (fail fast; record is signed above the seam so cannot clamp); raise MIN_TOMBSTONE_TTL_SECS >= cap with a compile-time pin so tombstone provably outlives any capped record even post-restart. Prove: over-cap announce Rejected; post-restart tombstone.expiry >= now+cap.
+INC-D (#4 e2e): record_lifecycle.rs multi-node provider-restart (state_dir preserved, newer honored, no resurrection), corrupted-state-at-composite-key (crate-internal put helper), partition+rejoin, expiry e2e. Each mutation-bites.
+FROZEN: no change to record_codec wire bytes / ProviderRecord/ContentKey layout; record_store GC+persistence API is validation/GC, not wire.
+<!-- SECTION:PLAN:END -->

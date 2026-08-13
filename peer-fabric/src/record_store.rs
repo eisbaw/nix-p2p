@@ -102,6 +102,34 @@ impl Slot {
             Slot::Withdrawn { sequence, .. } => *sequence,
         }
     }
+
+    /// When this slot stops being valid (a live record's own expiry, or the
+    /// tombstone's own expiry). The moment `now >= expiry`, the slot no longer
+    /// serves anything AND any assertion at-or-below its sequence is itself expired
+    /// (decode rejects it as `Stale`), so a GC that drops an expired slot cannot
+    /// reopen a rollback the slot was still guarding.
+    fn expiry(&self) -> u64 {
+        match self {
+            Slot::Active(r) => r.expiry,
+            Slot::Withdrawn { expiry, .. } => *expiry,
+        }
+    }
+}
+
+/// A durable snapshot of one `(key, provider)` slot's monotonic floor, for the
+/// backend's DURABLE SEQUENCE obligation (the frozen module doc names it): a restarted
+/// consumer/provider re-seeds its floor from these so a rolled-back record replayed
+/// after the restart still loses. It carries the FULL active record (so a re-fetch of
+/// the same record after restart is `Idempotent` and stays live), or the tombstone's
+/// sequence+expiry. Serialization is the BACKEND's concern (on-disk / Git); this type
+/// only names the state the store must be able to export and re-seed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SlotFloor {
+    /// The live positive record at the floor (kept whole so an identical re-fetch is
+    /// idempotent, not a spurious conflict).
+    Active(ProviderRecord),
+    /// A tombstone floor: the highest sequence seen and when the tombstone lapses.
+    Withdrawn { sequence: u64, expiry: u64 },
 }
 
 /// The in-memory provider directory oracle: `key -> (provider -> slot)`. Enforces the
@@ -210,6 +238,96 @@ impl ProviderRecordSet {
                 _ => None,
             })
             .collect()
+    }
+
+    // ---------------------------------------------------------------------
+    // GC + query API (TASK-176). The frozen module doc explicitly HANDS GC to the
+    // backend ("a real DHT GCs it by TTL; that is the backend's job"): these are that
+    // GC surface plus the durable-floor export/restore the DURABLE SEQUENCE obligation
+    // needs. They add NO wire form and change NO `apply` decision - a set with no
+    // eviction and no restore behaves exactly as before.
+
+    /// The total number of `(key, provider)` slots held (active + tombstoned). The
+    /// quantity a bounded backend caps: `provider` is attacker-choosable, so resolving
+    /// attacker-chosen keys grows this without a cap (the memory/DoS vector TASK-176
+    /// closes). O(number of keys).
+    pub fn slot_count(&self) -> usize {
+        self.by_key.values().map(HashMap::len).sum()
+    }
+
+    /// Whether a slot exists for `(key, provider)` (active or tombstoned). Lets a
+    /// bounded backend tell a NEW slot (which may need to evict to stay under its cap)
+    /// from a refresh of an existing one (which does not grow the set).
+    pub fn contains_slot(&self, key: &ContentKey, provider: &NodeId) -> bool {
+        self.by_key
+            .get(key)
+            .is_some_and(|providers| providers.contains_key(provider))
+    }
+
+    /// Drop every slot whose own expiry has passed (`expiry <= now`), returning how
+    /// many were removed. SAFE against rollback: an expired slot's sequence can only be
+    /// re-offered by an assertion that is ITSELF expired (decode rejects it as `Stale`),
+    /// so forgetting the floor cannot reopen a rollback it was still guarding. Empty key
+    /// maps are pruned so `slot_count` reflects only live state.
+    pub fn evict_expired(&mut self, now: u64) -> usize {
+        let mut removed = 0;
+        self.by_key.retain(|_key, providers| {
+            let before = providers.len();
+            providers.retain(|_provider, slot| slot.expiry() > now);
+            removed += before - providers.len();
+            !providers.is_empty()
+        });
+        removed
+    }
+
+    /// Forcibly forget one `(key, provider)` slot, returning whether it existed. This is
+    /// the backend's eviction primitive (e.g. LRU when a hard entry cap is hit).
+    /// Forgetting a still-live floor DEGRADES that slot to session-fresh (a subsequent
+    /// rollback below it would no longer be caught until the newer sequence is
+    /// re-observed) - the SAME anti-rollback residue a restart has - so a backend evicts
+    /// expired slots first and live floors only under memory pressure.
+    pub fn remove_slot(&mut self, key: &ContentKey, provider: &NodeId) -> bool {
+        let Some(providers) = self.by_key.get_mut(key) else {
+            return false;
+        };
+        let existed = providers.remove(provider).is_some();
+        if providers.is_empty() {
+            self.by_key.remove(key);
+        }
+        existed
+    }
+
+    /// Export every slot's durable floor (TASK-176, the DURABLE SEQUENCE obligation), so
+    /// a backend can persist it and re-seed after a restart. Order is unspecified.
+    pub fn export_floors(&self) -> Vec<(ContentKey, NodeId, SlotFloor)> {
+        let mut out = Vec::with_capacity(self.slot_count());
+        for (key, providers) in &self.by_key {
+            for (provider, slot) in providers {
+                let floor = match slot {
+                    Slot::Active(record) => SlotFloor::Active(record.clone()),
+                    Slot::Withdrawn { sequence, expiry } => SlotFloor::Withdrawn {
+                        sequence: *sequence,
+                        expiry: *expiry,
+                    },
+                };
+                out.push((*key, *provider, floor));
+            }
+        }
+        out
+    }
+
+    /// Re-seed one `(key, provider)` slot from a persisted [`SlotFloor`] (TASK-176). This
+    /// SETS the floor directly (trusted persisted state loaded at startup), so it does
+    /// NOT run the monotonic `apply` gate - the caller reconstructs a floor this node
+    /// already advanced past before it restarted. After restore, an `apply` of a record
+    /// at-or-below the restored sequence is rejected exactly as if the node had never
+    /// stopped. Intended for load-time only.
+    pub fn restore_floor(&mut self, key: ContentKey, provider: NodeId, floor: SlotFloor) {
+        let slot = match floor {
+            SlotFloor::Active(record) => Slot::Active(record),
+            SlotFloor::Withdrawn { sequence, expiry } => Slot::Withdrawn { sequence, expiry },
+        };
+        self.by_key.entry(key).or_default().insert(provider, slot);
     }
 }
 
@@ -463,5 +581,106 @@ mod tests {
         assert_eq!(set.find_providers(&key(1), 500).len(), 1);
         assert_eq!(set.find_providers(&key(2), 500).len(), 1);
         assert!(set.find_providers(&key(3), 500).is_empty());
+    }
+
+    // --- GC + query API (TASK-176). ---
+
+    #[test]
+    fn slot_count_and_contains_track_the_set() {
+        // BITE for the bounded-backend primitives: slot_count is the quantity a cap
+        // bounds, contains_slot tells a new slot from a refresh. Two providers under one
+        // key are two slots; a third key is a third.
+        let mut set = ProviderRecordSet::new();
+        assert_eq!(set.slot_count(), 0);
+        set.apply(&provide(key(1), provider(1), 1, 1_000), 0);
+        set.apply(&provide(key(1), provider(2), 1, 1_000), 0);
+        set.apply(&provide(key(2), provider(1), 1, 1_000), 0);
+        assert_eq!(set.slot_count(), 3);
+        assert!(set.contains_slot(&key(1), &provider(2)));
+        assert!(!set.contains_slot(&key(1), &provider(3)));
+        // A refresh does NOT grow the count.
+        set.apply(&provide(key(1), provider(1), 2, 2_000), 0);
+        assert_eq!(set.slot_count(), 3);
+    }
+
+    #[test]
+    fn evict_expired_drops_only_lapsed_slots() {
+        // BITE for TTL GC: a slot whose expiry has passed is dropped; a live one stays.
+        // Remove the `slot.expiry() > now` retain predicate and the live slot is dropped
+        // too (or, inverted, the expired one survives) - either way the count is wrong.
+        let mut set = ProviderRecordSet::new();
+        set.apply(&provide(key(1), provider(1), 1, 1_000), 0); // expiry 1_000
+        set.apply(&provide(key(2), provider(1), 1, 5_000), 0); // expiry 5_000
+        let removed = set.evict_expired(2_000); // now past key(1)'s expiry only
+        assert_eq!(removed, 1);
+        assert_eq!(set.slot_count(), 1);
+        assert!(!set.contains_slot(&key(1), &provider(1)));
+        assert!(set.contains_slot(&key(2), &provider(1)));
+    }
+
+    #[test]
+    fn remove_slot_forgets_one_provider() {
+        let mut set = ProviderRecordSet::new();
+        set.apply(&provide(key(1), provider(1), 1, 1_000), 0);
+        set.apply(&provide(key(1), provider(2), 1, 1_000), 0);
+        assert!(set.remove_slot(&key(1), &provider(1)));
+        assert!(!set.remove_slot(&key(1), &provider(1))); // already gone
+        assert_eq!(set.slot_count(), 1);
+        assert!(set.contains_slot(&key(1), &provider(2)));
+    }
+
+    #[test]
+    fn export_then_restore_reseeds_the_floor_and_still_rejects_rollback() {
+        // BITE for the DURABLE SEQUENCE obligation: advance a slot to seq 5, export the
+        // floor, restore it into a FRESH set (a restart), then a replay of the seq-3
+        // record must still lose. Drop restore_floor's insert and the fresh set is empty,
+        // so the rollback is Applied - the assertion fails.
+        let mut set = ProviderRecordSet::new();
+        let (k, p) = (key(1), provider(1));
+        set.apply(&provide(k, p, 5, 10_000), 0);
+        let floors = set.export_floors();
+        assert_eq!(floors.len(), 1);
+
+        let mut restarted = ProviderRecordSet::new();
+        for (fk, fp, floor) in floors {
+            restarted.restore_floor(fk, fp, floor);
+        }
+        // A re-fetch of the SAME seq-5 record stays live (idempotent), not a conflict.
+        assert_eq!(
+            restarted.apply(&provide(k, p, 5, 10_000), 0),
+            ApplyOutcome::Idempotent
+        );
+        // A rolled-back seq-3 record loses to the restored floor.
+        assert_eq!(
+            restarted.apply(&provide(k, p, 3, 10_000), 0),
+            ApplyOutcome::RejectedStale {
+                current: 5,
+                offered: 3
+            }
+        );
+    }
+
+    #[test]
+    fn restore_a_withdrawn_floor_blocks_resurrection_after_restart() {
+        // A tombstone floor persisted and restored still blocks a replay of the
+        // pre-withdrawal record (no post-restart resurrection).
+        let mut set = ProviderRecordSet::new();
+        let (k, p) = (key(1), provider(1));
+        set.apply(&provide(k, p, 1, 10_000), 0);
+        set.apply(&withdraw(k, p, 4, 10_000), 0);
+        let floors = set.export_floors();
+
+        let mut restarted = ProviderRecordSet::new();
+        for (fk, fp, floor) in floors {
+            restarted.restore_floor(fk, fp, floor);
+        }
+        assert_eq!(
+            restarted.apply(&provide(k, p, 1, 10_000), 0),
+            ApplyOutcome::RejectedStale {
+                current: 4,
+                offered: 1
+            }
+        );
+        assert!(restarted.find_providers(&k, 500).is_empty());
     }
 }

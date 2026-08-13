@@ -13,6 +13,7 @@ use peer_fabric::{
     ProviderRecordSet, Recipient, RecordDecodeError, Unavailable, decode_provider_assertion,
 };
 
+use crate::floor_store::FloorStore;
 use crate::keys::{peer_id_of_provider, provider_index_key, provider_value_key};
 use crate::swarm::{QueryFail, SwarmHandle, absence_from_reach};
 
@@ -37,14 +38,21 @@ pub struct Libp2pProviderDirectory {
     ///   * SESSION-SCOPED, not global. The guarantee is "no rollback BELOW a sequence THIS
     ///     node observed", not "no rollback the network ever saw": a fresh consumer that
     ///     never saw the newer record cannot detect a rollback to an older-but-valid one.
-    ///   * UNBOUNDED. The set never evicts, and `provider` is attacker-choosable (anyone
-    ///     may announce under any key), so resolving attacker-chosen keys grows it without
-    ///     bound - a memory/DoS vector. Bounded/TTL eviction is a filed follow-up
-    ///     (TASK-176); the frozen module explicitly leaves GC to the backend.
+    ///   * SESSION-SCOPED per PROCESS unless a durable floor is configured. The floor is
+    ///     kept across queries within this process; cross-restart durability is provided
+    ///     by [`FloorStore`]'s optional on-disk persistence (TASK-176 #1) when a state
+    ///     directory is configured, and is otherwise session-scoped (a fresh consumer
+    ///     that never saw the newer record cannot detect a rollback to an older-but-valid
+    ///     one).
+    ///
+    /// The set is now BOUNDED (TASK-176 #3): [`FloorStore`] caps the retained
+    /// `(key, provider)` slots and evicts by TTL/LRU, so resolving attacker-chosen keys
+    /// can no longer grow it without bound. The frozen module leaves GC to the backend;
+    /// [`FloorStore`] is that backend GC.
     ///
     /// A std Mutex is fine: it is only ever held for the SYNCHRONOUS apply loop, never
     /// across an `.await` (all `get_record` fetches complete first).
-    store: Mutex<ProviderRecordSet>,
+    store: Mutex<FloorStore>,
 }
 
 /// Apply one fetched, decoded `assertion` (from the DHT provider `peer`) against the
@@ -53,7 +61,7 @@ pub struct Libp2pProviderDirectory {
 /// tombstone, or LOSES to the monotonic floor (replay / rollback / stale / already-expired,
 /// AC#3). PURE over `store`, so the whole lifecycle decision is unit-testable without a
 /// live DHT.
-fn admit(
+pub(crate) fn admit(
     store: &mut ProviderRecordSet,
     peer: PeerId,
     assertion: ProviderAssertion,
@@ -127,7 +135,7 @@ impl Libp2pProviderDirectory {
         Libp2pProviderDirectory {
             handle,
             ledger,
-            store: Mutex::new(ProviderRecordSet::new()),
+            store: Mutex::new(FloorStore::new()),
         }
     }
 
@@ -232,7 +240,7 @@ impl Libp2pProviderDirectory {
                 match outcome {
                     Ok(Some(bytes)) => match decode_provider_assertion(&bytes, key, now) {
                         Ok(assertion) => {
-                            if let Some(record) = admit(&mut store, peer, assertion, now) {
+                            if let Some(record) = store.admit(peer, assertion, now) {
                                 records.push(record);
                             }
                         }

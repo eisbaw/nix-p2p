@@ -78,5 +78,5 @@ pub use record_codec::{
     encode_provider_withdrawal, provider_record_signing_bytes, provider_withdrawal_signing_bytes,
     sign_provider_record, sign_provider_withdrawal,
 };
-pub use record_store::{ApplyOutcome, ProviderRecordSet};
+pub use record_store::{ApplyOutcome, ProviderRecordSet, SlotFloor};
 pub use require::{Axis, MissingAxes, require_axes};

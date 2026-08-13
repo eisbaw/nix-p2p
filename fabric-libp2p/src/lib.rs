@@ -100,6 +100,7 @@
 mod announcer;
 mod directory;
 mod fabric;
+mod floor_store;
 mod keys;
 mod locator;
 mod nar;
