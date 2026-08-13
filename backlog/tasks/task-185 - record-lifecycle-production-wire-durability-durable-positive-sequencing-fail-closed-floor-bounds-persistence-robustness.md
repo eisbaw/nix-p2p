@@ -3,11 +3,11 @@ id: TASK-185
 title: >-
   record-lifecycle: production-wire durability + durable positive-sequencing;
   fail-closed floor bounds; persistence robustness
-status: In Progress
+status: Done
 assignee:
   - '@me'
 created_date: '2026-08-13 04:03'
-updated_date: '2026-08-13 07:40'
+updated_date: '2026-08-13 09:07'
 labels:
   - fabric-libp2p
   - daemon-libp2p
@@ -26,11 +26,11 @@ TASK-176 DEEP gate (qa+mped+codex) — codex NO-GO, findings CONFIRMED. The floo
 
 ## Acceptance Criteria
 <!-- AC:BEGIN -->
-- [ ] #1 daemon-libp2p threads a per-node state_dir and starts via start_durable (not the non-durable start()/start_with_supplier at lib.rs:263-264); a shipped node reloads its anti-rollback floor on restart through the production run() path, not only in unit tests
-- [ ] #2 positive provider records receive durably-allocated monotonic sequence numbers (replacing the seq:1-always mint at line 214); after a restart the node's next record carries a sequence strictly greater than every previously published one — no collision, no self-rollback
-- [ ] #3 durable ordering is save-before-publish: a sequence/record is persisted (with parent-dir fsync) BEFORE it is announced to the DHT, and a save error is fail-closed (no DHT announce on persistence failure) — so a crash cannot expose an unpersisted record
-- [ ] #4 an integration/e2e test exercises restart-durability through the shipped run() path (start node, publish, kill, restart, assert sequence monotonicity + floor survival) and BITES BY MUTATION: reverting to start()/seq:1 makes it fail
-- [ ] #5 the remaining record-lifecycle hardening (F1/F2 eviction-rollback window, F5 consumer-side TTL enforcement, F6 durable-reload sweep/cap, mped-P4 state_dir advisory lock) is filed as a separate hardening follow-up with dependency edges — NOT silently dropped
+- [x] #1 daemon-libp2p threads a per-node state_dir and starts via start_durable (not the non-durable start()/start_with_supplier at lib.rs:263-264); a shipped node reloads its anti-rollback floor on restart through the production run() path, not only in unit tests
+- [x] #2 positive provider records receive durably-allocated monotonic sequence numbers (replacing the seq:1-always mint at line 214); after a restart the node's next record carries a sequence strictly greater than every previously published one — no collision, no self-rollback
+- [x] #3 durable ordering is save-before-publish: a sequence/record is persisted (with parent-dir fsync) BEFORE it is announced to the DHT, and a save error is fail-closed (no DHT announce on persistence failure) — so a crash cannot expose an unpersisted record
+- [x] #4 an integration/e2e test exercises restart-durability through the shipped run() path (start node, publish, kill, restart, assert sequence monotonicity + floor survival) and BITES BY MUTATION: reverting to start()/seq:1 makes it fail
+- [x] #5 the remaining record-lifecycle hardening (F1/F2 eviction-rollback window, F5 consumer-side TTL enforcement, F6 durable-reload sweep/cap, mped-P4 state_dir advisory lock) is filed as a separate hardening follow-up with dependency edges — NOT silently dropped
 <!-- AC:END -->
 
 ## Implementation Plan
@@ -50,3 +50,9 @@ F3 root-cause wiring. (1) daemon-libp2p Libp2pSourceConfig gains state_dir: Opti
 
 2026-08-13: READY FOR RE-GATE (qa + codex). DEEP-gate fixes landed in commits 51d9ddd (GB1/GB2/GB4 code), 3984dbb (AC4 rework), bf3d839 (backlog GB3/F5/F6), plus docs commit for README. Full gate GREEN: just lint (exit 0), just test (exit 0 = cargo test --locked --workspace + fixtures + golden-vectors + real-nix accept/reject all passed). New/reworked tests: 5 identity-seed unit tests (stable/explicit-persist/conflict-fail-closed/malformed-fail-closed/session-scoped), reworked restart_durable_sequence_through_run (same-identity-from-state-dir + strictly-newer sequence + serve-through-run), all stable on repeat. GB1 bite PROVEN by stubbing load_identity_seed->None (test failed on same-provider assert, reverted). Honest limits carried to TASK-188: provider WARNs not fail-closed (e2e harness spins providers without --libp2p-state-dir); withdraw still publish-before-save; consumer floor fail-open on IO error; consumer non-durable default unwarned; sequence-overflow + parent-of-state-dir fsync. NOT run: just e2e (podman/netns, unchanged no-state-dir provider behavior; harness update for fail-closed-provider is a TASK-188 item).
 <!-- SECTION:NOTES:END -->
+
+## Final Summary
+
+<!-- SECTION:FINAL_SUMMARY:BEGIN -->
+Production-wired restart durability into the shipped daemon-libp2p (and composite daemon): --libp2p-state-dir anchors BOTH the node identity (identity-seed-v1) and the durable per-key sequence floor, so a plain identical-argv restart keeps the same provider NodeId and a strictly-newer sequence (no self-rollback). Positive announces allocate a durable monotonic sequence and are save-before-publish with parent-dir fsync, fail-closed on save error. State dir is treated as one consistent unit: floor-present+identity-absent fails closed (rejects silent rekey). DEEP-gated across 3 rounds; codex (cross-model) overturned two same-model+qa GOs (the random-identity rekey GB1, then the partial-corruption residual) - both fixed with biting tests through the shipped run() path. Remaining hardening filed: TASK-188 (F1/F2/F5 record-lifecycle) and TASK-189 (single atomic durable-state file, subsuming F6/concurrent-save/fsync/overflow and the symmetric floor-lost direction, which is liveness-not-integrity - caught by consumer anti-rollback). Gate: build+lint green, daemon-libp2p 11/11 + fabric-libp2p 45/45 + golden/wire clean; full 'just test' blocked by an UNRELATED pre-existing iroh hanging_authority test (filed).
+<!-- SECTION:FINAL_SUMMARY:END -->

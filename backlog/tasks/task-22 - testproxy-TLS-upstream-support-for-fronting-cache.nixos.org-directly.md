@@ -4,7 +4,7 @@ title: 'testproxy: TLS upstream support for fronting cache.nixos.org directly'
 status: To Do
 assignee: []
 created_date: '2026-08-08 07:30'
-updated_date: '2026-08-11 06:00'
+updated_date: '2026-08-13 09:08'
 labels:
   - testproxy
   - follow-up
@@ -33,4 +33,6 @@ After the global-first and LAN Iroh discovery vertical slices are complete, add 
 
 <!-- SECTION:NOTES:BEGIN -->
 Ordering revision 2026-08-11: TASK-22 depends on TASK-116 so the user-selected sequence is mechanical: global Iroh discovery and review, later LAN/direct-query Iroh, then HTTPS and compression, all before BitTorrent.
+
+COMPASS/orchestrator 2026-08-13: the TASK-116 dependency is STALE and should be ignored for scheduling. A rustls TLS upstream connector has ZERO technical relationship to iroh BatchHoldQuery (and TASK-116 itself sits behind 8 tasks). The edge was an iroh-first ORDERING preference the project has since steered away from (core real-world CDN fronting over optional-iroh breadth). The backlog CLI would not clear the edge to empty, so THIS NOTE is the authority: treat TASK-22 (and its dependent TASK-24 daemon HTTPS) as UNBLOCKED. Do not wait on TASK-116.
 <!-- SECTION:NOTES:END -->
