@@ -3,11 +3,11 @@ id: TASK-158
 title: >-
   fabric-libp2p: real node NAR supplier (store-dump / regular-file,
   cancellation-safe) behind Libp2pNarSupplier
-status: In Progress
+status: Done
 assignee:
   - '@me'
 created_date: '2026-08-12 08:38'
-updated_date: '2026-08-13 11:31'
+updated_date: '2026-08-13 11:41'
 labels:
   - libp2p
   - fabric
@@ -27,8 +27,8 @@ TASK-151's Libp2pNarSupplier has only an in-memory source (MemoryNarSupplier, te
 
 ## Acceptance Criteria
 <!-- AC:BEGIN -->
-- [ ] #1 Libp2pNarSupplier has Process and RegularFile sources that regenerate on demand without holding the NAR at rest, preserving declared-size-before-produce
-- [ ] #2 production is cancellation-safe (process group reaped on shutdown), no unkillable worker
+- [x] #1 Libp2pNarSupplier has Process and RegularFile sources that regenerate on demand without holding the NAR at rest, preserving declared-size-before-produce
+- [x] #2 production is cancellation-safe (process group reaped on shutdown), no unkillable worker
 <!-- AC:END -->
 
 ## Implementation Notes
@@ -70,3 +70,9 @@ HONEST LIMITS / GOTCHAS:
 
 FORWARD-CARRY to TASK-191: (1) declared-size-without-dump = read the persisted NarSize (uncompressed; not FileSize). (2) reverse-map = daemon impls fabric_libp2p::CatalogProbe over AvailabilityIndex; construct CatalogNarSupplier::new(probe, helper_program); keep fabric-libp2p daemon-core-free. (3) route store-dump bytes through announce_provider_seeds/verify_provider_seeds SSOT (TASK-56) - do not add a bypass announce path. (4) supply the raw-NAR helper binary for ProbedSource::RegularFile (RAW_NAR_HELPER_ARG). (5) cancellation-safe reap already proven at the fabric layer; the daemon just needs to own a TaskSupervisor and pass its handle to produce_supervised.
 <!-- SECTION:NOTES:END -->
+
+## Final Summary
+
+<!-- SECTION:FINAL_SUMMARY:BEGIN -->
+Added the real-node NAR supply capability to fabric-libp2p, mirroring fabric-iroh's proven SupplySource + the shared proc-supervisor crate. NarSource::Process runs nix-store --dump on demand under an OWNED process group; RegularFile collapses into a daemon-helper Process. declared_size comes from a fabric-libp2p-defined CatalogProbe seam (the daemon implements it over its AvailabilityIndex + TASK-82's persisted uncompressed NarSize) so plan() never dumps - declared-size-before-produce. produce_supervised runs via proc_supervisor::execute_process: SIGKILL+reap the whole group on shutdown (no unkillable worker / no reparent-to-init), stdout capped at declared_size, then rechecks len==declared_size AND BLAKE3(RawNarV1)==content before returning bytes (the byte-integrity anchor). NO ENUMERATION (single per-digest probe). fabric-libp2p stays daemon-core-free (independence green). DEEP-gated: independent mechanics 49/0 + codex GO (cancellation-safety structurally closed, no-enumeration sound, size/hash rechecks correct, bites genuine incl. /proc-pid-disappearance reap test). Honest scope boundary (built + unit-proven, NOT yet wired into the sync serve path): daemon serve-from-real-/nix/store end-to-end + container e2e = TASK-191 (filed); off-worker async serve wiring = TASK-157; whole-NAR-rehash-at-serve streaming = TASK-157.
+<!-- SECTION:FINAL_SUMMARY:END -->
