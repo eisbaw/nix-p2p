@@ -35,15 +35,21 @@ pub struct Libp2pProviderDirectory {
     ///     FORGOTTEN, so a later replay below it is admitted again (a rollback if the
     ///     evicted floor was Active, a resurrection if it was a live tombstone) - a bounded
     ///     session-fresh residue, the price of the hard memory bound. A fail-closed bound
-    ///     that never drops a live floor is TASK-185.
+    ///     that never drops a live floor is TASK-188.
     ///   * SESSION-SCOPED, not global. The guarantee is "no rollback BELOW a sequence THIS
     ///     node still holds", not "no rollback the network ever saw": a fresh consumer that
     ///     never saw the newer record cannot detect a rollback to an older-but-valid one.
-    ///   * CROSS-RESTART DURABILITY IS OPTIONAL AND NOT PRODUCTION-WIRED. [`FloorStore`] can
-    ///     persist the floor on disk ([`FloorStore::durable`], TASK-176 #1), and that path
-    ///     is unit-tested - but the `daemon-libp2p` production binary builds the fabric via
-    ///     the NON-durable [`crate::Libp2pFabric::start`], so the shipped consumer's floor
-    ///     starts EMPTY on restart. Wiring the daemon onto the durable path is TASK-185.
+    ///   * CROSS-RESTART DURABILITY IS PRODUCTION-WIRED (TASK-185), gated on a state dir.
+    ///     [`FloorStore`] persists the floor on disk ([`FloorStore::durable`], TASK-176 #1),
+    ///     and the `daemon-libp2p` production binary routes to
+    ///     [`crate::Libp2pFabric::start_durable`] whenever `--libp2p-state-dir` is configured,
+    ///     so the shipped consumer RELOADS its floor on restart through the production code
+    ///     path (`start_durable`, not a test-only constructor). A node started WITHOUT a state
+    ///     dir keeps the session-fresh (empty-on-restart) behaviour by choice. HONEST COVERAGE
+    ///     NOTE: the TASK-185 restart integration test exercises the PROVIDER announce-sequence
+    ///     across a restart end to end; the CONSUMER floor RELOAD across a restart is proven by
+    ///     the `FloorStore::durable` unit test (`a_durable_floor_survives_a_restart_...`), not
+    ///     yet by a consumer-restart arm through `run()`.
     ///
     /// A std Mutex is fine: it is only ever held for the SYNCHRONOUS apply loop, never
     /// across an `.await` (all `get_record` fetches complete first).

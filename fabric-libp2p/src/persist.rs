@@ -64,8 +64,29 @@ fn hex32(s: &str) -> Option<[u8; 32]> {
 /// Atomically replace `path`'s contents with `text` (write a sibling temp, then rename).
 /// A rename within a directory is atomic on POSIX, so a reader/crash sees either the old
 /// or the new file, never a partial one.
+///
+/// DURABILITY (TASK-185, AC#3): after the rename we fsync the CONTAINING DIRECTORY. A POSIX
+/// rename is not guaranteed persisted until the directory entry itself is fsynced, so
+/// without this a crash right after a successful `announce` could lose the just-persisted
+/// sequence even though this function returned `Ok` - reopening exactly the post-restart
+/// rollback window the durable floor exists to close. The temp file's own contents are
+/// fsynced (`sync_all`) before the rename, so the rename can only ever expose fully-written
+/// bytes.
+///
+/// CONCURRENCY (honest limit): this save is NOT internally serialized. The announcer
+/// snapshots its per-key map under the lock and writes OUTSIDE the lock, so two concurrent
+/// `announce` calls (even for different keys) can each take a snapshot and then race the
+/// `rename` - a writer holding an OLDER snapshot can land AFTER a newer one and DROP the
+/// newer key's durable advance from disk, a lost-update / restart-rollback for that key even
+/// though its announce already returned `Ok`. A unique per-write temp name does NOT close
+/// this (the lost update is at the rename, not the temp); the real fix is to make the
+/// snapshot+write ONE serialized critical section (or a persistence mutex). This is SAFE
+/// TODAY only because the shipped provider announce loop (`install_provider`) is strictly
+/// sequential - one awaited announce per seed - so no two saves are ever in flight. The
+/// serialized-save fix (and the shared-`state_dir` advisory lock) is filed in TASK-188.
 fn write_atomic(path: &Path, text: &str) -> std::io::Result<()> {
-    if let Some(parent) = path.parent() {
+    let parent = path.parent();
+    if let Some(parent) = parent {
         fs::create_dir_all(parent)?;
     }
     let tmp = path.with_extension("tmp");
@@ -74,7 +95,12 @@ fn write_atomic(path: &Path, text: &str) -> std::io::Result<()> {
         f.write_all(text.as_bytes())?;
         f.sync_all()?;
     }
-    fs::rename(&tmp, path)
+    fs::rename(&tmp, path)?;
+    // fsync the parent directory so the rename (the file's new identity) is itself durable.
+    if let Some(parent) = parent {
+        fs::File::open(parent)?.sync_all()?;
+    }
+    Ok(())
 }
 
 // -------------------------------------------------------------------------
@@ -265,6 +291,15 @@ pub fn save_seqs(path: &Path, seqs: &[(ContentKey, u64, u64)]) {
     if let Err(why) = write_atomic(path, &text) {
         tracing::error!(%why, path = %path.display(), "could not persist announce sequence");
     }
+}
+
+/// Persist the announcer's per-key sequence floor to `path`, PROPAGATING any I/O error
+/// (TASK-185, AC#3). The announce path uses THIS - not the logging [`save_seqs`] - so a save
+/// failure can FAIL-CLOSED the announce (no DHT publish) rather than silently degrading to
+/// non-durable. Includes the parent-dir fsync of [`write_atomic`], so on `Ok` the sequence
+/// is durably on disk before the caller publishes.
+pub fn save_seqs_checked(path: &Path, seqs: &[(ContentKey, u64, u64)]) -> std::io::Result<()> {
+    write_atomic(path, &serialize_seqs(seqs))
 }
 
 /// Load the announcer's per-key sequence floor (absent/error -> empty).

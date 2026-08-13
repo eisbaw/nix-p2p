@@ -24,7 +24,7 @@
 //! residue is BOUNDED (the same window a restart has) and is the price of a hard memory
 //! bound against an attacker who controls keys, providers, sequences AND TTLs; a pure TTL
 //! sweep cannot bound memory within the TTL window, so the hard cap + LRU is load-bearing.
-//! A FAIL-CLOSED bound that never drops a live floor/tombstone (a guard window) is TASK-185;
+//! A FAIL-CLOSED bound that never drops a live floor/tombstone (a guard window) is TASK-188;
 //! this store makes the DoS/memory guarantee (#3), not a fail-closed anti-rollback one.
 
 use std::collections::VecDeque;

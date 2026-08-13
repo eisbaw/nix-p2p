@@ -193,6 +193,56 @@ async fn announce_rejects_an_over_cap_record_ttl() {
     }
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn announce_fails_closed_when_the_sequence_cannot_be_persisted() {
+    // TASK-185 AC#3 BITE (save-before-publish, fail-closed): if the durably-allocated
+    // per-key sequence CANNOT be written, `announce` returns `AnnounceError::Persist` and
+    // does NOT publish - so a crash can never expose a record whose sequence is not on disk
+    // (the F3 rollback hazard). We force a persist failure by pointing the state dir UNDER a
+    // REGULAR FILE, so `create_dir_all` for the sequence file fails. No network is needed:
+    // the fail-closed check is BEFORE the DHT publish. Mutation: drop the fail-closed persist
+    // check in `announce` and this announce proceeds (to a publish/deadline) instead of
+    // returning `Persist` - the match below then panics.
+    let _ = tracing_subscriber::fmt::try_init();
+
+    // A regular file that cannot serve as a directory parent for the sequence file.
+    let blocker = std::env::temp_dir().join(format!(
+        "nix-p2p-persist-blocker-{}-{:?}",
+        std::process::id(),
+        std::thread::current().id()
+    ));
+    let _ = std::fs::remove_dir_all(&blocker);
+    std::fs::write(&blocker, b"not a directory").unwrap();
+    // state_dir's PARENT is a regular file -> any save's create_dir_all(parent) fails.
+    let state_dir = blocker.join("state");
+
+    let fabric = Libp2pFabric::start_durable(
+        NodeConfig {
+            identity_seed: [7u8; 32],
+            network_scope: "persist-failclosed".to_string(),
+        },
+        state_dir,
+    )
+    .expect("fabric builds even with an unwritable state dir (load is best-effort)");
+
+    // A valid, in-cap, self-serve record (seed 7 matches the node identity).
+    let (_key, record) = signed_record(7, [0x55u8; 32], 1, 3600);
+    let result = fabric
+        .announcer()
+        .unwrap()
+        .announce(&record, &AnnounceBudget::new(Duration::from_secs(5), 20))
+        .await;
+    match result {
+        Err(AnnounceError::Persist(_)) => {}
+        other => panic!(
+            "an announce whose sequence cannot be durably persisted must FAIL-CLOSED with \
+             AnnounceError::Persist (no DHT publish), got: {other:?}"
+        ),
+    }
+
+    let _ = std::fs::remove_file(&blocker);
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn withdrawal_retracts_one_of_two_concurrent_providers() {
     let _ = tracing_subscriber::fmt::try_init();

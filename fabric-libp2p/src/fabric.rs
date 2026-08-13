@@ -11,8 +11,9 @@ use std::sync::Arc;
 
 use libp2p::PeerId;
 use peer_fabric::{
-    AvailabilityAnnouncer, ExposureLedger, LocalPeerDiscovery, NarServer, NarTransfer, NodeId,
-    NodeLocator, PeerFabric, PeerHoldQuery, ProviderDirectory, TransferRegistry, TransportTag,
+    AvailabilityAnnouncer, ContentKey, ExposureLedger, LocalPeerDiscovery, NarServer, NarTransfer,
+    NodeId, NodeLocator, PeerFabric, PeerHoldQuery, ProviderDirectory, TransferRegistry,
+    TransportTag,
 };
 
 use crate::announcer::Libp2pAvailabilityAnnouncer;
@@ -32,6 +33,10 @@ pub struct Libp2pFabric {
     ledger: Arc<ExposureLedger>,
     directory: Arc<dyn ProviderDirectory>,
     announcer: Arc<dyn AvailabilityAnnouncer>,
+    /// The SAME announcer as `announcer`, kept concretely so the composition root can reach
+    /// the durable sequence allocator ([`next_announce_sequence`](Self::next_announce_sequence))
+    /// - the seam trait deliberately carries no sequence-allocation method (TASK-185, AC#2).
+    announcer_seq: Arc<Libp2pAvailabilityAnnouncer>,
     locator: Arc<dyn NodeLocator>,
     transfers: TransferRegistry,
     server: Option<Arc<dyn NarServer>>,
@@ -44,11 +49,11 @@ impl Libp2pFabric {
     /// anti-rollback floor is IN-MEMORY (session-scoped); [`start_durable`] persists it
     /// across restart.
     ///
-    /// PRODUCTION PATH TODAY: `daemon-libp2p` builds its fabric through THIS
-    /// (non-durable) constructor, so the shipped daemon's floor + announce sequence do
-    /// NOT survive a restart. Wiring the daemon onto [`start_durable`] (and minting
-    /// durable POSITIVE sequences rather than the current `sequence: 1`) is TASK-185; the
-    /// durable path below is built and unit-tested but not yet used in the binary.
+    /// NON-DURABLE BY CHOICE: this is the session-scoped path for an ephemeral/throwaway
+    /// node. The shipped `daemon-libp2p` routes to [`start_durable`] whenever a
+    /// `--libp2p-state-dir` is configured (TASK-185), so a production node reloads its floor
+    /// and announce sequence on restart; only a node started WITHOUT a state dir uses this
+    /// constructor and accepts the session-fresh consequence.
     ///
     /// [`start_durable`]: Self::start_durable
     pub fn start(config: NodeConfig) -> Result<Libp2pFabric, NodeError> {
@@ -60,13 +65,15 @@ impl Libp2pFabric {
     /// rejects a rolled-back record and mints a network-effective withdrawal. Each node
     /// needs its OWN `state_dir` (the files are keyed by directory, not identity).
     ///
-    /// BUILT AND UNIT-TESTED, NOT WIRED: no production binary calls this yet - the
-    /// `daemon-libp2p` composition root uses the non-durable [`start`]. Wiring it (and the
-    /// durable positive-sequence source that makes a restarted PROVIDER's re-announce win)
-    /// is TASK-185. So restart-durability is proven by tests, not yet delivered by the
-    /// shipped daemon.
+    /// PRODUCTION-WIRED (TASK-185): the `daemon-libp2p` composition root
+    /// (`start_and_join_libp2p`) routes here whenever `Libp2pSourceConfig::state_dir` is
+    /// `Some` (from `--libp2p-state-dir`), so the shipped consumer reloads its anti-rollback
+    /// floor on restart through the production `run()` path. The provider sibling
+    /// [`start_with_supplier_durable`] plus the durable positive-sequence source
+    /// ([`Libp2pFabric::next_announce_sequence`]) make a restarted PROVIDER's re-announce win.
     ///
     /// [`start`]: Self::start
+    /// [`start_with_supplier_durable`]: Self::start_with_supplier_durable
     pub fn start_durable(
         config: NodeConfig,
         state_dir: PathBuf,
@@ -120,7 +127,9 @@ impl Libp2pFabric {
             ),
             None => Libp2pProviderDirectory::new(node.handle.clone(), ledger.clone()),
         });
-        let announcer: Arc<dyn AvailabilityAnnouncer> = Arc::new(match &state_dir {
+        // Build the announcer CONCRETELY (so the composition root can reach its durable
+        // sequence allocator) and share the same instance behind the seam trait object.
+        let announcer_seq = Arc::new(match &state_dir {
             Some(dir) => Libp2pAvailabilityAnnouncer::durable(
                 node.handle.clone(),
                 ledger.clone(),
@@ -137,6 +146,7 @@ impl Libp2pFabric {
                 signing_key,
             ),
         });
+        let announcer: Arc<dyn AvailabilityAnnouncer> = announcer_seq.clone();
         // The node-locator resolves a provider's dial address THROUGH kad peer-routing.
         // ONE concrete instance is shared (TASK-169): the fetch transport drives its dial
         // off this SAME locator (so the resolve-then-dial lives inside the fabric, and its
@@ -166,11 +176,31 @@ impl Libp2pFabric {
             ledger,
             directory,
             announcer,
+            announcer_seq,
             locator,
             transfers,
             server,
             _node: node,
         })
+    }
+
+    /// The next durably-allocated POSITIVE announce sequence for `key` (TASK-185, AC#2).
+    /// The composition root calls this to mint a provider record whose sequence is strictly
+    /// greater than every record this node previously published for `key` - reseeded from
+    /// disk when the fabric was built via [`start_durable`](Self::start_durable) /
+    /// [`start_with_supplier_durable`](Self::start_with_supplier_durable), so a restarted
+    /// provider does NOT re-mint `sequence: 1` and self-rollback. For a non-durable fabric
+    /// this is session-fresh (always 1 at first announce), which is the honest consequence of
+    /// running without a `state_dir`.
+    ///
+    /// CONTRACT (non-reserving read, TOCTOU): this only READS the floor - the reservation
+    /// happens when [`AvailabilityAnnouncer::announce`](peer_fabric::AvailabilityAnnouncer::announce)
+    /// persists it. So for a given key the caller must ALLOCATE -> sign -> announce before the
+    /// next allocation on that same key; two allocations for one key before either announces
+    /// both return `last + 1`. The shipped provider loop honours this (one awaited announce per
+    /// seed, and each seed is a distinct key).
+    pub fn next_announce_sequence(&self, key: &ContentKey) -> u64 {
+        self.announcer_seq.next_sequence(key)
     }
 
     /// The libp2p `PeerId` of this node (for a peer to dial / for tests to assert
