@@ -24,9 +24,13 @@ pub enum NarProductionSource {
     Memory(Arc<Vec<u8>>),
 }
 
-/// Immutable snapshot returned by a single digest probe.
+/// Immutable snapshot returned by a single digest probe. `pub` (TASK-146) so a backend
+/// binary can bridge it into that backend's provider-supply seam: `daemon-core` is
+/// stack-neutral and cannot name `fabric_iroh::CatalogProbe`, so the iroh binary wraps a
+/// [`SupplyCatalogHandle`] in a newtype and maps this record into `fabric_iroh::ProbedSupply`
+/// (the orphan rule forbids implementing that foreign trait for this type in a third crate).
 #[derive(Clone)]
-pub(crate) struct SupplyCatalogRecord {
+pub struct SupplyCatalogRecord {
     pub declared_size: u64,
     pub source: NarProductionSource,
     pub store_path: PathBuf,
@@ -47,14 +51,12 @@ pub struct SupplyCatalogHandle {
 }
 
 impl SupplyCatalogHandle {
-    /// The inherent digest probe over the raw catalog record. Named `probe_record`,
-    /// NOT `probe`, on purpose: this type also implements
-    /// [`crate::transport_iroh::CatalogProbe`], whose method IS `probe`, and whose
-    /// body calls this one. Sharing the name would compile only by the inherent-beats-
-    /// trait resolution rule, so a later rename/removal of this method would silently
-    /// rebind `self.probe(..)` to the trait method - unbounded recursion with no
-    /// compile error. Distinct names make the call in the trait impl unambiguous.
-    pub(crate) fn probe_record(&self, digest: &Blake3Digest) -> Option<SupplyCatalogRecord> {
+    /// The inherent digest probe over the raw catalog record. `pub` (TASK-146) so a backend
+    /// binary's provider-supply bridge (e.g. the iroh `CatalogProbe` newtype) can read the
+    /// record without `daemon-core` naming any backend type. Named `probe_record`, NOT
+    /// `probe`, on purpose: a backend's `CatalogProbe::probe` calls this one, and sharing the
+    /// name across the inherent/trait boundary would risk an accidental self-recursion rebind.
+    pub fn probe_record(&self, digest: &Blake3Digest) -> Option<SupplyCatalogRecord> {
         self.state
             .lock()
             .expect("supply-catalog mutex")
@@ -67,26 +69,15 @@ impl SupplyCatalogHandle {
     }
 }
 
-/// The daemon fills the provider's [`CatalogProbe`] seam (TASK-150 AC#3): the
-/// availability index's inert read handle IS the catalog probe. The edge points
-/// `daemon -> transport_iroh` (soon `fabric-iroh`) - the provider names this trait,
-/// never this module's `SupplyCatalogRecord`/`NarProductionSource` concrete types -
-/// so the transport can move below the seam with no edge back to the serving core.
-impl crate::transport_iroh::CatalogProbe for SupplyCatalogHandle {
-    fn probe(&self, content: &Blake3Digest) -> Option<crate::transport_iroh::ProbedSupply> {
-        use crate::transport_iroh::{ProbedSource, ProbedSupply};
-        self.probe_record(content).map(|record| ProbedSupply {
-            declared_size: record.declared_size,
-            source: match record.source {
-                NarProductionSource::Process { program, args } => {
-                    ProbedSource::Process { program, args }
-                }
-                NarProductionSource::RegularFile(path) => ProbedSource::RegularFile(path),
-                NarProductionSource::Memory(bytes) => ProbedSource::Memory(bytes),
-            },
-        })
-    }
-}
+// The provider-facing `CatalogProbe` seam (TASK-150 AC#3) is a BACKEND type
+// (`fabric_iroh::transport_iroh::CatalogProbe`). `daemon-core` is stack-neutral and does
+// NOT depend on any backend, so it cannot implement that trait here (and the orphan rule
+// would forbid a third crate doing it for this type). TASK-146 relocated the bridge into
+// the iroh binary: a newtype `IrohCatalogProbe(SupplyCatalogHandle)` there implements
+// `CatalogProbe` by calling [`SupplyCatalogHandle::probe_record`] (now `pub`) and mapping
+// the returned [`SupplyCatalogRecord`] into `fabric_iroh::ProbedSupply`. The daemon still
+// fills the provider's supply seam with the availability index's inert read handle; only
+// the impl site moved below the backend boundary.
 
 /// Availability-side writer. This type is crate-private so transport code
 /// cannot activate or retire provider records.

@@ -958,7 +958,10 @@ fn index_supplier_retains_only_the_inert_catalog_not_the_availability_index() {
         .unwrap(),
     );
     let weak_index = Arc::downgrade(&index);
-    let supplier = IndexNarSupplier::new(index.supply_catalog(), env!("CARGO_BIN_EXE_daemon"));
+    let supplier = IndexNarSupplier::new(
+        daemon::IrohCatalogProbe::new(index.supply_catalog()),
+        env!("CARGO_BIN_EXE_daemon"),
+    );
     drop(index);
     assert!(
         weak_index.upgrade().is_none(),
@@ -988,7 +991,7 @@ async fn a_positive_hold_answer_implies_a_servable_blob() {
         .expect("register");
 
     let supplier = Arc::new(IndexNarSupplier::new(
-        index.supply_catalog(),
+        daemon::IrohCatalogProbe::new(index.supply_catalog()),
         env!("CARGO_BIN_EXE_daemon"),
     ));
     let provider =
@@ -1054,7 +1057,7 @@ async fn a_digest_the_index_never_answered_for_is_declined_not_dial_then_failed(
         .expect("register");
 
     let supplier = Arc::new(IndexNarSupplier::new(
-        index.supply_catalog(),
+        daemon::IrohCatalogProbe::new(index.supply_catalog()),
         env!("CARGO_BIN_EXE_daemon"),
     ));
     let provider = IrohProviderNode::spawn_supplying(supplier, ServeBudget::default(), SWEEP)

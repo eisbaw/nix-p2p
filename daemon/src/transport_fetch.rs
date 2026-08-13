@@ -3,7 +3,7 @@
 //!
 //! ## Where this sits
 //!
-//! [`crate::source::NarSource`] resolves a NAR by its signed `NarHash`. This
+//! [`daemon_core::source::NarSource`] resolves a NAR by its signed `NarHash`. This
 //! module is what a wave-2 `NarSource` uses to actually GET the bytes once
 //! discovery (task-40) has produced a [`Claim`]:
 //!
@@ -20,7 +20,7 @@
 //! plus a transport-specific locator (an iroh `NodeId`; a future BitTorrent
 //! infohash, carried inside the [`KnownTransport`] offer) and returns the raw NAR
 //! bytes for it. This module names no iroh crate (that lands in task-39); it is
-//! deliberately transport-agnostic, exactly like [`crate::transport`] keeps the
+//! deliberately transport-agnostic, exactly like [`daemon_core::transport`] keeps the
 //! locators transport-specific without an iroh dependency.
 //!
 //! ## The TWO gates (kept distinct on purpose)
@@ -43,7 +43,7 @@
 //! The two identities come from the SAME `RawNarV1` bytes but are different values
 //! addressing different things: the `sha256` NarHash is the LOOKUP/trust key a
 //! claim is keyed on; the `blake3` digest is the FETCH/stream-verify key a
-//! transport addresses. A claim binds them (see [`crate::claim`]). task-39 will
+//! transport addresses. A claim binds them (see [`daemon_core::claim`]). task-39 will
 //! split the two gates with a corruption bite; this module is shaped so both are
 //! independently checkable.
 //!
@@ -63,10 +63,10 @@ use bytes::Bytes;
 use http::HeaderMap;
 use http_body_util::{BodyExt, Full};
 
-use crate::claim::{KnownTransport, NarHashKey};
-use crate::content_id::Blake3Digest;
-use crate::discovery::Discovery;
-use crate::source::{NarKey, NarSource, SourceError, UpstreamResponse};
+use daemon_core::claim::{KnownTransport, NarHashKey};
+use daemon_core::content_id::Blake3Digest;
+use daemon_core::discovery::Discovery;
+use daemon_core::source::{NarKey, NarSource, SourceError, UpstreamResponse};
 
 // -------------------------------------------------------------------------
 // Transport selection tag.
@@ -78,7 +78,7 @@ use crate::source::{NarKey, NarSource, SourceError, UpstreamResponse};
 // module's use-sites (`TransportTag::Iroh`, ...) are unchanged.
 //
 // Note the layering, unchanged: the claim decoder already DROPS genuinely-unknown
-// wire transports (tolerated but inert - see [`crate::claim`]), so by the time an
+// wire transports (tolerated but inert - see [`daemon_core::claim`]), so by the time an
 // offer reaches this module it is always a KNOWN wire variant. "Unknown" AT THIS
 // LAYER means a known wire transport with NO registered backend (e.g. `bittorrent`,
 // representable but not implemented) - that offer is SKIPPED, never a crash.
@@ -145,7 +145,7 @@ pub enum TransportError {
     /// this is a DELIBERATE abort of a lying claim, not a "try the next holder"
     /// signal: every offer in the claim addresses the SAME oversized BLAKE3, so the
     /// driver short-circuits it (see [`fetch_via_offers`]) into a propagating
-    /// [`crate::source::SourceError::TooLarge`] rather than falling back.
+    /// [`daemon_core::source::SourceError::TooLarge`] rather than falling back.
     TooLarge { limit: u64, streamed: u64 },
 }
 
@@ -189,7 +189,7 @@ pub enum FetchError {
     /// streamed more than the signed NarSize bound. This is NOT "try the next
     /// offer" - every offer in the claim addresses the SAME oversized BLAKE3 - so
     /// the driver stops immediately and the caller maps this to a PROPAGATING
-    /// [`crate::source::SourceError::TooLarge`] (never an upstream fallback, which
+    /// [`daemon_core::source::SourceError::TooLarge`] (never an upstream fallback, which
     /// would paper over a deliberate abort).
     TooLarge { limit: u64, streamed: u64 },
 }
@@ -365,11 +365,11 @@ pub async fn fetch_via_offers(
 /// [`Transport`]; task-40 supplies the [`Discovery`] layer that maps a `NarHash`
 /// to a holder's complete claim. Neither touches the frozen [`NarSource`] seam.
 ///
-/// Composition (task-40): `resolve` converts the seam's loose [`crate::source::NarHash`]
+/// Composition (task-40): `resolve` converts the seam's loose [`daemon_core::source::NarHash`]
 /// to the canonical [`NarHashKey`] (so discovery, the index and the claim all agree
 /// on ONE key), asks [`Discovery::resolve`] for the holder's claim, then hands its
 /// content id + offers to [`fetch_via_offers`]. A discovery MISS is a
-/// [`SourceError::Unreachable`] - the fast, clean signal a [`crate::discovery::FallbackNarSource`]
+/// [`SourceError::Unreachable`] - the fast, clean signal a [`daemon_core::discovery::FallbackNarSource`]
 /// (or the wave-1 serving layer's 502) turns into upstream fallback (S2).
 pub struct TransportNarSource {
     registry: TransportRegistry,
@@ -393,7 +393,7 @@ impl NarSource for TransportNarSource {
     /// it DURING the transfer (task-51) - never post-hoc in this driver, which would
     /// let a lying holder stream a huge blob before a late check and defeat the
     /// bound. A trip returns [`FetchError::TooLarge`], which this maps to the
-    /// PROPAGATING [`SourceError::TooLarge`] (a [`crate::discovery::FallbackNarSource`]
+    /// PROPAGATING [`SourceError::TooLarge`] (a [`daemon_core::discovery::FallbackNarSource`]
     /// does NOT paper it over with an upstream fetch).
     async fn resolve(
         &self,
@@ -550,10 +550,10 @@ mod tests {
 
     use std::sync::Arc;
 
-    use crate::claim::{CLAIM_SCHEMA_VERSION, Claim, KnownPayload, NarHashKey};
-    use crate::discovery::InMemoryDiscovery;
-    use crate::source::{NarHash, NarPathToken};
-    use crate::transport::{BitTorrentInfoHash, NodeId};
+    use daemon_core::claim::{CLAIM_SCHEMA_VERSION, Claim, KnownPayload, NarHashKey};
+    use daemon_core::discovery::InMemoryDiscovery;
+    use daemon_core::source::{NarHash, NarPathToken};
+    use daemon_core::transport::{BitTorrentInfoHash, NodeId};
 
     /// A `TransportNarSource` over `registry` whose discovery already knows
     /// `claims` (the task-40 `InMemoryDiscovery` stand-in replacing the old inline

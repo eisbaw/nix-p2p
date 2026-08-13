@@ -94,7 +94,7 @@ use serde_json::Value;
 use crate::content_id::Blake3Digest;
 use crate::source::NarHash;
 use crate::transport::{BitTorrentInfoHash, NodeId};
-use crate::transport_fetch::TransportTag;
+use peer_fabric::TransportTag;
 
 /// Wire schema version of [`Claim`]. Bumped only on a breaking change; a decoder
 /// rejects any other version cleanly (network-split boundary).
@@ -354,7 +354,7 @@ impl KnownTransport {
     /// equals this offer's [`KnownTransport::wire_tag`] is asserted directly in
     /// `known_transport_tags_agree_with_the_wire_tags` (via `offer.tag().as_str()`),
     /// so the seam string cannot silently drift from what the daemon emits.
-    pub(crate) fn tag(&self) -> TransportTag {
+    pub fn tag(&self) -> TransportTag {
         match self {
             KnownTransport::Iroh { .. } => TransportTag::Iroh,
             KnownTransport::BitTorrent { .. } => TransportTag::BitTorrent,
@@ -370,7 +370,7 @@ impl KnownTransport {
     /// `NodeId` and `BitTorrentInfoHash` ARE the seam's `NodeId`/`InfoHash` (the
     /// daemon re-exports them from `peer_fabric`), so no locator information is lost
     /// or reinterpreted.
-    pub(crate) fn to_offer(&self) -> peer_fabric::TransportOffer {
+    pub fn to_offer(&self) -> peer_fabric::TransportOffer {
         match self {
             KnownTransport::Iroh { node } => peer_fabric::TransportOffer::Iroh { node: *node },
             KnownTransport::BitTorrent { infohash } => peer_fabric::TransportOffer::BitTorrent {

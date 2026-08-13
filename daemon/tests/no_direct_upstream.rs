@@ -1,13 +1,24 @@
 //! AC#5 (the compile-time seam): all Nix cache-upstream HTTP access goes through
-//! the traits, so cache-client calls are confined to `upstream.rs`. The separate
-//! `pinned_http.rs` client is an explicit pkarr publication/lookup exception: its only
-//! recipient is a validated numeric socket and its only path is `/pkarr/<key>`.
-//! This test greps the daemon's own source to keep both boundaries honest - a
-//! new cache client in the serving layer (or any other module) still fails here.
+//! the traits, so cache-client calls are confined to `upstream.rs`. This test greps
+//! the daemon serving source to keep that boundary honest - a new cache client in the
+//! serving layer (or any other module) still fails here.
 //!
-//! It reads `src/` under `CARGO_MANIFEST_DIR` (present in every build, including
-//! the Nix sandbox where `src` is the cleaned cargo source) and references no
-//! fixture tree or dev-shell env, so the source guard is satisfied.
+//! ## Scope after the daemon-core split (TASK-146)
+//!
+//! The serving core (including `upstream.rs`, the ONLY sanctioned cache-HTTP client)
+//! moved to the `daemon-core` crate; this composite `daemon` crate keeps only the iroh
+//! backend wiring + the libp2p construction. The scan therefore covers BOTH
+//! `../daemon-core/src` (the serving core) AND this crate's own `src` (the composition
+//! root + bridges), so a stray cache-HTTP client in EITHER still trips it.
+//!
+//! The separate `pinned_http.rs` pkarr client moved to the `fabric-iroh` backend crate
+//! (TASK-144), where it is a backend-internal (re-exported) module, so its narrowness
+//! invariant is out of THIS guard's scope (a follow-up re-homes it to a fabric-iroh test);
+//! the `pinned_http` branch below is retained but inert (no such file is scanned here).
+//!
+//! It reads `src/` trees relative to `CARGO_MANIFEST_DIR` (present in every build,
+//! including the Nix sandbox where the workspace source is the cleaned cargo source) and
+//! references no fixture tree or dev-shell env, so the source guard is satisfied.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -126,9 +137,15 @@ fn assert_pinned_pkarr_exception_is_narrow(src: &Path, files: &[PathBuf], source
 
 #[test]
 fn cache_http_client_calls_are_confined_to_upstream_and_bounded_pkarr_transport() {
-    let src = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+    let manifest = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let src = manifest.join("src");
+    // The serving core (with the sanctioned `upstream.rs` client) is in daemon-core after
+    // the TASK-146 split; the composition root + bridges stay here. Scan both so the
+    // cache-HTTP confinement holds across the crate boundary.
+    let daemon_core_src = manifest.join("../daemon-core/src");
     let mut files = Vec::new();
     rs_files(&src, &mut files);
+    rs_files(&daemon_core_src, &mut files);
     assert!(!files.is_empty(), "found no source files to scan");
 
     let mut upstream_had_markers = false;

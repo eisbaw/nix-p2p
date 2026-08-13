@@ -71,6 +71,14 @@ required-features = ["evidence-fixture"]
 # conformance tests as the cross-crate equivalence guard. This is a daemon-SIDE
 # crate (testproxy depends on none of it), so `just independence` stays green.
 peer-fabric = { path = "../peer-fabric" }
+# daemon-core (TASK-146): the STACK-NEUTRAL serving frontend (serving core, correlation,
+# policy, rewrite, source/discovery orchestration + the generic PeerFabricNarSource). This
+# monolith re-exports it wholesale and adds the two backend links (iroh + libp2p) + the
+# local orphan-rule bridges. daemon-core depends on peer-fabric + proc-supervisor ONLY.
+daemon-core = { path = "../daemon-core" }
+# proc-supervisor (TASK-146): named directly so this binary's composition root can
+# construct a standalone TaskSupervisor for the pure-HTTP path.
+proc-supervisor = { path = "../proc-supervisor" }
 # fabric-iroh (TASK-144 inc 1): the iroh BACKEND crate. The node-discovery /
 # runtime / publication cluster (iroh_runtime, iroh_node_*, iroh_publication*,
 # iroh_relay, pinned_http) and the generic process supervisor moved here behind

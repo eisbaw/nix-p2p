@@ -108,12 +108,12 @@ use crate::claim::{
     MAX_BATCH_HOLD_KEYS, NarHashKey, QUERY_SCHEMA_VERSION, check_batch_keys,
 };
 use crate::content_id::Blake3Digest;
-use crate::process_group::{ProcessJob, ProcessJobSpec};
 use crate::supply_catalog::{
     NarProductionSource, SupplyCatalog, SupplyCatalogHandle, SupplyCatalogRecord,
     SupplyRegistration,
 };
 use crate::transport::NodeId;
+use proc_supervisor::process_group::{ProcessJob, ProcessJobSpec};
 
 // -------------------------------------------------------------------------
 // StorePath: a local /nix/store path this node holds.

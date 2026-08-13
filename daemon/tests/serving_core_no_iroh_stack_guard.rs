@@ -6,9 +6,11 @@
 //!
 //! ## Scope, and the honest limit (why this is a RATCHET, not the final proof)
 //!
-//! The daemon is still ONE crate (the `daemon-core` split that would make this a compile
-//! boundary is TASK-145). So "serving core" here is a CURATED set of the stack-neutral
-//! frontend modules - it deliberately EXCLUDES:
+//! TASK-146 SPLIT THE SERVING CORE INTO THE `daemon-core` CRATE, whose Cargo dependency
+//! graph contains NO iroh - so naming an iroh type there now fails to COMPILE, which is the
+//! definitive proof this scan used to approximate. This test is retained as a fast content
+//! ratchet over `daemon-core/src`; "serving core" here is a CURATED set of its modules - it
+//! deliberately EXCLUDES:
 //!   * the composition root (`main.rs`, `bin/`) - the ONE place concrete backends are named
 //!     and wired, by design;
 //!   * `transport_iroh_bridge.rs` - the deliberate, documented daemon-side `Transport`
@@ -37,10 +39,15 @@
 
 use std::path::PathBuf;
 
-/// The stack-neutral serving-core modules the de-weld isolates from the iroh stack.
+/// The stack-neutral serving-core modules the de-weld isolates from the iroh stack. Since
+/// TASK-146 they live in the `daemon-core` crate, whose dependency graph contains NO iroh at
+/// all - so this content scan is now BACKED BY the definitive crate boundary (naming an iroh
+/// type in `daemon-core` cannot compile). `peer_source.rs` (the generic PeerFabric NarSource)
+/// replaces the old daemon-side `source_libp2p.rs` in the list; `source_libp2p.rs` itself is
+/// a libp2p-CONSTRUCTION module in the `daemon` composite, out of this iroh guard's scope.
 const SERVING_CORE: &[&str] = &[
     "source.rs",
-    "source_libp2p.rs",
+    "peer_source.rs",
     "server.rs",
     "rewrite.rs",
     "narinfo_cache.rs",
@@ -107,7 +114,9 @@ fn names_token(line: &str, token: &str) -> bool {
 
 #[test]
 fn serving_core_names_no_concrete_iroh_stack_type() {
-    let src = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src");
+    // The serving core is the `daemon-core` crate now (TASK-146). Scan its src; the crate's
+    // own dependency graph (no iroh dep) is the DEFINITIVE proof, this scan the fast ratchet.
+    let src = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../daemon-core/src");
 
     let mut scanned = 0usize;
     let mut violations: Vec<String> = Vec::new();

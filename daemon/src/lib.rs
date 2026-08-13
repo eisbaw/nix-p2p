@@ -1,87 +1,65 @@
-//! nix-p2p product daemon: a transparent Nix binary-cache substituter whose
-//! only cleverness is STRUCTURE (PRD wave 0).
+//! nix-p2p product daemon (monolith / interim dual-stack build).
 //!
-//! The daemon serves the tiny Nix binary-cache HTTP API - `nix-cache-info`,
-//! `*.narinfo`, `nar/*` - passing signed metadata and NAR payloads through from
-//! an upstream cache, behind two capability seams:
+//! TASK-146 split the stack-neutral serving FRONTEND into the `daemon-core` crate (serving
+//! core, correlation, policy, budgets, rewrite, source/discovery orchestration + the generic
+//! `PeerFabricNarSource`), which depends on `peer-fabric` + `proc-supervisor` ONLY. This
+//! `daemon` crate is now the INTERIM composite that links BOTH backends (`fabric-iroh` +
+//! `fabric-libp2p`) so the existing e2e harness (s6-p2p iroh + s7-libp2p) and every
+//! integration test keep driving one binary during the transition. The clean per-backend
+//! thin binaries are `daemon-libp2p` (daemon-core + fabric-libp2p, no iroh) and the deferred
+//! `daemon-iroh` (TASK-145); see docs/peer-fabric-seam.md "Crate topology".
 //!
-//!   * [`NarinfoSource`] - narinfo lookup;
-//!   * [`NarSource`] - NAR resolution by content identity to a verified stream.
-//!
-//! Both have a single [`UpstreamHttp`] impl in wave 1. The seam carries a TYPED
-//! [`NarKey`] (a signed NarHash on the normal path, learned by correlating each
-//! narinfo as it passes through - see [`catalog`]), which is exactly the key a
-//! wave-2 iroh/p2p `NarSource` resolves. The trait boundary is frozen; what wave
-//! 2 adds is the iroh impl and the narinfo URL rewrite, not a serving-layer
-//! change. See [`source`] for the precise scope.
-//!
-//! This crate is a library + a thin binary so the in-process integration tests
-//! can drive the real serving stack over loopback (`tests/`), the same code the
-//! container harness (task-5) will drive over a socket.
+//! It re-exports `daemon-core` wholesale (so `daemon::App`, `daemon::claim::…`, etc. resolve
+//! unchanged), plus the iroh backend modules/types (`fabric-iroh`), the libp2p construction
+//! (`source_libp2p`), and two LOCAL orphan-rule bridges: [`transport_iroh_bridge`]
+//! (`IrohTransport` -> daemon-core `Transport`) and [`iroh_catalog_probe`]
+//! (`SupplyCatalogHandle` -> iroh `CatalogProbe`).
 
-pub mod availability;
-mod body;
-pub mod cacheinfo;
-pub mod catalog;
-pub mod claim;
-pub mod content_id;
-pub mod discovery;
-pub mod narinfo_cache;
-mod nixbase32;
-pub mod rewrite;
+// The stack-neutral serving frontend. `daemon::App`, `daemon::serve`, `daemon::claim::…`,
+// `daemon::TaskSupervisor` (re-exported by daemon-core from proc-supervisor), etc. all
+// resolve through this one glob, matching the monolith's former public surface.
+pub use daemon_core::*;
 
-// TASK-144 increment 1: the node-discovery / runtime / publication cluster and
-// the generic process supervisor MOVED to the `fabric-iroh` backend crate (the
-// iroh weld isolated behind the peer-fabric seam). They are re-exported here as
-// crate-root modules so every existing `crate::iroh_runtime::...`,
-// `crate::process_group::...` and `crate::pinned_http::...` path inside the
-// daemon - and the flat `daemon::AddressLookupCapability`-style re-exports below
-// (which name `iroh_runtime::{...}` etc.) - keep resolving unchanged. The only
-// cross edge is daemon -> fabric-iroh; `transport_iroh` (the iroh-blobs transfer,
-// still welded to the serving core) stays in this crate until increment 2.
-// TASK-148 inc 2: `transport_iroh` (the iroh-blobs NAR transfer/serve) also MOVED
-// below the seam into `fabric-iroh` and is re-exported here, so every
-// `crate::transport_iroh::...` path and the flat `daemon::Foo` re-exports below keep
-// resolving unchanged. The only cross edge is daemon -> fabric-iroh.
+// The iroh BACKEND crate (TASK-144): the node-discovery / runtime / publication cluster and
+// the iroh-blobs transfer/serve. Re-exported as crate-root modules so every existing
+// `crate::iroh_runtime::…` / `crate::transport_iroh::…` path inside this binary and the flat
+// `daemon::Foo` re-exports below keep resolving. The only cross edge is daemon -> fabric-iroh.
 pub use fabric_iroh::{
     iroh_node_lookup, iroh_node_record, iroh_publication, iroh_publication_authority, iroh_relay,
-    iroh_runtime, pinned_http, process_group, transport_iroh,
+    iroh_runtime, pinned_http, transport_iroh,
 };
-pub mod server;
-pub mod source;
-pub mod source_libp2p;
-mod supply_catalog;
-pub mod transport;
-pub mod transport_fetch;
-// The daemon-side `Transport`-trait bridge over `fabric_iroh::IrohTransport`'s native
-// `peer_fabric::NarTransfer` (TASK-148 inc 2). Private: it exports no items, only the
-// trait impl that keeps the daemon fetch path (TransportRegistry) driving iroh.
-mod transport_iroh_bridge;
-pub mod upstream;
 
-pub use availability::{
-    AnnounceSink, AvailabilityError, AvailabilityIndex, CommandNarDumper, DerivedNar, DumpError,
-    IndexStore, JsonFileStore, MemoryNarDumper, NarDumper, NullAnnounce, NullStore, PersistError,
-    RegularFileNarDumper, StorePath,
+// The libp2p-specific construction (start + join + wrap) over the daemon-core
+// `PeerFabricNarSource`. The generic source itself lives in daemon-core; this module holds
+// only what needs `fabric_libp2p`.
+pub mod source_libp2p;
+// The daemon's OWN `Transport`/`Discovery` fetch registry - the LEGACY iroh fetch path
+// (`TransportNarSource`, `fetch_via_offers`, `TransportRegistry`). It stays in this composite
+// (not `daemon-core`) because only the iroh path uses it: the libp2p path resolves through
+// `daemon_core::PeerFabricNarSource`. Keeping the `Transport` trait local here also lets
+// `transport_iroh_bridge` implement it for the foreign `IrohTransport` (orphan rule). It
+// moves into `daemon-iroh` with the bridge when the iroh binary is split out (TASK-145).
+pub mod transport_fetch;
+// The iroh provider's `CatalogProbe` over the daemon-core supply catalog (LOCAL newtype:
+// `CatalogProbe` and `SupplyCatalogHandle` are both foreign here, so the orphan rule needs a
+// local wrapper, TASK-146).
+pub mod iroh_catalog_probe;
+// The daemon-side `Transport` impl for the iroh `IrohTransport` (a direct impl: `Transport`
+// is local to this crate, `IrohTransport` foreign - orphan rule satisfied). Exports nothing.
+mod transport_iroh_bridge;
+
+// The frozen iroh-blobs ALPN is an iroh-specific value that lives in `fabric-iroh`; the
+// stack-neutral `daemon-core::transport` no longer names it. Re-export it here so
+// `daemon::IROH_BLOBS_ALPN` is unchanged for the iroh composition.
+pub use fabric_iroh::IROH_BLOBS_ALPN;
+
+pub use iroh_catalog_probe::IrohCatalogProbe;
+// The legacy iroh fetch-registry surface (TransportTag comes via `daemon_core::*`).
+pub use transport_fetch::{
+    FakeTransport, FetchError, Transport, TransportError, TransportNarSource, TransportRegistry,
+    fetch_via_offers, verify_blake3,
 };
-pub use cacheinfo::CacheInfo;
-pub use catalog::{CorrelationStore, NarCatalog, NarMeta, NullCorrelation};
-pub use claim::{
-    BatchHoldAnswer, BatchHoldQuery, BatchHoldResponse, CLAIM_SCHEMA_VERSION, Claim,
-    ClaimCodecError, ClaimSignature, HoldAnswer, HoldQuery, HoldResponse, KnownPayload,
-    KnownTransport, MAX_BATCH_HOLD_KEYS, MAX_BATCH_HOLD_OFFERS, MAX_CLAIM_WIRE_BYTES, NAR_HASH_LEN,
-    NAR_HASH_PREFIX, NarHashKey, NarHashKeyParseError, OfferIndex, QUERY_SCHEMA_VERSION,
-    SignedNarinfoRelay, decode_batch_hold_query, decode_batch_hold_response, decode_claim,
-    decode_hold_query, decode_hold_response, encode_batch_hold_query, encode_batch_hold_response,
-    encode_claim, encode_hold_query, encode_hold_response,
-};
-pub use content_id::{
-    BLAKE3_DIGEST_LEN, BLAKE3_DOMAIN_SEPARATION, BLAKE3_PREFIX, Blake3Digest, DigestParseError,
-};
-pub use discovery::{
-    DirectDiscovery, Discovery, FallbackNarSource, InMemoryDiscovery, InProcessPeerQuery,
-    PROBE_TIMEOUT, PeerQuery, PeerQueryError,
-};
+
 pub use iroh_node_lookup::{
     MAX_NODE_LOOKUP_TRACKED_IDS, NODE_LOOKUP_DEADLINE, NODE_LOOKUP_PROVENANCE,
     NODE_LOOKUP_SCHEDULER_GRACE, NODE_LOOKUP_SCHEMA, NODE_LOOKUP_SOURCE,
@@ -108,30 +86,16 @@ pub use iroh_relay::{
     RelayTransportUnavailable, RelayTransportUnavailableKind, classify_connection_path,
     redact_fingerprint,
 };
+// NOTE: TaskSupervisor / TaskSupervisorHandle are re-exported via `daemon_core::*` (from
+// proc-supervisor), NOT from iroh_runtime, so this block omits them to avoid a name clash.
 pub use iroh_runtime::{
     AddressLookupCapability, EndpointCapabilityState, EndpointProfile, EndpointScope,
     IROH_IDENTITY_FILENAME, IROH_SHUTDOWN_DEADLINE, IdentitySource, IrohEndpointHandle,
     IrohNodeRuntime, IrohRuntimeBuilder, IrohRuntimeError, RelayCapability, ShutdownOutcome,
-    TaskSupervisor, TaskSupervisorHandle,
-};
-pub use narinfo_cache::{Clock, NarinfoDiskCache, SystemClock};
-pub use rewrite::{
-    AllowlistRawServe, AnyRawServe, NoRawServe, RawRewrite, RawServeDecision, RewriteError, to_raw,
-};
-pub use server::{App, serve};
-pub use source::{
-    NarBody, NarHash, NarKey, NarPathToken, NarSource, NarinfoSource, RawUpstream, SourceError,
-    StoreHash, UpstreamResponse,
 };
 pub use source_libp2p::{
     Libp2pNarSource, Libp2pRawServe, Libp2pSourceConfig, build_libp2p_nar_source,
     build_libp2p_provider_source, sign_libp2p_provider_record,
-};
-pub use supply_catalog::SupplyCatalogHandle;
-pub use transport::{BitTorrentInfoHash, IROH_BLOBS_ALPN, NODE_ID_LEN, NodeId, NodeIdParseError};
-pub use transport_fetch::{
-    FakeTransport, FetchError, Transport, TransportError, TransportNarSource, TransportRegistry,
-    TransportTag, fetch_via_offers, verify_blake3,
 };
 pub use transport_iroh::{
     BODY_IDLE_TIMEOUT, DEFAULT_MAX_INFLIGHT_NAR_BYTES, DEFAULT_MAX_SERVE_DURATION,
@@ -141,4 +105,3 @@ pub use transport_iroh::{
     SafetyEnvelope, ServeBudget, ServeCounters, ServeDecline, ServeWindow, StoreResidency,
     StoreRetention, SupplyError, copy_regular_raw_nar, iroh_blobs_alpn, raw_nar_helper_authorized,
 };
-pub use upstream::UpstreamHttp;

@@ -32,12 +32,12 @@ use tokio::net::TcpListener;
 use crate::body::{empty, full};
 use crate::cacheinfo::CacheInfo;
 use crate::catalog::{CorrelationStore, NarCatalog, parse_correlation};
-use crate::iroh_runtime::TaskSupervisorHandle;
 use crate::rewrite;
 use crate::source::{
     NarBody, NarHash, NarKey, NarPathToken, NarSource, NarinfoSource, RawUpstream, SourceError,
     StoreHash, UpstreamResponse,
 };
+use proc_supervisor::TaskSupervisorHandle;
 
 /// Everything a request needs, injected so tests can swap any source for a fake.
 pub struct App {

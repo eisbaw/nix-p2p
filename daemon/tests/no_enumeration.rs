@@ -75,13 +75,19 @@
 //!     in a place a reader of a failing test will see it.
 
 const SOURCES: &[(&str, &str)] = &[
-    ("claim.rs", include_str!("../src/claim.rs")),
-    ("availability.rs", include_str!("../src/availability.rs")),
+    ("claim.rs", include_str!("../../daemon-core/src/claim.rs")),
+    (
+        "availability.rs",
+        include_str!("../../daemon-core/src/availability.rs"),
+    ),
     (
         "supply_catalog.rs",
-        include_str!("../src/supply_catalog.rs"),
+        include_str!("../../daemon-core/src/supply_catalog.rs"),
     ),
-    ("discovery.rs", include_str!("../src/discovery.rs")),
+    (
+        "discovery.rs",
+        include_str!("../../daemon-core/src/discovery.rs"),
+    ),
     // transport_iroh.rs is the module that ACCEPTS peer connections and probes an
     // inert supply catalog. The scope note used to say the unscanned modules "do
     // not answer peer messages today", which was simply false of this one - and

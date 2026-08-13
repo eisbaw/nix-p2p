@@ -28,25 +28,52 @@ use std::collections::BTreeSet;
 /// citation may resolve to. EVERY module, not a chosen few: a citation gate that
 /// scans a subset would itself be a false assurance.
 const SOURCES: &[(&str, &str)] = &[
-    ("availability.rs", include_str!("../src/availability.rs")),
-    ("body.rs", include_str!("../src/body.rs")),
-    ("cacheinfo.rs", include_str!("../src/cacheinfo.rs")),
-    ("catalog.rs", include_str!("../src/catalog.rs")),
-    ("claim.rs", include_str!("../src/claim.rs")),
-    ("content_id.rs", include_str!("../src/content_id.rs")),
-    ("discovery.rs", include_str!("../src/discovery.rs")),
+    (
+        "availability.rs",
+        include_str!("../../daemon-core/src/availability.rs"),
+    ),
+    ("body.rs", include_str!("../../daemon-core/src/body.rs")),
+    (
+        "cacheinfo.rs",
+        include_str!("../../daemon-core/src/cacheinfo.rs"),
+    ),
+    (
+        "catalog.rs",
+        include_str!("../../daemon-core/src/catalog.rs"),
+    ),
+    ("claim.rs", include_str!("../../daemon-core/src/claim.rs")),
+    (
+        "content_id.rs",
+        include_str!("../../daemon-core/src/content_id.rs"),
+    ),
+    (
+        "discovery.rs",
+        include_str!("../../daemon-core/src/discovery.rs"),
+    ),
     ("lib.rs", include_str!("../src/lib.rs")),
     ("main.rs", include_str!("../src/main.rs")),
-    ("narinfo_cache.rs", include_str!("../src/narinfo_cache.rs")),
-    ("nixbase32.rs", include_str!("../src/nixbase32.rs")),
-    ("rewrite.rs", include_str!("../src/rewrite.rs")),
-    ("server.rs", include_str!("../src/server.rs")),
-    ("source.rs", include_str!("../src/source.rs")),
+    (
+        "narinfo_cache.rs",
+        include_str!("../../daemon-core/src/narinfo_cache.rs"),
+    ),
+    (
+        "nixbase32.rs",
+        include_str!("../../daemon-core/src/nixbase32.rs"),
+    ),
+    (
+        "rewrite.rs",
+        include_str!("../../daemon-core/src/rewrite.rs"),
+    ),
+    ("server.rs", include_str!("../../daemon-core/src/server.rs")),
+    ("source.rs", include_str!("../../daemon-core/src/source.rs")),
     (
         "supply_catalog.rs",
-        include_str!("../src/supply_catalog.rs"),
+        include_str!("../../daemon-core/src/supply_catalog.rs"),
     ),
-    ("transport.rs", include_str!("../src/transport.rs")),
+    (
+        "transport.rs",
+        include_str!("../../daemon-core/src/transport.rs"),
+    ),
     (
         "transport_fetch.rs",
         include_str!("../src/transport_fetch.rs"),
@@ -58,7 +85,10 @@ const SOURCES: &[(&str, &str)] = &[
         "transport_iroh.rs",
         include_str!("../../fabric-iroh/src/transport_iroh.rs"),
     ),
-    ("upstream.rs", include_str!("../src/upstream.rs")),
+    (
+        "upstream.rs",
+        include_str!("../../daemon-core/src/upstream.rs"),
+    ),
 ];
 
 /// Test files, which are where most cited names are actually DEFINED. The first

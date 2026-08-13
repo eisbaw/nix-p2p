@@ -1,10 +1,11 @@
 ---
 id: TASK-146
 title: daemon-libp2p thin binary (gated on fabric-libp2p)
-status: To Do
-assignee: []
+status: In Progress
+assignee:
+  - mped
 created_date: '2026-08-11 23:58'
-updated_date: '2026-08-13 00:17'
+updated_date: '2026-08-13 00:35'
 labels:
   - seam
   - de-welding

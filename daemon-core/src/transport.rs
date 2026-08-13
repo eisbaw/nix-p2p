@@ -5,8 +5,8 @@
 //! per-transport LOCATORS - the coordinates each transport needs to actually
 //! reach a holder, which are NOT derivable from the content identity and differ
 //! by transport:
-//!   * iroh: a holder [`NodeId`] (an ed25519 public key) + the [`IROH_BLOBS_ALPN`]
-//!     protocol identifier. iroh dials a NodeId and streams the blob addressed by
+//!   * iroh: a holder [`NodeId`] (an ed25519 public key) + the `IROH_BLOBS_ALPN`
+//!     protocol identifier (now in `fabric-iroh`). iroh dials a NodeId and streams the blob addressed by
 //!     the universal [`crate::content_id::Blake3Digest`].
 //!   * BitTorrent: a [`BitTorrentInfoHash`] naming a swarm/piece-layout. A future
 //!     BitTorrent backend addresses the swarm by infohash, then still verifies the
@@ -26,9 +26,8 @@
 //! the canonical home of every value type that crosses the P2P seam - and are
 //! re-exported here (the daemon used to keep byte-compatible DUPLICATES, deleted by
 //! TASK-141). `BitTorrentInfoHash` is `peer_fabric::InfoHash` under its
-//! daemon-facing name. This module keeps the freeze NARRATIVE, the iroh protocol
-//! constant [`IROH_BLOBS_ALPN`] (an iroh-specific value, not a cross-seam identity;
-//! it migrates to the `fabric-iroh` backend crate in TASK-141 increment 2), and a
+//! daemon-facing name. This module keeps the freeze NARRATIVE (the iroh protocol
+//! constant `IROH_BLOBS_ALPN` moved to the `fabric-iroh` backend crate, TASK-146), and a
 //! light RE-EXPORT SMOKE TEST proving the daemon path resolves to a working
 //! `NodeId`/`BitTorrentInfoHash` with the canonical string/serde forms. (The
 //! authoritative codec conformance for these types lives with them in
@@ -54,27 +53,13 @@ pub use peer_fabric::{
     InfoHash as BitTorrentInfoHash, InfoHashParseError, NODE_ID_LEN, NodeId, NodeIdParseError,
 };
 
-/// The iroh-blobs application-layer protocol negotiated over QUIC ALPN. Frozen:
-/// two nix-p2p daemons MUST present the identical ALPN or they never connect;
-/// changing it splits the network at the connection layer.
-///
-/// This is the stock iroh-blobs protocol identifier (PRD: "Transfer uses stock
-/// iroh-blobs ALPN"), so a nix-p2p node speaks the same get-protocol as any
-/// iroh-blobs node and gets BLAKE3-verified streaming for free.
-///
-/// MOVED (TASK-148 increment 2): this iroh-specific constant now LIVES in the
-/// `fabric-iroh` backend crate (co-located with the iroh-blobs get-protocol that uses
-/// it and the compile-time `IROH_BLOBS_ALPN == iroh_blobs::ALPN` assertion, which needs
-/// the iroh-blobs dependency that landed there). TASK-141 increment 1 deliberately left
-/// it here until then; it is now re-exported so every daemon use-site
-/// (`crate::transport::IROH_BLOBS_ALPN`, `daemon::IROH_BLOBS_ALPN`) is untouched.
-///
-/// FREEZE-RISK NOTE, stated honestly: a wrong ALPN fails LOUDLY and early (peers simply
-/// fail to connect at S6 interop, no bytes are corrupted and no held blob is
-/// invalidated), so it is reconcilable at S6 - which is the design intent: S6 CONFIRMS,
-/// and an ALPN mismatch is the one freeze surface S6 can still safely realign because no
-/// data is addressed by it.
-pub use fabric_iroh::IROH_BLOBS_ALPN;
+// The iroh-blobs ALPN constant (`IROH_BLOBS_ALPN`) is an iroh-specific value, not a
+// cross-seam identity, so it lives in the `fabric-iroh` backend crate (co-located with the
+// iroh-blobs get-protocol and the compile-time `IROH_BLOBS_ALPN == iroh_blobs::ALPN`
+// assertion). TASK-146 moved this module into the stack-neutral `daemon-core` crate, which
+// has NO iroh dependency, so the re-export that used to sit here is gone; the monolith
+// `daemon` (and the future `daemon-iroh` binary) re-export `fabric_iroh::IROH_BLOBS_ALPN`
+// directly. `fabric-iroh` owns the ALPN freeze test.
 
 #[cfg(test)]
 mod tests {
@@ -83,17 +68,6 @@ mod tests {
     // The authoritative codec conformance lives with the types in `peer_fabric::ids`;
     // the golden claim-wire JSON is the cross-crate wire anchor (see module docs).
     use super::*;
-
-    #[test]
-    fn alpn_is_pinned_and_non_empty() {
-        // Conformance: the frozen ALPN value. A change to this literal is a
-        // deliberate network-split and must be a reviewed diff.
-        assert_eq!(IROH_BLOBS_ALPN, b"/iroh-bytes/4");
-        assert!(
-            !IROH_BLOBS_ALPN.is_empty(),
-            "an empty ALPN never negotiates"
-        );
-    }
 
     #[test]
     fn node_id_round_trips_as_64_hex() {

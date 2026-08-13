@@ -1,0 +1,50 @@
+[package]
+name = "daemon-core"
+description = "nix-p2p STACK-NEUTRAL serving frontend (TASK-146): the serving core (server/source/upstream/catalog/rewrite/narinfo_cache), correlation, claim/discovery/availability orchestration, and the generic PeerFabric-backed NarSource. Depends on peer-fabric + proc-supervisor ONLY - ZERO p2p-lib deps (no iroh, no libp2p, no fabric-* backend). The per-backend thin binaries (daemon-libp2p, daemon-iroh) are daemon-core + exactly one fabric-* crate; see docs/peer-fabric-seam.md 'Crate topology'."
+version.workspace = true
+edition.workspace = true
+
+[lib]
+name = "daemon_core"
+path = "src/lib.rs"
+
+[dependencies]
+# peer-fabric (TASK-140/141): the intention-level P2P seam + the canonical home of the
+# FROZEN value types (NodeId, Blake3Digest, ContentKey, ProviderRecord, TransportTag,
+# InfoHash). The frontend reaches ANY backend ONLY through `Arc<dyn PeerFabric>` and the
+# seam capability traits - never a concrete stack - which is what makes it stack-neutral.
+peer-fabric = { path = "../peer-fabric" }
+# proc-supervisor (TASK-146): the generic task/subprocess supervisor. The HTTP accept loop
+# (`server::serve`) registers connections on a `TaskSupervisorHandle`, and NAR production
+# (`availability`) runs `nix` subprocesses through `process_group`. Stack-neutral (no p2p).
+proc-supervisor = { path = "../proc-supervisor" }
+
+# HTTP stack (task-4 decision): tokio + hyper 1.x LOW-LEVEL client/server + body/util
+# helpers. The serving core forwards bytes verbatim; hyper's low-level client does no
+# auto-decompression. Same crates the monolith `daemon` used (the daemon now re-exports
+# this crate), so the independence HTTP-stack denylist is unchanged.
+tokio = { version = "1", features = ["rt-multi-thread", "net", "macros", "io-util", "time", "sync"] }
+hyper = { version = "1", features = ["http1", "server", "client"] }
+hyper-util = { version = "0.1", features = ["tokio"] }
+http = "1"
+http-body = "1"
+http-body-util = "0.1"
+bytes = "1"
+async-trait = "0.1"
+# Claim wire format (task-37): serde derives on the versioned record + query envelope,
+# JSON as the draft codec, fail-closed decode. DAEMON-SIDE only (testproxy stays std-only).
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# BLAKE3 of the addressed unit (task-48 freeze): the raw-NAR content identity recipe.
+blake3 = "1"
+# availability's NAR reader opens the raw store path with descriptor-relative, no-follow,
+# regular-file-checked filesystem ops (openat/fstat) without unsafe code. Not a p2p dep.
+rustix = { version = "1", features = ["fs"] }
+
+[dev-dependencies]
+# The serving-core in-process integration tests moved here with the modules; several stand
+# up fake NAR sources + drive time.
+tokio = { version = "1", features = ["rt-multi-thread", "net", "macros", "io-util", "time", "sync", "test-util"] }
+
+[lints]
+workspace = true
