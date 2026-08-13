@@ -1,0 +1,33 @@
+[package]
+name = "daemon-libp2p"
+description = "The PRIMARY per-backend thin binary (docs/peer-fabric-seam.md): daemon-libp2p = daemon-core + fabric-libp2p, a pure single-stack libp2p node (libp2p-kad discovery + libp2p NAR transfer) with HTTP-upstream fallback. Its fn main constructs a Libp2pFabric and calls daemon_core::run - the binary IS the backend choice, no features, no cfg. Its dependency closure contains NO iroh (a build guard proves it). The lib holds the shared libp2p CONSTRUCTION (also re-used by the interim `daemon` composite)."
+version.workspace = true
+edition.workspace = true
+
+[lib]
+name = "daemon_libp2p"
+path = "src/lib.rs"
+
+[[bin]]
+name = "daemon-libp2p"
+path = "src/main.rs"
+
+[dependencies]
+# daemon-core (TASK-146): the stack-neutral serving frontend + `daemon_core::run`. The
+# construction here wraps a running Libp2pFabric in `daemon_core::PeerFabricNarSource`; the
+# bin calls `daemon_core::run`. NO iroh in this closure - that is the whole point.
+daemon-core = { path = "../daemon-core" }
+# fabric-libp2p: the ONE backend this binary links. The construction starts a `Libp2pFabric`
+# and drives its swarm connectivity; the bin constructs it from CLI config.
+fabric-libp2p = { path = "../fabric-libp2p" }
+# peer-fabric: the seam value types the construction + bin name (DiscoveryBudget,
+# SafetyEnvelope, Axis, ProviderRecord, AnnounceBudget, ServeBudget, sign_provider_record).
+peer-fabric = { path = "../peer-fabric" }
+# ed25519-dalek (TASK-178): the provider signs each seeded NAR's ProviderRecord with the SAME
+# ed25519 seed its libp2p identity is built from. Version "3" matches peer-fabric's SigningKey.
+ed25519-dalek = "3"
+# The runtime + the serve loop; `signal` so the bin shuts down on SIGINT/SIGTERM.
+tokio = { version = "1", features = ["rt-multi-thread", "net", "macros", "time", "signal"] }
+
+[lints]
+workspace = true

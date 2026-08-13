@@ -924,6 +924,7 @@ dependencies = [
  "blake3",
  "bytes",
  "daemon-core",
+ "daemon-libp2p",
  "ed25519-dalek 3.0.0",
  "fabric-iroh",
  "fabric-libp2p",
@@ -966,6 +967,17 @@ dependencies = [
  "rustix",
  "serde",
  "serde_json",
+ "tokio",
+]
+
+[[package]]
+name = "daemon-libp2p"
+version = "0.0.1"
+dependencies = [
+ "daemon-core",
+ "ed25519-dalek 3.0.0",
+ "fabric-libp2p",
+ "peer-fabric",
  "tokio",
 ]
 

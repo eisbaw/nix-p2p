@@ -34,6 +34,7 @@ pub mod narinfo_cache;
 mod nixbase32;
 pub mod peer_source;
 pub mod rewrite;
+pub mod run;
 pub mod server;
 pub mod source;
 mod supply_catalog;
@@ -68,6 +69,7 @@ pub use peer_source::{PeerFabricNarSource, PeerFabricRawServe};
 pub use rewrite::{
     AllowlistRawServe, AnyRawServe, NoRawServe, RawRewrite, RawServeDecision, RewriteError, to_raw,
 };
+pub use run::{RunConfig, run};
 pub use server::{App, serve};
 pub use source::{
     NarBody, NarHash, NarKey, NarPathToken, NarSource, NarinfoSource, RawUpstream, SourceError,

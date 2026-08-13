@@ -11,9 +11,9 @@
 //!
 //! It re-exports `daemon-core` wholesale (so `daemon::App`, `daemon::claim::…`, etc. resolve
 //! unchanged), plus the iroh backend modules/types (`fabric-iroh`), the libp2p construction
-//! (`source_libp2p`), and two LOCAL orphan-rule bridges: [`transport_iroh_bridge`]
-//! (`IrohTransport` -> daemon-core `Transport`) and [`iroh_catalog_probe`]
-//! (`SupplyCatalogHandle` -> iroh `CatalogProbe`).
+//! (from the `daemon-libp2p` crate's lib), and two LOCAL orphan-rule bridges:
+//! `transport_iroh_bridge` (`IrohTransport` -> daemon-core `Transport`) and
+//! [`iroh_catalog_probe`] (`SupplyCatalogHandle` -> iroh `CatalogProbe`).
 
 // The stack-neutral serving frontend. `daemon::App`, `daemon::serve`, `daemon::claim::…`,
 // `daemon::TaskSupervisor` (re-exported by daemon-core from proc-supervisor), etc. all
@@ -29,10 +29,6 @@ pub use fabric_iroh::{
     iroh_runtime, pinned_http, transport_iroh,
 };
 
-// The libp2p-specific construction (start + join + wrap) over the daemon-core
-// `PeerFabricNarSource`. The generic source itself lives in daemon-core; this module holds
-// only what needs `fabric_libp2p`.
-pub mod source_libp2p;
 // The daemon's OWN `Transport`/`Discovery` fetch registry - the LEGACY iroh fetch path
 // (`TransportNarSource`, `fetch_via_offers`, `TransportRegistry`). It stays in this composite
 // (not `daemon-core`) because only the iroh path uses it: the libp2p path resolves through
@@ -93,7 +89,10 @@ pub use iroh_runtime::{
     IROH_IDENTITY_FILENAME, IROH_SHUTDOWN_DEADLINE, IdentitySource, IrohEndpointHandle,
     IrohNodeRuntime, IrohRuntimeBuilder, IrohRuntimeError, RelayCapability, ShutdownOutcome,
 };
-pub use source_libp2p::{
+// The libp2p CONSTRUCTION now lives in the `daemon-libp2p` crate's lib (the SSOT shared with
+// the primary thin binary); re-exported here so `daemon::Libp2pSourceConfig`,
+// `daemon::build_libp2p_nar_source`, etc. and the integration tests are unchanged.
+pub use daemon_libp2p::{
     Libp2pNarSource, Libp2pRawServe, Libp2pSourceConfig, build_libp2p_nar_source,
     build_libp2p_provider_source, sign_libp2p_provider_record,
 };

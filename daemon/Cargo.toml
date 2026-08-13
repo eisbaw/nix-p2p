@@ -96,13 +96,14 @@ fabric-iroh = { path = "../fabric-iroh" }
 # the edge is one-way (daemon -> fabric-libp2p) and daemon-SIDE, so `just
 # independence` stays green (testproxy depends on none of it).
 fabric-libp2p = { path = "../fabric-libp2p" }
-# ed25519-dalek (TASK-178): the libp2p PROVIDER mode signs each seeded NAR's
-# `peer_fabric::ProviderRecord` with the SAME ed25519 seed the provider node's
-# libp2p identity is built from (self-serve v1), via `peer_fabric::sign_provider_record`.
-# Version "3" matches peer-fabric's, so `SigningKey` is the one shared type across the
-# seam. Already in the daemon's closure transitively (peer-fabric/fabric-libp2p depend
-# on it); this only names it directly so the binary can mint the records to announce.
-ed25519-dalek = "3"
+# daemon-libp2p (TASK-146): the shared libp2p CONSTRUCTION (Libp2pSourceConfig +
+# build_libp2p_nar_source / build_libp2p_provider_source / sign_libp2p_provider_record) over
+# the daemon-core PeerFabricNarSource, formerly this crate's `source_libp2p` module. The
+# `daemon-libp2p` crate is the PRIMARY thin binary (daemon-core + fabric-libp2p, no iroh); its
+# lib is the single source of truth for the construction that this interim composite re-exports,
+# so the two libp2p paths cannot drift. Daemon-SIDE edge; `just independence` stays green.
+# (The record-signing ed25519 dep now lives in daemon-libp2p, not directly here.)
+daemon-libp2p = { path = "../daemon-libp2p" }
 # `sync` (task-72): the on-demand supply path needs SINGLE FLIGHT - when two peers
 # ask for the same absent digest at once, exactly one regenerates and the other
 # waits for its verdict. `tokio::sync::watch` carries the state as well as the

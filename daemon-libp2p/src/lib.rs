@@ -1,60 +1,33 @@
-//! [`Libp2pNarSource`] - a [`NarSource`] that resolves a NAR through a libp2p
-//! [`PeerFabric`]: DISCOVER a provider via libp2p-kad, then FETCH the raw NAR from it,
-//! gate-1 BLAKE3-verified, all URL-less and keyed on the signed content identity.
+//! `daemon-libp2p` (lib) - the libp2p CONSTRUCTION over the stack-neutral `daemon-core`.
 //!
-//! ## Where this sits (TASK-160, the interim both-backends path)
+//! The generic discover-then-fetch [`NarSource`] and dynamic raw-serve decision live in
+//! `daemon-core` (`PeerFabricNarSource`/`PeerFabricRawServe`, generic over
+//! `Arc<dyn PeerFabric>`); this lib holds only what needs `fabric_libp2p`: the
+//! [`Libp2pSourceConfig`] the CLI parses into, and the builders that START a
+//! [`Libp2pFabric`], JOIN the DHT (listen + bootstrap-dial + the composition-root
+//! `require_axes` gate), and WRAP the running fabric in the daemon-core source. It re-exports
+//! the daemon-core source types under their historical `Libp2p*` names.
 //!
-//! This is the functionality-first wiring that makes the daemon actually run a
-//! decentralized content path, ahead of the clean daemon-core / two-binary split
-//! (TASK-145/146). It is the libp2p sibling of [`crate::transport_fetch::TransportNarSource`]
-//! (which drives the daemon's own iroh `Transport`/`Discovery`): both live behind the
-//! FROZEN [`NarSource`] seam, so the serving layer is unchanged and the iroh path stays
-//! intact (this is purely additive).
-//!
-//! It deliberately drives the `peer-fabric` seam types END TO END rather than adapting
-//! them into the daemon's parallel `Claim`/`KnownTransport`/`Discovery` shapes. The two
-//! type families are distinct (the daemon's `discovery::Discovery` yields a daemon
-//! `Claim`; the fabric's [`ProviderDirectory`] yields a `peer_fabric::ProviderRecord`),
-//! so bolting the fabric transfer into the daemon `TransportRegistry` would need a bridge
-//! for every value crossing the seam. Talking to the fabric directly behind the ONE
-//! `NarSource::resolve` method is the cleaner fit (option (b) in the task) and keeps the
-//! fabric a swappable dependency (`Arc<dyn PeerFabric>`), not a hard-wired backend.
+//! It is the single source of truth for the libp2p construction: BOTH the `daemon-libp2p`
+//! BINARY (the clean primary, `daemon_core::run(Libp2pFabric::…)`) and the interim `daemon`
+//! composite (which re-exports these) build the libp2p path through here, so they cannot
+//! drift. The binary's dependency closure contains NO iroh (a build guard proves it); the
+//! `daemon` composite additionally links `fabric-iroh` for its retained iroh path.
 //!
 //! ## The flow (matching the FROZEN recipe)
 //!
 //! ```text
 //!   NarSource::resolve(NarKey::SignedNarHash{ hash })
-//!     -> NarHashKey::try_from(hash)                 (canonical 32-byte sha256 NarHash)
 //!     -> ContentKey::derive_from_signed_nar_hash    (FROZEN peer-fabric content.rs recipe)
 //!     -> fabric.provider_directory().find_providers(ContentKey)   (libp2p-kad, NOT injected)
-//!     -> pick a ProviderRecord: its provider NodeId, content Blake3Digest + offers
-//!     -> for each offer: fabric.transfer(offer.tag()).fetch(content, offer, size, envelope)
-//!         (the transfer resolves WHERE the provider is dialable THROUGH kad peer-routing
-//!         INSIDE the fabric before dialing - TASK-169, no injected address, DialInfo never
-//!         reaches this serving layer; gate-1 BLAKE3 verify also lives INSIDE the transfer,
-//!         so a lying holder fails closed and the next offer/record is tried)
+//!     -> for each offer: fabric.transfer(tag).fetch(content, offer, size, envelope)
+//!         (dial address resolved via kad peer-routing INSIDE the fabric - TASK-169; gate-1
+//!         BLAKE3 verify INSIDE the transfer, so a lying holder fails closed, next offer tried)
 //!     -> hand the raw NAR up; Nix re-verifies sig + sha256==NarHash (gate 2, the TCB)
 //! ```
 //!
-//! ## The two gates (unchanged from the seam's contract)
-//!
-//!   1. Transport-integrity gate (BLAKE3) - owned by the [`NarTransfer`] impl: the bytes
-//!      MUST hash to the record's `content` [`Blake3Digest`] or the fetch fails closed
-//!      and the next offer/record is tried. This daemon does NOT re-implement it here;
-//!      it trusts the trait contract and re-checks nothing the transfer already checked.
-//!   2. Trust gate (sha256 == NarHash) - owned by NIX, downstream. The daemon stays
-//!      OUTSIDE the TCB: wrong bytes that somehow slipped gate 1 yield a failed build +
-//!      retry, never a poisoned store.
-//!
-//! ## Miss / fallback discipline (S2)
-//!
-//! A discovery [`Lookup::Miss`] or [`Lookup::Unavailable`], and an exhausted offer set,
-//! all fold to a fast [`SourceError::Unreachable`] - the clean signal a
-//! [`crate::discovery::FallbackNarSource`] turns into an upstream fetch, so an
-//! un-discoverable NAR never hangs the build path. A deliberate size abort
-//! ([`TransferError::TooLarge`]) is the ONE exception: it PROPAGATES as
-//! [`SourceError::TooLarge`] (never papered over by upstream fallback), because every
-//! offer addresses the same oversized content.
+//! A discovery miss / exhausted offer set folds to a fast fallback to HTTP upstream (S2); a
+//! deliberate size abort propagates (every offer addresses the same oversized content).
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};

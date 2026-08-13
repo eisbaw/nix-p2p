@@ -14,7 +14,7 @@ resolver = "3"
 # peer-fabric (never on the daemon) and the daemon depends on it (one-way edge).
 # Both are shared only AMONG the daemon's own components; testproxy shares nothing
 # with either, so `just independence` stays green.
-members = ["daemon", "daemon-core", "fabric-iroh", "fabric-libp2p", "peer-fabric", "proc-supervisor", "testproxy"]
+members = ["daemon", "daemon-core", "daemon-libp2p", "fabric-iroh", "fabric-libp2p", "peer-fabric", "proc-supervisor", "testproxy"]
 
 [workspace.package]
 version = "0.0.1"
