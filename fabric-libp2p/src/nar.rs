@@ -390,17 +390,28 @@ where
     }
     let content = Blake3Digest::from_bytes(digest);
 
-    // The in-flight reservation (Process serve only) is held HERE, at serve_stream scope, so
-    // it lives through production AND the response write - the in-flight ceiling accounts for
-    // the produced NAR's memory while it is resident being written, not merely while
-    // producing. It was created synchronously at admit, so dropping this task at ANY point
-    // after admit - including a drop before the first poll - releases the reserve exactly once.
+    // The in-flight reservation - for a Memory serve OR a Process serve - is held HERE, at
+    // serve_stream scope, so it lives through production AND the response write. The ceiling
+    // then accounts for the produced NAR's memory while it is resident being written, for
+    // BOTH source kinds: a consumer that never reads cannot park a reservation-free blocked
+    // write and so slip past the ceiling (codex DEEP-gate finding). It was created
+    // synchronously at admit, so dropping this task at ANY point after admit - including a
+    // drop before the first poll - releases the reserve exactly once (`None` for a non-admit,
+    // which reserved nothing).
     let mut _reservation: Option<InflightReservation> = None;
 
     let response = match gate {
         None => NarResponse::NotHeld,
         Some(gate) => match gate.admit(&content) {
-            Serve::Now(response) => response,
+            Serve::Now {
+                response,
+                reservation,
+            } => {
+                // `Some` for an inline Memory serve (held through the write below), `None` for
+                // a non-admit (NotHeld / Declined) that reserved nothing.
+                _reservation = reservation;
+                response
+            }
             Serve::OffLoop {
                 plan,
                 content,
@@ -1011,11 +1022,18 @@ impl ServeGate {
     pub(crate) fn admit(&self, content: &Blake3Digest) -> Serve {
         let (plan, reservation) = match self.admit_plan(content) {
             Ok(admitted) => admitted,
-            Err(immediate) => return Serve::Now(immediate),
+            // A non-admit reserved NOTHING (stopped / unknown / too-large / busy), so it
+            // carries no reservation to release.
+            Err(immediate) => {
+                return Serve::Now {
+                    response: immediate,
+                    reservation: None,
+                };
+            }
         };
         if plan.requires_supervised_production() {
-            // Hand the guard to the caller INSIDE the outcome: the swarm worker moves it
-            // into the production future, so the reserve is released whenever that future is
+            // Hand the guard to the caller INSIDE the outcome: the per-stream serve task moves
+            // it into the production future, so the reserve is released whenever that future is
             // dropped - including before its first poll (the DEEP-gate pre-first-poll leak).
             Serve::OffLoop {
                 plan,
@@ -1023,10 +1041,24 @@ impl ServeGate {
                 reservation,
             }
         } else {
-            // Memory produced inline on the poll loop; `reservation` releases as it drops
-            // at the end of this call.
-            Serve::Now(self.finish_inline(plan, content))
+            // Memory produced inline; the reserve is HANDED BACK (not dropped here) so
+            // `serve_stream` holds it THROUGH the response write, exactly as the Process path
+            // does. The in-flight ceiling must bound concurrent Memory serve writes too - a
+            // consumer that never reads must not park a reservation-free blocked write and so
+            // bypass the ceiling (codex DEEP-gate finding).
+            let response = self.finish_inline(plan, content);
+            Serve::Now {
+                response,
+                reservation: Some(reservation),
+            }
         }
+    }
+
+    /// The serve exchange deadline (`ServeBudget::max_serve_duration`): bounds off-loop
+    /// production ([`Self::produce_admitted`]) AND the serve-side request read / response
+    /// write ([`serve_stream`]), so no phase of an inbound serve can hang unbounded.
+    pub(crate) fn max_serve_duration(&self) -> Duration {
+        self.budget.max_serve_duration
     }
 
     /// Produce an admitted [`Serve::OffLoop`] plan OFF the poll loop (TASK-193): run the
@@ -1035,24 +1067,17 @@ impl ServeGate {
     /// ([`NarSupplyPlan::produce_supervised`]).
     ///
     /// The in-flight reservation is NOT managed here: its [`InflightReservation`] guard was
-    /// constructed at admit and is owned by the caller's future (the swarm worker moves it
-    /// in alongside this call). That deliberately keeps the reserve released even when this
-    /// future is dropped BEFORE its first poll - the DEEP-gate leak an in-body guard missed.
-    /// Dropping the returned future still SIGKILL-reaps the `nix-store --dump` group, because
-    /// dropping the inner `produce_supervised` future signals caller-abandonment.
+    /// constructed at admit and is owned by the caller (the per-stream serve task moves it in
+    /// alongside this call). That deliberately keeps the reserve released even when this future
+    /// is dropped BEFORE its first poll - the DEEP-gate leak an in-body guard missed. Dropping
+    /// the returned future still SIGKILL-reaps the `nix-store --dump` group, because dropping
+    /// the inner `produce_supervised` future signals caller-abandonment.
     ///
     /// SERVE DEADLINE (TASK-157): production is bounded by `budget.max_serve_duration`. A
     /// source that has not produced its bytes within the deadline is `Declined(SupplyFailed)`
     /// and, because the timeout DROPS the inner `produce_supervised` future, its supervised
     /// process group is SIGKILL-reaped - a wedged / pathologically slow dump can never pin a
     /// serve slot open forever now that production is a long-lived off-loop await.
-    /// The serve exchange deadline (`ServeBudget::max_serve_duration`): bounds off-loop
-    /// production ([`Self::produce_admitted`]) AND the serve-side request read / response
-    /// write ([`serve_stream`]), so no phase of an inbound serve can hang unbounded.
-    pub(crate) fn max_serve_duration(&self) -> Duration {
-        self.budget.max_serve_duration
-    }
-
     pub(crate) async fn produce_admitted(
         &self,
         plan: NarSupplyPlan,
@@ -1088,9 +1113,16 @@ impl ServeGate {
 /// Where an admitted inbound serve request's bytes are produced (TASK-193): the poll-loop
 /// decision returned by [`ServeGate::admit`].
 pub(crate) enum Serve {
-    /// Answer NOW from the poll loop: a non-admit (NotHeld / Declined) or an inline Memory
-    /// NAR produced on the spot.
-    Now(NarResponse),
+    /// Answer NOW (on the per-stream serve task): either a non-admit (NotHeld / Declined,
+    /// `reservation: None` - nothing was reserved) or an inline Memory NAR produced on the
+    /// spot (`reservation: Some`, the in-flight reserve that [`serve_stream`] must hold
+    /// THROUGH the response write so the ceiling bounds concurrent Memory serve writes exactly
+    /// as it bounds Process ones - a never-reading consumer must not park a reservation-free
+    /// blocked write).
+    Now {
+        response: NarResponse,
+        reservation: Option<InflightReservation>,
+    },
     /// An admitted process source to produce OFF the poll loop via
     /// [`ServeGate::produce_admitted`]. Carries the [`InflightReservation`] guard that OWNS
     /// the reserve's release: the swarm worker moves it into the production future, so
@@ -1517,7 +1549,9 @@ mod tests {
                 content,
                 reservation,
             } => (plan, content, reservation),
-            Serve::Now(other) => panic!("expected OffLoop for a Process source, got {other:?}"),
+            Serve::Now { response, .. } => {
+                panic!("expected OffLoop for a Process source, got {response:?}")
+            }
         };
         assert_eq!(admitted_content, content);
         assert_eq!(
@@ -1586,7 +1620,7 @@ mod tests {
                 content,
                 reservation,
             } => (plan, content, reservation),
-            Serve::Now(other) => panic!("expected OffLoop, got {other:?}"),
+            Serve::Now { response, .. } => panic!("expected OffLoop, got {response:?}"),
         };
         assert_eq!(
             gate.inflight_bytes.load(Ordering::Acquire),
@@ -1669,7 +1703,9 @@ mod tests {
             Serve::OffLoop {
                 plan, reservation, ..
             } => (plan, reservation),
-            Serve::Now(other) => panic!("expected OffLoop for a Process source, got {other:?}"),
+            Serve::Now { response, .. } => {
+                panic!("expected OffLoop for a Process source, got {response:?}")
+            }
         };
         assert_eq!(
             gate.inflight_bytes.load(Ordering::Acquire),
@@ -1736,7 +1772,7 @@ mod tests {
                 content,
                 reservation,
             } => (plan, content, reservation),
-            Serve::Now(other) => panic!("expected OffLoop, got {other:?}"),
+            Serve::Now { response, .. } => panic!("expected OffLoop, got {response:?}"),
         };
         let response = {
             let _reservation = reservation;
@@ -1774,26 +1810,39 @@ mod tests {
         v
     }
 
-    /// A reader that yields the status byte once, then STALLS FOREVER (never another byte,
-    /// never EOF) - a provider that sent a status and then hung mid-body. The body-idle bound
-    /// must fire on it (AC#2), distinct from any total bound.
-    struct StatusThenStall {
-        sent_status: bool,
+    /// A reader that yields the status byte, THEN one real body chunk, THEN STALLS FOREVER
+    /// (never another byte, never EOF). The successful body chunk is the point: it proves the
+    /// body-idle guard is re-armed PER read (the stall it must catch happens AFTER a chunk was
+    /// already delivered), not merely on the first body read. Phases: 0=status, 1=one body
+    /// chunk, 2=stall.
+    struct StatusChunkThenStall {
+        phase: u8,
     }
 
-    impl AsyncRead for StatusThenStall {
+    impl AsyncRead for StatusChunkThenStall {
         fn poll_read(
             mut self: Pin<&mut Self>,
             _cx: &mut Context<'_>,
             buf: &mut [u8],
         ) -> Poll<io::Result<usize>> {
-            if !self.sent_status && !buf.is_empty() {
-                self.sent_status = true;
-                buf[0] = STATUS_NAR;
-                Poll::Ready(Ok(1))
-            } else {
-                // No forward progress, ever: the inter-chunk idle guard must abort.
-                Poll::Pending
+            match self.phase {
+                0 if !buf.is_empty() => {
+                    self.phase = 1;
+                    buf[0] = STATUS_NAR;
+                    Poll::Ready(Ok(1))
+                }
+                1 if !buf.is_empty() => {
+                    self.phase = 2;
+                    // One modest body chunk, well under any cap so ONLY the idle guard can fire
+                    // on the following stall (not the size abort).
+                    let n = buf.len().min(1024);
+                    for byte in &mut buf[..n] {
+                        *byte = 0x5a;
+                    }
+                    Poll::Ready(Ok(n))
+                }
+                // Stall AFTER a chunk was delivered: the re-armed body-idle guard must abort.
+                _ => Poll::Pending,
             }
         }
     }
@@ -1851,18 +1900,21 @@ mod tests {
         assert_eq!(got, body);
     }
 
-    /// AC#2 the DECISIVE inter-chunk idle bite: a provider sends the status byte then stalls
-    /// with no body forever. The read must fail on the BODY-IDLE bound (within it), not hang
-    /// - proving the idle guard is enforced per chunk, distinct from `total_timeout`. BITE:
-    /// drop the `timeout(body_idle_timeout, ...)` around the body read and this hangs forever.
+    /// AC#2 the DECISIVE inter-chunk idle bite: a provider sends the status byte AND one real
+    /// body chunk, THEN stalls forever. The read must fail on the BODY-IDLE bound (within it),
+    /// not hang - proving the idle guard is re-armed PER chunk and fires on a stall that
+    /// happens AFTER a chunk already streamed, distinct from `total_timeout`. BITE: guard only
+    /// the FIRST body read (or drop the per-read `timeout(body_idle_timeout, ..)`) and this
+    /// hangs forever on the post-chunk stall.
     #[tokio::test]
     async fn read_aborts_on_inter_chunk_stall_within_the_idle_bound() {
         let content = Blake3Digest::from_bytes([0x11; 32]);
-        let mut reader = StatusThenStall { sent_status: false };
+        let mut reader = StatusChunkThenStall { phase: 0 };
         let started = std::time::Instant::now();
+        // A cap far above the 1 KiB chunk, so ONLY the post-chunk idle stall can abort here.
         let err = read_response_streamed(&mut reader, Some(1 << 20), IDLE, &content)
             .await
-            .expect_err("a mid-body stall must abort on the idle bound");
+            .expect_err("a post-chunk stall must abort on the re-armed idle bound");
         let elapsed = started.elapsed();
         match err {
             TransferError::Unavailable(why) => assert!(
@@ -2021,5 +2073,90 @@ mod tests {
             0,
             "the in-flight reservation must be released after the bounded serve write"
         );
+    }
+
+    /// THE DECISIVE ceiling oracle (codex DEEP-gate finding): the in-flight byte ceiling must
+    /// bound MEMORY-backed serves too, not only Process ones. A never-reading consumer opens a
+    /// Memory serve, which produces inline and then BLOCKS on the write while HOLDING its
+    /// reservation; with the ceiling sized for exactly one such NAR, a SECOND serve must be
+    /// `Declined(Busy)`. It directly OBSERVES the reservation is NONZERO while the first write
+    /// is blocked, then that it releases to zero after the blocked serve is dropped.
+    ///
+    /// BITE: this is the oracle for the fix. With the pre-fix Memory path (the reservation
+    /// dropped inside `admit` BEFORE the write), `inflight` stays 0 while the first consumer
+    /// blocks, so (a) the "charged the ceiling" wait times out RED, and (b) the second serve
+    /// would be wrongly ADMITTED - the ceiling defeated for memory-backed content.
+    #[tokio::test]
+    async fn a_never_reading_memory_consumer_holds_the_inflight_ceiling_against_a_second_serve() {
+        let nar = vec![0x5au8; 4096];
+        let content = Blake3Digest::from_raw_nar(&nar);
+        let supplier = Arc::new(MemoryNarSupplier::new([nar.clone()]));
+        // The ceiling holds EXACTLY one such NAR, and a LONG serve deadline so the first write
+        // stays blocked (the deadline does not race the assertions).
+        let tight = ServeBudget {
+            max_nar_bytes_uncompressed_nar: 1 << 20,
+            max_inflight_bytes_uncompressed_nar: nar.len() as u64,
+            max_serve_duration: Duration::from_secs(30),
+        };
+        let gate = Arc::new(ServeGate::new(
+            tight,
+            supplier,
+            TaskSupervisorHandle::disconnected(),
+        ));
+
+        // Never-reader #1: sends the digest, never reads. The Memory serve produces inline then
+        // BLOCKS on the write, holding its reservation THROUGH the write (the fix).
+        let mock = DigestThenUnreadable {
+            digest: *content.as_bytes(),
+            read_pos: 0,
+        };
+        let serve1 = tokio::spawn(serve_stream(mock, Some(Arc::clone(&gate))));
+
+        // OBSERVE the reservation charged while #1 is blocked on its write.
+        let deadline = std::time::Instant::now() + Duration::from_secs(3);
+        loop {
+            if gate.inflight_bytes.load(Ordering::Acquire) == nar.len() as u64 {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "never-reader #1 never charged the in-flight ceiling - the Memory reservation \
+                 was dropped before the blocked write (the ceiling is bypassable)"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
+        // DECISIVE: with #1's reservation held through its blocked write, the ceiling is full,
+        // so a second serve is Declined(Busy). Pre-fix, inflight would be 0 here and this would
+        // be admitted - the ceiling defeated.
+        match gate.admit(&content) {
+            Serve::Now {
+                response: NarResponse::Declined(DeclineReason::Busy),
+                ..
+            } => {}
+            other => match other {
+                Serve::Now { response, .. } => {
+                    panic!(
+                        "expected the second serve Declined(Busy) while #1 holds the ceiling, got {response:?}"
+                    )
+                }
+                Serve::OffLoop { .. } => panic!("expected Serve::Now for a Memory source"),
+            },
+        }
+
+        // Drop #1 (abort its blocked write) and confirm the reserve releases back to zero.
+        serve1.abort();
+        let _ = serve1.await;
+        let released = std::time::Instant::now() + Duration::from_secs(3);
+        loop {
+            if gate.inflight_bytes.load(Ordering::Acquire) == 0 {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < released,
+                "the in-flight reserve must release to zero once the blocked serve is dropped"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
     }
 }

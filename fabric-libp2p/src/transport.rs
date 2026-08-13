@@ -124,71 +124,85 @@ impl NarTransfer for Libp2pTransport {
         // Resolution runs per FETCH (i.e. per offer), so a record with N libp2p offers
         // would record N OurNodeId disclosures for the same provider; libp2p is one offer
         // per record today, so this is once-per-provider in practice.
-        match self
-            .locator
-            .locate(&node, &ResolutionPolicy::PublicInfrastructure)
-            .await
-        {
-            Lookup::Found(dial_info) => {
-                let mut added = 0usize;
-                for location in &dial_info.locations {
-                    match location.parse::<Multiaddr>() {
-                        Ok(addr) => {
-                            self.handle.add_address(peer, addr).await;
-                            added += 1;
-                        }
-                        Err(why) => {
-                            // A DHT-reported location that does not parse as a Multiaddr is
-                            // anomalous (the locator built each from a real Multiaddr's
-                            // `to_string`); log and skip it rather than dial a malformed
-                            // address.
-                            tracing::warn!(
-                                %location, %why,
-                                "fabric-libp2p: skipping unparseable DHT-resolved dial address"
-                            );
+        //
+        // TOTAL-TIMEOUT SCOPE (TASK-157, codex DEEP-gate finding): the envelope's total bound
+        // wraps the WHOLE remote operation - DHT resolution AND the dial+stream - so a hanging
+        // kad resolution is bounded too. Previously it wrapped only the transfer, so a stuck
+        // `locate` escaped the envelope (bounded only by kad's own query timeout) and the whole
+        // `NarTransfer::fetch` could run for that PLUS `total_timeout`. `dial_timeout` and
+        // `body_idle_timeout` remain the finer-grained bounds enforced INSIDE the transfer.
+        let content = *content;
+        let total_timeout = envelope.total_timeout;
+        let dial_timeout = envelope.dial_timeout;
+        let body_idle_timeout = envelope.body_idle_timeout;
+        let remote = async {
+            match self
+                .locator
+                .locate(&node, &ResolutionPolicy::PublicInfrastructure)
+                .await
+            {
+                Lookup::Found(dial_info) => {
+                    let mut added = 0usize;
+                    for location in &dial_info.locations {
+                        match location.parse::<Multiaddr>() {
+                            Ok(addr) => {
+                                self.handle.add_address(peer, addr).await;
+                                added += 1;
+                            }
+                            Err(why) => {
+                                // A DHT-reported location that does not parse as a Multiaddr is
+                                // anomalous (the locator built each from a real Multiaddr's
+                                // `to_string`); log and skip it rather than dial a malformed
+                                // address.
+                                tracing::warn!(
+                                    %location, %why,
+                                    "fabric-libp2p: skipping unparseable DHT-resolved dial address"
+                                );
+                            }
                         }
                     }
+                    if added == 0 {
+                        return Err(TransferError::Unavailable(format!(
+                            "libp2p resolved provider {node} but none of its DHT-reported \
+                             addresses parsed as a dialable Multiaddr"
+                        )));
+                    }
                 }
-                if added == 0 {
+                Lookup::Miss => {
                     return Err(TransferError::Unavailable(format!(
-                        "libp2p resolved provider {node} but none of its DHT-reported \
-                         addresses parsed as a dialable Multiaddr"
+                        "libp2p node-locator knows no DHT dial address for provider {node} \
+                         right now (kad peer-routing miss)"
+                    )));
+                }
+                Lookup::Unavailable(why) => {
+                    return Err(TransferError::Unavailable(format!(
+                        "libp2p node-locator could not resolve provider {node}: {why}"
                     )));
                 }
             }
-            Lookup::Miss => {
-                return Err(TransferError::Unavailable(format!(
-                    "libp2p node-locator knows no DHT dial address for provider {node} \
-                     right now (kad peer-routing miss)"
-                )));
-            }
-            Lookup::Unavailable(why) => {
-                return Err(TransferError::Unavailable(format!(
-                    "libp2p node-locator could not resolve provider {node}: {why}"
-                )));
-            }
-        }
 
-        // STREAM the NAR over a raw libp2p substream (TASK-157). The envelope's fine-grained
-        // bounds are enforced INSIDE `fetch_nar_streaming`: `dial_timeout` on opening the
-        // stream, `body_idle_timeout` as a real inter-chunk stall guard, and the running
-        // mid-stream SIZE abort at exactly `expected_size` (the signed uncompressed NarSize,
-        // NEVER the compressed FileSize) plus the gate-1 BLAKE3 verify - so a lying provider
-        // is cut off at ~expected_size mid-transfer, and a corrupt one fails gate-1, never
-        // wrong bytes handed upward (Nix's sha256 gate remains the trust anchor downstream).
-        // Here we add only the coarse TOTAL-timeout backstop over the whole dial+stream.
-        let fetch = self.handle.fetch_nar_streaming(
-            peer,
-            *content,
-            expected_size,
-            envelope.dial_timeout,
-            envelope.body_idle_timeout,
-        );
-        match tokio::time::timeout(envelope.total_timeout, fetch).await {
+            // STREAM the NAR over a raw libp2p substream (TASK-157). The envelope's fine-grained
+            // bounds are enforced INSIDE `fetch_nar_streaming`: `dial_timeout` on opening the
+            // stream, `body_idle_timeout` as a real inter-chunk stall guard, and the running
+            // mid-stream SIZE abort at exactly `expected_size` (the signed uncompressed NarSize,
+            // NEVER the compressed FileSize) plus the gate-1 BLAKE3 verify - so a lying provider
+            // is cut off at ~expected_size mid-transfer, and a corrupt one fails gate-1, never
+            // wrong bytes handed upward (Nix's sha256 gate remains the trust anchor downstream).
+            self.handle
+                .fetch_nar_streaming(
+                    peer,
+                    content,
+                    expected_size,
+                    dial_timeout,
+                    body_idle_timeout,
+                )
+                .await
+        };
+
+        match tokio::time::timeout(total_timeout, remote).await {
             Ok(result) => result,
             Err(_elapsed) => Err(TransferError::Unavailable(format!(
-                "libp2p fetch exceeded the total timeout {:?}",
-                envelope.total_timeout
+                "libp2p fetch exceeded the total timeout {total_timeout:?}"
             ))),
         }
     }

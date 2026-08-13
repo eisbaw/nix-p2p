@@ -7,7 +7,7 @@ status: In Progress
 assignee:
   - '@claude'
 created_date: '2026-08-12 08:38'
-updated_date: '2026-08-13 17:14'
+updated_date: '2026-08-13 17:46'
 labels:
   - libp2p
   - fabric
@@ -71,4 +71,20 @@ MPED-ARCHITECT DEEP REVIEW (done): found + FIXED the headline - the raw-stream r
 HONEST LIMITS -> TASK-197 (filed): (a) gate-1 byte-corruption caught at stream COMPLETION not per-chunk (per-chunk needs a bao outboard on the wire); (b) serve side still BUFFERS the produced NAR before shipping (the serve-time integrity recheck must complete before any byte ships). Both resolved by adding a bao outboard to the transport wire.
 
 REMAINING FOR THE GATE: codex review of streaming size-abort correctness, body-idle, off-worker non-blocking, cancellation/reap, gate-1 streaming verify, no frozen-wire change. NOT self-certifying Done.
+
+REGATE-2 (2026-08-13): addressed codex NO-GO from the first DEEP gate. Bounded gate re-run green; leaving In Progress for the codex re-gate.
+
+DECISIVE FIX (Memory-path in-flight ceiling was bypassable): the serve-deadline fix had held the InflightReservation THROUGH the write only on the Process path (Serve::OffLoop); the MEMORY path (Serve::Now) dropped its reservation inside admit() BEFORE the socket write, so a never-reading consumer parked a blocked reservation-free Memory write and run_accept_loop could spawn unbounded such writes -> the in-flight byte ceiling was defeated for memory-backed content. FIX: Serve::Now now carries reservation: Option<InflightReservation> (Some for an inline Memory serve, None for a non-admit that reserved nothing); admit() hands the Memory reserve back instead of dropping it; serve_stream holds it (Memory OR Process) through production AND the response write, released exactly once on every path (completion / consumer-hung-up / deadline / drop / abort). The ceiling now bounds ALL concurrent in-flight serve writes regardless of NarSource. (Also fixed a doc-comment mis-attachment: the produce_admitted doc had merged onto the max_serve_duration accessor.)
+
+STRENGTHENED BITES:
+- Body-idle: StatusThenStall -> StatusChunkThenStall (status + ONE real body chunk + stall). read_aborts_on_inter_chunk_stall_within_the_idle_bound now proves the idle timer is RE-ARMED per chunk (the stall it catches happens AFTER a chunk already streamed), not just guarded on the first body read.
+- Never-reader ceiling (the DECISIVE oracle): new a_never_reading_memory_consumer_holds_the_inflight_ceiling_against_a_second_serve - a Memory never-reader charges the ceiling; the test OBSERVES inflight == NAR size while its write is blocked, asserts a SECOND serve is Declined(Busy) (ceiling held), then that it releases to zero after the blocked serve is dropped. PROVEN TO BITE: with the pre-fix Memory-drop-before-write behavior it FAILS at 3s ('never-reader #1 never charged the in-flight ceiling - the ceiling is bypassable'). Kept serve_releases... (Process deadline-termination) too.
+
+total_timeout SCOPE (codex Medium - FIXED here, small change): NarTransfer::fetch now wraps the WHOLE remote operation (DHT resolution/locate + add_address + dial + stream) in tokio::time::timeout(total_timeout, ...), not just the transfer. A hanging kad resolution is now bounded by the envelope total (previously only kad's own query timeout bounded it, so fetch could run resolution + total_timeout). dial_timeout / body_idle_timeout remain the finer bounds inside.
+
+KEPT ALL codex-confirmed-sound properties (mid-stream abort genuine, Process reservation exactly-once, cancellation/reap, no bad store path, frozen wire unchanged, independence green).
+
+BOUNDED GATE (inside nix develop, NOT full just test - orchestrator runs that): cargo fmt --all --check = 0; cargo build -p fabric-libp2p --locked = 0; cargo clippy -p fabric-libp2p --all-targets -D warnings = 0; python3 scripts/check-independence.py = 0; cargo test -p fabric-libp2p --locked = 64 passed / 0 failed (44 lib, 10 nar_transport, 10 others). Files: fabric-libp2p/src/nar.rs, fabric-libp2p/src/transport.rs.
+
+RE-GATE: codex re-checks the Memory-path reservation-through-write (exactly-once release on all paths), the two strengthened bites, and the total_timeout scope.
 <!-- SECTION:NOTES:END -->
