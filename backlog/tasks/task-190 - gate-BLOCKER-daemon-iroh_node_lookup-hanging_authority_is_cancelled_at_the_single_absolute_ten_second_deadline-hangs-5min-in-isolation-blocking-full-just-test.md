@@ -4,11 +4,11 @@ title: >-
   gate BLOCKER: daemon iroh_node_lookup
   'hanging_authority_is_cancelled_at_the_single_absolute_ten_second_deadline'
   hangs >5min in isolation, blocking full 'just test'
-status: In Progress
+status: Done
 assignee:
   - '@claude'
 created_date: '2026-08-13 09:08'
-updated_date: '2026-08-13 16:02'
+updated_date: '2026-08-13 16:08'
 labels:
   - infra
   - daemon
@@ -52,3 +52,9 @@ GOTCHAS: (1) paused tokio time is INCOMPATIBLE with a real iroh endpoint - iroh 
 
 NEW FINDINGS (pre-existing, unrelated, now UNMASKED by the completing gate; both block a GREEN fail-fast just test): TASK-195 (doc_citations dangling nar_size_uncompressed_nar) and TASK-196 (no_enumeration plural-holdings rule misses load()). Not fixed here (scope; daemon-core guards). PRE-EXISTING unrelated fmt defect also noted: fabric-libp2p/tests/nar_transport.rs fails 'cargo fmt --all --check' at HEAD.
 <!-- SECTION:NOTES:END -->
+
+## Final Summary
+
+<!-- SECTION:FINAL_SUMMARY:BEGIN -->
+Un-hung the full just test gate. daemon/tests/iroh_node_lookup.rs hanging_authority test paired #[tokio::test(start_paused=true)] (virtual clock) with a REAL iroh endpoint (real network I/O + maintenance timers), which paused time starves -> the test hung >5min and capped cargo test --workspace. Fix (root cause, not #[ignore]): split fabric-iroh NodeLookupHandle::resolve into resolve (default policy: Instant::now()+NODE_LOOKUP_DEADLINE) + a new pub resolve_before(node_id, absolute_deadline: Instant) so the deadline is injectable/composable at the call site; the test drops start_paused, uses a 500ms real injected deadline, and wraps an outer timeout(deadline+2s) so a broken deadline FAILS bounded instead of hanging (bite proven: neuter cancel -> fails at 2.52s). Production behavior preserved. Defect-species sweep: the only other start_paused site (fabric-iroh:1266) is safe (drives NodeLookupCore directly, no real endpoint). ACCEPTANCE: cargo test --workspace --no-fail-fast completes in 56s (was >5min hang), the fixed test passes in the full run, no hang. The completing gate honestly exposed pre-existing RED (TASK-195 doc-citation FIXED; TASK-196 no_enumeration rule drift filed) + a TASK-191 fmt miss (FIXED). LIGHT-gated (test-infra refactor).
+<!-- SECTION:FINAL_SUMMARY:END -->
