@@ -56,6 +56,40 @@ async fn start_node(seed_byte: u8, scope: &str) -> (Libp2pFabric, Multiaddr) {
     (fabric, addr)
 }
 
+/// Like [`start_node`] but with a DURABLE state directory (TASK-176 #1): the anti-rollback
+/// floor and per-key announce sequence are persisted under `state_dir`, so a fabric
+/// rebuilt on the SAME `state_dir` (a restart) re-seeds them.
+async fn start_node_durable(
+    seed_byte: u8,
+    scope: &str,
+    state_dir: std::path::PathBuf,
+) -> (Libp2pFabric, Multiaddr) {
+    let fabric = Libp2pFabric::start_durable(
+        NodeConfig {
+            identity_seed: [seed_byte; 32],
+            network_scope: scope.to_string(),
+        },
+        state_dir,
+    )
+    .expect("swarm builds");
+
+    fabric
+        .handle()
+        .listen("/ip4/127.0.0.1/tcp/0".parse().unwrap())
+        .await
+        .expect("listen bound");
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let addr = loop {
+        if let Some(addr) = fabric.handle().listen_addrs().await.into_iter().next() {
+            break addr;
+        }
+        assert!(Instant::now() < deadline, "no listen address bound in time");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    };
+    (fabric, addr)
+}
+
 /// Join `node` to the network through `boot` only, then wait for `min_peers` routing entries.
 async fn join(node: &Libp2pFabric, boot_peer: PeerId, boot_addr: Multiaddr, min_peers: usize) {
     node.handle()
@@ -360,4 +394,134 @@ async fn a_rolled_back_record_is_rejected_by_the_durable_floor() {
         }
         tokio::time::sleep(Duration::from_millis(200)).await;
     }
+}
+
+/// Whether `consumer` currently returns `provider_id` as a live provider of `key`.
+async fn provider_is_present(
+    consumer: &Libp2pFabric,
+    key: &ContentKey,
+    provider_id: NodeId,
+    budget: &DiscoveryBudget,
+) -> bool {
+    matches!(
+        consumer.provider_directory().unwrap().find_providers(key, budget).await,
+        Lookup::Found(records) if records.iter().any(|r| r.provider == provider_id)
+    )
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_restarted_provider_withdrawal_blocks_resurrection() {
+    // TASK-176 #1 + #4 e2e: the DURABLE announce-sequence makes a RESTARTED provider's
+    // withdrawal supersede the consumer's floor, so a later re-serve of the old record
+    // cannot resurrect the provider.
+    //
+    // Timeline: provider announces seq 5 (its per-key floor persisted under a state dir),
+    // consumer resolves it (its own floor advances to 5), provider RESTARTS (fresh fabric,
+    // SAME identity + SAME state dir), WITHDRAWS (re-seeded floor -> tombstone seq 6), the
+    // consumer observes the retraction (its floor advances to Withdrawn@6), then the OLD
+    // seq-5 record is RE-SERVED (a stale cache / re-put). The durable seq-6 tombstone
+    // rejects the seq-5 resurrection.
+    //
+    // MUTATION that bites: build the restarted provider with `Libp2pFabric::start`
+    // (in-memory) instead of `start_durable`. Its re-seeded floor is empty, so the
+    // withdrawal is minted at seq 1, which LOSES to the consumer's floor (5) - the
+    // consumer's slot stays Active@5, so the re-served seq-5 record is Idempotent and the
+    // provider RESURRECTS. The final sustained-absence assertion then fails.
+    let _ = tracing_subscriber::fmt::try_init();
+    let scope = "lifecycle-provider-restart";
+    let state_dir = std::env::temp_dir().join(format!(
+        "nix-p2p-provider-restart-{}-{:?}",
+        std::process::id(),
+        std::thread::current().id()
+    ));
+    let _ = std::fs::remove_dir_all(&state_dir);
+
+    let (bootstrap, boot_addr) = start_node(1, scope).await;
+    let (consumer, _) = start_node(4, scope).await;
+    let boot_peer = bootstrap.peer_id();
+    join(&consumer, boot_peer, boot_addr.clone(), 1).await;
+
+    // Provider (seed 3, durable) announces seq 5 with a long TTL, so any later drop is the
+    // withdrawal's doing, not expiry.
+    let nar_hash = [0x44u8; 32];
+    let (key, record) = signed_record(3, nar_hash, 5, 3600);
+    let provider_id = record.provider;
+    let budget = DiscoveryBudget::new(Duration::from_secs(10), 32);
+    let announce_budget = AnnounceBudget::new(Duration::from_secs(10), 20);
+
+    {
+        let (provider, _) = start_node_durable(3, scope, state_dir.clone()).await;
+        join(&provider, boot_peer, boot_addr.clone(), 1).await;
+        provider
+            .announcer()
+            .unwrap()
+            .announce(&record, &announce_budget)
+            .await
+            .expect("seq-5 announce admitted");
+
+        // The consumer resolves it, advancing its durable floor to seq 5.
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while !provider_is_present(&consumer, &key, provider_id, &budget).await {
+            assert!(
+                Instant::now() < deadline,
+                "consumer never resolved the provider"
+            );
+            tokio::time::sleep(Duration::from_millis(150)).await;
+        }
+    } // the provider fabric is DROPPED here == a process restart (state dir persists)
+
+    // RESTART: a fresh fabric, SAME identity + SAME state dir -> re-seeds the per-key
+    // announce sequence floor from disk, then withdraws (mints seq 6, strictly newer).
+    let (restarted, _) = start_node_durable(3, scope, state_dir.clone()).await;
+    join(&restarted, boot_peer, boot_addr.clone(), 1).await;
+    restarted
+        .announcer()
+        .unwrap()
+        .withdraw(&key)
+        .await
+        .expect("restarted provider withdraw admitted");
+
+    // Let the tombstone propagate, then require the consumer to observe the retraction for
+    // a CONSECUTIVE streak (so its floor has reliably advanced to Withdrawn@6, not a
+    // transient not-yet-fetched blip) before we test resurrection.
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    let deadline = Instant::now() + Duration::from_secs(25);
+    let mut absent_streak = 0;
+    while absent_streak < 5 {
+        if provider_is_present(&consumer, &key, provider_id, &budget).await {
+            absent_streak = 0;
+            assert!(
+                Instant::now() < deadline,
+                "the restarted provider's withdrawal never retracted the record"
+            );
+        } else {
+            absent_streak += 1;
+        }
+        tokio::time::sleep(Duration::from_millis(150)).await;
+    }
+
+    // RESURRECTION ATTEMPT: the OLD seq-5 record is re-served (a stale cache re-put). Only
+    // a strictly-newer (durable seq-6) tombstone floor blocks it; a non-durable seq-1
+    // tombstone that lost to the consumer's floor does NOT, so the provider would come back.
+    restarted
+        .announcer()
+        .unwrap()
+        .announce(&record, &announce_budget)
+        .await
+        .expect("seq-5 re-serve admitted by the substrate");
+
+    // The provider must STAY gone for a sustained window: the durable floor rejects the
+    // re-served seq-5 record.
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    let check_until = Instant::now() + Duration::from_secs(6);
+    while Instant::now() < check_until {
+        assert!(
+            !provider_is_present(&consumer, &key, provider_id, &budget).await,
+            "the durable seq-6 tombstone must block resurrection of the re-served \
+             seq-5 record (a non-durable seq-1 tombstone would let it resurrect)"
+        );
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+
+    let _ = std::fs::remove_dir_all(&state_dir);
 }
