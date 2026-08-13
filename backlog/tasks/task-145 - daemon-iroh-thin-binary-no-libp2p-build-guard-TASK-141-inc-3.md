@@ -4,7 +4,7 @@ title: daemon-iroh thin binary + no-libp2p build guard (TASK-141 inc 3)
 status: To Do
 assignee: []
 created_date: '2026-08-11 23:58'
-updated_date: '2026-08-13 02:10'
+updated_date: '2026-08-13 02:20'
 labels:
   - iroh
   - seam
@@ -12,6 +12,7 @@ labels:
   - wave-2c
 dependencies:
   - TASK-144
+  - TASK-183
 priority: high
 ---
 
