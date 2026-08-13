@@ -3,11 +3,11 @@ id: TASK-166
 title: >-
   Iroh relay evidence: measure real connect duration; stop clamping the deadline
   oracle
-status: Done
+status: In Progress
 assignee:
   - '@claude'
 created_date: '2026-08-12 14:13'
-updated_date: '2026-08-13 05:16'
+updated_date: '2026-08-13 05:54'
 labels:
   - iroh
   - evidence
