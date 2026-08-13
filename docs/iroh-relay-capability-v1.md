@@ -87,7 +87,13 @@ COORDINATES are not trusted as free text either: `relay_ip` and `acceptor_ip` ar
 re-derived from the (strict, canonical) acceptor subnet at their deterministic
 `make_topology` offsets and the `relay_url` host must equal `relay_ip`, so a
 forged `acceptor_ip` cannot point the direct counter at a decoy while a real leak
-reaches the true peer. Attribution is IPv4-only, so every captured record must
+reaches the true peer. This coordinate binding assumes the relay-port traffic in
+the pcap is a GENUINE sandboxed capture: it defeats relocating the attribution
+coordinate over real bytes (there is no second relay-port endpoint to move the
+relay onto), but not a wholesale fabricated pcap with decoy relay-port packets at
+an arbitrary address — that is equivalent to fabricating the entire capture and
+is anchored by the rootless-podman sandbox plus the git-blob-pinned peer/harness
+binaries, not by the finalizer. Attribution is IPv4-only, so every captured record must
 decode to an IPv4 TCP/UDP flow (records == IPv4-flow count) — a non-IPv4 packet
 would otherwise be unattributed. The raw pcaps + capture logs are retained
 alongside the artifact so the counts stay independently re-derivable. Missing or invalid evidence is a fatal validation error,
