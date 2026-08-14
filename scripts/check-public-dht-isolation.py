@@ -79,10 +79,24 @@ in one file with the kad ctor swapped to `Behaviour::new`, plus an UNRELATED
 co-location, not mere global presence, is required). A guard that cannot be shown to
 fail is not a guard.
 
+PRIMARY vs SECONDARY (TASK-154 F2): this SOURCE scan is the CHEAP SECONDARY lint. The
+PRIMARY, unbypassable AC#3 oracle is now a SEMANTIC Rust test,
+`kad_speaks_only_the_private_scoped_protocol_never_the_public_ipfs_dht` in
+`fabric-libp2p/src/swarm.rs`. That test calls the SINGLE production kad constructor
+(`build_kad_behaviour`) and inspects `kad::Behaviour::protocol_names()` on the RUNTIME object,
+asserting the private `/nix-p2p/<scope>/kad` protocol IS advertised and the public
+`/ipfs/kad/1.0.0` is NOT. Because it binds to the constructed behaviour, not the source text,
+the `Behaviour::with_config` -> `Behaviour::new` / `Config::default()` regression BITES there
+regardless of any same-file source decoy (the bypass that defeated this text scan THREE times:
+global -> file -> same-file). This scan remains only to catch the ACCIDENTAL / straightforward
+re-enablement cheaply at lint time; it is NOT, and never was, an adversarial-proof oracle.
+
 Limits, stated plainly: like its sibling this is a dependency-free substring
 scan over comment-stripped source, so it catches an accidental or straightforward
 re-enablement, not a determined obfuscation (an aliased import, a runtime-computed
-protocol string, a raw-string-encoded marker). The comment stripper handles line
+protocol string, a raw-string-encoded marker); a determined developer defeats any source
+lint (or simply deletes the guard) — that is what the semantic test above exists to catch.
+The comment stripper handles line
 / block comments and ordinary string literals; it does not parse Rust.
 It also does NOT prove the node cannot be TOLD (via explicit config) to dial a
 public peer - `join_bootstraps` takes caller-supplied addresses by design

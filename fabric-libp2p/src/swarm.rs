@@ -1631,6 +1631,46 @@ pub mod abort {
     }
 }
 
+/// Build the shipped node's Kademlia behaviour: the PRIVATE, scope-namespaced kad DHT.
+///
+/// This is the SINGLE construction site for the node's `kad::Behaviour`, called by
+/// [`Node::start`] in production AND asserted directly by the AC#3 semantic guard test
+/// (`kad_speaks_only_the_private_scoped_protocol_never_the_public_ipfs_dht`, TASK-154). Binding
+/// the test to THIS function — it inspects [`kad::Behaviour::protocol_names`] on the object
+/// returned here — is what makes the AC#3 oracle SEMANTIC and unbypassable by source-text decoys
+/// (the TASK-154 F2 non-converging regex whack-a-mole). A regression swapping
+/// `kad::Behaviour::with_config` / `kad::Config::new(kad_protocol)` for the default
+/// `kad::Behaviour::new` / `kad::Config::default()` preset would silently advertise the PUBLIC
+/// IPFS default kad protocol (rejoining the global IPFS DHT); that flips the protocol set the
+/// test observes on the constructed runtime object and BITES, no matter what the surrounding
+/// source text says. The `check-public-dht-isolation.py` scan is retained only as a cheap
+/// secondary lint for the accidental case.
+///
+/// `kad_protocol` is the caller-built `/nix-p2p/<scope>/kad/1.0.0` [`StreamProtocol`]. The store
+/// carries the EXPLICIT anti-amplification caps (TASK-154 AC#1, see [`content_store_config`]); the
+/// query timeout is the configurable per-query deadline (TASK-210).
+fn build_kad_behaviour(
+    peer_id: PeerId,
+    kad_protocol: StreamProtocol,
+    kad_query_timeout: Duration,
+) -> kad::Behaviour<MemoryStore> {
+    // EXPLICIT storage caps for a shipped home node (TASK-154 AC#1), never the library
+    // defaults - a poisoning/amplification/sybil flood against the store costs only bounded
+    // memory. See `content_store_config`.
+    let store = MemoryStore::with_config(peer_id, content_store_config());
+    let mut kad_config = kad::Config::new(kad_protocol);
+    // Configurable per-query deadline (TASK-210). Was a hardcoded 10s, which TASK-209's RTT
+    // sweep showed covers only up to ~250ms one-way and silently DeadlineExceeds GEO-satellite
+    // (~600ms one-way) peers. See `DEFAULT_KAD_QUERY_TIMEOUT` for the default's justification.
+    kad_config.set_query_timeout(kad_query_timeout);
+    let mut kad = kad::Behaviour::with_config(peer_id, store, kad_config);
+    // Server mode: this node STORES records and ANSWERS queries. Without it a node stays a
+    // client that never holds provider/value records, so the DHT could not answer - fatal for
+    // a decentralized directory.
+    kad.set_mode(Some(kad::Mode::Server));
+    kad
+}
+
 impl Node {
     /// Build the swarm for `config` and spawn its worker. The node is not yet
     /// listening or bootstrapped; the caller drives that via the [`SwarmHandle`].
@@ -1678,21 +1718,13 @@ impl Node {
                  relay_client|
                  -> Result<Behaviour, Box<dyn std::error::Error + Send + Sync>> {
                     let peer_id = key.public().to_peer_id();
-                    // EXPLICIT storage caps for a shipped home node (TASK-154 AC#1), never the
-                    // library defaults - a poisoning/amplification/sybil flood against the
-                    // store costs only bounded memory. See `content_store_config`.
-                    let store = MemoryStore::with_config(peer_id, content_store_config());
-                    let mut kad_config = kad::Config::new(kad_protocol);
-                    // Configurable per-query deadline (TASK-210). Was a hardcoded 10s, which
-                    // TASK-209's RTT sweep showed covers only up to ~250ms one-way and
-                    // silently DeadlineExceeds GEO-satellite (~600ms one-way) peers. See
-                    // `DEFAULT_KAD_QUERY_TIMEOUT` for the default's justification + tradeoff.
-                    kad_config.set_query_timeout(kad_query_timeout);
-                    let mut kad = kad::Behaviour::with_config(peer_id, store, kad_config);
-                    // Server mode: this node STORES records and ANSWERS queries. Without
-                    // it a node stays a client that never holds provider/value records,
-                    // so the DHT could not answer - fatal for a decentralized directory.
-                    kad.set_mode(Some(kad::Mode::Server));
+                    // The node's Kademlia behaviour is built by the SINGLE shared constructor
+                    // `build_kad_behaviour` (see its doc): the PRIVATE, scope-namespaced
+                    // `/nix-p2p/<scope>/kad/1.0.0` DHT with EXPLICIT store caps (TASK-154 AC#1)
+                    // and the configurable query timeout (TASK-210). The AC#3 SEMANTIC guard test
+                    // asserts `.protocol_names()` on exactly this construction, so a swap to the
+                    // default `kad::Behaviour::new` (the PUBLIC IPFS DHT preset) bites (TASK-154 F2).
+                    let kad = build_kad_behaviour(peer_id, kad_protocol, kad_query_timeout);
                     let identify =
                         identify::Behaviour::new(identify::Config::new(id_protocol, key.public()));
                     // The RAW-STREAM NAR byte-transfer substrate (TASK-157): opened and
@@ -1918,6 +1950,70 @@ mod tests {
             store.providers(&key).len(),
             STORE_MAX_PROVIDERS_PER_KEY,
             "the per-key provider set must not grow past the explicit anti-sybil cap"
+        );
+    }
+
+    // ============ TASK-154 AC#3 SEMANTIC public-DHT-isolation oracle ============
+    // The unbypassable half of AC#3 (the source scan `check-public-dht-isolation.py` is the
+    // cheap secondary lint). Unlike a text scan — which a same-file decoy `with_config` kept
+    // defeating (the F2 non-converging regex whack-a-mole) — this binds to the RUNTIME object:
+    // it calls the SINGLE production constructor `build_kad_behaviour` and asserts the actual
+    // `protocol_names()` the swarm will advertise. A regression swapping `Behaviour::with_config`
+    // /`Config::new` for the default `Behaviour::new`/`Config::default()` preset flips this set
+    // to the PUBLIC IPFS default preset and BITES here regardless of any source-text decoy.
+
+    #[test]
+    fn kad_speaks_only_the_private_scoped_protocol_never_the_public_ipfs_dht() {
+        let peer = PeerId::random();
+        let scope = "unit-test-scope";
+        // The protocol is built exactly as `Node::start` builds it, then handed to the SAME
+        // production constructor the shipped node uses. We inspect what that construction
+        // actually advertises — not what the source says it advertises.
+        let kad_protocol = StreamProtocol::try_from_owned(format!("/nix-p2p/{scope}/kad/1.0.0"))
+            .expect("the scoped kad protocol name is valid");
+        let kad = build_kad_behaviour(peer, kad_protocol, DEFAULT_KAD_QUERY_TIMEOUT);
+        let names: Vec<String> = kad.protocol_names().iter().map(|p| p.to_string()).collect();
+
+        // The library DEFAULT preset (`kad::Behaviour::new` / `kad::Config::default()`) — the
+        // exact thing a regression would swap to — is derived at RUNTIME from `bare_kad()` rather
+        // than hardcoding the public token. This (a) keeps the forbidden public token out of our
+        // source so `check-public-dht-isolation.py`'s raw-text arm does not false-positive on this
+        // very test, and (b) stays correct if libp2p ever renames its default protocol.
+        let public_default: Vec<String> = bare_kad()
+            .protocol_names()
+            .iter()
+            .map(|p| p.to_string())
+            .collect();
+
+        // The private scoped protocol IS the kad protocol this node speaks.
+        assert!(
+            names
+                .iter()
+                .any(|n| n == &format!("/nix-p2p/{scope}/kad/1.0.0")),
+            "the constructed kad Behaviour must advertise the private /nix-p2p/<scope>/kad \
+             protocol, got {names:?}"
+        );
+        // It shares NOTHING with the public default preset. This is the bite: a swap to the
+        // default `kad::Behaviour::new`/`kad::Config::default()` preset makes `protocol_names()`
+        // equal `public_default` (the public IPFS DHT), failing every assertion here (proven by
+        // mutation: swap the ctor in `build_kad_behaviour` and this test fails, observing the
+        // public protocol set).
+        assert!(
+            names.iter().all(|n| !public_default.contains(n)),
+            "the constructed kad Behaviour must NOT advertise ANY protocol from the public \
+             default preset (a default `Behaviour::new`/`Config::default()` regression rejoined \
+             the global IPFS DHT), got {names:?} vs default {public_default:?}"
+        );
+        assert_ne!(
+            names, public_default,
+            "the constructed kad protocol set must DIFFER from the library default preset"
+        );
+        // Belt-and-braces: the ONLY protocol is the private one (single-protocol kad::Config),
+        // so nothing else slipped in either.
+        assert_eq!(
+            names,
+            vec![format!("/nix-p2p/{scope}/kad/1.0.0")],
+            "the constructed kad Behaviour must advertise ONLY the private scoped protocol"
         );
     }
 
