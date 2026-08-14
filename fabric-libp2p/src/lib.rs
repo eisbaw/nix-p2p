@@ -126,6 +126,7 @@ pub use transport::Libp2pTransport;
 // Re-export libp2p's address/peer types the composition root and tests need to drive
 // connectivity, so a consumer does not depend on libp2p directly for the seam-level
 // wiring.
+pub use libp2p::multiaddr::Protocol;
 pub use libp2p::{Multiaddr, PeerId};
 
 /// Current Unix time in seconds, for the record expiry gate and TTL reconciliation. A

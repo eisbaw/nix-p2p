@@ -23,9 +23,9 @@ use daemon_core::{
     RawUpstream, RunConfig, SystemClock, UpstreamHttp, run,
 };
 use daemon_libp2p::{
-    LanShare, Libp2pCatalogProbe, Libp2pSourceConfig, announce_provider_seeds,
+    LanReachability, LanShare, Libp2pCatalogProbe, Libp2pSourceConfig, announce_provider_seeds,
     announce_store_provisions, build_libp2p_nar_source, build_libp2p_provider_source,
-    resolve_durable_identity_seed, verify_store_provisions,
+    lan_isolation_or_refuse, resolve_durable_identity_seed, verify_store_provisions,
 };
 use ed25519_dalek::SigningKey;
 use fabric_libp2p::{
@@ -273,27 +273,20 @@ fn warn_if_non_durable_provider(source_cfg: &Libp2pSourceConfig) {
     }
 }
 
-/// The TASK-102 bootstrap guard for the shipped provider modes. These announce over a PRIVATE /
-/// LAN (operator-assembled) substrate: the seed/store bytes are content-verified (TASK-56) but NOT
-/// publication-authorized by the public-NAR allowlist (whose config is not wired until TASK-103).
-///
-/// Announcing to a BOOTSTRAPPED - hence potentially PUBLIC - DHT without an allowlist would publish
-/// operator-named local holdings to strangers, exactly the leak TASK-102 prevents. So refuse it
-/// (fail-closed, naming TASK-103) rather than merely warn. An EMPTY bootstrap set has no routing
-/// targets on which to store a provider record, a defensible proxy for "this announce cannot reach
-/// a public DHT", so the genuinely-isolated LAN MVP still runs and this returns the [`LanShare`]
-/// witness the private announce door requires.
-fn lan_share_or_refuse(bootstrap: &[(PeerId, Multiaddr)]) -> Result<LanShare, String> {
-    if !bootstrap.is_empty() {
-        return Err(
-            "refusing to announce provider records to a --libp2p-bootstrap (potentially PUBLIC) \
-             DHT without a configured public-NAR allowlist: this would publish operator-named \
-             local content to strangers. The allowlist-gated public announce door is wired by \
-             TASK-103; run WITHOUT --libp2p-bootstrap for an isolated LAN announce."
-                .to_string(),
-        );
-    }
-    Ok(LanShare::operator_assembled())
+/// The TASK-102 LAN-isolation guard for the shipped provider modes (fix cycle #2). These announce
+/// over a PRIVATE / LAN (operator-assembled) substrate: the seed/store bytes are content-verified
+/// (TASK-56) but NOT publication-authorized by the public-NAR allowlist (config not wired until
+/// TASK-103). This thin wrapper maps the binary's parsed [`Config`] to the FULL reachability the
+/// shared [`lan_isolation_or_refuse`] policy inspects - bootstrap, provider-addr, AND listen - so a
+/// provider that can reach ANY public substrate (not just one with a non-empty bootstrap) is
+/// refused. Keeping the Config->reachability mapping in ONE tested place is what closes the residual
+/// hole where `--libp2p-provider-addr` + empty bootstrap slipped through a bootstrap-only check.
+fn lan_share_or_refuse(cfg: &Config) -> Result<LanShare, String> {
+    lan_isolation_or_refuse(LanReachability {
+        bootstrap: &cfg.libp2p_bootstrap,
+        provider_addrs: &cfg.libp2p_provider_addrs,
+        listen: cfg.libp2p_listen.as_ref(),
+    })
 }
 
 /// Node B (PROVIDER): start the fabric WITH a supplier, install the serve gate, and announce.
@@ -371,7 +364,7 @@ async fn install_seed_provider(
 
     // TASK-102 bootstrap guard: refuse a bootstrapped (potentially public) announce without an
     // allowlist; an isolated LAN announce is permitted and yields the LanShare witness.
-    let lan = lan_share_or_refuse(&cfg.libp2p_bootstrap)?;
+    let lan = lan_share_or_refuse(cfg)?;
     let announce_budget = AnnounceBudget::new(Duration::from_secs(10), 20);
     // The shared SSOT provider announce loop (durable-allocate -> sign -> announce), the same
     // one the restart-durability test exercises (TASK-185 GB2).
@@ -480,7 +473,7 @@ async fn install_store_provider(
 
     // TASK-102 bootstrap guard (see install_seed_provider): refuse a bootstrapped announce
     // without an allowlist; an isolated LAN announce is permitted.
-    let lan = lan_share_or_refuse(&cfg.libp2p_bootstrap)?;
+    let lan = lan_share_or_refuse(cfg)?;
     let announce_budget = AnnounceBudget::new(Duration::from_secs(10), 20);
     let records = announce_store_provisions(
         &fabric,
@@ -738,32 +731,101 @@ async fn wait_for_shutdown() -> Result<&'static str, String> {
 
 #[cfg(test)]
 mod bootstrap_guard_tests {
-    //! TASK-102 bootstrap guard bite: the shipped provider modes must REFUSE announcing to a
-    //! `--libp2p-bootstrap` (potentially public) DHT without a configured allowlist, and must
-    //! still permit an isolated (empty-bootstrap) LAN announce. Neuter `lan_share_or_refuse`
-    //! (drop the `!bootstrap.is_empty()` refusal) and the refusal assertion goes RED.
-    use super::lan_share_or_refuse;
+    //! TASK-102 LAN-isolation guard bite (fix cycle #2): the shipped provider modes must REFUSE
+    //! announcing whenever the node can reach ANY public substrate without a configured allowlist -
+    //! a non-empty `--libp2p-bootstrap`, a non-empty `--libp2p-provider-addr` (the residual), or a
+    //! non-loopback/non-link-local `--libp2p-listen` - and still permit a provably-isolated
+    //! (loopback-listen, no bootstrap, no provider-addr) LAN announce. This drives the binary's
+    //! Config->reachability wrapper, so a call site that FORGOT to pass provider-addr/listen (the
+    //! original hole) is caught here, not only in the lib-level policy test.
+    use super::{Config, lan_share_or_refuse};
     use fabric_libp2p::{Multiaddr, PeerId};
 
+    fn peer() -> PeerId {
+        "12D3KooWDpJ7As7BWAwRMfu1VU2WCqNjvq387JEYKDBj4kx6nXTN"
+            .parse()
+            .unwrap()
+    }
+
+    fn addr(s: &str) -> Multiaddr {
+        s.parse().unwrap()
+    }
+
+    /// A minimal PROVIDER config with the reachability fields set from the args and safe defaults
+    /// elsewhere. The wrapper only reads `libp2p_bootstrap` / `libp2p_provider_addrs` /
+    /// `libp2p_listen`, so the other fields are immaterial to the guard.
+    fn provider_cfg(
+        bootstrap: Vec<(PeerId, Multiaddr)>,
+        provider_addrs: Vec<(PeerId, Multiaddr)>,
+        listen: Option<Multiaddr>,
+    ) -> Config {
+        Config {
+            listen: "127.0.0.1:0".parse().unwrap(),
+            upstream: "https://cache.nixos.org".to_string(),
+            header_timeout_ms: 30_000,
+            narinfo_cache_dir: None,
+            store_dir: "/nix/store".to_string(),
+            priority: 0,
+            want_mass_query: true,
+            libp2p_bootstrap: bootstrap,
+            libp2p_provider_addrs: provider_addrs,
+            libp2p_listen: listen,
+            libp2p_scope: None,
+            libp2p_identity_seed: None,
+            libp2p_provider: true,
+            libp2p_seed_nar: Vec::new(),
+            libp2p_provide_store: Vec::new(),
+            libp2p_print_peer_address: false,
+            libp2p_state_dir: None,
+        }
+    }
+
     #[test]
-    fn empty_bootstrap_is_permitted_as_a_lan_announce() {
+    fn isolated_loopback_provider_is_permitted_as_a_lan_announce() {
+        let cfg = provider_cfg(Vec::new(), Vec::new(), Some(addr("/ip4/127.0.0.1/tcp/0")));
         assert!(
-            lan_share_or_refuse(&[]).is_ok(),
-            "an isolated (no-bootstrap) LAN announce must be permitted"
+            lan_share_or_refuse(&cfg).is_ok(),
+            "a provably-isolated (loopback-listen, no bootstrap/provider-addr) announce is permitted"
         );
     }
 
     #[test]
     fn a_bootstrapped_announce_without_an_allowlist_is_refused() {
-        let peer: PeerId = "12D3KooWDpJ7As7BWAwRMfu1VU2WCqNjvq387JEYKDBj4kx6nXTN"
-            .parse()
-            .unwrap();
-        let addr: Multiaddr = "/ip4/127.0.0.1/tcp/4001".parse().unwrap();
-        let err = lan_share_or_refuse(&[(peer, addr)])
+        let cfg = provider_cfg(
+            vec![(peer(), addr("/ip4/127.0.0.1/tcp/4001"))],
+            Vec::new(),
+            Some(addr("/ip4/127.0.0.1/tcp/0")),
+        );
+        let err = lan_share_or_refuse(&cfg)
             .expect_err("a bootstrapped announce without an allowlist must be refused");
         assert!(
             err.contains("TASK-103"),
             "the refusal must name TASK-103 (the wiring that makes this safe): {err}"
         );
+    }
+
+    #[test]
+    fn a_provider_addr_with_empty_bootstrap_is_refused() {
+        // THE residual bite (fix cycle #2): before the fix the guard checked ONLY the bootstrap
+        // vector, so this provider (empty bootstrap, a provider-addr seeded into kad) MINTED a
+        // LanShare and announced UNGATED to the public DHT. It must now REFUSE.
+        let cfg = provider_cfg(
+            Vec::new(),
+            vec![(peer(), addr("/ip4/127.0.0.1/tcp/4001"))],
+            Some(addr("/ip4/127.0.0.1/tcp/0")),
+        );
+        let err = lan_share_or_refuse(&cfg)
+            .expect_err("a provider-addr with empty bootstrap must be refused");
+        assert!(
+            err.contains("--libp2p-provider-addr") && err.contains("TASK-103"),
+            "the refusal must name the provider-addr signal and TASK-103: {err}"
+        );
+    }
+
+    #[test]
+    fn a_public_listen_provider_is_refused() {
+        let cfg = provider_cfg(Vec::new(), Vec::new(), Some(addr("/ip4/0.0.0.0/tcp/4001")));
+        let err = lan_share_or_refuse(&cfg).expect_err("a wildcard/public listen must be refused");
+        assert!(err.contains("TASK-103"), "must name TASK-103: {err}");
     }
 }

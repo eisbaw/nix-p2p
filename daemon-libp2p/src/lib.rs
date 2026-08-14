@@ -720,6 +720,117 @@ impl LanShare {
     }
 }
 
+/// The FULL node-reachability configuration the LAN-isolation witness inspects (TASK-102 fix
+/// cycle #2). Borrowed from the composition root's parsed CLI so the guard sees EVERY public-reach
+/// signal the shipped config can express - not just the bootstrap vector, which was the residual
+/// hole: a provider started with `--libp2p-provider-addr` (a dial-addr override) but EMPTY
+/// `--libp2p-bootstrap` STILL joins the public kad DHT (the provider-addr enters the routing table),
+/// yet a bootstrap-only guard minted a `LanShare` and announced UNGATED. `bootstrap-empty` is NOT
+/// `isolated-LAN`; the witness must require POSITIVE proof the node is loopback/link-local-only.
+pub struct LanReachability<'a> {
+    /// `--libp2p-bootstrap` peers. ANY entry means the node is joining a kad DHT it did not
+    /// assemble; whatever that bootstrap peer bridges to (potentially the public DHT) receives the
+    /// announced records. Presence alone is a public-reach signal, regardless of the peer's address.
+    pub bootstrap: &'a [(PeerId, Multiaddr)],
+    /// `--libp2p-provider-addr` seeds. ANY entry is `add_address`-ed into the kad routing table (a
+    /// dial-addr override / entry hint), giving an otherwise-empty-bootstrap provider a peer to
+    /// `start_providing`/`put_record` against - the EXACT residual that let an ungated announce
+    /// reach a public substrate. Presence alone is a public-reach signal, like a bootstrap peer.
+    pub provider_addrs: &'a [(PeerId, Multiaddr)],
+    /// `--libp2p-listen` bind address, if any. A listen address that is NOT provably
+    /// loopback/link-local (a public IP, a wildcard `0.0.0.0`/`::`, or a DNS name) makes the node
+    /// reachable by strangers, so it is a public-reach signal. A loopback/link-local listen is not.
+    pub listen: Option<&'a Multiaddr>,
+}
+
+/// Whether a multiaddr is PROVABLY LAN-only: it carries at least one inspectable IP literal and
+/// every such literal is loopback or link-local. A multiaddr without an inspectable IP (a DNS name
+/// that resolves to who-knows-what, a relay `/p2p-circuit`, or a wildcard `0.0.0.0`/`::` which
+/// binds every interface including public ones) is NOT provably local, so this returns `false` -
+/// fail-closed: absence of proof is treated as public-reach, never assumed safe.
+fn multiaddr_is_lan_only(addr: &Multiaddr) -> bool {
+    use fabric_libp2p::Protocol;
+    let mut saw_ip = false;
+    for proto in addr.iter() {
+        match proto {
+            Protocol::Ip4(ip) => {
+                saw_ip = true;
+                if !(ip.is_loopback() || ip.is_link_local()) {
+                    return false;
+                }
+            }
+            Protocol::Ip6(ip) => {
+                saw_ip = true;
+                // `Ipv6Addr::is_unicast_link_local` is unstable, so test the `fe80::/10` prefix
+                // directly. Loopback `::1` is covered by `is_loopback`.
+                let link_local = (ip.segments()[0] & 0xffc0) == 0xfe80;
+                if !(ip.is_loopback() || link_local) {
+                    return false;
+                }
+            }
+            // A hostname resolves to an address we cannot inspect here; treat as non-local.
+            Protocol::Dns(_) | Protocol::Dns4(_) | Protocol::Dns6(_) | Protocol::Dnsaddr(_) => {
+                return false;
+            }
+            _ => {}
+        }
+    }
+    saw_ip
+}
+
+/// The TASK-102 LAN-isolation witness (fix cycle #2): mint a [`LanShare`] ONLY when the node is
+/// provably isolated from any public substrate, else REFUSE (fail-closed, naming TASK-103). This is
+/// the ONE place the shipped provider modes turn a reachability config into the private-announce
+/// witness, so both thin binaries share exactly one policy (no per-binary drift).
+///
+/// It refuses on ANY public-reach signal in `reach`:
+///   1. a non-empty `--libp2p-bootstrap` (joining a DHT we did not assemble);
+///   2. a non-empty `--libp2p-provider-addr` (an external entry seeded into the kad routing table -
+///      the residual that let an empty-bootstrap provider still announce to the public DHT); or
+///   3. a `--libp2p-listen` address that is not provably loopback/link-local.
+///
+/// A relay is NOT a shipped-config signal (the thin binaries expose no relay flag), so there is
+/// nothing to check for it here; were a relay flag added, it would be a fourth refusal.
+///
+/// Only a node with NO bootstrap, NO provider-addr, and (if listening at all) a loopback/link-local
+/// listen is `LanShare`-eligible - the genuinely-isolated single-host / link-local MVP. The real
+/// allowlist-gated PUBLIC announce door that lifts this restriction is TASK-103's hard blocker.
+pub fn lan_isolation_or_refuse(reach: LanReachability<'_>) -> Result<LanShare, String> {
+    if !reach.bootstrap.is_empty() {
+        return Err(
+            "refusing to announce provider records: --libp2p-bootstrap joins a (potentially \
+             PUBLIC) kad DHT and there is no configured public-NAR allowlist, so this would publish \
+             operator-named local content to strangers. The allowlist-gated public announce door is \
+             wired by TASK-103; run with NO --libp2p-bootstrap, NO --libp2p-provider-addr, and a \
+             loopback/link-local --libp2p-listen for an isolated LAN announce."
+                .to_string(),
+        );
+    }
+    if !reach.provider_addrs.is_empty() {
+        return Err(
+            "refusing to announce provider records: --libp2p-provider-addr seeds an external peer \
+             into the kad routing table, so even with an empty --libp2p-bootstrap the node can reach \
+             a (potentially PUBLIC) DHT to store its records - and there is no configured public-NAR \
+             allowlist, so this would publish operator-named local content to strangers. The \
+             allowlist-gated public announce door is wired by TASK-103; run with NO \
+             --libp2p-provider-addr for an isolated LAN announce."
+                .to_string(),
+        );
+    }
+    if let Some(listen) = reach.listen
+        && !multiaddr_is_lan_only(listen)
+    {
+        return Err(format!(
+            "refusing to announce provider records: --libp2p-listen {listen} is not provably \
+             loopback/link-local, so the node is reachable by strangers and its announce could \
+             reach a public substrate - and there is no configured public-NAR allowlist. The \
+             allowlist-gated public announce door is wired by TASK-103; listen on a \
+             loopback/link-local address for an isolated LAN announce."
+        ));
+    }
+    Ok(LanShare::operator_assembled())
+}
+
 /// A verified store [`StoreProvision`] PAIRED with the allowlist [`PublicNarClaim`] that
 /// authorises announcing it PUBLICLY. Private fields, minted ONLY by
 /// [`approve_provisions_for_public`], so a public announce CANNOT be represented without an
@@ -1287,5 +1398,143 @@ Sig: nix-p2p-test-1:Xqf1bjNJ1ReFahm86zY+hv80+7QeJer5V/HjlEAvP39yJEK8w8jHG9WH5lM7
             Err(PublicationRejected::SizeMismatch { .. }) => {}
             other => panic!("expected SizeMismatch, got {other:?}"),
         }
+    }
+}
+
+#[cfg(test)]
+mod lan_isolation_tests {
+    //! TASK-102 fix cycle #2: the LAN-isolation witness must require POSITIVE loopback/link-local
+    //! isolation, not merely absence-of-bootstrap. Each public-reach signal must make
+    //! [`lan_isolation_or_refuse`] REFUSE; only a provably-isolated node mints a [`LanShare`].
+    use super::{LanReachability, lan_isolation_or_refuse, multiaddr_is_lan_only};
+    use fabric_libp2p::{Multiaddr, PeerId};
+
+    fn peer() -> PeerId {
+        "12D3KooWDpJ7As7BWAwRMfu1VU2WCqNjvq387JEYKDBj4kx6nXTN"
+            .parse()
+            .unwrap()
+    }
+
+    fn addr(s: &str) -> Multiaddr {
+        s.parse().unwrap()
+    }
+
+    fn none() -> LanReachability<'static> {
+        LanReachability {
+            bootstrap: &[],
+            provider_addrs: &[],
+            listen: None,
+        }
+    }
+
+    #[test]
+    fn isolated_node_with_no_reach_signals_is_permitted() {
+        // No bootstrap, no provider-addr, no listen: a genuinely-isolated node -> LanShare.
+        assert!(lan_isolation_or_refuse(none()).is_ok());
+    }
+
+    #[test]
+    fn a_loopback_listen_only_node_is_permitted() {
+        let listen = addr("/ip4/127.0.0.1/tcp/0");
+        let reach = LanReachability {
+            listen: Some(&listen),
+            ..none()
+        };
+        assert!(
+            lan_isolation_or_refuse(reach).is_ok(),
+            "a loopback-listen isolated node is a valid LAN announce"
+        );
+    }
+
+    #[test]
+    fn a_link_local_listen_only_node_is_permitted() {
+        for a in ["/ip4/169.254.10.10/tcp/0", "/ip6/fe80::1/tcp/0"] {
+            let listen = addr(a);
+            let reach = LanReachability {
+                listen: Some(&listen),
+                ..none()
+            };
+            assert!(
+                lan_isolation_or_refuse(reach).is_ok(),
+                "a link-local listen ({a}) is LAN-only"
+            );
+        }
+    }
+
+    #[test]
+    fn a_bootstrapped_announce_is_refused() {
+        // Presence of ANY bootstrap peer refuses, regardless of its address (even loopback).
+        let bootstrap = [(peer(), addr("/ip4/127.0.0.1/tcp/4001"))];
+        let reach = LanReachability {
+            bootstrap: &bootstrap,
+            ..none()
+        };
+        let err = lan_isolation_or_refuse(reach).expect_err("bootstrap must refuse");
+        assert!(err.contains("TASK-103"), "must name TASK-103: {err}");
+        assert!(
+            err.contains("--libp2p-bootstrap"),
+            "must name the signal: {err}"
+        );
+    }
+
+    #[test]
+    fn a_provider_addr_with_empty_bootstrap_is_refused() {
+        // THE residual bite (fix cycle #2): a --libp2p-provider-addr with EMPTY bootstrap still
+        // seeds the kad routing table and reaches the public DHT, so it must REFUSE. Before the fix
+        // (bootstrap-only guard) this MINTED a LanShare and announced ungated. Loopback addr proves
+        // the refusal is on PRESENCE, not the address literal.
+        let provider_addrs = [(peer(), addr("/ip4/127.0.0.1/tcp/4001"))];
+        let reach = LanReachability {
+            provider_addrs: &provider_addrs,
+            ..none()
+        };
+        let err = lan_isolation_or_refuse(reach)
+            .expect_err("a provider-addr with empty bootstrap must be refused");
+        assert!(err.contains("TASK-103"), "must name TASK-103: {err}");
+        assert!(
+            err.contains("--libp2p-provider-addr"),
+            "must name the provider-addr signal: {err}"
+        );
+    }
+
+    #[test]
+    fn a_public_listen_refuses_and_a_private_lan_listen_also_refuses() {
+        // A public IP and a wildcard bind must refuse. A PRIVATE-LAN address (192.168/10/172.16) is
+        // deliberately ALSO refused: it is routable/NAT-able, so it is not PROVABLY isolated - only
+        // loopback/link-local is. This is the conservative fail-closed posture (positive proof).
+        for a in [
+            "/ip4/203.0.113.7/tcp/4001",
+            "/ip4/0.0.0.0/tcp/4001",
+            "/ip6/::/tcp/4001",
+            "/dns4/example.com/tcp/4001",
+            "/ip4/192.168.1.5/tcp/4001",
+            "/ip4/10.0.0.5/tcp/4001",
+        ] {
+            let listen = addr(a);
+            let reach = LanReachability {
+                listen: Some(&listen),
+                ..none()
+            };
+            assert!(
+                lan_isolation_or_refuse(reach).is_err(),
+                "listen {a} is not provably loopback/link-local; must refuse"
+            );
+        }
+    }
+
+    #[test]
+    fn multiaddr_is_lan_only_classifies_correctly() {
+        assert!(multiaddr_is_lan_only(&addr("/ip4/127.0.0.1/tcp/0")));
+        assert!(multiaddr_is_lan_only(&addr("/ip6/::1/tcp/0")));
+        assert!(multiaddr_is_lan_only(&addr("/ip4/169.254.1.1/tcp/0")));
+        assert!(multiaddr_is_lan_only(&addr("/ip6/fe80::abcd/tcp/0")));
+        assert!(!multiaddr_is_lan_only(&addr("/ip4/0.0.0.0/tcp/0")));
+        assert!(!multiaddr_is_lan_only(&addr("/ip4/8.8.8.8/tcp/0")));
+        assert!(!multiaddr_is_lan_only(&addr("/ip4/192.168.0.1/tcp/0")));
+        assert!(!multiaddr_is_lan_only(&addr("/dns4/example.com/tcp/0")));
+        // A multiaddr with no IP literal at all is not provably local.
+        assert!(!multiaddr_is_lan_only(&addr(
+            "/p2p/12D3KooWDpJ7As7BWAwRMfu1VU2WCqNjvq387JEYKDBj4kx6nXTN"
+        )));
     }
 }

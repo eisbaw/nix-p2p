@@ -23,14 +23,15 @@ use daemon::{
     DEFAULT_MAX_SERVE_DURATION, DEFAULT_MAX_SERVE_NAR_BYTES, EndpointProfile, EndpointScope,
     FallbackNarSource, FileNarSupplier, IdentitySource, InMemoryDiscovery, IrohNode,
     IrohNodeBuilder, IrohPeerAddr, IrohProviderConfig, IrohTransport, KnownPayload, KnownTransport,
-    LanShare, Libp2pCatalogProbe, Libp2pSourceConfig, NarCatalog, NarDumper, NarHashKey, NarSource,
-    NarinfoDiskCache, NarinfoSource, NoRawServe, NodeId, NodeLocation,
+    LanReachability, LanShare, Libp2pCatalogProbe, Libp2pSourceConfig, NarCatalog, NarDumper,
+    NarHashKey, NarSource, NarinfoDiskCache, NarinfoSource, NoRawServe, NodeId, NodeLocation,
     NodeLookupAuthorityAuthorization, NodeLookupConfig, NodePublicationCapability,
     NodePublicationConfig, NodePublicationHandle, NullAnnounce, NullCorrelation, NullStore,
     PublicationAuthorityAuthorization, RawServeDecision, RelayCapability, ServeBudget, StorePath,
     SystemClock, TaskSupervisor, TransportNarSource, TransportRegistry, UpstreamHttp,
     announce_provider_seeds, announce_store_provisions, build_libp2p_nar_source,
-    build_libp2p_provider_source, resolve_durable_identity_seed, serve, verify_store_provisions,
+    build_libp2p_provider_source, lan_isolation_or_refuse, resolve_durable_identity_seed, serve,
+    verify_store_provisions,
 };
 use fabric_libp2p::{CatalogNarSupplier, Libp2pFabric, MemoryNarSupplier, Multiaddr, PeerId};
 use peer_fabric::{AnnounceBudget, PeerFabric, ServeHandle};
@@ -1303,25 +1304,21 @@ struct Libp2pProviderGuard {
     _index: Option<Arc<AvailabilityIndex>>,
 }
 
-/// The TASK-102 bootstrap guard for the shipped libp2p provider modes. They announce over a
-/// PRIVATE / LAN (operator-assembled) substrate: the seed/store bytes are content-verified
-/// (TASK-56) but NOT publication-authorized by the public-NAR allowlist (config not wired until
-/// TASK-103). Announcing to a `--libp2p-bootstrap` (potentially PUBLIC) DHT without an allowlist
-/// would publish operator-named local holdings to strangers, so refuse it (fail-closed, naming
-/// TASK-103). An EMPTY bootstrap set has no routing targets on which to store a provider record - a
-/// defensible proxy for "cannot reach a public DHT" - so the isolated LAN MVP still runs and this
-/// returns the [`LanShare`] witness the private announce door requires.
-fn lan_share_or_refuse(bootstrap: &[(PeerId, Multiaddr)]) -> Result<LanShare, String> {
-    if !bootstrap.is_empty() {
-        return Err(
-            "refusing to announce provider records to a --libp2p-bootstrap (potentially PUBLIC) \
-             DHT without a configured public-NAR allowlist: this would publish operator-named \
-             local content to strangers. The allowlist-gated public announce door is wired by \
-             TASK-103; run WITHOUT --libp2p-bootstrap for an isolated LAN announce."
-                .to_string(),
-        );
-    }
-    Ok(LanShare::operator_assembled())
+/// The TASK-102 LAN-isolation guard for the shipped libp2p provider modes (fix cycle #2). They
+/// announce over a PRIVATE / LAN (operator-assembled) substrate: the seed/store bytes are
+/// content-verified (TASK-56) but NOT publication-authorized by the public-NAR allowlist (config
+/// not wired until TASK-103). This thin wrapper maps the daemon's parsed [`Config`] to the FULL
+/// reachability the shared [`daemon_libp2p::lan_isolation_or_refuse`] policy inspects - bootstrap, provider-addr,
+/// AND listen - so a provider that can reach ANY public substrate (not just one with a non-empty
+/// bootstrap) is refused. Keeping the Config->reachability mapping in ONE tested place closes the
+/// residual hole where `--libp2p-provider-addr` + empty bootstrap slipped through a bootstrap-only
+/// check and announced ungated.
+fn lan_share_or_refuse(config: &Config) -> Result<LanShare, String> {
+    lan_isolation_or_refuse(LanReachability {
+        bootstrap: &config.libp2p_bootstrap,
+        provider_addrs: &config.libp2p_provider_addrs,
+        listen: config.libp2p_listen.as_ref(),
+    })
 }
 
 /// Node B (libp2p PROVIDER, TASK-178): start the libp2p fabric WITH a supplier serving
@@ -1439,7 +1436,7 @@ async fn install_libp2p_provider(
         .unwrap_or(0);
     // TASK-102 bootstrap guard: refuse a bootstrapped (potentially public) announce without an
     // allowlist; an isolated LAN announce is permitted and yields the LanShare witness.
-    let lan = lan_share_or_refuse(&config.libp2p_bootstrap)?;
+    let lan = lan_share_or_refuse(config)?;
     let records = announce_provider_seeds(
         &fabric,
         identity_seed,
@@ -1604,7 +1601,7 @@ async fn install_libp2p_store_provider(
         .unwrap_or(0);
     // TASK-102 bootstrap guard (see install_libp2p_provider): refuse a bootstrapped announce
     // without an allowlist; an isolated LAN announce is permitted.
-    let lan = lan_share_or_refuse(&config.libp2p_bootstrap)?;
+    let lan = lan_share_or_refuse(config)?;
     let records = announce_store_provisions(
         &fabric,
         identity_seed,
@@ -2175,26 +2172,72 @@ async fn main() -> ExitCode {
 mod tests {
     use super::*;
 
-    #[test]
-    fn bootstrap_guard_permits_lan_and_refuses_bootstrapped_without_allowlist() {
-        // TASK-102 bootstrap guard bite (composite binary). Empty bootstrap = isolated LAN
-        // announce, permitted. Non-empty bootstrap without an allowlist = refuse (naming TASK-103).
-        // Neuter `lan_share_or_refuse` (drop the `!bootstrap.is_empty()` refusal) and the refusal
-        // assertion goes RED.
-        assert!(
-            lan_share_or_refuse(&[]).is_ok(),
-            "isolated LAN announce is permitted"
-        );
-        let peer: PeerId = "12D3KooWDpJ7As7BWAwRMfu1VU2WCqNjvq387JEYKDBj4kx6nXTN"
+    fn guard_peer() -> PeerId {
+        "12D3KooWDpJ7As7BWAwRMfu1VU2WCqNjvq387JEYKDBj4kx6nXTN"
             .parse()
-            .unwrap();
-        let addr: Multiaddr = "/ip4/127.0.0.1/tcp/4001".parse().unwrap();
-        let err = lan_share_or_refuse(&[(peer, addr)])
+            .unwrap()
+    }
+
+    fn guard_addr(s: &str) -> Multiaddr {
+        s.parse().unwrap()
+    }
+
+    #[test]
+    fn lan_isolation_guard_permits_a_provably_isolated_loopback_provider() {
+        // TASK-102 fix cycle #2 (composite binary). A loopback-listen provider with NO bootstrap
+        // and NO provider-addr is provably isolated -> permitted.
+        let config = Config {
+            libp2p_listen: Some(guard_addr("/ip4/127.0.0.1/tcp/0")),
+            ..Config::default()
+        };
+        assert!(
+            lan_share_or_refuse(&config).is_ok(),
+            "a provably-isolated loopback provider is permitted"
+        );
+    }
+
+    #[test]
+    fn lan_isolation_guard_refuses_a_bootstrapped_provider() {
+        let config = Config {
+            libp2p_bootstrap: vec![(guard_peer(), guard_addr("/ip4/127.0.0.1/tcp/4001"))],
+            libp2p_listen: Some(guard_addr("/ip4/127.0.0.1/tcp/0")),
+            ..Config::default()
+        };
+        let err = lan_share_or_refuse(&config)
             .expect_err("a bootstrapped announce without an allowlist must be refused");
         assert!(
             err.contains("TASK-103"),
             "the refusal must name TASK-103: {err}"
         );
+    }
+
+    #[test]
+    fn lan_isolation_guard_refuses_a_provider_addr_with_empty_bootstrap() {
+        // THE residual bite (fix cycle #2): before the fix the composite guard checked ONLY the
+        // bootstrap vector, so this provider (empty bootstrap, a provider-addr seeded into kad)
+        // MINTED a LanShare and announced UNGATED. It must now REFUSE.
+        let config = Config {
+            libp2p_provider_addrs: vec![(guard_peer(), guard_addr("/ip4/127.0.0.1/tcp/4001"))],
+            libp2p_listen: Some(guard_addr("/ip4/127.0.0.1/tcp/0")),
+            ..Config::default()
+        };
+        let err = lan_share_or_refuse(&config)
+            .expect_err("a provider-addr with empty bootstrap must be refused");
+        assert!(
+            err.contains("--libp2p-provider-addr") && err.contains("TASK-103"),
+            "the refusal must name the provider-addr signal and TASK-103: {err}"
+        );
+    }
+
+    #[test]
+    fn lan_isolation_guard_refuses_a_public_listen_provider() {
+        let config = Config {
+            libp2p_listen: Some(guard_addr("/ip4/0.0.0.0/tcp/4001")),
+            ..Config::default()
+        };
+        let err =
+            lan_share_or_refuse(&config).expect_err("a wildcard/public listen must be refused");
+        assert!(err.contains("TASK-103"), "must name TASK-103: {err}");
     }
 
     #[test]
