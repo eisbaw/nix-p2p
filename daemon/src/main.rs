@@ -2057,6 +2057,12 @@ async fn main() -> ExitCode {
         upstream_label: config.upstream.clone(),
         correlation,
         raw_serve,
+        // TASK-102: the public-NAR allowlist. Disabled (no trusted keys, no persistence)
+        // until an operator wires trusted-public-keys + a state path; a disabled allowlist
+        // learns nothing, so this serving daemon never records a publishable NAR yet. When
+        // TASK-103 wires the DHT publish path, this must become a configured allowlist so the
+        // publication gate has entries to approve. See the TASK-102 follow-up note.
+        public_allowlist: Arc::new(daemon_core::PublicNarAllowlist::disabled()),
     });
 
     let listener = match TcpListener::bind(config.listen).await {

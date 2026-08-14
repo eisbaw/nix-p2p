@@ -1217,6 +1217,7 @@ async fn active_http_connection_shares_the_node_shutdown_supervisor() {
         upstream_label: "pending-http-test".into(),
         correlation: Arc::new(NullCorrelation),
         raw_serve: Arc::new(NoRawServe),
+        public_allowlist: Arc::new(daemon::PublicNarAllowlist::disabled()),
     });
     let listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
         .await
@@ -1261,6 +1262,7 @@ async fn http_capacity_drops_one_connection_then_recovers_without_restart() {
         upstream_label: "http-capacity-test".into(),
         correlation: Arc::new(NullCorrelation),
         raw_serve: Arc::new(NoRawServe),
+        public_allowlist: Arc::new(daemon::PublicNarAllowlist::disabled()),
     });
     let listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
         .await

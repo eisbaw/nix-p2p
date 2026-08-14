@@ -661,6 +661,9 @@ async fn main() -> ExitCode {
         envelope: SafetyEnvelope::default(),
         required_axes,
         extra_raw_serve: Vec::new(),
+        // TASK-102: disabled until trusted-public-keys + a state path are wired; a disabled
+        // allowlist learns nothing. TASK-103's DHT publish gate must consume a configured one.
+        public_allowlist: Arc::new(daemon_core::PublicNarAllowlist::disabled()),
     };
 
     let fabric_dyn: Arc<dyn PeerFabric> = fabric.clone();

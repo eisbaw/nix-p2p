@@ -101,6 +101,14 @@ const SOURCES: &[(&str, &str)] = &[
         "transport_iroh.rs",
         include_str!("../../fabric-iroh/src/transport_iroh.rs"),
     ),
+    (
+        // TASK-102: the public-NAR allowlist is a persisted-holdings surface (it records
+        // which public NARs this node may announce). It is LOCAL-ONLY (no wire API), but
+        // scanning it here PROVES it adds no enumeration surface: the only plural-identity
+        // return is its local-startup `load`, exempted below exactly like IndexStore::load.
+        "public_allowlist.rs",
+        include_str!("../../daemon-core/src/public_allowlist.rs"),
+    ),
 ];
 
 /// Identity types whose PLURAL return is a potential holdings listing.
@@ -191,6 +199,28 @@ const ALLOWED: &[(&str, &str, &str, &str)] = &[
         "save",
         "IndexStore::save is the write direction of the same local persistence \
          seam; it takes the entries as an argument.",
+    ),
+    (
+        "public_allowlist.rs",
+        "AllowlistStore",
+        "load",
+        "AllowlistStore::load reads THIS node's own persisted public-NAR allowlist off \
+         local disk at startup. It is not reachable from any wire message, and a node is \
+         allowed to know which public NARs it may itself announce. There is no method that \
+         returns the set to a peer (status() is aggregate count+size only).",
+    ),
+    (
+        "public_allowlist.rs",
+        "NullAllowlistStore",
+        "load",
+        "The in-memory implementation of AllowlistStore::load; it returns an empty vector.",
+    ),
+    (
+        "public_allowlist.rs",
+        "FileAllowlistStore",
+        "load",
+        "The on-disk implementation of AllowlistStore::load; same local-startup argument, \
+         reading this node's own append-only allowlist file.",
     ),
     (
         "claim.rs",

@@ -450,6 +450,7 @@ async fn restart_durable_sequence_serves_through_run() {
             Axis::Transfer(TransportTag::Iroh),
         ],
         extra_raw_serve: Vec::new(),
+        public_allowlist: Arc::new(daemon_core::PublicNarAllowlist::disabled()),
     };
     let fabric_dyn: Arc<dyn PeerFabric> = consumer.clone();
     let run_task = tokio::spawn(run(fabric_dyn, run_cfg));

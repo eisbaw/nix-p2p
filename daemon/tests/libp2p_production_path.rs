@@ -408,6 +408,7 @@ async fn production_config_builds_libp2p_source_that_discovers_and_serves_with_c
         upstream_label: "task162-upstream".to_string(),
         correlation: Arc::new(NullCorrelation),
         raw_serve: Arc::new(daemon::NoRawServe),
+        public_allowlist: Arc::new(daemon::PublicNarAllowlist::disabled()),
     });
     let (addr, _daemon) = common::spawn_app(app).await;
 

@@ -58,6 +58,10 @@ pub struct RunConfig {
     /// Extra raw-serve decisions OR-ed with the dynamic p2p probe (e.g. a static allowlist).
     /// Empty is the normal single-backend case.
     pub extra_raw_serve: Vec<Arc<dyn RawServeDecision>>,
+    /// The public-NAR allowlist (TASK-102): the single writer of which NAR identities may
+    /// be publicly announced. The serving layer's narinfo path calls `learn` on it. Wire
+    /// [`crate::PublicNarAllowlist::disabled`] for a node with no publication authority.
+    pub public_allowlist: Arc<crate::public_allowlist::PublicNarAllowlist>,
 }
 
 /// Serve the Nix binary-cache frontend over `fabric` until the listener errors (or the
@@ -103,6 +107,7 @@ pub async fn run(fabric: Arc<dyn PeerFabric>, cfg: RunConfig) -> Result<(), Stri
         upstream_label: cfg.upstream_label,
         correlation: cfg.correlation,
         raw_serve,
+        public_allowlist: cfg.public_allowlist,
     });
 
     // A standalone supervisor: its drop cancels/aborts every in-flight HTTP connection task,

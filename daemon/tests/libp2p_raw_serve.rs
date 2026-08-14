@@ -422,6 +422,7 @@ async fn libp2p_hit_under_compressed_narinfo_is_rewritten_to_raw_and_a_nix_clien
         // The fix under test: the libp2p dynamic raw-serve decision, so a libp2p HIT
         // rewrites its compressed narinfo to raw.
         raw_serve: libp2p_raw_serve,
+        public_allowlist: Arc::new(daemon::PublicNarAllowlist::disabled()),
     });
     let (addr, _daemon) = common::spawn_app(app).await;
 

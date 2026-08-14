@@ -139,6 +139,7 @@ fn build_app(raw_serve: Arc<dyn RawServeDecision>, nar: Arc<dyn NarSource>) -> A
         upstream_label: "test-upstream".to_string(),
         correlation: Arc::new(daemon::NullCorrelation),
         raw_serve,
+        public_allowlist: Arc::new(daemon::PublicNarAllowlist::disabled()),
     })
 }
 

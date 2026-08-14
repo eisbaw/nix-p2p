@@ -70,6 +70,12 @@ pub struct App {
     /// compressed nar, the S2 path); task-41 wires the availability-backed decision
     /// alongside a raw NAR source.
     pub raw_serve: Arc<dyn rewrite::RawServeDecision>,
+    /// The public-NAR allowlist (TASK-102): the SINGLE writer of which NAR identities
+    /// this node may publicly announce. `respond_narinfo` calls `learn` on the exact
+    /// cache.nixos.org response; only a narinfo whose trusted-key Nix signature verifies
+    /// appends its `(NarHash, NarSize)`. A daemon with no configured publication
+    /// authority uses [`crate::PublicNarAllowlist::disabled`], which learns nothing.
+    pub public_allowlist: Arc<crate::public_allowlist::PublicNarAllowlist>,
 }
 
 /// Serve on an already-bound listener until it errors. Binding is the caller's
@@ -162,6 +168,7 @@ async fn handle(req: Request<Incoming>, app: Arc<App>) -> Response<NarBody> {
                 app.narinfo.fetch(&hash).await,
                 &app.catalog,
                 app.raw_serve.as_ref(),
+                app.public_allowlist.as_ref(),
                 is_head,
             )
             .await
@@ -232,6 +239,7 @@ async fn respond_narinfo(
     result: Result<UpstreamResponse, SourceError>,
     catalog: &NarCatalog,
     raw_serve: &dyn rewrite::RawServeDecision,
+    public_allowlist: &crate::public_allowlist::PublicNarAllowlist,
     is_head: bool,
 ) -> Response<NarBody> {
     let resp = match result {
@@ -269,6 +277,28 @@ async fn respond_narinfo(
             return text_status(StatusCode::BAD_GATEWAY, "upstream unavailable");
         }
     };
+
+    // TASK-102: LEARN whether this exact cache.nixos.org response PROVES the NAR public.
+    // `learn` verifies the trusted-key Nix signature over `1;StorePath;NarHash;NarSize;
+    // References` and, only on success, appends `(NarHash, NarSize)` to the public-NAR
+    // allowlist ONCE (idempotent). This is the SINGLE append site (AC#2): it runs on the
+    // ORIGINAL upstream bytes (the signed fields are byte-identical before any rewrite),
+    // and only a 200 that survived the framing checks above reaches here - a MISS/outage/
+    // timeout returned earlier, so a non-public path appends nothing (AC#3). A daemon with
+    // no configured trusted keys uses a disabled allowlist and this is a cheap no-op.
+    match public_allowlist.learn(&bytes) {
+        crate::public_allowlist::LearnOutcome::Appended { nar_hash, nar_size } => {
+            println!("daemon: public-allowlist appended narhash={nar_hash} nar_size={nar_size}");
+        }
+        crate::public_allowlist::LearnOutcome::PersistFailed(err) => {
+            // Fail-verbose: the entry was NOT admitted (disk and memory agree), so a
+            // later request simply re-verifies. Surface it rather than degrade silently.
+            eprintln!("daemon: public-allowlist append failed (not admitted): {err}");
+        }
+        // AlreadyPresent (idempotent duplicate) and Rejected (not proven public - the
+        // common case for a non-cache upstream or an unsigned path) are normal and silent.
+        _ => {}
+    }
 
     // Learn the token -> signed-NarHash correlation, and decide whether to rewrite
     // the narinfo's transport fields to describe the RAW nar (task-49). A malformed
