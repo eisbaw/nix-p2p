@@ -9,7 +9,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use futures::StreamExt;
-use libp2p::kad::store::MemoryStore;
+use libp2p::kad::store::{MemoryStore, MemoryStoreConfig};
 use libp2p::swarm::SwarmEvent;
 use libp2p::swarm::behaviour::toggle::Toggle;
 use libp2p::{
@@ -209,11 +209,28 @@ pub enum Command {
     },
     GetProviders {
         key: kad::RecordKey,
+        /// The worker replies here with the started query's [`kad::QueryId`] BEFORE the
+        /// result, so the caller can [`Command::Cancel`] the query if it abandons the
+        /// wait (TASK-154 S4 work bound).
+        id_reply: oneshot::Sender<kad::QueryId>,
         reply: oneshot::Sender<Result<(HashSet<PeerId>, QueryReach), QueryFail>>,
     },
     GetRecord {
         key: kad::RecordKey,
+        /// See [`Command::GetProviders::id_reply`] (TASK-154).
+        id_reply: oneshot::Sender<kad::QueryId>,
         reply: oneshot::Sender<Result<Option<Vec<u8>>, QueryFail>>,
+    },
+    /// Cancel an in-flight kad query whose caller has abandoned its result (TASK-154 S4
+    /// work bound). The commonest cause is the directory's `find_providers` outer deadline
+    /// firing and DROPPING the resolve future: without this, the underlying kad walk keeps
+    /// running to its own `query_timeout`, issuing further network requests and finally
+    /// replying into a receiver nobody holds - bounded WASTED work (ours and the answering
+    /// peers'). The worker `finish()`es the query (it terminates at the next poll instead of
+    /// walking on) and drops the pending reply. Idempotent + fail-safe: a `Cancel` for an
+    /// already-terminated / unknown id is a no-op.
+    Cancel {
+        id: kad::QueryId,
     },
     /// Resolve `peer`'s dialable addresses THROUGH kad peer-routing: an iterative
     /// `get_closest_peers` to the `peer`'s own key. The k-closest set the query converges
@@ -224,8 +241,52 @@ pub enum Command {
     /// TASK-159: the [`crate::locator::Libp2pNodeLocator`] active-resolution path.
     LocatePeer {
         peer: PeerId,
+        /// See [`Command::GetProviders::id_reply`] (TASK-154).
+        id_reply: oneshot::Sender<kad::QueryId>,
         reply: oneshot::Sender<Result<(Vec<Multiaddr>, QueryReach), QueryFail>>,
     },
+}
+
+/// Cancels the underlying kad query if this guard is dropped BEFORE the query terminated
+/// (TASK-154 S4 work bound). Armed for the whole time a caller awaits a query result; a
+/// normal completion [`disarm`](CancelOnDrop::disarm)s it so nothing is sent. When the
+/// caller's future is instead DROPPED mid-wait - the directory's `find_providers` deadline
+/// firing is the load-bearing case - this `Drop` sends a best-effort [`Command::Cancel`] so
+/// the worker stops the kad walk now rather than running it to `query_timeout`.
+///
+/// `Drop` cannot `.await`, so it uses `try_send`. A full command channel (a cancel storm)
+/// just means this one query falls back to the pre-TASK-154 behaviour (it self-terminates at
+/// its own `query_timeout`) - strictly never WORSE than before this fix, only not-yet-better.
+struct CancelOnDrop {
+    tx: mpsc::Sender<Command>,
+    id: kad::QueryId,
+    armed: bool,
+}
+
+impl CancelOnDrop {
+    fn new(tx: mpsc::Sender<Command>, id: kad::QueryId) -> Self {
+        CancelOnDrop {
+            tx,
+            id,
+            armed: true,
+        }
+    }
+
+    /// The query terminated normally; do NOT cancel on drop.
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for CancelOnDrop {
+    fn drop(&mut self) {
+        if self.armed && self.tx.try_send(Command::Cancel { id: self.id }).is_err() {
+            tracing::debug!(
+                "fabric-libp2p: could not enqueue a query cancel (worker gone or command \
+                 channel full); the abandoned query self-terminates at its own query_timeout"
+            );
+        }
+    }
 }
 
 /// A cloneable handle to the worker. Every capability holds one of these; a dropped
@@ -438,17 +499,46 @@ impl SwarmHandle {
         key: kad::RecordKey,
     ) -> Result<(HashSet<PeerId>, QueryReach), QueryFail> {
         let (reply, rx) = oneshot::channel();
-        self.send(Command::GetProviders { key, reply }).await;
-        rx.await
-            .unwrap_or_else(|_| Err(QueryFail::Backend("worker gone".into())))
+        let (id_reply, id_rx) = oneshot::channel();
+        self.send(Command::GetProviders {
+            key,
+            id_reply,
+            reply,
+        })
+        .await;
+        // Learn the started query's id, then arm cancel-on-drop so an ABANDONED wait (the
+        // outer find_providers deadline dropping this future) cancels the kad walk rather
+        // than letting it run to its own query_timeout (TASK-154 S4).
+        let Ok(id) = id_rx.await else {
+            return Err(QueryFail::Backend("worker gone".into()));
+        };
+        let mut cancel = CancelOnDrop::new(self.tx.clone(), id);
+        let out = rx
+            .await
+            .unwrap_or_else(|_| Err(QueryFail::Backend("worker gone".into())));
+        cancel.disarm();
+        out
     }
 
     /// Fetch the value stored under `key` from the DHT, if any.
     pub async fn get_record(&self, key: kad::RecordKey) -> Result<Option<Vec<u8>>, QueryFail> {
         let (reply, rx) = oneshot::channel();
-        self.send(Command::GetRecord { key, reply }).await;
-        rx.await
-            .unwrap_or_else(|_| Err(QueryFail::Backend("worker gone".into())))
+        let (id_reply, id_rx) = oneshot::channel();
+        self.send(Command::GetRecord {
+            key,
+            id_reply,
+            reply,
+        })
+        .await;
+        let Ok(id) = id_rx.await else {
+            return Err(QueryFail::Backend("worker gone".into()));
+        };
+        let mut cancel = CancelOnDrop::new(self.tx.clone(), id);
+        let out = rx
+            .await
+            .unwrap_or_else(|_| Err(QueryFail::Backend("worker gone".into())));
+        cancel.disarm();
+        out
     }
 
     /// Resolve `peer`'s dialable addresses through kad peer-routing (an active
@@ -463,9 +553,22 @@ impl SwarmHandle {
         peer: PeerId,
     ) -> Result<(Vec<Multiaddr>, QueryReach), QueryFail> {
         let (reply, rx) = oneshot::channel();
-        self.send(Command::LocatePeer { peer, reply }).await;
-        rx.await
-            .unwrap_or_else(|_| Err(QueryFail::Backend("worker gone".into())))
+        let (id_reply, id_rx) = oneshot::channel();
+        self.send(Command::LocatePeer {
+            peer,
+            id_reply,
+            reply,
+        })
+        .await;
+        let Ok(id) = id_rx.await else {
+            return Err(QueryFail::Backend("worker gone".into()));
+        };
+        let mut cancel = CancelOnDrop::new(self.tx.clone(), id);
+        let out = rx
+            .await
+            .unwrap_or_else(|_| Err(QueryFail::Backend("worker gone".into())));
+        cancel.disarm();
+        out
     }
 
     /// Fetch `content` from `peer` by STREAMING it over a raw NAR substream (TASK-157),
@@ -677,8 +780,16 @@ impl Worker {
                     }
                 }
             }
-            Command::GetProviders { key, reply } => {
+            Command::GetProviders {
+                key,
+                id_reply,
+                reply,
+            } => {
                 let id = self.swarm.behaviour_mut().kad.get_providers(key);
+                // Hand the id back BEFORE the result so the caller can cancel this query on
+                // an abandoned wait (TASK-154). If the caller already went away, the send
+                // fails harmlessly and the query completes into a dropped receiver as before.
+                let _ = id_reply.send(id);
                 self.pending.insert(
                     id,
                     Pending::GetProviders {
@@ -687,16 +798,36 @@ impl Worker {
                     },
                 );
             }
-            Command::GetRecord { key, reply } => {
+            Command::GetRecord {
+                key,
+                id_reply,
+                reply,
+            } => {
                 let id = self.swarm.behaviour_mut().kad.get_record(key);
+                let _ = id_reply.send(id);
                 self.pending.insert(id, Pending::GetRecord { reply });
             }
-            Command::LocatePeer { peer, reply } => {
+            Command::Cancel { id } => {
+                // Stop an abandoned query (TASK-154 S4). `finish()` makes kad terminate the
+                // walk at the next poll instead of running it to `query_timeout`; dropping the
+                // pending entry discards the terminal reply. Both are no-ops for an id that
+                // already terminated, so a late/duplicate Cancel is safe (never a panic).
+                if let Some(mut query) = self.swarm.behaviour_mut().kad.query_mut(&id) {
+                    query.finish();
+                }
+                self.pending.remove(&id);
+            }
+            Command::LocatePeer {
+                peer,
+                id_reply,
+                reply,
+            } => {
                 // Iterative peer-routing to `peer`'s own key: the query walks the DHT and
                 // the k-closest set it converges on carries the addresses a shared
                 // bootstrap reported for `peer` (learned via identify). This is what lets
                 // the resolver dial without an injected address.
                 let id = self.swarm.behaviour_mut().kad.get_closest_peers(peer);
+                let _ = id_reply.send(id);
                 self.pending.insert(
                     id,
                     Pending::GetClosestPeers {
@@ -1024,6 +1155,87 @@ pub fn relay_server_config() -> relay::Config {
 /// Override off with [`NodeConfig::with_relay_server`].
 pub const DEFAULT_RELAY_SERVER_ENABLED: bool = true;
 
+// ---------------------------------------------------------------------------------------
+// kad MemoryStore STORAGE bounds (TASK-154 AC#1).
+//
+// The kad value/provider store is where a hostile peer's records LAND: because a node runs
+// in `kad::Mode::Server` it accepts records other peers PUT toward the keys it is k-closest
+// to, and provider announcements for those keys. Left at `MemoryStoreConfig::default()`
+// (1024 records, 65 KiB/value, 1024 provided keys, k=20 providers/key) these are LIBRARY
+// defaults, not a decision. A SHIPPED home node needs EXPLICIT, defensible caps so a
+// poisoning / amplification / sybil flood costs BOUNDED memory, never an OOM - and never at
+// the price of integrity (Nix re-verifies every fetched byte; a cap only limits how much
+// UNTRUSTED hint state we hold, never whether an answer is trusted).
+//
+// The bounds are picked with HEADROOM so a legitimate record is never refused (the proven
+// decentralized-discovery / record-lifecycle tests hold a handful of records each - orders
+// of magnitude under these caps):
+//
+//   * VALUE SIZE is the tightest, most load-bearing cap. Every value we store is the FROZEN
+//     provider-record / withdrawal encoding, itself capped at
+//     `peer_fabric::MAX_PROVIDER_RECORD_BYTES` (1024 B, worst case ~324 B). We set
+//     `max_value_bytes` to 2 KiB: strictly ABOVE the 1024-B frozen cap (so a valid record is
+//     always accepted - the store's check is `len >= max`, so the ceiling must exceed the
+//     largest legal record) yet ~32x BELOW the library's 65 KiB, so a peer cannot park 64 KiB
+//     of junk per key on us. This is the value that stops per-record amplification.
+//   * RECORD COUNT bounds total distinct value-store keys we hold. 4096 (vs the 1024 default,
+//     raised for real-network headroom) * the 2 KiB value ceiling bounds worst-case value-
+//     store memory at ~8 MiB - fine for a home node, far from unbounded.
+//   * PROVIDERS-PER-KEY is the DIRECT sybil-flood cap libp2p itself documents ("if the
+//     providers list is full, we ignore the new provider ... can mitigate Sybil attacks"). We
+//     pin it EXPLICITLY at the kad replication factor 20 (k) so the anti-sybil intent is a
+//     decision, not an inherited default. Note this caps providers ONE node stores per key;
+//     the consumer-side fan-out cap (`find_providers`, `DiscoveryBudget.max_peers`) bounds how
+//     many of the aggregated providers a lookup then chases.
+//   * PROVIDED KEYS bounds how many keys WE announce as a provider (our own store paths),
+//     kept at 1024 explicitly.
+//
+// All values are integers (no-float rule).
+
+/// Max distinct value-store records this node holds for OTHER peers' keys (it is k-closest
+/// to). 4096, vs the library default 1024: real-network headroom, still hard-bounded. With
+/// [`STORE_MAX_VALUE_BYTES`] this caps worst-case value-store memory at ~8 MiB.
+pub const STORE_MAX_RECORDS: usize = 4096;
+
+/// Hard per-value byte ceiling for the kad value store. 2 KiB (`2 * 1024`): strictly ABOVE
+/// the frozen `peer_fabric::MAX_PROVIDER_RECORD_BYTES` (1024 B) so a legitimate record is
+/// never refused (the store rejects `len >= max`), and ~32x BELOW the library's 65 KiB so a
+/// peer cannot park junk. The load-bearing anti-amplification cap.
+pub const STORE_MAX_VALUE_BYTES: usize = 2 * 1024;
+
+/// Max provider records stored per key. 20 = the kad replication factor `k`. libp2p ignores
+/// providers past this ("can mitigate Sybil attacks, in which an attacker floods the network
+/// with fake provider records"); we pin it EXPLICITLY so the anti-sybil bound is a decision.
+pub const STORE_MAX_PROVIDERS_PER_KEY: usize = 20;
+
+/// Max keys for which THIS node is itself a provider (our own announced store paths). Kept at
+/// the library default 1024, set explicitly.
+pub const STORE_MAX_PROVIDED_KEYS: usize = 1024;
+
+/// The EXPLICIT kad [`MemoryStoreConfig`] for a shipped node (TASK-154 AC#1): every cap is
+/// threaded from a `STORE_*` constant rather than left to `MemoryStoreConfig::default()`, so
+/// a poisoning / amplification / sybil flood against the store costs only BOUNDED memory. See
+/// each constant for its justification and headroom argument.
+pub fn content_store_config() -> MemoryStoreConfig {
+    MemoryStoreConfig {
+        max_records: STORE_MAX_RECORDS,
+        max_value_bytes: STORE_MAX_VALUE_BYTES,
+        max_providers_per_key: STORE_MAX_PROVIDERS_PER_KEY,
+        max_provided_keys: STORE_MAX_PROVIDED_KEYS,
+    }
+}
+
+/// COMPILE-TIME pin of the value-size HEADROOM invariant (TASK-154 AC#1): the store's per-
+/// value ceiling MUST exceed the largest legal frozen record, or the store would reject a
+/// LEGITIMATE provider record (the store's own check is `len >= max_value_bytes`). This fails
+/// the build the moment someone lowers the cap below the frozen record size - the "a bound
+/// mis-set that rejects a legitimate record is a regression" guard, caught at compile time.
+const _: () = assert!(
+    STORE_MAX_VALUE_BYTES > peer_fabric::MAX_PROVIDER_RECORD_BYTES,
+    "the kad value-store per-value ceiling must exceed the largest legal frozen provider \
+     record, or a legitimate record would be refused by the store"
+);
+
 /// Configuration for one libp2p node.
 pub struct NodeConfig {
     /// The 32-byte ed25519 secret that IS this node's identity and record-signing key.
@@ -1207,7 +1419,10 @@ impl Node {
                  relay_client|
                  -> Result<Behaviour, Box<dyn std::error::Error + Send + Sync>> {
                     let peer_id = key.public().to_peer_id();
-                    let store = MemoryStore::new(peer_id);
+                    // EXPLICIT storage caps for a shipped home node (TASK-154 AC#1), never the
+                    // library defaults - a poisoning/amplification/sybil flood against the
+                    // store costs only bounded memory. See `content_store_config`.
+                    let store = MemoryStore::with_config(peer_id, content_store_config());
                     let mut kad_config = kad::Config::new(kad_protocol);
                     // Configurable per-query deadline (TASK-210). Was a hardcoded 10s, which
                     // TASK-209's RTT sweep showed covers only up to ~250ms one-way and
