@@ -6,7 +6,7 @@ title: >-
 status: In Progress
 assignee: []
 created_date: '2026-08-12 14:28'
-updated_date: '2026-08-14 19:54'
+updated_date: '2026-08-14 19:55'
 labels:
   - libp2p
   - fabric
@@ -69,4 +69,6 @@ NOT DONE THIS CYCLE (honest scope): the implementation-note convergence of the -
 BOUNDED GATE (all green): cargo build -p fabric-libp2p -p daemon-libp2p (exit 0); cargo test -p fabric-libp2p (86 tests, 0 failed, incl. the new AC#2 test + the 159 acceptance test); cargo fmt --all --check (exit 0); cargo clippy --locked -p fabric-libp2p --all-targets -D warnings (exit 0); just independence (exit 0). no_enumeration N/A (no persisted/exposure/Disclosed type touched; the new path records NO exposure).
 
 AC status: AC#2 MET; AC#1 CODE done + HARNESS blocked->TASK-207; AC#3 deferred (frozen Disclosed, wire review).
+
+AC#2 DONE 2026-08-14 (commit e1d000c): ExplicitPeersOnly now resolves from a local static peer address book (NodeConfig.peer_address_book / with_explicit_peer) — a pure local map lookup, ZERO third-party disclosure (proven: a node with an EMPTY routing table resolves a book peer Found while the SAME peer under PublicInfrastructure is Unavailable(InsufficientRouting), so Found came from the book not the DHT; exposure_ledger unchanged across explicit resolves; unconfigured -> Miss; oracle bites by mutation). AC#3's frozen Disclosed extension NOT needed (local lookup discloses nothing). kad path (159) + discovery unchanged/green. Orchestrator-verified. 168 STAYS In Progress: AC#1 (real-NAT proof) blocked -> TASK-207 (env); AC#3 (queried-NodeId Disclosed extension, wire-review) deferred. Follow-up seam noted: the transport doesn't yet consult the book on fetch + the --libp2p-provider-addr shim convergence into ExplicitPeersOnly is a larger daemon+transport change (book seam in place, untested surface until then).
 <!-- SECTION:NOTES:END -->
