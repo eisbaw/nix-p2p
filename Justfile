@@ -306,6 +306,20 @@ profile *ARGS: _python fixtures-large
 discovery: _toolchain _python
     "${NIX_P2P_PYTHON}/bin/python3" scripts/profile_p2p.py --discovery-only
 
+# The TASK-206 shaped-libp2p connectivity proof: runs the REAL libp2p
+# discover->fetch->serve between two swarm nodes whose kad/stream traffic
+# traverses a `tc netem`-shaped veth pair (real RTT + bandwidth cap), and proves
+# the fetched NAR is BYTE-IDENTICAL + BLAKE3-verified over that shaped link - not
+# secretly loopback. Reuses the TASK-70 netns/veth/tc substrate and the proven
+# `shaped_link.assert_shaping` oracle (injected RTT recovered, fetch throughput
+# near the cap, UNSHAPED negative control measurably faster). All shaping stays on
+# the measurement surface (check_shaping_out_of_daemon green). Needs userns caps
+# (`unshare -Urn`). `--self-test` runs the hermetic parse/verdict biting checks.
+# Run the shaped-libp2p connectivity proof (TASK-206).
+shaped-libp2p *ARGS: _toolchain _python
+    cargo build --locked -p fabric-libp2p --example shaped_probe
+    "${NIX_P2P_PYTHON}/bin/python3" scripts/shaped_libp2p.py {{ ARGS }}
+
 # The task-64 transport decomposition: a layered loopback throughput bench
 # (memcpy / TCP / raw UDP / raw QUIC / iroh-blobs / the product's own fetch)
 # that attributes the peer-path per-byte cost to a LAYER, so "iroh is slow" is
