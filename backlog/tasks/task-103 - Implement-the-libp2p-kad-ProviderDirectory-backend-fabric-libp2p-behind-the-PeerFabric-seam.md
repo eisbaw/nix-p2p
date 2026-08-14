@@ -7,7 +7,7 @@ status: In Progress
 assignee:
   - '@claude'
 created_date: '2026-08-10 10:04'
-updated_date: '2026-08-12 08:12'
+updated_date: '2026-08-14 14:52'
 labels:
   - iroh
   - discovery
@@ -17,13 +17,9 @@ labels:
   - implementation
   - wave-2c
 dependencies:
-  - TASK-83
-  - TASK-100
   - TASK-102
-  - TASK-115
   - TASK-126
   - TASK-140
-  - TASK-141
 priority: high
 ---
 
@@ -89,4 +85,10 @@ REVIEW FIXES (5979aef): (B1) a get_record CONSULTATION FAILURE no longer collaps
 HONEST LIMITS (routed to follow-ups): withdraw best-effort, signed tombstone + full lifecycle = TASK-152; InsufficientRouting is a TOTAL-routing bar not near-key = TASK-153; DeadlineExceeded does not cancel the underlying kad query = TASK-154; end-to-end spoof/withdraw/expiry BITE tests = TASK-152. get_providers vs the frozen 'NOT get_providers' seam sentence: honest tension flagged in the ADR (index only, record still in the value store) - owner reconciliation (TASK-147 doc-sync). NOT wired into the daemon; just e2e unaffected (daemon-libp2p = TASK-146).
 
 STATUS: In Progress - this cycle's deliverable (cornerstone core: crate + directory + announcer + real multi-node decentralized test) is DONE and green; AC#1 and AC#7 checked. The remaining 8 ACs (eligibility-wiring AC#2, cold-evidence AC#3, bootstrap-loss AC#5, lifecycle AC#6, batch/no-leak-proof AC#4, resource AC#8, packet-guard AC#9, evidence-artifact AC#10) are honestly filed as TASK-152/153/154/155 (+ TASK-132 cold journey, TASK-100 batch, TASK-146 daemon wiring), not faked here.
+
+TASK-102 landed the gate (commits c67aab2, 5cf73ec, b65263e). For AC#2, route ALL public daemon-originated publication through daemon_libp2p::announce_public_provisions / approve_provisions_for_public (daemon-libp2p/src/lib.rs): it mints an unforgeable daemon_core::PublicNarClaim per StoreProvision iff daemon_core::PublicNarAllowlist approved its NarHash at the matching NarSize (fail-closed, all-or-nothing). Do NOT reuse the substrate-NEUTRAL announce_provider_seeds/announce_store_provisions for PUBLIC announce (they also serve LAN/private; publicness is a substrate property). REMAINING 103 WORK: (1) wire trusted-public-keys + an allowlist persistence path into the serving daemons (App/RunConfig.public_allowlist is disabled() today, so learns nothing until configured) so the allowlist actually populates from cache.nixos.org narinfo requests; (2) reconcile that an operator NAMING a local path (--libp2p-provide-store/--libp2p-seed-nar) does not make it public - a provider must prove each declared path public via the same narinfo-signature gate before PUBLIC announce. REACHABILITY finding: network_scope is only a kad namespace string; there is no typed public-vs-private substrate today, and the operator loops require explicit per-path + per-bootstrap action (no passive/automatic public publication is reachable now), so the typed public door is latent-until-103, not a live hole.
+
+TASK-102 HARD-BLOCKER residual (public-announce gate): the shipped libp2p provider modes (--libp2p-seed-nar, --libp2p-provide-store) now REFUSE to announce when --libp2p-bootstrap is non-empty AND the public-NAR allowlist is unconfigured (lan_share_or_refuse in daemon/main.rs + daemon-libp2p/main.rs; error names TASK-103). This is a bootstrap-emptiness proxy for 'cannot reach a public DHT', NOT a real public-participation gate. TASK-103 MUST, before enabling any --libp2p-bootstrap provider operation: (1) wire the allowlist config (trusted-keys + on-disk path + MAC key via daemon_core::derive_allowlist_mac_key from the durable identity seed) and PublicNarAllowlist::open_file; (2) populate it by proving each operator-provided path public via the narinfo-signature gate; (3) route public announces through the typed claim-consuming door daemon_libp2p::announce_public_provisions (which consumes ApprovedPublicProvision = verified StoreProvision + minted PublicNarClaim), REPLACING the bootstrap-emptiness guard with real allowlist enforcement. Until then, no public-participation profile ships. Weakness (per mped arbitration): the guard covers the ANNOUNCE/out-reach path only; a listening node with empty bootstrap can still be dialed inbound and serve records it holds (serve seam, out of scope here). Content-integrity (TASK-56) holds throughout regardless.
+
+DEP CORRECTION 2026-08-14 (Mark-emulator): reduced to the true minimal Done set TASK-102/126/140. DROPPED: 83 (iroh AvailabilityIndex-as-supplier — libp2p serve path is 178/191, not 83); 100 (BACKWARDS edge — 100 is ProviderDirectory HARDENING, harden-after-implement, itself blocked on 104/106/107/110; 100 should dep on 103, not the reverse; 103's eligibility need = the direct 102 edge); 115 (shared IROH endpoint — libp2p uses its own transport); 141 (iroh de-welding — fabric-libp2p already implements ProviderDirectory with zero dependence on it). 103 is ACTIONABLE. BACKEND STATUS: the libp2p-kad ProviderDirectory is DONE + proven — in-process 4-swarm discovery (tests/decentralized_discovery.rs, no injection), >=3-bootstrap resilience + negative control (tests/bootstrap_independence.rs), lifecycle/withdrawal/anti-rollback (tests/record_lifecycle.rs), byte-identical discover->fetch->serve (tests/nar_transport.rs), AND container s7-libp2p 11/11 (2026-08-13). CRITICAL: the s7-libp2p container proof is now RED — the TASK-102 lan_isolation_or_refuse guard (landed 2026-08-14 16:41) refuses the harness's --libp2p-bootstrap provider (no allowlist configured), so it dies at startup (main.rs:367 propagates the refusal). The genuine missing piece = AC#2: wire the allowlist door so a bootstrapped provider can LEGITIMATELY announce, replacing the isolation-guard stopgap.
 <!-- SECTION:NOTES:END -->
