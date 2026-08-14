@@ -52,8 +52,9 @@ use daemon_core::{
     RunConfig, SourceError, StoreHash, UpstreamResponse, run,
 };
 use daemon_libp2p::{
-    IDENTITY_SEED_FILENAME, Libp2pSourceConfig, announce_provider_seeds, build_libp2p_nar_source,
-    build_libp2p_provider_source, provider_content_key, resolve_durable_identity_seed,
+    IDENTITY_SEED_FILENAME, LanShare, Libp2pSourceConfig, announce_provider_seeds,
+    build_libp2p_nar_source, build_libp2p_provider_source, provider_content_key,
+    resolve_durable_identity_seed,
 };
 use fabric_libp2p::{
     ANNOUNCE_SEQ_FILENAME, Libp2pFabric, MemoryNarSupplier, Multiaddr, NodeConfig, PeerId,
@@ -142,6 +143,7 @@ async fn start_provider_and_announce(
         &fabric,
         seed,
         &[(*nar_hash, nar.to_vec())],
+        LanShare::operator_assembled(),
         3600,
         unix_now(),
         &AnnounceBudget::new(Duration::from_secs(10), 20),

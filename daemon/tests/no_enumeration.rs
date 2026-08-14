@@ -223,6 +223,15 @@ const ALLOWED: &[(&str, &str, &str, &str)] = &[
          reading this node's own append-only allowlist file.",
     ),
     (
+        "public_allowlist.rs",
+        "FileAllowlistStore",
+        "parse_committed",
+        "The MAC-verifying parser `load` delegates to; it turns THIS node's own on-disk \
+         allowlist bytes into records at startup. Not reachable from any wire message, and a \
+         node is allowed to know which public NARs it may itself announce; there is no method \
+         that returns the set to a peer.",
+    ),
+    (
         "claim.rs",
         "",
         "decode_batch_hold_response",
@@ -329,16 +338,28 @@ fn declares_fn(line: &str) -> Option<usize> {
 /// exempted or blamed by name.
 fn impl_subject(line: &str) -> Option<String> {
     let line = line.trim_start();
-    if let Some(rest) = line.strip_prefix("trait ") {
-        return Some(
-            rest.trim()
-                .split(['<', ' ', '{', ':'])
-                .next()
-                .unwrap_or("")
-                .to_string(),
-        );
-    }
-    if let Some(rest) = line.strip_prefix("pub trait ") {
+    // Strip a leading visibility modifier (`pub`, `pub(crate)`, `pub(super)`, `pub(in ...)`)
+    // so `pub(crate) trait Foo` is attributed to `Foo` exactly like `trait Foo` / `pub trait Foo`.
+    // A trait declaration is where an enumeration method's contract is written, so it must be
+    // attributable by name regardless of its visibility (a `pub(crate)` seal must not blank it).
+    let vis_stripped = {
+        let mut s = line;
+        if let Some(rest) = s.strip_prefix("pub") {
+            let rest = rest.trim_start();
+            // Optional `(crate)` / `(super)` / `(in path)` scope after `pub`.
+            let rest = if let Some(after) = rest.strip_prefix('(') {
+                match after.find(')') {
+                    Some(close) => after[close + 1..].trim_start(),
+                    None => rest,
+                }
+            } else {
+                rest
+            };
+            s = rest;
+        }
+        s
+    };
+    if let Some(rest) = vis_stripped.strip_prefix("trait ") {
         return Some(
             rest.trim()
                 .split(['<', ' ', '{', ':'])

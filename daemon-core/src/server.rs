@@ -164,8 +164,10 @@ async fn handle(req: Request<Incoming>, app: Arc<App>) -> Response<NarBody> {
     match classify(&path) {
         Route::CacheInfo => respond_cache_info(&app.cache_info, is_head),
         Route::Narinfo(hash) => {
+            let fetched = app.narinfo.fetch(&hash).await;
             respond_narinfo(
-                app.narinfo.fetch(&hash).await,
+                fetched,
+                &hash,
                 &app.catalog,
                 app.raw_serve.as_ref(),
                 app.public_allowlist.as_ref(),
@@ -237,6 +239,7 @@ fn respond_cache_info(info: &CacheInfo, is_head: bool) -> Response<NarBody> {
 /// verbatim (the S2 path) and the original token is correlated.
 async fn respond_narinfo(
     result: Result<UpstreamResponse, SourceError>,
+    requested: &StoreHash,
     catalog: &NarCatalog,
     raw_serve: &dyn rewrite::RawServeDecision,
     public_allowlist: &crate::public_allowlist::PublicNarAllowlist,
@@ -286,7 +289,9 @@ async fn respond_narinfo(
     // and only a 200 that survived the framing checks above reaches here - a MISS/outage/
     // timeout returned earlier, so a non-public path appends nothing (AC#3). A daemon with
     // no configured trusted keys uses a disabled allowlist and this is a cheap no-op.
-    match public_allowlist.learn(&bytes) {
+    // `learn` also correlates the signed StorePath to the EXACT `<requested>.narinfo` key,
+    // so a response for a DIFFERENT path than the one requested appends nothing.
+    match public_allowlist.learn(requested, &bytes) {
         crate::public_allowlist::LearnOutcome::Appended { nar_hash, nar_size } => {
             println!("daemon: public-allowlist appended narhash={nar_hash} nar_size={nar_size}");
         }
@@ -294,6 +299,14 @@ async fn respond_narinfo(
             // Fail-verbose: the entry was NOT admitted (disk and memory agree), so a
             // later request simply re-verifies. Surface it rather than degrade silently.
             eprintln!("daemon: public-allowlist append failed (not admitted): {err}");
+        }
+        crate::public_allowlist::LearnOutcome::RequestMismatch { requested, signed } => {
+            // A response whose signed StorePath does not match the requested key: never
+            // learned. Surface it - it is either a misrouted cache or a hostile upstream.
+            eprintln!(
+                "daemon: public-allowlist ignored a mis-correlated narinfo \
+                 (requested {requested}, signed {signed})"
+            );
         }
         // AlreadyPresent (idempotent duplicate) and Rejected (not proven public - the
         // common case for a non-cache upstream or an unsigned path) are normal and silent.

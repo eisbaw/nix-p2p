@@ -23,7 +23,7 @@ use daemon::{
     DEFAULT_MAX_SERVE_DURATION, DEFAULT_MAX_SERVE_NAR_BYTES, EndpointProfile, EndpointScope,
     FallbackNarSource, FileNarSupplier, IdentitySource, InMemoryDiscovery, IrohNode,
     IrohNodeBuilder, IrohPeerAddr, IrohProviderConfig, IrohTransport, KnownPayload, KnownTransport,
-    Libp2pCatalogProbe, Libp2pSourceConfig, NarCatalog, NarDumper, NarHashKey, NarSource,
+    LanShare, Libp2pCatalogProbe, Libp2pSourceConfig, NarCatalog, NarDumper, NarHashKey, NarSource,
     NarinfoDiskCache, NarinfoSource, NoRawServe, NodeId, NodeLocation,
     NodeLookupAuthorityAuthorization, NodeLookupConfig, NodePublicationCapability,
     NodePublicationConfig, NodePublicationHandle, NullAnnounce, NullCorrelation, NullStore,
@@ -1303,6 +1303,27 @@ struct Libp2pProviderGuard {
     _index: Option<Arc<AvailabilityIndex>>,
 }
 
+/// The TASK-102 bootstrap guard for the shipped libp2p provider modes. They announce over a
+/// PRIVATE / LAN (operator-assembled) substrate: the seed/store bytes are content-verified
+/// (TASK-56) but NOT publication-authorized by the public-NAR allowlist (config not wired until
+/// TASK-103). Announcing to a `--libp2p-bootstrap` (potentially PUBLIC) DHT without an allowlist
+/// would publish operator-named local holdings to strangers, so refuse it (fail-closed, naming
+/// TASK-103). An EMPTY bootstrap set has no routing targets on which to store a provider record - a
+/// defensible proxy for "cannot reach a public DHT" - so the isolated LAN MVP still runs and this
+/// returns the [`LanShare`] witness the private announce door requires.
+fn lan_share_or_refuse(bootstrap: &[(PeerId, Multiaddr)]) -> Result<LanShare, String> {
+    if !bootstrap.is_empty() {
+        return Err(
+            "refusing to announce provider records to a --libp2p-bootstrap (potentially PUBLIC) \
+             DHT without a configured public-NAR allowlist: this would publish operator-named \
+             local content to strangers. The allowlist-gated public announce door is wired by \
+             TASK-103; run WITHOUT --libp2p-bootstrap for an isolated LAN announce."
+                .to_string(),
+        );
+    }
+    Ok(LanShare::operator_assembled())
+}
+
 /// Node B (libp2p PROVIDER, TASK-178): start the libp2p fabric WITH a supplier serving
 /// the `--libp2p-seed-nar` NARs, install the serve gate under the daemon's serve budget,
 /// and announce a signed [`ProviderRecord`] for each seed so a consumer discovers it via
@@ -1416,9 +1437,19 @@ async fn install_libp2p_provider(
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0);
-    let records =
-        announce_provider_seeds(&fabric, identity_seed, &seeds, 3600, now, &announce_budget)
-            .await?;
+    // TASK-102 bootstrap guard: refuse a bootstrapped (potentially public) announce without an
+    // allowlist; an isolated LAN announce is permitted and yields the LanShare witness.
+    let lan = lan_share_or_refuse(&config.libp2p_bootstrap)?;
+    let records = announce_provider_seeds(
+        &fabric,
+        identity_seed,
+        &seeds,
+        lan,
+        3600,
+        now,
+        &announce_budget,
+    )
+    .await?;
     for (record, (nar_hash, bytes)) in records.iter().zip(&seeds) {
         // Machine-readable: path/NarHash -> the derived ContentKey + raw BLAKE3 content id.
         println!(
@@ -1571,10 +1602,14 @@ async fn install_libp2p_store_provider(
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0);
+    // TASK-102 bootstrap guard (see install_libp2p_provider): refuse a bootstrapped announce
+    // without an allowlist; an isolated LAN announce is permitted.
+    let lan = lan_share_or_refuse(&config.libp2p_bootstrap)?;
     let records = announce_store_provisions(
         &fabric,
         identity_seed,
         &provisions,
+        lan,
         3600,
         now,
         &announce_budget,
@@ -2139,6 +2174,28 @@ async fn main() -> ExitCode {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn bootstrap_guard_permits_lan_and_refuses_bootstrapped_without_allowlist() {
+        // TASK-102 bootstrap guard bite (composite binary). Empty bootstrap = isolated LAN
+        // announce, permitted. Non-empty bootstrap without an allowlist = refuse (naming TASK-103).
+        // Neuter `lan_share_or_refuse` (drop the `!bootstrap.is_empty()` refusal) and the refusal
+        // assertion goes RED.
+        assert!(
+            lan_share_or_refuse(&[]).is_ok(),
+            "isolated LAN announce is permitted"
+        );
+        let peer: PeerId = "12D3KooWDpJ7As7BWAwRMfu1VU2WCqNjvq387JEYKDBj4kx6nXTN"
+            .parse()
+            .unwrap();
+        let addr: Multiaddr = "/ip4/127.0.0.1/tcp/4001".parse().unwrap();
+        let err = lan_share_or_refuse(&[(peer, addr)])
+            .expect_err("a bootstrapped announce without an allowlist must be refused");
+        assert!(
+            err.contains("TASK-103"),
+            "the refusal must name TASK-103: {err}"
+        );
+    }
 
     #[test]
     fn banner_names_this_crate_and_a_version() {

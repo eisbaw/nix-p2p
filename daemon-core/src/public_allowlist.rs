@@ -58,7 +58,6 @@
 
 use std::collections::BTreeMap;
 use std::fmt;
-use std::io::{Read, Write};
 use std::path::PathBuf;
 use std::sync::Mutex;
 
@@ -66,6 +65,7 @@ use base64::Engine;
 use ed25519_dalek::{Signature, VerifyingKey};
 
 use crate::claim::NarHashKey;
+use crate::source::StoreHash;
 
 // -------------------------------------------------------------------------
 // Trusted keys: the AUTHORITY that decides "public".
@@ -171,14 +171,21 @@ impl TrustedNarKeys {
 // -------------------------------------------------------------------------
 
 /// The canonical, trust-anchored identity a verified-public narinfo yields: exactly
-/// the `(NarHash, NarSize)` that the trusted signature COVERED. Nothing else is
-/// carried - no `StorePath`, no references - because nothing else is appended.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// the `(NarHash, NarSize)` that the trusted signature COVERED, plus the 32-char store
+/// hash of the signed `StorePath` so the caller can correlate it to the EXACT request
+/// that produced this narinfo (a signed narinfo for path B must never be admitted as
+/// the answer to a request for path A). Only `(NarHash, NarSize)` is ever APPENDED - the
+/// `store_hash` is a request-correlation witness, never persisted (no `StorePath` on disk).
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VerifiedPublicNar {
     /// The signed `NarHash`, parsed to the strict wire key (`sha256:<52 nix-base32>`).
     pub nar_hash: NarHashKey,
     /// The signed `NarSize` - the UNCOMPRESSED NAR length (never a compressed FileSize).
     pub nar_size: u64,
+    /// The nixbase32 store-hash component of the signed `StorePath` (`<hash>` in
+    /// `/nix/store/<hash>-<name>`). The append site checks this equals the requested
+    /// `<hash>.narinfo` key before learning, so a mis-correlated response is rejected.
+    pub store_hash: String,
 }
 
 /// Why a narinfo did NOT prove a NAR public. EACH variant is a distinct fail-closed
@@ -186,8 +193,20 @@ pub struct VerifiedPublicNar {
 /// append when it must not, so a negative test asserting the variant BITES that mutation.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PublicProofReject {
-    /// A field required to build the signed fingerprint was absent (malformed metadata).
+    /// A field required to build the signed fingerprint (or the structurally-required
+    /// `URL`) was absent (malformed metadata). Mirrors Nix's `nar-info.cc` parser
+    /// refusing a narinfo that lacks a mandatory field.
     MissingField(&'static str),
+    /// A single-line field required to occur AT MOST ONCE occurred twice. A duplicated
+    /// signed field is ambiguous (which value did the signature cover?) - Nix's parser
+    /// rejects it, and admitting one lets a first-vs-last split smuggle an unsigned value.
+    DuplicateField(&'static str),
+    /// The narinfo body did not end in a final newline. Nix writes/parses line-terminated
+    /// narinfos; a body without a trailing newline is a truncated / non-canonical response.
+    MissingFinalNewline,
+    /// `NarSize` parsed but was zero. A real NAR is never zero bytes; a zero size is
+    /// structurally invalid (and would let a degenerate record onto the list).
+    ZeroNarSize,
     /// `NarHash` was present but not a canonical `sha256:<52 nix-base32>` (hash guard).
     MalformedNarHash(String),
     /// `NarSize` was present but not a base-10 `u64` (size guard).
@@ -214,6 +233,16 @@ impl fmt::Display for PublicProofReject {
                     "narinfo lacks required field {name:?}; cannot prove public"
                 )
             }
+            PublicProofReject::DuplicateField(name) => {
+                write!(
+                    f,
+                    "narinfo has a duplicate {name:?} field; ambiguous, refusing"
+                )
+            }
+            PublicProofReject::MissingFinalNewline => {
+                write!(f, "narinfo body is not terminated by a final newline")
+            }
+            PublicProofReject::ZeroNarSize => write!(f, "narinfo NarSize is zero"),
             PublicProofReject::MalformedNarHash(v) => write!(f, "malformed NarHash {v:?}"),
             PublicProofReject::MalformedNarSize(v) => write!(f, "malformed NarSize {v:?}"),
             PublicProofReject::MalformedSig(v) => write!(f, "malformed Sig {v:?}"),
@@ -232,32 +261,62 @@ impl fmt::Display for PublicProofReject {
 
 impl std::error::Error for PublicProofReject {}
 
-/// The FIRST value of `key:` in the narinfo (values are single-line). Signed fields
-/// occur once; taking the first is deterministic for a well-formed cache narinfo.
-fn field<'a>(text: &'a str, key: &str) -> Option<&'a str> {
-    text.lines()
-        .find_map(|line| line.strip_prefix(key).map(str::trim))
+/// The nixbase32 store-hash component of a `StorePath` (`<hash>` in
+/// `/nix/store/<hash>-<name>`): the basename up to the FIRST `-`. Used only to correlate a
+/// verified narinfo back to the `<hash>.narinfo` request that produced it; never persisted.
+fn store_hash_of(store_path: &str) -> String {
+    let basename = store_path.rsplit('/').next().unwrap_or(store_path);
+    match basename.split_once('-') {
+        Some((hash, _)) => hash.to_string(),
+        None => basename.to_string(),
+    }
 }
 
-/// Rebuild the exact string Nix signs: `1;<StorePath>;<NarHash>;<NarSize>;<refs>`,
-/// where `refs` are the `References` basenames re-prefixed with the store directory
-/// (derived from the `StorePath`'s own parent, so a non-`/nix/store` store is handled)
-/// and joined by `,`. Getting the reference prefixing wrong yields a fingerprint that
-/// verifies NOWHERE, so the positive control (a real fixture signature) is what proves
-/// this correct. Mirrors `scripts/fixturelib.py::fingerprint`.
-fn fingerprint(store_path: &str, nar_hash: &str, nar_size: &str, references: &str) -> String {
+/// The single value of `key` in the narinfo (values are single-line), rejecting a
+/// DUPLICATE occurrence. Nix's narinfo is a map: a signed field occurs exactly once, and
+/// a well-formed cache narinfo never repeats one. Returning `Err(())` on a second
+/// occurrence is what unifies the field semantics across the codebase - proof
+/// ([`prove_public`]) and correlation ([`crate::catalog::parse_correlation`]) both refuse
+/// duplicates, so there is no first-vs-last gap for an unsigned value to slip through.
+fn field<'a>(text: &'a str, key: &str) -> Result<Option<&'a str>, ()> {
+    let mut found = None;
+    for line in text.lines() {
+        if let Some(value) = line.strip_prefix(key) {
+            if found.is_some() {
+                return Err(());
+            }
+            found = Some(value.trim());
+        }
+    }
+    Ok(found)
+}
+
+/// Rebuild the exact string Nix signs: `1;<StorePath>;<NarHash>;<NarSize>;<refs>`, in
+/// Nix's CANONICAL spelling (`path-info.cc` `ValidPathInfo::fingerprint`):
+///   * `nar_hash` is the PARSED canonical `sha256:<52 nix-base32>` (not the raw field
+///     spelling), so a non-canonical hash spelling cannot change what we record;
+///   * `nar_size` is the DECIMAL of the parsed `u64` (so a leading-zero `NarSize` like
+///     `0408` fingerprints as `408`, matching what Nix signed);
+///   * `refs` are the `References` basenames re-prefixed with the store directory and
+///     SORTED (Nix's fingerprint is over a `StorePathSet`, which is ordered), so a
+///     REORDERED `References` field yields the same fingerprint - a reorder cannot make a
+///     legitimately-signed NAR fail nor an illegitimate one pass.
+///
+/// Getting any of this wrong yields a fingerprint that verifies NOWHERE, so the positive
+/// control (a real fixture signature) proves it correct.
+fn fingerprint(store_path: &str, nar_hash: &str, nar_size: u64, references: &str) -> String {
     // The store directory is the StorePath's parent (e.g. `/nix/store`).
     let store_dir = store_path
         .rsplit_once('/')
         .map(|(dir, _)| dir)
         .unwrap_or("");
-    let refs = references
+    let mut refs: Vec<String> = references
         .split_whitespace()
         .filter(|r| !r.is_empty())
         .map(|r| format!("{store_dir}/{r}"))
-        .collect::<Vec<_>>()
-        .join(",");
-    format!("1;{store_path};{nar_hash};{nar_size};{refs}")
+        .collect();
+    refs.sort();
+    format!("1;{store_path};{nar_hash};{nar_size};{}", refs.join(","))
 }
 
 /// CRYPTOGRAPHICALLY prove a narinfo names a PUBLIC NAR: its trusted-key Nix ed25519
@@ -276,33 +335,58 @@ pub fn prove_public(
     let text =
         std::str::from_utf8(narinfo).map_err(|_| PublicProofReject::MissingField("StorePath"))?;
 
-    // The four signed fingerprint fields. `References:` may be EMPTY (a leaf path), so
-    // only its PRESENCE is required - an absent line is malformed metadata.
-    let store_path =
-        field(text, "StorePath:").ok_or(PublicProofReject::MissingField("StorePath"))?;
+    // STRUCTURAL validity (matching Nix's `nar-info.cc` parser strictness): the body must
+    // be newline-terminated, and each single-line field must occur AT MOST once. A missing
+    // final newline is a truncated / non-canonical response; a duplicated field is
+    // ambiguous. Both are refused BEFORE any crypto so a malformed body cannot reach append.
+    if !narinfo.ends_with(b"\n") {
+        return Err(PublicProofReject::MissingFinalNewline);
+    }
+
+    // The four signed fingerprint fields, plus the structurally-required `URL` (a narinfo
+    // with no `URL:` is not a servable cache response - Nix's parser requires it). Each is
+    // fetched with duplicate-rejection. `References:` may be EMPTY (a leaf path), so only
+    // its PRESENCE is required - an absent line is malformed metadata.
+    let store_path = field(text, "StorePath:")
+        .map_err(|_| PublicProofReject::DuplicateField("StorePath"))?
+        .ok_or(PublicProofReject::MissingField("StorePath"))?;
     if store_path.is_empty() {
         return Err(PublicProofReject::MissingField("StorePath"));
     }
-    let nar_hash_str = field(text, "NarHash:").ok_or(PublicProofReject::MissingField("NarHash"))?;
-    let nar_size_str = field(text, "NarSize:").ok_or(PublicProofReject::MissingField("NarSize"))?;
-    let references = text
-        .lines()
-        .find_map(|line| line.strip_prefix("References:"))
-        .ok_or(PublicProofReject::MissingField("References"))?
-        .trim();
+    let url = field(text, "URL:")
+        .map_err(|_| PublicProofReject::DuplicateField("URL"))?
+        .ok_or(PublicProofReject::MissingField("URL"))?;
+    if url.is_empty() {
+        return Err(PublicProofReject::MissingField("URL"));
+    }
+    let nar_hash_str = field(text, "NarHash:")
+        .map_err(|_| PublicProofReject::DuplicateField("NarHash"))?
+        .ok_or(PublicProofReject::MissingField("NarHash"))?;
+    let nar_size_str = field(text, "NarSize:")
+        .map_err(|_| PublicProofReject::DuplicateField("NarSize"))?
+        .ok_or(PublicProofReject::MissingField("NarSize"))?;
+    let references = field(text, "References:")
+        .map_err(|_| PublicProofReject::DuplicateField("References"))?
+        .ok_or(PublicProofReject::MissingField("References"))?;
 
     // Parse the canonical identity we will record. A NarHash that is not
     // `sha256:<52 nix-base32>` is refused (hash guard); a non-`u64` NarSize is refused
-    // (size guard). These are the EXACT strings the fingerprint uses, so the recorded
-    // identity is precisely what the signature bound.
+    // (size guard); a ZERO NarSize is structurally invalid (a real NAR is never empty).
     let nar_hash: NarHashKey = nar_hash_str
         .parse()
         .map_err(|_| PublicProofReject::MalformedNarHash(nar_hash_str.to_string()))?;
     let nar_size: u64 = nar_size_str
         .parse()
         .map_err(|_| PublicProofReject::MalformedNarSize(nar_size_str.to_string()))?;
+    if nar_size == 0 {
+        return Err(PublicProofReject::ZeroNarSize);
+    }
 
-    let fp = fingerprint(store_path, nar_hash_str, nar_size_str, references);
+    // Fingerprint over the CANONICAL spelling (parsed hash, decimal size, sorted refs), so
+    // a leading-zero size or reordered references cannot change what the signature must
+    // cover. The recorded identity is precisely what the trusted signature bound.
+    let fp = fingerprint(store_path, &nar_hash.to_string(), nar_size, references);
+    let store_hash = store_hash_of(store_path);
 
     // Try every Sig line. Track whether we ever SAW a trusted-named signature so the
     // rejection distinguishes "wrong authority" (no trusted signer at all) from "bad
@@ -338,7 +422,11 @@ pub fn prove_public(
             .verify_strict(fp.as_bytes(), &signature)
             .is_ok()
         {
-            return Ok(VerifiedPublicNar { nar_hash, nar_size });
+            return Ok(VerifiedPublicNar {
+                nar_hash,
+                nar_size,
+                store_hash,
+            });
         }
     }
 
@@ -371,25 +459,56 @@ impl fmt::Display for AllowlistPersistError {
 
 impl std::error::Error for AllowlistPersistError {}
 
-/// Persists the append-only allowlist so it survives a restart. The SOURCE OF TRUTH
-/// is the sequence of `(NarHash, NarSize)` records ever verified public; a duplicate
-/// is never appended (the in-memory set dedups before the store is touched). A SEAM so
-/// a test can persist to a temp file or use an in-memory store.
-pub trait AllowlistStore: Send + Sync {
-    /// Load every COMMITTED record (empty if the file does not exist yet). A record
-    /// that was fully written (terminated) but does not parse is CORRUPTION and fails
-    /// LOUD; a torn FINAL record (no terminator) is dropped (see [`FileAllowlistStore`]).
+/// A hard cap on the on-disk allowlist file: refuse to load a file larger than this
+/// rather than buffer an unbounded amount into memory (a corrupt/hostile file must not
+/// OOM the daemon). 64 MiB is ~500k records at ~130 B each - far above any real node.
+pub(crate) const MAX_ALLOWLIST_FILE_BYTES: u64 = 64 * 1024 * 1024;
+
+/// A hard cap on the number of COMMITTED records loaded, a second bound independent of the
+/// byte cap (a file of many tiny lines is still bounded).
+pub(crate) const MAX_ALLOWLIST_RECORDS: usize = 1_000_000;
+
+/// The blake3 domain-separation context the per-node allowlist MAC key is derived under.
+/// Distinct context => the MAC key is unusable for any other purpose even given the same
+/// identity seed, and a key from a DIFFERENT context cannot forge an allowlist line.
+pub(crate) const ALLOWLIST_MAC_CONTEXT: &str = "nix-p2p public-allowlist record MAC v1";
+
+/// Derive the per-node allowlist MAC key from a durable secret (the libp2p identity seed).
+/// Domain-separated via [`ALLOWLIST_MAC_CONTEXT`], so the returned key is unusable for any
+/// other purpose and a foreign node's key (a different seed) cannot forge a record line.
+/// The caller passes the result to [`PublicNarAllowlist::open_file`].
+pub fn derive_allowlist_mac_key(identity_seed: &[u8; 32]) -> [u8; 32] {
+    blake3::derive_key(ALLOWLIST_MAC_CONTEXT, identity_seed)
+}
+
+/// Persists the append-only allowlist so it survives a restart. The SOURCE OF TRUTH is the
+/// sequence of `(NarHash, NarSize)` records ever verified public; a duplicate is never
+/// appended (the in-memory set dedups before the store is touched).
+///
+/// SEALED (TASK-102 security fix). This trait, its implementations, and
+/// [`PublicNarAllowlist::open`] are `pub(crate)`: external code CANNOT name the trait, so
+/// it cannot implement a forged store nor pass one to `open`. The ONLY ways an external
+/// caller obtains a [`PublicNarAllowlist`] are the sealed constructors
+/// ([`PublicNarAllowlist::disabled`], [`PublicNarAllowlist::in_memory`],
+/// [`PublicNarAllowlist::open_file`]). This closes the forged-store bypass: previously
+/// `open(empty_trusted, forged_store)` then `approve()` could mint a claim for an entry
+/// that never passed `learn`'s signature check.
+pub(crate) trait AllowlistStore: Send + Sync {
+    /// Load every COMMITTED record (empty if the file does not exist yet). A record that
+    /// was fully written (terminated) but does not parse OR whose MAC does not verify is
+    /// CORRUPTION/TAMPERING and fails LOUD; a torn FINAL record (no terminator) is dropped.
     fn load(&self) -> Result<Vec<(NarHashKey, u64)>, AllowlistPersistError>;
 
-    /// Durably APPEND one record. Crash-safe: a torn append loses at most this record
-    /// and never creates eligibility (an unterminated tail is dropped on load).
+    /// Durably APPEND one record. Crash-safe: a torn append loses at most this record and
+    /// never creates eligibility (an unterminated tail is dropped on load / truncated on
+    /// the next append).
     fn append(&self, nar_hash: &NarHashKey, nar_size: u64) -> Result<(), AllowlistPersistError>;
 }
 
 /// An in-memory store: the allowlist does not survive a restart. Used by the DISABLED
 /// allowlist (an empty-trusted-keys no-op) and by tests that do not exercise persistence.
 #[derive(Debug, Default)]
-pub struct NullAllowlistStore;
+pub(crate) struct NullAllowlistStore;
 
 impl AllowlistStore for NullAllowlistStore {
     fn load(&self) -> Result<Vec<(NarHashKey, u64)>, AllowlistPersistError> {
@@ -400,44 +519,86 @@ impl AllowlistStore for NullAllowlistStore {
     }
 }
 
-/// The real store: a single APPEND-ONLY text file, one record per line:
-/// `sha256:<52 nix-base32> <nar_size>\n`. No `StorePath`, so the file cannot be an
-/// inventory of what the node BUILT - only which public NARs it may announce (AC#5).
+/// The canonical MAC-covered bytes of one record: `<NarHash> <NarSize>`. The MAC binds
+/// exactly what we record; the on-disk line is `<canonical> <mac-hex>\n`.
+fn record_canonical(nar_hash: &NarHashKey, nar_size: u64) -> String {
+    format!("{nar_hash} {nar_size}")
+}
+
+/// The keyed-blake3 MAC over a record's canonical bytes, as 64 lowercase hex chars.
+/// A modified/injected/foreign line (a flipped nixbase32 char, a size edit, or a line
+/// written under a different node's key) recomputes to a DIFFERENT MAC and fails on load.
+fn record_mac(mac_key: &[u8; 32], nar_hash: &NarHashKey, nar_size: u64) -> String {
+    blake3::keyed_hash(mac_key, record_canonical(nar_hash, nar_size).as_bytes())
+        .to_hex()
+        .to_string()
+}
+
+/// The real store: a single APPEND-ONLY, integrity-protected text file, one record per
+/// line: `sha256:<52 nix-base32> <nar_size> <mac-hex>\n`. No `StorePath`, so the file
+/// cannot be an inventory of what the node BUILT - only which public NARs it may announce.
 ///
-/// CRASH SAFETY (AC#4). Each record is one small `O_APPEND` write followed by
-/// `sync_all` (fdatasync of the file). A crash mid-append can leave a TORN final line
-/// (no trailing `\n`); [`Self::load`] drops any unterminated tail, so a torn append
-/// loses at most that one uncommitted record and NEVER admits a partial/garbage entry
-/// as eligible. A COMMITTED line (ends in `\n`) that fails to parse is real corruption
-/// and fails LOUD rather than being skipped. The file's directory entry is fsynced when
-/// the file is first created, so the file itself survives a crash.
+/// INTEGRITY (TASK-102 security fix, AC#4). Each line carries a keyed-blake3 MAC over its
+/// `<NarHash> <NarSize>` under a PER-NODE secret ([`FileAllowlistStore::new`]'s `mac_key`,
+/// derived from the durable identity seed). A line that was modified in place (a flipped
+/// nixbase32 char, an edited size), injected, or copied from another node fails its MAC on
+/// load - it can no longer fabricate eligibility for a NAR that never passed `learn`. The
+/// valid MAC is the integrity COMMIT MARKER (not a bare newline): a committed line is
+/// trusted only if its MAC verifies.
 ///
-/// STRICT FILE CHECKS (AC#4). The file is opened `O_NOFOLLOW` (a symlink in its place
-/// is refused - the "link" check) and `fstat`ed on every open: it must be a REGULAR
-/// file, OWNED by this process's euid, and NOT writable by group or other. A file that
-/// fails any check is refused (fail-closed) rather than trusted.
-pub struct FileAllowlistStore {
+/// CRASH SAFETY (AC#4). Append holds an exclusive `flock` and, before writing, TRUNCATES
+/// any torn tail (an unterminated final line from a prior crashed append) so a new record
+/// is never concatenated onto a partial one. The write is one line + `sync_all`; the parent
+/// directory is fsynced on first creation. A crash mid-append leaves a torn tail that
+/// [`Self::load`] drops and the next append truncates.
+///
+/// STRICT FILE CHECKS (AC#4). The file is opened `O_NOFOLLOW` (a symlink in its place is
+/// refused) and `fstat`ed on every open: it must be a REGULAR file with exactly ONE hard
+/// link (`st_nlink == 1`), OWNED by this process's euid, and mode `0600` (no group/other
+/// bits at all - the NarHash inventory must not be group/world-readable). Its PARENT
+/// directory is opened `O_DIRECTORY|O_NOFOLLOW` (a symlinked parent is refused) and checked
+/// to be owned by this euid and not group/other-writable. A cross-process `flock` serialises
+/// writers. A file that fails any check is refused (fail-closed) rather than trusted.
+pub(crate) struct FileAllowlistStore {
     path: PathBuf,
+    /// The per-node MAC secret (derived from the durable identity seed by the caller).
+    mac_key: [u8; 32],
+}
+
+/// How [`FileAllowlistStore::open_strict`] should open the file.
+enum OpenMode {
+    /// Read-only (`load`): `O_RDONLY`. A missing file yields `Ok(None)`.
+    Read,
+    /// Read-write for the truncate-then-append cycle: `O_RDWR|O_CREAT`.
+    ReadWrite,
 }
 
 impl FileAllowlistStore {
-    /// Persist to `path` (its parent directory is created on first append if absent).
-    pub fn new(path: impl Into<PathBuf>) -> Self {
-        FileAllowlistStore { path: path.into() }
+    /// Persist to `path`, MAC-protected under `mac_key` (a per-node secret). The parent
+    /// directory is created on first append if absent.
+    pub(crate) fn new(path: impl Into<PathBuf>, mac_key: [u8; 32]) -> Self {
+        FileAllowlistStore {
+            path: path.into(),
+            mac_key,
+        }
     }
 
-    /// Open the file with the strict owner/mode/type/link checks. `create` opens
-    /// `O_APPEND|O_CREAT` for writing; otherwise read-only. Returns `Ok(None)` only for
-    /// a non-existent file when NOT creating (a first-boot empty allowlist).
-    fn open_strict(&self, create: bool) -> Result<Option<std::fs::File>, AllowlistPersistError> {
+    /// Open the file with the strict owner/mode/type/link/nlink checks. Returns `Ok(None)`
+    /// only for a non-existent file in [`OpenMode::Read`] (a first-boot empty allowlist).
+    fn open_strict(&self, mode: OpenMode) -> Result<Option<std::fs::File>, AllowlistPersistError> {
         use rustix::fs::{FileType, Mode, OFlags};
 
         let mut flags = OFlags::NOFOLLOW | OFlags::CLOEXEC;
-        if create {
-            flags |= OFlags::WRONLY | OFlags::APPEND | OFlags::CREATE;
-        } else {
-            flags |= OFlags::RDONLY;
-        }
+        let create = match mode {
+            OpenMode::Read => {
+                flags |= OFlags::RDONLY;
+                false
+            }
+            OpenMode::ReadWrite => {
+                flags |= OFlags::RDWR | OFlags::CREATE;
+                true
+            }
+        };
         // 0600: owner read/write only. Applies only when CREATE actually makes the file.
         let fd = match rustix::fs::open(&self.path, flags, Mode::RUSR | Mode::WUSR) {
             Ok(fd) => fd,
@@ -458,6 +619,13 @@ impl FileAllowlistStore {
                 self.path.display()
             )));
         }
+        if stat.st_nlink != 1 {
+            return Err(AllowlistPersistError(format!(
+                "{} has {} hard links (expected 1); refusing a possibly-shared inode",
+                self.path.display(),
+                stat.st_nlink
+            )));
+        }
         let euid = rustix::process::geteuid().as_raw();
         if stat.st_uid != euid {
             return Err(AllowlistPersistError(format!(
@@ -466,9 +634,9 @@ impl FileAllowlistStore {
                 stat.st_uid
             )));
         }
-        if stat.st_mode & 0o022 != 0 {
+        if stat.st_mode & 0o077 != 0 {
             return Err(AllowlistPersistError(format!(
-                "{} is group/other-writable (mode {:o}); refusing to trust it",
+                "{} is group/other-accessible (mode {:o}); the NarHash inventory must be 0600",
                 self.path.display(),
                 stat.st_mode & 0o777
             )));
@@ -483,36 +651,90 @@ impl FileAllowlistStore {
             _ => PathBuf::from("."),
         }
     }
-}
 
-impl AllowlistStore for FileAllowlistStore {
-    fn load(&self) -> Result<Vec<(NarHashKey, u64)>, AllowlistPersistError> {
-        let Some(mut file) = self.open_strict(false)? else {
-            return Ok(Vec::new());
-        };
-        let mut bytes = Vec::new();
-        file.read_to_end(&mut bytes)
-            .map_err(|e| AllowlistPersistError(format!("reading {}: {e}", self.path.display())))?;
-        let text = std::str::from_utf8(&bytes).map_err(|e| {
+    /// Validate the immediate parent directory: opened `O_DIRECTORY|O_NOFOLLOW` (a symlinked
+    /// parent is refused), owned by this euid, and not group/other-writable. HONEST LIMIT:
+    /// only the IMMEDIATE parent is checked here, not every ancestor component; a fully
+    /// symlink-safe ancestor walk (openat from a trusted root) is a follow-up.
+    fn check_parent(&self) -> Result<(), AllowlistPersistError> {
+        use rustix::fs::{FileType, Mode, OFlags};
+        let parent = self.parent();
+        let fd = rustix::fs::open(
+            &parent,
+            OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::RDONLY | OFlags::CLOEXEC,
+            Mode::empty(),
+        )
+        .map_err(|e| {
+            AllowlistPersistError(format!(
+                "opening parent dir {} (O_NOFOLLOW): {e}",
+                parent.display()
+            ))
+        })?;
+        let stat = rustix::fs::fstat(&fd).map_err(|e| {
+            AllowlistPersistError(format!("inspecting parent dir {}: {e}", parent.display()))
+        })?;
+        if FileType::from_raw_mode(stat.st_mode) != FileType::Directory {
+            return Err(AllowlistPersistError(format!(
+                "{} is not a directory",
+                parent.display()
+            )));
+        }
+        let euid = rustix::process::geteuid().as_raw();
+        if stat.st_uid != euid {
+            return Err(AllowlistPersistError(format!(
+                "parent dir {} is owned by uid {}, not this process ({euid}); refusing",
+                parent.display(),
+                stat.st_uid
+            )));
+        }
+        if stat.st_mode & 0o022 != 0 {
+            return Err(AllowlistPersistError(format!(
+                "parent dir {} is group/other-writable (mode {:o}); refusing",
+                parent.display(),
+                stat.st_mode & 0o777
+            )));
+        }
+        Ok(())
+    }
+
+    /// Parse the loaded bytes into records, verifying each committed line's MAC. Shared by
+    /// `load` and by `append`'s torn-tail detection.
+    fn parse_committed(
+        &self,
+        bytes: &[u8],
+    ) -> Result<Vec<(NarHashKey, u64)>, AllowlistPersistError> {
+        let text = std::str::from_utf8(bytes).map_err(|e| {
             AllowlistPersistError(format!("{} is not valid UTF-8: {e}", self.path.display()))
         })?;
-
         let mut out = Vec::new();
-        // `split_inclusive` keeps each line's `\n`. A final segment WITHOUT a trailing
-        // `\n` is a TORN append (crash between write and the newline never happens, but
-        // a crash mid-write does) - drop it. Every COMMITTED line must parse strictly.
+        // `split_inclusive` keeps each line's `\n`. A final segment WITHOUT a trailing `\n`
+        // is a TORN append - drop it (never eligibility). Every COMMITTED line must parse
+        // AND its MAC must verify.
         for segment in text.split_inclusive('\n') {
             let Some(line) = segment.strip_suffix('\n') else {
-                // Unterminated tail: torn/uncommitted. Drop it (never eligibility).
-                break;
+                break; // torn/uncommitted tail
             };
             let line = line.trim_end_matches('\r');
             if line.is_empty() {
                 continue;
             }
-            let (hash_str, size_str) = line.split_once(' ').ok_or_else(|| {
+            if out.len() >= MAX_ALLOWLIST_RECORDS {
+                return Err(AllowlistPersistError(format!(
+                    "{} exceeds the {MAX_ALLOWLIST_RECORDS}-record bound",
+                    self.path.display()
+                )));
+            }
+            let mut parts = line.splitn(3, ' ');
+            let hash_str = parts.next().unwrap_or("");
+            let size_str = parts.next().ok_or_else(|| {
                 AllowlistPersistError(format!(
-                    "{} has a committed line with no ' ' separator: {line:?}",
+                    "{} has a committed line missing the size field: {line:?}",
+                    self.path.display()
+                ))
+            })?;
+            let mac_str = parts.next().ok_or_else(|| {
+                AllowlistPersistError(format!(
+                    "{} has a committed line missing the MAC field: {line:?}",
                     self.path.display()
                 ))
             })?;
@@ -528,12 +750,65 @@ impl AllowlistStore for FileAllowlistStore {
                     self.path.display()
                 ))
             })?;
+            // Integrity: recompute the MAC over the canonical bytes and compare. A modified,
+            // injected, or foreign line fails HERE and the whole load fails LOUD.
+            let expected = record_mac(&self.mac_key, &nar_hash, nar_size);
+            if !constant_time_eq(mac_str.as_bytes(), expected.as_bytes()) {
+                return Err(AllowlistPersistError(format!(
+                    "{} has a committed line whose MAC does not verify (modified, injected, \
+                     or written by another node): {line:?}",
+                    self.path.display()
+                )));
+            }
             out.push((nar_hash, nar_size));
         }
         Ok(out)
     }
+}
+
+/// A length-checked, timing-independent byte comparison for the MAC (both operands are
+/// fixed-length hex here, so timing is a defence-in-depth nicety, not load-bearing).
+fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for (x, y) in a.iter().zip(b.iter()) {
+        diff |= x ^ y;
+    }
+    diff == 0
+}
+
+impl AllowlistStore for FileAllowlistStore {
+    fn load(&self) -> Result<Vec<(NarHashKey, u64)>, AllowlistPersistError> {
+        use std::io::Read as _;
+        let Some(file) = self.open_strict(OpenMode::Read)? else {
+            return Ok(Vec::new());
+        };
+        // Shared lock: a concurrent writer's append is serialised against this read.
+        rustix::fs::flock(&file, rustix::fs::FlockOperation::LockShared).map_err(|e| {
+            AllowlistPersistError(format!("locking {} for read: {e}", self.path.display()))
+        })?;
+        let stat = rustix::fs::fstat(&file)
+            .map_err(|e| AllowlistPersistError(format!("sizing {}: {e}", self.path.display())))?;
+        if stat.st_size as u64 > MAX_ALLOWLIST_FILE_BYTES {
+            return Err(AllowlistPersistError(format!(
+                "{} is {} bytes, over the {MAX_ALLOWLIST_FILE_BYTES}-byte bound; refusing to load",
+                self.path.display(),
+                stat.st_size
+            )));
+        }
+        let mut bytes = Vec::new();
+        // Bounded read (defence-in-depth against a file that grew past the stat).
+        (&file)
+            .take(MAX_ALLOWLIST_FILE_BYTES)
+            .read_to_end(&mut bytes)
+            .map_err(|e| AllowlistPersistError(format!("reading {}: {e}", self.path.display())))?;
+        self.parse_committed(&bytes)
+    }
 
     fn append(&self, nar_hash: &NarHashKey, nar_size: u64) -> Result<(), AllowlistPersistError> {
+        use std::io::{Read as _, Seek as _, SeekFrom, Write as _};
         let parent = self.parent();
         let existed = self.path.exists();
         if !existed {
@@ -541,24 +816,61 @@ impl AllowlistStore for FileAllowlistStore {
                 AllowlistPersistError(format!("creating {}: {e}", parent.display()))
             })?;
         }
+        // Strict parent-directory checks (symlinked/foreign/writable parent refused).
+        self.check_parent()?;
+
         let mut file = self
-            .open_strict(true)?
-            .expect("open_strict(create=true) never returns None");
-        // One atomic-ish append. The line is small; `O_APPEND` makes the write land at
-        // the current end even under concurrent appenders. `sync_all` flushes it before
-        // we report success, so a reported append is durable.
-        let line = format!("{nar_hash} {nar_size}\n");
+            .open_strict(OpenMode::ReadWrite)?
+            .expect("open_strict(ReadWrite) never returns None");
+        // Exclusive cross-process writer lock: two daemons sharing a state dir cannot
+        // interleave appends (and a reader takes a shared lock).
+        rustix::fs::flock(&file, rustix::fs::FlockOperation::LockExclusive).map_err(|e| {
+            AllowlistPersistError(format!("locking {} for append: {e}", self.path.display()))
+        })?;
+
+        // TRUNCATE any torn tail before appending, so the new record is never concatenated
+        // onto a partial line (which would make BOTH fail their MAC). The committed prefix
+        // is everything up to and including the last newline.
+        let mut existing = Vec::new();
+        (&file)
+            .take(MAX_ALLOWLIST_FILE_BYTES)
+            .read_to_end(&mut existing)
+            .map_err(|e| AllowlistPersistError(format!("reading {}: {e}", self.path.display())))?;
+        let committed_len = match existing.iter().rposition(|b| *b == b'\n') {
+            Some(i) => i + 1,
+            None => 0,
+        };
+        if committed_len as u64 != existing.len() as u64 {
+            rustix::fs::ftruncate(&file, committed_len as u64).map_err(|e| {
+                AllowlistPersistError(format!(
+                    "truncating torn tail of {}: {e}",
+                    self.path.display()
+                ))
+            })?;
+        }
+        file.seek(SeekFrom::Start(committed_len as u64))
+            .map_err(|e| AllowlistPersistError(format!("seeking {}: {e}", self.path.display())))?;
+
+        let mac = record_mac(&self.mac_key, nar_hash, nar_size);
+        let line = format!("{} {mac}\n", record_canonical(nar_hash, nar_size));
         file.write_all(line.as_bytes()).map_err(|e| {
             AllowlistPersistError(format!("appending to {}: {e}", self.path.display()))
         })?;
         file.sync_all()
             .map_err(|e| AllowlistPersistError(format!("fsyncing {}: {e}", self.path.display())))?;
-        // On first creation, fsync the parent directory so the new file's name->inode
-        // link is itself durable (the same discipline the availability index uses).
-        if !existed
-            && let Ok(dir) = std::fs::File::open(&parent)
-        {
-            let _ = dir.sync_all();
+        // On first creation, fsync the parent directory so the new file's name->inode link
+        // is itself durable. Do NOT silently discard the error: a failed parent fsync means
+        // the file could vanish on a crash, so surface it (fail-verbose).
+        if !existed {
+            let dir = std::fs::File::open(&parent).map_err(|e| {
+                AllowlistPersistError(format!(
+                    "opening parent dir {} to fsync: {e}",
+                    parent.display()
+                ))
+            })?;
+            dir.sync_all().map_err(|e| {
+                AllowlistPersistError(format!("fsyncing parent dir {}: {e}", parent.display()))
+            })?;
         }
         Ok(())
     }
@@ -588,6 +900,11 @@ pub enum LearnOutcome {
     AlreadyPresent { nar_hash: NarHashKey },
     /// Not proven public (a NAMED fail-closed guard): nothing appended.
     Rejected(PublicProofReject),
+    /// The narinfo PROVED a NAR public, but its signed `StorePath` does not correspond to
+    /// the `<hash>.narinfo` that was requested (a mis-correlated response: request A,
+    /// received a signed narinfo for B). Nothing appended - only the exact requested key's
+    /// verified narinfo may learn, so a hostile/misrouted upstream cannot inject B.
+    RequestMismatch { requested: String, signed: String },
     /// Proven public, but persisting the append failed: nothing was admitted in-memory
     /// either, so disk and memory agree (a restart simply re-verifies on the next request).
     PersistFailed(AllowlistPersistError),
@@ -671,10 +988,11 @@ pub struct PublicNarAllowlist {
 }
 
 impl PublicNarAllowlist {
-    /// Build an allowlist over `trusted` and `store`, loading any persisted records so
-    /// it survives a restart. A corrupt persisted file fails LOUD here (never a silent
-    /// empty allowlist).
-    pub fn open(
+    /// Build an allowlist over `trusted` and `store`, loading any persisted records so it
+    /// survives a restart. A corrupt/tampered persisted file fails LOUD here (never a silent
+    /// empty allowlist). SEALED (`pub(crate)`): external code cannot pass a forged store -
+    /// it reaches this only through [`Self::in_memory`] / [`Self::open_file`] / [`Self::disabled`].
+    pub(crate) fn open(
         trusted: TrustedNarKeys,
         store: Box<dyn AllowlistStore>,
     ) -> Result<Self, AllowlistPersistError> {
@@ -685,6 +1003,28 @@ impl PublicNarAllowlist {
             entries: Mutex::new(entries),
             store,
         })
+    }
+
+    /// An IN-MEMORY allowlist over `trusted`: it learns and enforces for this process but
+    /// does not persist. The sealed replacement for `open(trusted, NullAllowlistStore)` now
+    /// that the store seam is `pub(crate)`.
+    pub fn in_memory(trusted: TrustedNarKeys) -> Self {
+        // Load of a NullAllowlistStore is infallible, so unwrap is total.
+        Self::open(trusted, Box::new(NullAllowlistStore))
+            .expect("NullAllowlistStore load is infallible")
+    }
+
+    /// A FILE-BACKED allowlist over `trusted`, integrity-protected under `mac_key` (a
+    /// per-node secret the caller derives from the durable identity seed, e.g. via
+    /// [`derive_allowlist_mac_key`]). Loads any persisted records (failing LOUD on a
+    /// tampered/foreign file). The sealed replacement for constructing a `FileAllowlistStore`
+    /// externally - external code cannot name the store type.
+    pub fn open_file(
+        trusted: TrustedNarKeys,
+        path: impl Into<PathBuf>,
+        mac_key: [u8; 32],
+    ) -> Result<Self, AllowlistPersistError> {
+        Self::open(trusted, Box::new(FileAllowlistStore::new(path, mac_key)))
     }
 
     /// A DISABLED allowlist: no trusted keys, in-memory only. Every `learn` is refused
@@ -699,15 +1039,27 @@ impl PublicNarAllowlist {
         }
     }
 
-    /// LEARN from a narinfo the daemon is serving: if it PROVES a NAR public, append its
-    /// `(NarHash, NarSize)` ONCE. Idempotent - a duplicate is [`LearnOutcome::AlreadyPresent`]
-    /// with no append and no second network request. This is the ONLY path that writes
-    /// the allowlist (AC#1/#2). Fail-closed on every rejection (AC#3).
-    pub fn learn(&self, narinfo: &[u8]) -> LearnOutcome {
+    /// LEARN from a narinfo the daemon is serving in response to a `<requested>.narinfo`
+    /// request: if the narinfo PROVES a NAR public AND its signed `StorePath` correlates to
+    /// the EXACT `requested` store hash, append its `(NarHash, NarSize)` ONCE. Idempotent -
+    /// a duplicate is [`LearnOutcome::AlreadyPresent`] with no append and no second network
+    /// request. This is the ONLY path that writes the allowlist (AC#1/#2). Fail-closed on
+    /// every rejection (AC#3) and on a request/response mismatch (AC#3 correlation): a signed
+    /// narinfo for a path OTHER than the one requested is refused, so a hostile or misrouted
+    /// upstream cannot answer "request A" with "here is signed-public B" and get B learned.
+    pub fn learn(&self, requested: &StoreHash, narinfo: &[u8]) -> LearnOutcome {
         let verified = match prove_public(narinfo, &self.trusted) {
             Ok(v) => v,
             Err(reject) => return LearnOutcome::Rejected(reject),
         };
+        // EXACT-request correlation: the verified narinfo must be the response to the key we
+        // asked for. Compare the signed StorePath's store hash to the requested `<hash>`.
+        if verified.store_hash != requested.as_str() {
+            return LearnOutcome::RequestMismatch {
+                requested: requested.as_str().to_string(),
+                signed: verified.store_hash,
+            };
+        }
         let mut entries = self.entries.lock().expect("allowlist mutex poisoned");
         if let Some(&existing) = entries.get(&verified.nar_hash) {
             // Idempotent. A verified duplicate must carry the same size (the signature
@@ -825,6 +1177,10 @@ References: 0a0lslqb6gbqnj6xqjlaljjqg6kgb3wz-nix-p2p-fixture-lib\n\
 Deriver: 3135ldqj1kl5wxkrrdnf4dfxiqakjz0z-nix-p2p-fixture-app.drv\n\
 Sig: nix-p2p-test-1:Xqf1bjNJ1ReFahm86zY+hv80+7QeJer5V/HjlEAvP39yJEK8w8jHG9WH5lM7mN9WCIbdH/DDx81dmsjVObMqAQ==\n";
 
+    // The store hash of APP_NARINFO's StorePath (the `<hash>.narinfo` a client requests).
+    const APP_STORE_HASH: &str = "l30jg5xg904s62jvw5znmr682xpr993c";
+    const APP_NAR_HASH: &str = "sha256:0pgsb9mjmfj57w1ddmqn9z9667nwbqbnn699j1s1s99jhy6cppsm";
+
     // The `lib` path with an EMPTY References field (a leaf) - proves the empty-refs
     // fingerprint (`...;<narsize>;` with a trailing empty segment) is right too.
     const LIB_NARINFO: &[u8] = b"StorePath: /nix/store/0a0lslqb6gbqnj6xqjlaljjqg6kgb3wz-nix-p2p-fixture-lib\n\
@@ -838,8 +1194,25 @@ References: \n\
 Deriver: g7hlrj8ys2w9i9d9zm6v4zxw7hpws0a7-nix-p2p-fixture-lib.drv\n\
 Sig: nix-p2p-test-1:kvRtCi6KujoW6x7esqgP8QdiaaVX4OL1beI/xmfobVHzM/tSSqmy7jcnI7QDognLkmkwaSgA6vraWOYN0kiICw==\n";
 
+    const LIB_STORE_HASH: &str = "0a0lslqb6gbqnj6xqjlaljjqg6kgb3wz";
+
+    // A deterministic per-node MAC key for the file-store tests.
+    const TEST_MAC_KEY: [u8; 32] = [0x42u8; 32];
+
     fn trusted() -> TrustedNarKeys {
         TrustedNarKeys::from_lines([FIXTURE_PUBKEY]).expect("fixture pubkey parses")
+    }
+
+    fn app_hash() -> StoreHash {
+        StoreHash::new(APP_STORE_HASH)
+    }
+
+    fn lib_hash() -> StoreHash {
+        StoreHash::new(LIB_STORE_HASH)
+    }
+
+    fn app_nar_hash() -> NarHashKey {
+        APP_NAR_HASH.parse().unwrap()
     }
 
     // A second, DIFFERENT valid keypair used as an UNTRUSTED signer. Deterministic seed.
@@ -852,32 +1225,27 @@ Sig: nix-p2p-test-1:kvRtCi6KujoW6x7esqgP8QdiaaVX4OL1beI/xmfobVHzM/tSSqmy7jcnI7QD
     #[test]
     fn real_fixture_narinfo_with_references_proves_public() {
         // POSITIVE CONTROL: a real cache-shaped narinfo, its real trusted signature,
-        // verifies over the reconstructed fingerprint. This proves the reference
-        // re-prefixing in `fingerprint` is correct (the app path has a reference).
+        // verifies over the reconstructed CANONICAL fingerprint. This proves the reference
+        // re-prefixing + sorting in `fingerprint` is correct (the app path has a reference).
         let v = prove_public(APP_NARINFO, &trusted()).expect("app narinfo proves public");
-        assert_eq!(
-            v.nar_hash.to_string(),
-            "sha256:0pgsb9mjmfj57w1ddmqn9z9667nwbqbnn699j1s1s99jhy6cppsm"
-        );
+        assert_eq!(v.nar_hash.to_string(), APP_NAR_HASH);
         assert_eq!(v.nar_size, 408);
+        assert_eq!(v.store_hash, APP_STORE_HASH);
     }
 
     #[test]
     fn real_fixture_narinfo_with_empty_references_proves_public() {
         let v = prove_public(LIB_NARINFO, &trusted()).expect("lib narinfo proves public");
         assert_eq!(v.nar_size, 66048);
+        assert_eq!(v.store_hash, LIB_STORE_HASH);
     }
 
     // ---- prove_public: each fail-closed guard BITES (AC#3) ----------------
     // Each negative differs from the positive control in EXACTLY ONE dimension, and the
     // guard producing its reject is the ONLY thing standing between it and an append.
-    // Neutering that guard (accept the malformed field / skip the trust or verify step)
-    // flips the outcome to Ok -> the matching assert below fails. That is the bite.
 
     #[test]
     fn guard_untrusted_key_bites_wrong_authority() {
-        // Same narinfo, but NO trusted key configured for its signer -> wrong authority.
-        // (Neuter: if `learn`/`prove_public` accepted an unknown key name, this appends.)
         let empty = TrustedNarKeys::empty();
         assert!(matches!(
             prove_public(APP_NARINFO, &empty),
@@ -887,13 +1255,11 @@ Sig: nix-p2p-test-1:kvRtCi6KujoW6x7esqgP8QdiaaVX4OL1beI/xmfobVHzM/tSSqmy7jcnI7QD
 
     #[test]
     fn guard_untrusted_key_bites_a_valid_but_untrusted_signer() {
-        // A narinfo VALIDLY signed by a real second keypair that is NOT trusted. The
-        // signature is cryptographically fine; the AUTHORITY is wrong. This is the
-        // strongest wrong-authority bite: only the trust-membership check refuses it.
+        // A narinfo VALIDLY signed by a real second keypair that is NOT trusted.
         let sk = untrusted_signing_key();
         let store_path = "/nix/store/0a0lslqb6gbqnj6xqjlaljjqg6kgb3wz-nix-p2p-fixture-lib";
         let nar_hash = "sha256:06rgb4vfjsg365xwwdjz12qhjnvg3w0agfvyqfp977hp3yk2bczb";
-        let nar_size = "66048";
+        let nar_size = 66048u64;
         let fp = fingerprint(store_path, nar_hash, nar_size, "");
         let sig = ed25519_dalek::Signer::sign(&sk, fp.as_bytes());
         let sig_b64 = base64::engine::general_purpose::STANDARD.encode(sig.to_bytes());
@@ -902,7 +1268,6 @@ Sig: nix-p2p-test-1:kvRtCi6KujoW6x7esqgP8QdiaaVX4OL1beI/xmfobVHzM/tSSqmy7jcnI7QD
              FileHash: {nar_hash}\nFileSize: {nar_size}\nNarHash: {nar_hash}\n\
              NarSize: {nar_size}\nReferences: \nSig: evil-key-1:{sig_b64}\n"
         );
-        // Trust only the fixture key, NOT evil-key-1.
         let out = prove_public(narinfo.as_bytes(), &trusted());
         assert_eq!(
             out,
@@ -912,10 +1277,6 @@ Sig: nix-p2p-test-1:kvRtCi6KujoW6x7esqgP8QdiaaVX4OL1beI/xmfobVHzM/tSSqmy7jcnI7QD
 
     #[test]
     fn guard_bad_signature_bites_a_tampered_narhash() {
-        // Flip one base32 char of the NarHash. It still parses (canonical base32) and is
-        // still signed by the TRUSTED key name, but the fingerprint no longer matches the
-        // signature -> BadSignature. (Neuter: skip verify_strict and this appends a NAR
-        // whose signature does not cover its recorded hash.)
         let tampered = String::from_utf8(APP_NARINFO.to_vec()).unwrap().replace(
             "NarHash: sha256:0pgsb9mjmfj57w1ddmqn9z9667nwbqbnn699j1s1s99jhy6cppsm",
             "NarHash: sha256:1pgsb9mjmfj57w1ddmqn9z9667nwbqbnn699j1s1s99jhy6cppsm",
@@ -928,7 +1289,6 @@ Sig: nix-p2p-test-1:kvRtCi6KujoW6x7esqgP8QdiaaVX4OL1beI/xmfobVHzM/tSSqmy7jcnI7QD
 
     #[test]
     fn guard_bad_signature_bites_a_tampered_narsize() {
-        // Change the signed NarSize; the signature no longer covers it -> BadSignature.
         let tampered = String::from_utf8(APP_NARINFO.to_vec())
             .unwrap()
             .replace("NarSize: 408", "NarSize: 409");
@@ -940,8 +1300,6 @@ Sig: nix-p2p-test-1:kvRtCi6KujoW6x7esqgP8QdiaaVX4OL1beI/xmfobVHzM/tSSqmy7jcnI7QD
 
     #[test]
     fn guard_bad_signature_bites_tampered_references() {
-        // Drop the reference. The fingerprint's refs segment changes -> BadSignature.
-        // This is the bite that proves references are actually IN the fingerprint.
         let tampered = String::from_utf8(APP_NARINFO.to_vec()).unwrap().replace(
             "References: 0a0lslqb6gbqnj6xqjlaljjqg6kgb3wz-nix-p2p-fixture-lib",
             "References: ",
@@ -954,7 +1312,6 @@ Sig: nix-p2p-test-1:kvRtCi6KujoW6x7esqgP8QdiaaVX4OL1beI/xmfobVHzM/tSSqmy7jcnI7QD
 
     #[test]
     fn guard_bad_signature_bites_forged_sig_bytes() {
-        // Replace the signature bytes with a valid-length but wrong 64-byte blob.
         let forged_b64 = base64::engine::general_purpose::STANDARD.encode([0x11u8; 64]);
         let tampered = String::from_utf8(APP_NARINFO.to_vec()).unwrap().replace(
             "Sig: nix-p2p-test-1:Xqf1bjNJ1ReFahm86zY+hv80+7QeJer5V/HjlEAvP39yJEK8w8jHG9WH5lM7mN9WCIbdH/DDx81dmsjVObMqAQ==",
@@ -974,10 +1331,91 @@ Sig: nix-p2p-test-1:kvRtCi6KujoW6x7esqgP8QdiaaVX4OL1beI/xmfobVHzM/tSSqmy7jcnI7QD
             .filter(|l| !l.starts_with("References:"))
             .collect::<Vec<_>>()
             .join("\n");
+        // Re-terminate (the join drops the trailing newline; the newline guard is tested
+        // separately, so keep this a pure missing-References bite).
+        let no_refs = format!("{no_refs}\n");
         assert_eq!(
             prove_public(no_refs.as_bytes(), &trusted()),
             Err(PublicProofReject::MissingField("References"))
         );
+    }
+
+    #[test]
+    fn guard_missing_field_bites_absent_url() {
+        // A narinfo with no URL: is structurally invalid (Nix requires it).
+        let no_url = String::from_utf8(APP_NARINFO.to_vec())
+            .unwrap()
+            .lines()
+            .filter(|l| !l.starts_with("URL:"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let no_url = format!("{no_url}\n");
+        assert_eq!(
+            prove_public(no_url.as_bytes(), &trusted()),
+            Err(PublicProofReject::MissingField("URL"))
+        );
+    }
+
+    #[test]
+    fn guard_duplicate_field_bites() {
+        // Duplicating a signed field is ambiguous; refuse it (unifies first-vs-last).
+        let dup = String::from_utf8(APP_NARINFO.to_vec())
+            .unwrap()
+            .replace("NarSize: 408\n", "NarSize: 408\nNarSize: 999\n");
+        assert_eq!(
+            prove_public(dup.as_bytes(), &trusted()),
+            Err(PublicProofReject::DuplicateField("NarSize"))
+        );
+    }
+
+    #[test]
+    fn guard_missing_final_newline_bites() {
+        let mut body = APP_NARINFO.to_vec();
+        assert_eq!(body.pop(), Some(b'\n'));
+        assert_eq!(
+            prove_public(&body, &trusted()),
+            Err(PublicProofReject::MissingFinalNewline)
+        );
+    }
+
+    #[test]
+    fn guard_zero_narsize_bites() {
+        // A validly-signed narinfo whose NarSize is 0 is structurally refused BEFORE crypto.
+        let sk = untrusted_signing_key();
+        let store_path = "/nix/store/0a0lslqb6gbqnj6xqjlaljjqg6kgb3wz-nix-p2p-fixture-lib";
+        let nar_hash = "sha256:06rgb4vfjsg365xwwdjz12qhjnvg3w0agfvyqfp977hp3yk2bczb";
+        let fp = fingerprint(store_path, nar_hash, 0, "");
+        let sig = ed25519_dalek::Signer::sign(&sk, fp.as_bytes());
+        let sig_b64 = base64::engine::general_purpose::STANDARD.encode(sig.to_bytes());
+        let narinfo = format!(
+            "StorePath: {store_path}\nURL: nar/x.nar\nCompression: none\n\
+             FileHash: {nar_hash}\nFileSize: 0\nNarHash: {nar_hash}\n\
+             NarSize: 0\nReferences: \nSig: nix-p2p-test-1:{sig_b64}\n"
+        );
+        assert_eq!(
+            prove_public(narinfo.as_bytes(), &trusted()),
+            Err(PublicProofReject::ZeroNarSize)
+        );
+    }
+
+    #[test]
+    fn reordered_references_do_not_change_the_fingerprint() {
+        // Canonicalisation bite: sorting references means a reordered References field
+        // yields the SAME fingerprint. Build a 2-ref fingerprint two ways and compare.
+        let sp = "/nix/store/aaaa-x";
+        let a = fingerprint(sp, "sha256:zz", 10, "bbbb-b cccc-c");
+        let b = fingerprint(sp, "sha256:zz", 10, "cccc-c bbbb-b");
+        assert_eq!(
+            a, b,
+            "reference order must not change the canonical fingerprint"
+        );
+    }
+
+    #[test]
+    fn leading_zero_narsize_canonicalises_to_decimal() {
+        // A NarSize of `0408` fingerprints as `408` (decimal of the parsed u64).
+        let sp = "/nix/store/aaaa-x";
+        assert!(fingerprint(sp, "sha256:zz", 408, "").contains(";408;"));
     }
 
     #[test]
@@ -1017,35 +1455,32 @@ Sig: nix-p2p-test-1:kvRtCi6KujoW6x7esqgP8QdiaaVX4OL1beI/xmfobVHzM/tSSqmy7jcnI7QD
 
     #[test]
     fn guard_unsigned_narinfo_is_untrusted_not_appended() {
-        // A LOCAL build / private path: no Sig line at all -> UntrustedKey (nothing to
-        // trust). Proves local/unsigned content NEVER enters the list.
         let unsigned = String::from_utf8(APP_NARINFO.to_vec())
             .unwrap()
             .lines()
             .filter(|l| !l.starts_with("Sig:"))
             .collect::<Vec<_>>()
             .join("\n");
+        let unsigned = format!("{unsigned}\n");
         assert!(matches!(
             prove_public(unsigned.as_bytes(), &trusted()),
             Err(PublicProofReject::UntrustedKey(_))
         ));
     }
 
-    // ---- learn: append-once, idempotent, status (AC#1/#2/#5) --------------
+    // ---- learn: append-once, idempotent, request-correlation (AC#1/#2/#3) --
 
     fn open_mem(trusted: TrustedNarKeys) -> PublicNarAllowlist {
-        PublicNarAllowlist::open(trusted, Box::new(NullAllowlistStore)).unwrap()
+        PublicNarAllowlist::in_memory(trusted)
     }
 
     #[test]
     fn learn_appends_once_and_is_idempotent() {
         let list = open_mem(trusted());
-        let key: NarHashKey = "sha256:0pgsb9mjmfj57w1ddmqn9z9667nwbqbnn699j1s1s99jhy6cppsm"
-            .parse()
-            .unwrap();
+        let key = app_nar_hash();
         assert!(!list.contains(&key));
 
-        match list.learn(APP_NARINFO) {
+        match list.learn(&app_hash(), APP_NARINFO) {
             LearnOutcome::Appended { nar_size, .. } => assert_eq!(nar_size, 408),
             other => panic!("expected Appended, got {other:?}"),
         }
@@ -1053,9 +1488,8 @@ Sig: nix-p2p-test-1:kvRtCi6KujoW6x7esqgP8QdiaaVX4OL1beI/xmfobVHzM/tSSqmy7jcnI7QD
         assert_eq!(list.status().count, 1);
         assert_eq!(list.status().total_nar_size_bytes, 408);
 
-        // A duplicate request: idempotent, no second append.
         assert!(matches!(
-            list.learn(APP_NARINFO),
+            list.learn(&app_hash(), APP_NARINFO),
             LearnOutcome::AlreadyPresent { .. }
         ));
         assert_eq!(
@@ -1063,6 +1497,28 @@ Sig: nix-p2p-test-1:kvRtCi6KujoW6x7esqgP8QdiaaVX4OL1beI/xmfobVHzM/tSSqmy7jcnI7QD
             1,
             "duplicate must not append a second entry"
         );
+    }
+
+    #[test]
+    fn learn_rejects_a_mismatched_request_correlation() {
+        // THE request-correlation bite: request A (the LIB hash) but the upstream returns a
+        // signed narinfo for B (the APP path). The signature is perfectly valid, but the
+        // response does not correlate to the requested key, so NOTHING is learned.
+        // (Neuter: drop the `verified.store_hash != requested` check and B is appended.)
+        let list = open_mem(trusted());
+        match list.learn(&lib_hash(), APP_NARINFO) {
+            LearnOutcome::RequestMismatch { requested, signed } => {
+                assert_eq!(requested, LIB_STORE_HASH);
+                assert_eq!(signed, APP_STORE_HASH);
+            }
+            other => panic!("expected RequestMismatch, got {other:?}"),
+        }
+        assert_eq!(
+            list.status().count,
+            0,
+            "a mis-correlated response must not learn"
+        );
+        assert!(!list.contains(&app_nar_hash()));
     }
 
     #[test]
@@ -1074,8 +1530,9 @@ Sig: nix-p2p-test-1:kvRtCi6KujoW6x7esqgP8QdiaaVX4OL1beI/xmfobVHzM/tSSqmy7jcnI7QD
             .filter(|l| !l.starts_with("Sig:"))
             .collect::<Vec<_>>()
             .join("\n");
+        let unsigned = format!("{unsigned}\n");
         assert!(matches!(
-            list.learn(unsigned.as_bytes()),
+            list.learn(&app_hash(), unsigned.as_bytes()),
             LearnOutcome::Rejected(_)
         ));
         assert_eq!(list.status().count, 0);
@@ -1085,7 +1542,7 @@ Sig: nix-p2p-test-1:kvRtCi6KujoW6x7esqgP8QdiaaVX4OL1beI/xmfobVHzM/tSSqmy7jcnI7QD
     fn disabled_allowlist_learns_nothing() {
         let list = PublicNarAllowlist::disabled();
         assert!(matches!(
-            list.learn(APP_NARINFO),
+            list.learn(&app_hash(), APP_NARINFO),
             LearnOutcome::Rejected(PublicProofReject::UntrustedKey(_))
         ));
         assert_eq!(list.status().count, 0);
@@ -1096,23 +1553,18 @@ Sig: nix-p2p-test-1:kvRtCi6KujoW6x7esqgP8QdiaaVX4OL1beI/xmfobVHzM/tSSqmy7jcnI7QD
     #[test]
     fn approve_mints_a_claim_only_for_allowlisted_nars() {
         let list = open_mem(trusted());
-        let key: NarHashKey = "sha256:0pgsb9mjmfj57w1ddmqn9z9667nwbqbnn699j1s1s99jhy6cppsm"
-            .parse()
-            .unwrap();
+        let key = app_nar_hash();
 
-        // BEFORE learning: fail-closed, NO claim minted (the bite for the publish gate).
         assert_eq!(
             list.approve(&key, None),
             Err(PublicationRejected::NotAllowlisted(key))
         );
 
-        list.learn(APP_NARINFO);
-        // AFTER learning: a claim is minted, carrying the approved size.
+        list.learn(&app_hash(), APP_NARINFO);
         let claim = list.approve(&key, Some(408)).expect("allowlisted -> claim");
         assert_eq!(claim.nar_hash(), &key);
         assert_eq!(claim.nar_size(), 408);
 
-        // A wrong intended size is refused (defensive size guard).
         assert!(matches!(
             list.approve(&key, Some(409)),
             Err(PublicationRejected::SizeMismatch { .. })
@@ -1121,11 +1573,10 @@ Sig: nix-p2p-test-1:kvRtCi6KujoW6x7esqgP8QdiaaVX4OL1beI/xmfobVHzM/tSSqmy7jcnI7QD
 
     #[test]
     fn an_operator_seeded_local_fixture_cannot_be_published() {
-        // The seam story (mped-architect must-have #2): a purely-local NAR the operator
-        // named for a provider mode is NOT on the (empty) allowlist, so `approve` refuses
-        // it and mints NO claim - the closed-by-construction public door can never
-        // announce it. Neuter the `contains`/`approved_size` check and this goes green
-        // (a claim is minted) -> the guard bites.
+        // A purely-local NAR (never proven public) mints NO claim - the closed-by-construction
+        // public door can never announce it. This is also the FORGED-STORE story: the ONLY
+        // writer of `entries` is `learn` (signature-verified), and the store seam is SEALED
+        // (`pub(crate)`), so external code cannot inject an entry then `approve` a forged claim.
         let list = open_mem(trusted());
         let local_only: NarHashKey = "sha256:1nn8563y6j55y003xjk1bvb1854abmigsas2jgzy4shy0f4vnzpa"
             .parse()
@@ -1137,38 +1588,52 @@ Sig: nix-p2p-test-1:kvRtCi6KujoW6x7esqgP8QdiaaVX4OL1beI/xmfobVHzM/tSSqmy7jcnI7QD
         );
     }
 
-    // ---- persistence + crash safety + strict file checks (AC#4) -----------
+    // ---- persistence + crash safety + strict file + MAC (AC#4) ------------
+
+    fn temp_dir(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "nixp2p-allowlist-{tag}-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    // Compose a VALID committed line for a record under TEST_MAC_KEY.
+    fn mac_line(nar_hash: &str, nar_size: u64) -> String {
+        let key: NarHashKey = nar_hash.parse().unwrap();
+        let mac = record_mac(&TEST_MAC_KEY, &key, nar_size);
+        format!("{nar_hash} {nar_size} {mac}\n")
+    }
+
+    fn set_0600(path: &std::path::Path) {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).unwrap();
+    }
 
     #[test]
     fn survives_restart_via_file_store() {
-        let dir = std::env::temp_dir().join(format!("nixp2p-allowlist-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
+        let dir = temp_dir("restart");
         let path = dir.join("public-allowlist");
 
         {
-            let list =
-                PublicNarAllowlist::open(trusted(), Box::new(FileAllowlistStore::new(&path)))
-                    .unwrap();
+            let list = PublicNarAllowlist::open_file(trusted(), &path, TEST_MAC_KEY).unwrap();
             assert!(matches!(
-                list.learn(APP_NARINFO),
+                list.learn(&app_hash(), APP_NARINFO),
                 LearnOutcome::Appended { .. }
             ));
             assert!(matches!(
-                list.learn(LIB_NARINFO),
+                list.learn(&lib_hash(), LIB_NARINFO),
                 LearnOutcome::Appended { .. }
             ));
         }
-        // Reopen: the two records reload.
-        let reopened =
-            PublicNarAllowlist::open(trusted(), Box::new(FileAllowlistStore::new(&path))).unwrap();
+        let reopened = PublicNarAllowlist::open_file(trusted(), &path, TEST_MAC_KEY).unwrap();
         assert_eq!(reopened.status().count, 2);
-        let app: NarHashKey = "sha256:0pgsb9mjmfj57w1ddmqn9z9667nwbqbnn699j1s1s99jhy6cppsm"
-            .parse()
-            .unwrap();
-        assert!(reopened.contains(&app));
-        // A duplicate learn after restart does NOT re-append.
+        assert!(reopened.contains(&app_nar_hash()));
         assert!(matches!(
-            reopened.learn(APP_NARINFO),
+            reopened.learn(&app_hash(), APP_NARINFO),
             LearnOutcome::AlreadyPresent { .. }
         ));
         assert_eq!(reopened.status().count, 2);
@@ -1177,86 +1642,140 @@ Sig: nix-p2p-test-1:kvRtCi6KujoW6x7esqgP8QdiaaVX4OL1beI/xmfobVHzM/tSSqmy7jcnI7QD
     }
 
     #[test]
-    fn torn_final_append_loses_only_that_record_and_never_creates_eligibility() {
-        let dir =
-            std::env::temp_dir().join(format!("nixp2p-allowlist-torn-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
+    fn a_flipped_mac_covered_char_is_rejected_on_load() {
+        // THE flipped-char bite (AC#4 integrity). Write one VALID committed record, then flip
+        // a single nixbase32 char of its NarHash IN PLACE (the record still parses). Its MAC
+        // no longer verifies, so load fails LOUD - the never-learned NAR is NOT eligible.
+        // (Neuter: drop the MAC check in `parse_committed` and the flipped NAR loads.)
+        let dir = temp_dir("flip");
         let path = dir.join("public-allowlist");
+        let good = mac_line(APP_NAR_HASH, 408);
+        let flipped = good.replacen(
+            "sha256:0pgsb9mjmfj57w1ddmqn9z9667nwbqbnn699j1s1s99jhy6cppsm",
+            "sha256:1pgsb9mjmfj57w1ddmqn9z9667nwbqbnn699j1s1s99jhy6cppsm",
+            1,
+        );
+        assert_ne!(good, flipped, "the flip must actually change the line");
+        std::fs::write(&path, &flipped).unwrap();
+        set_0600(&path);
+        let err = PublicNarAllowlist::open_file(trusted(), &path, TEST_MAC_KEY);
+        assert!(
+            err.is_err(),
+            "a flipped MAC-covered char must be rejected on load"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
-        // One committed record + a torn tail (a partial line with NO trailing newline).
-        std::fs::write(
-            &path,
-            "sha256:0pgsb9mjmfj57w1ddmqn9z9667nwbqbnn699j1s1s99jhy6cppsm 408\n\
-             sha256:06rgb4vfjsg365xwwdjz12qhjnvg3w0agfvyqfp977hp3yk2bcz",
-        )
-        .unwrap();
+    #[test]
+    fn a_line_from_another_nodes_key_is_rejected_on_load() {
+        // A line MAC'd under a DIFFERENT node's key (injected / copied from elsewhere) fails
+        // load: the MAC recomputed under THIS node's key does not match.
+        let dir = temp_dir("foreign");
+        let path = dir.join("public-allowlist");
+        let foreign_key = [0x99u8; 32];
+        let key: NarHashKey = APP_NAR_HASH.parse().unwrap();
+        let foreign_mac = record_mac(&foreign_key, &key, 408);
+        std::fs::write(&path, format!("{APP_NAR_HASH} 408 {foreign_mac}\n")).unwrap();
+        set_0600(&path);
+        assert!(
+            PublicNarAllowlist::open_file(trusted(), &path, TEST_MAC_KEY).is_err(),
+            "a line written under another node's MAC key must be refused"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
-        let list =
-            PublicNarAllowlist::open(trusted(), Box::new(FileAllowlistStore::new(&path))).unwrap();
-        // Only the COMMITTED record loads; the torn tail is dropped, so it never becomes
-        // eligible (a partial NarHash cannot even parse to a key).
+    #[test]
+    fn torn_final_append_is_truncated_and_next_append_is_clean() {
+        // One committed record + a torn tail (a partial line, no trailing newline). A NEW
+        // append must TRUNCATE the torn tail (not concatenate onto it), so the file ends with
+        // two clean committed records and both verify.
+        let dir = temp_dir("torn");
+        let path = dir.join("public-allowlist");
+        let mut content = mac_line(APP_NAR_HASH, 408);
+        content.push_str("sha256:06rgb4vfjsg365xwwdjz12qhjnvg3w0agfvyqfp977hp3yk2bcz"); // torn
+        std::fs::write(&path, &content).unwrap();
+        set_0600(&path);
+
+        // Load drops the torn tail: only the committed record is eligible.
+        let list = PublicNarAllowlist::open_file(trusted(), &path, TEST_MAC_KEY).unwrap();
         assert_eq!(list.status().count, 1);
-        let committed: NarHashKey = "sha256:0pgsb9mjmfj57w1ddmqn9z9667nwbqbnn699j1s1s99jhy6cppsm"
-            .parse()
-            .unwrap();
-        assert!(list.contains(&committed));
+        assert!(list.contains(&app_nar_hash()));
 
+        // A fresh append truncates the torn tail first, then writes a clean record.
+        assert!(matches!(
+            list.learn(&lib_hash(), LIB_NARINFO),
+            LearnOutcome::Appended { .. }
+        ));
+        // Reopen: exactly the two committed records, no corruption from the old torn tail.
+        let reopened = PublicNarAllowlist::open_file(trusted(), &path, TEST_MAC_KEY).unwrap();
+        assert_eq!(reopened.status().count, 2);
+        assert!(reopened.contains(&app_nar_hash()));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn corrupt_committed_record_fails_loud() {
-        let dir =
-            std::env::temp_dir().join(format!("nixp2p-allowlist-corrupt-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = temp_dir("corrupt");
         let path = dir.join("public-allowlist");
-        // A fully-terminated line that does not parse: real corruption, must fail LOUD.
-        std::fs::write(
-            &path,
-            "sha256:0pgsb9mjmfj57w1ddmqn9z9667nwbqbnn699j1s1s99jhy6cppsm not-a-size\n",
-        )
-        .unwrap();
+        // A fully-terminated line whose size does not parse: real corruption, fail LOUD.
+        std::fs::write(&path, format!("{APP_NAR_HASH} not-a-size deadbeef\n")).unwrap();
+        set_0600(&path);
+        assert!(PublicNarAllowlist::open_file(trusted(), &path, TEST_MAC_KEY).is_err());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn group_or_other_accessible_file_is_refused() {
+        let dir = temp_dir("mode");
+        let path = dir.join("public-allowlist");
+        std::fs::write(&path, "").unwrap();
+        set_0600(&path);
+        // 0644: group/other-READABLE. The NarHash inventory must be 0600.
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
         assert!(
-            PublicNarAllowlist::open(trusted(), Box::new(FileAllowlistStore::new(&path))).is_err()
+            PublicNarAllowlist::open_file(trusted(), &path, TEST_MAC_KEY).is_err(),
+            "a group/other-readable allowlist must be refused (0600 only)"
         );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
-    fn group_or_other_writable_file_is_refused() {
-        use std::os::unix::fs::PermissionsExt;
-        let dir =
-            std::env::temp_dir().join(format!("nixp2p-allowlist-mode-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("public-allowlist");
-        std::fs::write(&path, "").unwrap();
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o666)).unwrap();
-        // A world-writable allowlist is untrusted -> load fails closed.
-        assert!(FileAllowlistStore::new(&path).load().is_err());
+    fn a_symlinked_file_is_refused() {
+        use std::os::unix::fs::symlink;
+        let dir = temp_dir("symlink");
+        let real = dir.join("real");
+        std::fs::write(&real, mac_line(APP_NAR_HASH, 408)).unwrap();
+        set_0600(&real);
+        let link = dir.join("public-allowlist");
+        symlink(&real, &link).unwrap();
+        // O_NOFOLLOW refuses to open a symlink in the file's place.
+        assert!(PublicNarAllowlist::open_file(trusted(), &link, TEST_MAC_KEY).is_err());
         let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn the_file_contains_no_store_path() {
-        // AC#5: the on-disk form is NarHash + NarSize only, never a StorePath.
-        let dir =
-            std::env::temp_dir().join(format!("nixp2p-allowlist-nostore-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
+        // AC#5: the on-disk form is NarHash + NarSize + MAC only, never a StorePath.
+        let dir = temp_dir("nostore");
         let path = dir.join("public-allowlist");
-        let list =
-            PublicNarAllowlist::open(trusted(), Box::new(FileAllowlistStore::new(&path))).unwrap();
-        list.learn(APP_NARINFO);
+        let list = PublicNarAllowlist::open_file(trusted(), &path, TEST_MAC_KEY).unwrap();
+        list.learn(&app_hash(), APP_NARINFO);
         let on_disk = std::fs::read_to_string(&path).unwrap();
         assert!(
             !on_disk.contains("/nix/store"),
             "the allowlist file must not contain any StorePath: {on_disk:?}"
         );
-        assert!(
-            on_disk.contains("sha256:0pgsb9mjmfj57w1ddmqn9z9667nwbqbnn699j1s1s99jhy6cppsm 408")
-        );
+        assert!(on_disk.contains(&format!("{APP_NAR_HASH} 408 ")));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_different_mac_key_derives_from_a_different_seed() {
+        // Domain separation: two seeds yield different MAC keys, so a file from node A cannot
+        // be trusted by node B (covered behaviourally by the foreign-key test above).
+        let a = derive_allowlist_mac_key(&[1u8; 32]);
+        let b = derive_allowlist_mac_key(&[2u8; 32]);
+        assert_ne!(a, b);
     }
 }

@@ -124,21 +124,35 @@ impl NarCatalog {
 /// matches the `/nar/<token>` the client later requests.
 pub fn parse_correlation(body: &[u8]) -> Option<(NarPathToken, NarHash, u64)> {
     let text = String::from_utf8_lossy(body);
-    let mut url = None;
-    let mut nar_hash = None;
-    let mut nar_size = None;
+    // FIRST-occurrence, DUPLICATE-REJECTING - the SAME canonical field rule as the
+    // publication proof (`public_allowlist::field`), so correlation and proof can never
+    // disagree about which value a field carries (the first-vs-last split codex flagged).
+    // A duplicated single-line field is ambiguous; a narinfo carrying one simply does not
+    // correlate (it falls back to `UpstreamPath`, which is safe).
+    let mut url: Option<&str> = None;
+    let mut nar_hash: Option<&str> = None;
+    let mut nar_size_str: Option<&str> = None;
     for line in text.lines() {
         if let Some(value) = line.strip_prefix("URL:") {
+            if url.is_some() {
+                return None;
+            }
             url = Some(value.trim());
         } else if let Some(value) = line.strip_prefix("NarHash:") {
+            if nar_hash.is_some() {
+                return None;
+            }
             nar_hash = Some(value.trim());
         } else if let Some(value) = line.strip_prefix("NarSize:") {
-            nar_size = value.trim().parse::<u64>().ok();
+            if nar_size_str.is_some() {
+                return None;
+            }
+            nar_size_str = Some(value.trim());
         }
     }
     let url = url?;
     let nar_hash = nar_hash?;
-    let nar_size = nar_size?;
+    let nar_size = nar_size_str?.parse::<u64>().ok()?;
     let token = url.strip_prefix("nar/").unwrap_or(url);
     Some((NarPathToken::new(token), NarHash::new(nar_hash), nar_size))
 }

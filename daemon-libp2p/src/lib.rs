@@ -544,10 +544,16 @@ pub fn resolve_durable_identity_seed(
 /// install AND the TASK-185 restart-durability integration test call this exact function, so a
 /// mutation here (e.g. a hardcoded `sequence`) is caught by the test rather than hiding in a
 /// binary `fn main` no test exercises.
+///
+/// It is a PRIVATE / LAN announce (requires a [`LanShare`] witness): the operator-named seed bytes
+/// are content-verified (TASK-56) but NOT publication-authorized. Announcing them to a gated PUBLIC
+/// DHT must go through the allowlist door (TASK-102/103); the shipped modes assert `LanShare` only
+/// after the bootstrap guard refuses a bootstrapped announce without a configured allowlist.
 pub async fn announce_provider_seeds(
     fabric: &Libp2pFabric,
     identity_seed: [u8; 32],
     seeds: &[(NarHashKey, Vec<u8>)],
+    _lan: LanShare,
     ttl_secs: u64,
     now: u64,
     budget: &AnnounceBudget,
@@ -691,21 +697,58 @@ pub fn verify_store_provisions(
     Ok(provisions)
 }
 
-/// Announce a signed [`ProviderRecord`] for each VERIFIED store [`StoreProvision`] this node
-/// serves on demand (AC#1/#2, TASK-191), the store analogue of [`announce_provider_seeds`].
+/// A WITNESS that an announce targets a PRIVATE / LAN / operator-assembled substrate, NOT a
+/// gated PUBLIC DHT. [`announce_provider_seeds`] and [`announce_store_provisions`] require one, so
+/// a call site must EXPLICITLY declare "this is a private announce" - it can never be confused
+/// with the PUBLIC door, which instead consumes an allowlist-minted [`ApprovedPublicProvision`].
 ///
-/// It consumes only [`StoreProvision`]s, which - being an un-forgeable capability minted solely
-/// by [`verify_store_provisions`] - GUARANTEES every announced `content` came from the index's
-/// TASK-56-verified binding, never the operator's word. For each, it durably allocates the
-/// announce sequence, signs a record whose `content` is the verified digest (via
-/// [`sign_libp2p_store_record`]), and publishes it under `budget`. Returns the announced records
-/// (index-aligned with `provisions`).
-///
-/// The reverse-map the served bytes come from was published by `verify_store_provisions`'s
-/// `hold` call, so by the time this returns a consumer that discovers this node under the derived
-/// [`ContentKey`] can fetch it, and the `fabric-libp2p` serve path re-runs the len + BLAKE3
-/// recheck (TASK-158/193) as the last-line integrity anchor.
-pub async fn announce_store_provisions(
+/// Publicness is a property of the SUBSTRATE (does this DHT reach strangers?), which the LIBRARY
+/// cannot know; the composition root asserts it. The two guarantees are ORTHOGONAL: the private
+/// loop still content-verifies every provision (TASK-56), so no bad store path is ever published;
+/// what it does NOT assert is publication AUTHORIZATION (the allowlist). The shipped provider modes
+/// construct this only AFTER refusing any bootstrapped (potentially public) announce without a
+/// configured allowlist (the TASK-102 bootstrap guard; see `daemon-libp2p::main`/`daemon::main`).
+#[derive(Debug, Clone, Copy)]
+pub struct LanShare(());
+
+impl LanShare {
+    /// Assert this announce targets a private / LAN / operator-assembled substrate. The caller
+    /// (the composition root) owns the assertion; the type only makes it EXPLICIT and greppable so
+    /// a bare provision can never be handed to a PUBLIC announce API by accident.
+    pub fn operator_assembled() -> Self {
+        LanShare(())
+    }
+}
+
+/// A verified store [`StoreProvision`] PAIRED with the allowlist [`PublicNarClaim`] that
+/// authorises announcing it PUBLICLY. Private fields, minted ONLY by
+/// [`approve_provisions_for_public`], so a public announce CANNOT be represented without an
+/// allowlist-minted claim - the claim is LOAD-BEARING (held through the announce), not cosmetic.
+#[derive(Debug, Clone)]
+pub struct ApprovedPublicProvision {
+    provision: StoreProvision,
+    /// The unforgeable proof the allowlist approved this NAR for public announce. Held (never
+    /// discarded) so this capability cannot exist without it.
+    claim: PublicNarClaim,
+}
+
+impl ApprovedPublicProvision {
+    /// The verified provision to announce (its `content` is the TASK-56-verified digest).
+    pub fn provision(&self) -> &StoreProvision {
+        &self.provision
+    }
+
+    /// The allowlist claim authorising the PUBLIC announce of this provision's NAR.
+    pub fn claim(&self) -> &PublicNarClaim {
+        &self.claim
+    }
+}
+
+/// The shared record-signing announce loop. PRIVATE to this module: neither the public nor the
+/// private door is a bare-provision entry point reachable from outside. For each provision it
+/// durably allocates the announce sequence, signs a record whose `content` is the verified digest
+/// (via [`sign_libp2p_store_record`]), and publishes it under `budget`.
+async fn announce_store_records(
     fabric: &Libp2pFabric,
     identity_seed: [u8; 32],
     provisions: &[StoreProvision],
@@ -738,6 +781,28 @@ pub async fn announce_store_provisions(
     Ok(records)
 }
 
+/// Announce a signed [`ProviderRecord`] for each VERIFIED store [`StoreProvision`] this node serves
+/// on demand over a PRIVATE / LAN substrate (AC#1/#2, TASK-191), the store analogue of
+/// [`announce_provider_seeds`]. It requires a [`LanShare`] witness, so the call site EXPLICITLY
+/// declares the substrate is not a gated public DHT (the PUBLIC analogue is
+/// [`announce_public_provisions`], which instead demands allowlist claims).
+///
+/// It consumes only [`StoreProvision`]s, which - being an un-forgeable capability minted solely by
+/// [`verify_store_provisions`] - GUARANTEES every announced `content` came from the index's
+/// TASK-56-verified binding, never the operator's word. The `fabric-libp2p` serve path re-runs the
+/// len + BLAKE3 recheck (TASK-158/193) as the last-line integrity anchor.
+pub async fn announce_store_provisions(
+    fabric: &Libp2pFabric,
+    identity_seed: [u8; 32],
+    provisions: &[StoreProvision],
+    _lan: LanShare,
+    ttl_secs: u64,
+    now: u64,
+    budget: &AnnounceBudget,
+) -> Result<Vec<ProviderRecord>, String> {
+    announce_store_records(fabric, identity_seed, provisions, ttl_secs, now, budget).await
+}
+
 // -------------------------------------------------------------------------
 // The TYPED PUBLIC-ANNOUNCE door (TASK-102): the ONLY announce path gated on the
 // public-NAR allowlist. Closed-by-construction, so a PUBLIC announce cannot bypass it.
@@ -763,15 +828,20 @@ pub async fn announce_store_provisions(
 pub fn approve_provisions_for_public(
     provisions: &[StoreProvision],
     allowlist: &PublicNarAllowlist,
-) -> Result<Vec<PublicNarClaim>, PublicationRejected> {
-    let mut claims = Vec::with_capacity(provisions.len());
+) -> Result<Vec<ApprovedPublicProvision>, PublicationRejected> {
+    let mut approved = Vec::with_capacity(provisions.len());
     for provision in provisions {
-        // `approve` mints an UNFORGEABLE PublicNarClaim iff the NarHash is allowlisted AND
-        // its approved size matches what this node would advertise. Absence -> fail-closed.
+        // `approve` mints an UNFORGEABLE PublicNarClaim iff the NarHash is allowlisted AND its
+        // approved size matches what this node would advertise. Absence -> fail-closed. The claim
+        // is PAIRED with the provision into the capability and HELD through the announce, so a
+        // public announce cannot be represented without it.
         let claim = allowlist.approve(provision.nar_hash(), Some(provision.declared_size()))?;
-        claims.push(claim);
+        approved.push(ApprovedPublicProvision {
+            provision: provision.clone(),
+            claim,
+        });
     }
-    Ok(claims)
+    Ok(approved)
 }
 
 /// Announce a signed [`ProviderRecord`] for each verified store [`StoreProvision`], but
@@ -780,12 +850,13 @@ pub fn approve_provisions_for_public(
 /// [`approve_provisions_for_public`] (fail-closed, all-or-nothing) and announces nothing if
 /// any provision is un-allowlisted, then reuses the same verified-content announce loop.
 ///
-/// STATUS: this typed door exists so that - by construction - the only way to PUBLICLY
-/// announce store content is through the allowlist gate (a caller cannot announce a NAR the
-/// allowlist did not approve without a `PublicNarClaim`, which only the allowlist mints). It
-/// is not yet wired to a shipped binary: TASK-103 (the DHT discovery-announce driver) is the
-/// integration that routes public participation through this door and populates the allowlist
-/// for operator-provided paths by proving each public via the same narinfo-signature gate.
+/// STATUS: this typed door exists so that - by construction - the only way to PUBLICLY announce
+/// store content is through the allowlist gate. It takes `provisions + allowlist` and CONSUMES the
+/// minted [`ApprovedPublicProvision`]s (claim held through the announce), so a public announce with
+/// no allowlist-minted claim is UNREPRESENTABLE - there is no bare-provision public entry point.
+/// It is not yet wired to a shipped binary: TASK-103 (the DHT discovery-announce driver) is the
+/// integration that routes public participation through this door and populates the allowlist for
+/// operator-provided paths by proving each public via the same narinfo-signature gate.
 pub async fn announce_public_provisions(
     fabric: &Libp2pFabric,
     identity_seed: [u8; 32],
@@ -795,12 +866,33 @@ pub async fn announce_public_provisions(
     now: u64,
     budget: &AnnounceBudget,
 ) -> Result<Vec<ProviderRecord>, String> {
-    // THE GATE (fail-closed, before any record is signed or announced): every provision must
-    // be allowlisted, or the whole public announce is refused.
-    approve_provisions_for_public(provisions, allowlist)
+    // THE GATE (fail-closed, before any record is signed or announced): every provision must be
+    // allowlisted, minting a claim-bearing capability, or the whole public announce is refused.
+    let approved = approve_provisions_for_public(provisions, allowlist)
         .map_err(|rejected| format!("public announce refused by the allowlist gate: {rejected}"))?;
-    // Approved: reuse the verified-content announce loop (SSOT with the neutral store path).
-    announce_store_provisions(fabric, identity_seed, provisions, ttl_secs, now, budget).await
+    announce_approved_public(fabric, identity_seed, &approved, ttl_secs, now, budget).await
+}
+
+/// Announce a record per [`ApprovedPublicProvision`], the PUBLIC counterpart of
+/// [`announce_store_records`]. Consuming the capability (claim held) is what makes a public
+/// announce impossible without an allowlist-minted claim.
+async fn announce_approved_public(
+    fabric: &Libp2pFabric,
+    identity_seed: [u8; 32],
+    approved: &[ApprovedPublicProvision],
+    ttl_secs: u64,
+    now: u64,
+    budget: &AnnounceBudget,
+) -> Result<Vec<ProviderRecord>, String> {
+    let provisions: Vec<StoreProvision> = approved
+        .iter()
+        .map(|a| {
+            // The claim is load-bearing: its NarHash must match the provision it authorises.
+            debug_assert_eq!(a.claim().nar_hash(), a.provision().nar_hash());
+            a.provision().clone()
+        })
+        .collect();
+    announce_store_records(fabric, identity_seed, &provisions, ttl_secs, now, budget).await
 }
 
 /// Wrap a running `fabric` in the consumer [`Libp2pNarSource`] + its paired
@@ -1095,7 +1187,7 @@ mod public_announce_gate_tests {
     use super::{StoreProvision, approve_provisions_for_public};
     use daemon_core::content_id::Blake3Digest;
     use daemon_core::{
-        NarHashKey, NullAllowlistStore, PublicNarAllowlist, PublicationRejected, TrustedNarKeys,
+        NarHashKey, PublicNarAllowlist, PublicationRejected, StoreHash, TrustedNarKeys,
     };
 
     const FIXTURE_PUBKEY: &str = "nix-p2p-test-1:empdFBu9wVZG12rPKToHMOTsU1qzWzeCcLdq/KQH0JQ=";
@@ -1113,8 +1205,11 @@ Sig: nix-p2p-test-1:Xqf1bjNJ1ReFahm86zY+hv80+7QeJer5V/HjlEAvP39yJEK8w8jHG9WH5lM7
 
     fn allowlist_with_app() -> PublicNarAllowlist {
         let trusted = TrustedNarKeys::from_lines([FIXTURE_PUBKEY]).unwrap();
-        let list = PublicNarAllowlist::open(trusted, Box::new(NullAllowlistStore)).unwrap();
-        list.learn(APP_NARINFO);
+        let list = PublicNarAllowlist::in_memory(trusted);
+        list.learn(
+            &StoreHash::new("l30jg5xg904s62jvw5znmr682xpr993c"),
+            APP_NARINFO,
+        );
         list
     }
 
@@ -1133,9 +1228,14 @@ Sig: nix-p2p-test-1:Xqf1bjNJ1ReFahm86zY+hv80+7QeJer5V/HjlEAvP39yJEK8w8jHG9WH5lM7
             "sha256:0pgsb9mjmfj57w1ddmqn9z9667nwbqbnn699j1s1s99jhy6cppsm",
             408,
         )];
-        let claims = approve_provisions_for_public(&provisions, &list).expect("approved");
-        assert_eq!(claims.len(), 1);
-        assert_eq!(claims[0].nar_size(), 408);
+        let approved = approve_provisions_for_public(&provisions, &list).expect("approved");
+        assert_eq!(approved.len(), 1);
+        assert_eq!(approved[0].claim().nar_size(), 408);
+        // The claim is load-bearing: it authorises exactly the provision's NarHash.
+        assert_eq!(
+            approved[0].claim().nar_hash(),
+            approved[0].provision().nar_hash()
+        );
     }
 
     #[test]

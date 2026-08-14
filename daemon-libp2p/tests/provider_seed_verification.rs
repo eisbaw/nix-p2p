@@ -28,8 +28,8 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use daemon_core::NarHashKey;
 use daemon_core::content_id::Blake3Digest;
 use daemon_libp2p::{
-    Libp2pSourceConfig, SeedNarHashMismatch, announce_provider_seeds, build_libp2p_provider_source,
-    verify_provider_seeds,
+    LanShare, Libp2pSourceConfig, SeedNarHashMismatch, announce_provider_seeds,
+    build_libp2p_provider_source, verify_provider_seeds,
 };
 use fabric_libp2p::{Libp2pFabric, MemoryNarSupplier, Multiaddr, NodeConfig};
 use peer_fabric::{AnnounceBudget, DiscoveryBudget, PeerFabric, SafetyEnvelope, ServeBudget};
@@ -144,6 +144,7 @@ async fn the_shipped_announce_path_refuses_a_mis_specified_seed() {
         &fabric,
         [2u8; 32],
         &[(honest_key, nar.clone())],
+        LanShare::operator_assembled(),
         3600,
         unix_now(),
         &budget,
@@ -164,6 +165,7 @@ async fn the_shipped_announce_path_refuses_a_mis_specified_seed() {
         &fabric,
         [2u8; 32],
         &[(lied, nar.clone())],
+        LanShare::operator_assembled(),
         3600,
         unix_now(),
         &budget,

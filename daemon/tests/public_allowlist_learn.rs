@@ -18,8 +18,7 @@ use http_body_util::{BodyExt, Full};
 
 use daemon::{
     App, CacheInfo, NarCatalog, NarHashKey, NarKey, NarSource, NarinfoSource, NoRawServe,
-    NullAllowlistStore, PublicNarAllowlist, RawUpstream, SourceError, StoreHash, TrustedNarKeys,
-    UpstreamResponse,
+    PublicNarAllowlist, RawUpstream, SourceError, StoreHash, TrustedNarKeys, UpstreamResponse,
 };
 
 const FIXTURE_PUBKEY: &str = "nix-p2p-test-1:empdFBu9wVZG12rPKToHMOTsU1qzWzeCcLdq/KQH0JQ=";
@@ -35,6 +34,10 @@ References: 0a0lslqb6gbqnj6xqjlaljjqg6kgb3wz-nix-p2p-fixture-lib\n\
 Deriver: 3135ldqj1kl5wxkrrdnf4dfxiqakjz0z-nix-p2p-fixture-app.drv\n\
 Sig: nix-p2p-test-1:Xqf1bjNJ1ReFahm86zY+hv80+7QeJer5V/HjlEAvP39yJEK8w8jHG9WH5lM7mN9WCIbdH/DDx81dmsjVObMqAQ==\n";
 
+/// A fake upstream that returns the SAME narinfo body for ANY requested store hash - i.e. it
+/// IGNORES the requested key. That is precisely the misrouted / hostile-upstream scenario the
+/// request-correlation guard must catch: request A, receive a signed narinfo for B. The append
+/// site correlates the signed StorePath to the requested key, so B is not learned under A.
 struct FixedNarinfo(Vec<u8>);
 
 #[async_trait]
@@ -92,7 +95,7 @@ fn app_with(narinfo: &[u8], allowlist: Arc<PublicNarAllowlist>) -> Arc<App> {
 
 fn allowlist() -> Arc<PublicNarAllowlist> {
     let trusted = TrustedNarKeys::from_lines([FIXTURE_PUBKEY]).unwrap();
-    Arc::new(PublicNarAllowlist::open(trusted, Box::new(NullAllowlistStore)).unwrap())
+    Arc::new(PublicNarAllowlist::in_memory(trusted))
 }
 
 #[tokio::test]
@@ -147,4 +150,30 @@ async fn serving_an_unsigned_narinfo_appends_nothing() {
         0,
         "an unsigned narinfo must never enter the public allowlist"
     );
+}
+
+#[tokio::test]
+async fn a_response_for_a_different_path_than_requested_appends_nothing() {
+    // THE request-correlation bite at the SEAM: the upstream answers a request for hash A with a
+    // perfectly-signed narinfo for a DIFFERENT path B (the app path). Its signature verifies, but
+    // it does not correlate to the requested key, so NOTHING is learned. (Neuter: drop the
+    // `verified.store_hash != requested` check in `PublicNarAllowlist::learn` and B is appended
+    // under A - the guard bites.)
+    let list = allowlist();
+    let app = app_with(APP_NARINFO, list.clone());
+    let (addr, _daemon) = common::spawn_app(app).await;
+
+    // Request a store hash that is NOT the app path's hash; the fake still returns the signed app
+    // narinfo (a misrouted / hostile upstream).
+    let resp = common::get(addr, "/00000000000000000000000000000000.narinfo").await;
+    assert_eq!(resp.status, Some(200), "narinfo still served verbatim");
+    assert_eq!(
+        list.status().count,
+        0,
+        "a signed narinfo for a path other than the one requested must not be learned"
+    );
+    let signed_key: NarHashKey = "sha256:0pgsb9mjmfj57w1ddmqn9z9667nwbqbnn699j1s1s99jhy6cppsm"
+        .parse()
+        .unwrap();
+    assert!(!list.contains(&signed_key));
 }
