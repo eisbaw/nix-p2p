@@ -3,11 +3,11 @@ id: TASK-191
 title: >-
   daemon-libp2p: serve from a real /nix/store via the CatalogProbe store-dump
   supplier (replace --libp2p-seed-nar MemoryNarSupplier), + container e2e
-status: In Progress
+status: Done
 assignee:
   - '@claude'
 created_date: '2026-08-13 11:29'
-updated_date: '2026-08-14 16:44'
+updated_date: '2026-08-14 16:56'
 labels:
   - libp2p
   - daemon
@@ -91,4 +91,6 @@ The BLOCKED-PENDING-TASK-193 guards at daemon/src/main.rs:1296 and daemon-libp2p
 can be lifted once the store supplier is wired. TASK-193 is In Progress pending its DEEP gate.
 
 DEEP gate 2026-08-13: codex GO on the store-serve MVP capability (commit 62dfc36). AC#1 (CatalogProbe over the AvailabilityIndex -> CatalogNarSupplier, store path served on demand, nothing at rest) and AC#2 (store announce verification-gated by verify_store_provisions -> TASK-56 index.hold; content from the VERIFIED blake3; fail-fast on quarantine/absent; no shipped bypass) are MET. AC#3's byte-identical integrity proof is met by the loopback two-swarm bite (mutation-proven: wrong-same-length -> Declined -> consumer IntegrityMismatch); the literal CONTAINER e2e is DEFERRED to TASK-194 (shared box + TASK-190 hang) - 191 stays In Progress until that lands (no AC-gaming). Comment overclaim ('un-bypassable by type system') corrected to scope the guarantee to the shipped path + flag the sign_libp2p_store_record footgun (codex finding).
+
+DONE 2026-08-14. AC#1/#2 (serve real /nix/store via nix-store --dump on demand holding no .nar, through the announce SSOT NarHash verification/TASK-56) were done+GO; AC#3 (container e2e) landed as TASK-194: s8-libp2p-store 13/13 - provider serves a store path never held as .nar to a consumer over kad, byte-identical, orchestrator-verified independently. Robust-connectivity supply property proven on the shipped binary.
 <!-- SECTION:NOTES:END -->
