@@ -159,11 +159,8 @@ async fn bootstrap_mode(args: &[String]) {
     let id_seed: u8 = args[2].parse().expect("id-seed");
     let peerid_file = PathBuf::from(&args[3]);
 
-    let fabric = Libp2pFabric::start(NodeConfig {
-        identity_seed: seed32(id_seed),
-        network_scope: SCOPE.to_string(),
-    })
-    .expect("bootstrap fabric starts");
+    let fabric = Libp2pFabric::start(NodeConfig::new(seed32(id_seed)).with_network_scope(SCOPE))
+        .expect("bootstrap fabric starts");
     fabric
         .handle()
         .listen(
@@ -203,10 +200,7 @@ async fn provide_dht_mode(args: &[String]) {
 
     let supplier: Arc<dyn Libp2pNarSupplier> = Arc::new(MemoryNarSupplier::new([nar]));
     let fabric = Libp2pFabric::start_with_supplier(
-        NodeConfig {
-            identity_seed: seed32(id_seed),
-            network_scope: SCOPE.to_string(),
-        },
+        NodeConfig::new(seed32(id_seed)).with_network_scope(SCOPE),
         supplier,
     )
     .expect("provider fabric starts");
@@ -302,10 +296,14 @@ async fn fetch_dht_mode(args: &[String]) {
     let nar_hash = nar_hash_from_seed(nar_seed);
     let key = ContentKey::derive_from_signed_nar_hash(&nar_hash);
 
-    let fabric = Libp2pFabric::start(NodeConfig {
-        identity_seed: seed32(id_seed),
-        network_scope: SCOPE.to_string(),
-    })
+    // Drive the SAME budget into the kad iterative-query timeout (TASK-210) as into the
+    // application DiscoveryBudget below, so the sweep measures the REAL single-query budget
+    // a shipped consumer configures — not the old hardcoded 10s that truncated TASK-209.
+    let fabric = Libp2pFabric::start(
+        NodeConfig::new(seed32(id_seed))
+            .with_network_scope(SCOPE)
+            .with_kad_query_timeout(Duration::from_secs(disc_budget_secs)),
+    )
     .expect("consumer fabric starts");
     fabric
         .handle()

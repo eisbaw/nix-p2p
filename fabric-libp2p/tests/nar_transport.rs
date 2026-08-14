@@ -95,11 +95,7 @@ fn envelope() -> SafetyEnvelope {
 
 /// Start a node listening on loopback TCP and return it with its concrete listen addr.
 async fn start_listening(seed: [u8; 32], scope: &str) -> (Node, fabric_libp2p::Multiaddr) {
-    let node = Node::start(NodeConfig {
-        identity_seed: seed,
-        network_scope: scope.to_string(),
-    })
-    .expect("node starts");
+    let node = Node::start(NodeConfig::new(seed).with_network_scope(scope)).expect("node starts");
     node.handle
         .listen("/ip4/127.0.0.1/tcp/0".parse().unwrap())
         .await

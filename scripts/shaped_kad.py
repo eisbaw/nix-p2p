@@ -63,9 +63,14 @@ DEFAULT_NAR_BYTES = 40 * 1024 * 1024
 DEFAULT_DELAY_MS = 20
 DEFAULT_RATE_MBIT = 100
 DEFAULT_NAR_SEED = 20209
-# The production kad query_timeout is 10s (fabric-libp2p swarm.rs); we drive find_providers
-# with that SAME budget so the breaking point we report is the one a shipped consumer hits.
-DEFAULT_DISC_BUDGET_SECS = 10
+# TASK-210 lifted the kad query_timeout out of a hardcoded 10s literal into
+# NodeConfig.kad_query_timeout (default DEFAULT_KAD_QUERY_TIMEOUT = 30s). The probe now
+# threads THIS value into BOTH the consumer's kad_query_timeout AND its application
+# DiscoveryBudget, so `--disc-budget-secs N` measures the real single-query budget a shipped
+# consumer configures. The default matches the shipped default so a bare `--sweep` reports
+# the breaking point a default consumer hits; the old 10s finding is reproducible with
+# `--disc-budget-secs 10`. Raising it trades a later negative answer for satellite reach.
+DEFAULT_DISC_BUDGET_SECS = 30
 # Outer retry window per consumer run: enough to absorb propagation + a couple of budget
 # expiries, bounded so a broken point fails fast (shared-box discipline).
 DEFAULT_OUTER_SECS = 25
@@ -337,8 +342,9 @@ def sweep(
         "discovery_elapsed_ns  first_try  ok"
     )
     print(
-        "#   first_try=YES means the FIRST single kad query (one 10s query_timeout) resolved "
-        "-- what a shipped one-shot consumer sees; NO means it needed retries past the budget."
+        f"#   first_try=YES means the FIRST single kad query (one {DEFAULT_DISC_BUDGET_SECS}s "
+        "query_timeout) resolved -- what a shipped one-shot consumer sees; NO means it needed "
+        "retries past the budget."
     )
 
     breaking_point_ms: int | None = None
@@ -348,7 +354,7 @@ def sweep(
         # Outer window must exceed the injected join+query RTTs; scale it up generously for big
         # delays so a HEALTHY-but-slow point is not cut short (only a genuine budget miss should
         # read as broken). Discovery latency grew ~quadratically with RTT in early runs, so we
-        # allow a wide retry window and let find_attempts reveal the 10s-budget breaking point.
+        # allow a wide retry window and let find_attempts reveal the budget breaking point.
         outer = max(
             DEFAULT_OUTER_SECS, 20 * delay_ms // 1000 + DEFAULT_DISC_BUDGET_SECS + 15
         )
@@ -392,7 +398,8 @@ def sweep(
             and d["provider_matched"] == 1
         )
         # The FIRST-attempt signal: a shipped consumer that issues ONE find_providers + ONE
-        # locate (each bounded by the 10s kad query_timeout) succeeds iff attempts == 1 on both.
+        # locate (each bounded by the configured kad query_timeout) succeeds iff attempts == 1
+        # on both.
         first_try = ok and d["find_attempts"] == 1 and d["locate_attempts"] == 1
         shaping_note = (
             "" if shaping_fired else "  [!] shaping did NOT fire (RTT too low)"
@@ -424,14 +431,15 @@ def sweep(
             breaking_point_ms = delay_ms
 
     print()
-    # (a) The SINGLE-QUERY budget: where the FIRST one-shot kad query (10s query_timeout)
-    # starts missing. This is the shipped-consumer-facing limit.
+    # (a) The SINGLE-QUERY budget: where the FIRST one-shot kad query (the configured
+    # query_timeout) starts missing. This is the shipped-consumer-facing limit.
+    budget = DEFAULT_DISC_BUDGET_SECS
     first_ok = [r for r in rows if r.get("first_try")]
     if first_ok:
         max_first = max(r["delay_ms"] for r in first_ok)
         print(
-            f"SWEEP RESULT (single 10s query_timeout): a ONE-SHOT kad discovery held up to "
-            f"{max_first}ms one-way delay (~{2 * max_first}ms RTT)."
+            f"SWEEP RESULT (single {budget}s query_timeout): a ONE-SHOT kad discovery held up "
+            f"to {max_first}ms one-way delay (~{2 * max_first}ms RTT)."
         )
     if first_try_break_ms is not None:
         fb = next(r for r in rows if r["delay_ms"] == first_try_break_ms)
@@ -440,9 +448,9 @@ def sweep(
             f"locate={fb.get('locate')}/{fb.get('locate_attempts')}"
         )
         print(
-            f"SWEEP RESULT (single 10s query_timeout): FIRST-ATTEMPT BREAKING POINT at "
+            f"SWEEP RESULT (single {budget}s query_timeout): FIRST-ATTEMPT BREAKING POINT at "
             f"{first_try_break_ms}ms one-way delay (~{2 * first_try_break_ms}ms RTT): {detail} "
-            f"-- the first single query exceeded the 10s budget and needed retries."
+            f"-- the first single query exceeded the {budget}s budget and needed retries."
         )
 
     # (b) The retry-tolerant budget: whether discovery EVER succeeds within a bounded outer

@@ -902,6 +902,31 @@ async fn run_accept_loop(mut incoming: IncomingStreams, serve_slot: ServeSlot) {
     tracing::debug!("fabric-libp2p: NAR accept loop ended (swarm shut down)");
 }
 
+/// Default kad iterative-query timeout (the per-query deadline libp2p-kad enforces on a
+/// `get_providers`/`get_closest_peers`/`get_record` walk).
+///
+/// WHY 30s, and why configurable (TASK-210, informed by TASK-209's shaped-link RTT sweep):
+/// TASK-209 measured single-shot kad DISCOVERY latency growing steeply with link RTT
+/// (one-way delay -> observed discovery time): 20ms -> ~0.65s, 100ms -> ~3.6s,
+/// 250ms -> ~8.5s. At 500ms one-way (~1.7s RTT) the FIRST query already exceeded the old
+/// hardcoded 10s and needed an application retry; the old 10s therefore covered only up to
+/// ~250ms one-way. GEO-satellite peers sit at ~600ms one-way (~1.2s RTT) — squarely past
+/// the old ceiling — so a one-shot consumer lookup on a satellite uplink silently
+/// DeadlineExceeded. Extrapolating the measured near-linear ~34ms-per-one-way-ms slope
+/// beyond baseline (250ms -> 8.5s) puts a single query at 600ms one-way near ~20s; 30s
+/// clears that with margin (covers roughly up to ~800ms one-way single-shot).
+///
+/// TRADEOFF — a higher timeout is NOT free, and does NOT make satellite discovery FAST,
+/// only POSSIBLE: on a fast link a genuine `Miss`/`Unavailable` (a key that truly has no
+/// provider, or a peer that cannot be located) now takes up to 30s to surface instead of
+/// 10s, because the negative answer is exactly the timeout firing. It does NOT slow
+/// SUCCESSFUL discovery on residential/WAN links (20–250ms): those queries complete in
+/// well under 10s and return the moment they resolve, untouched by the raised ceiling. The
+/// cost is borne only on the failure path. Links slower than ~800ms one-way still need a
+/// larger configured timeout and/or application-level retry — which is why this is
+/// configurable rather than a bigger magic number.
+pub const DEFAULT_KAD_QUERY_TIMEOUT: Duration = Duration::from_secs(30);
+
 /// Configuration for one libp2p node.
 pub struct NodeConfig {
     /// The 32-byte ed25519 secret that IS this node's identity and record-signing key.
@@ -910,15 +935,37 @@ pub struct NodeConfig {
     /// using distinct scopes). The concrete protocol names are
     /// `/nix-p2p/<scope>/kad/1.0.0` and `/nix-p2p/<scope>/id/1.0.0`.
     pub network_scope: String,
+    /// The kad iterative-query timeout threaded into `kad::Config::set_query_timeout`
+    /// (TASK-210). Bounds every DHT discovery/locate walk (`get_providers`,
+    /// `get_closest_peers`, `get_record`); on elapse the query returns
+    /// [`QueryFail::Timeout`]. Defaults to [`DEFAULT_KAD_QUERY_TIMEOUT`]; raise it for
+    /// high-RTT (e.g. GEO-satellite) peers, at the cost of a slower negative answer. An
+    /// integer [`Duration`] — no fractional/float timeouts.
+    pub kad_query_timeout: Duration,
 }
 
 impl NodeConfig {
-    /// A config for `seed` on the default network scope.
+    /// A config for `seed` on the default network scope with the default
+    /// [`DEFAULT_KAD_QUERY_TIMEOUT`].
     pub fn new(identity_seed: [u8; 32]) -> Self {
         NodeConfig {
             identity_seed,
             network_scope: "v1".to_string(),
+            kad_query_timeout: DEFAULT_KAD_QUERY_TIMEOUT,
         }
+    }
+
+    /// Override the network scope (builder style).
+    pub fn with_network_scope(mut self, scope: impl Into<String>) -> Self {
+        self.network_scope = scope.into();
+        self
+    }
+
+    /// Override the kad iterative-query timeout (TASK-210, builder style). See
+    /// [`NodeConfig::kad_query_timeout`] for the tradeoff of a larger value.
+    pub fn with_kad_query_timeout(mut self, timeout: Duration) -> Self {
+        self.kad_query_timeout = timeout;
+        self
     }
 }
 
@@ -975,6 +1022,9 @@ impl Node {
         let node_id = node_id_of(&keypair);
         let peer_id = keypair.public().to_peer_id();
         let scope = config.network_scope;
+        // The configurable kad iterative-query timeout (TASK-210). `Duration` is `Copy`, so
+        // capture it before the behaviour closure moves other config out.
+        let kad_query_timeout = config.kad_query_timeout;
 
         let kad_protocol = StreamProtocol::try_from_owned(format!("/nix-p2p/{scope}/kad/1.0.0"))
             .map_err(|e| NodeError::Build(format!("invalid kad protocol name: {e:?}")))?;
@@ -1010,7 +1060,11 @@ impl Node {
                     let peer_id = key.public().to_peer_id();
                     let store = MemoryStore::new(peer_id);
                     let mut kad_config = kad::Config::new(kad_protocol);
-                    kad_config.set_query_timeout(Duration::from_secs(10));
+                    // Configurable per-query deadline (TASK-210). Was a hardcoded 10s, which
+                    // TASK-209's RTT sweep showed covers only up to ~250ms one-way and
+                    // silently DeadlineExceeds GEO-satellite (~600ms one-way) peers. See
+                    // `DEFAULT_KAD_QUERY_TIMEOUT` for the default's justification + tradeoff.
+                    kad_config.set_query_timeout(kad_query_timeout);
                     let mut kad = kad::Behaviour::with_config(peer_id, store, kad_config);
                     // Server mode: this node STORES records and ANSWERS queries. Without
                     // it a node stays a client that never holds provider/value records,

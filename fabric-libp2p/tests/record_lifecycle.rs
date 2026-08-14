@@ -33,11 +33,8 @@ use peer_fabric::{
 /// Bring up a node listening on an ephemeral loopback TCP port; returns the fabric and
 /// its concrete dial address.
 async fn start_node(seed_byte: u8, scope: &str) -> (Libp2pFabric, Multiaddr) {
-    let fabric = Libp2pFabric::start(NodeConfig {
-        identity_seed: [seed_byte; 32],
-        network_scope: scope.to_string(),
-    })
-    .expect("swarm builds");
+    let fabric = Libp2pFabric::start(NodeConfig::new([seed_byte; 32]).with_network_scope(scope))
+        .expect("swarm builds");
 
     fabric
         .handle()
@@ -65,10 +62,7 @@ async fn start_node_durable(
     state_dir: std::path::PathBuf,
 ) -> (Libp2pFabric, Multiaddr) {
     let fabric = Libp2pFabric::start_durable(
-        NodeConfig {
-            identity_seed: [seed_byte; 32],
-            network_scope: scope.to_string(),
-        },
+        NodeConfig::new([seed_byte; 32]).with_network_scope(scope),
         state_dir,
     )
     .expect("swarm builds");
@@ -217,10 +211,7 @@ async fn announce_fails_closed_when_the_sequence_cannot_be_persisted() {
     let state_dir = blocker.join("state");
 
     let fabric = Libp2pFabric::start_durable(
-        NodeConfig {
-            identity_seed: [7u8; 32],
-            network_scope: "persist-failclosed".to_string(),
-        },
+        NodeConfig::new([7u8; 32]).with_network_scope("persist-failclosed"),
         state_dir,
     )
     .expect("fabric builds even with an unwritable state dir (load is best-effort)");

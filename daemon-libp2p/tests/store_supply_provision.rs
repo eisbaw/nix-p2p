@@ -214,11 +214,8 @@ async fn shipped_store_announce_carries_verified_content_and_refuses_quarantined
 
     // ---- boot node: the provider's DHT entry point (holds no content) ----
     let (bootstrap, boot_addr) = start_fabric(
-        Libp2pFabric::start(NodeConfig {
-            identity_seed: [11u8; 32],
-            network_scope: scope.to_string(),
-        })
-        .expect("bootstrap starts"),
+        Libp2pFabric::start(NodeConfig::new([11u8; 32]).with_network_scope(scope))
+            .expect("bootstrap starts"),
     )
     .await;
     let boot_peer = bootstrap.peer_id();

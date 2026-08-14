@@ -255,11 +255,8 @@ async fn production_config_builds_libp2p_source_that_discovers_and_serves_with_c
 
     // ---- Stand up B (bootstrap) and P (serving provider) with the raw fabric API ----
     let (bootstrap, boot_addr) = start_fabric(
-        Libp2pFabric::start(NodeConfig {
-            identity_seed: [1u8; 32],
-            network_scope: scope.to_string(),
-        })
-        .expect("bootstrap starts"),
+        Libp2pFabric::start(NodeConfig::new([1u8; 32]).with_network_scope(scope))
+            .expect("bootstrap starts"),
     )
     .await;
     let boot_peer = bootstrap.peer_id();
@@ -267,10 +264,7 @@ async fn production_config_builds_libp2p_source_that_discovers_and_serves_with_c
     let provider_seed = [3u8; 32];
     let (provider, provider_listen_addr) = start_fabric(
         Libp2pFabric::start_with_supplier(
-            NodeConfig {
-                identity_seed: provider_seed,
-                network_scope: scope.to_string(),
-            },
+            NodeConfig::new(provider_seed).with_network_scope(scope),
             Arc::new(MemoryNarSupplier::new([nar.clone()])),
         )
         .expect("provider starts"),

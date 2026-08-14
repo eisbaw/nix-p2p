@@ -1238,10 +1238,8 @@ async fn start_and_join_libp2p(
     cfg: &Libp2pSourceConfig,
     supplier: Option<Arc<dyn Libp2pNarSupplier>>,
 ) -> Result<Arc<Libp2pFabric>, String> {
-    let node_config = NodeConfig {
-        identity_seed: cfg.identity_seed,
-        network_scope: cfg.network_scope.clone(),
-    };
+    let node_config =
+        NodeConfig::new(cfg.identity_seed).with_network_scope(cfg.network_scope.clone());
     let serving = supplier.is_some();
     // TASK-185, AC#1: a configured `state_dir` routes to the DURABLE constructors, so the
     // shipped daemon reloads its anti-rollback floor + per-key announce sequence on restart.

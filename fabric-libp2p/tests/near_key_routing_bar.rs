@@ -32,11 +32,8 @@ use peer_fabric::{
 
 /// Start an isolated single node on its own network scope (no bootstrap, no peers).
 fn start_node(seed_byte: u8, scope: &str) -> Libp2pFabric {
-    Libp2pFabric::start(NodeConfig {
-        identity_seed: [seed_byte; 32],
-        network_scope: scope.to_string(),
-    })
-    .expect("swarm builds")
+    Libp2pFabric::start(NodeConfig::new([seed_byte; 32]).with_network_scope(scope))
+        .expect("swarm builds")
 }
 
 /// An ed25519 identity whose PeerId is NOT in any routing table: a valid point (so

@@ -252,11 +252,8 @@ async fn daemon_discovers_via_libp2p_kad_and_serves_byte_identical_nar_with_clea
 
     // ---- Stand up the libp2p network: bootstrap B, provider P, consumer C ----
     let (bootstrap, boot_addr) = start_fabric(
-        Libp2pFabric::start(NodeConfig {
-            identity_seed: [1u8; 32],
-            network_scope: scope.to_string(),
-        })
-        .expect("bootstrap starts"),
+        Libp2pFabric::start(NodeConfig::new([1u8; 32]).with_network_scope(scope))
+            .expect("bootstrap starts"),
     )
     .await;
     let boot_peer = bootstrap.peer_id();
@@ -265,10 +262,7 @@ async fn daemon_discovers_via_libp2p_kad_and_serves_byte_identical_nar_with_clea
     let provider_seed = [3u8; 32];
     let (provider, provider_addr) = start_fabric(
         Libp2pFabric::start_with_supplier(
-            NodeConfig {
-                identity_seed: provider_seed,
-                network_scope: scope.to_string(),
-            },
+            NodeConfig::new(provider_seed).with_network_scope(scope),
             Arc::new(MemoryNarSupplier::new([nar.clone()])),
         )
         .expect("provider starts"),
@@ -277,11 +271,8 @@ async fn daemon_discovers_via_libp2p_kad_and_serves_byte_identical_nar_with_clea
     let provider_peer = provider.peer_id();
 
     let (consumer, _consumer_addr) = start_fabric(
-        Libp2pFabric::start(NodeConfig {
-            identity_seed: [4u8; 32],
-            network_scope: scope.to_string(),
-        })
-        .expect("consumer starts"),
+        Libp2pFabric::start(NodeConfig::new([4u8; 32]).with_network_scope(scope))
+            .expect("consumer starts"),
     )
     .await;
 

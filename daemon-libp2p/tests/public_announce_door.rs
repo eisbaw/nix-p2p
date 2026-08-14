@@ -87,11 +87,8 @@ async fn the_public_seed_door_refuses_an_unallowlisted_seed_on_a_real_fabric() {
 
     // ---- boot node (the provider's DHT entry point) ----
     let (bootstrap, boot_addr) = start_fabric(
-        Libp2pFabric::start(NodeConfig {
-            identity_seed: [7u8; 32],
-            network_scope: scope.to_string(),
-        })
-        .expect("bootstrap starts"),
+        Libp2pFabric::start(NodeConfig::new([7u8; 32]).with_network_scope(scope))
+            .expect("bootstrap starts"),
     )
     .await;
     let boot_peer = bootstrap.peer_id();

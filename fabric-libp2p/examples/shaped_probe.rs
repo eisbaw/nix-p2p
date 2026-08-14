@@ -75,11 +75,8 @@ async fn provide(args: &[String]) {
     let nar = incompressible_nar(nar_bytes, nar_seed);
     let content = Blake3Digest::from_raw_nar(&nar);
 
-    let node = Node::start(NodeConfig {
-        identity_seed: seed32(id_seed),
-        network_scope: "shaped206".to_string(),
-    })
-    .expect("provider node starts");
+    let node = Node::start(NodeConfig::new(seed32(id_seed)).with_network_scope("shaped206"))
+        .expect("provider node starts");
 
     let supplier = Arc::new(MemoryNarSupplier::new([nar]));
     let server = Libp2pServer::new(
@@ -130,11 +127,8 @@ async fn fetch(args: &[String]) {
     let expected = incompressible_nar(nar_bytes, nar_seed);
     let content = Blake3Digest::from_raw_nar(&expected);
 
-    let node = Node::start(NodeConfig {
-        identity_seed: seed32(id_seed),
-        network_scope: "shaped206".to_string(),
-    })
-    .expect("fetcher node starts");
+    let node = Node::start(NodeConfig::new(seed32(id_seed)).with_network_scope("shaped206"))
+        .expect("fetcher node starts");
     // The fetcher must also listen so noise/yamux dialing has a local transport.
     node.handle
         .listen("/ip4/0.0.0.0/tcp/0".parse().unwrap())

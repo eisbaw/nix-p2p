@@ -36,10 +36,7 @@ async fn start_serving_node(
     supplier: Arc<dyn Libp2pNarSupplier>,
 ) -> (Libp2pFabric, Multiaddr) {
     let fabric = Libp2pFabric::start_with_supplier(
-        NodeConfig {
-            identity_seed: [seed_byte; 32],
-            network_scope: scope.to_string(),
-        },
+        NodeConfig::new([seed_byte; 32]).with_network_scope(scope),
         supplier,
     )
     .expect("swarm builds");
@@ -48,11 +45,8 @@ async fn start_serving_node(
 
 /// Bring up a pure consumer/bootstrap fabric (no supplier) listening on loopback.
 async fn start_node(seed_byte: u8, scope: &str) -> (Libp2pFabric, Multiaddr) {
-    let fabric = Libp2pFabric::start(NodeConfig {
-        identity_seed: [seed_byte; 32],
-        network_scope: scope.to_string(),
-    })
-    .expect("swarm builds");
+    let fabric = Libp2pFabric::start(NodeConfig::new([seed_byte; 32]).with_network_scope(scope))
+        .expect("swarm builds");
     bind_and_addr(fabric).await
 }
 

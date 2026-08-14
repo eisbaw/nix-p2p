@@ -267,11 +267,8 @@ async fn run_serves_a_discovered_libp2p_nar_and_falls_back_on_miss() {
 
     // ---- B (bootstrap) + P (serving provider) via the raw fabric API ----
     let (bootstrap, boot_addr) = start_fabric(
-        Libp2pFabric::start(NodeConfig {
-            identity_seed: [1u8; 32],
-            network_scope: scope.to_string(),
-        })
-        .expect("bootstrap starts"),
+        Libp2pFabric::start(NodeConfig::new([1u8; 32]).with_network_scope(scope))
+            .expect("bootstrap starts"),
     )
     .await;
     let boot_peer = bootstrap.peer_id();
@@ -279,10 +276,7 @@ async fn run_serves_a_discovered_libp2p_nar_and_falls_back_on_miss() {
     let provider_seed = [3u8; 32];
     let (provider, provider_listen_addr) = start_fabric(
         Libp2pFabric::start_with_supplier(
-            NodeConfig {
-                identity_seed: provider_seed,
-                network_scope: scope.to_string(),
-            },
+            NodeConfig::new(provider_seed).with_network_scope(scope),
             Arc::new(MemoryNarSupplier::new([nar.clone()])),
         )
         .expect("provider starts"),

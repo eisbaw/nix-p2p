@@ -120,7 +120,9 @@ pub use nar::{
     raw_nar_helper_authorized,
 };
 pub use server::Libp2pServer;
-pub use swarm::{Node, NodeConfig, NodeError, QueryReach, SwarmHandle};
+pub use swarm::{
+    DEFAULT_KAD_QUERY_TIMEOUT, Node, NodeConfig, NodeError, QueryFail, QueryReach, SwarmHandle,
+};
 pub use transport::Libp2pTransport;
 
 // Re-export libp2p's address/peer types the composition root and tests need to drive

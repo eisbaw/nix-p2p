@@ -47,11 +47,8 @@ fn unix_now() -> u64 {
 
 /// Bring up a bootstrap fabric on an ephemeral loopback TCP port; return it + its address.
 async fn start_bootstrap(seed: u8, scope: &str) -> (Arc<Libp2pFabric>, Multiaddr) {
-    let fabric = Libp2pFabric::start(NodeConfig {
-        identity_seed: [seed; 32],
-        network_scope: scope.to_string(),
-    })
-    .expect("bootstrap starts");
+    let fabric = Libp2pFabric::start(NodeConfig::new([seed; 32]).with_network_scope(scope))
+        .expect("bootstrap starts");
     fabric
         .handle()
         .listen("/ip4/127.0.0.1/tcp/0".parse().unwrap())

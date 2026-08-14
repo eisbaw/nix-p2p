@@ -39,11 +39,8 @@ use peer_fabric::{
 /// Bring up a node listening on an ephemeral loopback TCP port; returns the fabric and
 /// its concrete dial address.
 async fn start_node(seed_byte: u8, scope: &str) -> (Libp2pFabric, Multiaddr) {
-    let fabric = Libp2pFabric::start(NodeConfig {
-        identity_seed: [seed_byte; 32],
-        network_scope: scope.to_string(),
-    })
-    .expect("swarm builds");
+    let fabric = Libp2pFabric::start(NodeConfig::new([seed_byte; 32]).with_network_scope(scope))
+        .expect("swarm builds");
 
     fabric
         .handle()
