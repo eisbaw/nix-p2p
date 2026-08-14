@@ -29,16 +29,30 @@ node config live):
   today, and any one of them means the node reaches out to the global network.
 
   POSITIVE INVARIANT (removing it BITES): the EXECUTABLE private-DHT wiring must
-  be present in CODE, not merely mentioned in a comment. Concretely, over the
-  COMMENT-STRIPPED source there must be BOTH (a) at least one private,
+  be present in CODE, not merely mentioned in a comment, and the marker and the
+  constructor must be CO-LOCATED IN THE SAME FILE. Concretely, over the
+  COMMENT-STRIPPED source there must be ONE file that holds BOTH (a) a private,
   scope-namespaced `/nix-p2p/.../kad` protocol string literal AND (b) the explicit
-  `Behaviour::with_config(..)` constructor that pins a custom `kad::Config` (the
-  only construction that can carry the private protocol). This is what catches the
-  QUIET regression the forbidden-list cannot: swapping the explicit
+  fully-qualified `kad::Behaviour::with_config(..)` constructor that pins a custom
+  `kad::Config` (the only construction that can carry the private protocol). This is
+  what catches the QUIET regression the forbidden-list cannot: swapping the explicit
   `kad::Behaviour::with_config(.., custom_protocol_config)` for the default
   `kad::Behaviour::new(..)` drops NO forbidden string into OUR source (the
   `/ipfs/kad/1.0.0` default lives inside the library), yet silently rejoins the
   public DHT.
+
+  WHY CO-LOCATION is load-bearing (TASK-154 F2): an intermediate version aggregated
+  the marker hits and the `with_config` presence GLOBALLY and checked them
+  INDEPENDENTLY, so the invariant held merely because SOME file had a marker and SOME
+  file had a `with_config`. That is bypassable: add a second, UNRELATED
+  `kad::Behaviour::with_config` (a future behaviour, a test/probe helper) in any
+  scanned file and swap the REAL kad ctor to `kad::Behaviour::new` - the marker
+  lingers in its file, the unrelated `with_config` satisfies the global check, and
+  the swap to the public DHT sails through. We now require the marker and the
+  constructor to be found TOGETHER in one file, and match the constructor as the
+  fully module-qualified `kad::Behaviour::with_config` specifically (not a bare
+  `with_config` nor a bare `Behaviour::with_config`), so neither `MemoryStore::with_config`
+  nor an unrelated behaviour's `with_config` can stand in for it.
 
   WHY comment-stripping is load-bearing (TASK-154 B4): an EARLIER version of this
   guard scanned the RAW text for the private marker, so the marker lingering in a
@@ -59,7 +73,11 @@ TASK-154 B4 mutation - the private marker swapped for `Behaviour::new` but LEFT
 LINGERING IN A COMMENT - and asserts it STILL FAILS (proving the comment-strip
 bites); (6) the executable marker present in code but wired via `Behaviour::new`
 instead of `with_config` and asserts it FAILS (proving the wiring, not just the
-marker, is required). A guard that cannot be shown to fail is not a guard.
+marker, is required); (7) the TASK-154 F2 global-noise bypass - the private marker
+in one file with the kad ctor swapped to `Behaviour::new`, plus an UNRELATED
+`kad::Behaviour::with_config` in a DIFFERENT file - and asserts it FAILS (proving
+co-location, not mere global presence, is required). A guard that cannot be shown to
+fail is not a guard.
 
 Limits, stated plainly: like its sibling this is a dependency-free substring
 scan over comment-stripped source, so it catches an accidental or straightforward
@@ -129,10 +147,14 @@ PRIVATE_KAD_MARKER = re.compile(r"/nix-p2p/[^\"]*?/kad")
 # `kad::Behaviour::with_config(..)` is the ONLY construction that carries a non-default
 # protocol; the default `kad::Behaviour::new(..)` silently uses `/ipfs/kad/1.0.0`. Requiring
 # this in code means a swap to `Behaviour::new` fails the invariant even if a marker literal
-# lingers (TASK-154 B4). Matched as `Behaviour::with_config(..)` SPECIFICALLY - NOT a bare
-# `with_config`, so the unrelated `MemoryStore::with_config(..)` (always present) cannot
-# satisfy it and mask a swapped-out kad Behaviour constructor.
-WITH_CONFIG_MARKER = re.compile(r"Behaviour::with_config\s*\(")
+# lingers (TASK-154 B4). Matched as `kad::Behaviour::with_config(..)` SPECIFICALLY - fully
+# module-qualified, NOT a bare `with_config` nor a bare `Behaviour::with_config`, so neither the
+# unrelated `MemoryStore::with_config(..)` (always present) NOR a future/unrelated OTHER
+# behaviour's `with_config` can satisfy it and mask a swapped-out kad Behaviour constructor
+# (TASK-154 F2). This pairs with the CO-LOCATION requirement in `scan` (marker and ctor must
+# live in the SAME file), so a stray `kad::Behaviour::with_config` in a different file cannot
+# vouch for a private marker stranded next to a swapped-in `Behaviour::new`.
+KAD_WITH_CONFIG_MARKER = re.compile(r"kad::Behaviour::with_config\s*\(")
 
 
 def strip_comments(text: str) -> str:
@@ -226,17 +248,25 @@ def strip_comments(text: str) -> str:
     return "".join(out)
 
 
-def scan(roots: list[Path]) -> tuple[list[str], int, int, bool]:
-    """Return (violations, files_scanned, code_marker_hits, with_config_in_code).
+def scan(roots: list[Path]) -> tuple[list[str], int, bool, bool, bool]:
+    """Return (violations, files_scanned, any_code_marker, any_kad_with_config, colocated).
 
     FORBIDDEN tokens are matched over RAW text (a public protocol string is a violation
-    wherever it appears). The POSITIVE invariant (private marker, `with_config`) is matched
-    over COMMENT-STRIPPED code only - a marker in a comment does NOT count (TASK-154 B4).
+    wherever it appears). The POSITIVE invariant (private marker + `kad::Behaviour::with_config`)
+    is matched over COMMENT-STRIPPED code only - a marker in a comment does NOT count (TASK-154
+    B4). Critically (TASK-154 F2) the marker and the constructor are tracked PER FILE and the
+    invariant demands they be CO-LOCATED (both present in the SAME file, `colocated`), not merely
+    both present SOMEWHERE in the scanned tree: aggregating them globally let an UNRELATED second
+    `kad::Behaviour::with_config` in one file vouch for a private marker stranded in a DIFFERENT
+    file whose real kad ctor had been swapped to `Behaviour::new`, so the AC#3 oracle did not bite
+    that global-noise bypass. `any_code_marker` / `any_kad_with_config` are still returned so the
+    verdict can name WHICH half is missing vs. merely un-colocated.
     """
     violations: list[str] = []
     scanned = 0
-    code_marker_hits = 0
-    with_config_in_code = False
+    any_code_marker = False
+    any_kad_with_config = False
+    colocated = False
     for root in roots:
         if not root.exists():
             continue
@@ -254,28 +284,41 @@ def scan(roots: list[Path]) -> tuple[list[str], int, int, bool]:
                 if needle in text:
                     violations.append(f"{source}: contains {needle!r} - {reason}")
             code = strip_comments(text)
-            code_marker_hits += len(PRIVATE_KAD_MARKER.findall(code))
-            if WITH_CONFIG_MARKER.search(code):
-                with_config_in_code = True
-    return violations, scanned, code_marker_hits, with_config_in_code
+            file_has_marker = PRIVATE_KAD_MARKER.search(code) is not None
+            file_has_ctor = KAD_WITH_CONFIG_MARKER.search(code) is not None
+            any_code_marker = any_code_marker or file_has_marker
+            any_kad_with_config = any_kad_with_config or file_has_ctor
+            if file_has_marker and file_has_ctor:
+                colocated = True
+    return violations, scanned, any_code_marker, any_kad_with_config, colocated
 
 
 def _evaluate(roots: list[Path]) -> tuple[list[str], int]:
-    """Full verdict: forbidden-token violations PLUS the missing-invariant check."""
-    violations, scanned, code_marker_hits, with_config_in_code = scan(roots)
-    if scanned > 0 and code_marker_hits == 0:
+    """Full verdict: forbidden-token violations PLUS the missing / un-colocated-invariant checks."""
+    violations, scanned, any_code_marker, any_kad_with_config, colocated = scan(roots)
+    if scanned > 0 and not any_code_marker:
         violations.append(
             "no private /nix-p2p/<scope>/kad protocol marker found IN CODE (a marker only in "
             "a comment does not count) - the shipped kad path has no proven-private DHT "
             "protocol; a default `/ipfs/kad/1.0.0` preset would silently rejoin the PUBLIC "
             "IPFS DHT (invariant lost)"
         )
-    if scanned > 0 and code_marker_hits > 0 and not with_config_in_code:
+    elif scanned > 0 and not any_kad_with_config:
         violations.append(
             "the private /nix-p2p/<scope>/kad marker is present but NOT wired through an "
             "executable `kad::Behaviour::with_config(..)` - a swap to the default "
             "`Behaviour::new(..)` would rejoin the PUBLIC IPFS DHT while the marker literal "
             "lingers unused (the executable-wiring invariant is lost)"
+        )
+    elif scanned > 0 and not colocated:
+        violations.append(
+            "the private /nix-p2p/<scope>/kad marker and the executable "
+            "`kad::Behaviour::with_config(..)` both appear in the scanned tree but are NOT "
+            "CO-LOCATED in the SAME file - the marker sits in one file while the only "
+            "private-kad constructor is in another, so the file that actually builds the kad "
+            "Behaviour may have been swapped to the default `Behaviour::new(..)` (PUBLIC IPFS "
+            "DHT) while an UNRELATED `kad::Behaviour::with_config` elsewhere masks the swap "
+            "(TASK-154 F2 global-noise bypass)"
         )
     return violations, scanned
 
@@ -389,12 +432,48 @@ def self_test() -> int:
             )
             return 1
 
+        # (7) TASK-154 F2 GLOBAL-NOISE MUTATION: the AC#3 bypass the earlier guard missed. The
+        # marker and the constructor were aggregated GLOBALLY and checked INDEPENDENTLY, so a
+        # SECOND, UNRELATED `kad::Behaviour::with_config` ANYWHERE in a scanned path vouched for a
+        # private marker stranded in a DIFFERENT file whose real kad ctor had been swapped to
+        # `Behaviour::new` (PUBLIC IPFS DHT). Synthesise exactly that: file A carries the private
+        # marker but builds kad via `Behaviour::new`; file B carries an UNRELATED
+        # `kad::Behaviour::with_config` (a test/probe helper) with NO private marker. Under the OLD
+        # global aggregation BOTH halves were independently satisfied and this PASSED (the bypass);
+        # co-location requires the marker and the constructor IN THE SAME file, so it MUST bite.
+        for stale in root.glob("*.rs"):
+            stale.unlink()
+        (root / "node.rs").write_text(
+            "let kad_protocol = StreamProtocol::try_from_owned(\n"
+            '    format!("/nix-p2p/{scope}/kad/1.0.0"))?;\n'
+            "let store = MemoryStore::with_config(peer_id, content_store_config());\n"
+            "let kad = kad::Behaviour::new(peer_id, store);\n"
+        )
+        (root / "probe_helper.rs").write_text(
+            "fn make_probe_kad(peer: PeerId, store: MemoryStore) -> kad::Behaviour<MemoryStore> {\n"
+            '    let cfg = kad::Config::new(StreamProtocol::new("/probe/kad/1.0.0"));\n'
+            "    kad::Behaviour::with_config(peer, store, cfg)\n"
+            "}\n"
+        )
+        violations, _ = _evaluate(roots)
+        if not any("CO-LOCATED" in v for v in violations):
+            print(
+                "self-test FAILED: a private marker in one file with the kad ctor swapped to "
+                "`Behaviour::new`, plus an UNRELATED `kad::Behaviour::with_config` in ANOTHER "
+                "file, did NOT trip the guard - the global-noise bypass survives and AC#3 is "
+                "bypassable (TASK-154 F2)",
+                file=sys.stderr,
+            )
+            return 1
+
         print(
             "check-public-dht-isolation: self-test OK - a private-DHT composition passes; "
             "adding '/ipfs/kad/1.0.0' BITES; baking in 'bootstrap.libp2p.io' BITES; "
             "dropping the private /nix-p2p kad marker BITES; a marker left only in a COMMENT "
             "BITES (comment-strip proven); an in-code marker not wired through with_config "
-            "BITES (executable-wiring proven) - AC#3 + TASK-154 B4 mutations caught"
+            "BITES (executable-wiring proven); a private marker and an UNRELATED "
+            "kad::Behaviour::with_config split across DIFFERENT files (kad ctor swapped to "
+            "Behaviour::new) BITES (co-location proven) - AC#3 + TASK-154 B4 + F2 mutations caught"
         )
         return 0
 
