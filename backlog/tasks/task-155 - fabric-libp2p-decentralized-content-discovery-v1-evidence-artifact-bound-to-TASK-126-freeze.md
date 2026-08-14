@@ -3,10 +3,10 @@ id: TASK-155
 title: >-
   fabric-libp2p: decentralized-content-discovery-v1 evidence artifact (bound to
   TASK-126 freeze)
-status: In Progress
+status: Done
 assignee: []
 created_date: '2026-08-12 07:55'
-updated_date: '2026-08-14 18:38'
+updated_date: '2026-08-14 18:41'
 labels:
   - libp2p
   - fabric
@@ -39,4 +39,6 @@ TASK-103 landed an MVP-minimal decentralized-content-discovery-v1 artifact (scri
 DEP CORRECTION 2026-08-14 (COMPASS): dropped the stale iroh-framed TASK-132 dep — decentralized discovery was PROVEN on libp2p-kad (TASK-103/159/179), not iroh; the discovery-v1 artifact this task fully-hardens is the libp2p one. Dep now TASK-103 (Done). NOTE: the TASK-103 MVP already landed a MINIMAL fail-closed decentralized-content-discovery-v1 artifact that re-derives from raw + records raw-log hashes + fails closed (verdict=pass ok/fail, checks_fail==0 required, both s7 arms required, live tree manifest). This task's REMAINING scope is the FULLER lock-in over that: (a) packet-level evidence (pcap capture in the s7/s8 pod so the no-injection + kad-only claims are backed at the wire, not just harness stdout); (b) a fuller mutation set; (c) binding to the TASK-126 frozen tree. If pcap-in-container proves env-heavy, scope it / BLOCK the pcap arm precisely and still deliver the fuller-mutation + tree-binding hardening — do not fake packet evidence.
 
 TASK-155 landed (commit b0820fe). Hardened the MVP decentralized-content-discovery-v1 artifact: (1) WIRE packet evidence - --capture captures the s7-libp2p pod netns host-side (nsenter into the rootless pod user+net ns + host tcpdump, NO e2e-image change), --finalize reparses the pcap: complete capture (records==tcpdump captured, 0 dropped), 0 mdns, 0 IPv4 multicast/broadcast, every IPv4 flow same-host (src==dst, so no external tracker/LAN peer), libp2p mesh on the 37000 band with a NAR-scale peer transfer (wire corroboration of 0-upstream-NAR). Honest limit: noise-encrypted streams => wire proves ABSENCE of every non-kad substrate + PRESENCE of a peer transfer; 'kad specifically' stays on the source guard. (2) Fuller mutation set - +missing no-injection line, mdns pkt, multicast pkt, external unicast, truncated pcap, kernel drop, no-peer-transfer, unattached, golden ContentKey drift, absent anchor (all BITE, synthetic pcaps, no containers). (3) Frozen-tree binding to TASK-126: hashes golden provider_record_v1.json + the pure-python anchor, asserts golden ContentKey==frozen 4e61db15... (context nix-p2p/discovery/ContentKey/v1) + both at HEAD + anchor OK line required. Fresh clean run: verdict=pass, 17 checks, wire 1558 pkts/0 dropped/0 mdns/0 external/91229B peer xfer, frozen ok; --verify green. Bounded gate green: finalizer --self-test, capture+finalize, --verify, ruff check+format, just independence, check-discovery-no-shortcut --self-test. Raw tree gitignored (house pattern; only -v1.json tracked). No pcap BLOCK needed - host nsenter capture worked. Awaiting orchestrator re-verify + qa/mped/codex gate.
+
+DONE 2026-08-14. Wire-level lock-in of the decentralized-discovery proof: host-side pcap (nsenter -t <pid> -U -n tcpdump, no image change) + a pure-python wire oracle proving 0 mdns / 0 multicast / 0 external-unicast + a peer transfer; fuller mutation battery (wire+frozen+harness+IO, all bite); frozen TASK-126 tree binding (golden ContentKey 4e61db15 + independent anchor at HEAD). Artifact regenerated verdict=pass 17 checks, --verify green. Orchestrator-verified (self-test all bite, --verify green, artifact wire_ok+frozen_ok). HONEST LIMIT: noise-encrypted streams -> the wire proves ABSENCE of non-kad substrate + PRESENCE of a peer transfer, not a positive kad protocol-id read ('it was kad' still attributed to the kad-exclusive source guard). Capture is host-bound (rootless podman + host tcpdump/nsenter); --self-test/--verify portable.
 <!-- SECTION:NOTES:END -->
