@@ -52,6 +52,20 @@ equality is a lie except where `Compression: none` makes them coincide. Every
 `*_bytes` key in the report MUST end in one of UNIT_SUFFIXES, and `unit_violations`
 fails the report otherwise. `--self-test` proves the gate bites by mutation.
 
+NO FLOAT ON THE TRUST / ADMISSION PATH (integer-exact)
+------------------------------------------------------
+Every integrity and admission decision is made in INTEGER arithmetic:
+  * re-derivation compares byte sums, exclusion counts and decile index/n/min/max with
+    EXACT `==` on integers (no tolerance; NaN is unrepresentable in an integer field);
+  * record FileSize/NarSize must be POSITIVE integers, and admitted store_hashes UNIQUE;
+  * `signed`/`gate_passed` are compared by EXACT bool, never truthiness;
+  * the sample_gate span check is `max_nar >= min_nar * MIN_SPAN_MULTIPLE`, a pure
+    integer comparison (a float `max/min` rounds `min*k-1` up to `k.0` at large sizes
+    and would admit a too-narrow sample -- the integer form is exact at the boundary).
+Floats appear ONLY in DISPLAY/ANALYSIS outputs -- the displayed FileSize/NarSize ratio,
+the span multiple/log10, the break-even threshold size and the throughput figures --
+never where a byte lands in or out of the aggregate or a report is published.
+
 ORACLES (each proven RED-under-mutation by `--self-test`)
 --------------------------------------------------------
   * compression exclusion: a `Compression: none` path (FileSize==NarSize, ratio
@@ -81,6 +95,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import statistics
 import sys
 import time
@@ -125,6 +140,15 @@ WAN_LABEL = "wan_shaped"
 DEFAULT_SHAPED_SIZES_MIB = (8, 20, 40)
 DEFAULT_DELAY_MS = 20
 DEFAULT_RATE_MBIT = 100
+
+# The minimum NarSize span (max/min, a LINEAR multiple) an admitted sample must
+# cover. It is an INTEGER and the span gate compares it with pure integer
+# arithmetic -- `max_nar >= min_nar * MIN_SPAN_MULTIPLE` -- so there is genuinely no
+# float on the admission trust path (a float max/min at the boundary max=k*min-1
+# rounds up to k.0 and lets a too-narrow sample slip through; the integer form is
+# exact). This is a LINEAR multiple (~55806x on the real sample), NOT orders of
+# magnitude (log10 ~4.7); the field is named `nar_size_span_multiple` accordingly.
+DEFAULT_MIN_SPAN_MULTIPLE = 10000
 
 # Break-even scenario bandwidth/latency assumptions. These are ASSUMED inputs, NOT
 # re-measured by this script: the upstream (CDN) figure derives from
@@ -349,14 +373,17 @@ def _deciles_by_nar(admitted: list[dict]) -> list[dict]:
 
 
 def _require_int_field(record: dict, key: str) -> int:
-    """Read a byte-count field, REJECTING any non-integer value.
+    """Read a byte-count field, REJECTING any non-integer or non-POSITIVE value.
 
-    NarSize/FileSize are byte COUNTS: integers. Because the field is integer-typed, a
-    NaN/inf is UNREPRESENTABLE in it -- a float (NaN/inf/fractional) smuggled into a
-    committed record is a corrupted record, not a measurement, and fails LOUDLY here
-    before it can poison a sum. This single integer-type choke point is why the whole
-    class of NaN fail-opens cannot exist on the trust path: there is nothing to
-    special-case, an integer field simply cannot hold a NaN.
+    NarSize/FileSize are byte COUNTS: they are POSITIVE integers. A real narinfo path
+    has a nonzero compressed FileSize and a nonzero uncompressed NarSize; zero or
+    negative is not a measurement but a corrupted/forged record. Because the field is
+    integer-typed a NaN/inf is UNREPRESENTABLE in it, and the positivity check rejects
+    the remaining nonsense (0, negatives) BEFORE it can poison a sum or a ratio -- e.g.
+    a negative FileSize with a re-generated (internally consistent) summary would sail
+    through the exact re-derivation checks, since the doctored sum matches the doctored
+    record; positivity is what bites it. This single choke point is why the whole class
+    of NaN/negative fail-opens cannot exist on the trust path.
     """
     value = record.get(key)
     if isinstance(value, bool) or not isinstance(value, int):
@@ -367,7 +394,37 @@ def _require_int_field(record: dict, key: str) -> int:
             f"{value!r} ({type(value).__name__}); byte counts must be plain integers "
             "(a float/NaN is unrepresentable as a byte count -- rejected fail-closed)"
         )
+    if value <= 0:
+        raise ValueError(
+            f"record {record.get('store_hash', '?')!r} field {key!r} is {value!r}; "
+            "byte counts must be POSITIVE (a zero/negative FileSize or NarSize is a "
+            "corrupted or forged record, not a measurement -- rejected fail-closed)"
+        )
     return value
+
+
+def _require_unique_admitted(admitted: list[dict]) -> None:
+    """Admitted store_hashes must be UNIQUE, or the path count is inflatable.
+
+    A store hash identifies a store path; a duplicate admitted record double-counts
+    that path -- so a sample of 199 distinct signed-compressed paths plus one repeat
+    would report `n_compressed == 200` and pass a `>= 200` gate it does not actually
+    meet. The real closure BFS de-duplicates by hash (a `seen` set), so a duplicate in
+    a committed artifact is a corrupted/forged sample; reject it fail-closed here, on
+    the one computation path shared by producer and verifier.
+    """
+    seen: set = set()
+    dups: list = []
+    for r in admitted:
+        h = r.get("store_hash")
+        if h in seen:
+            dups.append(h)
+        seen.add(h)
+    if dups:
+        raise ValueError(
+            f"duplicate admitted store_hash(es) {sorted(set(dups))!r}: a repeated path "
+            "inflates n_compressed and the admission count -- rejected fail-closed"
+        )
 
 
 def _aggregate_from_records(records: list[dict]) -> dict:
@@ -393,6 +450,7 @@ def _aggregate_from_records(records: list[dict]) -> dict:
             "no admitted (known-compressed AND signed) records -- cannot form an "
             "aggregate"
         )
+    _require_unique_admitted(admitted)  # a duplicate must not inflate the path count
     sum_file = sum(r["file_size_bytes_compressed_wire"] for r in admitted)
     sum_nar = sum(r["nar_size_bytes_uncompressed_nar"] for r in admitted)
     per_path_ratios = [
@@ -430,8 +488,17 @@ def _aggregate_from_records(records: list[dict]) -> dict:
         "sum_nar_size_bytes_uncompressed_nar": sum_nar,
         "nar_size_min_bytes_uncompressed_nar": min(nar_sizes),
         "nar_size_max_bytes_uncompressed_nar": max(nar_sizes),
-        "nar_size_span_orders_of_magnitude": (
+        # DISPLAY ONLY. `nar_size_span_multiple` is the LINEAR multiple max/min
+        # (~55806x on the real sample); `nar_size_span_log10` is the honest orders of
+        # magnitude (~4.7). NEITHER is on the admission trust path: `sample_gate`
+        # compares the INTEGER min/max fields directly (max >= min * MIN_SPAN_MULTIPLE),
+        # never these floats. (The old field was misnamed `_orders_of_magnitude` but
+        # held the linear multiple -- TASK-199; renamed here.)
+        "nar_size_span_multiple": (
             (max(nar_sizes) / min(nar_sizes)) if min(nar_sizes) > 0 else None
+        ),
+        "nar_size_span_log10": (
+            math.log10(max(nar_sizes) / min(nar_sizes)) if min(nar_sizes) > 0 else None
         ),
         "n_uncompressed_excluded": n_uncompressed,
         "n_unknown_compression_excluded": n_unknown,
@@ -464,22 +531,41 @@ def compressed_ratio_aggregate(samples: list[NarinfoSample]) -> dict:
     return agg
 
 
-def sample_gate(agg: dict, *, min_paths: int, min_span: float) -> list[str]:
+def sample_gate(agg: dict, *, min_paths: int, min_span: int) -> list[str]:
     """AC#1 admission: >=min_paths compressed signed paths, spanning a wide range.
 
     The span check is the non-vacuous part: a sample clustered in one size band
-    (the prior-figure flaw) is REFUSED even if it has 200 paths. Empty == clean.
+    (the prior-figure flaw) is REFUSED even if it has 200 paths. It is an INTEGER
+    comparison over the raw min/max NarSize -- `max_nar >= min_nar * min_span` -- so
+    there is NO float on the admission trust path. A float `max/min` at the boundary
+    `max = min*min_span - 1` rounds up to `min_span.0` for large `min` and would let a
+    too-narrow sample slip through; the integer form rejects it exactly. Empty == clean.
     """
+    if isinstance(min_span, bool) or not isinstance(min_span, int):
+        raise TypeError(
+            f"min_span must be a plain int (integer span gate), got {min_span!r} "
+            f"({type(min_span).__name__}) -- a float would reintroduce the boundary "
+            "rounding hole on the admission path"
+        )
     problems: list[str] = []
     if agg["n_compressed"] < min_paths:
         problems.append(
             f"only {agg['n_compressed']} compressed signed paths, need >= {min_paths}"
         )
-    span = agg.get("nar_size_span_orders_of_magnitude")
-    if span is None or span < min_span:
+    min_nar = agg.get("nar_size_min_bytes_uncompressed_nar")
+    max_nar = agg.get("nar_size_max_bytes_uncompressed_nar")
+    if (
+        not isinstance(min_nar, int)
+        or isinstance(min_nar, bool)
+        or not isinstance(max_nar, int)
+        or isinstance(max_nar, bool)
+        or min_nar <= 0
+        or max_nar < min_nar * min_span
+    ):
         problems.append(
-            f"NarSize span {span} is below {min_span}x -- the sample is clustered "
-            "in one size band, not spanning the deciles (the prior-figure flaw)"
+            f"NarSize span (max {max_nar} / min {min_nar}) is below {min_span}x -- the "
+            "sample is clustered in one size band, not spanning the deciles (the "
+            "prior-figure flaw). Integer gate: require max_nar >= min_nar * min_span."
         )
     empty = [d["decile"] for d in agg["deciles_by_nar_size"] if d["n"] == 0]
     if empty:
@@ -527,7 +613,8 @@ _DERIVED_DISPLAY_FLOATS = (
     "peer_raw_over_cdn_wire_multiple",
     "per_path_ratio_mean",
     "per_path_ratio_median",
-    "nar_size_span_orders_of_magnitude",
+    "nar_size_span_multiple",
+    "nar_size_span_log10",
 )
 
 
@@ -599,22 +686,38 @@ def _verify_deciles(want_dec, got_dec, out: list[str]) -> None:
         )
 
 
+def _stored_bool_matches(stored, want: bool) -> bool:
+    """EXACT-type boolean match: `stored` must be a real bool AND equal `want`.
+
+    Truthiness is NOT enough. A stored `signed` of `1`, `"true"`, `"false"` or `"no"`
+    is a wrong TYPE for a boolean field: `"false"` is truthy so `bool("false")` is
+    True, silently agreeing with a re-derived True; `1` likewise. Comparing by exact
+    bool identity (`isinstance(stored, bool) and stored is want`) rejects every such
+    non-bool, so a record can never smuggle a truthy-non-bool past the derivation check.
+    """
+    return isinstance(stored, bool) and stored is want
+
+
 def _verify_record_derivations(records: list[dict], out: list[str]) -> None:
     """Re-derive `signed`/`classification` from the RAW `sig`/`compression` and
-    demand the stored fields agree. The aggregate math ignores these stored booleans
-    (it re-derives admission from raw), so a lie in them is invisible to the sums --
-    yet a downstream reader who trusts `record['signed']`/`['classification']` would
-    be misled. Checking them here closes that gap.
+    demand the stored fields agree BY EXACT TYPE. The aggregate math ignores these
+    stored booleans (it re-derives admission from raw), so a lie in them is invisible
+    to the sums -- yet a downstream reader who trusts `record['signed']`/
+    `['classification']` would be misled. Checking them here closes that gap.
+
+    `signed` is compared by EXACT bool (`_stored_bool_matches`): a truthy non-bool
+    (`1`, `"false"`) is rejected, not silently accepted via truthiness.
 
     NOTE: `signed` means a NONEMPTY `Sig:` field, NOT cryptographic signature
     verification -- this diagnostic does not verify the signature, only its presence.
     """
     for r in records:
         want_signed = bool(str(r.get("sig", "")).strip())
-        if bool(r.get("signed")) != want_signed:
+        if not _stored_bool_matches(r.get("signed"), want_signed):
             out.append(
                 f"record {r.get('store_hash', '?')!r}: stored signed="
-                f"{r.get('signed')!r} disagrees with raw Sig (re-derived {want_signed})"
+                f"{r.get('signed')!r} disagrees with raw Sig (re-derived "
+                f"{want_signed}; must be an EXACT bool, not a truthy value)"
             )
         want_class = classify_compression(str(r.get("compression", "")))
         if r.get("classification") != want_class:
@@ -700,6 +803,41 @@ def build_sample_block(
         raise SampleGateError(gate)
     verify_rederivable(agg)  # a published aggregate is always self-consistent
     return {"aggregate": agg, "gate_violations": [], "gate_passed": True}
+
+
+def _assert_gate_block_publishable(sample: dict) -> None:
+    """Fail-CLOSED publication predicate for a PRESENT sample block (AC#1).
+
+    A sample block may be published only if it is INTERNALLY CONSISTENT about having
+    passed the gate: `gate_passed` must be EXACTLY `True` (not merely truthy -- an int
+    `1` or the string `"true"` is a wrong-typed field, not a pass) AND `gate_violations`
+    must be empty. A block that claims to pass while carrying violations is
+    self-contradictory and must never publish. On top of that the aggregate must be a
+    dict and re-derive from its own records. This is the decisive blocker codex found:
+    the old finalize checked only truthiness of `gate_passed` and ignored
+    `gate_violations`, so a passing-but-violated (or truthy-non-bool) block published.
+    """
+    gate_passed = sample.get("gate_passed")
+    if gate_passed is not True:
+        raise ValueError(
+            "refusing to publish: sample block present but gate_passed is not EXACTLY "
+            f"True (got {gate_passed!r} of type {type(gate_passed).__name__}); a truthy "
+            "non-bool is a wrong-typed field, not a passing gate"
+        )
+    violations = sample.get("gate_violations")
+    if violations:
+        raise ValueError(
+            "refusing to publish: sample block claims gate_passed but carries nonempty "
+            f"gate_violations {violations!r} -- a passing gate cannot have violations"
+        )
+    agg = sample.get("aggregate")
+    if not isinstance(agg, dict):
+        raise ValueError(
+            "refusing to publish: sample block present but carries no aggregate dict "
+            f"(got {type(agg).__name__}) -- fail-closed"
+        )
+    # Never emit a headline that disagrees with the raw records it carries.
+    verify_rederivable(agg)
 
 
 # --- real cache.nixos.org sampling (HTTP narinfo BFS over the closure) --------
@@ -1251,26 +1389,14 @@ class Report:
         assert_cannot_select_policy(d)
         # FAIL-CLOSED publication. A report with NO sample block (e.g. a
         # shaped-link-only run) is fine; but the MOMENT a sample block is present it
-        # MUST carry a passing gate AND an aggregate that re-derives from its own
-        # records. Never silently skip the check when the aggregate is missing/
-        # malformed (the old `if isinstance(agg, dict)` quietly published a
-        # gate-failed or aggregate-less block).
+        # MUST carry a gate_passed that is EXACTLY True, empty gate_violations, and an
+        # aggregate that re-derives from its own records. `_assert_gate_block_publishable`
+        # is the single fail-closed predicate; it never silently skips (the old
+        # `if isinstance(agg, dict)` quietly published a gate-failed or aggregate-less
+        # block, and truthiness let a `gate_passed:1` / violated block through).
         sample = self.sample or {}
         if sample:
-            if "gate_passed" not in sample or not sample.get("gate_passed"):
-                raise ValueError(
-                    "refusing to publish: sample block present but its gate did not "
-                    f"pass (gate_passed={sample.get('gate_passed')!r}, "
-                    f"gate_violations={sample.get('gate_violations')!r})"
-                )
-            agg = sample.get("aggregate")
-            if not isinstance(agg, dict):
-                raise ValueError(
-                    "refusing to publish: sample block present but carries no "
-                    f"aggregate dict (got {type(agg).__name__}) -- fail-closed"
-                )
-            # Never emit a headline that disagrees with the raw records it carries.
-            verify_rederivable(agg)
+            _assert_gate_block_publishable(sample)
         return d
 
 
@@ -1414,7 +1540,7 @@ def self_test() -> int:
             return False
 
     base_agg = compressed_ratio_aggregate(_good_samples())
-    base_block = build_sample_block(_good_samples(), min_paths=20, min_span=100.0)
+    base_block = build_sample_block(_good_samples(), min_paths=20, min_span=100)
     nan = float("nan")
 
     def _mut_verify(nbit, desc, mutate) -> None:
@@ -1518,6 +1644,185 @@ def self_test() -> int:
         failures.append(
             "fail-closed finalize false-positive: a clean, gate-passed report with a "
             "re-derivable aggregate was REFUSED publication"
+        )
+
+    # --- FINAL-HARDENING battery (task-94 final cycle): input-strictness guards (a)-(e).
+    # Each mutation, applied to a VALID artifact/report, must be REJECTED after the fix
+    # AND ACCEPTED once its specific guard is reverted (monkeypatched to its pre-fix
+    # form) -- proving the guard, not some unrelated check, is what bites. The revert is
+    # scoped by save/restore of a module global; nothing leaks past each block.
+    _adm_idx = next(
+        i
+        for i, r in enumerate(base_agg["records"])
+        if r["classification"] == "compressed" and r["signed"] is True
+    )
+
+    # (a) POSITIVITY: a negative record FileSize with a REGENERATED (internally
+    # consistent) summary must be REJECTED. The exact re-derivation checks pass (the
+    # doctored sum matches the doctored record); _require_int_field's positivity is the
+    # guard that bites. Revert it to a lax int check (permits negatives) for non-vacuity.
+    def _lax_int_field(record, key):  # pre-fix behaviour: type check, NO positivity
+        v = record.get(key)
+        if isinstance(v, bool) or not isinstance(v, int):
+            raise ValueError("lax: non-int byte count")
+        return v
+
+    neg_records = _copy(base_agg["records"])
+    neg_records[_adm_idx]["file_size_bytes_compressed_wire"] = -neg_records[_adm_idx][
+        "file_size_bytes_compressed_wire"
+    ]
+    _orig_int = globals()["_require_int_field"]
+    globals()["_require_int_field"] = _lax_int_field
+    try:
+        neg_agg = _aggregate_from_records(neg_records)  # regenerated consistent summary
+        neg_agg["records"] = neg_records
+        accepted_lax_neg = _verify_accepts(neg_agg)
+    finally:
+        globals()["_require_int_field"] = _orig_int
+    if not accepted_lax_neg:
+        failures.append(
+            "(a) positivity non-vacuity: the pre-fix lax int check did NOT accept the "
+            "regenerated negative-FileSize artifact -- the demo cannot isolate the guard"
+        )
+    if _verify_accepts(neg_agg):  # guard restored
+        failures.append(
+            "(a) positivity: a negative record FileSize with a regenerated summary was "
+            "ACCEPTED -- byte counts must be POSITIVE (rejected fail-closed)"
+        )
+
+    # (b) UNIQUENESS: a duplicate admitted record (199 unique + 1 repeat -> reported 200)
+    # must be REJECTED, not inflate n_compressed. Revert _require_unique_admitted to a
+    # no-op to prove that guard is what bites.
+    dup_records = _copy(base_agg["records"])
+    dup_records.append(_copy(dup_records[_adm_idx]))  # same store_hash, admitted twice
+    _orig_uniq = globals()["_require_unique_admitted"]
+    globals()["_require_unique_admitted"] = lambda admitted: None
+    try:
+        dup_agg = _aggregate_from_records(dup_records)
+        dup_agg["records"] = dup_records
+        inflated = dup_agg["n_compressed"] == base_agg["n_compressed"] + 1
+        accepted_lax_dup = _verify_accepts(dup_agg)
+    finally:
+        globals()["_require_unique_admitted"] = _orig_uniq
+    if not (inflated and accepted_lax_dup):
+        failures.append(
+            "(b) uniqueness non-vacuity: under the reverted no-op guard the duplicate "
+            f"did not inflate the count (+1={inflated}) or was not accepted "
+            f"({accepted_lax_dup}) -- the demo cannot isolate the guard"
+        )
+    if _verify_accepts(dup_agg):  # guard restored
+        failures.append(
+            "(b) uniqueness: a duplicate admitted store_hash inflating n_compressed was "
+            "ACCEPTED -- duplicates must be REJECTED so the path count is not inflatable"
+        )
+
+    # (c) EXACT-TYPE `signed`: a stored `signed` that is a truthy NON-bool (int 1, str
+    # "false"/"true") must be REJECTED, not accepted via truthiness. Revert
+    # _stored_bool_matches to a truthiness compare to prove exactness is what bites.
+    for bad_signed in (1, "false", "true"):
+        sig_agg = _copy(base_agg)
+        sig_agg["records"][_adm_idx]["signed"] = bad_signed
+        _orig_bm = globals()["_stored_bool_matches"]
+        globals()["_stored_bool_matches"] = lambda stored, want: bool(stored) == want
+        try:
+            accepted_lax_sig = _verify_accepts(sig_agg)
+        finally:
+            globals()["_stored_bool_matches"] = _orig_bm
+        if not accepted_lax_sig:
+            failures.append(
+                f"(c) signed non-vacuity: truthiness did NOT accept signed={bad_signed!r} "
+                "under the reverted guard -- the demo cannot isolate the exact-type check"
+            )
+        if _verify_accepts(sig_agg):  # guard restored
+            failures.append(
+                f"(c) exact-type signed: stored signed={bad_signed!r} (a truthy non-bool) "
+                "was ACCEPTED -- an EXACT bool is required (is True / isinstance bool)"
+            )
+
+    # (d) GATE CONSISTENCY in finalize: publication requires gate_passed IS True AND
+    # empty gate_violations. Each mutation must be REFUSED by finalize; revert
+    # _assert_gate_block_publishable to the old lax predicate (truthy gate_passed, no
+    # violations check) to prove the strictness is what bites.
+    def _lax_publishable(sample):  # pre-fix: truthy gate_passed, no violations check
+        if not sample.get("gate_passed"):
+            raise ValueError("lax: gate not passed")
+        agg = sample.get("aggregate")
+        if not isinstance(agg, dict):
+            raise ValueError("lax: no aggregate")
+        verify_rederivable(agg)
+
+    gate_muts = [
+        ("gate_passed = 1 (truthy int)", lambda b: b.__setitem__("gate_passed", 1)),
+        (
+            'gate_passed = "true" (truthy str)',
+            lambda b: b.__setitem__("gate_passed", "true"),
+        ),
+        (
+            "gate_passed True but gate_violations nonempty",
+            lambda b: b.__setitem__("gate_violations", ["late-detected clustering"]),
+        ),
+    ]
+    for desc, mutate in gate_muts:
+        blk = _copy(base_block)
+        mutate(blk)
+        _orig_pub = globals()["_assert_gate_block_publishable"]
+        globals()["_assert_gate_block_publishable"] = _lax_publishable
+        try:
+            accepted_lax_gate = _finalize_accepts(blk)
+        finally:
+            globals()["_assert_gate_block_publishable"] = _orig_pub
+        if not accepted_lax_gate:
+            failures.append(
+                f"(d) gate non-vacuity: the lax pre-fix predicate did NOT accept "
+                f"[{desc}] -- the demo cannot isolate the strict gate check"
+            )
+        if _finalize_accepts(blk):  # guard restored
+            failures.append(
+                f"(d) gate consistency: finalize ACCEPTED [{desc}] -- must REFUSE "
+                "(gate_passed must be exactly True AND gate_violations empty)"
+            )
+
+    # (e) INTEGER span gate: the boundary sample max = min*MIN_SPAN - 1, for a `min`
+    # large enough that the (correctly-rounded) FLOAT max/min rounds up to MIN_SPAN.0,
+    # must be REJECTED by the integer gate though the old float comparison ACCEPTED it.
+    # The true quotient is MIN_SPAN - 1/min; it rounds to MIN_SPAN.0 once 1/min drops
+    # below half-ulp(10000) = 2**-40, i.e. min > 2**40. min = 2**41 clears that.
+    span_min = 2**41
+    span_max = span_min * DEFAULT_MIN_SPAN_MULTIPLE - 1  # one byte short of the bar
+    boundary_agg = {
+        "n_compressed": 250,
+        "nar_size_min_bytes_uncompressed_nar": span_min,
+        "nar_size_max_bytes_uncompressed_nar": span_max,
+        "deciles_by_nar_size": [{"decile": d + 1, "n": 25} for d in range(10)],
+    }
+    # Reproduce codex: the OLD float comparison rounds max/min up to the bar and passes.
+    if span_max / span_min != float(DEFAULT_MIN_SPAN_MULTIPLE):
+        failures.append(
+            "(e) span boundary is not a float-rounding boundary as intended (float span "
+            f"{span_max / span_min!r} != {DEFAULT_MIN_SPAN_MULTIPLE}.0) -- pick a larger "
+            "min so the float rounds up and the old gate would have accepted it"
+        )
+    span_problems = sample_gate(
+        boundary_agg, min_paths=200, min_span=DEFAULT_MIN_SPAN_MULTIPLE
+    )
+    if not any("span" in p.lower() for p in span_problems):
+        failures.append(
+            "(e) integer span gate: the boundary sample max = min*MIN_SPAN - 1 was "
+            "ACCEPTED (span not flagged) -- the integer gate must REJECT it exactly"
+        )
+    # A sample exactly AT the bar (max = min*MIN_SPAN) passes the span check (no
+    # false-positive): proves the integer gate is a genuine boundary, not a blanket fail.
+    at_bar = dict(
+        boundary_agg,
+        nar_size_max_bytes_uncompressed_nar=span_min * DEFAULT_MIN_SPAN_MULTIPLE,
+    )
+    if any(
+        "span" in p.lower()
+        for p in sample_gate(at_bar, min_paths=200, min_span=DEFAULT_MIN_SPAN_MULTIPLE)
+    ):
+        failures.append(
+            "(e) integer span gate false-positive: a sample exactly at max = min*MIN_SPAN "
+            "was wrongly flagged as clustered"
         )
 
     # --- AC#3: break-even across ALL FOUR latency quadrants, each pinned.
@@ -1694,7 +1999,7 @@ def self_test() -> int:
         NarinfoSample(f"h{i}", "p", "xz", 300, 1000, "sig:x") for i in range(200)
     ]
     cagg = compressed_ratio_aggregate(clustered)
-    if not sample_gate(cagg, min_paths=200, min_span=1e3):
+    if not sample_gate(cagg, min_paths=200, min_span=1000):
         failures.append(
             "sample_gate is vacuous: a clustered single-size sample passed the "
             "span check (the prior-figure flaw would slip through)"
@@ -1703,7 +2008,7 @@ def self_test() -> int:
     # --- fail-CLOSED publish: build_sample_block REFUSES (publishes nothing) on a
     # failed gate, and SUCCEEDS on a good sample (proves it is not a blanket refusal).
     try:
-        build_sample_block(clustered, min_paths=200, min_span=1e3)
+        build_sample_block(clustered, min_paths=200, min_span=1000)
         failures.append(
             "fail-closed bite: build_sample_block published an aggregate for a "
             "clustered sample that FAILS the gate (must raise SampleGateError and "
@@ -1712,7 +2017,7 @@ def self_test() -> int:
     except SampleGateError:
         pass
     try:
-        block = build_sample_block(_good_samples(), min_paths=20, min_span=100.0)
+        block = build_sample_block(_good_samples(), min_paths=20, min_span=100)
         if not block.get("gate_passed"):
             failures.append("fail-closed: a passing sample was not marked gate_passed")
     except SampleGateError as exc:
@@ -1728,9 +2033,12 @@ def self_test() -> int:
         "SELF-TEST OK: compression-exclusion, unknown-compression, signed-admission, "
         "re-derivability (all 11 pinned tamper mutations bite: sum-drift, ratio/decile/"
         "record NaN, decile n/min/index, exclusion counts, gate_passed:false, "
-        "aggregate-less block, lying signed/classification), break-even-quadrants "
-        "(incl. numer==0 / tie / loss boundaries), loopback-label, unit-gate, "
-        "policy-guard, span-gate and fail-closed-publish oracles all bite"
+        "aggregate-less block, lying signed/classification), final-hardening (a) "
+        "positivity, (b) uniqueness, (c) exact-type signed, (d) gate-consistency, (e) "
+        "integer span-gate boundary -- each REJECTED after fix + ACCEPTED under its "
+        "reverted guard, break-even-quadrants (incl. numer==0 / tie / loss boundaries), "
+        "loopback-label, unit-gate, policy-guard, span-gate and fail-closed-publish "
+        "oracles all bite"
     )
     return 0
 
@@ -1823,7 +2131,12 @@ def main() -> int:
         help="comma-separated NAR sizes (MiB) for the shaped throughput arm",
     )
     ap.add_argument("--min-paths", type=int, default=200)
-    ap.add_argument("--min-span", type=float, default=1e4)
+    ap.add_argument(
+        "--min-span",
+        type=int,
+        default=DEFAULT_MIN_SPAN_MULTIPLE,
+        help="min NarSize span as an INTEGER linear multiple (max >= min * this)",
+    )
     ap.add_argument("--json-out", default=None)
     args = ap.parse_args()
 
