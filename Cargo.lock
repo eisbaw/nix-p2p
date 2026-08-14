@@ -957,8 +957,10 @@ name = "daemon-core"
 version = "0.0.1"
 dependencies = [
  "async-trait",
+ "base64",
  "blake3",
  "bytes",
+ "ed25519-dalek 3.0.0",
  "flate2",
  "http 1.5.0",
  "http-body 1.1.0",

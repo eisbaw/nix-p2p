@@ -60,7 +60,17 @@ blake3 = "1"
 sha2 = "0.10"
 # availability's NAR reader opens the raw store path with descriptor-relative, no-follow,
 # regular-file-checked filesystem ops (openat/fstat) without unsafe code. Not a p2p dep.
-rustix = { version = "1", features = ["fs"] }
+# The public-allowlist store (TASK-102) reuses it for the strict owner/mode/type/link
+# checks (openat NOFOLLOW + fstat) on its append-only file, and geteuid for the owner check.
+rustix = { version = "1", features = ["fs", "process"] }
+# TASK-102 public-NAR allowlist: verify a cache.nixos.org narinfo's trusted-key Nix ed25519
+# signature over the fingerprint `1;StorePath;NarHash;NarSize;References` before a NAR's
+# identity may be published. ed25519-dalek v3 `verify_strict` is the SAME strict verifier
+# peer-fabric's ProviderRecord codec uses (small-order A/R + S<L rejected), so the two agree
+# on which signatures are valid. base64 decodes the Nix `name:<base64>` key + Sig tokens.
+# Neither is a p2p stack nor an HTTP-logic crate, so the independence denylist is unaffected.
+ed25519-dalek = "3"
+base64 = "0.22"
 
 [dev-dependencies]
 # The serving-core in-process integration tests moved here with the modules; several stand

@@ -33,6 +33,7 @@ pub mod discovery;
 pub mod narinfo_cache;
 mod nixbase32;
 pub mod peer_source;
+pub mod public_allowlist;
 pub mod rewrite;
 pub mod run;
 pub mod server;
@@ -66,6 +67,11 @@ pub use discovery::{
 };
 pub use narinfo_cache::{Clock, NarinfoDiskCache, SystemClock};
 pub use peer_source::{PeerFabricNarSource, PeerFabricRawServe};
+pub use public_allowlist::{
+    AllowlistPersistError, AllowlistStatus, AllowlistStore, FileAllowlistStore, LearnOutcome,
+    NullAllowlistStore, PublicNarAllowlist, PublicNarClaim, PublicProofReject, PublicationRejected,
+    TrustedKeyError, TrustedNarKeys, VerifiedPublicNar, prove_public,
+};
 pub use rewrite::{
     AllowlistRawServe, AnyRawServe, NoRawServe, RawRewrite, RawServeDecision, RewriteError, to_raw,
 };
