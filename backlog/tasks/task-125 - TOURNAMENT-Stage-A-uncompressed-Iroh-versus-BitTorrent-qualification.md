@@ -4,7 +4,7 @@ title: 'TOURNAMENT Stage A: uncompressed Iroh versus BitTorrent qualification'
 status: To Do
 assignee: []
 created_date: '2026-08-10 22:30'
-updated_date: '2026-08-10 22:57'
+updated_date: '2026-08-14 08:24'
 labels:
   - tournament
   - diagnostic
@@ -45,4 +45,6 @@ Run the first comparative tournament only after the production-shaped Iroh path 
 
 <!-- SECTION:NOTES:BEGIN -->
 The user explicitly allows the first tournament without compression. Stage B later compares raw and compressed options.
+
+COMPASS 2026-08-14 (stale-framing flag): this Stage-A tournament is framed 'uncompressed Iroh vs BitTorrent' but Wave-2c makes libp2p-stream the PRIMARY transport (TASK-157 shipped) and libp2p-kad the mandatory discovery layer (TASK-103). Racing iroh vs BitTorrent while EXCLUDING the default libp2p-stream arm measures two non-default transports. RE-SCOPE before this runs: include libp2p-stream as the reference arm, or explicitly justify its omission. Same iroh-worded staleness TASK-198 records for profile_p2p.py + iroh_throughput.rs. ALSO: the value-thesis answer (TASK-99: compression is the binding constraint, near-parity on constrained uplinks, LAN needs pipelining) means the tournament's axis shifted from transport-choice to compression-throughput+discovery — this task is rung-6 and correctly parked behind its large dep wall + the pipelining cornerstone (F1).
 <!-- SECTION:NOTES:END -->

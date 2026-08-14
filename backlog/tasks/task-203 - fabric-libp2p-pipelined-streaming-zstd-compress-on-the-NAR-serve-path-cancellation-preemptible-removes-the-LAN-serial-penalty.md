@@ -6,6 +6,7 @@ title: >-
 status: To Do
 assignee: []
 created_date: '2026-08-14 08:28'
+updated_date: '2026-08-14 08:51'
 labels:
   - wave-2c
   - libp2p
@@ -14,7 +15,7 @@ labels:
 dependencies:
   - TASK-99
   - TASK-157
-priority: medium
+priority: low
 ---
 
 ## Description
@@ -29,3 +30,9 @@ TASK-99 landed negotiated zstd link compression, but the serve side compresses t
 - [ ] #2 The fetch-side bounded streaming decode remains fail-closed with the same integrity/OOM/window bounds (bomb/corruption/truncation/trailing still rejected, memory still cap + one block + window)
 - [ ] #3 The LAN serial penalty is re-measured with pipelining ON: the net_lan verdict from TASK-99 (zstd-3 marginally loses under the serial whole-nar-compress model) is re-evaluated, or the honest 'raw on a fast LAN' fallback is documented
 <!-- AC:END -->
+
+## Implementation Notes
+
+<!-- SECTION:NOTES:BEGIN -->
+DEPRIORITIZED 2026-08-14 (owner steer): 'dont worry much about compression, ok to measure but dont lean into it — we want basics first like discovery and good robust connectivity. then we will consider CA chunking and compression later.' TASK-99 already MEASURED the compression thesis (near-parity on home uplinks, peers don't beat CDN). This task is a compression follow-on (speedup-restatement / pipelining / iroh-codec) — defer until the discovery + robust-connectivity trunk (TASK-103/151/191/194) is solid. Not next.
+<!-- SECTION:NOTES:END -->

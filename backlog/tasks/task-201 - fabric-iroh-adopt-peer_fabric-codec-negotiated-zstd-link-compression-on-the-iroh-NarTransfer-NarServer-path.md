@@ -6,10 +6,12 @@ title: >-
 status: To Do
 assignee: []
 created_date: '2026-08-14 07:14'
+updated_date: '2026-08-14 08:51'
 labels:
   - wave-2b
 dependencies:
   - TASK-99
+priority: low
 ---
 
 ## Description
@@ -24,3 +26,9 @@ TASK-99 landed the transport-agnostic peer-LINK compression codec in peer_fabric
 - [ ] #2 bounded streaming decode reused from peer_fabric::codec (bomb/corruption/truncation fail closed, bounded memory), proven by mutation on the iroh path
 - [ ] #3 content id unchanged by compression on the iroh path; golden vectors + independence stay green
 <!-- AC:END -->
+
+## Implementation Notes
+
+<!-- SECTION:NOTES:BEGIN -->
+DEPRIORITIZED 2026-08-14 (owner steer): 'dont worry much about compression, ok to measure but dont lean into it — we want basics first like discovery and good robust connectivity. then we will consider CA chunking and compression later.' TASK-99 already MEASURED the compression thesis (near-parity on home uplinks, peers don't beat CDN). This task is a compression follow-on (speedup-restatement / pipelining / iroh-codec) — defer until the discovery + robust-connectivity trunk (TASK-103/151/191/194) is solid. Not next.
+<!-- SECTION:NOTES:END -->
