@@ -1,0 +1,76 @@
+{
+  "ac9_discovery_kad_exclusive": {
+    "real_scan_clean": true,
+    "self_test_bites": true
+  },
+  "captured_scenarios": {
+    "scenarios": [
+      "s7-libp2p",
+      "s7-libp2p-miss"
+    ]
+  },
+  "checks": {
+    "fail": 0,
+    "ok": 16,
+    "per_scenario": {
+      "s7-libp2p": {
+        "fail": 0,
+        "ok": 11
+      },
+      "s7-libp2p-miss": {
+        "fail": 0,
+        "ok": 5
+      }
+    }
+  },
+  "no_injection": {
+    "consumer_lacks_provider_addr_flag": true,
+    "consumer_lacks_provider_peerid": true
+  },
+  "problems": [],
+  "rederived_from_raw": true,
+  "required_oracle_lines_present": 5,
+  "required_oracle_lines_total": 5,
+  "schema": "decentralized-content-discovery-v1",
+  "task": "TASK-103",
+  "timings": {
+    "ac9_guard_ms": 52,
+    "e2e_ms": 57324
+  },
+  "tree_manifest": {
+    "count": 6,
+    "files": [
+      {
+        "bytes": 86148,
+        "path": "daemon-libp2p/src/lib.rs",
+        "sha256": "5e56e426fa78c9288778dee022fc76557f9bc8a8b22f371acf5b543626311bf5"
+      },
+      {
+        "bytes": 143661,
+        "path": "daemon/src/main.rs",
+        "sha256": "89d74b0bb018be1ff5d86aa428ac325b6a05d50542d32019a11c01b5e0e1adef"
+      },
+      {
+        "bytes": 7014,
+        "path": "daemon/src/lib.rs",
+        "sha256": "e610e37cf401b9d280e5bbea9d379f42fe2150fc43a3026934b3b62e176316c3"
+      },
+      {
+        "bytes": 84906,
+        "path": "daemon-core/src/public_allowlist.rs",
+        "sha256": "6f39ba31df4f449a8a5d0c6cbc794d5f57fe35dbe1f885fae82507c7c8371f30"
+      },
+      {
+        "bytes": 217131,
+        "path": "scripts/e2e_harness.py",
+        "sha256": "36d6f9067f0d0eb1ae676b087708582b3b98217c1fdf364c09e4fabeb8d5bce7"
+      },
+      {
+        "bytes": 7114,
+        "path": "scripts/check-discovery-no-shortcut.py",
+        "sha256": "314897d36337e87e033f380f71db9db80488fdac5cb0c08df5bf34ae96ae62db"
+      }
+    ]
+  },
+  "verdict": "pass"
+}
