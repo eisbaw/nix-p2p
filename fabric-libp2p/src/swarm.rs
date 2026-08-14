@@ -11,7 +11,10 @@ use std::time::{Duration, Instant};
 use futures::StreamExt;
 use libp2p::kad::store::MemoryStore;
 use libp2p::swarm::SwarmEvent;
-use libp2p::{Multiaddr, PeerId, StreamProtocol, Swarm, identify, kad, noise, tcp, yamux};
+use libp2p::{
+    Multiaddr, PeerId, StreamProtocol, Swarm, autonat, dcutr, identify, kad, noise, relay, tcp,
+    yamux,
+};
 use libp2p_stream::{Control, IncomingStreams};
 use tokio::sync::{mpsc, oneshot};
 
@@ -99,15 +102,49 @@ pub fn absence_from_reach<T>(reach: QueryReach) -> Lookup<T> {
 /// The combined behaviour: Kademlia (the DHT content discovery) plus Identify (so peers
 /// learn each other's listen addresses and feed them into kad routing) plus the RAW-STREAM
 /// NAR protocol (TASK-157: the byte-transfer half as a libp2p-stream substrate, over the
-/// SAME swarm - replacing the TASK-151 request-response carrier so bytes flow as a stream).
+/// SAME swarm - replacing the TASK-151 request-response carrier so bytes flow as a stream)
+/// plus the NAT-traversal trio (TASK-168).
 ///
 /// `stream` carries no swarm events we act on (its `ToSwarm` is `()`); the byte transfer is
 /// driven entirely through a [`libp2p_stream::Control`] on tasks OFF this poll loop.
+///
+/// NAT TRAVERSAL (TASK-168) - `autonat` / `relay` / `relay_client` / `dcutr`. This is the
+/// LAST unproven half of "robust connectivity" (the PRD's risk 8: works in the harness,
+/// fails behind real NAT). All prior connectivity proofs used ROUTABLE addresses with zero
+/// NAT; these behaviours let a peer with NO public address still be dialed for a fetch:
+///
+///   * `autonat` - reachability detection: peers probe whether OUR advertised addresses are
+///     dialable from outside, so a node learns it is behind NAT (`NatStatus::Private`) and
+///     should seek a relay rather than advertise a dead direct address.
+///   * `relay_client` - circuit-v2 CLIENT: a NAT'd node listens on a relay's
+///     `/p2p-circuit` address, obtaining a reservation so others can reach it THROUGH the
+///     relay even though its direct address is undialable.
+///   * `dcutr` - Direct Connection Upgrade through Relay (hole punching): once two peers
+///     share a relayed connection, DCUtR coordinates a simultaneous-open to UPGRADE it to a
+///     DIRECT connection, so the relay carries only the coordination, not the NAR bytes.
+///     Relay is the FALLBACK when the hole punch fails (symmetric NAT).
+///   * `relay` - circuit-v2 SERVER: this node relays for OTHERS. Run UNCONDITIONALLY so any
+///     node that happens to be public automatically helps NAT'd peers with NO dedicated
+///     relay infrastructure (the decentralized property); a NAT'd node's own relay server is
+///     simply never reached. Default `relay::Config` caps reservations/circuits so an open
+///     relay is not an unbounded amplifier. (A deployment that wants to opt OUT of serving as
+///     a relay is a future `NodeConfig` knob - noted, not built, this cycle.)
+///
+/// CRITICAL (AC#9 / `check-discovery-no-shortcut.py`): these are DIAL-ASSISTANCE /
+/// CONNECTIVITY, NOT discovery substitutes. They help us CONNECT to a peer we ALREADY
+/// discovered via kad; none of them enumerates providers or tells us WHO holds content.
+/// Discovery stays kad-EXCLUSIVE; NAT traversal only changes HOW we dial an
+/// already-discovered peer. The guard permits this trio but keeps forbidding the real
+/// discovery substitutes (LAN-multicast / central-tracker / pubsub-flooding behaviours).
 #[derive(libp2p::swarm::NetworkBehaviour)]
 pub struct Behaviour {
     pub kad: kad::Behaviour<MemoryStore>,
     pub identify: identify::Behaviour,
     pub stream: libp2p_stream::Behaviour,
+    pub autonat: autonat::Behaviour,
+    pub relay: relay::Behaviour,
+    pub relay_client: relay::client::Behaviour,
+    pub dcutr: dcutr::Behaviour,
 }
 
 /// A command sent to the swarm worker. Each carries a oneshot the worker replies on
@@ -122,6 +159,16 @@ pub enum Command {
     },
     AddAddress {
         peer: PeerId,
+        addr: Multiaddr,
+    },
+    /// Advertise `addr` as an EXTERNALLY-reachable address of THIS node (TASK-168). A node
+    /// that knows a public address for itself (config, or a public relay/bootstrap) must
+    /// announce it so identify propagates it and the relay SERVER can hand it back in
+    /// reservation vouchers - without a confirmed external address a relay answers a
+    /// reservation with `NoAddressesInReservation` and the NAT'd client cannot build its
+    /// circuit listen address. On a NAT'd node the reachability verdict comes from autonat
+    /// instead; this is the explicit-knowledge path.
+    AddExternalAddress {
         addr: Multiaddr,
     },
     Dial {
@@ -218,6 +265,14 @@ impl SwarmHandle {
     /// Teach kad how to reach `peer` at `addr` (a bootstrap/entry peer).
     pub async fn add_address(&self, peer: PeerId, addr: Multiaddr) {
         self.send(Command::AddAddress { peer, addr }).await;
+    }
+
+    /// Advertise `addr` as an externally-reachable address of THIS node (TASK-168). Use it
+    /// on a node with a known-public address (a relay/bootstrap, or a config-supplied
+    /// address): identify propagates it and the relay SERVER can cite it in reservation
+    /// vouchers so NAT'd clients can build their circuit listen address.
+    pub async fn add_external_address(&self, addr: Multiaddr) {
+        self.send(Command::AddExternalAddress { addr }).await;
     }
 
     /// Dial `addr` (used to establish the initial connection to a bootstrap peer).
@@ -544,6 +599,11 @@ impl Worker {
                 // is the single source of truth for what is bound.
                 let _ = reply.send(self.swarm.listeners().cloned().collect());
             }
+            Command::AddExternalAddress { addr } => {
+                // Mark this address as an externally-reachable address of ours: identify
+                // advertises it and the relay server can cite it in reservation vouchers.
+                self.swarm.add_external_address(addr);
+            }
             Command::AddAddress { peer, addr } => {
                 self.swarm.behaviour_mut().kad.add_address(&peer, addr);
             }
@@ -661,6 +721,38 @@ impl Worker {
                 step,
                 ..
             })) => self.on_query(id, result, stats, step.last),
+            // NAT traversal (TASK-168): we do not DRIVE these from the poll loop (libp2p
+            // handles the probing/reservation/hole-punch state machines internally), but we
+            // LOG them (fail verbosely) so a "fails behind NAT" incident is diagnosable - the
+            // reachability verdict, the relay reservation, and each hole-punch outcome.
+            SwarmEvent::Behaviour(BehaviourEvent::Autonat(autonat::Event::StatusChanged {
+                old,
+                new,
+            })) => {
+                // The reachability verdict flipping to `Private` is the signal a node is behind
+                // NAT and must rely on a relay/hole-punch to be dialed - the load-bearing state.
+                tracing::info!(?old, ?new, "fabric-libp2p: autonat reachability changed");
+            }
+            SwarmEvent::Behaviour(BehaviourEvent::RelayClient(ev)) => {
+                // A reservation accepted / circuit established is how a NAT'd node becomes
+                // reachable through a relay; surface it at info so the harness can attribute it.
+                tracing::info!(?ev, "fabric-libp2p: relay client (circuit-v2)");
+            }
+            SwarmEvent::Behaviour(BehaviourEvent::Relay(ev)) => {
+                // This node acting AS a relay for others; debug (routine housekeeping).
+                tracing::debug!(?ev, "fabric-libp2p: relay server (circuit-v2)");
+            }
+            SwarmEvent::Behaviour(BehaviourEvent::Dcutr(ev)) => match &ev.result {
+                Ok(_) => tracing::info!(
+                    peer = %ev.remote_peer_id,
+                    "fabric-libp2p: dcutr hole-punch upgraded a relayed connection to DIRECT"
+                ),
+                Err(e) => tracing::warn!(
+                    peer = %ev.remote_peer_id,
+                    error = %e,
+                    "fabric-libp2p: dcutr hole-punch FAILED - staying on the relay circuit (fallback)"
+                ),
+            },
             // The stream behaviour emits no events we act on (its `ToSwarm` is `()`); the
             // NAR byte transfer is driven off this loop through the Control (TASK-157).
             _ => {}
@@ -905,8 +997,16 @@ impl Node {
             )
             .map_err(|e| NodeError::Build(e.to_string()))?
             .with_quic()
+            // NAT traversal (TASK-168): install the relay-client TRANSPORT so a `/p2p-circuit`
+            // listen/dial actually routes through a relay. The builder hands the constructed
+            // `relay::client::Behaviour` to the behaviour closure below so the transport and the
+            // behaviour stay in lock-step (the one place the client behaviour can be built).
+            .with_relay_client(noise::Config::new, yamux::Config::default)
+            .map_err(|e| NodeError::Build(e.to_string()))?
             .with_behaviour(
-                |key| -> Result<Behaviour, Box<dyn std::error::Error + Send + Sync>> {
+                |key,
+                 relay_client|
+                 -> Result<Behaviour, Box<dyn std::error::Error + Send + Sync>> {
                     let peer_id = key.public().to_peer_id();
                     let store = MemoryStore::new(peer_id);
                     let mut kad_config = kad::Config::new(kad_protocol);
@@ -923,10 +1023,23 @@ impl Node {
                     // protocol-agnostic here; the concrete `/nar/3` name is registered on the
                     // accept side below.
                     let stream = libp2p_stream::Behaviour::new();
+                    // NAT traversal (TASK-168). See the `Behaviour` doc for the role of each.
+                    // `autonat` needs identify's observed-address signal (present above) to know
+                    // which of OUR addresses to probe. `relay` (server) runs unconditionally with
+                    // default caps so any public node helps NAT'd peers with no dedicated infra.
+                    // `dcutr` upgrades a relayed connection to a direct one (hole punch); relay is
+                    // the fallback. `relay_client` is the builder-constructed circuit-v2 client.
+                    let autonat = autonat::Behaviour::new(peer_id, autonat::Config::default());
+                    let relay = relay::Behaviour::new(peer_id, relay::Config::default());
+                    let dcutr = dcutr::Behaviour::new(peer_id);
                     Ok(Behaviour {
                         kad,
                         identify,
                         stream,
+                        autonat,
+                        relay,
+                        relay_client,
+                        dcutr,
                     })
                 },
             )

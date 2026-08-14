@@ -27,6 +27,14 @@ proc-supervisor = { path = "../proc-supervisor" }
 # each other's listen addrs for kad routing), request-response (the record/transfer
 # carrier, wired in TASK-151), tokio+macros (the runtime + NetworkBehaviour derive),
 # noise (auth) + yamux (mux over tcp).
+#
+# NAT traversal (TASK-168): autonat (reachability detection - am I publicly dialable?),
+# dcutr (DCUtR direct-connection-upgrade-through-relay hole punching), relay (circuit-v2
+# - this node as a relay CLIENT so a NAT'd peer stays reachable via a relay, AND as a
+# relay SERVER so any public node helps NAT'd peers with no dedicated infrastructure).
+# These are DIAL-ASSISTANCE, not discovery: they change HOW we reach a peer already
+# discovered via kad, never HOW we find who holds content (see
+# scripts/check-discovery-no-shortcut.py rationale).
 libp2p = { version = "0.54", default-features = false, features = [
     "kad",
     "tcp",
@@ -37,6 +45,9 @@ libp2p = { version = "0.54", default-features = false, features = [
     "macros",
     "noise",
     "yamux",
+    "autonat",
+    "dcutr",
+    "relay",
 ] }
 # libp2p-stream (TASK-157): the RAW-STREAM NAR transfer (AsyncRead/AsyncWrite per
 # call) that REPLACES the request-response NAR carrier. The libp2p 0.54 meta-crate

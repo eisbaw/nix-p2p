@@ -6,9 +6,22 @@ consumer can reach the provider ONLY through the libp2p-kad DHT. If the shipped
 node also ran a LAN/broadcast or central-tracker discovery behaviour, a
 "discovered" peer could have been found by that shortcut instead - and the
 proof's attribution (0 upstream egress => DHT-mediated peer serve) would be a
-lie. So the node's `NetworkBehaviour` composition must contain kad + identify
-ONLY: no mDNS (LAN multicast), no rendezvous (a central meeting-point tracker),
-no gossipsub/floodsub (pubsub flooding), no autonat.
+lie. So the node's `NetworkBehaviour` composition must run NO peer-DISCOVERY
+substitute: no mDNS (LAN multicast), no rendezvous (a central meeting-point
+tracker), no gossipsub/floodsub (pubsub flooding).
+
+DISCOVERY vs DIAL-ASSISTANCE (TASK-168). The NAT-traversal trio - autonat
+(reachability detection), dcutr (hole punching), relay (circuit-v2 client+server)
+- is EXPLICITLY PERMITTED. These are dial-assistance / CONNECTIVITY, not discovery:
+they change HOW you REACH a peer you have ALREADY discovered via kad, never HOW you
+find WHO holds content. None of them enumerates providers, floods content
+announcements, or offers a non-kad route to LEARN of a peer - autonat only tells YOU
+whether YOUR OWN address is dialable, relay carries bytes to an
+already-known-PeerId destination, dcutr upgrades an existing relayed connection to a
+direct one. Discovery stays kad-EXCLUSIVE; the no-injection oracle (0 upstream
+egress => DHT-mediated serve) is undisturbed because the consumer still LEARNS of the
+provider only through kad. So the guard forbids the discovery substitutes below and
+PERMITS the dial-assistance trio (asserted by the second self-test arm).
 
 This is the SOURCE half of AC#9 (the runtime half is s7-libp2p's no-injection
 oracle: the consumer's REAL container argv carries no `--libp2p-provider-addr`
@@ -49,17 +62,27 @@ DISCOVERY_ROOTS = ("fabric-libp2p/src", "daemon-libp2p/src")
 
 SKIP_DIRS = {".git", "target", "result", "fixtures", "backlog", ".direnv", "tests"}
 
-# libp2p discovery behaviours that would give a node a NON-kad route to a peer -
-# each a "tracker / LAN / broadcast substitute" AC#9 forbids. Kept as the libp2p
-# module tokens (not bare English words like "broadcast", which appears in an
+# libp2p peer-DISCOVERY behaviours that would give a node a NON-kad route to LEARN
+# OF a peer - each a "tracker / LAN / broadcast substitute" AC#9 forbids. Kept as the
+# libp2p module tokens (not bare English words like "broadcast", which appears in an
 # unrelated comment) so the scan does not false-positive on prose.
+#
+# NOTE (TASK-168): `autonat` was REMOVED from this set. It was originally forbidden as
+# "address-discovery signalling outside the kad proof", but autonat discovers only
+# whether OUR OWN address is publicly dialable - it never discovers OTHER peers or
+# content, so it is dial-assistance, not a discovery substitute (see the module
+# docstring). dcutr/relay were never forbidden and stay permitted for the same reason.
 FORBIDDEN = {
     "mdns": "mDNS is LAN multicast peer discovery - a non-kad shortcut",
     "rendezvous": "rendezvous is a central meeting-point tracker - a non-kad shortcut",
     "gossipsub": "gossipsub is pubsub flooding - a non-kad discovery/broadcast path",
     "floodsub": "floodsub is pubsub flooding - a non-kad discovery/broadcast path",
-    "autonat": "autonat is address-discovery signalling outside the kad proof",
 }
+
+# The NAT-traversal trio explicitly PERMITTED (TASK-168): dial-assistance, not
+# discovery. Documented here so a future reader sees the boundary is deliberate, and
+# asserted by the second self-test arm (a composition adding these must NOT trip).
+PERMITTED_DIAL_ASSISTANCE = ("autonat", "dcutr", "relay")
 
 
 def scan(roots: list[Path]) -> tuple[list[str], int]:
@@ -104,6 +127,30 @@ def self_test() -> int:
                 file=sys.stderr,
             )
             return 1
+        # A composition carrying the PERMITTED NAT-traversal trio (TASK-168) must NOT
+        # trip: dial-assistance is not a discovery substitute. This arm proves the guard
+        # still PASSES the exact behaviours the shipped node now runs, so a green scan is
+        # meaningful (the guard did not merely stop scanning).
+        (root / "dial_assistance.rs").write_text(
+            "pub struct Behaviour {\n"
+            "    pub kad: kad::Behaviour<MemoryStore>,\n"
+            "    pub identify: identify::Behaviour,\n"
+            "    pub autonat: autonat::Behaviour,\n"
+            "    pub relay: relay::Behaviour,\n"
+            "    pub relay_client: relay::client::Behaviour,\n"
+            "    pub dcutr: dcutr::Behaviour,\n"
+            "}\n"
+        )
+        permitted_violations, _ = scan([Path(tmp) / "fabric-libp2p" / "src"])
+        if permitted_violations:
+            print(
+                "self-test FAILED: the permitted NAT-traversal trio "
+                f"({', '.join(PERMITTED_DIAL_ASSISTANCE)}) was flagged as a discovery "
+                f"substitute ({permitted_violations}) - dial-assistance must be allowed",
+                file=sys.stderr,
+            )
+            return 1
+        (root / "dial_assistance.rs").unlink()
         # The MUTATION: re-enable a LAN discovery substitute. The guard MUST bite.
         (root / "mutated.rs").write_text(
             "pub struct Behaviour {\n"
@@ -121,8 +168,9 @@ def self_test() -> int:
             )
             return 1
         print(
-            "check-discovery-no-shortcut: self-test OK - clean composition passes, "
-            "adding mdns::Behaviour BITES (AC#9 mutation caught)"
+            "check-discovery-no-shortcut: self-test OK - clean composition passes, the "
+            "permitted NAT-traversal trio (autonat/dcutr/relay) is ALLOWED, and adding "
+            "mdns::Behaviour BITES (AC#9 mutation caught)"
         )
         return 0
 
@@ -155,7 +203,8 @@ def main(argv: list[str]) -> int:
         return 1
     print(
         f"check-discovery-no-shortcut: OK - {scanned} shipped discovery source file(s) "
-        "scanned; kad-exclusive (no mdns/rendezvous/gossipsub/floodsub/autonat)"
+        "scanned; discovery is kad-EXCLUSIVE (no mdns/rendezvous/gossipsub/floodsub); "
+        "the NAT-traversal trio (autonat/dcutr/relay) is permitted dial-assistance"
     )
     return 0
 

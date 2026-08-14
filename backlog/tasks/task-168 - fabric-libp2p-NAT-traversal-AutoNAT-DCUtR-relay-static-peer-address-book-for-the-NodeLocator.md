@@ -3,10 +3,10 @@ id: TASK-168
 title: >-
   fabric-libp2p: NAT traversal (AutoNAT/DCUtR/relay) + static peer address book
   for the NodeLocator
-status: To Do
+status: In Progress
 assignee: []
 created_date: '2026-08-12 14:28'
-updated_date: '2026-08-14 16:46'
+updated_date: '2026-08-14 16:59'
 labels:
   - libp2p
   - fabric
