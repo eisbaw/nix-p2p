@@ -1159,7 +1159,8 @@ impl fmt::Debug for PublicNarAllowlist {
 mod tests {
     use super::*;
 
-    // The committed fixture public key (fixtures/out/generations/.../test-key.pub) and a
+    // The committed fixture public key (the generation's test-key.pub, under the gitignored
+    // generated fixture tree) and a
     // REAL signed narinfo from that generation (the `app` path, which has a NON-EMPTY
     // References field - so it exercises the reference part of the fingerprint that an
     // empty-reference path cannot). If the fingerprint reconstruction were wrong, this
