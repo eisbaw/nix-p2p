@@ -32,17 +32,24 @@
 //!     [`crate::QueryReach`] for the honest limit of the `Miss` direction: reaching this
 //!     node's REACHABLE subgraph is not proof of reaching the target's global custodians
 //!     (an inherent single-node-view partition/eclipse residue).
-//!   * [`ResolutionPolicy::ExplicitPeersOnly`] - consult ONLY a statically configured peer
-//!     address book, disclosing nothing. This backend has no such book yet, so an
-//!     explicit-peers-only resolution has no source to answer from and returns
-//!     [`Lookup::Miss`] with zero disclosure (matching `declared_exposure` = none for that
-//!     policy). Wiring a real static address book is TASK-168 (dep TASK-159); it is NOT a
-//!     fabricated result - a node given no explicit peers genuinely knows no address.
+//!   * [`ResolutionPolicy::ExplicitPeersOnly`] - consult ONLY the statically configured peer
+//!     address book ([`NodeConfig::peer_address_book`](crate::NodeConfig::peer_address_book),
+//!     TASK-168 AC#2), disclosing NOTHING. This is a pure LOCAL map lookup:
+//!     [`locate`](Libp2pNodeLocator::locate) makes NO network query, opens NO connection,
+//!     and records NO ledger disclosure on this path. A [`NodeId`] present in the book
+//!     resolves [`Lookup::Found`] with its configured Multiaddr strings; an absent one is an
+//!     honest [`Lookup::Miss`] (a node given no explicit peer for that identity genuinely
+//!     knows no address - never a fabricated result). The ZERO-DISCLOSURE property is
+//!     load-bearing: it is the whole reason the explicit policy exists, and it holds because
+//!     the answer comes from local config, not from asking a third party. Contrast
+//!     `locate_via_dht` above, which DOES disclose (OUR identity, and the queried NodeId) to
+//!     the DHT nodes it contacts.
 //!
-//! NAT traversal (AutoNAT/DCUtR/relay) for residential peers with no public address, and
-//! the static address book above, are TASK-168: this locator is the AC#1 cornerstone
-//! (decentralized RESOLUTION on the test network), not the AC#2 NAT story.
+//! NAT traversal (AutoNAT/DCUtR/relay) for residential peers with no public address is
+//! TASK-168 AC#1: this locator is the AC#1-RESOLUTION cornerstone (decentralized RESOLUTION
+//! on the test network) plus the AC#2 static address book, not the AC#1 NAT-hole-punch story.
 
+use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -55,17 +62,54 @@ use peer_fabric::{
 use crate::keys::peer_id_of_provider;
 use crate::swarm::{QueryFail, SwarmHandle, absence_from_reach};
 
-/// The kad-backed [`NodeLocator`]. Holds a [`SwarmHandle`] to drive peer-routing and the
-/// shared [`ExposureLedger`] every capability appends to.
+/// The kad-backed [`NodeLocator`]. Holds a [`SwarmHandle`] to drive peer-routing, the
+/// shared [`ExposureLedger`] every capability appends to, and the statically-configured
+/// peer address book consulted (LOCALLY, disclosing nothing) under
+/// [`ResolutionPolicy::ExplicitPeersOnly`].
 pub struct Libp2pNodeLocator {
     handle: SwarmHandle,
     ledger: Arc<ExposureLedger>,
+    /// The static peer address book (TASK-168 AC#2): a provider's [`NodeId`] -> its dialable
+    /// location strings (opaque above the seam; libp2p Multiaddr strings here, the same shape
+    /// `locate_via_dht` yields). Consulted ONLY on the [`ResolutionPolicy::ExplicitPeersOnly`]
+    /// path as a pure local lookup - no network query, no ledger disclosure. Empty for a node
+    /// configured with no explicit peers.
+    peer_address_book: BTreeMap<NodeId, Vec<String>>,
 }
 
 impl Libp2pNodeLocator {
-    /// A locator driving `handle`, recording disclosures to `ledger`.
-    pub fn new(handle: SwarmHandle, ledger: Arc<ExposureLedger>) -> Self {
-        Libp2pNodeLocator { handle, ledger }
+    /// A locator driving `handle`, recording disclosures to `ledger`, and answering
+    /// [`ResolutionPolicy::ExplicitPeersOnly`] from the static `peer_address_book` (a
+    /// provider [`NodeId`] -> its dialable location strings). Pass an empty map for a node
+    /// with no explicit peers.
+    pub fn new(
+        handle: SwarmHandle,
+        ledger: Arc<ExposureLedger>,
+        peer_address_book: BTreeMap<NodeId, Vec<String>>,
+    ) -> Self {
+        Libp2pNodeLocator {
+            handle,
+            ledger,
+            peer_address_book,
+        }
+    }
+
+    /// The [`ResolutionPolicy::ExplicitPeersOnly`] resolution: a pure LOCAL lookup in the
+    /// statically-configured address book. It makes NO network query, opens NO connection,
+    /// and records NO ledger disclosure - the load-bearing ZERO-DISCLOSURE property that
+    /// distinguishes the explicit policy from `locate_via_dht` (which reveals our identity,
+    /// and the queried NodeId, to the DHT nodes it contacts). A configured `node` yields
+    /// [`Lookup::Found`] with its book addresses; an unconfigured one is an honest
+    /// [`Lookup::Miss`] (no explicit peer -> genuinely no address, never a fabricated one).
+    fn locate_via_book(&self, node: &NodeId) -> Lookup<DialInfo> {
+        match self.peer_address_book.get(node) {
+            Some(locations) if !locations.is_empty() => {
+                Lookup::Found(DialInfo::new(locations.iter().cloned()))
+            }
+            // Absent (or a book entry that somehow carries no address) is a healthy Miss: the
+            // explicit policy consults nothing else, so there is no fallback and no disclosure.
+            _ => Lookup::Miss,
+        }
     }
 
     /// The active kad peer-routing resolution (PublicInfrastructure). Kept separate so the
@@ -114,24 +158,27 @@ impl Libp2pNodeLocator {
 #[async_trait]
 impl NodeLocator for Libp2pNodeLocator {
     async fn locate(&self, node: &NodeId, policy: &ResolutionPolicy) -> Lookup<DialInfo> {
-        // The provider identity IS an ed25519 verifying key; derive the libp2p PeerId it
-        // MUST correspond to. A non-point key can never be dialed over libp2p - fail it as
-        // could-not-consult (a malformed target, not a healthy absence).
-        let peer = match peer_id_of_provider(node) {
-            Some(peer) => peer,
-            None => {
-                return Lookup::Unavailable(Unavailable::Backend(format!(
-                    "node {node} is not a valid ed25519 peer id; cannot resolve over libp2p"
-                )));
-            }
-        };
-
         match policy {
-            // No third party is consulted, so nothing is disclosed. This backend has no
-            // statically-configured peer address book yet (TASK-168), so there is no source
-            // to answer from: a genuine Miss, never a fabricated address.
-            ResolutionPolicy::ExplicitPeersOnly => Lookup::Miss,
-            ResolutionPolicy::PublicInfrastructure => self.locate_via_dht(peer).await,
+            // A pure LOCAL address-book lookup: no third party is consulted, so NOTHING is
+            // disclosed (no kad query, no dial, no ledger record). TASK-168 AC#2. We do NOT
+            // derive/validate the PeerId here: this path never dials, and a NodeId that is
+            // not in the book is simply an honest Miss (a malformed key can never match a
+            // book entry either way, so it lands on the same zero-disclosure Miss).
+            ResolutionPolicy::ExplicitPeersOnly => self.locate_via_book(node),
+            ResolutionPolicy::PublicInfrastructure => {
+                // The provider identity IS an ed25519 verifying key; derive the libp2p PeerId
+                // it MUST correspond to. A non-point key can never be dialed over libp2p -
+                // fail it as could-not-consult (a malformed target, not a healthy absence).
+                let peer = match peer_id_of_provider(node) {
+                    Some(peer) => peer,
+                    None => {
+                        return Lookup::Unavailable(Unavailable::Backend(format!(
+                            "node {node} is not a valid ed25519 peer id; cannot resolve over libp2p"
+                        )));
+                    }
+                };
+                self.locate_via_dht(peer).await
+            }
         }
     }
 

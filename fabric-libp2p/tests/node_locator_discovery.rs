@@ -23,9 +23,9 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use ed25519_dalek::SigningKey;
 use fabric_libp2p::{Libp2pFabric, Libp2pNarSupplier, MemoryNarSupplier, Multiaddr, NodeConfig};
 use peer_fabric::{
-    AnnounceBudget, Blake3Digest, ContentKey, DiscoveryBudget, Lookup, NodeId, PeerFabric,
-    ProviderRecord, ResolutionPolicy, SafetyEnvelope, ServeBudget, TransportOffer, TransportTag,
-    Unavailable, sign_provider_record,
+    AnnounceBudget, Blake3Digest, ContentKey, DialInfo, DiscoveryBudget, Lookup, NodeId,
+    PeerFabric, ProviderRecord, ResolutionPolicy, SafetyEnvelope, ServeBudget, TransportOffer,
+    TransportTag, Unavailable, sign_provider_record,
 };
 
 /// Bring up a serving fabric (a supplier makes it a provider) listening on an ephemeral
@@ -307,5 +307,105 @@ async fn node_locator_resolves_dial_address_via_kad_and_fetches_without_injectio
         resolver.exposure_ledger().len(),
         after_public,
         "ExplicitPeersOnly must disclose nothing (no new ledger entries)"
+    );
+}
+
+/// TASK-168 AC#2 acceptance: `ExplicitPeersOnly` resolves from a statically-configured peer
+/// address book with ZERO third-party disclosure - a pure LOCAL lookup that makes NO network
+/// query.
+///
+/// The oracle is a single node with an EMPTY routing table and NO peers/bootstrap: it is not
+/// on any DHT. On such a node the kad (`PublicInfrastructure`) path CANNOT resolve - it
+/// short-circuits to `Unavailable(InsufficientRouting)` because a peer-routing walk over an
+/// empty table is not authoritative. So the fact that `ExplicitPeersOnly` still returns
+/// `Found` for a book-configured peer PROVES the answer came from the local book, not from
+/// the network. Two further bites: an unconfigured peer is a `Miss` (no fabricated address),
+/// and the exposure ledger stays at ZERO across every explicit resolution (no disclosure -
+/// the load-bearing property that separates this policy from the kad path, which records an
+/// `OurNodeId -> DhtNode` disclosure on every consult).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn explicit_peers_only_resolves_from_static_book_with_zero_disclosure() {
+    let _ = tracing_subscriber::fmt::try_init();
+    let scope = "explicit-peers-static-book";
+
+    // The peer whose address we STATICALLY configure. Its NodeId is a real ed25519 verifying
+    // key (a dialable identity), distinct from this node's own identity.
+    let configured_peer = {
+        let sk = SigningKey::from_bytes(&[0x21u8; 32]);
+        NodeId::from_bytes(sk.verifying_key().to_bytes())
+    };
+    let book_addr: Multiaddr = "/ip4/127.0.0.1/tcp/45999".parse().unwrap();
+
+    // A peer we do NOT configure - its explicit resolution must Miss.
+    let unconfigured_peer = {
+        let sk = SigningKey::from_bytes(&[0x22u8; 32]);
+        NodeId::from_bytes(sk.verifying_key().to_bytes())
+    };
+
+    // A single node holding the static book. It is NEVER joined to any network: no bootstrap,
+    // no dial, no listen - so its kad routing table is empty. We do NOT even call listen().
+    let node = Libp2pFabric::start(
+        NodeConfig::new([0x20u8; 32])
+            .with_network_scope(scope)
+            .with_explicit_peer(configured_peer, [book_addr.clone()]),
+    )
+    .expect("swarm builds");
+
+    // PRECONDITION for the oracle: the node is genuinely off any DHT (empty routing table).
+    assert_eq!(
+        node.handle().routing_peers().await,
+        0,
+        "the node must have an EMPTY routing table so a kad resolve genuinely cannot answer - \
+         only then does an ExplicitPeersOnly Found prove the book (not the DHT) produced it"
+    );
+
+    let locator = node.node_locator().expect("locator present");
+
+    // ---- ZERO-DISCLOSURE baseline: nothing disclosed yet ----
+    let ledger_before = node.exposure_ledger().len();
+
+    // ---- FOUND arm: the book-configured peer resolves from the LOCAL book ----
+    let found = locator
+        .locate(&configured_peer, &ResolutionPolicy::ExplicitPeersOnly)
+        .await;
+    assert_eq!(
+        found,
+        Lookup::Found(DialInfo::new([book_addr.to_string()])),
+        "ExplicitPeersOnly must resolve a book-configured peer to its configured address"
+    );
+
+    // ---- PROOF IT WAS NOT THE DHT: the SAME node, SAME peer, under PublicInfrastructure
+    // cannot resolve at all (empty routing table). If the Found above had gone through kad it
+    // would be Unavailable here too. The book path is independent of the network. ----
+    let via_dht = locator
+        .locate(&configured_peer, &ResolutionPolicy::PublicInfrastructure)
+        .await;
+    assert!(
+        matches!(
+            via_dht,
+            Lookup::Unavailable(Unavailable::InsufficientRouting)
+        ),
+        "on an off-network node the kad path must be Unavailable(InsufficientRouting), \
+         proving the ExplicitPeersOnly Found came from the local book, got {via_dht:?}"
+    );
+
+    // ---- MISS arm: an unconfigured peer has no book entry -> honest Miss (no fabrication) ----
+    let miss = locator
+        .locate(&unconfigured_peer, &ResolutionPolicy::ExplicitPeersOnly)
+        .await;
+    assert!(
+        matches!(miss, Lookup::Miss),
+        "ExplicitPeersOnly for an unconfigured peer must Miss, got {miss:?}"
+    );
+
+    // ---- ZERO-DISCLOSURE oracle: NOT ONE explicit resolution touched the ledger. Contrast
+    // the PublicInfrastructure consult, which - had it reached the network - would record an
+    // OurNodeId disclosure. The InsufficientRouting short-circuit above also records nothing
+    // (it never touched the DHT), so the ledger must be exactly unchanged. ----
+    assert_eq!(
+        node.exposure_ledger().len(),
+        ledger_before,
+        "ExplicitPeersOnly resolution (Found or Miss) must disclose NOTHING - a static-book \
+         lookup makes no network query and records no exposure"
     );
 }

@@ -117,7 +117,7 @@ impl Libp2pFabric {
     }
 
     fn assemble(
-        config: NodeConfig,
+        mut config: NodeConfig,
         supplier: Option<Arc<dyn Libp2pNarSupplier>>,
         state_dir: Option<PathBuf>,
     ) -> Result<Libp2pFabric, NodeError> {
@@ -125,6 +125,16 @@ impl Libp2pFabric {
         // BEFORE `Node::start` consumes `config`, so the announcer can sign its own
         // withdrawal tombstones (TASK-152, AC#1) with the same key `node_id` derives from.
         let signing_key = ed25519_dalek::SigningKey::from_bytes(&config.identity_seed);
+        // The static peer address book (TASK-168 AC#2) is a pure LOCATOR concern - a local
+        // lookup consulted under ExplicitPeersOnly - so it NEVER enters the swarm. Take it
+        // out of `config` BEFORE `Node::start` consumes it, and flatten each Multiaddr to
+        // the opaque location string the seam's `DialInfo` carries (the same shape the kad
+        // path yields via `Multiaddr::to_string`; the fetch transport reparses it).
+        let peer_address_book: std::collections::BTreeMap<NodeId, Vec<String>> =
+            std::mem::take(&mut config.peer_address_book)
+                .into_iter()
+                .map(|(node, addrs)| (node, addrs.iter().map(|a| a.to_string()).collect()))
+                .collect();
         let node = Node::start(config)?;
         let ledger = Arc::new(ExposureLedger::new());
 
@@ -165,7 +175,11 @@ impl Libp2pFabric {
         // off this SAME locator (so the resolve-then-dial lives inside the fabric, and its
         // OurNodeId->DhtNode disclosure lands on the fabric's single `ledger`), and the
         // `node_locator()` axis (TASK-159, gate-able + unit-tested) exposes it too.
-        let node_locator = Arc::new(Libp2pNodeLocator::new(node.handle.clone(), ledger.clone()));
+        let node_locator = Arc::new(Libp2pNodeLocator::new(
+            node.handle.clone(),
+            ledger.clone(),
+            peer_address_book,
+        ));
 
         // The fetch transport is always available (a consumer needs it); it registers
         // under the NodeId-locator tag (see transport.rs ADR). It resolves the provider's

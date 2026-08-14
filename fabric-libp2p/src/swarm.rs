@@ -4,7 +4,7 @@
 //! is the standard rust-libp2p driver shape; it keeps the async capability traits free
 //! of the swarm's single-threaded ownership.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -1048,6 +1048,18 @@ pub struct NodeConfig {
     /// still USE relays to be reached. When enabled, the server's caps come from
     /// [`relay_server_config`] (explicit bounds, never the library default). (TASK-208.)
     pub relay_server_enabled: bool,
+    /// The statically-configured peer address book consulted LOCALLY under
+    /// [`ResolutionPolicy::ExplicitPeersOnly`](peer_fabric::ResolutionPolicy::ExplicitPeersOnly)
+    /// (TASK-168 AC#2). Maps a provider's ed25519 [`NodeId`] to the [`Multiaddr`]es it is
+    /// dialable at. Resolving one of these peers is a pure LOCAL map lookup: it makes NO
+    /// network query and discloses NOTHING to any third party (contrast the kad
+    /// peer-routing path, which reveals OUR identity - and the queried NodeId - to the DHT
+    /// nodes it contacts). That zero-disclosure property is the whole point of the explicit
+    /// policy. Empty by default (a node given no explicit peers genuinely knows no address,
+    /// so an explicit-peers resolution is an honest [`Lookup::Miss`], never a fabricated
+    /// address). This book is a pure LOCATOR concern: it never enters the swarm and does
+    /// not affect discovery, dialing, or the kad routing table.
+    pub peer_address_book: BTreeMap<NodeId, Vec<Multiaddr>>,
 }
 
 impl NodeConfig {
@@ -1059,6 +1071,7 @@ impl NodeConfig {
             network_scope: "v1".to_string(),
             kad_query_timeout: DEFAULT_KAD_QUERY_TIMEOUT,
             relay_server_enabled: DEFAULT_RELAY_SERVER_ENABLED,
+            peer_address_book: BTreeMap::new(),
         }
     }
 
@@ -1080,6 +1093,24 @@ impl NodeConfig {
     /// opt OUT of relaying while still USING relays (see [`NodeConfig::relay_server_enabled`]).
     pub fn with_relay_server(mut self, enabled: bool) -> Self {
         self.relay_server_enabled = enabled;
+        self
+    }
+
+    /// Register a provider `node`'s dial `addrs` in the static peer address book consulted
+    /// under [`ResolutionPolicy::ExplicitPeersOnly`](peer_fabric::ResolutionPolicy::ExplicitPeersOnly)
+    /// (TASK-168 AC#2, builder style). Repeated calls for the SAME `node` APPEND (a peer may
+    /// be dialable at several addresses); pass every address you know. Resolving a
+    /// so-configured peer is a pure LOCAL lookup that discloses nothing to any third party.
+    /// See [`NodeConfig::peer_address_book`].
+    pub fn with_explicit_peer(
+        mut self,
+        node: NodeId,
+        addrs: impl IntoIterator<Item = Multiaddr>,
+    ) -> Self {
+        self.peer_address_book
+            .entry(node)
+            .or_default()
+            .extend(addrs);
         self
     }
 }

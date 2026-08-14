@@ -6,7 +6,7 @@ title: >-
 status: In Progress
 assignee: []
 created_date: '2026-08-12 14:28'
-updated_date: '2026-08-14 17:23'
+updated_date: '2026-08-14 19:54'
 labels:
   - libp2p
   - fabric
@@ -26,7 +26,7 @@ Follow-up to TASK-159 AC#1 (which decentralized address RESOLUTION via kad peer-
 ## Acceptance Criteria
 <!-- AC:BEGIN -->
 - [ ] #1 AutoNAT/DCUtR/relay let a NAT'd peer be dialed for a fetch, proven by a test against a real or containerized-NAT network (not loopback)
-- [ ] #2 ExplicitPeersOnly resolves from a statically-configured peer address book with zero third-party disclosure
+- [x] #2 ExplicitPeersOnly resolves from a statically-configured peer address book with zero third-party disclosure
 - [ ] #3 The queried-NodeId disclosure a peer-routing lookup incurs is represented in the exposure ledger (frozen Disclosed extension, wire-reviewed)
 <!-- AC:END -->
 
@@ -51,4 +51,22 @@ DEFERRED this cycle (not touched):
 - AC#3 (extend the FROZEN peer_fabric::Disclosed enum for the queried-NodeId disclosure): FROZEN-SEAM change needing wire review - deliberately not touched this cycle.
 
 AC#1 CODE LANDED + orchestrator-verified 2026-08-14 (commits e2dcbac code, e364b93 notes). Wired autonat + relay(server, unconditional) + relay_client + dcutr onto the swarm (kad+identify+stream unchanged); added SwarmHandle::add_external_address (root-caused a NoAddressesInReservation bug). PROVEN LOAD-BEARING at the relay data path (nat_traversal.rs: a provider on a relay /p2p-circuit ONLY, no direct addr, is fetched byte-identical THROUGH the relay). AC#9 guard updated (trio = dial-assistance permitted; mdns still bites; discovery kad-exclusive). NO regression. REMAINS PARTIAL: the real-NAT proof (DCUtR hole-punch + the disable-relay/dcutr->undiallable->upstream-fallback minimal-pair) is BLOCKED on this box (rootless podman /proc/sys RO -> no ip_forward; no sudo) -> TASK-207 (HIGH). AC#2 (ExplicitPeersOnly static address book) + AC#3 (frozen Disclosed extension, wire-reviewed) DEFERRED. Follow-up filed: relay-server resource bounds/opt-out. 168 stays In Progress until 207's real-NAT proof backs the cornerstone claim.
+
+--- 2026-08-14 cycle (AC#2 static peer address book LANDED) ---
+
+DONE (AC#2): ExplicitPeersOnly now resolves from a statically-configured peer address book with ZERO third-party disclosure. Root: fabric-libp2p/src/locator.rs previously hard-returned Lookup::Miss for ExplicitPeersOnly (no book existed). Added:
+- NodeConfig::peer_address_book: BTreeMap<NodeId, Vec<Multiaddr>> + builder with_explicit_peer(node, addrs) (swarm.rs). A pure LOCATOR concern: taken out of config in fabric.rs::assemble BEFORE Node::start consumes it, flattened to opaque DialInfo location strings (Multiaddr::to_string, same shape the kad path yields), and handed to Libp2pNodeLocator::new. It NEVER enters the swarm and does not affect discovery/dialing/the kad routing table.
+- Libp2pNodeLocator holds the book; new locate_via_book(node) is a pure LOCAL map lookup: Found(configured addrs) or honest Miss. Restructured locate(): the PeerId derivation (peer_id_of_provider) moved INTO the PublicInfrastructure arm only; the ExplicitPeersOnly arm never derives/dials.
+
+ZERO-DISCLOSURE PROOF (the load-bearing property): tests/node_locator_discovery.rs::explicit_peers_only_resolves_from_static_book_with_zero_disclosure. A single node with an EMPTY routing table (routing_peers()==0, never joined/bootstrapped) asserted: (1) ExplicitPeersOnly(configured) -> Found(book addr); (2) the SAME node SAME peer under PublicInfrastructure -> Unavailable(InsufficientRouting) - the kad path genuinely cannot answer off-network, so the Found in (1) MUST have come from the local book, not the DHT; (3) ExplicitPeersOnly(unconfigured) -> Miss (no fabrication); (4) exposure_ledger().len() UNCHANGED across every explicit resolve (no network query, no disclosure). Oracle bites: a book that returned Miss fails (1); a book path that recorded to the ledger fails (4).
+
+AC#3 Disclosed extension: NOT needed for AC#2, as predicted. A local-book lookup discloses nothing, so it fits the EXISTING exposure model with NO ledger record at all (the frozen Disclosed enum is untouched). AC#3 (queried-NodeId disclosure on the kad path) remains a separate frozen-seam wire-review change.
+
+kad resolve path (159) + discovery: UNCHANGED and green. locate_via_dht untouched; the existing 159 acceptance test (Found via DHT / Miss / Unavailable arms + fetch) still passes, and its ExplicitPeersOnly-with-no-book-Miss assertion still holds (default book is empty).
+
+NOT DONE THIS CYCLE (honest scope): the implementation-note convergence of the --libp2p-provider-addr shim INTO ExplicitPeersOnly (feed CLI peers to the book; make the transport consult ExplicitPeersOnly; remove the add_address injection loop in daemon/src/source_libp2p.rs) is a larger daemon+transport change and was deliberately NOT attempted here to keep AC#2 surgical (no risk to the kad path). The book seam is now in place for it; filed as follow-up. The transport (transport.rs) still resolves via PublicInfrastructure only - it does not yet consult the book.
+
+BOUNDED GATE (all green): cargo build -p fabric-libp2p -p daemon-libp2p (exit 0); cargo test -p fabric-libp2p (86 tests, 0 failed, incl. the new AC#2 test + the 159 acceptance test); cargo fmt --all --check (exit 0); cargo clippy --locked -p fabric-libp2p --all-targets -D warnings (exit 0); just independence (exit 0). no_enumeration N/A (no persisted/exposure/Disclosed type touched; the new path records NO exposure).
+
+AC status: AC#2 MET; AC#1 CODE done + HARNESS blocked->TASK-207; AC#3 deferred (frozen Disclosed, wire review).
 <!-- SECTION:NOTES:END -->

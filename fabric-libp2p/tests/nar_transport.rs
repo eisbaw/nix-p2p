@@ -162,7 +162,12 @@ async fn wire_consumer(
     // holds the same kind of `Libp2pNodeLocator` the fabric wires it with. A standalone
     // ledger is fine here - these tests assert byte-path behaviour, not exposure counts.
     let ledger = Arc::new(ExposureLedger::new());
-    let locator = Arc::new(Libp2pNodeLocator::new(consumer.handle.clone(), ledger));
+    // No explicit peers configured: these tests drive the kad (PublicInfrastructure) path.
+    let locator = Arc::new(Libp2pNodeLocator::new(
+        consumer.handle.clone(),
+        ledger,
+        std::collections::BTreeMap::new(),
+    ));
 
     let deadline = Instant::now() + Duration::from_secs(15);
     loop {
