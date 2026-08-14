@@ -22,30 +22,30 @@
         287530648
       ],
       "aggregate_ratio_display": "0.222587 (~222587 ppm; exact 64000619/287530648)",
-      "aggregate_beats_cdn_wire": true,
-      "aggregate_compress_bytes_per_sec": 339488300,
-      "aggregate_decompress_bytes_per_sec": 822109947,
+      "beats_task94_crossset_baseline_INFORMONLY": true,
+      "aggregate_compress_bytes_per_sec": 315738890,
+      "aggregate_decompress_bytes_per_sec": 790759805,
       "net_home_uplink": {
         "bandwidth_bytes_per_sec": 2500000,
         "raw_delivery_ns": 115012259200,
-        "zstd_compress_ns": 846953040,
+        "zstd_compress_ns": 910659589,
         "zstd_link_ns": 25600247600,
-        "zstd_decompress_ns": 349747195,
-        "zstd_total_ns": 26796947835,
+        "zstd_decompress_ns": 363613130,
+        "zstd_total_ns": 26874520319,
         "zstd_beats_raw_end_to_end": true,
         "raw_net_bytes_per_sec": 2500000,
-        "zstd_net_bytes_per_sec": 10729977
+        "zstd_net_bytes_per_sec": 10699005
       },
       "net_lan": {
         "bandwidth_bytes_per_sec": 204000000,
         "raw_delivery_ns": 1409463960,
-        "zstd_compress_ns": 846953040,
+        "zstd_compress_ns": 910659589,
         "zstd_link_ns": 313728524,
-        "zstd_decompress_ns": 349747195,
-        "zstd_total_ns": 1510428759,
+        "zstd_decompress_ns": 363613130,
+        "zstd_total_ns": 1588001243,
         "zstd_beats_raw_end_to_end": false,
         "raw_net_bytes_per_sec": 204000000,
-        "zstd_net_bytes_per_sec": 190363594
+        "zstd_net_bytes_per_sec": 181064498
       }
     },
     {
@@ -58,35 +58,35 @@
         287530648
       ],
       "aggregate_ratio_display": "0.168082 (~168082 ppm; exact 48328733/287530648)",
-      "aggregate_beats_cdn_wire": true,
-      "aggregate_compress_bytes_per_sec": 2859059,
-      "aggregate_decompress_bytes_per_sec": 869903845,
+      "beats_task94_crossset_baseline_INFORMONLY": true,
+      "aggregate_compress_bytes_per_sec": 2734409,
+      "aggregate_decompress_bytes_per_sec": 832935863,
       "net_home_uplink": {
         "bandwidth_bytes_per_sec": 2500000,
         "raw_delivery_ns": 115012259200,
-        "zstd_compress_ns": 100568255281,
+        "zstd_compress_ns": 105152736705,
         "zstd_link_ns": 19331493200,
-        "zstd_decompress_ns": 330531529,
-        "zstd_total_ns": 120230280010,
+        "zstd_decompress_ns": 345201426,
+        "zstd_total_ns": 124829431331,
         "zstd_beats_raw_end_to_end": false,
         "raw_net_bytes_per_sec": 2500000,
-        "zstd_net_bytes_per_sec": 2391499
+        "zstd_net_bytes_per_sec": 2303388
       },
       "net_lan": {
         "bandwidth_bytes_per_sec": 204000000,
         "raw_delivery_ns": 1409463960,
-        "zstd_compress_ns": 100568255281,
+        "zstd_compress_ns": 105152736705,
         "zstd_link_ns": 236905553,
-        "zstd_decompress_ns": 330531529,
-        "zstd_total_ns": 101135692363,
+        "zstd_decompress_ns": 345201426,
+        "zstd_total_ns": 105734843684,
         "zstd_beats_raw_end_to_end": false,
         "raw_net_bytes_per_sec": 204000000,
-        "zstd_net_bytes_per_sec": 2843018
+        "zstd_net_bytes_per_sec": 2719355
       }
     }
   ],
   "same_path_xz_vs_zstd": {
-    "note": "rigorous: xz (CDN) vs our zstd on the IDENTICAL paths; the honest ratio verdict (the committed-baseline compare above uses a DIFFERENT nar set)",
+    "note": "rigorous: xz (CDN) vs our zstd on the IDENTICAL paths; the ONLY honest ratio verdict (the cross-set fields above use a DIFFERENT nar set)",
     "n_paths": 5,
     "sum_nar_bytes": 287442680,
     "sum_xz_bytes": 46458960,
@@ -232,11 +232,11 @@
             7808
           ],
           "ratio_display": "0.427766 (~427766 ppm; exact 835/1952)",
-          "beats_cdn_wire": false,
-          "compress_bytes_per_sec": 92175473,
-          "decompress_bytes_per_sec": 327888128,
-          "compress_ns": 84708,
-          "decompress_ns": 23813
+          "beats_task94_crossset_baseline_INFORMONLY": false,
+          "compress_bytes_per_sec": 215066795,
+          "decompress_bytes_per_sec": 602701659,
+          "compress_ns": 36305,
+          "decompress_ns": 12955
         },
         {
           "level": 19,
@@ -247,11 +247,11 @@
             7808
           ],
           "ratio_display": "0.405866 (~405865 ppm; exact 3169/7808)",
-          "beats_cdn_wire": false,
-          "compress_bytes_per_sec": 8323321,
-          "decompress_bytes_per_sec": 965142150,
-          "compress_ns": 938087,
-          "decompress_ns": 8090
+          "beats_task94_crossset_baseline_INFORMONLY": false,
+          "compress_bytes_per_sec": 8336224,
+          "decompress_bytes_per_sec": 785118149,
+          "compress_ns": 936635,
+          "decompress_ns": 9945
         }
       ]
     },
@@ -268,11 +268,11 @@
             80160
           ],
           "ratio_display": "0.247368 (~247367 ppm; exact 19829/80160)",
-          "beats_cdn_wire": true,
-          "compress_bytes_per_sec": 485039179,
-          "decompress_bytes_per_sec": 1809480812,
-          "compress_ns": 165265,
-          "decompress_ns": 44300
+          "beats_task94_crossset_baseline_INFORMONLY": true,
+          "compress_bytes_per_sec": 478575735,
+          "decompress_bytes_per_sec": 1796544073,
+          "compress_ns": 167497,
+          "decompress_ns": 44619
         },
         {
           "level": 19,
@@ -283,11 +283,11 @@
             80160
           ],
           "ratio_display": "0.213099 (~213098 ppm; exact 2847/13360)",
-          "beats_cdn_wire": true,
-          "compress_bytes_per_sec": 3671643,
-          "decompress_bytes_per_sec": 1475319321,
-          "compress_ns": 21832187,
-          "decompress_ns": 54334
+          "beats_task94_crossset_baseline_INFORMONLY": true,
+          "compress_bytes_per_sec": 3693468,
+          "decompress_bytes_per_sec": 1000361907,
+          "compress_ns": 21703177,
+          "decompress_ns": 80131
         }
       ]
     },
@@ -304,11 +304,11 @@
             804496
           ],
           "ratio_display": "0.336288 (~336287 ppm; exact 135271/402248)",
-          "beats_cdn_wire": false,
-          "compress_bytes_per_sec": 404224455,
-          "decompress_bytes_per_sec": 1254316460,
-          "compress_ns": 1990221,
-          "decompress_ns": 641382
+          "beats_task94_crossset_baseline_INFORMONLY": false,
+          "compress_bytes_per_sec": 268878668,
+          "decompress_bytes_per_sec": 1005777152,
+          "compress_ns": 2992041,
+          "decompress_ns": 799875
         },
         {
           "level": 19,
@@ -319,11 +319,11 @@
             804496
           ],
           "ratio_display": "0.287136 (~287136 ppm; exact 375/1306)",
-          "beats_cdn_wire": true,
-          "compress_bytes_per_sec": 6741208,
-          "decompress_bytes_per_sec": 1007919315,
-          "compress_ns": 119340032,
-          "decompress_ns": 798175
+          "beats_task94_crossset_baseline_INFORMONLY": true,
+          "compress_bytes_per_sec": 6622896,
+          "decompress_bytes_per_sec": 1019313198,
+          "compress_ns": 121471933,
+          "decompress_ns": 789253
         }
       ]
     },
@@ -340,11 +340,11 @@
             5017384
           ],
           "ratio_display": "0.276629 (~276629 ppm; exact 693977/2508692)",
-          "beats_cdn_wire": true,
-          "compress_bytes_per_sec": 375118668,
-          "decompress_bytes_per_sec": 1230945419,
-          "compress_ns": 13375458,
-          "decompress_ns": 4076041
+          "beats_task94_crossset_baseline_INFORMONLY": true,
+          "compress_bytes_per_sec": 369231566,
+          "decompress_bytes_per_sec": 1249440384,
+          "compress_ns": 13588719,
+          "decompress_ns": 4015705
         },
         {
           "level": 19,
@@ -355,11 +355,11 @@
             5017384
           ],
           "ratio_display": "0.218501 (~218501 ppm; exact 1096305/5017384)",
-          "beats_cdn_wire": true,
-          "compress_bytes_per_sec": 4607500,
-          "decompress_bytes_per_sec": 905403983,
-          "compress_ns": 1088959947,
-          "decompress_ns": 5541597
+          "beats_task94_crossset_baseline_INFORMONLY": true,
+          "compress_bytes_per_sec": 4503221,
+          "decompress_bytes_per_sec": 1095254529,
+          "compress_ns": 1114176702,
+          "decompress_ns": 4581021
         }
       ]
     },
@@ -376,11 +376,11 @@
             25421000
           ],
           "ratio_display": "0.105546 (~105546 ppm; exact 1341543/12710500)",
-          "beats_cdn_wire": true,
-          "compress_bytes_per_sec": 636500803,
-          "decompress_bytes_per_sec": 692884074,
-          "compress_ns": 39938677,
-          "decompress_ns": 36688677
+          "beats_task94_crossset_baseline_INFORMONLY": true,
+          "compress_bytes_per_sec": 782483379,
+          "decompress_bytes_per_sec": 1246679106,
+          "compress_ns": 32487591,
+          "decompress_ns": 20390973
         },
         {
           "level": 19,
@@ -391,11 +391,11 @@
             25421000
           ],
           "ratio_display": "0.070475 (~70474 ppm; exact 1791543/25421000)",
-          "beats_cdn_wire": true,
-          "compress_bytes_per_sec": 4700278,
-          "decompress_bytes_per_sec": 1103824601,
-          "compress_ns": 5408403038,
-          "decompress_ns": 23029927
+          "beats_task94_crossset_baseline_INFORMONLY": true,
+          "compress_bytes_per_sec": 4536283,
+          "decompress_bytes_per_sec": 1068992420,
+          "compress_ns": 5603926796,
+          "decompress_ns": 23780337
         }
       ]
     },
@@ -412,11 +412,11 @@
             78001448
           ],
           "ratio_display": "0.273119 (~273119 ppm; exact 21303711/78001448)",
-          "beats_cdn_wire": true,
-          "compress_bytes_per_sec": 296499216,
-          "decompress_bytes_per_sec": 734053289,
-          "compress_ns": 263074719,
-          "decompress_ns": 106261288
+          "beats_task94_crossset_baseline_INFORMONLY": true,
+          "compress_bytes_per_sec": 281119047,
+          "decompress_bytes_per_sec": 707007448,
+          "compress_ns": 277467673,
+          "decompress_ns": 110326204
         },
         {
           "level": 19,
@@ -427,11 +427,11 @@
             78001448
           ],
           "ratio_display": "0.211008 (~211008 ppm; exact 2351281/11143064)",
-          "beats_cdn_wire": true,
-          "compress_bytes_per_sec": 3070335,
-          "decompress_bytes_per_sec": 694344047,
-          "compress_ns": 25404857337,
-          "decompress_ns": 112338326
+          "beats_task94_crossset_baseline_INFORMONLY": true,
+          "compress_bytes_per_sec": 2759193,
+          "decompress_bytes_per_sec": 653178890,
+          "compress_ns": 28269651962,
+          "decompress_ns": 119418201
         }
       ]
     },
@@ -448,11 +448,11 @@
             178198352
           ],
           "ratio_display": "0.215109 (~215109 ppm; exact 38332157/178198352)",
-          "beats_cdn_wire": true,
-          "compress_bytes_per_sec": 337289910,
-          "decompress_bytes_per_sec": 882118992,
-          "compress_ns": 528323992,
-          "decompress_ns": 202011694
+          "beats_task94_crossset_baseline_INFORMONLY": true,
+          "compress_bytes_per_sec": 305176093,
+          "decompress_bytes_per_sec": 781493573,
+          "compress_ns": 583919763,
+          "decompress_ns": 228022799
         },
         {
           "level": 19,
@@ -463,11 +463,11 @@
             178198352
           ],
           "ratio_display": "0.161229 (~161228 ppm; exact 28730667/178198352)",
-          "beats_cdn_wire": true,
-          "compress_bytes_per_sec": 2600527,
-          "decompress_bytes_per_sec": 944041812,
-          "compress_ns": 68523924653,
-          "decompress_ns": 188761080
+          "beats_task94_crossset_baseline_INFORMONLY": true,
+          "compress_bytes_per_sec": 2544932,
+          "decompress_bytes_per_sec": 906665568,
+          "compress_ns": 70020869500,
+          "decompress_ns": 196542538
         }
       ]
     }

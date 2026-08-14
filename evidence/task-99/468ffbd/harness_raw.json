@@ -1,7 +1,7 @@
 {
   "harness": "peer_fabric::compress_zstd + BoundedZstdDecoder (the shipped /nar/3 codec)",
   "cpu_ns_note": "min wall-ns of single-threaded runs on an idle core; a proxy for CPU-ns",
-  "default_level": 19,
+  "default_level": 3,
   "files": [
     {
       "path": "/tmp/claude-1000/-home-mpedersen-topics-nix-decentralized-cache/eefa311f-89e2-4fdd-ace9-d1057c734fef/scratchpad/nars/00-3j4s89cy5vrfw6mp4v8ycp4znfxbjjr9-unit-script-wg0-direct-guard-start.nar",
@@ -12,15 +12,15 @@
           "level": 3,
           "compressed_bytes": 3340,
           "raw_bytes": 7808,
-          "compress_ns": 84708,
-          "decompress_ns": 23813
+          "compress_ns": 36305,
+          "decompress_ns": 12955
         },
         {
           "level": 19,
           "compressed_bytes": 3169,
           "raw_bytes": 7808,
-          "compress_ns": 938087,
-          "decompress_ns": 8090
+          "compress_ns": 936635,
+          "decompress_ns": 9945
         }
       ]
     },
@@ -33,15 +33,15 @@
           "level": 3,
           "compressed_bytes": 19829,
           "raw_bytes": 80160,
-          "compress_ns": 165265,
-          "decompress_ns": 44300
+          "compress_ns": 167497,
+          "decompress_ns": 44619
         },
         {
           "level": 19,
           "compressed_bytes": 17082,
           "raw_bytes": 80160,
-          "compress_ns": 21832187,
-          "decompress_ns": 54334
+          "compress_ns": 21703177,
+          "decompress_ns": 80131
         }
       ]
     },
@@ -54,15 +54,15 @@
           "level": 3,
           "compressed_bytes": 270542,
           "raw_bytes": 804496,
-          "compress_ns": 1990221,
-          "decompress_ns": 641382
+          "compress_ns": 2992041,
+          "decompress_ns": 799875
         },
         {
           "level": 19,
           "compressed_bytes": 231000,
           "raw_bytes": 804496,
-          "compress_ns": 119340032,
-          "decompress_ns": 798175
+          "compress_ns": 121471933,
+          "decompress_ns": 789253
         }
       ]
     },
@@ -75,15 +75,15 @@
           "level": 3,
           "compressed_bytes": 1387954,
           "raw_bytes": 5017384,
-          "compress_ns": 13375458,
-          "decompress_ns": 4076041
+          "compress_ns": 13588719,
+          "decompress_ns": 4015705
         },
         {
           "level": 19,
           "compressed_bytes": 1096305,
           "raw_bytes": 5017384,
-          "compress_ns": 1088959947,
-          "decompress_ns": 5541597
+          "compress_ns": 1114176702,
+          "decompress_ns": 4581021
         }
       ]
     },
@@ -96,15 +96,15 @@
           "level": 3,
           "compressed_bytes": 2683086,
           "raw_bytes": 25421000,
-          "compress_ns": 39938677,
-          "decompress_ns": 36688677
+          "compress_ns": 32487591,
+          "decompress_ns": 20390973
         },
         {
           "level": 19,
           "compressed_bytes": 1791543,
           "raw_bytes": 25421000,
-          "compress_ns": 5408403038,
-          "decompress_ns": 23029927
+          "compress_ns": 5603926796,
+          "decompress_ns": 23780337
         }
       ]
     },
@@ -117,15 +117,15 @@
           "level": 3,
           "compressed_bytes": 21303711,
           "raw_bytes": 78001448,
-          "compress_ns": 263074719,
-          "decompress_ns": 106261288
+          "compress_ns": 277467673,
+          "decompress_ns": 110326204
         },
         {
           "level": 19,
           "compressed_bytes": 16458967,
           "raw_bytes": 78001448,
-          "compress_ns": 25404857337,
-          "decompress_ns": 112338326
+          "compress_ns": 28269651962,
+          "decompress_ns": 119418201
         }
       ]
     },
@@ -138,15 +138,15 @@
           "level": 3,
           "compressed_bytes": 38332157,
           "raw_bytes": 178198352,
-          "compress_ns": 528323992,
-          "decompress_ns": 202011694
+          "compress_ns": 583919763,
+          "decompress_ns": 228022799
         },
         {
           "level": 19,
           "compressed_bytes": 28730667,
           "raw_bytes": 178198352,
-          "compress_ns": 68523924653,
-          "decompress_ns": 188761080
+          "compress_ns": 70020869500,
+          "decompress_ns": 196542538
         }
       ]
     }
