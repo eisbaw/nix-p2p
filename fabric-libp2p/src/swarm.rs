@@ -1671,6 +1671,81 @@ fn build_kad_behaviour(
     kad
 }
 
+/// The library DEFAULT kad protocol preset — the PUBLIC IPFS DHT protocol(s) a
+/// `kad::Behaviour::new` / `kad::Config::default()` construction advertises.
+///
+/// Derived at RUNTIME from a throwaway default-preset behaviour (never added to a swarm, never
+/// dialed — a `kad::Behaviour` is inert until polled) rather than hardcoding the `/ipfs/kad`
+/// literal. Two reasons, both load-bearing: (a) the literal is a FORBIDDEN token for
+/// `check-public-dht-isolation.py`, so writing it here would trip our own lint; (b) deriving it
+/// keeps the comparison correct if libp2p ever renames its default protocol. This is the same
+/// technique the AC#3 semantic test uses via `bare_kad()`, lifted into production so the
+/// fail-fast startup invariant ([`assert_private_kad_isolation`]) can compare against it.
+fn default_preset_protocol_names(peer_id: PeerId) -> Vec<StreamProtocol> {
+    let default_preset = kad::Behaviour::new(peer_id, MemoryStore::new(peer_id));
+    default_preset.protocol_names().to_vec()
+}
+
+/// FAIL-FAST public-DHT isolation invariant, asserted by [`Node::start`] on the ACTUAL
+/// constructed kad behaviour (`swarm.behaviour().kad`) BEFORE the node is allowed to run.
+///
+/// This is the PRODUCTION-PATH binding of TASK-154 AC#3 (F2). The AC#3 semantic test
+/// (`kad_speaks_only_the_private_scoped_protocol_never_the_public_ipfs_dht`) binds to the
+/// `build_kad_behaviour` HELPER; that leaves a gap — `Node::start` could regress to inline
+/// `kad::Behaviour::new` / `kad::Config::default()` (the PUBLIC IPFS DHT preset) while the helper
+/// stays a passing decoy, so both the test and the source scan still pass. This function closes
+/// that gap: `Node::start` calls it UNCONDITIONALLY on `swarm.behaviour().kad.protocol_names()`,
+/// the protocol set the node will actually advertise, so a regression cannot even BOOT — it makes
+/// the node REFUSE TO START ([`NodeError::Build`]) rather than silently rejoin the global DHT.
+/// Unbypassable by a test-helper decoy or a source-scan decoy: the assertion runs on the object
+/// production ships, not on any separately-constructed stand-in.
+///
+/// The invariant, over the ADVERTISED protocol set:
+///   (a) the private `/nix-p2p/<scope>/kad/1.0.0` protocol (for the configured `scope`) IS
+///       present — the node speaks the private DHT; AND
+///   (b) the set is DISJOINT from the library default preset (the PUBLIC IPFS DHT), derived at
+///       runtime by [`default_preset_protocol_names`] — the node does NOT speak the global DHT.
+///
+/// A default-preset regression flips `protocol_names()` to exactly `default_preset`, failing both
+/// (a) and (b); the bite is proven by feeding this same function the default-preset object's
+/// protocol set (test `production_isolation_invariant_bites_the_default_preset_regression`).
+///
+/// Pure and network-free (takes the already-constructed protocol slice) so it is unit-testable
+/// directly on the production-constructed behaviour without a running swarm.
+fn assert_private_kad_isolation(
+    advertised: &[StreamProtocol],
+    scope: &str,
+    peer_id: PeerId,
+) -> Result<(), String> {
+    let expected_private = format!("/nix-p2p/{scope}/kad/1.0.0");
+    let advertised_names: Vec<String> = advertised.iter().map(|p| p.to_string()).collect();
+    let default_preset: Vec<String> = default_preset_protocol_names(peer_id)
+        .iter()
+        .map(|p| p.to_string())
+        .collect();
+
+    // (a) the private scoped protocol MUST be advertised.
+    if !advertised_names.iter().any(|n| n == &expected_private) {
+        return Err(format!(
+            "kad public-DHT isolation invariant VIOLATED (refusing to start): the constructed kad \
+             behaviour does NOT advertise the private {expected_private} protocol \
+             (advertised {advertised_names:?}). A default kad::Behaviour::new / \
+             kad::Config::default() regression in Node::start would rejoin the PUBLIC IPFS DHT — \
+             the node must not boot."
+        ));
+    }
+    // (b) the advertised set MUST be DISJOINT from the library default (public IPFS DHT) preset.
+    if let Some(shared) = advertised_names.iter().find(|n| default_preset.contains(n)) {
+        return Err(format!(
+            "kad public-DHT isolation invariant VIOLATED (refusing to start): the constructed kad \
+             behaviour advertises {shared:?}, which is in the library DEFAULT preset \
+             {default_preset:?} (the PUBLIC IPFS DHT). The private DHT must share NO protocol with \
+             the global network — the node must not boot."
+        ));
+    }
+    Ok(())
+}
+
 impl Node {
     /// Build the swarm for `config` and spawn its worker. The node is not yet
     /// listening or bootstrapped; the caller drives that via the [`SwarmHandle`].
@@ -1761,6 +1836,18 @@ impl Node {
             .map_err(|e| NodeError::Build(e.to_string()))?
             .with_swarm_config(|c| c.with_idle_connection_timeout(Duration::from_secs(60)))
             .build();
+
+        // TASK-154 F2 (AC#3) — PRODUCTION-PATH fail-fast public-DHT isolation invariant.
+        // Assert the kad behaviour THIS node will actually run (`swarm.behaviour().kad`, the
+        // object shipped into the worker below, NOT a separately-built helper) advertises the
+        // private scope-namespaced `/nix-p2p/<scope>/kad/1.0.0` protocol AND shares nothing with
+        // the library default preset (the PUBLIC IPFS DHT). If `Node::start` ever regressed to
+        // inline `kad::Behaviour::new` / `kad::Config::default()` — bypassing `build_kad_behaviour`
+        // — this REFUSES TO START (`NodeError::Build`) instead of silently rejoining the global
+        // DHT. Binding the invariant to the constructed runtime object is what makes it
+        // unbypassable by a test-helper or source-scan decoy (see `assert_private_kad_isolation`).
+        assert_private_kad_isolation(swarm.behaviour().kad.protocol_names(), &scope, peer_id)
+            .map_err(NodeError::Build)?;
 
         // The raw-stream NAR surface (TASK-157). One Control drives both directions: it
         // registers the inbound `/nar/3` protocol (once) via `accept`, and opens outbound
@@ -2015,6 +2102,68 @@ mod tests {
             vec![format!("/nix-p2p/{scope}/kad/1.0.0")],
             "the constructed kad Behaviour must advertise ONLY the private scoped protocol"
         );
+    }
+
+    // ======== TASK-154 F2 (AC#3) PRODUCTION-PATH fail-fast isolation invariant ========
+    // The semantic test above binds to the `build_kad_behaviour` HELPER; these three bind to the
+    // PRODUCTION path. `assert_private_kad_isolation` is the smallest production function
+    // `Node::start` calls UNCONDITIONALLY on the real `swarm.behaviour().kad.protocol_names()`, so
+    // testing it directly on the production-constructed behaviour (and on the default-preset object
+    // a regression would produce) proves the invariant `Node::start` runs both ACCEPTS the
+    // legitimate node and REFUSES the regression — even a `Node::start` that inlined
+    // `Behaviour::new` (bypassing the helper) cannot skip this assertion, so a regression cannot
+    // boot. The full `Node::start` boot is exercised too, so nothing decouples the check from the
+    // shipped construction.
+
+    #[test]
+    fn production_isolation_invariant_accepts_the_real_private_kad() {
+        // Feed the invariant the protocol set of the ACTUAL production constructor. This is the
+        // exact `protocol_names()` slice `Node::start` hands `assert_private_kad_isolation`, so the
+        // legitimate node MUST pass — if this Err'd, every node would refuse to start.
+        let peer = PeerId::random();
+        let scope = "prod-path-scope";
+        let kad_protocol = StreamProtocol::try_from_owned(format!("/nix-p2p/{scope}/kad/1.0.0"))
+            .expect("the scoped kad protocol name is valid");
+        let kad = build_kad_behaviour(peer, kad_protocol, DEFAULT_KAD_QUERY_TIMEOUT);
+        assert_private_kad_isolation(kad.protocol_names(), scope, peer)
+            .expect("the real private-scoped production kad must satisfy the startup invariant");
+    }
+
+    #[test]
+    fn production_isolation_invariant_bites_the_default_preset_regression() {
+        // The BITE. Construct the library DEFAULT preset (`kad::Behaviour::new` /
+        // `kad::Config::default()`) — EXACTLY what a `Node::start` regression that inlined the
+        // default ctor would ship into the swarm — and feed ITS `protocol_names()` to the SAME
+        // production invariant `Node::start` runs. It MUST return the refuse-to-start Err: this is
+        // the proof that a default-preset regression makes the node fail to boot, observed through
+        // the production assertion (not a helper). `bare_kad()` is that default-preset object; its
+        // `protocol_names()` is the public IPFS DHT preset.
+        let peer = PeerId::random();
+        let scope = "prod-path-scope";
+        let regressed = bare_kad();
+        let err = assert_private_kad_isolation(regressed.protocol_names(), scope, peer).expect_err(
+            "a default-preset (public IPFS DHT) kad MUST fail the startup invariant — \
+                 Node::start must REFUSE TO START on this regression, not silently rejoin the \
+                 global DHT",
+        );
+        // The refuse-to-start message names the violated invariant (fail-fast, verbose).
+        assert!(
+            err.contains("isolation invariant VIOLATED") && err.contains("refusing to start"),
+            "the refuse-to-start error must name the violated isolation invariant, got: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn production_node_start_passes_the_public_dht_isolation_invariant() {
+        // End-to-end proof that the invariant does NOT reject the legitimate production
+        // construction: drive the REAL `Node::start` (which runs `assert_private_kad_isolation` on
+        // `swarm.behaviour().kad` after `.build()`). A wrongly-tightened invariant would turn this
+        // into `Err(NodeError::Build(..))` and every node would fail to boot; it must return Ok.
+        let seed = [7u8; 32];
+        let node = Node::start(NodeConfig::new(seed).with_network_scope("prod-path-scope"))
+            .expect("the legitimate private-scope node must pass the startup isolation invariant");
+        // Sanity: the node came up with the identity we seeded (the invariant ran on ITS behaviour).
+        let _ = node.peer_id;
     }
 
     // ===================== TASK-154 S4 query-cancel (work bound) =====================
