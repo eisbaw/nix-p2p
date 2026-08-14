@@ -1,0 +1,2511 @@
+{
+  "diagnostic_tag": "diagnostic_uncompressed",
+  "task": "task-94",
+  "counting_rule": "NONE -- this diagnostic does not route bytes through net-upstream-egress-v2/v3 (measure.classify_run). It reads cache.nixos.org narinfo metadata over HTTP and runs raw TCP over a tc-netem-shaped netns link. Confirmed dep-guard (task-94).",
+  "asymmetry_source": "peers serve RAW nar (Compression:none, FileHash==NarHash, FileSize==NarSize -- daemon narinfo rewrite); the CDN serves xz/zstd. The raw peer therefore moves ~1/ratio the CDN wire bytes.",
+  "forbidden": "this artifact emits no known policy-selection field (producer-side tripwire, not a barrier against a downstream reader deriving its own decision); task-99 owns the codec + compressed re-evaluation, task-198 re-states the speedup.",
+  "cdn_wire_vs_peer_raw_sample": {
+    "provenance": {
+      "seed_attrs": [
+        "gcc",
+        "python3",
+        "ffmpeg",
+        "git"
+      ],
+      "resolved": {
+        "gcc": "/nix/store/3d1c302vw7kc8a5vknhmn34c0pd7zm6m-gcc-wrapper-15.3.0",
+        "python3": "/nix/store/3n4qphl9s728sz8frmpqqrv9b1m87g68-python3-3.14.7",
+        "ffmpeg": "/nix/store/qrzizdzzzqh4wzhz98szh78n2nmdm1d1-ffmpeg-9.0-bin",
+        "git": "/nix/store/8wxs6573l730vxkqd6wp58kvxa19csll-git-2.55.0"
+      },
+      "nixpkgs": {
+        "__final": true,
+        "lastModified": 1786534138,
+        "narHash": "sha256-Cwffw7dPM56d8spt4/queFQ1cKg69D9qrsp+wfwKvfo=",
+        "rev": "044bfe75bfe4c7bbe043dc17b5e42ea823b84a09",
+        "type": "tarball",
+        "url": "https://releases.nixos.org/nixpkgs/nixpkgs-26.11pre1052792.044bfe75bfe4/nixexprs.tar.xz"
+      }
+    },
+    "fetch_stats": {
+      "cache": "https://cache.nixos.org",
+      "seed_hashes": [
+        "3d1c302vw7kc8a5vknhmn34c0pd7zm6m",
+        "3n4qphl9s728sz8frmpqqrv9b1m87g68",
+        "qrzizdzzzqh4wzhz98szh78n2nmdm1d1",
+        "8wxs6573l730vxkqd6wp58kvxa19csll"
+      ],
+      "narinfos_fetched": 220,
+      "samples_collected": 220,
+      "drops": 0,
+      "max_fetches": 1320,
+      "note": "metadata-only closure BFS over References; no NAR bodies fetched"
+    },
+    "aggregate": {
+      "n_compressed": 220,
+      "aggregate_file_over_nar_ratio": 0.3255628680152017,
+      "peer_raw_over_cdn_wire_multiple": 3.0716033621908823,
+      "per_path_ratio_mean": 0.34436450616545417,
+      "per_path_ratio_median": 0.33947397772113835,
+      "sum_file_size_bytes_compressed_wire": 383084972,
+      "sum_nar_size_bytes_uncompressed_nar": 1176685088,
+      "nar_size_min_bytes_uncompressed_nar": 4968,
+      "nar_size_max_bytes_uncompressed_nar": 277242232,
+      "nar_size_span_orders_of_magnitude": 55805.60225442834,
+      "deciles_by_nar_size": [
+        {
+          "decile": 1,
+          "n": 22,
+          "nar_size_min_bytes_uncompressed_nar": 4968,
+          "nar_size_max_bytes_uncompressed_nar": 33656,
+          "aggregate_file_over_nar_ratio": 0.323101240130711
+        },
+        {
+          "decile": 2,
+          "n": 22,
+          "nar_size_min_bytes_uncompressed_nar": 34736,
+          "nar_size_max_bytes_uncompressed_nar": 88952,
+          "aggregate_file_over_nar_ratio": 0.3443700441861873
+        },
+        {
+          "decile": 3,
+          "n": 22,
+          "nar_size_min_bytes_uncompressed_nar": 89776,
+          "nar_size_max_bytes_uncompressed_nar": 166400,
+          "aggregate_file_over_nar_ratio": 0.37659005440405474
+        },
+        {
+          "decile": 4,
+          "n": 22,
+          "nar_size_min_bytes_uncompressed_nar": 166576,
+          "nar_size_max_bytes_uncompressed_nar": 308776,
+          "aggregate_file_over_nar_ratio": 0.38194972882612344
+        },
+        {
+          "decile": 5,
+          "n": 22,
+          "nar_size_min_bytes_uncompressed_nar": 320072,
+          "nar_size_max_bytes_uncompressed_nar": 565792,
+          "aggregate_file_over_nar_ratio": 0.34381325672597746
+        },
+        {
+          "decile": 6,
+          "n": 22,
+          "nar_size_min_bytes_uncompressed_nar": 582360,
+          "nar_size_max_bytes_uncompressed_nar": 936792,
+          "aggregate_file_over_nar_ratio": 0.3477609146183904
+        },
+        {
+          "decile": 7,
+          "n": 22,
+          "nar_size_min_bytes_uncompressed_nar": 939376,
+          "nar_size_max_bytes_uncompressed_nar": 1626088,
+          "aggregate_file_over_nar_ratio": 0.42951250238693195
+        },
+        {
+          "decile": 8,
+          "n": 22,
+          "nar_size_min_bytes_uncompressed_nar": 1686488,
+          "nar_size_max_bytes_uncompressed_nar": 3018360,
+          "aggregate_file_over_nar_ratio": 0.3017520674429579
+        },
+        {
+          "decile": 9,
+          "n": 22,
+          "nar_size_min_bytes_uncompressed_nar": 3094704,
+          "nar_size_max_bytes_uncompressed_nar": 9308816,
+          "aggregate_file_over_nar_ratio": 0.31222568694313824
+        },
+        {
+          "decile": 10,
+          "n": 22,
+          "nar_size_min_bytes_uncompressed_nar": 9309600,
+          "nar_size_max_bytes_uncompressed_nar": 277242232,
+          "aggregate_file_over_nar_ratio": 0.3247403847837522
+        }
+      ],
+      "n_uncompressed_excluded": 2,
+      "n_unknown_compression_excluded": 0,
+      "n_unsigned_excluded": 0,
+      "n_records_total": 222,
+      "admission_rule": "admitted iff Compression in a known codec set AND Sig present; uncompressed/unknown-codec/unsigned each excluded and counted",
+      "records": [
+        {
+          "store_hash": "3d1c302vw7kc8a5vknhmn34c0pd7zm6m",
+          "name": "gcc-wrapper-15.3.0",
+          "compression": "zstd",
+          "file_size_bytes_compressed_wire": 12786,
+          "nar_size_bytes_uncompressed_nar": 71632,
+          "sig": "cache.nixos.org-1:d3G3WwX245Frwp3mTjdlOaY7lDrrFvpX+uIwit+huc4mO6PXDDAzSVDe9Zu42o2NFvotZLnrM/0Mpjx1gMlhBg==",
+          "signed": true,
+          "classification": "compressed"
+        },
+        {
+          "store_hash": "3n4qphl9s728sz8frmpqqrv9b1m87g68",
+          "name": "python3-3.14.7",
+          "compression": "zstd",
+          "file_size_bytes_compressed_wire": 60575959,
+          "nar_size_bytes_uncompressed_nar": 142028848,
+          "sig": "cache.nixos.org-1:qVJTVxeaszGAsqzpsp1KUP0/ebvQA1HQUua4GF2eHJRDvy/FyrnCChK6ce6zx0v3ctD0OhUj5+iAJH5DcQvkBw==",
+          "signed": true,
+          "classification": "compressed"
+        },
+        {
+          "store_hash": "qrzizdzzzqh4wzhz98szh78n2nmdm1d1",
+          "name": "ffmpeg-9.0-bin",
+          "compression": "zstd",
+          "file_size_bytes_compressed_wire": 369680,
+          "nar_size_bytes_uncompressed_nar": 1082880,
+          "sig": "cache.nixos.org-1:yKu/QiVT8N0nYyWf6xwf4lVp/5qarGpGiLG6gMhXZeoJptvjEf0JK0hcxlVADay1SChZ8Xv3BSxmwNf29BD5Cw==",
+          "signed": true,
+          "classification": "compressed"
+        },
+        {
+          "store_hash": "8wxs6573l730vxkqd6wp58kvxa19csll",
+          "name": "git-2.55.0",
+          "compression": "zstd",
+          "file_size_bytes_compressed_wire": 24630097,
+          "nar_size_bytes_uncompressed_nar": 58271744,
+          "sig": "cache.nixos.org-1:ZfpKU/1tCZeeukHXTUgqZAEIXdscd4lSqhYdP94pPD4zM3sDu1hCglhBSwNjFq9Bz8mnRWwh/NduL0+DRCvTCQ==",
+          "signed": true,
+          "classification": "compressed"
+        },
+        {
+          "store_hash": "0d8g8n0a11v6f5m2h416ajyxmnkwc3md",
+          "name": "glibc-2.42-67",
+          "compression": "zstd",
+          "file_size_bytes_compressed_wire": 10245977,
+          "nar_size_bytes_uncompressed_nar": 35073096,
+          "sig": "cache.nixos.org-1:OqfrYFHfATMaM2GOFIIjw2jMd+G0ARSxnnlx+draETQjX5GM8zjFHoCo03EhsRXBdk75LzE0ItpVwbocvPbdCw==",
+          "signed": true,
+          "classification": "compressed"
+        },
+        {
+          "store_hash": "3r334980q5lx8x00xlfx3498hklirv3v",
+          "name": "expand-response-params",
+          "compression": "zstd",
+          "file_size_bytes_compressed_wire": 3617,
+          "nar_size_bytes_uncompressed_nar": 16808,
+          "sig": "cache.nixos.org-1:+zIuF+eGdWsv5mrvDHuNrKjAq6vFuhKcc6GjV97zcOE43fQlQ5TYWff0bn59skARhUCo96MOLt8oiOKcMTXgDw==",
+          "signed": true,
+          "classification": "compressed"
+        },
+        {
+          "store_hash": "4dgym2zhac9vy0vrih4gsplh0wpfl13m",
+          "name": "gnugrep-3.12",
+          "compression": "zstd",
+          "file_size_bytes_compressed_wire": 248470,
+          "nar_size_bytes_uncompressed_nar": 954984,
+          "sig": "cache.nixos.org-1:Qk7v1YwW0SbYdMwwONSAvP8hHXCwLODI0N5qH63Xq2vmU/lEZE2jnsN59qI60k0CpRZGJ6inCM8XFJEHr1RPAQ==",
+          "signed": true,
+          "classification": "compressed"
+        },
+        {
+          "store_hash": "7sh9061yj9yl20ndc00rqw4d0bd80m1j",
+          "name": "gcc-15.3.0",
+          "compression": "zstd",
+          "file_size_bytes_compressed_wire": 89163791,
+          "nar_size_bytes_uncompressed_nar": 277242232,
+          "sig": "cache.nixos.org-1:aA1CiFwgu73ZL8gGH5rzlNTUU+GALsGo6Ca/PNH42y6tjPFApDftbWqxgPp9cZ0k9uZXtacVQUU7uBpmeVmGDA==",
+          "signed": true,
+          "classification": "compressed"
+        },
+        {
+          "store_hash": "97d5ygrvqj55f4nx1x34wfdcc7qn11c0",
+          "name": "coreutils-9.11",
+          "compression": "zstd",
+          "file_size_bytes_compressed_wire": 806045,
+          "nar_size_bytes_uncompressed_nar": 1806736,
+          "sig": "cache.nixos.org-1:w4dfEAW0wR6BZufL4LWZmE0anTc4rjuHTH+i5qLwigI9KyqTlxa3pShvR9txfHx2APGwKC0o7ZW2+b3HBcJXDA==",
+          "signed": true,
+          "classification": "compressed"
+        },
+        {
+          "store_hash": "byi2zpy2bgcf3dr6y0l8m50rmjj8z7q1",
+          "name": "bash-5.3p15",
+          "compression": "zstd",
+          "file_size_bytes_compressed_wire": 648591,
+          "nar_size_bytes_uncompressed_nar": 1856848,
+          "sig": "cache.nixos.org-1:L1O9X5c1uPJAdtUHF5tOCnTl7chbQNAoqw7DBBP6ehZdOCrfFTL1UpKAKHTrHZmVYgBIfJLiBYzPmIrwEsa0Cw==",
+          "signed": true,
+          "classification": "compressed"
+        },
+        {
+          "store_hash": "c2fgns4y4c4xjvc6pq024abmxyy4dl28",
+          "name": "glibc-2.42-67-bin",
+          "compression": "zstd",
+          "file_size_bytes_compressed_wire": 978059,
+          "nar_size_bytes_uncompressed_nar": 2878232,
+          "sig": "cache.nixos.org-1:reFeM+vatNb5ktPnQ0qcgrw44Zow3/C/IrQhA1P8on5b0rSVX+M7jbgg3A2GB3QT4bN29NyxGzuhNdDfduUNDA==",
+          "signed": true,
+          "classification": "compressed"
+        },
+        {
+          "store_hash": "j5rd8xm5zqgzcb0l19942ms7r96q0hip",
+          "name": "binutils-wrapper-2.46",
+          "compression": "zstd",
+          "file_size_bytes_compressed_wire": 9437,
+          "nar_size_bytes_uncompressed_nar": 56672,
+          "sig": "cache.nixos.org-1:MkjBWfO4JTnCXLWpy3s+yb9i9IaJW3HT8t9lT9o2dxWLgt/MCd+nu75RAViqlW+zSjemMQNOHPUW+JYAd7rdAA==",
+          "signed": true,
+          "classification": "compressed"
+        },
+        {
+          "store_hash": "m300ngckdmal8wnl3bjbpwca3a5bn74c",
+          "name": "glibc-2.42-67-dev",
+          "compression": "zstd",
+          "file_size_bytes_compressed_wire": 489909,
+          "nar_size_bytes_uncompressed_nar": 2445256,
+          "sig": "cache.nixos.org-1:W0C8H6D4h8cQc8hrVk+V0e5eTmintfq7CjZV5V8yjCE7kfx7GidWX9GFP/rO6Kq2lBBa9kI0+bmiLJM2c7J2CA==",
+          "signed": true,
+          "classification": "compressed"
+        },
+        {
+          "store_hash": "r48746qznwqxxl9qzd8f08ny8mg1dg2y",
+          "name": "gcc-15.3.0-lib",
+          "compression": "zstd",
+          "file_size_bytes_compressed_wire": 3100004,
+          "nar_size_bytes_uncompressed_nar": 10317392,
+          "sig": "cache.nixos.org-1:LmHwYgy+ubzZnZCyRIn+xPOx7XRlZEAffAG5s7ceeIDWaVG0ABaHLdSmUmrD6PMjLc/oxhj0LhUiPfOe7ehYDg==",
+          "signed": true,
+          "classification": "compressed"
+        },
+        {
+          "store_hash": "0hckf4kx70qifvrsbh64hc2s5xfyrf97",
+          "name": "bzip2-1.0.8",
+          "compression": "zstd",
+          "file_size_bytes_compressed_wire": 38418,
+          "nar_size_bytes_uncompressed_nar": 88952,
+          "sig": "cache.nixos.org-1:fBV7oaqzePNqwr3NA9jcLFDhaL8322mDyVQg3IeyCYHKHArZmEd8sxzG10jFKM7+b/fqcrDq7PXDUPk55v64AA==",
+          "signed": true,
+          "classification": "compressed"
+        },
+        {
+          "store_hash": "1mf3lj0mldr8732yvzjc12fig2407b3d",
+          "name": "openssl-3.6.3",
+          "compression": "zstd",
+          "file_size_bytes_compressed_wire": 3392773,
+          "nar_size_bytes_uncompressed_nar": 9308816,
+          "sig": "cache.nixos.org-1:/K3H0jRgkjT1R32lJxUPZCOnM1JW96mP8kI1vLwsUYucBporYGP8RX5I0GxLmIgr+5Q0h7sQcxEb4T5gjoqUAA==",
+          "signed": true,
+          "classification": "compressed"
+        },
+        {
+          "store_hash": "4myf3s1i9rahd2my1zs2cqify7y930sk",
+          "name": "readline-8.3p3",
+          "compression": "zstd",
+          "file_size_bytes_compressed_wire": 201087,
+          "nar_size_bytes_uncompressed_nar": 506392,
+          "sig": "cache.nixos.org-1:vEJuiOSmDR0svbazOWP8CpMq7QWStvf62zAuaNQNZg5eu8l3MYbkdTOxlLxkuoeIXVdAWt6sM+DU/ZFQ0FyYDw==",
+          "signed": true,
+          "classification": "compressed"
+        },
+        {
+          "store_hash": "6107vj1ijan2b4v48p064n0bfmn5hgkx",
+          "name": "mpdecimal-4.0.1",
+          "compression": "zstd",
+          "file_size_bytes_compressed_wire": 100353,
+          "nar_size_bytes_uncompressed_nar": 226192,
+          "sig": "cache.nixos.org-1:U/1DErBhv2JuGvLbr0qzFOb88R6TNEADsgzCYKu9b9xvCNzE4lHifNJgcVVL650paCJZsQsJo+cMT/lQt5m4DQ==",
+          "signed": true,
+          "classification": "compressed"
+        },
+        {
+          "store_hash": "96hgnqnikm0k4pag8x35hb6s46nag1l3",
+          "name": "xz-5.8.3",
+          "compression": "zstd",
+          "file_size_bytes_compressed_wire": 248998,
+          "nar_size_bytes_uncompressed_nar": 857952,
+          "sig": "cache.nixos.org-1:1stwxQGxnTlhUHTXX6LYO1kC+6atzyO6Sk4Hovipzqyg5Bbn07znA+I28oTfaSza0Xn3x7g27Wo2EKas1GSGBA==",
+          "signed": true,
+          "classification": "compressed"
+        },
+        {
+          "store_hash": "fqkp26idpnpqk5l2cjfb51jdn6nj5bam",
+          "name": "sqlite-3.53.3",
+          "compression": "zstd",
+          "file_size_bytes_compressed_wire": 2285791,
+          "nar_size_bytes_uncompressed_nar": 6027056,
+          "sig": "cache.nixos.org-1:1ORHLGgkyff+LgelHj9mkWKu/U2fpF6kP91bH5dWOV4a2sGK5oGBFaFm7ZtpM2TEMLkHm5uI8lZWUY5SaPWxBQ==",
+          "signed": true,
+          "classification": "compressed"
+        },
+        {
+          "store_hash": "ivslqa3a0qbj3q0p9w7n71zf62jlag2b",
+          "name": "mailcap-2.1.54",
+          "compression": "zstd",
+          "file_size_bytes_compressed_wire": 32571,
+          "nar_size_bytes_uncompressed_nar": 119360,
+          "sig": "cache.nixos.org-1:TJ9N/KfRqKCjfNSVyzTwrjSTRFrXq0d0nkRjPWGlsl+bSwLUE7/YfwFhkNnyMZ0zmvP8jRTC/ZFukVMkIL+FDA==",
+          "signed": true,
+          "classification": "compressed"
+        },
+        {
+          "store_hash": "kpjkxs3hlgl7yxqp8cg7fkvs42zi4vfh",
+          "name": "util-linux-minimal-2.42.2-lib",
+          "compression": "zstd",
+          "file_size_bytes_compressed_wire": 710222,
+          "nar_size_bytes_uncompressed_nar": 2100440,
+          "sig": "cache.nixos.org-1:09kEirZzeeZb+e4xpgaBnyjZHMg6MweduMxhVBlYkDfWL1ZSd0eyHStDkx2dxNTeUFCsGdXrc1PQUG/5dg3BAg==",
+          "signed": true,
+          "classification": "compressed"
+        },
+        {
+          "store_hash": "pxahscw9vl9vac1nbjpy6bhz3vbk3cpl",
+          "name": "zstd-1.5.7",
+          "compression": "zstd",
+          "file_size_bytes_compressed_wire": 473086,
+          "nar_size_bytes_uncompressed_nar": 1202224,
+          "sig": "cache.nixos.org-1:n7CfDIuAEn+TbhzTFEY+JFNzEDqQc4QFKrv22hl2RJliuWB4K4lqntjF84XA9lnyr5f4OE5HqM5o8+l7jozICw==",
+          "signed": true,
+          "classification": "compressed"
+        },
+        {
+          "store_hash": "ssvhb57axjvgid3q6jqy38vfqz7i7955",
+          "name": "gdbm-1.26-lib",
+          "compression": "zstd",
+          "file_size_bytes_compressed_wire": 127876,
+          "nar_size_bytes_uncompressed_nar": 459336,
+          "sig": "cache.nixos.org-1:wNPwmCybSSCe3/EKAxzzykeWPAhS+FNKMRrzBGeRz5ogUwyWZt9COjzu0g9xpWRxwD/xRw9QzbrwpC3GbgVQBA==",
+          "signed": true,
+          "classification": "compressed"
+        },
+        {
+          "store_hash": "vlgjd2179ahfh509p1aid8fl22bw8ri3",
+          "name": "tzdata-2026c",
+          "compression": "zstd",
+          "file_size_bytes_compressed_wire": 202653,
+          "nar_size_bytes_uncompressed_nar": 2138680,
+          "sig": "cache.nixos.org-1:CBnfciVsHEQSEzrMiSKQj6sCzJIcET6CuqA7RjNSUjp7dN7jbmLYTanRi2EjDjVqlgs71v5INEX+5qFF8EJaBA==",
+          "signed": true,
+          "classification": "compressed"
+        },
+        {
+          "store_hash": "wflv43s0i42ysmjvw1hiw4vdiidfzwnn",
+          "name": "libffi-3.7.1",
+          "compression": "zstd",
+          "file_size_bytes_compressed_wire": 36637,
+          "nar_size_bytes_uncompressed_nar": 95704,
+          "sig": "cache.nixos.org-1:8aWOkCNzz4uoatLkBdfngS4hAE+5JqTgRVF5Luzlgas+lx3sQYztD12QR8Pbu4d8CTVqchd/5m3CXayH8wrYCA==",
+          "signed": true,
+          "classification": "compressed"
+        },
+        {
+          "store_hash": "x7hyp2ndwysydy2q1djdvjzlqzvqhg8x",
+          "name": "expat-2.8.2",
+          "compression": "zstd",
+          "file_size_bytes_compressed_wire": 120555,
+          "nar_size_bytes_uncompressed_nar": 320072,
+          "sig": "cache.nixos.org-1:1La2zXcVO0BxuH5rMOEik09MGC5b6AgcyXhOvrrzwYHkP11k2rxCc6jlE5XjXGjGeyzA6INkZyh2bn+fhXQbDg==",
+          "signed": true,
+          "classification": "compressed"
+        },
+        {
+          "store_hash": "zks9mfsn4rqr6z9g6pcj2xqzcsplj0nb",
+          "name": "zlib-1.3.2",
+          "compression": "zstd",
+          "file_size_bytes_compressed_wire": 72148,
+          "nar_size_bytes_uncompressed_nar": 132608,
+          "sig": "cache.nixos.org-1:Hzqvms5imfhmm2eDXI3A6W5H7xTIVs6Ve1wGmhcEuvBul5FM2VwC9LSFAp+nH3Kl3qkA3oDhivOz1wyLMbvVDA==",
+          "signed": true,
+          "classification": "compressed"
+        },
+        {
+          "store_hash": "zlvs6miv8wfki399pmxri7x0sjd3429c",
+          "name": "ncurses-6.6",
+          "compression": "zstd",
+          "file_size_bytes_compressed_wire": 700103,
+          "nar_size_bytes_uncompressed_nar": 3870560,
+          "sig": "cache.nixos.org-1:R0QosvWMbhgVm/idxP4apaRpurWIhnbJHZTg4NAAz7oz2BJTi/hh5onm61jN1324NTiSTOvSpwWshsTjlF+xBw==",
+          "signed": true,
+          "classification": "compressed"
+        },
+        {
+          "store_hash": "7l4mplrxx5q2ca64084prb76v40nsdqb",
+          "name": "sdl2-compat-2.32.70",
+          "compression": "zstd",
+          "file_size_bytes_compressed_wire": 259738,
+          "nar_size_bytes_uncompressed_nar": 942232,
+          "sig": "cache.nixos.org-1:TAYfO7+zr1eeKcu8ac2aE5e/cwOIn+xAVxWtmJFcWtGPTqH14sRUQWe81lNpphPF9rOykwwfiBxkGrh4plM1AQ==",
+          "signed": true,
+          "classification": "compressed"
+        },
+        {
+          "store_hash": "byrrwp394d0hn6py4hbkjndnkqfw271c",
+          "name": "ffmpeg-9.0-lib",
+          "compression": "zstd",
+          "file_size_bytes_compressed_wire": 15030437,
+          "nar_size_bytes_uncompressed_nar": 35450328,
+          "sig": "cache.nixos.org-1:+aV1PnGfFvSlgoOznqFl+t4ecaKkZ4WO+e3s+6evX2FhbjTkm5li8Qc3CSYv2DEGn6E6Vkdx8Vw2Q6Hks6KQAw==",
+          "signed": true,
+          "classification": "compressed"
+        },
+        {
+          "store_hash": "cjwr2i0ydr3zf1zam06gqgfzzvni35g6",
+          "name": "ffmpeg-9.0-data",
+          "compression": "zstd",
+          "file_size_bytes_compressed_wire": 51839,
+          "nar_size_bytes_uncompressed_nar": 282360,
+          "sig": "cache.nixos.org-1:QuUac15792eD7CdTV6iT4uwEF3dg3158fQdw99u1CANhdHjwawxQJsikp5LH4rJbbJ5e2Q1q6LH1rKqZHcoIAw==",
+          "signed": true,
+          "classification": "compressed"
+        },
+        {
+          "store_hash": "1hhy4x0npgnf5xb8pyxfal4zk9nn0s41",
+          "name": "perl5.42.0-HTML-TagCloud-0.38",
+          "compression": "zstd",
+          "file_size_bytes_compressed_wire": 3821,
+          "nar_size_bytes_uncompressed_nar": 13144,
+          "sig": "cache.nixos.org-1:FYvYHQxZIXIp3vv5GT5913+zFMahaoWOCWti6hSXep/ucc88ZxSUV5pwn53+n712Ouwp8qG7ez5gqA3CPJxuBg==",
+          "signed": true,
+          "classification": "compressed"
+        },
+        {
+          "store_hash": "42ixphp7ffr0vc2pn0pwsmd28igrd0fh",
+          "name": "curl-8.21.0",
+          "compression": "zstd",
+          "file_size_bytes_compressed_wire": 581804,
+          "nar_size_bytes_uncompressed_nar": 1253944,
+          "sig": "cache.nixos.org-1:dN0QPuS2MekS2/ZN3rsIKc4DKrBYAgrcgR2VcNjzEuhLMEK09y18KQPlb74LJ9aZ9DCPOR8miRxgQ3xe+eMwBw==",
+          "signed": true,
+          "classification": "compressed"
+        },
+        {
+          "store_hash": "45v0zhdyy25r487v7fra7sdlrh5f17js",
+          "name": "gettext-1.0",
+          "compression": "zstd",
+          "file_size_bytes_compressed_wire": 4882844,
+          "nar_size_bytes_uncompressed_nar": 24728888,
+          "sig": "cache.nixos.org-1:kc5QufHdb0wQE5c55S5QZyj3bqIgnDLrORcLmut2TyDpvZ1sUBTd1VE1XfQagblHhgtKDZVr6/FZGSUWu8OwDg==",
+          "signed": true,
+          "classification": "compressed"
+        },
+        {
+          "store_hash": "5hfc0j56yc4xynq7m4xzi5c9qd2i156f",
+          "name": "gzip-1.14",
+          "compression": "zstd",
+          "file_size_bytes_compressed_wire": 72814,
+          "nar_size_bytes_uncompressed_nar": 159888,
+          "sig": "cache.nixos.org-1:ZoF6Sfo4qiZ7K+/PH+Ef2laqGn115eVzvMy21yD146QBGMtYueOdGACfmVCqqq4ZmrzxJRpVVTMOKao2HkTVCg==",
+          "signed": true,
+          "classification": "compressed"
+        },
+        {
+          "store_hash": "5vn578f6vq05mp71imi03yy4kbs3w5v8",
+          "name": "perl5.42.0-FCGI-ProcManager-0.28",
+          "compression": "zstd",
+          "file_size_bytes_compressed_wire": 9117,
+          "nar_size_bytes_uncompressed_nar": 28224,
+          "sig": "cache.nixos.org-1:9cH6l6b18saO5iX1hzwfx9chdPCn1m0UPeLavJ9iaCbyjSZdM1G3AgqvrmBHV8VmHtGI0fvEdb9n6VlaQox7CA==",
+          "signed": true,
+          "classification": "compressed"
+        },
+        {
+          "store_hash": "90nk33c4fkyg4x4dfk5cykqiryf2nlqq",
+          "name": "bash-interactive-5.3p15",
+          "compression": "zstd",
+          "file_size_bytes_compressed_wire": 1650418,
+          "nar_size_bytes_uncompressed_nar": 7411712,
+          "sig": "cache.nixos.org-1:32XoZzWREeEfKiST8X+4yF19hTpGHTuEoxuMP2x/yHyCtS6dqdVJjS/f3Pis7YtAykbAshytttaNi/F0im6NCg==",
+          "signed": true,
+          "classification": "compressed"
+        },
+        {
+          "store_hash": "969pp73dsr1i32rv9331m6vkww2m0z49",
+          "name": "perl5.42.0-CGI-Fast-2.16",
+          "compression": "zstd",
+          "file_size_bytes_compressed_wire": 4779,
+          "nar_size_bytes_uncompressed_nar": 13368,
+          "sig": "cache.nixos.org-1:KeP+C8MVLHxTHwNv63rcDEBnExjEjr418Y+tK4QqSyfSQ8ndKR1oWGG64Z3I9igt5tkUA0Z6VV8RYQdoGltCAw==",
+          "signed": true,
+          "classification": "compressed"
+        },
+        {
+          "store_hash": "anri00q3zrwkxdnch0vic10yy9kykgfp",
+          "name": "perl-5.42.0",
+          "compression": "zstd",
+          "file_size_bytes_compressed_wire": 13667731,
+          "nar_size_bytes_uncompressed_nar": 57724016,
+          "sig": "cache.nixos.org-1:WJ8AiXnRALShHhi6EpihIUqIcbZEaiAxYMgnJSsjQdPsHazGxbDLqPXXjZBu8t6CzivY+ZOPzxQ5FUba5LRECQ==",
+          "signed": true,
+          "classification": "compressed"
+        },
+        {
+          "store_hash": "bq60kllxrxj7lhr3cq0gil0fn4jbj3f0",
+          "name": "perl5.42.0-IO-Socket-SSL-2.083",
+          "compression": "zstd",
+          "file_size_bytes_compressed_wire": 160475,
+          "nar_size_bytes_uncompressed_nar": 492936,
+          "sig": "cache.nixos.org-1:2vVpxdGz2HwP6FSW5rcnhunfm1cZ05l/F/0c7hXZPfRS425wPXuM7xFxhgfFdAgK0XhpjSzjwS/w5lr59EoxCA==",
+          "signed": true,
+          "classification": "compressed"
+        },
+        {
+          "store_hash": "dsn500c5j62qz9f49mi3nhx74jbkf6xq",
+          "name": "pcre2-10.47",
+          "compression": "zstd",
+          "file_size_bytes_compressed_wire": 675849,
+          "nar_size_bytes_uncompressed_nar": 2072240,
+          "sig": "cache.nixos.org-1:UiKxsPjcqq+Bt4JRFlz2hlxCInSqijKMJah5xbXXcWM/F1HUvNrltVe4gFC36pwgudYJ4bFsrRJFGGEWLQypDg==",
+          "signed": true,
+          "classification": "compressed"
+        },
+        {
+          "store_hash": "fsqydrz91cy738y59jnv1x8qxgkl0wp3",
+          "name": "perl5.42.0-URI-5.21",
+          "compression": "zstd",
+          "file_size_bytes_compressed_wire": 46527,
+          "nar_size_bytes_uncompressed_nar": 161944,
+          "sig": "cache.nixos.org-1:ra+W5/Wx0QY2EjrQfU2/Y4oLMTNNGYP8thhLhvsecVSotPxmrKOjAVU9plcipY5vpc+f2BoB6OQQEp1NbCbdDg==",
+          "signed": true,
+          "classification": "compressed"
+        },
+        {
+          "store_hash": "g2baskikwmigbvynsk7gy57g0n8wgicq",
+          "name": "perl5.42.0-libnet-3.15",
+          "compression": "zstd",
+          "file_size_bytes_compressed_wire": 58329,
+          "nar_size_bytes_uncompressed_nar": 216056,
+          "sig": "cache.nixos.org-1:BNv1Dvh3xQMa4dx74lCXBfvLcQEBsKs8aB2i8AQgv9isA+hZpMOi8xnSnF2V5Ehp9vsgpvrIKB7AcNoreapTBg==",
+          "signed": true,
+          "classification": "compressed"
+        },
+        {
+          "store_hash": "h1dp7wlh1saz2d77ajpdpbms1fn56ih8",
+          "name": "git-2.55.0-doc",
+          "compression": "zstd",
+          "file_size_bytes_compressed_wire": 2556529,
+          "nar_size_bytes_uncompressed_nar": 16297536,
+          "sig": "cache.nixos.org-1:IP//BiJcav5BgqrZflBSiaXkA7wLzShBPJnDyFGdAl5H60G+uQWoKQ5eguHXwKolEuXiBCgCxoPGozvg1kx+Aw==",
+          "signed": true,
+          "classification": "compressed"
+        },
+        {
+          "store_hash": "h58nzfvb4js2dp7kb4ddj4is983x83h4",
+          "name": "perl5.42.0-Digest-HMAC-1.05",
+          "compression": "zstd",
+          "file_size_bytes_compressed_wire": 2310,
+          "nar_size_bytes_uncompressed_nar": 9432,
+          "sig": "cache.nixos.org-1:wxlG9nZWWNoSUIvbW+L4UsXh+WoKRQTbmMw7JQqIy6MkGeYxnOf2av+j9oKePObVWU7gzRHzgqobmNwdm/ICAQ==",
+          "signed": true,
+          "classification": "compressed"
+        },
+        {
+          "store_hash": "i014qgbl80pi5zfdacqjspv59ifnkgz2",
+          "name": "perl5.42.0-Authen-SASL-2.1900",
+          "compression": "zstd",
+          "file_size_bytes_compressed_wire": 21649,
+          "nar_size_bytes_uncompressed_nar": 86520,
+          "sig": "cache.nixos.org-1:gf705ViLWRjEXfIkXiy1T11UO6ZGYEcZ1MjpVR+oQ6HmH6C2yNYujOZRR8uVKj/DQFrUMEDUgpop0aLfI+N3Dw==",
+          "signed": true,
+          "classification": "compressed"
+        },
+        {
+          "store_hash": "inm9cfdi3ns7izy549nwd22520xl6rvd",
+          "name": "zlib-ng-2.3.3",
+          "compression": "zstd",
+          "file_size_bytes_compressed_wire": 100435,
+          "nar_size_bytes_uncompressed_nar": 197240,
+          "sig": "cache.nixos.org-1:MM/SlTO/X4ZYqTFSssjgbggDXlbmJGYOmAMLC9Wlum0pO0pcLPBgzCakTYivCWVQxTrblxnE6o/SE24S+N+bBg==",
+          "signed": true,
+          "classification": "compressed"
+        },
+        {
+          "store_hash": "l0mqbsf1f0rap7wh741jw3gv9yn3xvg4",
+          "name": "perl5.42.0-Net-SMTP-SSL-1.04",
+          "compression": "zstd",
+          "file_size_bytes_compressed_wire": 1584,
+          "nar_size_bytes_uncompressed_nar": 5544,
+          "sig": "cache.nixos.org-1:feRNFw56SWiHNgvA336CdnYDNqo/6gbfXT07A6eF4TOEvEJOZfqJxfMOeguaOjbYiVtOQL68gx+Tl4h3W+oMBg==",
+          "signed": true,
+          "classification": "compressed"
+        },
+        {
+          "store_hash": "pll08kqgkvvp2y356d4dc99ffvs5y0xw",
+          "name": "perl5.42.0-libwww-perl-6.83",
+          "compression": "zstd",
+          "file_size_bytes_compressed_wire": 94027,
+          "nar_size_bytes_uncompressed_nar": 305704,
+          "sig": "cache.nixos.org-1:h8btQyVquamJA0wWumnnuaIEcHHQqIiRJXIJ6nGaCja5Oo4Fk3ygQDVRJp5QieqVHSRvgDxI3vtpQAWlHZ8NAQ==",
+          "signed": true,
+          "classification": "compressed"
+        },
+        {
+          "store_hash": "qfwlgyr3r3fn09xc28fy1lbkq0bid78k",
+          "name": "perl5.42.0-TermReadKey-2.38",
+          "compression": "zstd",
+          "file_size_bytes_compressed_wire": 16236,
+          "nar_size_bytes_uncompressed_nar": 48472,
+          "sig": "cache.nixos.org-1:c1qldFeGSW8ftDcYTtsVBb3aHl+S30FeYcfvZUU+GYJBZSp5XuFpFAXpGByUegeFRnlyypyGhEBU+nK43RncCA==",
+          "signed": true,
+          "classification": "compressed"
+        },
+        {
+          "store_hash": "rxd8p6g4k4s0sx4q1szmzvp9rsmhmfys",
+          "name": "gnused-4.10",
+          "compression": "zstd",
+          "file_size_bytes_compressed_wire": 238121,
+          "nar_size_bytes_uncompressed_nar": 816464,
+          "sig": "cache.nixos.org-1:fGmGgdarvu+zck+uCiXrj7NrPqu+ywnEHg0uw/50wG60Uz4oz+BLJ+ChyDpduWFzt8OlDnkZw2XXKrT3Rzs7Cg==",
+          "signed": true,
+          "classification": "compressed"
+        },
+        {
+          "store_hash": "v4sp1b5d14xkh3971c9wv740hn8y8a5y",
+          "name": "perl5.42.0-Net-SSLeay-1.92",
+          "compression": "zstd",
+          "file_size_bytes_compressed_wire": 236237,
+          "nar_size_bytes_uncompressed_nar": 1149048,
+          "sig": "cache.nixos.org-1:JuLQqBB317cbo7rVEja6xZ812yDvbnz27tVgU+kn5s0li8XB//87LaDVPUWQOImG/BPhhmAQllr5tOTtqVc2AA==",
+          "signed": true,
+          "classification": "compressed"
+        },
+        {
+          "store_hash": "vgbjids4w9i7pv66h2i7n8ykjfp5ynhx",
+          "name": "perl5.42.0-HTML-Parser-3.85",
+          "compression": "zstd",
+          "file_size_bytes_compressed_wire": 57371,
+          "nar_size_bytes_uncompressed_nar": 157896,
+          "sig": "cache.nixos.org-1:sbuFcrTh5TJgzqOjRtR3zIKhgNEjwOYXW7kOhJh6kYYoE55TQ84sA3UpIe9KW6Fba8cW7lgNLHUAsimM73qZBQ==",
+          "signed": true,
+          "classification": "compressed"
+        },
+        {
+          "store_hash": "xygvygzhj2j1vsk5nxs6hy572pkp4vch",
+          "name": "perl5.42.0-FCGI-0.82",
+          "compression": "zstd",
+          "file_size_bytes_compressed_wire": 33616,
+          "nar_size_bytes_uncompressed_nar": 82376,
+          "sig": "cache.nixos.org-1:AZSE3WX3pyF84Q0RjhHYJWp786sfrgn3vy6Koy3+qwRqrWXL75VGejAmCxFm3NXs2DC9JfSTWoKcYS5lKgqnCg==",
+          "signed": true,
+          "classification": "compressed"
+        },
+        {
+          "store_hash": "ys8dsdhd5jzvvcqlfaziaa27ppjbmz18",
+          "name": "perl5.42.0-CGI-4.59",
+          "compression": "zstd",
+          "file_size_bytes_compressed_wire": 101000,
+          "nar_size_bytes_uncompressed_nar": 324280,
+          "sig": "cache.nixos.org-1:mBCCpKFRkILiwXJVyN6d4+IMZIdfVte8f3wr2KtS0zww61RCO4uC0HFd7FrA/4j7maWchtLUn2jlB1C1AZAyBA==",
+          "signed": true,
+          "classification": "compressed"
+        },
+        {
+          "store_hash": "kpcd405yxfc3pfv8x4mv5j3fj54v946p",
+          "name": "libidn2-2.3.8",
+          "compression": "zstd",
+          "file_size_bytes_compressed_wire": 142581,
+          "nar_size_bytes_uncompressed_nar": 368176,
+          "sig": "cache.nixos.org-1:PcBwpdidEdksmcMU4dkSWthPLV0VNqVvVScAQwVS+4Ulfjpc+XUSgUEuoA9EvlyKHd1o4+ZVtIs8htRJAXRDBw==",
+          "signed": true,
+          "classification": "compressed"
+        },
+        {
+          "store_hash": "v4zcvckzr9hqpg1f6bmkbf2q7fmszzvk",
+          "name": "xgcc-15.3.0-libgcc",
+          "compression": "zstd",
+          "file_size_bytes_compressed_wire": 92344,
+          "nar_size_bytes_uncompressed_nar": 197672,
+          "sig": "cache.nixos.org-1:kebQv2kBuXS1abzX2ooTPeI7ltIRCTsRrWbaIbp1QEgfk32TKqGL7nvRUxkNXNld+Mf9+sGQ/5iHebAz7EXzBw==",
+          "signed": true,
+          "classification": "compressed"
+        },
+        {
+          "store_hash": "4gacmljs66gjn5w2iya833ll4wbnz7hh",
+          "name": "mpfr-4.2.2",
+          "compression": "zstd",
+          "file_size_bytes_compressed_wire": 387472,
+          "nar_size_bytes_uncompressed_nar": 822648,
+          "sig": "cache.nixos.org-1:dy2Tn3VH1MnwZ6SqFWkMdUNubrSJIvHchC6L/zZvw8CN57gKRi5MmYGkR42kRvqt8t4BsN324NNUO9qkjutcAQ==",
+          "signed": true,
+          "classification": "compressed"
+        },
+        {
+          "store_hash": "5nli00pq00b48nrx6364gq1w2p3fhgcg",
+          "name": "isl-0.20",
+          "compression": "zstd",
+          "file_size_bytes_compressed_wire": 958395,
+          "nar_size_bytes_uncompressed_nar": 2638360,
+          "sig": "cache.nixos.org-1:82BBG2bNSuCgNpqfDNFNQLmZLDbW4cojXYHxtQ7QAuygiDNfk2NFmPxqd3me0sRPpYNMWpFY7llOF2fRW2T5BQ==",
+          "signed": true,
+          "classification": "compressed"
+        },
+        {
+          "store_hash": "9a4rlpdc6cc72slb7f2prdhcvidj5rhz",
+          "name": "gmp-6.3.0",
+          "compression": "zstd",
+          "file_size_bytes_compressed_wire": 339110,
+          "nar_size_bytes_uncompressed_nar": 739864,
+          "sig": "cache.nixos.org-1:yi4rvpyElzhX0GxXORs7T6qKl06acgt0cI1fzov+IARUVHm6onRcVuZQwi9ogdIpvdve00zraRXPAOIQLM8FBg==",
+          "signed": true,
+          "classification": "compressed"
+        },
+        {
+          "store_hash": "skwiwbwldgdjiky0g4cijs6gb3gz5rwr",
+          "name": "libmpc-1.4.1",
+          "compression": "zstd",
+          "file_size_bytes_compressed_wire": 111567,
+          "nar_size_bytes_uncompressed_nar": 308776,
+          "sig": "cache.nixos.org-1:K5lij859eEZwL3U9cx53MXYiHcAmeJfTxtgpeyPBIy8U+UFE9Nt0Lq99CxSS/cL4gTc3U6wrgflJ/KQyfsTvBg==",
+          "signed": true,
+          "classification": "compressed"
+        },
+        {
+          "store_hash": "hdafzn814kg90afqsm7dq130y0aq3iaz",
+          "name": "gmp-with-cxx-6.3.0",
+          "compression": "zstd",
+          "file_size_bytes_compressed_wire": 348617,
+          "nar_size_bytes_uncompressed_nar": 783432,
+          "sig": "cache.nixos.org-1:woOXuHRxRYgTaCCDpqKYUws6vZIGEFdCuzD4TYURnGpAsJIONi7/OFSACgKFn/HiVkT0oixVlmtN0GYI4DffBw==",
+          "signed": true,
+          "classification": "compressed"
+        },
+        {
+          "store_hash": "l0c9s0y8mspasl4dg91d9kqhsigqnl75",
+          "name": "attr-2.6.0",
+          "compression": "zstd",
+          "file_size_bytes_compressed_wire": 21049,
+          "nar_size_bytes_uncompressed_nar": 90936,
+          "sig": "cache.nixos.org-1:r+8FFX3vggHC5UJheAje+C7/28wdx0l+i/9w68QFgW7zCOmT5nj3Dh4tvacbMKYMcm18Ige/Kf/ZqPn7EIYxAQ==",
+          "signed": true,
+          "classification": "compressed"
+        },
+        {
+          "store_hash": "njhz1f5xr4hgniy9bbb9g5k2llgsmycv",
+          "name": "acl-2.4.0",
+          "compression": "zstd",
+          "file_size_bytes_compressed_wire": 36641,
+          "nar_size_bytes_uncompressed_nar": 137600,
+          "sig": "cache.nixos.org-1:5iJvvjdzPQhICIvd3/CUSxfLJcbqynU8M4bYjHA7txv9ziYzoexcjyhNFR8cQFDwixS8kFotFQVsgrI6/cJ+Dg==",
+          "signed": true,
+          "classification": "compressed"
+        },
+        {
+          "store_hash": "8lkj89binl0xhraqxb8bwmv0q4p3pnlr",
+          "name": "binutils-2.46",
+          "compression": "zstd",
+          "file_size_bytes_compressed_wire": 9055522,
+          "nar_size_bytes_uncompressed_nar": 34164200,
+          "sig": "cache.nixos.org-1:03wjKKp4PFXlP21VZeROHtgaS2chPhEsk0LN8knPHJOF2ffrsJ/t1tiTYdJ6tD8wnFbeIiMEHNM4tVi+Gr4LDg==",
+          "signed": true,
+          "classification": "compressed"
+        },
+        {
+          "store_hash": "clhc4r76h2a65s7dnkzxai2qdwiyylpd",
+          "name": "linux-headers-7.1",
+          "compression": "zstd",
+          "file_size_bytes_compressed_wire": 1935192,
+          "nar_size_bytes_uncompressed_nar": 7493728,
+          "sig": "cache.nixos.org-1:bspfNuYcsdAXKfOOkp3NzdqQJznEQ2Be12Gc3/uzBnB8hdxmOgqpFFBD2+IBl+TNS8xiTsKemTpW3r7AitYRCQ==",
+          "signed": true,
+          "classification": "compressed"
+        },
+        {
+          "store_hash": "cjgm8gv32xdrjgzbgc0zk2fypiys9ylf",
+          "name": "gcc-15.3.0-libgcc",
+          "compression": "zstd",
+          "file_size_bytes_compressed_wire": 92453,
+          "nar_size_bytes_uncompressed_nar": 197752,
+          "sig": "cache.nixos.org-1:byjP7URtwMXKFjNDocmJpq5nOmAoD67lRxBSQSWSVHOEHJQftPIrwrQHr8bZwh9Y5ObxIVxM/3pOi1CYqqC1BQ==",
+          "signed": true,
+          "classification": "compressed"
+        },
+        {
+          "store_hash": "5sj5gb7058q4qj4lri85n14njqynbax5",
+          "name": "sdl3-3.4.12-lib",
+          "compression": "zstd",
+          "file_size_bytes_compressed_wire": 1888781,
+          "nar_size_bytes_uncompressed_nar": 4901776,
+          "sig": "cache.nixos.org-1:dvOE+kXUSPI7Cykt2Zx2lqyAn6YtL5SxGVAsUszEAvw42oS6UEUkbwXK6B2LzahOi707n6UW/kEZtI7tGLRIDQ==",
+          "signed": true,
+          "classification": "compressed"
+        },
+        {
+          "store_hash": "0rdcwm42kiryn2hz3l7rwl57n996b9id",
+          "name": "libvpx-1.16.0",
+          "compression": "zstd",
+          "file_size_bytes_compressed_wire": 3194568,
+          "nar_size_bytes_uncompressed_nar": 9347088,
+          "sig": "cache.nixos.org-1:MrJ0soBNnf/0ZcbVUTcHeJvmSPqqikH/V3xXpITlS9tkqwfsmZUZVs1bVPj904CeVWjwb3SpAnldkMqUYONADA==",
+          "signed": true,
+          "classification": "compressed"
+        },
+        {
+          "store_hash": "133x6d2rys6yasnygq1hid7fs49rgr7d",
+          "name": "dav1d-1.5.3",
+          "compression": "zstd",
+          "file_size_bytes_compressed_wire": 861740,
+          "nar_size_bytes_uncompressed_nar": 2642136,
+          "sig": "cache.nixos.org-1:y8AvCAGJPm8XJhQvQ309wJkDotL/n8FjVQbxctAogJRFLl8E/Xsv7OclfnEhsnLbie1L55VzpMsiERHTLwnrBg==",
+          "signed": true,
+          "classification": "compressed"
+        },
+        {
+          "store_hash": "15fz2fsrhjk2z81dbwpggywjnq1mq7jr",
+          "name": "speex-1.2.1",
+          "compression": "zstd",
+          "file_size_bytes_compressed_wire": 70220,
+          "nar_size_bytes_uncompressed_nar": 136896,
+          "sig": "cache.nixos.org-1:M/is/GcXY65mXkS4XaqFC+qeQmEg/jWyJnTmZCS4q4mms57vGD4ynZmoytyM7yksO9aGcETttYmx6RSdSB2xCg==",
+          "signed": true,
+          "classification": "compressed"
+        },
+        {
+          "store_hash": "1x231msv0wc8vi1m0487r6hgy6ca3rjd",
+          "name": "x265-4.2",
+          "compression": "zstd",
+          "file_size_bytes_compressed_wire": 4565249,
+          "nar_size_bytes_uncompressed_nar": 25010816,
+          "sig": "cache.nixos.org-1:HQWr4jyJIVg+WAOh5pJahLvvUHfmSpMJNdwMQvye2RrZ9VfsQmG9th3prjyIlvh60C0OylOfYSv7RLC1R/wDCQ==",
+          "signed": true,
+          "classification": "compressed"
+        },
+        {
+          "store_hash": "2gc9jsd4g7g48ppp6iizd3jy4p64wg9c",
+          "name": "harfbuzz-13.2.1",
+          "compression": "zstd",
+          "file_size_bytes_compressed_wire": 1622561,
+          "nar_size_bytes_uncompressed_nar": 3896464,
+          "sig": "cache.nixos.org-1:sHAS8/EHUArL5SugZ66E1qUBLGpn4dMg3JhWPXfKZel07jDriwS35jwUHRrp8WrmcHbadbbLolKbjgEQUgIRBA==",
+          "signed": true,
+          "classification": "compressed"
+        },
+        {
+          "store_hash": "36g6iazrffiy3bkrkq1cg2siqwvah164",
+          "name": "libpulseaudio-17.0",
+          "compression": "zstd",
+          "file_size_bytes_compressed_wire": 1392246,
+          "nar_size_bytes_uncompressed_nar": 4924288,
+          "sig": "cache.nixos.org-1:qxhmKTSTsdgnWXp35jpByCv0hdT+YviH1+ArHfd+zU2xL3ab5vbK+Af9kMxlQSSZVKlqLGOONQcJlDld7f4uAA==",
+          "signed": true,
+          "classification": "compressed"
+        },
+        {
+          "store_hash": "3z8g9mx9psnyy696cnq76wm4gqz5vwhp",
+          "name": "libopus-1.6.1",
+          "compression": "zstd",
+          "file_size_bytes_compressed_wire": 289646,
+          "nar_size_bytes_uncompressed_nar": 513200,
+          "sig": "cache.nixos.org-1:ArTd37qsh0ABBOzDFxzmIxbCuJeMm5G1osKgez30OuRG+tYyyUPnffb32rB06sebq6jE8jJeLbIDGhDuLVW2AQ==",
+          "signed": true,
+          "classification": "compressed"
+        },
+        {
+          "store_hash": "4ivj7cm6rr1pj1zhr30bcl1jn6815pr1",
+          "name": "gmp-with-cxx-6.3.0",
+          "compression": "zstd",
+          "file_size_bytes_compressed_wire": 348616,
+          "nar_size_bytes_uncompressed_nar": 783432,
+          "sig": "cache.nixos.org-1:IyMX2gzGQRW/IKnAXyEt0SiQkMWJLFrfONmgzDZxk3klgYR39V7Izjyo5zJsXgqhp3qePsJYFm37a7P78c0vCg==",
+          "signed": true,
+          "classification": "compressed"
+        },
+        {
+          "store_hash": "56rncf05gyhg0vnn9vj3wmmvj7xynw4m",
+          "name": "libopenmpt-0.8.7",
+          "compression": "zstd",
+          "file_size_bytes_compressed_wire": 1272270,
+          "nar_size_bytes_uncompressed_nar": 3094704,
+          "sig": "cache.nixos.org-1:POrQMzQ5Wck9onyoZ2dwdxkWvDal+wUabOxLMfFpWIJIL/h/tCD9PrWal87y5FvMY7/MLSKEvj7JDUfNmX/VAA==",
+          "signed": true,
+          "classification": "compressed"
+        },
+        {
+          "store_hash": "5gazxn5x85bkqjxcnwzkzn0yps81fqal",
+          "name": "freetype-2.14.3",
+          "compression": "zstd",
+          "file_size_bytes_compressed_wire": 637392,
+          "nar_size_bytes_uncompressed_nar": 2264808,
+          "sig": "cache.nixos.org-1:dejQ4zmphXNtYYFlengoyfgUrt1mctYQOg1/jKoTuEmRN1RW/fV/BvQh3IhhImRZRqMmFcs63waAOa3VQ0X7Bg==",
+          "signed": true,
+          "classification": "compressed"
+        },
+        {
+          "store_hash": "62qx8cgv8h24cq4vgh5ipyflwg1naykl",
+          "name": "libx11-1.8.13",
+          "compression": "zstd",
+          "file_size_bytes_compressed_wire": 943330,
+          "nar_size_bytes_uncompressed_nar": 2700240,
+          "sig": "cache.nixos.org-1:X3wlvjF/ryHg42OYJQRogK2zuxj5kfyV9ZTyLsjZIWGGfskvBUqaLEWokANx3c0rLhxQzPLlytLNkNUsNC7aBg==",
+          "signed": true,
+          "classification": "compressed"
+        },
+        {
+          "store_hash": "6zfsinih6690m0f8prg1yxbfirs33p28",
+          "name": "ocl-icd-2.3.5",
+          "compression": "zstd",
+          "file_size_bytes_compressed_wire": 128825,
+          "nar_size_bytes_uncompressed_nar": 645064,
+          "sig": "cache.nixos.org-1:h/BP5idWkc2eNHt/mkT1ScY6ptNS9EQm5sJtmJfC/DHMDznoJ7G6V9t2/MM+oZo0cLIIOafGLmCsUtMSFEcgCg==",
+          "signed": true,
+          "classification": "compressed"
+        },
+        {
+          "store_hash": "7mqdncbvsyclvbswvi7ig0pgma8g2d11",
+          "name": "libtheora-1.2.0",
+          "compression": "zstd",
+          "file_size_bytes_compressed_wire": 182822,
+          "nar_size_bytes_uncompressed_nar": 691616,
+          "sig": "cache.nixos.org-1:yB3qAz/YadL4qsfeq1am99GK5LDiqhxdcm4RL9Sg4e3ALJ7saXh2arQEW1P1I34XJ7SV1SddXM4dYwjh/op9Dw==",
+          "signed": true,
+          "classification": "compressed"
+        },
+        {
+          "store_hash": "7mw31wmfssxhvg5pmswz1720va516g7y",
+          "name": "v4l-utils-1.32.0",
+          "compression": "zstd",
+          "file_size_bytes_compressed_wire": 272039,
+          "nar_size_bytes_uncompressed_nar": 800736,
+          "sig": "cache.nixos.org-1:imeZq3i038DIpFi0PtNkksr/TboHYCxo4aVlYpcynSy6Ey8uCmMtsHXqLcYmtWHKK/48YwQd+IALV3HLO7yUAg==",
+          "signed": true,
+          "classification": "compressed"
+        },
+        {
+          "store_hash": "8imlp2gsss6ljkg17hmgmpcw9s4cs41s",
+          "name": "librist-0.2.11",
+          "compression": "zstd",
+          "file_size_bytes_compressed_wire": 141508,
+          "nar_size_bytes_uncompressed_nar": 433096,
+          "sig": "cache.nixos.org-1:rwdMeE2/gzYhmyn0NV0QEO6hOGKPiKkVbb9ROISJVMYDYrpHMHhSp0mzvIuyLwoC1JmHrzRkjEoxwi+/Tw24DQ==",
+          "signed": true,
+          "classification": "compressed"
+        },
+        {
+          "store_hash": "akwszv4qid3cg2xqsiy6m7qdndvh552i",
+          "name": "fontconfig-2.18.2-lib",
+          "compression": "zstd",
+          "file_size_bytes_compressed_wire": 202428,
+          "nar_size_bytes_uncompressed_nar": 582360,
+          "sig": "cache.nixos.org-1:wtzGuqjvnBRzin2p8DlBAeNU0htMDvxu9xIS1moZHQbPdHP9SF0NxIJ+Z6NxVNtNX6hasxRzs1noFvNdw8lgDg==",
+          "signed": true,
+          "classification": "compressed"
+        },
+        {
+          "store_hash": "dzrsnq8qzlxs836vzl0v88y9i20aswsd",
+          "name": "libbluray-1.4.1",
+          "compression": "zstd",
+          "file_size_bytes_compressed_wire": 288836,
+          "nar_size_bytes_uncompressed_nar": 1172368,
+          "sig": "cache.nixos.org-1:s2g+NrMbbLp30ypQqe+15VwiVuSu9eLJUWSXc9o2vjEGcp+OR10SQH19825PYGg+tmXsdIJcPID2k8UnNj8SDg==",
+          "signed": true,
+          "classification": "compressed"
+        },
+        {
+          "store_hash": "f4m1lfn3zdi6pawkqnqgr9pnbpz6csqi",
+          "name": "zvbi-0.2.44",
+          "compression": "zstd",
+          "file_size_bytes_compressed_wire": 411008,
+          "nar_size_bytes_uncompressed_nar": 1086200,
+          "sig": "cache.nixos.org-1:uDjxp8ziU5Ga7eKptF8+9vRxfkGs1ZALjGhmmcv4bf6mONZijEGrz1PJ/PtRXmUmUVdni+Q93u22YseD95mQAQ==",
+          "signed": true,
+          "classification": "compressed"
+        },
+        {
+          "store_hash": "fsicx30ci2p9231hpmgl64z6ifr39mc9",
+          "name": "libass-0.17.4",
+          "compression": "zstd",
+          "file_size_bytes_compressed_wire": 127947,
+          "nar_size_bytes_uncompressed_nar": 259216,
+          "sig": "cache.nixos.org-1:kns/sL0GQV5kch2FRcUQenRT87rmCLl9AWWqFVpqmTBBXvRhgoKrT4sm/uGYKwQbwnEoDFC9ogSnBhaf5kUhDQ==",
+          "signed": true,
+          "classification": "compressed"
+        },
+        {
+          "store_hash": "fvzrihfjwmh1610sv7mz5vg2dnqc9fin",
+          "name": "libxml2-2.15.3",
+          "compression": "zstd",
+          "file_size_bytes_compressed_wire": 663053,
+          "nar_size_bytes_uncompressed_nar": 1460416,
+          "sig": "cache.nixos.org-1:N1h/O3xq+HDVssBIkHGylklvD35ZMX9Uh+sUUsCChTA/DHmZ0wsaqTWPUuqOG+FLFG6oB8+/FfITnJlX1G+KDg==",
+          "signed": true,
+          "classification": "compressed"
+        },
+        {
+          "store_hash": "gi40zlf4ywkyv0n643xhy092arza98b3",
+          "name": "libssh-0.12.2",
+          "compression": "zstd",
+          "file_size_bytes_compressed_wire": 307352,
+          "nar_size_bytes_uncompressed_nar": 703136,
+          "sig": "cache.nixos.org-1:hniRqkRsmCl6SVIJbJ22eWfXLtDJawxL6MRn04jLXdoRbsP8Sj1mkNNs6ZZm4R6Q6HdUbmJ5MEmgHXXsaHfwBA==",
+          "signed": true,
+          "classification": "compressed"
+        },
+        {
+          "store_hash": "gypmg732f1225n01gm7cgs2lmsjs9nwv",
+          "name": "xvidcore-1.3.7",
+          "compression": "zstd",
+          "file_size_bytes_compressed_wire": 294797,
+          "nar_size_bytes_uncompressed_nar": 805584,
+          "sig": "cache.nixos.org-1:9C2+srdgHnQffa/DcZyCFiFj5wJzwrlXeGNqnvWibWrXZ7zSkbQT+sPmm+Gq8TtAzpmVA0500YKhW508ruMYCA==",
+          "signed": true,
+          "classification": "compressed"
+        },
+        {
+          "store_hash": "gyrar45kwxnnzwfw5k018prs6scmj0mz",
+          "name": "libva-2.24.1",
+          "compression": "zstd",
+          "file_size_bytes_compressed_wire": 118650,
+          "nar_size_bytes_uncompressed_nar": 366432,
+          "sig": "cache.nixos.org-1:FHCmaMCzWGeDWCccJS8fH4Tj77/hhia7DRu5vWFspVZz3MHuZn4iHs8aHhrM12oNXqqNbsw3OeH8uuA1emATBg==",
+          "signed": true,
+          "classification": "compressed"
+        },
+        {
+          "store_hash": "hj6xh6dym5ycqry7j5fjdsr04zy9zf10",
+          "name": "libaom-3.12.1",
+          "compression": "zstd",
+          "file_size_bytes_compressed_wire": 3345619,
+          "nar_size_bytes_uncompressed_nar": 8854400,
+          "sig": "cache.nixos.org-1:zz+6J46cVuPmS9pHBe725nToXtBTvr9P7HVyqPFxNSJVkkL64YrxNb997Z2fZa37g8v5cNZSJ7QnJZDVZwgpAQ==",
+          "signed": true,
+          "classification": "compressed"
+        },
+        {
+          "store_hash": "jln7nf5lv6ml33vr829awb2ah44gld0l",
+          "name": "libvorbis-1.3.7",
+          "compression": "zstd",
+          "file_size_bytes_compressed_wire": 280615,
+          "nar_size_bytes_uncompressed_nar": 1114984,
+          "sig": "cache.nixos.org-1:qFI3uPXtx5n0wc0GhLMCNk9usTisDUnL5Ifjk5n9KnR4umotMBIK3PbchQ8wy4R0H/ghMp2KnwKXEK2q9jQ+Cw==",
+          "signed": true,
+          "classification": "compressed"
+        },
+        {
+          "store_hash": "jn4s2svaja5a1p6k8fkdvcdhqlsy0kpw",
+          "name": "srt-1.5.6",
+          "compression": "zstd",
+          "file_size_bytes_compressed_wire": 1761439,
+          "nar_size_bytes_uncompressed_nar": 7325616,
+          "sig": "cache.nixos.org-1:NCoJQ/37M/Xnoi94DUHN0VeHwckzqL2cyMRYj8qRHzdS3+MEAEKVaHDxBWC0TK3kAd5qbsAbOoA7iGtBTrYNAA==",
+          "signed": true,
+          "classification": "compressed"
+        },
+        {
+          "store_hash": "lyg6z8p25ns2a7lbnv7f59xgjdmn87pb",
+          "name": "x264-0-unstable-2025-01-03-lib",
+          "compression": "zstd",
+          "file_size_bytes_compressed_wire": 897667,
+          "nar_size_bytes_uncompressed_nar": 2468024,
+          "sig": "cache.nixos.org-1:pNv4orjwYhs4dmqDmfy7eKZOTGWiX6/yYVsxFRX/7z1sAwY80m4hoadzTiCmpH0HBE41GCta96QQJNCR6DdlAw==",
+          "signed": true,
+          "classification": "compressed"
+        },
+        {
+          "store_hash": "np5b4mjvx2g9arc0wh66ajmbx62nyv44",
+          "name": "vid.stab-1.1.1-unstable-2025-08-21",
+          "compression": "zstd",
+          "file_size_bytes_compressed_wire": 120732,
+          "nar_size_bytes_uncompressed_nar": 565792,
+          "sig": "cache.nixos.org-1:xxkDdChIUCk7eFQBv9tXAnigzT/ReS2diaTJHqo61Mi62Kfv5bA1erw57GyCzeqs7JalRVlolQ8XInYVC4uIBw==",
+          "signed": true,
+          "classification": "compressed"
+        },
+        {
+          "store_hash": "r8hr5vgnmgim4iawzsnj8zfcs75k2bxa",
+          "name": "soxr-0.1.3",
+          "compression": "zstd",
+          "file_size_bytes_compressed_wire": 127014,
+          "nar_size_bytes_uncompressed_nar": 305544,
+          "sig": "cache.nixos.org-1:idSHXsFxeKLVP8241YKjY9as6+dUA0hdP56CpuzmE50ZL2Gncy3hGNt3UvKvh+dxyl8qaosDetlXjP+rQcjGBQ==",
+          "signed": true,
+          "classification": "compressed"
+        },
+        {
+          "store_hash": "rzklsspxrf2b0c6j86r4xizis35j9gll",
+          "name": "svt-av1-4.1.0",
+          "compression": "zstd",
+          "file_size_bytes_compressed_wire": 3195312,
+          "nar_size_bytes_uncompressed_nar": 7684200,
+          "sig": "cache.nixos.org-1:hsUqbG4gAbvfgbuhk1TVD5QHr5A4UjnYBGft+gADC6+XP0iAqareIAOgXP0Kr5FG+i3cn4jQX/U9tvW8i5+uBg==",
+          "signed": true,
+          "classification": "compressed"
+        },
+        {
+          "store_hash": "sb8j2b253hb2vz34h8aacxhd9xbywkdx",
+          "name": "zimg-3.0.6",
+          "compression": "zstd",
+          "file_size_bytes_compressed_wire": 281305,
+          "nar_size_bytes_uncompressed_nar": 781312,
+          "sig": "cache.nixos.org-1:H5rvpeNJaTN2cEb9B7uorW9Sl0EKSCrHEWlO/i6+aDcj+E+8zhj5EN2Ew2/DEZCR7ve2r1cfTUG2smbBjZXBCQ==",
+          "signed": true,
+          "classification": "compressed"
+        },
+        {
+          "store_hash": "shigmwjhpsih311ngddbn8ppjsry7q9y",
+          "name": "openjpeg-2.5.4",
+          "compression": "zstd",
+          "file_size_bytes_compressed_wire": 414555,
+          "nar_size_bytes_uncompressed_nar": 1686488,
+          "sig": "cache.nixos.org-1:dgv4BKvAhQ26pvkkq8yuRxYzWFykhzePYmAzbYEKBxOgiagZeNm5RvSuvsv6RqB9WC1w8qhW4ahS2O+XOq8tDw==",
+          "signed": true,
+          "classification": "compressed"
+        },
+        {
+          "store_hash": "v4hbdl5ikpxwm5p1cf7lbyicg5nbf1i1",
+          "name": "openapv-0.2.1.3",
+          "compression": "zstd",
+          "file_size_bytes_compressed_wire": 141222,
+          "nar_size_bytes_uncompressed_nar": 737080,
+          "sig": "cache.nixos.org-1:beChg6jBqFYgOZK4b/g/h/7UJIUp6Vx6ZfzT9lWIcZL5g6434HBO/0S1HggEno5Jsy+SYm//e72Riap+k6XOCg==",
+          "signed": true,
+          "classification": "compressed"
+        },
+        {
+          "store_hash": "vby7f6w0189hcvcribawy73fq55h18z7",
+          "name": "gnutls-3.8.13",
+          "compression": "zstd",
+          "file_size_bytes_compressed_wire": 1385976,
+          "nar_size_bytes_uncompressed_nar": 3732704,
+          "sig": "cache.nixos.org-1:zsGNPorSTkoBEpVOlSYzrCjG/TDsyGZVTi+uHX4dHkm9/QcX1YyxnNzsFHbaeT7/PliWEoSfK+ssvsHimNxJDg==",
+          "signed": true,
+          "classification": "compressed"
+        },
+        {
+          "store_hash": "w5x1m3rrmiln4bq1wypfwrhx3x94d50l",
+          "name": "libvdpau-1.5",
+          "compression": "zstd",
+          "file_size_bytes_compressed_wire": 30859,
+          "nar_size_bytes_uncompressed_nar": 103728,
+          "sig": "cache.nixos.org-1:L7zt9SF4W/tKpBjg66N7uKIYmsZycM9TBK9TLrYTJNBp71t9J6UagCDP5aqv/EefehdKrf6srrlVFNzctquGBg==",
+          "signed": true,
+          "classification": "compressed"
+        },
+        {
+          "store_hash": "w8bgsxay0hvq7786kch1fpz5faij7cnx",
+          "name": "fribidi-1.0.16",
+          "compression": "zstd",
+          "file_size_bytes_compressed_wire": 34508,
+          "nar_size_bytes_uncompressed_nar": 166400,
+          "sig": "cache.nixos.org-1:V904VuWtdfnGkFL46ocuYzNlMQXEjp04Wud7L1G6GDPAImD8YV/yrOEYq0FCvcb7Gydyt3zMD4ouiJgZaE11BQ==",
+          "signed": true,
+          "classification": "compressed"
+        },
+        {
+          "store_hash": "wrx3mplc9dmmlla9qfb0dldn0ri85mbs",
+          "name": "lame-3.100-lib",
+          "compression": "zstd",
+          "file_size_bytes_compressed_wire": 177598,
+          "nar_size_bytes_uncompressed_nar": 357152,
+          "sig": "cache.nixos.org-1:51h9WXmPEPg6Dxsf8bRAjXSE2Iz0Eyn1PYKVpMiLdgj49Y9FBunVezLtQHh9lmtFFZNTMkEypSYhc6h5IcGHAA==",
+          "signed": true,
+          "classification": "compressed"
+        },
+        {
+          "store_hash": "wsawm4nismaxz5lzc40ywcwyi1mcn6xv",
+          "name": "vulkan-loader-1.4.357.0",
+          "compression": "zstd",
+          "file_size_bytes_compressed_wire": 219574,
+          "nar_size_bytes_uncompressed_nar": 727624,
+          "sig": "cache.nixos.org-1:uybXdIa4Sf90pzkKfzDwJNXW1JgWBA3D+7aMzJcEduJscipgTbAj3FkPYt0zAkSw8EFrP91ou9pkdqdYoVTQBA==",
+          "signed": true,
+          "classification": "compressed"
+        },
+        {
+          "store_hash": "y4iw2bnyk2l5xgx5ayhj8sp01928sh3x",
+          "name": "alsa-lib-1.2.16.1",
+          "compression": "zstd",
+          "file_size_bytes_compressed_wire": 665267,
+          "nar_size_bytes_uncompressed_nar": 1877072,
+          "sig": "cache.nixos.org-1:QIc8ON+Mmr+byNsQZUvtzMnp+T5xPuXGFDb4ZIuM3gW6bxGKv0lwAtdFJ3yWPQ+H7bujqhrthDBkIAEks3RxCQ==",
+          "signed": true,
+          "classification": "compressed"
+        },
+        {
+          "store_hash": "ywdnldi6bs71f3nka6fzgh4hq4hcswbm",
+          "name": "libwebp-1.6.0",
+          "compression": "zstd",
+          "file_size_bytes_compressed_wire": 582115,
+          "nar_size_bytes_uncompressed_nar": 1777968,
+          "sig": "cache.nixos.org-1:4HdvJrX8zQX0cpOCl7WTIX2M37BYZvu/jBgGE6SGwSHn2Jtxz7K1znVK1Inlp4mUzZ3TZ/5qxlmFJT+OHXq7AQ==",
+          "signed": true,
+          "classification": "compressed"
+        },
+        {
+          "store_hash": "yyvfjvdxxl26y0939wqfycc3x76k79cj",
+          "name": "libdrm-2.4.134",
+          "compression": "zstd",
+          "file_size_bytes_compressed_wire": 233328,
+          "nar_size_bytes_uncompressed_nar": 637752,
+          "sig": "cache.nixos.org-1:urGKe5ZNKuZ8AOgvXDs2o3r6PMsP9bZupJ/+JVzi2+l4g4BtMi1KSfgq6jOwT1HsGtXc+fEwtkwpQ7f1zx0JAg==",
+          "signed": true,
+          "classification": "compressed"
+        },
+        {
+          "store_hash": "1ww50zcsv4wbp5yz3ixcix4kjaicig6c",
+          "name": "libpsl-0.21.5",
+          "compression": "zstd",
+          "file_size_bytes_compressed_wire": 69258,
+          "nar_size_bytes_uncompressed_nar": 117608,
+          "sig": "cache.nixos.org-1:aDd5KrxZFRKidemeQqOGkpIyY0rSHcxpNN6HzHi68ANQOED9SlBVarljae2imgWi1YotNAOElvevHb68MQo3BQ==",
+          "signed": true,
+          "classification": "compressed"
+        },
+        {
+          "store_hash": "921rrm82ybaraxldrzjrmw2nqqabs3hv",
+          "name": "nghttp3-1.16.0",
+          "compression": "zstd",
+          "file_size_bytes_compressed_wire": 100320,
+          "nar_size_bytes_uncompressed_nar": 233768,
+          "sig": "cache.nixos.org-1:QRFJNPxiHtjVkhgitltkCh+/VcybMi9aTsXwQf0elE+J/inVrPq4UkTDq00/Mta7g4kYX8twZT3PJ80adMaJDg==",
+          "signed": true,
+          "classification": "compressed"
+        },
+        {
+          "store_hash": "as6g7bkfxkjgz29lqx613alhdcdh25h2",
+          "name": "libssh2-1.11.1",
+          "compression": "zstd",
+          "file_size_bytes_compressed_wire": 144990,
+          "nar_size_bytes_uncompressed_nar": 338512,
+          "sig": "cache.nixos.org-1:45L6pGfcfAmeGallAVqHd3nnyr6+qZQ9wliugJhEel2rkrwlg1EvkGq7Gh+JDbuAmvTQ2hBag+uHCWPoNXm3Dw==",
+          "signed": true,
+          "classification": "compressed"
+        },
+        {
+          "store_hash": "gycvlzgb3zyak6cjc77v14kj2cldvl8b",
+          "name": "brotli-1.2.0-lib",
+          "compression": "zstd",
+          "file_size_bytes_compressed_wire": 423381,
+          "nar_size_bytes_uncompressed_nar": 984976,
+          "sig": "cache.nixos.org-1:7j3pfR5wvzZ7GzcNmqUKHyhDlWn1r9+WP4p3hkcSbS9kKbgF4zCXxCnZpyvoEUUURWzWYjbJqbUM05o1gO3rDA==",
+          "signed": true,
+          "classification": "compressed"
+        },
+        {
+          "store_hash": "i3n4nir08v03qrabc13h53yz3nacbrls",
+          "name": "ngtcp2-1.23.0",
+          "compression": "zstd",
+          "file_size_bytes_compressed_wire": 221824,
+          "nar_size_bytes_uncompressed_nar": 527800,
+          "sig": "cache.nixos.org-1:QMRQD2WRCECAwIVMO4tEeIVlCfgHuy+4pqCFHUxods+mONrNbGmRhw6RvFDavAcOxNBaGcKpM2l+WfpOOhVtCw==",
+          "signed": true,
+          "classification": "compressed"
+        },
+        {
+          "store_hash": "pxf2z5y0qy63qlq39xwjv8i60lpcd0zy",
+          "name": "nghttp2-1.69.0-lib",
+          "compression": "zstd",
+          "file_size_bytes_compressed_wire": 98343,
+          "nar_size_bytes_uncompressed_nar": 230728,
+          "sig": "cache.nixos.org-1:UQ06jtjouiJ8706yq47KcN1ZgzA7zgwisQFsjV23EC0kjx3yVnEgYh61+yLVC1Mmpm01wX/c11zACFV0vIwqDA==",
+          "signed": true,
+          "classification": "compressed"
+        },
+        {
+          "store_hash": "vma5g0pj9by1x0kh788bqvfsvw4mfknc",
+          "name": "krb5-1.22.2-lib",
+          "compression": "zstd",
+          "file_size_bytes_compressed_wire": 1118331,
+          "nar_size_bytes_uncompressed_nar": 2879776,
+          "sig": "cache.nixos.org-1:qHYBzgu7VSjfdYsHiwHiYlbfpYt1MjYXxjpbbqQF+zT20Z7xYnP+LMcxuLP3qg3ViEleFjbcD5MFB7pIsf26BA==",
+          "signed": true,
+          "classification": "compressed"
+        },
+        {
+          "store_hash": "7fmcw8kn7pjj491062b4k43yfrmd95h5",
+          "name": "libxcrypt-4.5.2",
+          "compression": "zstd",
+          "file_size_bytes_compressed_wire": 80251,
+          "nar_size_bytes_uncompressed_nar": 144384,
+          "sig": "cache.nixos.org-1:CM3uQyoNqR0jKU1zujYtG9wimi+2lOddjR4TOP/WCBwXSq8XTXXvgPSwJhMbmHpaAUggUg/8ne0Xy9iFgDVpCw==",
+          "signed": true,
+          "classification": "compressed"
+        },
+        {
+          "store_hash": "kn5dbbzrx3mkajnf5vvzakw47hajhb38",
+          "name": "perl5.42.0-Mozilla-CA-20230821",
+          "compression": "zstd",
+          "file_size_bytes_compressed_wire": 154133,
+          "nar_size_bytes_uncompressed_nar": 477136,
+          "sig": "cache.nixos.org-1:skUiUqJUmYRriUNF4HC4ajsMngiRtnwc9XniG+8rv9+0n6f4Lp+OfGbK9uX/LhK3V6EQ3RoTDqlrhTjCDHX6Bw==",
+          "signed": true,
+          "classification": "compressed"
+        },
+        {
+          "store_hash": "5287imlr5lqrs4263y2pa0x6camrhrxv",
+          "name": "perl5.42.0-Crypt-URandom-0.55",
+          "compression": "zstd",
+          "file_size_bytes_compressed_wire": 8335,
+          "nar_size_bytes_uncompressed_nar": 33288,
+          "sig": "cache.nixos.org-1:e4uysGGbtlkNllKvlXgntz0rJ6g4Km5YsQRBZATQi0aFLue+3izPRo+qyx0UVV+BolcM20yOBstmBnfsNnkqCw==",
+          "signed": true,
+          "classification": "compressed"
+        },
+        {
+          "store_hash": "27rb30wk1qbd2jka42c5njd80imgap97",
+          "name": "perl5.42.0-HTML-Tagset-3.20",
+          "compression": "zstd",
+          "file_size_bytes_compressed_wire": 5736,
+          "nar_size_bytes_uncompressed_nar": 16048,
+          "sig": "cache.nixos.org-1:NJbws6Z+aAsiVKzzW8mRulZlCUD4MIxBTLmcZBjfTEK21QeMfCjCuJ6ZMRnxwQTdfjgGmKeNg74z1JGOjwOzCg==",
+          "signed": true,
+          "classification": "compressed"
+        },
+        {
+          "store_hash": "32a85l3z7nsk1kig23pgvxfbryfxlg5b",
+          "name": "perl5.42.0-Compress-Raw-Bzip2-2.218",
+          "compression": "zstd",
+          "file_size_bytes_compressed_wire": 17286,
+          "nar_size_bytes_uncompressed_nar": 58048,
+          "sig": "cache.nixos.org-1:aWdid5ZbAvcm2sQHwsjpYfY1MIOmg6O5Z04vv2ju7oxASbeOsj4UbqLeafQuK5GPgMD0xnWOygnKPf3Ap5uWCA==",
+          "signed": true,
+          "classification": "compressed"
+        },
+        {
+          "store_hash": "3ijcn0zp5xpqq4zkqml8yxmi50mbk093",
+          "name": "perl5.42.0-LWP-MediaTypes-6.04",
+          "compression": "zstd",
+          "file_size_bytes_compressed_wire": 17239,
+          "nar_size_bytes_uncompressed_nar": 60168,
+          "sig": "cache.nixos.org-1:Uh2o5dcNjSVAwySC4PYNiWy+l0u/0rZk1MxF0ZSPk/T3VB2T7ilq2P3ciPZfuQoFJA+WGp2L8An7S8XvvBgjBA==",
+          "signed": true,
+          "classification": "compressed"
+        },
+        {
+          "store_hash": "4fjyvbkfmqz31xlxixi31p5zmyl5y1pn",
+          "name": "perl5.42.0-Try-Tiny-0.31",
+          "compression": "zstd",
+          "file_size_bytes_compressed_wire": 9369,
+          "nar_size_bytes_uncompressed_nar": 24216,
+          "sig": "cache.nixos.org-1:VNpfkdWNitRfVQK9PhX2ezfiZPw50TTb0SJpS9OPn2b/DFu9UW+3jPfmXQM89ahvxZo2eFa5PgU/r8RKxbG3Aw==",
+          "signed": true,
+          "classification": "compressed"
+        },
+        {
+          "store_hash": "4fng4ii16smpgkicg2mnk9a79zf7xikr",
+          "name": "perl5.42.0-IO-HTML-1.004",
+          "compression": "zstd",
+          "file_size_bytes_compressed_wire": 7713,
+          "nar_size_bytes_uncompressed_nar": 22768,
+          "sig": "cache.nixos.org-1:GXIJ/HLPLW8yj6CcHSQR7yPnGEPqV1P8GShQKLZWSlPBH5vpkCwn3DpnsrXwwUT8Y0d79c/4n7E2QmovvWLNAA==",
+          "signed": true,
+          "classification": "compressed"
+        },
+        {
+          "store_hash": "4yjamqpqzk9ayskk4c71zqxs5i2k2wrf",
+          "name": "perl5.42.0-HTTP-Message-7.02",
+          "compression": "zstd",
+          "file_size_bytes_compressed_wire": 42941,
+          "nar_size_bytes_uncompressed_nar": 145864,
+          "sig": "cache.nixos.org-1:/8xYEHchxoZCT4NHmUTh6kvS+YBVSd8tTVbmFfyi8+gUM3XOgS345QLhT6/obo+oR+sX6ngkCIhgDQelnoT8Cw==",
+          "signed": true,
+          "classification": "compressed"
+        },
+        {
+          "store_hash": "75kzfcflz8rprq2wi2wgg989bmk6r5pi",
+          "name": "perl5.42.0-WWW-RobotRules-6.02",
+          "compression": "zstd",
+          "file_size_bytes_compressed_wire": 6067,
+          "nar_size_bytes_uncompressed_nar": 18976,
+          "sig": "cache.nixos.org-1:1zjs/5rU3uX6Hb+NAwyxqrrGI8nv2MOHBGK24uWdJWE2/J0T0S3BVYPWx0DHlcOidPENK5/r2OGdhCevHl5zDQ==",
+          "signed": true,
+          "classification": "compressed"
+        },
+        {
+          "store_hash": "8j3kp882nhwk0qxax285zfz71gqm2ggf",
+          "name": "perl5.42.0-Compress-Raw-Zlib-2.222",
+          "compression": "zstd",
+          "file_size_bytes_compressed_wire": 40056,
+          "nar_size_bytes_uncompressed_nar": 133472,
+          "sig": "cache.nixos.org-1:d1P+V+7suE/YLrXfJrQIbX+Sbn9e0HOlxTOx3b6FOMTBWLz6jfqYxuN0FEvAN7iyMwPZFa9wLIOuovubs9wqCw==",
+          "signed": true,
+          "classification": "compressed"
+        },
+        {
+          "store_hash": "8vv6lf6fwd7dgzwl38vyikn43wbhad96",
+          "name": "perl5.42.0-Clone-0.46",
+          "compression": "zstd",
+          "file_size_bytes_compressed_wire": 7358,
+          "nar_size_bytes_uncompressed_nar": 22520,
+          "sig": "cache.nixos.org-1:V9l6zbvJJgJer3hwnNB3HA48gUyF/bD4VXXIW2v2uGhchuQ76NiKU3cY/+Wm+ESppxlafFDaq5wa/BKJlYXkCw==",
+          "signed": true,
+          "classification": "compressed"
+        },
+        {
+          "store_hash": "cqr4dw03y3zbghh9xd64s0vm0lcz62cn",
+          "name": "perl5.42.0-HTTP-Daemon-6.17",
+          "compression": "zstd",
+          "file_size_bytes_compressed_wire": 11867,
+          "nar_size_bytes_uncompressed_nar": 35368,
+          "sig": "cache.nixos.org-1:UsbngTNf33Ii0QQxa6TL7s++wX3Ub3hKPtkRRnw9VyZZ9lb0LgVzqpg6JTzpjvsnLwSP6mg2t8re3ffxsXujAA==",
+          "signed": true,
+          "classification": "compressed"
+        },
+        {
+          "store_hash": "dl8202ar1cz18c2g3z2rbswv3ax2mh5a",
+          "name": "perl5.42.0-Test-RequiresInternet-0.05",
+          "compression": "zstd",
+          "file_size_bytes_compressed_wire": 1986,
+          "nar_size_bytes_uncompressed_nar": 6128,
+          "sig": "cache.nixos.org-1:FNhSK0AFXwXcGHv28LsXOIPe2SlI/65gweGOoms1kcdttAUJSuRb/94V7tqGQnDRNYrWZDoSWhwLwpwJNZUtCA==",
+          "signed": true,
+          "classification": "compressed"
+        },
+        {
+          "store_hash": "ffk0dnlfm86ha0lsp9j240qiah93zg12",
+          "name": "perl5.42.0-Test-Fatal-0.017",
+          "compression": "zstd",
+          "file_size_bytes_compressed_wire": 5072,
+          "nar_size_bytes_uncompressed_nar": 18896,
+          "sig": "cache.nixos.org-1:/7Q4b1EufR9kthDtl4IOWII6VI3mApqAwNBGFRkQ5ux5wU8GROdi01vx59ffk3ye29P+fJ9avp+ZUufgXgyKAQ==",
+          "signed": true,
+          "classification": "compressed"
+        },
+        {
+          "store_hash": "fnp0wap95dbwdarlp3lhyvdzcmy7m78j",
+          "name": "perl5.42.0-HTTP-CookieJar-0.014",
+          "compression": "zstd",
+          "file_size_bytes_compressed_wire": 7510,
+          "nar_size_bytes_uncompressed_nar": 26104,
+          "sig": "cache.nixos.org-1:CyKO1PCttK3LcO6an2MXmC9gZBGSFygkUFNSIWxwumXZd4KXhBqyY8T1s3hU3tju+N0jmkeXZGpTUMkJWSg6Dg==",
+          "signed": true,
+          "classification": "compressed"
+        },
+        {
+          "store_hash": "gphzaclhrk9agr4q0rlrn8ynirhx61n4",
+          "name": "perl5.42.0-TimeDate-2.33",
+          "compression": "zstd",
+          "file_size_bytes_compressed_wire": 20656,
+          "nar_size_bytes_uncompressed_nar": 90248,
+          "sig": "cache.nixos.org-1:cVp3Y3ikkAWU/lEX3024jBQV6dm+gLHu43dnUUyJmvnjwolj0yldIb2HGJIpB3RAsTr96jZ822G157qT3TPEAg==",
+          "signed": true,
+          "classification": "compressed"
+        },
+        {
+          "store_hash": "h6743sngch154d43y467ssbayvaaxr4q",
+          "name": "perl5.42.0-Net-HTTP-6.23",
+          "compression": "zstd",
+          "file_size_bytes_compressed_wire": 12060,
+          "nar_size_bytes_uncompressed_nar": 38696,
+          "sig": "cache.nixos.org-1:WlsC9ogCDA/n5o7umY5u1nNvtkEYAoRBIzDMKIcoQgmk/dey3x1ME6STxxj7yoKFGB/BtFVMhIcjaIg7RMNwCA==",
+          "signed": true,
+          "classification": "compressed"
+        },
+        {
+          "store_hash": "i2nyjwxqwbvwl3j83vp1ig6x0w5d8ld8",
+          "name": "perl5.42.0-Test-Needs-0.002010",
+          "compression": "zstd",
+          "file_size_bytes_compressed_wire": 4160,
+          "nar_size_bytes_uncompressed_nar": 11736,
+          "sig": "cache.nixos.org-1:HZQ3V4dzfu3CWSyaJirKOZokZlkyTL2dg6oS+DRRGurmoZaMDUr5wtnMJR8khlMo0UCI6RnkA25lMe/v1hZFDw==",
+          "signed": true,
+          "classification": "compressed"
+        },
+        {
+          "store_hash": "igancsrc6wcl4p9rab54q918zlc7bpjs",
+          "name": "perl5.42.0-HTTP-Cookies-6.10",
+          "compression": "zstd",
+          "file_size_bytes_compressed_wire": 13274,
+          "nar_size_bytes_uncompressed_nar": 41368,
+          "sig": "cache.nixos.org-1:eywl2pvPUKsHoJ2NIESWgy/71FJ0IMYU9EenPUy5FfU7KtIxkdWEk6LPC8jVjVMHs8B4IsBqxcX4nfC6hOejCg==",
+          "signed": true,
+          "classification": "compressed"
+        },
+        {
+          "store_hash": "kjk1fdskng1r08nxn76q1bq7pljanb4g",
+          "name": "perl5.42.0-IO-Compress-2.221",
+          "compression": "zstd",
+          "file_size_bytes_compressed_wire": 164498,
+          "nar_size_bytes_uncompressed_nar": 907112,
+          "sig": "cache.nixos.org-1:+trMCfYzbuSXyWIRfgmRfwVeEcX45wtOYwRA98lsn/s6JegIFdYW1uEw3F3RiatAOkRgZnSJkxuLhTA9r519DQ==",
+          "signed": true,
+          "classification": "compressed"
+        },
+        {
+          "store_hash": "l1l9x36zwjkyl0havwvcazyd48jbykx0",
+          "name": "perl5.42.0-File-Listing-6.16",
+          "compression": "zstd",
+          "file_size_bytes_compressed_wire": 6069,
+          "nar_size_bytes_uncompressed_nar": 17664,
+          "sig": "cache.nixos.org-1:hh0s8iPTiX8SbvN10Gb7FPbZeJ1rLohAos1Rdl2utyPatQDHF5D4aR6ozqhfk+jrycr2WSSPuflQgqIOdFbIBA==",
+          "signed": true,
+          "classification": "compressed"
+        },
+        {
+          "store_hash": "m32xmjqszjsb2dwkwgc2k06qami3xrz0",
+          "name": "perl5.42.0-Encode-Locale-1.05",
+          "compression": "zstd",
+          "file_size_bytes_compressed_wire": 5194,
+          "nar_size_bytes_uncompressed_nar": 15472,
+          "sig": "cache.nixos.org-1:FhKbGI0V8d4wZxPLVXzD49/iV5LP3ymewpCkCY7t92ccuLfrCI9VN9fmWNAPejNvXmu2Gvh/J8sl0T34yWmsBA==",
+          "signed": true,
+          "classification": "compressed"
+        },
+        {
+          "store_hash": "nh9bp4g6cxc2j5gcxikb5gac0y8jf825",
+          "name": "perl5.42.0-HTTP-Negotiate-6.01",
+          "compression": "zstd",
+          "file_size_bytes_compressed_wire": 6778,
+          "nar_size_bytes_uncompressed_nar": 19688,
+          "sig": "cache.nixos.org-1:KehxG1faOaJErvW7YyscRM7nHcrv81sLsaSsxZ5CZVMav6VFWQ0VJTIUNfo/1phQ5AthHjB/H2YjjkxskVeIAQ==",
+          "signed": true,
+          "classification": "compressed"
+        },
+        {
+          "store_hash": "rgw2h9m3dhckiawp3yjzbdnz1sa5a4jm",
+          "name": "perl5.42.0-HTTP-Date-6.06",
+          "compression": "zstd",
+          "file_size_bytes_compressed_wire": 5086,
+          "nar_size_bytes_uncompressed_nar": 15504,
+          "sig": "cache.nixos.org-1:oF3l4/OX7dvGOhMBMhcNUA/niFgb6NcYAOPyZb6AFPzWsbq9nKw4x1uw8jVXHKKwnF/htOAOTP4ijV69THl+Bw==",
+          "signed": true,
+          "classification": "compressed"
+        },
+        {
+          "store_hash": "h5yzhyi8j6iq4r26giryd0rh9ynsayan",
+          "name": "libunistring-1.4.2",
+          "compression": "zstd",
+          "file_size_bytes_compressed_wire": 796683,
+          "nar_size_bytes_uncompressed_nar": 2078944,
+          "sig": "cache.nixos.org-1:rbrADhXRm5mn/Q+t2n5nfqlvC4UGgW4datvmhmG8kj6IivIkfzd6AHPBoGzx2gq6PjUyRf6lQH5gFmGhxe2GBA==",
+          "signed": true,
+          "classification": "compressed"
+        },
+        {
+          "store_hash": "ycl2ii3m8l35icmk212dfs6drnnijgza",
+          "name": "binutils-2.46-lib",
+          "compression": "zstd",
+          "file_size_bytes_compressed_wire": 854057,
+          "nar_size_bytes_uncompressed_nar": 3018360,
+          "sig": "cache.nixos.org-1:3aTFZQjVpphv8E9wiM8sd0MFaoc27mplYwFN4Qe0fiNgXut/uJ9EZPgqQnd7IIB3z4aKbMGNJ3pyMs5vymFBAg==",
+          "signed": true,
+          "classification": "compressed"
+        },
+        {
+          "store_hash": "13kjy1d82s872mswb87y7bfzsmsmy971",
+          "name": "libxrender-0.9.12",
+          "compression": "zstd",
+          "file_size_bytes_compressed_wire": 20842,
+          "nar_size_bytes_uncompressed_nar": 54504,
+          "sig": "cache.nixos.org-1:pysUD9I/qtQke6p5NckfveCga+qRuL12vT1RgQ44P5NVtW8X6CEZMYcrN+sAvJR6xYnF9LFbRTsoFwUPa0XaBw==",
+          "signed": true,
+          "classification": "compressed"
+        },
+        {
+          "store_hash": "4b5ay6qhvhkvfmahmsk68hbqj17frnzg",
+          "name": "libdecor-0.2.5",
+          "compression": "zstd",
+          "file_size_bytes_compressed_wire": 58242,
+          "nar_size_bytes_uncompressed_nar": 203816,
+          "sig": "cache.nixos.org-1:5xxOOwkAgEQcUW5xRZMWqh0U5D7wVJ1+PV662bZwyCIgUiwuHoQgtO5ME1jLewUZQrMWkX7MJ+SWMkSQ7IqsCQ==",
+          "signed": true,
+          "classification": "compressed"
+        },
+        {
+          "store_hash": "4yrcph5895vdnc8crdzxh9vm51p3wgj3",
+          "name": "wayland-1.26.0",
+          "compression": "zstd",
+          "file_size_bytes_compressed_wire": 79188,
+          "nar_size_bytes_uncompressed_nar": 274840,
+          "sig": "cache.nixos.org-1:fH5Bb2Ul4ILRvc4vNIl1mdzhHZj7aUETkowz34sTHOJ66FLuU0+3iKeaa/b5ma6nTQHy/Q8qO2jU/wXDhSP7CA==",
+          "signed": true,
+          "classification": "compressed"
+        },
+        {
+          "store_hash": "5h2bqww71qn8qi9nhhlzb9qsmb0m07fq",
+          "name": "libxcursor-1.2.3",
+          "compression": "zstd",
+          "file_size_bytes_compressed_wire": 34054,
+          "nar_size_bytes_uncompressed_nar": 79816,
+          "sig": "cache.nixos.org-1:35wn8m8eZ4qT3MYeJfwFOSD44x7QoDFepuyLyee357sVFM7ZDnyWk+W0V8bQnTEOT6TGFSqHZdA9MB/nreJsCQ==",
+          "signed": true,
+          "classification": "compressed"
+        },
+        {
+          "store_hash": "7sqaqky2c5sj5bx8sgr6igc4px24ilb6",
+          "name": "libxkbcommon-1.13.2",
+          "compression": "zstd",
+          "file_size_bytes_compressed_wire": 327390,
+          "nar_size_bytes_uncompressed_nar": 1113832,
+          "sig": "cache.nixos.org-1:g1fF2G74/ti+lGLod01am3dVTSHEmpBtgwsmHNf1dSvhhKBW7fLMOmQeP54UiaZbcfPglwE3ZkrOVHGWk6E/CA==",
+          "signed": true,
+          "classification": "compressed"
+        },
+        {
+          "store_hash": "acrnf5y878q0s118klx9a47di53nrngd",
+          "name": "libxfixes-6.0.2",
+          "compression": "zstd",
+          "file_size_bytes_compressed_wire": 12006,
+          "nar_size_bytes_uncompressed_nar": 34736,
+          "sig": "cache.nixos.org-1:IM5aDf/sC2/EIhVtwvtXlxs3j3Cr50Hfd9maWLOYH/ZmuxofoXy3PHV0thUuhWDHYTiu+mPCu0OoFu6RdDdBDg==",
+          "signed": true,
+          "classification": "compressed"
+        },
+        {
+          "store_hash": "ahaa4jwd3bkyz6xcqkpyww548wj5x9c6",
+          "name": "libxrandr-1.5.5",
+          "compression": "zstd",
+          "file_size_bytes_compressed_wire": 26274,
+          "nar_size_bytes_uncompressed_nar": 64112,
+          "sig": "cache.nixos.org-1:0W2AmCYJYFk1N/ZZ+l2noXmQvibFUbKUsyIH83J9ovJo96MQcztXDxG3aaU2gCEgDfnRDzgFKHinaFmDUNvWDw==",
+          "signed": true,
+          "classification": "compressed"
+        },
+        {
+          "store_hash": "b3c89bqlzv6y67lgm00s1238g1zjpq1x",
+          "name": "libxi-1.8.3",
+          "compression": "zstd",
+          "file_size_bytes_compressed_wire": 37077,
+          "nar_size_bytes_uncompressed_nar": 89776,
+          "sig": "cache.nixos.org-1:WmVUW3nsP1bWYiWiXsBGZrz8816NGcoYEFonZBVtPvJ4rhkE68aHloYp4O4krnSMue0OkBqtcC+O3mqjuhbSBQ==",
+          "signed": true,
+          "classification": "compressed"
+        },
+        {
+          "store_hash": "c2wd07p71cfyx1wkxsqv32b1z0f2hknl",
+          "name": "libxtst-1.2.5",
+          "compression": "zstd",
+          "file_size_bytes_compressed_wire": 33216,
+          "nar_size_bytes_uncompressed_nar": 120400,
+          "sig": "cache.nixos.org-1:gBuJuIYP4xt+200T8g9Ar1nQTzRykNvGZwqXNClCp/D3uJD8ij1fOdqPtxmRm0nPcTq1CF/rNrNcGxmQdIY0Bw==",
+          "signed": true,
+          "classification": "compressed"
+        },
+        {
+          "store_hash": "dlnbl8k665ra9k1fqlma1zhkzzq8ip0l",
+          "name": "libjack2-1.9.22",
+          "compression": "zstd",
+          "file_size_bytes_compressed_wire": 146127,
+          "nar_size_bytes_uncompressed_nar": 430784,
+          "sig": "cache.nixos.org-1:uNsK9EXHMSEZZOMCokRbRpFyWADX09lT9LjVq8OMYUIZbjS7D5u0Sc+Ba22BddIQTxG72667fxN9GB5jTkHwAw==",
+          "signed": true,
+          "classification": "compressed"
+        },
+        {
+          "store_hash": "dwc1r464zf5379jr69vv9gl84h28bzc0",
+          "name": "libglvnd-1.7.0",
+          "compression": "zstd",
+          "file_size_bytes_compressed_wire": 480161,
+          "nar_size_bytes_uncompressed_nar": 2620480,
+          "sig": "cache.nixos.org-1:ofOBud2RYlsci/d1G6fdnMaJ60nVwiaMUDgPKXa01vNK2KG4TPdmc6KaKiAkO2pkdmzAuqgUjDb3f5VnNn5sCQ==",
+          "signed": true,
+          "classification": "compressed"
+        },
+        {
+          "store_hash": "gm44026jjfva58v9zaiv7alc2fqns61x",
+          "name": "zenity-4.2.2",
+          "compression": "zstd",
+          "file_size_bytes_compressed_wire": 3303089,
+          "nar_size_bytes_uncompressed_nar": 9309600,
+          "sig": "cache.nixos.org-1:hijCWYSRHk2qHaQ6zvXJh1QNNEgpVYD2FjcoPu5ntWMXBBrIgait0Ug6krqBefLu2L3O2XFGsNFQYDfnZHIJDA==",
+          "signed": true,
+          "classification": "compressed"
+        },
+        {
+          "store_hash": "h06qaqbc0llyr2vpqrj9ia2dpwgw120m",
+          "name": "pipewire-1.6.8",
+          "compression": "zstd",
+          "file_size_bytes_compressed_wire": 5317457,
+          "nar_size_bytes_uncompressed_nar": 17448560,
+          "sig": "cache.nixos.org-1:D1ePjKNVBzhmvPvLP0ixVIfEn8+5F0IDAXpz+45oqxxmLmtNT1pTcj8Vn1bcv9dH610Qh4hgx8F0CTxCm7kuAQ==",
+          "signed": true,
+          "classification": "compressed"
+        },
+        {
+          "store_hash": "m2223mn2xs6w55si8s44zaiypjmpwng7",
+          "name": "libusb-1.0.30",
+          "compression": "zstd",
+          "file_size_bytes_compressed_wire": 70805,
+          "nar_size_bytes_uncompressed_nar": 166576,
+          "sig": "cache.nixos.org-1:rqulMPP1qvb6xGf+ZUuvlJz6SEUKkV+UAzE0i3NWbXyJlWYYAOXR25UB1vY0QpcsWJo9GPtdwkw6mafn3NogDg==",
+          "signed": true,
+          "classification": "compressed"
+        },
+        {
+          "store_hash": "qdz5ms1bzjpjq2nx4pvsjq629gqm7g6g",
+          "name": "mesa-libgbm-26.1.3",
+          "compression": "zstd",
+          "file_size_bytes_compressed_wire": 15529,
+          "nar_size_bytes_uncompressed_nar": 59648,
+          "sig": "cache.nixos.org-1:Am8lQWdEKM++alRHJp9cMUkTkBVz4c+BKypPB89FhaIBqVy0KbHSQOXf6Aui72nn3czwAsMgMsdyX3g26dwHAw==",
+          "signed": true,
+          "classification": "compressed"
+        },
+        {
+          "store_hash": "whs9idvicsc1zi5553xsb06795nzgi4g",
+          "name": "libxext-1.3.7",
+          "compression": "zstd",
+          "file_size_bytes_compressed_wire": 34366,
+          "nar_size_bytes_uncompressed_nar": 95944,
+          "sig": "cache.nixos.org-1:1XmAhV84JaD25Kvxmy8zjO6SfnzCEIKyRyiRic/GQ9cr3UgsVO0jq6zUJ1hIGECJoacvOBBScQHBuY/SQRLGCA==",
+          "signed": true,
+          "classification": "compressed"
+        },
+        {
+          "store_hash": "wxghi90d4mxp1sql2s1bqhp5g7bmfz8n",
+          "name": "libxscrnsaver-1.2.5",
+          "compression": "zstd",
+          "file_size_bytes_compressed_wire": 13937,
+          "nar_size_bytes_uncompressed_nar": 33656,
+          "sig": "cache.nixos.org-1:oLN6cIAb/KCx7ebpl6D0u5cbn4viZsOiWbFIRQfD9RrHXD3hor5otRvlYc1zoR+ad33b/WNBozelDXUBQ1kGDw==",
+          "signed": true,
+          "classification": "compressed"
+        },
+        {
+          "store_hash": "pyb9nq71p3qwhy7v4vkbaayvr12i2pgk",
+          "name": "numactl-2.0.18",
+          "compression": "zstd",
+          "file_size_bytes_compressed_wire": 84779,
+          "nar_size_bytes_uncompressed_nar": 276400,
+          "sig": "cache.nixos.org-1:+xj6EHHWzkyRK0Yk3BHis5WYBPIARRgcDqE87lXzvwuDlE7ZDMmmY+FEhbP9C/EpIAG5NeDJ/ePNZ/GkuOS4CQ==",
+          "signed": true,
+          "classification": "compressed"
+        },
+        {
+          "store_hash": "8yc5xvphm2rbgh5d2h5hds5fvznll4ji",
+          "name": "graphite2-1.3.15",
+          "compression": "zstd",
+          "file_size_bytes_compressed_wire": 110051,
+          "nar_size_bytes_uncompressed_nar": 233464,
+          "sig": "cache.nixos.org-1:CpGrvxKW6ojJke46nIHOZ7VWVTuFWGAT4YuMBPmXmj3n7aYtf22iQawgrKtLoWBKyznVcTGIQCp7UcVk4pLLAw==",
+          "signed": true,
+          "classification": "compressed"
+        },
+        {
+          "store_hash": "msrf7lbwkxmzw9igyxjbhz9qc8097yvc",
+          "name": "glib-2.88.3",
+          "compression": "zstd",
+          "file_size_bytes_compressed_wire": 4133477,
+          "nar_size_bytes_uncompressed_nar": 16119128,
+          "sig": "cache.nixos.org-1:auv7cot8pV9ma70cYLNL8jlKkkWqwkjrrFvDGpGEj/yyfBwpulMz9SWiGrL65Qo5B/lVs6cTsKDqP2YlSDVxDA==",
+          "signed": true,
+          "classification": "compressed"
+        },
+        {
+          "store_hash": "hwn9ns1gr864npl6mvwsvkdhw9mykhhf",
+          "name": "libsndfile-1.2.2",
+          "compression": "zstd",
+          "file_size_bytes_compressed_wire": 267487,
+          "nar_size_bytes_uncompressed_nar": 660072,
+          "sig": "cache.nixos.org-1:w+pLaRikDe0V465eBJgKABU3nw0QInWtqO/toAnSPlQeZiFK15+kMwp+VkMTzKB0Rh6nlWWmOqiH/vvC3nXuDg==",
+          "signed": true,
+          "classification": "compressed"
+        },
+        {
+          "store_hash": "l5wg55bzsz3fiihwdxkwigxlnr0zzln3",
+          "name": "fftw-single-3.3.11",
+          "compression": "zstd",
+          "file_size_bytes_compressed_wire": 1668210,
+          "nar_size_bytes_uncompressed_nar": 4279712,
+          "sig": "cache.nixos.org-1:87cZmyoQohz0eTVntc42yvqd4Tc0/EoEciBW2hNubrSP1fY61uGqbZG1yb9x1EPPKwgq6YBu2VkUyxL/mrEpBw==",
+          "signed": true,
+          "classification": "compressed"
+        },
+        {
+          "store_hash": "pdr1dyni8b3y5cakzmjkrwyn8ygizj0z",
+          "name": "dbus-1.16.2-lib",
+          "compression": "zstd",
+          "file_size_bytes_compressed_wire": 198424,
+          "nar_size_bytes_uncompressed_nar": 472688,
+          "sig": "cache.nixos.org-1:mK0eon0y70WGzeAdmUscByGTCQWiS0XRMd9cvZMrIgkmFpcsK3H8QtuggIYaOTPNJcAd3Cl6pr9bVlVIfRX4BQ==",
+          "signed": true,
+          "classification": "compressed"
+        },
+        {
+          "store_hash": "xicqawdz30f0carilpjz5y80j5g9xr0y",
+          "name": "dconf-0.49.0-lib",
+          "compression": "zstd",
+          "file_size_bytes_compressed_wire": 87940,
+          "nar_size_bytes_uncompressed_nar": 332304,
+          "sig": "cache.nixos.org-1:O66jSArvcV9KrFbJLhjxvlvRbn86VxkqC8aobgGgIWteH8u+O4QB4dBleq+qhROjb7VZ0sSWNL2WtELFPleBAw==",
+          "signed": true,
+          "classification": "compressed"
+        },
+        {
+          "store_hash": "ybfrvyb81cz8jg140c0n0rmlr8l8xsy5",
+          "name": "speexdsp-1.2.1",
+          "compression": "zstd",
+          "file_size_bytes_compressed_wire": 41952,
+          "nar_size_bytes_uncompressed_nar": 80352,
+          "sig": "cache.nixos.org-1:k4x2TU4qHHaHhBUDefbiWXUkbg3UtXq2bE+JtE8pRrTQC2DvDKEiPTg6w/BdI9GMjJutFUOlmTIYwOIUk880DQ==",
+          "signed": true,
+          "classification": "compressed"
+        },
+        {
+          "store_hash": "zs5j10161w3h46a85ixrwmm5x7gccym1",
+          "name": "libtool-2.6.2-lib",
+          "compression": "zstd",
+          "file_size_bytes_compressed_wire": 21954,
+          "nar_size_bytes_uncompressed_nar": 58360,
+          "sig": "cache.nixos.org-1:C//zj1a0YiyAWf+c86diFFMHAbOWAhDMFsa74DH9INd95n5P1FqmNOyPrK9VrCz92+CV+utnb+cyS4Z99B0bAg==",
+          "signed": true,
+          "classification": "compressed"
+        },
+        {
+          "store_hash": "9zq299xkzpidyq3yhi8s8x1d6pcghm2y",
+          "name": "libogg-1.3.6",
+          "compression": "zstd",
+          "file_size_bytes_compressed_wire": 22658,
+          "nar_size_bytes_uncompressed_nar": 48176,
+          "sig": "cache.nixos.org-1:DBE4fWia1/bmDFyxd0ZGfSbYy3Sd+Tc9vkhRKdnPjykIwfkaYfvNTHHeq0u9rD9AD9VKU2NWc6MANkESCfd8Bg==",
+          "signed": true,
+          "classification": "compressed"
+        },
+        {
+          "store_hash": "fkdsw0iqhj3w364zp8fanqbsx6aq3rza",
+          "name": "mpg123-1.33.7",
+          "compression": "zstd",
+          "file_size_bytes_compressed_wire": 519004,
+          "nar_size_bytes_uncompressed_nar": 1193640,
+          "sig": "cache.nixos.org-1:RKpCY/fjduZn3ofFnYVpqY2CxRzWJSoM3xcmNzW+2MKGOXNkzHq54cQTeW4Hvv0vJXndjD8pMbzkmCrrFGocCA==",
+          "signed": true,
+          "classification": "compressed"
+        },
+        {
+          "store_hash": "0c5qg74fw50vz6scy5dn2zm6h2bvsscn",
+          "name": "zlib-1.3.2-static",
+          "compression": "zstd",
+          "file_size_bytes_compressed_wire": 69202,
+          "nar_size_bytes_uncompressed_nar": 152912,
+          "sig": "cache.nixos.org-1:Z4V20J8TPRtdW/Hd/wkx71GtAF6IHJygoBwJpjDnUyNVjM2dtRY5jnXa7UwboB4ppdvGns7hrJ8hZ3ZHlJ7KBg==",
+          "signed": true,
+          "classification": "compressed"
+        },
+        {
+          "store_hash": "r5v7743c48hj7n38m8yxyq36a754x4vl",
+          "name": "libpng-apng-1.6.58",
+          "compression": "zstd",
+          "file_size_bytes_compressed_wire": 137227,
+          "nar_size_bytes_uncompressed_nar": 275792,
+          "sig": "cache.nixos.org-1:vieWXtkx6xnIL/mMBZZ9q+ZHJXHqhVOtP1K9va8AR2SM4dKWFxCIuvQyZ7QGVhmSkmUymVTF94lvB4yN9+IzDg==",
+          "signed": true,
+          "classification": "compressed"
+        },
+        {
+          "store_hash": "nayywgvfsgzi1pma0a7c64pqz3zrz7vb",
+          "name": "libxcb-1.17.0",
+          "compression": "zstd",
+          "file_size_bytes_compressed_wire": 299712,
+          "nar_size_bytes_uncompressed_nar": 1449264,
+          "sig": "cache.nixos.org-1:NzqFSYbVVilFdoYVj5v8w/l3UMbbdhTlIERRvmLtN0AufDH4KCaaUyRIN8OpZ7Cxyq5F7JieJ9O726kAQF5sBQ==",
+          "signed": true,
+          "classification": "compressed"
+        },
+        {
+          "store_hash": "c6dz02sxdl4ac09kc0lgcarsi5wbjymf",
+          "name": "libjpeg-turbo-3.1.4.1",
+          "compression": "zstd",
+          "file_size_bytes_compressed_wire": 398018,
+          "nar_size_bytes_uncompressed_nar": 2057824,
+          "sig": "cache.nixos.org-1:BiX9rCPZDcKY5LTDk6nHIU0QsVymYz24izJA/dVB7NKAScgvFTE03WUf9QboVTiqey87pauDxqxZ7tvIDV+EAA==",
+          "signed": true,
+          "classification": "compressed"
+        },
+        {
+          "store_hash": "m5wp1l4kqbacif4wcmif00c6kqzpqij5",
+          "name": "systemd-minimal-libs-261.1",
+          "compression": "zstd",
+          "file_size_bytes_compressed_wire": 1782948,
+          "nar_size_bytes_uncompressed_nar": 4452640,
+          "sig": "cache.nixos.org-1:TZeQUR5bzIZYPlOw9cuEkmJ5CwtZKqsL87lNXGMNgvZgVNAgb7djG43XbMBrnl/bFoTimkpStLcYuHR/OMR6Aw==",
+          "signed": true,
+          "classification": "compressed"
+        },
+        {
+          "store_hash": "frknavr9s7f1cz6mxq0mgxzdgy6b0avs",
+          "name": "cjson-1.7.19",
+          "compression": "zstd",
+          "file_size_bytes_compressed_wire": 27252,
+          "nar_size_bytes_uncompressed_nar": 74056,
+          "sig": "cache.nixos.org-1:9io9uRYfKBAwedIe7LQ75FuaiydSh3LSo6c9jbzFJu61n4TeIY92uPAdD++YaLuqmShHsuOAR85n60F9kMQcBg==",
+          "signed": true,
+          "classification": "compressed"
+        },
+        {
+          "store_hash": "h91j9mm3zcnh7dj028vqc23fp5ql4a57",
+          "name": "mbedtls-3.6.7",
+          "compression": "zstd",
+          "file_size_bytes_compressed_wire": 1762500,
+          "nar_size_bytes_uncompressed_nar": 13375224,
+          "sig": "cache.nixos.org-1:VFa31cpEn2i20GwNhnpi82V6uJnI72Y96Zz/P5KHwK+X6raD5W5WFXIZyUopm3ZUdJuea2TbpL6VOsjE4zrvBA==",
+          "signed": true,
+          "classification": "compressed"
+        },
+        {
+          "store_hash": "09p3ih1qxxyj91zmm3h735q0yyyrgx8b",
+          "name": "fontconfig-2.18.2",
+          "compression": "zstd",
+          "file_size_bytes_compressed_wire": 641414,
+          "nar_size_bytes_uncompressed_nar": 1298528,
+          "sig": "cache.nixos.org-1:ww1eRIbmdJ7v1mPbspXsZUvFyIUfwCEL1xhFmVz5/RuKM4y2BRG9HzhV6c7OtYWDf8mfU9M5pqL54oC5r2BpCw==",
+          "signed": true,
+          "classification": "compressed"
+        },
+        {
+          "store_hash": "klwz4lnn6zvz88nas35gyqyh2iv5xh80",
+          "name": "dejavu-fonts-minimal-2.37",
+          "compression": "zstd",
+          "file_size_bytes_compressed_wire": 383156,
+          "nar_size_bytes_uncompressed_nar": 760472,
+          "sig": "cache.nixos.org-1:QxDgQSXpcwYA3aU5sDseJSWHfWfBsA2XGh/EVJ+799jX/bdto5X744PRWjjRbpprr8RaMgiIUukp4FR5DYUZBw==",
+          "signed": true,
+          "classification": "compressed"
+        },
+        {
+          "store_hash": "n0958nwhnnipz4day0xbs0my29idij5m",
+          "name": "libvmaf-3.0.0",
+          "compression": "zstd",
+          "file_size_bytes_compressed_wire": 332046,
+          "nar_size_bytes_uncompressed_nar": 2778976,
+          "sig": "cache.nixos.org-1:MSO3DSeUX4kYQn/DQFtgToTr0H8YmfY+XIeaagdc5LzCql07lUoq7wWxAnzkDpK9jIcy9xWfCW0zzrYl3PPJDA==",
+          "signed": true,
+          "classification": "compressed"
+        },
+        {
+          "store_hash": "dwxig4i40abpi96g84mj435xvziwa3q2",
+          "name": "libtiff-4.7.2",
+          "compression": "zstd",
+          "file_size_bytes_compressed_wire": 295847,
+          "nar_size_bytes_uncompressed_nar": 766176,
+          "sig": "cache.nixos.org-1:jP5kkUYT7Z3UaDLwnoc/8HBd5K/4Dp5zNp/yx6THGShg4AOz6Ri4QlVUbyPlqDam2dBTWGrzAs8/9HKjDmWFDw==",
+          "signed": true,
+          "classification": "compressed"
+        },
+        {
+          "store_hash": "sga3l7zinfrq7s5j2mn7izsjx7bp2m41",
+          "name": "lcms2-2.19.1",
+          "compression": "zstd",
+          "file_size_bytes_compressed_wire": 219346,
+          "nar_size_bytes_uncompressed_nar": 496480,
+          "sig": "cache.nixos.org-1:+FfFzbikdp+CD0bKt6wzCCdAayjgwCq9IAnhpDD3rowhsjhwi3+Iw+nbQ65U31dBK0yH/GCrn9em0ZtC6lfUDA==",
+          "signed": true,
+          "classification": "compressed"
+        },
+        {
+          "store_hash": "43grvfid3lryjg7hhz3g17lmwdpvr77f",
+          "name": "libtasn1-4.21.0",
+          "compression": "zstd",
+          "file_size_bytes_compressed_wire": 46652,
+          "nar_size_bytes_uncompressed_nar": 98096,
+          "sig": "cache.nixos.org-1:HZWhI648qwfJnZjNrUs3UPJlLUxlS5Cah1s0VnCTU8gmoHYFckH/ldVgBCYMQ37NR+S80lBw5a9ld6LL4z9tBg==",
+          "signed": true,
+          "classification": "compressed"
+        },
+        {
+          "store_hash": "gnnp2bs29cddbmglijhnaq3pk8hlfb7s",
+          "name": "unbound-1.25.2-lib",
+          "compression": "zstd",
+          "file_size_bytes_compressed_wire": 561426,
+          "nar_size_bytes_uncompressed_nar": 1186352,
+          "sig": "cache.nixos.org-1:Xg/Mna8zUQLOZmXHX7Z4Tc6nnvzXmBx1Xobi3GFnMXn4sq+urcv1Ut82M2gMkXw032GP4IsPaePZqejTkbhRCg==",
+          "signed": true,
+          "classification": "compressed"
+        },
+        {
+          "store_hash": "kpl6xdfb9i1ama4m151v4r904mc0s1mj",
+          "name": "nettle-3.10.2",
+          "compression": "zstd",
+          "file_size_bytes_compressed_wire": 399107,
+          "nar_size_bytes_uncompressed_nar": 740848,
+          "sig": "cache.nixos.org-1:Emb/ebOAjAxjqsZvZPhsPwR/f0WEtwx1lN6Xmc3/1kmWyfkMhI5cKifwKQ0XflpduEEf8ukMtmr4ujKqqWw9Cw==",
+          "signed": true,
+          "classification": "compressed"
+        },
+        {
+          "store_hash": "vphj765l5kv36rv8qq6fnm8rk77g0fwx",
+          "name": "p11-kit-0.26.2",
+          "compression": "zstd",
+          "file_size_bytes_compressed_wire": 1205926,
+          "nar_size_bytes_uncompressed_nar": 5986992,
+          "sig": "cache.nixos.org-1:vJLHGlQlztbFETF3KLuzOs6Gjz21YDKJP8oo+hPlMTa/7LHOUYgFtMEivzkN4wbd12W29DjHZieTRtsNqdkVBA==",
+          "signed": true,
+          "classification": "compressed"
+        },
+        {
+          "store_hash": "ws8fpx9ksf4xqn22jnz7mj3ibwccca3a",
+          "name": "dns-root-data-2025-04-14",
+          "compression": "zstd",
+          "file_size_bytes_compressed_wire": 1753,
+          "nar_size_bytes_uncompressed_nar": 4968,
+          "sig": "cache.nixos.org-1:Vj2vof45j0hOz4oRzU0fPS3l4npYXJRITnY6IkAX81W2sOGXrSmLSlF6FLdEysJUDr4X1O/apI1BecYOmYIGDA==",
+          "signed": true,
+          "classification": "compressed"
+        },
+        {
+          "store_hash": "0qqlyh7jh7lnv50zpkjxg6l7yqfqca7i",
+          "name": "alsa-topology-conf-1.2.5.1",
+          "compression": "zstd",
+          "file_size_bytes_compressed_wire": 14570,
+          "nar_size_bytes_uncompressed_nar": 344168,
+          "sig": "cache.nixos.org-1:113ZUlGTzjmJNcIUpbVUZCcJocEKzPpK2vFV2Pj1BMZke+8zztvzlDCwASMH3YKFlSqYx3+2CY1HwV82XZ+MAw==",
+          "signed": true,
+          "classification": "compressed"
+        },
+        {
+          "store_hash": "96qi3zvn90f3m9wds45mg3z6qpfixzkb",
+          "name": "alsa-ucm-conf-1.2.16.1",
+          "compression": "zstd",
+          "file_size_bytes_compressed_wire": 118549,
+          "nar_size_bytes_uncompressed_nar": 936792,
+          "sig": "cache.nixos.org-1:qQyVmKgkVhyFe99AydkBypOypTftfWk8PDS8h1Pky0112NW8DbU/7WMboG+x4BiCp0yODpjGlJGbSWktrm5+Ag==",
+          "signed": true,
+          "classification": "compressed"
+        },
+        {
+          "store_hash": "72qimgkjqnrjvvmmv0z69j6mqy3ahm2f",
+          "name": "giflib-6.1.3",
+          "compression": "zstd",
+          "file_size_bytes_compressed_wire": 110982,
+          "nar_size_bytes_uncompressed_nar": 487320,
+          "sig": "cache.nixos.org-1:+7dFsgpJsqjC5jeolw4A7jUkyo3dzIGt/Z6pENnUBarleSm0frtY3/Y2xodjm1Df3JAVvGATvhXlPI+O0kXfDA==",
+          "signed": true,
+          "classification": "compressed"
+        },
+        {
+          "store_hash": "7c2wp3v32kx4dn21fmyf7smcyib5r0i6",
+          "name": "libpciaccess-0.19",
+          "compression": "zstd",
+          "file_size_bytes_compressed_wire": 86184,
+          "nar_size_bytes_uncompressed_nar": 176112,
+          "sig": "cache.nixos.org-1:lD482ishA7TQQuTHuausqhm1bRV6bOaIEFvTpq+csckEXViPRkVbXkph82dsTQYQlVxH8CT3OSqGGzEmAZr7CA==",
+          "signed": true,
+          "classification": "compressed"
+        },
+        {
+          "store_hash": "jnrk28d552wrc6cw8ck3q6x8zgvbb0zq",
+          "name": "publicsuffix-list-0-unstable-2026-07-25",
+          "compression": "zstd",
+          "file_size_bytes_compressed_wire": 94375,
+          "nar_size_bytes_uncompressed_nar": 337912,
+          "sig": "cache.nixos.org-1:bjA0pxoXBBW+DTiyvYjB45ndVBZMYb9h6V2TAiXlFEhgjNT4OdfUClEoNj2pEyGTXC/qkbcGSP3wyPKoZnsFBQ==",
+          "signed": true,
+          "classification": "compressed"
+        },
+        {
+          "store_hash": "blpk08g22vz9dnhbxfbkdyx93bp4jqwx",
+          "name": "keyutils-1.6.3-lib",
+          "compression": "zstd",
+          "file_size_bytes_compressed_wire": 10288,
+          "nar_size_bytes_uncompressed_nar": 42848,
+          "sig": "cache.nixos.org-1:PMF2HT7zG0jHBpP1BNdmdAK1/DI+R9vJB7gJAPdkI1KkZ3nwz+LwSqhFA7Dx3dxmPaVYF6JCDMcjNMlfE7KsBw==",
+          "signed": true,
+          "classification": "compressed"
+        },
+        {
+          "store_hash": "846r2knifw60684yjrmlri56vsl4cnq7",
+          "name": "cairo-1.18.4",
+          "compression": "zstd",
+          "file_size_bytes_compressed_wire": 926070,
+          "nar_size_bytes_uncompressed_nar": 2171680,
+          "sig": "cache.nixos.org-1:q9tk5wuaaTDtIBUaLBhMvOuk0bsPYttasOqv61xJlKcKuxPNzfQegcFx1RsCkBFowQSMOuRtvnuxBz8CSC3PBQ==",
+          "signed": true,
+          "classification": "compressed"
+        },
+        {
+          "store_hash": "bylld9izhrwbhpgq145vfr49cl7v0b37",
+          "name": "pango-1.57.1",
+          "compression": "zstd",
+          "file_size_bytes_compressed_wire": 364544,
+          "nar_size_bytes_uncompressed_nar": 939376,
+          "sig": "cache.nixos.org-1:42ofRxxzzxDc2pRt0ajuC9Xdin5t2vBeJ8VueUUp1ab8Izqo/A4EFNgUUTXsd1pOF/eeHr0phpySdE53OzuEBg==",
+          "signed": true,
+          "classification": "compressed"
+        },
+        {
+          "store_hash": "mijaaxa13nv1h754xdic87f31z3mnbc6",
+          "name": "gtk+3-3.24.52",
+          "compression": "zstd",
+          "file_size_bytes_compressed_wire": 11949724,
+          "nar_size_bytes_uncompressed_nar": 43627584,
+          "sig": "cache.nixos.org-1:pdC/60kC7EHy3O2fa3wZIS5FUMgXmetEK2lm+/EqrH+BAHnR62aBUXTvhVdR+wVbC2HTTsm70SfN8Upclc4UAQ==",
+          "signed": true,
+          "classification": "compressed"
+        },
+        {
+          "store_hash": "9ndc176kmp1fz9ja64zxwq5r2r3g6695",
+          "name": "xkeyboard-config-2.48",
+          "compression": "zstd",
+          "file_size_bytes_compressed_wire": 1257021,
+          "nar_size_bytes_uncompressed_nar": 10828808,
+          "sig": "cache.nixos.org-1:mQACnTkV0cyZI0hd3M3oewY1E3+8/rgG5/GiHrsV+yBspZyEGdFYnKnW9+ou9icLLUBaQVnkcsqD2ZlIFi/pDA==",
+          "signed": true,
+          "classification": "compressed"
+        },
+        {
+          "store_hash": "bynpgspl550qs61mn985px38i83lkfyv",
+          "name": "libsamplerate-0.2.2",
+          "compression": "zstd",
+          "file_size_bytes_compressed_wire": 1414553,
+          "nar_size_bytes_uncompressed_nar": 1578104,
+          "sig": "cache.nixos.org-1:FQzdW6iOHzWfwjaUBOUlcuvrMcNlPy0rwmiSgIO7GjbJFpW5td9jhIvYibRvB6peLKhjec9cZPqB1HFVCdTTAw==",
+          "signed": true,
+          "classification": "compressed"
+        },
+        {
+          "store_hash": "4a5gbd2plkgaracgpq2rph426ljb24ps",
+          "name": "librsvg-2.62.3",
+          "compression": "zstd",
+          "file_size_bytes_compressed_wire": 5733643,
+          "nar_size_bytes_uncompressed_nar": 16562584,
+          "sig": "cache.nixos.org-1:5FCPDTSTIw5auHtIVe2WjsqPtunzifGMe6jJb6+F528jWwsKbL0uRm7ugtizCxi37exDptCF2H9dhB8aWM+HBg==",
+          "signed": true,
+          "classification": "compressed"
+        },
+        {
+          "store_hash": "78vgjwcfyp66rqdc9xsmfh75js2fjd39",
+          "name": "gsettings-desktop-schemas-50.1",
+          "compression": "zstd",
+          "file_size_bytes_compressed_wire": 1111130,
+          "nar_size_bytes_uncompressed_nar": 6483088,
+          "sig": "cache.nixos.org-1:7GD7M5ybgsuqvnIhCd/5qvCXHAbfNUlUFYvc//Tty0CjoJdD2ylSBU+GFK67/9DVZYSbQcMz/aNTTqc+bDTFAQ==",
+          "signed": true,
+          "classification": "compressed"
+        },
+        {
+          "store_hash": "mili2yqnsn5sgvyw474fq3kngz51zj1w",
+          "name": "gtk4-4.22.4",
+          "compression": "zstd",
+          "file_size_bytes_compressed_wire": 9569958,
+          "nar_size_bytes_uncompressed_nar": 31847272,
+          "sig": "cache.nixos.org-1:9JvmB2tudMzkbuAJ+ajrp6ZU959WPomI/R/4Gti21+nWQ2/a2VCG8yTYMPKnVQlHbJoeioOGqKGHLebiBN5YDw==",
+          "signed": true,
+          "classification": "compressed"
+        },
+        {
+          "store_hash": "vwdfzwb50dixp1pc6h47p9qkjarlgzm6",
+          "name": "libadwaita-1.9.3",
+          "compression": "zstd",
+          "file_size_bytes_compressed_wire": 866897,
+          "nar_size_bytes_uncompressed_nar": 3192784,
+          "sig": "cache.nixos.org-1:K/yuCdVs9Al+6BWt3MMxoax/iO6lHOe/dmBpb8gu5mqxXSljLEQ2ymzboDkTrDJcml8y/9TvbX31KMJc8eGoCQ==",
+          "signed": true,
+          "classification": "compressed"
+        },
+        {
+          "store_hash": "488s7zfa8p3vv7gzavsv6xkqqiy04xq0",
+          "name": "libmysofa-1.3.4",
+          "compression": "zstd",
+          "file_size_bytes_compressed_wire": 1172396,
+          "nar_size_bytes_uncompressed_nar": 1390304,
+          "sig": "cache.nixos.org-1:fmIzy/6HGfASPxip3w+R17KwWm4umUbMBieVrj9E4CpkgvFO8gojsa50j3J6adMh/TVWM2TpUDURSVu2ncmqDw==",
+          "signed": true,
+          "classification": "compressed"
+        },
+        {
+          "store_hash": "6dqrv7xkni4g516g2fxl282bm07sy839",
+          "name": "libfreeaptx-0.2.2",
+          "compression": "zstd",
+          "file_size_bytes_compressed_wire": 18470,
+          "nar_size_bytes_uncompressed_nar": 56800,
+          "sig": "cache.nixos.org-1:Ynqker1nZQnGj0Mnkzg8kjuLk+WDpyfrJhr5U7KNrHxkEMB0YuWozRGO8Nv4vhn2XZl8H26Q1jgyFOL3K2JgDQ==",
+          "signed": true,
+          "classification": "compressed"
+        },
+        {
+          "store_hash": "ax8jrqcq50digb2xx9hlbi3xw70h9iqb",
+          "name": "libcamera-0.7.0",
+          "compression": "zstd",
+          "file_size_bytes_compressed_wire": 1832205,
+          "nar_size_bytes_uncompressed_nar": 6358360,
+          "sig": "cache.nixos.org-1:aYVyi1ZMYeXh2OHfmhrUJt0xqo3woiI0UUVvnhoDk7LjcfqZ4F8ym6nmyN9Z5UpOZhD/IhbajGvffrmJEE8JBg==",
+          "signed": true,
+          "classification": "compressed"
+        },
+        {
+          "store_hash": "b4rc51gg4wxzia8xg834aphj83p5ss33",
+          "name": "gstreamer-1.28.5",
+          "compression": "zstd",
+          "file_size_bytes_compressed_wire": 2164493,
+          "nar_size_bytes_uncompressed_nar": 6408928,
+          "sig": "cache.nixos.org-1:zahq0HrP3fTs+tu8RcndotxIJt5aJUa2JRgINIG2ouMKTBk+AnBVSXb1hl5YnqsM8P/kN7w0YVIqWmEN6boIDw==",
+          "signed": true,
+          "classification": "compressed"
+        },
+        {
+          "store_hash": "csd8xs7bilf5b9saf70gm4bi9sd61a8j",
+          "name": "ldacbt-2.0.72",
+          "compression": "zstd",
+          "file_size_bytes_compressed_wire": 51633,
+          "nar_size_bytes_uncompressed_nar": 101072,
+          "sig": "cache.nixos.org-1:8nKh5VIk2it4ra89CY/arx5YM65denp9zjl53znYPFiYBp0DGP6suP4WBP6R4cBFLIOUO42hSCeZ5Uy5joW8CA==",
+          "signed": true,
+          "classification": "compressed"
+        },
+        {
+          "store_hash": "fdjdj3h57zi1g4x4pd8qplrflyz78883",
+          "name": "gst-plugins-base-1.28.5",
+          "compression": "zstd",
+          "file_size_bytes_compressed_wire": 3175414,
+          "nar_size_bytes_uncompressed_nar": 9307512,
+          "sig": "cache.nixos.org-1:cC4QnpZTenQCdrwvZXAvrqbOI14YyExa6Pp6U+zi83wn5z+baXGu3cKF1+i1kn3X7l0TLxYo8ImIJkwIIdepCg==",
+          "signed": true,
+          "classification": "compressed"
+        },
+        {
+          "store_hash": "kq6bqbxkvblwxx4g89l63103jq72lxcd",
+          "name": "roc-toolkit-0.4.0",
+          "compression": "zstd",
+          "file_size_bytes_compressed_wire": 1972108,
+          "nar_size_bytes_uncompressed_nar": 8265936,
+          "sig": "cache.nixos.org-1:y/JJACLmOTv6Cx/wFEOZszmJNP1HMfEBL1ZPBfeudqPeFxcUE1Y3Xge4HO7DDglIvDTzQQQW3lEIYzBucpb9Aw==",
+          "signed": true,
+          "classification": "compressed"
+        },
+        {
+          "store_hash": "kx9qcgaqkpchayz6a604zwq2cbj5d24i",
+          "name": "ffmpeg-headless-9.0-lib",
+          "compression": "zstd",
+          "file_size_bytes_compressed_wire": 14986787,
+          "nar_size_bytes_uncompressed_nar": 35382816,
+          "sig": "cache.nixos.org-1:ursGvJy0MwEvfoU4whuB2MeQuprHB2+VKrJT5XBgSdN+h7TGwMx5MyjkbP+LydUBisK5H4VoUEf4oGkrSXf7BQ==",
+          "signed": true,
+          "classification": "compressed"
+        },
+        {
+          "store_hash": "lmf2d8xj4zy3j1mhcqwarrnbci7c073p",
+          "name": "sbc-2.2",
+          "compression": "zstd",
+          "file_size_bytes_compressed_wire": 58034,
+          "nar_size_bytes_uncompressed_nar": 283568,
+          "sig": "cache.nixos.org-1:QT02ax6abCvI5Qg5orCJFB7eK+YVC75GuUBklkxwBXjHE0EMjJ4gwWLx1SKqmj1KlEKZw3gEpnlpllazNaVSAA==",
+          "signed": true,
+          "classification": "compressed"
+        },
+        {
+          "store_hash": "n1cr847pvw2zppnsbl7s7cgpg4ibpypg",
+          "name": "libcanberra-0.30",
+          "compression": "zstd",
+          "file_size_bytes_compressed_wire": 70854,
+          "nar_size_bytes_uncompressed_nar": 257264,
+          "sig": "cache.nixos.org-1:iy+8CzeHEX0lbTdHv82s0eXwJ+6ryBuvRMsrkfMR5ZS6INuEpbLrM6oX5+VXP6Q6UcIVqhuiuPd4O+Deahv7BQ==",
+          "signed": true,
+          "classification": "compressed"
+        },
+        {
+          "store_hash": "nhjxarsdpm67d1qhz4fgq3klzr3zzwgp",
+          "name": "webrtc-audio-processing-2.1",
+          "compression": "zstd",
+          "file_size_bytes_compressed_wire": 529497,
+          "nar_size_bytes_uncompressed_nar": 1290232,
+          "sig": "cache.nixos.org-1:28PckwaMU1AnSye1nB9dryjEpj3ywavgvHREsg0ztllTgTpNwBy22sbv+JB92AicAac7Li9DuP3QjCOdR/sHCQ==",
+          "signed": true,
+          "classification": "compressed"
+        },
+        {
+          "store_hash": "p195ra8gkhlkn7qxij7ivfqn4h1k4p7c",
+          "name": "fdk-aac-2.0.3",
+          "compression": "zstd",
+          "file_size_bytes_compressed_wire": 879974,
+          "nar_size_bytes_uncompressed_nar": 1626088,
+          "sig": "cache.nixos.org-1:kRlp7Vmv5UcKZIq+qnUQ9KFBq7zsfDeoPtqHhn4kD/SUNSkDxKY/jA8SoPfam0YAxU0RwAoCZmr7/ns7hMkBCw==",
+          "signed": true,
+          "classification": "compressed"
+        },
+        {
+          "store_hash": "rv0w4nv597sfrphgbnc2k2jfwpkhw27v",
+          "name": "lilv-0.28.0",
+          "compression": "zstd",
+          "file_size_bytes_compressed_wire": 117787,
+          "nar_size_bytes_uncompressed_nar": 390912,
+          "sig": "cache.nixos.org-1:nNN3BC+zIVZFIfhTcHLxjkHk9TujocizflLdF5+Po5Ivc2NWokiKJT8qC/p/1bhhG2hQQ5tzL6pQ2WFCWTJBBA==",
+          "signed": true,
+          "classification": "compressed"
+        },
+        {
+          "store_hash": "sp639w0gc7zhl73y5gj4m43jb5i6w6h5",
+          "name": "spandsp-0.0.6",
+          "compression": "zstd",
+          "file_size_bytes_compressed_wire": 426601,
+          "nar_size_bytes_uncompressed_nar": 1007528,
+          "sig": "cache.nixos.org-1:Bk8KDs+PwhIKTAi0HPn5fEvsKEUz0FYh2Drjp2dX/8jsr12sk/W5k4g09RjN9KutsLPOKkro/TG0PYmKojzqAQ==",
+          "signed": true,
+          "classification": "compressed"
+        },
+        {
+          "store_hash": "wbv6jwxq9ay99jwx1sagxcgwrd10wk9f",
+          "name": "bluez-5.87",
+          "compression": "zstd",
+          "file_size_bytes_compressed_wire": 3390799,
+          "nar_size_bytes_uncompressed_nar": 10041184,
+          "sig": "cache.nixos.org-1:3Z8fHt7+V2vyosKMIPHbp++PlZcEwNAdffErVPdlMs593l4Y0K533A2+lZzxYZ8u1m/pi6u0YoCBkG+smDDlDQ==",
+          "signed": true,
+          "classification": "compressed"
+        },
+        {
+          "store_hash": "wvm7vpzay5b2s5rhhjzaha98gm2fszcc",
+          "name": "liblc3-1.1.3",
+          "compression": "zstd",
+          "file_size_bytes_compressed_wire": 109461,
+          "nar_size_bytes_uncompressed_nar": 179280,
+          "sig": "cache.nixos.org-1:LgvZDGg1ynjRqkReYr7eLj/Z1gSaYxzK+xl2kanp4tTEqid9et3oA3/nvRLsHWidwkQ1+o1a/MxBUJguYGbFBQ==",
+          "signed": true,
+          "classification": "compressed"
+        },
+        {
+          "store_hash": "/nix/store/0a0lslqb6gbqnj6xqjlal",
+          "name": "/nix/store/0a0lslqb6gbqnj6xqjlaljjqg6kgb3wz-nix-p2p-fixture-lib",
+          "compression": "none",
+          "file_size_bytes_compressed_wire": 66048,
+          "nar_size_bytes_uncompressed_nar": 66048,
+          "sig": "",
+          "signed": false,
+          "classification": "uncompressed"
+        },
+        {
+          "store_hash": "/nix/store/537fv8f7v6i3qq7l6yrcm",
+          "name": "/nix/store/537fv8f7v6i3qq7l6yrcmcc54kdccd4x-nix-p2p-fixture-big",
+          "compression": "none",
+          "file_size_bytes_compressed_wire": 115343872,
+          "nar_size_bytes_uncompressed_nar": 115343872,
+          "sig": "",
+          "signed": false,
+          "classification": "uncompressed"
+        }
+      ]
+    },
+    "gate_violations": [],
+    "gate_passed": true
+  },
+  "raw_peer_socket_throughput": {
+    "profile": {
+      "delay_ms": 20,
+      "rate_cap_mbit": 100
+    },
+    "shaping_primitive": "scripts/shaped_link.py (task-70), tc netem over veth",
+    "per_size": [
+      {
+        "nar_size_bytes_uncompressed_nar": 8388608,
+        "shaped": {
+          "link_label": "wan_shaped",
+          "rtt_ms": 48.219,
+          "throughput_mbit_per_s": 73.91,
+          "throughput_bytes_uncompressed_nar_per_s": 9238750.0,
+          "delivered_bytes_uncompressed_nar": 8388608,
+          "shaping_asserted": true,
+          "shaping_error": null
+        },
+        "loopback_control": {
+          "link_label": "loopback",
+          "rtt_ms": 0.051,
+          "throughput_mbit_per_s": 71248.53,
+          "throughput_bytes_uncompressed_nar_per_s": 8906066250.0,
+          "delivered_bytes_uncompressed_nar": 8388608,
+          "wan_label_refused": true
+        },
+        "shaped_arm_transcript": "=== RTT probe (shape=yes) ===\n5 packets transmitted, 5 received, 0% packet loss, time 802ms\nrtt min/avg/max/mdev = 40.107/48.219/80.162/15.971 ms\n=== XFER (shape=yes, total=8388608 bytes) ===\nRECV_READY port=9099\nRECV_DONE bytes=8388608 expect=8388608 status=ok\nSEND_DONE bytes=8388608 elapsed_s=0.9080 mbit_per_s=73.91 MB_per_s=9.24\n",
+        "loopback_arm_transcript": "=== RTT probe (shape=no) ===\n5 packets transmitted, 5 received, 0% packet loss, time 832ms\nrtt min/avg/max/mdev = 0.034/0.051/0.060/0.009 ms\n=== XFER (shape=no, total=8388608 bytes) ===\nRECV_READY port=9099\nSEND_DONE bytes=8388608 elapsed_s=0.0009 mbit_per_s=71248.53 MB_per_s=8906.07\nRECV_DONE bytes=8388608 expect=8388608 status=ok\n"
+      },
+      {
+        "nar_size_bytes_uncompressed_nar": 20971520,
+        "shaped": {
+          "link_label": "wan_shaped",
+          "rtt_ms": 48.179,
+          "throughput_mbit_per_s": 85.57,
+          "throughput_bytes_uncompressed_nar_per_s": 10696250.0,
+          "delivered_bytes_uncompressed_nar": 20971520,
+          "shaping_asserted": true,
+          "shaping_error": null
+        },
+        "loopback_control": {
+          "link_label": "loopback",
+          "rtt_ms": 0.046,
+          "throughput_mbit_per_s": 48607.93,
+          "throughput_bytes_uncompressed_nar_per_s": 6075991250.0,
+          "delivered_bytes_uncompressed_nar": 20971520,
+          "wan_label_refused": true
+        },
+        "shaped_arm_transcript": "=== RTT probe (shape=yes) ===\n5 packets transmitted, 5 received, 0% packet loss, time 802ms\nrtt min/avg/max/mdev = 40.077/48.179/80.159/15.990 ms\n=== XFER (shape=yes, total=20971520 bytes) ===\nRECV_READY port=9099\nRECV_DONE bytes=20971520 expect=20971520 status=ok\nSEND_DONE bytes=20971520 elapsed_s=1.9607 mbit_per_s=85.57 MB_per_s=10.70\n",
+        "loopback_arm_transcript": "=== RTT probe (shape=no) ===\n5 packets transmitted, 5 received, 0% packet loss, time 828ms\nrtt min/avg/max/mdev = 0.037/0.046/0.053/0.005 ms\n=== XFER (shape=no, total=20971520 bytes) ===\nRECV_READY port=9099\nSEND_DONE bytes=20971520 elapsed_s=0.0035 mbit_per_s=48607.93 MB_per_s=6075.99\nRECV_DONE bytes=20971520 expect=20971520 status=ok\n"
+      },
+      {
+        "nar_size_bytes_uncompressed_nar": 41943040,
+        "shaped": {
+          "link_label": "wan_shaped",
+          "rtt_ms": 48.14,
+          "throughput_mbit_per_s": 90.33,
+          "throughput_bytes_uncompressed_nar_per_s": 11291250.0,
+          "delivered_bytes_uncompressed_nar": 41943040,
+          "shaping_asserted": true,
+          "shaping_error": null
+        },
+        "loopback_control": {
+          "link_label": "loopback",
+          "rtt_ms": 0.064,
+          "throughput_mbit_per_s": 57911.64,
+          "throughput_bytes_uncompressed_nar_per_s": 7238955000.0,
+          "delivered_bytes_uncompressed_nar": 41943040,
+          "wan_label_refused": true
+        },
+        "shaped_arm_transcript": "=== RTT probe (shape=yes) ===\n5 packets transmitted, 5 received, 0% packet loss, time 801ms\nrtt min/avg/max/mdev = 40.086/48.140/80.326/16.092 ms\n=== XFER (shape=yes, total=41943040 bytes) ===\nRECV_READY port=9099\nRECV_DONE bytes=41943040 expect=41943040 status=ok\nSEND_DONE bytes=41943040 elapsed_s=3.7147 mbit_per_s=90.33 MB_per_s=11.29\n",
+        "loopback_arm_transcript": "=== RTT probe (shape=no) ===\n5 packets transmitted, 5 received, 0% packet loss, time 826ms\nrtt min/avg/max/mdev = 0.048/0.064/0.108/0.022 ms\n=== XFER (shape=no, total=41943040 bytes) ===\nRECV_READY port=9099\nRECV_DONE bytes=41943040 expect=41943040 status=ok\nSEND_DONE bytes=41943040 elapsed_s=0.0058 mbit_per_s=57911.64 MB_per_s=7238.95\n"
+      }
+    ],
+    "note": "raw TCP over an emulated link; NOT the real libp2p transport (that is task-198's deferred scope). Peer bytes here are RAW NAR bytes."
+  },
+  "break_even": [
+    {
+      "inputs": {
+        "ratio_file_over_nar": 0.3255628680152017,
+        "upstream_bandwidth_bytes_compressed_wire_per_s": 22020096,
+        "peer_bandwidth_bytes_uncompressed_nar_per_s": 5242880,
+        "cdn_latency_s": 0.05,
+        "discovery_latency_s": 1.0,
+        "assumed_not_measured_here": true
+      },
+      "per_byte_saving_s_per_nar_byte": -1.7595005634783784e-07,
+      "latency_premium_s": 0.95,
+      "peer_bandwidth_needed_to_break_even_bytes_uncompressed_nar_per_s": 67637000.909366,
+      "verdict": "NO SIZE THRESHOLD EXISTS",
+      "interpretation": "the peer saves nothing per NAR byte (it moves raw NAR, ~1/ratio the CDN's wire bytes) and holds no latency advantage; no size lets it catch up. Raw WAN loses at every size -- the expected honest baseline.",
+      "threshold_kind": null,
+      "break_even_nar_size_bytes_uncompressed_nar": null,
+      "scenario": "home_uplink_5MiBps",
+      "input_provenance": {
+        "upstream_bandwidth": "ASSUMED (scripts/profile_p2p.py / task-35 real-upstream; not re-measured here)",
+        "cdn_latency_s": "ASSUMED (illustrative)",
+        "discovery_latency_s": "ASSUMED (illustrative)",
+        "peer_bandwidth": "ASSUMED (illustrative)",
+        "units": "all bandwidths are bytes/s of MiB/s constants (1024**2)"
+      }
+    },
+    {
+      "inputs": {
+        "ratio_file_over_nar": 0.3255628680152017,
+        "upstream_bandwidth_bytes_compressed_wire_per_s": 22020096,
+        "peer_bandwidth_bytes_uncompressed_nar_per_s": 131072000,
+        "cdn_latency_s": 0.05,
+        "discovery_latency_s": 0.2,
+        "assumed_not_measured_here": true
+      },
+      "per_byte_saving_s_per_nar_byte": 7.155412402162173e-09,
+      "latency_premium_s": 0.15000000000000002,
+      "peer_bandwidth_needed_to_break_even_bytes_uncompressed_nar_per_s": 67637000.909366,
+      "verdict": "BREAK-EVEN ABOVE THRESHOLD",
+      "interpretation": "the peer wins for NAR sizes ABOVE the lower crossover, where its per-byte bandwidth advantage overtakes the discovery premium.",
+      "threshold_kind": "lower_crossover_wins_above",
+      "break_even_nar_size_bytes_uncompressed_nar": 20963152.306172326,
+      "scenario": "lan_peer_125MiBps",
+      "input_provenance": {
+        "upstream_bandwidth": "ASSUMED (scripts/profile_p2p.py / task-35 real-upstream; not re-measured here)",
+        "cdn_latency_s": "ASSUMED (illustrative)",
+        "discovery_latency_s": "ASSUMED (illustrative)",
+        "peer_bandwidth": "ASSUMED (illustrative)",
+        "units": "all bandwidths are bytes/s of MiB/s constants (1024**2)"
+      }
+    },
+    {
+      "inputs": {
+        "ratio_file_over_nar": 0.3255628680152017,
+        "upstream_bandwidth_bytes_compressed_wire_per_s": 22020096,
+        "peer_bandwidth_bytes_uncompressed_nar_per_s": 11291250.0,
+        "cdn_latency_s": 0.05,
+        "discovery_latency_s": 1.0,
+        "assumed_not_measured_here": false
+      },
+      "per_byte_saving_s_per_nar_byte": -7.377934672539442e-08,
+      "latency_premium_s": 0.95,
+      "peer_bandwidth_needed_to_break_even_bytes_uncompressed_nar_per_s": 67637000.909366,
+      "verdict": "NO SIZE THRESHOLD EXISTS",
+      "interpretation": "the peer saves nothing per NAR byte (it moves raw NAR, ~1/ratio the CDN's wire bytes) and holds no latency advantage; no size lets it catch up. Raw WAN loses at every size -- the expected honest baseline.",
+      "threshold_kind": null,
+      "break_even_nar_size_bytes_uncompressed_nar": null,
+      "scenario": "measured_shaped_peer",
+      "input_provenance": {
+        "upstream_bandwidth": "ASSUMED (scripts/profile_p2p.py / task-35 real-upstream; not re-measured here)",
+        "cdn_latency_s": "ASSUMED (illustrative)",
+        "discovery_latency_s": "ASSUMED (illustrative)",
+        "peer_bandwidth": "MEASURED (this run's shaped arm, raw NAR bytes/s)",
+        "units": "all bandwidths are bytes/s of MiB/s constants (1024**2)"
+      }
+    }
+  ]
+}
