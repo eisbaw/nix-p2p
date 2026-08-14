@@ -85,6 +85,81 @@ use crate::source::{
 const MAX_BUFFERED_BODY: usize = MAX_NARINFO_BYTES;
 
 // ---------------------------------------------------------------------------
+// TASK-33: the COMPOSING per-hop header budget.
+//
+// The wave-1 header timeout was a FIXED per-hop constant: each daemon in a chain
+// started its OWN full `header_timeout` clock when IT sent its upstream request.
+// Across a chain that does NOT compose - the whole chain had no single end-to-end
+// deadline, so a downstream daemon with a LARGER local timeout would keep waiting
+// (and holding a connection) long after the entry hop the client is actually
+// waiting on had already given up.
+//
+// The fix is a request-carried REMAINING-BUDGET header. The chain ENTRY (the hop
+// the client talks to; the client sends no budget) seeds the budget from its own
+// `header_timeout`. Every hop then waits at most `min(header_timeout, budget -
+// setup_elapsed)` for its upstream's response headers and PROPAGATES that
+// decremented remainder to its own upstream, so the entire chain honours ONE
+// shrinking end-to-end deadline. A RELATIVE remaining-ms value (not an absolute
+// instant) is used deliberately: absolute deadlines would need synchronised
+// clocks across hosts, which a decentralised chain does not have.
+//
+// HONEST SCOPE (the reopened-NO-GO lesson): this does NOT remove the inherent
+// serial-chain admission penalty. The ENTRY hop is always the binding constraint
+// at exactly its own budget, so an upstream whose header latency L approaches T
+// is still served iff `L + (depth-1)*per_hop_overhead < T` - the outermost hop
+// 502s first. On pod loopback `per_hop_overhead` is sub-millisecond, so that term
+// is below the noise floor and cannot be separated by depth here (WAN-scale;
+// TASK-35/TASK-111). What DOES compose, and is unit/integration-pinned below, is
+// the shared end-to-end budget: a tighter downstream budget caps a hop that has a
+// larger local `header_timeout`, and no hop waits past the chain's deadline.
+// ---------------------------------------------------------------------------
+
+/// Request header carrying the remaining end-to-end header-wait budget, in
+/// INTEGER milliseconds, propagated DOWN a daemon chain (TASK-33). Lower-case so
+/// it is a valid `HeaderName::from_static`. A hop reads it as the budget its
+/// downstream client will wait; it writes the decremented remainder to its own
+/// upstream. Absent = "you are the entry, seed from your own `header_timeout`".
+pub const HOP_BUDGET_HEADER: &str = "x-nix-p2p-hop-budget-ms";
+
+/// The time THIS hop may wait for its upstream's RESPONSE HEADERS, composing the
+/// hop's own configured `header_timeout` with any remaining end-to-end `budget`
+/// propagated by a downstream chain client, after `setup_elapsed` has already
+/// been spent connecting.
+///
+///   * `None` budget - this hop is the chain ENTRY (the client sent no budget):
+///     it waits its full `header_timeout`, exactly as a lone wave-1 daemon did.
+///     `setup_elapsed` is intentionally ignored so single-daemon timing is
+///     byte-for-byte unchanged (the header wait is measured from AFTER connect).
+///   * `Some(b)` budget - an inner chain hop: it waits `min(header_timeout, b -
+///     setup_elapsed)`, so a tighter downstream budget caps a hop with a larger
+///     local timeout, and a budget already spent on connect yields ZERO (fail at
+///     once rather than wait a fresh full timeout the chain has no time for).
+///
+/// Integer-`Duration` and saturating throughout - no floats in the timeout math.
+fn composed_header_wait(
+    header_timeout: Duration,
+    budget: Option<Duration>,
+    setup_elapsed: Duration,
+) -> Duration {
+    match budget {
+        None => header_timeout,
+        Some(b) => header_timeout.min(b.saturating_sub(setup_elapsed)),
+    }
+}
+
+/// The connect deadline for this hop: the configured `connect_timeout`, additionally
+/// capped by any remaining end-to-end `budget` so a chain with little time left
+/// does not spend it all waiting to connect. A DOWN upstream therefore still fails
+/// FAST (via `connect_timeout`) regardless of the budget - only a connected,
+/// slow-but-alive upstream consumes the composed header wait.
+fn composed_connect_cap(connect_timeout: Duration, budget: Option<Duration>) -> Duration {
+    match budget {
+        None => connect_timeout,
+        Some(b) => connect_timeout.min(b),
+    }
+}
+
+// ---------------------------------------------------------------------------
 // FROZEN `tls-upstream-v1` connect budget (TASK-24 AC#5).
 //
 // ONE 10 s total covers the whole "reach the TLS peer" sequence - DNS
@@ -304,24 +379,26 @@ impl UpstreamHttp {
         self
     }
 
-    /// Override the per-hop upstream header timeout (default 1000 ms).
+    /// Override this hop's header timeout (default 1000 ms).
     ///
-    /// KNOWN CEILING (task-33, characterised by the task-13 fault x depth
-    /// matrix): this is a FIXED per-hop deadline - each daemon starts its own
-    /// clock when IT sends its upstream request. It does NOT compose across a
-    /// daemon chain: inner hops fetch serially, so at depth the deepest
-    /// upstream's effective deadline is the OUTERMOST hop's timeout minus the
-    /// accumulated per-hop connect/send overhead. Relationship: an upstream
-    /// whose header latency is L is served iff L + (depth-1)*overhead <
-    /// header_timeout at every hop, so the OUTERMOST hop is the first to 502 as
-    /// L approaches the timeout. On a loopback chain the per-hop overhead is
-    /// sub-millisecond, so the observable flip is governed by L vs
-    /// `header_timeout` (depth-composition is real but WAN-scale, below the
-    /// loopback noise floor - see TESTING.md). Making the deadline budget-aware
-    /// across hops (and validating it at real WAN RTT) is wave-2 work owned by
-    /// task-15 (re-plan) and task-33/task-35 (the reopened finding + real-upstream
-    /// re-measure); exposing this knob lets an operator (and the e2e boundary pin)
-    /// move the L-vs-T ceiling deliberately.
+    /// SEMANTICS (TASK-33, composing budget): for the chain ENTRY (the hop the
+    /// client talks to) this is the end-to-end header-wait budget seeded for the
+    /// WHOLE chain - it is propagated down every hop as a shrinking
+    /// remaining-budget (`HOP_BUDGET_HEADER`) rather than re-granted afresh at
+    /// each hop, so the whole chain shares ONE deadline (see [`composed_header_wait`]
+    /// and the module `TASK-33` note). For an inner hop it is the local ceiling
+    /// on the wait, capped further by whatever budget the downstream client
+    /// propagated.
+    ///
+    /// KNOWN CEILING (unchanged by the composing budget - honest scope): the
+    /// entry hop is always the binding constraint at its own budget, so an
+    /// upstream of header latency L is served iff `L + (depth-1)*per_hop_overhead
+    /// < budget` and the OUTERMOST hop 502s first as L approaches the budget. On
+    /// pod loopback `per_hop_overhead` is sub-millisecond, so the observable flip
+    /// is governed by L vs the budget; the raw depth-composition term is WAN-scale
+    /// (below the loopback noise floor) and its validation against a real
+    /// cache.nixos.org RTT is deferred to TASK-35 / TASK-111. This knob lets an
+    /// operator (and the e2e boundary pin) move the L-vs-budget ceiling.
     pub fn with_header_timeout(mut self, header_timeout: Duration) -> Self {
         self.header_timeout = header_timeout;
         self
@@ -330,14 +407,26 @@ impl UpstreamHttp {
     /// Open a fresh connection, send a GET for `path`, and return the response
     /// with its body still unread (streamed lazily by the caller). Dispatches on
     /// the transport: plain TCP, or TCP + rustls-validated TLS.
+    ///
+    /// `budget` is the remaining end-to-end header-wait time propagated by a
+    /// downstream chain client, or `None` when this hop is the chain ENTRY. It
+    /// composes with this hop's own `header_timeout` (see [`composed_header_wait`])
+    /// to bound the wait for the upstream's response headers, and the decremented
+    /// remainder is propagated to the upstream via [`HOP_BUDGET_HEADER`]. A DOWN
+    /// upstream still fails FAST on connect regardless of the budget.
     async fn send(
         &self,
         path: &str,
+        budget: Option<Duration>,
     ) -> Result<hyper::Response<hyper::body::Incoming>, SourceError> {
+        // Anchor the end-to-end budget clock at the START of this hop's work so
+        // the header wait we grant the upstream is decremented by our own connect
+        // setup - a genuine shrinking shared deadline, not a fresh full timeout.
+        let hop_start = Instant::now();
         match &self.transport {
             Transport::Plain => {
                 let stream = timeout(
-                    self.connect_timeout,
+                    composed_connect_cap(self.connect_timeout, budget),
                     TcpStream::connect((self.host.as_str(), self.port)),
                 )
                 .await
@@ -347,7 +436,8 @@ impl UpstreamHttp {
                 .map_err(|e| {
                     SourceError::Unreachable(format!("connect to {}: {e}", self.authority))
                 })?;
-                self.send_over(TokioIo::new(stream), path).await
+                self.send_over(TokioIo::new(stream), path, budget, hop_start)
+                    .await
             }
             Transport::Tls {
                 config,
@@ -356,7 +446,9 @@ impl UpstreamHttp {
                 // FROZEN tls-upstream-v1: one `total` deadline over DNS + TCP
                 // connect + TLS handshake, with each stage additionally capped.
                 // A stalled stage fails within the bound as a typed error, so the
-                // serving layer 502s and Nix falls back - never a hang.
+                // serving layer 502s and Nix falls back - never a hang. The
+                // composing HOP budget governs only the post-handshake HEADER wait
+                // (below); it does NOT weaken the frozen TLS connect budget.
                 let start = Instant::now();
                 let connect_cap = stage_budget(
                     self.tls_budget.total,
@@ -398,7 +490,8 @@ impl UpstreamHttp {
                 .map_err(|e| {
                     SourceError::Upstream(format!("tls handshake to {}: {e}", self.authority))
                 })?;
-                self.send_over(TokioIo::new(tls), path).await
+                self.send_over(TokioIo::new(tls), path, budget, hop_start)
+                    .await
             }
         }
     }
@@ -406,10 +499,17 @@ impl UpstreamHttp {
     /// The hyper http1 handshake + request send, shared by both transports. `IO`
     /// is `TokioIo<TcpStream>` (plain) or `TokioIo<TlsStream<TcpStream>>` (TLS);
     /// neither adds a decoding layer, so byte forwarding is identical (AC#2).
+    ///
+    /// `budget`/`hop_start` carry the composing end-to-end deadline (TASK-33): the
+    /// wait for the upstream's response headers is `composed_header_wait(header_timeout,
+    /// budget, setup_elapsed)`, and that same remaining value is written to the
+    /// upstream on [`HOP_BUDGET_HEADER`] so the NEXT hop inherits the shrunk budget.
     async fn send_over<IO>(
         &self,
         io: IO,
         path: &str,
+        budget: Option<Duration>,
+        hop_start: Instant,
     ) -> Result<hyper::Response<hyper::body::Incoming>, SourceError>
     where
         IO: hyper::rt::Read + hyper::rt::Write + Send + Unpin + 'static,
@@ -426,14 +526,24 @@ impl UpstreamHttp {
         let uri: Uri = path
             .parse()
             .map_err(|e| SourceError::Upstream(format!("bad upstream path {path:?}: {e}")))?;
+
+        // Compose the header wait from our own timeout and the downstream budget,
+        // decremented by whatever setup (connect + handshake) we already spent, and
+        // PROPAGATE that remainder so the upstream hop shares the same deadline.
+        let header_wait = composed_header_wait(self.header_timeout, budget, hop_start.elapsed());
+        let hop_budget_ms = u64::try_from(header_wait.as_millis()).unwrap_or(u64::MAX);
         let request = hyper::Request::builder()
             .method(hyper::Method::GET)
             .uri(uri)
             .header(hyper::header::HOST, &self.authority)
+            .header(
+                http::HeaderName::from_static(HOP_BUDGET_HEADER),
+                hop_budget_ms,
+            )
             .body(Empty::<Bytes>::new())
             .map_err(|e| SourceError::Upstream(format!("build request: {e}")))?;
 
-        let response = timeout(self.header_timeout, sender.send_request(request))
+        let response = timeout(header_wait, sender.send_request(request))
             .await
             .map_err(|_| {
                 SourceError::Unreachable(format!("no response headers from {}", self.authority))
@@ -444,8 +554,12 @@ impl UpstreamHttp {
 
     /// Fetch a small body in full (narinfo): needed so the rewrite allowlist can
     /// be applied and byte-fidelity asserted. Bounded by [`MAX_BUFFERED_BODY`].
-    async fn fetch_buffered(&self, path: &str) -> Result<UpstreamResponse, SourceError> {
-        let response = self.send(path).await?;
+    async fn fetch_buffered(
+        &self,
+        path: &str,
+        budget: Option<Duration>,
+    ) -> Result<UpstreamResponse, SourceError> {
+        let response = self.send(path, budget).await?;
         let status = response.status().as_u16();
         let headers = response.headers().clone();
         let collected = Limited::new(response.into_body(), MAX_BUFFERED_BODY)
@@ -486,8 +600,9 @@ impl UpstreamHttp {
         &self,
         path: &str,
         _expected_size: Option<u64>,
+        budget: Option<Duration>,
     ) -> Result<UpstreamResponse, SourceError> {
-        let response = self.send(path).await?;
+        let response = self.send(path, budget).await?;
         let status = response.status().as_u16();
         let headers = response.headers().clone();
         let body = response.into_body().map_err(std::io::Error::other).boxed();
@@ -536,9 +651,18 @@ fn parse_authority(base: &str) -> Result<(Scheme, String, u16), String> {
 #[async_trait]
 impl NarinfoSource for UpstreamHttp {
     async fn fetch(&self, store_hash: &StoreHash) -> Result<UpstreamResponse, SourceError> {
+        // A lone/entry fetch carries no downstream budget: seed from header_timeout.
+        self.fetch_within(store_hash, None).await
+    }
+
+    async fn fetch_within(
+        &self,
+        store_hash: &StoreHash,
+        budget: Option<Duration>,
+    ) -> Result<UpstreamResponse, SourceError> {
         // The store hash is the only thing the serving layer knows; THIS is
         // where it becomes a URL, and the only place.
-        self.fetch_buffered(&format!("/{}.narinfo", store_hash.as_str()))
+        self.fetch_buffered(&format!("/{}.narinfo", store_hash.as_str()), budget)
             .await
     }
 }
@@ -550,6 +674,15 @@ impl NarSource for UpstreamHttp {
         key: &NarKey,
         expected_size: Option<u64>,
     ) -> Result<UpstreamResponse, SourceError> {
+        self.resolve_within(key, expected_size, None).await
+    }
+
+    async fn resolve_within(
+        &self,
+        key: &NarKey,
+        expected_size: Option<u64>,
+        budget: Option<Duration>,
+    ) -> Result<UpstreamResponse, SourceError> {
         // The content identity becomes an upstream URL HERE and nowhere else -
         // the seam that lets wave 2 swap in an iroh source (which resolves the
         // SignedNarHash over p2p, and rejects UpstreamPath) behind the same
@@ -560,7 +693,7 @@ impl NarSource for UpstreamHttp {
             NarKey::SignedNarHash { upstream_hint, .. } => upstream_hint.as_str(),
             NarKey::UpstreamPath(token) => token.as_str(),
         };
-        self.fetch_streaming(&format!("/nar/{token}"), expected_size)
+        self.fetch_streaming(&format!("/nar/{token}"), expected_size, budget)
             .await
     }
 }
@@ -568,7 +701,15 @@ impl NarSource for UpstreamHttp {
 #[async_trait]
 impl RawUpstream for UpstreamHttp {
     async fn get(&self, path: &str) -> Result<UpstreamResponse, SourceError> {
-        self.fetch_streaming(path, None).await
+        self.get_within(path, None).await
+    }
+
+    async fn get_within(
+        &self,
+        path: &str,
+        budget: Option<Duration>,
+    ) -> Result<UpstreamResponse, SourceError> {
+        self.fetch_streaming(path, None, budget).await
     }
 }
 
@@ -633,6 +774,51 @@ mod tests {
             ),
             Duration::ZERO
         );
+    }
+
+    #[test]
+    fn composed_header_wait_seeds_and_shrinks_across_hops() {
+        // TASK-33: the composing budget arithmetic, integer + saturating.
+        let t = |ms| Duration::from_millis(ms);
+
+        // ENTRY (no downstream budget): waits its FULL header_timeout, and the
+        // setup already spent is intentionally IGNORED so single-daemon timing is
+        // byte-for-byte the wave-1 behaviour (header wait measured after connect).
+        assert_eq!(composed_header_wait(t(1000), None, t(7)), t(1000));
+
+        // A downstream budget LARGER than our own timeout: our timeout binds (we
+        // never wait longer than our local ceiling).
+        assert_eq!(composed_header_wait(t(1000), Some(t(2000)), t(10)), t(1000));
+
+        // THE COMPOSING PROPERTY: a TIGHTER downstream budget caps a hop that has
+        // a much larger local header_timeout - the shared end-to-end deadline wins.
+        assert_eq!(composed_header_wait(t(5000), Some(t(200)), t(10)), t(190));
+
+        // A budget already spent on connect setup yields ZERO -> fail at once,
+        // never a fresh full timeout the chain has no time left for.
+        assert_eq!(
+            composed_header_wait(t(1000), Some(t(300)), t(350)),
+            Duration::ZERO
+        );
+
+        // A downstream that says "expired" (0 ms) yields ZERO regardless.
+        assert_eq!(
+            composed_header_wait(t(1000), Some(Duration::ZERO), t(0)),
+            Duration::ZERO
+        );
+    }
+
+    #[test]
+    fn composed_connect_cap_keeps_dead_hops_fast() {
+        let t = |ms| Duration::from_millis(ms);
+        // No budget: the configured connect_timeout governs (wave-1 fast-fail).
+        assert_eq!(composed_connect_cap(t(1000), None), t(1000));
+        // A budget smaller than connect_timeout caps connect too (a chain with
+        // little time left does not spend it all connecting).
+        assert_eq!(composed_connect_cap(t(1000), Some(t(200))), t(200));
+        // A budget larger than connect_timeout leaves connect fast (connect_timeout
+        // still bounds a DOWN upstream).
+        assert_eq!(composed_connect_cap(t(1000), Some(t(9000))), t(1000));
     }
 
     #[test]
@@ -1155,6 +1341,204 @@ mod tls_tests {
                 .contains("StoreDir"),
             "nix-cache-info body must carry StoreDir, got {} bytes",
             body.len()
+        );
+    }
+}
+
+/// TASK-33: the composing per-hop header budget, exercised end-to-end against an
+/// in-process loopback HTTP server. These bite the BEHAVIOUR the wave-1 fixed
+/// per-hop timeout could not deliver: the budget is PROPAGATED to the upstream and
+/// it BOUNDS the header wait below a larger local `header_timeout`. Every assertion
+/// has a mutation control (an entry vs an inner hop, served vs timed-out) so it
+/// cannot pass on a daemon that ignores the budget. No podman, no floats.
+#[cfg(test)]
+mod budget_tests {
+    use super::*;
+
+    use std::net::SocketAddr;
+    use std::sync::{Arc, Mutex};
+
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
+
+    /// Extract the integer `x-nix-p2p-hop-budget-ms` value a request carried, or
+    /// `None` if absent/unparsable - the exact wire value the NEXT hop would read.
+    fn recorded_budget(raw: &[u8]) -> Option<u64> {
+        let text = std::str::from_utf8(raw).ok()?;
+        for line in text.split("\r\n") {
+            if let Some((name, value)) = line.split_once(':')
+                && name.trim().eq_ignore_ascii_case(HOP_BUDGET_HEADER)
+            {
+                return value.trim().parse().ok();
+            }
+        }
+        None
+    }
+
+    /// A loopback HTTP/1.1 server that (1) RECORDS the inbound
+    /// `x-nix-p2p-hop-budget-ms` of each request (proving propagation) and (2)
+    /// delays its response HEADERS by `delay` before replying 200 (so a
+    /// budget-vs-delay race proves the wait is bounded by the propagated budget).
+    async fn spawn_recording_http(delay: Duration) -> (SocketAddr, Arc<Mutex<Vec<Option<u64>>>>) {
+        let seen: Arc<Mutex<Vec<Option<u64>>>> = Arc::new(Mutex::new(Vec::new()));
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        let seen_task = seen.clone();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut sock, _)) = listener.accept().await else {
+                    return;
+                };
+                let seen = seen_task.clone();
+                tokio::spawn(async move {
+                    let mut acc = Vec::new();
+                    let mut buf = [0u8; 1024];
+                    loop {
+                        match sock.read(&mut buf).await {
+                            Ok(0) => return,
+                            Ok(n) => {
+                                acc.extend_from_slice(&buf[..n]);
+                                if acc.windows(4).any(|w| w == b"\r\n\r\n") {
+                                    break;
+                                }
+                            }
+                            Err(_) => return,
+                        }
+                    }
+                    seen.lock().expect("seen lock").push(recorded_budget(&acc));
+                    if !delay.is_zero() {
+                        tokio::time::sleep(delay).await;
+                    }
+                    let body = b"ok";
+                    let head = format!(
+                        "HTTP/1.1 200 OK\r\ncontent-type: text/plain\r\ncontent-length: {}\r\n\r\n",
+                        body.len()
+                    );
+                    let _ = sock.write_all(head.as_bytes()).await;
+                    let _ = sock.write_all(body).await;
+                    let _ = sock.flush().await;
+                    let _ = sock.shutdown().await;
+                });
+            }
+        });
+        (addr, seen)
+    }
+
+    /// The chain ENTRY (no inbound budget) SEEDS the propagated budget from its own
+    /// `header_timeout`, exactly - the whole chain's shared deadline starts here.
+    #[tokio::test]
+    async fn entry_hop_seeds_and_propagates_its_header_timeout() {
+        let (addr, seen) = spawn_recording_http(Duration::ZERO).await;
+        let client = UpstreamHttp::new(&format!("http://{addr}"))
+            .expect("http base")
+            .with_header_timeout(Duration::from_millis(1234));
+        // RawUpstream::get -> get_within(None): the entry seeds budget = header_timeout.
+        let resp = client.get("/nar/x").await.expect("served");
+        assert_eq!(resp.status, 200);
+        let recorded = seen.lock().expect("seen").clone();
+        assert_eq!(recorded.len(), 1, "exactly one upstream request");
+        assert_eq!(
+            recorded[0],
+            Some(1234),
+            "entry propagates its full header_timeout as the seed budget (setup ignored for the entry)"
+        );
+    }
+
+    /// An INNER hop caps the propagated budget to the SMALLER of the incoming
+    /// budget and its own timeout, and forwards the decremented remainder - the
+    /// shared deadline shrinks monotonically down the chain.
+    #[tokio::test]
+    async fn inner_hop_caps_to_incoming_budget_and_forwards_remainder() {
+        let (addr, seen) = spawn_recording_http(Duration::ZERO).await;
+        let client = UpstreamHttp::new(&format!("http://{addr}"))
+            .expect("http base")
+            .with_header_timeout(Duration::from_millis(1234));
+        // Simulate a downstream client that propagated an 800ms remaining budget.
+        let resp = client
+            .get_within("/nar/x", Some(Duration::from_millis(800)))
+            .await
+            .expect("served");
+        assert_eq!(resp.status, 200);
+        let forwarded = seen.lock().expect("seen").clone()[0].expect("budget header present");
+        // min(1234, 800 - sub-ms loopback setup): capped by the incoming budget,
+        // decremented by our own setup (so <= 800, and within a wide grace of it).
+        assert!(
+            (750..=800).contains(&forwarded),
+            "inner hop forwards the incoming budget minus its setup; got {forwarded}ms (want ~800)"
+        );
+    }
+
+    /// THE BITE: a TIGHTER downstream budget bounds this hop's header wait BELOW
+    /// its own (large) `header_timeout`. With the wave-1 fixed per-hop timeout the
+    /// budget was ignored and this same call would wait 5000ms and SERVE; the
+    /// composing budget makes it fail near the 150ms budget instead. The served
+    /// control (same upstream, no budget) proves the upstream is alive.
+    #[tokio::test]
+    async fn a_tighter_downstream_budget_bounds_the_wait_below_the_local_timeout() {
+        let (addr, _seen) = spawn_recording_http(Duration::from_millis(400)).await;
+        let client = UpstreamHttp::new(&format!("http://{addr}"))
+            .expect("http base")
+            .with_header_timeout(Duration::from_millis(5000));
+
+        // CONTROL: no downstream budget -> the 5000ms local timeout waits out the
+        // 400ms header delay -> served. Proves the upstream is alive and the delay
+        // is below the local timeout. (Map to status: UpstreamResponse is not Debug.)
+        let served = client.get("/nar/x").await.map(|r| r.status);
+        assert_eq!(
+            served.as_ref().ok().copied(),
+            Some(200),
+            "a 5000ms header_timeout serves a 400ms-slow upstream, got {served:?}"
+        );
+
+        // BITE: a 150ms downstream budget (< the 400ms delay) caps the wait below
+        // the 5000ms local timeout -> times out fast as a typed Unreachable.
+        let started = Instant::now();
+        let bounded = client
+            .get_within("/nar/x", Some(Duration::from_millis(150)))
+            .await
+            .map(|r| r.status);
+        let elapsed = started.elapsed();
+        assert!(
+            matches!(bounded, Err(SourceError::Unreachable(_))),
+            "a tight downstream budget must time out, got {bounded:?}"
+        );
+        assert!(
+            elapsed >= Duration::from_millis(150),
+            "must actually wait out the budget, not fail instantly for another reason; took {elapsed:?}"
+        );
+        assert!(
+            elapsed < Duration::from_millis(2000),
+            "must fail near the 150ms budget, NOT the 5000ms local timeout (the composing bite); took {elapsed:?}"
+        );
+    }
+
+    /// The required invariant (task brief): a DOWN upstream still fails FAST on
+    /// connect even with a generous budget - only a connected, slow-but-alive
+    /// upstream consumes the composed header wait.
+    #[tokio::test]
+    async fn down_upstream_fails_fast_even_with_a_generous_budget() {
+        // Bind then immediately drop the listener so the port is CLOSED: connect
+        // is refused near-instantly, independent of any budget.
+        let addr = {
+            let l = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+            l.local_addr().expect("addr")
+        };
+        let client = UpstreamHttp::new(&format!("http://{addr}"))
+            .expect("http base")
+            .with_header_timeout(Duration::from_millis(5000));
+        let started = Instant::now();
+        let res = client
+            .get_within("/nar/x", Some(Duration::from_millis(5000)))
+            .await
+            .map(|r| r.status);
+        let elapsed = started.elapsed();
+        assert!(
+            matches!(res, Err(SourceError::Unreachable(_))),
+            "a down upstream is a typed Unreachable, got {res:?}"
+        );
+        assert!(
+            elapsed < Duration::from_millis(2000),
+            "a dead hop fails fast on connect, NOT after the 5000ms budget; took {elapsed:?}"
         );
     }
 }

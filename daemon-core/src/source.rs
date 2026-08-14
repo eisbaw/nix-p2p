@@ -41,6 +41,8 @@
 //! may not passthrough arbitrary paths at all; this trait can then go away
 //! without touching the two capability seams.
 
+use std::time::Duration;
+
 use async_trait::async_trait;
 use bytes::Bytes;
 use http::HeaderMap;
@@ -266,6 +268,29 @@ impl std::error::Error for SourceError {}
 #[async_trait]
 pub trait NarinfoSource: Send + Sync {
     async fn fetch(&self, store_hash: &StoreHash) -> Result<UpstreamResponse, SourceError>;
+
+    /// Budget-aware variant (TASK-33). `budget` is the remaining end-to-end
+    /// header-wait time propagated by a DOWNSTREAM chain client (the daemon that
+    /// sent us this request), or `None` when we are the chain ENTRY (the client
+    /// - e.g. Nix - sent no budget). It exists so a daemon chain shares ONE
+    /// honest end-to-end deadline instead of each hop re-granting a fresh, fixed
+    /// per-hop `header_timeout`.
+    ///
+    /// The DEFAULT ignores `budget` and calls [`Self::fetch`]: correct for every
+    /// source that does NOT issue a serial HTTP-chain request (the disk-cache HIT
+    /// path, p2p sources, test fakes). Only [`crate::upstream::UpstreamHttp`]
+    /// overrides it to consume the budget - capping its upstream header-wait to
+    /// `min(header_timeout, budget - setup)` and propagating the decremented
+    /// remainder on its outbound request - and [`crate::narinfo_cache`] forwards
+    /// it through the cache-MISS path so the wrapped upstream still composes.
+    async fn fetch_within(
+        &self,
+        store_hash: &StoreHash,
+        budget: Option<Duration>,
+    ) -> Result<UpstreamResponse, SourceError> {
+        let _ = budget;
+        self.fetch(store_hash).await
+    }
 }
 
 /// NAR resolution by content identity ([`NarKey`]) to a verified byte stream.
@@ -289,6 +314,21 @@ pub trait NarSource: Send + Sync {
         key: &NarKey,
         expected_size: Option<u64>,
     ) -> Result<UpstreamResponse, SourceError>;
+
+    /// Budget-aware variant (TASK-33); see [`NarinfoSource::fetch_within`] for the
+    /// end-to-end chain budget semantics. The DEFAULT ignores `budget` and calls
+    /// [`Self::resolve`]; [`crate::upstream::UpstreamHttp`] overrides it. A p2p
+    /// `NarSource` legitimately ignores it - it resolves over its own transport,
+    /// not a serial HTTP hop - so the HTTP-chain budget does not apply.
+    async fn resolve_within(
+        &self,
+        key: &NarKey,
+        expected_size: Option<u64>,
+        budget: Option<Duration>,
+    ) -> Result<UpstreamResponse, SourceError> {
+        let _ = budget;
+        self.resolve(key, expected_size).await
+    }
 }
 
 /// Wave-1-only transparent passthrough for path kinds that are neither narinfo
@@ -298,4 +338,17 @@ pub trait NarSource: Send + Sync {
 #[async_trait]
 pub trait RawUpstream: Send + Sync {
     async fn get(&self, path: &str) -> Result<UpstreamResponse, SourceError>;
+
+    /// Budget-aware variant (TASK-33); see [`NarinfoSource::fetch_within`]. The
+    /// DEFAULT ignores `budget` and calls [`Self::get`];
+    /// [`crate::upstream::UpstreamHttp`] overrides it so `log/*`/`*.ls`
+    /// passthrough on a daemon chain shares the same end-to-end budget.
+    async fn get_within(
+        &self,
+        path: &str,
+        budget: Option<Duration>,
+    ) -> Result<UpstreamResponse, SourceError> {
+        let _ = budget;
+        self.get(path).await
+    }
 }

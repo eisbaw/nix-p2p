@@ -381,7 +381,18 @@ impl NarinfoDiskCache {
 #[async_trait]
 impl NarinfoSource for NarinfoDiskCache {
     async fn fetch(&self, store_hash: &StoreHash) -> Result<UpstreamResponse, SourceError> {
-        // 1. Disk hit (fresh, valid): serve verbatim, upstream untouched.
+        // A budget-less fetch (lone daemon / no downstream chain client): the
+        // MISS path seeds the inner upstream from its own header_timeout.
+        self.fetch_within(store_hash, None).await
+    }
+
+    async fn fetch_within(
+        &self,
+        store_hash: &StoreHash,
+        budget: Option<std::time::Duration>,
+    ) -> Result<UpstreamResponse, SourceError> {
+        // 1. Disk hit (fresh, valid): serve verbatim, upstream untouched. A HIT
+        // issues NO upstream request, so the chain budget does not apply here.
         if let Some(entry) = self.read_fresh(store_hash.as_str()) {
             return Ok(match entry.kind {
                 EntryKind::Positive => positive_response(entry.body),
@@ -389,8 +400,10 @@ impl NarinfoSource for NarinfoDiskCache {
             });
         }
 
-        // 2. Miss: go to the inner source.
-        let resp = self.inner.fetch(store_hash).await?;
+        // 2. Miss: go to the inner source, FORWARDING the composing chain budget
+        // (TASK-33) so the wrapped upstream shares the end-to-end deadline rather
+        // than starting a fresh per-hop timeout behind the cache.
+        let resp = self.inner.fetch_within(store_hash, budget).await?;
         let status = resp.status;
 
         if status == 404 {

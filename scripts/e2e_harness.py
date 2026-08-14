@@ -3765,16 +3765,18 @@ def scenario_chain_timeout_invariant(ctx: Ctx, expect) -> None:
         # passthrough incurs it once regardless of depth; a per-hop multiplying
         # design would incur it at every hop.
         #
-        # The delay is kept WELL BELOW the daemon's fixed 1000ms per-hop upstream
-        # header timeout (daemon/src/upstream.rs `header_timeout`). FINDING
-        # (filed for task-13/task-25): that timeout does NOT compose across hops
-        # - it starts when each hop sends its request, but inner hops fetch
-        # serially, so at depth the deepest upstream's effective deadline shrinks
-        # by the accumulated per-hop setup. A delay AT the 1000ms timeout that a
-        # 1-hop entry survives makes a 3-hop entry 502 (observed). That is a real
-        # depth-composition limit, not latency multiplication (the delay is still
-        # incurred once); this oracle stays below it to measure the property it
-        # names, and the finding is tracked separately rather than papered over.
+        # The delay is kept WELL BELOW the daemon's default 1000ms header budget
+        # (daemon/src/upstream.rs `header_timeout`). TASK-33 replaced the wave-1
+        # FIXED per-hop timeout with a COMPOSING budget: the entry hop seeds an
+        # end-to-end budget from its header_timeout and propagates a shrinking
+        # remaining-budget (`x-nix-p2p-hop-budget-ms`) down the chain, so the whole
+        # chain shares ONE deadline instead of each hop re-granting a fresh timeout.
+        # The inherent serial-chain admission ceiling remains (an upstream of header
+        # latency L is served iff L + (depth-1)*per_hop_overhead < budget, the
+        # OUTERMOST hop 502ing first); on loopback per_hop_overhead is sub-ms, so the
+        # flip is governed by L vs the budget and the depth term is WAN-scale
+        # (TASK-35/TASK-111). This oracle stays below the budget to measure the
+        # non-multiplication property it names.
         delay_ms = 300
         pod.proxy_faults(f"latency_narinfo_ms={delay_ms}")
         t_shallow_d, shallow_d_status = _time_get_median_ms(
@@ -4140,20 +4142,25 @@ def scenario_fault_depth_matrix(ctx: Ctx, expect) -> None:
 
 
 def scenario_chain_timeout_boundary(ctx: Ctx, expect) -> None:
-    """TASK-33 (partial - NOT a depth-pinned boundary): pin the upstream-latency
-    vs per-hop-header-timeout boundary that flips a narinfo GET 200 -> 502, and
-    PROVE it MOVES when the timeout changes. The daemon's `--header-timeout-ms`
-    (task-13) is the controllable lever.
+    """TASK-33: pin the upstream-latency (L) vs end-to-end header BUDGET (T)
+    boundary that flips a narinfo GET 200 -> 502 at FULL chain depth, and PROVE it
+    MOVES when the budget changes. The daemon's `--header-timeout-ms` seeds the
+    chain's shared end-to-end budget (TASK-33 composing budget), so it is the
+    controllable lever here.
 
-    HONEST SCOPE (codex re-gate): this does NOT pin a *depth*-dependent boundary.
-    On pod loopback the per-hop connect/send overhead is sub-millisecond, so the
-    fixed-per-hop-timeout composition term is below the noise floor and does not
-    separate depth 1 from depth 3 - a depth-pinned flip is WAN-scale and not
-    honestly assertable here. So the asserted CLAIM is only: at the FULL chain
-    depth (depth-3 entry, worst case), the flip is governed by L vs T and moves
-    with T. The all-depths statuses are PRINTED as an observation (they agree),
-    never asserted as a depth boundary. task-33 stays OPEN for the budget-aware
-    fix and its real-WAN validation (task-15/task-35).
+    HONEST SCOPE (the reopened codex NO-GO lesson - do NOT regress it): this does
+    NOT pin a *depth*-dependent boundary, and the composing budget does NOT claim
+    to remove the depth term. The entry hop is always the binding constraint at its
+    own budget, and on pod loopback the per-hop connect/send overhead is sub-ms, so
+    the depth-composition term (L + (depth-1)*overhead) is below the noise floor:
+    depth 1 and depth 3 flip TOGETHER at L~=T and cannot be honestly separated
+    here. So the asserted CLAIM is only: at FULL chain depth (depth-3 entry, worst
+    case) the flip is governed by L vs the budget and moves with the budget. The
+    all-depths statuses are PRINTED as an observation (they agree), never asserted
+    as a depth boundary. The composing-budget MECHANISM itself (propagation +
+    a tighter downstream budget bounding a hop's wait) is unit/integration-pinned
+    in daemon-core `upstream::budget_tests`; the raw depth term's real-WAN
+    validation is deferred to TASK-35 / TASK-111 (loopback cannot do WAN RTT).
 
     FALSIFIABILITY (qa N1): the bite is the PAIR, not either assertion alone -
     'L=900 -> 502 at T=500' AND 'L=900 -> 200 at T=1200' TOGETHER require the flip

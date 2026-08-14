@@ -155,6 +155,12 @@ async fn handle(req: Request<Incoming>, app: Arc<App>) -> Response<NarBody> {
     }
     let is_head = method == Method::HEAD;
     let path = req.uri().path().to_string();
+    // TASK-33: the remaining end-to-end header-wait budget propagated by a
+    // DOWNSTREAM daemon in a chain, or `None` when this hop is the ENTRY (a
+    // plain client - e.g. Nix - sends no such header). Passed to the budget-aware
+    // source methods so the whole chain shares ONE shrinking deadline instead of
+    // each hop re-granting a fresh `header_timeout`.
+    let hop_budget = parse_hop_budget(req.headers());
 
     // Wave-1 choice: HEAD is answered by fetching upstream via GET (the source
     // traits carry no method) and dropping the body. Status/headers are correct,
@@ -164,7 +170,7 @@ async fn handle(req: Request<Incoming>, app: Arc<App>) -> Response<NarBody> {
     match classify(&path) {
         Route::CacheInfo => respond_cache_info(&app.cache_info, is_head),
         Route::Narinfo(hash) => {
-            let fetched = app.narinfo.fetch(&hash).await;
+            let fetched = app.narinfo.fetch_within(&hash, hop_budget).await;
             respond_narinfo(
                 fetched,
                 &hash,
@@ -205,13 +211,36 @@ async fn handle(req: Request<Incoming>, app: Arc<App>) -> Response<NarBody> {
                 None => (NarKey::UpstreamPath(token), None),
             };
             let started = Instant::now();
-            let result = app.nar.resolve(&key, expected_size).await;
+            let result = app
+                .nar
+                .resolve_within(&key, expected_size, hop_budget)
+                .await;
             // Log BEFORE `forward` moves `result`: the ordering is load-bearing.
             log_substitution(&app.upstream_label, &nar_token, &result, started.elapsed());
             forward(result, is_head)
         }
-        Route::Other => forward(app.passthrough.get(&path).await, is_head),
+        Route::Other => forward(app.passthrough.get_within(&path, hop_budget).await, is_head),
     }
+}
+
+/// Parse the remaining end-to-end header-wait budget from the inbound request's
+/// [`crate::upstream::HOP_BUDGET_HEADER`] (integer milliseconds), propagated by a
+/// downstream daemon in a chain (TASK-33).
+///
+///   * ABSENT / unparsable / non-numeric -> `None`: treat this hop as the chain
+///     ENTRY and seed the budget from its own `header_timeout`. Failing OPEN on a
+///     garbled header is safe - the worst case is a hop uses its full local
+///     timeout, i.e. the wave-1 behaviour.
+///   * `0` -> `Some(0)`: the downstream says its deadline is already spent, so
+///     this hop must fail fast rather than start a fresh full timeout.
+///
+/// A hostile/oversized value cannot make this hop wait longer than its own
+/// `header_timeout`: [`crate::upstream::composed_header_wait`] takes the MIN, so
+/// no clamp is needed here.
+fn parse_hop_budget(headers: &HeaderMap) -> Option<Duration> {
+    let raw = headers.get(crate::upstream::HOP_BUDGET_HEADER)?;
+    let ms: u64 = raw.to_str().ok()?.trim().parse().ok()?;
+    Some(Duration::from_millis(ms))
 }
 
 /// Serve the locally-generated cache-info body (never proxied).
