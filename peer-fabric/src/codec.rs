@@ -249,6 +249,12 @@ pub enum DecodeError {
     /// A COMPLETE frame was followed by extra input. A well-formed transfer is exactly one
     /// zstd frame, so trailing bytes are a framing violation, rejected rather than ignored.
     TrailingInput { trailing: u64 },
+    /// A complete frame decoded to ZERO bytes: an empty output, or a zstd SKIPPABLE frame
+    /// (magic `0x184D2A50..=0x184D2A5F`, which carries no decompressed payload). A real store
+    /// -path NAR is NEVER empty (the NAR format has a fixed non-empty header), so a body that
+    /// decodes to nothing is not a valid transfer and is rejected at the codec rather than
+    /// handed up as an empty NAR.
+    EmptyNar,
 }
 
 impl std::fmt::Display for DecodeError {
@@ -275,6 +281,11 @@ impl std::fmt::Display for DecodeError {
                 "zstd stream carried {trailing} trailing byte(s) after a complete frame: \
                  malformed framing (a well-formed transfer is exactly one frame), rejected"
             ),
+            DecodeError::EmptyNar => write!(
+                f,
+                "zstd stream decoded to zero bytes (empty output or a skippable frame): a real \
+                 NAR is never empty, rejected at the codec"
+            ),
         }
     }
 }
@@ -300,12 +311,21 @@ const DECODE_BLOCK: usize = 128 * 1024;
 ///
 /// # Memory bound
 ///
-/// Peak decoder memory is `cap + one decode block (128 KiB) + the bounded zstd window`
-/// (`<= 2^`[`ZSTD_WINDOW_LOG_MAX`]): the output `Vec` is capped at `cap`, only one decode block
-/// is buffered at a time, and the window is bounded by [`ZSTD_WINDOW_LOG_MAX`] (the only term
-/// NOT bounded by `cap` - a small nar under a hostile frame header can still allocate up to the
-/// window ceiling, which is why the window itself is bounded). One inbound compressed chunk is
-/// additionally held by the caller's read loop, not here.
+/// Peak decoder memory is `O(cap) + one decode block (128 KiB) + the bounded zstd window`
+/// (`<= 2^`[`ZSTD_WINDOW_LOG_MAX`]). Every term is BOUNDED — there is no unbounded hole — but
+/// the constant is not exactly `cap`:
+///
+///   * The output `Vec`'s LENGTH never exceeds `cap` (every append is gated by
+///     [`append_capped`](Self::append_capped)), but its CAPACITY can transiently exceed its
+///     length during geometric (doubling) reallocation, so the output allocation is `O(cap)`,
+///     up to roughly `2 * cap`, not exactly `cap`.
+///   * Exactly one decode block (128 KiB) of scratch is buffered at a time.
+///   * The window is bounded by [`ZSTD_WINDOW_LOG_MAX`] — the only term NOT bounded by `cap`
+///     at all, so a small nar under a hostile frame header can still allocate up to the window
+///     ceiling, which is why the window itself is bounded.
+///
+/// One inbound compressed chunk (the caller's ~64 KiB wire read buffer) is additionally held
+/// by the caller's read loop across a [`push`](Self::push), not here.
 pub struct BoundedZstdDecoder {
     /// `None` once the decoder is terminal (a prior error, or `finish` consumed it). The raw
     /// [`Decoder`] is driven step by step so the frame-boundary hint is visible.
@@ -441,10 +461,17 @@ impl BoundedZstdDecoder {
             self.frame_complete = status.remaining == 0;
 
             let more_input = offset < compressed.len();
-            // If the scratch filled, the decoder may still hold buffered output to drain even
-            // with no further input, so keep going until an unfilled block or all input eaten.
+            // If the scratch filled, the decoder MAY still hold buffered output to drain even
+            // with no further input, so we normally loop again with empty input to flush it.
+            // EXCEPTION: if the frame just COMPLETED (`remaining == 0`, recorded in
+            // `frame_complete` above) there is nothing left to drain — and running another
+            // empty-input decode step would make zstd expect a NEW frame and clear
+            // `frame_complete`, so a NAR whose decoded size is an EXACT multiple of the
+            // scratch block would be falsely reported as truncated by `finish` (the 128 KiB
+            // boundary regression). A completed frame therefore always breaks, whether or not
+            // the scratch happened to fill exactly on the final step.
             let output_full = status.bytes_written == self.scratch.len();
-            if !more_input && !output_full {
+            if !more_input && (!output_full || self.frame_complete) {
                 break;
             }
             if status.bytes_read == 0 && status.bytes_written == 0 {
@@ -473,6 +500,12 @@ impl BoundedZstdDecoder {
             return Err(DecodeError::Truncated {
                 consumed: self.consumed,
             });
+        }
+        if self.buf.is_empty() {
+            // A complete frame that produced NO output — an empty frame or a skippable frame
+            // (which carries no decompressed payload). A real NAR is never empty, so reject
+            // rather than hand up an empty NAR.
+            return Err(DecodeError::EmptyNar);
         }
         Ok(self.buf)
     }
@@ -701,6 +734,123 @@ mod tests {
         assert!(
             matches!(err, DecodeError::Truncated { .. }),
             "expected Truncated for an empty stream, got {err}"
+        );
+    }
+
+    /// The 128 KiB BOUNDARY REGRESSION (codex 3rd re-gate, MUST-FIX): a NAR whose UNCOMPRESSED
+    /// size is an EXACT multiple of the 128 KiB scratch block (`DECODE_BLOCK`) must decode
+    /// successfully and round-trip. The pre-fix decoder, when a decode step filled the scratch
+    /// EXACTLY as the frame completed, looped once more and ran an empty-input decode that made
+    /// zstd expect a new frame and CLEARED `frame_complete`, so `finish` falsely reported
+    /// `Truncated`. codex's exact reproducer: 131072 zero-bytes -> `Truncated{consumed:22}`,
+    /// 262144 -> `Truncated`, while 131071/131073/262145 succeeded.
+    /// BITE: drop the `|| self.frame_complete` guard in `push`'s break condition and the
+    /// N*131072 cases below regress to `Truncated`.
+    #[test]
+    fn exact_block_multiple_sizes_round_trip() {
+        const BLOCK: usize = 128 * 1024; // tracks `DECODE_BLOCK`
+        assert_eq!(
+            BLOCK, DECODE_BLOCK,
+            "test block size must track the decoder's"
+        );
+        // codex's exact reproducer, N=1 (131072) FIRST, then N=2 (262144), N=3.
+        for n in 1..=3usize {
+            let raw = vec![0u8; n * BLOCK];
+            let compressed = compress_zstd(&raw, DEFAULT_ZSTD_LEVEL).unwrap();
+            let decoded = decode_all(&compressed, raw.len() as u64, 4096)
+                .unwrap_or_else(|e| panic!("N={n} ({} bytes) must decode, got {e}", n * BLOCK));
+            assert_eq!(
+                decoded,
+                raw,
+                "N={n} exact block multiple ({} bytes) must round-trip",
+                n * BLOCK
+            );
+        }
+    }
+
+    /// The exact-multiple fix must not create an off-by-one the OTHER way: ±1 byte around each
+    /// block boundary (N=1,2,3) must also round-trip. (These sizes already worked pre-fix, per
+    /// codex; kept as a guardrail so neither boundary regresses.)
+    #[test]
+    fn near_block_multiple_sizes_round_trip() {
+        const BLOCK: i64 = (128 * 1024) as i64;
+        for n in 1..=3i64 {
+            for delta in [-1i64, 1] {
+                let size = (n * BLOCK + delta) as usize;
+                let raw = vec![0u8; size];
+                let compressed = compress_zstd(&raw, DEFAULT_ZSTD_LEVEL).unwrap();
+                let decoded = decode_all(&compressed, size as u64, 4096)
+                    .unwrap_or_else(|e| panic!("size={size} must decode, got {e}"));
+                assert_eq!(decoded.len(), size, "size={size} decoded length");
+                assert_eq!(decoded, raw, "size={size} must round-trip");
+            }
+        }
+    }
+
+    /// A single-byte NAR round-trips (the smallest non-empty payload; the empty case is rejected
+    /// separately as `EmptyNar`).
+    #[test]
+    fn one_byte_nar_round_trips() {
+        let raw = vec![0x5au8; 1];
+        let compressed = compress_zstd(&raw, DEFAULT_ZSTD_LEVEL).unwrap();
+        let decoded = decode_all(&compressed, 1, 4096).expect("a 1-byte NAR must decode");
+        assert_eq!(decoded, raw);
+    }
+
+    /// A multi-MiB payload whose size is forced to an EXACT block multiple (32 blocks = 4 MiB)
+    /// round-trips: the boundary logic must hold for a genuinely multi-block frame, not only the
+    /// tiny all-zeros case. Content is a compressible-but-non-trivial LCG stream (a multi-block
+    /// frame), truncated to an exact block multiple.
+    #[test]
+    fn multi_mib_exact_block_multiple_round_trips() {
+        const BLOCK: usize = 128 * 1024;
+        let total = 32 * BLOCK; // 4 MiB, exact block multiple
+        let mut raw = Vec::with_capacity(total);
+        let mut x: u32 = 0x1234_5678;
+        while raw.len() < total {
+            x = x.wrapping_mul(1103515245).wrapping_add(12345);
+            // Low-entropy top byte biased toward repetition so the frame stays multi-block but
+            // compresses (not the incompressible high-entropy path).
+            raw.push(((x >> 24) & 0x0f) as u8);
+        }
+        raw.truncate(total);
+        assert_eq!(
+            raw.len() % BLOCK,
+            0,
+            "payload must be an exact block multiple"
+        );
+        let compressed = compress_zstd(&raw, DEFAULT_ZSTD_LEVEL).unwrap();
+        let decoded = decode_all(&compressed, raw.len() as u64, 64 * 1024)
+            .expect("a multi-MiB exact-block-multiple NAR must decode");
+        assert_eq!(decoded, raw);
+    }
+
+    /// A zstd SKIPPABLE frame (codex's exact bytes `50 2a 4d 18 00 00 00 00`, magic
+    /// `0x184D2A50` + zero content length) carries NO decompressed payload, so it decodes to an
+    /// empty output. A real NAR is never empty, so this must be rejected as `EmptyNar`, never
+    /// returned as `Ok(empty)`.
+    /// BITE: drop the `buf.is_empty()` check in `finish` and this returns `Ok(vec![])`.
+    #[test]
+    fn a_skippable_frame_is_rejected_as_empty() {
+        let skippable = [0x50u8, 0x2a, 0x4d, 0x18, 0x00, 0x00, 0x00, 0x00];
+        let err = decode_all(&skippable, 1024, 64)
+            .expect_err("a skippable frame decodes to nothing and must be rejected");
+        assert!(
+            matches!(err, DecodeError::EmptyNar),
+            "expected EmptyNar for a skippable frame, got {err}"
+        );
+    }
+
+    /// A well-formed zstd frame whose PAYLOAD is empty (compress of `&[]`) also decodes to zero
+    /// bytes and is rejected as `EmptyNar` (a real NAR is never empty).
+    #[test]
+    fn an_empty_payload_frame_is_rejected_as_empty() {
+        let compressed = compress_zstd(&[], DEFAULT_ZSTD_LEVEL).unwrap();
+        let err = decode_all(&compressed, 1024, 64)
+            .expect_err("an empty-payload frame must be rejected, not yield an empty NAR");
+        assert!(
+            matches!(err, DecodeError::EmptyNar),
+            "expected EmptyNar for an empty-payload frame, got {err}"
         );
     }
 
