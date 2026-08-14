@@ -6,6 +6,7 @@ title: >-
 status: To Do
 assignee: []
 created_date: '2026-08-12 07:55'
+updated_date: '2026-08-14 15:44'
 labels:
   - libp2p
   - fabric
@@ -30,3 +31,9 @@ Follow-up to TASK-103 (AC#10). Emit a decentralized-content-discovery-v1 verdict
 - [ ] #2 harness insertion, prior rendezvous, named candidates, tracker or LAN invalidate the evidence (bite by mutation)
 - [ ] #3 an evidence finalizer binds a passing raw run to its reviewed implementation commit, like the iroh artifacts
 <!-- AC:END -->
+
+## Implementation Notes
+
+<!-- SECTION:NOTES:BEGIN -->
+TASK-103 landed an MVP-minimal decentralized-content-discovery-v1 artifact (scripts/decentralized_discovery_evidence.py + artifacts/decentralized-content-discovery-v1.json): re-derives verdict from raw e2e + AC#9 captures, fails closed on missing raw. This task remains the FULL mutation-rich artifact (bound to the TASK-126 freeze: richer tree manifests, packet-level pcaps, the full mutation matrix). Extend the MVP finalizer rather than replace it.
+<!-- SECTION:NOTES:END -->

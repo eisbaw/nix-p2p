@@ -7,7 +7,7 @@ status: Done
 assignee:
   - mped
 created_date: '2026-08-12 22:28'
-updated_date: '2026-08-12 23:04'
+updated_date: '2026-08-14 15:44'
 labels:
   - libp2p
   - e2e
@@ -54,4 +54,6 @@ RESULTS (nix develop -c, targeted --only, ONE combined bounded run): s7-libp2p-n
 SECONDARIES FILED (not Done-blockers per task guidance "if it balloons, file it and keep the topology proof"): TASK-180 = LIBP2P-SERVED-TOTAL provider counter (it is a fabric-libp2p SUBSTRATE change across nar.rs/server.rs/fabric.rs/main.rs + a nix e2e-image rebuild, more than a small daemon change - turnkey design captured in TASK-180). TASK-181 = a libp2p xz target (compressed->raw rewrite over libp2p; S6 covers it on iroh).
 
 HONEST SCOPE: peer-attribution in the positive arm still rests on (0 upstream egress + BOOT-holds-nothing + byte-identity + no-injection) over the routed netns, NOT yet a provider-side served-bytes counter (TASK-180). "Reachable" in the control = P process up + net-c->net-p path present (both proven by the in-netns HTTP 200 to P routable IP); the control does NOT require P to be libp2p-listening on a routable addr (that IS the withheld input). This is the genuine resolution-only break the F1 caveat asked for.
+
+TASK-103 wired the netns provider's public-announce allowlist door (Libp2pNetnsTopology now stages narinfos + mounts a non-world-writable allowlist dir + proves each seed public, mirroring the shared-pod path). NOT re-run in the TASK-103 MVP (separate-netns podman networks = 'grind', deferred here). This task should re-run s7-libp2p-netns end-to-end and confirm GREEN under the shipped binary.
 <!-- SECTION:NOTES:END -->
