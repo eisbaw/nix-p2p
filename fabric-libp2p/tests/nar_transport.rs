@@ -24,13 +24,64 @@ use std::time::{Duration, Instant};
 
 use fabric_libp2p::{
     CatalogNarSupplier, CatalogProbe, Libp2pNodeLocator, Libp2pServer, Libp2pTransport,
-    MemoryNarSupplier, Node, NodeConfig, ProbedSource, ProbedSupply,
+    MemoryNarSupplier, Multiaddr, Node, NodeConfig, PeerId, ProbedSource, ProbedSupply, ServeGate,
 };
 use peer_fabric::{
-    Blake3Digest, ExposureLedger, Lookup, NarServer, NarTransfer, NodeLocator, ResolutionPolicy,
-    SafetyEnvelope, ServeBudget, TransferError, TransportOffer,
+    Blake3Digest, CODEC_ZSTD, ExposureLedger, Lookup, NarServer, NarTransfer, NodeLocator,
+    ResolutionPolicy, SafetyEnvelope, ServeBudget, ServeCodecPolicy, TransferError, TransportOffer,
+    compress_zstd,
 };
 use proc_supervisor::{TaskSupervisor, TaskSupervisorHandle};
+
+// TASK-99 live-adversary imports: a MINIMAL bare libp2p-stream swarm stood up IN THE TEST that
+// writes attacker-chosen `/nar/3` bytes (truncated frame / bogus codec byte) the honest serve
+// loop never emits. No production seam is added (mped-architect judgment): the honest
+// `serve_stream` stays the single always-installed inbound path; the codec-level unit tests in
+// peer-fabric are the PRIMARY oracle for truncation/trailing/unknown-codec, and these live
+// tests CONFIRM the adversarial bytes survive the real libp2p pipe and still hit the same
+// rejection at the consumer's decoder boundary.
+use futures::{AsyncReadExt, AsyncWriteExt, StreamExt};
+use libp2p::identity::Keypair;
+use libp2p::swarm::SwarmEvent;
+use libp2p::{StreamProtocol, SwarmBuilder, noise, tcp, yamux};
+use tokio::sync::oneshot;
+
+/// The `/nar/3` `STATUS_NAR` response byte (private to `nar.rs`; re-stated for the adversary).
+const STATUS_NAR: u8 = 1;
+
+/// Fetch `content` from a provider by its PeerId over the RAW-stream `/nar/3` path directly
+/// (add its dial address, then open a stream) - no DHT round trip. This exercises the SAME
+/// `serve_stream` + `read_response_streamed` byte path over real libp2p streams the transport
+/// uses, but without the bootstrap/discovery machinery, so the compression tests stay cheap and
+/// deterministic (mped-architect: route (b)/(c) through `fetch_nar_streaming`, not the DHT
+/// transport path). The fetcher always offers raw+zstd (`ACCEPT_RAW_AND_ZSTD`).
+async fn direct_fetch(
+    consumer: &Node,
+    provider_peer: PeerId,
+    provider_addr: &Multiaddr,
+    content: Blake3Digest,
+    expected_size: Option<u64>,
+) -> Result<Vec<u8>, TransferError> {
+    // Teach the address book AND explicitly dial by multiaddr (the same add_address + dial idiom
+    // `join_bootstraps` uses): the dial ESTABLISHES the connection so the subsequent open_stream
+    // reuses it, rather than racing a kad-provided address (which is not reliably surfaced for a
+    // bare-PeerId dial -> "no addresses for peer").
+    consumer
+        .handle
+        .add_address(provider_peer, provider_addr.clone())
+        .await;
+    let _ = consumer.handle.dial(provider_addr.clone()).await;
+    consumer
+        .handle
+        .fetch_nar_streaming(
+            provider_peer,
+            content,
+            expected_size,
+            Duration::from_secs(5),
+            Duration::from_secs(5),
+        )
+        .await
+}
 
 /// A generous per-call envelope: loopback finishes in milliseconds, so a multi-second
 /// total bound only guards against a hang.
@@ -701,5 +752,298 @@ async fn a_rebuilt_store_source_is_declined_and_never_ships_wrong_bytes() {
             "expected a supply-failed decline, got: {why}"
         ),
         other => panic!("expected an Unavailable decline (provider refused to ship), got {other}"),
+    }
+}
+
+// -------------------------------------------------------------------------
+// TASK-99 (codex DEEP-gate fix #5): LIVE 2-node coverage of the COMPRESSED path with payloads
+// OVER the 1 KiB compress threshold, so the zstd link is ACTUALLY exercised (the earlier
+// happy/corrupt tests use ~60 B bodies that fall back to RAW and never touch the codec). These
+// use the direct `/nar/3` fetch so the byte path - serve_stream negotiates zstd, the fetcher
+// decodes it - is the real one, over real libp2p streams.
+// -------------------------------------------------------------------------
+
+/// A >1 KiB compressible NAR body: large enough to clear the compress threshold (so serve_stream
+/// negotiates zstd) and repetitive enough that the zstd frame is much smaller than the raw nar.
+fn compressible_nar(tag: &str) -> Vec<u8> {
+    format!("raw NAR body for {tag} that repeats so zstd shrinks the link a lot; ")
+        .repeat(64)
+        .into_bytes()
+}
+
+#[tokio::test]
+async fn compressed_fetch_is_byte_identical_over_the_link() {
+    let scope = "nar99-happy-zstd";
+    let nar = compressible_nar("happy");
+    assert!(nar.len() > 1024, "must exceed the compress threshold");
+    let content = Blake3Digest::from_raw_nar(&nar);
+
+    // Provider A: default codec policy (zstd on, level 3) -> the >1 KiB body is served COMPRESSED.
+    let (node_a, addr_a) = start_listening([41u8; 32], scope).await;
+    let server = Libp2pServer::new(
+        node_a.handle.clone(),
+        Arc::new(MemoryNarSupplier::new([nar.clone()])),
+        TaskSupervisorHandle::disconnected(),
+    );
+    let _serve = server
+        .serve(ServeBudget::default())
+        .await
+        .expect("serve starts");
+
+    let (node_b, _addr_b) = start_listening([42u8; 32], scope).await;
+    let bytes = direct_fetch(
+        &node_b,
+        node_a.peer_id,
+        &addr_a,
+        content,
+        Some(nar.len() as u64),
+    )
+    .await
+    .expect("compressed fetch succeeds over the real link");
+    assert_eq!(
+        bytes, nar,
+        "the zstd-compressed link must decode to the byte-identical raw NAR"
+    );
+    assert_eq!(
+        Blake3Digest::from_raw_nar(&bytes),
+        content,
+        "the frozen blob id is unchanged by link compression (AC#1)"
+    );
+}
+
+#[tokio::test]
+async fn corrupt_compressed_provider_is_rejected_over_the_link() {
+    // A CORRUPT provider binds >1 KiB bytes that do NOT hash to the requested digest; the server
+    // COMPRESSES them (a valid zstd frame of the wrong bytes), and the consumer decodes a clean
+    // frame whose BLAKE3 mismatches -> gate-1 IntegrityMismatch. Proves the compressed path
+    // fails closed on wrong content (not only the tiny-RAW path the old test covered).
+    let scope = "nar99-corrupt-zstd";
+    let honest = compressible_nar("honest");
+    let requested = Blake3Digest::from_raw_nar(&honest);
+    let corrupt = compressible_nar("CORRUPT-different-bytes"); // same shape, different content
+    assert_ne!(honest, corrupt);
+    assert!(corrupt.len() > 1024);
+
+    let mut supplier = MemoryNarSupplier::new([]);
+    supplier.insert_raw(requested, corrupt);
+
+    let (node_a, addr_a) = start_listening([43u8; 32], scope).await;
+    let server = Libp2pServer::new(
+        node_a.handle.clone(),
+        Arc::new(supplier),
+        TaskSupervisorHandle::disconnected(),
+    );
+    let _serve = server
+        .serve(ServeBudget::default())
+        .await
+        .expect("serve starts");
+
+    let (node_b, _addr_b) = start_listening([44u8; 32], scope).await;
+    let err = direct_fetch(&node_b, node_a.peer_id, &addr_a, requested, None)
+        .await
+        .expect_err("a corrupt compressed provider must not yield trusted bytes");
+    match err {
+        TransferError::IntegrityMismatch { expected, actual } => {
+            assert_eq!(expected, requested);
+            assert_ne!(actual, requested);
+        }
+        other => panic!("expected IntegrityMismatch over the compressed link, got {other}"),
+    }
+}
+
+#[tokio::test]
+async fn two_servers_at_different_levels_serve_one_blob_id() {
+    // AC#1 END TO END: two independent nodes compress the SAME raw NAR at DIFFERENT zstd levels
+    // (3 vs 19) -> DIFFERENT wire bytes, but the consumer decodes EITHER to the byte-identical
+    // raw NAR and the SAME BLAKE3 blob id. So two holders with different compressor settings are
+    // interchangeable sources for one content id. Custom levels are set by installing a
+    // ServeGate with a codec policy directly (the serve seam carries only the budget).
+    let scope = "nar99-two-levels";
+    let nar = compressible_nar("shared-across-two-levels");
+    let content = Blake3Digest::from_raw_nar(&nar);
+
+    async fn provider_at_level(seed: u8, scope: &str, nar: &[u8], level: i32) -> (Node, Multiaddr) {
+        let (node, addr) = start_listening([seed; 32], scope).await;
+        let gate = Arc::new(
+            ServeGate::new(
+                ServeBudget::default(),
+                Arc::new(MemoryNarSupplier::new([nar.to_vec()])),
+                TaskSupervisorHandle::disconnected(),
+            )
+            .with_codec_policy(ServeCodecPolicy {
+                level,
+                ..ServeCodecPolicy::default()
+            }),
+        );
+        node.handle.install_serve(gate).await;
+        (node, addr)
+    }
+
+    let (node_lo, addr_lo) = provider_at_level(45, scope, &nar, 3).await;
+    let (node_hi, addr_hi) = provider_at_level(46, scope, &nar, 19).await;
+
+    let (consumer, _addr_c) = start_listening([47u8; 32], scope).await;
+
+    let from_lo = direct_fetch(
+        &consumer,
+        node_lo.peer_id,
+        &addr_lo,
+        content,
+        Some(nar.len() as u64),
+    )
+    .await
+    .expect("fetch from the level-3 holder");
+    let from_hi = direct_fetch(
+        &consumer,
+        node_hi.peer_id,
+        &addr_hi,
+        content,
+        Some(nar.len() as u64),
+    )
+    .await
+    .expect("fetch from the level-19 holder");
+
+    assert_eq!(from_lo, nar, "level-3 holder decodes to the raw NAR");
+    assert_eq!(from_hi, nar, "level-19 holder decodes to the raw NAR");
+    assert_eq!(
+        Blake3Digest::from_raw_nar(&from_lo),
+        content,
+        "level-3 holder serves the frozen blob id"
+    );
+    assert_eq!(
+        Blake3Digest::from_raw_nar(&from_hi),
+        content,
+        "level-19 holder serves the SAME frozen blob id (different settings, one id)"
+    );
+}
+
+// -------------------------------------------------------------------------
+// TASK-99 (codex DEEP-gate fix #1/#5): LIVE adversarial `/nar/3` responders. A minimal bare
+// libp2p-stream swarm writes attacker-chosen wire bytes the honest server never emits - a
+// TRUNCATED zstd frame (the P0 case) and an UNKNOWN codec byte - and the consumer's real
+// fetch path must fail CLOSED. See the module-top import note for why this needs no production
+// change.
+// -------------------------------------------------------------------------
+
+/// Stand up a MINIMAL bare libp2p swarm (tcp+noise+yamux + a `libp2p_stream::Behaviour`) that
+/// accepts `/nix-p2p/<scope>/nar/3` and, per inbound stream, reads the 33-byte request then
+/// writes `response` verbatim and closes. Returns its PeerId + concrete listen address. The
+/// swarm + accept tasks are detached; the `#[tokio::test]` runtime aborts them at test end (no
+/// leak). Deliberately carries NO kad/identify (a direct dial needs neither), keeping the
+/// duplicated swarm construction - the maintenance cost of this approach - as small as possible.
+async fn spawn_adversary(scope: &str, seed: u8, response: Vec<u8>) -> (PeerId, Multiaddr) {
+    let keypair = Keypair::ed25519_from_bytes([seed; 32]).expect("adversary keypair");
+    let peer_id = keypair.public().to_peer_id();
+    let proto = StreamProtocol::try_from_owned(format!("/nix-p2p/{scope}/nar/3"))
+        .expect("nar protocol name");
+
+    let mut swarm = SwarmBuilder::with_existing_identity(keypair)
+        .with_tokio()
+        .with_tcp(
+            tcp::Config::default(),
+            noise::Config::new,
+            yamux::Config::default,
+        )
+        .expect("tcp transport")
+        .with_behaviour(|_key| {
+            Ok::<_, Box<dyn std::error::Error + Send + Sync>>(libp2p_stream::Behaviour::new())
+        })
+        .expect("stream behaviour")
+        .with_swarm_config(|c| c.with_idle_connection_timeout(Duration::from_secs(60)))
+        .build();
+
+    let mut control = swarm.behaviour().new_control();
+    let mut incoming = control.accept(proto).expect("accept /nar/3");
+    swarm
+        .listen_on("/ip4/127.0.0.1/tcp/0".parse().unwrap())
+        .expect("listen");
+
+    // Drive the swarm (so connections/muxing progress) and capture the first listen address.
+    let (addr_tx, addr_rx) = oneshot::channel();
+    tokio::spawn(async move {
+        let mut addr_tx = Some(addr_tx);
+        loop {
+            if let SwarmEvent::NewListenAddr { address, .. } = swarm.select_next_some().await
+                && let Some(tx) = addr_tx.take()
+            {
+                let _ = tx.send(address);
+            }
+        }
+    });
+
+    // Per inbound `/nar/3` stream: read the 33-byte request, then ship the crafted response.
+    tokio::spawn(async move {
+        while let Some((_peer, mut stream)) = incoming.next().await {
+            let response = response.clone();
+            tokio::spawn(async move {
+                let mut request = [0u8; 33];
+                let _ = stream.read_exact(&mut request).await;
+                let _ = stream.write_all(&response).await;
+                let _ = stream.flush().await;
+                let _ = stream.close().await;
+            });
+        }
+    });
+
+    let addr = addr_rx.await.expect("adversary reported a listen address");
+    (peer_id, addr)
+}
+
+#[tokio::test]
+async fn adversarial_truncated_zstd_frame_fails_the_fetch() {
+    // The P0 case OVER A REAL LINK: a well-formed `Nar` header + zstd codec byte, then a valid
+    // zstd frame with its tail CUT OFF. The consumer must fail CLOSED (the codec's finish() sees
+    // the frame is not complete -> Unavailable), never accept a short/wrong NAR. The payload is
+    // >1 KiB so the zstd path is genuinely exercised.
+    let scope = "nar99-adv-trunc";
+    let nar = compressible_nar("adversarial-truncation");
+    assert!(nar.len() > 1024);
+    let content = Blake3Digest::from_raw_nar(&nar);
+
+    let frame = compress_zstd(&nar, 3).expect("compress");
+    let truncated = &frame[..frame.len() - 6]; // drop the frame tail
+    let mut response = vec![STATUS_NAR, CODEC_ZSTD];
+    response.extend_from_slice(truncated);
+
+    let (adv_peer, adv_addr) = spawn_adversary(scope, 51, response).await;
+
+    let (consumer, _addr) = start_listening([52u8; 32], scope).await;
+    let err = direct_fetch(
+        &consumer,
+        adv_peer,
+        &adv_addr,
+        content,
+        Some(nar.len() as u64),
+    )
+    .await
+    .expect_err("a truncated zstd frame over the link must fail the fetch");
+    // Truncation is now rejected AT THE CODEC (finish -> Truncated -> Unavailable), never a
+    // silent short NAR. (Pre-fix it could return the correct-but-short bytes and lean on gate-1.)
+    match err {
+        TransferError::Unavailable(_) | TransferError::IntegrityMismatch { .. } => {}
+        other => panic!("expected the truncated fetch to fail closed, got {other}"),
+    }
+}
+
+#[tokio::test]
+async fn adversarial_unknown_codec_byte_fails_the_fetch() {
+    // A `Nar` header followed by a codec byte that is neither raw (0) nor zstd (1): the consumer
+    // must fail rather than guess a framing (AC#5), over the real link.
+    let scope = "nar99-adv-codec";
+    let content = Blake3Digest::from_bytes([0x9c; 32]);
+    let response = vec![STATUS_NAR, 0x7f]; // 0x7f is not a known codec byte
+
+    let (adv_peer, adv_addr) = spawn_adversary(scope, 53, response).await;
+
+    let (consumer, _addr) = start_listening([54u8; 32], scope).await;
+    let err = direct_fetch(&consumer, adv_peer, &adv_addr, content, Some(4096))
+        .await
+        .expect_err("an unknown codec byte over the link must fail the fetch");
+    match err {
+        TransferError::Unavailable(why) => assert!(
+            why.contains("unknown NAR codec"),
+            "expected an unknown-codec failure, got: {why}"
+        ),
+        other => panic!("expected Unavailable(unknown codec), got {other}"),
     }
 }

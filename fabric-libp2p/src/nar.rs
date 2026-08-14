@@ -103,6 +103,10 @@ pub enum DeclineReason {
     Busy,
     /// The supplier could not produce the bytes (a source error).
     SupplyFailed,
+    /// The fetcher's `accept` bitmask named no codec this server can honour (TASK-99): a
+    /// protocol error, so the server DECLINES rather than shipping a codec the client never
+    /// offered (a compliant fetcher always offers raw, so only a broken/hostile peer sees this).
+    NoCommonCodec,
 }
 
 impl DeclineReason {
@@ -111,6 +115,7 @@ impl DeclineReason {
             DeclineReason::TooLarge => 0,
             DeclineReason::Busy => 1,
             DeclineReason::SupplyFailed => 2,
+            DeclineReason::NoCommonCodec => 3,
         }
     }
 
@@ -120,6 +125,7 @@ impl DeclineReason {
         match byte {
             0 => DeclineReason::TooLarge,
             1 => DeclineReason::Busy,
+            3 => DeclineReason::NoCommonCodec,
             _ => DeclineReason::SupplyFailed,
         }
     }
@@ -131,6 +137,7 @@ impl std::fmt::Display for DeclineReason {
             DeclineReason::TooLarge => "declared NAR exceeds the serve per-NAR budget",
             DeclineReason::Busy => "serve in-flight budget is full",
             DeclineReason::SupplyFailed => "supplier could not produce the NAR",
+            DeclineReason::NoCommonCodec => "no common NAR codec in the fetcher's accept set",
         })
     }
 }
@@ -423,6 +430,11 @@ where
                 DecodeError::Zstd(why) => TransferError::Unavailable(format!(
                     "corrupt zstd NAR frame for {content}: {why}"
                 )),
+                // Trailing bytes after a complete frame (or a mid-stream truncation surfaced by
+                // the codec): a malformed body from an unusable holder, fail the fetch.
+                other => TransferError::Unavailable(format!(
+                    "malformed zstd NAR frame for {content}: {other}"
+                )),
             });
         }
     }
@@ -603,18 +615,37 @@ where
     };
 
     // Negotiate the wire codec for a NAR body (TASK-99): intersect what the fetcher offered
-    // (`accept`) with this node's policy, for a nar of the produced size. RAW is always a
-    // valid outcome, so this never fails to agree; the reason is logged so a raw fallback is
-    // never silent (AC#5). NotHeld/Declined carry no body, so the codec is irrelevant there.
-    let (codec, level) = match &response {
+    // (`accept`) with this node's policy, for a nar of the produced size. The chosen codec is
+    // ALWAYS one the fetcher offered; the reason is logged so a raw fallback is never silent
+    // (AC#5). If the fetcher offered NO honourable codec (a broken/hostile `accept`; a
+    // compliant fetcher always offers raw), that is a protocol error - DECLINE the request
+    // rather than ship a codec it never offered. NotHeld/Declined carry no body, so the codec
+    // is irrelevant there.
+    //
+    // SCOPE (arbitrated, TASK-99 DEEP gate): "mixed-version" interop (AC#5) means codec-
+    // CAPABILITY mixing WITHIN /nar/3 via this `accept` bitmask (raw-only and raw+zstd fetchers
+    // both interoperate) - NOT cross-protocol /nar/2<->/nar/3. This pre-release wholesale-
+    // replaced /nar/1->2->3 (precedent TASK-157); there is no deployed old fleet to bridge.
+    let (response, codec, level) = match response {
         NarResponse::Nar(bytes) => {
-            let (codec, reason) = negotiate_serve_codec(accept, &codec_policy, bytes.len() as u64);
-            if reason != CodecChoiceReason::ZstdNegotiated {
-                tracing::trace!(%content, %reason, "libp2p serve: raw NAR codec (named fallback)");
+            match negotiate_serve_codec(accept, &codec_policy, bytes.len() as u64) {
+                Ok((codec, reason)) => {
+                    if reason != CodecChoiceReason::ZstdNegotiated {
+                        tracing::trace!(%content, %reason, "libp2p serve: raw NAR codec (named fallback)");
+                    }
+                    (NarResponse::Nar(bytes), codec, codec_policy.level)
+                }
+                Err(no_codec) => {
+                    tracing::debug!(%content, %no_codec, "libp2p serve: declining - no common NAR codec offered");
+                    (
+                        NarResponse::Declined(DeclineReason::NoCommonCodec),
+                        WireCodec::Raw,
+                        codec_policy.level,
+                    )
+                }
             }
-            (codec, codec_policy.level)
         }
-        _ => (WireCodec::Raw, codec_policy.level),
+        other => (other, WireCodec::Raw, codec_policy.level),
     };
 
     // The response write, bounded: a consumer that never READS its response (but keeps the
