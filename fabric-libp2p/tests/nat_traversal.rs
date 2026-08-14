@@ -192,3 +192,81 @@ async fn provider_reachable_only_via_relay_circuit_fetches_byte_identical() {
         "the relayed transfer preserves the frozen BLAKE3 blob id"
     );
 }
+
+/// TASK-208 opt-out: a node built with `with_relay_server(false)` does NOT run the circuit-v2
+/// relay server, so it accepts NO reservation - a provider that tries to reserve on it never
+/// obtains a `/p2p-circuit` listen address. The MINIMAL PAIR to
+/// `provider_reachable_only_via_relay_circuit_fetches_byte_identical` above, which proves the
+/// SAME reservation DOES appear against a default (server-ON) relay. This is the behavioral
+/// bite that the opt-out truly REMOVES the server (a disabled `Toggle`), not merely reconfigures
+/// it. The opted-out node keeps `relay_client`/`autonat`/`dcutr`, so it can still USE relays -
+/// asserted here by confirming it still starts and binds with the NAT trio active.
+#[tokio::test]
+async fn relay_server_opt_out_declines_reservations() {
+    let scope = "nat-relay-optout";
+
+    // R: an opted-OUT relay. It binds and advertises an address like any node, but installs
+    // NO relay server behaviour, so it cannot grant a reservation.
+    let relay = Node::start(
+        NodeConfig::new([181u8; 32])
+            .with_network_scope(scope)
+            .with_relay_server(false),
+    )
+    .expect("opted-out node still starts (relay_client/autonat/dcutr stay active)");
+    relay
+        .handle
+        .listen("/ip4/127.0.0.1/tcp/0".parse().unwrap())
+        .await
+        .expect("opted-out node still binds a direct address (it can still USE relays)");
+    let relay_addr = wait_for(|| async {
+        relay
+            .handle
+            .listen_addrs()
+            .await
+            .into_iter()
+            .find(is_direct_tcp)
+    })
+    .await
+    .expect("opted-out relay reported a direct loopback address");
+    let relay_peer: PeerId = relay.peer_id;
+    relay.handle.add_external_address(relay_addr.clone()).await;
+
+    // P: a provider that tries to reserve on R exactly as the positive test does.
+    let (provider, _p_direct) = start_listening([182u8; 32], scope).await;
+    let circuit_listen = relay_addr
+        .clone()
+        .with(Protocol::P2p(relay_peer))
+        .with(Protocol::P2pCircuit);
+    // `listen` on the circuit only REQUESTS a reservation; it returns once the listener is
+    // registered, not once a reservation is granted. Against an opted-out relay the request
+    // is refused (no relay-server protocol), so no `/p2p-circuit` address is ever advertised.
+    provider
+        .handle
+        .listen(circuit_listen)
+        .await
+        .expect("provider registers the circuit listener (the request itself still issues)");
+
+    // Bounded negative wait: poll well past the sub-second window the positive test needs, and
+    // assert NO `/p2p-circuit` listen address ever appears. ~6s (120 * 50ms) is comfortably
+    // longer than a granted reservation takes on loopback, so a miss here is a genuine refusal,
+    // not a slow grant.
+    let mut circuit_addr = None;
+    for _ in 0..120 {
+        if let Some(a) = provider
+            .handle
+            .listen_addrs()
+            .await
+            .into_iter()
+            .find(|a| a.iter().any(|p| matches!(p, Protocol::P2pCircuit)))
+        {
+            circuit_addr = Some(a);
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(
+        circuit_addr.is_none(),
+        "opted-out relay must grant NO reservation, but the provider advertised a circuit \
+         address: {circuit_addr:?}"
+    );
+}

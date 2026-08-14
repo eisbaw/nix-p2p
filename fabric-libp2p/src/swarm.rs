@@ -11,6 +11,7 @@ use std::time::{Duration, Instant};
 use futures::StreamExt;
 use libp2p::kad::store::MemoryStore;
 use libp2p::swarm::SwarmEvent;
+use libp2p::swarm::behaviour::toggle::Toggle;
 use libp2p::{
     Multiaddr, PeerId, StreamProtocol, Swarm, autonat, dcutr, identify, kad, noise, relay, tcp,
     yamux,
@@ -123,12 +124,17 @@ pub fn absence_from_reach<T>(reach: QueryReach) -> Lookup<T> {
 ///     share a relayed connection, DCUtR coordinates a simultaneous-open to UPGRADE it to a
 ///     DIRECT connection, so the relay carries only the coordination, not the NAR bytes.
 ///     Relay is the FALLBACK when the hole punch fails (symmetric NAT).
-///   * `relay` - circuit-v2 SERVER: this node relays for OTHERS. Run UNCONDITIONALLY so any
-///     node that happens to be public automatically helps NAT'd peers with NO dedicated
-///     relay infrastructure (the decentralized property); a NAT'd node's own relay server is
-///     simply never reached. Default `relay::Config` caps reservations/circuits so an open
-///     relay is not an unbounded amplifier. (A deployment that wants to opt OUT of serving as
-///     a relay is a future `NodeConfig` knob - noted, not built, this cycle.)
+///   * `relay` - circuit-v2 SERVER: this node relays for OTHERS. Run BY DEFAULT so any node
+///     that happens to be public automatically helps NAT'd peers with NO dedicated relay
+///     infrastructure (the decentralized property); a NAT'd node's own relay server is simply
+///     never reached. Its caps are set EXPLICITLY (see [`relay_server_config`] / the
+///     `RELAY_*` constants) rather than left to the library default, so a shipped home node
+///     relays only BOUNDED traffic (a small number of concurrent circuits, each byte- and
+///     time-capped) and is not an open, unbounded amplifier. A deployment that does not want
+///     to serve as a relay at all sets [`NodeConfig::with_relay_server(false)`], which makes
+///     this field a disabled [`Toggle`] (the server behaviour is absent, so no reservation or
+///     circuit is ever accepted) while leaving `relay_client` / `autonat` / `dcutr` intact so
+///     the node can still USE other relays. (TASK-208.)
 ///
 /// CRITICAL (AC#9 / `check-discovery-no-shortcut.py`): these are DIAL-ASSISTANCE /
 /// CONNECTIVITY, NOT discovery substitutes. They help us CONNECT to a peer we ALREADY
@@ -142,7 +148,12 @@ pub struct Behaviour {
     pub identify: identify::Behaviour,
     pub stream: libp2p_stream::Behaviour,
     pub autonat: autonat::Behaviour,
-    pub relay: relay::Behaviour,
+    /// The circuit-v2 relay SERVER, wrapped in a [`Toggle`] so a node can decline to relay
+    /// for others ([`NodeConfig::with_relay_server`]). Disabled = `Toggle::from(None)`: the
+    /// behaviour is absent from the swarm, so the node accepts no reservation and forwards no
+    /// circuit, yet still USES relays via `relay_client`/`dcutr`. Enabled, it carries the
+    /// EXPLICIT bounds from [`relay_server_config`] (never the library default). (TASK-208.)
+    pub relay: Toggle<relay::Behaviour>,
     pub relay_client: relay::client::Behaviour,
     pub dcutr: dcutr::Behaviour,
 }
@@ -927,6 +938,92 @@ async fn run_accept_loop(mut incoming: IncomingStreams, serve_slot: ServeSlot) {
 /// configurable rather than a bigger magic number.
 pub const DEFAULT_KAD_QUERY_TIMEOUT: Duration = Duration::from_secs(30);
 
+// ---------------------------------------------------------------------------------------
+// Circuit-v2 relay SERVER bounds (TASK-208).
+//
+// The swarm runs a circuit-v2 relay server BY DEFAULT (the permissionless-swarm intent:
+// any public node helps NAT'd peers with no dedicated infra). But a SHIPPED node is a home
+// / residential machine, NOT public relay infrastructure, so it must relay only BOUNDED
+// traffic. We set every cap EXPLICITLY rather than trusting `relay::Config::default()`
+// (whose values target a dedicated relay: 128 reservations, 16 circuits, 1h reservations).
+//
+// The knobs bound the abuse surface along three axes:
+//   * SLOTS: how many NAT'd peers we hold state for (`MAX_RESERVATIONS`) and how many
+//     concurrent forwarding circuits we run (`MAX_CIRCUITS`), plus per-peer caps so one
+//     peer cannot monopolize the node.
+//   * DATA: a hard per-circuit byte ceiling (`MAX_CIRCUIT_BYTES`). A relay circuit here is
+//     DIAL-ASSISTANCE - dcutr upgrades a relayed connection to DIRECT for the bulk NAR
+//     transfer, so the relay itself should carry only the hole-punch handshake and small
+//     control, never a full NAR. The ceiling caps worst-case forwarded volume at roughly
+//     `MAX_CIRCUITS * MAX_CIRCUIT_BYTES`.
+//   * TIME: a reservation lifetime (`RESERVATION_DURATION`) and a per-circuit lifetime
+//     (`MAX_CIRCUIT_DURATION`), so stale slots free themselves and no circuit lingers.
+//
+// All values are integers / integer `Duration`s (no-float rule). We keep the library's
+// per-peer / per-IP RATE limiters (from `relay::Config::default()`) unchanged and only
+// tighten these hard caps; see `relay_server_config`.
+
+/// Max concurrent reservations the relay server holds (NAT'd peers listening via us).
+/// 32, vs the library default 128: a home node should not pin state for a public-relay-scale
+/// crowd. A reservation is cheap state, so this is generous relative to the circuit cap while
+/// still an order of magnitude below "open infrastructure".
+pub const RELAY_MAX_RESERVATIONS: usize = 32;
+
+/// Max reservations any SINGLE peer may hold (default is 4). 2 is enough for a peer to hold a
+/// reservation while renewing, without letting one peer consume many of our 32 slots.
+pub const RELAY_MAX_RESERVATIONS_PER_PEER: usize = 2;
+
+/// How long a reservation stays valid before the client must renew. 10 minutes, vs the
+/// library's 1 hour: a home node frees a departed peer's slot quickly rather than pinning it
+/// for an hour. libp2p's default renewal cadence is well under this, so a live client renews
+/// transparently; the shorter lifetime only bounds how long a STALE reservation lingers.
+pub const RELAY_RESERVATION_DURATION: Duration = Duration::from_secs(10 * 60);
+
+/// Max concurrent forwarding circuits (active relayed connections). 8, vs the library default
+/// 16: the load-bearing bandwidth cap. With `MAX_CIRCUIT_BYTES` this bounds worst-case
+/// concurrently-forwarded volume to ~1 MiB (8 * 128 KiB) of in-flight relayed data.
+pub const RELAY_MAX_CIRCUITS: usize = 8;
+
+/// Max concurrent circuits sourced from any SINGLE peer (default is 4). 2 keeps one peer from
+/// taking most of our 8 circuit slots.
+pub const RELAY_MAX_CIRCUITS_PER_PEER: usize = 2;
+
+/// Max lifetime of a single forwarding circuit. Kept at the library default of 2 minutes: a
+/// relay circuit is a SHORT-LIVED hole-punch fallback (dcutr should upgrade to direct well
+/// inside this window), not a long-lived tunnel, so no circuit should outlive it.
+pub const RELAY_MAX_CIRCUIT_DURATION: Duration = Duration::from_secs(2 * 60);
+
+/// Hard per-circuit total-byte ceiling. Kept at the library default of 128 KiB (`1 << 17`):
+/// the relay carries the hole-punch handshake + small control, NOT the bulk NAR (dcutr
+/// upgrades to a direct connection for that). This is the value that stops the node being an
+/// unbounded byte amplifier; it is deliberately small because a home relay proxies dialing,
+/// not payloads.
+pub const RELAY_MAX_CIRCUIT_BYTES: u64 = 1 << 17;
+
+/// The EXPLICIT circuit-v2 relay-server config for a shipped node (TASK-208).
+///
+/// Starts from [`relay::Config::default()`] to inherit its sensible per-peer / per-IP RATE
+/// limiters, then overrides every hard CAP with the `RELAY_*` constants above so a home node
+/// relays only bounded traffic. We do NOT rely on the library's cap defaults (which target a
+/// dedicated public relay). See each constant for its justification.
+pub fn relay_server_config() -> relay::Config {
+    relay::Config {
+        max_reservations: RELAY_MAX_RESERVATIONS,
+        max_reservations_per_peer: RELAY_MAX_RESERVATIONS_PER_PEER,
+        reservation_duration: RELAY_RESERVATION_DURATION,
+        max_circuits: RELAY_MAX_CIRCUITS,
+        max_circuits_per_peer: RELAY_MAX_CIRCUITS_PER_PEER,
+        max_circuit_duration: RELAY_MAX_CIRCUIT_DURATION,
+        max_circuit_bytes: RELAY_MAX_CIRCUIT_BYTES,
+        ..relay::Config::default()
+    }
+}
+
+/// Whether a node runs the circuit-v2 relay SERVER by default (TASK-208). `true`: a public
+/// node helps NAT'd peers with no dedicated relay infra (the permissionless-swarm intent).
+/// Override off with [`NodeConfig::with_relay_server`].
+pub const DEFAULT_RELAY_SERVER_ENABLED: bool = true;
+
 /// Configuration for one libp2p node.
 pub struct NodeConfig {
     /// The 32-byte ed25519 secret that IS this node's identity and record-signing key.
@@ -942,6 +1039,15 @@ pub struct NodeConfig {
     /// high-RTT (e.g. GEO-satellite) peers, at the cost of a slower negative answer. An
     /// integer [`Duration`] — no fractional/float timeouts.
     pub kad_query_timeout: Duration,
+    /// Whether this node runs the circuit-v2 relay SERVER (relays for OTHER peers). Defaults
+    /// to [`DEFAULT_RELAY_SERVER_ENABLED`] (`true`) — the permissionless-swarm intent that any
+    /// public node helps NAT'd peers with no dedicated relay infra. Set `false`
+    /// ([`NodeConfig::with_relay_server`]) to DECLINE serving as a relay: the server behaviour
+    /// is not installed (a disabled [`Toggle`]), so the node accepts no reservation and
+    /// forwards no circuit, while `relay_client` / `autonat` / `dcutr` stay active so it can
+    /// still USE relays to be reached. When enabled, the server's caps come from
+    /// [`relay_server_config`] (explicit bounds, never the library default). (TASK-208.)
+    pub relay_server_enabled: bool,
 }
 
 impl NodeConfig {
@@ -952,6 +1058,7 @@ impl NodeConfig {
             identity_seed,
             network_scope: "v1".to_string(),
             kad_query_timeout: DEFAULT_KAD_QUERY_TIMEOUT,
+            relay_server_enabled: DEFAULT_RELAY_SERVER_ENABLED,
         }
     }
 
@@ -965,6 +1072,14 @@ impl NodeConfig {
     /// [`NodeConfig::kad_query_timeout`] for the tradeoff of a larger value.
     pub fn with_kad_query_timeout(mut self, timeout: Duration) -> Self {
         self.kad_query_timeout = timeout;
+        self
+    }
+
+    /// Choose whether this node serves as a circuit-v2 relay for OTHER peers (TASK-208,
+    /// builder style). Default is `true` ([`DEFAULT_RELAY_SERVER_ENABLED`]); pass `false` to
+    /// opt OUT of relaying while still USING relays (see [`NodeConfig::relay_server_enabled`]).
+    pub fn with_relay_server(mut self, enabled: bool) -> Self {
+        self.relay_server_enabled = enabled;
         self
     }
 }
@@ -1025,6 +1140,9 @@ impl Node {
         // The configurable kad iterative-query timeout (TASK-210). `Duration` is `Copy`, so
         // capture it before the behaviour closure moves other config out.
         let kad_query_timeout = config.kad_query_timeout;
+        // The relay-server opt-out (TASK-208). `bool` is `Copy`; capture it before the
+        // behaviour closure so it can decide whether to install the relay SERVER behaviour.
+        let relay_server_enabled = config.relay_server_enabled;
 
         let kad_protocol = StreamProtocol::try_from_owned(format!("/nix-p2p/{scope}/kad/1.0.0"))
             .map_err(|e| NodeError::Build(format!("invalid kad protocol name: {e:?}")))?;
@@ -1079,12 +1197,18 @@ impl Node {
                     let stream = libp2p_stream::Behaviour::new();
                     // NAT traversal (TASK-168). See the `Behaviour` doc for the role of each.
                     // `autonat` needs identify's observed-address signal (present above) to know
-                    // which of OUR addresses to probe. `relay` (server) runs unconditionally with
-                    // default caps so any public node helps NAT'd peers with no dedicated infra.
-                    // `dcutr` upgrades a relayed connection to a direct one (hole punch); relay is
-                    // the fallback. `relay_client` is the builder-constructed circuit-v2 client.
+                    // which of OUR addresses to probe. The `relay` SERVER runs BY DEFAULT so
+                    // any public node helps NAT'd peers with no dedicated infra, but with
+                    // EXPLICIT bounds (`relay_server_config`, TASK-208) - never the library
+                    // default caps - and it can be opted OUT entirely (a disabled `Toggle`),
+                    // in which case this node still USES relays via `relay_client`/`dcutr`.
+                    // `dcutr` upgrades a relayed connection to a direct one (hole punch); relay
+                    // is the fallback. `relay_client` is the builder-constructed circuit-v2
+                    // client.
                     let autonat = autonat::Behaviour::new(peer_id, autonat::Config::default());
-                    let relay = relay::Behaviour::new(peer_id, relay::Config::default());
+                    let relay: Toggle<relay::Behaviour> = relay_server_enabled
+                        .then(|| relay::Behaviour::new(peer_id, relay_server_config()))
+                        .into();
                     let dcutr = dcutr::Behaviour::new(peer_id);
                     Ok(Behaviour {
                         kad,
@@ -1157,5 +1281,60 @@ mod tests {
         // `reached_neighborhood` is the same predicate the classifier is built on.
         assert!(QueryReach { answered: 1 }.reached_neighborhood());
         assert!(!QueryReach { answered: 0 }.reached_neighborhood());
+    }
+
+    // TASK-208: the explicit relay-server bounds actually reach `relay::Config`, and are
+    // the tightened home-node values - NOT the library defaults. Bite: a revert to
+    // `relay::Config::default()` (128 reservations / 16 circuits / 1h) fails these asserts.
+    #[test]
+    fn relay_server_config_carries_explicit_bounds_not_library_defaults() {
+        let cfg = relay_server_config();
+        // Every hard cap is threaded from its `RELAY_*` constant.
+        assert_eq!(cfg.max_reservations, RELAY_MAX_RESERVATIONS);
+        assert_eq!(
+            cfg.max_reservations_per_peer,
+            RELAY_MAX_RESERVATIONS_PER_PEER
+        );
+        assert_eq!(cfg.reservation_duration, RELAY_RESERVATION_DURATION);
+        assert_eq!(cfg.max_circuits, RELAY_MAX_CIRCUITS);
+        assert_eq!(cfg.max_circuits_per_peer, RELAY_MAX_CIRCUITS_PER_PEER);
+        assert_eq!(cfg.max_circuit_duration, RELAY_MAX_CIRCUIT_DURATION);
+        assert_eq!(cfg.max_circuit_bytes, RELAY_MAX_CIRCUIT_BYTES);
+
+        // And they are strictly TIGHTER than the library defaults for a home node - so the
+        // node is not left as an open, public-relay-scale amplifier.
+        let default = relay::Config::default();
+        assert!(
+            cfg.max_reservations < default.max_reservations,
+            "home-node reservation cap must be below the library default"
+        );
+        assert!(
+            cfg.max_circuits < default.max_circuits,
+            "home-node circuit cap must be below the library default"
+        );
+        assert!(
+            cfg.reservation_duration < default.reservation_duration,
+            "home-node reservation lifetime must be below the library default"
+        );
+        // No-float rule: byte cap is an integer; duration caps are integer `Duration`s (no
+        // sub-second fraction) - assert the byte ceiling is the exact integer we intend.
+        assert_eq!(cfg.max_circuit_bytes, 1 << 17);
+    }
+
+    // TASK-208: the opt-out is honored at the config layer (default ON; builder flips it
+    // OFF). The behavioral proof that OFF actually removes the server (no reservation
+    // accepted) lives in `tests/nat_traversal.rs::relay_server_opt_out_*`.
+    #[test]
+    fn relay_server_opt_out_threads_through_node_config() {
+        assert!(
+            NodeConfig::new([9u8; 32]).relay_server_enabled,
+            "default is server ON (permissionless-swarm intent)"
+        );
+        assert!(
+            !NodeConfig::new([9u8; 32])
+                .with_relay_server(false)
+                .relay_server_enabled,
+            "with_relay_server(false) opts the node out of relaying"
+        );
     }
 }
