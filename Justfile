@@ -325,6 +325,20 @@ shaped-libp2p *ARGS: _toolchain _python
     cargo build --locked -p fabric-libp2p --example shaped_probe
     "${NIX_P2P_PYTHON}/bin/python3" scripts/shaped_libp2p.py {{ ARGS }}
 
+# The TASK-209 shaped-kad-DISCOVERY proof + RTT sweep: extends shaped-libp2p from 2
+# nodes to a 3-node kad topology (bootstrap B + provider P in ns A; consumer C in
+# ns B) so the DISCOVER half - kad `get_providers` + peer-routing `get_closest_peers`
+# - ALSO crosses the shaped veth, not just the fetch. C knows ONLY the bootstrap and
+# resolves the provider purely through the DHT (AC#9), then fetches BYTE-IDENTICAL.
+# Reuses the same netns/veth/tc substrate and the proven `shaped_link.assert_shaping`
+# oracle. `--sweep` sweeps the injected one-way delay to find the RTT at which kad
+# discovery misses its 10s query_timeout; `--self-test` runs the hermetic mutation
+# checks. Needs userns caps (`unshare -Urn`).
+# Run the shaped-kad-discovery proof / RTT sweep (TASK-209).
+shaped-kad *ARGS: _toolchain _python
+    cargo build --locked -p fabric-libp2p --example shaped_kad_probe
+    "${NIX_P2P_PYTHON}/bin/python3" scripts/shaped_kad.py {{ ARGS }}
+
 # The task-64 transport decomposition: a layered loopback throughput bench
 # (memcpy / TCP / raw UDP / raw QUIC / iroh-blobs / the product's own fetch)
 # that attributes the peer-path per-byte cost to a LAYER, so "iroh is slow" is
