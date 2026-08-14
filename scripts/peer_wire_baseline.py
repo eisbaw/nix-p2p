@@ -15,12 +15,22 @@ Stage A reasons about, WITHOUT smuggling compression or policy into the numbers:
      bigger, the honest verdict `NO SIZE THRESHOLD EXISTS` (AC#3).
 
 The whole point is the honest baseline/disproof. Peers serve RAW nar (Compression
-none: FileHash==NarHash, FileSize==NarSize -- see daemon narinfo rewrite), which
-is ~3.6x the CDN's xz/zstd wire bytes. A result where the raw WAN peer LOSES at
-every size is a VALID, EXPECTED outcome. This artifact is structurally tagged
-`diagnostic_uncompressed` and MUST NOT select a production policy: the compressed
-re-evaluation (per-connection codec) is task-99's job, the speedup re-statement is
-task-198's. `assert_cannot_select_policy` enforces that mechanically (AC#5).
+none: FileHash==NarHash, FileSize==NarSize -- see daemon narinfo rewrite), so a
+peer moves the full uncompressed NAR where the CDN moves its compressed wire
+bytes. Over a broad CURRENT zstd seed-closure convenience sample (BFS from
+gcc/python3/ffmpeg/git) this project ESTIMATES FileSize/NarSize ~= 0.3256, i.e.
+the raw peer moves ~3.07x the CDN's wire bytes ON THIS SAMPLE. Read 0.3256 as a
+convenience-sample estimate, NOT a population ratio and NOT a correction of the
+legacy size-only 0.278: that cohort was xz over ~20 large (>10 MiB) paths, this
+one is all-zstd over a size-spanning closure -- codec- and cohort-confounded, so
+the two numbers are not comparable (do not claim one "corrects" the other). A
+result where the raw WAN peer LOSES at every size is a VALID, EXPECTED outcome.
+
+This artifact is tagged `diagnostic_uncompressed`. That tag is a PRODUCER-SIDE
+tripwire: `assert_cannot_select_policy` asserts the artifact emits none of a known
+set of policy-selection field names -- it does NOT and cannot prevent a downstream
+reader from computing its own decision from the ratio. The compressed re-evaluation
+(per-connection codec) is task-99's job, the speedup re-statement is task-198's.
 
 WHY IT DOES NOT ROUTE THROUGH THE FROZEN COUNTING RULE (dep guard, task-94)
 --------------------------------------------------------------------------
@@ -47,12 +57,23 @@ ORACLES (each proven RED-under-mutation by `--self-test`)
   * compression exclusion: a `Compression: none` path (FileSize==NarSize, ratio
     1.0) must be CLASSIFIED and EXCLUDED from the compressed-upstream aggregate,
     or it inflates the peer's competitiveness toward parity (AC#1).
-  * negative-denominator: when the peer saves nothing per byte (denominator <= 0)
-    the break-even computation prints NO SIZE THRESHOLD EXISTS -- never a bogus
-    (negative) size (AC#3).
+  * unknown-compression bucket: a path whose Compression is missing/unrecognised
+    is classified out (its OWN bucket), never silently folded in as "compressed".
+  * signed admission: only cache-signed paths enter the aggregate; unsigned ones
+    are counted and excluded (fail-closed, not fail-open).
+  * re-derivability: the aggregate carries the per-path records; an INDEPENDENT
+    verifier recomputes sum_file/sum_nar/ratio/deciles FROM those records and
+    refuses any report whose headline does not match its own committed inputs.
+  * fail-closed publish: a failed sample_gate raises and the CLI publishes NO
+    aggregate and exits nonzero (a clustered/short sample cannot slip through).
+  * break-even quadrants: denom<=0 dispatches on the numer sign -- NO SIZE
+    THRESHOLD when the peer also loses on latency, PEER WINS AT EVERY SIZE / PEER
+    WINS BELOW an upper crossover when the peer has the latency advantage (AC#3).
   * loopback-label refusal: a run over an UNSHAPED loopback channel may NEVER be
     labelled `wan_shaped`; the label is earned only when task-70's shaping oracle
     fired (AC#2). Mirrors profile_p2p's named-condition discipline.
+  * receiver-counter: the shaped arm's receiver must confirm got==expect; a
+    truncated transfer is refused, not accepted as a measurement (AC#4).
   * unit gate + policy-selection guard (AC#4/#5).
 """
 
@@ -104,6 +125,17 @@ WAN_LABEL = "wan_shaped"
 DEFAULT_SHAPED_SIZES_MIB = (8, 20, 40)
 DEFAULT_DELAY_MS = 20
 DEFAULT_RATE_MBIT = 100
+
+# Break-even scenario bandwidth/latency assumptions. These are ASSUMED inputs, NOT
+# re-measured by this script: the upstream (CDN) figure derives from
+# scripts/profile_p2p.py / the task-35 real-upstream measurement; the home/LAN peer
+# figures and the latencies are round illustrative values. Units are MiB/s (binary
+# mebibytes per second) throughout -- the `1024**2` factor -- so every scenario
+# label reads *MiBps and the derived "bandwidth needed" is quoted in MiB/s too.
+# (Do not relabel these MB/s: 21*1024**2 B/s is 21 MiB/s = ~22.02 decimal MB/s.)
+ASSUMED_CDN_BYTES_PER_S = 21 * 1024**2  # 21 MiB/s upstream (profile_p2p / task-35)
+ASSUMED_HOME_PEER_BYTES_PER_S = 5 * 1024**2  # 5 MiB/s home uplink (illustrative)
+ASSUMED_LAN_PEER_BYTES_PER_S = 125 * 1024**2  # 125 MiB/s LAN peer (illustrative)
 
 
 def log(msg: str) -> None:
@@ -207,57 +239,88 @@ def assert_cannot_select_policy(report: dict) -> None:
 
 @dataclass
 class NarinfoSample:
-    """One narinfo's size fields. `compression` decides which aggregate it joins."""
+    """One narinfo's size fields. `compression` decides which aggregate it joins.
+
+    `sig` is the RAW `Sig:` value as read off the narinfo -- the ground truth from
+    which `signed` is derived, retained so admission is re-derivable from raw and
+    never rests on a self-reported boolean.
+    """
 
     store_hash: str
     name: str
     compression: str
     file_size_bytes_compressed_wire: int  # FileSize -- what the CDN moves
     nar_size_bytes_uncompressed_nar: int  # NarSize -- what a raw peer moves
-    signed: bool
+    sig: str  # RAW Sig line value ("" if absent); `signed` is bool(sig)
+
+    @property
+    def signed(self) -> bool:
+        return bool(self.sig.strip())
+
+
+# The compression codecs we RECOGNISE as producing a real compressed wire byte
+# count distinct from NarSize. Anything not in this set and not `none` is
+# UNKNOWN -- classified into its own bucket and excluded, never folded in as
+# "compressed" (that was the fail-open: a missing/garbled Compression field
+# silently counted as compressed and skewed the ratio).
+_KNOWN_COMPRESSED = frozenset({"xz", "zstd", "bzip2", "gzip", "br", "lzip", "lz4"})
 
 
 def classify_compression(compression: str) -> str:
-    """`none` -> uncompressed (EXCLUDED from the compressed aggregate); else compressed.
+    """Three-way: `none` -> uncompressed; a known codec -> compressed; else unknown.
 
     An uncompressed path has FileSize==NarSize (ratio 1.0). Folding it into the
     compressed-upstream FileSize/NarSize aggregate would drag the ratio toward
-    parity and make the peer look 1x instead of ~3.6x -- the unit trap. So it is
-    classified out.
+    parity and make the peer look 1x instead of ~3x -- the unit trap. So it is
+    classified out. An UNKNOWN/missing Compression is likewise classified out (its
+    own bucket): we do not know its wire units, so we must not assume "compressed".
     """
-    return "uncompressed" if compression.strip().lower() == "none" else "compressed"
+    value = compression.strip().lower()
+    if value == "none":
+        return "uncompressed"
+    if value in _KNOWN_COMPRESSED:
+        return "compressed"
+    return "unknown_compression"
 
 
-def compressed_ratio_aggregate(samples: list[NarinfoSample]) -> dict:
-    """Aggregate FileSize/NarSize over COMPRESSED samples only, plus per-decile.
+def _record_of(sample: NarinfoSample) -> dict:
+    """The RETAINED raw per-path record -- the committed source of truth from which
+    every aggregate is re-derivable. `classification`/`signed` are stored for
+    readability but the verifier RE-DERIVES them from `compression`/`sig`."""
+    return {
+        "store_hash": sample.store_hash,
+        "name": sample.name,
+        "compression": sample.compression,
+        "file_size_bytes_compressed_wire": sample.file_size_bytes_compressed_wire,
+        "nar_size_bytes_uncompressed_nar": sample.nar_size_bytes_uncompressed_nar,
+        "sig": sample.sig,
+        "signed": sample.signed,
+        "classification": classify_compression(sample.compression),
+    }
 
-    Returns the aggregate ratio (Sum FileSize / Sum NarSize -- byte-weighted, the
-    quantity that governs how many wire bytes a raw peer must move), the mean of
-    per-path ratios, and per-decile breakdown. Uncompressed samples are counted
-    and reported SEPARATELY so the exclusion is visible, never silent.
-    """
-    compressed = [
-        s for s in samples if classify_compression(s.compression) == "compressed"
+
+def _admitted_records(records: list[dict]) -> list[dict]:
+    """The paths that enter the aggregate: a KNOWN compressed codec AND signed.
+
+    This is the single admission predicate, applied identically by the aggregate
+    builder and by the independent re-derivation verifier -- so a reader who
+    reloads the committed records and re-runs it lands on the same headline."""
+    return [
+        r
+        for r in records
+        if classify_compression(r["compression"]) == "compressed"
+        and bool(str(r.get("sig", "")).strip())
     ]
-    excluded = [
-        s for s in samples if classify_compression(s.compression) == "uncompressed"
-    ]
 
-    if not compressed:
-        raise ValueError("no compressed samples -- cannot form a compressed aggregate")
 
-    sum_file = sum(s.file_size_bytes_compressed_wire for s in compressed)
-    sum_nar = sum(s.nar_size_bytes_uncompressed_nar for s in compressed)
-    per_path_ratios = [
-        s.file_size_bytes_compressed_wire / s.nar_size_bytes_uncompressed_nar
-        for s in compressed
-        if s.nar_size_bytes_uncompressed_nar > 0
-    ]
+def _deciles_by_nar(admitted: list[dict]) -> list[dict]:
+    """Per-decile FileSize/NarSize over the admitted records (ascending NarSize).
 
-    # Deciles OF THE COMPRESSED SAMPLE by NarSize: report the ratio within each
-    # decile so a reader can see the compression ratio is not a big-file artifact
-    # (the prior-figure flaw). Sorted ascending by NarSize.
-    by_nar = sorted(compressed, key=lambda s: s.nar_size_bytes_uncompressed_nar)
+    Deciles are a POST-HOC equal-count cut; they are near-tautologically populated
+    for n>=10 and are NOT the anti-clustering guarantee (the span gate is). They
+    are reported only so a reader can see the ratio is roughly stable across the
+    size axis -- i.e. compression is not purely a big-file artifact."""
+    by_nar = sorted(admitted, key=lambda r: r["nar_size_bytes_uncompressed_nar"])
     n = len(by_nar)
     deciles = []
     for d in range(10):
@@ -267,39 +330,47 @@ def compressed_ratio_aggregate(samples: list[NarinfoSample]) -> dict:
         if not chunk:
             deciles.append({"decile": d + 1, "n": 0, "note": "empty"})
             continue
-        c_file = sum(s.file_size_bytes_compressed_wire for s in chunk)
-        c_nar = sum(s.nar_size_bytes_uncompressed_nar for s in chunk)
+        c_file = sum(r["file_size_bytes_compressed_wire"] for r in chunk)
+        c_nar = sum(r["nar_size_bytes_uncompressed_nar"] for r in chunk)
         deciles.append(
             {
                 "decile": d + 1,
                 "n": len(chunk),
-                "nar_size_min_bytes_uncompressed_nar": chunk[
-                    0
-                ].nar_size_bytes_uncompressed_nar,
-                "nar_size_max_bytes_uncompressed_nar": chunk[
-                    -1
-                ].nar_size_bytes_uncompressed_nar,
+                "nar_size_min_bytes_uncompressed_nar": chunk[0][
+                    "nar_size_bytes_uncompressed_nar"
+                ],
+                "nar_size_max_bytes_uncompressed_nar": chunk[-1][
+                    "nar_size_bytes_uncompressed_nar"
+                ],
                 "aggregate_file_over_nar_ratio": c_file / c_nar if c_nar else None,
             }
         )
+    return deciles
 
-    nar_sizes = [s.nar_size_bytes_uncompressed_nar for s in compressed]
-    aggregate_ratio = sum_file / sum_nar
+
+def _aggregate_from_records(records: list[dict]) -> dict:
+    """Compute every aggregate quantity from the RAW records. This is the one
+    computation path; the report stores its output and the verifier re-runs it on
+    the reloaded records to prove the headline is re-derivable from committed raw.
+    """
+    admitted = _admitted_records(records)
+    if not admitted:
+        raise ValueError(
+            "no admitted (known-compressed AND signed) records -- cannot form an "
+            "aggregate"
+        )
+    sum_file = sum(r["file_size_bytes_compressed_wire"] for r in admitted)
+    sum_nar = sum(r["nar_size_bytes_uncompressed_nar"] for r in admitted)
+    per_path_ratios = [
+        r["file_size_bytes_compressed_wire"] / r["nar_size_bytes_uncompressed_nar"]
+        for r in admitted
+        if r["nar_size_bytes_uncompressed_nar"] > 0
+    ]
+    nar_sizes = [r["nar_size_bytes_uncompressed_nar"] for r in admitted]
     return {
-        "n_compressed": len(compressed),
-        "n_uncompressed_excluded": len(excluded),
-        "excluded_uncompressed": [
-            {
-                "store_hash": s.store_hash,
-                "name": s.name,
-                "compression": s.compression,
-                "file_size_bytes_compressed_wire": s.file_size_bytes_compressed_wire,
-                "nar_size_bytes_uncompressed_nar": s.nar_size_bytes_uncompressed_nar,
-            }
-            for s in excluded
-        ],
-        "aggregate_file_over_nar_ratio": aggregate_ratio,
-        "peer_raw_over_cdn_wire_multiple": 1.0 / aggregate_ratio,
+        "n_compressed": len(admitted),
+        "aggregate_file_over_nar_ratio": sum_file / sum_nar,
+        "peer_raw_over_cdn_wire_multiple": sum_nar / sum_file,
         "per_path_ratio_mean": statistics.mean(per_path_ratios)
         if per_path_ratios
         else None,
@@ -313,8 +384,50 @@ def compressed_ratio_aggregate(samples: list[NarinfoSample]) -> dict:
         "nar_size_span_orders_of_magnitude": (
             (max(nar_sizes) / min(nar_sizes)) if min(nar_sizes) > 0 else None
         ),
-        "deciles_by_nar_size": deciles,
+        "deciles_by_nar_size": _deciles_by_nar(admitted),
     }
+
+
+def compressed_ratio_aggregate(samples: list[NarinfoSample]) -> dict:
+    """Aggregate FileSize/NarSize over ADMITTED (known-compressed + signed) samples.
+
+    Admission is fail-CLOSED: a path enters the aggregate only if its Compression
+    is a recognised codec AND it carries a signature. Uncompressed, unknown-codec
+    and unsigned paths are each COUNTED in their own bucket and excluded, so every
+    exclusion is visible, never silent. The per-path `records` are retained so the
+    headline is re-derivable from committed raw (see `verify_rederivable`).
+    """
+    records = [_record_of(s) for s in samples]
+    agg = _aggregate_from_records(records)
+
+    n_uncompressed = sum(
+        1 for r in records if classify_compression(r["compression"]) == "uncompressed"
+    )
+    n_unknown = sum(
+        1
+        for r in records
+        if classify_compression(r["compression"]) == "unknown_compression"
+    )
+    n_unsigned = sum(
+        1
+        for r in records
+        if classify_compression(r["compression"]) == "compressed"
+        and not bool(str(r.get("sig", "")).strip())
+    )
+    agg.update(
+        {
+            "n_uncompressed_excluded": n_uncompressed,
+            "n_unknown_compression_excluded": n_unknown,
+            "n_unsigned_excluded": n_unsigned,
+            "n_records_total": len(records),
+            "admission_rule": (
+                "admitted iff Compression in a known codec set AND Sig present; "
+                "uncompressed/unknown-codec/unsigned each excluded and counted"
+            ),
+            "records": records,
+        }
+    )
+    return agg
 
 
 def sample_gate(agg: dict, *, min_paths: int, min_span: float) -> list[str]:
@@ -338,6 +451,111 @@ def sample_gate(agg: dict, *, min_paths: int, min_span: float) -> list[str]:
     if empty:
         problems.append(f"deciles {empty} are empty -- the size axis is not covered")
     return problems
+
+
+# --- re-derivability: recompute the headline from the committed raw records -----
+
+
+class RederivationError(Exception):
+    """A reported aggregate does not match what its own records re-derive to."""
+
+
+# Aggregate scalars the verifier recomputes from records and demands match.
+_REDERIVED_SCALARS = (
+    "n_compressed",
+    "aggregate_file_over_nar_ratio",
+    "peer_raw_over_cdn_wire_multiple",
+    "per_path_ratio_mean",
+    "per_path_ratio_median",
+    "sum_file_size_bytes_compressed_wire",
+    "sum_nar_size_bytes_uncompressed_nar",
+    "nar_size_min_bytes_uncompressed_nar",
+    "nar_size_max_bytes_uncompressed_nar",
+    "nar_size_span_orders_of_magnitude",
+)
+
+
+def verify_rederivable(agg: dict, *, tol: float = 1e-9) -> dict:
+    """Recompute EVERY reported aggregate FROM `agg['records']` and assert a match.
+
+    This is the re-derivability oracle: the committed artifact carries the raw
+    per-path records, and a reader (or `--verify-artifact`) recomputes the headline
+    from them WITHOUT trusting the stored summary. Any drift -- a hand-edited sum,
+    a stale ratio, a doctored decile -- raises RederivationError. Returns the freshly
+    re-derived aggregate on success (the headline a consumer should quote).
+    """
+    records = agg.get("records")
+    if not isinstance(records, list) or not records:
+        raise RederivationError(
+            "aggregate carries no per-path records -- the headline is not "
+            "re-derivable (this is the BLOCKER the fix cycle closes)"
+        )
+    fresh = _aggregate_from_records(records)
+
+    mismatches: list[str] = []
+    for key in _REDERIVED_SCALARS:
+        want, got = agg.get(key), fresh.get(key)
+        if isinstance(want, (int, float)) and isinstance(got, (int, float)):
+            denom = max(1.0, abs(want))
+            if abs(want - got) > tol * denom:
+                mismatches.append(f"{key}: reported {want!r} != re-derived {got!r}")
+        elif want != got:
+            mismatches.append(f"{key}: reported {want!r} != re-derived {got!r}")
+
+    want_dec = agg.get("deciles_by_nar_size", [])
+    got_dec = fresh["deciles_by_nar_size"]
+    if len(want_dec) != len(got_dec):
+        mismatches.append("deciles_by_nar_size: length differs from re-derived")
+    else:
+        for wd, gd in zip(want_dec, got_dec):
+            wr, gr = (
+                wd.get("aggregate_file_over_nar_ratio"),
+                gd.get("aggregate_file_over_nar_ratio"),
+            )
+            if isinstance(wr, float) and isinstance(gr, float):
+                if abs(wr - gr) > tol * max(1.0, abs(wr)):
+                    mismatches.append(
+                        f"decile {wd.get('decile')}: reported ratio {wr!r} != "
+                        f"re-derived {gr!r}"
+                    )
+            elif wr != gr:
+                mismatches.append(
+                    f"decile {wd.get('decile')}: reported ratio {wr!r} != "
+                    f"re-derived {gr!r}"
+                )
+
+    if mismatches:
+        raise RederivationError(
+            "headline is NOT re-derivable from committed records: "
+            + "; ".join(mismatches)
+        )
+    return fresh
+
+
+# --- fail-closed publish: a failed sample gate yields NO aggregate --------------
+
+
+class SampleGateError(Exception):
+    """The sample gate failed; the pipeline must publish NO aggregate and exit
+    nonzero. Carries the concrete violations so the refusal is traceable."""
+
+    def __init__(self, violations: list[str]):
+        self.violations = violations
+        super().__init__("; ".join(violations))
+
+
+def build_sample_block(
+    samples: list[NarinfoSample], *, min_paths: int, min_span: float
+) -> dict:
+    """Build the AC#1 sample block, fail-CLOSED: raise SampleGateError (publishing
+    nothing) if the gate fails. On success the block is re-derivable-verified so a
+    report can never carry a headline that disagrees with its own records."""
+    agg = compressed_ratio_aggregate(samples)
+    gate = sample_gate(agg, min_paths=min_paths, min_span=min_span)
+    if gate:
+        raise SampleGateError(gate)
+    verify_rederivable(agg)  # a published aggregate is always self-consistent
+    return {"aggregate": agg, "gate_violations": [], "gate_passed": True}
 
 
 # --- real cache.nixos.org sampling (HTTP narinfo BFS over the closure) --------
@@ -374,7 +592,6 @@ def parse_narinfo(store_hash: str, body: str) -> tuple[NarinfoSample | None, lis
         return None, refs
     store_path = fields.get("StorePath", "")
     name = store_path.split("-", 1)[1] if "-" in store_path else store_path
-    signed = "Sig" in fields and bool(fields["Sig"])
     return (
         NarinfoSample(
             store_hash=store_hash,
@@ -382,7 +599,7 @@ def parse_narinfo(store_hash: str, body: str) -> tuple[NarinfoSample | None, lis
             compression=fields.get("Compression", "unknown"),
             file_size_bytes_compressed_wire=file_size,
             nar_size_bytes_uncompressed_nar=nar_size,
-            signed=signed,
+            sig=fields.get("Sig", ""),  # RAW; `signed` is derived as bool(sig)
         ),
         refs,
     )
@@ -486,8 +703,16 @@ def sample_real_cache(
 def load_fixture_uncompressed(manifest: Path) -> list[NarinfoSample]:
     """Load the project's OWN `Compression: none` fixtures as a deliberate
     uncompressed sample, so AC#1's exclusion mechanism is exercised on real
-    Compression:none entries (FileSize==NarSize) that MUST be classified out."""
+    Compression:none entries (FileSize==NarSize) that MUST be classified out.
+
+    Fail-LOUD on an empty result: if the manifest is missing or carries zero
+    Compression:none entries the exclusion arm is vacuous for this run, so we WARN
+    rather than return [] silently."""
     if not manifest.is_file():
+        log(
+            f"WARN fixture manifest {manifest} not found -- the Compression:none "
+            "exclusion arm is VACUOUS for this run (no uncompressed fixtures loaded)"
+        )
         return []
     data = json.loads(manifest.read_text())
     entries = data.get("paths") or data.get("entries") or []
@@ -507,8 +732,13 @@ def load_fixture_uncompressed(manifest: Path) -> list[NarinfoSample]:
                 compression="none",
                 file_size_bytes_compressed_wire=int(e["file_size"]),
                 nar_size_bytes_uncompressed_nar=int(e["nar_size"]),
-                signed=False,
+                sig="",  # fixtures are unsigned; classified out either way
             )
+        )
+    if not out:
+        log(
+            f"WARN {manifest} carries zero Compression:none entries -- the "
+            "uncompressed-exclusion arm is VACUOUS for this run"
         )
     return out
 
@@ -540,8 +770,13 @@ class BreakEvenInputs:
     discovery_latency_s: float
 
 
+PEER_WINS_EVERY = "PEER WINS AT EVERY SIZE"
+PEER_WINS_ABOVE = "BREAK-EVEN ABOVE THRESHOLD"
+PEER_WINS_BELOW = "PEER WINS BELOW THRESHOLD"
+
+
 def break_even(inp: BreakEvenInputs) -> dict:
-    """Compute the break-even NAR size, or NO SIZE THRESHOLD EXISTS.
+    """Compute the peer-vs-CDN break-even NAR size across ALL latency quadrants.
 
     A peer wins iff its total fetch time is below the CDN's:
         discovery + S_nar/B_peer  <  cdn_latency + ratio*S_nar/B_up
@@ -549,16 +784,25 @@ def break_even(inp: BreakEvenInputs) -> dict:
         S_nar * (ratio/B_up - 1/B_peer)  >  discovery - cdn_latency
                     \\_______ denom ______/       \\____ numer ____/
 
-    `denom` is the seconds the peer SAVES per NAR byte. If denom <= 0 the peer
-    saves nothing (or loses) per byte, so no larger size ever lets it catch up:
-    NO SIZE THRESHOLD EXISTS. denom > 0 requires B_peer > B_up/ratio -- e.g. with
-    ratio ~ 0.278 and a 21 MB/s CDN, the peer must sustain > ~75 MB/s.
+    `denom` = seconds the peer SAVES per NAR byte; `numer` = the discovery-latency
+    premium the peer pays up front. The inequality `S*denom > numer` splits on the
+    SIGN OF BOTH terms -- the earlier code collapsed the whole denom<=0 half-plane
+    to NO SIZE THRESHOLD, which is only correct when numer >= 0:
 
-    When denom > 0 the break-even size is numer/denom NarSize bytes:
-      * threshold > 0: the peer wins ABOVE it (its per-byte advantage overtakes
-        the discovery-latency premium);
-      * threshold <= 0: the peer wins at EVERY size (it is both faster per byte
-        AND lower-latency) -- reported with that interpretation, still not a policy.
+      denom > 0 (peer faster per byte):
+        numer <= 0 -> peer also wins on latency  -> PEER WINS AT EVERY SIZE
+        numer  > 0 -> lower crossover S=numer/denom -> BREAK-EVEN ABOVE THRESHOLD
+      denom == 0 (per-byte parity):
+        numer  < 0 -> PEER WINS AT EVERY SIZE (size-independent latency win)
+        numer >= 0 -> NO SIZE THRESHOLD EXISTS
+      denom < 0 (peer SLOWER per byte -- the raw-NAR regime):
+        numer >= 0 -> NO SIZE THRESHOLD EXISTS (loses per byte AND on latency)
+        numer  < 0 -> peer's latency lead is eaten by size: it wins BELOW an
+                       UPPER crossover S=numer/denom (>0) -> PEER WINS BELOW THRESHOLD
+
+    denom > 0 requires B_peer > B_up/ratio; e.g. at the measured ratio ~0.3256 and
+    a 21 MiB/s CDN the peer must sustain > ~64.5 MiB/s. (The legacy xz 0.278 figure
+    would demand ~75 MiB/s, but it is a different codec/cohort and not used here.)
     """
     denom = inp.ratio / inp.up_bytes_per_s - 1.0 / inp.peer_bytes_per_s
     numer = inp.discovery_latency_s - inp.cdn_latency_s
@@ -576,30 +820,68 @@ def break_even(inp: BreakEvenInputs) -> dict:
             inp.up_bytes_per_s / inp.ratio if inp.ratio > 0 else None
         ),
     }
-    if denom <= 0:
-        result["verdict"] = NO_THRESHOLD
-        result["interpretation"] = (
-            "the peer saves nothing per NAR byte (it moves raw NAR, ~1/ratio the "
-            "CDN's wire bytes); no size lets it catch up. Raw WAN loses at every "
-            "size -- the expected honest baseline."
-        )
-        result["break_even_nar_size_bytes_uncompressed_nar"] = None
-        return result
 
-    threshold = numer / denom
-    result["break_even_nar_size_bytes_uncompressed_nar"] = threshold
-    if threshold <= 0:
-        result["verdict"] = "PEER WINS AT EVERY SIZE"
-        result["interpretation"] = (
-            "denom > 0 (peer faster per byte) AND the discovery latency is below "
-            "the CDN's first-byte latency, so the peer wins at all sizes."
-        )
-    else:
-        result["verdict"] = "BREAK-EVEN ABOVE THRESHOLD"
-        result["interpretation"] = (
-            "the peer wins for NAR sizes ABOVE the threshold, where its per-byte "
-            "bandwidth advantage overtakes the discovery-latency premium."
-        )
+    no_threshold = {
+        "verdict": NO_THRESHOLD,
+        "interpretation": (
+            "the peer saves nothing per NAR byte (it moves raw NAR, ~1/ratio the "
+            "CDN's wire bytes) and holds no latency advantage; no size lets it catch "
+            "up. Raw WAN loses at every size -- the expected honest baseline."
+        ),
+        "threshold_kind": None,
+        "break_even_nar_size_bytes_uncompressed_nar": None,
+    }
+
+    if denom > 0:
+        threshold = numer / denom
+        if numer <= 0:
+            result.update(
+                verdict=PEER_WINS_EVERY,
+                interpretation=(
+                    "denom > 0 (peer faster per byte) AND discovery latency <= the "
+                    "CDN's first-byte latency, so the peer wins at all sizes."
+                ),
+                threshold_kind="wins_at_every_size",
+                break_even_nar_size_bytes_uncompressed_nar=None,
+            )
+        else:
+            result.update(
+                verdict=PEER_WINS_ABOVE,
+                interpretation=(
+                    "the peer wins for NAR sizes ABOVE the lower crossover, where "
+                    "its per-byte bandwidth advantage overtakes the discovery premium."
+                ),
+                threshold_kind="lower_crossover_wins_above",
+                break_even_nar_size_bytes_uncompressed_nar=threshold,
+            )
+    elif denom == 0:
+        if numer < 0:
+            result.update(
+                verdict=PEER_WINS_EVERY,
+                interpretation=(
+                    "per-byte parity (denom == 0) but the peer's discovery latency "
+                    "is below the CDN's first-byte latency, a size-independent win."
+                ),
+                threshold_kind="wins_at_every_size",
+                break_even_nar_size_bytes_uncompressed_nar=None,
+            )
+        else:
+            result.update(no_threshold)
+    else:  # denom < 0: peer slower per byte
+        if numer < 0:
+            threshold = numer / denom  # neg/neg -> positive upper crossover
+            result.update(
+                verdict=PEER_WINS_BELOW,
+                interpretation=(
+                    "the peer starts ahead on latency but loses per byte, so it wins "
+                    "only for NAR sizes BELOW the upper crossover; beyond it the "
+                    "per-byte deficit overtakes the latency lead."
+                ),
+                threshold_kind="upper_crossover_wins_below",
+                break_even_nar_size_bytes_uncompressed_nar=threshold,
+            )
+        else:
+            result.update(no_threshold)
     return result
 
 
@@ -721,6 +1003,11 @@ def measure_shaped_throughput(
                     "rtt_ms": shaped["rtt_ms"],
                     "throughput_mbit_per_s": shaped["mbit"],
                     "throughput_bytes_uncompressed_nar_per_s": shaped["mbit"] * 1e6 / 8,
+                    # Provider-side counter: the receiver's confirmed delivered
+                    # bytes (== total, enforced by assert_full_delivery). This is
+                    # what makes the arm non-vacuous -- a truncated transfer never
+                    # reaches here.
+                    "delivered_bytes_uncompressed_nar": shaped["recv_bytes"],
                     "shaping_asserted": shaping_ok,
                     "shaping_error": shaping_error,
                 },
@@ -731,8 +1018,15 @@ def measure_shaped_throughput(
                     "throughput_bytes_uncompressed_nar_per_s": unshaped["mbit"]
                     * 1e6
                     / 8,
+                    "delivered_bytes_uncompressed_nar": unshaped["recv_bytes"],
                     "wan_label_refused": refused,
                 },
+                # Raw arm transcripts retained as evidence: they carry the verbatim
+                # sender (SEND_DONE bytes=) AND receiver (RECV_DONE bytes= expect=
+                # status=) counter lines and the ping RTT lines, so the shaped-arm
+                # measurement is auditable from the committed artifact.
+                "shaped_arm_transcript": shaped.get("raw", ""),
+                "loopback_arm_transcript": unshaped.get("raw", ""),
             }
         )
     return {
@@ -776,8 +1070,10 @@ class Report:
                 "xz/zstd. The raw peer therefore moves ~1/ratio the CDN wire bytes."
             ),
             "forbidden": (
-                "this artifact CANNOT select a production policy; task-99 owns the "
-                "codec + compressed re-evaluation, task-198 re-states the speedup."
+                "this artifact emits no known policy-selection field (producer-side "
+                "tripwire, not a barrier against a downstream reader deriving its own "
+                "decision); task-99 owns the codec + compressed re-evaluation, "
+                "task-198 re-states the speedup."
             ),
             "cdn_wire_vs_peer_raw_sample": self.sample,
             "raw_peer_socket_throughput": self.throughput,
@@ -790,6 +1086,11 @@ class Report:
         if violations:
             raise ValueError("UNIT VIOLATIONS: " + "; ".join(violations))
         assert_cannot_select_policy(d)
+        # A published report must be re-derivable from its own committed records:
+        # never emit a headline that disagrees with the raw it carries.
+        agg = (self.sample or {}).get("aggregate")
+        if isinstance(agg, dict):
+            verify_rederivable(agg)
         return d
 
 
@@ -810,7 +1111,7 @@ def _good_samples() -> list[NarinfoSample]:
                 compression="xz",
                 file_size_bytes_compressed_wire=int(nar * 0.3),
                 nar_size_bytes_uncompressed_nar=nar,
-                signed=True,
+                sig="sig:test:AAAA",
             )
         )
     # One Compression:none path: FileSize==NarSize, ratio 1.0. MUST be excluded.
@@ -821,7 +1122,7 @@ def _good_samples() -> list[NarinfoSample]:
             compression="none",
             file_size_bytes_compressed_wire=100_000_000,
             nar_size_bytes_uncompressed_nar=100_000_000,
-            signed=True,
+            sig="sig:test:AAAA",
         )
     )
     return out
@@ -851,44 +1152,128 @@ def self_test() -> int:
             "-- excluding the uncompressed path did not move the ratio as expected"
         )
 
-    # --- AC#3: negative-denominator prints NO SIZE THRESHOLD EXISTS (red-green).
-    # Home-uplink regime: peer saves nothing per byte -> no threshold.
-    home = break_even(
-        BreakEvenInputs(
-            ratio=0.278,
-            up_bytes_per_s=21 * 1024**2,
-            peer_bytes_per_s=5 * 1024**2,  # 5 MB/s home uplink << 75 MB/s needed
-            cdn_latency_s=0.05,
-            discovery_latency_s=1.0,
-        )
-    )
-    if home["verdict"] != NO_THRESHOLD:
+    # --- AC#1 fail-closed: unknown-compression is its OWN bucket, NOT compressed.
+    with_unknown = _good_samples() + [
+        NarinfoSample("k" + "0" * 31, "mystery", "wizardry", 300, 1000, "sig:x")
+    ]
+    uagg = compressed_ratio_aggregate(with_unknown)
+    if uagg["n_unknown_compression_excluded"] != 1:
         failures.append(
-            f"negative-denominator bite: expected {NO_THRESHOLD!r}, got {home['verdict']!r}"
+            "unknown-compression bite: an unrecognised codec was not classified into "
+            "its own bucket (the fail-open path would fold it in as 'compressed')"
         )
-    if home["break_even_nar_size_bytes_uncompressed_nar"] is not None:
+    if uagg["n_compressed"] != 20:
         failures.append(
-            "negative-denominator bite: a size was reported despite denom <= 0 "
-            "(the guard did not fire -- this is the exact mutation that must go RED)"
+            "unknown-compression bite: the unknown-codec path leaked into the "
+            "admitted compressed aggregate"
         )
-    # A denom>0 case must produce a finite threshold (proves the guard is not a
-    # blanket refusal that would pass the test vacuously).
-    fast = break_even(
-        BreakEvenInputs(
-            ratio=0.278,
-            up_bytes_per_s=20 * 1024**2,
-            peer_bytes_per_s=200 * 1024**2,  # 200 MB/s LAN peer > 75 MB/s
-            cdn_latency_s=0.05,
-            discovery_latency_s=1.0,
-        )
-    )
-    if fast["verdict"] == NO_THRESHOLD:
+
+    # --- AC#1 fail-closed: an UNSIGNED compressed path is excluded and counted.
+    with_unsigned = _good_samples() + [
+        NarinfoSample("n" + "0" * 31, "unsigned", "zstd", 300, 1000, "")
+    ]
+    sagg = compressed_ratio_aggregate(with_unsigned)
+    if sagg["n_unsigned_excluded"] != 1:
         failures.append(
-            "denom>0 case wrongly reported NO SIZE THRESHOLD -- the verdict is a "
-            "blanket refusal, so the negative bite proves nothing"
+            "signed-admission bite: an unsigned compressed path was not excluded/"
+            "counted (admission is not fail-closed on the signature)"
         )
-    if fast.get("break_even_nar_size_bytes_uncompressed_nar") is None:
-        failures.append("denom>0 case produced no break-even size")
+    if sagg["n_compressed"] != 20:
+        failures.append(
+            "signed-admission bite: an unsigned path leaked into the aggregate"
+        )
+
+    # --- AC#1 re-derivability: the headline recomputes from the committed records,
+    # and a doctored aggregate is REFUSED (the BLOCKER oracle).
+    try:
+        verify_rederivable(agg)
+    except RederivationError as exc:
+        failures.append(
+            f"re-derivability: a clean aggregate was wrongly refused: {exc}"
+        )
+    tampered = json.loads(json.dumps(agg))  # deep copy via round-trip
+    tampered["aggregate_file_over_nar_ratio"] = 0.999  # a lie vs the records
+    try:
+        verify_rederivable(tampered)
+        failures.append(
+            "re-derivability bite: a doctored ratio that disagrees with the records "
+            "was NOT refused (this is the exact mutation that must go RED)"
+        )
+    except RederivationError:
+        pass
+    no_records = {k: v for k, v in agg.items() if k != "records"}
+    try:
+        verify_rederivable(no_records)
+        failures.append(
+            "re-derivability bite: an aggregate WITHOUT per-path records passed -- "
+            "the headline must not be accepted as re-derivable when it is not"
+        )
+    except RederivationError:
+        pass
+
+    # --- AC#3: break-even across ALL FOUR latency quadrants, each pinned.
+    MiB = 1024**2
+    quadrants = [
+        # (name, ratio, up, peer, cdn_lat, disc_lat, want_verdict, want_threshold)
+        # denom<0 (peer slower/byte) & numer>0 (peer also slower to start):
+        ("raw-wan-loses", 0.3256, 21 * MiB, 5 * MiB, 0.05, 1.0, NO_THRESHOLD, None),
+        # denom>0 (peer faster/byte) & numer>0: finite LOWER crossover.
+        (
+            "lan-wins-above",
+            0.3256,
+            20 * MiB,
+            200 * MiB,
+            0.05,
+            1.0,
+            PEER_WINS_ABOVE,
+            "finite+",
+        ),
+        # denom>0 & numer<=0 (peer faster/byte AND lower latency): every size.
+        (
+            "lan-wins-every",
+            0.3256,
+            20 * MiB,
+            200 * MiB,
+            0.05,
+            0.0,
+            PEER_WINS_EVERY,
+            None,
+        ),
+        # denom<0 & numer<0 (peer slower/byte but lower latency): UPPER crossover.
+        # ratio/up=0.05, 1/peer=0.1 -> denom=-0.05; numer=0.1-0.6=-0.5 -> S=10.0.
+        ("peer-wins-below", 0.5, 10.0, 10.0, 0.6, 0.1, PEER_WINS_BELOW, 10.0),
+        # denom==0 (per-byte parity) & numer<0: size-independent latency win.
+        # ratio/up=0.05, 1/peer=0.05 -> denom=0; numer=-0.5 -> every size.
+        ("parity-wins-every", 0.5, 10.0, 20.0, 0.6, 0.1, PEER_WINS_EVERY, None),
+    ]
+    for name, ratio, up, peer, cdn_lat, disc, want_v, want_t in quadrants:
+        r = break_even(
+            BreakEvenInputs(
+                ratio=ratio,
+                up_bytes_per_s=up,
+                peer_bytes_per_s=peer,
+                cdn_latency_s=cdn_lat,
+                discovery_latency_s=disc,
+            )
+        )
+        if r["verdict"] != want_v:
+            failures.append(
+                f"quadrant {name}: expected verdict {want_v!r}, got {r['verdict']!r}"
+            )
+        thr = r["break_even_nar_size_bytes_uncompressed_nar"]
+        if want_t is None:
+            if thr is not None:
+                failures.append(f"quadrant {name}: expected no threshold, got {thr!r}")
+        elif want_t == "finite+":
+            if not (isinstance(thr, float) and thr > 0):
+                failures.append(
+                    f"quadrant {name}: expected a finite positive threshold, got {thr!r}"
+                )
+        else:
+            if thr is None or abs(thr - want_t) > 1e-9:
+                failures.append(
+                    f"quadrant {name}: expected threshold {want_t}, got {thr!r}"
+                )
 
     # --- AC#2: loopback-label refusal (red-green).
     # Loopback-looking metrics tagged wan_shaped MUST raise.
@@ -962,7 +1347,9 @@ def self_test() -> int:
         failures.append(f"policy guard false-positive on a clean report: {exc}")
 
     # --- sample_gate refuses a clustered (narrow-band) sample even at n>=200.
-    clustered = [NarinfoSample(f"h{i}", "p", "xz", 300, 1000, True) for i in range(200)]
+    clustered = [
+        NarinfoSample(f"h{i}", "p", "xz", 300, 1000, "sig:x") for i in range(200)
+    ]
     cagg = compressed_ratio_aggregate(clustered)
     if not sample_gate(cagg, min_paths=200, min_span=1e3):
         failures.append(
@@ -970,13 +1357,34 @@ def self_test() -> int:
             "span check (the prior-figure flaw would slip through)"
         )
 
+    # --- fail-CLOSED publish: build_sample_block REFUSES (publishes nothing) on a
+    # failed gate, and SUCCEEDS on a good sample (proves it is not a blanket refusal).
+    try:
+        build_sample_block(clustered, min_paths=200, min_span=1e3)
+        failures.append(
+            "fail-closed bite: build_sample_block published an aggregate for a "
+            "clustered sample that FAILS the gate (must raise SampleGateError and "
+            "publish nothing)"
+        )
+    except SampleGateError:
+        pass
+    try:
+        block = build_sample_block(_good_samples(), min_paths=20, min_span=100.0)
+        if not block.get("gate_passed"):
+            failures.append("fail-closed: a passing sample was not marked gate_passed")
+    except SampleGateError as exc:
+        failures.append(
+            f"fail-closed false-positive: a good sample was refused publication: {exc}"
+        )
+
     if failures:
         for f in failures:
             print(f"SELF-TEST FAIL: {f}", file=sys.stderr)
         return 1
     print(
-        "SELF-TEST OK: compression-exclusion, negative-denominator, "
-        "loopback-label, unit-gate, policy-guard and span-gate oracles all bite"
+        "SELF-TEST OK: compression-exclusion, unknown-compression, signed-admission, "
+        "re-derivability, break-even-quadrants, loopback-label, unit-gate, "
+        "policy-guard, span-gate and fail-closed-publish oracles all bite"
     )
     return 0
 
@@ -986,11 +1394,57 @@ def self_test() -> int:
 # ---------------------------------------------------------------------------
 
 
+def verify_artifact(path: Path) -> int:
+    """Reload a committed artifact and RE-DERIVE the headline from its records.
+
+    This is the auditor's entrypoint: it trusts none of the stored summary, finds
+    the sample aggregate (or accepts a bare aggregate), recomputes every quantity
+    from `records`, and prints the re-derived headline. Nonzero on any drift."""
+    doc = json.loads(path.read_text())
+    agg = doc
+    if isinstance(doc, dict) and "cdn_wire_vs_peer_raw_sample" in doc:
+        agg = doc["cdn_wire_vs_peer_raw_sample"].get("aggregate", {})
+    elif isinstance(doc, dict) and "aggregate" in doc:
+        agg = doc["aggregate"]
+    try:
+        fresh = verify_rederivable(agg)
+    except RederivationError as exc:
+        log(f"RE-DERIVATION FAILED for {path}: {exc}")
+        return 1
+    log(
+        f"RE-DERIVED from {path}: n={fresh['n_compressed']} admitted paths, "
+        f"FileSize/NarSize={fresh['aggregate_file_over_nar_ratio']:.10f} "
+        f"(peer moves {fresh['peer_raw_over_cdn_wire_multiple']:.4f}x the CDN wire)"
+    )
+    print(
+        json.dumps(
+            {
+                "verified_rederivable": True,
+                "source": str(path),
+                "rederived_aggregate_file_over_nar_ratio": fresh[
+                    "aggregate_file_over_nar_ratio"
+                ],
+                "rederived_peer_raw_over_cdn_wire_multiple": fresh[
+                    "peer_raw_over_cdn_wire_multiple"
+                ],
+                "rederived_n_compressed": fresh["n_compressed"],
+            },
+            indent=2,
+        )
+    )
+    return 0
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
     )
     ap.add_argument("--self-test", action="store_true", help="prove the oracles bite")
+    ap.add_argument(
+        "--verify-artifact",
+        default=None,
+        help="re-derive the headline from a committed artifact JSON and exit",
+    )
     ap.add_argument("--cache", default=DEFAULT_CACHE)
     ap.add_argument(
         "--sample", type=int, default=0, help="collect N real narinfos (AC#1)"
@@ -1023,6 +1477,9 @@ def main() -> int:
     if args.self_test:
         return self_test()
 
+    if args.verify_artifact:
+        return verify_artifact(Path(args.verify_artifact))
+
     report = Report()
 
     if args.sample > 0:
@@ -1030,23 +1487,24 @@ def main() -> int:
         seed_hashes, provenance = resolve_seed_hashes(seed_attrs)
         samples, stats = sample_real_cache(args.cache, seed_hashes, args.sample)
         samples += load_fixture_uncompressed(Path(args.fixture_manifest))
-        agg = compressed_ratio_aggregate(samples)
-        gate = sample_gate(agg, min_paths=args.min_paths, min_span=args.min_span)
-        report.sample = {
-            "provenance": provenance,
-            "fetch_stats": stats,
-            "aggregate": agg,
-            "gate_violations": gate,
-            "gate_passed": not gate,
-        }
+        # Fail CLOSED: a failed gate raises, we publish NO aggregate, exit nonzero.
+        try:
+            block = build_sample_block(
+                samples, min_paths=args.min_paths, min_span=args.min_span
+            )
+        except SampleGateError as exc:
+            log(f"SAMPLE GATE FAILED -- publishing NO aggregate: {exc.violations}")
+            return 2
+        agg = block["aggregate"]
+        report.sample = {"provenance": provenance, "fetch_stats": stats, **block}
         log(
-            f"sample: {agg['n_compressed']} compressed paths, "
+            f"sample: {agg['n_compressed']} admitted (signed+compressed) paths, "
             f"aggregate FileSize/NarSize={agg['aggregate_file_over_nar_ratio']:.4f} "
-            f"(peer moves {agg['peer_raw_over_cdn_wire_multiple']:.2f}x), "
-            f"{agg['n_uncompressed_excluded']} uncompressed excluded"
+            f"(peer moves {agg['peer_raw_over_cdn_wire_multiple']:.2f}x), excluded: "
+            f"{agg['n_uncompressed_excluded']} uncompressed / "
+            f"{agg['n_unknown_compression_excluded']} unknown-codec / "
+            f"{agg['n_unsigned_excluded']} unsigned"
         )
-        if gate:
-            log(f"SAMPLE GATE FAILED: {gate}")
 
     if args.shaped_link:
         sizes = tuple(int(m) for m in args.shaped_sizes_mib.split(","))
@@ -1054,8 +1512,10 @@ def main() -> int:
             sizes, args.delay_ms, args.rate_mbit
         )
 
-    # Break-even scenarios: driven by the MEASURED ratio when available, else a
-    # documented placeholder, over both a home-uplink and a LAN-peer regime.
+    # Break-even scenarios over the MEASURED ratio, in a home-uplink and a LAN-peer
+    # regime (both bandwidths ASSUMED), plus the measured-shaped-peer regime when a
+    # shaped arm ran. All bandwidth/latency inputs except the shaped peer bandwidth
+    # are ASSUMED, not re-measured here -- flagged per scenario.
     ratio = None
     if report.sample:
         ratio = report.sample["aggregate"]["aggregate_file_over_nar_ratio"]
@@ -1066,13 +1526,38 @@ def main() -> int:
             for s in report.throughput["per_size"]
         )
     if ratio is not None:
+        _assumed = "ASSUMED (scripts/profile_p2p.py / task-35 real-upstream; not re-measured here)"
+        # (name, up, peer, cdn_lat, disc_lat, peer_bw_measured)
         scenarios = [
-            ("home_uplink_5MBps", 21 * 1024**2, 5 * 1024**2, 0.05, 1.0),
-            ("lan_peer_125MBps", 21 * 1024**2, 125 * 1024**2, 0.05, 0.2),
+            (
+                "home_uplink_5MiBps",
+                ASSUMED_CDN_BYTES_PER_S,
+                ASSUMED_HOME_PEER_BYTES_PER_S,
+                0.05,
+                1.0,
+                False,
+            ),
+            (
+                "lan_peer_125MiBps",
+                ASSUMED_CDN_BYTES_PER_S,
+                ASSUMED_LAN_PEER_BYTES_PER_S,
+                0.05,
+                0.2,
+                False,
+            ),
         ]
         if peer_bw is not None:
-            scenarios.append(("measured_shaped_peer", 21 * 1024**2, peer_bw, 0.05, 1.0))
-        for name, up, peer, cdn_lat, disc_lat in scenarios:
+            scenarios.append(
+                (
+                    "measured_shaped_peer",
+                    ASSUMED_CDN_BYTES_PER_S,
+                    peer_bw,
+                    0.05,
+                    1.0,
+                    True,
+                )
+            )
+        for name, up, peer, cdn_lat, disc_lat, peer_measured in scenarios:
             r = break_even(
                 BreakEvenInputs(
                     ratio=ratio,
@@ -1083,6 +1568,20 @@ def main() -> int:
                 )
             )
             r["scenario"] = name
+            # Provenance: every input except (optionally) the shaped peer bandwidth
+            # is assumed, not measured by this script.
+            r["inputs"]["assumed_not_measured_here"] = not peer_measured
+            r["input_provenance"] = {
+                "upstream_bandwidth": _assumed,
+                "cdn_latency_s": "ASSUMED (illustrative)",
+                "discovery_latency_s": "ASSUMED (illustrative)",
+                "peer_bandwidth": (
+                    "MEASURED (this run's shaped arm, raw NAR bytes/s)"
+                    if peer_measured
+                    else "ASSUMED (illustrative)"
+                ),
+                "units": "all bandwidths are bytes/s of MiB/s constants (1024**2)",
+            }
             report.break_even_scenarios.append(r)
 
     final = report.finalize()

@@ -86,8 +86,11 @@ class ShapingViolation(Exception):
 
 
 def parse_inner_output(text: str) -> dict:
-    """Pull the RTT and throughput an arm reported. Missing either is fatal:
-    a silent absence must not read as a passing zero."""
+    """Pull the RTT, throughput AND the receiver's delivered-byte count an arm
+    reported. Missing any one is fatal: a silent absence must not read as a passing
+    zero. The receiver count is the provider-side counter that makes the arm
+    non-vacuous -- a truncated transfer (RECV_DONE status=short, or bytes < expect)
+    is not a measurement."""
     rtt = None
     m = re.search(r"rtt min/avg/max/mdev = [\d.]+/([\d.]+)/", text)
     if m:
@@ -96,6 +99,12 @@ def parse_inner_output(text: str) -> dict:
     m = re.search(r"SEND_DONE bytes=\d+ elapsed_s=[\d.]+ mbit_per_s=([\d.]+)", text)
     if m:
         mbit = float(m.group(1))
+    recv_bytes = None
+    recv_status = None
+    m = re.search(r"RECV_DONE bytes=(\d+)(?: expect=\d+ status=(\w+))?", text)
+    if m:
+        recv_bytes = int(m.group(1))
+        recv_status = m.group(2)
     if rtt is None:
         raise ShapingViolation(
             "arm reported no RTT line (ping did not complete) -- not a measurement"
@@ -104,7 +113,28 @@ def parse_inner_output(text: str) -> dict:
         raise ShapingViolation(
             "arm reported no SEND_DONE line (transfer did not complete) -- not a measurement"
         )
-    return {"rtt_ms": rtt, "mbit": mbit}
+    if recv_bytes is None:
+        raise ShapingViolation(
+            "arm reported no RECV_DONE line (receiver did not confirm delivery) -- "
+            "not a measurement"
+        )
+    if recv_status == "short":
+        raise ShapingViolation(
+            "receiver reported RECV_DONE status=short -- transfer was truncated, "
+            "not a measurement"
+        )
+    return {"rtt_ms": rtt, "mbit": mbit, "recv_bytes": recv_bytes}
+
+
+def assert_full_delivery(recv_bytes: int, expected: int) -> None:
+    """The receiver must have drained EVERY expected byte. Raise otherwise: a
+    truncated transfer that still produced a rate is not a valid measurement.
+    Pure so `--self-test` can bite it without a namespace."""
+    if recv_bytes != expected:
+        raise ShapingViolation(
+            f"receiver drained {recv_bytes} of {expected} expected bytes -- "
+            "truncated transfer, not a measurement"
+        )
 
 
 def assert_shaping(shaped: dict, unshaped: dict, delay_ms: int, rate_mbit: int) -> None:
@@ -197,6 +227,9 @@ def run_arm(shape: bool, total: int, delay_ms: int, rate_mbit: int) -> dict:
             f"{'shaped' if shape else 'unshaped'} arm setup failed: {fatal}\n{out}"
         )
     metrics = parse_inner_output(out)
+    # The receiver's delivered count must equal the bytes we asked to send: a
+    # short delivery that nonetheless produced a rate line is not a measurement.
+    assert_full_delivery(metrics["recv_bytes"], total)
     metrics["raw"] = out
     return metrics
 
@@ -275,10 +308,17 @@ def self_test() -> int:
         except ShapingViolation:
             pass  # correctly bitten
 
-    # parse_inner_output must reject a truncated arm (no silent zero).
+    # parse_inner_output must reject a truncated arm (no silent zero). A complete
+    # RTT+SEND_DONE+RECV_DONE(status=ok) triple is the only accepted shape.
+    _rtt = "rtt min/avg/max/mdev = 40.0/40.2/40.5/0.1 ms"
+    _send = "SEND_DONE bytes=100 elapsed_s=1.0 mbit_per_s=95.00 MB_per_s=11.9"
+    _recv_ok = "RECV_DONE bytes=100 expect=100 status=ok"
+    _recv_short = "RECV_DONE bytes=40 expect=100 status=short"
     for missing, text in {
-        "no-rtt": "SEND_DONE bytes=1 elapsed_s=1.0 mbit_per_s=95.00 MB_per_s=11.9",
-        "no-xfer": "rtt min/avg/max/mdev = 40.0/40.2/40.5/0.1 ms",
+        "no-rtt": f"{_send}\n{_recv_ok}",
+        "no-xfer": f"{_rtt}\n{_recv_ok}",
+        "no-recv": f"{_rtt}\n{_send}",
+        "recv-short": f"{_rtt}\n{_send}\n{_recv_short}",
     }.items():
         try:
             parse_inner_output(text)
@@ -286,11 +326,33 @@ def self_test() -> int:
         except ShapingViolation:
             pass
 
+    # A complete, consistent triple must PARSE (proves the checks are not blanket).
+    try:
+        parsed = parse_inner_output(f"{_rtt}\n{_send}\n{_recv_ok}")
+        if parsed.get("recv_bytes") != 100:
+            failures.append("parse dropped the receiver delivered-byte count")
+    except ShapingViolation as exc:
+        failures.append(f"complete arm wrongly rejected: {exc}")
+
+    # assert_full_delivery: got==expect passes, a short delivery bites.
+    try:
+        assert_full_delivery(100, 100)
+    except ShapingViolation as exc:
+        failures.append(f"assert_full_delivery wrongly rejected got==expect: {exc}")
+    try:
+        assert_full_delivery(40, 100)
+        failures.append("assert_full_delivery accepted a truncated (40/100) transfer")
+    except ShapingViolation:
+        pass
+
     if failures:
         for f in failures:
             print(f"SELF-TEST FAIL: {f}", file=sys.stderr)
         return 1
-    print("SELF-TEST OK: baseline accepted, all 6 mutations + 2 truncations bitten")
+    print(
+        "SELF-TEST OK: baseline accepted, 6 mutations + 4 truncations + "
+        "delivery-counter bitten"
+    )
     return 0
 
 

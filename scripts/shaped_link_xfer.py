@@ -35,12 +35,24 @@ def recv(port: int, expect: int, ready_file: str | None = None) -> None:
     while got < expect:
         b = conn.recv(CHUNK)
         if not b:
-            break
+            break  # early EOF: sender closed before delivering `expect` bytes
         got += len(b)
-    conn.sendall(b"D")  # ack: all bytes seen, unblock the sender's clock
+    # Ack SUCCESS only when every expected byte arrived. A truncated transfer
+    # (early EOF, got < expect) must NOT read as a completed measurement: send a
+    # distinct failure byte so the sender's `ack != b"D"` check fails loudly.
+    complete = got == expect
+    try:
+        conn.sendall(b"D" if complete else b"E")
+    except OSError:
+        pass  # peer already gone; the missing/failed ack is itself the signal
     conn.close()
     srv.close()
-    print(f"RECV_DONE bytes={got}", flush=True)
+    # Machine-parseable contract line consumed by shaped_link.py: it carries BOTH
+    # the delivered count and the expectation so the driver can verify got==expect.
+    print(
+        f"RECV_DONE bytes={got} expect={expect} status={'ok' if complete else 'short'}",
+        flush=True,
+    )
 
 
 def send(host: str, port: int, total: int) -> None:
