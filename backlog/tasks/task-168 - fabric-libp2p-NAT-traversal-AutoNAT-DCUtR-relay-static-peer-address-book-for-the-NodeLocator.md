@@ -6,7 +6,7 @@ title: >-
 status: In Progress
 assignee: []
 created_date: '2026-08-12 14:28'
-updated_date: '2026-08-14 17:19'
+updated_date: '2026-08-14 17:23'
 labels:
   - libp2p
   - fabric
@@ -49,4 +49,6 @@ BLOCKED (AC#1 HARNESS) -> TASK-207: a faithful containerized-NAT topology is not
 DEFERRED this cycle (not touched):
 - AC#2 (ExplicitPeersOnly static peer address book, zero-disclosure; converge the --libp2p-provider-addr shim into it): separable code gap. Not started. Stays open on this task.
 - AC#3 (extend the FROZEN peer_fabric::Disclosed enum for the queried-NodeId disclosure): FROZEN-SEAM change needing wire review - deliberately not touched this cycle.
+
+AC#1 CODE LANDED + orchestrator-verified 2026-08-14 (commits e2dcbac code, e364b93 notes). Wired autonat + relay(server, unconditional) + relay_client + dcutr onto the swarm (kad+identify+stream unchanged); added SwarmHandle::add_external_address (root-caused a NoAddressesInReservation bug). PROVEN LOAD-BEARING at the relay data path (nat_traversal.rs: a provider on a relay /p2p-circuit ONLY, no direct addr, is fetched byte-identical THROUGH the relay). AC#9 guard updated (trio = dial-assistance permitted; mdns still bites; discovery kad-exclusive). NO regression. REMAINS PARTIAL: the real-NAT proof (DCUtR hole-punch + the disable-relay/dcutr->undiallable->upstream-fallback minimal-pair) is BLOCKED on this box (rootless podman /proc/sys RO -> no ip_forward; no sudo) -> TASK-207 (HIGH). AC#2 (ExplicitPeersOnly static address book) + AC#3 (frozen Disclosed extension, wire-reviewed) DEFERRED. Follow-up filed: relay-server resource bounds/opt-out. 168 stays In Progress until 207's real-NAT proof backs the cornerstone claim.
 <!-- SECTION:NOTES:END -->
