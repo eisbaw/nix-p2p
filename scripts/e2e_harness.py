@@ -554,6 +554,16 @@ class Pod:
         # Parsed once the provider announces; the positive oracle reads it to assert C
         # was NEVER configured with it (no-injection).
         self.libp2p_provider_identity: tuple[str, str] | None = None
+        # The EXACT bootstrap entry (`<PeerId>@<multiaddr>`) the consumer is supposed to
+        # be given - the real BOOT node and nothing else - recorded when the topology is
+        # launched so the strengthened no-injection oracle can assert the consumer's
+        # `--libp2p-bootstrap` set is EXACTLY this (no provider addr smuggled in as a
+        # second bootstrap entry under a decoy PeerId).
+        self.libp2p_boot_peer_entry: str | None = None
+        # Every dial address the provider actually listens on (its configured
+        # `--libp2p-listen` AND the address it announces/resolves to). The oracle asserts
+        # NO consumer bootstrap entry resolves to any of these (out-of-band injection).
+        self.libp2p_provider_listen_addrs: set[str] = set()
         if self.libp2p and (with_daemon or daemon_chain or bool(p2p_seeds)):
             die("Pod: libp2p is mutually exclusive with with_daemon/daemon_chain/p2p")
         # Optional HOST directory under which each daemon role gets its own
@@ -1033,6 +1043,12 @@ class Pod:
             die("Pod: libp2p topology given seeds without libp2p_seed_dir")
         proxy = f"http://127.0.0.1:{PROXY_PORT}"
         boot_peer = f"{LIBP2P_BOOT_PEER_ID}@/ip4/127.0.0.1/tcp/{LIBP2P_BASE_PORT + 2}"
+        # SSOT for the no-injection oracle: the ONE bootstrap entry the consumer is
+        # allowed to carry, and the provider's dial address it must never carry.
+        self.libp2p_boot_peer_entry = boot_peer
+        self.libp2p_provider_listen_addrs = {
+            f"/ip4/127.0.0.1/tcp/{LIBP2P_BASE_PORT + 1}"
+        }
 
         # 1. BOOT: a pure kad router (fixed identity, no provider, no announce).
         run(
@@ -1130,6 +1146,9 @@ class Pod:
             "lp-provider", len(self.libp2p_provider_seeds)
         )
         self.libp2p_provider_identity = (prov_id, prov_listen)
+        # Fold the RESOLVED announce address in beside the configured one, so the oracle
+        # rejects an injected bootstrap entry regardless of which form P's address took.
+        self.libp2p_provider_listen_addrs.add(prov_listen)
 
         # 3. C (consumer): bootstraps to BOOT ALONE. NO provider-addr injection.
         run(
@@ -4417,6 +4436,177 @@ def libp2p_store_hash(store_path: str) -> str:
     return store_path.rsplit("/", 1)[-1].split("-", 1)[0]
 
 
+def _bootstrap_entries(argv: list[str]) -> list[str]:
+    """Every value passed to a `--libp2p-bootstrap` flag in argv, in order."""
+    entries: list[str] = []
+    for i, tok in enumerate(argv):
+        if tok == "--libp2p-bootstrap" and i + 1 < len(argv):
+            entries.append(argv[i + 1])
+    return entries
+
+
+def _split_bootstrap(entry: str) -> tuple[str, str]:
+    """(peer_id, multiaddr) of a `<PeerId>@<multiaddr>` bootstrap entry; any trailing
+    `/p2p/<id>` on the multiaddr is stripped so it compares equal to a bare listen addr."""
+    peer_id, _, multiaddr = entry.partition("@")
+    if "/p2p/" in multiaddr:
+        multiaddr = multiaddr.split("/p2p/", 1)[0]
+    return peer_id.strip(), multiaddr.strip()
+
+
+def check_libp2p_no_injection(
+    argv: list[str],
+    expected_boot_peer: str,
+    provider_peer_id: str,
+    provider_listen_addrs: set[str],
+) -> list[str]:
+    """PURE no-injection oracle (AC#9 runtime half). Returns a list of problems; empty
+    == clean, non-empty == the oracle BITES.
+
+    STRENGTHENED beyond the original `provider PeerId absent + --libp2p-provider-addr
+    absent` pair, which had a bypass: a consumer handed
+    `--libp2p-bootstrap <decoy-peerid>@<P's listen multiaddr>` would DIAL P directly
+    (daemon-libp2p lib.rs:1215 -> fabric-libp2p swarm.rs:547) and Identify would then
+    learn P's REAL id (swarm.rs:645) - so the address-resolution leg LOOKS
+    kad-discovered while P's address was actually injected out of band under a decoy id.
+
+    So this also asserts the consumer's `--libp2p-bootstrap` set is EXACTLY the real
+    BOOT node, and that NO bootstrap entry resolves to the provider's listen address OR
+    PeerId. The check compares against P's KNOWN listen multiaddr(s) + PeerId, not merely
+    'absent'."""
+    problems: list[str] = []
+    joined = " ".join(argv)
+
+    # (kept) the provider's PeerId must not appear ANYWHERE in argv.
+    if provider_peer_id and provider_peer_id in joined:
+        problems.append(
+            f"provider PeerId {provider_peer_id!r} present in consumer argv"
+        )
+
+    # (kept) no hand-fed dial address flag.
+    if "--libp2p-provider-addr" in argv:
+        problems.append(
+            "consumer argv contains --libp2p-provider-addr (hand-fed dial address)"
+        )
+
+    entries = _bootstrap_entries(argv)
+    if not entries:
+        problems.append(
+            "consumer argv has NO --libp2p-bootstrap (cannot be a kad node at all)"
+        )
+
+    for entry in entries:
+        pid, addr = _split_bootstrap(entry)
+        # STRENGTHENED: the bootstrap set must be EXACTLY the real BOOT node.
+        if entry != expected_boot_peer:
+            problems.append(
+                f"consumer --libp2p-bootstrap {entry!r} is not the sole real BOOT "
+                f"node {expected_boot_peer!r}"
+            )
+        # Explicit provider-injection bites (a clearer failure than the set-mismatch
+        # alone, and the load-bearing close of the decoy-PeerId bypass).
+        if provider_peer_id and pid == provider_peer_id:
+            problems.append(
+                f"consumer --libp2p-bootstrap entry {entry!r} resolves to the "
+                f"provider's PeerId {pid!r}"
+            )
+        if addr in provider_listen_addrs:
+            problems.append(
+                f"consumer --libp2p-bootstrap entry {entry!r} resolves to the "
+                f"provider's listen address {addr!r} (out-of-band injection)"
+            )
+    return problems
+
+
+def no_injection_self_test() -> int:
+    """AC#9 BITE: prove the strengthened no-injection oracle actually FAILS an injected
+    provider address. Before/after in one place: a CLEAN consumer argv (bootstraps to
+    the real BOOT alone) must pass; the SAME argv with P's listen address added as a
+    second bootstrap entry under a DECOY PeerId must BITE; and P's real PeerId as a
+    bootstrap entry must BITE. A guard that cannot be shown to fail proves nothing.
+
+    Returns 0 on success (all cases behave), 2 if any case misbehaves."""
+    boot = f"{LIBP2P_BOOT_PEER_ID}@/ip4/127.0.0.1/tcp/{LIBP2P_BASE_PORT + 2}"
+    prov_id = "12D3KooWProviderRealIdAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+    prov_listen = f"/ip4/127.0.0.1/tcp/{LIBP2P_BASE_PORT + 1}"
+    prov_addrs = {prov_listen}
+    decoy_id = "12D3KooWDecoyBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB"
+
+    clean_argv = [
+        "/bin/daemon",
+        "--listen",
+        f"0.0.0.0:{DAEMON_PORT}",
+        "--upstream",
+        "http://127.0.0.1:9",
+        "--libp2p-listen",
+        f"/ip4/127.0.0.1/tcp/{LIBP2P_BASE_PORT}",
+        "--libp2p-bootstrap",
+        boot,
+        "--libp2p-scope",
+        LIBP2P_SCOPE,
+    ]
+
+    # BEFORE (clean): the oracle must NOT bite the legitimate consumer argv.
+    clean_problems = check_libp2p_no_injection(clean_argv, boot, prov_id, prov_addrs)
+    if clean_problems:
+        print(
+            f"no-injection self-test FAILED: clean consumer argv wrongly flagged: "
+            f"{clean_problems}",
+            file=sys.stderr,
+        )
+        return 2
+
+    # AFTER (the bypass): inject P's LISTEN ADDRESS as a 2nd bootstrap entry under a
+    # decoy PeerId. The old oracle (PeerId-absent + no --libp2p-provider-addr) would NOT
+    # bite this; the strengthened one MUST - specifically on the provider listen addr.
+    injected_addr_argv = clean_argv + [
+        "--libp2p-bootstrap",
+        f"{decoy_id}@{prov_listen}",
+    ]
+    addr_problems = check_libp2p_no_injection(
+        injected_addr_argv, boot, prov_id, prov_addrs
+    )
+    if not any(prov_listen in p for p in addr_problems):
+        print(
+            "no-injection self-test FAILED: injecting P's listen address as a decoy-id "
+            f"bootstrap entry did NOT bite the oracle (problems={addr_problems}) - the "
+            "bypass is still open",
+            file=sys.stderr,
+        )
+        return 2
+
+    # AFTER (direct id): inject P's REAL PeerId as a bootstrap entry - must also bite.
+    injected_id_argv = clean_argv + [
+        "--libp2p-bootstrap",
+        f"{prov_id}@/ip4/127.0.0.1/tcp/1",
+    ]
+    id_problems = check_libp2p_no_injection(injected_id_argv, boot, prov_id, prov_addrs)
+    if not any(prov_id in p for p in id_problems):
+        print(
+            "no-injection self-test FAILED: injecting P's PeerId as a bootstrap entry "
+            f"did NOT bite the oracle (problems={id_problems})",
+            file=sys.stderr,
+        )
+        return 2
+
+    # AFTER (--libp2p-provider-addr): the legacy hand-fed dial flag must still bite.
+    flag_argv = clean_argv + ["--libp2p-provider-addr", f"{prov_id}@{prov_listen}"]
+    flag_problems = check_libp2p_no_injection(flag_argv, boot, prov_id, prov_addrs)
+    if not flag_problems:
+        print(
+            "no-injection self-test FAILED: --libp2p-provider-addr injection not caught",
+            file=sys.stderr,
+        )
+        return 2
+
+    print(
+        "e2e: no-injection oracle self-test passed - clean consumer argv is clean; "
+        "injecting P's listen address under a decoy PeerId BITES; P's PeerId BITES; "
+        "--libp2p-provider-addr BITES (AC#9 bypass closed)"
+    )
+    return 0
+
+
 def _copy_seed_narinfos(fixtures: Fixtures, seed_dir: Path, seeds) -> None:
     """Copy each seed's SIGNED narinfo (fixture cache key) beside the raw NAR, under
     `<seed_dir>/narinfos/<store_hash>.narinfo`, so the PROVIDER container can PROVE each
@@ -4489,6 +4679,23 @@ def scenario_s7_libp2p(ctx: Ctx, expect) -> None:
             "--libp2p-provider-addr" not in argv,
             "S7 no-injection: consumer has NO --libp2p-provider-addr (dial resolved via kad)",
             f"argv={joined!r}",
+        )
+        # STRENGTHENED oracle (closes the decoy-PeerId bootstrap-injection bypass): the
+        # consumer's --libp2p-bootstrap set must be EXACTLY the real BOOT node, and no
+        # entry may resolve to P's listen address or PeerId. Without this, a consumer
+        # given `--libp2p-bootstrap <decoy>@<P's listen>` would dial P directly and the
+        # leg would LOOK kad-discovered. Proven to BITE by `e2e_harness.py --self-test`.
+        boot_peer = pod.libp2p_boot_peer_entry or ""
+        prov_addrs = set(pod.libp2p_provider_listen_addrs)
+        injection_problems = check_libp2p_no_injection(
+            argv, boot_peer, prov_id, prov_addrs
+        )
+        expect(
+            not injection_problems,
+            "S7 no-injection: consumer --libp2p-bootstrap is EXACTLY the real BOOT node "
+            "(no provider listen-addr or PeerId injected out-of-band)",
+            f"problems={injection_problems!r} boot={boot_peer!r} "
+            f"prov_addrs={sorted(prov_addrs)!r} argv={joined!r}",
         )
 
         # -- ARM A (positive): C discovers+resolves+fetches the target from P --
@@ -4946,6 +5153,11 @@ def main() -> int:
     parser.add_argument("--clean", action="store_true", help="tear down pods and exit")
     parser.add_argument("--list", action="store_true", help="list scenarios and exit")
     parser.add_argument(
+        "--self-test",
+        action="store_true",
+        help="run the pure no-injection oracle BITE self-test (no containers) and exit",
+    )
+    parser.add_argument(
         "--only",
         action="append",
         default=[],
@@ -4958,6 +5170,12 @@ def main() -> int:
         help="fixture publication root",
     )
     args = parser.parse_args()
+
+    if args.self_test:
+        # Bounded, container-free: the tmp-byte probe bite AND the no-injection bite.
+        _self_test_tmp_size_snippet()
+        print("e2e: tmp-byte probe self-test passed", file=sys.stderr)
+        return no_injection_self_test()
 
     _self_test_tmp_size_snippet()
     print("e2e: tmp-byte probe self-test passed", file=sys.stderr)
