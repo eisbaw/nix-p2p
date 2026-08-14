@@ -3,10 +3,10 @@ id: TASK-200
 title: >-
   No-floats sweep: convert ratios to rational num/denom, bandwidth to bytes/sec,
   latency to ns across measurement code
-status: In Progress
+status: Done
 assignee: []
 created_date: '2026-08-14 06:42'
-updated_date: '2026-08-14 20:25'
+updated_date: '2026-08-14 20:29'
 labels:
   - hardening
   - tech-debt
@@ -42,4 +42,6 @@ COVERAGE BOUNDARY (honest): scans 11 listed scripts, not the whole tree, not the
 
 GATE: check-no-floats --self-test bites + real scan green; shaped_link + peer_wire_baseline self-tests green (verdicts unchanged); ruff check scripts green; my files ruff-format clean; just independence green (with the new guard).
 PRE-EXISTING BLOCKER (NOT TASK-200): ruff 0.15.14 flags committed format drift in scripts/e2e_harness.py (TASK-194) and scripts/task99_link_compression_measure.py (TASK-99) -- HEAD content fails 'ruff format --check' as named files, unrelated to this task and proven e2e/finalizer code the brief says NOT to touch. Left for orchestrator triage (likely a separate hygiene commit or a ruff pin bump); it blocks the whole-dir 'ruff format --check scripts' step of 'just lint'.
+
+DONE 2026-08-14. No-floats enforcement landed where it matters: (1) scripts/check-no-floats.py AST guard (wired into just lint) - flags float-in-gate comparisons (Rule A, with an intra-function float-TAINT pass that catches computed-float gates like break_even's denom=ratio/up-1.0/peer that a literal-only guard misses) + float in _ns/_num/_denom serialized fields (Rule B); 8 sanctioned floats allowlisted-with-reason (permanent physical/statistical vs deferred-to-TASK-211); --self-test bites 6 cases + 4 clean-pass + ALLOW-suppression proof (non-vacuous). (2) shaped_link.assert_shaping converted to integer-ns RTT + exact-rational bytes/sec (Fraction cross-multiplication), verdict-IDENTICAL (parses the same decimal strings; zero evidence-schema perturbation) - self-test 6+4 still bite. Orchestrator-verified: guard bites + real scan clean + both finalizer self-tests unchanged. Also fixed a latent pre-existing ruff-bump drift (e2e_harness.py + task99_link_compression_measure.py failed ruff 0.15.14 whole-dir check with empty git diff, blocking just lint) - pure reformat, self-tests green (ac228f6). DEFERRED -> TASK-211: the peer_wire_baseline break_even/assert_link_label Fraction conversion (convertible but COUPLED to the 3-codex-gated finalizer + committed evidence schema; break_even's denom==0 boundary self-test vectors need a re-bless audit since exact Fraction removes float cancellation error near the boundary - must not be done silently). HONEST: guard scans 11 listed scripts not the whole tree, Rule A is name+taint driven not a general analyzer (extend VERDICT_FUNCS include-list, don't weaken the taint pass).
 <!-- SECTION:NOTES:END -->
