@@ -123,6 +123,11 @@ test: build _python fixtures
     # task-142: routed relay-capability command safety and artifact mutation bites.
     "${NIX_P2P_PYTHON}/bin/python3" scripts/iroh_relay_capability_evidence.py --self-test
     "${NIX_P2P_PYTHON}/bin/python3" scripts/finalize_iroh_relay_capability.py --self-test
+    # TASK-155: the decentralized-content-discovery-v1 finalizer's full mutation set -
+    # harness/ac9 bites, WIRE-level pcap bites (mdns / multicast / external unicast /
+    # truncated pcap / kernel drop / no peer transfer), and TASK-126 frozen-tree bites
+    # (anchor absent / golden ContentKey drift). Container-free; every bite must fire.
+    "${NIX_P2P_PYTHON}/bin/python3" scripts/decentralized_discovery_evidence.py --self-test
     # task-42: the profiler's unit gate (NarSize vs FileSize can never share an
     # unlabelled `_bytes` key), its S9 class-recovery bite (a known-O(n^2) law is
     # NEVER fitted linear), the disk walk and the arm scoring are all
@@ -364,3 +369,19 @@ iroh-relay-evidence image output="artifacts/iroh-relay" *ARGS: _python
 # Finalize one passing raw relay-capability run against its reviewed implementation commit.
 iroh-relay-artifact raw_run implementation_commit output="artifacts/iroh-relay-capability-v1.json" *ARGS: _python
     "${NIX_P2P_PYTHON}/bin/python3" scripts/finalize_iroh_relay_capability.py --raw-run {{ quote(raw_run) }} --implementation-commit {{ quote(implementation_commit) }} --output {{ quote(output) }} {{ ARGS }}
+
+# TASK-155: capture the decentralized-content-discovery-v1 evidence (runs the s7-libp2p
+# arms + AC#9 guard + TASK-126 anchor, and captures the s7 pod netns to a pcap). Needs
+# rootless podman + host tcpdump/nsenter; writes raw captures ONLY (no verdict).
+discovery-evidence-capture out="artifacts/decentralized-content-discovery": _python
+    "${NIX_P2P_PYTHON}/bin/python3" scripts/decentralized_discovery_evidence.py --capture --out {{ quote(out) }}
+
+# Finalize the captured discovery evidence: re-derive the verdict from the raw captures
+# (recount checks, reparse the pcap, re-check the frozen golden) and write the tracked
+# artifacts/decentralized-content-discovery-v1.json. Fails closed.
+discovery-evidence-finalize out="artifacts/decentralized-content-discovery": _python
+    "${NIX_P2P_PYTHON}/bin/python3" scripts/decentralized_discovery_evidence.py --finalize --out {{ quote(out) }}
+
+# Re-verify the tracked discovery artifact against its on-disk raw captures (hash match).
+discovery-evidence-verify out="artifacts/decentralized-content-discovery": _python
+    "${NIX_P2P_PYTHON}/bin/python3" scripts/decentralized_discovery_evidence.py --verify --out {{ quote(out) }}

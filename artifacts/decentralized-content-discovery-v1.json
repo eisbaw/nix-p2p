@@ -23,49 +23,91 @@
       }
     }
   },
-  "git_head": "158a2ce78c1221634914cc1ea3a243ab9452d146",
+  "frozen_binding": {
+    "anchor_reproduced": true,
+    "content_key_context": "nix-p2p/discovery/ContentKey/v1",
+    "content_key_hex": "4e61db15d59529f33ad8f264c93302500233a84605dc58cb2ac3b8f4a2ed007c",
+    "frozen_content_key_hex": "4e61db15d59529f33ad8f264c93302500233a84605dc58cb2ac3b8f4a2ed007c",
+    "golden": "peer-fabric/tests/golden/provider_record_v1.json",
+    "ok": true
+  },
+  "frozen_tree_manifest": {
+    "count": 2,
+    "files": [
+      {
+        "bytes": 12709,
+        "path": "peer-fabric/tests/golden/provider_record_v1.json",
+        "sha256": "1590b4e2a8da12221e50670c68e3356326e365ddaf233dabe048dd630640ee04"
+      },
+      {
+        "bytes": 15554,
+        "path": "scripts/check-content-key-derivation.py",
+        "sha256": "45a0116514cb82d94460f51119ff07cd3fd9398f355f1dfe0371a2f9f10eeaa2"
+      }
+    ]
+  },
+  "git_head": "5f7f755adca1421fff42abf9e8d370555cfe7cea",
   "no_injection": {
     "consumer_bootstrap_is_boot_only": true,
     "consumer_lacks_provider_addr_flag": true,
     "consumer_lacks_provider_peerid": true
   },
+  "pcap_meta": {
+    "attached": true,
+    "attached_at": 1786732500.3720565,
+    "captured": 1558,
+    "dropped": 0,
+    "host_pid": 3407802,
+    "received": 3112,
+    "stopped_at": 1786732516.8367991,
+    "target": "nix-p2p-e2e-s7-origin"
+  },
   "problems": [],
   "raw_captures": {
     "raw-ac9.log": {
-      "bytes": 286,
-      "sha256": "f3bcd4ad93d8324713ba108ae0e8169bac82ba83cb15b3989f987190e142f036"
+      "bytes": 437,
+      "sha256": "d992834e26e86b968b659f825ac88799f04caee909f4887a2262a53417ad026d"
     },
     "raw-e2e.log": {
       "bytes": 3378,
-      "sha256": "078c092e928e76b640275504e08b8112742765063c4c738b013c6df57d0656be"
+      "sha256": "023a2576f3ea5313660235c066ab1cf00622801dac2e8605bd23d18aeee670a6"
+    },
+    "raw-frozen.log": {
+      "bytes": 131,
+      "sha256": "0d9e9e5080d55c6343bf01043e65007cdacfc0fd5033cf3327653a62527b3b49"
+    },
+    "raw-s7.pcap": {
+      "bytes": 539398,
+      "sha256": "891d5239049ae33cc5e57951e85a8f2a4c78aee6767aa0389f93ad4b1300252c"
     }
   },
   "rederived_from_raw": true,
   "required_oracle_lines_present": 6,
   "required_oracle_lines_total": 6,
   "schema": "decentralized-content-discovery-v1",
-  "task": "TASK-103",
+  "task": "TASK-155",
   "timings": {
-    "ac9_guard_ms": 85,
-    "e2e_ms": 59772
+    "ac9_guard_ms": 75,
+    "e2e_ms": 59009,
+    "frozen_anchor_ms": 1467
   },
   "tree_manifest": {
     "count": 6,
     "files": [
       {
-        "bytes": 86148,
+        "bytes": 90326,
         "path": "daemon-libp2p/src/lib.rs",
-        "sha256": "5e56e426fa78c9288778dee022fc76557f9bc8a8b22f371acf5b543626311bf5"
+        "sha256": "dcd08fdf5ccefd07654bac4fbac795a349d5b90d9cb6b7cbe8413b43e72ec9f1"
       },
       {
-        "bytes": 143661,
+        "bytes": 141579,
         "path": "daemon/src/main.rs",
-        "sha256": "89d74b0bb018be1ff5d86aa428ac325b6a05d50542d32019a11c01b5e0e1adef"
+        "sha256": "b3c4972eeb7765503f59ded8577b0a1061ce22a66808933d426d5fb0fb347e08"
       },
       {
-        "bytes": 7014,
+        "bytes": 7041,
         "path": "daemon/src/lib.rs",
-        "sha256": "e610e37cf401b9d280e5bbea9d379f42fe2150fc43a3026934b3b62e176316c3"
+        "sha256": "8e60d610cee8bea1fe0e3da393249247562d810d6cbe36df9bc49abf245753fb"
       },
       {
         "bytes": 84946,
@@ -73,16 +115,39 @@
         "sha256": "b930f99228e1aa91f411dc0d088b09714a085f08b4f6033d9d3c4f1fd7838341"
       },
       {
-        "bytes": 227041,
+        "bytes": 238584,
         "path": "scripts/e2e_harness.py",
-        "sha256": "fd8b62fb1d57ec627d0432b918e94501c81dae8e39c3f23e4b073f328de4c421"
+        "sha256": "0cafc5b71ecc7eb3a13c287b13856eae0126a8baca23e1f530dad8f4b6ce2670"
       },
       {
-        "bytes": 7114,
+        "bytes": 10167,
         "path": "scripts/check-discovery-no-shortcut.py",
-        "sha256": "314897d36337e87e033f380f71db9db80488fdac5cb0c08df5bf34ae96ae62db"
+        "sha256": "b7020cda4cd599673536aeb6b665cb1d044d74d34d46e0a546418a351b0c800b"
       }
     ]
   },
-  "verdict": "pass"
+  "verdict": "pass",
+  "wire_evidence": {
+    "distinct_ipv4": [
+      "10.221.148.66",
+      "127.0.0.1"
+    ],
+    "external_unicast_packets": 0,
+    "ipv4_multicast_or_broadcast": 0,
+    "ipv6_icmp_nd": 4,
+    "ipv6_non_icmp": 0,
+    "ipv6_total": 4,
+    "libp2p_listener_ports": [
+      37000,
+      37001,
+      37002
+    ],
+    "libp2p_transfer_max_bytes": 91229,
+    "libp2p_transfer_min_required": 40000,
+    "mdns_packets": 0,
+    "ok": true,
+    "records": 1558,
+    "tcpdump_captured": 1558,
+    "tcpdump_dropped": 0
+  }
 }
