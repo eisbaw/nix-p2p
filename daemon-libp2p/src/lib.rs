@@ -558,6 +558,23 @@ pub async fn announce_provider_seeds(
     now: u64,
     budget: &AnnounceBudget,
 ) -> Result<Vec<ProviderRecord>, String> {
+    announce_seed_records(fabric, identity_seed, seeds, ttl_secs, now, budget).await
+}
+
+/// The shared raw-seed announce loop: TASK-56-verify every seed, then per key
+/// durably-allocate the sequence, sign, and announce. PRIVATE to this module - BOTH the
+/// substrate-neutral LAN door ([`announce_provider_seeds`]) and the allowlist-gated PUBLIC
+/// door ([`announce_public_seeds`]) funnel through it, so the verify-then-sign SSOT (the
+/// site where a provider CLAIM is minted) is single-sourced and a public seed announce
+/// signs the exact same record a LAN one would.
+async fn announce_seed_records(
+    fabric: &Libp2pFabric,
+    identity_seed: [u8; 32],
+    seeds: &[(NarHashKey, Vec<u8>)],
+    ttl_secs: u64,
+    now: u64,
+    budget: &AnnounceBudget,
+) -> Result<Vec<ProviderRecord>, String> {
     // TASK-56: verify every seed's bytes hash to its declared NarHash BEFORE signing or
     // announcing ANY record. This is the shipped SSOT where the provider CLAIM is minted
     // (both thin binaries and the composite daemon call this exact loop), so a
@@ -1006,6 +1023,112 @@ async fn announce_approved_public(
     announce_store_records(fabric, identity_seed, &provisions, ttl_secs, now, budget).await
 }
 
+// -------------------------------------------------------------------------
+// The PUBLIC-ANNOUNCE door for raw SEEDS (`--libp2p-seed-nar`): the seed
+// counterpart of the StoreProvision public door above. The shipped seed-supply
+// provider (`daemon`/`daemon-libp2p`) uses it to announce over a PUBLIC (bootstrapped)
+// substrate, gated on the same public-NAR allowlist. Seeds and store provisions are
+// DISTINCT capabilities (a seed carries raw bytes; a provision carries an index-verified
+// digest), so publicness is gated by a parallel typed door rather than by fabricating a
+// `StoreProvision` from a byte string.
+// -------------------------------------------------------------------------
+
+/// A TASK-56-verified raw seed PAIRED with the allowlist [`PublicNarClaim`] that authorises
+/// announcing it PUBLICLY. Private fields, minted ONLY by [`approve_seeds_for_public`], so a
+/// public seed announce CANNOT be represented without an allowlist-minted claim - the claim is
+/// LOAD-BEARING (held through the announce), the seed analogue of [`ApprovedPublicProvision`].
+#[derive(Debug, Clone)]
+pub struct ApprovedPublicSeed {
+    nar_hash: NarHashKey,
+    bytes: Vec<u8>,
+    /// The unforgeable proof the allowlist approved this NAR for public announce. Held (never
+    /// discarded) so this capability cannot exist without it.
+    claim: PublicNarClaim,
+}
+
+impl ApprovedPublicSeed {
+    /// The NAR identity this seed will announce.
+    pub fn nar_hash(&self) -> &NarHashKey {
+        &self.nar_hash
+    }
+
+    /// The allowlist claim authorising the PUBLIC announce of this seed's NAR.
+    pub fn claim(&self) -> &PublicNarClaim {
+        &self.claim
+    }
+}
+
+/// CONSULT the public-NAR allowlist for a batch of raw seeds a node intends to announce
+/// PUBLICLY, minting one [`PublicNarClaim`] per seed. FAIL-CLOSED and ALL-OR-NOTHING: if ANY
+/// seed is not allowlisted (never proven public via a trusted narinfo signature), the WHOLE
+/// batch is refused and NO claim is minted, so no partial announce can leak an un-approved NAR.
+///
+/// The size the allowlist gates on is `bytes.len()` - the raw UNCOMPRESSED NAR length, which is
+/// exactly the signed NarSize a trusted narinfo proved. A wrong-length seed is refused as a
+/// [`PublicationRejected::SizeMismatch`] here; a right-length-but-wrong-CONTENT seed is refused
+/// by the TASK-56 `verify_provider_seeds` check inside the shared announce loop. The seed analogue
+/// of [`approve_provisions_for_public`]; a PURE function of `(seeds, allowlist)`, so the
+/// closed-by-construction gate is unit-testable without a DHT.
+pub fn approve_seeds_for_public(
+    seeds: &[(NarHashKey, Vec<u8>)],
+    allowlist: &PublicNarAllowlist,
+) -> Result<Vec<ApprovedPublicSeed>, PublicationRejected> {
+    let mut approved = Vec::with_capacity(seeds.len());
+    for (nar_hash, bytes) in seeds {
+        // `approve` mints an UNFORGEABLE PublicNarClaim iff the NarHash is allowlisted AND its
+        // approved size equals this seed's byte length. Absence -> fail-closed. The claim is
+        // PAIRED with the seed and HELD through the announce.
+        let claim = allowlist.approve(nar_hash, Some(bytes.len() as u64))?;
+        approved.push(ApprovedPublicSeed {
+            nar_hash: *nar_hash,
+            bytes: bytes.clone(),
+            claim,
+        });
+    }
+    Ok(approved)
+}
+
+/// Announce a signed [`ProviderRecord`] for each raw seed, but ONLY after the public-NAR
+/// allowlist has PROVEN every one publishable (TASK-102). The PUBLIC analogue of
+/// [`announce_provider_seeds`] and the seed counterpart of [`announce_public_provisions`]: it
+/// FIRST runs [`approve_seeds_for_public`] (fail-closed, all-or-nothing) and announces nothing
+/// if any seed is un-allowlisted, then reuses the SAME verified-content announce loop
+/// ([`announce_seed_records`]) a LAN announce uses. CONSUMING the minted [`ApprovedPublicSeed`]s
+/// (claim held to the announce) is what makes a public seed announce with no allowlist-minted
+/// claim UNREPRESENTABLE - there is no bare-seed public entry point.
+pub async fn announce_public_seeds(
+    fabric: &Libp2pFabric,
+    identity_seed: [u8; 32],
+    seeds: &[(NarHashKey, Vec<u8>)],
+    allowlist: &PublicNarAllowlist,
+    ttl_secs: u64,
+    now: u64,
+    budget: &AnnounceBudget,
+) -> Result<Vec<ProviderRecord>, String> {
+    // THE GATE (fail-closed, before any record is signed or announced): every seed must be
+    // allowlisted, minting a claim-bearing capability, or the whole public announce is refused.
+    let approved = approve_seeds_for_public(seeds, allowlist)
+        .map_err(|rejected| format!("public announce refused by the allowlist gate: {rejected}"))?;
+    // The claim is held to HERE, so a public seed announce is unrepresentable without an
+    // allowlist-minted claim. Reconstruct the (already-verified) seeds for the shared loop.
+    let approved_seeds: Vec<(NarHashKey, Vec<u8>)> = approved
+        .iter()
+        .map(|a| {
+            debug_assert_eq!(a.claim().nar_hash(), &a.nar_hash);
+            (a.nar_hash, a.bytes.clone())
+        })
+        .collect();
+    announce_seed_records(
+        fabric,
+        identity_seed,
+        &approved_seeds,
+        ttl_secs,
+        now,
+        budget,
+    )
+    .await
+}
+
 /// Wrap a running `fabric` in the consumer [`Libp2pNarSource`] + its paired
 /// [`Libp2pRawServe`], both holding the SAME fabric and discovery budget so the
 /// rewrite-to-raw decision and the fetch can never drift (TASK-164). Shared by the
@@ -1295,7 +1418,7 @@ mod public_announce_gate_tests {
     //! consult point every public announce goes through. StoreProvision has private fields,
     //! but this test lives in the SAME crate, so it can mint one directly (the shipped path
     //! mints it only via `verify_store_provisions`; here we only need the gate's decision).
-    use super::{StoreProvision, approve_provisions_for_public};
+    use super::{StoreProvision, approve_provisions_for_public, approve_seeds_for_public};
     use daemon_core::content_id::Blake3Digest;
     use daemon_core::{
         NarHashKey, PublicNarAllowlist, PublicationRejected, StoreHash, TrustedNarKeys,
@@ -1395,6 +1518,68 @@ Sig: nix-p2p-test-1:Xqf1bjNJ1ReFahm86zY+hv80+7QeJer5V/HjlEAvP39yJEK8w8jHG9WH5lM7
             999,
         );
         match approve_provisions_for_public(&[wrong_size], &list) {
+            Err(PublicationRejected::SizeMismatch { .. }) => {}
+            other => panic!("expected SizeMismatch, got {other:?}"),
+        }
+    }
+
+    // ---- the SEED public door (announce_public_seeds), the path the s7-libp2p e2e drives ----
+
+    const APP_NAR_HASH: &str = "sha256:0pgsb9mjmfj57w1ddmqn9z9667nwbqbnn699j1s1s99jhy6cppsm";
+
+    fn seed(nar_hash: &str, len: usize) -> (NarHashKey, Vec<u8>) {
+        // The GATE (approve_seeds_for_public) checks only the allowlist membership + byte length;
+        // the raw-content->NarHash TASK-56 check lives in the shared announce loop, so these
+        // fixture bytes need only the right length to exercise the gate.
+        (nar_hash.parse::<NarHashKey>().unwrap(), vec![0u8; len])
+    }
+
+    #[test]
+    fn allowlisted_seed_is_approved() {
+        let list = allowlist_with_app();
+        let approved =
+            approve_seeds_for_public(&[seed(APP_NAR_HASH, 408)], &list).expect("approved");
+        assert_eq!(approved.len(), 1);
+        assert_eq!(approved[0].claim().nar_size(), 408);
+        assert_eq!(approved[0].claim().nar_hash(), approved[0].nar_hash());
+    }
+
+    #[test]
+    fn an_operator_named_local_seed_is_refused_from_public_announce() {
+        // THE SEED BITE: a purely-local NAR the operator named via --libp2p-seed-nar is NOT
+        // allowlisted (never proven public via a trusted narinfo signature), so the public seed
+        // door refuses the whole batch and mints NO claim. Neuter the `approve` consult and this
+        // goes green -> the guard bites. Without a claim, announce_public_seeds cannot announce it.
+        let list = allowlist_with_app();
+        let local = seed(
+            "sha256:1nn8563y6j55y003xjk1bvb1854abmigsas2jgzy4shy0f4vnzpa",
+            1234,
+        );
+        match approve_seeds_for_public(&[local], &list) {
+            Err(PublicationRejected::NotAllowlisted(_)) => {}
+            other => panic!("expected NotAllowlisted, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn seed_all_or_nothing_one_unapproved_refuses_the_whole_batch() {
+        let list = allowlist_with_app();
+        let seeds = vec![
+            seed(APP_NAR_HASH, 408),
+            seed(
+                "sha256:1nn8563y6j55y003xjk1bvb1854abmigsas2jgzy4shy0f4vnzpa",
+                1234,
+            ),
+        ];
+        assert!(approve_seeds_for_public(&seeds, &list).is_err());
+    }
+
+    #[test]
+    fn a_seed_length_that_disagrees_with_the_proof_is_refused() {
+        // A NarHash allowlisted at 408 B announced from a seed of a DIFFERENT length is refused:
+        // the raw NAR length must equal the NarSize the trusted signature covered.
+        let list = allowlist_with_app();
+        match approve_seeds_for_public(&[seed(APP_NAR_HASH, 999)], &list) {
             Err(PublicationRejected::SizeMismatch { .. }) => {}
             other => panic!("expected SizeMismatch, got {other:?}"),
         }
