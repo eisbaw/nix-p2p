@@ -3,10 +3,10 @@ id: TASK-208
 title: >-
   relay circuit-v2 server resource bounds + opt-out (every node relays
   unconditionally with default caps)
-status: In Progress
+status: Done
 assignee: []
 created_date: '2026-08-14 17:23'
-updated_date: '2026-08-14 19:42'
+updated_date: '2026-08-14 19:45'
 labels:
   - libp2p
   - connectivity
@@ -37,4 +37,6 @@ Tests: (1) unit swarm::tests::relay_server_config_carries_explicit_bounds_not_li
 Gate (bounded, nix develop -c): cargo build 0; cargo test -p fabric-libp2p all suites pass (nat_traversal 3/3 incl new opt-out; decentralized_discovery 1/1; node_locator_discovery 1/1; lib +2 new); cargo fmt --all --check 0; cargo clippy --locked -p fabric-libp2p --all-targets -D warnings 0; just independence 0 (shaping guard: 82 src files clean). Shaping tokens avoided in shipped-src comments.
 
 Limits/honesty: opt-out proof is at the reservation boundary (behaviour absent) not a full multi-circuit reservation-saturation integration test (a real max_reservations/max_circuits saturation test is DEFERRED - would need N>caps concurrent NAT'd clients in-process; the unit test asserts the values reach relay::Config, which is the config-threading floor the task requires). max_circuit_duration/max_circuit_bytes kept at library defaults (already conservative for a home relay); only the slot/lifetime caps were tightened below default.
+
+DONE 2026-08-14. relay circuit-v2 server now bounded + opt-outable. NodeConfig.relay_server_enabled (default true, builder with_relay_server); Behaviour.relay -> Toggle<relay::Behaviour> so opt-out makes the SERVER genuinely absent (no reservation/circuit accepted) while relay_client/autonat/dcutr stay (node still USES relays). Explicit relay::Config (libp2p-relay 0.18.0, struct-FRU from default keeping its rate limiters): max_reservations 32 (lib 128), per_peer 2 (lib 4), reservation_duration 10min (lib 1h), max_circuits 8 (lib 16), per_peer 2 (lib 4); circuit duration 2min + bytes 128KiB at lib defaults. Worst-case ~1MiB concurrent forwarded. Rationale: a relay circuit is dial-assistance (dcutr upgrades to DIRECT for bulk NAR), so relay carries only hole-punch+control. Integer/Duration (no-float). Tests: explicit-bounds (bites revert-to-default), opt-out threads, opt-out declines reservations. Orchestrator-verified: bounds+opt-out tests bite, nat_traversal stays green, shaping-guard clean. HONEST: full multi-circuit reservation-SATURATION integration test deferred (unit asserts config threading + tighter-than-default).
 <!-- SECTION:NOTES:END -->
