@@ -348,11 +348,45 @@ def _deciles_by_nar(admitted: list[dict]) -> list[dict]:
     return deciles
 
 
+def _require_int_field(record: dict, key: str) -> int:
+    """Read a byte-count field, REJECTING any non-integer value.
+
+    NarSize/FileSize are byte COUNTS: integers. Because the field is integer-typed, a
+    NaN/inf is UNREPRESENTABLE in it -- a float (NaN/inf/fractional) smuggled into a
+    committed record is a corrupted record, not a measurement, and fails LOUDLY here
+    before it can poison a sum. This single integer-type choke point is why the whole
+    class of NaN fail-opens cannot exist on the trust path: there is nothing to
+    special-case, an integer field simply cannot hold a NaN.
+    """
+    value = record.get(key)
+    if isinstance(value, bool) or not isinstance(value, int):
+        # bool is an int subclass; a byte count is never a bool, and a float byte
+        # count (NaN/inf/fractional) is a corrupted record, not a measurement.
+        raise ValueError(
+            f"record {record.get('store_hash', '?')!r} field {key!r} is "
+            f"{value!r} ({type(value).__name__}); byte counts must be plain integers "
+            "(a float/NaN is unrepresentable as a byte count -- rejected fail-closed)"
+        )
+    return value
+
+
 def _aggregate_from_records(records: list[dict]) -> dict:
     """Compute every aggregate quantity from the RAW records. This is the one
     computation path; the report stores its output and the verifier re-runs it on
     the reloaded records to prove the headline is re-derivable from committed raw.
+
+    Every byte count is read through `_require_finite_int_field`, so a non-finite
+    (NaN/inf) or otherwise non-integer record value is rejected BEFORE it can enter
+    a sum. The exclusion counts and `n_records_total` are computed here too, so the
+    verifier re-derives them from the same choke point (they used to live only in
+    `compressed_ratio_aggregate`, unchecked -- the fail-open codex exploited).
     """
+    # Validate ALL records (admitted or not) up front: a non-integer byte count
+    # anywhere in the committed sample is a corrupted artifact, fail closed.
+    for r in records:
+        _require_int_field(r, "file_size_bytes_compressed_wire")
+        _require_int_field(r, "nar_size_bytes_uncompressed_nar")
+
     admitted = _admitted_records(records)
     if not admitted:
         raise ValueError(
@@ -367,6 +401,21 @@ def _aggregate_from_records(records: list[dict]) -> dict:
         if r["nar_size_bytes_uncompressed_nar"] > 0
     ]
     nar_sizes = [r["nar_size_bytes_uncompressed_nar"] for r in admitted]
+
+    n_uncompressed = sum(
+        1 for r in records if classify_compression(r["compression"]) == "uncompressed"
+    )
+    n_unknown = sum(
+        1
+        for r in records
+        if classify_compression(r["compression"]) == "unknown_compression"
+    )
+    n_unsigned = sum(
+        1
+        for r in records
+        if classify_compression(r["compression"]) == "compressed"
+        and not bool(str(r.get("sig", "")).strip())
+    )
     return {
         "n_compressed": len(admitted),
         "aggregate_file_over_nar_ratio": sum_file / sum_nar,
@@ -384,6 +433,10 @@ def _aggregate_from_records(records: list[dict]) -> dict:
         "nar_size_span_orders_of_magnitude": (
             (max(nar_sizes) / min(nar_sizes)) if min(nar_sizes) > 0 else None
         ),
+        "n_uncompressed_excluded": n_uncompressed,
+        "n_unknown_compression_excluded": n_unknown,
+        "n_unsigned_excluded": n_unsigned,
+        "n_records_total": len(records),
         "deciles_by_nar_size": _deciles_by_nar(admitted),
     }
 
@@ -398,28 +451,9 @@ def compressed_ratio_aggregate(samples: list[NarinfoSample]) -> dict:
     headline is re-derivable from committed raw (see `verify_rederivable`).
     """
     records = [_record_of(s) for s in samples]
-    agg = _aggregate_from_records(records)
-
-    n_uncompressed = sum(
-        1 for r in records if classify_compression(r["compression"]) == "uncompressed"
-    )
-    n_unknown = sum(
-        1
-        for r in records
-        if classify_compression(r["compression"]) == "unknown_compression"
-    )
-    n_unsigned = sum(
-        1
-        for r in records
-        if classify_compression(r["compression"]) == "compressed"
-        and not bool(str(r.get("sig", "")).strip())
-    )
+    agg = _aggregate_from_records(records)  # incl. exclusion counts + n_records_total
     agg.update(
         {
-            "n_uncompressed_excluded": n_uncompressed,
-            "n_unknown_compression_excluded": n_unknown,
-            "n_unsigned_excluded": n_unsigned,
-            "n_records_total": len(records),
             "admission_rule": (
                 "admitted iff Compression in a known codec set AND Sig present; "
                 "uncompressed/unknown-codec/unsigned each excluded and counted"
@@ -460,29 +494,158 @@ class RederivationError(Exception):
     """A reported aggregate does not match what its own records re-derive to."""
 
 
-# Aggregate scalars the verifier recomputes from records and demands match.
-_REDERIVED_SCALARS = (
+# The TRUST ANCHOR: every integrity-critical quantity is an INTEGER (a byte count or
+# a cardinal count) -- FileSize/NarSize, their sums, every exclusion count, the record
+# total, and each decile's index/n/min/max. The verifier recomputes these from the raw
+# records and compares with EXACT `==`. There is NO float, and NO tolerance, anywhere
+# on the trust path. This is the root-cause fix codex's mutations demanded: the whole
+# class of failures it broke (a relative tolerance swallowing a 1-byte drift; a NaN
+# passing a `>` that NaN fails) CANNOT EXIST here -- NaN is unrepresentable in an
+# integer field, and there is no tolerance to mis-set.
+_REDERIVED_INT_SCALARS = (
     "n_compressed",
-    "aggregate_file_over_nar_ratio",
-    "peer_raw_over_cdn_wire_multiple",
-    "per_path_ratio_mean",
-    "per_path_ratio_median",
     "sum_file_size_bytes_compressed_wire",
     "sum_nar_size_bytes_uncompressed_nar",
     "nar_size_min_bytes_uncompressed_nar",
     "nar_size_max_bytes_uncompressed_nar",
+    "n_uncompressed_excluded",
+    "n_unknown_compression_excluded",
+    "n_unsigned_excluded",
+    "n_records_total",
+)
+
+# DERIVED DISPLAY floats. These are NOT independent integrity quantities: each is a
+# pure function of the verified integers (ratio = sum_file/sum_nar; the multiple is
+# its reciprocal; per-path mean/median and decile ratios are recomputed from the same
+# integer records in the same order). Because the recomputation is deterministic they
+# reproduce BIT-IDENTICALLY, so we assert exact `==` against the re-derived value --
+# not as a tamper anchor (the integers are that) but so the stored display cannot lie
+# about what the integers imply. Exact `!=` also rejects a NaN/None for free (NaN and
+# None compare unequal to the finite re-derived value), needing no isnan/tolerance.
+_DERIVED_DISPLAY_FLOATS = (
+    "aggregate_file_over_nar_ratio",
+    "peer_raw_over_cdn_wire_multiple",
+    "per_path_ratio_mean",
+    "per_path_ratio_median",
     "nar_size_span_orders_of_magnitude",
 )
 
 
-def verify_rederivable(agg: dict, *, tol: float = 1e-9) -> dict:
+def _cmp_int(key: str, want, got, out: list[str]) -> None:
+    """EXACT integer equality on the trust path; rejects a non-integer reported value.
+
+    `want` MUST be a plain int (byte counts and cardinal counts are integers). A float
+    -- including NaN/inf, which is exactly how the old fail-open smuggled drift past a
+    tolerance -- is not an integer and is rejected on type, before any comparison.
+    """
+    if isinstance(want, bool) or not isinstance(want, int):
+        out.append(
+            f"{key}: reported {want!r} is not a plain integer (integrity quantities "
+            "are integers; a float/NaN here is a corrupted field)"
+        )
+        return
+    if want != got:
+        out.append(f"{key}: reported {want!r} != re-derived {got!r} (exact)")
+
+
+def _cmp_display(key: str, want, got, out: list[str]) -> None:
+    """Exact equality for a derived display value (float or None).
+
+    The re-derived `got` is deterministic, so a clean stored value equals it exactly.
+    A single `!=` catches every deviation -- a doctored float, a NaN (NaN != got), a
+    None/non-None mismatch -- with no tolerance and no special-casing.
+    """
+    if want != got:
+        out.append(f"{key}: reported {want!r} != re-derived {got!r} (display)")
+
+
+def _verify_deciles(want_dec, got_dec, out: list[str]) -> None:
+    """Compare the FULL decile fields (index, n, min, max, ratio), not just the ratio.
+
+    The prior verifier compared only `aggregate_file_over_nar_ratio`, so a doctored
+    decile index / n / min / max sailed through. index/n/min/max are integers checked
+    exactly on the trust path; the ratio is a derived display value checked exactly.
+    """
+    if not isinstance(want_dec, list) or len(want_dec) != len(got_dec):
+        out.append("deciles_by_nar_size: length differs from re-derived")
+        return
+    for wd, gd in zip(want_dec, got_dec):
+        if not isinstance(wd, dict):
+            out.append(f"decile entry {wd!r} is not a dict")
+            continue
+        tag = f"decile[{gd.get('decile')}]"
+        _cmp_int(f"{tag}.decile", wd.get("decile"), gd.get("decile"), out)
+        _cmp_int(f"{tag}.n", wd.get("n"), gd.get("n"), out)
+        # Empty deciles carry only {decile, n, note}; populated ones carry min/max/ratio.
+        if gd.get("n", 0) == 0:
+            continue
+        _cmp_int(
+            f"{tag}.min",
+            wd.get("nar_size_min_bytes_uncompressed_nar"),
+            gd.get("nar_size_min_bytes_uncompressed_nar"),
+            out,
+        )
+        _cmp_int(
+            f"{tag}.max",
+            wd.get("nar_size_max_bytes_uncompressed_nar"),
+            gd.get("nar_size_max_bytes_uncompressed_nar"),
+            out,
+        )
+        _cmp_display(
+            f"{tag}.ratio",
+            wd.get("aggregate_file_over_nar_ratio"),
+            gd.get("aggregate_file_over_nar_ratio"),
+            out,
+        )
+
+
+def _verify_record_derivations(records: list[dict], out: list[str]) -> None:
+    """Re-derive `signed`/`classification` from the RAW `sig`/`compression` and
+    demand the stored fields agree. The aggregate math ignores these stored booleans
+    (it re-derives admission from raw), so a lie in them is invisible to the sums --
+    yet a downstream reader who trusts `record['signed']`/`['classification']` would
+    be misled. Checking them here closes that gap.
+
+    NOTE: `signed` means a NONEMPTY `Sig:` field, NOT cryptographic signature
+    verification -- this diagnostic does not verify the signature, only its presence.
+    """
+    for r in records:
+        want_signed = bool(str(r.get("sig", "")).strip())
+        if bool(r.get("signed")) != want_signed:
+            out.append(
+                f"record {r.get('store_hash', '?')!r}: stored signed="
+                f"{r.get('signed')!r} disagrees with raw Sig (re-derived {want_signed})"
+            )
+        want_class = classify_compression(str(r.get("compression", "")))
+        if r.get("classification") != want_class:
+            out.append(
+                f"record {r.get('store_hash', '?')!r}: stored classification="
+                f"{r.get('classification')!r} disagrees with raw Compression "
+                f"(re-derived {want_class!r})"
+            )
+
+
+def verify_rederivable(agg: dict) -> dict:
     """Recompute EVERY reported aggregate FROM `agg['records']` and assert a match.
 
     This is the re-derivability oracle: the committed artifact carries the raw
     per-path records, and a reader (or `--verify-artifact`) recomputes the headline
-    from them WITHOUT trusting the stored summary. Any drift -- a hand-edited sum,
-    a stale ratio, a doctored decile -- raises RederivationError. Returns the freshly
-    re-derived aggregate on success (the headline a consumer should quote).
+    from them WITHOUT trusting the stored summary. Every reported quantity is checked:
+
+      * integer byte-sums and counts (incl. ALL exclusion counts + n_records_total)
+        and each decile's index/n/min/max, with EXACT integer equality -- the trust
+        path carries NO float and NO tolerance;
+      * the display ratios (aggregate/per-path/decile) are DERIVED from those integers
+        and asserted exactly equal to the re-derived value (a NaN/None/doctored float
+        fails the exact `!=` for free);
+      * `signed`/`classification` RE-DERIVED from raw `sig`/`compression`.
+
+    Any drift -- a hand-edited sum, a doctored decile field, a smuggled NaN, a lying
+    stored boolean -- raises RederivationError. NOTE the verifier shares
+    `_aggregate_from_records` with the producer: a fully independent second
+    implementation is out of scope for a diagnostic; the integer-exact strictness here
+    plus the `--self-test` mutation bites are what provide the re-derivability
+    assurance. Returns the freshly re-derived aggregate on success (headline to quote).
     """
     records = agg.get("records")
     if not isinstance(records, list) or not records:
@@ -490,39 +653,20 @@ def verify_rederivable(agg: dict, *, tol: float = 1e-9) -> dict:
             "aggregate carries no per-path records -- the headline is not "
             "re-derivable (this is the BLOCKER the fix cycle closes)"
         )
-    fresh = _aggregate_from_records(records)
+    try:
+        fresh = _aggregate_from_records(records)  # rejects non-integer record values
+    except ValueError as exc:
+        raise RederivationError(f"records are not aggregatable: {exc}") from exc
 
     mismatches: list[str] = []
-    for key in _REDERIVED_SCALARS:
-        want, got = agg.get(key), fresh.get(key)
-        if isinstance(want, (int, float)) and isinstance(got, (int, float)):
-            denom = max(1.0, abs(want))
-            if abs(want - got) > tol * denom:
-                mismatches.append(f"{key}: reported {want!r} != re-derived {got!r}")
-        elif want != got:
-            mismatches.append(f"{key}: reported {want!r} != re-derived {got!r}")
-
-    want_dec = agg.get("deciles_by_nar_size", [])
-    got_dec = fresh["deciles_by_nar_size"]
-    if len(want_dec) != len(got_dec):
-        mismatches.append("deciles_by_nar_size: length differs from re-derived")
-    else:
-        for wd, gd in zip(want_dec, got_dec):
-            wr, gr = (
-                wd.get("aggregate_file_over_nar_ratio"),
-                gd.get("aggregate_file_over_nar_ratio"),
-            )
-            if isinstance(wr, float) and isinstance(gr, float):
-                if abs(wr - gr) > tol * max(1.0, abs(wr)):
-                    mismatches.append(
-                        f"decile {wd.get('decile')}: reported ratio {wr!r} != "
-                        f"re-derived {gr!r}"
-                    )
-            elif wr != gr:
-                mismatches.append(
-                    f"decile {wd.get('decile')}: reported ratio {wr!r} != "
-                    f"re-derived {gr!r}"
-                )
+    for key in _REDERIVED_INT_SCALARS:
+        _cmp_int(key, agg.get(key), fresh.get(key), mismatches)
+    for key in _DERIVED_DISPLAY_FLOATS:
+        _cmp_display(key, agg.get(key), fresh.get(key), mismatches)
+    _verify_deciles(
+        agg.get("deciles_by_nar_size", []), fresh["deciles_by_nar_size"], mismatches
+    )
+    _verify_record_derivations(records, mismatches)
 
     if mismatches:
         raise RederivationError(
@@ -794,7 +938,9 @@ def break_even(inp: BreakEvenInputs) -> dict:
         numer  > 0 -> lower crossover S=numer/denom -> BREAK-EVEN ABOVE THRESHOLD
       denom == 0 (per-byte parity):
         numer  < 0 -> PEER WINS AT EVERY SIZE (size-independent latency win)
-        numer >= 0 -> NO SIZE THRESHOLD EXISTS
+        numer == 0 -> NO SIZE THRESHOLD EXISTS, but the peer TIES at every size
+                       (identical total time -- neither wins; not a loss)
+        numer  > 0 -> NO SIZE THRESHOLD EXISTS (peer loses at every size)
       denom < 0 (peer SLOWER per byte -- the raw-NAR regime):
         numer >= 0 -> NO SIZE THRESHOLD EXISTS (loses per byte AND on latency)
         numer  < 0 -> peer's latency lead is eaten by size: it wins BELOW an
@@ -832,6 +978,21 @@ def break_even(inp: BreakEvenInputs) -> dict:
         "break_even_nar_size_bytes_uncompressed_nar": None,
     }
 
+    # denom==0 AND numer==0: per-byte parity AND equal latency. The inequality
+    # S*denom > numer is 0 > 0 (false) at EVERY size, but so is the strict loss --
+    # total times are IDENTICAL, so the peer TIES at every size. Reporting this as a
+    # loss (as the older text did) is wrong: no crossover exists, but it is a draw.
+    ties_every = {
+        "verdict": NO_THRESHOLD,
+        "interpretation": (
+            "per-byte parity AND equal latency: the peer TIES the CDN at every size "
+            "(identical total fetch time). No crossover exists, but this is a draw, "
+            "not a loss -- neither side has an edge at any NAR size."
+        ),
+        "threshold_kind": "ties_at_every_size",
+        "break_even_nar_size_bytes_uncompressed_nar": None,
+    }
+
     if denom > 0:
         threshold = numer / denom
         if numer <= 0:
@@ -865,6 +1026,8 @@ def break_even(inp: BreakEvenInputs) -> dict:
                 threshold_kind="wins_at_every_size",
                 break_even_nar_size_bytes_uncompressed_nar=None,
             )
+        elif numer == 0:
+            result.update(ties_every)
         else:
             result.update(no_threshold)
     else:  # denom < 0: peer slower per byte
@@ -1086,10 +1249,27 @@ class Report:
         if violations:
             raise ValueError("UNIT VIOLATIONS: " + "; ".join(violations))
         assert_cannot_select_policy(d)
-        # A published report must be re-derivable from its own committed records:
-        # never emit a headline that disagrees with the raw it carries.
-        agg = (self.sample or {}).get("aggregate")
-        if isinstance(agg, dict):
+        # FAIL-CLOSED publication. A report with NO sample block (e.g. a
+        # shaped-link-only run) is fine; but the MOMENT a sample block is present it
+        # MUST carry a passing gate AND an aggregate that re-derives from its own
+        # records. Never silently skip the check when the aggregate is missing/
+        # malformed (the old `if isinstance(agg, dict)` quietly published a
+        # gate-failed or aggregate-less block).
+        sample = self.sample or {}
+        if sample:
+            if "gate_passed" not in sample or not sample.get("gate_passed"):
+                raise ValueError(
+                    "refusing to publish: sample block present but its gate did not "
+                    f"pass (gate_passed={sample.get('gate_passed')!r}, "
+                    f"gate_violations={sample.get('gate_violations')!r})"
+                )
+            agg = sample.get("aggregate")
+            if not isinstance(agg, dict):
+                raise ValueError(
+                    "refusing to publish: sample block present but carries no "
+                    f"aggregate dict (got {type(agg).__name__}) -- fail-closed"
+                )
+            # Never emit a headline that disagrees with the raw records it carries.
             verify_rederivable(agg)
         return d
 
@@ -1211,6 +1391,135 @@ def self_test() -> int:
     except RederivationError:
         pass
 
+    # --- AC#1 fail-closed: the 11 PINNED mutations codex proved were PUBLISHED by the
+    # old finalizer. Each takes a VALID aggregate/report, applies one mutation, and
+    # MUST be REJECTED (by verify_rederivable or the fail-closed finalize path). This
+    # battery is the acceptance gate for the 2nd fix cycle: if any is accepted, the
+    # re-derivability guarantee is a FALSE ASSURANCE again.
+    def _copy(x):
+        return json.loads(json.dumps(x))  # deep copy; round-trips NaN as needed
+
+    def _verify_accepts(a) -> bool:
+        try:
+            verify_rederivable(a)
+            return True
+        except Exception:
+            return False
+
+    def _finalize_accepts(block) -> bool:
+        try:
+            Report(sample=block).finalize()
+            return True
+        except Exception:
+            return False
+
+    base_agg = compressed_ratio_aggregate(_good_samples())
+    base_block = build_sample_block(_good_samples(), min_paths=20, min_span=100.0)
+    nan = float("nan")
+
+    def _mut_verify(nbit, desc, mutate) -> None:
+        a = _copy(base_agg)
+        mutate(a)
+        if _verify_accepts(a):
+            failures.append(
+                f"mutation #{nbit} ({desc}) was ACCEPTED by verify_rederivable -- "
+                "fail-open; it must be REJECTED"
+            )
+
+    def _mut_finalize(nbit, desc, block) -> None:
+        if _finalize_accepts(block):
+            failures.append(
+                f"mutation #{nbit} ({desc}) was ACCEPTED by finalize -- fail-open; "
+                "the CLI publication path must REFUSE it"
+            )
+
+    # 1. a 1-byte increase to the reported NarSize sum (integer-exact, no tolerance).
+    _mut_verify(
+        1,
+        "sum_nar +1 byte",
+        lambda a: a.__setitem__(
+            "sum_nar_size_bytes_uncompressed_nar",
+            a["sum_nar_size_bytes_uncompressed_nar"] + 1,
+        ),
+    )
+    # 2. stored aggregate ratio = NaN.
+    _mut_verify(
+        2,
+        "aggregate ratio = NaN",
+        lambda a: a.__setitem__("aggregate_file_over_nar_ratio", nan),
+    )
+    # 3. a decile ratio = NaN.
+    _mut_verify(
+        3,
+        "decile ratio = NaN",
+        lambda a: a["deciles_by_nar_size"][0].__setitem__(
+            "aggregate_file_over_nar_ratio", nan
+        ),
+    )
+    # 4. a record FileSize = NaN (a float is unrepresentable in an integer byte count).
+    _mut_verify(
+        4,
+        "record FileSize = NaN",
+        lambda a: a["records"][0].__setitem__("file_size_bytes_compressed_wire", nan),
+    )
+    # 5. a decile n = 999.
+    _mut_verify(
+        5, "decile n = 999", lambda a: a["deciles_by_nar_size"][0].__setitem__("n", 999)
+    )
+    # 6. a false decile minimum.
+    _mut_verify(
+        6,
+        "false decile minimum",
+        lambda a: a["deciles_by_nar_size"][0].__setitem__(
+            "nar_size_min_bytes_uncompressed_nar", 1
+        ),
+    )
+    # 7. a changed decile index.
+    _mut_verify(
+        7,
+        "changed decile index",
+        lambda a: a["deciles_by_nar_size"][0].__setitem__("decile", 99),
+    )
+    # 8. an exclusion count = 999 (each of the four, none were checked before).
+    for field_name in (
+        "n_uncompressed_excluded",
+        "n_unknown_compression_excluded",
+        "n_unsigned_excluded",
+        "n_records_total",
+    ):
+        _mut_verify(
+            8, f"{field_name} = 999", lambda a, f=field_name: a.__setitem__(f, 999)
+        )
+    # 9. a report with a VALID aggregate but gate_passed:false -> finalize must refuse.
+    blk9 = _copy(base_block)
+    blk9["gate_passed"] = False
+    blk9["gate_violations"] = ["injected: pretend the gate failed"]
+    _mut_finalize(9, "valid aggregate but gate_passed:false", blk9)
+    # 10. a failed-gate block WITHOUT any aggregate -> finalize must refuse.
+    _mut_finalize(
+        10,
+        "failed-gate block without aggregate",
+        {"gate_passed": False, "gate_violations": ["no aggregate at all"]},
+    )
+    # 11. stored signed/classification disagreeing with raw sig/compression.
+    _mut_verify(
+        11,
+        "stored signed disagrees with raw Sig",
+        lambda a: a["records"][0].__setitem__("signed", False),
+    )
+    _mut_verify(
+        11,
+        "stored classification disagrees with raw Compression",
+        lambda a: a["records"][0].__setitem__("classification", "uncompressed"),
+    )
+    # And the fail-closed finalize path ACCEPTS a genuinely clean report (not a
+    # blanket refusal): proves the refusals above are discriminating, not vacuous.
+    if not _finalize_accepts(_copy(base_block)):
+        failures.append(
+            "fail-closed finalize false-positive: a clean, gate-passed report with a "
+            "re-derivable aggregate was REFUSED publication"
+        )
+
     # --- AC#3: break-even across ALL FOUR latency quadrants, each pinned.
     MiB = 1024**2
     quadrants = [
@@ -1245,6 +1554,16 @@ def self_test() -> int:
         # denom==0 (per-byte parity) & numer<0: size-independent latency win.
         # ratio/up=0.05, 1/peer=0.05 -> denom=0; numer=-0.5 -> every size.
         ("parity-wins-every", 0.5, 10.0, 20.0, 0.6, 0.1, PEER_WINS_EVERY, None),
+        # denom>0 & numer==0 (boundary): peer faster/byte, equal latency -> every size.
+        # ratio/up=0.05, 1/peer=0.01 -> denom=0.04>0; cdn_lat==disc -> numer==0.
+        ("fast-peer-equal-latency", 0.5, 10.0, 100.0, 0.1, 0.1, PEER_WINS_EVERY, None),
+        # denom==0 & numer==0 (boundary): per-byte parity AND equal latency -> the peer
+        # TIES at every size (NOT a loss). ratio/up=0.05, 1/peer=0.05 -> denom==0;
+        # cdn_lat==disc -> numer==0.
+        ("parity-ties-every", 0.5, 10.0, 20.0, 0.3, 0.3, NO_THRESHOLD, None),
+        # denom==0 & numer>0 (boundary): per-byte parity but peer slower to start ->
+        # NO SIZE THRESHOLD (loses at every size). numer=0.6-0.1=0.5>0.
+        ("parity-loses-every", 0.5, 10.0, 20.0, 0.1, 0.6, NO_THRESHOLD, None),
     ]
     for name, ratio, up, peer, cdn_lat, disc, want_v, want_t in quadrants:
         r = break_even(
@@ -1274,6 +1593,30 @@ def self_test() -> int:
                 failures.append(
                     f"quadrant {name}: expected threshold {want_t}, got {thr!r}"
                 )
+
+    # denom==0 & numer==0 and denom==0 & numer>0 BOTH report NO_THRESHOLD, but they
+    # mean different things: the first is a DRAW (ties at every size), the second a
+    # LOSS. Pin that the interpretation TEXT distinguishes them (the old code called
+    # the tie a loss).
+    tie = break_even(BreakEvenInputs(0.5, 10.0, 20.0, 0.3, 0.3))
+    if (
+        tie.get("threshold_kind") != "ties_at_every_size"
+        or "tie" not in tie["interpretation"].lower()
+    ):
+        failures.append(
+            "break-even tie case (denom==0 & numer==0): interpretation must say the "
+            f"peer TIES at every size, got kind={tie.get('threshold_kind')!r} / "
+            f"{tie['interpretation']!r}"
+        )
+    loses = break_even(BreakEvenInputs(0.5, 10.0, 20.0, 0.1, 0.6))
+    if (
+        "tie" in loses["interpretation"].lower()
+        or "loses" not in loses["interpretation"].lower()
+    ):
+        failures.append(
+            "break-even loss case (denom==0 & numer>0): interpretation must say the "
+            f"peer LOSES at every size (not a tie), got {loses['interpretation']!r}"
+        )
 
     # --- AC#2: loopback-label refusal (red-green).
     # Loopback-looking metrics tagged wan_shaped MUST raise.
@@ -1383,7 +1726,10 @@ def self_test() -> int:
         return 1
     print(
         "SELF-TEST OK: compression-exclusion, unknown-compression, signed-admission, "
-        "re-derivability, break-even-quadrants, loopback-label, unit-gate, "
+        "re-derivability (all 11 pinned tamper mutations bite: sum-drift, ratio/decile/"
+        "record NaN, decile n/min/index, exclusion counts, gate_passed:false, "
+        "aggregate-less block, lying signed/classification), break-even-quadrants "
+        "(incl. numer==0 / tie / loss boundaries), loopback-label, unit-gate, "
         "policy-guard, span-gate and fail-closed-publish oracles all bite"
     )
     return 0
@@ -1394,12 +1740,15 @@ def self_test() -> int:
 # ---------------------------------------------------------------------------
 
 
-def verify_artifact(path: Path) -> int:
+def verify_artifact(path: Path, *, min_paths: int, min_span: float) -> int:
     """Reload a committed artifact and RE-DERIVE the headline from its records.
 
     This is the auditor's entrypoint: it trusts none of the stored summary, finds
     the sample aggregate (or accepts a bare aggregate), recomputes every quantity
-    from `records`, and prints the re-derived headline. Nonzero on any drift."""
+    from `records`, and RE-RUNS the canonical admission gate (`sample_gate`) on the
+    re-derived aggregate -- so the audit checks not just arithmetic consistency but
+    that the committed sample still MEETS the admission bar (>= min_paths signed
+    compressed paths, spanning the size axis). Nonzero on any drift or gate fail."""
     doc = json.loads(path.read_text())
     agg = doc
     if isinstance(doc, dict) and "cdn_wire_vs_peer_raw_sample" in doc:
@@ -1410,6 +1759,10 @@ def verify_artifact(path: Path) -> int:
         fresh = verify_rederivable(agg)
     except RederivationError as exc:
         log(f"RE-DERIVATION FAILED for {path}: {exc}")
+        return 1
+    gate = sample_gate(fresh, min_paths=min_paths, min_span=min_span)
+    if gate:
+        log(f"CANONICAL ADMISSION GATE FAILED for {path}: {gate}")
         return 1
     log(
         f"RE-DERIVED from {path}: n={fresh['n_compressed']} admitted paths, "
@@ -1478,7 +1831,11 @@ def main() -> int:
         return self_test()
 
     if args.verify_artifact:
-        return verify_artifact(Path(args.verify_artifact))
+        return verify_artifact(
+            Path(args.verify_artifact),
+            min_paths=args.min_paths,
+            min_span=args.min_span,
+        )
 
     report = Report()
 
@@ -1568,9 +1925,31 @@ def main() -> int:
                 )
             )
             r["scenario"] = name
-            # Provenance: every input except (optionally) the shaped peer bandwidth
-            # is assumed, not measured by this script.
-            r["inputs"]["assumed_not_measured_here"] = not peer_measured
+            # HONEST per-input provenance. Even the "measured_shaped_peer" scenario
+            # measures ONLY peer bandwidth: upstream bandwidth and BOTH latencies are
+            # still assumed. So a single scenario-level "assumed_not_measured_here"
+            # bool is a lie unless it is granular. `assumed_not_measured_here` is TRUE
+            # for every scenario (all of them carry assumed inputs); the per-input map
+            # says exactly which input is measured vs assumed.
+            per_input = {
+                "upstream_bandwidth": "assumed",
+                "peer_bandwidth": "measured" if peer_measured else "assumed",
+                "cdn_latency_s": "assumed",
+                "discovery_latency_s": "assumed",
+            }
+            r["inputs"]["assumed_not_measured_here"] = any(
+                v == "assumed" for v in per_input.values()
+            )  # always True: no scenario is fully measured
+            r["inputs"]["input_measured_or_assumed"] = per_input
+            # Units are NOT uniform: the assumed bandwidths are binary MiB/s constants
+            # (x1024**2 B/s); the measured peer bandwidth is derived from the shaped
+            # arm's DECIMAL Mbit/s (x1e6/8 B/s) -- do not claim they share a unit basis.
+            peer_units = (
+                "measured peer bandwidth is derived from the shaped arm's decimal "
+                "Mbit/s (x1e6/8 -> B/s)"
+                if peer_measured
+                else "peer bandwidth is a binary MiB/s constant (x1024**2 -> B/s)"
+            )
             r["input_provenance"] = {
                 "upstream_bandwidth": _assumed,
                 "cdn_latency_s": "ASSUMED (illustrative)",
@@ -1580,7 +1959,10 @@ def main() -> int:
                     if peer_measured
                     else "ASSUMED (illustrative)"
                 ),
-                "units": "all bandwidths are bytes/s of MiB/s constants (1024**2)",
+                "units": (
+                    "assumed upstream/peer bandwidths are binary MiB/s constants "
+                    f"(x1024**2 -> B/s); {peer_units}"
+                ),
             }
             report.break_even_scenarios.append(r)
 
