@@ -5,7 +5,7 @@ status: In Progress
 assignee:
   - '@mped'
 created_date: '2026-08-10 08:43'
-updated_date: '2026-08-13 22:14'
+updated_date: '2026-08-14 05:34'
 labels:
   - wave-2b
 dependencies:
@@ -92,4 +92,38 @@ GOTCHA fed forward: the 3.6x/0.278 legacy asymmetry is a NARROW-SAMPLE artifact 
 paths only). The honest decile-spanning ratio is ~0.326 (3.07x). Anyone re-deriving the
 "peer must sustain X MB/s" threshold must use the broad ratio, not 0.278, or they overstate
 the peer deficit by ~18%.
+
+DEEP GATE 2026-08-14 = NO-GO for Done (qa GO / mped GO-WITH-FIXES / codex NO-GO-as-canonical; NOT a store-integrity issue — TASK-94 ships no bytes). The numbers are CONFIRMED reproducible (codex independently got ratio 0.3255628680, 3.07x, shaped 9.2/10.7/11.3 MB/s; raw peer loses at every size in the measured latency quadrant). But the ARTIFACT is not yet an acceptable canonical baseline for TASK-99/198. Unticked AC#1/#3/#4 pending the fix cycle. Fix set (dispatched to a fresh implementer): (1) BLOCKER re-derivability — the report/--json-out must RETAIN per-path records (store_hash,Compression,FileSize,NarSize,Sig) and a finalizer must recompute every aggregate from them; commit the raw sample under evidence/task-94/<rev>/; (2) reframe the headline — codex's rerun shows the current >10MiB subset aggregates to 0.324 not 0.278 and the legacy cohort was xz vs current all-zstd, so '0.326 corrects the size-only 0.278' is codec/cohort-confounded and unsupported: state it as 'a broader current zstd seed-closure convenience sample estimates 0.3256', not a population ratio nor a correction; fix docstrings :19/:225/:555 that still assert the legacy 3.6x/0.278 as present fact; drop 'all 10 deciles populated' as a strength (post-hoc equal-count cut is near-tautological; the span gate does the real work); (3) FAIL-CLOSED admission — enforce/count 'signed', don't classify unknown-compression as compressed, and make a failed sample_gate exit nonzero with NO published aggregate (self-test must prove the CLI refuses to publish, not just that sample_gate returns nonempty); (4) fix break_even() denom<=0: when numer<0 (discovery<cdn latency) the peer wins at every size (denom==0) or below an upper crossover (denom<0) — handle the numer sign; add oracle cases for the other latency quadrants; (5) MiB/MB consistency on the 21/5/125 constants + the 67.6 headline; add inline provenance (source: profile_p2p/task-35) + emit assumed_not_measured_here:true on scenario inputs; (6) shaped_link_xfer.py receiver must check got==expect before acking (a truncated transfer currently reports success) and shaped_link.py must verify RECV_DONE bytes==expect — strengthens AC#4 non-vacuity (also improves TASK-70's primitive); (7) WARN when zero Compression:none fixtures found (load_fixture_uncompressed silent-empty); (8) soften diagnostic_uncompressed / assert_cannot_select_policy docstring — it's a producer-side tripwire, not a barrier against downstream derivation.
+
+DEEP-GATE FIX CYCLE (fresh implementer, 2026-08-14) — PLAN
+Applying the 8-point fix set. Conclusion (raw peer loses at every size in measured quadrant) STANDS; making the artifact re-derivable, the claim honestly framed, gates fail-closed.
+ F1 BLOCKER re-derivability: retain per-path records (store_hash,name,Compression,FileSize,NarSize,Sig,signed,classification) in the aggregate; independent verify_rederivable() recomputes sum_file/sum_nar/ratio/deciles from records + asserts match (RederivationError bite). --verify-artifact CLI reloads committed JSON + re-derives headline. Commit real >=200 sample + shaped log under evidence/task-94/<rev>/.
+ F2 reframe: 0.3256 = broad current zstd seed-closure convenience-sample ESTIMATE, not a population ratio, not a correction of legacy xz 0.278 (codec/cohort-confounded). Fix docstrings :19/:225/:555. Drop 'deciles populated' as a strength; credit span gate.
+ F3 fail-closed: admission=compressed(known codec)+signed; unknown/missing compression -> own bucket (excluded); failed sample_gate raises SampleGateError -> main exits nonzero, NO published aggregate; self-test proves the pipeline REFUSES to publish.
+ F4 break_even quadrants: denom<=0 branch handle numer sign (denom==0&numer<0 -> peer wins every size; denom<0&numer<0 -> peer wins BELOW upper crossover). Pin new oracle cases.
+ F5 MiB/MB: constants are MiB/s; relabel scenarios *MiBps, headline in MiB/s; inline provenance (profile_p2p/task-35, ASSUMED) + assumed_not_measured_here on scenario inputs.
+ F6 shaped receiver counter: xfer recv checks got==expect (ack 'E'/short on mismatch); parse RECV_DONE; run_arm asserts recv_bytes==total. Re-run shaped_link --self-test.
+ F7 load_fixture_uncompressed WARN on missing manifest / zero none-fixtures.
+ F8 soften diagnostic_uncompressed docstring: producer-side tripwire, not a barrier against downstream derivation.
+
+DEEP-GATE FIX CYCLE — DONE (2026-08-14). Code @ 17db75e, evidence @ 65a6e91.
+All 8 fixes landed; conclusion UNCHANGED (raw peer loses at every size in the measured quadrant).
+
+RE-DERIVED headline (from committed records, NOT self-reported):
+  evidence/task-94/17db75e/sample.json -> FileSize/NarSize = 0.3255628680152017 (3.0716x)
+  reproduce: python3 scripts/peer_wire_baseline.py --verify-artifact evidence/task-94/17db75e/sample.json
+  Matches codex's independent 0.3255628680. 220 admitted (signed+known-codec) paths; 2 Compression:none excluded; 0 unknown / 0 unsigned; NarSize span ~55806x, all deciles populated.
+
+Shaped arm (100mbit/20ms): 8/20/40 MiB -> 73.9/85.6/90.3 mbit, RTT ~48ms; loopback control ~38 Gbit @ 0.1ms; sender(SEND_DONE)+receiver(RECV_DONE status=ok) counters in the committed transcripts, delivered==expected every size. No netns leak (ip netns list empty post-run).
+
+Break-even: home-uplink 5 MiBps and the MEASURED shaped peer both -> NO SIZE THRESHOLD EXISTS; 125 MiBps LAN peer -> BREAK-EVEN ABOVE THRESHOLD. CDN/peer bw ASSUMED (profile_p2p/task-35), flagged assumed_not_measured_here per scenario.
+
+GATE (bounded, nix develop): peer_wire --self-test PASS (10 oracles incl new re-derivability/fail-closed/quadrant); shaped_link --self-test PASS (6 mut + 4 trunc + delivery-counter); ruff check clean; ruff format --check clean; py_compile OK; just independence GREEN. New oracles proven RED-under-mutation (monkeypatch demo): quadrant-collapse, rederive-noop, fail-open-publish, unknown-as-compressed, delivery-noop each turn the self-test RED.
+
+Re-ticked AC#1 (>=200 signed, re-derivable artifact committed, uncompressed excluded), AC#3 (break-even correct across quadrants + pinned bites), AC#4 (distinct unit fields + non-vacuous provider+receiver counters). AC#2/#5 unchanged.
+
+HONEST LIMITS / gotchas fed forward:
+ - 0.3256 is a CONVENIENCE-SAMPLE estimate (BFS from 4 seeds), NOT a population ratio; do not compare to legacy xz 0.278 (codec+cohort confounded).
+ - break-even bandwidths/latencies are ASSUMED, not re-measured here; only the shaped peer bw is measured (over an EMULATED link: mean RTT + rate cap, no loss/jitter/NAT — see shaped_link HONEST_LIMITS).
+ - unknown-codec classification uses a KNOWN-codec allowlist {xz,zstd,bzip2,gzip,br,lzip,lz4}; a real future codec outside it would be conservatively excluded+counted (fail-closed), not silently folded in.
 <!-- SECTION:NOTES:END -->
