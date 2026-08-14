@@ -10,14 +10,28 @@
 
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use daemon_core::content_id::Blake3Digest;
 use daemon_core::{
     AvailabilityIndex, NarDumper, NarHashKey, NodeId, NullAnnounce, NullStore,
     RegularFileNarDumper, StorePath,
 };
-use daemon_libp2p::{Libp2pCatalogProbe, verify_store_provisions};
-use fabric_libp2p::{CatalogNarSupplier, Libp2pNarSupplier};
+use daemon_libp2p::{
+    LanShare, Libp2pCatalogProbe, Libp2pSourceConfig, announce_store_provisions,
+    build_libp2p_provider_source, verify_store_provisions,
+};
+use fabric_libp2p::{
+    CatalogNarSupplier, Libp2pFabric, Libp2pNarSupplier, MemoryNarSupplier, Multiaddr, NodeConfig,
+};
+use peer_fabric::{AnnounceBudget, DiscoveryBudget, PeerFabric, SafetyEnvelope, ServeBudget};
+
+fn unix_now() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("clock after epoch")
+        .as_secs()
+}
 
 /// A unique-per-run temp path (no external tempdir dep; mirrors the fabric-libp2p tests).
 fn unique_temp(stem: &str) -> PathBuf {
@@ -161,4 +175,155 @@ fn catalog_supplier_serves_a_verified_store_path_and_only_that() {
     );
 
     let _ = std::fs::remove_file(&nar_path);
+}
+
+/// Bring a raw fabric up on an ephemeral loopback port; return it + its dial address (mirrors the
+/// seed-path shipped-announce test's helper).
+async fn start_fabric(fabric: Libp2pFabric) -> (Arc<Libp2pFabric>, Multiaddr) {
+    fabric
+        .handle()
+        .listen("/ip4/127.0.0.1/tcp/0".parse().unwrap())
+        .await
+        .expect("listen bound");
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let addr = loop {
+        if let Some(addr) = fabric.handle().listen_addrs().await.into_iter().next() {
+            break addr;
+        }
+        assert!(Instant::now() < deadline, "no listen address bound in time");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    };
+    (Arc::new(fabric), addr)
+}
+
+/// SHIPPED-ANNOUNCE regression oracle (codex TASK-191 finding): drive the STORE announce SSOT
+/// `announce_store_provisions` over a real DHT-joined provider and assert (a) a VERIFIED provision
+/// announces exactly one record whose `content` is the index's TASK-56-verified digest - never the
+/// operator's word - and (b) the verify->announce COMPOSITION mints NO record for a
+/// mis-registered/quarantined key (the shape a refused `verify_store_provisions` yields). This
+/// catches a future direct-sign regression in the announce path that the by-construction type gate
+/// alone would not surface as a behaviour.
+///
+/// MUTATION bites: (a) make `announce_store_records` sign from a source other than the verified
+/// `provision.content` -> the content assertion goes RED; (b) make `verify_store_provisions` return
+/// `Ok` on a mismatch -> the `is_err()` assertion goes RED and the empty-announce becomes a false
+/// record.
+#[tokio::test(flavor = "multi_thread")]
+async fn shipped_store_announce_carries_verified_content_and_refuses_quarantined() {
+    let scope = "task194-store-announce-verify";
+
+    // ---- boot node: the provider's DHT entry point (holds no content) ----
+    let (bootstrap, boot_addr) = start_fabric(
+        Libp2pFabric::start(NodeConfig {
+            identity_seed: [11u8; 32],
+            network_scope: scope.to_string(),
+        })
+        .expect("bootstrap starts"),
+    )
+    .await;
+    let boot_peer = bootstrap.peer_id();
+
+    // ---- provider fabric joined through the shipped builder (the supplier is irrelevant to the
+    // announce; it only gives us an announcer-capable DHT-joined fabric, as the seed test does) ----
+    let body = b"nix-archive-1 raw NAR regenerated on demand from a real store path".to_vec();
+    let true_key = NarHashKey::from_raw_nar(&body);
+    let expected_content = Blake3Digest::from_raw_nar(&body);
+
+    let cfg = Libp2pSourceConfig {
+        identity_seed: [12u8; 32],
+        network_scope: scope.to_string(),
+        listen: Some("/ip4/127.0.0.1/tcp/0".parse().unwrap()),
+        bootstrap: vec![(boot_peer, boot_addr)],
+        provider_addrs: vec![],
+        discovery_budget: DiscoveryBudget::new(Duration::from_secs(10), 32),
+        envelope: SafetyEnvelope::default(),
+        state_dir: None,
+    };
+    let (fabric, _source, _raw) =
+        build_libp2p_provider_source(cfg, Arc::new(MemoryNarSupplier::new([body.clone()])))
+            .await
+            .expect("production provider builder starts a serving fabric joined to the DHT");
+    let _serve = fabric
+        .server()
+        .expect("provider fabric exposes a serve axis")
+        .serve(ServeBudget::default())
+        .await
+        .expect("serve gate installs");
+    let budget = AnnounceBudget::new(Duration::from_secs(10), 20);
+
+    // --- HONEST: a store path registered under its TRUE NarHash verifies, and the shipped announce
+    // path publishes ONE record whose content is the VERIFIED digest. ---
+    let nar_path = unique_temp("announce-verified.nar");
+    std::fs::write(&nar_path, &body).unwrap();
+    let index = AvailabilityIndex::open(
+        NodeId::from_bytes([0u8; 32]),
+        Arc::new(RegularFileNarDumper) as Arc<dyn NarDumper>,
+        Arc::new(NullStore),
+        Arc::new(NullAnnounce),
+    )
+    .expect("index opens");
+    index
+        .register(true_key, StorePath::new(&nar_path))
+        .expect("register");
+    let provisions = verify_store_provisions(&index, &[true_key]).expect("verifies");
+    let records = announce_store_provisions(
+        &fabric,
+        [12u8; 32],
+        &provisions,
+        LanShare::operator_assembled(),
+        3600,
+        unix_now(),
+        &budget,
+    )
+    .await
+    .expect("a verified provision announces on the shipped store path");
+    assert_eq!(records.len(), 1, "one verified provision -> one record");
+    assert_eq!(
+        records[0].content, expected_content,
+        "the announced record carries the index's VERIFIED digest, not the operator's word"
+    );
+
+    // --- QUARANTINE: a path registered under a WRONG key is refused by verify, so the shipped
+    // verify->announce composition mints NO record (no false claim on the DHT). ---
+    let wrong_key = NarHashKey::from_raw_nar(b"totally different bytes -> a different NarHash");
+    assert_ne!(wrong_key, true_key);
+    let mismatch_path = unique_temp("announce-mismatch.nar");
+    std::fs::write(&mismatch_path, &body).unwrap();
+    let mismatch_index = AvailabilityIndex::open(
+        NodeId::from_bytes([0u8; 32]),
+        Arc::new(RegularFileNarDumper) as Arc<dyn NarDumper>,
+        Arc::new(NullStore),
+        Arc::new(NullAnnounce),
+    )
+    .expect("index opens");
+    mismatch_index
+        .register(wrong_key, StorePath::new(&mismatch_path))
+        .expect("register (the mis-binding is caught at verify, not register)");
+    let refused = verify_store_provisions(&mismatch_index, &[wrong_key]);
+    assert!(
+        refused.is_err(),
+        "a mis-registered store path must be quarantined by verify, never announced: {refused:?}"
+    );
+    let none = refused.unwrap_or_default();
+    let records = announce_store_provisions(
+        &fabric,
+        [12u8; 32],
+        &none,
+        LanShare::operator_assembled(),
+        3600,
+        unix_now(),
+        &budget,
+    )
+    .await
+    .expect("announcing an empty (verify-refused) provision set is Ok");
+    assert!(
+        records.is_empty(),
+        "a quarantined key mints NO ProviderRecord on the shipped store announce path"
+    );
+
+    // Fabrics clean up on drop; holding `bootstrap` kept the DHT entry point alive above.
+    drop(fabric);
+    drop(bootstrap);
+    let _ = std::fs::remove_file(&nar_path);
+    let _ = std::fs::remove_file(&mismatch_path);
 }
