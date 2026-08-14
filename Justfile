@@ -78,6 +78,10 @@ lint: _toolchain _python independence
     ruff format --check scripts
     "${NIX_P2P_PYTHON}/bin/python3" scripts/check-source-guard.py
     "${NIX_P2P_PYTHON}/bin/python3" scripts/check-lock-sources.py
+    # TASK-103 AC#9: the shipped libp2p discovery path must be kad-exclusive (no LAN/tracker
+    # substitute). --self-test first proves the guard bites, then the real scan must pass.
+    "${NIX_P2P_PYTHON}/bin/python3" scripts/check-discovery-no-shortcut.py --self-test
+    "${NIX_P2P_PYTHON}/bin/python3" scripts/check-discovery-no-shortcut.py
 
 # Assert daemon and testproxy stay strictly separated (PRD round 5/6).
 independence: _toolchain
