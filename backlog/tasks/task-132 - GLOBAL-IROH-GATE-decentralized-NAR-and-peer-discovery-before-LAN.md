@@ -4,7 +4,7 @@ title: GLOBAL-IROH GATE decentralized NAR and peer discovery before LAN
 status: To Do
 assignee: []
 created_date: '2026-08-11 05:31'
-updated_date: '2026-08-13 20:39'
+updated_date: '2026-08-14 18:22'
 labels:
   - iroh
   - discovery
@@ -49,4 +49,6 @@ Mandatory decentralized qualification gate. TASK-101 tracker artifacts may be at
 TASK-162 (64d0779) landed the production libp2p CONSUMER config path (build_libp2p_nar_source from Libp2pSourceConfig; CLI --libp2p-bootstrap/-provider-addr/-listen/-scope/-identity-seed), proven by an in-process integration test through the real serving stack (discover via kad NOT injected -> fetch -> gate-1 BLAKE3 -> serve byte-identical). This is the consumer half of the cold decentralized journey. Still injected per TASK-159: provider byte-transfer dial address (node_locator() is None) - the DISCOVERY is decentralized, the DIAL is out-of-band. A libp2p SERVING daemon from the real catalog is not yet CLI-exposed (TASK-146).
 
 COMPASS backlog surgery 2026-08-13 (F3): DEFERRED-STACK. Per PRD Wave-2c the PRODUCTION stack is libp2p-PRIMARY (iroh OPTIONAL). The production-qualifying DECENTRALIZED-DISCOVERY gate is therefore the LIBP2P one — already proven by the landed routed-separate-netns e2e (TASK-179) + the multi-daemon container journey (TASK-161), both Done. This task certifies the OPTIONAL iroh global-discovery path (the tournament arm), so it must NOT consume primary-cornerstone budget: lowered to Medium and marked deferred-stack. Revisit only when the iroh transport tournament is actually run (needs the budget-freeze + evidence forge-resistance TASK-187).
+
+COHERENCE REFRAME 2026-08-14 (COMPASS flag 2 / TASK-202): this is an IROH-framed task. Under the PRD Wave-2c authority (libp2p-PRIMARY) and the now-PROVEN libp2p-kad decentralized discovery (TASK-103 MVP Done + TASK-159 resolution + TASK-179 routed netns), the PRODUCTION decentralized-discovery gate is the LIBP2P path (TASK-103 -> 191 -> 194, all Done), NOT iroh. So this task is OPTIONAL-TRANSPORT REFERENCE (an iroh comparison arm), not the production gate its title/framing implies. OWNER DECISION (COMPASS fork point, not mine to make): whether iroh remains a FUNDED transport/tournament arm at all determines this task's priority — if iroh is deprioritized under libp2p-primary, demote accordingly. Left priority unchanged pending that product call. The PRD execution-order prose (§693-734, 'GLOBAL-IROH GATE') still reads as iroh-first and needs owner-reviewed reconciliation to Wave-2c (that PRD-prose edit is TASK-202, owner-review-gated).
 <!-- SECTION:NOTES:END -->

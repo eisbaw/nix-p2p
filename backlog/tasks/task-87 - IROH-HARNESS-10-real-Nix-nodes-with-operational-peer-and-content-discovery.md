@@ -4,7 +4,7 @@ title: 'IROH HARNESS: 10+ real Nix nodes with operational peer and content disco
 status: To Do
 assignee: []
 created_date: '2026-08-10 05:55'
-updated_date: '2026-08-11 20:08'
+updated_date: '2026-08-14 18:22'
 labels:
   - wave-2b
 dependencies:
@@ -41,3 +41,9 @@ Build the production-shaped Iroh testbed before any BitTorrent implementation. R
 - [ ] #6 Passing decentralized NAR-to-provider discovery is proven with tracker and LAN disabled. Direct hold-query records its bounded candidate source and non-global limitation; disabling each selected source restores upstream behavior without turning outages into MISS.
 - [ ] #7 The manifest records exact TASK-120 configuration. LAN DNS pkarr relay hold-query and decentralized DHT mechanisms each have explicit enabled state. Optional tracker and Mainline rows run only when their artifacts exist and unsupported optional rows are never imputed or treated as Iroh qualification.
 <!-- AC:END -->
+
+## Implementation Notes
+
+<!-- SECTION:NOTES:BEGIN -->
+COHERENCE REFRAME 2026-08-14 (COMPASS flag 2 / TASK-202): this is an IROH-framed task. Under the PRD Wave-2c authority (libp2p-PRIMARY) and the now-PROVEN libp2p-kad decentralized discovery (TASK-103 MVP Done + TASK-159 resolution + TASK-179 routed netns), the PRODUCTION decentralized-discovery gate is the LIBP2P path (TASK-103 -> 191 -> 194, all Done), NOT iroh. So this task is OPTIONAL-TRANSPORT REFERENCE (an iroh comparison arm), not the production gate its title/framing implies. OWNER DECISION (COMPASS fork point, not mine to make): whether iroh remains a FUNDED transport/tournament arm at all determines this task's priority — if iroh is deprioritized under libp2p-primary, demote accordingly. Left priority unchanged pending that product call. The PRD execution-order prose (§693-734, 'GLOBAL-IROH GATE') still reads as iroh-first and needs owner-reviewed reconciliation to Wave-2c (that PRD-prose edit is TASK-202, owner-review-gated).
+<!-- SECTION:NOTES:END -->
