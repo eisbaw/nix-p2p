@@ -114,6 +114,10 @@ READY_TIMEOUT_S = 45.0
 # scopes give distinct kad protocol names, so the nodes never meet). Distinct from
 # the iroh "offline-test" endpoint scope; the two backends are independent.
 LIBP2P_SCOPE = "e2e-s7"
+# Container mount for the TASK-103 public-NAR allowlist (a dedicated NON-world-writable
+# writable dir; the store refuses a 0777 parent like /tmp). The host side is created 0755
+# and rootless-podman maps it to container-root, satisfying the store's euid/ownership check.
+LIBP2P_ALLOWLIST_MOUNT = "/var/lib/nix-p2p"
 # Base TCP port for the in-pod libp2p listeners; role i (in `_daemon_roles` order)
 # listens on LIBP2P_BASE_PORT + i. Deliberately far from the HTTP 808x band.
 LIBP2P_BASE_PORT = 37000
@@ -377,6 +381,18 @@ def build_p2p_seed_dir(
     return seed_dir, seeds
 
 
+def libp2p_allowlist_volume(scratch: Path, tag: str) -> list[str]:
+    """Create a PRIVATE (0755, NOT group/other-writable) host dir and return the podman
+    `--volume` args mounting it writable at `LIBP2P_ALLOWLIST_MOUNT` for the provider's on-disk
+    public-NAR allowlist (TASK-103). Rootless podman maps the host dir (owned by the runner) to
+    container-root, so the store's euid-ownership + not-group/other-writable parent-dir checks
+    both pass - unlike a shared 0777 /tmp, which the store rightly refuses as tamper-prone."""
+    host_dir = (scratch / f"{tag}-allowlist").resolve()
+    host_dir.mkdir(parents=True, exist_ok=True)
+    host_dir.chmod(0o755)
+    return ["--volume", f"{host_dir}:{LIBP2P_ALLOWLIST_MOUNT}"]
+
+
 def build_corrupt_nar_tree(fixtures: Fixtures, scratch: Path) -> Path:
     """Build a key-free scratch cache serving `lib` with a PRISTINE, validly
     signed narinfo but a NAR whose content bytes are corrupted - so only the
@@ -475,6 +491,7 @@ class Pod:
         state_root: Path | None = None,
         libp2p_seed_dir: Path | None = None,
         libp2p_provider_seeds: tuple[P2pSeed, ...] = (),
+        libp2p_trusted_key: str | None = None,
     ):
         self.ctx = ctx
         self.pod = f"{POD_PREFIX}-{name}"
@@ -527,6 +544,13 @@ class Pod:
         self.libp2p = bool(libp2p_provider_seeds)
         self.libp2p_seed_dir = libp2p_seed_dir
         self.libp2p_provider_seeds = tuple(libp2p_provider_seeds)
+        # TASK-103: the trusted narinfo-signing key (the fixture cache key) the PROVIDER
+        # must be handed so it can PROVE each seeded NAR public before announcing it over the
+        # bootstrapped (public) DHT. When set, `_create_libp2p` opens a real public-NAR
+        # allowlist on P, proves each seed's narinfo (mounted read-only under the seed dir)
+        # public, and routes the announce through the allowlist gate - the LEGITIMATE
+        # public-participation path that replaces the isolated-LAN refusal stopgap.
+        self.libp2p_trusted_key = libp2p_trusted_key
         # Parsed once the provider announces; the positive oracle reads it to assert C
         # was NEVER configured with it (no-injection).
         self.libp2p_provider_identity: tuple[str, str] | None = None
@@ -676,6 +700,12 @@ class Pod:
         host_dir = self.state_dir(role)
         host_dir.mkdir(parents=True, exist_ok=True)
         return ["--volume", f"{host_dir}:{DAEMON_STATE_MOUNT}"]
+
+    def _libp2p_allowlist_args(self) -> list[str]:
+        """Podman `--volume` args mounting a private host dir for P's public-NAR allowlist
+        (TASK-103). Delegates to the shared `libp2p_allowlist_volume` so the shared-pod and
+        separate-netns topologies stage it identically."""
+        return libp2p_allowlist_volume(self.ctx.scratch, self.pod)
 
     def _daemon_state_flags(self) -> list[str]:
         """Daemon CLI flags matching `_state_args`'s mount. Kept beside it so the
@@ -1041,6 +1071,28 @@ class Pod:
         seed_args: list[str] = []
         for s in self.libp2p_provider_seeds:
             seed_args += ["--libp2p-seed-nar", f"{s.nar_hash}=/srv/seed/{s.filename}"]
+        # TASK-103 PUBLIC-announce door: hand P the trusted narinfo-signing key + an on-disk
+        # allowlist, and PROVE each seeded NAR public through its signed narinfo. Only then does P
+        # legitimately announce over the bootstrapped (public) DHT - the allowlist gate replaces
+        # the isolated-LAN refusal. The allowlist lives on a DEDICATED writable mount (NOT /tmp:
+        # the store refuses a world-writable parent dir, a real anti-tamper check); the host dir is
+        # created 0755 and rootless-podman maps it to container-root, satisfying the euid check.
+        allowlist_mount = (
+            self._libp2p_allowlist_args() if self.libp2p_trusted_key else []
+        )
+        if self.libp2p_trusted_key:
+            seed_args += [
+                "--libp2p-trusted-public-key",
+                self.libp2p_trusted_key,
+                "--libp2p-public-allowlist-path",
+                f"{LIBP2P_ALLOWLIST_MOUNT}/allowlist",
+            ]
+            for s in self.libp2p_provider_seeds:
+                sh = libp2p_store_hash(s.store_path)
+                seed_args += [
+                    "--libp2p-prove-public-narinfo",
+                    f"{sh}=/srv/seed/narinfos/{sh}.narinfo",
+                ]
         run(
             [
                 self._pm,
@@ -1054,6 +1106,7 @@ class Pod:
                 PROJECT_LABEL,
                 "--volume",
                 f"{self.libp2p_seed_dir}:/srv/seed:ro",
+                *allowlist_mount,
                 *self._state_args("lp-provider"),
                 self.ctx.image,
                 "/bin/daemon",
@@ -1578,6 +1631,7 @@ class Libp2pNetnsTopology:
         expect,
         *,
         provider_loopback_only: bool = False,
+        libp2p_trusted_key: str | None = None,
     ):
         self.ctx = ctx
         self._pm = ctx.podman
@@ -1587,6 +1641,9 @@ class Libp2pNetnsTopology:
         self.provider_seeds = tuple(provider_seeds)
         self._expect = expect
         self.provider_loopback_only = provider_loopback_only
+        # TASK-103: the trusted narinfo-signing key so P can prove its seed public and announce
+        # over the bootstrapped DHT through the allowlist gate (mirrors the shared-pod path).
+        self.libp2p_trusted_key = libp2p_trusted_key
         self.provider_identity: tuple[str, str] | None = None
 
     def __enter__(self) -> "Libp2pNetnsTopology":
@@ -1738,6 +1795,27 @@ class Libp2pNetnsTopology:
         seed_args: list[str] = []
         for s in self.provider_seeds:
             seed_args += ["--libp2p-seed-nar", f"{s.nar_hash}=/srv/seed/{s.filename}"]
+        # TASK-103 PUBLIC-announce door (mirrors Pod._create_libp2p): prove each seed public via
+        # its signed narinfo (staged under /srv/seed/narinfos by _s7_seeds) before P announces.
+        # The allowlist lives on a dedicated non-world-writable mount, not /tmp.
+        allowlist_mount = (
+            libp2p_allowlist_volume(self.ctx.scratch, self.prefix)
+            if self.libp2p_trusted_key
+            else []
+        )
+        if self.libp2p_trusted_key:
+            seed_args += [
+                "--libp2p-trusted-public-key",
+                self.libp2p_trusted_key,
+                "--libp2p-public-allowlist-path",
+                f"{LIBP2P_ALLOWLIST_MOUNT}/allowlist",
+            ]
+            for s in self.provider_seeds:
+                sh = libp2p_store_hash(s.store_path)
+                seed_args += [
+                    "--libp2p-prove-public-narinfo",
+                    f"{sh}=/srv/seed/narinfos/{sh}.narinfo",
+                ]
         run(
             [
                 pm,
@@ -1753,6 +1831,7 @@ class Libp2pNetnsTopology:
                 self.IP_PROVIDER,
                 "--volume",
                 f"{self.seed_dir}:/srv/seed:ro",
+                *allowlist_mount,
                 self.ctx.image,
                 "/bin/daemon",
                 "--listen",
@@ -4332,6 +4411,31 @@ S7_TARGET = "lib"
 S7_DECOY = "app"
 
 
+def libp2p_store_hash(store_path: str) -> str:
+    """The nixbase32 store-hash component (`<hash>` in `/nix/store/<hash>-<name>`) - the
+    `<hash>.narinfo` key a provider proves public against and correlates its narinfo to."""
+    return store_path.rsplit("/", 1)[-1].split("-", 1)[0]
+
+
+def _copy_seed_narinfos(fixtures: Fixtures, seed_dir: Path, seeds) -> None:
+    """Copy each seed's SIGNED narinfo (fixture cache key) beside the raw NAR, under
+    `<seed_dir>/narinfos/<store_hash>.narinfo`, so the PROVIDER container can PROVE each
+    seeded NAR public through the trusted-key signature gate (TASK-103) before it announces
+    over the bootstrapped DHT. The operator naming a seed does NOT make it public - only this
+    trusted narinfo signature does, so the provider is handed the exact narinfo, not a
+    blanket 'trust my paths' flag."""
+    narinfos = seed_dir / "narinfos"
+    narinfos.mkdir(parents=True, exist_ok=True)
+    for s in seeds:
+        store_hash = libp2p_store_hash(s.store_path)
+        src = fixtures.cache / fx.narinfo_name(s.store_path)
+        if not src.is_file():
+            die(
+                f"_copy_seed_narinfos: no signed narinfo at {src} for seed {s.store_path}"
+            )
+        shutil.copy2(src, narinfos / f"{store_hash}.narinfo")
+
+
 def _s7_seeds(ctx: Ctx, tag: str, attr: str):
     """Materialise `attr`'s raw NAR into a fresh seed dir; return
     (seed_dir, (that_seed,), target_store_path). The provider is given exactly this
@@ -4340,6 +4444,8 @@ def _s7_seeds(ctx: Ctx, tag: str, attr: str):
     seed_dir, seeds = build_p2p_seed_dir(
         ctx.fixtures, ctx.scratch / f"s7-{tag}-seed", [attr]
     )
+    # TASK-103: also stage the seed's SIGNED narinfo so the provider can prove it public.
+    _copy_seed_narinfos(ctx.fixtures, seed_dir, seeds)
     return seed_dir, (seeds[0],), ctx.fixtures.store_path(S7_TARGET)
 
 
@@ -4366,6 +4472,7 @@ def scenario_s7_libp2p(ctx: Ctx, expect) -> None:
         expect=expect,
         libp2p_seed_dir=seed_dir,
         libp2p_provider_seeds=prov_seeds,
+        libp2p_trusted_key=fixtures.public_key,
     ) as pod:
         # -- no-injection oracle: C's argv proves it was never handed P's address --
         prov_id = (
@@ -4467,6 +4574,7 @@ def scenario_s7_libp2p_miss(ctx: Ctx, expect) -> None:
         expect=expect,
         libp2p_seed_dir=seed_dir,
         libp2p_provider_seeds=decoy_seeds,
+        libp2p_trusted_key=fixtures.public_key,
     ) as pod:
         time.sleep(LIBP2P_CONVERGE_S)
         pod.proxy_reset()
@@ -4528,6 +4636,7 @@ def scenario_s7_libp2p_netns(ctx: Ctx, expect) -> None:
         prov_seeds,
         expect,
         provider_loopback_only=False,
+        libp2p_trusted_key=fixtures.public_key,
     ) as topo:
         prov_id = topo.provider_identity[0] if topo.provider_identity else ""
         prov_listen = topo.provider_identity[1] if topo.provider_identity else ""
@@ -4592,6 +4701,7 @@ def scenario_s7_libp2p_netns(ctx: Ctx, expect) -> None:
         prov_seeds2,
         expect,
         provider_loopback_only=True,
+        libp2p_trusted_key=fixtures.public_key,
     ) as topo:
         prov_listen = topo.provider_identity[1] if topo.provider_identity else ""
         # The control's SINGLE knob: P published ONLY a loopback address.
