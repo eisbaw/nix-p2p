@@ -20,12 +20,13 @@ use daemon_core::{
 };
 use daemon_core::{
     CacheInfo, CorrelationStore, NarSource, NarinfoDiskCache, NarinfoSource, NullCorrelation,
-    RawUpstream, RunConfig, SystemClock, UpstreamHttp, run,
+    PublicNarAllowlist, RawUpstream, RunConfig, SystemClock, UpstreamHttp, run,
 };
 use daemon_libp2p::{
     LanReachability, LanShare, Libp2pCatalogProbe, Libp2pSourceConfig, announce_provider_seeds,
-    announce_store_provisions, build_libp2p_nar_source, build_libp2p_provider_source,
-    lan_isolation_or_refuse, resolve_durable_identity_seed, verify_store_provisions,
+    announce_public_provisions, announce_public_seeds, announce_store_provisions,
+    build_libp2p_nar_source, build_libp2p_provider_source, lan_isolation_or_refuse,
+    open_public_allowlist, resolve_durable_identity_seed, verify_store_provisions,
 };
 use ed25519_dalek::SigningKey;
 use fabric_libp2p::{
@@ -68,6 +69,24 @@ struct Config {
     /// Per-node durable state directory (TASK-185): when set, the fabric persists its
     /// anti-rollback floor + per-key announce sequence here and re-seeds them on restart.
     libp2p_state_dir: Option<std::path::PathBuf>,
+    // ---- libp2p PUBLIC-announce allowlist config (TASK-103/204) --------------
+    // Setting `--libp2p-public-allowlist-path` puts a PROVIDER into PUBLIC-announce mode: its
+    // seeds/store paths are announced over a (bootstrapped) public substrate ONLY after each is
+    // proven public through a trusted narinfo signature. The allowlist IS the enforcement,
+    // replacing the isolated-LAN `lan_share_or_refuse` stopgap for the bootstrapped case. This
+    // mirrors the composite `daemon` binary's wiring (TASK-204: parity, one policy source).
+    /// Trusted narinfo-signing keys in the Nix `trusted-public-keys` format
+    /// (`name:<base64 ed25519 pubkey>`, repeatable). A NAR is proven public ONLY by a signature
+    /// from one of THESE keys; the operator naming a path does not make it public.
+    libp2p_trusted_public_keys: Vec<String>,
+    /// The on-disk, MAC-integrity-protected public-NAR allowlist file. Its presence switches a
+    /// provider to PUBLIC-announce mode. The MAC key is derived from the durable identity seed.
+    libp2p_public_allowlist_path: Option<std::path::PathBuf>,
+    /// Narinfos to PROVE public at startup (`<requested-store-hash>=<path/to/narinfo>`,
+    /// repeatable): each is verified against the trusted keys and correlated to its store hash,
+    /// then its `(NarHash, NarSize)` is appended to the allowlist so the announce gate can approve
+    /// the matching seed/store path.
+    libp2p_prove_public_narinfo: Vec<(String, String)>,
 }
 
 fn parse_libp2p_peer(flag: &str, raw: &str) -> Result<(PeerId, Multiaddr), String> {
@@ -111,6 +130,29 @@ fn parse_libp2p_seed_nar(raw: &str) -> Result<(daemon_core::NarHashKey, String),
     Ok((key, path.to_string()))
 }
 
+/// Parse `--libp2p-prove-public-narinfo <requested-store-hash>=<path/to/narinfo>`: the store hash
+/// the narinfo must correlate to (its signed StorePath's `<hash>`) and the narinfo file to prove
+/// public. The store hash is an opaque correlation token the allowlist compares against the signed
+/// StorePath; only its non-emptiness is checked here. Mirrors the composite `daemon` binary.
+fn parse_prove_public_narinfo(raw: &str) -> Result<(String, String), String> {
+    let (store_hash, path) = raw.split_once('=').ok_or_else(|| {
+        format!(
+            "bad --libp2p-prove-public-narinfo {raw:?}: expected <store-hash>=<path/to/narinfo>"
+        )
+    })?;
+    if store_hash.is_empty() {
+        return Err(format!(
+            "bad --libp2p-prove-public-narinfo {raw:?}: empty store hash"
+        ));
+    }
+    if path.is_empty() {
+        return Err(format!(
+            "bad --libp2p-prove-public-narinfo {raw:?}: empty narinfo path"
+        ));
+    }
+    Ok((store_hash.to_string(), path.to_string()))
+}
+
 fn parse_config<I: IntoIterator<Item = String>>(args: I) -> Result<Config, String> {
     let mut cfg = Config {
         listen: "127.0.0.1:0".parse().unwrap(),
@@ -130,6 +172,9 @@ fn parse_config<I: IntoIterator<Item = String>>(args: I) -> Result<Config, Strin
         libp2p_provide_store: Vec::new(),
         libp2p_print_peer_address: false,
         libp2p_state_dir: None,
+        libp2p_trusted_public_keys: Vec::new(),
+        libp2p_public_allowlist_path: None,
+        libp2p_prove_public_narinfo: Vec::new(),
     };
     let mut it = args.into_iter();
     while let Some(flag) = it.next() {
@@ -181,6 +226,13 @@ fn parse_config<I: IntoIterator<Item = String>>(args: I) -> Result<Config, Strin
                 .libp2p_provide_store
                 .push(parse_libp2p_seed_nar(&value()?)?),
             "--libp2p-print-peer-address" => cfg.libp2p_print_peer_address = true,
+            "--libp2p-trusted-public-key" => cfg.libp2p_trusted_public_keys.push(value()?),
+            "--libp2p-public-allowlist-path" => {
+                cfg.libp2p_public_allowlist_path = Some(value()?.into())
+            }
+            "--libp2p-prove-public-narinfo" => cfg
+                .libp2p_prove_public_narinfo
+                .push(parse_prove_public_narinfo(&value()?)?),
             other => return Err(format!("unknown flag {other}")),
         }
     }
@@ -210,6 +262,29 @@ fn parse_config<I: IntoIterator<Item = String>>(args: I) -> Result<Config, Strin
     } else if cfg.libp2p_bootstrap.is_empty() {
         return Err(
             "a consumer requires at least one --libp2p-bootstrap <PeerId>@<multiaddr>".into(),
+        );
+    }
+    // TASK-103/204 PUBLIC-announce allowlist companion validation, MIRRORING the composite `daemon`
+    // binary so the two cannot drift. Setting the allowlist path switches a provider into
+    // PUBLIC-announce mode (the allowlist gates each announce), so its companions are inert without
+    // it, and it is inert without a provider - fail fast rather than silently ignore. A public
+    // allowlist with no trusted key can prove NOTHING public (every announce would refuse), so
+    // reject that dead-on-arrival config up front.
+    let public_allowlist_companion =
+        !cfg.libp2p_trusted_public_keys.is_empty() || !cfg.libp2p_prove_public_narinfo.is_empty();
+    if cfg.libp2p_public_allowlist_path.is_some() && !cfg.libp2p_provider {
+        return Err(
+            "--libp2p-public-allowlist-path requires --libp2p-provider; the allowlist gates a PROVIDER's public announce".into(),
+        );
+    }
+    if public_allowlist_companion && cfg.libp2p_public_allowlist_path.is_none() {
+        return Err(
+            "--libp2p-trusted-public-key / --libp2p-prove-public-narinfo require --libp2p-public-allowlist-path (they populate the on-disk public-NAR allowlist)".into(),
+        );
+    }
+    if cfg.libp2p_public_allowlist_path.is_some() && cfg.libp2p_trusted_public_keys.is_empty() {
+        return Err(
+            "--libp2p-public-allowlist-path requires at least one --libp2p-trusted-public-key; without a trusted narinfo-signing key nothing can be proven public and every announce would be refused".into(),
         );
     }
     Ok(cfg)
@@ -297,12 +372,13 @@ fn lan_share_or_refuse(cfg: &Config) -> Result<LanShare, String> {
 async fn install_provider(
     cfg: &Config,
     source_cfg: Libp2pSourceConfig,
+    allowlist: &PublicNarAllowlist,
 ) -> Result<(Arc<Libp2pFabric>, ProviderGuard), String> {
     warn_if_non_durable_provider(&source_cfg);
     let (fabric, guard) = if !cfg.libp2p_provide_store.is_empty() {
-        install_store_provider(cfg, source_cfg).await?
+        install_store_provider(cfg, source_cfg, allowlist).await?
     } else {
-        install_seed_provider(cfg, source_cfg).await?
+        install_seed_provider(cfg, source_cfg, allowlist).await?
     };
 
     if cfg.libp2p_print_peer_address {
@@ -330,6 +406,7 @@ async fn install_provider(
 async fn install_seed_provider(
     cfg: &Config,
     source_cfg: Libp2pSourceConfig,
+    allowlist: &PublicNarAllowlist,
 ) -> Result<(Arc<Libp2pFabric>, ProviderGuard), String> {
     let mut seeds: Vec<(daemon_core::NarHashKey, Vec<u8>)> =
         Vec::with_capacity(cfg.libp2p_seed_nar.len());
@@ -362,22 +439,39 @@ async fn install_seed_provider(
         .await
         .map_err(|e| format!("libp2p serve gate failed to install: {e}"))?;
 
-    // TASK-102 bootstrap guard: refuse a bootstrapped (potentially public) announce without an
-    // allowlist; an isolated LAN announce is permitted and yields the LanShare witness.
-    let lan = lan_share_or_refuse(cfg)?;
     let announce_budget = AnnounceBudget::new(Duration::from_secs(10), 20);
-    // The shared SSOT provider announce loop (durable-allocate -> sign -> announce), the same
-    // one the restart-durability test exercises (TASK-185 GB2).
-    let records = announce_provider_seeds(
-        &fabric,
-        identity_seed,
-        &seeds,
-        lan,
-        3600,
-        now_secs(),
-        &announce_budget,
-    )
-    .await?;
+    // The announce path (TASK-103/204, parity with the composite `daemon` binary): PUBLIC-announce
+    // mode (a configured allowlist) gates each seed on a trusted narinfo signature via the typed
+    // claim-consuming door and legitimately announces over a bootstrapped substrate; ISOLATED-LAN
+    // mode (no allowlist) keeps the TASK-102 `lan_share_or_refuse` stopgap, which still refuses any
+    // public-reach without a configured allowlist. The allowlist IS the enforcement for the
+    // bootstrapped case, replacing the bootstrap-emptiness proxy.
+    let records = if cfg.libp2p_public_allowlist_path.is_some() {
+        announce_public_seeds(
+            &fabric,
+            identity_seed,
+            &seeds,
+            allowlist,
+            3600,
+            now_secs(),
+            &announce_budget,
+        )
+        .await?
+    } else {
+        // The shared SSOT provider announce loop (durable-allocate -> sign -> announce), the same
+        // one the restart-durability test exercises (TASK-185 GB2).
+        let lan = lan_share_or_refuse(cfg)?;
+        announce_provider_seeds(
+            &fabric,
+            identity_seed,
+            &seeds,
+            lan,
+            3600,
+            now_secs(),
+            &announce_budget,
+        )
+        .await?
+    };
     for (record, (nar_hash, bytes)) in records.iter().zip(&seeds) {
         println!(
             "LIBP2P-SEED narhash={nar_hash} content={} content_key={} bytes={}",
@@ -404,6 +498,7 @@ async fn install_seed_provider(
 async fn install_store_provider(
     cfg: &Config,
     source_cfg: Libp2pSourceConfig,
+    allowlist: &PublicNarAllowlist,
 ) -> Result<(Arc<Libp2pFabric>, ProviderGuard), String> {
     let serve_budget = provider_serve_budget();
     let identity_seed = source_cfg.identity_seed;
@@ -471,20 +566,34 @@ async fn install_store_provider(
         }
     }
 
-    // TASK-102 bootstrap guard (see install_seed_provider): refuse a bootstrapped announce
-    // without an allowlist; an isolated LAN announce is permitted.
-    let lan = lan_share_or_refuse(cfg)?;
     let announce_budget = AnnounceBudget::new(Duration::from_secs(10), 20);
-    let records = announce_store_provisions(
-        &fabric,
-        identity_seed,
-        &provisions,
-        lan,
-        3600,
-        now_secs(),
-        &announce_budget,
-    )
-    .await?;
+    // The announce path (TASK-103/204, see install_seed_provider): PUBLIC-announce mode (a
+    // configured allowlist) gates each provision on a trusted narinfo signature via the typed
+    // claim-consuming door; ISOLATED-LAN mode keeps the TASK-102 `lan_share_or_refuse` stopgap.
+    let records = if cfg.libp2p_public_allowlist_path.is_some() {
+        announce_public_provisions(
+            &fabric,
+            identity_seed,
+            &provisions,
+            allowlist,
+            3600,
+            now_secs(),
+            &announce_budget,
+        )
+        .await?
+    } else {
+        let lan = lan_share_or_refuse(cfg)?;
+        announce_store_provisions(
+            &fabric,
+            identity_seed,
+            &provisions,
+            lan,
+            3600,
+            now_secs(),
+            &announce_budget,
+        )
+        .await?
+    };
     for (record, provision) in records.iter().zip(&provisions) {
         println!(
             "LIBP2P-PROVIDE-STORE narhash={} content={} content_key={} nar_size={}",
@@ -579,6 +688,26 @@ async fn main() -> ExitCode {
         }
     };
 
+    // Build the node's ONE public-NAR allowlist (TASK-103/204) through the SHARED wiring the
+    // composite `daemon` binary also uses, so the two binaries' publication policy cannot drift.
+    // Without `--libp2p-public-allowlist-path` this is a DISABLED allowlist (learns nothing,
+    // `contains` always false) - the pre-TASK-103 behaviour. WITH a path it opens the
+    // MAC-integrity-protected file (key from the durable identity seed) and proves each
+    // `--libp2p-prove-public-narinfo` public via the trusted-key signature gate. It is BOTH the
+    // provider announce gate (below) and the serving daemon's learn sink (RunConfig), one instance.
+    let public_allowlist = match open_public_allowlist(
+        cfg.libp2p_public_allowlist_path.as_deref(),
+        &cfg.libp2p_trusted_public_keys,
+        &source_cfg.identity_seed,
+        &cfg.libp2p_prove_public_narinfo,
+    ) {
+        Ok(a) => a,
+        Err(err) => {
+            eprintln!("daemon-libp2p: {err}");
+            return ExitCode::FAILURE;
+        }
+    };
+
     let upstream = match UpstreamHttp::new(&cfg.upstream) {
         Ok(u) => Arc::new(u.with_header_timeout(Duration::from_millis(cfg.header_timeout_ms))),
         Err(err) => {
@@ -617,7 +746,7 @@ async fn main() -> ExitCode {
     let fabric: Arc<Libp2pFabric> = if cfg.libp2p_provider {
         required_axes.push(Axis::Server);
         required_axes.push(Axis::Announcer);
-        match install_provider(&cfg, source_cfg).await {
+        match install_provider(&cfg, source_cfg, &public_allowlist).await {
             Ok((fabric, guard)) => {
                 _serve_guard = Some(guard);
                 let supplied = if cfg.libp2p_provide_store.is_empty() {
@@ -685,9 +814,10 @@ async fn main() -> ExitCode {
         envelope: SafetyEnvelope::default(),
         required_axes,
         extra_raw_serve: Vec::new(),
-        // TASK-102: disabled until trusted-public-keys + a state path are wired; a disabled
-        // allowlist learns nothing. TASK-103's DHT publish gate must consume a configured one.
-        public_allowlist: Arc::new(daemon_core::PublicNarAllowlist::disabled()),
+        // TASK-103/204: the SAME allowlist instance the provider announce gate consulted above -
+        // one source of truth (a disabled allowlist without `--libp2p-public-allowlist-path`, a
+        // populated file-backed one with it), matching the composite `daemon` binary.
+        public_allowlist,
     };
 
     let fabric_dyn: Arc<dyn PeerFabric> = fabric.clone();
@@ -777,6 +907,9 @@ mod bootstrap_guard_tests {
             libp2p_provide_store: Vec::new(),
             libp2p_print_peer_address: false,
             libp2p_state_dir: None,
+            libp2p_trusted_public_keys: Vec::new(),
+            libp2p_public_allowlist_path: None,
+            libp2p_prove_public_narinfo: Vec::new(),
         }
     }
 
@@ -827,5 +960,110 @@ mod bootstrap_guard_tests {
         let cfg = provider_cfg(Vec::new(), Vec::new(), Some(addr("/ip4/0.0.0.0/tcp/4001")));
         let err = lan_share_or_refuse(&cfg).expect_err("a wildcard/public listen must be refused");
         assert!(err.contains("TASK-103"), "must name TASK-103: {err}");
+    }
+}
+
+#[cfg(test)]
+mod public_allowlist_parity_tests {
+    //! TASK-204: the thin `daemon-libp2p` binary must expose the SAME public-NAR allowlist door
+    //! config surface + fail-closed companion validation as the composite `daemon` binary, so the
+    //! two cannot drift into two divergent publication policies. These drive the binary's OWN
+    //! `parse_config` (not a lib helper), so a missing flag or a dropped validation is caught here.
+    use super::parse_config;
+
+    const APP_NAR_HASH: &str = "sha256:0pgsb9mjmfj57w1ddmqn9z9667nwbqbnn699j1s1s99jhy6cppsm";
+    const FIXTURE_PUBKEY: &str = "nix-p2p-test-1:empdFBu9wVZG12rPKToHMOTsU1qzWzeCcLdq/KQH0JQ=";
+
+    fn args(parts: &[&str]) -> Vec<String> {
+        parts.iter().map(|s| (*s).to_string()).collect()
+    }
+
+    /// A valid PUBLIC-announce seed provider: `--libp2p-provider` + a seed + a listener + the
+    /// allowlist path + a trusted key. Parses cleanly and carries all three door fields.
+    #[test]
+    fn a_public_provider_parses_with_the_door_flags() {
+        let cfg = parse_config(args(&[
+            "--libp2p-provider",
+            "--libp2p-listen",
+            "/ip4/127.0.0.1/tcp/0",
+            "--libp2p-seed-nar",
+            &format!("{APP_NAR_HASH}=/tmp/app.nar"),
+            "--libp2p-public-allowlist-path",
+            "/tmp/nix-p2p-allowlist",
+            "--libp2p-trusted-public-key",
+            FIXTURE_PUBKEY,
+            "--libp2p-prove-public-narinfo",
+            "l30jg5xg904s62jvw5znmr682xpr993c=/tmp/app.narinfo",
+        ]))
+        .expect("a public seed provider with the allowlist door flags parses");
+        assert_eq!(
+            cfg.libp2p_public_allowlist_path.as_deref(),
+            Some(std::path::Path::new("/tmp/nix-p2p-allowlist"))
+        );
+        assert_eq!(
+            cfg.libp2p_trusted_public_keys,
+            vec![FIXTURE_PUBKEY.to_string()]
+        );
+        assert_eq!(cfg.libp2p_prove_public_narinfo.len(), 1);
+    }
+
+    /// The allowlist path gates a PROVIDER's public announce, so it is inert (and rejected) without
+    /// `--libp2p-provider` - exactly the composite binary's rule.
+    #[test]
+    fn allowlist_path_without_provider_is_refused() {
+        let Err(err) = parse_config(args(&[
+            "--libp2p-bootstrap",
+            "12D3KooWDpJ7As7BWAwRMfu1VU2WCqNjvq387JEYKDBj4kx6nXTN@/ip4/127.0.0.1/tcp/4001",
+            "--libp2p-public-allowlist-path",
+            "/tmp/nix-p2p-allowlist",
+        ])) else {
+            panic!("an allowlist path without a provider must be refused");
+        };
+        assert!(
+            err.contains("--libp2p-public-allowlist-path") && err.contains("--libp2p-provider"),
+            "the refusal must name the path flag and require --libp2p-provider: {err}"
+        );
+    }
+
+    /// The trusted-key / prove-narinfo companions POPULATE the on-disk allowlist, so they are inert
+    /// (and rejected) without the path - the composite binary's rule.
+    #[test]
+    fn companions_without_the_allowlist_path_are_refused() {
+        let Err(err) = parse_config(args(&[
+            "--libp2p-provider",
+            "--libp2p-listen",
+            "/ip4/127.0.0.1/tcp/0",
+            "--libp2p-seed-nar",
+            &format!("{APP_NAR_HASH}=/tmp/app.nar"),
+            "--libp2p-trusted-public-key",
+            FIXTURE_PUBKEY,
+        ])) else {
+            panic!("a trusted key without the allowlist path must be refused");
+        };
+        assert!(
+            err.contains("--libp2p-public-allowlist-path"),
+            "the refusal must require the allowlist path: {err}"
+        );
+    }
+
+    /// A public allowlist with no trusted key can prove NOTHING public (every announce would
+    /// refuse), so it is rejected up front - fail-closed, matching the composite binary.
+    #[test]
+    fn allowlist_path_without_a_trusted_key_is_refused() {
+        let Err(err) = parse_config(args(&[
+            "--libp2p-provider",
+            "--libp2p-listen",
+            "/ip4/127.0.0.1/tcp/0",
+            "--libp2p-seed-nar",
+            &format!("{APP_NAR_HASH}=/tmp/app.nar"),
+            "--libp2p-public-allowlist-path",
+            "/tmp/nix-p2p-allowlist",
+        ])) else {
+            panic!("an allowlist path with no trusted key must be refused");
+        };
+        assert!(
+            err.contains("--libp2p-trusted-public-key"),
+            "the refusal must require at least one trusted key: {err}"
+        );
     }
 }

@@ -23,15 +23,14 @@ use daemon::{
     DEFAULT_MAX_SERVE_DURATION, DEFAULT_MAX_SERVE_NAR_BYTES, EndpointProfile, EndpointScope,
     FallbackNarSource, FileNarSupplier, IdentitySource, InMemoryDiscovery, IrohNode,
     IrohNodeBuilder, IrohPeerAddr, IrohProviderConfig, IrohTransport, KnownPayload, KnownTransport,
-    LanReachability, LanShare, LearnOutcome, Libp2pCatalogProbe, Libp2pSourceConfig, NarCatalog,
-    NarDumper, NarHashKey, NarSource, NarinfoDiskCache, NarinfoSource, NoRawServe, NodeId,
-    NodeLocation, NodeLookupAuthorityAuthorization, NodeLookupConfig, NodePublicationCapability,
+    LanReachability, LanShare, Libp2pCatalogProbe, Libp2pSourceConfig, NarCatalog, NarDumper,
+    NarHashKey, NarSource, NarinfoDiskCache, NarinfoSource, NoRawServe, NodeId, NodeLocation,
+    NodeLookupAuthorityAuthorization, NodeLookupConfig, NodePublicationCapability,
     NodePublicationConfig, NodePublicationHandle, NullAnnounce, NullCorrelation, NullStore,
     PublicNarAllowlist, PublicationAuthorityAuthorization, RawServeDecision, RelayCapability,
-    ServeBudget, StoreHash, StorePath, SystemClock, TaskSupervisor, TransportNarSource,
-    TransportRegistry, TrustedNarKeys, UpstreamHttp, announce_provider_seeds,
-    announce_public_provisions, announce_public_seeds, announce_store_provisions,
-    build_libp2p_nar_source, build_libp2p_provider_source, derive_allowlist_mac_key,
+    ServeBudget, StorePath, SystemClock, TaskSupervisor, TransportNarSource, TransportRegistry,
+    UpstreamHttp, announce_provider_seeds, announce_public_provisions, announce_public_seeds,
+    announce_store_provisions, build_libp2p_nar_source, build_libp2p_provider_source,
     lan_isolation_or_refuse, resolve_durable_identity_seed, serve, verify_store_provisions,
 };
 use fabric_libp2p::{CatalogNarSupplier, Libp2pFabric, MemoryNarSupplier, Multiaddr, PeerId};
@@ -944,59 +943,23 @@ impl Config {
     /// does. A narinfo that does not prove public, mis-correlates to its requested store hash, or
     /// fails to persist is a LOUD startup error (fail-closed), never a silently-empty allowlist.
     fn build_public_allowlist(&self) -> Result<Arc<PublicNarAllowlist>, String> {
-        let Some(path) = &self.libp2p_public_allowlist_path else {
-            return Ok(Arc::new(PublicNarAllowlist::disabled()));
+        // Delegate to the shared SSOT wiring in `daemon-libp2p` (TASK-204), so this composite
+        // binary and the thin `daemon-libp2p` binary open + populate the allowlist through ONE
+        // code path and their publication policy cannot drift. The identity seed is resolved when
+        // the allowlist path is set (from_args resolves it whenever libp2p is requested); a bare
+        // disabled allowlist needs none.
+        let identity_seed = match &self.libp2p_public_allowlist_path {
+            Some(_) => self.libp2p_identity_seed.ok_or_else(|| {
+                "internal: public allowlist requires the resolved libp2p identity seed (from_args resolves it when libp2p is requested)".to_string()
+            })?,
+            None => [0u8; 32],
         };
-        let trusted = TrustedNarKeys::from_lines(&self.libp2p_trusted_public_keys)
-            .map_err(|e| format!("--libp2p-trusted-public-key: {e}"))?;
-        // from_args already rejects an empty trusted set alongside a path, but guard here too so
-        // this method is safe to call in isolation (a disabled-by-emptiness allowlist proves
-        // nothing, which would be a silent no-op public provider).
-        if trusted.is_empty() {
-            return Err(
-                "internal: public allowlist path set with no trusted keys (from_args should have rejected this)".into(),
-            );
-        }
-        let identity_seed = self.libp2p_identity_seed.ok_or_else(|| {
-            "internal: public allowlist requires the resolved libp2p identity seed (from_args resolves it when libp2p is requested)".to_string()
-        })?;
-        let mac_key = derive_allowlist_mac_key(&identity_seed);
-        let allowlist = PublicNarAllowlist::open_file(trusted, path.clone(), mac_key)
-            .map_err(|e| format!("opening the public-NAR allowlist at {path:?}: {e}"))?;
-        for (store_hash, narinfo_path) in &self.libp2p_prove_public_narinfo {
-            let bytes = std::fs::read(narinfo_path).map_err(|e| {
-                format!("reading --libp2p-prove-public-narinfo {narinfo_path:?}: {e}")
-            })?;
-            match allowlist.learn(&StoreHash::new(store_hash.clone()), &bytes) {
-                LearnOutcome::Appended { nar_hash, nar_size } => {
-                    // Machine-readable proof line: which NAR identity was proven public + its size.
-                    println!(
-                        "LIBP2P-PUBLIC-LEARN store_hash={store_hash} nar_hash={nar_hash} nar_size={nar_size}"
-                    );
-                }
-                LearnOutcome::AlreadyPresent { nar_hash } => {
-                    println!(
-                        "LIBP2P-PUBLIC-LEARN store_hash={store_hash} nar_hash={nar_hash} already_present"
-                    );
-                }
-                LearnOutcome::Rejected(reject) => {
-                    return Err(format!(
-                        "--libp2p-prove-public-narinfo {store_hash}: narinfo did not prove public: {reject}"
-                    ));
-                }
-                LearnOutcome::RequestMismatch { requested, signed } => {
-                    return Err(format!(
-                        "--libp2p-prove-public-narinfo {store_hash}: the signed narinfo is for store hash {signed}, not the requested {requested} (mis-correlated response)"
-                    ));
-                }
-                LearnOutcome::PersistFailed(e) => {
-                    return Err(format!(
-                        "--libp2p-prove-public-narinfo {store_hash}: persisting the allowlist failed: {e}"
-                    ));
-                }
-            }
-        }
-        Ok(Arc::new(allowlist))
+        daemon::open_public_allowlist(
+            self.libp2p_public_allowlist_path.as_deref(),
+            &self.libp2p_trusted_public_keys,
+            &identity_seed,
+            &self.libp2p_prove_public_narinfo,
+        )
     }
 }
 

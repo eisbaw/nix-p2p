@@ -49,7 +49,8 @@ use daemon_core::claim::NarHashKey;
 use daemon_core::rewrite::RawServeDecision;
 use daemon_core::source::NarSource;
 use daemon_core::{
-    AvailabilityIndex, HoldAnswer, PublicNarAllowlist, PublicNarClaim, PublicationRejected,
+    AvailabilityIndex, HoldAnswer, LearnOutcome, PublicNarAllowlist, PublicNarClaim,
+    PublicationRejected, StoreHash, TrustedNarKeys, derive_allowlist_mac_key,
 };
 
 mod store_probe;
@@ -1127,6 +1128,79 @@ pub async fn announce_public_seeds(
         budget,
     )
     .await
+}
+
+/// Build the node's ONE public-NAR allowlist (TASK-103), the single authority the PUBLIC announce
+/// door ([`announce_public_seeds`] / [`announce_public_provisions`]) consults AND the serving
+/// daemon learns into (`App::public_allowlist`). This is the SINGLE SOURCE OF TRUTH for the
+/// config->allowlist wiring: BOTH the composite `daemon` binary and the thin `daemon-libp2p`
+/// binary call it from their parsed CLI, so their publication policy cannot drift (TASK-204).
+///
+/// Without `allowlist_path` this returns a DISABLED allowlist (no trusted keys, in-memory,
+/// `contains` always false) - the pre-TASK-103 behaviour, so a non-public node is unchanged. WITH
+/// a path it opens the MAC-integrity-protected file (key derived from the durable identity seed via
+/// [`derive_allowlist_mac_key`]) and POPULATES it by PROVING each `prove_public_narinfo` public
+/// through the trusted-key signature gate: the operator NAMING a seed/store path never makes it
+/// public - only a trusted narinfo signature does. A narinfo that does not prove public,
+/// mis-correlates to its requested store hash, or fails to persist is a LOUD startup error
+/// (fail-closed), never a silently-empty allowlist.
+///
+/// `prove_public_narinfo` is a slice of `(requested-store-hash, path-to-narinfo)`: the store hash
+/// the narinfo must correlate to (its signed `StorePath`'s `<hash>`) and the narinfo file to prove.
+pub fn open_public_allowlist(
+    allowlist_path: Option<&Path>,
+    trusted_public_keys: &[String],
+    identity_seed: &[u8; 32],
+    prove_public_narinfo: &[(String, String)],
+) -> Result<Arc<PublicNarAllowlist>, String> {
+    let Some(path) = allowlist_path else {
+        return Ok(Arc::new(PublicNarAllowlist::disabled()));
+    };
+    let trusted = TrustedNarKeys::from_lines(trusted_public_keys)
+        .map_err(|e| format!("--libp2p-trusted-public-key: {e}"))?;
+    // Guard here too (the CLI layer also rejects this) so the function is safe to call in
+    // isolation: a disabled-by-emptiness allowlist proves nothing, a silent no-op public provider.
+    if trusted.is_empty() {
+        return Err(
+            "internal: public allowlist path set with no trusted keys (the CLI should have rejected this)".into(),
+        );
+    }
+    let mac_key = derive_allowlist_mac_key(identity_seed);
+    let allowlist = PublicNarAllowlist::open_file(trusted, path.to_path_buf(), mac_key)
+        .map_err(|e| format!("opening the public-NAR allowlist at {path:?}: {e}"))?;
+    for (store_hash, narinfo_path) in prove_public_narinfo {
+        let bytes = std::fs::read(narinfo_path)
+            .map_err(|e| format!("reading --libp2p-prove-public-narinfo {narinfo_path:?}: {e}"))?;
+        match allowlist.learn(&StoreHash::new(store_hash.clone()), &bytes) {
+            LearnOutcome::Appended { nar_hash, nar_size } => {
+                // Machine-readable proof line: which NAR identity was proven public + its size.
+                println!(
+                    "LIBP2P-PUBLIC-LEARN store_hash={store_hash} nar_hash={nar_hash} nar_size={nar_size}"
+                );
+            }
+            LearnOutcome::AlreadyPresent { nar_hash } => {
+                println!(
+                    "LIBP2P-PUBLIC-LEARN store_hash={store_hash} nar_hash={nar_hash} already_present"
+                );
+            }
+            LearnOutcome::Rejected(reject) => {
+                return Err(format!(
+                    "--libp2p-prove-public-narinfo {store_hash}: narinfo did not prove public: {reject}"
+                ));
+            }
+            LearnOutcome::RequestMismatch { requested, signed } => {
+                return Err(format!(
+                    "--libp2p-prove-public-narinfo {store_hash}: the signed narinfo is for store hash {signed}, not the requested {requested} (mis-correlated response)"
+                ));
+            }
+            LearnOutcome::PersistFailed(e) => {
+                return Err(format!(
+                    "--libp2p-prove-public-narinfo {store_hash}: persisting the allowlist failed: {e}"
+                ));
+            }
+        }
+    }
+    Ok(Arc::new(allowlist))
 }
 
 /// Wrap a running `fabric` in the consumer [`Libp2pNarSource`] + its paired
