@@ -5,7 +5,7 @@ status: In Progress
 assignee:
   - '@mped'
 created_date: '2026-08-10 08:43'
-updated_date: '2026-08-14 05:34'
+updated_date: '2026-08-14 06:05'
 labels:
   - wave-2b
 dependencies:
@@ -126,4 +126,28 @@ HONEST LIMITS / gotchas fed forward:
  - 0.3256 is a CONVENIENCE-SAMPLE estimate (BFS from 4 seeds), NOT a population ratio; do not compare to legacy xz 0.278 (codec+cohort confounded).
  - break-even bandwidths/latencies are ASSUMED, not re-measured here; only the shaped peer bw is measured (over an EMULATED link: mean RTT + rate cap, no loss/jitter/NAT — see shaped_link HONEST_LIMITS).
  - unknown-codec classification uses a KNOWN-codec allowlist {xz,zstd,bzip2,gzip,br,lzip,lz4}; a real future codec outside it would be conservatively excluded+counted (fail-closed), not silently folded in.
+
+RE-GATE 2026-08-14 = NO-GO (2nd, codex). F2/F4-algebra/F6/F7/F8 RESOLVED. Remaining, 2nd fix cycle: (F1 BLOCKER, codex proved by mutation that finalize() PUBLISHED all of: 1-byte NarSize-sum drift [integer sums compared with a relative FLOAT tolerance], NaN in stored ratio / decile ratio / record FileSize [non-finite not rejected -> classic fail-open], decile n=999 / false decile min / changed decile index [decile verify compares only ratio, ignores index/n/min/max], exclusion-count 999 [n_uncompressed_excluded / n_unknown_compression_excluded / n_unsigned_excluded / n_records_total not verified], stored signed/classification not re-derived from raw sig/compression, and finalize() SILENTLY SKIPS verify when sample['aggregate'] is not a dict). FIX: verify_rederivable must recompute and STRICTLY compare EVERY aggregate incl. all exclusion counts + n_records_total + FULL decile fields (index,n,min,max,ratio); re-derive signed/classification from raw; REJECT non-finite (NaN/inf) explicitly; compare integer sums with EXACT integer equality (no float tolerance); finalize() must fail-CLOSED - raise (not skip) on missing/non-dict aggregate. DEFINITION OF DONE FOR THIS CYCLE: add a pinned self-test mutation case for EACH mutation codex accepted (1-byte drift, ratio NaN, decile NaN, FileSize NaN, decile n=999, false decile min, changed decile index, exclusion-count 999, gate_passed:false+valid aggregate, failed-gate-block-without-aggregate) and each MUST turn verify/finalize RED. (F3) finalize() must inspect gate_passed/gate_violations and refuse a failed/absent-gate report; self-test must prove the CLI/finalize path refuses to publish (not just build_sample_block); --verify-artifact must also re-run sample_gate (canonical admission). (F5) make assumed_not_measured_here honest per-input (measured-shaped: peer_bw measured, up_bw+latencies assumed) and fix the units string. (F4 minor) pin numer==0 and denom==0&&numer>=0 oracle cases; fix denom==0&&numer==0 interpretation to 'ties at every size' not 'loses'. Then REGENERATE the committed evidence artifact (fresh live sample; number will shift slightly, expected). Scope notes to state explicitly (not overclaim): 'signed'=nonempty Sig (not crypto verification); the verifier shares _aggregate_from_records (strictness + mutation-bites compensate; a fully independent 2nd impl is out of scope for a diagnostic).
+
+RE-GATE 2nd NO-GO CLOSED (2026-08-14). Code @ cdf5c3a, evidence @ ec6fbe3 (evidence/task-94/cdf5c3a/sample.json; stale 17db75e removed).
+
+ROOT-CAUSE fix (owner steer 'what do we need floats for?'): verify_rederivable is now a NO-FLOAT trust path. Every integrity quantity is an INTEGER (FileSize/NarSize, sums, ALL exclusion counts, n_records_total, each decile index/n/min/max) recomputed from raw records and compared EXACT ==. Display ratios are derived from those integers and asserted exactly == the re-derived value (NaN/None/doctored float fails != for free). No tolerance anywhere; NaN unrepresentable in an integer field -> the class codex broke cannot exist. signed/classification re-derived from raw sig/compression and must match stored.
+
+finalize() FAIL-CLOSED: raises (never skips) on missing/non-dict aggregate and on gate_passed!=true/absent gate. --verify-artifact now also re-runs sample_gate (canonical admission).
+
+11 PINNED mutations in --self-test, each proven RED when its guard is reverted (monkeypatch demo: verify no-op -> #1-8/#11 RED; old fail-open finalize -> #9/#10 RED). BEFORE (original committed code, run against real evidence/task-94/17db75e): 10/11 ACCEPTED (only record-FileSize-NaN rejected, and only incidentally via a median shift). AFTER: 11/11 REJECTED with named causes.
+ 1 sum_nar +1B; 2 aggregate ratio NaN; 3 decile ratio NaN; 4 record FileSize NaN; 5 decile n=999; 6 false decile min; 7 changed decile index; 8 exclusion counts=999 (all 4: uncompressed/unknown/unsigned/total); 9 valid aggregate + gate_passed:false; 10 failed-gate block w/o aggregate; 11 stored signed/classification lying vs raw.
+
+F5: assumed_not_measured_here honest per-input (true for every scenario; per-input map marks only peer_bw measured on the shaped scenario); units string no longer claims the measured peer bw is a MiB/s constant (it derives from decimal Mbit/s, x1e6/8).
+F4: denom==0&numer==0 now TIES at every size (draw, not loss); pinned numer==0 and denom==0&numer>=0 oracle cases.
+
+REGEN: fresh live seed-closure sample under corrected finalizer. BFS is deterministic vs the pinned nixpkgs registry so it reproduced the prior snapshot EXACTLY (not a slight shift): FileSize/NarSize=0.3255628680 (3.0716x), 220 admitted, 2 none-excluded, 0 unknown/0 unsigned; shaped 8/20/40 MiB -> 73.9/85.6/90.3 mbit; no netns leak. verify-artifact re-derives from raw + re-runs sample_gate -> rc=0.
+
+GATE (bounded, nix develop): peer --self-test / shaped_link --self-test / ruff check / ruff format --check / py_compile / just independence / --verify-artifact all rc=0. netns empty, disk 84G free.
+
+CONCLUSION UNCHANGED: raw peer loses at every size in the measured quadrant (home_uplink 5MiBps and measured shaped peer -> NO SIZE THRESHOLD EXISTS; assumed 125MiBps LAN peer -> break-even above threshold).
+
+SCOPE (honest, not overclaimed): 'signed'=nonempty Sig field, NOT crypto signature verification. The verifier shares _aggregate_from_records with the producer; a fully independent 2nd impl is out of scope for a diagnostic -- the integer-exact strictness + the 11 mutation-bites are the assurance. Residual naming smell (nar_size_span_orders_of_magnitude holds a linear multiple) tracked separately as TASK-199.
+
+AC#1/#3/#4 genuinely met and remain ticked.
 <!-- SECTION:NOTES:END -->
