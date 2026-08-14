@@ -6,7 +6,7 @@ title: >-
 status: To Do
 assignee: []
 created_date: '2026-08-12 14:28'
-updated_date: '2026-08-12 15:51'
+updated_date: '2026-08-14 16:46'
 labels:
   - libp2p
   - fabric
@@ -14,6 +14,7 @@ labels:
   - hardening
 dependencies:
   - TASK-159
+priority: high
 ---
 
 ## Description
@@ -33,4 +34,6 @@ Follow-up to TASK-159 AC#1 (which decentralized address RESOLUTION via kad peer-
 
 <!-- SECTION:NOTES:BEGIN -->
 SUPERSEDES the --libp2p-provider-addr / Libp2pSourceConfig.provider_addrs shim (from TASK-169 mped review F3): TASK-169 demoted that injection channel from required to an OPTIONAL out-of-band dial-address override hint (kept, not removed, as the lower-risk interim). It is now a SECOND source of truth for 'where is P' alongside node_locator's DHT resolution, and it is exercised by NO test (the acceptance test sets provider_addrs=[]). This task's ExplicitPeersOnly static peer address book is the clean seam-level home for 'reach a peer the DHT has not propagated' - when it lands, converge --libp2p-provider-addr into ExplicitPeersOnly (feed the CLI-supplied peers to the static address book resolved under ExplicitPeersOnly, disclosing nothing) and REMOVE the parallel add_address injection loop in build_libp2p_nar_source (daemon/src/source_libp2p.rs). Until then the retained shim is untested surface - either add a small test of the override role or remove-and-reintroduce here.
+
+COMPASS 2026-08-14: RAISED to High + this is a rung-2 CORNERSTONE (not hardening). It is the LAST unproven half of 'robust connectivity' and the PRD's #1 failure mode (risk 8: works in the harness, fails behind real NAT). All connectivity proofs so far (TASK-103 discovery, TASK-159 address resolution, TASK-179 routed netns) use ROUTABLE addresses with ZERO NAT — hole-punching/relay/AutoNAT/DCUtR are completely unexercised, the direct analogue of the compression thesis needing real link shaping before 94/99 could be believed. Highest-leverage cornerstone after TASK-194. HARNESS CAVEAT (from TASK-179 notes): the e2e image ships no iproute2, so a containerized-NAT topology is a harness fight; spike it first and FILE the true-multi-host residual separately if it balloons (the 179 file-it-keep-the-proof discipline). TEST-LOCK-IN: a minimal-pair bite — a peer reachable ONLY via hole-punch/relay fetches byte-identical; disable DCUtR/relay -> that peer is undiallable -> upstream fallback (proves traversal is load-bearing, not incidental).
 <!-- SECTION:NOTES:END -->
