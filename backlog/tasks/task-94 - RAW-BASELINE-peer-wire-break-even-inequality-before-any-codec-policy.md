@@ -1,11 +1,11 @@
 ---
 id: TASK-94
 title: 'RAW BASELINE: peer-wire break-even inequality before any codec policy'
-status: In Progress
+status: Done
 assignee:
   - '@mped'
 created_date: '2026-08-10 08:43'
-updated_date: '2026-08-14 06:33'
+updated_date: '2026-08-14 06:36'
 labels:
   - wave-2b
 dependencies:
@@ -169,4 +169,6 @@ RE-DERIVED headline (from committed records, --verify-artifact, rc=0): FileSize/
 BOUNDED GATE (nix develop, all rc=0): peer_wire --self-test (all prior 11 tamper mutations + new (a)-(e), each RED-under-reverted-guard); shaped_link --self-test (6 mut + 4 trunc + delivery-counter); ruff check clean; ruff format --check clean (30 files); py_compile OK; just independence GREEN; --verify-artifact rc=0. No netns leak; disk ~84G free.
 
 AC#1/#3/#4 genuinely met and remain ticked; AC#2/#5 unchanged. This was the FINAL cycle (orchestrator re-verified codex-3's mutations directly; no 4th codex gate). TASK-199 closed here.
+
+DONE 2026-08-14. Value-thesis raw break-even baseline is auditable, deterministically reproducible, integer-exact re-derivable, fail-closed, and honestly framed. Final GO after 3 codex DEEP gates (2 real NO-GOs closed at root: re-derivability + fail-open finalizer; 3rd NO-GO arbitrated down as tamper-resistance above the diagnostic bar, sub-findings still fixed). Independently re-verified by the orchestrator: signed-string + duplicate-record + NaN + sum-drift mutations all bite; positivity/uniqueness/integer-span/gate-consistency guards static-confirmed; baseline re-derives to 0.3255628680 (3.0716x) from committed records. CONCLUSION (stands, not policy): raw peer moves ~3.07x the CDN's compressed wire bytes; peer must sustain >64.5 MiB/s to break even; measured shaped peer ~10.8 MiB/s and home uplink 5 MiB/s -> NO SIZE THRESHOLD EXISTS (raw WAN loses at every size). This is the diagnostic_uncompressed baseline; TASK-99 (link compression) is the fix and re-measures against it; TASK-198 re-states the speedup through a shaped link. Artifact: evidence/task-94/59e7d3b/sample.json. Scope: 'signed'=nonempty Sig (not crypto); verifier shares producer aggregation fn (strictness + mutation battery are the assurance).
 <!-- SECTION:NOTES:END -->
