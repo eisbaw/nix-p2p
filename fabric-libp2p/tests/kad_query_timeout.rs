@@ -111,7 +111,7 @@ async fn configured_query_timeout_reaches_kad() {
     join(&fast_expire, holder_peer, holder_addr.clone()).await;
     let tiny = tokio::time::timeout(
         Duration::from_secs(5),
-        fast_expire.handle.get_providers(key.clone()),
+        fast_expire.handle.get_providers(key.clone(), 32),
     )
     .await
     .expect("the 1ns-timeout query must resolve well within 5s");
@@ -127,17 +127,22 @@ async fn configured_query_timeout_reaches_kad() {
     join(&generous, holder_peer, holder_addr.clone()).await;
     let ok = tokio::time::timeout(
         Duration::from_secs(10),
-        generous.handle.get_providers(key.clone()),
+        generous.handle.get_providers(key.clone(), 32),
     )
     .await
     .expect("the default-timeout query must resolve within 10s over loopback");
-    let (providers, reach) = ok.expect("the default-timeout query must reach the holder (Ok)");
+    let fan_out = ok.expect("the default-timeout query must reach the holder (Ok)");
     assert!(
-        providers.is_empty(),
-        "nobody provides this key; expected an empty provider set, got {providers:?}"
+        fan_out.providers.is_empty(),
+        "nobody provides this key; expected an empty provider set, got {:?}",
+        fan_out.providers
     );
     assert!(
-        reach.reached_neighborhood(),
+        !fan_out.truncated,
+        "an empty index over a generous budget must not report truncation"
+    );
+    assert!(
+        fan_out.reach.reached_neighborhood(),
         "the query should have reached the responding holder (answered > 0)"
     );
 }

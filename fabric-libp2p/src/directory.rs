@@ -3,7 +3,6 @@
 //! [`ProviderRecord`]s of every provider, purely through the DHT, and distinguishes a
 //! healthy `Miss` from a could-not-consult `Unavailable`.
 
-use std::collections::HashSet;
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
@@ -16,7 +15,7 @@ use peer_fabric::{
 
 use crate::floor_store::FloorStore;
 use crate::keys::{peer_id_of_provider, provider_index_key, provider_value_key};
-use crate::swarm::{QueryFail, SwarmHandle, absence_from_reach};
+use crate::swarm::{ProviderFanOut, QueryFail, QueryReach, SwarmHandle, absence_from_reach};
 
 /// The kad-backed [`ProviderDirectory`]. See the crate ADR for the HYBRID mapping.
 pub struct Libp2pProviderDirectory {
@@ -137,20 +136,34 @@ pub(crate) fn admit(
     }
 }
 
-/// Cap the provider fan-out of one lookup to at most `max_peers`, the TASK-154 AC#1 consumer
-/// bound. The kad index walk aggregates provider records from every peer it reached, so an
-/// unbounded set here would let a sybil flood turn ONE lookup into one `get_record` round
-/// trip per forged provider. Returns a DETERMINISTIC subset (sorted by `PeerId`) so the peers
-/// a lookup chases are stable across runs and across a `HashSet`'s arbitrary iteration order,
-/// which also makes the bound unit-testable. A `max_peers` of zero yields an empty fan-out,
-/// so a caller that budgeted zero peers gets zero fetches; callers pass a real budget whose
-/// default is sixteen. This never weakens integrity: every record a kept provider returns is
-/// still fully ed25519-verified downstream; the cap only bounds COST, never trust.
-fn cap_fan_out(providers: HashSet<PeerId>, max_peers: u32) -> Vec<PeerId> {
-    let mut providers: Vec<PeerId> = providers.into_iter().collect();
-    providers.sort_unstable();
-    providers.truncate(max_peers as usize);
-    providers
+/// The RETRYABLE outcome for a lookup whose fan-out was TRUNCATED by the consumer `max_peers`
+/// bound and yielded no live record (TASK-154 B2). This is NOT an authoritative absence: the
+/// index named MORE providers than `max_peers`, we chased only the retained subset, and a
+/// DISCARDED provider may have held the valid record. Returning `Miss` here would cross the
+/// project TCB boundary ("a hostile/broken peer costs a retry, never a wrong answer") and would
+/// poison negative caching - so a truncated-and-empty result is `Unavailable` (retryable with a
+/// larger budget), never `Miss`. Carried as `Backend` (a catch-all the caller already treats as
+/// non-absence) with a message that names the budget as the cause.
+fn truncated_unavailable() -> Unavailable {
+    Unavailable::Backend(
+        "provider index named more providers than the max_peers fan-out budget; the consulted \
+         subset held no live record but a discarded provider may be valid - retry with a larger \
+         budget (not an authoritative absence)"
+            .to_string(),
+    )
+}
+
+/// Classify a GENUINELY empty provider index (the walk named nobody WE retained), a PURE
+/// decision (TASK-154 B2). If nothing was discarded, defer to the near-key [`QueryReach`]
+/// (Miss vs `InsufficientRouting`, TASK-174). But if the `max_peers` bound discarded EVERY
+/// named provider (the degenerate `max_peers == 0` over a non-empty index), the empty fan-out
+/// is NOT an authoritative absence - return the retryable outcome, never `Miss`.
+fn classify_empty_index<T>(reach: QueryReach, truncated: bool) -> Lookup<T> {
+    if truncated {
+        Lookup::Unavailable(truncated_unavailable())
+    } else {
+        absence_from_reach(reach)
+    }
 }
 
 /// Classify the outcome of the value-store phase (a PURE decision, unit-tested to bite
@@ -160,9 +173,15 @@ fn cap_fan_out(providers: HashSet<PeerId>, max_peers: u32) -> Vec<PeerId> {
 ///   * no positive record but a value fetch could NOT be consulted -> `Unavailable`,
 ///     NEVER `Miss` (the index named providers; we simply could not fetch their
 ///     records - a caller must not cache this as authoritative absence);
-///   * no positive record and every skip was HEALTHY (withdrawn / expired / genuinely
-///     absent) -> `Miss`.
-fn classify(records: Vec<ProviderRecord>, consult_failed: bool) -> Lookup<Vec<ProviderRecord>> {
+///   * no positive record, none discarded, and every skip was HEALTHY (withdrawn / expired /
+///     genuinely absent) -> `Miss`;
+///   * no positive record but the fan-out was TRUNCATED by `max_peers` -> `Unavailable`
+///     (TASK-154 B2): a discarded provider may have been valid, so a `Miss` would be a lie.
+fn classify(
+    records: Vec<ProviderRecord>,
+    consult_failed: bool,
+    truncated: bool,
+) -> Lookup<Vec<ProviderRecord>> {
     if !records.is_empty() {
         Lookup::Found(records)
     } else if consult_failed {
@@ -170,6 +189,8 @@ fn classify(records: Vec<ProviderRecord>, consult_failed: bool) -> Lookup<Vec<Pr
             "provider index named providers but their value records could not be consulted"
                 .to_string(),
         ))
+    } else if truncated {
+        Lookup::Unavailable(truncated_unavailable())
     } else {
         Lookup::Miss
     }
@@ -263,34 +284,40 @@ impl Libp2pProviderDirectory {
             Exposure::new(Recipient::DhtNode, Disclosed::OurNodeId),
         ]);
 
-        // Phase 1: the multi-provider index.
-        let (providers, reach) = match self.handle.get_providers(provider_index_key(key)).await {
+        // Phase 1: the multi-provider index. AC#1 CONSUMER FAN-OUT BOUND (TASK-154 B1): the
+        // kad index walk AGGREGATES provider records from every peer it reaches near the key,
+        // so a sybil flood (many forged provider records for one key) can name far more
+        // providers than we should chase. The bound is enforced AT THE SOURCE inside the worker
+        // (`retain_bounded_provider`): `get_providers` returns at most `max_peers` providers -
+        // the deterministic smallest-by-PeerId subset - plus a `truncated` flag telling us
+        // whether any named provider was DISCARDED by the bound. So a single lookup costs a
+        // bounded number of `get_record` round trips (and bounded exposure) regardless of how
+        // many providers were named, and the worker's retained memory is O(max_peers), not
+        // O(flood). This is the read-path complement to the store-side
+        // `STORE_MAX_PROVIDERS_PER_KEY`. Integrity is untouched - every kept record is still
+        // ed25519-verified downstream.
+        let ProviderFanOut {
+            providers,
+            truncated,
+            reach,
+        } = match self
+            .handle
+            .get_providers(provider_index_key(key), max_peers)
+            .await
+        {
             Ok(found) => found,
             Err(QueryFail::Timeout) => return Lookup::Unavailable(Unavailable::DeadlineExceeded),
             Err(QueryFail::Backend(why)) => return Lookup::Unavailable(Unavailable::Backend(why)),
         };
         if providers.is_empty() {
-            // A completed index lookup that named no provider. Whether that is an
-            // authoritative absence (Miss) or a could-not-consult (InsufficientRouting)
-            // turns on the NEAR-KEY bar: did the iterative walk actually reach any
-            // responding peer near the key? (TASK-174, AC#7 "MISS only after a healthy
-            // completed lookup" - a lookup that reached nobody is NOT healthy.)
-            return absence_from_reach(reach);
+            // A completed index lookup that named no provider WE retained. If nothing was
+            // discarded this turns on the NEAR-KEY bar: did the walk reach a responding peer
+            // near the key? (TASK-174 - Miss vs InsufficientRouting.) But if the `max_peers`
+            // bound discarded EVERY named provider (the degenerate max_peers==0 over a
+            // non-empty index), an empty fan-out is NOT an authoritative absence - it is
+            // retryable, never a Miss (TASK-154 B2).
+            return classify_empty_index(reach, truncated);
         }
-
-        // AC#1 CONSUMER FAN-OUT BOUND (TASK-154). The kad index walk AGGREGATES provider
-        // records from every peer it reaches near the key, so a sybil flood (many forged
-        // provider records for one key) can name far more providers than we should chase.
-        // Cap the set we fan out to at `budget.max_peers` BEFORE issuing the Phase-2
-        // value-record fetches, so a single lookup costs a bounded number of `get_record`
-        // round trips (and bounded exposure) regardless of how many providers were named.
-        // This is the read-path complement to the store-side `STORE_MAX_PROVIDERS_PER_KEY`
-        // (how many providers ONE node holds per key); this bounds how many of the
-        // aggregated providers a lookup then consults. Never rejects a legitimate answer:
-        // headroom is large (default max_peers=16 >> the handful the proven tests hold), and
-        // when the cap does bite it keeps a deterministic subset, still able to yield a valid
-        // provider. Integrity is untouched - every kept record is still ed25519-verified.
-        let providers = cap_fan_out(providers, max_peers);
 
         // Phase 2: fetch each provider's signed record from the value store CONCURRENTLY
         // (resolve latency is the max of the fetches, not their sum - which keeps a
@@ -345,7 +372,7 @@ impl Libp2pProviderDirectory {
             }
         }
 
-        classify(records, consult_failed)
+        classify(records, consult_failed, truncated)
     }
 }
 
@@ -357,12 +384,15 @@ impl ProviderDirectory for Libp2pProviderDirectory {
         budget: &DiscoveryBudget,
     ) -> Lookup<Vec<ProviderRecord>> {
         // The deadline is enforced at THIS async boundary. On elapse the resolve future is
-        // dropped - and now (TASK-154 S4) that drop CANCELS the underlying kad query rather
+        // dropped - and now (TASK-154 S4/B3) that drop CANCELS the underlying kad query rather
         // than leaking it: `SwarmHandle::get_providers`/`get_record` hold a `CancelOnDrop`
-        // guard armed for the whole `rx.await`, so dropping this future mid-wait fires a
-        // `Command::Cancel { id }` that `finish()`es the kad walk at the worker instead of
-        // letting it run to its own `query_timeout` and reply into a dropped receiver. The
-        // fan-out bound (`budget.max_peers`) is enforced inside `resolve` (see there).
+        // guard armed for the whole `rx.await`, so dropping this future mid-wait sends the
+        // query's `QueryId` on the LOSSLESS cancel channel and the worker `finish()`es the kad
+        // walk instead of letting it run to its own `query_timeout` and reply into a dropped
+        // receiver. If the future is dropped in the narrow window BEFORE the QueryId even
+        // arrives, the worker finishes the query itself (it sees the id-reply receiver closed).
+        // The fan-out bound (`budget.max_peers`) is enforced at the source inside the worker
+        // (`retain_bounded_provider`) and threaded through `resolve` (see there).
         match tokio::time::timeout(budget.deadline, self.resolve(key, budget.max_peers)).await {
             Ok(lookup) => lookup,
             Err(_elapsed) => Lookup::Unavailable(Unavailable::DeadlineExceeded),
@@ -399,65 +429,72 @@ mod tests {
     #[test]
     fn classify_found_when_any_positive_record() {
         assert!(matches!(
-            classify(vec![a_record()], false),
+            classify(vec![a_record()], false, false),
             Lookup::Found(records) if records.len() == 1
         ));
         // Even if a consultation ALSO failed, a positive record is still Found.
-        assert!(classify(vec![a_record()], true).is_found());
+        assert!(classify(vec![a_record()], true, false).is_found());
+        // And a positive record wins even if the fan-out was truncated (we found a live one).
+        assert!(classify(vec![a_record()], false, true).is_found());
     }
 
     #[test]
-    fn classify_miss_only_when_healthy_and_empty() {
-        // No records, no consultation failure -> authoritative absence.
-        assert!(matches!(classify(Vec::new(), false), Lookup::Miss));
+    fn classify_miss_only_when_healthy_and_empty_and_not_truncated() {
+        // No records, no consultation failure, NOTHING discarded -> authoritative absence.
+        // This is the only path that may return Miss (TASK-154 B2 direction (b): a genuinely
+        // complete, empty lookup still returns Miss - the fix must NOT over-correct into never
+        // returning Miss). The proven decentralized_discovery / record_lifecycle negative paths
+        // ride exactly this: their budgets (max_peers 20/32) never truncate the handful of
+        // providers they hold, so truncated is false and an un-announced key stays a Miss.
+        assert!(matches!(classify(Vec::new(), false, false), Lookup::Miss));
     }
 
     #[test]
     fn classify_unavailable_when_consultation_failed_and_empty() {
-        // THE B1 BITE: an empty result that included a consultation FAILURE must be
-        // Unavailable, never Miss - or a caller would cache "no provider" for content
-        // that is in the DHT. Delete the `consult_failed` branch and this fails.
-        match classify(Vec::new(), true) {
+        // An empty result that included a consultation FAILURE must be Unavailable, never Miss
+        // - or a caller would cache "no provider" for content that is in the DHT. Delete the
+        // `consult_failed` branch and this fails.
+        match classify(Vec::new(), true, false) {
             Lookup::Unavailable(Unavailable::Backend(_)) => {}
             other => panic!("expected Unavailable(Backend), got {other:?}"),
         }
     }
 
-    // --- AC#1 consumer fan-out bound (TASK-154). `cap_fan_out` is the pure decision the
-    // resolver applies between the index walk and the per-provider value fetches; testing it
-    // directly proves the bound BITES without a live swarm.
-
     #[test]
-    fn fan_out_capped_to_max_peers_when_index_over_budget() {
-        // A flooded index names far more providers than the budget allows. The bound MUST
-        // reduce the fan-out to exactly `max_peers` - the anti-sybil-amplification bite:
-        // delete the `truncate` and this over-fetches (len == 100), failing here.
-        let providers: HashSet<PeerId> = (0..100).map(|_| PeerId::random()).collect();
-        let capped = cap_fan_out(providers, 16);
-        assert_eq!(
-            capped.len(),
-            16,
-            "a lookup must chase at most max_peers providers, not one per forged record"
-        );
+    fn classify_unavailable_when_truncated_and_all_retained_stale() {
+        // TASK-154 B2 direction (a): 17 providers, max_peers=16, the retained 16 all stale /
+        // missing but a DISCARDED provider may have been valid. An empty-but-TRUNCATED result
+        // must be the RETRYABLE Unavailable, NEVER an authoritative Miss (which would poison
+        // negative caching and cross the TCB "a broken peer costs a retry, never a wrong
+        // answer" boundary). Delete the `truncated` branch in `classify` and this returns Miss
+        // and fails here.
+        match classify(Vec::new(), false, true) {
+            Lookup::Unavailable(Unavailable::Backend(_)) => {}
+            other => panic!("truncated+empty must be retryable Unavailable, got {other:?}"),
+        }
     }
 
     #[test]
-    fn fan_out_keeps_all_when_index_within_budget() {
-        // The common case: fewer providers than the budget (what the proven tests hold) is
-        // passed through UNTOUCHED - the cap never drops a legitimate provider.
-        let providers: HashSet<PeerId> = (0..3).map(|_| PeerId::random()).collect();
-        assert_eq!(cap_fan_out(providers, 16).len(), 3);
-    }
-
-    #[test]
-    fn fan_out_is_deterministic_across_iteration_order() {
-        // Same provider SET, capped twice, must yield the SAME subset in the SAME order -
-        // otherwise the peers a lookup chases would drift with HashSet's arbitrary order,
-        // and the bound would be untestable / unreproducible.
-        let ids: Vec<PeerId> = (0..40).map(|_| PeerId::random()).collect();
-        let a: HashSet<PeerId> = ids.iter().copied().collect();
-        let b: HashSet<PeerId> = ids.iter().rev().copied().collect();
-        assert_eq!(cap_fan_out(a, 16), cap_fan_out(b, 16));
+    fn classify_empty_index_defers_to_reach_only_when_not_truncated() {
+        // The empty-INDEX decision (the walk retained no provider at all).
+        //  * genuinely empty (nothing discarded) + reached a peer near the key -> Miss.
+        assert!(matches!(
+            classify_empty_index::<Vec<ProviderRecord>>(QueryReach { answered: 1 }, false),
+            Lookup::Miss
+        ));
+        //  * genuinely empty + reached nobody -> InsufficientRouting (TASK-174), still not Miss.
+        assert!(matches!(
+            classify_empty_index::<Vec<ProviderRecord>>(QueryReach { answered: 0 }, false),
+            Lookup::Unavailable(Unavailable::InsufficientRouting)
+        ));
+        //  * the degenerate max_peers==0 over a NON-empty index: providers empty but truncated,
+        //    so NOT an authoritative absence even though the walk reached peers. This is the
+        //    "max_peers=0 makes every nonempty index an instant Miss" bug (TASK-154 B2). Without
+        //    the truncated guard this would be a Miss (answered>0); the guard makes it retryable.
+        match classify_empty_index::<Vec<ProviderRecord>>(QueryReach { answered: 5 }, true) {
+            Lookup::Unavailable(Unavailable::Backend(_)) => {}
+            other => panic!("empty+truncated index must be retryable, got {other:?}"),
+        }
     }
 
     // --- `admit` lifecycle-floor tests (TASK-152 AC#3/#4/#1-consume). Each crafts the

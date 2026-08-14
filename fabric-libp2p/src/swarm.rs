@@ -4,7 +4,7 @@
 //! is the standard rust-libp2p driver shape; it keeps the async capability traits free
 //! of the swarm's single-threaded ownership.
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -97,6 +97,68 @@ pub fn absence_from_reach<T>(reach: QueryReach) -> Lookup<T> {
         Lookup::Miss
     } else {
         Lookup::Unavailable(Unavailable::InsufficientRouting)
+    }
+}
+
+/// The result of a bounded `get_providers` walk (TASK-154 AC#1). The provider set is capped
+/// to at most `max_peers` DURING aggregation (see [`retain_bounded_provider`]), so the worker
+/// never holds more than `max_peers` PeerIds no matter how many (possibly forged) providers a
+/// sybil flood streams in - the bound is on WORK/MEMORY, enforced at the source, not a
+/// post-hoc sort+truncate over an already-unbounded set.
+#[derive(Debug, Clone)]
+pub struct ProviderFanOut {
+    /// The bounded, DETERMINISTIC provider set: the `max_peers` globally-smallest-by-`PeerId`
+    /// providers the walk saw, in ascending order. Deterministic selection (smallest by
+    /// `PeerId`) makes the peers a lookup chases stable across runs and across the arbitrary
+    /// arrival order of `FoundProviders` events, and is exactly the subset the pre-TASK-154
+    /// post-hoc `sort_unstable().truncate()` produced - only now the intermediate set is never
+    /// larger than `max_peers`.
+    pub providers: Vec<PeerId>,
+    /// `true` if the `max_peers` bound DISCARDED at least one named provider (the returned set
+    /// is a strict subset of what the index named). Load-bearing for the Miss/Unavailable
+    /// boundary (TASK-154 B2): when the retained subset yields no live record but a provider
+    /// was discarded, the lookup is NOT an authoritative absence - a discarded provider may
+    /// have been the valid one - so the directory must return a RETRYABLE `Unavailable`, never
+    /// a `Miss` (which would poison negative caching). `max_peers == 0` over a non-empty index
+    /// therefore also sets this.
+    pub truncated: bool,
+    /// How far the iterative walk reached (the near-key Miss-vs-`InsufficientRouting` signal,
+    /// TASK-174), for classifying a GENUINELY empty index (nothing named, nothing discarded).
+    pub reach: QueryReach,
+}
+
+/// Fold one advertised provider `peer` into the BOUNDED aggregation set `found`, retaining at
+/// most `max_peers` providers - the `max_peers` smallest-by-`PeerId`. TASK-154 B1: called for
+/// EVERY provider each `FoundProviders` event advertises, so a sybil flood of N >> max_peers
+/// forged providers costs O(max_peers) retained memory (and O(N log max_peers) work), never
+/// O(N) - the bound is enforced as records arrive, not after the whole set is accumulated.
+///
+/// Determinism: keeping the smallest-by-`PeerId` yields exactly the subset the old post-hoc
+/// `sort_unstable().truncate(max_peers)` produced. `discarded` is set to `true` whenever a
+/// provider is dropped by the bound (either an incoming one that does not make the cut, or an
+/// already-retained one evicted by a smaller newcomer), so the caller can tell a bounded
+/// result from a complete one. After each call `found.len() <= max_peers` holds (the set is
+/// transiently `max_peers + 1` inside, then trimmed), which is the retained-memory bound.
+fn retain_bounded_provider(
+    found: &mut BTreeSet<PeerId>,
+    max_peers: usize,
+    discarded: &mut bool,
+    peer: PeerId,
+) {
+    if !found.insert(peer) {
+        // Already retained: no change to the set, no discard.
+        return;
+    }
+    if found.len() > max_peers {
+        // Over the bound: evict the current LARGEST so the retained set stays the
+        // `max_peers` smallest. If `peer` itself is the largest it is the one evicted
+        // (a newcomer that does not make the cut). `max_peers == 0` evicts every insert.
+        let largest = *found
+            .iter()
+            .next_back()
+            .expect("just inserted, so the set is non-empty");
+        found.remove(&largest);
+        *discarded = true;
     }
 }
 
@@ -209,28 +271,22 @@ pub enum Command {
     },
     GetProviders {
         key: kad::RecordKey,
+        /// The consumer fan-out bound (TASK-154 AC#1 / B1): the worker retains at most this
+        /// many providers as `FoundProviders` events stream in (the `max_peers` smallest by
+        /// `PeerId`), so a sybil flood costs O(max_peers) memory at the SOURCE, not O(N) then
+        /// a post-hoc truncate. `0` retains none (a caller that budgeted zero peers).
+        max_peers: usize,
         /// The worker replies here with the started query's [`kad::QueryId`] BEFORE the
-        /// result, so the caller can [`Command::Cancel`] the query if it abandons the
-        /// wait (TASK-154 S4 work bound).
+        /// result, so the caller can cancel the query (via the lossless cancel channel) if it
+        /// abandons the wait (TASK-154 S4 work bound).
         id_reply: oneshot::Sender<kad::QueryId>,
-        reply: oneshot::Sender<Result<(HashSet<PeerId>, QueryReach), QueryFail>>,
+        reply: oneshot::Sender<Result<ProviderFanOut, QueryFail>>,
     },
     GetRecord {
         key: kad::RecordKey,
         /// See [`Command::GetProviders::id_reply`] (TASK-154).
         id_reply: oneshot::Sender<kad::QueryId>,
         reply: oneshot::Sender<Result<Option<Vec<u8>>, QueryFail>>,
-    },
-    /// Cancel an in-flight kad query whose caller has abandoned its result (TASK-154 S4
-    /// work bound). The commonest cause is the directory's `find_providers` outer deadline
-    /// firing and DROPPING the resolve future: without this, the underlying kad walk keeps
-    /// running to its own `query_timeout`, issuing further network requests and finally
-    /// replying into a receiver nobody holds - bounded WASTED work (ours and the answering
-    /// peers'). The worker `finish()`es the query (it terminates at the next poll instead of
-    /// walking on) and drops the pending reply. Idempotent + fail-safe: a `Cancel` for an
-    /// already-terminated / unknown id is a no-op.
-    Cancel {
-        id: kad::QueryId,
     },
     /// Resolve `peer`'s dialable addresses THROUGH kad peer-routing: an iterative
     /// `get_closest_peers` to the `peer`'s own key. The k-closest set the query converges
@@ -251,22 +307,25 @@ pub enum Command {
 /// (TASK-154 S4 work bound). Armed for the whole time a caller awaits a query result; a
 /// normal completion [`disarm`](CancelOnDrop::disarm)s it so nothing is sent. When the
 /// caller's future is instead DROPPED mid-wait - the directory's `find_providers` deadline
-/// firing is the load-bearing case - this `Drop` sends a best-effort [`Command::Cancel`] so
-/// the worker stops the kad walk now rather than running it to `query_timeout`.
+/// firing is the load-bearing case - this `Drop` signals the worker to stop the kad walk now
+/// rather than running it to `query_timeout`.
 ///
-/// `Drop` cannot `.await`, so it uses `try_send`. A full command channel (a cancel storm)
-/// just means this one query falls back to the pre-TASK-154 behaviour (it self-terminates at
-/// its own `query_timeout`) - strictly never WORSE than before this fix, only not-yet-better.
+/// The cancel travels on a DEDICATED UNBOUNDED channel (`cancels`), NOT the bounded command
+/// channel (TASK-154 B3): `Drop` cannot `.await`, and the previous best-effort `try_send` on
+/// the bounded command channel SILENTLY DROPPED the cancel whenever that channel was full (a
+/// cancel storm), leaving the query to run to its full timeout - the very case the work bound
+/// exists to stop. An unbounded `send` from `Drop` is non-blocking AND lossless: it only fails
+/// if the worker is already gone (nothing left to cancel).
 struct CancelOnDrop {
-    tx: mpsc::Sender<Command>,
+    cancels: mpsc::UnboundedSender<kad::QueryId>,
     id: kad::QueryId,
     armed: bool,
 }
 
 impl CancelOnDrop {
-    fn new(tx: mpsc::Sender<Command>, id: kad::QueryId) -> Self {
+    fn new(cancels: mpsc::UnboundedSender<kad::QueryId>, id: kad::QueryId) -> Self {
         CancelOnDrop {
-            tx,
+            cancels,
             id,
             armed: true,
         }
@@ -280,10 +339,12 @@ impl CancelOnDrop {
 
 impl Drop for CancelOnDrop {
     fn drop(&mut self) {
-        if self.armed && self.tx.try_send(Command::Cancel { id: self.id }).is_err() {
+        if self.armed && self.cancels.send(self.id).is_err() {
+            // The only way an unbounded send fails is a closed receiver = the worker task is
+            // already gone, so there is no live query left to cancel. Never a full-channel drop.
             tracing::debug!(
-                "fabric-libp2p: could not enqueue a query cancel (worker gone or command \
-                 channel full); the abandoned query self-terminates at its own query_timeout"
+                "fabric-libp2p: query-cancel not delivered because the swarm worker is gone \
+                 (nothing to cancel)"
             );
         }
     }
@@ -300,6 +361,10 @@ impl Drop for CancelOnDrop {
 #[derive(Clone)]
 pub struct SwarmHandle {
     tx: mpsc::Sender<Command>,
+    /// The LOSSLESS query-cancel channel (TASK-154 B3): a dropped [`CancelOnDrop`] guard sends
+    /// the abandoned query's [`kad::QueryId`] here. Unbounded + dedicated so a cancel is never
+    /// dropped by a full command channel (the previous best-effort `try_send` bug).
+    cancels: mpsc::UnboundedSender<kad::QueryId>,
     /// Opens outbound NAR substreams (auto-dialing the peer if not connected). Cloned per
     /// fetch to satisfy `open_stream`'s `&mut self` one-stream-at-a-time backpressure.
     control: Control,
@@ -497,22 +562,26 @@ impl SwarmHandle {
     pub async fn get_providers(
         &self,
         key: kad::RecordKey,
-    ) -> Result<(HashSet<PeerId>, QueryReach), QueryFail> {
+        max_peers: u32,
+    ) -> Result<ProviderFanOut, QueryFail> {
         let (reply, rx) = oneshot::channel();
         let (id_reply, id_rx) = oneshot::channel();
         self.send(Command::GetProviders {
             key,
+            max_peers: max_peers as usize,
             id_reply,
             reply,
         })
         .await;
         // Learn the started query's id, then arm cancel-on-drop so an ABANDONED wait (the
         // outer find_providers deadline dropping this future) cancels the kad walk rather
-        // than letting it run to its own query_timeout (TASK-154 S4).
+        // than letting it run to its own query_timeout (TASK-154 S4). If the caller is
+        // dropped BEFORE the id even arrives, the worker's `id_reply.send` fails and the
+        // worker finishes the query itself (TASK-154 B3a) - so no query leaks in that window.
         let Ok(id) = id_rx.await else {
             return Err(QueryFail::Backend("worker gone".into()));
         };
-        let mut cancel = CancelOnDrop::new(self.tx.clone(), id);
+        let mut cancel = CancelOnDrop::new(self.cancels.clone(), id);
         let out = rx
             .await
             .unwrap_or_else(|_| Err(QueryFail::Backend("worker gone".into())));
@@ -533,7 +602,7 @@ impl SwarmHandle {
         let Ok(id) = id_rx.await else {
             return Err(QueryFail::Backend("worker gone".into()));
         };
-        let mut cancel = CancelOnDrop::new(self.tx.clone(), id);
+        let mut cancel = CancelOnDrop::new(self.cancels.clone(), id);
         let out = rx
             .await
             .unwrap_or_else(|_| Err(QueryFail::Backend("worker gone".into())));
@@ -563,7 +632,7 @@ impl SwarmHandle {
         let Ok(id) = id_rx.await else {
             return Err(QueryFail::Backend("worker gone".into()));
         };
-        let mut cancel = CancelOnDrop::new(self.tx.clone(), id);
+        let mut cancel = CancelOnDrop::new(self.cancels.clone(), id);
         let out = rx
             .await
             .unwrap_or_else(|_| Err(QueryFail::Backend("worker gone".into())));
@@ -650,8 +719,17 @@ enum Pending {
     Simple(oneshot::Sender<Result<(), String>>),
     Bootstrap(oneshot::Sender<Result<(), String>>),
     GetProviders {
-        found: HashSet<PeerId>,
-        reply: oneshot::Sender<Result<(HashSet<PeerId>, QueryReach), QueryFail>>,
+        /// The BOUNDED aggregation set (TASK-154 B1): at most `max_peers` providers, the
+        /// smallest by `PeerId`, maintained by [`retain_bounded_provider`] as each
+        /// `FoundProviders` event arrives - never the full unbounded flood.
+        found: BTreeSet<PeerId>,
+        /// The consumer fan-out bound this query aggregates under.
+        max_peers: usize,
+        /// Set once the `max_peers` bound has discarded any named provider (the result is a
+        /// strict subset). Carried out so the directory can distinguish a bounded result from
+        /// a complete one (TASK-154 B2 Miss-vs-Unavailable).
+        truncated: bool,
+        reply: oneshot::Sender<Result<ProviderFanOut, QueryFail>>,
     },
     GetRecord {
         reply: oneshot::Sender<Result<Option<Vec<u8>>, QueryFail>>,
@@ -671,6 +749,11 @@ enum Pending {
 struct Worker {
     swarm: Swarm<Behaviour>,
     commands: mpsc::Receiver<Command>,
+    /// The LOSSLESS query-cancel channel (TASK-154 B3): abandoned-query [`kad::QueryId`]s from
+    /// dropped [`CancelOnDrop`] guards. Drained every loop iteration and routed to
+    /// [`Worker::cancel_query`]. Dedicated + unbounded so a cancel is never lost to command
+    /// channel backpressure.
+    cancels: mpsc::UnboundedReceiver<kad::QueryId>,
     pending: HashMap<kad::QueryId, Pending>,
 }
 
@@ -685,9 +768,26 @@ impl Worker {
                         break;
                     }
                 },
+                // A dropped caller's abandoned query (TASK-154 B3): cancel it promptly so it
+                // does not run to its full `query_timeout`. `recv()` yields `None` only once
+                // every handle (and thus every cancel sender) is dropped, in which case the
+                // command branch above also closes and ends the loop - so a `None` here is a
+                // harmless no-op, not a busy spin.
+                Some(id) = self.cancels.recv() => self.cancel_query(id),
                 event = self.swarm.select_next_some() => self.on_event(event),
             }
         }
+    }
+
+    /// Stop an abandoned in-flight kad query (TASK-154 S4/B3). `finish()` makes kad terminate
+    /// the walk at the next poll instead of running it to `query_timeout`; dropping the pending
+    /// entry discards the terminal reply. Both are no-ops for an id that already terminated (or
+    /// was never inserted), so a late/duplicate/never-pending cancel is safe - never a panic.
+    fn cancel_query(&mut self, id: kad::QueryId) {
+        if let Some(mut query) = self.swarm.behaviour_mut().kad.query_mut(&id) {
+            query.finish();
+        }
+        self.pending.remove(&id);
     }
 
     fn on_command(&mut self, command: Command) {
@@ -782,18 +882,26 @@ impl Worker {
             }
             Command::GetProviders {
                 key,
+                max_peers,
                 id_reply,
                 reply,
             } => {
                 let id = self.swarm.behaviour_mut().kad.get_providers(key);
-                // Hand the id back BEFORE the result so the caller can cancel this query on
-                // an abandoned wait (TASK-154). If the caller already went away, the send
-                // fails harmlessly and the query completes into a dropped receiver as before.
-                let _ = id_reply.send(id);
+                // Hand the id back BEFORE the result so the caller can cancel this query on an
+                // abandoned wait (TASK-154 S4). If the caller ALREADY went away (dropped before
+                // even learning the id), `id_reply.send` fails - so instead of inserting a
+                // Pending that runs to `query_timeout` replying into a dead receiver, finish
+                // the query NOW (TASK-154 B3a: close the enqueue-to-id race window).
+                if id_reply.send(id).is_err() {
+                    self.cancel_query(id);
+                    return;
+                }
                 self.pending.insert(
                     id,
                     Pending::GetProviders {
-                        found: HashSet::new(),
+                        found: BTreeSet::new(),
+                        max_peers,
+                        truncated: false,
                         reply,
                     },
                 );
@@ -804,18 +912,11 @@ impl Worker {
                 reply,
             } => {
                 let id = self.swarm.behaviour_mut().kad.get_record(key);
-                let _ = id_reply.send(id);
-                self.pending.insert(id, Pending::GetRecord { reply });
-            }
-            Command::Cancel { id } => {
-                // Stop an abandoned query (TASK-154 S4). `finish()` makes kad terminate the
-                // walk at the next poll instead of running it to `query_timeout`; dropping the
-                // pending entry discards the terminal reply. Both are no-ops for an id that
-                // already terminated, so a late/duplicate Cancel is safe (never a panic).
-                if let Some(mut query) = self.swarm.behaviour_mut().kad.query_mut(&id) {
-                    query.finish();
+                if id_reply.send(id).is_err() {
+                    self.cancel_query(id);
+                    return;
                 }
-                self.pending.remove(&id);
+                self.pending.insert(id, Pending::GetRecord { reply });
             }
             Command::LocatePeer {
                 peer,
@@ -827,7 +928,12 @@ impl Worker {
                 // bootstrap reported for `peer` (learned via identify). This is what lets
                 // the resolver dial without an injected address.
                 let id = self.swarm.behaviour_mut().kad.get_closest_peers(peer);
-                let _ = id_reply.send(id);
+                // Same abandoned-before-id guard as GetProviders (TASK-154 B3a): if the caller
+                // is already gone, finish the query now rather than let it run to timeout.
+                if id_reply.send(id).is_err() {
+                    self.cancel_query(id);
+                    return;
+                }
                 self.pending.insert(
                     id,
                     Pending::GetClosestPeers {
@@ -939,23 +1045,44 @@ impl Worker {
                 }
             }
             QueryResult::GetProviders(res) => {
-                if let Some(Pending::GetProviders { found, .. }) = self.pending.get_mut(&id)
+                if let Some(Pending::GetProviders {
+                    found,
+                    max_peers,
+                    truncated,
+                    ..
+                }) = self.pending.get_mut(&id)
                     && let Ok(GetProvidersOk::FoundProviders { providers, .. }) = &res
                 {
-                    found.extend(providers.iter().copied());
+                    // TASK-154 B1: fold each advertised provider into a set BOUNDED at
+                    // `max_peers`, so a sybil flood never grows the retained set past the
+                    // budget (O(max_peers) memory), and does so DETERMINISTICALLY.
+                    for peer in providers.iter().copied() {
+                        retain_bounded_provider(found, *max_peers, truncated, peer);
+                    }
                 }
                 let failed = res.is_err();
                 if (last || failed)
-                    && let Some(Pending::GetProviders { found, reply }) = self.pending.remove(&id)
+                    && let Some(Pending::GetProviders {
+                        found,
+                        truncated,
+                        reply,
+                        ..
+                    }) = self.pending.remove(&id)
                 {
                     // The terminal-step stats are cumulative for the whole query, so
                     // `num_successes` is how many peers answered the walk toward the key
-                    // (TASK-174: the near-key bar for an EMPTY provider set).
+                    // (TASK-174: the near-key bar for an EMPTY provider set). The `found`
+                    // BTreeSet iterates in ascending `PeerId` order, so collecting it yields
+                    // the deterministic ascending fan-out set.
                     let reach = QueryReach {
                         answered: stats.num_successes(),
                     };
                     let _ = reply.send(match res {
-                        Ok(_) => Ok((found, reach)),
+                        Ok(_) => Ok(ProviderFanOut {
+                            providers: found.into_iter().collect(),
+                            truncated,
+                            reach,
+                        }),
                         Err(kad::GetProvidersError::Timeout { .. }) => Err(QueryFail::Timeout),
                     });
                 }
@@ -1179,8 +1306,14 @@ pub const DEFAULT_RELAY_SERVER_ENABLED: bool = true;
 //     largest legal record) yet ~32x BELOW the library's 65 KiB, so a peer cannot park 64 KiB
 //     of junk per key on us. This is the value that stops per-record amplification.
 //   * RECORD COUNT bounds total distinct value-store keys we hold. 4096 (vs the 1024 default,
-//     raised for real-network headroom) * the 2 KiB value ceiling bounds worst-case value-
-//     store memory at ~8 MiB - fine for a home node, far from unbounded.
+//     raised for real-network headroom) * the 2 KiB value ceiling bounds the worst-case
+//     VALUE-PAYLOAD bytes at ~8 MiB (4096 * 2 KiB). This is a bound on the record VALUES only:
+//     it EXCLUDES the record keys, the store's index maps, the separate provider+address
+//     records (see PROVIDERS-PER-KEY / PROVIDED KEYS below), and per-entry allocator overhead,
+//     so TOTAL store memory is larger than 8 MiB by those addends. Every one of those addends
+//     is ALSO independently bounded (see below), so total store memory stays hard-bounded -
+//     just not AT 8 MiB. Do not read ~8 MiB as the whole-store figure; it is the value-payload
+//     component, the dominant and most attacker-controllable one.
 //   * PROVIDERS-PER-KEY is the DIRECT sybil-flood cap libp2p itself documents ("if the
 //     providers list is full, we ignore the new provider ... can mitigate Sybil attacks"). We
 //     pin it EXPLICITLY at the kad replication factor 20 (k) so the anti-sybil intent is a
@@ -1204,11 +1337,12 @@ pub const DEFAULT_RELAY_SERVER_ENABLED: bool = true;
 //     answer, and Nix re-verifies every fetched byte regardless. The cap's job is only to
 //     stop a poisoning FLOOD from costing unbounded memory.
 //   * AMPLIFICATION (junk parked to inflate our memory/serve cost). `STORE_MAX_VALUE_BYTES`
-//     (per record) and `STORE_MAX_RECORDS` (count) hard-bound value-store memory (~8 MiB
-//     worst case); the consumer fan-out cap (`DiscoveryBudget.max_peers`, directory.rs)
-//     bounds how many providers ONE lookup chases, so a flooded index cannot turn a lookup
-//     into one round trip per forged provider. These bound COST; they do not stop a peer
-//     from TRYING.
+//     (per record) and `STORE_MAX_RECORDS` (count) hard-bound the value-PAYLOAD memory (~8 MiB
+//     worst case - values only; keys/maps/provider records add a separately-bounded, smaller
+//     addend, so total store memory is larger but still hard-bounded, never unbounded). The
+//     consumer fan-out cap (`DiscoveryBudget.max_peers`, directory.rs) bounds how many
+//     providers ONE lookup chases, so a flooded index cannot turn a lookup into one round trip
+//     per forged provider. These bound COST; they do not stop a peer from TRYING.
 //   * SYBIL (many fake identities flooding one key). `STORE_MAX_PROVIDERS_PER_KEY` caps how
 //     many providers we store per key (libp2p's own documented Sybil mitigation), so a
 //     flood cannot evict a legitimate provider past the cap. This RAISES the cost of a
@@ -1229,7 +1363,9 @@ pub const DEFAULT_RELAY_SERVER_ENABLED: bool = true;
 
 /// Max distinct value-store records this node holds for OTHER peers' keys (it is k-closest
 /// to). 4096, vs the library default 1024: real-network headroom, still hard-bounded. With
-/// [`STORE_MAX_VALUE_BYTES`] this caps worst-case value-store memory at ~8 MiB.
+/// [`STORE_MAX_VALUE_BYTES`] this caps the worst-case VALUE-PAYLOAD memory at ~8 MiB (4096 * 2
+/// KiB) - the record values only; keys, index maps and provider/address records add a
+/// separately-bounded addend, so total store memory is larger but still hard-bounded.
 pub const STORE_MAX_RECORDS: usize = 4096;
 
 /// Hard per-value byte ceiling for the kad value store. 2 KiB (`2 * 1024`): strictly ABOVE
@@ -1518,9 +1654,14 @@ impl Node {
         let accept_join = tokio::spawn(run_accept_loop(incoming, Arc::clone(&serve_slot)));
 
         let (tx, rx) = mpsc::channel(64);
+        // The dedicated LOSSLESS query-cancel channel (TASK-154 B3), separate from the bounded
+        // command channel so an abandoned-query cancel is never dropped under command
+        // backpressure.
+        let (cancel_tx, cancel_rx) = mpsc::unbounded_channel();
         let worker = Worker {
             swarm,
             commands: rx,
+            cancels: cancel_rx,
             pending: HashMap::new(),
         };
         let join = tokio::spawn(worker.run());
@@ -1528,6 +1669,7 @@ impl Node {
         Ok(Node {
             handle: SwarmHandle {
                 tx,
+                cancels: cancel_tx,
                 control,
                 nar_protocol,
                 serve_slot,
@@ -1707,19 +1849,18 @@ mod tests {
         let armed_id = kad.get_providers(kad::RecordKey::new(&b"a".to_vec()));
         let disarmed_id = kad.get_providers(kad::RecordKey::new(&b"b".to_vec()));
 
-        let (tx, mut rx) = mpsc::channel::<Command>(4);
+        // The LOSSLESS dedicated cancel channel (TASK-154 B3): a dropped guard sends the
+        // abandoned query's id here, unbounded so it is never dropped under backpressure.
+        let (tx, mut rx) = mpsc::unbounded_channel::<kad::QueryId>();
 
         // ARMED: dropping the guard mid-wait (the abandoned find_providers deadline case)
-        // enqueues a Cancel for its query. Delete the Drop send and this receives nothing.
+        // sends a cancel for its query. Delete the Drop send and this receives nothing.
         {
             let _guard = CancelOnDrop::new(tx.clone(), armed_id);
         }
         match rx.try_recv() {
-            Ok(Command::Cancel { id }) => {
-                assert_eq!(id, armed_id, "cancel must carry the armed query's id")
-            }
-            Ok(_) => panic!("armed drop enqueued the wrong command"),
-            Err(_) => panic!("armed drop must enqueue a Cancel, but nothing was sent"),
+            Ok(id) => assert_eq!(id, armed_id, "cancel must carry the armed query's id"),
+            Err(_) => panic!("armed drop must send a cancel, but nothing was sent"),
         }
 
         // DISARMED: a query that completed normally calls disarm(); dropping sends NOTHING,
@@ -1731,6 +1872,32 @@ mod tests {
         assert!(
             rx.try_recv().is_err(),
             "a disarmed (normally-completed) query must NOT be cancelled"
+        );
+    }
+
+    #[test]
+    fn cancel_on_drop_is_lossless_even_when_many_cancels_queue_up() {
+        // TASK-154 B3: the OLD guard used `try_send` on the BOUNDED command channel, which
+        // SILENTLY DROPPED a cancel whenever the channel was full (a cancel storm) - leaving
+        // that query to run to its full timeout, the very case the work bound exists to stop.
+        // The dedicated UNBOUNDED cancel channel never drops: queue far more cancels than any
+        // bounded channel would hold and prove EVERY id arrives. Revert to a bounded try_send
+        // and this loses cancels past the capacity.
+        let mut kad = bare_kad();
+        let (tx, mut rx) = mpsc::unbounded_channel::<kad::QueryId>();
+        let mut expected = Vec::new();
+        for i in 0..1000u32 {
+            let id = kad.get_providers(kad::RecordKey::new(&i.to_be_bytes().to_vec()));
+            expected.push(id);
+            drop(CancelOnDrop::new(tx.clone(), id)); // armed drop -> lossless send
+        }
+        let mut got = Vec::new();
+        while let Ok(id) = rx.try_recv() {
+            got.push(id);
+        }
+        assert_eq!(
+            got, expected,
+            "every armed-drop cancel must be delivered in order - no cancel is ever dropped"
         );
     }
 
@@ -1751,13 +1918,105 @@ mod tests {
             q.finish();
         }
 
-        // UNKNOWN id: a behaviour with an EMPTY query pool resolves NO id, so the Cancel arm
-        // is a safe no-op (the already-terminated case). This is what makes `Command::Cancel`
-        // fail-safe for a query that finished before its Cancel arrived.
+        // UNKNOWN id: a behaviour with an EMPTY query pool resolves NO id, so the cancel path
+        // is a safe no-op (the already-terminated case). This is what makes `cancel_query`
+        // fail-safe for a query that finished before its cancel arrived.
         let mut empty = bare_kad();
         assert!(
             empty.query_mut(&live).is_none(),
-            "an unknown/terminated id must not resolve - Cancel is a safe no-op"
+            "an unknown/terminated id must not resolve - cancel is a safe no-op"
         );
+    }
+
+    // ============ TASK-154 B1: bounded, deterministic provider fan-out aggregation ============
+    // `retain_bounded_provider` is the pure fold the worker applies to EVERY advertised
+    // provider as `FoundProviders` events stream in. Testing it directly proves the memory
+    // bound and the deterministic selection WITHOUT a live swarm.
+
+    #[test]
+    fn retain_bounded_provider_holds_at_most_max_peers_regardless_of_flood() {
+        // A sybil flood advertises N >> max_peers providers. The retained set MUST never exceed
+        // max_peers AT ANY POINT (the O(max_peers) memory bound) - the anti-amplification bite:
+        // the OLD code accumulated all N into a HashSet then sorted+truncated (O(N) memory /
+        // O(N log N) work in the forged count). Delete the trim and `len` blows past max_peers.
+        let max_peers = 16usize;
+        let mut found = BTreeSet::new();
+        let mut truncated = false;
+        for _ in 0..10_000 {
+            retain_bounded_provider(&mut found, max_peers, &mut truncated, PeerId::random());
+            assert!(
+                found.len() <= max_peers,
+                "retained set must never exceed max_peers - the bounded-memory invariant"
+            );
+        }
+        assert_eq!(
+            found.len(),
+            max_peers,
+            "a flood fills the set to exactly the bound"
+        );
+        assert!(
+            truncated,
+            "discarding any provider past the bound sets truncated"
+        );
+    }
+
+    #[test]
+    fn retain_bounded_provider_keeps_the_max_peers_smallest_deterministically() {
+        // The retained subset MUST be exactly the max_peers globally-smallest PeerIds, the SAME
+        // subset the old post-hoc `sort_unstable().truncate()` produced, and independent of
+        // arrival order. Fold the SAME ids in forward and reverse order; both must converge on
+        // the identical set, equal to the smallest max_peers of the input.
+        let ids: Vec<PeerId> = (0..64).map(|_| PeerId::random()).collect();
+        let max_peers = 10usize;
+
+        let fold = |order: &[PeerId]| -> BTreeSet<PeerId> {
+            let mut found = BTreeSet::new();
+            let mut truncated = false;
+            for &p in order {
+                retain_bounded_provider(&mut found, max_peers, &mut truncated, p);
+            }
+            found
+        };
+        let forward = fold(&ids);
+        let mut rev = ids.clone();
+        rev.reverse();
+        let backward = fold(&rev);
+        assert_eq!(forward, backward, "selection must be order-independent");
+
+        let mut sorted = ids.clone();
+        sorted.sort_unstable();
+        let expected: BTreeSet<PeerId> = sorted.into_iter().take(max_peers).collect();
+        assert_eq!(
+            forward, expected,
+            "the retained set must be the max_peers smallest PeerIds (matches sort+truncate)"
+        );
+    }
+
+    #[test]
+    fn retain_bounded_provider_max_peers_zero_retains_none_but_marks_truncated() {
+        // The degenerate budget: a caller that budgeted zero peers retains NO provider, yet a
+        // non-empty index must still mark the result truncated so the directory does NOT read
+        // an empty fan-out as an authoritative Miss (TASK-154 B2).
+        let mut found = BTreeSet::new();
+        let mut truncated = false;
+        retain_bounded_provider(&mut found, 0, &mut truncated, PeerId::random());
+        assert!(found.is_empty(), "max_peers=0 retains no provider");
+        assert!(
+            truncated,
+            "but discarding the named provider marks truncated"
+        );
+    }
+
+    #[test]
+    fn retain_bounded_provider_duplicate_is_not_a_discard() {
+        // Re-advertising an already-retained provider (kad can report a provider more than once
+        // across steps) leaves the set unchanged and does NOT falsely set truncated.
+        let mut found = BTreeSet::new();
+        let mut truncated = false;
+        let p = PeerId::random();
+        retain_bounded_provider(&mut found, 4, &mut truncated, p);
+        retain_bounded_provider(&mut found, 4, &mut truncated, p);
+        assert_eq!(found.len(), 1, "a duplicate does not grow the set");
+        assert!(!truncated, "a duplicate is not a discard");
     }
 }
