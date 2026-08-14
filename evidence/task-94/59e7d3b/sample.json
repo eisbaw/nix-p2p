@@ -51,7 +51,8 @@
       "sum_nar_size_bytes_uncompressed_nar": 1176685088,
       "nar_size_min_bytes_uncompressed_nar": 4968,
       "nar_size_max_bytes_uncompressed_nar": 277242232,
-      "nar_size_span_orders_of_magnitude": 55805.60225442834,
+      "nar_size_span_multiple": 55805.60225442834,
+      "nar_size_span_log10": 4.746677799404533,
       "n_uncompressed_excluded": 2,
       "n_unknown_compression_excluded": 0,
       "n_unsigned_excluded": 0,
@@ -2355,82 +2356,7 @@
     "gate_violations": [],
     "gate_passed": true
   },
-  "raw_peer_socket_throughput": {
-    "profile": {
-      "delay_ms": 20,
-      "rate_cap_mbit": 100
-    },
-    "shaping_primitive": "scripts/shaped_link.py (task-70), tc netem over veth",
-    "per_size": [
-      {
-        "nar_size_bytes_uncompressed_nar": 8388608,
-        "shaped": {
-          "link_label": "wan_shaped",
-          "rtt_ms": 48.108,
-          "throughput_mbit_per_s": 73.9,
-          "throughput_bytes_uncompressed_nar_per_s": 9237500.0,
-          "delivered_bytes_uncompressed_nar": 8388608,
-          "shaping_asserted": true,
-          "shaping_error": null
-        },
-        "loopback_control": {
-          "link_label": "loopback",
-          "rtt_ms": 0.053,
-          "throughput_mbit_per_s": 38351.06,
-          "throughput_bytes_uncompressed_nar_per_s": 4793882500.0,
-          "delivered_bytes_uncompressed_nar": 8388608,
-          "wan_label_refused": true
-        },
-        "shaped_arm_transcript": "=== RTT probe (shape=yes) ===\n5 packets transmitted, 5 received, 0% packet loss, time 802ms\nrtt min/avg/max/mdev = 40.093/48.108/80.139/16.015 ms\n=== XFER (shape=yes, total=8388608 bytes) ===\nRECV_READY port=9099\nRECV_DONE bytes=8388608 expect=8388608 status=ok\nSEND_DONE bytes=8388608 elapsed_s=0.9081 mbit_per_s=73.90 MB_per_s=9.24\n",
-        "loopback_arm_transcript": "=== RTT probe (shape=no) ===\n5 packets transmitted, 5 received, 0% packet loss, time 826ms\nrtt min/avg/max/mdev = 0.047/0.053/0.058/0.004 ms\n=== XFER (shape=no, total=8388608 bytes) ===\nRECV_READY port=9099\nRECV_DONE bytes=8388608 expect=8388608 status=ok\nSEND_DONE bytes=8388608 elapsed_s=0.0017 mbit_per_s=38351.06 MB_per_s=4793.88\n"
-      },
-      {
-        "nar_size_bytes_uncompressed_nar": 20971520,
-        "shaped": {
-          "link_label": "wan_shaped",
-          "rtt_ms": 48.125,
-          "throughput_mbit_per_s": 85.58,
-          "throughput_bytes_uncompressed_nar_per_s": 10697500.0,
-          "delivered_bytes_uncompressed_nar": 20971520,
-          "shaping_asserted": true,
-          "shaping_error": null
-        },
-        "loopback_control": {
-          "link_label": "loopback",
-          "rtt_ms": 0.057,
-          "throughput_mbit_per_s": 72393.15,
-          "throughput_bytes_uncompressed_nar_per_s": 9049143750.0,
-          "delivered_bytes_uncompressed_nar": 20971520,
-          "wan_label_refused": true
-        },
-        "shaped_arm_transcript": "=== RTT probe (shape=yes) ===\n5 packets transmitted, 5 received, 0% packet loss, time 802ms\nrtt min/avg/max/mdev = 40.079/48.125/80.118/15.996 ms\n=== XFER (shape=yes, total=20971520 bytes) ===\nRECV_READY port=9099\nRECV_DONE bytes=20971520 expect=20971520 status=ok\nSEND_DONE bytes=20971520 elapsed_s=1.9605 mbit_per_s=85.58 MB_per_s=10.70\n",
-        "loopback_arm_transcript": "=== RTT probe (shape=no) ===\n5 packets transmitted, 5 received, 0% packet loss, time 829ms\nrtt min/avg/max/mdev = 0.049/0.057/0.067/0.006 ms\n=== XFER (shape=no, total=20971520 bytes) ===\nRECV_READY port=9099\nSEND_DONE bytes=20971520 elapsed_s=0.0023 mbit_per_s=72393.15 MB_per_s=9049.14\nRECV_DONE bytes=20971520 expect=20971520 status=ok\n"
-      },
-      {
-        "nar_size_bytes_uncompressed_nar": 41943040,
-        "shaped": {
-          "link_label": "wan_shaped",
-          "rtt_ms": 48.206,
-          "throughput_mbit_per_s": 90.32,
-          "throughput_bytes_uncompressed_nar_per_s": 11290000.0,
-          "delivered_bytes_uncompressed_nar": 41943040,
-          "shaping_asserted": true,
-          "shaping_error": null
-        },
-        "loopback_control": {
-          "link_label": "loopback",
-          "rtt_ms": 0.05,
-          "throughput_mbit_per_s": 61641.87,
-          "throughput_bytes_uncompressed_nar_per_s": 7705233750.0,
-          "delivered_bytes_uncompressed_nar": 41943040,
-          "wan_label_refused": true
-        },
-        "shaped_arm_transcript": "=== RTT probe (shape=yes) ===\n5 packets transmitted, 5 received, 0% packet loss, time 802ms\nrtt min/avg/max/mdev = 40.100/48.206/80.116/15.955 ms\n=== XFER (shape=yes, total=41943040 bytes) ===\nRECV_READY port=9099\nRECV_DONE bytes=41943040 expect=41943040 status=ok\nSEND_DONE bytes=41943040 elapsed_s=3.7149 mbit_per_s=90.32 MB_per_s=11.29\n",
-        "loopback_arm_transcript": "=== RTT probe (shape=no) ===\n5 packets transmitted, 5 received, 0% packet loss, time 825ms\nrtt min/avg/max/mdev = 0.034/0.050/0.066/0.011 ms\n=== XFER (shape=no, total=41943040 bytes) ===\nRECV_READY port=9099\nSEND_DONE bytes=41943040 elapsed_s=0.0054 mbit_per_s=61641.87 MB_per_s=7705.23\nRECV_DONE bytes=41943040 expect=41943040 status=ok\n"
-      }
-    ],
-    "note": "raw TCP over an emulated link; NOT the real libp2p transport (that is task-198's deferred scope). Peer bytes here are RAW NAR bytes."
-  },
+  "raw_peer_socket_throughput": null,
   "break_even": [
     {
       "inputs": {
@@ -2492,37 +2418,6 @@
         "discovery_latency_s": "ASSUMED (illustrative)",
         "peer_bandwidth": "ASSUMED (illustrative)",
         "units": "assumed upstream/peer bandwidths are binary MiB/s constants (x1024**2 -> B/s); peer bandwidth is a binary MiB/s constant (x1024**2 -> B/s)"
-      }
-    },
-    {
-      "inputs": {
-        "ratio_file_over_nar": 0.3255628680152017,
-        "upstream_bandwidth_bytes_compressed_wire_per_s": 22020096,
-        "peer_bandwidth_bytes_uncompressed_nar_per_s": 11290000.0,
-        "cdn_latency_s": 0.05,
-        "discovery_latency_s": 1.0,
-        "assumed_not_measured_here": true,
-        "input_measured_or_assumed": {
-          "upstream_bandwidth": "assumed",
-          "peer_bandwidth": "measured",
-          "cdn_latency_s": "assumed",
-          "discovery_latency_s": "assumed"
-        }
-      },
-      "per_byte_saving_s_per_nar_byte": -7.378915232256657e-08,
-      "latency_premium_s": 0.95,
-      "peer_bandwidth_needed_to_break_even_bytes_uncompressed_nar_per_s": 67637000.909366,
-      "verdict": "NO SIZE THRESHOLD EXISTS",
-      "interpretation": "the peer saves nothing per NAR byte (it moves raw NAR, ~1/ratio the CDN's wire bytes) and holds no latency advantage; no size lets it catch up. Raw WAN loses at every size -- the expected honest baseline.",
-      "threshold_kind": null,
-      "break_even_nar_size_bytes_uncompressed_nar": null,
-      "scenario": "measured_shaped_peer",
-      "input_provenance": {
-        "upstream_bandwidth": "ASSUMED (scripts/profile_p2p.py / task-35 real-upstream; not re-measured here)",
-        "cdn_latency_s": "ASSUMED (illustrative)",
-        "discovery_latency_s": "ASSUMED (illustrative)",
-        "peer_bandwidth": "MEASURED (this run's shaped arm, raw NAR bytes/s)",
-        "units": "assumed upstream/peer bandwidths are binary MiB/s constants (x1024**2 -> B/s); measured peer bandwidth is derived from the shaped arm's decimal Mbit/s (x1e6/8 -> B/s)"
       }
     }
   ]
