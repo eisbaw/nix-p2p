@@ -20,12 +20,16 @@ use std::time::Instant;
 
 use peer_fabric::{Blake3Digest, BoundedZstdDecoder, DEFAULT_ZSTD_LEVEL, compress_zstd};
 
-/// The levels measured: a FAST level (3, hundreds of MB/s) and the shipped DEFAULT (19,
-/// high-ratio but slow), so the ratio-vs-CPU tradeoff that decides the regime is visible.
-/// Level 22 (max) is deliberately NOT swept: on the large NARs it costs minutes for a ~1-2%
-/// marginal ratio gain over 19 - a known zstd property, not worth the shared-box CPU here;
-/// the 3-vs-19 spread already brackets the decision.
-const LEVELS: &[i32] = &[3, DEFAULT_ZSTD_LEVEL];
+/// The levels measured, FROZEN as LITERALS and DECOUPLED from the shipped policy default: a FAST
+/// level (3, hundreds of MB/s) and a HIGH-RATIO slow level (19, near-xz ratio). These are the two
+/// decision points the ratio-vs-CPU tradeoff turns on, so they must stay fixed independent of
+/// whatever `DEFAULT_ZSTD_LEVEL` happens to be - the earlier `[3, DEFAULT_ZSTD_LEVEL]` COLLAPSED
+/// to `[3, 3]` when the measurement drove the default to 3, silently dropping the level-19 arm
+/// and making the committed `[3, 19]` evidence un-reproducible (codex DEEP-gate). Level 22 (max)
+/// is deliberately NOT swept: on the large NARs it costs minutes for a ~1-2% marginal ratio gain
+/// over 19 - a known zstd property, not worth the shared-box CPU here; the 3-vs-19 spread already
+/// brackets the decision. (The shipped default is 3; see `DEFAULT_ZSTD_LEVEL`, emitted below.)
+const LEVELS: &[i32] = &[3, 19];
 
 /// Feed compressed bytes to the bounded decoder in wire-sized chunks, as the fetch loop does.
 const DECODE_FEED_CHUNK: usize = 64 * 1024;

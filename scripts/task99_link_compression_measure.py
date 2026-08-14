@@ -53,7 +53,21 @@ LAN_BYTES_PER_SEC = 204_000_000  # ~204 MB/s, the transport CPU-bound ceiling
 NS_PER_SEC = 1_000_000_000
 
 # The shipped default level, echoed for the report; the codec crate is the source of truth.
+# FAIL-CLOSED: the raw artifact's `default_level` MUST equal this, or the artifact was produced
+# by a harness on a different policy default than this finalizer claims (a re-derivability drift
+# codex flagged). See `validate_raw`.
 SHIPPED_LEVEL = 3
+
+# The two decision-point levels the harness MUST sweep (frozen literals in the Rust harness,
+# `measure_link_compression.rs`): a fast level and a high-ratio level. The finalizer REQUIRES both
+# for every file, so a harness that collapsed the sweep (e.g. `[3, DEFAULT]` -> `[3, 3]` when the
+# default flipped) is rejected rather than silently producing a one-level artifact.
+EXPECTED_LEVELS = frozenset({3, 19})
+
+# The minimum same-path (xz-vs-zstd) join required for an HONEST verdict: the same-path compare is
+# the ONLY non-confounded ratio verdict (the committed baseline is a different nar set), so the
+# finalizer fails closed if it cannot form it.
+MIN_SAME_PATH_ROWS = 3
 
 
 class Reject(Exception):
@@ -74,6 +88,50 @@ def require_pos_int(value, where: str) -> int:
     if v == 0:
         raise Reject(f"{where}: expected a positive integer, got 0")
     return v
+
+
+def validate_raw(raw: dict) -> None:
+    """FAIL-CLOSED structural checks on the harness artifact BEFORE any conclusion is derived
+    (mirroring the TASK-94 re-derivability discipline). Raises `Reject` on:
+      * a `default_level` that is missing or != the shipped level this finalizer claims;
+      * fewer than two measured files (a one-file input is too thin to conclude from);
+      * any file whose swept levels are not EXACTLY {3, 19} (a collapsed/duplicated/extra sweep -
+        the exact drift that made the committed [3,19] evidence un-reproducible from a [3,3] run).
+    """
+    default_level = raw.get("default_level")
+    if isinstance(default_level, bool) or not isinstance(default_level, int):
+        raise Reject(
+            f"raw.default_level: expected an integer, got {default_level!r}"
+        )
+    if default_level != SHIPPED_LEVEL:
+        raise Reject(
+            f"raw.default_level {default_level} != the finalizer's shipped level {SHIPPED_LEVEL}: "
+            "the artifact was produced against a different policy default than this finalizer "
+            "reports - regenerate the evidence from the committed harness"
+        )
+
+    files = raw.get("files")
+    if not isinstance(files, list) or len(files) < 2:
+        raise Reject(
+            f"raw.files: expected at least 2 measured files, got "
+            f"{0 if not isinstance(files, list) else len(files)}"
+        )
+
+    for f in files:
+        path = f.get("path", "<unknown>")
+        levels = f.get("levels")
+        if not isinstance(levels, list):
+            raise Reject(f"{path}: missing levels array")
+        level_values = [lv.get("level") for lv in levels]
+        if any(isinstance(v, bool) or not isinstance(v, int) for v in level_values):
+            raise Reject(f"{path}: non-integer level in {level_values!r}")
+        if len(level_values) != len(set(level_values)):
+            raise Reject(f"{path}: duplicate level in {level_values!r} (a collapsed sweep)")
+        if set(level_values) != set(EXPECTED_LEVELS):
+            raise Reject(
+                f"{path}: swept levels {sorted(level_values)} != the required "
+                f"{sorted(EXPECTED_LEVELS)} - the harness must sweep both decision points"
+            )
 
 
 def baseline_ratio(baseline_path: Path) -> tuple[int, int]:
@@ -121,12 +179,11 @@ def main() -> int:
         return 2
     baseline = Fraction(base_num, base_den)
 
-    files = raw.get("files")
-    if not files:
-        print("harness JSON has no files", file=sys.stderr)
-        return 2
-
     try:
+        # FAIL-CLOSED structural validation FIRST (default_level, file count, both levels).
+        validate_raw(raw)
+        files = raw["files"]
+
         # Aggregate compressed/raw sums PER LEVEL, as exact integers.
         level_sums: dict[int, dict[str, int]] = {}
         per_file_report = []
@@ -168,7 +225,11 @@ def main() -> int:
                         "raw_bytes": rb,
                         "ratio_pair": [cb, rb],
                         "ratio_display": frac_str(ratio),
-                        "beats_cdn_wire": breaks_even,
+                        # INFORMATIONAL ONLY, CROSS-NAR-SET: this compares THIS nar's zstd ratio
+                        # against TASK-94's DIFFERENT 220-nar aggregate baseline, so it is
+                        # confounded by the nar-set difference and is NOT a verdict. The honest
+                        # verdict is `same_path_xz_vs_zstd` (identical paths). See fix #3.
+                        "beats_task94_crossset_baseline_INFORMONLY": breaks_even,
                         "compress_bytes_per_sec": compress_bps,
                         "decompress_bytes_per_sec": decompress_bps,
                         "compress_ns": comp_ns,
@@ -221,7 +282,13 @@ def main() -> int:
                     "sum_raw_bytes": s["raw"],
                     "aggregate_ratio_pair": [s["compressed"], s["raw"]],
                     "aggregate_ratio_display": frac_str(agg_ratio),
-                    "aggregate_beats_cdn_wire": agg_breaks_even,
+                    # INFORMATIONAL ONLY, CROSS-NAR-SET (see per-file note): this aggregate is
+                    # compared against TASK-94's DIFFERENT 220-nar baseline and is confounded by
+                    # the nar-set difference, so it is NOT the verdict. It used to be persisted as
+                    # `aggregate_beats_cdn_wire: true` and asserted on stderr, which over-read a
+                    # cross-set number as a headline (codex DEEP-gate fix #3). The ONLY honest
+                    # ratio verdict is `same_path_xz_vs_zstd`.
+                    "beats_task94_crossset_baseline_INFORMONLY": agg_breaks_even,
                     "aggregate_compress_bytes_per_sec": agg_compress_bps,
                     "aggregate_decompress_bytes_per_sec": agg_decompress_bps,
                     "net_home_uplink": net_ns(HOME_UPLINK_BYTES_PER_SEC),
@@ -290,8 +357,8 @@ def main() -> int:
                         "zstd_beats_xz_aggregate": zsum < sums["xz"],
                     }
                 same_path = {
-                    "note": "rigorous: xz (CDN) vs our zstd on the IDENTICAL paths; the honest "
-                    "ratio verdict (the committed-baseline compare above uses a DIFFERENT nar set)",
+                    "note": "rigorous: xz (CDN) vs our zstd on the IDENTICAL paths; the ONLY "
+                    "honest ratio verdict (the cross-set fields above use a DIFFERENT nar set)",
                     "n_paths": len(rows),
                     "sum_nar_bytes": sums["nar"],
                     "sum_xz_bytes": sums["xz"],
@@ -300,6 +367,22 @@ def main() -> int:
                     "zstd_aggregate_by_level": agg_levels,
                     "per_path": rows,
                 }
+
+        # FAIL-CLOSED: the same-path xz-vs-zstd comparison is the ONLY honest ratio verdict, so it
+        # is REQUIRED - an input without a CDN narinfo join (no `--cdn-narinfo`, or too few joined
+        # paths) cannot produce a trustworthy conclusion and is rejected rather than shipping only
+        # the confounded cross-set numbers (codex DEEP-gate fix #3/#4).
+        if same_path is None:
+            raise Reject(
+                "the same-path xz-vs-zstd comparison is REQUIRED (pass --cdn-narinfo with the "
+                "CDN xz FileSize/NarSize for the SAME paths); the cross-set baseline compare "
+                "alone is confounded and not an honest verdict"
+            )
+        if same_path["n_paths"] < MIN_SAME_PATH_ROWS:
+            raise Reject(
+                f"same-path join has only {same_path['n_paths']} path(s); need "
+                f">= {MIN_SAME_PATH_ROWS} for an honest aggregate verdict"
+            )
     except Reject as exc:
         print(f"REJECTED (fail closed): {exc}", file=sys.stderr)
         return 1
@@ -328,9 +411,11 @@ def main() -> int:
     print("TASK-99 link-compression measurement (integer-exact):", file=sys.stderr)
     print(f"  CDN baseline FileSize/NarSize = {frac_str(baseline)}", file=sys.stderr)
     for lr in level_report:
+        # NOTE: the cross-set `beats_task94_crossset_baseline_INFORMONLY` field is deliberately
+        # NOT printed as a headline - it is confounded (different nar set). The honest ratio
+        # verdict is the SAME-PATH block below.
         print(
             f"  zstd -{lr['level']:>2}: ratio {lr['aggregate_ratio_display']}"
-            f"  beats-CDN={lr['aggregate_beats_cdn_wire']}"
             f"  compress={lr['aggregate_compress_bytes_per_sec']:,} B/s"
             f"  decompress={lr['aggregate_decompress_bytes_per_sec']:,} B/s",
             file=sys.stderr,
