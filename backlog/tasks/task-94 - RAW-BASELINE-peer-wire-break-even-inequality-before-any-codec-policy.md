@@ -5,7 +5,7 @@ status: In Progress
 assignee:
   - '@mped'
 created_date: '2026-08-10 08:43'
-updated_date: '2026-08-14 06:05'
+updated_date: '2026-08-14 06:33'
 labels:
   - wave-2b
 dependencies:
@@ -150,4 +150,23 @@ CONCLUSION UNCHANGED: raw peer loses at every size in the measured quadrant (hom
 SCOPE (honest, not overclaimed): 'signed'=nonempty Sig field, NOT crypto signature verification. The verifier shares _aggregate_from_records with the producer; a fully independent 2nd impl is out of scope for a diagnostic -- the integer-exact strictness + the 11 mutation-bites are the assurance. Residual naming smell (nar_size_span_orders_of_magnitude holds a linear multiple) tracked separately as TASK-199.
 
 AC#1/#3/#4 genuinely met and remain ticked.
+
+RE-GATE 2026-08-14 = codex NO-GO (3rd), ARBITRATED DOWN. codex CONFIRMED the core is fixed: numbers auditable + deterministically reproducible (BFS deterministic vs pinned nixpkgs), integer-exact re-derivation closed the NaN/drift class, quadrant algebra + receiver counter + headline framing all sound, committed artifact clean. codex-3's NEW findings are a NARROWER class — tamper-resistance of a diagnostic artifact + one boundary-float — above the bar for a task that ships no wire bytes / freezes no surface / whose artifact is machine-generated from real narinfo. Per the PRD threat model (store-path integrity is Nix's job; a measurement artifact is not a security surface) I arbitrate the NO-GO to NOT block Done as a class. BUT the concrete sub-findings are cheap and two touch claims 94 makes, so FINAL hardening cycle: (a) validate positivity — every FileSize/NarSize must be a positive int; (b) uniqueness gate — admitted store_hashes must be unique (a duplicate must not inflate the path count); (c) exact-type checks — 'signed'/'gate_passed' compared by EXACT bool (is True / isinstance bool), not truthiness (string 'false' / int 1 must be rejected); (d) finalize must require gate_passed is True AND gate_violations empty (reject truthy-nonbool + nonempty-violations-with-passing-gate); (e) INTEGER span gate — replace the float max/min span with an integer comparison (max_nar >= min_nar * min_span_int) so there is genuinely no float in the admission trust path, and RENAME the field (fold + CLOSE TASK-199: nar_size_span_orders_of_magnitude holds a linear multiple). Add a pinned self-test mutation for each of (a)-(d) + the span boundary; each must bite RED. Regenerate the evidence artifact. Correct any 'no float in trust path' wording that is now literally true only after (e). This is the FINAL cycle — orchestrator re-verifies codex-3's mutations directly, no 4th codex gate.
+
+FINAL HARDENING CYCLE — DONE (2026-08-14). Code @ 59e7d3b, evidence @ e03ed53 (evidence/task-94/59e7d3b/sample.json; stale cdf5c3a removed). Conclusion UNCHANGED: raw peer loses at every size in the measured quadrant.
+
+codex-3's arbitrated-down sub-findings all fixed; EACH has a pinned self-test mutation that is REJECTED after the fix and ACCEPTED once its specific guard is monkeypatch-reverted (proving the guard, not an unrelated check, is what bites):
+ (a) POSITIVITY — _require_int_field now rejects zero/negative FileSize/NarSize. BEFORE: a negative record FileSize with a re-generated (internally consistent) summary re-derived clean (exact sums matched the doctored record). AFTER: rejected fail-closed ('byte counts must be POSITIVE').
+ (b) UNIQUENESS — _require_unique_admitted rejects duplicate admitted store_hashes. BEFORE: 199 unique + 1 duplicate reported n_compressed=200 and passed. AFTER: rejected ('duplicate admitted store_hash ... inflates n_compressed').
+ (c) EXACT-TYPE signed — _stored_bool_matches requires isinstance(bool) AND is. BEFORE (truthiness): signed=1 / "false" / "true" all agreed with re-derived True. AFTER: all three rejected ('must be an EXACT bool').
+ (d) GATE CONSISTENCY in finalize — _assert_gate_block_publishable requires gate_passed IS True AND empty gate_violations. BEFORE (decisive blocker): a truthy-non-bool gate_passed (1 / "true") published, and a passing gate carrying nonempty gate_violations published (violations never inspected). AFTER: all refused.
+ (e) INTEGER span gate + CLOSES TASK-199 — sample_gate span is now max_nar >= min_nar * MIN_SPAN_MULTIPLE (pure int; --min-span is int). BEFORE (float max/min): the boundary max=min*10000-1 with min=2**41 rounds to 10000.0 and passed. AFTER: rejected exactly; a sample AT the bar still passes (no false-positive). Field renamed nar_size_span_orders_of_magnitude -> nar_size_span_multiple, plus a true nar_size_span_log10.
+
+WORDING: the module docstring now states accurately (only literally true after (e)) that NO float is on the integrity/admission trust path — integrity re-derivation, positivity, uniqueness, exact-bool and the span gate are all integer/exact; floats live ONLY in display/analysis outputs (displayed ratio, span multiple/log10, break-even threshold, throughput).
+
+RE-DERIVED headline (from committed records, --verify-artifact, rc=0): FileSize/NarSize = 0.3255628680152017 (3.0716x); 220 admitted signed+compressed, 2 Compression:none excluded, 0 unknown / 0 unsigned; NarSize 4968 B .. 277242232 B (span_multiple 55805.6, span_log10 4.75). Seed-closure BFS is deterministic vs the pinned nixpkgs registry so it reproduced the prior snapshot EXACTLY.
+
+BOUNDED GATE (nix develop, all rc=0): peer_wire --self-test (all prior 11 tamper mutations + new (a)-(e), each RED-under-reverted-guard); shaped_link --self-test (6 mut + 4 trunc + delivery-counter); ruff check clean; ruff format --check clean (30 files); py_compile OK; just independence GREEN; --verify-artifact rc=0. No netns leak; disk ~84G free.
+
+AC#1/#3/#4 genuinely met and remain ticked; AC#2/#5 unchanged. This was the FINAL cycle (orchestrator re-verified codex-3's mutations directly; no 4th codex gate). TASK-199 closed here.
 <!-- SECTION:NOTES:END -->
