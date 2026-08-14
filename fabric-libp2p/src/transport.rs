@@ -1,5 +1,5 @@
 //! [`Libp2pTransport`] - the libp2p [`NarTransfer`]: fetch a NAR from a provider peer by
-//! STREAMING it over the shared swarm's `/nix-p2p/<scope>/nar/2` raw libp2p-stream protocol
+//! STREAMING it over the shared swarm's `/nix-p2p/<scope>/nar/3` raw libp2p-stream protocol
 //! (TASK-157), gate-1 BLAKE3-verify it, and honour the [`SafetyEnvelope`] (dial / body-idle /
 //! total bounds) and the signed NarSize as a true mid-stream size abort.
 //!

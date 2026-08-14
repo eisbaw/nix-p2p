@@ -34,6 +34,14 @@ async-trait = "0.1"
 #     serde-FREE: TASK-126 freezes that codec against the adopted backend.
 blake3 = "1"
 serde = { version = "1", features = ["derive"] }
+# TASK-99: peer-LINK compression codec (negotiated zstd, raw fallback). Lives here so the
+# codec + its integrity bites (bounded streaming decode, bomb/corruption/truncation) are
+# TRANSPORT-AGNOSTIC and shared by every fabric backend below the seam - the compressed
+# bytes are an UNSIGNED transport encoding; the addressed unit stays BLAKE3(RawNarV1). zstd
+# is NOT a p2p stack (AC#8 intact) and NOT an HTTP-stack crate; it is unreachable from the
+# std-only `testproxy`, so `scripts/check-independence.py` needs no allowlist/denylist
+# change (daemon may reach it transitively, testproxy never does - no shared convergence).
+zstd = "0.13"
 # TASK-126: the frozen ProviderRecord opaque value is an ed25519-SIGNED byte blob,
 # and its fail-closed decode VERIFIES the signature in-crate (the provider NodeId IS
 # the verifying key), so the "bad-signature fails closed" freeze rule is real and

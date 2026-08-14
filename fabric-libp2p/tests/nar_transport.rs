@@ -2,8 +2,10 @@
 //! bar): a SERVING node A and a CONSUMER node B, two independent libp2p swarms over real
 //! loopback TCP, prove that:
 //!
-//!   * B fetches a NAR from A over the shared swarm's `/nix-p2p/<scope>/nar/2` raw
-//!     libp2p-stream protocol (TASK-157) and gets BYTE-IDENTICAL, BLAKE3-verified bytes;
+//!   * B fetches a NAR from A over the shared swarm's `/nix-p2p/<scope>/nar/3` raw
+//!     libp2p-stream protocol (TASK-157 + TASK-99 negotiated codec) and gets
+//!     BYTE-IDENTICAL, BLAKE3-verified bytes - the default policy compresses the LINK
+//!     with zstd, decoded back to the identical raw NAR on the fetch side;
 //!   * a CORRUPT provider (bytes that do not hash to the requested digest) is rejected
 //!     by the fetch-side gate-1 BLAKE3 verify (`IntegrityMismatch`), never trusted;
 //!   * an OVERSIZED response (larger than the signed NarSize) trips the size abort

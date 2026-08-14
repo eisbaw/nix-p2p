@@ -1,4 +1,4 @@
-//! The libp2p NAR byte-transfer protocol `/nix-p2p/<scope>/nar/2`: a RAW libp2p-stream
+//! The libp2p NAR byte-transfer protocol `/nix-p2p/<scope>/nar/3`: a RAW libp2p-stream
 //! protocol (`AsyncRead`/`AsyncWrite` per call, TASK-157) carried over the SAME
 //! [`Swarm`](crate::swarm) as the kad+identify discovery behaviour. It REPLACES the
 //! original request-response carrier (TASK-151, protocol `/nar/1`), which buffered the
@@ -66,7 +66,10 @@ use std::time::Duration;
 use futures::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use proc_supervisor::TaskSupervisorHandle;
 
-use peer_fabric::{Blake3Digest, ServeBudget, TransferError};
+use peer_fabric::{
+    Blake3Digest, BoundedZstdDecoder, CodecChoiceReason, DecodeError, ServeBudget,
+    ServeCodecPolicy, TransferError, WireCodec, compress_zstd, negotiate_serve_codec,
+};
 
 /// The absolute ceiling on a single NAR response the FETCH side will read off the
 /// wire, whatever the per-call `expected_size`. It is the peer-triggerable-OOM floor: a
@@ -146,23 +149,36 @@ pub enum NarResponse {
 }
 
 // -------------------------------------------------------------------------
-// The RAW-STREAM NAR wire (TASK-157): replaces the request-response codec so bytes flow
-// as a stream, not a buffered request/response. The ADDRESSED UNIT on the wire is
-// unchanged - the exact `RawNarV1` bytes keyed by BLAKE3 - only the framing that MOVES
-// them peer to peer changed (the churnable transport layer, not a frozen surface).
+// The RAW-STREAM NAR wire (TASK-157, + TASK-99 per-connection codec negotiation): bytes flow
+// as a stream, not a buffered request/response. The ADDRESSED UNIT on the wire is unchanged -
+// the exact `RawNarV1` bytes keyed by BLAKE3 - only the framing that MOVES them peer to peer
+// changed (the churnable transport layer, not a frozen surface). TASK-99 bumps the protocol
+// to `/nix-p2p/<scope>/nar/3` (wholesale, as TASK-157 replaced `/nar/1` with `/nar/2`; no
+// dual-accept) and adds an explicit per-connection codec byte, so a peer may serve the nar
+// COMPRESSED (negotiated zstd) while still being addressed by BLAKE3 of the UNCOMPRESSED nar.
 //
-// Wire form (over one raw substream of `/nix-p2p/<scope>/nar/2`):
-//   Request  = 32 raw digest bytes; the requester then KEEPS its write half OPEN for the
-//              whole transfer (it is the "still interested" signal the server races
-//              production against - see `serve_stream`), closing only when done reading.
+// Wire form (over one raw substream of `/nix-p2p/<scope>/nar/3`):
+//   Request  = 32 raw digest bytes + 1 `accept` byte (the codec bitmask the FETCHER can
+//              DECODE: bit0=raw MANDATORY, bit1=zstd - see peer_fabric::codec). The requester
+//              then KEEPS its write half OPEN for the whole transfer (the "still interested"
+//              signal the server races production against - see `serve_stream`), closing only
+//              when done reading.
 //   Response = 1 status byte, then:
 //     * `0` NotHeld  - nothing follows; the server closes its write half.
-//     * `1` Nar      - the raw NAR bytes STREAMED to EOF (NO length prefix, mirroring
-//                      fabric-iroh's bao stream): the reader counts bytes as they arrive
-//                      and aborts the INSTANT cumulative bytes exceed the per-call bound,
-//                      so a lying provider is cut off at ~expected_size, never after
-//                      buffering the whole thing. The server closes its write half at the
-//                      end; that EOF is how the reader knows the NAR is complete.
+//     * `1` Nar      - 1 `codec` byte (the codec the SERVER chose, always one the fetcher
+//                      offered; raw is the mandatory floor), then the body STREAMED to EOF
+//                      (NO length prefix, mirroring fabric-iroh's bao stream):
+//                        - codec 0 (raw):  the raw NAR bytes; the reader counts them and
+//                          aborts the INSTANT cumulative bytes exceed the per-call bound.
+//                        - codec 1 (zstd): a single zstd frame; the reader DECODES it
+//                          INCREMENTALLY and counts DECOMPRESSED bytes against the same
+//                          signed-NarSize bound, aborting mid-stream on a bomb, and caps the
+//                          compressed input at that bound too (a "compressed" body larger
+//                          than the raw nar is a lie). Either way memory is bounded and the
+//                          decoded bytes are gate-1 BLAKE3-verified - a corrupt/truncated
+//                          frame fails the fetch, never yields a short/wrong nar.
+//                      The server closes its write half at the end; that EOF is how the
+//                      reader knows the (length-prefix-free) body is complete.
 //     * `2` Declined - 1 reason byte (for the caller's log; the fetch still fails).
 // -------------------------------------------------------------------------
 
@@ -172,21 +188,27 @@ pub enum NarResponse {
 const NAR_STREAM_CHUNK: usize = 64 * 1024;
 
 /// The serve-side exchange deadline used when this node is NOT serving (no [`ServeGate`] to
-/// source `max_serve_duration` from): a slowloris guard so a peer that opens a `/nar/2`
+/// source `max_serve_duration` from): a slowloris guard so a peer that opens a `/nar/3`
 /// stream and then never sends its request digest - or never reads the `NotHeld` reply -
 /// cannot park a serve task forever. A serving node uses its
 /// [`ServeBudget::max_serve_duration`] instead (see [`serve_stream`]).
 const UNSERVED_STREAM_DEADLINE: Duration = Duration::from_secs(30);
 
-/// Send a fetch REQUEST on an opened outbound stream: the 32-byte content digest, flushed.
-/// Deliberately does NOT close the write half - the open write half is the requester's
-/// "still interested" signal the server watches, so closing it early would look like an
-/// abandoned request (see [`serve_stream`]).
-pub(crate) async fn write_request<W>(writer: &mut W, content: &Blake3Digest) -> io::Result<()>
+/// Send a fetch REQUEST on an opened outbound stream: the 32-byte content digest followed by
+/// the 1-byte `accept` codec bitmask (which codecs the fetcher can DECODE - raw is mandatory,
+/// TASK-99), flushed. Deliberately does NOT close the write half - the open write half is the
+/// requester's "still interested" signal the server watches, so closing it early would look
+/// like an abandoned request (see [`serve_stream`]).
+pub(crate) async fn write_request<W>(
+    writer: &mut W,
+    content: &Blake3Digest,
+    accept: u8,
+) -> io::Result<()>
 where
     W: AsyncWrite + Unpin,
 {
     writer.write_all(content.as_bytes()).await?;
+    writer.write_all(&[accept]).await?;
     writer.flush().await
 }
 
@@ -249,39 +271,44 @@ where
             )))
         }
         STATUS_NAR => {
-            // The running cap: the signed per-call bound when present, else the fixed
-            // unbounded-OOM floor (a cold-start fetch of a > 256 MiB NAR hard-fails here).
-            let cap = expected_size.unwrap_or(MAX_NAR_RESPONSE_BYTES);
-            let mut raw: Vec<u8> = Vec::new();
-            let mut buf = vec![0u8; NAR_STREAM_CHUNK];
-            loop {
-                let read = tokio::time::timeout(body_idle_timeout, reader.read(&mut buf)).await;
-                let n = match read {
-                    Ok(Ok(0)) => break, // EOF: the server closed its write half - NAR complete.
-                    Ok(Ok(n)) => n,
-                    Ok(Err(error)) => {
-                        return Err(TransferError::Unavailable(format!(
-                            "NAR stream for {content} failed mid-transfer: {error}"
-                        )));
-                    }
-                    Err(_elapsed) => {
-                        // Dropping `reader` (its stream) at this return ABORTS the transfer.
-                        return Err(TransferError::Unavailable(format!(
-                            "NAR transfer for {content} stalled: no bytes for {body_idle_timeout:?}"
-                        )));
-                    }
-                };
-                raw.extend_from_slice(&buf[..n]);
-                // Abort the INSTANT the running total crosses the cap - before reading more.
-                if raw.len() as u64 > cap {
-                    return Err(TransferError::TooLarge {
-                        limit: cap,
-                        streamed: raw.len() as u64,
-                    });
+            // The negotiated codec byte the SERVER chose (TASK-99): raw or zstd, always one
+            // the fetcher offered. An unknown codec is a protocol fault - fail, never guess a
+            // framing.
+            let mut codec_byte = [0u8; 1];
+            match tokio::time::timeout(body_idle_timeout, reader.read_exact(&mut codec_byte)).await
+            {
+                Ok(Ok(())) => {}
+                Ok(Err(error)) => {
+                    return Err(TransferError::Unavailable(format!(
+                        "NAR stream for {content} closed before its codec byte: {error}"
+                    )));
+                }
+                Err(_elapsed) => {
+                    return Err(TransferError::Unavailable(format!(
+                        "NAR stream for {content} stalled before its codec byte for {body_idle_timeout:?}"
+                    )));
                 }
             }
-            // Gate 1: BLAKE3-verify against the requested identity with the frozen SSOT
-            // recipe. A corrupt/lying provider errors here, never wrong bytes handed upward.
+            let codec = WireCodec::from_wire(codec_byte[0]).ok_or_else(|| {
+                TransferError::Unavailable(format!(
+                    "provider chose unknown NAR codec byte {} for {content}",
+                    codec_byte[0]
+                ))
+            })?;
+
+            // The running cap: the signed per-call bound when present, else the fixed
+            // unbounded-OOM floor (a cold-start fetch of a > 256 MiB NAR hard-fails here).
+            // For BOTH codecs the cap is the UNCOMPRESSED NarSize - for zstd it bounds the
+            // DECOMPRESSED output (AC#6 bomb defense), never the compressed FileSize.
+            let cap = expected_size.unwrap_or(MAX_NAR_RESPONSE_BYTES);
+            let raw = match codec {
+                WireCodec::Raw => read_raw_body(reader, cap, body_idle_timeout, content).await?,
+                WireCodec::Zstd => read_zstd_body(reader, cap, body_idle_timeout, content).await?,
+            };
+            // Gate 1: BLAKE3-verify the DECODED bytes against the requested identity with the
+            // frozen SSOT recipe - identical whether the link was raw or compressed. A
+            // corrupt/lying provider (or a TRUNCATED zstd frame that decoded short) errors
+            // here, never wrong bytes handed upward. Nix's sha256 gate-2 remains the anchor.
             let actual = Blake3Digest::from_raw_nar(&raw);
             if &actual != content {
                 return Err(TransferError::IntegrityMismatch {
@@ -297,9 +324,127 @@ where
     }
 }
 
-/// Frame a [`NarResponse`] onto a serve stream's write half and CLOSE it. The close is the
-/// EOF the fetcher's read loop terminates on (there is no length prefix on the NAR body).
-async fn write_response<W>(writer: &mut W, response: NarResponse) -> io::Result<()>
+/// Read a RAW (uncompressed) NAR body to EOF with the mid-stream size abort: count bytes as
+/// they arrive and abort the INSTANT cumulative bytes exceed `cap` (never after buffering the
+/// whole blob), each read bounded by `body_idle_timeout`. Returns the raw bytes for the
+/// caller's gate-1 BLAKE3 verify. Peak memory is `cap + one chunk`.
+async fn read_raw_body<R>(
+    reader: &mut R,
+    cap: u64,
+    body_idle_timeout: Duration,
+    content: &Blake3Digest,
+) -> Result<Vec<u8>, TransferError>
+where
+    R: AsyncRead + Unpin,
+{
+    let mut raw: Vec<u8> = Vec::new();
+    let mut buf = vec![0u8; NAR_STREAM_CHUNK];
+    loop {
+        let read = tokio::time::timeout(body_idle_timeout, reader.read(&mut buf)).await;
+        let n = match read {
+            Ok(Ok(0)) => break, // EOF: the server closed its write half - NAR complete.
+            Ok(Ok(n)) => n,
+            Ok(Err(error)) => {
+                return Err(TransferError::Unavailable(format!(
+                    "NAR stream for {content} failed mid-transfer: {error}"
+                )));
+            }
+            Err(_elapsed) => {
+                // Dropping `reader` (its stream) at this return ABORTS the transfer.
+                return Err(TransferError::Unavailable(format!(
+                    "NAR transfer for {content} stalled: no bytes for {body_idle_timeout:?}"
+                )));
+            }
+        };
+        raw.extend_from_slice(&buf[..n]);
+        // Abort the INSTANT the running total crosses the cap - before reading more.
+        if raw.len() as u64 > cap {
+            return Err(TransferError::TooLarge {
+                limit: cap,
+                streamed: raw.len() as u64,
+            });
+        }
+    }
+    Ok(raw)
+}
+
+/// Read a ZSTD-compressed NAR body to EOF, DECODING INCREMENTALLY through the bounded
+/// [`BoundedZstdDecoder`] (TASK-99 AC#6). The decoder counts DECOMPRESSED cumulative bytes
+/// against `cap` (the signed UNCOMPRESSED NarSize) and aborts mid-stream the instant it would
+/// exceed it - so a decompression BOMB fails closed with memory bounded to `cap + one decode
+/// block`, never the whole expansion. Compressed INPUT is bounded by the same `cap` (a
+/// "compressed" body larger than the raw nar is a lie), the zstd window is bounded, and a
+/// corrupt frame errors. A TRUNCATED frame decodes short and is caught by the caller's
+/// gate-1 length/BLAKE3 recheck. Returns the decoded raw NAR bytes.
+async fn read_zstd_body<R>(
+    reader: &mut R,
+    cap: u64,
+    body_idle_timeout: Duration,
+    content: &Blake3Digest,
+) -> Result<Vec<u8>, TransferError>
+where
+    R: AsyncRead + Unpin,
+{
+    let mut decoder = BoundedZstdDecoder::new(cap).map_err(|error| {
+        TransferError::Unavailable(format!(
+            "could not start zstd decode for {content}: {error}"
+        ))
+    })?;
+    let mut buf = vec![0u8; NAR_STREAM_CHUNK];
+    loop {
+        let read = tokio::time::timeout(body_idle_timeout, reader.read(&mut buf)).await;
+        let n = match read {
+            Ok(Ok(0)) => break, // EOF: the compressed frame is complete (or truncated - see below).
+            Ok(Ok(n)) => n,
+            Ok(Err(error)) => {
+                return Err(TransferError::Unavailable(format!(
+                    "compressed NAR stream for {content} failed mid-transfer: {error}"
+                )));
+            }
+            Err(_elapsed) => {
+                return Err(TransferError::Unavailable(format!(
+                    "compressed NAR transfer for {content} stalled: no bytes for {body_idle_timeout:?}"
+                )));
+            }
+        };
+        // Feed the compressed chunk; the decoder enforces the output/input/window bounds and
+        // aborts mid-stream. A bomb or oversize lie is TooLarge (the deliberate abort); a
+        // corrupt frame is Unavailable (this holder is unusable, try the next).
+        if let Err(error) = decoder.push(&buf[..n]) {
+            return Err(match error {
+                DecodeError::OutputTooLarge { cap, produced } => TransferError::TooLarge {
+                    limit: cap,
+                    streamed: produced,
+                },
+                DecodeError::InputTooLarge { cap, consumed } => TransferError::TooLarge {
+                    limit: cap,
+                    streamed: consumed,
+                },
+                DecodeError::Zstd(why) => TransferError::Unavailable(format!(
+                    "corrupt zstd NAR frame for {content}: {why}"
+                )),
+            });
+        }
+    }
+    // Finish the frame and take the decoded nar. A truncated frame yields fewer bytes than
+    // the signed size; the caller's gate-1 recheck then rejects it (never a short/wrong nar).
+    decoder.finish().map_err(|error| {
+        TransferError::Unavailable(format!(
+            "zstd decode did not complete for {content}: {error}"
+        ))
+    })
+}
+
+/// Frame a [`NarResponse`] onto a serve stream's write half and CLOSE it, encoding the NAR
+/// body with the negotiated `codec` (TASK-99). For a `Nar` the wire is: `STATUS_NAR`, the
+/// chosen codec byte, then the body (raw bytes, or a single zstd frame at `level`). The close
+/// is the EOF the fetcher's read loop terminates on (there is no length prefix on the body).
+async fn write_response<W>(
+    writer: &mut W,
+    response: NarResponse,
+    codec: WireCodec,
+    level: i32,
+) -> io::Result<()>
 where
     W: AsyncWrite + Unpin,
 {
@@ -309,8 +454,19 @@ where
             writer.write_all(&[STATUS_DECLINED, reason.wire()]).await?
         }
         NarResponse::Nar(bytes) => {
-            writer.write_all(&[STATUS_NAR]).await?;
-            writer.write_all(&bytes).await?;
+            writer.write_all(&[STATUS_NAR, codec.wire()]).await?;
+            match codec {
+                WireCodec::Raw => writer.write_all(&bytes).await?,
+                WireCodec::Zstd => {
+                    // Compress off the produced raw nar. The serve-time integrity recheck
+                    // (len == declared_size, BLAKE3 == content) already ran on the RAW bytes
+                    // before this point, so the compressed encoding is a pure transport step.
+                    let frame = compress_zstd(&bytes, level).map_err(|error| {
+                        io::Error::other(format!("zstd compress failed: {error}"))
+                    })?;
+                    writer.write_all(&frame).await?;
+                }
+            }
         }
     }
     writer.flush().await?;
@@ -371,23 +527,34 @@ where
         .map(|gate| gate.max_serve_duration())
         .unwrap_or(UNSERVED_STREAM_DEADLINE);
 
-    // The request digest, bounded: a peer that opens a stream and then stalls (sends a
-    // partial digest, or nothing) cannot park this task forever.
-    let mut digest = [0u8; 32];
-    match tokio::time::timeout(deadline, read_half.read_exact(&mut digest)).await {
+    // The serve-side compression policy (TASK-99): what this node is WILLING to do. A
+    // non-serving node never ships a body, so the default (unused) is fine.
+    let codec_policy = gate
+        .as_ref()
+        .map(|gate| gate.codec_policy())
+        .unwrap_or_default();
+
+    // The request: 32 digest bytes + 1 `accept` codec bitmask byte (TASK-99), bounded - a
+    // peer that opens a stream then stalls (sends a partial request, or nothing) cannot park
+    // this task forever.
+    let mut request = [0u8; 33];
+    match tokio::time::timeout(deadline, read_half.read_exact(&mut request)).await {
         Ok(Ok(())) => {}
         Ok(Err(error)) => {
-            tracing::debug!(%error, "libp2p serve: inbound NAR stream closed before its request digest");
+            tracing::debug!(%error, "libp2p serve: inbound NAR stream closed before its request");
             return;
         }
         Err(_elapsed) => {
             tracing::debug!(
                 ?deadline,
-                "libp2p serve: inbound NAR request digest did not arrive within the serve deadline"
+                "libp2p serve: inbound NAR request did not arrive within the serve deadline"
             );
             return;
         }
     }
+    let mut digest = [0u8; 32];
+    digest.copy_from_slice(&request[..32]);
+    let accept = request[32];
     let content = Blake3Digest::from_bytes(digest);
 
     // The in-flight reservation - for a Memory serve OR a Process serve - is held HERE, at
@@ -435,12 +602,32 @@ where
         },
     };
 
+    // Negotiate the wire codec for a NAR body (TASK-99): intersect what the fetcher offered
+    // (`accept`) with this node's policy, for a nar of the produced size. RAW is always a
+    // valid outcome, so this never fails to agree; the reason is logged so a raw fallback is
+    // never silent (AC#5). NotHeld/Declined carry no body, so the codec is irrelevant there.
+    let (codec, level) = match &response {
+        NarResponse::Nar(bytes) => {
+            let (codec, reason) = negotiate_serve_codec(accept, &codec_policy, bytes.len() as u64);
+            if reason != CodecChoiceReason::ZstdNegotiated {
+                tracing::trace!(%content, %reason, "libp2p serve: raw NAR codec (named fallback)");
+            }
+            (codec, codec_policy.level)
+        }
+        _ => (WireCodec::Raw, codec_policy.level),
+    };
+
     // The response write, bounded: a consumer that never READS its response (but keeps the
     // stream open, so `consumer_hung_up` above never fired) would otherwise block `write_all`
     // on yamux backpressure forever, holding the reservation and parking this task. The
     // deadline caps that; dropping `write_half` on return resets the substream, and
     // `_reservation` releases as this function returns.
-    match tokio::time::timeout(deadline, write_response(&mut write_half, response)).await {
+    match tokio::time::timeout(
+        deadline,
+        write_response(&mut write_half, response, codec, level),
+    )
+    .await
+    {
         Ok(Ok(())) => {}
         Ok(Err(error)) => {
             tracing::debug!(%error, %content, "libp2p serve: failed to write NAR response (consumer gone?)");
@@ -839,6 +1026,10 @@ pub struct ServeCounters {
 /// [`stop`](ServeGate::stop)).
 pub struct ServeGate {
     budget: ServeBudget,
+    /// The serve-side link-compression policy (TASK-99): whether/at what level this node
+    /// compresses a served nar, intersected per request with the fetcher's `accept` bitmask.
+    /// Raw is always available; this only decides when zstd is offered.
+    codec_policy: ServeCodecPolicy,
     supplier: Arc<dyn Libp2pNarSupplier>,
     /// The supervisor OFF-loop Process production runs under (TASK-193): a
     /// [`NarSource::Process`] source rides in a killable, reaped-on-shutdown process group
@@ -889,6 +1080,7 @@ impl ServeGate {
         } = budget;
         ServeGate {
             budget,
+            codec_policy: ServeCodecPolicy::default(),
             supplier,
             supervisor,
             active: AtomicBool::new(true),
@@ -900,6 +1092,20 @@ impl ServeGate {
             declined_supply_failed: AtomicU64::new(0),
             refused_stopped: AtomicU64::new(0),
         }
+    }
+
+    /// Set the serve-side link-compression policy (TASK-99). Builder-style so a fabric can
+    /// configure the level / disable zstd without churning the `new` signature; the default
+    /// ([`ServeCodecPolicy::default`]) offers zstd at [`peer_fabric::DEFAULT_ZSTD_LEVEL`].
+    pub fn with_codec_policy(mut self, policy: ServeCodecPolicy) -> Self {
+        self.codec_policy = policy;
+        self
+    }
+
+    /// The serve-side link-compression policy, read by [`serve_stream`] to negotiate the
+    /// per-request codec against the fetcher's `accept` bitmask.
+    pub(crate) fn codec_policy(&self) -> ServeCodecPolicy {
+        self.codec_policy
     }
 
     /// Stop admitting new requests (the synchronous teardown signal). Idempotent.
@@ -1157,6 +1363,7 @@ impl Drop for InflightReservation {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use peer_fabric::{ACCEPT_RAW_AND_ZSTD, DEFAULT_ZSTD_LEVEL};
     use std::time::Duration;
 
     fn budget(max_nar: u64, max_inflight: u64) -> ServeBudget {
@@ -1802,19 +2009,28 @@ mod tests {
     /// hiccup, short enough that the test finishes fast.
     const IDLE: Duration = Duration::from_millis(150);
 
-    /// Frame a wire response as raw bytes: a status byte then (for Nar) the body verbatim,
-    /// exactly what a well-behaved server writes (no length prefix - EOF terminates the NAR).
+    /// Frame a RAW wire response: the status byte, the RAW codec byte (TASK-99), then the
+    /// body verbatim, exactly what a well-behaved server writes for an uncompressed body (no
+    /// length prefix - EOF terminates the NAR).
     fn wire_nar(body: &[u8]) -> Vec<u8> {
-        let mut v = vec![STATUS_NAR];
+        let mut v = vec![STATUS_NAR, WireCodec::Raw.wire()];
         v.extend_from_slice(body);
         v
     }
 
-    /// A reader that yields the status byte, THEN one real body chunk, THEN STALLS FOREVER
-    /// (never another byte, never EOF). The successful body chunk is the point: it proves the
-    /// body-idle guard is re-armed PER read (the stall it must catch happens AFTER a chunk was
-    /// already delivered), not merely on the first body read. Phases: 0=status, 1=one body
-    /// chunk, 2=stall.
+    /// Frame a ZSTD wire response: the status byte, the ZSTD codec byte, then a single zstd
+    /// frame of `body` at `level` (TASK-99). Models a compressing server's wire.
+    fn wire_nar_zstd(body: &[u8], level: i32) -> Vec<u8> {
+        let mut v = vec![STATUS_NAR, WireCodec::Zstd.wire()];
+        v.extend_from_slice(&compress_zstd(body, level).expect("compress"));
+        v
+    }
+
+    /// A reader that yields the status byte, the RAW codec byte, THEN one real body chunk,
+    /// THEN STALLS FOREVER (never another byte, never EOF). The successful body chunk is the
+    /// point: it proves the body-idle guard is re-armed PER read (the stall it must catch
+    /// happens AFTER a chunk was already delivered), not merely on the first body read.
+    /// Phases: 0=status, 1=codec byte, 2=one body chunk, 3=stall.
     struct StatusChunkThenStall {
         phase: u8,
     }
@@ -1833,6 +2049,11 @@ mod tests {
                 }
                 1 if !buf.is_empty() => {
                     self.phase = 2;
+                    buf[0] = WireCodec::Raw.wire();
+                    Poll::Ready(Ok(1))
+                }
+                2 if !buf.is_empty() => {
+                    self.phase = 3;
                     // One modest body chunk, well under any cap so ONLY the idle guard can fire
                     // on the following stall (not the size abort).
                     let n = buf.len().min(1024);
@@ -1953,6 +2174,338 @@ mod tests {
         }
     }
 
+    // -------------------------------------------------------------------------
+    // TASK-99: the negotiated-codec wire, bitten over in-memory readers. The zstd body is
+    // decoded by the SAME `read_response_streamed` path, so these prove the compressed link
+    // round-trips, keeps the frozen blob id, and fails closed on bomb/corruption/truncation.
+    // -------------------------------------------------------------------------
+
+    /// AC#1/#3 the compressed round-trip: a server that ships a zstd body and a fetcher that
+    /// decodes it yield the EXACT raw nar, hashing to the SAME BLAKE3(RawNarV1) id as the
+    /// uncompressed path. Proven by writing a real serve response (`write_response` with the
+    /// negotiated codec) and reading it back through the fetch path.
+    #[tokio::test]
+    async fn zstd_body_round_trips_and_keeps_the_frozen_blob_id() {
+        let raw = b"a real-ish nar body that compresses well because it repeats".repeat(500);
+        let content = Blake3Digest::from_raw_nar(&raw);
+
+        // Serve side: frame a Nar response with the negotiated zstd codec.
+        let mut wire = futures::io::Cursor::new(Vec::new());
+        write_response(
+            &mut wire,
+            NarResponse::Nar(raw.clone()),
+            WireCodec::Zstd,
+            DEFAULT_ZSTD_LEVEL,
+        )
+        .await
+        .expect("serve writes the compressed response");
+        let wire = wire.into_inner();
+        assert!(
+            (wire.len() as u64) < raw.len() as u64,
+            "the compressed wire ({}) must be smaller than the raw nar ({})",
+            wire.len(),
+            raw.len()
+        );
+
+        // Fetch side: decode it, bounded by the signed uncompressed size.
+        let mut reader = futures::io::Cursor::new(wire);
+        let got = read_response_streamed(&mut reader, Some(raw.len() as u64), IDLE, &content)
+            .await
+            .expect("fetch decodes the compressed body");
+        assert_eq!(got, raw, "the decoded nar is byte-identical to the raw nar");
+        assert_eq!(
+            Blake3Digest::from_raw_nar(&got),
+            content,
+            "the frozen blob id is unchanged by compression (AC#1)"
+        );
+    }
+
+    /// AC#1 the multi-holder property: two servers compressing the SAME nar at DIFFERENT
+    /// levels produce DIFFERENT wire bytes, but a fetcher decodes either to the same nar and
+    /// the same blob id - so both can serve one fetch keyed by that id.
+    #[tokio::test]
+    async fn two_levels_serve_one_blob_id() {
+        let raw = b"different compressor settings must not fork the content id".repeat(300);
+        let content = Blake3Digest::from_raw_nar(&raw);
+
+        let mut got = Vec::new();
+        let mut wires = Vec::new();
+        for level in [1, 19] {
+            let mut wire = futures::io::Cursor::new(Vec::new());
+            write_response(
+                &mut wire,
+                NarResponse::Nar(raw.clone()),
+                WireCodec::Zstd,
+                level,
+            )
+            .await
+            .unwrap();
+            let wire = wire.into_inner();
+            let mut reader = futures::io::Cursor::new(wire.clone());
+            let decoded =
+                read_response_streamed(&mut reader, Some(raw.len() as u64), IDLE, &content)
+                    .await
+                    .expect("either level decodes to the same nar");
+            assert_eq!(Blake3Digest::from_raw_nar(&decoded), content);
+            got.push(decoded);
+            wires.push(wire);
+        }
+        assert_ne!(
+            wires[0], wires[1],
+            "different levels give different wire bytes"
+        );
+        assert_eq!(got[0], got[1], "but the same decoded nar");
+    }
+
+    /// AC#6 the DECISIVE bomb bite ON THE WIRE: a zstd body that decompresses to FAR more than
+    /// the signed size aborts with `TooLarge`, bounded, never materialising the expansion.
+    #[tokio::test]
+    async fn zstd_decompression_bomb_aborts_on_the_wire() {
+        let bomb = vec![0u8; 8 * 1024 * 1024]; // 8 MiB of zeros -> tiny zstd frame
+        let content = Blake3Digest::from_raw_nar(&bomb);
+        let wire = wire_nar_zstd(&bomb, DEFAULT_ZSTD_LEVEL);
+        assert!(wire.len() < 64 * 1024, "the bomb is tiny on the wire");
+        let cap: u64 = 64 * 1024; // the fetcher signed only 64 KiB
+        let mut reader = futures::io::Cursor::new(wire);
+        let err = read_response_streamed(&mut reader, Some(cap), IDLE, &content)
+            .await
+            .expect_err("a decompression bomb must abort");
+        match err {
+            TransferError::TooLarge { limit, streamed } => {
+                assert_eq!(limit, cap);
+                assert!(
+                    streamed > cap,
+                    "decoded ({streamed}) crossed the cap ({cap})"
+                );
+                assert!(
+                    streamed <= cap + 256 * 1024,
+                    "decoded ({streamed}) must be bounded by cap + one decode block, not the 8 MiB expansion"
+                );
+            }
+            other => panic!("expected TooLarge, got {other}"),
+        }
+    }
+
+    /// AC#3 corruption ON THE WIRE: a flipped byte inside the zstd frame fails the fetch
+    /// (either a frame error or a BLAKE3 mismatch), never a silent short/wrong nar.
+    #[tokio::test]
+    async fn corrupt_zstd_frame_fails_the_fetch() {
+        let raw = b"honest compressed nar bytes to be corrupted mid-frame".repeat(100);
+        let content = Blake3Digest::from_raw_nar(&raw);
+        let mut wire = wire_nar_zstd(&raw, DEFAULT_ZSTD_LEVEL);
+        // Flip a byte inside the frame (past the status+codec+magic bytes).
+        let mid = wire.len() / 2;
+        wire[mid] ^= 0xff;
+        let mut reader = futures::io::Cursor::new(wire);
+        let result =
+            read_response_streamed(&mut reader, Some(raw.len() as u64), IDLE, &content).await;
+        assert!(
+            result.is_err(),
+            "a corrupt zstd frame must fail the fetch, got {result:?}"
+        );
+    }
+
+    /// AC#3 truncation ON THE WIRE: a zstd frame cut short decodes to fewer bytes than the
+    /// signed size, so gate-1 rejects it - `IntegrityMismatch`, never a short nar accepted.
+    #[tokio::test]
+    async fn truncated_zstd_frame_fails_gate_one() {
+        let raw = b"a nar whose compressed frame is cut short before EOF".repeat(120);
+        let content = Blake3Digest::from_raw_nar(&raw);
+        let full = wire_nar_zstd(&raw, DEFAULT_ZSTD_LEVEL);
+        let truncated = full[..full.len() - 6].to_vec(); // drop the frame tail
+        let mut reader = futures::io::Cursor::new(truncated);
+        let err = read_response_streamed(&mut reader, Some(raw.len() as u64), IDLE, &content)
+            .await
+            .expect_err("a truncated frame must fail rather than yield a short nar");
+        assert!(
+            matches!(
+                err,
+                TransferError::IntegrityMismatch { .. } | TransferError::Unavailable(_)
+            ),
+            "expected an integrity/unavailable failure, got {err}"
+        );
+    }
+
+    /// AC#5 an unknown codec byte from an untrusted server fails the fetch (never guesses a
+    /// framing).
+    #[tokio::test]
+    async fn unknown_codec_byte_fails_the_fetch() {
+        let content = Blake3Digest::from_bytes([0x33; 32]);
+        let wire = vec![STATUS_NAR, 0x7f]; // 0x7f is not a known codec
+        let mut reader = futures::io::Cursor::new(wire);
+        let err = read_response_streamed(&mut reader, Some(1024), IDLE, &content)
+            .await
+            .expect_err("an unknown codec must fail");
+        match err {
+            TransferError::Unavailable(why) => {
+                assert!(why.contains("unknown NAR codec"), "got: {why}")
+            }
+            other => panic!("expected Unavailable(unknown codec), got {other}"),
+        }
+    }
+
+    /// A serve-side mock: yields a fixed 33-byte request (digest + accept) on read, then
+    /// PENDS (a Memory serve never reads again after admit), and CAPTURES everything the
+    /// server writes into a shared buffer for inspection. Lets a test drive `serve_stream`
+    /// end to end (the accept -> negotiate -> codec path) without a full duplex.
+    struct RequestThenCapture {
+        request: [u8; 33],
+        read_pos: usize,
+        written: Arc<std::sync::Mutex<Vec<u8>>>,
+    }
+
+    impl RequestThenCapture {
+        fn new(content: &Blake3Digest, accept: u8) -> Self {
+            let mut request = [0u8; 33];
+            request[..32].copy_from_slice(content.as_bytes());
+            request[32] = accept;
+            RequestThenCapture {
+                request,
+                read_pos: 0,
+                written: Arc::new(std::sync::Mutex::new(Vec::new())),
+            }
+        }
+    }
+
+    impl AsyncRead for RequestThenCapture {
+        fn poll_read(
+            mut self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            buf: &mut [u8],
+        ) -> Poll<io::Result<usize>> {
+            if self.read_pos < self.request.len() && !buf.is_empty() {
+                let start = self.read_pos;
+                let n = (self.request.len() - start).min(buf.len());
+                buf[..n].copy_from_slice(&self.request[start..start + n]);
+                self.read_pos += n;
+                Poll::Ready(Ok(n))
+            } else {
+                Poll::Pending // connected but idle (a Memory serve does not read again)
+            }
+        }
+    }
+
+    impl AsyncWrite for RequestThenCapture {
+        fn poll_write(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            buf: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            self.written.lock().unwrap().extend_from_slice(buf);
+            Poll::Ready(Ok(buf.len()))
+        }
+        fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+        fn poll_close(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    /// AC#5 negotiation END TO END through serve_stream: a Memory server with the DEFAULT
+    /// policy (zstd on) actually ships a ZSTD body when the fetcher offers zstd - the captured
+    /// wire's codec byte is zstd and its frame decodes to the exact nar (same blob id).
+    #[tokio::test]
+    async fn serve_stream_negotiates_zstd_when_offered() {
+        let raw = b"end-to-end negotiated compression through serve_stream".repeat(400);
+        let content = Blake3Digest::from_raw_nar(&raw);
+        let supplier = Arc::new(MemoryNarSupplier::new([raw.clone()]));
+        let gate = Arc::new(memory_gate(supplier)); // default policy: zstd enabled
+
+        let mock = RequestThenCapture::new(&content, ACCEPT_RAW_AND_ZSTD);
+        let wire = Arc::clone(&mock.written);
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            serve_stream(mock, Some(Arc::clone(&gate))),
+        )
+        .await
+        .expect("serve completes");
+
+        let wire = wire.lock().unwrap().clone();
+        assert_eq!(wire[0], STATUS_NAR, "status byte");
+        assert_eq!(
+            wire[1],
+            WireCodec::Zstd.wire(),
+            "server chose zstd when offered"
+        );
+        // The frame decodes back to the exact nar and the frozen id.
+        let mut reader = futures::io::Cursor::new(wire);
+        let got = read_response_streamed(&mut reader, Some(raw.len() as u64), IDLE, &content)
+            .await
+            .expect("the captured zstd wire decodes");
+        assert_eq!(got, raw);
+        assert_eq!(Blake3Digest::from_raw_nar(&got), content);
+        assert_eq!(gate.counters().admitted, 1);
+    }
+
+    /// AC#5 raw fallback (server opt-out): a server whose policy DISABLES zstd serves a RAW
+    /// body even though the fetcher offered zstd - the codec byte is raw and the fetch still
+    /// succeeds (raw is the mandatory floor, over the SAME protocol).
+    #[tokio::test]
+    async fn serve_stream_falls_back_to_raw_when_server_disables_zstd() {
+        let raw =
+            b"a server that opts out of compression serves raw on the same protocol".repeat(50);
+        let content = Blake3Digest::from_raw_nar(&raw);
+        let supplier = Arc::new(MemoryNarSupplier::new([raw.clone()]));
+        let gate = Arc::new(memory_gate(supplier).with_codec_policy(ServeCodecPolicy {
+            zstd_enabled: false,
+            ..ServeCodecPolicy::default()
+        }));
+
+        let mock = RequestThenCapture::new(&content, ACCEPT_RAW_AND_ZSTD);
+        let wire = Arc::clone(&mock.written);
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            serve_stream(mock, Some(Arc::clone(&gate))),
+        )
+        .await
+        .expect("serve completes");
+
+        let wire = wire.lock().unwrap().clone();
+        assert_eq!(
+            wire[1],
+            WireCodec::Raw.wire(),
+            "zstd-disabled server serves raw"
+        );
+        let mut reader = futures::io::Cursor::new(wire);
+        let got = read_response_streamed(&mut reader, Some(raw.len() as u64), IDLE, &content)
+            .await
+            .expect("raw fallback decodes");
+        assert_eq!(got, raw);
+    }
+
+    /// AC#5 raw fallback (client opt-out): a fetcher that offers ONLY raw gets a raw body even
+    /// from a zstd-enabled server - mixed codec-capability peers interoperate.
+    #[tokio::test]
+    async fn serve_stream_serves_raw_when_client_offers_only_raw() {
+        let raw =
+            b"a fetcher that cannot decode zstd still fetches over the same protocol".repeat(50);
+        let content = Blake3Digest::from_raw_nar(&raw);
+        let supplier = Arc::new(MemoryNarSupplier::new([raw.clone()]));
+        let gate = Arc::new(memory_gate(supplier)); // zstd enabled server
+
+        let mock = RequestThenCapture::new(&content, peer_fabric::ACCEPT_RAW); // raw only
+        let wire = Arc::clone(&mock.written);
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            serve_stream(mock, Some(Arc::clone(&gate))),
+        )
+        .await
+        .expect("serve completes");
+
+        let wire = wire.lock().unwrap().clone();
+        assert_eq!(
+            wire[1],
+            WireCodec::Raw.wire(),
+            "server must honour a raw-only fetcher (mandatory fallback)"
+        );
+        let mut reader = futures::io::Cursor::new(wire);
+        let got = read_response_streamed(&mut reader, Some(raw.len() as u64), IDLE, &content)
+            .await
+            .expect("raw fallback decodes");
+        assert_eq!(got, raw);
+    }
+
     /// The status arms: NotHeld and Declined map to the right typed fetch failures.
     #[tokio::test]
     async fn read_maps_notheld_and_declined_status_bytes() {
@@ -1995,10 +2548,14 @@ mod tests {
             _cx: &mut Context<'_>,
             buf: &mut [u8],
         ) -> Poll<io::Result<usize>> {
-            if self.read_pos < self.digest.len() && !buf.is_empty() {
+            // The request is 33 bytes: 32 digest + 1 accept byte (offering both codecs).
+            let mut request = [0u8; 33];
+            request[..32].copy_from_slice(&self.digest);
+            request[32] = ACCEPT_RAW_AND_ZSTD;
+            if self.read_pos < request.len() && !buf.is_empty() {
                 let start = self.read_pos;
-                let n = (self.digest.len() - start).min(buf.len());
-                buf[..n].copy_from_slice(&self.digest[start..start + n]);
+                let n = (request.len() - start).min(buf.len());
+                buf[..n].copy_from_slice(&request[start..start + n]);
                 self.read_pos += n;
                 Poll::Ready(Ok(n))
             } else {

@@ -184,7 +184,7 @@ pub struct SwarmHandle {
     /// Opens outbound NAR substreams (auto-dialing the peer if not connected). Cloned per
     /// fetch to satisfy `open_stream`'s `&mut self` one-stream-at-a-time backpressure.
     control: Control,
-    /// The raw-stream NAR protocol name (`/nix-p2p/<scope>/nar/2`), for `open_stream`.
+    /// The raw-stream NAR protocol name (`/nix-p2p/<scope>/nar/3`), for `open_stream`.
     nar_protocol: StreamProtocol,
     /// The installed serve gate (or `None`); read by the accept loop, written by install /
     /// uninstall. See [`ServeSlot`].
@@ -439,7 +439,9 @@ impl SwarmHandle {
                 )));
             }
         };
-        nar::write_request(&mut stream, &content)
+        // Offer BOTH codecs the fetcher can always decode (raw is mandatory; zstd optional).
+        // The server picks within this set; raw is the guaranteed fallback (TASK-99, AC#5).
+        nar::write_request(&mut stream, &content, peer_fabric::ACCEPT_RAW_AND_ZSTD)
             .await
             .map_err(|error| {
                 TransferError::Unavailable(format!(
@@ -885,10 +887,13 @@ impl Node {
         let kad_protocol = StreamProtocol::try_from_owned(format!("/nix-p2p/{scope}/kad/1.0.0"))
             .map_err(|e| NodeError::Build(format!("invalid kad protocol name: {e:?}")))?;
         let id_protocol = format!("/nix-p2p/{scope}/id/1.0.0");
-        // `/nar/2`: the raw-stream framing (TASK-157) is wire-incompatible with the old
-        // request-response `/nar/1` (TASK-151), so the version is bumped. The protocol NAME
-        // is a transport detail, not a frozen surface - the RawNarV1 bytes it carries are.
-        let nar_protocol = StreamProtocol::try_from_owned(format!("/nix-p2p/{scope}/nar/2"))
+        // `/nar/3`: TASK-99 adds an explicit per-connection codec byte (negotiated zstd, raw
+        // fallback) to the raw-stream framing, wire-incompatible with `/nar/2` (TASK-157),
+        // so the version is bumped wholesale - exactly as `/nar/2` replaced the
+        // request-response `/nar/1` (TASK-151), with no dual-accept. The protocol NAME is a
+        // transport detail, not a frozen surface - the RawNarV1 bytes it carries (and their
+        // BLAKE3 id) are unchanged; only the LINK encoding is negotiable.
+        let nar_protocol = StreamProtocol::try_from_owned(format!("/nix-p2p/{scope}/nar/3"))
             .map_err(|e| NodeError::Build(format!("invalid nar protocol name: {e:?}")))?;
 
         let swarm = libp2p::SwarmBuilder::with_existing_identity(keypair)
@@ -915,7 +920,7 @@ impl Node {
                         identify::Behaviour::new(identify::Config::new(id_protocol, key.public()));
                     // The RAW-STREAM NAR byte-transfer substrate (TASK-157): opened and
                     // accepted through a Control on tasks OFF this poll loop. It is
-                    // protocol-agnostic here; the concrete `/nar/2` name is registered on the
+                    // protocol-agnostic here; the concrete `/nar/3` name is registered on the
                     // accept side below.
                     let stream = libp2p_stream::Behaviour::new();
                     Ok(Behaviour {
@@ -930,7 +935,7 @@ impl Node {
             .build();
 
         // The raw-stream NAR surface (TASK-157). One Control drives both directions: it
-        // registers the inbound `/nar/2` protocol (once) via `accept`, and opens outbound
+        // registers the inbound `/nar/3` protocol (once) via `accept`, and opens outbound
         // NAR streams for fetches. The accept loop runs the SERVE half entirely off the poll
         // loop, reading the current gate from the shared slot.
         let mut control = swarm.behaviour().stream.new_control();
