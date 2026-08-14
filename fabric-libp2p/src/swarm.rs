@@ -1191,6 +1191,41 @@ pub const DEFAULT_RELAY_SERVER_ENABLED: bool = true;
 //     kept at 1024 explicitly.
 //
 // All values are integers (no-float rule).
+//
+// ADVERSARIAL MODEL & HONEST LIMITS (TASK-154 AC#2). What these bounds DO and, as
+// importantly, what they do NOT do - so no reader mistakes a resource bound for a
+// defeated attack:
+//
+//   * POISONING (a forged/replayed value record). The store cap does NOT decide trust -
+//     it only limits how much untrusted hint state we HOLD. Trust is enforced elsewhere
+//     and is total: every fetched provider record is ed25519-verified against the frozen
+//     codec, bound to the announcing PeerId, and floored by the monotonic/withdrawal
+//     `admit` gate (directory.rs); a forged value costs one skipped provider, never a bad
+//     answer, and Nix re-verifies every fetched byte regardless. The cap's job is only to
+//     stop a poisoning FLOOD from costing unbounded memory.
+//   * AMPLIFICATION (junk parked to inflate our memory/serve cost). `STORE_MAX_VALUE_BYTES`
+//     (per record) and `STORE_MAX_RECORDS` (count) hard-bound value-store memory (~8 MiB
+//     worst case); the consumer fan-out cap (`DiscoveryBudget.max_peers`, directory.rs)
+//     bounds how many providers ONE lookup chases, so a flooded index cannot turn a lookup
+//     into one round trip per forged provider. These bound COST; they do not stop a peer
+//     from TRYING.
+//   * SYBIL (many fake identities flooding one key). `STORE_MAX_PROVIDERS_PER_KEY` caps how
+//     many providers we store per key (libp2p's own documented Sybil mitigation), so a
+//     flood cannot evict a legitimate provider past the cap. This RAISES the cost of a
+//     sybil flood; it does NOT by itself distinguish a real provider from a fake one.
+//   * ECLIPSE (surrounding a node with adversarial peers so its view is controlled). This
+//     is the one these bounds DO NOT defeat. A determined adversary who can occupy a node's
+//     routing neighborhood can still bias what it sees; the bounds only ensure that doing
+//     so costs bounded RESOURCES on our side and cannot escalate to an OOM or an unbounded
+//     fan-out. A real eclipse defense needs diverse/rate-limited routing-table admission
+//     and multi-path lookups this single-node view does not have (the residual false-`Miss`
+//     window is documented on `crate::QueryReach`).
+//
+// These are SOURCE-level bounds + unit proofs, NOT an adversarial FIELD proof. Whether the
+// private DHT actually withstands a determined multi-node sybil/eclipse swarm is a separate
+// claim that needs an adversarial harness - deferred to TASK-205. Do not read this block as
+// "sybil/eclipse solved"; read it as "the resource cost of attempting them is bounded, and
+// integrity never depends on these bounds".
 
 /// Max distinct value-store records this node holds for OTHER peers' keys (it is k-closest
 /// to). 4096, vs the library default 1024: real-network headroom, still hard-bounded. With
@@ -1581,6 +1616,148 @@ mod tests {
                 .with_relay_server(false)
                 .relay_server_enabled,
             "with_relay_server(false) opts the node out of relaying"
+        );
+    }
+
+    // ============================ TASK-154 AC#1 store caps ============================
+    // The kad MemoryStore is where a hostile peer's records LAND. These prove the caps are
+    // (a) EXPLICIT decisions (not blind library defaults) and (b) actually BITE on the wire
+    // of the store API - an oversized value is refused and a per-key provider flood is bounded.
+
+    #[test]
+    fn store_config_carries_explicit_caps_not_blind_library_defaults() {
+        let cfg = content_store_config();
+        // Every field is threaded from its `STORE_*` constant - a decision, not a default.
+        assert_eq!(cfg.max_records, STORE_MAX_RECORDS);
+        assert_eq!(cfg.max_value_bytes, STORE_MAX_VALUE_BYTES);
+        assert_eq!(cfg.max_providers_per_key, STORE_MAX_PROVIDERS_PER_KEY);
+        assert_eq!(cfg.max_provided_keys, STORE_MAX_PROVIDED_KEYS);
+        // The load-bearing anti-amplification value cap is far TIGHTER than the 65 KiB
+        // library default, yet keeps headroom over the largest legal frozen record (so a
+        // legitimate provider record is never refused). Both halves are compile-time
+        // invariants (the second mirrors the production `const _` guard), pinned here as a
+        // `const` block so a cap edit that breaks either fails the build, not just the test.
+        const {
+            assert!(
+                STORE_MAX_VALUE_BYTES < 65 * 1024,
+                "value cap must be tighter than the library default so junk cannot be parked"
+            );
+            assert!(
+                STORE_MAX_VALUE_BYTES > peer_fabric::MAX_PROVIDER_RECORD_BYTES,
+                "value cap must exceed the largest legal frozen record (headroom)"
+            );
+        }
+    }
+
+    #[test]
+    fn store_rejects_oversized_value_but_accepts_a_legitimate_record() {
+        use libp2p::kad::store::{Error, RecordStore};
+        let peer = PeerId::random();
+        let mut store = MemoryStore::with_config(peer, content_store_config());
+        let key = kad::RecordKey::new(&b"k".to_vec());
+        // A value AT the ceiling is refused (the store's check is `len >= max_value_bytes`).
+        // Lower `STORE_MAX_VALUE_BYTES` past the frozen record size and the headroom assert
+        // above (and the compile-time guard) bite; delete the cap and THIS stops biting.
+        let oversized = kad::Record::new(key.clone(), vec![0u8; STORE_MAX_VALUE_BYTES]);
+        assert!(
+            matches!(store.put(oversized), Err(Error::ValueTooLarge)),
+            "a value at/over the cap must be refused - the anti-amplification bite"
+        );
+        // A legitimate frozen-size record (<= MAX_PROVIDER_RECORD_BYTES) is ACCEPTED.
+        let legit = kad::Record::new(key, vec![0u8; peer_fabric::MAX_PROVIDER_RECORD_BYTES]);
+        assert!(
+            store.put(legit).is_ok(),
+            "a legitimate frozen-size record must be accepted (the cap has headroom)"
+        );
+    }
+
+    #[test]
+    fn store_caps_providers_per_key_to_bound_a_sybil_flood() {
+        use libp2p::kad::store::RecordStore;
+        let peer = PeerId::random();
+        let mut store = MemoryStore::with_config(peer, content_store_config());
+        let key = kad::RecordKey::new(&b"contended".to_vec());
+        // Flood one key with more DISTINCT providers than the cap. libp2p ignores providers
+        // past `max_providers_per_key` (its documented Sybil mitigation); our explicit cap
+        // pins the bound. Raise the flood count freely - the stored set stays at the cap.
+        for _ in 0..(STORE_MAX_PROVIDERS_PER_KEY + 5) {
+            let rec = kad::ProviderRecord::new(key.clone(), PeerId::random(), Vec::new());
+            let _ = store.add_provider(rec);
+        }
+        assert_eq!(
+            store.providers(&key).len(),
+            STORE_MAX_PROVIDERS_PER_KEY,
+            "the per-key provider set must not grow past the explicit anti-sybil cap"
+        );
+    }
+
+    // ===================== TASK-154 S4 query-cancel (work bound) =====================
+    // A real `kad::QueryId` is obtained network-free: `get_providers` registers a query on a
+    // bare `kad::Behaviour` synchronously and returns its id (no swarm/loopback needed). That
+    // lets us prove the RAII guard and the worker's Cancel arm directly.
+
+    fn bare_kad() -> kad::Behaviour<MemoryStore> {
+        let peer = PeerId::random();
+        kad::Behaviour::new(peer, MemoryStore::with_config(peer, content_store_config()))
+    }
+
+    #[test]
+    fn cancel_on_drop_fires_when_armed_and_disarm_suppresses() {
+        let mut kad = bare_kad();
+        let armed_id = kad.get_providers(kad::RecordKey::new(&b"a".to_vec()));
+        let disarmed_id = kad.get_providers(kad::RecordKey::new(&b"b".to_vec()));
+
+        let (tx, mut rx) = mpsc::channel::<Command>(4);
+
+        // ARMED: dropping the guard mid-wait (the abandoned find_providers deadline case)
+        // enqueues a Cancel for its query. Delete the Drop send and this receives nothing.
+        {
+            let _guard = CancelOnDrop::new(tx.clone(), armed_id);
+        }
+        match rx.try_recv() {
+            Ok(Command::Cancel { id }) => {
+                assert_eq!(id, armed_id, "cancel must carry the armed query's id")
+            }
+            Ok(_) => panic!("armed drop enqueued the wrong command"),
+            Err(_) => panic!("armed drop must enqueue a Cancel, but nothing was sent"),
+        }
+
+        // DISARMED: a query that completed normally calls disarm(); dropping sends NOTHING,
+        // so a healthy query is never cancelled. Remove `disarm()`'s effect and this bites.
+        {
+            let mut guard = CancelOnDrop::new(tx.clone(), disarmed_id);
+            guard.disarm();
+        }
+        assert!(
+            rx.try_recv().is_err(),
+            "a disarmed (normally-completed) query must NOT be cancelled"
+        );
+    }
+
+    #[test]
+    fn cancel_arm_finishing_a_live_and_unknown_query_never_panics() {
+        // The worker's Cancel arm does `query_mut(&id).finish()` then drops the pending entry.
+        // Prove both halves are panic-free and idempotent - a late/duplicate Cancel for an
+        // id that already terminated must never crash the single worker task.
+        let mut kad = bare_kad();
+        let live = kad.get_providers(kad::RecordKey::new(&b"live".to_vec()));
+
+        // LIVE id: finish() terminates the walk at the next poll. Calling it TWICE (a
+        // duplicate Cancel) must not panic - idempotent.
+        if let Some(mut q) = kad.query_mut(&live) {
+            q.finish();
+        }
+        if let Some(mut q) = kad.query_mut(&live) {
+            q.finish();
+        }
+
+        // UNKNOWN id: a behaviour with an EMPTY query pool resolves NO id, so the Cancel arm
+        // is a safe no-op (the already-terminated case). This is what makes `Command::Cancel`
+        // fail-safe for a query that finished before its Cancel arrived.
+        let mut empty = bare_kad();
+        assert!(
+            empty.query_mut(&live).is_none(),
+            "an unknown/terminated id must not resolve - Cancel is a safe no-op"
         );
     }
 }

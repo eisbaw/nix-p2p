@@ -82,6 +82,10 @@ lint: _toolchain _python independence
     # substitute). --self-test first proves the guard bites, then the real scan must pass.
     "${NIX_P2P_PYTHON}/bin/python3" scripts/check-discovery-no-shortcut.py --self-test
     "${NIX_P2P_PYTHON}/bin/python3" scripts/check-discovery-no-shortcut.py
+    # TASK-154 AC#3: the shipped kad path stays off the PUBLIC IPFS DHT and bakes in no
+    # default bootstrap. --self-test proves the guard bites, then the real scan must pass.
+    "${NIX_P2P_PYTHON}/bin/python3" scripts/check-public-dht-isolation.py --self-test
+    "${NIX_P2P_PYTHON}/bin/python3" scripts/check-public-dht-isolation.py
 
 # Source-policy guards: daemon/testproxy stay strictly separated (PRD round 5/6),
 # link-shaping stays out of the shipped binary, and no float creeps into a gate/

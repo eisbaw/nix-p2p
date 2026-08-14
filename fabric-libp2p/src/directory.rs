@@ -3,6 +3,7 @@
 //! [`ProviderRecord`]s of every provider, purely through the DHT, and distinguishes a
 //! healthy `Miss` from a could-not-consult `Unavailable`.
 
+use std::collections::HashSet;
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
@@ -136,6 +137,22 @@ pub(crate) fn admit(
     }
 }
 
+/// Cap the provider fan-out of one lookup to at most `max_peers`, the TASK-154 AC#1 consumer
+/// bound. The kad index walk aggregates provider records from every peer it reached, so an
+/// unbounded set here would let a sybil flood turn ONE lookup into one `get_record` round
+/// trip per forged provider. Returns a DETERMINISTIC subset (sorted by `PeerId`) so the peers
+/// a lookup chases are stable across runs and across a `HashSet`'s arbitrary iteration order,
+/// which also makes the bound unit-testable. A `max_peers` of zero yields an empty fan-out,
+/// so a caller that budgeted zero peers gets zero fetches; callers pass a real budget whose
+/// default is sixteen. This never weakens integrity: every record a kept provider returns is
+/// still fully ed25519-verified downstream; the cap only bounds COST, never trust.
+fn cap_fan_out(providers: HashSet<PeerId>, max_peers: u32) -> Vec<PeerId> {
+    let mut providers: Vec<PeerId> = providers.into_iter().collect();
+    providers.sort_unstable();
+    providers.truncate(max_peers as usize);
+    providers
+}
+
 /// Classify the outcome of the value-store phase (a PURE decision, unit-tested to bite
 /// the Miss/Unavailable boundary the seam is built on).
 ///
@@ -233,7 +250,7 @@ impl Libp2pProviderDirectory {
     /// eclipse false-`Miss` limit `crate::QueryReach` documents (reaching this node's
     /// REACHABLE subgraph is not proof of reaching the key's global custodians; that
     /// residue is inherent to a single-node view and is not newly introduced here).
-    async fn resolve(&self, key: &ContentKey) -> Lookup<Vec<ProviderRecord>> {
+    async fn resolve(&self, key: &ContentKey, max_peers: u32) -> Lookup<Vec<ProviderRecord>> {
         if self.handle.routing_peers().await == 0 {
             return Lookup::Unavailable(Unavailable::InsufficientRouting);
         }
@@ -260,6 +277,20 @@ impl Libp2pProviderDirectory {
             // completed lookup" - a lookup that reached nobody is NOT healthy.)
             return absence_from_reach(reach);
         }
+
+        // AC#1 CONSUMER FAN-OUT BOUND (TASK-154). The kad index walk AGGREGATES provider
+        // records from every peer it reaches near the key, so a sybil flood (many forged
+        // provider records for one key) can name far more providers than we should chase.
+        // Cap the set we fan out to at `budget.max_peers` BEFORE issuing the Phase-2
+        // value-record fetches, so a single lookup costs a bounded number of `get_record`
+        // round trips (and bounded exposure) regardless of how many providers were named.
+        // This is the read-path complement to the store-side `STORE_MAX_PROVIDERS_PER_KEY`
+        // (how many providers ONE node holds per key); this bounds how many of the
+        // aggregated providers a lookup then consults. Never rejects a legitimate answer:
+        // headroom is large (default max_peers=16 >> the handful the proven tests hold), and
+        // when the cap does bite it keeps a deterministic subset, still able to yield a valid
+        // provider. Integrity is untouched - every kept record is still ed25519-verified.
+        let providers = cap_fan_out(providers, max_peers);
 
         // Phase 2: fetch each provider's signed record from the value store CONCURRENTLY
         // (resolve latency is the max of the fetches, not their sum - which keeps a
@@ -325,12 +356,14 @@ impl ProviderDirectory for Libp2pProviderDirectory {
         key: &ContentKey,
         budget: &DiscoveryBudget,
     ) -> Lookup<Vec<ProviderRecord>> {
-        // The deadline is enforced at THIS async boundary. On elapse the resolve future
-        // is dropped, but the underlying kad query already handed to the worker is NOT
-        // cancelled - it runs to its own query_timeout, then replies into a dropped
-        // receiver (bounded wasted work, no leak). An explicit Cancel(QueryId) path
-        // (threading the id back out of SwarmHandle) is a work-bound follow-up: TASK-154.
-        match tokio::time::timeout(budget.deadline, self.resolve(key)).await {
+        // The deadline is enforced at THIS async boundary. On elapse the resolve future is
+        // dropped - and now (TASK-154 S4) that drop CANCELS the underlying kad query rather
+        // than leaking it: `SwarmHandle::get_providers`/`get_record` hold a `CancelOnDrop`
+        // guard armed for the whole `rx.await`, so dropping this future mid-wait fires a
+        // `Command::Cancel { id }` that `finish()`es the kad walk at the worker instead of
+        // letting it run to its own `query_timeout` and reply into a dropped receiver. The
+        // fan-out bound (`budget.max_peers`) is enforced inside `resolve` (see there).
+        match tokio::time::timeout(budget.deadline, self.resolve(key, budget.max_peers)).await {
             Ok(lookup) => lookup,
             Err(_elapsed) => Lookup::Unavailable(Unavailable::DeadlineExceeded),
         }
@@ -388,6 +421,43 @@ mod tests {
             Lookup::Unavailable(Unavailable::Backend(_)) => {}
             other => panic!("expected Unavailable(Backend), got {other:?}"),
         }
+    }
+
+    // --- AC#1 consumer fan-out bound (TASK-154). `cap_fan_out` is the pure decision the
+    // resolver applies between the index walk and the per-provider value fetches; testing it
+    // directly proves the bound BITES without a live swarm.
+
+    #[test]
+    fn fan_out_capped_to_max_peers_when_index_over_budget() {
+        // A flooded index names far more providers than the budget allows. The bound MUST
+        // reduce the fan-out to exactly `max_peers` - the anti-sybil-amplification bite:
+        // delete the `truncate` and this over-fetches (len == 100), failing here.
+        let providers: HashSet<PeerId> = (0..100).map(|_| PeerId::random()).collect();
+        let capped = cap_fan_out(providers, 16);
+        assert_eq!(
+            capped.len(),
+            16,
+            "a lookup must chase at most max_peers providers, not one per forged record"
+        );
+    }
+
+    #[test]
+    fn fan_out_keeps_all_when_index_within_budget() {
+        // The common case: fewer providers than the budget (what the proven tests hold) is
+        // passed through UNTOUCHED - the cap never drops a legitimate provider.
+        let providers: HashSet<PeerId> = (0..3).map(|_| PeerId::random()).collect();
+        assert_eq!(cap_fan_out(providers, 16).len(), 3);
+    }
+
+    #[test]
+    fn fan_out_is_deterministic_across_iteration_order() {
+        // Same provider SET, capped twice, must yield the SAME subset in the SAME order -
+        // otherwise the peers a lookup chases would drift with HashSet's arbitrary order,
+        // and the bound would be untestable / unreproducible.
+        let ids: Vec<PeerId> = (0..40).map(|_| PeerId::random()).collect();
+        let a: HashSet<PeerId> = ids.iter().copied().collect();
+        let b: HashSet<PeerId> = ids.iter().rev().copied().collect();
+        assert_eq!(cap_fan_out(a, 16), cap_fan_out(b, 16));
     }
 
     // --- `admit` lifecycle-floor tests (TASK-152 AC#3/#4/#1-consume). Each crafts the
