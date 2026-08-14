@@ -1,0 +1,475 @@
+{
+  "task": "task-99",
+  "measures": "peer-LINK zstd compression on real nar data (the shipped /nar/3 codec)",
+  "integer_exact": true,
+  "no_floats_in_decisions": true,
+  "cdn_baseline_pair_file_over_nar": [
+    383084972,
+    1176685088
+  ],
+  "cdn_baseline_display": "0.325563 (~325562 ppm; exact 95771243/294171272)",
+  "home_uplink_bytes_per_sec": 2500000,
+  "lan_bytes_per_sec": 204000000,
+  "shipped_default_level": 3,
+  "per_level_aggregate": [
+    {
+      "level": 3,
+      "n_files": 7,
+      "sum_compressed_bytes": 64000619,
+      "sum_raw_bytes": 287530648,
+      "aggregate_ratio_pair": [
+        64000619,
+        287530648
+      ],
+      "aggregate_ratio_display": "0.222587 (~222587 ppm; exact 64000619/287530648)",
+      "aggregate_beats_cdn_wire": true,
+      "aggregate_compress_bytes_per_sec": 339488300,
+      "aggregate_decompress_bytes_per_sec": 822109947,
+      "net_home_uplink": {
+        "bandwidth_bytes_per_sec": 2500000,
+        "raw_delivery_ns": 115012259200,
+        "zstd_compress_ns": 846953040,
+        "zstd_link_ns": 25600247600,
+        "zstd_decompress_ns": 349747195,
+        "zstd_total_ns": 26796947835,
+        "zstd_beats_raw_end_to_end": true,
+        "raw_net_bytes_per_sec": 2500000,
+        "zstd_net_bytes_per_sec": 10729977
+      },
+      "net_lan": {
+        "bandwidth_bytes_per_sec": 204000000,
+        "raw_delivery_ns": 1409463960,
+        "zstd_compress_ns": 846953040,
+        "zstd_link_ns": 313728524,
+        "zstd_decompress_ns": 349747195,
+        "zstd_total_ns": 1510428759,
+        "zstd_beats_raw_end_to_end": false,
+        "raw_net_bytes_per_sec": 204000000,
+        "zstd_net_bytes_per_sec": 190363594
+      }
+    },
+    {
+      "level": 19,
+      "n_files": 7,
+      "sum_compressed_bytes": 48328733,
+      "sum_raw_bytes": 287530648,
+      "aggregate_ratio_pair": [
+        48328733,
+        287530648
+      ],
+      "aggregate_ratio_display": "0.168082 (~168082 ppm; exact 48328733/287530648)",
+      "aggregate_beats_cdn_wire": true,
+      "aggregate_compress_bytes_per_sec": 2859059,
+      "aggregate_decompress_bytes_per_sec": 869903845,
+      "net_home_uplink": {
+        "bandwidth_bytes_per_sec": 2500000,
+        "raw_delivery_ns": 115012259200,
+        "zstd_compress_ns": 100568255281,
+        "zstd_link_ns": 19331493200,
+        "zstd_decompress_ns": 330531529,
+        "zstd_total_ns": 120230280010,
+        "zstd_beats_raw_end_to_end": false,
+        "raw_net_bytes_per_sec": 2500000,
+        "zstd_net_bytes_per_sec": 2391499
+      },
+      "net_lan": {
+        "bandwidth_bytes_per_sec": 204000000,
+        "raw_delivery_ns": 1409463960,
+        "zstd_compress_ns": 100568255281,
+        "zstd_link_ns": 236905553,
+        "zstd_decompress_ns": 330531529,
+        "zstd_total_ns": 101135692363,
+        "zstd_beats_raw_end_to_end": false,
+        "raw_net_bytes_per_sec": 204000000,
+        "zstd_net_bytes_per_sec": 2843018
+      }
+    }
+  ],
+  "same_path_xz_vs_zstd": {
+    "note": "rigorous: xz (CDN) vs our zstd on the IDENTICAL paths; the honest ratio verdict (the committed-baseline compare above uses a DIFFERENT nar set)",
+    "n_paths": 5,
+    "sum_nar_bytes": 287442680,
+    "sum_xz_bytes": 46458960,
+    "xz_aggregate_ratio_pair": [
+      46458960,
+      287442680
+    ],
+    "xz_aggregate_ratio_display": "0.161629 (~161628 ppm; exact 1161474/7186067)",
+    "zstd_aggregate_by_level": {
+      "3": {
+        "sum_zstd_bytes": 63977450,
+        "aggregate_ratio_pair": [
+          63977450,
+          287442680
+        ],
+        "aggregate_ratio_display": "0.222575 (~222574 ppm; exact 6397745/28744268)",
+        "zstd_beats_xz_aggregate": false
+      },
+      "19": {
+        "sum_zstd_bytes": 48308482,
+        "aggregate_ratio_pair": [
+          48308482,
+          287442680
+        ],
+        "aggregate_ratio_display": "0.168063 (~168063 ppm; exact 24154241/143721340)",
+        "zstd_beats_xz_aggregate": false
+      }
+    },
+    "per_path": [
+      {
+        "hash": "2k6kb0jhvkkx35ldgkdmjq7z88am1jby",
+        "nar_size": 804496,
+        "xz_filesize": 212144,
+        "xz_ratio_pair": [
+          212144,
+          804496
+        ],
+        "xz_ratio_display": "0.263698 (~263698 ppm; exact 13259/50281)",
+        "zstd_by_level": {
+          "3": {
+            "compressed_bytes": 270542,
+            "beats_xz_same_path": false
+          },
+          "19": {
+            "compressed_bytes": 231000,
+            "beats_xz_same_path": false
+          }
+        }
+      },
+      {
+        "hash": "4b57hf2gdx58yvsmvkrs6pqgj94kr5jp",
+        "nar_size": 5017384,
+        "xz_filesize": 998284,
+        "xz_ratio_pair": [
+          998284,
+          5017384
+        ],
+        "xz_ratio_display": "0.198965 (~198965 ppm; exact 249571/1254346)",
+        "zstd_by_level": {
+          "3": {
+            "compressed_bytes": 1387954,
+            "beats_xz_same_path": false
+          },
+          "19": {
+            "compressed_bytes": 1096305,
+            "beats_xz_same_path": false
+          }
+        }
+      },
+      {
+        "hash": "440a84xjb9g0j0z8m4sq40i4lajvimfs",
+        "nar_size": 25421000,
+        "xz_filesize": 1713744,
+        "xz_ratio_pair": [
+          1713744,
+          25421000
+        ],
+        "xz_ratio_display": "0.067414 (~67414 ppm; exact 214218/3177625)",
+        "zstd_by_level": {
+          "3": {
+            "compressed_bytes": 2683086,
+            "beats_xz_same_path": false
+          },
+          "19": {
+            "compressed_bytes": 1791543,
+            "beats_xz_same_path": false
+          }
+        }
+      },
+      {
+        "hash": "08ppkh4vgi2m5mk094m2ljhha1g611s4",
+        "nar_size": 78001448,
+        "xz_filesize": 15322864,
+        "xz_ratio_pair": [
+          15322864,
+          78001448
+        ],
+        "xz_ratio_display": "0.196443 (~196443 ppm; exact 1915358/9750181)",
+        "zstd_by_level": {
+          "3": {
+            "compressed_bytes": 21303711,
+            "beats_xz_same_path": false
+          },
+          "19": {
+            "compressed_bytes": 16458967,
+            "beats_xz_same_path": false
+          }
+        }
+      },
+      {
+        "hash": "3nw826wh21n6m0mn2lmz28k261d68qch",
+        "nar_size": 178198352,
+        "xz_filesize": 28211924,
+        "xz_ratio_pair": [
+          28211924,
+          178198352
+        ],
+        "xz_ratio_display": "0.158318 (~158317 ppm; exact 7052981/44549588)",
+        "zstd_by_level": {
+          "3": {
+            "compressed_bytes": 38332157,
+            "beats_xz_same_path": false
+          },
+          "19": {
+            "compressed_bytes": 28730667,
+            "beats_xz_same_path": false
+          }
+        }
+      }
+    ]
+  },
+  "per_file": [
+    {
+      "path": "/tmp/claude-1000/-home-mpedersen-topics-nix-decentralized-cache/eefa311f-89e2-4fdd-ace9-d1057c734fef/scratchpad/nars/00-3j4s89cy5vrfw6mp4v8ycp4znfxbjjr9-unit-script-wg0-direct-guard-start.nar",
+      "raw_bytes": 7808,
+      "levels": [
+        {
+          "level": 3,
+          "compressed_bytes": 3340,
+          "raw_bytes": 7808,
+          "ratio_pair": [
+            3340,
+            7808
+          ],
+          "ratio_display": "0.427766 (~427766 ppm; exact 835/1952)",
+          "beats_cdn_wire": false,
+          "compress_bytes_per_sec": 92175473,
+          "decompress_bytes_per_sec": 327888128,
+          "compress_ns": 84708,
+          "decompress_ns": 23813
+        },
+        {
+          "level": 19,
+          "compressed_bytes": 3169,
+          "raw_bytes": 7808,
+          "ratio_pair": [
+            3169,
+            7808
+          ],
+          "ratio_display": "0.405866 (~405865 ppm; exact 3169/7808)",
+          "beats_cdn_wire": false,
+          "compress_bytes_per_sec": 8323321,
+          "decompress_bytes_per_sec": 965142150,
+          "compress_ns": 938087,
+          "decompress_ns": 8090
+        }
+      ]
+    },
+    {
+      "path": "/tmp/claude-1000/-home-mpedersen-topics-nix-decentralized-cache/eefa311f-89e2-4fdd-ace9-d1057c734fef/scratchpad/nars/01-2gpirn2vlqx82i9sqfjbj3rl26jnz5i0-cargo-package-paste-1.0.15.nar",
+      "raw_bytes": 80160,
+      "levels": [
+        {
+          "level": 3,
+          "compressed_bytes": 19829,
+          "raw_bytes": 80160,
+          "ratio_pair": [
+            19829,
+            80160
+          ],
+          "ratio_display": "0.247368 (~247367 ppm; exact 19829/80160)",
+          "beats_cdn_wire": true,
+          "compress_bytes_per_sec": 485039179,
+          "decompress_bytes_per_sec": 1809480812,
+          "compress_ns": 165265,
+          "decompress_ns": 44300
+        },
+        {
+          "level": 19,
+          "compressed_bytes": 17082,
+          "raw_bytes": 80160,
+          "ratio_pair": [
+            17082,
+            80160
+          ],
+          "ratio_display": "0.213099 (~213098 ppm; exact 2847/13360)",
+          "beats_cdn_wire": true,
+          "compress_bytes_per_sec": 3671643,
+          "decompress_bytes_per_sec": 1475319321,
+          "compress_ns": 21832187,
+          "decompress_ns": 54334
+        }
+      ]
+    },
+    {
+      "path": "/tmp/claude-1000/-home-mpedersen-topics-nix-decentralized-cache/eefa311f-89e2-4fdd-ace9-d1057c734fef/scratchpad/nars/02-2k6kb0jhvkkx35ldgkdmjq7z88am1jby-v4l-utils-1.30.1.nar",
+      "raw_bytes": 804496,
+      "levels": [
+        {
+          "level": 3,
+          "compressed_bytes": 270542,
+          "raw_bytes": 804496,
+          "ratio_pair": [
+            270542,
+            804496
+          ],
+          "ratio_display": "0.336288 (~336287 ppm; exact 135271/402248)",
+          "beats_cdn_wire": false,
+          "compress_bytes_per_sec": 404224455,
+          "decompress_bytes_per_sec": 1254316460,
+          "compress_ns": 1990221,
+          "decompress_ns": 641382
+        },
+        {
+          "level": 19,
+          "compressed_bytes": 231000,
+          "raw_bytes": 804496,
+          "ratio_pair": [
+            231000,
+            804496
+          ],
+          "ratio_display": "0.287136 (~287136 ppm; exact 375/1306)",
+          "beats_cdn_wire": true,
+          "compress_bytes_per_sec": 6741208,
+          "decompress_bytes_per_sec": 1007919315,
+          "compress_ns": 119340032,
+          "decompress_ns": 798175
+        }
+      ]
+    },
+    {
+      "path": "/tmp/claude-1000/-home-mpedersen-topics-nix-decentralized-cache/eefa311f-89e2-4fdd-ace9-d1057c734fef/scratchpad/nars/03-4b57hf2gdx58yvsmvkrs6pqgj94kr5jp-libpulseaudio-17.0.nar",
+      "raw_bytes": 5017384,
+      "levels": [
+        {
+          "level": 3,
+          "compressed_bytes": 1387954,
+          "raw_bytes": 5017384,
+          "ratio_pair": [
+            1387954,
+            5017384
+          ],
+          "ratio_display": "0.276629 (~276629 ppm; exact 693977/2508692)",
+          "beats_cdn_wire": true,
+          "compress_bytes_per_sec": 375118668,
+          "decompress_bytes_per_sec": 1230945419,
+          "compress_ns": 13375458,
+          "decompress_ns": 4076041
+        },
+        {
+          "level": 19,
+          "compressed_bytes": 1096305,
+          "raw_bytes": 5017384,
+          "ratio_pair": [
+            1096305,
+            5017384
+          ],
+          "ratio_display": "0.218501 (~218501 ppm; exact 1096305/5017384)",
+          "beats_cdn_wire": true,
+          "compress_bytes_per_sec": 4607500,
+          "decompress_bytes_per_sec": 905403983,
+          "compress_ns": 1088959947,
+          "decompress_ns": 5541597
+        }
+      ]
+    },
+    {
+      "path": "/tmp/claude-1000/-home-mpedersen-topics-nix-decentralized-cache/eefa311f-89e2-4fdd-ace9-d1057c734fef/scratchpad/nars/04-440a84xjb9g0j0z8m4sq40i4lajvimfs-python3.13-pyopengl-3.1.9.nar",
+      "raw_bytes": 25421000,
+      "levels": [
+        {
+          "level": 3,
+          "compressed_bytes": 2683086,
+          "raw_bytes": 25421000,
+          "ratio_pair": [
+            2683086,
+            25421000
+          ],
+          "ratio_display": "0.105546 (~105546 ppm; exact 1341543/12710500)",
+          "beats_cdn_wire": true,
+          "compress_bytes_per_sec": 636500803,
+          "decompress_bytes_per_sec": 692884074,
+          "compress_ns": 39938677,
+          "decompress_ns": 36688677
+        },
+        {
+          "level": 19,
+          "compressed_bytes": 1791543,
+          "raw_bytes": 25421000,
+          "ratio_pair": [
+            1791543,
+            25421000
+          ],
+          "ratio_display": "0.070475 (~70474 ppm; exact 1791543/25421000)",
+          "beats_cdn_wire": true,
+          "compress_bytes_per_sec": 4700278,
+          "decompress_bytes_per_sec": 1103824601,
+          "compress_ns": 5408403038,
+          "decompress_ns": 23029927
+        }
+      ]
+    },
+    {
+      "path": "/tmp/claude-1000/-home-mpedersen-topics-nix-decentralized-cache/eefa311f-89e2-4fdd-ace9-d1057c734fef/scratchpad/nars/05-08ppkh4vgi2m5mk094m2ljhha1g611s4-qtbase-6.8.1.nar",
+      "raw_bytes": 78001448,
+      "levels": [
+        {
+          "level": 3,
+          "compressed_bytes": 21303711,
+          "raw_bytes": 78001448,
+          "ratio_pair": [
+            21303711,
+            78001448
+          ],
+          "ratio_display": "0.273119 (~273119 ppm; exact 21303711/78001448)",
+          "beats_cdn_wire": true,
+          "compress_bytes_per_sec": 296499216,
+          "decompress_bytes_per_sec": 734053289,
+          "compress_ns": 263074719,
+          "decompress_ns": 106261288
+        },
+        {
+          "level": 19,
+          "compressed_bytes": 16458967,
+          "raw_bytes": 78001448,
+          "ratio_pair": [
+            16458967,
+            78001448
+          ],
+          "ratio_display": "0.211008 (~211008 ppm; exact 2351281/11143064)",
+          "beats_cdn_wire": true,
+          "compress_bytes_per_sec": 3070335,
+          "decompress_bytes_per_sec": 694344047,
+          "compress_ns": 25404857337,
+          "decompress_ns": 112338326
+        }
+      ]
+    },
+    {
+      "path": "/tmp/claude-1000/-home-mpedersen-topics-nix-decentralized-cache/eefa311f-89e2-4fdd-ace9-d1057c734fef/scratchpad/nars/06-3nw826wh21n6m0mn2lmz28k261d68qch-afawjm6nv8m5aagkcqxlxgrr5qpyh6cm-source.nar",
+      "raw_bytes": 178198352,
+      "levels": [
+        {
+          "level": 3,
+          "compressed_bytes": 38332157,
+          "raw_bytes": 178198352,
+          "ratio_pair": [
+            38332157,
+            178198352
+          ],
+          "ratio_display": "0.215109 (~215109 ppm; exact 38332157/178198352)",
+          "beats_cdn_wire": true,
+          "compress_bytes_per_sec": 337289910,
+          "decompress_bytes_per_sec": 882118992,
+          "compress_ns": 528323992,
+          "decompress_ns": 202011694
+        },
+        {
+          "level": 19,
+          "compressed_bytes": 28730667,
+          "raw_bytes": 178198352,
+          "ratio_pair": [
+            28730667,
+            178198352
+          ],
+          "ratio_display": "0.161229 (~161228 ppm; exact 28730667/178198352)",
+          "beats_cdn_wire": true,
+          "compress_bytes_per_sec": 2600527,
+          "decompress_bytes_per_sec": 944041812,
+          "compress_ns": 68523924653,
+          "decompress_ns": 188761080
+        }
+      ]
+    }
+  ]
+}

@@ -1,0 +1,7 @@
+3j4s89cy5vrfw6mp4v8ycp4znfxbjjr9  Compression= FileSize= NarSize=
+2gpirn2vlqx82i9sqfjbj3rl26jnz5i0  Compression= FileSize= NarSize=
+2k6kb0jhvkkx35ldgkdmjq7z88am1jby  Compression=xz FileSize=212144 NarSize=804496
+4b57hf2gdx58yvsmvkrs6pqgj94kr5jp  Compression=xz FileSize=998284 NarSize=5017384
+440a84xjb9g0j0z8m4sq40i4lajvimfs  Compression=xz FileSize=1713744 NarSize=25421000
+08ppkh4vgi2m5mk094m2ljhha1g611s4  Compression=xz FileSize=15322864 NarSize=78001448
+3nw826wh21n6m0mn2lmz28k261d68qch  Compression=xz FileSize=28211924 NarSize=178198352

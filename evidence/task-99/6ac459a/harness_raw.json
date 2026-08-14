@@ -1,0 +1,154 @@
+{
+  "harness": "peer_fabric::compress_zstd + BoundedZstdDecoder (the shipped /nar/3 codec)",
+  "cpu_ns_note": "min wall-ns of single-threaded runs on an idle core; a proxy for CPU-ns",
+  "default_level": 19,
+  "files": [
+    {
+      "path": "/tmp/claude-1000/-home-mpedersen-topics-nix-decentralized-cache/eefa311f-89e2-4fdd-ace9-d1057c734fef/scratchpad/nars/00-3j4s89cy5vrfw6mp4v8ycp4znfxbjjr9-unit-script-wg0-direct-guard-start.nar",
+      "raw_bytes": 7808,
+      "blake3": "blake3:c0c7ffbe039dd862b2bbe23760212c308c211844224a1c2f68037bef28c92510",
+      "levels": [
+        {
+          "level": 3,
+          "compressed_bytes": 3340,
+          "raw_bytes": 7808,
+          "compress_ns": 84708,
+          "decompress_ns": 23813
+        },
+        {
+          "level": 19,
+          "compressed_bytes": 3169,
+          "raw_bytes": 7808,
+          "compress_ns": 938087,
+          "decompress_ns": 8090
+        }
+      ]
+    },
+    {
+      "path": "/tmp/claude-1000/-home-mpedersen-topics-nix-decentralized-cache/eefa311f-89e2-4fdd-ace9-d1057c734fef/scratchpad/nars/01-2gpirn2vlqx82i9sqfjbj3rl26jnz5i0-cargo-package-paste-1.0.15.nar",
+      "raw_bytes": 80160,
+      "blake3": "blake3:c3a137bdf849f4202de8dc6b4ef21cd25188ed4b8769265aff8d9e5be82c2dfb",
+      "levels": [
+        {
+          "level": 3,
+          "compressed_bytes": 19829,
+          "raw_bytes": 80160,
+          "compress_ns": 165265,
+          "decompress_ns": 44300
+        },
+        {
+          "level": 19,
+          "compressed_bytes": 17082,
+          "raw_bytes": 80160,
+          "compress_ns": 21832187,
+          "decompress_ns": 54334
+        }
+      ]
+    },
+    {
+      "path": "/tmp/claude-1000/-home-mpedersen-topics-nix-decentralized-cache/eefa311f-89e2-4fdd-ace9-d1057c734fef/scratchpad/nars/02-2k6kb0jhvkkx35ldgkdmjq7z88am1jby-v4l-utils-1.30.1.nar",
+      "raw_bytes": 804496,
+      "blake3": "blake3:33a4dcb2098832a46e249982024bfeb25855e5b3f5c703dd6d40aadd391b047b",
+      "levels": [
+        {
+          "level": 3,
+          "compressed_bytes": 270542,
+          "raw_bytes": 804496,
+          "compress_ns": 1990221,
+          "decompress_ns": 641382
+        },
+        {
+          "level": 19,
+          "compressed_bytes": 231000,
+          "raw_bytes": 804496,
+          "compress_ns": 119340032,
+          "decompress_ns": 798175
+        }
+      ]
+    },
+    {
+      "path": "/tmp/claude-1000/-home-mpedersen-topics-nix-decentralized-cache/eefa311f-89e2-4fdd-ace9-d1057c734fef/scratchpad/nars/03-4b57hf2gdx58yvsmvkrs6pqgj94kr5jp-libpulseaudio-17.0.nar",
+      "raw_bytes": 5017384,
+      "blake3": "blake3:ad6b3f6678d21fac0b8aa4480f97c01bc17962a29a0d7a3758e512d3a5642f9d",
+      "levels": [
+        {
+          "level": 3,
+          "compressed_bytes": 1387954,
+          "raw_bytes": 5017384,
+          "compress_ns": 13375458,
+          "decompress_ns": 4076041
+        },
+        {
+          "level": 19,
+          "compressed_bytes": 1096305,
+          "raw_bytes": 5017384,
+          "compress_ns": 1088959947,
+          "decompress_ns": 5541597
+        }
+      ]
+    },
+    {
+      "path": "/tmp/claude-1000/-home-mpedersen-topics-nix-decentralized-cache/eefa311f-89e2-4fdd-ace9-d1057c734fef/scratchpad/nars/04-440a84xjb9g0j0z8m4sq40i4lajvimfs-python3.13-pyopengl-3.1.9.nar",
+      "raw_bytes": 25421000,
+      "blake3": "blake3:b9a3d90216eb54a188ee0d4e4c3673af8f13e90662846da592bc928b56c2e10b",
+      "levels": [
+        {
+          "level": 3,
+          "compressed_bytes": 2683086,
+          "raw_bytes": 25421000,
+          "compress_ns": 39938677,
+          "decompress_ns": 36688677
+        },
+        {
+          "level": 19,
+          "compressed_bytes": 1791543,
+          "raw_bytes": 25421000,
+          "compress_ns": 5408403038,
+          "decompress_ns": 23029927
+        }
+      ]
+    },
+    {
+      "path": "/tmp/claude-1000/-home-mpedersen-topics-nix-decentralized-cache/eefa311f-89e2-4fdd-ace9-d1057c734fef/scratchpad/nars/05-08ppkh4vgi2m5mk094m2ljhha1g611s4-qtbase-6.8.1.nar",
+      "raw_bytes": 78001448,
+      "blake3": "blake3:163f454eb7787a2375c533a40fbedce3c995de14578dd99fceabe8a02dda83bf",
+      "levels": [
+        {
+          "level": 3,
+          "compressed_bytes": 21303711,
+          "raw_bytes": 78001448,
+          "compress_ns": 263074719,
+          "decompress_ns": 106261288
+        },
+        {
+          "level": 19,
+          "compressed_bytes": 16458967,
+          "raw_bytes": 78001448,
+          "compress_ns": 25404857337,
+          "decompress_ns": 112338326
+        }
+      ]
+    },
+    {
+      "path": "/tmp/claude-1000/-home-mpedersen-topics-nix-decentralized-cache/eefa311f-89e2-4fdd-ace9-d1057c734fef/scratchpad/nars/06-3nw826wh21n6m0mn2lmz28k261d68qch-afawjm6nv8m5aagkcqxlxgrr5qpyh6cm-source.nar",
+      "raw_bytes": 178198352,
+      "blake3": "blake3:d7ca09e66b2fc4454dbc8b8fe6d9021d07587c8e17a21042d68e3624e0d91f85",
+      "levels": [
+        {
+          "level": 3,
+          "compressed_bytes": 38332157,
+          "raw_bytes": 178198352,
+          "compress_ns": 528323992,
+          "decompress_ns": 202011694
+        },
+        {
+          "level": 19,
+          "compressed_bytes": 28730667,
+          "raw_bytes": 178198352,
+          "compress_ns": 68523924653,
+          "decompress_ns": 188761080
+        }
+      ]
+    }
+  ]
+}
