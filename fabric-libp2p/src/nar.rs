@@ -2336,10 +2336,14 @@ mod tests {
         );
     }
 
-    /// AC#3 truncation ON THE WIRE: a zstd frame cut short decodes to fewer bytes than the
-    /// signed size, so gate-1 rejects it - `IntegrityMismatch`, never a short nar accepted.
+    /// AC#3 truncation ON THE WIRE: a zstd frame cut short is rejected AT THE CODEC - `finish`
+    /// sees the frame never reached a clean boundary (`DecodeError::Truncated`), surfacing as
+    /// `Unavailable("zstd decode did not complete")` BEFORE gate-1. This DISTINGUISHES the new
+    /// codec from the old short-decode decoder: the OLD path returned correct-but-short bytes
+    /// that gate-1 caught as `IntegrityMismatch`, so requiring the codec-completion failure here
+    /// is what bites a regression to the short-decode behaviour.
     #[tokio::test]
-    async fn truncated_zstd_frame_fails_gate_one() {
+    async fn truncated_zstd_frame_fails_at_the_codec() {
         let raw = b"a nar whose compressed frame is cut short before EOF".repeat(120);
         let content = Blake3Digest::from_raw_nar(&raw);
         let full = wire_nar_zstd(&raw, DEFAULT_ZSTD_LEVEL);
@@ -2348,13 +2352,18 @@ mod tests {
         let err = read_response_streamed(&mut reader, Some(raw.len() as u64), IDLE, &content)
             .await
             .expect_err("a truncated frame must fail rather than yield a short nar");
-        assert!(
-            matches!(
-                err,
-                TransferError::IntegrityMismatch { .. } | TransferError::Unavailable(_)
+        match err {
+            TransferError::Unavailable(why) => assert!(
+                why.contains("did not complete") || why.contains("truncated"),
+                "a truncated frame must be rejected at the codec (DecodeError::Truncated), got \
+                 Unavailable({why})"
             ),
-            "expected an integrity/unavailable failure, got {err}"
-        );
+            other => panic!(
+                "expected a codec-completion failure (Unavailable/did-not-complete); an \
+                 IntegrityMismatch would mean the codec accepted a short nar and leaned on \
+                 gate-1 (the OLD behaviour) - got {other}"
+            ),
+        }
     }
 
     /// AC#5 an unknown codec byte from an untrusted server fails the fetch (never guesses a

@@ -1017,11 +1017,22 @@ async fn adversarial_truncated_zstd_frame_fails_the_fetch() {
     )
     .await
     .expect_err("a truncated zstd frame over the link must fail the fetch");
-    // Truncation is now rejected AT THE CODEC (finish -> Truncated -> Unavailable), never a
-    // silent short NAR. (Pre-fix it could return the correct-but-short bytes and lean on gate-1.)
+    // Truncation is now rejected AT THE CODEC (finish -> Truncated -> Unavailable "zstd decode
+    // did not complete"), never a silent short NAR. This test DISTINGUISHES the new codec from
+    // the old short-decode decoder: the OLD path returned correct-but-short bytes that gate-1
+    // caught as IntegrityMismatch, so an IntegrityMismatch here would mean the codec accepted a
+    // truncated frame and we regressed. Require the codec-completion failure specifically.
     match err {
-        TransferError::Unavailable(_) | TransferError::IntegrityMismatch { .. } => {}
-        other => panic!("expected the truncated fetch to fail closed, got {other}"),
+        TransferError::Unavailable(why) => assert!(
+            why.contains("did not complete") || why.contains("truncated"),
+            "a truncated frame must be rejected AT THE CODEC (DecodeError::Truncated surfacing \
+             as a codec-completion failure), got Unavailable({why})"
+        ),
+        other => panic!(
+            "expected the truncated fetch to fail AT THE CODEC (Unavailable/did-not-complete); \
+             an IntegrityMismatch would mean the OLD short-decode path accepted a truncated \
+             frame and leaned on gate-1 - got {other}"
+        ),
     }
 }
 
