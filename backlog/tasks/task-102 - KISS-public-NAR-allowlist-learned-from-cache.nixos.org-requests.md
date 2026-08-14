@@ -5,7 +5,7 @@ status: Done
 assignee:
   - '@claude'
 created_date: '2026-08-10 10:03'
-updated_date: '2026-08-14 14:44'
+updated_date: '2026-08-14 14:45'
 labels:
   - privacy
   - publication
@@ -26,11 +26,11 @@ Implement one persistent append-only local allowlist. When the daemon handles a 
 
 ## Acceptance Criteria
 <!-- AC:BEGIN -->
-- [ ] #1 One PublicNarAllowlist enforcement point owns append and contains checks and every public publisher can consume only its approved entries.
-- [ ] #2 The existing requested-narinfo path appends one canonical NarHash and NarSize record only after an exact cache.nixos.org response is correlated and its trusted Nix signature is verified. Duplicate requests are idempotent and require no second network request or store census.
-- [ ] #3 MISS outage timeout malformed metadata bad signature wrong authority hash mismatch size mismatch local build and private upstream evidence append nothing and return named fail-closed outcomes. Mutations neutralizing each guard fail.
-- [ ] #4 The list is restart-persistent append-only bounded and crash-safe with strict file owner mode type link and record parsing. A torn final append loses at most that uncommitted entry and never creates eligibility.
-- [ ] #5 Status reports allowlisted count and total NarSize without StorePath NarHash or inventory labels. The file contains no StorePath and there is no remote enumeration API; documentation warns that publication still fingerprints public package holdings.
+- [x] #1 One PublicNarAllowlist enforcement point owns append and contains checks and every public publisher can consume only its approved entries.
+- [x] #2 The existing requested-narinfo path appends one canonical NarHash and NarSize record only after an exact cache.nixos.org response is correlated and its trusted Nix signature is verified. Duplicate requests are idempotent and require no second network request or store census.
+- [x] #3 MISS outage timeout malformed metadata bad signature wrong authority hash mismatch size mismatch local build and private upstream evidence append nothing and return named fail-closed outcomes. Mutations neutralizing each guard fail.
+- [x] #4 The list is restart-persistent append-only bounded and crash-safe with strict file owner mode type link and record parsing. A torn final append loses at most that uncommitted entry and never creates eligibility.
+- [x] #5 Status reports allowlisted count and total NarSize without StorePath NarHash or inventory labels. The file contains no StorePath and there is no remote enumeration API; documentation warns that publication still fingerprints public package holdings.
 <!-- AC:END -->
 
 ## Implementation Plan
