@@ -48,7 +48,9 @@ use peer_fabric::{
 use daemon_core::claim::NarHashKey;
 use daemon_core::rewrite::RawServeDecision;
 use daemon_core::source::NarSource;
-use daemon_core::{AvailabilityIndex, HoldAnswer};
+use daemon_core::{
+    AvailabilityIndex, HoldAnswer, PublicNarAllowlist, PublicNarClaim, PublicationRejected,
+};
 
 mod store_probe;
 pub use store_probe::Libp2pCatalogProbe;
@@ -736,6 +738,71 @@ pub async fn announce_store_provisions(
     Ok(records)
 }
 
+// -------------------------------------------------------------------------
+// The TYPED PUBLIC-ANNOUNCE door (TASK-102): the ONLY announce path gated on the
+// public-NAR allowlist. Closed-by-construction, so a PUBLIC announce cannot bypass it.
+// -------------------------------------------------------------------------
+
+/// CONSULT the public-NAR allowlist for a batch of verified store provisions a node
+/// intends to announce PUBLICLY, minting one [`PublicNarClaim`] per provision. FAIL-CLOSED
+/// and ALL-OR-NOTHING: if ANY provision is not allowlisted (never proven public via a
+/// trusted cache.nixos.org signature), the WHOLE batch is refused and NO claim is minted,
+/// so no partial announce can leak an un-approved NAR.
+///
+/// This is the single consult point (AC#1) the PUBLIC announce door goes through. It is a
+/// PURE function of `(provisions, allowlist)`, so the closed-by-construction gate is
+/// unit-testable without a live DHT: an operator-seeded LOCAL fixture (absent from the
+/// allowlist) yields a NAMED [`PublicationRejected`] and mints nothing. The size the
+/// allowlist proved must equal the provision's declared NarSize, or the claim is refused
+/// (a NAR can be announced only at exactly the size a trusted signature covered).
+///
+/// It is deliberately SEPARATE from [`announce_provider_seeds`] / [`announce_store_provisions`],
+/// which are SUBSTRATE-NEUTRAL (they legitimately serve LAN / private / test announces where
+/// operator-named local content is fine). Publicness is a property of the SUBSTRATE, so the
+/// allowlist gate belongs only at the PUBLIC boundary - this door - not inside the neutral loops.
+pub fn approve_provisions_for_public(
+    provisions: &[StoreProvision],
+    allowlist: &PublicNarAllowlist,
+) -> Result<Vec<PublicNarClaim>, PublicationRejected> {
+    let mut claims = Vec::with_capacity(provisions.len());
+    for provision in provisions {
+        // `approve` mints an UNFORGEABLE PublicNarClaim iff the NarHash is allowlisted AND
+        // its approved size matches what this node would advertise. Absence -> fail-closed.
+        let claim = allowlist.approve(provision.nar_hash(), Some(provision.declared_size()))?;
+        claims.push(claim);
+    }
+    Ok(claims)
+}
+
+/// Announce a signed [`ProviderRecord`] for each verified store [`StoreProvision`], but
+/// ONLY after the public-NAR allowlist has PROVEN every one publishable (TASK-102). This is
+/// the PUBLIC analogue of [`announce_store_provisions`]: it FIRST runs
+/// [`approve_provisions_for_public`] (fail-closed, all-or-nothing) and announces nothing if
+/// any provision is un-allowlisted, then reuses the same verified-content announce loop.
+///
+/// STATUS: this typed door exists so that - by construction - the only way to PUBLICLY
+/// announce store content is through the allowlist gate (a caller cannot announce a NAR the
+/// allowlist did not approve without a `PublicNarClaim`, which only the allowlist mints). It
+/// is not yet wired to a shipped binary: TASK-103 (the DHT discovery-announce driver) is the
+/// integration that routes public participation through this door and populates the allowlist
+/// for operator-provided paths by proving each public via the same narinfo-signature gate.
+pub async fn announce_public_provisions(
+    fabric: &Libp2pFabric,
+    identity_seed: [u8; 32],
+    provisions: &[StoreProvision],
+    allowlist: &PublicNarAllowlist,
+    ttl_secs: u64,
+    now: u64,
+    budget: &AnnounceBudget,
+) -> Result<Vec<ProviderRecord>, String> {
+    // THE GATE (fail-closed, before any record is signed or announced): every provision must
+    // be allowlisted, or the whole public announce is refused.
+    approve_provisions_for_public(provisions, allowlist)
+        .map_err(|rejected| format!("public announce refused by the allowlist gate: {rejected}"))?;
+    // Approved: reuse the verified-content announce loop (SSOT with the neutral store path).
+    announce_store_provisions(fabric, identity_seed, provisions, ttl_secs, now, budget).await
+}
+
 /// Wrap a running `fabric` in the consumer [`Libp2pNarSource`] + its paired
 /// [`Libp2pRawServe`], both holding the SAME fabric and discovery budget so the
 /// rewrite-to-raw decision and the fetch can never drift (TASK-164). Shared by the
@@ -1015,5 +1082,110 @@ mod identity_seed_tests {
             "identity-present + floor-absent is a normal boot, not corruption"
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+#[cfg(test)]
+mod public_announce_gate_tests {
+    //! TASK-102: the PUBLIC announce door is closed-by-construction on the allowlist.
+    //! These are network-free unit tests of [`approve_provisions_for_public`] - the single
+    //! consult point every public announce goes through. StoreProvision has private fields,
+    //! but this test lives in the SAME crate, so it can mint one directly (the shipped path
+    //! mints it only via `verify_store_provisions`; here we only need the gate's decision).
+    use super::{StoreProvision, approve_provisions_for_public};
+    use daemon_core::content_id::Blake3Digest;
+    use daemon_core::{
+        NarHashKey, NullAllowlistStore, PublicNarAllowlist, PublicationRejected, TrustedNarKeys,
+    };
+
+    const FIXTURE_PUBKEY: &str = "nix-p2p-test-1:empdFBu9wVZG12rPKToHMOTsU1qzWzeCcLdq/KQH0JQ=";
+    // The real `app` narinfo (NarHash sha256:0pgsb9..., NarSize 408), trusted-signed.
+    const APP_NARINFO: &[u8] = b"StorePath: /nix/store/l30jg5xg904s62jvw5znmr682xpr993c-nix-p2p-fixture-app\n\
+URL: nar/15m2z8ar1r1jm5x7fqblq4s7438ghdmam396l5kwvc25jq8rzxb7.nar.xz\n\
+Compression: xz\n\
+FileHash: sha256:15m2z8ar1r1jm5x7fqblq4s7438ghdmam396l5kwvc25jq8rzxb7\n\
+FileSize: 260\n\
+NarHash: sha256:0pgsb9mjmfj57w1ddmqn9z9667nwbqbnn699j1s1s99jhy6cppsm\n\
+NarSize: 408\n\
+References: 0a0lslqb6gbqnj6xqjlaljjqg6kgb3wz-nix-p2p-fixture-lib\n\
+Deriver: 3135ldqj1kl5wxkrrdnf4dfxiqakjz0z-nix-p2p-fixture-app.drv\n\
+Sig: nix-p2p-test-1:Xqf1bjNJ1ReFahm86zY+hv80+7QeJer5V/HjlEAvP39yJEK8w8jHG9WH5lM7mN9WCIbdH/DDx81dmsjVObMqAQ==\n";
+
+    fn allowlist_with_app() -> PublicNarAllowlist {
+        let trusted = TrustedNarKeys::from_lines([FIXTURE_PUBKEY]).unwrap();
+        let list = PublicNarAllowlist::open(trusted, Box::new(NullAllowlistStore)).unwrap();
+        list.learn(APP_NARINFO);
+        list
+    }
+
+    fn provision(nar_hash: &str, declared_size: u64) -> StoreProvision {
+        StoreProvision {
+            nar_hash: nar_hash.parse::<NarHashKey>().unwrap(),
+            content: Blake3Digest::from_bytes([0u8; 32]),
+            declared_size,
+        }
+    }
+
+    #[test]
+    fn allowlisted_provision_is_approved() {
+        let list = allowlist_with_app();
+        let provisions = vec![provision(
+            "sha256:0pgsb9mjmfj57w1ddmqn9z9667nwbqbnn699j1s1s99jhy6cppsm",
+            408,
+        )];
+        let claims = approve_provisions_for_public(&provisions, &list).expect("approved");
+        assert_eq!(claims.len(), 1);
+        assert_eq!(claims[0].nar_size(), 408);
+    }
+
+    #[test]
+    fn an_operator_seeded_local_fixture_is_refused_from_public_announce() {
+        // THE BITE (mped-architect must-have #2): a purely-local NAR the operator named is
+        // NOT allowlisted, so the public door refuses the whole batch and mints NO claim.
+        // Neuter the `approve` consult inside `approve_provisions_for_public` and this goes
+        // green (claims minted) -> the guard bites. This is the closed-by-construction gate:
+        // without a PublicNarClaim, `announce_public_provisions` cannot announce it.
+        let list = allowlist_with_app();
+        let local_only = provision(
+            "sha256:1nn8563y6j55y003xjk1bvb1854abmigsas2jgzy4shy0f4vnzpa",
+            524808,
+        );
+        match approve_provisions_for_public(&[local_only], &list) {
+            Err(PublicationRejected::NotAllowlisted(_)) => {}
+            other => panic!("expected NotAllowlisted, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn all_or_nothing_one_unapproved_refuses_the_whole_batch() {
+        // Fail-closed batch semantics: an approved provision alongside an un-allowlisted one
+        // refuses BOTH, so no partial public announce can leak the un-approved NAR.
+        let list = allowlist_with_app();
+        let provisions = vec![
+            provision(
+                "sha256:0pgsb9mjmfj57w1ddmqn9z9667nwbqbnn699j1s1s99jhy6cppsm",
+                408,
+            ),
+            provision(
+                "sha256:1nn8563y6j55y003xjk1bvb1854abmigsas2jgzy4shy0f4vnzpa",
+                524808,
+            ),
+        ];
+        assert!(approve_provisions_for_public(&provisions, &list).is_err());
+    }
+
+    #[test]
+    fn a_size_that_disagrees_with_the_proof_is_refused() {
+        // A NarHash allowlisted at 408 announced at a different size is refused: a NAR may be
+        // announced only at exactly the size a trusted signature covered (defensive guard).
+        let list = allowlist_with_app();
+        let wrong_size = provision(
+            "sha256:0pgsb9mjmfj57w1ddmqn9z9667nwbqbnn699j1s1s99jhy6cppsm",
+            999,
+        );
+        match approve_provisions_for_public(&[wrong_size], &list) {
+            Err(PublicationRejected::SizeMismatch { .. }) => {}
+            other => panic!("expected SizeMismatch, got {other:?}"),
+        }
     }
 }
