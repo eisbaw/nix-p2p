@@ -83,10 +83,13 @@ lint: _toolchain _python independence
     "${NIX_P2P_PYTHON}/bin/python3" scripts/check-discovery-no-shortcut.py --self-test
     "${NIX_P2P_PYTHON}/bin/python3" scripts/check-discovery-no-shortcut.py
 
-# Assert daemon and testproxy stay strictly separated (PRD round 5/6).
+# Source-policy guards: daemon/testproxy stay strictly separated (PRD round 5/6),
+# link-shaping stays out of the shipped binary, and no float creeps into a gate/
+# decision or serialized-integrity field (owner no-floats rule).
 independence: _toolchain
     python3 scripts/check-independence.py
     python3 scripts/check_shaping_out_of_daemon.py
+    python3 scripts/check-no-floats.py
 
 # Depends on the fast fixture tier because the signing and tamper assertions
 # live in scripts/, not in cargo (rationale: scripts/check-fixtures.py).

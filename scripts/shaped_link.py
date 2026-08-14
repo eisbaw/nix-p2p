@@ -52,6 +52,7 @@ import os
 import re
 import subprocess
 import sys
+from fractions import Fraction
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 INNER = os.path.join(HERE, "shaped_link_inner.sh")
@@ -85,19 +86,44 @@ class ShapingViolation(Exception):
     """The shaper could not be proven to have fired; the run is not a measurement."""
 
 
+def _decimal_ms_to_ns(ms_text: str) -> int:
+    """Convert a decimal-millisecond STRING (e.g. `ping`'s `40.2`) to EXACT integer
+    nanoseconds. Parsing the string (not the already-lossy float) keeps this exact:
+    a finite decimal * 1e6 is an integer, so no rounding enters the oracle's clock.
+    Owner rule: latency is a whole integer of nanoseconds, never a float."""
+    return int(Fraction(ms_text) * 1_000_000)
+
+
+def _decimal_mbit_to_bytes_per_s(mbit_text: str) -> Fraction:
+    """Convert a decimal-megabit/s STRING (the value the sender already reported) to
+    EXACT bytes/sec as a rational. `mbit * 1e6 / 8` is carried as a `Fraction` of the
+    SAME reported number, not a re-derivation from bytes/elapsed (which would be a
+    different, more-precise number and would perturb the serialized evidence)."""
+    return Fraction(mbit_text) * 1_000_000 / 8
+
+
 def parse_inner_output(text: str) -> dict:
     """Pull the RTT, throughput AND the receiver's delivered-byte count an arm
     reported. Missing any one is fatal: a silent absence must not read as a passing
     zero. The receiver count is the provider-side counter that makes the arm
     non-vacuous -- a truncated transfer (RECV_DONE status=short, or bytes < expect)
-    is not a measurement."""
-    rtt = None
+    is not a measurement.
+
+    Returns BOTH the exact integer/rational forms the oracle decides on (`rtt_ns`,
+    `rate_bytes_per_s`) AND the float `rtt_ms`/`mbit` display fields the report and
+    downstream (peer_wire_baseline) still read. The exact forms are the gate; the
+    floats are terminal display, derived from the SAME reported decimal string."""
+    rtt_ns = None
+    rtt_ms = None
     m = re.search(r"rtt min/avg/max/mdev = [\d.]+/([\d.]+)/", text)
     if m:
-        rtt = float(m.group(1))
+        rtt_ns = _decimal_ms_to_ns(m.group(1))
+        rtt_ms = float(m.group(1))
+    rate_bytes_per_s = None
     mbit = None
     m = re.search(r"SEND_DONE bytes=\d+ elapsed_s=[\d.]+ mbit_per_s=([\d.]+)", text)
     if m:
+        rate_bytes_per_s = _decimal_mbit_to_bytes_per_s(m.group(1))
         mbit = float(m.group(1))
     recv_bytes = None
     recv_status = None
@@ -105,11 +131,11 @@ def parse_inner_output(text: str) -> dict:
     if m:
         recv_bytes = int(m.group(1))
         recv_status = m.group(2)
-    if rtt is None:
+    if rtt_ns is None:
         raise ShapingViolation(
             "arm reported no RTT line (ping did not complete) -- not a measurement"
         )
-    if mbit is None:
+    if rate_bytes_per_s is None:
         raise ShapingViolation(
             "arm reported no SEND_DONE line (transfer did not complete) -- not a measurement"
         )
@@ -123,7 +149,14 @@ def parse_inner_output(text: str) -> dict:
             "receiver reported RECV_DONE status=short -- transfer was truncated, "
             "not a measurement"
         )
-    return {"rtt_ms": rtt, "mbit": mbit, "recv_bytes": recv_bytes}
+    return {
+        "rtt_ns": rtt_ns,
+        "rate_bytes_per_s": rate_bytes_per_s,
+        "recv_bytes": recv_bytes,
+        # Terminal display, derived from the same reported decimal string.
+        "rtt_ms": rtt_ms,
+        "mbit": mbit,
+    }
 
 
 def assert_full_delivery(recv_bytes: int, expected: int) -> None:
@@ -144,59 +177,79 @@ def assert_shaping(shaped: dict, unshaped: dict, delay_ms: int, rate_mbit: int) 
     Tolerances are deliberately generous on the "did it work" side and strict on
     the "can I tell it apart from the control" side -- the failure this exists to
     catch is a shaper that silently did nothing, which shows up as the shaped and
-    unshaped arms being indistinguishable."""
-    want_rtt = 2 * delay_ms
+    unshaped arms being indistinguishable.
+
+    The oracle DECIDES on the exact integer/rational forms only (owner no-floats
+    rule): RTT in whole nanoseconds, throughput in exact bytes/sec, and every
+    tolerance as an exact rational compared by cross-multiplication (e.g.
+    `x < 0.7*want` becomes `10*x < 7*want`). Floats appear ONLY in the human
+    message text. Every threshold is numerically identical to the previous float
+    form, so no verdict changes -- this is representation, not re-measurement."""
+    # want_rtt and the rate cap are exact integers (ns and bytes/sec).
+    want_rtt_ns = 2 * delay_ms * 1_000_000
+    rate_cap_bytes_per_s = rate_mbit * 1_000_000 // 8  # mbit -> bytes/sec, exact
+    s_rtt_ns = shaped["rtt_ns"]
+    u_rtt_ns = unshaped["rtt_ns"]
+    s_bps = shaped["rate_bytes_per_s"]
+    u_bps = unshaped["rate_bytes_per_s"]
+    # Display-only projections for the message text (terminal floats).
+    s_rtt_disp = s_rtt_ns / 1_000_000
+    u_rtt_disp = u_rtt_ns / 1_000_000
+    s_mbit_disp = float(s_bps) * 8 / 1_000_000
+    u_mbit_disp = float(u_bps) * 8 / 1_000_000
     problems = []
 
     # (A) The injected RTT is recovered on the shaped arm (~= 2*delay).
-    if shaped["rtt_ms"] < 0.7 * want_rtt:
+    #     s_rtt < 0.7*want  <=>  10*s_rtt < 7*want   (cross-multiplied)
+    if 10 * s_rtt_ns < 7 * want_rtt_ns:
         problems.append(
-            f"shaped RTT {shaped['rtt_ms']:.1f}ms is below 70% of the injected "
-            f"{want_rtt}ms -- delay not applied"
+            f"shaped RTT {s_rtt_disp:.1f}ms is below 70% of the injected "
+            f"{2 * delay_ms}ms -- delay not applied"
         )
-    if shaped["rtt_ms"] > want_rtt + 60:
+    if s_rtt_ns > want_rtt_ns + 60 * 1_000_000:
         problems.append(
-            f"shaped RTT {shaped['rtt_ms']:.1f}ms is far above the injected "
-            f"{want_rtt}ms (+60ms) -- link is mis-shaped or contended"
+            f"shaped RTT {s_rtt_disp:.1f}ms is far above the injected "
+            f"{2 * delay_ms}ms (+60ms) -- link is mis-shaped or contended"
         )
 
-    # (B) The unshaped control really is unshaped (near-zero RTT).
-    if unshaped["rtt_ms"] > 5.0:
+    # (B) The unshaped control really is unshaped (near-zero RTT, <= 5ms).
+    if u_rtt_ns > 5 * 1_000_000:
         problems.append(
-            f"unshaped control RTT {unshaped['rtt_ms']:.1f}ms is not near zero -- "
+            f"unshaped control RTT {u_rtt_disp:.1f}ms is not near zero -- "
             f"the 'control' is itself shaped, so the comparison is void"
         )
 
     # (C) The shaped throughput sits near the cap: the cap bit, and did NOT
     # collapse the link to zero (a broken link is not a shaped link).
-    if shaped["mbit"] > 1.3 * rate_mbit:
+    #     s_bps > 1.3*cap  and  s_bps < 0.4*cap  (exact rational thresholds)
+    if s_bps > Fraction(13, 10) * rate_cap_bytes_per_s:
         problems.append(
-            f"shaped throughput {shaped['mbit']:.1f}mbit exceeds 130% of the "
+            f"shaped throughput {s_mbit_disp:.1f}mbit exceeds 130% of the "
             f"{rate_mbit}mbit cap -- rate cap not applied"
         )
-    if shaped["mbit"] < 0.4 * rate_mbit:
+    if s_bps < Fraction(2, 5) * rate_cap_bytes_per_s:
         problems.append(
-            f"shaped throughput {shaped['mbit']:.1f}mbit is below 40% of the "
+            f"shaped throughput {s_mbit_disp:.1f}mbit is below 40% of the "
             f"{rate_mbit}mbit cap -- link broken, not shaped"
         )
 
     # (D) The negative control is MEASURABLY faster -- the crux. If the shaper
     # cannot be distinguished from no-shaper, it did not fire (task-63 discipline).
-    if unshaped["mbit"] < 1.5 * rate_mbit:
+    if u_bps < Fraction(3, 2) * rate_cap_bytes_per_s:
         problems.append(
-            f"unshaped control {unshaped['mbit']:.1f}mbit is not comfortably above "
+            f"unshaped control {u_mbit_disp:.1f}mbit is not comfortably above "
             f"the {rate_mbit}mbit cap -- the link itself is the bottleneck, so the "
             f"cap cannot be shown to bite"
         )
-    if unshaped["mbit"] < 2.0 * shaped["mbit"]:
+    if u_bps < 2 * s_bps:
         problems.append(
-            f"unshaped {unshaped['mbit']:.1f}mbit is not >=2x shaped "
-            f"{shaped['mbit']:.1f}mbit -- shaper indistinguishable from control"
+            f"unshaped {u_mbit_disp:.1f}mbit is not >=2x shaped "
+            f"{s_mbit_disp:.1f}mbit -- shaper indistinguishable from control"
         )
-    if shaped["rtt_ms"] < unshaped["rtt_ms"] + delay_ms:
+    if s_rtt_ns < u_rtt_ns + delay_ms * 1_000_000:
         problems.append(
-            f"shaped RTT {shaped['rtt_ms']:.1f}ms is not at least {delay_ms}ms above "
-            f"control {unshaped['rtt_ms']:.1f}ms -- delay indistinguishable from control"
+            f"shaped RTT {s_rtt_disp:.1f}ms is not at least {delay_ms}ms above "
+            f"control {u_rtt_disp:.1f}ms -- delay indistinguishable from control"
         )
 
     if problems:
@@ -271,12 +324,23 @@ def measure(total: int, delay_ms: int, rate_mbit: int) -> int:
 # --- self-test: prove the oracle bites by mutation (no netns needed) -----------
 
 
+def _arm(rtt_ms: float, mbit: float) -> dict:
+    """A synthetic arm's metrics in the SAME shape parse_inner_output returns:
+    the exact `rtt_ns`/`rate_bytes_per_s` the oracle decides on, plus the float
+    display fields. Built from the decimal STRING so the exact fields are exact,
+    mirroring the real parse path."""
+    return {
+        "rtt_ns": _decimal_ms_to_ns(str(rtt_ms)),
+        "rate_bytes_per_s": _decimal_mbit_to_bytes_per_s(str(mbit)),
+        "rtt_ms": rtt_ms,
+        "mbit": mbit,
+    }
+
+
 def _good() -> tuple[dict, dict, int, int]:
     # A realistic passing observation: 40ms shaped RTT near-zero control RTT,
     # ~95mbit shaped throughput, ~2 Gbit unshaped loopback.
-    shaped = {"rtt_ms": 40.2, "mbit": 95.0}
-    unshaped = {"rtt_ms": 0.05, "mbit": 2000.0}
-    return shaped, unshaped, 20, 100
+    return _arm(40.2, 95.0), _arm(0.05, 2000.0), 20, 100
 
 
 def self_test() -> int:
@@ -290,18 +354,19 @@ def self_test() -> int:
     except ShapingViolation as exc:
         failures.append(f"baseline should PASS but was rejected: {exc}")
 
-    # Each mutation breaks exactly one invariant and MUST be caught.
+    # Each mutation breaks exactly one invariant and MUST be caught. Each rebuilds
+    # the offending arm through _arm so the exact fields (not just display) move.
     mutations = {
-        "delay-not-applied": lambda s, u: (s.update(rtt_ms=1.0), u),
-        "cap-not-applied": lambda s, u: (s.update(mbit=1900.0), u),  # shaped ~ unshaped
-        "link-collapsed": lambda s, u: (s.update(mbit=1.0), u),
-        "control-also-shaped": lambda s, u: (u.update(rtt_ms=39.0), None),
-        "control-not-faster": lambda s, u: (u.update(mbit=110.0), None),
-        "shaper-eq-control": (lambda s, u: (s.update(rtt_ms=0.05, mbit=2000.0), None)),
+        "delay-not-applied": lambda s, u: (_arm(1.0, s["mbit"]), u),
+        "cap-not-applied": lambda s, u: (_arm(s["rtt_ms"], 1900.0), u),  # ~ unshaped
+        "link-collapsed": lambda s, u: (_arm(s["rtt_ms"], 1.0), u),
+        "control-also-shaped": lambda s, u: (s, _arm(39.0, u["mbit"])),
+        "control-not-faster": lambda s, u: (s, _arm(u["rtt_ms"], 110.0)),
+        "shaper-eq-control": lambda s, u: (_arm(0.05, 2000.0), u),
     }
     for name, mutate in mutations.items():
         shaped, unshaped, d, r = _good()
-        mutate(shaped, unshaped)
+        shaped, unshaped = mutate(shaped, unshaped)
         try:
             assert_shaping(shaped, unshaped, d, r)
             failures.append(f"mutation '{name}' should have been REJECTED but passed")
