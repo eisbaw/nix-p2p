@@ -186,6 +186,27 @@ Sig: k:AAAA==\n";
     }
 
     #[test]
+    fn duplicate_field_skips_recording() {
+        // Correlation probe (TASK-102 fix cycle #2): a DUPLICATED single-line field is ambiguous,
+        // so `parse_correlation` refuses it (returns None) - the SAME first-occurrence +
+        // duplicate-reject rule `public_allowlist::field` enforces, so correlation and the
+        // publication proof can never disagree about which value a field carries. Neuter the
+        // `is_some() -> None` guard and a first-vs-last split re-opens.
+        let dup_url = b"URL: nar/1abc.nar.xz\nURL: nar/evil.nar.xz\n\
+NarHash: sha256:1b2c3d\nNarSize: 4096\n";
+        assert!(
+            parse_correlation(dup_url).is_none(),
+            "a duplicate URL is ambiguous and must not correlate"
+        );
+        let dup_size = b"URL: nar/1abc.nar.xz\nNarHash: sha256:1b2c3d\n\
+NarSize: 4096\nNarSize: 1\n";
+        assert!(
+            parse_correlation(dup_size).is_none(),
+            "a duplicate NarSize is ambiguous and must not correlate"
+        );
+    }
+
+    #[test]
     fn records_and_looks_up_by_token() {
         let catalog = NarCatalog::new();
         let (token, hash, size) = parse_correlation(NARINFO).unwrap();

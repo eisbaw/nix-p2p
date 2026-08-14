@@ -1685,6 +1685,98 @@ Sig: nix-p2p-test-1:kvRtCi6KujoW6x7esqgP8QdiaaVX4OL1beI/xmfobVHzM/tSSqmy7jcnI7QD
     }
 
     #[test]
+    fn a_replayed_valid_line_dedups_and_fabricates_no_new_eligibility() {
+        // MAC probe - REPLAY (fix cycle #2). Duplicating a VALID committed line is NOT a
+        // fabrication vector: a valid line for NAR X can only exist if X was already learned
+        // (the MAC key is a per-node secret), so replaying it re-adds X (already eligible) and
+        // nothing else. It therefore loads CLEANLY (identical bytes carry an identical, valid MAC)
+        // and dedups to ONE entry - it can never make a NEVER-LEARNED NAR eligible.
+        // HONEST: an exact replay does NOT fail loud (it is cryptographically indistinguishable
+        // from a legitimately re-written identical record); the invariant it cannot break is the
+        // one that matters - eligibility for un-learned content.
+        let dir = temp_dir("replay");
+        let path = dir.join("public-allowlist");
+        let good = mac_line(APP_NAR_HASH, 408);
+        std::fs::write(&path, format!("{good}{good}")).unwrap(); // the SAME valid line, twice
+        set_0600(&path);
+        let list = PublicNarAllowlist::open_file(trusted(), &path, TEST_MAC_KEY)
+            .expect("a replayed valid line is cryptographically valid and loads");
+        assert_eq!(
+            list.status().count,
+            1,
+            "a replayed line dedups to one entry"
+        );
+        assert!(list.contains(&app_nar_hash()));
+        // The replay fabricated NO new eligibility: the lib NAR (never learned) stays out.
+        let lib_nar: NarHashKey = "sha256:06rgb4vfjsg365xwwdjz12qhjnvg3w0agfvyqfp977hp3yk2bczb"
+            .parse()
+            .unwrap();
+        assert!(
+            !list.contains(&lib_nar),
+            "replay must not fabricate eligibility"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_positionally_swapped_record_is_rejected_on_load() {
+        // MAC probe - SWAP (positions). Exchanging the NarHash and NarSize columns yields
+        // `<NarSize> <NarHash> <mac>`; the first column no longer parses as a canonical NarHash,
+        // so load fails LOUD before the MAC is even consulted (the fields are strictly typed).
+        let dir = temp_dir("swap-pos");
+        let path = dir.join("public-allowlist");
+        let key: NarHashKey = APP_NAR_HASH.parse().unwrap();
+        let mac = record_mac(&TEST_MAC_KEY, &key, 408);
+        std::fs::write(&path, format!("408 {APP_NAR_HASH} {mac}\n")).unwrap();
+        set_0600(&path);
+        assert!(
+            PublicNarAllowlist::open_file(trusted(), &path, TEST_MAC_KEY).is_err(),
+            "a record with NarHash/NarSize columns swapped must be refused on load"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_mac_reused_under_a_different_size_is_rejected_on_load() {
+        // MAC probe - the SWAP concern's essence: the MAC must bind BOTH fields jointly, so a
+        // valid MAC computed over (NarHash, 408) cannot be pasted onto a line that CLAIMS a
+        // different NarSize. Here the columns still parse (a real NarHash, a real u64), so this
+        // bites the MAC binding specifically (not the type parser): the recomputed MAC over
+        // (NarHash, 409) differs from the stored MAC over (NarHash, 408) -> load fails LOUD.
+        let dir = temp_dir("swap-size");
+        let path = dir.join("public-allowlist");
+        let key: NarHashKey = APP_NAR_HASH.parse().unwrap();
+        let mac_for_408 = record_mac(&TEST_MAC_KEY, &key, 408);
+        std::fs::write(&path, format!("{APP_NAR_HASH} 409 {mac_for_408}\n")).unwrap();
+        set_0600(&path);
+        assert!(
+            PublicNarAllowlist::open_file(trusted(), &path, TEST_MAC_KEY).is_err(),
+            "a MAC bound to NarSize 408 must not validate a line claiming NarSize 409"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_narinfo_missing_url_does_not_learn() {
+        // Correlation/structural probe: a signed narinfo with no `URL:` is structurally invalid
+        // (Nix requires it), so `learn` refuses it and appends NOTHING - the correlation/append
+        // path never admits a NAR from a malformed response.
+        let list = open_mem(trusted());
+        let no_url = String::from_utf8(APP_NARINFO.to_vec())
+            .unwrap()
+            .lines()
+            .filter(|l| !l.starts_with("URL:"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let no_url = format!("{no_url}\n");
+        assert!(matches!(
+            list.learn(&app_hash(), no_url.as_bytes()),
+            LearnOutcome::Rejected(PublicProofReject::MissingField("URL"))
+        ));
+        assert_eq!(list.status().count, 0);
+    }
+
+    #[test]
     fn torn_final_append_is_truncated_and_next_append_is_clean() {
         // One committed record + a torn tail (a partial line, no trailing newline). A NEW
         // append must TRUNCATE the torn tail (not concatenate onto it), so the file ends with
