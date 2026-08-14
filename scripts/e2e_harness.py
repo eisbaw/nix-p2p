@@ -585,7 +585,9 @@ class Pod:
         # (mounted under /srv/seed/narinfos/) needed to prove each path public - never a .nar.
         self.libp2p_store_supply = bool(libp2p_store_supply)
         if self.libp2p_store_supply and not libp2p_trusted_key:
-            die("Pod: libp2p_store_supply requires libp2p_trusted_key (public-narinfo proof)")
+            die(
+                "Pod: libp2p_store_supply requires libp2p_trusted_key (public-narinfo proof)"
+            )
         # Parsed once the provider announces; the positive oracle reads it to assert C
         # was NEVER configured with it (no-injection).
         self.libp2p_provider_identity: tuple[str, str] | None = None

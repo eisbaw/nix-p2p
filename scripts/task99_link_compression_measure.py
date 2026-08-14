@@ -77,7 +77,9 @@ class Reject(Exception):
 def require_int(value, where: str) -> int:
     """A field that MUST be a non-negative integer; reject a float/NaN/negative/other."""
     if isinstance(value, bool) or not isinstance(value, int):
-        raise Reject(f"{where}: expected an integer, got {value!r} ({type(value).__name__})")
+        raise Reject(
+            f"{where}: expected an integer, got {value!r} ({type(value).__name__})"
+        )
     if value < 0:
         raise Reject(f"{where}: expected a non-negative integer, got {value}")
     return value
@@ -122,9 +124,7 @@ def validate_raw(raw: dict) -> None:
     """
     default_level = raw.get("default_level")
     if isinstance(default_level, bool) or not isinstance(default_level, int):
-        raise Reject(
-            f"raw.default_level: expected an integer, got {default_level!r}"
-        )
+        raise Reject(f"raw.default_level: expected an integer, got {default_level!r}")
     if default_level != SHIPPED_LEVEL:
         raise Reject(
             f"raw.default_level {default_level} != the finalizer's shipped level {SHIPPED_LEVEL}: "
@@ -148,7 +148,9 @@ def validate_raw(raw: dict) -> None:
         if any(isinstance(v, bool) or not isinstance(v, int) for v in level_values):
             raise Reject(f"{path}: non-integer level in {level_values!r}")
         if len(level_values) != len(set(level_values)):
-            raise Reject(f"{path}: duplicate level in {level_values!r} (a collapsed sweep)")
+            raise Reject(
+                f"{path}: duplicate level in {level_values!r} (a collapsed sweep)"
+            )
         if set(level_values) != set(EXPECTED_LEVELS):
             raise Reject(
                 f"{path}: swept levels {sorted(level_values)} != the required "
@@ -161,8 +163,12 @@ def baseline_ratio(baseline_path: Path) -> tuple[int, int]:
     committed TASK-94 sample - the sums, not the derived float."""
     data = json.loads(baseline_path.read_text())
     agg = data["cdn_wire_vs_peer_raw_sample"]["aggregate"]
-    num = require_pos_int(agg["sum_file_size_bytes_compressed_wire"], "baseline.sum_file_size")
-    den = require_pos_int(agg["sum_nar_size_bytes_uncompressed_nar"], "baseline.sum_nar_size")
+    num = require_pos_int(
+        agg["sum_file_size_bytes_compressed_wire"], "baseline.sum_file_size"
+    )
+    den = require_pos_int(
+        agg["sum_nar_size_bytes_uncompressed_nar"], "baseline.sum_nar_size"
+    )
     return num, den
 
 
@@ -207,7 +213,9 @@ def derive(
             cb = require_pos_int(lv["compressed_bytes"], f"{path}.compressed_bytes")
             rb = require_pos_int(lv["raw_bytes"], f"{path}.raw_bytes(level)")
             if rb != raw_bytes:
-                raise Reject(f"{path}: level raw_bytes {rb} != file raw_bytes {raw_bytes}")
+                raise Reject(
+                    f"{path}: level raw_bytes {rb} != file raw_bytes {raw_bytes}"
+                )
             comp_ns = require_pos_int(lv["compress_ns"], f"{path}.compress_ns")
             deco_ns = require_pos_int(lv["decompress_ns"], f"{path}.decompress_ns")
 
@@ -220,7 +228,13 @@ def derive(
 
             sums = level_sums.setdefault(
                 level,
-                {"compressed": 0, "raw": 0, "compress_ns": 0, "decompress_ns": 0, "n": 0},
+                {
+                    "compressed": 0,
+                    "raw": 0,
+                    "compress_ns": 0,
+                    "decompress_ns": 0,
+                    "n": 0,
+                },
             )
             sums["compressed"] += cb
             sums["raw"] += rb
@@ -271,7 +285,9 @@ def derive(
             zstd_wins = zstd_total_ns < raw_link_ns
             # Net throughput of the raw payload over the whole op, integer bytes/sec.
             raw_net_bps = (s["raw"] * NS_PER_SEC) // raw_link_ns if raw_link_ns else 0
-            zstd_net_bps = (s["raw"] * NS_PER_SEC) // zstd_total_ns if zstd_total_ns else 0
+            zstd_net_bps = (
+                (s["raw"] * NS_PER_SEC) // zstd_total_ns if zstd_total_ns else 0
+            )
             return {
                 "bandwidth_bytes_per_sec": bw,
                 "raw_delivery_ns": raw_link_ns,
@@ -378,7 +394,9 @@ def derive(
                 "sum_nar_bytes": sums["nar"],
                 "sum_xz_bytes": sums["xz"],
                 "xz_aggregate_ratio_pair": [sums["xz"], sums["nar"]],
-                "xz_aggregate_ratio_display": frac_str(Fraction(sums["xz"], sums["nar"])),
+                "xz_aggregate_ratio_display": frac_str(
+                    Fraction(sums["xz"], sums["nar"])
+                ),
                 "zstd_aggregate_by_level": agg_levels,
                 "per_path": rows,
             }
@@ -418,7 +436,9 @@ def derive(
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--raw", type=Path, help="harness JSON")
-    ap.add_argument("--out", type=Path, default=None, help="write the derived evidence JSON")
+    ap.add_argument(
+        "--out", type=Path, default=None, help="write the derived evidence JSON"
+    )
     ap.add_argument("--baseline", type=Path, default=DEFAULT_BASELINE)
     ap.add_argument(
         "--cdn-narinfo",
@@ -566,7 +586,10 @@ def _sample_cdn() -> str:
 
 
 def self_test() -> int:
-    base_num, base_den = 383_084_972, 1_176_685_088  # a positive pair; not the guard under test
+    base_num, base_den = (
+        383_084_972,
+        1_176_685_088,
+    )  # a positive pair; not the guard under test
     cdn = _sample_cdn()
     failures: list[str] = []
 
@@ -603,7 +626,9 @@ def self_test() -> int:
                 f"n_paths (got {n}, expected 4) - the mutation is not meaningful"
             )
     except Reject as exc:
-        failures.append(f"(a) replay non-vacuity: unexpected reject with guard disabled: {exc}")
+        failures.append(
+            f"(a) replay non-vacuity: unexpected reject with guard disabled: {exc}"
+        )
     finally:
         globals()["require_unique_joined"] = orig_uniq
 
