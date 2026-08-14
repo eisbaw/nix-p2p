@@ -4,9 +4,10 @@ title: 'REAL NETWORK: Iroh and BitTorrent raw/compressed across NAT and real upl
 status: To Do
 assignee: []
 created_date: '2026-08-09 21:02'
-updated_date: '2026-08-10 22:57'
+updated_date: '2026-08-14 21:48'
 labels:
   - wave-2b
+  - deferred-pending-202
 dependencies:
   - TASK-45
   - TASK-70
@@ -15,7 +16,7 @@ dependencies:
   - TASK-119
   - TASK-121
   - TASK-125
-priority: high
+priority: low
 ---
 
 ## Description
@@ -34,3 +35,9 @@ Run the comparative backends outside the single-host testbed after Stage A and b
 - [ ] #6 The report places real-network results beside loopback/shaped results, states ranking changes and limitations, and carries manifest/config/code/topology hashes into TASK-122.
 - [ ] #7 Real-network scenarios are development/training-only and cannot generate/read holdout IDs, seeds or topologies; an access bite fails before any network trial starts.
 <!-- AC:END -->
+
+## Implementation Notes
+
+<!-- SECTION:NOTES:BEGIN -->
+Deprioritized to Low in the Wave-2c cleanup (2026-08-14): libp2p-PRIMARY trunk proven (libp2p-kad discovery + store-supply + streamed NAR). Per PRD §634-691 (normative owner-direction authority) content discovery is libp2p-kad; iroh is an OPTIONAL transport only. This task belongs to a superseded-discovery / premature-tournament / far-future-BitTorrent / optional-comparator track. Fate confirmed by TASK-202 (owner-gated §693-743 reconcile). Reversible — not deleted; revisit after 202.
+<!-- SECTION:NOTES:END -->

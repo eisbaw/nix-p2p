@@ -6,13 +6,14 @@ title: >-
 status: To Do
 assignee: []
 created_date: '2026-08-10 22:24'
-updated_date: '2026-08-11 02:36'
+updated_date: '2026-08-14 21:48'
 labels:
   - tournament
   - measurement
   - training
   - e2e
   - wave-2c
+  - deferred-pending-202
 dependencies:
   - TASK-52
   - TASK-62
@@ -32,7 +33,7 @@ dependencies:
   - TASK-125
   - TASK-127
   - TASK-128
-priority: high
+priority: low
 ---
 
 ## Description
@@ -58,4 +59,6 @@ Execute only the TRAINING partition defined by TASK-114 using the transport-neut
 
 <!-- SECTION:NOTES:BEGIN -->
 Policy-grade training evidence only. Losing to upstream, LAN-only usefulness and unsupported compression are valid outcomes.
+
+Deprioritized to Low in the Wave-2c cleanup (2026-08-14): libp2p-PRIMARY trunk proven (libp2p-kad discovery + store-supply + streamed NAR). Per PRD §634-691 (normative owner-direction authority) content discovery is libp2p-kad; iroh is an OPTIONAL transport only. This task belongs to a superseded-discovery / premature-tournament / far-future-BitTorrent / optional-comparator track. Fate confirmed by TASK-202 (owner-gated §693-743 reconcile). Reversible — not deleted; revisit after 202.
 <!-- SECTION:NOTES:END -->

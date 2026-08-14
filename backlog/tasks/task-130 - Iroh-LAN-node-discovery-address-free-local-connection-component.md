@@ -4,17 +4,18 @@ title: 'Iroh LAN node discovery: address-free local connection component'
 status: To Do
 assignee: []
 created_date: '2026-08-11 03:30'
-updated_date: '2026-08-11 05:53'
+updated_date: '2026-08-14 21:48'
 labels:
   - iroh
   - discovery
   - lan
   - wave-2c
+  - deferred-pending-202
 dependencies:
   - TASK-114
   - TASK-115
   - TASK-136
-priority: high
+priority: low
 ---
 
 ## Description
@@ -37,4 +38,6 @@ After TASK-132 proves, TASK-133 independently reviews, and TASK-136 admits a pas
 
 <!-- SECTION:NOTES:BEGIN -->
 Global-first graph revision 2026-08-11: LAN discovery is intentionally sequenced after the TASK-132 global journey, TASK-133 independent review/verdict, and TASK-136 pass-only admission/re-plan gate. It remains a required independent deployment mechanism, but no longer bootstraps or blocks the first global peer/content discovery slice. A whole-global no_go leaves TASK-136 incomplete and this task blocked.
+
+Deprioritized to Low in the Wave-2c cleanup (2026-08-14): libp2p-PRIMARY trunk proven (libp2p-kad discovery + store-supply + streamed NAR). Per PRD §634-691 (normative owner-direction authority) content discovery is libp2p-kad; iroh is an OPTIONAL transport only. This task belongs to a superseded-discovery / premature-tournament / far-future-BitTorrent / optional-comparator track. Fate confirmed by TASK-202 (owner-gated §693-743 reconcile). Reversible — not deleted; revisit after 202.
 <!-- SECTION:NOTES:END -->

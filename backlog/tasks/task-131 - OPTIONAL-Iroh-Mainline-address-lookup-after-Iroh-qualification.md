@@ -4,7 +4,7 @@ title: OPTIONAL Iroh Mainline address lookup after Iroh qualification
 status: To Do
 assignee: []
 created_date: '2026-08-11 03:31'
-updated_date: '2026-08-11 20:08'
+updated_date: '2026-08-14 21:48'
 labels:
   - iroh
   - discovery
@@ -12,11 +12,12 @@ labels:
   - privacy
   - wave-2c
   - optional
+  - deferred-pending-202
 dependencies:
   - TASK-89
   - TASK-96
   - TASK-120
-priority: medium
+priority: low
 ---
 
 ## Description
@@ -39,4 +40,6 @@ Consume TASK-96 public-Mainline evidence and TASK-120 authoritative operator con
 
 <!-- SECTION:NOTES:BEGIN -->
 Deferred until the mandatory Iroh discovery path and operator contract pass. TASK-96 is unconditional only for this optional Mainline capability; it is conditional and dynamically added if TASK-126 itself selects Mainline.
+
+Deprioritized to Low in the Wave-2c cleanup (2026-08-14): libp2p-PRIMARY trunk proven (libp2p-kad discovery + store-supply + streamed NAR). Per PRD §634-691 (normative owner-direction authority) content discovery is libp2p-kad; iroh is an OPTIONAL transport only. This task belongs to a superseded-discovery / premature-tournament / far-future-BitTorrent / optional-comparator track. Fate confirmed by TASK-202 (owner-gated §693-743 reconcile). Reversible — not deleted; revisit after 202.
 <!-- SECTION:NOTES:END -->

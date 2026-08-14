@@ -6,13 +6,14 @@ title: >-
 status: To Do
 assignee: []
 created_date: '2026-08-08 20:28'
-updated_date: '2026-08-10 22:26'
+updated_date: '2026-08-14 21:48'
 labels:
   - irreversible
+  - deferred-pending-202
 dependencies:
   - TASK-9
   - TASK-62
-priority: high
+priority: low
 ---
 
 ## Description
@@ -69,4 +70,6 @@ SLOWER than the loopback cache (0.690 s vs 0.184 s realise) while saving 100% of
 payload egress, and BOTH ends of a whole-NAR peer transfer resident-size the
 payload (holder 248 MiB, fetcher 141 MiB, for a 110 MiB NAR - the blob store is
 `MemStore`). A hedge therefore costs loser BYTES *and* concurrent MEMORY.
+
+Deprioritized to Low in the Wave-2c cleanup (2026-08-14): libp2p-PRIMARY trunk proven (libp2p-kad discovery + store-supply + streamed NAR). Per PRD §634-691 (normative owner-direction authority) content discovery is libp2p-kad; iroh is an OPTIONAL transport only. This task belongs to a superseded-discovery / premature-tournament / far-future-BitTorrent / optional-comparator track. Fate confirmed by TASK-202 (owner-gated §693-743 reconcile). Reversible — not deleted; revisit after 202.
 <!-- SECTION:NOTES:END -->

@@ -6,19 +6,20 @@ title: >-
 status: To Do
 assignee: []
 created_date: '2026-08-10 22:24'
-updated_date: '2026-08-11 02:38'
+updated_date: '2026-08-14 21:48'
 labels:
   - tournament
   - holdout
   - policy
   - review
   - wave-2c
+  - deferred-pending-202
 dependencies:
   - TASK-44
   - TASK-122
   - TASK-128
   - TASK-129
-priority: high
+priority: low
 ---
 
 ## Description
@@ -44,4 +45,6 @@ After TASK-44 freezes at most one primary candidate per selectable profile, TASK
 
 <!-- SECTION:NOTES:BEGIN -->
 This is the sole gate from tournament evidence to production-policy planning.
+
+Deprioritized to Low in the Wave-2c cleanup (2026-08-14): libp2p-PRIMARY trunk proven (libp2p-kad discovery + store-supply + streamed NAR). Per PRD §634-691 (normative owner-direction authority) content discovery is libp2p-kad; iroh is an OPTIONAL transport only. This task belongs to a superseded-discovery / premature-tournament / far-future-BitTorrent / optional-comparator track. Fate confirmed by TASK-202 (owner-gated §693-743 reconcile). Reversible — not deleted; revisit after 202.
 <!-- SECTION:NOTES:END -->

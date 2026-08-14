@@ -4,7 +4,7 @@ title: OPTIONAL tracker comparator behind ContentDiscovery
 status: To Do
 assignee: []
 created_date: '2026-08-10 09:27'
-updated_date: '2026-08-11 20:02'
+updated_date: '2026-08-14 21:49'
 labels:
   - iroh
   - discovery
@@ -12,6 +12,7 @@ labels:
   - optional
   - comparison
   - tournament
+  - deferred-pending-202
 dependencies:
   - TASK-83
   - TASK-89
@@ -21,7 +22,7 @@ dependencies:
   - TASK-115
   - TASK-134
   - TASK-135
-priority: medium
+priority: low
 ---
 
 ## Description
@@ -44,4 +45,6 @@ Optionally integrate the tracker service behind ContentDiscovery as a centralize
 
 <!-- SECTION:NOTES:BEGIN -->
 Demoted by owner requirement on 2026-08-11: a central tracker is optional comparison infrastructure only. Do not schedule before the mandatory TASK-126 to TASK-103 path.
+
+Deprioritized to Low in the Wave-2c cleanup (2026-08-14): libp2p-PRIMARY trunk proven (libp2p-kad discovery + store-supply + streamed NAR). Per PRD §634-691 (normative owner-direction authority) content discovery is libp2p-kad; iroh is an OPTIONAL transport only. This task belongs to a superseded-discovery / premature-tournament / far-future-BitTorrent / optional-comparator track. Fate confirmed by TASK-202 (owner-gated §693-743 reconcile). Reversible — not deleted; revisit after 202.
 <!-- SECTION:NOTES:END -->

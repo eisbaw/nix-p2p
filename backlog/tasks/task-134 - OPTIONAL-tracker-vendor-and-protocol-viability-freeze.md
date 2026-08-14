@@ -4,7 +4,7 @@ title: OPTIONAL tracker vendor and protocol viability freeze
 status: To Do
 assignee: []
 created_date: '2026-08-11 05:49'
-updated_date: '2026-08-11 20:01'
+updated_date: '2026-08-14 21:49'
 labels:
   - iroh
   - discovery
@@ -14,11 +14,12 @@ labels:
   - tournament
   - grounding
   - vendor
+  - deferred-pending-202
 dependencies:
   - TASK-103
   - TASK-114
   - TASK-115
-priority: medium
+priority: low
 ---
 
 ## Description
@@ -41,4 +42,6 @@ Optional post-DHT experiment. Freeze whether the pinned n0 tracker protocol is a
 
 <!-- SECTION:NOTES:BEGIN -->
 Deferred comparison work. Run only after the mandatory decentralized content discovery path passes.
+
+Deprioritized to Low in the Wave-2c cleanup (2026-08-14): libp2p-PRIMARY trunk proven (libp2p-kad discovery + store-supply + streamed NAR). Per PRD §634-691 (normative owner-direction authority) content discovery is libp2p-kad; iroh is an OPTIONAL transport only. This task belongs to a superseded-discovery / premature-tournament / far-future-BitTorrent / optional-comparator track. Fate confirmed by TASK-202 (owner-gated §693-743 reconcile). Reversible — not deleted; revisit after 202.
 <!-- SECTION:NOTES:END -->

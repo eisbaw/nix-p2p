@@ -4,9 +4,10 @@ title: 'BitTorrent raw-NAR transport: prove the transport seam is not an Iroh fo
 status: To Do
 assignee: []
 created_date: '2026-08-09 21:01'
-updated_date: '2026-08-10 22:54'
+updated_date: '2026-08-14 21:48'
 labels:
   - wave-2b
+  - deferred-pending-202
 dependencies:
   - TASK-24
   - TASK-62
@@ -14,7 +15,7 @@ dependencies:
   - TASK-99
   - TASK-114
   - TASK-117
-priority: high
+priority: low
 ---
 
 ## Description
@@ -37,4 +38,6 @@ Implement the raw-NAR BitTorrent transport chosen by TASK-117 after the complete
 
 <!-- SECTION:NOTES:BEGIN -->
 Raw BitTorrent only. TASK-125 consumes its raw measurements; TASK-121 is the conditional compressed arm; TASK-122 runs both. No registry preference is frozen here.
+
+Deprioritized to Low in the Wave-2c cleanup (2026-08-14): libp2p-PRIMARY trunk proven (libp2p-kad discovery + store-supply + streamed NAR). Per PRD §634-691 (normative owner-direction authority) content discovery is libp2p-kad; iroh is an OPTIONAL transport only. This task belongs to a superseded-discovery / premature-tournament / far-future-BitTorrent / optional-comparator track. Fate confirmed by TASK-202 (owner-gated §693-743 reconcile). Reversible — not deleted; revisit after 202.
 <!-- SECTION:NOTES:END -->

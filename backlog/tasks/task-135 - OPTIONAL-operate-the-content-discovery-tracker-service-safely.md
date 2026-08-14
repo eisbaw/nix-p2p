@@ -4,7 +4,7 @@ title: OPTIONAL operate the content-discovery tracker service safely
 status: To Do
 assignee: []
 created_date: '2026-08-11 05:50'
-updated_date: '2026-08-11 19:55'
+updated_date: '2026-08-14 21:49'
 labels:
   - iroh
   - discovery
@@ -15,13 +15,14 @@ labels:
   - service
   - persistence
   - privacy
+  - deferred-pending-202
 dependencies:
   - TASK-90
   - TASK-102
   - TASK-114
   - TASK-115
   - TASK-134
-priority: medium
+priority: low
 ---
 
 ## Description
@@ -44,4 +45,6 @@ Optional post-DHT experiment. Operate the centralized tracker service only to me
 
 <!-- SECTION:NOTES:BEGIN -->
 Deferred comparison infrastructure. It is deliberately absent from the mandatory TASK-126 to TASK-103 to TASK-132 chain.
+
+Deprioritized to Low in the Wave-2c cleanup (2026-08-14): libp2p-PRIMARY trunk proven (libp2p-kad discovery + store-supply + streamed NAR). Per PRD §634-691 (normative owner-direction authority) content discovery is libp2p-kad; iroh is an OPTIONAL transport only. This task belongs to a superseded-discovery / premature-tournament / far-future-BitTorrent / optional-comparator track. Fate confirmed by TASK-202 (owner-gated §693-743 reconcile). Reversible — not deleted; revisit after 202.
 <!-- SECTION:NOTES:END -->

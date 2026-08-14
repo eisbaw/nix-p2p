@@ -4,11 +4,12 @@ title: Integrate Iroh public node discovery and prove no-address connection
 status: To Do
 assignee: []
 created_date: '2026-08-10 07:09'
-updated_date: '2026-08-13 05:54'
+updated_date: '2026-08-14 21:48'
 labels:
   - wave-2b
   - discovery
   - iroh
+  - deferred-pending-202
 dependencies:
   - TASK-114
   - TASK-115
@@ -17,7 +18,7 @@ dependencies:
   - TASK-139
   - TASK-166
   - TASK-187
-priority: high
+priority: low
 ---
 
 ## Description
@@ -55,4 +56,6 @@ TASK-89 composes 137 (publish) + 138 (lookup) + 139 (relay) into the no-address 
 - Typed outcomes to expect/propagate: daemon::RelayTransportUnavailableKind {disabled, untrusted_configuration, external_relay_unsupported, wrong_relay_url, relay_outage, wrong_certificate, wrong_identity, half_open_stream, forced_direct_failure, deadline, no_relay_candidate, closed}. Deadline bound: RELAY_CONNECT_DEADLINE 10000ms + RELAY_SCHEDULER_GRACE 1000ms (11000ms admissible). NOTE: as of 139 the live connect path + most typed producers are NOT yet wired — TASK-142 (routed relay evidence harness) owns that; 89 depends on 142's real relayed connection, not just 139's config layer.
 - External/public (n0) relay is out of scope: only a locally operated routed relay is enabled; evidence is labelled production-shaped. Do NOT reach n0 default relays in the 89 proof.
 - The routed harness setup that 89 needs already exists as a template: scripts/iroh_node_lookup_evidence.py (two rootless-podman internal networks + a tiny L3 router; tcpdump in the resolver netns). TASK-142 adapts it to block the direct path and force relay.
+
+Deprioritized to Low in the Wave-2c cleanup (2026-08-14): libp2p-PRIMARY trunk proven (libp2p-kad discovery + store-supply + streamed NAR). Per PRD §634-691 (normative owner-direction authority) content discovery is libp2p-kad; iroh is an OPTIONAL transport only. This task belongs to a superseded-discovery / premature-tournament / far-future-BitTorrent / optional-comparator track. Fate confirmed by TASK-202 (owner-gated §693-743 reconcile). Reversible — not deleted; revisit after 202.
 <!-- SECTION:NOTES:END -->

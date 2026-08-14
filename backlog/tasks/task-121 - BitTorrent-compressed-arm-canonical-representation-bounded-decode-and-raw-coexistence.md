@@ -6,18 +6,19 @@ title: >-
 status: To Do
 assignee: []
 created_date: '2026-08-10 22:24'
-updated_date: '2026-08-10 22:53'
+updated_date: '2026-08-14 21:49'
 labels:
   - bittorrent
   - compression
   - tournament
   - wave-2c
+  - deferred-pending-202
 dependencies:
   - TASK-62
   - TASK-75
   - TASK-117
   - TASK-125
-priority: high
+priority: low
 ---
 
 ## Description
@@ -40,4 +41,6 @@ After raw Stage A, resolve whether a compressed BitTorrent representation can sa
 
 <!-- SECTION:NOTES:BEGIN -->
 Conditional completion: supported criteria are checked with evidence when supported and marked not-applicable by the frozen branch when unsupported; the no-go criterion is mandatory for the unsupported branch.
+
+Deprioritized to Low in the Wave-2c cleanup (2026-08-14): libp2p-PRIMARY trunk proven (libp2p-kad discovery + store-supply + streamed NAR). Per PRD §634-691 (normative owner-direction authority) content discovery is libp2p-kad; iroh is an OPTIONAL transport only. This task belongs to a superseded-discovery / premature-tournament / far-future-BitTorrent / optional-comparator track. Fate confirmed by TASK-202 (owner-gated §693-743 reconcile). Reversible — not deleted; revisit after 202.
 <!-- SECTION:NOTES:END -->

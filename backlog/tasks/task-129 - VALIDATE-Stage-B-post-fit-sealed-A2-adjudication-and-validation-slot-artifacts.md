@@ -6,17 +6,19 @@ title: >-
 status: To Do
 assignee: []
 created_date: '2026-08-11 02:36'
+updated_date: '2026-08-14 21:48'
 labels:
   - tournament
   - validation
   - policy
   - evidence
   - wave-2c
+  - deferred-pending-202
 dependencies:
   - TASK-44
   - TASK-122
   - TASK-128
-priority: high
+priority: low
 ---
 
 ## Description
@@ -34,3 +36,9 @@ After TASK-44 irreversibly freezes the A1-selected best-static comparator and at
 - [ ] #5 Transfer only the three hashed slot artifacts directly and one-way to the TASK-123 freeze input. No holdout ID, seed, topology, permit, manifest, result, or entropy is generated, read, or materialized by this task.
 - [ ] #6 Bites prove fail-closed behavior for altered/missing hashes, mismatched A1/A2 labels, malformed present or absent references, attempted A2 access from TASK-44, attempted refit/runner-up selection, and any holdout access.
 <!-- AC:END -->
+
+## Implementation Notes
+
+<!-- SECTION:NOTES:BEGIN -->
+Deprioritized to Low in the Wave-2c cleanup (2026-08-14): libp2p-PRIMARY trunk proven (libp2p-kad discovery + store-supply + streamed NAR). Per PRD §634-691 (normative owner-direction authority) content discovery is libp2p-kad; iroh is an OPTIONAL transport only. This task belongs to a superseded-discovery / premature-tournament / far-future-BitTorrent / optional-comparator track. Fate confirmed by TASK-202 (owner-gated §693-743 reconcile). Reversible — not deleted; revisit after 202.
+<!-- SECTION:NOTES:END -->

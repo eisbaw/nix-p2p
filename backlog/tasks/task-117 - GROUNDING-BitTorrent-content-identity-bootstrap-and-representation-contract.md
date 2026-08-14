@@ -4,12 +4,13 @@ title: 'GROUNDING: BitTorrent content identity, bootstrap and representation con
 status: To Do
 assignee: []
 created_date: '2026-08-10 22:23'
-updated_date: '2026-08-10 23:00'
+updated_date: '2026-08-14 21:49'
 labels:
   - grounding
   - bittorrent
   - irreversible
   - wave-2c
+  - deferred-pending-202
 dependencies:
   - TASK-37
   - TASK-45
@@ -18,7 +19,7 @@ dependencies:
   - TASK-96
   - TASK-110
   - TASK-114
-priority: high
+priority: low
 ---
 
 ## Description
@@ -43,4 +44,6 @@ Before implementing a BitTorrent backend, settle how a Nix request that begins w
 Design-for-test and freeze gate for the BitTorrent backend. TASK-75 implements the selected raw representation; a later task owns compressed representation.
 
 Iroh-first gate: this task cannot start until TASK-45 closes the production-shaped Iroh operator journey and TASK-88 has frozen the Iroh measurement artifact.
+
+Deprioritized to Low in the Wave-2c cleanup (2026-08-14): libp2p-PRIMARY trunk proven (libp2p-kad discovery + store-supply + streamed NAR). Per PRD §634-691 (normative owner-direction authority) content discovery is libp2p-kad; iroh is an OPTIONAL transport only. This task belongs to a superseded-discovery / premature-tournament / far-future-BitTorrent / optional-comparator track. Fate confirmed by TASK-202 (owner-gated §693-743 reconcile). Reversible — not deleted; revisit after 202.
 <!-- SECTION:NOTES:END -->

@@ -23,7 +23,9 @@ served **from a peer** — no injected addresses, upstream untouched on a hit.
 > network namespaces discover a provider, resolve its address, fetch, and serve a
 > NAR to an unmodified `nix build` with **no injected addresses**. The addressed
 > unit, the claim wire schema, and the discovery key/record are frozen; the
-> public-network story and the transport tournament are still moving.
+> public-network story (NAT traversal, relay, residential uplinks) is still ahead,
+> and the transport tournament is deferred behind getting decentralized discovery
+> and robust connectivity solid first.
 
 ## Architecture
 
@@ -91,8 +93,13 @@ serves a compressed file, so a peer moves more bytes per path and may not beat a
 CDN on speed until the peer link is itself compressed (an unsigned transport field;
 the addressed unit stays the raw NAR). The long tail is where a CDN is strong and
 swarms are weak. Whether peers usefully beat or supplement a CDN as a byte source is
-treated as a thesis to measure, not a premise; the measurement instrument is a
-first-class part of the project, and the real-network and swarm results are not in.
+treated as a thesis to measure, not a premise. **Early measurement says supplement,
+not beat:** on shaped links a peer's raw NAR runs several times the CDN's compressed
+bytes and loses at every size raw, while fast negotiated link-compression closes most
+of that gap back toward parity — so on the evidence so far peers look like a bandwidth
+*supplement* to the CDN (which is exactly the stated aim), not a replacement. The
+measurement instrument is a first-class part of the project; true public-network and
+public-swarm results are still out.
 
 ## What is
 

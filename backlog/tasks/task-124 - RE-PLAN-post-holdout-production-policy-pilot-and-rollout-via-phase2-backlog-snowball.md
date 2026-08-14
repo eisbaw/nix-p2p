@@ -6,17 +6,18 @@ title: >-
 status: To Do
 assignee: []
 created_date: '2026-08-10 22:25'
-updated_date: '2026-08-10 22:58'
+updated_date: '2026-08-14 21:48'
 labels:
   - replan
   - production
   - policy
   - wave-2c
+  - deferred-pending-202
 dependencies:
   - TASK-45
   - TASK-120
   - TASK-123
-priority: high
+priority: low
 ---
 
 ## Description
@@ -40,4 +41,6 @@ Terminal re-plan task, not feature code. Re-invoke phase2-backlog-snowball with 
 
 <!-- SECTION:NOTES:BEGIN -->
 Terminal wave-2c task. It consumes evidence; it must not merely note that evidence exists.
+
+Deprioritized to Low in the Wave-2c cleanup (2026-08-14): libp2p-PRIMARY trunk proven (libp2p-kad discovery + store-supply + streamed NAR). Per PRD §634-691 (normative owner-direction authority) content discovery is libp2p-kad; iroh is an OPTIONAL transport only. This task belongs to a superseded-discovery / premature-tournament / far-future-BitTorrent / optional-comparator track. Fate confirmed by TASK-202 (owner-gated §693-743 reconcile). Reversible — not deleted; revisit after 202.
 <!-- SECTION:NOTES:END -->

@@ -4,16 +4,18 @@ title: 'MEASUREMENT: request-weighted coverage and longitudinal publishable-set 
 status: To Do
 assignee: []
 created_date: '2026-08-10 22:51'
+updated_date: '2026-08-14 21:48'
 labels:
   - measurement
   - census
   - longitudinal
   - wave-2c
+  - deferred-pending-202
 dependencies:
   - TASK-31
   - TASK-88
   - TASK-95
-priority: high
+priority: low
 ---
 
 ## Description
@@ -35,4 +37,6 @@ Extend the early static store census with evidence that requires a running Iroh 
 
 <!-- SECTION:NOTES:BEGIN -->
 This is intentionally later than TASK-95. Environment time may block completion; that is an honest Phase-3 blocked outcome.
+
+Deprioritized to Low in the Wave-2c cleanup (2026-08-14): libp2p-PRIMARY trunk proven (libp2p-kad discovery + store-supply + streamed NAR). Per PRD §634-691 (normative owner-direction authority) content discovery is libp2p-kad; iroh is an OPTIONAL transport only. This task belongs to a superseded-discovery / premature-tournament / far-future-BitTorrent / optional-comparator track. Fate confirmed by TASK-202 (owner-gated §693-743 reconcile). Reversible — not deleted; revisit after 202.
 <!-- SECTION:NOTES:END -->

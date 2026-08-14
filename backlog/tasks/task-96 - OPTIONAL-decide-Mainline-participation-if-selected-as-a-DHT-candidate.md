@@ -4,7 +4,7 @@ title: OPTIONAL decide Mainline participation if selected as a DHT candidate
 status: To Do
 assignee: []
 created_date: '2026-08-10 08:43'
-updated_date: '2026-08-11 20:02'
+updated_date: '2026-08-14 21:48'
 labels:
   - mainline
   - dht
@@ -12,9 +12,10 @@ labels:
   - optional
   - decision
   - wave-2b
+  - deferred-pending-202
 dependencies:
   - TASK-114
-priority: medium
+priority: low
 ---
 
 ## Description
@@ -38,4 +39,6 @@ Conditional owner and privacy decision gate for optional Mainline address lookup
 
 <!-- SECTION:NOTES:BEGIN -->
 Conditional Mainline candidate gate. Deferred on the Iroh-first path unless TASK-126 selects Mainline. External trials still require explicit owner infrastructure credential cost and cleanup authorization.
+
+Deprioritized to Low in the Wave-2c cleanup (2026-08-14): libp2p-PRIMARY trunk proven (libp2p-kad discovery + store-supply + streamed NAR). Per PRD §634-691 (normative owner-direction authority) content discovery is libp2p-kad; iroh is an OPTIONAL transport only. This task is an optional-comparator / superseded-discovery / far-future-BitTorrent / premature-tournament track. Fate confirmed by TASK-202 (owner-gated §693-743 reconcile). Reversible — not deleted; revisit after 202.
 <!-- SECTION:NOTES:END -->

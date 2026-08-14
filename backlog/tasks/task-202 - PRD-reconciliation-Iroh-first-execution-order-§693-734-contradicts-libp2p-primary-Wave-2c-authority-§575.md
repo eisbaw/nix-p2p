@@ -6,13 +6,14 @@ title: >-
 status: To Do
 assignee: []
 created_date: '2026-08-14 08:24'
-updated_date: '2026-08-14 18:22'
+updated_date: '2026-08-14 21:49'
 labels:
   - doc
   - direction
   - tech-debt
+  - keystone
 dependencies: []
-priority: medium
+priority: high
 ---
 
 ## Description
@@ -25,4 +26,6 @@ COMPASS 2026-08-14 domain-coherence flag. The PRD's Wave-2c reconciliation (§57
 
 <!-- SECTION:NOTES:BEGIN -->
 AUTONOMOUS BACKLOG PART DONE 2026-08-14: re-pointed TASK-155's stale iroh dep (132 -> 103); appended coherence-reframe notes to the iroh-framed gate tasks 132/133/87/88 (they are optional-transport reference, NOT the production discovery gate, which is the proven libp2p-kad 103/191/194). REMAINING (owner-review-gated, NOT done autonomously): (a) the PRD execution-order PROSE (§693-734 'Iroh-first' / 'GLOBAL-IROH GATE') needs reconciling to the Wave-2c libp2p-primary authority — a PRD authority-section edit I will not make unilaterally; show the diff + confirm; (b) the product decision whether iroh remains a funded arm (sets 87/88/132/133/201 priority). These two are for the owner.
+
+Raised to High in the Wave-2c cleanup (2026-08-14): this is the keystone reconcile that gates the fate of ~29 now-Low tasks (label deferred-pending-202) across the superseded iroh-as-discovery-gate, premature multi-arm tournament, far-future BitTorrent, and optional-comparator tracks. Normative authority = PRD §634-691 (libp2p-kad mandatory discovery, iroh optional transport only); the stale §693-743 Iroh-first execution order is what this task removes/reconciles. Owner/PRD-gated: the 'is iroh a funded transport arm at all' call is owner product intent — route via mped-architect as Mark-emulator against the PRD, do not ask the owner.
 <!-- SECTION:NOTES:END -->

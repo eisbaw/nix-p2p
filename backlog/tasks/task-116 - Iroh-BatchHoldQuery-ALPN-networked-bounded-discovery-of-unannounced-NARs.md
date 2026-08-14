@@ -4,12 +4,13 @@ title: 'Iroh BatchHoldQuery ALPN: networked bounded discovery of unannounced NAR
 status: To Do
 assignee: []
 created_date: '2026-08-10 22:23'
-updated_date: '2026-08-11 03:31'
+updated_date: '2026-08-14 21:48'
 labels:
   - iroh
   - discovery
   - privacy
   - wave-2c
+  - deferred-pending-202
 dependencies:
   - TASK-83
   - TASK-100
@@ -19,7 +20,7 @@ dependencies:
   - TASK-110
   - TASK-115
   - TASK-130
-priority: high
+priority: low
 ---
 
 ## Description
@@ -41,4 +42,6 @@ Put the existing batched yes/no hold-query protocol on the real shared Iroh endp
 
 <!-- SECTION:NOTES:BEGIN -->
 This is bounded direct content probing over Iroh. Global announced-content lookup remains in TASK-101/TASK-103.
+
+Deprioritized to Low in the Wave-2c cleanup (2026-08-14): libp2p-PRIMARY trunk proven (libp2p-kad discovery + store-supply + streamed NAR). Per PRD §634-691 (normative owner-direction authority) content discovery is libp2p-kad; iroh is an OPTIONAL transport only. This task belongs to a superseded-discovery / premature-tournament / far-future-BitTorrent / optional-comparator track. Fate confirmed by TASK-202 (owner-gated §693-743 reconcile). Reversible — not deleted; revisit after 202.
 <!-- SECTION:NOTES:END -->

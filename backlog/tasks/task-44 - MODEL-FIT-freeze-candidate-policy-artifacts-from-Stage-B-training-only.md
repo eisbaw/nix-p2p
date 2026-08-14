@@ -4,8 +4,9 @@ title: 'MODEL/FIT: freeze candidate policy artifacts from Stage-B training only'
 status: To Do
 assignee: []
 created_date: '2026-08-08 20:13'
-updated_date: '2026-08-11 02:38'
-labels: []
+updated_date: '2026-08-14 21:48'
+labels:
+  - deferred-pending-202
 dependencies:
   - TASK-43
   - TASK-52
@@ -14,7 +15,7 @@ dependencies:
   - TASK-114
   - TASK-122
   - TASK-128
-priority: high
+priority: low
 ---
 
 ## Description
@@ -59,4 +60,6 @@ FIX AND ORDER: TASK-94 measures the inequality; TASK-99 fixes it by compressing 
 content - the addressed unit must stay BLAKE3(raw nar) or peers compressing with different settings
 produce different blob ids and lose all sharing). Do not re-derive any policy threshold, speedup, or
 peer-vs-upstream ranking from this task until TASK-99 has landed and TASK-99 AC#4 has re-measured.
+
+Deprioritized to Low in the Wave-2c cleanup (2026-08-14): libp2p-PRIMARY trunk proven (libp2p-kad discovery + store-supply + streamed NAR). Per PRD §634-691 (normative owner-direction authority) content discovery is libp2p-kad; iroh is an OPTIONAL transport only. This task belongs to a superseded-discovery / premature-tournament / far-future-BitTorrent / optional-comparator track. Fate confirmed by TASK-202 (owner-gated §693-743 reconcile). Reversible — not deleted; revisit after 202.
 <!-- SECTION:NOTES:END -->

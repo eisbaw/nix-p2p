@@ -4,16 +4,18 @@ title: 'REVIEW/JOURNEY: zero-injection BitTorrent serves a real Nix build'
 status: To Do
 assignee: []
 created_date: '2026-08-10 22:23'
+updated_date: '2026-08-14 21:49'
 labels:
   - review
   - journey
   - e2e
   - bittorrent
   - wave-2c
+  - deferred-pending-202
 dependencies:
   - TASK-83
   - TASK-118
-priority: high
+priority: low
 ---
 
 ## Description
@@ -35,4 +37,6 @@ Run the BitTorrent vertical slice as an operator, then review it before it enter
 
 <!-- SECTION:NOTES:BEGIN -->
 Interspersed review/e2e gate for the raw BitTorrent vertical slice.
+
+Deprioritized to Low in the Wave-2c cleanup (2026-08-14): libp2p-PRIMARY trunk proven (libp2p-kad discovery + store-supply + streamed NAR). Per PRD §634-691 (normative owner-direction authority) content discovery is libp2p-kad; iroh is an OPTIONAL transport only. This task belongs to a superseded-discovery / premature-tournament / far-future-BitTorrent / optional-comparator track. Fate confirmed by TASK-202 (owner-gated §693-743 reconcile). Reversible — not deleted; revisit after 202.
 <!-- SECTION:NOTES:END -->

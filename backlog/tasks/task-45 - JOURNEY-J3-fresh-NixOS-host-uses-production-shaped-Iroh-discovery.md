@@ -4,9 +4,10 @@ title: 'JOURNEY J3: fresh NixOS host uses production-shaped Iroh discovery'
 status: To Do
 assignee: []
 created_date: '2026-08-08 20:13'
-updated_date: '2026-08-10 22:35'
+updated_date: '2026-08-14 21:48'
 labels:
   - journey
+  - deferred-pending-202
 dependencies:
   - TASK-24
   - TASK-25
@@ -15,7 +16,7 @@ dependencies:
   - TASK-88
   - TASK-115
   - TASK-120
-priority: high
+priority: low
 ---
 
 ## Description
@@ -38,4 +39,6 @@ Close the Iroh-first milestone from a clean operator perspective. Install the Ni
 
 <!-- SECTION:NOTES:BEGIN -->
 REVIEW REVISION (qa#5): 'cache.nixos.org untouched' is an OVERCLAIM - the signed narinfo still comes from upstream in wave-2a. Assert NAR-payload served by the peer (egress 0 for the NAR) + narinfo egress as nonzero context. Do not claim the cache is untouched.
+
+Deprioritized to Low in the Wave-2c cleanup (2026-08-14): libp2p-PRIMARY trunk proven (libp2p-kad discovery + store-supply + streamed NAR). Per PRD §634-691 (normative owner-direction authority) content discovery is libp2p-kad; iroh is an OPTIONAL transport only. This task belongs to a superseded-discovery / premature-tournament / far-future-BitTorrent / optional-comparator track. Fate confirmed by TASK-202 (owner-gated §693-743 reconcile). Reversible — not deleted; revisit after 202.
 <!-- SECTION:NOTES:END -->
