@@ -48,6 +48,7 @@ import json
 import lzma
 import os
 import re
+import shlex
 import shutil
 import socket
 import statistics
@@ -414,6 +415,30 @@ def build_corrupt_nar_tree(fixtures: Fixtures, scratch: Path) -> Path:
     return cache
 
 
+# TASK-194 (191 AC#3): the STORE-supply provider's boot wrapper. It REALISES the real
+# /nix/store path(s) into the provider's own store from the ORIGIN cache (require-sigs
+# verified against the fixture key), asserts each is now a valid, dumpable store object,
+# then `exec`s the daemon so the daemon becomes the container's main process (podman
+# logs/kill still target it). The provider thus holds each path as UNPACKED FILES that nix
+# manages - it never keeps a .nar at rest and regenerates the .nar on demand via
+# `nix-store --dump` to serve peers. `set -euo pipefail` makes a failed realise or an
+# un-dumpable path a LOUD abort BEFORE the daemon announces (never announce-then-decline).
+_LIBP2P_PROVIDER_STORE_REALISE = r"""
+set -euo pipefail
+echo "STORE-SUPPLY: realising {store_paths} from {origin}"
+nix-store --realise {store_paths} \
+  --option substituters "{origin}" \
+  --option trusted-public-keys "{key}" \
+  --option require-sigs true \
+  --option substitute true
+for p in {store_paths}; do
+  nix-store --dump "$p" >/dev/null
+done
+echo "STORE-SUPPLY: realised + dumpable; starting daemon"
+exec {exec_cmd}
+"""
+
+
 # ---- the pod ---------------------------------------------------------------
 
 
@@ -492,6 +517,7 @@ class Pod:
         libp2p_seed_dir: Path | None = None,
         libp2p_provider_seeds: tuple[P2pSeed, ...] = (),
         libp2p_trusted_key: str | None = None,
+        libp2p_store_supply: bool = False,
     ):
         self.ctx = ctx
         self.pod = f"{POD_PREFIX}-{name}"
@@ -551,6 +577,15 @@ class Pod:
         # public, and routes the announce through the allowlist gate - the LEGITIMATE
         # public-participation path that replaces the isolated-LAN refusal stopgap.
         self.libp2p_trusted_key = libp2p_trusted_key
+        # TASK-194 (191 AC#3): STORE-supply provider mode. When True the provider does NOT
+        # mount any .nar file; instead it REALISES the real /nix/store path(s) from the origin
+        # cache at boot and serves each on demand via `nix-store --dump` (holding NO .nar at
+        # rest), announced through the SAME verification-gated store path as the shipped daemon
+        # (`--libp2p-provide-store`). `libp2p_seed_dir` then carries ONLY the signed narinfos
+        # (mounted under /srv/seed/narinfos/) needed to prove each path public - never a .nar.
+        self.libp2p_store_supply = bool(libp2p_store_supply)
+        if self.libp2p_store_supply and not libp2p_trusted_key:
+            die("Pod: libp2p_store_supply requires libp2p_trusted_key (public-narinfo proof)")
         # Parsed once the provider announces; the positive oracle reads it to assert C
         # was NEVER configured with it (no-injection).
         self.libp2p_provider_identity: tuple[str, str] | None = None
@@ -1085,8 +1120,18 @@ class Pod:
 
         # 2. P (provider): seeds the real target, bootstraps to BOOT, announces.
         seed_args: list[str] = []
-        for s in self.libp2p_provider_seeds:
-            seed_args += ["--libp2p-seed-nar", f"{s.nar_hash}=/srv/seed/{s.filename}"]
+        if self.libp2p_store_supply:
+            # STORE-supply (TASK-194): serve the REAL realised /nix/store path via
+            # `nix-store --dump` on demand - NO .nar mounted, nothing at rest. The narhash
+            # binds the announce to the signed NarHash exactly as the seed path does.
+            for s in self.libp2p_provider_seeds:
+                seed_args += ["--libp2p-provide-store", f"{s.nar_hash}={s.store_path}"]
+        else:
+            for s in self.libp2p_provider_seeds:
+                seed_args += [
+                    "--libp2p-seed-nar",
+                    f"{s.nar_hash}=/srv/seed/{s.filename}",
+                ]
         # TASK-103 PUBLIC-announce door: hand P the trusted narinfo-signing key + an on-disk
         # allowlist, and PROVE each seeded NAR public through its signed narinfo. Only then does P
         # legitimately announce over the bootstrapped (public) DHT - the allowlist gate replaces
@@ -1109,6 +1154,41 @@ class Pod:
                     "--libp2p-prove-public-narinfo",
                     f"{sh}=/srv/seed/narinfos/{sh}.narinfo",
                 ]
+        daemon_argv = [
+            "/bin/daemon",
+            "--listen",
+            f"0.0.0.0:{DAEMON_PORT + 1}",
+            "--upstream",
+            proxy,
+            "--libp2p-provider",
+            "--libp2p-listen",
+            f"/ip4/127.0.0.1/tcp/{LIBP2P_BASE_PORT + 1}",
+            "--libp2p-bootstrap",
+            boot_peer,
+            "--libp2p-scope",
+            LIBP2P_SCOPE,
+            "--libp2p-print-peer-address",
+            *seed_args,
+            *self._daemon_state_flags(),
+        ]
+        # STORE-supply (TASK-194): before the daemon starts, REALISE the real store path(s)
+        # into THIS provider's /nix/store from the ORIGIN (not the proxy - keeps the proxy's
+        # NAR cache cold so the kill-P control below is a true upstream miss). Then `exec` the
+        # daemon, which serves each path via `nix-store --dump` on demand and holds NO .nar.
+        # Fail-loud: a failed realise or an un-dumpable path aborts before any announce.
+        if self.libp2p_store_supply:
+            store_paths = " ".join(
+                shlex.quote(s.store_path) for s in self.libp2p_provider_seeds
+            )
+            realise_script = _LIBP2P_PROVIDER_STORE_REALISE.format(
+                store_paths=store_paths,
+                origin=f"http://127.0.0.1:{ORIGIN_PORT}",
+                key=self.libp2p_trusted_key,
+                exec_cmd=" ".join(shlex.quote(a) for a in daemon_argv),
+            )
+            container_cmd = ["bash", "-c", realise_script]
+        else:
+            container_cmd = daemon_argv
         run(
             [
                 self._pm,
@@ -1125,21 +1205,7 @@ class Pod:
                 *allowlist_mount,
                 *self._state_args("lp-provider"),
                 self.ctx.image,
-                "/bin/daemon",
-                "--listen",
-                f"0.0.0.0:{DAEMON_PORT + 1}",
-                "--upstream",
-                proxy,
-                "--libp2p-provider",
-                "--libp2p-listen",
-                f"/ip4/127.0.0.1/tcp/{LIBP2P_BASE_PORT + 1}",
-                "--libp2p-bootstrap",
-                boot_peer,
-                "--libp2p-scope",
-                LIBP2P_SCOPE,
-                "--libp2p-print-peer-address",
-                *seed_args,
-                *self._daemon_state_flags(),
+                *container_cmd,
             ]
         )
         prov_id, prov_listen = self._await_libp2p_identity(
@@ -1191,7 +1257,9 @@ class Pod:
         """
         deadline = time.time() + READY_TIMEOUT_S
         addr_re = re.compile(r"LIBP2P-PROVIDER-ADDR peer_id=(\S+) listen=(\S+)")
-        seed_re = re.compile(r"LIBP2P-SEED narhash=(\S+) ")
+        # Matches BOTH the seed-nar announce (`LIBP2P-SEED`) and the STORE-supply announce
+        # (`LIBP2P-PROVIDE-STORE`, TASK-194), so identity-await works in either provider mode.
+        seed_re = re.compile(r"LIBP2P-(?:SEED|PROVIDE-STORE) narhash=(\S+) ")
         while True:
             log = self.logs(role)
             addr = addr_re.search(log)
@@ -1971,7 +2039,9 @@ class Libp2pNetnsTopology:
         announces (never wires a dead peer)."""
         deadline = time.time() + READY_TIMEOUT_S
         addr_re = re.compile(r"LIBP2P-PROVIDER-ADDR peer_id=(\S+) listen=(\S+)")
-        seed_re = re.compile(r"LIBP2P-SEED narhash=(\S+) ")
+        # Matches BOTH the seed-nar announce (`LIBP2P-SEED`) and the STORE-supply announce
+        # (`LIBP2P-PROVIDE-STORE`, TASK-194), so identity-await works in either provider mode.
+        seed_re = re.compile(r"LIBP2P-(?:SEED|PROVIDE-STORE) narhash=(\S+) ")
         while True:
             log = self.logs(role)
             addr = addr_re.search(log)
@@ -4971,6 +5041,163 @@ def scenario_s7_libp2p_netns(ctx: Ctx, expect) -> None:
         )
 
 
+def _s8_store_seeds(ctx: Ctx):
+    """STORE-supply provider inputs (TASK-194): stage NO .nar. Return
+    (narinfo_dir, (that_seed,), target_store_path). `narinfo_dir` carries ONLY the seed's
+    SIGNED narinfo under narinfos/<store_hash>.narinfo, so the provider can prove the path
+    PUBLIC before announcing it; the provider realises the REAL /nix/store path itself and
+    serves it via `nix-store --dump`. The provider container thus holds no .nar file at all,
+    which is the property under test."""
+    fixtures = ctx.fixtures
+    entry = fixtures.entry(S7_TARGET)
+    seed = P2pSeed(
+        # `filename` is NEVER materialised in store mode (no .nar is mounted); it exists only
+        # to satisfy the P2pSeed shape the identity-await + announce line read.
+        filename=f"{entry['nar_hash'].split(':', 1)[1]}.nar",
+        nar_hash=entry["nar_hash"],
+        nar_size=entry["nar_size"],
+        store_path=entry["store_path"],
+    )
+    narinfo_dir = ctx.scratch / "s8-store-narinfos"
+    narinfo_dir.mkdir(parents=True)
+    _copy_seed_narinfos(fixtures, narinfo_dir, [seed])
+    return narinfo_dir, (seed,), fixtures.store_path(S7_TARGET)
+
+
+def scenario_s8_libp2p_store(ctx: Ctx, expect) -> None:
+    """S8 (TASK-194 / TASK-191 AC#3): a libp2p provider serves a REAL /nix/store path it
+    realised but NEVER held as a .nar file. It regenerates the NAR on demand via
+    `nix-store --dump` (store-supply mode, `--libp2p-provide-store`), announces it through
+    the SAME verification-gated public door as S7, and a consumer - told ONLY BOOT -
+    discovers it via kad and fetches it BYTE-IDENTICAL with 0 upstream NAR egress. The
+    kill-P control (upstream fallback serves the full NAR) keeps the peer path load-bearing.
+
+    STORE-supply DELTA from S7: the provider mounts NO .nar (only the signed narinfo, to
+    prove the path public); it realises the store path from the origin at boot and holds it
+    as unpacked files nix manages. Proven at the boundary by the provider's OWN log - it
+    announces via LIBP2P-PROVIDE-STORE (the store-dump path) and NEVER via LIBP2P-SEED.
+    """
+    fixtures = ctx.fixtures
+    narinfo_dir, prov_seeds, target_sp = _s8_store_seeds(ctx)
+    target_size = prov_seeds[0].nar_size
+
+    # HOST-side no-.nar oracle: the ONLY thing the provider mounts is signed narinfo(s) -
+    # not a single .nar file. (Its /nix/store copy of the path is realised in-container.)
+    staged = sorted(p.name for p in narinfo_dir.rglob("*") if p.is_file())
+    expect(
+        bool(staged) and not any(n.endswith(".nar") for n in staged),
+        "S8 no-.nar: the provider's mount stages ONLY signed narinfo(s), never a .nar",
+        f"staged={staged!r}",
+    )
+
+    with Pod(
+        ctx,
+        "s8",
+        fixtures.cache,
+        with_daemon=False,
+        expect=expect,
+        libp2p_seed_dir=narinfo_dir,
+        libp2p_provider_seeds=prov_seeds,
+        libp2p_trusted_key=fixtures.public_key,
+        libp2p_store_supply=True,
+    ) as pod:
+        # -- store-supply path exercised: provider realised the path + announced via
+        # nix-store --dump (LIBP2P-PROVIDE-STORE), NOT the seed-nar path (LIBP2P-SEED) --
+        plog = pod.logs("lp-provider")
+        expect(
+            "STORE-SUPPLY: realised + dumpable" in plog,
+            "S8 store-supply: provider REALISED the store path and proved it dumpable at boot",
+            f"provider log tail: {plog[-700:]!r}",
+        )
+        expect(
+            "LIBP2P-PROVIDE-STORE narhash=" in plog
+            and "LIBP2P-SEED narhash=" not in plog,
+            "S8 store-supply: provider announced via the STORE-DUMP path "
+            "(LIBP2P-PROVIDE-STORE), never the seed-nar path (LIBP2P-SEED) - no .nar at rest",
+            f"provider log tail: {plog[-700:]!r}",
+        )
+
+        # -- no-injection oracle (the hardened AC#9 guard, identical to S7): C's argv proves
+        # it was NEVER handed P's address; discovery is genuinely via kad from BOOT alone. --
+        prov_id = (
+            pod.libp2p_provider_identity[0] if pod.libp2p_provider_identity else ""
+        )
+        argv = pod.libp2p_consumer_argv()
+        joined = " ".join(argv)
+        boot_peer = pod.libp2p_boot_peer_entry or ""
+        prov_addrs = set(pod.libp2p_provider_listen_addrs)
+        injection_problems = check_libp2p_no_injection(
+            argv, boot_peer, prov_id, prov_addrs
+        )
+        expect(
+            not injection_problems,
+            "S8 no-injection: consumer --libp2p-bootstrap is EXACTLY the real BOOT node "
+            "(no provider addr/PeerId injected out-of-band)",
+            f"problems={injection_problems!r} boot={boot_peer!r} "
+            f"prov_addrs={sorted(prov_addrs)!r} argv={joined!r}",
+        )
+
+        # -- ARM A (positive): C discovers+resolves+fetches the store-dumped NAR from P --
+        time.sleep(LIBP2P_CONVERGE_S)
+        pod.proxy_reset()
+        res = pod.client_run(
+            [target_sp], ctx.substituter_daemon_only(), fixtures.public_key
+        )
+        expect(
+            res.exit_code == 0,
+            "S8: nix build completes with the NAR store-dumped + served by P over libp2p",
+            res.stderr[-800:],
+        )
+        got = res.narhash(target_sp)
+        expect(
+            got == fixtures.nar_hash(S7_TARGET),
+            f"S8 byte-identity: {S7_TARGET} NarHash matches the signed upstream (the "
+            "nix-store --dump bytes BLAKE3-match the announced content)",
+            f"got={got} want={fixtures.nar_hash(S7_TARGET)}",
+        )
+        stats = pod.proxy_stats()
+        nar_up = stats["upstream"].get("nar", 0)
+        ninfo_up = stats["upstream"].get("narinfo", 0)
+        expect(
+            nar_up == 0,
+            "S8 oracle: 0 upstream NAR egress (the target was store-dumped + peer-served, "
+            "not fetched from the cache) - want target_size>0",
+            f"upstream.nar={nar_up} target_size={target_size}",
+        )
+        expect(
+            ninfo_up > 0,
+            "S8 context: narinfo egress is NONZERO (served upstream)",
+            f"upstream.narinfo={ninfo_up}",
+        )
+
+        # -- ARM B (kill-P control): remove P -> the DHT-mediated peer path is the only route
+        # to the target (BOOT holds no content), so C must fall back to upstream, which serves
+        # the FULL NAR. Falsifies the 0-egress: the store-dumped peer serve was load-bearing. --
+        pod.kill("lp-provider")
+        pod.proxy_reset()
+        res2 = pod.client_run(
+            [target_sp], ctx.substituter_daemon_only(), fixtures.public_key
+        )
+        expect(
+            res2.exit_code == 0,
+            "S8 kill-P control: build still succeeds via upstream when P is dead",
+            res2.stderr[-800:],
+        )
+        got2 = res2.narhash(target_sp)
+        expect(
+            got2 == fixtures.nar_hash(S7_TARGET),
+            "S8 kill-P control: still byte-identical (served by upstream fallback)",
+            f"got={got2}",
+        )
+        nar_up2 = pod.proxy_stats()["upstream"].get("nar", 0)
+        expect(
+            nar_up2 >= 1,
+            "S8 kill-P control: upstream served the FULL NAR once P is dead (the store-dumped "
+            "peer serve was load-bearing, not a pre-open/local shortcut)",
+            f"upstream.nar={nar_up2}",
+        )
+
+
 SCENARIOS = [
     ("topology", scenario_topology),
     ("s1-byte-and-counts", scenario_s1_byte_and_counts),
@@ -5008,6 +5235,10 @@ SCENARIOS = [
     ("s7-libp2p", scenario_s7_libp2p),
     ("s7-libp2p-miss", scenario_s7_libp2p_miss),
     ("s7-libp2p-netns", scenario_s7_libp2p_netns),
+    # S8 (TASK-194 / 191 AC#3): the libp2p provider serves a REAL /nix/store path it NEVER
+    # held as a .nar - regenerated on demand via `nix-store --dump` (store-supply mode) -
+    # to a consumer that discovers it via kad, byte-identical, with the kill-P control.
+    ("s8-libp2p-store", scenario_s8_libp2p_store),
 ]
 
 

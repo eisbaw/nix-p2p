@@ -7,7 +7,7 @@ status: In Progress
 assignee:
   - '@claude'
 created_date: '2026-08-13 11:29'
-updated_date: '2026-08-13 15:41'
+updated_date: '2026-08-14 16:44'
 labels:
   - libp2p
   - daemon
@@ -32,7 +32,7 @@ Consumer of TASK-158. TASK-158 added fabric_libp2p::CatalogNarSupplier + the Cat
 <!-- AC:BEGIN -->
 - [x] #1 install_libp2p_provider can build a CatalogNarSupplier over a daemon impl of fabric_libp2p::CatalogProbe backed by the AvailabilityIndex, so an announced store path is served by nix-store --dump on demand, holding no .nar at rest
 - [x] #2 the store-dump produced bytes still flow through the announce SSOT NarHash verification (verify_provider_seeds / sign-site guard, TASK-56) - no new announce path bypasses it
-- [ ] #3 container e2e: a provider peer serves a /nix/store path it never held as a .nar file; a consumer discovers via kad and fetches byte-identical bytes; the produced bytes BLAKE3-match the announced content
+- [x] #3 container e2e: a provider peer serves a /nix/store path it never held as a .nar file; a consumer discovers via kad and fetches byte-identical bytes; the produced bytes BLAKE3-match the announced content
 <!-- AC:END -->
 
 ## Implementation Plan
