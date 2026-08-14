@@ -52,6 +52,10 @@
       "nar_size_min_bytes_uncompressed_nar": 4968,
       "nar_size_max_bytes_uncompressed_nar": 277242232,
       "nar_size_span_orders_of_magnitude": 55805.60225442834,
+      "n_uncompressed_excluded": 2,
+      "n_unknown_compression_excluded": 0,
+      "n_unsigned_excluded": 0,
+      "n_records_total": 222,
       "deciles_by_nar_size": [
         {
           "decile": 1,
@@ -124,10 +128,6 @@
           "aggregate_file_over_nar_ratio": 0.3247403847837522
         }
       ],
-      "n_uncompressed_excluded": 2,
-      "n_unknown_compression_excluded": 0,
-      "n_unsigned_excluded": 0,
-      "n_records_total": 222,
       "admission_rule": "admitted iff Compression in a known codec set AND Sig present; uncompressed/unknown-codec/unsigned each excluded and counted",
       "records": [
         {
@@ -2366,67 +2366,67 @@
         "nar_size_bytes_uncompressed_nar": 8388608,
         "shaped": {
           "link_label": "wan_shaped",
-          "rtt_ms": 48.219,
-          "throughput_mbit_per_s": 73.91,
-          "throughput_bytes_uncompressed_nar_per_s": 9238750.0,
+          "rtt_ms": 48.108,
+          "throughput_mbit_per_s": 73.9,
+          "throughput_bytes_uncompressed_nar_per_s": 9237500.0,
           "delivered_bytes_uncompressed_nar": 8388608,
           "shaping_asserted": true,
           "shaping_error": null
         },
         "loopback_control": {
           "link_label": "loopback",
-          "rtt_ms": 0.051,
-          "throughput_mbit_per_s": 71248.53,
-          "throughput_bytes_uncompressed_nar_per_s": 8906066250.0,
+          "rtt_ms": 0.053,
+          "throughput_mbit_per_s": 38351.06,
+          "throughput_bytes_uncompressed_nar_per_s": 4793882500.0,
           "delivered_bytes_uncompressed_nar": 8388608,
           "wan_label_refused": true
         },
-        "shaped_arm_transcript": "=== RTT probe (shape=yes) ===\n5 packets transmitted, 5 received, 0% packet loss, time 802ms\nrtt min/avg/max/mdev = 40.107/48.219/80.162/15.971 ms\n=== XFER (shape=yes, total=8388608 bytes) ===\nRECV_READY port=9099\nRECV_DONE bytes=8388608 expect=8388608 status=ok\nSEND_DONE bytes=8388608 elapsed_s=0.9080 mbit_per_s=73.91 MB_per_s=9.24\n",
-        "loopback_arm_transcript": "=== RTT probe (shape=no) ===\n5 packets transmitted, 5 received, 0% packet loss, time 832ms\nrtt min/avg/max/mdev = 0.034/0.051/0.060/0.009 ms\n=== XFER (shape=no, total=8388608 bytes) ===\nRECV_READY port=9099\nSEND_DONE bytes=8388608 elapsed_s=0.0009 mbit_per_s=71248.53 MB_per_s=8906.07\nRECV_DONE bytes=8388608 expect=8388608 status=ok\n"
+        "shaped_arm_transcript": "=== RTT probe (shape=yes) ===\n5 packets transmitted, 5 received, 0% packet loss, time 802ms\nrtt min/avg/max/mdev = 40.093/48.108/80.139/16.015 ms\n=== XFER (shape=yes, total=8388608 bytes) ===\nRECV_READY port=9099\nRECV_DONE bytes=8388608 expect=8388608 status=ok\nSEND_DONE bytes=8388608 elapsed_s=0.9081 mbit_per_s=73.90 MB_per_s=9.24\n",
+        "loopback_arm_transcript": "=== RTT probe (shape=no) ===\n5 packets transmitted, 5 received, 0% packet loss, time 826ms\nrtt min/avg/max/mdev = 0.047/0.053/0.058/0.004 ms\n=== XFER (shape=no, total=8388608 bytes) ===\nRECV_READY port=9099\nRECV_DONE bytes=8388608 expect=8388608 status=ok\nSEND_DONE bytes=8388608 elapsed_s=0.0017 mbit_per_s=38351.06 MB_per_s=4793.88\n"
       },
       {
         "nar_size_bytes_uncompressed_nar": 20971520,
         "shaped": {
           "link_label": "wan_shaped",
-          "rtt_ms": 48.179,
-          "throughput_mbit_per_s": 85.57,
-          "throughput_bytes_uncompressed_nar_per_s": 10696250.0,
+          "rtt_ms": 48.125,
+          "throughput_mbit_per_s": 85.58,
+          "throughput_bytes_uncompressed_nar_per_s": 10697500.0,
           "delivered_bytes_uncompressed_nar": 20971520,
           "shaping_asserted": true,
           "shaping_error": null
         },
         "loopback_control": {
           "link_label": "loopback",
-          "rtt_ms": 0.046,
-          "throughput_mbit_per_s": 48607.93,
-          "throughput_bytes_uncompressed_nar_per_s": 6075991250.0,
+          "rtt_ms": 0.057,
+          "throughput_mbit_per_s": 72393.15,
+          "throughput_bytes_uncompressed_nar_per_s": 9049143750.0,
           "delivered_bytes_uncompressed_nar": 20971520,
           "wan_label_refused": true
         },
-        "shaped_arm_transcript": "=== RTT probe (shape=yes) ===\n5 packets transmitted, 5 received, 0% packet loss, time 802ms\nrtt min/avg/max/mdev = 40.077/48.179/80.159/15.990 ms\n=== XFER (shape=yes, total=20971520 bytes) ===\nRECV_READY port=9099\nRECV_DONE bytes=20971520 expect=20971520 status=ok\nSEND_DONE bytes=20971520 elapsed_s=1.9607 mbit_per_s=85.57 MB_per_s=10.70\n",
-        "loopback_arm_transcript": "=== RTT probe (shape=no) ===\n5 packets transmitted, 5 received, 0% packet loss, time 828ms\nrtt min/avg/max/mdev = 0.037/0.046/0.053/0.005 ms\n=== XFER (shape=no, total=20971520 bytes) ===\nRECV_READY port=9099\nSEND_DONE bytes=20971520 elapsed_s=0.0035 mbit_per_s=48607.93 MB_per_s=6075.99\nRECV_DONE bytes=20971520 expect=20971520 status=ok\n"
+        "shaped_arm_transcript": "=== RTT probe (shape=yes) ===\n5 packets transmitted, 5 received, 0% packet loss, time 802ms\nrtt min/avg/max/mdev = 40.079/48.125/80.118/15.996 ms\n=== XFER (shape=yes, total=20971520 bytes) ===\nRECV_READY port=9099\nRECV_DONE bytes=20971520 expect=20971520 status=ok\nSEND_DONE bytes=20971520 elapsed_s=1.9605 mbit_per_s=85.58 MB_per_s=10.70\n",
+        "loopback_arm_transcript": "=== RTT probe (shape=no) ===\n5 packets transmitted, 5 received, 0% packet loss, time 829ms\nrtt min/avg/max/mdev = 0.049/0.057/0.067/0.006 ms\n=== XFER (shape=no, total=20971520 bytes) ===\nRECV_READY port=9099\nSEND_DONE bytes=20971520 elapsed_s=0.0023 mbit_per_s=72393.15 MB_per_s=9049.14\nRECV_DONE bytes=20971520 expect=20971520 status=ok\n"
       },
       {
         "nar_size_bytes_uncompressed_nar": 41943040,
         "shaped": {
           "link_label": "wan_shaped",
-          "rtt_ms": 48.14,
-          "throughput_mbit_per_s": 90.33,
-          "throughput_bytes_uncompressed_nar_per_s": 11291250.0,
+          "rtt_ms": 48.206,
+          "throughput_mbit_per_s": 90.32,
+          "throughput_bytes_uncompressed_nar_per_s": 11290000.0,
           "delivered_bytes_uncompressed_nar": 41943040,
           "shaping_asserted": true,
           "shaping_error": null
         },
         "loopback_control": {
           "link_label": "loopback",
-          "rtt_ms": 0.064,
-          "throughput_mbit_per_s": 57911.64,
-          "throughput_bytes_uncompressed_nar_per_s": 7238955000.0,
+          "rtt_ms": 0.05,
+          "throughput_mbit_per_s": 61641.87,
+          "throughput_bytes_uncompressed_nar_per_s": 7705233750.0,
           "delivered_bytes_uncompressed_nar": 41943040,
           "wan_label_refused": true
         },
-        "shaped_arm_transcript": "=== RTT probe (shape=yes) ===\n5 packets transmitted, 5 received, 0% packet loss, time 801ms\nrtt min/avg/max/mdev = 40.086/48.140/80.326/16.092 ms\n=== XFER (shape=yes, total=41943040 bytes) ===\nRECV_READY port=9099\nRECV_DONE bytes=41943040 expect=41943040 status=ok\nSEND_DONE bytes=41943040 elapsed_s=3.7147 mbit_per_s=90.33 MB_per_s=11.29\n",
-        "loopback_arm_transcript": "=== RTT probe (shape=no) ===\n5 packets transmitted, 5 received, 0% packet loss, time 826ms\nrtt min/avg/max/mdev = 0.048/0.064/0.108/0.022 ms\n=== XFER (shape=no, total=41943040 bytes) ===\nRECV_READY port=9099\nRECV_DONE bytes=41943040 expect=41943040 status=ok\nSEND_DONE bytes=41943040 elapsed_s=0.0058 mbit_per_s=57911.64 MB_per_s=7238.95\n"
+        "shaped_arm_transcript": "=== RTT probe (shape=yes) ===\n5 packets transmitted, 5 received, 0% packet loss, time 802ms\nrtt min/avg/max/mdev = 40.100/48.206/80.116/15.955 ms\n=== XFER (shape=yes, total=41943040 bytes) ===\nRECV_READY port=9099\nRECV_DONE bytes=41943040 expect=41943040 status=ok\nSEND_DONE bytes=41943040 elapsed_s=3.7149 mbit_per_s=90.32 MB_per_s=11.29\n",
+        "loopback_arm_transcript": "=== RTT probe (shape=no) ===\n5 packets transmitted, 5 received, 0% packet loss, time 825ms\nrtt min/avg/max/mdev = 0.034/0.050/0.066/0.011 ms\n=== XFER (shape=no, total=41943040 bytes) ===\nRECV_READY port=9099\nSEND_DONE bytes=41943040 elapsed_s=0.0054 mbit_per_s=61641.87 MB_per_s=7705.23\nRECV_DONE bytes=41943040 expect=41943040 status=ok\n"
       }
     ],
     "note": "raw TCP over an emulated link; NOT the real libp2p transport (that is task-198's deferred scope). Peer bytes here are RAW NAR bytes."
@@ -2439,7 +2439,13 @@
         "peer_bandwidth_bytes_uncompressed_nar_per_s": 5242880,
         "cdn_latency_s": 0.05,
         "discovery_latency_s": 1.0,
-        "assumed_not_measured_here": true
+        "assumed_not_measured_here": true,
+        "input_measured_or_assumed": {
+          "upstream_bandwidth": "assumed",
+          "peer_bandwidth": "assumed",
+          "cdn_latency_s": "assumed",
+          "discovery_latency_s": "assumed"
+        }
       },
       "per_byte_saving_s_per_nar_byte": -1.7595005634783784e-07,
       "latency_premium_s": 0.95,
@@ -2454,7 +2460,7 @@
         "cdn_latency_s": "ASSUMED (illustrative)",
         "discovery_latency_s": "ASSUMED (illustrative)",
         "peer_bandwidth": "ASSUMED (illustrative)",
-        "units": "all bandwidths are bytes/s of MiB/s constants (1024**2)"
+        "units": "assumed upstream/peer bandwidths are binary MiB/s constants (x1024**2 -> B/s); peer bandwidth is a binary MiB/s constant (x1024**2 -> B/s)"
       }
     },
     {
@@ -2464,7 +2470,13 @@
         "peer_bandwidth_bytes_uncompressed_nar_per_s": 131072000,
         "cdn_latency_s": 0.05,
         "discovery_latency_s": 0.2,
-        "assumed_not_measured_here": true
+        "assumed_not_measured_here": true,
+        "input_measured_or_assumed": {
+          "upstream_bandwidth": "assumed",
+          "peer_bandwidth": "assumed",
+          "cdn_latency_s": "assumed",
+          "discovery_latency_s": "assumed"
+        }
       },
       "per_byte_saving_s_per_nar_byte": 7.155412402162173e-09,
       "latency_premium_s": 0.15000000000000002,
@@ -2479,19 +2491,25 @@
         "cdn_latency_s": "ASSUMED (illustrative)",
         "discovery_latency_s": "ASSUMED (illustrative)",
         "peer_bandwidth": "ASSUMED (illustrative)",
-        "units": "all bandwidths are bytes/s of MiB/s constants (1024**2)"
+        "units": "assumed upstream/peer bandwidths are binary MiB/s constants (x1024**2 -> B/s); peer bandwidth is a binary MiB/s constant (x1024**2 -> B/s)"
       }
     },
     {
       "inputs": {
         "ratio_file_over_nar": 0.3255628680152017,
         "upstream_bandwidth_bytes_compressed_wire_per_s": 22020096,
-        "peer_bandwidth_bytes_uncompressed_nar_per_s": 11291250.0,
+        "peer_bandwidth_bytes_uncompressed_nar_per_s": 11290000.0,
         "cdn_latency_s": 0.05,
         "discovery_latency_s": 1.0,
-        "assumed_not_measured_here": false
+        "assumed_not_measured_here": true,
+        "input_measured_or_assumed": {
+          "upstream_bandwidth": "assumed",
+          "peer_bandwidth": "measured",
+          "cdn_latency_s": "assumed",
+          "discovery_latency_s": "assumed"
+        }
       },
-      "per_byte_saving_s_per_nar_byte": -7.377934672539442e-08,
+      "per_byte_saving_s_per_nar_byte": -7.378915232256657e-08,
       "latency_premium_s": 0.95,
       "peer_bandwidth_needed_to_break_even_bytes_uncompressed_nar_per_s": 67637000.909366,
       "verdict": "NO SIZE THRESHOLD EXISTS",
@@ -2504,7 +2522,7 @@
         "cdn_latency_s": "ASSUMED (illustrative)",
         "discovery_latency_s": "ASSUMED (illustrative)",
         "peer_bandwidth": "MEASURED (this run's shaped arm, raw NAR bytes/s)",
-        "units": "all bandwidths are bytes/s of MiB/s constants (1024**2)"
+        "units": "assumed upstream/peer bandwidths are binary MiB/s constants (x1024**2 -> B/s); measured peer bandwidth is derived from the shaped arm's decimal Mbit/s (x1e6/8 -> B/s)"
       }
     }
   ]

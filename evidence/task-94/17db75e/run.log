@@ -1,2 +1,0 @@
-[peer_wire_baseline] sample: 220 admitted (signed+compressed) paths, aggregate FileSize/NarSize=0.3256 (peer moves 3.07x), excluded: 2 uncompressed / 0 unknown-codec / 0 unsigned
-[peer_wire_baseline] wrote /tmp/claude-1000/-home-mpedersen-topics-nix-decentralized-cache/eefa311f-89e2-4fdd-ace9-d1057c734fef/scratchpad/sample.json
