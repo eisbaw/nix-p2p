@@ -743,6 +743,40 @@ enum Pending {
     },
 }
 
+impl Pending {
+    /// True when the caller awaiting this query's result has DROPPED its receiver, so the
+    /// terminal reply would go nowhere. This is how the worker detects an ABANDONED query
+    /// (TASK-154 B3). The load-bearing case: a caller dropped in the BUFFERED-ID WINDOW - after
+    /// the worker `id_reply.send(id)` succeeds but BEFORE the caller polls `id_rx` and arms its
+    /// [`CancelOnDrop`] - leaves a `Pending` here with NO cancel signal wired. The `id`-arm race
+    /// (`id_reply.send` failing) does not cover it because the send SUCCEEDED into a buffered
+    /// channel. Observing the closed reply (on the next kad event or the periodic sweep) lets the
+    /// worker cancel the walk instead of running it to its full `kad_query_timeout`.
+    ///
+    /// A normally-waiting caller holds its receiver, so this is `false` until the reply is sent
+    /// or the caller genuinely goes away - a healthy query is never reaped.
+    fn reply_is_closed(&self) -> bool {
+        match self {
+            Pending::Simple(reply) | Pending::Bootstrap(reply) => reply.is_closed(),
+            Pending::GetProviders { reply, .. } => reply.is_closed(),
+            Pending::GetRecord { reply } => reply.is_closed(),
+            Pending::GetClosestPeers { reply, .. } => reply.is_closed(),
+        }
+    }
+}
+
+/// The [`kad::QueryId`]s in `pending` whose caller has ABANDONED the query (dropped its
+/// receiver). Pure SELECTION, split from the swarm-touching cancel ([`Worker::cancel_query`]) so
+/// the abandoned-query reap can be unit-proven network-free (TASK-154 B3): the worker feeds the
+/// result to `cancel_query`, which finishes the kad walk and drops the entry.
+fn abandoned_query_ids(pending: &HashMap<kad::QueryId, Pending>) -> Vec<kad::QueryId> {
+    pending
+        .iter()
+        .filter(|(_, p)| p.reply_is_closed())
+        .map(|(id, _)| *id)
+        .collect()
+}
+
 /// The worker: owns the swarm, drives it, and matches kad query terminals back to the
 /// oneshot the command carried. The NAR byte transfer is NOT here (TASK-157): it runs on
 /// the accept loop + per-stream tasks through the [`libp2p_stream::Control`], off this loop.
@@ -759,6 +793,14 @@ struct Worker {
 
 impl Worker {
     async fn run(mut self) {
+        // TASK-154 B3: periodic abandoned-query sweep. The eager reap at the top of `on_query`
+        // cancels a query the instant its NEXT event arrives, but a query abandoned in the
+        // buffered-id window that then emits NO further event (a stalled walk) would still sit
+        // until `kad_query_timeout`. This tick bounds that residual to at most one interval.
+        // First tick fires immediately (a no-op on an empty pending map); `Delay` avoids a
+        // catch-up burst if the loop was busy.
+        let mut sweep = tokio::time::interval(ABANDONED_QUERY_SWEEP_INTERVAL);
+        sweep.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
             tokio::select! {
                 command = self.commands.recv() => match command {
@@ -774,8 +816,26 @@ impl Worker {
                 // command branch above also closes and ends the loop - so a `None` here is a
                 // harmless no-op, not a busy spin.
                 Some(id) = self.cancels.recv() => self.cancel_query(id),
+                // TASK-154 B3: reap any query whose caller went away in the buffered-id window
+                // (no CancelOnDrop armed) even if it never emits another event.
+                _ = sweep.tick() => self.reap_abandoned(),
                 event = self.swarm.select_next_some() => self.on_event(event),
             }
+        }
+    }
+
+    /// Cancel every abandoned in-flight query (TASK-154 B3): any [`Pending`] whose caller dropped
+    /// its receiver. Runs on the periodic sweep so a query abandoned in the buffered-id window is
+    /// reaped even if it emits no further kad event. The selection is the pure
+    /// [`abandoned_query_ids`]; the effect is [`Worker::cancel_query`] (finish the walk + drop the
+    /// entry), which is idempotent and panic-free on an already-terminated id.
+    fn reap_abandoned(&mut self) {
+        for id in abandoned_query_ids(&self.pending) {
+            tracing::debug!(
+                ?id,
+                "fabric-libp2p: reaping abandoned kad query (caller dropped)"
+            );
+            self.cancel_query(id);
         }
     }
 
@@ -1018,6 +1078,16 @@ impl Worker {
             AddProviderOk, GetClosestPeersError, GetClosestPeersOk, GetProvidersOk, GetRecordOk,
             PutRecordOk, QueryResult,
         };
+        // TASK-154 B3: eager abandoned-query reap. If the caller dropped its receiver after the
+        // worker buffered the QueryId but before it armed CancelOnDrop, no cancel signal exists;
+        // this query's next event observes the closed reply. Cancel the walk and drop the entry
+        // NOW rather than run it to `kad_query_timeout` (the periodic sweep is the backstop for a
+        // query that emits no further event). Closes the buffered-id window regardless of id-arm
+        // timing.
+        if self.pending.get(&id).is_some_and(Pending::reply_is_closed) {
+            self.cancel_query(id);
+            return;
+        }
         match result {
             QueryResult::StartProviding(res) => {
                 if let Some(Pending::Simple(reply)) = self.pending.remove(&id) {
@@ -1196,6 +1266,14 @@ async fn run_accept_loop(mut incoming: IncomingStreams, serve_slot: ServeSlot) {
 /// configurable rather than a bigger magic number.
 pub const DEFAULT_KAD_QUERY_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// How often the worker sweeps for abandoned queries (TASK-154 B3). The eager reap at the top of
+/// [`Worker::on_query`] cancels a query the instant its next event arrives; this periodic sweep
+/// is the backstop that bounds the reap latency for a query abandoned in the buffered-id window
+/// that then emits NO further event (a stalled walk) to at most this interval - far under
+/// [`DEFAULT_KAD_QUERY_TIMEOUT`], so an abandoned query no longer costs a full query_timeout of
+/// wasted work. Integer `Duration` (no-float rule).
+const ABANDONED_QUERY_SWEEP_INTERVAL: Duration = Duration::from_secs(1);
+
 // ---------------------------------------------------------------------------------------
 // Circuit-v2 relay SERVER bounds (TASK-208).
 //
@@ -1313,7 +1391,9 @@ pub const DEFAULT_RELAY_SERVER_ENABLED: bool = true;
 //     so TOTAL store memory is larger than 8 MiB by those addends. Every one of those addends
 //     is ALSO independently bounded (see below), so total store memory stays hard-bounded -
 //     just not AT 8 MiB. Do not read ~8 MiB as the whole-store figure; it is the value-payload
-//     component, the dominant and most attacker-controllable one.
+//     component, the most DIRECTLY attacker-controllable one (a peer sets the value bytes
+//     directly), NOT necessarily the largest component - the provider/address store's byte size
+//     is not quantified here (see the AMPLIFICATION note), so no ordering between them is claimed.
 //   * PROVIDERS-PER-KEY is the DIRECT sybil-flood cap libp2p itself documents ("if the
 //     providers list is full, we ignore the new provider ... can mitigate Sybil attacks"). We
 //     pin it EXPLICITLY at the kad replication factor 20 (k) so the anti-sybil intent is a
@@ -1338,11 +1418,17 @@ pub const DEFAULT_RELAY_SERVER_ENABLED: bool = true;
 //     stop a poisoning FLOOD from costing unbounded memory.
 //   * AMPLIFICATION (junk parked to inflate our memory/serve cost). `STORE_MAX_VALUE_BYTES`
 //     (per record) and `STORE_MAX_RECORDS` (count) hard-bound the value-PAYLOAD memory (~8 MiB
-//     worst case - values only; keys/maps/provider records add a separately-bounded, smaller
-//     addend, so total store memory is larger but still hard-bounded, never unbounded). The
-//     consumer fan-out cap (`DiscoveryBudget.max_peers`, directory.rs) bounds how many
-//     providers ONE lookup chases, so a flooded index cannot turn a lookup into one round trip
-//     per forged provider. These bound COST; they do not stop a peer from TRYING.
+//     worst case - values ONLY). The provider/address store is a SEPARATE structure bounded by
+//     its OWN caps: at most `STORE_MAX_PROVIDERS_PER_KEY` * `STORE_MAX_PROVIDED_KEYS`
+//     (20 * 1024 = 20480) provider records, each itself size-limited by libp2p's internal
+//     per-record address-list cap. That bounds its record COUNT; we do NOT quantify its BYTE
+//     size here (a provider record's bytes derive from libp2p's address cap, not one of OUR
+//     frozen value caps) and make NO claim it is "smaller" than the value payload - only that it
+//     is separately and independently bounded, never unbounded. Likewise the record keys and the
+//     store's index maps grow only with the (bounded) record/key counts. The consumer fan-out
+//     cap (`DiscoveryBudget.max_peers`, directory.rs) bounds how many providers ONE lookup
+//     chases, so a flooded index cannot turn a lookup into one round trip per forged provider.
+//     These bound COST; they do not stop a peer from TRYING.
 //   * SYBIL (many fake identities flooding one key). `STORE_MAX_PROVIDERS_PER_KEY` caps how
 //     many providers we store per key (libp2p's own documented Sybil mitigation), so a
 //     flood cannot evict a legitimate provider past the cap. This RAISES the cost of a
@@ -1364,8 +1450,10 @@ pub const DEFAULT_RELAY_SERVER_ENABLED: bool = true;
 /// Max distinct value-store records this node holds for OTHER peers' keys (it is k-closest
 /// to). 4096, vs the library default 1024: real-network headroom, still hard-bounded. With
 /// [`STORE_MAX_VALUE_BYTES`] this caps the worst-case VALUE-PAYLOAD memory at ~8 MiB (4096 * 2
-/// KiB) - the record values only; keys, index maps and provider/address records add a
-/// separately-bounded addend, so total store memory is larger but still hard-bounded.
+/// KiB) - the record values ONLY. Keys, index maps and the provider/address store are separate
+/// structures, each independently bounded by its own cap (the provider store by
+/// [`STORE_MAX_PROVIDERS_PER_KEY`] * [`STORE_MAX_PROVIDED_KEYS`] records); total store memory is
+/// larger than 8 MiB but still hard-bounded, and no per-structure byte figure is claimed here.
 pub const STORE_MAX_RECORDS: usize = 4096;
 
 /// Hard per-value byte ceiling for the kad value store. 2 KiB (`2 * 1024`): strictly ABOVE
@@ -1926,6 +2014,134 @@ mod tests {
             empty.query_mut(&live).is_none(),
             "an unknown/terminated id must not resolve - cancel is a safe no-op"
         );
+    }
+
+    #[test]
+    fn reply_is_closed_tracks_caller_abandonment_across_every_variant() {
+        // The reap primitive (TASK-154 B3): reply_is_closed() is true IFF the caller dropped its
+        // receiver, for EVERY Pending variant - so a future variant added without wiring here is
+        // caught. A dropped rx => the caller is gone (reap); a held rx => a normally-waiting
+        // caller (never reap).
+        let dropped_simple = {
+            let (tx, rx) = oneshot::channel::<Result<(), String>>();
+            drop(rx);
+            tx
+        };
+        assert!(Pending::Simple(dropped_simple).reply_is_closed());
+        let (held_simple, _rx) = oneshot::channel::<Result<(), String>>();
+        assert!(!Pending::Simple(held_simple).reply_is_closed());
+
+        let dropped_boot = {
+            let (tx, rx) = oneshot::channel::<Result<(), String>>();
+            drop(rx);
+            tx
+        };
+        assert!(Pending::Bootstrap(dropped_boot).reply_is_closed());
+
+        let dropped_get_providers = {
+            let (tx, rx) = oneshot::channel::<Result<ProviderFanOut, QueryFail>>();
+            drop(rx);
+            tx
+        };
+        assert!(
+            Pending::GetProviders {
+                found: BTreeSet::new(),
+                max_peers: 16,
+                truncated: false,
+                reply: dropped_get_providers,
+            }
+            .reply_is_closed()
+        );
+        let (held_get_providers, _rx2) = oneshot::channel::<Result<ProviderFanOut, QueryFail>>();
+        assert!(
+            !Pending::GetProviders {
+                found: BTreeSet::new(),
+                max_peers: 16,
+                truncated: false,
+                reply: held_get_providers,
+            }
+            .reply_is_closed()
+        );
+
+        let dropped_get_record = {
+            let (tx, rx) = oneshot::channel::<Result<Option<Vec<u8>>, QueryFail>>();
+            drop(rx);
+            tx
+        };
+        assert!(
+            Pending::GetRecord {
+                reply: dropped_get_record
+            }
+            .reply_is_closed()
+        );
+
+        let dropped_closest = {
+            let (tx, rx) = oneshot::channel::<Result<(Vec<Multiaddr>, QueryReach), QueryFail>>();
+            drop(rx);
+            tx
+        };
+        assert!(
+            Pending::GetClosestPeers {
+                target: PeerId::random(),
+                reply: dropped_closest,
+            }
+            .reply_is_closed()
+        );
+    }
+
+    #[test]
+    fn abandoned_query_in_the_buffered_id_window_is_selected_for_reaping_not_the_live_one() {
+        // TASK-154 B3 - the residual codex flagged: after `id_reply.send(id)` SUCCEEDS the id can
+        // sit BUFFERED while the caller is dropped BEFORE it polls `id_rx` and arms CancelOnDrop.
+        // The worker then holds a Pending with NO cancel signal, and the id-arm race (send
+        // failing) does NOT fire because the send succeeded. The close of the abandoned window is
+        // the worker detecting the dropped RECEIVER on the reply channel and reaping. Prove the
+        // SELECTION network-free: an abandoned Pending (receiver dropped) is chosen; a live one
+        // (receiver held) is left running. Revert the reap and this returns an empty/at-most-live
+        // set. Real QueryIds without a swarm via `bare_kad`.
+        let mut kad = bare_kad();
+        let abandoned_id = kad.get_providers(kad::RecordKey::new(&b"gone".to_vec()));
+        let live_id = kad.get_providers(kad::RecordKey::new(&b"here".to_vec()));
+
+        let mut pending: HashMap<kad::QueryId, Pending> = HashMap::new();
+
+        // Abandoned: the caller dropped its receiver in the buffered-id window.
+        let (abandoned_reply, abandoned_rx) =
+            oneshot::channel::<Result<ProviderFanOut, QueryFail>>();
+        drop(abandoned_rx);
+        pending.insert(
+            abandoned_id,
+            Pending::GetProviders {
+                found: BTreeSet::new(),
+                max_peers: 16,
+                truncated: false,
+                reply: abandoned_reply,
+            },
+        );
+
+        // Live: the caller still awaits (rx HELD open) - must NOT be reaped.
+        let (live_reply, _live_rx) = oneshot::channel::<Result<ProviderFanOut, QueryFail>>();
+        pending.insert(
+            live_id,
+            Pending::GetProviders {
+                found: BTreeSet::new(),
+                max_peers: 16,
+                truncated: false,
+                reply: live_reply,
+            },
+        );
+
+        let reap = abandoned_query_ids(&pending);
+        assert_eq!(
+            reap,
+            vec![abandoned_id],
+            "only the abandoned (caller-dropped) query is reaped; a live waiting caller's query \
+             is left running untouched"
+        );
+
+        // The reap ACTION (cancel_query) on the selected id is idempotent + panic-free even for a
+        // query that already terminated - proven separately by
+        // `cancel_arm_finishing_a_live_and_unknown_query_never_panics`.
     }
 
     // ============ TASK-154 B1: bounded, deterministic provider fan-out aggregation ============
