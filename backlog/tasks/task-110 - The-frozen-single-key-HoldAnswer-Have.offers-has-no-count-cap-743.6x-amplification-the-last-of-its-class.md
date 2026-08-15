@@ -7,7 +7,7 @@ status: In Progress
 assignee:
   - '@me'
 created_date: '2026-08-10 17:11'
-updated_date: '2026-08-15 19:36'
+updated_date: '2026-08-15 19:56'
 labels:
   - irreversible
 dependencies:
@@ -64,4 +64,11 @@ PROGRESS (gate in flight):
 - GATES so far GREEN: cargo test -p daemon-core -p daemon = 431 passed / 0 failed; cargo fmt --all --check; cargo clippy --locked --workspace + daemon evidence-fixture -D warnings; check-independence/shaping/no-floats; check-golden-vectors path (golden test). just e2e RUNNING.
 - GOTCHA (not mine): just lint fails only at ruff format --check on 3 UNTOUCHED scripts (check-discovery-no-shortcut.py, shaped_compress.py, task203_pipelined_measure.py), byte-identical to HEAD -> pre-existing drift, filed TASK-222. Not included in this commit.
 - SEAM SAFETY: availability serve path emits exactly one iroh offer per key (availability.rs ~1257), so encode_hold_response never rejects a legitimate produced answer.
+
+REVIEW GATE (qa-test-runner + mped-architect, run in parallel):
+- BOTH GO on the bound MECHANISM: enumeration fully closed, no decode bypass (HoldResponse/HoldAnswer non-Deserialize + not_deserialize coherence; only caller is discovery.rs:686 via decode_hold_response; peer-fabric HoldAnswer is a DISTINCT type), no emit-set drift (serve path emits one iroh offer), AC#5 ordering correct, no floats.
+- BOTH NO-GO on the recorded amplification CLAIM (HIGH). Proven by execution: the one-per-kind + count-4 rule bounds SLOTS not BYTES. An unknown-kind offer is an opaque Value slot (byte-unbounded body); a single-key Have with as few as ONE ~60 KB padded unknown offer decodes OK -> ~744x, ~unchanged from the 743.6x before, and identical to the batch path. My 743.6x -> 3.75x after-number was the LEGITIMATE known-only case mislabeled as the worst case (apples-to-oranges; the unit-label != valid-derivation trap).
+- CORRECTED (commit follows): the three claim sites + PRD + golden note now state the honest residual (COUNT/enumeration closed; BYTE ceiling remains the 64 KiB frame). Added honesty oracle a_padded_unknown_kind_have_still_saturates_the_frame_and_decodes_empty (padded unknown Have decodes to EMPTY offers at >600x wire cost). Filed TASK-223 (deferred per-offer byte cap; mped advised honest wording over a byte cap for THIS task because a future transport locator may be large) and referenced it in code.
+- Reviewer cruft (scratch amp probes in daemon-core/tests) already removed by both agents; tree clean, verified.
+- HONEST AC#2 numbers: BEFORE 743.6x (622 bittorrent offers, 65,440 B / 88 B) + 621 unnamed content identities. AFTER: enumeration = 0 unnamed identities (at most one per transport kind); legitimate known-only answer = 330 B = 15/4 = 3.75x; hostile byte worst case ~744x (unchanged, = batch residual, bounded by 64 KiB frame; closing it = TASK-223).
 <!-- SECTION:NOTES:END -->
