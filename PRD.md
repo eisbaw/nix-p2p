@@ -817,12 +817,18 @@ TASK-120 prerequisite. For every supported arm/profile:
   caches and transient allocations are not mislabeled as content. TASK-91's
   batch contract admits at most **256 named keys**, **512 dictionary offers**,
   **4 offers per positive answer** with at most one per transport kind, and a
-  **64 KiB encoded-message** gate. TASK-110 extends the same semantic bound to
-  the frozen single-key path — a single-key `Have` now carries at most **4
+  **64 KiB encoded-message** gate. TASK-110 extends the same semantic COUNT bound
+  to the frozen single-key path — a single-key `Have` now carries at most **4
   offers with one per transport kind**, applied on encode and decode against the
-  raw pre-drop offer list — cutting its worst case from **743.6×** (622 offers,
-  65,440 B against an 88 B query) to **3.75×** (330 B), so the single-key
-  hold-query cell is now supported for training.
+  raw pre-drop offer list. This closes the single-key **enumeration/content-count
+  vector** (622 offers naming 621 unasked content identities → at most one content
+  identity per transport kind; a legitimate known-only answer is **330 B, 3.75×**).
+  It does **not** change the worst-case **byte** amplification: an unknown-kind
+  offer body is byte-unbounded, so a hostile single-key `Have` can still pad to the
+  **64 KiB** frame (~**744×**), exactly as before TASK-110 and exactly as the batch
+  path — the frame gate remains the only byte bound. A per-offer byte cap is
+  deferred (TASK-223, forward-compat tension). The single-key hold-query cell is
+  supported for training on the same terms as the batch path.
 - **Privacy:** `upstream_only` emits zero P2P publication/query/serve records;
   `consume_only` emits zero publication and serve records and reports each
   opted-in lookup recipient/exposure; `lan_share` emits zero packets/records to
@@ -843,8 +849,11 @@ training, not values this document may guess:
 - TASK-104 must freeze bounded responder work for a 256-key batch.
 - TASK-106 must freeze a total discovery deadline and concurrency bound rather
   than relying on a per-probe timeout.
-- TASK-110 **(closed)** bounded the single-key offer amplification with the same
-  one-offer-per-transport-kind semantic rule as the batch path (743.6× → 3.75×).
+- TASK-110 **(closed)** bounded the single-key offer COUNT with the same
+  one-offer-per-transport-kind semantic rule as the batch path, closing the
+  enumeration/content-count vector (legitimate answer 330 B, 3.75×). The
+  worst-case BYTE amplification is unchanged (still the 64 KiB frame, ~744× via
+  unknown-kind padding, same as the batch path); a per-offer byte cap is TASK-223.
 - TASK-120 must freeze a hashed, typed, **complete and owner-reviewed** budget
   artifact for every profile with numeric upload bytes/rate, concurrent serves,
   transient RAM, metadata/disk, fd, discovery work/traffic/deadline and

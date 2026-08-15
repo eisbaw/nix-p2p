@@ -551,9 +551,20 @@ pub struct HoldQuery {
 /// identity per transport kind, so a legitimate `Have` needs at most one offer
 /// per kind. That bound is ENFORCED at both wire boundaries by
 /// [`check_single_offer_bindings`] (at most [`MAX_OFFERS_PER_ANSWER`], one per
-/// kind), against the RAW pre-drop offer list so unknown-kind PADDING is bounded
-/// too - see that function's doc for the freeze-amendment rationale. It is the
-/// single-key twin of the batch rule in [`check_batch_offer_bindings`].
+/// kind), against the RAW pre-drop offer list so unknown kinds are counted before
+/// they are dropped - see that function's doc for the freeze-amendment rationale
+/// and for what this does and does NOT bound. It is the single-key twin of the
+/// batch rule in [`check_batch_offer_bindings`].
+///
+/// WHAT THIS BOUNDS, PRECISELY: the offer COUNT (at most 4 slots, one per kind)
+/// and thus the number of CONTENT IDENTITIES a `Have` can name - the enumeration
+/// vector. It does NOT bound the message BYTES: an unknown-kind offer is kept as
+/// a `serde_json::Value` slot whose body is byte-unbounded, so a hostile peer can
+/// still pad a single-key `Have` up to [`MAX_CLAIM_WIRE_BYTES`] (64 KiB) with as
+/// few as one dropped unknown offer. That byte ceiling is the pre-existing frame
+/// gate, identical before and after this amendment and identical to the batch
+/// path; a per-offer byte cap is deliberately deferred (TASK-223) because a
+/// future transport's legitimate locator may itself be large.
 ///
 /// NOTE THE MISSING `Deserialize` (same reason as [`BatchHoldResponse`]): the
 /// bound is only a bound if the validator is the ONLY path from bytes. Unknown
@@ -597,9 +608,13 @@ pub struct HoldResponse {
 /// differs from [`HoldResponse`] in one way: a `Have`'s offer list keeps a SLOT
 /// for every element the peer sent, an unknown transport kind decoding to an
 /// [`OfferSlot::Unknown`] rather than vanishing. Keeping the slot is what lets the
-/// one-per-kind + count bound COUNT unknown kinds - so a peer cannot pad a
-/// one-key answer to 64 KiB with offers this build would silently drop - while
-/// still dropping them from the value a caller sees (forward compatibility).
+/// one-per-kind + count bound COUNT unknown kinds against the same cap as known
+/// ones - so the number of offers (and thus content identities) is bounded even
+/// when they would be dropped - while still dropping them from the value a caller
+/// sees (forward compatibility). This bounds the offer COUNT, not the message
+/// BYTES: an unknown offer's body is byte-unbounded and a peer can still pad a
+/// one-key answer up to [`MAX_CLAIM_WIRE_BYTES`] - see [`HoldAnswer`] and
+/// [`check_single_offer_bindings`] for what is and is not closed.
 #[derive(Deserialize)]
 struct HoldResponseWire {
     schema_version: u16,
@@ -1105,16 +1120,35 @@ fn compact_offer_slots(
 ///      inertly (dropped by [`keep_known_offers`] after being counted), so a
 ///      future transport still ships without a wire break - proven by
 ///      `a_single_key_have_still_drops_unknown_transports_inertly`. Only the
-///      COUNT is refused, which is exactly the amplification/enumeration surface.
+///      COUNT is refused, which is exactly the enumeration surface.
 ///   3. IT COSTS NOTHING WHILE NO PEERS ARE DEPLOYED. There is no released
 ///      network to break; the cost of tightening is zero today and rises
 ///      monotonically. Tightening later is a real break; tightening now is not.
-///   4. IT TIGHTENS A REAL AMPLIFICATION AND ENUMERATION VECTOR. Measured: 622
-///      `bittorrent` offers = 65 440 B against an 88 B query = 743.6x, and a
+///   4. IT CLOSES A REAL ENUMERATION VECTOR AND THE KNOWN-OFFER COUNT. Measured:
+///      622 `bittorrent` offers = 65 440 B against an 88 B query, and a
 ///      `bittorrent` infohash is a CONTENT identity, so those 622 offers name 621
 ///      content identities the asker never asked about. After the bound a one-key
-///      `Have` carries at most one offer per kind (iroh + bittorrent = 330 B =
-///      3.75x). Pinned by `a_single_key_have_cannot_amplify_past_one_per_kind`.
+///      `Have` carries at most one offer per transport kind, i.e. at most one
+///      content identity for the queried key; a legitimate known-only answer is
+///      iroh + bittorrent = 330 B (330/88 = 3.75x). Pinned by
+///      `a_single_key_have_cannot_amplify_past_one_per_kind`.
+///
+/// ## What this does NOT close, stated so the amendment is honest (task-110)
+///
+/// This is a COUNT bound, not a BYTE bound. An unknown-kind offer is retained as
+/// an opaque `serde_json::Value` slot (only its `transport` tag is read), so its
+/// body is byte-unbounded; a hostile peer can still pad a single-key `Have` up to
+/// [`MAX_CLAIM_WIRE_BYTES`] (64 KiB) with as few as one dropped unknown offer, for
+/// a worst-case wire amplification of ~744x that the count cap of 4 does not even
+/// engage. That byte ceiling is the pre-existing frame gate - identical before and
+/// after this amendment, and identical to the batch path, which has the same
+/// residual. So the "3.75x" figure is the LEGITIMATE (known-only) case, NOT the
+/// hostile worst case; do not read it as the latter. The residual is pinned by
+/// `a_padded_unknown_kind_have_still_saturates_the_frame_and_decodes_empty`. A
+/// per-offer byte cap would make the hostile case small too, but is DEFERRED
+/// (TASK-223): a future transport's legitimate locator may itself be large, so the
+/// cap needs its own forward-compat analysis and is out of this task's scope
+/// ("match the batch path's SEMANTIC rule", which is a count/kind rule).
 ///
 /// The accept-set narrowed; the emit-set did not (the golden `hold_response_*`
 /// encodings are byte-identical). An auditor finds this decision, not a slip.
@@ -1414,10 +1448,12 @@ pub fn encode_hold_response(response: &HoldResponse) -> Result<Vec<u8>, ClaimCod
 /// Size-, duplicate-key- and version-checked, and - task-110 - the `Have` offer
 /// list is BOUND: at most one offer per transport kind, at most
 /// [`MAX_OFFERS_PER_ANSWER`] in total ([`check_single_offer_bindings`]). The bound
-/// runs against the RAW, pre-drop offer slots (so unknown-kind padding is counted,
-/// not silently dropped under the bound) and BEFORE the value is handed back, so
-/// an over-cap response is REJECTED rather than trusted. Unknown transport kinds
-/// are then dropped ([`keep_known_offers`]), tolerated-but-inert as before.
+/// runs against the RAW, pre-drop offer slots (so unknown-kind slots are COUNTED
+/// against the cap, not silently dropped under it) and BEFORE the value is handed
+/// back, so an over-cap response is REJECTED rather than trusted. It bounds the
+/// offer COUNT, not the bytes - see [`check_single_offer_bindings`] for the
+/// residual. Unknown transport kinds are then dropped ([`keep_known_offers`]),
+/// tolerated-but-inert as before.
 pub fn decode_hold_response(bytes: &[u8]) -> Result<HoldResponse, ClaimCodecError> {
     check_size(bytes.len())?;
     reject_duplicate_keys(bytes)?;
@@ -2222,8 +2258,12 @@ mod tests {
             Err(ClaimCodecError::Malformed(_))
         ));
 
-        // AFTER: the largest SENDABLE one-key answer is one offer per known kind
-        // (iroh + bittorrent). Measured through the real encoder.
+        // AFTER (the LEGITIMATE case, NOT the hostile worst case): the largest
+        // SENDABLE known-only answer is one offer per known kind (iroh +
+        // bittorrent). Measured through the real encoder. The hostile worst case
+        // (unknown-kind byte padding, still ~744x) is a SEPARATE fact, pinned by
+        // `a_padded_unknown_kind_have_still_saturates_the_frame_and_decodes_empty`;
+        // this bound closes the ENUMERATION/count vector, not the byte ceiling.
         let after = HoldResponse {
             schema_version: QUERY_SCHEMA_VERSION,
             answer: HoldAnswer::Have {
@@ -2245,6 +2285,55 @@ mod tests {
         assert_eq!(
             decode_hold_response(&after_bytes).expect("decode after"),
             after
+        );
+    }
+
+    #[test]
+    fn a_padded_unknown_kind_have_still_saturates_the_frame_and_decodes_empty() {
+        // HONESTY ORACLE (task-110): the one-per-kind + count-4 rule is a COUNT
+        // bound, not a BYTE bound. An unknown-kind offer is kept as an opaque
+        // Value slot whose body is byte-unbounded, so a hostile peer can pad a
+        // single-key `Have` up to the frame gate with as few as ONE dropped
+        // unknown offer - the count cap of 4 never even engages. This pins that
+        // residual so the frozen record matches reality, not the aspirational
+        // "3.75x worst case" the amendment must NOT claim. What IS closed is the
+        // enumeration vector: the decoded offers are EMPTY (zero content
+        // identities), the unknown kind dropped inertly.
+        let query_len = 88usize; // the pinned single-key query size
+        let pad_len = 60_000; // one fat unknown offer, comfortably under the 64 KiB frame
+        let wire = format!(
+            "{{\"schema_version\":{QUERY_SCHEMA_VERSION},\"answer\":\"have\",\
+             \"blake3\":\"{BLAKE3_HEX}\",\"offers\":[\
+             {{\"transport\":\"future_bulk\",\"loc\":\"{}\"}}]}}",
+            "z".repeat(pad_len)
+        )
+        .into_bytes();
+        // It is a large fraction of the frame yet still under it, so ONLY a byte
+        // cap (which this task deliberately does not add) could reject it.
+        assert!(
+            wire.len() > MAX_CLAIM_WIRE_BYTES * 3 / 4 && wire.len() < MAX_CLAIM_WIRE_BYTES,
+            "the padded message must reach most of the frame but stay under it (len {})",
+            wire.len()
+        );
+        // The COUNT bound passes (one offer, one kind) and the message DECODES...
+        let decoded = decode_hold_response(&wire).expect("one padded unknown offer decodes");
+        // ...to an EMPTY offer set (the enumeration vector is closed), but at a
+        // wire cost that is still a large multiple of the query (byte residual
+        // OPEN, bounded only by the pre-existing frame gate). Magnitude, no float
+        // in the check: wire.len() > 600 * query_len (~680x here).
+        assert_eq!(
+            decoded.answer,
+            HoldAnswer::Have {
+                blake3: blake3_id(),
+                offers: vec![],
+            },
+            "the unknown kind is dropped: zero content identities survive"
+        );
+        assert!(
+            wire.len() > 600 * query_len,
+            "the byte amplification residual is still ~hundreds-x (len {} vs query {})",
+            wire.len(),
+            query_len
         );
     }
 
