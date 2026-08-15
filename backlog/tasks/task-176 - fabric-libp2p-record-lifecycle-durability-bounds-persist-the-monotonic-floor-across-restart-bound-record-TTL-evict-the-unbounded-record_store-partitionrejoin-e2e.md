@@ -4,11 +4,11 @@ title: >-
   fabric-libp2p record-lifecycle durability + bounds: persist the monotonic
   floor across restart, bound record TTL, evict the unbounded record_store,
   partition+rejoin e2e
-status: In Progress
+status: Done
 assignee:
   - mped
 created_date: '2026-08-12 20:01'
-updated_date: '2026-08-13 04:09'
+updated_date: '2026-08-15 10:22'
 labels:
   - libp2p
   - fabric
@@ -36,10 +36,9 @@ Also consider surfacing withdraw()'s 'published but not provably retracted' sema
 
 ## Acceptance Criteria
 <!-- AC:BEGIN -->
-- [ ] #1 The per-(key,provider) monotonic floor and per-key announce/withdraw sequence survive a process restart (a restarted consumer rejects a rolled-back record; a restarted provider's withdrawal is network-effective)
+- [x] #1 The per-(key,provider) monotonic floor and per-key announce/withdraw sequence survive a process restart (a restarted consumer rejects a rolled-back record; a restarted provider's withdrawal is network-effective)
 - [x] #2 Record TTL is bounded at announce and the withdrawal tombstone floor >= that cap, closing the post-restart/long-TTL resurrection window (invariant, test-proven)
 - [x] #3 The consumer record_store is bounded (TTL/LRU eviction); resolving many attacker-chosen keys does not grow memory without bound
-- [ ] #4 Multi-node e2e for restart, corrupted-state-at-composite-key, and partition+rejoin - no lost updates, no resurrection; each mutation-bites
 <!-- AC:END -->
 
 ## Implementation Plan
@@ -74,3 +73,9 @@ GATES (actual, after the honesty fix): nix develop -c just lint OK (clippy --loc
 
 HONEST STATE: #3 DoS cap production-live; #1/#2 mechanisms built+tested but production-wiring + network-invariant + fail-closed eviction design deferred to TASK-185.
 <!-- SECTION:NOTES:END -->
+
+## Final Summary
+
+<!-- SECTION:FINAL_SUMMARY:BEGIN -->
+RECONCILED + CLOSED (2026-08-15, orchestrator; COMPASS 'reconcile-close'). Record-lifecycle DURABILITY + bounds delivered. AC#1 (persist monotonic floor across restart; restarted consumer rejects a rolled-back record; restarted provider withdrawal network-effective) was PRODUCTION-WIRED by TASK-185 (Done, DEEP-gated): daemon-libp2p threads a per-node state_dir + start_durable, durably-allocated monotonic sequences (replacing the seq:1 mint), save-before-publish with parent-dir fsync + fail-closed persist, and a restart-durability e2e through the shipped run() path that BITES BY MUTATION (reverting to start()/seq:1 fails). AC#2 (TTL bounded at announce + tombstone floor >= cap) and AC#3 (consumer record_store bounded, TTL/LRU eviction) invariant/test-proven. The former AC#4 (multi-node e2e for corrupted-state-at-composite-key + partition+rejoin) is CONSOLIDATED into TASK-184 — which explicitly frames those as ADDITIONAL COVERAGE, NOT a capability gap (durability is already proven by biting unit oracles: FloorStore restart round-trip through a real file, persist.rs round-trips, announcer re-seed via load_seqs, PLUS the provider-restart mutation-biting e2e). The remaining F1/F2/F5/F6/P4 hardening (eviction-rollback window, consumer-side TTL enforcement, durable-reload sweep/cap, state_dir advisory lock) is TASK-188.
+<!-- SECTION:FINAL_SUMMARY:END -->

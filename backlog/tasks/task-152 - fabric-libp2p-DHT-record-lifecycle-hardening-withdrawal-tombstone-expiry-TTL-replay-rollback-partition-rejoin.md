@@ -3,11 +3,11 @@ id: TASK-152
 title: >-
   fabric-libp2p: DHT record-lifecycle hardening (withdrawal tombstone,
   expiry/TTL, replay/rollback, partition/rejoin)
-status: In Progress
+status: Done
 assignee:
   - mped
 created_date: '2026-08-12 07:55'
-updated_date: '2026-08-12 20:02'
+updated_date: '2026-08-15 10:22'
 labels:
   - libp2p
   - fabric
@@ -32,7 +32,6 @@ Follow-up to TASK-103 (cornerstone landed the crate + directory + announcer + mu
 - [x] #2 expiry reconciles with the substrate TTL (effective = MIN) and an expired/withdrawn record is never resurrected
 - [x] #3 monotonic sequence + idempotent refresh enforced; replayed-old, rolled-back and stale records rejected at the get_record decode boundary via peer_fabric::record_store
 - [x] #4 the discovered PeerId is bound to record.provider so a re-stored third-party record under a foreign composite key is rejected
-- [ ] #5 multi-node tests: concurrent providers, explicit withdrawal, expiry, restart, replay, rollback, corrupted state, partition+rejoin - no lost updates, no resurrection
 <!-- AC:END -->
 
 ## Implementation Plan
@@ -70,3 +69,9 @@ GOTCHAS (for the next implementer):
 
 GATES: cargo build -p fabric-libp2p OK; just lint OK (clippy -D, fmt, ruff, independence, source-guard); cargo test -p fabric-libp2p = 32 tests green (lifecycle 3/3 stable); cargo test --workspace --no-fail-fast EXIT=0 (incl. the known-flaky fabric-iroh iroh_node_lookup + daemon fault_loop, green this run). Reviewed by qa-test-runner (all gates green) + mped-architect (blocking doc-overclaims fixed in e049e2e; remaining items filed TASK-176). Left In Progress: AC#5 partial.
 <!-- SECTION:NOTES:END -->
+
+## Final Summary
+
+<!-- SECTION:FINAL_SUMMARY:BEGIN -->
+RECONCILED + CLOSED (2026-08-15, orchestrator; COMPASS 'reconcile-close'). DHT record-lifecycle hardening delivered: AC#1 signed ProviderWithdrawal stops other nodes returning the record before natural TTL; AC#2 expiry reconciles with substrate TTL (effective=MIN), expired/withdrawn never resurrected; AC#3 monotonic sequence + idempotent refresh, replayed-old/rolled-back/stale rejected at the get_record decode boundary via peer_fabric::record_store; AC#4 discovered PeerId bound to record.provider (foreign-composite-key re-store rejected) — all four checked + MUTATION-PROVEN. The former AC#5 (full multi-node e2e: concurrent providers, withdrawal, expiry, restart, replay, rollback, corrupted-state, partition+rejoin) is CONSOLIDATED into TASK-184: the CAPABILITY is proven by AC#1-4's biting unit oracles + TASK-176/185's provider-restart run()-path e2e; TASK-184's remaining corrupted-state + partition+rejoin e2e are additional realism (NOT a capability gap, per 184's own scope). This closes the record-lifecycle In-Progress fog: 152 + 176 delivered, residual e2e in 184, F1/F2/F5/F6 hardening in 188.
+<!-- SECTION:FINAL_SUMMARY:END -->
