@@ -129,10 +129,18 @@ fn envelope() -> SafetyEnvelope {
 }
 
 /// AC#1 (fabric level): a discovery-only consumer that knows the relay ONLY from bootstrap
-/// config RESOLVES the NAT'd provider's `/p2p-circuit` dial-address (no injection) and fetches
-/// the NAR byte-identical. THE BITE: the resolved `DialInfo` must carry a `/p2p-circuit`
-/// location - the pre-TASK-218 locator returns only the provider's direct address, so this
-/// assertion FAILS without the relay-circuit composition (RED), and passes with it (GREEN).
+/// config RESOLVES the NAT'd provider's `/p2p-circuit` dial-address (no injection). THE BITE:
+/// the resolved `DialInfo` must carry a `/p2p-circuit` location - the pre-TASK-218 locator
+/// returns only the provider's direct address, so this assertion FAILS without the
+/// relay-circuit composition (RED), and passes with it (GREEN).
+///
+/// SCOPE - this proves CONSTRUCTION + end-to-end DIALABILITY, NOT relay CARRIAGE. On loopback
+/// the provider's direct listen addr (which it must bind for the relay-client transport, and
+/// which kad propagates) is ALSO reachable, so the subsequent byte-identical fetch may traverse
+/// the direct connection - the fetch here proves the resolved DialInfo is dialable, not that the
+/// bytes went THROUGH the relay. Relay CARRIAGE is proven separately: at the fabric API level in
+/// `nat_traversal.rs` (a provider on a `/p2p-circuit` ONLY, circuit address supplied directly),
+/// and end-to-end behind a REAL NAT (direct path genuinely blocked) in `nixos/nat-vm-test.nix`.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn discovery_only_consumer_resolves_and_fetches_via_constructed_circuit() {
     let _ = tracing_subscriber::fmt::try_init();
@@ -274,6 +282,9 @@ async fn discovery_only_consumer_resolves_and_fetches_via_constructed_circuit() 
     );
 
     // Step 3: end-to-end byte-identical fetch off the resolved DialInfo (no injected address).
+    // This proves the constructed DialInfo is DIALABLE and yields the exact served bytes; it
+    // does NOT prove relay CARRIAGE (the loopback direct addr is also reachable - see the
+    // test-level SCOPE note). Carriage is proven by nat_traversal.rs + the VM harness.
     let transport = consumer
         .transfer(TransportTag::Iroh)
         .expect("transport present");

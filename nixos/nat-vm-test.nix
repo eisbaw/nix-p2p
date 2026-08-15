@@ -354,12 +354,14 @@ pkgs.testers.runNixOSTest {
           # A NAT'd provider binds its private transport AND the relay circuit.
           listen = [ "/ip4/${ipNodeA}/tcp/${toString libp2pPort}" circuitListen ];
           # SELF-ADVERTISE the relay circuit as this provider's external (reach-me)
-          # address - the standard libp2p relay pattern. identify then propagates it
-          # to the relay's kad routing table, so the consumer RESOLVES the circuit
-          # address via kad peer-routing (no consumer-side injection - the consumer
-          # still discovers it purely through the DHT). Without this the consumer
-          # discovers the provider RECORD but gets a kad peer-routing miss (no dial
-          # address), because a fresh reservation's circuit addr is not surfaced.
+          # address - the standard libp2p relay pattern (identify propagates it; the
+          # relay can cite it in reservation vouchers). NOTE (TASK-218 diagnosis): kad
+          # does NOT actually surface this /p2p-circuit address to a discovery-only
+          # consumer - get_closest_peers returns only the provider's DIRECT (private,
+          # NAT-unreachable) address; the circuit addr is dropped in the identify->kad->
+          # FIND_NODE path (libp2p 0.54). The consumer instead RESOLVES the circuit by
+          # CONSTRUCTING it (ROUTE 1: the kad-discovered provider PeerId + a relay it
+          # already knows from bootstrap config) - no injection, discovery stays kad-only.
           externalAddresses = [ circuitListen ];
           # kad bootstrap roots: the relay AND the independent zboot (TASK-207 B2). The
           # relay is a reliable DHT rendezvous because the provider holds a persistent
@@ -422,14 +424,14 @@ pkgs.testers.runNixOSTest {
       # discovery + the relay reservation converge, so an early miss must not be
       # cached for an hour and defeat the retry loop.
       nix.settings.narinfo-cache-negative-ttl = 0;
-      # Do NOT positive-cache narinfo either. The daemon derives the p2p SignedNarHash
-      # key ONLY from a narinfo it served IN THIS SESSION (daemon-core catalog
-      # correlation); if nix reuses a cached narinfo it skips the daemon's narinfo
-      # endpoint and the follow-up NAR request falls to the URL-less UpstreamPath (which
-      # the p2p source cannot serve) -> the fetch never even ATTEMPTS the relay circuit.
-      # Forcing a re-request every realise keeps the correlation warm across a FRESH
-      # (restarted) consumer daemon, so the B2 fresh-dial bite exercises the real p2p
-      # path both relay-up and relay-down.
+      # Do NOT positive-cache narinfo either (defense-in-depth). The daemon derives the p2p
+      # SignedNarHash key from the narinfo it served (daemon-core catalog correlation); if
+      # nix reused a positively-cached narinfo it could skip the daemon's narinfo endpoint
+      # and a follow-up NAR request could fall to the URL-less UpstreamPath (which the p2p
+      # source cannot serve). Re-requesting the narinfo every realise keeps the correlation
+      # freshly recorded, so each p2p fetch reliably ATTEMPTS the relay circuit (both the B2
+      # relay-up positive control and the relay-down bite run on the SAME warm consumer -
+      # no daemon restart - so this is belt-and-braces, not load-bearing for the bite).
       nix.settings.narinfo-cache-positive-ttl = 0;
     };
 
@@ -755,15 +757,52 @@ pkgs.testers.runNixOSTest {
         nodeb.fail("nc -z -w 5 ${ipRelay} ${toString libp2pPort}")
         nodeb.succeed("sleep 10")
 
-        # (c) Drop the path so the re-fetch is a REAL fetch (not a store no-op), then assert it
-        #     FAILS within a bounded window. narinfo still resolves (the narinfo-upstream HTTP
-        #     server on the relay VM is a SEPARATE service that survives stopping the relay
-        #     daemon), so the failure is purely REACHABILITY: the relay circuit is dead and the
-        #     private direct path is NAT-blocked.
+        # (c) Drop the path so the re-fetch is a REAL fetch (not a store no-op). narinfo still
+        #     resolves (the narinfo-upstream HTTP server on the relay VM is a SEPARATE service
+        #     that survives stopping the relay daemon). Cursor the consumer journal at the bite
+        #     moment so the POSITIVE relay-attribution assertions below scope to THIS relay-down
+        #     fetch, not the earlier relay-up ones.
         nodeb.succeed("nix-store --delete --ignore-liveness ${payloadA} 2>&1 || true")
         nodeb.fail("nix-store -q --hash ${payloadA}")  # genuinely absent (non-vacuous)
+        bite_cursor = nodeb.succeed(
+            "journalctl -u nix-p2p-daemon --no-pager --show-cursor | "
+            "sed -n 's/^-- cursor: //p' | tail -1"
+        ).strip()
         nodeb.fail("timeout 120 nix-store --realise ${payloadA}")
         nodeb.fail("nix-store -q --hash ${payloadA}")  # still absent: the fetch did NOT sneak through
+
+        # (d) POSITIVE relay-attribution (TASK-218 finding 1, the load-bearing tightening): a
+        #     bare "nonzero realise exit" does not prove the RELAY was the cause (a timeout /
+        #     lost discovery / correlation miss also exits nonzero). So in the bite window the
+        #     consumer journal MUST show, along the fetch pipeline, that the failure is a RELAY /
+        #     circuit-dial REACHABILITY failure and NOT lost discovery:
+        #       (i)   the consumer STILL discovered the provider record via kad (record held),
+        #       (ii)  it RESOLVED a /p2p-circuit dial-address and attempted to dial it, and
+        #       (iii) the NAR fetch was UNREACHABLE (could not open a stream at any resolved addr).
+        #     Lost discovery would drop (i)+(ii)+(iii); a correlation/UpstreamPath miss would
+        #     drop (ii)+(iii). All three present <=> the severed relay circuit is the cause.
+        def bite_count(pattern):
+            return int(nodeb.succeed(
+                "journalctl -u nix-p2p-daemon --no-pager --after-cursor '" + bite_cursor + "' | "
+                "grep -cE " + pattern + " || true"
+            ).strip())
+        assert bite_count("'discovered [1-9][0-9]* provider record.*via kad'") >= 1, (
+            "relay-down bite: consumer did NOT re-discover the provider record - the failure "
+            "cannot be attributed to the relay (looks like lost discovery, not reachability)"
+        )
+        assert bite_count("'resolved provider dial address.*p2p-circuit'") >= 1, (
+            "relay-down bite: consumer did NOT resolve+attempt a /p2p-circuit dial - the "
+            "circuit-dial ATTEMPT is unobserved, so relay-attribution is not positively proven"
+        )
+        assert bite_count("'NAR fetch UNREACHABLE'") >= 1, (
+            "relay-down bite: no circuit-dial/reachability failure diagnostic in the bite window "
+            "- the failure is NOT positively attributable to the severed relay circuit"
+        )
+        print(
+            "B2 relay-attribution PROVEN: in the relay-down bite window the consumer re-discovered "
+            "the provider via kad, resolved+dialed the /p2p-circuit, and the NAR fetch was "
+            "UNREACHABLE - the failure is positively the dead relay circuit, not lost discovery."
+        )
 
         # SUPPORTING (not the oracle): the SAME provider process stayed ACTIVE across the
         # relay stop - it did not crash/restart when its relay connection dropped. A crash

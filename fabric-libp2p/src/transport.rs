@@ -167,6 +167,16 @@ impl NarTransfer for Libp2pTransport {
                              addresses parsed as a dialable Multiaddr"
                         )));
                     }
+                    // Fail-verbose observability (TASK-218 finding 1): record WHICH addresses
+                    // we resolved and are about to dial. A NAT'd provider's set includes a
+                    // `/p2p-circuit` candidate, so this makes the circuit-dial ATTEMPT
+                    // observable - the B2 relay-down oracle uses it to confirm the consumer
+                    // still resolved the provider (and a circuit) before the fetch failed.
+                    tracing::info!(
+                        provider = %node,
+                        addresses = %dial_info.locations.join(", "),
+                        "fabric-libp2p: resolved provider dial address(es); dialing"
+                    );
                 }
                 Lookup::Miss => {
                     return Err(TransferError::Unavailable(format!(
@@ -188,7 +198,8 @@ impl NarTransfer for Libp2pTransport {
             // NEVER the compressed FileSize) plus the gate-1 BLAKE3 verify - so a lying provider
             // is cut off at ~expected_size mid-transfer, and a corrupt one fails gate-1, never
             // wrong bytes handed upward (Nix's sha256 gate remains the trust anchor downstream).
-            self.handle
+            let fetched = self
+                .handle
                 .fetch_nar_streaming(
                     peer,
                     content,
@@ -196,7 +207,21 @@ impl NarTransfer for Libp2pTransport {
                     dial_timeout,
                     body_idle_timeout,
                 )
-                .await
+                .await;
+            if let Err(err) = &fetched {
+                // Fail-verbose (TASK-218 finding 1): the provider was DISCOVERED and RESOLVED
+                // (a Found above, addresses dialed) but the NAR stream could NOT be opened at
+                // ANY resolved dial address - a REACHABILITY / circuit-dial failure, DISTINCT
+                // from a discovery miss or a correlation failure. The B2 relay-down oracle
+                // greps this DISTINCT marker to attribute the failure to the severed relay
+                // circuit (with the direct path B1-blocked), not to lost discovery.
+                tracing::warn!(
+                    provider = %node, %peer, error = %err,
+                    "fabric-libp2p: NAR fetch UNREACHABLE - could not open a NAR stream at any \
+                     resolved dial address (relay circuit + direct all unreachable)"
+                );
+            }
+            fetched
         };
 
         match tokio::time::timeout(total_timeout, remote).await {

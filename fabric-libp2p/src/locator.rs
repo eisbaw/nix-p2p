@@ -283,16 +283,109 @@ fn addr_is_public(addr: &Multiaddr) -> bool {
     false
 }
 
-/// RFC1918-private, loopback, link-local (169.254/16) and unspecified are non-public.
+/// A v4 address is NON-public if it is in any non-globally-routable range. Covering the
+/// carrier-grade-NAT range 100.64.0.0/10 (RFC 6598) is load-bearing: a provider behind a
+/// CARRIER NAT presents a 100.64.x.x address that is NOT directly dialable, so it must still
+/// get a relay-circuit candidate composed (PRD risk 8 - "fails behind a real-world NAT").
+/// All checks are integer octet math (no floats, no unstable std APIs).
 fn ipv4_is_public(ip: Ipv4Addr) -> bool {
-    !(ip.is_loopback() || ip.is_private() || ip.is_link_local() || ip.is_unspecified())
+    let o = ip.octets();
+    let non_public = ip.is_loopback()            // 127.0.0.0/8
+        || ip.is_private()                       // 10/8, 172.16/12, 192.168/16
+        || ip.is_link_local()                    // 169.254.0.0/16
+        || ip.is_unspecified()                   // 0.0.0.0
+        || ip.is_broadcast()                     // 255.255.255.255
+        || ip.is_multicast()                     // 224.0.0.0/4
+        || (o[0] == 100 && (o[1] & 0xc0) == 0x40)      // CGNAT 100.64.0.0/10 (RFC 6598)
+        || (o[0] == 198 && (o[1] & 0xfe) == 18)        // benchmarking 198.18.0.0/15
+        || (o[0] == 192 && o[1] == 0 && o[2] == 2)     // documentation 192.0.2.0/24
+        || (o[0] == 198 && o[1] == 51 && o[2] == 100)  // documentation 198.51.100.0/24
+        || (o[0] == 203 && o[1] == 0 && o[2] == 113); // documentation 203.0.113.0/24
+    !non_public
 }
 
-/// Loopback (::1), unspecified (::), ULA (fc00::/7) and link-local (fe80::/10) are non-public.
+/// A v6 address is NON-public if loopback (::1), unspecified (::), ULA (fc00::/7),
+/// link-local (fe80::/10), multicast (ff00::/8), or documentation (2001:db8::/32). Integer
+/// segment math only.
 fn ipv6_is_public(ip: Ipv6Addr) -> bool {
-    let is_ula = (ip.segments()[0] & 0xfe00) == 0xfc00;
-    let is_link_local = (ip.segments()[0] & 0xffc0) == 0xfe80;
-    !(ip.is_loopback() || ip.is_unspecified() || is_ula || is_link_local)
+    let s = ip.segments();
+    let is_ula = (s[0] & 0xfe00) == 0xfc00;
+    let is_link_local = (s[0] & 0xffc0) == 0xfe80;
+    let is_documentation = s[0] == 0x2001 && s[1] == 0x0db8;
+    let non_public = ip.is_loopback()
+        || ip.is_unspecified()
+        || ip.is_multicast() // ff00::/8
+        || is_ula
+        || is_link_local
+        || is_documentation;
+    !non_public
+}
+
+#[cfg(test)]
+mod ip_classification_tests {
+    use super::{ipv4_is_public, ipv6_is_public};
+    use std::net::{Ipv4Addr, Ipv6Addr};
+
+    #[test]
+    fn v4_non_public_ranges_are_not_public() {
+        for ip in [
+            "127.0.0.1",       // loopback
+            "10.1.2.3",        // private
+            "172.16.5.6",      // private
+            "192.168.2.3",     // private (the VM provider)
+            "169.254.1.1",     // link-local
+            "0.0.0.0",         // unspecified
+            "255.255.255.255", // broadcast
+            "224.0.0.1",       // multicast
+            "100.64.0.1",      // CGNAT low edge (RFC 6598)
+            "100.127.255.255", // CGNAT high edge
+            "198.18.0.1",      // benchmarking
+            "198.19.255.255",  // benchmarking
+            "192.0.2.5",       // documentation
+            "198.51.100.5",    // documentation
+            "203.0.113.5",     // documentation
+        ] {
+            let a: Ipv4Addr = ip.parse().unwrap();
+            assert!(!ipv4_is_public(a), "{ip} must be classified non-public");
+        }
+    }
+
+    #[test]
+    fn v4_public_ranges_are_public() {
+        for ip in [
+            "8.8.8.8",
+            "1.1.1.1",
+            "100.63.255.255",
+            "100.128.0.0",
+            "198.17.255.255",
+            "198.20.0.0",
+            "192.0.3.0",
+            "203.0.114.0",
+        ] {
+            let a: Ipv4Addr = ip.parse().unwrap();
+            assert!(ipv4_is_public(a), "{ip} must be classified public");
+        }
+    }
+
+    #[test]
+    fn v6_classification() {
+        for ip in [
+            "::1",
+            "::",
+            "fc00::1",
+            "fd12::1",
+            "fe80::1",
+            "ff02::1",
+            "2001:db8::1",
+        ] {
+            let a: Ipv6Addr = ip.parse().unwrap();
+            assert!(!ipv6_is_public(a), "{ip} must be non-public");
+        }
+        for ip in ["2606:4700:4700::1111", "2001:4860:4860::8888"] {
+            let a: Ipv6Addr = ip.parse().unwrap();
+            assert!(ipv6_is_public(a), "{ip} must be public");
+        }
+    }
 }
 
 #[async_trait]

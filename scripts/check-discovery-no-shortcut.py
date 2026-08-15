@@ -85,20 +85,37 @@ FORBIDDEN = {
 # asserted by the second self-test arm (a composition adding these must NOT trip).
 PERMITTED_DIAL_ASSISTANCE = ("autonat", "dcutr", "relay")
 
-# TASK-218 (mped-architect must-fix #3): the relay-circuit dial-address the locator
-# COMPOSES for a NAT'd provider must come from a CONFIG-LEVEL, provider-INDEPENDENT relay
-# set (`known_relays`), never from a per-provider / per-content channel. A per-provider
-# relay map would be "the relay THIS provider is on", i.e. address injection under another
-# name - reintroducing exactly what the kad-exclusive discovery guarantee forbids. We
-# enforce it STRUCTURALLY: every declaration of the `known_relays` field/param must be a
-# flat `Vec<...>`, never a map keyed by a provider/content identity. The field DECLARATION
-# is `known_relays: <Type>`; a map type there (BTreeMap/HashMap/… keyed by NodeId/provider/
-# ContentKey) is the violation. Prose/doc mentions (no `:` type after the name) are ignored.
-KNOWN_RELAYS_DECL = re.compile(r"\bknown_relays\s*:\s*([A-Za-z_][A-Za-z0-9_]*)")
+# TASK-218 (mped-architect must-fix #3, tightened per codex finding #4): the relay-circuit
+# dial-address the locator COMPOSES for a NAT'd provider must come from a CONFIG-LEVEL,
+# provider-INDEPENDENT relay set (`known_relays`), never from a per-provider / per-content
+# channel. A per-provider relay association is "the relay THIS provider is on", i.e. address
+# injection under another name - reintroducing exactly what the kad-exclusive discovery
+# guarantee forbids. We enforce it STRUCTURALLY against THREE shapes:
+#   (A) `known_relays` declared as anything other than a flat `Vec<...>` (a map keyed by an
+#       identity) - the original check;
+#   (B) `known_relays: Vec<(NodeId|ContentKey|Provider..., ...)>` - a Vec whose element is
+#       KEYED by a provider/content identity (the legit form's first element is the RELAY's
+#       transport `PeerId`, never the provider's `NodeId`); and
+#   (C) ANY field whose name mentions `relay`/`circuit` declared as a map keyed by a
+#       provider/content identity (`relay_by_provider: BTreeMap<NodeId, _>`, etc). The
+#       legitimate `peer_address_book: BTreeMap<NodeId, Vec<Multiaddr>>` is NOT flagged - its
+#       name carries no relay/circuit token and it is the zero-disclosure ExplicitPeers book.
+# Prose/doc mentions (comment lines) are ignored. A NodeId/ContentKey identifies the
+# CONTENT/PROVIDER; a PeerId identifies the RELAY transport - only the former keying is forbidden.
+IDENTITY_KEY = r"(?:NodeId|ContentKey|Provider\w*)"
+KNOWN_RELAYS_DECL = re.compile(r"\bknown_relays\s*:\s*([A-Za-z_][A-Za-z0-9_]*)\s*<\s*([^>\n]*)")
+# A field named *relay* / *circuit* that is a map/set keyed by a provider/content identity.
+RELAY_KEYED_BY_IDENTITY = re.compile(
+    r"\b\w*(?:relay|circuit)\w*\s*:\s*(?:BTreeMap|HashMap|BTreeSet|HashSet|IndexMap)\s*<\s*"
+    + IDENTITY_KEY
+)
+# `known_relays: Vec<(NodeId, ...)>` - the Vec element's FIRST type is a provider/content id.
+KNOWN_RELAYS_VEC_KEYED = re.compile(r"\bknown_relays\s*:\s*Vec\s*<\s*\(\s*" + IDENTITY_KEY)
 
 
 def scan_relay_provider_independence(roots: list[Path]) -> list[str]:
-    """The known_relays circuit-composition input must be a provider-INDEPENDENT Vec."""
+    """The known_relays circuit-composition input must be a provider-INDEPENDENT Vec, and no
+    relay/circuit set may be keyed by a provider/content identity (TASK-218, codex #4)."""
     violations: list[str] = []
     for root in roots:
         if not root.exists():
@@ -115,12 +132,28 @@ def scan_relay_provider_independence(roots: list[Path]) -> list[str]:
                 stripped = line.lstrip()
                 if stripped.startswith("//"):
                     continue  # a comment/doc mention, not a real declaration
+                # (A) known_relays is not a flat Vec.
                 m = KNOWN_RELAYS_DECL.search(line)
                 if m and m.group(1) != "Vec":
                     violations.append(
                         f"{source}: `known_relays` declared as {m.group(1)}<…> - it MUST be a "
                         "provider-INDEPENDENT Vec<(PeerId, Multiaddr)>; a provider/content-keyed "
                         "map is per-provider circuit-address injection (TASK-218)"
+                    )
+                # (B) known_relays is a Vec keyed by a provider/content identity.
+                if KNOWN_RELAYS_VEC_KEYED.search(line):
+                    violations.append(
+                        f"{source}: `known_relays` is a Vec KEYED BY a provider/content identity "
+                        "(Vec<(NodeId|ContentKey|Provider…, …)>) - the relay set must be "
+                        "provider-INDEPENDENT (first element is the RELAY's PeerId, not the "
+                        "provider's NodeId); per-provider circuit injection (TASK-218)"
+                    )
+                # (C) any relay/circuit field keyed by a provider/content identity.
+                if RELAY_KEYED_BY_IDENTITY.search(line):
+                    violations.append(
+                        f"{source}: a relay/circuit set keyed by a provider/content identity "
+                        f"({stripped[:80]!r}) - associating relays with a provider is per-provider "
+                        "circuit-address injection under another name (TASK-218)"
                     )
     return violations
 
@@ -191,32 +224,44 @@ def self_test() -> int:
             )
             return 1
         (root / "dial_assistance.rs").unlink()
-        # TASK-218 provider-independence: a provider-keyed relay map (per-provider circuit
-        # injection) MUST bite; the shipped flat Vec MUST NOT.
+        # TASK-218 provider-independence: the shipped provider-INDEPENDENT forms MUST pass;
+        # EVERY provider-keyed relay association (map, Vec-keyed, or a *relay* map) MUST bite.
+        # ALLOWED: the flat known_relays Vec AND the legit NodeId-keyed peer_address_book
+        # (its name carries no relay/circuit token, so it is NOT a relay association).
         (root / "relay_ok.rs").write_text(
-            "pub struct Cfg {\n    pub known_relays: Vec<(PeerId, Multiaddr)>,\n}\n"
+            "pub struct Cfg {\n"
+            "    pub known_relays: Vec<(PeerId, Multiaddr)>,\n"
+            "    pub peer_address_book: BTreeMap<NodeId, Vec<Multiaddr>>,\n"
+            "}\n"
         )
         relay_ok = scan_relay_provider_independence([Path(tmp) / "fabric-libp2p" / "src"])
         if relay_ok:
             print(
-                "self-test FAILED: a flat `known_relays: Vec<…>` was flagged as per-provider "
-                f"injection ({relay_ok}) - the provider-independent Vec must be allowed",
+                "self-test FAILED: a flat `known_relays: Vec<…>` (or the legit NodeId-keyed "
+                f"peer_address_book) was flagged as per-provider injection ({relay_ok})",
                 file=sys.stderr,
             )
             return 1
         (root / "relay_ok.rs").unlink()
-        (root / "relay_bad.rs").write_text(
-            "pub struct Cfg {\n    pub known_relays: BTreeMap<NodeId, Multiaddr>,\n}\n"
-        )
-        relay_bad = scan_relay_provider_independence([Path(tmp) / "fabric-libp2p" / "src"])
-        if not any("known_relays" in v for v in relay_bad):
-            print(
-                "self-test FAILED: a provider-keyed `known_relays: BTreeMap<NodeId, …>` did NOT "
-                "trip the guard - per-provider circuit injection would slip through",
-                file=sys.stderr,
-            )
-            return 1
-        (root / "relay_bad.rs").unlink()
+        # Each mutation must trip the guard; the message must cite the offending shape.
+        mutations = {
+            "known_relays_map": "    pub known_relays: BTreeMap<NodeId, Multiaddr>,",
+            "known_relays_vec_keyed": "    pub known_relays: Vec<(NodeId, Multiaddr)>,",
+            "relay_by_provider": "    pub relay_by_provider: BTreeMap<NodeId, Multiaddr>,",
+            "provider_circuit_map": "    pub provider_circuits: HashMap<ContentKey, Multiaddr>,",
+        }
+        for name, decl in mutations.items():
+            bad = root / f"{name}.rs"
+            bad.write_text("pub struct Cfg {\n" + decl + "\n}\n")
+            hits = scan_relay_provider_independence([Path(tmp) / "fabric-libp2p" / "src"])
+            bad.unlink()
+            if not hits:
+                print(
+                    f"self-test FAILED: the provider-keyed relay shape `{decl.strip()}` did NOT "
+                    "trip the guard - per-provider circuit injection would slip through",
+                    file=sys.stderr,
+                )
+                return 1
         # The MUTATION: re-enable a LAN discovery substitute. The guard MUST bite.
         (root / "mutated.rs").write_text(
             "pub struct Behaviour {\n"
