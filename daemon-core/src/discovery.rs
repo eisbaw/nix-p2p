@@ -1008,14 +1008,51 @@ impl NarSource for FallbackNarSource {
         key: &NarKey,
         expected_size: Option<u64>,
     ) -> Result<UpstreamResponse, SourceError> {
-        match self.primary.resolve(key, expected_size).await {
+        // Single source of truth for the fallback policy: the no-budget (chain
+        // ENTRY / lone-daemon) path is just `resolve_within` with `None`, which
+        // seeds the secondary from its own local timeout exactly as wave-1 did.
+        self.resolve_within(key, expected_size, None).await
+    }
+
+    /// Budget-aware fallback (TASK-33 F1). The end-to-end header-wait budget must
+    /// survive a p2p MISS: the primary attempt (a bounded discovery + fetch) spends
+    /// real time, so the HTTP secondary is granted only the REMAINING budget, not a
+    /// fresh full local timeout. Without this override the default `resolve_within`
+    /// would drop the budget and call `resolve`, and on the NORMAL p2p-miss -> CDN
+    /// path the secondary `UpstreamHttp` would re-seed its whole local
+    /// `header_timeout`, breaking chain composition on the most common production
+    /// path. Nested `FallbackNarSource` wrappers compose correctly because each
+    /// level subtracts its OWN primary's elapsed before forwarding the remainder.
+    async fn resolve_within(
+        &self,
+        key: &NarKey,
+        expected_size: Option<u64>,
+        budget: Option<Duration>,
+    ) -> Result<UpstreamResponse, SourceError> {
+        // Anchor the shared end-to-end clock at the START of the primary attempt so
+        // the secondary's grant is decremented by the time the primary actually
+        // spent (a genuine shrinking deadline, not a fresh timeout).
+        let started = Instant::now();
+        match self
+            .primary
+            .resolve_within(key, expected_size, budget)
+            .await
+        {
             Ok(resp) => Ok(resp),
             Err(err @ (SourceError::Unreachable(_) | SourceError::Upstream(_))) => {
                 // p2p could not serve it here: fall back to upstream (S2). The miss
                 // is already bounded upstream of here (DirectDiscovery / the
                 // transport timeout), so this does not re-introduce a hang.
                 eprintln!("daemon: p2p miss ({err}); falling back to upstream");
-                self.secondary.resolve(key, expected_size).await
+                // Forward the budget MINUS what the primary attempt consumed. `None`
+                // (chain entry) stays `None` so the secondary seeds from its own
+                // local timeout; a `Some` budget already spent by the primary
+                // saturates to zero, so the CDN fetch fails fast rather than
+                // starting a fresh full wait the chain has no time for.
+                let remaining = budget.map(|b| b.saturating_sub(started.elapsed()));
+                self.secondary
+                    .resolve_within(key, expected_size, remaining)
+                    .await
             }
             // A size abort is not a "try elsewhere" - do not paper over it.
             Err(err @ SourceError::TooLarge { .. }) => Err(err),
