@@ -3,10 +3,10 @@ id: TASK-218
 title: >-
   fabric-libp2p: consumer cannot resolve a NAT'd provider's /p2p-circuit
   dial-address via kad peer-routing (TASK-207 residual)
-status: Done
+status: In Progress
 assignee: []
 created_date: '2026-08-15 12:35'
-updated_date: '2026-08-15 17:05'
+updated_date: '2026-08-15 17:16'
 labels:
   - libp2p
   - fabric
@@ -61,6 +61,20 @@ VM RUN 4 (build4): AC#1 GATED PASSED again (discovery log fired, byte-identical 
 VM RUN 5 (build5): FileHash fix WORKED — AC#1 GATED and B2 POSITIVE CONTROL both passed (fresh consumer fetched byte-identical relay-UP; no more UpstreamPath, misses now show the healthy "directory unavailable: consultation deadline exceeded" pre-convergence state). But the B2 BITE (fresh RESTARTED consumer, relay DOWN, converge-via-zboot-then-fail) hung: the fresh consumer never re-discovered the provider via zboot alone (relay down) within 600s — kad re-convergence via a SINGLE surviving bootstrap behind the NAT is slow+unreliable, and requiring it confounds a REACHABILITY bite with a DISCOVERY one. REDESIGN (run6): the B2 bite now uses the SAME AC#1-converged consumer (no restart, no re-discovery). POSITIVE CONTROL: delete path + re-fetch relay-UP -> byte-identical (routing already warm). BITE: (a) assert NO DCUtR direct upgrade ever occurred (grep "dcutr hole-punch upgraded a relayed connection to DIRECT" is ABSENT — so the consumer has no hole-punched direct connection that could survive the relay stop); (b) stop the relay (severs the circuit-v2 connection, which is forwarded THROUGH the relay), confirm down from both nodea+nodeb, settle; (c) delete path + re-fetch -> MUST FAIL (dead relay circuit + NAT-blocked direct, B1); provider MainPID unchanged. This is honest (the DCUtR-absence guard + the connection-severing logic prove the re-fetch has NO reachable path) and sidesteps the re-discovery flake. Re-running (build6, mostly cached).
 
 VM RUN 6 (build6): PASSED — BUILD_EXIT=0. Full real-NAT 6-VM harness green: (1) AC#1 GATED: nodeb fetched payloadA BYTE-IDENTICAL THROUGH the relay circuit behind a real NAT (kad-discovered PeerId + bootstrap-known-relay construction, no injection); discovery observable via the new "discovered N provider record(s) ... via kad" log. (2) B2 POSITIVE CONTROL: warm consumer re-fetched byte-identical (relay UP). (3) B2 LOAD-BEARING PROVEN: with the relay stopped, the re-fetch FAILED in 50s (within the 120s bound), NO DCUtR direct upgrade ever occurred, provider MainPID 709 unchanged, sole reservation relay was the stopped relay. The relay circuit carries the NAR bytes - load-bearing, not incidental. AC#1 and AC#2 both MET; the TASK-207-deferred B2 load-bearing consumer-side reachability bite is DELIVERED. Fast gate green: cargo test 460 passed/0 failed (fabric-libp2p+daemon-libp2p+daemon-core+peer-fabric); fmt/clippy -D-warnings/no-floats/discovery-oracle(self-test+scan) clean. Frozen surfaces untouched. Running final qa-test-runner + mped-architect before commit.
+
+DEEP gate (2026-08-15): NO-GO -> reopened to In Progress. Cross-model split: codex NO-GO vs mped-architect GO; orchestrator arbitrated to UPHOLD NO-GO. Fixes go on top of 0415fab (NOT a redesign; frozen surface + current no-injection state verified clean by BOTH reviewers).
+
+1 (CRITICAL, codex): the B2 relay-down oracle at nat-vm-test.nix:758 accepts ANY nonzero nix-store --realise exit (timeout / lost discovery / correlation failure), so it does not positively prove the RELAY was the failure cause. mped rated this LOW (confounds closed structurally: separate surviving narinfo service, provider MainPID unchanged, total_res==base sole reservation, DCUtR-success absence); codex rated CRITICAL because the gating oracle itself does not enforce relay-reachability. FIX: assert the relay-down failure is specifically a circuit-dial / p2p reachability failure (grep the circuit-dial-failure or p2p-miss diagnostic at the bite moment; assert the warm consumer still holds the provider record and attempted the circuit), turning the structural argument into a direct positive observation.
+
+2 (HIGH): the fresh-consumer bite was changed to a warm consumer. mped judged warm a CLEANER single-variable control (fresh confounds relay-reachability with kad re-discovery behind double symmetric NAT) and it is KEPT; but the written AC said fresh and the comments at nat-vm-test.nix:425 still describe fresh-daemon behavior. Reconcile HONESTLY: update the AC text to the warm single-variable design WITH the rationale (do NOT silently re-tick), and fix the stale :425 comments (doc-vs-code drift).
+
+3 (HIGH): CGNAT 100.64.0.0/10 (and other non-global ranges) is classified as public at locator.rs:207/286, so a carrier-NAT'd provider is dialed directly and never gets a circuit - the real-world-NAT case (PRD risk 8). FIX at least the CGNAT 100.64.0.0/10 range now (integer range add); file remaining non-global ranges (multicast/documentation/benchmarking) if scoping.
+
+4 (MEDIUM): the no-injection guard at check-discovery-no-shortcut.py:97 catches only the literal known_relays: Vec form; relay_by_provider: BTreeMap or known_relays: Vec<(NodeId,..)> would pass. Current code is provider-independent (verified) so no live bug; strengthen the guard to catch any provider/NodeId-keyed relay association.
+
+5 (MEDIUM): fabric test nat_dht_resolve.rs leaves the provider direct loopback listener reachable, so the fetch at :276 may use the direct connection - the fetches-through-relay claim exceeds its oracle (circuit CONSTRUCTION is proven; carriage is proven by the VM). Tighten (remove the direct listener so the fabric test also proves carriage) or downgrade the claim to construction-only.
+
+Both reviewers VERIFIED: frozen surface untouched; known_relays is a flat bootstrap Vec (not a provider map); circuit constructed consumer-side; QueryReach honesty intact; no-floats + discovery guard pass. Re-gate with codex after fixes.
 <!-- SECTION:NOTES:END -->
 
 ## Final Summary
