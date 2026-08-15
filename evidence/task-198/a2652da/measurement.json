@@ -1,0 +1,132 @@
+{
+  "task": "task-198",
+  "measures": "live raw-vs-zstd libp2p NAR transfer over a tc-netem shaped peer link with BOTH ends shaped (the two-ends-shaped serve trace TASK-203 deferred here). The timed window is an ALREADY-CONNECTED open-stream /nar/3 fetch: discovery, dial, and the Noise/yamux handshake happen out of band BEFORE the clock starts.",
+  "environment_boundary": "shaped-link EMULATION (unshare -Urn nested netns + veth + tc netem), NOT real hardware / a real WAN. Models mean RTT + a rate cap; NOT loss, jitter, competing traffic, or NAT traversal. Removes the pod-loopback UPPER bound on the peer arm; is not itself a field measurement (the real-hardware residual is TASK-207).",
+  "integer_exact": true,
+  "no_floats_in_decisions": true,
+  "accepted": true,
+  "verdict": "ACCEPTED",
+  "failure_reasons": [],
+  "load_bearing_flags": {
+    "zstd_faster_every_run": true,
+    "wire_smaller_every_run": true,
+    "margin_dwarfs_noise": true,
+    "all_runs_shape_gated": true,
+    "wire_bytes_consistent": true,
+    "wire_bulk_crosscheck_ok": true
+  },
+  "nar_bytes": 16777216,
+  "delay_ms": 20,
+  "rate_mbit": 20,
+  "nar_seed": 20198,
+  "shaped_runs": 3,
+  "served_raw_bytes": 16777216,
+  "aux_bulk_zstd_frame_bytes": 4219763,
+  "wire_bulk_crosscheck": {
+    "ok": true,
+    "counted_zstd_wire_bytes": 4219766,
+    "bulk_zstd_frame_bytes": 4219763,
+    "abs_diff_bytes": 3,
+    "tolerance_den": 64
+  },
+  "wire_raw_bytes": 16777216,
+  "wire_zstd_bytes": 4219766,
+  "wire_ratio_pair": [
+    16777216,
+    4219766
+  ],
+  "wire_ratio_display": "~3.976x (exact 8388608/2109883)",
+  "shaping_oracle": {
+    "all_gated": true,
+    "unshaped_rtt_ns": 79000,
+    "unshaped_raw_throughput_bytes_per_s": 59360106,
+    "per_run": [
+      {
+        "shaped_rtt_ns": 48239000,
+        "shaped_raw_throughput_bytes_per_s": 2193976,
+        "passed": true
+      },
+      {
+        "shaped_rtt_ns": 48192000,
+        "shaped_raw_throughput_bytes_per_s": 2191233,
+        "passed": true
+      },
+      {
+        "shaped_rtt_ns": 48165000,
+        "shaped_raw_throughput_bytes_per_s": 2191068,
+        "passed": true
+      }
+    ]
+  },
+  "headline": {
+    "zstd_faster_every_run": true,
+    "wire_smaller_every_run": true,
+    "margin_dwarfs_noise": true,
+    "min_margin_ns": 5253951581,
+    "raw_spread_ns": 10148677,
+    "zstd_spread_ns": 2679719,
+    "best_raw_elapsed_ns": 7646945894,
+    "best_zstd_elapsed_ns": 2390314594,
+    "best_wallclock_speedup_pair": [
+      7646945894,
+      2390314594
+    ],
+    "best_wallclock_speedup_display": "~3.199x (exact 3823472947/1195157297)"
+  },
+  "per_run": [
+    {
+      "raw_elapsed_ns": 7646945894,
+      "zstd_elapsed_ns": 2392994313,
+      "margin_ns": 5253951581,
+      "raw_throughput_bytes_per_s": 2193976,
+      "zstd_throughput_bytes_per_s": 1763383,
+      "wire_raw_bytes": 16777216,
+      "wire_zstd_bytes": 4219766,
+      "wallclock_speedup_pair": [
+        7646945894,
+        2392994313
+      ],
+      "wire_ratio_pair": [
+        16777216,
+        4219766
+      ],
+      "zstd_faster": true
+    },
+    {
+      "raw_elapsed_ns": 7656516221,
+      "zstd_elapsed_ns": 2392058117,
+      "margin_ns": 5264458104,
+      "raw_throughput_bytes_per_s": 2191233,
+      "zstd_throughput_bytes_per_s": 1764073,
+      "wire_raw_bytes": 16777216,
+      "wire_zstd_bytes": 4219766,
+      "wallclock_speedup_pair": [
+        7656516221,
+        2392058117
+      ],
+      "wire_ratio_pair": [
+        16777216,
+        4219766
+      ],
+      "zstd_faster": true
+    },
+    {
+      "raw_elapsed_ns": 7657094571,
+      "zstd_elapsed_ns": 2390314594,
+      "margin_ns": 5266779977,
+      "raw_throughput_bytes_per_s": 2191068,
+      "zstd_throughput_bytes_per_s": 1765360,
+      "wire_raw_bytes": 16777216,
+      "wire_zstd_bytes": 4219766,
+      "wallclock_speedup_pair": [
+        7657094571,
+        2390314594
+      ],
+      "wire_ratio_pair": [
+        16777216,
+        4219766
+      ],
+      "zstd_faster": true
+    }
+  ]
+}
