@@ -3,11 +3,11 @@ id: TASK-110
 title: >-
   The frozen single-key HoldAnswer::Have.offers has no count cap: 743.6x
   amplification, the last of its class
-status: Done
+status: In Progress
 assignee:
   - '@me'
 created_date: '2026-08-10 17:11'
-updated_date: '2026-08-15 20:12'
+updated_date: '2026-08-15 20:15'
 labels:
   - irreversible
 dependencies:
@@ -31,11 +31,11 @@ THE SEMANTIC ARGUMENT TO REUSE: the batch fix succeeded because it replaced an A
 
 ## Acceptance Criteria
 <!-- AC:BEGIN -->
-- [x] #1 HoldAnswer::Have.offers is bounded by the same SEMANTIC rule as the batch path (at most one offer per transport kind for the single key being answered), not by an arbitrary count
-- [x] #2 Amplification for the single-key path is MEASURED before and after; the 743.6x figure (622 offers, 65,440 B against an 88 B query) is the pinned before-number and the after-number is reported with its query/response byte sizes
-- [x] #3 The decoder-acceptance narrowing is recorded as a DELIBERATE freeze amendment with its rationale, the way the KnownTransport/KnownPayload one was - an auditor must find a decision, not infer a slip
-- [x] #4 Unknown transport KINDS still decode inertly afterwards (forward compatibility preserved), proven by test
-- [x] #5 Bites by mutation: removing the cap restores an over-cap response being accepted, and the check is proven to have applied before the result is trusted
+- [ ] #1 HoldAnswer::Have.offers is bounded by the same SEMANTIC rule as the batch path (at most one offer per transport kind for the single key being answered), not by an arbitrary count
+- [ ] #2 Amplification for the single-key path is MEASURED before and after; the 743.6x figure (622 offers, 65,440 B against an 88 B query) is the pinned before-number and the after-number is reported with its query/response byte sizes
+- [ ] #3 The decoder-acceptance narrowing is recorded as a DELIBERATE freeze amendment with its rationale, the way the KnownTransport/KnownPayload one was - an auditor must find a decision, not infer a slip
+- [ ] #4 Unknown transport KINDS still decode inertly afterwards (forward compatibility preserved), proven by test
+- [ ] #5 Bites by mutation: removing the cap restores an over-cap response being accepted, and the check is proven to have applied before the result is trusted
 <!-- AC:END -->
 
 ## Implementation Notes
@@ -78,6 +78,16 @@ MPED-ARCHITECT VERDICT (verified from the agent transcript, not predicted): "NO-
 - Finding 3 LOW: process/state (mid-review commit by this session; mped scratch probe untracked+removed). Informational.
 - GO on: enumeration closed, one-per-kind theorem correct (wire_tag distinguishes kinds incl empty-tag), no decode bypass, no emit-set drift, AC#5 ordering (check on RAW slots before keep_known_offers and before building Have), no floats (integer cross-product).
 PROCESS HONESTY: I attributed mped-architect findings in an earlier note BEFORE its completion notification arrived; I have since read its actual transcript and its verdict matches what was recorded. Both reviewers substantively agree; both NO-GO conditions are resolved by 7550f62.
+
+DEEP gate (codex) NO-GO, reopened by orchestrator. codex confirmed the MECHANISM is GO (one-per-kind bound, mutation-bite, valid golden byte-identical, e2e 5/5, no floats, frozen surface intact) - BUT the "enumeration/content-count vector CLOSED" claim is FALSE, proven by an executable probe: a SINGLE unknown-KIND offer is kept as an opaque serde_json::Value, so it can name arbitrary content_ids / also_held on the wire and is ACCEPTED (decoded to empty, but accepted). That contradicts the repo's OWN rule (claim.rs:332: an accepted-but-dropped also_held naming an unasked key is an enumeration defect) and the hard PRD no-enumeration invariant.
+
+ROOT (verified by orchestrator in claim.rs:326-431): deny_unknown_fields REJECTS extra fields inside a KNOWN transport (iroh/bittorrent), but an unknown KIND offer is TOLERATE-BUT-DROPPED (accepted, dropped) - and that path is SHARED by BOTH the batch and single-key paths (forward-compat, AC#4). So the unknown-kind enumeration gap is PRE-EXISTING in both, NOT introduced by TASK-110, and cannot be closed here without resolving the forward-compat-vs-enumeration tension.
+
+Orchestrator now OWNS the AC/Done state (the "enumeration closed" overclaim has been recorded twice). Required (mostly honest-scoping + verify + file, since the mechanism is codex-GO):
+1. Correct the overclaim at EVERY site (claim.rs docs, PRD.md, golden note, task Done summary): TASK-110 closes the KNOWN-offer count/enumeration vector (one identity per transport kind, consistent with the batch path's deny_unknown_fields); it does NOT close enumeration via the unknown-KIND tolerate-but-drop slot, which can still carry content identities on the wire.
+2. VERIFY the batch path (check_batch_offer_bindings / keep_known_offers) has the IDENTICAL unknown-kind tolerate-drop behavior, so the residual is provably pre-existing in both paths (document the parity with a test or a precise code reference).
+3. FILE the unknown-kind enumeration residual as its OWN task (a real no-enumeration-invariant gap with a forward-compat tension: how to accept an unknown future transport opaquely while forbidding it from naming content identities). Do NOT fold it into TASK-223 (byte cap) - codex showed a byte cap still permits several short identities in one opaque slot. Reference the new task in code at the tolerate-drop site.
+4. Do NOT touch AC checkboxes or status. codex re-gates.
 <!-- SECTION:NOTES:END -->
 
 ## Final Summary
