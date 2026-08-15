@@ -1,7 +1,7 @@
 {
   "task": "task-203",
   "measures": "the TASK-99 net-LAN verdict re-evaluated under an IDEALIZED (best-case, constant-aggregate-rate) PIPELINED serve model",
-  "reuses": "the committed TASK-99 harness_raw.json (same shipped /nar/3 codec, same integer-exact compress/decompress ns and byte counts); pipelining changes the SCHEDULING of that same work. The bulk CPU is reused as a LOWER BOUND on the streamed path's CPU (the new raw-stream/channel/alloc overhead is not charged) - see the evidence README's measured bulk-vs-streamed encoder cross-check",
+  "reuses": "the committed TASK-99 harness_raw.json (same shipped /nar/3 codec, same integer-exact compressed/raw byte counts); pipelining changes only the SCHEDULING of the same wire bytes. The bulk CPU-ns are reused as a LOWER BOUND on the streamed path's CPU (the new raw-stream/channel/alloc overhead is not charged, so the streamed path costs measurably MORE - a few percent, up to ~15% run-to-run on a noisy box) - see the evidence README's measured bulk-vs-streamed encoder cross-check",
   "model_kind": "idealized-best-case-constant-aggregate-rates",
   "model_is_proven_bound": false,
   "model_caveats": [

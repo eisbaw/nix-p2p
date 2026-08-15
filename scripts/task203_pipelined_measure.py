@@ -4,15 +4,19 @@
 do it with INTEGER / EXACT-RATIONAL arithmetic ONLY - no float in any decision.
 
 WHY THIS IS A LEGITIMATE RE-DERIVATION (not a re-measurement). TASK-203 changed the SCHEDULING
-of the serve-side compressor (it now streams the zstd frame in blocks off the worker), NOT the
-codec's bytes or its CPU cost: a streamed frame is the SAME single zstd frame as the bulk frame
+of the serve-side compressor (it now streams the zstd frame in blocks off the worker), and the
+codec's WIRE BYTES are unchanged: a streamed frame is the SAME single zstd frame as the bulk frame
 (the codec test `streamed_frame_size_matches_bulk_within_tolerance` proves the streamed size is
-within ~1/64 of bulk, and `streamed_frame_decodes_like_bulk` proves identical decode), and the
-compress/decompress CPU-ns are the same work regardless of when it is scheduled. So the honest
-re-evaluation reuses TASK-99's committed INTEGER-EXACT harness measurement (`compressed_bytes`,
-`raw_bytes`, `compress_ns`, `decompress_ns` for the shipped /nar/3 codec on real nar data) and
-applies the PIPELINED makespan model to the same numbers. It does NOT need a fresh shaped-link
-run; it needs the same measured costs scheduled differently.
+within ~1/64 of bulk, and `streamed_frame_decodes_like_bulk` proves identical decode). The CPU cost
+is NOT unchanged, though: the streamed serve path runs different code (per-block `compress_block`
+calls, a per-block allocation, an mpsc channel + a `spawn_blocking` hop), so the TASK-99 BULK
+compress/decompress CPU-ns are a LOWER BOUND on the streamed path's CPU - it costs measurably MORE
+(a few percent, up to ~15% run-to-run on a noisy box), never less (measured in the evidence README's
+cross-check). So the honest re-evaluation reuses
+TASK-99's committed INTEGER-EXACT harness measurement (`compressed_bytes`, `raw_bytes`,
+`compress_ns`, `decompress_ns` for the shipped /nar/3 codec on real nar data) AS THAT LOWER BOUND
+and applies the PIPELINED makespan model to it. It does NOT need a fresh shaped-link run; it needs
+the same measured byte counts with a per-stage cost that lower-bounds the streamed path.
 
 THE TWO MODELS (aggregate over the measured nar set, at a given link bandwidth):
 
@@ -325,9 +329,10 @@ def derive(raw: dict, task99: dict | None) -> dict:
         "measures": "the TASK-99 net-LAN verdict re-evaluated under an IDEALIZED (best-case, "
         "constant-aggregate-rate) PIPELINED serve model",
         "reuses": "the committed TASK-99 harness_raw.json (same shipped /nar/3 codec, same "
-        "integer-exact compress/decompress ns and byte counts); pipelining changes the "
-        "SCHEDULING of that same work. The bulk CPU is reused as a LOWER BOUND on the streamed "
-        "path's CPU (the new raw-stream/channel/alloc overhead is not charged) - see the evidence "
+        "integer-exact compressed/raw byte counts); pipelining changes only the SCHEDULING of the "
+        "same wire bytes. The bulk CPU-ns are reused as a LOWER BOUND on the streamed path's CPU "
+        "(the new raw-stream/channel/alloc overhead is not charged, so the streamed path costs "
+        "measurably MORE - a few percent, up to ~15% run-to-run on a noisy box) - see the evidence "
         "README's measured bulk-vs-streamed encoder cross-check",
         "model_kind": "idealized-best-case-constant-aggregate-rates",
         "model_is_proven_bound": False,
