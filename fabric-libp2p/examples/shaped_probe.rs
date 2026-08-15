@@ -2,10 +2,17 @@
 //!
 //! A tiny two-mode binary the shaped-link harness (`scripts/shaped_libp2p.py` +
 //! `scripts/shaped_libp2p_inner.sh`) launches, one instance per network namespace, so a
-//! real libp2p `discover->fetch->serve` traverses a `tc netem`-shaped `veth` pair (real
+//! real libp2p `/nar/3` NAR transfer traverses a `tc netem`-shaped `veth` pair (real
 //! RTT + bandwidth cap) instead of loopback. It is deliberately an EXAMPLE, not a `src/`
 //! module: link-shaping/measurement machinery must stay out of the shipped daemon
 //! (`scripts/check_shaping_out_of_daemon.py` scans only `src/`).
+//!
+//! WHAT THE FETCH CLOCK TIMES (honest scope, TASK-198 F3). The fetcher is HANDED the provider
+//! multiaddr + PeerId out of band by the harness — it does NO DHT discovery — and the dial +
+//! Noise/yamux handshake complete BEFORE the clock starts. The timed window is therefore an
+//! ALREADY-CONNECTED open-stream `/nar/3` fetch: open the substream, send the request, and stream
+//! the body. Discovery / dial / handshake are OUT of the measured window; do not read the elapsed
+//! as a full discover->fetch->serve round.
 //!
 //!   provide <listen-ip> <port> <id-seed> <nar-bytes> <nar-seed> <peerid-file> [payload-kind]
 //!       Start a node, serve one deterministic NAR, write our PeerId to <peerid-file> once
@@ -218,7 +225,9 @@ async fn fetch(args: &[String]) {
         .expect("provider multiaddr");
 
     // Direct dial by multiaddr (the proven `direct_fetch` idiom from nar_transport.rs):
-    // teach the address book, establish the connection, then open the `/nar/3` stream.
+    // teach the address book, then establish the connection (dial + Noise/yamux handshake).
+    // This all completes BEFORE the clock starts, so the measured window EXCLUDES discovery,
+    // dial, and the handshake — it times an already-connected open-stream `/nar/3` fetch only.
     node.handle
         .add_address(provider_peer, provider_addr.clone())
         .await;
@@ -227,6 +236,10 @@ async fn fetch(args: &[String]) {
         .await
         .expect("dial provider");
 
+    // Clock STARTS on an already-established connection: open the `/nar/3` substream, send the
+    // request, await the first response byte (~one RTT of first-byte latency), then stream the
+    // body. Both arms pay that request round-trip + flow-control ramp once, independent of payload
+    // size — the honest fixed cost that keeps the wall-clock speedup below the wire-byte ratio.
     let t0 = Instant::now();
     let fetched = node
         .handle
