@@ -689,8 +689,8 @@ mod tests {
                     "produced ({produced}) must have crossed the cap ({cap})"
                 );
                 assert!(
-                    produced <= cap + 256 * 1024,
-                    "produced ({produced}) must be bounded by cap + one decode block, not the 8 MiB bomb"
+                    produced <= cap + DECODE_BLOCK as u64,
+                    "produced ({produced}) must be bounded by cap + one 128 KiB decode block, not the 8 MiB bomb"
                 );
             }
             other => panic!("expected OutputTooLarge, got {other}"),
@@ -1149,11 +1149,15 @@ mod tests {
     fn streamed_exact_block_multiples_round_trip() {
         const BLOCK: usize = 128 * 1024; // tracks DECODE_BLOCK
         assert_eq!(BLOCK, DECODE_BLOCK, "test block must track the decoder's");
+        // The FULL {small, BLOCK-1, BLOCK, BLOCK+1} encoder-block x decoder-chunk matrix (F2
+        // completion): land the encoder's and the decoder's block edges AT, JUST BEFORE, and JUST
+        // AFTER the decoder's DECODE_BLOCK boundary from both sides - the exact TASK-99 128 KiB
+        // regression class (including DECODE_BLOCK-1, previously absent) on STREAMED frames.
         for n in 1..=3usize {
             let raw = vec![0u8; n * BLOCK];
-            for enc_block in [4096usize, BLOCK, BLOCK + 1, 7 * 1024] {
+            for enc_block in [4096usize, BLOCK - 1, BLOCK, BLOCK + 1] {
                 let streamed = stream_compress(&raw, DEFAULT_ZSTD_LEVEL, enc_block);
-                for dec_chunk in [1usize, 4096, BLOCK, BLOCK + 1] {
+                for dec_chunk in [1usize, 4096, BLOCK - 1, BLOCK, BLOCK + 1] {
                     let decoded = decode_all(&streamed, raw.len() as u64, dec_chunk)
                         .unwrap_or_else(|e| {
                             panic!(
@@ -1172,19 +1176,36 @@ mod tests {
     }
 
     /// AC#2 ±1 around the block multiple on streamed frames (guard the OTHER direction, so the
-    /// exact-multiple handling did not create an off-by-one).
+    /// exact-multiple handling did not create an off-by-one). The full {small, BLOCK-1, BLOCK,
+    /// BLOCK+1} encoder-block x decoder-chunk matrix is swept here too (F2 completion): the ±1
+    /// case must hold across every block-edge alignment, not just one encoder/decoder config.
     #[test]
     fn streamed_near_block_multiples_round_trip() {
-        const BLOCK: i64 = (128 * 1024) as i64;
-        for n in 1..=3i64 {
+        const BLOCK: usize = 128 * 1024;
+        assert_eq!(BLOCK, DECODE_BLOCK, "test block must track the decoder's");
+        for n in 1..=3usize {
             for delta in [-1i64, 1] {
-                let size = (n * BLOCK + delta) as usize;
+                let size = (n as i64 * BLOCK as i64 + delta) as usize;
                 let raw = vec![0x5au8; size];
-                let streamed = stream_compress(&raw, DEFAULT_ZSTD_LEVEL, 64 * 1024);
-                let decoded = decode_all(&streamed, size as u64, 4096)
-                    .unwrap_or_else(|e| panic!("size={size}: {e}"));
-                assert_eq!(decoded.len(), size, "size={size} decoded length");
-                assert_eq!(decoded, raw, "size={size} streamed frame must round-trip");
+                for enc_block in [4096usize, BLOCK - 1, BLOCK, BLOCK + 1] {
+                    let streamed = stream_compress(&raw, DEFAULT_ZSTD_LEVEL, enc_block);
+                    for dec_chunk in [1usize, 4096, BLOCK - 1, BLOCK, BLOCK + 1] {
+                        let decoded =
+                            decode_all(&streamed, size as u64, dec_chunk).unwrap_or_else(|e| {
+                                panic!("size={size} enc={enc_block} dec={dec_chunk}: {e}")
+                            });
+                        assert_eq!(
+                            decoded.len(),
+                            size,
+                            "size={size} enc={enc_block} dec={dec_chunk} decoded length"
+                        );
+                        assert_eq!(
+                            decoded, raw,
+                            "size={size} enc={enc_block} dec={dec_chunk} streamed frame must \
+                             round-trip"
+                        );
+                    }
+                }
             }
         }
     }
@@ -1237,14 +1258,95 @@ mod tests {
             DecodeError::OutputTooLarge { produced, cap: got } => {
                 assert_eq!(got, cap);
                 assert!(produced > cap, "produced={produced} must cross cap={cap}");
+                // The EXACT bound: `append_capped` rejects when `buf.len() + bytes_written` would
+                // cross the cap, and a single decode step writes at most one `DECODE_BLOCK`
+                // (128 KiB) of scratch while `buf.len() <= cap` still held. So the attempted
+                // crossing is bounded by cap + ONE 128 KiB decode block - not cap + 256 KiB, and
+                // never the 8 MiB bomb. BITE: raise the append step past DECODE_BLOCK and this
+                // tightened bound fails.
                 assert!(
-                    produced <= cap + 256 * 1024,
-                    "produced={produced} must be bounded by cap + one decode block, not the 8 MiB \
-                     bomb"
+                    produced <= cap + DECODE_BLOCK as u64,
+                    "produced={produced} must be bounded by cap + one 128 KiB decode block \
+                     ({}), not the 8 MiB bomb",
+                    cap + DECODE_BLOCK as u64
                 );
             }
             other => panic!("expected OutputTooLarge, got {other}"),
         }
+    }
+
+    /// AC#2 CORRUPTION on a STREAMED frame (F2 completion): a byte flipped mid-frame in a frame
+    /// produced by the STREAMING encoder must make decode FAIL, or decode to DIFFERENT bytes (the
+    /// caller's BLAKE3 recheck then rejects) - it must NEVER silently reproduce the original nar.
+    /// Sweeps several flip positions across a genuinely multi-block streamed frame so a corrupt
+    /// byte in a mid-stream block, not only the header, is exercised. The decode side is unchanged,
+    /// but this proves the NEW producer's frames still fail closed on corruption.
+    #[test]
+    fn streamed_frame_corruption_fails_closed() {
+        const BLOCK: usize = 128 * 1024;
+        // A multi-block low-entropy nar so the streamed frame carries several internal zstd blocks.
+        let mut raw = Vec::with_capacity(3 * BLOCK);
+        let mut x: u32 = 0x2468_ace0;
+        while raw.len() < 3 * BLOCK {
+            x = x.wrapping_mul(1103515245).wrapping_add(12345);
+            raw.push(((x >> 24) & 0x0f) as u8);
+        }
+        let frame = stream_compress(&raw, DEFAULT_ZSTD_LEVEL, BLOCK);
+        assert!(frame.len() > 16, "streamed frame must be non-trivial");
+        // Flip a byte at positions spread across the frame - past the magic/header (len/4), the
+        // middle (len/2), and the footer (len-2) - covering corruption in different internal
+        // blocks of the streamed frame.
+        for pos in [frame.len() / 4, frame.len() / 2, frame.len() - 2] {
+            let mut corrupt = frame.clone();
+            corrupt[pos] ^= 0xff;
+            match decode_all(&corrupt, raw.len() as u64, 4096) {
+                Err(_) => {} // rejected at the codec: fail closed.
+                Ok(decoded) => assert_ne!(
+                    decoded, raw,
+                    "a corrupt streamed frame (flip@{pos}) must not silently reproduce the nar"
+                ),
+            }
+        }
+    }
+
+    /// AC#2 WINDOW bound on a STREAMED frame (F2 completion): a streamed frame whose zstd window
+    /// exceeds the decoder's window-log ceiling is rejected BEFORE any output - a hostile header
+    /// cannot force a huge window allocation, and the streaming producer does not weaken that.
+    /// BITE: the SAME streamed frame decodes cleanly under the production ceiling, proving the
+    /// ceiling - not the content - is what rejects it.
+    #[test]
+    fn streamed_frame_window_bound_bites() {
+        // 2 MiB of HIGH-ENTROPY data (splitmix64): a multi-block streamed frame with a real window
+        // descriptor (~window log 21), above the tight 2^17 ceiling below and high-entropy so the
+        // encoder cannot shrink the window. Fed through the STREAMING encoder in 128 KiB blocks.
+        let mut state: u64 = 0x0BADC0DE_DEADBEEF;
+        let raw: Vec<u8> = (0..2 * 1024 * 1024u32)
+            .map(|_| {
+                state = state.wrapping_add(0x9E3779B97F4A7C15);
+                let mut z = state;
+                z = (z ^ (z >> 30)).wrapping_mul(0xBF58476D1CE4E5B9);
+                z = (z ^ (z >> 27)).wrapping_mul(0x94D049BB133111EB);
+                (z ^ (z >> 31)) as u8
+            })
+            .collect();
+        let streamed = stream_compress(&raw, 3, 128 * 1024);
+
+        // A TIGHT ceiling (2^17 = 128 KiB window) below the frame's window: rejected at the
+        // header, before any large window allocation.
+        let mut tight = BoundedZstdDecoder::with_window_log_max(raw.len() as u64, 17).unwrap();
+        let err = tight
+            .push(&streamed)
+            .expect_err("a streamed frame whose window exceeds the ceiling must be rejected");
+        assert!(
+            matches!(err, DecodeError::Zstd(_)),
+            "expected a zstd window error, got {err}"
+        );
+
+        // The SAME streamed frame decodes cleanly under the production ceiling - the bound, not
+        // the content, is what bit above.
+        let decoded = decode_all(&streamed, raw.len() as u64, 64 * 1024)
+            .expect("the same streamed frame decodes under the production window ceiling");
+        assert_eq!(decoded, raw);
     }
 
     /// The streamed frame size stays within a hair of the bulk frame (feeding blocks does not
@@ -1273,6 +1375,70 @@ mod tests {
         assert!(
             (s - b).abs() * 64 <= b,
             "streamed {s} vs bulk {b} diverge > ~1/64 - the size-reuse assumption is unsafe"
+        );
+    }
+
+    /// MEASURED cross-check for the TASK-203 AC#3 model's "CPU unchanged" assumption (F1). The
+    /// pipelined makespan model reuses TASK-99's BULK compress CPU-ns for the STREAMED serve path;
+    /// codex correctly flagged that the streamed path is different code (per-block `compress_block`
+    /// calls, a per-block output allocation) so its CPU is not automatically equal to bulk. This
+    /// measures the streamed encoder's compress wall-ns vs `compress_zstd`'s on the SAME buffer, so
+    /// the model's assumption is a MEASURED near-equality rather than an unverified claim.
+    ///
+    /// Ignored by default (it is a wall-clock MEASUREMENT, not a pass/fail invariant, and timing
+    /// tests must not flake the gate). Run explicitly to capture the datum:
+    ///   `cargo test -p peer-fabric measure_streamed_vs_bulk_compress_cpu -- --ignored --nocapture`
+    /// The loose `streamed <= 2x bulk` guard only catches an ORDER-OF-MAGNITUDE regression; the
+    /// reported ppm delta is the honest number recorded in evidence/task-203/.../README.md.
+    #[test]
+    #[ignore = "wall-clock measurement; run explicitly with --ignored --nocapture"]
+    fn measure_streamed_vs_bulk_compress_cpu() {
+        use std::time::Instant;
+        const BLOCK: usize = 128 * 1024;
+        // ~32 MiB of low-entropy bytes standing in for a mixed real-nar corpus (compressible, so
+        // the compressor is doing genuine level-3 work, not just copying incompressible bytes).
+        let total = 32 * 1024 * 1024;
+        let mut raw = Vec::with_capacity(total);
+        let mut x: u32 = 0x1234_5678;
+        while raw.len() < total {
+            x = x.wrapping_mul(1103515245).wrapping_add(12345);
+            raw.push(((x >> 24) & 0x0f) as u8);
+        }
+
+        // Min wall-ns over a few iterations is the cleanest CPU proxy (least scheduler noise).
+        let iters = 5;
+        let mut bulk_ns = u128::MAX;
+        let mut streamed_ns = u128::MAX;
+        let mut bulk_len = 0usize;
+        let mut streamed_len = 0usize;
+        for _ in 0..iters {
+            let t = Instant::now();
+            let bulk = compress_zstd(&raw, DEFAULT_ZSTD_LEVEL).unwrap();
+            bulk_ns = bulk_ns.min(t.elapsed().as_nanos());
+            bulk_len = bulk.len();
+
+            let t = Instant::now();
+            let streamed = stream_compress(&raw, DEFAULT_ZSTD_LEVEL, BLOCK);
+            streamed_ns = streamed_ns.min(t.elapsed().as_nanos());
+            streamed_len = streamed.len();
+        }
+
+        // Integer ppm delta (display only): (streamed - bulk) / bulk in parts-per-million.
+        let delta_ppm = (streamed_ns as i128 - bulk_ns as i128) * 1_000_000 / bulk_ns as i128;
+        eprintln!(
+            "measure_streamed_vs_bulk_compress_cpu ({} MiB, level {DEFAULT_ZSTD_LEVEL}, min of \
+             {iters}):\n  bulk     compress = {bulk_ns:>13} ns  ({bulk_len} B frame)\n  streamed \
+             compress = {streamed_ns:>13} ns  ({streamed_len} B frame)\n  streamed vs bulk delta \
+             = {delta_ppm} ppm (positive = streamed slower)",
+            total / (1024 * 1024),
+        );
+
+        // Loose integer guard: an ORDER-OF-MAGNITUDE blowup (streamed > 2x bulk) would mean the
+        // model's bulk-CPU reuse is unsafe. The measured delta is far under this - see the README.
+        assert!(
+            streamed_ns <= bulk_ns.saturating_mul(2),
+            "streamed compress CPU {streamed_ns} ns > 2x bulk {bulk_ns} ns - the model's \
+             bulk-CPU-reuse assumption is unsafe"
         );
     }
 }
