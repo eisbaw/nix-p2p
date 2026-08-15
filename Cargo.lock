@@ -993,6 +993,8 @@ dependencies = [
  "http-body-util",
  "peer-fabric",
  "tokio",
+ "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]

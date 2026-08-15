@@ -56,7 +56,18 @@ struct Config {
     want_mass_query: bool,
     libp2p_bootstrap: Vec<(PeerId, Multiaddr)>,
     libp2p_provider_addrs: Vec<(PeerId, Multiaddr)>,
-    libp2p_listen: Option<Multiaddr>,
+    /// `--libp2p-listen` bind multiaddrs, REPEATABLE (TASK-207). The FIRST is bound through the
+    /// shared construction (`Libp2pSourceConfig.listen`); any EXTRA are applied post-build via the
+    /// fabric handle. A NAT'd provider needs two: a real transport bind (so the relay-client can
+    /// open its reservation connection) AND a relay `/…/p2p-circuit` address (the reservation
+    /// request) - the two `listen()` calls `fabric-libp2p/tests/nat_traversal.rs` makes.
+    libp2p_listen: Vec<Multiaddr>,
+    /// `--libp2p-external-address` self-advertised reachable multiaddrs, REPEATABLE (TASK-207).
+    /// Wired to the existing `SwarmHandle::add_external_address` so identify propagates them and,
+    /// on a relay node, the circuit-v2 SERVER can cite them in reservation vouchers (without a
+    /// known external address a relay answers reservations with `NoAddressesInReservation`). This
+    /// advertises the node's OWN address (like autonat/identify), never a third-party dial hint.
+    libp2p_external_addresses: Vec<Multiaddr>,
     libp2p_scope: Option<String>,
     libp2p_identity_seed: Option<[u8; 32]>,
     libp2p_provider: bool,
@@ -164,7 +175,8 @@ fn parse_config<I: IntoIterator<Item = String>>(args: I) -> Result<Config, Strin
         want_mass_query: true,
         libp2p_bootstrap: Vec::new(),
         libp2p_provider_addrs: Vec::new(),
-        libp2p_listen: None,
+        libp2p_listen: Vec::new(),
+        libp2p_external_addresses: Vec::new(),
         libp2p_scope: None,
         libp2p_identity_seed: None,
         libp2p_provider: false,
@@ -208,13 +220,16 @@ fn parse_config<I: IntoIterator<Item = String>>(args: I) -> Result<Config, Strin
             "--libp2p-provider-addr" => cfg
                 .libp2p_provider_addrs
                 .push(parse_libp2p_peer("--libp2p-provider-addr", &value()?)?),
-            "--libp2p-listen" => {
-                cfg.libp2p_listen = Some(
-                    value()?
-                        .parse()
-                        .map_err(|e| format!("bad --libp2p-listen multiaddr: {e}"))?,
-                )
-            }
+            "--libp2p-listen" => cfg.libp2p_listen.push(
+                value()?
+                    .parse()
+                    .map_err(|e| format!("bad --libp2p-listen multiaddr: {e}"))?,
+            ),
+            "--libp2p-external-address" => cfg.libp2p_external_addresses.push(
+                value()?
+                    .parse()
+                    .map_err(|e| format!("bad --libp2p-external-address multiaddr: {e}"))?,
+            ),
             "--libp2p-scope" => cfg.libp2p_scope = Some(value()?),
             "--libp2p-identity-seed" => {
                 cfg.libp2p_identity_seed = Some(parse_libp2p_seed(&value()?)?)
@@ -256,8 +271,20 @@ fn parse_config<I: IntoIterator<Item = String>>(args: I) -> Result<Config, Strin
                     .into(),
             );
         }
-        if cfg.libp2p_listen.is_none() {
+        if cfg.libp2p_listen.is_empty() {
             return Err("--libp2p-provider requires --libp2p-listen".into());
+        }
+        // TASK-207 fail-closed: an external address advertises PUBLIC reachability. On a provider
+        // WITHOUT the public-NAR allowlist door that is an isolated-LAN announce (lan_share_or_refuse),
+        // where advertising a public self-address contradicts the isolation the announce relies on -
+        // refuse rather than announce local content over a self-declared public address. With the
+        // allowlist door set the announce is gated per-NAR, so external addresses are fine.
+        if !cfg.libp2p_external_addresses.is_empty() && cfg.libp2p_public_allowlist_path.is_none() {
+            return Err(
+                "--libp2p-external-address on a provider requires --libp2p-public-allowlist-path: \
+                 advertising a public self-address is incompatible with an isolated-LAN announce"
+                    .into(),
+            );
         }
     } else if cfg.libp2p_bootstrap.is_empty() {
         return Err(
@@ -299,7 +326,9 @@ fn source_config(cfg: &Config) -> Result<Libp2pSourceConfig, String> {
     Ok(Libp2pSourceConfig {
         identity_seed,
         network_scope: cfg.libp2p_scope.clone().unwrap_or_else(|| "v1".to_string()),
-        listen: cfg.libp2p_listen.clone(),
+        // The FIRST --libp2p-listen is bound by the shared construction; any EXTRA listens (and all
+        // external addresses) are applied post-build in `main` via the fabric handle (TASK-207).
+        listen: cfg.libp2p_listen.first().cloned(),
         bootstrap: cfg.libp2p_bootstrap.clone(),
         provider_addrs: cfg.libp2p_provider_addrs.clone(),
         discovery_budget: DiscoveryBudget::default(),
@@ -357,11 +386,25 @@ fn warn_if_non_durable_provider(source_cfg: &Libp2pSourceConfig) {
 /// refused. Keeping the Config->reachability mapping in ONE tested place is what closes the residual
 /// hole where `--libp2p-provider-addr` + empty bootstrap slipped through a bootstrap-only check.
 fn lan_share_or_refuse(cfg: &Config) -> Result<LanShare, String> {
-    lan_isolation_or_refuse(LanReachability {
-        bootstrap: &cfg.libp2p_bootstrap,
-        provider_addrs: &cfg.libp2p_provider_addrs,
-        listen: cfg.libp2p_listen.as_ref(),
-    })
+    // --libp2p-listen is repeatable (TASK-207), so EVERY listen must pass the isolation witness:
+    // one non-loopback/non-link-local listen makes the node publicly reachable regardless of the
+    // others. Refuse on the first that fails; the bootstrap/provider-addr signals refuse up front
+    // (they are listen-independent). A node with no listen at all still runs the witness once.
+    fn witness(cfg: &Config, listen: Option<&Multiaddr>) -> Result<LanShare, String> {
+        lan_isolation_or_refuse(LanReachability {
+            bootstrap: &cfg.libp2p_bootstrap,
+            provider_addrs: &cfg.libp2p_provider_addrs,
+            listen,
+        })
+    }
+    if cfg.libp2p_listen.is_empty() {
+        return witness(cfg, None);
+    }
+    let mut share = None;
+    for listen in &cfg.libp2p_listen {
+        share = Some(witness(cfg, Some(listen))?);
+    }
+    Ok(share.expect("non-empty listen set yields a LanShare"))
 }
 
 /// Node B (PROVIDER): start the fabric WITH a supplier, install the serve gate, and announce.
@@ -665,6 +708,27 @@ fn run_raw_nar_helper() -> Option<ExitCode> {
     }
 }
 
+/// Install a stderr `tracing` subscriber when `RUST_LOG` is set, so the fabric's NAT-traversal
+/// diagnostics (autonat reachability verdict, relay circuit-v2 reservation, dcutr hole-punch
+/// outcome - all emitted at info/debug by `fabric-libp2p`) are visible for diagnosing a "works in
+/// the harness, fails behind NAT" incident. Coarse level mapping (no `env-filter` dependency):
+/// `RUST_LOG=debug|trace` -> DEBUG (also shows the relay SERVER's per-circuit forwarding), anything
+/// else -> INFO. Unset `RUST_LOG` installs no subscriber - the daemon stays quiet and its existing
+/// `println!` status lines are unchanged, so no test or deployment behaviour shifts.
+fn init_tracing() {
+    if let Ok(v) = std::env::var("RUST_LOG") {
+        let level = if v.eq_ignore_ascii_case("debug") || v.eq_ignore_ascii_case("trace") {
+            tracing::Level::DEBUG
+        } else {
+            tracing::Level::INFO
+        };
+        let _ = tracing_subscriber::fmt()
+            .with_max_level(level)
+            .with_writer(std::io::stderr)
+            .try_init();
+    }
+}
+
 #[tokio::main]
 async fn main() -> ExitCode {
     // Internal process-isolation boundary for raw-file supply, handled before configuration:
@@ -672,6 +736,8 @@ async fn main() -> ExitCode {
     if let Some(code) = run_raw_nar_helper() {
         return code;
     }
+
+    init_tracing();
 
     let cfg = match parse_config(std::env::args().skip(1)) {
         Ok(cfg) => cfg,
@@ -781,6 +847,24 @@ async fn main() -> ExitCode {
             }
         }
     };
+
+    // TASK-207: apply the EXTRA --libp2p-listen addresses (the first was bound by the shared
+    // construction) and ALL --libp2p-external-address self-advertisements now that the fabric
+    // exists. Extra listens carry a NAT'd provider's relay `/…/p2p-circuit` reservation; external
+    // addresses let a relay node cite its public address in reservation vouchers. Fail-fast on a
+    // listen error (a requested reservation address that cannot be registered is a config fault,
+    // not something to serve around silently); add_external_address is a fire-and-forget hint.
+    for extra in cfg.libp2p_listen.iter().skip(1) {
+        if let Err(err) = fabric.handle().listen(extra.clone()).await {
+            eprintln!("daemon-libp2p: cannot listen on {extra}: {err}");
+            return ExitCode::FAILURE;
+        }
+        println!("daemon-libp2p: additional libp2p listen {extra}");
+    }
+    for ext in &cfg.libp2p_external_addresses {
+        fabric.handle().add_external_address(ext.clone()).await;
+        println!("daemon-libp2p: advertising external address {ext}");
+    }
 
     let listener = match TcpListener::bind(cfg.listen).await {
         Ok(l) => l,
@@ -899,7 +983,8 @@ mod bootstrap_guard_tests {
             want_mass_query: true,
             libp2p_bootstrap: bootstrap,
             libp2p_provider_addrs: provider_addrs,
-            libp2p_listen: listen,
+            libp2p_listen: listen.into_iter().collect(),
+            libp2p_external_addresses: Vec::new(),
             libp2p_scope: None,
             libp2p_identity_seed: None,
             libp2p_provider: true,
@@ -1064,6 +1149,117 @@ mod public_allowlist_parity_tests {
         assert!(
             err.contains("--libp2p-trusted-public-key"),
             "the refusal must require at least one trusted key: {err}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod nat_flags_tests {
+    //! TASK-207: `--libp2p-listen` is REPEATABLE and `--libp2p-external-address` is NEW - the two
+    //! additive knobs that let the shipped binary drive the relay circuit-v2 path (a provider binds
+    //! a real transport AND a `/…/p2p-circuit` reservation; a relay advertises its public address so
+    //! reservation vouchers are not empty). These drive the binary's OWN `parse_config`, so a
+    //! regression in the repeatable-listen or external-address wiring is caught here.
+    use super::parse_config;
+
+    const APP_NAR_HASH: &str = "sha256:0pgsb9mjmfj57w1ddmqn9z9667nwbqbnn699j1s1s99jhy6cppsm";
+    const FIXTURE_PUBKEY: &str = "nix-p2p-test-1:empdFBu9wVZG12rPKToHMOTsU1qzWzeCcLdq/KQH0JQ=";
+    const RELAY_ID: &str = "12D3KooWBr7cTGxmMhdiGNcbesEusWMR1VG26jEQQgFr6wwZkNNf";
+
+    fn args(parts: &[&str]) -> Vec<String> {
+        parts.iter().map(|s| (*s).to_string()).collect()
+    }
+
+    /// A NAT'd provider binds TWO listens: a direct transport bind AND a relay `/p2p-circuit`
+    /// reservation address. Both must be retained IN ORDER (the first flows through the shared
+    /// construction, the rest are applied post-build).
+    #[test]
+    fn libp2p_listen_is_repeatable_and_ordered() {
+        let circuit = format!("/ip4/10.0.0.1/tcp/4001/p2p/{RELAY_ID}/p2p-circuit");
+        let cfg = parse_config(args(&[
+            "--libp2p-provider",
+            "--libp2p-listen",
+            "/ip4/192.168.2.3/tcp/4001",
+            "--libp2p-listen",
+            &circuit,
+            "--libp2p-seed-nar",
+            &format!("{APP_NAR_HASH}=/tmp/app.nar"),
+            "--libp2p-public-allowlist-path",
+            "/tmp/nix-p2p-allowlist",
+            "--libp2p-trusted-public-key",
+            FIXTURE_PUBKEY,
+        ]))
+        .expect("a provider with two --libp2p-listen addresses parses");
+        assert_eq!(cfg.libp2p_listen.len(), 2, "both listens retained");
+        assert_eq!(
+            cfg.libp2p_listen[0].to_string(),
+            "/ip4/192.168.2.3/tcp/4001",
+            "the direct transport bind is first"
+        );
+        assert!(
+            cfg.libp2p_listen[1].to_string().contains("p2p-circuit"),
+            "the circuit reservation address is second: {}",
+            cfg.libp2p_listen[1]
+        );
+    }
+
+    /// A relay/bootstrap node (a consumer-shaped node) advertises its public address via
+    /// `--libp2p-external-address`; repeatable, and it parses into the external-address vec.
+    #[test]
+    fn external_address_is_repeatable_on_a_consumer() {
+        let cfg = parse_config(args(&[
+            "--libp2p-bootstrap",
+            &format!("{RELAY_ID}@/ip4/10.0.0.9/tcp/1"),
+            "--libp2p-listen",
+            "/ip4/192.168.1.5/tcp/4001",
+            "--libp2p-external-address",
+            "/ip4/192.168.1.5/tcp/4001",
+        ]))
+        .expect("a consumer/relay with an external address parses");
+        assert_eq!(cfg.libp2p_external_addresses.len(), 1);
+        assert_eq!(
+            cfg.libp2p_external_addresses[0].to_string(),
+            "/ip4/192.168.1.5/tcp/4001"
+        );
+    }
+
+    /// Fail-closed: an external address on a provider WITHOUT the public-allowlist door is refused
+    /// (it would advertise a public self-address for an isolated-LAN announce). The bite: drop the
+    /// validation and this config is silently accepted.
+    #[test]
+    fn external_address_on_a_provider_without_allowlist_is_refused() {
+        let Err(err) = parse_config(args(&[
+            "--libp2p-provider",
+            "--libp2p-listen",
+            "/ip4/127.0.0.1/tcp/0",
+            "--libp2p-seed-nar",
+            &format!("{APP_NAR_HASH}=/tmp/app.nar"),
+            "--libp2p-external-address",
+            "/ip4/1.2.3.4/tcp/4001",
+        ])) else {
+            panic!("an external address on an isolated-LAN provider must be refused");
+        };
+        assert!(
+            err.contains("--libp2p-external-address")
+                && err.contains("--libp2p-public-allowlist-path"),
+            "the refusal must name the external-address flag and require the allowlist door: {err}"
+        );
+    }
+
+    /// A bad multiaddr on either new flag fails fast (never a silently-ignored knob).
+    #[test]
+    fn bad_external_address_multiaddr_fails_fast() {
+        let Err(err) = parse_config(args(&[
+            "--libp2p-bootstrap",
+            &format!("{RELAY_ID}@/ip4/10.0.0.9/tcp/1"),
+            "--libp2p-external-address",
+            "not-a-multiaddr",
+        ])) else {
+            panic!("a malformed --libp2p-external-address must be refused");
+        };
+        assert!(
+            err.contains("--libp2p-external-address"),
+            "the parse error must name the flag: {err}"
         );
     }
 }
