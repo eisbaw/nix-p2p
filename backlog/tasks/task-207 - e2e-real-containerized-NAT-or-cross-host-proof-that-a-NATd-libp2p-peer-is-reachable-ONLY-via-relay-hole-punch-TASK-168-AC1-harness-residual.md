@@ -6,7 +6,7 @@ title: >-
 status: In Progress
 assignee: []
 created_date: '2026-08-14 17:19'
-updated_date: '2026-08-15 13:14'
+updated_date: '2026-08-15 14:33'
 labels:
   - libp2p
   - fabric
@@ -109,4 +109,12 @@ B2 BLOCKER (nat-vm-test.nix:418, main.rs:812/851) confounded bite: install_provi
 H1 HIGH (nat-vm-test.nix:5/387) discovery OVERCLAIMED as proven: the subtest ignores fetch results and its log grep ends with a bare or-true, so a zero-provider-record run passes identically. Fix: GATE an explicit discovered-at-least-1-provider-record assertion, OR consistently label discovery non-gating/UNPROVEN in the header + report.
 H2 HIGH (nat-vm-test.nix:29): iptables random-fully is source-port randomization, NOT symmetric-NAT (endpoint-dependent mapping/filtering, unmeasured); the harness cannot categorically claim DCUtR is precluded. Fix: DROP the symmetric-NAT/no-DCUtR categorical claim for the reservation-only partial, OR add a deterministic direct-path block + a DCUtR-negative oracle.
 Next: harden the harness (B1 topology enforcement, B2 independent-bootstrap+active-provider assert, H1 discovery honesty, H2 drop/prove NAT-type), re-gate. Core mechanism sound; rigor insufficient.
+
+FINALIZATION landed + orchestrator-verified (recovery commit d602839; the finalization agent left it uncommitted after the VM run). codex B1/H1/H2 findings ADDRESSED, B2 honestly deferred:
+B1 FIXED: negative control now enforces the NAT topology (exclusive interfaces/addresses, ip route get via gwa with the private source, live listener via ss, MASQUERADE counters increment during the outbound control) -> no longer passes on a stray public interface.
+H1 FIXED: discovery gated (observed discovered>=1 provider record; the bare or-true removed); dial-address-resolution + byte-fetch kept explicitly non-gating / UNPROVEN (TASK-218); header/report wording matches.
+H2 FIXED: dropped the unfounded symmetric-NAT-therefore-no-DCUtR categorical claim; unit renamed symmetric-nat to nat-masquerade; framed as a reservation-only partial.
+B2 RESOLVED-AS-DEFERRED: NOT shipped as a tautological provider-side bite (libp2p 0.18 connection-scoped reservation renewal makes an in-process re-attempt unobservable). Keeps the real reservation EVENT as positive proof + supporting structural guards, incl. a NEW additive --libp2p-no-relay-server (module services.nix-p2p.libp2p) so zboot runs kad-only and no ALTERNATIVE relay path exists. The LOAD-BEARING consumer-side end-to-end reachability bite (relay-up fetch-through-relay / relay-down fresh-fetch-fails) is DEFERRED to TASK-218.
+VERIFIED (orchestrator): nix build .#nat-vm-test PASSED (daemon-libp2p tests all green during the VM run, VMs cleaned up); cargo test daemon-libp2p + daemon 0-failed; fmt + clippy -D-warnings + no-floats clean; frozen surfaces untouched; module additive (existing TASK-10 e2e-vm unaffected). No co-author.
+STATUS: In Progress. The FINAL codex re-gate of the complete NAT harness happens when TASK-218 lands the byte-fetch + the load-bearing reachability bite. 168 AC#1 still blocked on 218.
 <!-- SECTION:NOTES:END -->
