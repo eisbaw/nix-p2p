@@ -606,8 +606,14 @@ pkgs.testers.runNixOSTest {
         nodeb.systemctl("start nix-p2p-daemon.service")
         nodeb.wait_for_unit("nix-p2p-daemon.service")
         # The consumer side of the SHIPPED module comes up + serves (proves the
-        # module deploys a working libp2p consumer node).
-        nodeb.wait_until_succeeds("curl -sf http://127.0.0.1:8082/nix-cache-info", timeout=60)
+        # module deploys a working libp2p consumer node). NOTE the headroom: the shipped
+        # consumer binds its local HTTP listener only AFTER build_libp2p_nar_source
+        # returns, which AWAITS the bootstrap dials to the relay + zboot through gwb's
+        # NAT (daemon-libp2p start_and_join_libp2p; each dial().await blocks until it
+        # connects or fails). On a cold 6-VM emulated-NAT boot those dials can take tens
+        # of seconds, so this LIVENESS precondition (not an oracle) gets a generous
+        # bound. The discovery GATE below keeps its own independent 300s budget.
+        nodeb.wait_until_succeeds("curl -sf http://127.0.0.1:8082/nix-cache-info", timeout=180)
         # ABSENT-BEFORE: the consumer genuinely does not hold payloadA (non-vacuous).
         nodeb.fail("nix-store -q --hash ${payloadA}")
 
