@@ -21,29 +21,52 @@ THE TWO MODELS (aggregate over the measured nar set, at a given link bandwidth):
      the finalizer asserts against the committed measurement.json when given `--task99`):
          serial_total_ns = compress_ns + link_ns + decompress_ns
 
-  PIPELINED (TASK-203): compress, link and decompress run CONCURRENTLY on blocks in order. With
-     constant per-stage rates and in-order blocks, the makespan of a 3-stage pipeline is the
-     BOTTLENECK stage's total time plus the fill+drain of the two NON-bottleneck stages (each a
-     single block, since they are faster than the bottleneck and never make it wait):
+  PIPELINED (TASK-203): compress, link and decompress run CONCURRENTLY on blocks in order. Under
+     CONSTANT AGGREGATE per-stage rates and in-order blocks, the makespan of a 3-stage pipeline is
+     the BOTTLENECK stage's total time plus the fill+drain of the two NON-bottleneck stages (each a
+     single block, since at their AGGREGATE rate they are faster than the bottleneck and never make
+     it wait):
          pipelined_total_ns = bottleneck_total_ns + one_block(other stage A) + one_block(other stage B)
-     This is the EXACT makespan under constant aggregate rates, and an UPPER BOUND on the real
-     pipeline (real per-block variation only lets downstream stages get further ahead). So a
-     verdict "zstd beats raw pipelined" derived from it is CONSERVATIVE - it holds a fortiori for
-     the real, finer-grained pipeline.
+
+     THIS IS AN IDEALIZED / BEST-CASE ESTIMATE, NOT A PROVEN BOUND. It holds EXACTLY only under the
+     stated assumptions, and it is explicitly NOT an upper bound on the real pipeline. Two reasons,
+     stated honestly so the reader is not misled:
+       (1) PER-BLOCK RATE VARIATION can BEAT it. Aggregate constant rates do not bound a pipeline
+           whose per-block rates vary: a downstream stage that is slow on an EARLY block stalls the
+           whole line even though its AGGREGATE rate is fast. Counterexample (3 blocks, per-block
+           service times) compress[5,5] / link[8,1] / decode[1,8]: this model predicts 19, but the
+           real in-order schedule takes 22. So the real pipeline can be SLOWER than this estimate,
+           not only faster.
+       (2) STREAMING / CHANNEL / ALLOCATION OVERHEAD is NOT charged. The model reuses TASK-99's
+           BULK single-call compress/decompress CPU-ns. The TASK-203 serve path is different code:
+           raw-stream `compress_block` calls, a per-block output allocation, an mpsc channel + a
+           `spawn_blocking` hop, and scheduling. That overhead is real and unmodeled here, so the
+           TASK-99 bulk CPU is a LOWER BOUND on the new path's CPU, not an equality. See the
+           evidence README's MEASURED cross-check of the bulk-vs-streamed encoder CPU, and the
+           SENSITIVITY THRESHOLD below (`overhead_to_erase_flip`) for how much such overhead would
+           erase the level-3 flip.
 
   raw_delivery_ns = sum_raw_bytes sent uncompressed over the link.
   zstd_beats_raw  = (zstd model total_ns) < raw_delivery_ns   [integer compare]
 
-THE HONEST HEADLINE the model yields (it is NOT a rubber stamp - it still says zstd LOSES where
-the compressor is the true bottleneck, e.g. level 19 on a LAN, whose ~2.7 MB/s compress cannot
-outrun a 204 MB/s link even pipelined): on the ~204 MB/s LAN the serial model had zstd-3
-marginally LOSING (compress+decompress added in series with the link), while the PIPELINED model
-has zstd-3 BEATING raw - because the level-3 compressor (~316 MB/s) outruns the LAN (~204 MB/s),
-so compressing-and-overlapping delivers the ~4.5x-smaller compressed volume FASTER than shipping
-the raw volume. The serial penalty was purely the in-series compress/decompress latency;
-pipelining hides it behind the bottleneck. If instead the model shows zstd still losing (a
-CPU-bound operator, or level 19), that is the honest 'raw on a fast LAN' fallback (the shipped
-codec keeps raw as the mandatory floor, so such an operator lowers the level or disables zstd).
+  SENSITIVITY (integer-exact, reported per band as `overhead_to_erase_flip` num/denom): when the
+     model shows a flip, we also report how much EXTRA per-block streaming overhead - expressed as
+     a fraction of the bottleneck (compress) budget - would push the pipelined estimate back up to
+     `raw_delivery_ns` and ERASE the flip: (raw_delivery_ns - pipelined_total_ns) / bottleneck_ns.
+     This is the honest margin: the flip survives only if the unmodeled overhead stays below it.
+
+THE HEADLINE the model yields (it is NOT a rubber stamp - it still says zstd LOSES where the
+compressor is the true bottleneck, e.g. level 19 on a LAN, whose ~2.7 MB/s compress cannot outrun
+a 204 MB/s link even pipelined): on the ~204 MB/s LAN the serial model had zstd-3 marginally
+LOSING (compress+decompress added in series with the link), while under this IDEALIZED pipelined
+model zstd-3 BEATS raw - because the level-3 compressor's AGGREGATE ~316 MB/s outruns the LAN
+(~204 MB/s), so compressing-and-overlapping the ~4.5x-smaller compressed volume delivers it faster
+than shipping the raw volume, IF the per-block rates are near their aggregate and the streaming
+overhead stays under the reported sensitivity margin. The serial penalty was the in-series
+compress/decompress latency; pipelining hides it behind the bottleneck. Where the model shows zstd
+still losing (a CPU-bound operator, or level 19), that is the honest 'raw on a fast LAN' fallback
+(the shipped codec keeps raw as the mandatory floor, so such an operator lowers the level or
+disables zstd).
 
 Usage:
   task203_pipelined_measure.py --raw <task-99 harness.json> [--out <evidence.json>]
@@ -195,6 +218,24 @@ def net_at_bandwidth(s: dict, bw: int) -> dict:
         block_ns for name, (_total, block_ns) in stages.items() if name != bottleneck_stage
     )
     pipelined_total = bottleneck_total + fill_drain_ns
+    pipelined_beats_raw = pipelined_total < raw_delivery_ns
+
+    # SENSITIVITY (integer-exact rational): how much EXTRA per-block streaming overhead, as a
+    # fraction of the bottleneck (compress) budget, would push the IDEALIZED pipelined estimate
+    # back up to raw_delivery_ns and ERASE the flip. Only meaningful when the model shows a flip
+    # (pipelined currently beats raw); null otherwise. This is the honest margin the unmodeled
+    # streaming/channel/alloc overhead must stay under - it is NOT a claim the flip is proven.
+    if pipelined_beats_raw and bottleneck_total > 0:
+        margin_ns = raw_delivery_ns - pipelined_total  # > 0 here
+        overhead_to_erase_flip = {
+            "margin_ns": margin_ns,
+            "bottleneck_ns": bottleneck_total,
+            "fraction_pair": [margin_ns, bottleneck_total],
+            "fraction_display": frac_str(Fraction(margin_ns, bottleneck_total)),
+        }
+    else:
+        overhead_to_erase_flip = None
+
     pipelined = {
         "bottleneck_stage": bottleneck_stage,
         "bottleneck_total_ns": bottleneck_total,
@@ -203,7 +244,12 @@ def net_at_bandwidth(s: dict, bw: int) -> dict:
         "decompress_block_ns": decompress_block_ns,
         "fill_drain_ns": fill_drain_ns,
         "total_ns": pipelined_total,
-        "zstd_beats_raw": pipelined_total < raw_delivery_ns,
+        "zstd_beats_raw": pipelined_beats_raw,
+        # An IDEALIZED best-case estimate under constant aggregate rates - NOT an upper bound (see
+        # the module docstring: per-block variation can beat it; streaming overhead is uncharged).
+        "model": "idealized-best-case-constant-aggregate-rates",
+        "is_proven_bound": False,
+        "overhead_to_erase_flip": overhead_to_erase_flip,
     }
 
     return {
@@ -276,10 +322,24 @@ def derive(raw: dict, task99: dict | None) -> dict:
 
     return {
         "task": "task-203",
-        "measures": "the TASK-99 net-LAN verdict re-evaluated under the PIPELINED serve model",
+        "measures": "the TASK-99 net-LAN verdict re-evaluated under an IDEALIZED (best-case, "
+        "constant-aggregate-rate) PIPELINED serve model",
         "reuses": "the committed TASK-99 harness_raw.json (same shipped /nar/3 codec, same "
         "integer-exact compress/decompress ns and byte counts); pipelining changes the "
-        "SCHEDULING of that same work, not the bytes or the CPU cost",
+        "SCHEDULING of that same work. The bulk CPU is reused as a LOWER BOUND on the streamed "
+        "path's CPU (the new raw-stream/channel/alloc overhead is not charged) - see the evidence "
+        "README's measured bulk-vs-streamed encoder cross-check",
+        "model_kind": "idealized-best-case-constant-aggregate-rates",
+        "model_is_proven_bound": False,
+        "model_caveats": [
+            "per-block rate variation can make the real pipeline SLOWER than this estimate "
+            "(aggregate constant rates are not an upper bound; counterexample compress[5,5]/"
+            "link[8,1]/decode[1,8] -> model 19, real 22)",
+            "streaming/channel/allocation overhead of the TASK-203 serve path is not modeled; "
+            "TASK-99 bulk compress CPU is a lower bound on the streamed path's CPU",
+            "a live two-ends-shaped serve trace (TASK-198) is out of scope; the flip is a "
+            "conditional estimate, not a measured wall-clock result",
+        ],
         "integer_exact": True,
         "no_floats_in_decisions": True,
         "home_uplink_bytes_per_sec": HOME_UPLINK_BYTES_PER_SEC,
@@ -293,6 +353,8 @@ def derive(raw: dict, task99: dict | None) -> dict:
                 "verdict_flips_serial_to_pipelined"
             ],
             "pipelined_bottleneck_stage": lan_level3["pipelined_model"]["bottleneck_stage"],
+            "pipelined_model_is_proven_bound": False,
+            "overhead_to_erase_flip": lan_level3["pipelined_model"]["overhead_to_erase_flip"],
         },
         "per_level_aggregate": per_level,
     }
@@ -340,14 +402,25 @@ def main() -> int:
         args.out.write_text(text + "\n")
 
     h = result["headline_net_lan_level3"]
-    print("TASK-203 pipelined net-LAN re-evaluation (integer-exact):", file=sys.stderr)
+    print(
+        "TASK-203 net-LAN re-evaluation under an IDEALIZED (best-case, constant-aggregate-rate) "
+        "pipelined model - integer-exact, NOT a proven bound:",
+        file=sys.stderr,
+    )
     print(
         f"  level {SHIPPED_LEVEL} LAN({LAN_BYTES_PER_SEC:,} B/s): "
         f"serial zstd_beats_raw={h['serial_zstd_beats_raw']} -> "
-        f"pipelined zstd_beats_raw={h['pipelined_zstd_beats_raw']} "
+        f"pipelined(idealized) zstd_beats_raw={h['pipelined_zstd_beats_raw']} "
         f"(bottleneck={h['pipelined_bottleneck_stage']}; flips={h['verdict_flips_serial_to_pipelined']})",
         file=sys.stderr,
     )
+    if h["overhead_to_erase_flip"] is not None:
+        print(
+            f"    sensitivity: per-block streaming overhead of "
+            f"{h['overhead_to_erase_flip']['fraction_display']} of the compress budget would "
+            f"ERASE this flip (margin {h['overhead_to_erase_flip']['margin_ns']:,} ns)",
+            file=sys.stderr,
+        )
     for lr in result["per_level_aggregate"]:
         lan = lr["net_lan"]
         print(
