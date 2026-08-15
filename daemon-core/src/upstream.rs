@@ -98,10 +98,20 @@ const MAX_BUFFERED_BODY: usize = MAX_NARINFO_BYTES;
 // the client talks to; the client sends no budget) seeds the budget from its own
 // `header_timeout`. Every hop then waits at most `min(header_timeout, budget -
 // setup_elapsed)` for its upstream's response headers and PROPAGATES that
-// decremented remainder to its own upstream, so the entire chain honours ONE
-// shrinking end-to-end deadline. A RELATIVE remaining-ms value (not an absolute
-// instant) is used deliberately: absolute deadlines would need synchronised
-// clocks across hosts, which a decentralised chain does not have.
+// decremented remainder to its own upstream. A RELATIVE remaining-ms value (not
+// an absolute instant) is used deliberately: absolute deadlines would need
+// synchronised clocks across hosts, which a decentralised chain does not have.
+//
+// HONEST INVARIANT (what this actually guarantees - narrower than "one deadline
+// no hop ever waits past"): the propagated budget is MONOTONE NON-INCREASING down
+// the chain (a hop can only shorten it, never extend it - a hostile-large inbound
+// value is clamped by each hop's local `header_timeout` via `composed_header_wait`)
+// and each hop's CONNECT + header-wait (and, on TLS, connect + handshake) are
+// capped by the remaining budget. It does NOT bound every wall-clock segment: the
+// entry hop's own connection setup is not pre-charged to the budget it seeds
+// (`setup_elapsed` is ignored for the entry so lone-daemon timing is unchanged),
+// and request transmission, per-hop admission/queueing and BODY streaming are not
+// deducted. So the budget bounds the header-arrival path, not the whole response.
 //
 // HONEST SCOPE (the reopened-NO-GO lesson): this does NOT remove the inherent
 // serial-chain admission penalty. The ENTRY hop is always the binding constraint
@@ -111,7 +121,8 @@ const MAX_BUFFERED_BODY: usize = MAX_NARINFO_BYTES;
 // is below the noise floor and cannot be separated by depth here (WAN-scale;
 // TASK-35/TASK-111). What DOES compose, and is unit/integration-pinned below, is
 // the shared end-to-end budget: a tighter downstream budget caps a hop that has a
-// larger local `header_timeout`, and no hop waits past the chain's deadline.
+// larger local `header_timeout`, and the propagated budget only ever shrinks (see
+// the HONEST INVARIANT above for exactly which segments it bounds).
 // ---------------------------------------------------------------------------
 
 /// Request header carrying the remaining end-to-end header-wait budget, in
@@ -156,6 +167,30 @@ fn composed_connect_cap(connect_timeout: Duration, budget: Option<Duration>) -> 
     match budget {
         None => connect_timeout,
         Some(b) => connect_timeout.min(b),
+    }
+}
+
+/// Additionally cap a TLS-setup stage cap by the remaining end-to-end `budget`
+/// (TASK-33 F2). `base` is the stage's own upper bound (the frozen
+/// `tls-upstream-v1` [`stage_budget`], left UNCHANGED as the maximum); this layers
+/// the inbound chain budget on top so a tight downstream deadline shortens TLS
+/// connect/handshake exactly as [`composed_connect_cap`] shortens the plain-HTTP
+/// connect. `hop_elapsed` is the time already spent on THIS hop (measured from the
+/// shared hop clock), subtracted from the budget so each successive stage sees the
+/// dwindling remainder.
+///
+///   * `None` budget - this hop is the chain ENTRY: the stage keeps its full
+///     frozen `base`, so single-daemon / entry-hop TLS timing is unchanged.
+///   * `Some(b)` budget - an inner chain hop: the stage waits at most
+///     `min(base, b - hop_elapsed)`, saturating to `0` when the budget is spent
+///     (a DEAD/blackhole TLS upstream then fails within the budget, not the full
+///     frozen 5 s/10 s).
+///
+/// Integer-`Duration` and saturating - no floats in the timeout math.
+fn tls_stage_cap(base: Duration, budget: Option<Duration>, hop_elapsed: Duration) -> Duration {
+    match budget {
+        None => base,
+        Some(b) => base.min(b.saturating_sub(hop_elapsed)),
     }
 }
 
@@ -444,16 +479,24 @@ impl UpstreamHttp {
                 server_name,
             } => {
                 // FROZEN tls-upstream-v1: one `total` deadline over DNS + TCP
-                // connect + TLS handshake, with each stage additionally capped.
-                // A stalled stage fails within the bound as a typed error, so the
-                // serving layer 502s and Nix falls back - never a hang. The
-                // composing HOP budget governs only the post-handshake HEADER wait
-                // (below); it does NOT weaken the frozen TLS connect budget.
+                // connect + TLS handshake, with each stage capped at its frozen
+                // per-stage maximum. A stalled stage fails within the bound as a
+                // typed error, so the serving layer 502s and Nix falls back - never
+                // a hang. TASK-33 F2: each stage is ADDITIONALLY capped by the
+                // remaining inbound HOP budget (via `tls_stage_cap`), so a tight
+                // downstream deadline shortens TLS setup just like it shortens the
+                // plain-HTTP connect - a DEAD TLS upstream then fails within the
+                // budget, not the full frozen 5 s/10 s. The frozen values stay the
+                // MAXIMA (entry hop, no budget, is byte-for-byte unchanged).
                 let start = Instant::now();
-                let connect_cap = stage_budget(
-                    self.tls_budget.total,
-                    Duration::ZERO,
-                    self.tls_budget.connect,
+                let connect_cap = tls_stage_cap(
+                    stage_budget(
+                        self.tls_budget.total,
+                        Duration::ZERO,
+                        self.tls_budget.connect,
+                    ),
+                    budget,
+                    hop_start.elapsed(),
                 );
                 let stream = timeout(
                     connect_cap,
@@ -467,10 +510,14 @@ impl UpstreamHttp {
                     SourceError::Unreachable(format!("tls connect to {}: {e}", self.authority))
                 })?;
 
-                let handshake_cap = stage_budget(
-                    self.tls_budget.total,
-                    start.elapsed(),
-                    self.tls_budget.handshake,
+                let handshake_cap = tls_stage_cap(
+                    stage_budget(
+                        self.tls_budget.total,
+                        start.elapsed(),
+                        self.tls_budget.handshake,
+                    ),
+                    budget,
+                    hop_start.elapsed(),
                 );
                 let connector = TlsConnector::from(config.clone());
                 let tls = timeout(
@@ -1316,6 +1363,44 @@ mod tls_tests {
         assert!(
             elapsed >= budget.handshake,
             "must actually wait out the handshake deadline (not fail instantly for another reason); took {elapsed:?}"
+        );
+    }
+
+    /// TASK-33 F2: the inbound HOP budget must ALSO bound TLS setup, not just the
+    /// post-handshake header wait. Here the FROZEN `tls-upstream-v1` budget is left
+    /// UNCHANGED (handshake cap 5 s, total 10 s) - the ONLY thing shortening the
+    /// stalled handshake is the 300 ms inbound budget. Before F2 the handshake used
+    /// only the frozen 5 s cap and this call would take ~5 s; with F2 it fails within
+    /// the budget. THE BITE: reverting F2 (dropping the `tls_stage_cap` on the
+    /// handshake/connect stages) makes `elapsed` jump to ~5 s and this fails.
+    #[tokio::test]
+    async fn dead_tls_upstream_fails_within_the_inbound_budget_not_the_frozen_5s() {
+        let (ca, _issuer) = fixture_ca();
+        let addr = spawn_tcp_blackhole().await;
+        // FROZEN v1: connect 5 s, handshake 5 s, total 10 s. NOT shrunk.
+        let client = tls_client(addr, "valid.test", secure_config(&ca), TlsBudget::default());
+
+        let inbound_budget = Duration::from_millis(300);
+        let started = Instant::now();
+        // A downstream chain hop propagated a 300 ms remaining budget; the TLS
+        // handshake to the blackhole must abort within it, not the frozen 5 s.
+        let res = client.get_within("/nar/x", Some(inbound_budget)).await;
+        let elapsed = started.elapsed();
+
+        assert!(
+            matches!(res, Err(SourceError::Unreachable(_))),
+            "a stalled TLS handshake under a tight inbound budget must fail as a typed Unreachable"
+        );
+        let grace = Duration::from_millis(TLS_UPSTREAM_SCHEDULER_GRACE_MS);
+        assert!(
+            elapsed <= inbound_budget + grace,
+            "TLS setup must fail within the INBOUND budget+grace ({:?}), NOT the frozen 5 s \
+             handshake cap; took {elapsed:?} (if ~5 s, F2 is missing)",
+            inbound_budget + grace
+        );
+        assert!(
+            elapsed >= Duration::from_millis(200),
+            "must actually wait out the ~300ms budget, not fail instantly for another reason; took {elapsed:?}"
         );
     }
 
