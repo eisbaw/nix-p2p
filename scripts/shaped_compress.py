@@ -11,9 +11,10 @@ shaped `veth` pair with BOTH ends shaped, transfers the SAME compressible nar RA
 over that same link, and reports the MEASURED wall-clock of each arm.
 
 WHAT IS AND IS NOT IN THE TIMED WINDOW (the TASK-198 F3 honesty correction). The two nodes discover
-nothing over the DHT here and the dial + Noise/yamux handshake happen ONCE, out of band, BEFORE the
-clock starts: the probe injects the provider multiaddr+PeerId, completes the dial, and only THEN
-starts timing. So this measures an ALREADY-CONNECTED open-stream `/nar/3` fetch — not a
+nothing over the DHT here and the dial + Noise/yamux handshake are driven to COMPLETION before the
+clock starts: the probe injects the provider multiaddr+PeerId, dials, then POLLS `is_connected`
+until the swarm reports the peer fully ESTABLISHED (ConnectionEstablished fired — handshake done),
+and only THEN starts timing. So this measures an ALREADY-CONNECTED open-stream `/nar/3` fetch — not a
 discover->fetch->serve round. What both arms pay ONCE inside the timed window, independent of
 payload size, is the request round-trip: open the `/nar/3` substream, write the request header, and
 wait for the first response byte (~one RTT of first-byte latency), plus the stream's flow-control
@@ -73,10 +74,12 @@ minimum. `--self-test` proves the parse AND the verdict/oracle bite by mutation,
 
 PEER-VS-UPSTREAM re-statement (honest scope). The CDN serves the artifact xz-compressed (~3.6x
 smaller than the raw NarSize, per the project's TASK-99 corpus). The peer's disadvantage was
-serving RAW — ~3.6x the CDN's bytes. On a bandwidth-bound link, transfer time is proportional to
-wire bytes, so link zstd shrinks the peer's WIRE VOLUME — and hence its transfer time — by the
-MEASURED ratio R, closing the ~3.6x raw gap toward parity; the near-parity is a STRUCTURAL result
-on WIRE VOLUME (the peer reaches near-parity with the CDN exactly where R approaches the xz ratio).
+serving RAW — ~3.6x the CDN's bytes. Link zstd shrinks the peer's WIRE VOLUME by the MEASURED ratio
+R, closing that ~3.6x raw BYTE gap toward parity. A smaller wire volume does mean a shorter transfer
+on a bandwidth-bound link, but the WALL-CLOCK does NOT shrink by R — it shrinks by a SMALLER factor
+(the per-fetch request round-trip both arms pay once). Never equate the two: the wire VOLUME shrinks
+~R; the measured WALL-CLOCK shrinks less. The near-parity is a STRUCTURAL result on WIRE VOLUME (the
+peer reaches near-parity with the CDN exactly where R approaches the xz ratio).
 This script MEASURES the peer arms and R over a real shaped link (removing the loopback upper
 bound); the CDN xz ratio is a STATED corpus reference, not re-measured here, and the payload is
 SYNTHETIC (a stated construction), so we report R and the structural parity condition, NOT a claim
@@ -363,12 +366,11 @@ def gate_shaping(
     }
 
 
-def crosscheck_wire_bulk(wire_zstd_counted: int, bulk_zstd_frame: int) -> dict:
-    """Auxiliary cross-check (TASK-198 F1): the provider-side bulk `compress_zstd` frame size must
-    AGREE with the authoritative COUNTED zstd wire body within the streamed-vs-bulk tolerance. This
-    figure is NEVER the headline (the headline is counted-raw / counted-zstd); it is only a
-    consistency check, and a disagreement REJECTS the run rather than silently diverging. Exact
-    integer compare: WIRE_BULK_TOLERANCE_DEN * |counted - bulk| <= counted."""
+def _crosscheck_one(wire_zstd_counted: int, bulk_zstd_frame: int) -> dict:
+    """The exact-integer bulk-vs-counted agreement test for ONE run: the provider-side bulk
+    `compress_zstd` frame size must AGREE with THAT run's authoritative COUNTED zstd wire body
+    within the streamed-vs-bulk tolerance. Never the headline. Exact integer compare (no float):
+    WIRE_BULK_TOLERANCE_DEN * |counted - bulk| <= counted."""
     diff = abs(wire_zstd_counted - bulk_zstd_frame)
     ok = (
         wire_zstd_counted > 0
@@ -380,7 +382,27 @@ def crosscheck_wire_bulk(wire_zstd_counted: int, bulk_zstd_frame: int) -> dict:
         "counted_zstd_wire_bytes": wire_zstd_counted,
         "bulk_zstd_frame_bytes": bulk_zstd_frame,
         "abs_diff_bytes": diff,
+    }
+
+
+def crosscheck_wire_bulk(shaped_runs: list[dict]) -> dict:
+    """Auxiliary cross-check (TASK-198 F1), applied PER-RUN over EVERY headline run. For EACH run,
+    that run's provider-side bulk `compress_zstd` frame (its own PROVIDE_META) must AGREE with THAT
+    run's COUNTED zstd wire body. The aggregate `all_ok` holds ONLY if every run agrees; a SINGLE
+    run disagreeing REJECTS the whole measurement (fail closed). This is the F1 re-gate fix: the
+    prior version keyed the cross-check off `shaped_runs[0]` alone, so a run-2-only bulk mutation
+    (codex reproduced `bulk_frame=1000` on run 2 -> still ACCEPTED) slipped through. The bulk figure
+    is NEVER the headline (the headline is counted-raw / counted-zstd)."""
+    per_run = [
+        _crosscheck_one(
+            r["arms"]["zstd"]["wire_body_bytes"], r["meta"]["zstd_frame_bytes"]
+        )
+        for r in shaped_runs
+    ]
+    return {
+        "all_ok": all(e["ok"] for e in per_run),
         "tolerance_den": WIRE_BULK_TOLERANCE_DEN,
+        "per_run": per_run,
     }
 
 
@@ -406,18 +428,19 @@ def finalize(
     can drive the whole render+exit path by mutation."""
     verdict = derive_verdict(shaped_runs)
     shaping = gate_shaping(shaped_runs, unshaped, delay_ms, rate_mbit)
-    crosscheck = crosscheck_wire_bulk(
-        verdict["wire_zstd_common"], shaped_runs[0]["meta"]["zstd_frame_bytes"]
-    )
+    crosscheck = crosscheck_wire_bulk(shaped_runs)
 
     # The load-bearing flags. EVERY one must hold or the run is not evidence of a win (fail closed).
+    # The per-run flags (zstd_faster_every_run, wire_smaller_every_run, all_runs_shape_gated,
+    # wire_bulk_crosscheck_ok) each AND across ALL runs, so a SINGLE failing run rejects the whole
+    # verdict — no run-0-only shortcut (TASK-198 F1/F2 re-gate).
     flags = {
         "zstd_faster_every_run": verdict["zstd_faster_every_run"],
         "wire_smaller_every_run": verdict["wire_smaller_every_run"],
         "margin_dwarfs_noise": verdict["margin_dwarfs_noise"],
         "all_runs_shape_gated": shaping["all_gated"],
         "wire_bytes_consistent": verdict["wire_bytes_consistent"],
-        "wire_bulk_crosscheck_ok": crosscheck["ok"],
+        "wire_bulk_crosscheck_ok": crosscheck["all_ok"],
     }
     accepted = all(flags.values())
     failure_reasons = [name for name, ok in flags.items() if not ok]
@@ -490,10 +513,16 @@ def _print_report(report: dict) -> None:
     )
     cc = report["wire_bulk_crosscheck"]
     print(
-        f"  aux cross-check: provider bulk zstd frame {report['aux_bulk_zstd_frame_bytes']} bytes "
-        f"vs COUNTED zstd wire {cc['counted_zstd_wire_bytes']} bytes -> "
-        f"|diff| {cc['abs_diff_bytes']} bytes (<= 1/{cc['tolerance_den']} tolerance), agree={cc['ok']}"
+        f"  aux cross-check (PER-RUN, all {len(cc['per_run'])} runs): each run's provider bulk zstd "
+        f"frame vs THAT run's COUNTED zstd wire body (<= 1/{cc['tolerance_den']} tolerance); "
+        f"all_ok={cc['all_ok']}"
     )
+    for i, e in enumerate(cc["per_run"]):
+        print(
+            f"    run {i}: bulk {e['bulk_zstd_frame_bytes']} bytes vs counted "
+            f"{e['counted_zstd_wire_bytes']} bytes -> |diff| {e['abs_diff_bytes']} bytes, "
+            f"agree={e['ok']}"
+        )
     o = report["shaping_oracle"]
     print(
         f"  shaping oracle: {sum(1 for p in o['per_run'] if p['passed'])}/{len(o['per_run'])} "
@@ -530,13 +559,13 @@ def _print_report(report: dict) -> None:
     )
     print(
         "  PEER-VS-UPSTREAM: with the PEER link now shaped (both ends), the peer arm is no longer a "
-        "loopback upper bound. On this bandwidth-bound link the peer transfer time tracks its WIRE "
-        "VOLUME, so link zstd shrinks the peer's ~3.6x-raw disadvantage vs the xz CDN by the "
-        f"measured COUNTED wire ratio {report['wire_ratio_display']}. The near-parity is STRUCTURAL "
-        "on WIRE VOLUME (payload is SYNTHETIC; the xz ratio is a stated corpus reference, not "
-        "re-measured here) -- NOT a latency-parity claim; the measured wall-clock speedup "
-        f"{h['best_wallclock_speedup_display']} is smaller, by the shared per-fetch request "
-        "round-trip both arms pay once."
+        "loopback upper bound. Link zstd shrinks the peer's ~3.6x-raw WIRE-VOLUME disadvantage vs "
+        f"the xz CDN by the measured COUNTED wire ratio {report['wire_ratio_display']} -- a "
+        "WIRE-VOLUME ratio, NOT a time ratio. The near-parity is STRUCTURAL on WIRE VOLUME (payload "
+        "is SYNTHETIC; the xz ratio is a stated corpus reference, not re-measured here) -- NOT a "
+        "latency-parity claim. The two are NEVER equated: the measured WALL-CLOCK speedup "
+        f"{h['best_wallclock_speedup_display']} is SMALLER than the wire ratio, by the shared "
+        "per-fetch request round-trip both arms pay once."
     )
 
 
@@ -781,6 +810,31 @@ def self_test() -> int:
         good_unshaped,
     )
 
+    # --- PER-RUN mutation matrix (TASK-198 F1/F2 re-gate): a corruption of a SINGLE run — ANY of
+    # the three — must bite. The prior self-test only mutated EVERY run simultaneously, so a
+    # run-2-only corruption slipped past checks that were keyed off run 0 (codex reproduced
+    # `bulk_frame=1000` on run 2 alone -> VERDICT: ACCEPTED, PEER-VS-UPSTREAM, exit 0, evidence
+    # written). Here each species corrupts EXACTLY ONE run (at each index 0,1,2) and must render
+    # REJECTED + exit non-zero. `bulk-frame` is the exact codex escape; the others prove the other
+    # per-run load-bearing checks also bite an isolated run.
+    def _three_with(idx: int, mutant_text: str) -> list[dict]:
+        return [parse_run(mutant_text if i == idx else _good_run_text()) for i in range(3)]
+
+    single_run_species = {
+        # provider bulk frame garbage on ONE run: the PER-RUN wire-bulk cross-check must catch it
+        # (the run-0-only cross-check did not) — THE codex-reproduced escape.
+        "bulk-frame": _good_run_text(bulk_frame=1000),
+        # ONE run ships a different COUNTED zstd body -> wire_bytes_consistent fails.
+        "wire-body-drift": _good_run_text(frame=frame + 4096),
+        # ONE run's zstd is slower than its raw -> zstd_faster_every_run fails.
+        "slower-zstd": _good_run_text(raw_ns=1_700_000_000, zstd_ns=6_700_000_000),
+        # ONE run's raw arm collapses far below the cap -> its shape gate fails (all_runs_shape_gated).
+        "shape-collapse": _good_run_text(raw_ns=60_000_000_000, zstd_ns=1_700_000_000),
+    }
+    for idx in range(3):
+        for species, mutant in single_run_species.items():
+            _bites(f"run{idx}-only:{species}", _three_with(idx, mutant), good_unshaped)
+
     # shaping oracle unit teeth (via shaped_link, direct arms): an honest pair passes; a
     # shaping-removed arm is rejected.
     good_shaped_arm = _arm_for_oracle(_ms_str_to_ns("40.2"), nar, 6_700_000_000)
@@ -811,8 +865,10 @@ def self_test() -> int:
     print(
         "SELF-TEST OK: baseline parsed; 9 parse mutations bitten; fail-closed render+exit teeth "
         "bite on slower-zstd, swamped-margin, shaping-removed, run-not-shape-gated, "
-        "wire-bulk-mismatch, wire-bytes-inconsistent (each: no VERDICT: ACCEPTED, VERDICT: REJECTED "
-        "rendered, exit non-zero); shaping oracle bites a removed shaper; integer reporting checked"
+        "wire-bulk-mismatch, wire-bytes-inconsistent; PER-RUN matrix bites a SINGLE-run corruption "
+        "(bulk-frame, wire-body-drift, slower-zstd, shape-collapse) at EACH run index 0/1/2 "
+        "(each: no VERDICT: ACCEPTED, VERDICT: REJECTED rendered, exit non-zero); shaping oracle "
+        "bites a removed shaper; integer reporting checked"
     )
     return 0
 
