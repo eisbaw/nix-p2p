@@ -409,7 +409,7 @@ pub struct StreamedFetch {
 ///   * [`FetchOutcome::Ok`] - the NAR was fetched and gate-1-verified.
 ///   * [`FetchOutcome::NotOpened`] - the substream was NEVER opened: `open_stream` returned an
 ///     error or the dial timed out. Over a relay this is a dial / circuit-establishment failure
-///     - the provider was NOT reached at any resolved dial address. This (and ONLY this) is an
+///     (the provider was NOT reached at any resolved dial address). This, and ONLY this, is an
 ///     "unreachable" failure.
 ///   * [`FetchOutcome::OpenedThenFailed`] - the substream OPENED (the provider WAS reached and
 ///     the `/nar/3` protocol negotiated), but the transfer then failed: a `NotHeld` / `Declined`

@@ -144,15 +144,16 @@ impl Libp2pNodeLocator {
     ///      for the target; it keeps its OWN [`crate::QueryReach`] classification and its own
     ///      `OurNodeId->DhtNode` ledger disclosure EXACTLY as before, and records NO
     ///      disclosure when the routing table is empty (no query happened);
-    ///   2. relay-circuit composition - for a provider that kad could only place at
-    ///      non-public (loopback/private/link-local) addresses, or not at all, and when this
-    ///      node knows relays from bootstrap config, we CONSTRUCT
+    ///   2. relay-circuit composition - for a provider that kad could NOT place at a
+    ///      DIRECTLY-REACHABLE address (a PUBLIC IP or LOOPBACK are directly reachable and do
+    ///      NOT compose; a PRIVATE/link-local address or no address at all is the NAT symptom
+    ///      that does), and when this node knows relays from bootstrap config, we CONSTRUCT
     ///      `<relayAddr>/p2p/<relayPeer>/p2p-circuit/p2p/<providerPeer>` for each known relay.
     ///      This is the standard circuit-v2 dial pattern, not injection (the provider PeerId
     ///      came from kad; the relays are provider-INDEPENDENT config). Composing candidates
     ///      dials THROUGH the relay, which discloses to that relay operator that we relay to
     ///      this provider - recorded as `OurNodeId->Relay`, and ONLY when candidates are
-    ///      actually added.
+    ///      actually added (so localhost / a public provider records NO Relay disclosure).
     ///
     /// [`Lookup::Found`] iff the union is non-empty; otherwise the DHT walk's OWN honest
     /// absence ([`Lookup::Miss`] / [`Unavailable`]). So `Found` here means "at least one
@@ -197,14 +198,20 @@ impl Libp2pNodeLocator {
             };
 
         // --- Provenance 2: relay-circuit composition (TASK-218). ---
-        // Compose circuit candidates only when this node knows relays AND kad could NOT
-        // place the provider at a plausibly-public address (it returned nothing, or only
-        // loopback/private/link-local addrs - the exact NAT symptom). This SHOULD-filter
-        // avoids a gratuitous relay dial + Relay disclosure for a genuinely-public provider;
-        // both misfire directions are tolerable (over-compose = a wasted dial; under-compose
-        // = upstream fallback). Pure integer IP classification, no floats.
+        // Compose circuit candidates only when this node knows relays AND kad could NOT place
+        // the provider at a DIRECTLY-REACHABLE address. "Directly reachable" means a PUBLIC IP
+        // OR a LOOPBACK address (::1 / 127.0.0.0/8, same host — always self-reachable): you
+        // NEVER need a relay to reach localhost, so composing one there is a gratuitous
+        // over-disclosure to the relay operator (a tracked privacy axis) that the daemon
+        // production-path disclosure oracle rightly trips on. The NAT symptom is a provider kad
+        // could only place at a PRIVATE (RFC1918) / link-local address, or nowhere at all —
+        // that (and ONLY that) composes a circuit. HONEST RESIDUAL (documented, TASK-219): a
+        // private-LAN provider on the SAME LAN is also directly reachable, but across a NAT it
+        // is not; we cannot distinguish those two from the address alone, so we still compose
+        // for private addresses (the real-NAT cornerstone, nat-vm-test's 192.168.x provider,
+        // depends on it) and accept a same-LAN over-disclosure. Pure integer IP math, no floats.
         let circuit_locations: Vec<Multiaddr> =
-            if !self.known_relays.is_empty() && !addrs_include_public(&dht_addrs) {
+            if !self.known_relays.is_empty() && !addrs_include_directly_reachable(&dht_addrs) {
                 self.compose_circuit_locations(peer)
             } else {
                 Vec::new()
@@ -258,25 +265,27 @@ impl Libp2pNodeLocator {
     }
 }
 
-/// Does any address carry a plausibly-PUBLIC IP (TASK-218 SHOULD-filter)? Used to decide
-/// whether a provider looks NAT'd (all non-public / no address) and therefore warrants
-/// relay-circuit composition. An address with no IP component is treated as non-public (it
-/// is not a directly-dialable public transport address). Pure integer classification.
-fn addrs_include_public(addrs: &[Multiaddr]) -> bool {
-    addrs.iter().any(addr_is_public)
+/// Does any address let the consumer reach the provider DIRECTLY, without a relay (TASK-218
+/// SHOULD-filter)? A provider with such an address must NOT trigger relay-circuit composition
+/// (composing one is a gratuitous Relay over-disclosure). "Directly reachable" = a PUBLIC IP OR
+/// a LOOPBACK address (same host - always self-reachable). Deliberately NOT counted here: a
+/// private-LAN address (unreachable across a NAT - the cornerstone case that MUST compose) and
+/// an addressless / `/dns*` result. Used to decide whether the provider looks NAT'd (no directly
+/// reachable address) and therefore warrants a circuit. Pure integer classification.
+fn addrs_include_directly_reachable(addrs: &[Multiaddr]) -> bool {
+    addrs.iter().any(addr_is_directly_reachable)
 }
 
-/// Classify a single multiaddr as carrying a public IP: the FIRST `Ip4`/`Ip6` component
-/// decides. Loopback / RFC1918-private / link-local / unspecified are NON-public (the NAT
-/// symptom); everything else is public. A `/dns*`-addressed provider (no IP literal) is
-/// treated as non-public, so we may over-compose a circuit + record one Relay disclosure for
-/// a DNS-named public provider - a tolerable wasted dial (the direct dns dial still wins),
-/// never a wrong answer.
-fn addr_is_public(addr: &Multiaddr) -> bool {
+/// A single multiaddr is DIRECTLY reachable if its FIRST `Ip4`/`Ip6` component is a PUBLIC IP or
+/// a LOOPBACK address. A `/dns*`-addressed provider (no IP literal) is treated as NOT directly
+/// reachable, so we may over-compose a circuit + record one Relay disclosure for a DNS-named
+/// public provider - a tolerable wasted dial (the direct dns dial still wins), never a wrong
+/// answer.
+fn addr_is_directly_reachable(addr: &Multiaddr) -> bool {
     for p in addr.iter() {
         match p {
-            Protocol::Ip4(ip) => return ipv4_is_public(ip),
-            Protocol::Ip6(ip) => return ipv6_is_public(ip),
+            Protocol::Ip4(ip) => return ip.is_loopback() || ipv4_is_public(ip),
+            Protocol::Ip6(ip) => return ip.is_loopback() || ipv6_is_public(ip),
             _ => {}
         }
     }
@@ -326,10 +335,86 @@ fn ipv6_is_public(ip: Ipv6Addr) -> bool {
     !non_public
 }
 
+#[async_trait]
+impl NodeLocator for Libp2pNodeLocator {
+    async fn locate(&self, node: &NodeId, policy: &ResolutionPolicy) -> Lookup<DialInfo> {
+        match policy {
+            // A pure LOCAL address-book lookup: no third party is consulted, so NOTHING is
+            // disclosed (no kad query, no dial, no ledger record). TASK-168 AC#2. We do NOT
+            // derive/validate the PeerId here: this path never dials, and a NodeId that is
+            // not in the book is simply an honest Miss (a malformed key can never match a
+            // book entry either way, so it lands on the same zero-disclosure Miss).
+            ResolutionPolicy::ExplicitPeersOnly => self.locate_via_book(node),
+            ResolutionPolicy::PublicInfrastructure => {
+                // The provider identity IS an ed25519 verifying key; derive the libp2p PeerId
+                // it MUST correspond to. A non-point key can never be dialed over libp2p -
+                // fail it as could-not-consult (a malformed target, not a healthy absence).
+                let peer = match peer_id_of_provider(node) {
+                    Some(peer) => peer,
+                    None => {
+                        return Lookup::Unavailable(Unavailable::Backend(format!(
+                            "node {node} is not a valid ed25519 peer id; cannot resolve over libp2p"
+                        )));
+                    }
+                };
+                self.locate_via_dht(peer).await
+            }
+        }
+    }
+
+    fn declared_exposure(&self) -> ExposureSurface {
+        // The a-priori MAY-disclose surface, taken as the SUPERSET over policies: an active
+        // peer-routing query (PublicInfrastructure) reveals OUR identity to the DHT nodes
+        // and the bootstrap it contacts; when it composes a relay-circuit dial candidate
+        // (TASK-218) it also reveals to the relay operator that we relay to the target. The
+        // Relay entry belongs to the superset whether or not any concrete resolve composes a
+        // circuit. ExplicitPeersOnly is a strict subset (discloses nothing). See the module
+        // note on the queried-NodeId gap (TASK-168).
+        ExposureSurface::from_exposures([
+            Exposure::new(Recipient::DhtNode, Disclosed::OurNodeId),
+            Exposure::new(Recipient::Bootstrap, Disclosed::OurNodeId),
+            Exposure::new(Recipient::Relay, Disclosed::OurNodeId),
+        ])
+    }
+}
+
 #[cfg(test)]
 mod ip_classification_tests {
-    use super::{ipv4_is_public, ipv6_is_public};
+    use super::{addr_is_directly_reachable, ipv4_is_public, ipv6_is_public};
+    use crate::Multiaddr;
     use std::net::{Ipv4Addr, Ipv6Addr};
+
+    /// TASK-218 finding 1 (loopback exclusion): a DIRECTLY-REACHABLE provider must NOT trigger
+    /// relay-circuit composition (composing one is a gratuitous Relay over-disclosure that the
+    /// daemon production-path disclosure oracle trips on). Loopback (self-reachable) and public
+    /// addresses are directly reachable; a PRIVATE (RFC1918) address is NOT (unreachable across
+    /// a NAT - the cornerstone case that must still compose).
+    #[test]
+    fn directly_reachable_excludes_loopback_and_public_but_not_private() {
+        for a in [
+            "/ip4/127.0.0.1/tcp/4001", // loopback (the e2e production-path provider)
+            "/ip6/::1/tcp/4001",       // loopback v6
+            "/ip4/8.8.8.8/tcp/4001",   // public
+            "/ip6/2606:4700:4700::1111/tcp/4001", // public v6
+        ] {
+            let m: Multiaddr = a.parse().unwrap();
+            assert!(
+                addr_is_directly_reachable(&m),
+                "{a} is directly reachable -> must NOT compose a circuit"
+            );
+        }
+        for a in [
+            "/ip4/192.168.2.3/tcp/4001", // private (the NAT VM provider) -> must compose
+            "/ip4/10.1.2.3/tcp/4001",    // private
+            "/dns4/example.com/tcp/4001", // no IP literal -> treated as not directly reachable
+        ] {
+            let m: Multiaddr = a.parse().unwrap();
+            assert!(
+                !addr_is_directly_reachable(&m),
+                "{a} is NOT directly reachable -> a NAT'd provider that must compose a circuit"
+            );
+        }
+    }
 
     #[test]
     fn v4_non_public_ranges_are_not_public() {
@@ -394,48 +479,5 @@ mod ip_classification_tests {
             let a: Ipv6Addr = ip.parse().unwrap();
             assert!(ipv6_is_public(a), "{ip} must be public");
         }
-    }
-}
-
-#[async_trait]
-impl NodeLocator for Libp2pNodeLocator {
-    async fn locate(&self, node: &NodeId, policy: &ResolutionPolicy) -> Lookup<DialInfo> {
-        match policy {
-            // A pure LOCAL address-book lookup: no third party is consulted, so NOTHING is
-            // disclosed (no kad query, no dial, no ledger record). TASK-168 AC#2. We do NOT
-            // derive/validate the PeerId here: this path never dials, and a NodeId that is
-            // not in the book is simply an honest Miss (a malformed key can never match a
-            // book entry either way, so it lands on the same zero-disclosure Miss).
-            ResolutionPolicy::ExplicitPeersOnly => self.locate_via_book(node),
-            ResolutionPolicy::PublicInfrastructure => {
-                // The provider identity IS an ed25519 verifying key; derive the libp2p PeerId
-                // it MUST correspond to. A non-point key can never be dialed over libp2p -
-                // fail it as could-not-consult (a malformed target, not a healthy absence).
-                let peer = match peer_id_of_provider(node) {
-                    Some(peer) => peer,
-                    None => {
-                        return Lookup::Unavailable(Unavailable::Backend(format!(
-                            "node {node} is not a valid ed25519 peer id; cannot resolve over libp2p"
-                        )));
-                    }
-                };
-                self.locate_via_dht(peer).await
-            }
-        }
-    }
-
-    fn declared_exposure(&self) -> ExposureSurface {
-        // The a-priori MAY-disclose surface, taken as the SUPERSET over policies: an active
-        // peer-routing query (PublicInfrastructure) reveals OUR identity to the DHT nodes
-        // and the bootstrap it contacts; when it composes a relay-circuit dial candidate
-        // (TASK-218) it also reveals to the relay operator that we relay to the target. The
-        // Relay entry belongs to the superset whether or not any concrete resolve composes a
-        // circuit. ExplicitPeersOnly is a strict subset (discloses nothing). See the module
-        // note on the queried-NodeId gap (TASK-168).
-        ExposureSurface::from_exposures([
-            Exposure::new(Recipient::DhtNode, Disclosed::OurNodeId),
-            Exposure::new(Recipient::Bootstrap, Disclosed::OurNodeId),
-            Exposure::new(Recipient::Relay, Disclosed::OurNodeId),
-        ])
     }
 }

@@ -101,26 +101,37 @@ PERMITTED_DIAL_ASSISTANCE = ("autonat", "dcutr", "relay")
 #       legitimate `peer_address_book: BTreeMap<NodeId, Vec<Multiaddr>>` is NOT flagged - its
 #       name carries no relay/circuit token and it is the zero-disclosure ExplicitPeers book.
 # Prose/doc mentions (comment lines) are ignored. A NodeId/ContentKey identifies the
-# CONTENT/PROVIDER; a PeerId identifies the RELAY transport - only the former keying is forbidden.
 # A NodeId/ContentKey/Provider* identifies the CONTENT/PROVIDER; a PeerId identifies the RELAY
 # transport. Keying a relay set by the FORMER is per-provider injection; by the latter is fine.
 IDENTITY_KEY = r"(?:NodeId|ContentKey|Provider\w*)"
-# Any binding whose NAME mentions relay/circuit (case-insensitive: snake_case fields AND
-# PascalCase type aliases) that is a MAP/SET keyed by a provider/content identity, OR a
-# tuple-`Vec`/array whose FIRST element is that identity. Matches `field: Type` AND
-# `type Alias = Type`, and tolerates MULTILINE declarations (`\s*` spans newlines) because
-# comments are stripped first. The legit `known_relays: Vec<(PeerId, Multiaddr)>` (keyed by the
-# relay's PeerId) and `peer_address_book: BTreeMap<NodeId, ...>` (name has no relay/circuit
-# token) are NOT matched.
-RELAY_KEYED_BY_IDENTITY = re.compile(
-    r"\b(?i:[A-Za-z_]*(?:relay|circuit)[A-Za-z0-9_]*)\s*[:=]\s*"
-    r"(?:&\s*(?:'[A-Za-z_]\w*\s+)?)?"  # tolerate a borrowed / lifetime-qualified type
-    r"(?:"
-    r"(?:BTreeMap|HashMap|BTreeSet|HashSet|IndexMap|IndexSet)\s*<\s*"
+# An IDENTITY-KEYED CONTAINER: a map/set keyed by a provider/content identity, OR a tuple
+# Vec/array whose FIRST element is that identity. Tolerates a borrowed / lifetime-qualified type.
+IDENTITY_KEYED_CONTAINER = (
+    r"(?:&\s*(?:'[A-Za-z_]\w*\s+)?)?"
+    r"(?:(?:BTreeMap|HashMap|BTreeSet|HashSet|IndexMap|IndexSet)\s*<\s*"
     + IDENTITY_KEY
     + r"|(?:Vec|VecDeque|\[)\s*<?\s*\(\s*"
     + IDENTITY_KEY
     + r")"
+)
+# A binding NAME that mentions relay/circuit (case-insensitive; snake_case fields AND PascalCase
+# type aliases). `\s*[:=]\s*` handles both `field: T` and `type Alias = T`, MULTILINE (comments
+# are stripped first, so `\s*` spans newlines).
+RELAY_NAME = r"[A-Za-z_]*(?:relay|circuit)[A-Za-z0-9_]*"
+# (A) a relay/circuit-named binding whose type is a LITERAL identity-keyed container.
+RELAY_KEYED_BY_IDENTITY = re.compile(
+    r"\b(?i:" + RELAY_NAME + r")\s*[:=]\s*" + IDENTITY_KEYED_CONTAINER
+)
+# (B) a `type Alias = <identity-keyed container>` - captures the alias NAME so a relay/circuit
+# field that uses it (however innocuously the alias is named) can still be caught (codex #2).
+TYPE_ALIAS_TO_IDENTITY_KEYED = re.compile(
+    r"\btype\s+([A-Za-z_]\w*)\s*=\s*" + IDENTITY_KEYED_CONTAINER
+)
+# (C) a relay/circuit-named binding whose type is a bare NAMED type (the first identifier after
+# `:`/`=`) - so we can check it against the tainted-alias set. `Vec<...>` etc are literals, not
+# bare names, and are already covered by (A).
+RELAY_FIELD_TYPE_NAME = re.compile(
+    r"\b(?i:" + RELAY_NAME + r")\s*[:=]\s*(?:&\s*(?:'[A-Za-z_]\w*\s+)?)?([A-Za-z_]\w*)\b"
 )
 
 
@@ -132,28 +143,45 @@ def _strip_line_comments(text: str) -> str:
 
 def scan_relay_provider_independence(roots: list[Path]) -> list[str]:
     """No relay/circuit set may be keyed by a provider/content identity - as a map, set,
-    tuple-Vec, or type alias, on one line or across several (TASK-218, codex #4). The relay set
-    the locator composes circuit addresses from must be provider-INDEPENDENT."""
-    violations: list[str] = []
+    tuple-Vec, one line or across several, DIRECTLY or via a type ALIAS (TASK-218, codex #2/#4).
+    The relay set the locator composes circuit addresses from must be provider-INDEPENDENT."""
+    # Pass 1: collect every file's comment-stripped source AND the set of type-alias names that
+    # resolve to an identity-keyed container (so alias INDIRECTION cannot launder the injection).
+    files: list[tuple[Path, str]] = []
+    tainted_aliases: set[str] = set()
     for root in roots:
         if not root.exists():
             continue
         for source in sorted(root.rglob("*.rs")):
-            rel_parts = set(source.relative_to(root).parts)
-            if SKIP_DIRS & rel_parts:
+            if SKIP_DIRS & set(source.relative_to(root).parts):
                 continue
             try:
-                text = source.read_text()
+                code = _strip_line_comments(source.read_text())
             except (UnicodeDecodeError, OSError):
                 continue
-            code = _strip_line_comments(text)
-            for m in RELAY_KEYED_BY_IDENTITY.finditer(code):
+            files.append((source, code))
+            for m in TYPE_ALIAS_TO_IDENTITY_KEYED.finditer(code):
+                tainted_aliases.add(m.group(1))
+
+    # Pass 2: flag literal identity-keyed relay sets AND relay/circuit fields that reach an
+    # identity-keyed container THROUGH a tainted alias.
+    violations: list[str] = []
+    for source, code in files:
+        for m in RELAY_KEYED_BY_IDENTITY.finditer(code):
+            snippet = " ".join(m.group(0).split())[:90]
+            violations.append(
+                f"{source}: a relay/circuit set keyed by a provider/content identity "
+                f"({snippet!r}) - associating relays with a provider/content is per-provider "
+                "circuit-address injection under another name (TASK-218). The relay set MUST "
+                "be provider-INDEPENDENT (e.g. Vec<(PeerId, Multiaddr)>)."
+            )
+        for m in RELAY_FIELD_TYPE_NAME.finditer(code):
+            if m.group(1) in tainted_aliases:
                 snippet = " ".join(m.group(0).split())[:90]
                 violations.append(
-                    f"{source}: a relay/circuit set keyed by a provider/content identity "
-                    f"({snippet!r}) - associating relays with a provider/content is per-provider "
-                    "circuit-address injection under another name (TASK-218). The relay set MUST "
-                    "be provider-INDEPENDENT (e.g. Vec<(PeerId, Multiaddr)>)."
+                    f"{source}: a relay/circuit field uses the type alias {m.group(1)!r} which "
+                    f"resolves to a provider/content-keyed container ({snippet!r}) - alias "
+                    "indirection cannot launder per-provider circuit injection (TASK-218)."
                 )
     return violations
 
@@ -272,6 +300,23 @@ def self_test() -> int:
                     file=sys.stderr,
                 )
                 return 1
+        # codex #2: ALIAS INDIRECTION - a relay field whose type is a SEPARATELY-declared,
+        # innocuously-named identity-keyed alias must STILL bite (the alias is resolved).
+        alias_file = root / "relay_alias_indirection.rs"
+        alias_file.write_text(
+            "type ProviderMap = BTreeMap<NodeId, Multiaddr>;\n"
+            "pub struct Cfg {\n    pub relay_by_provider: ProviderMap,\n}\n"
+        )
+        alias_hits = scan_relay_provider_independence([Path(tmp) / "fabric-libp2p" / "src"])
+        alias_file.unlink()
+        if not any("alias" in v.lower() for v in alias_hits):
+            print(
+                "self-test FAILED: a relay field using an identity-keyed type ALIAS "
+                "(relay_by_provider: ProviderMap) did NOT trip the guard - alias indirection "
+                "would launder per-provider circuit injection",
+                file=sys.stderr,
+            )
+            return 1
         # The MUTATION: re-enable a LAN discovery substitute. The guard MUST bite.
         (root / "mutated.rs").write_text(
             "pub struct Behaviour {\n"

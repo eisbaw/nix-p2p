@@ -136,25 +136,25 @@ fn envelope() -> SafetyEnvelope {
     }
 }
 
-/// AC#1 (fabric level): a discovery-only consumer that knows the relay ONLY from bootstrap
-/// config RESOLVES the NAT'd provider's `/p2p-circuit` dial-address (no injection). THE BITE:
-/// the resolved `DialInfo` must carry a `/p2p-circuit` location - the pre-TASK-218 locator
-/// returns only the provider's direct address, so this assertion FAILS without the
-/// relay-circuit composition (RED), and passes with it (GREEN).
+/// TASK-218 finding 1 (loopback exclusion, fabric level): a discovery-only consumer that
+/// knows the relay ONLY from bootstrap config RESOLVES a provider it discovered via kad, and
+/// fetches the NAR byte-identical (DIALABILITY). THE PROPERTY LOCKED IN HERE: the provider
+/// binds a LOOPBACK direct address (kad propagates it), which is DIRECTLY REACHABLE, so the
+/// locator resolves it to that direct address and composes NO `/p2p-circuit` - you never need a
+/// relay to reach a self-reachable provider, and composing one is a gratuitous Relay
+/// over-disclosure (the daemon production-path disclosure oracle enforces the same end to end).
 ///
-/// SCOPE - this proves CONSTRUCTION + end-to-end DIALABILITY, NOT relay CARRIAGE. On loopback
-/// the provider's direct listen addr (which it must bind for the relay-client transport, and
-/// which kad propagates) is ALSO reachable, so the subsequent byte-identical fetch may traverse
-/// the direct connection - the fetch here proves the resolved DialInfo is dialable, not that the
-/// bytes went THROUGH the relay. Relay CARRIAGE is proven separately: at the fabric API level in
-/// `nat_traversal.rs` (a provider on a `/p2p-circuit` ONLY, circuit address supplied directly),
-/// and end-to-end behind a REAL NAT (direct path genuinely blocked) in `nixos/nat-vm-test.nix`.
+/// SCOPE: this proves DIALABILITY + the loopback-exclusion, NOT relay CARRIAGE or circuit
+/// CONSTRUCTION. Circuit CONSTRUCTION for a NON-directly-reachable provider is proven by the
+/// provider-independence test below (empty routing -> composes) and, end to end behind a REAL
+/// NAT (a PRIVATE, non-loopback provider), by `nixos/nat-vm-test.nix`. Relay CARRIAGE is proven
+/// at the fabric API level in `nat_traversal.rs` (a provider on a `/p2p-circuit` ONLY) and in
+/// the VM harness (direct path genuinely blocked).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn discovery_only_consumer_resolves_and_dials_constructed_circuit_no_carriage_claim() {
+async fn discovery_only_consumer_resolves_loopback_provider_directly_and_composes_no_circuit() {
     let _ = tracing_subscriber::fmt::try_init();
-    let scope = "task218-construct";
-    let nar =
-        b"raw NAR bytes a discovery-only consumer fetches through a constructed circuit".to_vec();
+    let scope = "task218-loopback";
+    let nar = b"raw NAR bytes a discovery-only consumer fetches from a loopback provider".to_vec();
     let content = Blake3Digest::from_raw_nar(&nar);
     let nar_hash = [0x21u8; 32];
 
@@ -254,7 +254,11 @@ async fn discovery_only_consumer_resolves_and_dials_constructed_circuit_no_carri
         "discovered provider is P"
     );
 
-    // Step 2: RESOLUTION via kad peer-routing + relay-circuit CONSTRUCTION (the bite).
+    // Step 2: RESOLUTION. The provider binds a LOOPBACK direct address (kad propagates it),
+    // which is DIRECTLY REACHABLE - so the locator resolves it to that direct address and,
+    // correctly, composes NO relay circuit (TASK-218 finding 1: composing one for a
+    // self-reachable provider is a gratuitous Relay over-disclosure). This LOCKS IN the
+    // loopback-exclusion at the fabric level.
     let locator = consumer.node_locator().expect("locator present");
     let deadline = Instant::now() + Duration::from_secs(25);
     let dial_info = loop {
@@ -274,25 +278,18 @@ async fn discovery_only_consumer_resolves_and_dials_constructed_circuit_no_carri
     };
     let located: Vec<String> = dial_info.locations.clone();
     assert!(
-        located.iter().any(|l| is_circuit_str(l)),
-        "THE BITE: resolution must carry a /p2p-circuit dial-address constructed from the \
-         bootstrap-known relay; got {located:?}"
+        located.iter().any(|l| l.contains("/ip4/127.0.0.1/")),
+        "the loopback provider must resolve to its DIRECT loopback address; got {located:?}"
     );
-    // And it must be a circuit THROUGH the known relay TO this provider (not fabricated).
-    let relay_peer_s = relay_peer.to_string();
-    let provider_peer_s = provider.peer_id().to_string();
     assert!(
-        located.iter().any(|l| is_circuit_str(l)
-            && l.contains(&relay_peer_s)
-            && l.contains(&provider_peer_s)),
-        "the constructed circuit must go through the known relay {relay_peer_s} to provider \
-         {provider_peer_s}; got {located:?}"
+        !located.iter().any(|l| is_circuit_str(l)),
+        "a DIRECTLY-REACHABLE (loopback) provider must NOT get a /p2p-circuit composed - that \
+         would be a gratuitous Relay over-disclosure (TASK-218 finding 1); got {located:?}"
     );
 
     // Step 3: end-to-end byte-identical fetch off the resolved DialInfo (no injected address).
-    // This proves the constructed DialInfo is DIALABLE and yields the exact served bytes; it
-    // does NOT prove relay CARRIAGE (the loopback direct addr is also reachable - see the
-    // test-level SCOPE note). Carriage is proven by nat_traversal.rs + the VM harness.
+    // This proves the resolved DialInfo is DIALABLE and yields the exact served bytes (here via
+    // the direct loopback address - a loopback provider needs no relay).
     let transport = consumer
         .transfer(TransportTag::Iroh)
         .expect("transport present");
