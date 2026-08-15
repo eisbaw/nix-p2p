@@ -1,0 +1,30 @@
+
+  wrote evidence/task-198/609c20b/measurement.json
+# TASK-198 raw-vs-zstd over a BOTH-ends-shaped peer link: 16777216 byte compressible nar, delay 20ms, cap 20mbit, 3 shaped run(s) (nar_seed=20198)
+  served: raw NarSize 16777216 bytes; COUNTED wire bodies: raw 16777216 bytes, zstd 4219766 bytes (HEADLINE wire ratio raw/zstd ~3.976x (exact 8388608/2109883), from COUNTED wire bytes)
+  aux cross-check (PER-RUN, all 3 runs): each run's provider bulk zstd frame vs THAT run's COUNTED zstd wire body (<= 1/64 tolerance); all_ok=True
+    run 0: bulk 4219763 bytes vs counted 4219766 bytes -> |diff| 3 bytes, agree=True
+    run 1: bulk 4219763 bytes vs counted 4219766 bytes -> |diff| 3 bytes, agree=True
+    run 2: bulk 4219763 bytes vs counted 4219766 bytes -> |diff| 3 bytes, agree=True
+  shaping oracle: 3/3 shaped runs gated vs control (control RTT 51000 ns, control raw throughput 63380319 bytes/s); all_gated=True
+  run 0: raw 7481231056 ns (2242574 bytes/s)  zstd 2213803414 ns (1906115 bytes/s)  margin 5267427642 ns  speedup ~3.379x (exact 3740615528/1106901707)  shape-gated=True
+  run 1: raw 7487159145 ns (2240798 bytes/s)  zstd 2222508333 ns (1898650 bytes/s)  margin 5264650812 ns  speedup ~3.369x (exact 2495719715/740836111)  shape-gated=True
+  run 2: raw 7486882551 ns (2240881 bytes/s)  zstd 2226817756 ns (1894975 bytes/s)  margin 5260064795 ns  speedup ~3.362x (exact 7486882551/2226817756)  shape-gated=True
+  VERDICT: ACCEPTED -- zstd faster every run=True, wire smaller every run=True; best wall-clock speedup ~3.379x (exact 3740615528/1106901707)
+  NOISE FRAMING: min margin 5260064795 ns vs spread (raw 5928089 ns + zstd 13014342 ns); margin dwarfs noise=True -> the OBSERVED sign of the win is robust (its margin many times the observed spread; a bandwidth-bound wire-byte difference, not a scheduler micro-delta). Three fixed-order runs cannot guarantee no future re-sample flips it; the claim is about the OBSERVED sign.
+  PEER-VS-UPSTREAM: with the PEER link now shaped (both ends), the peer arm is no longer a loopback upper bound. Link zstd shrinks the peer's ~3.6x-raw WIRE-VOLUME disadvantage vs the xz CDN by the measured COUNTED wire ratio ~3.976x (exact 8388608/2109883) -- a WIRE-VOLUME ratio, NOT a time ratio. The near-parity is STRUCTURAL on WIRE VOLUME (payload is SYNTHETIC; the xz ratio is a stated corpus reference, not re-measured here) -- NOT a latency-parity claim. The two are NEVER equated: the measured WALL-CLOCK speedup ~3.379x (exact 3740615528/1106901707) is SMALLER than the wire ratio, by the shared per-fetch request round-trip both arms pay once.
+
+HONEST LIMITS (task-70 AC#4) -- what this route does NOT model:
+  * packet loss and reordering: netem here injects delay + a rate cap only.
+  * jitter: the delay is constant; a real link's RTT varies.
+  * competing / cross traffic and bufferbloat under contention.
+  * NAT / hole-punching / relay traversal cost -- the two ends are directly
+    wired; a real peer link often is not.
+  * real-NIC effects: offload, interrupt coalescing, driver/CPU cost. This is a
+    veth pair over ONE host's shared kernel scheduler, not two machines.
+  * the rate cap is netem's token bucket, an approximation of a physical link's
+    serialization; achieved TCP throughput sits a little under the nominal cap.
+So a number taken here is "over an emulated link with mean RTT R and cap C",
+never "over the real internet". It removes the loopback UPPER bound; it is not
+itself a field measurement.
+

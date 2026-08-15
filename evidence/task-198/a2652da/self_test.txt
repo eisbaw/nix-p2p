@@ -1,1 +1,0 @@
-SELF-TEST OK: baseline parsed; 9 parse mutations bitten; fail-closed render+exit teeth bite on slower-zstd, swamped-margin, shaping-removed, run-not-shape-gated, wire-bulk-mismatch, wire-bytes-inconsistent (each: no VERDICT: ACCEPTED, VERDICT: REJECTED rendered, exit non-zero); shaping oracle bites a removed shaper; integer reporting checked
