@@ -80,7 +80,8 @@ def parse_arm(text: str) -> dict:
     m = re.search(r"rtt min/avg/max/mdev = [\d.]+/([\d.]+)/", text)
     if not m:
         raise ProofFailure("arm reported no RTT line (ping did not complete)")
-    rtt_ms = float(m.group(1))
+    rtt_avg_str = m.group(1)
+    rtt_ns_val = _ms_str_to_ns(rtt_avg_str)
 
     m = re.search(
         r"FETCH_DONE bytes=(\d+) expect=(\d+) elapsed_ns=(\d+) "
@@ -106,11 +107,13 @@ def parse_arm(text: str) -> dict:
         raise ProofFailure("non-positive elapsed_ns -- cannot form a throughput")
 
     return {
-        "rtt_ms": rtt_ms,
+        "rtt_ns": rtt_ns_val,
         "bytes": got,
         "elapsed_ns": elapsed_ns,
         "byte_identical": True,
         "blake3_ok": True,
+        # Terminal display only (never gated), from the SAME reported decimal string.
+        "rtt_ms": float(rtt_avg_str),
     }
 
 
@@ -119,9 +122,30 @@ def throughput_bytes_per_s(byte_count: int, elapsed_ns: int) -> int:
     return (byte_count * 1_000_000_000) // elapsed_ns
 
 
-def rtt_ns(rtt_ms: float) -> int:
-    """Report RTT as integer nanoseconds (ping only gives us float ms)."""
-    return round(rtt_ms * 1_000_000)
+def _ms_str_to_ns(ms_text: str) -> int:
+    """Exact decimal-millisecond STRING (e.g. `ping`'s `40.2`) -> integer nanoseconds.
+    Parsing the STRING (not the already-lossy float) keeps this exact: a finite
+    decimal * 1e6 is an integer, so no rounding enters the oracle's clock. Owner
+    rule: latency is a whole integer of nanoseconds, never a float."""
+    return int(Fraction(ms_text) * 1_000_000)
+
+
+def _arm_for_oracle(rtt_ns: int, byte_count: int, elapsed_ns: int) -> dict:
+    """Build the dict shape `shaped_link.assert_shaping` decides on: exact integer
+    `rtt_ns` and integer `rate_bytes_per_s` (the gate reads ONLY these two), plus
+    float `rtt_ms`/`mbit` display fields the gate never touches. This IS the contract
+    with assert_shaping -- constructing the arm here (mirroring
+    `shaped_compress._arm_for_oracle`) is what makes an arm-shape mismatch bite in
+    `--self-test` rather than surface as a runtime KeyError on the measure() path
+    (the TASK-206 latent bug: arms were built as {rtt_ms, mbit})."""
+    rate = throughput_bytes_per_s(byte_count, elapsed_ns)
+    return {
+        "rtt_ns": rtt_ns,
+        "rate_bytes_per_s": rate,
+        # Terminal display only (never gated): ns->ms and bytes/sec->mbit.
+        "rtt_ms": rtt_ns / 1_000_000,
+        "mbit": rate * 8 / 1_000_000,
+    }
 
 
 def run_arm(
@@ -182,23 +206,33 @@ def measure(
         print(f"PROOF FAILURE: {exc}", file=sys.stderr)
         return 2
 
-    # Integer/rational reporting (no-float rule).
-    s_bps = throughput_bytes_per_s(shaped["bytes"], shaped["elapsed_ns"])
-    u_bps = throughput_bytes_per_s(unshaped["bytes"], unshaped["elapsed_ns"])
+    # Integer/rational reporting (no-float rule). Build the oracle arms in the exact
+    # {rtt_ns, rate_bytes_per_s} shape assert_shaping consumes (mirroring
+    # shaped_compress._arm_for_oracle); the rate is the LIBP2P FETCH throughput, so
+    # the cap / negative-control invariants are asserted on the real fetch, not a
+    # side channel.
+    shaped_arm = _arm_for_oracle(
+        shaped["rtt_ns"], shaped["bytes"], shaped["elapsed_ns"]
+    )
+    unshaped_arm = _arm_for_oracle(
+        unshaped["rtt_ns"], unshaped["bytes"], unshaped["elapsed_ns"]
+    )
+    s_bps = shaped_arm["rate_bytes_per_s"]
+    u_bps = unshaped_arm["rate_bytes_per_s"]
     # Exact-rational negative-control speedup, from the raw integer ns (NOT the
     # rounded bytes/sec) so the ratio loses nothing.
     speedup = Fraction(shaped["elapsed_ns"], unshaped["elapsed_ns"])
 
     print(
         "  shaped   : "
-        f"RTT {rtt_ns(shaped['rtt_ms'])} ns  "
+        f"RTT {shaped['rtt_ns']} ns  "
         f"throughput {s_bps} bytes/s  "
         f"byte_identical={shaped['byte_identical']} "
         f"blake3_ok={shaped['blake3_ok']}"
     )
     print(
         "  unshaped : "
-        f"RTT {rtt_ns(unshaped['rtt_ms'])} ns  "
+        f"RTT {unshaped['rtt_ns']} ns  "
         f"throughput {u_bps} bytes/s  "
         f"byte_identical={unshaped['byte_identical']} "
         f"blake3_ok={unshaped['blake3_ok']}"
@@ -209,12 +243,9 @@ def measure(
         f"(~{float(speedup):.1f}x unshaped is faster)"
     )
 
-    # THE ORACLE (proven, reused verbatim): feed the shaped/unshaped RTT + mbit to
-    # shaped_link.assert_shaping. mbit here is the LIBP2P FETCH throughput, so the
-    # cap/negative-control invariants are asserted on the real fetch, not a side
-    # channel. Floats live ONLY inside this proven accept/reject gate.
-    shaped_arm = {"rtt_ms": shaped["rtt_ms"], "mbit": s_bps * 8 / 1e6}
-    unshaped_arm = {"rtt_ms": unshaped["rtt_ms"], "mbit": u_bps * 8 / 1e6}
+    # THE ORACLE (proven, reused verbatim): feed the {rtt_ns, rate_bytes_per_s} arms
+    # to shaped_link.assert_shaping. It decides on the exact integer fields ONLY; any
+    # float lives inside that proven accept/reject gate, never in a reported quantity.
     try:
         shaped_link.assert_shaping(shaped_arm, unshaped_arm, delay_ms, rate_mbit)
     except shaped_link.ShapingViolation as exc:
@@ -281,20 +312,67 @@ def self_test() -> int:
         except ProofFailure:
             pass  # correctly bitten
 
-    # throughput_bytes_per_s / rtt_ns are integer-domain (no-float rule).
+    # --- AC#2: EXERCISE the assert_shaping/measure() oracle path with arms built by
+    # the SAME _arm_for_oracle construction measure() uses. This is the load-bearing
+    # addition. TASK-206's self-test never ran this path, so the {rtt_ms, mbit} arm
+    # shape passed green while measure() would raise KeyError at runtime. Here an
+    # honest shaped/control pair MUST be accepted and a shaping-removed arm MUST be
+    # rejected. If the arm shape is reverted to {rtt_ms, mbit}, assert_shaping raises
+    # KeyError (NOT ShapingViolation) reading rtt_ns/rate_bytes_per_s -- caught below
+    # as a named FAILURE, so the mismatch BITES here instead of in production.
+    nar = 41943040
+    good_shaped = _arm_for_oracle(_ms_str_to_ns("40.2"), nar, 3_400_000_000)
+    good_control = _arm_for_oracle(_ms_str_to_ns("0.05"), nar, 60_000_000)
+    try:
+        shaped_link.assert_shaping(good_shaped, good_control, 20, 100)
+    except shaped_link.ShapingViolation as exc:
+        failures.append(f"oracle rejected an honest shaped/control pair: {exc}")
+    except KeyError as exc:
+        failures.append(
+            f"oracle arm is missing key {exc} -- _arm_for_oracle builds the WRONG "
+            "shape (must be rtt_ns/rate_bytes_per_s, not rtt_ms/mbit)"
+        )
+
+    # The oracle must also BITE a shaping-removed arm (shaped == control), or the
+    # acceptance above is vacuous (TASK-63 'oracle must bite by mutation').
+    removed = _arm_for_oracle(_ms_str_to_ns("0.05"), nar, 60_000_000)
+    try:
+        shaped_link.assert_shaping(removed, good_control, 20, 100)
+        failures.append("oracle: a shaping-removed arm should be REJECTED but passed")
+    except shaped_link.ShapingViolation:
+        pass  # correctly bitten
+    except KeyError as exc:
+        failures.append(
+            f"oracle arm is missing key {exc} -- _arm_for_oracle builds the WRONG shape"
+        )
+
+    # throughput_bytes_per_s / _ms_str_to_ns are integer-domain (no-float rule), and
+    # the arms the oracle decides on carry ONLY exact integer decision fields.
     if not isinstance(throughput_bytes_per_s(41943040, 3_400_000_000), int):
         failures.append("throughput must be an integer bytes/sec")
     if throughput_bytes_per_s(100, 1_000_000_000) != 100:
         failures.append("throughput_bytes_per_s wrong for 100 B / 1 s")
-    if rtt_ns(40.2) != 40_200_000:
-        failures.append("rtt_ns wrong for 40.2 ms")
+    if _ms_str_to_ns("40.2") != 40_200_000:
+        failures.append("_ms_str_to_ns wrong for 40.2 ms")
+    # `.get` (not `[]`) so a WRONG-shape arm reports a legible SELF-TEST FAIL rather
+    # than a bare KeyError traceback: the mismatch must be a NAMED failure.
+    if not isinstance(good_shaped.get("rtt_ns"), int):
+        failures.append(
+            "oracle arm rtt_ns must be an integer exact-ns field (got none)"
+        )
+    if not isinstance(good_shaped.get("rate_bytes_per_s"), int):
+        failures.append(
+            "oracle arm rate_bytes_per_s must be an integer exact-bytes/s field (got none)"
+        )
 
     if failures:
         for f in failures:
             print(f"SELF-TEST FAIL: {f}", file=sys.stderr)
         return 1
     print(
-        "SELF-TEST OK: baseline accepted, 6 mutations bitten, integer reporting checked"
+        "SELF-TEST OK: baseline accepted, 6 parse mutations bitten, oracle path "
+        "EXERCISED (honest shaped/control pair accepted, shaping-removed arm bitten, "
+        "arm-shape mismatch would KeyError), integer reporting checked"
     )
     return 0
 
