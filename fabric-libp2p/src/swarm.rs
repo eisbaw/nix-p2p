@@ -5,10 +5,12 @@
 //! of the swarm's single-threaded ownership.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::pin::Pin;
 use std::sync::{Arc, Mutex};
+use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 
-use futures::StreamExt;
+use futures::{AsyncRead, StreamExt};
 use libp2p::kad::store::{MemoryStore, MemoryStoreConfig};
 use libp2p::swarm::SwarmEvent;
 use libp2p::swarm::behaviour::toggle::Toggle;
@@ -375,6 +377,56 @@ pub struct SwarmHandle {
     serve_slot: ServeSlot,
 }
 
+/// The outcome of a measurement-facing NAR fetch ([`SwarmHandle::fetch_nar_streaming_measured`]):
+/// the gate-1-verified decoded NAR plus the number of COMPRESSED body bytes that crossed the wire.
+/// `bytes.len()` is always the uncompressed NarSize (post-decode); `wire_body_bytes` is what the
+/// link actually carried — equal to the NarSize for a raw fetch, the compressed frame for a zstd
+/// fetch. Keeping both explicit is how the harness compares like-for-like without conflating the
+/// uncompressed and compressed units.
+#[derive(Debug, Clone)]
+pub struct StreamedFetch {
+    /// The decoded, BLAKE3-verified NAR bytes (uncompressed).
+    pub bytes: Vec<u8>,
+    /// The compressed body bytes actually read from the wire (excludes the 2 framing header
+    /// bytes). For a raw fetch this equals `bytes.len()`; for a zstd fetch it is the frame size.
+    pub wire_body_bytes: u64,
+}
+
+/// A pass-through [`AsyncRead`] that tallies every byte it yields. It lets a measurement caller
+/// learn how many bytes actually crossed the wire (the compressed body volume for a zstd fetch,
+/// the raw volume for a raw fetch) without touching the framing reader. Measurement-only; not on
+/// any hot path.
+struct CountingReader<'a, R> {
+    inner: &'a mut R,
+    count: u64,
+}
+
+impl<'a, R> CountingReader<'a, R> {
+    fn new(inner: &'a mut R) -> Self {
+        CountingReader { inner, count: 0 }
+    }
+
+    fn count(&self) -> u64 {
+        self.count
+    }
+}
+
+impl<R: AsyncRead + Unpin> AsyncRead for CountingReader<'_, R> {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut [u8],
+    ) -> Poll<std::io::Result<usize>> {
+        match Pin::new(&mut *self.inner).poll_read(cx, buf) {
+            Poll::Ready(Ok(n)) => {
+                self.count += n as u64;
+                Poll::Ready(Ok(n))
+            }
+            other => other,
+        }
+    }
+}
+
 impl SwarmHandle {
     async fn send(&self, command: Command) {
         // The worker outlives every handle in normal operation; a send failure means
@@ -659,6 +711,41 @@ impl SwarmHandle {
         dial_timeout: Duration,
         body_idle_timeout: Duration,
     ) -> Result<Vec<u8>, TransferError> {
+        // The shipped fetch always offers BOTH codecs (raw mandatory, zstd optional); the server
+        // picks within that set with raw the guaranteed fallback (TASK-99, AC#5).
+        Ok(self
+            .fetch_nar_streaming_measured(
+                peer,
+                content,
+                expected_size,
+                dial_timeout,
+                body_idle_timeout,
+                true,
+            )
+            .await?
+            .bytes)
+    }
+
+    /// Measurement-facing fetch (TASK-198): like [`fetch_nar_streaming`], but lets the caller
+    /// choose whether to OFFER zstd (`offer_zstd = false` sends the raw-only accept set, the
+    /// mandatory floor a compliant fetcher always includes) and reports the COMPRESSED body
+    /// bytes that actually crossed the wire alongside the gate-1-verified NAR.
+    ///
+    /// It exists so the shaped-link harness can transfer the SAME nar RAW vs ZSTD over the SAME
+    /// link and compare like-for-like — the raw arm's `wire_body_bytes` is the uncompressed
+    /// NarSize; the zstd arm's is the compressed frame (the recurring unit trap made observable,
+    /// never conflated). It changes NO wire framing: same request bytes, same
+    /// [`nar::read_response_streamed`] reader; only the offered `accept` byte differs and a
+    /// pass-through counter tallies the body. Not on the hot path.
+    pub async fn fetch_nar_streaming_measured(
+        &self,
+        peer: PeerId,
+        content: Blake3Digest,
+        expected_size: Option<u64>,
+        dial_timeout: Duration,
+        body_idle_timeout: Duration,
+        offer_zstd: bool,
+    ) -> Result<StreamedFetch, TransferError> {
         // Clone the Control per fetch: `open_stream` takes `&mut self` and opens one stream
         // at a time, so a fresh clone is the natural unit of concurrency here.
         let mut control = self.control.clone();
@@ -677,16 +764,31 @@ impl SwarmHandle {
                 )));
             }
         };
-        // Offer BOTH codecs the fetcher can always decode (raw is mandatory; zstd optional).
-        // The server picks within this set; raw is the guaranteed fallback (TASK-99, AC#5).
-        nar::write_request(&mut stream, &content, peer_fabric::ACCEPT_RAW_AND_ZSTD)
+        let accept = if offer_zstd {
+            peer_fabric::ACCEPT_RAW_AND_ZSTD
+        } else {
+            peer_fabric::ACCEPT_RAW
+        };
+        nar::write_request(&mut stream, &content, accept)
             .await
             .map_err(|error| {
                 TransferError::Unavailable(format!(
                     "libp2p failed to send the NAR request to {peer}: {error}"
                 ))
             })?;
-        nar::read_response_streamed(&mut stream, expected_size, body_idle_timeout, &content).await
+        // Count every byte the reader pulls so the caller learns the COMPRESSED body volume
+        // without any change to the framing reader. On the success (NAR) path the reader
+        // consumes exactly a 1-byte status + a 1-byte codec header before the body, so the
+        // body volume is the tally minus those two framing bytes.
+        let mut counting = CountingReader::new(&mut stream);
+        let bytes =
+            nar::read_response_streamed(&mut counting, expected_size, body_idle_timeout, &content)
+                .await?;
+        let wire_body_bytes = counting.count().saturating_sub(2);
+        Ok(StreamedFetch {
+            bytes,
+            wire_body_bytes,
+        })
     }
 
     /// Install (or replace) the serve gate; inbound NAR requests are then admitted and

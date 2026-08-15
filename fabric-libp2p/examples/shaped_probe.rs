@@ -7,16 +7,24 @@
 //! module: link-shaping/measurement machinery must stay out of the shipped daemon
 //! (`scripts/check_shaping_out_of_daemon.py` scans only `src/`).
 //!
-//!   provide <listen-ip> <port> <id-seed> <nar-bytes> <nar-seed> <peerid-file>
-//!       Start a node, serve one deterministic INCOMPRESSIBLE NAR (so the wire byte
-//!       volume ~= the NAR size and the rate cap actually bites), write our PeerId to
-//!       <peerid-file> once listening, print READY, and serve until killed.
+//!   provide <listen-ip> <port> <id-seed> <nar-bytes> <nar-seed> <peerid-file> [payload-kind]
+//!       Start a node, serve one deterministic NAR, write our PeerId to <peerid-file> once
+//!       listening, print READY, and serve until killed. `payload-kind` (optional, default
+//!       `incompressible`) selects the payload: `incompressible` (TASK-206 connectivity proof —
+//!       the wire volume ~= the NAR size so the rate cap bites) or `compressible` (TASK-198
+//!       raw-vs-zstd demonstration — zstd shrinks the wire volume ~4x). Prints one PROVIDE_META
+//!       line with the raw NarSize and the deterministic zstd frame size (a cross-check for the
+//!       fetcher's counted wire bytes).
 //!
-//!   fetch <provider-ip> <port> <provider-peerid> <id-seed> <nar-bytes> <nar-seed>
-//!       Start a node, dial the provider by multiaddr, fetch the NAR over the real
-//!       `/nar/3` libp2p-stream path, and print a machine-parseable FETCH_DONE line with
-//!       the delivered byte count, wall-clock elapsed, throughput, and whether the bytes
-//!       are BYTE-IDENTICAL + BLAKE3-verified against the independently regenerated NAR.
+//!   fetch <provider-ip> <port> <provider-peerid> <id-seed> <nar-bytes> <nar-seed> \
+//!         [payload-kind] [codec]
+//!       Start a node, dial the provider by multiaddr, fetch the NAR over the real `/nar/3`
+//!       libp2p-stream path, and print a machine-parseable FETCH_DONE line with the delivered
+//!       byte count, wall-clock elapsed, the COMPRESSED body bytes that crossed the wire, and
+//!       whether the bytes are BYTE-IDENTICAL + BLAKE3-verified against the independently
+//!       regenerated NAR. `payload-kind` MUST match the provider. `codec` (optional, default
+//!       `both`) is `raw` (offer the raw-only accept set → forces the raw codec) or `both` (offer
+//!       raw+zstd → the server negotiates zstd); it is the only difference between the two arms.
 //!
 //! The provider and fetcher regenerate the SAME NAR from the same (nar-bytes, nar-seed),
 //! so the fetcher both knows the content id to request AND can assert byte-identity with
@@ -28,7 +36,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use fabric_libp2p::{Libp2pServer, MemoryNarSupplier, Multiaddr, Node, NodeConfig, PeerId};
-use peer_fabric::{Blake3Digest, NarServer, ServeBudget};
+use peer_fabric::{Blake3Digest, DEFAULT_ZSTD_LEVEL, NarServer, ServeBudget, compress_zstd};
 use proc_supervisor::TaskSupervisorHandle;
 
 /// Deterministic pseudo-random bytes (splitmix64). INCOMPRESSIBLE, so the default zstd
@@ -48,6 +56,56 @@ fn incompressible_nar(len: usize, seed: u64) -> Vec<u8> {
     }
     out.truncate(len);
     out
+}
+
+/// Deterministic COMPRESSIBLE bytes for the TASK-198 raw-vs-zstd demonstration. Each 4 KiB block
+/// is 1/4 splitmix64 entropy (incompressible) followed by 3/4 a low-entropy repeated motif, so
+/// zstd shrinks the wire volume by ~4x — the range a real nixpkgs NAR sits in (the project's xz
+/// CDN ratio is ~3.6x). This is a SYNTHETIC payload of a stated construction, NOT a specific real
+/// closure: the harness REPORTS the measured compressed frame size rather than asserting a target
+/// ratio. Same (len, seed) -> same bytes on both ends, so the fetcher regenerates the identical
+/// NAR and asserts byte-identity with no side channel.
+fn compressible_nar(len: usize, seed: u64) -> Vec<u8> {
+    const BLOCK: usize = 4096;
+    const ENTROPY: usize = BLOCK / 4; // 1024 incompressible bytes per block
+    let mut out = Vec::with_capacity(len);
+    let mut x = seed ^ 0x9E37_79B9_7F4A_7C15;
+    // A fixed low-entropy motif (its repeats compress to ~nothing), derived from the seed so
+    // distinct seeds give distinct-but-equally-compressible payloads.
+    let mut motif = [0u8; 32];
+    for (i, b) in motif.iter_mut().enumerate() {
+        *b = (seed as u8).wrapping_add(i as u8);
+    }
+    while out.len() < len {
+        let block_start = out.len();
+        // Entropy quarter: splitmix64.
+        while out.len() < block_start + ENTROPY && out.len() < len {
+            x = x.wrapping_add(0x9E37_79B9_7F4A_7C15);
+            let mut z = x;
+            z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+            z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+            z ^= z >> 31;
+            out.extend_from_slice(&z.to_le_bytes());
+        }
+        // Compressible remainder: repeated motif.
+        while out.len() < block_start + BLOCK && out.len() < len {
+            let take = (block_start + BLOCK - out.len()).min(motif.len());
+            out.extend_from_slice(&motif[..take]);
+        }
+    }
+    out.truncate(len);
+    out
+}
+
+/// Build the NAR both ends agree on. `"compressible"` selects the TASK-198 raw-vs-zstd payload;
+/// anything else (the default, incl. TASK-206's callers that pass no kind) selects the
+/// incompressible connectivity payload. Both ends MUST pass the same kind or byte-identity fails
+/// loudly at the fetcher.
+fn build_nar(kind: &str, len: usize, seed: u64) -> Vec<u8> {
+    match kind {
+        "compressible" => compressible_nar(len, seed),
+        _ => incompressible_nar(len, seed),
+    }
 }
 
 fn seed32(byte: u8) -> [u8; 32] {
@@ -71,9 +129,21 @@ async fn provide(args: &[String]) {
     let nar_bytes: usize = args[3].parse().expect("nar-bytes");
     let nar_seed: u64 = args[4].parse().expect("nar-seed");
     let peerid_file = PathBuf::from(&args[5]);
+    // Optional 7th arg (TASK-198): payload kind. Absent -> incompressible (TASK-206 behaviour).
+    let payload_kind = args.get(6).map(String::as_str).unwrap_or("incompressible");
 
-    let nar = incompressible_nar(nar_bytes, nar_seed);
+    let nar = build_nar(payload_kind, nar_bytes, nar_seed);
     let content = Blake3Digest::from_raw_nar(&nar);
+
+    // For the raw-vs-zstd demonstration, publish the DETERMINISTIC wire volumes both ends can
+    // cross-check: the raw NarSize and the zstd frame size the serve path would ship (the streamed
+    // serve frame matches this bulk frame within ~1/64, proven by the codec test). Reported as a
+    // convenience/cross-check; the fetcher's counted `wire_body_bytes` is the authoritative
+    // measurement. Compared LIKE-UNITS only: this is compressed transport bytes, never NarSize.
+    let zstd_frame_bytes = compress_zstd(&nar, DEFAULT_ZSTD_LEVEL)
+        .expect("bulk zstd of the served nar")
+        .len();
+    println!("PROVIDE_META raw_bytes={nar_bytes} zstd_frame_bytes={zstd_frame_bytes}");
 
     let node = Node::start(NodeConfig::new(seed32(id_seed)).with_network_scope("shaped206"))
         .expect("provider node starts");
@@ -123,8 +193,15 @@ async fn fetch(args: &[String]) {
     let id_seed: u8 = args[3].parse().expect("id-seed");
     let nar_bytes: usize = args[4].parse().expect("nar-bytes");
     let nar_seed: u64 = args[5].parse().expect("nar-seed");
+    // Optional 7th arg (TASK-198): payload kind, MUST match the provider. Absent -> incompressible.
+    let payload_kind = args.get(6).map(String::as_str).unwrap_or("incompressible");
+    // Optional 8th arg (TASK-198): "raw" offers the raw-only accept set (forces the raw codec on
+    // the wire); anything else (default "both") offers raw+zstd so the server negotiates zstd. This
+    // is the ONLY knob that differs between the raw and zstd arms — same nar, same link.
+    let codec_mode = args.get(7).map(String::as_str).unwrap_or("both");
+    let offer_zstd = codec_mode != "raw";
 
-    let expected = incompressible_nar(nar_bytes, nar_seed);
+    let expected = build_nar(payload_kind, nar_bytes, nar_seed);
     let content = Blake3Digest::from_raw_nar(&expected);
 
     let node = Node::start(NodeConfig::new(seed32(id_seed)).with_network_scope("shaped206"))
@@ -151,30 +228,39 @@ async fn fetch(args: &[String]) {
         .expect("dial provider");
 
     let t0 = Instant::now();
-    let bytes = node
+    let fetched = node
         .handle
-        .fetch_nar_streaming(
+        .fetch_nar_streaming_measured(
             provider_peer,
             content,
             Some(nar_bytes as u64),
             Duration::from_secs(30),
             Duration::from_secs(30),
+            offer_zstd,
         )
         .await
         .expect("fetch over shaped link succeeds");
     let elapsed_ns = t0.elapsed().as_nanos();
+    let bytes = fetched.bytes;
+    let wire_body_bytes = fetched.wire_body_bytes;
 
     let byte_identical = bytes == expected;
     let blake3_ok = Blake3Digest::from_raw_nar(&bytes) == content;
-    // Machine-parseable contract line consumed by shaped_libp2p.py. Integer-only:
-    // bytes and elapsed_ns; the Python side forms the exact-rational throughput.
+    // Machine-parseable contract line. Integer-only: byte counts and elapsed_ns; the Python side
+    // forms the exact-rational throughput/speedup. `wire_body_bytes` is the COMPRESSED body volume
+    // that crossed the wire (== NarSize on the raw arm, the frame on the zstd arm) — the like-units
+    // measurement. `codec_requested` records which accept set this arm offered (raw vs both). The
+    // trailing fields are additive: TASK-206's `shaped_libp2p.py` parses only up to `blake3_ok`.
     println!(
-        "FETCH_DONE bytes={} expect={} elapsed_ns={} byte_identical={} blake3_ok={}",
+        "FETCH_DONE bytes={} expect={} elapsed_ns={} byte_identical={} blake3_ok={} \
+         wire_body_bytes={} codec_requested={}",
         bytes.len(),
         nar_bytes,
         elapsed_ns,
         if byte_identical { 1 } else { 0 },
         if blake3_ok { 1 } else { 0 },
+        wire_body_bytes,
+        codec_mode,
     );
     if !byte_identical || !blake3_ok || bytes.len() != nar_bytes {
         eprintln!("FETCH_FAIL byte-identity/blake3/size mismatch");

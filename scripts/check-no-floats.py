@@ -89,6 +89,7 @@ SCANNED = [
     "decentralized_discovery_evidence.py",
     "shaped_link.py",
     "shaped_libp2p.py",
+    "shaped_compress.py",
     "shaped_kad.py",
     "measure.py",
     "profile_p2p.py",
