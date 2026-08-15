@@ -59,9 +59,11 @@
 use std::ffi::OsString;
 use std::io;
 use std::path::PathBuf;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, LazyLock};
 use std::time::Duration;
+
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
 use futures::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use proc_supervisor::TaskSupervisorHandle;
@@ -205,6 +207,50 @@ const SERVE_COMPRESS_INPUT_BLOCK: usize = 128 * 1024;
 /// a few blocks on top of the already-resident raw nar) rather than letting it race ahead and
 /// buffer the whole compressed nar.
 const SERVE_COMPRESS_BLOCKS_IN_FLIGHT: usize = 2;
+
+/// The FIXED ceiling on how many detached serve-side blocking compressors may be running at once
+/// (TASK-203 F2). Each [`write_zstd_streamed`] holds ONE permit from before it spawns its
+/// `spawn_blocking` compressor until that closure EXITS - so however fast serves are aborted (a
+/// deadline/consumer drop returns the async future while the blocking compressor is still
+/// finishing its current block), the number of live compressor tails cannot exceed this bound and
+/// the blocking pool never accumulates unboundedly. A serve that finds all permits taken simply
+/// awaits one under its own serve deadline (the acquire is inside the deadline-bound
+/// `write_response`), so this is backpressure, not a leak. The tail at the default level 3 is
+/// sub-millisecond; the point is that it is BOUNDED and COUNTED, not unaccounted.
+const SERVE_COMPRESS_MAX_CONCURRENT: usize = 64;
+
+/// The fixed-capacity permit pool gating detached serve compressors (see
+/// [`SERVE_COMPRESS_MAX_CONCURRENT`]). Never closed, so `acquire_owned` never errors.
+static SERVE_COMPRESS_SLOTS: LazyLock<Arc<Semaphore>> =
+    LazyLock::new(|| Arc::new(Semaphore::new(SERVE_COMPRESS_MAX_CONCURRENT)));
+
+/// The number of serve-side blocking compressors CURRENTLY between closure entry and exit - the
+/// live-tail gauge [`CompressorSlot`] maintains. Bounded by [`SERVE_COMPRESS_MAX_CONCURRENT`] (the
+/// permit is held for exactly this interval); returns to zero once every producer has stopped. The
+/// F2 stress test asserts it never exceeds the bound and drains to zero after repeated aborts.
+static ACTIVE_SERVE_COMPRESSORS: AtomicUsize = AtomicUsize::new(0);
+
+/// RAII guard for one running detached compressor: bumps [`ACTIVE_SERVE_COMPRESSORS`] on entry and
+/// drops it when the blocking closure EXITS (every early `return` included), while HOLDING the
+/// [`SERVE_COMPRESS_SLOTS`] permit for the same interval so concurrency stays bounded. Tying both
+/// to the closure's lifetime - not the async future's - is what makes an aborted serve's compress
+/// tail counted and capped instead of an unaccounted blocking-pool leak.
+struct CompressorSlot {
+    _permit: OwnedSemaphorePermit,
+}
+
+impl CompressorSlot {
+    fn enter(permit: OwnedSemaphorePermit) -> Self {
+        ACTIVE_SERVE_COMPRESSORS.fetch_add(1, Ordering::AcqRel);
+        CompressorSlot { _permit: permit }
+    }
+}
+
+impl Drop for CompressorSlot {
+    fn drop(&mut self) {
+        ACTIVE_SERVE_COMPRESSORS.fetch_sub(1, Ordering::AcqRel);
+    }
+}
 
 /// The serve-side exchange deadline used when this node is NOT serving (no [`ServeGate`] to
 /// source `max_serve_duration` from): a slowloris guard so a peer that opens a `/nar/3`
@@ -511,9 +557,21 @@ where
 ///     receiver, so the blocking compressor's next `send` fails and it stops after the current
 ///     block (a large nar no longer compresses inside one un-preemptible synchronous call).
 ///
-/// Wire-identical to a bulk zstd frame: only the PRODUCTION is pipelined. Peak extra memory is
-/// [`SERVE_COMPRESS_BLOCKS_IN_FLIGHT`] compressed blocks (a slow/non-reading consumer
-/// backpressures the compressor via the bounded channel), on top of the already-resident raw nar.
+/// Wire-identical to a bulk zstd frame: only the PRODUCTION is pipelined.
+///
+/// PEAK EXTRA MEMORY (compressed side, on top of the already-resident raw nar), integer bound:
+///
+/// * up to [`SERVE_COMPRESS_BLOCKS_IN_FLIGHT`] compressed blocks queued in the channel, PLUS
+/// * one compressed block the sender is holding while it awaits channel capacity
+///   (`blocking_send`), PLUS
+/// * one compressed block the writer is currently draining onto the socket, PLUS
+/// * the encoder's single [`peer_fabric`] `ENCODE_BLOCK` (128 KiB) reusable scratch.
+///
+/// i.e. at most `(SERVE_COMPRESS_BLOCKS_IN_FLIGHT + 2)` compressed blocks + one encoder scratch,
+/// never the whole compressed nar - a slow/non-reading consumer backpressures the compressor via
+/// the bounded channel. Concurrency across serves is itself bounded by
+/// [`SERVE_COMPRESS_MAX_CONCURRENT`] permits, so the fleet-wide compressed-side memory is bounded
+/// too.
 async fn write_zstd_streamed<W>(writer: &mut W, raw: Vec<u8>, level: i32) -> io::Result<()>
 where
     W: AsyncWrite + Unpin,
@@ -522,9 +580,21 @@ where
     let (tx, mut rx) =
         tokio::sync::mpsc::channel::<io::Result<Vec<u8>>>(SERVE_COMPRESS_BLOCKS_IN_FLIGHT);
 
+    // Take one fixed-capacity permit BEFORE spawning the detached compressor, and MOVE it into the
+    // closure so it (and the live-tail gauge) is released only when the closure EXITS - not when
+    // this async future is dropped. That bounds and counts the compressor tails that outlive an
+    // aborted serve (F2). The acquire is inside the deadline-bound `write_response`, so waiting for
+    // a slot is backpressure, never an unbounded stall. The pool is never closed.
+    let permit = Arc::clone(&SERVE_COMPRESS_SLOTS)
+        .acquire_owned()
+        .await
+        .expect("serve compress semaphore is never closed");
+
     // The off-worker compressor: owns the raw nar, streams the frame block by block, and stops
-    // the instant the consumer/deadline drops the receiver (its `blocking_send` then errors).
+    // the instant the consumer/deadline drops the receiver (checked before EVERY block, and its
+    // `blocking_send` also errors on a closed channel).
     tokio::task::spawn_blocking(move || {
+        let _slot = CompressorSlot::enter(permit);
         let mut encoder = match StreamingZstdEncoder::new(level, Some(pledged)) {
             Ok(encoder) => encoder,
             Err(error) => {
@@ -533,6 +603,14 @@ where
             }
         };
         for chunk in raw.chunks(SERVE_COMPRESS_INPUT_BLOCK) {
+            // Stop before compressing ANY block - including one that will buffer with no output
+            // yet - once the receiver (deadline/consumer) is gone, so a block whose output is
+            // empty cannot keep the compressor running past an abort (the one-block-stop
+            // guarantee holds on the empty-output path too, not only where there are bytes to
+            // send).
+            if tx.is_closed() {
+                return;
+            }
             let mut out = Vec::new();
             if let Err(error) = encoder.compress_block(chunk, &mut out) {
                 let _ = tx.blocking_send(Err(error));
@@ -2981,6 +3059,148 @@ mod tests {
         assert!(
             err.to_string().contains("consumer gone mid-transfer"),
             "expected the underlying write error, got {err}"
+        );
+    }
+
+    /// A consumer that sends the request and ACCEPTS the first `accept_cap` response bytes (the
+    /// status + codec byte, so `write_response` gets PAST them into the pipelined compressor and
+    /// the off-worker producer actually SPAWNS and runs), then STALLS every further write - so the
+    /// compressor produces into the bounded channel, backpressures, and is aborted by the serve
+    /// deadline while genuinely mid-flight. Unlike `DigestThenUnreadable` (which stalls on the very
+    /// first byte, before the compressor is ever reached) this exercises the compressor pool.
+    struct RequestThenStall {
+        digest: [u8; 32],
+        read_pos: usize,
+        accepted: usize,
+        accept_cap: usize,
+    }
+
+    impl AsyncRead for RequestThenStall {
+        fn poll_read(
+            mut self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            buf: &mut [u8],
+        ) -> Poll<io::Result<usize>> {
+            let mut request = [0u8; 33];
+            request[..32].copy_from_slice(&self.digest);
+            request[32] = ACCEPT_RAW_AND_ZSTD;
+            if self.read_pos < request.len() && !buf.is_empty() {
+                let start = self.read_pos;
+                let n = (request.len() - start).min(buf.len());
+                buf[..n].copy_from_slice(&request[start..start + n]);
+                self.read_pos += n;
+                Poll::Ready(Ok(n))
+            } else {
+                Poll::Pending // connected but idle: NOT EOF.
+            }
+        }
+    }
+
+    impl AsyncWrite for RequestThenStall {
+        fn poll_write(
+            mut self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            buf: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            if self.accepted >= self.accept_cap {
+                Poll::Pending // stall once the status bytes are past: the compressor backpressures.
+            } else {
+                let n = buf.len().min(self.accept_cap - self.accepted);
+                self.accepted += n;
+                Poll::Ready(Ok(n))
+            }
+        }
+        fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+        fn poll_close(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    /// F2 (codex NO-GO): repeated serve ABORTS at a high firing rate must keep the detached
+    /// blocking compressors BOUNDED by the fixed permit ceiling and LEAK-FREE - the tails that
+    /// outlive an aborted serve (a deadline drops the async future while the `spawn_blocking`
+    /// compressor is still finishing a block) are counted by the permit gate and drain back to
+    /// zero, never accumulating in the blocking pool OUTSIDE any counter.
+    ///
+    /// We fire FAR more aborts than the ceiling: every serve has a non-reading consumer and a very
+    /// short deadline, so each one aborts mid-compress. Two oracles:
+    ///   * BOUNDED: the live-compressor gauge never exceeds [`SERVE_COMPRESS_MAX_CONCURRENT`] (the
+    ///     permit is held from before spawn until the closure exits), and
+    ///   * LEAK-FREE: after the storm the gauge DRAINS back to zero within a bound.
+    /// BITE: leak the permit / drop the `CompressorSlot` decrement (or hold the permit on the
+    /// async future instead of the closure) and the gauge never returns to zero -> the drain
+    /// times out and this fails. Verified by mutation.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn repeated_serve_aborts_keep_the_compressor_pool_bounded_and_leak_free() {
+        // A genuinely multi-block nar so each serve is mid-compress when its deadline fires.
+        let raw = multi_block_nar(256 * 1024, 0xa5a5_1234);
+        let content = Blake3Digest::from_raw_nar(&raw);
+
+        let n = 4 * SERVE_COMPRESS_MAX_CONCURRENT; // far more aborts than the permit ceiling
+        let mut handles = Vec::with_capacity(n);
+        for _ in 0..n {
+            let supplier = Arc::new(MemoryNarSupplier::new([raw.clone()]));
+            let short = ServeBudget {
+                max_nar_bytes_uncompressed_nar: 1 << 20,
+                max_inflight_bytes_uncompressed_nar: 1 << 30,
+                max_serve_duration: Duration::from_millis(20),
+            };
+            let gate = Arc::new(ServeGate::new(
+                short,
+                supplier,
+                TaskSupervisorHandle::disconnected(),
+            ));
+            // Accept the 2 status bytes (STATUS_NAR + codec) so write_response REACHES the
+            // pipelined compressor and the off-worker producer actually spawns, then stall.
+            let mock = RequestThenStall {
+                digest: *content.as_bytes(),
+                read_pos: 0,
+                accepted: 0,
+                accept_cap: 2,
+            };
+            handles.push(tokio::spawn(serve_stream(mock, Some(gate))));
+        }
+
+        // Sample the live-compressor gauge across a window while the storm runs: it must NEVER
+        // exceed the fixed ceiling (the permit gate is the invariant under test), and it must
+        // actually REACH a compressor (max_seen >= 1) or the test would be vacuous.
+        let mut max_seen = 0usize;
+        for _ in 0..60 {
+            max_seen = max_seen.max(ACTIVE_SERVE_COMPRESSORS.load(Ordering::Acquire));
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+        assert!(
+            max_seen <= SERVE_COMPRESS_MAX_CONCURRENT,
+            "live compressors {max_seen} exceeded the fixed ceiling {SERVE_COMPRESS_MAX_CONCURRENT}"
+        );
+        assert!(
+            max_seen >= 1,
+            "no compressor was ever observed running - the storm did not exercise the pool"
+        );
+
+        // Every aborted serve terminates within a generous bound (deadline-bound, no hang).
+        tokio::time::timeout(Duration::from_secs(30), async {
+            for h in handles {
+                h.await.expect("serve task joins");
+            }
+        })
+        .await
+        .expect("all aborted serves terminate within the bound");
+
+        // LEAK ORACLE: the compressor tails must DRAIN back to zero. A tail whose permit/guard
+        // never dropped would pin the gauge above zero forever and time this out.
+        let drained = tokio::time::timeout(Duration::from_secs(10), async {
+            while ACTIVE_SERVE_COMPRESSORS.load(Ordering::Acquire) != 0 {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await;
+        assert!(
+            drained.is_ok(),
+            "serve compressor tails did not drain to zero: {} still live (a blocking-pool leak)",
+            ACTIVE_SERVE_COMPRESSORS.load(Ordering::Acquire)
         );
     }
 }
