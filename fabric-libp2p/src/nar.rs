@@ -68,7 +68,7 @@ use proc_supervisor::TaskSupervisorHandle;
 
 use peer_fabric::{
     Blake3Digest, BoundedZstdDecoder, CodecChoiceReason, DecodeError, ServeBudget,
-    ServeCodecPolicy, TransferError, WireCodec, compress_zstd, negotiate_serve_codec,
+    ServeCodecPolicy, StreamingZstdEncoder, TransferError, WireCodec, negotiate_serve_codec,
 };
 
 /// The absolute ceiling on a single NAR response the FETCH side will read off the
@@ -193,6 +193,18 @@ pub enum NarResponse {
 /// each chunk, so peak fetch memory is bounded by `expected_size + NAR_STREAM_CHUNK` (the
 /// "bound + one chunk" property fabric-iroh states for its bao leaf).
 const NAR_STREAM_CHUNK: usize = 64 * 1024;
+
+/// The raw-input block the serve-side STREAMING compressor consumes per step (TASK-203): small
+/// enough that the first compressed bytes ship early and the serve deadline preempts at a fine
+/// grain, large enough that per-block channel/await overhead stays negligible. Mirrors the codec's
+/// decode block.
+const SERVE_COMPRESS_INPUT_BLOCK: usize = 128 * 1024;
+
+/// How many compressed blocks may sit in the serve compressor->writer channel at once. A small
+/// bound so a slow/non-reading consumer BACKPRESSURES the off-worker compressor (bounded memory:
+/// a few blocks on top of the already-resident raw nar) rather than letting it race ahead and
+/// buffer the whole compressed nar.
+const SERVE_COMPRESS_BLOCKS_IN_FLIGHT: usize = 2;
 
 /// The serve-side exchange deadline used when this node is NOT serving (no [`ServeGate`] to
 /// source `max_serve_duration` from): a slowloris guard so a peer that opens a `/nar/3`
@@ -470,13 +482,11 @@ where
             match codec {
                 WireCodec::Raw => writer.write_all(&bytes).await?,
                 WireCodec::Zstd => {
-                    // Compress off the produced raw nar. The serve-time integrity recheck
-                    // (len == declared_size, BLAKE3 == content) already ran on the RAW bytes
-                    // before this point, so the compressed encoding is a pure transport step.
-                    let frame = compress_zstd(&bytes, level).map_err(|error| {
-                        io::Error::other(format!("zstd compress failed: {error}"))
-                    })?;
-                    writer.write_all(&frame).await?;
+                    // Stream the zstd frame in BLOCKS off the serve worker (TASK-203). The
+                    // serve-time integrity recheck (len == declared_size, BLAKE3 == content)
+                    // already ran on the RAW bytes before this point, so the compressed encoding
+                    // is a pure transport step - now pipelined, not a whole-buffer compress.
+                    write_zstd_streamed(writer, bytes, level).await?;
                 }
             }
         }
@@ -484,6 +494,79 @@ where
     writer.flush().await?;
     // Half-close: the FIN is how the fetcher knows the (length-prefix-free) NAR is complete.
     writer.close().await
+}
+
+/// Stream-compress `raw` into a single zstd frame and write it to `writer` in BLOCKS off the
+/// async serve worker (TASK-203) - the compress-side of TASK-157's off-worker streaming serve.
+///
+///   * OFF THE WORKER. The CPU-bound compression runs on the blocking pool
+///     ([`tokio::task::spawn_blocking`]) via [`StreamingZstdEncoder`], so a multi-second compress
+///     of a large nar never monopolizes an async worker thread.
+///   * PIPELINED. Compressed blocks flow back over a bounded channel and are written as they are
+///     produced, so the FIRST compressed bytes reach the fetcher BEFORE the whole nar is
+///     compressed - the compressor OVERLAPS the link instead of preceding it (removing the
+///     TASK-99 LAN serial penalty).
+///   * PREEMPTIBLE BETWEEN BLOCKS. Each block is written at a `.await`; the serve deadline wrapped
+///     around [`write_response`] fires at that boundary, dropping this future - which drops the
+///     receiver, so the blocking compressor's next `send` fails and it stops after the current
+///     block (a large nar no longer compresses inside one un-preemptible synchronous call).
+///
+/// Wire-identical to a bulk zstd frame: only the PRODUCTION is pipelined. Peak extra memory is
+/// [`SERVE_COMPRESS_BLOCKS_IN_FLIGHT`] compressed blocks (a slow/non-reading consumer
+/// backpressures the compressor via the bounded channel), on top of the already-resident raw nar.
+async fn write_zstd_streamed<W>(writer: &mut W, raw: Vec<u8>, level: i32) -> io::Result<()>
+where
+    W: AsyncWrite + Unpin,
+{
+    let pledged = raw.len() as u64;
+    let (tx, mut rx) =
+        tokio::sync::mpsc::channel::<io::Result<Vec<u8>>>(SERVE_COMPRESS_BLOCKS_IN_FLIGHT);
+
+    // The off-worker compressor: owns the raw nar, streams the frame block by block, and stops
+    // the instant the consumer/deadline drops the receiver (its `blocking_send` then errors).
+    tokio::task::spawn_blocking(move || {
+        let mut encoder = match StreamingZstdEncoder::new(level, Some(pledged)) {
+            Ok(encoder) => encoder,
+            Err(error) => {
+                let _ = tx.blocking_send(Err(error));
+                return;
+            }
+        };
+        for chunk in raw.chunks(SERVE_COMPRESS_INPUT_BLOCK) {
+            let mut out = Vec::new();
+            if let Err(error) = encoder.compress_block(chunk, &mut out) {
+                let _ = tx.blocking_send(Err(error));
+                return;
+            }
+            // A block may buffer with no output yet; ship only real bytes. A closed channel
+            // (receiver dropped by the deadline/consumer) means stop compressing.
+            if !out.is_empty() && tx.blocking_send(Ok(out)).is_err() {
+                return;
+            }
+        }
+        // The frame tail (last buffered block + footer). With the size pledged, `finish` also
+        // verifies the whole nar was fed.
+        let mut tail = Vec::new();
+        match encoder.finish(&mut tail) {
+            Ok(()) => {
+                if !tail.is_empty() {
+                    let _ = tx.blocking_send(Ok(tail));
+                }
+            }
+            Err(error) => {
+                let _ = tx.blocking_send(Err(error));
+            }
+        }
+    });
+
+    // Drain compressed blocks and write each to the socket. Each recv/write is an await the serve
+    // deadline preempts between; on error/drop the receiver falls, stopping the producer.
+    while let Some(item) = rx.recv().await {
+        let block = item
+            .map_err(|error| io::Error::other(format!("zstd stream compress failed: {error}")))?;
+        writer.write_all(&block).await?;
+    }
+    Ok(())
 }
 
 /// Resolve once the CONSUMER hung up: after sending its 32-byte request the requester keeps
@@ -1394,7 +1477,7 @@ impl Drop for InflightReservation {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use peer_fabric::{ACCEPT_RAW_AND_ZSTD, DEFAULT_ZSTD_LEVEL};
+    use peer_fabric::{ACCEPT_RAW_AND_ZSTD, DEFAULT_ZSTD_LEVEL, compress_zstd};
     use std::time::Duration;
 
     fn budget(max_nar: u64, max_inflight: u64) -> ServeBudget {
@@ -2755,5 +2838,149 @@ mod tests {
             );
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
+    }
+
+    // -------------------------------------------------------------------------
+    // TASK-203: the SERVE-side PIPELINED streaming zstd compress. End-to-end through
+    // serve_stream (a genuinely multi-block nar), plus the deadline-bound + write-error paths
+    // that prove the off-worker pipeline stays preemptible and leak-free.
+    // -------------------------------------------------------------------------
+
+    /// A ~512 KiB low-entropy raw nar - big enough to span several `SERVE_COMPRESS_INPUT_BLOCK`s
+    /// (a genuinely multi-block streamed frame), compressible so the frame stays small.
+    fn multi_block_nar(len: usize, seed: u32) -> Vec<u8> {
+        let mut raw = Vec::with_capacity(len);
+        let mut x = seed;
+        while raw.len() < len {
+            x = x.wrapping_mul(1103515245).wrapping_add(12345);
+            raw.push(((x >> 24) & 0x0f) as u8);
+        }
+        raw
+    }
+
+    /// AC#1 end-to-end: a large multi-block nar served through `serve_stream` streams a zstd frame
+    /// (pipelined off the worker) that the fetch path decodes to the EXACT nar and the frozen blob
+    /// id - the streamed production is wire-compatible with `/nar/3`.
+    #[tokio::test]
+    async fn serve_stream_pipelines_a_large_multi_block_nar() {
+        let raw = multi_block_nar(512 * 1024, 0x0f0f_0f0f);
+        let content = Blake3Digest::from_raw_nar(&raw);
+        let supplier = Arc::new(MemoryNarSupplier::new([raw.clone()]));
+        let gate = Arc::new(memory_gate(supplier));
+
+        let mock = RequestThenCapture::new(&content, ACCEPT_RAW_AND_ZSTD);
+        let wire = Arc::clone(&mock.written);
+        tokio::time::timeout(
+            Duration::from_secs(10),
+            serve_stream(mock, Some(Arc::clone(&gate))),
+        )
+        .await
+        .expect("serve completes");
+
+        let wire = wire.lock().unwrap().clone();
+        assert_eq!(wire[0], STATUS_NAR, "status byte");
+        assert_eq!(
+            wire[1],
+            WireCodec::Zstd.wire(),
+            "server streamed a zstd frame for a large nar"
+        );
+        // A real compression happened: the streamed body is smaller than the raw nar.
+        assert!(
+            (wire.len() as u64 - 2) < raw.len() as u64,
+            "the streamed frame ({} B) must be smaller than the raw nar ({} B)",
+            wire.len() - 2,
+            raw.len()
+        );
+        let mut reader = futures::io::Cursor::new(wire);
+        let got = read_response_streamed(&mut reader, Some(raw.len() as u64), IDLE, &content)
+            .await
+            .expect("the captured streamed zstd wire decodes");
+        assert_eq!(got, raw, "the streamed frame decodes to the exact nar");
+        assert_eq!(Blake3Digest::from_raw_nar(&got), content, "same blob id");
+        assert_eq!(gate.counters().admitted, 1);
+    }
+
+    /// AC#1 preemption + no-leak: a large nar whose consumer NEVER reads must have its pipelined
+    /// zstd write PREEMPTED by the serve deadline (each block is an await), the serve task
+    /// terminate, and the in-flight reservation RELEASE - the streaming path stays deadline-bound
+    /// and leak-free. BITE: an un-preemptible whole-nar compress + a never-released reservation
+    /// would trip the 5 s guard / leave inflight non-zero.
+    #[tokio::test]
+    async fn serve_streaming_zstd_stays_deadline_bounded_for_a_non_reading_consumer() {
+        let raw = multi_block_nar(400 * 1024, 0xbeef_1234);
+        let content = Blake3Digest::from_raw_nar(&raw);
+        let supplier = Arc::new(MemoryNarSupplier::new([raw.clone()]));
+        let short = ServeBudget {
+            max_nar_bytes_uncompressed_nar: 1 << 20,
+            max_inflight_bytes_uncompressed_nar: 1 << 30,
+            max_serve_duration: Duration::from_millis(300),
+        };
+        let gate = Arc::new(ServeGate::new(
+            short,
+            supplier,
+            TaskSupervisorHandle::disconnected(),
+        ));
+
+        let mock = DigestThenUnreadable {
+            digest: *content.as_bytes(),
+            read_pos: 0,
+        };
+        let serve = tokio::spawn(serve_stream(mock, Some(Arc::clone(&gate))));
+        tokio::time::timeout(Duration::from_secs(5), serve)
+            .await
+            .expect("serve_stream must terminate within the serve deadline, not hang")
+            .expect("serve task joins");
+        assert_eq!(
+            gate.inflight_bytes.load(Ordering::Acquire),
+            0,
+            "the reservation must release after the deadline-bounded streamed write"
+        );
+    }
+
+    /// A writer that accepts `fail_after` bytes total, then ERRORS every write (a consumer that
+    /// went away mid-transfer).
+    struct FailingWriter {
+        fail_after: usize,
+        written: usize,
+    }
+
+    impl AsyncWrite for FailingWriter {
+        fn poll_write(
+            mut self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            buf: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            if self.written >= self.fail_after {
+                Poll::Ready(Err(io::Error::other("consumer gone mid-transfer")))
+            } else {
+                self.written += buf.len();
+                Poll::Ready(Ok(buf.len()))
+            }
+        }
+        fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+        fn poll_close(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    /// A write error mid-stream propagates out of the pipelined compressor and abandons it (the
+    /// dropped receiver stops the off-worker producer) - the serve never spins compressing a dead
+    /// stream to completion.
+    #[tokio::test]
+    async fn write_zstd_streamed_surfaces_a_write_error_and_abandons_the_pipeline() {
+        let raw = multi_block_nar(300 * 1024, 0x1357_9bdf);
+        let mut writer = FailingWriter {
+            fail_after: 0, // error on the very first block write
+            written: 0,
+        };
+        let err = write_zstd_streamed(&mut writer, raw, DEFAULT_ZSTD_LEVEL)
+            .await
+            .expect_err("a write error must propagate and abandon the pipeline");
+        assert!(
+            err.to_string().contains("consumer gone mid-transfer"),
+            "expected the underlying write error, got {err}"
+        );
     }
 }

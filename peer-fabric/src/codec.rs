@@ -42,7 +42,7 @@
 //!     exactly ONE frame, so anything after it is a lie. Either way the fetch fails rather than
 //!     yielding a short/wrong nar.
 
-use zstd::stream::raw::{DParameter, Decoder, Operation};
+use zstd::stream::raw::{DParameter, Decoder, Encoder, Operation, OutBuffer};
 
 /// Wire byte for the RAW codec (body is the uncompressed nar verbatim).
 pub const CODEC_RAW: u8 = 0;
@@ -222,12 +222,106 @@ pub fn negotiate_serve_codec(
     Err(NoCommonCodec { accept })
 }
 
-/// Compress `raw` into a single zstd frame at `level`. Whole-buffer: the serve side already
-/// buffers the produced nar for its `len == declared_size` + BLAKE3 recheck before shipping
-/// any byte, so there is no streaming-compress requirement here. The result is an UNSIGNED
-/// transport encoding - the peer re-derives the signed identity from the decoded bytes.
+/// Compress `raw` into a single zstd frame at `level`, WHOLE-BUFFER (one synchronous call). The
+/// result is an UNSIGNED transport encoding - the peer re-derives the signed identity from the
+/// decoded bytes.
+///
+/// The SERVE PATH no longer uses this: a whole-buffer compress of a large nar runs for seconds
+/// inside ONE un-preemptible call and precedes the first byte on the wire (the TASK-99 LAN
+/// serial penalty + cancellation-preemption gap). The serve path streams the frame in blocks via
+/// [`StreamingZstdEncoder`] instead. This bulk helper remains for the offline measurement harness
+/// (`measure_link_compression.rs`) and the codec tests, where a single deterministic frame is
+/// what is wanted. A bulk frame and a streamed frame are BOTH a single zstd frame - wire-
+/// interchangeable and decoded identically by [`BoundedZstdDecoder`].
 pub fn compress_zstd(raw: &[u8], level: i32) -> std::io::Result<Vec<u8>> {
     zstd::bulk::compress(raw, level)
+}
+
+/// One compression output block: the scratch a single encode step drains into. The compress-side
+/// mirror of [`DECODE_BLOCK`] - a bound on how much compressed output one
+/// [`compress_block`](StreamingZstdEncoder::compress_block) step buffers before it is drained.
+const ENCODE_BLOCK: usize = 128 * 1024;
+
+/// A STREAMING, block-wise zstd ENCODER for the serve path (TASK-203) - the compress-side mirror
+/// of [`BoundedZstdDecoder`]. It drives the low-level zstd streaming encoder
+/// ([`zstd::stream::raw::Encoder`]) one block at a time so the serve loop can:
+///
+///   * SHIP THE FIRST COMPRESSED BYTES BEFORE THE WHOLE NAR IS COMPRESSED. Feeding the raw nar in
+///     blocks and draining the output after each emits completed zstd blocks as they form, so the
+///     compressor OVERLAPS the link instead of preceding it (removing the TASK-99 LAN serial
+///     penalty: whole-nar-compress-before-first-byte), and
+///   * PREEMPT BETWEEN BLOCKS. Each block is a natural await boundary for the caller's serve
+///     deadline, so a large nar no longer compresses inside one un-preemptible synchronous call
+///     (the cancellation-preemption gap codex flagged at the TASK-99 DEEP gate).
+///
+/// It produces a SINGLE zstd frame - wire-identical to [`compress_zstd`]'s bulk frame (a zstd
+/// frame is a zstd frame): only the PRODUCTION is pipelined, not the wire format or the addressed
+/// unit. The decode side ([`BoundedZstdDecoder`]) is UNCHANGED and stays fully fail-closed on the
+/// streamed frame (its exhaustive boundary bites cover streamed frames too - see the codec tests).
+pub struct StreamingZstdEncoder {
+    encoder: Encoder<'static>,
+    /// One reusable output block; a single encode step drains at most this many bytes at a time.
+    scratch: Vec<u8>,
+}
+
+impl StreamingZstdEncoder {
+    /// A streaming encoder at `level`. When the total uncompressed size is known up front (the
+    /// serve path already buffers the produced nar), pass it as `pledged_size` so the frame
+    /// carries the content-size header and a tight window - keeping the streamed frame ~identical
+    /// to the bulk frame - and so `finish` VERIFIES the fed byte count. Pass `None` when the size
+    /// is not known.
+    pub fn new(level: i32, pledged_size: Option<u64>) -> std::io::Result<Self> {
+        let mut encoder = Encoder::new(level)?;
+        encoder.set_pledged_src_size(pledged_size)?;
+        Ok(StreamingZstdEncoder {
+            encoder,
+            scratch: vec![0u8; ENCODE_BLOCK],
+        })
+    }
+
+    /// Compress one block of raw `input`, APPENDING every compressed byte it produces to `out`.
+    /// Drains the encoder until the whole `input` block has been consumed (a single step may not
+    /// take it all if the output scratch fills first). A block may append NOTHING yet (zstd is
+    /// still buffering toward a full internal block); the frame's bytes still emerge across
+    /// subsequent blocks and [`finish`](Self::finish).
+    pub fn compress_block(&mut self, mut input: &[u8], out: &mut Vec<u8>) -> std::io::Result<()> {
+        while !input.is_empty() {
+            let status = self.encoder.run_on_buffers(input, &mut self.scratch)?;
+            out.extend_from_slice(&self.scratch[..status.bytes_written]);
+            input = &input[status.bytes_read..];
+            if status.bytes_read == 0 && status.bytes_written == 0 {
+                // No forward progress with input still pending: refuse to spin (mirrors the
+                // decoder's stuck-guard). A healthy encoder always reads or writes something.
+                return Err(std::io::Error::other(
+                    "zstd streaming encoder made no progress on pending input",
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    /// Finish the frame, APPENDING the trailing compressed bytes (the epilogue: the last buffered
+    /// block plus the frame footer) to `out`. Consumes the encoder: production happens once. With
+    /// a `pledged_size` set, zstd ERRORS here if the fed byte count did not match it - a cheap
+    /// extra check that the whole nar was streamed.
+    pub fn finish(mut self, out: &mut Vec<u8>) -> std::io::Result<()> {
+        loop {
+            // Scope the OutBuffer's borrow of `scratch` so `out` can read `scratch` after it.
+            let (remaining, written);
+            {
+                let mut output = OutBuffer::around(&mut self.scratch[..]);
+                remaining = self.encoder.finish(&mut output, false)?;
+                written = output.pos();
+            }
+            out.extend_from_slice(&self.scratch[..written]);
+            if remaining == 0 {
+                break;
+            }
+            // `remaining > 0`: the scratch filled before the footer was fully flushed; loop to
+            // drain the rest (zstd's own finish-until-zero contract).
+        }
+        Ok(())
+    }
 }
 
 /// Why a bounded streaming decode failed - each fails the fetch CLOSED (never yields bytes).
@@ -964,5 +1058,221 @@ mod tests {
         assert_eq!(WireCodec::from_wire(0xff), None);
         assert_eq!(WireCodec::Raw.wire(), CODEC_RAW);
         assert_eq!(WireCodec::Zstd.wire(), CODEC_ZSTD);
+    }
+
+    // -------------------------------------------------------------------------
+    // TASK-203: the STREAMING serve-side encoder. It must produce a frame the UNCHANGED bounded
+    // decoder decodes fail-closed - especially at the block/size boundaries codex caught at the
+    // TASK-99 DEEP gate - and it must genuinely PIPELINE (emit bytes before the whole nar).
+    // -------------------------------------------------------------------------
+
+    /// Stream-compress `raw` through [`StreamingZstdEncoder`] in `block`-sized input chunks (as
+    /// the serve loop feeds it), returning the single zstd frame. The compress-side analogue of
+    /// [`decode_all`].
+    fn stream_compress(raw: &[u8], level: i32, block: usize) -> Vec<u8> {
+        let mut encoder = StreamingZstdEncoder::new(level, Some(raw.len() as u64)).unwrap();
+        let mut out = Vec::new();
+        for chunk in raw.chunks(block.max(1)) {
+            encoder.compress_block(chunk, &mut out).unwrap();
+        }
+        encoder.finish(&mut out).unwrap();
+        out
+    }
+
+    /// A streamed frame is a valid single zstd frame: it DECODES through the bounded decoder to
+    /// the exact raw nar and hence the SAME blob id as the bulk frame - only the PRODUCTION is
+    /// pipelined, the wire format is unchanged.
+    #[test]
+    fn streamed_frame_decodes_like_bulk() {
+        let raw = b"a streamed serve frame must decode exactly like the bulk frame".repeat(500);
+        let streamed = stream_compress(&raw, DEFAULT_ZSTD_LEVEL, 4096);
+        let decoded = decode_all(&streamed, raw.len() as u64, 64).unwrap();
+        assert_eq!(
+            decoded, raw,
+            "streamed frame must decode to the exact raw nar"
+        );
+        assert_eq!(
+            Blake3Digest::from_raw_nar(&decoded),
+            Blake3Digest::from_raw_nar(&raw),
+            "streamed frame yields the same blob id as the raw nar"
+        );
+    }
+
+    /// AC#1 PIPELINING: the first compressed bytes emerge BEFORE the whole nar is compressed.
+    /// Feeding only the first HALF of a multi-MiB nar, the encoder has already produced output -
+    /// so the serve loop can ship those blocks (overlap the link) before the whole nar is fed.
+    /// BITE: a whole-buffer compressor produces NOTHING until the end; this asserts non-empty
+    /// output after half the input, before `finish`.
+    #[test]
+    fn streaming_emits_bytes_before_the_whole_nar_is_compressed() {
+        const BLOCK: usize = 128 * 1024;
+        let total = 8 * 1024 * 1024;
+        let mut raw = Vec::with_capacity(total);
+        let mut x: u32 = 0x1234_5678;
+        while raw.len() < total {
+            x = x.wrapping_mul(1103515245).wrapping_add(12345);
+            // Low-entropy so zstd emits several internal blocks (a genuinely multi-block frame).
+            raw.push(((x >> 24) & 0x0f) as u8);
+        }
+        let mut encoder =
+            StreamingZstdEncoder::new(DEFAULT_ZSTD_LEVEL, Some(raw.len() as u64)).unwrap();
+        let mut out = Vec::new();
+        let half = raw.len() / 2;
+        for chunk in raw[..half].chunks(BLOCK) {
+            encoder.compress_block(chunk, &mut out).unwrap();
+        }
+        assert!(
+            !out.is_empty(),
+            "the compressor must emit bytes for early blocks before the whole nar is fed \
+             (pipelining) - got 0 bytes after half the nar"
+        );
+        let before_finish = out.len();
+        for chunk in raw[half..].chunks(BLOCK) {
+            encoder.compress_block(chunk, &mut out).unwrap();
+        }
+        encoder.finish(&mut out).unwrap();
+        assert!(
+            out.len() > before_finish,
+            "finish must add the frame tail past what streamed early"
+        );
+        let decoded = decode_all(&out, raw.len() as u64, 64 * 1024).unwrap();
+        assert_eq!(decoded, raw, "the streamed multi-block frame round-trips");
+    }
+
+    /// AC#2 the 128 KiB regression class on STREAMED frames: a nar whose UNCOMPRESSED size is an
+    /// exact multiple of the decoder block (`DECODE_BLOCK`), produced by the STREAMING encoder
+    /// (whose own block edges differ from bulk), must still decode fail-closed and round-trip -
+    /// streamed production must NOT reintroduce the codex 128 KiB boundary bug. The encoder input
+    /// block AND the decoder feed chunk are both varied to land block edges at, before, and after
+    /// the decoder's DECODE_BLOCK boundary from both sides.
+    #[test]
+    fn streamed_exact_block_multiples_round_trip() {
+        const BLOCK: usize = 128 * 1024; // tracks DECODE_BLOCK
+        assert_eq!(BLOCK, DECODE_BLOCK, "test block must track the decoder's");
+        for n in 1..=3usize {
+            let raw = vec![0u8; n * BLOCK];
+            for enc_block in [4096usize, BLOCK, BLOCK + 1, 7 * 1024] {
+                let streamed = stream_compress(&raw, DEFAULT_ZSTD_LEVEL, enc_block);
+                for dec_chunk in [1usize, 4096, BLOCK, BLOCK + 1] {
+                    let decoded = decode_all(&streamed, raw.len() as u64, dec_chunk)
+                        .unwrap_or_else(|e| {
+                            panic!(
+                                "N={n} enc={enc_block} dec={dec_chunk} ({} B): {e}",
+                                n * BLOCK
+                            )
+                        });
+                    assert_eq!(
+                        decoded, raw,
+                        "N={n} enc={enc_block} dec={dec_chunk}: exact-block-multiple streamed \
+                         frame must round-trip"
+                    );
+                }
+            }
+        }
+    }
+
+    /// AC#2 ±1 around the block multiple on streamed frames (guard the OTHER direction, so the
+    /// exact-multiple handling did not create an off-by-one).
+    #[test]
+    fn streamed_near_block_multiples_round_trip() {
+        const BLOCK: i64 = (128 * 1024) as i64;
+        for n in 1..=3i64 {
+            for delta in [-1i64, 1] {
+                let size = (n * BLOCK + delta) as usize;
+                let raw = vec![0x5au8; size];
+                let streamed = stream_compress(&raw, DEFAULT_ZSTD_LEVEL, 64 * 1024);
+                let decoded = decode_all(&streamed, size as u64, 4096)
+                    .unwrap_or_else(|e| panic!("size={size}: {e}"));
+                assert_eq!(decoded.len(), size, "size={size} decoded length");
+                assert_eq!(decoded, raw, "size={size} streamed frame must round-trip");
+            }
+        }
+    }
+
+    /// A single-byte streamed NAR round-trips (smallest non-empty payload).
+    #[test]
+    fn streamed_one_byte_round_trips() {
+        let raw = vec![0x5au8; 1];
+        let streamed = stream_compress(&raw, DEFAULT_ZSTD_LEVEL, 4096);
+        let decoded = decode_all(&streamed, 1, 4096).expect("1-byte streamed NAR decodes");
+        assert_eq!(decoded, raw);
+    }
+
+    /// AC#2 fail-closed on a STREAMED frame: truncation, a trailing byte, and a decompression
+    /// bomb are STILL rejected when the frame came from the streaming encoder, with memory still
+    /// bounded to `cap + one decode block`. The decode bounds are frame-shape-independent, but
+    /// this proves it on the NEW producer (the sensitive AC#2 surface).
+    #[test]
+    fn streamed_frame_stays_fail_closed() {
+        let raw =
+            b"streamed frames must still reject truncation, trailing junk and bombs".repeat(200);
+        let frame = stream_compress(&raw, DEFAULT_ZSTD_LEVEL, 4096);
+
+        // Truncation -> Truncated at the codec (not a short nar handed upward).
+        let truncated = &frame[..frame.len() - 6];
+        let err =
+            decode_all(truncated, raw.len() as u64, 64).expect_err("truncated streamed frame");
+        assert!(matches!(err, DecodeError::Truncated { .. }), "got {err}");
+
+        // A complete frame + one trailing byte -> TrailingInput (exactly one frame is valid).
+        let mut trailing = frame.clone();
+        trailing.push(0x00);
+        let err = decode_all(&trailing, raw.len() as u64, 64).expect_err("trailing byte");
+        assert!(
+            matches!(err, DecodeError::TrailingInput { .. }),
+            "got {err}"
+        );
+
+        // A bomb streamed frame decoded under a tiny cap -> OutputTooLarge, bounded memory.
+        let bomb = vec![0u8; 8 * 1024 * 1024];
+        let bomb_frame = stream_compress(&bomb, DEFAULT_ZSTD_LEVEL, 128 * 1024);
+        assert!(
+            (bomb_frame.len() as u64) < 64 * 1024,
+            "the streamed bomb must be tiny on the wire ({} B)",
+            bomb_frame.len()
+        );
+        let cap = 64 * 1024u64;
+        let err = decode_all(&bomb_frame, cap, 4096).expect_err("streamed bomb over cap");
+        match err {
+            DecodeError::OutputTooLarge { produced, cap: got } => {
+                assert_eq!(got, cap);
+                assert!(produced > cap, "produced={produced} must cross cap={cap}");
+                assert!(
+                    produced <= cap + 256 * 1024,
+                    "produced={produced} must be bounded by cap + one decode block, not the 8 MiB \
+                     bomb"
+                );
+            }
+            other => panic!("expected OutputTooLarge, got {other}"),
+        }
+    }
+
+    /// The streamed frame size stays within a hair of the bulk frame (feeding blocks does not
+    /// materially change the ratio at level 3, given the pledged content size): this is what
+    /// justifies re-deriving the TASK-203 LAN verdict from the TASK-99 bulk-measured compressed
+    /// sizes (scripts/task203_pipelined_measure.py). Integer cross-multiply, no float.
+    #[test]
+    fn streamed_frame_size_matches_bulk_within_tolerance() {
+        const BLOCK: usize = 128 * 1024;
+        let total = 4 * 1024 * 1024;
+        let mut raw = Vec::with_capacity(total);
+        let mut x: u32 = 0x9e37_79b9;
+        while raw.len() < total {
+            x = x.wrapping_mul(1103515245).wrapping_add(12345);
+            raw.push(((x >> 24) & 0x1f) as u8);
+        }
+        let bulk = compress_zstd(&raw, DEFAULT_ZSTD_LEVEL).unwrap();
+        let streamed = stream_compress(&raw, DEFAULT_ZSTD_LEVEL, BLOCK);
+        assert_eq!(
+            decode_all(&streamed, raw.len() as u64, 64 * 1024).unwrap(),
+            raw,
+            "streamed frame decodes to the same bytes as bulk"
+        );
+        // |streamed - bulk| * 64 <= bulk  (i.e. within ~1/64 = ~1.5%), integer-only.
+        let (s, b) = (streamed.len() as i64, bulk.len() as i64);
+        assert!(
+            (s - b).abs() * 64 <= b,
+            "streamed {s} vs bulk {b} diverge > ~1/64 - the size-reuse assumption is unsafe"
+        );
     }
 }

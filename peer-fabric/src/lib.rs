@@ -58,8 +58,8 @@ pub use capabilities::{
 };
 pub use codec::{
     ACCEPT_RAW, ACCEPT_RAW_AND_ZSTD, ACCEPT_ZSTD, BoundedZstdDecoder, CODEC_RAW, CODEC_ZSTD,
-    CodecChoiceReason, DEFAULT_ZSTD_LEVEL, DecodeError, NoCommonCodec, ServeCodecPolicy, WireCodec,
-    ZSTD_WINDOW_LOG_MAX, compress_zstd, negotiate_serve_codec,
+    CodecChoiceReason, DEFAULT_ZSTD_LEVEL, DecodeError, NoCommonCodec, ServeCodecPolicy,
+    StreamingZstdEncoder, WireCodec, ZSTD_WINDOW_LOG_MAX, compress_zstd, negotiate_serve_codec,
 };
 pub use content::{
     CONTENT_KEY_CONTEXT, CONTENT_KEY_LEN, CONTENT_KEY_PREFIX, ContentKey, DialInfo, NAR_HASH_LEN,
