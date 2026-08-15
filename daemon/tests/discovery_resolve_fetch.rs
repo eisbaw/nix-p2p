@@ -168,6 +168,7 @@ async fn node_a_resolves_and_fetches_from_node_b_over_real_iroh() {
     let seam_key = NarKey::SignedNarHash {
         hash: NarHash::new(key.to_string()),
         upstream_hint: NarPathToken::new("nar/1irrelevant.nar.xz"),
+        transport: Default::default(),
     };
 
     // resolve: discovery (real HoldQuery envelope, answered by B's index) -> claim
@@ -237,6 +238,7 @@ async fn an_unheld_nar_hash_misses_fast_then_falls_back_to_upstream() {
     let seam_key = NarKey::SignedNarHash {
         hash: NarHash::new(wanted_key.to_string()),
         upstream_hint: NarPathToken::new("nar/1wanted.nar.xz"),
+        transport: Default::default(),
     };
 
     // The p2p source alone: a MISS, and it comes back FAST (the real HoldQuery is

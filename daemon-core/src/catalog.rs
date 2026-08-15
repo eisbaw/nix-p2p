@@ -35,7 +35,7 @@
 use std::collections::HashMap;
 use std::sync::RwLock;
 
-use crate::source::{NarHash, NarPathToken};
+use crate::source::{NarCompression, NarHash, NarPathToken, NarinfoTransport};
 
 /// What the catalog remembers about one NAR, learned from its narinfo.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -43,6 +43,9 @@ pub struct NarMeta {
     pub nar_hash: NarHash,
     /// Signed `NarSize` (uncompressed NAR bytes) - the wave-2 abort bound.
     pub nar_size: u64,
+    /// The narinfo's UNSIGNED transport descriptor (`Compression`/`FileSize`) - so
+    /// the HTTP-delivery path bounds the on-wire body in the right unit (TASK-25).
+    pub transport: NarinfoTransport,
 }
 
 /// A PERSISTED correlation source consulted on an in-memory catalog miss.
@@ -97,11 +100,22 @@ impl NarCatalog {
 
     /// Record the correlation learned from a narinfo. Idempotent: re-seeing the
     /// same narinfo overwrites with identical data.
-    pub fn record(&self, token: NarPathToken, nar_hash: NarHash, nar_size: u64) {
+    pub fn record(
+        &self,
+        token: NarPathToken,
+        nar_hash: NarHash,
+        nar_size: u64,
+        transport: NarinfoTransport,
+    ) {
         let mut inner = self.inner.write().expect("catalog lock poisoned");
-        inner
-            .by_token
-            .insert(token.as_str().to_string(), NarMeta { nar_hash, nar_size });
+        inner.by_token.insert(
+            token.as_str().to_string(),
+            NarMeta {
+                nar_hash,
+                nar_size,
+                transport,
+            },
+        );
     }
 
     /// Look up what a narinfo told us about this URL token, if we saw it.
@@ -115,23 +129,45 @@ impl NarCatalog {
     }
 }
 
-/// Parse the correlation fields out of a narinfo body: `(url-token, NarHash,
-/// NarSize)`. Returns `None` (recording is skipped) unless all three are
-/// present and well-formed - a malformed narinfo simply falls back to
-/// `UpstreamPath` on its NAR request, which is safe.
+/// The correlation a narinfo yields: the token to key on, the signed identity +
+/// size, and the UNSIGNED transport descriptor the HTTP-delivery path needs to
+/// bound the on-wire body in the right unit (TASK-25).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Correlation {
+    /// `URL:` with any leading `nar/` stripped - the `/nar/<token>` key.
+    pub token: NarPathToken,
+    /// Signed `NarHash:` (trust anchor / p2p lookup key).
+    pub nar_hash: NarHash,
+    /// Signed `NarSize:` (UNCOMPRESSED NAR bytes).
+    pub nar_size: u64,
+    /// UNSIGNED transport descriptor - the AUTHORITATIVE `Compression:` (raw-vs-compressed).
+    pub transport: NarinfoTransport,
+}
+
+/// Parse the correlation out of a narinfo body. Returns `None` (recording skipped)
+/// unless the MANDATORY trio `URL`/`NarHash`/`NarSize` are all present and
+/// well-formed - a malformed narinfo simply falls back to `UpstreamPath` on its NAR
+/// request, which is safe.
 ///
-/// The URL token is the `URL:` value with any leading `nar/` stripped, so it
-/// matches the `/nar/<token>` the client later requests.
-pub fn parse_correlation(body: &[u8]) -> Option<(NarPathToken, NarHash, u64)> {
+/// The UNSIGNED `Compression` is parsed into [`Correlation::transport`] but is NOT
+/// mandatory: absent, unparseable, or DUPLICATED it degrades to `NarCompression::Unknown`
+/// (fail-safe to NOT-raw, so the uncompressed NarSize is never applied to a
+/// possibly-compressed on-wire body) - it does NOT reject the whole correlation, because
+/// the signed trio still lets the normal SignedNarHash path work. `Compression` is the
+/// AUTHORITATIVE raw-vs-compressed signal (TASK-25); the daemon must never re-derive it
+/// from the URL suffix (a spec-valid narinfo may be `URL: nar/x.nar` + `Compression: xz`).
+pub fn parse_correlation(body: &[u8]) -> Option<Correlation> {
     let text = String::from_utf8_lossy(body);
-    // FIRST-occurrence, DUPLICATE-REJECTING - the SAME canonical field rule as the
-    // publication proof (`public_allowlist::field`), so correlation and proof can never
-    // disagree about which value a field carries (the first-vs-last split codex flagged).
-    // A duplicated single-line field is ambiguous; a narinfo carrying one simply does not
-    // correlate (it falls back to `UpstreamPath`, which is safe).
+    // FIRST-occurrence, DUPLICATE-REJECTING for the SIGNED trio - the SAME canonical field
+    // rule as the publication proof (`public_allowlist::field`), so correlation and proof
+    // can never disagree about which value a field carries (the first-vs-last split codex
+    // flagged). A duplicated signed field is ambiguous -> no correlation (safe
+    // `UpstreamPath` fallback). A duplicated Compression degrades to Unknown (below).
     let mut url: Option<&str> = None;
     let mut nar_hash: Option<&str> = None;
     let mut nar_size_str: Option<&str> = None;
+    let mut compression: Option<&str> = None;
+    let mut compression_dup = false;
     for line in text.lines() {
         if let Some(value) = line.strip_prefix("URL:") {
             if url.is_some() {
@@ -148,13 +184,38 @@ pub fn parse_correlation(body: &[u8]) -> Option<(NarPathToken, NarHash, u64)> {
                 return None;
             }
             nar_size_str = Some(value.trim());
+        } else if let Some(value) = line.strip_prefix("Compression:") {
+            if compression.is_some() {
+                compression_dup = true;
+            } else {
+                compression = Some(value.trim());
+            }
         }
     }
     let url = url?;
     let nar_hash = nar_hash?;
     let nar_size = nar_size_str?.parse::<u64>().ok()?;
     let token = url.strip_prefix("nar/").unwrap_or(url);
-    Some((NarPathToken::new(token), NarHash::new(nar_hash), nar_size))
+
+    // AUTHORITATIVE raw-vs-compressed (TASK-25): `Compression: none` is raw; any other
+    // value is compressed; absent or DUPLICATED (ambiguous) is Unknown -> NOT raw, so the
+    // signed NarSize is never applied to the on-wire body. Never inferred from the suffix.
+    let compression = if compression_dup {
+        NarCompression::Unknown
+    } else {
+        match compression {
+            Some("none") => NarCompression::Raw,
+            Some(_) => NarCompression::Compressed,
+            None => NarCompression::Unknown,
+        }
+    };
+
+    Some(Correlation {
+        token: NarPathToken::new(token),
+        nar_hash: NarHash::new(nar_hash),
+        nar_size,
+        transport: NarinfoTransport { compression },
+    })
 }
 
 #[cfg(test)]
@@ -173,10 +234,53 @@ Sig: k:AAAA==\n";
 
     #[test]
     fn parses_the_three_correlation_fields_and_strips_nar_prefix() {
-        let (token, hash, size) = parse_correlation(NARINFO).unwrap();
-        assert_eq!(token.as_str(), "1abc.nar.xz");
-        assert_eq!(hash.as_str(), "sha256:1b2c3d");
-        assert_eq!(size, 4096);
+        let c = parse_correlation(NARINFO).unwrap();
+        assert_eq!(c.token.as_str(), "1abc.nar.xz");
+        assert_eq!(c.nar_hash.as_str(), "sha256:1b2c3d");
+        assert_eq!(c.nar_size, 4096);
+        // The UNSIGNED transport descriptor is captured authoritatively.
+        assert_eq!(c.transport.compression, NarCompression::Compressed);
+    }
+
+    #[test]
+    fn compression_is_authoritative_not_the_url_suffix() {
+        // THE 6th-recurrence ANTI-TRAP at the parse layer: a spec-valid narinfo whose
+        // URL ends `.nar` but whose Compression is `xz` is COMPRESSED - the suffix lies,
+        // the Compression field is authoritative.
+        let raw_suffix_xz = b"URL: nar/deadbeef.nar\nCompression: xz\nFileSize: 42\n\
+NarHash: sha256:abc\nNarSize: 100\n";
+        let c = parse_correlation(raw_suffix_xz).unwrap();
+        assert_eq!(c.token.as_str(), "deadbeef.nar");
+        assert_eq!(
+            c.transport.compression,
+            NarCompression::Compressed,
+            "Compression: xz is COMPRESSED even though the URL ends .nar"
+        );
+
+        // Compression: none is Raw (the genuinely-uncompressed endpoint).
+        let raw = b"URL: nar/deadbeef.nar\nCompression: none\nFileSize: 100\n\
+NarHash: sha256:abc\nNarSize: 100\n";
+        assert_eq!(
+            parse_correlation(raw).unwrap().transport.compression,
+            NarCompression::Raw
+        );
+
+        // Absent or DUPLICATED Compression degrades to Unknown (fail-safe NOT-raw),
+        // without rejecting the signed-trio correlation.
+        let absent = b"URL: nar/deadbeef.nar\nNarHash: sha256:abc\nNarSize: 100\n";
+        assert_eq!(
+            parse_correlation(absent).unwrap().transport.compression,
+            NarCompression::Unknown
+        );
+        let dup = b"URL: nar/deadbeef.nar\nCompression: none\nCompression: xz\n\
+NarHash: sha256:abc\nNarSize: 100\n";
+        let c = parse_correlation(dup).unwrap();
+        assert_eq!(
+            c.transport.compression,
+            NarCompression::Unknown,
+            "a duplicated Compression is ambiguous -> Unknown, but correlation still stands"
+        );
+        assert_eq!(c.nar_size, 100);
     }
 
     #[test]
@@ -209,12 +313,14 @@ NarSize: 4096\nNarSize: 1\n";
     #[test]
     fn records_and_looks_up_by_token() {
         let catalog = NarCatalog::new();
-        let (token, hash, size) = parse_correlation(NARINFO).unwrap();
-        catalog.record(token, hash.clone(), size);
+        let c = parse_correlation(NARINFO).unwrap();
+        let hash = c.nar_hash.clone();
+        catalog.record(c.token, c.nar_hash, c.nar_size, c.transport);
 
         let meta = catalog.meta_for_token("1abc.nar.xz").unwrap();
         assert_eq!(meta.nar_hash, hash);
         assert_eq!(meta.nar_size, 4096);
+        assert_eq!(meta.transport.compression, NarCompression::Compressed);
         // An unknown token is a miss, not a panic.
         assert!(catalog.meta_for_token("unknown.nar").is_none());
     }
@@ -226,8 +332,18 @@ NarSize: 4096\nNarSize: 1\n";
         // must resolve to ITS OWN entry so the daemon fetches the right token.
         let catalog = NarCatalog::new();
         let hash = NarHash::new("sha256:sharedhash");
-        catalog.record(NarPathToken::new("aaaa.nar.xz"), hash.clone(), 4096);
-        catalog.record(NarPathToken::new("bbbb.nar.zst"), hash.clone(), 4096);
+        catalog.record(
+            NarPathToken::new("aaaa.nar.xz"),
+            hash.clone(),
+            4096,
+            NarinfoTransport::default(),
+        );
+        catalog.record(
+            NarPathToken::new("bbbb.nar.zst"),
+            hash.clone(),
+            4096,
+            NarinfoTransport::default(),
+        );
 
         // Both forward entries survive carrying the shared hash - neither
         // overwrote the other (a reverse NarHash->token map could not do this).

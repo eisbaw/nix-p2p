@@ -583,6 +583,7 @@ mod tests {
             hash: NarHash::new(KEY_HEX),
             // The transport hint is a URL token a p2p source must IGNORE.
             upstream_hint: NarPathToken::new("nar/1irrelevant.nar.xz"),
+            transport: Default::default(),
         }
     }
 

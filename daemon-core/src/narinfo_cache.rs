@@ -344,11 +344,11 @@ impl NarinfoDiskCache {
 
     /// Add a positive entry's `token -> store_hash` correlation to the index.
     fn index_positive(&self, store_hash: &str, body: &[u8]) {
-        if let Some((token, _hash, _size)) = crate::catalog::parse_correlation(body) {
+        if let Some(c) = crate::catalog::parse_correlation(body) {
             self.token_index
                 .write()
                 .expect("token index poisoned")
-                .insert(token.as_str().to_string(), store_hash.to_string());
+                .insert(c.token.as_str().to_string(), store_hash.to_string());
         }
     }
 
@@ -508,14 +508,15 @@ impl CorrelationStore for NarinfoDiskCache {
         if entry.kind != EntryKind::Positive {
             return None;
         }
-        let (parsed_token, nar_hash, nar_size) = crate::catalog::parse_correlation(&entry.body)?;
+        let c = crate::catalog::parse_correlation(&entry.body)?;
         // Confirm the file really carries THIS token (guards a stale index entry).
-        if parsed_token.as_str() != token {
+        if c.token.as_str() != token {
             return None;
         }
         Some(NarMeta {
-            nar_hash: NarHash::new(nar_hash.as_str()),
-            nar_size,
+            nar_hash: NarHash::new(c.nar_hash.as_str()),
+            nar_size: c.nar_size,
+            transport: c.transport,
         })
     }
 }

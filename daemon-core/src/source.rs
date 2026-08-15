@@ -106,6 +106,48 @@ impl NarPathToken {
     }
 }
 
+/// The narinfo `Compression:` field, AUTHORITATIVE for whether the file the
+/// narinfo's `URL:` points at is the raw NAR or a compressed archive (TASK-25).
+///
+/// CARRIED LESSON (the 6th NarSize-vs-FileSize recurrence): this is NOT derivable
+/// from the URL SUFFIX. A spec-valid narinfo may be `URL: nar/x.nar` +
+/// `Compression: xz` - the `.nar` suffix says "raw" but the archive is xz. Only the
+/// `Compression` field says what the served bytes ACTUALLY are, so the HTTP-delivery
+/// size abort keys on THIS, never the suffix. `xz`/`zstd` here are Nix ARCHIVE
+/// codings, distinct from an HTTP `Content-Encoding` (a separate transform the HTTP
+/// layer may add on top).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum NarCompression {
+    /// `Compression: none` - the served file IS the raw NAR (FileSize == NarSize),
+    /// so the signed NarSize is a like-for-like bound on the on-wire body.
+    Raw,
+    /// Any other coding (`xz`, `zstd`, ...): the served file is a COMPRESSED archive
+    /// (unit FileSize), for which the uncompressed NarSize is the WRONG bound.
+    Compressed,
+    /// Not correlated / not stated (cold-start `UpstreamPath`, passthrough, a
+    /// malformed or duplicated `Compression` line). Treated as NOT raw so the
+    /// uncompressed NarSize is NEVER applied to the on-wire body - fail-safe.
+    #[default]
+    Unknown,
+}
+
+/// The UNSIGNED narinfo TRANSPORT descriptor a correlated NAR request carries so
+/// the HTTP-delivery path can bound the ON-WIRE body in the RIGHT unit (TASK-25).
+/// The SIGNED NarSize crosses separately (`expected_size`); this says what the
+/// on-wire bytes ACTUALLY are, so a compressed body is never bounded by NarSize.
+///
+/// Deliberately carries ONLY `Compression` - the authoritative raw-vs-compressed
+/// signal the cap needs. The narinfo `FileSize` is NOT carried: it is UNSIGNED, comes
+/// from a DIFFERENT response than the NAR body, and the CLIENT (nix) is the arbiter of
+/// FileHash/FileSize - so it has no valid daemon-side use as a transfer cap (enforcing
+/// it would abort a transfer the NAR's own Content-Length permits; see
+/// `tests/nar_hash_collision`). The on-wire `Content-Length` is the compressed bound.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct NarinfoTransport {
+    /// The narinfo `Compression:` - authoritative raw-vs-compressed (see [`NarCompression`]).
+    pub compression: NarCompression,
+}
+
 /// The identity a NAR request carries across the seam. A TYPED enum, not an
 /// erased string, so the source can dispatch on what the value actually is (the
 /// erasure codex flagged in the first cut).
@@ -130,6 +172,13 @@ pub enum NarKey {
         /// compressed bytes for a request and break S1 byte-identity. Typed as a
         /// transport hint so it can never masquerade as the identity.
         upstream_hint: NarPathToken,
+        /// The narinfo TRANSPORT descriptor (`Compression`/`FileSize`) the daemon
+        /// learned when it served this NAR's narinfo. The HTTP-delivery path uses it
+        /// to bound the on-wire body in the RIGHT unit (TASK-25): the AUTHORITATIVE
+        /// `Compression` decides raw-vs-compressed, never the URL suffix. A URL-less
+        /// p2p source ignores it (it streams the raw NAR and bounds by the signed
+        /// NarSize itself).
+        transport: NarinfoTransport,
     },
     /// Un-correlated cold-start fallback: the raw URL token. HTTP-only.
     UpstreamPath(NarPathToken),

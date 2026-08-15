@@ -80,6 +80,7 @@ impl NarSource for FakeP2pNar {
             NarKey::SignedNarHash {
                 hash,
                 upstream_hint,
+                ..
             } => {
                 self.seen.lock().unwrap().push(SeenKey::Signed {
                     hash: hash.as_str().to_string(),

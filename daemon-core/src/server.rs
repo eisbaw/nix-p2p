@@ -34,8 +34,8 @@ use crate::cacheinfo::CacheInfo;
 use crate::catalog::{CorrelationStore, NarCatalog, parse_correlation};
 use crate::rewrite;
 use crate::source::{
-    NarBody, NarHash, NarKey, NarPathToken, NarSource, NarinfoSource, RawUpstream, SourceError,
-    StoreHash, UpstreamResponse,
+    NarBody, NarCompression, NarHash, NarKey, NarPathToken, NarSource, NarinfoSource,
+    NarinfoTransport, RawUpstream, SourceError, StoreHash, UpstreamResponse,
 };
 use proc_supervisor::TaskSupervisorHandle;
 
@@ -205,6 +205,10 @@ async fn handle(req: Request<Incoming>, app: Arc<App>) -> Response<NarBody> {
                     NarKey::SignedNarHash {
                         hash: meta.nar_hash,
                         upstream_hint: token,
+                        // The AUTHORITATIVE narinfo transport descriptor (TASK-25): the
+                        // HTTP source bounds the on-wire body by NarSize ONLY when this
+                        // says Compression: none - never by the URL suffix.
+                        transport: meta.transport,
                     },
                     Some(meta.nar_size),
                 ),
@@ -352,7 +356,7 @@ async fn respond_narinfo(
     // raw?" is a discovery probe (TASK-164), not a static lookup. Await it only when
     // the narinfo actually correlated (a malformed narinfo is never rewritten).
     let rewrite_to_raw = match correlation.as_ref() {
-        Some((_, nar_hash, _)) => raw_serve.will_serve_raw(nar_hash.as_str()).await,
+        Some(c) => raw_serve.will_serve_raw(c.nar_hash.as_str()).await,
         None => false,
     };
 
@@ -369,6 +373,12 @@ async fn respond_narinfo(
                     NarPathToken::new(rw.url_token),
                     NarHash::new(rw.nar_hash),
                     rw.nar_size,
+                    // The rewritten narinfo is `Compression: none`, so the follow-up raw
+                    // NAR fetch is bounded by the signed NarSize (like-for-like) - the
+                    // authoritative transport for the raw token.
+                    NarinfoTransport {
+                        compression: NarCompression::Raw,
+                    },
                 );
                 (rw.body, true)
             }
@@ -387,8 +397,8 @@ async fn respond_narinfo(
     } else {
         // Normal (non-peer) path: byte-identical passthrough - unknown fields, odd
         // ordering and multiple Sig lines all survive (AC#3).
-        if let Some((token, nar_hash, nar_size)) = correlation {
-            catalog.record(token, nar_hash, nar_size);
+        if let Some(c) = correlation {
+            catalog.record(c.token, c.nar_hash, c.nar_size, c.transport);
         }
         (rewrite::apply(&bytes).into_owned(), false)
     };

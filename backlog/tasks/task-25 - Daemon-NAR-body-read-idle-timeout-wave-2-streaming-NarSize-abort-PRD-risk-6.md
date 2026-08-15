@@ -7,7 +7,7 @@ status: In Progress
 assignee:
   - '@claude'
 created_date: '2026-08-08 08:16'
-updated_date: '2026-08-15 21:57'
+updated_date: '2026-08-15 22:50'
 labels:
   - wave1-followup
   - daemon
@@ -86,4 +86,24 @@ FINDING 1 (HIGH/GATE - must fix): raw-body detection at upstream.rs:749/794 (pat
 FINDING 2 (MEDIUM): the size test (upstream.rs:2139/2214) asserts is_err() only - a mutant that errors before forwarding any frame, or forwards the over-cap frame then errors, still passes. Add a test that ASSERTS prior valid frames were forwarded to Nix and the crossing frame was DROPPED (the impl already drops it at 889 - prove it).
 FINDING 3 (MEDIUM): the idle-timeout test (upstream.rs:2153) does not mutation-prove the PER-READ RESET - removing the re-arm would still pass. Add a PACED-body oracle: every inter-frame gap below the idle bound but total transfer time above it must SUCCEED (not time out), and assert the received prefix.
 codex confirmed clean: SIGSTOP e2e wording honest, untrusted peers never reach UpstreamHttp (chain case: upstream daemon builds HTTP metadata after transport verification), compressed-without-Content-Length correctly uncapped, no floats, frozen surface untouched.
+
+CODEX NO-GO (6th trap recurrence) - REOPENED. Root fix in progress on top of 0f19166.
+ROOT CAUSE confirmed: parse_correlation (catalog.rs) discarded the authoritative narinfo Compression/FileSize, so fetch_streaming fell back to the URL-suffix heuristic (path_is_raw_nar). But Compression is INDEPENDENT of the suffix: a spec-valid narinfo can be URL: nar/x.nar + Compression: xz (xz is a Nix ARCHIVE coding, NOT an HTTP content-coding, so no HTTP Content-Encoding), which my suffix check misclassified as raw and would cap a legit compressed transfer at NarSize (wrong unit).
+FIX design: thread NarinfoTransport { compression: Raw|Compressed|Unknown, file_size } from the narinfo through catalog(NarMeta+parse_correlation) -> server(NarKey::SignedNarHash gains transport) -> upstream.fetch_streaming. Cap rule (authoritative, unit-labelled):
+- on_wire_is_raw = (narinfo Compression == none) AND (no non-identity HTTP Content-Encoding) -> cap = min(Content-Length, NarSize) [raw unit].
+- compressed archive on-wire (Compression != none, no HTTP coding) -> cap = min(Content-Length, FileSize); NO cap when Content-Length absent; NEVER NarSize.
+- HTTP content-coding on top -> only Content-Length counts on-wire bytes; NO cap when absent.
+Delete path_is_raw_nar (suffix heuristic) entirely. Add anti-trap test: URL nar/x.nar + Compression: xz must NOT be capped by NarSize (mutation-proven). Finding-2: assert prior frames forwarded + crossing frame DROPPED. Finding-3: paced-body oracle (inter-frame gap < idle, total > idle -> SUCCEEDS) to mutation-prove the per-read reset.
+
+ROUND-2 REVIEW (mped-architect Mark-emulator + qa-test-runner, parallel) on the root fix:
+- qa: all 5 gates green (fmt 0; clippy -p daemon-core -p daemon --all-targets -D warnings 0; daemon-core 198 pass/1 ignored; daemon all pass; no-floats 0). Every named TASK-25 test + nar_hash_collision regression pass.
+- mped-architect: NO HIGH findings. Unit reasoning now airtight (mutation-proven: flipping narinfo_raw=true turns the .nar+Compression:xz anti-test RED). Unknown->not-raw fail-safe correct at every entry (UpstreamPath, passthrough, absent/dup Compression). Seam change clean (FallbackNarSource forwards the key to both sources; p2p ignores via {..}; NarKey is not Hash/never a map key). Duplicated/hostile Compression can only degrade to Unknown, never force Raw. FileSize-not-a-cap decision endorsed (validated by nar_hash_collision fixture: FileSize:100 vs 160B body).
+
+FIXES APPLIED (re-gated green):
+- MEDIUM doc-vs-code drift: two comments claimed narinfo FileSize "tightens the compressed cap" but nothing read it. RESOLVED by removing file_size entirely.
+- MEDIUM carried-but-unread state: removed file_size from NarinfoTransport (+ NarMeta/parse_correlation/tests). NarinfoTransport now carries ONLY the authoritative Compression - the sole signal the cap needs. Answer to codex "(and preferably FileSize)": FileSize is unsigned, from a different response than the NAR body, and the CLIENT is the FileHash/FileSize arbiter, so it has no valid daemon-side cap role (using it regressed nar_hash_collision). The on-wire Content-Length is the compressed transport bound.
+- LOW oversize-oracle frame-granularity coupling: added a 10ms inter-frame gap + assert a RANGE (delivered in 1..=800) instead of exact 800, so the prefix-forwarded/crossing-frame-dropped property does not pin hyper chunking.
+Deferred (endorsed): none outstanding.
+
+Gate after fixes: daemon-core 198; daemon 37 result-lines 0 fail; fmt/clippy-Dwarnings/no-floats 0; just e2e 5/5 PASS. crash-sigstop-stall 7/7 verified on the prior iteration and unaffected by the file_size removal (that scenario uses default transport).
 <!-- SECTION:NOTES:END -->

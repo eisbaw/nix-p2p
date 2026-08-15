@@ -78,8 +78,8 @@ use tokio::time::{Instant as TokioInstant, Sleep, timeout};
 use tokio_rustls::TlsConnector;
 
 use crate::source::{
-    MAX_NARINFO_BYTES, NarKey, NarSource, NarinfoSource, RawUpstream, SourceError, StoreHash,
-    UpstreamResponse,
+    MAX_NARINFO_BYTES, NarCompression, NarKey, NarSource, NarinfoSource, NarinfoTransport,
+    RawUpstream, SourceError, StoreHash, UpstreamResponse,
 };
 
 /// Upper bound on a buffered (narinfo) body, applied by the `Limited` READER so
@@ -675,30 +675,30 @@ impl UpstreamHttp {
     /// cut off mid-stream (not merely a Content-Length PRE-check, which cannot catch a
     /// body that lies by streaming past its own declared length).
     ///
-    /// THE UNIT (the NarSize-vs-FileSize trap - recurred 5x; read [`compute_transport_cap`]):
+    /// THE UNIT (the NarSize-vs-FileSize trap - recurred 6x; read [`compute_transport_cap`]):
     /// the streamed body is the ON-WIRE TRANSPORT representation, whose byte-unit is
-    /// FileSize (COMPRESSED for a `.nar.xz`; equal to NarSize only for a raw `.nar`).
-    /// The cap is therefore a TRANSPORT-unit quantity = `min(Content-Length,
-    /// signed_raw_cap)`, where `signed_raw_cap` is the signed NarSize (`expected_size`)
-    /// ADMITTED ONLY when the on-wire body is proven RAW (so FileSize == NarSize, a
-    /// like-for-like comparison). A COMPRESSED body is NEVER bounded by the signed
-    /// NarSize here - that is the exact recurred bug (FileSize can exceed NarSize for a
-    /// tiny/incompressible NAR, which would 502 legitimate content). The signed
-    /// uncompressed NarSize guarantee on a compressed transfer is enforced DOWNSTREAM
-    /// by Nix's NarHash/NarSize gate (the ultimate arbiter), and for untrusted p2p
-    /// peers - who stream the RAW nar - by the fabric's mid-stream NarSize abort
+    /// FileSize (COMPRESSED when the narinfo `Compression` is xz/zstd; equal to NarSize
+    /// only when `Compression: none`). The cap is a TRANSPORT-unit quantity, and whether
+    /// the signed NarSize (`expected_size`) may bound the on-wire body is decided by the
+    /// AUTHORITATIVE narinfo `Compression` field carried in `transport` - NEVER by the
+    /// URL suffix (a spec-valid narinfo may be `URL: nar/x.nar` + `Compression: xz`, whose
+    /// on-wire bytes are xz-compressed despite the `.nar` suffix). A COMPRESSED body is
+    /// NEVER bounded by the signed NarSize here (the recurred bug); its signed uncompressed
+    /// guarantee is enforced DOWNSTREAM by Nix's NarHash/NarSize gate, and for untrusted
+    /// p2p peers - who stream the RAW nar - by the fabric's mid-stream NarSize abort
     /// (`peer-fabric`/`fabric-libp2p`), where NarSize IS the on-wire unit.
     async fn fetch_streaming(
         &self,
         path: &str,
         expected_size: Option<u64>,
+        transport: NarinfoTransport,
         budget: Option<Duration>,
     ) -> Result<UpstreamResponse, SourceError> {
         let response = self.send(path, budget).await?;
         let status = response.status().as_u16();
         let headers = response.headers().clone();
         // TASK-25 AC#2: the TRANSPORT-unit streaming byte cap (integer bytes; no floats).
-        let byte_cap = compute_transport_cap(path, &headers, expected_size);
+        let byte_cap = compute_transport_cap(&headers, transport, expected_size);
         let inner = response.into_body().map_err(std::io::Error::other);
         let body = BoundedBody::new(
             inner,
@@ -717,40 +717,61 @@ impl UpstreamHttp {
 
 /// The ON-WIRE TRANSPORT-unit streaming byte cap for a NAR/passthrough body
 /// (TASK-25 AC#2), computed like-for-like so the NarSize-vs-FileSize trap cannot
-/// recur. Returns `None` when no same-unit bound is available (an unbounded stream
-/// is then bounded only by the body-idle timeout above and by Nix downstream).
+/// recur (6th recurrence: the fix uses the AUTHORITATIVE narinfo `Compression`,
+/// NOT the URL suffix). Returns `None` when no same-unit bound is available (an
+/// unbounded stream is then bounded only by the body-idle timeout and by Nix
+/// downstream). Every quantity is a whole byte count (no floats).
 ///
-/// The streamed body is the on-wire TRANSPORT representation. Two same-unit bounds
-/// may apply, and the tighter wins:
-///   * `Content-Length` - the upstream's own declared on-wire byte count (= the
-///     narinfo FileSize for a compressed NAR). Always the on-wire unit by definition,
-///     so it is a valid cap for the on-wire body whatever the compression. It bites a
-///     body that streams MORE than it declared.
-///   * `signed_raw_cap` - the SIGNED NarSize (`expected_size`) ADMITTED ONLY when the
-///     on-wire body is proven RAW (`/nar/<h>.nar` AND no non-identity `Content-Encoding`),
-///     because ONLY THEN is the on-wire byte the raw-NAR byte and FileSize == NarSize. For
-///     a COMPRESSED body the on-wire byte is a FileSize byte and the signed NarSize is the
-///     WRONG unit (the 5x-recurred bug) - so it is NOT admitted, and the signed guarantee
-///     is enforced by Nix downstream.
+/// `expected_size` is the SIGNED NarSize (UNCOMPRESSED). `transport` is the narinfo's
+/// UNSIGNED descriptor: `compression` (authoritative raw-vs-compressed) and `file_size`
+/// (the COMPRESSED transport byte count). The unit of the on-wire body is decided by
+/// `transport.compression` COMBINED with any HTTP `Content-Encoding` (a SEPARATE transform
+/// the HTTP layer may add on top of the narinfo file):
 ///
-/// TRUST DEPENDENCY (stated so it is not mistaken for a cryptographic proof): "on-wire is
-/// raw" rests on the upstream being HONEST that a `.nar` token with no content-coding is
-/// genuinely uncompressed. A dishonest/malformed TRUSTED upstream serving compressed bytes
-/// at a bare `.nar` URL would be already broken end-to-end (Nix expects `Compression: none`
-/// there and cannot decompress it), so no LEGITIMATE content is lost - and UNTRUSTED peers
-/// never traverse this HTTP path (they fetch the raw NAR over the fabric, which enforces the
-/// signed NarSize itself). So the recurred bug cannot bite a real transfer, but the bound is
-/// admitted on transport metadata, not a decoded-length proof.
+///   * RAW on-wire (`Compression: none` AND no non-identity HTTP `Content-Encoding`): the
+///     on-wire byte IS the raw-NAR byte, so the signed NarSize is a like-for-like bound.
+///     cap = `min(Content-Length, NarSize)`.
+///   * COMPRESSED archive on-wire (`Compression != none`): the on-wire byte is a FileSize
+///     (compressed transport) byte - the signed NarSize is the WRONG unit and is NEVER
+///     used. cap = the on-wire `Content-Length`; when it is ABSENT (chunked) there is NO
+///     cap (Nix's NarHash gate + the fabric abort cover a runaway).
+///   * HTTP CONTENT-CODED on top (any `Compression`): the on-wire bytes are the HTTP-encoded
+///     form (neither NarSize nor FileSize), so again ONLY `Content-Length` counts them.
+///
+/// The compressed/coded cases collapse to the SAME rule (Content-Length only), so they
+/// share one branch below.
+///
+/// WHY NOT the narinfo `FileSize` as a compressed cap (and why it is not even carried in
+/// [`NarinfoTransport`]): it is UNSIGNED and comes from a DIFFERENT response (the narinfo)
+/// than the NAR body. Enforcing it here would abort a transfer that the NAR's OWN
+/// `Content-Length` permits whenever the narinfo's declared FileSize and the actual transfer
+/// disagree - which is legitimate (the CLIENT, not the daemon, is the arbiter of
+/// FileHash/FileSize). `tests/nar_hash_collision` is exactly such a case (FileSize: 100, body
+/// 160B) and a `min(CL, FileSize)` cap wrongly aborted it. So the on-wire `Content-Length`
+/// is the sole compressed transport bound.
+///
+/// Authoritativeness (the 6th-recurrence fix): the raw decision is `Compression == none`
+/// from the narinfo transport fields the daemon parsed at narinfo time, NOT
+/// `token.ends_with(".nar")`. A spec-valid `URL: nar/x.nar` + `Compression: xz` narinfo is
+/// therefore correctly classified COMPRESSED and never capped by the uncompressed NarSize.
 fn compute_transport_cap(
-    path: &str,
     headers: &http::HeaderMap,
+    transport: NarinfoTransport,
     expected_size: Option<u64>,
 ) -> Option<u64> {
     let content_length = content_length_of(headers);
-    let on_wire_is_raw = path_is_raw_nar(path) && !is_content_encoded(headers);
-    // NarSize is a like-for-like on-wire bound ONLY for a raw body; never for compressed.
-    let signed_raw_cap = if on_wire_is_raw { expected_size } else { None };
-    min_opt(content_length, signed_raw_cap)
+    let http_encoded = is_content_encoded(headers);
+    let narinfo_raw = transport.compression == NarCompression::Raw;
+
+    if narinfo_raw && !http_encoded {
+        // ON-WIRE == raw NAR (unit NarSize == FileSize). NarSize is like-for-like.
+        min_opt(content_length, expected_size)
+    } else {
+        // ON-WIRE == a COMPRESSED archive and/or HTTP-encoded form (transport unit).
+        // Bound ONLY by the on-wire Content-Length; NEVER the uncompressed NarSize, and
+        // never the narinfo FileSize (see the doc). No Content-Length -> NO cap.
+        content_length
+    }
 }
 
 /// True if the response declares a NON-identity `Content-Encoding` - an ACTUAL on-wire
@@ -783,19 +804,6 @@ fn content_length_of(headers: &http::HeaderMap) -> Option<u64> {
         .trim()
         .parse()
         .ok()
-}
-
-/// True when `path` addresses the RAW (uncompressed) NAR endpoint
-/// (`/nar/<narhash>.nar`, `Compression: none`), so the ON-WIRE body IS the raw NAR
-/// and FileSize == NarSize. A compressed token (`.nar.xz`, `.nar.zst`, ...) ends in
-/// its compression suffix, not `.nar`, so its on-wire bytes are FileSize (compressed),
-/// for which the signed NarSize is the WRONG unit. A non-`/nar/` passthrough path
-/// (`log/*`, `*.ls`) is never a raw NAR.
-fn path_is_raw_nar(path: &str) -> bool {
-    match path.strip_prefix("/nar/") {
-        Some(token) => token.ends_with(".nar"),
-        None => false,
-    }
 }
 
 /// The tighter of two OPTIONAL like-for-like byte caps (integer bytes; no floats).
@@ -1024,11 +1032,19 @@ impl NarSource for UpstreamHttp {
         // trait. This HTTP impl fetches by the URL token in either case, and
         // crucially fetches the EXACT token the request carried - never one
         // reconstructed from the hash (which is one-to-many across compression).
-        let token = match key {
-            NarKey::SignedNarHash { upstream_hint, .. } => upstream_hint.as_str(),
-            NarKey::UpstreamPath(token) => token.as_str(),
+        // The AUTHORITATIVE narinfo transport (TASK-25): only the correlated
+        // SignedNarHash path carries it. An UpstreamPath cold-start request has NO
+        // narinfo, so its transport is Unknown -> the on-wire body is NEVER treated as
+        // raw and the uncompressed NarSize is never applied to it (fail-safe).
+        let (token, transport) = match key {
+            NarKey::SignedNarHash {
+                upstream_hint,
+                transport,
+                ..
+            } => (upstream_hint.as_str(), *transport),
+            NarKey::UpstreamPath(token) => (token.as_str(), NarinfoTransport::default()),
         };
-        self.fetch_streaming(&format!("/nar/{token}"), expected_size, budget)
+        self.fetch_streaming(&format!("/nar/{token}"), expected_size, transport, budget)
             .await
     }
 }
@@ -1044,7 +1060,10 @@ impl RawUpstream for UpstreamHttp {
         path: &str,
         budget: Option<Duration>,
     ) -> Result<UpstreamResponse, SourceError> {
-        self.fetch_streaming(path, None, budget).await
+        // Passthrough (log/*, *.ls, debuginfo/*): no narinfo, no size bound -> Unknown
+        // transport, so the on-wire body is capped only by its own Content-Length.
+        self.fetch_streaming(path, None, NarinfoTransport::default(), budget)
+            .await
     }
 }
 
@@ -1189,16 +1208,18 @@ mod tests {
         h
     }
 
-    #[test]
-    fn path_is_raw_nar_only_for_uncompressed_tokens() {
-        // Raw endpoint: on-wire == raw NAR, FileSize == NarSize.
-        assert!(path_is_raw_nar("/nar/06rgb.nar"));
-        // Compressed tokens end in their compression suffix, NOT `.nar`.
-        assert!(!path_is_raw_nar("/nar/15m2z.nar.xz"));
-        assert!(!path_is_raw_nar("/nar/1nn85.nar.zst"));
-        // Passthrough paths are never a raw NAR.
-        assert!(!path_is_raw_nar("/log/foo"));
-        assert!(!path_is_raw_nar("/foo.ls"));
+    /// A `Compression: none` (raw) transport descriptor.
+    fn raw_transport() -> NarinfoTransport {
+        NarinfoTransport {
+            compression: NarCompression::Raw,
+        }
+    }
+
+    /// A compressed (`Compression: xz`) transport descriptor.
+    fn compressed_transport() -> NarinfoTransport {
+        NarinfoTransport {
+            compression: NarCompression::Compressed,
+        }
     }
 
     #[test]
@@ -1212,68 +1233,85 @@ mod tests {
 
     #[test]
     fn transport_cap_never_uses_narsize_on_a_compressed_body() {
-        // THE ANTI-TRAP (NarSize vs FileSize): a compressed `.nar.xz` on-wire body
-        // whose FileSize (300) EXCEEDS the signed NarSize (100). The signed NarSize
-        // must NOT bound it - only the transport Content-Length may. Using NarSize
-        // here (300 > 100) would falsely abort a legitimate transfer.
+        // THE 6th-recurrence ANTI-TRAP: the on-wire body is COMPRESSED per the
+        // AUTHORITATIVE narinfo `Compression` (NOT the URL suffix). Its FileSize (300)
+        // EXCEEDS the signed NarSize (100). NarSize must NEVER bound it.
         let h = headers_with(&[("content-length", "300")]);
         assert_eq!(
-            compute_transport_cap("/nar/abc.nar.xz", &h, Some(100)),
+            compute_transport_cap(&h, compressed_transport(), Some(100)),
             Some(300),
-            "a compressed body is bounded by its FileSize Content-Length, never the uncompressed NarSize"
+            "a compressed body is bounded by its on-wire Content-Length, never the uncompressed NarSize"
         );
-        // No Content-Length (chunked, compressed): NO cap - NarSize is the wrong unit
-        // and there is no transport bound. Bounded downstream by Nix + the idle timeout.
+        // The narinfo FileSize is NOT a transfer cap (it is unsigned, from a different
+        // response, and the CLIENT verifies it): a FileSize (260) BELOW the on-wire
+        // Content-Length (300) must NOT tighten the cap and abort a valid transfer.
+        let h = headers_with(&[("content-length", "300")]);
         assert_eq!(
-            compute_transport_cap("/nar/abc.nar.xz", &http::HeaderMap::new(), Some(100)),
+            compute_transport_cap(&h, compressed_transport(), Some(100)),
+            Some(300),
+            "narinfo FileSize must not override the on-wire Content-Length (nar_hash_collision regression)"
+        );
+        // No Content-Length (chunked, compressed): NO cap - NarSize is the wrong unit,
+        // and FileSize is NOT used as a lone cap (Nix + fabric cover a runaway).
+        assert_eq!(
+            compute_transport_cap(&http::HeaderMap::new(), compressed_transport(), Some(100)),
+            None
+        );
+        // `Unknown` compression (uncorrelated / ambiguous) is treated as NOT raw too.
+        assert_eq!(
+            compute_transport_cap(
+                &http::HeaderMap::new(),
+                NarinfoTransport::default(),
+                Some(100)
+            ),
             None
         );
     }
 
     #[test]
     fn transport_cap_admits_narsize_only_for_a_raw_body() {
-        // Raw `.nar` on-wire body: FileSize == NarSize, so the signed NarSize IS a
+        // Compression: none (raw): FileSize == NarSize, so the signed NarSize IS a
         // like-for-like bound. With no Content-Length (chunked raw) the NarSize is
         // the cap - this is where the SIGNED bound bites at the HTTP layer.
         assert_eq!(
-            compute_transport_cap("/nar/abc.nar", &http::HeaderMap::new(), Some(100)),
+            compute_transport_cap(&http::HeaderMap::new(), raw_transport(), Some(100)),
             Some(100)
         );
         // With BOTH present the tighter wins (both are the on-wire unit here).
         let h = headers_with(&[("content-length", "120")]);
         assert_eq!(
-            compute_transport_cap("/nar/abc.nar", &h, Some(100)),
+            compute_transport_cap(&h, raw_transport(), Some(100)),
             Some(100)
         );
         let h = headers_with(&[("content-length", "80")]);
         assert_eq!(
-            compute_transport_cap("/nar/abc.nar", &h, Some(100)),
+            compute_transport_cap(&h, raw_transport(), Some(100)),
             Some(80)
         );
     }
 
     #[test]
-    fn transport_cap_rejects_narsize_when_a_raw_token_is_content_encoded() {
-        // Defence: a raw `.nar` token but the upstream slapped a Content-Encoding on
-        // the wire -> the on-wire bytes are NO LONGER raw NAR bytes, so NarSize is not
-        // their unit. Only the transport Content-Length may bound them.
+    fn transport_cap_rejects_narsize_when_a_raw_narinfo_is_http_content_encoded() {
+        // A `Compression: none` narinfo but the upstream slapped an HTTP Content-Encoding
+        // on the wire -> the on-wire bytes are NO LONGER raw NAR bytes (they are the
+        // HTTP-encoded form), so NarSize is not their unit. Only Content-Length may bound.
         let h = headers_with(&[("content-length", "50"), ("content-encoding", "gzip")]);
         assert_eq!(
-            compute_transport_cap("/nar/abc.nar", &h, Some(100)),
+            compute_transport_cap(&h, raw_transport(), Some(100)),
             Some(50)
         );
         let h = headers_with(&[("content-encoding", "gzip")]);
-        assert_eq!(compute_transport_cap("/nar/abc.nar", &h, Some(100)), None);
+        assert_eq!(compute_transport_cap(&h, raw_transport(), Some(100)), None);
         // `identity` is the RFC no-op coding: the body is STILL raw, so the NarSize
         // bound is KEPT (a real like-for-like bound must not be discarded).
         let h = headers_with(&[("content-encoding", "identity")]);
         assert_eq!(
-            compute_transport_cap("/nar/abc.nar", &h, Some(100)),
+            compute_transport_cap(&h, raw_transport(), Some(100)),
             Some(100)
         );
         // A comma list containing a real coding is encoded -> bound dropped.
         let h = headers_with(&[("content-encoding", "identity, gzip")]);
-        assert_eq!(compute_transport_cap("/nar/abc.nar", &h, Some(100)), None);
+        assert_eq!(compute_transport_cap(&h, raw_transport(), Some(100)), None);
     }
 }
 
@@ -2149,6 +2187,83 @@ mod streaming_bounds_tests {
         Ok(total)
     }
 
+    /// Drain a body, returning the bytes ACTUALLY FORWARDED to the consumer before
+    /// any error, plus that error if the stream aborted. Distinguishes "forwarded the
+    /// valid prefix then aborted, dropping the crossing frame" from "errored before
+    /// forwarding anything" (Finding 2).
+    async fn drain_counting(body: crate::source::NarBody) -> (usize, Option<std::io::Error>) {
+        let mut body = body;
+        let mut total = 0usize;
+        while let Some(frame) = body.frame().await {
+            match frame {
+                Ok(frame) => {
+                    if let Some(data) = frame.data_ref() {
+                        total += data.len();
+                    }
+                }
+                Err(e) => return (total, Some(e)),
+            }
+        }
+        (total, None)
+    }
+
+    /// A `Compression: none` (raw) transport descriptor for the on-wire body.
+    fn raw_t() -> NarinfoTransport {
+        NarinfoTransport {
+            compression: NarCompression::Raw,
+        }
+    }
+
+    /// A compressed (`Compression: xz`) transport descriptor.
+    fn compressed_t() -> NarinfoTransport {
+        NarinfoTransport {
+            compression: NarCompression::Compressed,
+        }
+    }
+
+    /// A loopback upstream that answers with a CHUNKED body of the given FRAME sizes
+    /// (one HTTP chunk per size, each a distinct fill byte so frame boundaries are
+    /// observable), sleeping `gap` between frames. No `Content-Length`. Used to prove
+    /// the per-read idle RESET (paced body, Finding 3) and exact frame accounting.
+    async fn spawn_chunked_frames(sizes: Vec<usize>, gap: Duration) -> SocketAddr {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        tokio::spawn(async move {
+            let Ok((mut sock, _)) = listener.accept().await else {
+                return;
+            };
+            read_request(&mut sock).await;
+            if sock
+                .write_all(b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n")
+                .await
+                .is_err()
+            {
+                return;
+            }
+            for (i, size) in sizes.iter().enumerate() {
+                if i > 0 && !gap.is_zero() {
+                    tokio::time::sleep(gap).await;
+                }
+                let fill = b'a' + (i % 26) as u8;
+                let chunk = vec![fill; *size];
+                if sock
+                    .write_all(format!("{size:x}\r\n").as_bytes())
+                    .await
+                    .is_err()
+                    || sock.write_all(&chunk).await.is_err()
+                    || sock.write_all(b"\r\n").await.is_err()
+                {
+                    return; // client aborted (a cap fired) - stop writing.
+                }
+                let _ = sock.flush().await;
+            }
+            let _ = sock.write_all(b"0\r\n\r\n").await;
+            let _ = sock.flush().await;
+            let _ = sock.shutdown().await;
+        });
+        addr
+    }
+
     #[tokio::test]
     async fn body_idle_timeout_bounds_a_midstream_stall() {
         // AC#1: an upstream that sends headers + partial body then STALLS yields a
@@ -2156,7 +2271,7 @@ mod streaming_bounds_tests {
         let addr = spawn_stall(b"nix-archive-1 partial NAR".to_vec()).await;
         let client = plain_client(addr, Duration::from_millis(200));
         let resp = client
-            .fetch_streaming("/nar/abc.nar.xz", None, None)
+            .fetch_streaming("/nar/abc.nar.xz", None, NarinfoTransport::default(), None)
             .await
             .expect("headers arrive before the stall");
         assert_eq!(resp.status, 200);
@@ -2186,7 +2301,7 @@ mod streaming_bounds_tests {
         let addr = spawn_stall(b"partial".to_vec()).await;
         let client = plain_client(addr, Duration::from_secs(3600));
         let resp = client
-            .fetch_streaming("/nar/abc.nar.xz", None, None)
+            .fetch_streaming("/nar/abc.nar.xz", None, NarinfoTransport::default(), None)
             .await
             .expect("headers arrive");
         let outcome = tokio::time::timeout(Duration::from_millis(800), drain(resp.body)).await;
@@ -2208,7 +2323,7 @@ mod streaming_bounds_tests {
         let addr = spawn_chunked_bytes(oversize).await;
         let client = plain_client(addr, Duration::from_secs(30));
         let resp = client
-            .fetch_streaming("/nar/deadbeef.nar", Some(nar_size), None)
+            .fetch_streaming("/nar/deadbeef.nar", Some(nar_size), raw_t(), None)
             .await
             .expect("headers arrive");
         let drained = drain(resp.body).await;
@@ -2221,7 +2336,7 @@ mod streaming_bounds_tests {
         let addr2 = spawn_chunked_bytes(oversize).await;
         let client2 = plain_client(addr2, Duration::from_secs(30));
         let resp2 = client2
-            .fetch_streaming("/nar/deadbeef.nar", None, None)
+            .fetch_streaming("/nar/deadbeef.nar", None, raw_t(), None)
             .await
             .expect("headers arrive");
         let n = drain(resp2.body)
@@ -2242,7 +2357,7 @@ mod streaming_bounds_tests {
         let addr = spawn_chunked_bytes(nar_size as usize).await;
         let client = plain_client(addr, Duration::from_secs(30));
         let resp = client
-            .fetch_streaming("/nar/deadbeef.nar", Some(nar_size), None)
+            .fetch_streaming("/nar/deadbeef.nar", Some(nar_size), raw_t(), None)
             .await
             .expect("headers arrive");
         let n = drain(resp.body)
@@ -2267,7 +2382,7 @@ mod streaming_bounds_tests {
         let addr = spawn_chunked_bytes(on_wire).await;
         let client = plain_client(addr, Duration::from_secs(30));
         let resp = client
-            .fetch_streaming("/nar/deadbeef.nar.xz", Some(nar_size), None)
+            .fetch_streaming("/nar/deadbeef.nar.xz", Some(nar_size), compressed_t(), None)
             .await
             .expect("headers arrive");
         let n = drain(resp.body)
@@ -2276,6 +2391,88 @@ mod streaming_bounds_tests {
         assert_eq!(
             n, on_wire,
             "compressed on-wire bytes stream verbatim; NarSize is the wrong unit for them"
+        );
+    }
+
+    #[tokio::test]
+    async fn nar_suffix_url_with_compression_xz_is_not_capped_by_narsize() {
+        // THE 6th-recurrence ANTI-TRAP end to end (codex Finding 1): the URL ends
+        // `.nar` (the old suffix heuristic would call it RAW and cap at NarSize) but the
+        // AUTHORITATIVE narinfo `Compression` is xz -> the on-wire body is a compressed
+        // archive whose FileSize legitimately EXCEEDS the uncompressed NarSize. It MUST
+        // stream verbatim. The mutation is built in: pass `raw_t()` instead of
+        // `compressed_t(..)` and the on-wire bytes (3072) exceed NarSize (1000) -> abort.
+        let nar_size = 1000u64;
+        let on_wire = 3072usize;
+        let addr = spawn_chunked_bytes(on_wire).await;
+        let client = plain_client(addr, Duration::from_secs(30));
+        let resp = client
+            // Compression: xz carried in the transport, DESPITE the `.nar` URL suffix.
+            .fetch_streaming("/nar/deadbeef.nar", Some(nar_size), compressed_t(), None)
+            .await
+            .expect("headers arrive");
+        let n = drain(resp.body)
+            .await
+            .expect("a Compression: xz body must NOT be capped by NarSize even at a .nar URL");
+        assert_eq!(
+            n, on_wire,
+            "the authoritative Compression, not the URL suffix, decides the unit"
+        );
+    }
+
+    #[tokio::test]
+    async fn oversize_abort_forwards_the_valid_prefix_then_drops_the_crossing_frame() {
+        // Finding 2: prove the abort forwards the prior VALID frames and DROPS the frame
+        // that crosses the cap (never forwards oversized bytes), rather than erroring
+        // before delivering anything or forwarding the over-cap frame.
+        let cap = 1000u64;
+        // Three 400-byte frames: after two (800) we are under cap; the third crosses to
+        // 1200 > 1000 and must be DROPPED. A small inter-frame gap (well under the idle
+        // bound) keeps hyper from coalescing the reads. Assert a RANGE, not an exact 800, so
+        // the property does not pin hyper's chunking granularity:
+        //   delivered > 0    => the valid prefix WAS forwarded (not "errored before anything")
+        //   delivered <= 800 => the crossing frame (which would reach 1200) was NOT forwarded
+        let addr = spawn_chunked_frames(vec![400, 400, 400], Duration::from_millis(10)).await;
+        let client = plain_client(addr, Duration::from_secs(30));
+        let resp = client
+            .fetch_streaming("/nar/deadbeef.nar", Some(cap), raw_t(), None)
+            .await
+            .expect("headers arrive");
+        let (delivered, err) = drain_counting(resp.body).await;
+        assert!(
+            err.is_some(),
+            "the oversize transfer must abort with an error"
+        );
+        assert!(
+            delivered > 0 && delivered <= 800,
+            "the valid prefix was forwarded and the crossing frame (->1200B) DROPPED, \
+             got {delivered} bytes (must be 1..=800, never the oversized 1200)"
+        );
+    }
+
+    #[tokio::test]
+    async fn paced_body_within_idle_gap_succeeds_even_when_total_exceeds_the_bound() {
+        // Finding 3: mutation-prove the PER-READ RESET. Five 100-byte frames, each
+        // arriving 120ms after the last (below the 300ms idle bound), so the TOTAL
+        // transfer (~480ms) EXCEEDS the idle bound. A per-read-reset timeout SUCCEEDS
+        // (each gap is under bound); a TOTAL deadline would wrongly abort. Deleting the
+        // re-arm on progress turns this green test red.
+        let idle = Duration::from_millis(300);
+        let gap = Duration::from_millis(120);
+        let frames = vec![100usize; 5];
+        let expected: usize = frames.iter().sum();
+        let addr = spawn_chunked_frames(frames, gap).await;
+        let client = plain_client(addr, idle);
+        let resp = client
+            .fetch_streaming("/nar/deadbeef.nar", None, raw_t(), None)
+            .await
+            .expect("headers arrive");
+        let n = drain(resp.body)
+            .await
+            .expect("a paced body whose inter-frame gaps stay under the idle bound must SUCCEED");
+        assert_eq!(
+            n, expected,
+            "the full body arrives; the idle timeout resets on each frame, it is not a total deadline"
         );
     }
 }

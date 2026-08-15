@@ -2159,6 +2159,7 @@ mod tests {
         let key = NarKey::SignedNarHash {
             hash: NarHash::new(key_x().to_string()),
             upstream_hint: NarPathToken::new("nar/1abc.nar.xz"),
+            transport: crate::source::NarinfoTransport::default(),
         };
         let resp = fallback
             .resolve(&key, None)

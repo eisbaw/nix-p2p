@@ -242,6 +242,7 @@ async fn provider_serves_and_announces_a_nar_a_consumer_discovers_and_fetches_wi
     let nar_key = NarKey::SignedNarHash {
         hash: NarHash::new(nar_hash_key.to_string()),
         upstream_hint: NarPathToken::new("ignored-by-the-libp2p-source"),
+        transport: Default::default(),
     };
     let resolved = libp2p_source
         .resolve(&nar_key, Some(nar.len() as u64))
