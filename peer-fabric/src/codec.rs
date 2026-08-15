@@ -1079,6 +1079,27 @@ mod tests {
         out
     }
 
+    /// Deterministic HIGH-entropy (incompressible) bytes via splitmix64. Reproducible from a fixed
+    /// seed (NOT `rand`), but zstd cannot shrink them, so a frame built from `len >= DECODE_BLOCK`
+    /// of these is guaranteed LARGER than one decoder chunk - the boundary matrices below feed such
+    /// a frame in `DECODE_BLOCK`-sized pieces so the BLOCK-1/BLOCK/BLOCK+1 decoder axis exercises
+    /// genuinely different MULTI-push decode paths. A constant-byte buffer instead compresses to a
+    /// handful of bytes, collapsing every decoder-chunk case to a single push (a VACUOUS axis).
+    fn high_entropy(len: usize, seed: u64) -> Vec<u8> {
+        let mut out = Vec::with_capacity(len + 8);
+        let mut s = seed;
+        while out.len() < len {
+            s = s.wrapping_add(0x9E37_79B9_7F4A_7C15);
+            let mut z = s;
+            z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+            z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+            z ^= z >> 31;
+            out.extend_from_slice(&z.to_le_bytes());
+        }
+        out.truncate(len);
+        out
+    }
+
     /// A streamed frame is a valid single zstd frame: it DECODES through the bounded decoder to
     /// the exact raw nar and hence the SAME blob id as the bulk frame - only the PRODUCTION is
     /// pipelined, the wire format is unchanged.
@@ -1145,6 +1166,13 @@ mod tests {
     /// streamed production must NOT reintroduce the codex 128 KiB boundary bug. The encoder input
     /// block AND the decoder feed chunk are both varied to land block edges at, before, and after
     /// the decoder's DECODE_BLOCK boundary from both sides.
+    ///
+    /// The nar is HIGH-ENTROPY (incompressible), so the COMPRESSED frame is larger than one
+    /// `DECODE_BLOCK` and the decoder-chunk axis (`BLOCK-1/BLOCK/BLOCK+1`) genuinely feeds the frame
+    /// in MULTIPLE pushes that straddle the decoder's block boundary. A constant-byte nar (the
+    /// previous version) compressed to a few bytes, so every decoder chunk collapsed to ONE push and
+    /// the boundary axis was VACUOUS. The `compressed_len > DECODE_BLOCK` assertion fails LOUDLY if a
+    /// future change ever makes the input compressible again and silently re-vacates the axis.
     #[test]
     fn streamed_exact_block_multiples_round_trip() {
         const BLOCK: usize = 128 * 1024; // tracks DECODE_BLOCK
@@ -1154,10 +1182,18 @@ mod tests {
         // AFTER the decoder's DECODE_BLOCK boundary from both sides - the exact TASK-99 128 KiB
         // regression class (including DECODE_BLOCK-1, previously absent) on STREAMED frames.
         for n in 1..=3usize {
-            let raw = vec![0u8; n * BLOCK];
+            let raw = high_entropy(n * BLOCK, 0x0110_0203_0405_0607 ^ n as u64);
             for enc_block in [4096usize, BLOCK - 1, BLOCK, BLOCK + 1] {
                 let streamed = stream_compress(&raw, DEFAULT_ZSTD_LEVEL, enc_block);
-                for dec_chunk in [1usize, 4096, BLOCK - 1, BLOCK, BLOCK + 1] {
+                // NON-VACUITY: the incompressible frame must exceed one decoder chunk, so the
+                // BLOCK-1/BLOCK/BLOCK+1 decoder axis below spans multiple pushes across the boundary.
+                assert!(
+                    streamed.len() as u64 > DECODE_BLOCK as u64,
+                    "N={n} enc={enc_block}: compressed frame {} B must exceed one DECODE_BLOCK \
+                     ({DECODE_BLOCK} B) or the decoder-chunk boundary axis is vacuous",
+                    streamed.len()
+                );
+                for dec_chunk in [4096usize, BLOCK - 1, BLOCK, BLOCK + 1] {
                     let decoded = decode_all(&streamed, raw.len() as u64, dec_chunk)
                         .unwrap_or_else(|e| {
                             panic!(
@@ -1179,6 +1215,10 @@ mod tests {
     /// exact-multiple handling did not create an off-by-one). The full {small, BLOCK-1, BLOCK,
     /// BLOCK+1} encoder-block x decoder-chunk matrix is swept here too (F2 completion): the ±1
     /// case must hold across every block-edge alignment, not just one encoder/decoder config.
+    ///
+    /// As above, the nar is HIGH-ENTROPY so the compressed frame exceeds one `DECODE_BLOCK` and the
+    /// decoder-chunk axis is a real multi-push boundary sweep, not a vacuous single push - asserted
+    /// per case so a future compressibility regression fails loudly.
     #[test]
     fn streamed_near_block_multiples_round_trip() {
         const BLOCK: usize = 128 * 1024;
@@ -1186,10 +1226,19 @@ mod tests {
         for n in 1..=3usize {
             for delta in [-1i64, 1] {
                 let size = (n as i64 * BLOCK as i64 + delta) as usize;
-                let raw = vec![0x5au8; size];
+                let raw = high_entropy(
+                    size,
+                    0x0710_0605_0403_0201 ^ ((n as u64) << 1) ^ delta as u64,
+                );
                 for enc_block in [4096usize, BLOCK - 1, BLOCK, BLOCK + 1] {
                     let streamed = stream_compress(&raw, DEFAULT_ZSTD_LEVEL, enc_block);
-                    for dec_chunk in [1usize, 4096, BLOCK - 1, BLOCK, BLOCK + 1] {
+                    assert!(
+                        streamed.len() as u64 > DECODE_BLOCK as u64,
+                        "size={size} enc={enc_block}: compressed frame {} B must exceed one \
+                         DECODE_BLOCK ({DECODE_BLOCK} B) or the decoder-chunk axis is vacuous",
+                        streamed.len()
+                    );
+                    for dec_chunk in [4096usize, BLOCK - 1, BLOCK, BLOCK + 1] {
                         let decoded =
                             decode_all(&streamed, size as u64, dec_chunk).unwrap_or_else(|e| {
                                 panic!("size={size} enc={enc_block} dec={dec_chunk}: {e}")
