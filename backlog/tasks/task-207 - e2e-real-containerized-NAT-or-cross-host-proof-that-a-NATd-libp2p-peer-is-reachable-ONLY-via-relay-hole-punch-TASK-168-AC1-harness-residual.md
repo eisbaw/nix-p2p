@@ -6,12 +6,14 @@ title: >-
 status: To Do
 assignee: []
 created_date: '2026-08-14 17:19'
+updated_date: '2026-08-15 08:42'
 labels:
   - libp2p
   - fabric
   - nat
   - hardening
   - e2e
+  - owner-approved-env
 dependencies:
   - TASK-168
 priority: high
@@ -42,4 +44,6 @@ VIABLE PATHS for a future cycle (pick one):
 (b) A real TWO-HOST run: two machines behind real home/cloud NATs, a public relay+bootstrap, prove C fetches from P only via relay/hole-punch, byte-identical.
 
 TEST-LOCK-IN (unchanged from 168): minimal-pair bite - the NATd peer fetches byte-identical with relay/dcutr ON; disable them -> that peer is undiallable -> upstream fallback (upstream.nar>=1). Extend scripts/e2e_harness.py - the Libp2pNetnsTopology separate-netns class is the base - with the NAT gateway + the relay/bootstrap node.
+
+OWNER ENVIRONMENT DECISION (2026-08-15): build a NixOS VM harness — TWO NixOS VMs, EACH behind its OWN NAT — for the real-NAT hole-punch proof. This UNPARKS 207 (was env-blocked on the rootless host). Approach: NixOS VM test (nixos/ layer, cf. TASK-10 just e2e-vm) with QEMU networking placing each node's VM behind a separate NAT (its own user-mode-net / a NAT gateway VM per node), so a NATd libp2p peer is reachable ONLY via relay/hole-punch (AutoNAT/DCUtR/circuit-relay). This is rootful INSIDE the VM (real ip_forward + NAT), sidestepping the rootless-host block. Also unblocks TASK-168 AC#1. Sequence: after TASK-203 lands + TASK-198 (owner: demonstrate compression). Scope carefully — VM-based e2e is heavier; a new just recipe (e2e-nat-vm) + honest per-hole-punch-vs-relay assertion.
 <!-- SECTION:NOTES:END -->
