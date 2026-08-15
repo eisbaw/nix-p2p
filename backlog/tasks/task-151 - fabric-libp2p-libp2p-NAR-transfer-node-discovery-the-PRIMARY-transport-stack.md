@@ -3,11 +3,11 @@ id: TASK-151
 title: >-
   fabric-libp2p: libp2p NAR transfer + node discovery (the PRIMARY transport
   stack)
-status: In Progress
+status: Done
 assignee:
   - '@claude'
 created_date: '2026-08-12 07:22'
-updated_date: '2026-08-12 08:58'
+updated_date: '2026-08-15 00:20'
 labels:
   - libp2p
   - fabric
@@ -53,3 +53,9 @@ HONEST LIMITS (filed, not faked): NAT traversal / NodeLocator = TASK-159; true m
 
 FORWARD-CARRY: TASK-146 (daemon-libp2p wiring): build Libp2pFabric via start_with_supplier with the daemon's catalog-backed Libp2pNarSupplier (needs TASK-158's real supplier) and register the transport in the fetch path; the transport already consumes the existing Iroh NodeId-locator offer. TASK-132 (cold journey) + TASK-145 (daemon-libp2p binary): depend on TASK-146. Transport tournament (libp2p vs iroh transfer under one kad discovery): BLOCKED on TASK-156 (distinct offer/tag) since a single-process dual-stack currently collides on the Iroh tag.
 <!-- SECTION:NOTES:END -->
+
+## Final Summary
+
+<!-- SECTION:FINAL_SUMMARY:BEGIN -->
+RECONCILED + CLOSED (2026-08-15, orchestrator + COMPASS 'reconcile & close'). The PRIMARY libp2p transport stack is delivered and reviewed: the libp2p NAR transfer + serve run over the SAME swarm as kad+identify (request-response /nix-p2p/<scope>/nar/1, BLAKE3-verified, task-72 admission ServeGate, 256 MiB response cap); core landed in f9c10ae, mped-architect review-fixes in e8796d5 (incl. the re-serve clobber race fix), tracker/follow-ups in c33307b. The 6-test multi-node suite (tests/nar_transport.rs) proves byte-identical BLAKE3-verified fetch, corrupt-provider gate-1 trip, signed-size abort, serve-budget decline, drop-stops-admission, and the stale-teardown-doesn't-clobber-successor regression. Every honest-limit this task filed is now DONE: true streamed mid-stream size-abort + off-worker production (TASK-157), real store-dump/regular-file cancellation-safe supplier (TASK-158), NAT traversal + NodeLocator (TASK-159), daemon wiring (TASK-160), container e2e store-serve (TASK-194). The ONLY remaining forward-carry is the additive distinct TransportTag::Libp2p + frozen-codec OFFER_LIBP2P for the dual-stack tournament, which is its own task TASK-156 (this task deliberately kept the frozen seam untouched, consuming the existing Iroh NodeId-locator offer via offer-driven dispatch — honest ADR in transport.rs). Closing here unblocks TASK-156 (its dependency) and thereby the 183/156 coherence prune.
+<!-- SECTION:FINAL_SUMMARY:END -->
