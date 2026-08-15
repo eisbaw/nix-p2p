@@ -478,6 +478,20 @@
         # The gate scripts import a shared module; without this they would
         # leave a scripts/__pycache__ behind on every run.
         PYTHONDONTWRITEBYTECODE = "1";
+        # TASK-54 root-cause fix: one SHARED cargo target dir for the main repo AND
+        # every /tmp review/implementer worktree. Without this, each agent copy of
+        # the tree builds into its OWN target dir - six concurrent reviewers = six
+        # full builds of the same tree, which took the box to 0 MB (a single review
+        # worktree measured 44 GB). Pointing them all here collapses N target dirs
+        # to ONE (~44 GB -> ~3 GB) and SERIALISES concurrent builds on cargo's target
+        # lock - which is CORRECT here: TASK-109 established that concurrent builds
+        # are what make the gate non-deterministic. Absolute + under $HOME/.cache so
+        # it is OUTSIDE any /tmp worktree and shared by every copy. This affects only
+        # `nix develop` (interactive/agent builds); `nix build` / `nix flake check`
+        # use crane's own sandboxed target, so frozen artifacts are unaffected. Set
+        # as a devShell env ATTR (not a shellHook echo) per the owner's
+        # no-spammy-shellHook rule. `just reclaim` clears it.
+        CARGO_TARGET_DIR = "/home/mpedersen/.cache/nix-p2p-target";
         # No shellHook: house rule forbids verbose devshell output.
       };
     };

@@ -44,6 +44,35 @@ _toolchain:
             ;;
     esac
 
+# Refuse to start a disk-heavy recipe below NIX_P2P_MIN_FREE_GIB free (default 15
+# GiB), pointing at `just reclaim`, INSTEAD of a mid-run 100%-full crash that also
+# kills the shell's output capture and manufactures false gate results (TASK-54).
+# The heavy recipes list this FIRST so it fires before nix/python/cargo spin up.
+# Override the threshold with NIX_P2P_MIN_FREE_GIB=<gib> for tests/demos. Integer
+# math only (owner no-float rule).
+_headroom:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    min_gib="${NIX_P2P_MIN_FREE_GIB:-15}"
+    avail=$(df -B1 --output=avail . | tail -n1 | tr -d ' ')
+    avail="${avail:-0}"
+    min_bytes=$(( min_gib * 1024 * 1024 * 1024 ))
+    if (( avail < min_bytes )); then
+        echo "DISK HEADROOM TOO LOW: $(( avail / 1024 / 1024 / 1024 )) GiB free, need ${min_gib} GiB." >&2
+        echo "Run 'just reclaim' to free rebuildable artifacts + podman, then retry." >&2
+        echo "(Override with NIX_P2P_MIN_FREE_GIB=<gib> only if you know the run fits.)" >&2
+        exit 1
+    fi
+
+# Only THIS user's podman objects and THIS project's rebuildable artifacts - never
+# another session's files. Prunes podman images/volumes/build-cache, drops
+# unreferenced fixture generations, prunes stale git worktrees, and clears the cargo
+# target dir(s). Reports bytes freed. The next build after this is COLD by design.
+# See scripts/reclaim.sh.
+# Reclaim this project's rebuildable disk footprint + podman safely (reports bytes freed).
+reclaim:
+    scripts/reclaim.sh
+
 # Refuse to run the fixture gates against anything but the pinned Python.
 # Without this, `${NIX_P2P_PYTHON}/bin/python3` expands to `/bin/python3`
 # outside `nix develop` - which EXISTS on Debian and Ubuntu, so the run would
@@ -102,7 +131,7 @@ independence: _toolchain
 # provenance fail-closed path with synthetic inputs - no containers, so it runs
 # in the fast tier alongside the fixture gate.
 # Run the fast unit, integration, fixture, and evidence self-test suite.
-test: build _python fixtures
+test: _headroom build _python fixtures
     cargo test --locked --workspace
     # The evidence fixture is feature-gated out of the workspace-default suite.
     cargo test --locked --package daemon --bin iroh-node-lookup-fixture --features evidence-fixture
@@ -225,19 +254,22 @@ package:
 E2E_FAST := "--only s1-byte-and-counts --only s2-fallback --only tamper-narhash --only chain-s1-and-counts --only s6-p2p"
 
 # Run the fast breadth-first e2e subset (5 scenarios) - the common pre-commit loop.
-e2e: _python fixtures-large
+e2e: _headroom _python fixtures-large
     "${NIX_P2P_PYTHON}/bin/python3" scripts/e2e_harness.py {{E2E_FAST}}
 
 # Required before shipping a serving-path change: it is the only run whose green
 # means what `just e2e` used to mean, since the fast subset omits the crash
 # suite, the fault x depth matrix and the timeout boundary.
 # Run EVERY e2e scenario (the real gate; slower than `just e2e`).
-e2e-full: _python fixtures-large
+e2e-full: _headroom _python fixtures-large
     "${NIX_P2P_PYTHON}/bin/python3" scripts/e2e_harness.py
 
 # Scoped to the harness's own label - never the fixture tree. Also the manual
-# counterpart of the Ctrl-C leak trap.
-# Tear down every pod/container the e2e harness created.
+# counterpart of the Ctrl-C leak trap. Beyond pods/containers/networks it also
+# prunes dangling podman images and unused volumes (TASK-54 AC#1) - the leftovers
+# a bare `pod rm` leaves behind. For a deeper reclaim (cargo target, fixtures,
+# build cache) use `just reclaim`.
+# Tear down every pod/container/network the e2e harness created + prune dangling images/volumes.
 e2e-clean:
     "${NIX_P2P_PYTHON}/bin/python3" scripts/e2e_harness.py --clean
 
@@ -260,7 +292,7 @@ e2e-vm:
 # check-fixtures gate (via the harness). SLOW tier: container runs are minutes.
 # WAVE-1 SCOPE: this measures the INSTRUMENT (offload is ~0 with no p2p yet).
 # Run the egress/latency/gap measurement and emit the report (S3/S4).
-measure *ARGS: _python fixtures-large
+measure *ARGS: _headroom _python fixtures-large
     "${NIX_P2P_PYTHON}/bin/python3" scripts/measure.py {{ ARGS }}
 
 # The S5 scale-sweep instrument (task-18): runs the real system at N over the
@@ -276,7 +308,7 @@ measure *ARGS: _python fixtures-large
 # runs at the default grid (the fast-tier half is the --self-test wired into
 # `just test`). Cleans up label-scoped, like `e2e-clean`, on exit and SIGTERM.
 # Run the S5 scale sweep and emit the fitted/extrapolated report.
-scale-sweep *ARGS: _python fixtures-large
+scale-sweep *ARGS: _headroom _python fixtures-large
     "${NIX_P2P_PYTHON}/bin/python3" scripts/scale_sweep.py {{ ARGS }}
 
 # The owner-goal profiling instrument (task-42): RAM / disk / latency /
@@ -305,7 +337,7 @@ scale-sweep *ARGS: _python fixtures-large
 # Do NOT run this concurrently with `e2e`/`measure`/`scale-sweep`: they share one
 # podman label and would tear down each other's pods mid-run (TASK-58).
 # Run the p2p profile (RAM/disk/latency/throughput/speedup) and emit the report.
-profile *ARGS: _python fixtures-large
+profile *ARGS: _headroom _python fixtures-large
     "${NIX_P2P_PYTHON}/bin/python3" scripts/profile_p2p.py {{ ARGS }}
 
 # The task-91 closure-discovery arm of the profiler, ALONE. It is the profiler's
@@ -364,7 +396,7 @@ iroh-bench: _toolchain
 # manifest. Full-tier fixtures + the e2e image, so it shares e2e's SLOW tier and
 # fail-closed preflight gate.
 # J1 operator journey (task-6): substitute through the daemon, then lose it.
-journey: _python fixtures-large
+journey: _headroom _python fixtures-large
     "${NIX_P2P_PYTHON}/bin/python3" scripts/journey.py
 
 # Capture isolated routed Iroh node-publication evidence with an immutable image.

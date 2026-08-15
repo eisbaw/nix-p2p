@@ -5341,6 +5341,22 @@ def cleanup_pods(reason: str = "") -> int:
     return removed
 
 
+def prune_images_and_volumes() -> None:
+    """Prune dangling podman images + unused volumes (TASK-54 AC#1).
+
+    Called ONLY from the `--clean` CLI path, never from `cleanup_pods` (which runs
+    BETWEEN scenarios, where pruning would delete the very image the next scenario
+    needs). `image prune` (no `-a`) removes only DANGLING images - untagged layers
+    orphaned by a rebuilt e2e image - so a still-referenced image is never touched;
+    a fresh `just e2e` reloads its image regardless. Rootless podman scopes both to
+    THIS user's objects. Podman prints the bytes it reclaimed."""
+    pm = podman()
+    print("e2e-clean: pruning dangling images")
+    run([pm, "image", "prune", "-f"], check=False)
+    print("e2e-clean: pruning unused volumes")
+    run([pm, "volume", "prune", "-f"], check=False)
+
+
 def run_scenarios(ctx: Ctx, selected) -> int:
     if not selected:
         # Fail-closed honesty: a harness with nothing to run is a stub.
@@ -5426,6 +5442,7 @@ def main() -> int:
         return 0
     if args.clean:
         cleanup_pods("(--clean)")
+        prune_images_and_volumes()
         return 0
 
     preflight_gate()
