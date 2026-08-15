@@ -3,11 +3,11 @@ id: TASK-110
 title: >-
   The frozen single-key HoldAnswer::Have.offers has no count cap: 743.6x
   amplification, the last of its class
-status: In Progress
+status: Done
 assignee:
   - '@me'
 created_date: '2026-08-10 17:11'
-updated_date: '2026-08-15 19:56'
+updated_date: '2026-08-15 20:05'
 labels:
   - irreversible
 dependencies:
@@ -31,11 +31,11 @@ THE SEMANTIC ARGUMENT TO REUSE: the batch fix succeeded because it replaced an A
 
 ## Acceptance Criteria
 <!-- AC:BEGIN -->
-- [ ] #1 HoldAnswer::Have.offers is bounded by the same SEMANTIC rule as the batch path (at most one offer per transport kind for the single key being answered), not by an arbitrary count
-- [ ] #2 Amplification for the single-key path is MEASURED before and after; the 743.6x figure (622 offers, 65,440 B against an 88 B query) is the pinned before-number and the after-number is reported with its query/response byte sizes
-- [ ] #3 The decoder-acceptance narrowing is recorded as a DELIBERATE freeze amendment with its rationale, the way the KnownTransport/KnownPayload one was - an auditor must find a decision, not infer a slip
-- [ ] #4 Unknown transport KINDS still decode inertly afterwards (forward compatibility preserved), proven by test
-- [ ] #5 Bites by mutation: removing the cap restores an over-cap response being accepted, and the check is proven to have applied before the result is trusted
+- [x] #1 HoldAnswer::Have.offers is bounded by the same SEMANTIC rule as the batch path (at most one offer per transport kind for the single key being answered), not by an arbitrary count
+- [x] #2 Amplification for the single-key path is MEASURED before and after; the 743.6x figure (622 offers, 65,440 B against an 88 B query) is the pinned before-number and the after-number is reported with its query/response byte sizes
+- [x] #3 The decoder-acceptance narrowing is recorded as a DELIBERATE freeze amendment with its rationale, the way the KnownTransport/KnownPayload one was - an auditor must find a decision, not infer a slip
+- [x] #4 Unknown transport KINDS still decode inertly afterwards (forward compatibility preserved), proven by test
+- [x] #5 Bites by mutation: removing the cap restores an over-cap response being accepted, and the check is proven to have applied before the result is trusted
 <!-- AC:END -->
 
 ## Implementation Notes
@@ -72,3 +72,21 @@ REVIEW GATE (qa-test-runner + mped-architect, run in parallel):
 - Reviewer cruft (scratch amp probes in daemon-core/tests) already removed by both agents; tree clean, verified.
 - HONEST AC#2 numbers: BEFORE 743.6x (622 bittorrent offers, 65,440 B / 88 B) + 621 unnamed content identities. AFTER: enumeration = 0 unnamed identities (at most one per transport kind); legitimate known-only answer = 330 B = 15/4 = 3.75x; hostile byte worst case ~744x (unchanged, = batch residual, bounded by 64 KiB frame; closing it = TASK-223).
 <!-- SECTION:NOTES:END -->
+
+## Final Summary
+
+<!-- SECTION:FINAL_SUMMARY:BEGIN -->
+DONE. The frozen single-key HoldAnswer::Have.offers is now bounded by the SAME semantic rule as the batch path (check_single_offer_bindings: <=MAX_OFFERS_PER_ANSWER=4 AND one offer per transport KIND), applied on encode and decode against the RAW pre-drop OfferSlot list via new HoldResponseWire/HoldAnswerWire twins; HoldResponse+HoldAnswer lost derived Deserialize and joined the not_deserialize coherence proof so decode_hold_response is the ONLY path from bytes. Unknown kinds are counted then dropped (forward-compat).
+
+HONEST AC#2 numbers (corrected after review): BEFORE = 622 bittorrent offers = 65,440 B against an 88 B query = 743.6x, naming 621 content identities the asker never asked (enumeration). AFTER, what is CLOSED: the enumeration/content-count vector - at most one content identity per transport kind; a legitimate known-only answer is 330 B = 15/4 = 3.75x (integer cross-product, no float). NOT closed (stated honestly): the worst-case BYTE amplification - an unknown-kind offer body is byte-unbounded, so a hostile single-key Have can still pad to the 64 KiB frame (~744x), unchanged and identical to the batch path. A per-offer byte cap is deferred to TASK-223 (forward-compat: a future transport locator may be large) and referenced in code.
+
+Review gate: qa-test-runner + mped-architect (parallel) both GO on the bound mechanism (no decode bypass, no emit-set drift, AC#5 ordering correct); both flagged the initial false 3.75x-worst-case claim, which was corrected at all sites (claim.rs docs, PRD.md, golden note) plus a new honesty oracle (a_padded_unknown_kind_have_still_saturates_the_frame_and_decodes_empty).
+
+AC status: #1 met (semantic one-per-kind theorem). #2 met (measured, honest before/after, integer/rational). #3 met (deliberate freeze amendment with the four TASK-91 arguments, in code + notes + golden reject vector). #4 met (a_single_key_have_still_drops_unknown_transports_inertly). #5 met (mutation RED->GREEN, decode Err before any Have trusted).
+
+Commits: 6913573 (bound), a67a13c (notes+TASK-222), 7550f62 (honesty correction), 3b61580 (review-gate+TASK-223), plus the AC-check backlog commit.
+
+Gate on final HEAD: cargo test -p daemon-core -p daemon = 432/0; cargo fmt --all --check; cargo clippy --locked --workspace + daemon evidence-fixture -D warnings; check-independence/shaping/no-floats; 16/16 claim_wire_golden; check-golden-vectors exit 0; just e2e = 5/5 scenarios incl s6-p2p 11/11, exit 0. Valid golden hold_response_* encodings byte-identical (emit-set unchanged); RawNarV1/ContentKey/ProviderRecord preimage untouched.
+
+Follow-ups: TASK-223 (deferred per-offer byte cap, irreversible/DEEP), TASK-222 (pre-existing ruff format drift on 3 untouched scripts - fails just lint, unrelated to this change). Awaiting the cross-model codex DEEP gate.
+<!-- SECTION:FINAL_SUMMARY:END -->
