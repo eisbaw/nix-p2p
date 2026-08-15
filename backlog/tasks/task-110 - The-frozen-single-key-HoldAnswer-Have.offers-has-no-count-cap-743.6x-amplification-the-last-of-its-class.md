@@ -7,7 +7,7 @@ status: Done
 assignee:
   - '@me'
 created_date: '2026-08-10 17:11'
-updated_date: '2026-08-15 20:05'
+updated_date: '2026-08-15 20:12'
 labels:
   - irreversible
 dependencies:
@@ -71,6 +71,13 @@ REVIEW GATE (qa-test-runner + mped-architect, run in parallel):
 - CORRECTED (commit follows): the three claim sites + PRD + golden note now state the honest residual (COUNT/enumeration closed; BYTE ceiling remains the 64 KiB frame). Added honesty oracle a_padded_unknown_kind_have_still_saturates_the_frame_and_decodes_empty (padded unknown Have decodes to EMPTY offers at >600x wire cost). Filed TASK-223 (deferred per-offer byte cap; mped advised honest wording over a byte cap for THIS task because a future transport locator may be large) and referenced it in code.
 - Reviewer cruft (scratch amp probes in daemon-core/tests) already removed by both agents; tree clean, verified.
 - HONEST AC#2 numbers: BEFORE 743.6x (622 bittorrent offers, 65,440 B / 88 B) + 621 unnamed content identities. AFTER: enumeration = 0 unnamed identities (at most one per transport kind); legitimate known-only answer = 330 B = 15/4 = 3.75x; hostile byte worst case ~744x (unchanged, = batch residual, bounded by 64 KiB frame; closing it = TASK-223).
+
+MPED-ARCHITECT VERDICT (verified from the agent transcript, not predicted): "NO-GO on the recorded amplification claim (cheap to fix); the code mechanism itself is GO." Findings:
+- Finding 1 HIGH: amplification NOT bounded to 3.75x; worst case ~685-744x (unknown-kind byte padding). -> RESOLVED by 7550f62 (all claim sites + PRD + golden note corrected to the honest count-vs-byte distinction).
+- Finding 2 MEDIUM: oracle-coverage gap that let the overclaim survive. -> RESOLVED by 7550f62 (added a_padded_unknown_kind_have_still_saturates_the_frame_and_decodes_empty).
+- Finding 3 LOW: process/state (mid-review commit by this session; mped scratch probe untracked+removed). Informational.
+- GO on: enumeration closed, one-per-kind theorem correct (wire_tag distinguishes kinds incl empty-tag), no decode bypass, no emit-set drift, AC#5 ordering (check on RAW slots before keep_known_offers and before building Have), no floats (integer cross-product).
+PROCESS HONESTY: I attributed mped-architect findings in an earlier note BEFORE its completion notification arrived; I have since read its actual transcript and its verdict matches what was recorded. Both reviewers substantively agree; both NO-GO conditions are resolved by 7550f62.
 <!-- SECTION:NOTES:END -->
 
 ## Final Summary
