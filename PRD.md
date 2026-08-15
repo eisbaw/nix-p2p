@@ -680,8 +680,9 @@ adopt libp2p's. Durable decisions:
   ed25519 keypair derives both the libp2p `PeerId` and the iroh `EndpointId`
   (same-keypair, not byte-equal).
 - **The seam changes packaging, not the gates.** Production still requires a
-  passing decentralized exact-key mechanism (TASK-132/133/136); a backend swap is
-  never a shortcut around evidence.
+  passing decentralized exact-key mechanism (TASK-126 froze the contract, TASK-103
+  implements + passes it over libp2p-kad); a backend swap is never a shortcut
+  around evidence.
 
 This reconciles the earlier "Transport: iroh/iroh-blobs" and "everything in Rust,
 iroh is Rust" lines: still Rust, iroh still serves and transfers the bytes, but
@@ -690,57 +691,97 @@ rather than the substrate itself. The default is therefore **dual-stack** — an
 evidence-forced flip of the original iroh-first single-stack preference, not an
 aesthetic choice.
 
-### Iroh-first execution order
+### Execution order (libp2p-primary — reconciled 2026-08-15)
 
-The build order is a gate, not a preference inside the eventual policy:
+**Reconciliation note (2026-08-15, TASK-202).** This subsection historically
+read as an "Iroh-first execution order" whose gate was to "prove global Iroh
+peer and decentralized content discovery before LAN." That framing is aligned
+here to the libp2p-primary authority above (2026-08-12) and to what has since
+shipped. The alignment is a drift-fix, not a new product call: the authority
+already decided that iroh has **no content-provider routing**, so an
+"Iroh global content-discovery gate" was a category error; discovery is
+libp2p-kad. Concretely this note (a) re-points the decentralized-discovery
+production gate at libp2p-kad, which is **proven** — TASK-126 froze the exact-key
+contract and TASK-103 implements and passes it (real multi-node decentralized
+test green, TASK-155 evidence), with store-supply and byte-identical transfer
+also proven (TASK-158/TASK-193/TASK-194, streamed NAR TASK-157); (b) marks the
+iroh-framed discovery-gate tasks (TASK-132/TASK-133/TASK-136), the iroh
+node/address-discovery arm (TASK-137/TASK-138/TASK-139/TASK-89) and the iroh LAN
+tasks (TASK-130/TASK-116) as **superseded for discovery** — now Low priority +
+`deferred-pending-202`, retained only as optional iroh-transport reference; and
+(c) **preserves iroh as an optional, measured transport backend** — the transport
+tournament is deferred basics-first (owner steer: decentralized discovery and
+robust connectivity first), **not dropped**, so the dual-stack transport-tag work
+(TASK-156/TASK-183) stays deferred-not-cancelled. (Updated owner steer 2026-08-15:
+fast link-compression is pulled EARLIER — it is the value-thesis lever that brings
+the peer path to near-parity, an unsigned transport field that never touches the
+frozen addressed unit — see TASK-203; content-addressed variable chunking à la
+casync is a separate later demo-crate spike, distinct from this transport
+tournament — see TASK-215.)
+The build order below is implementation risk ordering only:
 
-1. Complete the persistent shared runtime (TASK-115), then prove **global Iroh
-   peer and decentralized content discovery before LAN discovery**. TASK-137,
-   TASK-138, TASK-139 and TASK-89 separately own signed NodeId/address
-   publication, exact NodeId lookup, relay transport and their no-address
-   connection proof. TASK-100 and TASK-102 establish the typed content seam and
-   single publication-eligibility gate. TASK-126 freezes a mandatory
-   decentralized exact-key contract and TASK-103 implements NAR identity to
-   bounded provider NodeIds without a central tracker. Native Iroh support is
-   preferred; if Iroh has no suitable content DHT, the selected decentralized
-   discovery substrate remains separate from Iroh identity and transfer.
-   Unsupported or central-only discovery blocks production qualification rather
-   than completing this milestone. TASK-132 runs the cold, zero-peer-injection
-   global real-Nix journey and TASK-133 binds independent review to that exact
-   evidence and code. The requester may receive operator-level bootstrap
-   configuration for multiple independent DHT/routing nodes, but no peer
+1. **libp2p-kad decentralized discovery is the production gate — and it is
+   proven.** On the persistent shared runtime (TASK-115), TASK-126 freezes the
+   mandatory decentralized exact-key contract (NAR identity → bounded provider
+   NodeIds, no central tracker) and TASK-103 implements and passes it over
+   libp2p-kad `start_providing`/`get_providers`. **Discovery is libp2p-kad, never
+   global iroh content discovery** — iroh has no `GET_PROVIDERS`, so proving
+   "global iroh content discovery" is a category error under the authority above.
+   TASK-100 and TASK-102 establish the typed content seam and the single
+   publication-eligibility gate. The requester may receive operator-level
+   bootstrap configuration for multiple independent DHT/routing nodes, but no peer
    address, claim, per-content locator, magnet, prior peer rendezvous state or
-   equivalent test injection. Endpoint bind scope alone never activates
-   discovery or public participation. TASK-134/TASK-135/TASK-101 are optional
-   centralized tournament comparators after the decentralized path passes; they
-   never satisfy this gate. TASK-96 is consumed only if TASK-126 explicitly
-   selects Mainline as a candidate.
-2. Only TASK-136's versioned admission artifact, derived from a passing global
-   verdict, admits the later LAN component (TASK-130) and LAN BatchHoldQuery
-   vertical slice (TASK-116). A whole-global no-go re-enters phase-2 planning
-   and leaves LAN blocked rather than silently changing the experiment. After
-   both Iroh discovery scopes work, land
-   authenticated HTTPS upstream support (TASK-22/TASK-24) and negotiated,
-   bounded Iroh raw/zstd operation (TASK-99). Raw fallback stays explicit. Then
+   equivalent test injection; endpoint bind scope alone never activates discovery
+   or public participation. Unsupported or central-only discovery blocks
+   production qualification rather than completing this milestone.
+   TASK-134/TASK-135/TASK-101 remain optional centralized tournament comparators
+   that never satisfy this gate, and TASK-96 is consumed only if TASK-126
+   explicitly selects Mainline. The iroh-framed global-discovery journey/gate
+   tasks (TASK-132/TASK-133/TASK-136) and the iroh node/address-discovery arm
+   (TASK-137/TASK-138/TASK-139/TASK-89) are superseded for discovery (Low +
+   `deferred-pending-202`); they are optional iroh-transport reference material,
+   not the production discovery gate.
+2. **The libp2p data plane is proven; the transport tournament is deferred
+   basics-first, not dropped.** libp2p store-supply and serving
+   (TASK-158/TASK-193) and byte-identical end-to-end supply (TASK-194), with
+   streamed NAR transfer (TASK-157), are green — the libp2p transport works from
+   cold libp2p-kad discovery through fetch. Iroh remains an **optional, measured**
+   `NarTransfer`/`NarServer` backend behind the seam: whether iroh's transport
+   beats libp2p's own transport (request-response/stream over AutoNAT/DCUtR/relay)
+   on real NATs is exactly what the transport tournament measures, under one
+   libp2p-kad discovery; if it does not, the product collapses to pure libp2p.
+   Per the owner's basics-first steer, the tournament and its dual-stack
+   transport-tag work (TASK-156/TASK-183) are **deferred, not cancelled** — iroh
+   stays a funded measured arm and the winner is decided by evidence, not here.
+   The LAN component (TASK-130) and LAN BatchHoldQuery slice (TASK-116) are
+   likewise deferred (Low, `deferred-pending-202`) and are no longer gated behind
+   an iroh global verdict.
+3. **Iroh transport reference (deferred optional-transport measurement).** When
+   the tournament is scheduled, exercise the production-shaped 10+ node iroh
+   harness (TASK-87), measure iroh raw and compressed from cold discovery through
+   real-Nix completion (TASK-88), land authenticated HTTPS upstream support
+   (TASK-22/TASK-24) and negotiated, bounded iroh raw/zstd operation (TASK-99,
+   raw fallback explicit), and close the fresh-host operator journey (TASK-45).
    TASK-120 makes the operator-mode mapping authoritative and is a hard
    prerequisite for the production-shaped harness. TASK-131 may later consume
    TASK-96/TASK-120 as an optional Mainline address adapter and comparison cell;
-   it does not block or qualify the Iroh harness.
-3. Exercise the production-shaped 10+ node Iroh harness (TASK-87), measure Iroh
-   raw and compressed from cold discovery through real-Nix completion (TASK-88),
-   then close the fresh-host operator journey (TASK-45). These artifacts are an
-   Iroh reference, not a default-policy verdict.
-4. Only after that evidence freezes may BitTorrent grounding and implementation
-   begin (TASK-117, TASK-75, TASK-118, TASK-119, then conditional TASK-121).
-5. After both backends exist, run cross-backend property/fuzz rigor and the
-   preregistered sequence: diagnostic raw Stage A (TASK-125), real-network
-   development/training evidence (TASK-80), Stage-B training (TASK-122),
-   training-only fitting (TASK-44), sealed-A2 validation (TASK-129), and one
-   later holdout (TASK-123).
+   it neither blocks nor qualifies anything. These artifacts are an iroh
+   **reference, not a default-policy verdict** (TASK-87/TASK-88 are Low +
+   `deferred-pending-202`).
+4. **BitTorrent grounding and implementation stay far-future**, beginning only
+   after the tournament evidence freezes (TASK-117, TASK-75, TASK-118, TASK-119,
+   then conditional TASK-121; Low, `deferred-pending-202`).
+5. After both transport backends exist and are measured, run cross-backend
+   property/fuzz rigor and the preregistered sequence: diagnostic raw Stage A
+   (TASK-125), real-network development/training evidence (TASK-80), Stage-B
+   training (TASK-122), training-only fitting (TASK-44), sealed-A2 validation
+   (TASK-129), and one later holdout (TASK-123).
 
-“Iroh first” above is implementation risk ordering only. Transport registries,
-policy artifacts and tournament scoring contain no implicit Iroh-first,
-BitTorrent-first, fastest-first or cheapest-first preference.
+The ordering above is implementation risk ordering only. Transport registries,
+policy artifacts and tournament scoring contain no implicit libp2p-first,
+iroh-first, BitTorrent-first, fastest-first or cheapest-first preference: libp2p
+is the primary *discovery* stack by the authority above, while which *transport*
+wins is decided only by the tournament's measured evidence.
 
 ### Evidence-grounded eligibility constraints
 
