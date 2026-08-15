@@ -3199,8 +3199,13 @@ mod tests {
             // A high-entropy, multi-block nar: incompressible, so each compressor emits many output
             // blocks, overflows the cap-`SERVE_COMPRESS_BLOCKS_IN_FLIGHT` channel against the
             // non-reading consumer, and STALLS (stays alive holding its permit + gauge slot for the
-            // whole sampling window) rather than finishing instantly.
-            let raw = high_entropy_nar(4 * 1024 * 1024, 0xa5a5_1234_dead_beef);
+            // whole sampling window) rather than finishing instantly. SIZE: only large enough to
+            // overflow the cap-`SERVE_COMPRESS_BLOCKS_IN_FLIGHT` (=2) channel and block the producer
+            // on its 3rd `ENCODE_BLOCK` (128 KiB) send — 512 KiB (~4 incompressible blocks) suffices.
+            // Kept deliberately small: this test clones `raw` per serve across `n` serves, so a large
+            // nar would balloon RSS (a 4 MiB nar x 256 serves reached ~1 GiB — a low-memory-CI OOM
+            // risk); 512 KiB x 256 caps the clone footprint at ~128 MiB.
+            let raw = high_entropy_nar(512 * 1024, 0xa5a5_1234_dead_beef);
             let content = Blake3Digest::from_raw_nar(&raw);
 
             let n = 4 * SERVE_COMPRESS_MAX_CONCURRENT; // far more serves than the permit ceiling

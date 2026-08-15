@@ -14,16 +14,19 @@ Pipelining changed the **scheduling** of the serve-side compressor, and the code
 are unchanged. A streamed frame is the **same single zstd frame** as the bulk frame — the codec
 tests `streamed_frame_decodes_like_bulk` (identical decode → same blob id) and
 `streamed_frame_size_matches_bulk_within_tolerance` (streamed size within ~1/64 of bulk) prove
-it. The **CPU cost is not unchanged**, though: the streamed serve path runs different code
+it. The **CPU cost is not identical**, though: the streamed serve path runs different code
 (per-block `compress_block` calls, a per-block allocation, an mpsc channel + a `spawn_blocking`
-hop), so TASK-99's **bulk** compress/decompress CPU-ns are a **lower bound** on the streamed path's
-CPU — the streamed path costs measurably **more** (a few percent, up to ~15% run-to-run on a noisy
-box; measured below), never less. So the honest
+hop), so the model **reuses TASK-99's bulk compress/decompress CPU-ns as the ESTIMATE** for the
+streamed path's CPU (the streamed serve is not separately modeled). The measured cross-check below
+shows the streamed-vs-bulk delta is **within measurement noise — it straddles zero (both signs
+occur) with `|delta|` ≲ ~15% either direction** — so it bounds the delta's **magnitude**, not its
+sign. So the honest
 re-evaluation **reuses TASK-99's committed integer-exact harness measurement**
 (`evidence/task-99/468ffbd/harness_raw.json`: per-file `compressed_bytes`, `raw_bytes`,
-`compress_ns`, `decompress_ns`) **as that lower bound** and applies the pipelined makespan model to
-it. No fresh shaped-link run is needed — the same measured byte counts, with a per-stage cost that
-**lower-bounds** the streamed path, scheduled differently.
+`compress_ns`, `decompress_ns`) **as that estimate** and applies the pipelined makespan model to
+it. No fresh shaped-link run is needed — the same measured byte counts, with a per-stage CPU cost
+whose deviation from the streamed path is bounded in magnitude (≲ ~15%, far under the ~55% flip
+margin below), scheduled differently.
 
 The finalizer **fails closed**: `--task99` ties the SERIAL re-derivation to the committed
 `measurement.json` and rejects any mismatch (so the two artifacts cannot drift), and it rejects
@@ -46,11 +49,13 @@ model has **teeth** (a bottleneck-slow compressor still LOSES — it is not a ru
      even if its aggregate rate is fast. Counterexample (3 blocks, per-block service times)
      `compress[5,5] / link[8,1] / decode[1,8]`: this model predicts **19**, the real in-order
      schedule takes **22**. The real pipeline can be *slower* than the estimate, not only faster.
-  2. **Streaming/channel/allocation overhead is not charged.** The model reuses TASK-99's **bulk**
-     single-call compress/decompress CPU-ns. The TASK-203 serve path is different code (raw-stream
-     `compress_block` calls, a per-block output allocation, an mpsc channel + a `spawn_blocking`
-     hop). So the bulk CPU is a **lower bound** on the streamed path's CPU, not an equality — see
-     the **measured cross-check** below.
+  2. **Streaming/channel/allocation overhead is not separately charged.** The model reuses
+     TASK-99's **bulk** single-call compress/decompress CPU-ns as the **estimate** for the streamed
+     path. The TASK-203 serve path is different code (raw-stream `compress_block` calls, a per-block
+     output allocation, an mpsc channel + a `spawn_blocking` hop). The **measured cross-check**
+     below bounds the **magnitude** of the bulk-vs-streamed CPU delta (it straddles zero, `|delta|`
+     ≲ ~15% either direction) — it does **not** establish a sign, so the estimate carries an error
+     bounded in size but of unknown sign.
 - `raw_delivery_ns = sum_raw_bytes · 1e9 / lan_bytes_per_sec`; `zstd_beats_raw` is the integer
   compare `model_total_ns < raw_delivery_ns`. The block is the serve compressor's 128 KiB input
   block (`SERVE_COMPRESS_INPUT_BLOCK` = `peer_fabric` `ENCODE_BLOCK`/`DECODE_BLOCK`).
@@ -84,10 +89,10 @@ before the idealized flip is erased (`overhead_to_erase_flip` in `measurement.js
 `headline_net_lan_level3`). The flip survives only while the real unmodeled overhead stays under
 that ~55% margin.
 
-### Measured cross-check that bulk CPU is a lower bound on the streamed path
+### Measured cross-check: the streamed-vs-bulk CPU delta is small (bounded far under the flip margin)
 
-The model reuses TASK-99's **bulk** compress CPU as a **lower bound** on the **streamed** path. To
-check that directly (rather than assert it), the ignored codec test
+The model reuses TASK-99's **bulk** compress CPU as the **estimate** for the **streamed** path. To
+check how far that estimate can be off (rather than assert it), the ignored codec test
 `measure_streamed_vs_bulk_compress_cpu` times `StreamingZstdEncoder` (fed in 128 KiB blocks) vs
 `compress_zstd` on the **same** 32 MiB level-3 buffer:
 
@@ -96,14 +101,16 @@ cargo test -p peer-fabric measure_streamed_vs_bulk_compress_cpu -- --ignored --n
 # streamed vs bulk delta = <N> ppm (positive = streamed slower)
 ```
 
-Across ~10 runs on this (shared, loaded) box the delta was **run-to-run noisy** but **always
-positive** — the streamed encoder is never faster than bulk, which is exactly what the lower-bound
-framing needs. Observed samples spanned ≈ **+0.6%** (5,972 ppm) to ≈ **+14.5%** (145,398 ppm), most
-falling in a low-single-digit-to-~8% band (e.g. 22,500 / 34,321 / 34,445 / 81,586 ppm). A min-of-5
-wall-clock proxy on a loaded single box is dominated by scheduler noise, so the *specific*
-percentage is not load-bearing; the **sign** (streamed ≥ bulk) and the **order of magnitude** are.
-The streamed path's per-block CPU is a few percent to at most ~15% above bulk — **far** under the
-~55% sensitivity margin the flip needs (§ above). This measurement does **not** cover the
+Across many runs on this (shared, loaded) box the delta is **run-to-run noisy and STRADDLES ZERO** —
+both signs occur (observed roughly **−2% to +15%**, e.g. −22,505 / −11,073 / +5,972 / +34,445 /
++145,398 ppm). A min-of-5 wall-clock proxy on a loaded single box is dominated by scheduler noise, so
+**neither the exact percentage NOR the sign is reproducible or load-bearing** — do NOT read this as
+"streamed is always slower" (it isn't) or "always faster". What IS load-bearing is the **magnitude**:
+across every run `|delta|` stays well under **~15%** — **far** under the ~55% sensitivity margin the
+flip needs (§ above). So the model's reuse of TASK-99 bulk compress-ns as the streamed-path estimate
+carries an error too small (< ~15%, either direction) to consume the 55% headroom, and the flip
+conclusion holds **regardless of the delta's small value or sign**. This cross-check establishes only
+that the streamed path does not add a LARGE CPU cost — not that it is uniformly slower or faster. This measurement does **not** cover the
 fabric-libp2p mpsc/`spawn_blocking` hop; that adds one sub-µs channel send per 128 KiB block
 (≈ 1,400 sends for the largest nar), analytically negligible against a ~910 ms compress. The
 *original TASK-99 corpus was a transient scratchpad and is gone*, so this is a

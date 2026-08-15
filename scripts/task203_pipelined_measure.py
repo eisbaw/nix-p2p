@@ -8,15 +8,18 @@ of the serve-side compressor (it now streams the zstd frame in blocks off the wo
 codec's WIRE BYTES are unchanged: a streamed frame is the SAME single zstd frame as the bulk frame
 (the codec test `streamed_frame_size_matches_bulk_within_tolerance` proves the streamed size is
 within ~1/64 of bulk, and `streamed_frame_decodes_like_bulk` proves identical decode). The CPU cost
-is NOT unchanged, though: the streamed serve path runs different code (per-block `compress_block`
-calls, a per-block allocation, an mpsc channel + a `spawn_blocking` hop), so the TASK-99 BULK
-compress/decompress CPU-ns are a LOWER BOUND on the streamed path's CPU - it costs measurably MORE
-(a few percent, up to ~15% run-to-run on a noisy box), never less (measured in the evidence README's
-cross-check). So the honest re-evaluation reuses
+is NOT identical, though: the streamed serve path runs different code (per-block `compress_block`
+calls, a per-block allocation, an mpsc channel + a `spawn_blocking` hop), so the model REUSES the
+TASK-99 BULK compress/decompress CPU-ns AS THE ESTIMATE for the streamed path's CPU (the streamed
+serve is not separately modeled). The evidence README's measured cross-check shows the
+streamed-vs-bulk delta is WITHIN MEASUREMENT NOISE - it STRADDLES ZERO (both signs occur, |delta|
+<~ 15% either direction, scheduler-dominated on a loaded single box) - so it bounds the delta's
+MAGNITUDE, not its sign. So the honest re-evaluation reuses
 TASK-99's committed INTEGER-EXACT harness measurement (`compressed_bytes`, `raw_bytes`,
-`compress_ns`, `decompress_ns` for the shipped /nar/3 codec on real nar data) AS THAT LOWER BOUND
+`compress_ns`, `decompress_ns` for the shipped /nar/3 codec on real nar data) AS THAT ESTIMATE
 and applies the PIPELINED makespan model to it. It does NOT need a fresh shaped-link run; it needs
-the same measured byte counts with a per-stage cost that lower-bounds the streamed path.
+the same measured byte counts with a per-stage cost whose deviation from the streamed path is
+bounded in magnitude (<~ 15%, far under the ~55% flip margin below), of unknown sign.
 
 THE TWO MODELS (aggregate over the measured nar set, at a given link bandwidth):
 
@@ -41,14 +44,15 @@ THE TWO MODELS (aggregate over the measured nar set, at a given link bandwidth):
            service times) compress[5,5] / link[8,1] / decode[1,8]: this model predicts 19, but the
            real in-order schedule takes 22. So the real pipeline can be SLOWER than this estimate,
            not only faster.
-       (2) STREAMING / CHANNEL / ALLOCATION OVERHEAD is NOT charged. The model reuses TASK-99's
-           BULK single-call compress/decompress CPU-ns. The TASK-203 serve path is different code:
-           raw-stream `compress_block` calls, a per-block output allocation, an mpsc channel + a
-           `spawn_blocking` hop, and scheduling. That overhead is real and unmodeled here, so the
-           TASK-99 bulk CPU is a LOWER BOUND on the new path's CPU, not an equality. See the
-           evidence README's MEASURED cross-check of the bulk-vs-streamed encoder CPU, and the
-           SENSITIVITY THRESHOLD below (`overhead_to_erase_flip`) for how much such overhead would
-           erase the level-3 flip.
+       (2) STREAMING / CHANNEL / ALLOCATION OVERHEAD is NOT separately charged. The model reuses
+           TASK-99's BULK single-call compress/decompress CPU-ns AS THE ESTIMATE for the streamed
+           path. The TASK-203 serve path is different code: raw-stream `compress_block` calls, a
+           per-block output allocation, an mpsc channel + a `spawn_blocking` hop, and scheduling.
+           The evidence README's MEASURED cross-check of the bulk-vs-streamed encoder CPU bounds the
+           MAGNITUDE of that delta (it STRADDLES ZERO, |delta| <~ 15% either direction) - it does
+           NOT establish a sign, so the estimate's error is bounded in size but of unknown sign. See
+           the SENSITIVITY THRESHOLD below (`overhead_to_erase_flip`, ~55%) for how much such a
+           deviation would have to reach to erase the level-3 flip.
 
   raw_delivery_ns = sum_raw_bytes sent uncompressed over the link.
   zstd_beats_raw  = (zstd model total_ns) < raw_delivery_ns   [integer compare]
@@ -330,18 +334,21 @@ def derive(raw: dict, task99: dict | None) -> dict:
         "constant-aggregate-rate) PIPELINED serve model",
         "reuses": "the committed TASK-99 harness_raw.json (same shipped /nar/3 codec, same "
         "integer-exact compressed/raw byte counts); pipelining changes only the SCHEDULING of the "
-        "same wire bytes. The bulk CPU-ns are reused as a LOWER BOUND on the streamed path's CPU "
-        "(the new raw-stream/channel/alloc overhead is not charged, so the streamed path costs "
-        "measurably MORE - a few percent, up to ~15% run-to-run on a noisy box) - see the evidence "
-        "README's measured bulk-vs-streamed encoder cross-check",
+        "same wire bytes. The bulk CPU-ns are reused as the ESTIMATE for the streamed path's CPU "
+        "(the new raw-stream/channel/alloc overhead is not separately modeled); the evidence "
+        "README's measured bulk-vs-streamed encoder cross-check shows that delta is within "
+        "measurement noise - it STRADDLES ZERO (both signs, |delta| <~ 15% either direction, "
+        "scheduler-dominated) - so it bounds the delta's MAGNITUDE, not its sign",
         "model_kind": "idealized-best-case-constant-aggregate-rates",
         "model_is_proven_bound": False,
         "model_caveats": [
             "per-block rate variation can make the real pipeline SLOWER than this estimate "
             "(aggregate constant rates are not an upper bound; counterexample compress[5,5]/"
             "link[8,1]/decode[1,8] -> model 19, real 22)",
-            "streaming/channel/allocation overhead of the TASK-203 serve path is not modeled; "
-            "TASK-99 bulk compress CPU is a lower bound on the streamed path's CPU",
+            "streaming/channel/allocation overhead of the TASK-203 serve path is not separately "
+            "modeled; TASK-99 bulk compress CPU is reused as the ESTIMATE for the streamed path's "
+            "CPU, and the measured cross-check bounds that delta's MAGNITUDE (straddles zero, "
+            "|delta| <~ 15% either direction), not its sign",
             "a live two-ends-shaped serve trace (TASK-198) is out of scope; the flip is a "
             "conditional estimate, not a measured wall-clock result",
         ],
