@@ -128,6 +128,12 @@
 
       daemon = memberPackage "daemon";
       testproxy = memberPackage "testproxy";
+      # The PRIMARY thin libp2p binary (docs/peer-fabric-seam.md): daemon-core +
+      # fabric-libp2p, a pure single-stack libp2p node. Built as its OWN crane
+      # package (own dependency closure, meta.mainProgram = "daemon-libp2p" so
+      # lib.getExe resolves /bin/daemon-libp2p). Consumed by the NAT VM test
+      # (nixos/nat-vm-test.nix, TASK-207) which drives it through a real relay.
+      daemonLibp2p = memberPackage "daemon-libp2p";
 
       # TASK-138's adversarial authority is deliberately absent from the
       # production daemon package. Build a separate derivation with the narrow
@@ -336,6 +342,9 @@
         # (task-10). These attribute names are a public-ish interface: renaming
         # them breaks those consumers.
         inherit daemon testproxy;
+        # The primary thin libp2p binary, exposed so the NAT VM test and any
+        # libp2p-node deployment can consume it (TASK-207).
+        daemon-libp2p = daemonLibp2p;
         # The e2e container image (task-5). Slow-tier: built by `just e2e`, kept
         # out of `checks` so `nix flake check` and the devshell closure stay
         # lean (like the 110 MiB fixture payload).
@@ -360,6 +369,20 @@
         vm-test = import ./nixos/vm-test.nix {
           inherit pkgs daemon;
           fixtures = fixtureWorkload;
+        };
+
+        # The NAT-traversal NixOS VM test (TASK-207): two VMs each behind its own
+        # NAT + a public circuit-v2 relay, driving the SHIPPED `services.nix-p2p`
+        # module + daemon-libp2p. GATED proofs: the real-NAT boundary (direct dial
+        # blocked), the relay RESERVATION over real NAT, and that the relay is
+        # load-bearing (remove it -> the provider cannot reserve). Decentralized
+        # discovery over NAT and the end-to-end relay-carried BYTE fetch are
+        # exercised as NON-GATING evidence (kad convergence is flaky, and the fetch
+        # hits a documented residual TASK-218: the circuit dial-address does not
+        # resolve via kad peer-routing). A PACKAGE, not a check, like vm-test (needs
+        # /dev/kvm; `just e2e-nat-vm` builds it).
+        nat-vm-test = import ./nixos/nat-vm-test.nix {
+          inherit pkgs daemonLibp2p;
         };
 
         default = self.packages.${system}.daemon;

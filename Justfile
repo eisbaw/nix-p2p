@@ -284,6 +284,18 @@ e2e-clean:
 e2e-vm:
     nix build -L --no-link .#vm-test
 
+# The NAT-traversal VM truth layer (TASK-207): two NixOS VMs EACH behind its OWN
+# NAT + a public circuit-v2 relay, driving the shipped services.nix-p2p module +
+# daemon-libp2p. GATED proofs: the real-NAT boundary (direct dial blocked), the
+# relay RESERVATION over real NAT, and that the relay is load-bearing (remove it ->
+# no reservation). Discovery over NAT + the end-to-end byte fetch are NON-GATING
+# evidence (documented residual TASK-218: the circuit dial-address does not resolve
+# via kad peer-routing). Like e2e-vm it is a PACKAGE, not a check; needs /dev/kvm.
+# HEAVY (boots 5 QEMU VMs).
+# Run the NAT-traversal NixOS VM test (relay circuit-v2 over real NAT).
+e2e-nat-vm: _headroom
+    nix build -L --no-link .#nat-vm-test
+
 # The S3/S4 measurement instrument (task-9): runs an identical scripted workload
 # with-daemon vs without-daemon over the task-5 Pod seam and emits a
 # machine-readable egress + p95 + gap-histogram report, with each oracle proven
