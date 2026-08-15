@@ -3,10 +3,10 @@ id: TASK-54
 title: >-
   Bound the disk footprint - including SUBAGENT SCRATCH, which took the machine
   to 0 MB
-status: To Do
+status: Done
 assignee: []
 created_date: '2026-08-08 22:11'
-updated_date: '2026-08-10 19:35'
+updated_date: '2026-08-15 09:57'
 labels:
   - tooling
 dependencies:
@@ -22,8 +22,8 @@ Disk hit 100% during task-48 (target/ got auto-nuked by a cleanup; rebuildable, 
 
 ## Acceptance Criteria
 <!-- AC:BEGIN -->
-- [ ] #1 e2e-clean and a reclaim recipe bound podman images/volumes + fixture generations; documented
-- [ ] #2 The profiling harness (task-42) caps per-node blob store + cleans up swarm nodes; a disk-headroom precondition fails fast with a clear message
+- [x] #1 e2e-clean and a reclaim recipe bound podman images/volumes + fixture generations; documented
+- [x] #2 The profiling harness (task-42) caps per-node blob store + cleans up swarm nodes; a disk-headroom precondition fails fast with a clear message
 <!-- AC:END -->
 
 ## Implementation Notes
@@ -68,4 +68,12 @@ THE FIX, in order of leverage:
 
 DO NOT solve this by having agents skip builds. The gate must still run; it just must not run six
 times into six directories.
+
+TASK-54 done (commit 2cff63b). Root-cause fix: SHARED CARGO_TARGET_DIR (~/.cache/nix-p2p-target) set as a QUIET devShell env attr in flake.nix (no shellHook echo) - N per-agent target dirs collapse to ONE and serialise on cargo's lock (TASK-109-correct). Only affects nix develop; nix build/flake check use crane's sandboxed target, so frozen artifacts unaffected.
+
+AC#1: e2e-clean now prunes dangling podman images + unused volumes (not just pods/nets) via prune_images_and_volumes() in the --clean CLI path only (kept out of cleanup_pods so it cannot delete an in-use image between scenarios). New 'just reclaim' + scripts/reclaim.sh: podman system prune -f --volumes, drop unreferenced fixture generations (keep current+previous), git worktree prune, clear cargo target dir(s) with guarded rms. Documented in Justfile comments. On a real run it freed 36341 MiB (26G repo-local target + 9.7G stale shared cache; podman had 0B stale to free; fixture GC found only referenced gens). df 93G->129G.
+
+AC#2: the profiler's headroom precondition (MIN_FREE_DISK_BYTES, profile_p2p.py:4701), SIGTERM->teardown (ss.install_sigterm_cleanup + cleanup_pods + scratch rmtree), MemStore blob + scratch-cache-deleted-with-dir caps ALREADY existed. Added an EARLIER, stricter Justfile _headroom gate (default 15 GiB, override NIX_P2P_MIN_FREE_GIB, integer math) wired FIRST into test/e2e/e2e-full/measure/scale-sweep/profile/journey - it fires before nix/python/cargo spin up and points at 'just reclaim'. Demonstrated: fires exit 1 with message at threshold 999999; passes exit 0 at default on ~93G box.
+
+Gate: cold 'just build' into shared dir succeeds (4m05s, exit 0); ruff check+format, check-no-floats, e2e --self-test all green; reclaim exit 0. NO full e2e run (heavy). No AI/co-author credit in commit (audited).
 <!-- SECTION:NOTES:END -->
