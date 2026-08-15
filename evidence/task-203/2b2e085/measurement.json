@@ -1,0 +1,129 @@
+{
+  "task": "task-203",
+  "measures": "the TASK-99 net-LAN verdict re-evaluated under the PIPELINED serve model",
+  "reuses": "the committed TASK-99 harness_raw.json (same shipped /nar/3 codec, same integer-exact compress/decompress ns and byte counts); pipelining changes the SCHEDULING of that same work, not the bytes or the CPU cost",
+  "integer_exact": true,
+  "no_floats_in_decisions": true,
+  "home_uplink_bytes_per_sec": 2500000,
+  "lan_bytes_per_sec": 204000000,
+  "serve_compress_input_block_bytes": 131072,
+  "shipped_default_level": 3,
+  "headline_net_lan_level3": {
+    "serial_zstd_beats_raw": false,
+    "pipelined_zstd_beats_raw": true,
+    "verdict_flips_serial_to_pipelined": true,
+    "pipelined_bottleneck_stage": "compress"
+  },
+  "per_level_aggregate": [
+    {
+      "level": 3,
+      "n_files": 7,
+      "sum_compressed_bytes": 64000619,
+      "sum_raw_bytes": 287530648,
+      "aggregate_ratio_pair": [
+        64000619,
+        287530648
+      ],
+      "aggregate_ratio_display": "0.222587 (~222587 ppm; exact 64000619/287530648)",
+      "net_home_uplink": {
+        "bandwidth_bytes_per_sec": 2500000,
+        "raw_delivery_ns": 115012259200,
+        "serial_model": {
+          "compress_ns": 910659589,
+          "link_ns": 25600247600,
+          "decompress_ns": 363613130,
+          "total_ns": 26874520319,
+          "zstd_beats_raw": true
+        },
+        "pipelined_model": {
+          "bottleneck_stage": "link",
+          "bottleneck_total_ns": 25600247600,
+          "compress_block_ns": 415127,
+          "link_block_ns": 11669600,
+          "decompress_block_ns": 165754,
+          "fill_drain_ns": 580881,
+          "total_ns": 25600828481,
+          "zstd_beats_raw": true
+        },
+        "verdict_flips_serial_to_pipelined": false
+      },
+      "net_lan": {
+        "bandwidth_bytes_per_sec": 204000000,
+        "raw_delivery_ns": 1409463960,
+        "serial_model": {
+          "compress_ns": 910659589,
+          "link_ns": 313728524,
+          "decompress_ns": 363613130,
+          "total_ns": 1588001243,
+          "zstd_beats_raw": false
+        },
+        "pipelined_model": {
+          "bottleneck_stage": "compress",
+          "bottleneck_total_ns": 910659589,
+          "compress_block_ns": 415127,
+          "link_block_ns": 143009,
+          "decompress_block_ns": 165754,
+          "fill_drain_ns": 308763,
+          "total_ns": 910968352,
+          "zstd_beats_raw": true
+        },
+        "verdict_flips_serial_to_pipelined": true
+      }
+    },
+    {
+      "level": 19,
+      "n_files": 7,
+      "sum_compressed_bytes": 48328733,
+      "sum_raw_bytes": 287530648,
+      "aggregate_ratio_pair": [
+        48328733,
+        287530648
+      ],
+      "aggregate_ratio_display": "0.168082 (~168082 ppm; exact 48328733/287530648)",
+      "net_home_uplink": {
+        "bandwidth_bytes_per_sec": 2500000,
+        "raw_delivery_ns": 115012259200,
+        "serial_model": {
+          "compress_ns": 105152736705,
+          "link_ns": 19331493200,
+          "decompress_ns": 345201426,
+          "total_ns": 124829431331,
+          "zstd_beats_raw": false
+        },
+        "pipelined_model": {
+          "bottleneck_stage": "compress",
+          "bottleneck_total_ns": 105152736705,
+          "compress_block_ns": 47934297,
+          "link_block_ns": 8812000,
+          "decompress_block_ns": 157361,
+          "fill_drain_ns": 8969361,
+          "total_ns": 105161706066,
+          "zstd_beats_raw": true
+        },
+        "verdict_flips_serial_to_pipelined": true
+      },
+      "net_lan": {
+        "bandwidth_bytes_per_sec": 204000000,
+        "raw_delivery_ns": 1409463960,
+        "serial_model": {
+          "compress_ns": 105152736705,
+          "link_ns": 236905553,
+          "decompress_ns": 345201426,
+          "total_ns": 105734843684,
+          "zstd_beats_raw": false
+        },
+        "pipelined_model": {
+          "bottleneck_stage": "compress",
+          "bottleneck_total_ns": 105152736705,
+          "compress_block_ns": 47934297,
+          "link_block_ns": 107990,
+          "decompress_block_ns": 157361,
+          "fill_drain_ns": 265351,
+          "total_ns": 105153002056,
+          "zstd_beats_raw": false
+        },
+        "verdict_flips_serial_to_pipelined": false
+      }
+    }
+  ]
+}

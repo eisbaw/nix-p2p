@@ -85,6 +85,7 @@ EXIT_CANNOT_CHECK = 2
 SCANNED = [
     "peer_wire_baseline.py",
     "task99_link_compression_measure.py",
+    "task203_pipelined_measure.py",
     "decentralized_discovery_evidence.py",
     "shaped_link.py",
     "shaped_libp2p.py",
