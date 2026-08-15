@@ -420,10 +420,12 @@ impl UpstreamHttp {
     /// client talks to) this is the end-to-end header-wait budget seeded for the
     /// WHOLE chain - it is propagated down every hop as a shrinking
     /// remaining-budget (`HOP_BUDGET_HEADER`) rather than re-granted afresh at
-    /// each hop, so the whole chain shares ONE deadline (see [`composed_header_wait`]
-    /// and the module `TASK-33` note). For an inner hop it is the local ceiling
-    /// on the wait, capped further by whatever budget the downstream client
-    /// propagated.
+    /// each hop. The propagated budget is MONOTONE NON-INCREASING and caps each
+    /// hop's connect + header-wait ONLY - it does NOT bound the entry hop's own
+    /// connection setup, request transmission, per-hop admission/queueing, or body
+    /// streaming (see the HONEST INVARIANT module note and [`composed_header_wait`]).
+    /// For an inner hop it is the local ceiling on the wait, capped further by
+    /// whatever budget the downstream client propagated.
     ///
     /// KNOWN CEILING (unchanged by the composing budget - honest scope): the
     /// entry hop is always the binding constraint at its own budget, so an
@@ -1510,7 +1512,7 @@ mod budget_tests {
     }
 
     /// The chain ENTRY (no inbound budget) SEEDS the propagated budget from its own
-    /// `header_timeout`, exactly - the whole chain's shared deadline starts here.
+    /// `header_timeout`, exactly - the monotone-non-increasing header-wait budget starts here.
     #[tokio::test]
     async fn entry_hop_seeds_and_propagates_its_header_timeout() {
         let (addr, seen) = spawn_recording_http(Duration::ZERO).await;
