@@ -6,12 +6,13 @@ title: >-
 status: To Do
 assignee: []
 created_date: '2026-08-15 17:03'
+updated_date: '2026-08-15 23:19'
 labels:
   - daemon-core
   - p2p
   - hardening
 dependencies: []
-priority: medium
+priority: high
 ---
 
 ## Description

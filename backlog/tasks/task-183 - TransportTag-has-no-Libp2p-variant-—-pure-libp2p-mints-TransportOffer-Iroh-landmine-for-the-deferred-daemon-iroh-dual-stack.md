@@ -6,6 +6,7 @@ title: >-
 status: To Do
 assignee: []
 created_date: '2026-08-13 02:20'
+updated_date: '2026-08-15 23:19'
 labels:
   - peer-fabric
   - fabric-libp2p
@@ -13,6 +14,7 @@ labels:
   - discovery
   - wave-2c
 dependencies: []
+priority: high
 ---
 
 ## Description

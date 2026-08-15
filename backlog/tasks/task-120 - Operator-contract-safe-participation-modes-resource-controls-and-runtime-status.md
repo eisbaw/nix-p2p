@@ -6,7 +6,7 @@ title: >-
 status: To Do
 assignee: []
 created_date: '2026-08-10 22:24'
-updated_date: '2026-08-11 20:08'
+updated_date: '2026-08-15 23:18'
 labels:
   - production
   - operator
@@ -20,14 +20,10 @@ dependencies:
   - TASK-31
   - TASK-77
   - TASK-78
-  - TASK-83
-  - TASK-86
-  - TASK-89
   - TASK-100
   - TASK-103
   - TASK-111
   - TASK-115
-  - TASK-116
 priority: high
 ---
 
