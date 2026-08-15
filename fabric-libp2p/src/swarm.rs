@@ -402,6 +402,27 @@ pub struct StreamedFetch {
     pub wire_body_bytes: u64,
 }
 
+/// The ATTRIBUTED outcome of a streaming NAR fetch (TASK-218): whether a failure happened
+/// BEFORE the substream opened or AFTER. This distinction is load-bearing for the
+/// relay-reachability oracle - only a `NotOpened` failure means the provider was UNREACHABLE.
+///
+///   * [`FetchOutcome::Ok`] - the NAR was fetched and gate-1-verified.
+///   * [`FetchOutcome::NotOpened`] - the substream was NEVER opened: `open_stream` returned an
+///     error or the dial timed out. Over a relay this is a dial / circuit-establishment failure
+///     - the provider was NOT reached at any resolved dial address. This (and ONLY this) is an
+///     "unreachable" failure.
+///   * [`FetchOutcome::OpenedThenFailed`] - the substream OPENED (the provider WAS reached and
+///     the `/nar/3` protocol negotiated), but the transfer then failed: a `NotHeld` / `Declined`
+///     reply, a `TooLarge` size abort, a gate-1 `IntegrityMismatch`, a mid-body idle timeout, or
+///     a post-open write error. The relay WORKED here - conflating this with `NotOpened` would
+///     falsely blame the relay for a reachable provider that merely does not hold the content.
+#[derive(Debug)]
+pub enum FetchOutcome {
+    Ok(StreamedFetch),
+    NotOpened(TransferError),
+    OpenedThenFailed(TransferError),
+}
+
 /// A pass-through [`AsyncRead`] that tallies every byte it yields. It lets a measurement caller
 /// learn how many bytes actually crossed the wire (the compressed body volume for a zstd fetch,
 /// the raw volume for a raw fetch) without touching the framing reader. Measurement-only; not on
@@ -767,19 +788,57 @@ impl SwarmHandle {
         body_idle_timeout: Duration,
         offer_zstd: bool,
     ) -> Result<StreamedFetch, TransferError> {
+        // Flatten the attribution: measurement callers only care Ok vs error, not WHERE it
+        // failed. The `NotOpened` / `OpenedThenFailed` distinction is for the transport's
+        // reachability oracle (TASK-218), which calls `fetch_nar_streaming_attributed` directly.
+        match self
+            .fetch_nar_streaming_attributed(
+                peer,
+                content,
+                expected_size,
+                dial_timeout,
+                body_idle_timeout,
+                offer_zstd,
+            )
+            .await
+        {
+            FetchOutcome::Ok(fetch) => Ok(fetch),
+            FetchOutcome::NotOpened(error) | FetchOutcome::OpenedThenFailed(error) => Err(error),
+        }
+    }
+
+    /// Streaming NAR fetch that ATTRIBUTES the failure to BEFORE vs AFTER the substream opened
+    /// (TASK-218). The split point is `open_stream`: an error/timeout there is a dial /
+    /// circuit-establishment failure ([`FetchOutcome::NotOpened`] — the provider was UNREACHABLE
+    /// at every resolved dial address); once the stream is open the provider WAS reached and
+    /// every subsequent failure (a `NotHeld`/`Declined` reply, a `TooLarge` abort, a gate-1
+    /// `IntegrityMismatch`, a mid-body idle timeout, a post-open write error) is
+    /// [`FetchOutcome::OpenedThenFailed`]. The transport uses this to log "UNREACHABLE" ONLY on
+    /// a genuine dial failure, never for a reachable provider that merely does not hold the NAR.
+    pub async fn fetch_nar_streaming_attributed(
+        &self,
+        peer: PeerId,
+        content: Blake3Digest,
+        expected_size: Option<u64>,
+        dial_timeout: Duration,
+        body_idle_timeout: Duration,
+        offer_zstd: bool,
+    ) -> FetchOutcome {
         // Clone the Control per fetch: `open_stream` takes `&mut self` and opens one stream
         // at a time, so a fresh clone is the natural unit of concurrency here.
         let mut control = self.control.clone();
         let open = control.open_stream(peer, self.nar_protocol.clone());
+        // THE ATTRIBUTION BOUNDARY: a failure to open/dial the substream means the provider was
+        // never reached (unreachable). Everything past this point is a post-open transfer error.
         let mut stream = match tokio::time::timeout(dial_timeout, open).await {
             Ok(Ok(stream)) => stream,
             Ok(Err(error)) => {
-                return Err(TransferError::Unavailable(format!(
+                return FetchOutcome::NotOpened(TransferError::Unavailable(format!(
                     "libp2p could not open a NAR stream to {peer}: {error}"
                 )));
             }
             Err(_elapsed) => {
-                return Err(TransferError::Unavailable(format!(
+                return FetchOutcome::NotOpened(TransferError::Unavailable(format!(
                     "libp2p dialing/opening a NAR stream to {peer} exceeded the dial timeout \
                      {dial_timeout:?}"
                 )));
@@ -790,26 +849,29 @@ impl SwarmHandle {
         } else {
             peer_fabric::ACCEPT_RAW
         };
-        nar::write_request(&mut stream, &content, accept)
-            .await
-            .map_err(|error| {
-                TransferError::Unavailable(format!(
-                    "libp2p failed to send the NAR request to {peer}: {error}"
-                ))
-            })?;
+        // The substream is OPEN — the provider was REACHED. From here, failures are post-open.
+        if let Err(error) = nar::write_request(&mut stream, &content, accept).await {
+            return FetchOutcome::OpenedThenFailed(TransferError::Unavailable(format!(
+                "libp2p failed to send the NAR request to {peer}: {error}"
+            )));
+        }
         // Count every byte the reader pulls so the caller learns the COMPRESSED body volume
         // without any change to the framing reader. On the success (NAR) path the reader
         // consumes exactly a 1-byte status + a 1-byte codec header before the body, so the
         // body volume is the tally minus those two framing bytes.
         let mut counting = CountingReader::new(&mut stream);
-        let bytes =
-            nar::read_response_streamed(&mut counting, expected_size, body_idle_timeout, &content)
-                .await?;
-        let wire_body_bytes = counting.count().saturating_sub(2);
-        Ok(StreamedFetch {
-            bytes,
-            wire_body_bytes,
-        })
+        match nar::read_response_streamed(&mut counting, expected_size, body_idle_timeout, &content)
+            .await
+        {
+            Ok(bytes) => {
+                let wire_body_bytes = counting.count().saturating_sub(2);
+                FetchOutcome::Ok(StreamedFetch {
+                    bytes,
+                    wire_body_bytes,
+                })
+            }
+            Err(error) => FetchOutcome::OpenedThenFailed(error),
+        }
     }
 
     /// Install (or replace) the serve gate; inbound NAR requests are then admitted and

@@ -6,7 +6,7 @@ title: >-
 status: In Progress
 assignee: []
 created_date: '2026-08-15 12:35'
-updated_date: '2026-08-15 17:50'
+updated_date: '2026-08-15 18:04'
 labels:
   - libp2p
   - fabric
@@ -87,6 +87,8 @@ Findings still open after 70479ce:
 3 (MEDIUM): guard still bypassable - relay_by_provider: Vec<(NodeId, Multiaddr)> and multiline/type-alias forms pass check-discovery-no-shortcut.py. Generalize to ANY provider/NodeId/ContentKey-keyed relay association (map OR tuple-Vec OR alias), add mutation arms that bite.
 4 (MEDIUM): locator.rs:286 comment overclaims exhaustive non-global classification while 0.0.0.0/8, 192.0.0.0/24, 240.0.0.0/4 still classify public (a 240/4 provider would be mis-dialed). Either add those reserved ranges (integer math) or soften the comment to not claim exhaustiveness and file the rest - do not overclaim.
 5 (MEDIUM): nat_dht_resolve.rs module-level claim (:1) and test name resolves_and_fetches_via_constructed_circuit (:145) still say through-the-relay while the direct loopback listener is reachable - downgrade the module claim + rename the test to construction+dialability.
+
+2nd codex NO-GO addressed (code-only; per orchestrator process change I did NOT touch ACs or status). Finding 1 (CRITICAL, WRONG BOUNDARY) FIXED: the NAR fetch is now ATTRIBUTED - added FetchOutcome { Ok | NotOpened | OpenedThenFailed } and SwarmHandle::fetch_nar_streaming_attributed splitting at open_stream. UNREACHABLE is logged (and the B2 grep gated) ONLY on NotOpened (the substream NEVER opened = dial/circuit-establishment failure). A reachable provider that opens the stream then replies NotHeld/Declined/TooLarge/IntegrityMismatch/idle-timeout is OpenedThenFailed -> logged as reached-but-failed, NOT UNREACHABLE. LOCK-IN test fabric-libp2p/tests/nar_transport.rs::fetch_attribution_distinguishes_dial_failure_from_post_open_not_held: a reachable NotHeld provider => OpenedThenFailed(NotHeld) (mutation-proven: reverting the read-error arm to NotOpened makes it RED); a peer with no dialable address => NotOpened. On the correlation-id suggestion: not needed - the B2 bite is a SINGLE realise = one discovery+one fetch, and the three greps are cursor-scoped to that one attempt, so cross-attempt satisfaction is not possible. Finding 3 (comment overclaim) FIXED: added 0.0.0.0/8, 192.0.0.0/24, and class-E 240.0.0.0/4 to ipv4_is_public (integer octet math) and softened the doc to not claim exhaustiveness; extended ip_classification_tests. Finding 4 (guard) FIXED: check-discovery-no-shortcut.py now strips line comments and scans whole-text with one regex that forbids ANY relay/circuit-named binding (field OR type alias, case-insensitive name) keyed by NodeId/ContentKey/Provider as a map/set OR tuple-Vec/array, tolerating MULTILINE and borrowed types; 7 mutation self-test arms incl relay_by_provider: Vec<(NodeId,..)>, a multiline decl, and a type alias - all bite; real scan clean. Finding 5 (test overclaim) FIXED: downgraded the module-level claim to CONSTRUCTION+DIALABILITY (carriage proven by nat_traversal.rs + the VM) and renamed the test to discovery_only_consumer_resolves_and_dials_constructed_circuit_no_carriage_claim. Fast gate GREEN: fabric-libp2p 80 lib + nar_transport 16 (incl attribution) 0-failed; daemon-libp2p+daemon-core 238/0; fmt/clippy -D-warnings/no-floats/discovery(self-test 7 arms + scan) all pass. Re-running nix build .#nat-vm-test (build8) to confirm UNREACHABLE now fires only on a genuine dial failure and the B2 oracle still passes.
 <!-- SECTION:NOTES:END -->
 
 ## Final Summary

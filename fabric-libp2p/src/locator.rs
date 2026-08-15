@@ -283,11 +283,13 @@ fn addr_is_public(addr: &Multiaddr) -> bool {
     false
 }
 
-/// A v4 address is NON-public if it is in any non-globally-routable range. Covering the
-/// carrier-grade-NAT range 100.64.0.0/10 (RFC 6598) is load-bearing: a provider behind a
-/// CARRIER NAT presents a 100.64.x.x address that is NOT directly dialable, so it must still
-/// get a relay-circuit candidate composed (PRD risk 8 - "fails behind a real-world NAT").
-/// All checks are integer octet math (no floats, no unstable std APIs).
+/// A v4 address is NON-public if it falls in a non-globally-routable range. This covers the
+/// IANA special-purpose ranges that matter for dial-address classification (it is not a claim
+/// to enumerate every last IANA registry entry - the tail-anycast/6to4 corners are irrelevant
+/// here). Covering carrier-grade NAT 100.64.0.0/10 (RFC 6598) and the class-E 240.0.0.0/4 is
+/// load-bearing: a provider behind a CARRIER NAT (or on a reserved address) is NOT directly
+/// dialable, so it must still get a relay-circuit candidate composed (PRD risk 8 - "fails
+/// behind a real-world NAT"). All checks are integer octet math (no floats, no unstable std).
 fn ipv4_is_public(ip: Ipv4Addr) -> bool {
     let o = ip.octets();
     let non_public = ip.is_loopback()            // 127.0.0.0/8
@@ -296,7 +298,10 @@ fn ipv4_is_public(ip: Ipv4Addr) -> bool {
         || ip.is_unspecified()                   // 0.0.0.0
         || ip.is_broadcast()                     // 255.255.255.255
         || ip.is_multicast()                     // 224.0.0.0/4
+        || o[0] == 0                                   // "this network" 0.0.0.0/8
+        || (o[0] & 0xf0) == 0xf0                       // reserved/class-E 240.0.0.0/4 (incl. 255/8)
         || (o[0] == 100 && (o[1] & 0xc0) == 0x40)      // CGNAT 100.64.0.0/10 (RFC 6598)
+        || (o[0] == 192 && o[1] == 0 && o[2] == 0)     // IETF protocol assignments 192.0.0.0/24
         || (o[0] == 198 && (o[1] & 0xfe) == 18)        // benchmarking 198.18.0.0/15
         || (o[0] == 192 && o[1] == 0 && o[2] == 2)     // documentation 192.0.2.0/24
         || (o[0] == 198 && o[1] == 51 && o[2] == 100)  // documentation 198.51.100.0/24
@@ -344,6 +349,10 @@ mod ip_classification_tests {
             "192.0.2.5",       // documentation
             "198.51.100.5",    // documentation
             "203.0.113.5",     // documentation
+            "0.1.2.3",         // "this network" 0.0.0.0/8
+            "192.0.0.8",       // IETF protocol assignments 192.0.0.0/24
+            "240.0.0.1",       // reserved/class-E 240.0.0.0/4 low edge
+            "254.254.254.254", // reserved/class-E high side
         ] {
             let a: Ipv4Addr = ip.parse().unwrap();
             assert!(!ipv4_is_public(a), "{ip} must be classified non-public");

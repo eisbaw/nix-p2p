@@ -23,8 +23,9 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use fabric_libp2p::{
-    CatalogNarSupplier, CatalogProbe, Libp2pNodeLocator, Libp2pServer, Libp2pTransport,
-    MemoryNarSupplier, Multiaddr, Node, NodeConfig, PeerId, ProbedSource, ProbedSupply, ServeGate,
+    CatalogNarSupplier, CatalogProbe, FetchOutcome, Libp2pNodeLocator, Libp2pServer,
+    Libp2pTransport, MemoryNarSupplier, Multiaddr, Node, NodeConfig, PeerId, ProbedSource,
+    ProbedSupply, ServeGate,
 };
 use peer_fabric::{
     Blake3Digest, CODEC_ZSTD, ExposureLedger, Lookup, NarServer, NarTransfer, NodeLocator,
@@ -190,6 +191,87 @@ async fn wire_consumer(
     }
 
     Libp2pTransport::new(consumer.handle.clone(), locator)
+}
+
+/// TASK-218 finding 1 (the load-bearing boundary): the streaming fetch must ATTRIBUTE a
+/// failure to BEFORE vs AFTER the substream opened, because the transport logs "NAR fetch
+/// UNREACHABLE" (which the B2 relay-down oracle greps) ONLY on the never-opened path. This
+/// LOCKS IN that a REACHABLE provider replying `NotHeld` is `OpenedThenFailed` (relay/dial
+/// WORKED — NOT unreachable), while a peer with NO dialable address is `NotOpened` (a genuine
+/// dial failure). MUTATION: revert `fetch_nar_streaming_attributed` to return `NotOpened` (or
+/// a bare Err the transport treats as unreachable) for the post-open NotHeld and this fails.
+#[tokio::test]
+async fn fetch_attribution_distinguishes_dial_failure_from_post_open_not_held() {
+    let scope = "nar-attribution";
+    let held = b"the NAR bytes the provider actually holds".to_vec();
+    let held_content = Blake3Digest::from_raw_nar(&held);
+    let unheld_content = Blake3Digest::from_raw_nar(b"a DIFFERENT NAR the provider does NOT hold");
+
+    // Provider A serves ONLY `held`, and is directly reachable by the consumer.
+    let (node_a, addr_a) = start_listening([61u8; 32], scope).await;
+    let server = Libp2pServer::new(
+        node_a.handle.clone(),
+        Arc::new(MemoryNarSupplier::new([held.clone()])),
+        TaskSupervisorHandle::disconnected(),
+    );
+    let _serve = server
+        .serve(ServeBudget::default())
+        .await
+        .expect("serve starts");
+
+    // Consumer B connects DIRECTLY to A (add_address + dial) - no DHT needed for this boundary.
+    let (node_b, _addr_b) = start_listening([62u8; 32], scope).await;
+    node_b
+        .handle
+        .add_address(node_a.peer_id, addr_a.clone())
+        .await;
+    let _ = node_b.handle.dial(addr_a.clone()).await;
+
+    // (1) POST-OPEN: fetch content the REACHABLE provider does NOT hold. The substream OPENS
+    //     (the provider is reached, the /nar/3 protocol negotiates) and the reply is NotHeld ->
+    //     `OpenedThenFailed(NotHeld)`. This must NOT be classified as unreachable.
+    let after_open = node_b
+        .handle
+        .fetch_nar_streaming_attributed(
+            node_a.peer_id,
+            unheld_content,
+            None,
+            Duration::from_secs(5),
+            Duration::from_secs(5),
+            true,
+        )
+        .await;
+    match after_open {
+        FetchOutcome::OpenedThenFailed(TransferError::NotHeld(c)) => assert_eq!(c, unheld_content),
+        other => panic!(
+            "a REACHABLE NotHeld provider must be OpenedThenFailed(NotHeld) (relay/dial worked) \
+             - the transport must NOT log UNREACHABLE here; got {other:?}"
+        ),
+    }
+
+    // (2) DIAL FAILURE: fetch from a peer the consumer has NO dialable address for. The
+    //     substream NEVER opens -> `NotOpened` (the "unreachable" attribution the transport
+    //     logs UNREACHABLE for). This is what a relay-down circuit dial produces.
+    let unreachable_peer = Keypair::ed25519_from_bytes([99u8; 32])
+        .expect("keypair")
+        .public()
+        .to_peer_id();
+    let never_opened = node_b
+        .handle
+        .fetch_nar_streaming_attributed(
+            unreachable_peer,
+            held_content,
+            None,
+            Duration::from_secs(2),
+            Duration::from_secs(2),
+            true,
+        )
+        .await;
+    assert!(
+        matches!(never_opened, FetchOutcome::NotOpened(_)),
+        "a peer with NO dialable address must be NotOpened (the UNREACHABLE attribution); \
+         got {never_opened:?}"
+    );
 }
 
 #[tokio::test]

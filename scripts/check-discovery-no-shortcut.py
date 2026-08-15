@@ -102,20 +102,38 @@ PERMITTED_DIAL_ASSISTANCE = ("autonat", "dcutr", "relay")
 #       name carries no relay/circuit token and it is the zero-disclosure ExplicitPeers book.
 # Prose/doc mentions (comment lines) are ignored. A NodeId/ContentKey identifies the
 # CONTENT/PROVIDER; a PeerId identifies the RELAY transport - only the former keying is forbidden.
+# A NodeId/ContentKey/Provider* identifies the CONTENT/PROVIDER; a PeerId identifies the RELAY
+# transport. Keying a relay set by the FORMER is per-provider injection; by the latter is fine.
 IDENTITY_KEY = r"(?:NodeId|ContentKey|Provider\w*)"
-KNOWN_RELAYS_DECL = re.compile(r"\bknown_relays\s*:\s*([A-Za-z_][A-Za-z0-9_]*)\s*<\s*([^>\n]*)")
-# A field named *relay* / *circuit* that is a map/set keyed by a provider/content identity.
+# Any binding whose NAME mentions relay/circuit (case-insensitive: snake_case fields AND
+# PascalCase type aliases) that is a MAP/SET keyed by a provider/content identity, OR a
+# tuple-`Vec`/array whose FIRST element is that identity. Matches `field: Type` AND
+# `type Alias = Type`, and tolerates MULTILINE declarations (`\s*` spans newlines) because
+# comments are stripped first. The legit `known_relays: Vec<(PeerId, Multiaddr)>` (keyed by the
+# relay's PeerId) and `peer_address_book: BTreeMap<NodeId, ...>` (name has no relay/circuit
+# token) are NOT matched.
 RELAY_KEYED_BY_IDENTITY = re.compile(
-    r"\b\w*(?:relay|circuit)\w*\s*:\s*(?:BTreeMap|HashMap|BTreeSet|HashSet|IndexMap)\s*<\s*"
+    r"\b(?i:[A-Za-z_]*(?:relay|circuit)[A-Za-z0-9_]*)\s*[:=]\s*"
+    r"(?:&\s*(?:'[A-Za-z_]\w*\s+)?)?"  # tolerate a borrowed / lifetime-qualified type
+    r"(?:"
+    r"(?:BTreeMap|HashMap|BTreeSet|HashSet|IndexMap|IndexSet)\s*<\s*"
     + IDENTITY_KEY
+    + r"|(?:Vec|VecDeque|\[)\s*<?\s*\(\s*"
+    + IDENTITY_KEY
+    + r")"
 )
-# `known_relays: Vec<(NodeId, ...)>` - the Vec element's FIRST type is a provider/content id.
-KNOWN_RELAYS_VEC_KEYED = re.compile(r"\bknown_relays\s*:\s*Vec\s*<\s*\(\s*" + IDENTITY_KEY)
+
+
+def _strip_line_comments(text: str) -> str:
+    """Drop `// ...` (and `/// ...`) tails so prose mentioning a forbidden shape never trips the
+    scan, while KEEPING newlines so a multiline declaration stays contiguous for the regex."""
+    return "\n".join(re.sub(r"//.*", "", line) for line in text.splitlines())
 
 
 def scan_relay_provider_independence(roots: list[Path]) -> list[str]:
-    """The known_relays circuit-composition input must be a provider-INDEPENDENT Vec, and no
-    relay/circuit set may be keyed by a provider/content identity (TASK-218, codex #4)."""
+    """No relay/circuit set may be keyed by a provider/content identity - as a map, set,
+    tuple-Vec, or type alias, on one line or across several (TASK-218, codex #4). The relay set
+    the locator composes circuit addresses from must be provider-INDEPENDENT."""
     violations: list[str] = []
     for root in roots:
         if not root.exists():
@@ -128,33 +146,15 @@ def scan_relay_provider_independence(roots: list[Path]) -> list[str]:
                 text = source.read_text()
             except (UnicodeDecodeError, OSError):
                 continue
-            for line in text.splitlines():
-                stripped = line.lstrip()
-                if stripped.startswith("//"):
-                    continue  # a comment/doc mention, not a real declaration
-                # (A) known_relays is not a flat Vec.
-                m = KNOWN_RELAYS_DECL.search(line)
-                if m and m.group(1) != "Vec":
-                    violations.append(
-                        f"{source}: `known_relays` declared as {m.group(1)}<…> - it MUST be a "
-                        "provider-INDEPENDENT Vec<(PeerId, Multiaddr)>; a provider/content-keyed "
-                        "map is per-provider circuit-address injection (TASK-218)"
-                    )
-                # (B) known_relays is a Vec keyed by a provider/content identity.
-                if KNOWN_RELAYS_VEC_KEYED.search(line):
-                    violations.append(
-                        f"{source}: `known_relays` is a Vec KEYED BY a provider/content identity "
-                        "(Vec<(NodeId|ContentKey|Provider…, …)>) - the relay set must be "
-                        "provider-INDEPENDENT (first element is the RELAY's PeerId, not the "
-                        "provider's NodeId); per-provider circuit injection (TASK-218)"
-                    )
-                # (C) any relay/circuit field keyed by a provider/content identity.
-                if RELAY_KEYED_BY_IDENTITY.search(line):
-                    violations.append(
-                        f"{source}: a relay/circuit set keyed by a provider/content identity "
-                        f"({stripped[:80]!r}) - associating relays with a provider is per-provider "
-                        "circuit-address injection under another name (TASK-218)"
-                    )
+            code = _strip_line_comments(text)
+            for m in RELAY_KEYED_BY_IDENTITY.finditer(code):
+                snippet = " ".join(m.group(0).split())[:90]
+                violations.append(
+                    f"{source}: a relay/circuit set keyed by a provider/content identity "
+                    f"({snippet!r}) - associating relays with a provider/content is per-provider "
+                    "circuit-address injection under another name (TASK-218). The relay set MUST "
+                    "be provider-INDEPENDENT (e.g. Vec<(PeerId, Multiaddr)>)."
+                )
     return violations
 
 
@@ -232,23 +232,33 @@ def self_test() -> int:
             "pub struct Cfg {\n"
             "    pub known_relays: Vec<(PeerId, Multiaddr)>,\n"
             "    pub peer_address_book: BTreeMap<NodeId, Vec<Multiaddr>>,\n"
+            "    /// doc prose: a known_relays: BTreeMap<NodeId, _> would be forbidden (comment)\n"
+            "    pub relay: Toggle<relay::Behaviour>,\n"
             "}\n"
         )
         relay_ok = scan_relay_provider_independence([Path(tmp) / "fabric-libp2p" / "src"])
         if relay_ok:
             print(
-                "self-test FAILED: a flat `known_relays: Vec<…>` (or the legit NodeId-keyed "
-                f"peer_address_book) was flagged as per-provider injection ({relay_ok})",
+                "self-test FAILED: a legit shape (flat known_relays Vec, NodeId-keyed "
+                "peer_address_book, a relay Toggle, or a comment mention) was flagged as "
+                f"per-provider injection ({relay_ok})",
                 file=sys.stderr,
             )
             return 1
         (root / "relay_ok.rs").unlink()
-        # Each mutation must trip the guard; the message must cite the offending shape.
+        # Each mutation must trip the guard; INCLUDING the tuple-Vec, multiline, and type-alias
+        # forms codex flagged as slipping through the earlier line-oriented / map-only check.
         mutations = {
             "known_relays_map": "    pub known_relays: BTreeMap<NodeId, Multiaddr>,",
             "known_relays_vec_keyed": "    pub known_relays: Vec<(NodeId, Multiaddr)>,",
-            "relay_by_provider": "    pub relay_by_provider: BTreeMap<NodeId, Multiaddr>,",
+            "relay_by_provider_map": "    pub relay_by_provider: BTreeMap<NodeId, Multiaddr>,",
+            # codex #4: the tuple-Vec form (a map keyed by provider under a Vec of pairs).
+            "relay_by_provider_vec": "    pub relay_by_provider: Vec<(NodeId, Multiaddr)>,",
             "provider_circuit_map": "    pub provider_circuits: HashMap<ContentKey, Multiaddr>,",
+            # codex #4: a MULTILINE declaration (name and type on different lines).
+            "relay_multiline": "    pub provider_relays:\n        BTreeMap<NodeId, Multiaddr>,",
+            # codex #4: a type ALIAS whose name mentions relay and is identity-keyed.
+            "relay_type_alias": "pub type ProviderRelays = BTreeMap<NodeId, Multiaddr>;",
         }
         for name, decl in mutations.items():
             bad = root / f"{name}.rs"

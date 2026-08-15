@@ -44,7 +44,7 @@ use peer_fabric::{
 
 use crate::keys::peer_id_of_provider;
 use crate::locator::Libp2pNodeLocator;
-use crate::swarm::SwarmHandle;
+use crate::swarm::{FetchOutcome, SwarmHandle};
 
 /// The libp2p [`NarTransfer`]. Holds a [`SwarmHandle`] to drive the shared swarm's NAR
 /// request-response protocol, and the in-fabric [`Libp2pNodeLocator`] so the dial is
@@ -198,30 +198,49 @@ impl NarTransfer for Libp2pTransport {
             // NEVER the compressed FileSize) plus the gate-1 BLAKE3 verify - so a lying provider
             // is cut off at ~expected_size mid-transfer, and a corrupt one fails gate-1, never
             // wrong bytes handed upward (Nix's sha256 gate remains the trust anchor downstream).
-            let fetched = self
+            // ATTRIBUTED fetch (TASK-218 finding 1): only a failure BEFORE the substream opened
+            // (a dial / circuit-establishment failure) is "unreachable". A reachable provider
+            // that opens the stream and then replies NotHeld/Declined/TooLarge/etc. must NOT be
+            // logged UNREACHABLE - otherwise the B2 relay-down oracle would pass even though the
+            // relay WORKED. The `offer_zstd = true` matches the shipped `fetch_nar_streaming`.
+            match self
                 .handle
-                .fetch_nar_streaming(
+                .fetch_nar_streaming_attributed(
                     peer,
                     content,
                     expected_size,
                     dial_timeout,
                     body_idle_timeout,
+                    true,
                 )
-                .await;
-            if let Err(err) = &fetched {
-                // Fail-verbose (TASK-218 finding 1): the provider was DISCOVERED and RESOLVED
-                // (a Found above, addresses dialed) but the NAR stream could NOT be opened at
-                // ANY resolved dial address - a REACHABILITY / circuit-dial failure, DISTINCT
-                // from a discovery miss or a correlation failure. The B2 relay-down oracle
-                // greps this DISTINCT marker to attribute the failure to the severed relay
-                // circuit (with the direct path B1-blocked), not to lost discovery.
-                tracing::warn!(
-                    provider = %node, %peer, error = %err,
-                    "fabric-libp2p: NAR fetch UNREACHABLE - could not open a NAR stream at any \
-                     resolved dial address (relay circuit + direct all unreachable)"
-                );
+                .await
+            {
+                FetchOutcome::Ok(fetch) => Ok(fetch.bytes),
+                FetchOutcome::NotOpened(err) => {
+                    // The provider was DISCOVERED and RESOLVED (a Found above, addresses dialed)
+                    // but the NAR substream NEVER OPENED at any resolved dial address - a genuine
+                    // dial / relay-circuit REACHABILITY failure. This DISTINCT marker is what the
+                    // B2 relay-down oracle greps to attribute the failure to the severed relay
+                    // circuit (with the direct path B1-blocked), never to a discovery miss.
+                    tracing::warn!(
+                        provider = %node, %peer, error = %err,
+                        "fabric-libp2p: NAR fetch UNREACHABLE - the NAR substream never opened \
+                         (dial / relay-circuit establishment failed) at any resolved dial address"
+                    );
+                    Err(err)
+                }
+                FetchOutcome::OpenedThenFailed(err) => {
+                    // The provider WAS REACHED (the substream opened and the /nar/3 protocol
+                    // negotiated) but the transfer then failed. The relay/dial WORKED, so this is
+                    // NOT logged UNREACHABLE - the info line keeps it diagnosable.
+                    tracing::info!(
+                        provider = %node, %peer, error = %err,
+                        "fabric-libp2p: NAR fetch reached the provider (substream opened) but the \
+                         transfer failed - NOT an unreachability"
+                    );
+                    Err(err)
+                }
             }
-            fetched
         };
 
         match tokio::time::timeout(total_timeout, remote).await {

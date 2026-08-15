@@ -121,8 +121,8 @@ pub use nar::{
 };
 pub use server::Libp2pServer;
 pub use swarm::{
-    DEFAULT_KAD_QUERY_TIMEOUT, Node, NodeConfig, NodeError, ProviderFanOut, QueryFail, QueryReach,
-    SwarmHandle,
+    DEFAULT_KAD_QUERY_TIMEOUT, FetchOutcome, Node, NodeConfig, NodeError, ProviderFanOut,
+    QueryFail, QueryReach, SwarmHandle,
 };
 pub use transport::Libp2pTransport;
 

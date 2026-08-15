@@ -1,9 +1,17 @@
 //! TASK-218: a consumer that did ONLY kad discovery must RESOLVE a NAT'd provider's
-//! `/p2p-circuit` dial-address WITHOUT any injected address, and fetch the NAR through the
-//! relay. `nat_traversal.rs` proves the relay DATA path when the circuit address is supplied
-//! DIRECTLY; this file proves the RESOLUTION half - the discovery-only consumer CONSTRUCTS
-//! the circuit dial-address (ROUTE 1, mped-architect-ruled) from the provider PeerId it got
-//! via kad `get_providers` PLUS a relay it already knows from bootstrap config.
+//! `/p2p-circuit` dial-address WITHOUT any injected address. This file proves the RESOLUTION
+//! (CONSTRUCTION) half - the discovery-only consumer CONSTRUCTS the circuit dial-address
+//! (ROUTE 1, mped-architect-ruled) from the provider PeerId it got via kad `get_providers`
+//! PLUS a relay it already knows from bootstrap config - and that the resolved DialInfo is
+//! DIALABLE end to end.
+//!
+//! SCOPE - this file proves CONSTRUCTION + DIALABILITY, NOT relay CARRIAGE. These are LOOPBACK
+//! tests: the provider's direct listen address (which it must bind for the relay-client
+//! transport, and which kad propagates) is ALSO reachable here, so a byte-identical fetch does
+//! NOT prove the bytes traversed the relay. Relay CARRIAGE is proven separately - at the fabric
+//! API level in `nat_traversal.rs` (a provider on a `/p2p-circuit` ONLY, circuit address
+//! supplied directly), and end to end behind a REAL NAT (direct path genuinely blocked) in
+//! `nixos/nat-vm-test.nix`.
 //!
 //! DIAGNOSIS this pins (the TASK-218 miss): kad `get_closest_peers` for the NAT'd provider
 //! returns ONLY the provider's DIRECT transport address, never its `/p2p-circuit` address (it
@@ -142,7 +150,7 @@ fn envelope() -> SafetyEnvelope {
 /// `nat_traversal.rs` (a provider on a `/p2p-circuit` ONLY, circuit address supplied directly),
 /// and end-to-end behind a REAL NAT (direct path genuinely blocked) in `nixos/nat-vm-test.nix`.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn discovery_only_consumer_resolves_and_fetches_via_constructed_circuit() {
+async fn discovery_only_consumer_resolves_and_dials_constructed_circuit_no_carriage_claim() {
     let _ = tracing_subscriber::fmt::try_init();
     let scope = "task218-construct";
     let nar =
