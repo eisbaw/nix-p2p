@@ -3,11 +3,11 @@ id: TASK-110
 title: >-
   The frozen single-key HoldAnswer::Have.offers has no count cap: 743.6x
   amplification, the last of its class
-status: In Progress
+status: Done
 assignee:
   - '@me'
 created_date: '2026-08-10 17:11'
-updated_date: '2026-08-15 20:36'
+updated_date: '2026-08-15 20:48'
 labels:
   - irreversible
 dependencies:
@@ -31,11 +31,11 @@ THE SEMANTIC ARGUMENT TO REUSE: the batch fix succeeded because it replaced an A
 
 ## Acceptance Criteria
 <!-- AC:BEGIN -->
-- [ ] #1 HoldAnswer::Have.offers is bounded by the same SEMANTIC rule as the batch path (at most one offer per transport kind for the single key being answered), not by an arbitrary count
-- [ ] #2 Amplification for the single-key path is MEASURED before and after; the 743.6x figure (622 offers, 65,440 B against an 88 B query) is the pinned before-number and the after-number is reported with its query/response byte sizes
-- [ ] #3 The decoder-acceptance narrowing is recorded as a DELIBERATE freeze amendment with its rationale, the way the KnownTransport/KnownPayload one was - an auditor must find a decision, not infer a slip
-- [ ] #4 Unknown transport KINDS still decode inertly afterwards (forward compatibility preserved), proven by test
-- [ ] #5 Bites by mutation: removing the cap restores an over-cap response being accepted, and the check is proven to have applied before the result is trusted
+- [x] #1 HoldAnswer::Have.offers is bounded by the same SEMANTIC rule as the batch path (at most one offer per transport kind for the single key being answered), not by an arbitrary count
+- [x] #2 Amplification for the single-key path is MEASURED before and after; the 743.6x figure (622 offers, 65,440 B against an 88 B query) is the pinned before-number and the after-number is reported with its query/response byte sizes
+- [x] #3 The decoder-acceptance narrowing is recorded as a DELIBERATE freeze amendment with its rationale, the way the KnownTransport/KnownPayload one was - an auditor must find a decision, not infer a slip
+- [x] #4 Unknown transport KINDS still decode inertly afterwards (forward compatibility preserved), proven by test
+- [x] #5 Bites by mutation: removing the cap restores an over-cap response being accepted, and the check is proven to have applied before the result is trusted
 <!-- AC:END -->
 
 ## Implementation Notes
@@ -90,6 +90,8 @@ Orchestrator now OWNS the AC/Done state (the "enumeration closed" overclaim has 
 4. Do NOT touch AC checkboxes or status. codex re-gates.
 
 CORRECTION SUPERSEDES the earlier progress-note wording (2026-08-15): any earlier note in this task that says the "enumeration/content-count vector is CLOSED" or "enumeration = 0" WITHOUT the KNOWN-offer qualifier is SUPERSEDED and inaccurate. The accurate statement, now enforced in the code docs (daemon-core/src/claim.rs module doc, HoldResponse/HoldResponseWire/BatchHoldQuery docs, discovery.rs) and PRD/golden note: TASK-110 closes the KNOWN-offer count/enumeration vector (at most one content identity per transport KIND, consistent with the batch path deny_unknown_fields). It does NOT close enumeration via the unknown-KIND tolerate-but-drop slot, whose opaque body can still name content identities on the wire (accepted-then-dropped) - a PRE-EXISTING no-enumeration residual shared with the batch path, owned by TASK-224. The worst-case BYTE amplification (~744x, 64 KiB frame) is likewise unchanged, owned by TASK-223. Orchestrator applied the remaining doc corrections directly (the implementer's sweep missed several sites across two rounds; codex re-gate caught them).
+
+DEEP gate CLOSED - codex GO (2026-08-15), orchestrator arbitrated + finalized. HONEST SCOPE of what shipped: TASK-110 bounds the frozen single-key HoldAnswer::Have.offers to <=4 offers AND one per transport KIND (check_single_offer_bindings), on encode and decode against the raw pre-drop slot list - closing the KNOWN-offer count/enumeration vector (<=1 content identity per transport kind, batch-path parity via deny_unknown_fields). Mutation-proven (AC#5), valid golden byte-identical, just e2e 5/5, no floats, frozen surface intact. TWO residuals are honestly filed, NOT closed here: TASK-224 (an unknown-KIND opaque offer slot can still NAME content identities on the wire, accepted-then-dropped - a pre-existing no-enumeration gap shared with the batch path; forward-compat-vs-enumeration tension) and TASK-223 (worst-case BYTE amplification ~744x via unknown-kind padding, bounded by the 64 KiB frame). Gate history: mechanism GO'd early; codex NO-GO x3 on claim honesty (byte overclaim -> enumeration-closed overclaim -> doc completeness), each a real "comment that would lie about the code" defect; orchestrator applied the final doc corrections directly (implementer sweep missed sites twice). All 5 ACs (the count bound) genuinely met; the residuals are distinct NEW vectors, not unmet ACs.
 <!-- SECTION:NOTES:END -->
 
 ## Final Summary
