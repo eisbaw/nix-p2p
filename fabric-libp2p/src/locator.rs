@@ -24,7 +24,9 @@
 //!   * [`ResolutionPolicy::PublicInfrastructure`] - a UNION of two independent dial-candidate
 //!     provenances (TASK-218): the active kad peer-routing query (which discloses this node's
 //!     identity to the DHT nodes / bootstrap it contacts, recorded to the ledger) AND, for a
-//!     provider kad could only place at non-public addresses (or not at all), a `/p2p-circuit`
+//!     provider kad could only place at non-directly-reachable addresses — private (RFC1918) /
+//!     link-local, or nowhere at all (loopback and public addresses ARE directly reachable, so
+//!     they do NOT compose a circuit) — a `/p2p-circuit`
 //!     dial-address CONSTRUCTED from a relay this node knows via bootstrap config (a NAT'd
 //!     provider is reachable only THROUGH its relay; disclosing to that relay operator that we
 //!     relay to the target, also recorded). Returns [`Lookup::Found`] when the union is
