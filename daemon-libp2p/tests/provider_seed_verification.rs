@@ -121,6 +121,7 @@ async fn the_shipped_announce_path_refuses_a_mis_specified_seed() {
         discovery_budget: DiscoveryBudget::new(Duration::from_secs(10), 32),
         envelope: SafetyEnvelope::default(),
         state_dir: None,
+        relay_server_enabled: true,
     };
     let supplier = Arc::new(MemoryNarSupplier::new([nar.clone()]));
     let (fabric, _source, _raw) = build_libp2p_provider_source(cfg, supplier)

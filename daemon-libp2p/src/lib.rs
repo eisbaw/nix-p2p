@@ -119,6 +119,13 @@ pub struct Libp2pSourceConfig {
     /// so two nodes sharing one `state_dir` corrupt each other's floor/sequence. A fail-loud
     /// advisory lock is the TASK-185 hardening follow-up.
     pub state_dir: Option<PathBuf>,
+    /// Whether this node runs the circuit-v2 relay SERVER (TASK-207/208). Default `true`
+    /// (the permissionless-swarm intent: any public node helps NAT'd peers). Set `false`
+    /// for a node that must be kad-only - e.g. a dedicated bootstrap that offers NO
+    /// reservation service, so it can never be an ALTERNATIVE relay path. Threads straight to
+    /// [`NodeConfig::with_relay_server`]: the relay-client / autonat / dcutr behaviours stay
+    /// intact, only the server (which accepts reservations + forwards circuits) is dropped.
+    pub relay_server_enabled: bool,
 }
 
 /// Build the PRODUCTION libp2p [`NarSource`] from `cfg`: start a [`Libp2pFabric`],
@@ -1238,8 +1245,9 @@ async fn start_and_join_libp2p(
     cfg: &Libp2pSourceConfig,
     supplier: Option<Arc<dyn Libp2pNarSupplier>>,
 ) -> Result<Arc<Libp2pFabric>, String> {
-    let node_config =
-        NodeConfig::new(cfg.identity_seed).with_network_scope(cfg.network_scope.clone());
+    let node_config = NodeConfig::new(cfg.identity_seed)
+        .with_network_scope(cfg.network_scope.clone())
+        .with_relay_server(cfg.relay_server_enabled);
     let serving = supplier.is_some();
     // TASK-185, AC#1: a configured `state_dir` routes to the DURABLE constructors, so the
     // shipped daemon reloads its anti-rollback floor + per-key announce sequence on restart.

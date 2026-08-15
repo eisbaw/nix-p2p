@@ -374,10 +374,12 @@
         # The NAT-traversal NixOS VM test (TASK-207): two VMs each behind its own
         # NAT + a public circuit-v2 relay, driving the SHIPPED `services.nix-p2p`
         # module + daemon-libp2p. GATED proofs: the real-NAT boundary (direct dial
-        # blocked), the relay RESERVATION over real NAT, and that the relay is
-        # load-bearing (remove it -> the provider cannot reserve). Decentralized
-        # discovery over NAT and the end-to-end relay-carried BYTE fetch are
-        # exercised as NON-GATING evidence (kad convergence is flaky, and the fetch
+        # blocked), the relay RESERVATION over real NAT, and RECORD discovery over NAT.
+        # The relay being LOAD-BEARING is NOT claimed here: a provider-side relay-loss
+        # bite is tautological (connection-scoped renewal), so the load-bearing
+        # consumer-side reachability bite is DEFERRED to TASK-218; a supporting guard
+        # only shows the provider stays active across relay loss. The end-to-end
+        # relay-carried BYTE fetch is exercised as NON-GATING evidence (the fetch
         # hits a documented residual TASK-218: the circuit dial-address does not
         # resolve via kad peer-routing). A PACKAGE, not a check, like vm-test (needs
         # /dev/kvm; `just e2e-nat-vm` builds it).

@@ -104,6 +104,19 @@ in
         description = "Run as a PROVIDER (`--libp2p-provider`): serve + announce the configured seeds/store paths.";
       };
 
+      relayServer = lib.mkOption {
+        type = lib.types.bool;
+        default = true;
+        description = ''
+          Run the circuit-v2 relay SERVER (accept reservations + forward circuits).
+          Default `true` (the permissionless-swarm intent: any public node helps
+          NAT'd peers). Set `false` (appends `--libp2p-no-relay-server`) for a
+          kad-only node - a dedicated bootstrap that offers NO reservation service,
+          so it can never be an ALTERNATIVE relay path. relay-client/autonat/dcutr
+          stay intact; only the server behaviour is dropped.
+        '';
+      };
+
       listen = lib.mkOption {
         type = lib.types.listOf lib.types.str;
         default = [ ];
@@ -228,6 +241,7 @@ in
           # option expands to its repeatable flag; the scalars append when set.
           ++ lib.optionals lcfg.enable (
             lib.optionals lcfg.provider [ "--libp2p-provider" ]
+            ++ lib.optionals (!lcfg.relayServer) [ "--libp2p-no-relay-server" ]
             ++ lib.concatMap (a: [ "--libp2p-listen" a ]) lcfg.listen
             ++ lib.concatMap (a: [ "--libp2p-external-address" a ]) lcfg.externalAddresses
             ++ lib.concatMap (b: [ "--libp2p-bootstrap" b ]) lcfg.bootstrap

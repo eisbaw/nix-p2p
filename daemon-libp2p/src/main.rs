@@ -98,6 +98,11 @@ struct Config {
     /// then its `(NarHash, NarSize)` is appended to the allowlist so the announce gate can approve
     /// the matching seed/store path.
     libp2p_prove_public_narinfo: Vec<(String, String)>,
+    /// Whether this node runs the circuit-v2 relay SERVER (TASK-207). Default `true` (a public
+    /// node helps NAT'd peers with no dedicated relay). `--libp2p-no-relay-server` sets it
+    /// `false` for a kad-only node (a dedicated bootstrap that offers NO reservation service),
+    /// leaving relay-client/autonat/dcutr intact. Threads to `NodeConfig::with_relay_server`.
+    libp2p_relay_server_enabled: bool,
 }
 
 fn parse_libp2p_peer(flag: &str, raw: &str) -> Result<(PeerId, Multiaddr), String> {
@@ -187,6 +192,7 @@ fn parse_config<I: IntoIterator<Item = String>>(args: I) -> Result<Config, Strin
         libp2p_trusted_public_keys: Vec::new(),
         libp2p_public_allowlist_path: None,
         libp2p_prove_public_narinfo: Vec::new(),
+        libp2p_relay_server_enabled: true,
     };
     let mut it = args.into_iter();
     while let Some(flag) = it.next() {
@@ -241,6 +247,7 @@ fn parse_config<I: IntoIterator<Item = String>>(args: I) -> Result<Config, Strin
                 .libp2p_provide_store
                 .push(parse_libp2p_seed_nar(&value()?)?),
             "--libp2p-print-peer-address" => cfg.libp2p_print_peer_address = true,
+            "--libp2p-no-relay-server" => cfg.libp2p_relay_server_enabled = false,
             "--libp2p-trusted-public-key" => cfg.libp2p_trusted_public_keys.push(value()?),
             "--libp2p-public-allowlist-path" => {
                 cfg.libp2p_public_allowlist_path = Some(value()?.into())
@@ -334,6 +341,7 @@ fn source_config(cfg: &Config) -> Result<Libp2pSourceConfig, String> {
         discovery_budget: DiscoveryBudget::default(),
         envelope: SafetyEnvelope::default(),
         state_dir: cfg.libp2p_state_dir.clone(),
+        relay_server_enabled: cfg.libp2p_relay_server_enabled,
     })
 }
 
@@ -995,6 +1003,7 @@ mod bootstrap_guard_tests {
             libp2p_trusted_public_keys: Vec::new(),
             libp2p_public_allowlist_path: None,
             libp2p_prove_public_narinfo: Vec::new(),
+            libp2p_relay_server_enabled: true,
         }
     }
 
@@ -1220,6 +1229,35 @@ mod nat_flags_tests {
         assert_eq!(
             cfg.libp2p_external_addresses[0].to_string(),
             "/ip4/192.168.1.5/tcp/4001"
+        );
+    }
+
+    /// TASK-207 B2: the relay SERVER is ON by default (a public node helps NAT'd peers) and
+    /// `--libp2p-no-relay-server` turns it OFF for a kad-only node (a dedicated bootstrap that
+    /// offers NO reservation service, so it can never be an ALTERNATIVE relay). The bite: drop the
+    /// flag wiring and a kad-only node silently keeps serving reservations.
+    #[test]
+    fn relay_server_defaults_on_and_no_relay_server_disables_it() {
+        let bootstrap = format!("{RELAY_ID}@/ip4/10.0.0.9/tcp/1");
+        let base: [&str; 4] = [
+            "--libp2p-bootstrap",
+            &bootstrap,
+            "--libp2p-listen",
+            "/ip4/192.168.1.6/tcp/4001",
+        ];
+        let on =
+            parse_config(args(&base)).expect("a kad node with the relay server default parses");
+        assert!(
+            on.libp2p_relay_server_enabled,
+            "the relay server is ON by default"
+        );
+        let mut off_args: Vec<&str> = base.to_vec();
+        off_args.push("--libp2p-no-relay-server");
+        let off = parse_config(args(&off_args))
+            .expect("a kad-only node with --libp2p-no-relay-server parses");
+        assert!(
+            !off.libp2p_relay_server_enabled,
+            "--libp2p-no-relay-server disables the relay server"
         );
     }
 

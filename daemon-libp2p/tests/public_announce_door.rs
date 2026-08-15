@@ -106,6 +106,7 @@ async fn the_public_seed_door_refuses_an_unallowlisted_seed_on_a_real_fabric() {
         discovery_budget: DiscoveryBudget::new(Duration::from_secs(10), 32),
         envelope: SafetyEnvelope::default(),
         state_dir: None,
+        relay_server_enabled: true,
     };
     let supplier = Arc::new(MemoryNarSupplier::new([nar.clone()]));
     let (fabric, _source, _raw) = build_libp2p_provider_source(cfg, supplier)

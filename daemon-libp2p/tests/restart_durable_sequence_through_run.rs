@@ -114,6 +114,7 @@ fn durable_provider_cfg(
         discovery_budget: DiscoveryBudget::new(Duration::from_secs(10), 32),
         envelope: SafetyEnvelope::default(),
         state_dir: Some(state_dir.to_path_buf()),
+        relay_server_enabled: true,
     }
 }
 
@@ -392,6 +393,7 @@ async fn restart_durable_sequence_serves_through_run() {
         discovery_budget,
         envelope: SafetyEnvelope::default(),
         state_dir: None,
+        relay_server_enabled: true,
     };
     let (consumer, _c_source, _c_raw) = build_libp2p_nar_source(consumer_cfg)
         .await

@@ -920,6 +920,7 @@ impl Config {
             discovery_budget: peer_fabric::DiscoveryBudget::default(),
             envelope: peer_fabric::SafetyEnvelope::default(),
             state_dir: self.libp2p_state_dir.clone(),
+            relay_server_enabled: true,
         })
     }
 
