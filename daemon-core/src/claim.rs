@@ -19,9 +19,13 @@
 //!     asked about a whole closure at once: N named NarHashes, one round trip,
 //!     one positional yes/no vector back. ADDED ALONGSIDE the single-key form,
 //!     which is unchanged; both are pinned byte-for-byte in
-//!     `daemon/tests/golden/claim_wire_v1.json`. Still no enumeration: the answer
-//!     is positional over keys the asker already named and carries no keys of its
-//!     own, so it reveals exactly what N single probes would have.
+//!     `daemon/tests/golden/claim_wire_v1.json`. No KNOWN-offer enumeration: the
+//!     answer is positional over keys the asker already named, and its KNOWN
+//!     offers are bounded one-per-transport-kind. RESIDUAL (task-224): an
+//!     unknown-KIND offer body is opaque and can still name content identities on
+//!     the wire (accepted-then-dropped), a pre-existing gap shared with the
+//!     single-key path - so it reveals AT MOST what N single probes would, plus
+//!     that residual.
 //!
 //! ## DHT-is-rendezvous model (why the claim is NOT a DHT record)
 //!
@@ -552,9 +556,12 @@ pub struct HoldQuery {
     pub key: NarHashKey,
 }
 
-/// The answer to a [`HoldQuery`]: have-with-offers, or absent. Yes/no ONLY - it
-/// never carries a listing of other holdings, and it concerns only the queried
-/// hash. Unknown transport offers are dropped on decode (tolerated but inert).
+/// The answer to a [`HoldQuery`]: have-with-offers, or absent. Yes/no over the
+/// queried hash; its KNOWN offers name no other holdings and are bounded
+/// one-per-transport-kind. RESIDUAL (task-224): an unknown-KIND offer body is
+/// opaque and can still carry content identities on the wire (accepted-then-
+/// dropped) - a pre-existing no-enumeration gap shared with the batch path.
+/// Unknown transport offers are dropped on decode (tolerated but inert).
 ///
 /// ## Bounded to ONE offer per transport KIND (task-110 freeze amendment)
 ///
@@ -624,12 +631,14 @@ pub struct HoldResponse {
 /// for every element the peer sent, an unknown transport kind decoding to an
 /// [`OfferSlot::Unknown`] rather than vanishing. Keeping the slot is what lets the
 /// one-per-kind + count bound COUNT unknown kinds against the same cap as known
-/// ones - so the number of offers (and thus content identities) is bounded even
-/// when they would be dropped - while still dropping them from the value a caller
-/// sees (forward compatibility). This bounds the offer COUNT, not the message
-/// BYTES: an unknown offer's body is byte-unbounded and a peer can still pad a
-/// one-key answer up to [`MAX_CLAIM_WIRE_BYTES`] - see [`HoldAnswer`] and
-/// [`check_single_offer_bindings`] for what is and is not closed.
+/// ones - so the number of OFFERS is bounded even when they would be dropped -
+/// while still dropping them from the value a caller sees (forward
+/// compatibility). This bounds the offer COUNT, not the content IDENTITIES a
+/// single offer may name (an unknown-KIND offer body is opaque - task-224), and
+/// not the message BYTES: an unknown offer's body is byte-unbounded and a peer
+/// can still pad a one-key answer up to [`MAX_CLAIM_WIRE_BYTES`] (task-223) - see
+/// [`HoldAnswer`] and [`check_single_offer_bindings`] for what is and is not
+/// closed.
 #[derive(Deserialize)]
 struct HoldResponseWire {
     schema_version: u16,
@@ -725,17 +734,18 @@ pub const MAX_OFFERS_PER_ANSWER: usize = 4;
 /// A probe about MANY content identities at once: "of these N NarHashes, which do
 /// you hold?". One round trip replaces N.
 ///
-/// ## This is NOT enumeration, even though the answer looks like a listing
+/// ## KNOWN-offer answers are NOT enumeration (unknown-kind residual: task-224)
 ///
 /// The asker names every key. The answer ([`BatchHoldResponse`]) is a POSITIONAL
-/// vector over exactly those keys and carries no keys of its own - there is no
-/// field in which a responder could mention a hash the asker did not already
-/// name. So a batch reveals precisely what N single [`HoldQuery`] probes would
-/// have revealed, and nothing more; it only removes the round trips. There is
-/// still no message anywhere in this module that asks a peer "what do you have?",
-/// and that remains structural, not a policy. (The privacy invariant being
-/// protected is that store-path names are secrets: a node must not be able to
-/// harvest a listing it could not already guess.)
+/// vector over exactly those keys and carries no keys of its own in its KNOWN
+/// structure. RESIDUAL (task-224): a Have's unknown-KIND offer body is opaque, so
+/// a responder CAN mention hashes the asker did not name there (accepted-then-
+/// dropped) - a pre-existing gap shared with the single-key path. So a batch
+/// reveals what N single [`HoldQuery`] probes would, plus that residual; it
+/// removes the round trips. There is still no message in this module that asks a
+/// peer "what do you have?", and that remains structural, not a policy. (The
+/// privacy invariant being protected is that store-path names are secrets: a node
+/// must not be able to harvest a listing it could not already guess.)
 ///
 /// BOUNDED: `keys` is capped at [`MAX_BATCH_HOLD_KEYS`], must be non-empty, and
 /// must contain no repeated key. Duplicates are rejected rather than deduplicated
@@ -2514,7 +2524,7 @@ mod tests {
         );
     }
 
-    // --- BATCHED query (task-91): bounded, positional, still no enumeration --
+    // --- BATCHED query (task-91): bounded, positional; no KNOWN-offer enumeration (unknown-kind residual: task-224) --
 
     /// `n` DISTINCT canonical keys, derived from a counter so a test can build a
     /// full-cap batch without 256 literals.

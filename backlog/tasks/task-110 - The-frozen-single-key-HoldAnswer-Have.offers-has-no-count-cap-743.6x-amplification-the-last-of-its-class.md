@@ -7,7 +7,7 @@ status: In Progress
 assignee:
   - '@me'
 created_date: '2026-08-10 17:11'
-updated_date: '2026-08-15 20:15'
+updated_date: '2026-08-15 20:36'
 labels:
   - irreversible
 dependencies:
@@ -88,6 +88,8 @@ Orchestrator now OWNS the AC/Done state (the "enumeration closed" overclaim has 
 2. VERIFY the batch path (check_batch_offer_bindings / keep_known_offers) has the IDENTICAL unknown-kind tolerate-drop behavior, so the residual is provably pre-existing in both paths (document the parity with a test or a precise code reference).
 3. FILE the unknown-kind enumeration residual as its OWN task (a real no-enumeration-invariant gap with a forward-compat tension: how to accept an unknown future transport opaquely while forbidding it from naming content identities). Do NOT fold it into TASK-223 (byte cap) - codex showed a byte cap still permits several short identities in one opaque slot. Reference the new task in code at the tolerate-drop site.
 4. Do NOT touch AC checkboxes or status. codex re-gates.
+
+CORRECTION SUPERSEDES the earlier progress-note wording (2026-08-15): any earlier note in this task that says the "enumeration/content-count vector is CLOSED" or "enumeration = 0" WITHOUT the KNOWN-offer qualifier is SUPERSEDED and inaccurate. The accurate statement, now enforced in the code docs (daemon-core/src/claim.rs module doc, HoldResponse/HoldResponseWire/BatchHoldQuery docs, discovery.rs) and PRD/golden note: TASK-110 closes the KNOWN-offer count/enumeration vector (at most one content identity per transport KIND, consistent with the batch path deny_unknown_fields). It does NOT close enumeration via the unknown-KIND tolerate-but-drop slot, whose opaque body can still name content identities on the wire (accepted-then-dropped) - a PRE-EXISTING no-enumeration residual shared with the batch path, owned by TASK-224. The worst-case BYTE amplification (~744x, 64 KiB frame) is likewise unchanged, owned by TASK-223. Orchestrator applied the remaining doc corrections directly (the implementer's sweep missed several sites across two rounds; codex re-gate caught them).
 <!-- SECTION:NOTES:END -->
 
 ## Final Summary

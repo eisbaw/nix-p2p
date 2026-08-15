@@ -53,10 +53,13 @@
 //! ([`BatchHoldQuery`], task-91) - and gets back yes/no about exactly those. There
 //! is, by construction, no method on [`Discovery`] or [`PeerQuery`] that lists a
 //! peer's holdings - the probes reuse task-50's [`HoldQuery`]/[`HoldAnswer`] and
-//! the positional batch form, which forbid enumeration in their SHAPE: a batch
-//! answer carries no keys of its own and is meaningless detached from the asker's
-//! own query. Probing X (alone or in a batch) reveals nothing about a key Y the
-//! peer also holds (proven by test, for both forms).
+//! the positional batch form, which forbid KNOWN-offer enumeration in their
+//! SHAPE: an honest peer's answer carries no keys of its own and is meaningless
+//! detached from the asker's own query. Probing X (alone or in a batch) reveals
+//! nothing about a key Y an honest peer also holds (proven by test, for both
+//! forms). RESIDUAL (task-224): the DECODER still ACCEPTS (then drops) an
+//! unknown-KIND offer body that names unqueried identities - a wire-acceptance
+//! gap shared with the single-key path, not an honest-peer leak.
 //!
 //! ## Bounded miss (the real correctness point)
 //!
