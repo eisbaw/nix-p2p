@@ -6,7 +6,7 @@ title: >-
 status: To Do
 assignee: []
 created_date: '2026-08-14 08:28'
-updated_date: '2026-08-14 08:51'
+updated_date: '2026-08-15 07:07'
 labels:
   - wave-2c
   - libp2p
@@ -15,7 +15,7 @@ labels:
 dependencies:
   - TASK-99
   - TASK-157
-priority: low
+priority: high
 ---
 
 ## Description
@@ -35,4 +35,6 @@ TASK-99 landed negotiated zstd link compression, but the serve side compresses t
 
 <!-- SECTION:NOTES:BEGIN -->
 DEPRIORITIZED 2026-08-14 (owner steer): 'dont worry much about compression, ok to measure but dont lean into it — we want basics first like discovery and good robust connectivity. then we will consider CA chunking and compression later.' TASK-99 already MEASURED the compression thesis (near-parity on home uplinks, peers don't beat CDN). This task is a compression follow-on (speedup-restatement / pipelining / iroh-codec) — defer until the discovery + robust-connectivity trunk (TASK-103/151/191/194) is solid. Not next.
+
+PRIORITY RAISED Low->High (owner steer 2026-08-15: 'compression earlier'). Rationale: the measured value thesis shows the peer path only reaches near-parity WITH fast link-compression (raw ~3.07x the CDN's compressed bytes; zstd link-compression ~1.38x residual), so streaming zstd on the libp2p serve path is THE lever that makes peers competitive — pulled ahead of the deferred tournament/CA-chunking. Compression is an UNSIGNED transport field: the addressed unit stays the raw NAR, so this is NOT a frozen-surface change. Distinct from TASK-215 (CA variable-chunking demo spike, later, separate crate). TASK-99 already did the iroh-side negotiated zstd + BoundedZstdDecoder; reuse peer_fabric::codec.
 <!-- SECTION:NOTES:END -->

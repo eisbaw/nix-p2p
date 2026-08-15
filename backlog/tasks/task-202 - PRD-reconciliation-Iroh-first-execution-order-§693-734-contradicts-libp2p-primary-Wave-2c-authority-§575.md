@@ -3,10 +3,10 @@ id: TASK-202
 title: >-
   PRD reconciliation: Iroh-first execution order (§693-734) contradicts
   libp2p-primary Wave-2c authority (§575+)
-status: To Do
+status: Done
 assignee: []
 created_date: '2026-08-14 08:24'
-updated_date: '2026-08-14 21:49'
+updated_date: '2026-08-15 07:07'
 labels:
   - doc
   - direction
@@ -29,3 +29,9 @@ AUTONOMOUS BACKLOG PART DONE 2026-08-14: re-pointed TASK-155's stale iroh dep (1
 
 Raised to High in the Wave-2c cleanup (2026-08-14): this is the keystone reconcile that gates the fate of ~29 now-Low tasks (label deferred-pending-202) across the superseded iroh-as-discovery-gate, premature multi-arm tournament, far-future BitTorrent, and optional-comparator tracks. Normative authority = PRD §634-691 (libp2p-kad mandatory discovery, iroh optional transport only); the stale §693-743 Iroh-first execution order is what this task removes/reconciles. Owner/PRD-gated: the 'is iroh a funded transport arm at all' call is owner product intent — route via mped-architect as Mark-emulator against the PRD, do not ask the owner.
 <!-- SECTION:NOTES:END -->
+
+## Final Summary
+
+<!-- SECTION:FINAL_SUMMARY:BEGIN -->
+DONE (2026-08-15, owner-reviewed diff). Reconciled the stale 'Iroh-first execution order' (PRD §693-743) to the normative libp2p-primary Wave-2c authority (§634-691). Mark-emulator adjudicated it a faithful DRIFT-FIX, not a new product decision: §634-691 already decided iroh has no content-provider routing (category error to use for discovery), libp2p-kad is the mandatory discovery layer (proven TASK-103/126/155), iroh is an optional MEASURED transport. Rewrote the 5-item order to libp2p-primary; removed the iroh-discovery gate that blocked LAN behind an iroh verdict; marked iroh-discovery tasks superseded-for-discovery (matching their deferred-pending-202 labels); kept iroh as optional measured transport so the tournament + dual-stack tags (156/183) are deferred-NOT-cancelled. Preserved §634-691 / privacy contract / frozen surfaces / S1-S2 verbatim. Re-pointed the one stale in-authority citation §683 (132/133/136 -> 126/103). Owner diff-reviewed before commit (74c2a65). Folded in the 2026-08-15 owner steer: link-compression pulled EARLIER (TASK-203 raised High) and CA variable-chunking filed as a later separate-crate spike (TASK-215).
+<!-- SECTION:FINAL_SUMMARY:END -->
