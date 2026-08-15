@@ -3328,13 +3328,17 @@ def scenario_crash_kill_between_narinfo_and_nar(ctx: Ctx, expect) -> None:
 
 
 def scenario_crash_sigstop_stall(ctx: Ctx, expect) -> None:
-    """AC#2: SIGSTOP-style stall (cgroup freeze: no RST/FIN). The daemon is
-    FROZEN mid-NAR, so the client's connection to it goes silent. Nothing in the
-    daemon bounds a stalled body (see upstream.rs / task-25), so recovery relies
-    entirely on nix's client-side `stalled-download-timeout` - which we pin low
-    for a bounded test and MEASURE. The build must still complete via fallback;
-    if the stall exceeded an acceptable bound that is a FINDING (task-25), not a
-    pass."""
+    """AC#2: SIGSTOP-style stall (cgroup freeze: no RST/FIN). The DAEMON ITSELF is
+    FROZEN mid-NAR, so the client's connection to it goes silent. TASK-25 landed a
+    daemon body-idle timeout, but it does NOT govern THIS scenario by construction:
+    the frozen party is the daemon, and a cgroup-frozen process cannot run its own
+    tokio timer - so recovery here still relies entirely on nix's client-side
+    `stalled-download-timeout`, which we pin low for a bounded test and MEASURE. (The
+    daemon body-idle timeout bounds a DIFFERENT fault - daemon ALIVE, its UPSTREAM
+    silent mid-body - which cannot be isolated in this topology because every e2e
+    stall point is shared with the fallback route; it is proven at the daemon boundary
+    by daemon-core `upstream::streaming_bounds_tests` instead.) The build must still
+    complete via fallback within the bound."""
     fixtures = ctx.fixtures
     big = fixtures.store_path(BIG_ATTR)
     big_size = _host_nar_size(fixtures, BIG_ATTR)
@@ -3394,13 +3398,15 @@ def scenario_crash_sigstop_stall(ctx: Ctx, expect) -> None:
         expect(
             elapsed <= bound_s,
             f"sigstop: recovered within {bound_s}s of the freeze "
-            f"(FINDING for task-25 if exceeded: daemon has no body-idle timeout)",
+            f"(nix-client-bounded: a cgroup-frozen daemon cannot run its own idle timer)",
             f"measured {elapsed:.1f}s (pinned stalled-download-timeout={pinned_timeout_s}s)",
         )
         print(
             f"  sigstop MEASURED: fallback completed {elapsed:.1f}s after the freeze; "
             f"nix stalled-download-timeout pinned to {pinned_timeout_s}s "
-            "(default is 300s - the unbounded hang a daemon body-idle timeout would cap; task-25)"
+            "(the frozen DAEMON is nix-bounded here; the daemon body-idle timeout - "
+            "TASK-25 - bounds a live daemon whose UPSTREAM stalls, proven in "
+            "daemon-core upstream::streaming_bounds_tests)"
         )
 
 

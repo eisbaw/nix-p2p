@@ -58,19 +58,23 @@
 //!     the same origin, so the daemon reaches it; an h2-ONLY upstream still fails
 //!     closed (above). h2/ALPN negotiation remains a later concern.
 
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::Arc;
+use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
-use bytes::Bytes;
+use bytes::{Buf, Bytes};
 use http::Uri;
+use http_body::{Body, Frame};
 use http_body_util::{BodyExt, Empty, Limited};
 use hyper::client::conn::http1;
 use hyper_util::rt::TokioIo;
 use rustls::RootCertStore;
 use rustls::pki_types::ServerName;
 use tokio::net::TcpStream;
-use tokio::time::timeout;
+use tokio::time::{Instant as TokioInstant, Sleep, timeout};
 use tokio_rustls::TlsConnector;
 
 use crate::source::{
@@ -219,6 +223,18 @@ pub const TLS_UPSTREAM_HANDSHAKE_MS: u64 = 5_000;
 /// configured deadline before asserting it fired. NOT part of the deadline.
 pub const TLS_UPSTREAM_SCHEDULER_GRACE_MS: u64 = 1_000;
 
+/// Default per-read NAR body-idle timeout (TASK-25 AC#1). Bounds the time the
+/// daemon will wait for the NEXT body frame from a connected-but-silent upstream
+/// before aborting the stream with a clean error, so a mid-body stall (an upstream
+/// that sends headers then freezes the NAR body, no RST/FIN) fails FAST at the
+/// daemon boundary instead of hanging the daemon->Nix response indefinitely. It is
+/// deliberately generous (30 s) so a slow-but-alive WAN transfer of a large NAR is
+/// never mistaken for a stall - it caps a STALL (no bytes at all), not throughput.
+/// Independent of the TASK-33 header-wait budget, which bounds header ARRIVAL, not
+/// body streaming (see the composing-budget module note). Tests inject a short value
+/// via [`UpstreamHttp::with_body_idle_timeout`] to bite quickly.
+pub const BODY_IDLE_TIMEOUT_MS: u64 = 30_000;
+
 /// The frozen `tls-upstream-v1` connect budget: a whole-operation `total`
 /// deadline (DNS + TCP connect + TLS handshake) with per-stage caps on the
 /// `connect` and `handshake` legs. Each stage waits at most
@@ -326,6 +342,10 @@ pub struct UpstreamHttp {
     authority: String,
     connect_timeout: Duration,
     header_timeout: Duration,
+    /// Per-read NAR body-idle timeout (TASK-25 AC#1): the max wait for the NEXT
+    /// streamed body frame before the transfer is aborted as a stalled body. Bounds
+    /// a mid-body stall at the daemon boundary; see [`BODY_IDLE_TIMEOUT_MS`].
+    body_idle_timeout: Duration,
     transport: Transport,
     /// The frozen `tls-upstream-v1` connect budget; used only on the TLS path.
     tls_budget: TlsBudget,
@@ -382,6 +402,7 @@ impl UpstreamHttp {
             // Short by design (AC#6): a down upstream fails clean, fast.
             connect_timeout: Duration::from_millis(1000),
             header_timeout: Duration::from_millis(1000),
+            body_idle_timeout: Duration::from_millis(BODY_IDLE_TIMEOUT_MS),
             transport: Transport::Plain,
             tls_budget: TlsBudget::tls_upstream_v1(),
         }
@@ -397,6 +418,7 @@ impl UpstreamHttp {
             port,
             connect_timeout: Duration::from_millis(1000),
             header_timeout: Duration::from_millis(1000),
+            body_idle_timeout: Duration::from_millis(BODY_IDLE_TIMEOUT_MS),
             transport: Transport::Tls {
                 config: Arc::new(client_config_with_roots(roots)),
                 server_name,
@@ -438,6 +460,16 @@ impl UpstreamHttp {
     /// operator (and the e2e boundary pin) move the L-vs-budget ceiling.
     pub fn with_header_timeout(mut self, header_timeout: Duration) -> Self {
         self.header_timeout = header_timeout;
+        self
+    }
+
+    /// Override the per-read NAR body-idle timeout (default [`BODY_IDLE_TIMEOUT_MS`]).
+    /// Exists so a test can shrink it to bite a mid-body stall quickly, and so an
+    /// operator can tune the stall bound. It bounds only the wait for the NEXT body
+    /// frame - not total transfer time - so a large, slow-but-alive NAR is unaffected
+    /// as long as bytes keep arriving within the window (TASK-25 AC#1).
+    pub fn with_body_idle_timeout(mut self, body_idle_timeout: Duration) -> Self {
+        self.body_idle_timeout = body_idle_timeout;
         self
     }
 
@@ -603,6 +635,11 @@ impl UpstreamHttp {
 
     /// Fetch a small body in full (narinfo): needed so the rewrite allowlist can
     /// be applied and byte-fidelity asserted. Bounded by [`MAX_BUFFERED_BODY`].
+    ///
+    /// KNOWN GAP (TASK-225): unlike [`Self::fetch_streaming`], this buffered read has
+    /// NO body-idle timeout - an upstream that sends narinfo headers then stalls the
+    /// body would hang `collect()`. Lower severity (narinfo is ~1 KB, size-capped),
+    /// but the same S2 no-hang bound belongs here; filed as TASK-225.
     async fn fetch_buffered(
         &self,
         path: &str,
@@ -623,43 +660,292 @@ impl UpstreamHttp {
         })
     }
 
-    /// Fetch a body by streaming it straight through (NAR, passthrough): the
-    /// body never sits whole in memory.
+    /// Fetch a body by streaming it straight through (NAR, passthrough): the body
+    /// never sits whole in memory. The returned body is wrapped in a [`BoundedBody`]
+    /// that enforces two bounds AS BYTES ARRIVE (TASK-25):
     ///
-    /// `expected_size` is deliberately NOT enforced here (see `_expected_size`).
-    /// The PRD-risk-6 abort is a defense against *untrusted peers* claiming a huge
-    /// blob; wave-1's upstream is the trusted cache.nixos.org, which poses no such
-    /// threat. Worse, the bound would be wrong-unit: `expected_size` is the signed
-    /// NarSize (the raw, uncompressed NAR - the wave-2 addressed unit), but this
-    /// HTTP path downloads the *compressed* file, whose length is FileSize.
-    /// FileSize can exceed NarSize for tiny/incompressible NARs (container
-    /// overhead), so enforcing NarSize here would 502 legitimate content. The
-    /// abort belongs to the wave-2 NarSource, which transfers the raw NAR and for
-    /// which NarSize is the right bound (task-25). `expected_size` still crosses
-    /// the seam so that source has it.
+    /// AC#1 - a per-read BODY-IDLE TIMEOUT ([`Self::body_idle_timeout`]): a connected
+    /// upstream that sends headers then STALLS the body (no RST/FIN - a cgroup-freeze
+    /// / black-hole) is aborted with a clean bounded error at the daemon boundary,
+    /// so the daemon->Nix response never hangs. `connect_timeout`/`header_timeout`
+    /// only bounded connect + header arrival before this.
     ///
-    /// Scope limit (honest gap): `connect_timeout`/`header_timeout` bound connect
-    /// and header arrival, but NOTHING here bounds an upstream that sends headers
-    /// then stalls the body indefinitely - the response to Nix would hang. The
-    /// fault suite exercises only terminating faults (reset/truncate/latency), so
-    /// the open-ended stall is untested. A per-read/idle timeout (and the wave-2
-    /// throughput-abort hedge) is filed as task-25; wave-1 "no hang on the build
-    /// path" therefore holds for connect/header failures, not body stalls.
+    /// AC#2 - a per-chunk TRANSPORT-BYTE cap (the PRD-risk-6 oversized-transfer abort):
+    /// cumulative ON-WIRE body bytes are bounded, and a transfer that streams MORE is
+    /// cut off mid-stream (not merely a Content-Length PRE-check, which cannot catch a
+    /// body that lies by streaming past its own declared length).
+    ///
+    /// THE UNIT (the NarSize-vs-FileSize trap - recurred 5x; read [`compute_transport_cap`]):
+    /// the streamed body is the ON-WIRE TRANSPORT representation, whose byte-unit is
+    /// FileSize (COMPRESSED for a `.nar.xz`; equal to NarSize only for a raw `.nar`).
+    /// The cap is therefore a TRANSPORT-unit quantity = `min(Content-Length,
+    /// signed_raw_cap)`, where `signed_raw_cap` is the signed NarSize (`expected_size`)
+    /// ADMITTED ONLY when the on-wire body is proven RAW (so FileSize == NarSize, a
+    /// like-for-like comparison). A COMPRESSED body is NEVER bounded by the signed
+    /// NarSize here - that is the exact recurred bug (FileSize can exceed NarSize for a
+    /// tiny/incompressible NAR, which would 502 legitimate content). The signed
+    /// uncompressed NarSize guarantee on a compressed transfer is enforced DOWNSTREAM
+    /// by Nix's NarHash/NarSize gate (the ultimate arbiter), and for untrusted p2p
+    /// peers - who stream the RAW nar - by the fabric's mid-stream NarSize abort
+    /// (`peer-fabric`/`fabric-libp2p`), where NarSize IS the on-wire unit.
     async fn fetch_streaming(
         &self,
         path: &str,
-        _expected_size: Option<u64>,
+        expected_size: Option<u64>,
         budget: Option<Duration>,
     ) -> Result<UpstreamResponse, SourceError> {
         let response = self.send(path, budget).await?;
         let status = response.status().as_u16();
         let headers = response.headers().clone();
-        let body = response.into_body().map_err(std::io::Error::other).boxed();
+        // TASK-25 AC#2: the TRANSPORT-unit streaming byte cap (integer bytes; no floats).
+        let byte_cap = compute_transport_cap(path, &headers, expected_size);
+        let inner = response.into_body().map_err(std::io::Error::other);
+        let body = BoundedBody::new(
+            inner,
+            self.body_idle_timeout,
+            byte_cap,
+            self.authority.clone(),
+        )
+        .boxed();
         Ok(UpstreamResponse {
             status,
             headers,
             body,
         })
+    }
+}
+
+/// The ON-WIRE TRANSPORT-unit streaming byte cap for a NAR/passthrough body
+/// (TASK-25 AC#2), computed like-for-like so the NarSize-vs-FileSize trap cannot
+/// recur. Returns `None` when no same-unit bound is available (an unbounded stream
+/// is then bounded only by the body-idle timeout above and by Nix downstream).
+///
+/// The streamed body is the on-wire TRANSPORT representation. Two same-unit bounds
+/// may apply, and the tighter wins:
+///   * `Content-Length` - the upstream's own declared on-wire byte count (= the
+///     narinfo FileSize for a compressed NAR). Always the on-wire unit by definition,
+///     so it is a valid cap for the on-wire body whatever the compression. It bites a
+///     body that streams MORE than it declared.
+///   * `signed_raw_cap` - the SIGNED NarSize (`expected_size`) ADMITTED ONLY when the
+///     on-wire body is proven RAW (`/nar/<h>.nar` AND no non-identity `Content-Encoding`),
+///     because ONLY THEN is the on-wire byte the raw-NAR byte and FileSize == NarSize. For
+///     a COMPRESSED body the on-wire byte is a FileSize byte and the signed NarSize is the
+///     WRONG unit (the 5x-recurred bug) - so it is NOT admitted, and the signed guarantee
+///     is enforced by Nix downstream.
+///
+/// TRUST DEPENDENCY (stated so it is not mistaken for a cryptographic proof): "on-wire is
+/// raw" rests on the upstream being HONEST that a `.nar` token with no content-coding is
+/// genuinely uncompressed. A dishonest/malformed TRUSTED upstream serving compressed bytes
+/// at a bare `.nar` URL would be already broken end-to-end (Nix expects `Compression: none`
+/// there and cannot decompress it), so no LEGITIMATE content is lost - and UNTRUSTED peers
+/// never traverse this HTTP path (they fetch the raw NAR over the fabric, which enforces the
+/// signed NarSize itself). So the recurred bug cannot bite a real transfer, but the bound is
+/// admitted on transport metadata, not a decoded-length proof.
+fn compute_transport_cap(
+    path: &str,
+    headers: &http::HeaderMap,
+    expected_size: Option<u64>,
+) -> Option<u64> {
+    let content_length = content_length_of(headers);
+    let on_wire_is_raw = path_is_raw_nar(path) && !is_content_encoded(headers);
+    // NarSize is a like-for-like on-wire bound ONLY for a raw body; never for compressed.
+    let signed_raw_cap = if on_wire_is_raw { expected_size } else { None };
+    min_opt(content_length, signed_raw_cap)
+}
+
+/// True if the response declares a NON-identity `Content-Encoding` - an ACTUAL on-wire
+/// transform that makes the body no longer the raw NAR. Absent, empty, or exactly
+/// `identity` (the RFC no-op coding) is NOT encoded, so a raw `.nar` body stays raw and
+/// keeps its signed-NarSize bound. Any other token (`gzip`, `br`, ...), or a comma list
+/// that contains one, means encoded. Mirrors [`crate::source::has_unsupported_transfer_coding`]'s
+/// tokenisation so the two agree on what a coding token is.
+fn is_content_encoded(headers: &http::HeaderMap) -> bool {
+    for value in headers.get_all(http::header::CONTENT_ENCODING) {
+        for token in value.as_bytes().split(|&b| b == b',') {
+            let t = crate::source::ascii_lower_trim(token);
+            if !t.is_empty() && t.as_slice() != b"identity" {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// The upstream response's declared `Content-Length` in bytes - the ON-WIRE
+/// TRANSPORT byte count (the narinfo FileSize for a compressed NAR) - or `None`
+/// when absent/malformed (e.g. a chunked response). This is the like-for-like
+/// unit for the streamed on-wire body regardless of compression.
+fn content_length_of(headers: &http::HeaderMap) -> Option<u64> {
+    headers
+        .get(http::header::CONTENT_LENGTH)?
+        .to_str()
+        .ok()?
+        .trim()
+        .parse()
+        .ok()
+}
+
+/// True when `path` addresses the RAW (uncompressed) NAR endpoint
+/// (`/nar/<narhash>.nar`, `Compression: none`), so the ON-WIRE body IS the raw NAR
+/// and FileSize == NarSize. A compressed token (`.nar.xz`, `.nar.zst`, ...) ends in
+/// its compression suffix, not `.nar`, so its on-wire bytes are FileSize (compressed),
+/// for which the signed NarSize is the WRONG unit. A non-`/nar/` passthrough path
+/// (`log/*`, `*.ls`) is never a raw NAR.
+fn path_is_raw_nar(path: &str) -> bool {
+    match path.strip_prefix("/nar/") {
+        Some(token) => token.ends_with(".nar"),
+        None => false,
+    }
+}
+
+/// The tighter of two OPTIONAL like-for-like byte caps (integer bytes; no floats).
+/// `None` means "no cap from this source"; the result is the min of whichever are
+/// present, or `None` when neither is.
+fn min_opt(a: Option<u64>, b: Option<u64>) -> Option<u64> {
+    match (a, b) {
+        (Some(a), Some(b)) => Some(a.min(b)),
+        (Some(a), None) => Some(a),
+        (None, b) => b,
+    }
+}
+
+/// A streamed upstream body wrapped with two AS-BYTES-ARRIVE bounds (TASK-25):
+///
+///   * a per-read IDLE timeout (`idle`): if the next frame does not arrive within
+///     `idle`, the stream aborts with a `TimedOut` error (AC#1 - a mid-body stall
+///     fails fast at the daemon boundary, never a hang);
+///   * a cumulative TRANSPORT-byte cap (`byte_cap`, in the SAME on-wire unit as the
+///     streamed bytes - see [`compute_transport_cap`]): the instant cumulative body
+///     bytes EXCEED it, the stream aborts with an oversized-transfer error and the
+///     over-cap frame is dropped rather than forwarded (AC#2).
+///
+/// Both are streaming aborts: once one fires the body ends. The daemon has already
+/// sent the 200 + partial body to Nix, so an abort surfaces as a truncated/failed
+/// download that Nix retries / falls back on (S2) - never wrong or unbounded bytes.
+struct BoundedBody<B> {
+    inner: B,
+    idle: Duration,
+    /// Re-armed on each delivered frame; fires on `idle` of silence.
+    deadline: Pin<Box<Sleep>>,
+    /// Lazily armed on the first poll so the construct->first-poll scheduling gap
+    /// is not mistaken for upstream silence.
+    armed: bool,
+    /// TRANSPORT-unit cumulative-byte cap, or `None` for no size bound.
+    byte_cap: Option<u64>,
+    /// Cumulative ON-WIRE body bytes seen so far (same unit as `byte_cap`).
+    seen: u64,
+    /// For the error message: which upstream stalled / overflowed.
+    authority: String,
+    /// Fuse: once an abort fires (or the inner body ends), stay ended.
+    ended: bool,
+}
+
+impl<B> BoundedBody<B> {
+    fn new(inner: B, idle: Duration, byte_cap: Option<u64>, authority: String) -> Self {
+        BoundedBody {
+            inner,
+            idle,
+            // Armed lazily on the first poll (see `armed`); this initial deadline is
+            // overwritten there, so its value is immaterial.
+            deadline: Box::pin(tokio::time::sleep(idle)),
+            armed: false,
+            byte_cap,
+            seen: 0,
+            authority,
+            ended: false,
+        }
+    }
+}
+
+impl<B> Body for BoundedBody<B>
+where
+    B: Body<Data = Bytes, Error = std::io::Error> + Unpin,
+{
+    type Data = Bytes;
+    type Error = std::io::Error;
+
+    fn poll_frame(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<Result<Frame<Bytes>, std::io::Error>>> {
+        let this = self.get_mut();
+        if this.ended {
+            return Poll::Ready(None);
+        }
+        // Arm the idle clock at the first poll (not at construction) so scheduling
+        // latency before the first poll is not counted as upstream silence.
+        if !this.armed {
+            this.deadline
+                .as_mut()
+                .reset(TokioInstant::now() + this.idle);
+            this.armed = true;
+        }
+        match Pin::new(&mut this.inner).poll_frame(cx) {
+            Poll::Ready(Some(Ok(frame))) => {
+                // Progress: re-arm the idle clock for the wait until the NEXT frame.
+                this.deadline
+                    .as_mut()
+                    .reset(TokioInstant::now() + this.idle);
+                if let Some(data) = frame.data_ref() {
+                    let n = data.remaining() as u64;
+                    this.seen = this.seen.saturating_add(n);
+                    if let Some(cap) = this.byte_cap
+                        && this.seen > cap
+                    {
+                        // Over the TRANSPORT bound: abort mid-stream and DROP the
+                        // over-cap frame (never forward oversized bytes). LOG it
+                        // (fail-verbose): the serving-layer success line was already
+                        // emitted on the 200 headers, and an upstream streaming past
+                        // its declared/signed size is exactly the PRD-risk-6 signal an
+                        // operator must see - hyper does not surface a body-stream error.
+                        this.ended = true;
+                        let msg = format!(
+                            "upstream {} streamed {} on-wire body bytes, over the \
+                             {}-byte transport bound (declared Content-Length / signed \
+                             raw NarSize); aborting mid-stream (TASK-25 PRD-risk-6)",
+                            this.authority, this.seen, cap
+                        );
+                        eprintln!("daemon: {msg}");
+                        return Poll::Ready(Some(Err(std::io::Error::other(msg))));
+                    }
+                }
+                Poll::Ready(Some(Ok(frame)))
+            }
+            Poll::Ready(Some(Err(e))) => {
+                this.ended = true;
+                Poll::Ready(Some(Err(e)))
+            }
+            Poll::Ready(None) => {
+                this.ended = true;
+                Poll::Ready(None)
+            }
+            Poll::Pending => {
+                // No frame ready: enforce the per-read idle bound.
+                match this.deadline.as_mut().poll(cx) {
+                    Poll::Ready(()) => {
+                        this.ended = true;
+                        // Fail-verbose: the 200 success line was already logged on the
+                        // headers, so log the stall abort too or it is invisible.
+                        let msg = format!(
+                            "upstream {} stalled mid-body: no data for {} ms \
+                             (TASK-25 body-idle timeout)",
+                            this.authority,
+                            this.idle.as_millis()
+                        );
+                        eprintln!("daemon: {msg}");
+                        Poll::Ready(Some(Err(std::io::Error::new(
+                            std::io::ErrorKind::TimedOut,
+                            msg,
+                        ))))
+                    }
+                    Poll::Pending => Poll::Pending,
+                }
+            }
+        }
+    }
+
+    fn is_end_stream(&self) -> bool {
+        self.ended
     }
 }
 
@@ -888,6 +1174,106 @@ mod tests {
         assert_eq!(default.total, v1.total);
         assert_eq!(default.connect, v1.connect);
         assert_eq!(default.handshake, v1.handshake);
+    }
+
+    // --- TASK-25 AC#2: the TRANSPORT-unit cap arithmetic, unit-labelled ---------
+
+    fn headers_with(pairs: &[(&str, &str)]) -> http::HeaderMap {
+        let mut h = http::HeaderMap::new();
+        for (k, v) in pairs {
+            h.insert(
+                http::HeaderName::from_bytes(k.as_bytes()).unwrap(),
+                v.parse().unwrap(),
+            );
+        }
+        h
+    }
+
+    #[test]
+    fn path_is_raw_nar_only_for_uncompressed_tokens() {
+        // Raw endpoint: on-wire == raw NAR, FileSize == NarSize.
+        assert!(path_is_raw_nar("/nar/06rgb.nar"));
+        // Compressed tokens end in their compression suffix, NOT `.nar`.
+        assert!(!path_is_raw_nar("/nar/15m2z.nar.xz"));
+        assert!(!path_is_raw_nar("/nar/1nn85.nar.zst"));
+        // Passthrough paths are never a raw NAR.
+        assert!(!path_is_raw_nar("/log/foo"));
+        assert!(!path_is_raw_nar("/foo.ls"));
+    }
+
+    #[test]
+    fn min_opt_takes_the_tighter_present_cap() {
+        assert_eq!(min_opt(Some(10), Some(4)), Some(4));
+        assert_eq!(min_opt(Some(4), Some(10)), Some(4));
+        assert_eq!(min_opt(Some(7), None), Some(7));
+        assert_eq!(min_opt(None, Some(7)), Some(7));
+        assert_eq!(min_opt(None, None), None);
+    }
+
+    #[test]
+    fn transport_cap_never_uses_narsize_on_a_compressed_body() {
+        // THE ANTI-TRAP (NarSize vs FileSize): a compressed `.nar.xz` on-wire body
+        // whose FileSize (300) EXCEEDS the signed NarSize (100). The signed NarSize
+        // must NOT bound it - only the transport Content-Length may. Using NarSize
+        // here (300 > 100) would falsely abort a legitimate transfer.
+        let h = headers_with(&[("content-length", "300")]);
+        assert_eq!(
+            compute_transport_cap("/nar/abc.nar.xz", &h, Some(100)),
+            Some(300),
+            "a compressed body is bounded by its FileSize Content-Length, never the uncompressed NarSize"
+        );
+        // No Content-Length (chunked, compressed): NO cap - NarSize is the wrong unit
+        // and there is no transport bound. Bounded downstream by Nix + the idle timeout.
+        assert_eq!(
+            compute_transport_cap("/nar/abc.nar.xz", &http::HeaderMap::new(), Some(100)),
+            None
+        );
+    }
+
+    #[test]
+    fn transport_cap_admits_narsize_only_for_a_raw_body() {
+        // Raw `.nar` on-wire body: FileSize == NarSize, so the signed NarSize IS a
+        // like-for-like bound. With no Content-Length (chunked raw) the NarSize is
+        // the cap - this is where the SIGNED bound bites at the HTTP layer.
+        assert_eq!(
+            compute_transport_cap("/nar/abc.nar", &http::HeaderMap::new(), Some(100)),
+            Some(100)
+        );
+        // With BOTH present the tighter wins (both are the on-wire unit here).
+        let h = headers_with(&[("content-length", "120")]);
+        assert_eq!(
+            compute_transport_cap("/nar/abc.nar", &h, Some(100)),
+            Some(100)
+        );
+        let h = headers_with(&[("content-length", "80")]);
+        assert_eq!(
+            compute_transport_cap("/nar/abc.nar", &h, Some(100)),
+            Some(80)
+        );
+    }
+
+    #[test]
+    fn transport_cap_rejects_narsize_when_a_raw_token_is_content_encoded() {
+        // Defence: a raw `.nar` token but the upstream slapped a Content-Encoding on
+        // the wire -> the on-wire bytes are NO LONGER raw NAR bytes, so NarSize is not
+        // their unit. Only the transport Content-Length may bound them.
+        let h = headers_with(&[("content-length", "50"), ("content-encoding", "gzip")]);
+        assert_eq!(
+            compute_transport_cap("/nar/abc.nar", &h, Some(100)),
+            Some(50)
+        );
+        let h = headers_with(&[("content-encoding", "gzip")]);
+        assert_eq!(compute_transport_cap("/nar/abc.nar", &h, Some(100)), None);
+        // `identity` is the RFC no-op coding: the body is STILL raw, so the NarSize
+        // bound is KEPT (a real like-for-like bound must not be discarded).
+        let h = headers_with(&[("content-encoding", "identity")]);
+        assert_eq!(
+            compute_transport_cap("/nar/abc.nar", &h, Some(100)),
+            Some(100)
+        );
+        // A comma list containing a real coding is encoded -> bound dropped.
+        let h = headers_with(&[("content-encoding", "identity, gzip")]);
+        assert_eq!(compute_transport_cap("/nar/abc.nar", &h, Some(100)), None);
     }
 }
 
@@ -1124,6 +1510,7 @@ mod tls_tests {
             authority: validated_name.to_string(),
             connect_timeout: Duration::from_millis(1000),
             header_timeout: Duration::from_millis(1000),
+            body_idle_timeout: Duration::from_millis(BODY_IDLE_TIMEOUT_MS),
             transport: Transport::Tls {
                 config,
                 server_name: ServerName::try_from(validated_name.to_string())
@@ -1626,6 +2013,269 @@ mod budget_tests {
         assert!(
             elapsed < Duration::from_millis(2000),
             "a dead hop fails fast on connect, NOT after the 5000ms budget; took {elapsed:?}"
+        );
+    }
+}
+
+/// TASK-25: the streamed-body bounds (`fetch_streaming` / [`BoundedBody`]) proven
+/// against IN-PROCESS mock upstreams on loopback - the daemon-boundary oracle for a
+/// mid-body stall (AC#1) and an oversized/lying transfer (AC#2). These drive the
+/// PLAIN transport (the loopback fixtures below speak raw HTTP/1.1) with a shrunk
+/// `body_idle_timeout` so a stall bites in milliseconds. Each abort carries its OWN
+/// bite control (remove the bound -> the body flows / hangs) so the tests fail if
+/// the bound is decorative.
+#[cfg(test)]
+mod streaming_bounds_tests {
+    use super::*;
+
+    use std::net::SocketAddr;
+
+    use http_body_util::BodyExt;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
+
+    /// A PLAIN `UpstreamHttp` pointed at loopback `addr`, with `idle` as its
+    /// body-idle timeout. Constructed field-by-field (like `tls_client`) so tests
+    /// can inject a short timeout the public constructors do not expose.
+    fn plain_client(addr: SocketAddr, idle: Duration) -> UpstreamHttp {
+        UpstreamHttp {
+            host: addr.ip().to_string(),
+            port: addr.port(),
+            authority: "mock-upstream".to_string(),
+            connect_timeout: Duration::from_millis(1000),
+            header_timeout: Duration::from_millis(1000),
+            body_idle_timeout: idle,
+            transport: Transport::Plain,
+            tls_budget: TlsBudget::tls_upstream_v1(),
+        }
+    }
+
+    /// Read a request's headers off `sock` (up to the blank line) and discard them.
+    async fn read_request<S: AsyncReadExt + Unpin>(sock: &mut S) {
+        let mut acc = Vec::new();
+        let mut buf = [0u8; 1024];
+        loop {
+            match sock.read(&mut buf).await {
+                Ok(0) => return,
+                Ok(n) => {
+                    acc.extend_from_slice(&buf[..n]);
+                    if acc.windows(4).any(|w| w == b"\r\n\r\n") {
+                        return;
+                    }
+                }
+                Err(_) => return,
+            }
+        }
+    }
+
+    /// A loopback upstream that answers with a CHUNKED body of exactly `total`
+    /// bytes (in 512-byte chunks), then the terminating chunk + ordered close. No
+    /// `Content-Length` - so the ONLY size bound is the caller's transport cap.
+    async fn spawn_chunked_bytes(total: usize) -> SocketAddr {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        tokio::spawn(async move {
+            let Ok((mut sock, _)) = listener.accept().await else {
+                return;
+            };
+            read_request(&mut sock).await;
+            if sock
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Type: application/x-nix-nar\r\n\
+                      Transfer-Encoding: chunked\r\n\r\n",
+                )
+                .await
+                .is_err()
+            {
+                return;
+            }
+            let payload = [b'x'; 512];
+            let mut remaining = total;
+            while remaining > 0 {
+                let n = remaining.min(512);
+                let hdr = format!("{n:x}\r\n");
+                if sock.write_all(hdr.as_bytes()).await.is_err()
+                    || sock.write_all(&payload[..n]).await.is_err()
+                    || sock.write_all(b"\r\n").await.is_err()
+                {
+                    return; // client aborted (the cap fired) - stop writing.
+                }
+                remaining -= n;
+            }
+            let _ = sock.write_all(b"0\r\n\r\n").await;
+            let _ = sock.flush().await;
+            let _ = sock.shutdown().await;
+        });
+        addr
+    }
+
+    /// A loopback upstream that sends response headers + ONE chunk of `prefix`
+    /// bytes, then STALLS: it holds the socket open forever, sending nothing more
+    /// and never closing (no RST/FIN) - the SIGSTOP-style silent mid-body stall.
+    async fn spawn_stall(prefix: Vec<u8>) -> SocketAddr {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        tokio::spawn(async move {
+            let Ok((mut sock, _)) = listener.accept().await else {
+                return;
+            };
+            read_request(&mut sock).await;
+            let _ = sock
+                .write_all(b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n")
+                .await;
+            let _ = sock
+                .write_all(format!("{:x}\r\n", prefix.len()).as_bytes())
+                .await;
+            let _ = sock.write_all(&prefix).await;
+            let _ = sock.write_all(b"\r\n").await;
+            let _ = sock.flush().await;
+            // Silent stall: hold the connection open, send nothing, never close.
+            tokio::time::sleep(Duration::from_secs(3600)).await;
+            drop(sock);
+        });
+        addr
+    }
+
+    /// Drain a body to completion, counting bytes; return the first body error.
+    async fn drain(body: crate::source::NarBody) -> Result<usize, std::io::Error> {
+        let mut body = body;
+        let mut total = 0usize;
+        while let Some(frame) = body.frame().await {
+            let frame = frame?;
+            if let Some(data) = frame.data_ref() {
+                total += data.len();
+            }
+        }
+        Ok(total)
+    }
+
+    #[tokio::test]
+    async fn body_idle_timeout_bounds_a_midstream_stall() {
+        // AC#1: an upstream that sends headers + partial body then STALLS yields a
+        // clean bounded error at the daemon boundary, not a hang.
+        let addr = spawn_stall(b"nix-archive-1 partial NAR".to_vec()).await;
+        let client = plain_client(addr, Duration::from_millis(200));
+        let resp = client
+            .fetch_streaming("/nar/abc.nar.xz", None, None)
+            .await
+            .expect("headers arrive before the stall");
+        assert_eq!(resp.status, 200);
+
+        let start = std::time::Instant::now();
+        let drained = drain(resp.body).await;
+        let elapsed = start.elapsed();
+
+        let err = drained.expect_err("a mid-body stall must abort, not hang");
+        assert_eq!(
+            err.kind(),
+            std::io::ErrorKind::TimedOut,
+            "the abort must be the body-idle timeout, got: {err}"
+        );
+        assert!(
+            elapsed < Duration::from_secs(3),
+            "the 200ms idle timeout must bound the stall; took {elapsed:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn without_the_idle_timeout_the_same_stall_would_hang() {
+        // BITE CONTROL for AC#1: the SAME silent stall, but with the idle timeout
+        // effectively disabled, does NOT complete within a generous window - proving
+        // the short timeout in the sibling test is what bounds the stall, not the
+        // mock closing on its own.
+        let addr = spawn_stall(b"partial".to_vec()).await;
+        let client = plain_client(addr, Duration::from_secs(3600));
+        let resp = client
+            .fetch_streaming("/nar/abc.nar.xz", None, None)
+            .await
+            .expect("headers arrive");
+        let outcome = tokio::time::timeout(Duration::from_millis(800), drain(resp.body)).await;
+        assert!(
+            outcome.is_err(),
+            "with the idle timeout disabled the stalled body must still be pending, \
+             not aborted/closed"
+        );
+    }
+
+    #[tokio::test]
+    async fn raw_nar_body_over_signed_narsize_is_aborted_midstream() {
+        // AC#2 (unit-correct): a RAW `.nar` on-wire body streaming MORE raw bytes
+        // than the signed NarSize is cut off mid-stream. On-wire bytes ARE raw-NAR
+        // bytes here, so NarSize is the like-for-like bound (FileSize == NarSize).
+        let nar_size = 1000u64;
+        let oversize = 4096usize;
+
+        let addr = spawn_chunked_bytes(oversize).await;
+        let client = plain_client(addr, Duration::from_secs(30));
+        let resp = client
+            .fetch_streaming("/nar/deadbeef.nar", Some(nar_size), None)
+            .await
+            .expect("headers arrive");
+        let drained = drain(resp.body).await;
+        assert!(
+            drained.is_err(),
+            "a raw body exceeding the signed NarSize must abort mid-stream, got {drained:?}"
+        );
+
+        // BITE CONTROL: the SAME oversize body with NO cap -> every byte flows through.
+        let addr2 = spawn_chunked_bytes(oversize).await;
+        let client2 = plain_client(addr2, Duration::from_secs(30));
+        let resp2 = client2
+            .fetch_streaming("/nar/deadbeef.nar", None, None)
+            .await
+            .expect("headers arrive");
+        let n = drain(resp2.body)
+            .await
+            .expect("no cap -> whole body streams");
+        assert_eq!(
+            n, oversize,
+            "without the cap the entire oversize body streams through (the cap is not decorative)"
+        );
+    }
+
+    #[tokio::test]
+    async fn raw_nar_body_of_exactly_narsize_streams_uncut() {
+        // The strict `>` boundary: a raw body of EXACTLY the signed NarSize must
+        // stream to completion, never aborted (guards the strict `>` against a future
+        // `>=` regression that would 502 legitimate exactly-sized content).
+        let nar_size = 2048u64;
+        let addr = spawn_chunked_bytes(nar_size as usize).await;
+        let client = plain_client(addr, Duration::from_secs(30));
+        let resp = client
+            .fetch_streaming("/nar/deadbeef.nar", Some(nar_size), None)
+            .await
+            .expect("headers arrive");
+        let n = drain(resp.body)
+            .await
+            .expect("a raw body of exactly NarSize must NOT abort");
+        assert_eq!(
+            n, nar_size as usize,
+            "the exactly-at-cap body streams uncut"
+        );
+    }
+
+    #[tokio::test]
+    async fn compressed_nar_body_is_not_bounded_by_uncompressed_narsize() {
+        // THE ANTI-TRAP end to end: a `.nar.xz` on-wire body whose COMPRESSED
+        // FileSize (3072) exceeds the signed uncompressed NarSize (1000). Comparing
+        // compressed on-wire bytes to the uncompressed NarSize is the 5x-recurred bug
+        // and would falsely abort. It must stream verbatim; the signed guarantee is
+        // enforced by Nix downstream. (No Content-Length here, so the only candidate
+        // cap is the - correctly rejected - NarSize.)
+        let nar_size = 1000u64;
+        let on_wire = 3072usize;
+        let addr = spawn_chunked_bytes(on_wire).await;
+        let client = plain_client(addr, Duration::from_secs(30));
+        let resp = client
+            .fetch_streaming("/nar/deadbeef.nar.xz", Some(nar_size), None)
+            .await
+            .expect("headers arrive");
+        let n = drain(resp.body)
+            .await
+            .expect("a compressed body must NOT be capped by the uncompressed NarSize");
+        assert_eq!(
+            n, on_wire,
+            "compressed on-wire bytes stream verbatim; NarSize is the wrong unit for them"
         );
     }
 }
