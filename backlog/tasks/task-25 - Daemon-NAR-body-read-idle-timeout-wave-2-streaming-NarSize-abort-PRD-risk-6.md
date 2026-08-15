@@ -7,7 +7,7 @@ status: In Progress
 assignee:
   - '@claude'
 created_date: '2026-08-08 08:16'
-updated_date: '2026-08-15 21:46'
+updated_date: '2026-08-15 21:57'
 labels:
   - wave1-followup
   - daemon
@@ -28,8 +28,8 @@ Two related gaps carried from TASK-4 (daemon/src/upstream.rs fetch_streaming):
 
 ## Acceptance Criteria
 <!-- AC:BEGIN -->
-- [ ] #1 an upstream that stalls mid-NAR yields a clean error within a bounded time, not a hang
-- [ ] #2 expected_size is populated from the signed narinfo and a transfer exceeding it is aborted mid-stream (per-chunk, not just Content-Length pre-check)
+- [x] #1 an upstream that stalls mid-NAR yields a clean error within a bounded time, not a hang
+- [x] #2 expected_size is populated from the signed narinfo and a transfer exceeding it is aborted mid-stream (per-chunk, not just Content-Length pre-check)
 <!-- AC:END -->
 
 ## Implementation Notes
@@ -72,4 +72,18 @@ FIXES APPLIED from the review (re-gated green):
 - LOW: added a happy-path streaming test (raw NAR of EXACTLY NarSize streams uncut) guarding the strict > against a future >= regression.
 - LOW: documented the TRUST DEPENDENCY of the raw-determinant (rests on upstream honesty about suffix-vs-encoding; a dishonest trusted upstream is already broken end-to-end and untrusted peers never traverse this HTTP path).
 Deferred (reviewer agreed no change needed): size_hint passthrough.
+
+FINAL (commit 0f19166, not pushed):
+- AC#1 idle timeout: BoundedBody per-read idle bound aborts a silent mid-body stall at the daemon boundary. Biting tests: body_idle_timeout_bounds_a_midstream_stall (+ bite control without_the_idle_timeout_the_same_stall_would_hang).
+- AC#2 streaming size abort: per-chunk transport-unit cap = min(Content-Length, signed_raw_cap). expected_size(NarSize) admitted ONLY for a proven-raw on-wire body. Biting tests: raw_nar_body_over_signed_narsize_is_aborted_midstream (+ no-cap bite control), compressed_nar_body_is_not_bounded_by_uncompressed_narsize (ANTI-TRAP), raw_nar_body_of_exactly_narsize_streams_uncut (strict-> boundary). expected_size population pre-existing at seam (server.rs), covered by nar_source_seam.rs.
+- UNIT each abort uses: compressed on-wire body -> bounded by Content-Length (FileSize) ONLY, never NarSize; raw on-wire body -> bounded by NarSize (== FileSize, like-for-like). Signed uncompressed NarSize on a compressed transfer is enforced downstream by Nix + by fabric-libp2p for untrusted peers.
+- Gate (actual): cargo fmt --check 0; clippy -p daemon-core -p daemon --all-targets -D warnings 0; check-no-floats 0; cargo test -p daemon-core 195 pass/0 fail/1 ignored(network); cargo test -p daemon all pass; just e2e 5/5 scenarios PASS (74.2s); crash-sigstop-stall 7/7 PASS.
+- Follow-up filed: TASK-225 (narinfo fetch_buffered stall gap, referenced in code).
+- Honest limits: the raw-determinant rests on upstream honesty (trust dependency, documented); Content-Length-only cap for a compressed CHUNKED runaway is bounded by Nix downstream, not at this layer (correct unit-wise). e2e cannot isolate the daemon idle timer (frozen-daemon scenario + shared fallback route), hence the Rust in-process oracle.
+
+DEEP gate (codex) NO-GO, reopened. The NarSize-vs-FileSize unit trap RECURRED (6th time) in a subtle form.
+FINDING 1 (HIGH/GATE - must fix): raw-body detection at upstream.rs:749/794 (path_is_raw_nar) classifies a body as RAW from the .nar URL SUFFIX + no non-identity HTTP Content-Encoding. But Nix's narinfo Compression field is INDEPENDENT of the URL suffix: a spec-valid narinfo can be URL:nar/object.nar + Compression:xz (an xz archive has NO HTTP Content-Encoding - xz is the Nix archive representation, not an HTTP content-coding). So path_is_raw_nar returns true, admits NarSize as the cap, and a LEGITIMATE compressed transfer is ABORTED (cap = min(Content-Length=FileSize, NarSize) or just NarSize when Content-Length is absent). ROOT: catalog.rs:118 parses only (url-token, NarHash, NarSize) and DISCARDS the authoritative Compression/FileSize, so the daemon cannot tell the body is compressed and falls back to the suffix heuristic. ROOT FIX (codex): thread the narinfo Compression (and preferably FileSize) through catalog.rs -> server.rs -> upstream.rs; admit NarSize as the raw cap ONLY when Compression==none (the authoritative narinfo field) AND no non-identity HTTP content-coding - NOT the URL suffix. A compressed body is bounded by FileSize/Content-Length, never NarSize. ADD the anti-trap test: URL:nar/x.nar + Compression:xz must NOT be capped by NarSize.
+FINDING 2 (MEDIUM): the size test (upstream.rs:2139/2214) asserts is_err() only - a mutant that errors before forwarding any frame, or forwards the over-cap frame then errors, still passes. Add a test that ASSERTS prior valid frames were forwarded to Nix and the crossing frame was DROPPED (the impl already drops it at 889 - prove it).
+FINDING 3 (MEDIUM): the idle-timeout test (upstream.rs:2153) does not mutation-prove the PER-READ RESET - removing the re-arm would still pass. Add a PACED-body oracle: every inter-frame gap below the idle bound but total transfer time above it must SUCCEED (not time out), and assert the received prefix.
+codex confirmed clean: SIGSTOP e2e wording honest, untrusted peers never reach UpstreamHttp (chain case: upstream daemon builds HTTP metadata after transport verification), compressed-without-Content-Length correctly uncapped, no floats, frozen surface untouched.
 <!-- SECTION:NOTES:END -->
