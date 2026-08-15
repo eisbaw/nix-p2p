@@ -3,11 +3,11 @@ id: TASK-25
 title: >-
   Daemon NAR body-read/idle timeout + wave-2 streaming NarSize abort (PRD risk
   6)
-status: In Progress
+status: Done
 assignee:
   - '@claude'
 created_date: '2026-08-08 08:16'
-updated_date: '2026-08-15 22:50'
+updated_date: '2026-08-15 23:10'
 labels:
   - wave1-followup
   - daemon
@@ -106,4 +106,12 @@ FIXES APPLIED (re-gated green):
 Deferred (endorsed): none outstanding.
 
 Gate after fixes: daemon-core 198; daemon 37 result-lines 0 fail; fmt/clippy-Dwarnings/no-floats 0; just e2e 5/5 PASS. crash-sigstop-stall 7/7 verified on the prior iteration and unaffected by the file_size removal (that scenario uses default transport).
+
+READY FOR CODEX RE-GATE. Root fix landed in 85f0f6b (on top of coordinator reopen eab56e4; not pushed).
+- Author confirmed repo user (Mark Ruvald Pedersen), no AI/co-author credit (hook passed).
+- All 3 codex findings addressed with biting/mutation-proven oracles; round-2 mped+qa reviews green; regression (nar_hash_collision) fixed.
+- Exact unit per cap now: RAW (narinfo Compression==none AND no non-identity HTTP Content-Encoding) -> min(Content-Length, NarSize); COMPRESSED/HTTP-coded -> Content-Length ONLY (no-cap when absent), NEVER NarSize; Unknown -> fail-safe NOT-raw.
+- Leaving In Progress for codex re-gate to flip to Done.
+
+DEEP gate CLOSED - codex GO (2026-08-16). All 3 NO-GO findings fixed at the ROOT: the on-wire NAR body size cap now derives the unit from the AUTHORITATIVE narinfo Compression (threaded narinfo->catalog->server->resolve->fetch_streaming; path_is_raw_nar deleted; Unknown->not-raw fail-safe), so NarSize (uncompressed) is the cap ONLY for Compression:none + no non-identity HTTP content-coding, and a compressed body is bounded by Content-Length only, never NarSize (the 6th unit-trap recurrence closed). Body-idle timeout is per-read (paced-body mutation-proven); the size abort forwards the valid prefix then drops the crossing frame (mutation-proven). FileSize deliberately not carried/used (unsigned, cross-response; Nix + fabric enforce the signed guarantee) - codex confirmed sound. Gate: daemon-core 198/0, daemon 37/0, just e2e 5/5 48/48, no-floats/clippy/fmt green, frozen surface untouched. Two non-gating residuals: TASK-226 (end-to-end anti-trap defense-in-depth test) filed; the LOW stale-FileSize doc wording fixed by orchestrator at close. Follow-up TASK-225 (narinfo fetch_buffered stall) filed in round 1.
 <!-- SECTION:NOTES:END -->

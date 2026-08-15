@@ -43,8 +43,9 @@ pub struct NarMeta {
     pub nar_hash: NarHash,
     /// Signed `NarSize` (uncompressed NAR bytes) - the wave-2 abort bound.
     pub nar_size: u64,
-    /// The narinfo's UNSIGNED transport descriptor (`Compression`/`FileSize`) - so
-    /// the HTTP-delivery path bounds the on-wire body in the right unit (TASK-25).
+    /// The narinfo's UNSIGNED transport descriptor (`Compression` only - `FileSize`
+    /// is deliberately NOT carried, see [`NarinfoTransport`]) - so the HTTP-delivery
+    /// path bounds the on-wire body in the right unit (TASK-25).
     pub transport: NarinfoTransport,
 }
 

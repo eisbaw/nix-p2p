@@ -723,8 +723,9 @@ impl UpstreamHttp {
 /// downstream). Every quantity is a whole byte count (no floats).
 ///
 /// `expected_size` is the SIGNED NarSize (UNCOMPRESSED). `transport` is the narinfo's
-/// UNSIGNED descriptor: `compression` (authoritative raw-vs-compressed) and `file_size`
-/// (the COMPRESSED transport byte count). The unit of the on-wire body is decided by
+/// UNSIGNED descriptor: `compression` (authoritative raw-vs-compressed) ONLY - the
+/// narinfo `FileSize` is deliberately NOT carried (see the WHY-NOT note below). The
+/// unit of the on-wire body is decided by
 /// `transport.compression` COMBINED with any HTTP `Content-Encoding` (a SEPARATE transform
 /// the HTTP layer may add on top of the narinfo file):
 ///

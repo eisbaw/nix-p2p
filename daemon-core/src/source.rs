@@ -172,7 +172,8 @@ pub enum NarKey {
         /// compressed bytes for a request and break S1 byte-identity. Typed as a
         /// transport hint so it can never masquerade as the identity.
         upstream_hint: NarPathToken,
-        /// The narinfo TRANSPORT descriptor (`Compression`/`FileSize`) the daemon
+        /// The narinfo TRANSPORT descriptor (`Compression` only; `FileSize` is
+        /// deliberately NOT carried - see [`NarinfoTransport`]) the daemon
         /// learned when it served this NAR's narinfo. The HTTP-delivery path uses it
         /// to bound the on-wire body in the RIGHT unit (TASK-25): the AUTHORITATIVE
         /// `Compression` decides raw-vs-compressed, never the URL suffix. A URL-less
