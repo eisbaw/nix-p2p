@@ -411,6 +411,17 @@ impl KnownTransport {
 /// malformed known transport ERRORS the whole decode), an unknown transport tag
 /// is DROPPED from the set (not retained, not re-serialized). Used by both
 /// [`Claim::transports`] and [`HoldAnswer::Have`].
+///
+/// NO-ENUMERATION RESIDUAL (TASK-224): an unknown-KIND element is peeked for its
+/// `transport` tag ONLY; the rest of the object is an opaque `serde_json::Value`
+/// that is accepted and discarded. So a hostile peer can name content identities
+/// inside an unknown offer (e.g. `{"transport":"future","content_ids":[..]}`) and
+/// the message is ACCEPTED (then dropped) - the same `also_held` enumeration case
+/// [`deny_unknown_fields`] forecloses for a KNOWN transport, still open on the
+/// unknown-KIND path. TASK-110 bounded the KNOWN-offer count/enumeration; it did
+/// NOT close this, and closing it means resolving the forward-compat-vs-
+/// enumeration tension (accept an unknown future transport opaquely while
+/// forbidding it from naming content). Same residual in [`deserialize_transport_slots`].
 fn deserialize_known_transports<'de, D>(deserializer: D) -> Result<Vec<KnownTransport>, D::Error>
 where
     D: serde::Deserializer<'de>,
@@ -557,11 +568,15 @@ pub struct HoldQuery {
 /// batch rule in [`check_batch_offer_bindings`].
 ///
 /// WHAT THIS BOUNDS, PRECISELY: the offer COUNT (at most 4 slots, one per kind)
-/// and thus the number of CONTENT IDENTITIES a `Have` can name - the enumeration
-/// vector. It does NOT bound the message BYTES: an unknown-kind offer is kept as
-/// a `serde_json::Value` slot whose body is byte-unbounded, so a hostile peer can
-/// still pad a single-key `Have` up to [`MAX_CLAIM_WIRE_BYTES`] (64 KiB) with as
-/// few as one dropped unknown offer. That byte ceiling is the pre-existing frame
+/// and thus the number of KNOWN-transport content identities a `Have` can name -
+/// the KNOWN-offer enumeration, consistent with the batch path's
+/// `deny_unknown_fields`. It does NOT close enumeration in general: an unknown-KIND
+/// offer is kept as an opaque `serde_json::Value` (only its `transport` tag is
+/// read), so it can still NAME content identities on the wire and be accepted-
+/// then-dropped - the residual tracked as TASK-224. Nor does it bound the message
+/// BYTES: that same unknown-kind slot has a byte-unbounded body, so a hostile peer
+/// can still pad a single-key `Have` up to [`MAX_CLAIM_WIRE_BYTES`] (64 KiB) with
+/// as few as one dropped unknown offer. That byte ceiling is the pre-existing frame
 /// gate, identical before and after this amendment and identical to the batch
 /// path; a per-offer byte cap is deliberately deferred (TASK-223) because a
 /// future transport's legitimate locator may itself be large.
@@ -741,6 +756,13 @@ pub struct BatchHoldQuery {
 /// index into this list: dropping an element in place would silently rebind every
 /// later index. [`compact_offer_slots`] removes the `None`s and rewrites the
 /// indices together, which is the only safe order.
+///
+/// Carries the SAME no-enumeration residual as [`deserialize_known_transports`]
+/// (TASK-224): the unknown-kind element keeps only its `transport` tag, the rest
+/// is an opaque `Value` accepted and dropped, so an unknown offer can still name
+/// content identities on the wire. Proven identical across the batch and
+/// single-key paths by
+/// `an_unknown_kind_offer_still_carries_content_ids_on_the_wire_on_both_paths`.
 ///
 /// It is a SEPARATE function rather than a refactor of
 /// [`deserialize_known_transports`] because the two return DIFFERENT types: the
@@ -1120,35 +1142,46 @@ fn compact_offer_slots(
 ///      inertly (dropped by [`keep_known_offers`] after being counted), so a
 ///      future transport still ships without a wire break - proven by
 ///      `a_single_key_have_still_drops_unknown_transports_inertly`. Only the
-///      COUNT is refused, which is exactly the enumeration surface.
+///      COUNT is refused. That forward-compat seam is exactly what leaves the
+///      unknown-KIND enumeration residual open (TASK-224); see below.
 ///   3. IT COSTS NOTHING WHILE NO PEERS ARE DEPLOYED. There is no released
 ///      network to break; the cost of tightening is zero today and rises
 ///      monotonically. Tightening later is a real break; tightening now is not.
-///   4. IT CLOSES A REAL ENUMERATION VECTOR AND THE KNOWN-OFFER COUNT. Measured:
-///      622 `bittorrent` offers = 65 440 B against an 88 B query, and a
-///      `bittorrent` infohash is a CONTENT identity, so those 622 offers name 621
-///      content identities the asker never asked about. After the bound a one-key
-///      `Have` carries at most one offer per transport kind, i.e. at most one
-///      content identity for the queried key; a legitimate known-only answer is
-///      iroh + bittorrent = 330 B (330/88 = 3.75x). Pinned by
+///   4. IT CLOSES THE KNOWN-OFFER ENUMERATION AND COUNT (not enumeration in
+///      general). Measured: 622 `bittorrent` offers = 65 440 B against an 88 B
+///      query, and a `bittorrent` infohash is a CONTENT identity, so those 622
+///      offers named 621 content identities the asker never asked about. After the
+///      bound a one-key `Have` carries at most one KNOWN offer per transport kind,
+///      i.e. at most one known content identity for the queried key; a legitimate
+///      known-only answer is iroh + bittorrent = 330 B (330/88 = 3.75x). Pinned by
 ///      `a_single_key_have_cannot_amplify_past_one_per_kind`.
 ///
 /// ## What this does NOT close, stated so the amendment is honest (task-110)
 ///
-/// This is a COUNT bound, not a BYTE bound. An unknown-kind offer is retained as
-/// an opaque `serde_json::Value` slot (only its `transport` tag is read), so its
-/// body is byte-unbounded; a hostile peer can still pad a single-key `Have` up to
-/// [`MAX_CLAIM_WIRE_BYTES`] (64 KiB) with as few as one dropped unknown offer, for
-/// a worst-case wire amplification of ~744x that the count cap of 4 does not even
-/// engage. That byte ceiling is the pre-existing frame gate - identical before and
-/// after this amendment, and identical to the batch path, which has the same
-/// residual. So the "3.75x" figure is the LEGITIMATE (known-only) case, NOT the
-/// hostile worst case; do not read it as the latter. The residual is pinned by
-/// `a_padded_unknown_kind_have_still_saturates_the_frame_and_decodes_empty`. A
-/// per-offer byte cap would make the hostile case small too, but is DEFERRED
-/// (TASK-223): a future transport's legitimate locator may itself be large, so the
-/// cap needs its own forward-compat analysis and is out of this task's scope
-/// ("match the batch path's SEMANTIC rule", which is a count/kind rule).
+/// TWO residuals remain, both PRE-EXISTING and both SHARED with the batch path -
+/// neither introduced nor closed here:
+///
+/// A. ENUMERATION via the unknown-KIND slot (TASK-224). An unknown transport is
+///    retained as an opaque `serde_json::Value` (only its `transport` tag is read),
+///    so a hostile peer can name content identities inside it
+///    (`{"transport":"future","content_ids":[..]}`) and the message is ACCEPTED
+///    (then dropped) - the same `also_held` case `deny_unknown_fields` forecloses
+///    for a KNOWN transport, still open on the unknown-KIND forward-compat seam. So
+///    ONLY the KNOWN-offer half of enumeration is closed here. Pinned by
+///    `an_unknown_kind_offer_still_carries_content_ids_on_the_wire_on_both_paths`.
+/// B. BYTE amplification (TASK-223). This is a COUNT bound, not a BYTE bound: that
+///    same unknown-kind slot has a byte-unbounded body, so a hostile `Have` can pad
+///    to [`MAX_CLAIM_WIRE_BYTES`] (64 KiB, ~744x) with as few as one dropped
+///    offer - the count cap of 4 never even engages. So the "3.75x" figure is the
+///    LEGITIMATE (known-only) case, NOT the hostile worst case; do not read it as
+///    the latter. Pinned by
+///    `a_padded_unknown_kind_have_still_saturates_the_frame_and_decodes_empty`. A
+///    per-offer byte cap is deferred (a future transport's legitimate locator may
+///    itself be large, needing its own forward-compat analysis) and would not fix
+///    A: codex showed a byte cap still permits several short identities per slot.
+///
+/// Both are out of this task's scope, which was to match the batch path's SEMANTIC
+/// (count/kind) rule; that is what this does.
 ///
 /// The accept-set narrowed; the emit-set did not (the golden `hold_response_*`
 /// encodings are byte-identical). An auditor finds this decision, not a slip.
@@ -2226,7 +2259,8 @@ mod tests {
         // `bittorrent` offers = 65 440 B against an 88 B query = 743.6x, bounded
         // only by the 64 KiB wire gate - and a bittorrent infohash is a CONTENT
         // identity, so those 622 offers name 621 content identities the asker
-        // never asked about (a no-enumeration leak, not just amplification).
+        // never asked about (a KNOWN-offer no-enumeration leak, not just
+        // amplification - the unknown-KIND leak is separate, TASK-224).
         let query_bytes = encode_hold_query(&HoldQuery {
             schema_version: QUERY_SCHEMA_VERSION,
             key: key(),
@@ -2260,10 +2294,12 @@ mod tests {
 
         // AFTER (the LEGITIMATE case, NOT the hostile worst case): the largest
         // SENDABLE known-only answer is one offer per known kind (iroh +
-        // bittorrent). Measured through the real encoder. The hostile worst case
-        // (unknown-kind byte padding, still ~744x) is a SEPARATE fact, pinned by
-        // `a_padded_unknown_kind_have_still_saturates_the_frame_and_decodes_empty`;
-        // this bound closes the ENUMERATION/count vector, not the byte ceiling.
+        // bittorrent). Measured through the real encoder. This bound closes the
+        // KNOWN-offer count/enumeration only. TWO residuals remain, both pinned
+        // separately: hostile byte padding (~744x, TASK-223,
+        // `a_padded_unknown_kind_have_still_saturates_the_frame_and_decodes_empty`)
+        // and unknown-KIND content-id smuggling (TASK-224,
+        // `an_unknown_kind_offer_still_carries_content_ids_on_the_wire_on_both_paths`).
         let after = HoldResponse {
             schema_version: QUERY_SCHEMA_VERSION,
             answer: HoldAnswer::Have {
@@ -2317,23 +2353,78 @@ mod tests {
         );
         // The COUNT bound passes (one offer, one kind) and the message DECODES...
         let decoded = decode_hold_response(&wire).expect("one padded unknown offer decodes");
-        // ...to an EMPTY offer set (the enumeration vector is closed), but at a
-        // wire cost that is still a large multiple of the query (byte residual
-        // OPEN, bounded only by the pre-existing frame gate). Magnitude, no float
-        // in the check: wire.len() > 600 * query_len (~680x here).
+        // ...dropping the unknown kind from the DECODED value, but at a wire cost
+        // that is still a large multiple of the query (byte residual OPEN, bounded
+        // only by the pre-existing frame gate). Magnitude, no float in the check:
+        // wire.len() > 600 * query_len (~680x here). NOTE: "offers empty in the
+        // decoded value" is NOT "no enumeration on the wire" - an unknown-kind slot
+        // can still NAME content identities that were accepted-then-dropped; that
+        // separate residual is TASK-224, pinned by
+        // `an_unknown_kind_offer_still_carries_content_ids_on_the_wire_on_both_paths`.
         assert_eq!(
             decoded.answer,
             HoldAnswer::Have {
                 blake3: blake3_id(),
                 offers: vec![],
             },
-            "the unknown kind is dropped: zero content identities survive"
+            "the unknown kind is dropped from the decoded value (it was still accepted)"
         );
         assert!(
             wire.len() > 600 * query_len,
             "the byte amplification residual is still ~hundreds-x (len {} vs query {})",
             wire.len(),
             query_len
+        );
+    }
+
+    #[test]
+    fn an_unknown_kind_offer_still_carries_content_ids_on_the_wire_on_both_paths() {
+        // CODEX RE-GATE FINDING (task-110): the one-per-kind bound closes the
+        // KNOWN-offer enumeration, but an unknown-KIND offer is retained as an
+        // opaque `serde_json::Value` slot (only its `transport` tag is read), so a
+        // hostile peer can name arbitrary content identities INSIDE it and the
+        // message is ACCEPTED (the unknown kind is then dropped) - the exact
+        // `also_held` enumeration case the KNOWN-transport rule near
+        // `KNOWN_TRANSPORT_TAGS` forbids, on the unknown-KIND path. So enumeration
+        // is NOT fully closed; only the KNOWN-offer half is. This residual is
+        // tracked as TASK-224. This test proves it AND proves it is IDENTICAL
+        // across the single-key and batch decoders (the shared tolerate-but-drop
+        // deserializer), i.e. pre-existing in both, not a task-110 regression.
+        let smuggled = format!(
+            "{{\"transport\":\"future_bulk\",\"content_ids\":[\"{BLAKE3_HEX}\",\"blake3:{}\"]}}",
+            "c".repeat(64)
+        );
+
+        // SINGLE-KEY path: a `Have` naming one unknown-kind offer that smuggles two
+        // content identities is ACCEPTED (the offer dropped from the value).
+        let single = format!(
+            "{{\"schema_version\":{QUERY_SCHEMA_VERSION},\"answer\":\"have\",\
+             \"blake3\":\"{BLAKE3_HEX}\",\"offers\":[{smuggled}]}}"
+        );
+        let decoded = decode_hold_response(single.as_bytes())
+            .expect("an unknown-kind offer is TOLERATED - that is the residual");
+        assert_eq!(
+            decoded.answer,
+            HoldAnswer::Have {
+                blake3: blake3_id(),
+                offers: vec![],
+            },
+            "single-key: the unknown kind is dropped from the value, but the WIRE \
+             named content identities and was accepted"
+        );
+
+        // BATCH path: the SAME unknown-kind offer, referenced by a `Have`, is also
+        // ACCEPTED - proving the enumeration residual is identical on both paths.
+        let batch = format!(
+            "{{\"schema_version\":{QUERY_SCHEMA_VERSION},\"offers\":[{smuggled}],\
+             \"answers\":[{{\"answer\":\"have\",\"blake3\":\"{BLAKE3_HEX}\",\
+             \"offer_indices\":[0]}}]}}"
+        );
+        let decoded_batch = decode_batch_hold_response(batch.as_bytes(), 1)
+            .expect("the batch path TOLERATES the same unknown-kind offer");
+        assert!(
+            decoded_batch.offers.is_empty(),
+            "batch parity: the unknown kind is dropped here too, having been accepted"
         );
     }
 
