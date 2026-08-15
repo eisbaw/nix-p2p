@@ -159,6 +159,16 @@ impl NarSource for PeerFabricNarSource {
             }
         };
 
+        // Observability (fail-verbosely): the DHT answered with >= 1 record, so log the
+        // DISCOVERY outcome BEFORE any fetch attempt - discovery is thus observable
+        // independent of whether a subsequent fetch succeeds or misses (the miss diagnostic
+        // below only fires on failure, so a clean success would otherwise leave discovery
+        // unobserved). `records` is non-empty here (a `Found` with an empty vec never occurs).
+        eprintln!(
+            "daemon: discovered {} provider record(s) for {content_key} via kad",
+            records.len()
+        );
+
         // Try each discovered provider's offers in order, returning the first gate-1
         // verified bytes. A per-offer failure (holder absent, integrity gate fired, dial
         // failed) is recorded and the next offer/record is tried - fail closed, try next.

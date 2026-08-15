@@ -4,27 +4,28 @@
 # HONEST SCOPE (read before trusting the name). This harness proves, as GATING
 # oracles: (1) a real egress-only NAT boundary (nodea is NAT'd; no inbound path),
 # (2) the relay circuit-v2 RESERVATION path over that NAT (a genuine
-# ReservationReqAccepted), and (3) decentralized DISCOVERY of the provider RECORD
-# over the real-NAT DHT. It does NOT prove that the relay is LOAD-BEARING for
-# reachability, and it does NOT prove the end-to-end byte transfer through the relay:
-# BOTH need the byte-fetch and are DEFERRED to TASK-218 (the load-bearing bite is
-# consumer-side end-to-end reachability; #4 below ships only SUPPORTING guards, not
-# that bite). The residual is a filed code gap (TASK-218) - the SHIPPED consumer
-# discovers the provider RECORD via kad but gets a "kad peer-routing miss" resolving
-# the provider's /p2p-circuit dial-address - so the NAR fetch falls back to upstream.
-# Dial-address RESOLUTION and the byte-fetch are therefore NON-GATING and explicitly
-# UNPROVEN here. The relay DATA path itself IS load-bearing - proven at the fabric
-# API level in fabric-libp2p/tests/nat_traversal.rs (a provider on a /p2p-circuit
-# ONLY is fetched byte-identical when the circuit address is supplied). The remaining
-# gap is purely the DHT-side propagation/resolution of that address to a consumer.
+# ReservationReqAccepted), (3) decentralized DISCOVERY of the provider RECORD over the
+# real-NAT DHT PLUS the end-to-end AC#1 byte-fetch - the consumer RESOLVES the
+# provider's /p2p-circuit dial-address (kad-discovered PeerId + a bootstrap-known
+# relay, ROUTE 1) and fetches the NAR BYTE-IDENTICAL THROUGH the relay (TASK-218
+# landed), and (4) the LOAD-BEARING consumer-side reachability bite: the same consumer
+# fetches byte-identical with the relay UP and FAILS with the relay DOWN (relay carries
+# the NAR bytes, not incidental). The relay DATA path is also proven at the fabric API
+# level in fabric-libp2p/tests/nat_traversal.rs (circuit address supplied directly) and
+# the ROUTE-1 resolution at fabric-libp2p/tests/nat_dht_resolve.rs (no injection).
+# GENERALITY LIMIT (TASK-219): ROUTE 1 resolves a provider that reserved on a relay the
+# consumer already knows from config (the single shared-relay case, as here); the fully
+# general multi-relay case is a filed follow-up.
 #
-# WHAT IS **NOT** CLAIMED. This is a RESERVATION-ONLY partial: DCUtR/hole-punch is
-# NOT exercised and NOT claimed. `--random-fully` on the MASQUERADE rule randomizes
-# the outbound source PORT per connection; it is a NAT-realism detail, NOT a proof of
-# endpoint-dependent ("symmetric") NAT mapping, and the harness measures neither NAT
-# mapping type nor a DCUtR outcome. The negative control below establishes only that
-# nodea has NO inbound path (egress-only NAT) - which is what forces the relay for
-# INBOUND reachability, independent of any NAT-mapping taxonomy.
+# WHAT IS **NOT** CLAIMED. DCUtR/hole-punch is NOT claimed to SUCCEED; on the contrary,
+# the B2 bite ASSERTS the DCUtR success log is ABSENT (no relayed connection was ever
+# upgraded to DIRECT), which is what keeps the consumer's only live path the relay
+# circuit. `--random-fully` on the MASQUERADE rule randomizes the outbound source PORT
+# per connection; it is a NAT-realism detail, NOT a proof of endpoint-dependent
+# ("symmetric") NAT mapping, and the harness measures no NAT-mapping taxonomy - it
+# OBSERVES the DCUtR outcome (absent) directly instead. The negative control below
+# establishes that nodea has NO inbound path (egress-only NAT) - which is what forces
+# the relay for INBOUND reachability, independent of any NAT-mapping taxonomy.
 #
 # TOPOLOGY - two VMs EACH behind its OWN NAT, joined by a public segment that hosts a
 # circuit-v2 relay (+ the narinfo HTTP upstream) AND a SEPARATE kad bootstrap node
@@ -55,11 +56,11 @@
 #   DISABLED (relayServer=false), so it is NEVER an alternative reservation path.
 #   Stopping the `relay` node therefore removes the swarm's SOLE reservation service
 #   while zboot keeps the DHT alive - so the provider does NOT die for lack of a
-#   bootstrap, it simply loses its relay. That decoupling is what the B2 SUPPORTING
-#   guard needs: the provider stays ACTIVE across the relay stop (a liveness we can
-#   observe), rather than a confounded "provider crashed" masquerading as a relay
-#   denial. The LOAD-BEARING relay-loss proof is consumer-side and DEFERRED to TASK-218
-#   (see the gating-oracle note #4 and the B2 subtest).
+#   bootstrap, it simply loses its relay. That decoupling is what the B2 bite needs:
+#   the provider stays ACTIVE across the relay stop (a liveness we can observe), ruling
+#   out a confounded "provider crashed" masquerading as a relay denial, while the
+#   consumer-side LOAD-BEARING proof (relay-up fetch succeeds / relay-down fetch fails)
+#   attributes the failure to the severed relay circuit (see oracle #4 + the B2 subtest).
 #
 # GATING oracles (the test PASSES these; each bites deterministically):
 #   1. NEGATIVE CONTROL - nodea is genuinely NAT'd egress-only with a LIVE listener:
@@ -73,25 +74,26 @@
 #      against the relay (ReservationReqAccepted); loopback could not exercise a real
 #      NAT boundary, this does. With #1, the NAT'd peer's ONLY inbound path is the
 #      relay circuit, and it establishes it.
-#   3. DISCOVERY over real NAT - the consumer, bootstrapped only to the public
-#      segment, discovers the provider RECORD via kad get_providers (>=1 record).
-#      This is GATED. Dial-address RESOLUTION + the byte-fetch remain NON-GATING and
-#      UNPROVEN here (TASK-218): the consumer gets a "kad peer-routing miss" on the
-#      provider's /p2p-circuit dial-address and falls back to upstream (no NAR body).
-#      When TASK-218 lands, that flips to a HARD byte-identical relay-carried fetch.
-#   4. SUPPORTING structural guards (NOT load-bearing) - with the relay SERVICE
-#      stopped (but the independent, relay-server-DISABLED kad bootstrap zboot still
-#      alive), the SAME provider process stays ACTIVE (no crash/restart) across the
-#      relay disconnect. This is NOT a proof that the relay is load-bearing: a
-#      provider-side "no reservation after relay-down" bite would be TAUTOLOGICAL
-#      (libp2p-relay 0.18's renewal timer is connection-scoped - the provider silently
-#      drops its lease and emits nothing gateable). The genuinely LOAD-BEARING bite is
-#      CONSUMER-SIDE end-to-end reachability (relay-up: a fresh consumer fetches a path
-#      THROUGH the relay; relay-down: a FRESH unwarmed consumer fetch fails within a
-#      bound) - which needs the byte-fetch and is therefore DEFERRED to TASK-218. What
-#      IS shipped here: the POSITIVE reservation proof (#2), zboot's disabled relay
-#      server (no alternative relay path), the B1 direct-path block, provider liveness
-#      across relay loss, and per-VM journal-cursor discipline (no cross-VM wall-clock).
+#   3. DISCOVERY over real NAT + AC#1 byte-fetch (TASK-218) - the consumer,
+#      bootstrapped only to the public segment, discovers the provider RECORD via kad
+#      get_providers (>=1 record, observed via the "discovered N provider record(s) ...
+#      via kad" log), RESOLVES the provider's /p2p-circuit dial-address by CONSTRUCTING
+#      it from the discovered PeerId + a bootstrap-known relay (ROUTE 1, no injection),
+#      and fetches the NAR BYTE-IDENTICAL THROUGH the relay (the narinfo upstream holds
+#      no NAR body + the direct path is B1-blocked, so the bytes can ONLY be relay-
+#      carried). GATED: a NarHash-equality byte oracle.
+#   4. LOAD-BEARING consumer-side reachability bite (TASK-218) - the SAME converged
+#      consumer fetches the (deleted) path byte-identical with the relay UP, and FAILS
+#      to fetch it within a bounded timeout with the relay DOWN, while the provider
+#      MainPID is unchanged (no crash - a provider-side "no reservation after relay-down"
+#      bite would be TAUTOLOGICAL: libp2p-relay 0.18's renewal is connection-scoped and
+#      emits nothing gateable, so the load-bearing oracle is consumer-side). A circuit-v2
+#      connection is forwarded THROUGH the relay, so stopping it severs the consumer's
+#      only live path; the bite asserts NO DCUtR direct upgrade ever occurred (so no
+#      hole-punched direct connection survives), zboot's relay server is DISABLED (no
+#      alternative relay), the direct addr is B1-blocked, and total_res==base observes
+#      the provider's SOLE reservation relay is the stopped relay. The UP-succeeds /
+#      DOWN-fails delta on the SAME consumer proves the relay carries the NAR bytes.
 { pkgs, daemonLibp2p }:
 
 let
@@ -420,6 +422,15 @@ pkgs.testers.runNixOSTest {
       # discovery + the relay reservation converge, so an early miss must not be
       # cached for an hour and defeat the retry loop.
       nix.settings.narinfo-cache-negative-ttl = 0;
+      # Do NOT positive-cache narinfo either. The daemon derives the p2p SignedNarHash
+      # key ONLY from a narinfo it served IN THIS SESSION (daemon-core catalog
+      # correlation); if nix reuses a cached narinfo it skips the daemon's narinfo
+      # endpoint and the follow-up NAR request falls to the URL-less UpstreamPath (which
+      # the p2p source cannot serve) -> the fetch never even ATTEMPTS the relay circuit.
+      # Forcing a re-request every realise keeps the correlation warm across a FRESH
+      # (restarted) consumer daemon, so the B2 fresh-dial bite exercises the real p2p
+      # path both relay-up and relay-down.
+      nix.settings.narinfo-cache-positive-ttl = 0;
     };
 
     # ---- relay: public vlan1, the circuit-v2 relay + kad bootstrap root, AND the
@@ -596,13 +607,13 @@ pkgs.testers.runNixOSTest {
             f"nodea's outbound did NOT traverse the NAT, so the boundary is not real"
         )
 
-    with subtest("DISCOVERY over NAT (GATED) + the TASK-218 residual (NON-GATING/UNPROVEN)"):
-        # H1 (TASK-207): GATE exactly what is genuinely achieved - RECORD discovery -
-        # and keep dial-address RESOLUTION + the byte-fetch explicitly NON-GATING and
-        # labelled UNPROVEN (blocked on TASK-218). The prior harness ignored the fetch
-        # result and grep'd with a bare `|| true`, so a ZERO-provider-record run passed
-        # identically - discovery was overclaimed. Now the consumer must OBSERVABLY
-        # discover >= 1 provider RECORD via kad get_providers, or this subtest FAILS.
+    with subtest("DISCOVERY over NAT (GATED) + AC#1: byte-identical NAR fetch THROUGH the relay (GATED, TASK-218)"):
+        # H1 (TASK-207): GATE what is genuinely achieved - RECORD discovery via kad. The
+        # consumer must OBSERVABLY discover >= 1 provider RECORD via kad get_providers.
+        # TASK-218 additionally makes the end-to-end byte-fetch a HARD oracle: the consumer
+        # RESOLVES the provider's /p2p-circuit dial-address (kad-discovered PeerId + a
+        # bootstrap-known relay, ROUTE 1) and fetches the NAR byte-identical THROUGH the
+        # relay. Single-relay generality limit is documented in the locator + TASK-218.
         nodeb.systemctl("start nix-p2p-daemon.service")
         nodeb.wait_for_unit("nix-p2p-daemon.service")
         # The consumer side of the SHIPPED module comes up + serves (proves the
@@ -617,82 +628,73 @@ pkgs.testers.runNixOSTest {
         # ABSENT-BEFORE: the consumer genuinely does not hold payloadA (non-vacuous).
         nodeb.fail("nix-store -q --hash ${payloadA}")
 
-        # GATING: drive fetch attempts (each triggers a discovery) and POLL for a
-        # "discovered >= 1 provider record" line. The `[1-9][0-9]*` bound excludes the
-        # "discovered 0 provider record" case (which the old `|| true` would have let
-        # pass). `timeout` bounds the whole loop; on convergence the grep exits 0 and
-        # the loop ends, otherwise `timeout` kills it non-zero and `succeed` FAILS.
-        # kad convergence over the emulated NAT is variable, hence the generous ceiling.
+        # AC#1 GATE (TASK-218): ONE convergence budget. A successful realise REQUIRES the full
+        # chain - kad discovery of the provider record, RESOLUTION of the /p2p-circuit
+        # dial-address (kad-discovered PeerId + a bootstrap-known relay, ROUTE 1), and a
+        # byte-verified NAR fetch THROUGH the relay. The narinfo upstream holds NO NAR body
+        # (nar/ stripped), and the direct path is blocked (B1 negative control), so the ONLY
+        # way these bytes arrive is the relay circuit. kad bootstrap convergence through TWO
+        # symmetric NATs is slow AND variable (observed 30s-260s across runs), hence the
+        # generous 600s ceiling; a single loop avoids two racing sub-budgets.
         nodeb.succeed(
-            "timeout 300 sh -c '"
-            "until journalctl -u nix-p2p-daemon --no-pager | "
-            "grep -qE \"discovered [1-9][0-9]* provider record\"; do "
-            "  timeout 20 nix-store --realise ${payloadA} >/dev/null 2>&1 || true; "
-            "done'"
+            "timeout 600 sh -c '"
+            "until nix-store --realise ${payloadA} >/dev/null 2>&1; do sleep 3; done'"
+        )
+        # BYTE ORACLE: the realised path's NarHash equals the provider's signed NarHash -
+        # a byte-identical relay-carried transfer (Nix also enforces NarHash on substitution,
+        # so a corrupt transfer could never have realised in the first place).
+        got_hash = nodeb.succeed("nix-store -q --hash ${payloadA}").strip()
+        assert got_hash == "${narHashA}", (
+            f"AC#1 byte oracle: realised NarHash {got_hash} != provider signed NarHash "
+            f"${narHashA} - the relay-carried transfer is NOT byte-identical"
+        )
+        # H1 (TASK-207) discovery observability: the daemon logs the discovery outcome BEFORE
+        # each fetch attempt (peer_source.rs: "discovered N provider record(s) ... via kad"),
+        # so a successful fetch guarantees this line is present (>= 1 record; the `[1-9][0-9]*`
+        # bound excludes a zero-record run). A post-hoc assertion, not a racing timed gate.
+        nodeb.succeed(
+            "journalctl -u nix-p2p-daemon --no-pager | "
+            "grep -qE 'discovered [1-9][0-9]* provider record'"
         )
         print(
-            "DISCOVERY GATED: nodeb observed >= 1 provider record via kad. Record:\n"
+            "DISCOVERY observed + AC#1 byte-fetch GATED. Records:\n"
             + nodeb.succeed(
                 "journalctl -u nix-p2p-daemon --no-pager | "
                 "grep -Eo 'discovered [1-9][0-9]* provider record' | sort -u | tail -5"
             )
         )
+        print("AC#1 GATED: nodeb fetched ${storeHashA} byte-identical THROUGH the relay circuit.")
 
-        # NON-GATING / UNPROVEN (TASK-218): the consumer discovers the RECORD but gets a
-        # "kad peer-routing miss" resolving the provider's /p2p-circuit DIAL-address, so
-        # the end-to-end NAR fetch falls back to upstream (which holds no NAR body). This
-        # is documented evidence, NOT an assertion. When TASK-218 lands (dial-address
-        # resolution), the byte-fetch becomes a HARD byte-identical relay-carried oracle.
-        print(
-            "NON-GATING residual (TASK-218; dial-address resolution + byte-fetch UNPROVEN):\n"
-            + nodeb.succeed(
-                "journalctl -u nix-p2p-daemon --no-pager | "
-                "grep -Eo 'kad peer-routing miss|directory unavailable[^;]*' | "
-                "sort | uniq -c | tail -10 || true"
-            )
-        )
+    with subtest("B2 LOAD-BEARING (TASK-218): relay carriage is essential - consumer fetches with relay UP, FAILS with relay DOWN"):
+        # B2 (TASK-207 deferred -> TASK-218 delivers): the genuinely LOAD-BEARING proof that
+        # the relay CARRIES THE NAR BYTES (not merely helps discovery) is a CONSUMER-SIDE
+        # reachability delta on the SAME converged consumer:
+        #   POSITIVE CONTROL (relay UP): re-fetch the (deleted) store path -> byte-identical.
+        #   BITE (relay DOWN): re-fetch the SAME path -> FAILS within a bounded timeout, while
+        #     the provider MainPID is unchanged and the provider's SOLE reservation relay is
+        #     the stopped relay.
+        # The provider-side "no reservation after relay stop" bite would be TAUTOLOGICAL
+        # (libp2p-relay 0.18 renewal is connection-scoped, emits nothing gateable), so the
+        # load-bearing oracle MUST be consumer-side. A circuit-v2 connection is forwarded
+        # THROUGH the relay, so stopping the relay SEVERS the consumer's only live path to the
+        # NAT'd provider; the consumer holds NO direct connection (DCUtR hole-punch cannot
+        # succeed across this symmetric NAT - asserted below), the direct addr is NAT-blocked
+        # (B1), and zboot's relay server is disabled (relayServer=false, no alternative relay).
+        # So a relay-down re-fetch must RE-DIAL and has NO reachable path. This deliberately
+        # does NOT restart-and-rediscover (kad re-convergence via a single surviving bootstrap
+        # is slow+unreliable and would confound a REACHABILITY bite with a DISCOVERY one); the
+        # AC#1 subtest already converged this consumer's kad routing.
 
-    with subtest("SUPPORTING (NOT load-bearing): provider stays ACTIVE across relay loss; the load-bearing consumer-side reachability bite is DEFERRED to TASK-218"):
-        # B2 (TASK-207) - HONEST resolution (mped-architect ruling, 2026-08-15):
-        #
-        # A provider-side "no new ReservationReqAccepted after the relay stops" bite is
-        # TAUTOLOGICAL. libp2p-relay 0.18's reservation-renewal timer is CONNECTION-
-        # SCOPED: when the relay disconnects, the running provider silently drops its
-        # lease and emits NOTHING gateable - so "no acceptance appears after relay-down"
-        # is true BY CONSTRUCTION, not a denial we observed. We therefore do NOT ship a
-        # provider-side relay-loss assertion as the load-bearing oracle.
-        #
-        # The genuinely LOAD-BEARING bite is CONSUMER-SIDE end-to-end reachability
-        # (relay-up: a fresh consumer fetches a path THROUGH the relay; relay-down: a
-        # FRESH, unwarmed consumer fetch fails within a bounded timeout). That requires
-        # the byte-fetch, which is BLOCKED on TASK-218 (the /p2p-circuit dial-address
-        # does not yet resolve via kad peer-routing). So the load-bearing B2 is DEFERRED
-        # to TASK-218 and is NOT claimed here.
-        #
-        # What THIS subtest ships instead are SUPPORTING STRUCTURAL guards (explicitly
-        # NOT load-bearing): (i) the real POSITIVE proof is already recorded - relay UP
-        # -> the NAT'd provider obtained ReservationReqAccepted (asserted in the
-        # "provider" subtest above); (ii) zboot's relay SERVER is disabled structurally
-        # (relayServer=false) so no ALTERNATIVE relay exists in the swarm; (iii) the B1
-        # negative control already proved the provider's direct inbound path is blocked;
-        # (iv) below, the provider process stays ACTIVE across a relay stop (it does not
-        # crash when its relay disconnects) - observed via a per-VM JOURNAL CURSOR, never
-        # a cross-VM wall-clock.
-
-        # (i) POSITIVE proof recorded: >= 1 reservation FROM THE RELAY specifically
-        #     (match the relay's PeerId in the logged event). Not load-bearing on its
-        #     own; it is the genuine relay-client event the resolution keeps.
+        # POSITIVE proof recorded (relay UP): >= 1 reservation FROM THE RELAY specifically,
+        # and the provider's SOLE reservation relay is THE relay (every logged acceptance
+        # cites the relay's PeerId; none cites another peer). This closes the "reachable via
+        # a different relay" wrong-reason path (zboot's relayServer=false guarantees it
+        # structurally; here we OBSERVE it).
         base = int(nodea.succeed(
             "journalctl -u nix-p2p-daemon --no-pager | "
             "grep -c 'ReservationReqAccepted.*${relayPeerId}' || true"
         ).strip())
         assert base >= 1, f"positive proof: provider must hold a relay reservation; count={base}"
-
-        # SUPPORTING guard: the provider's SOLE reservation relay is THE relay - EVERY
-        # logged ReservationReqAccepted cites the relay's PeerId, none cites another peer.
-        # This OBSERVES what zboot's relayServer=false guarantees structurally (no
-        # alternative reservation service in the swarm), closing the "reachable via a
-        # different relay" wrong-reason path.
         total_res = int(nodea.succeed(
             "journalctl -u nix-p2p-daemon --no-pager | grep -c ReservationReqAccepted || true"
         ).strip())
@@ -701,34 +703,72 @@ pkgs.testers.runNixOSTest {
             f"relay-cited={base}): an ALTERNATIVE relay path exists - the relay is not sole"
         )
 
-        # Capture the provider's MainPID + its journal CURSOR at the point of stop.
-        # The cursor scopes every post-stop query to THIS VM's own journal position,
-        # so no cross-VM wall-clock is involved (journal-cursor-at-stop discipline).
+        # POSITIVE CONTROL (relay UP): drop the path (so this is a REAL fetch, not a store
+        # no-op) and re-fetch it byte-identical THROUGH the relay on the already-converged
+        # consumer. This is the baseline the bite is measured against. Generous budget for
+        # kad/reservation timing variance over the emulated NAT.
+        nodeb.succeed("nix-store --delete --ignore-liveness ${payloadA} 2>&1 || true")
+        nodeb.fail("nix-store -q --hash ${payloadA}")  # genuinely absent before the re-fetch
+        nodeb.succeed(
+            "timeout 300 sh -c '"
+            "until nix-store --realise ${payloadA} >/dev/null 2>&1; do sleep 3; done'"
+        )
+        up_hash = nodeb.succeed("nix-store -q --hash ${payloadA}").strip()
+        assert up_hash == "${narHashA}", (
+            f"relay-UP positive control: re-fetched NarHash {up_hash} != ${narHashA}"
+        )
+        print("B2 POSITIVE CONTROL: consumer re-fetched ${storeHashA} byte-identical (relay UP).")
+
+        # Capture the provider's MainPID at the point of stop (journal-cursor discipline for
+        # any post-stop query; no cross-VM wall-clock).
         pid_before = nodea.succeed(
             "systemctl show -p MainPID --value nix-p2p-daemon.service"
         ).strip()
         assert pid_before != "0", f"provider not running before the relay stop (MainPID={pid_before})"
-        cursor = nodea.succeed(
-            "journalctl -u nix-p2p-daemon --no-pager --show-cursor | "
-            "sed -n 's/^-- cursor: //p' | tail -1"
-        ).strip()
-        assert cursor, "could not capture nodea journal cursor at relay stop"
 
-        # (ii)+(iv) Stop ONLY the relay service (zboot's kad + relay-server-disabled
-        #     node stays up, so this removes the swarm's SOLE reservation service, not
-        #     the DHT). Then give the provider a bounded window to react to the relay
-        #     disconnect.
+        # THE BITE (relay DOWN, on the SAME just-converged consumer): the consumer that just
+        # fetched byte-identical (routing converged, provider address cached) must FAIL to
+        # fetch once the relay is stopped. This deliberately does NOT restart-and-rediscover
+        # (kad re-convergence via a single surviving bootstrap is slow+unreliable and would
+        # confound a REACHABILITY bite with a DISCOVERY one); instead it exploits that a
+        # circuit-v2 connection is forwarded THROUGH the relay, so stopping the relay SEVERS
+        # the consumer's only live path to the NAT'd provider. The consumer holds NO direct
+        # connection - DCUtR hole-punch cannot succeed across this NAT - so the re-fetch must
+        # RE-DIAL, and its only candidates (the now-dead relay circuit + the NAT-blocked
+        # private direct addr, B1) are both unreachable. The UP-succeeds / DOWN-fails delta on
+        # the SAME converged consumer is the load-bearing proof the relay carries the bytes.
+
+        # (a) Confirm the consumer NEVER upgraded its relayed connection to a DIRECT one via
+        #     DCUtR: a hole-punched direct connection could survive the relay stop and confound
+        #     the bite. In this symmetric NAT the hole-punch cannot succeed, so the fabric's
+        #     success log MUST be absent (only failures, if any, are logged).
+        nodeb.fail(
+            "journalctl -u nix-p2p-daemon --no-pager | "
+            "grep -q 'dcutr hole-punch upgraded a relayed connection to DIRECT'"
+        )
+
+        # (b) Stop ONLY the relay service (zboot's kad node stays up). The relay is genuinely
+        #     DOWN: outbound dials to its libp2p port are refused from both the provider and
+        #     the consumer. Give libp2p a moment to observe the severed circuit connection.
         relay.systemctl("stop nix-p2p-daemon.service")
-        # The relay is genuinely DOWN: the provider's own outbound dial to the relay
-        # port is refused (not a silent no-op stop).
         nodea.fail("nc -z -w 5 ${ipRelay} ${toString libp2pPort}")
-        nodea.succeed("sleep 30")
+        nodeb.fail("nc -z -w 5 ${ipRelay} ${toString libp2pPort}")
+        nodeb.succeed("sleep 10")
 
-        # SUPPORTING structural guard: the SAME provider process is still ACTIVE - it
-        # did not crash or systemd-restart when its relay connection dropped. A crash
-        # here WOULD fail this assertion, so it is a genuine (non-tautological)
-        # observation - just not sufficient to prove relay-loss end-to-end (that is the
-        # deferred consumer-side bite).
+        # (c) Drop the path so the re-fetch is a REAL fetch (not a store no-op), then assert it
+        #     FAILS within a bounded window. narinfo still resolves (the narinfo-upstream HTTP
+        #     server on the relay VM is a SEPARATE service that survives stopping the relay
+        #     daemon), so the failure is purely REACHABILITY: the relay circuit is dead and the
+        #     private direct path is NAT-blocked.
+        nodeb.succeed("nix-store --delete --ignore-liveness ${payloadA} 2>&1 || true")
+        nodeb.fail("nix-store -q --hash ${payloadA}")  # genuinely absent (non-vacuous)
+        nodeb.fail("timeout 120 nix-store --realise ${payloadA}")
+        nodeb.fail("nix-store -q --hash ${payloadA}")  # still absent: the fetch did NOT sneak through
+
+        # SUPPORTING (not the oracle): the SAME provider process stayed ACTIVE across the
+        # relay stop - it did not crash/restart when its relay connection dropped. A crash
+        # would confound the bite (fetch fails because the provider died, not because the
+        # relay is essential), so this rules that confound OUT.
         pid_after = nodea.succeed(
             "systemctl show -p MainPID --value nix-p2p-daemon.service"
         ).strip()
@@ -736,24 +776,11 @@ pkgs.testers.runNixOSTest {
             f"provider must stay ACTIVE across the relay stop (no crash/restart); "
             f"MainPID {pid_before} -> {pid_after}"
         )
-
-        # NON-GATING evidence (NOT an oracle): post-cursor reservation acceptances on
-        # nodea. Per the ruling this is expected to be 0 by construction (the renewal
-        # timer is connection-scoped and emits nothing on relay-down), so it is printed
-        # as documentation, NEVER asserted - asserting it would be the tautological bite
-        # the resolution forbids.
-        post = nodea.succeed(
-            "journalctl -u nix-p2p-daemon --no-pager --after-cursor '" + cursor + "' | "
-            "grep -c 'ReservationReqAccepted' || true"
-        ).strip()
         print(
-            "SUPPORTING guards held: provider stayed ACTIVE (MainPID " + pid_before +
-            ") across the relay stop; zboot relay-server disabled (no alternative relay); "
-            "B1 direct-path blocked. NON-GATING post-stop reservation acceptances (expected "
-            "0 by construction, connection-scoped renewal): " + post + ".\n"
-            "LOAD-BEARING consumer-side end-to-end reachability (relay-up positive-control "
-            "fetch + relay-down FRESH-dial bite, unwarmed connection, bounded timeout) is "
-            "DEFERRED to TASK-218, which unblocks the /p2p-circuit byte-fetch it requires."
+            "B2 LOAD-BEARING PROVEN: the converged consumer fetched ${storeHashA} byte-identical "
+            "with the relay UP and FAILED to fetch it with the relay DOWN (no DCUtR direct "
+            "upgrade; provider MainPID " + pid_before + " unchanged; sole reservation relay was "
+            "the stopped relay). The relay circuit carries the NAR bytes - load-bearing, not incidental."
         )
   '';
 }

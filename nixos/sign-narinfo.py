@@ -56,6 +56,18 @@ def main(argv: list[str]) -> int:
         f.write("Compression: none\n")
         f.write(f"NarHash: {nar_hash}\n")
         f.write(f"NarSize: {nar_size}\n")
+        # FileHash/FileSize describe the TRANSPORT bytes. With `Compression: none` the
+        # transferred file IS the raw NAR, so FileHash == NarHash and FileSize == NarSize.
+        # These are UNSIGNED (Nix's fingerprint covers only NarHash/NarSize/refs), so adding
+        # them does NOT change the Sig. Emitting them matches what a real cache writes for an
+        # uncompressed path, and it is REQUIRED for the daemon's rewrite-to-raw correlation:
+        # without FileHash the daemon cannot rewrite a peer-serveable narinfo to raw and
+        # records no token->SignedNarHash correlation, so the follow-up NAR request falls to
+        # the URL-less UpstreamPath and the p2p path is never attempted (daemon-core
+        # server.rs / rewrite.rs). A signed cache lacking FileHash would make the p2p fetch
+        # non-deterministic; emitting it keeps discovery+relay-fetch reliable.
+        f.write(f"FileHash: {nar_hash}\n")
+        f.write(f"FileSize: {nar_size}\n")
         f.write("References: \n")
         f.write(f"Sig: {name}:{signature}\n")
     return 0

@@ -1660,6 +1660,24 @@ pub struct NodeConfig {
     /// address). This book is a pure LOCATOR concern: it never enters the swarm and does
     /// not affect discovery, dialing, or the kad routing table.
     pub peer_address_book: BTreeMap<NodeId, Vec<Multiaddr>>,
+    /// Relays this node ALREADY knows from bootstrap/relay config (each a libp2p
+    /// [`PeerId`] + its direct transport [`Multiaddr`], e.g. `/ip4/…/tcp/…`). TASK-218:
+    /// a discovery-only consumer that finds a NAT'd provider via kad `get_providers`
+    /// resolves the provider's `/p2p-circuit` dial-address by CONSTRUCTING it -
+    /// `<relayAddr>/p2p/<relayPeer>/p2p-circuit/p2p/<providerPeer>` - from the provider
+    /// PeerId (discovered via kad) plus one of these bootstrap-known relays. This is NOT
+    /// injection (the provider identity still came ONLY from kad; a relay in the bootstrap
+    /// set is explicitly permitted config, PRD §733-736) and touches NO frozen surface.
+    ///
+    /// GENERALITY LIMIT (documented, filed as TASK-219): the construction assumes the
+    /// provider reserved on a relay THIS node knows - true when there is one shared relay
+    /// in the bootstrap set (the harness, and the common "a known public relay" deployment).
+    /// The fully general multi-relay case, where the consumer does not know which relay a
+    /// provider chose, needs the relay identity to propagate through the DHT and is filed
+    /// separately. Empty by default (a node with no known relay synthesizes no circuit
+    /// candidate and falls back to the plain kad-resolved address). A pure LOCATOR concern:
+    /// it never enters the swarm and does not affect discovery or the kad routing table.
+    pub known_relays: Vec<(PeerId, Multiaddr)>,
 }
 
 impl NodeConfig {
@@ -1672,6 +1690,7 @@ impl NodeConfig {
             kad_query_timeout: DEFAULT_KAD_QUERY_TIMEOUT,
             relay_server_enabled: DEFAULT_RELAY_SERVER_ENABLED,
             peer_address_book: BTreeMap::new(),
+            known_relays: Vec::new(),
         }
     }
 
@@ -1711,6 +1730,18 @@ impl NodeConfig {
             .entry(node)
             .or_default()
             .extend(addrs);
+        self
+    }
+
+    /// Register a relay this node knows from bootstrap/relay config (TASK-218, builder
+    /// style): `peer` is the relay's libp2p [`PeerId`] and `addr` its direct transport
+    /// [`Multiaddr`] (e.g. `/ip4/…/tcp/…`). The node-locator uses these to CONSTRUCT a
+    /// `/p2p-circuit` dial-address for a NAT'd provider it discovered via kad (see
+    /// [`NodeConfig::known_relays`]). Repeated calls APPEND. Passing the consumer's
+    /// bootstrap peers here is the intended wiring (a shared bootstrap relay is exactly
+    /// what a NAT'd provider reserves on).
+    pub fn with_known_relay(mut self, peer: PeerId, addr: Multiaddr) -> Self {
+        self.known_relays.push((peer, addr));
         self
     }
 }

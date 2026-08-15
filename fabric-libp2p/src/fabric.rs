@@ -135,6 +135,12 @@ impl Libp2pFabric {
                 .into_iter()
                 .map(|(node, addrs)| (node, addrs.iter().map(|a| a.to_string()).collect()))
                 .collect();
+        // TASK-218: the relays this node knows from bootstrap config are a pure LOCATOR
+        // concern (used to CONSTRUCT a NAT'd provider's /p2p-circuit dial-address), so take
+        // them out of `config` BEFORE `Node::start` consumes it and hand them to the locator.
+        // They never enter the swarm here (the composition root separately dials the
+        // bootstrap peers to JOIN the DHT; this is only the address-construction input).
+        let known_relays = std::mem::take(&mut config.known_relays);
         let node = Node::start(config)?;
         let ledger = Arc::new(ExposureLedger::new());
 
@@ -179,6 +185,7 @@ impl Libp2pFabric {
             node.handle.clone(),
             ledger.clone(),
             peer_address_book,
+            known_relays,
         ));
 
         // The fetch transport is always available (a consumer needs it); it registers

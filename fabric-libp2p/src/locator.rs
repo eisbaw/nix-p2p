@@ -21,17 +21,27 @@
 //!
 //! # `ResolutionPolicy` mapping (and its honest current limit)
 //!
-//!   * [`ResolutionPolicy::PublicInfrastructure`] - the active kad peer-routing query
-//!     above. It discloses this node's identity to the DHT nodes / bootstrap it contacts
-//!     (recorded to the ledger). Returns [`Lookup::Found`] with the learned Multiaddr
-//!     strings, [`Lookup::Miss`] when a query that reached responding peers near the key
-//!     knows no address, and [`Lookup::Unavailable`] when the mechanism could not be
-//!     consulted (`InsufficientRouting` when the peer-routing walk reached NO responding
-//!     peer - either an empty routing table or one of only dead entries, gated on the
-//!     near-key [`crate::QueryReach`], TASK-174; `DeadlineExceeded` on timeout). See
+//!   * [`ResolutionPolicy::PublicInfrastructure`] - a UNION of two independent dial-candidate
+//!     provenances (TASK-218): the active kad peer-routing query (which discloses this node's
+//!     identity to the DHT nodes / bootstrap it contacts, recorded to the ledger) AND, for a
+//!     provider kad could only place at non-public addresses (or not at all), a `/p2p-circuit`
+//!     dial-address CONSTRUCTED from a relay this node knows via bootstrap config (a NAT'd
+//!     provider is reachable only THROUGH its relay; disclosing to that relay operator that we
+//!     relay to the target, also recorded). Returns [`Lookup::Found`] when the union is
+//!     non-empty - so `Found` means "at least one dial candidate exists, from DHT peer-routing
+//!     AND/OR permitted relay-circuit composition", NOT "learned exclusively through the DHT".
+//!     When NEITHER provenance yields a candidate it returns the kad walk's OWN honest verdict:
+//!     [`Lookup::Miss`] when a query that reached responding peers near the key knows no
+//!     address, and [`Lookup::Unavailable`] when the mechanism could not be consulted
+//!     (`InsufficientRouting` when the peer-routing walk reached NO responding peer - either an
+//!     empty routing table or one of only dead entries, gated on the near-key
+//!     [`crate::QueryReach`], TASK-174; `DeadlineExceeded` on timeout). See
 //!     [`crate::QueryReach`] for the honest limit of the `Miss` direction: reaching this
 //!     node's REACHABLE subgraph is not proof of reaching the target's global custodians
-//!     (an inherent single-node-view partition/eclipse residue).
+//!     (an inherent single-node-view partition/eclipse residue). GENERALITY LIMIT: the
+//!     relay-circuit provenance only resolves a provider that reserved on a relay THIS node
+//!     already knows from config (the single shared-relay case); the multi-relay case is
+//!     the filed follow-up TASK-219.
 //!   * [`ResolutionPolicy::ExplicitPeersOnly`] - consult ONLY the statically configured peer
 //!     address book ([`NodeConfig::peer_address_book`](crate::NodeConfig::peer_address_book),
 //!     TASK-168 AC#2), disclosing NOTHING. This is a pure LOCAL map lookup:
@@ -50,10 +60,12 @@
 //! on the test network) plus the AC#2 static address book, not the AC#1 NAT-hole-punch story.
 
 use std::collections::BTreeMap;
+use std::net::{Ipv4Addr, Ipv6Addr};
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use libp2p::PeerId;
+use libp2p::multiaddr::Protocol;
+use libp2p::{Multiaddr, PeerId};
 use peer_fabric::{
     DialInfo, Disclosed, Exposure, ExposureLedger, ExposureSurface, Lookup, NodeId, NodeLocator,
     Recipient, ResolutionPolicy, Unavailable,
@@ -75,22 +87,35 @@ pub struct Libp2pNodeLocator {
     /// path as a pure local lookup - no network query, no ledger disclosure. Empty for a node
     /// configured with no explicit peers.
     peer_address_book: BTreeMap<NodeId, Vec<String>>,
+    /// Relays this node knows from bootstrap/relay config (TASK-218): each a libp2p
+    /// [`PeerId`] + its direct transport [`Multiaddr`]. Used ON THE
+    /// [`ResolutionPolicy::PublicInfrastructure`] path to CONSTRUCT a `/p2p-circuit`
+    /// dial-address for a provider discovered via kad `get_providers` (composed
+    /// `<relayAddr>/p2p/<relayPeer>/p2p-circuit/p2p/<providerPeer>`). This is a
+    /// CONFIG-LEVEL, provider-INDEPENDENT set - the SAME relays for every provider - so it
+    /// is dial-assistance, never a per-provider address injection: the provider identity
+    /// still comes ONLY from kad. Empty by default (no relay known -> no circuit composed).
+    known_relays: Vec<(PeerId, Multiaddr)>,
 }
 
 impl Libp2pNodeLocator {
-    /// A locator driving `handle`, recording disclosures to `ledger`, and answering
+    /// A locator driving `handle`, recording disclosures to `ledger`, answering
     /// [`ResolutionPolicy::ExplicitPeersOnly`] from the static `peer_address_book` (a
-    /// provider [`NodeId`] -> its dialable location strings). Pass an empty map for a node
-    /// with no explicit peers.
+    /// provider [`NodeId`] -> its dialable location strings), and composing `/p2p-circuit`
+    /// dial-addresses on the [`ResolutionPolicy::PublicInfrastructure`] path from
+    /// `known_relays` (TASK-218). Pass empties for a node with no explicit peers / no
+    /// known relays.
     pub fn new(
         handle: SwarmHandle,
         ledger: Arc<ExposureLedger>,
         peer_address_book: BTreeMap<NodeId, Vec<String>>,
+        known_relays: Vec<(PeerId, Multiaddr)>,
     ) -> Self {
         Libp2pNodeLocator {
             handle,
             ledger,
             peer_address_book,
+            known_relays,
         }
     }
 
@@ -112,47 +137,162 @@ impl Libp2pNodeLocator {
         }
     }
 
-    /// The active kad peer-routing resolution (PublicInfrastructure). Kept separate so the
-    /// routing-bar short-circuit and the ledger disclosure live in one place.
+    /// The active PublicInfrastructure resolution: a UNION of two INDEPENDENT dial-candidate
+    /// provenances (TASK-218, mped-architect ruling), each honest about what it did:
+    ///
+    ///   1. the kad peer-routing walk (`get_closest_peers`) - the addresses the DHT learned
+    ///      for the target; it keeps its OWN [`crate::QueryReach`] classification and its own
+    ///      `OurNodeId->DhtNode` ledger disclosure EXACTLY as before, and records NO
+    ///      disclosure when the routing table is empty (no query happened);
+    ///   2. relay-circuit composition - for a provider that kad could only place at
+    ///      non-public (loopback/private/link-local) addresses, or not at all, and when this
+    ///      node knows relays from bootstrap config, we CONSTRUCT
+    ///      `<relayAddr>/p2p/<relayPeer>/p2p-circuit/p2p/<providerPeer>` for each known relay.
+    ///      This is the standard circuit-v2 dial pattern, not injection (the provider PeerId
+    ///      came from kad; the relays are provider-INDEPENDENT config). Composing candidates
+    ///      dials THROUGH the relay, which discloses to that relay operator that we relay to
+    ///      this provider - recorded as `OurNodeId->Relay`, and ONLY when candidates are
+    ///      actually added.
+    ///
+    /// [`Lookup::Found`] iff the union is non-empty; otherwise the DHT walk's OWN honest
+    /// absence ([`Lookup::Miss`] / [`Unavailable`]). So `Found` here means "at least one
+    /// dial candidate exists, from DHT peer-routing AND/OR permitted relay-circuit
+    /// composition" - NOT "learned exclusively through the DHT".
     async fn locate_via_dht(&self, peer: PeerId) -> Lookup<DialInfo> {
+        // --- Provenance 1: the kad peer-routing walk (unchanged honesty). ---
         // A peer-routing query over an EMPTY routing table is not authoritative: a Miss
         // would be a lie (we simply are not on the network to ask). This cheap pre-check
-        // short-circuits it to Unavailable before issuing a doomed query or recording a
-        // spurious ledger disclosure. The FINER near-key bar is applied below, on the
-        // QueryReach the walk actually achieved (TASK-174), so a routing table of only
-        // DEAD entries - which passes this pre-check - is still classified honestly.
-        if self.handle.routing_peers().await == 0 {
-            return Lookup::Unavailable(Unavailable::InsufficientRouting);
+        // short-circuits the query, recording NO ledger disclosure (no query touched the
+        // network). The FINER near-key bar (TASK-174) is applied on the QueryReach an actual
+        // walk achieved. `dht_addrs` are the DHT-learned addresses; `dht_absence` is the
+        // honest Lookup to fall back to if NEITHER provenance yields a candidate.
+        let (dht_addrs, dht_absence): (Vec<Multiaddr>, Lookup<DialInfo>) =
+            if self.handle.routing_peers().await == 0 {
+                (
+                    Vec::new(),
+                    Lookup::Unavailable(Unavailable::InsufficientRouting),
+                )
+            } else {
+                // We are about to actually consult the DHT: record the disclosure HERE, after
+                // the short-circuit, so a query that never touched the network does not
+                // pollute the ledger. An active peer-routing query reveals OUR identity to the
+                // DHT nodes it contacts. HONEST GAP: it also reveals the QUERIED target NodeId
+                // to those nodes, but the frozen `peer_fabric::Disclosed` enum models OUR
+                // disclosures + ContentKey and has no third-party-NodeId variant (TASK-168).
+                self.ledger
+                    .record(Exposure::new(Recipient::DhtNode, Disclosed::OurNodeId));
+                match self.handle.locate_peer(peer).await {
+                    Ok((addrs, _)) if !addrs.is_empty() => (addrs, Lookup::Miss),
+                    // A completed query that learned no address: Miss vs InsufficientRouting
+                    // turns on the NEAR-KEY bar (TASK-174). `dht_addrs` stays empty.
+                    Ok((_, reach)) => (Vec::new(), absence_from_reach(reach)),
+                    Err(QueryFail::Timeout) => (
+                        Vec::new(),
+                        Lookup::Unavailable(Unavailable::DeadlineExceeded),
+                    ),
+                    Err(QueryFail::Backend(why)) => {
+                        (Vec::new(), Lookup::Unavailable(Unavailable::Backend(why)))
+                    }
+                }
+            };
+
+        // --- Provenance 2: relay-circuit composition (TASK-218). ---
+        // Compose circuit candidates only when this node knows relays AND kad could NOT
+        // place the provider at a plausibly-public address (it returned nothing, or only
+        // loopback/private/link-local addrs - the exact NAT symptom). This SHOULD-filter
+        // avoids a gratuitous relay dial + Relay disclosure for a genuinely-public provider;
+        // both misfire directions are tolerable (over-compose = a wasted dial; under-compose
+        // = upstream fallback). Pure integer IP classification, no floats.
+        let circuit_locations: Vec<Multiaddr> =
+            if !self.known_relays.is_empty() && !addrs_include_public(&dht_addrs) {
+                self.compose_circuit_locations(peer)
+            } else {
+                Vec::new()
+            };
+        if !circuit_locations.is_empty() {
+            // Dialing a provider THROUGH a relay reveals to that relay operator that we relay
+            // to this provider. Record it ONLY here, where candidates are actually added, and
+            // separately from the DhtNode record above (so the empty-kad -> Found-via-circuit
+            // path records Relay-without-DhtNode honestly).
+            self.ledger
+                .record(Exposure::new(Recipient::Relay, Disclosed::OurNodeId));
         }
 
-        // We are about to actually consult the DHT: record the disclosure HERE, after the
-        // short-circuit, so a query that never touched the network does not pollute the
-        // ledger. An active peer-routing query reveals OUR identity to the DHT nodes it
-        // contacts. HONEST GAP: it also reveals the QUERIED target NodeId to those nodes,
-        // but the frozen `peer_fabric::Disclosed` enum models OUR disclosures + ContentKey
-        // and has no third-party-NodeId variant; recording that is a frozen-seam change
-        // under wire review (TASK-168), so we record the expressible OurNodeId disclosure.
-        self.ledger
-            .record(Exposure::new(Recipient::DhtNode, Disclosed::OurNodeId));
-
-        match self.handle.locate_peer(peer).await {
-            Ok((addrs, _)) if !addrs.is_empty() => {
-                // The frozen seam treats DialInfo locations as OPAQUE strings; for libp2p
-                // they are Multiaddr strings, reparsed inside the fabric when dialing.
-                Lookup::Found(DialInfo::new(
-                    addrs.into_iter().map(|addr| addr.to_string()),
-                ))
-            }
-            // A completed query that learned no address for the target. Whether that is
-            // "no address known right now" (Miss) or a could-not-consult
-            // (InsufficientRouting) turns on the NEAR-KEY bar: did the peer-routing walk
-            // actually reach any responding peer? (TASK-174; the Miss direction carries
-            // the partition/eclipse limit QueryReach documents.)
-            Ok((_, reach)) => absence_from_reach(reach),
-            Err(QueryFail::Timeout) => Lookup::Unavailable(Unavailable::DeadlineExceeded),
-            Err(QueryFail::Backend(why)) => Lookup::Unavailable(Unavailable::Backend(why)),
+        // --- Union. The frozen seam treats DialInfo locations as OPAQUE strings; for libp2p
+        // they are Multiaddr strings, reparsed inside the fabric when dialing. ---
+        let locations: Vec<String> = dht_addrs
+            .iter()
+            .chain(circuit_locations.iter())
+            .map(|addr| addr.to_string())
+            .collect();
+        if locations.is_empty() {
+            // Neither provenance produced a candidate: return the DHT walk's OWN honest
+            // absence (Miss / InsufficientRouting / DeadlineExceeded / Backend).
+            dht_absence
+        } else {
+            Lookup::Found(DialInfo::new(locations))
         }
     }
+
+    /// Construct a `/p2p-circuit` dial-address for `provider` through each known relay:
+    /// `<relayTransportAddr>/p2p/<relayPeer>/p2p-circuit/p2p/<providerPeer>` (TASK-218). Any
+    /// trailing `/p2p/<x>` AND any stray `/p2p-circuit` on the configured relay address are
+    /// stripped first, so the composed address carries exactly ONE relay-peer component and
+    /// ONE circuit hop even if a malformed config supplied a circuit-shaped relay addr. A
+    /// pure LOCAL construction - it consults no third party (the disclosure is recorded by
+    /// the caller only when these are actually added for dialing).
+    fn compose_circuit_locations(&self, provider: PeerId) -> Vec<Multiaddr> {
+        self.known_relays
+            .iter()
+            .map(|(relay_peer, relay_addr)| {
+                let mut base: Multiaddr = relay_addr
+                    .iter()
+                    .filter(|p| !matches!(p, Protocol::P2p(_) | Protocol::P2pCircuit))
+                    .collect();
+                base.push(Protocol::P2p(*relay_peer));
+                base.push(Protocol::P2pCircuit);
+                base.push(Protocol::P2p(provider));
+                base
+            })
+            .collect()
+    }
+}
+
+/// Does any address carry a plausibly-PUBLIC IP (TASK-218 SHOULD-filter)? Used to decide
+/// whether a provider looks NAT'd (all non-public / no address) and therefore warrants
+/// relay-circuit composition. An address with no IP component is treated as non-public (it
+/// is not a directly-dialable public transport address). Pure integer classification.
+fn addrs_include_public(addrs: &[Multiaddr]) -> bool {
+    addrs.iter().any(addr_is_public)
+}
+
+/// Classify a single multiaddr as carrying a public IP: the FIRST `Ip4`/`Ip6` component
+/// decides. Loopback / RFC1918-private / link-local / unspecified are NON-public (the NAT
+/// symptom); everything else is public. A `/dns*`-addressed provider (no IP literal) is
+/// treated as non-public, so we may over-compose a circuit + record one Relay disclosure for
+/// a DNS-named public provider - a tolerable wasted dial (the direct dns dial still wins),
+/// never a wrong answer.
+fn addr_is_public(addr: &Multiaddr) -> bool {
+    for p in addr.iter() {
+        match p {
+            Protocol::Ip4(ip) => return ipv4_is_public(ip),
+            Protocol::Ip6(ip) => return ipv6_is_public(ip),
+            _ => {}
+        }
+    }
+    false
+}
+
+/// RFC1918-private, loopback, link-local (169.254/16) and unspecified are non-public.
+fn ipv4_is_public(ip: Ipv4Addr) -> bool {
+    !(ip.is_loopback() || ip.is_private() || ip.is_link_local() || ip.is_unspecified())
+}
+
+/// Loopback (::1), unspecified (::), ULA (fc00::/7) and link-local (fe80::/10) are non-public.
+fn ipv6_is_public(ip: Ipv6Addr) -> bool {
+    let is_ula = (ip.segments()[0] & 0xfe00) == 0xfc00;
+    let is_link_local = (ip.segments()[0] & 0xffc0) == 0xfe80;
+    !(ip.is_loopback() || ip.is_unspecified() || is_ula || is_link_local)
 }
 
 #[async_trait]
@@ -185,11 +325,15 @@ impl NodeLocator for Libp2pNodeLocator {
     fn declared_exposure(&self) -> ExposureSurface {
         // The a-priori MAY-disclose surface, taken as the SUPERSET over policies: an active
         // peer-routing query (PublicInfrastructure) reveals OUR identity to the DHT nodes
-        // and the bootstrap it contacts. ExplicitPeersOnly is a strict subset (discloses
-        // nothing). See the module note on the queried-NodeId gap (TASK-168).
+        // and the bootstrap it contacts; when it composes a relay-circuit dial candidate
+        // (TASK-218) it also reveals to the relay operator that we relay to the target. The
+        // Relay entry belongs to the superset whether or not any concrete resolve composes a
+        // circuit. ExplicitPeersOnly is a strict subset (discloses nothing). See the module
+        // note on the queried-NodeId gap (TASK-168).
         ExposureSurface::from_exposures([
             Exposure::new(Recipient::DhtNode, Disclosed::OurNodeId),
             Exposure::new(Recipient::Bootstrap, Disclosed::OurNodeId),
+            Exposure::new(Recipient::Relay, Disclosed::OurNodeId),
         ])
     }
 }

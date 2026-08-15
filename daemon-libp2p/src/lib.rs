@@ -1245,9 +1245,19 @@ async fn start_and_join_libp2p(
     cfg: &Libp2pSourceConfig,
     supplier: Option<Arc<dyn Libp2pNarSupplier>>,
 ) -> Result<Arc<Libp2pFabric>, String> {
-    let node_config = NodeConfig::new(cfg.identity_seed)
+    let mut node_config = NodeConfig::new(cfg.identity_seed)
         .with_network_scope(cfg.network_scope.clone())
         .with_relay_server(cfg.relay_server_enabled);
+    // TASK-218: teach the node-locator the relays this node knows from bootstrap config,
+    // so a discovery-only consumer can CONSTRUCT a NAT'd provider's /p2p-circuit
+    // dial-address (<relayAddr>/p2p/<relayPeer>/p2p-circuit/p2p/<providerPeer>) from the
+    // provider PeerId it discovered via kad plus a bootstrap-known relay. A bootstrap peer
+    // IS the relay a NAT'd provider reserves on in the shipped topology; this is permitted
+    // config, NOT out-of-band provider-address injection (the provider identity still comes
+    // ONLY from kad get_providers). See NodeConfig::known_relays for the generality limit.
+    for (peer, addr) in &cfg.bootstrap {
+        node_config = node_config.with_known_relay(*peer, addr.clone());
+    }
     let serving = supplier.is_some();
     // TASK-185, AC#1: a configured `state_dir` routes to the DURABLE constructors, so the
     // shipped daemon reloads its anti-rollback floor + per-key announce sequence on restart.

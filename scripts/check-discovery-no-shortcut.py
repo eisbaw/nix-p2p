@@ -46,6 +46,7 @@ was scanned so nothing was proven.
 
 from __future__ import annotations
 
+import re
 import sys
 import tempfile
 from pathlib import Path
@@ -83,6 +84,45 @@ FORBIDDEN = {
 # discovery. Documented here so a future reader sees the boundary is deliberate, and
 # asserted by the second self-test arm (a composition adding these must NOT trip).
 PERMITTED_DIAL_ASSISTANCE = ("autonat", "dcutr", "relay")
+
+# TASK-218 (mped-architect must-fix #3): the relay-circuit dial-address the locator
+# COMPOSES for a NAT'd provider must come from a CONFIG-LEVEL, provider-INDEPENDENT relay
+# set (`known_relays`), never from a per-provider / per-content channel. A per-provider
+# relay map would be "the relay THIS provider is on", i.e. address injection under another
+# name - reintroducing exactly what the kad-exclusive discovery guarantee forbids. We
+# enforce it STRUCTURALLY: every declaration of the `known_relays` field/param must be a
+# flat `Vec<...>`, never a map keyed by a provider/content identity. The field DECLARATION
+# is `known_relays: <Type>`; a map type there (BTreeMap/HashMap/… keyed by NodeId/provider/
+# ContentKey) is the violation. Prose/doc mentions (no `:` type after the name) are ignored.
+KNOWN_RELAYS_DECL = re.compile(r"\bknown_relays\s*:\s*([A-Za-z_][A-Za-z0-9_]*)")
+
+
+def scan_relay_provider_independence(roots: list[Path]) -> list[str]:
+    """The known_relays circuit-composition input must be a provider-INDEPENDENT Vec."""
+    violations: list[str] = []
+    for root in roots:
+        if not root.exists():
+            continue
+        for source in sorted(root.rglob("*.rs")):
+            rel_parts = set(source.relative_to(root).parts)
+            if SKIP_DIRS & rel_parts:
+                continue
+            try:
+                text = source.read_text()
+            except (UnicodeDecodeError, OSError):
+                continue
+            for line in text.splitlines():
+                stripped = line.lstrip()
+                if stripped.startswith("//"):
+                    continue  # a comment/doc mention, not a real declaration
+                m = KNOWN_RELAYS_DECL.search(line)
+                if m and m.group(1) != "Vec":
+                    violations.append(
+                        f"{source}: `known_relays` declared as {m.group(1)}<…> - it MUST be a "
+                        "provider-INDEPENDENT Vec<(PeerId, Multiaddr)>; a provider/content-keyed "
+                        "map is per-provider circuit-address injection (TASK-218)"
+                    )
+    return violations
 
 
 def scan(roots: list[Path]) -> tuple[list[str], int]:
@@ -151,6 +191,32 @@ def self_test() -> int:
             )
             return 1
         (root / "dial_assistance.rs").unlink()
+        # TASK-218 provider-independence: a provider-keyed relay map (per-provider circuit
+        # injection) MUST bite; the shipped flat Vec MUST NOT.
+        (root / "relay_ok.rs").write_text(
+            "pub struct Cfg {\n    pub known_relays: Vec<(PeerId, Multiaddr)>,\n}\n"
+        )
+        relay_ok = scan_relay_provider_independence([Path(tmp) / "fabric-libp2p" / "src"])
+        if relay_ok:
+            print(
+                "self-test FAILED: a flat `known_relays: Vec<…>` was flagged as per-provider "
+                f"injection ({relay_ok}) - the provider-independent Vec must be allowed",
+                file=sys.stderr,
+            )
+            return 1
+        (root / "relay_ok.rs").unlink()
+        (root / "relay_bad.rs").write_text(
+            "pub struct Cfg {\n    pub known_relays: BTreeMap<NodeId, Multiaddr>,\n}\n"
+        )
+        relay_bad = scan_relay_provider_independence([Path(tmp) / "fabric-libp2p" / "src"])
+        if not any("known_relays" in v for v in relay_bad):
+            print(
+                "self-test FAILED: a provider-keyed `known_relays: BTreeMap<NodeId, …>` did NOT "
+                "trip the guard - per-provider circuit injection would slip through",
+                file=sys.stderr,
+            )
+            return 1
+        (root / "relay_bad.rs").unlink()
         # The MUTATION: re-enable a LAN discovery substitute. The guard MUST bite.
         (root / "mutated.rs").write_text(
             "pub struct Behaviour {\n"
@@ -186,6 +252,8 @@ def main(argv: list[str]) -> int:
             return 0
     roots = [Path(a) for a in args] if args else [Path(r) for r in DISCOVERY_ROOTS]
     violations, scanned = scan(roots)
+    # TASK-218: also enforce that the relay-circuit composition input is provider-independent.
+    violations = violations + scan_relay_provider_independence(roots)
     if scanned == 0:
         print(
             "check-discovery-no-shortcut: NOTHING scanned - nothing proven "
