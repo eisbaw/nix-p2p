@@ -544,16 +544,34 @@ pub struct HoldQuery {
 /// The answer to a [`HoldQuery`]: have-with-offers, or absent. Yes/no ONLY - it
 /// never carries a listing of other holdings, and it concerns only the queried
 /// hash. Unknown transport offers are dropped on decode (tolerated but inert).
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+///
+/// ## Bounded to ONE offer per transport KIND (task-110 freeze amendment)
+///
+/// `offers` answers about EXACTLY ONE key, and the content behind a key has one
+/// identity per transport kind, so a legitimate `Have` needs at most one offer
+/// per kind. That bound is ENFORCED at both wire boundaries by
+/// [`check_single_offer_bindings`] (at most [`MAX_OFFERS_PER_ANSWER`], one per
+/// kind), against the RAW pre-drop offer list so unknown-kind PADDING is bounded
+/// too - see that function's doc for the freeze-amendment rationale. It is the
+/// single-key twin of the batch rule in [`check_batch_offer_bindings`].
+///
+/// NOTE THE MISSING `Deserialize` (same reason as [`BatchHoldResponse`]): the
+/// bound is only a bound if the validator is the ONLY path from bytes. Unknown
+/// transport kinds are tolerated-but-dropped on decode, so the offers are parsed
+/// into position-preserving [`OfferSlot`]s, bound-checked against the raw list,
+/// and only then dropped - all inside [`decode_hold_response`]. A derived
+/// `Deserialize` would let a caller skip that and re-open the amplification. The
+/// non-`Deserialize` fact is enforced by coherence in [`not_deserialize`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(tag = "answer", rename_all = "snake_case")]
 pub enum HoldAnswer {
     /// "Yes, I hold it": the single content identity (`blake3`) for the queried
     /// key, plus pure-locator offers. The `blake3` lives here exactly once - a
     /// Have has no payload - so the offers carry no digest to disagree with it. A
-    /// consumer fetches the `blake3` via any offer's locator.
+    /// consumer fetches the `blake3` via any offer's locator. Bounded to one
+    /// offer per transport kind (see the type doc).
     Have {
         blake3: Blake3Digest,
-        #[serde(default, deserialize_with = "deserialize_known_transports")]
         offers: Vec<KnownTransport>,
     },
     /// "No, I do not hold it."
@@ -563,11 +581,46 @@ pub enum HoldAnswer {
 /// The versioned response envelope for a [`HoldQuery`]. The answer is FLATTENED
 /// so the wire is `{schema_version, answer, [offers]}` - `answer` is the yes/no
 /// tag (`have`/`absent`), not a nested object.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+///
+/// NOT `Deserialize`, deliberately (see [`HoldAnswer`] and [`not_deserialize`]):
+/// [`decode_hold_response`] is the ONLY way to build one from bytes, because the
+/// offer bound has to run against the RAW pre-drop offer list. A derived
+/// `Deserialize` compiled cleanly and silently skipped the bound.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct HoldResponse {
     pub schema_version: u16,
     #[serde(flatten)]
     pub answer: HoldAnswer,
+}
+
+/// The wire twin of [`HoldResponse`] used ONLY by [`decode_hold_response`]. It
+/// differs from [`HoldResponse`] in one way: a `Have`'s offer list keeps a SLOT
+/// for every element the peer sent, an unknown transport kind decoding to an
+/// [`OfferSlot::Unknown`] rather than vanishing. Keeping the slot is what lets the
+/// one-per-kind + count bound COUNT unknown kinds - so a peer cannot pad a
+/// one-key answer to 64 KiB with offers this build would silently drop - while
+/// still dropping them from the value a caller sees (forward compatibility).
+#[derive(Deserialize)]
+struct HoldResponseWire {
+    schema_version: u16,
+    #[serde(flatten)]
+    answer: HoldAnswerWire,
+}
+
+/// The wire twin of [`HoldAnswer`]: identical acceptance to the frozen type
+/// EXCEPT that `Have.offers` decodes into position-preserving [`OfferSlot`]s
+/// (unknown kinds preserved for counting, then dropped by
+/// [`keep_known_offers`]). No `deny_unknown_fields` is added - that would narrow
+/// acceptance beyond this task's scope; only the offer COUNT/kind is bounded.
+#[derive(Deserialize)]
+#[serde(tag = "answer", rename_all = "snake_case")]
+enum HoldAnswerWire {
+    Have {
+        blake3: Blake3Digest,
+        #[serde(default, deserialize_with = "deserialize_transport_slots")]
+        offers: Vec<OfferSlot>,
+    },
+    Absent,
 }
 
 // -------------------------------------------------------------------------
@@ -838,27 +891,31 @@ pub struct BatchHoldResponse {
     pub answers: Vec<BatchHoldAnswer>,
 }
 
-/// COMPILE-TIME PROOF that [`BatchHoldResponse`] does not implement `Deserialize`.
+/// COMPILE-TIME PROOF that the wire response types do not implement
+/// `Deserialize`.
 ///
-/// The whole index-remap safety argument rests on `decode_batch_hold_response`
-/// being the only way to build one from bytes. That was enforced by nothing but
-/// the absence of a word: re-adding `Deserialize` to the derive list compiled
-/// cleanly and left the entire suite GREEN, silently reopening the rebinding
-/// hazard the position-preserving slots exist to close.
+/// The bound-runs-before-value safety argument rests on the `decode_*` functions
+/// being the only way to build these from bytes. For [`BatchHoldResponse`] that
+/// protects the index-remap; for [`HoldResponse`]/[`HoldAnswer`] (task-110) it
+/// protects the one-offer-per-kind bound, which runs against the RAW pre-drop
+/// slots and would be silently skipped by a derived `Deserialize`. Both were
+/// enforced by nothing but the absence of a word: re-adding `Deserialize` to a
+/// derive list compiled cleanly and left the whole suite GREEN.
 ///
 /// Rust has no negative trait bound, so the proof is by COHERENCE: the blanket
-/// impl below covers every `Deserialize` type, and the specific impl covers
-/// `BatchHoldResponse`. They overlap if and only if `BatchHoldResponse` is
-/// `Deserialize`, and an overlap is E0119 - a build error, not a test failure.
-/// There is deliberately no accompanying #[test]: a test would document the fact,
-/// and this enforces it.
+/// impl below covers every `Deserialize` type, and each specific impl covers one
+/// of these types. They overlap if and only if that type is `Deserialize`, and an
+/// overlap is E0119 - a build error, not a test failure. There is deliberately no
+/// accompanying #[test]: a test would document the fact, and this enforces it.
 mod not_deserialize {
-    use super::BatchHoldResponse;
+    use super::{BatchHoldResponse, HoldAnswer, HoldResponse};
 
     #[allow(dead_code)] // a coherence vehicle, never called: see the module doc
     pub(super) trait NotDeserialize {}
     impl<T> NotDeserialize for T where T: for<'de> serde::Deserialize<'de> {}
     impl NotDeserialize for BatchHoldResponse {}
+    impl NotDeserialize for HoldResponse {}
+    impl NotDeserialize for HoldAnswer {}
 }
 
 /// The wire twin of [`BatchHoldResponse`] used ONLY by
@@ -1023,6 +1080,79 @@ fn compact_offer_slots(
         }
     }
     kept
+}
+
+/// Reject a SINGLE-KEY [`HoldAnswer::Have`] offer list that names more than one
+/// locator of the same transport kind, or more than [`MAX_OFFERS_PER_ANSWER`] in
+/// total. Applied on BOTH encode and decode (see [`encode_hold_response`] /
+/// [`decode_hold_response`]), against the RAW pre-drop [`OfferSlot`] list so that
+/// unknown transport kinds count too.
+///
+/// ## Why this is a DELIBERATE freeze amendment, not a slip (task-110)
+///
+/// This NARROWS what the FROZEN `HoldAnswer::Have.offers` ACCEPTS: a v1 wire with
+/// 622 offers used to decode and now does not. It is APPROVED by the same four
+/// arguments the orchestrator ruled on for `deny_unknown_fields` at
+/// [`KnownTransport`]/[`KnownPayload`] (TASK-91, 2026-08-10), re-examined here:
+///   1. IT ALIGNS THE CODE WITH A RULE THE MODULE ALREADY ENFORCES. The batch
+///      path already holds that "the content behind a key has ONE identity per
+///      transport kind" ([`check_batch_offer_bindings`], one locator per kind).
+///      The single-key `Have` answers about exactly ONE key, so the SAME theorem
+///      gives the tighter bound directly. This closes the gap where the frozen
+///      single-key path did not implement the module's own stated single-identity
+///      rule; it invents no new policy.
+///   2. FORWARD COMPATIBILITY IS PRESERVED. Unknown transport KINDS still decode
+///      inertly (dropped by [`keep_known_offers`] after being counted), so a
+///      future transport still ships without a wire break - proven by
+///      `a_single_key_have_still_drops_unknown_transports_inertly`. Only the
+///      COUNT is refused, which is exactly the amplification/enumeration surface.
+///   3. IT COSTS NOTHING WHILE NO PEERS ARE DEPLOYED. There is no released
+///      network to break; the cost of tightening is zero today and rises
+///      monotonically. Tightening later is a real break; tightening now is not.
+///   4. IT TIGHTENS A REAL AMPLIFICATION AND ENUMERATION VECTOR. Measured: 622
+///      `bittorrent` offers = 65 440 B against an 88 B query = 743.6x, and a
+///      `bittorrent` infohash is a CONTENT identity, so those 622 offers name 621
+///      content identities the asker never asked about. After the bound a one-key
+///      `Have` carries at most one offer per kind (iroh + bittorrent = 330 B =
+///      3.75x). Pinned by `a_single_key_have_cannot_amplify_past_one_per_kind`.
+///
+/// The accept-set narrowed; the emit-set did not (the golden `hold_response_*`
+/// encodings are byte-identical). An auditor finds this decision, not a slip.
+pub(crate) fn check_single_offer_bindings(offers: &[OfferSlot]) -> Result<(), ClaimCodecError> {
+    if offers.len() > MAX_OFFERS_PER_ANSWER {
+        return Err(ClaimCodecError::Malformed(format!(
+            "hold answer names {} offers; at most {MAX_OFFERS_PER_ANSWER} locators can \
+             describe one key",
+            offers.len()
+        )));
+    }
+    let mut kinds = std::collections::HashSet::with_capacity(offers.len());
+    for offer in offers {
+        let kind = offer.wire_tag();
+        if !kinds.insert(kind) {
+            return Err(ClaimCodecError::Malformed(format!(
+                "hold answer names two `{kind}` offers; the content behind one key has ONE \
+                 identity per transport, so the second names a different blob"
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// Drop the unknown-transport slots from a single-key [`HoldAnswer::Have`] offer
+/// list, keeping the known ones in order. The single-key twin of
+/// [`compact_offer_slots`]: there are no indices to re-map here (the list is
+/// flat), so this is a plain filter. Applied AFTER
+/// [`check_single_offer_bindings`], so an unknown kind is counted against the
+/// bound and only then dropped (tolerate-but-drop, per key).
+fn keep_known_offers(slots: Vec<OfferSlot>) -> Vec<KnownTransport> {
+    slots
+        .into_iter()
+        .filter_map(|slot| match slot {
+            OfferSlot::Known(offer) => Some(offer),
+            OfferSlot::Unknown(_) => None,
+        })
+        .collect()
 }
 
 /// Reject a batch key list that is empty, over the cap, or contains a repeated
@@ -1267,19 +1397,47 @@ pub fn decode_hold_query(bytes: &[u8]) -> Result<HoldQuery, ClaimCodecError> {
     Ok(query)
 }
 
-/// Encode a hold response to its wire bytes.
+/// Encode a hold response to its wire bytes, refusing to EMIT an offer list this
+/// node's own decoder would refuse: a `Have` may name at most one offer per
+/// transport kind ([`check_single_offer_bindings`]). Bounding the sender means a
+/// bug that piles up offers fails HERE, loudly, not as a peer's rejection - the
+/// same fail-fast rationale as [`encode_batch_hold_response`].
 pub fn encode_hold_response(response: &HoldResponse) -> Result<Vec<u8>, ClaimCodecError> {
+    if let HoldAnswer::Have { offers, .. } = &response.answer {
+        check_single_offer_bindings(&as_offer_slots(offers))?;
+    }
     encode_checked(response)
 }
 
-/// Decode + validate a hold response (size-, duplicate-key- and version-checked).
+/// Decode + validate a hold response.
+///
+/// Size-, duplicate-key- and version-checked, and - task-110 - the `Have` offer
+/// list is BOUND: at most one offer per transport kind, at most
+/// [`MAX_OFFERS_PER_ANSWER`] in total ([`check_single_offer_bindings`]). The bound
+/// runs against the RAW, pre-drop offer slots (so unknown-kind padding is counted,
+/// not silently dropped under the bound) and BEFORE the value is handed back, so
+/// an over-cap response is REJECTED rather than trusted. Unknown transport kinds
+/// are then dropped ([`keep_known_offers`]), tolerated-but-inert as before.
 pub fn decode_hold_response(bytes: &[u8]) -> Result<HoldResponse, ClaimCodecError> {
     check_size(bytes.len())?;
     reject_duplicate_keys(bytes)?;
-    let response: HoldResponse =
+    let wire: HoldResponseWire =
         serde_json::from_slice(bytes).map_err(|e| ClaimCodecError::Malformed(e.to_string()))?;
-    check_version(response.schema_version, QUERY_SCHEMA_VERSION)?;
-    Ok(response)
+    check_version(wire.schema_version, QUERY_SCHEMA_VERSION)?;
+    let answer = match wire.answer {
+        HoldAnswerWire::Have { blake3, offers } => {
+            check_single_offer_bindings(&offers)?;
+            HoldAnswer::Have {
+                blake3,
+                offers: keep_known_offers(offers),
+            }
+        }
+        HoldAnswerWire::Absent => HoldAnswer::Absent,
+    };
+    Ok(HoldResponse {
+        schema_version: wire.schema_version,
+        answer,
+    })
 }
 
 /// Encode a BATCHED hold query to its wire bytes, refusing to EMIT an over-cap,
@@ -2008,6 +2166,172 @@ mod tests {
             "an absent answer must not leak a holdings listing"
         );
         assert!(on_wire.get("blake3").is_none());
+    }
+
+    // --- single-key Have offers are bounded to one per kind (task-110) -------
+
+    /// Build the wire bytes of a single-key `Have` carrying `n` copies of an
+    /// offer whose `transport` tag is `tag`, WITHOUT going through
+    /// [`encode_hold_response`] - the whole point is to synthesise the hostile
+    /// pre-bound message a peer could send, which the encoder now refuses to make.
+    fn have_wire_with_repeated_offer(tag: &str, body: &str, n: usize) -> Vec<u8> {
+        let offer = format!("{{\"transport\":\"{tag}\",{body}}}");
+        let offers = vec![offer; n].join(",");
+        format!(
+            "{{\"schema_version\":{QUERY_SCHEMA_VERSION},\"answer\":\"have\",\
+             \"blake3\":\"{BLAKE3_HEX}\",\"offers\":[{offers}]}}"
+        )
+        .into_bytes()
+    }
+
+    #[test]
+    fn a_single_key_have_cannot_amplify_past_one_per_kind() {
+        // AC#1 + AC#2. BEFORE (pinned): a `Have` about ONE key could carry 622
+        // `bittorrent` offers = 65 440 B against an 88 B query = 743.6x, bounded
+        // only by the 64 KiB wire gate - and a bittorrent infohash is a CONTENT
+        // identity, so those 622 offers name 621 content identities the asker
+        // never asked about (a no-enumeration leak, not just amplification).
+        let query_bytes = encode_hold_query(&HoldQuery {
+            schema_version: QUERY_SCHEMA_VERSION,
+            key: key(),
+        })
+        .expect("encode query");
+        assert_eq!(query_bytes.len(), 88, "the pinned before-query is 88 B");
+
+        let before = have_wire_with_repeated_offer(
+            "bittorrent",
+            &format!("\"infohash\":\"{INFOHASH_HEX}\""),
+            622,
+        );
+        assert_eq!(
+            before.len(),
+            65_440,
+            "the pinned before-response is 65 440 B"
+        );
+        // 65 440 / 88 = 743.6x (terminal DISPLAY only; the gate below is integer).
+        assert!(
+            before.len() < MAX_CLAIM_WIRE_BYTES,
+            "the before-message passed the ONLY pre-existing gate (the 64 KiB \
+             MAX_CLAIM_WIRE_BYTES), which is exactly why the count bound is needed"
+        );
+        // The bound REJECTS it now (622 `bittorrent` offers is >1 per kind AND
+        // > MAX_OFFERS_PER_ANSWER). Proven to reject BEFORE any value is trusted:
+        // decode returns Err, so no `HoldAnswer::Have` is ever handed back.
+        assert!(matches!(
+            decode_hold_response(&before),
+            Err(ClaimCodecError::Malformed(_))
+        ));
+
+        // AFTER: the largest SENDABLE one-key answer is one offer per known kind
+        // (iroh + bittorrent). Measured through the real encoder.
+        let after = HoldResponse {
+            schema_version: QUERY_SCHEMA_VERSION,
+            answer: HoldAnswer::Have {
+                blake3: blake3_id(),
+                offers: vec![
+                    KnownTransport::Iroh { node: node_a() },
+                    KnownTransport::BitTorrent {
+                        infohash: infohash(),
+                    },
+                ],
+            },
+        };
+        let after_bytes = encode_hold_response(&after).expect("encode after");
+        assert_eq!(after_bytes.len(), 330, "the after-response is 330 B");
+        // Amplification as an EXACT rational, no float in the assertion: after/query
+        // = 330/88 = 15/4 (cross-multiplied). Display is 3.75x.
+        assert_eq!(after_bytes.len() * 4, query_bytes.len() * 15);
+        // Round-trips through the bound cleanly (it is at the bound, not over it).
+        assert_eq!(
+            decode_hold_response(&after_bytes).expect("decode after"),
+            after
+        );
+    }
+
+    #[test]
+    fn a_single_key_have_rejects_two_offers_of_the_same_kind() {
+        // The load-bearing semantic rule, at both known kinds. Two `iroh` or two
+        // `bittorrent` offers on ONE key name a second blob for a single content
+        // identity - forbidden by the same theorem as the batch path.
+        let two_iroh =
+            have_wire_with_repeated_offer("iroh", &format!("\"node\":\"{NODE_A_HEX}\""), 2);
+        assert!(matches!(
+            decode_hold_response(&two_iroh),
+            Err(ClaimCodecError::Malformed(_))
+        ));
+        let two_bt = have_wire_with_repeated_offer(
+            "bittorrent",
+            &format!("\"infohash\":\"{INFOHASH_HEX}\""),
+            2,
+        );
+        assert!(matches!(
+            decode_hold_response(&two_bt),
+            Err(ClaimCodecError::Malformed(_))
+        ));
+
+        // The ENCODER refuses to emit it either (a bug fails at the sender).
+        let dup = HoldResponse {
+            schema_version: QUERY_SCHEMA_VERSION,
+            answer: HoldAnswer::Have {
+                blake3: blake3_id(),
+                offers: vec![
+                    KnownTransport::Iroh { node: node_a() },
+                    KnownTransport::Iroh { node: node_b() },
+                ],
+            },
+        };
+        assert!(matches!(
+            encode_hold_response(&dup),
+            Err(ClaimCodecError::Malformed(_))
+        ));
+    }
+
+    #[test]
+    fn the_bound_counts_raw_offers_before_unknown_kinds_are_dropped() {
+        // AC#5 boundary: the bound must run against the RAW pre-drop offer list,
+        // or a peer pads a one-key answer to the wire gate with offers this build
+        // would silently drop. Five DISTINCT unknown kinds decode to zero kept
+        // offers, yet must be REFUSED (5 > MAX_OFFERS_PER_ANSWER) - which is only
+        // observable if the count is taken before the drop.
+        let offers = (0..5)
+            .map(|i| format!("{{\"transport\":\"future{i}\",\"loc\":\"x\"}}"))
+            .collect::<Vec<_>>()
+            .join(",");
+        let wire = format!(
+            "{{\"schema_version\":{QUERY_SCHEMA_VERSION},\"answer\":\"have\",\
+             \"blake3\":\"{BLAKE3_HEX}\",\"offers\":[{offers}]}}"
+        );
+        assert!(
+            matches!(
+                decode_hold_response(wire.as_bytes()),
+                Err(ClaimCodecError::Malformed(_))
+            ),
+            "five unknown-kind offers must be counted (and refused) even though all \
+             five drop to nothing"
+        );
+    }
+
+    #[test]
+    fn a_single_key_have_still_drops_unknown_transports_inertly() {
+        // AC#4 forward compatibility: a `Have` mixing one known (iroh) and one
+        // unknown-kind offer must still DECODE, the unknown kind dropped inertly,
+        // the known one kept. The count bound (2 offers, 2 distinct kinds) admits
+        // it - the unknown kind is tolerated, not a wire break.
+        let wire = format!(
+            "{{\"schema_version\":{QUERY_SCHEMA_VERSION},\"answer\":\"have\",\
+             \"blake3\":\"{BLAKE3_HEX}\",\"offers\":[\
+             {{\"transport\":\"iroh\",\"node\":\"{NODE_A_HEX}\"}},\
+             {{\"transport\":\"future_quic\",\"endpoint\":\"somewhere\"}}]}}"
+        );
+        let decoded = decode_hold_response(wire.as_bytes()).expect("unknown kind is inert");
+        assert_eq!(
+            decoded.answer,
+            HoldAnswer::Have {
+                blake3: blake3_id(),
+                offers: vec![KnownTransport::Iroh { node: node_a() }],
+            },
+            "the unknown transport kind is dropped, the known one kept"
+        );
     }
 
     // --- BATCHED query (task-91): bounded, positional, still no enumeration --

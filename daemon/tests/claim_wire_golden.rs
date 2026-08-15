@@ -156,6 +156,7 @@ const EXERCISED: &[&str] = &[
     "reject_batch_response_offer_bound_to_no_answer",
     "reject_batch_response_two_locators_of_one_kind",
     "reject_batch_answer_absent_with_a_field",
+    "reject_hold_response_two_locators_of_one_kind",
 ];
 
 #[test]
@@ -214,6 +215,10 @@ fn every_reject_vector_is_refused() {
                 .map_err(|e| format!("{e:?}"))
         } else if name.starts_with("reject_batch_hold_query") {
             decode_batch_hold_query(&bytes)
+                .map(|_| ())
+                .map_err(|e| format!("{e:?}"))
+        } else if name.starts_with("reject_hold_response") {
+            decode_hold_response(&bytes)
                 .map(|_| ())
                 .map_err(|e| format!("{e:?}"))
         } else {
