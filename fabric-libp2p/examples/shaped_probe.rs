@@ -9,10 +9,12 @@
 //!
 //! WHAT THE FETCH CLOCK TIMES (honest scope, TASK-198 F3). The fetcher is HANDED the provider
 //! multiaddr + PeerId out of band by the harness — it does NO DHT discovery — and the dial +
-//! Noise/yamux handshake complete BEFORE the clock starts. The timed window is therefore an
-//! ALREADY-CONNECTED open-stream `/nar/3` fetch: open the substream, send the request, and stream
-//! the body. Discovery / dial / handshake are OUT of the measured window; do not read the elapsed
-//! as a full discover->fetch->serve round.
+//! Noise/yamux handshake are driven to COMPLETION before the clock starts: after `dial` (which
+//! only INITIATES the connection) the fetcher POLLS `is_connected` until the swarm reports the
+//! peer fully established (`ConnectionEstablished` fired — handshake done), and only THEN starts
+//! timing. The timed window is therefore genuinely an ALREADY-CONNECTED open-stream `/nar/3`
+//! fetch: open the substream, send the request, and stream the body. Discovery / dial / handshake
+//! are OUT of the measured window; do not read the elapsed as a full discover->fetch->serve round.
 //!
 //!   provide <listen-ip> <port> <id-seed> <nar-bytes> <nar-seed> <peerid-file> [payload-kind]
 //!       Start a node, serve one deterministic NAR, write our PeerId to <peerid-file> once
@@ -226,8 +228,6 @@ async fn fetch(args: &[String]) {
 
     // Direct dial by multiaddr (the proven `direct_fetch` idiom from nar_transport.rs):
     // teach the address book, then establish the connection (dial + Noise/yamux handshake).
-    // This all completes BEFORE the clock starts, so the measured window EXCLUDES discovery,
-    // dial, and the handshake — it times an already-connected open-stream `/nar/3` fetch only.
     node.handle
         .add_address(provider_peer, provider_addr.clone())
         .await;
@@ -236,10 +236,34 @@ async fn fetch(args: &[String]) {
         .await
         .expect("dial provider");
 
-    // Clock STARTS on an already-established connection: open the `/nar/3` substream, send the
-    // request, await the first response byte (~one RTT of first-byte latency), then stream the
-    // body. Both arms pay that request round-trip + flow-control ramp once, independent of payload
-    // size — the honest fixed cost that keeps the wall-clock speedup below the wire-byte ratio.
+    // TASK-198 F3 (true timing boundary): `dial().await` returns as soon as the connection is
+    // INITIATED — the Noise + yamux handshake still runs asynchronously AFTER it returns. Starting
+    // the clock here would leave the handshake INSIDE the timed window, making the
+    // "already-connected open-stream fetch" label FALSE. So we DRIVE the connection to completion
+    // first: poll `is_connected` (true only once the swarm has fired `ConnectionEstablished`, i.e.
+    // the handshake is DONE) until the peer is genuinely up, and only THEN start the clock. This
+    // makes discovery + dial + Noise/yamux all fall OUTSIDE the timed window — the label is now
+    // true. Bounded so a connection that never establishes fails loud instead of hanging silently.
+    let connect_deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        if node.handle.is_connected(provider_peer).await {
+            break;
+        }
+        if Instant::now() >= connect_deadline {
+            panic!(
+                "provider connection was not ESTABLISHED within 30s after dial \
+                 (Noise/yamux handshake never completed) — cannot start a handshake-excluded clock"
+            );
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+
+    // Clock STARTS on an ESTABLISHED connection (confirmed by the poll above — the handshake is
+    // already complete): open the `/nar/3` substream, send the request, await the first response
+    // byte (~one RTT of first-byte latency), then stream the body. Both arms pay that request
+    // round-trip + flow-control ramp once, independent of payload size — the honest fixed cost
+    // that keeps the wall-clock speedup below the wire-byte ratio. The dial + handshake are OUT of
+    // this window (they finished before t0), so the "already-connected" label is TRUE.
     let t0 = Instant::now();
     let fetched = node
         .handle

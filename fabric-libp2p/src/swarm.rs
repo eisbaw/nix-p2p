@@ -256,6 +256,16 @@ pub enum Command {
     RoutingPeers {
         reply: oneshot::Sender<usize>,
     },
+    /// Is there a fully-ESTABLISHED connection to `peer` right now? (TASK-198 F3). `true` iff the
+    /// swarm has an open connection whose upgrade — the Noise handshake and yamux muxer
+    /// negotiation — has already completed (i.e. a `ConnectionEstablished` has fired and no
+    /// matching close since). A caller polls this after `dial` to confirm the handshake is DONE
+    /// before it starts a wall-clock it wants to exclude the handshake from. Read-only; touches no
+    /// wire framing.
+    IsConnected {
+        peer: PeerId,
+        reply: oneshot::Sender<bool>,
+    },
     StartProviding {
         key: kad::RecordKey,
         reply: oneshot::Sender<Result<(), String>>,
@@ -484,6 +494,17 @@ impl SwarmHandle {
         let (reply, rx) = oneshot::channel();
         self.send(Command::RoutingPeers { reply }).await;
         rx.await.unwrap_or(0)
+    }
+
+    /// Is there a fully-established connection to `peer` right now (Noise + yamux upgrade already
+    /// complete)? (TASK-198 F3). A `dial` only INITIATES a connection and returns before the
+    /// handshake finishes; a caller that must EXCLUDE the handshake from a wall-clock polls this
+    /// until it returns `true`, at which point `ConnectionEstablished` has fired and the timed
+    /// window that follows contains no handshake. A dropped worker answers `false` (not connected).
+    pub async fn is_connected(&self, peer: PeerId) -> bool {
+        let (reply, rx) = oneshot::channel();
+        self.send(Command::IsConnected { peer, reply }).await;
+        rx.await.unwrap_or(false)
     }
 
     /// Join the network through a SET of independently-operated bootstrap peers. Pass
@@ -1004,6 +1025,12 @@ impl Worker {
                     .map(|bucket| bucket.num_entries())
                     .sum();
                 let _ = reply.send(count);
+            }
+            Command::IsConnected { peer, reply } => {
+                // `Swarm::is_connected` is true only once a connection's upgrade (Noise + yamux)
+                // has completed and `ConnectionEstablished` fired — exactly the post-handshake
+                // signal the F3 caller polls for before starting its timed window.
+                let _ = reply.send(self.swarm.is_connected(&peer));
             }
             Command::StartProviding { key, reply } => {
                 match self.swarm.behaviour_mut().kad.start_providing(key) {
