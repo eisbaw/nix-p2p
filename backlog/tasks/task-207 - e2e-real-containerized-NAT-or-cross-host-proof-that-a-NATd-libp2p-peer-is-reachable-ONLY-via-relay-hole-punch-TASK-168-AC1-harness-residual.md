@@ -3,10 +3,10 @@ id: TASK-207
 title: >-
   e2e: real containerized-NAT or cross-host proof that a NATd libp2p peer is
   reachable ONLY via relay/hole-punch (TASK-168 AC#1 harness residual)
-status: To Do
+status: In Progress
 assignee: []
 created_date: '2026-08-14 17:19'
-updated_date: '2026-08-15 08:42'
+updated_date: '2026-08-15 13:01'
 labels:
   - libp2p
   - fabric
@@ -46,4 +46,60 @@ VIABLE PATHS for a future cycle (pick one):
 TEST-LOCK-IN (unchanged from 168): minimal-pair bite - the NATd peer fetches byte-identical with relay/dcutr ON; disable them -> that peer is undiallable -> upstream fallback (upstream.nar>=1). Extend scripts/e2e_harness.py - the Libp2pNetnsTopology separate-netns class is the base - with the NAT gateway + the relay/bootstrap node.
 
 OWNER ENVIRONMENT DECISION (2026-08-15): build a NixOS VM harness — TWO NixOS VMs, EACH behind its OWN NAT — for the real-NAT hole-punch proof. This UNPARKS 207 (was env-blocked on the rootless host). Approach: NixOS VM test (nixos/ layer, cf. TASK-10 just e2e-vm) with QEMU networking placing each node's VM behind a separate NAT (its own user-mode-net / a NAT gateway VM per node), so a NATd libp2p peer is reachable ONLY via relay/hole-punch (AutoNAT/DCUtR/circuit-relay). This is rootful INSIDE the VM (real ip_forward + NAT), sidestepping the rootless-host block. Also unblocks TASK-168 AC#1. Sequence: after TASK-203 lands + TASK-198 (owner: demonstrate compression). Scope carefully — VM-based e2e is heavier; a new just recipe (e2e-nat-vm) + honest per-hole-punch-vs-relay assertion.
+
+--- 2026-08-15 cycle (NixOS VM NAT harness: real-NAT boundary + relay reservation + discovery PROVEN; end-to-end relay byte-fetch is a filed residual TASK-218) ---
+
+DELIVERED (In Progress, honest partial). Built nixos/nat-vm-test.nix: 5 QEMU VMs (KVM), TWO
+NixOS VMs EACH behind its OWN iptables MASQUERADE gateway (--random-fully = symmetric NAT, so
+DCUtR cannot hole-punch and a relay claim stays unambiguous), joined by a public segment hosting a
+circuit-v2 relay+kad-bootstrap node. Drives the SHIPPED services.nix-p2p module (extended, see
+below) + daemon-libp2p. `just e2e-nat-vm` / `nix build .#nat-vm-test`. Runs on /dev/kvm.
+
+PROVEN (the test PASSES these, oracle bites):
+ 1. NEGATIVE CONTROL (NAT is real): a direct dial to nodea's PRIVATE address from the relay AND
+    from nodeb FAILS (no route to the private /24; no inbound port-forward) while nodea CAN reach
+    the relay OUTBOUND through its NAT - the stateful-NAT asymmetry. nodea's daemon IS bound on that
+    port, so this is unreachability, not a missing listener.
+ 2. RELAY RESERVATION over a REAL NAT: the NAT'd provider obtains a circuit-v2 reservation against
+    the relay (ReservationReqAccepted, surfaced by the new RUST_LOG tracing). The loopback
+    nat_traversal.rs could not exercise a real NAT boundary; this does. Required the two new
+    daemon-libp2p flags (see below): --libp2p-external-address on the relay (so its vouchers cite an
+    address; else NoAddressesInReservation) + repeatable --libp2p-listen on the provider (direct
+    transport bind + the /p2p-circuit reservation).
+ 3. DISCOVERY over real NAT: the consumer, bootstrapped ONLY to the relay, discovers the provider
+    RECORD via kad get_providers ("discovered 1 provider record").
+ 4. LOAD-BEARING: remove the relay + restart the provider -> it can NO LONGER obtain a reservation
+    (the relay is essential to the peer's reachability, not incidental).
+
+RESIDUAL (filed TASK-218, HIGH) - the ONE thing NOT proven: the SHIPPED consumer cannot RESOLVE the
+provider's /p2p-circuit dial-address via kad peer-routing ("kad peer-routing miss"), even though the
+provider self-advertises it (--libp2p-external-address) AND holds a live reservation, so the
+end-to-end NAR fetch through the relay does not complete via the shipped consumer yet (it falls back
+to upstream). This is exactly the gap-3 the mped-architect ruling predicted: circuit-address
+propagation through identify->kad->peer-routing to a discovery-only consumer. Per the ruling I did
+NOT add a consumer-side --libp2p-provider-addr injection (would violate the no-injection oracle and
+manufacture a false pass); instead filed TASK-218 with the root-cause area. The relay DATA path
+ITSELF is load-bearing - proven at the fabric API level in fabric-libp2p/tests/nat_traversal.rs (a
+provider on a /p2p-circuit ONLY is fetched byte-identical when the circuit address is supplied
+directly). When TASK-218 lands, the RESIDUAL subtest flips to a byte-identical relay-carried fetch.
+
+CODE surfaced (mped-architect-approved capability-surfacing, NOT re-implementing traversal; frozen
+surfaces untouched):
+ - daemon-libp2p: --libp2p-listen now REPEATABLE (Vec); NEW --libp2p-external-address (repeatable) ->
+   the existing SwarmHandle::add_external_address; a RUST_LOG-gated stderr tracing subscriber so the
+   fabric's autonat/relay/dcutr diagnostics (previously swallowed) are visible. Fail-closed:
+   external-address on a provider requires the public-allowlist door. 4 new unit tests; fmt/clippy
+   green; no-injection oracle + independence + no-floats green.
+ - nixos/nix-p2p.nix: ADDITIVE services.nix-p2p.libp2p option set (enable/provider/listen/
+   externalAddresses/bootstrap/scope/identitySeed/stateDir/provideStore/seedNar/printPeerAddress/
+   publicAllowlistPath/libp2pTrustedPublicKeys/provePublicNarinfo); ExecStart appends --libp2p-* only
+   when libp2p.enable; nix on PATH + StateDirectory then. Backward-compatible: existing TASK-10
+   e2e-vm still builds+passes (verified, exit 0).
+ - Gotcha recorded: the public-allowlist O_NOFOLLOW parent-dir check rejects the StateDirectory
+   SYMLINK that DynamicUser creates - nest the allowlist one level below the state root
+   (/var/lib/nix-p2p/state/allowlist).
+
+168 AC#1: STILL BLOCKED on the byte-fetch (residual TASK-218), but SUBSTANTIALLY advanced - the
+real-NAT reservation + discovery + negative control are now proven (loopback could not). 207 stays
+In Progress until TASK-218 closes the end-to-end fetch.
 <!-- SECTION:NOTES:END -->
