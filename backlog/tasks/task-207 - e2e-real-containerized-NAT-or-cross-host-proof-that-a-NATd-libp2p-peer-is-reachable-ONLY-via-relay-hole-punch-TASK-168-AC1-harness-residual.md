@@ -6,7 +6,7 @@ title: >-
 status: In Progress
 assignee: []
 created_date: '2026-08-14 17:19'
-updated_date: '2026-08-15 13:01'
+updated_date: '2026-08-15 13:14'
 labels:
   - libp2p
   - fabric
@@ -102,4 +102,11 @@ surfaces untouched):
 168 AC#1: STILL BLOCKED on the byte-fetch (residual TASK-218), but SUBSTANTIALLY advanced - the
 real-NAT reservation + discovery + negative control are now proven (loopback could not). 207 stays
 In Progress until TASK-218 closes the end-to-end fetch.
+
+codex gate of da2d3f1/e14dad8/fa2a921: NO-GO. SOUND (confirmed): ReservationReqAccepted is a real relay-client reservation event; NO consumer-side --libp2p-provider-addr injection; byte-fetch non-gating; module flags conditional on libp2p.enable; single-listen CLI compat; no wire/frozen-surface change; no float. BUT the harness ORACLES can pass for the WRONG reasons.
+B1 BLOCKER (nat-vm-test.nix:336) negative control potentially VACUOUS: it only checks expected addresses EXIST. If nodea also acquired a public-vlan interface, the private-addr probes fail while nodea-to-relay + the reservation bypass NAT entirely. Fix: assert EXCLUSIVE interface/address sets; ip route get via gwa with the private source; ss on the live listener 192.168.2.3:4001; MASQUERADE rule counters INCREMENTING during the outbound control.
+B2 BLOCKER (nat-vm-test.nix:418, main.rs:812/851) confounded bite: install_provider does DHT bootstrap/announce BEFORE circuit listeners register; stopping the relay ALSO removes the providers SOLE kad bootstrap, so the restarted provider can fail announcement and exit BEFORE requesting any reservation -> the absence-only assertion passes because the reservation was never ATTEMPTED, not DENIED. Fix: keep an INDEPENDENT kad bootstrap alive while disabling ONLY the relay service; assert post-restart the provider stays ACTIVE and issued the circuit-listen/reservation REQUEST, THEN check acceptance never occurs.
+H1 HIGH (nat-vm-test.nix:5/387) discovery OVERCLAIMED as proven: the subtest ignores fetch results and its log grep ends with a bare or-true, so a zero-provider-record run passes identically. Fix: GATE an explicit discovered-at-least-1-provider-record assertion, OR consistently label discovery non-gating/UNPROVEN in the header + report.
+H2 HIGH (nat-vm-test.nix:29): iptables random-fully is source-port randomization, NOT symmetric-NAT (endpoint-dependent mapping/filtering, unmeasured); the harness cannot categorically claim DCUtR is precluded. Fix: DROP the symmetric-NAT/no-DCUtR categorical claim for the reservation-only partial, OR add a deterministic direct-path block + a DCUtR-negative oracle.
+Next: harden the harness (B1 topology enforcement, B2 independent-bootstrap+active-provider assert, H1 discovery honesty, H2 drop/prove NAT-type), re-gate. Core mechanism sound; rigor insufficient.
 <!-- SECTION:NOTES:END -->
