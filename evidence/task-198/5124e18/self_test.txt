@@ -1,0 +1,2 @@
+$ python3 scripts/shaped_compress.py --self-test
+SELF-TEST OK: baseline parsed; 9 parse mutations + slower-zstd + swamped-margin bitten; shaping oracle bites a removed shaper; integer reporting checked

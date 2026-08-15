@@ -1,0 +1,97 @@
+{
+  "task": "task-198",
+  "measures": "live raw-vs-zstd libp2p NAR transfer over a tc-netem shaped peer link with BOTH ends shaped (the two-ends-shaped serve trace TASK-203 deferred here)",
+  "environment_boundary": "shaped-link EMULATION (unshare -Urn nested netns + veth + tc netem), NOT real hardware / a real WAN. Models mean RTT + a rate cap; NOT loss, jitter, competing traffic, or NAT traversal. Removes the pod-loopback UPPER bound on the peer arm; is not itself a field measurement (the real-hardware residual is TASK-207).",
+  "integer_exact": true,
+  "no_floats_in_decisions": true,
+  "nar_bytes": 16777216,
+  "delay_ms": 20,
+  "rate_mbit": 20,
+  "nar_seed": 20198,
+  "shaped_runs": 3,
+  "served_raw_bytes": 16777216,
+  "served_zstd_frame_bytes": 4219763,
+  "wire_ratio_pair": [
+    16777216,
+    4219763
+  ],
+  "wire_ratio_display": "~3.976x (exact 16777216/4219763)",
+  "shaping_oracle": {
+    "passed": true,
+    "shaped_rtt_ns": 48167000,
+    "unshaped_rtt_ns": 45000,
+    "shaped_raw_throughput_bytes_per_s": 2191477,
+    "unshaped_raw_throughput_bytes_per_s": 56184826
+  },
+  "headline": {
+    "zstd_faster_every_run": true,
+    "wire_smaller_every_run": true,
+    "margin_dwarfs_noise": true,
+    "min_margin_ns": 5252277245,
+    "raw_spread_ns": 10208789,
+    "zstd_spread_ns": 6887512,
+    "best_raw_elapsed_ns": 7654463630,
+    "best_zstd_elapsed_ns": 2395298873,
+    "best_wallclock_speedup_pair": [
+      7654463630,
+      2395298873
+    ],
+    "best_wallclock_speedup_display": "~3.196x (exact 695860330/217754443)"
+  },
+  "per_run": [
+    {
+      "raw_elapsed_ns": 7655663419,
+      "zstd_elapsed_ns": 2397427823,
+      "margin_ns": 5258235596,
+      "raw_throughput_bytes_per_s": 2191477,
+      "zstd_throughput_bytes_per_s": 1760122,
+      "wire_raw_bytes": 16777216,
+      "wire_zstd_bytes": 4219766,
+      "wallclock_speedup_pair": [
+        7655663419,
+        2397427823
+      ],
+      "wire_ratio_pair": [
+        16777216,
+        4219766
+      ],
+      "zstd_faster": true
+    },
+    {
+      "raw_elapsed_ns": 7654463630,
+      "zstd_elapsed_ns": 2402186385,
+      "margin_ns": 5252277245,
+      "raw_throughput_bytes_per_s": 2191821,
+      "zstd_throughput_bytes_per_s": 1756635,
+      "wire_raw_bytes": 16777216,
+      "wire_zstd_bytes": 4219766,
+      "wallclock_speedup_pair": [
+        7654463630,
+        2402186385
+      ],
+      "wire_ratio_pair": [
+        16777216,
+        4219766
+      ],
+      "zstd_faster": true
+    },
+    {
+      "raw_elapsed_ns": 7664672419,
+      "zstd_elapsed_ns": 2395298873,
+      "margin_ns": 5269373546,
+      "raw_throughput_bytes_per_s": 2188901,
+      "zstd_throughput_bytes_per_s": 1761686,
+      "wire_raw_bytes": 16777216,
+      "wire_zstd_bytes": 4219766,
+      "wallclock_speedup_pair": [
+        7664672419,
+        2395298873
+      ],
+      "wire_ratio_pair": [
+        16777216,
+        4219766
+      ],
+      "zstd_faster": true
+    }
+  ]
+}
