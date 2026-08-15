@@ -413,8 +413,10 @@ impl KnownTransport {
 /// Field deserializer for a transport-offer list: TOLERATE-BUT-DROP unknown
 /// transports. Each element is peeked; a KNOWN transport is strict-parsed (a
 /// malformed known transport ERRORS the whole decode), an unknown transport tag
-/// is DROPPED from the set (not retained, not re-serialized). Used by both
-/// [`Claim::transports`] and [`HoldAnswer::Have`].
+/// is DROPPED from the set (not retained, not re-serialized). Used by
+/// [`Claim::transports`]; the hold-response paths (single-key AND batch) decode
+/// their offers via [`deserialize_transport_slots`] instead (same tolerate-drop
+/// rule, slot-preserving), so the unknown-KIND residual below is shared by both.
 ///
 /// NO-ENUMERATION RESIDUAL (TASK-224): an unknown-KIND element is peeked for its
 /// `transport` tag ONLY; the rest of the object is an opaque `serde_json::Value`
@@ -2343,8 +2345,10 @@ mod tests {
         // unknown offer - the count cap of 4 never even engages. This pins that
         // residual so the frozen record matches reality, not the aspirational
         // "3.75x worst case" the amendment must NOT claim. What IS closed is the
-        // enumeration vector: the decoded offers are EMPTY (zero content
-        // identities), the unknown kind dropped inertly.
+        // KNOWN-offer count/enumeration: the DECODED offers are EMPTY (zero
+        // content identities in the decoded VALUE), the unknown kind dropped
+        // inertly - but the WIRE can still NAME identities in the opaque slot
+        // (TASK-224 residual, see the note below + the sibling parity test).
         let query_len = 88usize; // the pinned single-key query size
         let pad_len = 60_000; // one fat unknown offer, comfortably under the 64 KiB frame
         let wire = format!(
