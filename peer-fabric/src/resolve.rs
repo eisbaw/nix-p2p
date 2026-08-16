@@ -384,8 +384,7 @@ impl BatchResolution {
             });
         }
         for (index, (key, outcome)) in request.keys.iter().zip(outcomes.iter()).enumerate() {
-            let names_unasked_holding =
-                matches!(outcome, KeyResolution::Found(records) if records.iter().any(|r| r.key != *key));
+            let names_unasked_holding = matches!(outcome, KeyResolution::Found(records) if records.iter().any(|r| r.key != *key));
             if names_unasked_holding {
                 return Err(BatchBindError::FoundUnaskedKey { index });
             }
