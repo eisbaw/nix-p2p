@@ -134,6 +134,41 @@ independence: _toolchain
 audit:
     cargo deny check
 
+# CI-side mirror of the local .git/hooks/commit-msg guard (TASK-230): so a hook
+# bypassed with `git commit --no-verify` is still caught on the remote. The regex
+# is kept byte-identical to the hook. RANGE defaults to the tip commit; CI passes
+# the push/PR range (e.g. origin/master..HEAD). Defensive by construction: if the
+# base of RANGE is not a resolvable commit (shallow clone / brand-new branch /
+# first CI run) it falls back to scanning HEAD alone, so it never manufactures a
+# failure from a missing ref - it only fails on an actual forbidden trailer.
+# Reject AI/co-author credit in every commit message in RANGE (mirrors the hook).
+check-commit-msg range="HEAD~1..HEAD":
+    #!/usr/bin/env bash
+    set -euo pipefail
+    range="{{ range }}"
+    base="${range%%..*}"
+    if [ -z "${range}" ] || [ "${base}" = "${range}" ] \
+       || ! git rev-parse --verify --quiet "${base}^{commit}" >/dev/null 2>&1; then
+        echo "check-commit-msg: base of '${range}' unresolvable; scanning HEAD only" >&2
+        range=""
+    fi
+    if [ -n "${range}" ]; then
+        shas="$(git rev-list "${range}" 2>/dev/null || true)"
+    else
+        shas=""
+    fi
+    [ -n "${shas}" ] || shas="$(git rev-parse HEAD)"
+    bad=0
+    while IFS= read -r sha; do
+        [ -n "${sha}" ] || continue
+        if git log -1 --format=%B "${sha}" \
+           | grep -qiE 'co-authored-by:.*(claude|anthropic|noreply@anthropic)|generated with.*(claude|claude code)|🤖 generated'; then
+            echo "commit-msg policy VIOLATION in ${sha}: AI/co-author credit is not allowed (disclose in README.md)." >&2
+            bad=1
+        fi
+    done <<< "${shas}"
+    exit "${bad}"
+
 # Depends on the fast fixture tier because the signing and tamper assertions
 # live in scripts/, not in cargo (rationale: scripts/check-fixtures.py).
 # Unit and integration tests plus the fixture gate (in-process, no containers).

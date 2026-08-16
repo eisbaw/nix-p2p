@@ -1,0 +1,163 @@
+# nix-p2p CI (TASK-230).
+#
+# HARD CONSTRAINT (owner rule): every GATE step below is a `just <recipe>`
+# invocation and nothing else. There is deliberately NO raw cargo / clippy /
+# ruff / python / nix build logic in this YAML - all gate logic lives in the
+# Justfile so a CI failure is reproduced locally by the identical `just` recipe.
+# The ONLY non-`just` steps are the Determinate Nix install + the flake cache.
+#
+# The recipes assert they run inside the flake devShell (they require
+# NIX_P2P_TOOLCHAIN / NIX_P2P_PYTHON / NIX_P2P_NIX, exported by the devShell in
+# flake.nix), so each gate step is `nix develop -c just <recipe>` - byte-for-byte
+# the command surface the README documents (`nix develop` then `just ...`).
+# `nix develop -c` is the dev-shell entry, not build logic; it carries no
+# cargo/clippy/nix-build commands of its own.
+#
+# WHAT THIS CI COVERS vs DOES NOT (honest-gate discipline):
+#   fast-gate  (github-hosted)  build + lint (incl. fmt --check, ruff, the
+#                               independence/source guards, no-floats,
+#                               discovery-no-shortcut, public-dht-isolation) +
+#                               test (workspace + fixture + golden-vectors +
+#                               content-key-derivation + the evidence self-tests)
+#                               + the commit-msg policy mirror. BLOCKING.
+#   audit      (github-hosted)  `just audit` (cargo-deny). NON-BLOCKING today:
+#                               it is RED against 4 real RustSec advisories
+#                               tracked in TASK-236. It is run so the advisories
+#                               stay VISIBLE in every CI log; it joins the
+#                               blocking gate once TASK-236 clears. No deny.toml
+#                               ignore-entry is added to force it green.
+#   e2e        (github-hosted)  `just e2e` - the rootless-podman integration
+#                               oracle. Run, NOT continue-on-error, so its status
+#                               is always visible (never a silent skip). BUT its
+#                               green-ness on a github-hosted runner is UNVERIFIED
+#                               from here: the harness also does packet capture
+#                               and network-namespace work that may need caps not
+#                               present on github-hosted runners. If it proves
+#                               unreliable here, move this job to a self-hosted
+#                               runner (see the `runs-on` comment) rather than
+#                               hiding it.
+#   vm-tests   (self-hosted,    `just e2e-vm` + `just e2e-nat-vm` - the NixOS VM
+#               kvm; on-demand)  truth layers. They need /dev/kvm, which standard
+#                               github-hosted runners DO NOT provide, so they are
+#                               NOT run on push/PR. They run only via manual
+#                               `workflow_dispatch` on a KVM-capable self-hosted
+#                               runner. This is an explicit exclusion, not an
+#                               implied-covered gate.
+#
+# NOTHING here proves the pipeline green: a green LOCAL gate is not a green CI
+# run, and this YAML's correctness is UNPROVEN until it actually executes on
+# GitHub (push / PR). The local checks done for TASK-230 were: YAML well-formed,
+# every referenced `just` recipe exists and runs, and the action refs are real.
+
+name: CI
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+    branches: [master]
+  workflow_dispatch: {}  # manual trigger for the KVM vm-tests job below
+
+# Superseded runs on the same ref are pointless spend; cancel them.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  id-token: write  # required so FlakeHub Cache can authenticate via GitHub OIDC
+
+env:
+  # The Justfile's `_headroom` guard refuses disk-heavy recipes below 15 GiB
+  # free (a local-workstation floor). GitHub-hosted runners have less headroom,
+  # so lower - not remove - the floor for CI. The guard still fires if the
+  # runner is genuinely out of space; it just fits the smaller runner.
+  NIX_P2P_MIN_FREE_GIB: "8"
+
+jobs:
+  fast-gate:
+    name: fast gate (build / lint / test / commit-msg)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # Full history so `just check-commit-msg` can scan the pushed range.
+          fetch-depth: 0
+      # Determinate Nix installer (flakes + nix-command enabled by default).
+      - name: Install Determinate Nix
+        uses: DeterminateSystems/determinate-nix-action@v3
+      # FlakeHub Cache is the current Determinate cache (Magic Nix Cache was
+      # deprecated 2025-02-01). continue-on-error: caching is a SPEED
+      # optimization and must never gate correctness - if auth/cache is
+      # unavailable, builds simply fall back to cache.nixos.org.
+      - name: FlakeHub Cache
+        uses: DeterminateSystems/flakehub-cache-action@v3
+        continue-on-error: true
+      - name: build
+        run: nix develop -c just build
+      - name: lint
+        run: nix develop -c just lint
+      - name: test
+        run: nix develop -c just test
+      - name: commit-msg policy
+        # CI passes the pushed range; the recipe falls back to HEAD if the base
+        # ref is not present, so it never false-fails on a shallow/new branch.
+        run: nix develop -c just check-commit-msg "origin/master..HEAD"
+
+  audit:
+    name: audit (informational - RED pending TASK-236)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Determinate Nix
+        uses: DeterminateSystems/determinate-nix-action@v3
+      - name: FlakeHub Cache
+        uses: DeterminateSystems/flakehub-cache-action@v3
+        continue-on-error: true
+      # NON-BLOCKING: `just audit` (cargo-deny) is RED against 4 real RustSec
+      # advisories tracked in TASK-236. Kept visible in CI, not suppressed.
+      # Remove continue-on-error once TASK-236 clears the advisories.
+      - name: audit
+        run: nix develop -c just audit
+        continue-on-error: true
+
+  e2e:
+    name: e2e (rootless-podman integration oracle)
+    # NOTE: rootless podman is present on github-hosted ubuntu, but this
+    # harness also does packet capture + netns work whose required caps are
+    # UNVERIFIED here. If this job is unreliable on github-hosted, switch
+    # `runs-on` to a self-hosted runner that grants those caps, e.g.:
+    #   runs-on: [self-hosted, podman, netcap]
+    # Do NOT make it continue-on-error: an integration oracle allowed to fail
+    # silently is worse than an honestly red one.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Determinate Nix
+        uses: DeterminateSystems/determinate-nix-action@v3
+      - name: FlakeHub Cache
+        uses: DeterminateSystems/flakehub-cache-action@v3
+        continue-on-error: true
+      - name: e2e
+        run: nix develop -c just e2e
+
+  vm-tests:
+    name: VM truth layers (KVM - self-hosted, on-demand only)
+    # Standard github-hosted runners DO NOT expose /dev/kvm, so these NixOS VM
+    # tests cannot run there. They are gated to a KVM-capable self-hosted runner
+    # and only on a manual workflow_dispatch, so they never block push/PR and
+    # never hang the default triggers. This is an explicit, documented exclusion
+    # from the push/PR gate - not a silent skip.
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: [self-hosted, kvm]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Determinate Nix
+        uses: DeterminateSystems/determinate-nix-action@v3
+      - name: FlakeHub Cache
+        uses: DeterminateSystems/flakehub-cache-action@v3
+        continue-on-error: true
+      - name: e2e-vm
+        run: nix develop -c just e2e-vm
+      - name: e2e-nat-vm
+        run: nix develop -c just e2e-nat-vm
