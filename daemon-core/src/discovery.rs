@@ -725,8 +725,9 @@ impl PeerQuery for InProcessPeerQuery {
             encode_batch_hold_query(query).map_err(|e| PeerQueryError::Codec(e.to_string()))?;
 
         // Node B side: decode (size gate, then key cap, then the answer), and
-        // answer from the REAL index on a blocking thread - the batch may cost up
-        // to MAX_BATCH_HOLD_KEYS `nix-store --dump`s under the digest locks.
+        // answer from the REAL index on a blocking thread - task-104 caps the fresh
+        // dumps this batch may trigger at MAX_BATCH_DERIVE_WORK (not one per key), so
+        // a cold batch does bounded `nix-store --dump` work under the digest locks.
         let decoded =
             decode_batch_hold_query(&on_wire).map_err(|e| PeerQueryError::Codec(e.to_string()))?;
         let keys_asked = decoded.keys.len();
@@ -856,12 +857,19 @@ impl Discovery for DirectDiscovery {
     ///     resolved, so the common case (the first peer holds the closure) really
     ///     is one round trip.
     ///   * Each chunk probe carries the same [`PROBE_TIMEOUT`] bound as a single
-    ///     probe, so a wedged peer still yields a fast miss. STATED LIMIT: a cold
-    ///     peer that must hash 256 large NARs to answer may exceed that bound and
-    ///     be treated as a miss. That is the safe direction (the fetch falls back
-    ///     upstream), but it does mean a first batch against a cold peer can
-    ///     under-report. A responder-side "answer with what is already derived"
-    ///     policy is TASK-104.
+    ///     probe, so a wedged peer still yields a fast miss. On the responder side a
+    ///     single COLD batch message no longer hashes up to 256 NARs: task-104's
+    ///     per-batch derivation budget ([`crate::MAX_BATCH_DERIVE_WORK`]) makes it
+    ///     answer from what is ALREADY derived plus a bounded number of fresh dumps
+    ///     and defer the rest to `Absent`. Note the interaction with the timeout: for
+    ///     large closures even ONE dump can exceed [`PROBE_TIMEOUT`], so a fully-cold
+    ///     peer is treated as a MISS on first contact regardless of the budget - and
+    ///     because the responder's `answer_batch` runs in an uncancellable blocking
+    ///     task, it still finishes its budgeted dumps and warms its cache for a later
+    ///     query. THIS resolver does NOT re-probe the deferred keys; it falls back
+    ///     upstream (the safe direction). So the under-report is bounded and the
+    ///     responder cache warms for future traffic, but it is not first-contact
+    ///     healing for this fetch.
     async fn resolve_many(&self, keys: &[NarHashKey]) -> Vec<Option<Claim>> {
         let mut results: Vec<Option<Claim>> = vec![None; keys.len()];
         if keys.is_empty() {

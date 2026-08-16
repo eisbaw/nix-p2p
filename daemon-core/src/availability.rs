@@ -902,6 +902,115 @@ impl AnnounceSink for NullAnnounce {
 // The index.
 // -------------------------------------------------------------------------
 
+/// The most FRESH `nix-store --dump` derivations one BATCHED hold-query
+/// ([`AvailabilityIndex::answer_batch`]) may trigger on the responder (task-104).
+///
+/// WHY THIS EXISTS. task-91 caps a batch at [`crate::claim::MAX_BATCH_HOLD_KEYS`]
+/// = 256 keys, which bounds the NUMBER of probes one message demands but NOT the
+/// derivation work: on a COLD responder each of those 256 probes can cost one
+/// `nix-store --dump` of a large unhashed NAR, so ONE batch message could make this
+/// node dump up to 256 large NARs. This bounds that AMPLIFICATION to a fixed count
+/// per message. The bound is on a COUNT of fresh dumps, never on a clock: raising
+/// the probe timeout instead would put unbounded latency back into the build path,
+/// the exact property task-40 forbids.
+///
+/// WHAT IT DOES NOT BOUND (be honest). This is a bound on the NUMBER of dumps, NOT
+/// on the BYTES hashed: 16 dumps of multi-GB closures is still unbounded bytes, so
+/// one message can still cost minutes of I/O. A true per-byte bound is achievable -
+/// a store path's NAR size is in the store DB (`nix path-info -S`), so a byte budget
+/// seeded from path-info could refuse before dumping - and is the real root-cause
+/// follow-up; it is NOT done here. Nor does this per-MESSAGE bound stop a hostile
+/// peer: the peer chooses the message boundaries, so it can send 16 batches (or
+/// 4 096 single-key probes, which take the UNLIMITED [`AvailabilityIndex::hold`]
+/// path) to drive the same total. A per-PEER aggregate limit on concurrent/total
+/// dumps is the DoS defense and is also a follow-up (task-72's serve budget bounds
+/// bytes SERVED, not bytes HASHED). What this closes is the single-message
+/// amplification, not adversarial resource exhaustion.
+///
+/// WHAT IT DOES. A batch answers freely from what is ALREADY derived (warm keys
+/// cost no dump and spend no budget) and triggers at most this many FRESH dumps;
+/// once spent, further COLD keys answer `Absent` WITHOUT dumping - today's safe
+/// direction (the asker falls back upstream, never a wrong byte). It is a per-
+/// MESSAGE policy knob, deliberately `<<` [`crate::claim::MAX_BATCH_HOLD_KEYS`]:
+/// larger warms more per probe at more work per message. The value 16 is not
+/// derived from a disk/CPU target - it is a conservative placeholder well below the
+/// 256-key cap and above the largest batch any current test holds; tune it when a
+/// deployment gives a real per-message I/O ceiling. It is a tunable integer, not a
+/// wire constant, so changing it is not a wire change. See
+/// [`AvailabilityIndex::answer_batch`] for the residual under-report and how the
+/// responder cache warms `MAX_BATCH_DERIVE_WORK` cold keys per probe.
+pub const MAX_BATCH_DERIVE_WORK: u32 = 16;
+
+/// A per-BATCH allowance of FRESH derivations (task-104). [`AvailabilityIndex::answer_batch`]
+/// starts it at [`MAX_BATCH_DERIVE_WORK`]; every key that triggers a real
+/// `nix-store --dump` spends one unit. A key that is already derived (warm),
+/// unregistered, or GC'd triggers no dump and so spends NO unit. The single-key
+/// [`AvailabilityIndex::hold`] path uses [`DeriveBudget::unlimited`], preserving
+/// its pre-task-104 behaviour exactly (it can never defer).
+struct DeriveBudget {
+    /// `None` = unlimited (the single-key path). `Some(n)` = `n` fresh dumps remain.
+    remaining: Option<u32>,
+}
+
+impl DeriveBudget {
+    /// No bound: the single-key path, which must always answer truthfully.
+    fn unlimited() -> Self {
+        Self { remaining: None }
+    }
+
+    /// At most `n` fresh dumps: the batched path.
+    fn limited(n: u32) -> Self {
+        Self { remaining: Some(n) }
+    }
+
+    /// Reserve permission for ONE fresh dump. `true` (and, for a limited budget,
+    /// consumes one unit) when a dump is permitted; `false` when a limited budget
+    /// is spent. Unlimited never consumes and never refuses.
+    ///
+    /// The budget itself is not shared between threads - it is a `&mut` threaded
+    /// through one `answer_batch` loop, which is the only mutator, so a batch cannot
+    /// race PAST ITS OWN budget (there is no intra-batch concurrency). Call this only
+    /// after the `None` (cold) check UNDER the digest lock so that (a) each reserved
+    /// unit maps 1:1 to a real dump - the lock's single-flight guard means the slot
+    /// cannot flip to `Verified` between the check and the dump - and (b) a warm key
+    /// never consumes a unit.
+    fn try_reserve(&mut self) -> bool {
+        match &mut self.remaining {
+            None => true,
+            Some(0) => false,
+            Some(n) => {
+                *n -= 1;
+                true
+            }
+        }
+    }
+}
+
+/// The outcome of a budget-aware per-key resolution ([`AvailabilityIndex::hold_budgeted`]).
+enum BudgetedHold {
+    /// The key is held and derived; answer `Have`.
+    Have {
+        blake3: Blake3Digest,
+        offers: Vec<KnownTransport>,
+    },
+    /// The key is genuinely not held (unregistered or GC'd), or its cached verdict
+    /// is a quarantine handled by the caller; answer `Absent`.
+    Absent,
+    /// The key is COLD (a fresh dump would be needed) but the batch's derivation
+    /// budget is spent, so NO dump happened. Answered `Absent` on the wire (today's
+    /// behaviour) and counted as a deferral for the self-heal / under-report note.
+    Deferred,
+}
+
+/// The outcome of [`AvailabilityIndex::derive`] under a [`DeriveBudget`].
+enum DeriveStep {
+    /// Derived (from the cache or a fresh dump). `(derivation, freshly_derived)`.
+    Derived(DerivedNar, bool),
+    /// Cold and the budget is spent: no dump happened (task-104). The caller answers
+    /// Absent for this key and the entry warms on a later, budget-bearing probe.
+    Deferred,
+}
+
 /// What ONE `nix-store --dump` derived: the addressed unit AND the NarSize that
 /// produced it. They are kept together because they come from the same bytes in
 /// the same pass - deriving the size separately would be a second source of truth
@@ -1172,12 +1281,43 @@ impl AvailabilityIndex {
     /// resolves to `Absent` and is pruned (materialisation/cleanup). There is no
     /// enumeration counterpart - only this per-key probe.
     pub fn hold(&self, key: &NarHashKey) -> Result<HoldAnswer, AvailabilityError> {
+        // The single-key path is UNLIMITED: it must always answer truthfully, and an
+        // unlimited budget can never return `Deferred`, so the mapping below is total.
+        match self.hold_budgeted(key, &mut DeriveBudget::unlimited())? {
+            BudgetedHold::Have { blake3, offers } => Ok(HoldAnswer::Have { blake3, offers }),
+            BudgetedHold::Absent => Ok(HoldAnswer::Absent),
+            // Unreachable: an unlimited budget never defers. Fail LOUD in debug so a
+            // future caller that wrongly routes a LIMITED budget through the single-key
+            // path is caught, while still degrading to the SAFE `Absent` in release
+            // (a spurious miss falls back upstream; it never serves a wrong answer).
+            BudgetedHold::Deferred => {
+                debug_assert!(
+                    false,
+                    "hold() uses an unlimited budget and must never defer"
+                );
+                Ok(HoldAnswer::Absent)
+            }
+        }
+    }
+
+    /// The budget-aware core of [`Self::hold`] (task-104). Resolves ONE key while
+    /// spending at most what `budget` permits on FRESH derivations: a warm key
+    /// (already derived) or an absent key costs no dump and no budget; a cold key
+    /// dumps only while the budget allows, otherwise answers [`BudgetedHold::Deferred`]
+    /// (no dump). [`Self::answer_batch`] passes a [`DeriveBudget::limited`] budget so
+    /// one batch message cannot trigger unbounded derivation; [`Self::hold`] passes
+    /// [`DeriveBudget::unlimited`], so its behaviour is exactly as before.
+    fn hold_budgeted(
+        &self,
+        key: &NarHashKey,
+        budget: &mut DeriveBudget,
+    ) -> Result<BudgetedHold, AvailabilityError> {
         loop {
             let entry = {
                 let entries = self.entries.lock().expect("entries mutex");
                 match entries.get(key) {
                     Some(entry) => Arc::clone(entry),
-                    None => return Ok(HoldAnswer::Absent),
+                    None => return Ok(BudgetedHold::Absent),
                 }
             };
 
@@ -1188,13 +1328,18 @@ impl AvailabilityIndex {
                 self.drop_if_same(key, &entry)?;
                 let entries = self.entries.lock().expect("entries mutex");
                 if entries.get(key).is_none() {
-                    return Ok(HoldAnswer::Absent);
+                    return Ok(BudgetedHold::Absent);
                 }
                 continue;
             }
 
-            let (derived, freshly_derived) = match self.derive(key, &entry) {
-                Ok(derived) => derived,
+            let (derived, freshly_derived) = match self.derive(key, &entry, budget) {
+                // A cold key the batch cannot afford to dump right now. No dump
+                // happened, so nothing is published and no unit was spent; the caller
+                // answers Absent. This warms nothing, so it is a later, budget-bearing
+                // probe reaching this key that finally dumps and caches it.
+                Ok(DeriveStep::Deferred) => return Ok(BudgetedHold::Deferred),
+                Ok(DeriveStep::Derived(derived, freshly_derived)) => (derived, freshly_derived),
                 Err(error) => {
                     let entries = self.entries.lock().expect("entries mutex");
                     if entries
@@ -1252,7 +1397,7 @@ impl AvailabilityIndex {
                 );
             }
             drop(entries);
-            return Ok(HoldAnswer::Have {
+            return Ok(BudgetedHold::Have {
                 blake3: derived.blake3,
                 offers: vec![self.iroh_offer()],
             });
@@ -1421,6 +1566,36 @@ impl AvailabilityIndex {
     /// The per-KEY fault policy above is unchanged and is deliberately NOT this
     /// error channel: a broken store path degrades one key to `Absent`, while a
     /// malformed batch is refused whole.
+    ///
+    /// THE DERIVATION BUDGET (task-104). The key cap bounds how many probes a
+    /// message demands, but on a COLD responder each probe can cost one
+    /// `nix-store --dump` of a large NAR, so a 256-key batch could otherwise make
+    /// this node dump 256 large NARs for ONE message. This method therefore answers
+    /// freely from what is ALREADY derived and triggers at most
+    /// [`MAX_BATCH_DERIVE_WORK`] FRESH dumps per batch (a bound on the COUNT of dumps,
+    /// never on a clock - raising the probe timeout is forbidden by task-40; see the
+    /// const docs for what a dump COUNT does and does not bound). Once the budget is
+    /// spent, further COLD keys answer `Absent` WITHOUT dumping - the same safe
+    /// direction a miss already takes, and NO wire change (Absent is an existing
+    /// answer; the frozen claim wire and its golden vectors are untouched).
+    ///
+    /// THE UNDER-REPORT, MEASURED (AC#2, honestly). A wholly-cold `N`-key batch
+    /// answers at most [`MAX_BATCH_DERIVE_WORK`] keys truthfully and under-reports the
+    /// other `N - MAX_BATCH_DERIVE_WORK` as `Absent` (bounded, safe direction). It is
+    /// NOT silent - the deferral count is logged. It does NOT self-heal for the ASKER
+    /// of this probe: [`crate::discovery::DirectDiscovery::resolve_many`] treats
+    /// `Absent` as a miss and falls back UPSTREAM; it does not re-probe the deferred
+    /// keys. What heals is the RESPONDER'S cache: this probe dumps and caches
+    /// [`MAX_BATCH_DERIVE_WORK`] cold keys, so a LATER organic query of those paths
+    /// (a subsequent build, or the same closure re-queried) finds them warm. A single
+    /// asker that keeps re-querying the same closure sees the warm frontier advance
+    /// ~[`MAX_BATCH_DERIVE_WORK`] keys per probe, so all `N` are warm after
+    /// ~`ceil(N / MAX_BATCH_DERIVE_WORK)` probes - but nothing in the resolver drives
+    /// that re-query, so treat it as cache warming for future traffic, not as
+    /// first-contact healing. RESIDUAL: this per-MESSAGE bound does not cap the
+    /// aggregate dumps many messages from one peer can start (the peer picks the
+    /// message boundaries) - a per-peer aggregate limit is the follow-up (task-72's
+    /// serve budget bounds bytes served, not bytes hashed).
     pub fn answer_batch(
         &self,
         query: &BatchHoldQuery,
@@ -1428,11 +1603,15 @@ impl AvailabilityIndex {
         debug_assert_eq!(query.schema_version, QUERY_SCHEMA_VERSION);
         check_batch_keys(&query.keys)?;
 
+        // One budget for the WHOLE batch: the bound is per-message, so every key in
+        // this message draws down the same allowance of fresh dumps.
+        let mut budget = DeriveBudget::limited(MAX_BATCH_DERIVE_WORK);
         let mut answers = Vec::with_capacity(query.keys.len().min(MAX_BATCH_HOLD_KEYS));
         let mut any_have = false;
+        let mut deferred: u32 = 0;
         for key in &query.keys {
-            match self.hold(key) {
-                Ok(HoldAnswer::Have { blake3, .. }) => {
+            match self.hold_budgeted(key, &mut budget) {
+                Ok(BudgetedHold::Have { blake3, .. }) => {
                     any_have = true;
                     // This node speaks exactly one transport, so every Have points
                     // at the single dictionary entry below. The INDEX is what binds
@@ -1444,7 +1623,14 @@ impl AvailabilityIndex {
                         offer_indices: vec![0],
                     });
                 }
-                Ok(HoldAnswer::Absent) => answers.push(BatchHoldAnswer::Absent {}),
+                Ok(BudgetedHold::Absent) => answers.push(BatchHoldAnswer::Absent {}),
+                // COLD but the batch's derivation budget is spent: NOT dumped, answered
+                // Absent on the wire (todays behaviour), counted so the deferral is
+                // reported rather than silent. It warms on a subsequent probe.
+                Ok(BudgetedHold::Deferred) => {
+                    deferred = deferred.saturating_add(1);
+                    answers.push(BatchHoldAnswer::Absent {});
+                }
                 Err(err) => {
                     // Loud, not silent: the operator sees exactly which key
                     // degraded and why.
@@ -1455,6 +1641,18 @@ impl AvailabilityIndex {
                     answers.push(BatchHoldAnswer::Absent {});
                 }
             }
+        }
+        if deferred > 0 {
+            // LOUD, not silent (the AC#2 point): the operator sees that this batch
+            // under-reported `deferred` COLD key(s) because it hit the per-batch
+            // derivation budget. Those keys were NOT dumped this time; a later probe
+            // that reaches them dumps and caches them, so a subsequent organic query
+            // finds them warm (the asker of THIS probe falls back upstream).
+            eprintln!(
+                "daemon: batch hold-query: {deferred} cold key(s) exceeded the per-batch \
+                 derivation budget (MAX_BATCH_DERIVE_WORK={MAX_BATCH_DERIVE_WORK}); answered \
+                 Absent without dumping - they warm the responder cache on a later probe"
+            );
         }
         Ok(BatchHoldResponse {
             schema_version: QUERY_SCHEMA_VERSION,
@@ -1554,23 +1752,43 @@ impl AvailabilityIndex {
     /// costs a peer a wasted dial), so the entry is QUARANTINED and every probe of
     /// it fails loudly with a typed [`NarHashMismatch`]. The comparison is raw-byte
     /// (`NarHashKey == NarHashKey`), so there is no encoding to get wrong.
-    /// Returns the derivation and whether it was FRESHLY computed on this call
-    /// (`true`) or served from the single-flight cache / a warmed persisted binding
-    /// (`false`). The caller ([`Self::hold`]) uses the flag to persist the verified
-    /// derived binding to disk exactly ONCE - on the fresh transition - rather than
-    /// rewriting the whole snapshot on every probe.
+    /// Returns [`DeriveStep::Derived`] with the derivation and whether it was FRESHLY
+    /// computed on this call (`true`) or served from the single-flight cache / a
+    /// warmed persisted binding (`false`); the caller ([`Self::hold_budgeted`]) uses
+    /// the flag to persist the verified derived binding to disk exactly ONCE - on the
+    /// fresh transition - rather than rewriting the whole snapshot on every probe.
+    ///
+    /// task-104: a COLD key (its digest slot is `None`, so answering it needs a fresh
+    /// dump) reserves one unit of `budget` ATOMICALLY under the digest lock right
+    /// before dumping. If the budget is spent, it returns [`DeriveStep::Deferred`]
+    /// WITHOUT dumping - so the number of `nix-store --dump`s one batch triggers is
+    /// hard-capped at the budget, not at the batch's key count. A WARM key (Verified
+    /// or Quarantined) returns from the cache before the reservation, so it neither
+    /// dumps nor spends a unit. The single-key path passes an unlimited budget and so
+    /// never defers.
     fn derive(
         &self,
         key: &NarHashKey,
         entry: &Entry,
-    ) -> Result<(DerivedNar, bool), AvailabilityError> {
+        budget: &mut DeriveBudget,
+    ) -> Result<DeriveStep, AvailabilityError> {
         let mut slot = entry.digest.lock().expect("digest mutex");
         match &*slot {
-            Some(DeriveOutcome::Verified(derived)) => return Ok((*derived, false)),
+            Some(DeriveOutcome::Verified(derived)) => {
+                return Ok(DeriveStep::Derived(*derived, false));
+            }
             Some(DeriveOutcome::Quarantined(mismatch)) => {
                 return Err(AvailabilityError::NarHashMismatch(mismatch.clone()));
             }
             None => {}
+        }
+        // COLD: a fresh dump is required. Gate it on the batch's derivation budget
+        // HERE - under the digest lock, immediately before the dump - so the decision
+        // and the dump are atomic and the count of dumps a batch triggers cannot
+        // exceed its budget. A spent budget defers WITHOUT dumping (the safe
+        // direction: the caller answers Absent, the key warms on a later probe).
+        if !budget.try_reserve() {
+            return Ok(DeriveStep::Deferred);
         }
         let raw_nar = self.dumper.dump(&entry.store_path, &NeverCancelled)?;
         // Verify the caller's binding BEFORE trusting the dump. sha256 of the same
@@ -1607,7 +1825,7 @@ impl AvailabilityIndex {
             .persisted_derived
             .lock()
             .expect("persisted-derived mutex") = Some(derived);
-        Ok((derived, true))
+        Ok(DeriveStep::Derived(derived, true))
     }
 
     /// This node's iroh transport offer (a pure locator: just the NodeId).

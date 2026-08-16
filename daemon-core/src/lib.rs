@@ -44,8 +44,8 @@ pub mod upstream;
 
 pub use availability::{
     AnnounceSink, AvailabilityError, AvailabilityIndex, CommandNarDumper, DerivedNar, DumpError,
-    IndexStore, JsonFileStore, MemoryNarDumper, NarDumper, NarHashMismatch, NullAnnounce,
-    NullStore, PersistError, PersistedRegistration, RegularFileNarDumper, StorePath,
+    IndexStore, JsonFileStore, MAX_BATCH_DERIVE_WORK, MemoryNarDumper, NarDumper, NarHashMismatch,
+    NullAnnounce, NullStore, PersistError, PersistedRegistration, RegularFileNarDumper, StorePath,
 };
 pub use cacheinfo::CacheInfo;
 pub use catalog::{CorrelationStore, NarCatalog, NarMeta, NullCorrelation};
