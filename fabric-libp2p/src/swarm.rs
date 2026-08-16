@@ -2931,9 +2931,11 @@ mod tests {
         // deterministic `1,2,3..` sequence (which is neither independent nor a faithful model of
         // the per-query renewal, and would not license the (185/201)^R miss math). We draw the
         // salts from a FIXED-SEED `StdRng`: the draws are genuinely independent u64s (so the flake
-        // bound below is real), yet the seed is fixed so the test is reproducible with ZERO CI
-        // flake. Each drawn salt is fed through the SAME `retain_bounded_provider` fold the worker
-        // runs (`retained_under_salt`), so this exercises the production per-query selection path.
+        // bound below is real), yet the seed is fixed so the SALT sequence is reproducible run-to-
+        // run. This is NOT literally zero-flake - the providers use `PeerId::random()` and the
+        // self-heal is probabilistic - but the residual miss probability is the ~4e-19 bound below,
+        // negligible for CI. Each drawn salt is fed through the SAME `retain_bounded_provider` fold
+        // the worker runs (`retained_under_salt`), so this exercises the production selection path.
         //
         // Honest flake bound: with T = S+1 = 201 named providers and max_peers = 16, the modeled
         // (idealized-uniform) per-retry miss probability is 1 - 16/201 = 185/201 ~ 0.9204. Over
