@@ -44,8 +44,8 @@ use fabric_libp2p::{
 
 use ed25519_dalek::SigningKey;
 use peer_fabric::{
-    AdmitAllPublication, AnnounceBudget, Axis, Blake3Digest, ContentKey, DiscoveryBudget,
-    IneligibleReason, NodeId, PeerFabric, ProviderRecord, PublicationEligibility,
+    AdmitAllPublication, AnnounceBudget, AnnounceError, Axis, Blake3Digest, ContentKey,
+    DiscoveryBudget, IneligibleReason, NodeId, PeerFabric, ProviderRecord, PublicationEligibility,
     RefusePublication, SafetyEnvelope, TransportOffer, TransportTag, require_axes,
     sign_provider_record,
 };
@@ -1206,10 +1206,14 @@ struct AnnounceLedger {
     /// announced path is a no-op (this node is already a holder).
     announced: HashSet<NarHashKey>,
     /// The still-advertised holdings, `nar_hash -> (announced ContentKey, store path)` (TASK-77
-    /// FIX 3b). [`reconcile`] walks this to WITHDRAW any holding whose store path was GC'd, so the
-    /// node never keeps advertising a record it can no longer serve (index-coverage ==
-    /// provider-coverage across a GC). A withdrawn holding is dropped from here (it stays in
-    /// `announced` for dedup, so its one budget unit is not re-spent).
+    /// FIX 3b/D). [`reconcile`] walks this to WITHDRAW any holding whose store path was GC'd, so the
+    /// node self-heals a record it can no longer serve. This is EVENTUALLY consistent, not
+    /// instantaneous: between a GC (or an ambiguous announce) and the next successful reconcile, the
+    /// node CAN transiently keep advertising a record it cannot serve - bounded by reconcile-on-
+    /// dispatch and the record's kad TTL (a stale record costs a querier one clean-declined retry,
+    /// within the TCB; see the module doc's eventually-consistent residual). A withdrawn holding is
+    /// dropped from here ONLY on a SUCCESSFUL withdraw (a failed one is KEPT for retry); it stays in
+    /// `announced` for dedup, so its one budget unit is not re-spent.
     held: HashMap<NarHashKey, (ContentKey, String)>,
 }
 
@@ -1310,15 +1314,18 @@ impl Withdrawer for FabricWithdrawer {
 }
 
 /// GC-serveability reconcile (TASK-77 FIX 3b, AC#3 / TASK-72): WITHDRAW every held record whose
-/// store path is no longer materialised (GC'd since the announce), so the node never keeps
-/// advertising a holding it cannot serve. Self-correcting, no disk growth, reuses the existing
-/// TASK-231 withdraw. `path.exists()` is the GC signal (the store GC unlinks the path); the serve
-/// side ALSO fails cleanly on a vanished path (fabric-libp2p re-dumps + BLAKE3-re-verifies before
-/// emitting a byte, so a stale holding costs a peer a Declined retry, never a wrong byte), so this
-/// is the ACTIVE self-heal on top of that passive safety. A holding is dropped from `held` ONLY on a
-/// SUCCESSFUL withdraw (FIX B): a failed withdraw is KEPT so the next dispatch retries it. Removing
-/// the `withdraw` call - the mutation the production GC bite catches - leaves a lasting false
-/// holding on the DHT.
+/// store path is no longer materialised (GC'd since the announce), self-healing toward
+/// index==provider coverage. This is EVENTUALLY consistent, not instantaneous: it runs
+/// OPPORTUNISTICALLY (on the next dispatch), so between a GC and the next successful reconcile the
+/// node CAN transiently keep advertising a record it cannot serve - bounded by that reconcile and
+/// the record's kad TTL. Self-correcting, no disk growth, reuses the existing TASK-231 withdraw.
+/// `path.exists()` is the GC signal (the store GC unlinks the path); the serve side ALSO fails
+/// cleanly on a vanished path (fabric-libp2p re-dumps + BLAKE3-re-verifies before emitting a byte,
+/// so a stale holding costs a peer a clean Declined retry, never a wrong byte - the transient
+/// window is within the TCB), so this is the ACTIVE self-heal on top of that passive safety. A
+/// holding is dropped from `held` ONLY on a SUCCESSFUL withdraw (FIX B): a failed withdraw is KEPT
+/// so the next dispatch retries it. Removing the `withdraw` call - the mutation the production GC
+/// bite catches - leaves a lasting false holding on the DHT.
 async fn reconcile(ledger: &Mutex<AnnounceLedger>, withdrawer: &dyn Withdrawer) {
     // Snapshot the GC'd holdings under the lock (do not hold it across the async withdraw).
     let gone: Vec<(NarHashKey, ContentKey)> = {
@@ -1508,38 +1515,130 @@ impl GrowWorker {
         )
     }
 
-    /// Announce the verified `provisions` through the SAME door the shipped provider uses, so the
-    /// announce goes through the fabric announcer's TASK-231 eligibility authority (no bypass).
-    async fn announce_provisions(
-        &self,
-        provisions: &[StoreProvision],
-    ) -> Result<Vec<ProviderRecord>, String> {
+    /// Announce ONE verified provision through the fabric's announcer, returning the outcome
+    /// CLASSIFIED (FIX D) by whether a DHT side-effect could have occurred. This drives
+    /// `announcer.announce` DIRECTLY (rather than the String-collapsing door) so the typed
+    /// [`AnnounceError`] survives for classification. It does NOT bypass the eligibility gate: the
+    /// witness is minted by THIS door's authority (Public: allowlist-gated; Lan: AdmitAll) AND the
+    /// announcer re-checks with the FABRIC'S OWN per-fabric authority fail-closed (TASK-231), the
+    /// same allowlist `eligible_provisions` already approved - three independent gates, no bypass.
+    async fn announce_one(&self, provision: &StoreProvision) -> AnnounceAttempt {
+        let Some(announcer) = self.fabric.announcer() else {
+            // No announcer -> nothing published -> clean pre-publication failure.
+            return AnnounceAttempt::CleanFailure("fabric exposes no announcer".to_string());
+        };
         let now = now_unix_secs();
-        match &self.door {
-            AnnounceAfterFetchDoor::Public(allowlist) => {
-                announce_public_provisions(
-                    &self.fabric,
-                    self.identity_seed,
-                    provisions,
-                    allowlist,
-                    self.ttl_secs,
-                    now,
-                    &self.announce_budget,
-                )
-                .await
+        let sequence = self
+            .fabric
+            .next_announce_sequence(&provider_content_key(provision.nar_hash()));
+        let record = sign_libp2p_store_record(
+            self.identity_seed,
+            provision.nar_hash(),
+            provision.content(),
+            self.ttl_secs,
+            now,
+            sequence,
+        );
+        let content_key = record.key;
+        // Mint the witness via THIS door's authority (a witness-authorize refusal is a CLEAN
+        // pre-publication failure - nothing reached the announcer).
+        let witness = match &self.door {
+            AnnounceAfterFetchDoor::Public(allowlist) => AllowlistWitnessAuthority {
+                allowlist: allowlist.as_ref(),
             }
-            AnnounceAfterFetchDoor::Lan(lan) => {
-                announce_store_provisions(
-                    &self.fabric,
-                    self.identity_seed,
-                    provisions,
-                    *lan,
-                    self.ttl_secs,
-                    now,
-                    &self.announce_budget,
-                )
-                .await
+            .authorize(record.clone()),
+            AnnounceAfterFetchDoor::Lan(_) => AdmitAllPublication.authorize(record.clone()),
+        };
+        let witness = match witness {
+            Ok(w) => w,
+            Err(reason) => {
+                return AnnounceAttempt::CleanFailure(format!(
+                    "witness refused (not published): {reason}"
+                ));
             }
+        };
+        let attempt = classify_announce(
+            announcer
+                .announce(&witness, &self.announce_budget)
+                .await
+                .map(|_| ()),
+            content_key,
+        );
+        match &attempt {
+            AnnounceAttempt::Published(_) => println!(
+                "LIBP2P-ANNOUNCE-AFTER-FETCH narhash={} content={} content_key={content_key} nar_size={}",
+                provision.nar_hash(),
+                provision.content().to_hex(),
+                provision.declared_size(),
+            ),
+            AnnounceAttempt::Ambiguous(_) => eprintln!(
+                "LIBP2P-ANNOUNCE-AFTER-FETCH narhash={} reason=announce-ambiguous \
+                 (record may be live; tracked for withdraw, budget spent)",
+                provision.nar_hash()
+            ),
+            AnnounceAttempt::CleanFailure(why) => eprintln!(
+                "LIBP2P-ANNOUNCE-AFTER-FETCH narhash={} reason=announce-clean-fail: {why} \
+                 (guaranteed not published; budget refunded)",
+                provision.nar_hash()
+            ),
+        }
+        attempt
+    }
+}
+
+/// The outcome of announcing one provision, classified for FIX D accounting.
+#[derive(Debug)]
+enum AnnounceAttempt {
+    /// The announcer returned `Ok`: the record was published. Track + keep budget spent.
+    Published(ContentKey),
+    /// The announce could have taken effect (an [`AnnounceError`] raised DURING/AROUND the publish
+    /// future). The record MAY be live, so track it for `reconcile` + keep the budget SPENT.
+    Ambiguous(ContentKey),
+    /// A CLEAN pre-publication failure (no announcer / witness refused / an [`AnnounceError`]
+    /// raised BEFORE the publish future - GUARANTEED not published). Refund the budget, track nothing.
+    CleanFailure(String),
+}
+
+impl AnnounceAttempt {
+    /// The FIX D ledger decision: `Some(content_key)` for Published OR Ambiguous (the caller
+    /// `commit_success`es - SPENDS the budget + TRACKS the holding for `reconcile`), `None` for a
+    /// CleanFailure (the caller `commit_failure`s - REFUNDS the budget + tracks nothing). Pure, so
+    /// the discriminating FIX D bite chains `classify_announce` -> here -> the ledger without a swarm.
+    fn into_grow_result(self) -> Option<ContentKey> {
+        match self {
+            AnnounceAttempt::Published(ck) | AnnounceAttempt::Ambiguous(ck) => Some(ck),
+            AnnounceAttempt::CleanFailure(_) => None,
+        }
+    }
+}
+
+/// Classify one announce result into the FIX D accounting outcome (PURE, so the discriminating bite
+/// needs no live swarm). `Ok` -> published (spend + track); an AMBIGUOUS error -> the record may be
+/// live (spend + track for `reconcile`); a CLEAN error -> guaranteed not published (refund).
+fn classify_announce(
+    result: Result<(), AnnounceError>,
+    content_key: ContentKey,
+) -> AnnounceAttempt {
+    match result {
+        Ok(()) => AnnounceAttempt::Published(content_key),
+        Err(e) if announce_error_is_ambiguous(&e) => AnnounceAttempt::Ambiguous(content_key),
+        Err(e) => AnnounceAttempt::CleanFailure(e.to_string()),
+    }
+}
+
+/// Classify an [`AnnounceError`] (FIX D): is it AMBIGUOUS (a DHT side-effect could have occurred) or
+/// a CLEAN pre-publication failure (guaranteed not published)? Per `fabric-libp2p/src/announcer.rs`:
+/// `Persist` is raised in save-before-publish BEFORE the `publish` future (announcer.rs:459), and
+/// `Rejected` (record encode/decode/expiry/TTL) and `Ineligible` before it too - all GUARANTEED not
+/// on the wire. Only `Unreachable` (raised inside `publish`'s `start_providing`/`put_record`) and
+/// `DeadlineExceeded` (the `publish` future timed out, possibly after `start_providing`) can have a
+/// side-effect. Exhaustive (no wildcard), so a NEW `AnnounceError` variant forces a conscious
+/// clean-vs-ambiguous classification here rather than defaulting silently.
+fn announce_error_is_ambiguous(err: &AnnounceError) -> bool {
+    match err {
+        AnnounceError::Unreachable(_) | AnnounceError::DeadlineExceeded => true,
+        AnnounceError::Rejected(_) | AnnounceError::Persist(_) | AnnounceError::Ineligible(_) => {
+            false
         }
     }
 }
@@ -1602,34 +1701,19 @@ impl Grower for GrowWorker {
             }
         };
 
-        match self.announce_provisions(&provisions).await {
-            Ok(records) => {
-                let mut content_key = None;
-                for (record, provision) in records.iter().zip(&provisions) {
-                    println!(
-                        "LIBP2P-ANNOUNCE-AFTER-FETCH narhash={} content={} content_key={} nar_size={}",
-                        provision.nar_hash(),
-                        record.content.to_hex(),
-                        record.key,
-                        provision.declared_size(),
-                    );
-                    content_key = Some(record.key);
-                }
-                content_key
-            }
-            Err(why) => {
-                // FIX D: AMBIGUOUS post-side-effect failure. `announce` does `start_providing` +
-                // `put_record` before returning; an Err/timeout may leave a LIVE record we can no
-                // longer distinguish. So TRACK the holding (return `Some(derived content_key)`) and
-                // keep the budget SPENT, so `reconcile` can withdraw it if the path is/goes
-                // unserveable - never a leaked, untrackable record. Only CLEAN failures above refund.
-                eprintln!(
-                    "LIBP2P-ANNOUNCE-AFTER-FETCH narhash={key} reason=announce-ambiguous: {why} \
-                     (record may be live; tracked for withdraw, budget spent)"
-                );
-                Some(provider_content_key(key))
+        // Announce each verified provision (one per fetched key). FIX D: `announce_one` classifies
+        // the announce outcome by whether a DHT side-effect could have occurred, so a CLEAN
+        // pre-publication failure (e.g. `AnnounceError::Persist`, raised BEFORE `start_providing`)
+        // REFUNDS (returns `None`) while a Published/Ambiguous outcome SPENDS + tracks (returns
+        // `Some`). A CleanFailure short-circuits: no `Some` was set, so the caller refunds.
+        let mut content_key = None;
+        for provision in &provisions {
+            match self.announce_one(provision).await.into_grow_result() {
+                Some(ck) => content_key = Some(ck),
+                None => return None, // clean pre-publication failure -> refund
             }
         }
+        content_key
     }
 }
 
@@ -2588,8 +2672,8 @@ mod announce_after_fetch_tests {
 
     use super::{
         AnnounceAfterFetchDoor, AnnounceLedger, Begin, GrowSpawner, Grower,
-        Libp2pAnnounceAfterFetch, Withdrawer, WorkerSpawner, begin, eligible_provisions,
-        validate_store_path,
+        Libp2pAnnounceAfterFetch, Withdrawer, WorkerSpawner, begin, classify_announce,
+        eligible_provisions, validate_store_path,
     };
     use async_trait::async_trait;
     use std::collections::{HashMap, HashSet};
@@ -2600,7 +2684,7 @@ mod announce_after_fetch_tests {
         AvailabilityIndex, NarDumper, NarHash, NarHashKey, NodeId, NullAnnounce, NullStore,
         PublicNarAllowlist, RegularFileNarDumper,
     };
-    use peer_fabric::{ContentKey, ServeBudget};
+    use peer_fabric::{AnnounceError, ContentKey, IneligibleReason, ServeBudget};
 
     const HASH32: &str = "0123456789abcdfghijklmnpqrsvwxyz";
     const STORE_DIR: &str = "/nix/store";
@@ -2767,6 +2851,45 @@ mod announce_after_fetch_tests {
             led.held.contains_key(&key(2)),
             "the holding is TRACKED for reconcile"
         );
+    }
+
+    /// AC#3 FIX D BITE (discriminating): the announce-error classification drives the ledger. A
+    /// CLEAN pre-publication error (`Persist`/`Rejected`/`Ineligible` - GUARANTEED not published)
+    /// maps to `None` -> `commit_failure` REFUNDS + tracks nothing; an AMBIGUOUS error
+    /// (`Unreachable`/`DeadlineExceeded` - may be live) or `Ok` maps to `Some` -> `commit_success`
+    /// SPENDS + TRACKS for `reconcile`. (The `None`->refund / `Some`->spend+track half is proven by
+    /// `run_refunds_clean_failures_and_spends_plus_tracks_announced`.) MUTATION: making `Persist`
+    /// ambiguous (or an ambiguous variant clean) in `announce_error_is_ambiguous` flips the mapped
+    /// result - this reddens, discriminating the exact error the announcer raises BEFORE vs
+    /// during/after `start_providing`/`put_record`.
+    #[test]
+    fn announce_error_classification_discriminates_clean_pre_publication_from_ambiguous() {
+        let ck = content_key(9);
+        // CLEAN pre-publication (announcer.rs: raised BEFORE the publish future) -> None -> refund.
+        for clean in [
+            AnnounceError::Persist("save-before-publish failed".into()),
+            AnnounceError::Rejected("bad record".into()),
+            AnnounceError::Ineligible(IneligibleReason::NotAllowlisted),
+        ] {
+            assert_eq!(
+                classify_announce(Err(clean), ck).into_grow_result(),
+                None,
+                "a clean pre-publication announce error must REFUND (guaranteed not published)"
+            );
+        }
+        // AMBIGUOUS (raised inside/around the publish future - may be live) -> Some -> spend + track.
+        for ambiguous in [
+            AnnounceError::Unreachable("partition".into()),
+            AnnounceError::DeadlineExceeded,
+        ] {
+            assert_eq!(
+                classify_announce(Err(ambiguous), ck).into_grow_result(),
+                Some(ck),
+                "an ambiguous announce error must SPEND + TRACK (reconcile may need to withdraw)"
+            );
+        }
+        // Ok -> published -> Some (spend + track).
+        assert_eq!(classify_announce(Ok(()), ck).into_grow_result(), Some(ck));
     }
 
     /// AC#3 / TASK-72 FIX 3b BITE (production-wired): `WorkerSpawner::run` reconciles + WITHDRAWS a
