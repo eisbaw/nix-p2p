@@ -101,6 +101,26 @@ use crate::transport::NodeId;
 /// bound. Coarse on purpose - the fine-grained per-request abort/hedge is task-51.
 pub const PROBE_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// The TOTAL wall-clock a single [`DirectDiscovery::resolve_many`] call may spend
+/// probing peers, regardless of how many peers are configured or how many chunks a
+/// closure splits into. [`PROBE_TIMEOUT`] bounds ONE probe; without a bound over
+/// their SUM, batching multiplied the number of bounded waits (8 peers x 4 chunks x
+/// 5 s = ~160 s, and a pathological config ~31 min - task-106). This is the backstop
+/// over the whole call: once it is spent, the keys resolved so far are returned and
+/// every still-unresolved key folds to a CLEAN miss -> upstream fallback (the safe
+/// direction; never wrong bytes - task-40).
+///
+/// 30 s = 6 x [`PROBE_TIMEOUT`] and half the fabric-iroh `FETCH_TIMEOUT` (60 s) total
+/// fetch bound, so discovery stays a bounded FRACTION of the overall build-path
+/// budget. It is a BACKSTOP, not the common path: on a live peer set the first peer
+/// answers in milliseconds and this never fires; it bites only the pathological
+/// silent/wedged config the per-probe bound alone left unbounded. With per-peer fault
+/// abandonment (task-106 AC#2) a silent peer now costs ONE [`PROBE_TIMEOUT`], so
+/// sequentially this deadline backstops any configuration beyond ~6 dead peers.
+/// PROVISIONAL, like the fetch envelope: task-100 threads the CALLER's real budget
+/// through the discovery seam and subsumes this internal default.
+pub const RESOLVE_MANY_TIMEOUT: Duration = Duration::from_secs(30);
+
 // -------------------------------------------------------------------------
 // The Discovery seam: NarHash -> a complete claim, or a miss.
 // -------------------------------------------------------------------------
@@ -760,20 +780,27 @@ pub struct DirectDiscovery {
     peers: Vec<NodeId>,
     query: Arc<dyn PeerQuery>,
     probe_timeout: Duration,
+    /// The backstop over a whole [`resolve_many`](Discovery::resolve_many) call (see
+    /// [`RESOLVE_MANY_TIMEOUT`]). Bounds the SUM of the per-probe waits, which the
+    /// per-probe [`probe_timeout`](Self::probe_timeout) alone does not (task-106).
+    total_timeout: Duration,
 }
 
 impl DirectDiscovery {
-    /// Probe `peers` (in order) via `query`, with the default [`PROBE_TIMEOUT`].
+    /// Probe `peers` (in order) via `query`, with the default [`PROBE_TIMEOUT`] per
+    /// probe and [`RESOLVE_MANY_TIMEOUT`] over a whole closure resolution.
     pub fn new(peers: Vec<NodeId>, query: Arc<dyn PeerQuery>) -> Self {
         Self {
             peers,
             query,
             probe_timeout: PROBE_TIMEOUT,
+            total_timeout: RESOLVE_MANY_TIMEOUT,
         }
     }
 
     /// As [`new`](Self::new) but with an explicit per-peer probe bound (tests use a
-    /// short one to prove a hanging peer still yields a fast miss).
+    /// short one to prove a hanging peer still yields a fast miss). The total-call
+    /// backstop keeps its [`RESOLVE_MANY_TIMEOUT`] default.
     pub fn with_timeout(
         peers: Vec<NodeId>,
         query: Arc<dyn PeerQuery>,
@@ -783,6 +810,24 @@ impl DirectDiscovery {
             peers,
             query,
             probe_timeout,
+            total_timeout: RESOLVE_MANY_TIMEOUT,
+        }
+    }
+
+    /// As [`with_timeout`](Self::with_timeout) but ALSO pins the total-call backstop,
+    /// so a test can prove the SUM over many silent peers is bounded by the total,
+    /// not by N x the per-probe bound (task-106 AC#1).
+    pub fn with_bounds(
+        peers: Vec<NodeId>,
+        query: Arc<dyn PeerQuery>,
+        probe_timeout: Duration,
+        total_timeout: Duration,
+    ) -> Self {
+        Self {
+            peers,
+            query,
+            probe_timeout,
+            total_timeout,
         }
     }
 
@@ -856,8 +901,37 @@ impl Discovery for DirectDiscovery {
     ///   * Peers are tried in order and the loop STOPS as soon as every key is
     ///     resolved, so the common case (the first peer holds the closure) really
     ///     is one round trip.
-    ///   * Each chunk probe carries the same [`PROBE_TIMEOUT`] bound as a single
-    ///     probe, so a wedged peer still yields a fast miss. On the responder side a
+    ///   * The whole call is bounded by [`RESOLVE_MANY_TIMEOUT`] (task-106 AC#1), not
+    ///     only per probe: a deadline is taken once at entry, each probe waits at most
+    ///     `min(probe_timeout, remaining)`, and once the budget is spent the peer loop
+    ///     stops. The keys resolved so far are RETURNED (partial results are kept, not
+    ///     discarded); every still-unresolved key folds to a clean miss -> upstream.
+    ///     This is why the naive 8 x 4 x 5 s = ~160 s (pathological ~31 min) blowup of
+    ///     a silent peer set cannot recur: the per-probe bound bounds ONE wait, this
+    ///     bounds their SUM.
+    ///   * On a per-PEER fault (a `query_batch` error - no route / a wire fault - or a
+    ///     probe TIMEOUT, both true of every key alike) the peer's REMAINING chunks
+    ///     are ABANDONED, not just the current one (task-106 AC#2). This matches the
+    ///     rule [`PeerQuery::query_batch`] already states: retrying the other keys
+    ///     against a peer we cannot reach is pure waste. (A peer that DID answer in
+    ///     time but whose answer fails a positional / offer-index defence check is a
+    ///     per-ANSWER fault, not a connectivity one, so that chunk is skipped without
+    ///     abandoning the peer.)
+    ///   * SEQUENTIAL, not concurrent, is a DELIBERATE choice (task-106 AC#3): the
+    ///     total deadline makes the sequential worst case bounded regardless of peer
+    ///     count, and the only residual downside - a silent early peer spending budget
+    ///     a live later peer could have used - degrades to a SAFE miss -> upstream, a
+    ///     performance opportunity cost, not a correctness bug. Sequential also
+    ///     preserves the cross-peer key subtraction (a later peer is asked only about
+    ///     still-unresolved keys) and the deterministic first-Have-wins / failover
+    ///     order (task-66). Concurrency would sacrifice both and needs a bounded
+    ///     fan-out plus a Have tiebreak - which is exactly the versioned execution plan
+    ///     (ordering / parallelism / racing / stop conditions) task-100 AC#5 owns and
+    ///     must not be hardcoded before holdout. Note for task-100: this
+    ///     total-deadline + per-peer-abandon shape is now in place; thread the
+    ///     CALLER's real budget through and subsume [`RESOLVE_MANY_TIMEOUT`].
+    ///   * Each chunk probe carries at most the [`PROBE_TIMEOUT`] bound (clamped to the
+    ///     remaining total budget), so a wedged peer still yields a fast miss. On the responder side a
     ///     single COLD batch message no longer hashes up to 256 NARs: task-104's
     ///     per-batch derivation budget ([`crate::MAX_BATCH_DERIVE_WORK`]) makes it
     ///     answer from what is ALREADY derived plus a bounded number of fresh dumps
@@ -876,7 +950,13 @@ impl Discovery for DirectDiscovery {
             return results;
         }
 
-        for peer in &self.peers {
+        // The backstop over this WHOLE call (task-106 AC#1). Taken once, checked
+        // before each peer and each chunk; each probe is additionally clamped to the
+        // remaining budget so no single wait can overrun it. Integer Instant/Duration
+        // arithmetic only - no floats in a build-path bound.
+        let deadline = Instant::now() + self.total_timeout;
+
+        'peers: for peer in &self.peers {
             // The distinct keys still unanswered, and where each one's answer goes.
             let mut positions: HashMap<NarHashKey, Vec<usize>> = HashMap::new();
             let mut pending: Vec<NarHashKey> = Vec::new();
@@ -895,32 +975,56 @@ impl Discovery for DirectDiscovery {
             }
 
             for chunk in pending.chunks(MAX_BATCH_HOLD_KEYS) {
+                // The remaining total budget. Zero means the call deadline is spent:
+                // stop probing entirely and return what is resolved so far (the rest
+                // fold to a clean miss -> upstream). Clamp this probe to the remainder
+                // so a single wait cannot overrun the total (task-106 AC#1).
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                if remaining.is_zero() {
+                    eprintln!(
+                        "daemon: resolve_many hit its total {:?} budget; returning partial \
+                         results, unresolved keys fall back upstream",
+                        self.total_timeout
+                    );
+                    break 'peers;
+                }
+                let probe_bound = self.probe_timeout.min(remaining);
                 let query = BatchHoldQuery {
                     schema_version: QUERY_SCHEMA_VERSION,
                     keys: chunk.to_vec(),
                 };
                 let response = match tokio::time::timeout(
-                    self.probe_timeout,
+                    probe_bound,
                     self.query.query_batch(peer, &query),
                 )
                 .await
                 {
                     Ok(Ok(response)) => response,
                     Ok(Err(err)) => {
+                        // A per-PEER fault (no route / a wire fault) is true of every
+                        // key alike, so ABANDON this peer's remaining chunks rather
+                        // than burning a probe on each - matching the rule
+                        // `query_batch` documents (task-106 AC#2).
                         eprintln!(
-                            "daemon: batched discovery probe of {peer} ({} keys) failed: {err}",
+                            "daemon: batched discovery probe of {peer} ({} keys) failed: {err}; \
+                             abandoning this peer's remaining chunks",
                             chunk.len()
                         );
-                        continue;
+                        continue 'peers;
                     }
                     Err(_elapsed) => {
+                        // A probe TIMEOUT is a per-PEER fault too (the peer did not
+                        // answer within the bound): abandon its remaining chunks, do
+                        // not re-probe it chunk by chunk (task-106 AC#2). `probe_bound`
+                        // is the clamped bound actually applied (<= PROBE_TIMEOUT once
+                        // the total budget runs low).
                         eprintln!(
                             "daemon: batched discovery probe of {peer} ({} keys) exceeded {:?}; \
-                             treating as a miss",
+                             treating as a miss and abandoning this peer's remaining chunks",
                             chunk.len(),
-                            self.probe_timeout
+                            probe_bound
                         );
-                        continue;
+                        continue 'peers;
                     }
                 };
                 // Defence in depth: the transport already checked this against the
@@ -2083,6 +2187,96 @@ mod tests {
         assert!(
             elapsed < Duration::from_secs(5),
             "a batched miss must be bounded too, took {elapsed:?}"
+        );
+    }
+
+    // ---- task-106 AC#1 bite: the WHOLE call is bounded, not just per probe ----
+
+    #[tokio::test]
+    async fn resolve_many_is_bounded_in_total_not_per_probe() {
+        // Many SILENT peers. Per probe each times out at `probe_bound`; the OLD code
+        // bounded only ONE probe, so the sum was N x probe_bound (here 50 x 100 ms =
+        // 5 s, and at production scale 8 x 4 x 5 s = ~160 s / ~31 min). The total
+        // deadline bounds the SUM: the call returns at ~`total` regardless of N.
+        //
+        // MUTATION PROOF (task-106 AC#1): delete the `deadline` / `remaining` /
+        // `break 'peers` budget check in `resolve_many` and this reverts to ~N x
+        // probe_bound (~5 s here), blowing the `< 1500 ms` assertion. The gap between
+        // the 300 ms budget and the 5 s naive sum is the bite.
+        let probe_bound = Duration::from_millis(100);
+        let total = Duration::from_millis(300);
+        let silent: Vec<NodeId> = (1..=50u8).map(|i| NodeId::from_bytes([i; 32])).collect();
+        let discovery =
+            DirectDiscovery::with_bounds(silent, Arc::new(HangingQuery), probe_bound, total);
+
+        let all = keys(4);
+        let started = std::time::Instant::now();
+        let resolved = discovery.resolve_many(&all).await;
+        let elapsed = started.elapsed();
+
+        assert!(
+            resolved.iter().all(Option::is_none),
+            "every silent peer is a miss; the closure folds to upstream"
+        );
+        assert!(
+            elapsed < Duration::from_millis(1500),
+            "resolve_many must be bounded by its TOTAL deadline (~{total:?}), not by \
+             50 x {probe_bound:?} = ~5 s; took {elapsed:?}"
+        );
+    }
+
+    // ---- task-106 AC#2 bite: a per-peer fault abandons that peer's chunks ----
+
+    /// A peer whose batch probe always FAULTS (a per-peer error, true of every key
+    /// alike), counting how many times it is probed. The resolver must abandon it
+    /// after the FIRST faulting chunk, not re-probe it chunk by chunk.
+    struct CountingFaultPeer {
+        batch_calls: AtomicUsize,
+    }
+    #[async_trait]
+    impl PeerQuery for CountingFaultPeer {
+        async fn query(
+            &self,
+            _node: &NodeId,
+            _query: &HoldQuery,
+        ) -> Result<HoldResponse, PeerQueryError> {
+            unreachable!("this test only drives the batch path")
+        }
+        async fn query_batch(
+            &self,
+            _node: &NodeId,
+            _query: &BatchHoldQuery,
+        ) -> Result<BatchHoldResponse, PeerQueryError> {
+            self.batch_calls.fetch_add(1, Ordering::Relaxed);
+            Err(PeerQueryError::Answer("simulated per-peer fault".into()))
+        }
+    }
+
+    #[tokio::test]
+    async fn a_faulting_peer_abandons_its_remaining_chunks() {
+        // A closure that SPLITS into two chunks (MAX_BATCH_HOLD_KEYS + 1 keys). The
+        // first chunk faults. Because a per-peer fault is true of every key alike
+        // (the rule `query_batch` documents), the peer's SECOND chunk must NOT be
+        // probed - retrying an unreachable peer is pure waste.
+        //
+        // MUTATION PROOF (task-106 AC#2): change the fault arm's `continue 'peers`
+        // back to `continue` (skip only the current chunk) and this reads 2 probes.
+        let all = keys(MAX_BATCH_HOLD_KEYS + 1);
+        let peer = Arc::new(CountingFaultPeer {
+            batch_calls: AtomicUsize::new(0),
+        });
+        let discovery = DirectDiscovery::new(vec![node_b()], peer.clone());
+
+        let resolved = discovery.resolve_many(&all).await;
+        assert!(
+            resolved.iter().all(Option::is_none),
+            "a peer that faults every chunk resolves nothing"
+        );
+        assert_eq!(
+            peer.batch_calls.load(Ordering::Relaxed),
+            1,
+            "the faulting peer must be abandoned after its FIRST chunk (2-chunk \
+             closure), not re-probed for the second"
         );
     }
 
