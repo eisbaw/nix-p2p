@@ -9,6 +9,7 @@
 
 mod common;
 
+use std::num::NonZeroUsize;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::Mutex;
@@ -934,4 +935,303 @@ async fn malformed_connection_200_is_not_cached() {
         2,
         "request #2 must reach upstream again (no cached 200)"
     );
+}
+
+// =============================================================================
+// TASK-27 AC#1/#3 - the on-disk cache is bounded by an integer COUNT cap and
+// evicts the oldest (coldest by fetched_at) entries, staying at or below the cap.
+// ManualClock gives a deterministic LRU ordering (no wall-clock flake).
+// =============================================================================
+
+/// Nix base32 alphabet (32 symbols, no e/o/u/t) - the store-hash charset.
+const B32: &[u8] = b"0123456789abcdfghijklmnpqrsvwxyz";
+
+/// A distinct VALID 32-char nix-base32 store hash per `i`: start from a known-good
+/// hash and overwrite its leading chars with a base-32 encoding of `i`, so
+/// different `i` yield different, still-valid keys (each names its own `.nic`).
+fn hash_n(i: usize) -> String {
+    let mut s = b"0a0lslqb6gbqnj6xqjlaljjqg6kgb3wz".to_vec();
+    let mut v = i;
+    let mut idx = 0;
+    loop {
+        s[idx] = B32[v % 32];
+        v /= 32;
+        idx += 1;
+        if v == 0 {
+            break;
+        }
+    }
+    String::from_utf8(s).unwrap()
+}
+
+/// Count the `.nic` entry files under `dir` (the sidecar `index` is not a `.nic`).
+fn count_nic(dir: &TempDir) -> usize {
+    std::fs::read_dir(dir.path())
+        .unwrap()
+        .flatten()
+        .filter(|e| e.path().extension().is_some_and(|x| x == "nic"))
+        .count()
+}
+
+#[tokio::test]
+async fn ac3_eviction_caps_entry_count_and_drops_the_oldest() {
+    let dir = TempDir::new("ac3-evict");
+    let clock = ManualClock::new(1_000);
+    // A well-formed body; every request stores under its OWN store hash, so the
+    // body content is immaterial - the .nic file name is the store hash.
+    let body = narinfo(
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-x",
+        "1abc.nar.xz",
+        "sha256:deadbeef",
+        4096,
+    );
+    let upstream = FakeUpstream::new(Behavior::Body(body));
+    let cap = NonZeroUsize::new(3).unwrap();
+    let cache = NarinfoDiskCache::with_max_entries(
+        dir.path(),
+        upstream.clone(),
+        Arc::new(clock.clone()),
+        cap,
+    )
+    .unwrap();
+
+    // Install 5 distinct entries at strictly increasing fetched_at (advance the
+    // manual clock between each), exceeding the cap of 3.
+    let n = 5usize;
+    for i in 0..n {
+        clock.advance(10); // strictly-increasing fetched_at => deterministic LRU
+        let r = cache.fetch(&StoreHash::new(hash_n(i))).await.unwrap();
+        assert_eq!(r.status, 200, "install {i} served");
+    }
+
+    // The cap holds: no more than 3 entries on disk. RED if eviction is removed
+    // (all 5 would remain).
+    assert_eq!(
+        count_nic(&dir),
+        3,
+        "cache must stay at or below the count cap after exceeding it"
+    );
+
+    // The OLDEST two (i=0,1) were evicted; the NEWEST three (i=2,3,4) survive.
+    // RED if eviction dropped the wrong end (or nothing).
+    for i in 0..2 {
+        assert!(
+            !entry_file(&dir, &hash_n(i)).exists(),
+            "oldest entry {i} must have been evicted"
+        );
+    }
+    for i in 2..5 {
+        assert!(
+            entry_file(&dir, &hash_n(i)).exists(),
+            "newest entry {i} must survive"
+        );
+    }
+}
+
+#[tokio::test]
+async fn ac3_evicted_key_refetches_never_serves_stale() {
+    // Correctness bite: an evicted entry is a cache MISS that re-fetches upstream,
+    // never a stale/wrong serve. Prove it by changing the upstream body across the
+    // eviction: the post-eviction fetch returns the CURRENT upstream bytes and
+    // reaches upstream again (a stale serve would return the old bytes without a
+    // new upstream hit).
+    let dir = TempDir::new("ac3-refetch");
+    let clock = ManualClock::new(1_000);
+    let body_v1 = narinfo(
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-x",
+        "v1.nar.xz",
+        "sha256:aaaa",
+        1,
+    );
+    let body_v2 = narinfo(
+        "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb-y",
+        "v2.nar.xz",
+        "sha256:bbbb",
+        2,
+    );
+    let upstream = FakeUpstream::new(Behavior::Body(body_v1.clone()));
+    let cap = NonZeroUsize::new(1).unwrap();
+    let cache = NarinfoDiskCache::with_max_entries(
+        dir.path(),
+        upstream.clone(),
+        Arc::new(clock.clone()),
+        cap,
+    )
+    .unwrap();
+
+    let a = hash_n(0);
+    let b = hash_n(1);
+
+    // 1. Cache A (body_v1).
+    clock.advance(10);
+    let r = cache.fetch(&StoreHash::new(&a)).await.unwrap();
+    assert_eq!(body_bytes(r).await, body_v1);
+    assert_eq!(upstream.hits(), 1);
+    assert!(entry_file(&dir, &a).exists());
+
+    // 2. Upstream now serves body_v2. Fetch B: with cap=1 this EVICTS A.
+    upstream.set(Behavior::Body(body_v2.clone()));
+    clock.advance(10);
+    let r = cache.fetch(&StoreHash::new(&b)).await.unwrap();
+    assert_eq!(body_bytes(r).await, body_v2);
+    assert_eq!(upstream.hits(), 2);
+    assert_eq!(count_nic(&dir), 1, "cap=1 holds");
+    assert!(!entry_file(&dir, &a).exists(), "A was evicted");
+
+    // 3. Re-fetch A: it was evicted, so this is a MISS -> refetch. It returns the
+    // CURRENT upstream bytes (body_v2), NOT a stale body_v1, and reaches upstream
+    // again. RED if eviction is removed: A would still be a HIT serving body_v1
+    // and hits would stay 2.
+    clock.advance(10);
+    let r = cache.fetch(&StoreHash::new(&a)).await.unwrap();
+    assert_eq!(
+        body_bytes(r).await,
+        body_v2,
+        "evicted key re-fetches fresh upstream bytes, never serves stale"
+    );
+    assert_eq!(
+        upstream.hits(),
+        3,
+        "evicted key forced a refetch (proves miss, not a stale hit)"
+    );
+}
+
+#[tokio::test]
+async fn ac2_restart_warms_live_set_from_sidecar_not_a_nic_rescan() {
+    // AC#2 (biting): a restart must learn the live set from the COMPACT SIDECAR,
+    // not by re-scanning `.nic` bodies. We prove it by DELETING every `.nic` after
+    // shutdown while keeping the sidecar: a full-`.nic`-rescan would then find ZERO
+    // entries, but the sidecar still lists them. On restart the warmed count must
+    // still be honoured - installing one more entry over the cap evicts a
+    // (now-phantom) sidecar entry, so the rewritten sidecar keeps exactly `cap`
+    // lines. RED under a mutation that ignores the sidecar and always rescans: the
+    // warmed count would be 0, the new install would NOT evict, and the sidecar
+    // would end with a single line.
+    let dir = TempDir::new("ac2-sidecar");
+    let clock = ManualClock::new(1_000);
+    let body = narinfo(
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-x",
+        "1abc.nar.xz",
+        "sha256:deadbeef",
+        4096,
+    );
+    let cap = NonZeroUsize::new(4).unwrap();
+    {
+        let upstream = FakeUpstream::new(Behavior::Body(body.clone()));
+        let cache = NarinfoDiskCache::with_max_entries(
+            dir.path(),
+            upstream.clone(),
+            Arc::new(clock.clone()),
+            cap,
+        )
+        .unwrap();
+        for i in 0..4 {
+            clock.advance(10);
+            let _ = cache.fetch(&StoreHash::new(hash_n(i))).await.unwrap();
+        }
+    }
+
+    // Sidecar is compact: a magic line + one line per live entry.
+    let sidecar = std::fs::read_to_string(dir.path().join("index")).unwrap();
+    let lines: Vec<&str> = sidecar.lines().collect();
+    assert_eq!(lines[0], "NIXP2P-NARINFO-INDEX\t1", "sidecar magic header");
+    assert_eq!(
+        lines.len(),
+        1 + 4,
+        "one compact line per live entry (magic + 4)"
+    );
+
+    // Delete every `.nic` body but KEEP the sidecar: a full rescan would now find 0.
+    for i in 0..4 {
+        std::fs::remove_file(entry_file(&dir, &hash_n(i))).unwrap();
+    }
+    assert_eq!(
+        count_nic(&dir),
+        0,
+        "all bodies gone; only the sidecar remains"
+    );
+
+    // Restart over the same dir (same cap). Install a 5th distinct entry: the book,
+    // warmed to 4 from the sidecar, hits 5 > cap and evicts one (phantom) entry.
+    let upstream = FakeUpstream::new(Behavior::Body(body));
+    let cache2 = NarinfoDiskCache::with_max_entries(
+        dir.path(),
+        upstream.clone(),
+        Arc::new(clock.clone()),
+        cap,
+    )
+    .unwrap();
+    clock.advance(10);
+    let r = cache2.fetch(&StoreHash::new(hash_n(4))).await.unwrap();
+    assert_eq!(r.status, 200);
+
+    // The rewritten sidecar keeps exactly `cap` (=4) lines: 3 warmed phantoms + the
+    // new entry. A rescan-only restart would have started empty, not evicted, and
+    // left magic + 1.
+    let sidecar = std::fs::read_to_string(dir.path().join("index")).unwrap();
+    assert_eq!(
+        sidecar.lines().count(),
+        1 + 4,
+        "restart warmed 4 from the sidecar, so the 5th install evicted down to the cap"
+    );
+    // Only the 5th body exists on disk (the phantoms had no bodies to begin with).
+    assert_eq!(
+        count_nic(&dir),
+        1,
+        "only the newly-installed body is on disk"
+    );
+    assert!(
+        entry_file(&dir, &hash_n(4)).exists(),
+        "the new entry's body"
+    );
+}
+
+#[tokio::test]
+async fn ac2_lowered_cap_on_restart_trims_the_oldest() {
+    // A restart with a LOWER cap than the persisted set trims the oldest down to
+    // the new cap (honours the configured bound immediately, not lazily).
+    let dir = TempDir::new("ac2-trim");
+    let clock = ManualClock::new(1_000);
+    let body = narinfo(
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-x",
+        "1abc.nar.xz",
+        "sha256:deadbeef",
+        4096,
+    );
+    let upstream = FakeUpstream::new(Behavior::Body(body));
+    {
+        let cache = NarinfoDiskCache::with_max_entries(
+            dir.path(),
+            upstream.clone(),
+            Arc::new(clock.clone()),
+            NonZeroUsize::new(6).unwrap(),
+        )
+        .unwrap();
+        for i in 0..6 {
+            clock.advance(10);
+            let _ = cache.fetch(&StoreHash::new(hash_n(i))).await.unwrap();
+        }
+        assert_eq!(count_nic(&dir), 6);
+    }
+
+    // Restart with cap=2: the oldest 4 (i=0..4) must be trimmed on load.
+    let dead = FakeUpstream::new(Behavior::Missing);
+    let _cache = NarinfoDiskCache::with_max_entries(
+        dir.path(),
+        dead.clone(),
+        Arc::new(clock.clone()),
+        NonZeroUsize::new(2).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        count_nic(&dir),
+        2,
+        "lowered cap trimmed the persisted set on load"
+    );
+    for i in 0..4 {
+        assert!(!entry_file(&dir, &hash_n(i)).exists(), "oldest {i} trimmed");
+    }
+    for i in 4..6 {
+        assert!(entry_file(&dir, &hash_n(i)).exists(), "newest {i} kept");
+    }
 }

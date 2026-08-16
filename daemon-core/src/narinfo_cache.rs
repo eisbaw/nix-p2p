@@ -51,21 +51,55 @@
 //! detection from signature presence - so unsigned upstreams cache too - is a
 //! filed wave-2 follow-up, not an accident.
 //!
-//! Bounds (honest limit, filed follow-up; task-25 covers the NAR-side abort, the
-//! narinfo-cache eviction is its own task): the on-disk cache is UNBOUNDED in
-//! wave 1 (one small entry per distinct narinfo seen), exactly as the in-memory
-//! catalog was. A large cache also makes each restart an O(entries) synchronous
-//! `rebuild_index` scan before serving. Eviction/bounding is deferred, not
-//! silently shipped - see the task-8 note.
+//! Bounds + eviction (TASK-27). The on-disk cache is BOUNDED by an integer
+//! `max_entries` COUNT (a constructor parameter; [`NarinfoDiskCache::new`] applies
+//! [`DEFAULT_MAX_ENTRIES`], [`NarinfoDiskCache::with_max_entries`] takes an
+//! explicit cap). Count (not bytes) because each entry is already per-entry
+//! byte-capped at [`crate::source::MAX_NARINFO_BYTES`], so a count cap bounds disk
+//! within a known factor while keeping the eviction ordering key an integer.
+//! When an install pushes the live-entry count over the cap, the OLDEST entries
+//! by `fetched_at` (an integer Unix-seconds stamp; ties broken by store-hash for
+//! determinism) are evicted - an LRU-by-fetch-time policy. Eviction NEVER causes
+//! a wrong serve: an evicted entry is simply a cache MISS that re-fetches upstream
+//! (which Nix re-verifies sig+NarHash regardless), never a stale/wrong narinfo.
+//!
+//! Restart warm-up (TASK-27 AC#2). Steady-state startup reads a single compact
+//! sidecar index file (`<root>/index`), one line per live entry
+//! (`store_hash \t fetched_at \t token`), and populates the in-memory bookkeeping
+//! from that ONE file read - it does NOT open, frame-decode and re-validate every
+//! `.nic` as the old `rebuild_index` did. The sidecar is rewritten atomically on
+//! every mutation. It is a DERIVED CACHE, never authoritative: serving reads
+//! `<hash>.nic` directly by hash (never via the index) and re-validates, and
+//! correlation re-parses the actual `.nic`, so a stale/absent/corrupt sidecar can
+//! never produce a wrong serve - at worst it costs an extra refetch. A cache dir
+//! with entries but no sidecar (a legacy dir, or a torn write) is bootstrapped
+//! ONCE by a full scan and then persisted, so the next restart is cheap again.
+//!
+//! Cap honesty (be explicit): the count cap holds exactly in steady state, but it
+//! is reconciled against the actual `.nic` files ONLY when the sidecar is absent or
+//! corrupt (the rescan path). A crash between the `.nic` rename and the sidecar
+//! rewrite - or a sidecar-write failure - can leave orphan `.nic` files that
+//! `book` never counts and eviction never reaps, so across repeated crashes the
+//! on-disk count can drift ABOVE `max_entries`. This never causes a wrong serve
+//! (an orphan is a valid entry; a phantom is a miss); it only weakens the bound
+//! until the next absent/corrupt-sidecar rescan. Tightening this would need a
+//! periodic reconciliation (e.g. rescan when a cheap dir-entry count disagrees
+//! with `book`), deliberately not added here.
 //!
 //! I/O note (filed follow-up): reads/writes use blocking `std::fs` on the async
 //! fetch path. The reads and small writes are cheap; the sharp edge is the
 //! `sync_all()` fsync in [`write_durably`], which can stall a Tokio worker for
 //! milliseconds under load - so the `spawn_blocking`/`tokio::fs` move should land
-//! before the cache is enabled by default, not after.
+//! before the cache is enabled by default, not after. Sharper still: the MISS-path
+//! sidecar rewrite (one bounded atomic write + fsync + a dir fsync) runs while
+//! holding the EXCLUSIVE bookkeeping lock, so it serialises other installs and
+//! blocks `meta_for_token` correlation readers for that fsync. Serving HITs are
+//! lock-free and unaffected; still, this is the first thing to move off-worker
+//! before the cache is enabled by default.
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::io::Write;
+use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
 use std::sync::RwLock;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -89,6 +123,23 @@ const STORE_HASH_LEN: usize = 32;
 pub const POSITIVE_TTL: Duration = Duration::from_secs(30 * 24 * 3600);
 /// Negative narinfo TTL: 3600 s, matching Nix's default `narinfo-cache-negative-ttl`.
 pub const NEGATIVE_TTL: Duration = Duration::from_secs(3600);
+
+/// Default on-disk entry cap when the caller does not pass one to
+/// [`NarinfoDiskCache::new`]. Chosen so the cache is bounded by default (never
+/// unbounded on disk) while being ample for a workstation substituter: at the
+/// per-entry [`crate::source::MAX_NARINFO_BYTES`] ceiling this is a loose upper
+/// bound, and real narinfos are ~1 KiB, so the steady-state footprint is far
+/// smaller. An operator who wants a different cap uses
+/// [`NarinfoDiskCache::with_max_entries`].
+pub const DEFAULT_MAX_ENTRIES: usize = 100_000;
+
+/// Filename of the compact sidecar index under `<root>`. Not a `.nic` file, so the
+/// entry scan skips it and [`safe_key`] would reject it as a store hash anyway.
+const INDEX_FILE: &str = "index";
+
+/// Magic first line of the sidecar index; a version bump invalidates an old
+/// sidecar (it fails to parse -> a one-time full rescan rebuilds and rewrites it).
+const INDEX_MAGIC: &str = "NIXP2P-NARINFO-INDEX\t1";
 
 /// Injected time source, so TTL expiry is deterministic under test.
 ///
@@ -204,6 +255,63 @@ impl Entry {
     }
 }
 
+/// One tracked entry's eviction/correlation metadata. The bytes live in the
+/// `.nic` file; this is only what eviction and correlation need in memory.
+struct Record {
+    /// Integer Unix-seconds stamp the entry was fetched at - the LRU key.
+    fetched_at: u64,
+    /// The narinfo's NAR token, for positive entries whose body parsed a
+    /// correlation; `None` for negatives and un-parseable positives.
+    token: Option<String>,
+}
+
+/// In-memory bookkeeping for the on-disk cache: the single source of truth for
+/// what is live, the LRU order, and the `token -> store_hash` correlation. All
+/// three move together under one lock so they cannot race apart. Every field is a
+/// DERIVED VIEW of the `.nic` files on disk (re-derivable by a full scan); it is
+/// held in memory, and mirrored to the sidecar index, purely to make restart and
+/// eviction cheap.
+#[derive(Default)]
+struct Bookkeeping {
+    /// `store_hash -> Record` for every live entry.
+    records: HashMap<String, Record>,
+    /// `(fetched_at, store_hash)` ordered for O(log n) oldest-first eviction.
+    lru: BTreeSet<(u64, String)>,
+    /// `token -> store_hash` correlation (positive entries only).
+    token_index: HashMap<String, String>,
+}
+
+impl Bookkeeping {
+    /// Drop `store_hash` from all three views. A no-op if absent. The token map is
+    /// only cleared when it still points at THIS hash, so replacing an entry never
+    /// unlinks a token that a newer entry has taken over.
+    fn remove(&mut self, store_hash: &str) {
+        if let Some(rec) = self.records.remove(store_hash) {
+            self.lru.remove(&(rec.fetched_at, store_hash.to_string()));
+            if let Some(token) = rec.token
+                && self
+                    .token_index
+                    .get(&token)
+                    .is_some_and(|h| h == store_hash)
+            {
+                self.token_index.remove(&token);
+            }
+        }
+    }
+
+    /// Insert (or replace) `store_hash`'s record across all three views. Callers
+    /// [`Bookkeeping::remove`] first when replacing so no stale LRU/token lingers.
+    fn insert(&mut self, store_hash: &str, fetched_at: u64, token: Option<String>) {
+        self.lru.insert((fetched_at, store_hash.to_string()));
+        if let Some(token) = &token {
+            self.token_index
+                .insert(token.clone(), store_hash.to_string());
+        }
+        self.records
+            .insert(store_hash.to_string(), Record { fetched_at, token });
+    }
+}
+
 /// Persistent narinfo cache over an inner source.
 pub struct NarinfoDiskCache {
     root: PathBuf,
@@ -211,23 +319,41 @@ pub struct NarinfoDiskCache {
     clock: std::sync::Arc<dyn Clock>,
     positive_ttl: Duration,
     negative_ttl: Duration,
+    /// Integer COUNT cap on live on-disk entries (AC#1). A constructor parameter,
+    /// never a float; eviction keeps the live count at or below this.
+    max_entries: NonZeroUsize,
     /// Monotonic counter for unique tmp names (a request never collides with a
     /// concurrent one mid-write).
     tmp_seq: AtomicU64,
-    /// Derived `token -> store_hash` index accelerating correlation lookups. A
-    /// pure cache of what a full directory scan would find; the authoritative
-    /// meta is always re-read from the entry file, so this cannot drift.
-    token_index: RwLock<HashMap<String, String>>,
+    /// The single in-memory source of truth for liveness, LRU order and
+    /// correlation. A derived view of the `.nic` files, mirrored to the sidecar.
+    book: RwLock<Bookkeeping>,
 }
 
 impl NarinfoDiskCache {
-    /// Build a cache rooted at `root`, fronting `inner`, timed by `clock`. Scans
-    /// `root` once to warm the correlation index from any entries a previous
-    /// process left (the restart path). Fails fast if `root` cannot be created.
+    /// Build a cache rooted at `root`, fronting `inner`, timed by `clock`, bounded
+    /// by [`DEFAULT_MAX_ENTRIES`]. See [`NarinfoDiskCache::with_max_entries`] to
+    /// choose the cap.
     pub fn new(
         root: impl Into<PathBuf>,
         inner: std::sync::Arc<dyn NarinfoSource>,
         clock: std::sync::Arc<dyn Clock>,
+    ) -> std::io::Result<Self> {
+        let max_entries =
+            NonZeroUsize::new(DEFAULT_MAX_ENTRIES).expect("DEFAULT_MAX_ENTRIES is nonzero");
+        Self::with_max_entries(root, inner, clock, max_entries)
+    }
+
+    /// Build a cache with an explicit integer entry cap (AC#1). Loads the compact
+    /// sidecar index once to warm bookkeeping from a previous process (the cheap
+    /// restart path); if the sidecar is absent or unreadable it falls back to a
+    /// one-time full scan and then writes the sidecar. Fails fast if `root` cannot
+    /// be created.
+    pub fn with_max_entries(
+        root: impl Into<PathBuf>,
+        inner: std::sync::Arc<dyn NarinfoSource>,
+        clock: std::sync::Arc<dyn Clock>,
+        max_entries: NonZeroUsize,
     ) -> std::io::Result<Self> {
         let root = root.into();
         std::fs::create_dir_all(&root)?;
@@ -248,11 +374,139 @@ impl NarinfoDiskCache {
             clock,
             positive_ttl: POSITIVE_TTL,
             negative_ttl: NEGATIVE_TTL,
+            max_entries,
             tmp_seq: AtomicU64::new(0),
-            token_index: RwLock::new(HashMap::new()),
+            book: RwLock::new(Bookkeeping::default()),
         };
-        cache.rebuild_index();
+        cache.load_index();
         Ok(cache)
+    }
+
+    /// Path of the sidecar index file.
+    fn index_path(&self) -> PathBuf {
+        self.root.join(INDEX_FILE)
+    }
+
+    /// Warm bookkeeping at startup. Prefer the compact sidecar (ONE file read +
+    /// line-parse, no per-entry `.nic` decode); if it is missing or corrupt,
+    /// rebuild from a full scan and persist a fresh sidecar so the NEXT restart is
+    /// cheap. This is the AC#2 restart path.
+    fn load_index(&self) {
+        let rescanned = match self.read_sidecar() {
+            Some(records) => {
+                let mut book = self.book.write().expect("book poisoned");
+                for (store_hash, fetched_at, token) in records {
+                    book.insert(&store_hash, fetched_at, token);
+                }
+                false
+            }
+            None => {
+                self.rebuild_from_scan();
+                true
+            }
+        };
+        // Honour the current cap even if a previous run used a larger one or a
+        // legacy dir was over-cap; (re)write the sidecar only when the loaded state
+        // actually changed, so a normal in-cap restart stays write-free.
+        let trimmed = self.trim_to_cap();
+        if rescanned || trimmed {
+            self.persist_sidecar();
+        }
+    }
+
+    /// Read + parse the sidecar index. Returns `None` (fall back to a full scan)
+    /// for ANY problem: absent file, bad magic, or a malformed line. A `None` here
+    /// is never a wrong serve - it only forces the one-time rescan path.
+    fn read_sidecar(&self) -> Option<Vec<(String, u64, Option<String>)>> {
+        let raw = std::fs::read(self.index_path()).ok()?;
+        let text = std::str::from_utf8(&raw).ok()?;
+        let mut lines = text.lines();
+        if lines.next()? != INDEX_MAGIC {
+            return None;
+        }
+        let mut out = Vec::new();
+        let mut seen = std::collections::HashSet::new();
+        for line in lines {
+            if line.is_empty() {
+                continue;
+            }
+            // `store_hash \t fetched_at \t token` (token may be empty).
+            let mut cols = line.split('\t');
+            let store_hash = cols.next()?;
+            let fetched_at = cols.next()?.parse::<u64>().ok()?;
+            let token = cols.next()?;
+            // A store hash that is not a safe key is corruption - reject the whole
+            // sidecar rather than trust a partially-valid one.
+            safe_key(store_hash)?;
+            // A duplicate hash would desync `lru` from `records` on load (a dangling
+            // BTreeSet tuple), so reject the whole sidecar - same stance as a bad key.
+            if !seen.insert(store_hash.to_string()) {
+                return None;
+            }
+            let token = if token.is_empty() {
+                None
+            } else {
+                Some(token.to_string())
+            };
+            out.push((store_hash.to_string(), fetched_at, token));
+        }
+        Some(out)
+    }
+
+    /// Serialise the current bookkeeping to sidecar bytes, oldest-first (the LRU
+    /// order), so the file is deterministic and greppable.
+    fn serialize_sidecar(book: &Bookkeeping) -> Vec<u8> {
+        let mut out = String::from(INDEX_MAGIC);
+        out.push('\n');
+        for (fetched_at, store_hash) in &book.lru {
+            let token = book
+                .records
+                .get(store_hash)
+                .and_then(|r| r.token.as_deref())
+                .unwrap_or("");
+            out.push_str(store_hash);
+            out.push('\t');
+            out.push_str(&fetched_at.to_string());
+            out.push('\t');
+            out.push_str(token);
+            out.push('\n');
+        }
+        out.into_bytes()
+    }
+
+    /// Atomically write the sidecar from the current bookkeeping. Best-effort: a
+    /// failure is logged, not fatal - the sidecar is only an accelerator and a
+    /// missing one is recovered by the next-restart rescan.
+    fn persist_sidecar(&self) {
+        let bytes = {
+            let book = self.book.read().expect("book poisoned");
+            Self::serialize_sidecar(&book)
+        };
+        self.write_sidecar_bytes(&bytes);
+    }
+
+    /// Atomically install sidecar `bytes` via tmp + fsync + rename.
+    fn write_sidecar_bytes(&self, bytes: &[u8]) {
+        let seq = self.tmp_seq.fetch_add(1, Ordering::Relaxed);
+        let tmp = self
+            .root
+            .join(".tmp")
+            .join(format!("index.{}.{}.tmp", std::process::id(), seq));
+        if let Err(err) = write_durably(&tmp, bytes) {
+            eprintln!("narinfo-cache: write sidecar tmp {tmp:?}: {err}");
+            let _ = std::fs::remove_file(&tmp);
+            return;
+        }
+        if let Err(err) = std::fs::rename(&tmp, self.index_path()) {
+            eprintln!(
+                "narinfo-cache: rename sidecar into {:?}: {err}",
+                self.index_path()
+            );
+            let _ = std::fs::remove_file(&tmp);
+            return;
+        }
+        // Make the sidecar rename durable across a crash (task-7).
+        fsync_dir(&self.root);
     }
 
     /// Path of the entry file for a store hash, or `None` if the hash is not a
@@ -336,28 +590,82 @@ impl NarinfoDiskCache {
             let _ = std::fs::remove_file(&tmp);
             return;
         }
-        // Keep the derived index consistent with the bytes just installed.
-        if entry.kind == EntryKind::Positive {
-            self.index_positive(store_hash, &entry.body);
+        // Make the rename itself durable (task-7): fsync the directory it landed in.
+        fsync_dir(&self.root);
+        // Record the freshly-installed entry, evict the oldest over-cap entries,
+        // and mirror the result to the sidecar. Serving never consults this
+        // bookkeeping, so an eviction can only turn a later request into a MISS
+        // (refetch), never a wrong serve.
+        let token = if entry.kind == EntryKind::Positive {
+            crate::catalog::parse_correlation(&entry.body).map(|c| c.token.as_str().to_string())
+        } else {
+            None
+        };
+        self.record_and_evict(store_hash, entry.fetched_at, token);
+    }
+
+    /// Insert `store_hash` into bookkeeping, evict the oldest (coldest by
+    /// `fetched_at`) entries while the live count exceeds `max_entries`, rewrite
+    /// the sidecar, then delete the evicted `.nic` files. The just-installed hash
+    /// is never itself an eviction victim, so the cap is enforced by dropping COLD
+    /// entries (AC#3). An evicted entry becomes a plain cache MISS on its next
+    /// request and is re-fetched (never served stale).
+    fn record_and_evict(&self, store_hash: &str, fetched_at: u64, token: Option<String>) {
+        let victims = {
+            let mut book = self.book.write().expect("book poisoned");
+            book.remove(store_hash);
+            book.insert(store_hash, fetched_at, token);
+            // Spare the just-installed hash so the cap is met by dropping COLD
+            // entries (AC#3) - the newest always survives.
+            let victims = evict_over_cap(&mut book, self.max_entries.get(), Some(store_hash));
+            // Mirror the post-eviction state while still holding the lock, so the
+            // sidecar matches memory exactly at steady state.
+            let bytes = Self::serialize_sidecar(&book);
+            self.write_sidecar_bytes(&bytes);
+            victims
+        };
+        self.delete_entry_files(victims);
+    }
+
+    /// Evict the oldest entries until the live count is at or below `max_entries`,
+    /// deleting their `.nic` files. Used at startup to honour a lowered cap or trim
+    /// a legacy over-cap dir. Returns whether anything was evicted (so the caller
+    /// can decide to rewrite the sidecar). Unlike [`record_and_evict`] there is no
+    /// just-installed entry to spare - it trims the plain oldest.
+    fn trim_to_cap(&self) -> bool {
+        let victims = {
+            let mut book = self.book.write().expect("book poisoned");
+            evict_over_cap(&mut book, self.max_entries.get(), None)
+        };
+        let evicted = !victims.is_empty();
+        self.delete_entry_files(victims);
+        evicted
+    }
+
+    /// Delete the `.nic` files for a set of evicted store hashes. Called after the
+    /// hashes are already gone from bookkeeping, so it cannot double-evict; a
+    /// missing file (a crash window) is fine.
+    fn delete_entry_files(&self, victims: Vec<String>) {
+        for victim in victims {
+            if let Some(path) = self.entry_path(&victim) {
+                match std::fs::remove_file(&path) {
+                    Ok(()) => {}
+                    Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(err) => eprintln!("narinfo-cache: evict {path:?}: {err}"),
+                }
+            }
         }
     }
 
-    /// Add a positive entry's `token -> store_hash` correlation to the index.
-    fn index_positive(&self, store_hash: &str, body: &[u8]) {
-        if let Some(c) = crate::catalog::parse_correlation(body) {
-            self.token_index
-                .write()
-                .expect("token index poisoned")
-                .insert(c.token.as_str().to_string(), store_hash.to_string());
-        }
-    }
-
-    /// Warm the correlation index from every valid positive entry on disk (the
-    /// restart path). O(entries) at startup only.
-    fn rebuild_index(&self) {
+    /// Rebuild bookkeeping from a full scan of every `.nic` (the cold/legacy path,
+    /// used ONLY when the sidecar is absent or corrupt). O(entries) - the very cost
+    /// the sidecar exists to spare a normal restart. Records positive AND negative
+    /// entries so both count toward the cap.
+    fn rebuild_from_scan(&self) {
         let Ok(dir) = std::fs::read_dir(&self.root) else {
             return;
         };
+        let mut book = self.book.write().expect("book poisoned");
         for entry in dir.flatten() {
             let path = entry.path();
             if path.extension().is_none_or(|e| e != "nic") {
@@ -366,14 +674,23 @@ impl NarinfoDiskCache {
             let Some(store_hash) = path.file_stem().and_then(|s| s.to_str()) else {
                 continue;
             };
+            if safe_key(store_hash).is_none() {
+                continue;
+            }
             let Ok(raw) = std::fs::read(&path) else {
                 continue;
             };
-            if let Some(decoded) = Entry::decode(&raw)
-                && decoded.kind == EntryKind::Positive
-            {
-                self.index_positive(store_hash, &decoded.body);
-            }
+            let Some(decoded) = Entry::decode(&raw) else {
+                continue;
+            };
+            let token = if decoded.kind == EntryKind::Positive {
+                crate::catalog::parse_correlation(&decoded.body)
+                    .map(|c| c.token.as_str().to_string())
+            } else {
+                None
+            };
+            book.remove(store_hash);
+            book.insert(store_hash, decoded.fetched_at, token);
         }
     }
 }
@@ -497,9 +814,10 @@ impl CorrelationStore for NarinfoDiskCache {
         // The index gives us a candidate store_hash; the authoritative answer is
         // re-parsed from the actual entry file so it cannot drift from the bytes.
         let store_hash = self
-            .token_index
+            .book
             .read()
-            .expect("token index poisoned")
+            .expect("book poisoned")
+            .token_index
             .get(token)
             .cloned()?;
         let path = self.entry_path(&store_hash)?;
@@ -580,13 +898,55 @@ fn safe_key(store_hash: &str) -> Option<String> {
     }
 }
 
-/// Write `bytes` to `path` and fsync both the file and its directory, so an
-/// atomic rename that follows is durable across a crash (task-7).
+/// Write `bytes` to `path` and fsync the FILE's contents, so a rename that
+/// follows can never publish a name pointing at unflushed (zero/garbage) bytes.
+/// The caller must [`fsync_dir`] the parent directory AFTER the rename to make the
+/// rename itself durable across a crash - this is the same task-7 recipe the rest
+/// of the crate uses (see `availability.rs`/`public_allowlist.rs`).
 fn write_durably(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     let mut file = std::fs::File::create(path)?;
     file.write_all(bytes)?;
     file.sync_all()?;
     Ok(())
+}
+
+/// fsync a directory so a rename INTO it survives a crash: opening the dir
+/// read-only and `sync_all`ing it is the portable way to fsync a directory. This
+/// completes the durable-rename recipe [`write_durably`] starts. Best-effort - a
+/// failure is logged, never fatal, since the cache is an optimisation and a lost
+/// entry after a crash is a miss (refetch), never a wrong serve.
+fn fsync_dir(dir: &Path) {
+    match std::fs::File::open(dir) {
+        Ok(handle) => {
+            if let Err(err) = handle.sync_all() {
+                eprintln!("narinfo-cache: fsync dir {dir:?}: {err}");
+            }
+        }
+        Err(err) => eprintln!("narinfo-cache: open dir {dir:?} to fsync: {err}"),
+    }
+}
+
+/// Evict the oldest entries (smallest `(fetched_at, store_hash)`) from `book`
+/// until its live count is at or below `cap`, returning the evicted store hashes
+/// so the caller can delete their `.nic` files. `spare` (the just-installed hash,
+/// or `None` at startup trim) is never chosen as a victim, so an install's own new
+/// entry always survives its own eviction pass. The `.nic` deletion is the
+/// caller's job (done outside the lock); this only mutates `book`.
+fn evict_over_cap(book: &mut Bookkeeping, cap: usize, spare: Option<&str>) -> Vec<String> {
+    let mut victims = Vec::new();
+    while book.records.len() > cap {
+        let Some(victim) = book
+            .lru
+            .iter()
+            .find(|(_, h)| spare != Some(h.as_str()))
+            .cloned()
+        else {
+            break; // only the spared entry remains
+        };
+        book.remove(&victim.1);
+        victims.push(victim.1);
+    }
+    victims
 }
 
 /// First index of `needle` in `haystack`, or `None`.
@@ -800,8 +1160,9 @@ NarSize: 40";
             clock: std::sync::Arc::new(SystemClock),
             positive_ttl: POSITIVE_TTL,
             negative_ttl: NEGATIVE_TTL,
+            max_entries: NonZeroUsize::new(DEFAULT_MAX_ENTRIES).unwrap(),
             tmp_seq: AtomicU64::new(0),
-            token_index: RwLock::new(HashMap::new()),
+            book: RwLock::new(Bookkeeping::default()),
         };
         let mut rng = Rng(0x1234_5678_9abc_def0);
         let mut accepted = 0usize;
@@ -943,5 +1304,92 @@ NarSize: 40";
         async fn fetch(&self, _hash: &StoreHash) -> Result<UpstreamResponse, SourceError> {
             Err(SourceError::Upstream("noop".into()))
         }
+    }
+
+    // ---- AC#2 bite: restart warms bookkeeping from the SIDECAR, not a .nic scan -
+
+    /// The load path must warm `book` from the compact sidecar ALONE. Seed a fresh
+    /// root with ONLY a sidecar (zero `.nic` bodies) and construct the cache: the
+    /// two entries must appear in `book` even though there is nothing to scan. This
+    /// is the biting oracle for AC#2 - a mutation that ignores the sidecar and
+    /// always calls `rebuild_from_scan` would find ZERO `.nic` files, leave `book`
+    /// empty, and redden every assertion below. (An integration test that keeps the
+    /// `.nic` files cannot distinguish the two paths; this one can.)
+    #[test]
+    fn load_index_warms_book_from_sidecar_without_any_nic_file() {
+        static SEQ: AtomicU64 = AtomicU64::new(0);
+        let root = std::env::temp_dir().join(format!(
+            "nixp2p-nic-sidecar-{}-{}",
+            std::process::id(),
+            SEQ.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+
+        // A positive entry (with a token) and a negative entry (empty token), and
+        // NO `.nic` files at all.
+        let key_a = VALID_KEY;
+        let key_b = "1a0lslqb6gbqnj6xqjlaljjqg6kgb3wz"; // distinct, still valid base32
+        let sidecar = format!("{INDEX_MAGIC}\n{key_a}\t100\ttok-a.nar.xz\n{key_b}\t200\t\n");
+        std::fs::write(root.join(INDEX_FILE), sidecar).unwrap();
+
+        let cache = NarinfoDiskCache::with_max_entries(
+            &root,
+            std::sync::Arc::new(NoopSource),
+            std::sync::Arc::new(SystemClock),
+            NonZeroUsize::new(10).unwrap(),
+        )
+        .unwrap();
+
+        {
+            let book = cache.book.read().unwrap();
+            assert_eq!(
+                book.records.len(),
+                2,
+                "both entries warmed from the sidecar with NO .nic present"
+            );
+            assert_eq!(book.lru.len(), 2, "lru mirrors records exactly");
+            assert_eq!(
+                book.token_index.get("tok-a.nar.xz").map(String::as_str),
+                Some(key_a),
+                "the positive entry's token->hash correlation was loaded from the sidecar"
+            );
+            assert!(
+                !book.token_index.contains_key(""),
+                "the negative entry's empty token is not indexed"
+            );
+        }
+
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// The sidecar-reject stance: a duplicate `store_hash` line is corruption and
+    /// rejects the WHOLE sidecar (forcing the safe rescan), rather than desyncing
+    /// `lru` from `records`. RED if `read_sidecar` accepts duplicates.
+    #[test]
+    fn read_sidecar_rejects_a_duplicate_hash_line() {
+        static SEQ: AtomicU64 = AtomicU64::new(0);
+        let root = std::env::temp_dir().join(format!(
+            "nixp2p-nic-dup-{}-{}",
+            std::process::id(),
+            SEQ.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        // Construct over an EMPTY dir first (construction would otherwise normalise
+        // a corrupt sidecar by rescanning + rewriting it), then plant the duplicate
+        // and read it directly.
+        let cache = NarinfoDiskCache::with_max_entries(
+            &root,
+            std::sync::Arc::new(NoopSource),
+            std::sync::Arc::new(SystemClock),
+            NonZeroUsize::new(10).unwrap(),
+        )
+        .unwrap();
+        let dup = format!("{INDEX_MAGIC}\n{VALID_KEY}\t100\t\n{VALID_KEY}\t200\t\n");
+        std::fs::write(root.join(INDEX_FILE), dup).unwrap();
+        assert!(
+            cache.read_sidecar().is_none(),
+            "a duplicate-hash sidecar must be rejected wholesale"
+        );
+        std::fs::remove_dir_all(&root).unwrap();
     }
 }
