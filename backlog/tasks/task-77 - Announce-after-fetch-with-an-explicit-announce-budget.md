@@ -1,11 +1,11 @@
 ---
 id: TASK-77
 title: Announce-after-fetch with an explicit announce budget
-status: In Progress
+status: Done
 assignee:
   - '@claude'
 created_date: '2026-08-09 21:01'
-updated_date: '2026-08-16 21:16'
+updated_date: '2026-08-16 21:56'
 labels:
   - wave-2b
 dependencies:
@@ -25,10 +25,10 @@ Interacts with TASK-72 (a node must not announce what it cannot serve) and TASK-
 
 ## Acceptance Criteria
 <!-- AC:BEGIN -->
-- [ ] #1 After a successful peer or upstream fetch, the node becomes a discoverable holder for that content, and a second node can fetch it FROM the first - shown end to end
-- [ ] #2 The announce budget is explicit, configurable and ENFORCED: past the budget, announcing stops rather than degrading. Bite by mutation - remove the budget and the count grows unbounded
-- [ ] #3 A node never announces content it cannot serve (consistency with TASK-72's index-coverage == provider-coverage requirement)
-- [ ] #4 The privacy cost is stated: announcing reveals what you fetched. Interacts with the leech-mode flag (TASK-78)
+- [x] #1 After a successful peer or upstream fetch, the node becomes a discoverable holder for that content, and a second node can fetch it FROM the first - shown end to end
+- [x] #2 The announce budget is explicit, configurable and ENFORCED: past the budget, announcing stops rather than degrading. Bite by mutation - remove the budget and the count grows unbounded
+- [x] #3 A node never announces content it cannot serve (consistency with TASK-72's index-coverage == provider-coverage requirement)
+- [x] #4 The privacy cost is stated: announcing reveals what you fetched. Interacts with the leech-mode flag (TASK-78)
 <!-- AC:END -->
 
 ## Implementation Notes
@@ -80,4 +80,6 @@ CODEX DEEP GATE NO-GO on 1367cf8. AC#1/#3-eligibility/#5 PASS (231 hole NOT reop
 CODEX RE-GATE NO-GO(2) on ab3137f. AC#2 budget NOW FIXED; AC#1/eligibility/#5 PASS. AC#3 FAIL: real defects — (1) GC reconcile bite not production-wired (mutant removing dispatch->reconcile left tests green); (2) failed withdrawals forgotten (unconditional delete even on withdraw failure, no retry); (3) StorePath still accepts non-/nix/store (shape-only); (4) ambiguous-announce refund+forget leaves an untracked possibly-published record. TCB arbitration (orchestrator): eventually-consistent reconcile is acceptable per the project guarantee (a stale record -> Declined -> retry, within the TCB) IF the real defects are fixed + residual documented; strict GC-pin/periodic-sweep is a deferrable follow-up, not a blocker. Fix cycle dispatched.
 
 CODEX RE-GATE(3) NO-GO - 3 of 4 fixes PASS (production-wired GC bite, failed-withdraw retry, real store_dir parent; eligibility+golden PASS). Only FIX D fails, narrowly: all announce_provisions Errs treated as ambiguous, but AnnounceError::Persist is pre-start_providing (guaranteed unpublished) = a CLEAN failure that must REFUND not spend/track; bite lacks discrimination (Err=>None mutant stayed green). Plus a never-keeps-advertising doc overclaim. Round-4 fix: classify announce errors pre/post-side-effect (Persist->clean->refund) + discriminating bite + doc correction. Converging (round findings 3->4->1).
+
+CODEX RE-GATE(4): GO (commits 1367cf8+ab3137f+5977d94+da24c0c). Four-round cross-model cycle complete. FIX D exhaustive + mutation-proven (AnnounceError classified by where raised: Persist/Rejected/Ineligible clean-refund, Unreachable/DeadlineExceeded ambiguous-spend+track). The announce_one direct-path refactor retains EVERY fail-closed eligibility gate (eligible_provisions allowlist + sealed announcer eligibility.admit; codex confirmed no bypass - AdmitAll witness on a public fabric emits nothing). AC#1 swarm-growth (s9-libp2p-grow 14/14), AC#2 budget (production-load-bearing bite + reserve-with-refund + clean/ambiguous discrimination), AC#3 (eligibility-gated announce + never-announce-what-you-cant-serve at announce time, eventually-consistent afterward via reconcile-on-dispatch + TTL, documented residual), AC#4 privacy + consume-only default. golden byte-identical, 8/8 announce-after-fetch bites, e2e 7/7. AC#3 strict always-coverage (GC-root pin/periodic sweep) deferred as TASK-239.
 <!-- SECTION:NOTES:END -->
