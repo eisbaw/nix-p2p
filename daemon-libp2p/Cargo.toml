@@ -28,6 +28,10 @@ peer-fabric = { path = "../peer-fabric" }
 ed25519-dalek = "3"
 # The runtime + the serve loop; `signal` so the bin shuts down on SIGINT/SIGTERM.
 tokio = { version = "1", features = ["rt-multi-thread", "net", "macros", "time", "signal"] }
+# async-trait (TASK-77): the announce-after-fetch GC-reconcile `Withdrawer` seam has an async
+# method (it drives the async `announcer.withdraw`), decoupled so the GC-withdraw bite needs no
+# live swarm. Not iroh - inside the no-iroh closure.
+async-trait = "0.1"
 # Fail-verbose diagnostics (TASK-207): fabric-libp2p emits its NAT-traversal state (autonat
 # reachability, relay reservation, dcutr hole-punch outcome) via `tracing`, which the binary
 # previously SWALLOWED (no subscriber). Install a stderr subscriber gated on RUST_LOG so a
