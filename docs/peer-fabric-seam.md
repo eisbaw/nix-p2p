@@ -293,6 +293,53 @@ Downstream code takes `&dyn PeerFabric` (or the concrete `Fabric`); `App` is a
 plain type, no `where F: PeerFabric + …` spread. A `FakeFabric` (per-axis fakes)
 exercises the whole daemon substrate-free.
 
+## Leech / consume-only, at the seam (TASK-78)
+
+A **leech** fetches from the swarm but gives nothing back: it does not SERVE and
+does not ANNOUNCE. Because participation is expressed as `Some`/`None` on the
+umbrella, the leech is a **transport/discovery-agnostic decorator** —
+`peer_fabric::LeechFabric` — that wraps ANY `Arc<dyn PeerFabric>` and forces the
+two GIVE axes to `None` while passing every CONSUME axis (directory, locator,
+transfer, hold-query, local-peers) and the exposure ledger through unchanged:
+
+```rust
+fn announcer(&self) -> Option<&Arc<dyn AvailabilityAnnouncer>> { None } // GIVE — masked
+fn server(&self)    -> Option<&Arc<dyn NarServer>>            { None } // GIVE — masked
+// every other accessor delegates to the inner fabric
+```
+
+This is the AC#4 realisation: **any backend inherits the same
+remote-observation contract with no per-backend code**, because the mask sits on
+the seam, not inside a stack. Two properties make it airtight rather than
+cosmetic:
+
+- **Fail-closed at the seam, not scattered `if leech` checks.** With `server()`
+  masked to `None`, no composition root / `run()` / future caller can reach the
+  inner server to *start* the serve lifecycle. On the libp2p backend serving is
+  a lifecycle armed only by `NarServer::serve()` (which installs the inbound
+  gate); a fabric on which it was never called answers every inbound request
+  `NotHeld` (`nar.rs`: `None => NarResponse::NotHeld`). So a leech is built as a
+  **pure consumer** (no supplier ⇒ no gate ever installed) and then wrapped — the
+  mask is the seam formalisation and the belt-and-suspenders; "no gate was ever
+  installed" is the load-bearing enforcement the *peer* observes. Proven from the
+  peer side by `fabric-libp2p`'s `a_leech_serves_nothing_to_a_reachable_peer` (a
+  directly-dialled leech ⇒ `NotHeld`) and end-to-end by the `libp2p-leech` e2e
+  scenario (a second consumer that would discover a serving node gets nothing
+  from a leech and falls back to upstream; the mutation flips the node to serving
+  and the peer obtains the content).
+
+- **HONEST LIMIT — a leech still SENDS its lookups (AC#5).** Consume-only is NOT
+  private lookup. The CONSUME axes stay present and are exactly what a leech uses:
+  `provider_directory` sends `get_record` queries and `node_locator` sends
+  peer-routing queries, both disclosing this node's interest to the DHT nodes
+  they touch — and those disclosures still land in the **same** exposure ledger
+  (passed through unchanged), so status/preflight read them identically to a
+  non-leech consumer. A leech hides what it SERVES and ANNOUNCES; it does **not**
+  hide what it LOOKS UP. The shipped `daemon-libp2p --libp2p-leech` prints this
+  distinction verbatim at startup (`LIBP2P-LEECH consume-only …`) and refuses,
+  fail-fast, to be combined with any give-side flag (`--libp2p-provider`,
+  `--libp2p-announce-after-fetch`, seed/store supply, the public-allowlist door).
+
 ## How both stacks map onto it
 
 | Intention | Trait | iroh backend | libp2p backend |

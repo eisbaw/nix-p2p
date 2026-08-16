@@ -43,6 +43,7 @@ mod content;
 mod eligibility;
 mod exposure;
 mod fabric;
+mod fabric_leech;
 mod fake;
 mod hexfmt;
 mod ids;
@@ -73,6 +74,7 @@ pub use eligibility::{
 };
 pub use exposure::{Disclosed, Exposure, ExposureLedger, ExposureSurface, Recipient};
 pub use fabric::{PeerFabric, TransferRegistry};
+pub use fabric_leech::LeechFabric;
 pub use fake::{
     FakeAvailabilityAnnouncer, FakeFabric, FakeLocalPeerDiscovery, FakeNarServer, FakeNarTransfer,
     FakeNodeLocator, FakePeerHoldQuery, FakeProviderDirectory,

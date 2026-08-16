@@ -2358,6 +2358,82 @@ DISK_FINDING = {
 }
 
 
+# ---- TASK-78: the leech-FRACTION knob (AC#2/#3) -----------------------------
+# A leech fetches from the swarm but SERVES + ANNOUNCES nothing (its fabric is wrapped in a
+# `peer_fabric::LeechFabric`; see daemon-libp2p `--libp2p-leech`). A swarm that is 90% leeches
+# behaves very differently from one that is 10%: only the SERVING peers supply content, so raising
+# the leech fraction lowers the supply and thus the achievable offload. This is the KNOB that lets
+# a swarm be run/modelled with a given leech fraction and makes leech mode OBSERVABLE in the report.
+# It is an EXACT INTEGER RATIONAL num/den (owner rule: no floats in a knob/decision) and the split
+# is an integer floor. The full quantitative offload-vs-leech-fraction campaign is TASK-237; here we
+# provide the knob + a DIRECTIONAL model (more leeches -> fewer serving peers -> less supply).
+
+
+def parse_leech_fraction(text: str) -> tuple[int, int]:
+    """Parse `NUM/DEN` into an exact rational `(num, den)`, integers only. Fail-fast on a float,
+    a zero/negative denominator, or a fraction outside 0..1 (a leech fraction is a share of peers)."""
+    if "/" not in text:
+        raise argparse.ArgumentTypeError(
+            f"--leech-fraction {text!r}: expected an exact rational NUM/DEN (e.g. 0/1, 1/4, 9/10)"
+        )
+    num_s, den_s = text.split("/", 1)
+    try:
+        num, den = int(num_s), int(den_s)
+    except ValueError:
+        raise argparse.ArgumentTypeError(
+            f"--leech-fraction {text!r}: NUM and DEN must be INTEGERS (no floats in a knob)"
+        )
+    if den <= 0:
+        raise argparse.ArgumentTypeError(
+            f"--leech-fraction {text!r}: the denominator must be a positive integer"
+        )
+    if not (0 <= num <= den):
+        raise argparse.ArgumentTypeError(
+            f"--leech-fraction {text!r}: the fraction must lie in 0..1 (a share of the peers)"
+        )
+    return num, den
+
+
+def leech_split(n_peers: int, num: int, den: int) -> tuple[int, int]:
+    """Split `n_peers` into (serving_peers, leech_peers) at leech fraction `num/den`, integer floor.
+    `leech_peers = n_peers * num // den` (exact integer arithmetic), `serving = n_peers - leech`."""
+    if n_peers < 0:
+        raise ValueError(f"n_peers must be non-negative, got {n_peers}")
+    leech = n_peers * num // den
+    return n_peers - leech, leech
+
+
+def leech_model(swarm_sizes, num: int, den: int) -> dict:
+    """The OBSERVABLE leech-fraction block for the report (AC#2/#3). Records the knob, the integer
+    serving/leech split per swarm size, and the DIRECTIONAL statement that supply is non-increasing
+    in the leech fraction - measured/modelled here, with the full campaign deferred to TASK-237. All
+    fields are integers or prose; no floats, no `*_bytes` keys."""
+    per_size = []
+    for n in sorted({int(x) for x in swarm_sizes}):
+        serving, leech = leech_split(n, num, den)
+        per_size.append(
+            {"n_peers": n, "serving_peers": serving, "leech_peers": leech}
+        )
+    return {
+        "ran": True,
+        "knob": "--leech-fraction",
+        "leech_fraction_num": num,
+        "leech_fraction_den": den,
+        "per_swarm_size": per_size,
+        "note": (
+            "A leech (TASK-78) fetches but SERVES + ANNOUNCES nothing (LeechFabric mask). Only "
+            "SERVING peers supply content, so a higher leech fraction means fewer serving peers, "
+            "less supply, and a lower achievable offload. Exact integer-rational knob, integer "
+            "floor split."
+        ),
+        "directional_offload": (
+            "serving_peers is NON-INCREASING as the leech fraction rises; at num==den every peer is "
+            "a leech and serving_peers==0 (no supply -> the offload floor). This is the DIRECTION; "
+            "the full quantitative offload-vs-leech-fraction campaign is TASK-237."
+        ),
+    }
+
+
 def build_report(
     axis,
     speedup: dict | None,
@@ -2367,6 +2443,7 @@ def build_report(
     targets,
     size: tuple[dict, dict, list[str]] | None = None,
     discovery: dict | None = None,
+    leech: dict | None = None,
 ) -> dict:
     """Assemble the report. PURE: takes collected measurements, touches nothing.
 
@@ -2516,6 +2593,10 @@ def build_report(
         "measured": measured,
         "models": models,
         "red_flags": red_flags,
+        # TASK-78 AC#2/#3: leech mode is OBSERVABLE here. `leech is None` means the knob was not set
+        # (default 0/1 = no leeches), so the model is inert but still present so a reader sees it.
+        "leech_model": leech
+        or {"ran": False, "reason": "no leech fraction set (--leech-fraction defaults to 0/1)"},
     }
     s5_violations = scalefit.sweep_report_violations(report)
     unit_problems = unit_violations(report)
@@ -3290,6 +3371,48 @@ def run_self_test() -> int:  # noqa: C901 - a flat list of checks reads better h
     check(
         "a word merely CONTAINING 'bytes' is not a byte key",
         unit_violations({"bytesize_note": "x"}) == [],
+    )
+
+    # --- TASK-78: the leech-FRACTION knob (AC#2/#3) --------------------------
+    print("\n  -- leech fraction knob --")
+    check(
+        "no leeches (0/den) leaves every peer serving",
+        leech_split(10, 0, 1) == (10, 0),
+    )
+    check(
+        "all leeches (den/den) leaves NO peer serving (the offload floor)",
+        leech_split(10, 3, 3) == (0, 10),
+    )
+    check(
+        "a 1/4 fraction floors the leech count (integer split, no floats)",
+        leech_split(10, 1, 4) == (8, 2),
+        str(leech_split(10, 1, 4)),
+    )
+    # DIRECTIONAL: supply (serving_peers) is NON-INCREASING as the leech fraction rises.
+    serving_curve = [leech_split(12, k, 12)[0] for k in range(0, 13)]
+    check(
+        "MODEL: serving_peers is non-increasing as the leech fraction rises (less supply)",
+        all(a >= b for a, b in zip(serving_curve, serving_curve[1:]))
+        and serving_curve[0] == 12
+        and serving_curve[-1] == 0,
+        str(serving_curve),
+    )
+    # The parser is fail-fast: floats, den<=0, and out-of-range are all rejected.
+    for bad in ("0.5/1", "1/0", "3/2", "1", "x/2"):
+        try:
+            parse_leech_fraction(bad)
+            rejected = False
+        except argparse.ArgumentTypeError:
+            rejected = True
+        check(f"MUTATION: --leech-fraction {bad!r} is rejected", rejected)
+    check("a valid rational parses", parse_leech_fraction("9/10") == (9, 10))
+    # The observable block is unit-clean (no `*_bytes` keys) and carries integer splits.
+    lm = leech_model([1, 4, 16], 3, 4)
+    check(
+        "leech_model is unit-clean and observable in the report",
+        unit_violations({"leech_model": lm}) == []
+        and lm["per_swarm_size"][2] == {"n_peers": 16, "serving_peers": 4, "leech_peers": 12},
+        str(lm["per_swarm_size"]),
     )
 
     # unit coincidence precondition, proven both ways with a fake fixture set.
@@ -4668,6 +4791,16 @@ def main() -> int:
         action="store_true",
         help="run the pure logic tests (no containers, no nix) and exit",
     )
+    parser.add_argument(
+        "--leech-fraction",
+        type=parse_leech_fraction,
+        default=(0, 1),
+        metavar="NUM/DEN",
+        help="TASK-78: model the swarm with a leech fraction NUM/DEN (exact integer rational, "
+        "default 0/1 = no leeches). Records the integer serving/leech split per swarm size in the "
+        "report's leech_model block (observability); the full offload-vs-fraction campaign is "
+        "TASK-237",
+    )
     args = parser.parse_args()
 
     if args.self_test:
@@ -4896,6 +5029,7 @@ def main() -> int:
         replicates=STUDY_REPLICATES,
         noise_levels=STUDY_NOISE_LEVELS,
     )
+    leech_num, leech_den = args.leech_fraction
     report = build_report(
         axis,
         speedup,
@@ -4905,6 +5039,13 @@ def main() -> int:
         args.extrapolate_to,
         size=size_blocks,
         discovery=discovery_block,
+        # TASK-78: model the leech-fraction split over the SAME swarm grid, so leech mode is
+        # observable beside the measured resource axis. Inert at the default 0/1 (no leeches).
+        leech=(
+            leech_model(args.swarm, leech_num, leech_den)
+            if leech_num > 0
+            else None
+        ),
     )
     # PERSIST BEFORE PRETTY-PRINTING. The human summary is a formatter over a
     # report that cost ~20 minutes of container runs to produce; a KeyError in

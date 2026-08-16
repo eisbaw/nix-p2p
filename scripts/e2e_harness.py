@@ -526,6 +526,7 @@ class Pod:
         libp2p_store_supply: bool = False,
         libp2p_announce_after_fetch: bool = False,
         libp2p_announce_budget: int = 256,
+        libp2p_leech: bool = False,
     ):
         self.ctx = ctx
         self.pod = f"{POD_PREFIX}-{name}"
@@ -604,6 +605,22 @@ class Pod:
         # fetches (no `--libp2p-prove-public-narinfo` staging), so it still requires the trusted key.
         self.libp2p_announce_after_fetch = bool(libp2p_announce_after_fetch)
         self.libp2p_announce_budget = int(libp2p_announce_budget)
+        # TASK-78 (leech / consume-only): the node in the PROVIDER slot `A` is instead launched as a
+        # `--libp2p-leech` CONSUMER - it fetches the target through its own daemon (so it HOLDS the
+        # path in its store) but its fabric is wrapped in a LeechFabric, so it SERVES nothing and
+        # ANNOUNCES nothing. The second consumer `B` therefore finds NO provider record for the
+        # target (A, the only holder, is a leech) and must fall back to upstream. This is the
+        # peer-side proof that a leech gives nothing back; the mutation is running the SAME topology
+        # with A as an announce-after-fetch provider (0 upstream on B instead of >=1). A leech needs
+        # no trusted key / allowlist (it never announces), so those are not required here.
+        self.libp2p_leech = bool(libp2p_leech)
+        if self.libp2p_leech and (
+            self.libp2p_announce_after_fetch or self.libp2p_store_supply
+        ):
+            die(
+                "Pod: libp2p_leech (consume-only) is mutually exclusive with the "
+                "announce-after-fetch / store-supply provider modes"
+            )
         if self.libp2p_announce_after_fetch and not libp2p_trusted_key:
             die(
                 "Pod: libp2p_announce_after_fetch requires libp2p_trusted_key (the public-announce "
@@ -1141,6 +1158,12 @@ class Pod:
         # BOOT must be reachable before P announces; its HTTP readiness is our gate.
         self._await_http_ready("lp-boot", 2)
 
+        # TASK-78: in LEECH mode the node in the provider slot `A` is a consume-only leech, launched
+        # by a dedicated path that keeps the non-leech provider topology below byte-identical.
+        if self.libp2p_leech:
+            self._create_libp2p_leech(boot_peer, proxy)
+            return
+
         # 2. P (provider): seeds the real target, bootstraps to BOOT, announces.
         seed_args: list[str] = []
         if self.libp2p_announce_after_fetch:
@@ -1270,6 +1293,89 @@ class Pod:
         self.libp2p_provider_listen_addrs.add(prov_listen)
 
         # 3. C (consumer): bootstraps to BOOT ALONE. NO provider-addr injection.
+        run(
+            [
+                self._pm,
+                "run",
+                "-d",
+                "--pod",
+                self.pod,
+                "--name",
+                self._c("lp-consumer"),
+                "--label",
+                PROJECT_LABEL,
+                *self._state_args("lp-consumer"),
+                self.ctx.image,
+                "/bin/daemon",
+                "--listen",
+                f"0.0.0.0:{DAEMON_PORT}",
+                "--upstream",
+                proxy,
+                "--libp2p-listen",
+                f"/ip4/127.0.0.1/tcp/{LIBP2P_BASE_PORT}",
+                "--libp2p-bootstrap",
+                boot_peer,
+                "--libp2p-scope",
+                LIBP2P_SCOPE,
+                *self._daemon_state_flags(),
+                *self.daemon_extra_args,
+            ]
+        )
+
+    def _create_libp2p_leech(self, boot_peer: str, proxy: str) -> None:
+        """TASK-78 leech topology: BOOT is already up. Launch A as a CONSUME-ONLY leech in the
+        provider slot (port+1) and B as the second consumer (port+0, the client's substituter).
+
+        A (leech): `--libp2p-leech`, bootstraps to BOOT, and fetches the target through its OWN
+        daemon (ORIGIN-DIRECT upstream, so the proxy NAR cache stays COLD - B's later fallback is a
+        true origin miss, not a warm-cache confound, exactly as the announce-after-fetch provider
+        does). Its fabric is LeechFabric-wrapped, so it announces NOTHING and serves NOTHING: it
+        never prints a provider identity, so this path awaits its HTTP readiness instead. A holds no
+        content at boot; the scenario drives its fetch.
+
+        B (consumer): identical to the non-leech consumer - bootstraps to BOOT ALONE, fronts the
+        proxy. Because A (the only holder after it fetches) is a leech, B's `find_providers` MISSES
+        and B falls back to upstream. The mutation (A as an announce-after-fetch provider) makes B's
+        egress 0 instead.
+        """
+        # A leech never announces an identity/seed line, so there is nothing to await here and no
+        # provider dial address to record for the no-injection oracle.
+        self.libp2p_provider_identity = None
+        origin = f"http://127.0.0.1:{ORIGIN_PORT}"
+
+        # A: the leech in the provider slot (port+1). Origin-direct upstream keeps the proxy cold.
+        run(
+            [
+                self._pm,
+                "run",
+                "-d",
+                "--pod",
+                self.pod,
+                "--name",
+                self._c("lp-provider"),
+                "--label",
+                PROJECT_LABEL,
+                *self._state_args("lp-provider"),
+                self.ctx.image,
+                "/bin/daemon",
+                "--listen",
+                f"0.0.0.0:{DAEMON_PORT + 1}",
+                "--upstream",
+                origin,
+                "--libp2p-leech",
+                "--libp2p-listen",
+                f"/ip4/127.0.0.1/tcp/{LIBP2P_BASE_PORT + 1}",
+                "--libp2p-bootstrap",
+                boot_peer,
+                "--libp2p-scope",
+                LIBP2P_SCOPE,
+                *self._daemon_state_flags(),
+            ]
+        )
+        # The leech binds its libp2p listener before HTTP; a 200 here means it is a live swarm peer.
+        self._await_http_ready("lp-provider", 1)
+
+        # B: the second consumer (port+0), bootstraps to BOOT ALONE, fronts the proxy.
         run(
             [
                 self._pm,
@@ -5442,6 +5548,189 @@ def scenario_s9_libp2p_grow(ctx: Ctx, expect) -> None:
         )
 
 
+def _leech_drive_a_fetch(pod, ctx, target_sp, a_daemon):
+    """Drive A's OWN daemon to realise `target_sp` from its (origin-direct) upstream, so A HOLDS
+    the path in its store. Shared by both arms of the leech scenario; returns the realise result."""
+    return pod.exec(
+        "lp-provider",
+        [
+            "bash",
+            "-lc",
+            (
+                f"nix-store --realise {shlex.quote(target_sp)} "
+                f"--option substituters {shlex.quote(a_daemon)} "
+                f"--option trusted-public-keys {shlex.quote(ctx.fixtures.public_key)} "
+                f"--option require-sigs true --option substitute true"
+            ),
+        ],
+        check=False,
+    )
+
+
+def scenario_libp2p_leech(ctx: Ctx, expect) -> None:
+    """S-LEECH (TASK-78): a CONSUME-ONLY leech gives nothing back, verified FROM THE PEER SIDE.
+
+    A leech fetches from the swarm but SERVES nothing and ANNOUNCES nothing (its fabric is wrapped
+    in a `peer_fabric::LeechFabric`, so the serve + announce axes are masked at the capability
+    seam). This scenario proves the peer-side consequence with a MINIMAL PAIR whose only delta is
+    node A's mode - leech vs announce-after-fetch provider - and reads the SAME oracle (B's upstream
+    NAR egress) in both arms:
+
+      * LEECH arm: A is a `--libp2p-leech` consumer. It fetches the target through its OWN daemon
+        (so it HOLDS the path in its store), but announces nothing. A second consumer B - which in
+        the mutation below discovers A via kad - now finds NO provider record for the target (A, the
+        only holder, is a leech), so B falls back to UPSTREAM (upstream.nar >= 1). B got NOTHING
+        from the leech: the peer-side proof.
+
+      * SERVING mutation (negative control): the SAME topology with A as an announce-after-fetch
+        PROVIDER. A fetches the target, ANNOUNCES it, and B discovers A via kad and fetches the
+        target FROM A with 0 upstream NAR egress. This reddens the leech arm's ">= 1": flip A from
+        leech to serving and the peer CAN obtain the content - so the leech mask is load-bearing.
+
+    Attribution is clean in the leech arm because A is PROVEN to hold the target (its realise
+    succeeds) and PROVEN to be a leech (its log carries the LIBP2P-LEECH marker and NO announce
+    marker) - so B's fallback is caused by A giving nothing back, not by A lacking the content or
+    being down. The airtight serve-refusal for a DIRECTLY-dialled leech (NotHeld regardless of
+    announce) is proven at the fabric layer by fabric-libp2p's `a_leech_serves_nothing_to_a_
+    reachable_peer`; here the e2e proves the discovery half end to end through real nix.
+    """
+    fixtures = ctx.fixtures
+
+    # -- LEECH arm: A is a leech; B gets NOTHING from it and falls back to upstream. --
+    seed_dir, prov_seeds, target_sp = _s7_seeds(ctx, "leech", S7_TARGET)
+    target_nar_hash = fixtures.nar_hash(S7_TARGET)
+    a_daemon = f"http://127.0.0.1:{DAEMON_PORT + 1}"
+    with Pod(
+        ctx,
+        "leech",
+        fixtures.cache,
+        with_daemon=False,
+        expect=expect,
+        libp2p_seed_dir=seed_dir,
+        libp2p_provider_seeds=prov_seeds,
+        libp2p_leech=True,
+    ) as pod:
+        # A boots as a consume-only leech (its own log states what it hides vs reveals).
+        alog = pod.logs("lp-provider")
+        expect(
+            "LIBP2P-LEECH consume-only" in alog,
+            "S-LEECH: A boots in consume-only leech mode (serves + announces nothing at the seam)",
+            f"provider log tail: {alog[-700:]!r}",
+        )
+
+        time.sleep(LIBP2P_CONVERGE_S)  # bounded kad settle
+
+        # STEP 1: A FETCHES the target through its OWN daemon (origin-direct), so it HOLDS the path.
+        pod.proxy_reset()
+        realise = _leech_drive_a_fetch(pod, ctx, target_sp, a_daemon)
+        expect(
+            realise.returncode == 0,
+            "S-LEECH step1: the leech A still FETCHES successfully (it realises the target through "
+            "its own daemon) - consume-only does not break consuming",
+            (realise.stdout + realise.stderr)[-800:],
+        )
+        # A announced NOTHING despite now holding the target - the leech mask at work.
+        alog = pod.logs("lp-provider")
+        expect(
+            "LIBP2P-ANNOUNCE-AFTER-FETCH narhash=" not in alog
+            and "LIBP2P-PROVIDE-STORE narhash=" not in alog
+            and "LIBP2P-SEED narhash=" not in alog,
+            "S-LEECH step1: A announces NOTHING even after fetching+holding the target",
+            f"provider log tail: {alog[-900:]!r}",
+        )
+        time.sleep(LIBP2P_CONVERGE_S)  # give any (absent) record propagation the same window
+
+        # STEP 2 (the peer-side bite): B builds the target. A is the only holder, but it is a leech,
+        # so B finds no provider record and falls back to UPSTREAM.
+        pod.proxy_reset()
+        res = pod.client_run(
+            [target_sp], ctx.substituter_daemon_only(), fixtures.public_key
+        )
+        expect(
+            res.exit_code == 0,
+            "S-LEECH step2: B's build still completes (via upstream fallback) with A a leech",
+            res.stderr[-800:],
+        )
+        got = res.narhash(target_sp)
+        expect(
+            got == target_nar_hash,
+            f"S-LEECH S1 byte-identity: {S7_TARGET} NarHash matches the signed upstream",
+            f"got={got} want={target_nar_hash}",
+        )
+        b_nar_up = pod.proxy_stats()["upstream"].get("nar", 0)
+        expect(
+            b_nar_up >= 1,
+            "S-LEECH peer-side oracle: B obtained NOTHING from the leech A (which HOLDS the target) "
+            "and fell back to upstream (upstream.nar >= 1) - a leech gives nothing back",
+            f"upstream.nar={b_nar_up}",
+        )
+
+    # -- SERVING mutation (negative control): SAME topology, A is an announce-after-fetch provider; --
+    #    B now gets the target FROM A with 0 upstream egress. This reddens the leech arm's ">= 1".
+    seed_dir2, prov_seeds2, target_sp2 = _s7_seeds(ctx, "leech-mut", S7_TARGET)
+    a_daemon2 = f"http://127.0.0.1:{DAEMON_PORT + 1}"
+    with Pod(
+        ctx,
+        "leech-mut",
+        fixtures.cache,
+        with_daemon=False,
+        expect=expect,
+        libp2p_seed_dir=seed_dir2,
+        libp2p_provider_seeds=prov_seeds2,
+        libp2p_trusted_key=fixtures.public_key,
+        libp2p_announce_after_fetch=True,
+    ) as pod:
+        time.sleep(LIBP2P_CONVERGE_S)
+        # A fetches the target (fires announce-after-fetch).
+        pod.proxy_reset()
+        realise = _leech_drive_a_fetch(pod, ctx, target_sp2, a_daemon2)
+        expect(
+            realise.returncode == 0,
+            "S-LEECH mutation: A (a serving provider) realises the target through its own daemon",
+            (realise.stdout + realise.stderr)[-800:],
+        )
+        # Wait for A to ANNOUNCE the fetched path.
+        announced = False
+        deadline = time.time() + READY_TIMEOUT_S
+        while time.time() < deadline:
+            if (
+                "LIBP2P-ANNOUNCE-AFTER-FETCH narhash=" in pod.logs("lp-provider")
+                and target_nar_hash in pod.logs("lp-provider")
+            ):
+                announced = True
+                break
+            time.sleep(0.5)
+        expect(
+            announced,
+            "S-LEECH mutation: A ANNOUNCES the fetched path (the delta from the leech arm)",
+            f"want narhash={target_nar_hash}; provider log tail: {pod.logs('lp-provider')[-900:]!r}",
+        )
+        time.sleep(LIBP2P_CONVERGE_S)
+        # B discovers A via kad and fetches the target FROM A: 0 upstream egress.
+        pod.proxy_reset()
+        res = pod.client_run(
+            [target_sp2], ctx.substituter_daemon_only(), fixtures.public_key
+        )
+        expect(
+            res.exit_code == 0,
+            "S-LEECH mutation: B's build completes, served by A over libp2p",
+            res.stderr[-800:],
+        )
+        got = res.narhash(target_sp2)
+        expect(
+            got == target_nar_hash,
+            "S-LEECH mutation S1 byte-identity: NarHash matches the signed upstream",
+            f"got={got} want={target_nar_hash}",
+        )
+        b_nar_up = pod.proxy_stats()["upstream"].get("nar", 0)
+        expect(
+            b_nar_up == 0,
+            "S-LEECH MUTATION oracle: with A SERVING (not a leech), B obtains the target FROM A "
+            "(0 upstream NAR egress) - proving the leech arm's >=1 is load-bearing, not vacuous",
+            f"upstream.nar={b_nar_up}",
+        )
+
+
 def scenario_narinfo_default_cache_offload(ctx: Ctx, expect) -> None:
     """TASK-29 AC#1/#2: the daemon narinfo disk cache is ON BY DEFAULT and, on a
     REPEAT build of the same paths, serves narinfo LOCALLY so ZERO narinfo crosses
@@ -5640,6 +5929,10 @@ SCENARIOS = [
     # the target FROM A (0 upstream egress). The swarm GROWS; the kill-A control proves A was
     # load-bearing.
     ("s9-libp2p-grow", scenario_s9_libp2p_grow),
+    # S-LEECH (TASK-78): a consume-only leech serves + announces NOTHING, verified from the peer
+    # side - a second consumer that WOULD discover A (and does, in the serving mutation) gets
+    # nothing from the leech and falls back to upstream. Minimal pair on A's mode (leech vs serving).
+    ("libp2p-leech", scenario_libp2p_leech),
 ]
 
 

@@ -161,6 +161,13 @@ public-swarm results are still out.
   instant a transfer exceeds its declared size — mid-stream, not after buffering — enforces an
   inter-chunk idle bound, and a bounded in-flight ceiling caps concurrent serves, while every
   byte is still BLAKE3/bao-verified before the build accepts it.
+- **Leech / consume-only mode (`--libp2p-leech`).** An affirmative opt-out for anyone who
+  cannot or will not contribute uplink: a leech still fetches from peers, but its fabric is
+  wrapped in a transport-agnostic `LeechFabric` that masks the *serve* and *announce* axes at
+  the capability seam, so peers can obtain nothing from it — verified from the peer side, not
+  self-reported. It is honest about its limits: a leech hides what it **serves and announces**,
+  not what it **looks up** (it still sends discovery queries), and it refuses fail-fast to be
+  combined with any give-side provider flag.
 
 ## What is not yet
 

@@ -462,6 +462,14 @@ struct Config {
     /// fetched paths this process announces. Past it, announcing STOPS (the guardrail against
     /// unbounded self-DoS + the privacy surface). A plain integer, never a float.
     libp2p_announce_budget: u64,
+    /// LEECH / consume-only mode (TASK-78): an affirmative opt-out of contributing uplink. A leech
+    /// still FETCHES from peers, but its fabric is wrapped in a [`peer_fabric::LeechFabric`] so the
+    /// SERVE and ANNOUNCE axes are masked to `None` at the transport-agnostic capability seam - it
+    /// serves nothing and announces nothing. Mutually exclusive with every provider/serve flag,
+    /// enforced fail-fast. HONEST LIMIT: a leech still SENDS its discovery lookups (get_record /
+    /// peer-routing), so it hides what it serves and announces, NOT what it looks up. Mirrors the
+    /// thin `daemon-libp2p` binary so the two cannot drift.
+    libp2p_leech: bool,
 }
 
 /// The default announce-after-fetch budget: distinct paths a process announces before growth
@@ -530,6 +538,7 @@ impl Default for Config {
             libp2p_prove_public_narinfo: Vec::new(),
             libp2p_announce_after_fetch: false,
             libp2p_announce_budget: DEFAULT_LIBP2P_ANNOUNCE_BUDGET,
+            libp2p_leech: false,
         }
     }
 }
@@ -818,6 +827,7 @@ impl Config {
                     .libp2p_prove_public_narinfo
                     .push(parse_prove_public_narinfo(&value()?)?),
                 "--libp2p-announce-after-fetch" => config.libp2p_announce_after_fetch = true,
+                "--libp2p-leech" => config.libp2p_leech = true,
                 "--libp2p-announce-budget" => {
                     let raw = value()?;
                     config.libp2p_announce_budget = raw.parse::<u64>().map_err(|e| {
@@ -827,6 +837,42 @@ impl Config {
                     })?;
                 }
                 other => return Err(format!("unknown flag {other:?}")),
+            }
+        }
+        // TASK-78 LEECH mode is consume-only: it masks the SERVE + ANNOUNCE axes at the seam, so it
+        // is contradictory with every flag that makes this node GIVE content back. Reject the
+        // combination fail-fast rather than silently mask a provider the operator asked for (a leech
+        // that serves would be a lie). Mirrors the thin `daemon-libp2p` binary's check.
+        if config.libp2p_leech {
+            let give_side = [
+                ("--libp2p-provider", config.libp2p_provider),
+                (
+                    "--libp2p-announce-after-fetch",
+                    config.libp2p_announce_after_fetch,
+                ),
+                ("--libp2p-seed-nar", !config.libp2p_seed_nar.is_empty()),
+                (
+                    "--libp2p-provide-store",
+                    !config.libp2p_provide_store.is_empty(),
+                ),
+                (
+                    "--libp2p-public-allowlist-path",
+                    config.libp2p_public_allowlist_path.is_some(),
+                ),
+                (
+                    "--libp2p-trusted-public-key",
+                    !config.libp2p_trusted_public_keys.is_empty(),
+                ),
+                (
+                    "--libp2p-prove-public-narinfo",
+                    !config.libp2p_prove_public_narinfo.is_empty(),
+                ),
+            ];
+            if let Some((flag, _)) = give_side.iter().find(|(_, present)| *present) {
+                return Err(format!(
+                    "--libp2p-leech is consume-only (it serves nothing and announces nothing); it \
+                     cannot be combined with {flag}. Drop the give-side flag or drop --libp2p-leech."
+                ));
             }
         }
         let publication_companion_configured = config.iroh_publication_namespace.is_some()
@@ -978,6 +1024,9 @@ impl Config {
             || !self.libp2p_seed_nar.is_empty()
             || !self.libp2p_provide_store.is_empty()
             || self.libp2p_print_peer_address
+            // TASK-78: a lone `--libp2p-leech` must not be silently ignored - it requests libp2p
+            // (consume-only), so it trips the bootstrap requirement (a leech needs an entry peer).
+            || self.libp2p_leech
     }
 
     /// Build the production [`Libp2pSourceConfig`] this `Config` describes. PURE and
@@ -2055,8 +2104,25 @@ async fn setup_p2p_source(
             let (_fabric, libp2p_source, raw_serve) =
                 build_libp2p_nar_source(config.libp2p_source_config()?).await?;
             libp2p_raw_serve = Some(raw_serve);
+            // TASK-78: the non-provider path is CONSUME-ONLY by construction - it builds the fabric
+            // WITHOUT a supplier, so the libp2p backend installs no serve gate (every inbound NAR
+            // request is answered NotHeld) and runs no announce loop. `--libp2p-leech` makes that an
+            // AFFIRMATIVE opt-out (fail-fast against every give-side flag, see from_args) and states
+            // the exposure honesty. The transport-agnostic seam mask (peer_fabric::LeechFabric) is
+            // applied by the PRIMARY thin `daemon-libp2p` binary, which threads a `PeerFabric` into
+            // `daemon_core::run`; this iroh-native composite wraps libp2p as a `NarSource` layer, so
+            // here consume-only is a structural property of the non-provider path, not a wrapper.
+            if config.libp2p_leech {
+                println!(
+                    "daemon: LIBP2P-LEECH consume-only: serves NOTHING + announces NOTHING. HONEST \
+                     LIMIT: it STILL SENDS discovery lookups (kad get_record + peer-routing), \
+                     disclosing what it looks up to the DHT nodes it queries - a leech hides what it \
+                     SERVES/ANNOUNCES, not what it LOOKS UP."
+                );
+            }
             println!(
-                "daemon: libp2p p2p source started, discovery converging ({} bootstrap peer(s), {} optional provider dial-addr override hint(s); dial addresses resolved via kad peer-routing)",
+                "daemon: libp2p {} source started, discovery converging ({} bootstrap peer(s), {} optional provider dial-addr override hint(s); dial addresses resolved via kad peer-routing)",
+                if config.libp2p_leech { "LEECH" } else { "p2p" },
                 config.libp2p_bootstrap.len(),
                 config.libp2p_provider_addrs.len()
             );
@@ -2845,6 +2911,44 @@ mod tests {
         ])
         .unwrap_err();
         assert!(err.contains("libp2p-bootstrap"), "got {err}");
+    }
+
+    #[test]
+    fn libp2p_leech_is_consume_only_and_conflicts_with_give_side_flags() {
+        // TASK-78 parity with the thin `daemon-libp2p` binary. A leech consumer with a bootstrap
+        // parses and is consume-only (not a provider); it trips the bootstrap requirement on its
+        // own; and it is refused fail-fast alongside any give-side flag.
+        let peer = PeerId::random();
+        let boot = format!("{peer}@/ip4/127.0.0.1/tcp/4001");
+        let ok = Config::from_args(vec![
+            "--libp2p-leech".to_string(),
+            "--libp2p-bootstrap".to_string(),
+            boot.clone(),
+        ])
+        .expect("a leech consumer with a bootstrap parses");
+        assert!(ok.libp2p_leech && !ok.libp2p_provider && ok.libp2p_requested());
+
+        // A lone --libp2p-leech requests libp2p, so the missing bootstrap is caught (not ignored).
+        let err = Config::from_args(vec!["--libp2p-leech".to_string()]).unwrap_err();
+        assert!(err.contains("libp2p-bootstrap"), "got {err}");
+
+        // Conflict with a give-side flag is refused, naming both.
+        let nar_hash = NarHashKey::from_sha256_bytes([0x33u8; 32]);
+        let err = Config::from_args(vec![
+            "--libp2p-leech".to_string(),
+            "--libp2p-bootstrap".to_string(),
+            boot.clone(),
+            "--libp2p-provider".to_string(),
+            "--libp2p-listen".to_string(),
+            "/ip4/127.0.0.1/tcp/0".to_string(),
+            "--libp2p-seed-nar".to_string(),
+            format!("{nar_hash}=/srv/seed/a.nar"),
+        ])
+        .unwrap_err();
+        assert!(
+            err.contains("--libp2p-leech") && err.contains("--libp2p-provider"),
+            "the refusal must name both conflicting flags: {err}"
+        );
     }
 
     #[test]

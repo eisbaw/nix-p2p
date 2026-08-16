@@ -556,6 +556,49 @@ async fn dropping_the_serve_handle_stops_admission() {
     );
 }
 
+/// TASK-78 leech serve-barrier (the AIRTIGHT peer-side proof): a LEECH node is one on which
+/// NO serve gate was ever installed (a pure consumer; on the seam, `PeerFabric::server()` is
+/// `None`, so nothing can start the serve lifecycle). This test proves the peer-observable
+/// consequence DIRECTLY, at the swarm boundary and INDEPENDENTLY of discovery: a consumer that
+/// has the leech's exact dial address (the "told the leech is a provider" case - `add_address` +
+/// `dial` in `direct_fetch`) and asks for content the leech holds gets `NotHeld` - the leech's
+/// inbound `/nar/3` handler answers "not held" for EVERY request because its serve slot is empty
+/// (`nar.rs`: `None => NarResponse::NotHeld`). So a peer cannot obtain bytes from a leech by ANY
+/// path: not via the DHT (a leech never announces, so there is no record to find), and not via a
+/// direct dial (this test). MUTATION: install a serve gate on the "leech" (make it serve) and the
+/// `NotHeld` assertion reddens - the `dropping_the_serve_handle_stops_admission` test above is the
+/// live proof that WITH a gate the very same fetch succeeds.
+#[tokio::test]
+async fn a_leech_serves_nothing_to_a_reachable_peer() {
+    let scope = "nar-leech";
+    // The leech has, in the field, FETCHED this content (it holds it in its nix store) - but it
+    // installs no serve gate, so it cannot hand it out. We model "content the leech holds" by the
+    // digest a peer would request; the leech's answer must be NotHeld regardless.
+    let held = b"content a leech fetched but must never serve".to_vec();
+    let held_content = Blake3Digest::from_raw_nar(&held);
+
+    // The LEECH: a listening node with NO `Libp2pServer::serve()` ever called on it. Its inbound
+    // serve slot stays empty for the whole test.
+    let (leech, leech_addr) = start_listening([78u8; 32], scope).await;
+
+    // A peer that is handed the leech's EXACT address (out-of-band "told it is a provider") and
+    // asks for the content the leech holds.
+    let (peer, _peer_addr) = start_listening([79u8; 32], scope).await;
+    let outcome = direct_fetch(
+        &peer,
+        leech.peer_id,
+        &leech_addr,
+        held_content,
+        Some(held.len() as u64),
+    )
+    .await;
+    let err = outcome.expect_err("a leech must serve NOTHING even to a peer holding its address");
+    assert!(
+        matches!(err, TransferError::NotHeld(_)),
+        "a reachable leech must answer NotHeld to every request (no serve gate installed); got {err}"
+    );
+}
+
 #[tokio::test]
 async fn a_stale_teardown_does_not_clobber_a_live_successor_session() {
     // Regression for the re-serve handoff race: install a SECOND serve session before
