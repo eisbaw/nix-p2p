@@ -815,10 +815,12 @@ pub struct HoldResponse {
 /// one-per-kind + count bound COUNT unknown kinds against the same cap as known
 /// ones - so the number of OFFERS is bounded even when they would be dropped -
 /// while still dropping them from the value a caller sees (forward
-/// compatibility). This bounds the offer COUNT; the content IDENTITIES a single
-/// unknown offer could name are bounded SEPARATELY by the shape rule (task-224,
+/// compatibility). This bounds the offer COUNT; the STRUCTURED/list expression of
+/// content identities is bounded by the shape rule (task-224,
 /// [`reject_enumeration_shaped_unknown_offer`] - no array/nested/multi-field
-/// body). It does NOT bound the message BYTES: a well-shaped unknown offer's
+/// body), but a single scalar (or the tag / field-name) can STILL carry
+/// identity-shaped TEXT - that residual is owned by task-227, NOT bounded here.
+/// It does NOT bound the message BYTES: a well-shaped unknown offer's
 /// single scalar is byte-unbounded and a peer can still pad a one-key answer up
 /// to [`MAX_CLAIM_WIRE_BYTES`] (task-223) - see [`HoldAnswer`] and
 /// [`check_single_offer_bindings`] for what is and is not closed.

@@ -524,7 +524,10 @@ impl std::error::Error for PeerQueryError {}
 /// one yes/no answer; [`query_batch`](PeerQuery::query_batch) takes N keys the
 /// caller named and returns N positional yes/no answers. There is deliberately NO
 /// "list holdings" method in either form, so the no-enumeration invariant is
-/// structural at this seam, not just at the index.
+/// structural at this seam (no list method), not just at the index. (A SEPARATE
+/// decoder-layer residual - an unknown-KIND offer can carry identity-shaped TEXT
+/// in its tag / field-name / scalar value - is tracked by task-227; task-224
+/// closed only the structured/list form, not this text channel.)
 #[async_trait]
 pub trait PeerQuery: Send + Sync {
     /// Probe `node` for the key named in `query`.
