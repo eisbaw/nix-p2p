@@ -137,11 +137,15 @@ impl NarSource for PeerFabricNarSource {
             )
         })?;
 
-        // Exact-key directory lookup. The answer (signed ProviderRecord: content digest +
-        // offers) is produced by the DHT, NOT injected.
-        let records = match directory
-            .find_providers(&content_key, &self.discovery_budget)
-            .await
+        // Exact-key directory lookup, through the BOUND choke-point (TASK-100 AC#4): a
+        // record whose own key is not the queried `content_key` is DROPPED, so a hostile
+        // adapter cannot hand this direct caller holders of a key it did not name.
+        let records = match peer_fabric::find_providers_bound(
+            directory.as_ref(),
+            &content_key,
+            &self.discovery_budget,
+        )
+        .await
         {
             Lookup::Found(records) => records,
             // A healthy authoritative absence: fast, clean miss -> upstream fallback (S2).
@@ -272,11 +276,16 @@ impl RawServeDecision for PeerFabricRawServe {
         let Some(directory) = self.fabric.provider_directory() else {
             return false;
         };
-        // The SAME probe the paired PeerFabricNarSource fetch uses. Only an authoritative,
-        // non-empty Found rewrites to raw; a Miss or Unavailable leave the narinfo verbatim.
-        match directory
-            .find_providers(&content_key, &self.discovery_budget)
-            .await
+        // The SAME probe the paired PeerFabricNarSource fetch uses, through the BOUND
+        // choke-point (AC#4): records for an un-asked key are dropped, so a hostile
+        // adapter cannot make us rewrite-to-raw on holdings of a different key. Only an
+        // authoritative, non-empty Found rewrites; a Miss/Unavailable leaves it verbatim.
+        match peer_fabric::find_providers_bound(
+            directory.as_ref(),
+            &content_key,
+            &self.discovery_budget,
+        )
+        .await
         {
             Lookup::Found(records) => !records.is_empty(),
             Lookup::Miss | Lookup::Unavailable(_) => false,

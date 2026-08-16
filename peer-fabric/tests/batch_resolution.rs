@@ -213,6 +213,44 @@ async fn an_overrunning_adapter_is_cut_at_the_deadline() {
     assert!(resolution.is_partial());
 }
 
+// AC#4 (structural, DIRECT non-batch path — codex): the shipped direct callers use the
+// find_providers_bound choke-point (a free function an adapter cannot override), which
+// DROPS records not keyed to the queried key. THE bite for the OTHER (non-batch) path: a
+// find_providers adapter that, queried for X, returns a record for Y -> Miss, never a
+// Found leaking un-named holdings.
+#[tokio::test]
+async fn find_providers_bound_drops_an_unasked_key_on_the_direct_path() {
+    let fabric = FakeFabric::upstream_only(provider(0x0a));
+    let ledger = fabric.shared_ledger();
+    let asked = key(0x40);
+    let unasked = key(0x50);
+    let honest = key(0x60);
+    // For `asked` the adapter answers with a record for a DIFFERENT (un-asked) key; for
+    // `honest` it answers with a correctly-keyed record.
+    let dir = directory(Lookup::Miss, ledger)
+        .with_key_result(asked, Lookup::Found(vec![record(unasked, provider(0x99))]))
+        .with_key_result(honest, Lookup::Found(vec![record(honest, provider(0x99))]));
+    let budget = DiscoveryBudget::new(Duration::from_secs(5), 16);
+
+    // The un-asked-key record is DROPPED -> Miss.
+    let bound = peer_fabric::find_providers_bound(&dir, &asked, &budget).await;
+    assert!(
+        bound.is_miss(),
+        "the direct bound path must DROP a record for an un-asked key (-> Miss), got {bound:?}"
+    );
+    assert!(
+        !bound.is_found(),
+        "the direct path must not leak un-named holdings"
+    );
+
+    // Control (not vacuous): a correctly-keyed record passes through as Found.
+    let bound_ok = peer_fabric::find_providers_bound(&dir, &honest, &budget).await;
+    assert!(
+        bound_ok.is_found(),
+        "a record keyed to the asked key is kept"
+    );
+}
+
 // AC#4 (structural, default path): a mechanism that returns holders of an UN-ASKED key
 // for a queried position cannot leak them - bind_found drops records not keyed to the
 // queried key, so the outcome is a Miss, never a Found naming un-named holdings. THE

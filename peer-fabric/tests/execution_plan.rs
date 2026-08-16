@@ -13,11 +13,14 @@
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use std::time::Instant;
+
 use async_trait::async_trait;
 use peer_fabric::{
-    BatchResolveRequest, ContentKey, DiscoveryBudget, ExecutionPlan, ExposureSurface, Lookup,
-    MechanismId, MechanismRegistry, Parallelism, PlanExecError, ProviderDirectory, ProviderRecord,
-    ResourceOutcome, StopCondition, Unavailable,
+    BatchResolution, BatchResolveRequest, ContentKey, DiscoveryBudget, ExecutionPlan,
+    ExposureSurface, KeyResolution, Lookup, MechanismId, MechanismMeasurement, MechanismRegistry,
+    Parallelism, PlanExecError, ProviderDirectory, ProviderRecord, ResourceOutcome, StopCondition,
+    Unavailable,
 };
 use peer_fabric::{Blake3Digest, NodeId, TransportOffer};
 
@@ -258,6 +261,170 @@ async fn the_stop_condition_comes_from_the_plan_not_the_registry() {
         vec![MechanismId::GlobalDirectory, MechanismId::DirectHoldQuery],
         "AllMechanisms must consult every mechanism (the stop comes from the plan)"
     );
+}
+
+/// A directory that IGNORES the budget entirely: its resolve_batch sleeps past any
+/// deadline before answering, so ONLY the registry's own outer timeout can cut it (its
+/// own default per-key timeout is bypassed by the override). This is what forces the
+/// registry deadline-cut path (not the mechanism's inner timeout).
+struct OverrunDirectory;
+
+#[async_trait]
+impl ProviderDirectory for OverrunDirectory {
+    async fn find_providers(
+        &self,
+        _key: &ContentKey,
+        _budget: &DiscoveryBudget,
+    ) -> Lookup<Vec<ProviderRecord>> {
+        Lookup::Miss
+    }
+    async fn resolve_batch(
+        &self,
+        request: &BatchResolveRequest,
+        _budget: &DiscoveryBudget,
+    ) -> BatchResolution {
+        // Budget-ignoring overrun: sleep well past any caller deadline, THEN answer.
+        tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+        let outcomes = request.keys().iter().map(|_| KeyResolution::Miss).collect();
+        BatchResolution::for_request(
+            request,
+            outcomes,
+            MechanismMeasurement::completed_unmetered(0),
+        )
+        .expect("Miss outcomes carry no keys")
+    }
+    fn declared_exposure(&self) -> ExposureSurface {
+        ExposureSurface::none()
+    }
+}
+
+/// A directory that overrides resolve_batch to return NotAttempted for EVERY asked key
+/// (a mechanism that did not authoritatively answer), so a cross-mechanism
+/// NotAttempted+Miss can be exercised through the registry.
+struct NotAttemptedDirectory;
+
+#[async_trait]
+impl ProviderDirectory for NotAttemptedDirectory {
+    async fn find_providers(
+        &self,
+        _key: &ContentKey,
+        _budget: &DiscoveryBudget,
+    ) -> Lookup<Vec<ProviderRecord>> {
+        Lookup::Miss // unused (resolve_batch is overridden)
+    }
+    async fn resolve_batch(
+        &self,
+        request: &BatchResolveRequest,
+        _budget: &DiscoveryBudget,
+    ) -> BatchResolution {
+        let outcomes = request
+            .keys()
+            .iter()
+            .map(|_| KeyResolution::NotAttempted)
+            .collect();
+        BatchResolution::for_request(
+            request,
+            outcomes,
+            MechanismMeasurement::completed_unmetered(0),
+        )
+        .expect("NotAttempted outcomes carry no keys, so binding trivially holds")
+    }
+    fn declared_exposure(&self) -> ExposureSurface {
+        ExposureSurface::none()
+    }
+}
+
+// AC#3 (BLOCKER, REGISTRY path — codex): a registry deadline-cut marks every still-pending
+// key Unavailable(DeadlineExceeded), NEVER a false Miss, and the batch is not Completed.
+// A earlier bite only exercised the default resolve_batch; this exercises MechanismRegistry:
+// mechanism A Misses fast, mechanism B overruns -> the keys A Missed become Unavailable
+// (DeadlineExceeded) because B never authoritatively answered before the cut.
+#[tokio::test]
+async fn the_registry_deadline_cut_marks_pending_keys_unavailable_not_miss() {
+    let k1 = key(0x71);
+    let k2 = key(0x72);
+    let mut registry = MechanismRegistry::new();
+    registry
+        // A: Misses both keys quickly.
+        .register(
+            MechanismId::GlobalDirectory,
+            Arc::new(RecordingDirectory {
+                id: MechanismId::GlobalDirectory,
+                answer: Lookup::Miss,
+                log: Arc::new(Mutex::new(Vec::new())),
+            }),
+        )
+        // B: overruns the deadline for the still-pending keys.
+        .register(MechanismId::DirectHoldQuery, Arc::new(OverrunDirectory));
+
+    let started = Instant::now();
+    let res = registry
+        .resolve(
+            &BatchResolveRequest::new([k1, k2]),
+            &DiscoveryBudget::new(std::time::Duration::from_millis(100), 16),
+            &ExecutionPlan::fixed_baseline_v1(),
+        )
+        .await
+        .unwrap();
+    let elapsed = started.elapsed();
+
+    assert!(
+        elapsed < std::time::Duration::from_millis(300),
+        "the registry must be CUT near the 100ms deadline, not run B's 400ms - took {elapsed:?}"
+    );
+    for (i, o) in res.outcomes().iter().enumerate() {
+        assert!(
+            matches!(o, KeyResolution::Unavailable(Unavailable::DeadlineExceeded)),
+            "key {i} must be Unavailable(DeadlineExceeded) after a cut, not a false Miss - got {o:?}"
+        );
+    }
+    assert!(!res.is_complete(), "a deadline-cut batch is not Completed");
+    assert_eq!(res.measurement().resource, ResourceOutcome::DeadlineCut);
+}
+
+// AC#2 (BLOCKER, generalized, REGISTRY path — codex): a key that mechanism A did NOT
+// authoritatively answer (NotAttempted) plus a genuine Miss from B is NOT an
+// authoritative Miss - it stays partial. THE bite the rank fold failed (Miss ranked
+// above NotAttempted): the key collapsed to Miss/Completed.
+#[tokio::test]
+async fn a_not_attempted_plus_miss_across_mechanisms_is_not_a_miss() {
+    let k = key(0x73);
+    let mut registry = MechanismRegistry::new();
+    registry
+        // A: does not authoritatively answer (NotAttempted).
+        .register(
+            MechanismId::GlobalDirectory,
+            Arc::new(NotAttemptedDirectory),
+        )
+        // B: genuinely Misses.
+        .register(
+            MechanismId::DirectHoldQuery,
+            Arc::new(RecordingDirectory {
+                id: MechanismId::DirectHoldQuery,
+                answer: Lookup::Miss,
+                log: Arc::new(Mutex::new(Vec::new())),
+            }),
+        );
+
+    let res = registry
+        .resolve(
+            &BatchResolveRequest::single(k),
+            &budget(),
+            &ExecutionPlan::fixed_baseline_v1(),
+        )
+        .await
+        .unwrap();
+
+    assert!(
+        !res.outcomes()[0].is_miss(),
+        "NotAttempted(A) + Miss(B) is NOT an authoritative Miss - got {:?}",
+        res.outcomes()[0]
+    );
+    assert!(
+        !res.outcomes()[0].is_authoritative(),
+        "the key is partial (not authoritatively resolved), not Completed"
+    );
+    assert!(!res.is_complete());
 }
 
 // AC#2 (deepened, registry precedence): a mechanism that is DEAD for key X is NEVER

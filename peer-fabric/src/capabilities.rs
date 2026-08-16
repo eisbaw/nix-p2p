@@ -47,12 +47,38 @@ use crate::resolve::{
 /// [`ProviderRecord::key`] IS the queried key, so a mechanism cannot smuggle holders of
 /// an un-asked key into this position. A holder set that is empty after binding is a
 /// [`Miss`](KeyResolution::Miss), not an empty `Found`.
-fn bind_found(key: &ContentKey, records: Vec<ProviderRecord>) -> KeyResolution {
+pub(crate) fn bind_found(key: &ContentKey, records: Vec<ProviderRecord>) -> KeyResolution {
     let bound: Vec<ProviderRecord> = records.into_iter().filter(|r| r.key == *key).collect();
     if bound.is_empty() {
         KeyResolution::Miss
     } else {
         KeyResolution::Found(bound)
+    }
+}
+
+/// The BOUND single-key discovery path (AC#4, structural). This is the ONLY sanctioned
+/// way to consume [`ProviderDirectory::find_providers`] directly: it is a FREE FUNCTION,
+/// not a trait method, so a buggy or hostile adapter CANNOT override it to skip the
+/// binding. It queries the directory for exactly `key` and then DROPS any returned
+/// record whose own [`ProviderRecord::key`] is not `key` (an un-asked holding), so a
+/// direct caller can never learn holders of a key it did not name. If every record is
+/// dropped the answer is an authoritative [`Miss`](Lookup::Miss), and a `Miss`/
+/// `Unavailable` passes through unchanged. Shipped direct callers (the daemon's NAR
+/// source and raw-serve probe) use THIS, not the raw trait method, so the same
+/// structural no-enumeration guarantee the batch path enforces holds on the direct path.
+pub async fn find_providers_bound(
+    directory: &dyn ProviderDirectory,
+    key: &ContentKey,
+    budget: &DiscoveryBudget,
+) -> Lookup<Vec<ProviderRecord>> {
+    match directory.find_providers(key, budget).await {
+        Lookup::Found(records) => match bind_found(key, records) {
+            KeyResolution::Found(bound) => Lookup::Found(bound),
+            // Every record named an un-asked key and was dropped: an authoritative Miss,
+            // never a leak of un-named holdings.
+            _ => Lookup::Miss,
+        },
+        other => other,
     }
 }
 

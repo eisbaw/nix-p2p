@@ -259,6 +259,20 @@ impl Libp2pFabric {
     /// The swarm handle, so connectivity (listen / dial / bootstrap) can be driven.
     /// TASK-151 will fold the standard connectivity setup behind a config; for now the
     /// composition root / tests drive it explicitly.
+    ///
+    /// The handle deliberately does NOT expose raw publishing: `put_record` /
+    /// `start_providing` are `pub(crate)` (TASK-100 codex BLOCKER, AC#6), so an external
+    /// caller holding this handle CANNOT publish an unverified value to the kad DHT -
+    /// the verified [`crate::Libp2pAvailabilityAnnouncer`] is the only publisher. This is
+    /// enforced at compile time; the doc-test below is a COMPILE-GUARD proving the raw
+    /// publish is not publicly reachable (it fails with E0624, "method is private"):
+    ///
+    /// ```compile_fail,E0624
+    /// # async fn raw_publish_is_sealed(fabric: fabric_libp2p::Libp2pFabric) {
+    /// // `put_record` is pub(crate): an external caller cannot reach it through handle().
+    /// fabric.handle().put_record(todo!(), todo!(), todo!()).await.ok();
+    /// # }
+    /// ```
     pub fn handle(&self) -> &SwarmHandle {
         &self.handle
     }

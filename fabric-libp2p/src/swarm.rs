@@ -619,7 +619,15 @@ impl SwarmHandle {
     }
 
     /// Announce this node as a provider of `key` (the multi-provider index).
-    pub async fn start_providing(&self, key: kad::RecordKey) -> Result<(), String> {
+    ///
+    /// SEALED `pub(crate)` (TASK-100 codex BLOCKER, AC#6): the ONLY sanctioned publisher
+    /// is [`crate::Libp2pAvailabilityAnnouncer`], which VERIFIES the record's signature
+    /// (and, per TASK-231, its publication eligibility) BEFORE publishing. Exposing this
+    /// raw write publicly - reachable via the public [`crate::Libp2pFabric::handle`] -
+    /// would let a library caller publish an unverifiable value to the kad DHT while
+    /// skipping that check. Keeping it crate-private makes the verified announcer the
+    /// only path to `put_record`/`start_providing`.
+    pub(crate) async fn start_providing(&self, key: kad::RecordKey) -> Result<(), String> {
         let (reply, rx) = oneshot::channel();
         self.send(Command::StartProviding { key, reply }).await;
         rx.await.unwrap_or_else(|_| Err("worker gone".into()))
@@ -632,7 +640,11 @@ impl SwarmHandle {
 
     /// Store `value` under `key` in the DHT value store (the signed record), expiring
     /// at `expires` (the record's own expiry, reconciled with the store TTL).
-    pub async fn put_record(
+    ///
+    /// SEALED `pub(crate)` (TASK-100 codex BLOCKER, AC#6), as [`SwarmHandle::start_providing`]:
+    /// the verified [`crate::Libp2pAvailabilityAnnouncer`] is the only publisher, so no
+    /// public raw-publish can skip the signature/eligibility check.
+    pub(crate) async fn put_record(
         &self,
         key: kad::RecordKey,
         value: Vec<u8>,

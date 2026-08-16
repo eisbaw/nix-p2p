@@ -776,13 +776,14 @@ impl MechanismRegistry {
             eprintln!("peer-fabric: resolver plan warning: {warning}");
         }
 
-        // Per-key aggregation across mechanisms, in plan order, folded by PRECEDENCE
-        // (AC#2): Found > Unavailable > Miss > NotAttempted. A key is a Miss ONLY if
-        // every consulted mechanism genuinely Missed it; ANY mechanism being Unavailable
-        // for the key keeps it Unavailable (retryable), so a dead mechanism can never be
-        // overwritten into a Miss - not even by a later mechanism's Miss.
+        // Per-key aggregation across mechanisms (AC#2, generalized). A key is an
+        // AUTHORITATIVE Miss ONLY if EVERY mechanism authoritatively Missed it. Every
+        // NON-authoritative outcome - Unavailable, NotAttempted, or a deadline cut -
+        // means "not authoritatively resolved", so it BLOCKS a Miss and keeps the key
+        // partial. A dead mechanism can never read as a Miss; and neither can a key one
+        // mechanism Missed but another never authoritatively answered.
         let len = request.keys().len();
-        let mut aggregated: Vec<KeyResolution> = vec![KeyResolution::NotAttempted; len];
+        let mut acc: Vec<KeyAcc> = vec![KeyAcc::default(); len];
         // Track whether THIS registry's total deadline actually cut the loop, so the
         // reported `resource` is a real event, consistent with is_complete()/is_partial().
         let mut deadline_cut = false;
@@ -792,9 +793,7 @@ impl MechanismRegistry {
             // held - never re-send an already-resolved key (MEDIUM: FirstHolder must not
             // forward resolved keys). Under AllMechanisms, always ask about every key.
             let pending: Vec<usize> = match plan.stop() {
-                StopCondition::FirstHolder => {
-                    (0..len).filter(|&i| !aggregated[i].is_found()).collect()
-                }
+                StopCondition::FirstHolder => (0..len).filter(|&i| !acc[i].is_found()).collect(),
                 StopCondition::AllMechanisms => (0..len).collect(),
             };
             if pending.is_empty() {
@@ -822,6 +821,9 @@ impl MechanismRegistry {
             {
                 Ok(resolution) => resolution,
                 Err(_elapsed) => {
+                    // The overrun cut the loop: the still-pending keys were NOT
+                    // authoritatively resolved by this mechanism, so they stay partial
+                    // (handled fail-closed below), never a fabricated Miss.
                     deadline_cut = true;
                     break;
                 }
@@ -838,19 +840,30 @@ impl MechanismRegistry {
                     sub_outcomes.len(),
                     pending.len()
                 );
-                let unavailable = KeyResolution::Unavailable(Unavailable::Backend(
-                    "misaligned batch reply".into(),
-                ));
                 for &i in &pending {
-                    fold_key(&mut aggregated[i], &unavailable);
+                    acc[i].note_unavailable(Unavailable::Backend("misaligned batch reply".into()));
                 }
                 continue;
             }
             for (pos, &i) in pending.iter().enumerate() {
-                fold_key(&mut aggregated[i], &sub_outcomes[pos]);
+                acc[i].note(&sub_outcomes[pos]);
             }
         }
 
+        // AC#3 (BLOCKER, registry path): on a deadline cut, EVERY still-pending (not
+        // Found) key is Unavailable(DeadlineExceeded) - the envelope was cut before it
+        // could be authoritatively resolved. This overrides any Miss a mechanism gave it
+        // (a Miss is authoritative only if the WHOLE consultation completed), so a cut
+        // never leaves a false Miss/Completed.
+        if deadline_cut {
+            for a in acc.iter_mut() {
+                if !a.is_found() {
+                    a.note_unavailable(Unavailable::DeadlineExceeded);
+                }
+            }
+        }
+
+        let aggregated: Vec<KeyResolution> = acc.into_iter().map(KeyAcc::finalize).collect();
         let latency_ns = u64::try_from(start.elapsed().as_nanos()).unwrap_or(u64::MAX);
         let complete = aggregated.iter().all(KeyResolution::is_authoritative);
         let any_unavailable = aggregated.iter().any(KeyResolution::is_unavailable);
@@ -871,8 +884,8 @@ impl MechanismRegistry {
             // envelope ran to completion.
             ResourceOutcome::Completed
         };
-        // The aggregate is bound per queried key (each folded Found came from a
-        // for_request-bound sub-resolution mapped to its position), so `new` is safe.
+        // The aggregate is bound per queried key (each Found came from a for_request-bound
+        // sub-resolution mapped to its position), so `new` is safe.
         Ok(BatchResolution::new(
             aggregated,
             MechanismMeasurement {
@@ -884,22 +897,65 @@ impl MechanismRegistry {
     }
 }
 
-/// Fold `incoming` into `slot` by AC#2 precedence, highest-first: Found(3), then
-/// Unavailable(2), then Miss(1), then NotAttempted(0). A strictly-higher-precedence
-/// outcome replaces the slot; a tie or lower keeps the slot (first-wins for a Found's
-/// holder set / an Unavailable's reason). This is what makes an Unavailable impossible
-/// to overwrite with a Miss.
-fn fold_key(slot: &mut KeyResolution, incoming: &KeyResolution) {
-    fn rank(o: &KeyResolution) -> u8 {
-        match o {
-            KeyResolution::NotAttempted => 0,
-            KeyResolution::Miss => 1,
-            KeyResolution::Unavailable(_) => 2,
-            KeyResolution::Found(_) => 3,
+/// Per-key cross-mechanism accumulator (AC#2). It records the DISTINCT facts each
+/// mechanism reported about a key and finalizes them by the rule "authoritative Miss
+/// only if EVERY mechanism authoritatively Missed". Unlike a precedence-max fold, it
+/// cannot let a Miss win over a NotAttempted: any non-authoritative outcome blocks the
+/// Miss and keeps the key partial.
+#[derive(Clone, Default)]
+struct KeyAcc {
+    /// The first Found holder set for this key (a Found is terminal - it wins).
+    found: Option<Vec<ProviderRecord>>,
+    /// The first Unavailable reason a mechanism reported (a dead/cut mechanism).
+    unavailable: Option<Unavailable>,
+    /// At least one mechanism authoritatively Missed this key.
+    saw_miss: bool,
+    /// At least one mechanism did NOT authoritatively answer (returned NotAttempted).
+    saw_not_authoritative: bool,
+}
+
+impl KeyAcc {
+    fn is_found(&self) -> bool {
+        self.found.is_some()
+    }
+
+    /// Fold one mechanism's outcome for this key.
+    fn note(&mut self, outcome: &KeyResolution) {
+        match outcome {
+            KeyResolution::Found(records) => {
+                if self.found.is_none() {
+                    self.found = Some(records.clone());
+                }
+            }
+            KeyResolution::Unavailable(why) => self.note_unavailable(why.clone()),
+            KeyResolution::Miss => self.saw_miss = true,
+            KeyResolution::NotAttempted => self.saw_not_authoritative = true,
         }
     }
-    if rank(incoming) > rank(slot) {
-        *slot = incoming.clone();
+
+    fn note_unavailable(&mut self, why: Unavailable) {
+        if self.unavailable.is_none() {
+            self.unavailable = Some(why);
+        }
+    }
+
+    /// Decide the key's final outcome. Found wins; else any Unavailable reason (a dead
+    /// or cut mechanism); else a NON-authoritative gap (NotAttempted) keeps it partial;
+    /// else an authoritative Miss (every mechanism Missed); else never consulted.
+    fn finalize(self) -> KeyResolution {
+        if let Some(records) = self.found {
+            KeyResolution::Found(records)
+        } else if let Some(why) = self.unavailable {
+            KeyResolution::Unavailable(why)
+        } else if self.saw_not_authoritative {
+            // A mechanism did not authoritatively answer, so this is NOT an authoritative
+            // Miss - it is partial (a caller must not read it as absence).
+            KeyResolution::NotAttempted
+        } else if self.saw_miss {
+            KeyResolution::Miss
+        } else {
+            KeyResolution::NotAttempted
+        }
     }
 }
 
@@ -1005,35 +1061,39 @@ mod tests {
         );
     }
 
-    // AC#2 precedence: fold_key never lets a Miss overwrite an Unavailable, and a key is
-    // Miss only if no mechanism was Unavailable for it (Found > Unavailable > Miss >
-    // NotAttempted). THE bite: the old max-authoritative fold let a Miss win here.
+    // AC#2 (generalized): KeyAcc makes a key Miss ONLY if EVERY mechanism authoritatively
+    // Missed. Any non-authoritative outcome - Unavailable OR NotAttempted - blocks the
+    // Miss and keeps the key partial. THE bite the old rank fold failed: Miss + NotAttempted.
     #[test]
-    fn fold_key_precedence_keeps_unavailable_over_miss() {
-        // Unavailable then Miss -> stays Unavailable.
-        let mut slot = KeyResolution::Unavailable(Unavailable::BootstrapOutage);
-        fold_key(&mut slot, &KeyResolution::Miss);
+    fn key_acc_miss_requires_every_mechanism_to_authoritatively_miss() {
+        // Miss + NotAttempted -> NOT an authoritative Miss (the rank fold wrongly gave Miss).
+        let mut a = KeyAcc::default();
+        a.note(&KeyResolution::Miss);
+        a.note(&KeyResolution::NotAttempted);
         assert!(
-            slot.is_unavailable(),
-            "a Miss must not overwrite an Unavailable"
+            !a.clone().finalize().is_miss(),
+            "a key one mechanism Missed and another did not authoritatively answer is NOT a Miss"
         );
+        assert!(!a.finalize().is_authoritative());
 
-        // Miss then Unavailable -> upgrades to Unavailable.
-        let mut slot = KeyResolution::Miss;
-        fold_key(
-            &mut slot,
-            &KeyResolution::Unavailable(Unavailable::Partition),
-        );
-        assert!(slot.is_unavailable(), "an Unavailable must upgrade a Miss");
+        // Miss + Unavailable -> Unavailable (a dead mechanism never reads as a Miss).
+        let mut a = KeyAcc::default();
+        a.note(&KeyResolution::Miss);
+        a.note(&KeyResolution::Unavailable(Unavailable::BootstrapOutage));
+        assert!(a.finalize().is_unavailable());
 
-        // Found beats everything; nothing overwrites a Found.
-        let mut slot = KeyResolution::Found(vec![record(key(1))]);
-        fold_key(
-            &mut slot,
-            &KeyResolution::Unavailable(Unavailable::Partition),
-        );
-        fold_key(&mut slot, &KeyResolution::Miss);
-        assert!(slot.is_found());
+        // Miss by EVERY mechanism -> an authoritative Miss.
+        let mut a = KeyAcc::default();
+        a.note(&KeyResolution::Miss);
+        a.note(&KeyResolution::Miss);
+        assert!(a.finalize().is_miss());
+
+        // Found wins over everything.
+        let mut a = KeyAcc::default();
+        a.note(&KeyResolution::Miss);
+        a.note(&KeyResolution::Unavailable(Unavailable::Partition));
+        a.note(&KeyResolution::Found(vec![record(key(1))]));
+        assert!(a.finalize().is_found());
     }
 
     // AC#2/AC#4: a resolution is positional over the asker's keys; aligned_with is the

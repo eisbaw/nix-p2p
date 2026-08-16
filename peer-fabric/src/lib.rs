@@ -56,7 +56,7 @@ pub use budget::{AnnounceBudget, DiscoveryBudget, SafetyEnvelope, ServeBudget};
 pub use capabilities::{
     AnnounceError, AvailabilityAnnouncer, HoldAnswer, HoldMisalignment, LocalPeerDiscovery,
     NarServer, NarTransfer, NodeLocator, PeerHoldQuery, PeerHoldReply, PeerHoldRequest,
-    ProviderDirectory, Receipt, ServeError, ServeHandle, TransferError,
+    ProviderDirectory, Receipt, ServeError, ServeHandle, TransferError, find_providers_bound,
 };
 pub use codec::{
     ACCEPT_RAW, ACCEPT_RAW_AND_ZSTD, ACCEPT_ZSTD, BoundedZstdDecoder, CODEC_RAW, CODEC_ZSTD,
