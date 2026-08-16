@@ -49,6 +49,7 @@ mod outcome;
 mod record_codec;
 mod record_store;
 mod require;
+mod resolve;
 
 pub use budget::{AnnounceBudget, DiscoveryBudget, SafetyEnvelope, ServeBudget};
 pub use capabilities::{
@@ -86,3 +87,9 @@ pub use record_codec::{
 };
 pub use record_store::{ApplyOutcome, ProviderRecordSet, SlotFloor};
 pub use require::{Axis, MissingAxes, require_axes};
+pub use resolve::{
+    BatchMisalignment, BatchResolution, BatchResolveRequest, ControlBytes, DirectoryCapabilities,
+    ExecutionPlan, ExecutionPlanVersion, KeyResolution, MechanismId, MechanismMeasurement,
+    MechanismOrder, MechanismRegistry, Parallelism, PlanExecError, PlanProvenance, ResourceOutcome,
+    StopCondition,
+};

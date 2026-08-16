@@ -8,8 +8,8 @@ use std::sync::{Arc, Mutex};
 use async_trait::async_trait;
 use libp2p::PeerId;
 use peer_fabric::{
-    ApplyOutcome, ContentKey, Disclosed, DiscoveryBudget, Exposure, ExposureLedger,
-    ExposureSurface, Lookup, ProviderAssertion, ProviderDirectory, ProviderRecord,
+    ApplyOutcome, ContentKey, DirectoryCapabilities, Disclosed, DiscoveryBudget, Exposure,
+    ExposureLedger, ExposureSurface, Lookup, ProviderAssertion, ProviderDirectory, ProviderRecord,
     ProviderRecordSet, Recipient, RecordDecodeError, Unavailable, decode_provider_assertion,
 };
 
@@ -396,6 +396,22 @@ impl ProviderDirectory for Libp2pProviderDirectory {
         match tokio::time::timeout(budget.deadline, self.resolve(key, budget.max_peers)).await {
             Ok(lookup) => lookup,
             Err(_elapsed) => Lookup::Unavailable(Unavailable::DeadlineExceeded),
+        }
+    }
+
+    fn capabilities(&self) -> DirectoryCapabilities {
+        // The kad directory is GLOBAL exact-key discovery (a value store that answers
+        // WITHOUT the provider online), and it measures its consultation latency (the
+        // trait's default batch path times the wall clock). It resolves each key with
+        // an independent kad walk under the total deadline rather than a single batched
+        // wire round trip, so `batched_roundtrip` is false; it does not yet count its
+        // control-plane bytes (`measures_control_bytes` false - an honest "not
+        // instrumented", not a claim of zero cost).
+        DirectoryCapabilities {
+            global: true,
+            batched_roundtrip: false,
+            measures_latency: true,
+            measures_control_bytes: false,
         }
     }
 

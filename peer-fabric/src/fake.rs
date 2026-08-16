@@ -24,6 +24,7 @@ use crate::exposure::{Exposure, ExposureLedger, ExposureSurface};
 use crate::fabric::{PeerFabric, TransferRegistry};
 use crate::ids::{Blake3Digest, NodeId, TransportOffer, TransportTag};
 use crate::outcome::Lookup;
+use crate::resolve::DirectoryCapabilities;
 
 // -------------------------------------------------------------------------
 // Per-axis fakes. Each holds the shared ledger and records its configured
@@ -31,9 +32,15 @@ use crate::outcome::Lookup;
 // -------------------------------------------------------------------------
 
 /// A [`ProviderDirectory`] that returns a configured [`Lookup`] and records a
-/// configured exposure. Lets a test choose Found / Miss / Unavailable per key class.
+/// configured exposure. Lets a test choose Found / Miss / Unavailable per key class,
+/// either uniformly (`result`) or PER KEY (`keyed`, for batch tests where different
+/// asked keys must resolve differently). Its batch behaviour is the trait's default
+/// (loop the single-key path under the total deadline), so a test also exercises that
+/// default; the declared [`DirectoryCapabilities`] are overridable.
 pub struct FakeProviderDirectory {
     result: Lookup<Vec<ProviderRecord>>,
+    keyed: HashMap<ContentKey, Lookup<Vec<ProviderRecord>>>,
+    capabilities: DirectoryCapabilities,
     on_call: Vec<Exposure>,
     surface: ExposureSurface,
     ledger: Arc<ExposureLedger>,
@@ -50,10 +57,35 @@ impl FakeProviderDirectory {
     ) -> Self {
         FakeProviderDirectory {
             result,
+            keyed: HashMap::new(),
+            capabilities: DirectoryCapabilities::conservative(),
             on_call,
             surface,
             ledger,
         }
+    }
+
+    /// Route `key` to `result`, overriding the uniform answer for THIS key only. Lets
+    /// a batch test map different asked keys to Found / Miss / Unavailable.
+    pub fn with_key_result(mut self, key: ContentKey, result: Lookup<Vec<ProviderRecord>>) -> Self {
+        self.keyed.insert(key, result);
+        self
+    }
+
+    /// Declare non-default a-priori [`DirectoryCapabilities`] (AC#3), e.g. to model a
+    /// global directory in a seam test.
+    pub fn with_capabilities(mut self, capabilities: DirectoryCapabilities) -> Self {
+        self.capabilities = capabilities;
+        self
+    }
+
+    /// The answer for `key`: its per-key override if one is set, else the uniform
+    /// `result`.
+    fn answer_for(&self, key: &ContentKey) -> Lookup<Vec<ProviderRecord>> {
+        self.keyed
+            .get(key)
+            .cloned()
+            .unwrap_or_else(|| self.result.clone())
     }
 }
 
@@ -61,11 +93,15 @@ impl FakeProviderDirectory {
 impl ProviderDirectory for FakeProviderDirectory {
     async fn find_providers(
         &self,
-        _key: &ContentKey,
+        key: &ContentKey,
         _budget: &DiscoveryBudget,
     ) -> Lookup<Vec<ProviderRecord>> {
         self.ledger.record_all(self.on_call.iter().copied());
-        self.result.clone()
+        self.answer_for(key)
+    }
+
+    fn capabilities(&self) -> DirectoryCapabilities {
+        self.capabilities
     }
 
     fn declared_exposure(&self) -> ExposureSurface {

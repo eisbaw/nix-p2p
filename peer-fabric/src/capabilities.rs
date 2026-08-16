@@ -29,6 +29,8 @@
 //! incurs are first-class, so an operator can turn address discovery off
 //! independently of everything else.
 
+use std::time::{Duration, Instant};
+
 use async_trait::async_trait;
 
 use crate::budget::{AnnounceBudget, DiscoveryBudget, SafetyEnvelope, ServeBudget};
@@ -36,6 +38,10 @@ use crate::content::{ContentKey, DialInfo, ProviderRecord, ResolutionPolicy};
 use crate::exposure::ExposureSurface;
 use crate::ids::{Blake3Digest, NodeId, TransportOffer, TransportTag};
 use crate::outcome::Lookup;
+use crate::resolve::{
+    BatchResolution, BatchResolveRequest, ControlBytes, DirectoryCapabilities, KeyResolution,
+    MechanismMeasurement, ResourceOutcome,
+};
 
 // -------------------------------------------------------------------------
 // Axis 3a - global exact-key content discovery.
@@ -62,6 +68,79 @@ pub trait ProviderDirectory: Send + Sync {
         key: &ContentKey,
         budget: &DiscoveryBudget,
     ) -> Lookup<Vec<ProviderRecord>>;
+
+    /// BATCH-resolve every asker-named key in `request` to its holders, within the
+    /// caller's TOTAL `budget` (TASK-100 AC#1). The answer is a positional
+    /// [`BatchResolution`] over exactly the request's keys, carrying no keys of its own
+    /// (AC#4), one TYPED [`KeyResolution`] each (AC#2), plus the consultation's
+    /// [`MechanismMeasurement`] (AC#3).
+    ///
+    /// The DEFAULT implementation resolves each key with the single-key
+    /// [`find_providers`](ProviderDirectory::find_providers) primitive under the
+    /// REMAINING share of the caller's total deadline, so a batch is bounded IN TOTAL
+    /// (AC#3, composing with TASK-106's total-deadline discipline rather than
+    /// double-bounding it) and a single-key batch is byte-for-byte the single-key path
+    /// (AC#1 compatibility). Keys reached after the total deadline is spent are typed
+    /// [`KeyResolution::NotAttempted`] - a PARTIAL result, never a false
+    /// [`Miss`](KeyResolution::Miss). A backend with a true batched wire round trip may
+    /// override this and declare [`DirectoryCapabilities::batched_roundtrip`].
+    async fn resolve_batch(
+        &self,
+        request: &BatchResolveRequest,
+        budget: &DiscoveryBudget,
+    ) -> BatchResolution {
+        let start = Instant::now();
+        let mut outcomes = Vec::with_capacity(request.keys().len());
+        let mut cut = false;
+        for key in request.keys() {
+            if cut {
+                // The total deadline is already spent: every remaining key is a typed
+                // PARTIAL marker, distinct from an authoritative Miss.
+                outcomes.push(KeyResolution::NotAttempted);
+                continue;
+            }
+            let remaining = budget
+                .deadline
+                .checked_sub(start.elapsed())
+                .unwrap_or(Duration::ZERO);
+            if remaining.is_zero() {
+                cut = true;
+                outcomes.push(KeyResolution::NotAttempted);
+                continue;
+            }
+            // Bound THIS key by the REMAINING total budget, so the sum is bounded by the
+            // caller's deadline (never per-key deadline * N).
+            let sub_budget = DiscoveryBudget::new(remaining, budget.max_peers);
+            let outcome = match self.find_providers(key, &sub_budget).await {
+                Lookup::Found(records) => KeyResolution::Found(records),
+                Lookup::Miss => KeyResolution::Miss,
+                Lookup::Unavailable(why) => KeyResolution::Unavailable(why),
+            };
+            outcomes.push(outcome);
+        }
+        let latency_ns = u64::try_from(start.elapsed().as_nanos()).unwrap_or(u64::MAX);
+        let resource = if cut {
+            ResourceOutcome::DeadlineCut
+        } else {
+            ResourceOutcome::Completed
+        };
+        BatchResolution::new(
+            outcomes,
+            MechanismMeasurement {
+                observed_latency_ns: latency_ns,
+                control_bytes: ControlBytes::NotInstrumented,
+                resource,
+            },
+        )
+    }
+
+    /// What this directory CAN do, declared a-priori (AC#3): whether it is global,
+    /// whether it batches on the wire, and which measurements it reports. The default
+    /// is [`DirectoryCapabilities::conservative`]; a real backend overrides it (e.g. a
+    /// DHT directory declares itself global).
+    fn capabilities(&self) -> DirectoryCapabilities {
+        DirectoryCapabilities::conservative()
+    }
 
     /// The a-priori exposure this directory WILL incur when enabled (AC#3), for
     /// TASK-120 preflight - computed from config, discloses nothing itself.
