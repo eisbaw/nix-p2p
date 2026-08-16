@@ -658,6 +658,7 @@ async fn warm_on_disk_correlation_survives_past_positive_ttl() {
     // fetch() would now MISS (TTL honoured), but correlation still resolves.
     let meta = cache
         .meta_for_token(TOKEN)
+        .await
         .expect("correlation survives TTL expiry");
     assert_eq!(meta.nar_hash.as_str(), NARHASH);
     assert_eq!(meta.nar_size, NARSIZE);

@@ -35,6 +35,8 @@
 use std::collections::HashMap;
 use std::sync::RwLock;
 
+use async_trait::async_trait;
+
 use crate::source::{NarCompression, NarHash, NarPathToken, NarinfoTransport};
 
 /// What the catalog remembers about one NAR, learned from its narinfo.
@@ -61,9 +63,16 @@ pub struct NarMeta {
 ///
 /// FORWARD-ONLY (`token -> meta`), like [`NarCatalog`]: a NAR request has the
 /// token and needs the hash. The lossy reverse map is deliberately not revived.
+///
+/// ASYNC (TASK-28): the disk-backed implementation re-reads and re-parses a
+/// `.nic` file, which is blocking `std::fs`. Making the trait method `async` lets
+/// that impl push the read onto `spawn_blocking` so a `/nar/<token>` request never
+/// stalls a Tokio worker on a slow disk. In-memory implementations (e.g.
+/// [`NullCorrelation`]) simply return without awaiting anything.
+#[async_trait]
 pub trait CorrelationStore: Send + Sync {
     /// The correlation persisted for this URL token, if any.
-    fn meta_for_token(&self, token: &str) -> Option<NarMeta>;
+    async fn meta_for_token(&self, token: &str) -> Option<NarMeta>;
 }
 
 /// A [`CorrelationStore`] that knows nothing - the default when no persistent
@@ -73,8 +82,9 @@ pub trait CorrelationStore: Send + Sync {
 #[derive(Debug, Default, Clone, Copy)]
 pub struct NullCorrelation;
 
+#[async_trait]
 impl CorrelationStore for NullCorrelation {
-    fn meta_for_token(&self, _token: &str) -> Option<NarMeta> {
+    async fn meta_for_token(&self, _token: &str) -> Option<NarMeta> {
         None
     }
 }

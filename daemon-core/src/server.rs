@@ -197,10 +197,13 @@ async fn handle(req: Request<Incoming>, app: Arc<App>) -> Response<NarBody> {
             // narinfos, so a warm-on-disk-but-cold-in-memory daemon still carries
             // the signed hash. Only when BOTH miss do we fall back to the raw URL
             // token - the documented cold-start degenerate (PRD risk 2).
-            let correlated = app
-                .catalog
-                .meta_for_token(token.as_str())
-                .or_else(|| app.correlation.meta_for_token(token.as_str()));
+            // In-memory catalog first (cheap, non-blocking); on a miss consult the
+            // PERSISTED store, whose disk re-parse is `async` (TASK-28: run
+            // off-worker) so it never stalls a Tokio worker on the NAR path.
+            let correlated = match app.catalog.meta_for_token(token.as_str()) {
+                Some(meta) => Some(meta),
+                None => app.correlation.meta_for_token(token.as_str()).await,
+            };
             // Capture the inbound token for the log's `path=` before it is moved
             // into the key; it is the exact NAR locator the client asked for.
             let nar_token = token.as_str().to_string();

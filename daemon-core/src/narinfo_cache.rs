@@ -312,10 +312,15 @@ impl Bookkeeping {
     }
 }
 
-/// Persistent narinfo cache over an inner source.
-pub struct NarinfoDiskCache {
+/// Disk + bookkeeping state, split out of [`NarinfoDiskCache`] so the blocking
+/// `std::fs` work - ESPECIALLY the fsync-heavy `write_durably`/sidecar path - can
+/// be handed to [`tokio::task::spawn_blocking`] and never runs on a Tokio worker
+/// thread (TASK-28). Every method on `Shared` is synchronous blocking I/O; the
+/// async [`NarinfoSource`]/[`CorrelationStore`] layer on [`NarinfoDiskCache`] owns
+/// the `.await`. Held behind an `Arc` so a blocking closure can capture it
+/// `'static` and outlive the poll that dispatched it.
+struct Shared {
     root: PathBuf,
-    inner: std::sync::Arc<dyn NarinfoSource>,
     clock: std::sync::Arc<dyn Clock>,
     positive_ttl: Duration,
     negative_ttl: Duration,
@@ -328,6 +333,17 @@ pub struct NarinfoDiskCache {
     /// The single in-memory source of truth for liveness, LRU order and
     /// correlation. A derived view of the `.nic` files, mirrored to the sidecar.
     book: RwLock<Bookkeeping>,
+}
+
+/// Persistent narinfo cache over an inner source. The async facade: it fronts the
+/// blocking [`Shared`] disk state, dispatching every disk touch (read+validate,
+/// the durable install, the correlation re-parse) onto
+/// [`tokio::task::spawn_blocking`] so the `sync_all` fsync never stalls a Tokio
+/// worker (TASK-28). The `inner` async source stays here (it is `.await`ed, not
+/// blocking), so only the pure-disk state moves behind the `Arc`.
+pub struct NarinfoDiskCache {
+    shared: std::sync::Arc<Shared>,
+    inner: std::sync::Arc<dyn NarinfoSource>,
 }
 
 impl NarinfoDiskCache {
@@ -349,6 +365,11 @@ impl NarinfoDiskCache {
     /// restart path); if the sidecar is absent or unreadable it falls back to a
     /// one-time full scan and then writes the sidecar. Fails fast if `root` cannot
     /// be created.
+    ///
+    /// This runs at WIRING time (once, at daemon start), NOT on the async fetch
+    /// path, so its blocking directory setup + one-shot index warm-up are kept
+    /// synchronous on purpose: TASK-28 moves the PER-REQUEST disk work off-worker
+    /// (read/install/correlation), not this one-time construction cost.
     pub fn with_max_entries(
         root: impl Into<PathBuf>,
         inner: std::sync::Arc<dyn NarinfoSource>,
@@ -368,20 +389,21 @@ impl NarinfoDiskCache {
                 let _ = std::fs::remove_file(entry.path());
             }
         }
-        let cache = NarinfoDiskCache {
+        let shared = std::sync::Arc::new(Shared {
             root,
-            inner,
             clock,
             positive_ttl: POSITIVE_TTL,
             negative_ttl: NEGATIVE_TTL,
             max_entries,
             tmp_seq: AtomicU64::new(0),
             book: RwLock::new(Bookkeeping::default()),
-        };
-        cache.load_index();
-        Ok(cache)
+        });
+        shared.load_index();
+        Ok(NarinfoDiskCache { shared, inner })
     }
+}
 
+impl Shared {
     /// Path of the sidecar index file.
     fn index_path(&self) -> PathBuf {
         self.root.join(INDEX_FILE)
@@ -693,6 +715,44 @@ impl NarinfoDiskCache {
             book.insert(store_hash, decoded.fetched_at, token);
         }
     }
+
+    /// Blocking core of [`CorrelationStore::meta_for_token`]: the `token -> hash`
+    /// index gives a candidate store_hash, and the authoritative answer is
+    /// re-parsed from the actual `.nic` on disk so it cannot drift from the bytes.
+    /// The `std::fs::read` + decode here is the disk I/O the async trait impl runs
+    /// off-worker (TASK-28).
+    fn meta_for_token(&self, token: &str) -> Option<NarMeta> {
+        // TTL ASYMMETRY (intentional): unlike `fetch`, correlation does NOT honour
+        // the positive TTL - a present positive entry yields correlation even past
+        // 30 days. `token -> NarHash` is effectively immutable (the token embeds
+        // the content-addressed FileHash), so the mapping does not go stale; and
+        // expiring it would drop a warm daemon back to the `UpstreamPath` fallback,
+        // which a p2p-only wave-2 NarSource cannot resolve. So we keep it available.
+        // See `warm_on_disk_correlation_survives_past_positive_ttl` for the guard.
+        let store_hash = self
+            .book
+            .read()
+            .expect("book poisoned")
+            .token_index
+            .get(token)
+            .cloned()?;
+        let path = self.entry_path(&store_hash)?;
+        let raw = std::fs::read(&path).ok()?;
+        let entry = Entry::decode(&raw)?;
+        if entry.kind != EntryKind::Positive {
+            return None;
+        }
+        let c = crate::catalog::parse_correlation(&entry.body)?;
+        // Confirm the file really carries THIS token (guards a stale index entry).
+        if c.token.as_str() != token {
+            return None;
+        }
+        Some(NarMeta {
+            nar_hash: NarHash::new(c.nar_hash.as_str()),
+            nar_size: c.nar_size,
+            transport: c.transport,
+        })
+    }
 }
 
 #[async_trait]
@@ -710,7 +770,17 @@ impl NarinfoSource for NarinfoDiskCache {
     ) -> Result<UpstreamResponse, SourceError> {
         // 1. Disk hit (fresh, valid): serve verbatim, upstream untouched. A HIT
         // issues NO upstream request, so the chain budget does not apply here.
-        if let Some(entry) = self.read_fresh(store_hash.as_str()) {
+        // The read + frame-decode + TTL check is blocking `std::fs`, so it runs
+        // OFF the Tokio worker on a `spawn_blocking` thread (TASK-28) - the worker
+        // stays free to poll other connections while a slow disk answers.
+        let hit = {
+            let shared = std::sync::Arc::clone(&self.shared);
+            let key = store_hash.as_str().to_string();
+            tokio::task::spawn_blocking(move || shared.read_fresh(&key))
+                .await
+                .expect("narinfo cache read task panicked")
+        };
+        if let Some(entry) = hit {
             return Ok(match entry.kind {
                 EntryKind::Positive => positive_response(entry.body),
                 EntryKind::Negative => negative_response(),
@@ -724,15 +794,19 @@ impl NarinfoSource for NarinfoDiskCache {
         let status = resp.status;
 
         if status == 404 {
-            // Negative cache the absence, then return a fresh 404.
-            self.install(
-                store_hash.as_str(),
-                &Entry {
-                    kind: EntryKind::Negative,
-                    fetched_at: self.clock.now_unix_secs(),
-                    body: Vec::new(),
-                },
-            );
+            // Negative cache the absence off-worker (the install fsyncs), then
+            // return a fresh 404. The `fetched_at` stamp is read here (cheap, in
+            // memory) BEFORE the blocking install so ordering is unchanged.
+            let entry = Entry {
+                kind: EntryKind::Negative,
+                fetched_at: self.shared.clock.now_unix_secs(),
+                body: Vec::new(),
+            };
+            let shared = std::sync::Arc::clone(&self.shared);
+            let key = store_hash.as_str().to_string();
+            tokio::task::spawn_blocking(move || shared.install(&key, &entry))
+                .await
+                .expect("narinfo cache install task panicked");
             return Ok(negative_response());
         }
 
@@ -775,14 +849,20 @@ impl NarinfoSource for NarinfoDiskCache {
             && !crate::source::connection_header_is_malformed(&headers)
             && !crate::source::has_ambiguous_framing(&headers);
         if cacheable {
-            self.install(
-                store_hash.as_str(),
-                &Entry {
-                    kind: EntryKind::Positive,
-                    fetched_at: self.clock.now_unix_secs(),
-                    body: bytes.to_vec(),
-                },
-            );
+            // The durable install (tmp write + `sync_all` fsync + rename + parent-
+            // dir fsync + the sidecar rewrite under the book lock) is the sharp
+            // edge TASK-28 targets: run it OFF the worker. The exact same ordered
+            // sequence executes inside the closure - only the THREAD changes.
+            let entry = Entry {
+                kind: EntryKind::Positive,
+                fetched_at: self.shared.clock.now_unix_secs(),
+                body: bytes.to_vec(),
+            };
+            let shared = std::sync::Arc::clone(&self.shared);
+            let key = store_hash.as_str().to_string();
+            tokio::task::spawn_blocking(move || shared.install(&key, &entry))
+                .await
+                .expect("narinfo cache install task panicked");
         } else {
             eprintln!(
                 "narinfo-cache: upstream narinfo for {} not cacheable ({} bytes); not caching",
@@ -801,41 +881,19 @@ impl NarinfoSource for NarinfoDiskCache {
     }
 }
 
+#[async_trait]
 impl CorrelationStore for NarinfoDiskCache {
-    fn meta_for_token(&self, token: &str) -> Option<NarMeta> {
-        // TTL ASYMMETRY (intentional): unlike `fetch`, correlation does NOT honour
-        // the positive TTL - a present positive entry yields correlation even past
-        // 30 days. `token -> NarHash` is effectively immutable (the token embeds
-        // the content-addressed FileHash), so the mapping does not go stale; and
-        // expiring it would drop a warm daemon back to the `UpstreamPath` fallback,
-        // which a p2p-only wave-2 NarSource cannot resolve. So we keep it available.
-        // See `warm_on_disk_correlation_survives_past_positive_ttl` for the guard.
-        //
-        // The index gives us a candidate store_hash; the authoritative answer is
-        // re-parsed from the actual entry file so it cannot drift from the bytes.
-        let store_hash = self
-            .book
-            .read()
-            .expect("book poisoned")
-            .token_index
-            .get(token)
-            .cloned()?;
-        let path = self.entry_path(&store_hash)?;
-        let raw = std::fs::read(&path).ok()?;
-        let entry = Entry::decode(&raw)?;
-        if entry.kind != EntryKind::Positive {
-            return None;
-        }
-        let c = crate::catalog::parse_correlation(&entry.body)?;
-        // Confirm the file really carries THIS token (guards a stale index entry).
-        if c.token.as_str() != token {
-            return None;
-        }
-        Some(NarMeta {
-            nar_hash: NarHash::new(c.nar_hash.as_str()),
-            nar_size: c.nar_size,
-            transport: c.transport,
-        })
+    async fn meta_for_token(&self, token: &str) -> Option<NarMeta> {
+        // The correlation lookup re-reads and re-parses the `.nic` from disk, so
+        // it runs OFF the Tokio worker (TASK-28): a slow disk here must not stall
+        // the `/nar/<token>` request path. The blocking core lives on `Shared`;
+        // the semantics (index candidate -> authoritative re-parse, TTL-immune)
+        // are unchanged - only the thread differs.
+        let shared = std::sync::Arc::clone(&self.shared);
+        let token = token.to_string();
+        tokio::task::spawn_blocking(move || shared.meta_for_token(&token))
+            .await
+            .expect("narinfo cache correlation task panicked")
     }
 }
 
@@ -1154,9 +1212,8 @@ NarSize: 40";
     #[test]
     fn fuzz_hostile_cache_keys_never_escape_root() {
         let root = PathBuf::from("/var/cache/nixp2p-narinfo");
-        let cache = NarinfoDiskCache {
+        let shared = Shared {
             root: root.clone(),
-            inner: std::sync::Arc::new(NoopSource),
             clock: std::sync::Arc::new(SystemClock),
             positive_ttl: POSITIVE_TTL,
             negative_ttl: NEGATIVE_TTL,
@@ -1168,7 +1225,7 @@ NarSize: 40";
         let mut accepted = 0usize;
         for _ in 0..20_000 {
             let key = hostile_key(&mut rng);
-            match cache.entry_path(&key) {
+            match shared.entry_path(&key) {
                 None => {} // rejected: never touches the filesystem
                 Some(path) => {
                     accepted += 1;
@@ -1195,7 +1252,7 @@ NarSize: 40";
         }
         // Non-vacuous: a valid base32 key IS accepted (the fuzz can produce one).
         assert_eq!(
-            cache
+            shared
                 .entry_path("0a0lslqb6gbqnj6xqjlaljjqg6kgb3wz")
                 .unwrap(),
             root.join("0a0lslqb6gbqnj6xqjlaljjqg6kgb3wz.nic"),
@@ -1341,7 +1398,7 @@ NarSize: 40";
         .unwrap();
 
         {
-            let book = cache.book.read().unwrap();
+            let book = cache.shared.book.read().unwrap();
             assert_eq!(
                 book.records.len(),
                 2,
@@ -1387,9 +1444,120 @@ NarSize: 40";
         let dup = format!("{INDEX_MAGIC}\n{VALID_KEY}\t100\t\n{VALID_KEY}\t200\t\n");
         std::fs::write(root.join(INDEX_FILE), dup).unwrap();
         assert!(
-            cache.read_sidecar().is_none(),
+            cache.shared.read_sidecar().is_none(),
             "a duplicate-hash sidecar must be rejected wholesale"
         );
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    // ---- AC#1 bite: cache disk I/O runs OFF the Tokio worker ------------------
+
+    /// A `Clock` whose `now_unix_secs()` blocks for `sleep` once `armed`, standing
+    /// in for a slow disk/fsync. It returns a CONSTANT time (so TTL freshness is
+    /// unaffected - the entry never expires); only the WALL-CLOCK cost is injected.
+    /// `read_fresh` calls the clock AFTER decoding the entry, so the block lands
+    /// exactly inside the region TASK-28 moves onto `spawn_blocking`.
+    struct ArmableSlowClock {
+        armed: std::sync::atomic::AtomicBool,
+        sleep: Duration,
+    }
+    impl Clock for ArmableSlowClock {
+        fn now_unix_secs(&self) -> u64 {
+            if self.armed.load(Ordering::Relaxed) {
+                std::thread::sleep(self.sleep);
+            }
+            1000
+        }
+    }
+
+    /// THE AC#1 BITE. On a SINGLE-worker (`current_thread`) runtime the cache
+    /// serves a disk HIT whose read deliberately blocks for 800 ms (the armed
+    /// clock stands in for a slow fsync/disk). A concurrent 50 ms task is started
+    /// alongside it. If the blocking read runs OFF the worker (`spawn_blocking`,
+    /// TASK-28) the lone worker stays free to poll the 50 ms task, which finishes
+    /// FIRST. If the read runs ON the worker (the pre-TASK-28 code, or a mutation
+    /// that reverts the `spawn_blocking`) the single thread is stuck in
+    /// `thread::sleep(800ms)` and the 50 ms task cannot even start until the fetch
+    /// returns - so the fetch records FIRST and the assertion goes RED.
+    ///
+    /// MUTATION-PROOF: replace the `spawn_blocking(move || shared.read_fresh(&key))`
+    /// in `fetch_within` with a direct `self.shared.read_fresh(store_hash.as_str())`
+    /// and this test reddens (order becomes `["A", "B"]`).
+    #[test]
+    fn ac1_cache_read_runs_off_the_tokio_worker() {
+        static SEQ: AtomicU64 = AtomicU64::new(0);
+        let root = std::env::temp_dir().join(format!(
+            "nixp2p-nic-offworker-{}-{}",
+            std::process::id(),
+            SEQ.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+
+        let clock = std::sync::Arc::new(ArmableSlowClock {
+            armed: std::sync::atomic::AtomicBool::new(false),
+            sleep: Duration::from_millis(800),
+        });
+        let cache = std::sync::Arc::new(
+            NarinfoDiskCache::with_max_entries(
+                &root,
+                std::sync::Arc::new(NoopSource), // never consulted on a HIT
+                clock.clone(),
+                NonZeroUsize::new(10).unwrap(),
+            )
+            .unwrap(),
+        );
+
+        // Populate one valid, fresh entry directly (sync install; the clock is not
+        // armed yet, so this is fast). A later fetch of this key is a disk HIT.
+        cache.shared.install(
+            VALID_KEY,
+            &Entry {
+                kind: EntryKind::Positive,
+                fetched_at: 1000,
+                body: GOOD.to_vec(),
+            },
+        );
+        assert!(
+            root.join(format!("{VALID_KEY}.nic")).exists(),
+            "entry must be on disk so the fetch is a HIT (read_fresh reaches the clock)"
+        );
+
+        // Arm the clock so the HIT's `read_fresh` blocks 800 ms inside its read.
+        clock.armed.store(true, Ordering::Relaxed);
+
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let order: std::sync::Arc<std::sync::Mutex<Vec<&'static str>>> =
+            std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+
+        rt.block_on(async {
+            let a_cache = cache.clone();
+            let a_order = order.clone();
+            let a = tokio::spawn(async move {
+                let _ = a_cache.fetch(&StoreHash::new(VALID_KEY)).await;
+                a_order.lock().unwrap().push("A"); // the slow blocking fetch
+            });
+            // Let A be polled once so it dispatches its blocking read to the
+            // blocking pool and yields (returns Pending) before B starts timing.
+            tokio::task::yield_now().await;
+            // B: a fast concurrent task. Off-worker -> ~50 ms; on-worker it cannot
+            // run until A's 800 ms fetch completes.
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            order.lock().unwrap().push("B");
+            a.await.unwrap();
+        });
+
+        let seq = order.lock().unwrap().clone();
+        assert_eq!(
+            seq.first().copied(),
+            Some("B"),
+            "the cache read + its blocking clock/fsync must run OFF the worker: a \
+             concurrent 50ms task must finish before the 800ms-blocked fetch. Got \
+             {seq:?} (\"A\" first == the blocking read starved the worker)"
+        );
+
         std::fs::remove_dir_all(&root).unwrap();
     }
 }
