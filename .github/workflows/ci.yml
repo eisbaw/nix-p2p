@@ -4,7 +4,11 @@
 # invocation and nothing else. There is deliberately NO raw cargo / clippy /
 # ruff / python / nix build logic in this YAML - all gate logic lives in the
 # Justfile so a CI failure is reproduced locally by the identical `just` recipe.
-# The ONLY non-`just` steps are the Determinate Nix install + the flake cache.
+# The ONLY non-`just` step is the Determinate Nix install. (TASK-238: the
+# FlakeHub Cache step was removed - it could not authenticate on an unregistered
+# repo and only ever errored. Builds fall back to cache.nixos.org; correctness
+# over caching speed. Re-add a cache only via a path that needs no external
+# account.)
 #
 # The recipes assert they run inside the flake devShell (they require
 # NIX_P2P_TOOLCHAIN / NIX_P2P_PYTHON / NIX_P2P_NIX, exported by the devShell in
@@ -65,7 +69,8 @@ concurrency:
 
 permissions:
   contents: read
-  id-token: write  # required so FlakeHub Cache can authenticate via GitHub OIDC
+  # id-token: write was only needed for FlakeHub Cache's OIDC auth; the cache
+  # step is gone (TASK-238), so the extra token scope is dropped too.
 
 env:
   # The Justfile's `_headroom` guard refuses disk-heavy recipes below 15 GiB
@@ -86,13 +91,6 @@ jobs:
       # Determinate Nix installer (flakes + nix-command enabled by default).
       - name: Install Determinate Nix
         uses: DeterminateSystems/determinate-nix-action@v3
-      # FlakeHub Cache is the current Determinate cache (Magic Nix Cache was
-      # deprecated 2025-02-01). continue-on-error: caching is a SPEED
-      # optimization and must never gate correctness - if auth/cache is
-      # unavailable, builds simply fall back to cache.nixos.org.
-      - name: FlakeHub Cache
-        uses: DeterminateSystems/flakehub-cache-action@v3
-        continue-on-error: true
       - name: build
         run: nix develop -c just build
       - name: lint
@@ -111,9 +109,6 @@ jobs:
       - uses: actions/checkout@v4
       - name: Install Determinate Nix
         uses: DeterminateSystems/determinate-nix-action@v3
-      - name: FlakeHub Cache
-        uses: DeterminateSystems/flakehub-cache-action@v3
-        continue-on-error: true
       # NON-BLOCKING: `just audit` (cargo-deny) is RED against 4 real RustSec
       # advisories tracked in TASK-236. Kept visible in CI, not suppressed.
       # Remove continue-on-error once TASK-236 clears the advisories.
@@ -135,9 +130,6 @@ jobs:
       - uses: actions/checkout@v4
       - name: Install Determinate Nix
         uses: DeterminateSystems/determinate-nix-action@v3
-      - name: FlakeHub Cache
-        uses: DeterminateSystems/flakehub-cache-action@v3
-        continue-on-error: true
       - name: e2e
         run: nix develop -c just e2e
 
@@ -154,9 +146,6 @@ jobs:
       - uses: actions/checkout@v4
       - name: Install Determinate Nix
         uses: DeterminateSystems/determinate-nix-action@v3
-      - name: FlakeHub Cache
-        uses: DeterminateSystems/flakehub-cache-action@v3
-        continue-on-error: true
       - name: e2e-vm
         run: nix develop -c just e2e-vm
       - name: e2e-nat-vm

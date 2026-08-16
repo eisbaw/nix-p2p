@@ -516,14 +516,25 @@
         # worktree measured 44 GB). Pointing them all here collapses N target dirs
         # to ONE (~44 GB -> ~3 GB) and SERIALISES concurrent builds on cargo's target
         # lock - which is CORRECT here: TASK-109 established that concurrent builds
-        # are what make the gate non-deterministic. Absolute + under $HOME/.cache so
-        # it is OUTSIDE any /tmp worktree and shared by every copy. This affects only
+        # are what make the gate non-deterministic. Under $HOME/.cache so it is
+        # OUTSIDE any /tmp worktree and shared by every copy. This affects only
         # `nix develop` (interactive/agent builds); `nix build` / `nix flake check`
-        # use crane's own sandboxed target, so frozen artifacts are unaffected. Set
-        # as a devShell env ATTR (not a shellHook echo) per the owner's
-        # no-spammy-shellHook rule. `just reclaim` clears it.
-        CARGO_TARGET_DIR = "/home/mpedersen/.cache/nix-p2p-target";
-        # No shellHook: house rule forbids verbose devshell output.
+        # use crane's own sandboxed target, so frozen artifacts are unaffected.
+        #
+        # TASK-238 portability fix: this MUST be set in the shellHook, not as an env
+        # ATTR. A Nix string literal in the env attrs is baked at eval time and does
+        # NOT expand $HOME, so a literal froze the author's home path into the shell
+        # and every cargo invocation on any other machine/user (e.g. the CI runner,
+        # home /home/runner) failed with `failed to create directory
+        # '/home/mpedersen/.cache', Permission denied`. Setting it in the shellHook
+        # (bash, where $HOME expands) makes it portable while keeping the persistent,
+        # out-of-tree, shared target intent. The `:-` keeps a caller-provided
+        # CARGO_TARGET_DIR authoritative. This is an `export`, not an `echo`, so it
+        # respects the owner's no-spammy-shellHook rule. `just reclaim` reads the
+        # same var and clears it.
+        shellHook = ''
+          export CARGO_TARGET_DIR="''${CARGO_TARGET_DIR:-$HOME/.cache/nix-p2p-target}"
+        '';
       };
     };
 }

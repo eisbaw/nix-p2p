@@ -91,8 +91,11 @@ clean_cargo_dir() {
 }
 # Resolve to real paths so the repo-local ./target and a shared CARGO_TARGET_DIR that
 # happen to be the same place are not cleared twice.
+# The $HOME/.cache/nix-p2p-target default mirrors the devShell shellHook (flake.nix,
+# TASK-238): CARGO_TARGET_DIR is normally inherited from `nix develop`, but list the
+# HOME-based default too so a reclaim run WITHOUT that env still clears the shared dir.
 declare -A seen_target=()
-for candidate in "${repo_root}/target" "${CARGO_TARGET_DIR:-}"; do
+for candidate in "${repo_root}/target" "${CARGO_TARGET_DIR:-$HOME/.cache/nix-p2p-target}"; do
     [[ -n "${candidate}" ]] || continue
     real=$(readlink -f "${candidate}" 2>/dev/null || echo "${candidate}")
     [[ -n "${seen_target[${real}]:-}" ]] && continue
