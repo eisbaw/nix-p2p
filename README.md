@@ -131,7 +131,10 @@ public-swarm results are still out.
   one is dead; ≥3 independent bootstrap nodes with resolution surviving the loss of any
   one; signed provider records with monotonic-sequence replay/rollback rejection and
   signed-withdrawal tombstones; and a bounded provider index an attacker cannot grow
-  without limit by announcing arbitrary keys.
+  without limit by announcing arbitrary keys. The bounded fan-out selection is **salted
+  per query**, so a PeerId-grinding attacker can no longer permanently evict a chosen
+  key's legit provider — an out-competed lookup self-heals on retry (a bounded
+  probabilistic degradation, never permanent denial; integrity is untouched throughout).
 - **A transparent substituter proxy:** `nix-cache-info` semantics, a narinfo disk
   cache, the NAR correlation catalog, correct serving of a raw NAR under a compressed
   upstream narinfo (the hit is rewritten to match the bytes it serves), multi-daemon
