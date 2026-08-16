@@ -6,7 +6,7 @@ title: >-
 status: Done
 assignee: []
 created_date: '2026-08-14 08:24'
-updated_date: '2026-08-15 07:07'
+updated_date: '2026-08-16 15:24'
 labels:
   - doc
   - direction
@@ -28,6 +28,8 @@ COMPASS 2026-08-14 domain-coherence flag. The PRD's Wave-2c reconciliation (§57
 AUTONOMOUS BACKLOG PART DONE 2026-08-14: re-pointed TASK-155's stale iroh dep (132 -> 103); appended coherence-reframe notes to the iroh-framed gate tasks 132/133/87/88 (they are optional-transport reference, NOT the production discovery gate, which is the proven libp2p-kad 103/191/194). REMAINING (owner-review-gated, NOT done autonomously): (a) the PRD execution-order PROSE (§693-734 'Iroh-first' / 'GLOBAL-IROH GATE') needs reconciling to the Wave-2c libp2p-primary authority — a PRD authority-section edit I will not make unilaterally; show the diff + confirm; (b) the product decision whether iroh remains a funded arm (sets 87/88/132/133/201 priority). These two are for the owner.
 
 Raised to High in the Wave-2c cleanup (2026-08-14): this is the keystone reconcile that gates the fate of ~29 now-Low tasks (label deferred-pending-202) across the superseded iroh-as-discovery-gate, premature multi-arm tournament, far-future BitTorrent, and optional-comparator tracks. Normative authority = PRD §634-691 (libp2p-kad mandatory discovery, iroh optional transport only); the stale §693-743 Iroh-first execution order is what this task removes/reconciles. Owner/PRD-gated: the 'is iroh a funded transport arm at all' call is owner product intent — route via mped-architect as Mark-emulator against the PRD, do not ask the owner.
+
+TASK-232 disposition (2026-08-16, codex NO-GO + mped Mark-emulator): daemon-core DirectDiscovery / resolve_many / ClaimResolution / daemon/examples/closure_discovery.rs are WAVE-2A SCAFFOLDING with NO production caller (verified: run->PeerFabricNarSource is the shipped discovery path and already routes through peer-fabric find_providers_bound + KeyResolution; TransportNarSource uses single-key resolve->InMemoryDiscovery). 232 was reverted (c18d866) as premise-stale. Fold DirectDiscovery/resolve_many/ClaimResolution/closure_discovery.rs into this 202 PRUNE-vs-promote decision. IF ever promoted to a shipped path: (1) the batch finalizer MUST reuse peer-fabric KeyAcc/KeyResolution as the single SSOT, never a divergent clone; (2) close the latent single-key DirectDiscovery::resolve()->None fault-fold AND the trait-default resolve()->None-to-Miss fold (both fold a fault to a false absence); (3) re-apply the single caller-budget deadline (no internal total_timeout backstop). These are latent (non-shipped) today - real only on promotion.
 <!-- SECTION:NOTES:END -->
 
 ## Final Summary

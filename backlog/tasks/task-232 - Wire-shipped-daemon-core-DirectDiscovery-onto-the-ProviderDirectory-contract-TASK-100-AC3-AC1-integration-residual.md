@@ -3,11 +3,11 @@ id: TASK-232
 title: >-
   Wire shipped daemon-core DirectDiscovery onto the ProviderDirectory contract
   (TASK-100 AC#3/AC#1 integration residual)
-status: In Progress
+status: Done
 assignee:
   - '@claude'
 created_date: '2026-08-16 09:07'
-updated_date: '2026-08-16 15:14'
+updated_date: '2026-08-16 15:24'
 labels:
   - daemon-core
   - discovery
@@ -50,4 +50,6 @@ The literal AC clause return KeyResolution/Vec<ProviderRecord> via finalize_batc
 - Frozen wire untouched (no encode/decode/Claim/ProviderRecord change) => golden byte-identical. NOTE: cannot reword ACs (owner owns them); documenting reinterpretation here + in final report.
 
 CODEX DEEP GATE NO-GO on 0694dffe - PREMISE STALE (codex-verified vs production wiring): the shipped DHT path (run->PeerFabricNarSource) ALREADY used find_providers_bound + Miss!=Unavailable before this commit; DirectDiscovery::resolve_many is test/example-only (production TransportNarSource uses single-key resolve->InMemoryDiscovery). COMPASS theater-on-shipped-path premise was WRONG. The commit hardened unshipped wave-2a scaffolding + added a divergent ClaimResolution enum (lacks finalize_batch resource-envelope/multi-holder/exec-plan/peer-cap). AC#2/#4 pass; AC#1/#3 fail as shipped-path criteria; shipped_path test is not a distinction bite (Unavailable and Miss both fold to Unreachable). Disposition (revert vs keep+reconcile vs re-scope) routing through mped-architect as Mark-emulator; not grinding the implementer to fix a mis-scoped task.
+
+CLOSED as premise-stale / SUPERSEDED — NOT implemented (this is not a delivered feature; Done only because the tracker has no Cancelled state). codex NO-GO + mped(Mark-emulator) both verified the shipped path (run->PeerFabricNarSource) was ALREADY fault!=miss-correct before any 232 work; DirectDiscovery::resolve_many is test/example-only; COMPASS theater-on-shipped-path premise refuted by code. Commit 0694dffe REVERTED in c18d866 (kept only the peer_source shipped_path_tests salvage). Prune-vs-promote of the wave-2a DirectDiscovery scaffolding folded into TASK-202.
 <!-- SECTION:NOTES:END -->
