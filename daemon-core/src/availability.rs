@@ -1600,6 +1600,33 @@ impl AvailabilityIndex {
         &self,
         query: &BatchHoldQuery,
     ) -> Result<BatchHoldResponse, ClaimCodecError> {
+        let (response, notes) = self.answer_batch_reporting(query)?;
+        // Emit the AGGREGATED operator notes (task-107 M3). At most one line per
+        // fault CLASS for the WHOLE message, never one per key: a responder whose
+        // store was GC'd out from under it - or a peer deliberately naming keys it
+        // knows will fault - could otherwise make ONE 91-byte query print up to
+        // MAX_BATCH_HOLD_KEYS near-identical lines (log amplification a remote peer
+        // provokes). The decision of WHICH bounded set of lines to emit lives in
+        // `answer_batch_reporting`, which RETURNS them so it can be tested in
+        // process; this method is only the effect.
+        for note in &notes {
+            eprintln!("{note}");
+        }
+        Ok(response)
+    }
+
+    /// The core of [`Self::answer_batch`] that RETURNS the operator notes instead
+    /// of printing them (task-107 M3). Separating the DECISION (which bounded set
+    /// of lines a batch should log) from the EFFECT (the `eprintln!`s) is what makes
+    /// the "at most one line per fault class, never one per key" property testable
+    /// without capturing stderr: a test provokes many per-key faults and asserts the
+    /// returned `notes.len()` stays small. `notes` is empty on the happy path (a
+    /// `Vec::new()` allocates nothing until a fault or deferral pushes), so the
+    /// aggregation costs nothing when every key is answered cleanly.
+    fn answer_batch_reporting(
+        &self,
+        query: &BatchHoldQuery,
+    ) -> Result<(BatchHoldResponse, Vec<String>), ClaimCodecError> {
         debug_assert_eq!(query.schema_version, QUERY_SCHEMA_VERSION);
         check_batch_keys(&query.keys)?;
 
@@ -1609,6 +1636,11 @@ impl AvailabilityIndex {
         let mut answers = Vec::with_capacity(query.keys.len().min(MAX_BATCH_HOLD_KEYS));
         let mut any_have = false;
         let mut deferred: u32 = 0;
+        // AGGREGATE the per-key faults (task-107 M3): count them and keep only the
+        // FIRST offender's context, so the whole message costs ONE summary line, not
+        // one eprintln per faulting key.
+        let mut faulted: u32 = 0;
+        let mut first_fault: Option<String> = None;
         for key in &query.keys {
             match self.hold_budgeted(key, &mut budget) {
                 Ok(BudgetedHold::Have { blake3, .. }) => {
@@ -1632,29 +1664,45 @@ impl AvailabilityIndex {
                     answers.push(BatchHoldAnswer::Absent {});
                 }
                 Err(err) => {
-                    // Loud, not silent: the operator sees exactly which key
-                    // degraded and why.
-                    eprintln!(
-                        "daemon: batch hold-query: {key} could not be answered ({err}); \
-                         answering Absent for it"
-                    );
+                    // Loud, but AGGREGATED (task-107 M3): record the count and the
+                    // first offender's context here, and emit ONE summary line for the
+                    // whole batch below - never one eprintln per key, which a remote
+                    // peer could otherwise provoke up to MAX_BATCH_HOLD_KEYS times with
+                    // a single message.
+                    faulted = faulted.saturating_add(1);
+                    if first_fault.is_none() {
+                        first_fault = Some(format!("{key} ({err})"));
+                    }
                     answers.push(BatchHoldAnswer::Absent {});
                 }
             }
         }
+
+        // The bounded operator notes: at most one line per fault CLASS, each naming
+        // its COUNT (and, for faults, the first offender), so a 256-key message that
+        // faults on every key still logs a fixed, small number of lines.
+        let mut notes = Vec::new();
+        if faulted > 0 {
+            notes.push(format!(
+                "daemon: batch hold-query: {faulted} key(s) could not be answered \
+                 (answered Absent for each); first: {}",
+                first_fault.as_deref().unwrap_or("<unknown>")
+            ));
+        }
         if deferred > 0 {
-            // LOUD, not silent (the AC#2 point): the operator sees that this batch
+            // LOUD, not silent (the task-104 point): the operator sees that this batch
             // under-reported `deferred` COLD key(s) because it hit the per-batch
             // derivation budget. Those keys were NOT dumped this time; a later probe
             // that reaches them dumps and caches them, so a subsequent organic query
             // finds them warm (the asker of THIS probe falls back upstream).
-            eprintln!(
+            notes.push(format!(
                 "daemon: batch hold-query: {deferred} cold key(s) exceeded the per-batch \
                  derivation budget (MAX_BATCH_DERIVE_WORK={MAX_BATCH_DERIVE_WORK}); answered \
                  Absent without dumping - they warm the responder cache on a later probe"
-            );
+            ));
         }
-        Ok(BatchHoldResponse {
+
+        let response = BatchHoldResponse {
             schema_version: QUERY_SCHEMA_VERSION,
             // This node's iroh locator is genuinely peer-scoped, so it appears
             // ONCE and every Have indexes it - and only when at least one answer is
@@ -1667,7 +1715,8 @@ impl AvailabilityIndex {
                 Vec::new()
             },
             answers,
-        })
+        };
+        Ok((response, notes))
     }
 
     /// Produce the COMPLETE claim for `key` if this node holds it: the BLAKE3 to
@@ -1880,5 +1929,135 @@ impl Drop for AvailabilityIndex {
         for entry in entries.values() {
             self.supply_catalog.retire(&entry.supply_registration);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A temp file that EXISTS (so the index does not short-circuit a probe to
+    /// `Absent` on a missing path) and removes itself on drop.
+    struct TempFile(std::path::PathBuf);
+
+    impl TempFile {
+        fn new(tag: &str) -> Self {
+            let mut path = std::env::temp_dir();
+            path.push(format!(
+                "nixp2p-{tag}-{}-{}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .expect("clock after epoch")
+                    .as_nanos()
+            ));
+            std::fs::write(&path, b"present").expect("write temp file");
+            TempFile(path)
+        }
+    }
+
+    impl Drop for TempFile {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.0);
+        }
+    }
+
+    fn node() -> NodeId {
+        NodeId::from_bytes([0x11; 32])
+    }
+
+    /// TASK-107 M3 bite: a batch that FAULTS on many keys must emit a BOUNDED number
+    /// of log lines - one aggregate per fault class - not one line per key.
+    ///
+    /// The fault provoked is a `NarHash` MISMATCH (a registered key that does not
+    /// equal the sha256 of the dumped bytes): the index quarantines it and the
+    /// per-key path returns `Err`, which is exactly the arm task-107 M3 aggregates.
+    /// Every faulting key points at the SAME existing file dumped by an in-memory
+    /// dumper, so each independently mismatches. The per-batch derivation budget
+    /// (`MAX_BATCH_DERIVE_WORK`) caps how many keys actually dump-and-fault, so we
+    /// register a few MORE than the budget: the surplus defers, giving us BOTH fault
+    /// classes in one message.
+    ///
+    /// MUTATION PROOF: revert `answer_batch_reporting` to push one note per faulting
+    /// key (the pre-fix `eprintln!`-per-key amplification) and `notes` grows to
+    /// `MAX_BATCH_DERIVE_WORK` fault lines instead of one, failing the `== 1` assert.
+    #[test]
+    fn batch_fault_logging_is_aggregated_not_one_line_per_key() {
+        let present = TempFile::new("m3-fault");
+        let dumped = b"in-memory nar bytes the lied keys do not hash to".to_vec();
+        let honest_key = NarHashKey::from_raw_nar(&dumped);
+
+        let index = AvailabilityIndex::open(
+            node(),
+            Arc::new(MemoryNarDumper::new(dumped)),
+            Arc::new(NullStore),
+            Arc::new(NullAnnounce),
+        )
+        .expect("open index");
+
+        // More faulting keys than the derivation budget, so some fault (dump then
+        // mismatch) and the rest defer (budget spent) - both fault classes at once.
+        let total = (MAX_BATCH_DERIVE_WORK + 4) as usize;
+        let mut keys = Vec::with_capacity(total);
+        for i in 0..total {
+            // A distinct, LIED key: from_sha256_bytes([tag; 32]) cannot equal the
+            // sha256 of `dumped` (asserted once via honest_key), so every key
+            // mismatches when dumped.
+            let key = NarHashKey::from_sha256_bytes([(i as u8).wrapping_add(1); 32]);
+            assert_ne!(key, honest_key, "the test key must be a LIED key");
+            index
+                .register(key, StorePath::new(present.0.clone()))
+                .expect("register lied key");
+            keys.push(key);
+        }
+
+        let query = BatchHoldQuery {
+            schema_version: QUERY_SCHEMA_VERSION,
+            keys,
+        };
+        let (response, notes) = index
+            .answer_batch_reporting(&query)
+            .expect("a batch of faulting keys still returns a well-formed response");
+
+        // Behaviour preserved: a faulting/deferred key answers Absent, never a false
+        // Have, and an all-absent batch volunteers no locator.
+        assert!(
+            response
+                .answers
+                .iter()
+                .all(|a| matches!(a, BatchHoldAnswer::Absent {})),
+            "every faulting/deferred key must answer Absent: {:?}",
+            response.answers
+        );
+        assert!(
+            response.offers.is_empty(),
+            "all-absent batch offers nothing"
+        );
+
+        // The BITE: the log is bounded to one line per fault CLASS (here: one fault
+        // aggregate + one deferral aggregate = 2), NOT ~N. Without aggregation the
+        // fault arm alone would emit MAX_BATCH_DERIVE_WORK lines.
+        assert!(
+            notes.len() <= 2,
+            "the batch path must log at most one line per fault class, not per key; \
+             got {} lines: {notes:?}",
+            notes.len()
+        );
+        let fault_lines: Vec<&String> = notes
+            .iter()
+            .filter(|n| n.contains("could not be answered"))
+            .collect();
+        assert_eq!(
+            fault_lines.len(),
+            1,
+            "exactly ONE aggregated fault line for the whole message: {notes:?}"
+        );
+        // The count is REPORTED (the aggregate is meaningful, not just quieter): the
+        // budget bounds the faults at MAX_BATCH_DERIVE_WORK.
+        assert!(
+            fault_lines[0].contains(&format!("{MAX_BATCH_DERIVE_WORK} key(s)")),
+            "the aggregate line must report the fault COUNT: {}",
+            fault_lines[0]
+        );
     }
 }

@@ -31,7 +31,7 @@
 //! by internally looping the single-key form would be counted as one exchange
 //! while costing N on a real network. The transport measured here
 //! ([`InProcessPeerQuery`]) natively batches, and that is asserted from outside
-//! rather than assumed - `discovery.rs::the_in_process_batch_really_crosses_the_wire_not_the_shim`
+//! rather than assumed - `discovery.rs::the_in_process_batch_is_encoded_once_not_looped_per_key`
 //! tells the two apart by handing both an over-cap batch, which only the encoding
 //! (native) path can refuse.
 //!
@@ -392,7 +392,7 @@ async fn main() {
                     "repeats": config.repeats,
                     "nar_bytes_uncompressed_nar": config.nar_bytes_uncompressed_nar,
                     "transport": "InProcessPeerQuery (native batch; asserted, \
-                                  see the_in_process_batch_really_crosses_the_wire_not_the_shim)",
+                                  see the_in_process_batch_is_encoded_once_not_looped_per_key)",
                 },
                 "resolved_paths": serial_resolved,
                 "arms": {

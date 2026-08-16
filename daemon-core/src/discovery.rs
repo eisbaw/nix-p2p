@@ -78,6 +78,7 @@
 //! into the full abort/hedge policy; task-40 only guarantees the miss is bounded.
 
 use std::collections::HashMap;
+use std::collections::hash_map::Entry;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -578,84 +579,132 @@ pub trait PeerQuery: Send + Sync {
         node: &NodeId,
         query: &BatchHoldQuery,
     ) -> Result<BatchHoldResponse, PeerQueryError> {
-        // The cap applies to the SHIM too, and before any probe is issued. Its
-        // return value is a wire message: constructing an over-cap one would build
-        // something no decoder on the network accepts, and doing so only AFTER 257
-        // single round trips would spend the cost first and refuse afterwards.
-        check_batch_keys(&query.keys).map_err(|e| PeerQueryError::Codec(e.to_string()))?;
-        let mut answers = Vec::with_capacity(query.keys.len().min(MAX_BATCH_HOLD_KEYS));
-        // The offer DICTIONARY built up as the per-key answers arrive. Each key's
-        // own locators are interned here and referenced BY INDEX, so a locator that
-        // is content-specific (a BitTorrent infohash belongs to one NAR, not to the
-        // peer) stays bound to the key it came from. An earlier revision kept the
-        // FIRST Have's offers and gave them to every Have, which bound key 2's
-        // claim to key 1's infohash - a wrong dial, and a locator volunteered for
-        // content the asker never asked about.
-        let mut offers: Vec<KnownTransport> = Vec::new();
-        for key in &query.keys {
-            let single = HoldQuery {
-                schema_version: QUERY_SCHEMA_VERSION,
-                key: *key,
-            };
-            match self.query(node, &single).await {
-                Ok(response) => match response.answer {
-                    HoldAnswer::Have {
-                        blake3,
-                        offers: key_offers,
-                    } => {
-                        let mut offer_indices = Vec::with_capacity(key_offers.len());
-                        for offer in key_offers {
-                            // Intern: an identical locator (the common case - one
-                            // iroh NodeId for every key) is stored once.
-                            let at = match offers.iter().position(|known| *known == offer) {
-                                Some(at) => at,
-                                None => {
-                                    if offers.len() >= MAX_BATCH_HOLD_OFFERS {
-                                        return Err(PeerQueryError::Codec(format!(
-                                            "peer {node} offered more than \
-                                             {MAX_BATCH_HOLD_OFFERS} distinct locators \
-                                             across one batch"
-                                        )));
-                                    }
-                                    offers.push(offer);
-                                    offers.len() - 1
-                                }
-                            };
-                            let at = at as OfferIndex;
-                            // The wire rejects a repeated index inside one answer,
-                            // and a peer may legally repeat an offer within one
-                            // single-key answer, so dedupe here.
-                            if !offer_indices.contains(&at) {
-                                offer_indices.push(at);
-                            }
-                        }
-                        answers.push(BatchHoldAnswer::Have {
-                            blake3,
-                            offer_indices,
-                        });
-                    }
-                    HoldAnswer::Absent => answers.push(BatchHoldAnswer::Absent {}),
-                },
-                Err(err @ PeerQueryError::Answer(_)) => {
-                    eprintln!("daemon: batch probe of {node}: {key} failed ({err}); Absent");
-                    answers.push(BatchHoldAnswer::Absent {});
-                }
-                // A peer-level fault is true of every key; do not burn N-1 more.
-                Err(err) => return Err(err),
-            }
+        let (response, notes) = run_query_batch_shim(self, node, query).await?;
+        // Emit the AGGREGATED operator notes (task-107 M3): at most one line per
+        // fault class for the WHOLE batch, never one per key. Otherwise a peer whose
+        // store was GC'd out from under it could make one N-key batch print N
+        // near-identical "failed; Absent" lines - log amplification a peer provokes.
+        // The decision (WHICH bounded lines) lives in `run_query_batch_shim`, which
+        // RETURNS them so it is testable in process; this is only the effect.
+        for note in &notes {
+            eprintln!("{note}");
         }
-        // Interning can leave an entry no surviving answer references only if a
-        // Have was later replaced - it cannot happen above, but the codec's rule is
-        // the authority, so assemble and let the shared check speak if it ever does.
-        let response = BatchHoldResponse {
-            schema_version: QUERY_SCHEMA_VERSION,
-            offers,
-            answers,
-        };
-        check_batch_offer_bindings(&as_offer_slots(&response.offers), &response.answers)
-            .map_err(|e| PeerQueryError::Codec(e.to_string()))?;
         Ok(response)
     }
+}
+
+/// The compatibility-shim body of [`PeerQuery::query_batch`], factored out so it can
+/// RETURN its operator notes instead of printing them (task-107 M3). This is what
+/// makes "the shim logs at most one line per fault class per batch, never one per
+/// key" provable in process: a test drives it with a peer that faults every key and
+/// asserts the returned `notes.len()` stays small. `peer` is the transport whose
+/// single-key [`PeerQuery::query`] the shim loops; the trait default calls this and
+/// emits the notes.
+async fn run_query_batch_shim<P: PeerQuery + ?Sized>(
+    peer: &P,
+    node: &NodeId,
+    query: &BatchHoldQuery,
+) -> Result<(BatchHoldResponse, Vec<String>), PeerQueryError> {
+    // The cap applies to the SHIM too, and before any probe is issued. Its
+    // return value is a wire message: constructing an over-cap one would build
+    // something no decoder on the network accepts, and doing so only AFTER 257
+    // single round trips would spend the cost first and refuse afterwards.
+    check_batch_keys(&query.keys).map_err(|e| PeerQueryError::Codec(e.to_string()))?;
+    let mut answers = Vec::with_capacity(query.keys.len().min(MAX_BATCH_HOLD_KEYS));
+    // The offer DICTIONARY built up as the per-key answers arrive. Each key's
+    // own locators are interned here and referenced BY INDEX, so a locator that
+    // is content-specific (a BitTorrent infohash belongs to one NAR, not to the
+    // peer) stays bound to the key it came from. An earlier revision kept the
+    // FIRST Have's offers and gave them to every Have, which bound key 2's
+    // claim to key 1's infohash - a wrong dial, and a locator volunteered for
+    // content the asker never asked about.
+    let mut offers: Vec<KnownTransport> = Vec::new();
+    // AGGREGATE the per-key `Answer` faults (task-107 M3): count them and keep only
+    // the FIRST offender's context, so the batch costs ONE summary line, not one per
+    // faulting key.
+    let mut faulted: u32 = 0;
+    let mut first_fault: Option<String> = None;
+    for key in &query.keys {
+        let single = HoldQuery {
+            schema_version: QUERY_SCHEMA_VERSION,
+            key: *key,
+        };
+        match peer.query(node, &single).await {
+            Ok(response) => match response.answer {
+                HoldAnswer::Have {
+                    blake3,
+                    offers: key_offers,
+                } => {
+                    let mut offer_indices = Vec::with_capacity(key_offers.len());
+                    for offer in key_offers {
+                        // Intern: an identical locator (the common case - one
+                        // iroh NodeId for every key) is stored once.
+                        let at = match offers.iter().position(|known| *known == offer) {
+                            Some(at) => at,
+                            None => {
+                                if offers.len() >= MAX_BATCH_HOLD_OFFERS {
+                                    return Err(PeerQueryError::Codec(format!(
+                                        "peer {node} offered more than \
+                                         {MAX_BATCH_HOLD_OFFERS} distinct locators \
+                                         across one batch"
+                                    )));
+                                }
+                                offers.push(offer);
+                                offers.len() - 1
+                            }
+                        };
+                        let at = at as OfferIndex;
+                        // The wire rejects a repeated index inside one answer,
+                        // and a peer may legally repeat an offer within one
+                        // single-key answer, so dedupe here.
+                        if !offer_indices.contains(&at) {
+                            offer_indices.push(at);
+                        }
+                    }
+                    answers.push(BatchHoldAnswer::Have {
+                        blake3,
+                        offer_indices,
+                    });
+                }
+                HoldAnswer::Absent => answers.push(BatchHoldAnswer::Absent {}),
+            },
+            Err(err @ PeerQueryError::Answer(_)) => {
+                // Loud, but AGGREGATED (task-107 M3): record the count and the first
+                // offender here; the caller emits ONE summary line for the whole
+                // batch. A per-KEY answer fault degrades that key to Absent (the safe
+                // direction) without denying the rest of the closure.
+                faulted = faulted.saturating_add(1);
+                if first_fault.is_none() {
+                    first_fault = Some(format!("{key} ({err})"));
+                }
+                answers.push(BatchHoldAnswer::Absent {});
+            }
+            // A peer-level fault is true of every key; do not burn N-1 more.
+            Err(err) => return Err(err),
+        }
+    }
+    // Interning can leave an entry no surviving answer references only if a
+    // Have was later replaced - it cannot happen above, but the codec's rule is
+    // the authority, so assemble and let the shared check speak if it ever does.
+    let response = BatchHoldResponse {
+        schema_version: QUERY_SCHEMA_VERSION,
+        offers,
+        answers,
+    };
+    check_batch_offer_bindings(&as_offer_slots(&response.offers), &response.answers)
+        .map_err(|e| PeerQueryError::Codec(e.to_string()))?;
+
+    // At most ONE aggregated fault line for the whole batch, naming the COUNT and the
+    // first offender - never one line per faulting key.
+    let mut notes = Vec::new();
+    if faulted > 0 {
+        notes.push(format!(
+            "daemon: batch probe of {node}: {faulted} key(s) failed (answered Absent \
+             for each); first: {}",
+            first_fault.as_deref().unwrap_or("<unknown>")
+        ));
+    }
+    Ok((response, notes))
 }
 
 /// The wave-2a query transport: a shared, in-process rendezvous mapping each peer
@@ -964,11 +1013,19 @@ impl Discovery for DirectDiscovery {
                 if results[i].is_some() {
                     continue;
                 }
-                positions.entry(*key).or_insert_with(|| {
-                    pending.push(*key);
-                    Vec::new()
-                });
-                positions.get_mut(key).expect("just inserted").push(i);
+                // Match on the entry directly: the FIRST time a still-unresolved key
+                // is seen it is recorded once in `pending` (the distinct keys this peer
+                // will be probed for) and its position list is started; a repeat just
+                // appends its position. This replaces a side-effecting `or_insert_with`
+                // closure (whose only job was to push onto `pending`) plus a second
+                // `get_mut` on the same key - one lookup, no hidden effect.
+                match positions.entry(*key) {
+                    Entry::Occupied(mut slot) => slot.get_mut().push(i),
+                    Entry::Vacant(slot) => {
+                        pending.push(*key);
+                        slot.insert(vec![i]);
+                    }
+                }
             }
             if pending.is_empty() {
                 break; // every key resolved; no further peer is worth a round trip
@@ -2087,7 +2144,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn the_in_process_batch_really_crosses_the_wire_not_the_shim() {
+    async fn the_in_process_batch_is_encoded_once_not_looped_per_key() {
         // WHY THIS TEST EXISTS. Round trips are counted at the `PeerQuery` seam
         // (that is what the measurement instrument observes), and a transport that
         // implemented `query_batch` by internally looping the single-key form
@@ -2277,6 +2334,76 @@ mod tests {
             1,
             "the faulting peer must be abandoned after its FIRST chunk (2-chunk \
              closure), not re-probed for the second"
+        );
+    }
+
+    // ---- task-107 M3 bite: the shim aggregates per-key faults to ONE line ----
+
+    /// A transport whose SINGLE-key `query` faults every key with a per-KEY
+    /// [`PeerQueryError::Answer`]. It uses the DEFAULT `query_batch` shim, so the
+    /// shim loops it once per key and each loop records an answer fault - the exact
+    /// arm task-107 M3 aggregates.
+    struct AnswerFaultEveryKey;
+    #[async_trait]
+    impl PeerQuery for AnswerFaultEveryKey {
+        async fn query(
+            &self,
+            _node: &NodeId,
+            _query: &HoldQuery,
+        ) -> Result<HoldResponse, PeerQueryError> {
+            Err(PeerQueryError::Answer(
+                "simulated per-key answer fault".into(),
+            ))
+        }
+        // No `query_batch` override: the compatibility shim under test drives this.
+    }
+
+    #[tokio::test]
+    async fn shim_batch_fault_logging_is_aggregated_not_one_line_per_key() {
+        // The compatibility shim, asked a full-cap batch against a peer that faults
+        // EVERY key (a per-KEY answer fault, which degrades that key to Absent rather
+        // than abandoning the whole peer), must cost ONE aggregated log line for the
+        // whole message - not one per key, which a peer could provoke up to
+        // MAX_BATCH_HOLD_KEYS times with a single 91-byte query.
+        //
+        // MUTATION PROOF: revert `run_query_batch_shim` to push (or eprintln) a note
+        // per faulting key and `notes` grows to MAX_BATCH_HOLD_KEYS lines, failing the
+        // `== 1` assert below.
+        let peer = AnswerFaultEveryKey;
+        let query = BatchHoldQuery {
+            schema_version: QUERY_SCHEMA_VERSION,
+            keys: keys(MAX_BATCH_HOLD_KEYS),
+        };
+        let (response, notes) = run_query_batch_shim(&peer, &node_b(), &query)
+            .await
+            .expect("an all-Absent shim response is well-formed");
+
+        // Behaviour preserved: every faulting key degrades to a positional Absent.
+        assert_eq!(
+            response.answers.len(),
+            MAX_BATCH_HOLD_KEYS,
+            "positional: exactly one answer per asked key"
+        );
+        assert!(
+            response
+                .answers
+                .iter()
+                .all(|a| matches!(a, BatchHoldAnswer::Absent {})),
+            "a per-key answer fault degrades that key to Absent, never a false Have"
+        );
+
+        // The BITE: the whole batch costs ONE aggregated fault line, not ~N.
+        assert_eq!(
+            notes.len(),
+            1,
+            "the shim must aggregate {MAX_BATCH_HOLD_KEYS} per-key faults into ONE \
+             line; got {} lines: {notes:?}",
+            notes.len()
+        );
+        assert!(
+            notes[0].contains(&format!("{MAX_BATCH_HOLD_KEYS} key(s) failed")),
+            "the aggregate line must report the fault COUNT: {}",
+            notes[0]
         );
     }
 
