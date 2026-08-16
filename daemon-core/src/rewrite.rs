@@ -59,11 +59,15 @@
 //! ## Fail-fast, never half-rewritten
 //!
 //! [`to_raw`] rewrites only a WELL-FORMED cache narinfo: it requires `NarHash`,
-//! `NarSize`, `URL`, `Compression`, `FileHash` and `FileSize` all present and a
-//! parseable `NarSize`/`NarHash`, returning a [`RewriteError`] otherwise. A caller
-//! that gets an error serves the upstream narinfo VERBATIM (via [`apply`]) - the
-//! safe wave-1 path - rather than emit an inconsistent narinfo. It never fabricates
-//! a signature-valid narinfo from a malformed one.
+//! `NarSize`, `URL` and `Compression` present with a parseable `NarSize`/`NarHash`.
+//! `FileHash`/`FileSize` are required for a COMPRESSED narinfo (there they are the
+//! compressed-transport units, distinct from the signed nar units) but are OPTIONAL
+//! for `Compression: none` - an uncompressed narinfo may omit them and Nix defaults
+//! each to its nar counterpart, which is exactly the raw bytes the daemon serves, so
+//! rejecting that class here would silently disable the p2p path (TASK-220). On any
+//! genuine error the caller serves the upstream narinfo VERBATIM (via [`apply`]) -
+//! the safe wave-1 path - rather than emit an inconsistent narinfo. It never
+//! fabricates a signature-valid narinfo from a malformed one.
 //!
 //! ## Where the rewrite is triggered (and the peer-miss fallback)
 //!
@@ -193,17 +197,17 @@ pub fn to_raw(body: &[u8]) -> Result<RawRewrite, RewriteError> {
     // we intend to rewrite is actually present (so the output is well-formed).
     let mut nar_hash: Option<&[u8]> = None;
     let mut nar_size_raw: Option<&[u8]> = None;
-    let (mut have_url, mut have_compression, mut have_filehash, mut have_filesize) =
-        (false, false, false, false);
+    let mut compression: Option<&[u8]> = None;
+    let (mut have_url, mut have_filehash, mut have_filesize) = (false, false, false);
     for line in body.split(|&b| b == b'\n') {
         if let Some(v) = field_value(line, b"NarHash") {
             nar_hash = Some(v);
         } else if let Some(v) = field_value(line, b"NarSize") {
             nar_size_raw = Some(v);
+        } else if let Some(v) = field_value(line, b"Compression") {
+            compression = Some(v);
         } else if is_field(line, b"URL") {
             have_url = true;
-        } else if is_field(line, b"Compression") {
-            have_compression = true;
         } else if is_field(line, b"FileHash") {
             have_filehash = true;
         } else if is_field(line, b"FileSize") {
@@ -216,13 +220,31 @@ pub fn to_raw(body: &[u8]) -> Result<RawRewrite, RewriteError> {
     if !have_url {
         return Err(RewriteError::MissingField("URL"));
     }
-    if !have_compression {
-        return Err(RewriteError::MissingField("Compression"));
-    }
-    if !have_filehash {
+    let compression = compression.ok_or(RewriteError::MissingField("Compression"))?;
+
+    // `Compression: none` narinfos may LEGITIMATELY omit FileHash/FileSize: Nix's
+    // narinfo reader defaults `FileHash := NarHash` and `FileSize := NarSize` when
+    // absent, and for an UNCOMPRESSED nar those defaults are exactly what the raw
+    // bytes hash to and measure - the served file IS the raw nar (module docs
+    // "Fail-fast" + "The rewrite"). So requiring FileHash/FileSize here would
+    // OVER-REJECT a valid, p2p-serveable narinfo, silently disabling the p2p path
+    // for that whole class (TASK-220). Such a narinfo needs no FileHash/FileSize
+    // LINE in the output either: the client re-derives the same NarHash/NarSize
+    // defaults and verifies them against the raw bytes we serve, so pass 2 simply
+    // leaves the absent lines absent.
+    //
+    // For a COMPRESSED narinfo the two units GENUINELY DIFFER - FileHash/FileSize
+    // describe the COMPRESSED transport, NarHash/NarSize the UNCOMPRESSED nar (the
+    // recurring unit trap). We therefore keep requiring them for compressed input:
+    // a compressed narinfo missing them is not raw-rewritable and is served
+    // verbatim rather than defaulted (which would emit the wrong compressed-unit
+    // transport). The determination is on the AUTHORITATIVE `Compression:` value,
+    // never inferred from the URL suffix.
+    let is_uncompressed = ascii_trim(compression) == b"none";
+    if !have_filehash && !is_uncompressed {
         return Err(RewriteError::MissingField("FileHash"));
     }
-    if !have_filesize {
+    if !have_filesize && !is_uncompressed {
         return Err(RewriteError::MissingField("FileSize"));
     }
 
@@ -745,6 +767,73 @@ FileSize: 1\nNarHash: sha256:abc\nNarSize: 2\nReferences: \n";
         assert_eq!(
             to_raw(no_compression),
             Err(RewriteError::MissingField("Compression"))
+        );
+    }
+
+    #[test]
+    fn none_narinfo_without_filehash_or_filesize_rewrites_to_raw() {
+        // TASK-220: a `Compression: none` narinfo that OMITS FileHash/FileSize is
+        // valid per Nix (each defaults to its nar counterpart) and p2p-serveable as
+        // is. BEFORE the fix, to_raw returned MissingField(FileHash), the narinfo was
+        // served verbatim, NO correlation was recorded, and the follow-up NAR request
+        // fell to the URL-less UpstreamPath - silently disabling p2p. It must now
+        // rewrite successfully and carry the SignedNarHash correlation.
+        let digest = "06rgb4vfjsg365xwwdjz12qhjnvg3w0agfvyqfp977hp3yk2bczb";
+        let none_no_file = format!(
+            "StorePath: /nix/store/0a0lslqb6gbqnj6xqjlaljjqg6kgb3wz-nix-p2p-fixture-lib\n\
+URL: nar/{digest}.nar\n\
+Compression: none\n\
+NarHash: sha256:{digest}\n\
+NarSize: 66048\n\
+References: \n\
+Sig: nix-p2p-test-1:kvRtCi6KujoW6x7esqgP8QdiaaVX4OL1beI/xmfobVHzM/tSSqmy7jcnI7QDognLkmkwaSgA6vraWOYN0kiICw==\n"
+        );
+        let rw = to_raw(none_no_file.as_bytes()).expect(
+            "a Compression: none narinfo lacking FileHash/FileSize must be raw-rewritable, \
+             not over-rejected",
+        );
+        // Correlation carries the SIGNED nar identity that dispatches the p2p path.
+        assert_eq!(rw.nar_hash, format!("sha256:{digest}"));
+        assert_eq!(rw.nar_size, 66048);
+        assert_eq!(rw.url_token, format!("{digest}.nar"));
+        // No FileHash/FileSize line is FABRICATED: the client re-derives the same
+        // NarHash/NarSize defaults and verifies them against the raw bytes served.
+        assert_eq!(
+            value(&rw.body, "FileHash"),
+            None,
+            "an absent FileHash stays absent (Nix defaults it to NarHash) - not fabricated"
+        );
+        assert_eq!(value(&rw.body, "FileSize"), None);
+        // The signed nar units are untouched and the transport is uncompressed.
+        assert_eq!(
+            value(&rw.body, "NarHash").as_deref(),
+            Some(format!("sha256:{digest}").as_str())
+        );
+        assert_eq!(value(&rw.body, "NarSize").as_deref(), Some("66048"));
+        assert_eq!(value(&rw.body, "Compression").as_deref(), Some("none"));
+    }
+
+    #[test]
+    fn compressed_narinfo_missing_filehash_still_errors_no_unit_trap() {
+        // TASK-220 deliverable #3: the relaxation is SCOPED to Compression: none.
+        // A COMPRESSED narinfo missing FileHash/FileSize must NOT default them to the
+        // nar units (FileHash/FileSize describe the COMPRESSED transport, NarHash/
+        // NarSize the UNCOMPRESSED nar - the recurring unit trap). It stays an honest
+        // MissingField error, so the serving layer relays it verbatim.
+        let xz_no_filehash = b"StorePath: /nix/store/x\nURL: nar/a.nar.xz\nCompression: xz\n\
+FileSize: 100\nNarHash: sha256:abc\nNarSize: 200\nReferences: \n";
+        assert_eq!(
+            to_raw(xz_no_filehash),
+            Err(RewriteError::MissingField("FileHash")),
+            "a COMPRESSED narinfo missing FileHash must error, never default to NarHash"
+        );
+
+        let xz_no_filesize = b"StorePath: /nix/store/x\nURL: nar/a.nar.xz\nCompression: xz\n\
+FileHash: sha256:a\nNarHash: sha256:abc\nNarSize: 200\nReferences: \n";
+        assert_eq!(
+            to_raw(xz_no_filesize),
+            Err(RewriteError::MissingField("FileSize")),
+            "a COMPRESSED narinfo missing FileSize must error, never default to NarSize"
         );
     }
 

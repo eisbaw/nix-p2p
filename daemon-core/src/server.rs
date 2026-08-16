@@ -636,6 +636,61 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn none_narinfo_without_filehash_correlates_and_dispatches_p2p() {
+        // TASK-220 biting integration test at the serving layer. A `Compression: none`
+        // narinfo that OMITS FileHash arrives on the p2p-discovery HIT path
+        // (will_serve_raw = true). The daemon MUST rewrite it to raw AND record the
+        // token -> SignedNarHash correlation, so the follow-up GET /nar/<token>
+        // dispatches the SignedNarHash (p2p) source - NOT the URL-less UpstreamPath.
+        //
+        // BITE: before the rewrite fix, to_raw returned MissingField(FileHash), so
+        // respond_narinfo took the verbatim else-branch that records NO correlation;
+        // meta_for_token would then be None and Route::Nar would fall to UpstreamPath.
+        // The assertions below hold only once to_raw stops over-rejecting this class.
+        let digest = "06rgb4vfjsg365xwwdjz12qhjnvg3w0agfvyqfp977hp3yk2bczb";
+        let body = format!(
+            "StorePath: /nix/store/0a0lslqb6gbqnj6xqjlaljjqg6kgb3wz-nix-p2p-fixture-lib\n\
+URL: nar/{digest}.nar\n\
+Compression: none\n\
+NarHash: sha256:{digest}\n\
+NarSize: 66048\n\
+References: \n\
+Sig: nix-p2p-test-1:kvRtCi6KujoW6x7esqgP8QdiaaVX4OL1beI/xmfobVHzM/tSSqmy7jcnI7QDognLkmkwaSgA6vraWOYN0kiICw==\n"
+        );
+        let mut headers = HeaderMap::new();
+        headers.insert(http::header::CONTENT_LENGTH, body.len().into());
+        let resp = UpstreamResponse {
+            status: 200,
+            headers,
+            body: full(bytes::Bytes::from(body.into_bytes())),
+        };
+
+        let catalog = NarCatalog::new();
+        // will_serve_raw = YES for this NarHash: the p2p-discovery HIT that triggers
+        // the rewrite-to-raw branch (the exact path where the bug lived).
+        let raw_serve = rewrite::AllowlistRawServe::new([format!("sha256:{digest}")]);
+        let public = crate::public_allowlist::PublicNarAllowlist::disabled();
+        let requested = StoreHash::new("0a0lslqb6gbqnj6xqjlaljjqg6kgb3wz");
+
+        let response =
+            respond_narinfo(Ok(resp), &requested, &catalog, &raw_serve, &public, false).await;
+        assert_eq!(response.status(), StatusCode::OK);
+
+        // The token the client requests next (the rewritten raw URL token).
+        let token = format!("{digest}.nar");
+        let meta = catalog.meta_for_token(&token).expect(
+            "correlation MUST be recorded for a Compression: none narinfo lacking FileHash - \
+             without it the NAR request falls to the URL-less UpstreamPath and p2p is disabled",
+        );
+        // Route::Nar dispatches the SignedNarHash (p2p) source IFF meta_for_token is
+        // Some; prove the recorded meta carries the SIGNED nar identity and the
+        // authoritative raw transport (NarSize, not a compressed unit).
+        assert_eq!(meta.nar_hash.as_str(), format!("sha256:{digest}"));
+        assert_eq!(meta.nar_size, 66048);
+        assert_eq!(meta.transport.compression, NarCompression::Raw);
+    }
+
     #[test]
     fn hop_by_hop_headers_are_dropped() {
         let mut src = HeaderMap::new();
