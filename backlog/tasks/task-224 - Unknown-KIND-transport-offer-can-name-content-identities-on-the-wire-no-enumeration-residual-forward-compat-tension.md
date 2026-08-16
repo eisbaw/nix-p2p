@@ -7,7 +7,7 @@ status: In Progress
 assignee:
   - '@me'
 created_date: '2026-08-15 20:17'
-updated_date: '2026-08-16 00:22'
+updated_date: '2026-08-16 00:51'
 labels:
   - irreversible
 dependencies: []
@@ -95,4 +95,16 @@ Findings:
 5 (MED): the "frozen golden makes literal closure impossible" argument is WRONG - the golden pins ONE carrier_pigeon input; it is the CHOSEN arbitrary-string forward-compat contract (not the golden) that admits the residual. Literal closure IS possible with a substantial forward-compat cost. Correct this reasoning wherever stated.
 6 (LOW): add committed regression vectors for non-string/missing transport tag, transport-slot array/object, field-name cramming, value cramming - pin every clause so a selective weakening bites.
 ARBITRATION (orchestrator, vs project TCB): the ACTUAL privacy invariant (an honest peer's secret holdings never enumerated) is NOT violated by this channel - a hostile RESPONDER naming FAKE identities to an asker leaks nothing about any honest peer. It is a format-cleanliness gap per the repo's self-imposed claim.rs:332 rule. So full text-closure is worth a proper task but is not a same-severity privacy hole; the load-bearing fix NOW is honest framing + proper ownership + the allowlist tightening.
+
+codex DEEP-gate NO-GO addressed (commit 44ae8e7; stays In Progress - coordinator owns Done after codex re-gate). codex verified the structural close is airtight (no structured-JSON evasion on any of the 3 routes; bite tests mutation-proven; valid golden byte-identical; forward-compat inert). The NO-GO was HONESTY + residual OWNERSHIP + one code tightening. Per-finding status:
+
+FINDING 4/5 (overclaims - DONE): corrected every site that said the unknown-KIND enumeration was closed/discharged or that the residual was only padding/owned-by-223. Honest statement now everywhere - claim.rs:56 (module doc), claim.rs:349 (the seam-untouched line), claim.rs:2484 (amp-test), the helper doc, HoldAnswer/BatchHoldQuery/check_single_offer_bindings docs, the flipped+padded test comments; discovery.rs:57-66; PRD (both blocks); golden notes :146/:158/:164: TASK-224 closes the STRUCTURAL/list enumeration on all 3 routes; a TEXT residual REMAINS across THREE channels (transport TAG, extra FIELD NAME, string VALUE); NOT owned by TASK-223; literal closure IS possible at a forward-compat cost (the arbitrary-string CONTRACT, not the frozen golden, admits it). Key honest sentences quoted in code: "It is NOT literal closure of no-enumeration" and "one accepted unasked identity is already the claim.rs:332 defect" and "This residual is NOT owned by TASK-223 ... a byte cap ... does NOT ELIMINATE identity naming".
+
+FINDING 3 (string-tag allowlist - DONE): the guard now requires a PRESENT STRING transport tag; absent/null/number/boolean/array/object tags are REJECTED (previously {"transport":7,"loc":"opaque"} decoded). Mutation-proven via an_unknown_offer_with_a_non_string_tag_is_rejected (neutralise guard -> RED on all 3 routes).
+
+FINDING 1 (owning task - DONE): filed TASK-227 (full text-enumeration closure; all 3 routes x all 3 channels; genuine ELIMINATION criterion not a byte bound; the forward-compat-vs-enumeration architectural fork with options A/B/C; the orchestrator threat-model note that this is format-cleanliness per claim.rs:332, NOT an honest-peer-holdings leak). Referenced in code at the reject_enumeration_shaped_unknown_offer guard doc. TASK-223 annotated: byte-VOLUME only, does NOT own the enumeration residual.
+
+FINDING 6 (regression vectors - DONE): golden reject_hold_response_unknown_transport_non_string_tag (+EXERCISED); rust an_unknown_offer_with_a_non_string_tag_is_rejected (reject, 3 routes, mutation-proven); rust an_unknown_kind_offer_text_residual_is_documented_not_closed (residual oracle - tag/field-name/value cram all still ACCEPTED, pinned OPEN so TASK-227 closure flips it deliberately); the accept-inert tag+one-string case stays pinned by claim_unknown_transport_dropped + the forward-compat test.
+
+GATE (all green): cargo test -p daemon-core -p daemon 448/0 (2 unrelated iroh_node_lookup load-flakes, confirmed 15/15 green in isolation + a clean full rerun 448/0); cargo fmt --all --check; cargo clippy --workspace --all-targets -- -D warnings exit 0; check-no-floats rc=0; claim_wire_golden 16/16 + golden_vectors 2/2 + doc_citations green; just e2e 5/5 (s1 11/11, s2 9/9, tamper 4/4, chain 13/13, s6-p2p 11/11), exit 0. Mutation bite (guard neutralised -> RED, restored -> GREEN): list-form test, string-tag test, flipped claim-digest test, coherence test, golden every_reject_vector_is_refused. Frozen surface accept-only; emit byte-identical; RawNarV1/ContentKey/ProviderRecord preimage untouched. Commit 44ae8e7. Awaiting codex re-gate on the framing.
 <!-- SECTION:NOTES:END -->
