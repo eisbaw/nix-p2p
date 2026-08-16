@@ -2,10 +2,15 @@
 //!
 //! WHETHER a piece of content may be published at all is the single TASK-102 decision
 //! (the `PublicNarAllowlist`): a public record may name only content established as
-//! signed-public upstream. That decision lives ABOVE this seam (the allowlist is keyed
+//! signed-public upstream. That decision lives ABOVE this seam. The allowlist is keyed
 //! by the signed sha256 `NarHash`, which the frozen [`ProviderRecord`] deliberately no
-//! longer carries - it carries the derived [`ContentKey`](crate::ContentKey) and the
-//! BLAKE3 content id, so eligibility is inherently decided on the pre-record provision).
+//! longer carries - it carries the derived [`ContentKey`](crate::ContentKey) (a
+//! deterministic `derive_key` of that same `NarHash`) and the BLAKE3 content id. A
+//! seam-level authority COULD therefore consult a `ContentKey`-keyed view of the
+//! decision at `admit(&record)` time; it is not wired that way today only because doing
+//! so is a signature change across every publisher and its call sites (the filed
+//! residual), so for now the shipped public path keeps enforcing on the pre-record
+//! provision (`ApprovedPublicProvision`) where the `NarHash` is still in hand.
 //!
 //! What THIS seam adds is a mechanism-neutral CONTRACT that a PUBLISH-capable adapter
 //! CONSUMES that decision: every [`AvailabilityAnnouncer`](crate::AvailabilityAnnouncer)

@@ -17,7 +17,7 @@ use async_trait::async_trait;
 use peer_fabric::{
     BatchResolveRequest, ContentKey, DiscoveryBudget, ExecutionPlan, ExposureSurface, Lookup,
     MechanismId, MechanismRegistry, Parallelism, PlanExecError, ProviderDirectory, ProviderRecord,
-    StopCondition,
+    ResourceOutcome, StopCondition, Unavailable,
 };
 use peer_fabric::{Blake3Digest, NodeId, TransportOffer};
 
@@ -257,6 +257,150 @@ async fn the_stop_condition_comes_from_the_plan_not_the_registry() {
         *all_log.lock().unwrap(),
         vec![MechanismId::GlobalDirectory, MechanismId::DirectHoldQuery],
         "AllMechanisms must consult every mechanism (the stop comes from the plan)"
+    );
+}
+
+// AC#3/#5: the registry's reported `resource` is a REAL event, consistent with
+// is_complete()/is_partial() - not inferred from verdict flags (mped-architect #2).
+// Three pinned cases: spent budget -> DeadlineCut; clean all-Miss -> Completed; a
+// healthy mixed Found+Unavailable envelope with budget to spare -> MechanismDown
+// (NOT a false DeadlineCut).
+#[tokio::test]
+async fn the_registry_resource_outcome_reflects_the_real_envelope() {
+    let k = key(6);
+
+    // (a) A spent total deadline with a mechanism present -> DeadlineCut, all NotAttempted.
+    let mut spent = MechanismRegistry::new();
+    spent.register(
+        MechanismId::GlobalDirectory,
+        Arc::new(RecordingDirectory {
+            id: MechanismId::GlobalDirectory,
+            answer: Lookup::Found(vec![record(k)]),
+            log: Arc::new(Mutex::new(Vec::new())),
+        }),
+    );
+    let zero = DiscoveryBudget::new(Duration::ZERO, 16);
+    let res = spent
+        .resolve(
+            &BatchResolveRequest::single(k),
+            &zero,
+            &ExecutionPlan::fixed_baseline_v1(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        res.measurement().resource,
+        ResourceOutcome::DeadlineCut,
+        "a spent budget must be DeadlineCut, not a false Completed"
+    );
+    assert!(res.is_partial());
+
+    // (b) A clean all-Miss consultation with budget to spare -> Completed.
+    let mut clean = MechanismRegistry::new();
+    clean.register(
+        MechanismId::GlobalDirectory,
+        Arc::new(RecordingDirectory {
+            id: MechanismId::GlobalDirectory,
+            answer: Lookup::Miss,
+            log: Arc::new(Mutex::new(Vec::new())),
+        }),
+    );
+    let res = clean
+        .resolve(
+            &BatchResolveRequest::single(k),
+            &budget(),
+            &ExecutionPlan::fixed_baseline_v1(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(res.measurement().resource, ResourceOutcome::Completed);
+    assert!(res.is_complete());
+
+    // (c) A mixed Found + Unavailable envelope, budget to spare -> MechanismDown, NOT a
+    // false DeadlineCut (no deadline event occurred). One mechanism Founds A and is
+    // Unavailable for B, so the aggregate has an authoritative Found AND a live
+    // Unavailable with the envelope intact.
+    let a = key(0x61);
+    let b = key(0x62);
+    let mut mixed = MechanismRegistry::new();
+    mixed.register(
+        MechanismId::GlobalDirectory,
+        Arc::new(KeyedDirectory {
+            found_key: a,
+            record: record(a),
+        }),
+    );
+    let res = mixed
+        .resolve(
+            &BatchResolveRequest::new([a, b]),
+            &budget(),
+            &ExecutionPlan::fixed_baseline_v1(),
+        )
+        .await
+        .unwrap();
+    assert!(res.outcomes()[0].is_found(), "A is Found");
+    assert!(res.outcomes()[1].is_unavailable(), "B stayed Unavailable");
+    assert_eq!(
+        res.measurement().resource,
+        ResourceOutcome::MechanismDown,
+        "a healthy mixed envelope with a down mechanism is MechanismDown, not DeadlineCut"
+    );
+}
+
+/// A directory that Founds exactly one key and is Unavailable for every other key - so
+/// a mixed Found+Unavailable aggregate can be built deterministically without a
+/// deadline event.
+struct KeyedDirectory {
+    found_key: ContentKey,
+    record: ProviderRecord,
+}
+
+#[async_trait]
+impl ProviderDirectory for KeyedDirectory {
+    async fn find_providers(
+        &self,
+        key: &ContentKey,
+        _budget: &DiscoveryBudget,
+    ) -> Lookup<Vec<ProviderRecord>> {
+        if *key == self.found_key {
+            Lookup::Found(vec![self.record.clone()])
+        } else {
+            Lookup::Unavailable(Unavailable::BootstrapOutage)
+        }
+    }
+
+    fn declared_exposure(&self) -> ExposureSurface {
+        ExposureSurface::none()
+    }
+}
+
+// AC#5 (finding #1): an Explicit plan naming an UNREGISTERED mechanism does not abort -
+// the registry consults the mechanisms it does hold, skipping the unknown one (which is
+// surfaced on stderr, not silently ignored in the result).
+#[tokio::test]
+async fn an_unknown_mechanism_in_an_explicit_plan_is_skipped_not_fatal() {
+    let k = key(9);
+    let mut registry = MechanismRegistry::new();
+    registry.register(
+        MechanismId::GlobalDirectory,
+        Arc::new(RecordingDirectory {
+            id: MechanismId::GlobalDirectory,
+            answer: Lookup::Found(vec![record(k)]),
+            log: Arc::new(Mutex::new(Vec::new())),
+        }),
+    );
+    // The plan names Tracker (not registered) then GlobalDirectory (registered).
+    let plan = ExecutionPlan::with_explicit_order(vec![
+        MechanismId::Tracker,
+        MechanismId::GlobalDirectory,
+    ]);
+    let res = registry
+        .resolve(&BatchResolveRequest::single(k), &budget(), &plan)
+        .await
+        .expect("an unknown mechanism is non-fatal");
+    assert!(
+        res.outcomes()[0].is_found(),
+        "the registered mechanism still resolves the key; the unknown id is skipped"
     );
 }
 

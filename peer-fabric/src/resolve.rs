@@ -687,6 +687,13 @@ impl MechanismRegistry {
         let start = Instant::now();
         let mut warnings = Vec::new();
         let ordered = self.ordered(plan, &mut warnings);
+        // Surface a misconfigured plan (an Explicit order naming an unregistered
+        // mechanism) rather than silently dropping it - fail verbosely. Non-fatal:
+        // correctness does not depend on a mechanism the registry does not hold, so the
+        // consultation continues with the mechanisms it does have.
+        for warning in &warnings {
+            eprintln!("peer-fabric: resolver plan warning: {warning}");
+        }
 
         // Per-key aggregation across mechanisms, in plan order. Each mechanism is asked
         // the SAME positional batch (asker-named keys only), and its per-key outcome is
@@ -696,8 +703,12 @@ impl MechanismRegistry {
         // absence-with-no-conclusion and let a later mechanism still answer.
         let mut aggregated: Vec<KeyResolution> =
             vec![KeyResolution::NotAttempted; request.keys().len()];
-        let mut any_found = false;
         let mut any_unavailable = false;
+        // Track whether THIS registry's total deadline actually cut the loop, so the
+        // reported `resource` is a real event (not inferred from verdict flags, which
+        // mislabels a healthy mixed envelope as DeadlineCut and a spent envelope as
+        // Completed).
+        let mut deadline_cut = false;
 
         for mechanism in ordered {
             // Under FirstHolder, once every key has a holder there is nothing left to ask.
@@ -712,6 +723,7 @@ impl MechanismRegistry {
                 .checked_sub(start.elapsed())
                 .unwrap_or(Duration::ZERO);
             if remaining.is_zero() {
+                deadline_cut = true;
                 break;
             }
             let sub_budget = DiscoveryBudget::new(remaining, budget.max_peers);
@@ -725,7 +737,6 @@ impl MechanismRegistry {
                         if !slot.is_found() {
                             *slot = KeyResolution::Found(records.clone());
                         }
-                        any_found = true;
                     }
                     KeyResolution::Miss => {
                         // A healthy absence only upgrades a not-yet-authoritative slot.
@@ -746,15 +757,22 @@ impl MechanismRegistry {
 
         let latency_ns = u64::try_from(start.elapsed().as_nanos()).unwrap_or(u64::MAX);
         let complete = aggregated.iter().all(KeyResolution::is_authoritative);
-        let resource = if complete {
-            ResourceOutcome::Completed
-        } else if any_found {
-            // Some keys resolved, others did not: a partial consultation cut by the
-            // total deadline / an unavailable mechanism.
+        // Derive the envelope outcome from what ACTUALLY happened, in priority order:
+        // a real deadline cut > a fully-resolved consultation > an unavailable mechanism
+        // left keys unresolved. A healthy mixed Found+Unavailable envelope with budget to
+        // spare is MechanismDown (a mechanism was down), NOT DeadlineCut; a spent envelope
+        // that resolved nothing is DeadlineCut, NOT Completed. This keeps `resource`
+        // consistent with `is_complete()`/`is_partial()`.
+        let resource = if deadline_cut {
             ResourceOutcome::DeadlineCut
+        } else if complete {
+            ResourceOutcome::Completed
         } else if any_unavailable {
             ResourceOutcome::MechanismDown
         } else {
+            // No deadline event, no failed mechanism, yet not every key is authoritative
+            // (e.g. an empty registry, or a sub-mechanism deferred a key under its own
+            // budget): the registry's own envelope ran to completion.
             ResourceOutcome::Completed
         };
         Ok(BatchResolution::new(
