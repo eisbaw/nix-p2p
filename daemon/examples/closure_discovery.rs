@@ -243,10 +243,10 @@ async fn run_arm(
     let started = Instant::now();
     let resolved = if batched {
         discovery
-            .resolve_many(keys)
+            .resolve_many(keys, &peer_fabric::DiscoveryBudget::default())
             .await
             .iter()
-            .filter(|c| c.is_some())
+            .filter(|c| c.is_found())
             .count()
     } else {
         let mut hits = 0;

@@ -83,6 +83,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
+use peer_fabric::{DiscoveryBudget, Unavailable};
 
 use crate::availability::AvailabilityIndex;
 use crate::claim::{
@@ -115,12 +116,102 @@ pub const PROBE_TIMEOUT: Duration = Duration::from_secs(5);
 /// fetch bound, so discovery stays a bounded FRACTION of the overall build-path
 /// budget. It is a BACKSTOP, not the common path: on a live peer set the first peer
 /// answers in milliseconds and this never fires; it bites only the pathological
-/// silent/wedged config the per-probe bound alone left unbounded. With per-peer fault
-/// abandonment (task-106 AC#2) a silent peer now costs ONE [`PROBE_TIMEOUT`], so
-/// sequentially this deadline backstops any configuration beyond ~6 dead peers.
-/// PROVISIONAL, like the fetch envelope: task-100 threads the CALLER's real budget
-/// through the discovery seam and subsumes this internal default.
+/// silent/wedged config the per-probe bound alone left unbounded.
+///
+/// SUBSUMED (TASK-232). This is NO LONGER a live internal bound raced against a caller
+/// deadline: [`Discovery::resolve_many`] now takes the caller's
+/// [`DiscoveryBudget`] and enforces `budget.deadline` as the SINGLE total-call bound
+/// (no double-bound). This constant survives only as the DEFAULT deadline a composition
+/// root passes when it has no tighter budget of its own; `DirectDiscovery` holds no
+/// internal total-timeout field anymore.
 pub const RESOLVE_MANY_TIMEOUT: Duration = Duration::from_secs(30);
+
+// -------------------------------------------------------------------------
+// TASK-232: the typed per-key outcome of a closure resolution.
+// -------------------------------------------------------------------------
+
+/// The TYPED outcome of resolving ONE closure key (TASK-232): the daemon-core / wave-2a
+/// mirror of peer-fabric's [`KeyResolution`](peer_fabric::KeyResolution), in THIS type
+/// universe ([`NarHashKey`] -> [`Claim`]). It carries the SAME four-way distinction the
+/// TASK-100 `ProviderDirectory` contract hardened, replacing the old `Option<Claim>` whose
+/// `None` folded a dead/faulted mechanism, a spent deadline and a genuine absence into ONE
+/// indistinguishable value:
+///
+///   * [`Found`](ClaimResolution::Found) - a peer answered `Have`; the merged holder claim.
+///   * [`Miss`](ClaimResolution::Miss) - EVERY consulted known peer authoritatively answered
+///     `Absent`, in full, within budget. A caller may trust this as absence.
+///   * [`Unavailable`](ClaimResolution::Unavailable) - a peer that could hold the key could
+///     NOT be consulted (a per-peer fault, a probe timeout, or an unusable/misaligned
+///     answer). NOT absence: a dead mechanism can never read as nobody-has-it, so this is
+///     the variant that keeps a fault from becoming a false [`Miss`](ClaimResolution::Miss).
+///   * [`NotAttempted`](ClaimResolution::NotAttempted) - the caller's TOTAL deadline was
+///     spent before the full known-peer set was consulted for this key (a PARTIAL result).
+///
+/// `Found` carries a [`Claim`], NOT a peer-fabric `ProviderRecord`: `DirectDiscovery` probes
+/// a wave-2a known-peer set over the [`PeerQuery`] seam and produces UNSIGNED claims, a
+/// different surface from the DHT's signed `ProviderRecord`. Only the OUTCOME taxonomy
+/// (peer-fabric's [`Unavailable`]) is shared, not the holder payload - so no frozen wire is
+/// touched.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ClaimResolution {
+    /// A peer answered `Have`: the complete, merged holder [`Claim`].
+    Found(Claim),
+    /// Every consulted known peer authoritatively answered `Absent`, in full, within budget.
+    Miss,
+    /// A peer that could hold the key could not be consulted (fault / timeout / unusable
+    /// answer). NOT absence; never cache it as a negative.
+    Unavailable(Unavailable),
+    /// The total deadline was spent before the full known-peer set was consulted (partial).
+    NotAttempted,
+}
+
+impl ClaimResolution {
+    /// The holder claim if this is a [`Found`](ClaimResolution::Found), else `None`. A
+    /// convenience that FLATTENS the Miss/Unavailable/NotAttempted distinction; use the
+    /// variant directly where that distinction matters.
+    pub fn found(&self) -> Option<&Claim> {
+        match self {
+            ClaimResolution::Found(claim) => Some(claim),
+            _ => None,
+        }
+    }
+
+    /// Consume into the holder claim if [`Found`](ClaimResolution::Found), else `None`.
+    pub fn into_found(self) -> Option<Claim> {
+        match self {
+            ClaimResolution::Found(claim) => Some(claim),
+            _ => None,
+        }
+    }
+
+    /// `true` only for [`Found`](ClaimResolution::Found).
+    pub fn is_found(&self) -> bool {
+        matches!(self, ClaimResolution::Found(_))
+    }
+
+    /// `true` only for [`Miss`](ClaimResolution::Miss) - a healthy, authoritative absence.
+    pub fn is_miss(&self) -> bool {
+        matches!(self, ClaimResolution::Miss)
+    }
+
+    /// `true` only for [`Unavailable`](ClaimResolution::Unavailable) - could-not-consult.
+    pub fn is_unavailable(&self) -> bool {
+        matches!(self, ClaimResolution::Unavailable(_))
+    }
+
+    /// `true` only for [`NotAttempted`](ClaimResolution::NotAttempted) - the deadline was
+    /// spent before the full peer set was consulted.
+    pub fn is_not_attempted(&self) -> bool {
+        matches!(self, ClaimResolution::NotAttempted)
+    }
+
+    /// Whether this key reached an AUTHORITATIVE verdict - a `Found` claim or a healthy
+    /// `Miss`. Unavailable and NotAttempted are non-authoritative (the resolution is partial
+    /// while any key is one of them).
+    pub fn is_authoritative(&self) -> bool {
+        matches!(self, ClaimResolution::Found(_) | ClaimResolution::Miss)
+    }
+}
 
 // -------------------------------------------------------------------------
 // The Discovery seam: NarHash -> a complete claim, or a miss.
@@ -161,14 +252,34 @@ pub trait Discovery: Send + Sync {
     /// the wire form forbids duplicates, so an implementation must de-duplicate
     /// before it probes.
     ///
-    /// The DEFAULT implementation is the pre-task-91 behaviour - one
-    /// [`resolve`](Self::resolve) per key - so every existing [`Discovery`] impl
-    /// keeps working unchanged and a batching impl is an override, not a rewrite.
-    /// It is also the honest baseline the measurement compares against.
-    async fn resolve_many(&self, keys: &[NarHashKey]) -> Vec<Option<Claim>> {
+    /// The DEFAULT implementation is one [`resolve`](Self::resolve) per key under the
+    /// caller's TOTAL `budget` (TASK-232): so every existing [`Discovery`] impl keeps
+    /// working unchanged and a batching impl is an override, not a rewrite. Keys reached
+    /// after `budget.deadline` is spent are typed [`ClaimResolution::NotAttempted`] (a
+    /// PARTIAL result), never a false [`Miss`](ClaimResolution::Miss). Because single-key
+    /// [`resolve`](Self::resolve) can only answer `Some`/`None`, this default can produce
+    /// only `Found`/`Miss`/`NotAttempted` - it NEVER fabricates an `Unavailable`, which is
+    /// the honest thing for a mechanism whose single-key primitive cannot report a fault.
+    async fn resolve_many(
+        &self,
+        keys: &[NarHashKey],
+        budget: &DiscoveryBudget,
+    ) -> Vec<ClaimResolution> {
+        // The SINGLE total-call bound (TASK-232): the caller's deadline, taken once. No
+        // internal timeout races it. Integer Instant/Duration only - no floats.
+        let deadline = Instant::now() + budget.deadline;
         let mut out = Vec::with_capacity(keys.len());
+        let mut cut = false;
         for key in keys {
-            out.push(self.resolve(key).await);
+            if cut || Instant::now() >= deadline {
+                cut = true;
+                out.push(ClaimResolution::NotAttempted);
+                continue;
+            }
+            out.push(match self.resolve(key).await {
+                Some(claim) => ClaimResolution::Found(claim),
+                None => ClaimResolution::Miss,
+            });
         }
         out
     }
@@ -829,27 +940,24 @@ pub struct DirectDiscovery {
     peers: Vec<NodeId>,
     query: Arc<dyn PeerQuery>,
     probe_timeout: Duration,
-    /// The backstop over a whole [`resolve_many`](Discovery::resolve_many) call (see
-    /// [`RESOLVE_MANY_TIMEOUT`]). Bounds the SUM of the per-probe waits, which the
-    /// per-probe [`probe_timeout`](Self::probe_timeout) alone does not (task-106).
-    total_timeout: Duration,
 }
 
 impl DirectDiscovery {
     /// Probe `peers` (in order) via `query`, with the default [`PROBE_TIMEOUT`] per
-    /// probe and [`RESOLVE_MANY_TIMEOUT`] over a whole closure resolution.
+    /// probe. The TOTAL-call bound is the caller's [`DiscoveryBudget`] passed to
+    /// [`resolve_many`](Discovery::resolve_many) (TASK-232) - it is no longer an
+    /// internal field, so there is exactly ONE total deadline, not two racing.
     pub fn new(peers: Vec<NodeId>, query: Arc<dyn PeerQuery>) -> Self {
         Self {
             peers,
             query,
             probe_timeout: PROBE_TIMEOUT,
-            total_timeout: RESOLVE_MANY_TIMEOUT,
         }
     }
 
     /// As [`new`](Self::new) but with an explicit per-peer probe bound (tests use a
-    /// short one to prove a hanging peer still yields a fast miss). The total-call
-    /// backstop keeps its [`RESOLVE_MANY_TIMEOUT`] default.
+    /// short one to prove a hanging peer still yields a fast, typed outcome). The
+    /// total-call bound is the caller's [`DiscoveryBudget`], not a field here.
     pub fn with_timeout(
         peers: Vec<NodeId>,
         query: Arc<dyn PeerQuery>,
@@ -859,24 +967,6 @@ impl DirectDiscovery {
             peers,
             query,
             probe_timeout,
-            total_timeout: RESOLVE_MANY_TIMEOUT,
-        }
-    }
-
-    /// As [`with_timeout`](Self::with_timeout) but ALSO pins the total-call backstop,
-    /// so a test can prove the SUM over many silent peers is bounded by the total,
-    /// not by N x the per-probe bound (task-106 AC#1).
-    pub fn with_bounds(
-        peers: Vec<NodeId>,
-        query: Arc<dyn PeerQuery>,
-        probe_timeout: Duration,
-        total_timeout: Duration,
-    ) -> Self {
-        Self {
-            peers,
-            query,
-            probe_timeout,
-            total_timeout,
         }
     }
 
@@ -899,6 +989,95 @@ impl DirectDiscovery {
             transports: offers,
             relay: None,
             signatures: vec![],
+        }
+    }
+}
+
+/// Per-key cross-peer accumulator for [`DirectDiscovery::resolve_many`] (TASK-232),
+/// applying the TASK-100 contract's ONE RULE in the Claim type universe: a key is an
+/// authoritative [`Miss`](ClaimResolution::Miss) ONLY if at least one peer authoritatively
+/// answered `Absent`, no peer that could have answered it faulted, and the total deadline
+/// did not cut its consultation short. `Found` is terminal (first `Have` wins); a mechanism
+/// fault is sticky and BLOCKS a `Miss` (a dead/unusable peer can never read as
+/// nobody-has-it).
+#[derive(Clone, Default)]
+struct ClaimAcc {
+    /// The first `Have` claim for this key (a `Found` is terminal - it wins).
+    found: Option<Claim>,
+    /// The first could-not-consult reason (a per-peer fault, a probe timeout, or an
+    /// unusable answer). First-wins keeps the most specific earlier reason.
+    fault: Option<Unavailable>,
+    /// At least one consulted peer authoritatively answered `Absent` for this key.
+    saw_absent: bool,
+}
+
+impl ClaimAcc {
+    fn is_found(&self) -> bool {
+        self.found.is_some()
+    }
+
+    fn note_found(&mut self, claim: Claim) {
+        if self.found.is_none() {
+            self.found = Some(claim);
+        }
+    }
+
+    fn note_absent(&mut self) {
+        self.saw_absent = true;
+    }
+
+    fn note_fault(&mut self, why: Unavailable) {
+        if self.fault.is_none() {
+            self.fault = Some(why);
+        }
+    }
+
+    /// Decide the key's final typed outcome. `deadline_cut` is the batch-level flag: the
+    /// total deadline stopped the peer loop before the full known-peer set was consulted.
+    /// Found wins; else a fault is could-not-consult (Unavailable), NEVER an authoritative
+    /// absence; else a deadline cut leaves it a partial NotAttempted; else an authoritative
+    /// Absent-by-every-consulted-peer is a Miss; else (no peer was ever consulted, e.g. an
+    /// empty peer set) nothing was attempted, so NotAttempted - never a false Miss.
+    fn finalize(self, deadline_cut: bool) -> ClaimResolution {
+        if let Some(claim) = self.found {
+            ClaimResolution::Found(claim)
+        } else if let Some(why) = self.fault {
+            ClaimResolution::Unavailable(why)
+        } else if deadline_cut {
+            ClaimResolution::NotAttempted
+        } else if self.saw_absent {
+            ClaimResolution::Miss
+        } else {
+            ClaimResolution::NotAttempted
+        }
+    }
+}
+
+/// Mark EVERY still-pending key of a peer (all of `positions`) as could-not-consult - the
+/// per-PEER fault path, where the fault is true of every key the peer was going to answer.
+fn note_fault_all(
+    acc: &mut [ClaimAcc],
+    positions: &HashMap<NarHashKey, Vec<usize>>,
+    why: Unavailable,
+) {
+    for idxs in positions.values() {
+        for &i in idxs {
+            acc[i].note_fault(why.clone());
+        }
+    }
+}
+
+/// Mark only THIS chunk's keys as could-not-consult - the per-ANSWER fault path (a
+/// misaligned reply), which does not implicate the peer's other chunks.
+fn note_fault_chunk(
+    acc: &mut [ClaimAcc],
+    positions: &HashMap<NarHashKey, Vec<usize>>,
+    chunk: &[NarHashKey],
+    why: Unavailable,
+) {
+    for key in chunk {
+        for &i in positions.get(key).into_iter().flatten() {
+            acc[i].note_fault(why.clone());
         }
     }
 }
@@ -937,88 +1116,71 @@ impl Discovery for DirectDiscovery {
         None
     }
 
-    /// Resolve a whole closure with ONE probe per peer per chunk (task-91).
+    /// Resolve a whole closure with ONE probe per peer per chunk (task-91), into TYPED
+    /// per-key [`ClaimResolution`]s (TASK-232) - never a lossy `Option<Claim>` that folds
+    /// a dead peer, a spent deadline and a genuine absence into one indistinguishable
+    /// `None`.
     ///
     /// The shape of the work, and why it is this shape:
-    ///   * The DISTINCT still-unresolved keys are collected per peer, so a peer is
-    ///     never asked about a key an earlier peer already answered `Have` for, and
-    ///     never asked the same key twice (the wire forbids duplicates; a caller's
-    ///     closure list may legitimately contain them).
-    ///   * The batch is chunked at [`MAX_BATCH_HOLD_KEYS`], so a 1000-path closure
-    ///     is 4 probes per peer rather than 1000 - and the cap is enforced by
-    ///     construction here, never discovered as a peer's rejection.
-    ///   * Peers are tried in order and the loop STOPS as soon as every key is
-    ///     resolved, so the common case (the first peer holds the closure) really
-    ///     is one round trip.
-    ///   * The whole call is bounded by [`RESOLVE_MANY_TIMEOUT`] (task-106 AC#1), not
-    ///     only per probe: a deadline is taken once at entry, each probe waits at most
+    ///   * The DISTINCT keys still WITHOUT a holder are collected per peer, so a peer is
+    ///     never asked about a key an earlier peer already answered `Have` for, and never
+    ///     asked the same key twice (the wire forbids duplicates; a caller's closure list
+    ///     may legitimately contain them). A key one peer faulted on OR answered `Absent`
+    ///     is still worth asking a LATER peer (only a `Found` is terminal).
+    ///   * The batch is chunked at [`MAX_BATCH_HOLD_KEYS`], so a 1000-path closure is 4
+    ///     probes per peer rather than 1000 - the cap enforced by construction here.
+    ///   * Peers are tried in order and the loop STOPS as soon as every key has a holder,
+    ///     so the common case (the first peer holds the closure) really is one round trip.
+    ///   * The whole call is bounded by the CALLER's [`DiscoveryBudget`] total deadline
+    ///     (TASK-232, subsuming the old internal `RESOLVE_MANY_TIMEOUT` - ONE bound, not
+    ///     two racing): the deadline is taken once at entry, each probe waits at most
     ///     `min(probe_timeout, remaining)`, and once the budget is spent the peer loop
-    ///     stops. The keys resolved so far are RETURNED (partial results are kept, not
-    ///     discarded); every still-unresolved key folds to a clean miss -> upstream.
-    ///     This is why the naive 8 x 4 x 5 s = ~160 s (pathological ~31 min) blowup of
-    ///     a silent peer set cannot recur: the per-probe bound bounds ONE wait, this
-    ///     bounds their SUM.
+    ///     stops. Every key STILL without a holder when the deadline cut the loop is typed
+    ///     [`ClaimResolution::NotAttempted`] (a PARTIAL marker), never a false `Miss`.
     ///   * On a per-PEER fault (a `query_batch` error - no route / a wire fault - or a
-    ///     probe TIMEOUT, both true of every key alike) the peer's REMAINING chunks
-    ///     are ABANDONED, not just the current one (task-106 AC#2). This matches the
-    ///     rule [`PeerQuery::query_batch`] already states: retrying the other keys
-    ///     against a peer we cannot reach is pure waste. (A peer that DID answer in
-    ///     time but whose answer fails a positional / offer-index defence check is a
-    ///     per-ANSWER fault, not a connectivity one, so that chunk is skipped without
-    ///     abandoning the peer.)
-    ///   * SEQUENTIAL, not concurrent, is a DELIBERATE choice (task-106 AC#3): the
-    ///     total deadline makes the sequential worst case bounded regardless of peer
-    ///     count, and the only residual downside - a silent early peer spending budget
-    ///     a live later peer could have used - degrades to a SAFE miss -> upstream, a
-    ///     performance opportunity cost, not a correctness bug. Sequential also
-    ///     preserves the cross-peer key subtraction (a later peer is asked only about
-    ///     still-unresolved keys) and the deterministic first-Have-wins / failover
-    ///     order (task-66). Concurrency would sacrifice both and needs a bounded
-    ///     fan-out plus a Have tiebreak - which is exactly the versioned execution plan
-    ///     (ordering / parallelism / racing / stop conditions) task-100 AC#5 owns and
-    ///     must not be hardcoded before holdout. Note for task-100: this
-    ///     total-deadline + per-peer-abandon shape is now in place; thread the
-    ///     CALLER's real budget through and subsume [`RESOLVE_MANY_TIMEOUT`].
-    ///   * Each chunk probe carries at most the [`PROBE_TIMEOUT`] bound (clamped to the
-    ///     remaining total budget), so a wedged peer still yields a fast miss. On the responder side a
-    ///     single COLD batch message no longer hashes up to 256 NARs: task-104's
-    ///     per-batch derivation budget ([`crate::MAX_BATCH_DERIVE_WORK`]) makes it
-    ///     answer from what is ALREADY derived plus a bounded number of fresh dumps
-    ///     and defer the rest to `Absent`. Note the interaction with the timeout: for
-    ///     large closures even ONE dump can exceed [`PROBE_TIMEOUT`], so a fully-cold
-    ///     peer is treated as a MISS on first contact regardless of the budget - and
-    ///     because the responder's `answer_batch` runs in an uncancellable blocking
-    ///     task, it still finishes its budgeted dumps and warms its cache for a later
-    ///     query. THIS resolver does NOT re-probe the deferred keys; it falls back
-    ///     upstream (the safe direction). So the under-report is bounded and the
-    ///     responder cache warms for future traffic, but it is not first-contact
-    ///     healing for this fetch.
-    async fn resolve_many(&self, keys: &[NarHashKey]) -> Vec<Option<Claim>> {
-        let mut results: Vec<Option<Claim>> = vec![None; keys.len()];
+    ///     probe TIMEOUT, both true of every key alike) the peer's REMAINING chunks are
+    ///     ABANDONED, not just the current one (task-106 AC#2), and every key that peer
+    ///     was going to answer is marked [`ClaimResolution::Unavailable`] - a
+    ///     could-not-consult, NEVER a false `Miss` (a dead peer might have held it). A
+    ///     later peer can still override that to `Found`.
+    ///   * A per-ANSWER fault (a misaligned reply, or an out-of-range offer index) is the
+    ///     answering peer's fault for the affected keys only: they are marked
+    ///     `Unavailable` and the chunk is skipped WITHOUT abandoning the peer.
+    ///   * A key EVERY consulted peer authoritatively answered `Absent` for, in full and
+    ///     within budget, with no fault blocking it, is an authoritative
+    ///     [`ClaimResolution::Miss`] - the caller may trust it as absence.
+    ///   * SEQUENTIAL, not concurrent, is a DELIBERATE choice (task-106 AC#3): the total
+    ///     deadline makes the sequential worst case bounded regardless of peer count.
+    ///     Concurrency needs a bounded fan-out plus a Have tiebreak - the versioned
+    ///     execution plan task-100 AC#5 owns and must not be hardcoded before holdout.
+    async fn resolve_many(
+        &self,
+        keys: &[NarHashKey],
+        budget: &DiscoveryBudget,
+    ) -> Vec<ClaimResolution> {
+        let mut acc: Vec<ClaimAcc> = vec![ClaimAcc::default(); keys.len()];
         if keys.is_empty() {
-            return results;
+            return Vec::new();
         }
 
-        // The backstop over this WHOLE call (task-106 AC#1). Taken once, checked
-        // before each peer and each chunk; each probe is additionally clamped to the
-        // remaining budget so no single wait can overrun it. Integer Instant/Duration
+        // The SINGLE total-call bound (TASK-232, subsuming RESOLVE_MANY_TIMEOUT). Taken
+        // once, checked before each peer and each chunk; each probe is additionally clamped
+        // to the remaining budget so no single wait can overrun it. Integer Instant/Duration
         // arithmetic only - no floats in a build-path bound.
-        let deadline = Instant::now() + self.total_timeout;
+        let deadline = Instant::now() + budget.deadline;
+        // Whether the total deadline actually cut the peer loop short, so a key that still
+        // has no holder is a PARTIAL NotAttempted (the full known-peer set was NOT consulted
+        // for it), never a fabricated authoritative Miss.
+        let mut deadline_cut = false;
 
         'peers: for peer in &self.peers {
-            // The distinct keys still unanswered, and where each one's answer goes.
+            // The distinct keys still WITHOUT a holder, and where each one's answer goes.
             let mut positions: HashMap<NarHashKey, Vec<usize>> = HashMap::new();
             let mut pending: Vec<NarHashKey> = Vec::new();
             for (i, key) in keys.iter().enumerate() {
-                if results[i].is_some() {
+                if acc[i].is_found() {
                     continue;
                 }
-                // Match on the entry directly: the FIRST time a still-unresolved key
-                // is seen it is recorded once in `pending` (the distinct keys this peer
-                // will be probed for) and its position list is started; a repeat just
-                // appends its position. This replaces a side-effecting `or_insert_with`
-                // closure (whose only job was to push onto `pending`) plus a second
-                // `get_mut` on the same key - one lookup, no hidden effect.
                 match positions.entry(*key) {
                     Entry::Occupied(mut slot) => slot.get_mut().push(i),
                     Entry::Vacant(slot) => {
@@ -1028,21 +1190,21 @@ impl Discovery for DirectDiscovery {
                 }
             }
             if pending.is_empty() {
-                break; // every key resolved; no further peer is worth a round trip
+                break; // every key has a holder; no further peer is worth a round trip
             }
 
             for chunk in pending.chunks(MAX_BATCH_HOLD_KEYS) {
-                // The remaining total budget. Zero means the call deadline is spent:
-                // stop probing entirely and return what is resolved so far (the rest
-                // fold to a clean miss -> upstream). Clamp this probe to the remainder
-                // so a single wait cannot overrun the total (task-106 AC#1).
+                // The remaining total budget. Zero means the call deadline is spent: stop
+                // probing entirely. Clamp this probe to the remainder so a single wait
+                // cannot overrun the total (task-106 AC#1).
                 let remaining = deadline.saturating_duration_since(Instant::now());
                 if remaining.is_zero() {
                     eprintln!(
-                        "daemon: resolve_many hit its total {:?} budget; returning partial \
-                         results, unresolved keys fall back upstream",
-                        self.total_timeout
+                        "daemon: resolve_many hit its total {:?} budget; keys still without a \
+                         holder are NotAttempted (partial), never a false miss",
+                        budget.deadline
                     );
+                    deadline_cut = true;
                     break 'peers;
                 }
                 let probe_bound = self.probe_timeout.min(remaining);
@@ -1058,42 +1220,62 @@ impl Discovery for DirectDiscovery {
                 {
                     Ok(Ok(response)) => response,
                     Ok(Err(err)) => {
-                        // A per-PEER fault (no route / a wire fault) is true of every
-                        // key alike, so ABANDON this peer's remaining chunks rather
-                        // than burning a probe on each - matching the rule
-                        // `query_batch` documents (task-106 AC#2).
+                        // A per-PEER fault (no route / a wire fault) is true of every key
+                        // alike: every key this peer was going to answer is could-not-consult
+                        // (never a false Miss), and its remaining chunks are ABANDONED
+                        // (task-106 AC#2).
                         eprintln!(
                             "daemon: batched discovery probe of {peer} ({} keys) failed: {err}; \
                              abandoning this peer's remaining chunks",
                             chunk.len()
                         );
+                        note_fault_all(
+                            &mut acc,
+                            &positions,
+                            Unavailable::Backend(format!("peer {peer} probe failed: {err}")),
+                        );
                         continue 'peers;
                     }
                     Err(_elapsed) => {
-                        // A probe TIMEOUT is a per-PEER fault too (the peer did not
-                        // answer within the bound): abandon its remaining chunks, do
-                        // not re-probe it chunk by chunk (task-106 AC#2). `probe_bound`
-                        // is the clamped bound actually applied (<= PROBE_TIMEOUT once
-                        // the total budget runs low).
+                        // A probe TIMEOUT is a per-PEER fault too (the peer did not answer):
+                        // could-not-consult for every key, never a false Miss; abandon the
+                        // peer's remaining chunks (task-106 AC#2). `probe_bound` is the
+                        // clamped bound actually applied (<= PROBE_TIMEOUT once budget is low).
                         eprintln!(
                             "daemon: batched discovery probe of {peer} ({} keys) exceeded {:?}; \
-                             treating as a miss and abandoning this peer's remaining chunks",
+                             treating as could-not-consult and abandoning its remaining chunks",
                             chunk.len(),
                             probe_bound
+                        );
+                        note_fault_all(
+                            &mut acc,
+                            &positions,
+                            Unavailable::Backend(format!(
+                                "peer {peer} probe exceeded {probe_bound:?}"
+                            )),
                         );
                         continue 'peers;
                     }
                 };
-                // Defence in depth: the transport already checked this against the
-                // asked count, but a mis-aligned answer would silently bind every
-                // later key to the wrong hash, so it is re-checked at the one place
-                // the mapping is actually performed.
+                // Defence in depth: a mis-aligned answer would silently bind every later
+                // key to the wrong hash. It is an UNUSABLE (protocol-broken) answer for this
+                // chunk's keys - mark them could-not-consult (never a fabricated Miss) and
+                // skip the chunk, but do NOT abandon the peer (a per-answer, not per-peer,
+                // fault).
                 if response.answers.len() != chunk.len() {
                     eprintln!(
                         "daemon: peer {peer} answered {} of {} batched keys; discarding the \
                          whole answer (positional alignment is not recoverable)",
                         response.answers.len(),
                         chunk.len()
+                    );
+                    note_fault_chunk(
+                        &mut acc,
+                        &positions,
+                        chunk,
+                        Unavailable::Backend(format!(
+                            "peer {peer} returned a misaligned batch reply"
+                        )),
                     );
                     continue;
                 }
@@ -1103,18 +1285,17 @@ impl Discovery for DirectDiscovery {
                         offer_indices,
                     } = answer
                     else {
+                        // Absent: this peer authoritatively does not hold the key.
+                        for i in positions.get(key).into_iter().flatten() {
+                            acc[*i].note_absent();
+                        }
                         continue;
                     };
-                    // THIS key's own locators, selected from the response's offer
-                    // dictionary - not the whole dictionary. Two things follow:
-                    // a content-specific locator (a BitTorrent infohash) stays bound
-                    // to the key it was offered for, and a 256-key answer retains
-                    // 256 small vectors rather than 256 clones of the dictionary.
-                    //
-                    // Defence in depth: the codec already proved every index is in
-                    // range. A missing one is therefore a bug on THIS side, so it is
-                    // logged and the whole answer is dropped rather than silently
-                    // producing a claim with a partial offer set.
+                    // THIS key's own locators, selected from the response's offer dictionary
+                    // (not the whole dictionary) so a content-specific locator stays bound to
+                    // its key. The codec already proved every index is in range; a missing
+                    // one is a bug on THIS side - it is an unusable answer for that key, so it
+                    // is marked Unavailable rather than silently producing a partial claim.
                     let mut offers = Vec::with_capacity(offer_indices.len());
                     let mut out_of_range = false;
                     for index in offer_indices {
@@ -1129,6 +1310,11 @@ impl Discovery for DirectDiscovery {
                              its own dictionary of {}; discarding that answer",
                             response.offers.len()
                         );
+                        for i in positions.get(key).into_iter().flatten() {
+                            acc[*i].note_fault(Unavailable::Backend(format!(
+                                "peer {peer} answer for {key} carried an out-of-range offer index"
+                            )));
+                        }
                         continue;
                     }
                     let claim = Self::claim_from_have(
@@ -1140,12 +1326,16 @@ impl Discovery for DirectDiscovery {
                         },
                     );
                     for i in positions.get(key).into_iter().flatten() {
-                        results[*i] = Some(claim.clone());
+                        acc[*i].note_found(claim.clone());
                     }
                 }
             }
         }
-        results
+        // THE ONE choke-point: each per-key accumulator is finalized under the SAME rule the
+        // contract enforces - Found wins; else a fault (dead/unusable mechanism) is
+        // Unavailable, never a Miss; else a deadline cut is NotAttempted (partial); else an
+        // authoritative Absent-by-all is a Miss.
+        acc.into_iter().map(|a| a.finalize(deadline_cut)).collect()
     }
 }
 
@@ -1299,6 +1489,13 @@ mod tests {
     }
 
     /// Two distinct canonical NarHash keys, built from real sha256-shaped bytes.
+    /// A generous total-call budget for the closure-resolution tests whose subject is NOT
+    /// the deadline (TASK-232). Mirrors the old `RESOLVE_MANY_TIMEOUT` default so behaviour
+    /// unrelated to the deadline is unchanged; deadline-focused tests build their own.
+    fn budget() -> DiscoveryBudget {
+        DiscoveryBudget::new(RESOLVE_MANY_TIMEOUT, 16)
+    }
+
     fn key_x() -> NarHashKey {
         NarHashKey::from_sha256_bytes([0x11; 32])
     }
@@ -1872,17 +2069,29 @@ mod tests {
         for key in &all {
             serial.push(discovery.resolve(key).await);
         }
-        let batched = discovery.resolve_many(&all).await;
+        let batched = discovery.resolve_many(&all, &budget()).await;
 
-        assert_eq!(
-            batched, serial,
-            "the batched answer must equal the one-at-a-time answer, position for position"
-        );
+        // The batched TYPED answer must AGREE with the one-at-a-time answer, position for
+        // position: a Found holds exactly the serial claim, and a key no peer holds is an
+        // authoritative Miss (every one of the 3 peers answered Absent, in full) - NOT the
+        // old indistinguishable None (TASK-232).
+        assert_eq!(batched.len(), serial.len());
+        for (i, (typed, opt)) in batched.iter().zip(serial.iter()).enumerate() {
+            assert_eq!(
+                typed.found(),
+                opt.as_ref(),
+                "position {i} must agree with the serial one-at-a-time claim"
+            );
+        }
         // ...and it is a real mixture across peers, so the equality is not vacuous.
-        assert_eq!(batched.iter().filter(|c| c.is_some()).count(), 6);
-        assert!(batched[6..].iter().all(Option::is_none));
-        for (i, claim) in batched.iter().enumerate() {
-            let Some(claim) = claim else { continue };
+        assert_eq!(batched.iter().filter(|c| c.is_found()).count(), 6);
+        assert!(
+            batched[6..].iter().all(ClaimResolution::is_miss),
+            "keys no peer holds are an authoritative Miss (every peer answered Absent), \
+             never a fault or a partial"
+        );
+        for (i, res) in batched.iter().enumerate() {
+            let Some(claim) = res.found() else { continue };
             assert_eq!(claim.key, all[i], "position {i} must answer about all[{i}]");
             assert_eq!(
                 claim.holders,
@@ -1908,7 +2117,7 @@ mod tests {
         }
         let serial_probes = counting.singles.load(Ordering::Relaxed);
 
-        let batched = discovery.resolve_many(&all).await;
+        let batched = discovery.resolve_many(&all, &budget()).await;
         let batch_probes = counting.batches.load(Ordering::Relaxed);
 
         assert_eq!(serial_probes, 20, "one-at-a-time costs one probe per key");
@@ -1919,8 +2128,8 @@ mod tests {
             "the batched arm must not have fallen back to single-key probes"
         );
         assert!(
-            batched.iter().all(Option::is_some),
-            "and it still resolved every key"
+            batched.iter().all(ClaimResolution::is_found),
+            "and it still resolved every key to a Found holder"
         );
     }
 
@@ -1934,12 +2143,19 @@ mod tests {
         let counting = CountingQuery::wrap(Arc::new(rendezvous));
         let discovery = DirectDiscovery::new(vec![node_b()], counting.clone());
 
-        let resolved = discovery.resolve_many(&all).await;
+        let resolved = discovery.resolve_many(&all, &budget()).await;
         assert_eq!(resolved.len(), all.len());
         assert_eq!(
-            resolved.iter().filter(|c| c.is_some()).count(),
+            resolved.iter().filter(|c| c.is_found()).count(),
             5,
-            "the 5 held keys resolve; the rest miss"
+            "the 5 held keys resolve to Found"
+        );
+        assert!(
+            resolved
+                .iter()
+                .filter(|c| !c.is_found())
+                .all(ClaimResolution::is_miss),
+            "the rest are an authoritative Miss (the single peer answered Absent for each)"
         );
         assert_eq!(
             counting.batches.load(Ordering::Relaxed),
@@ -1966,16 +2182,22 @@ mod tests {
         let counting = CountingQuery::wrap(Arc::new(rendezvous));
         let discovery = DirectDiscovery::new(vec![node_b()], counting.clone());
 
-        let resolved = discovery.resolve_many(&with_repeats).await;
+        let resolved = discovery.resolve_many(&with_repeats, &budget()).await;
         assert_eq!(
             counting.keys_in_batches.load(Ordering::Relaxed),
             3,
             "5 positions, 3 distinct keys - the peer is asked 3 things"
         );
-        for (i, claim) in resolved.iter().enumerate() {
+        for (i, res) in resolved.iter().enumerate() {
             match with_repeats[i] == all[0] {
-                true => assert!(claim.is_some(), "every position of the held key resolves"),
-                false => assert!(claim.is_none()),
+                true => assert!(
+                    res.is_found(),
+                    "every position of the held key resolves to Found"
+                ),
+                false => assert!(
+                    res.is_miss(),
+                    "an unheld key the single peer answered Absent for is an authoritative Miss"
+                ),
             }
         }
     }
@@ -2082,15 +2304,18 @@ mod tests {
 
     #[tokio::test]
     async fn a_misaligned_batch_answer_is_discarded_whole() {
-        // Positional alignment is not recoverable from a short answer, so the
-        // resolver must throw the WHOLE answer away rather than use its prefix.
+        // Positional alignment is not recoverable from a short answer, so the resolver must
+        // throw the WHOLE answer away rather than use its prefix. TASK-232: a discarded
+        // (unusable) answer is could-not-consult -> Unavailable, NEVER a fabricated Miss (the
+        // key's true holding is unknown; the sole peer's reply was protocol-broken).
         let all = keys(4);
         let discovery = DirectDiscovery::new(vec![node_b()], Arc::new(MisalignedPeer));
-        let resolved = discovery.resolve_many(&all).await;
+        let resolved = discovery.resolve_many(&all, &budget()).await;
         assert_eq!(resolved.len(), 4);
         assert!(
-            resolved.iter().all(Option::is_none),
-            "a mis-aligned answer must resolve NOTHING, not a shifted prefix"
+            resolved.iter().all(ClaimResolution::is_unavailable),
+            "a mis-aligned answer must resolve to Unavailable (could-not-consult), never a \
+             shifted prefix and never a false Miss"
         );
     }
 
@@ -2125,15 +2350,15 @@ mod tests {
         let discovery =
             DirectDiscovery::new(vec![node_b()], Arc::new(SingleOnly(counting.clone())));
 
-        let resolved = discovery.resolve_many(&all).await;
+        let resolved = discovery.resolve_many(&all, &budget()).await;
         assert_eq!(
             counting.singles.load(Ordering::Relaxed),
             6,
             "the shim really does cost one round trip per key"
         );
-        assert_eq!(resolved.iter().filter(|c| c.is_some()).count(), 2);
-        for (i, claim) in resolved.iter().enumerate().take(2) {
-            let claim = claim.as_ref().expect("held");
+        assert_eq!(resolved.iter().filter(|c| c.is_found()).count(), 2);
+        for (i, res) in resolved.iter().enumerate().take(2) {
+            let claim = res.found().expect("held");
             assert_eq!(claim.key, all[i]);
             assert_eq!(
                 claim.transports,
@@ -2230,20 +2455,25 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_hanging_peer_yields_a_bounded_batched_miss() {
-        // The AC#2 bounded-miss guarantee must survive batching: a wedged peer
-        // cannot stall a whole closure resolution either.
+    async fn a_hanging_peer_yields_a_bounded_batched_unavailable() {
+        // The AC#2 bounded-outcome guarantee must survive batching: a wedged peer cannot
+        // stall a whole closure resolution. TASK-232: a wedged (dead) peer is could-not-
+        // consult -> Unavailable, NEVER a fabricated Miss - the key's true holding is
+        // unknown because the only peer never answered.
         let probe_bound = Duration::from_millis(150);
         let discovery =
             DirectDiscovery::with_timeout(vec![node_b()], Arc::new(HangingQuery), probe_bound);
         let all = keys(4);
         let started = std::time::Instant::now();
-        let resolved = discovery.resolve_many(&all).await;
+        let resolved = discovery.resolve_many(&all, &budget()).await;
         let elapsed = started.elapsed();
-        assert!(resolved.iter().all(Option::is_none));
+        assert!(
+            resolved.iter().all(ClaimResolution::is_unavailable),
+            "a wedged peer yields Unavailable (could-not-consult), never a false Miss"
+        );
         assert!(
             elapsed < Duration::from_secs(5),
-            "a batched miss must be bounded too, took {elapsed:?}"
+            "a batched resolution against a wedged peer must be bounded too, took {elapsed:?}"
         );
     }
 
@@ -2256,28 +2486,32 @@ mod tests {
         // 5 s, and at production scale 8 x 4 x 5 s = ~160 s / ~31 min). The total
         // deadline bounds the SUM: the call returns at ~`total` regardless of N.
         //
-        // MUTATION PROOF (task-106 AC#1): delete the `deadline` / `remaining` /
-        // `break 'peers` budget check in `resolve_many` and this reverts to ~N x
-        // probe_bound (~5 s here), blowing the `< 1500 ms` assertion. The gap between
-        // the 300 ms budget and the 5 s naive sum is the bite.
+        // MUTATION PROOF (task-106 AC#1, TASK-232): delete the `deadline` / `remaining` /
+        // `break 'peers` budget check in `resolve_many` (now sourced from `budget.deadline`)
+        // and this reverts to ~N x probe_bound (~5 s here), blowing the `< 1500 ms`
+        // assertion. The gap between the 300 ms budget and the 5 s naive sum is the bite.
+        // The total deadline is now the CALLER's DiscoveryBudget - a SINGLE bound, no
+        // internal RESOLVE_MANY_TIMEOUT racing it.
         let probe_bound = Duration::from_millis(100);
         let total = Duration::from_millis(300);
         let silent: Vec<NodeId> = (1..=50u8).map(|i| NodeId::from_bytes([i; 32])).collect();
-        let discovery =
-            DirectDiscovery::with_bounds(silent, Arc::new(HangingQuery), probe_bound, total);
+        let discovery = DirectDiscovery::with_timeout(silent, Arc::new(HangingQuery), probe_bound);
 
         let all = keys(4);
         let started = std::time::Instant::now();
-        let resolved = discovery.resolve_many(&all).await;
+        let resolved = discovery
+            .resolve_many(&all, &DiscoveryBudget::new(total, 16))
+            .await;
         let elapsed = started.elapsed();
 
         assert!(
-            resolved.iter().all(Option::is_none),
-            "every silent peer is a miss; the closure folds to upstream"
+            resolved.iter().all(ClaimResolution::is_unavailable),
+            "every silent peer is could-not-consult -> Unavailable (never a false Miss); \
+             the closure still folds to upstream because nothing is Found"
         );
         assert!(
             elapsed < Duration::from_millis(1500),
-            "resolve_many must be bounded by its TOTAL deadline (~{total:?}), not by \
+            "resolve_many must be bounded by its TOTAL caller deadline (~{total:?}), not by \
              50 x {probe_bound:?} = ~5 s; took {elapsed:?}"
         );
     }
@@ -2324,16 +2558,110 @@ mod tests {
         });
         let discovery = DirectDiscovery::new(vec![node_b()], peer.clone());
 
-        let resolved = discovery.resolve_many(&all).await;
+        let resolved = discovery.resolve_many(&all, &budget()).await;
         assert!(
-            resolved.iter().all(Option::is_none),
-            "a peer that faults every chunk resolves nothing"
+            resolved.iter().all(ClaimResolution::is_unavailable),
+            "a peer that faults every chunk leaves every key Unavailable (could-not-consult), \
+             never a false Miss"
         );
         assert_eq!(
             peer.batch_calls.load(Ordering::Relaxed),
             1,
             "the faulting peer must be abandoned after its FIRST chunk (2-chunk \
              closure), not re-probed for the second"
+        );
+    }
+
+    // ---- TASK-232 AC#3 bite: a dead mechanism yields Unavailable, not a false Miss ----
+
+    /// A transport that FAULTS (a per-peer error) for one designated node and answers
+    /// honestly from an in-process index for every other node. Lets one `resolve_many` call
+    /// mix a could-not-consult peer with an honest Absent peer.
+    struct MixedPeer {
+        honest: InProcessPeerQuery,
+        faulty_node: NodeId,
+    }
+    #[async_trait]
+    impl PeerQuery for MixedPeer {
+        async fn query(
+            &self,
+            _node: &NodeId,
+            _query: &HoldQuery,
+        ) -> Result<HoldResponse, PeerQueryError> {
+            unreachable!("this test only drives the batch path")
+        }
+        async fn query_batch(
+            &self,
+            node: &NodeId,
+            query: &BatchHoldQuery,
+        ) -> Result<BatchHoldResponse, PeerQueryError> {
+            if *node == self.faulty_node {
+                return Err(PeerQueryError::Answer("simulated dead mechanism".into()));
+            }
+            self.honest.query_batch(node, query).await
+        }
+    }
+
+    #[tokio::test]
+    async fn a_dead_mechanism_yields_unavailable_not_a_false_miss() {
+        // AC#3 (TASK-232), the load-bearing distinction on the shipped resolve path: a key
+        // NO peer holds is an authoritative Miss ONLY when every consulted peer answered
+        // Absent in full; if a peer that could have held it FAULTED, the key is Unavailable
+        // (could-not-consult), NEVER a false Miss - a dead mechanism can never read as
+        // nobody-has-it.
+        //
+        // MUTATION PROOF: drop the `else if let Some(why) = self.fault` arm in
+        // ClaimAcc::finalize (so a faulted+absent key falls through to the `saw_absent` Miss
+        // arm). The Unavailable assertion below then reddens while the Miss CONTROL stays
+        // green - pinning the fault-blocks-Miss rule exactly, not merely "something differs".
+        let unheld = key_x();
+
+        // CONTROL: with only an HONEST peer that answers Absent, an unheld key is an
+        // authoritative Miss - so the bite below is a real state change, not a vacuous
+        // "nothing is ever a Miss".
+        let (honest_idx, held_key, _dir) =
+            index_holding(node_b(), b"the honest peer holds something else".to_vec());
+        assert_ne!(
+            unheld, held_key,
+            "the probed key must be one node_b does NOT hold"
+        );
+        let mut honest_only = InProcessPeerQuery::new();
+        honest_only.add_index(node_b(), honest_idx);
+        let miss = DirectDiscovery::new(vec![node_b()], Arc::new(honest_only));
+        let control = miss
+            .resolve_many(std::slice::from_ref(&unheld), &budget())
+            .await;
+        assert!(
+            control[0].is_miss(),
+            "every consulted peer answered Absent in full -> authoritative Miss, got {:?}",
+            control[0]
+        );
+
+        // THE BITE: put a FAULTING peer AHEAD of the honest one. The faulting peer might
+        // have held `unheld`; we could not consult it, so even though the honest peer says
+        // Absent the outcome must be Unavailable, not Miss.
+        let (honest_idx2, _k, _dir2) =
+            index_holding(node_b(), b"the honest peer holds something else".to_vec());
+        let mut honest2 = InProcessPeerQuery::new();
+        honest2.add_index(node_b(), honest_idx2);
+        let faulty_node = NodeId::from_bytes([0xf0; 32]);
+        let mixed = MixedPeer {
+            honest: honest2,
+            faulty_node,
+        };
+        let discovery = DirectDiscovery::new(vec![faulty_node, node_b()], Arc::new(mixed));
+        let resolved = discovery
+            .resolve_many(std::slice::from_ref(&unheld), &budget())
+            .await;
+        assert!(
+            resolved[0].is_unavailable(),
+            "a faulted (dead) mechanism must yield Unavailable, not a false Miss; got {:?}",
+            resolved[0]
+        );
+        assert!(
+            !resolved[0].is_miss(),
+            "a dead mechanism can NEVER read as an authoritative Miss (the honest peer's \
+             Absent does not license absence while a peer that could hold it was unreachable)"
         );
     }
 
@@ -2606,12 +2934,12 @@ mod tests {
         // locator that binds to a key the asker never asked about.
         let all = keys(3);
         let discovery = DirectDiscovery::new(vec![node_b()], Arc::new(PerContentLocatorPeer));
-        let resolved = discovery.resolve_many(&all).await;
+        let resolved = discovery.resolve_many(&all, &budget()).await;
 
         assert_eq!(resolved.len(), 3);
         for (i, key) in all.iter().enumerate() {
             let claim = resolved[i]
-                .as_ref()
+                .found()
                 .unwrap_or_else(|| panic!("key {i} must resolve"));
             let mine = KnownTransport::BitTorrent {
                 infohash: infohash_for(key),

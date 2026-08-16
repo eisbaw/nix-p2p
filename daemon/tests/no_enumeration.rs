@@ -116,6 +116,11 @@ const IDENTITY_TYPES: &[&str] = &[
     "NarHashKey",
     "Blake3Digest",
     "Claim",
+    // A `ClaimResolution::Found` carries a `Claim` (TASK-232), so a `Vec<ClaimResolution>`
+    // IS a plural holdings listing just as `Vec<Option<Claim>>` was - and because the word
+    // boundary in `mentions` does NOT match `Claim` inside `ClaimResolution`, it must be
+    // listed in its own right or the guard would stop seeing `resolve_many` at all.
+    "ClaimResolution",
     "StorePath",
     // Every `Have` carries a blake3, so a Vec of these IS a holdings listing -
     // built out of the project's own types, which is what made it easy to miss.

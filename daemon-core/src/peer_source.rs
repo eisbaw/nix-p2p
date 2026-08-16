@@ -292,3 +292,89 @@ impl RawServeDecision for PeerFabricRawServe {
         }
     }
 }
+
+#[cfg(test)]
+mod shipped_path_tests {
+    //! TASK-232 AC#3 on the GENUINELY-SHIPPED decentralized path. `PeerFabricNarSource` is
+    //! the production p2p NAR source; it consults the directory through
+    //! [`peer_fabric::find_providers_bound`] (the bound choke-point, AC#3's direct-caller
+    //! requirement), and the TYPED `Lookup::Miss` vs `Lookup::Unavailable` distinction that
+    //! keeps a fault from becoming a false absence is proven load-bearing by peer-fabric's
+    //! own `classify_lookup` / `KeyResolution` tests and rides in here.
+    //!
+    //! At THIS layer both a directory MISS and a directory FAULT deliberately fold to the
+    //! same fast `SourceError::Unreachable` (S2 upstream fallback): a decentralized miss and
+    //! a decentralized outage are both "p2p cannot serve it here". The property that MUST
+    //! hold, and that this test bites, is the SAFE direction - a fault must never become a
+    //! false SERVE or a hang, and is never cached as a negative (structural: this source
+    //! holds no negative cache).
+
+    use std::sync::Arc;
+
+    use peer_fabric::{
+        DiscoveryBudget, ExposureLedger, ExposureSurface, FakeFabric, FakeProviderDirectory,
+        Lookup, NodeId, SafetyEnvelope, Unavailable,
+    };
+
+    use super::PeerFabricNarSource;
+    use crate::claim::NarHashKey;
+    use crate::source::{NarHash, NarKey, NarPathToken, NarSource, NarinfoTransport, SourceError};
+
+    fn signed_key() -> NarKey {
+        NarKey::SignedNarHash {
+            hash: NarHash::new(NarHashKey::from_sha256_bytes([0x11; 32]).to_string()),
+            upstream_hint: NarPathToken::new("nar/deadbeef.nar.xz"),
+            transport: NarinfoTransport::default(),
+        }
+    }
+
+    fn source_over(directory: FakeProviderDirectory) -> PeerFabricNarSource {
+        let node = NodeId::from_bytes([0x01; 32]);
+        let fabric = FakeFabric::upstream_only(node).with_provider_directory(Arc::new(directory));
+        PeerFabricNarSource::new(
+            Arc::new(fabric),
+            DiscoveryBudget::default(),
+            SafetyEnvelope::default(),
+        )
+    }
+
+    fn fake_directory(result: Lookup<Vec<peer_fabric::ProviderRecord>>) -> FakeProviderDirectory {
+        FakeProviderDirectory::new(
+            result,
+            Vec::new(),
+            ExposureSurface::none(),
+            Arc::new(ExposureLedger::new()),
+        )
+    }
+
+    #[tokio::test]
+    async fn a_directory_fault_folds_to_fallback_never_a_false_serve() {
+        // A directory that FAULTS (Unavailable) must NOT be served as authoritative content
+        // and must NOT hang: it folds to a fast Unreachable that the FallbackNarSource turns
+        // into an upstream fetch. Crucially it is NEVER an Ok(bytes) (a false serve).
+        let source = source_over(fake_directory(Lookup::Unavailable(
+            Unavailable::BootstrapOutage,
+        )));
+        match source.resolve(&signed_key(), None).await {
+            Err(SourceError::Unreachable(_)) => {}
+            Ok(_) => panic!("a directory fault must NEVER become a false serve"),
+            Err(other) => panic!("a directory fault must fold to a fast Unreachable, got {other}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_directory_miss_folds_to_fallback_too() {
+        // The deliberate collapse: a genuine decentralized MISS folds the same way, so the
+        // fault case above is not distinguishable at THIS output BY DESIGN - the typed
+        // distinction that matters lives in peer-fabric (classify_lookup) upstream of here,
+        // and this source never caches either as a negative (no negative cache exists).
+        let source = source_over(fake_directory(Lookup::Miss));
+        assert!(
+            matches!(
+                source.resolve(&signed_key(), None).await,
+                Err(SourceError::Unreachable(_))
+            ),
+            "a directory miss folds to a fast Unreachable (upstream fallback), never a serve"
+        );
+    }
+}
