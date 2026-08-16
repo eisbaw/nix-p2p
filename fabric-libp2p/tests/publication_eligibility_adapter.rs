@@ -15,6 +15,15 @@
 //! `withdraw_refuses_a_key_this_node_never_announced`: a withdrawal ALSO emits a signed record to
 //! the DHT, so the announcer refuses a tombstone for a key it never announced (the self-serve
 //! invariant), closing that emit-to-DHT path too.
+//!
+//! `cross_mode_withdraw_of_an_unallowlisted_key_after_a_public_restart_is_refused` (TASK-231 FIX B,
+//! codex NO-GO): a key persisted under LAN AdmitAll mode, re-seeded into PUBLIC mode after a
+//! restart, is REFUSED at withdraw by the CURRENT authority - no unallowlisted tombstone reaches
+//! the public DHT across a mode transition.
+//!
+//! Every bite asserts on the ExposureLedger (zero DHT ops), not just the return type. The
+//! construction-seal counterpart (an external caller cannot build a shadow announcer with a weaker
+//! authority - FIX A) is a COMPILE-FAIL doc-test on `Libp2pAvailabilityAnnouncer` itself.
 
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -161,4 +170,95 @@ async fn withdraw_refuses_a_key_this_node_never_announced() {
         ),
         other => panic!("withdrawing a never-announced key must be Rejected, got: {other:?}"),
     }
+    // ORACLE: the refusal disclosed NOTHING - the exposure ledger (written immediately before
+    // put_record/stop_providing) is empty, so no tombstone reached the DHT emission path.
+    assert!(
+        fabric.exposure_ledger().is_empty(),
+        "a refused withdraw must emit nothing - no DHT exposure recorded"
+    );
+}
+
+/// A unique per-process durable state directory (so parallel test runs never share a floor).
+fn temp_state_dir(stem: &str) -> std::path::PathBuf {
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let dir = std::env::temp_dir().join(format!(
+        "nix-p2p-task231-{stem}-{}-{now}",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_dir_all(&dir);
+    dir
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cross_mode_withdraw_of_an_unallowlisted_key_after_a_public_restart_is_refused() {
+    // TASK-231 FIX B (codex NO-GO): the `announced` floor carries NO authority provenance, so a
+    // key announced under a permissive LAN (AdmitAll) mode and PERSISTED survives a restart into
+    // PUBLIC allowlist mode. A tombstone is itself a signed record on the public DHT, so
+    // withdrawing that key on the public node MUST be refused - "LAN-share emits ZERO records to
+    // the public DHT" (PRD 102/120/624). MUTATION that reddens it: drop the withdraw-time
+    // `self.eligibility.admit(..)` consult and the unallowlisted tombstone's exposure is recorded
+    // (and it proceeds to put_record).
+    let _ = tracing_subscriber::fmt::try_init();
+    let state_dir = temp_state_dir("xmode-withdraw");
+    let seed = [21u8; 32];
+    let (unallowed_key, unallowed_record) = signed_record(21, [0x99u8; 32]);
+
+    // ---- PHASE 1: LAN mode (AdmitAll) announces + PERSISTS the unallowlisted key ----
+    {
+        let lan = Libp2pFabric::start_durable(
+            NodeConfig::new(seed)
+                .with_network_scope("task231-xmode")
+                .with_admit_all_publication(),
+            state_dir.clone(),
+        )
+        .expect("durable LAN fabric builds");
+        let announcer = lan.announcer().expect("announcer axis present").clone();
+        // The announce persists the per-key floor FAIL-CLOSED *before* publishing (save-before-
+        // publish), so the floor records `unallowed_key` even though this peerless node's publish
+        // itself does not reach a quorum. We only need the durable floor written here.
+        let _ = announcer
+            .announce(
+                &admit_all_witness(&unallowed_record),
+                &AnnounceBudget::new(Duration::from_millis(500), 20),
+            )
+            .await;
+    } // lan fabric dropped == a process shutdown; the state dir persists.
+
+    // ---- PHASE 2: PUBLIC mode (an allowlist that does NOT admit the key) restarts on the SAME
+    // state dir + identity, re-seeding the floor with `unallowed_key`. ----
+    let public = Libp2pFabric::start_durable(
+        NodeConfig::new(seed)
+            .with_network_scope("task231-xmode")
+            // A public allowlist authority that admits only some OTHER key, never `unallowed_key`.
+            .with_publication_eligibility(Arc::new(AllowOnly {
+                allowed: ContentKey::derive_from_signed_nar_hash(&[0x01u8; 32]),
+            })),
+        state_dir.clone(),
+    )
+    .expect("durable PUBLIC fabric builds on the same state dir");
+    let announcer = public.announcer().expect("announcer axis present").clone();
+
+    // THE BITE: the key IS in the re-seeded floor (so it passes the self-serve membership check),
+    // but the CURRENT authority does not admit it -> withdraw is REFUSED with Ineligible (NOT
+    // Rejected-for-never-announced), and NOTHING is disclosed.
+    let refused = announcer.withdraw(&unallowed_key).await;
+    assert!(
+        matches!(
+            refused,
+            Err(AnnounceError::Ineligible(IneligibleReason::NotAllowlisted))
+        ),
+        "a public node must REFUSE (Ineligible) a cross-mode tombstone for an unallowlisted key, \
+         got: {refused:?}"
+    );
+    // ORACLE (codex bite-quality): assert on the ExposureLedger, not just the return type - the
+    // refused withdraw recorded ZERO exposure, so no put_record/stop_providing was reached.
+    assert!(
+        public.exposure_ledger().is_empty(),
+        "a refused cross-mode withdraw must emit nothing to the DHT (empty exposure ledger)"
+    );
+
+    let _ = std::fs::remove_dir_all(&state_dir);
 }

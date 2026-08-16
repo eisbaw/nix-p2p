@@ -48,10 +48,10 @@ use async_trait::async_trait;
 use ed25519_dalek::SigningKey;
 use libp2p::PeerId;
 use peer_fabric::{
-    AnnounceBudget, AnnounceError, AvailabilityAnnouncer, ContentKey, Disclosed, Exposure,
-    ExposureLedger, ExposureSurface, NodeId, ProviderWithdrawal, PublicationEligibility,
-    PublicationWitness, Receipt, Recipient, decode_provider_assertion, encode_provider_record,
-    encode_provider_withdrawal, sign_provider_withdrawal,
+    AnnounceBudget, AnnounceError, AvailabilityAnnouncer, Blake3Digest, ContentKey, Disclosed,
+    Exposure, ExposureLedger, ExposureSurface, NodeId, ProviderRecord, ProviderWithdrawal,
+    PublicationEligibility, PublicationWitness, Receipt, Recipient, decode_provider_assertion,
+    encode_provider_record, encode_provider_withdrawal, sign_provider_withdrawal,
 };
 
 use crate::keys::{provider_index_key, provider_value_key};
@@ -91,6 +91,27 @@ const _: () = assert!(
 );
 
 /// The kad-backed [`AvailabilityAnnouncer`].
+///
+/// ## The eligibility authority is SEALED TO THE FABRIC (TASK-231 FIX A, codex NO-GO)
+///
+/// The constructors ([`new`](Libp2pAvailabilityAnnouncer::new) /
+/// [`durable`](Libp2pAvailabilityAnnouncer::durable)) are `pub(crate)`, so
+/// [`crate::Libp2pFabric`] assembly is the SOLE place an announcer is built and the ONLY input
+/// of its [`PublicationEligibility`] authority. An external caller CANNOT construct a SECOND
+/// announcer over a public fabric's [`SwarmHandle`] with a weaker (`AdmitAll`) authority to
+/// shadow the fabric's - the authority is a property of the fabric/node (the operator mode fixed
+/// at assembly), not re-suppliable at announcer construction. Combined with the `pub(crate)`
+/// `put_record`/`start_providing` seal (TASK-100), the ONLY path from an external caller to the
+/// DHT is the fabric's own announcer with the fabric's own authority.
+///
+/// This is a COMPILE-TIME seal - the doc-test below fails to build (E0624, "associated function
+/// is private") because `new` is not externally reachable:
+///
+/// ```compile_fail,E0624
+/// // `new` is pub(crate): an external caller cannot construct a shadow announcer with its own
+/// // (weaker) authority. Only `Libp2pFabric` assembly builds an announcer.
+/// let _ctor = fabric_libp2p::Libp2pAvailabilityAnnouncer::new;
+/// ```
 pub struct Libp2pAvailabilityAnnouncer {
     handle: SwarmHandle,
     ledger: Arc<ExposureLedger>,
@@ -137,7 +158,11 @@ impl Libp2pAvailabilityAnnouncer {
     /// An announcer driving `handle` for the node identified by `node_id`/`peer_id`,
     /// signing its own withdrawals with `signing_key` (whose verifying key MUST equal
     /// `node_id` - a debug-asserted self-serve invariant).
-    pub fn new(
+    ///
+    /// `pub(crate)` (TASK-231 FIX A): only [`crate::Libp2pFabric`] assembly builds an announcer,
+    /// so its `eligibility` authority is sealed to the fabric and cannot be shadowed by an
+    /// externally-constructed announcer with a weaker authority.
+    pub(crate) fn new(
         handle: SwarmHandle,
         ledger: Arc<ExposureLedger>,
         node_id: NodeId,
@@ -159,8 +184,8 @@ impl Libp2pAvailabilityAnnouncer {
     /// An announcer whose per-key sequence floor is DURABLY backed by `seq_path`
     /// (TASK-176 #1): re-seeded at startup and re-flushed on every announce/withdraw, so
     /// a restarted provider's withdrawal is network-effective instead of silently losing
-    /// at sequence 1.
-    pub fn durable(
+    /// at sequence 1. `pub(crate)` (TASK-231 FIX A): see [`new`](Libp2pAvailabilityAnnouncer::new).
+    pub(crate) fn durable(
         handle: SwarmHandle,
         ledger: Arc<ExposureLedger>,
         node_id: NodeId,
@@ -485,6 +510,33 @@ impl AvailabilityAnnouncer for Libp2pAvailabilityAnnouncer {
                  unauthorized record to the DHT)"
             )));
         }
+
+        // TASK-231 FIX B (codex NO-GO, cross-mode withdraw): the `announced` floor carries NO
+        // authority provenance - it is re-seeded from disk at construction - so a key persisted
+        // under a permissive (LAN AdmitAll) mode survives a restart into PUBLIC allowlist mode and
+        // would emit an UNALLOWLISTED tombstone (a signed record naming `key` + this node) onto
+        // the public DHT, violating "LAN-share emits ZERO records to the public DHT" (PRD
+        // 102/120/624). So consult the CURRENT eligibility authority FAIL-CLOSED, on a probe
+        // record carrying `key` (the allowlist authority keys on the derived ContentKey), BEFORE
+        // the exposure ledger write and any `put_record`/`stop_providing`. A legitimately
+        // allowlisted key still withdraws (admit passes); a de-allowlisted key can no longer be
+        // ACTIVELY retracted on the public DHT - correct: it expires via its own TTL, and a public
+        // node emits ZERO unallowlisted records, tombstones included. Removing this consult is the
+        // mutation the cross-mode withdraw bite catches.
+        let probe = ProviderRecord {
+            key: *key,
+            content: Blake3Digest::from_bytes([0u8; 32]),
+            provider: self.node_id,
+            offers: Vec::new(),
+            sequence: 0,
+            issued_at: 0,
+            expiry: 0,
+            signature: [0u8; 64],
+        };
+        self.eligibility
+            .admit(&probe)
+            .map_err(AnnounceError::Ineligible)?;
+
         // AC#1: propagate a SIGNED withdrawal tombstone, not just a local stop_providing.
         // Two acts, in this order:
         //   1. put_record the signed ProviderWithdrawal on the SAME composite value key the
