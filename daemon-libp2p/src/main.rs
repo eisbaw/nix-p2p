@@ -753,6 +753,7 @@ async fn install_store_provider(
                 serve_budget,
                 announce_budget,
                 3600,
+                cfg.store_dir.clone(),
                 cfg.libp2p_announce_budget,
             );
             println!(

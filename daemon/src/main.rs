@@ -1920,6 +1920,7 @@ async fn install_libp2p_store_provider(
                 serve_budget,
                 announce_budget,
                 3600,
+                config.store_dir.clone(),
                 config.libp2p_announce_budget,
             );
             println!(

@@ -41,6 +41,20 @@
 //!   * respect an explicit, integer announce BUDGET (TASK-77 AC#2): past the budget,
 //!     announcing STOPS.
 //!
+//! ## AC#3 serveability is EVENTUALLY consistent (honest residual)
+//!
+//! "Never announce what you cannot serve" (index-coverage == provider-coverage) holds
+//! at announce time (the `sha256(--dump)==NarHash` floor gates it) and is kept EVENTUALLY
+//! consistent afterwards, not instantaneously. The store's GC can unlink an announced
+//! path after the fact; the backend then self-heals by WITHDRAWING that record - but the
+//! trigger is OPPORTUNISTIC (it reconciles on the next fetch) plus the record's own kad
+//! TTL, so a window exists where an idle node still advertises a GC'd path. That window is
+//! WITHIN the project TCB: the serve side re-dumps and BLAKE3-re-verifies before emitting a
+//! byte, so a GC'd path yields a CLEAN decline (zero bytes) - a querier just retries the
+//! next provider, never a bad byte. STRICT always-coverage (pin a GC root for the announce
+//! lifetime, or a periodic reconcile timer) is deliberately OUT of TASK-77's scope (it is a
+//! supply-model / retention decision, TASK-61/120) and is a filed follow-up.
+//!
 //! ## The privacy cost (TASK-77 AC#4), and the consume-only escape hatch
 //!
 //! Announcing is not free of disclosure: a positive availability record on the DHT

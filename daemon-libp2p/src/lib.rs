@@ -1270,12 +1270,14 @@ fn commit_failure(ledger: &Mutex<AnnounceLedger>, key: &NarHashKey) {
     }
 }
 
-/// Retract a provider record this node published (TASK-77 FIX 3b). Decoupled from the fabric so the
-/// GC-withdraw bite needs no live swarm: the production impl drives `fabric.announcer().withdraw`
-/// (the existing TASK-231 self-serve tombstone path), the test double counts.
+/// Retract a provider record this node published (TASK-77 FIX 3b). Returns `true` iff the
+/// withdrawal was published, so [`reconcile`] KEEPS a holding whose withdraw FAILED and retries it
+/// on a later dispatch (FIX B). Decoupled from the fabric so the GC-withdraw bite needs no live
+/// swarm: the production impl drives `fabric.announcer().withdraw` (the existing TASK-231 self-serve
+/// tombstone path), the test double scripts success/failure.
 #[async_trait]
 trait Withdrawer: Send + Sync {
-    async fn withdraw(&self, key: &ContentKey);
+    async fn withdraw(&self, key: &ContentKey) -> bool;
 }
 
 /// The production [`Withdrawer`]: withdraw through the fabric's own announcer (the SAME announcer
@@ -1286,16 +1288,23 @@ struct FabricWithdrawer {
 
 #[async_trait]
 impl Withdrawer for FabricWithdrawer {
-    async fn withdraw(&self, key: &ContentKey) {
+    async fn withdraw(&self, key: &ContentKey) -> bool {
         let Some(announcer) = self.fabric.announcer() else {
             eprintln!("LIBP2P-ANNOUNCE-AFTER-FETCH withdraw skipped: fabric exposes no announcer");
-            return;
+            return false;
         };
         match announcer.withdraw(key).await {
-            Ok(_) => println!("LIBP2P-ANNOUNCE-AFTER-FETCH withdrew content_key={key} (GC'd path)"),
-            Err(e) => eprintln!(
-                "LIBP2P-ANNOUNCE-AFTER-FETCH withdraw of {key} failed: {e} (record will expire by TTL)"
-            ),
+            Ok(_) => {
+                println!("LIBP2P-ANNOUNCE-AFTER-FETCH withdrew content_key={key} (GC'd path)");
+                true
+            }
+            Err(e) => {
+                eprintln!(
+                    "LIBP2P-ANNOUNCE-AFTER-FETCH withdraw of {key} failed: {e} (retained; retried \
+                     on the next fetch, and it expires by TTL regardless)"
+                );
+                false
+            }
         }
     }
 }
@@ -1306,8 +1315,10 @@ impl Withdrawer for FabricWithdrawer {
 /// TASK-231 withdraw. `path.exists()` is the GC signal (the store GC unlinks the path); the serve
 /// side ALSO fails cleanly on a vanished path (fabric-libp2p re-dumps + BLAKE3-re-verifies before
 /// emitting a byte, so a stale holding costs a peer a Declined retry, never a wrong byte), so this
-/// is the ACTIVE self-heal on top of that passive safety. Removing the `withdraw` call - the
-/// mutation the GC bite catches - leaves a lasting false holding on the DHT.
+/// is the ACTIVE self-heal on top of that passive safety. A holding is dropped from `held` ONLY on a
+/// SUCCESSFUL withdraw (FIX B): a failed withdraw is KEPT so the next dispatch retries it. Removing
+/// the `withdraw` call - the mutation the production GC bite catches - leaves a lasting false
+/// holding on the DHT.
 async fn reconcile(ledger: &Mutex<AnnounceLedger>, withdrawer: &dyn Withdrawer) {
     // Snapshot the GC'd holdings under the lock (do not hold it across the async withdraw).
     let gone: Vec<(NarHashKey, ContentKey)> = {
@@ -1319,14 +1330,16 @@ async fn reconcile(ledger: &Mutex<AnnounceLedger>, withdrawer: &dyn Withdrawer) 
             .collect()
     };
     for (key, content_key) in gone {
-        withdrawer.withdraw(&content_key).await;
-        // Drop it from `held` (stop tracking); it stays in `announced` so its budget unit is not
-        // re-spent by a later re-fetch of the same path.
-        ledger
-            .lock()
-            .expect("announce ledger poisoned")
-            .held
-            .remove(&key);
+        if withdrawer.withdraw(&content_key).await {
+            // Drop it from `held` (stop tracking) ONLY on success; it stays in `announced` so its
+            // budget unit is not re-spent by a later re-fetch of the same path. A FAILED withdraw is
+            // KEPT in `held` so the next dispatch retries it (FIX B).
+            ledger
+                .lock()
+                .expect("announce ledger poisoned")
+                .held
+                .remove(&key);
+        }
     }
 }
 
@@ -1334,14 +1347,17 @@ async fn reconcile(ledger: &Mutex<AnnounceLedger>, withdrawer: &dyn Withdrawer) 
 /// component. Used by [`validate_store_path`] to reject a non-store-shaped path shape.
 const NIXBASE32_ALPHABET: &[u8] = b"0123456789abcdfghijklmnpqrsvwxyz";
 
-/// Structural validation (TASK-77 FIX 3a) that `store_path` is a well-formed Nix store path -
-/// `<store-dir>/<32-char nix-base32 hash>-<name>` - BEFORE the node registers/dumps it. The
-/// narinfo `StorePath` is signature-covered for allowlisted content and the TASK-56
+/// Structural validation (TASK-77 FIX 3a, tightened per FIX C) that `store_path` is a well-formed
+/// Nix store path DIRECTLY under this node's REAL store directory - `<store_dir>/<32-char
+/// nix-base32 hash>-<name>` - BEFORE the node registers/dumps it. It requires the path's PARENT to
+/// be exactly `store_dir` (the daemon's `--store-dir`, `/nix/store` in production), so a merely
+/// store-SHAPED path elsewhere (e.g. `/tmp/store/<validhash>-x`) is refused rather than dumped.
+/// The narinfo `StorePath` is signature-covered for allowlisted content and the TASK-56
 /// `sha256(nix-store --dump) == NarHash` check is the ULTIMATE integrity gate; this is cheap
-/// defense-in-depth so a malformed/hostile path shape can never make the node shell
-/// `nix-store --dump` at an arbitrary filesystem path (e.g. `/etc/shadow`). It checks the SHAPE,
-/// not the hash (that is nix's job at dump time).
-fn validate_store_path(store_path: &str) -> Result<(), String> {
+/// defense-in-depth so a hostile/odd path can never make the node shell `nix-store --dump` at an
+/// arbitrary filesystem path (e.g. `/etc/shadow`). It checks the SHAPE + LOCATION, not the hash
+/// (that is nix's job at dump time).
+fn validate_store_path(store_path: &str, store_dir: &str) -> Result<(), String> {
     let path = Path::new(store_path);
     if !path.is_absolute() {
         return Err(format!("store path {store_path:?} is not absolute"));
@@ -1363,16 +1379,12 @@ fn validate_store_path(store_path: &str) -> Result<(), String> {
             "store path basename {name:?} has an empty <name> component"
         ));
     }
-    // The immediate parent must be a store dir (basename `store`), so a fetched path outside a
-    // `.../store/` tree is refused rather than dumped.
-    match path
-        .parent()
-        .and_then(|p| p.file_name())
-        .and_then(|n| n.to_str())
-    {
-        Some("store") => Ok(()),
+    // The immediate parent must be EXACTLY the node's real store dir, so a store-shaped path
+    // outside `/nix/store` (a decoy `/tmp/store/<hash>-x`) is refused rather than dumped (FIX C).
+    match path.parent() {
+        Some(parent) if parent == Path::new(store_dir) => Ok(()),
         _ => Err(format!(
-            "store path {store_path:?} parent is not a store dir (expected .../store/<hash>-<name>)"
+            "store path {store_path:?} is not directly under the store dir {store_dir:?}"
         )),
     }
 }
@@ -1390,10 +1402,11 @@ fn eligible_provisions(
     index: &AvailabilityIndex,
     serve_budget: &peer_fabric::ServeBudget,
     door: &AnnounceAfterFetchDoor,
+    store_dir: &str,
     key: &NarHashKey,
     store_path: &str,
 ) -> Result<Vec<StoreProvision>, String> {
-    validate_store_path(store_path)?;
+    validate_store_path(store_path, store_dir)?;
     index
         .register(*key, StorePath::new(store_path))
         .map_err(|e| format!("registering fetched store path {store_path:?} under {key}: {e}"))?;
@@ -1471,6 +1484,9 @@ struct GrowWorker {
     announce_budget: AnnounceBudget,
     /// The record TTL (seconds) an announced record carries, matching the provider's.
     ttl_secs: u64,
+    /// This node's REAL store dir (`--store-dir`, `/nix/store` in production): a fetched path must
+    /// be DIRECTLY under it or it is refused before any dump (FIX C).
+    store_dir: String,
     materialise: MaterialiseWait,
 }
 
@@ -1482,7 +1498,14 @@ impl GrowWorker {
         key: &NarHashKey,
         store_path: &str,
     ) -> Result<Vec<StoreProvision>, String> {
-        eligible_provisions(&self.index, &self.serve_budget, &self.door, key, store_path)
+        eligible_provisions(
+            &self.index,
+            &self.serve_budget,
+            &self.door,
+            &self.store_dir,
+            key,
+            store_path,
+        )
     }
 
     /// Announce the verified `provisions` through the SAME door the shipped provider uses, so the
@@ -1519,17 +1542,27 @@ impl GrowWorker {
             }
         }
     }
+}
 
-    /// The full grow step for one reserved key: bounded materialisation wait -> verify -> announce.
-    /// Best-effort; a refusal/timeout is LOGGED (fail-verbose), never a panic.
-    /// The full grow step for one reserved key: bounded materialisation wait -> validate/verify ->
-    /// announce. Returns `Some(content_key)` IFF a record was actually published (the caller then
-    /// commits the holding + keeps the budget spent), else `None` (the caller REFUNDS the budget -
-    /// FIX 2: an ineligible / never-materialised / publish-failed fetch must not consume growth
-    /// budget). Best-effort; a refusal/timeout is LOGGED, never a panic.
+/// The announce side-effect for one fetched path, DECOUPLED from the ledger/spawn wiring so the
+/// production-wired GC/retry bites can drive the real dispatch body ([`WorkerSpawner::run`]) with a
+/// fake. The production impl is [`GrowWorker`].
+#[async_trait]
+trait Grower: Send + Sync {
+    /// Bounded materialisation wait -> validate/verify -> announce for one reserved key. Returns
+    /// `Some(content_key)` iff the record was PUBLISHED, OR the publish was AMBIGUOUSLY attempted
+    /// (the announce call may have taken effect before erroring/timing out) - in both cases the
+    /// caller TRACKS the holding (so `reconcile` can withdraw it) and keeps the budget SPENT.
+    /// Returns `None` only on a CLEAN pre-publication failure (never materialised / ineligible /
+    /// verify failed - no DHT side-effect), where the caller REFUNDS the budget (FIX 2/D).
+    async fn grow(&self, key: &NarHashKey, store_path: &str) -> Option<ContentKey>;
+}
+
+#[async_trait]
+impl Grower for GrowWorker {
     async fn grow(&self, key: &NarHashKey, store_path: &str) -> Option<ContentKey> {
         // Bounded wait for the local store to materialise the path (the daemon relayed the bytes;
-        // nix imports them a moment later). A never-materialising path times out -> no announce.
+        // nix imports them a moment later). A never-materialising path times out -> CLEAN failure.
         let mut materialised = false;
         for _ in 0..self.materialise.max_polls {
             if Path::new(store_path).exists() {
@@ -1543,10 +1576,11 @@ impl GrowWorker {
                 "LIBP2P-ANNOUNCE-AFTER-FETCH skipped narhash={key} reason=not-materialised \
                  (store path {store_path:?} did not appear within the wait bound; not announced)"
             );
-            return None;
+            return None; // clean pre-publication failure -> refund
         }
 
-        // The validate+dump+verify is blocking; run it off the async worker.
+        // The validate+dump+verify is blocking; run it off the async worker. All failures here are
+        // CLEAN (no DHT side-effect yet) -> refund.
         let worker = self.clone();
         let k = *key;
         let sp = store_path.to_string();
@@ -1584,56 +1618,74 @@ impl GrowWorker {
                 content_key
             }
             Err(why) => {
+                // FIX D: AMBIGUOUS post-side-effect failure. `announce` does `start_providing` +
+                // `put_record` before returning; an Err/timeout may leave a LIVE record we can no
+                // longer distinguish. So TRACK the holding (return `Some(derived content_key)`) and
+                // keep the budget SPENT, so `reconcile` can withdraw it if the path is/goes
+                // unserveable - never a leaked, untrackable record. Only CLEAN failures above refund.
                 eprintln!(
-                    "LIBP2P-ANNOUNCE-AFTER-FETCH skipped narhash={key} reason=announce-failed: {why}"
+                    "LIBP2P-ANNOUNCE-AFTER-FETCH narhash={key} reason=announce-ambiguous: {why} \
+                     (record may be live; tracked for withdraw, budget spent)"
                 );
-                None
+                Some(provider_content_key(key))
             }
         }
     }
 }
 
-/// The seam that turns a reserved fetch into a spawned grow (TASK-77 FIX 1). It DECOUPLES the
+/// The seam that turns a reserved fetch into a spawned dispatch (TASK-77 FIX 1). It DECOUPLES the
 /// announce side-effect from `on_fetched`'s budget gate, so the production budget bite - drive
-/// `on_fetched` and count spawns - needs no live swarm. The production impl also RECONCILES GC'd
-/// holdings before each grow (FIX 3b).
+/// `on_fetched` and count grows - needs no live swarm. The production impl also RECONCILES GC'd
+/// holdings on every fetch (FIX 3b).
 trait GrowSpawner: Send + Sync {
     /// On EVERY fetch: reconcile GC'd holdings (FIX 3b), and - iff `grow` is `Some` (the fetch was
     /// admitted by the budget gate) - run the grow for that reserved key, committing the outcome
-    /// back to `ledger` (commit_success on a real announce, commit_failure - which REFUNDS the
-    /// budget - otherwise). Running reconcile on every fetch (not only on a grow) means a
+    /// back to `ledger`. Running reconcile on every fetch (not only on a grow) means a
     /// budget-exhausted node still self-heals its stale holdings.
     fn dispatch(&self, ledger: Arc<Mutex<AnnounceLedger>>, grow: Option<(NarHashKey, String)>);
 }
 
-/// The production [`GrowSpawner`]: self-heal any GC'd holding, then (if admitted) run the real grow
-/// on a detached task and commit its outcome (success -> track the holding + keep the budget spent;
-/// failure -> refund the budget).
+/// The production [`GrowSpawner`]. Its [`run`](WorkerSpawner::run) body - self-heal GC'd holdings,
+/// then (if admitted) grow + commit - is async over its `Arc<dyn>` deps, so the production-wired
+/// GC/retry bites drive `run` DIRECTLY with fakes (removing the `reconcile` call in `run` reddens
+/// the GC bite). `dispatch` is the thin `tokio::spawn(run(..))` fire-and-forget wrapper.
 struct WorkerSpawner {
-    worker: GrowWorker,
+    grower: Arc<dyn Grower>,
     withdrawer: Arc<dyn Withdrawer>,
+}
+
+impl WorkerSpawner {
+    /// The production dispatch BODY (what `dispatch` spawns): reconcile GC'd holdings, then (if
+    /// admitted) grow + commit its outcome. `commit_success` on a published/ambiguous grow (track +
+    /// keep budget spent); `commit_failure` (REFUND) on a clean pre-publication failure.
+    async fn run(
+        ledger: Arc<Mutex<AnnounceLedger>>,
+        grower: Arc<dyn Grower>,
+        withdrawer: Arc<dyn Withdrawer>,
+        grow: Option<(NarHashKey, String)>,
+    ) {
+        // FIX 3b: WITHDRAW any holding whose store path was GC'd since we announced it. Runs on
+        // EVERY fetch, so an exhausted-budget node still reconciles. Timer-free; an IDLE node
+        // relies on the clean serve-fail + record TTL (the documented eventually-consistent
+        // residual - see the module doc).
+        reconcile(&ledger, &*withdrawer).await;
+        if let Some((key, store_path)) = grow {
+            match grower.grow(&key, &store_path).await {
+                Some(content_key) => commit_success(&ledger, &key, content_key, store_path),
+                None => commit_failure(&ledger, &key),
+            }
+        }
+    }
 }
 
 impl GrowSpawner for WorkerSpawner {
     fn dispatch(&self, ledger: Arc<Mutex<AnnounceLedger>>, grow: Option<(NarHashKey, String)>) {
-        let worker = self.worker.clone();
+        let grower = Arc::clone(&self.grower);
         let withdrawer = Arc::clone(&self.withdrawer);
         // Fire-and-forget: never blocks the serve path. Honest limit: a detached task is not tied to
         // a shutdown supervisor, so an in-flight announce is dropped on process exit - acceptable
         // for a best-effort growth announce (kad republish / TTL cover it).
-        tokio::spawn(async move {
-            // FIX 3b: WITHDRAW any holding whose store path was GC'd since we announced it
-            // (self-heal; the serve side also fails cleanly on a vanished path). Runs on EVERY
-            // fetch, so an exhausted-budget node still reconciles. Timer-free; an IDLE node relies
-            // on the clean serve-fail + TTL (an honest, filed limit).
-            reconcile(&ledger, &*withdrawer).await;
-            if let Some((key, store_path)) = grow {
-                match worker.grow(&key, &store_path).await {
-                    Some(content_key) => commit_success(&ledger, &key, content_key, store_path),
-                    None => commit_failure(&ledger, &key),
-                }
-            }
-        });
+        tokio::spawn(WorkerSpawner::run(ledger, grower, withdrawer, grow));
     }
 }
 
@@ -1665,6 +1717,7 @@ impl Libp2pAnnounceAfterFetch {
         serve_budget: peer_fabric::ServeBudget,
         announce_budget: AnnounceBudget,
         ttl_secs: u64,
+        store_dir: String,
         announce_budget_count: u64,
     ) -> Self {
         let worker = GrowWorker {
@@ -1675,8 +1728,10 @@ impl Libp2pAnnounceAfterFetch {
             serve_budget,
             announce_budget,
             ttl_secs,
+            store_dir,
             materialise: MaterialiseWait::default(),
         };
+        let grower: Arc<dyn Grower> = Arc::new(worker);
         let withdrawer: Arc<dyn Withdrawer> = Arc::new(FabricWithdrawer { fabric });
         Libp2pAnnounceAfterFetch {
             ledger: Arc::new(Mutex::new(AnnounceLedger {
@@ -1685,7 +1740,7 @@ impl Libp2pAnnounceAfterFetch {
                 announced: HashSet::new(),
                 held: HashMap::new(),
             })),
-            spawner: Arc::new(WorkerSpawner { worker, withdrawer }),
+            spawner: Arc::new(WorkerSpawner { grower, withdrawer }),
         }
     }
 
@@ -2519,21 +2574,22 @@ mod lan_isolation_tests {
 
 #[cfg(test)]
 mod announce_after_fetch_tests {
-    //! Mutation-proven bite tests for the TASK-77 announce-after-fetch invariants. Each targets a
-    //! pure core / seam, so no live swarm is needed; end-to-end swarm growth is proven in the e2e
-    //! `s9-libp2p-grow` scenario.
+    //! Mutation-proven bites for the TASK-77 announce-after-fetch invariants. Each targets a pure
+    //! core / seam (no live swarm); end-to-end swarm growth is proven in the e2e `s9-libp2p-grow`.
     //!
-    //! - AC#2 FIX 1: the budget is enforced through the PRODUCTION `on_fetched` path - a fake
-    //!   `GrowSpawner` counts grows, so neutering the `begin` call in `on_fetched` reddens it.
-    //! - AC#2 FIX 2: the budget is REFUNDED on a failed/ineligible fetch - invalid fetches leave
-    //!   the budget intact; only a real announce spends it.
-    //! - AC#3 / TASK-72: an unallowlisted / mis-registered / malformed fetched path is never
-    //!   announced (`eligible_provisions` + `validate_store_path`).
-    //! - AC#3 / TASK-72 FIX 3b: a held record whose store path was GC'd is WITHDRAWN (`reconcile`).
+    //! - AC#2 FIX 1: budget enforced through the PRODUCTION `on_fetched` path (fake `GrowSpawner`
+    //!   counts grows; neutering the `begin` call in `on_fetched` reddens it).
+    //! - AC#2 FIX 2 / FIX D: the PRODUCTION dispatch body `WorkerSpawner::run` REFUNDS a clean
+    //!   pre-publication failure and SPENDS + TRACKS an announced/ambiguous grow.
+    //! - AC#3 / TASK-72 FIX 3b: `WorkerSpawner::run` reconciles + WITHDRAWS a GC'd holding (the
+    //!   production wiring; removing the `reconcile` call in `run` reddens it).
+    //! - AC#3 FIX B: a FAILED withdraw is retained + retried, dropped only on success.
+    //! - AC#3 FIX C: `validate_store_path` rejects a store-shaped path outside the real store dir.
 
     use super::{
-        AnnounceAfterFetchDoor, AnnounceLedger, GrowSpawner, Libp2pAnnounceAfterFetch, Withdrawer,
-        commit_failure, commit_success, eligible_provisions, reconcile, validate_store_path,
+        AnnounceAfterFetchDoor, AnnounceLedger, Begin, GrowSpawner, Grower,
+        Libp2pAnnounceAfterFetch, Withdrawer, WorkerSpawner, begin, eligible_provisions,
+        validate_store_path,
     };
     use async_trait::async_trait;
     use std::collections::{HashMap, HashSet};
@@ -2546,6 +2602,9 @@ mod announce_after_fetch_tests {
     };
     use peer_fabric::{ContentKey, ServeBudget};
 
+    const HASH32: &str = "0123456789abcdfghijklmnpqrsvwxyz";
+    const STORE_DIR: &str = "/nix/store";
+
     fn unique_temp(stem: &str) -> PathBuf {
         let suffix = format!(
             "{}-{}",
@@ -2557,7 +2616,6 @@ mod announce_after_fetch_tests {
         );
         std::env::temp_dir().join(format!("nix-p2p-task77-{stem}-{suffix}"))
     }
-
     fn nar_hash(seed: u8) -> NarHash {
         NarHash::new(NarHashKey::from_sha256_bytes([seed; 32]).to_string())
     }
@@ -2567,142 +2625,252 @@ mod announce_after_fetch_tests {
     fn content_key(seed: u8) -> ContentKey {
         ContentKey::from_bytes([seed; 32])
     }
-    /// A well-formed store path string (the shape `validate_store_path` accepts); the fake spawner
-    /// never dumps it, so it need not exist for the budget bites.
     fn store_path_str(seed: u8) -> String {
-        format!(
-            "/nix/store/{}-pkg-{seed}",
-            "0123456789abcdfghijklmnpqrsvwxyz"
-        )
+        format!("/nix/store/{HASH32}-pkg-{seed}")
+    }
+    fn empty_ledger(budget: u64) -> Arc<Mutex<AnnounceLedger>> {
+        Arc::new(Mutex::new(AnnounceLedger {
+            remaining: budget,
+            inflight: HashSet::new(),
+            announced: HashSet::new(),
+            held: HashMap::new(),
+        }))
     }
 
-    // ---- the fake GrowSpawner: observes on_fetched's decision + scripts the grow outcome ----
-
-    #[derive(Clone, Copy, PartialEq, Eq)]
-    enum FakeOutcome {
-        /// Simulate a real announce (commit_success: budget stays spent).
-        Announce,
-        /// Simulate an ineligible / never-materialised / publish-failed grow (commit_failure:
-        /// budget refunded).
-        Fail,
-    }
+    // ---- FIX 1: budget enforced through on_fetched (fake GrowSpawner counts dispatched grows) ----
 
     struct FakeSpawner {
-        spawns: Arc<Mutex<Vec<NarHashKey>>>,
-        outcome: Arc<Mutex<FakeOutcome>>,
+        grows: Arc<Mutex<Vec<NarHashKey>>>,
     }
-
     impl GrowSpawner for FakeSpawner {
-        fn dispatch(&self, ledger: Arc<Mutex<AnnounceLedger>>, grow: Option<(NarHashKey, String)>) {
-            // Only a Some(grow) is an admitted fetch; record it (the count under test) and mirror
-            // the real spawner's commit. A None (budget-exhausted / dup) still arrives here (real
-            // spawner would reconcile) but grows nothing.
-            let Some((k, store_path)) = grow else {
-                return;
-            };
-            self.spawns.lock().unwrap().push(k);
-            match *self.outcome.lock().unwrap() {
-                // The content_key is arbitrary here (no DHT is touched); the outcome under test is
-                // the ledger transition, mirroring the real spawner's commit.
-                FakeOutcome::Announce => commit_success(&ledger, &k, content_key(0xEE), store_path),
-                FakeOutcome::Fail => commit_failure(&ledger, &k),
+        fn dispatch(
+            &self,
+            _ledger: Arc<Mutex<AnnounceLedger>>,
+            grow: Option<(NarHashKey, String)>,
+        ) {
+            if let Some((k, _)) = grow {
+                self.grows.lock().unwrap().push(k);
             }
         }
     }
-
-    /// Build a hook over a fake spawner (no fabric), so `on_fetched` is exercised end to end.
-    fn hook_with_fake(
-        budget: u64,
-        spawns: Arc<Mutex<Vec<NarHashKey>>>,
-        outcome: Arc<Mutex<FakeOutcome>>,
-    ) -> Libp2pAnnounceAfterFetch {
+    fn hook_with_fake(budget: u64, grows: Arc<Mutex<Vec<NarHashKey>>>) -> Libp2pAnnounceAfterFetch {
         Libp2pAnnounceAfterFetch {
-            ledger: Arc::new(Mutex::new(AnnounceLedger {
-                remaining: budget,
-                inflight: HashSet::new(),
-                announced: HashSet::new(),
-                held: HashMap::new(),
-            })),
-            spawner: Arc::new(FakeSpawner { spawns, outcome }),
+            ledger: empty_ledger(budget),
+            spawner: Arc::new(FakeSpawner { grows }),
         }
     }
 
-    /// AC#2 FIX 1 BITE (production-load-bearing): the budget is enforced THROUGH `on_fetched`. With
-    /// budget 2, three DISTINCT fetches drive `on_fetched`, but only TWO spawn a grow - the third is
-    /// refused at `begin`. MUTATION: delete the `begin` CALL in `on_fetched` (spawn unconditionally),
-    /// or the `remaining == 0` guard in `begin`, and the spawn count grows to 3 - this reddens.
     #[test]
     fn budget_is_enforced_through_the_production_on_fetched_path() {
         use daemon_core::PostFetchAnnounce;
-        let spawns = Arc::new(Mutex::new(Vec::new()));
-        let hook = hook_with_fake(
-            2,
-            Arc::clone(&spawns),
-            Arc::new(Mutex::new(FakeOutcome::Announce)),
-        );
+        let grows = Arc::new(Mutex::new(Vec::new()));
+        let hook = hook_with_fake(2, Arc::clone(&grows));
         for seed in [1u8, 2, 3] {
             hook.on_fetched(&nar_hash(seed), &store_path_str(seed));
         }
         assert_eq!(
-            spawns.lock().unwrap().len(),
+            grows.lock().unwrap().len(),
             2,
-            "on_fetched must STOP spawning grows past the integer budget"
+            "on_fetched must STOP dispatching grows past the integer budget"
         );
-        assert_eq!(
-            hook.remaining_budget(),
-            0,
-            "the budget decremented to exactly zero"
-        );
-        // A re-fetch of an already-announced path is a no-op (dedup), not a spawn.
+        assert_eq!(hook.remaining_budget(), 0);
+        // A re-fetch of an already-handled path is a no-op (dedup), not a new grow.
         hook.on_fetched(&nar_hash(1), &store_path_str(1));
         assert_eq!(
-            spawns.lock().unwrap().len(),
+            grows.lock().unwrap().len(),
             2,
-            "a re-fetch does not re-spawn"
+            "a re-fetch does not re-dispatch"
         );
     }
 
-    /// AC#2 FIX 2 BITE (no exhaustion by invalid fetches): a stream of INVALID fetches (each grow
-    /// reports failure) leaves the budget INTACT - only a real announce spends it. MUTATION: delete
-    /// the `remaining += 1` refund in `commit_failure` and the invalid fetches drain the budget, so
-    /// the "budget intact" + "valid fetches still announce" assertions redden.
-    #[test]
-    fn invalid_fetches_do_not_consume_the_growth_budget() {
-        use daemon_core::PostFetchAnnounce;
-        let spawns = Arc::new(Mutex::new(Vec::new()));
-        let outcome = Arc::new(Mutex::new(FakeOutcome::Fail));
-        let hook = hook_with_fake(2, Arc::clone(&spawns), Arc::clone(&outcome));
-        // Four DISTINCT invalid fetches: each reserves then refunds.
-        for seed in [10u8, 11, 12, 13] {
-            hook.on_fetched(&nar_hash(seed), &store_path_str(seed));
+    // ---- the production dispatch body (WorkerSpawner::run) with fakes ----
+
+    struct FakeGrower {
+        outcome: Arc<Mutex<Option<ContentKey>>>,
+    }
+    #[async_trait]
+    impl Grower for FakeGrower {
+        async fn grow(&self, _key: &NarHashKey, _store_path: &str) -> Option<ContentKey> {
+            *self.outcome.lock().unwrap()
         }
+    }
+    /// A grower that is never called (used when driving `run` with `grow == None`).
+    struct NoopGrower;
+    #[async_trait]
+    impl Grower for NoopGrower {
+        async fn grow(&self, _key: &NarHashKey, _store_path: &str) -> Option<ContentKey> {
+            None
+        }
+    }
+    struct FakeWithdrawer {
+        result: Arc<Mutex<bool>>,
+        withdrawn: Arc<Mutex<Vec<ContentKey>>>,
+    }
+    #[async_trait]
+    impl Withdrawer for FakeWithdrawer {
+        async fn withdraw(&self, k: &ContentKey) -> bool {
+            self.withdrawn.lock().unwrap().push(*k);
+            *self.result.lock().unwrap()
+        }
+    }
+    fn noop_withdrawer() -> Arc<dyn Withdrawer> {
+        Arc::new(FakeWithdrawer {
+            result: Arc::new(Mutex::new(true)),
+            withdrawn: Arc::new(Mutex::new(Vec::new())),
+        })
+    }
+
+    /// AC#2 FIX 2 + FIX D BITE: a CLEAN pre-publication failure (grow -> None) REFUNDS the budget
+    /// and tracks nothing; an announced/AMBIGUOUS grow (grow -> Some) SPENDS the budget and TRACKS
+    /// the holding for reconcile. MUTATION: flip either arm in `WorkerSpawner::run` (None ->
+    /// commit_success, or Some -> commit_failure) and one of these assertions reddens.
+    #[tokio::test]
+    async fn run_refunds_clean_failures_and_spends_plus_tracks_announced() {
+        // Clean failure: reserve, then grow returns None -> refund, not tracked.
+        let ledger = empty_ledger(1);
+        assert_eq!(begin(&ledger, &key(1)), Begin::Proceed);
+        assert_eq!(ledger.lock().unwrap().remaining, 0, "reserved");
+        WorkerSpawner::run(
+            Arc::clone(&ledger),
+            Arc::new(FakeGrower {
+                outcome: Arc::new(Mutex::new(None)),
+            }),
+            noop_withdrawer(),
+            Some((key(1), store_path_str(1))),
+        )
+        .await;
+        {
+            let led = ledger.lock().unwrap();
+            assert_eq!(led.remaining, 1, "a clean failure REFUNDS the budget");
+            assert!(led.held.is_empty(), "a clean failure tracks nothing");
+            assert!(led.announced.is_empty());
+        }
+
+        // Announced/ambiguous: reserve, grow returns Some -> spend + track.
+        assert_eq!(begin(&ledger, &key(2)), Begin::Proceed);
+        WorkerSpawner::run(
+            Arc::clone(&ledger),
+            Arc::new(FakeGrower {
+                outcome: Arc::new(Mutex::new(Some(content_key(2)))),
+            }),
+            noop_withdrawer(),
+            Some((key(2), store_path_str(2))),
+        )
+        .await;
+        let led = ledger.lock().unwrap();
         assert_eq!(
-            hook.remaining_budget(),
-            2,
-            "invalid fetches must REFUND their reservation - budget stays intact"
+            led.remaining, 0,
+            "an announced/ambiguous grow SPENDS the budget"
         );
-        // Now valid fetches: exactly the budget worth announce, then it STOPS.
-        *outcome.lock().unwrap() = FakeOutcome::Announce;
-        for seed in [20u8, 21, 22] {
-            hook.on_fetched(&nar_hash(seed), &store_path_str(seed));
-        }
-        assert_eq!(
-            hook.remaining_budget(),
-            0,
-            "two valid announces spend the (undrained) budget; the third is refused"
+        assert!(led.announced.contains(&key(2)));
+        assert!(
+            led.held.contains_key(&key(2)),
+            "the holding is TRACKED for reconcile"
         );
     }
 
-    // ---- AC#3 / TASK-72 eligibility + serveability (fabric-free) ----
+    /// AC#3 / TASK-72 FIX 3b BITE (production-wired): `WorkerSpawner::run` reconciles + WITHDRAWS a
+    /// GC'd holding and leaves a present one. MUTATION: delete the `reconcile(&ledger, ...)` call in
+    /// `run` and the GC'd holding is never withdrawn - this reddens (this is the exact production
+    /// dispatch body, not a directly-called `reconcile`).
+    #[tokio::test]
+    async fn run_reconciles_and_withdraws_a_gc_d_holding_through_the_production_path() {
+        let present = unique_temp("present").join("store");
+        std::fs::create_dir_all(&present).unwrap();
+        let present_path = present
+            .join(format!("{HASH32}-present"))
+            .to_string_lossy()
+            .into_owned();
+        std::fs::write(&present_path, b"here").unwrap();
+        let gone_path = format!("/nix/store/{HASH32}-gc-d");
 
-    fn verified_index() -> (Arc<AvailabilityIndex>, NarHashKey, String) {
+        let mut held = HashMap::new();
+        held.insert(key(1), (content_key(1), present_path));
+        held.insert(key(2), (content_key(2), gone_path));
+        let ledger = Arc::new(Mutex::new(AnnounceLedger {
+            remaining: 0,
+            inflight: HashSet::new(),
+            announced: [key(1), key(2)].into_iter().collect(),
+            held,
+        }));
+        let withdrawn = Arc::new(Mutex::new(Vec::new()));
+        let wd: Arc<dyn Withdrawer> = Arc::new(FakeWithdrawer {
+            result: Arc::new(Mutex::new(true)),
+            withdrawn: Arc::clone(&withdrawn),
+        });
+        // Drive the production dispatch body with grow == None (a budget-exhausted fetch): reconcile
+        // still runs.
+        WorkerSpawner::run(Arc::clone(&ledger), Arc::new(NoopGrower), wd, None).await;
+
+        assert_eq!(
+            *withdrawn.lock().unwrap(),
+            vec![content_key(2)],
+            "only the GC'd record withdrawn"
+        );
+        let led = ledger.lock().unwrap();
+        assert!(led.held.contains_key(&key(1)), "present holding kept");
+        assert!(
+            !led.held.contains_key(&key(2)),
+            "GC'd holding dropped on success"
+        );
+    }
+
+    /// AC#3 FIX B BITE: a FAILED withdraw is RETAINED in `held` and RETRIED on the next dispatch;
+    /// only a SUCCESSFUL withdraw drops it. MUTATION: drop-on-failure in `reconcile` and the
+    /// "retained after a failed withdraw" assertion reddens.
+    #[tokio::test]
+    async fn a_failed_withdraw_is_retained_and_retried() {
+        let gone_path = format!("/nix/store/{HASH32}-gc-d");
+        let mut held = HashMap::new();
+        held.insert(key(5), (content_key(5), gone_path));
+        let ledger = Arc::new(Mutex::new(AnnounceLedger {
+            remaining: 0,
+            inflight: HashSet::new(),
+            announced: [key(5)].into_iter().collect(),
+            held,
+        }));
+        let result = Arc::new(Mutex::new(false)); // fail the first withdraw
+        let withdrawn = Arc::new(Mutex::new(Vec::new()));
+        let wd: Arc<dyn Withdrawer> = Arc::new(FakeWithdrawer {
+            result: Arc::clone(&result),
+            withdrawn: Arc::clone(&withdrawn),
+        });
+        WorkerSpawner::run(
+            Arc::clone(&ledger),
+            Arc::new(NoopGrower),
+            Arc::clone(&wd),
+            None,
+        )
+        .await;
+        assert_eq!(withdrawn.lock().unwrap().len(), 1, "one withdraw attempted");
+        assert!(
+            ledger.lock().unwrap().held.contains_key(&key(5)),
+            "a FAILED withdraw KEEPS the holding for retry"
+        );
+
+        *result.lock().unwrap() = true; // succeed on retry
+        WorkerSpawner::run(Arc::clone(&ledger), Arc::new(NoopGrower), wd, None).await;
+        assert_eq!(
+            withdrawn.lock().unwrap().len(),
+            2,
+            "retried on the next dispatch"
+        );
+        assert!(
+            !ledger.lock().unwrap().held.contains_key(&key(5)),
+            "a SUCCESSFUL withdraw drops the holding"
+        );
+    }
+
+    // ---- AC#3 / TASK-72 eligibility + FIX C store-path location (fabric-free) ----
+
+    fn verified_index() -> (Arc<AvailabilityIndex>, NarHashKey, String, String) {
         let body = b"a raw NAR regenerated on demand from a fetched store path (TASK-77)".to_vec();
         let true_key = NarHashKey::from_raw_nar(&body);
-        // A well-formed store-shaped path (`.../store/<32-nix-base32>-<name>`, so
-        // validate_store_path accepts it) holding the NAR.
+        // A well-formed path DIRECTLY under a temp store dir; eligible_provisions is told that same
+        // store dir, so validate_store_path (FIX C) accepts it.
         let store_dir = unique_temp("root").join("store");
         std::fs::create_dir_all(&store_dir).unwrap();
-        let nar_path = store_dir.join("0123456789abcdfghijklmnpqrsvwxyz-fetched");
+        let nar_path = store_dir.join(format!("{HASH32}-fetched"));
         std::fs::write(&nar_path, &body).unwrap();
         let index = AvailabilityIndex::open(
             NodeId::from_bytes([0u8; 32]),
@@ -2714,10 +2882,10 @@ mod announce_after_fetch_tests {
         (
             Arc::new(index),
             true_key,
+            store_dir.to_string_lossy().into_owned(),
             nar_path.to_string_lossy().into_owned(),
         )
     }
-
     fn big_serve_budget() -> ServeBudget {
         ServeBudget {
             max_nar_bytes_uncompressed_nar: 1 << 30,
@@ -2726,17 +2894,14 @@ mod announce_after_fetch_tests {
         }
     }
 
-    /// AC#3 BITE: a VERIFIED-servable fetched path is REFUSED on a PUBLIC door when it is NOT
-    /// allowlisted (nothing becomes a provision, nothing reaches the DHT); the SAME path on a LAN
-    /// door is admitted - proving the ONLY thing that refused it was the eligibility gate. MUTATION:
-    /// delete `approve_provisions_for_public` and the public case returns Ok - reddens.
     #[test]
     fn public_door_refuses_an_unallowlisted_fetched_path_lan_admits_it() {
-        let (index, true_key, store_path) = verified_index();
+        let (index, true_key, store_dir, store_path) = verified_index();
         let public = eligible_provisions(
             &index,
             &big_serve_budget(),
             &AnnounceAfterFetchDoor::Public(Arc::new(PublicNarAllowlist::disabled())),
+            &store_dir,
             &true_key,
             &store_path,
         );
@@ -2745,11 +2910,12 @@ mod announce_after_fetch_tests {
             "a PUBLIC node must not announce a fetched path it is not allowlisted to publish; got {public:?}"
         );
 
-        let (index2, true_key2, store_path2) = verified_index();
+        let (index2, true_key2, store_dir2, store_path2) = verified_index();
         let lan = eligible_provisions(
             &index2,
             &big_serve_budget(),
             &AnnounceAfterFetchDoor::Lan(super::LanShare::operator_assembled()),
+            &store_dir2,
             &true_key2,
             &store_path2,
         )
@@ -2757,116 +2923,54 @@ mod announce_after_fetch_tests {
         assert_eq!(*lan[0].nar_hash(), true_key2);
     }
 
-    /// AC#3 / TASK-72: a mis-registered path (bytes do not hash to the registered NarHash) is
-    /// refused even on a LAN door - the index quarantines it, so a node never announces content it
-    /// cannot serve.
     #[test]
     fn a_mis_registered_fetched_path_is_never_announced() {
-        let (index, _true_key, store_path) = verified_index();
-        let wrong_key = NarHashKey::from_sha256_bytes([0xAB; 32]);
+        let (index, _true_key, store_dir, store_path) = verified_index();
         let refused = eligible_provisions(
             &index,
             &big_serve_budget(),
             &AnnounceAfterFetchDoor::Lan(super::LanShare::operator_assembled()),
-            &wrong_key,
+            &store_dir,
+            &NarHashKey::from_sha256_bytes([0xAB; 32]),
             &store_path,
         );
         assert!(
             refused.is_err(),
             "a fetched path whose bytes do not hash to the registered NarHash must never be \
-             announced (index-coverage == provider-coverage); got {refused:?}"
+             announced; got {refused:?}"
         );
     }
 
-    /// AC#3 FIX 3a BITE: a malformed / non-store-shaped StorePath is rejected BEFORE any dump, so
-    /// the node never shells `nix-store --dump` at an arbitrary filesystem path.
+    /// AC#3 FIX C BITE: `validate_store_path` requires the path DIRECTLY under the real store dir -
+    /// a store-SHAPED decoy elsewhere (`/tmp/store/<validhash>-x`) is rejected before any dump.
     #[test]
-    fn validate_store_path_rejects_non_store_paths() {
-        assert!(validate_store_path("/nix/store/0123456789abcdfghijklmnpqrsvwxyz-ok").is_ok());
+    fn validate_store_path_requires_the_real_store_dir() {
+        assert!(validate_store_path(&format!("/nix/store/{HASH32}-ok"), STORE_DIR).is_ok());
         assert!(
-            validate_store_path("relative/path").is_err(),
+            validate_store_path("relative/path", STORE_DIR).is_err(),
             "not absolute"
         );
         assert!(
-            validate_store_path("/etc/shadow").is_err(),
+            validate_store_path("/etc/shadow", STORE_DIR).is_err(),
             "not a store path"
         );
         assert!(
-            validate_store_path("/nix/store/tooshorthash-x").is_err(),
+            validate_store_path(&format!("/nix/store/{HASH32}-x/nested"), STORE_DIR).is_err(),
+            "not directly under the store dir"
+        );
+        assert!(
+            validate_store_path("/nix/store/tooshorthash-x", STORE_DIR).is_err(),
             "hash not 32 nix-base32 chars"
         );
         assert!(
-            validate_store_path("/nix/store/0123456789abcdefghijklmnpqrsvwxy-x").is_err(),
+            validate_store_path("/nix/store/0123456789abcdefghijklmnpqrsvwxy-x", STORE_DIR)
+                .is_err(),
             "'e' is not in the nix-base32 alphabet"
         );
+        // FIX C: a store-shaped path under a DIFFERENT parent (a decoy) is rejected.
         assert!(
-            validate_store_path("/tmp/0123456789abcdfghijklmnpqrsvwxyz-x").is_err(),
-            "parent is not a store dir"
-        );
-    }
-
-    // ---- AC#3 / TASK-72 GC-serveability: withdraw-on-GC (FIX 3b) ----
-
-    struct FakeWithdrawer {
-        withdrawn: Arc<Mutex<Vec<ContentKey>>>,
-    }
-    #[async_trait]
-    impl Withdrawer for FakeWithdrawer {
-        async fn withdraw(&self, k: &ContentKey) {
-            self.withdrawn.lock().unwrap().push(*k);
-        }
-    }
-
-    /// AC#3 / TASK-72 FIX 3b BITE: `reconcile` WITHDRAWS a held record whose store path was GC'd
-    /// (no longer exists) and leaves a still-present holding alone. MUTATION: delete the
-    /// `withdrawer.withdraw(...)` call in `reconcile` and the GC'd record is never withdrawn - the
-    /// node keeps advertising a holding it cannot serve; this reddens.
-    #[tokio::test]
-    async fn reconcile_withdraws_a_gc_d_holding_and_keeps_a_present_one() {
-        // A present store path (exists on disk) and a GC'd one (never created).
-        let present = unique_temp("present-store");
-        std::fs::create_dir_all(&present).unwrap();
-        let present_path = present
-            .join("0123456789abcdfghijklmnpqrsvwxyz-present")
-            .to_string_lossy()
-            .into_owned();
-        std::fs::write(&present_path, b"still here").unwrap();
-        let gone_path = "/nix/store/0123456789abcdfghijklmnpqrsvwxyz-gc-d".to_string();
-
-        let present_key = key(1);
-        let gone_key = key(2);
-        let present_ck = content_key(1);
-        let gone_ck = content_key(2);
-
-        let mut held = HashMap::new();
-        held.insert(present_key, (present_ck, present_path.clone()));
-        held.insert(gone_key, (gone_ck, gone_path));
-        let ledger = Arc::new(Mutex::new(AnnounceLedger {
-            remaining: 0,
-            inflight: HashSet::new(),
-            announced: [present_key, gone_key].into_iter().collect(),
-            held,
-        }));
-
-        let withdrawn = Arc::new(Mutex::new(Vec::new()));
-        let withdrawer = FakeWithdrawer {
-            withdrawn: Arc::clone(&withdrawn),
-        };
-        reconcile(&ledger, &withdrawer).await;
-
-        assert_eq!(
-            *withdrawn.lock().unwrap(),
-            vec![gone_ck],
-            "only the GC'd holding's ContentKey is withdrawn"
-        );
-        let led = ledger.lock().unwrap();
-        assert!(
-            led.held.contains_key(&present_key),
-            "the present holding stays tracked"
-        );
-        assert!(
-            !led.held.contains_key(&gone_key),
-            "the GC'd holding is dropped from held"
+            validate_store_path(&format!("/tmp/store/{HASH32}-x"), STORE_DIR).is_err(),
+            "a /tmp/store decoy is not the real /nix/store"
         );
     }
 }
