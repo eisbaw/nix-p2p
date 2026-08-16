@@ -49,6 +49,14 @@ zstd = "0.13"
 # "no iroh/libp2p" invariant is intact); it is already in the workspace lock via
 # iroh, so this direct dep reuses the pinned version with no new source.
 ed25519-dalek = "3"
+# TASK-100 AC#3: the seam ENFORCES the caller's TOTAL discovery deadline with a real
+# outer timeout (so a budget-IGNORING or hostile adapter is CUT at the deadline rather
+# than hanging the Nix build path - the whole point of the PROBE_TIMEOUT/TASK-40/106
+# latency-on-build-path invariant). That needs a timer, so tokio's `time` feature is a
+# real dep here. This is NOT a P2P stack (the AC#8 no-iroh/libp2p invariant is intact)
+# and NOT the HTTP stack `just independence` forbids (that denylist targets
+# {rustls,tokio-rustls}); plain tokio is already in the workspace lock via the daemon.
+tokio = { version = "1", default-features = false, features = ["time"] }
 
 [dev-dependencies]
 # Only the tests need an async runtime, to `.await` the trait methods. `macros` for

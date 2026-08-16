@@ -289,12 +289,60 @@ impl std::fmt::Display for BatchMisalignment {
 
 impl std::error::Error for BatchMisalignment {}
 
+/// A [`BatchResolution`] could not be bound to its request. Structural no-enumeration
+/// (AC#4): a resolution's outcomes must be POSITIONALLY BOUND to the asker's request
+/// keys, and a `Found` outcome may name ONLY holders of the key at that position - an
+/// adapter that ignores the request and returns holders for an un-named key is
+/// REJECTED at construction, not merely length-checked, so it cannot smuggle inventory
+/// the caller did not ask for.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BatchBindError {
+    /// The outcomes count differs from the request key count (positional mismatch).
+    LengthMismatch {
+        /// Keys the request named.
+        asked: usize,
+        /// Outcomes offered.
+        answered: usize,
+    },
+    /// A `Found` outcome at position `index` named a holder record whose own
+    /// [`ProviderRecord::key`](crate::ProviderRecord) is NOT the key the asker put at
+    /// that position - an un-asked holding. The whole resolution is rejected.
+    FoundUnaskedKey {
+        /// The position whose Found carried an un-asked key.
+        index: usize,
+    },
+}
+
+impl std::fmt::Display for BatchBindError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            BatchBindError::LengthMismatch { asked, answered } => write!(
+                f,
+                "batch resolution carries {answered} outcomes for {asked} keys asked"
+            ),
+            BatchBindError::FoundUnaskedKey { index } => write!(
+                f,
+                "batch resolution position {index} names holders of a key the asker did \
+                 not name (an un-asked holding) - rejected"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for BatchBindError {}
+
 /// The answer to a [`BatchResolveRequest`]: one [`KeyResolution`] per asked key, in
 /// the asker's order, plus the [`MechanismMeasurement`] of the consultation. It
 /// carries NO keys of its own (AC#4): it is meaningless without the request, and the
 /// ONLY safe way to read it is [`aligned_with`](BatchResolution::aligned_with), which
 /// re-pairs each outcome with the key the ASKER named and fails fast on a count
 /// mismatch.
+///
+/// The ONLY way an external adapter can build one is
+/// [`for_request`](BatchResolution::for_request), which BINDS each outcome to the
+/// request key at its position and REJECTS a `Found` whose holder records do not
+/// correspond to that key - so an ignore-the-request adapter cannot construct a
+/// resolution that names un-asked holdings (structural no-enumeration, AC#4).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BatchResolution {
     /// Positionally aligned with the request's `keys`. Carries no keys of its own.
@@ -304,14 +352,48 @@ pub struct BatchResolution {
 }
 
 impl BatchResolution {
-    /// Build a resolution from positional `outcomes` and its `measurement`. The
-    /// outcomes MUST be in the request's key order and have the request's length;
-    /// [`aligned_with`](BatchResolution::aligned_with) re-checks that at read time.
-    pub fn new(outcomes: Vec<KeyResolution>, measurement: MechanismMeasurement) -> Self {
+    /// Raw constructor, `pub(crate)`: the seam's own construction points use it AFTER
+    /// they have bound each outcome to its request key (the default `resolve_batch` and
+    /// the registry build outcomes per queried key). External adapters cannot reach it;
+    /// they must use [`for_request`](BatchResolution::for_request), which does the
+    /// binding check. Kept crate-private so the structural AC#4 guarantee cannot be
+    /// bypassed by an outside caller handing arbitrary outcomes.
+    pub(crate) fn new(outcomes: Vec<KeyResolution>, measurement: MechanismMeasurement) -> Self {
         BatchResolution {
             outcomes,
             measurement,
         }
+    }
+
+    /// Build a resolution BOUND to `request` (AC#4 structural). Verifies (1) one outcome
+    /// per asked key, in order, and (2) every `Found` outcome names ONLY holders of the
+    /// key at that position - a `Found` whose records carry a different
+    /// [`ProviderRecord::key`](crate::ProviderRecord) is an un-asked holding and is
+    /// REJECTED with [`BatchBindError::FoundUnaskedKey`]. This is the ONLY public
+    /// constructor, so a resolution that names inventory the caller did not ask for is
+    /// impossible to construct (not merely detectable after the fact).
+    pub fn for_request(
+        request: &BatchResolveRequest,
+        outcomes: Vec<KeyResolution>,
+        measurement: MechanismMeasurement,
+    ) -> Result<Self, BatchBindError> {
+        if outcomes.len() != request.keys.len() {
+            return Err(BatchBindError::LengthMismatch {
+                asked: request.keys.len(),
+                answered: outcomes.len(),
+            });
+        }
+        for (index, (key, outcome)) in request.keys.iter().zip(outcomes.iter()).enumerate() {
+            let names_unasked_holding =
+                matches!(outcome, KeyResolution::Found(records) if records.iter().any(|r| r.key != *key));
+            if names_unasked_holding {
+                return Err(BatchBindError::FoundUnaskedKey { index });
+            }
+        }
+        Ok(BatchResolution {
+            outcomes,
+            measurement,
+        })
     }
 
     /// The positional outcomes, in the request's key order. Prefer
@@ -695,27 +777,29 @@ impl MechanismRegistry {
             eprintln!("peer-fabric: resolver plan warning: {warning}");
         }
 
-        // Per-key aggregation across mechanisms, in plan order. Each mechanism is asked
-        // the SAME positional batch (asker-named keys only), and its per-key outcome is
-        // folded in: a Found wins for that key; otherwise a Miss is authoritative-but-
-        // absent and an Unavailable is remembered so a dead mechanism never reads as a
-        // Miss (AC#2). NotAttempted keys (a mechanism's deadline ran out) fold like an
-        // absence-with-no-conclusion and let a later mechanism still answer.
-        let mut aggregated: Vec<KeyResolution> =
-            vec![KeyResolution::NotAttempted; request.keys().len()];
-        let mut any_unavailable = false;
+        // Per-key aggregation across mechanisms, in plan order, folded by PRECEDENCE
+        // (AC#2): Found > Unavailable > Miss > NotAttempted. A key is a Miss ONLY if
+        // every consulted mechanism genuinely Missed it; ANY mechanism being Unavailable
+        // for the key keeps it Unavailable (retryable), so a dead mechanism can never be
+        // overwritten into a Miss - not even by a later mechanism's Miss.
+        let len = request.keys().len();
+        let mut aggregated: Vec<KeyResolution> = vec![KeyResolution::NotAttempted; len];
         // Track whether THIS registry's total deadline actually cut the loop, so the
-        // reported `resource` is a real event (not inferred from verdict flags, which
-        // mislabels a healthy mixed envelope as DeadlineCut and a spent envelope as
-        // Completed).
+        // reported `resource` is a real event, consistent with is_complete()/is_partial().
         let mut deadline_cut = false;
 
-        for mechanism in ordered {
-            // Under FirstHolder, once every key has a holder there is nothing left to ask.
-            if plan.stop() == StopCondition::FirstHolder
-                && aggregated.iter().all(KeyResolution::is_found)
-                && !aggregated.is_empty()
-            {
+        for (index, mechanism) in ordered.iter().enumerate() {
+            // Under FirstHolder, ask each subsequent mechanism ONLY about keys not yet
+            // held - never re-send an already-resolved key (MEDIUM: FirstHolder must not
+            // forward resolved keys). Under AllMechanisms, always ask about every key.
+            let pending: Vec<usize> = match plan.stop() {
+                StopCondition::FirstHolder => {
+                    (0..len).filter(|&i| !aggregated[i].is_found()).collect()
+                }
+                StopCondition::AllMechanisms => (0..len).collect(),
+            };
+            if pending.is_empty() {
+                // FirstHolder: every key already has a holder - stop.
                 break;
             }
             let remaining = budget
@@ -726,43 +810,56 @@ impl MechanismRegistry {
                 deadline_cut = true;
                 break;
             }
+            // A positional sub-request of ONLY the still-pending, asker-named keys.
+            let sub_request = BatchResolveRequest::new(pending.iter().map(|&i| request.keys()[i]));
             let sub_budget = DiscoveryBudget::new(remaining, budget.max_peers);
-            let resolution = mechanism.resolve_batch(request, &sub_budget).await;
-            for (slot, outcome) in aggregated.iter_mut().zip(resolution.outcomes().iter()) {
-                match outcome {
-                    KeyResolution::Found(records) => {
-                        // FirstHolder: keep the first mechanism's holders for a key. Under
-                        // AllMechanisms we still keep the first Found (merging holder sets
-                        // across mechanisms is a policy the holdout owns, not the baseline).
-                        if !slot.is_found() {
-                            *slot = KeyResolution::Found(records.clone());
-                        }
-                    }
-                    KeyResolution::Miss => {
-                        // A healthy absence only upgrades a not-yet-authoritative slot.
-                        if !slot.is_authoritative() {
-                            *slot = KeyResolution::Miss;
-                        }
-                    }
-                    KeyResolution::Unavailable(why) => {
-                        any_unavailable = true;
-                        if !slot.is_authoritative() {
-                            *slot = KeyResolution::Unavailable(why.clone());
-                        }
-                    }
-                    KeyResolution::NotAttempted => {}
+            // ENFORCE the total deadline with a real outer timeout (AC#3): a mechanism
+            // that IGNORES its budget and overruns is CUT here, it does not hang the loop.
+            let resolution = match tokio::time::timeout(
+                remaining,
+                mechanism.resolve_batch(&sub_request, &sub_budget),
+            )
+            .await
+            {
+                Ok(resolution) => resolution,
+                Err(_elapsed) => {
+                    deadline_cut = true;
+                    break;
                 }
+            };
+            let sub_outcomes = resolution.outcomes();
+            // Alignment (MEDIUM): a mechanism whose reply does not have one outcome per
+            // asked key is protocol-broken; do NOT zip a shifted/short reply. Treat the
+            // whole misaligned reply as this mechanism being Unavailable for the pending
+            // keys (never a fabricated Miss), and surface it.
+            if sub_outcomes.len() != pending.len() {
+                eprintln!(
+                    "peer-fabric: mechanism #{index} returned {} outcomes for {} asked keys \
+                     (misaligned) - treating as unavailable, not folding a shifted reply",
+                    sub_outcomes.len(),
+                    pending.len()
+                );
+                let unavailable = KeyResolution::Unavailable(Unavailable::Backend(
+                    "misaligned batch reply".into(),
+                ));
+                for &i in &pending {
+                    fold_key(&mut aggregated[i], &unavailable);
+                }
+                continue;
+            }
+            for (pos, &i) in pending.iter().enumerate() {
+                fold_key(&mut aggregated[i], &sub_outcomes[pos]);
             }
         }
 
         let latency_ns = u64::try_from(start.elapsed().as_nanos()).unwrap_or(u64::MAX);
         let complete = aggregated.iter().all(KeyResolution::is_authoritative);
-        // Derive the envelope outcome from what ACTUALLY happened, in priority order:
-        // a real deadline cut > a fully-resolved consultation > an unavailable mechanism
-        // left keys unresolved. A healthy mixed Found+Unavailable envelope with budget to
-        // spare is MechanismDown (a mechanism was down), NOT DeadlineCut; a spent envelope
-        // that resolved nothing is DeadlineCut, NOT Completed. This keeps `resource`
-        // consistent with `is_complete()`/`is_partial()`.
+        let any_unavailable = aggregated.iter().any(KeyResolution::is_unavailable);
+        // Derive the envelope outcome from what ACTUALLY happened, in priority order: a
+        // real deadline cut > a fully-resolved consultation > an unavailable mechanism
+        // left a key retryable. A batch containing an Unavailable is NEVER Completed
+        // (AC#2): it is MechanismDown (partial), so a caller retries rather than trusting
+        // an absence that was really a dead mechanism.
         let resource = if deadline_cut {
             ResourceOutcome::DeadlineCut
         } else if complete {
@@ -771,10 +868,12 @@ impl MechanismRegistry {
             ResourceOutcome::MechanismDown
         } else {
             // No deadline event, no failed mechanism, yet not every key is authoritative
-            // (e.g. an empty registry, or a sub-mechanism deferred a key under its own
-            // budget): the registry's own envelope ran to completion.
+            // (an empty registry, or every mechanism deferred a key): the registry's own
+            // envelope ran to completion.
             ResourceOutcome::Completed
         };
+        // The aggregate is bound per queried key (each folded Found came from a
+        // for_request-bound sub-resolution mapped to its position), so `new` is safe.
         Ok(BatchResolution::new(
             aggregated,
             MechanismMeasurement {
@@ -783,6 +882,25 @@ impl MechanismRegistry {
                 resource,
             },
         ))
+    }
+}
+
+/// Fold `incoming` into `slot` by AC#2 precedence, highest-first: Found(3), then
+/// Unavailable(2), then Miss(1), then NotAttempted(0). A strictly-higher-precedence
+/// outcome replaces the slot; a tie or lower keeps the slot (first-wins for a Found's
+/// holder set / an Unavailable's reason). This is what makes an Unavailable impossible
+/// to overwrite with a Miss.
+fn fold_key(slot: &mut KeyResolution, incoming: &KeyResolution) {
+    fn rank(o: &KeyResolution) -> u8 {
+        match o {
+            KeyResolution::NotAttempted => 0,
+            KeyResolution::Miss => 1,
+            KeyResolution::Unavailable(_) => 2,
+            KeyResolution::Found(_) => 3,
+        }
+    }
+    if rank(incoming) > rank(slot) {
+        *slot = incoming.clone();
     }
 }
 
@@ -835,6 +953,88 @@ mod tests {
         );
         assert!(found.holders().is_some());
         assert!(miss.holders().is_none() && unavail.holders().is_none());
+    }
+
+    // AC#4 STRUCTURAL: for_request is the only public constructor and it BINDS each
+    // outcome to the request key at its position. A Found naming holders of an UN-ASKED
+    // key is REJECTED at construction - an ignore-the-request adapter cannot build a
+    // resolution that leaks inventory the caller did not name. THE bite: removing the
+    // key-correspondence check would let this construction succeed.
+    #[test]
+    fn for_request_binds_found_to_the_queried_key() {
+        let request = BatchResolveRequest::new([key(1), key(2)]);
+
+        // Honest: Found at position 0 names holders of key(1) (the asked key) -> accepted.
+        let ok = BatchResolution::for_request(
+            &request,
+            vec![
+                KeyResolution::Found(vec![record(key(1))]),
+                KeyResolution::Miss,
+            ],
+            MechanismMeasurement::completed_unmetered(1),
+        );
+        assert!(ok.is_ok(), "a Found bound to the asked key is accepted");
+
+        // Hostile: position 0 (asked key(1)) returns holders of key(9) - an UN-ASKED key.
+        // Rejected structurally, not merely length-checked (lengths match).
+        let leaked = BatchResolution::for_request(
+            &request,
+            vec![
+                KeyResolution::Found(vec![record(key(9))]),
+                KeyResolution::Miss,
+            ],
+            MechanismMeasurement::completed_unmetered(1),
+        );
+        assert_eq!(
+            leaked,
+            Err(BatchBindError::FoundUnaskedKey { index: 0 }),
+            "a Found naming an un-asked key must be REJECTED (structural no-enumeration)"
+        );
+
+        // A length mismatch is also rejected.
+        let short = BatchResolution::for_request(
+            &request,
+            vec![KeyResolution::Miss],
+            MechanismMeasurement::completed_unmetered(1),
+        );
+        assert_eq!(
+            short,
+            Err(BatchBindError::LengthMismatch {
+                asked: 2,
+                answered: 1
+            })
+        );
+    }
+
+    // AC#2 precedence: fold_key never lets a Miss overwrite an Unavailable, and a key is
+    // Miss only if no mechanism was Unavailable for it (Found > Unavailable > Miss >
+    // NotAttempted). THE bite: the old max-authoritative fold let a Miss win here.
+    #[test]
+    fn fold_key_precedence_keeps_unavailable_over_miss() {
+        // Unavailable then Miss -> stays Unavailable.
+        let mut slot = KeyResolution::Unavailable(Unavailable::BootstrapOutage);
+        fold_key(&mut slot, &KeyResolution::Miss);
+        assert!(
+            slot.is_unavailable(),
+            "a Miss must not overwrite an Unavailable"
+        );
+
+        // Miss then Unavailable -> upgrades to Unavailable.
+        let mut slot = KeyResolution::Miss;
+        fold_key(
+            &mut slot,
+            &KeyResolution::Unavailable(Unavailable::Partition),
+        );
+        assert!(slot.is_unavailable(), "an Unavailable must upgrade a Miss");
+
+        // Found beats everything; nothing overwrites a Found.
+        let mut slot = KeyResolution::Found(vec![record(key(1))]);
+        fold_key(
+            &mut slot,
+            &KeyResolution::Unavailable(Unavailable::Partition),
+        );
+        fold_key(&mut slot, &KeyResolution::Miss);
+        assert!(slot.is_found());
     }
 
     // AC#2/AC#4: a resolution is positional over the asker's keys; aligned_with is the

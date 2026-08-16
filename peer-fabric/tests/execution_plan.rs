@@ -260,6 +260,62 @@ async fn the_stop_condition_comes_from_the_plan_not_the_registry() {
     );
 }
 
+// AC#2 (deepened, registry precedence): a mechanism that is DEAD for key X is NEVER
+// overwritten into a Miss by a later mechanism that genuinely Misses X. THE bite: the
+// old max-authoritative fold let global=Unavailable(X) + tracker=Miss(X) collapse to
+// X=Miss, is_complete()=true, resource=Completed - exactly the dead->Miss defect codex
+// found. Now X stays Unavailable, the batch is partial, resource=MechanismDown.
+#[tokio::test]
+async fn a_dead_mechanism_for_a_key_is_not_overwritten_by_a_later_miss() {
+    let x = key(0x51);
+    let y = key(0x52);
+    let mut registry = MechanismRegistry::new();
+    registry
+        // global: dead for BOTH keys (Unavailable).
+        .register(
+            MechanismId::GlobalDirectory,
+            Arc::new(RecordingDirectory {
+                id: MechanismId::GlobalDirectory,
+                answer: Lookup::Unavailable(Unavailable::BootstrapOutage),
+                log: Arc::new(Mutex::new(Vec::new())),
+            }),
+        )
+        // tracker: genuinely Misses everything.
+        .register(
+            MechanismId::Tracker,
+            Arc::new(RecordingDirectory {
+                id: MechanismId::Tracker,
+                answer: Lookup::Miss,
+                log: Arc::new(Mutex::new(Vec::new())),
+            }),
+        );
+
+    let res = registry
+        .resolve(
+            &BatchResolveRequest::new([x, y]),
+            &budget(),
+            // AllMechanisms so both mechanisms are consulted for every key.
+            &ExecutionPlan::fixed_baseline_v1().with_stop(StopCondition::AllMechanisms),
+        )
+        .await
+        .unwrap();
+
+    assert!(
+        res.outcomes()[0].is_unavailable(),
+        "key X must stay Unavailable (dead mechanism), NOT be overwritten to Miss - got {:?}",
+        res.outcomes()[0]
+    );
+    assert!(
+        !res.outcomes()[0].is_miss(),
+        "a dead-for-X mechanism must never read as a Miss (AC#2)"
+    );
+    assert!(
+        !res.is_complete(),
+        "a batch with an Unavailable is not Completed"
+    );
+    assert_eq!(res.measurement().resource, ResourceOutcome::MechanismDown);
+}
+
 // AC#3/#5: the registry's reported `resource` is a REAL event, consistent with
 // is_complete()/is_partial() - not inferred from verdict flags (mped-architect #2).
 // Three pinned cases: spent budget -> DeadlineCut; clean all-Miss -> Completed; a

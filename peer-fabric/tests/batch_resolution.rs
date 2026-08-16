@@ -150,8 +150,9 @@ async fn a_spent_total_deadline_yields_typed_partial_not_a_miss() {
     assert!(resolution.is_partial());
 }
 
-/// A directory that SLEEPS a fixed duration per key, so a batch's measured latency is
-/// a real observation (used for the AC#3 "measurement, not a class" bite).
+/// A directory that SLEEPS a fixed duration per key and IGNORES the budget (it never
+/// checks the deadline), so it models a budget-ignoring / hostile mechanism. Used for
+/// both the AC#3 "measured latency" and the AC#3 "overrun is CUT" bites.
 struct SlowDirectory {
     per_key: Duration,
 }
@@ -170,6 +171,76 @@ impl ProviderDirectory for SlowDirectory {
     fn declared_exposure(&self) -> ExposureSurface {
         ExposureSurface::none()
     }
+}
+
+// AC#3 (deadline ENFORCED, not just passed down): a budget-IGNORING adapter that
+// overruns the caller's total deadline is CUT by an outer timeout - it does NOT run to
+// its own completion. THE deepened bite: without the outer timeout the SlowDirectory
+// sleeps the full 200ms and returns Miss (elapsed ~200ms, outcome Miss); WITH it, the
+// batch returns in ~50ms with a typed DeadlineExceeded, never a false Miss.
+#[tokio::test]
+async fn an_overrunning_adapter_is_cut_at_the_deadline() {
+    let dir = SlowDirectory {
+        per_key: Duration::from_millis(200),
+    };
+    let request = BatchResolveRequest::single(key(0x77));
+    let started = std::time::Instant::now();
+    let resolution = dir
+        .resolve_batch(
+            &request,
+            &DiscoveryBudget::new(Duration::from_millis(50), 16),
+        )
+        .await;
+    let elapsed = started.elapsed();
+
+    assert!(
+        elapsed < Duration::from_millis(150),
+        "the overrunning adapter must be CUT near the 50ms deadline, not run its full \
+         200ms - took {elapsed:?}"
+    );
+    assert!(
+        matches!(
+            resolution.outcomes()[0],
+            peer_fabric::KeyResolution::Unavailable(Unavailable::DeadlineExceeded)
+        ),
+        "a deadline-cut key is a typed DeadlineExceeded, never a false Miss - got {:?}",
+        resolution.outcomes()[0]
+    );
+    assert_eq!(
+        resolution.measurement().resource,
+        ResourceOutcome::DeadlineCut
+    );
+    assert!(resolution.is_partial());
+}
+
+// AC#4 (structural, default path): a mechanism that returns holders of an UN-ASKED key
+// for a queried position cannot leak them - bind_found drops records not keyed to the
+// queried key, so the outcome is a Miss, never a Found naming un-named holdings. THE
+// bite: removing the binding filter would surface Found(holders-of-Y) for a query of X.
+#[tokio::test]
+async fn the_default_path_drops_holders_of_an_unasked_key() {
+    let fabric = FakeFabric::upstream_only(provider(0x08));
+    let ledger = fabric.shared_ledger();
+    let asked = key(0x10);
+    let unasked = key(0x20);
+    // Configure the fake to answer the ASKED key with holders of a DIFFERENT (un-asked) key.
+    let dir = directory(Lookup::Miss, ledger)
+        .with_key_result(asked, Lookup::Found(vec![record(unasked, provider(0x99))]));
+
+    let request = BatchResolveRequest::single(asked);
+    let resolution = dir
+        .resolve_batch(&request, &DiscoveryBudget::new(Duration::from_secs(5), 16))
+        .await;
+
+    assert!(
+        resolution.outcomes()[0].is_miss(),
+        "holders of an un-asked key must be DROPPED (Miss), never surfaced as Found - got {:?}",
+        resolution.outcomes()[0]
+    );
+    assert!(
+        !resolution.outcomes()[0].is_found(),
+        "the default path must not leak un-named holdings"
+    );
 }
 
 // AC#3: latency is a MEASURED value (integer nanoseconds), not a timeless class. A

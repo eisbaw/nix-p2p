@@ -43,6 +43,19 @@ use crate::resolve::{
     MechanismMeasurement, ResourceOutcome,
 };
 
+/// Bind a `Found` holder set to the key it answers (AC#4): keep only records whose own
+/// [`ProviderRecord::key`] IS the queried key, so a mechanism cannot smuggle holders of
+/// an un-asked key into this position. A holder set that is empty after binding is a
+/// [`Miss`](KeyResolution::Miss), not an empty `Found`.
+fn bind_found(key: &ContentKey, records: Vec<ProviderRecord>) -> KeyResolution {
+    let bound: Vec<ProviderRecord> = records.into_iter().filter(|r| r.key == *key).collect();
+    if bound.is_empty() {
+        KeyResolution::Miss
+    } else {
+        KeyResolution::Found(bound)
+    }
+}
+
 // -------------------------------------------------------------------------
 // Axis 3a - global exact-key content discovery.
 // -------------------------------------------------------------------------
@@ -109,12 +122,27 @@ pub trait ProviderDirectory: Send + Sync {
                 continue;
             }
             // Bound THIS key by the REMAINING total budget, so the sum is bounded by the
-            // caller's deadline (never per-key deadline * N).
+            // caller's deadline (never per-key deadline * N). ENFORCE it with a real outer
+            // timeout so a budget-IGNORING or hostile adapter that overruns is CUT at the
+            // deadline rather than hanging the build path (AC#3) - the deadline is not
+            // merely passed down and trusted.
             let sub_budget = DiscoveryBudget::new(remaining, budget.max_peers);
-            let outcome = match self.find_providers(key, &sub_budget).await {
-                Lookup::Found(records) => KeyResolution::Found(records),
-                Lookup::Miss => KeyResolution::Miss,
-                Lookup::Unavailable(why) => KeyResolution::Unavailable(why),
+            let outcome = match tokio::time::timeout(
+                remaining,
+                self.find_providers(key, &sub_budget),
+            )
+            .await
+            {
+                Ok(Lookup::Found(records)) => bind_found(key, records),
+                Ok(Lookup::Miss) => KeyResolution::Miss,
+                Ok(Lookup::Unavailable(why)) => KeyResolution::Unavailable(why),
+                // The outer timeout fired: this key was CUT by the caller's total deadline.
+                // Typed as DeadlineExceeded (attempted, cut), never a false Miss; the rest
+                // are NotAttempted.
+                Err(_elapsed) => {
+                    cut = true;
+                    KeyResolution::Unavailable(crate::Unavailable::DeadlineExceeded)
+                }
             };
             outcomes.push(outcome);
         }
@@ -124,6 +152,9 @@ pub trait ProviderDirectory: Send + Sync {
         } else {
             ResourceOutcome::Completed
         };
+        // The outcomes are built PER QUERIED KEY (bound above), so `new` is safe here; an
+        // external adapter overriding this method must use the checked
+        // `BatchResolution::for_request` instead.
         BatchResolution::new(
             outcomes,
             MechanismMeasurement {
