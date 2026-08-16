@@ -1,0 +1,130 @@
+# cargo-deny policy for nix-p2p — the supply-chain advisory/license/ban/source
+# gate driven by `just audit` (see Justfile). Tuned to PASS on the current tree
+# while still biting on a real vulnerability, a non-permissive license, an
+# unvetted crate source, or a yanked crate. cargo-deny 0.19.x schema.
+#
+# At runtime `cargo deny check advisories` fetches the RustSec advisory-db from
+# GitHub; that network access is expected for local `just audit` and for
+# Determinate-Nix CI (TASK-230). The other checks are offline.
+
+[graph]
+# Check every target we actually build/ship for, not just the host triple —
+# otherwise a Windows/macOS/wasm-only transitive dep escapes the license/ban
+# scan. all-features so an optional dep cannot smuggle a bad license past us.
+all-features = true
+
+[advisories]
+# RustSec advisory database. A KNOWN vulnerability fails the gate (never
+# suppressed silently — a real hit is reported and gets a follow-up task).
+# Unmaintained is a warning: informative, but not every unmaintained crate has
+# a fix available, so it must not wedge the whole gate.
+version = 2
+yanked = "deny"
+unmaintained = "workspace"
+# No blanket ignores. Add a specific `ID = "..."` here ONLY with a filed
+# follow-up task explaining why the advisory does not apply to our usage.
+ignore = []
+
+[licenses]
+# version = 2 semantics: a crate passes iff its SPDX expression is satisfied by
+# this allow list. Dual/multi-licensed crates (e.g. "MIT OR Apache-2.0") pass on
+# ANY allowed branch, so GPL-2.0/LGPL branches that appear only as OR
+# alternatives (self_cell, r-efi) are satisfied via their MIT/Apache branch and
+# need NOT be allowed here. Only PERMISSIVE licenses actually present in the tree
+# are listed — this is not a blanket allow.
+version = 2
+# confidence below this fails rather than guessing a license from a fuzzy match.
+confidence-threshold = 0.9
+allow = [
+    "MIT",
+    "MIT-0",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-1-Clause",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "BSL-1.0",        # Boost — ryu (as an OR branch)
+    "Zlib",           # foldhash is Zlib-only
+    "CC0-1.0",        # public-domain dedication (blake3/constant_time_eq branch)
+    "Unlicense",      # public-domain dedication — pharos, async_io_stream, ws_stream_wasm
+    "Unicode-3.0",    # the icu_* crates are Unicode-3.0-only
+    "CDLA-Permissive-2.0",  # webpki-roots / webpki-root-certs are this-only
+    "MPL-2.0",        # weak, file-level copyleft — attohttpc; permissive enough to ship
+    # OpenSSL license (permissive, attribution + advertising clause — NOT
+    # copyleft). Present only because ring 0.16.20 bundles OpenSSL-licensed
+    # crypto (clarified below); we genuinely ship that code, so we allow it
+    # rather than mislabel ring.
+    "OpenSSL",
+]
+# `private.ignore` only skips crates marked `publish = false`; our workspace
+# members do not set that (and are out of this change's scope to edit), so they
+# are clarified individually below instead.
+private = { ignore = true }
+
+# Our eight first-party workspace crates carry no per-manifest `license` field,
+# so cargo-deny cannot classify them. They ARE covered by the repo-root MIT
+# LICENSE (see ./LICENSE, README "## License"), so clarifying them to MIT states
+# the real license rather than inventing one. (Adding `license = "MIT"` /
+# `publish = false` to each Cargo.toml is the tidier long-term fix but is out of
+# this tooling change's scope.)
+[[licenses.clarify]]
+crate = "daemon"
+expression = "MIT"
+license-files = []
+[[licenses.clarify]]
+crate = "daemon-core"
+expression = "MIT"
+license-files = []
+[[licenses.clarify]]
+crate = "daemon-libp2p"
+expression = "MIT"
+license-files = []
+[[licenses.clarify]]
+crate = "fabric-iroh"
+expression = "MIT"
+license-files = []
+[[licenses.clarify]]
+crate = "fabric-libp2p"
+expression = "MIT"
+license-files = []
+[[licenses.clarify]]
+crate = "peer-fabric"
+expression = "MIT"
+license-files = []
+[[licenses.clarify]]
+crate = "proc-supervisor"
+expression = "MIT"
+license-files = []
+[[licenses.clarify]]
+crate = "testproxy"
+expression = "MIT"
+license-files = []
+
+# ring 0.16.20 (via rcgen 0.11 -> libp2p-tls) ships a non-SPDX `license-file`
+# instead of a `license` expression, so cargo-deny cannot classify it. Pin its
+# real license expression and the exact LICENSE-file hash so a swapped-out
+# license (supply-chain tamper) would fail the hash and re-surface here. ring's
+# LICENSE is ISC for its own code plus MIT/OpenSSL notices for vendored code.
+[[licenses.clarify]]
+crate = "ring"
+expression = "ISC AND MIT AND OpenSSL"
+license-files = [{ path = "LICENSE", hash = 0xbd0eed23 }]
+
+[bans]
+# Duplicate versions are common and benign in a large libp2p+iroh tree (multiple
+# rand/hashbrown/windows-sys majors). Warn so the count is visible and can be
+# trimmed opportunistically, but do not fail the build on it.
+multiple-versions = "warn"
+wildcards = "warn"
+# No crate is banned outright yet; add here with a reason if one must go.
+deny = []
+
+[sources]
+# Every dependency must come from a vetted source. crates.io is the only
+# registry in Cargo.lock today (607/607 registry entries, zero git sources), so
+# an unknown registry or a git dependency sneaking in fails the gate.
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = []

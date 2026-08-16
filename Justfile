@@ -124,6 +124,16 @@ independence: _toolchain
     python3 scripts/check_shaping_out_of_daemon.py
     python3 scripts/check-no-floats.py
 
+# Standalone (no _toolchain prereq) because cargo-deny reads Cargo.lock directly
+# and does not use the pinned rustc, and because TASK-230's CI must call this
+# recipe verbatim. NOTE: `check advisories` fetches the RustSec advisory-db from
+# GitHub, so this recipe needs network (fine locally and on Determinate-Nix CI).
+# A non-zero exit means a real advisory/license/source violation - see the
+# printed RUSTSEC IDs; do not suppress without a filed follow-up task.
+# Supply-chain gate: RustSec advisories + licenses + bans + sources (deny.toml).
+audit:
+    cargo deny check
+
 # Depends on the fast fixture tier because the signing and tamper assertions
 # live in scripts/, not in cargo (rationale: scripts/check-fixtures.py).
 # Unit and integration tests plus the fixture gate (in-process, no containers).

@@ -485,7 +485,13 @@
         # Pulls the checks' build inputs into the shell, so `nix develop` and
         # `nix flake check` cannot drift apart on toolchain or native deps.
         checks = self.checks.${system};
-        packages = [ pkgs.just pythonEnv pkgs.ruff ];
+        # cargo-deny is the supply-chain advisory/license/ban/source gate driven
+        # by `just audit` (deny.toml at the repo root). It is a standalone binary
+        # from nixpkgs, not part of the pinned rust toolchain: it reads Cargo.lock
+        # directly and does not invoke rustc, so it is independent of the
+        # `_toolchain` pin. At runtime it fetches the RustSec advisory-db from
+        # GitHub (fine for local `just audit` and Determinate-Nix CI).
+        packages = [ pkgs.just pythonEnv pkgs.ruff pkgs.cargo-deny ];
         # Exact toolchain derivation, so the Justfile's `_toolchain` guard can
         # prove the tools come from THIS one rather than from any /nix/store
         # path that happens to be on PATH.
