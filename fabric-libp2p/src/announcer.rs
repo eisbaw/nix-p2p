@@ -50,7 +50,8 @@ use libp2p::PeerId;
 use peer_fabric::{
     AnnounceBudget, AnnounceError, AvailabilityAnnouncer, ContentKey, Disclosed, Exposure,
     ExposureLedger, ExposureSurface, NodeId, ProviderRecord, ProviderWithdrawal, Receipt,
-    Recipient, encode_provider_record, encode_provider_withdrawal, sign_provider_withdrawal,
+    Recipient, decode_provider_assertion, encode_provider_record, encode_provider_withdrawal,
+    sign_provider_withdrawal,
 };
 
 use crate::keys::{provider_index_key, provider_value_key};
@@ -342,6 +343,18 @@ impl AvailabilityAnnouncer for Libp2pAvailabilityAnnouncer {
         // the sender - fail fast before publishing).
         let value =
             encode_provider_record(record).map_err(|e| AnnounceError::Rejected(e.to_string()))?;
+
+        // TASK-100 (codex BLOCKER, AC#6 half): VERIFY the record's ed25519 signature BEFORE
+        // publishing, so a zero-signature / unverifiable self-provider record can never reach
+        // the kad DHT (`start_providing`/`put_record` below). The encode step copies the
+        // signature verbatim without checking it; here we re-parse the encoded value through
+        // the FROZEN self-verifying decoder (`verify_strict` over the signing preimage, keyed
+        // by the provider NodeId that MUST equal this node). A bad/zero signature fails closed
+        // as `Rejected`, not published. This is an adapter INVARIANT: no announce path (public
+        // or LAN) can publish an unsigned record, regardless of how it was routed here.
+        decode_provider_assertion(&value, &record.key, now).map_err(|e| {
+            AnnounceError::Rejected(format!("record failed signature self-verification: {e}"))
+        })?;
 
         self.ledger.record_all([
             Exposure::new(Recipient::DhtNode, Disclosed::ContentKey),

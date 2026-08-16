@@ -188,6 +188,68 @@ async fn announce_rejects_an_over_cap_record_ttl() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn announce_rejects_a_zero_signature_record_before_reaching_the_dht() {
+    // TASK-100 codex BLOCKER (AC#6 half): a ZERO-signature / unverifiable self-provider
+    // record must NEVER reach the kad DHT. The shipped announcer VERIFIES the record's
+    // ed25519 signature (via the frozen self-verifying decoder) BEFORE start_providing/
+    // put_record, so a caller that mints a record with `provider == node_id` but an empty
+    // signature is REJECTED, fail-closed, and nothing is published. MUTATION that bites:
+    // remove the `decode_provider_assertion` verify in `announce` and this UNSIGNED record
+    // proceeds to publish rather than being Rejected - the assertion below fails.
+    let _ = tracing_subscriber::fmt::try_init();
+    let (node, _addr) = start_node(7, "lifecycle-zero-sig").await;
+
+    // A record that passes the self-serve provider check (provider == this node's id) and
+    // the expiry/TTL gates, but is NOT signed (signature stays all-zero).
+    let signing_key = SigningKey::from_bytes(&[7u8; 32]);
+    let provider = NodeId::from_bytes(signing_key.verifying_key().to_bytes());
+    let nar_hash = [0x77u8; 32];
+    let key = ContentKey::derive_from_signed_nar_hash(&nar_hash);
+    let now = now_secs();
+    let unsigned = ProviderRecord {
+        key,
+        content: Blake3Digest::from_bytes([0x5a; 32]),
+        provider,
+        offers: vec![TransportOffer::Iroh { node: provider }],
+        sequence: 1,
+        issued_at: now,
+        expiry: now + 3600,
+        signature: [0u8; 64],
+    };
+
+    let result = node
+        .announcer()
+        .unwrap()
+        .announce(&unsigned, &AnnounceBudget::new(Duration::from_secs(5), 20))
+        .await;
+    match result {
+        Err(AnnounceError::Rejected(why)) => assert!(
+            why.contains("signature"),
+            "a zero-signature record must be rejected for its signature, got: {why}"
+        ),
+        other => panic!("an unsigned record must be Rejected before publishing, got: {other:?}"),
+    }
+
+    // Control: the SAME record, now validly signed, passes the signature gate (it does not
+    // reach the network here without bootstrap, but it is NOT rejected for its signature).
+    let signed = sign_provider_record(&signing_key, &unsigned);
+    if let Err(AnnounceError::Rejected(why)) = node
+        .announcer()
+        .unwrap()
+        .announce(
+            &signed,
+            &AnnounceBudget::new(Duration::from_millis(300), 20),
+        )
+        .await
+    {
+        assert!(
+            !why.contains("signature"),
+            "a validly-signed record must not be rejected for its signature, got: {why}"
+        );
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn announce_fails_closed_when_the_sequence_cannot_be_persisted() {
     // TASK-185 AC#3 BITE (save-before-publish, fail-closed): if the durably-allocated
     // per-key sequence CANNOT be written, `announce` returns `AnnounceError::Persist` and
