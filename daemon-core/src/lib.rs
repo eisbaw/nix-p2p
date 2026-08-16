@@ -62,8 +62,8 @@ pub use content_id::{
     BLAKE3_DIGEST_LEN, BLAKE3_DOMAIN_SEPARATION, BLAKE3_PREFIX, Blake3Digest, DigestParseError,
 };
 pub use discovery::{
-    ClaimResolution, DirectDiscovery, Discovery, FallbackNarSource, InMemoryDiscovery,
-    InProcessPeerQuery, PROBE_TIMEOUT, PeerQuery, PeerQueryError,
+    DirectDiscovery, Discovery, FallbackNarSource, InMemoryDiscovery, InProcessPeerQuery,
+    PROBE_TIMEOUT, PeerQuery, PeerQueryError,
 };
 pub use narinfo_cache::{Clock, NarinfoDiskCache, SystemClock};
 pub use peer_source::{PeerFabricNarSource, PeerFabricRawServe};
