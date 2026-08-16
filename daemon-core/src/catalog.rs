@@ -49,6 +49,20 @@ pub struct NarMeta {
     /// is deliberately NOT carried, see [`NarinfoTransport`]) - so the HTTP-delivery
     /// path bounds the on-wire body in the right unit (TASK-25).
     pub transport: NarinfoTransport,
+    /// The signed `StorePath: /nix/store/<hash>-<name>` this narinfo describes, when the
+    /// narinfo carried an unambiguous one (TASK-77 announce-after-fetch). It is the path
+    /// the LOCAL nix realises this NAR to, so a node that fetched it can - once the store
+    /// materialises the path - regenerate the raw NAR from `/nix/store` on demand and
+    /// announce itself a holder (TASK-61 arm-a: no blob at rest, the store IS the copy).
+    ///
+    /// IN-MEMORY ONLY: this is never written to the persisted narinfo cache's INDEX (the
+    /// `.nic` files already hold the verbatim narinfo, so this adds no on-disk store-path
+    /// exposure the allowlist's "no StorePath on disk" invariant does not already carry);
+    /// a cold-memory node simply re-derives it from the cached narinfo body on the next
+    /// correlation. `None` when the narinfo lacked a `StorePath` or carried a duplicated
+    /// (ambiguous) one - announce-after-fetch then simply does not fire for that NAR
+    /// (fail-safe: no store path, no holder claim).
+    pub store_path: Option<String>,
 }
 
 /// A PERSISTED correlation source consulted on an in-memory catalog miss.
@@ -117,6 +131,7 @@ impl NarCatalog {
         nar_hash: NarHash,
         nar_size: u64,
         transport: NarinfoTransport,
+        store_path: Option<String>,
     ) {
         let mut inner = self.inner.write().expect("catalog lock poisoned");
         inner.by_token.insert(
@@ -125,6 +140,7 @@ impl NarCatalog {
                 nar_hash,
                 nar_size,
                 transport,
+                store_path,
             },
         );
     }
@@ -153,6 +169,11 @@ pub struct Correlation {
     pub nar_size: u64,
     /// UNSIGNED transport descriptor - the AUTHORITATIVE `Compression:` (raw-vs-compressed).
     pub transport: NarinfoTransport,
+    /// The signed `StorePath:` line, when present and unambiguous - the local `/nix/store`
+    /// path this NAR realises to (TASK-77). `None` if absent or DUPLICATED (ambiguous). It
+    /// is carried for announce-after-fetch only; the mandatory correlation trio
+    /// (`URL`/`NarHash`/`NarSize`) is unaffected by its presence.
+    pub store_path: Option<String>,
 }
 
 /// Parse the correlation out of a narinfo body. Returns `None` (recording skipped)
@@ -179,8 +200,20 @@ pub fn parse_correlation(body: &[u8]) -> Option<Correlation> {
     let mut nar_size_str: Option<&str> = None;
     let mut compression: Option<&str> = None;
     let mut compression_dup = false;
+    let mut store_path: Option<&str> = None;
+    let mut store_path_dup = false;
     for line in text.lines() {
-        if let Some(value) = line.strip_prefix("URL:") {
+        if let Some(value) = line.strip_prefix("StorePath:") {
+            // First-occurrence; a DUPLICATED StorePath is ambiguous (which one did the
+            // signature cover?) so it drops to `None` below rather than picking one -
+            // announce-after-fetch then does not fire (fail-safe). It never rejects the
+            // whole correlation: the signed trio still drives the normal SignedNarHash path.
+            if store_path.is_some() {
+                store_path_dup = true;
+            } else {
+                store_path = Some(value.trim());
+            }
+        } else if let Some(value) = line.strip_prefix("URL:") {
             if url.is_some() {
                 return None;
             }
@@ -221,11 +254,20 @@ pub fn parse_correlation(body: &[u8]) -> Option<Correlation> {
         }
     };
 
+    // A duplicated (ambiguous) StorePath drops to `None`: announce-after-fetch fires only
+    // on an unambiguous signed store path.
+    let store_path = if store_path_dup {
+        None
+    } else {
+        store_path.map(|s| s.to_string())
+    };
+
     Some(Correlation {
         token: NarPathToken::new(token),
         nar_hash: NarHash::new(nar_hash),
         nar_size,
         transport: NarinfoTransport { compression },
+        store_path,
     })
 }
 
@@ -322,16 +364,44 @@ NarSize: 4096\nNarSize: 1\n";
     }
 
     #[test]
+    fn duplicate_store_path_is_ambiguous_and_yields_no_store_path() {
+        // TASK-77: a DUPLICATED StorePath is ambiguous (which one did the signature cover?), so
+        // announce-after-fetch must not pick one - it degrades to `None` (fail-safe: no store path,
+        // no holder claim). Unlike the mandatory trio, a duplicate StorePath does NOT reject the
+        // whole correlation: the signed trio still drives the normal SignedNarHash path.
+        let dup_store_path = b"StorePath: /nix/store/aaaa-x\nStorePath: /nix/store/bbbb-y\n\
+URL: nar/1abc.nar.xz\nNarHash: sha256:1b2c3d\nNarSize: 4096\n";
+        let c = parse_correlation(dup_store_path).expect("the signed trio still correlates");
+        assert_eq!(
+            c.store_path, None,
+            "an ambiguous (duplicated) StorePath must not be announced under"
+        );
+        assert_eq!(c.nar_hash.as_str(), "sha256:1b2c3d");
+    }
+
+    #[test]
+    fn absent_store_path_yields_none_but_still_correlates() {
+        // A narinfo with no StorePath still correlates (the trio is present); announce-after-fetch
+        // simply does not fire for it.
+        let no_store_path = b"URL: nar/1abc.nar.xz\nNarHash: sha256:1b2c3d\nNarSize: 4096\n";
+        let c = parse_correlation(no_store_path).expect("the trio correlates");
+        assert_eq!(c.store_path, None);
+    }
+
+    #[test]
     fn records_and_looks_up_by_token() {
         let catalog = NarCatalog::new();
         let c = parse_correlation(NARINFO).unwrap();
         let hash = c.nar_hash.clone();
-        catalog.record(c.token, c.nar_hash, c.nar_size, c.transport);
+        // TASK-77: the signed StorePath is captured for announce-after-fetch.
+        assert_eq!(c.store_path.as_deref(), Some("/nix/store/aaaa-x"));
+        catalog.record(c.token, c.nar_hash, c.nar_size, c.transport, c.store_path);
 
         let meta = catalog.meta_for_token("1abc.nar.xz").unwrap();
         assert_eq!(meta.nar_hash, hash);
         assert_eq!(meta.nar_size, 4096);
         assert_eq!(meta.transport.compression, NarCompression::Compressed);
+        assert_eq!(meta.store_path.as_deref(), Some("/nix/store/aaaa-x"));
         // An unknown token is a miss, not a panic.
         assert!(catalog.meta_for_token("unknown.nar").is_none());
     }
@@ -348,12 +418,14 @@ NarSize: 4096\nNarSize: 1\n";
             hash.clone(),
             4096,
             NarinfoTransport::default(),
+            None,
         );
         catalog.record(
             NarPathToken::new("bbbb.nar.zst"),
             hash.clone(),
             4096,
             NarinfoTransport::default(),
+            None,
         );
 
         // Both forward entries survive carrying the shared hash - neither

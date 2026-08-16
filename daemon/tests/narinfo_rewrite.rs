@@ -140,6 +140,8 @@ fn build_app(raw_serve: Arc<dyn RawServeDecision>, nar: Arc<dyn NarSource>) -> A
         correlation: Arc::new(daemon::NullCorrelation),
         raw_serve,
         public_allowlist: Arc::new(daemon::PublicNarAllowlist::disabled()),
+
+        post_fetch_announce: None,
     })
 }
 

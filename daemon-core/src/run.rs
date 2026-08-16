@@ -62,6 +62,11 @@ pub struct RunConfig {
     /// be publicly announced. The serving layer's narinfo path calls `learn` on it. Wire
     /// [`crate::PublicNarAllowlist::disabled`] for a node with no publication authority.
     pub public_allowlist: Arc<crate::public_allowlist::PublicNarAllowlist>,
+    /// The ANNOUNCE-AFTER-FETCH hook (TASK-77), or `None` for a CONSUME-ONLY (leech) node.
+    /// The backend binary supplies it (the `daemon-libp2p` announce-after-fetch impl) so a
+    /// successful fetch makes this node a discoverable holder; `None` is the privacy-preserving
+    /// default (fetch without announcing what you fetched, TASK-78).
+    pub post_fetch_announce: Option<Arc<dyn crate::post_fetch::PostFetchAnnounce>>,
 }
 
 /// Serve the Nix binary-cache frontend over `fabric` until the listener errors (or the
@@ -108,6 +113,7 @@ pub async fn run(fabric: Arc<dyn PeerFabric>, cfg: RunConfig) -> Result<(), Stri
         correlation: cfg.correlation,
         raw_serve,
         public_allowlist: cfg.public_allowlist,
+        post_fetch_announce: cfg.post_fetch_announce,
     });
 
     // A standalone supervisor: its drop cancels/aborts every in-flight HTTP connection task,

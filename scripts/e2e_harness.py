@@ -524,6 +524,8 @@ class Pod:
         libp2p_provider_seeds: tuple[P2pSeed, ...] = (),
         libp2p_trusted_key: str | None = None,
         libp2p_store_supply: bool = False,
+        libp2p_announce_after_fetch: bool = False,
+        libp2p_announce_budget: int = 256,
     ):
         self.ctx = ctx
         self.pod = f"{POD_PREFIX}-{name}"
@@ -593,6 +595,19 @@ class Pod:
         if self.libp2p_store_supply and not libp2p_trusted_key:
             die(
                 "Pod: libp2p_store_supply requires libp2p_trusted_key (public-narinfo proof)"
+            )
+        # TASK-77 (announce-after-fetch): the provider `A` starts with NO static supply set +
+        # `--libp2p-announce-after-fetch`. It holds nothing at boot; a scenario drives A's OWN
+        # daemon to fetch the target from upstream (which materialises the path into A's store and
+        # fires the announce), so a second consumer `B` can then discover A via kad and fetch from
+        # it - the swarm GROWS. A learns the public allowlist DYNAMICALLY from the narinfo it
+        # fetches (no `--libp2p-prove-public-narinfo` staging), so it still requires the trusted key.
+        self.libp2p_announce_after_fetch = bool(libp2p_announce_after_fetch)
+        self.libp2p_announce_budget = int(libp2p_announce_budget)
+        if self.libp2p_announce_after_fetch and not libp2p_trusted_key:
+            die(
+                "Pod: libp2p_announce_after_fetch requires libp2p_trusted_key (the public-announce "
+                "door proves each fetched path public via a trusted narinfo signature)"
             )
         # Parsed once the provider announces; the positive oracle reads it to assert C
         # was NEVER configured with it (no-injection).
@@ -1128,7 +1143,17 @@ class Pod:
 
         # 2. P (provider): seeds the real target, bootstraps to BOOT, announces.
         seed_args: list[str] = []
-        if self.libp2p_store_supply:
+        if self.libp2p_announce_after_fetch:
+            # TASK-77: node A holds NOTHING at boot; it becomes a holder by FETCHING. It runs in
+            # public-announce mode (trusted key + a writable allowlist file) but learns the
+            # allowlist DYNAMICALLY from the narinfo it fetches, so NO `--libp2p-prove-public-narinfo`
+            # staging and NO seed/provide-store args. The scenario drives A's own daemon to fetch.
+            seed_args += [
+                "--libp2p-announce-after-fetch",
+                "--libp2p-announce-budget",
+                str(self.libp2p_announce_budget),
+            ]
+        elif self.libp2p_store_supply:
             # STORE-supply (TASK-194): serve the REAL realised /nix/store path via
             # `nix-store --dump` on demand - NO .nar mounted, nothing at rest. The narhash
             # binds the announce to the signed NarHash exactly as the seed path does.
@@ -1156,18 +1181,33 @@ class Pod:
                 "--libp2p-public-allowlist-path",
                 f"{LIBP2P_ALLOWLIST_MOUNT}/allowlist",
             ]
-            for s in self.libp2p_provider_seeds:
-                sh = libp2p_store_hash(s.store_path)
-                seed_args += [
-                    "--libp2p-prove-public-narinfo",
-                    f"{sh}=/srv/seed/narinfos/{sh}.narinfo",
-                ]
+            # Announce-after-fetch (TASK-77) learns the allowlist from the narinfo it FETCHES at
+            # runtime, so it stages NO prove-public-narinfo files; the static providers do.
+            if not self.libp2p_announce_after_fetch:
+                for s in self.libp2p_provider_seeds:
+                    sh = libp2p_store_hash(s.store_path)
+                    seed_args += [
+                        "--libp2p-prove-public-narinfo",
+                        f"{sh}=/srv/seed/narinfos/{sh}.narinfo",
+                    ]
+        # TASK-77: an announce-after-fetch node A fetches its content THROUGH ITS OWN DAEMON. If
+        # that daemon's upstream were the testproxy, A's first fetch would WARM the proxy's NAR
+        # cache, so a later consumer B could be served by the warm cache rather than by A - and the
+        # kill-A control could no longer force an origin miss (the growth would be un-attributable).
+        # So A's daemon fetches DIRECTLY from the ORIGIN (bypassing the proxy), keeping the proxy
+        # cache COLD, exactly as the S8 store-supply provider realises from the origin. B's daemon
+        # still fronts the proxy, so B's serve is cleanly attributable: 0 proxy egress <=> A served.
+        provider_upstream = (
+            f"http://127.0.0.1:{ORIGIN_PORT}"
+            if self.libp2p_announce_after_fetch
+            else proxy
+        )
         daemon_argv = [
             "/bin/daemon",
             "--listen",
             f"0.0.0.0:{DAEMON_PORT + 1}",
             "--upstream",
-            proxy,
+            provider_upstream,
             "--libp2p-provider",
             "--libp2p-listen",
             f"/ip4/127.0.0.1/tcp/{LIBP2P_BASE_PORT + 1}",
@@ -1216,8 +1256,13 @@ class Pod:
                 *container_cmd,
             ]
         )
+        # Announce-after-fetch node A prints NO seed/provide-store lines at boot (it holds nothing
+        # yet), so await only its LIBP2P-PROVIDER-ADDR; a static provider awaits its N seed lines.
+        n_startup_seeds = 0 if self.libp2p_announce_after_fetch else len(
+            self.libp2p_provider_seeds
+        )
         prov_id, prov_listen = self._await_libp2p_identity(
-            "lp-provider", len(self.libp2p_provider_seeds)
+            "lp-provider", n_startup_seeds
         )
         self.libp2p_provider_identity = (prov_id, prov_listen)
         # Fold the RESOLVED announce address in beside the configured one, so the oracle
@@ -5219,6 +5264,184 @@ def scenario_s8_libp2p_store(ctx: Ctx, expect) -> None:
         )
 
 
+def scenario_s9_libp2p_grow(ctx: Ctx, expect) -> None:
+    """S9 (TASK-77 announce-after-fetch): the swarm GROWS. Node A holds NOTHING at boot; it
+    FETCHES the target from UPSTREAM through its OWN daemon, becomes a discoverable HOLDER
+    (announce-after-fetch: it registers the realised /nix/store path + announces it through the
+    verification-gated public door), and a SECOND consumer B - told ONLY BOOT - then discovers A
+    via kad and fetches the target FROM A with 0 upstream NAR egress.
+
+    Topology (3 real daemon containers): BOOT (pure kad router, no content), A (a
+    `--libp2p-announce-after-fetch` provider with an EMPTY initial supply set), B (a plain
+    consumer). The growth is attributed by construction: A's first fetch came from UPSTREAM
+    (proxy NAR egress > 0), and B's fetch came from A (proxy NAR egress == 0, and BOOT holds
+    nothing, so A is the only possible source). The kill-A control proves A was load-bearing.
+
+    This is the swarm-GROWTH delta from S7/S8, where the provider is PRE-SEEDED: here A acquires
+    the content by fetching and then propagates it, so popular paths gain holders naturally.
+    """
+    fixtures = ctx.fixtures
+    seed_dir, prov_seeds, target_sp = _s7_seeds(ctx, "grow", S7_TARGET)
+    target_nar_hash = fixtures.nar_hash(S7_TARGET)
+    a_daemon = f"http://127.0.0.1:{DAEMON_PORT + 1}"
+
+    with Pod(
+        ctx,
+        "s9",
+        fixtures.cache,
+        with_daemon=False,
+        expect=expect,
+        libp2p_seed_dir=seed_dir,
+        libp2p_provider_seeds=prov_seeds,
+        libp2p_trusted_key=fixtures.public_key,
+        libp2p_announce_after_fetch=True,
+    ) as pod:
+        # -- A boots holding NOTHING: announce-after-fetch enabled, no static supply announced --
+        plog = pod.logs("lp-provider")
+        expect(
+            "LIBP2P-ANNOUNCE-AFTER-FETCH enabled budget=" in plog,
+            "S9: A boots in announce-after-fetch mode",
+            f"provider log tail: {plog[-700:]!r}",
+        )
+        expect(
+            "LIBP2P-PROVIDE-STORE narhash=" not in plog
+            and "LIBP2P-SEED narhash=" not in plog
+            and "LIBP2P-ANNOUNCE-AFTER-FETCH narhash=" not in plog,
+            "S9: A announces NOTHING at boot (it holds no content until it fetches)",
+            f"provider log tail: {plog[-700:]!r}",
+        )
+
+        # -- no-injection oracle (identical to S7/S8): B was NEVER handed A's address --
+        prov_id = (
+            pod.libp2p_provider_identity[0] if pod.libp2p_provider_identity else ""
+        )
+        argv = pod.libp2p_consumer_argv()
+        joined = " ".join(argv)
+        boot_peer = pod.libp2p_boot_peer_entry or ""
+        prov_addrs = set(pod.libp2p_provider_listen_addrs)
+        injection_problems = check_libp2p_no_injection(
+            argv, boot_peer, prov_id, prov_addrs
+        )
+        expect(
+            not injection_problems,
+            "S9 no-injection: B's --libp2p-bootstrap is EXACTLY the real BOOT node "
+            "(no provider addr/PeerId injected out-of-band)",
+            f"problems={injection_problems!r} boot={boot_peer!r} argv={joined!r}",
+        )
+
+        time.sleep(LIBP2P_CONVERGE_S)  # bounded kad settle
+
+        # -- STEP 1: A FETCHES the target from UPSTREAM through its OWN daemon, materialising the
+        # path into A's store and firing announce-after-fetch. --
+        pod.proxy_reset()
+        realise = pod.exec(
+            "lp-provider",
+            [
+                "bash",
+                "-lc",
+                (
+                    f"nix-store --realise {shlex.quote(target_sp)} "
+                    f"--option substituters {shlex.quote(a_daemon)} "
+                    f"--option trusted-public-keys {shlex.quote(fixtures.public_key)} "
+                    f"--option require-sigs true --option substitute true"
+                ),
+            ],
+            check=False,
+        )
+        expect(
+            realise.returncode == 0,
+            "S9 step1: A realises the target through its OWN daemon (fetch from upstream origin) - "
+            "A held nothing, so this is the growth SOURCE",
+            (realise.stdout + realise.stderr)[-800:],
+        )
+        stats1 = pod.proxy_stats()
+        a_nar_up = stats1["upstream"].get("nar", 0)
+        # A fetches DIRECTLY from the origin (its upstream bypasses the proxy), so the proxy NAR
+        # cache stays COLD. This is what makes B's serve cleanly attributable to A below and the
+        # kill-A control a TRUE origin miss (no warm-cache confound). 0 here PROVES A did not warm
+        # the proxy - the mutation that pointed A's upstream at the proxy would redden this AND the
+        # kill-A control.
+        expect(
+            a_nar_up == 0,
+            "S9 step1: A's fetch did NOT touch the proxy (A fetches origin-direct, so the proxy "
+            "NAR cache stays cold - the growth attribution below is un-confounded)",
+            f"proxy upstream.nar={a_nar_up}",
+        )
+
+        # -- STEP 2: A becomes a HOLDER - it announces the fetched path (bounded wait for the
+        # announce-after-fetch marker naming the target's NarHash). --
+        announced = False
+        deadline = time.time() + READY_TIMEOUT_S
+        while time.time() < deadline:
+            plog = pod.logs("lp-provider")
+            if (
+                "LIBP2P-ANNOUNCE-AFTER-FETCH narhash=" in plog
+                and target_nar_hash in plog
+            ):
+                announced = True
+                break
+            time.sleep(0.5)
+        expect(
+            announced,
+            "S9 step2: A ANNOUNCED the fetched path (became a discoverable holder for the target "
+            "NarHash) via the verification-gated announce-after-fetch door",
+            f"want narhash={target_nar_hash}; provider log tail: {pod.logs('lp-provider')[-900:]!r}",
+        )
+        time.sleep(LIBP2P_CONVERGE_S)  # let A's record propagate on the DHT
+
+        # -- STEP 3 (the growth payoff): B discovers A via kad and fetches the target FROM A, with
+        # 0 upstream NAR egress. BOOT holds nothing, so A is the only possible source. --
+        pod.proxy_reset()
+        res = pod.client_run(
+            [target_sp], ctx.substituter_daemon_only(), fixtures.public_key
+        )
+        expect(
+            res.exit_code == 0,
+            "S9 step3: B's build completes, served by A over libp2p (A grew the swarm)",
+            res.stderr[-800:],
+        )
+        got = res.narhash(target_sp)
+        expect(
+            got == target_nar_hash,
+            f"S9 S1 byte-identity: {S7_TARGET} NarHash from A matches the signed upstream",
+            f"got={got} want={target_nar_hash}",
+        )
+        b_nar_up = pod.proxy_stats()["upstream"].get("nar", 0)
+        expect(
+            b_nar_up == 0,
+            "S9 GROWTH oracle: 0 upstream NAR egress on B's build - the target was served by A "
+            "(a node that had only just FETCHED it), not by the cache",
+            f"upstream.nar={b_nar_up}",
+        )
+
+        # -- STEP 4 (load-bearing control): kill A -> the only holder is gone (BOOT holds nothing),
+        # so B must fall back to UPSTREAM, which serves the full NAR. Falsifies the 0-egress: A's
+        # grown holder-serve was load-bearing, not a pre-open/local shortcut. --
+        pod.kill("lp-provider")
+        pod.proxy_reset()
+        res2 = pod.client_run(
+            [target_sp], ctx.substituter_daemon_only(), fixtures.public_key
+        )
+        expect(
+            res2.exit_code == 0,
+            "S9 kill-A control: B's build still succeeds via upstream when A is dead",
+            res2.stderr[-800:],
+        )
+        got2 = res2.narhash(target_sp)
+        expect(
+            got2 == target_nar_hash,
+            "S9 kill-A control: still byte-identical (served by upstream fallback)",
+            f"got={got2}",
+        )
+        nar_up2 = pod.proxy_stats()["upstream"].get("nar", 0)
+        expect(
+            nar_up2 >= 1,
+            "S9 kill-A control: upstream served the FULL NAR once A is dead (A's grown holder "
+            "serve was load-bearing)",
+            f"upstream.nar={nar_up2}",
+        )
+
+
 def scenario_narinfo_default_cache_offload(ctx: Ctx, expect) -> None:
     """TASK-29 AC#1/#2: the daemon narinfo disk cache is ON BY DEFAULT and, on a
     REPEAT build of the same paths, serves narinfo LOCALLY so ZERO narinfo crosses
@@ -5412,6 +5635,11 @@ SCENARIOS = [
     # held as a .nar - regenerated on demand via `nix-store --dump` (store-supply mode) -
     # to a consumer that discovers it via kad, byte-identical, with the kill-P control.
     ("s8-libp2p-store", scenario_s8_libp2p_store),
+    # S9 (TASK-77): announce-after-fetch - node A holds nothing, FETCHES the target from upstream
+    # through its own daemon, becomes a discoverable holder, and a second consumer B then fetches
+    # the target FROM A (0 upstream egress). The swarm GROWS; the kill-A control proves A was
+    # load-bearing.
+    ("s9-libp2p-grow", scenario_s9_libp2p_grow),
 ]
 
 

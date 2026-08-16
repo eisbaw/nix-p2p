@@ -431,6 +431,8 @@ async fn libp2p_hit_under_compressed_narinfo_is_rewritten_to_raw_and_a_nix_clien
         // rewrites its compressed narinfo to raw.
         raw_serve: libp2p_raw_serve,
         public_allowlist: Arc::new(daemon::PublicNarAllowlist::disabled()),
+
+        post_fetch_announce: None,
     });
     let (addr, _daemon) = common::spawn_app(app).await;
 

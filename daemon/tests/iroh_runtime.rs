@@ -1218,6 +1218,8 @@ async fn active_http_connection_shares_the_node_shutdown_supervisor() {
         correlation: Arc::new(NullCorrelation),
         raw_serve: Arc::new(NoRawServe),
         public_allowlist: Arc::new(daemon::PublicNarAllowlist::disabled()),
+
+        post_fetch_announce: None,
     });
     let listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
         .await
@@ -1263,6 +1265,8 @@ async fn http_capacity_drops_one_connection_then_recovers_without_restart() {
         correlation: Arc::new(NullCorrelation),
         raw_serve: Arc::new(NoRawServe),
         public_allowlist: Arc::new(daemon::PublicNarAllowlist::disabled()),
+
+        post_fetch_announce: None,
     });
     let listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
         .await

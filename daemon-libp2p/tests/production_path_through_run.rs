@@ -417,6 +417,8 @@ async fn run_serves_a_discovered_libp2p_nar_and_falls_back_on_miss() {
         ],
         extra_raw_serve: Vec::new(),
         public_allowlist: Arc::new(daemon_core::PublicNarAllowlist::disabled()),
+
+        post_fetch_announce: None,
     };
     let fabric_dyn: Arc<dyn PeerFabric> = consumer.clone();
     let run_task = tokio::spawn(run(fabric_dyn, run_cfg));

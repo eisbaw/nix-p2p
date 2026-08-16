@@ -29,8 +29,10 @@
 //! A discovery miss / exhausted offer set folds to a fast fallback to HTTP upstream (S2); a
 //! deliberate size abort propagates (every offer addresses the same oversized content).
 
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::str::FromStr;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use fabric_libp2p::{
@@ -48,10 +50,11 @@ use peer_fabric::{
 
 use daemon_core::claim::NarHashKey;
 use daemon_core::rewrite::RawServeDecision;
-use daemon_core::source::NarSource;
+use daemon_core::source::{NarHash, NarSource};
 use daemon_core::{
-    AvailabilityIndex, HoldAnswer, LearnOutcome, PublicNarAllowlist, PublicNarClaim,
-    PublicationRejected, StoreHash, TrustedNarKeys, derive_allowlist_mac_key,
+    AvailabilityIndex, HoldAnswer, LearnOutcome, PostFetchAnnounce, PublicNarAllowlist,
+    PublicNarClaim, PublicationRejected, StoreHash, StorePath, TrustedNarKeys,
+    derive_allowlist_mac_key,
 };
 
 mod store_probe;
@@ -310,6 +313,15 @@ fn sign_libp2p_record_for_content(
 /// [`sign_libp2p_provider_record`] does, so the provider path can look up the durable
 /// announce sequence for the record it is about to mint (TASK-185, AC#2). Kept here, next to
 /// the record construction, so the two cannot drift on the derivation recipe.
+/// Wall-clock UNIX seconds, the `now` an announced record's `issued_at`/`expiry` are stamped
+/// from. Saturates to 0 before the epoch (an unreachable clock skew), never a float.
+fn now_unix_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
 pub fn provider_content_key(nar_hash: &NarHashKey) -> ContentKey {
     ContentKey::derive_from_signed_nar_hash(nar_hash.as_bytes())
 }
@@ -1147,6 +1159,370 @@ async fn announce_approved_public(
 }
 
 // -------------------------------------------------------------------------
+// ANNOUNCE-AFTER-FETCH (TASK-77): the swarm-GROWTH hook. A node that just fetched a
+// NAR becomes a discoverable holder for it, so popular paths acquire holders naturally.
+// It REUSES the verified announce doors above (verify_store_provisions ->
+// announce_store_provisions / announce_public_provisions) - there is deliberately NO
+// second announce path that could bypass the TASK-231 eligibility authority.
+// -------------------------------------------------------------------------
+
+/// The publication door an announce-after-fetch node uses, mirroring the two shipped
+/// provider doors (the substrate's publicness is a composition-root fact - see [`LanShare`] /
+/// the allowlist - so the binary picks the door, never the library).
+#[derive(Clone)]
+pub enum AnnounceAfterFetchDoor {
+    /// A PUBLIC (bootstrapped) substrate: announce ONLY allowlisted content. The allowlist is
+    /// the SAME instance the fabric's `AllowlistEligibility` authority holds and that
+    /// `respond_narinfo` keeps learning from the trusted-signed narinfos this node fetches, so a
+    /// fetched path is announced iff a trusted narinfo proved it public - and the announcer
+    /// re-checks that authority fail-closed (TASK-231). An unallowlisted fetched path is REFUSED
+    /// here (nothing reaches the DHT).
+    Public(Arc<PublicNarAllowlist>),
+    /// A genuinely-isolated LAN substrate (the operator asserted no public reach): a fetched
+    /// path may be announced without the public-allowlist gate (the fabric's `AdmitAll`
+    /// authority admits), still TASK-56 verification-gated. The witness is the composition
+    /// root's [`LanShare`].
+    Lan(LanShare),
+}
+
+/// The integer announce BUDGET + the set of distinct paths already announced (TASK-77 AC#2).
+/// One `Mutex` guards BOTH so the reserve+dedup decision is atomic under concurrent fetches.
+struct AnnounceLedger {
+    /// Remaining announce-after-fetch announces this process may still make. An INTEGER
+    /// (no float): each distinct fetched path that is admitted spends exactly one. At zero,
+    /// announcing STOPS (not degrades) - the guardrail against unbounded self-DoS + the
+    /// privacy surface (every announce reveals a path you fetched).
+    remaining: u64,
+    /// The distinct keys already reserved, so re-fetching the SAME path never double-spends the
+    /// budget nor re-announces an existing holder claim.
+    seen: HashSet<NarHashKey>,
+}
+
+/// The outcome of reserving a budget unit for a fetched key ([`Libp2pAnnounceAfterFetch::reserve`]).
+#[derive(Debug, PartialEq, Eq)]
+enum Reservation {
+    /// A budget unit was reserved; proceed to grow (verify + announce).
+    Reserved,
+    /// This distinct path was already handled; do nothing (not a failure).
+    AlreadySeen,
+    /// The budget is spent; announcing STOPS. This is the AC#2 enforcement point - the mutation
+    /// that removes it makes the announce count grow unbounded.
+    Exhausted,
+}
+
+/// The pure AC#2 core: atomically dedup + reserve one budget unit for `key`. Past the budget this
+/// returns [`Reservation::Exhausted`] and the caller announces NOTHING; a re-seen key returns
+/// [`Reservation::AlreadySeen`] (no double-spend, no re-announce). Removing the `remaining == 0`
+/// guard - the mutation the budget bite catches - lets the announce count grow unbounded. Pure
+/// over the ledger, so the bite needs no runtime/fabric.
+fn reserve_in(ledger: &Mutex<AnnounceLedger>, key: &NarHashKey) -> Reservation {
+    let mut led = ledger.lock().expect("announce ledger poisoned");
+    if led.seen.contains(key) {
+        return Reservation::AlreadySeen;
+    }
+    if led.remaining == 0 {
+        return Reservation::Exhausted;
+    }
+    led.remaining -= 1;
+    led.seen.insert(*key);
+    Reservation::Reserved
+}
+
+/// The pure AC#3 core: register `key -> store_path` in `index` and VERIFY it is servable (TASK-56
+/// `sha256(--dump)==NarHash`, quarantine on mismatch), enforce the per-NAR serve-size guard, and -
+/// for a PUBLIC door - approve it against the allowlist (refuse an unallowlisted fetched path
+/// BEFORE any DHT touch). Returns the verified provisions ready to announce, or a typed refusal.
+/// This is where "never announce what you cannot serve" is enforced independently of the
+/// announcer's own TASK-231 re-check; removing the allowlist approval (the mutation the eligibility
+/// bite catches) lets an unallowlisted fetched path become a provision that would reach the DHT.
+/// Free + fabric-free so the bite needs no live swarm; the blocking dump runs on the caller thread.
+fn eligible_provisions(
+    index: &AvailabilityIndex,
+    serve_budget: &peer_fabric::ServeBudget,
+    door: &AnnounceAfterFetchDoor,
+    key: &NarHashKey,
+    store_path: &str,
+) -> Result<Vec<StoreProvision>, String> {
+    index
+        .register(*key, StorePath::new(store_path))
+        .map_err(|e| format!("registering fetched store path {store_path:?} under {key}: {e}"))?;
+    // verify_store_provisions runs the index's TASK-56 dump+sha256==NarHash gate and refuses (Err)
+    // an Absent/quarantined/undumpable path - so index-coverage == provider-coverage.
+    let provisions = verify_store_provisions(index, std::slice::from_ref(key))?;
+    // Size guard: never announce a NAR the serve gate would then decline (TooLarge).
+    for provision in &provisions {
+        if provision.declared_size() > serve_budget.max_nar_bytes_uncompressed_nar {
+            return Err(format!(
+                "fetched NAR {} dumps to {} B but the per-NAR serve bound is {}: not announcing a \
+                 claim this node would decline to serve",
+                provision.nar_hash(),
+                provision.declared_size(),
+                serve_budget.max_nar_bytes_uncompressed_nar
+            ));
+        }
+    }
+    // PUBLIC door (AC#3): announce a fetched path iff a trusted narinfo proved it public (it is in
+    // the allowlist). Refuses BEFORE any DHT touch; the announcer's TASK-231 authority is the
+    // second, independent gate. A LAN door skips this (publicness asserted by the composition
+    // root's LanShare), still TASK-56-gated.
+    if let AnnounceAfterFetchDoor::Public(allowlist) = door {
+        approve_provisions_for_public(&provisions, allowlist).map_err(|rejected| {
+            format!("announce-after-fetch refused by the allowlist gate: {rejected}")
+        })?;
+    }
+    Ok(provisions)
+}
+
+/// A bounded wait for the LOCAL nix to MATERIALISE a fetched path into `/nix/store` (TASK-77).
+///
+/// The daemon RELAYS the NAR bytes; the local nix imports+registers the store path a moment
+/// AFTER the serve completes (nix builds into a temp dir then renames the finished tree into
+/// place atomically). So announce-after-fetch waits (bounded, cheap `exists()` polls) for the
+/// path to appear before it dumps + announces - you announce only once you can actually serve
+/// (TASK-72). If it never materialises (a truncated body the client rejected, a pure relay with
+/// no local store), the wait times out and NOTHING is announced: fail-safe, never a claim this
+/// node cannot back. The bound is an integer count of polls at an integer interval (no float).
+#[derive(Debug, Clone, Copy)]
+struct MaterialiseWait {
+    poll_interval: Duration,
+    max_polls: u32,
+}
+
+impl Default for MaterialiseWait {
+    fn default() -> Self {
+        // 250 ms x 240 = up to 60 s: generous headroom for a large-closure import, while a
+        // never-materialising path gives up promptly enough not to pile up tasks. Tunable
+        // integers, not wire constants.
+        MaterialiseWait {
+            poll_interval: Duration::from_millis(250),
+            max_polls: 240,
+        }
+    }
+}
+
+/// The clonable WORKER that does the actual grow (verify + announce) for one fetched path. It
+/// holds only cheap-to-clone handles (Arcs + Copy budgets), so [`PostFetchAnnounce::on_fetched`]
+/// can clone it into a detached task without needing `Arc<Self>`. The stateful ledger stays on
+/// [`Libp2pAnnounceAfterFetch`]; the worker is stateless over the ledger.
+#[derive(Clone)]
+struct GrowWorker {
+    fabric: Arc<Libp2pFabric>,
+    identity_seed: [u8; 32],
+    /// The SHARED availability index: the provider serve path (`CatalogNarSupplier`) reads its
+    /// reverse-map, so a path THIS worker registers+verifies is immediately servable to a peer.
+    index: Arc<AvailabilityIndex>,
+    door: AnnounceAfterFetchDoor,
+    /// The per-NAR serve bound: a fetched NAR larger than this is NOT announced (announcing it
+    /// would publish a claim the serve gate would then decline - the same guard the provider
+    /// applies at startup).
+    serve_budget: peer_fabric::ServeBudget,
+    /// The DHT publish bound (deadline + replica fan-out) each announce runs under.
+    announce_budget: AnnounceBudget,
+    /// The record TTL (seconds) an announced record carries, matching the provider's.
+    ttl_secs: u64,
+    materialise: MaterialiseWait,
+}
+
+impl GrowWorker {
+    /// Register + VERIFY + (public) approve one fetched path (delegates to the pure, fabric-free
+    /// [`eligible_provisions`]). See there for the "never announce what you cannot serve" argument.
+    fn eligible_provisions(
+        &self,
+        key: &NarHashKey,
+        store_path: &str,
+    ) -> Result<Vec<StoreProvision>, String> {
+        eligible_provisions(&self.index, &self.serve_budget, &self.door, key, store_path)
+    }
+
+    /// Announce the verified `provisions` through the SAME door the shipped provider uses, so the
+    /// announce goes through the fabric announcer's TASK-231 eligibility authority (no bypass).
+    async fn announce_provisions(
+        &self,
+        provisions: &[StoreProvision],
+    ) -> Result<Vec<ProviderRecord>, String> {
+        let now = now_unix_secs();
+        match &self.door {
+            AnnounceAfterFetchDoor::Public(allowlist) => {
+                announce_public_provisions(
+                    &self.fabric,
+                    self.identity_seed,
+                    provisions,
+                    allowlist,
+                    self.ttl_secs,
+                    now,
+                    &self.announce_budget,
+                )
+                .await
+            }
+            AnnounceAfterFetchDoor::Lan(lan) => {
+                announce_store_provisions(
+                    &self.fabric,
+                    self.identity_seed,
+                    provisions,
+                    *lan,
+                    self.ttl_secs,
+                    now,
+                    &self.announce_budget,
+                )
+                .await
+            }
+        }
+    }
+
+    /// The full grow step for one reserved key: bounded materialisation wait -> verify -> announce.
+    /// Best-effort; a refusal/timeout is LOGGED (fail-verbose), never a panic.
+    async fn grow(self, key: NarHashKey, store_path: String) {
+        // Bounded wait for the local store to materialise the path (the daemon relayed the bytes;
+        // nix imports them a moment later). A never-materialising path times out -> no announce.
+        let mut materialised = false;
+        for _ in 0..self.materialise.max_polls {
+            if Path::new(&store_path).exists() {
+                materialised = true;
+                break;
+            }
+            tokio::time::sleep(self.materialise.poll_interval).await;
+        }
+        if !materialised {
+            eprintln!(
+                "LIBP2P-ANNOUNCE-AFTER-FETCH skipped narhash={key} reason=not-materialised \
+                 (store path {store_path:?} did not appear within the wait bound; not announced)"
+            );
+            return;
+        }
+
+        // The dump+verify is blocking; run it off the async worker.
+        let worker = self.clone();
+        let sp = store_path.clone();
+        let verified =
+            tokio::task::spawn_blocking(move || worker.eligible_provisions(&key, &sp)).await;
+        let provisions = match verified {
+            Ok(Ok(p)) => p,
+            Ok(Err(why)) => {
+                eprintln!(
+                    "LIBP2P-ANNOUNCE-AFTER-FETCH skipped narhash={key} reason=ineligible: {why}"
+                );
+                return;
+            }
+            Err(join) => {
+                eprintln!(
+                    "LIBP2P-ANNOUNCE-AFTER-FETCH skipped narhash={key} reason=verify-panicked: {join}"
+                );
+                return;
+            }
+        };
+
+        match self.announce_provisions(&provisions).await {
+            Ok(records) => {
+                for (record, provision) in records.iter().zip(&provisions) {
+                    println!(
+                        "LIBP2P-ANNOUNCE-AFTER-FETCH narhash={} content={} content_key={} nar_size={}",
+                        provision.nar_hash(),
+                        record.content.to_hex(),
+                        record.key,
+                        provision.declared_size(),
+                    );
+                }
+            }
+            Err(why) => {
+                eprintln!(
+                    "LIBP2P-ANNOUNCE-AFTER-FETCH skipped narhash={key} reason=announce-failed: {why}"
+                );
+            }
+        }
+    }
+}
+
+/// The libp2p ANNOUNCE-AFTER-FETCH authority (TASK-77): the backend impl of the fabric-neutral
+/// [`PostFetchAnnounce`] seam. It shares the provider's [`AvailabilityIndex`] (so a path it
+/// registers becomes servable through the same `CatalogNarSupplier` reverse-map) and the
+/// fabric's announcer (so every announce goes through the TASK-231 eligibility authority - no
+/// bypass). On a successful fetch it: reserves a budget unit (AC#2), waits for the local store to
+/// materialise the path, registers it, verifies `sha256(--dump)==NarHash` (AC#3 / TASK-72:
+/// index-coverage == provider-coverage), and announces via the SAME verified door the shipped
+/// provider uses.
+pub struct Libp2pAnnounceAfterFetch {
+    worker: GrowWorker,
+    ledger: Mutex<AnnounceLedger>,
+}
+
+impl Libp2pAnnounceAfterFetch {
+    /// Build the hook. `announce_budget_count` is the INTEGER number of distinct fetched paths
+    /// this process may announce (AC#2); `index`/`fabric`/`identity_seed` MUST be the SAME ones
+    /// the provider serve path + announcer use, so a registered path is servable and every
+    /// announce is signed by this node and re-checked by its eligibility authority.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        fabric: Arc<Libp2pFabric>,
+        identity_seed: [u8; 32],
+        index: Arc<AvailabilityIndex>,
+        door: AnnounceAfterFetchDoor,
+        serve_budget: peer_fabric::ServeBudget,
+        announce_budget: AnnounceBudget,
+        ttl_secs: u64,
+        announce_budget_count: u64,
+    ) -> Self {
+        Libp2pAnnounceAfterFetch {
+            worker: GrowWorker {
+                fabric,
+                identity_seed,
+                index,
+                door,
+                serve_budget,
+                announce_budget,
+                ttl_secs,
+                materialise: MaterialiseWait::default(),
+            },
+            ledger: Mutex::new(AnnounceLedger {
+                remaining: announce_budget_count,
+                seen: HashSet::new(),
+            }),
+        }
+    }
+
+    /// The AC#2 enforcement point (delegates to [`reserve_in`], the pure testable core).
+    fn reserve(&self, key: &NarHashKey) -> Reservation {
+        reserve_in(&self.ledger, key)
+    }
+
+    /// The remaining budget (test/observability).
+    pub fn remaining_budget(&self) -> u64 {
+        self.ledger
+            .lock()
+            .expect("announce ledger poisoned")
+            .remaining
+    }
+}
+
+impl PostFetchAnnounce for Libp2pAnnounceAfterFetch {
+    fn on_fetched(&self, nar_hash: &NarHash, store_path: &str) {
+        let key = match NarHashKey::from_str(nar_hash.as_str()) {
+            Ok(k) => k,
+            // A NarHash that is not a canonical p2p key can never be a discovery key; nothing to
+            // announce (the UpstreamPath cold-start path never reaches here anyway).
+            Err(_) => return,
+        };
+        // AC#2: reserve a budget unit (atomic dedup + decrement). Past the budget, STOP.
+        match self.reserve(&key) {
+            Reservation::Reserved => {}
+            Reservation::AlreadySeen => return,
+            Reservation::Exhausted => {
+                eprintln!(
+                    "LIBP2P-ANNOUNCE-AFTER-FETCH budget-exhausted narhash={key} \
+                     (announce budget spent; not announcing - swarm growth is capped here)"
+                );
+                return;
+            }
+        }
+        // Offload the wait + verify + announce so the serve path is never blocked (fire-and-forget;
+        // the cloned worker's Arcs keep the index/fabric alive). Honest limit: a detached task is
+        // not tied to a shutdown supervisor, so an in-flight announce is dropped on process exit -
+        // acceptable for a best-effort growth announce (kad republish/TTL cover it).
+        let worker = self.worker.clone();
+        tokio::spawn(worker.grow(key, store_path.to_string()));
+    }
+}
+
+// -------------------------------------------------------------------------
 // The PUBLIC-ANNOUNCE door for raw SEEDS (`--libp2p-seed-nar`): the seed
 // counterpart of the StoreProvision public door above. The shipped seed-supply
 // provider (`daemon`/`daemon-libp2p`) uses it to announce over a PUBLIC (bootstrapped)
@@ -1934,5 +2310,184 @@ mod lan_isolation_tests {
         assert!(!multiaddr_is_lan_only(&addr(
             "/p2p/12D3KooWDpJ7As7BWAwRMfu1VU2WCqNjvq387JEYKDBj4kx6nXTN"
         )));
+    }
+}
+
+#[cfg(test)]
+mod announce_after_fetch_tests {
+    //! Bite tests for the TASK-77 announce-after-fetch invariants: the AC#2 integer budget is
+    //! ENFORCED (past it, announcing STOPS), and the AC#3 eligibility gate REFUSES an unallowlisted
+    //! fetched path (never announce what you are not allowed to publish). Both target the pure
+    //! cores (`reserve_in` / `eligible_provisions`), so they need no live swarm - the end-to-end
+    //! swarm-growth is proven in the e2e `s9-libp2p-grow` scenario.
+
+    use super::{
+        AnnounceAfterFetchDoor, AnnounceLedger, Reservation, eligible_provisions, reserve_in,
+    };
+    use std::collections::HashSet;
+    use std::path::PathBuf;
+    use std::sync::{Arc, Mutex};
+
+    use daemon_core::{
+        AvailabilityIndex, NarDumper, NarHashKey, NodeId, NullAnnounce, NullStore,
+        PublicNarAllowlist, RegularFileNarDumper,
+    };
+    use peer_fabric::ServeBudget;
+
+    fn unique_temp(stem: &str) -> PathBuf {
+        let suffix = format!(
+            "{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+        std::env::temp_dir().join(format!("nix-p2p-task77-{stem}-{suffix}"))
+    }
+
+    fn ledger(remaining: u64) -> Mutex<AnnounceLedger> {
+        Mutex::new(AnnounceLedger {
+            remaining,
+            seen: HashSet::new(),
+        })
+    }
+
+    fn key(seed: u8) -> NarHashKey {
+        // A distinct canonical NarHash key per seed (32 raw sha256 bytes).
+        NarHashKey::from_sha256_bytes([seed; 32])
+    }
+
+    /// AC#2 BITE: the announce budget is an ENFORCED integer. With a budget of 2, two DISTINCT
+    /// fetched paths reserve, the THIRD is REFUSED (Exhausted) - announcing STOPS, it does not
+    /// degrade. A re-fetch of an already-seen path is AlreadySeen (no double-spend, no re-announce).
+    /// MUTATION: delete the `remaining == 0` guard in `reserve_in` and the third key would Reserve
+    /// (unbounded growth) - this assertion reddens.
+    #[test]
+    fn budget_is_enforced_and_stops_past_the_cap() {
+        let led = ledger(2);
+        assert_eq!(reserve_in(&led, &key(1)), Reservation::Reserved);
+        assert_eq!(reserve_in(&led, &key(2)), Reservation::Reserved);
+        // Budget spent: the third DISTINCT path is refused (STOP, not degrade).
+        assert_eq!(
+            reserve_in(&led, &key(3)),
+            Reservation::Exhausted,
+            "past the integer budget, announcing must STOP"
+        );
+        assert_eq!(
+            led.lock().unwrap().remaining,
+            0,
+            "the budget is an integer that decrements to exactly zero"
+        );
+        // A re-seen path never double-spends nor re-announces.
+        assert_eq!(reserve_in(&led, &key(1)), Reservation::AlreadySeen);
+    }
+
+    /// AC#2: a zero budget announces NOTHING - the consume-only-when-capped posture.
+    #[test]
+    fn zero_budget_announces_nothing() {
+        let led = ledger(0);
+        assert_eq!(reserve_in(&led, &key(1)), Reservation::Exhausted);
+    }
+
+    /// Build a real availability index over a temp raw-NAR file (a Process/file source, the
+    /// store-dump analogue) registered under its TRUE NarHash, so `verify_store_provisions` runs a
+    /// real dump + `sha256(--dump)==NarHash` verify without needing a `/nix/store`. Returns the
+    /// index, the true key, and the store path.
+    fn verified_index() -> (Arc<AvailabilityIndex>, NarHashKey, String) {
+        let body = b"a raw NAR regenerated on demand from a fetched store path (TASK-77)".to_vec();
+        let true_key = NarHashKey::from_raw_nar(&body);
+        let nar_path = unique_temp("fetched.nar");
+        std::fs::write(&nar_path, &body).unwrap();
+        let index = AvailabilityIndex::open(
+            NodeId::from_bytes([0u8; 32]),
+            Arc::new(RegularFileNarDumper) as Arc<dyn NarDumper>,
+            Arc::new(NullStore),
+            Arc::new(NullAnnounce),
+        )
+        .expect("index opens");
+        (
+            Arc::new(index),
+            true_key,
+            nar_path.to_string_lossy().into_owned(),
+        )
+    }
+
+    fn big_serve_budget() -> ServeBudget {
+        ServeBudget {
+            max_nar_bytes_uncompressed_nar: 1 << 30,
+            max_inflight_bytes_uncompressed_nar: 1 << 30,
+            max_serve_duration: std::time::Duration::from_secs(30),
+        }
+    }
+
+    /// AC#3 BITE (the security crux): a fetched path that VERIFIES as servable is nonetheless
+    /// REFUSED on a PUBLIC door when it is NOT allowlisted - nothing becomes a provision, so nothing
+    /// reaches the DHT. The SAME path on a LAN door (no public-allowlist gate) IS admitted, proving
+    /// the ONLY thing that refused it was the eligibility gate, not an un-servable path. MUTATION:
+    /// delete the `approve_provisions_for_public` call in `eligible_provisions` and the PUBLIC case
+    /// would also return Ok (an unallowlisted fetched path would reach announce) - this reddens.
+    /// The announcer's own TASK-231 authority is a SECOND, independent gate (proven in
+    /// `fabric-libp2p/tests/publication_eligibility_adapter.rs`).
+    #[test]
+    fn public_door_refuses_an_unallowlisted_fetched_path_lan_admits_it() {
+        // PUBLIC door with a node that has NO publication authority (disabled == nothing is
+        // allowlisted): the verified-servable path is REFUSED before any DHT touch.
+        let (index, true_key, store_path) = verified_index();
+        let public_refuses = eligible_provisions(
+            &index,
+            &big_serve_budget(),
+            &AnnounceAfterFetchDoor::Public(Arc::new(PublicNarAllowlist::disabled())),
+            &true_key,
+            &store_path,
+        );
+        assert!(
+            public_refuses.is_err(),
+            "a PUBLIC node must NOT announce a fetched path it is not allowlisted to publish; got {public_refuses:?}"
+        );
+        assert!(
+            public_refuses.unwrap_err().contains("allowlist"),
+            "the refusal is attributed to the eligibility (allowlist) gate"
+        );
+
+        // The SAME verified path on a LAN door IS admitted: the path is genuinely servable, so the
+        // ONLY thing that refused the public case was the eligibility gate.
+        let (index2, true_key2, store_path2) = verified_index();
+        let lan_admits = eligible_provisions(
+            &index2,
+            &big_serve_budget(),
+            &AnnounceAfterFetchDoor::Lan(super::LanShare::operator_assembled()),
+            &true_key2,
+            &store_path2,
+        )
+        .expect("a LAN door admits a verified-servable fetched path");
+        assert_eq!(lan_admits.len(), 1);
+        assert_eq!(
+            *lan_admits[0].nar_hash(),
+            true_key2,
+            "the admitted provision announces the verified NarHash"
+        );
+    }
+
+    /// AC#3 / TASK-72: a path whose stored bytes do NOT hash to the registered NarHash (a
+    /// mis-registration) is REFUSED even on a LAN door - the index quarantines it, so a node never
+    /// announces content it cannot serve. This is index-coverage == provider-coverage.
+    #[test]
+    fn a_mis_registered_fetched_path_is_never_announced() {
+        let (index, _true_key, store_path) = verified_index();
+        // Register the real file under a WRONG NarHash: the dump will not match, so verify refuses.
+        let wrong_key = NarHashKey::from_sha256_bytes([0xAB; 32]);
+        let refused = eligible_provisions(
+            &index,
+            &big_serve_budget(),
+            &AnnounceAfterFetchDoor::Lan(super::LanShare::operator_assembled()),
+            &wrong_key,
+            &store_path,
+        );
+        assert!(
+            refused.is_err(),
+            "a fetched path whose bytes do not hash to the registered NarHash must never be \
+             announced (index-coverage == provider-coverage); got {refused:?}"
+        );
     }
 }

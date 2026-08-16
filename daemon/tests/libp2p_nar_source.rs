@@ -387,6 +387,8 @@ async fn daemon_discovers_via_libp2p_kad_and_serves_byte_identical_nar_with_clea
         correlation: Arc::new(NullCorrelation),
         raw_serve: Arc::new(daemon::NoRawServe),
         public_allowlist: Arc::new(daemon::PublicNarAllowlist::disabled()),
+
+        post_fetch_announce: None,
     });
     let (addr, _daemon) = common::spawn_app(app).await;
 

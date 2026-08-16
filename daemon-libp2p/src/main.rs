@@ -24,11 +24,11 @@ use daemon_core::{
     UpstreamHttp, build_narinfo_layer, resolve_narinfo_cache_dir, run,
 };
 use daemon_libp2p::{
-    AllowlistEligibility, LanReachability, LanShare, Libp2pCatalogProbe, Libp2pSourceConfig,
-    announce_provider_seeds, announce_public_provisions, announce_public_seeds,
-    announce_store_provisions, build_libp2p_nar_source, build_libp2p_provider_source,
-    lan_isolation_or_refuse, open_public_allowlist, resolve_durable_identity_seed,
-    verify_store_provisions,
+    AllowlistEligibility, AnnounceAfterFetchDoor, LanReachability, LanShare,
+    Libp2pAnnounceAfterFetch, Libp2pCatalogProbe, Libp2pSourceConfig, announce_provider_seeds,
+    announce_public_provisions, announce_public_seeds, announce_store_provisions,
+    build_libp2p_nar_source, build_libp2p_provider_source, lan_isolation_or_refuse,
+    open_public_allowlist, resolve_durable_identity_seed, verify_store_provisions,
 };
 use ed25519_dalek::SigningKey;
 use fabric_libp2p::{
@@ -107,7 +107,20 @@ struct Config {
     /// `false` for a kad-only node (a dedicated bootstrap that offers NO reservation service),
     /// leaving relay-client/autonat/dcutr intact. Threads to `NodeConfig::with_relay_server`.
     libp2p_relay_server_enabled: bool,
+    /// ANNOUNCE-AFTER-FETCH (TASK-77): a successful peer/upstream fetch makes this node a
+    /// discoverable HOLDER (register the realised store path, then announce it through the
+    /// verification-gated + eligibility-gated door). Puts the node into provider mode (serve axis
+    /// and announcer) even with an EMPTY initial supply set. DEFAULT OFF = consume-only / leech
+    /// (TASK-78). Mirrors the composite `daemon` binary.
+    libp2p_announce_after_fetch: bool,
+    /// The INTEGER announce-after-fetch BUDGET (TASK-77 AC#2): max DISTINCT fetched paths this
+    /// process announces. Past it, announcing STOPS. Never a float.
+    libp2p_announce_budget: u64,
 }
+
+/// The default announce-after-fetch budget (distinct paths announced before growth stops). An
+/// integer; the operator raises it with `--libp2p-announce-budget`. Mirrors the composite binary.
+const DEFAULT_LIBP2P_ANNOUNCE_BUDGET: u64 = 256;
 
 fn parse_libp2p_peer(flag: &str, raw: &str) -> Result<(PeerId, Multiaddr), String> {
     let (peer_str, addr_str) = raw
@@ -198,6 +211,8 @@ fn parse_config<I: IntoIterator<Item = String>>(args: I) -> Result<Config, Strin
         libp2p_public_allowlist_path: None,
         libp2p_prove_public_narinfo: Vec::new(),
         libp2p_relay_server_enabled: true,
+        libp2p_announce_after_fetch: false,
+        libp2p_announce_budget: DEFAULT_LIBP2P_ANNOUNCE_BUDGET,
     };
     let mut it = args.into_iter();
     while let Some(flag) = it.next() {
@@ -261,6 +276,13 @@ fn parse_config<I: IntoIterator<Item = String>>(args: I) -> Result<Config, Strin
             "--libp2p-prove-public-narinfo" => cfg
                 .libp2p_prove_public_narinfo
                 .push(parse_prove_public_narinfo(&value()?)?),
+            "--libp2p-announce-after-fetch" => cfg.libp2p_announce_after_fetch = true,
+            "--libp2p-announce-budget" => {
+                let raw = value()?;
+                cfg.libp2p_announce_budget = raw.parse::<u64>().map_err(|e| {
+                    format!("--libp2p-announce-budget {raw:?} is not a non-negative integer: {e}")
+                })?;
+            }
             other => return Err(format!("unknown flag {other}")),
         }
     }
@@ -270,13 +292,28 @@ fn parse_config<I: IntoIterator<Item = String>>(args: I) -> Result<Config, Strin
     if cfg.narinfo_cache_dir.is_some() && cfg.no_narinfo_cache {
         return Err(NARINFO_CACHE_FLAG_CONFLICT.into());
     }
+    // --libp2p-announce-after-fetch is a PROVIDER companion (it needs the serve axis + announcer):
+    // reject it on a consumer rather than silently ignore it.
+    if cfg.libp2p_announce_after_fetch && !cfg.libp2p_provider {
+        return Err(
+            "--libp2p-announce-after-fetch requires --libp2p-provider (announcing what you fetched \
+             needs the serve axis + announcer)"
+                .into(),
+        );
+    }
     // A provider MUST have at least one seed and a listener; a consumer MUST have a bootstrap
     // peer (an empty bootstrap set can never discover anyone) - fail fast, never a silent
     // node that does nothing.
     if cfg.libp2p_provider {
-        if cfg.libp2p_seed_nar.is_empty() && cfg.libp2p_provide_store.is_empty() {
+        // A provider must have SOMETHING: a static supply set OR announce-after-fetch (TASK-77),
+        // which grows the supply set dynamically from what it fetches (an EMPTY initial set is
+        // then legitimate).
+        if cfg.libp2p_seed_nar.is_empty()
+            && cfg.libp2p_provide_store.is_empty()
+            && !cfg.libp2p_announce_after_fetch
+        {
             return Err(
-                "--libp2p-provider requires at least one --libp2p-seed-nar or --libp2p-provide-store"
+                "--libp2p-provider requires at least one --libp2p-seed-nar, --libp2p-provide-store, or --libp2p-announce-after-fetch"
                     .into(),
             );
         }
@@ -364,6 +401,10 @@ fn source_config(cfg: &Config) -> Result<Libp2pSourceConfig, String> {
 struct ProviderGuard {
     _serve: ServeHandle,
     _index: Option<Arc<AvailabilityIndex>>,
+    /// The ANNOUNCE-AFTER-FETCH hook (TASK-77), present with `--libp2p-announce-after-fetch`. It
+    /// shares `_index` above, so a fetched path it registers is servable through the same supply
+    /// catalog. `RunConfig` clones this `Arc` so the serving frontend grows the swarm.
+    post_fetch_announce: Option<Arc<dyn daemon_core::PostFetchAnnounce>>,
 }
 
 /// The provider serve budget (PROVISIONAL defaults; shared by both supply modes).
@@ -458,7 +499,8 @@ async fn install_provider(
     allowlist: &Arc<PublicNarAllowlist>,
 ) -> Result<(Arc<Libp2pFabric>, ProviderGuard), String> {
     warn_if_non_durable_provider(&source_cfg);
-    let (fabric, guard) = if !cfg.libp2p_provide_store.is_empty() {
+    let (fabric, guard) = if !cfg.libp2p_provide_store.is_empty() || cfg.libp2p_announce_after_fetch
+    {
         install_store_provider(cfg, source_cfg, allowlist).await?
     } else {
         install_seed_provider(cfg, source_cfg, allowlist).await?
@@ -570,6 +612,8 @@ async fn install_seed_provider(
         ProviderGuard {
             _serve: serve,
             _index: None,
+            // The in-memory seed provider owns no AvailabilityIndex, so it cannot grow by fetching.
+            post_fetch_announce: None,
         },
     ))
 }
@@ -690,11 +734,42 @@ async fn install_store_provider(
             provision.declared_size(),
         );
     }
+
+    // ANNOUNCE-AFTER-FETCH (TASK-77): build the hook over the SAME index + fabric + identity so a
+    // fetched path it registers is servable and every announce it makes goes through this node's
+    // eligibility authority (no second announce path). Mirrors the composite `daemon` binary.
+    let post_fetch_announce: Option<Arc<dyn daemon_core::PostFetchAnnounce>> =
+        if cfg.libp2p_announce_after_fetch {
+            let door = if cfg.libp2p_public_allowlist_path.is_some() {
+                AnnounceAfterFetchDoor::Public(allowlist.clone())
+            } else {
+                AnnounceAfterFetchDoor::Lan(lan_share_or_refuse(cfg)?)
+            };
+            let hook = Libp2pAnnounceAfterFetch::new(
+                Arc::clone(&fabric),
+                identity_seed,
+                Arc::clone(&index),
+                door,
+                serve_budget,
+                announce_budget,
+                3600,
+                cfg.libp2p_announce_budget,
+            );
+            println!(
+                "LIBP2P-ANNOUNCE-AFTER-FETCH enabled budget={}",
+                cfg.libp2p_announce_budget
+            );
+            Some(Arc::new(hook) as Arc<dyn daemon_core::PostFetchAnnounce>)
+        } else {
+            None
+        };
+
     Ok((
         fabric,
         ProviderGuard {
             _serve: serve,
             _index: Some(index),
+            post_fetch_announce,
         },
     ))
 }
@@ -975,6 +1050,11 @@ async fn main() -> ExitCode {
         // one source of truth (a disabled allowlist without `--libp2p-public-allowlist-path`, a
         // populated file-backed one with it), matching the composite `daemon` binary.
         public_allowlist,
+        // TASK-77: the announce-after-fetch hook the provider install built (present only with
+        // `--libp2p-announce-after-fetch`); `None` = consume-only (leech).
+        post_fetch_announce: _serve_guard
+            .as_ref()
+            .and_then(|g| g.post_fetch_announce.clone()),
     };
 
     let fabric_dyn: Arc<dyn PeerFabric> = fabric.clone();
@@ -1070,6 +1150,8 @@ mod bootstrap_guard_tests {
             libp2p_public_allowlist_path: None,
             libp2p_prove_public_narinfo: Vec::new(),
             libp2p_relay_server_enabled: true,
+            libp2p_announce_after_fetch: false,
+            libp2p_announce_budget: crate::DEFAULT_LIBP2P_ANNOUNCE_BUDGET,
         }
     }
 

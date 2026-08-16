@@ -49,6 +49,8 @@ async fn run_config(required_axes: Vec<Axis>) -> RunConfig {
         required_axes,
         extra_raw_serve: Vec::new(),
         public_allowlist: Arc::new(daemon_core::PublicNarAllowlist::disabled()),
+
+        post_fetch_announce: None,
     }
 }
 

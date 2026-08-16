@@ -921,6 +921,10 @@ impl Shared {
             nar_hash: NarHash::new(c.nar_hash.as_str()),
             nar_size: c.nar_size,
             transport: c.transport,
+            // Re-derived from the verbatim cached narinfo body (TASK-77): a warm-on-disk,
+            // cold-in-memory node can still announce-after-fetch. No NEW on-disk exposure -
+            // the `.nic` already holds the verbatim narinfo carrying this StorePath.
+            store_path: c.store_path,
         })
     }
 }

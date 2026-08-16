@@ -33,6 +33,7 @@ pub mod discovery;
 pub mod narinfo_cache;
 mod nixbase32;
 pub mod peer_source;
+pub mod post_fetch;
 pub mod public_allowlist;
 pub mod rewrite;
 pub mod run;
@@ -70,6 +71,7 @@ pub use narinfo_cache::{
     PassThroughReason, SystemClock, build_narinfo_layer, resolve_narinfo_cache_dir,
 };
 pub use peer_source::{PeerFabricNarSource, PeerFabricRawServe};
+pub use post_fetch::PostFetchAnnounce;
 pub use public_allowlist::{
     AllowlistPersistError, AllowlistStatus, LearnOutcome, PublicNarAllowlist, PublicNarClaim,
     PublicProofReject, PublicationRejected, TrustedKeyError, TrustedNarKeys, VerifiedPublicNar,

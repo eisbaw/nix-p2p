@@ -165,6 +165,8 @@ fn build_app(canned_nar: &[u8], seen: Arc<Mutex<Vec<SeenKey>>>) -> Arc<App> {
         correlation: Arc::new(daemon::NullCorrelation),
         raw_serve: Arc::new(daemon::NoRawServe),
         public_allowlist: Arc::new(daemon::PublicNarAllowlist::disabled()),
+
+        post_fetch_announce: None,
     })
 }
 

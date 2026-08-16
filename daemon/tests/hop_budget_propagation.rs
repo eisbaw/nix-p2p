@@ -205,6 +205,8 @@ fn fallback_app(upstream_url: &str, header_timeout: Duration) -> Arc<App> {
         correlation: Arc::new(NullCorrelation),
         raw_serve: Arc::new(NoRawServe),
         public_allowlist: Arc::new(PublicNarAllowlist::disabled()),
+
+        post_fetch_announce: None,
     })
 }
 

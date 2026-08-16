@@ -90,6 +90,8 @@ fn app_with(narinfo: &[u8], allowlist: Arc<PublicNarAllowlist>) -> Arc<App> {
         correlation: Arc::new(daemon::NullCorrelation),
         raw_serve: Arc::new(NoRawServe),
         public_allowlist: allowlist,
+
+        post_fetch_announce: None,
     })
 }
 

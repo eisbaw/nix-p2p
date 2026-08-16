@@ -288,6 +288,8 @@ pub fn app_from_upstream(
         // The plain-upstream harness never serves raw, so narinfos relay verbatim.
         raw_serve: Arc::new(daemon::NoRawServe),
         public_allowlist: Arc::new(daemon::PublicNarAllowlist::disabled()),
+
+        post_fetch_announce: None,
     })
 }
 

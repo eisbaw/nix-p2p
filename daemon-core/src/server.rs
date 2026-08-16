@@ -80,6 +80,13 @@ pub struct App {
     /// appends its `(NarHash, NarSize)`. A daemon with no configured publication
     /// authority uses [`crate::PublicNarAllowlist::disabled`], which learns nothing.
     pub public_allowlist: Arc<crate::public_allowlist::PublicNarAllowlist>,
+    /// ANNOUNCE-AFTER-FETCH hook (TASK-77), or `None` for a CONSUME-ONLY (leech) node.
+    /// When set, a successful `SignedNarHash` NAR fetch whose narinfo carried a store path
+    /// invokes it so this node becomes a discoverable holder (register + verify + announce,
+    /// budgeted + eligibility-gated - all in the backend impl). `None` (the default, and the
+    /// only posture for a node with no publish authority) means the node fetches without ever
+    /// announcing what it fetched - the privacy-preserving consume-only mode (TASK-78).
+    pub post_fetch_announce: Option<Arc<dyn crate::post_fetch::PostFetchAnnounce>>,
 }
 
 /// Serve on an already-bound listener until it errors. Binding is the caller's
@@ -207,6 +214,17 @@ async fn handle(req: Request<Incoming>, app: Arc<App>) -> Response<NarBody> {
             // Capture the inbound token for the log's `path=` before it is moved
             // into the key; it is the exact NAR locator the client asked for.
             let nar_token = token.as_str().to_string();
+            // TASK-77 announce-after-fetch: capture (signed NarHash, signed StorePath) BEFORE
+            // `meta` is moved into the key, so a successful fetch of a correlated NAR whose
+            // narinfo declared a store path can make this node a discoverable holder. Only the
+            // SignedNarHash path (a correlated NAR with a store path) is eligible - an
+            // UpstreamPath cold-start fetch has no NarHash to announce under, and a narinfo with
+            // no unambiguous StorePath yields `None` (fail-safe: no store path, no holder claim).
+            let announce_target: Option<(NarHash, String)> = correlated.as_ref().and_then(|meta| {
+                meta.store_path
+                    .clone()
+                    .map(|sp| (meta.nar_hash.clone(), sp))
+            });
             let (key, expected_size) = match correlated {
                 Some(meta) => (
                     NarKey::SignedNarHash {
@@ -226,6 +244,20 @@ async fn handle(req: Request<Incoming>, app: Arc<App>) -> Response<NarBody> {
                 .nar
                 .resolve_within(&key, expected_size, hop_budget)
                 .await;
+            // TASK-77: a successful (200) fetch of a correlated NAR triggers announce-after-fetch,
+            // so this node becomes a discoverable holder and the swarm GROWS. Fire-and-forget: the
+            // hook offloads onto its own task (a bounded wait for the local nix to materialise the
+            // path, then a verified announce), so this never blocks or fails the serve. Firing at
+            // resolve-success (rather than at stream-drain) is safe because the hook's hard gate is
+            // materialisation + `sha256(--dump)==NarHash`: a truncated/aborted body the client never
+            // imports leaves the path unmaterialised, so nothing is ever announced (fail-safe). A
+            // consume-only (leech) node has `post_fetch_announce == None` and never reaches here.
+            if let (Some(hook), Some((nar_hash, store_path)), Ok(resp)) =
+                (&app.post_fetch_announce, &announce_target, &result)
+                && resp.status == 200
+            {
+                hook.on_fetched(nar_hash, store_path);
+            }
             // The per-substitution log line is emitted on STREAM COMPLETION (not
             // here at header arrival): `forward_nar` wraps the streamed body so the
             // narrated `bytes=` is the ACTUAL drained count and `duration_ms=` covers
@@ -376,6 +408,10 @@ async fn respond_narinfo(
         Some(c) => raw_serve.will_serve_raw(c.nar_hash.as_str()).await,
         None => false,
     };
+    // TASK-77: the signed StorePath survives a rewrite unchanged (rewrite only touches the
+    // UNSIGNED transport/URL fields, never the signed StorePath/NarHash), so capture it here
+    // once for whichever record branch runs below - it is what announce-after-fetch registers.
+    let correlated_store_path = correlation.as_ref().and_then(|c| c.store_path.clone());
 
     let (out_bytes, rewrote) = if rewrite_to_raw {
         match rewrite::to_raw(&bytes) {
@@ -396,6 +432,7 @@ async fn respond_narinfo(
                     NarinfoTransport {
                         compression: NarCompression::Raw,
                     },
+                    correlated_store_path.clone(),
                 );
                 (rw.body, true)
             }
@@ -415,7 +452,7 @@ async fn respond_narinfo(
         // Normal (non-peer) path: byte-identical passthrough - unknown fields, odd
         // ordering and multiple Sig lines all survive (AC#3).
         if let Some(c) = correlation {
-            catalog.record(c.token, c.nar_hash, c.nar_size, c.transport);
+            catalog.record(c.token, c.nar_hash, c.nar_size, c.transport, c.store_path);
         }
         (rewrite::apply(&bytes).into_owned(), false)
     };
