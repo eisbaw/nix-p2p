@@ -115,25 +115,33 @@ pub fn absence_from_reach<T>(reach: QueryReach) -> Lookup<T> {
 /// key and evict a legit provider FOREVER, with deterministic retries re-chasing the identical
 /// dead subset) and makes an out-competed key SELF-HEAL on retry. It is NOT a full close, and we
 /// do not claim one (the TASK-110/224 lesson - state the bound, do not overclaim):
-///   * Per query the ranks are an effectively-uniform permutation of the T named providers the
-///     walk saw (S forged + the legit set, including a victim v). v is retained iff its rank is
-///     among the `max_peers` smallest, so P(v retained) = min(1, max_peers / T) for one query.
-///   * Salts are drawn independently per retry, so P(v never retained over R retries)
-///     = (1 - max_peers/T)^R, which -> 0 as R grows. Availability self-heals with probability
-///     ->1; the attacker can NO LONGER force NEVER (the old deterministic rule could).
+///   * Per query, v (the victim) is retained iff its rank is among the `max_peers` smallest of the
+///     T named providers the walk saw (S forged + the legit set incl. v). The EXACT retention
+///     probability is N_v / 2^64, where N_v is the number of salts under which v makes the cut;
+///     `provider_rank` (FNV-1a + splitmix64) is NOT a proven-uniform PRF and 2^64 is not divisible
+///     by T, so this is not a clean fraction. Under an IDEALIZED-UNIFORM model it is
+///     P(v retained) ~ min(1, max_peers / T) for one query (an approximation, not an equality).
+///   * Salts are drawn independently per retry (a fresh `rand::random()` per query), so the
+///     modeled probability v is never retained over R retries is ~ (1 - min(1, max_peers/T))^R.
+///     The `min(1, .)` clamp matters: when fewer than `max_peers` providers are named (T <=
+///     max_peers) EVERY named provider is retained, so the exclusion probability is 0. As R -> oo
+///     this -> 0: healing is ALMOST SURE under a FIXED FINITE provider population and INDEFINITELY
+///     MANY INDEPENDENT retries. This is NOT a finite-retry guarantee - it removes the old rule's
+///     ability to force NEVER, but it does not bound healing to any fixed number of tries.
 ///   * RESIDUAL (accepted, not closed): a determined attacker who SUSTAINS S forged providers on
-///     the key drives the per-query success probability down to max_peers/(S + legit) and thus
+///     the key drives the per-query success probability down to ~ max_peers/(S + legit) and thus
 ///     raises the EXPECTED number of retries to first success to ~ (S + legit)/max_peers. They
-///     cannot deny availability outright, but they can degrade it PROBABILISTICALLY (more retries
-///     / higher resolve latency), bounded by how many forged providers they can keep on the key.
-///     That count is itself capped: any single honest store node holds at most
-///     [`STORE_MAX_PROVIDERS_PER_KEY`] providers per key, so per honest record-holder T <= 20 and
-///     the per-query success probability is >= max_peers/20 = 16/20 at prod defaults (expected
-///     retries <= 5/4). Across the DHT's k-replication the union the walk sees CAN exceed 20, so
-///     the honest worst case is larger - but it is a bounded probabilistic degradation with
-///     guaranteed eventual self-heal, never the old permanent, deterministic denial. Integrity is
-///     untouched throughout: every retained record is still ed25519-verified and Nix re-verifies
-///     the store path, so a forged provider costs at most a wasted round trip, never a bad path.
+///     cannot force permanent denial, but they CAN drive expected retries (and resolve latency)
+///     arbitrarily high by keeping more forged providers on the key - a probabilistic degradation,
+///     not an outright denial. That count is itself capped per store node: any single honest store
+///     node holds at most [`STORE_MAX_PROVIDERS_PER_KEY`] providers per key, so per honest
+///     record-holder T <= 20 and the modeled per-query success probability is ~ >= max_peers/20 =
+///     16/20 at prod defaults (expected retries ~ <= 5/4). Across the DHT's k-replication the union
+///     the walk sees CAN exceed 20, so the honest worst case is larger - a bounded probabilistic
+///     degradation with almost-sure (not finite-guaranteed) healing, never the old permanent,
+///     deterministic denial. Integrity is untouched throughout: every retained record is still
+///     ed25519-verified and Nix re-verifies the store path, so a forged provider costs at most a
+///     wasted round trip, never a bad path.
 #[derive(Debug, Clone)]
 pub struct ProviderFanOut {
     /// The bounded provider set: the `max_peers` smallest by RANK under this query's fresh salt
@@ -2886,10 +2894,10 @@ mod tests {
         //
         // The pinned salt is 0 ON PURPOSE. `provider_rank(0, .)` seeds the FNV with `FNV_OFFSET ^
         // 0 == FNV_OFFSET`, which is EXACTLY what the natural revert-mutation (drop the `^ salt`
-        // seed, `let mut h = FNV_OFFSET`) makes EVERY salt compute. So under that mutation the
-        // GREEN arm's fresh salts all collapse onto salt-0 behaviour, the victim is out-competed
-        // under all of them, `healed_at` is None, and this test REDDENS - the required
-        // mutation-proof that the self-heal depends on the salt actually varying the selection.
+        // seed, `let mut h = FNV_OFFSET`) makes EVERY salt compute. So under that mutation ALL of
+        // the GREEN arm's independently-drawn salts collapse onto salt-0 behaviour, the victim is
+        // out-competed under every one of them, `healed` is false, and this test REDDENS - the
+        // required mutation-proof that the self-heal depends on the salt actually varying selection.
         let max_peers = 16usize;
         let sybils: Vec<PeerId> = (0..200).map(|_| PeerId::random()).collect();
         let pinned_salt: FanOutSalt = 0;
@@ -2918,15 +2926,32 @@ mod tests {
              if this trips, the test victim was not actually out-competed"
         );
 
-        // GREEN arm: with a FRESH salt per retry the victim IS selected within a bounded budget.
-        // Expected retries ~ (S+1)/max_peers = 201/16 ~ 13; the 1..513 ceiling is a generous
-        // non-flaky bound (per-retry miss prob ~ 1 - 16/201 ~ 0.92, so P(all 512 miss) < 10^-18).
-        let healed_at =
-            (1u64..513).find(|&salt| retained_under_salt(&all, max_peers, salt).contains(&victim));
+        // GREEN arm: production draws a FRESH INDEPENDENT `rand::random()` salt for EVERY query,
+        // and a retry is a new query - so this arm must model INDEPENDENT per-query salts, not a
+        // deterministic `1,2,3..` sequence (which is neither independent nor a faithful model of
+        // the per-query renewal, and would not license the (185/201)^R miss math). We draw the
+        // salts from a FIXED-SEED `StdRng`: the draws are genuinely independent u64s (so the flake
+        // bound below is real), yet the seed is fixed so the test is reproducible with ZERO CI
+        // flake. Each drawn salt is fed through the SAME `retain_bounded_provider` fold the worker
+        // runs (`retained_under_salt`), so this exercises the production per-query selection path.
+        //
+        // Honest flake bound: with T = S+1 = 201 named providers and max_peers = 16, the modeled
+        // (idealized-uniform) per-retry miss probability is 1 - 16/201 = 185/201 ~ 0.9204. Over
+        // R = 512 INDEPENDENT retries the probability the victim is never healed is ~
+        // (185/201)^512 ~ 4e-19 - an arbitrary seed essentially never fails, so the fixed seed
+        // below is not a cherry-picked lucky one. (The rank hash is not a proven-uniform PRF, so
+        // 4e-19 is a model estimate, not an exact guarantee; the assertion itself is exact.)
+        use rand::{RngCore, SeedableRng};
+        let retries = 512usize;
+        let mut rng = rand::rngs::StdRng::seed_from_u64(0x5A17_0214_C0FF_EE00);
+        let healed = (0..retries).any(|_| {
+            let salt: FanOutSalt = rng.next_u64();
+            retained_under_salt(&all, max_peers, salt).contains(&victim)
+        });
         assert!(
-            healed_at.is_some(),
-            "fresh-salt retries must self-heal the out-competed victim within the budget; \
-             it was never selected across 512 independent-salt retries"
+            healed,
+            "fresh INDEPENDENT-salt retries must self-heal the out-competed victim within {retries} \
+             retries; it was never selected - the per-query salt is not renewing the selection"
         );
     }
 }
