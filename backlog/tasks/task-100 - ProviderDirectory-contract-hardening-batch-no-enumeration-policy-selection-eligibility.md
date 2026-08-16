@@ -3,11 +3,11 @@ id: TASK-100
 title: >-
   ProviderDirectory contract hardening: batch, no-enumeration, policy-selection,
   eligibility
-status: In Progress
+status: Done
 assignee:
   - '@claude'
 created_date: '2026-08-10 09:26'
-updated_date: '2026-08-16 08:28'
+updated_date: '2026-08-16 14:04'
 labels:
   - wave-2b
 dependencies:
@@ -143,4 +143,6 @@ Round-4 blockers each a PROVEN row (verified each reddens by reverting its rule)
 EXHAUSTIVE finalizer test in resolve.rs: classify over {Found-nonempty, mixed, wrong-key, empty, Miss, Unavailable}; KeyAcc fold over all singletons + {F,M,U,N}^2 (both orders); finalize_batch over 2-key {F,M,U,N}^2 x deadline_cut with an INDEPENDENT reference oracle; for_request empty/unasked.
 FULL GATE GREEN: peer-fabric 117 lib + 9 batch + 14 plan + 3 no-enum + 8 golden + 3 eligibility; fabric-libp2p 81 + integration; daemon-core 209; daemon-libp2p + daemon all pass; daemon golden_vectors 2. cargo fmt --check clean; clippy -D warnings clean (peer-fabric+fabric-libp2p+daemon-core+daemon-libp2p+daemon); check-no-floats + check-discovery-no-shortcut --self-test + check-golden-vectors green; just e2e 5/5 (74.8s incl s6-p2p). Frozen wire byte-identical; no floats.
 HONEST scope: classify_lookup covers the two SHIPPED direct callers (peer_source.rs) + the default/registry batch paths; a NEW direct caller using the raw trait find_providers would still be unbound (discipline note, filed). Behaviour change for shipped callers: a wrong-key directory answer is now Unavailable not Miss - both already route to the SAME fallback in peer_source.rs, so no observable regression. RESIDUALS unchanged: TASK-231 (validly-signed-but-UNALLOWLISTED libp2p eligibility hole), AC#3 shipped discovery.rs integration onto the contract.
+
+DONE-with-residual (COMPASS 2026-08-16): AC1-5 closed + mutation-proven + cross-model verified (5-round aggregation defect class). AC#6 publication-eligibility residual CLOSED by TASK-231 (Done, codex GO: shipped announcer fail-closed consumes the eligibility witness; shadow-announcer sealed; cross-mode withdraw gated). Remaining integration residual (shipped daemon-core DirectDiscovery not yet wired onto the hardened ProviderDirectory contract - AC#3/AC#1) tracked by TASK-232. Marking Done so it stops distorting the In-Progress frontier.
 <!-- SECTION:NOTES:END -->
