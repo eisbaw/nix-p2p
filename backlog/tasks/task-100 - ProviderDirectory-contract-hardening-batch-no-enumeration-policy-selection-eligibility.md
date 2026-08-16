@@ -7,7 +7,7 @@ status: In Progress
 assignee:
   - '@claude'
 created_date: '2026-08-10 09:26'
-updated_date: '2026-08-16 07:02'
+updated_date: '2026-08-16 07:18'
 labels:
   - wave-2b
 dependencies:
@@ -117,4 +117,11 @@ CODEX RE-GATE #2 FIX CYCLE (commit 587213e). Meta-pattern acknowledged: prior fi
 GATE from HEAD 587213e: peer-fabric 113 lib + 9 batch + 12 plan + 3 no-enum + 3 eligibility + 8 golden; fabric-libp2p lib + doc compile-guard (1) + integration; daemon-core; daemon-libp2p + daemon all pass (48 ok groups no fail; daemon-core+fabric-libp2p 17 ok groups no fail); cargo fmt --check + clippy -D warnings clean; check-no-floats + check-discovery-no-shortcut --self-test + check-golden-vectors green; just e2e result appended after it completes.
 
 HONEST uncovered-path check: the find_providers_bound choke-point covers the two SHIPPED direct callers; a NEW direct caller that used the raw trait find_providers would be unbound (mitigation: the raw method exists for adapters/tests; shipped consumption goes through the free function - a future direct caller must use find_providers_bound). The raw-publish seal covers SwarmHandle; fabric-iroh has its own separate publish path (not this seam). AC#6 unallowlisted-eligibility remains TASK-231.
+
+DEEP re-gate #2 codex NO-GO (4th round on TASK-100). NON-CONVERGING - handing off as a dedicated fresh-context effort. The 4 codex rounds all found the SAME defect class on different paths: outcome-finalization treats NON-authoritative results as authoritative (false Miss / false Completed).
+ROOT CAUSE + THE FIX (for whoever takes this up): a key is authoritative-Miss and a batch is Completed ONLY IF every key was authoritatively resolved by a mechanism that ACTUALLY ANSWERED. ANY of these must yield Unavailable(reason)/partial and a NON-Completed batch: NotAttempted, Unavailable, deadline-cut, an unregistered mechanism named in an explicit plan (do NOT silently drop it), a malformed/wrong-key/empty-Found response (Unavailable(Backend), not Miss). DO NOT keep patching per-path (4 rounds failed) - UNIFY the finalization into ONE choke-point that default resolve_batch, the MechanismRegistry, and find_providers_bound all funnel through, and pin it with an EXHAUSTIVE or property test over the outcome-combination space (every mechanism-outcome x plan combination), not one example per path.
+Round-4 blockers (exact sites): (1) find_providers_bound wrong-key -> Miss (peer-fabric/src/capabilities.rs:50; exposed to shipped callers daemon-core/src/peer_source.rs:143/283) must be Unavailable(Backend); (2) unregistered-mechanism-in-plan dropped + single Miss finalizes (resolve.rs:735 + :954); (3) Found(vec![]) admitted by the public ctor (resolve.rs:386) violates the Found-never-empty invariant; (4) non-authoritative -> Completed (capabilities.rs:176 + resolve.rs:881).
+GENUINELY DONE + codex-verified (keep): AC#5 (no-default versioned plan), MEDIUM (alignment/FirstHolder sub-requests), the SwarmHandle raw-publish seal (pub(crate) + E0624 compile guard, no other public raw-write on this seam), the two shipped direct callers routed through find_providers_bound, registry deadline-cut marking, frozen wire byte-identical, no floats. fabric-iroh publishes node-address records (not content) so it is NOT a content-availability hole.
+RESIDUALS still open + honestly filed: TASK-231 (validly-signed-but-UNALLOWLISTED libp2p publication-eligibility hole, High/security - the real remaining security work); AC#3 shipped-discovery.rs integration onto the ProviderDirectory contract (needs its own task); the AC#4 raw-trait find_providers unbound for a NEW caller (discipline, not a live leak).
+STATUS: In Progress. Do NOT mark Done. This is a dedicated systematic-redesign effort, not another per-path patch round.
 <!-- SECTION:NOTES:END -->
