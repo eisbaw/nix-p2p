@@ -189,6 +189,12 @@ pub enum AnnounceError {
     /// restart re-mint an already-published sequence and self-rollback, so the announce is
     /// refused rather than made non-durable silently.
     Persist(String),
+    /// The node's publication-eligibility decision (TASK-102) REFUSED this record, so the
+    /// publish-capable adapter emitted nothing (TASK-100 AC#6). Distinct from
+    /// [`Rejected`](AnnounceError::Rejected) (the substrate rejected a well-formed record):
+    /// here the LOCAL policy forbade publishing it at all. Fail-closed - the record never
+    /// reached the wire.
+    Ineligible(crate::eligibility::IneligibleReason),
 }
 
 impl std::fmt::Display for AnnounceError {
@@ -201,6 +207,9 @@ impl std::fmt::Display for AnnounceError {
             AnnounceError::DeadlineExceeded => f.write_str("announce deadline exceeded"),
             AnnounceError::Persist(why) => {
                 write!(f, "durable sequence persist failed, not published: {why}")
+            }
+            AnnounceError::Ineligible(reason) => {
+                write!(f, "publication refused by eligibility decision: {reason}")
             }
         }
     }

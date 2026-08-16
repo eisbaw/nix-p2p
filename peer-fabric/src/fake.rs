@@ -20,6 +20,7 @@ use crate::capabilities::{
     ServeError, ServeHandle, TransferError,
 };
 use crate::content::{ContentKey, DialInfo, ProviderRecord, ResolutionPolicy};
+use crate::eligibility::{AdmitAllPublication, PublicationEligibility};
 use crate::exposure::{Exposure, ExposureLedger, ExposureSurface};
 use crate::fabric::{PeerFabric, TransferRegistry};
 use crate::ids::{Blake3Digest, NodeId, TransportOffer, TransportTag};
@@ -110,23 +111,42 @@ impl ProviderDirectory for FakeProviderDirectory {
 }
 
 /// An [`AvailabilityAnnouncer`] that accepts every publish with a fixed receipt (or
-/// fails if `fail` is set) and records a configured exposure.
+/// fails if `fail` is set) and records a configured exposure. It is CONSTRUCTED WITH a
+/// [`PublicationEligibility`] authority (AC#6) which it consults FAIL-CLOSED before
+/// publishing, so there is no fake announcer that does not consume the eligibility
+/// decision, and a refusing authority makes `announce` fail without recording exposure.
 pub struct FakeAvailabilityAnnouncer {
     fail: bool,
+    eligibility: Arc<dyn PublicationEligibility>,
     on_call: Vec<Exposure>,
     surface: ExposureSurface,
     ledger: Arc<ExposureLedger>,
 }
 
 impl FakeAvailabilityAnnouncer {
-    /// An announcer that accepts publishes, recording `on_call` to `ledger`.
+    /// An announcer that accepts publishes admitted by [`AdmitAllPublication`],
+    /// recording `on_call` to `ledger`. The unfiltered posture is an EXPLICIT authority
+    /// choice, not an absent one.
     pub fn accepting(
+        on_call: Vec<Exposure>,
+        surface: ExposureSurface,
+        ledger: Arc<ExposureLedger>,
+    ) -> Self {
+        Self::with_eligibility(Arc::new(AdmitAllPublication), on_call, surface, ledger)
+    }
+
+    /// An announcer that consults `eligibility` before every publish (AC#6): a refusing
+    /// authority makes `announce` return [`AnnounceError::Ineligible`] and record no
+    /// exposure. This is the constructor that proves the adapter consumes the decision.
+    pub fn with_eligibility(
+        eligibility: Arc<dyn PublicationEligibility>,
         on_call: Vec<Exposure>,
         surface: ExposureSurface,
         ledger: Arc<ExposureLedger>,
     ) -> Self {
         FakeAvailabilityAnnouncer {
             fail: false,
+            eligibility,
             on_call,
             surface,
             ledger,
@@ -138,9 +158,15 @@ impl FakeAvailabilityAnnouncer {
 impl AvailabilityAnnouncer for FakeAvailabilityAnnouncer {
     async fn announce(
         &self,
-        _record: &ProviderRecord,
+        record: &ProviderRecord,
         _budget: &AnnounceBudget,
     ) -> Result<Receipt, AnnounceError> {
+        // AC#6: consume the eligibility decision FIRST, fail-closed. A refused record
+        // never reaches "the wire" (here: never records exposure, never returns a
+        // receipt). Removing this consult is the mutation the seam bite catches.
+        self.eligibility
+            .admit(record)
+            .map_err(AnnounceError::Ineligible)?;
         self.ledger.record_all(self.on_call.iter().copied());
         if self.fail {
             Err(AnnounceError::Rejected(

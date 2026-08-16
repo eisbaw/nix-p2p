@@ -40,6 +40,7 @@ mod budget;
 mod capabilities;
 mod codec;
 mod content;
+mod eligibility;
 mod exposure;
 mod fabric;
 mod fake;
@@ -65,6 +66,9 @@ pub use codec::{
 pub use content::{
     CONTENT_KEY_CONTEXT, CONTENT_KEY_LEN, CONTENT_KEY_PREFIX, ContentKey, DialInfo, NAR_HASH_LEN,
     PROVIDER_SIGNATURE_LEN, ProviderRecord, ResolutionPolicy,
+};
+pub use eligibility::{
+    AdmitAllPublication, IneligibleReason, PublicationEligibility, RefusePublication,
 };
 pub use exposure::{Disclosed, Exposure, ExposureLedger, ExposureSurface, Recipient};
 pub use fabric::{PeerFabric, TransferRegistry};
