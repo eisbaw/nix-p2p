@@ -17,10 +17,14 @@
 //! it is produced fast so Nix falls back without hanging (S2).
 
 use std::convert::Infallible;
+use std::pin::Pin;
 use std::sync::Arc;
+use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 
+use bytes::{Buf, Bytes};
 use http::{HeaderMap, HeaderName};
+use http_body::{Body, Frame};
 use http_body_util::BodyExt;
 use hyper::body::Incoming;
 use hyper::server::conn::http1;
@@ -219,9 +223,19 @@ async fn handle(req: Request<Incoming>, app: Arc<App>) -> Response<NarBody> {
                 .nar
                 .resolve_within(&key, expected_size, hop_budget)
                 .await;
-            // Log BEFORE `forward` moves `result`: the ordering is load-bearing.
-            log_substitution(&app.upstream_label, &nar_token, &result, started.elapsed());
-            forward(result, is_head)
+            // The per-substitution log line is emitted on STREAM COMPLETION (not
+            // here at header arrival): `forward_nar` wraps the streamed body so the
+            // narrated `bytes=` is the ACTUAL drained count and `duration_ms=` covers
+            // the whole transfer (TASK-31). A truncated/aborted stream is narrated
+            // honestly, never as a completed substitution.
+            forward_nar(
+                result,
+                is_head,
+                &app.upstream_label,
+                &nar_token,
+                started,
+                stdout_substitution_sink(),
+            )
         }
         Route::Other => forward(app.passthrough.get_within(&path, hop_budget).await, is_head),
     }
@@ -429,51 +443,245 @@ async fn respond_narinfo(
     response
 }
 
-/// One comprehensible line per NAR substitution the daemon serves, so an
-/// operator tailing the daemon sees WHAT moved, FROM WHERE, HOW MUCH, and HOW
-/// LONG. Emitted only for a 200 (an actual substitution); a 404 or a transport
-/// error is not a substitution and is reported by the error paths, not here.
+/// The outcome the daemon narrates once a NAR body has finished draining (or has
+/// failed to). Fired ON STREAM COMPLETION by [`LoggingBody`], so the reported
+/// `bytes` is the ACTUAL drained count and `duration` covers the whole transfer
+/// (TASK-31) - not the wave-1 `Content-Length` + time-to-headers self-report.
 ///
-/// `bytes` is the upstream `Content-Length` - the COMPRESSED on-wire transfer
-/// size - or `unknown` when the upstream sent none (a chunked response). It is
-/// deliberately NOT the signed NarSize: NarSize is the UNCOMPRESSED size, a
-/// different quantity for any compressed NAR, so guessing with it would print a
-/// wrong-unit number. Absence is reported honestly as `unknown`.
-///
-/// WAVE-1 LIMITATION (filed TASK-31): `duration_ms` is the time to the upstream
-/// RESPONSE HEADERS, not the full body drain - the NAR body streams verbatim
-/// AFTER this point - and `bytes` is `Content-Length`, not a counted drain, so a
-/// truncated transfer would still log its advertised length. Full-drain
-/// accounting is a wave-2 refinement that TASK-9's measurement layer consumes.
-fn log_substitution(
-    source: &str,
-    nar_token: &str,
-    result: &Result<UpstreamResponse, SourceError>,
-    elapsed: Duration,
-) {
-    let Ok(resp) = result else { return };
-    if resp.status != 200 {
-        return;
-    }
-    let bytes = match content_length(&resp.headers) {
-        Some(n) => n.to_string(),
-        None => "unknown".to_string(),
-    };
-    println!(
-        "daemon: substituted path=/nar/{nar_token} source={source} bytes={bytes} duration_ms={}",
-        elapsed.as_millis()
-    );
+/// THE UNIT (the NarSize-vs-FileSize trap - recurred): `bytes` is the count of
+/// ON-WIRE body bytes drained, i.e. the COMPRESSED transport representation
+/// (FileSize-scaled when the narinfo `Compression` is xz/zstd; equal to NarSize
+/// only for `Compression: none`). It is the SAME unit the wave-1 `Content-Length`
+/// reported - now COUNTED, not declared - and NEVER the uncompressed signed
+/// NarSize, which is a different quantity for any compressed NAR.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum SubstitutionOutcome {
+    /// The body reached a clean end (`poll_frame` -> `None`): a full, honest
+    /// substitution of `bytes` on-wire bytes taking `duration`.
+    Complete { bytes: u64, duration: Duration },
+    /// The stream aborted before a clean end: an upstream truncation (hyper
+    /// surfaces a short `Content-Length`/chunked body as an error), a TASK-25
+    /// `BoundedBody` abort (idle-timeout / over-cap - it composes BELOW this
+    /// wrapper and surfaces as an `Err` frame), or the client hanging up
+    /// mid-stream (the body is dropped before completion). `bytes` were drained
+    /// so far. This is NOT a successful substitution - it is deliberately NOT the
+    /// `substituted` success line, so a truncated transfer is never mistaken for a
+    /// full one (AC#3).
+    Aborted {
+        bytes: u64,
+        duration: Duration,
+        reason: String,
+    },
 }
 
-/// Parse an upstream `Content-Length` into bytes, or `None` when absent or
-/// malformed (chunked transfers, which then fall back to the signed NarSize).
-fn content_length(headers: &HeaderMap) -> Option<u64> {
-    headers
-        .get(http::header::CONTENT_LENGTH)?
-        .to_str()
-        .ok()?
-        .parse()
-        .ok()
+/// Where a finished [`LoggingBody`] reports its [`SubstitutionOutcome`]. A trait
+/// object (not a hard-coded `println!`) so a test can OBSERVE the outcome at the
+/// right boundary - the drained byte count and the complete-vs-aborted decision -
+/// while production prints the operator-facing lines.
+type SubstitutionSink = Arc<dyn Fn(&str, &str, &SubstitutionOutcome) + Send + Sync>;
+
+/// The production sink: prints one comprehensible line per NAR substitution the
+/// daemon serves, so an operator tailing the daemon sees WHAT moved, FROM WHERE,
+/// HOW MUCH, and HOW LONG.
+///
+///   * a COMPLETE drain prints the pinned `daemon: substituted ...` success line
+///     on stdout (consumed by `scripts/journey.py` + `scripts/measure.py`);
+///   * an ABORT prints a DISTINCT `daemon: substitution-aborted ...` line on
+///     stderr carrying the PARTIAL drained count - fail-verbose, and never the
+///     `substituted` token, so nothing mistakes it for a full substitution.
+fn stdout_substitution_sink() -> SubstitutionSink {
+    Arc::new(
+        |source: &str, nar_token: &str, outcome: &SubstitutionOutcome| match outcome {
+            SubstitutionOutcome::Complete { bytes, duration } => {
+                println!(
+                    "daemon: substituted path=/nar/{nar_token} source={source} \
+                     bytes={bytes} duration_ms={}",
+                    duration.as_millis()
+                );
+            }
+            SubstitutionOutcome::Aborted {
+                bytes,
+                duration,
+                reason,
+            } => {
+                eprintln!(
+                    "daemon: substitution-aborted path=/nar/{nar_token} source={source} \
+                     bytes={bytes} duration_ms={} reason={reason}",
+                    duration.as_millis()
+                );
+            }
+        },
+    )
+}
+
+/// Wraps a streamed NAR body to ACCOUNT the transfer at its real boundary
+/// (TASK-31). It counts drained frame-data bytes as they pass through and, ON
+/// STREAM COMPLETION, reports a [`SubstitutionOutcome`] to a [`SubstitutionSink`]
+/// exactly once.
+///
+/// Composition with TASK-25 (load-bearing): this wraps the body returned by
+/// `upstream::fetch_streaming`, which is ALREADY a `BoundedBody` (the per-read
+/// idle timeout + the per-chunk over-cap abort). `LoggingBody` sits ABOVE it, so
+/// those aborts arrive here as `Err` frames and are narrated as `Aborted` - never
+/// as a completed substitution. The two wrappers compose; this one adds no bound,
+/// only honest accounting.
+struct LoggingBody<B> {
+    inner: B,
+    /// Request-dispatch instant; `duration` is `start.elapsed()` AT COMPLETION, so
+    /// it spans the whole transfer, not just the header wait (AC#2).
+    start: Instant,
+    source: String,
+    nar_token: String,
+    /// Cumulative ON-WIRE body bytes drained so far (the compressed transport unit).
+    drained: u64,
+    sink: SubstitutionSink,
+    /// Fuse: the outcome is reported exactly once (a clean end, an error, or Drop).
+    reported: bool,
+}
+
+impl<B> LoggingBody<B> {
+    fn new(
+        inner: B,
+        start: Instant,
+        source: String,
+        nar_token: String,
+        sink: SubstitutionSink,
+    ) -> Self {
+        LoggingBody {
+            inner,
+            start,
+            source,
+            nar_token,
+            drained: 0,
+            sink,
+            reported: false,
+        }
+    }
+
+    /// Report `outcome` to the sink at most once (fuse). Idempotent: a clean end
+    /// followed by Drop, or an error followed by Drop, reports only the first.
+    fn report(&mut self, outcome: SubstitutionOutcome) {
+        if self.reported {
+            return;
+        }
+        self.reported = true;
+        (self.sink)(&self.source, &self.nar_token, &outcome);
+    }
+}
+
+impl<B> Body for LoggingBody<B>
+where
+    B: Body<Data = Bytes, Error = std::io::Error> + Unpin,
+{
+    type Data = Bytes;
+    type Error = std::io::Error;
+
+    fn poll_frame(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<Result<Frame<Bytes>, std::io::Error>>> {
+        let this = self.get_mut();
+        match Pin::new(&mut this.inner).poll_frame(cx) {
+            Poll::Ready(Some(Ok(frame))) => {
+                if let Some(data) = frame.data_ref() {
+                    this.drained = this.drained.saturating_add(data.remaining() as u64);
+                }
+                Poll::Ready(Some(Ok(frame)))
+            }
+            Poll::Ready(Some(Err(e))) => {
+                // A mid-stream error (upstream truncation, or a TASK-25 BoundedBody
+                // abort below us): narrate an honest PARTIAL transfer and forward the
+                // error unchanged so hyper/Nix still see the failed download.
+                let reason = e.to_string();
+                this.report(SubstitutionOutcome::Aborted {
+                    bytes: this.drained,
+                    duration: this.start.elapsed(),
+                    reason,
+                });
+                Poll::Ready(Some(Err(e)))
+            }
+            Poll::Ready(None) => {
+                this.report(SubstitutionOutcome::Complete {
+                    bytes: this.drained,
+                    duration: this.start.elapsed(),
+                });
+                Poll::Ready(None)
+            }
+            Poll::Pending => Poll::Pending,
+        }
+    }
+
+    fn is_end_stream(&self) -> bool {
+        self.reported
+    }
+}
+
+impl<B> Drop for LoggingBody<B> {
+    fn drop(&mut self) {
+        // The body was dropped before a clean end or an error surfaced: the client
+        // hung up (or the handler was cancelled) mid-transfer. Narrate it honestly
+        // as an abort with the partial count - never a completed substitution.
+        if !self.reported {
+            self.report(SubstitutionOutcome::Aborted {
+                bytes: self.drained,
+                duration: self.start.elapsed(),
+                reason: "body dropped before completion (client hung up or handler cancelled)"
+                    .to_string(),
+            });
+        }
+    }
+}
+
+/// Forward a streamed NAR response, accounting the transfer on completion.
+///
+/// Only a `200` GET is an actual substitution whose body is drained: its body is
+/// wrapped in a [`LoggingBody`] so the log line fires on completion with the real
+/// drained byte count and full duration. A HEAD (no body drained) and a non-200
+/// (a 404/403 is not a substitution) are forwarded verbatim and NOT narrated - the
+/// same events the wave-1 header-time logger skipped.
+fn forward_nar(
+    result: Result<UpstreamResponse, SourceError>,
+    is_head: bool,
+    source: &str,
+    nar_token: &str,
+    started: Instant,
+    sink: SubstitutionSink,
+) -> Response<NarBody> {
+    let resp = match result {
+        Ok(resp) => resp,
+        Err(err) => return gateway_error(&err),
+    };
+    if must_fail_closed(&resp.headers) {
+        eprintln!("daemon: refusing response (unsupported coding / malformed Connection)");
+        return text_status(StatusCode::BAD_GATEWAY, "upstream unavailable");
+    }
+    let UpstreamResponse {
+        status,
+        headers,
+        body,
+    } = resp;
+    let status_code = StatusCode::from_u16(status).unwrap_or(StatusCode::BAD_GATEWAY);
+    let body = if is_head {
+        empty()
+    } else if status == 200 {
+        LoggingBody::new(
+            body,
+            started,
+            source.to_string(),
+            nar_token.to_string(),
+            sink,
+        )
+        .boxed()
+    } else {
+        // A non-200 body forwards verbatim; it is not a substitution to account.
+        body
+    };
+    let mut response = Response::builder()
+        .status(status_code)
+        .body(body)
+        .expect("forwarded NAR response is well-formed");
+    forward_headers(response.headers_mut(), &headers);
+    response
 }
 
 /// Forward a streaming upstream response (NAR / passthrough) verbatim.
@@ -702,5 +910,267 @@ Sig: nix-p2p-test-1:kvRtCi6KujoW6x7esqgP8QdiaaVX4OL1beI/xmfobVHzM/tSSqmy7jcnI7QD
         assert_eq!(dst.get("content-encoding").unwrap(), "gzip");
         assert!(dst.get("connection").is_none());
         assert!(dst.get("transfer-encoding").is_none());
+    }
+
+    // ----- TASK-31: full-drain byte + duration accounting (LoggingBody) -----
+
+    use std::collections::VecDeque;
+    use std::future::Future;
+    use std::sync::Mutex;
+    use tokio::time::Sleep;
+
+    /// A scripted body that yields a fixed sequence of frames, optionally pacing a
+    /// `gap` of real time BEFORE each frame (to exercise duration accounting). A
+    /// `Fail` step terminates the stream with an `io::Error` (an upstream
+    /// truncation / reset), mirroring how hyper surfaces a short body.
+    enum Step {
+        Data(Vec<u8>),
+        Fail(String),
+    }
+
+    struct StepBody {
+        steps: VecDeque<Step>,
+        gap: Duration,
+        delay: Option<Pin<Box<Sleep>>>,
+    }
+
+    impl StepBody {
+        fn new(steps: Vec<Step>, gap: Duration) -> Self {
+            StepBody {
+                steps: steps.into(),
+                gap,
+                delay: None,
+            }
+        }
+    }
+
+    impl Body for StepBody {
+        type Data = Bytes;
+        type Error = std::io::Error;
+
+        fn poll_frame(
+            self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+        ) -> Poll<Option<Result<Frame<Bytes>, std::io::Error>>> {
+            let this = self.get_mut();
+            // Pace: wait `gap` of real time before delivering the next frame, so the
+            // drain takes measurable wall-clock time (the AC#2 slow-body oracle).
+            if this.gap > Duration::ZERO && !this.steps.is_empty() {
+                if this.delay.is_none() {
+                    this.delay = Some(Box::pin(tokio::time::sleep(this.gap)));
+                }
+                if let Some(d) = this.delay.as_mut() {
+                    match d.as_mut().poll(cx) {
+                        Poll::Pending => return Poll::Pending,
+                        Poll::Ready(()) => this.delay = None,
+                    }
+                }
+            }
+            match this.steps.pop_front() {
+                Some(Step::Data(d)) => Poll::Ready(Some(Ok(Frame::data(Bytes::from(d))))),
+                Some(Step::Fail(msg)) => Poll::Ready(Some(Err(std::io::Error::other(msg)))),
+                None => Poll::Ready(None),
+            }
+        }
+    }
+
+    type Records = Arc<Mutex<Vec<(String, String, SubstitutionOutcome)>>>;
+
+    /// A sink that CAPTURES every reported outcome, so a test observes the drained
+    /// count and the complete-vs-aborted decision at the real boundary.
+    fn capturing_sink() -> (SubstitutionSink, Records) {
+        let records: Records = Arc::new(Mutex::new(Vec::new()));
+        let sink_records = Arc::clone(&records);
+        let sink: SubstitutionSink = Arc::new(
+            move |source: &str, token: &str, outcome: &SubstitutionOutcome| {
+                sink_records.lock().unwrap().push((
+                    source.to_string(),
+                    token.to_string(),
+                    outcome.clone(),
+                ));
+            },
+        );
+        (sink, records)
+    }
+
+    /// Drain a body to the end (or first error), returning the total drained bytes
+    /// or the propagated error. This is what hyper does while serving to Nix.
+    async fn drain<B>(mut body: B) -> Result<u64, std::io::Error>
+    where
+        B: Body<Data = Bytes, Error = std::io::Error> + Unpin,
+    {
+        let mut total = 0u64;
+        while let Some(frame) = body.frame().await {
+            let frame = frame?;
+            if let Some(d) = frame.data_ref() {
+                total += d.remaining() as u64;
+            }
+        }
+        Ok(total)
+    }
+
+    // AC#1 BITE: with NO Content-Length in play, the logged byte count is the
+    // ACTUAL drained sum of the frames - not Content-Length (there is none) and not
+    // the signed NarSize. The wave-1 logger printed `bytes=unknown` for exactly this
+    // chunked, length-less case; full-drain accounting replaces it with an honest
+    // COMPRESSED on-wire byte count.
+    #[tokio::test]
+    async fn ac1_logs_actual_drained_bytes_not_content_length() {
+        let (sink, records) = capturing_sink();
+        // Chunked-style: three frames, 7 + 5 + 3 = 15 on-wire bytes, no length header.
+        let inner = StepBody::new(
+            vec![
+                Step::Data(vec![0u8; 7]),
+                Step::Data(vec![0u8; 5]),
+                Step::Data(vec![0u8; 3]),
+            ],
+            Duration::ZERO,
+        );
+        let body = LoggingBody::new(
+            inner,
+            Instant::now(),
+            "cache.example".to_string(),
+            "deadbeef.nar.xz".to_string(),
+            sink,
+        );
+        let drained = drain(body).await.expect("clean drain");
+        assert_eq!(drained, 15, "the drain itself moved 15 bytes");
+
+        let rec = records.lock().unwrap();
+        assert_eq!(rec.len(), 1, "exactly one outcome reported on completion");
+        let (source, token, outcome) = &rec[0];
+        assert_eq!(source, "cache.example");
+        assert_eq!(token, "deadbeef.nar.xz");
+        match outcome {
+            SubstitutionOutcome::Complete { bytes, .. } => {
+                assert_eq!(
+                    *bytes, 15,
+                    "logged bytes MUST be the counted drain (15), never Content-Length/NarSize"
+                );
+            }
+            other => panic!("expected Complete, got {other:?}"),
+        }
+    }
+
+    // AC#2 BITE: a paced (slow) body makes `duration` reflect the WHOLE transfer,
+    // emitted on completion - not the near-zero header latency. Real wall-clock is
+    // used (not tokio paused time) because `duration` is a std `Instant::elapsed`.
+    #[tokio::test]
+    async fn ac2_duration_covers_full_body_transfer() {
+        let (sink, records) = capturing_sink();
+        let gap = Duration::from_millis(30);
+        // Three frames paced 30ms apart => the body takes ~90ms to drain, whereas a
+        // header-time logger would have recorded ~0ms.
+        let inner = StepBody::new(
+            vec![
+                Step::Data(vec![0u8; 4]),
+                Step::Data(vec![0u8; 4]),
+                Step::Data(vec![0u8; 4]),
+            ],
+            gap,
+        );
+        let start = Instant::now();
+        let body = LoggingBody::new(
+            inner,
+            start,
+            "cache.example".to_string(),
+            "paced.nar".to_string(),
+            sink,
+        );
+        drain(body).await.expect("clean drain");
+
+        let rec = records.lock().unwrap();
+        assert_eq!(rec.len(), 1);
+        match &rec[0].2 {
+            SubstitutionOutcome::Complete { bytes, duration } => {
+                assert_eq!(*bytes, 12);
+                // Loose lower bound (>= 2 gaps) tolerates scheduler jitter while still
+                // proving the duration spans the body, not just the header wait.
+                assert!(
+                    *duration >= gap * 2,
+                    "duration {duration:?} must cover the paced body (>= {:?})",
+                    gap * 2
+                );
+            }
+            other => panic!("expected Complete, got {other:?}"),
+        }
+    }
+
+    // AC#3 BITE: a truncated stream (data then a mid-stream error) is narrated as an
+    // Aborted PARTIAL transfer - NEVER a Complete substitution. The `substituted`
+    // success line is therefore never emitted for a truncated body, and the reported
+    // bytes are the honest partial count.
+    #[tokio::test]
+    async fn ac3_truncated_stream_is_aborted_not_substituted() {
+        let (sink, records) = capturing_sink();
+        // 4 + 4 = 8 bytes arrive, then the upstream truncates mid-stream.
+        let inner = StepBody::new(
+            vec![
+                Step::Data(vec![0u8; 4]),
+                Step::Data(vec![0u8; 4]),
+                Step::Fail("connection reset: body truncated mid-stream".to_string()),
+            ],
+            Duration::ZERO,
+        );
+        let body = LoggingBody::new(
+            inner,
+            Instant::now(),
+            "cache.example".to_string(),
+            "truncated.nar.xz".to_string(),
+            sink,
+        );
+        let err = drain(body)
+            .await
+            .expect_err("a truncated stream surfaces an error");
+        assert!(err.to_string().contains("truncated"));
+
+        let rec = records.lock().unwrap();
+        assert_eq!(rec.len(), 1, "exactly one outcome reported");
+        match &rec[0].2 {
+            SubstitutionOutcome::Aborted { bytes, reason, .. } => {
+                assert_eq!(*bytes, 8, "honest partial count, not a full length");
+                assert!(reason.contains("truncated"));
+            }
+            other => panic!("a truncated transfer must be Aborted, never {other:?}"),
+        }
+        // The load-bearing negative: no Complete/`substituted` outcome exists.
+        assert!(
+            !rec.iter()
+                .any(|(_, _, o)| matches!(o, SubstitutionOutcome::Complete { .. })),
+            "a truncated stream must NEVER be logged as a completed substitution"
+        );
+    }
+
+    // AC#3 (client-hangup variant): a body dropped before a clean end - the client
+    // hung up mid-download - is narrated as Aborted with the partial count, never a
+    // completed substitution.
+    #[tokio::test]
+    async fn client_hangup_midstream_is_aborted_not_substituted() {
+        let (sink, records) = capturing_sink();
+        let inner = StepBody::new(
+            vec![Step::Data(vec![0u8; 6]), Step::Data(vec![0u8; 6])],
+            Duration::ZERO,
+        );
+        let mut body = LoggingBody::new(
+            inner,
+            Instant::now(),
+            "cache.example".to_string(),
+            "hangup.nar".to_string(),
+            sink,
+        );
+        // Pull exactly one frame, then drop the body (client disconnected).
+        let first = body.frame().await.expect("a frame").expect("ok frame");
+        assert_eq!(first.data_ref().map(|d| d.remaining()), Some(6));
+        drop(body);
+
+        let rec = records.lock().unwrap();
+        assert_eq!(rec.len(), 1);
+        match &rec[0].2 {
+            SubstitutionOutcome::Aborted { bytes, reason, .. } => {
+                assert_eq!(*bytes, 6, "only the drained-so-far bytes are honest");
+                assert!(reason.contains("dropped before completion"));
+            }
+            other => panic!("a mid-stream drop must be Aborted, never {other:?}"),
+        }
     }
 }
