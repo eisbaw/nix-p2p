@@ -7,7 +7,7 @@ status: In Progress
 assignee:
   - '@me'
 created_date: '2026-08-15 20:17'
-updated_date: '2026-08-16 00:06'
+updated_date: '2026-08-16 00:22'
 labels:
   - irreversible
 dependencies: []
@@ -71,4 +71,28 @@ REVIEW GATE (qa-test-runner + mped-architect, run in parallel):
 RE-GATE after the doc/wording corrections (docs + JSON notes + one Err message TEXT only; no control-flow/acceptance change - tests match the Malformed variant, not strings): cargo test -p daemon-core -p daemon = 446/0; fmt clean; clippy --workspace -D warnings exit 0; check-no-floats rc=0. just e2e 5/5 result STANDS (comment/text-only change since the green run; e2e does not inspect these strings).
 
 HONEST FINAL SCOPE: TASK-224 closes the STRUCTURAL/list half of the unknown-KIND enumeration vector on all three tolerate-drop routes (claim + single-key + batch). It does NOT achieve literal parity with a known transport; the crammable-single-scalar byte-volume residual is owned by TASK-223. Multi-field future transports are now hard-rejected (disclosed forward-compat cost). Proceeding to commit; codex DEEP re-gate is the orchestrators call.
+
+CLOSING STATUS (left In Progress deliberately; code LANDED + fully gated):
+
+COMMIT: 3f56d55 (claim: close the STRUCTURAL half of the unknown-KIND no-enumeration gap). Tree clean, no AI co-author, not pushed.
+
+WHY NOT MARKED DONE: the Done bar is "the gap is genuinely closed on both paths." What is genuinely + mutation-provenly closed on all three tolerate-drop routes (claim + single-key + batch) is the STRUCTURAL/list form - the exact codex-proven probe ({"transport":"future","content_ids":[..]}) and every array/nested/multi-field variant. But mped-architect proved (and I confirmed) the invariant is NOT LITERALLY discharged: the one tolerated scalar is unbounded/unvalidated, so a delimiter-crammed single string ({"transport":"future","loc":"blake3:a,blake3:b,..."}) is still ACCEPTED and still names identities as raw text. That is strictly more permissive than a type-validated known-transport locator, and is a byte-volume residual owned by TASK-223. Marking Done with "enumeration closed" would repeat the exact overclaim that cost TASK-110 three codex NO-GO rounds. So: honest In Progress.
+
+RECOMMENDATION FOR THE ORCHESTRATOR / codex DEEP re-gate (a genuine scope call I should not make alone):
+  Option 1 - accept the 224/223 split as the task itself architected it: 224 = structural list-affordance closure (DONE as committed); 223 = the per-offer byte cap that bounds the crammable single scalar. Under this reading 224 is complete and can be marked Done on its structural scope, with 223 owning literal closure. This matches the task body ("a byte cap still permits several short identities in one opaque slot" - i.e. structure is 224, bytes are 223) and codex framing.
+  Option 2 - hold 224 to LITERAL closure: then 224 must also bound the single scalar (a length/byte cap), which (a) collides with the recorded large-future-locator concern and (b) largely subsumes 223. mped advised AGAINST adding a cap here (a cap does not change the KIND of residual; it belongs in 223). If the orchestrator wants literal closure, the cleanest is to merge the byte cap work (223) rather than add it under 224.
+
+WHAT IS SOLID regardless of that call: structural gap closed on both response paths + the claim twin via one shared guard; mutation-proven bite (guard neutralised -> bite test + flipped claim test + coherence test + golden every_reject_vector_is_refused all RED; restored GREEN); forward-compat preserved for a single-locator transport (multi-field future = disclosed hard-reject cost); frozen surface accept-only, emit byte-identical; full gate green (446/0, fmt, clippy --workspace -D warnings, no-floats, golden 16/16 + 2/2, just e2e 5/5 incl s6-p2p 11/11); all narrative honest (no "closed/discharged" overclaim - relabelled to structural-closed + residual=223 across claim.rs/discovery.rs/PRD/golden/tests) per mped MEDIUM-1.
+
+NO new follow-up filed: TASK-223 already owns the crammable-scalar byte-volume residual (its padded-frame oracle stays green and its scope already covers this). If the orchestrator picks Option 2, update TASK-223 scope rather than filing a duplicate.
+
+DEEP gate (codex) NO-GO - stays In Progress. codex VERIFIED the structural close is airtight (arrays/nested/multi-field/non-string-value/array-or-object-transport-slot/dup-keys/escape-dup all REJECT on all 3 routes; bite tests mutation-proven; valid golden byte-identical; a tag+one-string offer decodes inertly). The NO-GO is about HONESTY + RESIDUAL OWNERSHIP (the TASK-110 overclaim lesson), NOT that the structural fix is wrong.
+Findings:
+1 (HIGH): TASK-223 (byte cap) does NOT own/close the residual - a byte cap BOUNDS volume, it does not ELIMINATE identity naming, and even ONE accepted unasked identity is a defect per claim.rs:332; 223 also omits the Claim.transports route. The residual needs a PROPER owning task with a GENUINE closure criterion covering all 3 routes.
+2 (HIGH): the residual is THREE text channels, not one: the transport TAG ({"transport":"blake3:a,blake3:b"}), an extra FIELD NAME ({"transport":"future","blake3:a,blake3:b":"x"}), and the string VALUE. Any future closure must cover the WHOLE serialized offer on every route.
+3 (MED): the allowlist does not actually require a string transport tag - {"transport":7|true|null|absent,"loc":"opaque"} is accepted (mapped to empty-tag). Reject a non-string/absent transport tag so it is a strict allowlist.
+4 (MED): several sites still OVERCLAIM closure/fwd-compat: claim.rs:56, :349 (seam "untouched"), :2484 (smuggling "closed", remainder "only padding"), golden claim_wire_v1.json:146/:164, discovery.rs:523. Every "no-enumeration closed/discharged/structural-closed-only-padding" claim must be corrected to: STRUCTURAL/list enumeration closed; a TEXT residual remains across 3 channels; NOT owned by 223.
+5 (MED): the "frozen golden makes literal closure impossible" argument is WRONG - the golden pins ONE carrier_pigeon input; it is the CHOSEN arbitrary-string forward-compat contract (not the golden) that admits the residual. Literal closure IS possible with a substantial forward-compat cost. Correct this reasoning wherever stated.
+6 (LOW): add committed regression vectors for non-string/missing transport tag, transport-slot array/object, field-name cramming, value cramming - pin every clause so a selective weakening bites.
+ARBITRATION (orchestrator, vs project TCB): the ACTUAL privacy invariant (an honest peer's secret holdings never enumerated) is NOT violated by this channel - a hostile RESPONDER naming FAKE identities to an asker leaks nothing about any honest peer. It is a format-cleanliness gap per the repo's self-imposed claim.rs:332 rule. So full text-closure is worth a proper task but is not a same-severity privacy hole; the load-bearing fix NOW is honest framing + proper ownership + the allowlist tightening.
 <!-- SECTION:NOTES:END -->
