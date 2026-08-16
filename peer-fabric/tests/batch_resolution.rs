@@ -213,13 +213,15 @@ async fn an_overrunning_adapter_is_cut_at_the_deadline() {
     assert!(resolution.is_partial());
 }
 
-// AC#4 (structural, DIRECT non-batch path — codex): the shipped direct callers use the
+// AC#4 + round-4 blocker #1 (DIRECT non-batch path): the shipped direct callers use the
 // find_providers_bound choke-point (a free function an adapter cannot override), which
-// DROPS records not keyed to the queried key. THE bite for the OTHER (non-batch) path: a
-// find_providers adapter that, queried for X, returns a record for Y -> Miss, never a
-// Found leaking un-named holdings.
+// funnels through classify_lookup. A find_providers adapter that, queried for X, returns
+// a record for Y (a WRONG-KEY answer) must NOT leak Y as a Found AND must NOT read as a
+// false Miss - it is a backend fault, so it is Unavailable(Backend). THE bite: the old
+// bind_found dropped the record to a Miss; a caller would then cache an authoritative
+// absence that was really a misbehaving mechanism.
 #[tokio::test]
-async fn find_providers_bound_drops_an_unasked_key_on_the_direct_path() {
+async fn find_providers_bound_wrong_key_is_unavailable_not_miss_on_the_direct_path() {
     let fabric = FakeFabric::upstream_only(provider(0x0a));
     let ledger = fabric.shared_ledger();
     let asked = key(0x40);
@@ -232,15 +234,19 @@ async fn find_providers_bound_drops_an_unasked_key_on_the_direct_path() {
         .with_key_result(honest, Lookup::Found(vec![record(honest, provider(0x99))]));
     let budget = DiscoveryBudget::new(Duration::from_secs(5), 16);
 
-    // The un-asked-key record is DROPPED -> Miss.
+    // The un-asked-key record does not leak AND is not a false Miss -> Unavailable(Backend).
     let bound = peer_fabric::find_providers_bound(&dir, &asked, &budget).await;
     assert!(
-        bound.is_miss(),
-        "the direct bound path must DROP a record for an un-asked key (-> Miss), got {bound:?}"
+        matches!(bound, Lookup::Unavailable(Unavailable::Backend(_))),
+        "a wrong-key answer must be Unavailable(Backend), never a false Miss - got {bound:?}"
     );
     assert!(
         !bound.is_found(),
         "the direct path must not leak un-named holdings"
+    );
+    assert!(
+        !bound.is_miss(),
+        "a wrong-key answer must never read as an authoritative absence"
     );
 
     // Control (not vacuous): a correctly-keyed record passes through as Found.
@@ -251,12 +257,13 @@ async fn find_providers_bound_drops_an_unasked_key_on_the_direct_path() {
     );
 }
 
-// AC#4 (structural, default path): a mechanism that returns holders of an UN-ASKED key
-// for a queried position cannot leak them - bind_found drops records not keyed to the
-// queried key, so the outcome is a Miss, never a Found naming un-named holdings. THE
-// bite: removing the binding filter would surface Found(holders-of-Y) for a query of X.
+// AC#4 + round-4 blocker #1 (default path): a mechanism that returns holders of an
+// UN-ASKED key for a queried position cannot leak them - classify_lookup drops records
+// not keyed to the queried key, and a set that is empty after the filter (a wrong-key
+// answer) is a backend fault, NEVER a false Miss and NEVER a Found. THE bite: the old
+// bind_found returned Miss, which a stop-condition/caller would trust as absence.
 #[tokio::test]
-async fn the_default_path_drops_holders_of_an_unasked_key() {
+async fn the_default_path_maps_an_unasked_key_answer_to_unavailable_not_miss() {
     let fabric = FakeFabric::upstream_only(provider(0x08));
     let ledger = fabric.shared_ledger();
     let asked = key(0x10);
@@ -271,14 +278,25 @@ async fn the_default_path_drops_holders_of_an_unasked_key() {
         .await;
 
     assert!(
-        resolution.outcomes()[0].is_miss(),
-        "holders of an un-asked key must be DROPPED (Miss), never surfaced as Found - got {:?}",
+        resolution.outcomes()[0].is_unavailable(),
+        "holders of an un-asked key are a backend fault (Unavailable), never a false Miss \
+         or a Found - got {:?}",
         resolution.outcomes()[0]
     );
     assert!(
         !resolution.outcomes()[0].is_found(),
         "the default path must not leak un-named holdings"
     );
+    assert!(
+        !resolution.outcomes()[0].is_miss(),
+        "a wrong-key answer must never read as an authoritative absence"
+    );
+    // A batch whose only key is Unavailable is not Completed (round-4 blocker #4).
+    assert_eq!(
+        resolution.measurement().resource,
+        ResourceOutcome::MechanismDown
+    );
+    assert!(resolution.is_partial());
 }
 
 // AC#3: latency is a MEASURED value (integer nanoseconds), not a timeless class. A

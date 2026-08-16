@@ -43,7 +43,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use crate::content::{ContentKey, ProviderRecord};
-use crate::outcome::Unavailable;
+use crate::outcome::{Lookup, Unavailable};
 
 // -------------------------------------------------------------------------
 // AC#1/AC#4 - the positional, asker-named batch request.
@@ -166,6 +166,76 @@ impl KeyResolution {
     /// is partial while any key is one of them.
     pub fn is_authoritative(&self) -> bool {
         matches!(self, KeyResolution::Found(_) | KeyResolution::Miss)
+    }
+}
+
+// -------------------------------------------------------------------------
+// THE FINALIZER CHOKE-POINT (TASK-100 systematic redesign).
+//
+// Four codex rounds each found the SAME defect class on a DIFFERENT path:
+// outcome-finalization treated a NON-authoritative result as authoritative (a false
+// `Miss` or a false `Completed`). The fix is NOT to patch each site again but to route
+// EVERY resolution path through ONE finalizer that applies THE ONE RULE by
+// construction:
+//
+//   * a key is an authoritative `Miss` ONLY if EVERY mechanism that was supposed to
+//     answer it authoritatively Missed;
+//   * a batch is `ResourceOutcome::Completed` ONLY if EVERY key is authoritative
+//     (a non-empty `Found` or an authoritative `Miss`) AND no non-authoritative event
+//     (deadline cut, dead mechanism, un-consulted planned mechanism, malformed answer)
+//     occurred.
+//
+// The three funnel points are [`classify_lookup`] (a mechanism's raw `Lookup` answer to
+// a typed per-key outcome - where a wrong-key / empty `Found` becomes `Unavailable`,
+// never a `Miss`), [`KeyAcc`] (the per-key cross-mechanism fold), and
+// [`finalize_batch`] (the per-key + batch resource decision). The default
+// `resolve_batch`, the [`MechanismRegistry`] and `find_providers_bound` all use these;
+// none computes finalization or a `ResourceOutcome` on its own.
+// -------------------------------------------------------------------------
+
+/// Classify ONE mechanism's raw [`Lookup`] answer for `key` into a typed per-key
+/// [`KeyResolution`], under the Found-never-empty / wrong-key-is-a-fault rule. This is
+/// the SINGLE place that decides what an empty or wrong-key `Found` means, shared by the
+/// default [`resolve_batch`](crate::ProviderDirectory::resolve_batch) and by
+/// [`find_providers_bound`](crate::find_providers_bound):
+///
+///   * a `Found` is FILTERED to records whose own [`ProviderRecord::key`] IS `key`, so a
+///     mechanism cannot smuggle holders of an un-asked key into this position (AC#4);
+///   * if that filter empties a NON-empty answer (the mechanism returned holders, but
+///     none for `key` - a WRONG-KEY answer) OR the answer was already `Found(vec![])`
+///     (an EMPTY `Found` - `Found` is never empty), the mechanism gave a MALFORMED
+///     answer. That is a backend fault, NOT an authoritative absence: it becomes
+///     [`Unavailable`](KeyResolution::Unavailable), NEVER a [`Miss`](KeyResolution::Miss)
+///     and NEVER a stop-worthy [`Found`](KeyResolution::Found). A caller must not read it
+///     as "nobody has it".
+pub(crate) fn classify_lookup(
+    key: &ContentKey,
+    answer: Lookup<Vec<ProviderRecord>>,
+) -> KeyResolution {
+    match answer {
+        Lookup::Found(records) => {
+            let had_records = !records.is_empty();
+            let bound: Vec<ProviderRecord> =
+                records.into_iter().filter(|r| r.key == *key).collect();
+            if !bound.is_empty() {
+                KeyResolution::Found(bound)
+            } else if had_records {
+                // Wrong-key: the mechanism returned holders, but none for the asked key.
+                // A protocol/impl fault - treat as could-not-consult, never a Miss.
+                KeyResolution::Unavailable(Unavailable::Backend(
+                    "directory returned holders for un-asked key(s) only (wrong-key answer)"
+                        .to_string(),
+                ))
+            } else {
+                // Empty Found: Found is never empty. A malformed answer, not an
+                // authoritative absence.
+                KeyResolution::Unavailable(Unavailable::Backend(
+                    "directory returned an empty Found (Found is never empty)".to_string(),
+                ))
+            }
+        }
+        Lookup::Miss => KeyResolution::Miss,
+        Lookup::Unavailable(why) => KeyResolution::Unavailable(why),
     }
 }
 
@@ -311,6 +381,16 @@ pub enum BatchBindError {
         /// The position whose Found carried an un-asked key.
         index: usize,
     },
+    /// A `Found` outcome at position `index` carried NO holders (`Found(vec![])`).
+    /// `Found` is never empty by invariant: an empty holder set is an authoritative
+    /// [`Miss`](KeyResolution::Miss) (nobody holds it) or a backend fault
+    /// ([`Unavailable`](KeyResolution::Unavailable)), never a `Found`. Admitting an empty
+    /// `Found` here would let a stop-condition treat "nothing" as "found something", so it
+    /// is rejected at construction.
+    EmptyFound {
+        /// The position whose Found carried no holders.
+        index: usize,
+    },
 }
 
 impl std::fmt::Display for BatchBindError {
@@ -324,6 +404,11 @@ impl std::fmt::Display for BatchBindError {
                 f,
                 "batch resolution position {index} names holders of a key the asker did \
                  not name (an un-asked holding) - rejected"
+            ),
+            BatchBindError::EmptyFound { index } => write!(
+                f,
+                "batch resolution position {index} carries an empty Found (Found is never \
+                 empty; an empty holder set is a Miss or a backend fault) - rejected"
             ),
         }
     }
@@ -384,9 +469,15 @@ impl BatchResolution {
             });
         }
         for (index, (key, outcome)) in request.keys.iter().zip(outcomes.iter()).enumerate() {
-            let names_unasked_holding = matches!(outcome, KeyResolution::Found(records) if records.iter().any(|r| r.key != *key));
-            if names_unasked_holding {
-                return Err(BatchBindError::FoundUnaskedKey { index });
+            if let KeyResolution::Found(records) = outcome {
+                // Found is never empty (an empty holder set is a Miss / backend fault).
+                if records.is_empty() {
+                    return Err(BatchBindError::EmptyFound { index });
+                }
+                // A Found may name ONLY holders of the key at its position.
+                if records.iter().any(|r| r.key != *key) {
+                    return Err(BatchBindError::FoundUnaskedKey { index });
+                }
             }
         }
         Ok(BatchResolution {
@@ -850,6 +941,25 @@ impl MechanismRegistry {
             }
         }
 
+        // A planned mechanism that could NOT be consulted (an explicit plan named an
+        // UNREGISTERED mechanism) did not answer, so it cannot be silently dropped and
+        // let another mechanism's Miss finalize as authoritative absence (round-4
+        // blocker #2). Record it as a non-authoritative event on EVERY key: a key a
+        // registered mechanism only Missed becomes Unavailable (the un-consulted
+        // mechanism might have held it), while a key another mechanism FOUND stays Found
+        // (Found is terminal). `note_unavailable` is first-wins, so a genuine mechanism
+        // failure already recorded in the loop keeps its own, more specific reason.
+        for warning in &warnings {
+            let PlanExecError::UnknownMechanism(id) = warning else {
+                continue;
+            };
+            for a in acc.iter_mut() {
+                a.note_unavailable(Unavailable::Backend(format!(
+                    "planned mechanism {id} is not registered, so it could not be consulted"
+                )));
+            }
+        }
+
         // AC#3 (BLOCKER, registry path): on a deadline cut, EVERY still-pending (not
         // Found) key is Unavailable(DeadlineExceeded) - the envelope was cut before it
         // could be authoritatively resolved. This overrides any Miss a mechanism gave it
@@ -863,38 +973,65 @@ impl MechanismRegistry {
             }
         }
 
-        let aggregated: Vec<KeyResolution> = acc.into_iter().map(KeyAcc::finalize).collect();
+        // THE ONE finalizer: per-key resolution AND the batch ResourceOutcome are decided
+        // here, not by this method. The aggregate is bound per queried key (each Found came
+        // from a for_request-bound sub-resolution mapped to its position).
         let latency_ns = u64::try_from(start.elapsed().as_nanos()).unwrap_or(u64::MAX);
-        let complete = aggregated.iter().all(KeyResolution::is_authoritative);
-        let any_unavailable = aggregated.iter().any(KeyResolution::is_unavailable);
-        // Derive the envelope outcome from what ACTUALLY happened, in priority order: a
-        // real deadline cut > a fully-resolved consultation > an unavailable mechanism
-        // left a key retryable. A batch containing an Unavailable is NEVER Completed
-        // (AC#2): it is MechanismDown (partial), so a caller retries rather than trusting
-        // an absence that was really a dead mechanism.
-        let resource = if deadline_cut {
-            ResourceOutcome::DeadlineCut
-        } else if complete {
-            ResourceOutcome::Completed
-        } else if any_unavailable {
-            ResourceOutcome::MechanismDown
-        } else {
-            // No deadline event, no failed mechanism, yet not every key is authoritative
-            // (an empty registry, or every mechanism deferred a key): the registry's own
-            // envelope ran to completion.
-            ResourceOutcome::Completed
-        };
-        // The aggregate is bound per queried key (each Found came from a for_request-bound
-        // sub-resolution mapped to its position), so `new` is safe.
-        Ok(BatchResolution::new(
-            aggregated,
-            MechanismMeasurement {
-                observed_latency_ns: latency_ns,
-                control_bytes: ControlBytes::NotInstrumented,
-                resource,
-            },
+        Ok(finalize_batch(
+            request,
+            acc,
+            deadline_cut,
+            latency_ns,
+            ControlBytes::NotInstrumented,
         ))
     }
+}
+
+/// THE batch finalizer (TASK-100 systematic redesign): the SINGLE place that turns the
+/// per-key cross-mechanism accumulators plus the batch-level `deadline_cut` flag into
+/// BOTH the per-key [`KeyResolution`]s AND the batch [`ResourceOutcome`], under THE ONE
+/// RULE. Every resolution path (the default
+/// [`resolve_batch`](crate::ProviderDirectory::resolve_batch) and the
+/// [`MechanismRegistry`]) funnels through here; none computes a `ResourceOutcome` itself.
+///
+/// The resource decision is CONSISTENT with [`BatchResolution::is_complete`] by
+/// construction: a batch is `Completed` IFF every key is authoritative and no deadline
+/// cut occurred; a cut is `DeadlineCut`; anything else non-authoritative is
+/// `MechanismDown`. There is no branch that reports `Completed` while a key is
+/// non-authoritative (round-4 blocker #4).
+pub(crate) fn finalize_batch(
+    request: &BatchResolveRequest,
+    acc: Vec<KeyAcc>,
+    deadline_cut: bool,
+    latency_ns: u64,
+    control_bytes: ControlBytes,
+) -> BatchResolution {
+    debug_assert_eq!(
+        acc.len(),
+        request.keys().len(),
+        "the finalizer accumulators are positional over the request keys"
+    );
+    let outcomes: Vec<KeyResolution> = acc.into_iter().map(KeyAcc::finalize).collect();
+    let all_authoritative = outcomes.iter().all(KeyResolution::is_authoritative);
+    // THE ONE RULE for the envelope: a cut is never Completed; Completed requires EVERY
+    // key authoritative; everything else non-authoritative is a down mechanism (partial).
+    let resource = if deadline_cut {
+        ResourceOutcome::DeadlineCut
+    } else if all_authoritative {
+        ResourceOutcome::Completed
+    } else {
+        ResourceOutcome::MechanismDown
+    };
+    // The outcomes are bound per queried key (each Found was classified against its key by
+    // `classify_lookup` or a for_request-bound sub-resolution), so `new` is safe here.
+    BatchResolution::new(
+        outcomes,
+        MechanismMeasurement {
+            observed_latency_ns: latency_ns,
+            control_bytes,
+            resource,
+        },
+    )
 }
 
 /// Per-key cross-mechanism accumulator (AC#2). It records the DISTINCT facts each
@@ -903,7 +1040,7 @@ impl MechanismRegistry {
 /// cannot let a Miss win over a NotAttempted: any non-authoritative outcome blocks the
 /// Miss and keeps the key partial.
 #[derive(Clone, Default)]
-struct KeyAcc {
+pub(crate) struct KeyAcc {
     /// The first Found holder set for this key (a Found is terminal - it wins).
     found: Option<Vec<ProviderRecord>>,
     /// The first Unavailable reason a mechanism reported (a dead/cut mechanism).
@@ -915,12 +1052,12 @@ struct KeyAcc {
 }
 
 impl KeyAcc {
-    fn is_found(&self) -> bool {
+    pub(crate) fn is_found(&self) -> bool {
         self.found.is_some()
     }
 
     /// Fold one mechanism's outcome for this key.
-    fn note(&mut self, outcome: &KeyResolution) {
+    pub(crate) fn note(&mut self, outcome: &KeyResolution) {
         match outcome {
             KeyResolution::Found(records) => {
                 if self.found.is_none() {
@@ -933,7 +1070,7 @@ impl KeyAcc {
         }
     }
 
-    fn note_unavailable(&mut self, why: Unavailable) {
+    pub(crate) fn note_unavailable(&mut self, why: Unavailable) {
         if self.unavailable.is_none() {
             self.unavailable = Some(why);
         }
@@ -942,7 +1079,7 @@ impl KeyAcc {
     /// Decide the key's final outcome. Found wins; else any Unavailable reason (a dead
     /// or cut mechanism); else a NON-authoritative gap (NotAttempted) keeps it partial;
     /// else an authoritative Miss (every mechanism Missed); else never consulted.
-    fn finalize(self) -> KeyResolution {
+    pub(crate) fn finalize(self) -> KeyResolution {
         if let Some(records) = self.found {
             KeyResolution::Found(records)
         } else if let Some(why) = self.unavailable {
@@ -1209,5 +1346,248 @@ mod tests {
         );
         assert_eq!(plan.provenance(), PlanProvenance::NamedBaseline);
         assert!(!plan.is_production());
+    }
+
+    // =====================================================================
+    // THE EXHAUSTIVE FINALIZER TEST (TASK-100 systematic redesign).
+    //
+    // The four codex rounds all found ONE defect class - a NON-authoritative result
+    // finalized as authoritative (a false Miss / a false Completed) - on four different
+    // paths. Rather than one example per path, this enumerates the finalizer's whole
+    // input space and asserts (per-key KeyResolution, batch ResourceOutcome) against an
+    // INDEPENDENT reference oracle for every combination. The three funnel points are
+    // classify_lookup, the KeyAcc fold, and finalize_batch; every resolution path uses
+    // exactly these, so a correct table here pins every path. Each round-4 blocker is a
+    // specific row (marked below) that reddens if THE ONE RULE is reverted.
+    // =====================================================================
+
+    /// The kinds of per-key observation a mechanism can contribute to the fold.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum Obs {
+        Found,
+        Miss,
+        Unavailable,
+        NotAttempted,
+    }
+
+    impl Obs {
+        fn as_resolution(self, k: ContentKey) -> KeyResolution {
+            match self {
+                Obs::Found => KeyResolution::Found(vec![record(k)]),
+                Obs::Miss => KeyResolution::Miss,
+                Obs::Unavailable => KeyResolution::Unavailable(Unavailable::BootstrapOutage),
+                Obs::NotAttempted => KeyResolution::NotAttempted,
+            }
+        }
+    }
+
+    const ALL_OBS: [Obs; 4] = [Obs::Found, Obs::Miss, Obs::Unavailable, Obs::NotAttempted];
+
+    fn resolution_kind(r: &KeyResolution) -> Obs {
+        match r {
+            KeyResolution::Found(_) => Obs::Found,
+            KeyResolution::Miss => Obs::Miss,
+            KeyResolution::Unavailable(_) => Obs::Unavailable,
+            KeyResolution::NotAttempted => Obs::NotAttempted,
+        }
+    }
+
+    /// THE ONE RULE for a single key's fold, computed INDEPENDENTLY of the
+    /// implementation (a reference oracle): Found wins; else any Unavailable; else any
+    /// NotAttempted (a non-authoritative gap BLOCKS a Miss); else an authoritative Miss
+    /// requires that EVERY observation was a Miss; else (no observation) NotAttempted.
+    fn expected_fold(obs: &[Obs]) -> Obs {
+        if obs.contains(&Obs::Found) {
+            Obs::Found
+        } else if obs.contains(&Obs::Unavailable) {
+            Obs::Unavailable
+        } else if obs.contains(&Obs::NotAttempted) {
+            Obs::NotAttempted
+        } else if !obs.is_empty() && obs.iter().all(|o| *o == Obs::Miss) {
+            Obs::Miss
+        } else {
+            Obs::NotAttempted
+        }
+    }
+
+    // classify_lookup, EXHAUSTIVE over the answer kinds a mechanism can return. The
+    // wrong-key and empty-Found rows are ROUND-4 BLOCKER #1: a malformed answer must be
+    // Unavailable, NEVER a Miss and NEVER a stop-worthy Found.
+    #[test]
+    fn classify_lookup_is_exhaustive_and_never_turns_a_fault_into_a_miss() {
+        let asked = key(1);
+        let other = key(2);
+
+        // Right-key, non-empty -> Found (filtered to the asked key).
+        let r = classify_lookup(&asked, Lookup::Found(vec![record(asked)]));
+        assert!(matches!(&r, KeyResolution::Found(v) if v.len() == 1 && v[0].key == asked));
+
+        // Mixed right+wrong -> Found keeps ONLY the asked key's records (drops the rest).
+        let r = classify_lookup(&asked, Lookup::Found(vec![record(asked), record(other)]));
+        assert!(matches!(&r, KeyResolution::Found(v) if v.len() == 1 && v[0].key == asked));
+
+        // ROUND-4 BLOCKER #1 - wrong-key ONLY -> Unavailable(Backend), never Miss/Found.
+        let r = classify_lookup(&asked, Lookup::Found(vec![record(other)]));
+        assert!(
+            matches!(r, KeyResolution::Unavailable(Unavailable::Backend(_))),
+            "a wrong-key answer is a backend fault, not a Miss - got {r:?}"
+        );
+
+        // Empty Found -> Unavailable(Backend), never Miss (Found is never empty).
+        let r = classify_lookup(&asked, Lookup::Found(vec![]));
+        assert!(
+            matches!(r, KeyResolution::Unavailable(Unavailable::Backend(_))),
+            "an empty Found is a backend fault, not a Miss - got {r:?}"
+        );
+
+        // Genuine Miss / Unavailable pass through as themselves.
+        assert!(classify_lookup(&asked, Lookup::Miss).is_miss());
+        assert!(matches!(
+            classify_lookup(&asked, Lookup::Unavailable(Unavailable::Partition)),
+            KeyResolution::Unavailable(Unavailable::Partition)
+        ));
+    }
+
+    // The KeyAcc fold, EXHAUSTIVE over every singleton and every ordered pair of
+    // observations (cross-mechanism). The Miss-only-if-EVERY-mechanism-Missed rule
+    // (ROUND-4 BLOCKER #2 / AC#2) is checked for all 16 pairs against the oracle; a fold
+    // that ranked Miss above NotAttempted would flip (Miss, NotAttempted) -> Miss and
+    // redden here. Both orders are exercised, so the variant is proven order-independent.
+    #[test]
+    fn key_acc_fold_is_exhaustive_over_observation_combinations() {
+        let k = key(7);
+        for o in ALL_OBS {
+            let mut acc = KeyAcc::default();
+            acc.note(&o.as_resolution(k));
+            assert_eq!(
+                resolution_kind(&acc.finalize()),
+                expected_fold(&[o]),
+                "singleton fold of {o:?}"
+            );
+        }
+        for a in ALL_OBS {
+            for b in ALL_OBS {
+                let mut acc = KeyAcc::default();
+                acc.note(&a.as_resolution(k));
+                acc.note(&b.as_resolution(k));
+                assert_eq!(
+                    resolution_kind(&acc.finalize()),
+                    expected_fold(&[a, b]),
+                    "fold of ({a:?}, {b:?}) violated THE ONE RULE"
+                );
+            }
+        }
+        // The empty acc (never consulted) is NotAttempted, never a Miss.
+        assert_eq!(
+            resolution_kind(&KeyAcc::default().finalize()),
+            Obs::NotAttempted
+        );
+    }
+
+    // finalize_batch, EXHAUSTIVE over 2-key batches ({F,M,U,N}^2) x deadline_cut. Asserts
+    // (a) each key's finalized kind is preserved; (b) NO deadline-cut envelope is ever
+    // Completed; (c) with no cut, resource == Completed IFF every key is authoritative,
+    // consistent with is_complete(). Row (c) is ROUND-4 BLOCKER #4: e.g. (Miss,
+    // NotAttempted) must be MechanismDown, not the pre-redesign false Completed.
+    #[test]
+    fn finalize_batch_is_exhaustive_over_two_key_batches() {
+        for a in ALL_OBS {
+            for b in ALL_OBS {
+                for cut in [false, true] {
+                    let ka = key(0x10);
+                    let kb = key(0x20);
+                    let request = BatchResolveRequest::new([ka, kb]);
+                    let mut acc_a = KeyAcc::default();
+                    acc_a.note(&a.as_resolution(ka));
+                    let mut acc_b = KeyAcc::default();
+                    acc_b.note(&b.as_resolution(kb));
+                    let res = finalize_batch(
+                        &request,
+                        vec![acc_a, acc_b],
+                        cut,
+                        0,
+                        ControlBytes::NotInstrumented,
+                    );
+
+                    // (a) per-key kind is preserved (finalize_batch never rewrites a key's
+                    // fold; the deadline injection is the caller path's job, done before).
+                    assert_eq!(
+                        resolution_kind(&res.outcomes()[0]),
+                        a,
+                        "key A kind, cut={cut}"
+                    );
+                    assert_eq!(
+                        resolution_kind(&res.outcomes()[1]),
+                        b,
+                        "key B kind, cut={cut}"
+                    );
+
+                    let all_authoritative =
+                        [a, b].iter().all(|k| matches!(k, Obs::Found | Obs::Miss));
+                    assert_eq!(res.is_complete(), all_authoritative);
+                    if cut {
+                        // (b) a cut is DeadlineCut and can NEVER be Completed.
+                        assert_eq!(res.measurement().resource, ResourceOutcome::DeadlineCut);
+                        assert_ne!(res.measurement().resource, ResourceOutcome::Completed);
+                    } else {
+                        // (c) Completed IFF all-authoritative; else MechanismDown.
+                        let expected = if all_authoritative {
+                            ResourceOutcome::Completed
+                        } else {
+                            ResourceOutcome::MechanismDown
+                        };
+                        assert_eq!(
+                            res.measurement().resource,
+                            expected,
+                            "resource for ({a:?},{b:?}) no-cut"
+                        );
+                        assert_eq!(
+                            res.measurement().resource == ResourceOutcome::Completed,
+                            all_authoritative,
+                            "Completed must mean every key authoritative ({a:?},{b:?})"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    // ROUND-4 BLOCKER #3: the public batch constructor rejects an empty Found (Found is
+    // never empty) AND an un-asked-key Found, positionally; a well-formed resolution is
+    // accepted.
+    #[test]
+    fn for_request_rejects_empty_and_unasked_found() {
+        let request = BatchResolveRequest::new([key(1), key(2)]);
+
+        let empty = BatchResolution::for_request(
+            &request,
+            vec![KeyResolution::Found(vec![]), KeyResolution::Miss],
+            MechanismMeasurement::completed_unmetered(1),
+        );
+        assert_eq!(
+            empty,
+            Err(BatchBindError::EmptyFound { index: 0 }),
+            "an empty Found must be rejected (Found is never empty)"
+        );
+
+        let unasked = BatchResolution::for_request(
+            &request,
+            vec![
+                KeyResolution::Miss,
+                KeyResolution::Found(vec![record(key(9))]),
+            ],
+            MechanismMeasurement::completed_unmetered(1),
+        );
+        assert_eq!(unasked, Err(BatchBindError::FoundUnaskedKey { index: 1 }));
+
+        let ok = BatchResolution::for_request(
+            &request,
+            vec![
+                KeyResolution::Found(vec![record(key(1))]),
+                KeyResolution::Miss,
+            ],
+            MechanismMeasurement::completed_unmetered(1),
+        );
+        assert!(ok.is_ok());
     }
 }

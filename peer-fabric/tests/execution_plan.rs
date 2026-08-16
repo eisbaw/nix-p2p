@@ -627,6 +627,82 @@ async fn an_unknown_mechanism_in_an_explicit_plan_is_skipped_not_fatal() {
     );
 }
 
+// Round-4 blocker #2 (REGISTRY path): an Explicit plan naming an UNREGISTERED mechanism
+// must NOT be silently dropped and let another mechanism's Miss finalize as an
+// authoritative absence. The unregistered mechanism did NOT answer, so it might have held
+// the key: a key the registered mechanism only Missed becomes Unavailable, the batch is
+// partial, and the resource is MechanismDown - never a Miss/Completed. THE bite: dropping
+// the unknown mechanism (the pre-redesign behaviour) leaves the key a clean Miss and the
+// batch Completed, so both assertions redden.
+#[tokio::test]
+async fn an_unregistered_planned_mechanism_blocks_an_authoritative_miss() {
+    let k = key(0x81);
+    let mut registry = MechanismRegistry::new();
+    // Only GlobalDirectory is registered, and it genuinely Misses the key.
+    registry.register(
+        MechanismId::GlobalDirectory,
+        Arc::new(RecordingDirectory {
+            id: MechanismId::GlobalDirectory,
+            answer: Lookup::Miss,
+            log: Arc::new(Mutex::new(Vec::new())),
+        }),
+    );
+    // The plan names GlobalDirectory (registered, Miss) THEN Tracker (NOT registered).
+    let plan = ExecutionPlan::with_explicit_order(vec![
+        MechanismId::GlobalDirectory,
+        MechanismId::Tracker,
+    ]);
+
+    let res = registry
+        .resolve(&BatchResolveRequest::single(k), &budget(), &plan)
+        .await
+        .expect("an unknown mechanism is non-fatal to execution");
+
+    assert!(
+        res.outcomes()[0].is_unavailable(),
+        "a key the registered mechanism Missed, with a PLANNED mechanism that could not be \
+         consulted, is NOT an authoritative Miss - got {:?}",
+        res.outcomes()[0]
+    );
+    assert!(
+        !res.outcomes()[0].is_miss(),
+        "the un-consulted planned mechanism might have held the key; the Miss is not authoritative"
+    );
+    assert!(!res.is_complete(), "the batch is partial, not Completed");
+    assert_eq!(res.measurement().resource, ResourceOutcome::MechanismDown);
+}
+
+// The control for the blocker above (not vacuous): when the registered mechanism FINDS
+// the key, the un-consulted planned mechanism is irrelevant (FirstHolder already stopped),
+// so the key stays Found - the phantom-mechanism taint must not clobber a real Found.
+#[tokio::test]
+async fn an_unregistered_planned_mechanism_does_not_clobber_a_found() {
+    let k = key(0x82);
+    let mut registry = MechanismRegistry::new();
+    registry.register(
+        MechanismId::GlobalDirectory,
+        Arc::new(RecordingDirectory {
+            id: MechanismId::GlobalDirectory,
+            answer: Lookup::Found(vec![record(k)]),
+            log: Arc::new(Mutex::new(Vec::new())),
+        }),
+    );
+    let plan = ExecutionPlan::with_explicit_order(vec![
+        MechanismId::GlobalDirectory,
+        MechanismId::Tracker,
+    ]);
+    let res = registry
+        .resolve(&BatchResolveRequest::single(k), &budget(), &plan)
+        .await
+        .unwrap();
+    assert!(
+        res.outcomes()[0].is_found(),
+        "a real Found must survive the un-consulted-planned-mechanism taint - got {:?}",
+        res.outcomes()[0]
+    );
+    assert!(res.is_complete(), "an all-Found batch is Completed");
+}
+
 // AC#5 STRUCTURAL: the plan type exposes NO production default. A source guard over
 // resolve.rs, with a negative-mutation self-test proving it BITES.
 const RESOLVE_SRC: &str = include_str!("../src/resolve.rs");

@@ -37,48 +37,38 @@ use crate::budget::{AnnounceBudget, DiscoveryBudget, SafetyEnvelope, ServeBudget
 use crate::content::{ContentKey, DialInfo, ProviderRecord, ResolutionPolicy};
 use crate::exposure::ExposureSurface;
 use crate::ids::{Blake3Digest, NodeId, TransportOffer, TransportTag};
-use crate::outcome::Lookup;
+use crate::outcome::{Lookup, Unavailable};
 use crate::resolve::{
-    BatchResolution, BatchResolveRequest, ControlBytes, DirectoryCapabilities, KeyResolution,
-    MechanismMeasurement, ResourceOutcome,
+    BatchResolution, BatchResolveRequest, ControlBytes, DirectoryCapabilities, KeyAcc,
+    KeyResolution, classify_lookup, finalize_batch,
 };
-
-/// Bind a `Found` holder set to the key it answers (AC#4): keep only records whose own
-/// [`ProviderRecord::key`] IS the queried key, so a mechanism cannot smuggle holders of
-/// an un-asked key into this position. A holder set that is empty after binding is a
-/// [`Miss`](KeyResolution::Miss), not an empty `Found`.
-pub(crate) fn bind_found(key: &ContentKey, records: Vec<ProviderRecord>) -> KeyResolution {
-    let bound: Vec<ProviderRecord> = records.into_iter().filter(|r| r.key == *key).collect();
-    if bound.is_empty() {
-        KeyResolution::Miss
-    } else {
-        KeyResolution::Found(bound)
-    }
-}
 
 /// The BOUND single-key discovery path (AC#4, structural). This is the ONLY sanctioned
 /// way to consume [`ProviderDirectory::find_providers`] directly: it is a FREE FUNCTION,
 /// not a trait method, so a buggy or hostile adapter CANNOT override it to skip the
-/// binding. It queries the directory for exactly `key` and then DROPS any returned
-/// record whose own [`ProviderRecord::key`] is not `key` (an un-asked holding), so a
-/// direct caller can never learn holders of a key it did not name. If every record is
-/// dropped the answer is an authoritative [`Miss`](Lookup::Miss), and a `Miss`/
-/// `Unavailable` passes through unchanged. Shipped direct callers (the daemon's NAR
-/// source and raw-serve probe) use THIS, not the raw trait method, so the same
-/// structural no-enumeration guarantee the batch path enforces holds on the direct path.
+/// classification. It queries the directory for exactly `key` and funnels the raw answer
+/// through [`classify_lookup`] - the SAME choke-point the batch path uses - so a record
+/// whose own [`ProviderRecord::key`] is not `key` is DROPPED (a direct caller can never
+/// learn holders of a key it did not name), and a WRONG-KEY or EMPTY `Found` becomes
+/// [`Unavailable`](Lookup::Unavailable) (a backend fault), NEVER a false
+/// [`Miss`](Lookup::Miss). A genuine `Miss`/`Unavailable` passes through unchanged.
+/// Shipped direct callers (the daemon's NAR source and raw-serve probe) use THIS, not the
+/// raw trait method, so the same structural no-enumeration + no-false-miss guarantee the
+/// batch path enforces holds on the direct path.
 pub async fn find_providers_bound(
     directory: &dyn ProviderDirectory,
     key: &ContentKey,
     budget: &DiscoveryBudget,
 ) -> Lookup<Vec<ProviderRecord>> {
-    match directory.find_providers(key, budget).await {
-        Lookup::Found(records) => match bind_found(key, records) {
-            KeyResolution::Found(bound) => Lookup::Found(bound),
-            // Every record named an un-asked key and was dropped: an authoritative Miss,
-            // never a leak of un-named holdings.
-            _ => Lookup::Miss,
-        },
-        other => other,
+    match classify_lookup(key, directory.find_providers(key, budget).await) {
+        KeyResolution::Found(bound) => Lookup::Found(bound),
+        KeyResolution::Miss => Lookup::Miss,
+        KeyResolution::Unavailable(why) => Lookup::Unavailable(why),
+        // classify_lookup never yields NotAttempted (it maps a completed single-key
+        // answer); treat it defensively as could-not-consult rather than panicking.
+        KeyResolution::NotAttempted => Lookup::Unavailable(Unavailable::Backend(
+            "classify_lookup produced an unexpected NotAttempted on the direct path".to_string(),
+        )),
     }
 }
 
@@ -112,7 +102,7 @@ pub trait ProviderDirectory: Send + Sync {
     /// caller's TOTAL `budget` (TASK-100 AC#1). The answer is a positional
     /// [`BatchResolution`] over exactly the request's keys, carrying no keys of its own
     /// (AC#4), one TYPED [`KeyResolution`] each (AC#2), plus the consultation's
-    /// [`MechanismMeasurement`] (AC#3).
+    /// [`MechanismMeasurement`](crate::MechanismMeasurement) (AC#3).
     ///
     /// The DEFAULT implementation resolves each key with the single-key
     /// [`find_providers`](ProviderDirectory::find_providers) primitive under the
@@ -129,13 +119,17 @@ pub trait ProviderDirectory: Send + Sync {
         budget: &DiscoveryBudget,
     ) -> BatchResolution {
         let start = Instant::now();
-        let mut outcomes = Vec::with_capacity(request.keys().len());
+        // One accumulator per asked key. Each key's single-mechanism outcome is folded
+        // in exactly like a registry mechanism's, so the default path and the registry
+        // funnel through the SAME finalizer (round-4 unification) rather than each
+        // computing its own resolution and ResourceOutcome.
+        let mut acc: Vec<KeyAcc> = vec![KeyAcc::default(); request.keys().len()];
         let mut cut = false;
-        for key in request.keys() {
+        for (i, key) in request.keys().iter().enumerate() {
             if cut {
                 // The total deadline is already spent: every remaining key is a typed
                 // PARTIAL marker, distinct from an authoritative Miss.
-                outcomes.push(KeyResolution::NotAttempted);
+                acc[i].note(&KeyResolution::NotAttempted);
                 continue;
             }
             let remaining = budget
@@ -144,7 +138,7 @@ pub trait ProviderDirectory: Send + Sync {
                 .unwrap_or(Duration::ZERO);
             if remaining.is_zero() {
                 cut = true;
-                outcomes.push(KeyResolution::NotAttempted);
+                acc[i].note(&KeyResolution::NotAttempted);
                 continue;
             }
             // Bound THIS key by the REMAINING total budget, so the sum is bounded by the
@@ -159,36 +153,22 @@ pub trait ProviderDirectory: Send + Sync {
             )
             .await
             {
-                Ok(Lookup::Found(records)) => bind_found(key, records),
-                Ok(Lookup::Miss) => KeyResolution::Miss,
-                Ok(Lookup::Unavailable(why)) => KeyResolution::Unavailable(why),
+                // The SINGLE classifier: a wrong-key / empty Found becomes Unavailable
+                // (backend fault), never a false Miss (round-4 blocker #1).
+                Ok(answer) => classify_lookup(key, answer),
                 // The outer timeout fired: this key was CUT by the caller's total deadline.
                 // Typed as DeadlineExceeded (attempted, cut), never a false Miss; the rest
                 // are NotAttempted.
                 Err(_elapsed) => {
                     cut = true;
-                    KeyResolution::Unavailable(crate::Unavailable::DeadlineExceeded)
+                    KeyResolution::Unavailable(Unavailable::DeadlineExceeded)
                 }
             };
-            outcomes.push(outcome);
+            acc[i].note(&outcome);
         }
+        // THE ONE finalizer decides both the per-key resolutions and the ResourceOutcome.
         let latency_ns = u64::try_from(start.elapsed().as_nanos()).unwrap_or(u64::MAX);
-        let resource = if cut {
-            ResourceOutcome::DeadlineCut
-        } else {
-            ResourceOutcome::Completed
-        };
-        // The outcomes are built PER QUERIED KEY (bound above), so `new` is safe here; an
-        // external adapter overriding this method must use the checked
-        // `BatchResolution::for_request` instead.
-        BatchResolution::new(
-            outcomes,
-            MechanismMeasurement {
-                observed_latency_ns: latency_ns,
-                control_bytes: ControlBytes::NotInstrumented,
-                resource,
-            },
-        )
+        finalize_batch(request, acc, cut, latency_ns, ControlBytes::NotInstrumented)
     }
 
     /// What this directory CAN do, declared a-priori (AC#3): whether it is global,
