@@ -7,7 +7,7 @@ status: In Progress
 assignee:
   - '@claude'
 created_date: '2026-08-10 09:26'
-updated_date: '2026-08-16 07:49'
+updated_date: '2026-08-16 08:28'
 labels:
   - wave-2b
 dependencies:
@@ -132,4 +132,15 @@ SYSTEMATIC-REDESIGN plan (round-5, fresh context). Root cause across 4 codex rou
 (4) Registry: an UnknownMechanism named in an explicit plan is noted as Unavailable(Backend) into every key acc (a planned mechanism that did NOT answer -> its keys cannot finalize as an authoritative Miss; Found still wins).
 (5) for_request rejects Found(vec![]) (EmptyFound) -> Found-never-empty holds at the public ctor.
 Round-4 blockers become rows of an EXHAUSTIVE finalizer test (resolve.rs unit, has pub(crate) access): classify over {Found-nonempty, Found-empty, wrong-key, Miss, Unavailable}; KeyAcc fold over {Found,Miss,Unavailable,NotAttempted}^2 x deadline_cut; plus registry integration rows for unregistered-plan-Miss and default/direct wrong-key. Frozen wire untouched; no floats.
+
+ROUND-5 REDESIGN LANDED (commit 2808d90); STATUS stays In Progress (orchestrator owns Done via codex re-gate).
+Unified finalizer: classify_lookup (wrong-key/empty-Found -> Unavailable, never Miss) + KeyAcc fold + finalize_batch (resource = cut?DeadlineCut : all-authoritative?Completed : MechanismDown) in resolve.rs; default resolve_batch and MechanismRegistry::resolve both funnel through it; find_providers_bound uses classify_lookup; for_request rejects EmptyFound. No path computes resolution or ResourceOutcome on its own.
+Round-4 blockers each a PROVEN row (verified each reddens by reverting its rule):
+ #1 wrong-key/empty-Found -> Unavailable: classify_lookup_is_exhaustive_* (unit) + find_providers_bound_wrong_key_* + the_default_path_maps_an_unasked_key_* (batch_resolution). Reverting classify to Miss reddens all three.
+ #2 unregistered planned mechanism blocks an authoritative Miss: an_unregistered_planned_mechanism_blocks_an_authoritative_miss + does_not_clobber_a_found control (execution_plan). Dropping the phantom note reddens.
+ #3 Found(vec![]) rejected: for_request_rejects_empty_and_unasked_found (unit). Removing the EmptyFound check reddens.
+ #4 non-authoritative -> not Completed: finalize_batch_is_exhaustive_over_two_key_batches (unit, {F,M,U,N}^2 x cut) + the_registry_resource_outcome_reflects_the_real_envelope. Reverting resource to if-cut-else-Completed reddens.
+EXHAUSTIVE finalizer test in resolve.rs: classify over {Found-nonempty, mixed, wrong-key, empty, Miss, Unavailable}; KeyAcc fold over all singletons + {F,M,U,N}^2 (both orders); finalize_batch over 2-key {F,M,U,N}^2 x deadline_cut with an INDEPENDENT reference oracle; for_request empty/unasked.
+FULL GATE GREEN: peer-fabric 117 lib + 9 batch + 14 plan + 3 no-enum + 8 golden + 3 eligibility; fabric-libp2p 81 + integration; daemon-core 209; daemon-libp2p + daemon all pass; daemon golden_vectors 2. cargo fmt --check clean; clippy -D warnings clean (peer-fabric+fabric-libp2p+daemon-core+daemon-libp2p+daemon); check-no-floats + check-discovery-no-shortcut --self-test + check-golden-vectors green; just e2e 5/5 (74.8s incl s6-p2p). Frozen wire byte-identical; no floats.
+HONEST scope: classify_lookup covers the two SHIPPED direct callers (peer_source.rs) + the default/registry batch paths; a NEW direct caller using the raw trait find_providers would still be unbound (discipline note, filed). Behaviour change for shipped callers: a wrong-key directory answer is now Unavailable not Miss - both already route to the SAME fallback in peer_source.rs, so no observable regression. RESIDUALS unchanged: TASK-231 (validly-signed-but-UNALLOWLISTED libp2p eligibility hole), AC#3 shipped discovery.rs integration onto the contract.
 <!-- SECTION:NOTES:END -->
