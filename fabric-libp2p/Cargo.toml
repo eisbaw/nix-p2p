@@ -74,6 +74,14 @@ futures = "0.3"
 blake3 = "1"
 # Structured, level-appropriate logging of swarm/kad events (fail verbosely).
 tracing = "0.1"
+# TASK-214: a FRESH per-query u64 SALT for the provider fan-out selection, drawn from
+# the OS CSPRNG (`rand::random`) so the salt is UNPREDICTABLE to a griefer and is fixed
+# only AFTER the attacker's identities are minted. This is what makes the retained
+# fan-out subset non-grindable and self-healing across retries (see swarm.rs
+# `provider_rank`). `rand` is already in the tree via libp2p 0.54 (0.8.x); pinning it
+# here is the direct edge. The salt is the ONLY randomness in the path and it is an
+# integer (u64) - no float ever enters the selection decision (owner no-floats rule).
+rand = "0.8"
 # The announcer SIGNS its own ProviderWithdrawal tombstones (TASK-152, AC#1) with the
 # SAME ed25519 secret that IS this node's identity (self-serve v1: a node only ever
 # withdraws records it itself signed). `sign_provider_withdrawal` takes an

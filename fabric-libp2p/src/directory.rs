@@ -289,8 +289,10 @@ impl Libp2pProviderDirectory {
         // so a sybil flood (many forged provider records for one key) can name far more
         // providers than we should chase. The bound is enforced AT THE SOURCE inside the worker
         // (`retain_bounded_provider`): `get_providers` returns at most `max_peers` providers -
-        // the deterministic smallest-by-PeerId subset - plus a `truncated` flag telling us
-        // whether any named provider was DISCARDED by the bound. So a single lookup costs a
+        // the smallest-by-RANK subset under a FRESH per-query salt (TASK-214: non-grindable and
+        // self-healing across retries, NOT the fixed smallest-by-PeerId a griefer could own for a
+        // chosen key) - plus a `truncated` flag telling us whether any named provider was
+        // DISCARDED by the bound. So a single lookup costs a
         // bounded number of `get_record` round trips (and bounded exposure) regardless of how
         // many providers were named, and the worker's retained memory is O(max_peers), not
         // O(flood). This is the read-path complement to the store-side

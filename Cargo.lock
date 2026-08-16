@@ -1324,6 +1324,7 @@ dependencies = [
  "libp2p-stream",
  "peer-fabric",
  "proc-supervisor",
+ "rand 0.8.7",
  "tokio",
  "tracing",
  "tracing-subscriber",

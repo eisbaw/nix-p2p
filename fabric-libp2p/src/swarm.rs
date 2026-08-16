@@ -107,14 +107,42 @@ pub fn absence_from_reach<T>(reach: QueryReach) -> Lookup<T> {
 /// never holds more than `max_peers` PeerIds no matter how many (possibly forged) providers a
 /// sybil flood streams in - the bound is on WORK/MEMORY, enforced at the source, not a
 /// post-hoc sort+truncate over an already-unbounded set.
+///
+/// TASK-214 THREAT MODEL - targeted-key censorship of the fan-out subset, and its HONEST bound.
+/// The retained subset is the `max_peers` smallest by RANK under a FRESH per-query salt
+/// ([`provider_rank`]), NOT the fixed `max_peers` smallest-by-`PeerId`. This closes the
+/// PERMANENT-censorship vector (a griefer grinding PeerIds to own the retained slots for a chosen
+/// key and evict a legit provider FOREVER, with deterministic retries re-chasing the identical
+/// dead subset) and makes an out-competed key SELF-HEAL on retry. It is NOT a full close, and we
+/// do not claim one (the TASK-110/224 lesson - state the bound, do not overclaim):
+///   * Per query the ranks are an effectively-uniform permutation of the T named providers the
+///     walk saw (S forged + the legit set, including a victim v). v is retained iff its rank is
+///     among the `max_peers` smallest, so P(v retained) = min(1, max_peers / T) for one query.
+///   * Salts are drawn independently per retry, so P(v never retained over R retries)
+///     = (1 - max_peers/T)^R, which -> 0 as R grows. Availability self-heals with probability
+///     ->1; the attacker can NO LONGER force NEVER (the old deterministic rule could).
+///   * RESIDUAL (accepted, not closed): a determined attacker who SUSTAINS S forged providers on
+///     the key drives the per-query success probability down to max_peers/(S + legit) and thus
+///     raises the EXPECTED number of retries to first success to ~ (S + legit)/max_peers. They
+///     cannot deny availability outright, but they can degrade it PROBABILISTICALLY (more retries
+///     / higher resolve latency), bounded by how many forged providers they can keep on the key.
+///     That count is itself capped: any single honest store node holds at most
+///     [`STORE_MAX_PROVIDERS_PER_KEY`] providers per key, so per honest record-holder T <= 20 and
+///     the per-query success probability is >= max_peers/20 = 16/20 at prod defaults (expected
+///     retries <= 5/4). Across the DHT's k-replication the union the walk sees CAN exceed 20, so
+///     the honest worst case is larger - but it is a bounded probabilistic degradation with
+///     guaranteed eventual self-heal, never the old permanent, deterministic denial. Integrity is
+///     untouched throughout: every retained record is still ed25519-verified and Nix re-verifies
+///     the store path, so a forged provider costs at most a wasted round trip, never a bad path.
 #[derive(Debug, Clone)]
 pub struct ProviderFanOut {
-    /// The bounded, DETERMINISTIC provider set: the `max_peers` globally-smallest-by-`PeerId`
-    /// providers the walk saw, in ascending order. Deterministic selection (smallest by
-    /// `PeerId`) makes the peers a lookup chases stable across runs and across the arbitrary
-    /// arrival order of `FoundProviders` events, and is exactly the subset the pre-TASK-154
-    /// post-hoc `sort_unstable().truncate()` produced - only now the intermediate set is never
-    /// larger than `max_peers`.
+    /// The bounded provider set: the `max_peers` smallest by RANK under this query's fresh salt
+    /// (TASK-214 - see the struct-level threat model), presented in ascending `PeerId` order.
+    /// The MEMBERSHIP is salt-dependent (re-drawn per query, so non-grindable and self-healing);
+    /// the presentation ORDER is salt-independent (the directory fetches every retained provider
+    /// concurrently, so order carries no selection weight). Selection is stable within a single
+    /// query regardless of `FoundProviders` arrival order, and the intermediate set is never
+    /// larger than `max_peers` (the TASK-154 O(max_peers) memory bound, preserved).
     pub providers: Vec<PeerId>,
     /// `true` if the `max_peers` bound DISCARDED at least one named provider (the returned set
     /// is a strict subset of what the index named). Load-bearing for the Miss/Unavailable
@@ -129,31 +157,79 @@ pub struct ProviderFanOut {
     pub reach: QueryReach,
 }
 
-/// Fold one advertised provider `peer` into the BOUNDED aggregation set `found`, retaining at
-/// most `max_peers` providers - the `max_peers` smallest-by-`PeerId`. TASK-154 B1: called for
-/// EVERY provider each `FoundProviders` event advertises, so a sybil flood of N >> max_peers
-/// forged providers costs O(max_peers) retained memory (and O(N log max_peers) work), never
-/// O(N) - the bound is enforced as records arrive, not after the whole set is accumulated.
+/// The per-query fan-out SALT (TASK-214). A fresh `u64` is drawn from the OS CSPRNG for EVERY
+/// `get_providers` query (see the `Command::GetProviders` handler), so it is re-drawn on every
+/// RETRY. It seeds [`provider_rank`], which is what the bounded fan-out selection orders by -
+/// turning "keep the `max_peers` smallest-by-`PeerId`" (a FIXED, grindable subset) into "keep
+/// the `max_peers` smallest-by-*rank-under-this-salt*" (a fresh pseudo-random subset each query).
+/// Integer by type: no float ever enters the selection decision (owner no-floats rule).
+type FanOutSalt = u64;
+
+/// The integer selection rank of `peer` under this query's `salt` (TASK-214). The fan-out keeps
+/// the `max_peers` SMALLEST ranks, so with a fresh random `salt` per query the retained subset is
+/// a pseudo-random size-`max_peers` sample of the named providers, re-drawn every retry.
 ///
-/// Determinism: keeping the smallest-by-`PeerId` yields exactly the subset the old post-hoc
-/// `sort_unstable().truncate(max_peers)` produced. `discarded` is set to `true` whenever a
-/// provider is dropped by the bound (either an incoming one that does not make the cut, or an
-/// already-retained one evicted by a smaller newcomer), so the caller can tell a bounded
-/// result from a complete one. After each call `found.len() <= max_peers` holds (the set is
-/// transiently `max_peers + 1` inside, then trimmed), which is the retained-memory bound.
+/// WHY THIS DEFEATS GRINDING. PeerIds are grindable: under the OLD "smallest-by-`PeerId`" rule an
+/// attacker mints identities whose `PeerId` sorts below a victim's and PERMANENTLY owns the
+/// retained slots for a CHOSEN key - and a deterministic retry re-chases the identical dead
+/// subset, so it never self-heals (the TASK-214 vector). Here the rank is a keyed hash of the
+/// peer bytes; a griefer cannot pre-compute it without the `salt`, and the `salt` is chosen
+/// FRESH at query time, AFTER the attacker's identities are already fixed. So no set of forged
+/// identities can guarantee the `max_peers` smallest ranks for a chosen key across retries: each
+/// retry is an independent draw (see the honest residual bound on [`ProviderFanOut`]).
+///
+/// Pure and deterministic in `(salt, peer)` so the selection is unit-testable and STABLE within a
+/// single query (the retained set does not depend on `FoundProviders` arrival order - the same
+/// order-independence the old `PeerId` order had, now under the rank order). Integer-only: FNV-1a
+/// over the peer's multihash bytes seeded by the salt, then a splitmix64 avalanche so
+/// structurally-similar PeerIds do not produce correlated ranks. NOT a cryptographic commitment
+/// and NOT serialized - it is an in-process selection key only, never a wire/integrity field.
+fn provider_rank(salt: FanOutSalt, peer: &PeerId) -> u64 {
+    const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
+    const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
+    let mut h = FNV_OFFSET ^ salt;
+    for b in peer.to_bytes() {
+        h ^= b as u64;
+        h = h.wrapping_mul(FNV_PRIME);
+    }
+    // splitmix64 finalizer (integer-only avalanche).
+    h = (h ^ (h >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+    h = (h ^ (h >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+    h ^ (h >> 31)
+}
+
+/// Fold one advertised provider `peer` into the BOUNDED aggregation set `found`, retaining at
+/// most `max_peers` providers - the `max_peers` smallest by RANK under the query `salt`
+/// ([`provider_rank`]). TASK-154 B1: called for EVERY provider each `FoundProviders` event
+/// advertises, so a sybil flood of N >> max_peers forged providers costs O(max_peers) retained
+/// memory (and O(N log max_peers) work), never O(N) - the bound is enforced as records arrive,
+/// not after the whole set is accumulated.
+///
+/// TASK-214: the set is keyed by `(rank, peer)` and the LARGEST-ranked is evicted when over the
+/// bound, so the retained subset is the `max_peers` smallest-by-rank. With a FRESH random `salt`
+/// per query this is a fresh pseudo-random sample each retry, not the fixed grindable
+/// smallest-by-`PeerId`. The `peer` is kept in the key purely as a deterministic tiebreak for the
+/// (astronomically rare) 64-bit rank collision, so the total order is strict and eviction is
+/// well-defined. `discarded` is set to `true` whenever a provider is dropped by the bound (an
+/// incoming one that does not make the cut, or an already-retained one evicted by a
+/// smaller-ranked newcomer), so the caller can tell a bounded result from a complete one. After
+/// each call `found.len() <= max_peers` holds (the set is transiently `max_peers + 1` inside,
+/// then trimmed), which is the retained-memory bound - preserved unchanged from TASK-154.
 fn retain_bounded_provider(
-    found: &mut BTreeSet<PeerId>,
+    found: &mut BTreeSet<(u64, PeerId)>,
     max_peers: usize,
+    salt: FanOutSalt,
     discarded: &mut bool,
     peer: PeerId,
 ) {
-    if !found.insert(peer) {
-        // Already retained: no change to the set, no discard.
+    let entry = (provider_rank(salt, &peer), peer);
+    if !found.insert(entry) {
+        // Already retained (same peer, same salt => same rank): no change, no discard.
         return;
     }
     if found.len() > max_peers {
-        // Over the bound: evict the current LARGEST so the retained set stays the
-        // `max_peers` smallest. If `peer` itself is the largest it is the one evicted
+        // Over the bound: evict the current LARGEST-ranked so the retained set stays the
+        // `max_peers` smallest by rank. If `entry` itself ranks largest it is the one evicted
         // (a newcomer that does not make the cut). `max_peers == 0` evicts every insert.
         let largest = *found
             .iter()
@@ -285,8 +361,9 @@ pub enum Command {
         key: kad::RecordKey,
         /// The consumer fan-out bound (TASK-154 AC#1 / B1): the worker retains at most this
         /// many providers as `FoundProviders` events stream in (the `max_peers` smallest by
-        /// `PeerId`), so a sybil flood costs O(max_peers) memory at the SOURCE, not O(N) then
-        /// a post-hoc truncate. `0` retains none (a caller that budgeted zero peers).
+        /// RANK under a fresh per-query salt, TASK-214), so a sybil flood costs O(max_peers)
+        /// memory at the SOURCE, not O(N) then a post-hoc truncate. `0` retains none (a caller
+        /// that budgeted zero peers).
         max_peers: usize,
         /// The worker replies here with the started query's [`kad::QueryId`] BEFORE the
         /// result, so the caller can cancel the query (via the lossless cancel channel) if it
@@ -916,12 +993,18 @@ enum Pending {
     Simple(oneshot::Sender<Result<(), String>>),
     Bootstrap(oneshot::Sender<Result<(), String>>),
     GetProviders {
-        /// The BOUNDED aggregation set (TASK-154 B1): at most `max_peers` providers, the
-        /// smallest by `PeerId`, maintained by [`retain_bounded_provider`] as each
-        /// `FoundProviders` event arrives - never the full unbounded flood.
-        found: BTreeSet<PeerId>,
+        /// The BOUNDED aggregation set (TASK-154 B1): at most `max_peers` providers, keyed by
+        /// `(rank, PeerId)` and holding the smallest by RANK under this query's `salt`
+        /// (TASK-214), maintained by [`retain_bounded_provider`] as each `FoundProviders` event
+        /// arrives - never the full unbounded flood.
+        found: BTreeSet<(u64, PeerId)>,
         /// The consumer fan-out bound this query aggregates under.
         max_peers: usize,
+        /// The FRESH per-query fan-out salt (TASK-214), drawn once when this query started. Fixes
+        /// the rank order [`retain_bounded_provider`] selects by for THIS query; a retry is a new
+        /// query with a new salt, which is what makes the retained subset non-grindable and
+        /// self-healing across retries.
+        salt: FanOutSalt,
         /// Set once the `max_peers` bound has discarded any named provider (the result is a
         /// strict subset). Carried out so the directory can distinguish a bounded result from
         /// a complete one (TASK-154 B2 Miss-vs-Unavailable).
@@ -1159,11 +1242,18 @@ impl Worker {
                     self.cancel_query(id);
                     return;
                 }
+                // TASK-214: draw a FRESH salt for THIS query from the OS CSPRNG. Because it is
+                // chosen here - AFTER any attacker's PeerIds are already minted - and re-drawn on
+                // every retry (each retry is a new GetProviders command), the retained fan-out
+                // subset is a fresh pseudo-random sample, not the fixed grindable
+                // smallest-by-PeerId. A u64 (no float enters the selection decision).
+                let salt: FanOutSalt = rand::random();
                 self.pending.insert(
                     id,
                     Pending::GetProviders {
                         found: BTreeSet::new(),
                         max_peers,
+                        salt,
                         truncated: false,
                         reply,
                     },
@@ -1321,6 +1411,7 @@ impl Worker {
                 if let Some(Pending::GetProviders {
                     found,
                     max_peers,
+                    salt,
                     truncated,
                     ..
                 }) = self.pending.get_mut(&id)
@@ -1328,9 +1419,10 @@ impl Worker {
                 {
                     // TASK-154 B1: fold each advertised provider into a set BOUNDED at
                     // `max_peers`, so a sybil flood never grows the retained set past the
-                    // budget (O(max_peers) memory), and does so DETERMINISTICALLY.
+                    // budget (O(max_peers) memory). TASK-214: the set is ordered by RANK under
+                    // this query's fresh `salt`, so which subset is retained is non-grindable.
                     for peer in providers.iter().copied() {
-                        retain_bounded_provider(found, *max_peers, truncated, peer);
+                        retain_bounded_provider(found, *max_peers, *salt, truncated, peer);
                     }
                 }
                 let failed = res.is_err();
@@ -1345,14 +1437,19 @@ impl Worker {
                     // The terminal-step stats are cumulative for the whole query, so
                     // `num_successes` is how many peers answered the walk toward the key
                     // (TASK-174: the near-key bar for an EMPTY provider set). The `found`
-                    // BTreeSet iterates in ascending `PeerId` order, so collecting it yields
-                    // the deterministic ascending fan-out set.
+                    // BTreeSet is keyed by `(rank, PeerId)` (TASK-214); drop the rank and present
+                    // the retained peers in ascending `PeerId` order - the MEMBERSHIP is the
+                    // salt-dependent selection, the ORDER is a salt-independent presentation (the
+                    // directory fetches all retained providers concurrently).
                     let reach = QueryReach {
                         answered: stats.num_successes(),
                     };
+                    let mut providers: Vec<PeerId> =
+                        found.into_iter().map(|(_rank, peer)| peer).collect();
+                    providers.sort_unstable();
                     let _ = reply.send(match res {
                         Ok(_) => Ok(ProviderFanOut {
-                            providers: found.into_iter().collect(),
+                            providers,
                             truncated,
                             reach,
                         }),
@@ -2526,6 +2623,7 @@ mod tests {
             Pending::GetProviders {
                 found: BTreeSet::new(),
                 max_peers: 16,
+                salt: 0,
                 truncated: false,
                 reply: dropped_get_providers,
             }
@@ -2536,6 +2634,7 @@ mod tests {
             !Pending::GetProviders {
                 found: BTreeSet::new(),
                 max_peers: 16,
+                salt: 0,
                 truncated: false,
                 reply: held_get_providers,
             }
@@ -2593,6 +2692,7 @@ mod tests {
             Pending::GetProviders {
                 found: BTreeSet::new(),
                 max_peers: 16,
+                salt: 0,
                 truncated: false,
                 reply: abandoned_reply,
             },
@@ -2605,6 +2705,7 @@ mod tests {
             Pending::GetProviders {
                 found: BTreeSet::new(),
                 max_peers: 16,
+                salt: 0,
                 truncated: false,
                 reply: live_reply,
             },
@@ -2635,10 +2736,17 @@ mod tests {
         // the OLD code accumulated all N into a HashSet then sorted+truncated (O(N) memory /
         // O(N log N) work in the forged count). Delete the trim and `len` blows past max_peers.
         let max_peers = 16usize;
+        let salt: FanOutSalt = 0x1234_5678_9abc_def0;
         let mut found = BTreeSet::new();
         let mut truncated = false;
         for _ in 0..10_000 {
-            retain_bounded_provider(&mut found, max_peers, &mut truncated, PeerId::random());
+            retain_bounded_provider(
+                &mut found,
+                max_peers,
+                salt,
+                &mut truncated,
+                PeerId::random(),
+            );
             assert!(
                 found.len() <= max_peers,
                 "retained set must never exceed max_peers - the bounded-memory invariant"
@@ -2656,19 +2764,22 @@ mod tests {
     }
 
     #[test]
-    fn retain_bounded_provider_keeps_the_max_peers_smallest_deterministically() {
-        // The retained subset MUST be exactly the max_peers globally-smallest PeerIds, the SAME
-        // subset the old post-hoc `sort_unstable().truncate()` produced, and independent of
-        // arrival order. Fold the SAME ids in forward and reverse order; both must converge on
-        // the identical set, equal to the smallest max_peers of the input.
+    fn retain_bounded_provider_keeps_the_max_peers_smallest_by_rank_order_independently() {
+        // TASK-214: WITHIN a single query (a fixed salt) the retained subset MUST be exactly the
+        // max_peers smallest by RANK under that salt, and independent of `FoundProviders` arrival
+        // order (the same order-independence the old PeerId order had, now under the rank order).
+        // Fold the SAME ids forward and reverse; both must converge on the identical set, equal to
+        // the max_peers smallest by `provider_rank(salt, .)`. (That the subset VARIES with the
+        // salt - the non-grindability - is the separate `..._varies_with_salt` bite below.)
         let ids: Vec<PeerId> = (0..64).map(|_| PeerId::random()).collect();
         let max_peers = 10usize;
+        let salt: FanOutSalt = 0xdead_beef_0000_0001;
 
-        let fold = |order: &[PeerId]| -> BTreeSet<PeerId> {
+        let fold = |order: &[PeerId]| -> BTreeSet<(u64, PeerId)> {
             let mut found = BTreeSet::new();
             let mut truncated = false;
             for &p in order {
-                retain_bounded_provider(&mut found, max_peers, &mut truncated, p);
+                retain_bounded_provider(&mut found, max_peers, salt, &mut truncated, p);
             }
             found
         };
@@ -2678,12 +2789,13 @@ mod tests {
         let backward = fold(&rev);
         assert_eq!(forward, backward, "selection must be order-independent");
 
-        let mut sorted = ids.clone();
-        sorted.sort_unstable();
-        let expected: BTreeSet<PeerId> = sorted.into_iter().take(max_peers).collect();
+        let mut by_rank: Vec<(u64, PeerId)> =
+            ids.iter().map(|p| (provider_rank(salt, p), *p)).collect();
+        by_rank.sort_unstable();
+        let expected: BTreeSet<(u64, PeerId)> = by_rank.into_iter().take(max_peers).collect();
         assert_eq!(
             forward, expected,
-            "the retained set must be the max_peers smallest PeerIds (matches sort+truncate)"
+            "the retained set must be the max_peers smallest by rank under this salt"
         );
     }
 
@@ -2694,7 +2806,7 @@ mod tests {
         // an empty fan-out as an authoritative Miss (TASK-154 B2).
         let mut found = BTreeSet::new();
         let mut truncated = false;
-        retain_bounded_provider(&mut found, 0, &mut truncated, PeerId::random());
+        retain_bounded_provider(&mut found, 0, 42, &mut truncated, PeerId::random());
         assert!(found.is_empty(), "max_peers=0 retains no provider");
         assert!(
             truncated,
@@ -2709,9 +2821,112 @@ mod tests {
         let mut found = BTreeSet::new();
         let mut truncated = false;
         let p = PeerId::random();
-        retain_bounded_provider(&mut found, 4, &mut truncated, p);
-        retain_bounded_provider(&mut found, 4, &mut truncated, p);
+        retain_bounded_provider(&mut found, 4, 7, &mut truncated, p);
+        retain_bounded_provider(&mut found, 4, 7, &mut truncated, p);
         assert_eq!(found.len(), 1, "a duplicate does not grow the set");
         assert!(!truncated, "a duplicate is not a discard");
+    }
+
+    // ================= TASK-214: non-grindable, self-healing fan-out selection =================
+    // The old rule kept the max_peers smallest-by-PeerId - a FIXED, grindable subset: an attacker
+    // grinds PeerIds below a victim's, PERMANENTLY owns the retained slots for a CHOSEN key, and a
+    // deterministic retry re-chases the identical dead subset (never self-heals). These bites
+    // prove the rank-under-fresh-salt selection (a) VARIES the retained subset across salts
+    // (non-grindable) and (b) SELF-HEALS: a victim out-competed on one query IS selected within a
+    // bounded number of independent-salt retries. Both are MUTATION-PROVEN: pin the salt to a
+    // constant (revert to a deterministic subset) and each reddens.
+
+    /// The retained subset a query with `salt` would keep from `providers`, as the pure fold the
+    /// worker runs. Mirrors the worker's `retain_bounded_provider` loop exactly.
+    fn retained_under_salt(
+        providers: &[PeerId],
+        max_peers: usize,
+        salt: FanOutSalt,
+    ) -> BTreeSet<PeerId> {
+        let mut found = BTreeSet::new();
+        let mut truncated = false;
+        for &p in providers {
+            retain_bounded_provider(&mut found, max_peers, salt, &mut truncated, p);
+        }
+        found.into_iter().map(|(_rank, peer)| peer).collect()
+    }
+
+    #[test]
+    fn fan_out_selection_varies_with_salt_not_grindable_to_a_fixed_subset() {
+        // AC#1: the retained subset is NOT a fixed function of the PeerIds - it changes with the
+        // per-query salt, so no grind of PeerIds owns the slots across queries. Over many salts
+        // the same provider set must yield MORE THAN ONE distinct retained subset (a determinism
+        // that pinned the subset would yield exactly one). MUTATION: make `provider_rank` ignore
+        // the salt (e.g. `let mut h = FNV_OFFSET;`) and every salt yields the SAME subset ->
+        // `distinct == 1` -> this reddens.
+        let providers: Vec<PeerId> = (0..40).map(|_| PeerId::random()).collect();
+        let max_peers = 16usize;
+        let distinct: BTreeSet<Vec<PeerId>> = (0u64..64)
+            .map(|salt| {
+                retained_under_salt(&providers, max_peers, salt)
+                    .into_iter()
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+        assert!(
+            distinct.len() > 1,
+            "the retained subset must VARY across salts (non-grindable); got a single fixed \
+             subset across 64 salts - the selection is salt-independent (grindable)"
+        );
+    }
+
+    #[test]
+    fn out_competed_victim_self_heals_within_bounded_retries_but_never_under_a_pinned_salt() {
+        // AC#2, the biting self-heal test. Model an attacker that mints S forged providers plus
+        // ONE legit victim on a CHOSEN key. Under a PINNED salt (the old deterministic rule) the
+        // victim is selected iff it makes the fixed smallest-max_peers cut - and if it does not,
+        // NO retry ever selects it (perpetual Unavailable(truncated)); this is the RED the fix
+        // must remove. Under fresh per-query salts the victim IS selected within a bounded number
+        // of retries.
+        //
+        // The pinned salt is 0 ON PURPOSE. `provider_rank(0, .)` seeds the FNV with `FNV_OFFSET ^
+        // 0 == FNV_OFFSET`, which is EXACTLY what the natural revert-mutation (drop the `^ salt`
+        // seed, `let mut h = FNV_OFFSET`) makes EVERY salt compute. So under that mutation the
+        // GREEN arm's fresh salts all collapse onto salt-0 behaviour, the victim is out-competed
+        // under all of them, `healed_at` is None, and this test REDDENS - the required
+        // mutation-proof that the self-heal depends on the salt actually varying the selection.
+        let max_peers = 16usize;
+        let sybils: Vec<PeerId> = (0..200).map(|_| PeerId::random()).collect();
+        let pinned_salt: FanOutSalt = 0;
+
+        // Find a legit victim that the PINNED salt does NOT retain (out-competed on query 0). With
+        // 200 sybils vs a 16-slot cut this is the overwhelmingly likely case; loop to be certain.
+        let victim = (0u64..10_000)
+            .map(|_| PeerId::random())
+            .find(|v| {
+                let mut all = sybils.clone();
+                all.push(*v);
+                !retained_under_salt(&all, max_peers, pinned_salt).contains(v)
+            })
+            .expect("a victim out-competed under the pinned salt must exist against 200 sybils");
+
+        let mut all = sybils.clone();
+        all.push(victim);
+
+        // RED arm: a deterministic (pinned-salt) retry re-chases the identical dead subset - the
+        // victim is NEVER selected, no matter how many times we retry. This is the pre-fix vector.
+        let pinned_ever = (0u64..256)
+            .any(|_retry| retained_under_salt(&all, max_peers, pinned_salt).contains(&victim));
+        assert!(
+            !pinned_ever,
+            "a pinned-salt (deterministic) selection must NEVER heal the out-competed victim - \
+             if this trips, the test victim was not actually out-competed"
+        );
+
+        // GREEN arm: with a FRESH salt per retry the victim IS selected within a bounded budget.
+        // Expected retries ~ (S+1)/max_peers = 201/16 ~ 13; the 1..513 ceiling is a generous
+        // non-flaky bound (per-retry miss prob ~ 1 - 16/201 ~ 0.92, so P(all 512 miss) < 10^-18).
+        let healed_at =
+            (1u64..513).find(|&salt| retained_under_salt(&all, max_peers, salt).contains(&victim));
+        assert!(
+            healed_at.is_some(),
+            "fresh-salt retries must self-heal the out-competed victim within the budget; \
+             it was never selected across 512 independent-salt retries"
+        );
     }
 }
