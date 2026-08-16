@@ -829,20 +829,27 @@ TASK-120 prerequisite. For every supported arm/profile:
   shared tolerate-drop decoder now constrains an unknown offer to a whitelisted
   minimal shape (the `transport` tag plus at most one scalar string locator) and
   **REJECTS** any unknown offer whose body could name a *list* of identities (an
-  array, a nested object, more than one scalar field), on the claim path and both
-  hold-response paths. This is **not literal parity** with a known transport,
-  whose locator is type-validated and fixed-length: the one tolerated scalar is
-  unbounded and unvalidated, so a delimiter-crammed single string
-  (`{"transport":"future","loc":"blake3:a,blake3:b,…"}`) is still accepted and
-  still names identities as raw text — a **byte-volume residual owned by
-  TASK-223**, not closed here. A plausible future *single-locator* transport still
+  array, a nested object, more than one scalar field, or a non-string tag), on the
+  claim path and both hold-response paths. This is **not literal closure** of
+  no-enumeration: a single opaque scalar of identity-shaped **text** can still ride
+  in an accepted unknown offer through three channels — the transport **tag**
+  itself (`{"transport":"blake3:…"}`), an extra **field name**
+  (`{"transport":"future","blake3:…":"x"}`), and the string **value**
+  (`{"transport":"future","loc":"blake3:a,blake3:b,…"}`). Each is accepted-then-
+  dropped, and one accepted unasked identity is already a `claim.rs:332` defect, so
+  the invariant is discharged at the *schema* level (a list is inexpressible) but
+  not literally. This **TEXT residual is owned by TASK-227** — *not* TASK-223: a
+  byte cap bounds volume, it does not eliminate identity naming. Per orchestrator
+  arbitration this is a **format-cleanliness** gap by the repo's own rule, not an
+  honest-peer-holdings leak (a hostile responder naming fake identities reveals
+  nothing about any honest peer), hence Low urgency; literal closure is possible at
+  a forward-compat cost (it is the arbitrary-string *contract*, not the frozen
+  golden, that admits it). A plausible future *single-locator* transport still
   decodes inertly, but a future *multi-field* transport is now a hard decode error
-  (a disclosed forward-compat cost — foreclosing the multi-field vector and
-  tolerating a multi-field future are the same affordance). The worst-case
-  **byte** amplification is likewise unchanged: a well-shaped unknown-kind slot
-  still has a byte-unbounded single scalar, so a hostile single-key `Have` can
-  still pad to the **64 KiB** frame (~**744×**), exactly as before TASK-110 and
-  exactly as the batch path — the frame gate remains the only byte bound (a
+  (a disclosed forward-compat cost). Separately, the worst-case **byte**
+  amplification is unchanged: a well-shaped unknown-kind slot still has a
+  byte-unbounded single scalar, so a hostile single-key `Have` can still pad to the
+  **64 KiB** frame (~**744×**) — the frame gate remains the only byte bound (a
   per-offer byte cap is deferred, **TASK-223**). The single-key hold-query cell is
   supported for training on the same terms as the batch path.
 - **Privacy:** `upstream_only` emits zero P2P publication/query/serve records;
@@ -868,20 +875,22 @@ training, not values this document may guess:
 - TASK-110 **(mechanism landed)** bounded the single-key offer COUNT with the same
   one-offer-per-transport-kind semantic rule as the batch path, closing the
   KNOWN-offer count/enumeration vector (legitimate answer 330 B, 3.75×).
-  **TASK-224 (landed)** closes the **structural half** of the second vector —
+  **TASK-224 (landed)** closes the **structural/list half** of the second vector —
   enumeration via the opaque unknown-**KIND** slot — by narrowing the shared
-  tolerate-drop decoder to a whitelisted minimal shape (tag + at most one scalar
-  string locator) and rejecting any unknown offer that could name a *list* of
-  identities (array/nested/multi-field), on the claim path and both hold-response
-  paths, with forward-compat for a single-locator transport preserved (a
-  multi-field future transport is a disclosed hard-reject). The no-enumeration
-  invariant is therefore discharged **at the schema level** for both paths (a list
-  of identities is inexpressible), but **not literally**: the one tolerated scalar
-  is unbounded, so identities delimiter-crammed into a single string are still
-  accepted — a byte-volume residual, strictly more permissive than a type-validated
-  known-transport locator, owned by **TASK-223** (the same task that owns the
-  ~744× worst-case padding). Enumeration and byte-volume are the same residual
-  here: one unbounded opaque scalar.
+  tolerate-drop decoder to a whitelisted minimal shape (string tag + at most one
+  scalar string locator) and rejecting any unknown offer that could name a *list*
+  of identities (array/nested/multi-field/non-string-tag), on the claim path and
+  both hold-response paths, with forward-compat for a single-locator transport
+  preserved (a multi-field future transport is a disclosed hard-reject). The
+  no-enumeration invariant is therefore discharged **at the schema level** for both
+  paths (a list of identities is inexpressible), but **not literally**: a single
+  identity-shaped **string** can still ride via the tag, an extra field name, or
+  the value. That **TEXT residual is owned by TASK-227** — distinct from **TASK-223**
+  (byte VOLUME, the ~744× padding): a byte cap does not eliminate identity naming,
+  since one accepted unasked identity is already the defect. Per orchestrator
+  arbitration the residual is format-cleanliness (a hostile responder naming fake
+  identities is not an honest-peer-holdings leak), hence Low urgency but a real
+  defect to own; literal closure is possible at a forward-compat cost.
 - TASK-120 must freeze a hashed, typed, **complete and owner-reviewed** budget
   artifact for every profile with numeric upload bytes/rate, concurrent serves,
   transient RAM, metadata/disk, fd, discovery work/traffic/deadline and

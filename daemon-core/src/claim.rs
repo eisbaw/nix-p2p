@@ -25,10 +25,11 @@
 //!     longer name a LIST of identities either (task-224): the shared
 //!     tolerate-drop decoder rejects an unknown offer whose SHAPE (array, nested
 //!     object, or more than one scalar field) could name unqueried identities.
-//!     A residual remains, NOT closed: the one tolerated opaque scalar is
-//!     unbounded, so identities delimiter-crammed into a single string are still
-//!     accepted - a byte-volume channel owned by task-223, strictly more
-//!     permissive than a type-validated known-transport locator.
+//!     A TEXT residual remains, NOT closed (task-227): a single opaque scalar of
+//!     identity-shaped text can still ride in an accepted unknown offer via its
+//!     tag, an extra field name, or its string value - strictly more permissive
+//!     than a type-validated known-transport locator. (Distinct from task-223,
+//!     which bounds byte VOLUME, not identity naming.)
 //!
 //! ## DHT-is-rendezvous model (why the claim is NOT a DHT record)
 //!
@@ -53,11 +54,16 @@
 //! needed here, so the mechanism was REMOVED rather than patched again. Two axes
 //! remain, and both fail loud or drop - never carry:
 //!
-//!   * Unknown KIND/transport, same schema_version: TOLERATED BUT INERT. Decode
-//!     succeeds; an unknown payload kind yields a claim with NO usable content id
-//!     (`payload == None`), an unknown transport offer is DROPPED from the set.
-//!     The unknown is NOT retained and NOT re-serialized (no `Value` kept). A
-//!     KNOWN kind with MALFORMED fields is still a hard ERROR (the task-13 fix).
+//!   * Unknown KIND/transport, same schema_version: TOLERATED BUT INERT, IF its
+//!     shape is minimal. Decode succeeds; an unknown payload kind yields a claim
+//!     with NO usable content id (`payload == None`), and an unknown transport
+//!     offer of a minimal shape (a string tag + at most one scalar string locator)
+//!     is DROPPED from the set. The unknown is NOT retained and NOT re-serialized
+//!     (no `Value` kept). An unknown transport offer that could name a LIST of
+//!     identities (array/nested/multiple fields, or a non-string tag) is a hard
+//!     ERROR, not dropped (TASK-224); a single identity-shaped string can still
+//!     ride via the tag/field-name/value (TEXT residual, TASK-227). A KNOWN kind
+//!     with MALFORMED fields is still a hard ERROR (the task-13 fix).
 //!   * Wrong schema_version: a hard network-split boundary. [`decode_claim`] /
 //!     [`decode_hold_query`] / [`decode_hold_response`] REJECT it cleanly. Real
 //!     v2 evolution BUMPS `schema_version` - that is what the version field is
@@ -347,7 +353,11 @@ const KNOWN_TRANSPORT_TAGS: &[&str] = &["iroh", "bittorrent"];
 /// anything we EMIT (the golden encoding vectors are byte-identical), and it is
 /// consistent with the existing rule that a MALFORMED known transport is a hard
 /// error rather than a dropped one. Unknown transport KINDS are still tolerated
-/// and dropped; that is the forward-compatibility seam and it is untouched.
+/// and dropped - that is the forward-compatibility seam - but the seam is NO
+/// LONGER untouched: TASK-224 narrowed it so an unknown offer that could name a
+/// LIST of identities (array/nested/multiple fields, or a non-string tag) is now
+/// rejected (see [`reject_enumeration_shaped_unknown_offer`]); a single
+/// identity-shaped string can still ride through it (TEXT residual, TASK-227).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "transport", rename_all = "snake_case")]
 #[serde(deny_unknown_fields)]
@@ -433,13 +443,16 @@ impl KnownTransport {
 /// executable probe at the TASK-110 re-gate.
 ///
 /// ## The rule (approach A: a whitelisted minimal shape, REJECT on violation)
-/// A tolerated unknown-kind offer is an OBJECT carrying the `transport` tag and
-/// AT MOST ONE other field, whose value must be a SCALAR STRING (a single opaque
-/// locator). Any ARRAY, any NESTED OBJECT, any NON-STRING extra value, a SECOND
-/// non-`transport` field, or an array/object in the `transport` slot itself
-/// REJECTS the whole decode - it is not silently dropped, because
-/// accepting-then-dropping a wire that NAMED identities is itself the defect, so
-/// the wire must be un-acceptable, not merely un-used.
+/// A tolerated unknown-kind offer is an OBJECT whose `transport` tag is PRESENT
+/// and a STRING, carrying AT MOST ONE other field whose value must be a SCALAR
+/// STRING (a single opaque locator). Any ARRAY, any NESTED OBJECT, any NON-STRING
+/// extra value, a SECOND non-`transport` field, or an absent/null/number/boolean/
+/// array/object `transport` tag REJECTS the whole decode - it is not silently
+/// dropped, because accepting-then-dropping a wire that NAMED a list of identities
+/// is itself the defect, so the wire must be un-acceptable, not merely un-used.
+/// (The string-tag requirement is a strict allowlist: a tolerated kind must
+/// POSITIVELY declare itself, not slip in by an absent or non-string tag that the
+/// old code mapped to an empty tag and accepted.)
 ///
 /// ## Two disclosed costs of this narrowing (it is not free)
 /// 1. FORWARD-COMPAT REGRESSION vs TASK-110 AC#4. The old seam tolerated an
@@ -457,29 +470,52 @@ impl KnownTransport {
 ///    golden-accepted wire uses that shape, so nothing legitimate breaks, but it
 ///    is behaviour beyond the strictly-named scope, recorded here deliberately.
 ///
-/// ## What this closes, what it does NOT, and why NOT a byte cap
+/// ## What this closes, and the TEXT residual it does NOT (TASK-227)
 /// This removes the FORMAT-LEVEL affordance to express a LIST of identities: an
 /// array, a nested object, or a second scalar field can no longer appear, so
 /// volunteering a list of holdings is INEXPRESSIBLE in the schema. That is the
-/// structural half - the exact shape codex's probe used.
+/// structural half - the exact shape codex's probe used - and it is closed on all
+/// three tolerate-drop routes.
 ///
-/// It is NOT literal parity with a known transport, and this doc must not claim
-/// it is. A known transport's locator is TYPE-VALIDATED and fixed-length
-/// (`iroh`'s `node` is exactly 64 hex chars via `NodeId::from_str`;
-/// `bittorrent`'s `infohash` likewise), so a crammed string simply fails to
-/// parse - it has NO cramming residual. The single scalar tolerated here is
-/// arbitrary-length and arbitrary-content (we cannot validate a format we do not
-/// know), so it is STRICTLY MORE PERMISSIVE: a hostile
-/// `{"transport":"future","loc":"blake3:a,blake3:b,..."}` is still ACCEPTED and
-/// still names identities as raw text. That residual is a BYTE-VOLUME channel
-/// (how many delimited identities fit scales with bytes, bounded only by
-/// [`MAX_CLAIM_WIRE_BYTES`]); it is deliberately left to TASK-223's per-offer
-/// byte cap, NOT closed here. No length cap is added in this task because (a) a
-/// cap does not change the KIND of the residual - codex already showed a byte
-/// cap still admits several SHORT identities per slot - and (b) a legitimate
-/// future locator may itself be large and needs its own forward-compat analysis
-/// (the recorded TASK-110/223 rationale). So: structural list-affordance CLOSED;
-/// crammable unbounded-scalar residual OPEN and owned by TASK-223.
+/// It is NOT literal closure of no-enumeration, and this doc must not claim it is.
+/// A single opaque scalar of identity-shaped TEXT can still ride in an ACCEPTED
+/// unknown offer through THREE channels, none of which this rule forecloses:
+///   1. the transport TAG itself - any string kind not in [`KNOWN_TRANSPORT_TAGS`]
+///      is tolerated, so `{"transport":"blake3:<64hex>"}` is accepted;
+///   2. an extra FIELD NAME - `{"transport":"future","blake3:<64hex>":"x"}` has one
+///      string-valued field and is accepted (the NAME is unconstrained);
+///   3. the single scalar VALUE - `{"transport":"future","loc":"blake3:a,blake3:b"}`
+///      crams identities as delimited text and is accepted.
+///
+/// Each is accepted-then-dropped, and even ONE accepted unasked identity is the
+/// claim.rs:332 defect. So the invariant is discharged at the SCHEMA level (a list
+/// is inexpressible) but NOT literally.
+///
+/// This is unlike a KNOWN transport, whose locator is TYPE-VALIDATED and
+/// fixed-length (`iroh`'s `node` is exactly 64 hex via `NodeId::from_str`;
+/// `bittorrent`'s `infohash` likewise), so identity-shaped junk simply fails to
+/// parse - it has NO text residual. The tolerated unknown scalar is
+/// arbitrary-content (we cannot validate a format we do not know), so it is
+/// STRICTLY MORE PERMISSIVE.
+///
+/// This residual is NOT owned by TASK-223. TASK-223 is byte-VOLUME only (a
+/// per-offer byte cap bounds how many bytes fit); it does NOT ELIMINATE identity
+/// naming - a byte cap still admits one (or a few short) identities per slot, and
+/// one is already the defect. Elimination across all three channels is owned by
+/// TASK-227. No cap is added HERE because (a) a cap changes the volume, not the
+/// KIND, of the residual, and (b) literal closure is an architectural
+/// forward-compat fork (reject identity-shaped tokens / cap below one identity /
+/// tag-only registered kinds - each with a real forward-compat cost) that
+/// TASK-227 must decide deliberately and DEEP-gate. NOTE: literal closure IS
+/// possible - it is the arbitrary-string forward-compat CONTRACT, not the frozen
+/// golden (which pins one `carrier_pigeon` input), that admits the residual; the
+/// contract can be tightened at a cost, which is precisely TASK-227's fork.
+///
+/// THREAT MODEL (orchestrator arbitration): this residual is a FORMAT-CLEANLINESS
+/// gap by the repo's own claim.rs:332 rule, NOT a live privacy leak - a hostile
+/// RESPONDER naming FAKE identities to an asker reveals nothing about any HONEST
+/// peer's secret holdings. Hence TASK-227 is Low urgency, but still a real defect
+/// to own.
 ///
 /// Applied at BOTH tolerate-drop decoders via this one helper
 /// ([`deserialize_known_transports`] for [`Claim::transports`],
@@ -487,33 +523,44 @@ impl KnownTransport {
 /// offer dictionaries), so the rule lives once (like [`KNOWN_TRANSPORT_TAGS`])
 /// and the two cannot drift - asserted by
 /// `the_slot_and_drop_transport_decoders_agree`. Pinned by
-/// `an_unknown_kind_offer_cannot_name_content_ids_on_the_wire_on_both_paths` and
-/// the golden `reject_*_unknown_transport_names_content_ids` vectors.
+/// `an_unknown_kind_offer_cannot_name_content_ids_on_the_wire_on_both_paths` (the
+/// list form), `an_unknown_offer_with_a_non_string_tag_is_rejected` (the
+/// string-tag clause), the golden `reject_*_unknown_transport_names_content_ids`
+/// and `reject_*_non_string_tag` vectors; the TEXT
+/// residual is documented OPEN by
+/// `an_unknown_kind_offer_text_residual_is_documented_not_closed` and owned by
+/// TASK-227.
 fn reject_enumeration_shaped_unknown_offer(value: &Value) -> Result<(), String> {
     let obj = value
         .as_object()
         .ok_or_else(|| "an unknown-kind transport offer must be a JSON object".to_string())?;
+    // STRICT ALLOWLIST: the tag slot must be PRESENT and a STRING. An absent /
+    // null / number / boolean `transport` used to map to an empty tag and be
+    // ACCEPTED (`{"transport":7,"loc":"opaque"}` decoded); an array/object there
+    // is a smuggling channel of its own. A tolerated unknown offer must positively
+    // declare a string kind, not be admitted by omission.
+    match obj.get("transport") {
+        Some(Value::String(_)) => {}
+        _ => {
+            return Err(
+                "an unknown-kind transport offer's `transport` tag must be present and a \
+                 string; an absent, null, numeric, boolean, array, or object tag is refused \
+                 (only a positively-declared string kind is tolerated for forward compat)"
+                    .to_string(),
+            );
+        }
+    }
     let mut extra_fields = 0usize;
     for (field_name, field_value) in obj {
         if field_name == "transport" {
-            // The tag slot must be a bare scalar (a string, or absent/non-string
-            // which decodes to an empty tag). An array or object THERE would be a
-            // smuggling channel of its own.
-            if field_value.is_array() || field_value.is_object() {
-                return Err(
-                    "an unknown-kind transport offer's `transport` tag is an array or object; \
-                     that can name content identities the asker never queried"
-                        .to_string(),
-                );
-            }
             continue;
         }
         extra_fields += 1;
         if extra_fields > 1 {
             return Err(format!(
                 "an unknown-kind transport offer carries more than one field besides \
-                 `transport` (`{field_name}` is a second); at most one bounded scalar string \
-                 locator is tolerated, or it could name content identities the asker never \
+                 `transport` (`{field_name}` is a second); at most one scalar string locator \
+                 is tolerated, or it could name a LIST of content identities the asker never \
                  queried"
             ));
         }
@@ -521,9 +568,7 @@ fn reject_enumeration_shaped_unknown_offer(value: &Value) -> Result<(), String> 
             return Err(format!(
                 "an unknown-kind transport offer field `{field_name}` is not a scalar string; \
                  an array or nested object is a LIST affordance for naming several content \
-                 identities at once, which the schema must not express (a single string is \
-                 tolerated as one opaque locator, though its bytes are still bounded only by \
-                 the frame - task-223)"
+                 identities at once, which the schema must not express"
             ));
         }
     }
@@ -548,10 +593,11 @@ fn reject_enumeration_shaped_unknown_offer(value: &Value) -> Result<(), String> 
 /// unknown-KIND path. A well-shaped unknown offer (`transport` tag + at most one
 /// scalar string locator) still decodes INERTLY (dropped); a plausible future
 /// SINGLE-locator transport is preserved, a future MULTI-field one is now
-/// rejected (see the helper doc's disclosed costs). The unbounded single scalar
-/// is still delimiter-crammable (byte-volume residual, task-223). The identical
-/// rule guards [`deserialize_transport_slots`] (the shared hold-response path);
-/// the two are kept in step by `the_slot_and_drop_transport_decoders_agree`.
+/// rejected (see the helper doc's disclosed costs). A TEXT residual remains
+/// (task-227): identity-shaped text can still ride in the tag, a field name, or
+/// the single string value. The identical rule guards
+/// [`deserialize_transport_slots`] (the shared hold-response path); the two are
+/// kept in step by `the_slot_and_drop_transport_decoders_agree`.
 fn deserialize_known_transports<'de, D>(deserializer: D) -> Result<Vec<KnownTransport>, D::Error>
 where
     D: serde::Deserializer<'de>,
@@ -692,8 +738,9 @@ pub struct HoldQuery {
 /// content identities either (task-224): the shared tolerate-drop decoder
 /// rejects an unknown offer whose SHAPE could name unqueried identities (see
 /// [`reject_enumeration_shaped_unknown_offer`]). A well-shaped unknown transport
-/// offer is still dropped on decode (tolerated but inert); its one unbounded
-/// scalar is still delimiter-crammable (byte-volume residual, task-223).
+/// offer is still dropped on decode (tolerated but inert); a TEXT residual
+/// remains (task-227): identity-shaped text via the tag, a field name, or the
+/// single string value.
 ///
 /// ## Bounded to ONE offer per transport KIND (task-110 freeze amendment)
 ///
@@ -713,7 +760,8 @@ pub struct HoldQuery {
 /// closed SEPARATELY (TASK-224, [`reject_enumeration_shaped_unknown_offer`]): an
 /// unknown offer whose shape (array / nested object / multiple scalar fields)
 /// could name a LIST of identities is REJECTED, so it cannot list-smuggle on the
-/// wire (a single crammed scalar residual remains, task-223).
+/// wire (a TEXT residual - single identity-shaped strings via tag/field-name/
+/// value - remains, owned by task-227; the byte VOLUME is task-223).
 /// This COUNT bound does NOT bound the message BYTES: a well-shaped unknown-kind
 /// slot still has a byte-unbounded single scalar, so a hostile peer can still pad
 /// a single-key `Have` up to [`MAX_CLAIM_WIRE_BYTES`] (64 KiB) with
@@ -876,10 +924,11 @@ pub const MAX_OFFERS_PER_ANSWER: usize = 4;
 /// structure. Nor can a Have's unknown-KIND offer name a LIST of unqueried hashes
 /// anymore (task-224): the shared decoder rejects an unknown offer whose SHAPE
 /// (array/nested/multi-field) could name identities (see
-/// [`reject_enumeration_shaped_unknown_offer`]). A byte-volume residual remains -
-/// the one tolerated opaque scalar is unbounded and delimiter-crammable
-/// (task-223) - so a batch reveals AT MOST what N single [`HoldQuery`] probes
-/// would, plus that residual; it removes the round trips. There is still no
+/// [`reject_enumeration_shaped_unknown_offer`]). A TEXT residual remains
+/// (task-227): identity-shaped text can still ride in an accepted unknown offer
+/// via its tag, an extra field name, or its single string value - so a batch
+/// reveals AT MOST what N single [`HoldQuery`] probes would, plus that residual;
+/// it removes the round trips. There is still no
 /// message in this module that asks a peer "what do you have?", and that remains
 /// structural, not a policy. (The
 /// privacy invariant being protected is that store-path names are secrets: a node
@@ -910,8 +959,9 @@ pub struct BatchHoldQuery {
 /// [`reject_enumeration_shaped_unknown_offer`] before the slot is dropped, so an
 /// unknown offer that would name a LIST of identities (an array, a nested object,
 /// more than one scalar field) is REJECTED rather than accepted-then-dropped. A
-/// well-shaped unknown offer still leaves an inert `Unknown` slot; its one
-/// unbounded scalar remains delimiter-crammable (byte-volume residual, task-223).
+/// well-shaped unknown offer still leaves an inert `Unknown` slot; a TEXT residual
+/// remains (task-227): identity-shaped text via the tag, a field name, or the
+/// single string value.
 /// Proven identical across the batch and single-key paths (and the claim path) by
 /// `an_unknown_kind_offer_cannot_name_content_ids_on_the_wire_on_both_paths` and
 /// `the_slot_and_drop_transport_decoders_agree`.
@@ -947,10 +997,11 @@ where
                     .map_err(serde::de::Error::custom)?,
             ));
         } else {
-            // An absent or non-string `transport` has no kind at all; it still
-            // occupies a slot (indices must not shift) and is still dropped - but
-            // only if its SHAPE cannot name content identities (TASK-224); an
-            // enumeration-shaped unknown offer is a hard error, not a silent drop.
+            // An unknown string kind still occupies a slot (indices must not
+            // shift) and is dropped - but only if its SHAPE cannot name a LIST of
+            // content identities (TASK-224); an enumeration-shaped unknown offer,
+            // or one whose `transport` tag is absent/non-string, is a hard error,
+            // not a silent drop. So a tolerated slot always has a real string tag.
             reject_enumeration_shaped_unknown_offer(&value).map_err(serde::de::Error::custom)?;
             slots.push(OfferSlot::Unknown(tag.unwrap_or_default().to_string()));
         }
@@ -1301,8 +1352,8 @@ fn compact_offer_slots(
 ///      seam to a whitelisted minimal shape so it can no longer NAME a LIST of
 ///      identities (array/nested/multi-field), keeping inert decode for a
 ///      plausible single-locator transport but hard-rejecting a multi-field
-///      future one (a disclosed cost); a crammed single scalar is still a
-///      byte-volume residual (task-223). See below.
+///      future one (a disclosed cost); a single identity-shaped string via the
+///      tag/field-name/value is still a TEXT residual (task-227). See below.
 ///   3. IT COSTS NOTHING WHILE NO PEERS ARE DEPLOYED. There is no released
 ///      network to break; the cost of tightening is zero today and rises
 ///      monotonically. Tightening later is a real break; tightening now is not.
@@ -1320,18 +1371,19 @@ fn compact_offer_slots(
 /// This bound is the COUNT/kind half of enumeration. Two further vectors, both
 /// PRE-EXISTING and both SHARED with the batch path, were NOT closed HERE:
 ///
-/// A. ENUMERATION via the unknown-KIND slot (TASK-224 closed the STRUCTURAL half;
-///    a byte-volume residual remains, see [`reject_enumeration_shaped_unknown_offer`]).
-///    An unknown transport used to be retained as an opaque `serde_json::Value`
-///    (only its `transport` tag read), so a hostile peer could name content
-///    identities inside it (`{"transport":"future","content_ids":[..]}`) and the
-///    message was ACCEPTED (then dropped). TASK-224 narrowed the shared
-///    tolerate-drop decoder to a whitelisted minimal shape (tag + at most one
-///    scalar string locator), so an array/nested/multi-field unknown offer is now
-///    REJECTED - the STRUCTURAL `also_held` list vector, closed on the unknown-KIND
-///    path. NOT literal parity with a known transport: the one tolerated scalar is
-///    unbounded/unvalidated, so a delimiter-crammed single string still names
-///    identities as raw text (byte-volume residual, TASK-223). Pinned by
+/// A. ENUMERATION via the unknown-KIND slot (TASK-224 closed the STRUCTURAL/list
+///    half; a TEXT residual remains, owned by TASK-227 - see
+///    [`reject_enumeration_shaped_unknown_offer`]). An unknown transport used to be
+///    retained as an opaque `serde_json::Value` (only its `transport` tag read),
+///    so a hostile peer could name a LIST of content identities inside it
+///    (`{"transport":"future","content_ids":[..]}`) and the message was ACCEPTED
+///    (then dropped). TASK-224 narrowed the shared tolerate-drop decoder to a
+///    whitelisted minimal shape (string tag + at most one scalar string locator),
+///    so an array/nested/multi-field unknown offer is now REJECTED - the STRUCTURAL
+///    `also_held` list vector, closed on the unknown-KIND path. NOT literal
+///    closure: a single identity-shaped string can still ride via the tag, an
+///    extra field name, or the value (TEXT residual, TASK-227 - NOT a byte cap,
+///    since one accepted identity is already the defect). Pinned by
 ///    `an_unknown_kind_offer_cannot_name_content_ids_on_the_wire_on_both_paths`.
 /// B. BYTE amplification (TASK-223, still OPEN). This is a COUNT bound, not a BYTE
 ///    bound: a well-shaped unknown-kind slot still has a byte-unbounded single
@@ -1341,9 +1393,12 @@ fn compact_offer_slots(
 ///    hostile worst case; do not read it as the latter. Pinned by
 ///    `a_padded_unknown_kind_have_still_saturates_the_frame_and_decodes_empty`. A
 ///    per-offer byte cap is deferred (a future transport's legitimate locator may
-///    itself be large, needing its own forward-compat analysis); it is orthogonal
-///    to A - TASK-224 closes naming a LIST of identities (structure), TASK-223 would
-///    bound the BYTE volume of the one opaque locator that remains.
+///    itself be large, needing its own forward-compat analysis). Three DISTINCT
+///    concerns, three owners: TASK-224 closes naming a LIST (structure); TASK-227
+///    owns eliminating identity-shaped TEXT in the one remaining scalar
+///    (tag/field-name/value); TASK-223 owns bounding the BYTE VOLUME. A byte cap
+///    (223) does not discharge 227: one accepted short identity is already the
+///    defect.
 ///
 /// The COUNT/kind rule is this task's scope, matching the batch path's SEMANTIC
 /// bound; that is what this does. The enumeration SHAPE rule (A) is TASK-224's.
@@ -2481,11 +2536,13 @@ mod tests {
         // AFTER (the LEGITIMATE case, NOT the hostile worst case): the largest
         // SENDABLE known-only answer is one offer per known kind (iroh +
         // bittorrent). Measured through the real encoder. This bound closes the
-        // KNOWN-offer count/enumeration. The unknown-KIND content-id smuggling
-        // vector is now ALSO closed, separately (TASK-224,
+        // KNOWN-offer count/enumeration. The unknown-KIND content-id LIST vector is
+        // now ALSO closed, separately (TASK-224 structural half,
         // `an_unknown_kind_offer_cannot_name_content_ids_on_the_wire_on_both_paths`).
-        // One residual remains, pinned separately: hostile byte padding of a single
-        // well-shaped opaque locator (~744x, TASK-223,
+        // TWO residuals remain, pinned separately and DISTINCT: the TEXT residual -
+        // a single identity-shaped string via tag/field-name/value (TASK-227,
+        // `an_unknown_kind_offer_text_residual_is_documented_not_closed`) - and
+        // hostile byte padding volume (~744x, TASK-223,
         // `a_padded_unknown_kind_have_still_saturates_the_frame_and_decodes_empty`).
         let after = HoldResponse {
             schema_version: QUERY_SCHEMA_VERSION,
@@ -2525,7 +2582,9 @@ mod tests {
         // in the decoded VALUE), the unknown kind dropped inertly - and, since
         // task-224, the WIRE can no longer NAME A LIST of identities in the slot
         // (only ONE opaque scalar; the LIST form is rejected - see the note below +
-        // the sibling parity test). The BYTE volume of that one scalar is TASK-223.
+        // the sibling parity test). Two DISTINCT residuals remain on that one
+        // scalar: identity-shaped TEXT in it (TASK-227) and its BYTE volume
+        // (TASK-223); this test measures the BYTE volume.
         let query_len = 88usize; // the pinned single-key query size
         let pad_len = 60_000; // one fat unknown offer, comfortably under the 64 KiB frame
         let wire = format!(
@@ -2549,15 +2608,15 @@ mod tests {
         // only by the pre-existing frame gate). Magnitude, no float in the check:
         // wire.len() > 600 * query_len (~680x here). This offer is WELL-SHAPED under
         // TASK-224 (the tag plus ONE scalar string `loc`), so the structural
-        // enumeration rule admits it. What remains is BYTE volume - and note that
-        // "padding" need not be filler: the same unbounded scalar could hold a
-        // delimiter-crammed LIST of identities as raw text (e.g. "blake3:a,blake3:b,
-        // ..."), still accepted. TASK-224 forbids the STRUCTURED list form (array /
-        // nested / multiple fields), pinned by
-        // `an_unknown_kind_offer_cannot_name_content_ids_on_the_wire_on_both_paths`,
-        // but NOT the text-crammed single scalar - that is strictly more permissive
-        // than a type-validated known-transport locator and is TASK-223's job
-        // (bounding the bytes of the one remaining opaque scalar).
+        // enumeration rule admits it. What this test measures is BYTE volume
+        // (TASK-223). Note that "padding" need not be filler: the same scalar could
+        // hold a delimiter-crammed list of identities as raw text
+        // (e.g. "blake3:a,blake3:b,..."), still accepted - but that is the identity-
+        // naming TEXT residual (TASK-227), a DIFFERENT concern from the byte volume
+        // and NOT dischargeable by a byte cap (one accepted identity is already the
+        // defect). TASK-224 forbids only the STRUCTURED list form (array / nested /
+        // multiple fields), pinned by
+        // `an_unknown_kind_offer_cannot_name_content_ids_on_the_wire_on_both_paths`.
         assert_eq!(
             decoded.answer,
             HoldAnswer::Have {
@@ -2586,8 +2645,9 @@ mod tests {
         // AND that it is IDENTICAL across the single-key and batch decoders (the
         // shared `deserialize_transport_slots`), so neither path can list-smuggle.
         // SCOPE (honest): it does NOT prove the invariant is LITERALLY closed - a
-        // single unbounded scalar can still delimiter-cram identities as text
-        // (byte-volume residual, task-223); this test bites the array/list form.
+        // single identity-shaped string can still ride via the tag, a field name,
+        // or the value (TEXT residual, task-227); this test bites the array/list
+        // form only.
         //
         // BITE (AC): removing the `reject_enumeration_shaped_unknown_offer` call in
         // `deserialize_transport_slots` re-opens the gap and BOTH asserts below go
@@ -2661,6 +2721,106 @@ mod tests {
                 .is_empty(),
             "batch parity: a one-scalar-locator unknown offer stays inert (forward-compat)"
         );
+    }
+
+    #[test]
+    fn an_unknown_offer_with_a_non_string_tag_is_rejected() {
+        // TASK-224 strict-allowlist tightening: a tolerated unknown kind must
+        // POSITIVELY declare itself with a STRING `transport` tag. An absent, null,
+        // numeric, boolean, array, or object tag used to map to an empty tag and be
+        // ACCEPTED (e.g. `{"transport":7,"loc":"opaque"}` decoded) - a smuggling
+        // channel of its own. Each such offer must now be REJECTED, on all three
+        // routes. BITE: neutralising `reject_enumeration_shaped_unknown_offer`
+        // re-accepts every one of these.
+        let bad_offers = [
+            r#"{"transport":7,"loc":"opaque"}"#,       // numeric tag
+            r#"{"transport":null,"loc":"opaque"}"#,    // null tag
+            r#"{"loc":"opaque"}"#,                     // absent tag
+            r#"{"transport":["blake3:x"],"loc":"y"}"#, // array tag (smuggling)
+            r#"{"transport":{"k":"v"},"loc":"y"}"#,    // object tag (smuggling)
+            r#"{"transport":true}"#,                   // boolean tag
+        ];
+        for offer in bad_offers {
+            // single-key path
+            let single = format!(
+                "{{\"schema_version\":{QUERY_SCHEMA_VERSION},\"answer\":\"have\",\
+                 \"blake3\":\"{BLAKE3_HEX}\",\"offers\":[{offer}]}}"
+            );
+            assert!(
+                matches!(
+                    decode_hold_response(single.as_bytes()),
+                    Err(ClaimCodecError::Malformed(_))
+                ),
+                "single-key must REJECT a non-string/absent transport tag: {offer}"
+            );
+            // batch path
+            let batch = format!(
+                "{{\"schema_version\":{QUERY_SCHEMA_VERSION},\"offers\":[{offer}],\
+                 \"answers\":[{{\"answer\":\"have\",\"blake3\":\"{BLAKE3_HEX}\",\
+                 \"offer_indices\":[0]}}]}}"
+            );
+            assert!(
+                matches!(
+                    decode_batch_hold_response(batch.as_bytes(), 1),
+                    Err(ClaimCodecError::Malformed(_))
+                ),
+                "batch must REJECT a non-string/absent transport tag: {offer}"
+            );
+            // claim path
+            let claim = format!(
+                "{{\"schema_version\":{CLAIM_SCHEMA_VERSION},\"key\":\"{KEY_HEX}\",\
+                 \"payload\":{{\"kind\":\"whole_nar\",\"blake3\":\"{BLAKE3_HEX}\"}},\
+                 \"holders\":[],\"transports\":[{offer}]}}"
+            );
+            assert!(
+                matches!(
+                    decode_claim(claim.as_bytes()),
+                    Err(ClaimCodecError::Malformed(_))
+                ),
+                "claim must REJECT a non-string/absent transport tag: {offer}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_unknown_kind_offer_text_residual_is_documented_not_closed() {
+        // HONESTY ORACLE (TASK-227 residual). TASK-224 closes only the STRUCTURAL
+        // LIST form. A single opaque scalar of IDENTITY-SHAPED TEXT still rides in
+        // an ACCEPTED unknown offer through THREE channels; each decodes to EMPTY
+        // offers (the unknown kind is dropped) but was ACCEPTED on the wire, and one
+        // accepted unasked identity is already the claim.rs:332 defect. This test
+        // PINS that the residual is OPEN, so when TASK-227 closes it these flip from
+        // accept to reject and this oracle must be updated deliberately. It is a
+        // format-cleanliness gap (a hostile responder naming FAKE ids leaks nothing
+        // about an honest peer), not a live privacy leak - hence documented, not a
+        // regression bar.
+        let id = format!("blake3:{}", "c".repeat(64));
+        let residual_offers = [
+            // 1. the TAG channel: an identity-shaped string kind not in the known set
+            format!("{{\"transport\":\"{id}\"}}"),
+            // 2. the FIELD-NAME channel: the extra field's NAME is an identity
+            format!("{{\"transport\":\"future\",\"{id}\":\"x\"}}"),
+            // 3. the VALUE channel: the single scalar value crams two identities
+            format!("{{\"transport\":\"future\",\"loc\":\"{id},{id}\"}}"),
+        ];
+        for offer in residual_offers {
+            let single = format!(
+                "{{\"schema_version\":{QUERY_SCHEMA_VERSION},\"answer\":\"have\",\
+                 \"blake3\":\"{BLAKE3_HEX}\",\"offers\":[{offer}]}}"
+            );
+            let decoded = decode_hold_response(single.as_bytes()).unwrap_or_else(|e| {
+                panic!("TASK-227 residual: this identity-shaped text is STILL accepted today ({offer}): {e:?}")
+            });
+            assert_eq!(
+                decoded.answer,
+                HoldAnswer::Have {
+                    blake3: blake3_id(),
+                    offers: vec![],
+                },
+                "the unknown kind is dropped from the value, but the identity-shaped \
+                 TEXT was accepted on the wire (TASK-227 residual): {offer}"
+            );
+        }
     }
 
     #[test]

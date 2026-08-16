@@ -59,11 +59,14 @@
 //! nothing about a key Y an honest peer also holds (proven by test, for both
 //! forms). The unknown-KIND decoder path is narrowed too (task-224): the shared
 //! tolerate-drop decoder REJECTS an unknown offer whose SHAPE (array / nested
-//! object / multiple scalar fields) could name a LIST of unqueried identities, so
-//! the schema-level list-smuggling vector is closed. A byte-volume residual
-//! remains (NOT closed): the one tolerated opaque scalar is unbounded, so a
-//! hostile peer can still delimiter-cram identities into a single string, bounded
-//! only by the 64 KiB frame - owned by task-223.
+//! object / multiple scalar fields, or a non-string tag) could name a LIST of
+//! unqueried identities, so the schema-level list-smuggling vector is closed.
+//! A TEXT residual remains (NOT closed, task-227): a single identity-shaped
+//! string can still ride in an accepted unknown offer via its tag, an extra field
+//! name, or its string value. Note (orchestrator arbitration): this is
+//! format-cleanliness by the repo's own claim.rs rule, not an honest-peer-holdings
+//! leak - a hostile RESPONDER naming FAKE identities reveals nothing about any
+//! honest peer. (Distinct from task-223, which bounds byte VOLUME.)
 //!
 //! ## Bounded miss (the real correctness point)
 //!
