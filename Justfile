@@ -270,6 +270,11 @@ package:
 # any one of them makes a whole capability unguarded in the common loop:
 #   s1-byte-and-counts    the core S1 acceptance signal - byte identity + the
 #                         upstream-hit counts every other oracle is paired against
+#   narinfo-default-cache-offload  TASK-29: the default-on daemon narinfo cache
+#                         offloads the REPEAT narinfo (0 upstream PAIRED with N
+#                         served-locally), with an --no-narinfo-cache negative
+#                         control that reddens the oracle - the only scenario
+#                         guarding the narinfo-offload path
 #   s2-fallback           daemon down -> nix still resolves (the additive invariant)
 #   tamper-narhash        THE SAFETY BITE. Deliberately kept in the fast set: it
 #                         proves nix REJECTS mutated content, and a fast gate that
@@ -296,7 +301,7 @@ package:
 #   * There is a ~11s floor per scenario (pod setup), so the COUNT of scenarios
 #     dominates the cost far more than which ones are chosen. Adding a sixth
 #     "cheap" scenario here costs ~11s, not ~1s.
-E2E_FAST := "--only s1-byte-and-counts --only s2-fallback --only tamper-narhash --only chain-s1-and-counts --only s6-p2p"
+E2E_FAST := "--only s1-byte-and-counts --only narinfo-default-cache-offload --only s2-fallback --only tamper-narhash --only chain-s1-and-counts --only s6-p2p"
 
 # Run the fast breadth-first e2e subset (5 scenarios) - the common pre-commit loop.
 e2e: _headroom _python fixtures-large

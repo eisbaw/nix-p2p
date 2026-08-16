@@ -75,13 +75,21 @@ in
 
     narinfoCacheDir = lib.mkOption {
       type = lib.types.nullOr lib.types.str;
-      default = null;
+      default = "/var/lib/nix-p2p/narinfo";
       description = ''
-        Optional persistent narinfo disk-cache directory (daemon task-8). Off by
-        default in wave 1 so enabling it is a separate, reviewable change
-        (task-29 wires a default and re-asserts the e2e AC). When set with the
-        default DynamicUser sandbox the directory must be writable by the
-        service - prefer a StateDirectory-managed path.
+        Persistent narinfo disk-cache directory (daemon task-8). ON BY DEFAULT
+        (TASK-29): a fresh service persists narinfo across restarts, so a warm
+        daemon serves the repeat narinfo locally instead of re-fetching upstream
+        (TASK-28 moved the fsync off the async worker, making default-enabling
+        safe). The default lives ONE LEVEL BELOW the `StateDirectory`-managed
+        `/var/lib/nix-p2p` (which the DynamicUser owns and can write); the daemon
+        creates the `narinfo/` subdir. Set to `null` to turn the cache OFF (the
+        module then passes `--no-narinfo-cache`). CAUTION: a CUSTOM path (anything
+        other than the default) is treated as EXPLICIT, so if the DynamicUser cannot
+        write it the daemon fails fast and systemd restart-loops - point it at a
+        StateDirectory / `ReadWritePaths` the service owns. Privacy note: which narinfos were
+        fetched are now recorded on LOCAL disk - a local, re-derivable, count-capped
+        cache, not a network disclosure; TASK-120 will refine the state-dir/mode.
       '';
     };
 
@@ -232,10 +240,16 @@ in
             "--upstream"
             cfg.upstream
           ]
-          ++ lib.optionals (cfg.narinfoCacheDir != null) [
-            "--narinfo-cache-dir"
-            cfg.narinfoCacheDir
-          ]
+          # TASK-29: the narinfo cache is default-on. A concrete dir passes
+          # `--narinfo-cache-dir`; `null` is an explicit opt-out that passes
+          # `--no-narinfo-cache` (never relying on the daemon's built-in default,
+          # since $HOME under DynamicUser is not a dependable write target).
+          ++ (
+            if cfg.narinfoCacheDir != null then
+              [ "--narinfo-cache-dir" cfg.narinfoCacheDir ]
+            else
+              [ "--no-narinfo-cache" ]
+          )
           # libp2p P2P node flags (TASK-207). Empty unless `libp2p.enable`, so the
           # wave-1 HTTP-only service is byte-identical when libp2p is off. Each list
           # option expands to its repeatable flag; the scalars append when set.
@@ -264,11 +278,15 @@ in
         # No ambient privilege: the daemon only opens a loopback socket and an
         # outbound HTTP connection.
         DynamicUser = true;
-        # A private, non-world-writable /var/lib/nix-p2p for the libp2p node's
-        # durable state + the public-NAR allowlist (the allowlist's anti-tamper
-        # check refuses a world-writable parent). Created 0700 owned by the
-        # DynamicUser. Only when libp2p is enabled; the wave-1 service needs none.
-        StateDirectory = lib.mkIf lcfg.enable "nix-p2p";
+        # A private, non-world-writable /var/lib/nix-p2p owned 0700 by the
+        # DynamicUser: home for the default narinfo disk cache (TASK-29, on by
+        # default) AND, when libp2p is enabled, the node's durable state + the
+        # public-NAR allowlist (whose anti-tamper check refuses a world-writable
+        # parent). Always present now - the wave-1 HTTP service needs it for the
+        # default narinfo cache dir - UNLESS the operator has turned the cache off
+        # (narinfoCacheDir = null) and libp2p is disabled, in which case no state
+        # dir is required at all.
+        StateDirectory = lib.mkIf (cfg.narinfoCacheDir != null || lcfg.enable) "nix-p2p";
       };
     };
 

@@ -65,7 +65,10 @@ pub use discovery::{
     DirectDiscovery, Discovery, FallbackNarSource, InMemoryDiscovery, InProcessPeerQuery,
     PROBE_TIMEOUT, PeerQuery, PeerQueryError,
 };
-pub use narinfo_cache::{Clock, NarinfoDiskCache, SystemClock};
+pub use narinfo_cache::{
+    Clock, NARINFO_CACHE_FLAG_CONFLICT, NarinfoCacheChoice, NarinfoDiskCache, NarinfoLayer,
+    PassThroughReason, SystemClock, build_narinfo_layer, resolve_narinfo_cache_dir,
+};
 pub use peer_source::{PeerFabricNarSource, PeerFabricRawServe};
 pub use public_allowlist::{
     AllowlistPersistError, AllowlistStatus, LearnOutcome, PublicNarAllowlist, PublicNarClaim,

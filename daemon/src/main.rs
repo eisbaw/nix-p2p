@@ -24,15 +24,16 @@ use daemon::{
     DEFAULT_MAX_SERVE_NAR_BYTES, EndpointProfile, EndpointScope, FallbackNarSource,
     FileNarSupplier, HEADER_TIMEOUT_MS, IdentitySource, InMemoryDiscovery, IrohNode,
     IrohNodeBuilder, IrohPeerAddr, IrohProviderConfig, IrohTransport, KnownPayload, KnownTransport,
-    LanReachability, LanShare, Libp2pCatalogProbe, Libp2pSourceConfig, NarCatalog, NarDumper,
-    NarHashKey, NarSource, NarinfoDiskCache, NarinfoSource, NoRawServe, NodeId, NodeLocation,
-    NodeLookupAuthorityAuthorization, NodeLookupConfig, NodePublicationCapability,
-    NodePublicationConfig, NodePublicationHandle, NullAnnounce, NullCorrelation, NullStore,
+    LanReachability, LanShare, Libp2pCatalogProbe, Libp2pSourceConfig, NARINFO_CACHE_FLAG_CONFLICT,
+    NarCatalog, NarDumper, NarHashKey, NarSource, NarinfoLayer, NarinfoSource, NoRawServe, NodeId,
+    NodeLocation, NodeLookupAuthorityAuthorization, NodeLookupConfig, NodePublicationCapability,
+    NodePublicationConfig, NodePublicationHandle, NullAnnounce, NullStore, PassThroughReason,
     PublicNarAllowlist, PublicationAuthorityAuthorization, RawServeDecision, RelayCapability,
     ServeBudget, StorePath, SystemClock, TaskSupervisor, TransportNarSource, TransportRegistry,
     UpstreamHttp, announce_provider_seeds, announce_public_provisions, announce_public_seeds,
     announce_store_provisions, build_libp2p_nar_source, build_libp2p_provider_source,
-    lan_isolation_or_refuse, resolve_durable_identity_seed, serve, verify_store_provisions,
+    build_narinfo_layer, lan_isolation_or_refuse, resolve_durable_identity_seed,
+    resolve_narinfo_cache_dir, serve, verify_store_provisions,
 };
 use fabric_libp2p::{CatalogNarSupplier, Libp2pFabric, MemoryNarSupplier, Multiaddr, PeerId};
 use peer_fabric::{
@@ -286,6 +287,12 @@ struct Config {
     /// Opt-in in wave 1 so enabling it in the container/NixOS paths is a separate,
     /// reviewable change (filed: wire a default cache dir into the module + e2e).
     narinfo_cache_dir: Option<String>,
+    /// Explicit opt-out of the narinfo disk cache (`--no-narinfo-cache`, TASK-29).
+    /// The cache is ON BY DEFAULT (a default XDG state dir is resolved when
+    /// `narinfo_cache_dir` is unset); this flag turns it fully off. Passing both
+    /// `--narinfo-cache-dir` and `--no-narinfo-cache` is a contradictory-usage
+    /// error, rejected before the cache is constructed.
+    no_narinfo_cache: bool,
     /// Per-hop upstream header timeout in milliseconds (default
     /// [`HEADER_TIMEOUT_MS`] = 15000; TASK-111 raised it from a WAN-hostile 1000).
     /// Bounds the wait for RESPONSE HEADERS after connect - the upstream's own work
@@ -455,6 +462,7 @@ impl Default for Config {
             priority: DEFAULT_PRIORITY,
             want_mass_query: true,
             narinfo_cache_dir: None,
+            no_narinfo_cache: false,
             header_timeout_ms: HEADER_TIMEOUT_MS,
             connect_timeout_ms: CONNECT_TIMEOUT_MS,
             iroh_provider: false,
@@ -525,6 +533,7 @@ impl Config {
                 }
                 "--upstream" => config.upstream = value()?,
                 "--narinfo-cache-dir" => config.narinfo_cache_dir = Some(value()?),
+                "--no-narinfo-cache" => config.no_narinfo_cache = true,
                 "--header-timeout-ms" => {
                     let raw = value()?;
                     let ms: u64 = raw
@@ -890,6 +899,13 @@ impl Config {
         // peer (kad cannot discover a provider without one). A `--libp2p-listen`/
         // `--libp2p-provider-addr` with no bootstrap would be a consumer that can
         // never find anyone - a silently-useless config, so fail fast. A PROVIDER
+        // TASK-29: the narinfo cache is on by default; naming a dir AND opting out
+        // at once is contradictory intent, so reject it at parse time (fail fast)
+        // rather than silently pick one.
+        if config.narinfo_cache_dir.is_some() && config.no_narinfo_cache {
+            return Err(NARINFO_CACHE_FLAG_CONFLICT.into());
+        }
+
         // equally needs one: its announce only propagates once it has joined the DHT.
         if config.libp2p_requested() && config.libp2p_bootstrap.is_empty() {
             return Err(
@@ -2219,26 +2235,58 @@ async fn main() -> ExitCode {
         );
     }
 
-    // Layer the persistent narinfo cache over the upstream when a cache dir is
-    // configured (task-8). The SAME instance is the narinfo source AND the
-    // persistent correlation store, so a warm-on-disk daemon dispatches the
-    // signed NarHash even after an in-memory-cold restart.
-    let (narinfo, correlation): (Arc<dyn NarinfoSource>, Arc<dyn CorrelationStore>) = match &config
-        .narinfo_cache_dir
-    {
-        Some(dir) => match NarinfoDiskCache::new(dir, upstream.clone(), Arc::new(SystemClock)) {
-            Ok(cache) => {
-                let cache = Arc::new(cache);
-                println!("daemon: narinfo disk cache at {dir}");
-                (cache.clone(), cache)
+    // Layer the persistent narinfo cache over the upstream (task-8). The SAME
+    // instance is the narinfo source AND the persistent correlation store, so a
+    // warm-on-disk daemon dispatches the signed NarHash even after an in-memory-cold
+    // restart. TASK-29: the cache is ON BY DEFAULT — a default XDG state dir is
+    // resolved when no `--narinfo-cache-dir` is given (TASK-28 moved the fsync
+    // off-worker, so default-enabling is safe). `--no-narinfo-cache` opts out; the
+    // contradictory `--narinfo-cache-dir` + `--no-narinfo-cache` pair is already
+    // rejected in `from_args`. The choice→source policy (soft-fail default vs fatal
+    // explicit) lives ONCE in `daemon_core::build_narinfo_layer`, shared with
+    // daemon-libp2p; here we only log the outcome and decide whether to abort.
+    let choice = resolve_narinfo_cache_dir(
+        config.narinfo_cache_dir.as_deref(),
+        config.no_narinfo_cache,
+        |k| std::env::var(k).ok(),
+    );
+    let (narinfo, correlation): (Arc<dyn NarinfoSource>, Arc<dyn CorrelationStore>) =
+        match build_narinfo_layer(choice, upstream.clone(), Arc::new(SystemClock)) {
+            NarinfoLayer::Cached {
+                narinfo,
+                correlation,
+                dir,
+            } => {
+                println!("daemon: narinfo disk cache at {}", dir.display());
+                (narinfo, correlation)
             }
-            Err(err) => {
+            NarinfoLayer::PassThrough {
+                narinfo,
+                correlation,
+                reason,
+            } => {
+                match reason {
+                    PassThroughReason::Disabled => {
+                        println!("daemon: narinfo disk cache disabled (--no-narinfo-cache)")
+                    }
+                    PassThroughReason::NoDefault => eprintln!(
+                        "daemon: WARNING: no --narinfo-cache-dir and neither HOME nor \
+                         XDG_STATE_HOME is set, so no default narinfo cache dir could be derived; \
+                         running WITHOUT a persistent narinfo cache (pass --narinfo-cache-dir to \
+                         enable it explicitly)"
+                    ),
+                    PassThroughReason::DefaultOpenFailed { dir, err } => eprintln!(
+                        "daemon: WARNING: default narinfo cache dir {dir:?} is unusable ({err}); \
+                         running WITHOUT a persistent narinfo cache"
+                    ),
+                }
+                (narinfo, correlation)
+            }
+            NarinfoLayer::ExplicitOpenFailed { dir, err } => {
                 eprintln!("daemon: cannot open narinfo cache dir {dir:?}: {err}");
                 return ExitCode::FAILURE;
             }
-        },
-        None => (upstream.clone(), Arc::new(NullCorrelation)),
-    };
+        };
 
     // One persistent Iroh node owns provider and fetch capabilities. Keeping it
     // alive for the process lifetime keeps the shared router/socket alive.
@@ -2569,6 +2617,35 @@ mod tests {
     #[test]
     fn default_config_advertises_a_preferred_priority() {
         assert!(Config::default().priority < 40);
+    }
+
+    #[test]
+    fn parse_narinfo_cache_flags() {
+        // TASK-29: the cache defaults on (dir resolved later, not at parse), the
+        // off-switch sets the bool, and the two together are a usage error.
+        let default = Config::from_args(std::iter::empty()).unwrap();
+        assert_eq!(default.narinfo_cache_dir, None);
+        assert!(!default.no_narinfo_cache);
+
+        let off = Config::from_args(["--no-narinfo-cache".to_string()]).unwrap();
+        assert!(off.no_narinfo_cache);
+        assert_eq!(off.narinfo_cache_dir, None);
+
+        let explicit =
+            Config::from_args(["--narinfo-cache-dir".to_string(), "/srv/nic".to_string()]).unwrap();
+        assert_eq!(explicit.narinfo_cache_dir.as_deref(), Some("/srv/nic"));
+
+        let contradiction = Config::from_args([
+            "--narinfo-cache-dir".to_string(),
+            "/srv/nic".to_string(),
+            "--no-narinfo-cache".to_string(),
+        ]);
+        assert!(
+            contradiction
+                .as_ref()
+                .is_err_and(|e| e.contains("contradictory")),
+            "both flags must be rejected, got {contradiction:?}"
+        );
     }
 
     // A valid 64-hex NodeId (parse is hex-only; the ed25519 curve check lives at

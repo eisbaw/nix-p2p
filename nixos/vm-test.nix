@@ -186,6 +186,16 @@ pkgs.testers.runNixOSTest {
             "journalctl -u nix-p2p-daemon --no-pager | grep 'daemon: substituted path=/nar/'"
         )
 
+        # TASK-29 AC#1 through systemd: the DynamicUser service resolved and opened
+        # its default StateDirectory-managed narinfo cache dir (module default). The
+        # container e2e proves the OFFLOAD; this proves the sandboxed systemd path
+        # can actually WRITE the default dir (a DynamicUser + StateDirectory concern
+        # the container layer cannot exercise).
+        client.succeed(
+            "journalctl -u nix-p2p-daemon --no-pager "
+            "| grep 'daemon: narinfo disk cache at /var/lib/nix-p2p/narinfo'"
+        )
+
     with subtest("S2: daemon stopped -> fallback still builds"):
         client.succeed("systemctl stop nix-p2p-daemon.service")
         # The preferred substituter really is gone.

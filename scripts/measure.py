@@ -79,6 +79,19 @@ LATENCY_INJECT_MS = 200
 DAEMON_HEADER_TIMEOUT_MS = 1000
 GAP_INJECT_MS = (300, 500)
 
+# TASK-29: the daemon narinfo cache is now ON BY DEFAULT, and podman sets HOME=/root
+# in the e2e image, so a flag-less measurement daemon would silently default-on. That
+# would (a) break bites whose control assumes NO narinfo cache - the gap oracle relies
+# on the proxy SEEING each narinfo to stamp its narinfo->nar gap, which a warm daemon
+# cache suppresses (gap_ms=None -> the oracle goes dead), and the product bite's
+# off_flat control collapses - and (b) violate the frozen "narinfo-cache held IDENTICAL
+# across arms" rule (MEASUREMENT_COUNTING_RULE.md §2). EVERY measurement daemon is
+# therefore pinned cache-OFF via this single constant, so the instrument's narinfo
+# config is deterministic regardless of the shipped default (a new bite that spawns a
+# daemon must reuse this, or it reintroduces the drift). The ON arm of the product bite
+# opts back in explicitly with its own --narinfo-cache-dir.
+MEASURE_DAEMON_CACHE_OFF = ("--no-narinfo-cache",)
+
 # The daemon's per-substitution narration (daemon/src/server.rs::log_substitution).
 # `bytes=` is the upstream Content-Length - the self-report we MEASURE, never trust.
 SUBST_RE = re.compile(
@@ -444,6 +457,7 @@ def bite_magnitude_and_self_counter(ctx, fixtures, attrs) -> dict:
         fixtures.cache,
         with_daemon=True,
         expect=_silent_expect([]),
+        daemon_extra_args=MEASURE_DAEMON_CACHE_OFF,
     ) as pod:
         # -- CONTROL: clean run --
         pod.proxy_faults("")  # no faults
@@ -562,7 +576,12 @@ def bite_gap_oracle(ctx, fixtures) -> dict:
     samples = 5
     readings = {}
     with e2e.Pod(
-        ctx, "bite-gap", fixtures.cache, with_daemon=True, expect=_silent_expect([])
+        ctx,
+        "bite-gap",
+        fixtures.cache,
+        with_daemon=True,
+        expect=_silent_expect([]),
+        daemon_extra_args=MEASURE_DAEMON_CACHE_OFF,
     ) as pod:
         base = _measure_gap_median(pod, substituter, keys, fixtures, attr, 0, samples)
         g1 = _measure_gap_median(pod, substituter, keys, fixtures, attr, x1, samples)
@@ -642,7 +661,12 @@ def bite_latency_p95(ctx, fixtures, attrs, runs, s4_usable, aa_noise_floor) -> d
         return [r.wall_s for r in rows if r.valid]
 
     with e2e.Pod(
-        ctx, "bite-latency", fixtures.cache, with_daemon=True, expect=_silent_expect([])
+        ctx,
+        "bite-latency",
+        fixtures.cache,
+        with_daemon=True,
+        expect=_silent_expect([]),
+        daemon_extra_args=MEASURE_DAEMON_CACHE_OFF,
     ) as pod:
         base = arm(pod, "")
         slow = arm(pod, inject)
@@ -712,7 +736,11 @@ def bite_product_narinfo_cache(ctx, fixtures, attrs) -> dict:
                 vals.append(rr.egress_narinfo)
         return vals
 
-    off = per_run_narinfo(())
+    # TASK-29: the daemon narinfo cache is now ON BY DEFAULT (podman sets HOME=/root
+    # in the e2e image, so a flag-less daemon resolves an XDG default dir). The OFF
+    # arm must therefore pin the cache off EXPLICITLY, or it would silently default-on
+    # and this bite's off_flat control would collapse.
+    off = per_run_narinfo(MEASURE_DAEMON_CACHE_OFF)
     on = per_run_narinfo(("--narinfo-cache-dir", "/tmp/nix-p2p-narinfo-cache"))
     # ON must drop after run 1; OFF must stay flat (control that the drop is the
     # product, not the harness).
@@ -791,6 +819,13 @@ def build_report(ctx, fixtures, out_root, runs) -> dict:
         substituter=ctx.substituter_daemon_only(),
         attrs=attrs,
         runs=runs,
+        # TASK-29 + the frozen counting rule (MEASUREMENT_COUNTING_RULE.md §2): the
+        # daemon narinfo cache is now default-on, but the offload metric is PAYLOAD
+        # egress and the rule requires the narinfo-cache config be held IDENTICAL
+        # across the daemon-on and daemon-off arms (daemon-off has no daemon, hence
+        # no cache). Pin the daemon-on arm's cache OFF too, so metadata config cannot
+        # move the go/no-go number via the default that now ships.
+        daemon_extra=MEASURE_DAEMON_CACHE_OFF,
     )
 
     # A/A noise floor: two daemon-off arms should agree; if not below the S4

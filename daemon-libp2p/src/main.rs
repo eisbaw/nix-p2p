@@ -19,8 +19,9 @@ use daemon_core::{
     RegularFileNarDumper, StorePath,
 };
 use daemon_core::{
-    CacheInfo, CorrelationStore, NarSource, NarinfoDiskCache, NarinfoSource, NullCorrelation,
-    PublicNarAllowlist, RawUpstream, RunConfig, SystemClock, UpstreamHttp, run,
+    CacheInfo, CorrelationStore, NARINFO_CACHE_FLAG_CONFLICT, NarSource, NarinfoLayer,
+    NarinfoSource, PassThroughReason, PublicNarAllowlist, RawUpstream, RunConfig, SystemClock,
+    UpstreamHttp, build_narinfo_layer, resolve_narinfo_cache_dir, run,
 };
 use daemon_libp2p::{
     AllowlistEligibility, LanReachability, LanShare, Libp2pCatalogProbe, Libp2pSourceConfig,
@@ -52,6 +53,8 @@ struct Config {
     upstream: String,
     header_timeout_ms: u64,
     narinfo_cache_dir: Option<String>,
+    /// Explicit opt-out of the (default-on, TASK-29) narinfo disk cache.
+    no_narinfo_cache: bool,
     store_dir: String,
     priority: u32,
     want_mass_query: bool,
@@ -176,6 +179,7 @@ fn parse_config<I: IntoIterator<Item = String>>(args: I) -> Result<Config, Strin
         upstream: "https://cache.nixos.org".to_string(),
         header_timeout_ms: 30_000,
         narinfo_cache_dir: None,
+        no_narinfo_cache: false,
         store_dir: "/nix/store".to_string(),
         priority: DEFAULT_PRIORITY,
         want_mass_query: true,
@@ -215,6 +219,7 @@ fn parse_config<I: IntoIterator<Item = String>>(args: I) -> Result<Config, Strin
                 }
             }
             "--narinfo-cache-dir" => cfg.narinfo_cache_dir = Some(value()?),
+            "--no-narinfo-cache" => cfg.no_narinfo_cache = true,
             "--store-dir" => cfg.store_dir = value()?,
             "--priority" => {
                 cfg.priority = value()?
@@ -258,6 +263,12 @@ fn parse_config<I: IntoIterator<Item = String>>(args: I) -> Result<Config, Strin
                 .push(parse_prove_public_narinfo(&value()?)?),
             other => return Err(format!("unknown flag {other}")),
         }
+    }
+    // TASK-29: naming a narinfo cache dir AND opting out is contradictory; reject
+    // it at parse time (shares the error string with the composite `daemon` binary
+    // via NARINFO_CACHE_FLAG_CONFLICT so the two cannot drift).
+    if cfg.narinfo_cache_dir.is_some() && cfg.no_narinfo_cache {
+        return Err(NARINFO_CACHE_FLAG_CONFLICT.into());
     }
     // A provider MUST have at least one seed and a listener; a consumer MUST have a bootstrap
     // peer (an empty bootstrap set can never discover anyone) - fail fast, never a silent
@@ -814,22 +825,51 @@ async fn main() -> ExitCode {
             return ExitCode::from(2);
         }
     };
-    let (narinfo, correlation): (Arc<dyn NarinfoSource>, Arc<dyn CorrelationStore>) = match &cfg
-        .narinfo_cache_dir
-    {
-        Some(dir) => match NarinfoDiskCache::new(dir, upstream.clone(), Arc::new(SystemClock)) {
-            Ok(cache) => {
-                let cache = Arc::new(cache);
-                println!("daemon-libp2p: narinfo disk cache at {dir}");
-                (cache.clone(), cache)
+    // TASK-29: narinfo disk cache ON BY DEFAULT (a default XDG state dir is resolved
+    // when no `--narinfo-cache-dir` is given; `--no-narinfo-cache` opts out). The
+    // choice→source policy (soft-fail default vs fatal explicit) lives ONCE in
+    // `daemon_core::build_narinfo_layer`, shared with the composite `daemon` binary;
+    // here we only log the outcome and decide whether to abort.
+    let choice = resolve_narinfo_cache_dir(
+        cfg.narinfo_cache_dir.as_deref(),
+        cfg.no_narinfo_cache,
+        |k| std::env::var(k).ok(),
+    );
+    let (narinfo, correlation): (Arc<dyn NarinfoSource>, Arc<dyn CorrelationStore>) =
+        match build_narinfo_layer(choice, upstream.clone(), Arc::new(SystemClock)) {
+            NarinfoLayer::Cached {
+                narinfo,
+                correlation,
+                dir,
+            } => {
+                println!("daemon-libp2p: narinfo disk cache at {}", dir.display());
+                (narinfo, correlation)
             }
-            Err(err) => {
+            NarinfoLayer::PassThrough {
+                narinfo,
+                correlation,
+                reason,
+            } => {
+                match reason {
+                    PassThroughReason::Disabled => {
+                        println!("daemon-libp2p: narinfo disk cache disabled (--no-narinfo-cache)")
+                    }
+                    PassThroughReason::NoDefault => eprintln!(
+                        "daemon-libp2p: WARNING: no --narinfo-cache-dir and neither HOME nor \
+                         XDG_STATE_HOME is set; running WITHOUT a persistent narinfo cache"
+                    ),
+                    PassThroughReason::DefaultOpenFailed { dir, err } => eprintln!(
+                        "daemon-libp2p: WARNING: default narinfo cache dir {dir:?} is unusable \
+                         ({err}); running WITHOUT a persistent narinfo cache"
+                    ),
+                }
+                (narinfo, correlation)
+            }
+            NarinfoLayer::ExplicitOpenFailed { dir, err } => {
                 eprintln!("daemon-libp2p: cannot open narinfo cache dir {dir:?}: {err}");
                 return ExitCode::FAILURE;
             }
-        },
-        None => (upstream.clone(), Arc::new(NullCorrelation)),
-    };
+        };
 
     // Consumer axes; a provider additionally needs the serve + announce axes. `run` re-asserts
     // these, and the construction already asserted them at start (belt and braces).
@@ -1011,6 +1051,7 @@ mod bootstrap_guard_tests {
             upstream: "https://cache.nixos.org".to_string(),
             header_timeout_ms: 30_000,
             narinfo_cache_dir: None,
+            no_narinfo_cache: false,
             store_dir: "/nix/store".to_string(),
             priority: 0,
             want_mass_query: true,

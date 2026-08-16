@@ -135,8 +135,8 @@ public-swarm results are still out.
   per query**, so a PeerId-grinding attacker can no longer permanently evict a chosen
   key's legit provider — an out-competed lookup self-heals on retry (a bounded
   probabilistic degradation, never permanent denial; integrity is untouched throughout).
-- **A transparent substituter proxy:** `nix-cache-info` semantics, a narinfo disk
-  cache, the NAR correlation catalog, correct serving of a raw NAR under a compressed
+- **A transparent substituter proxy:** `nix-cache-info` semantics, a persistent narinfo disk
+  cache **on by default** (see below), the NAR correlation catalog, correct serving of a raw NAR under a compressed
   upstream narinfo (the hit is rewritten to match the bytes it serves), multi-daemon
   chains, the additive-invariant crash behaviour (daemon dead or killed mid-transfer →
   `nix build` still succeeds via fallback, the store never corrupted), a NixOS module +
@@ -174,6 +174,16 @@ public-swarm results are still out.
 - **The iroh optional-transport journey.** iroh transfer works; its decentralized
   public-node discovery / no-address connection, and the iroh-versus-libp2p transport
   tournament that decides whether iroh's NAT traversal earns its place, are in progress.
+- **The narinfo disk cache is on by default.** With no flag the daemon persists narinfo at
+  an XDG state path (`$XDG_STATE_HOME/nix-p2p/narinfo`, else `$HOME/.local/state/nix-p2p/narinfo`),
+  so a warm daemon serves a repeat narinfo from local disk instead of re-fetching it upstream;
+  the fsync runs off the async worker (TASK-28), the cache is count-capped (TASK-27), and every
+  entry is re-derivable, so a lost or corrupt cache is only ever an extra refetch, never a wrong
+  serve. `--narinfo-cache-dir <dir>` picks an explicit directory; `--no-narinfo-cache` turns it
+  off. The NixOS module defaults it to `/var/lib/nix-p2p/narinfo` under a `StateDirectory`-managed
+  dir the DynamicUser owns (`services.nix-p2p.narinfoCacheDir = null` to disable). Scope note: this
+  records **which** narinfos an operator fetched on **local** disk — a local, re-derivable cache,
+  not a network disclosure; the operator-contract task (TASK-120) will refine the state-dir/mode.
 - **Restart-durable state in the shipped daemon — now wired, gated on a state dir.**
   With `--libp2p-state-dir <dir>` the shipped daemon runs in durable mode: the directory is
   the single anchor for both the node's **identity** (a state-dir-only restart comes back as

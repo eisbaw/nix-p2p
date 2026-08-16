@@ -165,6 +165,166 @@ impl Clock for SystemClock {
     }
 }
 
+/// Where the narinfo disk cache ended up once the daemon reconciled its two CLI
+/// flags (`--narinfo-cache-dir`, `--no-narinfo-cache`) with the environment
+/// (TASK-29 AC#1). The four outcomes are kept DISTINCT — rather than collapsing
+/// to `Option<PathBuf>` — so the daemon can log precisely WHY it is (or is not)
+/// caching, and so the failure policy can differ: a DEFAULT dir that will not open
+/// is a warning (the operator did not ask for it), whereas an EXPLICIT dir that
+/// will not open is fatal (they did).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum NarinfoCacheChoice {
+    /// The operator opted out with `--no-narinfo-cache`. Run pure-upstream.
+    Disabled,
+    /// The operator named a directory with `--narinfo-cache-dir DIR`. A failure to
+    /// open THIS path must be fatal — they asked for it explicitly.
+    Explicit(PathBuf),
+    /// No flag was given, so the cache defaults ON at the XDG state path (AC#1).
+    /// A failure to open a DEFAULT path is a warning, not fatal: a convenience
+    /// default must never brick a daemon that would otherwise serve fine.
+    Default(PathBuf),
+    /// No flag, and neither `HOME` nor `XDG_STATE_HOME` is set, so there is nowhere
+    /// sensible to root a default. Run pure-upstream with a warning rather than
+    /// guess an absolute path.
+    NoDefault,
+}
+
+/// Resolve the EFFECTIVE narinfo cache directory from the two CLI flags and an
+/// injected environment lookup (TASK-29 AC#1). Pure and env-injected so the
+/// precedence is unit-tested without touching real process env vars or disk; the
+/// daemon passes `|k| std::env::var(k).ok()`.
+///
+/// Precedence, highest first:
+///   1. `disabled` (`--no-narinfo-cache`) → [`NarinfoCacheChoice::Disabled`]. The
+///      caller rejects the contradictory `--narinfo-cache-dir` + `--no-narinfo-cache`
+///      combination up front, so an opt-out here is unambiguous.
+///   2. `explicit` (`--narinfo-cache-dir DIR`) → [`NarinfoCacheChoice::Explicit`],
+///      honoured verbatim.
+///   3. neither → the XDG default: `$XDG_STATE_HOME/nix-p2p/narinfo`, falling back
+///      to `$HOME/.local/state/nix-p2p/narinfo` when `XDG_STATE_HOME` is unset,
+///      empty, or (spec-invalid) relative. If neither yields an ABSOLUTE base,
+///      [`NarinfoCacheChoice::NoDefault`].
+///
+/// XDG *state* (not *cache*) is deliberate: the entries back the persistent
+/// `token → NarHash` correlation a warm daemon dispatches after an in-memory-cold
+/// restart — state that should survive a reboot — even though it is re-derivable
+/// and count-capped (TASK-27), which is exactly why a missing default is only
+/// best-effort rather than fatal. NOTE (privacy scope): enabling this by default
+/// means WHICH narinfos an operator fetched are now recorded on local disk. That is
+/// a LOCAL cache (re-derivable, count-capped, off-worker per TASK-28), not a network
+/// disclosure; the operator-contract task (TASK-120) will refine the state-dir/mode.
+pub fn resolve_narinfo_cache_dir(
+    explicit: Option<&str>,
+    disabled: bool,
+    getenv: impl Fn(&str) -> Option<String>,
+) -> NarinfoCacheChoice {
+    if disabled {
+        return NarinfoCacheChoice::Disabled;
+    }
+    if let Some(dir) = explicit {
+        return NarinfoCacheChoice::Explicit(PathBuf::from(dir));
+    }
+    // A usable base must be an ABSOLUTE path. XDG_STATE_HOME is required by the XDG
+    // spec to be absolute; a relative or empty value is ignored in favour of HOME.
+    let absolute = |s: String| -> Option<PathBuf> {
+        let p = PathBuf::from(s);
+        p.is_absolute().then_some(p)
+    };
+    let base = getenv("XDG_STATE_HOME")
+        .filter(|s| !s.is_empty())
+        .and_then(absolute)
+        .or_else(|| {
+            getenv("HOME")
+                .filter(|s| !s.is_empty())
+                .and_then(absolute)
+                .map(|home| home.join(".local").join("state"))
+        });
+    match base {
+        Some(base) => NarinfoCacheChoice::Default(base.join("nix-p2p").join("narinfo")),
+        None => NarinfoCacheChoice::NoDefault,
+    }
+}
+
+/// The error string both daemon binaries emit when `--narinfo-cache-dir` and
+/// `--no-narinfo-cache` are passed together. Shared here so the two parse-time
+/// guards cannot drift their wording (SSOT).
+pub const NARINFO_CACHE_FLAG_CONFLICT: &str =
+    "--narinfo-cache-dir and --no-narinfo-cache are contradictory; pass at most one";
+
+/// The result of turning a resolved [`NarinfoCacheChoice`] into a live narinfo
+/// layer. Built once in [`build_narinfo_layer`] and shared by BOTH daemon binaries,
+/// so the fatal-explicit / soft-fail-default policy and the (source, correlation)
+/// wiring live in ONE place rather than being copy-pasted and left to drift. The
+/// caller owns only the LOGGING and the process-exit decision — everything that
+/// decides WHICH source to serve is here.
+pub enum NarinfoLayer {
+    /// The cache is active. `narinfo` is disk-cache-over-upstream, `correlation` the
+    /// matching persistent store, `dir` the resolved directory (for the log line).
+    Cached {
+        narinfo: std::sync::Arc<dyn NarinfoSource>,
+        correlation: std::sync::Arc<dyn CorrelationStore>,
+        dir: PathBuf,
+    },
+    /// No cache: pure-upstream passthrough. `reason` records WHY so the caller logs
+    /// the precise cause without re-deriving it.
+    PassThrough {
+        narinfo: std::sync::Arc<dyn NarinfoSource>,
+        correlation: std::sync::Arc<dyn CorrelationStore>,
+        reason: PassThroughReason,
+    },
+    /// An EXPLICIT `--narinfo-cache-dir` could not be opened. The operator asked for
+    /// it, so this is FATAL: the caller logs the error and aborts (fail-fast).
+    ExplicitOpenFailed { dir: PathBuf, err: std::io::Error },
+}
+
+/// Why a [`NarinfoLayer::PassThrough`] carries no cache — kept distinct so the
+/// caller emits the right (and only the right) log line.
+pub enum PassThroughReason {
+    /// `--no-narinfo-cache`: the operator opted out.
+    Disabled,
+    /// No flag and no `HOME`/`XDG_STATE_HOME` to root a default.
+    NoDefault,
+    /// A DEFAULT dir that would not open. Best-effort: the caller WARNS (naming the
+    /// `dir` and `err`) and serves pure-upstream rather than bricking a daemon that
+    /// would otherwise serve fine.
+    DefaultOpenFailed { dir: PathBuf, err: std::io::Error },
+}
+
+/// Turn a resolved [`NarinfoCacheChoice`] into a [`NarinfoLayer`], applying the ONE
+/// failure policy both binaries share: a DEFAULT dir that will not open soft-fails
+/// to pure-upstream, an EXPLICIT one is fatal. Pure w.r.t. the environment (the
+/// choice is resolved by [`resolve_narinfo_cache_dir`] beforehand); it does touch
+/// the filesystem via [`NarinfoDiskCache::new`], exactly as the daemon start-up must.
+pub fn build_narinfo_layer(
+    choice: NarinfoCacheChoice,
+    upstream: std::sync::Arc<dyn NarinfoSource>,
+    clock: std::sync::Arc<dyn Clock>,
+) -> NarinfoLayer {
+    let pass_through = |reason| NarinfoLayer::PassThrough {
+        narinfo: upstream.clone(),
+        correlation: std::sync::Arc::new(crate::catalog::NullCorrelation),
+        reason,
+    };
+    let (dir, is_default) = match choice {
+        NarinfoCacheChoice::Disabled => return pass_through(PassThroughReason::Disabled),
+        NarinfoCacheChoice::NoDefault => return pass_through(PassThroughReason::NoDefault),
+        NarinfoCacheChoice::Explicit(dir) => (dir, false),
+        NarinfoCacheChoice::Default(dir) => (dir, true),
+    };
+    match NarinfoDiskCache::new(&dir, upstream.clone(), clock) {
+        Ok(cache) => {
+            let cache = std::sync::Arc::new(cache);
+            NarinfoLayer::Cached {
+                narinfo: cache.clone(),
+                correlation: cache,
+                dir,
+            }
+        }
+        Err(err) if is_default => pass_through(PassThroughReason::DefaultOpenFailed { dir, err }),
+        Err(err) => NarinfoLayer::ExplicitOpenFailed { dir, err },
+    }
+}
+
 /// What kind of cached outcome an entry records.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum EntryKind {
@@ -377,6 +537,16 @@ impl NarinfoDiskCache {
         max_entries: NonZeroUsize,
     ) -> std::io::Result<Self> {
         let root = root.into();
+        // DELIBERATELY plain `create_dir_all` + later plain `File` opens - NO
+        // O_NOFOLLOW parent check like `public_allowlist.rs` uses. This is required,
+        // not an oversight: under the NixOS module's `DynamicUser` + `StateDirectory`,
+        // the default root `/var/lib/nix-p2p` is itself a systemd-managed SYMLINK into
+        // `/var/lib/private/…`, so an O_NOFOLLOW-on-parent check would REFUSE the
+        // module's own default. It is also safe to omit: the narinfo cache is not a
+        // trust input - every entry is re-derivable, well-formedness-checked on read,
+        // and the served NAR is signature/hash-verified downstream by nix - so a
+        // symlink swap costs at most a refetch, never a bad serve (unlike the
+        // allowlist, which gates a public announce and therefore IS hardened).
         std::fs::create_dir_all(&root)?;
         let tmp_dir = root.join(".tmp");
         std::fs::create_dir_all(&tmp_dir)?;
@@ -1061,6 +1231,188 @@ Sig: k:AAAA==\n";
     #[test]
     fn well_formed_accepts_a_complete_narinfo() {
         assert!(is_well_formed_narinfo(GOOD));
+    }
+
+    // ---- TASK-29: default-on cache-dir resolution -------------------------
+
+    #[test]
+    fn resolve_disabled_beats_an_explicit_dir_and_the_env() {
+        // `--no-narinfo-cache` wins over everything (the caller has already
+        // rejected the contradictory combination, so this is an honest opt-out).
+        let env = |_: &str| Some("/home/u".to_string());
+        assert_eq!(
+            resolve_narinfo_cache_dir(Some("/srv/cache"), true, env),
+            NarinfoCacheChoice::Disabled
+        );
+    }
+
+    #[test]
+    fn resolve_explicit_dir_is_honoured_verbatim() {
+        // An explicit dir is used as-is and does NOT consult the environment.
+        let env = |_: &str| panic!("explicit dir must not read the environment");
+        assert_eq!(
+            resolve_narinfo_cache_dir(Some("/srv/cache"), false, env),
+            NarinfoCacheChoice::Explicit(PathBuf::from("/srv/cache"))
+        );
+    }
+
+    #[test]
+    fn resolve_default_prefers_xdg_state_home() {
+        let env = |k: &str| match k {
+            "XDG_STATE_HOME" => Some("/xdg/state".to_string()),
+            "HOME" => Some("/home/u".to_string()),
+            _ => None,
+        };
+        assert_eq!(
+            resolve_narinfo_cache_dir(None, false, env),
+            NarinfoCacheChoice::Default(PathBuf::from("/xdg/state/nix-p2p/narinfo"))
+        );
+    }
+
+    #[test]
+    fn resolve_default_falls_back_to_home_local_state() {
+        let env = |k: &str| match k {
+            "HOME" => Some("/home/u".to_string()),
+            _ => None,
+        };
+        assert_eq!(
+            resolve_narinfo_cache_dir(None, false, env),
+            NarinfoCacheChoice::Default(PathBuf::from("/home/u/.local/state/nix-p2p/narinfo"))
+        );
+    }
+
+    #[test]
+    fn resolve_ignores_relative_or_empty_xdg_state_home() {
+        // A relative (spec-invalid) or empty XDG_STATE_HOME must not be trusted;
+        // fall back to HOME rather than root a cache at a relative path.
+        for bad in ["relative/state", ""] {
+            let env = move |k: &str| match k {
+                "XDG_STATE_HOME" => Some(bad.to_string()),
+                "HOME" => Some("/home/u".to_string()),
+                _ => None,
+            };
+            assert_eq!(
+                resolve_narinfo_cache_dir(None, false, env),
+                NarinfoCacheChoice::Default(PathBuf::from("/home/u/.local/state/nix-p2p/narinfo")),
+                "bad XDG_STATE_HOME {bad:?} must fall back to HOME"
+            );
+        }
+    }
+
+    #[test]
+    fn resolve_relative_home_yields_no_default() {
+        // A relative HOME is as untrustworthy as a relative XDG base.
+        let env = |k: &str| match k {
+            "HOME" => Some("relative/home".to_string()),
+            _ => None,
+        };
+        assert_eq!(
+            resolve_narinfo_cache_dir(None, false, env),
+            NarinfoCacheChoice::NoDefault
+        );
+    }
+
+    #[test]
+    fn resolve_no_home_no_xdg_yields_no_default() {
+        // Nowhere sensible to put a default -> run pure-upstream (never guess).
+        let env = |_: &str| None;
+        assert_eq!(
+            resolve_narinfo_cache_dir(None, false, env),
+            NarinfoCacheChoice::NoDefault
+        );
+    }
+
+    // ---- TASK-29: choice -> live layer, the shared fatal/soft-fail policy --------
+
+    fn a_upstream() -> std::sync::Arc<dyn NarinfoSource> {
+        std::sync::Arc::new(NoopSource)
+    }
+    fn a_clock() -> std::sync::Arc<dyn Clock> {
+        std::sync::Arc::new(SystemClock)
+    }
+    fn unique_tmp(tag: &str) -> PathBuf {
+        static SEQ: AtomicU64 = AtomicU64::new(0);
+        std::env::temp_dir().join(format!(
+            "nixp2p-layer-{tag}-{}-{}",
+            std::process::id(),
+            SEQ.fetch_add(1, Ordering::Relaxed)
+        ))
+    }
+
+    #[test]
+    fn build_layer_disabled_and_no_default_pass_through() {
+        assert!(matches!(
+            build_narinfo_layer(NarinfoCacheChoice::Disabled, a_upstream(), a_clock()),
+            NarinfoLayer::PassThrough {
+                reason: PassThroughReason::Disabled,
+                ..
+            }
+        ));
+        assert!(matches!(
+            build_narinfo_layer(NarinfoCacheChoice::NoDefault, a_upstream(), a_clock()),
+            NarinfoLayer::PassThrough {
+                reason: PassThroughReason::NoDefault,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn build_layer_default_dir_opens_to_cached() {
+        let dir = unique_tmp("ok");
+        let layer = build_narinfo_layer(
+            NarinfoCacheChoice::Default(dir.clone()),
+            a_upstream(),
+            a_clock(),
+        );
+        match layer {
+            NarinfoLayer::Cached { dir: got, .. } => assert_eq!(got, dir),
+            other => panic!(
+                "expected Cached, got a different variant: {other:?}",
+                other = variant(&other)
+            ),
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn build_layer_default_dir_that_cannot_open_soft_fails() {
+        // Root the "dir" UNDER a regular file: create_dir_all fails (ENOTDIR), and a
+        // DEFAULT dir must soft-fail to pure-upstream rather than abort.
+        let file = unique_tmp("file");
+        std::fs::write(&file, b"x").unwrap();
+        let bogus = file.join("subdir");
+        assert!(matches!(
+            build_narinfo_layer(NarinfoCacheChoice::Default(bogus), a_upstream(), a_clock()),
+            NarinfoLayer::PassThrough {
+                reason: PassThroughReason::DefaultOpenFailed { .. },
+                ..
+            }
+        ));
+        let _ = std::fs::remove_file(&file);
+    }
+
+    #[test]
+    fn build_layer_explicit_dir_that_cannot_open_is_fatal() {
+        // The SAME un-openable path, but EXPLICIT, is fatal (the operator asked).
+        let file = unique_tmp("file");
+        std::fs::write(&file, b"x").unwrap();
+        let bogus = file.join("subdir");
+        assert!(matches!(
+            build_narinfo_layer(NarinfoCacheChoice::Explicit(bogus), a_upstream(), a_clock()),
+            NarinfoLayer::ExplicitOpenFailed { .. }
+        ));
+        let _ = std::fs::remove_file(&file);
+    }
+
+    /// A tiny variant label so a failed `build_layer_*` assertion prints WHICH
+    /// variant it got (the layer holds trait objects, so it is not `Debug`).
+    fn variant(layer: &NarinfoLayer) -> &'static str {
+        match layer {
+            NarinfoLayer::Cached { .. } => "Cached",
+            NarinfoLayer::PassThrough { .. } => "PassThrough",
+            NarinfoLayer::ExplicitOpenFailed { .. } => "ExplicitOpenFailed",
+        }
     }
 
     #[test]

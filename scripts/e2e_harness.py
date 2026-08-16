@@ -108,6 +108,12 @@ STUB_MARKER = "0 scenarios registered - NOT a pass"
 # exercises signed References.
 ALL_ATTRS = ("lib", "app", "zstd", "big")
 
+# TASK-29: the narinfo-offload scenario's target set. A big-free subset (lib+app+
+# zstd, all <=512 KiB) - narinfo is tiny, so the 110 MiB `big` payload adds cold-
+# pull seconds without strengthening a narinfo-count oracle. `app` references `lib`,
+# so the closure still exercises a dependency edge, not just leaf paths.
+NARINFO_ATTRS = ("lib", "app", "zstd")
+
 READY_TIMEOUT_S = 45.0
 
 # --- libp2p (S7, TASK-161) ----------------------------------------------------
@@ -5213,9 +5219,161 @@ def scenario_s8_libp2p_store(ctx: Ctx, expect) -> None:
         )
 
 
+def scenario_narinfo_default_cache_offload(ctx: Ctx, expect) -> None:
+    """TASK-29 AC#1/#2: the daemon narinfo disk cache is ON BY DEFAULT and, on a
+    REPEAT build of the same paths, serves narinfo LOCALLY so ZERO narinfo crosses
+    the daemon->testproxy (upstream) boundary - the offload oracle, ORACLE-PAIRED
+    per scripts/MEASUREMENT_COUNTING_RULE.md: a "0 upstream narinfo" claim is only
+    meaningful when the client independently confirms it received those narinfo (a
+    zero-crossing is offload iff delivery is confirmed - never a silent miss).
+
+    The daemon does NOT narrate narinfo serves (only NAR substitutions, per the
+    counting rule), so the "nonzero served-locally" half is observed as: a FRESH
+    client (wiped narinfo cache) realises all N targets and reports all N NarHashes
+    on the warm run WHILE received.narinfo == 0 at the boundary - i.e. all N narinfo
+    were served from the daemon's own disk cache. The explicit-dir arm additionally
+    counts the daemon's persisted `.nic` entries host-side as a direct daemon-side
+    integer.
+
+    Scope (stated honestly): a warm HIT reads the `.nic` BODY from disk on every
+    request (NarinfoDiskCache holds no in-memory body cache - `read_fresh` does an
+    `fs::read`), so these arms genuinely prove a DISK-read serve, not merely an
+    in-memory one. What they do NOT exercise is a daemon RESTART: the post-restart
+    sidecar warm-up (`load_index`) is covered by daemon-core's own unit tests, not
+    re-asserted here.
+
+    THREE arms, so the oracle BITES (the mutation is a PERMANENT negative control):
+      * default-on : no cache flag at all -> the daemon defaults the cache on at its
+                     XDG state dir (podman sets HOME=/root in the e2e image). Proves
+                     AC#1 end-to-end: a fresh daemon with NO flag persists+offloads.
+      * explicit   : the harness passes --narinfo-cache-dir via a host-mounted state
+                     dir (AC#2 'the harness passes the cache dir') + the `.nic` count.
+      * disabled   : --no-narinfo-cache -> the daemon holds NO narinfo cache, so on
+                     the REPEAT it RE-FETCHES every narinfo upstream and
+                     received.narinfo > 0. THIS is the mutation that reddens the
+                     other arms' `== 0`, attributing the offload to the cache.
+    """
+    fixtures = ctx.fixtures
+    attrs = NARINFO_ATTRS
+    targets = [fixtures.store_path(a) for a in attrs]
+    subst = ctx.substituter_daemon_only()
+    keys = fixtures.public_key
+
+    def cold_then_warm(pod):
+        """Cold populate, then a warm REPEAT with proxy COUNTERS reset (its disk
+        cache kept, exactly like s1) and a FRESH client. Returns the warm proxy
+        stats + the warm client result so each arm asserts its own oracle."""
+        pod.proxy_reset()
+        cold = pod.client_run(targets, subst, keys)
+        expect(
+            cold.exit_code == 0, f"{pod.pod}: cold realise succeeds", cold.stderr[-400:]
+        )
+        cold_ninfo = pod.proxy_stats()["received"].get("narinfo", 0)
+        expect(
+            cold_ninfo >= len(attrs),
+            f"{pod.pod}: cold fetches every narinfo upstream (the pre-offload baseline)",
+            f"received.narinfo={cold_ninfo} want>={len(attrs)}",
+        )
+        pod.proxy_reset()
+        warm = pod.client_run(targets, subst, keys)
+        expect(
+            warm.exit_code == 0, f"{pod.pod}: warm repeat succeeds", warm.stderr[-400:]
+        )
+        return pod.proxy_stats(), warm
+
+    def assert_offload(wstats, warm, label):
+        """The oracle-paired AC#1 offload, asserted on the warm REPEAT."""
+        w_ninfo = wstats["received"].get("narinfo", 0)
+        served_locally = sum(
+            1
+            for a in attrs
+            if warm.narhash(fixtures.store_path(a)) == fixtures.nar_hash(a)
+        )
+        # HALF A (zero upstream): no narinfo crossed the daemon->testproxy boundary.
+        # HALF B (nonzero served locally): the fresh client received all N narinfo,
+        # and since zero crossed, the daemon served all N from its own disk cache.
+        expect(
+            w_ninfo == 0 and served_locally == len(attrs) and len(attrs) > 0,
+            f"{label}: warm repeat offloads narinfo - 0 upstream PAIRED with "
+            f"{served_locally} narinfo served locally by the daemon cache",
+            f"received.narinfo={w_ninfo} served_locally={served_locally}/{len(attrs)}",
+        )
+
+    # -- arm 1: DEFAULT ON (no flag). AC#1: a fresh daemon with no flag offloads. --
+    with Pod(
+        ctx, "narinfo-default", fixtures.cache, with_daemon=True, expect=expect
+    ) as pod:
+        wstats, warm = cold_then_warm(pod)
+        default_line = "narinfo disk cache at /root/.local/state/nix-p2p/narinfo"
+        expect(
+            default_line in pod.logs("daemon"),
+            "default-on: the daemon resolves+logs the DEFAULT XDG cache dir (no flag)",
+            f"expected {default_line!r}; daemon log tail: {pod.logs('daemon')[-400:]}",
+        )
+        assert_offload(wstats, warm, "AC#1 default-on")
+
+    # -- arm 2: EXPLICIT --narinfo-cache-dir via a host-mounted state dir (AC#2:  --
+    #    'the harness passes the cache dir') + a direct host-side `.nic` count.
+    state_root = ctx.scratch / "narinfo-offload-state"
+    if state_root.exists():
+        shutil.rmtree(state_root)
+    with Pod(
+        ctx,
+        "narinfo-explicit",
+        fixtures.cache,
+        with_daemon=True,
+        expect=expect,
+        state_root=state_root,
+    ) as pod:
+        wstats, warm = cold_then_warm(pod)
+        nic_files = list(pod.state_dir("daemon").glob("*.nic"))
+        expect(
+            len(nic_files) >= len(attrs),
+            "explicit-dir: the daemon persisted narinfo entries on disk (host-side .nic count)",
+            f"nic_files={len(nic_files)} want>={len(attrs)}",
+        )
+        assert_offload(wstats, warm, "AC#2 explicit-dir")
+
+    # -- arm 3: DISABLED (--no-narinfo-cache): the negative control / MUTATION. --
+    #    With NO cache the daemon re-fetches every narinfo upstream on the REPEAT,
+    #    so received.narinfo > 0 - exactly what reddens the '== 0' arms above.
+    with Pod(
+        ctx,
+        "narinfo-disabled",
+        fixtures.cache,
+        with_daemon=True,
+        expect=expect,
+        daemon_extra_args=("--no-narinfo-cache",),
+    ) as pod:
+        pod.proxy_reset()
+        cold = pod.client_run(targets, subst, keys)
+        expect(
+            cold.exit_code == 0, "disabled: cold realise succeeds", cold.stderr[-400:]
+        )
+        pod.proxy_reset()
+        warm = pod.client_run(targets, subst, keys)
+        expect(
+            warm.exit_code == 0, "disabled: warm repeat succeeds", warm.stderr[-400:]
+        )
+        w_ninfo = pod.proxy_stats()["received"].get("narinfo", 0)
+        expect(
+            "narinfo disk cache disabled (--no-narinfo-cache)" in pod.logs("daemon"),
+            "disabled: the daemon logs the cache is OFF (--no-narinfo-cache honoured)",
+            f"daemon log tail: {pod.logs('daemon')[-400:]}",
+        )
+        expect(
+            w_ninfo >= 1,
+            "MUTATION (negative control): with the cache OFF the REPEAT re-fetches "
+            "narinfo upstream (received.narinfo>0), proving the offload oracle above "
+            "is load-bearing, not vacuous",
+            f"received.narinfo={w_ninfo} want>=1",
+        )
+
+
 SCENARIOS = [
     ("topology", scenario_topology),
     ("s1-byte-and-counts", scenario_s1_byte_and_counts),
+    ("narinfo-default-cache-offload", scenario_narinfo_default_cache_offload),
     ("s2-fallback", scenario_s2_fallback),
     ("daemon-positive-control", scenario_daemon_positive_control),
     ("tamper-corrupt-sig", scenario_tamper_corrupt_sig),
