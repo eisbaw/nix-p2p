@@ -824,16 +824,26 @@ TASK-120 prerequisite. For every supported arm/profile:
   count/enumeration vector** (622 offers naming 621 unasked content identities → at
   most one KNOWN content identity per transport kind; a legitimate known-only
   answer is **330 B, 3.75×**), consistent with the batch path's
-  `deny_unknown_fields`. It does **not** close enumeration in general: an
-  unknown-**KIND** offer is retained as an opaque value (only its `transport` tag is
-  read), so a hostile peer can still name content identities inside it and be
-  accepted-then-dropped — a pre-existing no-enumeration residual shared with the
-  batch path, tracked as **TASK-224**. Nor does it change the worst-case **byte**
-  amplification: that same unknown-kind slot is byte-unbounded, so a hostile
-  single-key `Have` can still pad to the **64 KiB** frame (~**744×**), exactly as
-  before TASK-110 and exactly as the batch path — the frame gate remains the only
-  byte bound (a per-offer byte cap is deferred, **TASK-223**). The single-key
-  hold-query cell is
+  `deny_unknown_fields`. The unknown-**KIND** enumeration vector is narrowed
+  SEPARATELY by **TASK-224**, which closes its **structural/list half**: the
+  shared tolerate-drop decoder now constrains an unknown offer to a whitelisted
+  minimal shape (the `transport` tag plus at most one scalar string locator) and
+  **REJECTS** any unknown offer whose body could name a *list* of identities (an
+  array, a nested object, more than one scalar field), on the claim path and both
+  hold-response paths. This is **not literal parity** with a known transport,
+  whose locator is type-validated and fixed-length: the one tolerated scalar is
+  unbounded and unvalidated, so a delimiter-crammed single string
+  (`{"transport":"future","loc":"blake3:a,blake3:b,…"}`) is still accepted and
+  still names identities as raw text — a **byte-volume residual owned by
+  TASK-223**, not closed here. A plausible future *single-locator* transport still
+  decodes inertly, but a future *multi-field* transport is now a hard decode error
+  (a disclosed forward-compat cost — foreclosing the multi-field vector and
+  tolerating a multi-field future are the same affordance). The worst-case
+  **byte** amplification is likewise unchanged: a well-shaped unknown-kind slot
+  still has a byte-unbounded single scalar, so a hostile single-key `Have` can
+  still pad to the **64 KiB** frame (~**744×**), exactly as before TASK-110 and
+  exactly as the batch path — the frame gate remains the only byte bound (a
+  per-offer byte cap is deferred, **TASK-223**). The single-key hold-query cell is
   supported for training on the same terms as the batch path.
 - **Privacy:** `upstream_only` emits zero P2P publication/query/serve records;
   `consume_only` emits zero publication and serve records and reports each
@@ -857,12 +867,21 @@ training, not values this document may guess:
   than relying on a per-probe timeout.
 - TASK-110 **(mechanism landed)** bounded the single-key offer COUNT with the same
   one-offer-per-transport-kind semantic rule as the batch path, closing the
-  KNOWN-offer count/enumeration vector (legitimate answer 330 B, 3.75×). It does
-  NOT close two pre-existing residuals shared with the batch path: enumeration via
-  the opaque unknown-**KIND** slot (it can still name content identities on the
-  wire — **TASK-224**) and worst-case BYTE amplification (still the 64 KiB frame,
-  ~744× via unknown-kind padding — **TASK-223**). The no-enumeration invariant is
-  therefore not yet fully discharged for either path; TASK-224 owns that.
+  KNOWN-offer count/enumeration vector (legitimate answer 330 B, 3.75×).
+  **TASK-224 (landed)** closes the **structural half** of the second vector —
+  enumeration via the opaque unknown-**KIND** slot — by narrowing the shared
+  tolerate-drop decoder to a whitelisted minimal shape (tag + at most one scalar
+  string locator) and rejecting any unknown offer that could name a *list* of
+  identities (array/nested/multi-field), on the claim path and both hold-response
+  paths, with forward-compat for a single-locator transport preserved (a
+  multi-field future transport is a disclosed hard-reject). The no-enumeration
+  invariant is therefore discharged **at the schema level** for both paths (a list
+  of identities is inexpressible), but **not literally**: the one tolerated scalar
+  is unbounded, so identities delimiter-crammed into a single string are still
+  accepted — a byte-volume residual, strictly more permissive than a type-validated
+  known-transport locator, owned by **TASK-223** (the same task that owns the
+  ~744× worst-case padding). Enumeration and byte-volume are the same residual
+  here: one unbounded opaque scalar.
 - TASK-120 must freeze a hashed, typed, **complete and owner-reviewed** budget
   artifact for every profile with numeric upload bytes/rate, concurrent serves,
   transient RAM, metadata/disk, fd, discovery work/traffic/deadline and

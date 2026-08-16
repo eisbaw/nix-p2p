@@ -157,6 +157,9 @@ const EXERCISED: &[&str] = &[
     "reject_batch_response_two_locators_of_one_kind",
     "reject_batch_answer_absent_with_a_field",
     "reject_hold_response_two_locators_of_one_kind",
+    "reject_hold_response_unknown_transport_names_content_ids",
+    "reject_batch_response_unknown_transport_names_content_ids",
+    "reject_claim_unknown_transport_names_content_ids",
 ];
 
 #[test]

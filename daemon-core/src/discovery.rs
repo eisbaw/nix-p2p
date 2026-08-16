@@ -57,9 +57,13 @@
 //! SHAPE: an honest peer's answer carries no keys of its own and is meaningless
 //! detached from the asker's own query. Probing X (alone or in a batch) reveals
 //! nothing about a key Y an honest peer also holds (proven by test, for both
-//! forms). RESIDUAL (task-224): the DECODER still ACCEPTS (then drops) an
-//! unknown-KIND offer body that names unqueried identities - a wire-acceptance
-//! gap shared with the single-key path, not an honest-peer leak.
+//! forms). The unknown-KIND decoder path is narrowed too (task-224): the shared
+//! tolerate-drop decoder REJECTS an unknown offer whose SHAPE (array / nested
+//! object / multiple scalar fields) could name a LIST of unqueried identities, so
+//! the schema-level list-smuggling vector is closed. A byte-volume residual
+//! remains (NOT closed): the one tolerated opaque scalar is unbounded, so a
+//! hostile peer can still delimiter-cram identities into a single string, bounded
+//! only by the 64 KiB frame - owned by task-223.
 //!
 //! ## Bounded miss (the real correctness point)
 //!
