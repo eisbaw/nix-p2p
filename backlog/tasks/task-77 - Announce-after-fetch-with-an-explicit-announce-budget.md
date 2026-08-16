@@ -5,7 +5,7 @@ status: In Progress
 assignee:
   - '@claude'
 created_date: '2026-08-09 21:01'
-updated_date: '2026-08-16 19:04'
+updated_date: '2026-08-16 20:15'
 labels:
   - wave-2b
 dependencies:
@@ -76,4 +76,6 @@ Bites proven by mutation: AC#2 remove the remaining==0 budget guard -> budget/ze
 e2e s9 confound fixed: node A fetches origin-direct (bypasses the testproxy) so the proxy NAR cache stays cold -> B is cleanly attributable to A and the kill-A control is a true origin miss (the first e2e run correctly caught the warm-cache confound at the kill-A oracle).
 
 CODEX DEEP GATE NO-GO on 1367cf8. AC#1/#3-eligibility/#5 PASS (231 hole NOT reopened - full fail-closed chain confirmed). FAILs: (AC#2) budget bite tests reserve_in not the production on_fetched, so removing the production reserve() leaves tests green + announces unbounded (oracle at wrong boundary); budget spent before eligibility + never refunded = invalid-fetch exhaustion vector. (AC#3/TASK-72) network-derived StorePath under-validated + UNPINNED GC lifetime -> can announce stale/GC-removed holdings it cannot serve. Fix cycle: production-load-bearing budget mutation + reserve-after-eligibility/refund + StorePath validation + GC-serveability (pin OR withdraw-on-unserveable OR honest-defer meeting never-announce-what-you-cant-serve).
+
+CODEX RE-GATE NO-GO(2) on ab3137f. AC#2 budget NOW FIXED; AC#1/eligibility/#5 PASS. AC#3 FAIL: real defects — (1) GC reconcile bite not production-wired (mutant removing dispatch->reconcile left tests green); (2) failed withdrawals forgotten (unconditional delete even on withdraw failure, no retry); (3) StorePath still accepts non-/nix/store (shape-only); (4) ambiguous-announce refund+forget leaves an untracked possibly-published record. TCB arbitration (orchestrator): eventually-consistent reconcile is acceptable per the project guarantee (a stale record -> Declined -> retry, within the TCB) IF the real defects are fixed + residual documented; strict GC-pin/periodic-sweep is a deferrable follow-up, not a blocker. Fix cycle dispatched.
 <!-- SECTION:NOTES:END -->
