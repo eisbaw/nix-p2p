@@ -3,11 +3,11 @@ id: TASK-231
 title: >-
   Shipped fabric-libp2p announcer must consume the seam-level eligibility
   witness (TASK-100 AC#6 residual)
-status: In Progress
+status: Done
 assignee:
   - '@claude'
 created_date: '2026-08-16 05:03'
-updated_date: '2026-08-16 13:27'
+updated_date: '2026-08-16 14:00'
 labels:
   - publication
 dependencies: []
@@ -22,10 +22,10 @@ The shipped fabric-libp2p AvailabilityAnnouncer must STRUCTURALLY consume the si
 
 ## Acceptance Criteria
 <!-- AC:BEGIN -->
-- [ ] #1 The seam AvailabilityAnnouncer::announce requires a mechanism-neutral eligibility witness (not a bare ProviderRecord); a bare-record announce does not compile
-- [ ] #2 The shipped fabric-libp2p announcer consumes the single TASK-102 decision (witness minted from ApprovedPublicProvision); a bypass makes a test fail
-- [ ] #3 The LAN/consume paths mint a distinct explicit witness (not allowlist-gated); upstream_only announces nothing
-- [ ] #4 Frozen wire untouched (golden vectors byte-identical); full gate incl just e2e green
+- [x] #1 The seam AvailabilityAnnouncer::announce requires a mechanism-neutral eligibility witness (not a bare ProviderRecord); a bare-record announce does not compile
+- [x] #2 The shipped fabric-libp2p announcer consumes the single TASK-102 decision (witness minted from ApprovedPublicProvision); a bypass makes a test fail
+- [x] #3 The LAN/consume paths mint a distinct explicit witness (not allowlist-gated); upstream_only announces nothing
+- [x] #4 Frozen wire untouched (golden vectors byte-identical); full gate incl just e2e green
 <!-- AC:END -->
 
 ## Implementation Notes
@@ -55,4 +55,13 @@ Mutation proof: removing self.eligibility.admit(record)? in fabric-libp2p announ
 Reviewer note for the DEEP gate: mped-architect judged the witness (AC#1) redundant with the announcer-authority (AC#2) and would drop it; KEPT because AC#1 explicitly and repeatedly mandates the compile-time bare-record-does-not-compile property + the ~46-site signature change. Adopted mpeds concrete findings: withdraw gate (E-hole), RefusePublication default + explicit AdmitAll opt-in, derive-outside-lock, per-fabric binding, contains_content_key in-process-admit-only.
 
 CODEX DEEP GATE NO-GO on c15a3f4 (2 real bypasses, orchestrator-confirmed in-code). AC#1/#4 PASS. FAIL: (1) SHADOW-ANNOUNCER - announcer constructors are pub + take eligibility as an arg, so a second announcer with AdmitAllPublication on a cloned SwarmHandle announces an unallowlisted record; authority is per-instance not sealed to the fabric. (2) CROSS-MODE WITHDRAW - announced floor re-seeded from disk without mode/authority provenance and withdraw() consults only floor membership, so LAN-AdmitAll-announce K -> restart same state-dir in public mode -> withdraw(K) emits an unallowlisted tombstone to the public DHT. Fix cycle: seal authority to the fabric (downgrade pub constructors; fabric assembly is sole binder from operator mode) + withdraw() consults CURRENT eligibility before put_record + add both bites mutation-proven.
+
+TASK-231 codex NO-GO FIXED (follow-up commit a4af0d0 on c15a3f4; not pushed).
+FIX A shadow-announcer: Libp2pAvailabilityAnnouncer::new/durable downgraded pub -> pub(crate); Libp2pFabric assembly is the SOLE builder, so the eligibility authority is sealed to the fabric/node (operator mode at assembly), not re-suppliable at announcer construction. With put_record/start_providing already pub(crate) (TASK-100), the only external path to the DHT is the fabrics own announcer with the fabrics own authority. SEAL PROVEN by a compile_fail (E0624) doc-test on the type (external construction does not compile).
+FIX B cross-mode withdraw: withdraw() now consults the CURRENT eligibility authority fail-closed (probe record carrying the key) BEFORE the exposure-ledger write and any put_record/stop_providing, on top of the existing announced-floor self-serve check. Closes the LAN-AdmitAll-announce -> persist -> PUBLIC-restart -> withdraw-emits-unallowlisted-tombstone leak (PRD 102/120/624). A de-allowlisted key expires via TTL; a public node emits ZERO unallowlisted records incl tombstones.
+Enumerated paths to the DHT (none admits an unallowlisted record on a public fabric): (1) announce -> per-fabric authority admit(witness.record()) fail-closed; (2) withdraw -> current-authority admit(probe) fail-closed + floor membership; (3) raw put_record/start_providing -> pub(crate) sealed; (4) announcer construction -> pub(crate), sole builder is fabric assembly which sets the authority from operator mode.
+Bites (all assert ExposureLedger == empty, per codex bite-quality note): NEW cross_mode_withdraw_of_an_unallowlisted_key_after_a_public_restart_is_refused (mutation: drop withdraw consult -> RED, verified); withdraw_refuses_a_key_this_node_never_announced (+ ledger empty); announce_refuses_an_unallowlisted_record_before_reaching_the_dht (+ ledger empty, mutation-proven prior); FIX A compile_fail seal doc-test.
+Gate all green: fmt --check; clippy --workspace --all-targets -D warnings (rc=0); check-no-floats; check-golden-vectors BYTE-IDENTICAL (AC#4); check-content-key-derivation; check-discovery-no-shortcut --self-test; peer-fabric/daemon-core/fabric-libp2p(27 blocks)/daemon-libp2p suites 0 failed; daemon libp2p integration 4/4. just e2e: ALL 5 SCENARIOS PASSED (s1/s2/tamper/chain/s6-p2p) rc=0, clean (no iroh flake this run). AC#1/AC#4 unchanged. Done/AC left for orchestrator.
+
+CODEX RE-GATE (c15a3f4 + a4af0d0): GO. Both prior bypasses sealed before DHT publication. FIX A (shadow-announcer): announcer new/durable -> pub(crate), Libp2pFabric::assemble is sole builder, eligibility set from operator mode (not re-suppliable); compile_fail E0624 doc-test bite, mutation-proven. FIX B (cross-mode withdraw): withdraw() consults current authority admit(probe) fail-closed BEFORE ledger/put_record/stop_providing; LAN-persist->public-restart test returns Ineligible(NotAllowlisted) with empty ExposureLedger, mutation-proven. All 3 adapter bites assert exposure_ledger empty. 4 publication paths enumerated (announce/withdraw/raw pub(crate)/construction) - none admit an unallowlisted record. AC#1/#4 regression-clean, golden byte-identical (orchestrator + codex confirmed). Full gate green incl just e2e 5/5. TASK-231 DONE - closes TASK-100 AC#6 residual.
 <!-- SECTION:NOTES:END -->
