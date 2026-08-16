@@ -106,6 +106,17 @@ fn lookup_label<T>(l: &Lookup<T>) -> &'static str {
     }
 }
 
+/// TASK-231: wrap a record in a PublicationWitness for the witness-taking `announce`. A test
+/// fabric is a genuinely-isolated in-process network built with the explicit
+/// `with_admit_all_publication()` authority, so the announcer admits and the record reaches the
+/// DHT exactly as before.
+fn eligible(record: &peer_fabric::ProviderRecord) -> peer_fabric::PublicationWitness {
+    use peer_fabric::PublicationEligibility;
+    peer_fabric::AdmitAllPublication
+        .authorize(record.clone())
+        .expect("admit-all authorizes a test record")
+}
+
 async fn wait_listen_addr(fabric: &Libp2pFabric) -> Multiaddr {
     for _ in 0..500 {
         if let Some(addr) = fabric.handle().listen_addrs().await.into_iter().next() {
@@ -159,8 +170,12 @@ async fn bootstrap_mode(args: &[String]) {
     let id_seed: u8 = args[2].parse().expect("id-seed");
     let peerid_file = PathBuf::from(&args[3]);
 
-    let fabric = Libp2pFabric::start(NodeConfig::new(seed32(id_seed)).with_network_scope(SCOPE))
-        .expect("bootstrap fabric starts");
+    let fabric = Libp2pFabric::start(
+        NodeConfig::new(seed32(id_seed))
+            .with_network_scope(SCOPE)
+            .with_admit_all_publication(),
+    )
+    .expect("bootstrap fabric starts");
     fabric
         .handle()
         .listen(
@@ -200,7 +215,9 @@ async fn provide_dht_mode(args: &[String]) {
 
     let supplier: Arc<dyn Libp2pNarSupplier> = Arc::new(MemoryNarSupplier::new([nar]));
     let fabric = Libp2pFabric::start_with_supplier(
-        NodeConfig::new(seed32(id_seed)).with_network_scope(SCOPE),
+        NodeConfig::new(seed32(id_seed))
+            .with_network_scope(SCOPE)
+            .with_admit_all_publication(),
         supplier,
     )
     .expect("provider fabric starts");
@@ -261,7 +278,10 @@ async fn provide_dht_mode(args: &[String]) {
     fabric
         .announcer()
         .expect("announcer present")
-        .announce(&signed, &AnnounceBudget::new(Duration::from_secs(20), 20))
+        .announce(
+            &eligible(&signed),
+            &AnnounceBudget::new(Duration::from_secs(20), 20),
+        )
         .await
         .expect("provider announce admitted");
 
@@ -302,6 +322,7 @@ async fn fetch_dht_mode(args: &[String]) {
     let fabric = Libp2pFabric::start(
         NodeConfig::new(seed32(id_seed))
             .with_network_scope(SCOPE)
+            .with_admit_all_publication()
             .with_kad_query_timeout(Duration::from_secs(disc_budget_secs)),
     )
     .expect("consumer fabric starts");

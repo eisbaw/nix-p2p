@@ -78,6 +78,15 @@ async fn body_bytes(resp: daemon::UpstreamResponse) -> Vec<u8> {
         .to_vec()
 }
 
+/// TASK-231: wrap a record in a PublicationWitness for the witness-taking `announce`. The provider
+/// fabric is built with the explicit AdmitAll test authority.
+fn eligible(record: &peer_fabric::ProviderRecord) -> peer_fabric::PublicationWitness {
+    use peer_fabric::PublicationEligibility;
+    peer_fabric::AdmitAllPublication
+        .authorize(record.clone())
+        .expect("admit-all authorizes a test record")
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn provider_serves_and_announces_a_nar_a_consumer_discovers_and_fetches_without_injection() {
     let scope = "task178-provider-path";
@@ -108,10 +117,13 @@ async fn provider_serves_and_announces_a_nar_a_consumer_discovers_and_fetches_wi
         relay_server_enabled: true,
     };
     let supplier = Arc::new(MemoryNarSupplier::new([nar.clone()]));
-    let (provider_fabric, _p_source, _p_raw_serve) =
-        build_libp2p_provider_source(provider_cfg, supplier)
-            .await
-            .expect("provider builder starts a serving fabric joined to the DHT");
+    let (provider_fabric, _p_source, _p_raw_serve) = build_libp2p_provider_source(
+        provider_cfg,
+        supplier,
+        Arc::new(peer_fabric::AdmitAllPublication),
+    )
+    .await
+    .expect("provider builder starts a serving fabric joined to the DHT");
 
     // The provider's REAL listen address - the no-injection oracle target below. C is NEVER
     // told this; it can only learn it through the DHT.
@@ -155,7 +167,10 @@ async fn provider_serves_and_announces_a_nar_a_consumer_discovers_and_fetches_wi
     provider_fabric
         .announcer()
         .expect("provider announces")
-        .announce(&record, &AnnounceBudget::new(Duration::from_secs(10), 20))
+        .announce(
+            &eligible(&record),
+            &AnnounceBudget::new(Duration::from_secs(10), 20),
+        )
         .await
         .expect("announce admitted (provider is DHT-joined)");
 

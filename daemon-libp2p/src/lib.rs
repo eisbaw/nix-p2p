@@ -40,8 +40,9 @@ use fabric_libp2p::{
 
 use ed25519_dalek::SigningKey;
 use peer_fabric::{
-    AnnounceBudget, Axis, Blake3Digest, ContentKey, DiscoveryBudget, NodeId, PeerFabric,
-    ProviderRecord, SafetyEnvelope, TransportOffer, TransportTag, require_axes,
+    AdmitAllPublication, AnnounceBudget, Axis, Blake3Digest, ContentKey, DiscoveryBudget,
+    IneligibleReason, NodeId, PeerFabric, ProviderRecord, PublicationEligibility,
+    RefusePublication, SafetyEnvelope, TransportOffer, TransportTag, require_axes,
     sign_provider_record,
 };
 
@@ -154,7 +155,8 @@ pub async fn build_libp2p_nar_source(
     ),
     String,
 > {
-    let fabric = start_and_join_libp2p(&cfg, None).await?;
+    // A pure consumer never announces, so its announcer authority is the fail-closed default.
+    let fabric = start_and_join_libp2p(&cfg, None, Arc::new(RefusePublication)).await?;
     Ok(wrap_consumer_source(fabric, &cfg))
 }
 
@@ -175,6 +177,7 @@ pub async fn build_libp2p_nar_source(
 pub async fn build_libp2p_provider_source(
     cfg: Libp2pSourceConfig,
     supplier: Arc<dyn Libp2pNarSupplier>,
+    publication_eligibility: Arc<dyn PublicationEligibility>,
 ) -> Result<
     (
         Arc<Libp2pFabric>,
@@ -183,7 +186,7 @@ pub async fn build_libp2p_provider_source(
     ),
     String,
 > {
-    let fabric = start_and_join_libp2p(&cfg, Some(supplier)).await?;
+    let fabric = start_and_join_libp2p(&cfg, Some(supplier), publication_eligibility).await?;
 
     // Unlike a CONSUMER (whose find_providers RETRIES until the routing table fills), a
     // provider's announce is a ONE-SHOT at startup and needs a non-empty kad routing table
@@ -566,7 +569,20 @@ pub async fn announce_provider_seeds(
     now: u64,
     budget: &AnnounceBudget,
 ) -> Result<Vec<ProviderRecord>, String> {
-    announce_seed_records(fabric, identity_seed, seeds, ttl_secs, now, budget).await
+    // LAN door (AC#3): the witness is minted via an EXPLICIT AdmitAllPublication - NOT
+    // allowlist-gated. On a PUBLIC-reachable node the fabric's OWN authority (allowlist or
+    // RefusePublication) still refuses at the adapter, so this permissive witness does not open a
+    // bypass; on a genuinely-isolated node the fabric's AdmitAll authority admits.
+    announce_seed_records(
+        fabric,
+        identity_seed,
+        seeds,
+        &AdmitAllPublication,
+        ttl_secs,
+        now,
+        budget,
+    )
+    .await
 }
 
 /// The shared raw-seed announce loop: TASK-56-verify every seed, then per key
@@ -579,6 +595,7 @@ async fn announce_seed_records(
     fabric: &Libp2pFabric,
     identity_seed: [u8; 32],
     seeds: &[(NarHashKey, Vec<u8>)],
+    witness_authority: &dyn PublicationEligibility,
     ttl_secs: u64,
     now: u64,
     budget: &AnnounceBudget,
@@ -600,8 +617,15 @@ async fn announce_seed_records(
         let sequence = fabric.next_announce_sequence(&provider_content_key(nar_hash));
         let record =
             sign_libp2p_provider_record(identity_seed, nar_hash, bytes, ttl_secs, now, sequence);
+        // TASK-231 (AC#1): mint the eligibility witness for THIS path's authority (AdmitAll for
+        // the LAN door, the allowlist for the public door), then hand it to `announce`. The
+        // announcer ALSO re-checks with its own per-fabric authority, so a public node still
+        // refuses an unallowlisted record even if this witness is permissive.
+        let witness = witness_authority.authorize(record.clone()).map_err(|e| {
+            format!("publication eligibility refused libp2p seed record for {nar_hash}: {e}")
+        })?;
         announcer
-            .announce(&record, budget)
+            .announce(&witness, budget)
             .await
             .map_err(|e| format!("announcing libp2p provider record for {nar_hash}: {e}"))?;
         records.push(record);
@@ -880,6 +904,59 @@ impl ApprovedPublicProvision {
     }
 }
 
+/// The single TASK-102 publication-eligibility decision as a PER-FABRIC authority the shipped
+/// announcer HOLDS (TASK-231, AC#2): it ADMITS exactly the derived [`ContentKey`]s of the NARs the
+/// [`PublicNarAllowlist`] proved public. The public provider path injects this so the announcer
+/// refuses - fail-closed, AT THE ADAPTER, before any `start_providing`/`put_record` - any record the
+/// allowlist did not approve. This is what structurally closes the bypass where a freely-minted LAN
+/// witness reached `announce` carrying an unallowlisted-but-signed record.
+pub struct AllowlistEligibility {
+    allowlist: Arc<PublicNarAllowlist>,
+}
+
+impl AllowlistEligibility {
+    /// An authority backed by `allowlist` - the SAME instance the public door consults, so the
+    /// announcer's re-check and the door's approve gate are ONE decision (single source of truth).
+    pub fn new(allowlist: Arc<PublicNarAllowlist>) -> Self {
+        AllowlistEligibility { allowlist }
+    }
+}
+
+impl PublicationEligibility for AllowlistEligibility {
+    fn admit(&self, record: &ProviderRecord) -> Result<(), IneligibleReason> {
+        allowlist_admits(&self.allowlist, record)
+    }
+}
+
+/// A BORROWED allowlist authority used only to MINT a public-announce witness at the door
+/// (transient): the public path's witness is thus genuinely allowlist-gated (AC#3), distinct from
+/// the LAN path's [`AdmitAllPublication`] witness. Never stored; `authorize` returns an owned witness
+/// and the borrow ends with the call.
+struct AllowlistWitnessAuthority<'a> {
+    allowlist: &'a PublicNarAllowlist,
+}
+
+impl PublicationEligibility for AllowlistWitnessAuthority<'_> {
+    fn admit(&self, record: &ProviderRecord) -> Result<(), IneligibleReason> {
+        allowlist_admits(self.allowlist, record)
+    }
+}
+
+/// The ONE admit rule both allowlist authorities share: a record is admitted iff its derived
+/// [`ContentKey`] matches an allowlisted NAR. The frozen `ProviderRecord` carries no `NarHash`
+/// preimage, so the allowlist reverse-derives each entry's key (see
+/// [`PublicNarAllowlist::contains_content_key`]). Fail-closed: no match -> refuse.
+fn allowlist_admits(
+    allowlist: &PublicNarAllowlist,
+    record: &ProviderRecord,
+) -> Result<(), IneligibleReason> {
+    if allowlist.contains_content_key(&record.key) {
+        Ok(())
+    } else {
+        Err(IneligibleReason::NotAllowlisted)
+    }
+}
+
 /// The shared record-signing announce loop. PRIVATE to this module: neither the public nor the
 /// private door is a bare-provision entry point reachable from outside. For each provision it
 /// durably allocates the announce sequence, signs a record whose `content` is the verified digest
@@ -888,6 +965,7 @@ async fn announce_store_records(
     fabric: &Libp2pFabric,
     identity_seed: [u8; 32],
     provisions: &[StoreProvision],
+    witness_authority: &dyn PublicationEligibility,
     ttl_secs: u64,
     now: u64,
     budget: &AnnounceBudget,
@@ -906,7 +984,14 @@ async fn announce_store_records(
             now,
             sequence,
         );
-        announcer.announce(&record, budget).await.map_err(|e| {
+        // TASK-231 (AC#1): mint this path's eligibility witness (see `announce_seed_records`).
+        let witness = witness_authority.authorize(record.clone()).map_err(|e| {
+            format!(
+                "publication eligibility refused libp2p store record for {}: {e}",
+                provision.nar_hash
+            )
+        })?;
+        announcer.announce(&witness, budget).await.map_err(|e| {
             format!(
                 "announcing libp2p store provider record for {}: {e}",
                 provision.nar_hash
@@ -936,7 +1021,17 @@ pub async fn announce_store_provisions(
     now: u64,
     budget: &AnnounceBudget,
 ) -> Result<Vec<ProviderRecord>, String> {
-    announce_store_records(fabric, identity_seed, provisions, ttl_secs, now, budget).await
+    // LAN door (AC#3): AdmitAll witness, as `announce_provider_seeds`.
+    announce_store_records(
+        fabric,
+        identity_seed,
+        provisions,
+        &AdmitAllPublication,
+        ttl_secs,
+        now,
+        budget,
+    )
+    .await
 }
 
 // -------------------------------------------------------------------------
@@ -1006,16 +1101,27 @@ pub async fn announce_public_provisions(
     // allowlisted, minting a claim-bearing capability, or the whole public announce is refused.
     let approved = approve_provisions_for_public(provisions, allowlist)
         .map_err(|rejected| format!("public announce refused by the allowlist gate: {rejected}"))?;
-    announce_approved_public(fabric, identity_seed, &approved, ttl_secs, now, budget).await
+    announce_approved_public(
+        fabric,
+        identity_seed,
+        &approved,
+        allowlist,
+        ttl_secs,
+        now,
+        budget,
+    )
+    .await
 }
 
 /// Announce a record per [`ApprovedPublicProvision`], the PUBLIC counterpart of
 /// [`announce_store_records`]. Consuming the capability (claim held) is what makes a public
-/// announce impossible without an allowlist-minted claim.
+/// announce impossible without an allowlist-minted claim. The witness is minted from the SAME
+/// `allowlist` (AC#2/#3): allowlist-gated, distinct from the LAN path's AdmitAll witness.
 async fn announce_approved_public(
     fabric: &Libp2pFabric,
     identity_seed: [u8; 32],
     approved: &[ApprovedPublicProvision],
+    allowlist: &PublicNarAllowlist,
     ttl_secs: u64,
     now: u64,
     budget: &AnnounceBudget,
@@ -1028,7 +1134,16 @@ async fn announce_approved_public(
             a.provision().clone()
         })
         .collect();
-    announce_store_records(fabric, identity_seed, &provisions, ttl_secs, now, budget).await
+    announce_store_records(
+        fabric,
+        identity_seed,
+        &provisions,
+        &AllowlistWitnessAuthority { allowlist },
+        ttl_secs,
+        now,
+        budget,
+    )
+    .await
 }
 
 // -------------------------------------------------------------------------
@@ -1126,10 +1241,13 @@ pub async fn announce_public_seeds(
             (a.nar_hash, a.bytes.clone())
         })
         .collect();
+    // Public door (AC#2/#3): mint the witness from the SAME allowlist (allowlist-gated), distinct
+    // from the LAN door's AdmitAll witness.
     announce_seed_records(
         fabric,
         identity_seed,
         &approved_seeds,
+        &AllowlistWitnessAuthority { allowlist },
         ttl_secs,
         now,
         budget,
@@ -1244,10 +1362,15 @@ fn wrap_consumer_source(
 async fn start_and_join_libp2p(
     cfg: &Libp2pSourceConfig,
     supplier: Option<Arc<dyn Libp2pNarSupplier>>,
+    publication_eligibility: Arc<dyn PublicationEligibility>,
 ) -> Result<Arc<Libp2pFabric>, String> {
     let mut node_config = NodeConfig::new(cfg.identity_seed)
         .with_network_scope(cfg.network_scope.clone())
-        .with_relay_server(cfg.relay_server_enabled);
+        .with_relay_server(cfg.relay_server_enabled)
+        // TASK-231 (AC#2): the announcer's per-fabric publication-eligibility authority. A pure
+        // CONSUMER passes RefusePublication (it never announces); a PROVIDER injects the
+        // allowlist-backed (public) or AdmitAll (isolated-LAN) decision from the composition root.
+        .with_publication_eligibility(publication_eligibility);
     // TASK-218: teach the node-locator the relays this node knows from bootstrap config,
     // so a discovery-only consumer can CONSTRUCT a NAT'd provider's /p2p-circuit
     // dial-address (<relayAddr>/p2p/<relayPeer>/p2p-circuit/p2p/<providerPeer>) from the

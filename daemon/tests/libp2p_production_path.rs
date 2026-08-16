@@ -238,6 +238,14 @@ impl RawUpstream for DeadPassthrough {
 // The pass-bar test.
 // -------------------------------------------------------------------------
 
+/// TASK-231: wrap a record for the witness-taking `announce`; provider uses AdmitAll test authority.
+fn eligible(record: &peer_fabric::ProviderRecord) -> peer_fabric::PublicationWitness {
+    use peer_fabric::PublicationEligibility;
+    peer_fabric::AdmitAllPublication
+        .authorize(record.clone())
+        .expect("admit-all authorizes a test record")
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn production_config_builds_libp2p_source_that_discovers_and_serves_with_clean_miss_fallback()
 {
@@ -264,7 +272,9 @@ async fn production_config_builds_libp2p_source_that_discovers_and_serves_with_c
     let provider_seed = [3u8; 32];
     let (provider, provider_listen_addr) = start_fabric(
         Libp2pFabric::start_with_supplier(
-            NodeConfig::new(provider_seed).with_network_scope(scope),
+            NodeConfig::new(provider_seed)
+                .with_network_scope(scope)
+                .with_admit_all_publication(),
             Arc::new(MemoryNarSupplier::new([nar.clone()])),
         )
         .expect("provider starts"),
@@ -286,7 +296,10 @@ async fn production_config_builds_libp2p_source_that_discovers_and_serves_with_c
     provider
         .announcer()
         .expect("provider announces")
-        .announce(&record, &AnnounceBudget::new(Duration::from_secs(10), 20))
+        .announce(
+            &eligible(&record),
+            &AnnounceBudget::new(Duration::from_secs(10), 20),
+        )
         .await
         .expect("announce admitted");
 

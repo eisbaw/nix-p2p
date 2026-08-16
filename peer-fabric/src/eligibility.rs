@@ -28,6 +28,43 @@
 
 use crate::content::ProviderRecord;
 
+/// An UNFORGEABLE in-process proof that a [`ProviderRecord`] passed a
+/// [`PublicationEligibility`] decision (TASK-231, AC#1). It WRAPS the record it authorises,
+/// so [`AvailabilityAnnouncer::announce`](crate::AvailabilityAnnouncer::announce) takes a
+/// witness rather than a bare record: a caller cannot ask the announcer to publish a record
+/// that did not pass an eligibility [`admit`](PublicationEligibility::admit).
+///
+/// It is minted ONLY by [`PublicationEligibility::authorize`], whose default body is the sole
+/// caller of the crate-private constructor - external [`PublicationEligibility`] impls
+/// implement only `admit` and CANNOT name the constructor, so they can neither forge a witness
+/// nor override `authorize` to mint one without consulting `admit`. Fail-closed by
+/// construction: no `admit`, no witness.
+///
+/// NEVER SERIALIZED: this is a purely in-process capability. It carries no wire form and does
+/// NOT touch any frozen surface (RawNarV1 / ContentKey / ProviderRecord codec / claim schema);
+/// the record it wraps is published in its own already-frozen encoding (AC#4). It is not a
+/// second trust anchor: a hostile backend is still caught by the signed-record / packet
+/// oracles (TASK-102/103); the witness is the cooperative adapter-level structural hook that
+/// makes "an un-consulted publish" UNREPRESENTABLE at the seam.
+#[derive(Debug, Clone)]
+pub struct PublicationWitness {
+    record: ProviderRecord,
+}
+
+impl PublicationWitness {
+    /// Mint a witness for `record`. Crate-private: the ONLY caller is
+    /// [`PublicationEligibility::authorize`]'s default body (which first consults `admit`), so a
+    /// witness cannot exist without an eligibility decision having admitted its record.
+    pub(crate) fn sealed(record: ProviderRecord) -> Self {
+        PublicationWitness { record }
+    }
+
+    /// The record this witness authorises the announcer to publish.
+    pub fn record(&self) -> &ProviderRecord {
+        &self.record
+    }
+}
+
 /// Why a publication was refused by the node's publication-eligibility decision. Typed
 /// so a rejected publish tells an un-allowlisted record from a named policy refusal
 /// (fail verbosely, never a silent drop).
@@ -64,8 +101,21 @@ impl std::error::Error for IneligibleReason {}
 /// [`AnnounceError::Ineligible`](crate::AnnounceError::Ineligible) and emits nothing).
 pub trait PublicationEligibility: Send + Sync {
     /// May `record` be published? `Ok(())` admits; `Err` REFUSES (fail-closed - the
-    /// caller must not publish on an `Err`).
+    /// caller must not publish on an `Err`). This is the ONE method an authority implements.
     fn admit(&self, record: &ProviderRecord) -> Result<(), IneligibleReason>;
+
+    /// Consult the decision for `record` and, IFF it admits, mint a [`PublicationWitness`]
+    /// proving so (TASK-231, AC#1). This is the ONLY way to obtain a witness, so a witness can
+    /// never exist without an [`admit`](PublicationEligibility::admit) having passed - the
+    /// fail-closed seam invariant that makes an un-consulted publish unrepresentable.
+    ///
+    /// It is a provided method deliberately NOT meant to be overridden: its body is the sole
+    /// caller of the crate-private [`PublicationWitness`] constructor, so an external impl that
+    /// tried to override it could not actually mint a witness. Implement only `admit`.
+    fn authorize(&self, record: ProviderRecord) -> Result<PublicationWitness, IneligibleReason> {
+        self.admit(&record)?;
+        Ok(PublicationWitness::sealed(record))
+    }
 }
 
 /// An authority that admits EVERY record. For the LAN-isolated / consume-side paths
@@ -120,6 +170,28 @@ mod tests {
             RefusePublication.admit(&record()),
             Err(IneligibleReason::NotAllowlisted),
             "the fail-closed authority refuses every record"
+        );
+    }
+
+    #[test]
+    fn authorize_mints_a_witness_only_when_admit_passes() {
+        // AC#1: the witness is minted iff admit admits, and it wraps the exact record.
+        let rec = record();
+        let witness = AdmitAllPublication
+            .authorize(rec.clone())
+            .expect("admit-all authorizes");
+        assert_eq!(
+            witness.record(),
+            &rec,
+            "the witness carries the record it authorises verbatim"
+        );
+
+        // A refusing authority mints NO witness (fail-closed): there is no witness for a record
+        // the decision did not admit, so the announcer can never be handed one.
+        assert_eq!(
+            RefusePublication.authorize(record()).err(),
+            Some(IneligibleReason::NotAllowlisted),
+            "a refusing authority yields Err, not a witness"
         );
     }
 }

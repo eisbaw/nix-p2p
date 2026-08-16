@@ -8,20 +8,20 @@
 //! wire". If the announcer skipped the eligibility consult (the mutation), the refusing
 //! case below would publish and record exposure, reddening the assertions.
 //!
-//! Honest scope: this proves the SEAM CONTRACT and the FAKE publish-capable adapter.
-//! The shipped `fabric-libp2p` announcer's public eligibility is enforced one layer up
-//! by the `ApprovedPublicProvision` gate (the single TASK-102 `PublicNarAllowlist`
-//! decision, bite-tested in `daemon-libp2p`), because the frozen `ProviderRecord` no
-//! longer carries the sha256 `NarHash` the allowlist is keyed by; threading a
-//! seam-level eligibility WITNESS as the required `announce` input across the shipped
-//! adapter + all call sites is a filed residual (see the task notes).
+//! Honest scope: this proves the SEAM CONTRACT and the FAKE publish-capable adapter. Since
+//! TASK-231 `announce` takes a [`PublicationWitness`] rather than a bare record (AC#1), and the
+//! announcer ALSO re-consults its OWN authority (AC#2) - so a witness minted by a PERMISSIVE
+//! authority and handed to a STRICTER announcer is still refused. The shipped `fabric-libp2p`
+//! announcer now carries the same per-fabric authority (the `PublicNarAllowlist`-backed
+//! decision on a public node), bite-tested in `fabric-libp2p` + `daemon-libp2p`.
 
 use std::sync::Arc;
 
 use peer_fabric::{
     AdmitAllPublication, AnnounceBudget, AnnounceError, AvailabilityAnnouncer, Blake3Digest,
     ContentKey, ExposureLedger, ExposureSurface, FakeAvailabilityAnnouncer, IneligibleReason,
-    NodeId, ProviderRecord, RefusePublication, TransportOffer,
+    NodeId, ProviderRecord, PublicationEligibility, PublicationWitness, RefusePublication,
+    TransportOffer,
 };
 
 fn record() -> ProviderRecord {
@@ -38,6 +38,14 @@ fn record() -> ProviderRecord {
     }
 }
 
+/// A witness minted by a PERMISSIVE authority (AdmitAllPublication). Handing THIS to a
+/// stricter announcer is exactly the vector the announcer's own re-check must refuse.
+fn admit_all_witness() -> PublicationWitness {
+    AdmitAllPublication
+        .authorize(record())
+        .expect("admit-all mints a witness")
+}
+
 // AC#6: a refusing eligibility authority makes the publish FAIL, fail-closed, and
 // NOTHING is emitted (no exposure recorded). This is the bypass bite: neutering the
 // announcer's eligibility consult would let this publish succeed.
@@ -52,7 +60,7 @@ async fn a_refusing_authority_blocks_the_publish_and_emits_nothing() {
     );
 
     let outcome = announcer
-        .announce(&record(), &AnnounceBudget::default())
+        .announce(&admit_all_witness(), &AnnounceBudget::default())
         .await;
 
     assert!(
@@ -81,7 +89,7 @@ async fn an_admitting_authority_lets_the_publish_through() {
     );
 
     let outcome = announcer
-        .announce(&record(), &AnnounceBudget::default())
+        .announce(&admit_all_witness(), &AnnounceBudget::default())
         .await;
     assert!(
         outcome.is_ok(),
@@ -101,7 +109,7 @@ async fn the_default_announcer_consumes_an_explicit_admit_all_authority() {
     // eligibility consult rather than skipping it.
     assert!(
         announcer
-            .announce(&record(), &AnnounceBudget::default())
+            .announce(&admit_all_witness(), &AnnounceBudget::default())
             .await
             .is_ok()
     );

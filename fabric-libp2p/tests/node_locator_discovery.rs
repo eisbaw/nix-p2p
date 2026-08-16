@@ -36,7 +36,9 @@ async fn start_serving_node(
     supplier: Arc<dyn Libp2pNarSupplier>,
 ) -> (Libp2pFabric, Multiaddr) {
     let fabric = Libp2pFabric::start_with_supplier(
-        NodeConfig::new([seed_byte; 32]).with_network_scope(scope),
+        NodeConfig::new([seed_byte; 32])
+            .with_network_scope(scope)
+            .with_admit_all_publication(),
         supplier,
     )
     .expect("swarm builds");
@@ -45,8 +47,12 @@ async fn start_serving_node(
 
 /// Bring up a pure consumer/bootstrap fabric (no supplier) listening on loopback.
 async fn start_node(seed_byte: u8, scope: &str) -> (Libp2pFabric, Multiaddr) {
-    let fabric = Libp2pFabric::start(NodeConfig::new([seed_byte; 32]).with_network_scope(scope))
-        .expect("swarm builds");
+    let fabric = Libp2pFabric::start(
+        NodeConfig::new([seed_byte; 32])
+            .with_network_scope(scope)
+            .with_admit_all_publication(),
+    )
+    .expect("swarm builds");
     bind_and_addr(fabric).await
 }
 
@@ -130,6 +136,17 @@ fn envelope() -> SafetyEnvelope {
     }
 }
 
+/// TASK-231: wrap a record in a PublicationWitness for the witness-taking `announce`. A test
+/// fabric is a genuinely-isolated in-process network built with the explicit
+/// `with_admit_all_publication()` authority, so the announcer admits and the record reaches the
+/// DHT exactly as before.
+fn eligible(record: &peer_fabric::ProviderRecord) -> peer_fabric::PublicationWitness {
+    use peer_fabric::PublicationEligibility;
+    peer_fabric::AdmitAllPublication
+        .authorize(record.clone())
+        .expect("admit-all authorizes a test record")
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn node_locator_resolves_dial_address_via_kad_and_fetches_without_injection() {
     let _ = tracing_subscriber::fmt::try_init();
@@ -180,7 +197,10 @@ async fn node_locator_resolves_dial_address_via_kad_and_fetches_without_injectio
     provider
         .announcer()
         .expect("announcer present")
-        .announce(&record_p, &AnnounceBudget::new(Duration::from_secs(10), 20))
+        .announce(
+            &eligible(&record_p),
+            &AnnounceBudget::new(Duration::from_secs(10), 20),
+        )
         .await
         .expect("P announce admitted");
 
@@ -347,6 +367,7 @@ async fn explicit_peers_only_resolves_from_static_book_with_zero_disclosure() {
     let node = Libp2pFabric::start(
         NodeConfig::new([0x20u8; 32])
             .with_network_scope(scope)
+            .with_admit_all_publication()
             .with_explicit_peer(configured_peer, [book_addr.clone()]),
     )
     .expect("swarm builds");

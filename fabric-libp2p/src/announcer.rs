@@ -49,9 +49,9 @@ use ed25519_dalek::SigningKey;
 use libp2p::PeerId;
 use peer_fabric::{
     AnnounceBudget, AnnounceError, AvailabilityAnnouncer, ContentKey, Disclosed, Exposure,
-    ExposureLedger, ExposureSurface, NodeId, ProviderRecord, ProviderWithdrawal, Receipt,
-    Recipient, decode_provider_assertion, encode_provider_record, encode_provider_withdrawal,
-    sign_provider_withdrawal,
+    ExposureLedger, ExposureSurface, NodeId, ProviderWithdrawal, PublicationEligibility,
+    PublicationWitness, Receipt, Recipient, decode_provider_assertion, encode_provider_record,
+    encode_provider_withdrawal, sign_provider_withdrawal,
 };
 
 use crate::keys::{provider_index_key, provider_value_key};
@@ -94,6 +94,16 @@ const _: () = assert!(
 pub struct Libp2pAvailabilityAnnouncer {
     handle: SwarmHandle,
     ledger: Arc<ExposureLedger>,
+    /// The PER-FABRIC publication-eligibility authority (TASK-231, AC#2). Consulted
+    /// FAIL-CLOSED on the record a [`PublicationWitness`] carries BEFORE any
+    /// `start_providing`/`put_record`, so this announcer publishes ONLY what its OWN authority
+    /// admits - even a witness minted by a MORE PERMISSIVE authority (e.g. an `AdmitAll`
+    /// LAN-door witness handed to a public announcer) is refused here. The authority IS the
+    /// node's audience: a public provider holds the `PublicNarAllowlist`-backed decision, a
+    /// genuinely-isolated LAN node an explicit `AdmitAllPublication`, and the fail-closed
+    /// default is `RefusePublication` (no announcer without an authority). This is the
+    /// load-bearing adapter invariant; the witness is the seam-level compile-time proof on top.
+    eligibility: Arc<dyn PublicationEligibility>,
     /// This node's identity - the announcer only publishes ITS OWN records (self-serve
     /// v1). The `peer_id` keys the value store; `node_id` is checked against the
     /// record's `provider`.
@@ -133,8 +143,17 @@ impl Libp2pAvailabilityAnnouncer {
         node_id: NodeId,
         peer_id: PeerId,
         signing_key: SigningKey,
+        eligibility: Arc<dyn PublicationEligibility>,
     ) -> Self {
-        Self::build(handle, ledger, node_id, peer_id, signing_key, None)
+        Self::build(
+            handle,
+            ledger,
+            node_id,
+            peer_id,
+            signing_key,
+            eligibility,
+            None,
+        )
     }
 
     /// An announcer whose per-key sequence floor is DURABLY backed by `seq_path`
@@ -147,6 +166,7 @@ impl Libp2pAvailabilityAnnouncer {
         node_id: NodeId,
         peer_id: PeerId,
         signing_key: SigningKey,
+        eligibility: Arc<dyn PublicationEligibility>,
         seq_path: PathBuf,
     ) -> Self {
         Self::build(
@@ -155,6 +175,7 @@ impl Libp2pAvailabilityAnnouncer {
             node_id,
             peer_id,
             signing_key,
+            eligibility,
             Some(seq_path),
         )
     }
@@ -165,6 +186,7 @@ impl Libp2pAvailabilityAnnouncer {
         node_id: NodeId,
         peer_id: PeerId,
         signing_key: SigningKey,
+        eligibility: Arc<dyn PublicationEligibility>,
         seq_path: Option<PathBuf>,
     ) -> Self {
         // HARD assert (not debug_assert): this is a signing surface on a data-integrity
@@ -187,6 +209,7 @@ impl Libp2pAvailabilityAnnouncer {
         Libp2pAvailabilityAnnouncer {
             handle,
             ledger,
+            eligibility,
             node_id,
             peer_id,
             signing_key,
@@ -297,9 +320,23 @@ fn mint_withdrawal(
 impl AvailabilityAnnouncer for Libp2pAvailabilityAnnouncer {
     async fn announce(
         &self,
-        record: &ProviderRecord,
+        witness: &PublicationWitness,
         budget: &AnnounceBudget,
     ) -> Result<Receipt, AnnounceError> {
+        let record = witness.record();
+
+        // TASK-231 (AC#2) - THE load-bearing adapter invariant: consult THIS fabric's OWN
+        // publication-eligibility authority FAIL-CLOSED before anything else, so no record this
+        // authority refuses can reach `start_providing`/`put_record` below. The witness proves
+        // SOME authority admitted the record, but a public announcer re-checks with its OWN
+        // (allowlist-backed) authority, so a permissive `AdmitAll` LAN-door witness carrying an
+        // UNALLOWLISTED record is REFUSED here rather than published to the public DHT. Removing
+        // this consult is the mutation the security bite catches (an unallowlisted-but-signed
+        // record would then reach the wire).
+        self.eligibility
+            .admit(record)
+            .map_err(AnnounceError::Ineligible)?;
+
         // Self-serve v1: a node publishes only records it itself signed, or the
         // composite value key (derived from OUR peer id) would not match what a
         // resolver computes from the provider `get_providers` returns. Fail fast on a
@@ -426,6 +463,28 @@ impl AvailabilityAnnouncer for Libp2pAvailabilityAnnouncer {
     }
 
     async fn withdraw(&self, key: &ContentKey) -> Result<Receipt, AnnounceError> {
+        // TASK-231 (mped DEEP-gate E-finding): a withdrawal ALSO emits a signed record naming
+        // `key` + this node to the public DHT, so "LAN-share emits ZERO records to the public
+        // DHT" (PRD 102/120/624) is violated if a caller can withdraw an ARBITRARY key. Enforce
+        // the self-serve invariant the module doc already CLAIMS ("only ever withdraws records
+        // it itself announced"): refuse a key absent from the per-key `announced` floor - the
+        // set of keys THIS node announced (re-seeded from disk on a durable restart). `announce`
+        // records the key into that floor (save-before-publish) only AFTER passing the
+        // eligibility consult above, so a refused announce leaves no key to later withdraw. This
+        // needs no allowlist at withdraw time: you can only retract what you (eligibly)
+        // published.
+        if !self
+            .announced
+            .lock()
+            .expect("announced-sequence mutex poisoned")
+            .contains_key(key)
+        {
+            return Err(AnnounceError::Rejected(format!(
+                "refusing to withdraw {key}: this node never announced it (self-serve v1 \
+                 retracts only its own records; a tombstone for an unannounced key would emit an \
+                 unauthorized record to the DHT)"
+            )));
+        }
         // AC#1: propagate a SIGNED withdrawal tombstone, not just a local stop_providing.
         // Two acts, in this order:
         //   1. put_record the signed ProviderWithdrawal on the SAME composite value key the

@@ -1092,6 +1092,35 @@ impl PublicNarAllowlist {
             .contains_key(nar_hash)
     }
 
+    /// Whether the NAR named by a derived [`ContentKey`] is allowlisted (TASK-231, AC#2).
+    ///
+    /// The frozen `ProviderRecord` an announcer publishes carries the derived
+    /// [`ContentKey`](peer_fabric::ContentKey), NOT the sha256 `NarHash` this allowlist is
+    /// keyed by (the derivation is one-way: `ContentKey =
+    /// blake3::derive_key(CONTENT_KEY_CONTEXT, NarHash)`, frozen by TASK-126). So at the
+    /// `admit(&record)` boundary the `NarHash` preimage is gone and the only way to answer
+    /// "is this record's key allowlisted?" is to derive each allowlisted entry's `ContentKey`
+    /// forward and match. `n` is the allowlisted set (small) and this runs at ANNOUNCE time
+    /// (startup/refresh), not per request; the reverse scan is FORCED by the frozen wire, so
+    /// do not "optimize" it into a stored `ContentKey`-index (that would duplicate `entries`,
+    /// the single source of truth, and add a coherence obligation on every `learn`).
+    ///
+    /// A caller-NAMED probe returning a single bool - NOT an enumeration surface (like
+    /// `contains`/`approved_size`, it leaks no inventory). IN-PROCESS `admit` USE ONLY: it must
+    /// never be wired to any status/CLI/RPC surface, or it becomes a preimage-free membership
+    /// oracle for a `ContentKey` a remote party holds. The derivation runs OUTSIDE the
+    /// `entries` lock (snapshot the keys, release, then derive), so a startup announce burst
+    /// does not contend the KDF loop against a concurrent `learn`.
+    pub fn contains_content_key(&self, key: &peer_fabric::ContentKey) -> bool {
+        let nar_hashes: Vec<NarHashKey> = {
+            let entries = self.entries.lock().expect("allowlist mutex poisoned");
+            entries.keys().copied().collect()
+        };
+        nar_hashes.iter().any(|nar_hash| {
+            &peer_fabric::ContentKey::derive_from_signed_nar_hash(nar_hash.as_bytes()) == key
+        })
+    }
+
     /// The approved NarSize for `nar_hash`, if allowlisted. Caller-named, like `contains`.
     pub fn approved_size(&self, nar_hash: &NarHashKey) -> Option<u64> {
         self.entries
@@ -1473,6 +1502,42 @@ Sig: nix-p2p-test-1:kvRtCi6KujoW6x7esqgP8QdiaaVX4OL1beI/xmfobVHzM/tSSqmy7jcnI7QD
 
     fn open_mem(trusted: TrustedNarKeys) -> PublicNarAllowlist {
         PublicNarAllowlist::in_memory(trusted)
+    }
+
+    #[test]
+    fn contains_content_key_matches_the_derived_key_of_an_allowlisted_nar() {
+        // TASK-231 AC#2 bite: after the APP NAR is proven public, its DERIVED ContentKey
+        // (what the frozen ProviderRecord carries - the NarHash preimage is gone) is
+        // recognised, and a foreign NAR's derived key is NOT. This is the reverse-derive the
+        // announcer's allowlist authority consults at admit(&record). If contains_content_key
+        // derived the WRONG recipe (or matched nothing), the announcer would refuse every
+        // allowlisted record; if it matched anything, it would admit an unallowlisted one.
+        let list = open_mem(trusted());
+        let app_key =
+            peer_fabric::ContentKey::derive_from_signed_nar_hash(app_nar_hash().as_bytes());
+        // Not allowlisted yet -> not recognised (fail-closed).
+        assert!(!list.contains_content_key(&app_key));
+
+        assert!(matches!(
+            list.learn(&app_hash(), APP_NARINFO),
+            LearnOutcome::Appended { .. }
+        ));
+        // Now the derived key of the proven NAR is recognised.
+        assert!(
+            list.contains_content_key(&app_key),
+            "the derived ContentKey of an allowlisted NarHash must be recognised"
+        );
+        // A DIFFERENT NarHash derives to a DIFFERENT key, which is NOT allowlisted.
+        let foreign_key = peer_fabric::ContentKey::derive_from_signed_nar_hash(
+            "sha256:1nn8563y6j55y003xjk1bvb1854abmigsas2jgzy4shy0f4vnzpa"
+                .parse::<NarHashKey>()
+                .unwrap()
+                .as_bytes(),
+        );
+        assert!(
+            !list.contains_content_key(&foreign_key),
+            "a NAR that was never proven public must not be recognised by its derived key"
+        );
     }
 
     #[test]

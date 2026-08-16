@@ -237,10 +237,13 @@ async fn shipped_store_announce_carries_verified_content_and_refuses_quarantined
         state_dir: None,
         relay_server_enabled: true,
     };
-    let (fabric, _source, _raw) =
-        build_libp2p_provider_source(cfg, Arc::new(MemoryNarSupplier::new([body.clone()])))
-            .await
-            .expect("production provider builder starts a serving fabric joined to the DHT");
+    let (fabric, _source, _raw) = build_libp2p_provider_source(
+        cfg,
+        Arc::new(MemoryNarSupplier::new([body.clone()])),
+        Arc::new(peer_fabric::AdmitAllPublication),
+    )
+    .await
+    .expect("production provider builder starts a serving fabric joined to the DHT");
     let _serve = fabric
         .server()
         .expect("provider fabric exposes a serve axis")

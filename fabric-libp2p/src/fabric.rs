@@ -141,6 +141,10 @@ impl Libp2pFabric {
         // They never enter the swarm here (the composition root separately dials the
         // bootstrap peers to JOIN the DHT; this is only the address-construction input).
         let known_relays = std::mem::take(&mut config.known_relays);
+        // The publication-eligibility authority (TASK-231, AC#2) is the announcer's per-fabric
+        // gate; capture it (an Arc clone) BEFORE `Node::start` consumes `config`, like the
+        // signing key above. It never enters the swarm.
+        let publication_eligibility = Arc::clone(&config.publication_eligibility);
         let node = Node::start(config)?;
         let ledger = Arc::new(ExposureLedger::new());
 
@@ -165,6 +169,7 @@ impl Libp2pFabric {
                 node.node_id,
                 node.peer_id,
                 signing_key,
+                publication_eligibility,
                 dir.join(ANNOUNCE_SEQ_FILENAME),
             ),
             None => Libp2pAvailabilityAnnouncer::new(
@@ -173,6 +178,7 @@ impl Libp2pFabric {
                 node.node_id,
                 node.peer_id,
                 signing_key,
+                publication_eligibility,
             ),
         });
         let announcer: Arc<dyn AvailabilityAnnouncer> = announcer_seq.clone();

@@ -23,10 +23,11 @@ use daemon_core::{
     PublicNarAllowlist, RawUpstream, RunConfig, SystemClock, UpstreamHttp, run,
 };
 use daemon_libp2p::{
-    LanReachability, LanShare, Libp2pCatalogProbe, Libp2pSourceConfig, announce_provider_seeds,
-    announce_public_provisions, announce_public_seeds, announce_store_provisions,
-    build_libp2p_nar_source, build_libp2p_provider_source, lan_isolation_or_refuse,
-    open_public_allowlist, resolve_durable_identity_seed, verify_store_provisions,
+    AllowlistEligibility, LanReachability, LanShare, Libp2pCatalogProbe, Libp2pSourceConfig,
+    announce_provider_seeds, announce_public_provisions, announce_public_seeds,
+    announce_store_provisions, build_libp2p_nar_source, build_libp2p_provider_source,
+    lan_isolation_or_refuse, open_public_allowlist, resolve_durable_identity_seed,
+    verify_store_provisions,
 };
 use ed25519_dalek::SigningKey;
 use fabric_libp2p::{
@@ -34,8 +35,8 @@ use fabric_libp2p::{
     raw_nar_helper_authorized,
 };
 use peer_fabric::{
-    AnnounceBudget, Axis, DiscoveryBudget, PeerFabric, SafetyEnvelope, ServeBudget, ServeHandle,
-    TransportTag,
+    AdmitAllPublication, AnnounceBudget, Axis, DiscoveryBudget, PeerFabric, PublicationEligibility,
+    RefusePublication, SafetyEnvelope, ServeBudget, ServeHandle, TransportTag,
 };
 use tokio::net::TcpListener;
 
@@ -415,6 +416,26 @@ fn lan_share_or_refuse(cfg: &Config) -> Result<LanShare, String> {
     Ok(share.expect("non-empty listen set yields a LanShare"))
 }
 
+/// The announcer's per-fabric publication-eligibility authority for a PROVIDER node (TASK-231,
+/// AC#2), matching the announce door it will use: a configured public allowlist -> the
+/// [`AllowlistEligibility`] backed by that SAME allowlist (the announcer refuses any record the
+/// allowlist did not approve); no allowlist but PROVABLY isolated -> an explicit
+/// [`AdmitAllPublication`]; a public-reachable node with no allowlist -> fail-closed
+/// [`RefusePublication`] (its LAN announce is also refused by `lan_share_or_refuse`, and now the
+/// adapter refuses too, so no unallowlisted record reaches the DHT by any path).
+fn provider_publication_authority(
+    cfg: &Config,
+    allowlist: &Arc<PublicNarAllowlist>,
+) -> Arc<dyn PublicationEligibility> {
+    if cfg.libp2p_public_allowlist_path.is_some() {
+        Arc::new(AllowlistEligibility::new(allowlist.clone()))
+    } else if lan_share_or_refuse(cfg).is_ok() {
+        Arc::new(AdmitAllPublication)
+    } else {
+        Arc::new(RefusePublication)
+    }
+}
+
 /// Node B (PROVIDER): start the fabric WITH a supplier, install the serve gate, and announce.
 /// Two supply modes (mutually exclusive at the CLI, TASK-191 MVP): the in-memory `--libp2p-seed-nar`
 /// path (holds the .nar at rest) and the `--libp2p-provide-store` path (serves a real `/nix/store`
@@ -423,7 +444,7 @@ fn lan_share_or_refuse(cfg: &Config) -> Result<LanShare, String> {
 async fn install_provider(
     cfg: &Config,
     source_cfg: Libp2pSourceConfig,
-    allowlist: &PublicNarAllowlist,
+    allowlist: &Arc<PublicNarAllowlist>,
 ) -> Result<(Arc<Libp2pFabric>, ProviderGuard), String> {
     warn_if_non_durable_provider(&source_cfg);
     let (fabric, guard) = if !cfg.libp2p_provide_store.is_empty() {
@@ -457,7 +478,7 @@ async fn install_provider(
 async fn install_seed_provider(
     cfg: &Config,
     source_cfg: Libp2pSourceConfig,
-    allowlist: &PublicNarAllowlist,
+    allowlist: &Arc<PublicNarAllowlist>,
 ) -> Result<(Arc<Libp2pFabric>, ProviderGuard), String> {
     let mut seeds: Vec<(daemon_core::NarHashKey, Vec<u8>)> =
         Vec::with_capacity(cfg.libp2p_seed_nar.len());
@@ -481,7 +502,9 @@ async fn install_seed_provider(
 
     let identity_seed = source_cfg.identity_seed;
     let supplier = Arc::new(MemoryNarSupplier::new(seeds.iter().map(|(_, b)| b.clone())));
-    let (fabric, _source, _raw) = build_libp2p_provider_source(source_cfg, supplier).await?;
+    let authority = provider_publication_authority(cfg, allowlist);
+    let (fabric, _source, _raw) =
+        build_libp2p_provider_source(source_cfg, supplier, authority).await?;
 
     let serve = fabric
         .server()
@@ -549,7 +572,7 @@ async fn install_seed_provider(
 async fn install_store_provider(
     cfg: &Config,
     source_cfg: Libp2pSourceConfig,
-    allowlist: &PublicNarAllowlist,
+    allowlist: &Arc<PublicNarAllowlist>,
 ) -> Result<(Arc<Libp2pFabric>, ProviderGuard), String> {
     let serve_budget = provider_serve_budget();
     let identity_seed = source_cfg.identity_seed;
@@ -591,7 +614,9 @@ async fn install_store_provider(
         Libp2pCatalogProbe::new(index.supply_catalog()),
         helper_program,
     ));
-    let (fabric, _source, _raw) = build_libp2p_provider_source(source_cfg, supplier).await?;
+    let authority = provider_publication_authority(cfg, allowlist);
+    let (fabric, _source, _raw) =
+        build_libp2p_provider_source(source_cfg, supplier, authority).await?;
 
     let serve = fabric
         .server()

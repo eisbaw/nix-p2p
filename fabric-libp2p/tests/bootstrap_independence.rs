@@ -39,8 +39,12 @@ use peer_fabric::{
 /// Bring up a node listening on an ephemeral loopback TCP port; returns the fabric and
 /// its concrete dial address.
 async fn start_node(seed_byte: u8, scope: &str) -> (Libp2pFabric, Multiaddr) {
-    let fabric = Libp2pFabric::start(NodeConfig::new([seed_byte; 32]).with_network_scope(scope))
-        .expect("swarm builds");
+    let fabric = Libp2pFabric::start(
+        NodeConfig::new([seed_byte; 32])
+            .with_network_scope(scope)
+            .with_admit_all_publication(),
+    )
+    .expect("swarm builds");
 
     fabric
         .handle()
@@ -113,6 +117,17 @@ async fn resolve_found(
     }
 }
 
+/// TASK-231: wrap a record in a PublicationWitness for the witness-taking `announce`. A test
+/// fabric is a genuinely-isolated in-process network built with the explicit
+/// `with_admit_all_publication()` authority, so the announcer admits and the record reaches the
+/// DHT exactly as before.
+fn eligible(record: &peer_fabric::ProviderRecord) -> peer_fabric::PublicationWitness {
+    use peer_fabric::PublicationEligibility;
+    peer_fabric::AdmitAllPublication
+        .authorize(record.clone())
+        .expect("admit-all authorizes a test record")
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn resolves_after_any_single_bootstrap_is_lost() {
     let _ = tracing_subscriber::fmt::try_init();
@@ -157,7 +172,10 @@ async fn resolves_after_any_single_bootstrap_is_lost() {
     provider
         .announcer()
         .unwrap()
-        .announce(&record1, &AnnounceBudget::new(Duration::from_secs(10), 20))
+        .announce(
+            &eligible(&record1),
+            &AnnounceBudget::new(Duration::from_secs(10), 20),
+        )
         .await
         .expect("provider announce admitted");
 
@@ -207,7 +225,10 @@ async fn resolves_after_any_single_bootstrap_is_lost() {
     provider
         .announcer()
         .unwrap()
-        .announce(&record2, &AnnounceBudget::new(Duration::from_secs(10), 20))
+        .announce(
+            &eligible(&record2),
+            &AnnounceBudget::new(Duration::from_secs(10), 20),
+        )
         .await
         .expect("fresh announce admitted with one bootstrap down");
 
@@ -265,7 +286,10 @@ async fn single_bootstrap_join_does_not_survive_its_only_bootstrap() {
     provider
         .announcer()
         .unwrap()
-        .announce(&record, &AnnounceBudget::new(Duration::from_secs(10), 20))
+        .announce(
+            &eligible(&record),
+            &AnnounceBudget::new(Duration::from_secs(10), 20),
+        )
         .await
         .expect("announce admitted through the single bootstrap");
 

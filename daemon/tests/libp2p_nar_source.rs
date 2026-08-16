@@ -231,6 +231,15 @@ impl RawUpstream for DeadPassthrough {
 // The pass-bar test.
 // -------------------------------------------------------------------------
 
+/// TASK-231: wrap a record in a PublicationWitness for the witness-taking `announce`. The
+/// provider fabric below is built with the explicit `with_admit_all_publication()` test authority.
+fn eligible(record: &peer_fabric::ProviderRecord) -> peer_fabric::PublicationWitness {
+    use peer_fabric::PublicationEligibility;
+    peer_fabric::AdmitAllPublication
+        .authorize(record.clone())
+        .expect("admit-all authorizes a test record")
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn daemon_discovers_via_libp2p_kad_and_serves_byte_identical_nar_with_clean_miss_fallback() {
     let scope = "task160-daemon-libp2p";
@@ -262,7 +271,9 @@ async fn daemon_discovers_via_libp2p_kad_and_serves_byte_identical_nar_with_clea
     let provider_seed = [3u8; 32];
     let (provider, provider_addr) = start_fabric(
         Libp2pFabric::start_with_supplier(
-            NodeConfig::new(provider_seed).with_network_scope(scope),
+            NodeConfig::new(provider_seed)
+                .with_network_scope(scope)
+                .with_admit_all_publication(),
             Arc::new(MemoryNarSupplier::new([nar.clone()])),
         )
         .expect("provider starts"),
@@ -300,7 +311,10 @@ async fn daemon_discovers_via_libp2p_kad_and_serves_byte_identical_nar_with_clea
     provider
         .announcer()
         .expect("provider announces")
-        .announce(&record, &AnnounceBudget::new(Duration::from_secs(10), 20))
+        .announce(
+            &eligible(&record),
+            &AnnounceBudget::new(Duration::from_secs(10), 20),
+        )
         .await
         .expect("announce admitted");
 

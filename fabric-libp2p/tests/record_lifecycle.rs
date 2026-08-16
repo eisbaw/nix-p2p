@@ -26,15 +26,30 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use ed25519_dalek::SigningKey;
 use fabric_libp2p::{Libp2pFabric, MAX_RECORD_TTL_SECS, Multiaddr, NodeConfig, PeerId};
 use peer_fabric::{
-    AnnounceBudget, AnnounceError, Blake3Digest, ContentKey, DiscoveryBudget, Lookup, NodeId,
-    PeerFabric, ProviderRecord, TransportOffer, sign_provider_record,
+    AdmitAllPublication, AnnounceBudget, AnnounceError, Blake3Digest, ContentKey, DiscoveryBudget,
+    Lookup, NodeId, PeerFabric, ProviderRecord, PublicationEligibility, PublicationWitness,
+    TransportOffer, sign_provider_record,
 };
+
+/// Wrap `record` in a [`PublicationWitness`] for the witness-taking `announce` (TASK-231). A
+/// test fabric is a genuinely-isolated in-process network, so it uses the explicit
+/// [`AdmitAllPublication`] authority; the announcer's own authority (also AdmitAll here)
+/// admits, so the record reaches the DHT exactly as before.
+fn eligible(record: &ProviderRecord) -> PublicationWitness {
+    AdmitAllPublication
+        .authorize(record.clone())
+        .expect("admit-all authorizes a test record")
+}
 
 /// Bring up a node listening on an ephemeral loopback TCP port; returns the fabric and
 /// its concrete dial address.
 async fn start_node(seed_byte: u8, scope: &str) -> (Libp2pFabric, Multiaddr) {
-    let fabric = Libp2pFabric::start(NodeConfig::new([seed_byte; 32]).with_network_scope(scope))
-        .expect("swarm builds");
+    let fabric = Libp2pFabric::start(
+        NodeConfig::new([seed_byte; 32])
+            .with_network_scope(scope)
+            .with_admit_all_publication(),
+    )
+    .expect("swarm builds");
 
     fabric
         .handle()
@@ -62,7 +77,9 @@ async fn start_node_durable(
     state_dir: std::path::PathBuf,
 ) -> (Libp2pFabric, Multiaddr) {
     let fabric = Libp2pFabric::start_durable(
-        NodeConfig::new([seed_byte; 32]).with_network_scope(scope),
+        NodeConfig::new([seed_byte; 32])
+            .with_network_scope(scope)
+            .with_admit_all_publication(),
         state_dir,
     )
     .expect("swarm builds");
@@ -154,7 +171,10 @@ async fn announce_rejects_an_over_cap_record_ttl() {
     let result = node
         .announcer()
         .unwrap()
-        .announce(&record, &AnnounceBudget::new(Duration::from_secs(5), 20))
+        .announce(
+            &eligible(&record),
+            &AnnounceBudget::new(Duration::from_secs(5), 20),
+        )
         .await;
     match result {
         Err(AnnounceError::Rejected(why)) => {
@@ -175,7 +195,7 @@ async fn announce_rejects_an_over_cap_record_ttl() {
         .announcer()
         .unwrap()
         .announce(
-            &ok_record,
+            &eligible(&ok_record),
             &AnnounceBudget::new(Duration::from_millis(300), 20),
         )
         .await
@@ -220,7 +240,10 @@ async fn announce_rejects_a_zero_signature_record_before_reaching_the_dht() {
     let result = node
         .announcer()
         .unwrap()
-        .announce(&unsigned, &AnnounceBudget::new(Duration::from_secs(5), 20))
+        .announce(
+            &eligible(&unsigned),
+            &AnnounceBudget::new(Duration::from_secs(5), 20),
+        )
         .await;
     match result {
         Err(AnnounceError::Rejected(why)) => assert!(
@@ -237,7 +260,7 @@ async fn announce_rejects_a_zero_signature_record_before_reaching_the_dht() {
         .announcer()
         .unwrap()
         .announce(
-            &signed,
+            &eligible(&signed),
             &AnnounceBudget::new(Duration::from_millis(300), 20),
         )
         .await
@@ -273,7 +296,9 @@ async fn announce_fails_closed_when_the_sequence_cannot_be_persisted() {
     let state_dir = blocker.join("state");
 
     let fabric = Libp2pFabric::start_durable(
-        NodeConfig::new([7u8; 32]).with_network_scope("persist-failclosed"),
+        NodeConfig::new([7u8; 32])
+            .with_network_scope("persist-failclosed")
+            .with_admit_all_publication(),
         state_dir,
     )
     .expect("fabric builds even with an unwritable state dir (load is best-effort)");
@@ -283,7 +308,10 @@ async fn announce_fails_closed_when_the_sequence_cannot_be_persisted() {
     let result = fabric
         .announcer()
         .unwrap()
-        .announce(&record, &AnnounceBudget::new(Duration::from_secs(5), 20))
+        .announce(
+            &eligible(&record),
+            &AnnounceBudget::new(Duration::from_secs(5), 20),
+        )
         .await;
     match result {
         Err(AnnounceError::Persist(_)) => {}
@@ -323,13 +351,19 @@ async fn withdrawal_retracts_one_of_two_concurrent_providers() {
     provider_p
         .announcer()
         .unwrap()
-        .announce(&record_p, &AnnounceBudget::new(Duration::from_secs(10), 20))
+        .announce(
+            &eligible(&record_p),
+            &AnnounceBudget::new(Duration::from_secs(10), 20),
+        )
         .await
         .expect("P announce admitted");
     provider_q
         .announcer()
         .unwrap()
-        .announce(&record_q, &AnnounceBudget::new(Duration::from_secs(10), 20))
+        .announce(
+            &eligible(&record_q),
+            &AnnounceBudget::new(Duration::from_secs(10), 20),
+        )
         .await
         .expect("Q announce admitted");
 
@@ -426,7 +460,7 @@ async fn a_rolled_back_record_is_rejected_by_the_durable_floor() {
         .announcer()
         .unwrap()
         .announce(
-            &record_new,
+            &eligible(&record_new),
             &AnnounceBudget::new(Duration::from_secs(10), 20),
         )
         .await
@@ -465,7 +499,7 @@ async fn a_rolled_back_record_is_rejected_by_the_durable_floor() {
         .announcer()
         .unwrap()
         .announce(
-            &record_old,
+            &eligible(&record_old),
             &AnnounceBudget::new(Duration::from_secs(10), 20),
         )
         .await
@@ -558,7 +592,7 @@ async fn a_restarted_provider_withdrawal_blocks_resurrection() {
         provider
             .announcer()
             .unwrap()
-            .announce(&record, &announce_budget)
+            .announce(&eligible(&record), &announce_budget)
             .await
             .expect("seq-5 announce admitted");
 
@@ -609,7 +643,7 @@ async fn a_restarted_provider_withdrawal_blocks_resurrection() {
     restarted
         .announcer()
         .unwrap()
-        .announce(&record, &announce_budget)
+        .announce(&eligible(&record), &announce_budget)
         .await
         .expect("seq-5 re-serve admitted by the substrate");
 

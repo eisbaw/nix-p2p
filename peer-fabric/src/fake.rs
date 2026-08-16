@@ -158,12 +158,16 @@ impl FakeAvailabilityAnnouncer {
 impl AvailabilityAnnouncer for FakeAvailabilityAnnouncer {
     async fn announce(
         &self,
-        record: &ProviderRecord,
+        witness: &crate::PublicationWitness,
         _budget: &AnnounceBudget,
     ) -> Result<Receipt, AnnounceError> {
-        // AC#6: consume the eligibility decision FIRST, fail-closed. A refused record
-        // never reaches "the wire" (here: never records exposure, never returns a
-        // receipt). Removing this consult is the mutation the seam bite catches.
+        // AC#2: consume the eligibility decision FIRST, fail-closed, on the record the witness
+        // carries. Even though the witness proves SOME authority admitted the record, this
+        // announcer re-checks with its OWN authority (a permissive witness handed to a strict
+        // announcer is still refused). A refused record never reaches "the wire" (here: never
+        // records exposure, never returns a receipt). Removing this consult is the mutation the
+        // seam bite catches.
+        let record = witness.record();
         self.eligibility
             .admit(record)
             .map_err(AnnounceError::Ineligible)?;

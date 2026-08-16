@@ -68,7 +68,8 @@ pub use content::{
     PROVIDER_SIGNATURE_LEN, ProviderRecord, ResolutionPolicy,
 };
 pub use eligibility::{
-    AdmitAllPublication, IneligibleReason, PublicationEligibility, RefusePublication,
+    AdmitAllPublication, IneligibleReason, PublicationEligibility, PublicationWitness,
+    RefusePublication,
 };
 pub use exposure::{Disclosed, Exposure, ExposureLedger, ExposureSurface, Recipient};
 pub use fabric::{PeerFabric, TransferRegistry};

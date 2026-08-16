@@ -130,9 +130,10 @@ async fn start_provider_and_announce(
 ) -> (Arc<Libp2pFabric>, peer_fabric::ServeHandle, ProviderRecord) {
     let seed = cfg.identity_seed;
     let supplier = Arc::new(MemoryNarSupplier::new([nar.to_vec()]));
-    let (fabric, _source, _raw) = build_libp2p_provider_source(cfg, supplier)
-        .await
-        .expect("production provider builder starts a serving fabric joined to the DHT");
+    let (fabric, _source, _raw) =
+        build_libp2p_provider_source(cfg, supplier, Arc::new(peer_fabric::AdmitAllPublication))
+            .await
+            .expect("production provider builder starts a serving fabric joined to the DHT");
     let serve = fabric
         .server()
         .expect("provider fabric exposes a serve axis")

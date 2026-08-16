@@ -18,24 +18,27 @@ use std::sync::Arc;
 use daemon::cacheinfo::DEFAULT_PRIORITY;
 use daemon::claim::CLAIM_SCHEMA_VERSION;
 use daemon::{
-    AddressLookupCapability, AllowlistRawServe, AnyRawServe, App, AvailabilityIndex, Blake3Digest,
-    CONNECT_TIMEOUT_MS, CacheInfo, Claim, CommandNarDumper, CorrelationStore,
-    DEFAULT_MAX_INFLIGHT_NAR_BYTES, DEFAULT_MAX_SERVE_DURATION, DEFAULT_MAX_SERVE_NAR_BYTES,
-    EndpointProfile, EndpointScope, FallbackNarSource, FileNarSupplier, HEADER_TIMEOUT_MS,
-    IdentitySource, InMemoryDiscovery, IrohNode, IrohNodeBuilder, IrohPeerAddr, IrohProviderConfig,
-    IrohTransport, KnownPayload, KnownTransport, LanReachability, LanShare, Libp2pCatalogProbe,
-    Libp2pSourceConfig, NarCatalog, NarDumper, NarHashKey, NarSource, NarinfoDiskCache,
-    NarinfoSource, NoRawServe, NodeId, NodeLocation, NodeLookupAuthorityAuthorization,
-    NodeLookupConfig, NodePublicationCapability, NodePublicationConfig, NodePublicationHandle,
-    NullAnnounce, NullCorrelation, NullStore, PublicNarAllowlist,
-    PublicationAuthorityAuthorization, RawServeDecision, RelayCapability, ServeBudget, StorePath,
-    SystemClock, TaskSupervisor, TransportNarSource, TransportRegistry, UpstreamHttp,
-    announce_provider_seeds, announce_public_provisions, announce_public_seeds,
+    AddressLookupCapability, AllowlistEligibility, AllowlistRawServe, AnyRawServe, App,
+    AvailabilityIndex, Blake3Digest, CONNECT_TIMEOUT_MS, CacheInfo, Claim, CommandNarDumper,
+    CorrelationStore, DEFAULT_MAX_INFLIGHT_NAR_BYTES, DEFAULT_MAX_SERVE_DURATION,
+    DEFAULT_MAX_SERVE_NAR_BYTES, EndpointProfile, EndpointScope, FallbackNarSource,
+    FileNarSupplier, HEADER_TIMEOUT_MS, IdentitySource, InMemoryDiscovery, IrohNode,
+    IrohNodeBuilder, IrohPeerAddr, IrohProviderConfig, IrohTransport, KnownPayload, KnownTransport,
+    LanReachability, LanShare, Libp2pCatalogProbe, Libp2pSourceConfig, NarCatalog, NarDumper,
+    NarHashKey, NarSource, NarinfoDiskCache, NarinfoSource, NoRawServe, NodeId, NodeLocation,
+    NodeLookupAuthorityAuthorization, NodeLookupConfig, NodePublicationCapability,
+    NodePublicationConfig, NodePublicationHandle, NullAnnounce, NullCorrelation, NullStore,
+    PublicNarAllowlist, PublicationAuthorityAuthorization, RawServeDecision, RelayCapability,
+    ServeBudget, StorePath, SystemClock, TaskSupervisor, TransportNarSource, TransportRegistry,
+    UpstreamHttp, announce_provider_seeds, announce_public_provisions, announce_public_seeds,
     announce_store_provisions, build_libp2p_nar_source, build_libp2p_provider_source,
     lan_isolation_or_refuse, resolve_durable_identity_seed, serve, verify_store_provisions,
 };
 use fabric_libp2p::{CatalogNarSupplier, Libp2pFabric, MemoryNarSupplier, Multiaddr, PeerId};
-use peer_fabric::{AnnounceBudget, PeerFabric, ServeHandle};
+use peer_fabric::{
+    AdmitAllPublication, AnnounceBudget, PeerFabric, PublicationEligibility, RefusePublication,
+    ServeHandle,
+};
 use tokio::net::TcpListener;
 
 /// A configured peer's iroh address: its `NodeId` and one-or-more direct sockets
@@ -1456,6 +1459,24 @@ fn lan_share_or_refuse(config: &Config) -> Result<LanShare, String> {
     })
 }
 
+/// The announcer's per-fabric publication-eligibility authority for a libp2p PROVIDER node
+/// (TASK-231, AC#2), matching the announce door it will use: a configured public allowlist -> the
+/// [`AllowlistEligibility`] backed by that SAME allowlist; no allowlist but PROVABLY isolated ->
+/// an explicit [`AdmitAllPublication`]; a public-reachable node with no allowlist -> fail-closed
+/// [`RefusePublication`] (so no unallowlisted record reaches the DHT by any path).
+fn provider_publication_authority(
+    config: &Config,
+    allowlist: &Arc<PublicNarAllowlist>,
+) -> Arc<dyn PublicationEligibility> {
+    if config.libp2p_public_allowlist_path.is_some() {
+        Arc::new(AllowlistEligibility::new(allowlist.clone()))
+    } else if lan_share_or_refuse(config).is_ok() {
+        Arc::new(AdmitAllPublication)
+    } else {
+        Arc::new(RefusePublication)
+    }
+}
+
 /// Node B (libp2p PROVIDER, TASK-178): start the libp2p fabric WITH a supplier serving
 /// the `--libp2p-seed-nar` NARs, install the serve gate under the daemon's serve budget,
 /// and announce a signed [`ProviderRecord`] for each seed so a consumer discovers it via
@@ -1467,7 +1488,7 @@ fn lan_share_or_refuse(config: &Config) -> Result<LanShare, String> {
 async fn install_libp2p_provider(
     config: &Config,
     cfg: Libp2pSourceConfig,
-    allowlist: &PublicNarAllowlist,
+    allowlist: &Arc<PublicNarAllowlist>,
 ) -> Result<
     (
         Arc<dyn NarSource>,
@@ -1548,7 +1569,9 @@ async fn install_libp2p_provider(
 
     // Start the fabric WITH the supplier (serve axis present) + join the DHT, and get its
     // consumer source/raw-serve from the SAME fabric (one identity, one listen).
-    let (fabric, source, raw_serve) = build_libp2p_provider_source(cfg, supplier).await?;
+    let authority = provider_publication_authority(config, allowlist);
+    let (fabric, source, raw_serve) =
+        build_libp2p_provider_source(cfg, supplier, authority).await?;
 
     // Install the serve gate (bounded by the serve budget). The returned ServeHandle MUST
     // live for the process; it goes in the guard `main` holds.
@@ -1655,7 +1678,7 @@ async fn install_libp2p_provider(
 async fn install_libp2p_store_provider(
     config: &Config,
     cfg: Libp2pSourceConfig,
-    allowlist: &PublicNarAllowlist,
+    allowlist: &Arc<PublicNarAllowlist>,
 ) -> Result<
     (
         Arc<dyn NarSource>,
@@ -1722,7 +1745,9 @@ async fn install_libp2p_store_provider(
         Libp2pCatalogProbe::new(index.supply_catalog()),
         helper_program,
     ));
-    let (fabric, source, raw_serve) = build_libp2p_provider_source(cfg, supplier).await?;
+    let authority = provider_publication_authority(config, allowlist);
+    let (fabric, source, raw_serve) =
+        build_libp2p_provider_source(cfg, supplier, authority).await?;
 
     let serve = fabric
         .server()
@@ -1833,7 +1858,7 @@ async fn setup_p2p_source(
     config: &Config,
     upstream: Arc<UpstreamHttp>,
     transport: Option<IrohTransport>,
-    public_allowlist: &PublicNarAllowlist,
+    public_allowlist: &Arc<PublicNarAllowlist>,
 ) -> Result<
     (
         Arc<dyn NarSource>,

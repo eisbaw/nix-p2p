@@ -23,7 +23,10 @@ use tokio::sync::{mpsc, oneshot};
 
 use crate::keys::{keypair_from_seed, node_id_of};
 use crate::nar::{self, ServeGate};
-use peer_fabric::{Blake3Digest, Lookup, NodeId, TransferError, Unavailable};
+use peer_fabric::{
+    AdmitAllPublication, Blake3Digest, Lookup, NodeId, PublicationEligibility, RefusePublication,
+    TransferError, Unavailable,
+};
 
 /// The shared serve-gate slot (TASK-157): the installed [`ServeGate`], or `None` when this
 /// node is not serving inbound NAR requests. Written by
@@ -1857,6 +1860,17 @@ pub struct NodeConfig {
     /// candidate and falls back to the plain kad-resolved address). A pure LOCATOR concern:
     /// it never enters the swarm and does not affect discovery or the kad routing table.
     pub known_relays: Vec<(PeerId, Multiaddr)>,
+    /// The node's PUBLICATION-ELIGIBILITY authority (TASK-231, AC#2): the per-fabric
+    /// [`PublicationEligibility`] the announcer consults FAIL-CLOSED before publishing any
+    /// record. It IS the node's audience/policy, singular per fabric (one fabric = one kad DHT
+    /// membership = one audience): a PUBLIC provider injects the `PublicNarAllowlist`-backed
+    /// decision; a genuinely-isolated LAN node an explicit [`AdmitAllPublication`]
+    /// ([`with_admit_all_publication`](NodeConfig::with_admit_all_publication)); a pure consumer
+    /// leaves the default. The DEFAULT is [`RefusePublication`] - fail-closed: a node that did
+    /// not EXPLICITLY choose a publication policy announces NOTHING (an `AdmitAll` default would
+    /// silently reopen the bypass). This is the ONE place the announcer's authority is set; it
+    /// never enters the swarm.
+    pub publication_eligibility: Arc<dyn PublicationEligibility>,
 }
 
 impl NodeConfig {
@@ -1870,6 +1884,11 @@ impl NodeConfig {
             relay_server_enabled: DEFAULT_RELAY_SERVER_ENABLED,
             peer_address_book: BTreeMap::new(),
             known_relays: Vec::new(),
+            // Fail-closed default (TASK-231, AC#2): a node that did not explicitly choose a
+            // publication policy refuses to publish anything. A publishing node opts in with
+            // `with_admit_all_publication` (isolated LAN) or `with_publication_eligibility`
+            // (the allowlist-backed public authority).
+            publication_eligibility: Arc::new(RefusePublication),
         }
     }
 
@@ -1922,6 +1941,29 @@ impl NodeConfig {
     pub fn with_known_relay(mut self, peer: PeerId, addr: Multiaddr) -> Self {
         self.known_relays.push((peer, addr));
         self
+    }
+
+    /// Set this node's publication-eligibility authority (TASK-231, AC#2, builder style). The
+    /// PUBLIC provider path injects the `PublicNarAllowlist`-backed decision here so the
+    /// announcer refuses any record the single TASK-102 allowlist did not approve. See
+    /// [`NodeConfig::publication_eligibility`].
+    pub fn with_publication_eligibility(
+        mut self,
+        eligibility: Arc<dyn PublicationEligibility>,
+    ) -> Self {
+        self.publication_eligibility = eligibility;
+        self
+    }
+
+    /// Declare this a GENUINELY-ISOLATED-LAN (or test) node whose announcer admits EVERY record
+    /// (TASK-231, AC#3, builder style): an EXPLICIT [`AdmitAllPublication`], never a silent
+    /// bypass. Use ONLY for a node provably not joined to any public substrate (no bootstrap, no
+    /// provider-addr, a loopback/link-local listen - the `lan_isolation_or_refuse` policy), or a
+    /// test fabric. A public-reachable node must instead inject the allowlist authority via
+    /// [`with_publication_eligibility`](NodeConfig::with_publication_eligibility); the default
+    /// ([`RefusePublication`]) fails closed.
+    pub fn with_admit_all_publication(self) -> Self {
+        self.with_publication_eligibility(Arc::new(AdmitAllPublication))
     }
 }
 

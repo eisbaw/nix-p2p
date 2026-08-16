@@ -124,9 +124,10 @@ async fn the_shipped_announce_path_refuses_a_mis_specified_seed() {
         relay_server_enabled: true,
     };
     let supplier = Arc::new(MemoryNarSupplier::new([nar.clone()]));
-    let (fabric, _source, _raw) = build_libp2p_provider_source(cfg, supplier)
-        .await
-        .expect("production provider builder starts a serving fabric joined to the DHT");
+    let (fabric, _source, _raw) =
+        build_libp2p_provider_source(cfg, supplier, Arc::new(peer_fabric::AdmitAllPublication))
+            .await
+            .expect("production provider builder starts a serving fabric joined to the DHT");
     let _serve = fabric
         .server()
         .expect("provider fabric exposes a serve axis")

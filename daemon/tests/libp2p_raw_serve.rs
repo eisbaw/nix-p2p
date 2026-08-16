@@ -293,6 +293,14 @@ fn nix_client_accepts(narinfo: &[u8], served: &[u8]) -> Result<(), String> {
 // The pass-bar test.
 // -------------------------------------------------------------------------
 
+/// TASK-231: wrap a record for the witness-taking `announce`; provider uses AdmitAll test authority.
+fn eligible(record: &peer_fabric::ProviderRecord) -> peer_fabric::PublicationWitness {
+    use peer_fabric::PublicationEligibility;
+    peer_fabric::AdmitAllPublication
+        .authorize(record.clone())
+        .expect("admit-all authorizes a test record")
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn libp2p_hit_under_compressed_narinfo_is_rewritten_to_raw_and_a_nix_client_accepts() {
     let scope = "task164-raw-serve";
@@ -320,7 +328,9 @@ async fn libp2p_hit_under_compressed_narinfo_is_rewritten_to_raw_and_a_nix_clien
     let provider_seed = [3u8; 32];
     let (provider, provider_addr) = start_fabric(
         Libp2pFabric::start_with_supplier(
-            NodeConfig::new(provider_seed).with_network_scope(scope),
+            NodeConfig::new(provider_seed)
+                .with_network_scope(scope)
+                .with_admit_all_publication(),
             Arc::new(MemoryNarSupplier::new([nar.clone()])),
         )
         .expect("provider starts"),
@@ -343,7 +353,10 @@ async fn libp2p_hit_under_compressed_narinfo_is_rewritten_to_raw_and_a_nix_clien
     provider
         .announcer()
         .expect("provider announces")
-        .announce(&record, &AnnounceBudget::new(Duration::from_secs(10), 20))
+        .announce(
+            &eligible(&record),
+            &AnnounceBudget::new(Duration::from_secs(10), 20),
+        )
         .await
         .expect("announce admitted");
 

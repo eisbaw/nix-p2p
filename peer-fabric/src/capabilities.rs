@@ -254,16 +254,23 @@ impl std::fmt::Display for AnnounceError {
 
 impl std::error::Error for AnnounceError {}
 
-/// "Tell the network I can serve this NAR." Eligibility - WHETHER this content may
-/// be published at all - is decided ABOVE the seam (TASK-102); the fabric only
-/// enforces the [`AnnounceBudget`] it is handed and publishes the already-eligible
-/// record. Records its exposure to the fabric ledger.
+/// "Tell the network I can serve this NAR." Eligibility - WHETHER this content may be
+/// published at all - is the single TASK-102 decision; `announce` takes a
+/// [`PublicationWitness`](crate::PublicationWitness) rather than a bare
+/// [`ProviderRecord`] (TASK-231, AC#1), so a caller cannot ask the announcer to publish a
+/// record that did not pass a [`PublicationEligibility`](crate::PublicationEligibility)
+/// `admit` - an un-consulted publish is UNREPRESENTABLE at the seam. A publish-capable
+/// backend ALSO consults its own per-fabric authority fail-closed before it emits any record
+/// (the load-bearing adapter invariant), so a witness minted by a permissive authority and
+/// handed to a stricter announcer is still refused. Records its exposure to the fabric ledger.
 #[async_trait]
 pub trait AvailabilityAnnouncer: Send + Sync {
-    /// Publish `record` under its [`ContentKey`], within `budget`.
+    /// Publish the record carried by `witness` under its [`ContentKey`], within `budget`. The
+    /// witness proves the record passed an eligibility decision (AC#1); the backend re-consults
+    /// its own authority before publishing (AC#2).
     async fn announce(
         &self,
-        record: &ProviderRecord,
+        witness: &crate::PublicationWitness,
         budget: &AnnounceBudget,
     ) -> Result<Receipt, AnnounceError>;
 

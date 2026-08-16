@@ -4,13 +4,15 @@
 //! the two binaries' publication policy cannot drift. Two levels of bite:
 //!
 //!   * `the_public_seed_door_refuses_an_unallowlisted_seed_on_a_real_fabric` - PROVIDER level, over
-//!     a real DHT-joined provider (the same harness `provider_seed_verification.rs` uses): a seed
-//!     that is NOT allowlisted is REFUSED by `announce_public_seeds` (the door the thin binary
-//!     routes through when `--libp2p-public-allowlist-path` is set), while the SAME seed announces
-//!     over the ISOLATED-LAN path (`announce_provider_seeds` + a `LanShare`). The LAN positive
-//!     proves the DHT announce genuinely works, so the public door's `Err` is attributable to the
-//!     allowlist gate, not a routing failure. MUTATION: drop the `approve_seeds_for_public(..)?`
-//!     gate inside `announce_public_seeds` -> the un-allowlisted seed announces -> RED.
+//!     a real DHT-joined provider. TWO refusals + one attribution positive:
+//!       - TASK-231 AC#3: the LAN door (`announce_provider_seeds` + a freely-minted `LanShare`) on a
+//!         PUBLIC-reachable node (built with the shipped fail-closed authority) is REFUSED AT THE
+//!         ADAPTER - the confirmed bypass, now closed. Before TASK-231 it announced ungated.
+//!       - The public door (`announce_public_seeds`, when `--libp2p-public-allowlist-path` is set)
+//!         refuses an un-allowlisted seed at its approve gate. MUTATION: drop the
+//!         `approve_seeds_for_public(..)?` gate -> the un-allowlisted seed announces -> RED.
+//!       - Attribution: the SAME seed announces over a genuinely-isolated AdmitAll node, so the LAN
+//!         refusal is the eligibility authority, not a transport/DHT failure.
 //!
 //!   * `the_shared_builder_populates_a_file_allowlist_that_approves_only_proven_seeds` - the SSOT
 //!     config builder both binaries call: `open_public_allowlist(None, ..)` yields a DISABLED
@@ -30,7 +32,9 @@ use daemon_libp2p::{
     approve_seeds_for_public, build_libp2p_provider_source, open_public_allowlist,
 };
 use fabric_libp2p::{Libp2pFabric, MemoryNarSupplier, Multiaddr, NodeConfig};
-use peer_fabric::{AnnounceBudget, DiscoveryBudget, PeerFabric, SafetyEnvelope, ServeBudget};
+use peer_fabric::{
+    AnnounceBudget, DiscoveryBudget, PeerFabric, RefusePublication, SafetyEnvelope, ServeBudget,
+};
 
 /// The real `app` fixture narinfo (NarHash sha256:0pgsb9..., NarSize 408), trusted-signed by
 /// `FIXTURE_PUBKEY` - the same fixture the lib-level door tests and the composite daemon's
@@ -97,6 +101,9 @@ async fn the_public_seed_door_refuses_an_unallowlisted_seed_on_a_real_fabric() {
     let nar = b"nix-archive-1 the raw NAR this provider honestly holds".to_vec();
     let seed_key = NarHashKey::from_raw_nar(&nar);
 
+    // The PUBLIC-reachable provider (bootstrapped into the DHT), built with the SHIPPED authority
+    // choice for a public-reach node with NO allowlist: fail-closed RefusePublication (TASK-231
+    // `provider_publication_authority`). Its announcer refuses ANY record at the adapter.
     let cfg = Libp2pSourceConfig {
         identity_seed: [8u8; 32],
         network_scope: scope.to_string(),
@@ -109,9 +116,10 @@ async fn the_public_seed_door_refuses_an_unallowlisted_seed_on_a_real_fabric() {
         relay_server_enabled: true,
     };
     let supplier = Arc::new(MemoryNarSupplier::new([nar.clone()]));
-    let (fabric, _source, _raw) = build_libp2p_provider_source(cfg, supplier)
-        .await
-        .expect("production provider builder starts a serving fabric joined to the DHT");
+    let (fabric, _source, _raw) =
+        build_libp2p_provider_source(cfg, supplier, Arc::new(RefusePublication))
+            .await
+            .expect("production provider builder starts a serving fabric joined to the DHT");
     let _serve = fabric
         .server()
         .expect("provider fabric exposes a serve axis")
@@ -120,10 +128,12 @@ async fn the_public_seed_door_refuses_an_unallowlisted_seed_on_a_real_fabric() {
         .expect("serve gate installs");
     let budget = AnnounceBudget::new(Duration::from_secs(10), 20);
 
-    // ISOLATED-LAN positive: the SAME (honest) seed announces over the LAN path, proving the DHT
-    // announce genuinely works - so the public door's refusal below is the allowlist gate, not a
-    // transport failure.
-    let lan_records = announce_provider_seeds(
+    // TASK-231 AC#3 BITE (the closed bypass): the LAN door (`announce_provider_seeds` with a
+    // freely-minted `LanShare::operator_assembled`) on a PUBLIC-reachable node is now REFUSED at
+    // the announcer's own fail-closed authority - the operator-named seed does NOT reach the public
+    // DHT. Before TASK-231 this announced ungated (the confirmed hole). MUTATION that reddens it:
+    // drop the `self.eligibility.admit(record)?` consult in the fabric-libp2p announcer.
+    let lan_refused = announce_provider_seeds(
         &fabric,
         [8u8; 32],
         &[(seed_key, nar.clone())],
@@ -132,13 +142,25 @@ async fn the_public_seed_door_refuses_an_unallowlisted_seed_on_a_real_fabric() {
         unix_now(),
         &budget,
     )
-    .await
-    .expect("the honest seed announces over the isolated-LAN path");
-    assert_eq!(lan_records.len(), 1, "one honest seed -> one LAN record");
+    .await;
+    let lan_err = lan_refused.expect_err(
+        "a public-reachable node must REFUSE an unallowlisted LAN-path announce at the adapter \
+         (TASK-231 AC#3); it announced ungated before the fix",
+    );
+    assert!(
+        lan_err.contains("eligibility") || lan_err.contains("not established publishable"),
+        "the LAN refusal must name the publication-eligibility decision: {lan_err}"
+    );
+    // ATTRIBUTION: the refusal above is `AnnounceError::Ineligible`, raised by the announcer's
+    // authority BEFORE any DHT op (the eligibility consult is the first thing `announce` does), so
+    // it can NOT be a transport/quorum failure - the error TYPE pins it to the publication-
+    // eligibility decision. That an ADMITTING authority lets the same record through (non-vacuous)
+    // is proven directly in `fabric-libp2p/tests/publication_eligibility_adapter.rs`.
 
     // PUBLIC door with an EMPTY allowlist (what `open_public_allowlist(None, ..)` yields): the seed
     // was never proven public via a trusted narinfo signature, so the door refuses the whole batch
-    // and announces NOTHING. This is the exact door the thin binary routes through in PUBLIC mode.
+    // at the approve gate and announces NOTHING. This is the exact door the thin binary routes
+    // through in PUBLIC mode.
     let empty =
         open_public_allowlist(None, &[], &[8u8; 32], &[]).expect("a disabled allowlist opens");
     let refused = announce_public_seeds(

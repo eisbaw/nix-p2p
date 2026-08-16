@@ -38,6 +38,17 @@ use peer_fabric::{
     sign_provider_record,
 };
 
+/// TASK-231: wrap a record in a PublicationWitness for the witness-taking `announce`. A test
+/// fabric is a genuinely-isolated in-process network built with the explicit
+/// `with_admit_all_publication()` authority, so the announcer admits and the record reaches the
+/// DHT exactly as before.
+fn eligible(record: &peer_fabric::ProviderRecord) -> peer_fabric::PublicationWitness {
+    use peer_fabric::PublicationEligibility;
+    peer_fabric::AdmitAllPublication
+        .authorize(record.clone())
+        .expect("admit-all authorizes a test record")
+}
+
 fn is_direct_tcp(addr: &Multiaddr) -> bool {
     !addr.iter().any(|p| matches!(p, Protocol::P2pCircuit))
         && addr.iter().any(|p| matches!(p, Protocol::Tcp(_)))
@@ -159,8 +170,12 @@ async fn discovery_only_consumer_resolves_loopback_provider_directly_and_compose
     let nar_hash = [0x21u8; 32];
 
     // R: public relay + kad bootstrap.
-    let relay = Libp2pFabric::start(NodeConfig::new([211u8; 32]).with_network_scope(scope))
-        .expect("relay fabric starts");
+    let relay = Libp2pFabric::start(
+        NodeConfig::new([211u8; 32])
+            .with_network_scope(scope)
+            .with_admit_all_publication(),
+    )
+    .expect("relay fabric starts");
     let relay_addr = bind_direct(&relay).await;
     let relay_peer = relay.peer_id();
     relay
@@ -171,7 +186,9 @@ async fn discovery_only_consumer_resolves_loopback_provider_directly_and_compose
     // P: the NAT'd provider. Serves the NAR; its REACHABLE address is the relay circuit.
     let supplier: Arc<dyn Libp2pNarSupplier> = Arc::new(MemoryNarSupplier::new([nar.clone()]));
     let provider = Libp2pFabric::start_with_supplier(
-        NodeConfig::new([212u8; 32]).with_network_scope(scope),
+        NodeConfig::new([212u8; 32])
+            .with_network_scope(scope)
+            .with_admit_all_publication(),
         supplier,
     )
     .expect("provider fabric starts");
@@ -214,7 +231,10 @@ async fn discovery_only_consumer_resolves_loopback_provider_directly_and_compose
     provider
         .announcer()
         .expect("announcer present")
-        .announce(&record, &AnnounceBudget::new(Duration::from_secs(10), 20))
+        .announce(
+            &eligible(&record),
+            &AnnounceBudget::new(Duration::from_secs(10), 20),
+        )
         .await
         .expect("provider announce admitted");
 
@@ -222,6 +242,7 @@ async fn discovery_only_consumer_resolves_loopback_provider_directly_and_compose
     let consumer = Libp2pFabric::start(
         NodeConfig::new([213u8; 32])
             .with_network_scope(scope)
+            .with_admit_all_publication()
             .with_known_relay(relay_peer, relay_addr.clone()),
     )
     .expect("consumer fabric starts");
@@ -319,8 +340,12 @@ async fn known_relays_compose_distinct_circuits_for_different_providers() {
 
     // R: a relay whose identity the consumer knows from config. It need not even be joined -
     // circuit CONSTRUCTION is a pure local operation from the provider PeerId + known relay.
-    let relay = Libp2pFabric::start(NodeConfig::new([221u8; 32]).with_network_scope(scope))
-        .expect("relay fabric starts");
+    let relay = Libp2pFabric::start(
+        NodeConfig::new([221u8; 32])
+            .with_network_scope(scope)
+            .with_admit_all_publication(),
+    )
+    .expect("relay fabric starts");
     let relay_addr = bind_direct(&relay).await;
     let relay_peer = relay.peer_id();
 
@@ -329,6 +354,7 @@ async fn known_relays_compose_distinct_circuits_for_different_providers() {
     let consumer = Libp2pFabric::start(
         NodeConfig::new([222u8; 32])
             .with_network_scope(scope)
+            .with_admit_all_publication()
             .with_known_relay(relay_peer, relay_addr.clone()),
     )
     .expect("consumer fabric starts");
