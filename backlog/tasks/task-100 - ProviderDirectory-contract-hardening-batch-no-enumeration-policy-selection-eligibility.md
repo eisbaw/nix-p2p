@@ -7,7 +7,7 @@ status: In Progress
 assignee:
   - '@claude'
 created_date: '2026-08-10 09:26'
-updated_date: '2026-08-16 06:27'
+updated_date: '2026-08-16 07:02'
 labels:
   - wave-2b
 dependencies:
@@ -105,4 +105,16 @@ PER-BLOCKER STATUS:
 - AC#5 kept (codex verified closed). Frozen wire untouched (golden byte-identical); no floats (tokio time is a timer dep, not a decision/measurement field).
 
 GATE from HEAD 3f3e929: peer-fabric 113 lib + 8 batch + 10 plan + 3 no-enum + 3 eligibility + 8 golden; fabric-libp2p 81 lib + all integration incl record_lifecycle 6; daemon-libp2p all pass; daemon-core 209 lib; daemon all pass (no_enumeration + golden_vectors); cargo fmt --check + clippy -D warnings clean (peer-fabric+fabric-libp2p); check-no-floats + check-discovery-no-shortcut --self-test + check-golden-vectors green; just e2e result appended after it completes.
+
+CODEX RE-GATE #2 FIX CYCLE (commit 587213e). Meta-pattern acknowledged: prior fixes covered only the one path each bite exercised; codex kept finding another public path. This round fixes at the CHOKE-POINT/type level and bites the OTHER paths.
+
+- BLOCKER AC#2 (fold ranked Miss above NotAttempted) FIXED. The rank fold let NotAttempted(A)+Miss(B) collapse to authoritative Miss/Completed. Replaced fold_key with a per-key KeyAcc: authoritative Miss ONLY if EVERY mechanism authoritatively Missed; any non-authoritative outcome (Unavailable, NotAttempted, deadline cut) blocks the Miss and keeps the key partial. OTHER-PATH bites: key_acc_miss_requires_every_mechanism_to_authoritatively_miss (unit) + a_not_attempted_plus_miss_across_mechanisms_is_not_a_miss (through the REGISTRY, using a NotAttemptedDirectory). Red under the rank fold; green now.
+- BLOCKER AC#4 (find_providers unbound on the DIRECT path) FIXED. Batch bound via for_request, but public find_providers returned an unbound Lookup and shipped callers (peer_source.rs:143/278) used it directly. Added find_providers_bound - a FREE FUNCTION (non-overridable) that drops any record not keyed to the queried key - and routed BOTH shipped direct callers (PeerFabricNarSource, PeerFabricRawServe) through it. OTHER-PATH bite: find_providers_bound_drops_an_unasked_key_on_the_direct_path (queried X, adapter returns record for Y -> Miss; control: correctly-keyed -> Found).
+- BLOCKER AC#3 (registry deadline-cut left pending keys Miss/Completed) FIXED. On a registry outer-timeout OR spent budget, every still-pending (not-Found) key is marked Unavailable(DeadlineExceeded), overriding any Miss (Miss is authoritative only if the whole consultation completed). OTHER-PATH bite (REGISTRY, not just default resolve_batch): the_registry_deadline_cut_marks_pending_keys_unavailable_not_miss (A Misses fast, B a budget-ignoring OverrunDirectory whose resolve_batch sleeps past the deadline -> keys Unavailable(DeadlineExceeded), not Miss, not Completed, cut < 300ms).
+- BLOCKER AC#6 (raw-publish bypass) FIXED (the RAW zero-check surface). SwarmHandle::start_providing/put_record were pub and reachable via the public Libp2pFabric::handle(), so a library caller could publish an unverified value skipping the verified announcer. Sealed both to pub(crate) (only the internal announcer, which verifies the signature, calls them). COMPILE-GUARD bite: a compile_fail,E0624 doc-test on handle() proving put_record is not publicly reachable. The validly-signed/UNALLOWLISTED eligibility hole stays TASK-231 (High/security) - this blocker was specifically the raw zero-check publish surface.
+- AC#5, MEDIUM: kept (codex verified). Frozen wire untouched; no floats.
+
+GATE from HEAD 587213e: peer-fabric 113 lib + 9 batch + 12 plan + 3 no-enum + 3 eligibility + 8 golden; fabric-libp2p lib + doc compile-guard (1) + integration; daemon-core; daemon-libp2p + daemon all pass (48 ok groups no fail; daemon-core+fabric-libp2p 17 ok groups no fail); cargo fmt --check + clippy -D warnings clean; check-no-floats + check-discovery-no-shortcut --self-test + check-golden-vectors green; just e2e result appended after it completes.
+
+HONEST uncovered-path check: the find_providers_bound choke-point covers the two SHIPPED direct callers; a NEW direct caller that used the raw trait find_providers would be unbound (mitigation: the raw method exists for adapters/tests; shipped consumption goes through the free function - a future direct caller must use find_providers_bound). The raw-publish seal covers SwarmHandle; fabric-iroh has its own separate publish path (not this seam). AC#6 unallowlisted-eligibility remains TASK-231.
 <!-- SECTION:NOTES:END -->
