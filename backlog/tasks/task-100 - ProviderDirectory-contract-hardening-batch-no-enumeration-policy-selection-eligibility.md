@@ -7,7 +7,7 @@ status: In Progress
 assignee:
   - '@claude'
 created_date: '2026-08-10 09:26'
-updated_date: '2026-08-16 07:18'
+updated_date: '2026-08-16 07:49'
 labels:
   - wave-2b
 dependencies:
@@ -124,4 +124,12 @@ Round-4 blockers (exact sites): (1) find_providers_bound wrong-key -> Miss (peer
 GENUINELY DONE + codex-verified (keep): AC#5 (no-default versioned plan), MEDIUM (alignment/FirstHolder sub-requests), the SwarmHandle raw-publish seal (pub(crate) + E0624 compile guard, no other public raw-write on this seam), the two shipped direct callers routed through find_providers_bound, registry deadline-cut marking, frozen wire byte-identical, no floats. fabric-iroh publishes node-address records (not content) so it is NOT a content-availability hole.
 RESIDUALS still open + honestly filed: TASK-231 (validly-signed-but-UNALLOWLISTED libp2p publication-eligibility hole, High/security - the real remaining security work); AC#3 shipped-discovery.rs integration onto the ProviderDirectory contract (needs its own task); the AC#4 raw-trait find_providers unbound for a NEW caller (discipline, not a live leak).
 STATUS: In Progress. Do NOT mark Done. This is a dedicated systematic-redesign effort, not another per-path patch round.
+
+SYSTEMATIC-REDESIGN plan (round-5, fresh context). Root cause across 4 codex rounds: outcome-finalization was computed per-path, so each path could treat a non-authoritative result as authoritative. FIX = ONE choke-point in resolve.rs all paths funnel through:
+(1) classify_lookup(key, Lookup) -> KeyResolution : the SINGLE wrong-key/empty-Found classifier. A Found filtered to the queried key; if the filter empties a non-empty answer (wrong-key) OR the answer was Found(vec![]) (empty) -> Unavailable(Backend), NEVER Miss, NEVER Found. Replaces bind_found. Used by the default resolve_batch AND find_providers_bound.
+(2) KeyAcc (pub(crate)) unchanged fold: authoritative Miss only if EVERY mechanism authoritatively Missed; any Unavailable/NotAttempted blocks the Miss.
+(3) finalize_batch(request, acc, deadline_cut, latency_ns, control_bytes) -> BatchResolution : the SINGLE batch finalizer. Per-key via KeyAcc::finalize; resource = if deadline_cut DeadlineCut else if all-authoritative Completed else MechanismDown (kills the false-Completed else-branch). Both the default resolve_batch and MechanismRegistry::resolve call it; neither computes resource itself.
+(4) Registry: an UnknownMechanism named in an explicit plan is noted as Unavailable(Backend) into every key acc (a planned mechanism that did NOT answer -> its keys cannot finalize as an authoritative Miss; Found still wins).
+(5) for_request rejects Found(vec![]) (EmptyFound) -> Found-never-empty holds at the public ctor.
+Round-4 blockers become rows of an EXHAUSTIVE finalizer test (resolve.rs unit, has pub(crate) access): classify over {Found-nonempty, Found-empty, wrong-key, Miss, Unavailable}; KeyAcc fold over {Found,Miss,Unavailable,NotAttempted}^2 x deadline_cut; plus registry integration rows for unregistered-plan-Miss and default/direct wrong-key. Frozen wire untouched; no floats.
 <!-- SECTION:NOTES:END -->
