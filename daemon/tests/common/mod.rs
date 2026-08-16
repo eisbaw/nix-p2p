@@ -238,22 +238,17 @@ pub async fn spawn_daemon(upstream_url: &str) -> (SocketAddr, DaemonHandle) {
 
 /// The upstream header timeout the in-process HARNESS runs with.
 ///
-/// TASK-109. `UpstreamHttp::new` defaults to 1000 ms, which is a PRODUCTION
-/// default chosen so a down upstream fails clean and fast (upstream.rs AC#6). It
-/// is the wrong number for a test harness: on a loaded CI box or a developer
-/// machine building in another terminal, a perfectly healthy loopback upstream can
-/// take longer than a second to return headers, and the daemon then - correctly by
-/// its own rules - answers 502. The test that asserted 200 fails, and it looks
-/// like a passthrough defect instead of a scheduling artifact.
+/// TASK-109 / TASK-111. `UpstreamHttp::new`'s PRODUCT default header timeout is now
+/// `HEADER_TIMEOUT_MS` = 15 s (TASK-111 raised it from a WAN-hostile 1000 ms so a
+/// slow-but-healthy upstream is not 502'd as if dead). The harness pins its OWN value
+/// regardless, for two reasons: (1) it must be INDEPENDENT of future product-default
+/// changes so a tuning of the product number never silently alters test timing, and
+/// (2) it wants a value that is "long enough that only a genuine hang reaches it" yet
+/// bites a real hang a little sooner in CI than the 15 s product default would.
 ///
-/// Ten seconds is not a tuned value. It is "long enough that only a genuine hang
-/// reaches it", which is the only property the harness needs. Tests that want to
-/// exercise the timeout ITSELF must set their own value explicitly rather than
-/// leaning on this one.
-///
-/// NOT changed here: the PRODUCT default. Whether 1000 ms is right for real users
-/// on a WAN link is a separate question, filed rather than silently answered under
-/// cover of a flake fix.
+/// Ten seconds is not a tuned value - it is exactly that "only a genuine hang reaches
+/// it" property, the only one the harness needs. Tests that exercise the timeout
+/// ITSELF must set their own value explicitly rather than leaning on this one.
 pub const HARNESS_HEADER_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// As [`spawn_daemon`] but with a caller-chosen cache-info (for AC#5 priority).

@@ -154,6 +154,12 @@ const NOT_ITEMS: &[(&str, &str)] = &[
         "The persisted StoreProvision/registration field name (TASK-82 unit-trap doc), \
          prose in a doc comment, not a test or item.",
     ),
+    (
+        "scenario_chain_timeout_boundary",
+        "An e2e SCENARIO function in scripts/e2e_harness.py (the L-vs-budget 200->502 \
+         flip pin), not a Rust item - cited by the TASK-111 header-timeout default doc. \
+         The evidence exists as a Python e2e scenario, outside the Rust SOURCES scanned here.",
+    ),
 ];
 
 /// Every `fn`, `const`, `static` and `type` name defined anywhere we look.

@@ -44,10 +44,16 @@
 //! h2/ALPN: the daemon still negotiates no ALPN protocol and speaks h1.1 over
 //! TLS, which cache.nixos.org accepts. Adding h2 remains a later concern.
 //!
-//! Fast-failure discipline (AC#6 / S2): a down upstream must not hang the build
-//! path. Connect and header reads are each bounded by a short timeout so a
-//! dead/black-holed upstream yields a clean 502 well within 2 s, letting Nix
-//! fall back.
+//! Fast-failure discipline (AC#6 / S2), and the TASK-111 split: a DEAD upstream
+//! must not hang the build path. That property is owned by the CONNECT bound - a
+//! refused / black-holed connect yields a clean 502 within `connect_timeout`
+//! (plain, ~1 RTT) or the frozen TLS budget (<= 10 s), letting Nix fall back. The
+//! HEADER bound is a DIFFERENT number for a DIFFERENT job (TASK-111): it tolerates a
+//! slow-but-HEALTHY upstream's own work (a WAN link, a loaded host, an upstream
+//! cache-miss) so the daemon does not 502 an upstream Nix itself would have kept.
+//! Raising the header timeout does NOT slow failing against a dead upstream - the
+//! header wait starts only AFTER a successful connect. See [`CONNECT_TIMEOUT_MS`]
+//! and [`HEADER_TIMEOUT_MS`] for the physics and the chosen defaults.
 //!
 //! Wave-1 simplifications, sound for the transparent proxy and documented so
 //! they are not mistaken for bugs:
@@ -235,6 +241,104 @@ pub const TLS_UPSTREAM_SCHEDULER_GRACE_MS: u64 = 1_000;
 /// via [`UpstreamHttp::with_body_idle_timeout`] to bite quickly.
 pub const BODY_IDLE_TIMEOUT_MS: u64 = 30_000;
 
+// ---------------------------------------------------------------------------
+// TASK-111: the connect vs header timeouts are DIFFERENT PHYSICS and DIFFERENT
+// FAILURE MODES - kept as two separate numbers, not one (AC#1).
+//
+//   * connect_timeout bounds REACHING the host (a TCP connect to a reachable peer
+//     is ~1 RTT). It is the fast-fail-against-a-DEAD upstream bound: a refused or
+//     black-holed connect yields a clean 502 within it and Nix falls back. It is
+//     independent of how much WORK the upstream then does.
+//   * header_timeout bounds the wait for RESPONSE HEADERS, which starts only AFTER
+//     a successful connect (+ TLS handshake). Header latency includes the UPSTREAM'S
+//     OWN WORK - a cache-miss upstream synthesising/compressing a NAR, a loaded or
+//     distant host. A slow-but-HEALTHY upstream here is NOT a dead one, and 502ing
+//     it as if it were is the wave-1 bug this task fixes.
+//
+// The wave-1 code set BOTH to 1000 ms under one "short by design: a down upstream
+// fails clean, fast" comment. That reasoning is sound for CONNECT and WRONG for
+// HEADER: a healthy upstream needing >1 s to return headers (a WAN link, a loaded
+// laptop, an upstream cache-miss doing real work) was indistinguishable from dead
+// and got a 502 - which needlessly bounces Nix to the next substituter. Observed
+// under 2x CPU oversubscription on loopback (no network at all).
+// ---------------------------------------------------------------------------
+
+/// Default plaintext TCP connect timeout (TASK-111 AC#1). Deliberately TIGHT: a
+/// TCP connect to a REACHABLE host is ~1 RTT, and this is the fast-fail-against-a-
+/// DEAD upstream bound (a refused / black-holed connect yields a clean 502 within
+/// it so Nix falls back). 1000 ms covers even a poor satellite RTT (~600 ms) with
+/// margin. It bounds ONLY the plaintext path; the TLS connect stage is instead the
+/// FROZEN `tls-upstream-v1` budget (connect <= 5 s, total <= 10 s). Tunable per-hop
+/// via [`UpstreamHttp::with_connect_timeout`] (AC#2 - it is no longer a hard-wired
+/// constant an operator cannot move and a test cannot pin).
+pub const CONNECT_TIMEOUT_MS: u64 = 1_000;
+
+/// Default upstream RESPONSE-HEADER timeout (TASK-111). DIFFERENT PHYSICS from the
+/// connect timeout (see the module note above): this bounds the wait for response
+/// headers AFTER connect, which includes the upstream's OWN work, so a slow-but-
+/// HEALTHY upstream must not be 502'd as if it were dead.
+///
+/// WHY 15 s (the wave-1 value was a WRONG 1000 ms - the bug this task fixes). 15 s is
+/// a deliberate COMPROMISE between two competing pressures on ONE segment - the wait
+/// for response headers (time-to-first-header AFTER connect):
+///   * LARGER tolerates a slow-but-HEALTHY upstream's think-time before it starts
+///     responding (a WAN cache-miss synthesising/compressing a NAR, a loaded host).
+///     Realistic header TTFB is a few seconds even in the bad cases; the observed
+///     loopback-oversubscription failures were >1 s. 15 s clears them comfortably.
+///   * SMALLER preserves the S2 no-hang property for the one failure mode this bound
+///     actually governs (connect-succeeds-then-header-silent; see IMPORTANT below),
+///     so the daemon does not sit for the ~300 s Nix itself would tolerate.
+///
+/// UNIT DISCIPLINE (do NOT re-import the recurring conflation): this is a HEADER-
+/// ARRIVAL bound, a DIFFERENT physical segment from BODY streaming. Nix's
+/// `stalled-download-timeout = 300 s` is an idle-receive timeout on the BODY (it
+/// fires only once a download is in progress and goes silent); THIS daemon's analog
+/// of that is [`BODY_IDLE_TIMEOUT_MS`] (30 s), NOT this constant. So 15 s is NOT
+/// "matched to Nix's 300 s" and is deliberately NOT trying to be "an order below Nix
+/// so we are never the weak link" - being below Nix's tolerance is what COULD make us
+/// the weak link, and 15 s accepts a narrow such window (a healthy upstream needing
+/// more than 15 s of pure think-time before its FIRST header is still 502'd) in
+/// exchange for bounding the connect-then-silent hang. What Nix's numbers DO establish
+/// is only the
+/// direction and magnitude of the fix: Nix tolerates ~300 s of no-progress and an
+/// UNLIMITED connect, so the old 1000 ms header bound was ~300x tighter than anything
+/// Nix would have given up at - indefensibly tight. 15 s is also in the same ballpark
+/// as the test harness's 10 s "only a genuine hang reaches it" value
+/// (`HARNESS_HEADER_TIMEOUT`). The >=100-observation campaign (TASK-228) is what
+/// replaces this compromise with a measured header-arrival distribution.
+///
+/// IMPORTANT - why raising this is SAFE for fast-fail: it does NOT slow failing
+/// against a DEAD upstream. A refused / black-holed CONNECT is bounded by
+/// `connect_timeout` (plain) or the frozen TLS budget; header_timeout starts only
+/// AFTER a successful connect + handshake (verified: `send()` returns on connect
+/// failure BEFORE `send_over`, and the h1 handshake does no network I/O). So the SOLE
+/// wall-clock segment it lengthens is connect-succeeds-then-header-silent.
+///
+/// DoS SURFACE (honest cost of raising it): a connected-but-hostile/broken upstream
+/// can now dribble out its header block and tie up a connection + inflight slot for
+/// up to 15 s instead of 1 s (a mild slowloris amplification). The upstream is
+/// operator-configured / semi-trusted, so this is low severity, but it IS a real
+/// widening of the hold window - tune down via `--connect-timeout-ms` is the WRONG
+/// lever (that bounds connect, not headers); use `--header-timeout-ms` if an operator
+/// fronts an untrusted upstream and wants the window back.
+///
+/// AC#3 - NON-COMPOSITION ACROSS A DAEMON CHAIN (TESTING.md task-33): for the chain
+/// ENTRY this seeds the shared end-to-end header-wait BUDGET propagated (shrinking)
+/// down every hop (`HOP_BUDGET_HEADER`); it is a per-hop ceiling, NOT a depth-
+/// composed deadline. The entry hop stays the binding constraint at exactly this
+/// value, so an upstream of header latency L is served iff `L + (depth-1) *
+/// per_hop_overhead < budget`; raising this default raises that 200->502 ceiling at
+/// every depth (the e2e `scenario_chain_timeout_boundary` pins the flip against an
+/// EXPLICIT `--header-timeout-ms`, so it is independent of this default). See the
+/// composing-budget module note above.
+///
+/// AC#5 CARVE-OFF (TASK-228): this default is the header-TTFB compromise argued
+/// above, NOT yet validated by a >=100-observation authenticated-HTTPS idle/loaded/
+/// WAN campaign that characterises the real HEADER-ARRIVAL distribution (kept
+/// distinct from body-idle) and proves replay-zero-502. That measurement is deferred
+/// to TASK-228 (which depends on this task).
+pub const HEADER_TIMEOUT_MS: u64 = 15_000;
+
 /// The frozen `tls-upstream-v1` connect budget: a whole-operation `total`
 /// deadline (DNS + TCP connect + TLS handshake) with per-stage caps on the
 /// `connect` and `handshake` legs. Each stage waits at most
@@ -399,9 +503,12 @@ impl UpstreamHttp {
             authority: authority_for(&host, port, 80),
             host,
             port,
-            // Short by design (AC#6): a down upstream fails clean, fast.
-            connect_timeout: Duration::from_millis(1000),
-            header_timeout: Duration::from_millis(1000),
+            // TASK-111: two DIFFERENT numbers (see [`CONNECT_TIMEOUT_MS`] /
+            // [`HEADER_TIMEOUT_MS`]). connect stays TIGHT (fast-fail against a dead
+            // upstream, ~1 RTT); header is WAN-sane (a slow-but-healthy upstream's
+            // own work is not a death). NOT the wave-1 single "short by design 1 s".
+            connect_timeout: Duration::from_millis(CONNECT_TIMEOUT_MS),
+            header_timeout: Duration::from_millis(HEADER_TIMEOUT_MS),
             body_idle_timeout: Duration::from_millis(BODY_IDLE_TIMEOUT_MS),
             transport: Transport::Plain,
             tls_budget: TlsBudget::tls_upstream_v1(),
@@ -416,8 +523,12 @@ impl UpstreamHttp {
             authority: authority_for(&host, port, 443),
             host,
             port,
-            connect_timeout: Duration::from_millis(1000),
-            header_timeout: Duration::from_millis(1000),
+            // TASK-111: connect_timeout governs ONLY the plaintext path; on TLS the
+            // connect stage is the frozen `tls-upstream-v1` budget. header_timeout
+            // still governs response-header arrival AFTER the TLS handshake on BOTH
+            // transports, so the WAN-sane default applies here too.
+            connect_timeout: Duration::from_millis(CONNECT_TIMEOUT_MS),
+            header_timeout: Duration::from_millis(HEADER_TIMEOUT_MS),
             body_idle_timeout: Duration::from_millis(BODY_IDLE_TIMEOUT_MS),
             transport: Transport::Tls {
                 config: Arc::new(client_config_with_roots(roots)),
@@ -436,7 +547,23 @@ impl UpstreamHttp {
         self
     }
 
-    /// Override this hop's header timeout (default 1000 ms).
+    /// Override this hop's plaintext CONNECT timeout (default [`CONNECT_TIMEOUT_MS`],
+    /// 1000 ms). TASK-111 AC#2: `connect_timeout` was previously a hard-wired
+    /// constant with NO setter - untunable by an operator and unpinnable by a test,
+    /// unlike `header_timeout`. This closes that asymmetry.
+    ///
+    /// This is the fast-fail-against-a-DEAD upstream bound and is DISTINCT from the
+    /// header timeout (different physics: reaching the host, ~1 RTT, vs the upstream's
+    /// own work). It governs ONLY the plaintext transport; the TLS connect stage is
+    /// the frozen `tls-upstream-v1` budget, tuned via [`Self::with_tls_budget`]. A
+    /// test injects a short value to pin fast-fail-against-dead quickly; an operator
+    /// fronting a distant upstream can widen it.
+    pub fn with_connect_timeout(mut self, connect_timeout: Duration) -> Self {
+        self.connect_timeout = connect_timeout;
+        self
+    }
+
+    /// Override this hop's header timeout (default [`HEADER_TIMEOUT_MS`], 15 s).
     ///
     /// SEMANTICS (TASK-33, composing budget): for the chain ENTRY (the hop the
     /// client talks to) this is the end-to-end header-wait budget seeded for the
@@ -1194,6 +1321,41 @@ mod tests {
         assert_eq!(default.total, v1.total);
         assert_eq!(default.connect, v1.connect);
         assert_eq!(default.handshake, v1.handshake);
+    }
+
+    #[test]
+    fn connect_and_header_defaults_are_distinct_and_wan_sane() {
+        // TASK-111 AC#1: two DIFFERENT numbers for DIFFERENT physics, not one.
+        // connect stays tight (fast-fail against a dead upstream, ~1 RTT); header is
+        // WAN-sane (tolerates the upstream's own work). Integer ms, no floats.
+        assert_eq!(CONNECT_TIMEOUT_MS, 1_000);
+        assert_eq!(HEADER_TIMEOUT_MS, 15_000);
+        // Compile-time: the header wait (upstream's own work) must tolerate more
+        // than connect (~1 RTT). Const block so a future edit that inverts them
+        // fails to BUILD, not just at test time (and clippy is happy - both const).
+        const _: () = assert!(HEADER_TIMEOUT_MS > CONNECT_TIMEOUT_MS);
+        // A fresh client carries the two distinct defaults on both transports.
+        let plain = UpstreamHttp::new("http://127.0.0.1:8080").unwrap();
+        assert_eq!(
+            plain.connect_timeout,
+            Duration::from_millis(CONNECT_TIMEOUT_MS)
+        );
+        assert_eq!(
+            plain.header_timeout,
+            Duration::from_millis(HEADER_TIMEOUT_MS)
+        );
+    }
+
+    #[test]
+    fn with_connect_timeout_is_tunable_like_header() {
+        // TASK-111 AC#2: connect_timeout is no longer a hard-wired constant - it has
+        // a setter, so an operator can tune it and a test can pin it.
+        let c = UpstreamHttp::new("http://127.0.0.1:8080")
+            .unwrap()
+            .with_connect_timeout(Duration::from_millis(250))
+            .with_header_timeout(Duration::from_millis(9_000));
+        assert_eq!(c.connect_timeout, Duration::from_millis(250));
+        assert_eq!(c.header_timeout, Duration::from_millis(9_000));
     }
 
     // --- TASK-25 AC#2: the TRANSPORT-unit cap arithmetic, unit-labelled ---------

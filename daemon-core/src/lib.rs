@@ -83,7 +83,7 @@ pub use source::{
 };
 pub use supply_catalog::{NarProductionSource, SupplyCatalogHandle, SupplyCatalogRecord};
 pub use transport::{BitTorrentInfoHash, NODE_ID_LEN, NodeId, NodeIdParseError};
-pub use upstream::UpstreamHttp;
+pub use upstream::{CONNECT_TIMEOUT_MS, HEADER_TIMEOUT_MS, UpstreamHttp};
 
 // TransportTag is a peer-fabric value type; re-exported for consumers that had it via the
 // daemon's former `transport_fetch` re-export. The daemon's own `Transport`/registry fetch

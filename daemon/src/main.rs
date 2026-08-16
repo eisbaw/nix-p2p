@@ -19,17 +19,18 @@ use daemon::cacheinfo::DEFAULT_PRIORITY;
 use daemon::claim::CLAIM_SCHEMA_VERSION;
 use daemon::{
     AddressLookupCapability, AllowlistRawServe, AnyRawServe, App, AvailabilityIndex, Blake3Digest,
-    CacheInfo, Claim, CommandNarDumper, CorrelationStore, DEFAULT_MAX_INFLIGHT_NAR_BYTES,
-    DEFAULT_MAX_SERVE_DURATION, DEFAULT_MAX_SERVE_NAR_BYTES, EndpointProfile, EndpointScope,
-    FallbackNarSource, FileNarSupplier, IdentitySource, InMemoryDiscovery, IrohNode,
-    IrohNodeBuilder, IrohPeerAddr, IrohProviderConfig, IrohTransport, KnownPayload, KnownTransport,
-    LanReachability, LanShare, Libp2pCatalogProbe, Libp2pSourceConfig, NarCatalog, NarDumper,
-    NarHashKey, NarSource, NarinfoDiskCache, NarinfoSource, NoRawServe, NodeId, NodeLocation,
-    NodeLookupAuthorityAuthorization, NodeLookupConfig, NodePublicationCapability,
-    NodePublicationConfig, NodePublicationHandle, NullAnnounce, NullCorrelation, NullStore,
-    PublicNarAllowlist, PublicationAuthorityAuthorization, RawServeDecision, RelayCapability,
-    ServeBudget, StorePath, SystemClock, TaskSupervisor, TransportNarSource, TransportRegistry,
-    UpstreamHttp, announce_provider_seeds, announce_public_provisions, announce_public_seeds,
+    CONNECT_TIMEOUT_MS, CacheInfo, Claim, CommandNarDumper, CorrelationStore,
+    DEFAULT_MAX_INFLIGHT_NAR_BYTES, DEFAULT_MAX_SERVE_DURATION, DEFAULT_MAX_SERVE_NAR_BYTES,
+    EndpointProfile, EndpointScope, FallbackNarSource, FileNarSupplier, HEADER_TIMEOUT_MS,
+    IdentitySource, InMemoryDiscovery, IrohNode, IrohNodeBuilder, IrohPeerAddr, IrohProviderConfig,
+    IrohTransport, KnownPayload, KnownTransport, LanReachability, LanShare, Libp2pCatalogProbe,
+    Libp2pSourceConfig, NarCatalog, NarDumper, NarHashKey, NarSource, NarinfoDiskCache,
+    NarinfoSource, NoRawServe, NodeId, NodeLocation, NodeLookupAuthorityAuthorization,
+    NodeLookupConfig, NodePublicationCapability, NodePublicationConfig, NodePublicationHandle,
+    NullAnnounce, NullCorrelation, NullStore, PublicNarAllowlist,
+    PublicationAuthorityAuthorization, RawServeDecision, RelayCapability, ServeBudget, StorePath,
+    SystemClock, TaskSupervisor, TransportNarSource, TransportRegistry, UpstreamHttp,
+    announce_provider_seeds, announce_public_provisions, announce_public_seeds,
     announce_store_provisions, build_libp2p_nar_source, build_libp2p_provider_source,
     lan_isolation_or_refuse, resolve_durable_identity_seed, serve, verify_store_provisions,
 };
@@ -282,12 +283,23 @@ struct Config {
     /// Opt-in in wave 1 so enabling it in the container/NixOS paths is a separate,
     /// reviewable change (filed: wire a default cache dir into the module + e2e).
     narinfo_cache_dir: Option<String>,
-    /// Per-hop upstream header timeout in milliseconds (default 1000). Exposed so
-    /// the fault x depth matrix (task-13) can move the 200->502 latency ceiling
-    /// deliberately and so an operator fronting a slow upstream can widen it. It
-    /// is a FIXED per-hop deadline that does NOT compose across a daemon chain
-    /// (task-33); see `UpstreamHttp::with_header_timeout`.
+    /// Per-hop upstream header timeout in milliseconds (default
+    /// [`HEADER_TIMEOUT_MS`] = 15000; TASK-111 raised it from a WAN-hostile 1000).
+    /// Bounds the wait for RESPONSE HEADERS after connect - the upstream's own work
+    /// (a cache-miss, a loaded/distant host) - so a slow-but-HEALTHY upstream is not
+    /// 502'd as if dead. Exposed so the fault x depth matrix (task-13) can move the
+    /// 200->502 latency ceiling deliberately and so an operator can tune it. It seeds
+    /// a per-hop deadline that does NOT depth-compose across a daemon chain (task-33);
+    /// see `UpstreamHttp::with_header_timeout`.
     header_timeout_ms: u64,
+    /// Per-hop plaintext CONNECT timeout in milliseconds (default
+    /// [`CONNECT_TIMEOUT_MS`] = 1000; TASK-111 AC#2). DISTINCT from the header
+    /// timeout - this is the fast-fail-against-a-DEAD upstream bound (~1 RTT to reach
+    /// the host), kept TIGHT so a down upstream 502s fast and Nix falls back. Governs
+    /// ONLY the plaintext transport (the TLS connect stage is the frozen
+    /// `tls-upstream-v1` budget). Newly operator-tunable; see
+    /// `UpstreamHttp::with_connect_timeout`.
+    connect_timeout_ms: u64,
     /// Node B (provider) mode: run an iroh-blobs provider seeded with the raw NARs
     /// named by `iroh_seed_nar`, in ADDITION to the normal HTTP daemon (so the node
     /// stays readiness-pollable and is a real peer). Off by default. The S6 harness
@@ -440,7 +452,8 @@ impl Default for Config {
             priority: DEFAULT_PRIORITY,
             want_mass_query: true,
             narinfo_cache_dir: None,
-            header_timeout_ms: 1000,
+            header_timeout_ms: HEADER_TIMEOUT_MS,
+            connect_timeout_ms: CONNECT_TIMEOUT_MS,
             iroh_provider: false,
             iroh_print_peer_address: false,
             iroh_state_dir: None,
@@ -524,6 +537,22 @@ impl Config {
                         ));
                     }
                     config.header_timeout_ms = ms;
+                }
+                "--connect-timeout-ms" => {
+                    let raw = value()?;
+                    let ms: u64 = raw
+                        .parse()
+                        .map_err(|e| format!("bad --connect-timeout-ms {raw:?}: {e}"))?;
+                    // Reject 0 (mirrors --header-timeout-ms, TASK-111 AC#2): a 0 ms
+                    // connect timeout fires before any TCP connect can complete, so
+                    // EVERY request 502s - a bricked daemon. The upper bound catches a
+                    // units typo. Range identical to the header timeout for symmetry.
+                    if !(1..=600_000).contains(&ms) {
+                        return Err(format!(
+                            "bad --connect-timeout-ms {ms}: must be 1..=600000 (0 bricks the daemon)"
+                        ));
+                    }
+                    config.connect_timeout_ms = ms;
                 }
                 "--store-dir" => config.store_dir = value()?,
                 "--priority" => {
@@ -2142,13 +2171,28 @@ async fn main() -> ExitCode {
     let upstream = match UpstreamHttp::new(&config.upstream) {
         Ok(upstream) => Arc::new(
             upstream
-                .with_header_timeout(std::time::Duration::from_millis(config.header_timeout_ms)),
+                .with_header_timeout(std::time::Duration::from_millis(config.header_timeout_ms))
+                .with_connect_timeout(std::time::Duration::from_millis(config.connect_timeout_ms)),
         ),
         Err(err) => {
             eprintln!("daemon: bad --upstream: {err}");
             return ExitCode::from(2);
         }
     };
+    // Fail-verbose UX (TASK-111, mped review): `connect_timeout` governs ONLY the
+    // plaintext connect; on a `https://` upstream the connect+handshake is the frozen
+    // `tls-upstream-v1` budget, so a NON-default --connect-timeout-ms is INERT there.
+    // An operator who set it expecting effect must see that it did nothing, rather
+    // than silently get no change (the primary production upstream, cache.nixos.org,
+    // is https - exactly where this trap bites).
+    if config.upstream.starts_with("https://") && config.connect_timeout_ms != CONNECT_TIMEOUT_MS {
+        eprintln!(
+            "daemon: WARNING: --connect-timeout-ms {} is INERT on an https:// upstream \
+             (the TLS connect+handshake is the frozen tls-upstream-v1 budget, not \
+             connect_timeout); it applies only to plaintext http:// upstreams",
+            config.connect_timeout_ms
+        );
+    }
 
     // Layer the persistent narinfo cache over the upstream when a cache dir is
     // configured (task-8). The SAME instance is the narinfo source AND the
@@ -2422,6 +2466,8 @@ mod tests {
                 "0",
                 "--header-timeout-ms",
                 "250",
+                "--connect-timeout-ms",
+                "750",
             ]
             .map(String::from),
         )
@@ -2431,6 +2477,41 @@ mod tests {
         assert_eq!(config.priority, 25);
         assert!(!config.want_mass_query);
         assert_eq!(config.header_timeout_ms, 250);
+        assert_eq!(config.connect_timeout_ms, 750);
+    }
+
+    #[test]
+    fn default_timeouts_are_distinct_connect_and_header_numbers() {
+        // TASK-111 AC#1: the two are DIFFERENT physics and DIFFERENT defaults, not
+        // one number. connect stays tight (fast-fail against dead); header is WAN-sane.
+        let config = Config::default();
+        assert_eq!(config.connect_timeout_ms, CONNECT_TIMEOUT_MS);
+        assert_eq!(config.header_timeout_ms, HEADER_TIMEOUT_MS);
+        assert_eq!(config.connect_timeout_ms, 1000);
+        assert_eq!(config.header_timeout_ms, 15000);
+        assert!(
+            config.header_timeout_ms > config.connect_timeout_ms,
+            "header (upstream's own work) must tolerate more than connect (~1 RTT)"
+        );
+    }
+
+    #[test]
+    fn connect_timeout_zero_is_rejected() {
+        // 0 ms bricks the daemon (every connect fails before it can complete),
+        // mirroring --header-timeout-ms; a units typo (seconds) is rejected too.
+        assert!(
+            Config::from_args(["--connect-timeout-ms".to_string(), "0".to_string()]).is_err(),
+            "0 must be rejected"
+        );
+        assert!(
+            Config::from_args(["--connect-timeout-ms".to_string(), "9999999".to_string()]).is_err()
+        );
+        assert_eq!(
+            Config::from_args(["--connect-timeout-ms".to_string(), "500".to_string()])
+                .unwrap()
+                .connect_timeout_ms,
+            500
+        );
     }
 
     #[test]

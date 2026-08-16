@@ -162,8 +162,9 @@ async fn h2_only_upstream_fails_closed_not_hang() {
         result.map(|r| r.status)
     );
     // Fail-CLOSED discipline (S2): the error is a transport SourceError the
-    // serving layer maps to 502, and it arrives fast (well within the 1000ms
-    // header timeout) - not a hang.
+    // serving layer maps to 502, and it arrives fast - a handshake/parse failure,
+    // not a header-wait timeout, so it is well within the 2 s bound below (and
+    // unaffected by TASK-111 raising the header-timeout default to 15 s) - not a hang.
     assert!(
         matches!(
             result,
