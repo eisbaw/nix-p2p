@@ -3,11 +3,11 @@ id: TASK-224
 title: >-
   Unknown-KIND transport offer can name content identities on the wire
   (no-enumeration residual; forward-compat tension)
-status: In Progress
+status: Done
 assignee:
   - '@me'
 created_date: '2026-08-15 20:17'
-updated_date: '2026-08-16 00:51'
+updated_date: '2026-08-16 01:12'
 labels:
   - irreversible
 dependencies: []
@@ -107,4 +107,6 @@ FINDING 1 (owning task - DONE): filed TASK-227 (full text-enumeration closure; a
 FINDING 6 (regression vectors - DONE): golden reject_hold_response_unknown_transport_non_string_tag (+EXERCISED); rust an_unknown_offer_with_a_non_string_tag_is_rejected (reject, 3 routes, mutation-proven); rust an_unknown_kind_offer_text_residual_is_documented_not_closed (residual oracle - tag/field-name/value cram all still ACCEPTED, pinned OPEN so TASK-227 closure flips it deliberately); the accept-inert tag+one-string case stays pinned by claim_unknown_transport_dropped + the forward-compat test.
 
 GATE (all green): cargo test -p daemon-core -p daemon 448/0 (2 unrelated iroh_node_lookup load-flakes, confirmed 15/15 green in isolation + a clean full rerun 448/0); cargo fmt --all --check; cargo clippy --workspace --all-targets -- -D warnings exit 0; check-no-floats rc=0; claim_wire_golden 16/16 + golden_vectors 2/2 + doc_citations green; just e2e 5/5 (s1 11/11, s2 9/9, tamper 4/4, chain 13/13, s6-p2p 11/11), exit 0. Mutation bite (guard neutralised -> RED, restored -> GREEN): list-form test, string-tag test, flipped claim-digest test, coherence test, golden every_reject_vector_is_refused. Frozen surface accept-only; emit byte-identical; RawNarV1/ContentKey/ProviderRecord preimage untouched. Commit 44ae8e7. Awaiting codex re-gate on the framing.
+
+DEEP gate CLOSED - codex GO (2026-08-16). DELIVERED: the shared tolerate-drop decoder now REJECTS (on all 3 routes: Claim.transports + single-key + batch hold-response) any unknown-KIND offer whose SHAPE could name a LIST of unqueried identities - array, nested object, multiple scalar fields, or a non-string/absent transport tag (strict string-tag allowlist). So the schema-level LIST-smuggling enumeration vector is closed, mutation-proven (reject_enumeration_shaped_unknown_offer). HONEST RESIDUAL (NOT closed here, owned by TASK-227): a single identity-shaped TEXT string can still ride in an accepted unknown offer via THREE channels - the transport tag, an extra field name, or the scalar value; a byte cap (TASK-223) bounds volume but does not eliminate this. ARBITRATION: this residual is format-cleanliness per the repo's own claim.rs:332 rule, NOT an honest-peer-holdings privacy leak (a hostile responder naming fake identities to an asker leaks nothing about any honest peer). Gate: 448/0, just e2e 5/5, valid golden byte-identical, frozen preimage untouched, no-floats. 3 codex NO-GO rounds, all on honest framing (the TASK-110 lesson recurred); the structural mechanism was verified airtight from round 1. Follow-ups: TASK-227 (full 3-channel text closure, Low/irreversible), TASK-223 (byte cap, annotated byte-only).
 <!-- SECTION:NOTES:END -->
