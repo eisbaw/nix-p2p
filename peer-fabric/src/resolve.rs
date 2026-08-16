@@ -266,8 +266,8 @@ pub enum ResourceOutcome {
     /// The caller's TOTAL deadline stopped the consultation before every key was
     /// attempted (a partial result - some keys are [`NotAttempted`](KeyResolution::NotAttempted)).
     DeadlineCut,
-    /// The mechanism could not be consulted at all (every attempted key is
-    /// [`Unavailable`](KeyResolution::Unavailable)).
+    /// At least one mechanism failed or otherwise did not answer authoritatively, or
+    /// the batch could not reach an authoritative verdict for every key.
     MechanismDown,
 }
 
@@ -994,11 +994,12 @@ impl MechanismRegistry {
 /// [`resolve_batch`](crate::ProviderDirectory::resolve_batch) and the
 /// [`MechanismRegistry`]) funnels through here; none computes a `ResourceOutcome` itself.
 ///
-/// The resource decision is CONSISTENT with [`BatchResolution::is_complete`] by
-/// construction: a batch is `Completed` IFF every key is authoritative and no deadline
-/// cut occurred; a cut is `DeadlineCut`; anything else non-authoritative is
+/// The resource decision preserves mechanism-level failures that the per-key fold can
+/// intentionally mask with a `Found`: a batch is `Completed` only if every key is
+/// authoritative, no mechanism produced a non-authoritative observation, and no
+/// deadline cut occurred. A cut is `DeadlineCut`; anything else non-authoritative is
 /// `MechanismDown`. There is no branch that reports `Completed` while a key is
-/// non-authoritative (round-4 blocker #4).
+/// non-authoritative or a consulted mechanism failed.
 pub(crate) fn finalize_batch(
     request: &BatchResolveRequest,
     acc: Vec<KeyAcc>,
@@ -1011,12 +1012,18 @@ pub(crate) fn finalize_batch(
         request.keys().len(),
         "the finalizer accumulators are positional over the request keys"
     );
+    // Inspect the raw mechanism observations before finalizing the per-key folds. A
+    // later Found correctly wins for the key, but must not erase the fact that another
+    // consulted mechanism was Unavailable or otherwise non-authoritative.
+    let any_mechanism_non_authoritative = acc.iter().any(KeyAcc::saw_non_authoritative_observation);
     let outcomes: Vec<KeyResolution> = acc.into_iter().map(KeyAcc::finalize).collect();
     let all_authoritative = outcomes.iter().all(KeyResolution::is_authoritative);
-    // THE ONE RULE for the envelope: a cut is never Completed; Completed requires EVERY
-    // key authoritative; everything else non-authoritative is a down mechanism (partial).
+    // THE ONE RULE for the envelope, in precedence order: deadline cut, any raw
+    // mechanism-level non-authoritative observation, all keys authoritative, fallback.
     let resource = if deadline_cut {
         ResourceOutcome::DeadlineCut
+    } else if any_mechanism_non_authoritative {
+        ResourceOutcome::MechanismDown
     } else if all_authoritative {
         ResourceOutcome::Completed
     } else {
@@ -1074,6 +1081,13 @@ impl KeyAcc {
         if self.unavailable.is_none() {
             self.unavailable = Some(why);
         }
+    }
+
+    /// Whether any mechanism failed or otherwise did not answer authoritatively.
+    /// This remains observable even when `finalize` correctly selects a `Found` for
+    /// the key, allowing the batch envelope to retain mechanism-level health.
+    fn saw_non_authoritative_observation(&self) -> bool {
+        self.unavailable.is_some() || self.saw_not_authoritative
     }
 
     /// Decide the key's final outcome. Found wins; else any Unavailable reason (a dead
@@ -1410,6 +1424,52 @@ mod tests {
         }
     }
 
+    /// Independent envelope oracle over the RAW per-mechanism observations. Per-key
+    /// Found precedence does not erase an Unavailable or NotAttempted mechanism event.
+    fn expected_resource(observations: &[&[Obs]], deadline_cut: bool) -> ResourceOutcome {
+        if deadline_cut {
+            ResourceOutcome::DeadlineCut
+        } else if observations.iter().any(|obs| {
+            obs.iter()
+                .any(|o| matches!(o, Obs::Unavailable | Obs::NotAttempted))
+        }) {
+            ResourceOutcome::MechanismDown
+        } else if observations
+            .iter()
+            .all(|obs| matches!(expected_fold(obs), Obs::Found | Obs::Miss))
+        {
+            ResourceOutcome::Completed
+        } else {
+            ResourceOutcome::MechanismDown
+        }
+    }
+
+    /// Every semantically distinct accumulator state plus all ordered pairs. Longer
+    /// sequences and repetitions beyond a pair create no additional state: KeyAcc's
+    /// four facts are idempotent, and this test checks outcome kinds rather than the
+    /// first-wins payload retained for Found and Unavailable.
+    fn finalizer_observation_cases() -> Vec<Vec<Obs>> {
+        let mut cases = vec![Vec::new()];
+        for bits in 1_u8..(1_u8 << ALL_OBS.len()) {
+            cases.push(
+                ALL_OBS
+                    .into_iter()
+                    .enumerate()
+                    .filter_map(|(index, obs)| (bits & (1 << index) != 0).then_some(obs))
+                    .collect(),
+            );
+        }
+        for first in ALL_OBS {
+            for second in ALL_OBS {
+                let pair = vec![first, second];
+                if !cases.contains(&pair) {
+                    cases.push(pair);
+                }
+            }
+        }
+        cases
+    }
+
     // classify_lookup, EXHAUSTIVE over the answer kinds a mechanism can return. The
     // wrong-key and empty-Found rows are ROUND-4 BLOCKER #1: a malformed answer must be
     // Unavailable, NEVER a Miss and NEVER a stop-worthy Found.
@@ -1484,13 +1544,14 @@ mod tests {
         );
     }
 
-    // finalize_batch, EXHAUSTIVE over 2-key batches ({F,M,U,N}^2) x deadline_cut. Asserts
-    // (a) each key's finalized kind is preserved; (b) NO deadline-cut envelope is ever
-    // Completed; (c) with no cut, resource == Completed IFF every key is authoritative,
-    // consistent with is_complete(). Row (c) is ROUND-4 BLOCKER #4: e.g. (Miss,
-    // NotAttempted) must be MechanismDown, not the pre-redesign false Completed.
+    // finalize_batch: preserve the existing singleton rows, then exhaust every
+    // semantically distinct KeyAcc state for each key and every ordered observation
+    // pair. This includes {Unavailable, Found} and {NotAttempted, Found}: the key is
+    // Found while the batch is MechanismDown. Both deadline values verify that
+    // DeadlineCut has precedence over a mechanism failure.
     #[test]
     fn finalize_batch_is_exhaustive_over_two_key_batches() {
+        // Existing singleton rows ({F,M,U,N}^2 x deadline_cut).
         for a in ALL_OBS {
             for b in ALL_OBS {
                 for cut in [false, true] {
@@ -1547,6 +1608,52 @@ mod tests {
                             "Completed must mean every key authoritative ({a:?},{b:?})"
                         );
                     }
+                }
+            }
+        }
+
+        // Multi-mechanism rows: the cross-product makes every case drive each key,
+        // covering all ordered pairs in both positions as well as every accumulator
+        // state relevant to the finalizer's one rule.
+        let cases = finalizer_observation_cases();
+        for obs_a in &cases {
+            for obs_b in &cases {
+                for cut in [false, true] {
+                    let ka = key(0x10);
+                    let kb = key(0x20);
+                    let request = BatchResolveRequest::new([ka, kb]);
+                    let mut acc_a = KeyAcc::default();
+                    for obs in obs_a {
+                        acc_a.note(&obs.as_resolution(ka));
+                    }
+                    let mut acc_b = KeyAcc::default();
+                    for obs in obs_b {
+                        acc_b.note(&obs.as_resolution(kb));
+                    }
+
+                    let res = finalize_batch(
+                        &request,
+                        vec![acc_a, acc_b],
+                        cut,
+                        0,
+                        ControlBytes::NotInstrumented,
+                    );
+
+                    assert_eq!(
+                        resolution_kind(&res.outcomes()[0]),
+                        expected_fold(obs_a),
+                        "key A fold for {obs_a:?}, cut={cut}"
+                    );
+                    assert_eq!(
+                        resolution_kind(&res.outcomes()[1]),
+                        expected_fold(obs_b),
+                        "key B fold for {obs_b:?}, cut={cut}"
+                    );
+                    assert_eq!(
+                        res.measurement().resource,
+                        expected_resource(&[obs_a, obs_b], cut),
+                        "resource for raw observations ({obs_a:?}, {obs_b:?}), cut={cut}"
+                    );
                 }
             }
         }
