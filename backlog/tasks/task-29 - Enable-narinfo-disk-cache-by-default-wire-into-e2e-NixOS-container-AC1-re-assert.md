@@ -3,10 +3,11 @@ id: TASK-29
 title: >-
   Enable narinfo disk cache by default + wire into e2e/NixOS + container AC#1
   re-assert
-status: To Do
-assignee: []
+status: Done
+assignee:
+  - '@claude'
 created_date: '2026-08-08 11:24'
-updated_date: '2026-08-10 22:35'
+updated_date: '2026-08-16 17:33'
 labels:
   - wave1-followup
   - daemon
@@ -24,8 +25,8 @@ task-8 shipped the narinfo disk cache OPT-IN via --narinfo-cache-dir (daemon/src
 
 ## Acceptance Criteria
 <!-- AC:BEGIN -->
-- [ ] #1 Daemon uses a narinfo disk cache by default (sensible state dir), documented
-- [ ] #2 e2e harness + NixOS module pass the cache dir; a container scenario asserts AC#1 oracle-paired (nonzero daemon narinfo, zero upstream narinfo on the repeat)
+- [x] #1 Daemon uses a narinfo disk cache by default (sensible state dir), documented
+- [x] #2 e2e harness + NixOS module pass the cache dir; a container scenario asserts AC#1 oracle-paired (nonzero daemon narinfo, zero upstream narinfo on the repeat)
 <!-- AC:END -->
 
 ## Implementation Notes
@@ -34,4 +35,10 @@ task-8 shipped the narinfo disk cache OPT-IN via --narinfo-cache-dir (daemon/src
 From TASK-6 (J1 journey): scripts/journey.py has a runtime friction DETECTOR for this task - it greps the default daemon's log for 'narinfo disk cache at' and, while absent, emits FRICTION referencing TASK-29. When you default-wire the narinfo disk cache (main.rs prints that line when --narinfo-cache-dir is set), the journey's FRICTION for TASK-29 auto-clears - so re-run 'just journey' as part of this task's DoD to confirm the default operator now gets a persistent cache.
 
 forward-carry from task-10: the NixOS module nixos/nix-p2p.nix has a narinfoCacheDir option (default null = OFF; daemon --narinfo-cache-dir unset). Wire a DEFAULT here. CAUTION: the daemon service runs under systemd DynamicUser, which cannot write an arbitrary absolute dir - use serviceConfig.StateDirectory (=> /var/lib/<name>, owned by the dynamic user) and pass that path, or drop DynamicUser. The VM test (nixos/vm-test.nix) is where you re-assert the e2e AC1 through systemd once the cache is on.
+
+TASK-29 plan (impl start): AC#1 default-on via a pure env-injected resolver resolve_narinfo_cache_dir() in daemon-core (NarinfoCacheChoice: Disabled/Explicit/Default/NoDefault); default = $XDG_STATE_HOME/nix-p2p/narinfo else $HOME/.local/state/nix-p2p/narinfo; best-effort (a DEFAULT dir that cannot open warns+runs pure-upstream, never crashes; an EXPLICIT dir still fails fast). New off-switch --no-narinfo-cache (contradicts --narinfo-cache-dir => usage error). Wired into daemon + daemon-libp2p. AC#2 new e2e scenario narinfo-default-cache-offload, 3 arms: (1) default-on (podman sets HOME=/root => cache at /root/.local/state/nix-p2p/narinfo) cold+warm asserting warm received[narinfo]==0 paired with N narhashes delivered; (2) explicit --narinfo-cache-dir via state_root mount + host-side .nic count>0; (3) --no-narinfo-cache negative control asserting warm received[narinfo]>=1 (the built-in mutation that reddens the ==0). measure.py: daemon-on main arm + product-bite OFF arm get --no-narinfo-cache (podman HOME=/root would otherwise silently default-on and break off_flat + the frozen held-identical rule). NixOS module: narinfoCacheDir default /var/lib/nix-p2p/narinfo, StateDirectory=nix-p2p always, null=>--no-narinfo-cache.
+
+TASK-29 IMPLEMENTED (commit 958e0e8, not pushed). AC#1: narinfo cache default-ON. Default state dir = $XDG_STATE_HOME/nix-p2p/narinfo else $HOME/.local/state/nix-p2p/narinfo (XDG state, not cache, because it backs the persistent token->NarHash correlation a warm daemon needs post-restart; still best-effort since re-derivable + count-capped). New off-switch --no-narinfo-cache; contradictory flags rejected at parse. DEFAULT dir open-failure soft-fails (warn+pure-upstream); EXPLICIT dir failure is fatal. Shared daemon_core::build_narinfo_layer + resolve_narinfo_cache_dir (SSOT across daemon + daemon-libp2p; 11 unit tests). Docs: README, flag doc-comments, NixOS option desc. AC#2: new e2e scenario narinfo-default-cache-offload (added to E2E_FAST). Oracle-paired on the warm REPEAT: received.narinfo==0 at the testproxy PAIRED with N=3 narhashes delivered to a fresh client (=> daemon served all N from disk). 3 arms: default-on (no flag, HOME=/root), explicit-dir (--narinfo-cache-dir mount + host-side .nic count), disabled (--no-narinfo-cache negative control asserting received.narinfo>=1 on the repeat = the baked-in MUTATION that reddens the ==0). GATE GREEN: fmt/clippy(-D warnings)/no-floats/golden(byte-identical)/daemon-core 230+tests/daemon+daemon-libp2p tests; just e2e ALL 6 scenarios pass (narinfo-default-cache-offload 20/20). measure.py: all daemon-spawning bites pinned --no-narinfo-cache via MEASURE_DAEMON_CACHE_OFF (podman HOME=/root would else default-on and break the gap-oracle/off_flat + the frozen held-identical rule) - caught by mped review. vm-test.nix: systemd DynamicUser AC#1 log assert. Reviewers: qa GREEN (532 tests), mped HIGH measure.py finding fixed + SSOT dedup done.
+
+DONE (LIGHT gate, orchestrator-verified). Commit 958e0e8. Narinfo disk cache ON BY DEFAULT (XDG state dir; --no-narinfo-cache to disable; SSOT build_narinfo_layer failure policy: default-dir soft-fail vs explicit-dir fatal). New e2e scenario narinfo-default-cache-offload proves repeat-path offload ORACLE-PAIRED (received.narinfo==0 at boundary AND client-confirmed 3/3 delivery) with a permanent DISABLED negative-control arm that reddens it. mped-review (implementer-run) caught + fixed a measure.py HIGH (default-on would corrupt the gap oracle). golden byte-identical, 532/0 unit (qa-confirmed), just e2e 6/6. Completes the narinfo-persistence chain 27->28->29; clears those TASK-120 deps.
 <!-- SECTION:NOTES:END -->
