@@ -1344,6 +1344,10 @@ class Pod:
         origin = f"http://127.0.0.1:{ORIGIN_PORT}"
 
         # A: the leech in the provider slot (port+1). Origin-direct upstream keeps the proxy cold.
+        # TASK-78 (fix): the leech node runs the PRIMARY /bin/daemon-libp2p binary, whose --libp2p-leech
+        # wraps the fabric in peer_fabric::LeechFabric and threads it into daemon_core::run - so this
+        # scenario exercises the CAPABILITY-SEAM mask end to end (not the composite daemon's separate
+        # consume-only NarSource path).
         run(
             [
                 self._pm,
@@ -1357,7 +1361,7 @@ class Pod:
                 PROJECT_LABEL,
                 *self._state_args("lp-provider"),
                 self.ctx.image,
-                "/bin/daemon",
+                "/bin/daemon-libp2p",
                 "--listen",
                 f"0.0.0.0:{DAEMON_PORT + 1}",
                 "--upstream",
@@ -5610,12 +5614,15 @@ def scenario_libp2p_leech(ctx: Ctx, expect) -> None:
         libp2p_provider_seeds=prov_seeds,
         libp2p_leech=True,
     ) as pod:
-        # A boots as a consume-only leech (its own log states what it hides vs reveals).
+        # A boots as a consume-only leech on the PRIMARY daemon-libp2p binary, whose marker states
+        # the serve/announce axes are masked AT THE CAPABILITY SEAM (peer_fabric::LeechFabric) - so
+        # this scenario exercises the seam mask end to end, not a separate consume-only path.
         alog = pod.logs("lp-provider")
         expect(
-            "LIBP2P-LEECH consume-only" in alog,
-            "S-LEECH: A boots in consume-only leech mode (serves + announces nothing at the seam)",
-            f"provider log tail: {alog[-700:]!r}",
+            "daemon-libp2p: LIBP2P-LEECH consume-only" in alog
+            and "masked at the capability seam" in alog,
+            "S-LEECH: A boots in consume-only leech mode via the daemon-libp2p LeechFabric SEAM mask",
+            f"provider log tail: {alog[-900:]!r}",
         )
 
         time.sleep(LIBP2P_CONVERGE_S)  # bounded kad settle

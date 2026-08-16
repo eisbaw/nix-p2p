@@ -202,6 +202,10 @@
             python3Minimal # origin: `python3 -m http.server`; stdlib only
             utillinux # setpriv: drop to the untrusted client uid, no PAM
             daemon
+            # TASK-78: the PRIMARY thin binary. The leech e2e scenario launches /bin/daemon-libp2p
+            # for the node under test so the LeechFabric capability-seam mask (threaded into
+            # daemon_core::run) is what's exercised end-to-end, not the composite's NarSource path.
+            daemonLibp2p
             testproxy
             e2eEtc
           ];

@@ -62,14 +62,16 @@ pub struct LeechFabric {
 impl LeechFabric {
     /// Wrap `inner` so that its SERVE and ANNOUNCE axes read `None` while every CONSUME
     /// axis (and the exposure ledger) passes through unchanged.
+    ///
+    /// NON-BYPASSABLE (TASK-78 fix): there is DELIBERATELY no accessor that hands the
+    /// wrapped `inner` back out. Exposing it would let a holder call
+    /// `leech.inner().server()` / `.announcer()` and reach the very give-side axes the
+    /// mask removes - a hole straight through the seam. The ONLY way to read this
+    /// fabric's capabilities is the [`PeerFabric`] impl below, whose `server()` and
+    /// `announcer()` are hard-coded `None`. The consume axes are still reachable there
+    /// (delegated), which is all a consumer needs.
     pub fn new(inner: Arc<dyn PeerFabric>) -> Self {
         LeechFabric { inner }
-    }
-
-    /// The wrapped fabric, for callers that need the concrete consume axes the mask
-    /// leaves intact (the mask only removes serve + announce).
-    pub fn inner(&self) -> &Arc<dyn PeerFabric> {
-        &self.inner
     }
 }
 
@@ -125,10 +127,12 @@ mod tests {
     use std::sync::Arc;
 
     use super::*;
-    use crate::budget::ServeBudget;
+    use std::time::Duration;
+
+    use crate::budget::{DiscoveryBudget, ServeBudget};
     use crate::capabilities::{NarServer, ServeError, ServeHandle};
-    use crate::content::DialInfo;
-    use crate::exposure::ExposureSurface;
+    use crate::content::{ContentKey, DialInfo};
+    use crate::exposure::{Disclosed, Exposure, ExposureSurface, Recipient};
     use crate::fake::{
         FakeAvailabilityAnnouncer, FakeFabric, FakeNarTransfer, FakeNodeLocator,
         FakeProviderDirectory,
@@ -247,6 +251,135 @@ mod tests {
         assert_eq!(
             inner_ledger_ptr, leech_ledger_ptr,
             "the leech exposes the SAME exposure ledger as its inner fabric"
+        );
+    }
+
+    /// FIX 1 (non-bypassable mask): a `LeechFabric` exposes NO accessor that hands the
+    /// wrapped inner fabric back out, so a holder cannot reach a working server/announcer
+    /// by ANY path. This is a STRUCTURAL guarantee - the only capability accessors are the
+    /// `PeerFabric` trait methods, and both give-side methods are `None`. The bite: were an
+    /// `inner()`-style accessor re-added returning `&Arc<dyn PeerFabric>`, this call site
+    /// would compile and `leech.inner().server()` would yield a working server; the test
+    /// documents+enforces that the give side is unreachable through EVERY accessor a
+    /// `LeechFabric` has.
+    #[test]
+    fn leech_exposes_no_working_give_side_by_any_accessor() {
+        let leech = LeechFabric::new(Arc::new(serving_fabric()));
+        // Every capability accessor on the type, enumerated: the two give-side ones are None,
+        // and there is no other accessor (e.g. a leaked `inner()`) through which a server or
+        // announcer could be obtained.
+        assert!(leech.server().is_none(), "no server via server()");
+        assert!(leech.announcer().is_none(), "no announcer via announcer()");
+        // The consume axes remain reachable (that is the whole point), but none of them is a
+        // server/announcer.
+        assert!(leech.provider_directory().is_some());
+        assert!(leech.node_locator().is_some());
+        assert!(leech.transfer(TransportTag::Iroh).is_some());
+    }
+
+    /// A fabric that offers ONLY the SERVE give-axis (a server, no announcer). Used to prove
+    /// the serve mask is INDEPENDENT of the announce mask.
+    fn serve_only_fabric() -> FakeFabric {
+        FakeFabric::upstream_only(node()).with_server(Arc::new(DummyServer))
+    }
+
+    /// A fabric that offers ONLY the ANNOUNCE give-axis (an announcer, no server).
+    fn announce_only_fabric() -> FakeFabric {
+        FakeFabric::upstream_only(node()).with_announcer(Arc::new(
+            FakeAvailabilityAnnouncer::accepting(
+                Vec::new(),
+                ExposureSurface::none(),
+                Arc::new(ExposureLedger::new()),
+            ),
+        ))
+    }
+
+    /// FIX 3 (per-axis independence, SERVE): the leech masks the serve axis on its OWN, and
+    /// re-enabling serve ALONE is observable. The inner fabric has a server but NO announcer;
+    /// wrapped, `server()` is None (masked) while `announcer()` stays None (untouched). The
+    /// reddening mutation is unwrapping: the SAME inner offers a working `server()` again -
+    /// serve alone flips, announce never moved.
+    #[test]
+    fn leech_masks_serve_axis_independently() {
+        let inner = Arc::new(serve_only_fabric());
+        assert!(inner.server().is_some(), "inner offers a server");
+        assert!(inner.announcer().is_none(), "inner offers NO announcer");
+
+        let leech = LeechFabric::new(inner.clone());
+        assert!(leech.server().is_none(), "leech masks the serve axis");
+        assert!(
+            leech.announcer().is_none(),
+            "announce axis is untouched (was already absent)"
+        );
+        // MUTATION (unwrap): the give side comes back for serve ALONE.
+        assert!(
+            inner.server().is_some() && inner.announcer().is_none(),
+            "unwrapping re-enables serve ALONE - the two axes are independent"
+        );
+    }
+
+    /// FIX 3 (per-axis independence, ANNOUNCE): symmetric to the serve case. The inner has an
+    /// announcer but NO server; wrapped, `announcer()` is None (masked) while `server()` stays
+    /// None (untouched). Unwrapping re-enables announce ALONE.
+    #[test]
+    fn leech_masks_announce_axis_independently() {
+        let inner = Arc::new(announce_only_fabric());
+        assert!(inner.announcer().is_some(), "inner offers an announcer");
+        assert!(inner.server().is_none(), "inner offers NO server");
+
+        let leech = LeechFabric::new(inner.clone());
+        assert!(leech.announcer().is_none(), "leech masks the announce axis");
+        assert!(
+            leech.server().is_none(),
+            "serve axis is untouched (was already absent)"
+        );
+        // MUTATION (unwrap): the give side comes back for announce ALONE.
+        assert!(
+            inner.announcer().is_some() && inner.server().is_none(),
+            "unwrapping re-enables announce ALONE - the two axes are independent"
+        );
+    }
+
+    /// FIX 5 (AC#5 lookup exposure is REAL, not claimed): a leech's `find_providers` call
+    /// actually records its query disclosures (ContentKey + OurNodeId to a DhtNode) into the
+    /// SHARED exposure ledger. The directory records to the fabric's own ledger; the mask
+    /// passes that same ledger through, so a status/preflight reader sees the leech's lookup.
+    /// The bite: were the consume axes masked too (or the ledger not shared), the ledger would
+    /// stay empty and this reddens.
+    #[tokio::test]
+    async fn leech_lookups_are_recorded_in_the_shared_exposure_ledger() {
+        let fabric = FakeFabric::upstream_only(node());
+        let ledger = fabric.shared_ledger();
+        // A directory that, on each lookup, discloses what a real kad get_record discloses.
+        let dir = FakeProviderDirectory::new(
+            Lookup::Miss,
+            vec![
+                Exposure::new(Recipient::DhtNode, Disclosed::ContentKey),
+                Exposure::new(Recipient::DhtNode, Disclosed::OurNodeId),
+            ],
+            ExposureSurface::none(),
+            ledger.clone(),
+        );
+        let fabric = fabric.with_provider_directory(Arc::new(dir));
+        let leech = LeechFabric::new(Arc::new(fabric));
+
+        assert!(
+            leech.exposure_ledger().is_empty(),
+            "no disclosure before any lookup"
+        );
+        let key = ContentKey::derive_from_signed_nar_hash(&[0x11u8; 32]);
+        let _ = leech
+            .provider_directory()
+            .expect("a leech still looks providers up")
+            .find_providers(&key, &DiscoveryBudget::new(Duration::from_secs(5), 32))
+            .await;
+        let entries = leech.exposure_ledger().entries();
+        assert!(
+            entries.contains(&Exposure::new(Recipient::DhtNode, Disclosed::ContentKey))
+                && entries.contains(&Exposure::new(Recipient::DhtNode, Disclosed::OurNodeId)),
+            "the leech's lookup DISCLOSED its ContentKey + NodeId to a DhtNode and that was \
+             recorded in the shared ledger (consume-only hides serve/announce, NOT lookups); \
+             got {entries:?}"
         );
     }
 }

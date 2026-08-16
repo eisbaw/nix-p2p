@@ -37,8 +37,8 @@ use daemon::{
 };
 use fabric_libp2p::{CatalogNarSupplier, Libp2pFabric, MemoryNarSupplier, Multiaddr, PeerId};
 use peer_fabric::{
-    AdmitAllPublication, AnnounceBudget, PeerFabric, PublicationEligibility, RefusePublication,
-    ServeHandle,
+    AdmitAllPublication, AnnounceBudget, Axis, LeechFabric, PeerFabric, PublicationEligibility,
+    RefusePublication, ServeHandle, require_axes,
 };
 use tokio::net::TcpListener;
 
@@ -2101,23 +2101,38 @@ async fn setup_p2p_source(
             // here: the source holds its own Arc clone, keeping the node alive for the
             // process lifetime. The raw-serve decision is captured so a libp2p HIT
             // rewrites its narinfo to raw (see below).
-            let (_fabric, libp2p_source, raw_serve) =
+            let (fabric, libp2p_source, raw_serve) =
                 build_libp2p_nar_source(config.libp2p_source_config()?).await?;
             libp2p_raw_serve = Some(raw_serve);
             // TASK-78: the non-provider path is CONSUME-ONLY by construction - it builds the fabric
             // WITHOUT a supplier, so the libp2p backend installs no serve gate (every inbound NAR
-            // request is answered NotHeld) and runs no announce loop. `--libp2p-leech` makes that an
-            // AFFIRMATIVE opt-out (fail-fast against every give-side flag, see from_args) and states
-            // the exposure honesty. The transport-agnostic seam mask (peer_fabric::LeechFabric) is
-            // applied by the PRIMARY thin `daemon-libp2p` binary, which threads a `PeerFabric` into
-            // `daemon_core::run`; this iroh-native composite wraps libp2p as a `NarSource` layer, so
-            // here consume-only is a structural property of the non-provider path, not a wrapper.
+            // request is answered NotHeld) and runs no announce loop. When `--libp2p-leech` is set,
+            // wrap the fabric in the SAME transport-agnostic seam mask the primary `daemon-libp2p`
+            // binary uses (peer_fabric::LeechFabric) and ASSERT, fail-closed, that the give-side
+            // axes are absent - so BOTH binaries enforce consume-only through the one capability
+            // seam, not two divergent mechanisms. (The composite is iroh-native and consumes libp2p
+            // as a `NarSource`, so the fetch rides `libp2p_source`; the wrapped fabric is the
+            // seam-level guard. The behavioural end-to-end proof of the mask runs on daemon-libp2p,
+            // which the leech e2e scenario launches.)
             if config.libp2p_leech {
+                let leech: Arc<dyn PeerFabric> = Arc::new(LeechFabric::new(fabric));
+                // Fail-closed: the mask MUST have removed serve + announce. If a future refactor
+                // let either axis leak, refuse to start rather than run a leech that can give back.
+                require_axes(leech.as_ref(), &[Axis::ProviderDirectory]).map_err(|e| {
+                    format!("libp2p leech fabric lost a required consumer axis: {e}")
+                })?;
+                if leech.server().is_some() || leech.announcer().is_some() {
+                    return Err(
+                        "libp2p leech fabric still exposes a serve/announce axis after masking - \
+                         refusing to start a leech that could give content back"
+                            .into(),
+                    );
+                }
                 println!(
-                    "daemon: LIBP2P-LEECH consume-only: serves NOTHING + announces NOTHING. HONEST \
-                     LIMIT: it STILL SENDS discovery lookups (kad get_record + peer-routing), \
-                     disclosing what it looks up to the DHT nodes it queries - a leech hides what it \
-                     SERVES/ANNOUNCES, not what it LOOKS UP."
+                    "daemon: LIBP2P-LEECH consume-only (LeechFabric seam mask): serves NOTHING + \
+                     announces NOTHING. HONEST LIMIT: it STILL SENDS discovery lookups (kad \
+                     get_record + peer-routing), disclosing what it looks up to the DHT nodes it \
+                     queries - a leech hides what it SERVES/ANNOUNCES, not what it LOOKS UP."
                 );
             }
             println!(

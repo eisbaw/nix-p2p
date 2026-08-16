@@ -313,20 +313,39 @@ remote-observation contract with no per-backend code**, because the mask sits on
 the seam, not inside a stack. Two properties make it airtight rather than
 cosmetic:
 
-- **Fail-closed at the seam, not scattered `if leech` checks.** With `server()`
-  masked to `None`, no composition root / `run()` / future caller can reach the
-  inner server to *start* the serve lifecycle. On the libp2p backend serving is
-  a lifecycle armed only by `NarServer::serve()` (which installs the inbound
-  gate); a fabric on which it was never called answers every inbound request
-  `NotHeld` (`nar.rs`: `None => NarResponse::NotHeld`). So a leech is built as a
-  **pure consumer** (no supplier ⇒ no gate ever installed) and then wrapped — the
-  mask is the seam formalisation and the belt-and-suspenders; "no gate was ever
-  installed" is the load-bearing enforcement the *peer* observes. Proven from the
-  peer side by `fabric-libp2p`'s `a_leech_serves_nothing_to_a_reachable_peer` (a
-  directly-dialled leech ⇒ `NotHeld`) and end-to-end by the `libp2p-leech` e2e
-  scenario (a second consumer that would discover a serving node gets nothing
-  from a leech and falls back to upstream; the mutation flips the node to serving
-  and the peer obtains the content).
+- **Non-bypassable, fail-closed at the seam, not scattered `if leech` checks.**
+  `LeechFabric` deliberately exposes **no accessor that hands the wrapped `inner`
+  back out** — exposing it would let a holder call `leech.inner().server()` and
+  reach the very axes the mask removes. The only way to read a leech's
+  capabilities is the `PeerFabric` impl, whose `server()`/`announcer()` are
+  hard-coded `None`. On the libp2p backend serving is a lifecycle armed only by
+  `NarServer::serve()` (which installs the inbound gate); with `server()` masked
+  to `None`, no composition root / `run()` / future caller can reach the inner
+  server to start it, and a gate that was never installed answers every inbound
+  request `NotHeld` (`nar.rs`: `None => NarResponse::NotHeld`).
+- **The mask is load-bearing over CONTENT, and each give-axis is proven
+  independently.** `fabric-libp2p/tests/leech_seam.rs` wraps a **content-bearing**
+  fabric (a real supplier, so it *could* serve) in `LeechFabric` and shows a
+  reachable peer that dials it directly still gets `NotHeld`; the reddening
+  mutation *unwraps* the fabric and installs the gate through the inner server, so
+  the very same fetch returns the bytes — proving the mask, not an empty node, is
+  what withholds the content. A sibling test does the same for the **announce**
+  axis (wrapped ⇒ `find_providers` misses; unwrap + announce ⇒ Found). Each
+  mutation flips exactly one axis (the serve test never announces; the announce
+  test never serves), so a serve-only or announce-only re-enablement is caught on
+  its own. The peer-fabric unit tests mirror this per-axis independence at the
+  seam.
+- **One enforcement type in both binaries; the e2e exercises the seam.** The
+  primary `daemon-libp2p --libp2p-leech` threads the `LeechFabric` into
+  `daemon_core::run` (behavioural enforcement); the iroh-native composite
+  `daemon --libp2p-leech` — whose consumer path is consume-only by construction
+  (it consumes libp2p as a `NarSource`, never as a serving `PeerFabric`) — still
+  constructs the **same** `LeechFabric` and asserts, fail-closed, that
+  `server()`/`announcer()` are absent, so both binaries enforce through the one
+  seam type rather than two divergent mechanisms. The `libp2p-leech` e2e scenario
+  launches **`/bin/daemon-libp2p`** for the node under test, so the end-to-end
+  proof (a second consumer gets nothing from the leech and falls back; the serving
+  mutation flips it to 0 upstream) exercises the actual `LeechFabric` seam.
 
 - **HONEST LIMIT — a leech still SENDS its lookups (AC#5).** Consume-only is NOT
   private lookup. The CONSUME axes stay present and are exactly what a leech uses:
