@@ -7,7 +7,7 @@ status: In Progress
 assignee:
   - '@claude'
 created_date: '2026-08-10 22:24'
-updated_date: '2026-08-17 01:18'
+updated_date: '2026-08-17 02:21'
 labels:
   - production
   - operator
@@ -59,4 +59,6 @@ READY (all deps Done as of 2026-08-17: 24/25/29/31/77/78/100/103/111/115) BUT NE
 CODEX DEEP GATE NO-GO (deep) on 0fff8c0. ROOT CAUSE: OperatorContract is a REPORTING VENEER not the enforcement authority - runtime still branches on legacy booleans. AC#1/#2/#8/#9 FAIL (claimed Complete but bites test the TYPE not the runtime): fresh daemon-libp2p cant do upstream-only (exits 2); NixOS ORs legacy booleans; ContractRequest re-derives from flags not an explicit --profile; IROH GLOBAL-SCOPE PROVIDER MISLABELED lan-share (safety bug); iroh/pkarr flags bypass pending-non-selectability; contradictory ResourceCaps defaults (512/300 vs 256/120). AC#3 phantom caps, AC#7 preflight misreports, AC#5 redaction unwired + NarHash in logs. integer/frozen PASS; 231/77/78 reuse PASS where triggered. Disposition (rework-vs-rescope) routing through mped; core fix = make the contract the ENFORCEMENT AUTHORITY. Commit kept (type is a foundation).
 
 mped(Mark-emulator) disposition: verified codex on every point. KEEP commit (OperatorContract type + NixOS profile-authority are goods), REJECT Done, REWORK scoped to PRIMARY daemon-libp2p + NixOS authoritative; composite iroh = fail-fast SAFETY fix now, full composite-iroh contract deferred to TASK-202. Core: behavior derives FROM contract.profile not legacy cfg.* booleans (explicit --profile; flags=compat-shim must-agree-or-fail; serve/announce gated by profile; reachability incl global-iroh-scope only under public-share+allowlist). MUST-FIX-NOW: #3a global-scope iroh not labeled lan-share; #3b publish-node not publishes_records=false; #1 primary upstream-only + preflight-before-guard; #2 explicit --profile; #4 mechanism registry; #6 caps wired-or-removed + redaction; #5 ServeBudget SSOT. Do NOT mark Done until just e2e green. Rework dispatched.
+
+CODEX RE-GATE NO-GO(2) on 4f5d524. PRIMARY daemon-libp2p authority inversion PASSES; 5/7 must-fixes pass; golden byte-identical. 3 honesty gaps: (A PRIMARY must-fix) upstream-only + --libp2p-listen runs kad SERVER + relay-server -> DHT-participates while reporting public_dht_participation=false; swarm participation mode must derive from profile. (B composite must-fix honesty) iroh consumers fetch over iroh while contract reports upstream-only/HTTP-only (iroh-consume absent from ContractRequest) - report!=wire. (C composite deferrable-202) libp2p give-side still flag-authoritative. Round-3 fix: A kad-mode+relay derive from profile; B represent iroh-consume (report matches wire); C document+file 202 follow-up. Convergent (primary core passed).
 <!-- SECTION:NOTES:END -->
