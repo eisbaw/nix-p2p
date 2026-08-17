@@ -6,6 +6,7 @@ title: >-
 status: To Do
 assignee: []
 created_date: '2026-08-17 11:04'
+updated_date: '2026-08-17 12:38'
 labels:
   - daemon-core
   - discovery
@@ -27,4 +28,10 @@ Forward-carried from TASK-229. TASK-229 built the responder derivation-DoS enfor
 - [ ] #1 The over-libp2p inbound hold-query responder keys a shared PeerDeriveLedger by the AUTHENTICATED remote PeerId and calls answer_for_peer/answer_batch_for_peer, proven by an over-the-wire bite that a per-peer/global flood is bounded
 - [ ] #2 daemon-libp2p passes Some(ledger) into Observability so --status reports the LIVE derive_budget_global_bytes used/CAP, read from the enforcing ledger (not a mirror)
 - [ ] #3 NarSize is cached per Entry so a repeated cold peer probe does not re-spawn the size query each time; placeholder DeriveBudget defaults are revisited against a measured I/O ceiling
+- [ ] #4 Responder uses ONE shared responder-lifetime enforcing ledger (never fresh-per-request, which would defeat cross-message aggregation); the unbounded local hold() cannot be reached by the inbound responder path (rename to hold_local or a guard asserting no inbound handler calls hold) [codex#3/mped#5]
+- [ ] #5 The NarSize size-query (nix-store -q --size) is itself per-peer bounded: a refused-before-dump cold probe cannot drive an unbounded fork/exec flood (cap or charge the size-query per peer) [mped#2]
+- [ ] #6 A GLOBAL dump-COUNT ceiling (companion to max_dumps_per_peer) bounds total fresh dumps so a many-PeerId tiny-NAR Sybil flood cannot exceed it under the global byte floor [mped#3]
+- [ ] #7 The per-peer ledger map evicts stale entries (drop a peer window when it rolls empty, or periodic GC) so a churning/Sybil peer population cannot slowly exhaust memory [mped#4]
+- [ ] #8 Single-key responder refusals are observable (a refusal counter or operator note), consistent with the batch path and the fail-loud discipline [mped#6]
+- [ ] #9 The derivation budget uses a true sliding/rolling window so the effective bound is cap, replacing the tumbling window whose worst case is up to 2x cap across a boundary [229-D/codex]
 <!-- AC:END -->
