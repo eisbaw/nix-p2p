@@ -6,7 +6,7 @@ title: >-
 status: To Do
 assignee: []
 created_date: '2026-08-10 22:24'
-updated_date: '2026-08-15 23:18'
+updated_date: '2026-08-17 00:13'
 labels:
   - production
   - operator
@@ -52,4 +52,6 @@ Define and implement the production-facing core contract for nix-p2p after the m
 Production foundation independent of tournament-derived automatic defaults. TASK-45 exercises this contract from a clean host. Implement and prove it for mandatory Iroh first; optional tracker Mainline and later BitTorrent plug into the same modes without becoming prerequisites. Lower-level scope selection never implies publication lookup relay use or public participation.
 
 Forward-carried from TASK-138 review: the v1 NodeId lookup replay table is fail-closed and non-reclaiming. Before public-share is production-ready define a durable or reclaiming admission policy or operator-visible restart ledger preserving anti-replay guarantees and expose hostile-churn capacity use and exhaustion.
+
+READY (all deps Done as of 2026-08-17: 24/25/29/31/77/78/100/103/111/115) BUT NEEDS A LIBP2P-PRIMARY RE-SCOPE before implementation. The description + ACs are IROH-ERA ("after the mandatory Iroh discovery path passes", "prove it for mandatory Iroh first", "explicit Iroh mechanism overrides") - pre-reconciliation, contradicting the Wave-2c authority (libp2p-kad is PRIMARY + proven; iroh deferred-pending-202). This is DRIFT, not a product change (cf. the PRD Wave-2c execution-order reconciliation). Re-scope: the CORE is transport-agnostic + valid (upstream-only/consume-only/LAN-share/public-share modes; the resource-cap budgets AC#3; the status surface AC#4; the bounded-cardinality privacy-safe metrics AC#5; the preflight AC#7; the one-authoritative-typed-config AC#9) - keep those. Re-point the iroh-first language to "prove on the libp2p path first (the primary, proven); iroh is an optional deferred mechanism override, not a prerequisite." The consume-only/LAN/public modes already have real enforcement shipped (TASK-231 eligibility gate, TASK-77 announce-after-fetch, TASK-78 LeechFabric consume-only) - 120 makes them the AUTHORITATIVE typed operator contract + adds resource caps + status + preflight + the NixOS profiles. TASK-45 exercises it from a clean host. This is the pilot-readiness gate.
 <!-- SECTION:NOTES:END -->
