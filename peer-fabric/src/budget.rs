@@ -146,9 +146,11 @@ impl Default for ServeBudget {
 ///
 /// Every field is an INTEGER (owner no-floats rule). The two byte fields are NarSize
 /// units - UNCOMPRESSED NAR bytes, the exact hashing-work unit - NEVER the compressed
-/// FileSize a narinfo carries (the recurring unit trap). The allowance is a ROLLING
-/// [`window`](DeriveBudget::window): usage accrues within a window and resets when it
-/// rolls over, so `bytes/window` and `dumps/window` are integer rate bounds.
+/// FileSize a narinfo carries (the recurring unit trap). The allowance is a TUMBLING
+/// [`window`](DeriveBudget::window): usage accrues within a window and resets WHOLLY at
+/// the boundary, so `bytes/window` and `dumps/window` are integer rate bounds of `cap`
+/// per window in steady state — with up to 2x cap across a boundary (full cap just
+/// before the reset, full cap just after); a true sliding window is deferred to TASK-243.
 ///
 /// KEYED BY THE AUTHENTICATED REMOTE PEER. The per-peer fields bound ONE authenticated
 /// peer's aggregate derivation over the window; the fabric hands the responder the

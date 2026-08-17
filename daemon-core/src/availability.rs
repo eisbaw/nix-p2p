@@ -1815,7 +1815,8 @@ impl AvailabilityIndex {
     ///
     /// task-229: `asker` is the AUTHENTICATED remote peer, and `ledger` bounds its
     /// AGGREGATE derivation across ALL the messages it sends (bytes hashed AND dump
-    /// count, over a rolling window) plus a GLOBAL ceiling across all peers. So the
+    /// count, over a TUMBLING window — cap per window in steady state, up to 2x cap
+    /// across a boundary; true sliding window is TASK-243) plus a GLOBAL ceiling across all peers. So the
     /// per-MESSAGE [`MAX_BATCH_DERIVE_WORK`] count above is only the inner cap; the
     /// cross-message per-peer/global bound is what actually stops a hostile peer that
     /// picks the message boundaries. Each cold key is refused BEFORE dumping when its

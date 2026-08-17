@@ -96,8 +96,8 @@ impl MonotonicClock for SystemClock {
     }
 }
 
-/// One rolling accounting window: the bytes hashed and dumps taken since
-/// `start_millis`. Integers only.
+/// One TUMBLING accounting window: the bytes hashed and dumps taken since
+/// `start_millis` (resets wholly at the boundary — up to 2x cap across it). Integers only.
 #[derive(Debug, Clone, Copy)]
 struct Window {
     /// The millisecond timestamp this window opened.
@@ -302,7 +302,7 @@ impl PeerDeriveLedger {
     }
 
     /// The GLOBAL window's `(bytes_used, cap)` for the operator surface (used/CAP),
-    /// rolling an expired window to zero first so a stale figure is never reported. An
+    /// resetting an expired window to zero first so a stale figure is never reported. An
     /// AGGREGATE integer with no per-peer identifier - safe to expose without leaking a
     /// peer-behaviour channel (mirrors how `announce_budget` reports a single figure).
     pub fn global_bytes_used(&self) -> u64 {

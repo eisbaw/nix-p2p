@@ -412,7 +412,8 @@ pub struct ResourceCaps {
     /// GLOBAL ceiling on bytes HASHED across ALL peers within one window - the Sybil
     /// floor (per-peer alone is bypassable by minting PeerIds).
     pub derive_max_bytes_global_uncompressed: u64,
-    /// The rolling derivation-accounting window, ms.
+    /// The derivation-accounting window, ms (TUMBLING: cap per window in steady state,
+    /// up to 2x cap across a boundary; true sliding window is TASK-243).
     pub derive_window_ms: u64,
     // ---- publication / announce (enforced by AnnounceBudget + the TASK-77 counter) ----
     /// The announce-after-fetch budget (TASK-77): max DISTINCT fetched paths this
@@ -441,8 +442,9 @@ impl Default for ResourceCaps {
             discovery_max_peers: 16,
             // TASK-229 responder-derivation defaults. CONSERVATIVE PLACEHOLDERS, not
             // derived from a measured per-deployment disk/CPU I/O ceiling (same honesty
-            // as MAX_BATCH_DERIVE_WORK=16): a peer may cost us ~1 GiB of hashing / minute
-            // and ~64 fresh dumps / minute; the global backstop is 4 GiB / minute, i.e.
+            // as MAX_BATCH_DERIVE_WORK=16): in steady state a peer may cost us ~1 GiB of
+            // hashing / minute and ~64 fresh dumps / minute (tumbling window: up to 2x
+            // that across a boundary); the global backstop is 4 GiB / minute, i.e.
             // it tolerates ~4 fully-busy peers before biting. Tune per deployment.
             derive_max_bytes_per_peer_uncompressed: 1024 * 1024 * 1024, // 1 GiB / window / peer
             derive_max_dumps_per_peer: 64,
