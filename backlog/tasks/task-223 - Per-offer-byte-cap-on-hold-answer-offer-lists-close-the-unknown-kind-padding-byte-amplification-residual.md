@@ -3,10 +3,11 @@ id: TASK-223
 title: >-
   Per-offer byte cap on hold-answer offer lists (close the unknown-kind padding
   byte-amplification residual)
-status: To Do
-assignee: []
+status: In Progress
+assignee:
+  - '@me'
 created_date: '2026-08-15 19:54'
-updated_date: '2026-08-16 00:33'
+updated_date: '2026-08-17 13:15'
 labels:
   - irreversible
 dependencies: []

@@ -161,6 +161,9 @@ const EXERCISED: &[&str] = &[
     "reject_batch_response_unknown_transport_names_content_ids",
     "reject_claim_unknown_transport_names_content_ids",
     "reject_hold_response_unknown_transport_non_string_tag",
+    "reject_hold_response_offer_over_byte_cap",
+    "reject_batch_response_offer_over_byte_cap",
+    "reject_claim_offer_over_byte_cap",
 ];
 
 #[test]

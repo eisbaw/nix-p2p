@@ -847,11 +847,18 @@ TASK-120 prerequisite. For every supported arm/profile:
   golden, that admits it). A plausible future *single-locator* transport still
   decodes inertly, but a future *multi-field* transport is now a hard decode error
   (a disclosed forward-compat cost). Separately, the worst-case **byte**
-  amplification is unchanged: a well-shaped unknown-kind slot still has a
-  byte-unbounded single scalar, so a hostile single-key `Have` can still pad to the
-  **64 KiB** frame (~**744×**) — the frame gate remains the only byte bound (a
-  per-offer byte cap is deferred, **TASK-223**). The single-key hold-query cell is
-  supported for training on the same terms as the batch path.
+  amplification (a well-shaped unknown-kind slot had a byte-unbounded single scalar,
+  so a hostile single-key `Have` could pad to the **64 KiB** frame, ~**744×**) is
+  now **CLOSED by TASK-223**: a per-offer serialized-byte cap
+  (`MAX_OFFER_WIRE_BYTES` = **2 KiB**, applied to every offer on the claim and both
+  hold-response paths) refuses any single offer over the cap, so one offer can no
+  longer fill the frame and a single-key `Have`'s offer content is at most
+  `MAX_OFFERS_PER_ANSWER × 2 KiB` — a fixed constant, not the frame. The cap was set
+  deliberately generous over any plausible legitimate locator (a max-length URL
+  fits under 2 KiB; loosening later is backward-safe, tightening is not). A residual
+  raw-JSON whitespace/escape inflation channel is universal, frame-bounded and
+  draft-codec-only, out of scope of the offer-body cap. The single-key hold-query
+  cell is supported for training on the same terms as the batch path.
 - **Privacy:** `upstream_only` emits zero P2P publication/query/serve records;
   `consume_only` emits zero publication and serve records and reports each
   opted-in lookup recipient/exposure; `lan_share` emits zero packets/records to
@@ -885,12 +892,14 @@ training, not values this document may guess:
   no-enumeration invariant is therefore discharged **at the schema level** for both
   paths (a list of identities is inexpressible), but **not literally**: a single
   identity-shaped **string** can still ride via the tag, an extra field name, or
-  the value. That **TEXT residual is owned by TASK-227** — distinct from **TASK-223**
-  (byte VOLUME, the ~744× padding): a byte cap does not eliminate identity naming,
-  since one accepted unasked identity is already the defect. Per orchestrator
-  arbitration the residual is format-cleanliness (a hostile responder naming fake
-  identities is not an honest-peer-holdings leak), hence Low urgency but a real
-  defect to own; literal closure is possible at a forward-compat cost.
+  the value. That **TEXT residual is owned by TASK-227** — distinct from **TASK-223
+  (landed)**, which bounds byte VOLUME (the ~744× padding) with a per-offer 2 KiB
+  serialized-byte cap: a byte cap does not eliminate identity naming, since one
+  accepted unasked identity is already the defect regardless of its length. Per
+  orchestrator arbitration the TEXT residual is format-cleanliness (a hostile
+  responder naming fake identities is not an honest-peer-holdings leak), hence Low
+  urgency but a real defect to own; literal closure is possible at a forward-compat
+  cost.
 - TASK-120 must freeze a hashed, typed, **complete and owner-reviewed** budget
   artifact for every profile with numeric upload bytes/rate, concurrent serves,
   transient RAM, metadata/disk, fd, discovery work/traffic/deadline and
