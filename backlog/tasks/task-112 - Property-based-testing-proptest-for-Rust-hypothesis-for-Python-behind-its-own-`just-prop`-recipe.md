@@ -6,7 +6,7 @@ title: >-
 status: To Do
 assignee: []
 created_date: '2026-08-10 21:39'
-updated_date: '2026-08-10 22:55'
+updated_date: '2026-08-17 17:39'
 labels: []
 dependencies:
   - TASK-46
@@ -55,3 +55,9 @@ PREREQUISITES, both real:
 - [ ] #7 Cross-backend properties generate claims/discovery outcomes/offers containing Iroh and BitTorrent kinds and assert bounded round-trip, at-most-one-offer-per-frozen-kind, explicit registry dispatch and unknown-kind behavior.
 - [ ] #8 BitTorrent properties cover NarHash/RawNar-to-metainfo/infohash determinism, piece partition boundaries and malformed/oversized metadata; Iroh properties cover codec negotiation/raw fallback and decompressed-size bounds.
 <!-- AC:END -->
+
+## Implementation Notes
+
+<!-- SECTION:NOTES:BEGIN -->
+RE-SCOPED (COMPASS 2026-08-17, post-TASK-202). AC#7 (Iroh+BitTorrent cross-backend properties) and AC#8 (BitTorrent metainfo/infohash + Iroh codec) are DEFERRED-PENDING-202 (iroh OPTIONAL, BT tournament deferred) — do NOT implement now; Done is Done-with-#7/#8-residual, re-file when iroh/BT un-parks. This task now targets the SHIPPED surfaces only: AC#3 (>=3 Rust + 2 Python properties, each mutation-proven) should cover the FROZEN CLAIM WIRE round-trip (decode(encode(claim))==claim; decode FAILS-CLOSED on arbitrary/truncated/oversized bytes; the MAX_OFFERS_PER_ANSWER count cap + the MAX_OFFER_WIRE_BYTES per-offer byte cap hold for generated offer vectors; unknown-kind tolerate-but-inert), RawNarV1/NAR, narinfo parse, safe_key, and the hand-rolled HTTP framing. This property class would STRUCTURALLY close the 110->223->224->227 enumeration family that has cost ~9 cumulative codex NO-GO rounds by hand. AC#1-#6 unchanged.
+<!-- SECTION:NOTES:END -->
