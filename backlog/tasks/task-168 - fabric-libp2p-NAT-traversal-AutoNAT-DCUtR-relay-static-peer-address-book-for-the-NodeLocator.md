@@ -6,7 +6,7 @@ title: >-
 status: In Progress
 assignee: []
 created_date: '2026-08-12 14:28'
-updated_date: '2026-08-14 19:55'
+updated_date: '2026-08-17 23:17'
 labels:
   - libp2p
   - fabric
@@ -25,7 +25,7 @@ Follow-up to TASK-159 AC#1 (which decentralized address RESOLUTION via kad peer-
 
 ## Acceptance Criteria
 <!-- AC:BEGIN -->
-- [ ] #1 AutoNAT/DCUtR/relay let a NAT'd peer be dialed for a fetch, proven by a test against a real or containerized-NAT network (not loopback)
+- [x] #1 AutoNAT/DCUtR/relay let a NAT'd peer be dialed for a fetch, proven by a test against a real or containerized-NAT network (not loopback)
 - [x] #2 ExplicitPeersOnly resolves from a statically-configured peer address book with zero third-party disclosure
 - [ ] #3 The queried-NodeId disclosure a peer-routing lookup incurs is represented in the exposure ledger (frozen Disclosed extension, wire-reviewed)
 <!-- AC:END -->
@@ -35,7 +35,7 @@ Follow-up to TASK-159 AC#1 (which decentralized address RESOLUTION via kad peer-
 <!-- SECTION:NOTES:BEGIN -->
 SUPERSEDES the --libp2p-provider-addr / Libp2pSourceConfig.provider_addrs shim (from TASK-169 mped review F3): TASK-169 demoted that injection channel from required to an OPTIONAL out-of-band dial-address override hint (kept, not removed, as the lower-risk interim). It is now a SECOND source of truth for 'where is P' alongside node_locator's DHT resolution, and it is exercised by NO test (the acceptance test sets provider_addrs=[]). This task's ExplicitPeersOnly static peer address book is the clean seam-level home for 'reach a peer the DHT has not propagated' - when it lands, converge --libp2p-provider-addr into ExplicitPeersOnly (feed the CLI-supplied peers to the static address book resolved under ExplicitPeersOnly, disclosing nothing) and REMOVE the parallel add_address injection loop in build_libp2p_nar_source (daemon/src/source_libp2p.rs). Until then the retained shim is untested surface - either add a small test of the override role or remove-and-reintroduce here.
 
-COMPASS 2026-08-14: RAISED to High + this is a rung-2 CORNERSTONE (not hardening). It is the LAST unproven half of 'robust connectivity' and the PRD's #1 failure mode (risk 8: works in the harness, fails behind real NAT). All connectivity proofs so far (TASK-103 discovery, TASK-159 address resolution, TASK-179 routed netns) use ROUTABLE addresses with ZERO NAT — hole-punching/relay/AutoNAT/DCUtR are completely unexercised, the direct analogue of the compression thesis needing real link shaping before 94/99 could be believed. Highest-leverage cornerstone after TASK-194. HARNESS CAVEAT (from TASK-179 notes): the e2e image ships no iproute2, so a containerized-NAT topology is a harness fight; spike it first and FILE the true-multi-host residual separately if it balloons (the 179 file-it-keep-the-proof discipline). TEST-LOCK-IN: a minimal-pair bite — a peer reachable ONLY via hole-punch/relay fetches byte-identical; disable DCUtR/relay -> that peer is undiallable -> upstream fallback (proves traversal is load-bearing, not incidental).
+COMPASS 2026-08-14: RAISED to High + this is a rung-2 CORNERSTONE (not hardening). It is the LAST unproven half of 'robust connectivity' and the PRD's #1 failure mode (risk 8: works in the harness, fails behind real NAT). All connectivity proofs so far (TASK-103 discovery, TASK-159 address resolution, TASK-179 routed netns) use ROUTABLE addresses with ZERO NAT — hole-punching/relay/AutoNAT/DCUtR are completely unexercised, the direct analogue of the compression thesis needing real link shaping before 94/99 could be believed. Highest-leverage cornerstone after TASK-194. HARNESS CAVEAT (from TASK-179 notes): the e2e image ships no iproute2, so a containerized-NAT topology is a harness fight; spike it first and FILE the true-multi-host residual separately if it balloons (the 179 file-it-keep-the-proof discipline). ORIGINAL TEST-LOCK-IN (superseded by TASK-207 final warm design): the first proposal disabled DCUtR and relay together. The accepted proof instead observes that no DCUtR direct upgrade occurred, stops only the sole relay on the same converged consumer, positively attributes circuit UNREACHABLE with unchanged daemons, and only then activates the already-raw fixed-point upstream fallback. This is the less-confounded load-bearing oracle.
 
 --- 2026-08-14 cycle (AC#1 CODE landed; harness residual + AC#2/#3 deferred) ---
 Commit e2dcbac. AC#1 split into CODE (done) + HARNESS (blocked, filed TASK-207).
@@ -71,4 +71,8 @@ BOUNDED GATE (all green): cargo build -p fabric-libp2p -p daemon-libp2p (exit 0)
 AC status: AC#2 MET; AC#1 CODE done + HARNESS blocked->TASK-207; AC#3 deferred (frozen Disclosed, wire review).
 
 AC#2 DONE 2026-08-14 (commit e1d000c): ExplicitPeersOnly now resolves from a local static peer address book (NodeConfig.peer_address_book / with_explicit_peer) — a pure local map lookup, ZERO third-party disclosure (proven: a node with an EMPTY routing table resolves a book peer Found while the SAME peer under PublicInfrastructure is Unavailable(InsufficientRouting), so Found came from the book not the DHT; exposure_ledger unchanged across explicit resolves; unconfigured -> Miss; oracle bites by mutation). AC#3's frozen Disclosed extension NOT needed (local lookup discloses nothing). kad path (159) + discovery unchanged/green. Orchestrator-verified. 168 STAYS In Progress: AC#1 (real-NAT proof) blocked -> TASK-207 (env); AC#3 (queried-NodeId Disclosed extension, wire-review) deferred. Follow-up seam noted: the transport doesn't yet consult the book on fetch + the --libp2p-provider-addr shim convergence into ExplicitPeersOnly is a larger daemon+transport change (book seam in place, untested surface until then).
+
+2026-08-18 forward-carried TASK-207 evidence (pending independent review): TASK-218 plus the finalized real-NAT VM harness now exercise the literal TASK-168 AC#1 chain. A consumer behind its own real NAT discovers a provider behind a separate real NAT via kad, fetches the signed NAR byte-identically through the sole relay circuit, then fails fresh on the same warm consumer after that relay is stopped. The final TASK-207 extension proves production upstream fallback for an already-raw Compression:none fixed-point URL only after the relay-down attribution by atomically activating the same signed NAR at the unchanged HTTP URL; it does not claim the known compressed-to-raw fallback gap is closed. Targeted VM GREEN: AC#1 298.73s, B2 13.56s, fallback 1.03s, total 371.01s; mutation without activation went RED at final realise while AC#1/B2 stayed green. No AC/status changed here; orchestrator review remains required.
+
+2026-08-17 TASK-207 CLOSED after independent QA + MPED GO. AC#1 is now checked: the final fresh six-VM run proved kad discovery and signed byte-identical relay carriage across two real egress-only NATs, plus the same warm consumer failing with circuit UNREACHABLE when the sole relay stopped. Consumer MainPID 720 and provider PID stayed unchanged; no DCUtR upgrade occurred. TASK-168 remains In Progress solely for AC#3, the frozen queried-NodeId disclosure extension.
 <!-- SECTION:NOTES:END -->

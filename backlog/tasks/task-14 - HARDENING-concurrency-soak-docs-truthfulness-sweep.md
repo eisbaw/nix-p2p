@@ -4,7 +4,7 @@ title: 'HARDENING: concurrency soak + docs truthfulness sweep'
 status: To Do
 assignee: []
 created_date: '2026-08-07 21:56'
-updated_date: '2026-08-10 22:58'
+updated_date: '2026-08-17 22:12'
 labels:
   - hardening
 dependencies:
@@ -45,4 +45,6 @@ Forward-carry from task-13 (VM fault re-assertion, re-deferred here with owner-v
 SEQUENCING (owner, 2026-08-08): deprioritized - owner chose to jump to wave-2 planning before finishing wave-1 hardening. task-14 (soak + docs sweep) deferred to run alongside/after wave-2 planning, not blocking. Relabeled for later.
 
 README drift found by mped-architect review (2026-08-08, figures commit) - README.md was committed in 0ca03b6 and already drifts; belongs to this task's docs-truthfulness sweep: (1) 'no shared crates, enforced by just independence' overstates the gate - check-independence covers only path-linked workspace crates + an HTTP-stack lockfile denylist, third-party sharing like serde would pass; also they are lib+bin crates, not bare binaries. (2) 'passes signed metadata through from cache.nixos.org' - daemon rejects https upstreams in wave 1 (task-24 open). (3) narinfo disk cache listed as current behavior but is OFF by default (task-29 open). (4) S4 listed under 'tested end-to-end' but TESTING.md marks S4 UNUSABLE at container tier (s4_usable=false). (5) S3 bullet drops 'offload = 0 by construction in wave 1'. (6) Status paragraph + S1-S4 restatement duplicate TESTING.md/backlog state and have already drifted - consider pointing at TESTING.md instead of restating. Also: TESTING.md internally inconsistent 'S1-S4' (line ~522) vs 'S1-S5' (~656). Also backlog hygiene: task-37 is Done with all 4 ACs unchecked.
+
+Forward-carried from TASK-247: the focused real nix-daemon wide-fanout libp2p latency-hiding proof now lives in TASK-247 after TASK-57. Reuse its fixture, knob matrix, request-overlap oracle, and evidence here. Keep TASK-14 scoped to the additional restart-under-load, fault-depth, documentation, and eventual cross-backend soak; do not rebuild the core concurrency proof.
 <!-- SECTION:NOTES:END -->
