@@ -31,7 +31,7 @@
 use std::fmt;
 use std::time::Duration;
 
-use peer_fabric::{AnnounceBudget, DiscoveryBudget, ServeBudget};
+use peer_fabric::{AnnounceBudget, DeriveBudget, DiscoveryBudget, ServeBudget};
 
 // ===========================================================================
 // SharingProfile — the four transport-agnostic operator modes (AC#1/#2).
@@ -401,6 +401,19 @@ pub struct ResourceCaps {
     pub discovery_deadline_ms: u64,
     /// Max peers one consultation may fan out to (the hold-query work bound).
     pub discovery_max_peers: u32,
+    // ---- responder derivation / hold-query answering (enforced by DeriveBudget, TASK-229) ----
+    /// Per-authenticated-peer ceiling on UNCOMPRESSED-NAR bytes HASHED to answer that
+    /// peer's hold-queries within [`derive_window_ms`](ResourceCaps::derive_window_ms).
+    /// A cold probe whose NarSize would exceed this is refused BEFORE dumping.
+    pub derive_max_bytes_per_peer_uncompressed: u64,
+    /// Per-authenticated-peer ceiling on the COUNT of fresh `nix-store --dump`s within
+    /// one window (bounds many-small-NAR floods under the byte cap).
+    pub derive_max_dumps_per_peer: u32,
+    /// GLOBAL ceiling on bytes HASHED across ALL peers within one window - the Sybil
+    /// floor (per-peer alone is bypassable by minting PeerIds).
+    pub derive_max_bytes_global_uncompressed: u64,
+    /// The rolling derivation-accounting window, ms.
+    pub derive_window_ms: u64,
     // ---- publication / announce (enforced by AnnounceBudget + the TASK-77 counter) ----
     /// The announce-after-fetch budget (TASK-77): max DISTINCT fetched paths this
     /// process announces. Past it, announcing STOPS.
@@ -426,6 +439,15 @@ impl Default for ResourceCaps {
             serve_duration_ms: 300_000,                    // 5 min per serve
             discovery_deadline_ms: 5_000, // matches DiscoveryBudget provisional deadline
             discovery_max_peers: 16,
+            // TASK-229 responder-derivation defaults. CONSERVATIVE PLACEHOLDERS, not
+            // derived from a measured per-deployment disk/CPU I/O ceiling (same honesty
+            // as MAX_BATCH_DERIVE_WORK=16): a peer may cost us ~1 GiB of hashing / minute
+            // and ~64 fresh dumps / minute; the global backstop is 4 GiB / minute, i.e.
+            // it tolerates ~4 fully-busy peers before biting. Tune per deployment.
+            derive_max_bytes_per_peer_uncompressed: 1024 * 1024 * 1024, // 1 GiB / window / peer
+            derive_max_dumps_per_peer: 64,
+            derive_max_bytes_global_uncompressed: 4 * 1024 * 1024 * 1024, // 4 GiB / window
+            derive_window_ms: 60_000,                                     // 1 min window
             announce_distinct_paths_budget: 256, // matches DEFAULT_LIBP2P_ANNOUNCE_BUDGET
             announce_max_replicas: 20,
             announce_deadline_ms: 10_000,
@@ -461,6 +483,17 @@ impl ResourceCaps {
         )
     }
 
+    /// The `peer_fabric` responder-derivation budget this contract mandates (TASK-229).
+    /// The integer numbers a `PeerDeriveLedger` enforces on the hold-query answer path.
+    pub fn derive_budget(&self) -> DeriveBudget {
+        DeriveBudget {
+            max_bytes_per_peer_uncompressed_nar: self.derive_max_bytes_per_peer_uncompressed,
+            max_dumps_per_peer: self.derive_max_dumps_per_peer,
+            max_bytes_global_uncompressed_nar: self.derive_max_bytes_global_uncompressed,
+            window: Duration::from_millis(self.derive_window_ms),
+        }
+    }
+
     /// The effective-configuration lines (AC#3: bounds are VISIBLE). One `key=value`
     /// per line, integers only, stable order — greppable and diffable.
     pub fn effective_lines(&self) -> Vec<String> {
@@ -476,6 +509,19 @@ impl ResourceCaps {
             format!("serve_duration_ms={}", self.serve_duration_ms),
             format!("discovery_deadline_ms={}", self.discovery_deadline_ms),
             format!("discovery_max_peers={}", self.discovery_max_peers),
+            format!(
+                "derive_max_bytes_per_peer_uncompressed={}",
+                self.derive_max_bytes_per_peer_uncompressed
+            ),
+            format!(
+                "derive_max_dumps_per_peer={}",
+                self.derive_max_dumps_per_peer
+            ),
+            format!(
+                "derive_max_bytes_global_uncompressed={}",
+                self.derive_max_bytes_global_uncompressed
+            ),
+            format!("derive_window_ms={}", self.derive_window_ms),
             format!(
                 "announce_distinct_paths_budget={}",
                 self.announce_distinct_paths_budget
@@ -726,6 +772,11 @@ pub struct StatusInputs {
     pub last_lookup: Option<LookupOutcome>,
     /// Announce-after-fetch budget consumed so far (distinct paths announced).
     pub announce_budget_used: u64,
+    /// Responder-derivation GLOBAL byte budget consumed so far in the current window
+    /// (UNCOMPRESSED-NAR bytes hashed across ALL peers, TASK-229). An AGGREGATE integer
+    /// with NO per-peer identifier - exposing per-peer usage would be a peer-behaviour
+    /// channel, so only this global figure is reported (mirrors `announce_budget_used`).
+    pub derive_budget_global_used: u64,
     /// A short fallback reason if the node is currently on the upstream path, e.g.
     /// "no-provider", "discovery-unavailable", "budget-exhausted". Empty if none.
     pub fallback_reason: String,
@@ -879,6 +930,12 @@ impl OperatorContract {
         out.push(format!(
             "announce_budget={}/{}",
             rt.announce_budget_used, self.caps.announce_distinct_paths_budget
+        ));
+        // TASK-229: the responder-derivation GLOBAL byte budget, used/CAP. An aggregate
+        // integer only (no per-peer identifier), so it discloses no peer behaviour.
+        out.push(format!(
+            "derive_budget_global_bytes={}/{}",
+            rt.derive_budget_global_used, self.caps.derive_max_bytes_global_uncompressed
         ));
         // Enabled mechanisms only (the pending set is the preflight's job).
         let enabled: Vec<&str> = Mechanism::registry()
@@ -1448,10 +1505,21 @@ mod tests {
         let ann = caps.announce_budget();
         assert_eq!(ann.max_replicas, 20);
         assert_eq!(caps.announce_distinct_paths_budget, 256);
+        // TASK-229: the responder-derivation budget the caps drive.
+        let der = caps.derive_budget();
+        assert_eq!(der.max_bytes_per_peer_uncompressed_nar, 1024 * 1024 * 1024);
+        assert_eq!(der.max_dumps_per_peer, 64);
+        assert_eq!(
+            der.max_bytes_global_uncompressed_nar,
+            4 * 1024 * 1024 * 1024
+        );
+        assert_eq!(der.window, Duration::from_millis(60_000));
+        // The global ceiling is the Sybil floor: >= a single peer's byte cap.
+        assert!(der.max_bytes_global_uncompressed_nar >= der.max_bytes_per_peer_uncompressed_nar);
         // Every effective line is present and integer-valued (no float rendering); every
         // ADVERTISED cap must be one that is actually enforced (fix #6: no phantom bounds).
         let lines = caps.effective_lines();
-        assert_eq!(lines.len(), 9);
+        assert_eq!(lines.len(), 13);
         for l in &lines {
             let v = l.split('=').nth(1).unwrap();
             assert!(v.parse::<u64>().is_ok(), "cap {l} is not an integer");
@@ -1488,6 +1556,7 @@ mod tests {
             path: PeerPath::Relay,
             last_lookup: Some(LookupOutcome::Unavailable),
             announce_budget_used: 7,
+            derive_budget_global_used: 123,
             fallback_reason: "discovery-unavailable".to_string(),
         };
         let s = c.status(&rt);
@@ -1496,6 +1565,14 @@ mod tests {
         assert!(s.contains("peer_path=relay"));
         assert!(s.contains("last_lookup=unavailable"));
         assert!(s.contains("announce_budget=7/256"));
+        // TASK-229: the responder-derivation GLOBAL byte budget renders used/CAP.
+        assert!(
+            s.contains(&format!(
+                "derive_budget_global_bytes=123/{}",
+                4u64 * 1024 * 1024 * 1024
+            )),
+            "{s}"
+        );
         assert!(s.contains("fallback_reason=discovery-unavailable"));
         assert!(s.contains("mechanisms_enabled=libp2p-kad-discovery,libp2p-nar-transfer"));
     }
@@ -1534,6 +1611,7 @@ mod tests {
             path: PeerPath::Unknown,
             last_lookup: None,
             announce_budget_used: 0,
+            derive_budget_global_used: 0,
             fallback_reason: String::new(),
         };
         let s = c.status(&rt);
@@ -1586,6 +1664,7 @@ mod tests {
             path: PeerPath::None,
             last_lookup: None,
             announce_budget_used: 0,
+            derive_budget_global_used: 0,
             fallback_reason: String::new(),
         };
         assert!(s.status(&rt).contains("dht_role=server"));

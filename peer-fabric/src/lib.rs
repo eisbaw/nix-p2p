@@ -24,7 +24,7 @@
 //!     [`TransportOffer`] (this crate is their canonical home; TASK-141 re-points
 //!     the daemon at them and deletes its duplicates);
 //!   * the budgets [`DiscoveryBudget`], [`AnnounceBudget`], [`SafetyEnvelope`],
-//!     [`ServeBudget`];
+//!     [`ServeBudget`], [`DeriveBudget`];
 //!   * a [`FakeFabric`] and one fake per axis, so the seam - and eventually the
 //!     whole daemon-core - is unit-testable with no p2p stack linked.
 //!
@@ -53,7 +53,7 @@ mod record_store;
 mod require;
 mod resolve;
 
-pub use budget::{AnnounceBudget, DiscoveryBudget, SafetyEnvelope, ServeBudget};
+pub use budget::{AnnounceBudget, DeriveBudget, DiscoveryBudget, SafetyEnvelope, ServeBudget};
 pub use capabilities::{
     AnnounceError, AvailabilityAnnouncer, HoldAnswer, HoldMisalignment, LocalPeerDiscovery,
     NarServer, NarTransfer, NodeLocator, PeerHoldQuery, PeerHoldReply, PeerHoldRequest,

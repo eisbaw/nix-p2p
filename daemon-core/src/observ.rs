@@ -307,6 +307,11 @@ pub struct Observability {
     pub facts: Arc<dyn StatusFacts>,
     /// The announce-after-fetch hook, for the LIVE announce budget figure (`None` = consume-only).
     pub announce: Option<Arc<dyn crate::post_fetch::PostFetchAnnounce>>,
+    /// The RESPONDER derivation ledger, for the LIVE global derive-budget figure
+    /// (TASK-229). Read LIVE (not mirrored) so the reported used/CAP cannot drift from
+    /// what the hold-query answer path actually enforces - the same discipline as the
+    /// announce budget. `None` for a node that answers no hold-queries (no responder).
+    pub derive_ledger: Option<Arc<crate::derive_ledger::PeerDeriveLedger>>,
 }
 
 impl Observability {
@@ -321,6 +326,13 @@ impl Observability {
             .as_ref()
             .and_then(|h| h.budget_used())
             .unwrap_or(0);
+        // LIVE global derive-budget usage (TASK-229): read straight from the ledger the
+        // answer path charges, so the figure cannot drift from what is enforced.
+        let derive_budget_global_used = self
+            .derive_ledger
+            .as_ref()
+            .map(|l| l.global_bytes_used())
+            .unwrap_or(0);
         // ONE lock acquisition for both fields (no torn read: the holders and outcome a scrape
         // reports are always from the SAME lookup).
         let (last_lookup, holder_count) = self.metrics.last_snapshot();
@@ -332,6 +344,7 @@ impl Observability {
             path: facts.path,
             last_lookup,
             announce_budget_used,
+            derive_budget_global_used,
             fallback_reason: fallback_reason(last_lookup, &facts).to_string(),
         };
         self.contract.status(&inputs)
@@ -532,6 +545,7 @@ mod tests {
             metrics: Arc::new(RuntimeMetrics::new()),
             facts: Arc::new(FixedFacts(facts)),
             announce: None,
+            derive_ledger: None,
         }
     }
 

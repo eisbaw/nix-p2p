@@ -48,9 +48,9 @@
 //! ## The two query shapes (yes/no ONLY - never enumeration)
 //!
 //!   * [`AvailabilityIndex::hold`] answers "do I hold this ONE NarHash?" -> a
-//!     [`HoldAnswer`] (`Have{blake3, offers}` or `Absent`). [`AvailabilityIndex::answer`]
+//!     [`HoldAnswer`] (`Have{blake3, offers}` or `Absent`). [`AvailabilityIndex::answer_for_peer`]
 //!     wraps it in the versioned [`HoldResponse`] envelope for the wire.
-//!     [`AvailabilityIndex::answer_batch`] (task-91) answers the same question
+//!     [`AvailabilityIndex::answer_batch_for_peer`] (task-91) answers the same question
 //!     about MANY caller-named keys in one call - a positional yes/no vector, not
 //!     a listing: every element is about a key the caller supplied.
 //!   * [`AvailabilityIndex::claim`] / [`AvailabilityIndex::publish`] produce the
@@ -173,6 +173,7 @@ use crate::claim::{
     MAX_BATCH_HOLD_KEYS, NarHashKey, QUERY_SCHEMA_VERSION, check_batch_keys,
 };
 use crate::content_id::Blake3Digest;
+use crate::derive_ledger::{DeriveAdmission, PeerDeriveLedger};
 use crate::supply_catalog::{
     NarProductionSource, SupplyCatalog, SupplyCatalogHandle, SupplyCatalogRecord,
     SupplyRegistration,
@@ -366,6 +367,25 @@ pub trait NarDumper: nar_dumper_sealed::Sealed + Send + Sync {
         path: &StorePath,
         cancellation: &dyn CancellationCheck,
     ) -> Result<Vec<u8>, DumpError>;
+
+    /// The UNCOMPRESSED NAR byte size (NarSize) this path WOULD dump to, answered
+    /// WITHOUT dumping (TASK-229 R1). This is the size a byte budget is seeded from so
+    /// a responder can REFUSE a hold-query probe BEFORE it spends a whole
+    /// `nix-store --dump` + BLAKE3 on it: the production dumper reads `narSize` from the
+    /// store DB (`nix-store -q --size`, a cheap O(1) query, NOT a dump), so an
+    /// over-budget cold probe costs a stat, not a multi-GB hash.
+    ///
+    /// The unit is NarSize - UNCOMPRESSED NAR bytes, the exact hashing-work unit and the
+    /// same unit [`DumpError`]-free [`dump`](Self::dump) produces - NEVER the compressed
+    /// FileSize a narinfo carries (the recurring unit trap). For an immutable
+    /// `/nix/store` path this equals the eventual `dump().len()` exactly; for a
+    /// raw-file-backed non-production path it is the file length, which the serve-time
+    /// `BLAKE3 == announced` recheck still backstops if the file changed.
+    fn nar_size(
+        &self,
+        path: &StorePath,
+        cancellation: &dyn CancellationCheck,
+    ) -> Result<u64, DumpError>;
 }
 
 /// The REAL dumper: shells out to `nix-store --dump <path>` and returns its stdout
@@ -463,6 +483,88 @@ impl NarDumper for CommandNarDumper {
         }
         Ok(output.stdout)
     }
+
+    fn nar_size(
+        &self,
+        path: &StorePath,
+        cancellation: &dyn CancellationCheck,
+    ) -> Result<u64, DumpError> {
+        // `nix-store -q --size <path>` prints the store DB's `narSize` (UNCOMPRESSED
+        // NAR bytes) as a single integer line - a cheap O(1) metadata query, NOT a
+        // dump. Same binary the dump path uses, so no new tool dependency. This is the
+        // R1 "answer the byte budget's question without producing the bytes" query.
+        if cancellation.is_cancelled() {
+            return Err(DumpError(format!(
+                "{} -q --size {} cancelled before spawn",
+                self.program.display(),
+                path
+            )));
+        }
+        let job = ProcessJob::standalone(
+            format!("{} -q --size {}", self.program.display(), path),
+            ProcessJobSpec {
+                program: self.program.clone(),
+                args: vec![
+                    OsString::from("--query"),
+                    OsString::from("--size"),
+                    path.as_path().as_os_str().into(),
+                ],
+                environment: Vec::new(),
+                // A NarSize is a small integer line; bound stdout tightly so a broken
+                // nix cannot flood us on the metadata path.
+                stdout_limit: Some(4 * 1024),
+                stderr_limit: 64 * 1024,
+            },
+        )
+        .map_err(|error| DumpError(format!("starting supervised size query: {error}")))?;
+        let output = loop {
+            if cancellation.is_cancelled() {
+                job.cancel();
+                let cleaned = job.wait().map_err(|error| {
+                    DumpError(format!(
+                        "{} -q --size {} cancellation cleanup failed: {error}",
+                        self.program.display(),
+                        path
+                    ))
+                })?;
+                return Err(DumpError(format!(
+                    "{} -q --size {} cancelled; process group killed and reaped (status {})",
+                    self.program.display(),
+                    path,
+                    cleaned.status
+                )));
+            }
+            if let Some(result) = job.try_take_result() {
+                break result.map_err(|error| DumpError(error.to_string()))?;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        };
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            return Err(DumpError(format!(
+                "{} -q --size {} exited {}: {}",
+                self.program.display(),
+                path,
+                output.status,
+                stderr.trim()
+            )));
+        }
+        let text = String::from_utf8_lossy(&output.stdout);
+        let first = text.split_whitespace().next().ok_or_else(|| {
+            DumpError(format!(
+                "{} -q --size {} produced no size line",
+                self.program.display(),
+                path
+            ))
+        })?;
+        first.parse::<u64>().map_err(|error| {
+            DumpError(format!(
+                "{} -q --size {} produced a non-integer NarSize {first:?}: {error}",
+                self.program.display(),
+                path
+            ))
+        })
+    }
 }
 
 /// Deterministic, cancellation-aware dumper for tests and in-memory probes.
@@ -522,6 +624,21 @@ impl NarDumper for MemoryNarDumper {
         }
         Ok(self.bytes.as_ref().clone())
     }
+
+    fn nar_size(
+        &self,
+        _path: &StorePath,
+        cancellation: &dyn CancellationCheck,
+    ) -> Result<u64, DumpError> {
+        // The in-memory NAR's length IS its NarSize; no dump, and crucially NO `calls`
+        // increment - the size query is not a dump, so a test that counts dumps sees the
+        // R1 refuse-before-dump property directly (a refused probe leaves `calls`
+        // unchanged).
+        if cancellation.is_cancelled() {
+            return Err(DumpError("in-memory NAR size query cancelled".into()));
+        }
+        Ok(self.bytes.len() as u64)
+    }
 }
 
 /// Read a store path that is itself a raw-NAR regular file.
@@ -575,6 +692,34 @@ impl NarDumper for RegularFileNarDumper {
             bytes.extend_from_slice(&chunk[..read]);
         }
         Ok(bytes)
+    }
+
+    fn nar_size(
+        &self,
+        path: &StorePath,
+        cancellation: &dyn CancellationCheck,
+    ) -> Result<u64, DumpError> {
+        use rustix::fs::{FileType, Mode, OFlags};
+
+        // The file IS the raw NAR, so its byte length is its NarSize - answered with a
+        // single fstat, no read (R1: no bytes produced). The same NOFOLLOW/regular-file
+        // validation as `dump`, so a path swapped for a FIFO/device/symlink fails here
+        // too rather than reporting a bogus size.
+        if cancellation.is_cancelled() {
+            return Err(DumpError(format!("sizing {path} cancelled before open")));
+        }
+        let fd = rustix::fs::open(
+            path.as_path(),
+            OFlags::RDONLY | OFlags::NONBLOCK | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+            Mode::empty(),
+        )
+        .map_err(|error| DumpError(format!("opening raw NAR {path} for size: {error}")))?;
+        let stat = rustix::fs::fstat(&fd)
+            .map_err(|error| DumpError(format!("inspecting raw NAR {path} for size: {error}")))?;
+        if FileType::from_raw_mode(stat.st_mode) != FileType::RegularFile {
+            return Err(DumpError(format!("raw NAR {path} is not a regular file")));
+        }
+        Ok(stat.st_size.max(0) as u64)
     }
 }
 
@@ -903,7 +1048,7 @@ impl AnnounceSink for NullAnnounce {
 // -------------------------------------------------------------------------
 
 /// The most FRESH `nix-store --dump` derivations one BATCHED hold-query
-/// ([`AvailabilityIndex::answer_batch`]) may trigger on the responder (task-104).
+/// ([`AvailabilityIndex::answer_batch_for_peer`]) may trigger on the responder (task-104).
 ///
 /// WHY THIS EXISTS. task-91 caps a batch at [`crate::claim::MAX_BATCH_HOLD_KEYS`]
 /// = 256 keys, which bounds the NUMBER of probes one message demands but NOT the
@@ -937,39 +1082,45 @@ impl AnnounceSink for NullAnnounce {
 /// 256-key cap and above the largest batch any current test holds; tune it when a
 /// deployment gives a real per-message I/O ceiling. It is a tunable integer, not a
 /// wire constant, so changing it is not a wire change. See
-/// [`AvailabilityIndex::answer_batch`] for the residual under-report and how the
+/// [`AvailabilityIndex::answer_batch_for_peer`] for the residual under-report and how the
 /// responder cache warms `MAX_BATCH_DERIVE_WORK` cold keys per probe.
 pub const MAX_BATCH_DERIVE_WORK: u32 = 16;
 
-/// A per-BATCH allowance of FRESH derivations (task-104). [`AvailabilityIndex::answer_batch`]
+/// A per-BATCH allowance of FRESH derivations (task-104). [`AvailabilityIndex::answer_batch_for_peer`]
 /// starts it at [`MAX_BATCH_DERIVE_WORK`]; every key that triggers a real
 /// `nix-store --dump` spends one unit. A key that is already derived (warm),
 /// unregistered, or GC'd triggers no dump and so spends NO unit. The single-key
-/// [`AvailabilityIndex::hold`] path uses [`DeriveBudget::unlimited`], preserving
-/// its pre-task-104 behaviour exactly (it can never defer).
-struct DeriveBudget {
+/// [`AvailabilityIndex::hold`] path uses [`BatchDeriveAllowance::unlimited`], preserving
+/// its pre-task-104 behaviour exactly (it can never defer on the COUNT axis).
+///
+/// This is the per-MESSAGE COUNT bound. It is DISTINCT from - and composed with - the
+/// cross-message, per-authenticated-peer BYTE+count [`PeerDeriveLedger`](crate::derive_ledger::PeerDeriveLedger)
+/// (task-229), which is what actually bounds a hostile peer that picks the message
+/// boundaries. Both are consulted in [`AvailabilityIndex::derive`]; the tighter bites.
+struct BatchDeriveAllowance {
     /// `None` = unlimited (the single-key path). `Some(n)` = `n` fresh dumps remain.
     remaining: Option<u32>,
 }
 
-impl DeriveBudget {
-    /// No bound: the single-key path, which must always answer truthfully.
+impl BatchDeriveAllowance {
+    /// No per-message COUNT bound: the single-key path (the per-peer ledger still bounds
+    /// it across messages).
     fn unlimited() -> Self {
         Self { remaining: None }
     }
 
-    /// At most `n` fresh dumps: the batched path.
+    /// At most `n` fresh dumps in this one message: the batched path.
     fn limited(n: u32) -> Self {
         Self { remaining: Some(n) }
     }
 
-    /// Reserve permission for ONE fresh dump. `true` (and, for a limited budget,
-    /// consumes one unit) when a dump is permitted; `false` when a limited budget
+    /// Reserve permission for ONE fresh dump. `true` (and, for a limited allowance,
+    /// consumes one unit) when a dump is permitted; `false` when a limited allowance
     /// is spent. Unlimited never consumes and never refuses.
     ///
-    /// The budget itself is not shared between threads - it is a `&mut` threaded
+    /// The allowance itself is not shared between threads - it is a `&mut` threaded
     /// through one `answer_batch` loop, which is the only mutator, so a batch cannot
-    /// race PAST ITS OWN budget (there is no intra-batch concurrency). Call this only
+    /// race PAST ITS OWN allowance (there is no intra-batch concurrency). Call this only
     /// after the `None` (cold) check UNDER the digest lock so that (a) each reserved
     /// unit maps 1:1 to a real dump - the lock's single-flight guard means the slot
     /// cannot flip to `Verified` between the check and the dump - and (b) a warm key
@@ -982,6 +1133,48 @@ impl DeriveBudget {
                 *n -= 1;
                 true
             }
+        }
+    }
+}
+
+/// The full RESPONDER derivation gate threaded through one hold-query answer (task-229):
+/// the per-MESSAGE count allowance (task-104) PLUS, for a peer-attributed answer, the
+/// authenticated asker identity and the shared cross-message [`PeerDeriveLedger`].
+///
+/// A LOCAL self-probe ([`AvailabilityIndex::hold`], used by `claim`/`publish`/post-fetch
+/// learning) is node-initiated, not peer-driven, and must always answer truthfully, so
+/// it carries [`DeriveGate::local`] (unlimited count, no ledger, no byte check). A
+/// RESPONDER answer to a remote peer carries [`DeriveGate::for_peer`], so every cold key
+/// is admitted against BOTH the per-message count AND the per-peer/global byte ledger,
+/// seeded by the path's NarSize queried WITHOUT dumping (R1: refuse before dump).
+struct DeriveGate<'a> {
+    /// The per-message fresh-dump COUNT allowance (task-104).
+    batch: BatchDeriveAllowance,
+    /// `Some((asker, ledger))` for a peer-attributed responder answer (task-229);
+    /// `None` for a local self-probe, which is never bounded or byte-checked.
+    peer: Option<(&'a NodeId, &'a PeerDeriveLedger)>,
+}
+
+impl<'a> DeriveGate<'a> {
+    /// The LOCAL self-probe gate: unlimited count, no per-peer ledger. Never refuses a
+    /// cold key on either axis - a self-initiated probe must always answer truthfully.
+    fn local() -> Self {
+        DeriveGate {
+            batch: BatchDeriveAllowance::unlimited(),
+            peer: None,
+        }
+    }
+
+    /// A peer-attributed responder gate with the given per-message count allowance,
+    /// bounded across messages by `ledger` keyed on the authenticated `asker`.
+    fn for_peer(
+        batch: BatchDeriveAllowance,
+        asker: &'a NodeId,
+        ledger: &'a PeerDeriveLedger,
+    ) -> Self {
+        DeriveGate {
+            batch,
+            peer: Some((asker, ledger)),
         }
     }
 }
@@ -1281,36 +1474,37 @@ impl AvailabilityIndex {
     /// resolves to `Absent` and is pruned (materialisation/cleanup). There is no
     /// enumeration counterpart - only this per-key probe.
     pub fn hold(&self, key: &NarHashKey) -> Result<HoldAnswer, AvailabilityError> {
-        // The single-key path is UNLIMITED: it must always answer truthfully, and an
-        // unlimited budget can never return `Deferred`, so the mapping below is total.
-        match self.hold_budgeted(key, &mut DeriveBudget::unlimited())? {
+        // The single-key LOCAL self-probe path is UNBOUNDED (no per-message count cap,
+        // no per-peer ledger): it is node-initiated (claim/publish/post-fetch learning),
+        // must always answer truthfully, and a local gate can never return `Deferred`,
+        // so the mapping below is total. The RESPONDER single-key path is
+        // `answer_for_peer`, which IS bounded (task-229).
+        match self.hold_budgeted(key, &mut DeriveGate::local())? {
             BudgetedHold::Have { blake3, offers } => Ok(HoldAnswer::Have { blake3, offers }),
             BudgetedHold::Absent => Ok(HoldAnswer::Absent),
-            // Unreachable: an unlimited budget never defers. Fail LOUD in debug so a
-            // future caller that wrongly routes a LIMITED budget through the single-key
+            // Unreachable: a local gate never defers. Fail LOUD in debug so a future
+            // caller that wrongly routes a bounded gate through the single-key LOCAL
             // path is caught, while still degrading to the SAFE `Absent` in release
             // (a spurious miss falls back upstream; it never serves a wrong answer).
             BudgetedHold::Deferred => {
-                debug_assert!(
-                    false,
-                    "hold() uses an unlimited budget and must never defer"
-                );
+                debug_assert!(false, "hold() uses a local gate and must never defer");
                 Ok(HoldAnswer::Absent)
             }
         }
     }
 
-    /// The budget-aware core of [`Self::hold`] (task-104). Resolves ONE key while
-    /// spending at most what `budget` permits on FRESH derivations: a warm key
+    /// The gate-aware core of [`Self::hold`] (task-104/229). Resolves ONE key while
+    /// spending at most what `gate` permits on FRESH derivations: a warm key
     /// (already derived) or an absent key costs no dump and no budget; a cold key
-    /// dumps only while the budget allows, otherwise answers [`BudgetedHold::Deferred`]
-    /// (no dump). [`Self::answer_batch`] passes a [`DeriveBudget::limited`] budget so
-    /// one batch message cannot trigger unbounded derivation; [`Self::hold`] passes
-    /// [`DeriveBudget::unlimited`], so its behaviour is exactly as before.
+    /// dumps only while BOTH the per-message count allowance AND (for a peer-attributed
+    /// gate) the per-peer/global byte ledger allow, otherwise answers
+    /// [`BudgetedHold::Deferred`] (no dump). [`Self::answer_batch_for_peer`] passes a
+    /// [`BatchDeriveAllowance::limited`] count with a bounded ledger; [`Self::hold`]
+    /// passes [`DeriveGate::local`], so its behaviour is exactly as before.
     fn hold_budgeted(
         &self,
         key: &NarHashKey,
-        budget: &mut DeriveBudget,
+        gate: &mut DeriveGate,
     ) -> Result<BudgetedHold, AvailabilityError> {
         loop {
             let entry = {
@@ -1333,7 +1527,7 @@ impl AvailabilityIndex {
                 continue;
             }
 
-            let (derived, freshly_derived) = match self.derive(key, &entry, budget) {
+            let (derived, freshly_derived) = match self.derive(key, &entry, gate) {
                 // A cold key the batch cannot afford to dump right now. No dump
                 // happened, so nothing is published and no unit was spent; the caller
                 // answers Absent. This warms nothing, so it is a later, budget-bearing
@@ -1518,10 +1712,23 @@ impl AvailabilityIndex {
         self.supply_catalog.read_handle()
     }
 
-    /// The versioned wire envelope for a [`HoldQuery`] probe: the same yes/no
-    /// [`hold`](Self::hold) answer, wrapped for transmission. There is deliberately
-    /// no query that lists holdings.
-    pub fn answer(&self, query: &HoldQuery) -> Result<HoldResponse, AvailabilityError> {
+    /// The versioned wire envelope for a single [`HoldQuery`] probe from an
+    /// authenticated `asker`, bounded by the per-peer/global `ledger` (task-229). The
+    /// RESPONDER single-key path: unlike [`hold`](Self::hold) (the LOCAL self-probe,
+    /// which is never bounded), a single-key probe FROM A PEER draws the same per-peer
+    /// byte+count budget the batch path does, so a single-key `hold`-query FLOOD is
+    /// bounded, not unlimited. A cold key past the asker's budget is answered `Absent`
+    /// (the safe direction), never a false `Have`.
+    ///
+    /// `asker` is the AUTHENTICATED remote peer identity (the libp2p `PeerId` / iroh
+    /// [`NodeId`], the cryptographic connection identity the fabric hands the responder),
+    /// so the bound is keyed on an identity a peer cannot forge.
+    pub fn answer_for_peer(
+        &self,
+        query: &HoldQuery,
+        asker: &NodeId,
+        ledger: &PeerDeriveLedger,
+    ) -> Result<HoldResponse, AvailabilityError> {
         // PRECONDITION: `query` is a DECODED, version-checked probe - the wire path
         // gates it in `decode_hold_query`, so by construction its version is current.
         // This is a `debug_assert` (not a hard reject) because `answer` has no version
@@ -1529,9 +1736,18 @@ impl AvailabilityIndex {
         // it a raw, unvalidated query. The response is always emitted at this build's
         // `QUERY_SCHEMA_VERSION`.
         debug_assert_eq!(query.schema_version, QUERY_SCHEMA_VERSION);
+        // A single-key probe triggers at most one dump, so the per-message COUNT
+        // allowance is unlimited; the per-peer LEDGER is what bounds a single-key flood.
+        let mut gate = DeriveGate::for_peer(BatchDeriveAllowance::unlimited(), asker, ledger);
+        let answer = match self.hold_budgeted(&query.key, &mut gate)? {
+            BudgetedHold::Have { blake3, offers } => HoldAnswer::Have { blake3, offers },
+            // Genuinely absent OR deferred past the asker's per-peer/global budget: both
+            // answer `Absent` on the wire (the safe direction - never a false `Have`).
+            BudgetedHold::Absent | BudgetedHold::Deferred => HoldAnswer::Absent,
+        };
         Ok(HoldResponse {
             schema_version: QUERY_SCHEMA_VERSION,
-            answer: self.hold(&query.key)?,
+            answer,
         })
     }
 
@@ -1596,11 +1812,23 @@ impl AvailabilityIndex {
     /// aggregate dumps many messages from one peer can start (the peer picks the
     /// message boundaries) - a per-peer aggregate limit is the follow-up (task-72's
     /// serve budget bounds bytes served, not bytes hashed).
-    pub fn answer_batch(
+    ///
+    /// task-229: `asker` is the AUTHENTICATED remote peer, and `ledger` bounds its
+    /// AGGREGATE derivation across ALL the messages it sends (bytes hashed AND dump
+    /// count, over a rolling window) plus a GLOBAL ceiling across all peers. So the
+    /// per-MESSAGE [`MAX_BATCH_DERIVE_WORK`] count above is only the inner cap; the
+    /// cross-message per-peer/global bound is what actually stops a hostile peer that
+    /// picks the message boundaries. Each cold key is refused BEFORE dumping when its
+    /// NarSize would exceed the remaining budget (R1). An over-budget key answers
+    /// `Absent` exactly like the per-message deferral - same safe direction, no false
+    /// `Have`, no wire change.
+    pub fn answer_batch_for_peer(
         &self,
         query: &BatchHoldQuery,
+        asker: &NodeId,
+        ledger: &PeerDeriveLedger,
     ) -> Result<BatchHoldResponse, ClaimCodecError> {
-        let (response, notes) = self.answer_batch_reporting(query)?;
+        let (response, notes) = self.answer_batch_reporting(query, asker, ledger)?;
         // Emit the AGGREGATED operator notes (task-107 M3). At most one line per
         // fault CLASS for the WHOLE message, never one per key: a responder whose
         // store was GC'd out from under it - or a peer deliberately naming keys it
@@ -1615,7 +1843,7 @@ impl AvailabilityIndex {
         Ok(response)
     }
 
-    /// The core of [`Self::answer_batch`] that RETURNS the operator notes instead
+    /// The core of [`Self::answer_batch_for_peer`] that RETURNS the operator notes instead
     /// of printing them (task-107 M3). Separating the DECISION (which bounded set
     /// of lines a batch should log) from the EFFECT (the `eprintln!`s) is what makes
     /// the "at most one line per fault class, never one per key" property testable
@@ -1626,13 +1854,20 @@ impl AvailabilityIndex {
     fn answer_batch_reporting(
         &self,
         query: &BatchHoldQuery,
+        asker: &NodeId,
+        ledger: &PeerDeriveLedger,
     ) -> Result<(BatchHoldResponse, Vec<String>), ClaimCodecError> {
         debug_assert_eq!(query.schema_version, QUERY_SCHEMA_VERSION);
         check_batch_keys(&query.keys)?;
 
-        // One budget for the WHOLE batch: the bound is per-message, so every key in
-        // this message draws down the same allowance of fresh dumps.
-        let mut budget = DeriveBudget::limited(MAX_BATCH_DERIVE_WORK);
+        // One gate for the WHOLE batch: a per-MESSAGE fresh-dump count allowance
+        // (task-104) plus the peer-attributed cross-message byte/count ledger (task-229).
+        // Every key in this message draws down BOTH; the tighter one defers.
+        let mut gate = DeriveGate::for_peer(
+            BatchDeriveAllowance::limited(MAX_BATCH_DERIVE_WORK),
+            asker,
+            ledger,
+        );
         let mut answers = Vec::with_capacity(query.keys.len().min(MAX_BATCH_HOLD_KEYS));
         let mut any_have = false;
         let mut deferred: u32 = 0;
@@ -1642,7 +1877,7 @@ impl AvailabilityIndex {
         let mut faulted: u32 = 0;
         let mut first_fault: Option<String> = None;
         for key in &query.keys {
-            match self.hold_budgeted(key, &mut budget) {
+            match self.hold_budgeted(key, &mut gate) {
                 Ok(BudgetedHold::Have { blake3, .. }) => {
                     any_have = true;
                     // This node speaks exactly one transport, so every Have points
@@ -1691,14 +1926,16 @@ impl AvailabilityIndex {
         }
         if deferred > 0 {
             // LOUD, not silent (the task-104 point): the operator sees that this batch
-            // under-reported `deferred` COLD key(s) because it hit the per-batch
-            // derivation budget. Those keys were NOT dumped this time; a later probe
-            // that reaches them dumps and caches them, so a subsequent organic query
-            // finds them warm (the asker of THIS probe falls back upstream).
+            // under-reported `deferred` COLD key(s) because it hit a derivation bound -
+            // either the per-message count (MAX_BATCH_DERIVE_WORK) or the per-peer/global
+            // byte+count ledger (task-229). Those keys were NOT dumped this time; a later
+            // probe that reaches them dumps and caches them, so a subsequent organic
+            // query finds them warm (the asker of THIS probe falls back upstream).
             notes.push(format!(
-                "daemon: batch hold-query: {deferred} cold key(s) exceeded the per-batch \
-                 derivation budget (MAX_BATCH_DERIVE_WORK={MAX_BATCH_DERIVE_WORK}); answered \
-                 Absent without dumping - they warm the responder cache on a later probe"
+                "daemon: batch hold-query: {deferred} cold key(s) exceeded a derivation \
+                 bound (per-message MAX_BATCH_DERIVE_WORK={MAX_BATCH_DERIVE_WORK} or the \
+                 per-peer/global byte budget); answered Absent without dumping - they warm \
+                 the responder cache on a later, budget-bearing probe"
             ));
         }
 
@@ -1808,18 +2045,29 @@ impl AvailabilityIndex {
     /// fresh transition - rather than rewriting the whole snapshot on every probe.
     ///
     /// task-104: a COLD key (its digest slot is `None`, so answering it needs a fresh
-    /// dump) reserves one unit of `budget` ATOMICALLY under the digest lock right
-    /// before dumping. If the budget is spent, it returns [`DeriveStep::Deferred`]
+    /// dump) reserves one unit of the per-message COUNT allowance ATOMICALLY under the
+    /// digest lock right before dumping. If it is spent, [`DeriveStep::Deferred`]
     /// WITHOUT dumping - so the number of `nix-store --dump`s one batch triggers is
-    /// hard-capped at the budget, not at the batch's key count. A WARM key (Verified
-    /// or Quarantined) returns from the cache before the reservation, so it neither
-    /// dumps nor spends a unit. The single-key path passes an unlimited budget and so
-    /// never defers.
+    /// hard-capped at the allowance, not the batch's key count.
+    ///
+    /// task-229: for a PEER-ATTRIBUTED gate a cold key is ALSO admitted against the
+    /// per-peer/global byte+count [`PeerDeriveLedger`], seeded by the NarSize this path
+    /// WOULD dump to - queried WITHOUT dumping ([`NarDumper::nar_size`]) - so an
+    /// over-budget probe is REFUSED for a COST OF A STAT, never a multi-GB hash (R1:
+    /// refuse before dump). The ledger keys on the authenticated asker and carries a
+    /// global ceiling, so a cross-message per-peer flood and a many-identity Sybil flood
+    /// are both bounded (R2 + the Sybil floor). Order under the digest lock: NarSize
+    /// query, then count allowance, then ledger admission; any refusal defers WITHOUT
+    /// dumping. A WARM key (Verified or Quarantined) returns from the cache before ANY
+    /// of this, so it neither dumps, spends a count unit, nor draws byte budget - warm
+    /// answers are free, exactly as the serve gate only charges bytes actually served. A
+    /// LOCAL self-probe gate carries no ledger and an unlimited count, so it never
+    /// defers.
     fn derive(
         &self,
         key: &NarHashKey,
         entry: &Entry,
-        budget: &mut DeriveBudget,
+        gate: &mut DeriveGate,
     ) -> Result<DeriveStep, AvailabilityError> {
         let mut slot = entry.digest.lock().expect("digest mutex");
         match &*slot {
@@ -1831,13 +2079,30 @@ impl AvailabilityIndex {
             }
             None => {}
         }
-        // COLD: a fresh dump is required. Gate it on the batch's derivation budget
-        // HERE - under the digest lock, immediately before the dump - so the decision
-        // and the dump are atomic and the count of dumps a batch triggers cannot
-        // exceed its budget. A spent budget defers WITHOUT dumping (the safe
-        // direction: the caller answers Absent, the key warms on a later probe).
-        if !budget.try_reserve() {
+        // COLD: a fresh dump is required. Gate it HERE - under the digest lock,
+        // immediately before the dump - so the decision and the dump are atomic. A
+        // refusal on ANY axis defers WITHOUT dumping (the safe direction: the caller
+        // answers Absent, the key warms on a later, budget-bearing probe).
+        //
+        // The per-message COUNT allowance (task-104) is reserved FIRST, so it bounds not
+        // just the dumps but also the NarSize queries below: a 256-key cold batch does at
+        // most MAX_BATCH_DERIVE_WORK size-queries + dumps, never one per key. (If this
+        // reserve succeeds but the ledger below refuses, the unit is spent without a dump
+        // - a harmless under-count in the SAFE direction, fewer dumps this message.)
+        if !gate.batch.try_reserve() {
             return Ok(DeriveStep::Deferred);
+        }
+        // R1 (task-229): for a peer-attributed gate, learn the NarSize the path WOULD dump
+        // to WITHOUT dumping it, so the byte budget can REFUSE BEFORE the expensive dump.
+        // The ledger keys on the authenticated asker (per-peer aggregate across messages)
+        // and carries a global ceiling (the Sybil floor); on any refusal NOTHING is
+        // charged and NO dump happens. A LOCAL self-probe (`gate.peer == None`) skips this
+        // entirely - it is node-initiated, not peer-driven, and must always answer truly.
+        if let Some((asker, ledger)) = gate.peer {
+            let nar_size = self.dumper.nar_size(&entry.store_path, &NeverCancelled)?;
+            if !matches!(ledger.try_admit(asker, nar_size), DeriveAdmission::Admitted) {
+                return Ok(DeriveStep::Deferred);
+            }
         }
         let raw_nar = self.dumper.dump(&entry.store_path, &NeverCancelled)?;
         // Verify the caller's binding BEFORE trusting the dump. sha256 of the same
@@ -1966,6 +2231,10 @@ mod tests {
         NodeId::from_bytes([0x11; 32])
     }
 
+    fn asker() -> NodeId {
+        NodeId::from_bytes([0x22; 32])
+    }
+
     /// TASK-107 M3 bite: a batch that FAULTS on many keys must emit a BOUNDED number
     /// of log lines - one aggregate per fault class - not one line per key.
     ///
@@ -2015,8 +2284,11 @@ mod tests {
             schema_version: QUERY_SCHEMA_VERSION,
             keys,
         };
+        // An UNLIMITED ledger so ONLY the per-message count (MAX_BATCH_DERIVE_WORK) bites
+        // here - this bite is about task-107 log aggregation, not the task-229 ledger.
+        let ledger = PeerDeriveLedger::unlimited();
         let (response, notes) = index
-            .answer_batch_reporting(&query)
+            .answer_batch_reporting(&query, &asker(), &ledger)
             .expect("a batch of faulting keys still returns a well-formed response");
 
         // Behaviour preserved: a faulting/deferred key answers Absent, never a false

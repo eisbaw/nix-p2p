@@ -36,8 +36,8 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 use daemon_core::{
     AvailabilityIndex, BatchHoldAnswer, BatchHoldQuery, Blake3Digest, MAX_BATCH_DERIVE_WORK,
-    MemoryNarDumper, NarDumper, NarHashKey, NodeId, NullAnnounce, NullStore, QUERY_SCHEMA_VERSION,
-    StorePath,
+    MemoryNarDumper, NarDumper, NarHashKey, NodeId, NullAnnounce, NullStore, PeerDeriveLedger,
+    QUERY_SCHEMA_VERSION, StorePath,
 };
 
 // ------------------------------------------------------------------ helpers
@@ -171,11 +171,20 @@ fn one_batch_message_is_bounded_to_the_derivation_budget_and_self_heals() {
     sorted.dedup();
     assert_eq!(sorted.len(), n, "all registered keys must be distinct");
 
+    // An UNLIMITED per-peer ledger so ONLY the per-message count (MAX_BATCH_DERIVE_WORK)
+    // bites - this task-104 bite asserts the exact per-message dump count, which the
+    // task-229 byte ledger must not perturb.
+    let asker = NodeId::from_bytes([0x77; 32]);
     let probe = |i: &AvailabilityIndex| -> Vec<BatchHoldAnswer> {
-        i.answer_batch(&BatchHoldQuery {
-            schema_version: QUERY_SCHEMA_VERSION,
-            keys: all.clone(),
-        })
+        let ledger = PeerDeriveLedger::unlimited();
+        i.answer_batch_for_peer(
+            &BatchHoldQuery {
+                schema_version: QUERY_SCHEMA_VERSION,
+                keys: all.clone(),
+            },
+            &asker,
+            &ledger,
+        )
         .expect("answer_batch")
         .answers
     };

@@ -33,7 +33,7 @@
 //! In other words: plural holdings out require named keys in. A `fn all_keys(&self)
 //! -> Vec<NarHashKey>` fails; `fn resolve_many(&self, keys: &[NarHashKey]) ->
 //! Vec<Option<Claim>>` passes, because every element of its result is about a key
-//! the caller supplied; `fn answer_batch(&self, q: &BatchHoldQuery) ->
+//! the caller supplied; `fn answer_batch_for_peer(&self, q: &BatchHoldQuery, ..) ->
 //! BatchHoldResponse` passes, because a `BatchHoldQuery` IS a list of named keys.
 //!
 //! ## What this file got wrong the first time, and what fixed it
@@ -647,7 +647,12 @@ fn no_function_returns_plural_holdings_it_was_not_given() {
     // ...and it must SEE the functions that really do return plural holdings, by
     // name - including the WRAPPER-returning ones, which the first version of this
     // guard could not see at all.
-    for expected in ["load", "resolve_many", "answer_batch", "query_batch"] {
+    for expected in [
+        "load",
+        "resolve_many",
+        "answer_batch_for_peer",
+        "query_batch",
+    ] {
         assert!(
             plural_returns.iter().any(|name| name == expected),
             "the rule did not even notice `{expected}`, which does return plural \

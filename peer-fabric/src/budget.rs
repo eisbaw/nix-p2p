@@ -135,6 +135,62 @@ impl Default for ServeBudget {
     }
 }
 
+/// The numeric bound on what RESPONDER DERIVATION may cost - the hashing analog of
+/// [`ServeBudget`] (TASK-229). Where [`ServeBudget`] bounds bytes SERVED, this bounds
+/// bytes HASHED: answering a peer's hold-query for a COLD path costs one
+/// `nix-store --dump` + BLAKE3 of the whole uncompressed NAR, so an unbounded stream
+/// of hold-query probes is a responder-side derivation-DoS the serve budget does not
+/// touch. This is the RECEIVER-SIDE admission bound a responder applies BEFORE it
+/// dumps: a probe whose NarSize would exceed the remaining allowance is refused
+/// (answered `Absent`, the safe direction) with NO dump.
+///
+/// Every field is an INTEGER (owner no-floats rule). The two byte fields are NarSize
+/// units - UNCOMPRESSED NAR bytes, the exact hashing-work unit - NEVER the compressed
+/// FileSize a narinfo carries (the recurring unit trap). The allowance is a ROLLING
+/// [`window`](DeriveBudget::window): usage accrues within a window and resets when it
+/// rolls over, so `bytes/window` and `dumps/window` are integer rate bounds.
+///
+/// KEYED BY THE AUTHENTICATED REMOTE PEER. The per-peer fields bound ONE authenticated
+/// peer's aggregate derivation over the window; the fabric hands the responder the
+/// cryptographic connection identity (the libp2p `PeerId` / iroh [`NodeId`](crate::NodeId),
+/// the same 32-byte ed25519 key) so the bound is on a self-declared field.
+///
+/// THE GLOBAL CEILING IS THE SYBIL FLOOR. A per-peer bound alone is bypassable by
+/// minting many PeerIds, so [`max_bytes_global_uncompressed_nar`](DeriveBudget::max_bytes_global_uncompressed_nar)
+/// caps the aggregate across ALL peers within the window as the responder's own last
+/// line of defence. It is NOT a full Sybil defence (that is TASK-205's domain, e.g.
+/// per-source-subnet accounting); it is the backstop that keeps a many-identity flood
+/// bounded regardless.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DeriveBudget {
+    /// Per-authenticated-peer ceiling on NarSize BYTES hashed within one
+    /// [`window`](DeriveBudget::window). A cold probe whose NarSize would push this
+    /// peer's window total over the cap is refused BEFORE dumping.
+    pub max_bytes_per_peer_uncompressed_nar: u64,
+    /// Per-authenticated-peer ceiling on the COUNT of fresh dumps within one window.
+    /// Bounds many-small-NAR floods that stay under the byte cap.
+    pub max_dumps_per_peer: u32,
+    /// GLOBAL ceiling on NarSize BYTES hashed across ALL peers within one window - the
+    /// Sybil floor (per-peer alone is bypassable by minting PeerIds).
+    pub max_bytes_global_uncompressed_nar: u64,
+    /// The rolling accounting window. A typed carrier of an INTEGER millisecond value
+    /// (owner no-floats rule); never fractional.
+    pub window: Duration,
+}
+
+impl Default for DeriveBudget {
+    /// Provisional test-convenience defaults (NOT authoritative policy numbers;
+    /// TASK-120's `ResourceCaps` owns those). Conservative placeholders, integer.
+    fn default() -> Self {
+        DeriveBudget {
+            max_bytes_per_peer_uncompressed_nar: 1024 * 1024 * 1024, // 1 GiB / window / peer
+            max_dumps_per_peer: 64,
+            max_bytes_global_uncompressed_nar: 4 * 1024 * 1024 * 1024, // 4 GiB / window
+            window: Duration::from_secs(60),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -156,5 +212,24 @@ mod tests {
             1024 * 1024 * 1024
         );
         assert_eq!(serve.max_serve_duration, Duration::from_secs(120));
+    }
+
+    #[test]
+    fn derive_budget_defaults_are_integer_and_global_exceeds_per_peer() {
+        let d = DeriveBudget::default();
+        assert_eq!(d.max_bytes_per_peer_uncompressed_nar, 1024 * 1024 * 1024);
+        assert_eq!(d.max_dumps_per_peer, 64);
+        assert_eq!(d.max_bytes_global_uncompressed_nar, 4 * 1024 * 1024 * 1024);
+        assert_eq!(d.window, Duration::from_secs(60));
+        // The global ceiling is the Sybil floor: it must be >= a single peer's cap, or
+        // one honest peer would trip the global before its own per-peer bound (which
+        // would make the per-peer bound dead) - and it should leave room for a few
+        // busy peers before the backstop bites.
+        assert!(
+            d.max_bytes_global_uncompressed_nar >= d.max_bytes_per_peer_uncompressed_nar,
+            "global ceiling must be at least one peer's per-peer cap"
+        );
+        // Integer window (no fractional milliseconds).
+        assert_eq!(d.window.subsec_nanos() % 1_000_000, 0);
     }
 }

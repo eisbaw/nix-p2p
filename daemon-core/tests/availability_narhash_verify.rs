@@ -35,8 +35,8 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 use daemon_core::{
     AvailabilityError, AvailabilityIndex, BatchHoldAnswer, BatchHoldQuery, Blake3Digest,
-    HoldAnswer, MemoryNarDumper, NarHashKey, NodeId, NullAnnounce, NullStore, QUERY_SCHEMA_VERSION,
-    StorePath,
+    HoldAnswer, MemoryNarDumper, NarHashKey, NodeId, NullAnnounce, NullStore, PeerDeriveLedger,
+    QUERY_SCHEMA_VERSION, StorePath,
 };
 
 // ------------------------------------------------------------------ helpers
@@ -263,11 +263,16 @@ fn a_quarantined_key_answers_absent_in_a_batch() {
         .register(lied_key, tmp.store_file("lied.nar"))
         .expect("register");
 
+    let ledger = PeerDeriveLedger::unlimited();
     let response = index
-        .answer_batch(&BatchHoldQuery {
-            schema_version: QUERY_SCHEMA_VERSION,
-            keys: vec![lied_key],
-        })
+        .answer_batch_for_peer(
+            &BatchHoldQuery {
+                schema_version: QUERY_SCHEMA_VERSION,
+                keys: vec![lied_key],
+            },
+            &node(),
+            &ledger,
+        )
         .expect("a batch with a quarantined key still returns a well-formed response");
     assert!(
         matches!(response.answers.as_slice(), [BatchHoldAnswer::Absent {}]),

@@ -1545,6 +1545,13 @@ async fn main() -> ExitCode {
         metrics: Arc::new(RuntimeMetrics::new()),
         facts: status_facts,
         announce: post_fetch.clone(),
+        // TASK-229: no LIVE derive-budget figure yet - this binary runs no over-libp2p
+        // hold-query RESPONDER, so there is no `PeerDeriveLedger` charging on a wire path
+        // to report. The contract's derive_budget() CAP is still visible in --preflight
+        // via `effective_lines`. When the libp2p hold-responder lands (its own task), it
+        // constructs `PeerDeriveLedger::new(contract.caps.derive_budget())`, threads it
+        // into the answer path, and passes `Some(ledger)` here for the live used/CAP.
+        derive_ledger: None,
     });
     let admin_listener = match cfg.status_listen {
         Some(addr) => match TcpListener::bind(addr).await {

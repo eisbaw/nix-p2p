@@ -29,6 +29,7 @@ pub mod cacheinfo;
 pub mod catalog;
 pub mod claim;
 pub mod content_id;
+pub mod derive_ledger;
 pub mod discovery;
 pub mod narinfo_cache;
 mod nixbase32;
@@ -64,6 +65,7 @@ pub use claim::{
 pub use content_id::{
     BLAKE3_DIGEST_LEN, BLAKE3_DOMAIN_SEPARATION, BLAKE3_PREFIX, Blake3Digest, DigestParseError,
 };
+pub use derive_ledger::{DeriveAdmission, MonotonicClock, PeerDeriveLedger};
 pub use discovery::{
     DirectDiscovery, Discovery, FallbackNarSource, InMemoryDiscovery, InProcessPeerQuery,
     PROBE_TIMEOUT, PeerQuery, PeerQueryError,
@@ -81,6 +83,9 @@ pub use operator::{
     MechanismState, MetricLabel, OperatorContract, PeerPath, PrivacyPolicy, ResourceCaps,
     SharingProfile, StatusInputs,
 };
+// The peer-fabric DeriveBudget POLICY type (mirrors ServeBudget); re-exported so the
+// binaries construct a PeerDeriveLedger from their ResourceCaps (TASK-229).
+pub use peer_fabric::DeriveBudget;
 pub use peer_source::{PeerFabricNarSource, PeerFabricRawServe};
 pub use post_fetch::PostFetchAnnounce;
 pub use public_allowlist::{

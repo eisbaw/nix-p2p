@@ -93,7 +93,9 @@ use crate::claim::{
     decode_batch_hold_response, decode_hold_query, decode_hold_response, encode_batch_hold_query,
     encode_batch_hold_response, encode_hold_query, encode_hold_response,
 };
+use crate::derive_ledger::PeerDeriveLedger;
 use crate::source::{NarKey, NarSource, SourceError, UpstreamResponse};
+use crate::transport::NODE_ID_LEN;
 use crate::transport::NodeId;
 
 /// How long a single peer probe may take before it is declared a non-answer and
@@ -713,15 +715,56 @@ async fn run_query_batch_shim<P: PeerQuery + ?Sized>(
 /// task-37 codec and is answered by the task-50 index - the WIRE is real, only the
 /// topology (a `HashMap`, not a QUIC connection) is minimal. Wave-2b (task-47)
 /// swaps this for an over-iroh protocol behind the same [`PeerQuery`] seam.
-#[derive(Default)]
 pub struct InProcessPeerQuery {
     peers: HashMap<NodeId, Arc<AvailabilityIndex>>,
+    /// The shared RESPONDER derivation ledger (task-229): every hold-query answer this
+    /// rendezvous produces is admitted through it, keyed on the [`asker`](Self::asker),
+    /// so a peer's aggregate derivation across many messages (and the global ceiling
+    /// across all peers) is bounded. Defaults to
+    /// [`PeerDeriveLedger::unlimited`](crate::derive_ledger::PeerDeriveLedger::unlimited)
+    /// so the wave-2a tests (which probe cold keys and expect `Have`) are unaffected; a
+    /// bounded ledger is injected via [`with_derive_ledger`](Self::with_derive_ledger).
+    derive_ledger: Arc<PeerDeriveLedger>,
+    /// The AUTHENTICATED asker identity probes through this rendezvous are attributed to.
+    /// In-process this stands in for the libp2p `PeerId` a real responder's inbound
+    /// connection authenticates (the same 32-byte ed25519 identity); a real backend
+    /// supplies the connection identity, so keying here is faithful to the wire keying.
+    asker: NodeId,
+}
+
+/// The in-process stand-in asker identity when none is configured - a fixed synthetic
+/// [`NodeId`] documenting that a real responder keys on the authenticated connection
+/// `PeerId` instead.
+const IN_PROCESS_ASKER: NodeId = NodeId::from_bytes([0xA5; NODE_ID_LEN]);
+
+impl Default for InProcessPeerQuery {
+    fn default() -> Self {
+        InProcessPeerQuery {
+            peers: HashMap::new(),
+            derive_ledger: Arc::new(PeerDeriveLedger::unlimited()),
+            asker: IN_PROCESS_ASKER,
+        }
+    }
 }
 
 impl InProcessPeerQuery {
-    /// An empty rendezvous.
+    /// An empty rendezvous whose responder derivation is UNBOUNDED (the wave-2a default;
+    /// the task-229 bound is opt-in via [`with_derive_ledger`](Self::with_derive_ledger)).
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// An empty rendezvous whose responder answers are BOUNDED by `ledger`, attributing
+    /// every probe to the authenticated `asker` (task-229). This is the realistic
+    /// responder wiring: the fabric that authenticates the inbound peer hands the
+    /// responder its cryptographic identity + the shared ledger, exactly as
+    /// `ServeBudget` is threaded into `serve()`.
+    pub fn with_derive_ledger(asker: NodeId, ledger: Arc<PeerDeriveLedger>) -> Self {
+        InProcessPeerQuery {
+            peers: HashMap::new(),
+            derive_ledger: ledger,
+            asker,
+        }
     }
 
     /// Register a peer's availability index under its `NodeId`, so a probe of that
@@ -756,10 +799,16 @@ impl PeerQuery for InProcessPeerQuery {
         // the runtime.
         let decoded =
             decode_hold_query(&on_wire).map_err(|e| PeerQueryError::Codec(e.to_string()))?;
-        let response = tokio::task::spawn_blocking(move || index.answer(&decoded))
-            .await
-            .map_err(|e| PeerQueryError::Answer(format!("query task panicked: {e}")))?
-            .map_err(|e| PeerQueryError::Answer(e.to_string()))?;
+        // task-229: the RESPONDER bounds derivation per authenticated asker + a global
+        // ceiling. In-process the asker is `self.asker` (a real backend supplies the
+        // authenticated connection PeerId); the ledger is shared across all probes.
+        let asker = self.asker;
+        let ledger = Arc::clone(&self.derive_ledger);
+        let response =
+            tokio::task::spawn_blocking(move || index.answer_for_peer(&decoded, &asker, &ledger))
+                .await
+                .map_err(|e| PeerQueryError::Answer(format!("query task panicked: {e}")))?
+                .map_err(|e| PeerQueryError::Answer(e.to_string()))?;
 
         // Node B -> A: serialise the response and decode it on A's side, so the
         // whole probe crosses the frozen envelope in both directions.
@@ -800,10 +849,15 @@ impl PeerQuery for InProcessPeerQuery {
         let decoded =
             decode_batch_hold_query(&on_wire).map_err(|e| PeerQueryError::Codec(e.to_string()))?;
         let keys_asked = decoded.keys.len();
-        let response = tokio::task::spawn_blocking(move || index.answer_batch(&decoded))
-            .await
-            .map_err(|e| PeerQueryError::Answer(format!("batch query task panicked: {e}")))?
-            .map_err(|e| PeerQueryError::Codec(e.to_string()))?;
+        // task-229: bounded by the per-asker + global derivation ledger (see `query`).
+        let asker = self.asker;
+        let ledger = Arc::clone(&self.derive_ledger);
+        let response = tokio::task::spawn_blocking(move || {
+            index.answer_batch_for_peer(&decoded, &asker, &ledger)
+        })
+        .await
+        .map_err(|e| PeerQueryError::Answer(format!("batch query task panicked: {e}")))?
+        .map_err(|e| PeerQueryError::Codec(e.to_string()))?;
 
         // Node B -> A: back across the envelope, with the positional length
         // checked against what THIS node asked - never against what B claims.
@@ -2237,9 +2291,10 @@ mod tests {
             schema_version: QUERY_SCHEMA_VERSION,
             keys: all,
         };
+        let unlimited = PeerDeriveLedger::unlimited();
         assert!(
             matches!(
-                index.answer_batch(&over_cap),
+                index.answer_batch_for_peer(&over_cap, &node_b(), &unlimited),
                 Err(crate::claim::ClaimCodecError::BatchTooLarge { .. })
             ),
             "answer_batch must refuse an over-cap batch, not probe 257 keys"
@@ -2250,7 +2305,11 @@ mod tests {
             schema_version: QUERY_SCHEMA_VERSION,
             keys: over_cap.keys[..1].to_vec(),
         };
-        assert!(index.answer_batch(&legal).is_ok());
+        assert!(
+            index
+                .answer_batch_for_peer(&legal, &node_b(), &unlimited)
+                .is_ok()
+        );
     }
 
     #[tokio::test]

@@ -177,6 +177,7 @@ async fn start_daemon(
         metrics: Arc::new(RuntimeMetrics::new()),
         facts,
         announce: announce.clone(),
+        derive_ledger: None,
     });
 
     let fabric = Arc::new(FakeFabric::upstream_only(NodeId::from_bytes([0x09; 32])));

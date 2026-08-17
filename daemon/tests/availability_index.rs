@@ -23,7 +23,7 @@ use std::time::Duration;
 use daemon::{
     AnnounceSink, AvailabilityIndex, Blake3Digest, Claim, HoldAnswer, HoldQuery, JsonFileStore,
     KnownPayload, KnownTransport, MemoryNarDumper, NarDumper, NarHashKey, NodeId, NullAnnounce,
-    NullStore, QUERY_SCHEMA_VERSION, RegularFileNarDumper, StorePath,
+    NullStore, PeerDeriveLedger, QUERY_SCHEMA_VERSION, RegularFileNarDumper, StorePath,
 };
 
 // ------------------------------------------------------------------ helpers
@@ -259,11 +259,16 @@ fn a_held_key_yields_the_complete_offer_from_the_real_store() {
     ));
 
     // The versioned wire envelope mirrors the same yes/no answer.
+    let ledger = PeerDeriveLedger::unlimited();
     let response = index
-        .answer(&HoldQuery {
-            schema_version: QUERY_SCHEMA_VERSION,
-            key,
-        })
+        .answer_for_peer(
+            &HoldQuery {
+                schema_version: QUERY_SCHEMA_VERSION,
+                key,
+            },
+            &node(),
+            &ledger,
+        )
         .expect("answer");
     assert_eq!(response.schema_version, QUERY_SCHEMA_VERSION);
     assert!(matches!(response.answer, HoldAnswer::Have { .. }));
