@@ -165,6 +165,19 @@ pkgs.testers.runNixOSTest {
             "curl -sf http://localhost:8082/nix-cache-info", timeout=60
         )
 
+        # TASK-120 AC#1 (fail-safe default on the REAL systemd stack): a fresh install with the
+        # module defaults (libp2p.profile = "upstream-only", libp2p.enable = false) must derive the
+        # upstream-only operator MODE - serving, publication and P2P participation OFF. The daemon
+        # prints its derived profile at startup; assert it is upstream-only, and that NO libp2p
+        # give/consume flag reached its ExecStart (the mode is not merely logged but unwired).
+        client.succeed(
+            "journalctl -u nix-p2p-daemon --no-pager "
+            "| grep 'daemon: operator profile=upstream-only'"
+        )
+        client.fail(
+            "systemctl cat nix-p2p-daemon.service | grep -E -- '--libp2p-(provider|leech|announce-after-fetch)'"
+        )
+
         # ABSENT-BEFORE: neither the closure root nor its dependency is a valid
         # path yet, so the substitution below cannot pass vacuously.
         assert_invalid(client, "${libPath}", "S1 lib")

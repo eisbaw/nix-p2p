@@ -19,8 +19,9 @@ use daemon_core::{
     RegularFileNarDumper, StorePath,
 };
 use daemon_core::{
-    CacheInfo, CorrelationStore, NARINFO_CACHE_FLAG_CONFLICT, NarSource, NarinfoLayer,
-    NarinfoSource, PassThroughReason, PublicNarAllowlist, RawUpstream, RunConfig, SystemClock,
+    CacheInfo, ContractRequest, CorrelationStore, NARINFO_CACHE_FLAG_CONFLICT, NarSource,
+    NarinfoLayer, NarinfoSource, OperatorContract, PassThroughReason, PrivacyPolicy,
+    PublicNarAllowlist, RawUpstream, ResourceCaps, RunConfig, SharingProfile, SystemClock,
     UpstreamHttp, build_narinfo_layer, resolve_narinfo_cache_dir, run,
 };
 use daemon_libp2p::{
@@ -42,12 +43,10 @@ use peer_fabric::{
 };
 use tokio::net::TcpListener;
 
-/// PROVISIONAL serve bounds (uncompressed NAR bytes / wall clock). Backend-neutral
-/// `peer_fabric::ServeBudget` numbers; explicit `--libp2p-max-*` knobs are a follow-up once
-/// the operating numbers are pinned. A large-but-finite default, never "unlimited".
-const DEFAULT_MAX_SERVE_NAR_BYTES: u64 = 512 * 1024 * 1024;
-const DEFAULT_MAX_INFLIGHT_NAR_BYTES: u64 = 1024 * 1024 * 1024;
-const DEFAULT_MAX_SERVE_DURATION_MS: u64 = 300_000;
+// The serve/announce bounds are NO LONGER local constants: they are DERIVED from the ONE
+// authoritative `daemon_core::ResourceCaps` (TASK-120 AC#3/#9), so this binary cannot silently
+// disagree with the documented operator contract. `provider_serve_budget()` and
+// `DEFAULT_LIBP2P_ANNOUNCE_BUDGET` read `ResourceCaps::default()`; a parity test asserts it.
 
 struct Config {
     listen: SocketAddr,
@@ -117,6 +116,15 @@ struct Config {
     /// The INTEGER announce-after-fetch BUDGET (TASK-77 AC#2): max DISTINCT fetched paths this
     /// process announces. Past it, announcing STOPS. Never a float.
     libp2p_announce_budget: u64,
+    /// TASK-120 AC#7: `--preflight` renders the one-command operator preflight (the selected
+    /// [`SharingProfile`], the enabled/pending mechanism registry, external dependencies, and the
+    /// effective integer resource + privacy controls) to stdout and EXITS before any socket is
+    /// bound or any P2P traffic is emitted. A pure static read of the authoritative contract.
+    preflight: bool,
+    /// TASK-120 AC#5: `--diagnostics` opts into verbose diagnostics that MAY include otherwise
+    /// redacted identifiers (StorePath / NarHash / peer IP / full NodeId). DEFAULT OFF; when set
+    /// the node prints the mandatory [`daemon_core::DIAGNOSTICS_WARNING`] banner.
+    diagnostics: bool,
     /// LEECH / consume-only mode (TASK-78): an affirmative opt-out of contributing uplink. A leech
     /// still FETCHES from peers, but its fabric is wrapped in a [`peer_fabric::LeechFabric`] so the
     /// SERVE and ANNOUNCE axes are masked to `None` at the transport-agnostic capability seam - it
@@ -128,8 +136,41 @@ struct Config {
 }
 
 /// The default announce-after-fetch budget (distinct paths announced before growth stops). An
-/// integer; the operator raises it with `--libp2p-announce-budget`. Mirrors the composite binary.
-const DEFAULT_LIBP2P_ANNOUNCE_BUDGET: u64 = 256;
+/// integer; the operator raises it with `--libp2p-announce-budget`. Sourced from the ONE
+/// authoritative [`ResourceCaps`] so it cannot drift from the documented contract (TASK-120).
+fn default_libp2p_announce_budget() -> u64 {
+    ResourceCaps::default().announce_distinct_paths_budget
+}
+
+/// Map the parsed [`Config`] onto the ONE authoritative [`OperatorContract`] (TASK-120 AC#9):
+/// distil the give/consume flags into a transport-agnostic [`ContractRequest`], derive the
+/// [`SharingProfile`] FAIL-CLOSED (AC#2, the same invalid-combo policy both binaries and the NixOS
+/// module share), attach the authoritative caps + privacy stance, and validate. Belt-and-braces
+/// atop the flag-level checks in `parse_config` - it re-asserts the mode-level invariant from ONE
+/// place so a future flag-check gap cannot let a contradictory node through.
+fn derive_contract(cfg: &Config) -> Result<OperatorContract, String> {
+    let req = ContractRequest {
+        is_leech: cfg.libp2p_leech,
+        is_provider: cfg.libp2p_provider,
+        announces: cfg.libp2p_announce_after_fetch
+            || !cfg.libp2p_seed_nar.is_empty()
+            || !cfg.libp2p_provide_store.is_empty(),
+        has_public_allowlist: cfg.libp2p_public_allowlist_path.is_some(),
+        advertises_public_address: !cfg.libp2p_external_addresses.is_empty(),
+        has_bootstrap: !cfg.libp2p_bootstrap.is_empty(),
+    };
+    let profile = SharingProfile::derive(req).map_err(|e| e.to_string())?;
+    let contract = OperatorContract {
+        profile,
+        caps: ResourceCaps::default(),
+        privacy: PrivacyPolicy {
+            diagnostics_opt_in: cfg.diagnostics,
+        },
+        selected_mechanisms: Vec::new(),
+    };
+    contract.validate().map_err(|e| e.to_string())?;
+    Ok(contract)
+}
 
 fn parse_libp2p_peer(flag: &str, raw: &str) -> Result<(PeerId, Multiaddr), String> {
     let (peer_str, addr_str) = raw
@@ -221,8 +262,10 @@ fn parse_config<I: IntoIterator<Item = String>>(args: I) -> Result<Config, Strin
         libp2p_prove_public_narinfo: Vec::new(),
         libp2p_relay_server_enabled: true,
         libp2p_announce_after_fetch: false,
-        libp2p_announce_budget: DEFAULT_LIBP2P_ANNOUNCE_BUDGET,
+        libp2p_announce_budget: default_libp2p_announce_budget(),
         libp2p_leech: false,
+        preflight: false,
+        diagnostics: false,
     };
     let mut it = args.into_iter();
     while let Some(flag) = it.next() {
@@ -288,6 +331,8 @@ fn parse_config<I: IntoIterator<Item = String>>(args: I) -> Result<Config, Strin
                 .push(parse_prove_public_narinfo(&value()?)?),
             "--libp2p-announce-after-fetch" => cfg.libp2p_announce_after_fetch = true,
             "--libp2p-leech" => cfg.libp2p_leech = true,
+            "--preflight" => cfg.preflight = true,
+            "--diagnostics" => cfg.diagnostics = true,
             "--libp2p-announce-budget" => {
                 let raw = value()?;
                 cfg.libp2p_announce_budget = raw.parse::<u64>().map_err(|e| {
@@ -455,13 +500,11 @@ struct ProviderGuard {
     post_fetch_announce: Option<Arc<dyn daemon_core::PostFetchAnnounce>>,
 }
 
-/// The provider serve budget (PROVISIONAL defaults; shared by both supply modes).
+/// The provider serve budget, DERIVED from the ONE authoritative [`ResourceCaps`] (TASK-120
+/// AC#3/#9) so the shipped bounds cannot drift from the documented operator contract; shared by
+/// both supply modes.
 fn provider_serve_budget() -> ServeBudget {
-    ServeBudget {
-        max_nar_bytes_uncompressed_nar: DEFAULT_MAX_SERVE_NAR_BYTES,
-        max_inflight_bytes_uncompressed_nar: DEFAULT_MAX_INFLIGHT_NAR_BYTES,
-        max_serve_duration: Duration::from_millis(DEFAULT_MAX_SERVE_DURATION_MS),
-    }
+    ResourceCaps::default().serve_budget()
 }
 
 /// UNIX seconds now (0 on a pre-epoch clock, matching the seed path).
@@ -914,6 +957,37 @@ async fn main() -> ExitCode {
             return ExitCode::from(2);
         }
     };
+
+    // TASK-120: derive the ONE authoritative operator contract and validate it FAIL-CLOSED before
+    // touching the network. A contradictory mode (caught here even if a flag-level check ever
+    // regressed) blocks startup rather than running a node the operator did not ask for.
+    let contract = match derive_contract(&cfg) {
+        Ok(c) => c,
+        Err(err) => {
+            eprintln!("daemon-libp2p: operator contract rejected: {err}");
+            return ExitCode::from(2);
+        }
+    };
+
+    // TASK-120 AC#7: `--preflight` is a pure static one-shot - render the contract and EXIT before
+    // any socket is bound or any P2P traffic is emitted.
+    if cfg.preflight {
+        println!("{}", contract.preflight());
+        return ExitCode::SUCCESS;
+    }
+
+    // TASK-120 AC#4 (startup surface): always announce the derived operator MODE so the running
+    // node's participation is legible from its first log line; AC#5: print the mandatory privacy
+    // banner when opt-in diagnostics are enabled.
+    println!(
+        "daemon-libp2p: operator profile={} ({})",
+        contract.profile,
+        contract.profile.describe()
+    );
+    if contract.privacy.diagnostics_opt_in {
+        eprintln!("daemon-libp2p: {}", daemon_core::DIAGNOSTICS_WARNING);
+    }
+
     let source_cfg = match source_config(&cfg) {
         Ok(sc) => sc,
         Err(err) => {
@@ -1226,8 +1300,10 @@ mod bootstrap_guard_tests {
             libp2p_prove_public_narinfo: Vec::new(),
             libp2p_relay_server_enabled: true,
             libp2p_announce_after_fetch: false,
-            libp2p_announce_budget: crate::DEFAULT_LIBP2P_ANNOUNCE_BUDGET,
+            libp2p_announce_budget: crate::default_libp2p_announce_budget(),
             libp2p_leech: false,
+            preflight: false,
+            diagnostics: false,
         }
     }
 
@@ -1383,6 +1459,107 @@ mod public_allowlist_parity_tests {
             err.contains("--libp2p-trusted-public-key"),
             "the refusal must require at least one trusted key: {err}"
         );
+    }
+}
+
+#[cfg(test)]
+mod operator_contract_tests {
+    //! TASK-120: the binary maps its parsed CLI onto the ONE authoritative operator contract. These
+    //! drive the binary's OWN `parse_config` + `derive_contract`, so a wiring gap (a flag that fails
+    //! to move the derived MODE, or a serve budget that drifts from the authoritative caps) is caught
+    //! here.
+    use super::{
+        default_libp2p_announce_budget, derive_contract, parse_config, provider_serve_budget,
+    };
+    use daemon_core::{ResourceCaps, SharingProfile};
+
+    fn args(parts: &[&str]) -> Vec<String> {
+        parts.iter().map(|s| (*s).to_string()).collect()
+    }
+
+    const APP_NAR_HASH: &str = "sha256:0pgsb9mjmfj57w1ddmqn9z9667nwbqbnn699j1s1s99jhy6cppsm";
+    const FIXTURE_PUBKEY: &str = "nix-p2p-test-1:empdFBu9wVZG12rPKToHMOTsU1qzWzeCcLdq/KQH0JQ=";
+    const BOOT: &str =
+        "12D3KooWDpJ7As7BWAwRMfu1VU2WCqNjvq387JEYKDBj4kx6nXTN@/ip4/127.0.0.1/tcp/4001";
+
+    /// AC#9 parity: the shipped serve/announce bounds are the authoritative `ResourceCaps`, not a
+    /// second hardcoded set. If a local constant were reintroduced and drifted, this bites.
+    #[test]
+    fn shipped_budgets_equal_the_authoritative_caps() {
+        let caps = ResourceCaps::default();
+        assert_eq!(provider_serve_budget(), caps.serve_budget());
+        assert_eq!(
+            default_libp2p_announce_budget(),
+            caps.announce_distinct_paths_budget
+        );
+    }
+
+    /// AC#1 fail-safe default: a plain libp2p CONSUMER (a bootstrap, no give-side flag) derives
+    /// consume-only - it serves + announces NOTHING. The mode never silently becomes a give-side one.
+    #[test]
+    fn a_plain_consumer_is_consume_only() {
+        let cfg = parse_config(args(&["--libp2p-bootstrap", BOOT])).expect("consumer parses");
+        let contract = derive_contract(&cfg).expect("consumer contract derives");
+        assert_eq!(contract.profile, SharingProfile::ConsumeOnly);
+        assert!(!contract.profile.serves());
+        assert!(!contract.profile.announces());
+    }
+
+    /// AC#2: an explicit leech is consume-only.
+    #[test]
+    fn an_explicit_leech_is_consume_only() {
+        let cfg = parse_config(args(&["--libp2p-leech", "--libp2p-bootstrap", BOOT]))
+            .expect("leech parses");
+        assert_eq!(
+            derive_contract(&cfg).unwrap().profile,
+            SharingProfile::ConsumeOnly
+        );
+    }
+
+    /// AC#2: a provider WITHOUT a public allowlist is lan-share; WITH one it is public-share.
+    #[test]
+    fn provider_modes_map_to_lan_and_public_share() {
+        let lan = parse_config(args(&[
+            "--libp2p-provider",
+            "--libp2p-listen",
+            "/ip4/127.0.0.1/tcp/0",
+            "--libp2p-seed-nar",
+            &format!("{APP_NAR_HASH}=/tmp/app.nar"),
+        ]))
+        .expect("lan provider parses");
+        assert_eq!(
+            derive_contract(&lan).unwrap().profile,
+            SharingProfile::LanShare
+        );
+
+        let public = parse_config(args(&[
+            "--libp2p-provider",
+            "--libp2p-listen",
+            "/ip4/127.0.0.1/tcp/0",
+            "--libp2p-seed-nar",
+            &format!("{APP_NAR_HASH}=/tmp/app.nar"),
+            "--libp2p-public-allowlist-path",
+            "/tmp/nix-p2p-allowlist",
+            "--libp2p-trusted-public-key",
+            FIXTURE_PUBKEY,
+        ]))
+        .expect("public provider parses");
+        let contract = derive_contract(&public).unwrap();
+        assert_eq!(contract.profile, SharingProfile::PublicShare);
+        assert!(contract.profile.serves());
+        assert!(contract.profile.public_participation());
+    }
+
+    /// AC#7: `--preflight` parses and the derived contract renders a preflight naming the pending
+    /// mechanisms + the effective integer controls.
+    #[test]
+    fn preflight_flag_parses_and_renders() {
+        let cfg = parse_config(args(&["--preflight", "--libp2p-bootstrap", BOOT]))
+            .expect("preflight parses");
+        assert!(cfg.preflight);
+        let p = derive_contract(&cfg).unwrap().preflight();
+        assert!(p.contains("iroh-transport = PENDING"));
+        assert!(p.contains("max_nar_bytes_uncompressed=536870912"));
     }
 }
 

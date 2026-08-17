@@ -22,6 +22,21 @@ let
   # libp2p sub-options (TASK-207). Read here so the ExecStart assembly below stays
   # terse; every field is inert unless `cfg.libp2p.enable`.
   lcfg = cfg.libp2p;
+
+  # TASK-120: the operator PROFILE is the authoritative, validated participation MODE. It maps
+  # DOWN onto the shipped libp2p flags (the daemon binary owns the identical fail-fast checks, so
+  # this stays a thin mapping surface, not a second policy). The four modes mirror
+  # `daemon_core::SharingProfile`:
+  #   * upstream-only  -> NO p2p give/consume flags (the fail-safe default; a fresh install)
+  #   * consume-only   -> --libp2p-leech (fetch from peers, serve/announce NOTHING)
+  #   * lan-share      -> --libp2p-provider over an isolated substrate (no public allowlist)
+  #   * public-share   -> --libp2p-provider + --libp2p-announce-after-fetch + the public-NAR
+  #                       allowlist door (per-NAR announce gate)
+  # The profile is used only when libp2p is enabled; upstream-only needs no libp2p at all.
+  profile = lcfg.profile;
+  isProvider = lcfg.provider || profile == "lan-share" || profile == "public-share";
+  isLeech = lcfg.leech || profile == "consume-only";
+  wantsAnnounceAfterFetch = lcfg.announceAfterFetch || profile == "public-share";
   # Local daemon URL, pinned ahead of everything with an explicit priority so
   # ordering does not depend on the advertised nix-cache-info Priority.
   daemonSubstituter = "http://127.0.0.1:${toString cfg.port}?priority=10";
@@ -106,10 +121,48 @@ in
     libp2p = {
       enable = lib.mkEnableOption "the libp2p P2P node (decentralized directory + NAR transfer + NAT traversal)";
 
+      profile = lib.mkOption {
+        type = lib.types.enum [ "upstream-only" "consume-only" "lan-share" "public-share" ];
+        default = "upstream-only";
+        description = ''
+          The authoritative, validated operator PARTICIPATION MODE (TASK-120,
+          `daemon_core::SharingProfile`). Maps onto the shipped libp2p flags:
+
+          - `upstream-only` (DEFAULT, fail-safe): HTTP upstream fallback only. No P2P
+            serving, publication, public-DHT participation or third-party discovery -
+            merely enabling the service emits no P2P give/consume traffic.
+          - `consume-only`: fetch from peers but serve NOTHING and announce NOTHING
+            (appends `--libp2p-leech`). A consumer still discloses what it looks up.
+          - `lan-share`: serve + announce over an isolated/LAN substrate (sets
+            `--libp2p-provider`, no public allowlist).
+          - `public-share`: serve + announce over a public substrate, gated per NAR by
+            the public-NAR allowlist (sets `--libp2p-provider`,
+            `--libp2p-announce-after-fetch`, and REQUIRES `publicAllowlistPath` +
+            `libp2pTrustedPublicKeys`). Invalid/privacy-contradictory combinations FAIL
+            at evaluation (see the assertions below) rather than silently downgrading.
+
+          The lower-level `provider`/`leech`/`announceAfterFetch` booleans still exist for
+          fine control; the profile is the recommended surface and its guarantees are the
+          ones the assertions enforce.
+        '';
+      };
+
       provider = lib.mkOption {
         type = lib.types.bool;
         default = false;
-        description = "Run as a PROVIDER (`--libp2p-provider`): serve + announce the configured seeds/store paths.";
+        description = "Run as a PROVIDER (`--libp2p-provider`): serve + announce the configured seeds/store paths. Usually set via `profile` instead.";
+      };
+
+      leech = lib.mkOption {
+        type = lib.types.bool;
+        default = false;
+        description = "Consume-only LEECH (`--libp2p-leech`): fetch from peers, serve + announce NOTHING. Usually set via `profile = \"consume-only\"`.";
+      };
+
+      announceAfterFetch = lib.mkOption {
+        type = lib.types.bool;
+        default = false;
+        description = "Announce-after-fetch (`--libp2p-announce-after-fetch`): become a discoverable holder of what you fetch, within an integer budget. Requires `provider`. Usually set via `profile = \"public-share\"`.";
       };
 
       relayServer = lib.mkOption {
@@ -222,6 +275,38 @@ in
   };
 
   config = lib.mkIf cfg.enable {
+    # TASK-120 AC#2: invalid or privacy-contradictory profile combinations FAIL at EVALUATION,
+    # precisely - never a silent downgrade into a weaker-than-asked mode. These mirror the daemon
+    # binary's fail-fast checks (`daemon_core::SharingProfile::derive`), catching the misconfig at
+    # `nixos-rebuild` time instead of a systemd restart-loop.
+    assertions = [
+      {
+        # A consume-only leech gives nothing back: it cannot also be a provider / announce / allowlist.
+        assertion = !(isLeech && (isProvider || wantsAnnounceAfterFetch || lcfg.publicAllowlistPath != null));
+        message = "services.nix-p2p.libp2p: consume-only/leech serves NOTHING and announces NOTHING; it cannot be combined with a provider profile, announceAfterFetch, or a public allowlist. Choose one participation mode.";
+      }
+      {
+        # public-share REQUIRES the per-NAR allowlist door - otherwise it is not the gated public mode.
+        assertion = profile != "public-share" || lcfg.publicAllowlistPath != null;
+        message = "services.nix-p2p.libp2p.profile = \"public-share\" requires libp2p.publicAllowlistPath (the per-NAR announce gate). Set it, or use \"lan-share\" for an isolated substrate.";
+      }
+      {
+        # A public allowlist with no trusted key can prove NOTHING public - every announce would refuse.
+        assertion = lcfg.publicAllowlistPath == null || lcfg.libp2pTrustedPublicKeys != [ ];
+        message = "services.nix-p2p.libp2p.publicAllowlistPath requires at least one entry in libp2p.libp2pTrustedPublicKeys; without a trusted narinfo-signing key nothing can be proven public and every announce would be refused.";
+      }
+      {
+        # announce-after-fetch needs the serve axis (a provider) to advertise what it fetched.
+        assertion = !wantsAnnounceAfterFetch || isProvider;
+        message = "services.nix-p2p.libp2p.announceAfterFetch requires a provider profile (lan-share/public-share) or libp2p.provider = true.";
+      }
+      {
+        # A give/consume profile is inert unless the libp2p node is enabled - refuse the silent no-op.
+        assertion = profile == "upstream-only" || lcfg.enable;
+        message = "services.nix-p2p.libp2p.profile = \"${profile}\" requires libp2p.enable = true (and a package that speaks the libp2p flags). upstream-only is the only profile that needs no libp2p node.";
+      }
+    ];
+
     systemd.services.nix-p2p-daemon = {
       description = "nix-p2p decentralized binary cache daemon";
       wantedBy = [ "multi-user.target" ];
@@ -254,7 +339,11 @@ in
           # wave-1 HTTP-only service is byte-identical when libp2p is off. Each list
           # option expands to its repeatable flag; the scalars append when set.
           ++ lib.optionals lcfg.enable (
-            lib.optionals lcfg.provider [ "--libp2p-provider" ]
+            # TASK-120: the profile-derived give/consume flags. `isProvider`/`isLeech`/
+            # `wantsAnnounceAfterFetch` fold the profile together with the low-level booleans.
+            lib.optionals isProvider [ "--libp2p-provider" ]
+            ++ lib.optionals isLeech [ "--libp2p-leech" ]
+            ++ lib.optionals wantsAnnounceAfterFetch [ "--libp2p-announce-after-fetch" ]
             ++ lib.optionals (!lcfg.relayServer) [ "--libp2p-no-relay-server" ]
             ++ lib.concatMap (a: [ "--libp2p-listen" a ]) lcfg.listen
             ++ lib.concatMap (a: [ "--libp2p-external-address" a ]) lcfg.externalAddresses

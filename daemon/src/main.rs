@@ -20,17 +20,18 @@ use daemon::claim::CLAIM_SCHEMA_VERSION;
 use daemon::{
     AddressLookupCapability, AllowlistEligibility, AllowlistRawServe, AnyRawServe, App,
     AvailabilityIndex, Blake3Digest, CONNECT_TIMEOUT_MS, CacheInfo, Claim, CommandNarDumper,
-    CorrelationStore, DEFAULT_MAX_INFLIGHT_NAR_BYTES, DEFAULT_MAX_SERVE_DURATION,
+    ContractRequest, CorrelationStore, DEFAULT_MAX_INFLIGHT_NAR_BYTES, DEFAULT_MAX_SERVE_DURATION,
     DEFAULT_MAX_SERVE_NAR_BYTES, EndpointProfile, EndpointScope, FallbackNarSource,
     FileNarSupplier, HEADER_TIMEOUT_MS, IdentitySource, InMemoryDiscovery, IrohNode,
     IrohNodeBuilder, IrohPeerAddr, IrohProviderConfig, IrohTransport, KnownPayload, KnownTransport,
     LanReachability, LanShare, Libp2pCatalogProbe, Libp2pSourceConfig, NARINFO_CACHE_FLAG_CONFLICT,
     NarCatalog, NarDumper, NarHashKey, NarSource, NarinfoLayer, NarinfoSource, NoRawServe, NodeId,
     NodeLocation, NodeLookupAuthorityAuthorization, NodeLookupConfig, NodePublicationCapability,
-    NodePublicationConfig, NodePublicationHandle, NullAnnounce, NullStore, PassThroughReason,
-    PublicNarAllowlist, PublicationAuthorityAuthorization, RawServeDecision, RelayCapability,
-    ServeBudget, StorePath, SystemClock, TaskSupervisor, TransportNarSource, TransportRegistry,
-    UpstreamHttp, announce_provider_seeds, announce_public_provisions, announce_public_seeds,
+    NodePublicationConfig, NodePublicationHandle, NullAnnounce, NullStore, OperatorContract,
+    PassThroughReason, PrivacyPolicy, PublicNarAllowlist, PublicationAuthorityAuthorization,
+    RawServeDecision, RelayCapability, ResourceCaps, ServeBudget, SharingProfile, StorePath,
+    SystemClock, TaskSupervisor, TransportNarSource, TransportRegistry, UpstreamHttp,
+    announce_provider_seeds, announce_public_provisions, announce_public_seeds,
     announce_store_provisions, build_libp2p_nar_source, build_libp2p_provider_source,
     build_narinfo_layer, lan_isolation_or_refuse, resolve_durable_identity_seed,
     resolve_narinfo_cache_dir, serve, verify_store_provisions,
@@ -470,12 +471,56 @@ struct Config {
     /// peer-routing), so it hides what it serves and announces, NOT what it looks up. Mirrors the
     /// thin `daemon-libp2p` binary so the two cannot drift.
     libp2p_leech: bool,
+    /// TASK-120 AC#7: `--preflight` renders the one-command operator preflight (selected profile,
+    /// enabled/pending mechanism registry, dependencies, effective integer resource + privacy
+    /// controls) and EXITS before any socket bind or P2P traffic. A pure static contract read.
+    preflight: bool,
+    /// TASK-120 AC#5: `--diagnostics` opts into verbose diagnostics that MAY include otherwise
+    /// redacted identifiers. DEFAULT OFF; when set the node prints the mandatory privacy banner.
+    diagnostics: bool,
 }
 
 /// The default announce-after-fetch budget: distinct paths a process announces before growth
 /// stops. Conservative (a swarm-growth cap, not a throughput target); an operator raises it with
-/// `--libp2p-announce-budget`. An integer, not a wire constant.
-const DEFAULT_LIBP2P_ANNOUNCE_BUDGET: u64 = 256;
+/// `--libp2p-announce-budget`. Sourced from the ONE authoritative [`ResourceCaps`] (TASK-120
+/// AC#9) so it cannot drift from the documented operator contract or the thin `daemon-libp2p`.
+fn default_libp2p_announce_budget() -> u64 {
+    ResourceCaps::default().announce_distinct_paths_budget
+}
+
+/// Map the composite daemon's parsed [`Config`] onto the ONE authoritative [`OperatorContract`]
+/// (TASK-120 AC#9), on the libp2p-PRIMARY path. Give-side intent counts a libp2p provider OR the
+/// legacy iroh provider (so a serving node is never mislabeled upstream-only), while the
+/// public-vs-LAN distinction follows the libp2p public-NAR allowlist door. The iroh transport is
+/// the deferred REFERENCE transport (AC#8: modeled non-selectable-pending in the registry the
+/// preflight prints); its own publication gating is separate. Derives the profile FAIL-CLOSED and
+/// validates - belt-and-braces atop the flag-level checks.
+fn derive_contract(config: &Config) -> Result<OperatorContract, String> {
+    let req = ContractRequest {
+        is_leech: config.libp2p_leech,
+        is_provider: config.libp2p_provider || config.iroh_provider,
+        announces: config.libp2p_announce_after_fetch
+            || !config.libp2p_seed_nar.is_empty()
+            || !config.libp2p_provide_store.is_empty()
+            || config.iroh_provider,
+        has_public_allowlist: config.libp2p_public_allowlist_path.is_some(),
+        // The composite daemon has no `--libp2p-external-address`; public reachability is governed
+        // by the allowlist door alone here.
+        advertises_public_address: false,
+        has_bootstrap: !config.libp2p_bootstrap.is_empty(),
+    };
+    let profile = SharingProfile::derive(req).map_err(|e| e.to_string())?;
+    let contract = OperatorContract {
+        profile,
+        caps: ResourceCaps::default(),
+        privacy: PrivacyPolicy {
+            diagnostics_opt_in: config.diagnostics,
+        },
+        selected_mechanisms: Vec::new(),
+    };
+    contract.validate().map_err(|e| e.to_string())?;
+    Ok(contract)
+}
 
 impl Default for Config {
     fn default() -> Self {
@@ -537,8 +582,10 @@ impl Default for Config {
             libp2p_public_allowlist_path: None,
             libp2p_prove_public_narinfo: Vec::new(),
             libp2p_announce_after_fetch: false,
-            libp2p_announce_budget: DEFAULT_LIBP2P_ANNOUNCE_BUDGET,
+            libp2p_announce_budget: default_libp2p_announce_budget(),
             libp2p_leech: false,
+            preflight: false,
+            diagnostics: false,
         }
     }
 }
@@ -828,6 +875,8 @@ impl Config {
                     .push(parse_prove_public_narinfo(&value()?)?),
                 "--libp2p-announce-after-fetch" => config.libp2p_announce_after_fetch = true,
                 "--libp2p-leech" => config.libp2p_leech = true,
+                "--preflight" => config.preflight = true,
+                "--diagnostics" => config.diagnostics = true,
                 "--libp2p-announce-budget" => {
                     let raw = value()?;
                     config.libp2p_announce_budget = raw.parse::<u64>().map_err(|e| {
@@ -2354,6 +2403,22 @@ async fn main() -> ExitCode {
             return ExitCode::from(2);
         }
     };
+
+    // TASK-120: derive + validate the ONE authoritative operator contract (libp2p-primary path)
+    // before touching the network; a contradictory mode blocks startup fail-closed.
+    let contract = match derive_contract(&config) {
+        Ok(c) => c,
+        Err(err) => {
+            eprintln!("daemon: operator contract rejected: {err}");
+            return ExitCode::from(2);
+        }
+    };
+    // TASK-120 AC#7: `--preflight` is a pure static one-shot - render and EXIT before any bind.
+    if config.preflight {
+        println!("{}", contract.preflight());
+        return ExitCode::SUCCESS;
+    }
+
     let shutdown_signals = match install_shutdown_signals() {
         Ok(signals) => signals,
         Err(error) => {
@@ -2363,6 +2428,16 @@ async fn main() -> ExitCode {
     };
 
     println!("{}", banner());
+    // TASK-120 AC#4 (startup surface) + AC#5: announce the derived operator MODE and the privacy
+    // banner when diagnostics are opted in, so the running node's participation is legible.
+    println!(
+        "daemon: operator profile={} ({})",
+        contract.profile,
+        contract.profile.describe()
+    );
+    if contract.privacy.diagnostics_opt_in {
+        eprintln!("daemon: {}", daemon::DIAGNOSTICS_WARNING);
+    }
 
     // The correlation catalog lives in the server only: it populates it as
     // narinfos pass through and reads it at NAR-request time. UpstreamHttp needs
