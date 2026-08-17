@@ -670,11 +670,17 @@ impl SwarmHandle {
     /// [`ConnPath::Direct`] or `budget` elapses. A same-LAN provider connects within a few RTT; a
     /// cross-NAT provider is never reached directly, so the probe spends the full (short, bounded)
     /// `budget` then returns `false` — a too-short budget therefore only costs the privacy win
-    /// (fall back to composing the circuit), NEVER correctness. It dials ONLY the given direct
-    /// targets (never a relay/circuit), so a `true` verdict is a genuine direct L3 path: a relayed
-    /// connection reads as [`ConnPath::Relay`] and never trips a false positive. A dial that fails
-    /// to INITIATE is ignored (its async failure surfaces as a swarm event, leaving
+    /// (fall back to composing the circuit), NEVER correctness. A `true` verdict is a genuine
+    /// DIRECT L3 path: a `true` requires [`ConnPath::Direct`], and a relayed dial reads as
+    /// [`ConnPath::Relay`], so dialing a target that happens to be circuit-shaped can never trip a
+    /// false positive (the caller passes direct targets, but the verdict is robust regardless). A
+    /// dial that fails to INITIATE is ignored (its async failure surfaces as a swarm event, leaving
     /// `connection_path` at its current non-Direct value — exactly the cross-NAT outcome).
+    ///
+    /// The `budget` bounds the WHOLE call: the deadline is taken BEFORE issuing the dials, so the
+    /// command-channel round-trips and any number of `targets` fall INSIDE the bound (the poll loop
+    /// exits at the deadline even if dialing already consumed it). The one thing outside `budget` is
+    /// the single pre-dial fast-path `connection_path` round-trip.
     pub async fn probe_direct_reachable(
         &self,
         peer: PeerId,
@@ -684,10 +690,11 @@ impl SwarmHandle {
         if self.connection_path(peer).await == ConnPath::Direct {
             return true;
         }
+        // Strict bound (F4): start the clock BEFORE the dials so their setup is inside `budget`.
+        let deadline = Instant::now() + budget;
         for addr in targets {
             let _ = self.dial(addr.clone()).await;
         }
-        let deadline = Instant::now() + budget;
         loop {
             if self.connection_path(peer).await == ConnPath::Direct {
                 return true;

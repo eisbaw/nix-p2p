@@ -9,10 +9,15 @@
 //!   * a provider at an UNREACHABLE address -> the probe returns `false`, BOUNDED by the budget
 //!     (it never hangs). This is the cross-NAT outcome that keeps the circuit composed.
 //!
-//! Address CLASSIFICATION (which providers even reach the probe) is unit-tested in
-//! `src/locator.rs`; the DISCLOSURE invariant (reachable => no Relay record) is unit-tested
-//! there too; and the full cross-NAT end-to-end (probe fails behind a real NAT -> circuit
-//! carries the bytes) is `nixos/nat-vm-test.nix`.
+//! F5 SCOPE NOTE: the positive test below uses a LOOPBACK provider to exercise the probe
+//! MECHANISM (dial + connection_path -> Direct). In PRODUCTION a loopback address is classified
+//! directly reachable BEFORE the probe, so the probe branch is reached only for a PRIVATE address
+//! — and a reachable private address cannot be bound hermetically on a test host. The probe-TRUE
+//! MECHANISM proven here is address-agnostic (it takes targets directly), and the reachable ->
+//! suppress -> no-disclosure CHAIN through the real locator is covered by
+//! `locator::circuit_provenance_tests` (the by-address suppress bite + the F1 coupled compose
+//! bite). Address CLASSIFICATION is unit-tested in `src/locator.rs`; the cross-NAT end-to-end
+//! (probe fails behind a real NAT -> circuit carries the bytes) is `nixos/nat-vm-test.nix`.
 
 use std::time::{Duration, Instant};
 
