@@ -24,17 +24,18 @@ use daemon::{
     DEFAULT_MAX_SERVE_NAR_BYTES, EndpointProfile, EndpointScope, FallbackNarSource,
     FileNarSupplier, HEADER_TIMEOUT_MS, IdentitySource, InMemoryDiscovery, IrohNode,
     IrohNodeBuilder, IrohPeerAddr, IrohProviderConfig, IrohTransport, KnownPayload, KnownTransport,
-    LanReachability, LanShare, Libp2pCatalogProbe, Libp2pSourceConfig, NARINFO_CACHE_FLAG_CONFLICT,
-    NarCatalog, NarDumper, NarHashKey, NarSource, NarinfoLayer, NarinfoSource, NoRawServe, NodeId,
-    NodeLocation, NodeLookupAuthorityAuthorization, NodeLookupConfig, NodePublicationCapability,
-    NodePublicationConfig, NodePublicationHandle, NullAnnounce, NullStore, OperatorContract,
-    PassThroughReason, PrivacyPolicy, PublicNarAllowlist, PublicationAuthorityAuthorization,
-    RawServeDecision, RelayCapability, ResourceCaps, ServeBudget, SharingProfile, StorePath,
-    SystemClock, TaskSupervisor, TransportNarSource, TransportRegistry, UpstreamHttp,
-    announce_provider_seeds, announce_public_provisions, announce_public_seeds,
-    announce_store_provisions, build_libp2p_nar_source, build_libp2p_provider_source,
-    build_narinfo_layer, lan_isolation_or_refuse, resolve_durable_identity_seed,
-    resolve_narinfo_cache_dir, serve, verify_store_provisions,
+    LanReachability, LanShare, Libp2pCatalogProbe, Libp2pSourceConfig, Mechanism,
+    NARINFO_CACHE_FLAG_CONFLICT, NarCatalog, NarDumper, NarHashKey, NarSource, NarinfoLayer,
+    NarinfoSource, NoRawServe, NodeId, NodeLocation, NodeLookupAuthorityAuthorization,
+    NodeLookupConfig, NodePublicationCapability, NodePublicationConfig, NodePublicationHandle,
+    NullAnnounce, NullStore, OperatorContract, PassThroughReason, PrivacyPolicy,
+    PublicNarAllowlist, PublicationAuthorityAuthorization, RawServeDecision, RelayCapability,
+    ResourceCaps, ServeBudget, SharingProfile, StorePath, SystemClock, TaskSupervisor,
+    TransportNarSource, TransportRegistry, UpstreamHttp, announce_provider_seeds,
+    announce_public_provisions, announce_public_seeds, announce_store_provisions,
+    build_libp2p_nar_source, build_libp2p_provider_source, build_narinfo_layer,
+    lan_isolation_or_refuse, resolve_durable_identity_seed, resolve_narinfo_cache_dir, serve,
+    verify_store_provisions,
 };
 use fabric_libp2p::{CatalogNarSupplier, Libp2pFabric, MemoryNarSupplier, Multiaddr, PeerId};
 use peer_fabric::{
@@ -478,6 +479,9 @@ struct Config {
     /// TASK-120 AC#5: `--diagnostics` opts into verbose diagnostics that MAY include otherwise
     /// redacted identifiers. DEFAULT OFF; when set the node prints the mandatory privacy banner.
     diagnostics: bool,
+    /// TASK-120 (compat shim): the operator's EXPLICIT `--profile <token>` declaration, if given.
+    /// The give/consume flags must DERIVE the same profile, else `derive_contract` fails closed.
+    explicit_profile: Option<String>,
 }
 
 /// The default announce-after-fetch budget: distinct paths a process announces before growth
@@ -488,28 +492,75 @@ fn default_libp2p_announce_budget() -> u64 {
     ResourceCaps::default().announce_distinct_paths_budget
 }
 
+/// Is the composite daemon's legacy iroh GIVE-SIDE active (serving or publishing over iroh)?
+/// The iroh transport is DEFERRED (prune-pending TASK-202); when it is active it is reported as an
+/// ACTIVE deferred-reference mechanism, and its reachability is safety-gated (#3a).
+fn iroh_give_side_active(config: &Config) -> bool {
+    config.iroh_provider || config.iroh_publish_node
+}
+
 /// Map the composite daemon's parsed [`Config`] onto the ONE authoritative [`OperatorContract`]
-/// (TASK-120 AC#9), on the libp2p-PRIMARY path. Give-side intent counts a libp2p provider OR the
-/// legacy iroh provider (so a serving node is never mislabeled upstream-only), while the
-/// public-vs-LAN distinction follows the libp2p public-NAR allowlist door. The iroh transport is
-/// the deferred REFERENCE transport (AC#8: modeled non-selectable-pending in the registry the
-/// preflight prints); its own publication gating is separate. Derives the profile FAIL-CLOSED and
-/// validates - belt-and-braces atop the flag-level checks.
+/// (TASK-120), on the libp2p-PRIMARY path with the legacy iroh transport modeled HONESTLY as a
+/// deferred reference (the composite's FULL iroh contract is deferred to TASK-202).
+///
+/// * Give-side intent counts a libp2p provider OR the legacy iroh provider/publish, so a SERVING
+///   node is never mislabeled upstream-only (#3b: `announces` reflects `iroh_publish_node`).
+/// * #3a SAFETY: a GLOBAL-scope iroh endpoint is public-reachable (it binds/relays to the open
+///   internet), so it is permitted ONLY under public-share (+ the allowlist door); a global iroh
+///   give-side on any other profile is REFUSED rather than mislabeled lan-share. Offline-test / LAN
+///   iroh scopes are genuinely isolated and map to lan-share honestly.
+/// * #4: when the iroh give-side (or iroh node-lookup / pkarr) is active it is recorded in
+///   `active_reference_mechanisms` so the preflight/status REPORT MATCHES THE WIRE.
 fn derive_contract(config: &Config) -> Result<OperatorContract, String> {
     let req = ContractRequest {
         is_leech: config.libp2p_leech,
-        is_provider: config.libp2p_provider || config.iroh_provider,
+        // Give-side participants: a libp2p provider, an iroh content provider, OR an iroh node that
+        // publishes its own address to be dialed (a give-side participation - publishing your
+        // reachability so peers can fetch from you). Counting node-publish here keeps `is_provider`
+        // consistent with `announces` below, so #3b never trips AnnounceWithoutProvider.
+        is_provider: config.libp2p_provider || config.iroh_provider || config.iroh_publish_node,
         announces: config.libp2p_announce_after_fetch
             || !config.libp2p_seed_nar.is_empty()
             || !config.libp2p_provide_store.is_empty()
-            || config.iroh_provider,
+            || config.iroh_provider
+            || config.iroh_publish_node,
         has_public_allowlist: config.libp2p_public_allowlist_path.is_some(),
-        // The composite daemon has no `--libp2p-external-address`; public reachability is governed
-        // by the allowlist door alone here.
+        // The composite daemon has no `--libp2p-external-address`; libp2p public reachability is
+        // governed by the allowlist door. Iroh public reachability is handled by the #3a scope
+        // gate below (a global iroh endpoint is the iroh analogue of a public self-address).
         advertises_public_address: false,
         has_bootstrap: !config.libp2p_bootstrap.is_empty(),
     };
     let profile = SharingProfile::derive(req).map_err(|e| e.to_string())?;
+
+    // #3a: a GLOBAL iroh endpoint scope is public-reachable. A serving node on it must be
+    // public-share (allowlist-gated) - otherwise it would announce local content over a public
+    // endpoint mislabeled as lan-share. Refuse rather than mislabel. (offline-test / LAN scopes are
+    // isolated and legitimately lan-share; the e2e s6 provider uses offline-test.)
+    if iroh_give_side_active(config)
+        && matches!(
+            config.iroh_endpoint_scope,
+            Some(EndpointScope::Global { .. })
+        )
+        && profile != SharingProfile::PublicShare
+    {
+        return Err(format!(
+            "an iroh give-side (provider/publish) on a GLOBAL endpoint scope is public-reachable \
+             and may run ONLY under the public-share profile (with a public-NAR allowlist); the \
+             flags imply {profile}. Use --iroh-endpoint-scope offline-test/lan for an isolated \
+             substrate, or configure public-share."
+        ));
+    }
+
+    // #4: reflect the ACTIVE deferred-reference mechanisms so the report matches the wire.
+    let mut active_reference = Vec::new();
+    if iroh_give_side_active(config) {
+        active_reference.push(Mechanism::IrohTransport);
+    }
+    if config.iroh_enable_node_lookup {
+        active_reference.push(Mechanism::DnsPkarr);
+    }
+
     let contract = OperatorContract {
         profile,
         caps: ResourceCaps::default(),
@@ -517,8 +568,21 @@ fn derive_contract(config: &Config) -> Result<OperatorContract, String> {
             diagnostics_opt_in: config.diagnostics,
         },
         selected_mechanisms: Vec::new(),
+        active_reference_mechanisms: active_reference,
     };
     contract.validate().map_err(|e| e.to_string())?;
+
+    // The compat-shim cross-check (#2/#4): an explicit `--profile` must EQUAL the profile the flags
+    // imply, else fail closed - `--profile upstream-only` with give-side flags can never run.
+    if let Some(token) = &config.explicit_profile {
+        let declared = SharingProfile::parse(token).map_err(|e| e.to_string())?;
+        if declared != profile {
+            return Err(format!(
+                "--profile {declared} disagrees with the profile the flags imply ({profile}): the \
+                 flags are the compat shim and must MATCH the declared profile."
+            ));
+        }
+    }
     Ok(contract)
 }
 
@@ -558,6 +622,13 @@ impl Default for Config {
             iroh_lookup_owner: None,
             iroh_lookup_external_authorization: None,
             iroh_seed_nar: Vec::new(),
+            // TASK-120 fix #5: the iroh serve budget is DELIBERATELY the fabric-iroh FROZEN values
+            // (256 MiB / 1 GiB / 120 s), NOT the libp2p-primary `ResourceCaps` (512 MiB / 1 GiB /
+            // 300 s). This is an EXPLICIT freeze, prune-pending TASK-202 (the iroh transport is the
+            // deferred reference), not a silent divergence: the test
+            // `iroh_budget_is_the_frozen_reference_distinct_from_caps` pins it. When TASK-202
+            // decides iroh's fate this either adopts `ResourceCaps` or is
+            // removed with the iroh give-side.
             iroh_max_serve_nar_bytes: DEFAULT_MAX_SERVE_NAR_BYTES,
             iroh_max_inflight_nar_bytes: DEFAULT_MAX_INFLIGHT_NAR_BYTES,
             iroh_max_serve_duration_ms: DEFAULT_MAX_SERVE_DURATION.as_millis() as u64,
@@ -586,6 +657,7 @@ impl Default for Config {
             libp2p_leech: false,
             preflight: false,
             diagnostics: false,
+            explicit_profile: None,
         }
     }
 }
@@ -877,6 +949,7 @@ impl Config {
                 "--libp2p-leech" => config.libp2p_leech = true,
                 "--preflight" => config.preflight = true,
                 "--diagnostics" => config.diagnostics = true,
+                "--profile" => config.explicit_profile = Some(value()?),
                 "--libp2p-announce-budget" => {
                     let raw = value()?;
                     config.libp2p_announce_budget = raw.parse::<u64>().map_err(|e| {
@@ -1778,12 +1851,18 @@ async fn install_libp2p_provider(
         )
         .await?
     };
+    // TASK-120 fix #6 (mirror of daemon-libp2p): route the served-content identity fields through
+    // the privacy policy - the MARKER + field KEYS stay (machine oracles bind on `LIBP2P-SEED
+    // narhash=`), only the secret VALUES are masked unless --diagnostics.
+    let privacy = PrivacyPolicy {
+        diagnostics_opt_in: config.diagnostics,
+    };
     for (record, (nar_hash, bytes)) in records.iter().zip(&seeds) {
-        // Machine-readable: path/NarHash -> the derived ContentKey + raw BLAKE3 content id.
         println!(
-            "LIBP2P-SEED narhash={nar_hash} content={} content_key={} bytes={}",
-            record.content.to_hex(),
-            record.key,
+            "LIBP2P-SEED narhash={} content={} content_key={} bytes={}",
+            privacy.content_id(&nar_hash.to_string()),
+            privacy.content_id(&record.content.to_hex()),
+            privacy.content_id(&record.key.to_string()),
             bytes.len()
         );
     }
@@ -1963,12 +2042,16 @@ async fn install_libp2p_store_provider(
         )
         .await?
     };
+    // TASK-120 fix #6 (mirror): content-identity fields routed through the privacy policy.
+    let privacy = PrivacyPolicy {
+        diagnostics_opt_in: config.diagnostics,
+    };
     for (record, provision) in records.iter().zip(&provisions) {
         println!(
             "LIBP2P-PROVIDE-STORE narhash={} content={} content_key={} nar_size={}",
-            provision.nar_hash(),
-            record.content.to_hex(),
-            record.key,
+            privacy.content_id(&provision.nar_hash().to_string()),
+            privacy.content_id(&record.content.to_hex()),
+            privacy.content_id(&record.key.to_string()),
             provision.declared_size(),
         );
     }
@@ -2688,6 +2771,99 @@ mod tests {
 
     fn guard_addr(s: &str) -> Multiaddr {
         s.parse().unwrap()
+    }
+
+    // ---- TASK-120 composite safety fixes (#3a/#3b/#4/#5 + compat shim) ----
+
+    /// #3a SAFETY: a GLOBAL-scope iroh provider is public-reachable, so it must NOT be labelled
+    /// lan-share; without public-share (+ allowlist) it is REFUSED rather than mislabelled.
+    #[test]
+    fn iroh_global_scope_provider_without_public_share_is_refused() {
+        let config = Config {
+            iroh_provider: true,
+            iroh_endpoint_scope: Some(EndpointScope::Global { port: 0 }),
+            iroh_seed_nar: vec!["/srv/seed/x.nar".to_string()],
+            ..Config::default()
+        };
+        let err = derive_contract(&config)
+            .expect_err("a global-scope iroh provider without public-share must be refused");
+        assert!(err.contains("GLOBAL endpoint scope"), "{err}");
+    }
+
+    /// #3a negative control + #4: an OFFLINE-scope iroh provider is genuinely isolated -> lan-share
+    /// (honest), and the active iroh transport is reported as a deferred-reference mechanism so the
+    /// preflight REPORT MATCHES THE WIRE (the e2e s6 provider uses exactly this scope).
+    #[test]
+    fn iroh_offline_scope_provider_is_lan_share_and_reports_iroh_active() {
+        let config = Config {
+            iroh_provider: true,
+            iroh_endpoint_scope: Some(EndpointScope::OfflineTest { port: 0 }),
+            iroh_seed_nar: vec!["/srv/seed/x.nar".to_string()],
+            ..Config::default()
+        };
+        let contract =
+            derive_contract(&config).expect("an offline-scope iroh provider is lan-share");
+        assert_eq!(contract.profile, SharingProfile::LanShare);
+        assert!(
+            contract
+                .active_reference_mechanisms
+                .contains(&Mechanism::IrohTransport),
+            "a running iroh give-side must be reported as an active deferred-reference mechanism"
+        );
+        // The preflight must SAY iroh is active (report matches wire), not report it merely pending.
+        assert!(contract.preflight().contains("iroh-transport = ACTIVE"));
+    }
+
+    /// #3b: `iroh_publish_node` is a give-side publication, so `publishes_records` must reflect it -
+    /// never report `publishes_records=false` while an iroh publication capability is installed.
+    #[test]
+    fn iroh_publish_node_is_reflected_in_publishes_records() {
+        let config = Config {
+            iroh_publish_node: true,
+            iroh_endpoint_scope: Some(EndpointScope::OfflineTest { port: 0 }),
+            ..Config::default()
+        };
+        let contract = derive_contract(&config).expect("an iroh-publishing node derives a profile");
+        assert!(
+            contract.profile.announces(),
+            "an iroh-publishing node must report publishes_records=true"
+        );
+    }
+
+    /// The compat shim: an explicit `--profile` that disagrees with the flags fails closed.
+    #[test]
+    fn explicit_profile_disagreement_fails_closed() {
+        let config = Config {
+            explicit_profile: Some("upstream-only".to_string()),
+            libp2p_provider: true,
+            libp2p_seed_nar: vec![(
+                "sha256:0pgsb9mjmfj57w1ddmqn9z9667nwbqbnn699j1s1s99jhy6cppsm"
+                    .parse()
+                    .unwrap(),
+                "/tmp/x.nar".to_string(),
+            )],
+            ..Config::default()
+        };
+        let err = derive_contract(&config)
+            .expect_err("--profile upstream-only with provider flags must fail closed");
+        assert!(err.contains("disagrees"), "{err}");
+    }
+
+    /// #5: the composite iroh serve budget is the FROZEN fabric-iroh reference (256 MiB / 1 GiB /
+    /// 120 s), DELIBERATELY distinct from the libp2p-primary `ResourceCaps` - an explicit,
+    /// documented, prune-pending-202 divergence, never a silent one.
+    #[test]
+    fn iroh_budget_is_the_frozen_reference_distinct_from_caps() {
+        assert_eq!(DEFAULT_MAX_SERVE_NAR_BYTES, 256 * 1024 * 1024);
+        assert_eq!(
+            DEFAULT_MAX_SERVE_DURATION,
+            std::time::Duration::from_secs(120)
+        );
+        let caps = ResourceCaps::default();
+        assert_ne!(
+            DEFAULT_MAX_SERVE_NAR_BYTES, caps.max_nar_bytes_uncompressed,
+            "the frozen iroh budget must be a KNOWN divergence from the libp2p-primary caps"
+        );
     }
 
     #[test]

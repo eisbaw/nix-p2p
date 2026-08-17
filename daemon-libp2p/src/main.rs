@@ -125,6 +125,16 @@ struct Config {
     /// redacted identifiers (StorePath / NarHash / peer IP / full NodeId). DEFAULT OFF; when set
     /// the node prints the mandatory [`daemon_core::DIAGNOSTICS_WARNING`] banner.
     diagnostics: bool,
+    /// TASK-120 (authority inversion): the operator's EXPLICIT `--profile <token>` declaration, if
+    /// given. The legacy give/consume flags are a validated COMPAT SHIM: the profile DERIVED from
+    /// them must EQUAL this declaration, else `parse_config` fails closed (so
+    /// `--profile upstream-only --libp2p-provider` can never pass silently).
+    explicit_profile: Option<String>,
+    /// The AUTHORITATIVE participation MODE, derived from the flags (and cross-checked against
+    /// `explicit_profile`). This - NOT the raw `libp2p_provider`/`libp2p_leech` booleans - is what
+    /// the RUNTIME branches on: the serve gate is installed IFF `profile.serves()`, and the
+    /// consume-only [`LeechFabric`] mask is applied IFF `!profile.serves()`.
+    profile: SharingProfile,
     /// LEECH / consume-only mode (TASK-78): an affirmative opt-out of contributing uplink. A leech
     /// still FETCHES from peers, but its fabric is wrapped in a [`peer_fabric::LeechFabric`] so the
     /// SERVE and ANNOUNCE axes are masked to `None` at the transport-agnostic capability seam - it
@@ -142,31 +152,20 @@ fn default_libp2p_announce_budget() -> u64 {
     ResourceCaps::default().announce_distinct_paths_budget
 }
 
-/// Map the parsed [`Config`] onto the ONE authoritative [`OperatorContract`] (TASK-120 AC#9):
-/// distil the give/consume flags into a transport-agnostic [`ContractRequest`], derive the
-/// [`SharingProfile`] FAIL-CLOSED (AC#2, the same invalid-combo policy both binaries and the NixOS
-/// module share), attach the authoritative caps + privacy stance, and validate. Belt-and-braces
-/// atop the flag-level checks in `parse_config` - it re-asserts the mode-level invariant from ONE
-/// place so a future flag-check gap cannot let a contradictory node through.
-fn derive_contract(cfg: &Config) -> Result<OperatorContract, String> {
-    let req = ContractRequest {
-        is_leech: cfg.libp2p_leech,
-        is_provider: cfg.libp2p_provider,
-        announces: cfg.libp2p_announce_after_fetch
-            || !cfg.libp2p_seed_nar.is_empty()
-            || !cfg.libp2p_provide_store.is_empty(),
-        has_public_allowlist: cfg.libp2p_public_allowlist_path.is_some(),
-        advertises_public_address: !cfg.libp2p_external_addresses.is_empty(),
-        has_bootstrap: !cfg.libp2p_bootstrap.is_empty(),
-    };
-    let profile = SharingProfile::derive(req).map_err(|e| e.to_string())?;
+/// Build the ONE authoritative [`OperatorContract`] from the parsed [`Config`] (TASK-120 AC#9).
+/// The [`SharingProfile`] was ALREADY derived + cross-checked against `--profile` in
+/// `parse_config` (and stored in `cfg.profile`); this attaches the authoritative caps + privacy
+/// stance and validates. daemon-libp2p is the libp2p-primary binary, so it selects no deferred
+/// reference mechanism (no iroh give-side here); `active_reference_mechanisms` is empty.
+fn build_contract(cfg: &Config) -> Result<OperatorContract, String> {
     let contract = OperatorContract {
-        profile,
+        profile: cfg.profile,
         caps: ResourceCaps::default(),
         privacy: PrivacyPolicy {
             diagnostics_opt_in: cfg.diagnostics,
         },
         selected_mechanisms: Vec::new(),
+        active_reference_mechanisms: Vec::new(),
     };
     contract.validate().map_err(|e| e.to_string())?;
     Ok(contract)
@@ -266,6 +265,10 @@ fn parse_config<I: IntoIterator<Item = String>>(args: I) -> Result<Config, Strin
         libp2p_leech: false,
         preflight: false,
         diagnostics: false,
+        explicit_profile: None,
+        // Provisional; parse_config recomputes it from the flags (+ cross-checks explicit_profile)
+        // before returning. UpstreamOnly is the fail-safe placeholder.
+        profile: SharingProfile::UpstreamOnly,
     };
     let mut it = args.into_iter();
     while let Some(flag) = it.next() {
@@ -333,6 +336,7 @@ fn parse_config<I: IntoIterator<Item = String>>(args: I) -> Result<Config, Strin
             "--libp2p-leech" => cfg.libp2p_leech = true,
             "--preflight" => cfg.preflight = true,
             "--diagnostics" => cfg.diagnostics = true,
+            "--profile" => cfg.explicit_profile = Some(value()?),
             "--libp2p-announce-budget" => {
                 let raw = value()?;
                 cfg.libp2p_announce_budget = raw.parse::<u64>().map_err(|e| {
@@ -394,50 +398,20 @@ fn parse_config<I: IntoIterator<Item = String>>(args: I) -> Result<Config, Strin
                 .into(),
         );
     }
-    // A provider MUST have at least one seed and a listener; a consumer MUST have a bootstrap
-    // peer (an empty bootstrap set can never discover anyone) - fail fast, never a silent
-    // node that does nothing.
-    if cfg.libp2p_provider {
-        // A provider must have SOMETHING: a static supply set OR announce-after-fetch (TASK-77),
-        // which grows the supply set dynamically from what it fetches (an EMPTY initial set is
-        // then legitimate).
-        if cfg.libp2p_seed_nar.is_empty()
-            && cfg.libp2p_provide_store.is_empty()
-            && !cfg.libp2p_announce_after_fetch
-        {
-            return Err(
-                "--libp2p-provider requires at least one --libp2p-seed-nar, --libp2p-provide-store, or --libp2p-announce-after-fetch"
-                    .into(),
-            );
-        }
-        // MVP scope (TASK-191): one supplier drives the fabric, so the in-memory seed path and
-        // the store-dump path are not combined in a single provider yet. Combining them (a union
-        // supplier) is a filed follow-up; fail fast rather than silently serve only one.
-        if !cfg.libp2p_seed_nar.is_empty() && !cfg.libp2p_provide_store.is_empty() {
-            return Err(
-                "--libp2p-seed-nar and --libp2p-provide-store cannot be combined in one provider \
-                 yet (TASK-191 MVP): use one supply mode"
-                    .into(),
-            );
-        }
-        if cfg.libp2p_listen.is_empty() {
-            return Err("--libp2p-provider requires --libp2p-listen".into());
-        }
-        // TASK-207 fail-closed: an external address advertises PUBLIC reachability. On a provider
-        // WITHOUT the public-NAR allowlist door that is an isolated-LAN announce (lan_share_or_refuse),
-        // where advertising a public self-address contradicts the isolation the announce relies on -
-        // refuse rather than announce local content over a self-declared public address. With the
-        // allowlist door set the announce is gated per-NAR, so external addresses are fine.
-        if !cfg.libp2p_external_addresses.is_empty() && cfg.libp2p_public_allowlist_path.is_none() {
-            return Err(
-                "--libp2p-external-address on a provider requires --libp2p-public-allowlist-path: \
-                 advertising a public self-address is incompatible with an isolated-LAN announce"
-                    .into(),
-            );
-        }
-    } else if cfg.libp2p_bootstrap.is_empty() {
+    // TASK-207 fail-closed CONTRADICTION (safety): on a PROVIDER, an external address advertises
+    // PUBLIC reachability, and without the public-NAR allowlist door that is an isolated-LAN
+    // announce over a self-declared public address - refuse rather than leak local content. A
+    // NON-serving node (a consumer, or a relay/bootstrap that carries no content) advertising its
+    // OWN reachable address is legitimate (a relay's whole job), so the check is provider-scoped;
+    // `SharingProfile::derive` enforces the same rule transport-agnostically (gated on the give side).
+    if cfg.libp2p_provider
+        && !cfg.libp2p_external_addresses.is_empty()
+        && cfg.libp2p_public_allowlist_path.is_none()
+    {
         return Err(
-            "a consumer requires at least one --libp2p-bootstrap <PeerId>@<multiaddr>".into(),
+            "--libp2p-external-address on a provider requires --libp2p-public-allowlist-path: \
+             advertising a public self-address is incompatible with an isolated-LAN announce"
+                .into(),
         );
     }
     // TASK-103/204 PUBLIC-announce allowlist companion validation, MIRRORING the composite `daemon`
@@ -463,7 +437,83 @@ fn parse_config<I: IntoIterator<Item = String>>(args: I) -> Result<Config, Strin
             "--libp2p-public-allowlist-path requires at least one --libp2p-trusted-public-key; without a trusted narinfo-signing key nothing can be proven public and every announce would be refused".into(),
         );
     }
+
+    // AUTHORITY INVERSION (TASK-120): derive the AUTHORITATIVE profile from the flags, then
+    // cross-check it against any explicit `--profile`. The legacy flags are a validated COMPAT
+    // SHIM - the derived profile MUST equal the declared one, else fail closed. This is what makes
+    // `--profile upstream-only --libp2p-provider ...` impossible to pass silently.
+    let derived = SharingProfile::derive(contract_request(&cfg)).map_err(|e| e.to_string())?;
+    if let Some(token) = &cfg.explicit_profile {
+        let declared = SharingProfile::parse(token).map_err(|e| e.to_string())?;
+        if declared != derived {
+            return Err(format!(
+                "--profile {} disagrees with the profile the flags imply ({}): the flags are the \
+                 compat shim and must MATCH the declared profile. Fix the flags or the --profile.",
+                declared, derived
+            ));
+        }
+    }
+    cfg.profile = derived;
     Ok(cfg)
+}
+
+/// Distil the parsed [`Config`]'s give/consume flags into the transport-agnostic
+/// [`ContractRequest`] the ONE authority ([`SharingProfile::derive`]) consumes. The SINGLE place
+/// the flags map to intent, so the derived MODE cannot diverge between parse-time and runtime.
+fn contract_request(cfg: &Config) -> ContractRequest {
+    ContractRequest {
+        is_leech: cfg.libp2p_leech,
+        is_provider: cfg.libp2p_provider,
+        announces: cfg.libp2p_announce_after_fetch
+            || !cfg.libp2p_seed_nar.is_empty()
+            || !cfg.libp2p_provide_store.is_empty(),
+        has_public_allowlist: cfg.libp2p_public_allowlist_path.is_some(),
+        advertises_public_address: !cfg.libp2p_external_addresses.is_empty(),
+        has_bootstrap: !cfg.libp2p_bootstrap.is_empty(),
+    }
+}
+
+/// NETWORK-PRECONDITION checks, keyed off the AUTHORITATIVE [`SharingProfile`] (TASK-120 fix #1 +
+/// #3). Distinct from the CONTRADICTION checks in `parse_config` (which fail even a `--preflight`):
+/// these say a node is not yet WIRED to do what its profile asks, so `main` runs them ONLY on the
+/// live path, AFTER the `--preflight` early-return. Crucially, a CONSUME-ONLY node requires a
+/// bootstrap (it intends to fetch from peers), but an UPSTREAM-ONLY node does NOT - a fresh
+/// `daemon-libp2p` with no flags is upstream-only and must run.
+fn check_runtime_preconditions(cfg: &Config) -> Result<(), String> {
+    if cfg.profile.serves() {
+        // A provider must have SOMETHING to serve: a static supply set OR announce-after-fetch
+        // (TASK-77), which grows the supply set from what it fetches.
+        if cfg.libp2p_seed_nar.is_empty()
+            && cfg.libp2p_provide_store.is_empty()
+            && !cfg.libp2p_announce_after_fetch
+        {
+            return Err(
+                "a provider profile (lan-share/public-share) requires at least one --libp2p-seed-nar, --libp2p-provide-store, or --libp2p-announce-after-fetch"
+                    .into(),
+            );
+        }
+        // MVP scope (TASK-191): one supplier drives the fabric; the seed and store paths are not
+        // combined yet. Fail fast rather than silently serve only one.
+        if !cfg.libp2p_seed_nar.is_empty() && !cfg.libp2p_provide_store.is_empty() {
+            return Err(
+                "--libp2p-seed-nar and --libp2p-provide-store cannot be combined in one provider \
+                 yet (TASK-191 MVP): use one supply mode"
+                    .into(),
+            );
+        }
+        if cfg.libp2p_listen.is_empty() {
+            return Err(
+                "a provider profile (lan-share/public-share) requires --libp2p-listen".into(),
+            );
+        }
+    } else if cfg.profile == SharingProfile::ConsumeOnly && cfg.libp2p_bootstrap.is_empty() {
+        // CONSUME-ONLY intends to fetch from peers, so it needs an entry peer; UPSTREAM-ONLY does
+        // NOT (it is pure HTTP fallback) - the guard keys off the profile, not "non-provider".
+        return Err(
+            "consume-only requires at least one --libp2p-bootstrap <PeerId>@<multiaddr> (it fetches from peers); for pure HTTP fallback use --profile upstream-only with no bootstrap".into(),
+        );
+    }
+    Ok(())
 }
 
 fn source_config(cfg: &Config) -> Result<Libp2pSourceConfig, String> {
@@ -586,15 +636,17 @@ fn provider_publication_authority(
 /// [`ProviderGuard`] the caller must keep alive for the process.
 async fn install_provider(
     cfg: &Config,
+    contract: &OperatorContract,
     source_cfg: Libp2pSourceConfig,
     allowlist: &Arc<PublicNarAllowlist>,
 ) -> Result<(Arc<Libp2pFabric>, ProviderGuard), String> {
     warn_if_non_durable_provider(&source_cfg);
+    let privacy = &contract.privacy;
     let (fabric, guard) = if !cfg.libp2p_provide_store.is_empty() || cfg.libp2p_announce_after_fetch
     {
-        install_store_provider(cfg, source_cfg, allowlist).await?
+        install_store_provider(cfg, privacy, source_cfg, allowlist).await?
     } else {
-        install_seed_provider(cfg, source_cfg, allowlist).await?
+        install_seed_provider(cfg, privacy, source_cfg, allowlist).await?
     };
 
     if cfg.libp2p_print_peer_address {
@@ -621,6 +673,7 @@ async fn install_provider(
 /// [`MemoryNarSupplier`] (holding them at rest) and announce a signed record per seed.
 async fn install_seed_provider(
     cfg: &Config,
+    privacy: &PrivacyPolicy,
     source_cfg: Libp2pSourceConfig,
     allowlist: &Arc<PublicNarAllowlist>,
 ) -> Result<(Arc<Libp2pFabric>, ProviderGuard), String> {
@@ -691,10 +744,14 @@ async fn install_seed_provider(
         .await?
     };
     for (record, (nar_hash, bytes)) in records.iter().zip(&seeds) {
+        // TASK-120 fix #6: route the served-content identity fields through the privacy policy -
+        // the MARKER + field KEYS stay (machine oracles bind on `LIBP2P-SEED narhash=`), only the
+        // secret VALUES (NarHash / BLAKE3 content / content key) are masked unless --diagnostics.
         println!(
-            "LIBP2P-SEED narhash={nar_hash} content={} content_key={} bytes={}",
-            record.content.to_hex(),
-            record.key,
+            "LIBP2P-SEED narhash={} content={} content_key={} bytes={}",
+            privacy.content_id(&nar_hash.to_string()),
+            privacy.content_id(&record.content.to_hex()),
+            privacy.content_id(&record.key.to_string()),
             bytes.len()
         );
     }
@@ -717,6 +774,7 @@ async fn install_seed_provider(
 /// is the index's VERIFIED digest, never the operator's word.
 async fn install_store_provider(
     cfg: &Config,
+    privacy: &PrivacyPolicy,
     source_cfg: Libp2pSourceConfig,
     allowlist: &Arc<PublicNarAllowlist>,
 ) -> Result<(Arc<Libp2pFabric>, ProviderGuard), String> {
@@ -817,11 +875,13 @@ async fn install_store_provider(
         .await?
     };
     for (record, provision) in records.iter().zip(&provisions) {
+        // TASK-120 fix #6: content-identity fields routed through the privacy policy (marker + keys
+        // stay for machine oracles; secret values masked unless --diagnostics).
         println!(
             "LIBP2P-PROVIDE-STORE narhash={} content={} content_key={} nar_size={}",
-            provision.nar_hash(),
-            record.content.to_hex(),
-            record.key,
+            privacy.content_id(&provision.nar_hash().to_string()),
+            privacy.content_id(&record.content.to_hex()),
+            privacy.content_id(&record.key.to_string()),
             provision.declared_size(),
         );
     }
@@ -958,10 +1018,9 @@ async fn main() -> ExitCode {
         }
     };
 
-    // TASK-120: derive the ONE authoritative operator contract and validate it FAIL-CLOSED before
-    // touching the network. A contradictory mode (caught here even if a flag-level check ever
-    // regressed) blocks startup rather than running a node the operator did not ask for.
-    let contract = match derive_contract(&cfg) {
+    // TASK-120: build the ONE authoritative operator contract and validate it FAIL-CLOSED. The
+    // profile was already derived + cross-checked against `--profile` in parse_config.
+    let contract = match build_contract(&cfg) {
         Ok(c) => c,
         Err(err) => {
             eprintln!("daemon-libp2p: operator contract rejected: {err}");
@@ -969,11 +1028,20 @@ async fn main() -> ExitCode {
         }
     };
 
-    // TASK-120 AC#7: `--preflight` is a pure static one-shot - render the contract and EXIT before
-    // any socket is bound or any P2P traffic is emitted.
+    // TASK-120 AC#7 + fix #3: `--preflight` renders the contract and EXITS BEFORE any
+    // network-precondition guard (a pure static read of the INTENDED profile), so e.g.
+    // `daemon-libp2p --preflight` shows the upstream-only preflight without demanding a bootstrap.
     if cfg.preflight {
         println!("{}", contract.preflight());
         return ExitCode::SUCCESS;
+    }
+
+    // TASK-120 fix #1/#3: the network-precondition guards run ONLY on the live path, AFTER the
+    // preflight early-return, keyed off the AUTHORITATIVE profile - so a fresh upstream-only node
+    // with no bootstrap runs, while a consume-only node still requires one.
+    if let Err(err) = check_runtime_preconditions(&cfg) {
+        eprintln!("daemon-libp2p: {err}");
+        return ExitCode::from(2);
     }
 
     // TASK-120 AC#4 (startup surface): always announce the derived operator MODE so the running
@@ -1077,13 +1145,15 @@ async fn main() -> ExitCode {
         Axis::Transfer(TransportTag::Iroh),
     ];
 
-    // Keep the provider serve gate (and, in store-supply mode, its availability index) alive for
-    // the process (dropping the guard stops serving / retires the served reverse-map).
+    // AUTHORITY INVERSION (TASK-120 fix #3): the serve gate + announcer are installed IFF the
+    // AUTHORITATIVE profile SERVES (lan-share / public-share) - NOT off the raw `libp2p_provider`
+    // boolean. A non-serving profile (upstream-only / consume-only) takes the consumer path and is
+    // masked below, so it CANNOT serve or announce regardless of any stray give-side flag.
     let _serve_guard: Option<ProviderGuard>;
-    let fabric: Arc<Libp2pFabric> = if cfg.libp2p_provider {
+    let fabric: Arc<Libp2pFabric> = if contract.profile.serves() {
         required_axes.push(Axis::Server);
         required_axes.push(Axis::Announcer);
-        match install_provider(&cfg, source_cfg, &public_allowlist).await {
+        match install_provider(&cfg, &contract, source_cfg, &public_allowlist).await {
             Ok((fabric, guard)) => {
                 _serve_guard = Some(guard);
                 let supplied = if cfg.libp2p_provide_store.is_empty() {
@@ -1106,10 +1176,12 @@ async fn main() -> ExitCode {
         match build_libp2p_nar_source(source_cfg).await {
             Ok((fabric, _source, _raw)) => {
                 _serve_guard = None;
-                let role = if cfg.libp2p_leech {
-                    "LEECH"
-                } else {
-                    "CONSUMER"
+                // The non-serving profiles: consume-only (fetches from peers) and upstream-only
+                // (pure HTTP fallback, no bootstrap). Both are masked below so serve+announce are
+                // structurally absent; the role print reflects the AUTHORITATIVE profile.
+                let role = match contract.profile {
+                    SharingProfile::UpstreamOnly => "UPSTREAM-ONLY",
+                    _ => "CONSUMER",
                 };
                 println!(
                     "daemon-libp2p: {role} started, discovery converging ({} bootstrap peer(s))",
@@ -1198,11 +1270,13 @@ async fn main() -> ExitCode {
             .and_then(|g| g.post_fetch_announce.clone()),
     };
 
-    // TASK-78: a leech runs the ordinary CONSUMER fabric (no supplier, so its backend installs no
-    // serve gate and never announces) wrapped in the transport-agnostic LeechFabric mask, which
-    // makes the serve + announce axes structurally `None` at the seam. Post-build handle wiring
-    // above used the concrete `fabric`; the daemon frontend below takes the masked `&dyn PeerFabric`.
-    let fabric_dyn: Arc<dyn PeerFabric> = if cfg.libp2p_leech {
+    // AUTHORITY INVERSION (TASK-120 fix #3): a NON-SERVING profile (upstream-only OR consume-only)
+    // is wrapped in the transport-agnostic [`LeechFabric`] mask, which makes the serve + announce
+    // axes structurally `None` at the seam - so a default/consume-only node gives NOTHING back even
+    // if a stray give-side flag slipped through. A serving profile (lan-share/public-share) uses the
+    // concrete fabric (its serve gate was installed above). The mask keys off `profile.serves()`,
+    // NOT the `libp2p_leech` boolean.
+    let fabric_dyn: Arc<dyn PeerFabric> = if !contract.profile.serves() {
         Arc::new(LeechFabric::new(fabric.clone()))
     } else {
         fabric.clone()
@@ -1254,7 +1328,7 @@ mod bootstrap_guard_tests {
     //! (loopback-listen, no bootstrap, no provider-addr) LAN announce. This drives the binary's
     //! Config->reachability wrapper, so a call site that FORGOT to pass provider-addr/listen (the
     //! original hole) is caught here, not only in the lib-level policy test.
-    use super::{Config, lan_share_or_refuse};
+    use super::{Config, SharingProfile, lan_share_or_refuse};
     use fabric_libp2p::{Multiaddr, PeerId};
 
     fn peer() -> PeerId {
@@ -1304,6 +1378,10 @@ mod bootstrap_guard_tests {
             libp2p_leech: false,
             preflight: false,
             diagnostics: false,
+            explicit_profile: None,
+            // This helper constructs a PROVIDER config directly for the lan_share_or_refuse guard
+            // tests; those tests never consult `profile`, so lan-share is a faithful placeholder.
+            profile: SharingProfile::LanShare,
         }
     }
 
@@ -1464,12 +1542,14 @@ mod public_allowlist_parity_tests {
 
 #[cfg(test)]
 mod operator_contract_tests {
-    //! TASK-120: the binary maps its parsed CLI onto the ONE authoritative operator contract. These
-    //! drive the binary's OWN `parse_config` + `derive_contract`, so a wiring gap (a flag that fails
-    //! to move the derived MODE, or a serve budget that drifts from the authoritative caps) is caught
-    //! here.
+    //! TASK-120 authority inversion: the RUNTIME derives its participation from `cfg.profile`, and
+    //! `cfg.profile` is derived from the flags (cross-checked against `--profile`) in `parse_config`.
+    //! These drive the binary's OWN `parse_config` + `build_contract` + `check_runtime_preconditions`,
+    //! so a wiring gap (a flag that fails to move the MODE, a `--profile` that disagrees silently, a
+    //! serve budget that drifts from the caps, or a fresh node that cannot start) is caught here.
     use super::{
-        default_libp2p_announce_budget, derive_contract, parse_config, provider_serve_budget,
+        build_contract, check_runtime_preconditions, default_libp2p_announce_budget, parse_config,
+        provider_serve_budget,
     };
     use daemon_core::{ResourceCaps, SharingProfile};
 
@@ -1494,26 +1574,45 @@ mod operator_contract_tests {
         );
     }
 
-    /// AC#1 fail-safe default: a plain libp2p CONSUMER (a bootstrap, no give-side flag) derives
-    /// consume-only - it serves + announces NOTHING. The mode never silently becomes a give-side one.
+    /// fix #1 (fail-safe default): a fresh `daemon-libp2p` with NO flags is UPSTREAM-ONLY and STARTS
+    /// (no bootstrap demanded). It serves + announces nothing. This is the mutation-target of the
+    /// authority inversion: the runtime keys the serve gate off `profile.serves()`, which is false.
+    #[test]
+    fn fresh_no_flag_node_is_upstream_only_and_starts() {
+        let cfg = parse_config(args(&[])).expect("a fresh no-flag node parses");
+        assert_eq!(cfg.profile, SharingProfile::UpstreamOnly);
+        assert!(!cfg.profile.serves(), "upstream-only must not serve");
+        assert!(!cfg.profile.announces(), "upstream-only must not announce");
+        // fix #1: upstream-only does NOT require a bootstrap - it must start.
+        check_runtime_preconditions(&cfg)
+            .expect("a fresh upstream-only node must start with no bootstrap");
+        build_contract(&cfg).expect("upstream-only contract is valid");
+    }
+
+    /// fix #3 (consume-only still requires a bootstrap): the guard keys off CONSUME-ONLY, not
+    /// "non-provider" - so upstream-only is exempt but consume-only is not.
+    #[test]
+    fn consume_only_requires_a_bootstrap_upstream_only_does_not() {
+        // A leech with no bootstrap is consume-only and MUST be rejected at runtime preconditions.
+        let leech = parse_config(args(&["--libp2p-leech"])).expect("leech parses");
+        assert_eq!(leech.profile, SharingProfile::ConsumeOnly);
+        let err = check_runtime_preconditions(&leech)
+            .expect_err("consume-only with no bootstrap must be rejected");
+        assert!(err.contains("consume-only requires"), "{err}");
+        // The same node WITH a bootstrap starts.
+        let leech_ok =
+            parse_config(args(&["--libp2p-leech", "--libp2p-bootstrap", BOOT])).expect("parses");
+        check_runtime_preconditions(&leech_ok).expect("consume-only with a bootstrap starts");
+    }
+
+    /// A plain consumer (a bootstrap, no give-side flag) is consume-only - serves + announces
+    /// nothing. The mode never silently becomes a give-side one.
     #[test]
     fn a_plain_consumer_is_consume_only() {
         let cfg = parse_config(args(&["--libp2p-bootstrap", BOOT])).expect("consumer parses");
-        let contract = derive_contract(&cfg).expect("consumer contract derives");
-        assert_eq!(contract.profile, SharingProfile::ConsumeOnly);
-        assert!(!contract.profile.serves());
-        assert!(!contract.profile.announces());
-    }
-
-    /// AC#2: an explicit leech is consume-only.
-    #[test]
-    fn an_explicit_leech_is_consume_only() {
-        let cfg = parse_config(args(&["--libp2p-leech", "--libp2p-bootstrap", BOOT]))
-            .expect("leech parses");
-        assert_eq!(
-            derive_contract(&cfg).unwrap().profile,
-            SharingProfile::ConsumeOnly
-        );
+        assert_eq!(cfg.profile, SharingProfile::ConsumeOnly);
+        assert!(!cfg.profile.serves());
+        assert!(!cfg.profile.announces());
     }
 
     /// AC#2: a provider WITHOUT a public allowlist is lan-share; WITH one it is public-share.
@@ -1527,10 +1626,8 @@ mod operator_contract_tests {
             &format!("{APP_NAR_HASH}=/tmp/app.nar"),
         ]))
         .expect("lan provider parses");
-        assert_eq!(
-            derive_contract(&lan).unwrap().profile,
-            SharingProfile::LanShare
-        );
+        assert_eq!(lan.profile, SharingProfile::LanShare);
+        assert!(lan.profile.serves());
 
         let public = parse_config(args(&[
             "--libp2p-provider",
@@ -1544,22 +1641,60 @@ mod operator_contract_tests {
             FIXTURE_PUBKEY,
         ]))
         .expect("public provider parses");
-        let contract = derive_contract(&public).unwrap();
-        assert_eq!(contract.profile, SharingProfile::PublicShare);
-        assert!(contract.profile.serves());
-        assert!(contract.profile.public_participation());
+        assert_eq!(public.profile, SharingProfile::PublicShare);
+        assert!(public.profile.serves());
+        assert!(public.profile.public_participation());
     }
 
-    /// AC#7: `--preflight` parses and the derived contract renders a preflight naming the pending
-    /// mechanisms + the effective integer controls.
+    /// fix #4 / #2 (the compat shim): an explicit `--profile` that AGREES with the flags passes; one
+    /// that DISAGREES fails closed - `--profile upstream-only --libp2p-provider ...` can never run.
     #[test]
-    fn preflight_flag_parses_and_renders() {
-        let cfg = parse_config(args(&["--preflight", "--libp2p-bootstrap", BOOT]))
-            .expect("preflight parses");
+    fn explicit_profile_must_agree_with_the_flags() {
+        // Agreement: --profile lan-share + provider flags.
+        parse_config(args(&[
+            "--profile",
+            "lan-share",
+            "--libp2p-provider",
+            "--libp2p-listen",
+            "/ip4/127.0.0.1/tcp/0",
+            "--libp2p-seed-nar",
+            &format!("{APP_NAR_HASH}=/tmp/app.nar"),
+        ]))
+        .expect("--profile lan-share agrees with provider flags");
+
+        // Disagreement: --profile upstream-only but the flags make it a provider. FAIL CLOSED.
+        let err = parse_config(args(&[
+            "--profile",
+            "upstream-only",
+            "--libp2p-provider",
+            "--libp2p-listen",
+            "/ip4/127.0.0.1/tcp/0",
+            "--libp2p-seed-nar",
+            &format!("{APP_NAR_HASH}=/tmp/app.nar"),
+        ]))
+        .err()
+        .expect("--profile upstream-only + provider flags must fail closed");
+        assert!(err.contains("disagrees"), "{err}");
+
+        // Disagreement the other way: --profile consume-only but no bootstrap-only intent (a bare
+        // node is upstream-only). FAIL CLOSED.
+        let err2 = parse_config(args(&["--profile", "consume-only"]))
+            .err()
+            .expect("--profile consume-only on a bare (upstream-only) node must fail closed");
+        assert!(err2.contains("disagrees"), "{err2}");
+    }
+
+    /// AC#7 + fix #3: `--preflight` renders the INTENDED profile with NO network-precondition
+    /// demanded (a bare `--preflight` shows the upstream-only preflight - no bootstrap needed).
+    #[test]
+    fn preflight_needs_no_network_precondition() {
+        let cfg = parse_config(args(&["--preflight"])).expect("bare --preflight parses");
         assert!(cfg.preflight);
-        let p = derive_contract(&cfg).unwrap().preflight();
+        assert_eq!(cfg.profile, SharingProfile::UpstreamOnly);
+        let p = build_contract(&cfg).unwrap().preflight();
         assert!(p.contains("iroh-transport = PENDING"));
         assert!(p.contains("max_nar_bytes_uncompressed=536870912"));
+        assert!(p.contains("serves_bytes: false"));
     }
 }
 
@@ -1710,7 +1845,7 @@ mod leech_flag_tests {
     //! serve and announce axes are masked at the seam. These drive the binary's OWN `parse_config`,
     //! so the fail-fast mutual-exclusion with every give-side flag is caught here (a dropped check
     //! would silently accept "a leech that also serves", which is exactly the lie the flag forbids).
-    use super::parse_config;
+    use super::{check_runtime_preconditions, parse_config};
 
     const APP_NAR_HASH: &str = "sha256:0pgsb9mjmfj57w1ddmqn9z9667nwbqbnn699j1s1s99jhy6cppsm";
     const FIXTURE_PUBKEY: &str = "nix-p2p-test-1:empdFBu9wVZG12rPKToHMOTsU1qzWzeCcLdq/KQH0JQ=";
@@ -1730,13 +1865,16 @@ mod leech_flag_tests {
         assert!(!cfg.libp2p_provider, "a leech is not a provider");
     }
 
-    /// A leech still needs a bootstrap - it is a consumer, and an empty bootstrap set can never
-    /// discover anyone (the existing consumer rule applies).
+    /// A leech (consume-only) still needs a bootstrap - it fetches from peers. TASK-120 moved this
+    /// NETWORK-PRECONDITION out of `parse_config` (so `--preflight` can render without it) into
+    /// `check_runtime_preconditions`, keyed off the consume-only profile.
     #[test]
     fn a_leech_without_a_bootstrap_is_refused() {
-        let Err(err) = parse_config(args(&["--libp2p-leech"])) else {
-            panic!("a leech with no bootstrap must be refused");
-        };
+        let cfg = parse_config(args(&["--libp2p-leech"])).expect(
+            "a bootstrap-less leech PARSES (upstream-only exempt; consume-only checked at runtime)",
+        );
+        let err = check_runtime_preconditions(&cfg)
+            .expect_err("a consume-only leech with no bootstrap must be refused at runtime");
         assert!(
             err.contains("--libp2p-bootstrap"),
             "the refusal must require a bootstrap: {err}"

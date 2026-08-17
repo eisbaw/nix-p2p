@@ -339,9 +339,15 @@ in
           # wave-1 HTTP-only service is byte-identical when libp2p is off. Each list
           # option expands to its repeatable flag; the scalars append when set.
           ++ lib.optionals lcfg.enable (
-            # TASK-120: the profile-derived give/consume flags. `isProvider`/`isLeech`/
-            # `wantsAnnounceAfterFetch` fold the profile together with the low-level booleans.
-            lib.optionals isProvider [ "--libp2p-provider" ]
+            # TASK-120: emit the AUTHORITATIVE --profile so the binary's compat-shim cross-check
+            # (derive_from_flags MUST equal --profile) validates the module's own profile->flag
+            # mapping end-to-end - a module mapping bug becomes a fail-fast startup error, not a
+            # silent mislabel. Kept inside the libp2p block so the wave-1 HTTP-only ExecStart is
+            # byte-identical when libp2p is off (the daemon defaults to upstream-only anyway).
+            [ "--profile" profile ]
+            # The profile-derived give/consume flags. `isProvider`/`isLeech`/`wantsAnnounceAfterFetch`
+            # fold the profile together with the low-level booleans.
+            ++ lib.optionals isProvider [ "--libp2p-provider" ]
             ++ lib.optionals isLeech [ "--libp2p-leech" ]
             ++ lib.optionals wantsAnnounceAfterFetch [ "--libp2p-announce-after-fetch" ]
             ++ lib.optionals (!lcfg.relayServer) [ "--libp2p-no-relay-server" ]

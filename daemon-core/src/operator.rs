@@ -176,10 +176,16 @@ impl SharingProfile {
         if req.is_leech && (req.is_provider || req.announces || req.has_public_allowlist) {
             return Err(ContractError::LeechServes);
         }
-        // A public self-address on a node WITHOUT the per-NAR allowlist door would
-        // announce local content over a self-declared public address — the isolation
-        // an lan-share relies on is gone. Refuse rather than leak.
-        if req.advertises_public_address && !req.has_public_allowlist {
+        // A public self-address on a SERVING node WITHOUT the per-NAR allowlist door would
+        // announce local content over a self-declared public address — the isolation an lan-share
+        // relies on is gone. Refuse rather than leak. A NON-serving node (a consumer or a
+        // relay/bootstrap that carries no content) advertising its own reachable address is fine —
+        // that is a relay's whole job — so this is gated on the give side, not on address
+        // advertisement alone.
+        if req.advertises_public_address
+            && !req.has_public_allowlist
+            && (req.is_provider || req.announces)
+        {
             return Err(ContractError::PublicAddressWithoutAllowlist);
         }
         // Announcing requires the serve axis (you cannot advertise what you will not
@@ -323,29 +329,32 @@ impl Mechanism {
 /// per-binary constant cannot silently disagree with the documented contract (a
 /// parity test asserts the binary uses these). A large-but-finite default is used
 /// throughout — never "unlimited".
+///
+/// EVERY field here is ENFORCED on the wire (TASK-120 codex fix #6: no phantom
+/// bounds). The serve/discovery/announce fields feed the `peer_fabric` budgets the
+/// gates check; `narinfo_cache_max_entries` is the count the disk cache actually
+/// evicts against ([`crate::narinfo_cache::DEFAULT_MAX_ENTRIES`]). Bounds that are
+/// not yet enforced (an upload-rate shaper, a concurrent-serve COUNT distinct from
+/// the in-flight-byte cap, an FD budget) are DELIBERATELY ABSENT rather than
+/// advertised-but-unenforced — a follow-up wires them AND adds them here together.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ResourceCaps {
-    // ---- upload / serving ----
-    /// Sustained upload shaping ceiling, integer bytes per second. `0` means the
-    /// contract declares no additional application-level shaping (the OS/link bounds
-    /// it); it is still a declared, visible value, not an accident.
-    pub upload_rate_bytes_per_sec: u64,
+    // ---- serving (enforced by ServeBudget) ----
     /// Per-NAR uncompressed-NAR byte ceiling: a single blob over this is DECLINED,
     /// never allocated (the peer-triggerable-OOM guard).
     pub max_nar_bytes_uncompressed: u64,
     /// Total concurrently-admitted uncompressed-NAR bytes: a further serve over this
-    /// is declined rather than admitted.
+    /// is declined rather than admitted. This IS the concurrency bound (by bytes, the
+    /// resource that matters), so there is no separate serve-COUNT knob.
     pub max_inflight_bytes_uncompressed: u64,
     /// How long one serve may hold its reservation before it is reclaimed, ms.
     pub serve_duration_ms: u64,
-    /// Concurrent serve sessions admitted at once.
-    pub max_concurrent_serves: u32,
-    // ---- discovery / hold-query ----
+    // ---- discovery / hold-query (enforced by DiscoveryBudget) ----
     /// Wall-clock deadline for one discovery/hold-query consultation, ms.
     pub discovery_deadline_ms: u64,
     /// Max peers one consultation may fan out to (the hold-query work bound).
     pub discovery_max_peers: u32,
-    // ---- publication / announce ----
+    // ---- publication / announce (enforced by AnnounceBudget + the TASK-77 counter) ----
     /// The announce-after-fetch budget (TASK-77): max DISTINCT fetched paths this
     /// process announces. Past it, announcing STOPS.
     pub announce_distinct_paths_budget: u64,
@@ -353,31 +362,28 @@ pub struct ResourceCaps {
     pub announce_max_replicas: u32,
     /// Wall-clock deadline for one announce, ms.
     pub announce_deadline_ms: u64,
-    // ---- disk / descriptors ----
-    /// Narinfo disk-cache entry ceiling (TASK-27): the count-capped local cache.
+    // ---- disk (enforced by the narinfo disk cache eviction) ----
+    /// Narinfo disk-cache entry ceiling (TASK-27): the count-capped local cache the
+    /// cache actually evicts against.
     pub narinfo_cache_max_entries: u64,
-    /// File-descriptor budget the node runs within.
-    pub max_file_descriptors: u32,
 }
 
 impl Default for ResourceCaps {
     /// The authoritative production defaults for the libp2p-primary path. These are
-    /// the numbers `daemon-libp2p` runs with (the local `DEFAULT_MAX_*` constants are
-    /// derived FROM here, and a parity test enforces it). Large-but-finite, integer.
+    /// the numbers `daemon-libp2p` runs with (the local budget helpers are derived
+    /// FROM here, and a parity test enforces it). Large-but-finite, integer.
     fn default() -> Self {
         ResourceCaps {
-            upload_rate_bytes_per_sec: 0, // no extra app-level shaping declared (visible, not implicit)
             max_nar_bytes_uncompressed: 512 * 1024 * 1024, // 512 MiB per NAR
             max_inflight_bytes_uncompressed: 1024 * 1024 * 1024, // 1 GiB in flight
-            serve_duration_ms: 300_000,   // 5 min per serve
-            max_concurrent_serves: 64,
+            serve_duration_ms: 300_000,                    // 5 min per serve
             discovery_deadline_ms: 5_000, // matches DiscoveryBudget provisional deadline
             discovery_max_peers: 16,
             announce_distinct_paths_budget: 256, // matches DEFAULT_LIBP2P_ANNOUNCE_BUDGET
             announce_max_replicas: 20,
             announce_deadline_ms: 10_000,
-            narinfo_cache_max_entries: 100_000,
-            max_file_descriptors: 4_096,
+            // The value the disk cache actually enforces (imported, cannot drift).
+            narinfo_cache_max_entries: crate::narinfo_cache::DEFAULT_MAX_ENTRIES as u64,
         }
     }
 }
@@ -413,10 +419,6 @@ impl ResourceCaps {
     pub fn effective_lines(&self) -> Vec<String> {
         vec![
             format!(
-                "upload_rate_bytes_per_sec={}",
-                self.upload_rate_bytes_per_sec
-            ),
-            format!(
                 "max_nar_bytes_uncompressed={}",
                 self.max_nar_bytes_uncompressed
             ),
@@ -425,7 +427,6 @@ impl ResourceCaps {
                 self.max_inflight_bytes_uncompressed
             ),
             format!("serve_duration_ms={}", self.serve_duration_ms),
-            format!("max_concurrent_serves={}", self.max_concurrent_serves),
             format!("discovery_deadline_ms={}", self.discovery_deadline_ms),
             format!("discovery_max_peers={}", self.discovery_max_peers),
             format!(
@@ -438,7 +439,6 @@ impl ResourceCaps {
                 "narinfo_cache_max_entries={}",
                 self.narinfo_cache_max_entries
             ),
-            format!("max_file_descriptors={}", self.max_file_descriptors),
         ]
     }
 }
@@ -492,6 +492,20 @@ impl PrivacyPolicy {
             full.to_string()
         } else {
             "<redacted-peer-ip>".to_string()
+        }
+    }
+
+    /// Redact a content identity token (a NarHash, a BLAKE3 content id, a content
+    /// key). `<redacted-content-id>` by default, full value only under opt-in
+    /// diagnostics. Used to route a provider's served-content status lines through
+    /// the privacy policy (TASK-120 fix #6) — the field KEY (`narhash=`, `content=`,
+    /// `content_key=`) and the line marker stay so machine oracles still bind; only
+    /// the secret VALUE is masked.
+    pub fn content_id(&self, full: &str) -> String {
+        if self.diagnostics_opt_in {
+            full.to_string()
+        } else {
+            "<redacted-content-id>".to_string()
         }
     }
 }
@@ -639,6 +653,17 @@ pub struct OperatorContract {
     /// [`Enabled`](MechanismState::Enabled) or [`validate`](OperatorContract::validate)
     /// fails closed.
     pub selected_mechanisms: Vec<Mechanism>,
+    /// Mechanisms ACTIVE on the wire as a DEFERRED REFERENCE (TASK-120 fix #4), NOT as
+    /// a selectable primary. The composite `daemon` populates this with
+    /// [`IrohTransport`](Mechanism::IrohTransport) when its legacy iroh give-side is
+    /// running and [`DnsPkarr`](Mechanism::DnsPkarr) when its iroh node-lookup is on,
+    /// so the preflight/status REPORT MATCHES THE WIRE (a running iroh provider is not
+    /// silently reported as "iroh pending / not present"). These do NOT pass through
+    /// [`validate`](OperatorContract::validate)'s selectable gate — they are honestly
+    /// labelled "active (deferred reference, prune-pending TASK-202)", the truthful
+    /// state for a shipped-but-deferred transport, distinct from an operator SELECTING
+    /// a pending mechanism as primary (which validate still rejects).
+    pub active_reference_mechanisms: Vec<Mechanism>,
 }
 
 impl OperatorContract {
@@ -650,6 +675,7 @@ impl OperatorContract {
             caps: ResourceCaps::default(),
             privacy: PrivacyPolicy::default(),
             selected_mechanisms: Vec::new(),
+            active_reference_mechanisms: Vec::new(),
         }
     }
 
@@ -725,6 +751,16 @@ impl OperatorContract {
             .map(|m| m.as_str())
             .collect();
         out.push(format!("mechanisms_enabled={}", enabled.join(",")));
+        // Deferred-reference mechanisms ACTIVE on the wire (fix #4: report matches wire).
+        let active_ref: Vec<&str> = self
+            .active_reference_mechanisms
+            .iter()
+            .map(|m| m.as_str())
+            .collect();
+        out.push(format!(
+            "mechanisms_active_reference={}",
+            active_ref.join(",")
+        ));
         out.push(format!(
             "diagnostics_opt_in={}",
             self.privacy.diagnostics_opt_in
@@ -779,6 +815,13 @@ impl OperatorContract {
                 .map(|m| m.as_str())
                 .collect();
             out.push(format!("  operator-selected overrides: {}", sel.join(",")));
+        }
+        // Deferred-reference mechanisms ACTIVE on the wire (fix #4: report matches wire).
+        for m in &self.active_reference_mechanisms {
+            out.push(format!(
+                "  {} = ACTIVE (deferred reference, prune-pending TASK-202)",
+                m.as_str()
+            ));
         }
         out.push(String::new());
 
@@ -1110,13 +1153,31 @@ mod tests {
         let ann = caps.announce_budget();
         assert_eq!(ann.max_replicas, 20);
         assert_eq!(caps.announce_distinct_paths_budget, 256);
-        // Every effective line is present and integer-valued (no float rendering).
+        // Every effective line is present and integer-valued (no float rendering); every
+        // ADVERTISED cap must be one that is actually enforced (fix #6: no phantom bounds).
         let lines = caps.effective_lines();
-        assert_eq!(lines.len(), 12);
+        assert_eq!(lines.len(), 9);
         for l in &lines {
             let v = l.split('=').nth(1).unwrap();
             assert!(v.parse::<u64>().is_ok(), "cap {l} is not an integer");
         }
+        // The three phantom (unenforced) caps must NOT be advertised.
+        let joined = lines.join("\n");
+        for phantom in [
+            "upload_rate_bytes_per_sec",
+            "max_concurrent_serves",
+            "max_file_descriptors",
+        ] {
+            assert!(
+                !joined.contains(phantom),
+                "unenforced cap {phantom} must not be advertised"
+            );
+        }
+        // The narinfo cap reported equals the value the disk cache actually enforces.
+        assert_eq!(
+            caps.narinfo_cache_max_entries,
+            crate::narinfo_cache::DEFAULT_MAX_ENTRIES as u64
+        );
     }
 
     // ---- AC#4/#7: status + preflight render from the contract ----------
