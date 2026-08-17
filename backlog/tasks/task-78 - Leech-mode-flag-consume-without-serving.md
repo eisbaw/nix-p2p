@@ -1,11 +1,11 @@
 ---
 id: TASK-78
 title: Leech-mode flag (consume without serving)
-status: In Progress
+status: Done
 assignee:
   - '@claude'
 created_date: '2026-08-09 21:02'
-updated_date: '2026-08-16 23:20'
+updated_date: '2026-08-17 00:11'
 labels:
   - wave-2b
 dependencies:
@@ -25,11 +25,11 @@ Cheap to implement, and it is the privacy answer to TASK-77's 'announcing reveal
 
 ## Acceptance Criteria
 <!-- AC:BEGIN -->
-- [ ] #1 A leech-mode flag disables serving AND announcing; a leech node still fetches from peers successfully, and peers cannot obtain content from it (verified from the peer side, not the leech's self-report)
-- [ ] #2 Leech mode is observable in the profiling report, and the harness can run a swarm with a configurable leech FRACTION so the effect on offload can be modelled
-- [ ] #3 Honest statement of what a high leech fraction does to the value thesis, measured on the testbed rather than asserted
-- [ ] #4 Serving and publication are disabled through transport/discovery-agnostic capabilities; the Iroh milestone proves them first and every later registered backend must pass the same remote-observation contract.
-- [ ] #5 Lookup-side exposure is measured and documented per enabled mechanism; consume-only/leech mode never claims to hide queries it still sends, and TASK-119 verifies the later BitTorrent integration.
+- [x] #1 A leech-mode flag disables serving AND announcing; a leech node still fetches from peers successfully, and peers cannot obtain content from it (verified from the peer side, not the leech's self-report)
+- [x] #2 Leech mode is observable in the profiling report, and the harness can run a swarm with a configurable leech FRACTION so the effect on offload can be modelled
+- [x] #3 Honest statement of what a high leech fraction does to the value thesis, measured on the testbed rather than asserted
+- [x] #4 Serving and publication are disabled through transport/discovery-agnostic capabilities; the Iroh milestone proves them first and every later registered backend must pass the same remote-observation contract.
+- [x] #5 Lookup-side exposure is measured and documented per enabled mechanism; consume-only/leech mode never claims to hide queries it still sends, and TASK-119 verifies the later BitTorrent integration.
 <!-- AC:END -->
 
 ## Implementation Notes
@@ -97,4 +97,6 @@ check-no-floats, check-golden-vectors, check-discovery-no-shortcut --self-test,
 profile_p2p --self-test, just e2e 8/8 (libp2p-leech 15/15).
 
 CODEX DEEP GATE NO-GO on 5f57940. AC#2/#3 + float/wire PASS. AC#1/#4/#5 FAIL: (1) LeechFabric::inner() public, exposes masked server/announcer = bypassable; (2) e2e runs composite /bin/daemon whose leech branch does NOT use LeechFabric (different mechanism than the claimed capability seam); (3) oracle observes only fallback-after-DHT-miss so serve-only vs announce-only re-enable are NOT independently mutation-proven (negative control flips both axes together); (4) direct fabric test uses a bare empty node, not the mask over a content-bearing fabric (airtightness overclaimed). Fix: seal inner(); unify LeechFabric enforcement in BOTH binaries incl composite daemon so the e2e tests the seam; independent per-axis mutation proofs (a peer reaching the leech via injected/direct address gets NotHeld); mask-over-content test.
+
+CODEX RE-GATE: GO (commits 5f57940+79dd070). A peer cannot obtain content from either shipped leech path: no announce (discovery Miss) + direct dial reaches an unarmed serve slot -> NotHeld. inner() removed (field private, server()/announcer() unconditionally None); both binaries construct LeechFabric (daemon-libp2p threads it into daemon_core::run = functional; composite daemon fail-closed check); e2e leech runs /bin/daemon-libp2p so the capability seam is what is tested. Per-axis INDEPENDENT mutation proofs over a content-bearing fabric (serve-only reddens: NotHeld->unwrap+gate->bytes; announce-only reddens: Miss->announce->Found). AC#5 real: leech find_providers records ContentKey+NodeId into the shared exposure ledger. AC#2/#3 leech-fraction knob (exact rational) + directional offload, full campaign deferred to TASK-237. golden byte-identical, no float. Honest documented limit: wrapping an already-armed fabric would not revoke its gate - but production always builds the leech as a pure consumer. Unblocks TASK-120 (operator contract).
 <!-- SECTION:NOTES:END -->
