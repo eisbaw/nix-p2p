@@ -846,19 +846,23 @@ TASK-120 prerequisite. For every supported arm/profile:
   a forward-compat cost (it is the arbitrary-string *contract*, not the frozen
   golden, that admits it). A plausible future *single-locator* transport still
   decodes inertly, but a future *multi-field* transport is now a hard decode error
-  (a disclosed forward-compat cost). Separately, the worst-case **byte**
-  amplification (a well-shaped unknown-kind slot had a byte-unbounded single scalar,
-  so a hostile single-key `Have` could pad to the **64 KiB** frame, ~**744×**) is
-  now **CLOSED by TASK-223**: a per-offer serialized-byte cap
-  (`MAX_OFFER_WIRE_BYTES` = **2 KiB**, applied to every offer on the claim and both
-  hold-response paths) refuses any single offer over the cap, so one offer can no
-  longer fill the frame and a single-key `Have`'s offer content is at most
-  `MAX_OFFERS_PER_ANSWER × 2 KiB` — a fixed constant, not the frame. The cap was set
-  deliberately generous over any plausible legitimate locator (a max-length URL
-  fits under 2 KiB; loosening later is backward-safe, tightening is not). A residual
-  raw-JSON whitespace/escape inflation channel is universal, frame-bounded and
-  draft-codec-only, out of scope of the offer-body cap. The single-key hold-query
-  cell is supported for training on the same terms as the batch path.
+  (a disclosed forward-compat cost). Separately, **TASK-223** adds a per-offer
+  serialized-byte cap (`MAX_OFFER_WIRE_BYTES` = **2 KiB**, on every offer on the claim
+  and both hold-response paths) that bounds the **DECODED offer CONTENT** a single-key
+  `Have` can carry to at most `MAX_OFFERS_PER_ANSWER × 2 KiB` (≤ 8 KiB) — a fixed
+  structural invariant independent of the frame — with a ~2016 B single-locator
+  payload budget (2 KiB minus the ~32 B JSON wrapper), generous over every plausible
+  locator (iroh ticket ~400 B, multiaddr ~150 B, typical URL ≤ ~512 B; a maximum-length
+  ~2048 B URL would **not** fit and is not claimed to). This is **not** a
+  wire-amplification closure: raw-JSON whitespace/escape padding normalizes away under
+  the compact cap and is threat-equivalent (unknown bodies are never re-emitted), so
+  the raw **wire** stays frame-bounded at ~**744×** — within the frame-bounded /
+  cost-a-retry guarantee and tracked as **TASK-244**. The cap's value is what makes the
+  future binary codec (where whitespace vanishes) actually per-offer-bounded; loosening
+  it for a future large-locator transport is a coordinated network-wide rollout (an
+  over-cap offer hard-rejects the whole response and the resolver skips that peer — no
+  per-exchange self-heal). The single-key hold-query cell is supported for training on
+  the same terms as the batch path.
 - **Privacy:** `upstream_only` emits zero P2P publication/query/serve records;
   `consume_only` emits zero publication and serve records and reports each
   opted-in lookup recipient/exposure; `lan_share` emits zero packets/records to
@@ -893,9 +897,11 @@ training, not values this document may guess:
   paths (a list of identities is inexpressible), but **not literally**: a single
   identity-shaped **string** can still ride via the tag, an extra field name, or
   the value. That **TEXT residual is owned by TASK-227** — distinct from **TASK-223
-  (landed)**, which bounds byte VOLUME (the ~744× padding) with a per-offer 2 KiB
-  serialized-byte cap: a byte cap does not eliminate identity naming, since one
-  accepted unasked identity is already the defect regardless of its length. Per
+  (landed)**, whose per-offer 2 KiB serialized-byte cap bounds the DECODED offer
+  CONTENT (≤ 4 × 2 KiB), not the raw wire (whitespace/escape padding keeps the wire
+  frame-bounded at ~744×, tracked as **TASK-244**): a byte cap does not eliminate
+  identity naming, since one accepted unasked identity is already the defect
+  regardless of its length. Per
   orchestrator arbitration the TEXT residual is format-cleanliness (a hostile
   responder naming fake identities is not an honest-peer-holdings leak), hence Low
   urgency but a real defect to own; literal closure is possible at a forward-compat

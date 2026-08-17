@@ -629,12 +629,13 @@ fn offer_within_byte_cap(value: &Value) -> Result<(), String> {
 /// SINGLE-locator transport is preserved, a future MULTI-field one is now
 /// rejected (see the helper doc's disclosed costs). A TEXT residual remains
 /// (task-227): identity-shaped text can still ride in the tag, a field name, or
-/// the single string value. The BYTE VOLUME of that residual is bounded here too
-/// (TASK-223, [`offer_within_byte_cap`]): every element - known or unknown - is
-/// refused if its serialized size exceeds [`MAX_OFFER_WIRE_BYTES`], so a single
-/// offer can no longer pad the frame. The identical rules guard
-/// [`deserialize_transport_slots`] (the shared hold-response path); the two are
-/// kept in step by `the_slot_and_drop_transport_decoders_agree`.
+/// the single string value. The DECODED CONTENT volume of each element is bounded
+/// here too (TASK-223, [`offer_within_byte_cap`]): every element - known or unknown -
+/// is refused if its serialized size exceeds [`MAX_OFFER_WIRE_BYTES`]. This bounds
+/// decoded offer content, NOT the raw wire (whitespace/escape padding normalizes away
+/// and stays frame-bounded, TASK-244 - see [`MAX_OFFER_WIRE_BYTES`]). The identical
+/// rules guard [`deserialize_transport_slots`] (the shared hold-response path); the
+/// two are kept in step by `the_slot_and_drop_transport_decoders_agree`.
 fn deserialize_known_transports<'de, D>(deserializer: D) -> Result<Vec<KnownTransport>, D::Error>
 where
     D: serde::Deserializer<'de>,
@@ -802,17 +803,15 @@ pub struct HoldQuery {
 /// could name a LIST of identities is REJECTED, so it cannot list-smuggle on the
 /// wire (a TEXT residual - single identity-shaped strings via tag/field-name/
 /// value - remains, owned by task-227; the byte VOLUME is bounded by TASK-223).
-/// This COUNT bound alone does not bound the message BYTES, but a per-offer BYTE cap
-/// now does (TASK-223, [`offer_within_byte_cap`] / [`MAX_OFFER_WIRE_BYTES`]): each
-/// offer is refused if its serialized size exceeds the cap, so a hostile peer can no
-/// longer pad a single-key `Have` toward [`MAX_CLAIM_WIRE_BYTES`] (64 KiB) with even
-/// one fat unknown offer. A one-key `Have`'s offer content is thus at most
-/// `MAX_OFFERS_PER_ANSWER * MAX_OFFER_WIRE_BYTES` - a FIXED constant, not the frame -
-/// identical on the batch path. The cap was deliberately set GENEROUS (a future
-/// transport's legitimate locator may be large; loosening later is backward-safe),
-/// so it bounds the byte VOLUME without refusing any plausible locator; raw
-/// JSON whitespace/escape inflation is a separate frame-bounded, draft-codec residual
-/// (see [`MAX_OFFER_WIRE_BYTES`]).
+/// The per-offer BYTE cap (TASK-223, [`offer_within_byte_cap`] /
+/// [`MAX_OFFER_WIRE_BYTES`]) refuses any offer whose serialized size exceeds the cap,
+/// which bounds the DECODED offer CONTENT a one-key `Have` can carry to at most
+/// `MAX_OFFERS_PER_ANSWER * MAX_OFFER_WIRE_BYTES` (<= 4 * 2 KiB = 8 KiB), a FIXED
+/// constant independent of the frame, identical on the batch path. This is NOT a
+/// wire-amplification closure: raw-JSON whitespace/escape padding normalizes away
+/// under the compact cap, so the RAW WIRE stays frame-bounded (~744x) - a separate,
+/// frame-bounded, draft-codec-only residual tracked as TASK-244. See
+/// [`MAX_OFFER_WIRE_BYTES`] for what the cap does and does not deliver.
 ///
 /// NOTE THE MISSING `Deserialize` (same reason as [`BatchHoldResponse`]): the
 /// bound is only a bound if the validator is the ONLY path from bytes. Unknown
@@ -968,63 +967,84 @@ pub const MAX_OFFERS_PER_ANSWER: usize = 4;
 /// via [`deserialize_known_transports`]; the single-key AND batch hold-response
 /// offer dictionaries via [`deserialize_transport_slots`]).
 ///
-/// ## The residual this closes (the byte VOLUME channel)
-/// The COUNT/kind bound ([`check_single_offer_bindings`] /
-/// [`check_batch_offer_bindings`]) and the SHAPE bound
-/// ([`reject_enumeration_shaped_unknown_offer`], TASK-224) leave the offer BYTE
-/// volume unbounded: a tolerated unknown-kind offer is `{"transport":<tag>,[<field>:
-/// <string>]}`, and the tag string, the extra field NAME, and its scalar string
-/// VALUE are each byte-unbounded. So a hostile single-key `Have` (or a one-answer
-/// batch response) could pad a SINGLE dropped unknown offer up to the 64 KiB frame
-/// ([`MAX_CLAIM_WIRE_BYTES`]) - measured ~744x wire amplification against an ~88 B
-/// query, unchanged by TASK-110/224 and identical on the batch path. This cap makes
-/// one offer unable to fill the frame: each offer is <= this many canonical bytes,
-/// so a single-key `Have`'s offer content is at most
-/// `MAX_OFFERS_PER_ANSWER * MAX_OFFER_WIRE_BYTES` (a FIXED constant, independent of
-/// the frame), collapsing the "one fat offer" vector from ~744x to a small fixed
-/// multiple. See `a_padded_unknown_kind_have_is_rejected_by_the_per_offer_byte_cap`.
+/// ## What this ACTUALLY delivers (read this before citing a number)
+/// This is NOT a WIRE-amplification closure, and this doc must never say it is (that
+/// was the TASK-110 claim-honesty trap, re-flagged by codex+mped on the first cut of
+/// TASK-223). The cap measures the COMPACT re-serialization of each offer, so raw
+/// JSON inter-token WHITESPACE and `\uXXXX` escapes NORMALIZE AWAY and do not count:
+/// a mostly-whitespace 64 KiB response carrying <= 4 tiny offers passes this cap and
+/// every other gate, so the RAW WIRE amplification stays ~744x (64 KiB frame / an
+/// ~88 B query), exactly as before. And because an unknown offer body is never
+/// retained or re-emitted (it is dropped after counting), whitespace padding is
+/// THREAT-EQUIVALENT to a padded scalar - the peer spends the same bytes to the same
+/// non-effect - so bounding the offer's content does not reduce the wire threat.
+/// That residual wire padding is WITHIN the project guarantee (a hostile peer's
+/// oversize-but-under-frame response is frame-bounded and costs at most a retry) and
+/// is tracked separately as TASK-244.
 ///
-/// ## Why 2 KiB, and why deliberately GENEROUS rather than maximally tight
-/// The bound must give GENEROUS headroom over any plausible LEGITIMATE single
-/// locator, because mped deferred a byte cap at TASK-110 precisely on the worry that
-/// a FUTURE transport's legitimate locator may itself be large. Concretely: an iroh
-/// `NodeId` is 32 B (64 hex); a full iroh ticket (node + relay URL + a few direct
-/// addrs, base32) is ~200-400 B; a libp2p multiaddr, even relayed, is ~150 B; a
-/// BitTorrent infohash is 40-64 hex; the largest single-scalar locator any plausible
-/// future transport would carry is a URL, whose practical maximum (the ~2048 B
-/// browser address-bar limit) still fits UNDER 2 KiB. So 2 KiB (2048) accommodates
-/// even a maximum-practical-length URL with the whole offer wrapper, and is >17x the
-/// largest offer this build emits (a `bittorrent` offer is ~114 B) and >40x the
-/// tolerated `carrier_pigeon` golden (46 B). No known or realistically-projected
-/// legitimate locator is close to it.
+/// What the cap DOES buy, precisely:
+///  1. A FIXED DECODED offer-CONTENT bound. Each accepted offer carries at most this
+///     many canonical bytes, so a single-key `Have`'s decoded offer content is at
+///     most `MAX_OFFERS_PER_ANSWER * MAX_OFFER_WIRE_BYTES` (<= 4 * 2 KiB = 8 KiB),
+///     INDEPENDENT of the 64 KiB frame. That is a real structural invariant on how
+///     much offer content one answer can carry - not a wire-byte claim. (Measured in
+///     DECODED offer-content bytes: 8 KiB / an 88 B query. Do NOT restate this as a
+///     wire-amplification ratio; the wire is whitespace-padded to the frame per the
+///     paragraph above.)
+///  2. FORWARD-PORTABILITY. Under the planned binary codec (see the module `Codec`
+///     note) whitespace/escape inflation VANISHES, so this per-offer cap becomes the
+///     BINDING wire constraint on offer size. Freezing the value now is what makes
+///     the future binary wire actually bounded per offer.
+///  3. DEFENSE-IN-DEPTH. It removes the "one fat offer" affordance at the JSON layer
+///     even though the frame gate already bounds the total, so a single offer can
+///     never be the whole message's bulk.
 ///
-/// LOOSENING this later is BACKWARD-SAFE: a newer decoder that accepts a larger
-/// offer than an older one is a SOFT version-skew (the older peer refuses one
-/// oversized message and the exchange retries), NOT a network split - unlike
-/// TIGHTENING it, which would start refusing a wire older peers accept. That
-/// asymmetry is the reason to pick a value that is safe NOW (generous) rather than
-/// maximally tight: the cost of being a little loose is a slightly larger fixed
-/// amplification constant (still far below the frame), while the cost of being a
-/// little tight is refusing a legitimate future locator. Both a per-offer cap (this)
-/// and a per-Have total would close the channel; per-offer is chosen because it is a
-/// single uniform rule that lives once and applies identically to every slot on
-/// every route (the batch offer dictionary is a per-RESPONSE dictionary, so a
-/// "per-Have total" is ambiguous there, whereas a per-offer bound is not).
+/// Pinned by `a_padded_unknown_kind_have_is_rejected_by_the_per_offer_byte_cap`
+/// (an over-cap offer is refused) and the exact-boundary vectors
+/// `an_offer_of_exactly_the_cap_is_accepted` / `an_offer_one_byte_over_the_cap_is_rejected`.
 ///
-/// ## What this does NOT close (honest scope)
-/// This bounds the canonical CONTENT bytes of each offer. It does NOT bound raw
-/// JSON transport inflation - inter-token WHITESPACE and `\uXXXX` string escapes -
-/// which serde tolerates and which re-serialization normalizes away, so it does not
-/// count against this cap. That inflation is a DISTINCT, PRE-EXISTING residual: it
-/// is UNIVERSAL (a hostile peer can whitespace-pad ANY message, even an `Absent`
-/// one, not just an offer), it carries NO content, it is bounded by the same 64 KiB
-/// frame gate as before, and it VANISHES under the final binary codec (the JSON here
-/// is an explicit draft - see the module `Codec` note). It is therefore a
-/// frame/codec-level concern, not an offer-body channel, and is out of scope for
-/// this per-offer cap. The identity-NAMING residual (that ONE short identity-shaped
-/// string can still ride in the tag/field-name/value) is a different concern again,
-/// owned by TASK-227 and NOT dischargeable by any byte cap (one accepted identity is
-/// already the defect, regardless of its length).
+/// ## Why 2 KiB, and the PAYLOAD budget it actually grants
+/// The cap counts the WHOLE serialized offer - the `{"transport":"<tag>","<field>":
+/// "<locator>"}` wrapper AND the locator payload - not the payload alone. The wrapper
+/// (tag + one field name + JSON punctuation) is ~32 B for a short tag/field, so the
+/// supported single-locator PAYLOAD budget is roughly `2048 - ~32 = ~2016 B`, not a
+/// full 2048 B of locator. That budget still clears every plausible LEGITIMATE single
+/// locator with large headroom: an iroh `NodeId` is 32 B (64 hex); a full iroh ticket
+/// (node + relay URL + a few direct addrs, base32) is ~200-400 B; a libp2p multiaddr,
+/// even relayed, is ~150 B; a BitTorrent infohash is 40-64 hex; a typical locator URL
+/// is <= ~512 B. (Do NOT claim it fits a maximum-length ~2048 B URL - a 2048 B URL
+/// plus the wrapper is ~2080 B and would be REJECTED; ~2016 B is the honest payload
+/// ceiling, ~4x a long URL and >5x a full iroh ticket.) It is >17x the largest offer
+/// this build emits (a `bittorrent` offer is ~114 B) and >40x the tolerated
+/// `carrier_pigeon` golden (46 B). No known or realistically-projected legitimate
+/// locator is close to it, and mped deferred a byte cap at TASK-110 precisely on the
+/// worry that a FUTURE locator may be large - ~2016 B of payload headroom answers
+/// that worry while still foreclosing the one-fat-offer affordance.
+///
+/// Chosen GENEROUS rather than maximally tight, but the safety of loosening it is
+/// NOT "soft version-skew / retry" - be precise: an over-cap offer HARD-REJECTS the
+/// WHOLE response, discarding any co-located KNOWN offers in the same message, and an
+/// OLD peer that later meets a future transport whose legitimate locator exceeds this
+/// cap does NOT self-heal by retrying - the resolver simply SKIPS that peer for that
+/// content. So the correct way to ship such a transport is to LOOSEN the cap
+/// NETWORK-WIDE (in every deployed decoder) BEFORE the transport ships; loosening is
+/// backward-compatible in that a newer, larger cap still accepts everything an older
+/// decoder did, but it is a coordinated rollout, not a per-exchange retry. Picking a
+/// generous value NOW minimizes the chance of ever needing that rollout. Both a
+/// per-offer cap (this) and a per-Have total would bound decoded offer content;
+/// per-offer is chosen because it is a single uniform rule that lives once and
+/// applies identically to every slot on every route (the batch offer dictionary is a
+/// per-RESPONSE dictionary, so a "per-Have total" is ambiguous there, whereas a
+/// per-offer bound is not).
+///
+/// ## What this does NOT bound (honest scope)
+/// (a) RAW WIRE bytes - inter-token WHITESPACE and `\uXXXX` escapes normalize away
+/// and are frame-bounded only; UNIVERSAL (a hostile peer can whitespace-pad ANY
+/// message, even an `Absent` one), carrying no content, and gone under the binary
+/// codec. Tracked as TASK-244. (b) The identity-NAMING residual - ONE short
+/// identity-shaped string can still ride in the tag/field-name/value; owned by
+/// TASK-227 and NOT dischargeable by any byte cap (one accepted identity is already
+/// the defect, regardless of length).
 pub const MAX_OFFER_WIRE_BYTES: usize = 2 * 1024;
 
 /// A probe about MANY content identities at once: "of these N NarHashes, which do
@@ -1076,9 +1096,10 @@ pub struct BatchHoldQuery {
 /// remains (task-227): identity-shaped text via the tag, a field name, or the
 /// single string value. It also carries the SAME per-offer BYTE cap (TASK-223,
 /// [`offer_within_byte_cap`] / [`MAX_OFFER_WIRE_BYTES`]): every element, known or
-/// unknown, whose serialized size is over the cap is refused, so neither the batch
-/// nor the single-key hold-response path (both decode through here) can be padded to
-/// the frame by a single fat offer.
+/// unknown, whose serialized size is over the cap is refused, bounding the DECODED
+/// offer CONTENT on both the batch and single-key hold-response paths (both decode
+/// through here). This bounds decoded content, NOT the raw wire (whitespace/escape
+/// padding is frame-bounded only, TASK-244).
 /// Proven identical across the batch and single-key paths (and the claim path) by
 /// `an_unknown_kind_offer_cannot_name_content_ids_on_the_wire_on_both_paths` and
 /// `the_slot_and_drop_transport_decoders_agree`.
@@ -1506,28 +1527,29 @@ fn compact_offer_slots(
 ///    extra field name, or the value (TEXT residual, TASK-227 - NOT a byte cap,
 ///    since one accepted identity is already the defect). Pinned by
 ///    `an_unknown_kind_offer_cannot_name_content_ids_on_the_wire_on_both_paths`.
-/// B. BYTE amplification (TASK-223, now CLOSED for the offer-body channel). THIS
-///    function is a COUNT bound, not a BYTE bound: on its own, a well-shaped
+/// B. Byte handling (TASK-223 for DECODED offer content; TASK-244 for the wire).
+///    THIS function is a COUNT bound, not a BYTE bound: on its own, a well-shaped
 ///    unknown-kind slot has a byte-unbounded single scalar, so a hostile `Have`
 ///    could pad to [`MAX_CLAIM_WIRE_BYTES`] (64 KiB, ~744x) with as few as one
 ///    dropped offer - the count cap of 4 never even engaging. So the "3.75x" figure
 ///    is the LEGITIMATE (known-only) case, NOT the hostile worst case; do not read it
-///    as the latter. That byte volume is now bounded SEPARATELY by the per-offer cap
-///    [`offer_within_byte_cap`] ([`MAX_OFFER_WIRE_BYTES`] = 2 KiB), applied in the
-///    slot deserializers before this count check ever runs: each offer is refused
-///    over the cap, so a single-key `Have`'s offer content is at most
-///    `MAX_OFFERS_PER_ANSWER * MAX_OFFER_WIRE_BYTES` (a fixed constant, not the
-///    frame). Pinned by
+///    as the latter. The per-offer cap [`offer_within_byte_cap`]
+///    ([`MAX_OFFER_WIRE_BYTES`] = 2 KiB), applied in the slot deserializers before
+///    this count check runs, bounds the DECODED offer CONTENT a single-key `Have` can
+///    carry to at most `MAX_OFFERS_PER_ANSWER * MAX_OFFER_WIRE_BYTES` (<= 8 KiB, a
+///    fixed constant independent of the frame). It is NOT a wire-amplification
+///    closure: raw-JSON whitespace/escape padding normalizes away under the compact
+///    cap, so the RAW WIRE stays frame-bounded (~744x) - a separate residual tracked
+///    as TASK-244. Pinned by
 ///    `a_padded_unknown_kind_have_is_rejected_by_the_per_offer_byte_cap`. The cap is
 ///    deliberately GENEROUS (a future transport's legitimate locator may be large;
-///    loosening it later is backward-safe, tightening is not). Three DISTINCT
-///    concerns, three owners: TASK-224 closes naming a LIST (structure); TASK-227
-///    owns eliminating identity-shaped TEXT in the one remaining scalar
-///    (tag/field-name/value); TASK-223 bounds the BYTE VOLUME. A byte cap (223) does
-///    not discharge 227: one accepted short identity is already the defect, whatever
-///    its length. A raw-JSON whitespace/escape inflation residual (universal,
-///    frame-bounded, draft-codec-only) is out of scope of the offer-body cap - see
-///    [`MAX_OFFER_WIRE_BYTES`].
+///    loosening it later is a coordinated network-wide rollout, NOT a per-exchange
+///    retry - see [`MAX_OFFER_WIRE_BYTES`]). Distinct concerns, distinct owners:
+///    TASK-224 closes naming a LIST (structure); TASK-227 owns eliminating
+///    identity-shaped TEXT in the one remaining scalar (tag/field-name/value);
+///    TASK-223 bounds the DECODED offer-content VOLUME; TASK-244 owns the raw-wire
+///    whitespace residual. A byte cap (223) does not discharge 227: one accepted
+///    short identity is already the defect, whatever its length.
 ///
 /// The COUNT/kind rule is this task's scope, matching the batch path's SEMANTIC
 /// bound; that is what this does. The enumeration SHAPE rule (A) is TASK-224's.
@@ -2668,11 +2690,13 @@ mod tests {
         // KNOWN-offer count/enumeration. The unknown-KIND content-id LIST vector is
         // now ALSO closed, separately (TASK-224 structural half,
         // `an_unknown_kind_offer_cannot_name_content_ids_on_the_wire_on_both_paths`).
-        // ONE residual remains DISTINCT from this count bound: the TEXT residual -
+        // Residuals remain DISTINCT from this count bound: the TEXT residual -
         // a single identity-shaped string via tag/field-name/value (TASK-227,
-        // `an_unknown_kind_offer_text_residual_is_documented_not_closed`). The hostile
-        // byte-padding volume (formerly ~744x) is now CLOSED by the per-offer byte cap
-        // (TASK-223, `a_padded_unknown_kind_have_is_rejected_by_the_per_offer_byte_cap`).
+        // `an_unknown_kind_offer_text_residual_is_documented_not_closed`); and the raw
+        // WIRE padding via whitespace/escapes, still frame-bounded ~744x (TASK-244).
+        // The per-offer byte cap (TASK-223,
+        // `a_padded_unknown_kind_have_is_rejected_by_the_per_offer_byte_cap`) bounds
+        // DECODED offer CONTENT (<= 4 * 2 KiB), NOT the raw wire.
         let after = HoldResponse {
             schema_version: QUERY_SCHEMA_VERSION,
             answer: HoldAnswer::Have {
@@ -2701,16 +2725,17 @@ mod tests {
     fn a_padded_unknown_kind_have_is_rejected_by_the_per_offer_byte_cap() {
         // FROZEN DECODER-ACCEPTANCE NARROWING (task-223 - this REPLACES the earlier
         // task-110/224 honesty oracle that pinned the padded unknown Have DECODING to
-        // empty at ~744x wire cost; that residual is now closed, so the oracle flips
+        // empty; the per-offer cap now REJECTS an over-cap offer, so the oracle flips
         // from "decodes empty" to "rejected").
         // Before task-223 the count/kind + shape rules were a COUNT/STRUCTURE bound,
-        // not a BYTE bound: a WELL-SHAPED unknown-kind offer (tag + ONE scalar string,
-        // admitted by task-224) had a byte-unbounded scalar, so a hostile peer could
-        // pad a single-key `Have` up to the 64 KiB frame with as few as ONE dropped
-        // offer (~744x, the count cap of 4 never engaging). The per-offer byte cap
-        // (`offer_within_byte_cap`, `MAX_OFFER_WIRE_BYTES` = 2 KiB) now REFUSES that
-        // offer: it is over the cap, so the whole decode errors rather than accepting
-        // (then dropping) a frame-filling offer.
+        // not a per-offer BYTE bound: a WELL-SHAPED unknown-kind offer (tag + ONE
+        // scalar string, admitted by task-224) had a byte-unbounded scalar, so a
+        // single dropped offer's CONTENT could reach the 64 KiB frame. The per-offer
+        // cap (`offer_within_byte_cap`, `MAX_OFFER_WIRE_BYTES` = 2 KiB) now REFUSES
+        // that offer, bounding DECODED offer CONTENT (this is NOT a wire-amplification
+        // fix: whitespace/escape padding keeps the raw wire frame-bounded ~744x,
+        // TASK-244). It errors the whole decode rather than accepting-then-dropping a
+        // content-fat offer.
         //
         // BITE (AC#1): removing the `offer_within_byte_cap` call in the slot
         // deserializer re-admits this wire (it decodes, dropping the unknown kind,
@@ -2737,9 +2762,10 @@ mod tests {
              right boundary"
         );
         // The per-offer BYTE cap REJECTS it - decode returns Err, so no
-        // `HoldAnswer::Have` (empty or otherwise) is ever handed back. The ~744x
-        // one-fat-offer padding vector is closed: a single offer can no longer fill
-        // the frame.
+        // `HoldAnswer::Have` (empty or otherwise) is ever handed back. This bounds the
+        // DECODED offer CONTENT one offer may carry (the CONTENT-fat offer is refused);
+        // it is NOT a wire-amplification closure (whitespace/escape padding keeps the
+        // raw wire frame-bounded ~744x, TASK-244).
         assert!(
             matches!(
                 decode_hold_response(&wire),
@@ -2802,8 +2828,9 @@ mod tests {
         // and batch hold-response paths share `deserialize_transport_slots`, so the
         // per-offer byte cap bounds BOTH. This pins the batch path directly: a batch
         // response whose one referenced offer is an over-cap unknown-kind slot is
-        // REJECTED, identical to the single-key path - a hostile peer cannot pad a
-        // one-answer batch response to the frame with one fat offer either.
+        // REJECTED, identical to the single-key path - so a single offer's DECODED
+        // CONTENT is bounded on the batch path too (raw-wire whitespace padding is a
+        // separate frame-bounded residual, TASK-244).
         //
         // BITE (AC#3): removing the shared `offer_within_byte_cap` call re-admits this
         // batch wire (proving the batch path is bounded by the SAME code, not a copy
@@ -2831,6 +2858,120 @@ mod tests {
             ),
             "a batch response padded with one over-cap unknown offer must be REJECTED \
              on the batch path too"
+        );
+    }
+
+    #[test]
+    fn the_per_offer_cap_constant_is_pinned() {
+        // FREEZE VALUE PIN (task-223): the exact cap is part of the freeze. Without
+        // this, the boundary vectors below still pass if the constant drifts to a
+        // nearby value together with them; this assertion makes the VALUE itself a
+        // mutation target (2048 -> 2100 reddens here).
+        assert_eq!(
+            MAX_OFFER_WIRE_BYTES, 2048,
+            "the per-offer byte cap value is frozen at 2048; changing it is a \
+             deliberate, reviewed re-freeze (see the constant's doc)"
+        );
+    }
+
+    /// Build a single unknown-kind offer whose COMPACT serialized size is EXACTLY
+    /// `target` bytes: `{"transport":"future_bulk","loc":"z…"}` with the payload
+    /// sized to hit the target. Returns the offer's serialized JSON. Asserts the
+    /// length is exactly `target`, so the boundary the test claims to pin is real.
+    fn offer_of_serialized_size(target: usize) -> String {
+        let wrapper =
+            serde_json::to_string(&serde_json::json!({ "transport": "future_bulk", "loc": "" }))
+                .unwrap()
+                .len();
+        let payload = target
+            .checked_sub(wrapper)
+            .expect("target must exceed the wrapper size");
+        let offer = serde_json::json!({ "transport": "future_bulk", "loc": "z".repeat(payload) });
+        let json = serde_json::to_string(&offer).unwrap();
+        assert_eq!(
+            json.len(),
+            target,
+            "the constructed offer must serialize to exactly {target} bytes"
+        );
+        json
+    }
+
+    #[test]
+    fn an_offer_of_exactly_the_cap_is_accepted() {
+        // BOUNDARY PIN (task-223): an offer whose compact serialized size is EXACTLY
+        // 2048 (the frozen cap) is ACCEPTED (the cap is `<=`, not `<`). The literal
+        // 2048 is deliberate, NOT `MAX_OFFER_WIRE_BYTES`, so the boundary is pinned
+        // independently of the constant: changing `>` to `>=` in `offer_within_byte_cap`
+        // reddens THIS test (the at-cap offer would then be rejected). It decodes
+        // inertly (the unknown kind is dropped), so the accepted Have has empty offers.
+        let offer = offer_of_serialized_size(2048);
+        let wire = format!(
+            "{{\"schema_version\":{QUERY_SCHEMA_VERSION},\"answer\":\"have\",\
+             \"blake3\":\"{BLAKE3_HEX}\",\"offers\":[{offer}]}}"
+        );
+        let decoded = decode_hold_response(wire.as_bytes())
+            .expect("an offer at exactly the cap must be ACCEPTED (cap is inclusive)");
+        assert_eq!(
+            decoded.answer,
+            HoldAnswer::Have {
+                blake3: blake3_id(),
+                offers: vec![],
+            },
+            "the at-cap unknown offer is accepted then dropped inertly"
+        );
+    }
+
+    #[test]
+    fn an_offer_one_byte_over_the_cap_is_rejected() {
+        // BOUNDARY PIN (task-223): an offer of EXACTLY 2049 bytes (one over the frozen
+        // cap) is REJECTED. The literal 2049 is deliberate, NOT
+        // `MAX_OFFER_WIRE_BYTES + 1`, so the vector is FIXED: raising the constant
+        // (e.g. 2048 -> 2100) reddens THIS test (the 2049-byte offer would then be
+        // under the new cap and accepted). Together with the at-cap accept test above,
+        // the frozen boundary is exactly [.. 2048] accept / [2049 ..] reject.
+        let offer = offer_of_serialized_size(2049);
+        let wire = format!(
+            "{{\"schema_version\":{QUERY_SCHEMA_VERSION},\"answer\":\"have\",\
+             \"blake3\":\"{BLAKE3_HEX}\",\"offers\":[{offer}]}}"
+        );
+        assert!(
+            matches!(
+                decode_hold_response(wire.as_bytes()),
+                Err(ClaimCodecError::Malformed(_))
+            ),
+            "an offer one byte over the cap must be REJECTED (cap threshold is exact)"
+        );
+    }
+
+    #[test]
+    fn a_batch_response_with_an_under_cap_unknown_offer_is_accepted() {
+        // FORWARD-COMPAT on the BATCH path (task-223): the batch accept-under-cap twin
+        // of the single-key `a_legit_sized_offer_under_the_byte_cap_is_still_accepted`.
+        // A batch response referencing a well-shaped UNDER-cap unknown offer decodes:
+        // the unknown kind is dropped (its Have's offer_indices compacts to empty), the
+        // response is accepted. Proves the batch cap tolerates a legit-sized offer, not
+        // just that it rejects an over-cap one.
+        let plausible_locator = "n".repeat(1024); // ~1 KiB, under the 2 KiB cap
+        let wire = format!(
+            "{{\"schema_version\":{QUERY_SCHEMA_VERSION},\"offers\":[\
+             {{\"transport\":\"future_bulk\",\"loc\":\"{plausible_locator}\"}}],\
+             \"answers\":[{{\"answer\":\"have\",\"blake3\":\"{BLAKE3_HEX}\",\
+             \"offer_indices\":[0]}}]}}"
+        );
+        let decoded = decode_batch_hold_response(wire.as_bytes(), 1)
+            .expect("a batch response with a well-shaped under-cap unknown offer decodes");
+        assert_eq!(
+            decoded.offers,
+            vec![],
+            "the under-cap unknown offer is dropped"
+        );
+        assert_eq!(
+            decoded.answers,
+            vec![BatchHoldAnswer::Have {
+                blake3: blake3_id(),
+                offer_indices: vec![],
+            }],
+            "the Have's index list compacts to empty after the unknown offer is dropped"
         );
     }
 
