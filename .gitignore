@@ -32,3 +32,6 @@ __pycache__/
 /artifacts/iroh-lookup/
 /artifacts/iroh-publication/
 /artifacts/decentralized-content-discovery/
+
+# hypothesis example DB (prop_tests.py uses database=None, but ignore any stray dir)
+/.hypothesis/

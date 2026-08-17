@@ -37,6 +37,10 @@ pub mod observ;
 pub mod operator;
 pub mod peer_source;
 pub mod post_fetch;
+// Property-test support (TASK-112): the shared, determinism-controlled proptest
+// runner used by the `prop_*` tests in `claim` and `narinfo_cache`. Test-only.
+#[cfg(test)]
+mod prop_support;
 pub mod public_allowlist;
 pub mod rewrite;
 pub mod run;

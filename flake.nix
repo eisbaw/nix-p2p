@@ -80,7 +80,13 @@
       # fixture and so cannot live in a sandboxed cargo test. The independence
       # check below keeps plain python3 - it needs no third-party module and
       # should not wait on one.
-      pythonEnv = pkgs.python3.withPackages (ps: [ ps.cryptography ps.blake3 ps.jsonschema ]);
+      #
+      # hypothesis drives the Python PROPERTY tests (scripts/prop_tests.py,
+      # TASK-112). It is added here and does NOT force pytest: hypothesis's
+      # `@given` wraps a plain function this repo calls directly through the same
+      # `--check`/`--explore` convention the other gate scripts use, so no test
+      # framework enters the closure (AC#5).
+      pythonEnv = pkgs.python3.withPackages (ps: [ ps.cryptography ps.blake3 ps.jsonschema ps.hypothesis ]);
 
       commonArgs = {
         inherit src;

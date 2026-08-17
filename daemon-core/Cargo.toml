@@ -84,6 +84,16 @@ tokio = { version = "1", features = ["rt-multi-thread", "net", "macros", "io-uti
 # decoding layer would change the bytes; hyper's low-level client has none).
 rcgen = { version = "0.14", default-features = false, features = ["crypto", "ring", "pem"] }
 flate2 = "1"
+# Property-based testing (TASK-112): proptest generates claim-wire / safe_key
+# inputs and SHRINKS a failure to a minimal reproducer (persisted to
+# .proptest-regressions). Determinism is this crate's own concern, not
+# proptest's default: `prop_support::runner` picks a FIXED seed for `just test`
+# and a FREE seed for `just prop`, so a randomized test lives in the
+# flake-gated fast suite without reintroducing the TASK-109 non-determinism.
+# NOT an HTTP/TLS stack and reachable only by daemon-core (never testproxy), so
+# the independence denylist is unaffected (AC#5). dev-dependency: out of every
+# shipped closure.
+proptest = "1"
 
 [lints]
 workspace = true

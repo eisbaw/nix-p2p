@@ -4245,3 +4245,335 @@ mod tests {
         assert!(serde_json::from_slice::<Slotted>(&at_cap_bytes).is_ok());
     }
 }
+
+// -------------------------------------------------------------------------
+// PROPERTY-BASED TESTS (TASK-112). The claim wire is the surface that cost the
+// 110->223->224->227 enumeration family ~9 cumulative codex NO-GO rounds by
+// hand; these properties STATE the invariants (round-trip, fail-closed, the
+// caps) instead of sampling them. Each is proven to BITE by mutation - see the
+// task report. Determinism policy: `crate::prop_support::runner` (FIXED seed in
+// `just test`, FREE seed in `just prop`).
+// -------------------------------------------------------------------------
+#[cfg(test)]
+mod properties {
+    use super::*;
+    use crate::prop_support::runner;
+    use proptest::array::{uniform20, uniform32};
+    use proptest::prelude::*;
+
+    // --- Generators for VALID wire values ---------------------------------
+
+    fn nar_key() -> impl Strategy<Value = NarHashKey> {
+        uniform32(any::<u8>()).prop_map(NarHashKey::from_sha256_bytes)
+    }
+    fn blake3() -> impl Strategy<Value = Blake3Digest> {
+        uniform32(any::<u8>()).prop_map(Blake3Digest::from_bytes)
+    }
+    fn node_id() -> impl Strategy<Value = NodeId> {
+        uniform32(any::<u8>()).prop_map(NodeId::from_bytes)
+    }
+    fn info_hash() -> impl Strategy<Value = BitTorrentInfoHash> {
+        prop_oneof![
+            uniform20(any::<u8>()).prop_map(BitTorrentInfoHash::v1),
+            uniform32(any::<u8>()).prop_map(BitTorrentInfoHash::v2),
+        ]
+    }
+    fn known_transport() -> impl Strategy<Value = KnownTransport> {
+        prop_oneof![
+            node_id().prop_map(|node| KnownTransport::Iroh { node }),
+            info_hash().prop_map(|infohash| KnownTransport::BitTorrent { infohash }),
+        ]
+    }
+
+    /// A generated VALID claim: real key, an optional whole-NAR payload, small
+    /// holder/transport/signature vectors, an optional relay blob. Every field a
+    /// v1 claim can carry, so the round-trip exercises them all. The vectors are
+    /// bounded so the serialized claim stays well under the frame.
+    fn a_claim() -> impl Strategy<Value = Claim> {
+        (
+            nar_key(),
+            prop::option::of(blake3().prop_map(|blake3| KnownPayload::WholeNar { blake3 })),
+            prop::collection::vec(node_id(), 0..6),
+            prop::collection::vec(known_transport(), 0..6),
+            prop::option::of("[a-zA-Z0-9]{0,64}".prop_map(|blob| SignedNarinfoRelay { blob })),
+            prop::collection::vec(
+                ("[a-zA-Z0-9]{0,16}", "[a-zA-Z0-9]{0,48}")
+                    .prop_map(|(key_id, sig)| ClaimSignature { key_id, sig }),
+                0..4,
+            ),
+        )
+            .prop_map(
+                |(key, payload, holders, transports, relay, signatures)| Claim {
+                    schema_version: CLAIM_SCHEMA_VERSION,
+                    key,
+                    payload,
+                    holders,
+                    transports,
+                    relay,
+                    signatures,
+                },
+            )
+    }
+
+    /// A generated VALID hold-response. A `Have` carries at most one offer per
+    /// transport KIND (the frozen single-identity-per-kind rule), so the offer
+    /// vector is (optional iroh, optional bittorrent) - always within the caps.
+    fn a_hold_response() -> impl Strategy<Value = HoldResponse> {
+        let have = (
+            blake3(),
+            prop::option::of(node_id()),
+            prop::option::of(info_hash()),
+        )
+            .prop_map(|(blake3, iroh, bt)| {
+                let mut offers = Vec::new();
+                if let Some(node) = iroh {
+                    offers.push(KnownTransport::Iroh { node });
+                }
+                if let Some(infohash) = bt {
+                    offers.push(KnownTransport::BitTorrent { infohash });
+                }
+                HoldResponse {
+                    schema_version: QUERY_SCHEMA_VERSION,
+                    answer: HoldAnswer::Have { blake3, offers },
+                }
+            });
+        prop_oneof![
+            have,
+            Just(HoldResponse {
+                schema_version: QUERY_SCHEMA_VERSION,
+                answer: HoldAnswer::Absent,
+            }),
+        ]
+    }
+
+    // --- P1: claim wire round-trip ----------------------------------------
+
+    /// decode(encode(claim)) == claim for every generated valid claim.
+    #[test]
+    fn prop_claim_wire_roundtrips() {
+        runner()
+            .run(&a_claim(), |claim| {
+                let bytes = encode_claim(&claim)
+                    .map_err(|e| TestCaseError::fail(format!("encode: {e}")))?;
+                let back = decode_claim(&bytes)
+                    .map_err(|e| TestCaseError::fail(format!("decode: {e}")))?;
+                prop_assert_eq!(claim, back);
+                Ok(())
+            })
+            .unwrap();
+    }
+
+    /// The shrunk counterexample committed as a NAMED example (AC#4): a claim
+    /// with a payload AND a transport - the shape the `deserialize_optional_
+    /// known_payload`-drops-everything mutation breaks. Locks that exact edge
+    /// even without proptest.
+    #[test]
+    fn example_claim_with_payload_and_transport_roundtrips() {
+        let claim = Claim {
+            schema_version: CLAIM_SCHEMA_VERSION,
+            key: NarHashKey::from_sha256_bytes([0x07; 32]),
+            payload: Some(KnownPayload::WholeNar {
+                blake3: Blake3Digest::from_bytes([0x09; 32]),
+            }),
+            holders: vec![NodeId::from_bytes([0x11; 32])],
+            transports: vec![KnownTransport::Iroh {
+                node: NodeId::from_bytes([0x11; 32]),
+            }],
+            relay: None,
+            signatures: vec![],
+        };
+        let bytes = encode_claim(&claim).expect("encode");
+        assert_eq!(decode_claim(&bytes).expect("decode"), claim);
+    }
+
+    // --- P2: hold-response round-trip -------------------------------------
+
+    /// decode(encode(response)) == response for every generated valid response.
+    #[test]
+    fn prop_hold_response_roundtrips() {
+        runner()
+            .run(&a_hold_response(), |response| {
+                let bytes = encode_hold_response(&response)
+                    .map_err(|e| TestCaseError::fail(format!("encode: {e}")))?;
+                let back = decode_hold_response(&bytes)
+                    .map_err(|e| TestCaseError::fail(format!("decode: {e}")))?;
+                prop_assert_eq!(response, back);
+                Ok(())
+            })
+            .unwrap();
+    }
+
+    /// Named example (AC#4): a Have carrying BOTH known offers - the shape the
+    /// `keep_known_offers` drop-one mutation breaks.
+    #[test]
+    fn example_have_with_both_offers_roundtrips() {
+        let response = HoldResponse {
+            schema_version: QUERY_SCHEMA_VERSION,
+            answer: HoldAnswer::Have {
+                blake3: Blake3Digest::from_bytes([0xaa; 32]),
+                offers: vec![
+                    KnownTransport::Iroh {
+                        node: NodeId::from_bytes([0x11; 32]),
+                    },
+                    KnownTransport::BitTorrent {
+                        infohash: BitTorrentInfoHash::v2([0xbb; 32]),
+                    },
+                ],
+            },
+        };
+        let bytes = encode_hold_response(&response).expect("encode");
+        assert_eq!(decode_hold_response(&bytes).expect("decode"), response);
+    }
+
+    // --- P3: fail-closed - never panic, oversize always rejected ----------
+
+    /// No decoder PANICS on arbitrary bytes (reaching the end of the closure is
+    /// the assertion) and the size cap rejects an oversize but otherwise VALID
+    /// claim. The second clause isolates `check_size`: the padded claim is valid
+    /// JSON for a `Claim`, so without the cap it would decode Ok - a decoder that
+    /// rejects it can only be rejecting on SIZE.
+    #[test]
+    fn prop_decoders_never_panic_on_arbitrary_bytes() {
+        runner()
+            .run(&prop::collection::vec(any::<u8>(), 0..4096), |bytes| {
+                // Each returns Ok or a typed error - never unwinds.
+                let _ = decode_claim(&bytes);
+                let _ = decode_hold_query(&bytes);
+                let _ = decode_hold_response(&bytes);
+                let _ = decode_batch_hold_query(&bytes);
+                let _ = decode_batch_hold_response(&bytes, 1);
+                Ok(())
+            })
+            .unwrap();
+    }
+
+    /// An oversize but WELL-FORMED claim (padded past the frame via the reserved
+    /// relay blob) is rejected on size by every decoder that takes bare bytes.
+    #[test]
+    fn prop_oversize_valid_claim_is_rejected_by_the_size_cap() {
+        let over = (MAX_CLAIM_WIRE_BYTES + 1)..=(MAX_CLAIM_WIRE_BYTES + 512);
+        runner()
+            .run(&over, |total| {
+                let key_str = NarHashKey::from_sha256_bytes([0u8; 32]).to_string();
+                let base = serde_json::to_vec(&serde_json::json!({
+                    "schema_version": CLAIM_SCHEMA_VERSION,
+                    "key": key_str,
+                    "holders": [],
+                    "relay": {"blob": ""},
+                }))
+                .unwrap()
+                .len();
+                let pad = total.saturating_sub(base).max(1);
+                let bytes = serde_json::to_vec(&serde_json::json!({
+                    "schema_version": CLAIM_SCHEMA_VERSION,
+                    "key": key_str,
+                    "holders": [],
+                    "relay": {"blob": "a".repeat(pad)},
+                }))
+                .unwrap();
+                prop_assert!(
+                    bytes.len() > MAX_CLAIM_WIRE_BYTES,
+                    "padding must exceed the frame: {} <= {}",
+                    bytes.len(),
+                    MAX_CLAIM_WIRE_BYTES
+                );
+                match decode_claim(&bytes) {
+                    Err(ClaimCodecError::Malformed(_)) => Ok(()),
+                    other => Err(TestCaseError::fail(format!(
+                        "oversize valid claim ({} B) must be rejected on size, got {other:?}",
+                        bytes.len()
+                    ))),
+                }
+            })
+            .unwrap();
+    }
+
+    // --- P4: the offer caps hold (the enumeration-family closer) -----------
+
+    /// The COUNT cap: a `Have` naming more than `MAX_OFFERS_PER_ANSWER` offers is
+    /// REJECTED, even when the excess are unknown-kind slots that would be dropped
+    /// (they are counted against the cap BEFORE the drop). Built as raw wire
+    /// because the typed encoder would itself refuse to construct it - which is
+    /// the point.
+    #[test]
+    fn prop_over_count_offers_are_rejected() {
+        let n = (MAX_OFFERS_PER_ANSWER + 1)..=32usize;
+        runner()
+            .run(&n, |n| {
+                // Distinct WELL-SHAPED unknown offers (string tag, no extra
+                // field): they pass the shape + byte checks, so it is the COUNT
+                // cap - not duplicate-known-kind or shape - that must trip.
+                let offers: Vec<serde_json::Value> = (0..n)
+                    .map(|i| serde_json::json!({"transport": format!("future{i}")}))
+                    .collect();
+                let bytes = serde_json::to_vec(&serde_json::json!({
+                    "schema_version": QUERY_SCHEMA_VERSION,
+                    "answer": "have",
+                    "blake3": Blake3Digest::from_bytes([0u8; 32]).to_string(),
+                    "offers": offers,
+                }))
+                .unwrap();
+                prop_assert!(
+                    decode_hold_response(&bytes).is_err(),
+                    "an answer naming {n} offers must be rejected by the count cap of {}",
+                    MAX_OFFERS_PER_ANSWER
+                );
+                Ok(())
+            })
+            .unwrap();
+    }
+
+    /// The per-offer BYTE cap: a single offer whose serialized size exceeds
+    /// `MAX_OFFER_WIRE_BYTES` is REJECTED (count of 1 is fine, so it is the byte
+    /// cap that trips).
+    #[test]
+    fn prop_over_byte_cap_offer_is_rejected() {
+        let pad = MAX_OFFER_WIRE_BYTES..=(MAX_OFFER_WIRE_BYTES + 256);
+        runner()
+            .run(&pad, |pad| {
+                let offer = serde_json::json!({"transport": "future", "loc": "a".repeat(pad)});
+                // Confirm the offer really is over the cap, so a green cannot be
+                // a too-small offer sneaking under it.
+                prop_assert!(serde_json::to_string(&offer).unwrap().len() > MAX_OFFER_WIRE_BYTES);
+                let bytes = serde_json::to_vec(&serde_json::json!({
+                    "schema_version": QUERY_SCHEMA_VERSION,
+                    "answer": "have",
+                    "blake3": Blake3Digest::from_bytes([0u8; 32]).to_string(),
+                    "offers": [offer],
+                }))
+                .unwrap();
+                prop_assert!(
+                    decode_hold_response(&bytes).is_err(),
+                    "an offer over the {MAX_OFFER_WIRE_BYTES}-byte cap must be rejected"
+                );
+                Ok(())
+            })
+            .unwrap();
+    }
+
+    /// Named example (AC#4): exactly `MAX_OFFERS_PER_ANSWER + 1` unknown offers -
+    /// the minimal count-cap breach - and one over-byte offer. Locks both caps.
+    #[test]
+    fn example_minimal_cap_breaches_are_rejected() {
+        let over_count: Vec<serde_json::Value> = (0..=MAX_OFFERS_PER_ANSWER)
+            .map(|i| serde_json::json!({"transport": format!("k{i}")}))
+            .collect();
+        let count_wire = serde_json::to_vec(&serde_json::json!({
+            "schema_version": QUERY_SCHEMA_VERSION,
+            "answer": "have",
+            "blake3": Blake3Digest::from_bytes([0u8; 32]).to_string(),
+            "offers": over_count,
+        }))
+        .unwrap();
+        assert!(decode_hold_response(&count_wire).is_err());
+
+        let byte_wire = serde_json::to_vec(&serde_json::json!({
+            "schema_version": QUERY_SCHEMA_VERSION,
+            "answer": "have",
+            "blake3": Blake3Digest::from_bytes([0u8; 32]).to_string(),
+            "offers": [{"transport": "future", "loc": "a".repeat(MAX_OFFER_WIRE_BYTES)}],
+        }))
+        .unwrap();
+        assert!(decode_hold_response(&byte_wire).is_err());
+    }
+}

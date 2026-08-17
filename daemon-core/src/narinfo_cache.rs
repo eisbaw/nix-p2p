@@ -1497,6 +1497,77 @@ NarSize: 40";
         assert!(safe_key(&unicode).is_none(), "non-ascii must reject");
     }
 
+    /// PROPERTY (TASK-112): the safe_key CONTAINMENT invariant, over generated
+    /// inputs biased to hit BOTH branches (arbitrary strings; exact-length
+    /// base32; length-32 lowercase that may include the out-of-alphabet e/o/u/t;
+    /// a trailing slash). The independent claim is the SECURITY consequence, not
+    /// a restatement of the alphabet test: an ACCEPTED key can never contain a
+    /// path separator, `.`, or NUL, so it can never escape the cache root when
+    /// joined to a directory. It also pins the equivalence acceptance <=> (exact
+    /// STORE_HASH_LEN AND every byte in NIX_BASE32), whose length half bites if
+    /// the `!= STORE_HASH_LEN` guard is ever loosened. Determinism via
+    /// `crate::prop_support::runner` (fixed seed in `just test`).
+    #[test]
+    fn prop_safe_key_containment_and_acceptance() {
+        use proptest::prelude::*;
+        let inputs = prop_oneof![
+            ".*",
+            "[0-9abcdfghijklmnpqrsvwxyz]{32}",
+            // All-base32 but VARYING length (30..=34): the only inputs that
+            // isolate the exact-length guard - a WRONG-length in-alphabet key
+            // must still be rejected, so loosening `len != STORE_HASH_LEN` bites
+            // here and nowhere the alphabet check would already catch it.
+            "[0-9abcdfghijklmnpqrsvwxyz]{30,34}",
+            "[a-z]{32}",
+            "[0-9a-z]{31}/",
+        ];
+        crate::prop_support::runner()
+            .run(&inputs, |s| {
+                let accepted = super::safe_key(&s);
+                let alphabet_ok = s.as_bytes().iter().all(|b| super::NIX_BASE32.contains(b));
+                let length_ok = s.len() == super::STORE_HASH_LEN;
+                match accepted {
+                    Some(key) => {
+                        // Acceptance <=> exact length AND every byte in-alphabet.
+                        prop_assert!(
+                            length_ok,
+                            "accepted a {}-byte key (want {})",
+                            s.len(),
+                            super::STORE_HASH_LEN
+                        );
+                        prop_assert!(alphabet_ok, "accepted a non-base32 key {s:?}");
+                        // The returned key is the input verbatim and can never
+                        // name anything but a leaf under the cache root.
+                        prop_assert_eq!(&key, &s);
+                        prop_assert!(
+                            !key.contains('/') && !key.contains('.') && !key.contains('\0'),
+                            "accepted key {key:?} could escape the cache root"
+                        );
+                    }
+                    None => {
+                        // Rejection <=> wrong length OR a non-base32 byte.
+                        prop_assert!(
+                            !(length_ok && alphabet_ok),
+                            "rejected a well-formed key {s:?}"
+                        );
+                    }
+                }
+                Ok(())
+            })
+            .unwrap();
+    }
+
+    /// Named example (AC#4): a length-32 all-base32 string with a `/` swapped in
+    /// at a valid-alphabet position is impossible, but a 33-char base32-ish key
+    /// and a slash-bearing key are the two shapes the length + containment claims
+    /// pin. Locks them without proptest.
+    #[test]
+    fn example_safe_key_rejects_overlong_and_slash() {
+        assert!(safe_key("0a0lslqb6gbqnj6xqjlaljjqg6kgb3wz0").is_none()); // 33 chars
+        assert!(safe_key("0a0lslqb6gbqnj6xqjlaljjqg6kgb3w/").is_none()); // slash
+        assert_eq!(safe_key(VALID_KEY).as_deref(), Some(VALID_KEY));
+    }
+
     // ---- AC#3 fuzz: cache-key path traversal must never escape root ---------
 
     /// A tiny deterministic PRNG (xorshift64*) so the fuzz is seeded and

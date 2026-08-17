@@ -234,7 +234,11 @@ just            # list gates
 just build      # cargo build, all targets
 just lint       # clippy -D warnings, rustfmt, ruff, independence + source guards
 just test       # cargo test — incl. the multi-node discovery + address-resolution +
-                # transfer + daemon-integration tests — plus the fixture and measurement gates
+                # transfer + daemon-integration tests — plus the fixture and measurement gates,
+                # and the property tests (proptest + hypothesis) at a FIXED seed
+just prop       # the SAME property tests at a FREE/random seed + many cases —
+                # exploration mode, run deliberately (kept out of the fast loop
+                # so `just test` stays deterministic)
 ```
 
 Slow tier (containers / VMs):

@@ -219,6 +219,22 @@ test: _headroom build _python fixtures
     # (none/xz/zstd) and rejects a signed-field mutation. Needs the `daemon`
     # binary (hence the `build` dep) and the fast-tier fixtures.
     "${NIX_P2P_PYTHON}/bin/python3" scripts/check-rewrite-realnix.py
+    # TASK-112: the Python PROPERTY tests (hypothesis) with a FIXED seed + bounded
+    # examples - deterministic, so they belong in the flake-gated fast suite. The
+    # Rust `prop_*` properties ran above inside `cargo test` (fixed seed by default
+    # via prop_support::runner). `just prop` runs the SAME properties with a FREE
+    # seed for exploration.
+    "${NIX_P2P_PYTHON}/bin/python3" scripts/prop_tests.py --check
+
+# Property tests with a FREE/random seed + many cases (EXPLORATION mode). Run
+# deliberately, NOT on every cycle: `just test` runs the SAME properties with a
+# FIXED seed so the fast gate stays deterministic (TASK-109/112). Rust proptest is
+# seeded via daemon-core's prop_support::runner (PROPTEST_FREE_SEED); Python via
+# hypothesis. Override the count with PROPTEST_CASES (Rust) / the explore profile
+# (Python).
+prop: _toolchain _python
+    PROPTEST_FREE_SEED=1 PROPTEST_CASES="${PROPTEST_CASES:-1024}" cargo test --locked -p daemon-core prop_
+    "${NIX_P2P_PYTHON}/bin/python3" scripts/prop_tests.py --explore
 
 # Regenerate the signed fixture cache - fast tier (none/xz/zstd, <1 MiB).
 fixtures: _python

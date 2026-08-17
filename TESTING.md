@@ -80,7 +80,18 @@ only FAST must say so; slow-tier results are never implied.
 Gates (all must pass; `just` recipes are the canonical entry points):
 1. `just build` — workspace compiles.
 2. `just lint` — clippy, `-D warnings`.
-3. `just test` — unit + integration (in-process, mock upstream).
+3. `just test` — unit + integration (in-process, mock upstream). Also
+   runs the PROPERTY tests (proptest for Rust, hypothesis for Python:
+   claim-wire round-trip / fail-closed / offer caps, safe_key
+   containment, flake_rate.classify fail-closed, narinfo parse
+   round-trip/fail-closed) at a FIXED seed + bounded case count, so a
+   randomized test lives in the flake-gated fast suite without
+   reintroducing the task-109 non-determinism.
+   `just prop` — the SAME properties at a FREE seed + many cases
+   (`PROPTEST_FREE_SEED`, hypothesis `explore` profile). Exploration
+   mode, run deliberately, NOT on every cycle. A failure in either mode
+   persists a replayable reproducer (proptest `.proptest-regressions` /
+   hypothesis "Falsifying example").
 4. `just e2e` — container harness, FAST subset: five scenarios, one
    per distinct path (S1 byte/counts, S2 fallback, the tamper-narhash
    safety bite, depth-3 chain composition, S6 p2p). Sized for the
