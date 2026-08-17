@@ -246,11 +246,15 @@ pub struct StatusFactSnapshot {
     pub bootstrap_total: u32,
     /// How many of them are currently connected (live bootstrap health).
     pub bootstrap_healthy: u32,
-    /// The current peer path (direct / relay / none). HONEST PARTIAL (TASK-240): the shipped
-    /// binary reports [`PeerPath::None`] — the direct-vs-relay discriminator needs the swarm to
-    /// track `ConnectedPoint::is_relayed` on `ConnectionEstablished` and expose it via a query
-    /// command; that is a named follow-up, not wired here. The drills key on bootstrap health,
-    /// last-lookup, budget and dht_role, none of which depend on this field.
+    /// The current peer path (direct / relay / unknown / none). LIVE as of TASK-242: the libp2p
+    /// backend classifies it from the swarm's own `ConnectionEstablished`/`ConnectionClosed`
+    /// bookkeeping (`ConnectedPoint::is_relayed`) via `SwarmHandle::connection_path`, so a node
+    /// reaching a bootstrap over a `/p2p-circuit` reports [`PeerPath::Relay`] and a direct dial
+    /// reports [`PeerPath::Direct`]. A running swarm with no classified live bootstrap connection
+    /// reports [`PeerPath::Unknown`]; [`PeerPath::None`] is reserved for an upstream-only node with
+    /// no swarm at all (this snapshot's [`none`](StatusFactSnapshot::none)). See the backend's
+    /// `SwarmStatusFacts` for the honest scope (this classifies the path to the CONFIGURED bootstrap
+    /// peers, not a NAT-reachability verdict).
     pub path: PeerPath,
 }
 

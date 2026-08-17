@@ -651,13 +651,23 @@ impl DhtRole {
 // ===========================================================================
 
 /// The path the node currently reaches peers over.
+///
+/// The four states are DISTINCT on purpose (TASK-242): `None` means there is no peer subsystem at
+/// all (an upstream-only node — [`crate::observ::NullStatusFacts`]); `Unknown` means the swarm IS
+/// running but has no currently-classified live connection to a configured peer (nothing to
+/// measure yet, or every bootstrap disconnected). Reporting `Unknown` (not `None`) in the latter
+/// case is what keeps `bootstrap_healthy=2/2` from ever pairing with a contradictory `peer_path=none`
+/// (a node that HAS healthy peers but is measured as having "no peer path"). `Direct`/`Relay` are the
+/// measured live paths: a `Direct` connection vs a relayed (`/p2p-circuit`) one.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PeerPath {
     /// A direct connection.
     Direct,
     /// A relayed (circuit-v2) connection.
     Relay,
-    /// No peer path (upstream-only or not yet connected).
+    /// A swarm is running but no live peer connection is currently classified (unmeasured).
+    Unknown,
+    /// No peer path (upstream-only: there is no swarm at all).
     None,
 }
 
@@ -667,6 +677,7 @@ impl PeerPath {
         match self {
             PeerPath::Direct => "direct",
             PeerPath::Relay => "relay",
+            PeerPath::Unknown => "unknown",
             PeerPath::None => "none",
         }
     }
@@ -1487,6 +1498,47 @@ mod tests {
         assert!(s.contains("announce_budget=7/256"));
         assert!(s.contains("fallback_reason=discovery-unavailable"));
         assert!(s.contains("mechanisms_enabled=libp2p-kad-discovery,libp2p-nar-transfer"));
+    }
+
+    /// TASK-242: the four [`PeerPath`] states render to FOUR distinct tokens. `Unknown` must render
+    /// `unknown` (not `none`), so a swarm that is running but has no classified live path is never
+    /// conflated with an upstream-only node that has no swarm at all. MUTATION: aliasing
+    /// `Unknown => "none"` in `as_str` collapses the two and reddens the `unknown`/`none` split.
+    #[test]
+    fn peer_path_tokens_are_four_distinct_states() {
+        assert_eq!(PeerPath::Direct.as_str(), "direct");
+        assert_eq!(PeerPath::Relay.as_str(), "relay");
+        assert_eq!(PeerPath::Unknown.as_str(), "unknown");
+        assert_eq!(PeerPath::None.as_str(), "none");
+        let tokens = [
+            PeerPath::Direct.as_str(),
+            PeerPath::Relay.as_str(),
+            PeerPath::Unknown.as_str(),
+            PeerPath::None.as_str(),
+        ];
+        let distinct: std::collections::HashSet<_> = tokens.iter().collect();
+        assert_eq!(
+            distinct.len(),
+            4,
+            "every PeerPath state is a distinct token"
+        );
+
+        // The Unknown token surfaces on the rendered status line (a running swarm, no classified
+        // path yet) — never printed as `peer_path=none`.
+        let c = OperatorContract::for_profile(SharingProfile::ConsumeOnly);
+        let rt = StatusInputs {
+            node_id: "12D3KooW…".to_string(),
+            bootstrap_total: 2,
+            bootstrap_healthy: 2,
+            holder_count: None,
+            path: PeerPath::Unknown,
+            last_lookup: None,
+            announce_budget_used: 0,
+            fallback_reason: String::new(),
+        };
+        let s = c.status(&rt);
+        assert!(s.contains("peer_path=unknown"), "{s}");
+        assert!(!s.contains("peer_path=none"), "{s}");
     }
 
     #[test]

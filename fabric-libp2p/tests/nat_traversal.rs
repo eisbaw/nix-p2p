@@ -28,7 +28,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use fabric_libp2p::{
-    Libp2pServer, MemoryNarSupplier, Multiaddr, Node, NodeConfig, PeerId, Protocol,
+    ConnPath, Libp2pServer, MemoryNarSupplier, Multiaddr, Node, NodeConfig, PeerId, Protocol,
 };
 use peer_fabric::{Blake3Digest, NarServer, ServeBudget};
 use proc_supervisor::TaskSupervisorHandle;
@@ -190,6 +190,26 @@ async fn provider_reachable_only_via_relay_circuit_fetches_byte_identical() {
         Blake3Digest::from_raw_nar(&bytes),
         content,
         "the relayed transfer preserves the frozen BLAKE3 blob id"
+    );
+
+    // TASK-242 relay-detection bite: C reaches P ONLY over the relay circuit, so the live
+    // connection-path query (which reads `ConnectedPoint::is_relayed` off the swarm's own
+    // ConnectionEstablished bookkeeping) MUST report `Relay` for P — this is exactly the signal
+    // the operator status surface renders as `peer_path=relay` for a relayed fetch. MUTATION:
+    // classifying a `/p2p-circuit` connection as `Direct` (dropping the `is_relayed` check)
+    // reddens this. The SAME node's path to the relay R, which C dials directly, is `Direct` — so
+    // the query is not a constant `Relay`, it discriminates by the actual connected endpoint.
+    let path_to_provider = consumer.handle.connection_path(provider_peer).await;
+    assert_eq!(
+        path_to_provider,
+        ConnPath::Relay,
+        "the only live path to P is the relay circuit, so connection_path must be Relay (not {path_to_provider:?})"
+    );
+    let path_to_relay = consumer.handle.connection_path(relay_peer).await;
+    assert_eq!(
+        path_to_relay,
+        ConnPath::Direct,
+        "C dials the relay R directly, so its path to R is Direct (proves the query is not a constant Relay): got {path_to_relay:?}"
     );
 }
 

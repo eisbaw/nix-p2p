@@ -21,21 +21,21 @@ use daemon_core::{
 use daemon_core::{
     CacheInfo, ContractRequest, CorrelationStore, DhtRole, METRICS_PATH,
     NARINFO_CACHE_FLAG_CONFLICT, NarSource, NarinfoLayer, NarinfoSource, NullStatusFacts,
-    Observability, OperatorContract, PassThroughReason, PeerPath, PrivacyPolicy,
-    PublicNarAllowlist, RawUpstream, ResourceCaps, RunConfig, RuntimeMetrics, STATUS_PATH,
-    SharingProfile, StatusFactSnapshot, StatusFacts, SystemClock, UpstreamHttp,
-    build_narinfo_layer, resolve_narinfo_cache_dir, run,
+    Observability, OperatorContract, PassThroughReason, PrivacyPolicy, PublicNarAllowlist,
+    RawUpstream, ResourceCaps, RunConfig, RuntimeMetrics, STATUS_PATH, SharingProfile, StatusFacts,
+    SystemClock, UpstreamHttp, build_narinfo_layer, resolve_narinfo_cache_dir, run,
 };
 use daemon_libp2p::{
     AllowlistEligibility, AnnounceAfterFetchDoor, LanReachability, LanShare,
-    Libp2pAnnounceAfterFetch, Libp2pCatalogProbe, Libp2pSourceConfig, announce_provider_seeds,
-    announce_public_provisions, announce_public_seeds, announce_store_provisions,
-    build_libp2p_nar_source, build_libp2p_provider_source, lan_isolation_or_refuse,
-    open_public_allowlist, resolve_durable_identity_seed, verify_store_provisions,
+    Libp2pAnnounceAfterFetch, Libp2pCatalogProbe, Libp2pSourceConfig, SwarmStatusFacts,
+    announce_provider_seeds, announce_public_provisions, announce_public_seeds,
+    announce_store_provisions, build_libp2p_nar_source, build_libp2p_provider_source,
+    lan_isolation_or_refuse, open_public_allowlist, resolve_durable_identity_seed,
+    verify_store_provisions,
 };
 use ed25519_dalek::SigningKey;
 use fabric_libp2p::{
-    CatalogNarSupplier, Libp2pFabric, MemoryNarSupplier, Multiaddr, PeerId, SwarmHandle,
+    CatalogNarSupplier, Libp2pFabric, MemoryNarSupplier, Multiaddr, PeerId,
     raw_nar_helper_authorized,
 };
 use peer_fabric::{
@@ -146,7 +146,7 @@ struct Config {
     /// announces, NOT what it looks up.
     libp2p_leech: bool,
     /// ROUTER / bootstrap-relay mode (TASK-241): an EXPLICIT request to run as a kad SERVER (a
-    /// bootstrap rendezvous root that answers FIND_NODE/GET_PROVIDERS) plus, by default, a
+    /// bootstrap/entry root that answers FIND_NODE/GET_PROVIDERS) plus, by default, a
     /// circuit-v2 relay server — carrying NO content (serves + announces NOTHING). It is the
     /// DHT-infrastructure role the give/consume modes cannot express: `consume-only` is a kad
     /// CLIENT (cannot be a bootstrap root) and the provider modes require content to serve.
@@ -167,34 +167,6 @@ struct Config {
 /// authoritative [`ResourceCaps`] so it cannot drift from the documented contract (TASK-120).
 fn default_libp2p_announce_budget() -> u64 {
     ResourceCaps::default().announce_distinct_paths_budget
-}
-
-/// TASK-240 AC#4: the LIVE swarm-facts provider for the status surface. It answers bootstrap health
-/// by asking the RUNNING swarm which configured bootstrap peers are currently connected
-/// ([`SwarmHandle::is_connected`]) — a genuinely live signal that degrades when a bootstrap dies
-/// (the dependency-outage drill keys on it). Peer path is a documented partial (see
-/// [`StatusFactSnapshot`]): the direct-vs-relay discriminator needs the swarm to track
-/// `ConnectedPoint::is_relayed` and expose it via a query command, a named follow-up.
-struct SwarmStatusFacts {
-    handle: SwarmHandle,
-    bootstrap: Vec<PeerId>,
-}
-
-#[async_trait::async_trait]
-impl StatusFacts for SwarmStatusFacts {
-    async fn snapshot(&self) -> StatusFactSnapshot {
-        let mut healthy = 0u32;
-        for peer in &self.bootstrap {
-            if self.handle.is_connected(*peer).await {
-                healthy += 1;
-            }
-        }
-        StatusFactSnapshot {
-            bootstrap_total: self.bootstrap.len() as u32,
-            bootstrap_healthy: healthy,
-            path: PeerPath::None,
-        }
-    }
 }
 
 /// TASK-240: if invoked as `daemon-libp2p --status <addr>` / `--metrics <addr>`, QUERY a running
@@ -1474,10 +1446,10 @@ async fn main() -> ExitCode {
         // TASK-240: capture the live-facts provider (bootstrap health via the swarm handle) + the
         // node identity BEFORE the fabric is moved into `fabric_dyn`.
         observ_node_id = fabric.peer_id().to_string();
-        status_facts = Arc::new(SwarmStatusFacts {
-            handle: fabric.handle().clone(),
-            bootstrap: cfg.libp2p_bootstrap.iter().map(|(p, _)| *p).collect(),
-        });
+        status_facts = Arc::new(SwarmStatusFacts::new(
+            fabric.handle().clone(),
+            cfg.libp2p_bootstrap.iter().map(|(p, _)| *p).collect(),
+        ));
         // A serving profile uses the concrete fabric (its serve gate is installed).
         fabric_dyn = fabric;
     } else {
@@ -1532,10 +1504,10 @@ async fn main() -> ExitCode {
         // TASK-240: capture the live-facts provider + node identity BEFORE the fabric is wrapped in
         // the LeechFabric mask (a router/consumer still has a real swarm with bootstrap health).
         observ_node_id = fabric.peer_id().to_string();
-        status_facts = Arc::new(SwarmStatusFacts {
-            handle: fabric.handle().clone(),
-            bootstrap: cfg.libp2p_bootstrap.iter().map(|(p, _)| *p).collect(),
-        });
+        status_facts = Arc::new(SwarmStatusFacts::new(
+            fabric.handle().clone(),
+            cfg.libp2p_bootstrap.iter().map(|(p, _)| *p).collect(),
+        ));
         // AUTHORITY INVERSION (fix #3): a non-serving profile is wrapped in the LeechFabric mask so
         // serve + announce are structurally None at the seam.
         fabric_dyn = Arc::new(LeechFabric::new(fabric));
@@ -2014,7 +1986,7 @@ mod operator_contract_tests {
         // ...yet it IS the DHT infrastructure (a kad server + relay), unlike a consume-only client.
         assert!(
             cfg.profile.runs_dht_server(),
-            "a router must be a kad SERVER (a bootstrap rendezvous root)"
+            "a router must be a kad SERVER (a bootstrap/entry root)"
         );
         check_runtime_preconditions(&cfg).expect("a router with a listen starts");
         // The wire the swarm actually runs: kad SERVER + relay server ON.

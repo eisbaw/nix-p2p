@@ -128,6 +128,11 @@ LIBP2P_ALLOWLIST_MOUNT = "/var/lib/nix-p2p"
 # Base TCP port for the in-pod libp2p listeners; role i (in `_daemon_roles` order)
 # listens on LIBP2P_BASE_PORT + i. Deliberately far from the HTTP 808x band.
 LIBP2P_BASE_PORT = 37000
+# The operator admin (`--status-listen`) loopback port inside the consumer container (TASK-242).
+# Loopback-only + queried via `podman exec` from inside the container (never host-published), so it
+# only needs to avoid the in-container HTTP/libp2p bands above. Used by the containerized
+# dependency-outage drill (`scenario_libp2p_bootstrap_outage`).
+LIBP2P_STATUS_PORT = 39100
 # A syntactically valid but UNREACHABLE ed25519 PeerId used as the GENESIS (BOOT)
 # node's `--libp2p-bootstrap` entry. Every libp2p daemon requires a bootstrap peer, but
 # the first node has no one to point at; kad's self-lookup against an unreachable entry
@@ -527,6 +532,7 @@ class Pod:
         libp2p_announce_after_fetch: bool = False,
         libp2p_announce_budget: int = 256,
         libp2p_leech: bool = False,
+        libp2p_consumer_status_port: int | None = None,
     ):
         self.ctx = ctx
         self.pod = f"{POD_PREFIX}-{name}"
@@ -614,6 +620,19 @@ class Pod:
         # with A as an announce-after-fetch provider (0 upstream on B instead of >=1). A leech needs
         # no trusted key / allowlist (it never announces), so those are not required here.
         self.libp2p_leech = bool(libp2p_leech)
+        # TASK-242 item 3: when set, the CONSUMER runs the primary `/bin/daemon-libp2p` binary (the
+        # one carrying the operator observability surface) with `--status-listen 127.0.0.1:<port>`,
+        # so the containerized dependency-outage drill can read the LIVE `/nix-p2p/status` surface
+        # from inside the consumer container (via `podman exec`) and watch bootstrap health flip when
+        # BOOT is killed. `None` (every existing scenario) leaves the consumer on `/bin/daemon` with
+        # no admin surface — byte-identical to before.
+        self.libp2p_consumer_status_port = (
+            int(libp2p_consumer_status_port)
+            if libp2p_consumer_status_port is not None
+            else None
+        )
+        if self.libp2p_consumer_status_port is not None and not self.libp2p:
+            die("Pod: libp2p_consumer_status_port requires a libp2p provider topology")
         if self.libp2p_leech and (
             self.libp2p_announce_after_fetch or self.libp2p_store_supply
         ):
@@ -1293,6 +1312,20 @@ class Pod:
         self.libp2p_provider_listen_addrs.add(prov_listen)
 
         # 3. C (consumer): bootstraps to BOOT ALONE. NO provider-addr injection.
+        # TASK-242: the dependency-outage drill runs C on the PRIMARY /bin/daemon-libp2p binary (the
+        # one carrying the operator --status surface) + a loopback --status-listen, so the drill can
+        # read live bootstrap health from inside the container. Every other libp2p scenario keeps C
+        # on /bin/daemon (no admin surface) byte-identical to before.
+        consumer_binary = (
+            "/bin/daemon-libp2p"
+            if self.libp2p_consumer_status_port is not None
+            else "/bin/daemon"
+        )
+        status_flags = (
+            ["--status-listen", f"127.0.0.1:{self.libp2p_consumer_status_port}"]
+            if self.libp2p_consumer_status_port is not None
+            else []
+        )
         run(
             [
                 self._pm,
@@ -1306,7 +1339,7 @@ class Pod:
                 PROJECT_LABEL,
                 *self._state_args("lp-consumer"),
                 self.ctx.image,
-                "/bin/daemon",
+                consumer_binary,
                 "--listen",
                 f"0.0.0.0:{DAEMON_PORT}",
                 "--upstream",
@@ -1317,6 +1350,7 @@ class Pod:
                 boot_peer,
                 "--libp2p-scope",
                 LIBP2P_SCOPE,
+                *status_flags,
                 *self._daemon_state_flags(),
                 *self.daemon_extra_args,
             ]
@@ -1740,6 +1774,26 @@ class Pod:
 
     def exec(self, role: str, argv: list[str], check: bool = False):
         return run([self._pm, "exec", self._c(role), *argv], check=check)
+
+    def libp2p_consumer_status(self) -> str:
+        """Read the LIVE operator `/nix-p2p/status` surface from INSIDE the consumer container
+        (TASK-242 drill). Uses the SHIPPED admin-query client mode (`daemon-libp2p --status <addr>`)
+        against the consumer's own loopback `--status-listen`, so the real client + surface path is
+        exercised, not a hand-rolled GET. Returns the (already privacy-redacted) status body on
+        success, or the client's stderr (an "ERR"/refusal) otherwise — the caller asserts on tokens.
+        Requires the pod to have been built with `libp2p_consumer_status_port`."""
+        if self.libp2p_consumer_status_port is None:
+            die("libp2p_consumer_status: pod lacks libp2p_consumer_status_port")
+        res = self.exec(
+            "lp-consumer",
+            [
+                "/bin/daemon-libp2p",
+                "--status",
+                f"127.0.0.1:{self.libp2p_consumer_status_port}",
+            ],
+            check=False,
+        )
+        return res.stdout if res.stdout.strip() else res.stderr
 
     # -- crash-suite additions (task-7) --
 
@@ -5011,6 +5065,110 @@ def scenario_s7_libp2p(ctx: Ctx, expect) -> None:
         )
 
 
+def scenario_libp2p_bootstrap_outage(ctx: Ctx, expect) -> None:
+    """TASK-242 item 3: the dependency-outage DRILL promoted from the in-process observability seam
+    (TASK-240 drill 2) to a REAL container/network fault.
+
+    A 3-daemon libp2p topology (BOOT + provider P + consumer C), with C running the PRIMARY
+    /bin/daemon-libp2p binary — the one carrying the operator surface — on a loopback
+    `--status-listen`. The drill:
+
+      1. converged + healthy: the LIVE `--status` (read via the SHIPPED admin client from inside C's
+         container) reports `bootstrap_healthy=1/1`, `fallback_reason=none`, and `peer_path=direct`
+         (C dials its sole bootstrap BOOT directly — this exercises the TASK-242 live direct/relay
+         detection end to end in a container, not just the unit bite);
+      2. INJECT the outage at the CONTAINER level: `podman kill` the BOOT process;
+      3. the live status flips to `bootstrap_healthy=0/1` + `fallback_reason=bootstrap-outage`, read
+         from the ACTUAL swarm `is_connected` state (not a mocked snapshot);
+      4. the S2 ADDITIVE INVARIANT holds THROUGH the outage: a real `nix build` still succeeds via
+         the daemon's HTTP-upstream fallback — the store is never blocked.
+
+    MUTATION: a surface not reading live `is_connected` keeps `1/1` after the kill (reddens step 3);
+    a `peer_path` hardcoded to none/unknown reddens the step-1 `direct` assertion; a broken fallback
+    reddens step 4.
+
+    HONEST SCOPE: the other three TASK-240 drills stay IN-PROCESS. Restart-identity and
+    exhausted-budget inject at seams with no natural container/network analogue (a durable-seed
+    restart; an in-memory announce ledger), and kill-switch is a static profile assertion the
+    `libp2p-leech` scenario already proves peer-side; this drill containerizes the one whose fault IS
+    a network/process event (a bootstrap dying).
+    """
+    fixtures = ctx.fixtures
+    seed_dir, prov_seeds, target_sp = _s7_seeds(ctx, "outage", S7_TARGET)
+    with Pod(
+        ctx,
+        "lp-outage",
+        fixtures.cache,
+        with_daemon=False,
+        expect=expect,
+        libp2p_seed_dir=seed_dir,
+        libp2p_provider_seeds=prov_seeds,
+        libp2p_trusted_key=fixtures.public_key,
+        libp2p_consumer_status_port=LIBP2P_STATUS_PORT,
+    ) as pod:
+        time.sleep(LIBP2P_CONVERGE_S)
+
+        # 1. Converged + healthy: the sole bootstrap is connected, over a DIRECT path.
+        healthy = pod.libp2p_consumer_status()
+        expect(
+            "bootstrap_healthy=1/1" in healthy,
+            "TASK-242 drill: converged consumer reports its sole bootstrap healthy (live is_connected)",
+            f"status={healthy!r}",
+        )
+        expect(
+            "peer_path=direct" in healthy,
+            "TASK-242 drill: live peer_path is DIRECT (C dials BOOT directly) - direct/relay "
+            "detection wired end to end, not a hardcoded placeholder",
+            f"status={healthy!r}",
+        )
+        expect(
+            "fallback_reason=none" in healthy,
+            "TASK-242 drill: no fallback reason while the bootstrap is healthy",
+            f"status={healthy!r}",
+        )
+
+        # 2. INJECT the outage at the container level: kill BOOT.
+        pod.kill("lp-boot")
+
+        # 3. Poll the LIVE surface until bootstrap health degrades. Bounded (~60s) so a genuinely
+        #    stuck flip FAILS rather than hangs; the flip is the swarm's real ConnectionClosed once
+        #    BOOT's container (and its TCP endpoint) is gone.
+        outaged = ""
+        for _ in range(120):
+            outaged = pod.libp2p_consumer_status()
+            if "bootstrap_healthy=0/1" in outaged:
+                break
+            time.sleep(0.5)
+        expect(
+            "bootstrap_healthy=0/1" in outaged,
+            "TASK-242 drill: killing BOOT flips the LIVE status to 0/1 healthy (real is_connected, "
+            "not a mocked snapshot)",
+            f"status={outaged!r}",
+        )
+        expect(
+            "fallback_reason=bootstrap-outage" in outaged,
+            "TASK-242 drill: the surface ATTRIBUTES the fallback to the bootstrap outage",
+            f"status={outaged!r}",
+        )
+
+        # 4. S2 additive invariant: a real nix build STILL succeeds via the HTTP upstream fallback.
+        res = pod.client_run(
+            [target_sp], ctx.substituter_daemon_only(), fixtures.public_key
+        )
+        expect(
+            res.exit_code == 0,
+            "TASK-242 drill S2 additive invariant: a nix build still succeeds with BOOT dead "
+            "(the fetch folds to the HTTP upstream; the store is never blocked)",
+            res.stderr[-800:],
+        )
+        got = res.narhash(target_sp)
+        expect(
+            got == fixtures.nar_hash(S7_TARGET),
+            "TASK-242 drill S2: the fallback-served NAR is byte-identical to the signed upstream",
+            f"got={got} want={fixtures.nar_hash(S7_TARGET)}",
+        )
+
+
 def scenario_s7_libp2p_miss(ctx: Ctx, expect) -> None:
     """S7 MISS arm: a NAR that NO peer announces -> a clean libp2p kad miss -> upstream
     fallback, build still succeeds. The provider seeds only the DECOY (`app`); the
@@ -5933,6 +6091,9 @@ SCENARIOS = [
     # S7 (task-161): the libp2p arm - real 3-daemon decentralized discover->resolve->
     # fetch->serve across containers, with the F1 load-bearing control + a MISS arm.
     ("s7-libp2p", scenario_s7_libp2p),
+    # TASK-242: the containerized dependency-outage drill - kill a REAL bootstrap process and watch
+    # the live operator --status surface flip bootstrap health, while a nix build still succeeds.
+    ("libp2p-bootstrap-outage", scenario_libp2p_bootstrap_outage),
     ("s7-libp2p-miss", scenario_s7_libp2p_miss),
     ("s7-libp2p-netns", scenario_s7_libp2p_netns),
     # S8 (TASK-194 / 191 AC#3): the libp2p provider serves a REAL /nix/store path it NEVER

@@ -38,9 +38,12 @@ use std::time::{Duration, Instant};
 use async_trait::async_trait;
 
 use fabric_libp2p::{
-    ANNOUNCE_SEQ_FILENAME, Libp2pFabric, Libp2pNarSupplier, Multiaddr, NodeConfig,
-    PROVIDER_FLOOR_FILENAME, PeerId,
+    ANNOUNCE_SEQ_FILENAME, ConnPath, Libp2pNarSupplier, Multiaddr, NodeConfig,
+    PROVIDER_FLOOR_FILENAME, PeerId, SwarmHandle,
 };
+// `Libp2pFabric` is used in several places under its bare name; keep it a separate line so the
+// status-facts wiring above can re-order without churn.
+use fabric_libp2p::Libp2pFabric;
 
 use ed25519_dalek::SigningKey;
 use peer_fabric::{
@@ -2217,6 +2220,75 @@ async fn start_and_join_libp2p(
     }
 
     Ok(fabric)
+}
+
+/// The LIVE swarm-facts provider for the operator status surface (TASK-240/242). It answers the
+/// two connectivity facts the stack-neutral frontend cannot compute itself (they live in the
+/// backend's swarm):
+///
+/// * **bootstrap health** — how many of the configured bootstrap/entry peers the running swarm
+///   holds an established connection to right now, via [`SwarmHandle::is_connected`]. A genuinely
+///   live signal: it degrades the instant a bootstrap dies (the dependency-outage drill keys on it).
+/// * **peer path** — direct vs relayed, via [`SwarmHandle::connection_path`], which reads the same
+///   connection ledger `is_connected` does. `Direct` if ANY bootstrap connection is direct, else
+///   `Relay` if a bootstrap is reachable only over a `/p2p-circuit`, else `Unknown` (a running swarm
+///   with no classified live bootstrap connection — NEVER `None`, which is reserved for an
+///   upstream-only node with no swarm at all; see [`daemon_core::PeerPath`]).
+///
+/// HONEST SCOPE (TASK-242): `peer_path` classifies the path to the CONFIGURED BOOTSTRAP peers (the
+/// same peer set `bootstrap_healthy` counts), not a NAT-reachability verdict. A NAT'd node's
+/// OUTBOUND dial to a bootstrap is typically direct even when the node itself is only reachable
+/// INBOUND via a relay; the "am I publicly reachable" verdict is autonat's, surfaced separately.
+/// What this reports is truthful and load-bearing: it is `relay` exactly when the only live path to
+/// a bootstrap is a circuit, and `direct` when a direct connection exists.
+pub struct SwarmStatusFacts {
+    handle: SwarmHandle,
+    bootstrap: Vec<PeerId>,
+}
+
+impl SwarmStatusFacts {
+    /// Wire the live-facts provider over a running swarm's [`SwarmHandle`] and the configured
+    /// bootstrap peer set (the same set `--libp2p-bootstrap` parsed).
+    pub fn new(handle: SwarmHandle, bootstrap: Vec<PeerId>) -> Self {
+        SwarmStatusFacts { handle, bootstrap }
+    }
+}
+
+#[async_trait]
+impl daemon_core::StatusFacts for SwarmStatusFacts {
+    async fn snapshot(&self) -> daemon_core::StatusFactSnapshot {
+        let mut healthy = 0u32;
+        let mut any_direct = false;
+        let mut any_relay = false;
+        for peer in &self.bootstrap {
+            // Bootstrap health is read from the ACTUAL connection state (is_connected), so a dead
+            // bootstrap drops the count — the drill's load-bearing signal.
+            if self.handle.is_connected(*peer).await {
+                healthy += 1;
+            }
+            // Path classification reads the SAME connection ledger, so it can never disagree with
+            // is_connected about whether the peer is connected.
+            match self.handle.connection_path(*peer).await {
+                ConnPath::Direct => any_direct = true,
+                ConnPath::Relay => any_relay = true,
+                ConnPath::None => {}
+            }
+        }
+        // Direct dominates (a hole-punched peer reports direct even while a stale circuit lingers);
+        // a swarm with no classified live bootstrap connection reports Unknown, never None.
+        let path = if any_direct {
+            daemon_core::PeerPath::Direct
+        } else if any_relay {
+            daemon_core::PeerPath::Relay
+        } else {
+            daemon_core::PeerPath::Unknown
+        };
+        daemon_core::StatusFactSnapshot {
+            bootstrap_total: self.bootstrap.len() as u32,
+            bootstrap_healthy: healthy,
+            path,
+        }
+    }
 }
 
 #[cfg(test)]

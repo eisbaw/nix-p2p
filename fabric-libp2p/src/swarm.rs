@@ -309,6 +309,24 @@ pub struct Behaviour {
     pub dcutr: dcutr::Behaviour,
 }
 
+/// The live transport path to a peer, derived from the swarm's own `ConnectionEstablished` /
+/// `ConnectionClosed` bookkeeping (TASK-242). `Relay` iff the peer is reachable ONLY over a
+/// relayed (`/p2p-circuit`) connection right now; `Direct` iff at least one non-relayed connection
+/// is open (a direct connection, or a relayed one that dcutr has since upgraded); `None` iff the
+/// worker holds no open connection to the peer. It reads the SAME connection ledger `is_connected`
+/// answers from, so the two can never disagree about whether a peer is connected. A fabric-native
+/// type: the daemon layer maps it onto its operator-facing `PeerPath` (fabric-libp2p never depends
+/// on `daemon-core`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConnPath {
+    /// At least one DIRECT (non-relayed) connection to the peer is open.
+    Direct,
+    /// The peer is reachable, but ONLY over a relayed (`/p2p-circuit`) connection.
+    Relay,
+    /// No open connection to the peer.
+    None,
+}
+
 /// A command sent to the swarm worker. Each carries a oneshot the worker replies on
 /// once the corresponding swarm event arrives (or immediately, for synchronous ops).
 pub enum Command {
@@ -352,6 +370,16 @@ pub enum Command {
     IsConnected {
         peer: PeerId,
         reply: oneshot::Sender<bool>,
+    },
+    /// What is the live transport path to `peer` right now — direct, relay-only, or not connected?
+    /// (TASK-242). Answered from the worker's connection ledger, which mirrors the swarm's
+    /// `ConnectionEstablished`/`ConnectionClosed` events (each carries the `ConnectedPoint`, whose
+    /// `is_relayed()` is the direct-vs-`/p2p-circuit` discriminator). Read-only; touches no wire
+    /// framing. The operator status surface uses it to report `peer_path=direct|relay` honestly for
+    /// a NAT'd/relayed node instead of a hardcoded placeholder.
+    ConnectionPath {
+        peer: PeerId,
+        reply: oneshot::Sender<ConnPath>,
     },
     StartProviding {
         key: kad::RecordKey,
@@ -614,6 +642,16 @@ impl SwarmHandle {
         let (reply, rx) = oneshot::channel();
         self.send(Command::IsConnected { peer, reply }).await;
         rx.await.unwrap_or(false)
+    }
+
+    /// The live transport path to `peer` — direct, relay-only, or not connected (TASK-242). Reads
+    /// the worker's connection ledger (fed by `ConnectionEstablished`/`ConnectionClosed`), so it is
+    /// consistent with [`is_connected`](Self::is_connected): `ConnPath::None` iff not connected,
+    /// exactly when `is_connected` is `false`. A dropped worker answers `None` (not connected).
+    pub async fn connection_path(&self, peer: PeerId) -> ConnPath {
+        let (reply, rx) = oneshot::channel();
+        self.send(Command::ConnectionPath { peer, reply }).await;
+        rx.await.unwrap_or(ConnPath::None)
     }
 
     /// Join the network through a SET of independently-operated bootstrap peers. Pass
@@ -1080,6 +1118,36 @@ struct Worker {
     /// channel backpressure.
     cancels: mpsc::UnboundedReceiver<kad::QueryId>,
     pending: HashMap<kad::QueryId, Pending>,
+    /// Per-peer live connection ledger (TASK-242): how many DIRECT vs RELAYED connections are open
+    /// to each peer right now. Written by `ConnectionEstablished`/`ConnectionClosed` (each carries
+    /// the `ConnectedPoint`, whose `is_relayed()` classifies the connection), read by
+    /// [`Command::ConnectionPath`]. An entry is removed when its last connection closes, so a peer
+    /// present here is one the swarm currently holds at least one connection to — kept in lockstep
+    /// with `Swarm::is_connected`. Bounded by the live connection count (small), never a leak.
+    conn_paths: HashMap<PeerId, ConnCounts>,
+}
+
+/// The open-connection tally to one peer, split by transport path (TASK-242). Both counters are the
+/// number of currently-open connections of that kind; the entry is dropped when both reach zero.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct ConnCounts {
+    direct: u32,
+    relayed: u32,
+}
+
+impl ConnCounts {
+    /// The path this tally represents: `Direct` if ANY direct connection is open (a direct dial, or
+    /// a relayed one dcutr upgraded), else `Relay` if only relayed connections remain, else `None`.
+    /// Direct dominates so a hole-punched peer reports `direct` even while a stale circuit lingers.
+    fn path(self) -> ConnPath {
+        if self.direct > 0 {
+            ConnPath::Direct
+        } else if self.relayed > 0 {
+            ConnPath::Relay
+        } else {
+            ConnPath::None
+        }
+    }
 }
 
 impl Worker {
@@ -1200,6 +1268,16 @@ impl Worker {
                 // signal the F3 caller polls for before starting its timed window.
                 let _ = reply.send(self.swarm.is_connected(&peer));
             }
+            Command::ConnectionPath { peer, reply } => {
+                // Read the connection ledger the ConnectionEstablished/Closed events maintain. A
+                // peer absent from the map has no open connection (ConnPath::None) — the same
+                // verdict `is_connected` would give, since both are driven by the same events.
+                let path = self
+                    .conn_paths
+                    .get(&peer)
+                    .map_or(ConnPath::None, |counts| counts.path());
+                let _ = reply.send(path);
+            }
             Command::StartProviding { key, reply } => {
                 match self.swarm.behaviour_mut().kad.start_providing(key) {
                     Ok(id) => {
@@ -1313,6 +1391,39 @@ impl Worker {
         match event {
             SwarmEvent::NewListenAddr { address, .. } => {
                 tracing::debug!(%address, "fabric-libp2p: listening");
+            }
+            // TASK-242: track the live transport path per peer for the operator status surface.
+            // Each ConnectionEstablished carries the ConnectedPoint; `is_relayed()` is the
+            // direct-vs-`/p2p-circuit` discriminator. We tally per connection (a peer can hold
+            // several at once, e.g. a relayed circuit dcutr later upgrades to a direct one) and
+            // classify direct-dominant. This ledger stays in lockstep with `Swarm::is_connected`
+            // because both are driven by the same paired Established/Closed events.
+            SwarmEvent::ConnectionEstablished {
+                peer_id, endpoint, ..
+            } => {
+                let counts = self.conn_paths.entry(peer_id).or_default();
+                if endpoint.is_relayed() {
+                    counts.relayed = counts.relayed.saturating_add(1);
+                } else {
+                    counts.direct = counts.direct.saturating_add(1);
+                }
+            }
+            SwarmEvent::ConnectionClosed {
+                peer_id, endpoint, ..
+            } => {
+                // Decrement the SAME class this connection was counted under; drop the entry when
+                // its last connection closes so an absent peer means "not connected" (== is_connected
+                // false). saturating_sub guards against any unpaired-event surprise (never underflow).
+                if let Some(counts) = self.conn_paths.get_mut(&peer_id) {
+                    if endpoint.is_relayed() {
+                        counts.relayed = counts.relayed.saturating_sub(1);
+                    } else {
+                        counts.direct = counts.direct.saturating_sub(1);
+                    }
+                    if *counts == ConnCounts::default() {
+                        self.conn_paths.remove(&peer_id);
+                    }
+                }
             }
             SwarmEvent::Behaviour(BehaviourEvent::Identify(identify::Event::Received {
                 peer_id,
@@ -2292,6 +2403,7 @@ impl Node {
             commands: rx,
             cancels: cancel_rx,
             pending: HashMap::new(),
+            conn_paths: HashMap::new(),
         };
         let join = tokio::spawn(worker.run());
 
@@ -2314,6 +2426,42 @@ impl Node {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // TASK-242: the direct-vs-relay classification of a peer's open-connection tally. The rule is
+    // direct-dominant so a hole-punched peer (a lingering circuit PLUS a fresh direct connection)
+    // reports `Direct`, and an entry with no connections collapses to `None` (== not connected).
+    // MUTATION: swapping the `direct`/`relayed` order (report `Relay` whenever a circuit exists,
+    // even alongside a direct link) reddens the mixed-tally `Direct` assertion; dropping the
+    // direct-dominance and returning `Relay` for `{direct:1, relayed:1}` fails the same line.
+    #[test]
+    fn conn_counts_classify_direct_dominant() {
+        assert_eq!(ConnCounts::default().path(), ConnPath::None);
+        assert_eq!(
+            ConnCounts {
+                direct: 1,
+                relayed: 0
+            }
+            .path(),
+            ConnPath::Direct
+        );
+        assert_eq!(
+            ConnCounts {
+                direct: 0,
+                relayed: 1
+            }
+            .path(),
+            ConnPath::Relay
+        );
+        // A relayed circuit that dcutr upgraded (a direct connection now co-exists) is DIRECT.
+        assert_eq!(
+            ConnCounts {
+                direct: 1,
+                relayed: 1
+            }
+            .path(),
+            ConnPath::Direct
+        );
+    }
 
     // The pure near-key mapping (TASK-174), deterministic and network-free. The
     // integration test `tests/near_key_routing_bar.rs` proves the same boundary end to
