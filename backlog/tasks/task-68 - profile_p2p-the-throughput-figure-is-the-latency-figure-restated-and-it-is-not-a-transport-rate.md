@@ -3,10 +3,11 @@ id: TASK-68
 title: >-
   profile_p2p: the 'throughput' figure is the latency figure restated, and it is
   not a transport rate
-status: To Do
-assignee: []
+status: Done
+assignee:
+  - '@claude'
 created_date: '2026-08-09 14:01'
-updated_date: '2026-08-10 22:36'
+updated_date: '2026-08-17 13:08'
 labels:
   - honesty
   - measurement
@@ -22,9 +23,9 @@ FOUND BY TASK-64. scripts/profile_p2p.py:745 computes throughput as `workload_by
 
 ## Acceptance Criteria
 <!-- AC:BEGIN -->
-- [ ] #1 The report no longer presents throughput and latency as independent corroboration: either the derived throughput key is removed, or it is structurally labelled as a restatement of realise_s with the identity spelled out
-- [ ] #2 Any figure derived by dividing a CONSTANT by a measured quantity is labelled as such, and the honesty machinery gates on it - proven by mutation (a report that presents such a pair as two observations must be REJECTED by the self-test)
-- [ ] #3 The realise-rate figures are renamed so they cannot be read as transport throughput (they carry nix unpack + NarHash + store registration), with the task-64 transport-only numbers cited as the contrast
+- [x] #1 The report no longer presents throughput and latency as independent corroboration: either the derived throughput key is removed, or it is structurally labelled as a restatement of realise_s with the identity spelled out
+- [x] #2 Any figure derived by dividing a CONSTANT by a measured quantity is labelled as such, and the honesty machinery gates on it - proven by mutation (a report that presents such a pair as two observations must be REJECTED by the self-test)
+- [x] #3 The realise-rate figures are renamed so they cannot be read as transport throughput (they carry nix unpack + NarHash + store registration), with the task-64 transport-only numbers cited as the contrast
 <!-- AC:END -->
 
 ## Implementation Notes
@@ -68,4 +69,55 @@ STILL OPEN, and it is the harder half:
     reports bytes served over the time it was actually serving. Until then the
     honest contrast is TASK-64's separate bench, and that is what the report
     says. TASK-65 may be able to produce this as a side effect of its axis.
+
+## TASK-68 completed the harder half (commit 033b180)
+
+TASK-63 had done AC#3's data-key rename + a real transport link rate beside it,
+but AC#1/#2 lacked the MECHANICAL, mutation-proven gate. Landed now in
+scripts/profile_p2p.py:
+
+- derived_quantity_violations(report): pure structural gate, wired into the
+  honesty block (compliant now ANDs it) alongside unit/qualifier gates. Two rules:
+  (1) every registered constant-numerator rate key
+  (realise_rate_bytes_uncompressed_nar_per_s) must carry a disclaimer sibling
+  that SPELLS the identity (must contain 'constant' AND '1/latency'); bare or
+  vague is rejected. (2) no key may pair a constant-numerator rate stem
+  (throughput|realise_rate) with a corroboration stem (ratio|speedup|corrobor) -
+  the double-count reborn. Honest latency_speedup_* keys carry no rate stem and
+  pass; the measured transport link rate (numerator = measured bytes_sent, not a
+  constant) passes too.
+- Relabelled the stale counting_rule 'throughput' doc key to 'realise_rate' with
+  the identity + TASK-64 transport-alone contrast (fetch 187, iroh-blobs 255 MB/s
+  at 110 MiB).
+
+BITE (mutation red/green), all in --self-test:
+  * strip the disclaimer sibling -> gate RED, names the bare rate.
+  * disclaimer present but no longer names the identity -> RED.
+  * inject throughput_speedup_<cond> into the speedup block, rebuild report ->
+    honesty.compliant is False end-to-end.
+  * CONTROLS: latency_speedup_* and the measured link rate are NOT caught.
+  * Load-bearing proof: neutering derived_quantity_violations to `return []`
+    turns all three mutation checks RED (self-test exit 1); reverted -> green.
+
+GATES (nix devshell): profile_p2p.py --self-test exit 0 (ALL PASS incl.
+assert_unit_coincidence and the unit gate, both untouched); ruff check clean;
+ruff format --check clean on profile_p2p.py; check-no-floats.py rc 0 (no float in
+any gated comparison - the gate is string/set-membership only). Full e2e not run:
+the change is confined to the pure Python report/self-test layer, touches no Rust
+or container path.
+
+HONEST LIMITS / still open:
+  * The peer-SIDE transport rate: sizeaxis.peer_serve_rate (holder_send_*) closes
+    it on the size axis; the speedup arm still cites TASK-64's separate bench for
+    the peer side rather than measuring it in-arm. Not regressed here.
+  * The gate's rate registry is explicit (one key today). A future
+    constant-numerator rate must be added to CONSTANT_NUMERATOR_RATE_KEYS or it
+    escapes rule (1) - rule (2)'s stem match is the backstop, but a novel rate
+    name with no throughput/realise_rate stem would need registration. Documented
+    at the constant.
+  * Pre-existing repo-wide ruff-format drift (4 other scripts) keeps `just lint`
+    exit 1 independent of this change - folded into TASK-222 (duplicate TASK-244
+    archived). profile_p2p.py itself is now ruff-format clean.
+
+DONE (LIGHT gate). Commit 033b180. Landed the mutation-proven derived_quantity_violations gate for AC#1/#2 (AC#3 relabel was TASK-63). Self-test rc0; neutering the gate -> rc1 (load-bearing, orchestrator-verified); check-no-floats rc0; assert_unit_coincidence untouched. Pre-existing ruff-format red on 4 OTHER scripts -> TASK-222.
 <!-- SECTION:NOTES:END -->
