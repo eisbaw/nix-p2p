@@ -72,9 +72,9 @@ pub use narinfo_cache::{
     PassThroughReason, SystemClock, build_narinfo_layer, resolve_narinfo_cache_dir,
 };
 pub use operator::{
-    ContractError, ContractRequest, DIAGNOSTICS_WARNING, LookupOutcome, Mechanism, MechanismState,
-    MetricLabel, OperatorContract, PeerPath, PrivacyPolicy, ResourceCaps, SharingProfile,
-    StatusInputs,
+    ContractError, ContractRequest, DIAGNOSTICS_WARNING, DhtRole, LookupOutcome, Mechanism,
+    MechanismState, MetricLabel, OperatorContract, PeerPath, PrivacyPolicy, ResourceCaps,
+    SharingProfile, StatusInputs,
 };
 pub use peer_source::{PeerFabricNarSource, PeerFabricRawServe};
 pub use post_fetch::PostFetchAnnounce;

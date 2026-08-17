@@ -21,7 +21,7 @@ use daemon::{
     AddressLookupCapability, AllowlistEligibility, AllowlistRawServe, AnyRawServe, App,
     AvailabilityIndex, Blake3Digest, CONNECT_TIMEOUT_MS, CacheInfo, Claim, CommandNarDumper,
     ContractRequest, CorrelationStore, DEFAULT_MAX_INFLIGHT_NAR_BYTES, DEFAULT_MAX_SERVE_DURATION,
-    DEFAULT_MAX_SERVE_NAR_BYTES, EndpointProfile, EndpointScope, FallbackNarSource,
+    DEFAULT_MAX_SERVE_NAR_BYTES, DhtRole, EndpointProfile, EndpointScope, FallbackNarSource,
     FileNarSupplier, HEADER_TIMEOUT_MS, IdentitySource, InMemoryDiscovery, IrohNode,
     IrohNodeBuilder, IrohPeerAddr, IrohProviderConfig, IrohTransport, KnownPayload, KnownTransport,
     LanReachability, LanShare, Libp2pCatalogProbe, Libp2pSourceConfig, Mechanism,
@@ -499,6 +499,19 @@ fn iroh_give_side_active(config: &Config) -> bool {
     config.iroh_provider || config.iroh_publish_node
 }
 
+/// Is the composite daemon's legacy iroh CONSUME side active (fetching over iroh)? TASK-120 fix B:
+/// a node given `--iroh-peer` and/or `--p2p-claim` starts an iroh transport and FETCHES over it -
+/// it is NOT "HTTP-only/upstream-only". This makes the profile + the mechanism registry reflect
+/// that the node reaches peers over iroh.
+fn iroh_consume_active(config: &Config) -> bool {
+    !config.iroh_peers.is_empty() || !config.p2p_claims.is_empty()
+}
+
+/// Is ANY iroh transport running on this node (give OR consume side)?
+fn iroh_transport_active(config: &Config) -> bool {
+    iroh_give_side_active(config) || iroh_consume_active(config)
+}
+
 /// Map the composite daemon's parsed [`Config`] onto the ONE authoritative [`OperatorContract`]
 /// (TASK-120), on the libp2p-PRIMARY path with the legacy iroh transport modeled HONESTLY as a
 /// deferred reference (the composite's FULL iroh contract is deferred to TASK-202).
@@ -529,7 +542,10 @@ fn derive_contract(config: &Config) -> Result<OperatorContract, String> {
         // governed by the allowlist door. Iroh public reachability is handled by the #3a scope
         // gate below (a global iroh endpoint is the iroh analogue of a public self-address).
         advertises_public_address: false,
-        has_bootstrap: !config.libp2p_bootstrap.is_empty(),
+        // "Reaches a peer substrate" - a libp2p bootstrap OR an iroh consume side (fix B). An
+        // iroh-consuming node with no give-side flag is CONSUME-ONLY (fetches from peers), never
+        // upstream-only: it is a lie to report HTTP-only while an iroh transport fetches.
+        has_bootstrap: !config.libp2p_bootstrap.is_empty() || iroh_consume_active(config),
     };
     let profile = SharingProfile::derive(req).map_err(|e| e.to_string())?;
 
@@ -552,15 +568,31 @@ fn derive_contract(config: &Config) -> Result<OperatorContract, String> {
         ));
     }
 
-    // #4: reflect the ACTIVE deferred-reference mechanisms so the report matches the wire.
+    // #4 + fix B: reflect the ACTIVE deferred-reference mechanisms so the report matches the wire.
+    // ANY iroh transport (give OR consume) marks IrohTransport active - a node fetching over iroh
+    // is not HTTP-only. Node publication via the pkarr path AND iroh node-lookup both mark DnsPkarr.
     let mut active_reference = Vec::new();
-    if iroh_give_side_active(config) {
+    if iroh_transport_active(config) {
         active_reference.push(Mechanism::IrohTransport);
     }
-    if config.iroh_enable_node_lookup {
+    if config.iroh_enable_node_lookup || config.iroh_publish_node {
         active_reference.push(Mechanism::DnsPkarr);
     }
 
+    // FIX A / C-defer: the composite's libp2p give-side stays FLAG-AUTHORITATIVE (prune-pending
+    // TASK-202) and always runs kad in SERVER mode when its libp2p swarm is engaged - so its
+    // REPORTED dht_role reflects THAT reality (Server whenever the libp2p node is active), rather
+    // than the profile-derived client/server mapping the PRIMARY binary uses. This keeps the
+    // composite's report honest against its actual (unchanged) wire behaviour. A node with no
+    // libp2p flags runs no libp2p swarm (iroh is a separate transport with no kad DHT) -> None.
+    let libp2p_swarm_active = config.libp2p_provider
+        || !config.libp2p_bootstrap.is_empty()
+        || config.libp2p_listen.is_some();
+    let dht_role = if libp2p_swarm_active {
+        DhtRole::Server
+    } else {
+        DhtRole::None
+    };
     let contract = OperatorContract {
         profile,
         caps: ResourceCaps::default(),
@@ -569,6 +601,7 @@ fn derive_contract(config: &Config) -> Result<OperatorContract, String> {
         },
         selected_mechanisms: Vec::new(),
         active_reference_mechanisms: active_reference,
+        dht_role,
     };
     contract.validate().map_err(|e| e.to_string())?;
 
@@ -1174,6 +1207,13 @@ impl Config {
             envelope: peer_fabric::SafetyEnvelope::default(),
             state_dir: self.libp2p_state_dir.clone(),
             relay_server_enabled: true,
+            // TASK-120 fix C is DEFERRED (prune-pending TASK-202): the composite daemon's libp2p
+            // give-side remains FLAG-AUTHORITATIVE (it branches on config.libp2p_provider /
+            // libp2p_leech, not on contract.profile) rather than deriving the swarm participation
+            // mode from the profile as the PRIMARY daemon-libp2p does. Kept at kad SERVER (the
+            // pre-TASK-120 behaviour) so this defer changes nothing; the profile-derived
+            // kad-client/relay-off wiring is the primary binary's job and a filed 202 follow-up.
+            kad_server: true,
         })
     }
 
@@ -2811,6 +2851,33 @@ mod tests {
             "a running iroh give-side must be reported as an active deferred-reference mechanism"
         );
         // The preflight must SAY iroh is active (report matches wire), not report it merely pending.
+        assert!(contract.preflight().contains("iroh-transport = ACTIVE"));
+    }
+
+    /// FIX B: an iroh CONSUMER (given `--iroh-peer` / `--p2p-claim`) fetches over iroh, so it is
+    /// NOT upstream-only/HTTP-only - it is consume-only, and the preflight/registry mark iroh ACTIVE.
+    /// A node reporting HTTP-only while an iroh transport fetches is the lie this fixes. Mutation:
+    /// drop the iroh-consume inputs from the request and the node falsely reverts to upstream-only.
+    #[test]
+    fn iroh_consumer_is_not_upstream_only_and_reports_iroh_active() {
+        let node_hex = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let config = Config {
+            iroh_peers: vec![parse_peer_spec(&format!("{node_hex}@127.0.0.1:35766")).unwrap()],
+            ..Config::default()
+        };
+        let contract = derive_contract(&config).expect("an iroh consumer derives a profile");
+        assert_ne!(
+            contract.profile,
+            SharingProfile::UpstreamOnly,
+            "a node fetching over iroh must NOT report upstream-only/HTTP-only"
+        );
+        assert_eq!(contract.profile, SharingProfile::ConsumeOnly);
+        assert!(
+            contract
+                .active_reference_mechanisms
+                .contains(&Mechanism::IrohTransport),
+            "an iroh-consuming node must report iroh ACTIVE"
+        );
         assert!(contract.preflight().contains("iroh-transport = ACTIVE"));
     }
 

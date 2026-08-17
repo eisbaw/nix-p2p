@@ -558,6 +558,47 @@ impl MetricLabel {
     }
 }
 
+/// The node's Kademlia participation on the wire (TASK-120 fix A). This is set by each binary to
+/// what its swarm ACTUALLY runs, so the reported DHT participation cannot drift from reality (the
+/// codex honesty gap: a node running a kad SERVER while reporting no DHT participation).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum DhtRole {
+    /// No participating libp2p swarm at all (a pure HTTP / upstream-only node). Answers nothing,
+    /// stores nothing, relays nothing.
+    #[default]
+    None,
+    /// kad CLIENT: the node ISSUES queries (it can discover + fetch) but ANSWERS none for others
+    /// and stores no records - it provides NO DHT infrastructure (a consumer).
+    Client,
+    /// kad SERVER: the node STORES records and ANSWERS `FIND_NODE`/`GET_PROVIDERS`/`GET_RECORD`
+    /// for others - it PARTICIPATES in the DHT infrastructure (a provider, or a router).
+    Server,
+}
+
+impl DhtRole {
+    /// The stable status token.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            DhtRole::None => "none",
+            DhtRole::Client => "client",
+            DhtRole::Server => "server",
+        }
+    }
+
+    /// A one-line human description for the preflight surface.
+    pub fn describe(self) -> &'static str {
+        match self {
+            DhtRole::None => "none (no participating libp2p swarm: answers/stores/relays nothing)",
+            DhtRole::Client => {
+                "kad-client (issues queries + fetches, answers NONE for others - no DHT infrastructure)"
+            }
+            DhtRole::Server => {
+                "kad-server (stores records + ANSWERS FIND_NODE/GET_PROVIDERS for others - DHT infrastructure)"
+            }
+        }
+    }
+}
+
 // ===========================================================================
 // StatusInputs / PeerPath / LookupOutcome — the runtime status surface (AC#4).
 // ===========================================================================
@@ -664,6 +705,11 @@ pub struct OperatorContract {
     /// state for a shipped-but-deferred transport, distinct from an operator SELECTING
     /// a pending mechanism as primary (which validate still rejects).
     pub active_reference_mechanisms: Vec<Mechanism>,
+    /// The node's Kademlia participation ON THE WIRE (TASK-120 fix A). Set by each binary to what
+    /// its swarm actually runs (daemon-libp2p derives it from the profile; the composite reflects
+    /// its flag-authoritative always-server behaviour, C-deferred), so the reported DHT role cannot
+    /// drift from reality. Default [`DhtRole::None`] (a fresh install runs no participating swarm).
+    pub dht_role: DhtRole,
 }
 
 impl OperatorContract {
@@ -676,6 +722,7 @@ impl OperatorContract {
             privacy: PrivacyPolicy::default(),
             selected_mechanisms: Vec::new(),
             active_reference_mechanisms: Vec::new(),
+            dht_role: DhtRole::None,
         }
     }
 
@@ -725,6 +772,7 @@ impl OperatorContract {
                 .map(|c| c.to_string())
                 .unwrap_or_else(|| "n/a".to_string())
         ));
+        out.push(format!("dht_role={}", self.dht_role.as_str()));
         out.push(format!("peer_path={}", rt.path.as_str()));
         out.push(format!(
             "last_lookup={}",
@@ -784,6 +832,10 @@ impl OperatorContract {
             "  public_dht_participation: {}",
             self.profile.public_participation()
         ));
+        // FIX A: the ACTUAL kad role on the wire (set by the binary), so the report cannot drift
+        // from what the swarm runs - a node reporting no participation while running a kad server
+        // is exactly the honesty gap this closes.
+        out.push(format!("  dht_role: {}", self.dht_role.describe()));
         out.push(format!(
             "  sends_discovery_lookups: {}",
             self.profile.sends_discovery_lookups()
@@ -1227,6 +1279,32 @@ mod tests {
         assert!(p.contains("serves_bytes: false"));
         assert!(p.contains("sends_discovery_lookups: false"));
         assert!(p.contains("public_dht_participation: false"));
+        // FIX A: a fresh install runs no participating swarm - the reported dht_role is none.
+        assert!(p.contains("dht_role: none"));
+    }
+
+    /// FIX A: the reported dht_role renders the ACTUAL kad role (set by the binary), so the report
+    /// cannot claim no participation while a kad server runs.
+    #[test]
+    fn dht_role_renders_in_status_and_preflight() {
+        let mut c = OperatorContract::for_profile(SharingProfile::ConsumeOnly);
+        c.dht_role = DhtRole::Client;
+        assert!(c.preflight().contains("dht_role: kad-client"));
+
+        let mut s = OperatorContract::for_profile(SharingProfile::LanShare);
+        s.dht_role = DhtRole::Server;
+        assert!(s.preflight().contains("dht_role: kad-server"));
+        let rt = StatusInputs {
+            node_id: "n".to_string(),
+            bootstrap_total: 0,
+            bootstrap_healthy: 0,
+            holder_count: None,
+            path: PeerPath::None,
+            last_lookup: None,
+            announce_budget_used: 0,
+            fallback_reason: String::new(),
+        };
+        assert!(s.status(&rt).contains("dht_role=server"));
     }
 
     // ---- AC#5: redaction + bounded-cardinality labels -------------------

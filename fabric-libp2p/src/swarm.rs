@@ -1671,6 +1671,13 @@ pub fn relay_server_config() -> relay::Config {
 /// Override off with [`NodeConfig::with_relay_server`].
 pub const DEFAULT_RELAY_SERVER_ENABLED: bool = true;
 
+/// Whether a node runs Kademlia in SERVER mode by default (TASK-120 fix A). `true`: the node
+/// STORES records and ANSWERS DHT queries for others (the decentralized-directory intent, needed
+/// by a PROVIDER). A CONSUMER overrides this to `false` (kad CLIENT: issues queries, answers
+/// none), and an upstream-only node runs no participating swarm at all. Override with
+/// [`NodeConfig::with_kad_server`].
+pub const DEFAULT_KAD_SERVER: bool = true;
+
 // ---------------------------------------------------------------------------------------
 // kad MemoryStore STORAGE bounds (TASK-154 AC#1).
 //
@@ -1830,6 +1837,16 @@ pub struct NodeConfig {
     /// still USE relays to be reached. When enabled, the server's caps come from
     /// [`relay_server_config`] (explicit bounds, never the library default). (TASK-208.)
     pub relay_server_enabled: bool,
+    /// Whether this node runs Kademlia in SERVER mode (TASK-120 fix A): a kad SERVER STORES
+    /// records and ANSWERS `FIND_NODE`/`GET_PROVIDERS`/`GET_RECORD` for OTHER peers - it
+    /// PARTICIPATES in the DHT infrastructure. `false` puts kad in CLIENT mode: the node still
+    /// ISSUES queries (it can discover + fetch) but answers NONE for others and stores no
+    /// records, so it provides no DHT infrastructure. Defaults to [`DEFAULT_KAD_SERVER`]
+    /// (`true`). The operator contract sets this from the participation profile: a PROVIDER
+    /// (lan-share/public-share) is a server; a CONSUMER (consume-only) is a client; an
+    /// upstream-only node runs no participating swarm at all. This is what makes a node's
+    /// reported `public_dht_participation` match what it actually does on the wire.
+    pub kad_server: bool,
     /// The statically-configured peer address book consulted LOCALLY under
     /// [`ResolutionPolicy::ExplicitPeersOnly`](peer_fabric::ResolutionPolicy::ExplicitPeersOnly)
     /// (TASK-168 AC#2). Maps a provider's ed25519 [`NodeId`] to the [`Multiaddr`]es it is
@@ -1882,6 +1899,7 @@ impl NodeConfig {
             network_scope: "v1".to_string(),
             kad_query_timeout: DEFAULT_KAD_QUERY_TIMEOUT,
             relay_server_enabled: DEFAULT_RELAY_SERVER_ENABLED,
+            kad_server: DEFAULT_KAD_SERVER,
             peer_address_book: BTreeMap::new(),
             known_relays: Vec::new(),
             // Fail-closed default (TASK-231, AC#2): a node that did not explicitly choose a
@@ -1910,6 +1928,15 @@ impl NodeConfig {
     /// opt OUT of relaying while still USING relays (see [`NodeConfig::relay_server_enabled`]).
     pub fn with_relay_server(mut self, enabled: bool) -> Self {
         self.relay_server_enabled = enabled;
+        self
+    }
+
+    /// Choose whether this node runs Kademlia in SERVER mode (TASK-120 fix A, builder style).
+    /// Default is `true` ([`DEFAULT_KAD_SERVER`]); pass `false` for CLIENT mode (issue queries,
+    /// answer none, store nothing - a consumer that provides no DHT infrastructure). See
+    /// [`NodeConfig::kad_server`].
+    pub fn with_kad_server(mut self, enabled: bool) -> Self {
+        self.kad_server = enabled;
         self
     }
 
@@ -2034,6 +2061,7 @@ fn build_kad_behaviour(
     peer_id: PeerId,
     kad_protocol: StreamProtocol,
     kad_query_timeout: Duration,
+    kad_server: bool,
 ) -> kad::Behaviour<MemoryStore> {
     // EXPLICIT storage caps for a shipped home node (TASK-154 AC#1), never the library
     // defaults - a poisoning/amplification/sybil flood against the store costs only bounded
@@ -2045,10 +2073,20 @@ fn build_kad_behaviour(
     // (~600ms one-way) peers. See `DEFAULT_KAD_QUERY_TIMEOUT` for the default's justification.
     kad_config.set_query_timeout(kad_query_timeout);
     let mut kad = kad::Behaviour::with_config(peer_id, store, kad_config);
-    // Server mode: this node STORES records and ANSWERS queries. Without it a node stays a
-    // client that never holds provider/value records, so the DHT could not answer - fatal for
-    // a decentralized directory.
-    kad.set_mode(Some(kad::Mode::Server));
+    // TASK-120 fix A: the kad MODE derives from the operator's participation profile.
+    //   * SERVER: this node STORES records and ANSWERS queries for others - a PROVIDER
+    //     participates in the DHT infrastructure (needed for a decentralized directory).
+    //   * CLIENT: this node ISSUES queries (still discovers + fetches) but answers NONE and
+    //     stores nothing - a CONSUMER provides no DHT infrastructure. An upstream-only node
+    //     runs no participating swarm at all (it never reaches this constructor).
+    // Making the mode reflect the profile is what keeps a node's REPORTED
+    // `public_dht_participation` honest against what it actually does on the wire.
+    let mode = if kad_server {
+        kad::Mode::Server
+    } else {
+        kad::Mode::Client
+    };
+    kad.set_mode(Some(mode));
     kad
 }
 
@@ -2138,6 +2176,8 @@ impl Node {
         // The configurable kad iterative-query timeout (TASK-210). `Duration` is `Copy`, so
         // capture it before the behaviour closure moves other config out.
         let kad_query_timeout = config.kad_query_timeout;
+        // TASK-120 fix A: the kad server/client mode derives from the participation profile.
+        let kad_server = config.kad_server;
         // The relay-server opt-out (TASK-208). `bool` is `Copy`; capture it before the
         // behaviour closure so it can decide whether to install the relay SERVER behaviour.
         let relay_server_enabled = config.relay_server_enabled;
@@ -2180,7 +2220,8 @@ impl Node {
                     // and the configurable query timeout (TASK-210). The AC#3 SEMANTIC guard test
                     // asserts `.protocol_names()` on exactly this construction, so a swap to the
                     // default `kad::Behaviour::new` (the PUBLIC IPFS DHT preset) bites (TASK-154 F2).
-                    let kad = build_kad_behaviour(peer_id, kad_protocol, kad_query_timeout);
+                    let kad =
+                        build_kad_behaviour(peer_id, kad_protocol, kad_query_timeout, kad_server);
                     let identify =
                         identify::Behaviour::new(identify::Config::new(id_protocol, key.public()));
                     // The RAW-STREAM NAR byte-transfer substrate (TASK-157): opened and
@@ -2439,7 +2480,7 @@ mod tests {
         // actually advertises — not what the source says it advertises.
         let kad_protocol = StreamProtocol::try_from_owned(format!("/nix-p2p/{scope}/kad/1.0.0"))
             .expect("the scoped kad protocol name is valid");
-        let kad = build_kad_behaviour(peer, kad_protocol, DEFAULT_KAD_QUERY_TIMEOUT);
+        let kad = build_kad_behaviour(peer, kad_protocol, DEFAULT_KAD_QUERY_TIMEOUT, true);
         let names: Vec<String> = kad.protocol_names().iter().map(|p| p.to_string()).collect();
 
         // The library DEFAULT preset (`kad::Behaviour::new` / `kad::Config::default()`) — the
@@ -2505,7 +2546,7 @@ mod tests {
         let scope = "prod-path-scope";
         let kad_protocol = StreamProtocol::try_from_owned(format!("/nix-p2p/{scope}/kad/1.0.0"))
             .expect("the scoped kad protocol name is valid");
-        let kad = build_kad_behaviour(peer, kad_protocol, DEFAULT_KAD_QUERY_TIMEOUT);
+        let kad = build_kad_behaviour(peer, kad_protocol, DEFAULT_KAD_QUERY_TIMEOUT, true);
         assert_private_kad_isolation(kad.protocol_names(), scope, peer)
             .expect("the real private-scoped production kad must satisfy the startup invariant");
     }

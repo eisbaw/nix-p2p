@@ -325,6 +325,7 @@ async fn run_serves_a_discovered_libp2p_nar_and_falls_back_on_miss() {
         envelope: SafetyEnvelope::default(),
         state_dir: None,
         relay_server_enabled: true,
+        kad_server: true,
     };
     let (consumer, _libp2p_source, _raw) = build_libp2p_nar_source(cfg)
         .await

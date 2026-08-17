@@ -236,6 +236,7 @@ async fn shipped_store_announce_carries_verified_content_and_refuses_quarantined
         envelope: SafetyEnvelope::default(),
         state_dir: None,
         relay_server_enabled: true,
+        kad_server: true,
     };
     let (fabric, _source, _raw) = build_libp2p_provider_source(
         cfg,

@@ -5624,6 +5624,14 @@ def scenario_libp2p_leech(ctx: Ctx, expect) -> None:
             "S-LEECH: A boots in consume-only leech mode via the daemon-libp2p LeechFabric SEAM mask",
             f"provider log tail: {alog[-900:]!r}",
         )
+        # TASK-120 FIX A: a consume-only node runs kad in CLIENT mode (relay server OFF) - it issues
+        # queries + fetches but ANSWERS no DHT queries for others and provides no relay, so its swarm
+        # participation matches what it reports. A regression to kad-server would redden here.
+        expect(
+            "kad CLIENT mode, relay OFF" in alog,
+            "S-LEECH FIX A: the consume-only leech runs kad CLIENT mode + relay OFF (no DHT infrastructure)",
+            f"provider log tail: {alog[-900:]!r}",
+        )
 
         time.sleep(LIBP2P_CONVERGE_S)  # bounded kad settle
 

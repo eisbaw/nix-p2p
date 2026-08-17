@@ -115,6 +115,7 @@ async fn provider_serves_and_announces_a_nar_a_consumer_discovers_and_fetches_wi
         envelope: SafetyEnvelope::default(),
         state_dir: None,
         relay_server_enabled: true,
+        kad_server: true,
     };
     let supplier = Arc::new(MemoryNarSupplier::new([nar.clone()]));
     let (provider_fabric, _p_source, _p_raw_serve) = build_libp2p_provider_source(
@@ -185,6 +186,7 @@ async fn provider_serves_and_announces_a_nar_a_consumer_discovers_and_fetches_wi
         envelope: SafetyEnvelope::default(),
         state_dir: None,
         relay_server_enabled: true,
+        kad_server: true,
     };
     let (consumer_fabric, libp2p_source, _c_raw_serve) = build_libp2p_nar_source(consumer_cfg)
         .await

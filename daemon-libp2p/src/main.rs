@@ -19,7 +19,7 @@ use daemon_core::{
     RegularFileNarDumper, StorePath,
 };
 use daemon_core::{
-    CacheInfo, ContractRequest, CorrelationStore, NARINFO_CACHE_FLAG_CONFLICT, NarSource,
+    CacheInfo, ContractRequest, CorrelationStore, DhtRole, NARINFO_CACHE_FLAG_CONFLICT, NarSource,
     NarinfoLayer, NarinfoSource, OperatorContract, PassThroughReason, PrivacyPolicy,
     PublicNarAllowlist, RawUpstream, ResourceCaps, RunConfig, SharingProfile, SystemClock,
     UpstreamHttp, build_narinfo_layer, resolve_narinfo_cache_dir, run,
@@ -158,6 +158,14 @@ fn default_libp2p_announce_budget() -> u64 {
 /// stance and validates. daemon-libp2p is the libp2p-primary binary, so it selects no deferred
 /// reference mechanism (no iroh give-side here); `active_reference_mechanisms` is empty.
 fn build_contract(cfg: &Config) -> Result<OperatorContract, String> {
+    // FIX A: the reported DHT role is what the swarm ACTUALLY runs, derived from the SAME profile
+    // that drives the kad mode in `source_config` (upstream-only builds no swarm, consume-only is a
+    // kad CLIENT, a provider is a kad SERVER) - so the report cannot drift from the wire.
+    let dht_role = match cfg.profile {
+        SharingProfile::UpstreamOnly => DhtRole::None,
+        SharingProfile::ConsumeOnly => DhtRole::Client,
+        SharingProfile::LanShare | SharingProfile::PublicShare => DhtRole::Server,
+    };
     let contract = OperatorContract {
         profile: cfg.profile,
         caps: ResourceCaps::default(),
@@ -166,6 +174,7 @@ fn build_contract(cfg: &Config) -> Result<OperatorContract, String> {
         },
         selected_mechanisms: Vec::new(),
         active_reference_mechanisms: Vec::new(),
+        dht_role,
     };
     contract.validate().map_err(|e| e.to_string())?;
     Ok(contract)
@@ -512,17 +521,48 @@ fn check_runtime_preconditions(cfg: &Config) -> Result<(), String> {
         return Err(
             "consume-only requires at least one --libp2p-bootstrap <PeerId>@<multiaddr> (it fetches from peers); for pure HTTP fallback use --profile upstream-only with no bootstrap".into(),
         );
+    } else if cfg.profile == SharingProfile::UpstreamOnly {
+        // TASK-120 fix A: upstream-only runs NO participating libp2p swarm - it is a pure HTTP
+        // node. Refuse any flag that would start/participate a swarm (listen, bootstrap, provider
+        // address, external address), so an upstream-only node can NEVER bind a kad server / relay
+        // and then report `public_dht_participation=false`. The report matches the wire because
+        // there is no swarm at all.
+        let swarm_flag = [
+            ("--libp2p-listen", !cfg.libp2p_listen.is_empty()),
+            ("--libp2p-bootstrap", !cfg.libp2p_bootstrap.is_empty()),
+            (
+                "--libp2p-provider-addr",
+                !cfg.libp2p_provider_addrs.is_empty(),
+            ),
+            (
+                "--libp2p-external-address",
+                !cfg.libp2p_external_addresses.is_empty(),
+            ),
+        ];
+        if let Some((flag, _)) = swarm_flag.iter().find(|(_, present)| *present) {
+            return Err(format!(
+                "upstream-only runs NO libp2p swarm (pure HTTP fallback); it cannot be combined \
+                 with {flag}. Drop it, or select --profile consume-only (to fetch from peers) or a \
+                 provider profile."
+            ));
+        }
     }
     Ok(())
 }
 
-fn source_config(cfg: &Config) -> Result<Libp2pSourceConfig, String> {
-    // TASK-185 GB1: anchor the identity to the state dir so a plain `--libp2p-state-dir`-only
-    // restart is the SAME node (stable identity + stable sequence floor). An explicit
-    // --libp2p-identity-seed still wins but must agree with any persisted one.
-    let identity_seed =
-        resolve_durable_identity_seed(cfg.libp2p_state_dir.as_deref(), cfg.libp2p_identity_seed)?;
-    Ok(Libp2pSourceConfig {
+/// Build the fabric construction config for a SWARM-PARTICIPATING profile (consume-only or a
+/// provider). TASK-120 fix A: the swarm's PARTICIPATION MODE derives from the profile. A PROVIDER
+/// (lan-share/public-share) runs kad SERVER + the relay server as configured (it participates in
+/// the DHT infrastructure); a CONSUMER (consume-only) runs kad CLIENT + relay server OFF (it issues
+/// queries and fetches, but answers no DHT queries and relays for nobody - no infrastructure).
+/// upstream-only never calls this: it runs no participating swarm at all (a pure HTTP node).
+fn source_config(
+    cfg: &Config,
+    profile: SharingProfile,
+    identity_seed: [u8; 32],
+) -> Libp2pSourceConfig {
+    let serves = profile.serves();
+    Libp2pSourceConfig {
         identity_seed,
         network_scope: cfg.libp2p_scope.clone().unwrap_or_else(|| "v1".to_string()),
         // The FIRST --libp2p-listen is bound by the shared construction; any EXTRA listens (and all
@@ -533,8 +573,32 @@ fn source_config(cfg: &Config) -> Result<Libp2pSourceConfig, String> {
         discovery_budget: DiscoveryBudget::default(),
         envelope: SafetyEnvelope::default(),
         state_dir: cfg.libp2p_state_dir.clone(),
-        relay_server_enabled: cfg.libp2p_relay_server_enabled,
-    })
+        // A CONSUMER relays for nobody (relay server OFF); a PROVIDER uses the configured value.
+        relay_server_enabled: serves && cfg.libp2p_relay_server_enabled,
+        // A PROVIDER is a kad SERVER (DHT participation); a CONSUMER is a kad CLIENT.
+        kad_server: serves,
+    }
+}
+
+/// Apply the EXTRA `--libp2p-listen` addresses (the first was bound by the shared construction) and
+/// ALL `--libp2p-external-address` self-advertisements to a running [`Libp2pFabric`] (TASK-207).
+/// Shared by the provider and consumer paths (both run a participating swarm); upstream-only has no
+/// swarm and never calls this. Fail-fast on a listen error (a reservation address that cannot be
+/// registered is a config fault); `add_external_address` is a fire-and-forget hint.
+async fn apply_swarm_addresses(fabric: &Arc<Libp2pFabric>, cfg: &Config) -> Result<(), String> {
+    for extra in cfg.libp2p_listen.iter().skip(1) {
+        fabric
+            .handle()
+            .listen(extra.clone())
+            .await
+            .map_err(|e| format!("cannot listen on {extra}: {e}"))?;
+        println!("daemon-libp2p: additional libp2p listen {extra}");
+    }
+    for ext in &cfg.libp2p_external_addresses {
+        fabric.handle().add_external_address(ext.clone()).await;
+        println!("daemon-libp2p: advertising external address {ext}");
+    }
+    Ok(())
 }
 
 /// What keeps a libp2p PROVIDER serving for the process. Dropping the [`ServeHandle`] stops
@@ -1056,8 +1120,14 @@ async fn main() -> ExitCode {
         eprintln!("daemon-libp2p: {}", daemon_core::DIAGNOSTICS_WARNING);
     }
 
-    let source_cfg = match source_config(&cfg) {
-        Ok(sc) => sc,
+    // Resolve the durable identity seed ONCE (TASK-185 GB1: anchor to the state dir so a plain
+    // `--libp2p-state-dir` restart is the SAME node). Shared by the public-NAR allowlist MAC key,
+    // the (participating) fabric construction, and the upstream-only FakeFabric's NodeId.
+    let identity_seed = match resolve_durable_identity_seed(
+        cfg.libp2p_state_dir.as_deref(),
+        cfg.libp2p_identity_seed,
+    ) {
+        Ok(s) => s,
         Err(err) => {
             eprintln!("daemon-libp2p: {err}");
             return ExitCode::FAILURE;
@@ -1074,7 +1144,7 @@ async fn main() -> ExitCode {
     let public_allowlist = match open_public_allowlist(
         cfg.libp2p_public_allowlist_path.as_deref(),
         &cfg.libp2p_trusted_public_keys,
-        &source_cfg.identity_seed,
+        &identity_seed,
         &cfg.libp2p_prove_public_narinfo,
     ) {
         Ok(a) => a,
@@ -1139,21 +1209,45 @@ async fn main() -> ExitCode {
 
     // Consumer axes; a provider additionally needs the serve + announce axes. `run` re-asserts
     // these, and the construction already asserted them at start (belt and braces).
+    // AUTHORITY INVERSION (TASK-120 fix #3 + fix A): BOTH the serve/announce axes AND the SWARM
+    // PARTICIPATION derive from the AUTHORITATIVE profile, so a node's reported participation
+    // matches what it does on the wire:
+    //   * UPSTREAM-ONLY: NO participating swarm at all - a pure HTTP node backed by a FakeFabric
+    //     (every P2P axis None). No kad (server OR client), no relay, no listen. required_axes is
+    //     EMPTY. This is why `public_dht_participation=false` is honest: there is no swarm.
+    //   * CONSUME-ONLY: a Libp2pFabric in kad CLIENT mode + relay-server OFF (source_config), masked
+    //     with LeechFabric (serve+announce None). It fetches but provides no DHT infrastructure.
+    //   * PROVIDER (lan-share/public-share): a Libp2pFabric in kad SERVER mode + relay as configured,
+    //     with the serve gate + announcer installed.
     let mut required_axes = vec![
         Axis::ProviderDirectory,
         Axis::NodeLocator,
         Axis::Transfer(TransportTag::Iroh),
     ];
-
-    // AUTHORITY INVERSION (TASK-120 fix #3): the serve gate + announcer are installed IFF the
-    // AUTHORITATIVE profile SERVES (lan-share / public-share) - NOT off the raw `libp2p_provider`
-    // boolean. A non-serving profile (upstream-only / consume-only) takes the consumer path and is
-    // masked below, so it CANNOT serve or announce regardless of any stray give-side flag.
     let _serve_guard: Option<ProviderGuard>;
-    let fabric: Arc<Libp2pFabric> = if contract.profile.serves() {
+    let fabric_dyn: Arc<dyn PeerFabric>;
+
+    if contract.profile == SharingProfile::UpstreamOnly {
+        // FIX A: a pure HTTP node. No libp2p swarm is constructed, so it stores nothing, answers no
+        // DHT query, and relays for nobody. required_axes is emptied (the FakeFabric exposes no P2P
+        // axis and `run` asserts only what is required).
+        required_axes.clear();
+        _serve_guard = None;
+        let node_id = NodeId::from_bytes(
+            SigningKey::from_bytes(&identity_seed)
+                .verifying_key()
+                .to_bytes(),
+        );
+        fabric_dyn = Arc::new(peer_fabric::FakeFabric::upstream_only(node_id));
+        println!(
+            "daemon-libp2p: UPSTREAM-ONLY started - pure HTTP fallback, NO libp2p swarm (no DHT \
+             participation: no kad server/client, no relay, no serving, no announce)"
+        );
+    } else if contract.profile.serves() {
         required_axes.push(Axis::Server);
         required_axes.push(Axis::Announcer);
-        match install_provider(&cfg, &contract, source_cfg, &public_allowlist).await {
+        let source_cfg = source_config(&cfg, contract.profile, identity_seed);
+        let fabric = match install_provider(&cfg, &contract, source_cfg, &public_allowlist).await {
             Ok((fabric, guard)) => {
                 _serve_guard = Some(guard);
                 let supplied = if cfg.libp2p_provide_store.is_empty() {
@@ -1164,34 +1258,35 @@ async fn main() -> ExitCode {
                         cfg.libp2p_provide_store.len()
                     )
                 };
-                println!("daemon-libp2p: PROVIDER serving + announcing {supplied}");
+                println!(
+                    "daemon-libp2p: PROVIDER serving + announcing {supplied} (kad SERVER mode)"
+                );
                 fabric
             }
             Err(err) => {
                 eprintln!("daemon-libp2p: provider setup failed: {err}");
                 return ExitCode::FAILURE;
             }
+        };
+        if let Err(err) = apply_swarm_addresses(&fabric, &cfg).await {
+            eprintln!("daemon-libp2p: {err}");
+            return ExitCode::FAILURE;
         }
+        // A serving profile uses the concrete fabric (its serve gate is installed).
+        fabric_dyn = fabric;
     } else {
-        match build_libp2p_nar_source(source_cfg).await {
+        // CONSUME-ONLY: kad CLIENT + relay-server OFF (set in source_config), masked below.
+        _serve_guard = None;
+        let source_cfg = source_config(&cfg, contract.profile, identity_seed);
+        let fabric = match build_libp2p_nar_source(source_cfg).await {
             Ok((fabric, _source, _raw)) => {
-                _serve_guard = None;
-                // The non-serving profiles: consume-only (fetches from peers) and upstream-only
-                // (pure HTTP fallback, no bootstrap). Both are masked below so serve+announce are
-                // structurally absent; the role print reflects the AUTHORITATIVE profile.
-                let role = match contract.profile {
-                    SharingProfile::UpstreamOnly => "UPSTREAM-ONLY",
-                    _ => "CONSUMER",
-                };
                 println!(
-                    "daemon-libp2p: {role} started, discovery converging ({} bootstrap peer(s))",
+                    "daemon-libp2p: CONSUMER started (kad CLIENT mode, relay OFF), discovery \
+                     converging ({} bootstrap peer(s))",
                     cfg.libp2p_bootstrap.len()
                 );
                 if cfg.libp2p_leech {
-                    // TASK-78 exposure honesty (AC#5): state EXACTLY what a leech hides vs reveals,
-                    // so nobody reads consume-only as private lookup. The LeechFabric mask below
-                    // makes serve+announce structurally absent; the discovery lookups it still
-                    // sends are NOT hidden.
+                    // TASK-78 exposure honesty (AC#5): state EXACTLY what a leech hides vs reveals.
                     println!(
                         "daemon-libp2p: LIBP2P-LEECH consume-only: serves NOTHING + announces \
                          NOTHING (serve/announce axes masked at the capability seam). HONEST \
@@ -1206,25 +1301,14 @@ async fn main() -> ExitCode {
                 eprintln!("daemon-libp2p: consumer setup failed: {err}");
                 return ExitCode::FAILURE;
             }
-        }
-    };
-
-    // TASK-207: apply the EXTRA --libp2p-listen addresses (the first was bound by the shared
-    // construction) and ALL --libp2p-external-address self-advertisements now that the fabric
-    // exists. Extra listens carry a NAT'd provider's relay `/…/p2p-circuit` reservation; external
-    // addresses let a relay node cite its public address in reservation vouchers. Fail-fast on a
-    // listen error (a requested reservation address that cannot be registered is a config fault,
-    // not something to serve around silently); add_external_address is a fire-and-forget hint.
-    for extra in cfg.libp2p_listen.iter().skip(1) {
-        if let Err(err) = fabric.handle().listen(extra.clone()).await {
-            eprintln!("daemon-libp2p: cannot listen on {extra}: {err}");
+        };
+        if let Err(err) = apply_swarm_addresses(&fabric, &cfg).await {
+            eprintln!("daemon-libp2p: {err}");
             return ExitCode::FAILURE;
         }
-        println!("daemon-libp2p: additional libp2p listen {extra}");
-    }
-    for ext in &cfg.libp2p_external_addresses {
-        fabric.handle().add_external_address(ext.clone()).await;
-        println!("daemon-libp2p: advertising external address {ext}");
+        // AUTHORITY INVERSION (fix #3): a non-serving profile is wrapped in the LeechFabric mask so
+        // serve + announce are structurally None at the seam.
+        fabric_dyn = Arc::new(LeechFabric::new(fabric));
     }
 
     let listener = match TcpListener::bind(cfg.listen).await {
@@ -1270,17 +1354,9 @@ async fn main() -> ExitCode {
             .and_then(|g| g.post_fetch_announce.clone()),
     };
 
-    // AUTHORITY INVERSION (TASK-120 fix #3): a NON-SERVING profile (upstream-only OR consume-only)
-    // is wrapped in the transport-agnostic [`LeechFabric`] mask, which makes the serve + announce
-    // axes structurally `None` at the seam - so a default/consume-only node gives NOTHING back even
-    // if a stray give-side flag slipped through. A serving profile (lan-share/public-share) uses the
-    // concrete fabric (its serve gate was installed above). The mask keys off `profile.serves()`,
-    // NOT the `libp2p_leech` boolean.
-    let fabric_dyn: Arc<dyn PeerFabric> = if !contract.profile.serves() {
-        Arc::new(LeechFabric::new(fabric.clone()))
-    } else {
-        fabric.clone()
-    };
+    // `fabric_dyn` was built above per the AUTHORITATIVE profile: a FakeFabric (no swarm) for
+    // upstream-only, a LeechFabric-masked consumer for consume-only, or the concrete serving fabric
+    // for a provider profile.
     let mut success = true;
     tokio::select! {
         result = run(fabric_dyn, run_cfg) => {
@@ -1549,7 +1625,7 @@ mod operator_contract_tests {
     //! serve budget that drifts from the caps, or a fresh node that cannot start) is caught here.
     use super::{
         build_contract, check_runtime_preconditions, default_libp2p_announce_budget, parse_config,
-        provider_serve_budget,
+        provider_serve_budget, source_config,
     };
     use daemon_core::{ResourceCaps, SharingProfile};
 
@@ -1682,6 +1758,56 @@ mod operator_contract_tests {
             .err()
             .expect("--profile consume-only on a bare (upstream-only) node must fail closed");
         assert!(err2.contains("disagrees"), "{err2}");
+    }
+
+    /// FIX A: the swarm PARTICIPATION MODE derives from the profile. A CONSUMER is a kad CLIENT +
+    /// relay-server OFF (provides no DHT infrastructure); a PROVIDER is a kad SERVER + relay on.
+    /// This is what makes `public_dht_participation` honest against the wire. Mutation: flip either
+    /// mapping and the mismatch reddens.
+    #[test]
+    fn swarm_participation_mode_derives_from_the_profile() {
+        let consumer = parse_config(args(&["--libp2p-bootstrap", BOOT])).expect("consumer parses");
+        assert_eq!(consumer.profile, SharingProfile::ConsumeOnly);
+        let sc = source_config(&consumer, consumer.profile, [7u8; 32]);
+        assert!(
+            !sc.kad_server,
+            "consume-only must be a kad CLIENT, not a server"
+        );
+        assert!(
+            !sc.relay_server_enabled,
+            "consume-only must relay for nobody (relay-server OFF)"
+        );
+
+        let provider = parse_config(args(&[
+            "--libp2p-provider",
+            "--libp2p-listen",
+            "/ip4/127.0.0.1/tcp/0",
+            "--libp2p-seed-nar",
+            &format!("{APP_NAR_HASH}=/tmp/app.nar"),
+        ]))
+        .expect("provider parses");
+        let sc2 = source_config(&provider, provider.profile, [7u8; 32]);
+        assert!(
+            sc2.kad_server,
+            "a provider must be a kad SERVER (DHT participation)"
+        );
+        assert!(
+            sc2.relay_server_enabled,
+            "a provider relays by default (relay-server ON)"
+        );
+    }
+
+    /// FIX A: an UPSTREAM-ONLY node runs NO participating swarm, so any swarm-starting flag
+    /// (--libp2p-listen/bootstrap/provider-addr/external-address) is REFUSED at runtime - it can
+    /// never bind a kad server/relay and then report public_dht_participation=false.
+    #[test]
+    fn upstream_only_refuses_swarm_flags() {
+        let cfg = parse_config(args(&["--libp2p-listen", "/ip4/127.0.0.1/tcp/0"]))
+            .expect("upstream-only + a stray listen parses (contract is valid)");
+        assert_eq!(cfg.profile, SharingProfile::UpstreamOnly);
+        let err = check_runtime_preconditions(&cfg)
+            .expect_err("upstream-only must refuse --libp2p-listen (no participating swarm)");
+        assert!(err.contains("NO libp2p swarm"), "{err}");
     }
 
     /// AC#7 + fix #3: `--preflight` renders the INTENDED profile with NO network-precondition

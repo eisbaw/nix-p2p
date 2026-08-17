@@ -132,6 +132,13 @@ pub struct Libp2pSourceConfig {
     /// [`NodeConfig::with_relay_server`]: the relay-client / autonat / dcutr behaviours stay
     /// intact, only the server (which accepts reservations + forwards circuits) is dropped.
     pub relay_server_enabled: bool,
+    /// Whether this node runs Kademlia in SERVER mode (TASK-120 fix A). Threads straight to
+    /// [`NodeConfig::with_kad_server`]. The operator contract sets it from the participation
+    /// profile: a PROVIDER (lan-share/public-share) is a kad SERVER (stores + answers DHT
+    /// queries for others - real DHT participation); a CONSUMER (consume-only) is a kad CLIENT
+    /// (issues queries, answers none). An upstream-only node runs no participating swarm at all
+    /// and never builds this config. Default `true` (server); a consumer sets `false`.
+    pub kad_server: bool,
 }
 
 /// Build the PRODUCTION libp2p [`NarSource`] from `cfg`: start a [`Libp2pFabric`],
@@ -2086,6 +2093,8 @@ async fn start_and_join_libp2p(
     let mut node_config = NodeConfig::new(cfg.identity_seed)
         .with_network_scope(cfg.network_scope.clone())
         .with_relay_server(cfg.relay_server_enabled)
+        // TASK-120 fix A: kad server/client mode from the participation profile.
+        .with_kad_server(cfg.kad_server)
         // TASK-231 (AC#2): the announcer's per-fabric publication-eligibility authority. A pure
         // CONSUMER passes RefusePublication (it never announces); a PROVIDER injects the
         // allowlist-backed (public) or AdmitAll (isolated-LAN) decision from the composition root.
