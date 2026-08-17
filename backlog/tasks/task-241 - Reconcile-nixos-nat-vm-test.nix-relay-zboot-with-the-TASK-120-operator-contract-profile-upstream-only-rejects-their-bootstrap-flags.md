@@ -3,11 +3,11 @@ id: TASK-241
 title: >-
   Reconcile nixos/nat-vm-test.nix relay/zboot with the TASK-120
   operator-contract (--profile upstream-only rejects their bootstrap flags)
-status: In Progress
+status: Done
 assignee:
   - '@claude'
 created_date: '2026-08-17 04:15'
-updated_date: '2026-08-17 05:13'
+updated_date: '2026-08-17 05:44'
 labels:
   - ci
   - nixos
@@ -36,4 +36,6 @@ BROADER REGRESSION than task framing: the nat-vm build now PASSES subtest 2 (rel
 GATE GREEN (commit c528a08, NOT pushed). nix build .#nat-vm-test PASSES all 6 subtests exit 0: topology; services-come-up (relay+zboot start as ROUTER kad-SERVER - the original regression fixed); provider reserves (nodea public-share); NEGATIVE CONTROL; DISCOVERY+AC#1 byte-identical NAR fetch THROUGH the relay (re-validates TASK-218 circuit-v2 on libp2p 0.56, completes TASK-236 NAT AC#4); B2 LOAD-BEARING (relay-up fetch OK / relay-down FAILS, no DCUtR upgrade, provider MainPID unchanged, sole reservation relay was the stopped relay). just e2e 8/8 (incl S-LEECH mask). cargo test 1020 passed; TASK-120 safety bites (fresh_install upstream-only, fail-closed invalid-combo, derive-maps-each-intent) + new router bites (router_is_a_kad_server_that_gives_nothing, router_with_a_give_side_fails_closed=RouterServes, router_is_kad_server_relay_serving_nothing with kad_server/relay mutation) all green - fail-safe default NOT regressed. fmt/clippy -D warnings/no-floats/golden byte-identical all clean. Left In Progress for review (not marking Done).
 
 CODEX NO-GO (narrow, item 4 only). PASS: router serves-nothing, explicit-only/never-default, NO TASK-120 regression, frozen/no-float; nat-vm 6/6 (re-validates 218 on 0.56 + completes 236 NAT AC#4). FAIL: a PUBLIC router (kad-server+relay at a public external address) reports public_dht_participation=false (public_participation() true only for PublicShare) - report!=wire, same honesty class TASK-120 fixed. Round-2 fix: public_dht_participation for Router reflects actual reachability (public addr/non-isolated -> true; LAN -> false) + a bite. Convergent.
+
+CODEX RE-GATE: GO (commits c528a08 + 8e99231). Fixes the TASK-120 nat-vm regression via a minimal Router role (kad-server+relay, serves/announces NOTHING, LeechFabric-masked, 3-layer RouterServes fail-closed, never a default). public_dht_participation() derives from (profile, reachability): a public router (external-address advertised) reports true, a LAN router false, mutation-proven - report matches wire. NO TASK-120 regression (fail-safe upstream-only default + safety bites green). nix build .#nat-vm-test 6/6 - re-validates TASK-218 circuit-v2 relay on libp2p 0.56 and COMPLETES TASK-236 NAT AC#4. just e2e 8/8, cargo test 1021/0, golden byte-identical. DONE.
 <!-- SECTION:NOTES:END -->
