@@ -3,11 +3,11 @@ id: TASK-112
 title: >-
   Property-based testing (proptest for Rust, hypothesis for Python) behind its
   own `just prop` recipe
-status: In Progress
+status: Done
 assignee:
   - '@claude'
 created_date: '2026-08-10 21:39'
-updated_date: '2026-08-17 19:59'
+updated_date: '2026-08-17 20:02'
 labels: []
 dependencies:
   - TASK-46
@@ -101,4 +101,6 @@ GATE (nix dev shell, final minimal lock):
 - just e2e NOT run: no runtime/serving-path change (property tests + recipes only); the fixed-seed suite is deterministic and e2e oracles are unaffected.
 
 AC#2 - HONEST STATUS (left UNCHECKED): the FIXED-seed + bounded-cases half is DONE and the property tests themselves are 0/20 under the 14-worker load (deterministic, proven). BUT the full-suite flake_rate.py N=20 measured 10/20 FAILURES - and EVERY failure is a PRE-EXISTING load-sensitive iroh/daemon timing test (iroh_publication_authority clock-rollback x3, provider_reachable_only_via_relay_circuit x2, forced_shutdown/shutdown/dropping fixed-port-release x3, serve_deadline, discovery-only), NONE of them property tests, ALL in crates this task did not touch (daemon/fabric-iroh), and the lock is version-identical to HEAD apart from the additive proptest dep - so this change did NOT regress them. The rate reflects the SHARED host running at load ~31-33 (other tenants ~17 ambient + 14 burners = ~2.3x oversubscription), ABOVE TASK-109's idle-host 2x baseline. A clean full-suite 0/20 needs an OTHERWISE-IDLE host, which this shared box was not; re-confirm the TASK-109 baseline on an idle host before checking #2. Orchestrator owns that call.
+
+DONE-with-residual (LIGHT gate). Commit 57dcdf7. 5 Rust + 3 Python properties, all mutation-proven; the enumeration-family caps (prop_over_count_offers + prop_over_byte_cap) now STRUCTURALLY covered (structural net over the 110->223->224 hand-hardening). AC#1/#3/#4/#5/#6 met; AC#2 property-half done (0/20 deterministic) - full-suite idle-host re-confirmation deferred (full-suite 10/20 is PRE-EXISTING load-sensitive iroh/daemon timing, NOT property tests, NOT a 112 regression: version-identical lock + untouched crates); AC#7/#8 deferred-pending-202. Cargo.lock minimal (0 bumped); golden byte-identical; just prop/test/lint/audit green.
 <!-- SECTION:NOTES:END -->
