@@ -187,6 +187,13 @@ fn build_contract(cfg: &Config) -> Result<OperatorContract, String> {
         selected_mechanisms: Vec::new(),
         active_reference_mechanisms: Vec::new(),
         dht_role,
+        // TASK-241: does this node advertise a PUBLIC/reachable self-address? `--libp2p-external-address`
+        // is the operator's explicit "I am reachable here" declaration (a relay/bootstrap sets it so
+        // peers can dial it). This makes a PUBLIC router's `public_dht_participation` report the honest
+        // `true` (a publicly-reachable kad-server + relay) while a LAN-isolated router reports `false` -
+        // the report matches the wire. Inert for the give/consume modes (their public participation is
+        // intrinsic).
+        advertises_public_reachability: !cfg.libp2p_external_addresses.is_empty(),
     };
     contract.validate().map_err(|e| e.to_string())?;
     Ok(contract)
@@ -1807,6 +1814,41 @@ mod operator_contract_tests {
         // The reported DHT role matches the wire.
         let contract = build_contract(&cfg).expect("router contract is valid");
         assert_eq!(contract.dht_role, daemon_core::DhtRole::Server);
+        // TASK-241 (codex item 4): this router advertises NO external address, so it is LAN-isolated
+        // and must report public_dht_participation=false - NOT the intrinsic-profile hardcode.
+        assert!(
+            !contract.advertises_public_reachability && !contract.public_dht_participation(),
+            "a router with no --libp2p-external-address must report public_dht_participation=false"
+        );
+
+        // A PUBLIC router - same flags PLUS a self-advertised external address - runs a
+        // publicly-reachable kad-server + relay, so it MUST report public_dht_participation=true
+        // (the honesty gap codex caught: a public router mislabelled false). It still serves +
+        // announces NOTHING.
+        let public_router = parse_config(args(&[
+            "--libp2p-router",
+            "--libp2p-listen",
+            "/ip4/0.0.0.0/tcp/0",
+            "--libp2p-external-address",
+            "/ip4/203.0.113.7/tcp/4001",
+            "--libp2p-bootstrap",
+            BOOT,
+        ]))
+        .expect("a public router parses");
+        assert_eq!(public_router.profile, SharingProfile::Router);
+        let pub_contract = build_contract(&public_router).expect("public router contract is valid");
+        assert!(
+            pub_contract.advertises_public_reachability && pub_contract.public_dht_participation(),
+            "a router advertising a public external address must report public_dht_participation=true"
+        );
+        assert!(
+            pub_contract
+                .preflight()
+                .contains("public_dht_participation: true"),
+            "the preflight must print public_dht_participation: true for a public router"
+        );
+        // ...and it STILL serves + announces NOTHING (public reachability is not a give side).
+        assert!(!public_router.profile.serves() && !public_router.profile.announces());
 
         // `--libp2p-no-relay-server` drops ONLY the relay server (a kad-only bootstrap like zboot):
         // still a kad SERVER, but relays for nobody, so it can never be an alternative relay path.

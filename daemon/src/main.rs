@@ -605,6 +605,10 @@ fn derive_contract(config: &Config) -> Result<OperatorContract, String> {
         selected_mechanisms: Vec::new(),
         active_reference_mechanisms: active_reference,
         dht_role,
+        // TASK-241: the composite exposes no `--libp2p-external-address` and no router mode, so it
+        // advertises no libp2p public self-address here (iroh public reachability is governed by the
+        // #3a endpoint-scope gate, not this field). Inert for every profile the composite derives.
+        advertises_public_reachability: false,
     };
     contract.validate().map_err(|e| e.to_string())?;
 

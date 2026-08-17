@@ -757,6 +757,17 @@ pub struct OperatorContract {
     /// its flag-authoritative always-server behaviour, C-deferred), so the reported DHT role cannot
     /// drift from reality. Default [`DhtRole::None`] (a fresh install runs no participating swarm).
     pub dht_role: DhtRole,
+    /// Whether the node advertises a PUBLIC/reachable self-address on the wire (TASK-241): set by
+    /// each binary from `--libp2p-external-address` (the operator's explicit "I am reachable here"
+    /// declaration a relay/bootstrap sets so peers can dial it). It only CHANGES the report for the
+    /// [`Router`](SharingProfile::Router) mode, whose public-DHT participation depends on its ACTUAL
+    /// reachability rather than being intrinsic to the profile: a router that advertises a public
+    /// address runs a PUBLICLY-reachable kad server + relay (a public DHT participant); a
+    /// LAN-isolated router (no advertised public address) does not. The four give/consume modes'
+    /// public participation is intrinsic (public-share yes, the rest no), so this field is inert for
+    /// them. See [`public_dht_participation`](OperatorContract::public_dht_participation). Default
+    /// `false` (a fresh install advertises nothing).
+    pub advertises_public_reachability: bool,
 }
 
 impl OperatorContract {
@@ -770,6 +781,7 @@ impl OperatorContract {
             selected_mechanisms: Vec::new(),
             active_reference_mechanisms: Vec::new(),
             dht_role: DhtRole::None,
+            advertises_public_reachability: false,
         }
     }
 
@@ -778,6 +790,24 @@ impl OperatorContract {
         OperatorContract {
             profile,
             ..OperatorContract::fresh_install()
+        }
+    }
+
+    /// Whether this node participates in the PUBLIC DHT as a server / advertises public
+    /// reachability — the honest, report-matches-wire answer the preflight/status prints (TASK-241
+    /// fix). For the four give/consume modes this is INTRINSIC to the profile
+    /// ([`SharingProfile::public_participation`]: public-share yes, the rest no). A
+    /// [`Router`](SharingProfile::Router) is the exception: a single `router` profile can be PUBLIC
+    /// or LAN depending on its address, so its public participation is computed from its ACTUAL
+    /// reachability ([`advertises_public_reachability`](OperatorContract::advertises_public_reachability)),
+    /// NOT hardcoded to the profile. A router advertising a public/external address runs a
+    /// publicly-reachable kad server + relay (`true`); a LAN-isolated router (`false`). This closes
+    /// the honesty gap where a public router would run public DHT infrastructure while reporting it
+    /// does not — exactly the report≠wire lie the profile fixes closed for the other modes.
+    pub fn public_dht_participation(&self) -> bool {
+        match self.profile {
+            SharingProfile::Router => self.advertises_public_reachability,
+            other => other.public_participation(),
         }
     }
 
@@ -875,9 +905,12 @@ impl OperatorContract {
         out.push("participation:".to_string());
         out.push(format!("  serves_bytes: {}", self.profile.serves()));
         out.push(format!("  publishes_records: {}", self.profile.announces()));
+        // TASK-241: the reachability-aware answer, so a PUBLIC router (a publicly-reachable
+        // kad-server + relay) is not mislabelled `false`. Computed from (profile, reachability),
+        // not the profile alone - the report matches the wire.
         out.push(format!(
             "  public_dht_participation: {}",
-            self.profile.public_participation()
+            self.public_dht_participation()
         ));
         // FIX A: the ACTUAL kad role on the wire (set by the binary), so the report cannot drift
         // from what the swarm runs - a node reporting no participation while running a kad server
@@ -1213,6 +1246,71 @@ mod tests {
                 SharingProfile::derive(req).unwrap_err(),
                 ContractError::RouterServes,
                 "a router + give-side intent must fail closed: {req:?}"
+            );
+        }
+    }
+
+    /// TASK-241 (codex item 4): a PUBLIC router (one advertising a reachable external address) runs
+    /// a publicly-reachable kad-server + relay, so it IS a public DHT participant and the report
+    /// MUST say so; a LAN-isolated router (no advertised public address) is not. The report is
+    /// computed from (profile, reachability), NOT the profile alone.
+    ///
+    /// MUTATION: hardcoding the router arm to `false` (the bug codex caught) reddens the public
+    /// case; hardcoding it to `true` reddens the LAN case; ignoring reachability (return the
+    /// intrinsic `profile.public_participation()`, which is `false` for Router) reddens the public
+    /// case. Only the reachability-threaded computation passes both.
+    #[test]
+    fn public_router_reports_public_dht_participation_lan_router_does_not() {
+        let public_router = OperatorContract {
+            advertises_public_reachability: true,
+            dht_role: DhtRole::Server,
+            ..OperatorContract::for_profile(SharingProfile::Router)
+        };
+        assert!(
+            public_router.public_dht_participation(),
+            "a router advertising a public reachable address IS a public DHT participant"
+        );
+        assert!(
+            public_router
+                .preflight()
+                .contains("public_dht_participation: true"),
+            "the preflight report must say true for a public router:\n{}",
+            public_router.preflight()
+        );
+
+        let lan_router = OperatorContract {
+            advertises_public_reachability: false,
+            dht_role: DhtRole::Server,
+            ..OperatorContract::for_profile(SharingProfile::Router)
+        };
+        assert!(
+            !lan_router.public_dht_participation(),
+            "a LAN-isolated router (no advertised public address) is NOT a public DHT participant"
+        );
+        assert!(
+            lan_router
+                .preflight()
+                .contains("public_dht_participation: false"),
+            "the preflight report must say false for a LAN router:\n{}",
+            lan_router.preflight()
+        );
+
+        // The four give/consume modes stay INTRINSIC (reachability is inert for them): public-share
+        // is always true, and the rest false, regardless of the reachability field.
+        for (p, want) in [
+            (SharingProfile::UpstreamOnly, false),
+            (SharingProfile::ConsumeOnly, false),
+            (SharingProfile::LanShare, false),
+            (SharingProfile::PublicShare, true),
+        ] {
+            let c = OperatorContract {
+                advertises_public_reachability: true, // deliberately set; must NOT change the answer
+                ..OperatorContract::for_profile(p)
+            };
+            assert_eq!(
+                c.public_dht_participation(),
+                want,
+                "{p} public participation is intrinsic and must ignore the reachability field"
             );
         }
     }
