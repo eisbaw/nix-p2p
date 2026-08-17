@@ -7,7 +7,7 @@ status: In Progress
 assignee:
   - '@me'
 created_date: '2026-08-15 19:54'
-updated_date: '2026-08-17 14:09'
+updated_date: '2026-08-17 14:38'
 labels:
   - irreversible
 dependencies: []
@@ -38,4 +38,14 @@ PINNED TEST FLIP: a_padded_unknown_kind_have_still_saturates_the_frame_and_decod
 BITES (each mutation-proven red via a temporary env-gate, removed before commit): (1) single-key over-cap Have REJECTED [disable cap -> red]; (2) legit iroh + ~1 KiB under-cap unknown offer still ACCEPTED/tolerated [tiny cap 10 -> red]; (3) batch over-cap offer REJECTED [disable cap -> red]; (4) golden every_reject_vector_is_refused with 3 new byte-cap vectors [disable cap -> red]; parity test over-cap+control [disable -> red]. Golden existing wires byte-identical (pure additions; git diff 0 deletions on the wire strings).
 
 GATE (actual, nix dev shell): cargo test --workspace 1055 passed / 0 failed (89 blocks); cargo fmt --all --check ok; cargo clippy --workspace --all-targets -D warnings rc 0; check-no-floats/check-golden-vectors/check-discovery-no-shortcut rc 0; just audit rc 0; just e2e 9/9 scenarios PASS (s1 11/11, narinfo 20/20, s2 9/9, tamper 4/4, chain 13/13, s6-p2p 11/11, bootstrap-outage 9/9, s9-grow 14/14, leech 16/16; 247.6s) exit 0.
+
+DEEP-gate round 2 fixes (commit aa53bb8 on top of 68e0c3a). Mechanism unchanged (cap 2048, offer_within_byte_cap logic byte-identical); honesty + freeze-precision + bite-quality only. No runtime path changed, so e2e NOT re-run (68e0c3a was e2e 9/9).
+
+F1 (HONESTY, wire-vs-decoded unit switch): re-scoped the claim EVERYWHERE from "closes byte-amplification / 744x->94x wire" to what the cap ACTUALLY delivers. The cap measures COMPACT re-serialized JSON, so whitespace/escape padding normalizes away and does NOT count; a mostly-whitespace 64 KiB response with <=4 tiny offers passes every gate, so raw WIRE amplification stays ~744x, and since unknown bodies are never re-emitted, whitespace is threat-equivalent. What the cap buys: (a) FIXED DECODED offer-CONTENT bound <= MAX_OFFERS_PER_ANSWER*2 KiB = 8 KiB, frame-independent (measured in decoded-content bytes, NOT a wire ratio); (b) forward-portability (binding constraint under the planned binary codec); (c) defense-in-depth. Raw-wire whitespace residual is frame-bounded ~744x, within the frame-bounded/cost-a-retry guarantee, now cited as TASK-244. Fixed at claim.rs (MAX_OFFER_WIRE_BYTES doc, check_single_offer_bindings "B." block, HoldAnswer/HoldResponseWire/deserialize_* docs, flipped+batch+after test comments), PRD.md (both sites), golden notes (reject_hold_response_two_locators_of_one_kind + the 3 new byte-cap vectors).
+
+F2 (FREEZE VALUE, wrapper arithmetic): the 2048 cap counts the whole offer incl. the ~32 B JSON wrapper, so the single-locator PAYLOAD budget is ~2016 B, not 2048. Removed the wrong "max-length ~2048 B URL fits" claim (2048 URL + wrapper ~2080 -> rejected); stated the honest ~2016 B ceiling (>5x a full iroh ticket, ~4x a long URL). Backward-safety corrected: an over-cap offer HARD-REJECTS the whole response (discarding co-located KNOWN offers); an old peer meeting a future >cap legit offer does NOT self-heal by retry, the resolver SKIPS that peer; the fix is a coordinated network-wide cap loosening BEFORE such a transport ships, not a per-exchange retry.
+
+F3 (BITE QUALITY, exact boundary): added the_per_offer_cap_constant_is_pinned (assert_eq!(MAX_OFFER_WIRE_BYTES, 2048)); an_offer_of_exactly_the_cap_is_accepted (compact size EXACTLY 2048 -> accepted, pins <= vs <); an_offer_one_byte_over_the_cap_is_rejected (EXACTLY 2049 -> rejected). Boundary tests use FIXED literals (2048/2049) so a constant drift moves the threshold, not the vector. MUTATIONS verified: (A) `>`->`>=` reddens 2048-accept, 2049-reject+constant-pin stay green; (B) constant 2048->2100 reddens constant-pin AND 2049-reject, 2048-accept stays green. Also added a_batch_response_with_an_under_cap_unknown_offer_is_accepted (batch accept-under-cap twin; mped LOW). Justfile "5 scenarios" comment NOT touched (not in a file I edited; orchestrator said skip).
+
+Gate (round 2): cargo test --workspace 1059 passed / 0 failed (89 blocks; +4 new tests); cargo fmt --all --check ok; cargo clippy --workspace --all-targets -D warnings rc 0 (fixed a doc-list-indentation lint on the new constant doc); check-no-floats/check-golden-vectors/check-discovery-no-shortcut rc 0; just audit rc 0; claim_wire_golden 16/16, doc_citations 3/3. Existing AND new golden wire strings byte-identical (only note text + tests changed this round).
 <!-- SECTION:NOTES:END -->
