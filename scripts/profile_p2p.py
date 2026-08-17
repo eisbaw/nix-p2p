@@ -734,6 +734,95 @@ def speedup_qualifier_violations(report: dict) -> list[str]:
     return problems
 
 
+# TASK-68: a rate whose NUMERATOR is a report CONSTANT is a latency reciprocal
+# wearing a throughput name. `workload_bytes / realise_s` has a constant on top,
+# so its cross-arm ratio is IDENTICALLY 1/latency-ratio: quoting it beside the
+# latency figure is one observation counted twice (task-42's "throughput ratio
+# 3.61 vs latency ratio 3.53" was the same measurement, the 3.61-vs-3.53 gap only
+# Jensen's mean-of-reciprocals). Each such key is registered here WITH the
+# disclaimer sibling that must travel in the same dict and spell the identity out.
+# This is a DERIVED-QUANTITY honesty rule, not a unit rule - `assert_unit_
+# coincidence` is correct and untouched; the numbers agree on units and still lie
+# about being two witnesses.
+CONSTANT_NUMERATOR_RATE_KEYS = {
+    # constant-numerator rate key -> disclaimer sibling that must sit beside it
+    "realise_rate_bytes_uncompressed_nar_per_s": "realise_rate_is_not_a_transport_rate",
+}
+
+# The disclaimer must NAME the identity, not merely exist. It has to say the
+# numerator is CONSTANT and that the figure is the latency reciprocal rescaled -
+# a vague "a rate in NarSize units" is exactly the editorial protection this
+# project keeps finding insufficient.
+_DERIVED_IDENTITY_TOKENS = ("constant", "1/latency")
+
+# Stems that name a constant-numerator rate, and stems that turn one into a
+# CLAIM (a second observation). A key carrying BOTH is the task-42 double-count
+# reborn - a `throughput_ratio` / `realise_rate_speedup` presented as if it
+# corroborated the latency ratio. `latency_*` keys carry NEITHER rate stem, so
+# the honest `latency_speedup_*` survives untouched; the measured transport link
+# rate carries no `ratio`/`speedup` stem, so it survives too.
+_CONSTANT_RATE_STEMS = ("throughput", "realise_rate")
+_CORROBORATION_STEMS = ("ratio", "speedup", "corrobor")
+
+
+def derived_quantity_violations(node, path: str = "") -> list[str]:
+    """No constant-numerator rate may be presented as an independent witness.
+
+    Two mechanical checks, both proven to BITE by mutation in `run_self_test`:
+
+      1. Every registered constant-numerator rate key must carry its disclaimer
+         sibling, and that sibling must SPELL the identity (constant numerator,
+         1/latency-ratio). A bare rate - or a vague one - is REJECTED.
+      2. No key may pair a constant-numerator rate stem with a corroboration
+         stem (`throughput_ratio`, `realise_rate_speedup`, ...): that is the
+         double-count restated, and the honest thing to quote is the latency
+         ratio alone.
+
+    Pure and structural: strings and set membership only, no float division, so
+    it introduces nothing into a gated decision that the no-floats rule forbids.
+    """
+    problems: list[str] = []
+    if isinstance(node, dict):
+        for rate_key, disclaimer_key in CONSTANT_NUMERATOR_RATE_KEYS.items():
+            if rate_key not in node:
+                continue
+            here = f"{path}.{rate_key}" if path else rate_key
+            disclaimer = node.get(disclaimer_key)
+            if not isinstance(disclaimer, str) or not disclaimer.strip():
+                problems.append(
+                    f"{here}: a constant-numerator rate with no `{disclaimer_key}` "
+                    "sibling. Its numerator is the workload constant, so its "
+                    "cross-arm ratio is identically 1/latency-ratio; unlabelled it "
+                    "reads as an independent throughput (TASK-68)"
+                )
+            elif not all(tok in disclaimer.lower() for tok in _DERIVED_IDENTITY_TOKENS):
+                problems.append(
+                    f"{here}: `{disclaimer_key}` is present but does not spell the "
+                    f"identity (must name a {list(_DERIVED_IDENTITY_TOKENS)} "
+                    "numerator/reciprocal). A vague note is not the structural "
+                    "label AC#2 requires (TASK-68)"
+                )
+        for key, value in node.items():
+            here = f"{path}.{key}" if path else key
+            if isinstance(key, str):
+                lowered = key.lower()
+                if any(s in lowered for s in _CONSTANT_RATE_STEMS) and any(
+                    c in lowered for c in _CORROBORATION_STEMS
+                ):
+                    problems.append(
+                        f"{here}: a constant-numerator rate presented as a "
+                        "ratio/speedup/corroboration. This IS the task-42 "
+                        "double-count - throughput_ratio == 1/latency_ratio "
+                        "algebraically - so it is one observation, not two. Quote "
+                        "the latency ratio; the rate is a restatement (TASK-68)"
+                    )
+            problems += derived_quantity_violations(value, here)
+    elif isinstance(node, list):
+        for index, value in enumerate(node):
+            problems += derived_quantity_violations(value, f"{path}[{index}]")
+    return problems
+
+
 # What makes a summary LINE a speedup claim. Deliberately literal: `speedup=`
 # is how this summary spells a ratio, and `faster`/`slower` are how it spells a
 # ranking. `speedup_arms_usable=` is an instrument flag, not a claim, and does
@@ -2411,9 +2500,7 @@ def leech_model(swarm_sizes, num: int, den: int) -> dict:
     per_size = []
     for n in sorted({int(x) for x in swarm_sizes}):
         serving, leech = leech_split(n, num, den)
-        per_size.append(
-            {"n_peers": n, "serving_peers": serving, "leech_peers": leech}
-        )
+        per_size.append({"n_peers": n, "serving_peers": serving, "leech_peers": leech})
     return {
         "ran": True,
         "knob": "--leech-fraction",
@@ -2546,9 +2633,16 @@ def build_report(
                 "never used in a speedup ratio: it carries container "
                 "create/start/teardown, which itself scales with the swarm."
             ),
-            "throughput": (
-                "workload bytes / in-container realise seconds, per arm, in that "
-                "arm's own unit"
+            "realise_rate": (
+                "workload bytes / in-container realise seconds, per arm. A REALISE "
+                "RATE, NOT a transport throughput: the numerator is the workload "
+                "constant so its cross-arm ratio is identically 1/latency-ratio "
+                "(never quote it beside the latency speedup as a second witness), "
+                "and its denominator carries NAR unpack + sha256 NarHash + store "
+                "registration on top of any transfer. The measured link rate is "
+                "`upstream_nar_transport_bytes_compressed_wire_per_s`; the "
+                "transport-alone bench is TASK-64 (fetch 187, iroh-blobs 255 MB/s "
+                "at 110 MiB). Gated by derived_quantity_violations (TASK-68)."
             ),
             "egress": (
                 "net-upstream-egress-v2, executed by measure.classify_run - the "
@@ -2596,21 +2690,28 @@ def build_report(
         # TASK-78 AC#2/#3: leech mode is OBSERVABLE here. `leech is None` means the knob was not set
         # (default 0/1 = no leeches), so the model is inert but still present so a reader sees it.
         "leech_model": leech
-        or {"ran": False, "reason": "no leech fraction set (--leech-fraction defaults to 0/1)"},
+        or {
+            "ran": False,
+            "reason": "no leech fraction set (--leech-fraction defaults to 0/1)",
+        },
     }
     s5_violations = scalefit.sweep_report_violations(report)
     unit_problems = unit_violations(report)
     qualifier_problems = speedup_qualifier_violations(report)
+    derived_problems = derived_quantity_violations(report)
     report["honesty"] = {
         "rules": (
             "TESTING.md S5 (a)-(d) via scalefit.sweep_report_violations, this "
-            "module's unit rule via unit_violations, and task-63's "
-            "upstream-condition rule via speedup_qualifier_violations over the "
-            "JSON plus human_summary_violations over the printed text"
+            "module's unit rule via unit_violations, task-63's "
+            "upstream-condition rule via speedup_qualifier_violations, and "
+            "task-68's constant-numerator/double-count rule via "
+            "derived_quantity_violations over the JSON plus "
+            "human_summary_violations over the printed text"
         ),
         "s5_violations": s5_violations,
         "unit_violations": unit_problems,
         "speedup_qualifier_violations": qualifier_problems,
+        "derived_quantity_violations": derived_problems,
         # The summary is generated FROM this report, so its gate belongs here
         # too. Judging it only in `main` left the persisted artifact - the thing
         # someone quotes months later - saying `compliant: true` while the
@@ -2618,7 +2719,12 @@ def build_report(
         # prevent. It runs in a SECOND pass below, because the summary reads
         # `verdict`, which does not exist yet.
         "human_summary_violations": [],
-        "compliant": not s5_violations and not unit_problems and not qualifier_problems,
+        "compliant": (
+            not s5_violations
+            and not unit_problems
+            and not qualifier_problems
+            and not derived_problems
+        ),
     }
     # A speedup arm that RAISED is not a missing arm - it is a failed one, and
     # `usable` must say so. `speedup is None` means it was never asked for
@@ -3411,7 +3517,8 @@ def run_self_test() -> int:  # noqa: C901 - a flat list of checks reads better h
     check(
         "leech_model is unit-clean and observable in the report",
         unit_violations({"leech_model": lm}) == []
-        and lm["per_swarm_size"][2] == {"n_peers": 16, "serving_peers": 4, "leech_peers": 12},
+        and lm["per_swarm_size"][2]
+        == {"n_peers": 16, "serving_peers": 4, "leech_peers": 12},
         str(lm["per_swarm_size"]),
     )
 
@@ -3774,7 +3881,85 @@ def run_self_test() -> int:  # noqa: C901 - a flat list of checks reads better h
             report["honesty"]["s5_violations"]
             + report["honesty"]["unit_violations"]
             + report["honesty"]["speedup_qualifier_violations"]
+            + report["honesty"]["derived_quantity_violations"]
         ),
+    )
+
+    # --- TASK-68: the constant-numerator / double-count gate, by mutation ----
+    print("\n  -- TASK-68: constant-numerator double-count gate --")
+    check(
+        "the assembled report passes the derived-quantity gate (the realise rate "
+        "carries its identity disclaimer and nothing sells it as a witness)",
+        derived_quantity_violations(report) == [],
+        str(derived_quantity_violations(report)),
+    )
+    # MUTATION 1: strip the disclaimer sibling from a shipped arm. The constant-
+    # numerator rate is now BARE - exactly the task-42 "throughput 758 MB/s"
+    # presented as if it were a transport observation.
+    stripped = json.loads(json.dumps(report))
+    _arm = stripped["measured"]["speedup"]["by_upstream_condition"][WAN_SHAPED][
+        "peers_off"
+    ]
+    del _arm["realise_rate_is_not_a_transport_rate"]
+    check(
+        "MUTATION: deleting `realise_rate_is_not_a_transport_rate` from an arm "
+        "makes the gate RED and NAMES the now-bare rate",
+        any(
+            "realise_rate_bytes_uncompressed_nar_per_s" in p
+            for p in derived_quantity_violations(stripped)
+        ),
+        str(derived_quantity_violations(stripped)),
+    )
+    # MUTATION 1b: the disclaimer exists but no longer SPELLS the identity - the
+    # editorial-note-instead-of-a-gate species this project keeps rejecting.
+    vague = json.loads(json.dumps(report))
+    vague["measured"]["speedup"]["by_upstream_condition"][WAN_SHAPED]["peers_off"][
+        "realise_rate_is_not_a_transport_rate"
+    ] = "a rate in NarSize units"
+    check(
+        "MUTATION: a disclaimer that no longer names the constant/1-over-latency "
+        "identity is REJECTED (a vague note is not the structural label)",
+        derived_quantity_violations(vague) != [],
+        str(derived_quantity_violations(vague)),
+    )
+    # MUTATION 2, END-TO-END: re-introduce the task-42 double-count - present the
+    # rate as a `throughput_speedup` beside the latency speedup, as if it were a
+    # second, agreeing observation. It must make the WHOLE report non-compliant,
+    # not merely earn a note, because `compliant` is what a later quoter trusts.
+    poisoned_speedup = json.loads(json.dumps(speedup_measured))
+    poisoned_speedup["by_upstream_condition"][WAN_SHAPED][
+        f"throughput_speedup_{WAN_SHAPED}"
+    ] = 3.61
+    poisoned_report = build_report(
+        linear, poisoned_speedup, study, prov, config, (10, 100, 1000)
+    )
+    check(
+        "MUTATION: a report that re-presents the rate as a `throughput_speedup` "
+        "beside the latency speedup is NON-COMPLIANT (honesty.compliant False), "
+        "not merely annotated - it is 1/latency-ratio restated, not a witness",
+        poisoned_report["honesty"]["compliant"] is False
+        and any(
+            "double-count" in p
+            for p in poisoned_report["honesty"]["derived_quantity_violations"]
+        ),
+        str(poisoned_report["honesty"]["derived_quantity_violations"]),
+    )
+    # CONTROL: the honest `latency_speedup_*` key carries no constant-numerator
+    # rate stem, so it must NOT trip the corroboration half of the gate.
+    check(
+        "CONTROL: the honest latency_speedup key is NOT caught (no rate stem)",
+        derived_quantity_violations({f"latency_speedup_mean_{WAN_SHAPED}": 3.53}) == [],
+    )
+    # CONTROL: the MEASURED transport link rate has a measured numerator
+    # (bytes_sent), not a constant, so it is genuinely independent and needs no
+    # disclaimer - the gate must not demand one.
+    check(
+        "CONTROL: a measured transport link rate needs no disclaimer (its "
+        "numerator is measured bytes_sent, not a report constant)",
+        derived_quantity_violations(
+            {"upstream_nar_transport_bytes_compressed_wire_per_s": {"mean": 9.0e8}}
+        )
+        == [],
     )
 
     # --- task-65: the host-total extrapolation must not read as a deployment --
@@ -5042,9 +5227,7 @@ def main() -> int:
         # TASK-78: model the leech-fraction split over the SAME swarm grid, so leech mode is
         # observable beside the measured resource axis. Inert at the default 0/1 (no leeches).
         leech=(
-            leech_model(args.swarm, leech_num, leech_den)
-            if leech_num > 0
-            else None
+            leech_model(args.swarm, leech_num, leech_den) if leech_num > 0 else None
         ),
     )
     # PERSIST BEFORE PRETTY-PRINTING. The human summary is a formatter over a
