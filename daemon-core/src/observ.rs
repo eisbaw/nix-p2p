@@ -326,13 +326,14 @@ impl Observability {
             .as_ref()
             .and_then(|h| h.budget_used())
             .unwrap_or(0);
-        // LIVE global derive-budget usage (TASK-229): read straight from the ledger the
-        // answer path charges, so the figure cannot drift from what is enforced.
-        let derive_budget_global_used = self
+        // LIVE global derive-budget (TASK-229): BOTH used AND cap read straight from the
+        // ledger the answer path charges, so neither figure can drift from what is
+        // enforced. `None` when there is no live ledger (no over-the-wire responder), in
+        // which case the status renderer OMITS the line rather than synthesising one.
+        let derive_budget_global = self
             .derive_ledger
             .as_ref()
-            .map(|l| l.global_bytes_used())
-            .unwrap_or(0);
+            .map(|l| (l.global_bytes_used(), l.global_bytes_cap()));
         // ONE lock acquisition for both fields (no torn read: the holders and outcome a scrape
         // reports are always from the SAME lookup).
         let (last_lookup, holder_count) = self.metrics.last_snapshot();
@@ -344,7 +345,7 @@ impl Observability {
             path: facts.path,
             last_lookup,
             announce_budget_used,
-            derive_budget_global_used,
+            derive_budget_global,
             fallback_reason: fallback_reason(last_lookup, &facts).to_string(),
         };
         self.contract.status(&inputs)

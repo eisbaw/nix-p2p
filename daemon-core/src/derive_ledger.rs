@@ -43,11 +43,19 @@
 
 use std::collections::HashMap;
 use std::sync::Mutex;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use peer_fabric::DeriveBudget;
 
 use crate::transport::NodeId;
+
+/// Clamp a configured window UP to [`MIN_WINDOW_MS`] (fail-closed): a zero or
+/// sub-millisecond window would reset the accounting on every admission and silently
+/// disable aggregation.
+fn clamp_window(window: Duration) -> Duration {
+    let ms = window.as_millis().min(u64::MAX as u128) as u64;
+    Duration::from_millis(ms.max(MIN_WINDOW_MS))
+}
 
 /// A monotonic millisecond clock. A seam so a test advances time deterministically
 /// (the window roll-over is the whole point and must be testable without sleeping).
@@ -100,6 +108,13 @@ struct Window {
     dumps: u32,
 }
 
+/// The floor a [`DeriveBudget::window`] is clamped UP to at ledger construction. A
+/// zero (or sub-millisecond) window would make [`Window::roll_if_expired`] reset on
+/// EVERY admission - silently disabling all aggregation and turning the per-peer bound
+/// into a per-message one. Clamping fail-CLOSED (never below this floor) keeps the
+/// aggregation the type promises; see [`PeerDeriveLedger::with_clock`].
+pub const MIN_WINDOW_MS: u64 = 1000;
+
 impl Window {
     fn opened_at(now: u64) -> Self {
         Window {
@@ -112,6 +127,15 @@ impl Window {
     /// Reset to an empty window opened at `now` if the current one has aged past
     /// `window_millis`. Uses saturating subtraction so a monotonic clock can never
     /// underflow.
+    ///
+    /// TUMBLING (not sliding), stated honestly: this resets the WHOLE window to zero at
+    /// the boundary, so the EFFECTIVE bound a peer can spend across a boundary is up to
+    /// 2x the per-window cap (full cap just before the reset, full cap just after). The
+    /// per-window ceilings are therefore a rate bound of `cap` per `window` in steady
+    /// state with a `2*cap` transient at each boundary - NOT a hard `cap` over every
+    /// sliding `window`. A true sliding window (bounding any window-length interval to
+    /// `cap`) is a follow-up (TASK-243); the tumbling bound is sufficient as a
+    /// coarse DoS rate-limit and is documented here so no caller assumes the tighter one.
     fn roll_if_expired(&mut self, now: u64, window_millis: u64) {
         if now.saturating_sub(self.start_millis) >= window_millis {
             *self = Window::opened_at(now);
@@ -182,7 +206,14 @@ impl PeerDeriveLedger {
 
     /// An enforcing ledger over `budget` reading time from `clock` (tests inject a
     /// manual clock to drive window roll-over deterministically).
-    pub fn with_clock(budget: DeriveBudget, clock: Box<dyn MonotonicClock>) -> Self {
+    ///
+    /// FAIL-CLOSED window clamp: a zero or sub-[`MIN_WINDOW_MS`] window is clamped UP to
+    /// the floor, because a sub-millisecond window rolls on every admission and silently
+    /// disables aggregation (the per-peer bound would collapse to per-message). The
+    /// clamp is reflected in the stored [`budget`](Self::budget), so the reported window
+    /// is the one actually enforced - never a value that looks tighter than it is.
+    pub fn with_clock(mut budget: DeriveBudget, clock: Box<dyn MonotonicClock>) -> Self {
+        budget.window = clamp_window(budget.window);
         PeerDeriveLedger {
             budget,
             enforced: true,
@@ -216,8 +247,11 @@ impl PeerDeriveLedger {
     /// under its own cap; then the per-peer byte and dump ceilings. A single call to a
     /// non-enforcing ([`unlimited`](Self::unlimited)) ledger is always `Admitted`.
     ///
-    /// Overflow-safe: every accumulation uses `saturating_add`, so a hostile huge
-    /// NarSize saturates to the cap (refused) rather than wrapping past it.
+    /// Overflow is fail-CLOSED: an accumulation that would overflow the `u64` byte or
+    /// `u32` dump accumulator is treated as OVER-cap and REFUSED (via `checked_add`),
+    /// never wrapped and never saturated-equal-to a `MAX` cap (which a `>` test would
+    /// then wrongly admit). A cap set to `u64::MAX`/`u32::MAX` therefore still refuses
+    /// mathematically-over-cap work rather than admitting it.
     pub fn try_admit(&self, peer: &NodeId, nar_size: u64) -> DeriveAdmission {
         if !self.enforced {
             return DeriveAdmission::Admitted;
@@ -229,38 +263,40 @@ impl PeerDeriveLedger {
 
         // Roll the global window first, then evaluate the global ceiling. A refusal
         // here is the Sybil floor biting: return WITHOUT touching the per-peer window,
-        // so nothing is charged.
+        // so nothing is charged. An accumulator overflow is over-cap (fail-closed).
         let global = state.global.get_or_insert_with(|| Window::opened_at(now));
         global.roll_if_expired(now, window_millis);
-        let global_after = global.bytes.saturating_add(nar_size);
-        if global_after > self.budget.max_bytes_global_uncompressed_nar {
-            return DeriveAdmission::RefusedGlobal;
-        }
-        // Snapshot the global's identity so we only commit once the per-peer check also
-        // passes (a two-phase check-then-commit; nothing is charged on a per-peer
-        // refusal).
-        let global_snapshot = *global;
+        // `global_after` is a plain integer copy, so the per-peer borrow below cannot
+        // disturb it; it is committed only if the per-peer check ALSO passes (a two-phase
+        // check-then-commit; nothing is charged on a per-peer refusal).
+        let global_after = match global.bytes.checked_add(nar_size) {
+            Some(sum) if sum <= self.budget.max_bytes_global_uncompressed_nar => sum,
+            _ => return DeriveAdmission::RefusedGlobal,
+        };
 
         let peer_window = state
             .per_peer
             .entry(*peer)
             .or_insert_with(|| Window::opened_at(now));
         peer_window.roll_if_expired(now, window_millis);
-        let peer_bytes_after = peer_window.bytes.saturating_add(nar_size);
-        let peer_dumps_after = peer_window.dumps.saturating_add(1);
-        if peer_bytes_after > self.budget.max_bytes_per_peer_uncompressed_nar
-            || peer_dumps_after > self.budget.max_dumps_per_peer
-        {
-            return DeriveAdmission::RefusedPerPeer;
-        }
+        // Both per-peer ceilings, overflow-as-over-cap. `checked_add` returning `None`
+        // (or a sum over the cap) refuses; nothing is charged on a refusal.
+        let peer_bytes_after = match peer_window.bytes.checked_add(nar_size) {
+            Some(sum) if sum <= self.budget.max_bytes_per_peer_uncompressed_nar => sum,
+            _ => return DeriveAdmission::RefusedPerPeer,
+        };
+        let peer_dumps_after = match peer_window.dumps.checked_add(1) {
+            Some(sum) if sum <= self.budget.max_dumps_per_peer => sum,
+            _ => return DeriveAdmission::RefusedPerPeer,
+        };
 
         // COMMIT: both ceilings pass. Charge the peer window and the global window.
         peer_window.bytes = peer_bytes_after;
         peer_window.dumps = peer_dumps_after;
         let global = state.global.as_mut().expect("global window present");
-        // The global window could not have rolled between the snapshot and here (single
-        // lock held throughout), so committing the snapshot's byte total is exact.
-        global.bytes = global_snapshot.bytes.saturating_add(nar_size);
+        // The global window could not have rolled since `global_after` was computed
+        // (single lock held throughout), so committing it is exact.
+        global.bytes = global_after;
 
         DeriveAdmission::Admitted
     }
@@ -427,21 +463,72 @@ mod tests {
         assert_eq!(ledger.global_bytes_used(), 0);
     }
 
+    /// codex fix B (MAX-cap boundary, fail-closed): with a `u64::MAX` global cap, work
+    /// that OVERFLOWS the accumulator is REFUSED, not admitted. MUTATION: revert the
+    /// `checked_add`/`<=` admission to `saturating_add` + `>` and the second probe
+    /// saturates to `u64::MAX`, which is NOT `> u64::MAX`, so it is wrongly admitted -
+    /// reddening the `RefusedGlobal` assertion below.
     #[test]
-    fn huge_narsize_saturates_and_refuses_not_wraps() {
+    fn overflow_of_the_accumulator_is_refused_not_admitted_at_max_cap() {
+        // GLOBAL cap at the u64 ceiling: only an accumulator OVERFLOW can refuse - and it
+        // must, or a MAX cap would silently mean "unlimited".
         let ledger = PeerDeriveLedger::with_clock(
-            budget(u64::MAX, 1000, u64::MAX - 1),
+            budget(u64::MAX, 1000, u64::MAX),
             Box::new(ManualClock::default()),
         );
-        // A probe at the global cap is admitted; a second near-MAX one must saturate
-        // (not wrap to a small number) and be refused by the global ceiling.
+        // First near-MAX probe fits exactly under the MAX cap (no overflow).
         assert_eq!(
             ledger.try_admit(&peer(1), u64::MAX - 1),
             DeriveAdmission::Admitted
         );
+        // The next probe would overflow the u64 accumulator: fail-CLOSED -> refused,
+        // never wrapped, never saturated-equal-to the MAX cap and then admitted.
         assert_eq!(
             ledger.try_admit(&peer(2), 100),
             DeriveAdmission::RefusedGlobal
         );
+        assert_eq!(
+            ledger.global_bytes_used(),
+            u64::MAX - 1,
+            "no wrap on refusal"
+        );
+    }
+
+    /// codex fix A (window fail-closed): a zero (or sub-`MIN_WINDOW_MS`) window is clamped
+    /// UP at construction, so aggregation still happens - it does NOT silently reset on
+    /// every admission. MUTATION: drop the `clamp_window` call in `with_clock` and, with a
+    /// clock that advances 1 ms between calls, the window (0 ms) rolls on the SECOND
+    /// admission, so the per-peer cap never bites and the second probe is (wrongly)
+    /// Admitted - reddening the `RefusedPerPeer` assertion.
+    #[test]
+    fn zero_window_is_clamped_not_silently_disabling_aggregation() {
+        let clock = ManualClock::default();
+        let ledger = PeerDeriveLedger::with_clock(
+            DeriveBudget {
+                max_bytes_per_peer_uncompressed_nar: 100,
+                max_dumps_per_peer: 1000,
+                max_bytes_global_uncompressed_nar: 1_000_000,
+                window: Duration::ZERO, // hostile/degenerate: would disable aggregation
+            },
+            Box::new(clock.clone()),
+        );
+        // The stored window reflects the clamp (honest reporting), never 0.
+        assert_eq!(
+            ledger.budget().window,
+            Duration::from_millis(MIN_WINDOW_MS),
+            "a zero window must be clamped UP to the floor, not stored as 0"
+        );
+        let p = peer(7);
+        assert_eq!(ledger.try_admit(&p, 60), DeriveAdmission::Admitted);
+        // Advance well within the clamped window; aggregation MUST still hold.
+        clock.advance(10);
+        assert_eq!(
+            ledger.try_admit(&p, 60),
+            DeriveAdmission::RefusedPerPeer,
+            "a clamped window must still aggregate across admissions, not reset each call"
+        );
+        // Only after the CLAMPED window elapses does usage reset.
+        clock.advance(MIN_WINDOW_MS);
+        assert_eq!(ledger.try_admit(&p, 60), DeriveAdmission::Admitted);
     }
 }

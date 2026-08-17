@@ -772,11 +772,15 @@ pub struct StatusInputs {
     pub last_lookup: Option<LookupOutcome>,
     /// Announce-after-fetch budget consumed so far (distinct paths announced).
     pub announce_budget_used: u64,
-    /// Responder-derivation GLOBAL byte budget consumed so far in the current window
-    /// (UNCOMPRESSED-NAR bytes hashed across ALL peers, TASK-229). An AGGREGATE integer
-    /// with NO per-peer identifier - exposing per-peer usage would be a peer-behaviour
-    /// channel, so only this global figure is reported (mirrors `announce_budget_used`).
-    pub derive_budget_global_used: u64,
+    /// Responder-derivation GLOBAL byte budget as `(used, cap)` in the current window
+    /// (UNCOMPRESSED-NAR bytes hashed across ALL peers, TASK-229) - BOTH figures read
+    /// from the SAME live ledger, so the reported CAP cannot drift from the enforced one.
+    /// An AGGREGATE integer pair with NO per-peer identifier (exposing per-peer usage
+    /// would be a peer-behaviour channel). `None` when this node runs no live derivation
+    /// ledger (no over-the-wire hold-query responder): the status line is then OMITTED
+    /// rather than emitting a synthetic figure - the configured CAP still shows in
+    /// `--preflight`'s effective controls. See TASK-243 for the live-wire responder.
+    pub derive_budget_global: Option<(u64, u64)>,
     /// A short fallback reason if the node is currently on the upstream path, e.g.
     /// "no-provider", "discovery-unavailable", "budget-exhausted". Empty if none.
     pub fallback_reason: String,
@@ -931,12 +935,14 @@ impl OperatorContract {
             "announce_budget={}/{}",
             rt.announce_budget_used, self.caps.announce_distinct_paths_budget
         ));
-        // TASK-229: the responder-derivation GLOBAL byte budget, used/CAP. An aggregate
-        // integer only (no per-peer identifier), so it discloses no peer behaviour.
-        out.push(format!(
-            "derive_budget_global_bytes={}/{}",
-            rt.derive_budget_global_used, self.caps.derive_max_bytes_global_uncompressed
-        ));
+        // TASK-229: the responder-derivation GLOBAL byte budget, used/CAP - BOTH from the
+        // live ledger (single source of truth; the denominator is NOT independently read
+        // from `caps`, which could drift). Emitted ONLY when a live ledger exists; a node
+        // with no over-the-wire responder omits the line rather than reporting a synthetic
+        // figure (the CAP is still visible in --preflight's effective controls).
+        if let Some((used, cap)) = rt.derive_budget_global {
+            out.push(format!("derive_budget_global_bytes={used}/{cap}"));
+        }
         // Enabled mechanisms only (the pending set is the preflight's job).
         let enabled: Vec<&str> = Mechanism::registry()
             .into_iter()
@@ -1556,7 +1562,10 @@ mod tests {
             path: PeerPath::Relay,
             last_lookup: Some(LookupOutcome::Unavailable),
             announce_budget_used: 7,
-            derive_budget_global_used: 123,
+            // A CAP (999) deliberately DIFFERENT from `caps.derive_max_bytes_global_uncompressed`
+            // (4 GiB): the rendered denominator must be THIS ledger-sourced value, proving
+            // the status cap is single-sourced from the ledger, not re-read from caps.
+            derive_budget_global: Some((123, 999)),
             fallback_reason: "discovery-unavailable".to_string(),
         };
         let s = c.status(&rt);
@@ -1565,16 +1574,46 @@ mod tests {
         assert!(s.contains("peer_path=relay"));
         assert!(s.contains("last_lookup=unavailable"));
         assert!(s.contains("announce_budget=7/256"));
-        // TASK-229: the responder-derivation GLOBAL byte budget renders used/CAP.
+        // TASK-229: used/CAP both from the ledger figure, NOT the caps denominator.
+        assert!(s.contains("derive_budget_global_bytes=123/999"), "{s}");
         assert!(
-            s.contains(&format!(
-                "derive_budget_global_bytes=123/{}",
-                4u64 * 1024 * 1024 * 1024
-            )),
-            "{s}"
+            !s.contains(&format!("/{}", 4u64 * 1024 * 1024 * 1024)),
+            "the derive CAP must come from the ledger figure, not caps: {s}"
         );
         assert!(s.contains("fallback_reason=discovery-unavailable"));
         assert!(s.contains("mechanisms_enabled=libp2p-kad-discovery,libp2p-nar-transfer"));
+    }
+
+    /// TASK-229 (codex fix C, honesty gap): a node with NO live derivation ledger OMITS
+    /// the derive-budget status line entirely rather than emitting a synthetic `0/CAP`
+    /// (the code now matches the comment "no live figure"). The configured CAP is still
+    /// discoverable via --preflight's effective controls. MUTATION: emitting the line on
+    /// `None` (a synthetic `0/CAP`) reddens the `!contains` below.
+    #[test]
+    fn status_omits_derive_budget_line_when_no_live_ledger() {
+        let c = OperatorContract::for_profile(SharingProfile::ConsumeOnly);
+        let rt = StatusInputs {
+            node_id: "12D3KooW…".to_string(),
+            bootstrap_total: 1,
+            bootstrap_healthy: 1,
+            holder_count: None,
+            path: PeerPath::Unknown,
+            last_lookup: None,
+            announce_budget_used: 0,
+            derive_budget_global: None,
+            fallback_reason: String::new(),
+        };
+        let s = c.status(&rt);
+        assert!(
+            !s.contains("derive_budget_global_bytes"),
+            "no live responder ledger -> the derive line must be OMITTED, not synthetic: {s}"
+        );
+        // The CAP remains visible where it belongs: the preflight effective controls.
+        assert!(
+            c.preflight()
+                .contains("derive_max_bytes_global_uncompressed="),
+            "the configured CAP must still show in preflight effective controls"
+        );
     }
 
     /// TASK-242: the four [`PeerPath`] states render to FOUR distinct tokens. `Unknown` must render
@@ -1611,7 +1650,7 @@ mod tests {
             path: PeerPath::Unknown,
             last_lookup: None,
             announce_budget_used: 0,
-            derive_budget_global_used: 0,
+            derive_budget_global: None,
             fallback_reason: String::new(),
         };
         let s = c.status(&rt);
@@ -1664,7 +1703,7 @@ mod tests {
             path: PeerPath::None,
             last_lookup: None,
             announce_budget_used: 0,
-            derive_budget_global_used: 0,
+            derive_budget_global: None,
             fallback_reason: String::new(),
         };
         assert!(s.status(&rt).contains("dht_role=server"));

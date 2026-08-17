@@ -173,8 +173,13 @@ pub struct DeriveBudget {
     /// GLOBAL ceiling on NarSize BYTES hashed across ALL peers within one window - the
     /// Sybil floor (per-peer alone is bypassable by minting PeerIds).
     pub max_bytes_global_uncompressed_nar: u64,
-    /// The rolling accounting window. A typed carrier of an INTEGER millisecond value
-    /// (owner no-floats rule); never fractional.
+    /// The accounting window. A typed carrier of an INTEGER millisecond value (owner
+    /// no-floats rule); never fractional. The enforcer clamps a zero/sub-millisecond
+    /// value UP to a sane floor (fail-closed, so a degenerate window cannot disable
+    /// aggregation). HONEST BOUND: the enforcer uses a TUMBLING window (it resets wholly
+    /// at the boundary), so the effective ceiling is `cap` per window in steady state
+    /// with up to `2*cap` across a single boundary - a coarse rate limit, NOT a tight
+    /// sliding-window cap. A true sliding window is TASK-243.
     pub window: Duration,
 }
 
