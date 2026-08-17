@@ -131,7 +131,9 @@ TYPE_ALIAS_TO_IDENTITY_KEYED = re.compile(
 # `:`/`=`) - so we can check it against the tainted-alias set. `Vec<...>` etc are literals, not
 # bare names, and are already covered by (A).
 RELAY_FIELD_TYPE_NAME = re.compile(
-    r"\b(?i:" + RELAY_NAME + r")\s*[:=]\s*(?:&\s*(?:'[A-Za-z_]\w*\s+)?)?([A-Za-z_]\w*)\b"
+    r"\b(?i:"
+    + RELAY_NAME
+    + r")\s*[:=]\s*(?:&\s*(?:'[A-Za-z_]\w*\s+)?)?([A-Za-z_]\w*)\b"
 )
 
 
@@ -264,7 +266,9 @@ def self_test() -> int:
             "    pub relay: Toggle<relay::Behaviour>,\n"
             "}\n"
         )
-        relay_ok = scan_relay_provider_independence([Path(tmp) / "fabric-libp2p" / "src"])
+        relay_ok = scan_relay_provider_independence(
+            [Path(tmp) / "fabric-libp2p" / "src"]
+        )
         if relay_ok:
             print(
                 "self-test FAILED: a legit shape (flat known_relays Vec, NodeId-keyed "
@@ -291,7 +295,9 @@ def self_test() -> int:
         for name, decl in mutations.items():
             bad = root / f"{name}.rs"
             bad.write_text("pub struct Cfg {\n" + decl + "\n}\n")
-            hits = scan_relay_provider_independence([Path(tmp) / "fabric-libp2p" / "src"])
+            hits = scan_relay_provider_independence(
+                [Path(tmp) / "fabric-libp2p" / "src"]
+            )
             bad.unlink()
             if not hits:
                 print(
@@ -307,7 +313,9 @@ def self_test() -> int:
             "type ProviderMap = BTreeMap<NodeId, Multiaddr>;\n"
             "pub struct Cfg {\n    pub relay_by_provider: ProviderMap,\n}\n"
         )
-        alias_hits = scan_relay_provider_independence([Path(tmp) / "fabric-libp2p" / "src"])
+        alias_hits = scan_relay_provider_independence(
+            [Path(tmp) / "fabric-libp2p" / "src"]
+        )
         alias_file.unlink()
         if not any("alias" in v.lower() for v in alias_hits):
             print(

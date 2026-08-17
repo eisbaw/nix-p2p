@@ -1300,8 +1300,8 @@ class Pod:
         )
         # Announce-after-fetch node A prints NO seed/provide-store lines at boot (it holds nothing
         # yet), so await only its LIBP2P-PROVIDER-ADDR; a static provider awaits its N seed lines.
-        n_startup_seeds = 0 if self.libp2p_announce_after_fetch else len(
-            self.libp2p_provider_seeds
+        n_startup_seeds = (
+            0 if self.libp2p_announce_after_fetch else len(self.libp2p_provider_seeds)
         )
         prov_id, prov_listen = self._await_libp2p_identity(
             "lp-provider", n_startup_seeds
@@ -5811,7 +5811,9 @@ def scenario_libp2p_leech(ctx: Ctx, expect) -> None:
             "S-LEECH step1: A announces NOTHING even after fetching+holding the target",
             f"provider log tail: {alog[-900:]!r}",
         )
-        time.sleep(LIBP2P_CONVERGE_S)  # give any (absent) record propagation the same window
+        time.sleep(
+            LIBP2P_CONVERGE_S
+        )  # give any (absent) record propagation the same window
 
         # STEP 2 (the peer-side bite): B builds the target. A is the only holder, but it is a leech,
         # so B finds no provider record and falls back to UPSTREAM.
@@ -5866,10 +5868,9 @@ def scenario_libp2p_leech(ctx: Ctx, expect) -> None:
         announced = False
         deadline = time.time() + READY_TIMEOUT_S
         while time.time() < deadline:
-            if (
-                "LIBP2P-ANNOUNCE-AFTER-FETCH narhash=" in pod.logs("lp-provider")
-                and target_nar_hash in pod.logs("lp-provider")
-            ):
+            if "LIBP2P-ANNOUNCE-AFTER-FETCH narhash=" in pod.logs(
+                "lp-provider"
+            ) and target_nar_hash in pod.logs("lp-provider"):
                 announced = True
                 break
             time.sleep(0.5)

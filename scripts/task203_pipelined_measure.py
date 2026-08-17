@@ -94,7 +94,9 @@ from pathlib import Path
 # Bandwidths as INTEGER bytes/sec (never a float MB/s), IDENTICAL to the TASK-99 finalizer so the
 # serial control reproduces its net figures byte-for-byte.
 HOME_UPLINK_BYTES_PER_SEC = 2_500_000  # 2.5 MB/s, mid home uplink
-LAN_BYTES_PER_SEC = 204_000_000  # ~204 MB/s, the transport CPU-bound ceiling (PRD risk 11)
+LAN_BYTES_PER_SEC = (
+    204_000_000  # ~204 MB/s, the transport CPU-bound ceiling (PRD risk 11)
+)
 NS_PER_SEC = 1_000_000_000
 
 # The serve-side streaming compressor's raw-input block (fabric-libp2p SERVE_COMPRESS_INPUT_BLOCK
@@ -114,7 +116,9 @@ class Reject(Exception):
 
 def require_int(value, where: str) -> int:
     if isinstance(value, bool) or not isinstance(value, int):
-        raise Reject(f"{where}: expected an integer, got {value!r} ({type(value).__name__})")
+        raise Reject(
+            f"{where}: expected an integer, got {value!r} ({type(value).__name__})"
+        )
     if value < 0:
         raise Reject(f"{where}: expected a non-negative integer, got {value}")
     return value
@@ -151,7 +155,9 @@ def validate_raw(raw: dict) -> None:
         if any(isinstance(v, bool) or not isinstance(v, int) for v in level_values):
             raise Reject(f"{path}: non-integer level in {level_values!r}")
         if len(level_values) != len(set(level_values)):
-            raise Reject(f"{path}: duplicate level in {level_values!r} (a collapsed sweep)")
+            raise Reject(
+                f"{path}: duplicate level in {level_values!r} (a collapsed sweep)"
+            )
         if set(level_values) != set(EXPECTED_LEVELS):
             raise Reject(
                 f"{path}: swept levels {sorted(level_values)} != the required "
@@ -178,11 +184,17 @@ def aggregate_level(files: list, level: int) -> dict:
             cb = require_pos_int(lv["compressed_bytes"], f"{path}.compressed_bytes")
             rb = require_pos_int(lv["raw_bytes"], f"{path}.raw_bytes(level)")
             if rb != raw_bytes:
-                raise Reject(f"{path}: level raw_bytes {rb} != file raw_bytes {raw_bytes}")
+                raise Reject(
+                    f"{path}: level raw_bytes {rb} != file raw_bytes {raw_bytes}"
+                )
             s["compressed"] += cb
             s["raw"] += rb
-            s["compress_ns"] += require_pos_int(lv["compress_ns"], f"{path}.compress_ns")
-            s["decompress_ns"] += require_pos_int(lv["decompress_ns"], f"{path}.decompress_ns")
+            s["compress_ns"] += require_pos_int(
+                lv["compress_ns"], f"{path}.compress_ns"
+            )
+            s["decompress_ns"] += require_pos_int(
+                lv["decompress_ns"], f"{path}.decompress_ns"
+            )
             s["n"] += 1
     if s["n"] == 0:
         raise Reject(f"no rows for level {level}")
@@ -223,7 +235,9 @@ def net_at_bandwidth(s: dict, bw: int) -> dict:
     bottleneck_stage = max(stages, key=lambda k: stages[k][0])
     bottleneck_total = stages[bottleneck_stage][0]
     fill_drain_ns = sum(
-        block_ns for name, (_total, block_ns) in stages.items() if name != bottleneck_stage
+        block_ns
+        for name, (_total, block_ns) in stages.items()
+        if name != bottleneck_stage
     )
     pipelined_total = bottleneck_total + fill_drain_ns
     pipelined_beats_raw = pipelined_total < raw_delivery_ns
@@ -306,7 +320,9 @@ def derive(raw: dict, task99: dict | None) -> dict:
             if lr.get("level") == SHIPPED_LEVEL:
                 t99_lan3 = lr.get("net_lan")
         if t99_lan3 is None:
-            raise Reject("task99 measurement.json has no level-3 net_lan to tie against")
+            raise Reject(
+                "task99 measurement.json has no level-3 net_lan to tie against"
+            )
         got = lan_level3["serial_model"]
         checks = {
             "compress_ns": ("zstd_compress_ns", got["compress_ns"]),
@@ -364,9 +380,13 @@ def derive(raw: dict, task99: dict | None) -> dict:
             "verdict_flips_serial_to_pipelined": lan_level3[
                 "verdict_flips_serial_to_pipelined"
             ],
-            "pipelined_bottleneck_stage": lan_level3["pipelined_model"]["bottleneck_stage"],
+            "pipelined_bottleneck_stage": lan_level3["pipelined_model"][
+                "bottleneck_stage"
+            ],
             "pipelined_model_is_proven_bound": False,
-            "overhead_to_erase_flip": lan_level3["pipelined_model"]["overhead_to_erase_flip"],
+            "overhead_to_erase_flip": lan_level3["pipelined_model"][
+                "overhead_to_erase_flip"
+            ],
         },
         "per_level_aggregate": per_level,
     }
@@ -375,7 +395,9 @@ def derive(raw: dict, task99: dict | None) -> dict:
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--raw", type=Path, help="TASK-99 harness JSON (harness_raw.json)")
-    ap.add_argument("--out", type=Path, default=None, help="write the derived evidence JSON")
+    ap.add_argument(
+        "--out", type=Path, default=None, help="write the derived evidence JSON"
+    )
     ap.add_argument(
         "--task99",
         type=Path,
@@ -513,7 +535,9 @@ def self_test() -> int:
                 "task removes) - the self-test fixture does not model the flip"
             )
         if not h["verdict_flips_serial_to_pipelined"]:
-            failures.append("control: the serial->pipelined verdict flip did not register")
+            failures.append(
+                "control: the serial->pipelined verdict flip did not register"
+            )
     except Reject as exc:
         failures.append(f"control: a clean input was rejected: {exc}")
 

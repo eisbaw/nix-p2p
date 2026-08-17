@@ -118,7 +118,9 @@ DEFAULT_NAR_BYTES = 16 * 1024 * 1024
 DEFAULT_DELAY_MS = 20  # -> ~40 ms RTT, a modest home-broadband round trip
 DEFAULT_RATE_MBIT = 20  # ~2.5 MB/s, a mid home uplink
 DEFAULT_NAR_SEED = 20198
-DEFAULT_RUNS = 3  # a FEW bounded shaped runs for a noise estimate — never a CPU-hog farm
+DEFAULT_RUNS = (
+    3  # a FEW bounded shaped runs for a noise estimate — never a CPU-hog farm
+)
 
 NS_PER_SEC = 1_000_000_000
 
@@ -164,7 +166,9 @@ def parse_fetch(line: str) -> dict:
     byte_identical, blake3_ok = int(m.group(4)), int(m.group(5))
     wire_body_bytes, codec = int(m.group(6)), m.group(7)
     if got != expect:
-        raise MeasureFailure(f"fetch delivered {got} of {expect} bytes -- truncated, not evidence")
+        raise MeasureFailure(
+            f"fetch delivered {got} of {expect} bytes -- truncated, not evidence"
+        )
     if byte_identical != 1:
         raise MeasureFailure("fetched bytes are NOT byte-identical to the served NAR")
     if blake3_ok != 1:
@@ -186,7 +190,9 @@ def parse_run(text: str) -> dict:
     Missing any one is fatal. Pure (netns-free) so `--self-test` bites it."""
     if "FATAL" in text:
         fatal = next((ln for ln in text.splitlines() if "FATAL" in ln), "FATAL")
-        raise MeasureFailure(f"inner harness reported {fatal!r} -- link/fetch setup failed")
+        raise MeasureFailure(
+            f"inner harness reported {fatal!r} -- link/fetch setup failed"
+        )
 
     m = re.search(r"rtt min/avg/max/mdev = [\d.]+/([\d.]+)/", text)
     if not m:
@@ -196,7 +202,9 @@ def parse_run(text: str) -> dict:
 
     m = re.search(r"PROVIDE_META raw_bytes=(\d+) zstd_frame_bytes=(\d+)", text)
     if not m:
-        raise MeasureFailure("run reported no PROVIDE_META line (provider did not start)")
+        raise MeasureFailure(
+            "run reported no PROVIDE_META line (provider did not start)"
+        )
     meta = {"raw_bytes": int(m.group(1)), "zstd_frame_bytes": int(m.group(2))}
 
     arms = {}
@@ -238,7 +246,12 @@ def _arm_for_oracle(rtt_ns: int, wire_bytes: int, elapsed_ns: int) -> dict:
 
 
 def run_inner(
-    shape: bool, nar_bytes: int, delay_ms: int, rate_mbit: int, probe_bin: str, nar_seed: int
+    shape: bool,
+    nar_bytes: int,
+    delay_ms: int,
+    rate_mbit: int,
+    probe_bin: str,
+    nar_seed: int,
 ) -> dict:
     """Run one inner configuration inside `unshare -Urn` and return its parsed metrics."""
     cmd = [
@@ -287,11 +300,16 @@ def derive_verdict(shaped_runs: list[dict]) -> dict:
                 "zstd_elapsed_ns": zstd_ns,
                 "margin_ns": raw_ns - zstd_ns,
                 "raw_throughput_bytes_per_s": throughput_bytes_per_s(wire_raw, raw_ns),
-                "zstd_throughput_bytes_per_s": throughput_bytes_per_s(wire_zstd, zstd_ns),
+                "zstd_throughput_bytes_per_s": throughput_bytes_per_s(
+                    wire_zstd, zstd_ns
+                ),
                 "wire_raw_bytes": wire_raw,
                 "wire_zstd_bytes": wire_zstd,
                 "wallclock_speedup_pair": [raw_ns, zstd_ns],  # exact rational raw/zstd
-                "wire_ratio_pair": [wire_raw, wire_zstd],  # exact rational raw/zstd (COUNTED)
+                "wire_ratio_pair": [
+                    wire_raw,
+                    wire_zstd,
+                ],  # exact rational raw/zstd (COUNTED)
                 "zstd_faster": zstd_faster,
             }
         )
@@ -344,7 +362,9 @@ def gate_shaping(
     all_gated = True
     for r in shaped_runs:
         shaped_arm = _arm_for_oracle(
-            r["rtt_ns"], r["arms"]["raw"]["wire_body_bytes"], r["arms"]["raw"]["elapsed_ns"]
+            r["rtt_ns"],
+            r["arms"]["raw"]["wire_body_bytes"],
+            r["arms"]["raw"]["elapsed_ns"],
         )
         entry = {
             "shaped_rtt_ns": shaped_arm["rtt_ns"],
@@ -603,7 +623,9 @@ def measure(
         print(f"MEASURE FAILURE: {exc}", file=sys.stderr)
         return 2
 
-    report = finalize(shaped_runs, unshaped, delay_ms, rate_mbit, nar_bytes, nar_seed, runs)
+    report = finalize(
+        shaped_runs, unshaped, delay_ms, rate_mbit, nar_bytes, nar_seed, runs
+    )
     _print_report(report)
     print()
     print(shaped_link.HONEST_LIMITS)
@@ -630,7 +652,9 @@ def measure(
 # --- self-test: prove the parse AND the render+exit bite by mutation (no netns) ----------------
 
 
-def _good_fetch(codec: str, elapsed_ns: int, wire: int, nar: int = 16 * 1024 * 1024) -> str:
+def _good_fetch(
+    codec: str, elapsed_ns: int, wire: int, nar: int = 16 * 1024 * 1024
+) -> str:
     return (
         f"FETCH_DONE bytes={nar} expect={nar} elapsed_ns={elapsed_ns} "
         f"byte_identical=1 blake3_ok=1 wire_body_bytes={wire} codec_requested={codec}\n"
@@ -660,7 +684,9 @@ def _good_run_text(
     )
 
 
-def _good_unshaped_text(nar: int = 16 * 1024 * 1024, frame: int = 4 * 1024 * 1024) -> str:
+def _good_unshaped_text(
+    nar: int = 16 * 1024 * 1024, frame: int = 4 * 1024 * 1024
+) -> str:
     """A synthetic UNSHAPED negative control: near-zero RTT and a throughput far above the cap
     (raw ~56 MB/s), so the shaping oracle can tell the shaped runs apart from it."""
     return _good_run_text(
@@ -673,8 +699,13 @@ def _render_and_exit(shaped_runs: list[dict], unshaped: dict) -> tuple[str, int]
     exit status the way `measure` would derive it (0 iff accepted). This is what the F2 self-test
     asserts on — the RENDERED OUTPUT and the EXIT STATUS, not merely internal booleans."""
     report = finalize(
-        shaped_runs, unshaped, DEFAULT_DELAY_MS, DEFAULT_RATE_MBIT, DEFAULT_NAR_BYTES,
-        DEFAULT_NAR_SEED, len(shaped_runs),
+        shaped_runs,
+        unshaped,
+        DEFAULT_DELAY_MS,
+        DEFAULT_RATE_MBIT,
+        DEFAULT_NAR_BYTES,
+        DEFAULT_NAR_SEED,
+        len(shaped_runs),
     )
     buf = io.StringIO()
     with contextlib.redirect_stdout(buf):
@@ -701,8 +732,12 @@ def self_test() -> int:
     # parse mutations: each breaks exactly one invariant and MUST be caught.
     parse_mutations = {
         "fatal": "=== XFER ===\nFATAL provider-not-ready\n",
-        "no-rtt": _good_run_text().replace("rtt min/avg/max/mdev = 40.2/40.2/40.2/0.1 ms", ""),
-        "no-meta": _good_run_text().replace(f"PROVIDE_META raw_bytes={nar} zstd_frame_bytes={frame}", ""),
+        "no-rtt": _good_run_text().replace(
+            "rtt min/avg/max/mdev = 40.2/40.2/40.2/0.1 ms", ""
+        ),
+        "no-meta": _good_run_text().replace(
+            f"PROVIDE_META raw_bytes={nar} zstd_frame_bytes={frame}", ""
+        ),
         "no-raw-arm": (
             "rtt min/avg/max/mdev = 40.2/40.2/40.2/0.1 ms\n"
             f"PROVIDE_META raw_bytes={nar} zstd_frame_bytes={frame}\n"
@@ -717,7 +752,9 @@ def self_test() -> int:
             f"FETCH_DONE bytes={nar} expect={nar} elapsed_ns=6700000000",
             f"FETCH_DONE bytes=1024 expect={nar} elapsed_ns=6700000000",
         ),
-        "not-byte-identical": _good_run_text().replace("byte_identical=1", "byte_identical=0"),
+        "not-byte-identical": _good_run_text().replace(
+            "byte_identical=1", "byte_identical=0"
+        ),
         "blake3-fail": _good_run_text().replace("blake3_ok=1", "blake3_ok=0"),
         "raw-wire-not-narsize": _good_run_text().replace(
             f"wire_body_bytes={nar} codec_requested=raw",
@@ -727,7 +764,9 @@ def self_test() -> int:
     for name, text in parse_mutations.items():
         try:
             parse_run(text)
-            failures.append(f"parse mutation {name!r} should have been REJECTED but passed")
+            failures.append(
+                f"parse mutation {name!r} should have been REJECTED but passed"
+            )
         except MeasureFailure:
             pass
 
@@ -740,29 +779,44 @@ def self_test() -> int:
     if code != 0:
         failures.append("fail-closed control: a clean run should exit 0")
     if "VERDICT: ACCEPTED" not in out:
-        failures.append("fail-closed control: a clean run should render VERDICT: ACCEPTED")
+        failures.append(
+            "fail-closed control: a clean run should render VERDICT: ACCEPTED"
+        )
     if "the OBSERVED sign of the win is robust" not in out:
-        failures.append("fail-closed control: a clean run should render the robustness conclusion")
+        failures.append(
+            "fail-closed control: a clean run should render the robustness conclusion"
+        )
     if "PEER-VS-UPSTREAM" not in out:
-        failures.append("fail-closed control: a clean run should render the parity conclusion")
+        failures.append(
+            "fail-closed control: a clean run should render the parity conclusion"
+        )
 
     def _bites(name: str, shaped_runs: list[dict], unshaped: dict) -> None:
         out, code = _render_and_exit(shaped_runs, unshaped)
         if code == 0:
             failures.append(f"F2 mutation {name!r}: should exit NON-ZERO but exited 0")
         if "VERDICT: ACCEPTED" in out:
-            failures.append(f"F2 mutation {name!r}: rendered VERDICT: ACCEPTED (must be rejected)")
+            failures.append(
+                f"F2 mutation {name!r}: rendered VERDICT: ACCEPTED (must be rejected)"
+            )
         if "VERDICT: REJECTED" not in out:
             failures.append(f"F2 mutation {name!r}: did not render VERDICT: REJECTED")
         if "the OBSERVED sign of the win is robust" in out:
-            failures.append(f"F2 mutation {name!r}: still rendered the robustness conclusion")
+            failures.append(
+                f"F2 mutation {name!r}: still rendered the robustness conclusion"
+            )
         if "PEER-VS-UPSTREAM" in out:
-            failures.append(f"F2 mutation {name!r}: still rendered the parity conclusion")
+            failures.append(
+                f"F2 mutation {name!r}: still rendered the parity conclusion"
+            )
 
     # (1) slower zstd: raw/zstd elapsed swapped -> not a win.
     _bites(
         "slower-zstd",
-        [parse_run(_good_run_text(raw_ns=1_700_000_000, zstd_ns=6_700_000_000)) for _ in range(3)],
+        [
+            parse_run(_good_run_text(raw_ns=1_700_000_000, zstd_ns=6_700_000_000))
+            for _ in range(3)
+        ],
         good_unshaped,
     )
     # (2) spread-swamped margin: zstd still faster every run, but its spread exceeds the margin.
@@ -778,7 +832,9 @@ def self_test() -> int:
     _bites(
         "shaping-removed",
         [parse_run(_good_run_text()) for _ in range(3)],
-        parse_run(_good_run_text()),  # control == shaped: oracle must reject every run's gate
+        parse_run(
+            _good_run_text()
+        ),  # control == shaped: oracle must reject every run's gate
     )
     # (4) a headline run NOT shape-gated: one run's raw arm collapses far below the cap (F5) — it
     #     must not slip into the minimum; its failed gate rejects the whole measurement.
@@ -818,7 +874,9 @@ def self_test() -> int:
     # REJECTED + exit non-zero. `bulk-frame` is the exact codex escape; the others prove the other
     # per-run load-bearing checks also bite an isolated run.
     def _three_with(idx: int, mutant_text: str) -> list[dict]:
-        return [parse_run(mutant_text if i == idx else _good_run_text()) for i in range(3)]
+        return [
+            parse_run(mutant_text if i == idx else _good_run_text()) for i in range(3)
+        ]
 
     single_run_species = {
         # provider bulk frame garbage on ONE run: the PER-RUN wire-bulk cross-check must catch it
@@ -845,10 +903,16 @@ def self_test() -> int:
         )
     except shaped_link.ShapingViolation as exc:
         failures.append(f"shaping oracle rejected an honest shaped/control pair: {exc}")
-    removed = _arm_for_oracle(_ms_str_to_ns("0.05"), nar, 60_000_000)  # 'shaped' == control
+    removed = _arm_for_oracle(
+        _ms_str_to_ns("0.05"), nar, 60_000_000
+    )  # 'shaped' == control
     try:
-        shaped_link.assert_shaping(removed, good_control_arm, DEFAULT_DELAY_MS, DEFAULT_RATE_MBIT)
-        failures.append("shaping oracle: a shaping-removed arm should be REJECTED but passed")
+        shaped_link.assert_shaping(
+            removed, good_control_arm, DEFAULT_DELAY_MS, DEFAULT_RATE_MBIT
+        )
+        failures.append(
+            "shaping oracle: a shaping-removed arm should be REJECTED but passed"
+        )
     except shaped_link.ShapingViolation:
         pass
 
@@ -874,7 +938,9 @@ def self_test() -> int:
 
 
 def main() -> int:
-    ap = argparse.ArgumentParser(description="TASK-198 live two-ends-shaped raw-vs-zstd measurement")
+    ap = argparse.ArgumentParser(
+        description="TASK-198 live two-ends-shaped raw-vs-zstd measurement"
+    )
     ap.add_argument(
         "--self-test",
         action="store_true",
@@ -892,7 +958,12 @@ def main() -> int:
     if args.self_test:
         return self_test()
     return measure(
-        args.nar_bytes, args.delay_ms, args.rate_mbit, args.probe_bin, args.nar_seed, args.runs,
+        args.nar_bytes,
+        args.delay_ms,
+        args.rate_mbit,
+        args.probe_bin,
+        args.nar_seed,
+        args.runs,
         args.out,
     )
 
