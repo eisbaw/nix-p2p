@@ -52,7 +52,9 @@ import shaped_link  # sibling module: the proven oracle + honest-limits text
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
 INNER = os.path.join(HERE, "shaped_libp2p_inner.sh")
-DEFAULT_BIN = os.path.join(ROOT, "target", "debug", "examples", "shaped_probe")
+# Honour the shared CARGO_TARGET_DIR (TASK-54/238); fall back to the in-tree ./target.
+_TARGET_DIR = os.environ.get("CARGO_TARGET_DIR") or os.path.join(ROOT, "target")
+DEFAULT_BIN = os.path.join(_TARGET_DIR, "debug", "examples", "shaped_probe")
 
 # 40 MiB incompressible NAR over a 100 mbit cap is ~3.4 s of pure transfer -- long
 # enough that the fetch throughput reflects the steady-state shaped rate rather

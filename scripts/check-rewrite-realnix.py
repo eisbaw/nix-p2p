@@ -225,7 +225,11 @@ def nix_copy(
 def main() -> int:
     repo = Path(__file__).resolve().parent.parent
     nix = f"{require_env('NIX_P2P_NIX')}/bin/nix"
-    daemon_bin = repo / "target" / "debug" / "daemon"
+    # Honour the shared CARGO_TARGET_DIR (TASK-54/238) so the daemon binary is found
+    # whether cargo built into the in-tree ./target or the shared cache; a dev-box
+    # `target` -> cache symlink can mask a hardcode locally, but CI has no symlink.
+    target_dir = Path(os.environ.get("CARGO_TARGET_DIR") or (repo / "target"))
+    daemon_bin = target_dir / "debug" / "daemon"
     if not daemon_bin.is_file():
         fail(f"{daemon_bin} missing - run `just build` first")
     src_cache = repo / "fixtures" / "out" / "current" / "cache"
