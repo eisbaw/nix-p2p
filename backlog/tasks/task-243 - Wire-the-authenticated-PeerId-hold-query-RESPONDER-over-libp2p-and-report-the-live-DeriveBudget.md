@@ -6,7 +6,7 @@ title: >-
 status: To Do
 assignee: []
 created_date: '2026-08-17 11:04'
-updated_date: '2026-08-17 12:38'
+updated_date: '2026-08-17 16:52'
 labels:
   - daemon-core
   - discovery
@@ -35,3 +35,9 @@ Forward-carried from TASK-229. TASK-229 built the responder derivation-DoS enfor
 - [ ] #8 Single-key responder refusals are observable (a refusal counter or operator note), consistent with the batch path and the fail-loud discipline [mped#6]
 - [ ] #9 The derivation budget uses a true sliding/rolling window so the effective bound is cap, replacing the tumbling window whose worst case is up to 2x cap across a boundary [229-D/codex]
 <!-- AC:END -->
+
+## Implementation Notes
+
+<!-- SECTION:NOTES:BEGIN -->
+PREMISE RE-SCOPE (COMPASS 2026-08-17 + orchestrator call-graph check). This task as filed targets the over-libp2p hold-query RESPONDER (answer_for_peer/answer_batch_for_peer + PeerDeriveLedger) — but that surface lives in daemon-core/src/discovery.rs / InProcessPeerQuery and is wave-2a SCAFFOLDING with NO production caller (same class as the reverted TASK-232). The shipped libp2p path serves via kad provider-records to the /nar/3 stream, not hold-queries. The REAL shipped DoS surface is fabric-libp2p/src/server.rs serve(ServeBudget) -> ServeGate where a peer-triggered nix-store --dump regenerate-on-demand runs (Libp2pNarSupplier, TASK-193/158/191), fed by the swarm accept loop (swarm.rs ~1688). That dump work is bounded by ServeBudget (bytes SERVED) but NOT by a per-peer DeriveBudget (bytes hashed). TASK-229 built PeerDeriveLedger but daemon-libp2p ships derive_ledger=None. RE-SCOPE before dispatch: charge the per-peer DeriveBudget on the shipped SERVE/regenerate path keyed by the authenticated remote PeerId (available at the accept loop), with an OVER-THE-WIRE mutation bite (a peer flood drives the ledger to cap and the serve declines; neutralise the charge -> flood succeeds unbounded). Premise-check the exact serve->supplier->dump call site first; if it is already adequately per-peer-bounded, park 243 and note why. AC#1 (over-libp2p responder keying) and the hold() footgun AC re-point at the SERVE path, not a hold-query responder.
+<!-- SECTION:NOTES:END -->
