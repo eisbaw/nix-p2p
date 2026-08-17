@@ -3,11 +3,11 @@ id: TASK-223
 title: >-
   Per-offer byte cap on hold-answer offer lists (close the unknown-kind padding
   byte-amplification residual)
-status: In Progress
+status: Done
 assignee:
   - '@me'
 created_date: '2026-08-15 19:54'
-updated_date: '2026-08-17 14:38'
+updated_date: '2026-08-17 14:49'
 labels:
   - irreversible
 dependencies: []
@@ -48,4 +48,6 @@ F2 (FREEZE VALUE, wrapper arithmetic): the 2048 cap counts the whole offer incl.
 F3 (BITE QUALITY, exact boundary): added the_per_offer_cap_constant_is_pinned (assert_eq!(MAX_OFFER_WIRE_BYTES, 2048)); an_offer_of_exactly_the_cap_is_accepted (compact size EXACTLY 2048 -> accepted, pins <= vs <); an_offer_one_byte_over_the_cap_is_rejected (EXACTLY 2049 -> rejected). Boundary tests use FIXED literals (2048/2049) so a constant drift moves the threshold, not the vector. MUTATIONS verified: (A) `>`->`>=` reddens 2048-accept, 2049-reject+constant-pin stay green; (B) constant 2048->2100 reddens constant-pin AND 2049-reject, 2048-accept stays green. Also added a_batch_response_with_an_under_cap_unknown_offer_is_accepted (batch accept-under-cap twin; mped LOW). Justfile "5 scenarios" comment NOT touched (not in a file I edited; orchestrator said skip).
 
 Gate (round 2): cargo test --workspace 1059 passed / 0 failed (89 blocks; +4 new tests); cargo fmt --all --check ok; cargo clippy --workspace --all-targets -D warnings rc 0 (fixed a doc-list-indentation lint on the new constant doc); check-no-floats/check-golden-vectors/check-discovery-no-shortcut rc 0; just audit rc 0; claim_wire_golden 16/16, doc_citations 3/3. Existing AND new golden wire strings byte-identical (only note text + tests changed this round).
+
+DEEP GATE PASSED (2026-08-17). Commits 68e0c3a + aa53bb8 + c4c0ee6. qa GREEN (1059/0, e2e 9/9), mped GO-conditional (met), codex NOGO(F1 false-wire-claim/F2 wrapper-arithmetic/F3 boundary-not-pinned)->fixed->GO-VERDICT-223R. Per-offer MAX_OFFER_WIRE_BYTES=2048 bounds DECODED offer-content <=8KiB (NOT wire: raw wire stays ~744x via whitespace -> TASK-244), both paths via shared deserializer, exact-boundary mutation-pinned (2048-accept/2049-reject/constant-pin). Golden byte-identical.
 <!-- SECTION:NOTES:END -->
