@@ -35,7 +35,7 @@ proc-supervisor = { path = "../proc-supervisor" }
 # These are DIAL-ASSISTANCE, not discovery: they change HOW we reach a peer already
 # discovered via kad, never HOW we find who holds content (see
 # scripts/check-discovery-no-shortcut.py rationale).
-libp2p = { version = "0.54", default-features = false, features = [
+libp2p = { version = "0.56", default-features = false, features = [
     "kad",
     "tcp",
     "quic",
@@ -50,15 +50,17 @@ libp2p = { version = "0.54", default-features = false, features = [
     "relay",
 ] }
 # libp2p-stream (TASK-157): the RAW-STREAM NAR transfer (AsyncRead/AsyncWrite per
-# call) that REPLACES the request-response NAR carrier. The libp2p 0.54 meta-crate
+# call) that REPLACES the request-response NAR carrier. The libp2p 0.56 meta-crate
 # does not re-export a `stream` feature, so the crate is pulled directly; it is
 # pinned to the version whose libp2p-swarm/libp2p-core reqs match the locked
-# libp2p 0.54.1 (swarm 0.45 / core 0.42). This gives the swarm a `stream::Behaviour`
+# libp2p 0.56.0 (swarm 0.47 / core 0.43.1). TASK-236 bumped this from 0.2.0-alpha
+# (which matched libp2p 0.54's swarm 0.45 / core 0.42) so the resolver keeps the
+# whole libp2p stack on one swarm/core generation. This gives the swarm a `stream::Behaviour`
 # whose `Control` opens/accepts raw substreams OFF the poll loop, so the fetcher
 # aborts mid-stream at exactly the signed size, enforces a real inter-chunk idle
 # bound, and a large serve never blocks kad. Stays on the libp2p side
 # (check-independence green: testproxy shares none of it).
-libp2p-stream = "0.2.0-alpha"
+libp2p-stream = "0.4.0-alpha"
 # The single-threaded Swarm is driven from a dedicated worker task; the directory /
 # announcer talk to it over tokio channels (mpsc command in, oneshot reply out).
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "sync", "time"] }
