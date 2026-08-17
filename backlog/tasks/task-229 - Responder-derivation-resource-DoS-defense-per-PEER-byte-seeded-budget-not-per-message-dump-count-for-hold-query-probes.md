@@ -3,11 +3,11 @@ id: TASK-229
 title: >-
   Responder derivation-resource DoS defense: per-PEER byte-seeded budget (not
   per-message dump-count) for hold-query probes
-status: In Progress
+status: Done
 assignee:
   - '@claude'
 created_date: '2026-08-16 03:18'
-updated_date: '2026-08-17 12:38'
+updated_date: '2026-08-17 12:52'
 labels:
   - daemon-core
   - discovery
@@ -53,4 +53,6 @@ GATE (nix dev shell, ACTUAL): cargo test --workspace --no-fail-fast = 1051 passe
 HONEST LIMITS. (1) NO over-libp2p hold-query RESPONDER exists on the shipped path yet, so no live wire call site authenticates a remote PeerId to key the ledger and daemon-libp2p Observability.derive_ledger is None (CAP still visible in --preflight). The enforcer + bounded API are ready and proven; the wave-2a InProcessPeerQuery transport is threaded (unlimited by default, with_derive_ledger for the bound). Live-wire threading + live used/CAP reporting = TASK-243. This is the honest premise correction: 229 delivers the mechanism + bites, not a live-wire responder that did not exist. (2) Global ceiling is the responder last line, NOT full Sybil defence (per-subnet / identity-cost = TASK-205). (3) nar_size adds one nix-store -q --size subprocess per admitted cold peer key (bounded per message by the count cap); caching NarSize on the Entry = TASK-243. (4) DeriveBudget defaults (1 GiB/64-dumps per peer, 4 GiB global, 60s) are CONSERVATIVE PLACEHOLDERS not a measured I/O ceiling (same honesty as MAX_BATCH_DERIVE_WORK=16); tune per deployment = TASK-243.
 
 CLARIFICATION (DEEP gate, codex+mped): the earlier R1/Sybil-floor "CLOSED" wording is closed on the BYTES-HASHED axis ONLY. Non-hashing-axis residuals carried to TASK-243 AC#4-9: fresh-ledger-lifetime + hold() footgun, NarSize size-query fork bound, global dump-COUNT ceiling, per-peer map eviction, single-key refusal observability, true sliding-window (tumbling worst case is up to 2x cap across a boundary). Codex NOGO on fail-closed EDGES fixed in 6038d9a: zero/sub-ms window clamped to 1s (written back), MAX-cap checked_add (over-cap refused not admitted), status used/CAP single-sourced from the live ledger + derive line OMITTED when no live ledger (no synthetic zero), tumbling window documented honestly. Core confirmed sound by both reviewers: no live responder exists; enforcement inside core answer_for_peer/answer_batch_for_peer; NarSize uncompressed unit; integers only; frozen wire byte-identical.
+
+DEEP GATE PASSED (2026-08-17). Commits 80b47cc + 6038d9a + 0e922f2. qa GREEN (1053/0, e2e 9/9), mped GO (conditions applied), codex R1 NOGO->fixed->R2 code-GO/doc-NOGO->fixed->R3 GO-VERDICT-229R2. Mechanism DONE on the bytes-hashed axis (per-peer+global DeriveBudget keyed by authenticated PeerId, refuse-before-dump via NarSize, enforced inside core answer_*_for_peer). Live-wire responder + 6 non-hashing residuals -> TASK-243 AC#1-9.
 <!-- SECTION:NOTES:END -->
