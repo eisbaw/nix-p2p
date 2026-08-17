@@ -168,6 +168,17 @@ public-swarm results are still out.
   self-reported. It is honest about its limits: a leech hides what it **serves and announces**,
   not what it **looks up** (it still sends discovery queries), and it refuses fail-fast to be
   combined with any give-side provider flag.
+- **An operator contract — one setting governs what a node gives.** A node's role is a single
+  **sharing profile** (upstream-only, consume-only, LAN-share, public-share, or router), and its
+  runtime behaviour *derives from that contract*: whether it serves, whether it announces, its
+  DHT mode, and its relay use are **computed from the profile**, not wired from ad-hoc booleans —
+  and a profile that disagrees with an explicit flag fails **closed** at startup. The fresh-install
+  default is **upstream-only** — a node gives nothing until its operator opts in. Consume-only and
+  router both ride the same capability-seam `LeechFabric` mask (above), so the give-side is masked
+  by construction, verified peer-side. A live, **loopback-only, off-by-default** `--status` /
+  `--metrics` surface reports the node's real state — bootstrap health, holder counts, the
+  announce and responder-derivation budgets — with every identifier privacy-redacted by default,
+  so an operator can see what a node is doing without it becoming a network disclosure.
 
 ## What is not yet
 
@@ -184,13 +195,13 @@ public-swarm results are still out.
 - **The narinfo disk cache is on by default.** With no flag the daemon persists narinfo at
   an XDG state path (`$XDG_STATE_HOME/nix-p2p/narinfo`, else `$HOME/.local/state/nix-p2p/narinfo`),
   so a warm daemon serves a repeat narinfo from local disk instead of re-fetching it upstream;
-  the fsync runs off the async worker (TASK-28), the cache is count-capped (TASK-27), and every
+  the fsync runs off the async worker, the cache is count-capped, and every
   entry is re-derivable, so a lost or corrupt cache is only ever an extra refetch, never a wrong
   serve. `--narinfo-cache-dir <dir>` picks an explicit directory; `--no-narinfo-cache` turns it
   off. The NixOS module defaults it to `/var/lib/nix-p2p/narinfo` under a `StateDirectory`-managed
   dir the DynamicUser owns (`services.nix-p2p.narinfoCacheDir = null` to disable). Scope note: this
   records **which** narinfos an operator fetched on **local** disk — a local, re-derivable cache,
-  not a network disclosure; the operator-contract task (TASK-120) will refine the state-dir/mode.
+  not a network disclosure; the operator contract (above) governs the state-dir and mode.
 - **Restart-durable state in the shipped daemon — now wired, gated on a state dir.**
   With `--libp2p-state-dir <dir>` the shipped daemon runs in durable mode: the directory is
   the single anchor for both the node's **identity** (a state-dir-only restart comes back as
