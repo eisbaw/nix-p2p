@@ -24,12 +24,19 @@
 //!   * [`ResolutionPolicy::PublicInfrastructure`] - a UNION of two independent dial-candidate
 //!     provenances (TASK-218): the active kad peer-routing query (which discloses this node's
 //!     identity to the DHT nodes / bootstrap it contacts, recorded to the ledger) AND, for a
-//!     provider kad could only place at non-directly-reachable addresses — private (RFC1918) /
-//!     link-local, or nowhere at all (loopback and public addresses ARE directly reachable, so
-//!     they do NOT compose a circuit) — a `/p2p-circuit`
+//!     provider that is NOT directly reachable, a `/p2p-circuit`
 //!     dial-address CONSTRUCTED from a relay this node knows via bootstrap config (a NAT'd
 //!     provider is reachable only THROUGH its relay; disclosing to that relay operator that we
-//!     relay to the target, also recorded). Returns [`Lookup::Found`] when the union is
+//!     relay to the target, also recorded). "Directly reachable" is decided by OBSERVED
+//!     reachability, not by the address alone (TASK-221): a PUBLIC IP or LOOPBACK address is
+//!     directly reachable a-priori; a provider kad could only place at PRIVATE (RFC1918) /
+//!     link-local addresses is PROBED — a bounded direct dial — because such an address is
+//!     directly reachable when the provider is on our OWN LAN (same-LAN) but NOT across a NAT,
+//!     and the two are indistinguishable from the address alone. A same-LAN provider whose
+//!     probe connects DIRECTLY composes NO circuit and records NO Relay disclosure (the
+//!     over-disclosure TASK-218 accepted is now suppressed); a cross-NAT provider (probe never
+//!     reaches it) or an addressless one still composes the circuit (the nat-vm-test 192.168.x
+//!     cornerstone). Returns [`Lookup::Found`] when the union is
 //!     non-empty - so `Found` means "at least one dial candidate exists, from DHT peer-routing
 //!     AND/OR permitted relay-circuit composition", NOT "learned exclusively through the DHT".
 //!     When NEITHER provenance yields a candidate it returns the kad walk's OWN honest verdict:
@@ -64,6 +71,7 @@
 use std::collections::BTreeMap;
 use std::net::{Ipv4Addr, Ipv6Addr};
 use std::sync::Arc;
+use std::time::Duration;
 
 use async_trait::async_trait;
 use libp2p::multiaddr::Protocol;
@@ -146,16 +154,19 @@ impl Libp2pNodeLocator {
     ///      for the target; it keeps its OWN [`crate::QueryReach`] classification and its own
     ///      `OurNodeId->DhtNode` ledger disclosure EXACTLY as before, and records NO
     ///      disclosure when the routing table is empty (no query happened);
-    ///   2. relay-circuit composition - for a provider that kad could NOT place at a
-    ///      DIRECTLY-REACHABLE address (a PUBLIC IP or LOOPBACK are directly reachable and do
-    ///      NOT compose; a PRIVATE/link-local address or no address at all is the NAT symptom
-    ///      that does), and when this node knows relays from bootstrap config, we CONSTRUCT
+    ///   2. relay-circuit composition - for a provider that is NOT DIRECTLY REACHABLE (a PUBLIC
+    ///      IP or LOOPBACK is directly reachable a-priori and does NOT compose; a provider placed
+    ///      ONLY at PRIVATE/link-local addresses is PROBED via a bounded direct dial — TASK-221 —
+    ///      composing only if the probe never reaches it directly, i.e. it is across a NAT rather
+    ///      than on our own LAN; an addressless provider composes without a probe), and when this
+    ///      node knows relays from bootstrap config, we CONSTRUCT
     ///      `<relayAddr>/p2p/<relayPeer>/p2p-circuit/p2p/<providerPeer>` for each known relay.
     ///      This is the standard circuit-v2 dial pattern, not injection (the provider PeerId
     ///      came from kad; the relays are provider-INDEPENDENT config). Composing candidates
     ///      dials THROUGH the relay, which discloses to that relay operator that we relay to
     ///      this provider - recorded as `OurNodeId->Relay`, and ONLY when candidates are
-    ///      actually added (so localhost / a public provider records NO Relay disclosure).
+    ///      actually added (so a localhost / public / same-LAN provider records NO Relay
+    ///      disclosure).
     ///
     /// [`Lookup::Found`] iff the union is non-empty; otherwise the DHT walk's OWN honest
     /// absence ([`Lookup::Miss`] / [`Unavailable`]). So `Found` here means "at least one
@@ -199,33 +210,44 @@ impl Libp2pNodeLocator {
                 }
             };
 
-        // --- Provenance 2: relay-circuit composition (TASK-218). ---
-        // Compose circuit candidates only when this node knows relays AND kad could NOT place
-        // the provider at a DIRECTLY-REACHABLE address. "Directly reachable" means a PUBLIC IP
-        // OR a LOOPBACK address (::1 / 127.0.0.0/8, same host — always self-reachable): you
-        // NEVER need a relay to reach localhost, so composing one there is a gratuitous
-        // over-disclosure to the relay operator (a tracked privacy axis) that the daemon
-        // production-path disclosure oracle rightly trips on. The NAT symptom is a provider kad
-        // could only place at a PRIVATE (RFC1918) / link-local address, or nowhere at all —
-        // that (and ONLY that) composes a circuit. HONEST RESIDUAL (documented, TASK-219): a
-        // private-LAN provider on the SAME LAN is also directly reachable, but across a NAT it
-        // is not; we cannot distinguish those two from the address alone, so we still compose
-        // for private addresses (the real-NAT cornerstone, nat-vm-test's 192.168.x provider,
-        // depends on it) and accept a same-LAN over-disclosure. Pure integer IP math, no floats.
-        let circuit_locations: Vec<Multiaddr> =
-            if !self.known_relays.is_empty() && !addrs_include_directly_reachable(&dht_addrs) {
-                self.compose_circuit_locations(peer)
-            } else {
-                Vec::new()
-            };
-        if !circuit_locations.is_empty() {
-            // Dialing a provider THROUGH a relay reveals to that relay operator that we relay
-            // to this provider. Record it ONLY here, where candidates are actually added, and
-            // separately from the DhtNode record above (so the empty-kad -> Found-via-circuit
-            // path records Relay-without-DhtNode honestly).
-            self.ledger
-                .record(Exposure::new(Recipient::Relay, Disclosed::OurNodeId));
-        }
+        // --- Provenance 2: relay-circuit composition (TASK-218, refined by TASK-221). ---
+        // Compose circuit candidates only when this node knows relays AND the provider is NOT
+        // DIRECTLY REACHABLE. Reachability is decided by OBSERVATION, not the address alone:
+        //   * a PUBLIC IP or LOOPBACK address (::1 / 127.0.0.0/8) is directly reachable a-priori
+        //     — you never need a relay to reach a public host or localhost, so composing one is a
+        //     gratuitous over-disclosure to the relay operator (a tracked privacy axis);
+        //   * a provider placed ONLY at PRIVATE (RFC1918) / link-local addresses is AMBIGUOUS:
+        //     it is directly reachable when it is on OUR OWN LAN (same-LAN) but not across a NAT,
+        //     and the address alone cannot tell those apart. So we PROBE — a bounded direct dial
+        //     (`probe_direct_reachable`). A same-LAN provider connects DIRECTLY within the budget
+        //     and composes NO circuit (TASK-221: the over-disclosure TASK-218 accepted is now
+        //     suppressed); a cross-NAT provider is never reached directly and DOES compose (the
+        //     real-NAT cornerstone, nat-vm-test's 192.168.x provider). Observing reachability —
+        //     rather than a subnet heuristic — cannot be fooled by two NATs numbering their LANs
+        //     identically (RFC1918 collision). A too-short probe only costs the privacy win
+        //     (fall back to composing), never the cornerstone.
+        //   * an ADDRESSLESS provider (kad placed it nowhere) has nothing to probe — the NAT
+        //     symptom — so it composes without a probe.
+        // The probe costs a bounded direct-dial latency on a genuinely cross-NAT fetch; public /
+        // loopback / addressless providers never pay it. Pure integer IP math, no floats.
+        let reachable_directly = if addrs_include_directly_reachable(&dht_addrs) {
+            true
+        } else if !self.known_relays.is_empty() && !dht_addrs.is_empty() {
+            // Identity-check each probe target so a wrong host at a colliding private address
+            // cannot masquerade as the provider (its handshake peer id would not match).
+            let targets: Vec<Multiaddr> = dht_addrs
+                .iter()
+                .map(|addr| with_peer_id(addr, peer))
+                .collect();
+            self.handle
+                .probe_direct_reachable(peer, &targets, DIRECT_PROBE_BUDGET)
+                .await
+        } else {
+            // No relays to compose anyway, or nothing to probe: skip the probe latency.
+            false
+        };
+        let circuit_locations =
+            compose_and_record_circuit(&self.known_relays, &self.ledger, peer, reachable_directly);
 
         // --- Union. The frozen seam treats DialInfo locations as OPAQUE strings; for libp2p
         // they are Multiaddr strings, reparsed inside the fabric when dialing. ---
@@ -242,29 +264,83 @@ impl Libp2pNodeLocator {
             Lookup::Found(DialInfo::new(locations))
         }
     }
+}
 
-    /// Construct a `/p2p-circuit` dial-address for `provider` through each known relay:
-    /// `<relayTransportAddr>/p2p/<relayPeer>/p2p-circuit/p2p/<providerPeer>` (TASK-218). Any
-    /// trailing `/p2p/<x>` AND any stray `/p2p-circuit` on the configured relay address are
-    /// stripped first, so the composed address carries exactly ONE relay-peer component and
-    /// ONE circuit hop even if a malformed config supplied a circuit-shaped relay addr. A
-    /// pure LOCAL construction - it consults no third party (the disclosure is recorded by
-    /// the caller only when these are actually added for dialing).
-    fn compose_circuit_locations(&self, provider: PeerId) -> Vec<Multiaddr> {
-        self.known_relays
-            .iter()
-            .map(|(relay_peer, relay_addr)| {
-                let mut base: Multiaddr = relay_addr
-                    .iter()
-                    .filter(|p| !matches!(p, Protocol::P2p(_) | Protocol::P2pCircuit))
-                    .collect();
-                base.push(Protocol::P2p(*relay_peer));
-                base.push(Protocol::P2pCircuit);
-                base.push(Protocol::P2p(provider));
-                base
-            })
-            .collect()
+/// How long the TASK-221 same-LAN probe (`probe_direct_reachable`) waits for a DIRECT
+/// connection before concluding a private-addressed provider is across a NAT and composing the
+/// relay circuit. SHORT and integer (owner no-floats rule): a same-LAN provider connects in a
+/// few RTT so the common case returns fast; a cross-NAT provider is never reached and spends
+/// this full budget once, on the LOCATE, before falling back to the circuit. On the nat-vm's
+/// 600s budgets this is negligible, and a too-short value only forgoes the privacy win (it
+/// falls back to composing), never the cornerstone.
+const DIRECT_PROBE_BUDGET: Duration = Duration::from_millis(2000);
+
+/// Append `/p2p/<peer>` to `addr` for an identity-checked dial, unless it already ends in a
+/// `/p2p/<x>` component. Used to build TASK-221 probe targets so libp2p verifies the dialed
+/// host really is `peer` (a wrong host at a colliding private address fails the handshake and
+/// never registers as a DIRECT connection to `peer`).
+fn with_peer_id(addr: &Multiaddr, peer: PeerId) -> Multiaddr {
+    if matches!(addr.iter().last(), Some(Protocol::P2p(_))) {
+        addr.clone()
+    } else {
+        let mut out = addr.clone();
+        out.push(Protocol::P2p(peer));
+        out
     }
+}
+
+/// Construct a `/p2p-circuit` dial-address for `provider` through each known relay:
+/// `<relayTransportAddr>/p2p/<relayPeer>/p2p-circuit/p2p/<providerPeer>` (TASK-218). Any
+/// trailing `/p2p/<x>` AND any stray `/p2p-circuit` on the configured relay address are
+/// stripped first, so the composed address carries exactly ONE relay-peer component and
+/// ONE circuit hop even if a malformed config supplied a circuit-shaped relay addr. A
+/// pure LOCAL construction - it consults no third party (the disclosure is recorded by
+/// [`compose_and_record_circuit`] only when these are actually added for dialing).
+fn compose_circuit_locations(
+    known_relays: &[(PeerId, Multiaddr)],
+    provider: PeerId,
+) -> Vec<Multiaddr> {
+    known_relays
+        .iter()
+        .map(|(relay_peer, relay_addr)| {
+            let mut base: Multiaddr = relay_addr
+                .iter()
+                .filter(|p| !matches!(p, Protocol::P2p(_) | Protocol::P2pCircuit))
+                .collect();
+            base.push(Protocol::P2p(*relay_peer));
+            base.push(Protocol::P2pCircuit);
+            base.push(Protocol::P2p(provider));
+            base
+        })
+        .collect()
+}
+
+/// Decide the relay-circuit provenance and record its disclosure (TASK-218 / TASK-221). Composes
+/// a `/p2p-circuit` candidate per known relay — and records the ONE `OurNodeId->Relay` disclosure
+/// — IFF this node knows relays AND the provider is NOT directly reachable (`reachable_directly`
+/// is the caller's observed verdict: a PUBLIC/LOOPBACK address, or a same-LAN private provider the
+/// probe reached directly, is directly reachable and composes NOTHING). Returns the composed
+/// candidates (empty when none). Keeping the compose-and-record together in ONE place is what
+/// guarantees the privacy invariant: NO circuit composed <=> NO Relay disclosure recorded. The
+/// Relay record is separate from the DhtNode record (so an addressless provider found only via a
+/// composed circuit records Relay-without-DhtNode honestly).
+fn compose_and_record_circuit(
+    known_relays: &[(PeerId, Multiaddr)],
+    ledger: &ExposureLedger,
+    provider: PeerId,
+    reachable_directly: bool,
+) -> Vec<Multiaddr> {
+    if known_relays.is_empty() || reachable_directly {
+        return Vec::new();
+    }
+    let circuit_locations = compose_circuit_locations(known_relays, provider);
+    if !circuit_locations.is_empty() {
+        // Dialing a provider THROUGH a relay reveals to that relay operator that we relay to this
+        // provider. Recorded ONLY here, where candidates are actually added, so a directly
+        // reachable (public / loopback / same-LAN) provider records NO Relay disclosure.
+        ledger.record(Exposure::new(Recipient::Relay, Disclosed::OurNodeId));
+    }
+    circuit_locations
 }
 
 /// Does any address let the consumer reach the provider DIRECTLY, without a relay (TASK-218
@@ -481,5 +557,112 @@ mod ip_classification_tests {
             let a: Ipv6Addr = ip.parse().unwrap();
             assert!(ipv6_is_public(a), "{ip} must be public");
         }
+    }
+}
+
+#[cfg(test)]
+mod circuit_disclosure_tests {
+    //! TASK-221 privacy invariant, asserted on the DISCLOSURE (the ledger), hermetically: a
+    //! DIRECTLY-REACHABLE provider (public / loopback, or a same-LAN private provider the probe
+    //! reached — modelled here by `reachable_directly = true`) composes NO circuit and records NO
+    //! Relay disclosure, while a NON-directly-reachable (cross-NAT) provider composes AND records
+    //! exactly one `OurNodeId->Relay`. The live same-LAN-vs-cross-NAT probe that produces the
+    //! `reachable_directly` verdict is proven at the swarm level in
+    //! `tests/direct_reachability_probe.rs` and end to end behind a real NAT by
+    //! `nixos/nat-vm-test.nix`.
+    use super::{compose_and_record_circuit, with_peer_id};
+    use crate::{Multiaddr, PeerId, Protocol};
+    use peer_fabric::{ExposureLedger, Recipient};
+
+    fn relay_set() -> Vec<(PeerId, Multiaddr)> {
+        vec![(
+            PeerId::random(),
+            "/ip4/203.0.113.7/tcp/4001".parse().unwrap(),
+        )]
+    }
+
+    fn relay_disclosures(ledger: &ExposureLedger) -> usize {
+        ledger
+            .entries()
+            .iter()
+            .filter(|e| e.to == Recipient::Relay)
+            .count()
+    }
+
+    /// BITE #1 (the privacy win): a directly-reachable provider records NO Relay disclosure and
+    /// composes no circuit. MUTATION: reverting the gate to eager compose (dropping the
+    /// `reachable_directly` short-circuit) makes this record a Relay disclosure -> reddens.
+    #[test]
+    fn directly_reachable_provider_records_no_relay_disclosure() {
+        let ledger = ExposureLedger::new();
+        let provider = PeerId::random();
+        let circuit = compose_and_record_circuit(&relay_set(), &ledger, provider, true);
+        assert!(
+            circuit.is_empty(),
+            "a directly-reachable provider must compose NO /p2p-circuit; got {circuit:?}"
+        );
+        assert_eq!(
+            relay_disclosures(&ledger),
+            0,
+            "a directly-reachable (same-LAN / public / loopback) provider must record NO Relay \
+             disclosure — that is the whole TASK-221 privacy win"
+        );
+    }
+
+    /// BITE #2 (cornerstone core): a NON-directly-reachable (cross-NAT) provider STILL composes a
+    /// circuit and records exactly one Relay disclosure. This is the sentinel the bite-#1 mutation
+    /// must NOT also break, and the decision half of the cross-NAT preservation.
+    #[test]
+    fn cross_nat_provider_composes_circuit_and_records_one_relay_disclosure() {
+        let ledger = ExposureLedger::new();
+        let provider = PeerId::random();
+        let circuit = compose_and_record_circuit(&relay_set(), &ledger, provider, false);
+        assert_eq!(
+            circuit.len(),
+            1,
+            "a cross-NAT provider must compose one /p2p-circuit per known relay"
+        );
+        assert!(
+            circuit[0].iter().any(|p| matches!(p, Protocol::P2pCircuit)),
+            "the composed candidate must be a /p2p-circuit address; got {:?}",
+            circuit[0]
+        );
+        assert_eq!(
+            relay_disclosures(&ledger),
+            1,
+            "a cross-NAT provider must record exactly one OurNodeId->Relay disclosure"
+        );
+    }
+
+    /// A node that knows NO relays composes nothing and discloses nothing, even for a
+    /// non-directly-reachable provider (there is no relay to fall back to).
+    #[test]
+    fn no_known_relays_composes_nothing_and_discloses_nothing() {
+        let ledger = ExposureLedger::new();
+        let circuit = compose_and_record_circuit(&[], &ledger, PeerId::random(), false);
+        assert!(circuit.is_empty());
+        assert_eq!(relay_disclosures(&ledger), 0);
+    }
+
+    /// `with_peer_id` appends an identity check for the probe dial, and is idempotent when the
+    /// address already carries a `/p2p/<x>` tail (so a kad address that already ends in `/p2p`
+    /// is not double-suffixed).
+    #[test]
+    fn with_peer_id_appends_identity_once() {
+        let peer = PeerId::random();
+        let bare: Multiaddr = "/ip4/192.168.3.9/tcp/4001".parse().unwrap();
+        let checked = with_peer_id(&bare, peer);
+        assert_eq!(
+            checked
+                .iter()
+                .filter(|p| matches!(p, Protocol::P2p(_)))
+                .count(),
+            1,
+            "a bare address gains exactly one /p2p identity component"
+        );
+        assert!(matches!(checked.iter().last(), Some(Protocol::P2p(p)) if p == peer));
+        // Idempotent: an address already ending in /p2p/<x> is returned unchanged.
+        let already = with_peer_id(&checked, PeerId::random());
+        assert_eq!(already, checked);
     }
 }

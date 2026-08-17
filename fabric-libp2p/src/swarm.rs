@@ -654,6 +654,51 @@ impl SwarmHandle {
         rx.await.unwrap_or(ConnPath::None)
     }
 
+    /// Bounded DIRECT-reachability probe (TASK-221): is `peer` reachable by a DIRECT
+    /// (non-relayed) connection at one of `targets` within `budget`?
+    ///
+    /// The locator uses this to distinguish a provider that kad could only place at a PRIVATE
+    /// (RFC1918) address that is on OUR OWN LAN (directly reachable — compose NO relay circuit
+    /// and record NO Relay disclosure, the TASK-221 privacy win) from one across a NAT (never
+    /// directly reachable — compose the circuit, the real-NAT cornerstone). The decision is by
+    /// OBSERVED reachability, not an address/subnet heuristic, so it cannot be fooled by two NATs
+    /// that number their LANs identically (RFC1918 collision).
+    ///
+    /// FAST PATH: returns `true` immediately if a DIRECT connection to `peer` already exists (the
+    /// kad walk may already have connected same-LAN). Otherwise it INITIATES a dial to each target
+    /// and polls [`connection_path`](Self::connection_path) until it observes
+    /// [`ConnPath::Direct`] or `budget` elapses. A same-LAN provider connects within a few RTT; a
+    /// cross-NAT provider is never reached directly, so the probe spends the full (short, bounded)
+    /// `budget` then returns `false` — a too-short budget therefore only costs the privacy win
+    /// (fall back to composing the circuit), NEVER correctness. It dials ONLY the given direct
+    /// targets (never a relay/circuit), so a `true` verdict is a genuine direct L3 path: a relayed
+    /// connection reads as [`ConnPath::Relay`] and never trips a false positive. A dial that fails
+    /// to INITIATE is ignored (its async failure surfaces as a swarm event, leaving
+    /// `connection_path` at its current non-Direct value — exactly the cross-NAT outcome).
+    pub async fn probe_direct_reachable(
+        &self,
+        peer: PeerId,
+        targets: &[Multiaddr],
+        budget: Duration,
+    ) -> bool {
+        if self.connection_path(peer).await == ConnPath::Direct {
+            return true;
+        }
+        for addr in targets {
+            let _ = self.dial(addr.clone()).await;
+        }
+        let deadline = Instant::now() + budget;
+        loop {
+            if self.connection_path(peer).await == ConnPath::Direct {
+                return true;
+            }
+            if Instant::now() >= deadline {
+                return false;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    }
+
     /// Join the network through a SET of independently-operated bootstrap peers. Pass
     /// `>=3` so NO single bootstrap is load-bearing: this teaches kad every bootstrap's
     /// address, dials them all (not just the first), runs ONE bootstrap self-lookup, then
