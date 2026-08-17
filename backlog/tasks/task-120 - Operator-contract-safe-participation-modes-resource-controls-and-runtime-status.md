@@ -3,10 +3,11 @@ id: TASK-120
 title: >-
   Operator contract: safe participation modes, resource controls and runtime
   status
-status: To Do
-assignee: []
+status: In Progress
+assignee:
+  - '@claude'
 created_date: '2026-08-10 22:24'
-updated_date: '2026-08-17 00:13'
+updated_date: '2026-08-17 01:12'
 labels:
   - production
   - operator
@@ -54,4 +55,6 @@ Production foundation independent of tournament-derived automatic defaults. TASK
 Forward-carried from TASK-138 review: the v1 NodeId lookup replay table is fail-closed and non-reclaiming. Before public-share is production-ready define a durable or reclaiming admission policy or operator-visible restart ledger preserving anti-replay guarantees and expose hostile-churn capacity use and exhaustion.
 
 READY (all deps Done as of 2026-08-17: 24/25/29/31/77/78/100/103/111/115) BUT NEEDS A LIBP2P-PRIMARY RE-SCOPE before implementation. The description + ACs are IROH-ERA ("after the mandatory Iroh discovery path passes", "prove it for mandatory Iroh first", "explicit Iroh mechanism overrides") - pre-reconciliation, contradicting the Wave-2c authority (libp2p-kad is PRIMARY + proven; iroh deferred-pending-202). This is DRIFT, not a product change (cf. the PRD Wave-2c execution-order reconciliation). Re-scope: the CORE is transport-agnostic + valid (upstream-only/consume-only/LAN-share/public-share modes; the resource-cap budgets AC#3; the status surface AC#4; the bounded-cardinality privacy-safe metrics AC#5; the preflight AC#7; the one-authoritative-typed-config AC#9) - keep those. Re-point the iroh-first language to "prove on the libp2p path first (the primary, proven); iroh is an optional deferred mechanism override, not a prerequisite." The consume-only/LAN/public modes already have real enforcement shipped (TASK-231 eligibility gate, TASK-77 announce-after-fetch, TASK-78 LeechFabric consume-only) - 120 makes them the AUTHORITATIVE typed operator contract + adds resource caps + status + preflight + the NixOS profiles. TASK-45 exercises it from a clean host. This is the pilot-readiness gate.
+
+CODEX DEEP GATE NO-GO (deep) on 0fff8c0. ROOT CAUSE: OperatorContract is a REPORTING VENEER not the enforcement authority - runtime still branches on legacy booleans. AC#1/#2/#8/#9 FAIL (claimed Complete but bites test the TYPE not the runtime): fresh daemon-libp2p cant do upstream-only (exits 2); NixOS ORs legacy booleans; ContractRequest re-derives from flags not an explicit --profile; IROH GLOBAL-SCOPE PROVIDER MISLABELED lan-share (safety bug); iroh/pkarr flags bypass pending-non-selectability; contradictory ResourceCaps defaults (512/300 vs 256/120). AC#3 phantom caps, AC#7 preflight misreports, AC#5 redaction unwired + NarHash in logs. integer/frozen PASS; 231/77/78 reuse PASS where triggered. Disposition (rework-vs-rescope) routing through mped; core fix = make the contract the ENFORCEMENT AUTHORITY. Commit kept (type is a foundation).
 <!-- SECTION:NOTES:END -->
