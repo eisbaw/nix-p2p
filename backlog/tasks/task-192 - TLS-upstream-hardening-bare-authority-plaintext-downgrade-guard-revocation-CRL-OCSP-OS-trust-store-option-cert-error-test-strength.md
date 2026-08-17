@@ -3,9 +3,11 @@ id: TASK-192
 title: >-
   TLS upstream hardening: bare-authority plaintext-downgrade guard + revocation
   (CRL/OCSP) + OS trust store option + cert-error test strength
-status: To Do
-assignee: []
+status: In Progress
+assignee:
+  - '@claude'
 created_date: '2026-08-13 12:21'
+updated_date: '2026-08-17 20:08'
 labels:
   - daemon-core
   - tls

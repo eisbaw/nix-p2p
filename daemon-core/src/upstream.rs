@@ -65,6 +65,7 @@
 //!     closed (above). h2/ALPN negotiation remains a later concern.
 
 use std::future::Future;
+use std::net::{IpAddr, Ipv6Addr};
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
@@ -1092,31 +1093,92 @@ enum Scheme {
     Https,
 }
 
-/// Split `https://host[:port]`, `http://host[:port]` (or a bare `host[:port]`,
-/// treated as http) into scheme + host + port. The port defaults to the scheme
-/// default when absent: 80 for http, 443 for https (TASK-24 accepts https).
+/// True when `host` is a loopback / private / link-local ADDRESS or a
+/// `localhost` NAME - i.e. a host a plaintext hop does NOT expose on an untrusted
+/// network. Used ONLY to decide the default scheme of a BARE authority (no
+/// scheme): a bare loopback/private authority keeps the plaintext `http://`
+/// default (the daemon is a localhost substituter and the tests front a
+/// testproxy over `http://127.0.0.1:PORT`), while a bare PUBLIC authority is
+/// defaulted to `https://` instead of silently downgrading to plaintext
+/// (TASK-192). This is TRANSPORT defense-in-depth, not an integrity control: the
+/// Nix signature + NarHash remain the backstop on the bytes regardless of scheme.
+///
+/// A bracketed IPv6 literal (`[::1]`) is unwrapped before parsing. A DNS name
+/// other than `localhost`/`*.localhost` is treated as PUBLIC (fail-safe: we
+/// cannot resolve it here, and defaulting an unknown name to TLS is the safe
+/// direction - an operator who genuinely wants plaintext to a named private host
+/// writes an explicit `http://`).
+fn is_private_or_loopback_host(host: &str) -> bool {
+    let literal = host
+        .strip_prefix('[')
+        .and_then(|s| s.strip_suffix(']'))
+        .unwrap_or(host);
+    if let Ok(ip) = literal.parse::<IpAddr>() {
+        return match ip {
+            IpAddr::V4(v4) => v4.is_loopback() || v4.is_private() || v4.is_link_local(),
+            // std's IPv6 unique-local / link-local predicates are unstable, so
+            // mask the prefixes directly: fc00::/7 (ULA), fe80::/10 (link-local).
+            IpAddr::V6(v6) => {
+                v6.is_loopback() || is_ipv6_unique_local(v6) || is_ipv6_link_local(v6)
+            }
+        };
+    }
+    let lower = host.to_ascii_lowercase();
+    lower == "localhost" || lower.ends_with(".localhost")
+}
+
+/// fc00::/7 - IPv6 unique-local (the ULA private range).
+fn is_ipv6_unique_local(ip: Ipv6Addr) -> bool {
+    (ip.segments()[0] & 0xfe00) == 0xfc00
+}
+
+/// fe80::/10 - IPv6 unicast link-local.
+fn is_ipv6_link_local(ip: Ipv6Addr) -> bool {
+    (ip.segments()[0] & 0xffc0) == 0xfe80
+}
+
+/// Split `https://host[:port]`, `http://host[:port]`, or a bare `host[:port]`
+/// into scheme + host + port.
+///
+/// Scheme resolution (TASK-192 plaintext-downgrade guard): an EXPLICIT `http://`
+/// or `https://` is honoured as-is (an explicit `http://` is the operator's
+/// deliberate plaintext choice - the localhost/testproxy path depends on it). A
+/// BARE authority (no scheme) is NO LONGER blindly defaulted to plaintext
+/// `http://`: a bare LOOPBACK/PRIVATE host keeps `http://` (the dev/testproxy
+/// path), but a bare PUBLIC host is defaulted to `https://` so a public upstream
+/// is never silently downgraded to an unencrypted hop. The port defaults to the
+/// RESOLVED scheme's default when absent: 80 for http, 443 for https.
 fn parse_authority(base: &str) -> Result<(Scheme, String, u16), String> {
-    let (scheme, rest) = if let Some(rest) = base.strip_prefix("https://") {
-        (Scheme::Https, rest)
+    // `None` => no scheme was written (bare authority) and must be classified.
+    let (explicit_scheme, rest) = if let Some(rest) = base.strip_prefix("https://") {
+        (Some(Scheme::Https), rest)
     } else if let Some(rest) = base.strip_prefix("http://") {
-        (Scheme::Http, rest)
+        (Some(Scheme::Http), rest)
     } else {
-        (Scheme::Http, base)
-    };
-    let default_port = match scheme {
-        Scheme::Http => 80,
-        Scheme::Https => 443,
+        (None, base)
     };
     let authority = rest.trim_end_matches('/');
-    match authority.rsplit_once(':') {
+    let (host, explicit_port) = match authority.rsplit_once(':') {
         Some((host, port)) => {
             let port = port
-                .parse()
+                .parse::<u16>()
                 .map_err(|_| format!("bad port in upstream {base:?}"))?;
-            Ok((scheme, host.to_string(), port))
+            (host.to_string(), Some(port))
         }
-        None => Ok((scheme, authority.to_string(), default_port)),
-    }
+        None => (authority.to_string(), None),
+    };
+    let scheme = match explicit_scheme {
+        Some(s) => s,
+        // Bare authority: default a PUBLIC host to https (no silent plaintext
+        // downgrade); keep loopback/private on http (the localhost dev path).
+        None if is_private_or_loopback_host(&host) => Scheme::Http,
+        None => Scheme::Https,
+    };
+    let port = explicit_port.unwrap_or(match scheme {
+        Scheme::Http => 80,
+        Scheme::Https => 443,
+    });
+    Ok((scheme, host, port))
 }
 
 #[async_trait]
@@ -1205,10 +1267,107 @@ mod tests {
             parse_authority("http://127.0.0.1:8080").unwrap(),
             (Scheme::Http, "127.0.0.1".to_string(), 8080)
         );
+        // A BARE loopback host keeps plaintext http (the localhost dev path).
         assert_eq!(
-            parse_authority("example.com").unwrap(),
-            (Scheme::Http, "example.com".to_string(), 80)
+            parse_authority("127.0.0.1:8080").unwrap(),
+            (Scheme::Http, "127.0.0.1".to_string(), 8080)
         );
+    }
+
+    /// TASK-192 PRIMARY bite: a BARE PUBLIC authority (no scheme) must NOT be
+    /// silently downgraded to plaintext http - it defaults to https (port 443),
+    /// so a public upstream is TLS by default. MUTATION: default a bare authority
+    /// back to `Scheme::Http` in `parse_authority` and this reddens (the bare
+    /// public host would then connect plaintext).
+    #[test]
+    fn bare_public_authority_defaults_to_https_not_plaintext() {
+        assert_eq!(
+            parse_authority("cache.nixos.org").unwrap(),
+            (Scheme::Https, "cache.nixos.org".to_string(), 443)
+        );
+        // The built client actually carries a TLS transport (not Plain).
+        let client = UpstreamHttp::new("cache.nixos.org").expect("bare public base accepted");
+        assert!(
+            matches!(client.transport, Transport::Tls { .. }),
+            "a bare public authority must build a TLS client, not a plaintext one"
+        );
+        // An explicit port on a bare public host is preserved; scheme still https.
+        assert_eq!(
+            parse_authority("cache.nixos.org:8443").unwrap(),
+            (Scheme::Https, "cache.nixos.org".to_string(), 8443)
+        );
+    }
+
+    /// TASK-192 CONTROL bite (do not over-refuse): an EXPLICIT `http://` to
+    /// loopback/private, AND a BARE loopback/private authority, both stay
+    /// plaintext http - the localhost substituter / testproxy path is untouched.
+    /// MUTATION: refuse ALL plaintext (or upgrade loopback too) and this reddens.
+    #[test]
+    fn loopback_and_private_stay_plaintext_http() {
+        // Explicit http:// to loopback - the e2e/testproxy path.
+        assert_eq!(
+            parse_authority("http://127.0.0.1:8080").unwrap(),
+            (Scheme::Http, "127.0.0.1".to_string(), 8080)
+        );
+        // Explicit http:// to a public host is the operator's deliberate choice.
+        assert_eq!(
+            parse_authority("http://cache.nixos.org").unwrap(),
+            (Scheme::Http, "cache.nixos.org".to_string(), 80)
+        );
+        // Bare loopback name and RFC1918 / link-local literals: all private.
+        for (input, host, port) in [
+            ("localhost:5000", "localhost", 5000u16),
+            ("10.0.0.5:8080", "10.0.0.5", 8080),
+            ("192.168.1.10:9000", "192.168.1.10", 9000),
+            ("172.16.4.4:80", "172.16.4.4", 80),
+            ("169.254.1.1:80", "169.254.1.1", 80),
+        ] {
+            assert_eq!(
+                parse_authority(input).unwrap(),
+                (Scheme::Http, host.to_string(), port),
+                "bare private/loopback authority {input:?} must stay plaintext http"
+            );
+        }
+        // The built loopback client is a Plain transport, not TLS.
+        let client = UpstreamHttp::new("http://127.0.0.1:8080").expect("loopback base");
+        assert!(matches!(client.transport, Transport::Plain));
+    }
+
+    #[test]
+    fn host_privacy_classification() {
+        // Private / loopback.
+        for h in [
+            "127.0.0.1",
+            "127.5.5.5",
+            "localhost",
+            "sub.localhost",
+            "10.1.2.3",
+            "192.168.0.1",
+            "172.31.255.255",
+            "169.254.0.1",
+            "::1",
+            "[::1]",
+            "fc00::1",
+            "fd12:3456::1",
+            "fe80::1",
+        ] {
+            assert!(
+                is_private_or_loopback_host(h),
+                "{h} must be private/loopback"
+            );
+        }
+        // Public.
+        for h in [
+            "cache.nixos.org",
+            "example.com",
+            "8.8.8.8",
+            "1.1.1.1",
+            "172.32.0.1", // just outside 172.16/12
+            "2606:4700::1111",
+            "notlocalhost.com",
+        ] {
+            assert!(!is_private_or_loopback_host(h), "{h} must be public");
+        }
     }
 
     #[test]
@@ -1825,6 +1984,59 @@ mod tls_tests {
         );
     }
 
+    /// Run the rustls handshake DIRECTLY (bypassing `UpstreamHttp`, which folds
+    /// the cause into a `SourceError` string) so a test can assert the EXACT
+    /// `rustls::Error` variant the verifier produced - not just "an error". The
+    /// TCP target is `addr` (loopback) while the client VALIDATES `validated_name`
+    /// against `ca`, mirroring `tls_client`. tokio-rustls wraps a rustls handshake
+    /// failure as `io::Error(InvalidData, rustls::Error)`, so we downcast the
+    /// inner error back to the typed variant.
+    async fn direct_handshake_error(
+        addr: SocketAddr,
+        validated_name: &str,
+        ca: &CertificateDer<'static>,
+    ) -> rustls::Error {
+        let connector = TlsConnector::from(secure_config(ca));
+        let stream = TcpStream::connect(addr).await.expect("tcp connect");
+        let server_name = ServerName::try_from(validated_name.to_string()).expect("server name");
+        let io_err = connector
+            .connect(server_name, stream)
+            .await
+            .expect_err("handshake must fail for an invalid cert");
+        *io_err
+            .into_inner()
+            .expect("tokio-rustls wraps a source error")
+            .downcast::<rustls::Error>()
+            .expect("the wrapped cause is a rustls::Error")
+    }
+
+    /// A TLS server that records the SNI the client sent (from the negotiated
+    /// `ServerConnection`) and forwards it over a oneshot, so a test can assert
+    /// the client sent the VALIDATED host name as SNI - not the loopback IP it
+    /// actually dialled. Serves `response` on the one connection it accepts.
+    async fn spawn_https_capture_sni(
+        chain: Vec<CertificateDer<'static>>,
+        key: PrivateKeyDer<'static>,
+        response: Vec<u8>,
+    ) -> (SocketAddr, tokio::sync::oneshot::Receiver<Option<String>>) {
+        let acceptor = TlsAcceptor::from(Arc::new(server_config(chain, key)));
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        tokio::spawn(async move {
+            let Ok((sock, _)) = listener.accept().await else {
+                return;
+            };
+            if let Ok(tls) = acceptor.accept(sock).await {
+                // The SNI the client offered, read off the completed handshake.
+                let sni = tls.get_ref().1.server_name().map(str::to_string);
+                let _ = tx.send(sni);
+                serve_response(tls, response).await;
+            }
+        });
+        (addr, rx)
+    }
+
     // --- tests -------------------------------------------------------------
 
     /// AC#1 + AC#2: an https base connects over TLS against a fixture-CA valid
@@ -1897,6 +2109,17 @@ mod tls_tests {
         let (leaf, key) = self_signed_leaf("valid.test");
         let addr = spawn_https(vec![leaf], key, http_response(b"secret", None)).await;
         assert_rejected_with_bite(addr, "valid.test", &ca).await;
+        // TASK-192 (4): assert the EXACT rustls error kind, not merely "an error".
+        // A self-signed leaf chains to no root in the store => UnknownIssuer.
+        // MUTATION: expect a different CertificateError variant here and it reddens.
+        let err = direct_handshake_error(addr, "valid.test", &ca).await;
+        assert!(
+            matches!(
+                err,
+                rustls::Error::InvalidCertificate(rustls::CertificateError::UnknownIssuer)
+            ),
+            "expected InvalidCertificate(UnknownIssuer), got {err:?}"
+        );
     }
 
     /// AC#4: a cert whose SAN is `wrong.test` is rejected when the client
@@ -1907,6 +2130,19 @@ mod tls_tests {
         let (leaf, key) = leaf_signed_by(&issuer, "wrong.test", false);
         let addr = spawn_https(vec![leaf], key, http_response(b"secret", None)).await;
         assert_rejected_with_bite(addr, "valid.test", &ca).await;
+        // TASK-192 (4): the chain and validity are fine; only the NAME mismatches,
+        // so the exact kind is NotValidForName (with rustls's name context). A
+        // DISTINCT kind from the untrusted/expired cases => swapping certs reddens.
+        let err = direct_handshake_error(addr, "valid.test", &ca).await;
+        assert!(
+            matches!(
+                err,
+                rustls::Error::InvalidCertificate(
+                    rustls::CertificateError::NotValidForNameContext { .. }
+                )
+            ),
+            "expected InvalidCertificate(NotValidForNameContext), got {err:?}"
+        );
     }
 
     /// AC#4: an expired cert (validity 2000..2001) is rejected though its chain
@@ -1917,6 +2153,39 @@ mod tls_tests {
         let (leaf, key) = leaf_signed_by(&issuer, "valid.test", true);
         let addr = spawn_https(vec![leaf], key, http_response(b"secret", None)).await;
         assert_rejected_with_bite(addr, "valid.test", &ca).await;
+        // TASK-192 (4): chain and name are fine; only VALIDITY is stale (2000..2001
+        // vs now), so the exact kind is Expired (with rustls's time context).
+        // MUTATION: issue a non-expired cert here and this reddens.
+        let err = direct_handshake_error(addr, "valid.test", &ca).await;
+        assert!(
+            matches!(
+                err,
+                rustls::Error::InvalidCertificate(rustls::CertificateError::ExpiredContext { .. })
+            ),
+            "expected InvalidCertificate(ExpiredContext), got {err:?}"
+        );
+    }
+
+    /// TASK-192 (4): the client sends the VALIDATED host name as the TLS SNI, not
+    /// the loopback IP it dialled. The fixture server reads the SNI off the
+    /// negotiated connection; we assert it equals the validated name. MUTATION:
+    /// validate a different name (change `server_name` sent) and the captured SNI
+    /// no longer matches => this reddens.
+    #[tokio::test]
+    async fn tls_client_sends_host_as_sni() {
+        let (ca, issuer) = fixture_ca();
+        let (leaf, key) = leaf_signed_by(&issuer, "valid.test", false);
+        let (addr, sni_rx) =
+            spawn_https_capture_sni(vec![leaf], key, http_response(b"ok", None)).await;
+        let client = tls_client(addr, "valid.test", secure_config(&ca), TlsBudget::default());
+        let resp = client.get("/nar/x").await.expect("valid cert connects");
+        assert_eq!(resp.status, 200);
+        let sni = sni_rx.await.expect("server captured the SNI");
+        assert_eq!(
+            sni.as_deref(),
+            Some("valid.test"),
+            "the client must offer the validated host as SNI, not the dialled IP"
+        );
     }
 
     /// AC#5: a server that accepts TCP but never completes the TLS handshake must
