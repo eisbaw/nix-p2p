@@ -143,6 +143,15 @@ struct Config {
     /// SENDS its discovery lookups (get_record / peer-routing), so it hides what it serves and
     /// announces, NOT what it looks up.
     libp2p_leech: bool,
+    /// ROUTER / bootstrap-relay mode (TASK-241): an EXPLICIT request to run as a kad SERVER (a
+    /// bootstrap rendezvous root that answers FIND_NODE/GET_PROVIDERS) plus, by default, a
+    /// circuit-v2 relay server — carrying NO content (serves + announces NOTHING). It is the
+    /// DHT-infrastructure role the give/consume modes cannot express: `consume-only` is a kad
+    /// CLIENT (cannot be a bootstrap root) and the provider modes require content to serve.
+    /// Derives [`SharingProfile::Router`]; mutually exclusive with every give-side flag (a router
+    /// that serves would be a backdoor), enforced fail-fast in `parse_config` and again by
+    /// `SharingProfile::derive`. Threads to `NodeConfig::with_kad_server(true)` + the relay server.
+    libp2p_router: bool,
 }
 
 /// The default announce-after-fetch budget (distinct paths announced before growth stops). An
@@ -164,7 +173,10 @@ fn build_contract(cfg: &Config) -> Result<OperatorContract, String> {
     let dht_role = match cfg.profile {
         SharingProfile::UpstreamOnly => DhtRole::None,
         SharingProfile::ConsumeOnly => DhtRole::Client,
-        SharingProfile::LanShare | SharingProfile::PublicShare => DhtRole::Server,
+        // A provider AND a router both run a kad SERVER (a router IS the infrastructure role).
+        SharingProfile::LanShare | SharingProfile::PublicShare | SharingProfile::Router => {
+            DhtRole::Server
+        }
     };
     let contract = OperatorContract {
         profile: cfg.profile,
@@ -272,6 +284,7 @@ fn parse_config<I: IntoIterator<Item = String>>(args: I) -> Result<Config, Strin
         libp2p_announce_after_fetch: false,
         libp2p_announce_budget: default_libp2p_announce_budget(),
         libp2p_leech: false,
+        libp2p_router: false,
         preflight: false,
         diagnostics: false,
         explicit_profile: None,
@@ -343,6 +356,7 @@ fn parse_config<I: IntoIterator<Item = String>>(args: I) -> Result<Config, Strin
                 .push(parse_prove_public_narinfo(&value()?)?),
             "--libp2p-announce-after-fetch" => cfg.libp2p_announce_after_fetch = true,
             "--libp2p-leech" => cfg.libp2p_leech = true,
+            "--libp2p-router" => cfg.libp2p_router = true,
             "--preflight" => cfg.preflight = true,
             "--diagnostics" => cfg.diagnostics = true,
             "--profile" => cfg.explicit_profile = Some(value()?),
@@ -395,6 +409,44 @@ fn parse_config<I: IntoIterator<Item = String>>(args: I) -> Result<Config, Strin
             return Err(format!(
                 "--libp2p-leech is consume-only (it serves nothing and announces nothing); it \
                  cannot be combined with {flag}. Drop the give-side flag or drop --libp2p-leech."
+            ));
+        }
+    }
+    // TASK-241 ROUTER mode is a kad-server + relay that carries NO content: like a leech it must
+    // GIVE nothing back, so it is contradictory with every give-side flag (and with --libp2p-leech,
+    // which is the OTHER non-serving mode - a node is one or the other, not both). Reject fail-fast
+    // rather than silently drop the flag; `SharingProfile::derive` re-checks this transport-agnostically.
+    if cfg.libp2p_router {
+        let incompatible = [
+            ("--libp2p-provider", cfg.libp2p_provider),
+            (
+                "--libp2p-announce-after-fetch",
+                cfg.libp2p_announce_after_fetch,
+            ),
+            ("--libp2p-seed-nar", !cfg.libp2p_seed_nar.is_empty()),
+            (
+                "--libp2p-provide-store",
+                !cfg.libp2p_provide_store.is_empty(),
+            ),
+            (
+                "--libp2p-public-allowlist-path",
+                cfg.libp2p_public_allowlist_path.is_some(),
+            ),
+            (
+                "--libp2p-trusted-public-key",
+                !cfg.libp2p_trusted_public_keys.is_empty(),
+            ),
+            (
+                "--libp2p-prove-public-narinfo",
+                !cfg.libp2p_prove_public_narinfo.is_empty(),
+            ),
+            ("--libp2p-leech", cfg.libp2p_leech),
+        ];
+        if let Some((flag, _)) = incompatible.iter().find(|(_, present)| *present) {
+            return Err(format!(
+                "--libp2p-router is a pure kad-server + relay that carries NO content (serves \
+                 nothing, announces nothing); it cannot be combined with {flag}. Drop it, or drop \
+                 --libp2p-router."
             ));
         }
     }
@@ -476,6 +528,7 @@ fn contract_request(cfg: &Config) -> ContractRequest {
         announces: cfg.libp2p_announce_after_fetch
             || !cfg.libp2p_seed_nar.is_empty()
             || !cfg.libp2p_provide_store.is_empty(),
+        is_router: cfg.libp2p_router,
         has_public_allowlist: cfg.libp2p_public_allowlist_path.is_some(),
         advertises_public_address: !cfg.libp2p_external_addresses.is_empty(),
         has_bootstrap: !cfg.libp2p_bootstrap.is_empty(),
@@ -521,6 +574,12 @@ fn check_runtime_preconditions(cfg: &Config) -> Result<(), String> {
         return Err(
             "consume-only requires at least one --libp2p-bootstrap <PeerId>@<multiaddr> (it fetches from peers); for pure HTTP fallback use --profile upstream-only with no bootstrap".into(),
         );
+    } else if cfg.profile == SharingProfile::Router && cfg.libp2p_listen.is_empty() {
+        // TASK-241: a router is a kad-server + relay OTHERS reach - it must BIND a transport, so a
+        // listen is mandatory. (A bootstrap is optional: a genesis router seeds the DHT itself.)
+        return Err(
+            "a router (--libp2p-router) requires at least one --libp2p-listen: it binds a kad-server + relay that others dial as a bootstrap/relay root".into(),
+        );
     } else if cfg.profile == SharingProfile::UpstreamOnly {
         // TASK-120 fix A: upstream-only runs NO participating libp2p swarm - it is a pure HTTP
         // node. Refuse any flag that would start/participate a swarm (listen, bootstrap, provider
@@ -561,7 +620,10 @@ fn source_config(
     profile: SharingProfile,
     identity_seed: [u8; 32],
 ) -> Libp2pSourceConfig {
-    let serves = profile.serves();
+    // TASK-241: the DHT-infrastructure axis (kad SERVER + the relay server) is run by a PROVIDER
+    // AND by a ROUTER; a CONSUMER is a kad CLIENT that relays for nobody. `runs_dht_server()` is
+    // that axis, distinct from `serves()` (which is content-serving, false for a router).
+    let dht_server = profile.runs_dht_server();
     Libp2pSourceConfig {
         identity_seed,
         network_scope: cfg.libp2p_scope.clone().unwrap_or_else(|| "v1".to_string()),
@@ -573,10 +635,11 @@ fn source_config(
         discovery_budget: DiscoveryBudget::default(),
         envelope: SafetyEnvelope::default(),
         state_dir: cfg.libp2p_state_dir.clone(),
-        // A CONSUMER relays for nobody (relay server OFF); a PROVIDER uses the configured value.
-        relay_server_enabled: serves && cfg.libp2p_relay_server_enabled,
-        // A PROVIDER is a kad SERVER (DHT participation); a CONSUMER is a kad CLIENT.
-        kad_server: serves,
+        // A PROVIDER or ROUTER runs the relay server (unless --libp2p-no-relay-server); a CONSUMER
+        // relays for nobody (relay server OFF).
+        relay_server_enabled: dht_server && cfg.libp2p_relay_server_enabled,
+        // A PROVIDER or ROUTER is a kad SERVER (DHT infrastructure); a CONSUMER is a kad CLIENT.
+        kad_server: dht_server,
     }
 }
 
@@ -1275,16 +1338,33 @@ async fn main() -> ExitCode {
         // A serving profile uses the concrete fabric (its serve gate is installed).
         fabric_dyn = fabric;
     } else {
-        // CONSUME-ONLY: kad CLIENT + relay-server OFF (set in source_config), masked below.
+        // Non-serving participating swarm: either CONSUME-ONLY (kad CLIENT + relay OFF) or a ROUTER
+        // (kad SERVER + relay as configured, TASK-241). Both are masked with LeechFabric below so
+        // the serve + announce axes are structurally None - a router carries NO content just like a
+        // leech. `source_config` already set kad_server + the relay server from the profile.
         _serve_guard = None;
         let source_cfg = source_config(&cfg, contract.profile, identity_seed);
         let fabric = match build_libp2p_nar_source(source_cfg).await {
             Ok((fabric, _source, _raw)) => {
-                println!(
-                    "daemon-libp2p: CONSUMER started (kad CLIENT mode, relay OFF), discovery \
-                     converging ({} bootstrap peer(s))",
-                    cfg.libp2p_bootstrap.len()
-                );
+                if contract.profile == SharingProfile::Router {
+                    let relay = if cfg.libp2p_relay_server_enabled {
+                        "relay server ON"
+                    } else {
+                        "relay server OFF (--libp2p-no-relay-server)"
+                    };
+                    println!(
+                        "daemon-libp2p: ROUTER started (kad SERVER mode, {relay}) - a bootstrap/relay \
+                         root for others; carries NO content (serves NOTHING, announces NOTHING), \
+                         {} bootstrap peer(s)",
+                        cfg.libp2p_bootstrap.len()
+                    );
+                } else {
+                    println!(
+                        "daemon-libp2p: CONSUMER started (kad CLIENT mode, relay OFF), discovery \
+                         converging ({} bootstrap peer(s))",
+                        cfg.libp2p_bootstrap.len()
+                    );
+                }
                 if cfg.libp2p_leech {
                     // TASK-78 exposure honesty (AC#5): state EXACTLY what a leech hides vs reveals.
                     println!(
@@ -1452,6 +1532,7 @@ mod bootstrap_guard_tests {
             libp2p_announce_after_fetch: false,
             libp2p_announce_budget: crate::default_libp2p_announce_budget(),
             libp2p_leech: false,
+            libp2p_router: false,
             preflight: false,
             diagnostics: false,
             explicit_profile: None,
@@ -1689,6 +1770,87 @@ mod operator_contract_tests {
         assert_eq!(cfg.profile, SharingProfile::ConsumeOnly);
         assert!(!cfg.profile.serves());
         assert!(!cfg.profile.announces());
+    }
+
+    /// TASK-241: `--libp2p-router` derives the ROUTER profile - a kad SERVER + relay that carries
+    /// NO content. The load-bearing bite (mirroring the leech serve-side proof): a router serves
+    /// NOTHING and announces NOTHING, yet is a kad SERVER (so it is a usable bootstrap root), and
+    /// `source_config` puts kad in SERVER mode with the relay server engaged - the exact wire a
+    /// content-less bootstrap/relay root needs, without any give-side capability.
+    #[test]
+    fn router_is_kad_server_relay_serving_nothing() {
+        let cfg = parse_config(args(&[
+            "--libp2p-router",
+            "--libp2p-listen",
+            "/ip4/127.0.0.1/tcp/0",
+            "--libp2p-bootstrap",
+            BOOT,
+        ]))
+        .expect("a router parses");
+        assert_eq!(cfg.profile, SharingProfile::Router);
+        // GIVE-SIDE BACKDOOR BITE: a router must serve + announce NOTHING.
+        assert!(!cfg.profile.serves(), "a router must serve NOTHING");
+        assert!(!cfg.profile.announces(), "a router must announce NOTHING");
+        // ...yet it IS the DHT infrastructure (a kad server + relay), unlike a consume-only client.
+        assert!(
+            cfg.profile.runs_dht_server(),
+            "a router must be a kad SERVER (a bootstrap rendezvous root)"
+        );
+        check_runtime_preconditions(&cfg).expect("a router with a listen starts");
+        // The wire the swarm actually runs: kad SERVER + relay server ON.
+        let src = source_config(&cfg, cfg.profile, [7u8; 32]);
+        assert!(src.kad_server, "router swarm must be a kad SERVER");
+        assert!(
+            src.relay_server_enabled,
+            "router runs the relay server by default"
+        );
+        // The reported DHT role matches the wire.
+        let contract = build_contract(&cfg).expect("router contract is valid");
+        assert_eq!(contract.dht_role, daemon_core::DhtRole::Server);
+
+        // `--libp2p-no-relay-server` drops ONLY the relay server (a kad-only bootstrap like zboot):
+        // still a kad SERVER, but relays for nobody, so it can never be an alternative relay path.
+        let kad_only = parse_config(args(&[
+            "--libp2p-router",
+            "--libp2p-no-relay-server",
+            "--libp2p-listen",
+            "/ip4/127.0.0.1/tcp/0",
+        ]))
+        .expect("a kad-only router parses");
+        assert_eq!(kad_only.profile, SharingProfile::Router);
+        let kad_only_src = source_config(&kad_only, kad_only.profile, [7u8; 32]);
+        assert!(kad_only_src.kad_server, "still a kad SERVER");
+        assert!(
+            !kad_only_src.relay_server_enabled,
+            "--libp2p-no-relay-server drops the relay server"
+        );
+
+        // A router with NO listen fails fast (it must bind a transport to be reachable).
+        let no_listen = parse_config(args(&["--libp2p-router"])).expect("parses");
+        let err = check_runtime_preconditions(&no_listen)
+            .expect_err("a router with no listen must be rejected");
+        assert!(err.contains("router"), "{err}");
+
+        // FAIL-CLOSED: a router combined with a give-side flag is rejected at parse time.
+        let backdoor = parse_config(args(&[
+            "--libp2p-router",
+            "--libp2p-provider",
+            "--libp2p-listen",
+            "/ip4/127.0.0.1/tcp/0",
+        ]))
+        .err()
+        .expect("router + provider must fail closed");
+        assert!(backdoor.contains("router"), "{backdoor}");
+
+        // The explicit `--profile router` agrees with the flag (the compat-shim cross-check).
+        parse_config(args(&[
+            "--profile",
+            "router",
+            "--libp2p-router",
+            "--libp2p-listen",
+            "/ip4/127.0.0.1/tcp/0",
+        ]))
+        .expect("--profile router agrees with --libp2p-router");
     }
 
     /// AC#2: a provider WITHOUT a public allowlist is lan-share; WITH one it is public-share.

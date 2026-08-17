@@ -36,6 +36,10 @@ let
   profile = lcfg.profile;
   isProvider = lcfg.provider || profile == "lan-share" || profile == "public-share";
   isLeech = lcfg.leech || profile == "consume-only";
+  # TASK-241: a ROUTER is a kad-server + relay that carries NO content (serves + announces
+  # NOTHING). It is the DHT-infrastructure role the give/consume modes cannot express - a
+  # dedicated bootstrap/relay root. Selected via `profile = "router"` (or the low-level `router`).
+  isRouter = lcfg.router || profile == "router";
   wantsAnnounceAfterFetch = lcfg.announceAfterFetch || profile == "public-share";
   # Local daemon URL, pinned ahead of everything with an explicit priority so
   # ordering does not depend on the advertised nix-cache-info Priority.
@@ -122,7 +126,7 @@ in
       enable = lib.mkEnableOption "the libp2p P2P node (decentralized directory + NAR transfer + NAT traversal)";
 
       profile = lib.mkOption {
-        type = lib.types.enum [ "upstream-only" "consume-only" "lan-share" "public-share" ];
+        type = lib.types.enum [ "upstream-only" "consume-only" "lan-share" "public-share" "router" ];
         default = "upstream-only";
         description = ''
           The authoritative, validated operator PARTICIPATION MODE (TASK-120,
@@ -140,6 +144,13 @@ in
             `--libp2p-announce-after-fetch`, and REQUIRES `publicAllowlistPath` +
             `libp2pTrustedPublicKeys`). Invalid/privacy-contradictory combinations FAIL
             at evaluation (see the assertions below) rather than silently downgrading.
+          - `router` (TASK-241): a pure kad-SERVER + circuit-v2 relay for OTHERS, carrying
+            NO content (sets `--libp2p-router`; serves NOTHING, announces NOTHING). This is
+            the dedicated bootstrap/relay-root role the give/consume modes cannot express:
+            `consume-only` is a kad CLIENT (cannot be a bootstrap root) and the provider
+            modes require content to serve. Requires `listen`; `relayServer = false` makes
+            it a kad-only bootstrap (no reservation service). Combining it with any give-side
+            option FAILS at evaluation.
 
           The lower-level `provider`/`leech`/`announceAfterFetch` booleans still exist for
           fine control; the profile is the recommended surface and its guarantees are the
@@ -157,6 +168,12 @@ in
         type = lib.types.bool;
         default = false;
         description = "Consume-only LEECH (`--libp2p-leech`): fetch from peers, serve + announce NOTHING. Usually set via `profile = \"consume-only\"`.";
+      };
+
+      router = lib.mkOption {
+        type = lib.types.bool;
+        default = false;
+        description = "ROUTER (`--libp2p-router`, TASK-241): a kad-SERVER + relay for others, carrying NO content (serves + announces NOTHING). Requires `listen`. Usually set via `profile = \"router\"`.";
       };
 
       announceAfterFetch = lib.mkOption {
@@ -305,6 +322,17 @@ in
         assertion = profile == "upstream-only" || lcfg.enable;
         message = "services.nix-p2p.libp2p.profile = \"${profile}\" requires libp2p.enable = true (and a package that speaks the libp2p flags). upstream-only is the only profile that needs no libp2p node.";
       }
+      {
+        # TASK-241: a router carries NO content - it cannot also be a provider/leech/announce/allowlist
+        # (a router that serves would be a give-side backdoor). Mirrors the daemon's RouterServes.
+        assertion = !isRouter || !(isProvider || isLeech || wantsAnnounceAfterFetch || lcfg.publicAllowlistPath != null);
+        message = "services.nix-p2p.libp2p: a router (profile = \"router\" / libp2p.router) is a kad-server + relay that carries NO content; it cannot be combined with a provider profile, leech, announceAfterFetch, or a public allowlist. Choose one participation mode.";
+      }
+      {
+        # TASK-241: a router must BIND a transport (it is a bootstrap/relay root others dial).
+        assertion = !isRouter || lcfg.listen != [ ];
+        message = "services.nix-p2p.libp2p: a router (profile = \"router\") requires libp2p.listen (it binds a kad-server + relay that others dial as a bootstrap/relay root).";
+      }
     ];
 
     systemd.services.nix-p2p-daemon = {
@@ -349,6 +377,7 @@ in
             # fold the profile together with the low-level booleans.
             ++ lib.optionals isProvider [ "--libp2p-provider" ]
             ++ lib.optionals isLeech [ "--libp2p-leech" ]
+            ++ lib.optionals isRouter [ "--libp2p-router" ]
             ++ lib.optionals wantsAnnounceAfterFetch [ "--libp2p-announce-after-fetch" ]
             ++ lib.optionals (!lcfg.relayServer) [ "--libp2p-no-relay-server" ]
             ++ lib.concatMap (a: [ "--libp2p-listen" a ]) lcfg.listen

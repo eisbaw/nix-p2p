@@ -546,6 +546,9 @@ fn derive_contract(config: &Config) -> Result<OperatorContract, String> {
         // iroh-consuming node with no give-side flag is CONSUME-ONLY (fetches from peers), never
         // upstream-only: it is a lie to report HTTP-only while an iroh transport fetches.
         has_bootstrap: !config.libp2p_bootstrap.is_empty() || iroh_consume_active(config),
+        // The composite daemon exposes no `--libp2p-router`: the pure kad-server/relay ROUTER mode
+        // (TASK-241) is a daemon-libp2p-primary surface. Never a router here.
+        is_router: false,
     };
     let profile = SharingProfile::derive(req).map_err(|e| e.to_string())?;
 

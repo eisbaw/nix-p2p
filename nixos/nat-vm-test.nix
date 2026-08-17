@@ -343,6 +343,14 @@ pkgs.testers.runNixOSTest {
         upstream = narinfoUpstreamUrl;
         libp2p = {
           enable = true;
+          # EXPLICIT profile (TASK-120/241): the flags below (provider + public allowlist +
+          # self-advertised external address) derive PUBLIC-SHARE. The module always emits the
+          # authoritative --profile for its own end-to-end cross-check, so it must be declared
+          # here - a bare `provider = true` left the DEFAULT --profile upstream-only emitted,
+          # which the daemon fail-closes against the derived public-share (the TASK-120 contract
+          # working as designed). public-share also enables announce-after-fetch; nodea fetches
+          # nothing (it is the seed provider), so that is inert here.
+          profile = "public-share";
           provider = true;
           scope = scope;
           printPeerAddress = true;
@@ -407,6 +415,12 @@ pkgs.testers.runNixOSTest {
         trustedPublicKeys = [ publicKey ];
         libp2p = {
           enable = true;
+          # EXPLICIT profile (TASK-120/241): a bootstrap-only node with no give-side flag derives
+          # CONSUME-ONLY (fetch from peers, serve + announce NOTHING). Declared so the module's
+          # emitted --profile matches the derived one - a bare consumer left the DEFAULT --profile
+          # upstream-only emitted, which the daemon fail-closes against the derived consume-only.
+          # consume-only is the leech mask; nodeb still FETCHES (that is a leech's whole point).
+          profile = "consume-only";
           scope = scope;
           listen = [ "/ip4/${ipNodeB}/tcp/${toString libp2pPort}" ];
           # kad bootstrap roots: the relay AND the independent zboot (see nodea). The
@@ -448,6 +462,12 @@ pkgs.testers.runNixOSTest {
         upstream = "http://127.0.0.1:1"; # dummy: the relay serves/routes, never fetches
         libp2p = {
           enable = true;
+          # ROUTER (TASK-241): a kad-SERVER + circuit-v2 relay that carries NO content. This is the
+          # dedicated bootstrap/relay-root role - the operator contract (TASK-120) fail-closes an
+          # unprofiled bootstrap node (default upstream-only rejects --libp2p-bootstrap), and neither
+          # consume-only (kad CLIENT, cannot be a bootstrap root) nor a provider mode (requires
+          # content + rejects external-address-without-allowlist) fits a content-less relay.
+          profile = "router";
           scope = scope;
           identitySeed = relaySeed;
           listen = [ relayMultiaddr ];
@@ -484,6 +504,9 @@ pkgs.testers.runNixOSTest {
         upstream = "http://127.0.0.1:1"; # dummy: a bootstrap root never fetches
         libp2p = {
           enable = true;
+          # ROUTER (TASK-241): a kad-SERVER carrying NO content, PLUS relayServer = false below -
+          # a kad-only bootstrap root that can NEVER be an alternative reservation path (the B2 guard).
+          profile = "router";
           scope = scope;
           identitySeed = bootSeed;
           listen = [ bootMultiaddr ];

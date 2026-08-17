@@ -60,6 +60,17 @@ pub enum SharingProfile {
     /// narinfo signature proves it public. The only mode that participates in the
     /// public DHT as a server and advertises public reachability.
     PublicShare,
+    /// A pure ROUTER / bootstrap-relay node (TASK-241): a kad SERVER (answers
+    /// FIND_NODE/GET_PROVIDERS and stores records, so it can be a bootstrap rendezvous
+    /// root) plus, by default, a circuit-v2 relay server — but it holds and carries NO
+    /// content: it serves NO NAR bytes and announces NOTHING. It routes + relays for
+    /// OTHERS. This is the DHT-infrastructure role the four give/consume modes cannot
+    /// express: `consume-only` is a kad CLIENT (cannot be a bootstrap root), and the
+    /// provider modes REQUIRE content to serve. Never a default — an operator must
+    /// EXPLICITLY select it (`--libp2p-router` / `profile = "router"`); a give-side flag
+    /// combined with it fails closed ([`ContractError::RouterServes`]), so a router can
+    /// never become a serve/announce backdoor.
+    Router,
 }
 
 impl SharingProfile {
@@ -70,6 +81,7 @@ impl SharingProfile {
             SharingProfile::ConsumeOnly => "consume-only",
             SharingProfile::LanShare => "lan-share",
             SharingProfile::PublicShare => "public-share",
+            SharingProfile::Router => "router",
         }
     }
 
@@ -80,6 +92,7 @@ impl SharingProfile {
             "consume-only" => Ok(SharingProfile::ConsumeOnly),
             "lan-share" => Ok(SharingProfile::LanShare),
             "public-share" => Ok(SharingProfile::PublicShare),
+            "router" => Ok(SharingProfile::Router),
             other => Err(ContractError::UnknownProfile(other.to_string())),
         }
     }
@@ -100,6 +113,10 @@ impl SharingProfile {
             }
             SharingProfile::PublicShare => {
                 "public-share: serve + announce over a public substrate, allowlist-gated per NAR"
+            }
+            SharingProfile::Router => {
+                "router: kad-server + circuit-v2 relay for OTHERS; carries NO content \
+                 (serves NOTHING, announces NOTHING)"
             }
         }
     }
@@ -129,6 +146,20 @@ impl SharingProfile {
     /// caveat made legible.
     pub fn sends_discovery_lookups(self) -> bool {
         !matches!(self, SharingProfile::UpstreamOnly)
+    }
+
+    /// Does this node run the DHT INFRASTRUCTURE — a kad SERVER (stores records + answers
+    /// FIND_NODE/GET_PROVIDERS) and, subject to `--libp2p-no-relay-server`, the circuit-v2
+    /// relay server? TRUE for the two provider modes AND for [`Router`](SharingProfile::Router).
+    /// This is the "is a kad server, not merely a client" axis: a provider serves content AND
+    /// runs infrastructure; a router runs ONLY infrastructure (no content); a consumer is a kad
+    /// CLIENT; upstream-only runs no swarm at all. Drives the swarm's `kad_server` + relay-server
+    /// gating so a router is a usable bootstrap/relay root while serving/announcing nothing.
+    pub fn runs_dht_server(self) -> bool {
+        matches!(
+            self,
+            SharingProfile::LanShare | SharingProfile::PublicShare | SharingProfile::Router
+        )
     }
 }
 
@@ -160,6 +191,11 @@ pub struct ContractRequest {
     pub advertises_public_address: bool,
     /// The node has at least one bootstrap/entry peer (can reach a P2P substrate).
     pub has_bootstrap: bool,
+    /// `--libp2p-router`: an EXPLICIT request to be a pure ROUTER / bootstrap-relay node
+    /// (kad SERVER + relay for others, carrying NO content). Never inferred — a content-less
+    /// bootstrap otherwise looks exactly like a consumer; only this affirmative flag selects
+    /// the [`Router`](SharingProfile::Router) mode. Contradictory with every give-side intent.
+    pub is_router: bool,
 }
 
 impl SharingProfile {
@@ -175,6 +211,17 @@ impl SharingProfile {
         // A leech gives nothing back: it is contradictory with every give-side intent.
         if req.is_leech && (req.is_provider || req.announces || req.has_public_allowlist) {
             return Err(ContractError::LeechServes);
+        }
+        // A ROUTER (TASK-241) is a kad-server + relay that carries NO content. It is an EXPLICIT,
+        // never-default mode, and — like a leech — must give NOTHING back: combining it with any
+        // serve/announce/allowlist/leech intent is a contradiction (a router that serves would be a
+        // give-side backdoor). Checked BEFORE the give-side derivation so `--libp2p-router
+        // --libp2p-provider ...` can never silently resolve to a serving mode.
+        if req.is_router {
+            if req.is_provider || req.announces || req.has_public_allowlist || req.is_leech {
+                return Err(ContractError::RouterServes);
+            }
+            return Ok(SharingProfile::Router);
         }
         // A public self-address on a SERVING node WITHOUT the per-NAR allowlist door would
         // announce local content over a self-declared public address — the isolation an lan-share
@@ -928,6 +975,11 @@ impl OperatorContract {
                     .to_string(),
                 "circuit-v2 relays (for NAT'd reachability, if used)".to_string(),
             ],
+            SharingProfile::Router => vec![
+                "libp2p-kad peers (kad-server: a bootstrap rendezvous root for others)".to_string(),
+                "circuit-v2 relay clients it relays for (unless --libp2p-no-relay-server)"
+                    .to_string(),
+            ],
         }
     }
 }
@@ -950,6 +1002,9 @@ pub enum ContractError {
     PublicAddressWithoutAllowlist,
     /// Announcing (or a public allowlist) was requested without the serve axis.
     AnnounceWithoutProvider,
+    /// A router (kad-server + relay, carries NO content) was combined with a give-side intent
+    /// (provider/announce/allowlist/leech). A router that serves would be a give-side backdoor.
+    RouterServes,
     /// A pending / evidenced-unsupported mechanism was selected (AC#8). Fail-closed —
     /// no profile aliases pending to enabled.
     PendingMechanismSelected {
@@ -977,6 +1032,11 @@ impl fmt::Display for ContractError {
             ContractError::AnnounceWithoutProvider => f.write_str(
                 "announcing / a public allowlist requires the serve axis (a provider): you \
                  cannot advertise what you will not serve",
+            ),
+            ContractError::RouterServes => f.write_str(
+                "a router (--libp2p-router) is a kad-server + relay that carries NO content; it \
+                 cannot be combined with a give-side intent (provider/announce/allowlist/leech): \
+                 a router serves NOTHING and announces NOTHING",
             ),
             ContractError::PendingMechanismSelected {
                 mechanism,
@@ -1077,10 +1137,84 @@ mod tests {
                 advertises_public_address: true,
                 has_bootstrap: true,
                 is_leech: false,
+                is_router: false,
             })
             .unwrap(),
             SharingProfile::PublicShare
         );
+        // router (TASK-241): explicit --libp2p-router, no give side. A router advertising its
+        // OWN reachable address is legitimate (a relay's whole job), so an external address does
+        // NOT flip it to a leaky provider.
+        assert_eq!(
+            SharingProfile::derive(ContractRequest {
+                is_router: true,
+                advertises_public_address: true,
+                has_bootstrap: true,
+                ..Default::default()
+            })
+            .unwrap(),
+            SharingProfile::Router
+        );
+    }
+
+    /// TASK-241: a router carries NO content — the wire facts that keep it from being a give-side
+    /// backdoor. It is a kad SERVER (a usable bootstrap root) yet serves + announces NOTHING.
+    #[test]
+    fn router_is_a_kad_server_that_gives_nothing() {
+        let p = SharingProfile::Router;
+        assert!(!p.serves(), "a router serves no NAR bytes");
+        assert!(!p.announces(), "a router announces nothing");
+        assert!(
+            p.runs_dht_server(),
+            "a router IS a kad server (a bootstrap rendezvous root)"
+        );
+        assert!(
+            p.sends_discovery_lookups(),
+            "a router runs a participating swarm (self-lookup / kad queries)"
+        );
+        // Round-trips through the machine token (NixOS `profile = \"router\"`).
+        assert_eq!(p.as_str(), "router");
+        assert_eq!(SharingProfile::parse("router").unwrap(), p);
+        // The DHT-server axis distinguishes a router from a consume-only CLIENT.
+        assert!(!SharingProfile::ConsumeOnly.runs_dht_server());
+    }
+
+    /// TASK-241 fail-closed: --libp2p-router combined with ANY give-side intent is a contradiction
+    /// (a router that serves would be a backdoor). Each give-side bit trips it.
+    #[test]
+    fn router_with_a_give_side_fails_closed() {
+        for req in [
+            ContractRequest {
+                is_router: true,
+                is_provider: true,
+                has_bootstrap: true,
+                ..Default::default()
+            },
+            ContractRequest {
+                is_router: true,
+                announces: true,
+                has_bootstrap: true,
+                ..Default::default()
+            },
+            ContractRequest {
+                is_router: true,
+                has_public_allowlist: true,
+                has_bootstrap: true,
+                ..Default::default()
+            },
+            ContractRequest {
+                is_router: true,
+                is_leech: true,
+                has_bootstrap: true,
+                ..Default::default()
+            },
+        ] {
+            assert_eq!(
+                SharingProfile::derive(req).unwrap_err(),
+                ContractError::RouterServes,
+                "a router + give-side intent must fail closed: {req:?}"
+            );
+        }
     }
 
     #[test]
@@ -1349,6 +1483,7 @@ mod tests {
             SharingProfile::ConsumeOnly,
             SharingProfile::LanShare,
             SharingProfile::PublicShare,
+            SharingProfile::Router,
         ] {
             assert_eq!(SharingProfile::parse(p.as_str()).unwrap(), p);
         }
