@@ -285,16 +285,43 @@ impl Libp2pNodeLocator {
             // No relays to compose anyway, or nothing to probe: skip the probe latency.
             false
         };
+        self.circuit_from_verdict(peer, dht_addrs, reachable_directly)
+    }
+
+    /// The LOCATOR's USE of the reachability `verdict` (F5), split out so BOTH directions are
+    /// unit-couplable with an INJECTED verdict — a hermetic reachable-PRIVATE address cannot be
+    /// bound on a test host, so `circuit_provenance`'s real probe can only ever produce
+    /// verdict=false for a private address in a test. Here the verdict is a parameter, so a test
+    /// drives verdict=true (a same-LAN private provider the probe DID reach) and asserts the
+    /// locator SUPPRESSES the circuit and records NO disclosure, and verdict=false and asserts it
+    /// composes + discloses. This is the load-bearing positive-direction coupling: if the locator's
+    /// use of the verdict is broken (composes despite verdict=true), the over-disclosure TASK-221
+    /// removes comes back and the verdict=true test reddens.
+    fn circuit_from_verdict(
+        &self,
+        peer: PeerId,
+        dht_addrs: &[Multiaddr],
+        reachable_directly: bool,
+    ) -> Vec<Multiaddr> {
         let composed = compose_circuit_candidates(&self.known_relays, peer, reachable_directly);
-        // END-TO-END privacy invariant (F2): dialing THROUGH a relay — a /p2p-circuit ANYWHERE in
-        // the resolved dial set, whether WE composed it (cross-NAT) or one arrived among the
-        // DHT-provided addresses — discloses to that relay operator that we relay to this provider.
-        // Recording on the UNION (not just our composed set) closes a circuit-WITHOUT-disclosure
-        // under-count. In the current frozen schema a DHT-provided circuit is structurally
-        // impossible (a `ProviderRecord` carries no dial address — only the provider `NodeId` +
-        // `TransportOffer`s — and kad peer-routing drops the `/p2p-circuit` addr in the
-        // identify->kad->FIND_NODE path, TASK-218 diagnosis), so this is defense-in-depth that also
-        // keeps the invariant true if kad address handling or the offer schema ever changes.
+        self.record_relay_if_circuit_dialed(dht_addrs, &composed);
+        composed
+    }
+
+    /// The END-TO-END privacy invariant (F2): dialing THROUGH a relay — a `/p2p-circuit` ANYWHERE
+    /// in the resolved dial set, whether WE composed it (cross-NAT) or one arrived among the
+    /// DHT-provided addresses — discloses to that relay operator that we relay to this provider.
+    /// Recording on the UNION (`dht_addrs` + `composed`), not just our composed set, closes a
+    /// circuit-WITHOUT-disclosure under-count. This is LOAD-BEARING, not merely defensive: kad
+    /// PEER-ROUTING (separate from the `ProviderRecord`, which carries no dial address) feeds a
+    /// target's identify listen addresses into the routing table UNFILTERED and returns them from
+    /// `get_closest_peers` (`swarm.rs`, identify->kad `add_address` and the `GetClosestPeers`
+    /// `info.addrs`), so a provider that advertises a `/p2p-circuit` listen address CAN surface one
+    /// in `dht_addrs`. That the harness provider currently advertises only a direct addr is OBSERVED
+    /// behaviour, not a frozen-schema guarantee — so the union-record here (with
+    /// [`addr_is_directly_reachable`] refusing to classify a circuit as directly reachable) is what
+    /// keeps "circuit dialed <=> Relay disclosed" true on that reachable path.
+    fn record_relay_if_circuit_dialed(&self, dht_addrs: &[Multiaddr], composed: &[Multiaddr]) {
         let dials_via_circuit = dht_addrs
             .iter()
             .chain(composed.iter())
@@ -303,7 +330,6 @@ impl Libp2pNodeLocator {
             self.ledger
                 .record(Exposure::new(Recipient::Relay, Disclosed::OurNodeId));
         }
-        composed
     }
 }
 
@@ -311,10 +337,10 @@ impl Libp2pNodeLocator {
 /// connection before concluding a private-addressed provider is across a NAT and composing the
 /// relay circuit. SHORT and integer (owner no-floats rule): a same-LAN provider connects in a
 /// few RTT so the common case returns fast; a cross-NAT provider is never reached and spends
-/// this full budget once, on the LOCATE, before falling back to the circuit — it is the WHOLE
-/// probe bound (the deadline is taken before the dials), well inside the fetch envelope. On the
-/// nat-vm's 600s budgets this is negligible, and a too-short value only forgoes the privacy win
-/// (it falls back to composing), never the cornerstone.
+/// this full budget once, on the LOCATE, before falling back to the circuit — it HARD-bounds the
+/// whole probe (a `tokio::time::timeout` wraps the fast-path + dials + poll), well inside the fetch
+/// envelope. On the nat-vm's 600s budgets this is negligible, and a too-short value only forgoes
+/// the privacy win (it falls back to composing), never the cornerstone.
 const DIRECT_PROBE_BUDGET: Duration = Duration::from_millis(2000);
 
 /// Append `/p2p/<peer>` to `addr` for an identity-checked dial, unless it already ends in a
@@ -784,6 +810,66 @@ mod circuit_provenance_tests {
             relay_disclosures(&ledger),
             1,
             "a DHT-provided /p2p-circuit in the dial set MUST still record a Relay disclosure"
+        );
+    }
+
+    /// F5 POSITIVE-DIRECTION COUPLING: the locator's USE of a verdict=TRUE for a genuinely
+    /// reachable PRIVATE provider SUPPRESSES the circuit and records NO disclosure (the exact
+    /// over-disclosure TASK-221 removes). Driven through the real `circuit_from_verdict` with an
+    /// injected verdict because a reachable private address cannot be bound hermetically.
+    /// MUTATION: the locator ignoring the verdict (composing despite verdict=true — e.g.
+    /// `compose_circuit_candidates(.., false)`) -> a circuit + disclosure appear for a reachable
+    /// same-LAN provider -> this test reddens.
+    #[tokio::test]
+    async fn reachable_private_verdict_suppresses_circuit_and_discloses_nothing() {
+        let relay = (
+            PeerId::random(),
+            "/ip4/203.0.113.7/tcp/4001".parse().unwrap(),
+        );
+        let (_node, ledger, locator) = consumer([34u8; 32], vec![relay]).await;
+        let provider = PeerId::random();
+        // A PRIVATE (RFC1918) same-LAN address the probe DID reach -> verdict = true.
+        let dht_addrs: Vec<Multiaddr> = vec!["/ip4/192.168.3.9/tcp/4001".parse().unwrap()];
+
+        let composed = locator.circuit_from_verdict(provider, &dht_addrs, true);
+
+        assert!(
+            composed.is_empty(),
+            "a REACHABLE same-LAN private provider (verdict=true) MUST NOT compose a circuit — \
+             that is the TASK-221 over-disclosure we remove"
+        );
+        assert_eq!(
+            relay_disclosures(&ledger),
+            0,
+            "a reachable same-LAN private provider MUST record NO Relay disclosure"
+        );
+    }
+
+    /// F5 NEGATIVE-DIRECTION COUPLING (the mirror): the SAME private provider with verdict=FALSE
+    /// (probe did NOT reach it — cross-NAT) composes the circuit + records exactly one disclosure.
+    /// MUTATION: the locator ignoring the verdict the OTHER way (always suppress — e.g.
+    /// `compose_circuit_candidates(.., true)`) -> a cross-NAT provider gets no circuit -> reddens.
+    #[tokio::test]
+    async fn unreachable_private_verdict_composes_circuit_and_discloses_once() {
+        let relay = (
+            PeerId::random(),
+            "/ip4/203.0.113.7/tcp/4001".parse().unwrap(),
+        );
+        let (_node, ledger, locator) = consumer([35u8; 32], vec![relay]).await;
+        let provider = PeerId::random();
+        let dht_addrs: Vec<Multiaddr> = vec!["/ip4/192.168.3.9/tcp/4001".parse().unwrap()];
+
+        let composed = locator.circuit_from_verdict(provider, &dht_addrs, false);
+
+        assert_eq!(
+            composed.len(),
+            1,
+            "a NON-reachable (cross-NAT) private provider (verdict=false) MUST compose the circuit"
+        );
+        assert_eq!(
+            relay_disclosures(&ledger),
+            1,
+            "composing the circuit MUST record exactly one Relay disclosure"
         );
     }
 

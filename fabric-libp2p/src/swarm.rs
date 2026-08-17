@@ -677,33 +677,33 @@ impl SwarmHandle {
     /// dial that fails to INITIATE is ignored (its async failure surfaces as a swarm event, leaving
     /// `connection_path` at its current non-Direct value — exactly the cross-NAT outcome).
     ///
-    /// The `budget` bounds the WHOLE call: the deadline is taken BEFORE issuing the dials, so the
-    /// command-channel round-trips and any number of `targets` fall INSIDE the bound (the poll loop
-    /// exits at the deadline even if dialing already consumed it). The one thing outside `budget` is
-    /// the single pre-dial fast-path `connection_path` round-trip.
+    /// The `budget` HARD-bounds the WHOLE call (F4): the entire fast-path check + sequential dials +
+    /// poll loop run inside a single `tokio::time::timeout(budget, ..)`, so even command-channel
+    /// congestion or a large `targets` set cannot overrun it — the call resolves `false` the moment
+    /// `budget` elapses, whatever it was waiting on.
     pub async fn probe_direct_reachable(
         &self,
         peer: PeerId,
         targets: &[Multiaddr],
         budget: Duration,
     ) -> bool {
-        if self.connection_path(peer).await == ConnPath::Direct {
-            return true;
-        }
-        // Strict bound (F4): start the clock BEFORE the dials so their setup is inside `budget`.
-        let deadline = Instant::now() + budget;
-        for addr in targets {
-            let _ = self.dial(addr.clone()).await;
-        }
-        loop {
+        let probe = async {
             if self.connection_path(peer).await == ConnPath::Direct {
                 return true;
             }
-            if Instant::now() >= deadline {
-                return false;
+            for addr in targets {
+                let _ = self.dial(addr.clone()).await;
             }
-            tokio::time::sleep(Duration::from_millis(50)).await;
-        }
+            loop {
+                if self.connection_path(peer).await == ConnPath::Direct {
+                    return true;
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        };
+        // On timeout the provider was not reached DIRECTLY within the budget -> not directly
+        // reachable (compose the circuit). `budget` is the whole-call ceiling.
+        (tokio::time::timeout(budget, probe).await).unwrap_or(false)
     }
 
     /// Join the network through a SET of independently-operated bootstrap peers. Pass

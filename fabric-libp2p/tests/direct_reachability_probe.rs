@@ -13,10 +13,11 @@
 //! MECHANISM (dial + connection_path -> Direct). In PRODUCTION a loopback address is classified
 //! directly reachable BEFORE the probe, so the probe branch is reached only for a PRIVATE address
 //! — and a reachable private address cannot be bound hermetically on a test host. The probe-TRUE
-//! MECHANISM proven here is address-agnostic (it takes targets directly), and the reachable ->
-//! suppress -> no-disclosure CHAIN through the real locator is covered by
-//! `locator::circuit_provenance_tests` (the by-address suppress bite + the F1 coupled compose
-//! bite). Address CLASSIFICATION is unit-tested in `src/locator.rs`; the cross-NAT end-to-end
+//! MECHANISM proven here is address-agnostic (it takes targets directly); the reachable-PRIVATE ->
+//! verdict=true -> locator SUPPRESSES + records NO disclosure CHAIN is coupled+mutation-proven in
+//! `locator::circuit_provenance_tests::reachable_private_verdict_suppresses_circuit_and_discloses_nothing`
+//! (via the `circuit_from_verdict` seam, with `unreachable_private_verdict_composes_circuit_and_discloses_once`
+//! the mirror). Address CLASSIFICATION is unit-tested in `src/locator.rs`; the cross-NAT end-to-end
 //! (probe fails behind a real NAT -> circuit carries the bytes) is `nixos/nat-vm-test.nix`.
 
 use std::time::{Duration, Instant};
