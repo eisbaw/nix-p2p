@@ -15,7 +15,7 @@ absolute-path reference list threaded in here, so we fail loud rather than emit 
 wrong signature.
 
 Usage:
-    sign-narinfo.py <out.narinfo> <storePath> <narHash> <narSize> <storeHash> <secretKeyFile>
+    sign-narinfo.py <out.narinfo> <storePath> <narHash> <narSize> <narUrlToken> <secretKeyFile>
 """
 
 import base64
@@ -28,10 +28,16 @@ def main(argv: list[str]) -> int:
     if len(argv) != 7:
         sys.stderr.write(
             "sign-narinfo.py: expected 6 args "
-            "(out storePath narHash narSize storeHash secretKeyFile)\n"
+            "(out storePath narHash narSize narUrlToken secretKeyFile)\n"
         )
         return 2
-    out, store_path, nar_hash, nar_size, store_hash, secret_file = argv[1:7]
+    out, store_path, nar_hash, nar_size, nar_url_token, secret_file = argv[1:7]
+
+    if not nar_url_token.endswith(".nar") or "/" in nar_url_token:
+        sys.stderr.write(
+            "sign-narinfo.py: narUrlToken must be one path component ending in .nar\n"
+        )
+        return 2
 
     # The nix binary-cache secret key: "<name>:<base64(32-byte seed || 32-byte pubkey)>".
     with open(secret_file, "r", encoding="utf-8") as f:
@@ -52,20 +58,17 @@ def main(argv: list[str]) -> int:
 
     with open(out, "w", encoding="utf-8") as f:
         f.write(f"StorePath: {store_path}\n")
-        f.write(f"URL: nar/{store_hash}.nar\n")
+        f.write(f"URL: nar/{nar_url_token}\n")
         f.write("Compression: none\n")
         f.write(f"NarHash: {nar_hash}\n")
         f.write(f"NarSize: {nar_size}\n")
         # FileHash/FileSize describe the TRANSPORT bytes. With `Compression: none` the
         # transferred file IS the raw NAR, so FileHash == NarHash and FileSize == NarSize.
         # These are UNSIGNED (Nix's fingerprint covers only NarHash/NarSize/refs), so adding
-        # them does NOT change the Sig. Emitting them matches what a real cache writes for an
-        # uncompressed path, and it is REQUIRED for the daemon's rewrite-to-raw correlation:
-        # without FileHash the daemon cannot rewrite a peer-serveable narinfo to raw and
-        # records no token->SignedNarHash correlation, so the follow-up NAR request falls to
-        # the URL-less UpstreamPath and the p2p path is never attempted (daemon-core
-        # server.rs / rewrite.rs). A signed cache lacking FileHash would make the p2p fetch
-        # non-deterministic; emitting it keeps discovery+relay-fetch reliable.
+        # them does NOT change the Sig. Emitting them matches what a generated cache writes
+        # for an uncompressed path and makes the fixture's transfer metadata explicit.
+        # Current rewrite logic can also correlate a Compression:none narinfo without these
+        # optional fields; they are not a prerequisite for peer discovery or raw rewriting.
         f.write(f"FileHash: {nar_hash}\n")
         f.write(f"FileSize: {nar_size}\n")
         f.write("References: \n")

@@ -20,7 +20,13 @@
 # WHAT IS **NOT** CLAIMED. DCUtR/hole-punch is NOT claimed to SUCCEED; on the contrary,
 # the B2 bite ASSERTS the DCUtR success log is ABSENT (no relayed connection was ever
 # upgraded to DIRECT), which is what keeps the consumer's only live path the relay
-# circuit. `--random-fully` on the MASQUERADE rule randomizes the outbound source PORT
+# circuit, and (5) production fallback for this already-raw `Compression: none`
+# fixed-point URL after that bite: once the test atomically exposes the staged NAR
+# in the still-running HTTP upstream, the SAME consumer retries the SAME path,
+# observes a fresh circuit-unreachable -> upstream fallback, receives an exact HTTP
+# NAR 200, and realises the signed NarHash. This does NOT claim fallback for a
+# compressed narinfo rewritten to a raw URL; that representation gap fails closed.
+# `--random-fully` on the MASQUERADE rule randomizes the outbound source PORT
 # per connection; it is a NAT-realism detail, NOT a proof of endpoint-dependent
 # ("symmetric") NAT mapping, and the harness measures no NAT-mapping taxonomy - it
 # OBSERVES the DCUtR outcome (absent) directly instead. The negative control below
@@ -94,6 +100,15 @@
 #      alternative relay), the direct addr is B1-blocked, and total_res==base observes
 #      the provider's SOLE reservation relay is the stopped relay. The UP-succeeds /
 #      DOWN-fails delta on the SAME consumer proves the relay carries the NAR bytes.
+#   5. ALREADY-RAW UPSTREAM FALLBACK (TASK-207 AC#2) - only AFTER #4 passes,
+#      atomically expose a staged copy of payloadA's signed raw NAR at the fixed-point
+#      URL in the same running HTTP service. The SAME consumer and daemon retry the
+#      SAME absent path with the relay still DOWN. Fresh, cursor-scoped journals must
+#      show NAR fetch UNREACHABLE -> p2p miss -> falling back to upstream, plus >=1
+#      exact GET of that NAR returning 200; the realised hash must equal the signed
+#      NarHash. Until activation, the served root contains narinfo metadata only, so
+#      #3/#4 cannot pass by taking this HTTP byte path early. Compressed-to-raw
+#      fallback is explicitly outside this harness and remains a fail-closed gap.
 { pkgs, daemonLibp2p }:
 
 let
@@ -201,10 +216,23 @@ let
       local narSize narHash
       narSize=$(stat -c%s nar.bin)
       narHash="sha256:$(nix-hash --type sha256 --flat --base32 nar.bin)"
-      cp nar.bin "$out/nar/$storeHash.nar"
+      # Binary-cache URL tokens are opaque, so a store-path-hash token would also
+      # be valid upstream. This fixture deliberately uses the raw NarHash digest:
+      # rewrite::to_raw emits that token, making the already-raw representation a
+      # fixed point whose exact upstream_hint remains fetchable after peer failure.
+      local narDigest="''${narHash#*:}"
+      if [ -z "$narDigest" ] || [ "$narDigest" = "$narHash" ]; then
+        echo "signedCache: malformed NarHash '$narHash' (expected algorithm:digest)" >&2
+        exit 1
+      fi
+      cp nar.bin "$out/nar/$narDigest.nar"
       python3 ${./sign-narinfo.py} \
-        "$out/$storeHash.narinfo" "$storePath" "$narHash" "$narSize" "$storeHash" \
+        "$out/$storeHash.narinfo" "$storePath" "$narHash" "$narSize" "$narDigest.nar" \
         "${cacheKey}/secret"
+      grep -qxF "URL: nar/$narDigest.nar" "$out/$storeHash.narinfo" || {
+        echo "signedCache: narinfo URL does not name the raw NarHash-digest file" >&2
+        exit 1
+      }
     }
     sign_one "${payloadA}" "${storeHashA}"
   '';
@@ -227,6 +255,32 @@ let
       grep '^NarHash: ' ${signedCache}/${storeHash}.narinfo | cut -d' ' -f2 > "$out"
     ''));
   narHashA = narHashOf storeHashA;
+  narDigestA = lib.removePrefix "sha256:" narHashA;
+
+  # Cheap fixture lock-in: this already-raw (`Compression:none`) cache URL chooses
+  # the raw NarHash digest, while the store-path hash names only `.narinfo`. URL
+  # tokens are generally opaque; this deliberate choice is load-bearing because
+  # rewrite::to_raw preserves the token and UpstreamHttp fetches it verbatim.
+  narUrlOf = storeHash: lib.removeSuffix "\n" (builtins.readFile (
+    pkgs.runCommand "nat-vm-narurl-${storeHash}" { } ''
+      sed -n 's/^URL: //p' ${signedCache}/${storeHash}.narinfo > "$out"
+    ''));
+  narUrlA = narUrlOf storeHashA;
+  narinfoUrlSelfCheck = lib.assertMsg
+    (lib.hasPrefix "sha256:" narHashA
+      && narDigestA != ""
+      && narUrlA == "nar/${narDigestA}.nar")
+    "raw-cache fixture drift: NarHash ${narHashA} but URL ${narUrlA}";
+
+  # Mutable HTTP fixture state. systemd owns this runtime directory; the service's
+  # preStart seeds ONLY metadata into `root` and keeps the signed NAR in `staged`,
+  # outside the served tree. AC#2 later hard-links that fully-written staged file
+  # into root/nar atomically, without changing the URL or restarting any service.
+  narinfoRuntimeDirectory = "narinfo-upstream";
+  narinfoRuntimeRoot = "/run/${narinfoRuntimeDirectory}";
+  narinfoServedRoot = "${narinfoRuntimeRoot}/root";
+  narinfoStagedRoot = "${narinfoRuntimeRoot}/staged";
+  narinfoStagedNar = "${narinfoStagedRoot}/${narDigestA}.nar";
 
   # ---- network constants (see the topology header; derived from the driver's
   # alphabetical nodeNumber assignment). Asserted at runtime so a rename that
@@ -280,6 +334,7 @@ let
 in
 # `assert` forces the build-time PeerId self-check before the test is even realised.
 assert peerIdSelfCheck;
+assert narinfoUrlSelfCheck;
 pkgs.testers.runNixOSTest {
   name = "nix-p2p-nat-vm";
 
@@ -450,7 +505,8 @@ pkgs.testers.runNixOSTest {
     };
 
     # ---- relay: public vlan1, the circuit-v2 relay + kad bootstrap root, AND the
-    # narinfo-only HTTP upstream (a separate service that SURVIVES the mutation). ----
+    # runtime-mutable HTTP upstream. It starts narinfo-only, is a separate service
+    # that SURVIVES the relay-down mutation, and gains the staged NAR only after B2. ----
     relay = { ... }: {
       imports = [ libp2pNode ];
       virtualisation.vlans = [ 1 ];
@@ -480,9 +536,25 @@ pkgs.testers.runNixOSTest {
       systemd.services.narinfo-upstream = {
         wantedBy = [ "multi-user.target" ];
         after = [ "network.target" ];
-        serviceConfig.ExecStart =
-          "${pkgs.python3}/bin/python3 -m http.server ${toString narinfoPort} "
-          + "--directory ${narinfoUpstream} --bind 0.0.0.0";
+        # Re-seed on every service start so a restart can never retain a NAR exposed
+        # by an earlier run and make the relay-carriage oracle vacuous.
+        preStart = ''
+          set -euo pipefail
+          served_root=${lib.escapeShellArg narinfoServedRoot}
+          staged_root=${lib.escapeShellArg narinfoStagedRoot}
+          ${pkgs.coreutils}/bin/rm -rf -- "$served_root" "$staged_root"
+          ${pkgs.coreutils}/bin/install -d -m 0755 "$served_root" "$staged_root"
+          ${pkgs.coreutils}/bin/cp -a ${narinfoUpstream}/. "$served_root/"
+          ${pkgs.coreutils}/bin/cp -a \
+            ${signedCache}/nar/${narDigestA}.nar ${lib.escapeShellArg narinfoStagedNar}
+        '';
+        serviceConfig = {
+          RuntimeDirectory = narinfoRuntimeDirectory;
+          RuntimeDirectoryMode = "0755";
+          ExecStart =
+            "${pkgs.python3}/bin/python3 -m http.server ${toString narinfoPort} "
+            + "--directory ${narinfoServedRoot} --bind 0.0.0.0";
+        };
       };
     };
 
@@ -556,6 +628,11 @@ pkgs.testers.runNixOSTest {
         relay.wait_for_unit("nix-p2p-daemon.service")
         relay.wait_for_unit("narinfo-upstream.service")
         relay.wait_until_succeeds("curl -sf ${narinfoUpstreamUrl}/nix-cache-info", timeout=60)
+        # The upstream MUST remain metadata-only through AC#1 and B2. The complete
+        # NAR is staged outside the served root, and the same URL returns 404 for it.
+        relay.succeed("test -f ${narinfoStagedNar}")
+        relay.fail("test -e ${narinfoServedRoot}/nar/${narDigestA}.nar")
+        relay.fail("curl -sf ${narinfoUpstreamUrl}/nar/${narDigestA}.nar")
         zboot.wait_for_unit("nix-p2p-daemon.service")
 
     with subtest("provider: nodea announces + reserves against the live relay"):
@@ -659,7 +736,7 @@ pkgs.testers.runNixOSTest {
         # byte-verified NAR fetch THROUGH the relay. The narinfo upstream holds NO NAR body
         # (nar/ stripped), and the direct path is blocked (B1 negative control), so the ONLY
         # way these bytes arrive is the relay circuit. kad bootstrap convergence through TWO
-        # symmetric NATs is slow AND variable (observed 30s-260s across runs), hence the
+        # egress-only NATs is slow AND variable (observed 30s-260s across runs), hence the
         # generous 600s ceiling; a single loop avoids two racing sub-budgets.
         nodeb.succeed(
             "timeout 600 sh -c '"
@@ -689,6 +766,15 @@ pkgs.testers.runNixOSTest {
             )
         )
         print("AC#1 GATED: nodeb fetched ${storeHashA} byte-identical THROUGH the relay circuit.")
+        # Pin the converged consumer process BEFORE any relay-loss mutation. The
+        # service has Restart=on-failure, so later local before/after checks alone
+        # could miss a crash+restart between subtests and falsely call it "same".
+        warm_consumer_pid = nodeb.succeed(
+            "systemctl show -p MainPID --value nix-p2p-daemon.service"
+        ).strip()
+        assert warm_consumer_pid != "0", (
+            "AC#1 warm-consumer precondition: nodeb daemon is not running"
+        )
 
     with subtest("B2 LOAD-BEARING (TASK-218): relay carriage is essential - consumer fetches with relay UP, FAILS with relay DOWN"):
         # B2 (TASK-207 deferred -> TASK-218 delivers): the genuinely LOAD-BEARING proof that
@@ -702,8 +788,8 @@ pkgs.testers.runNixOSTest {
         # (libp2p-relay 0.18 renewal is connection-scoped, emits nothing gateable), so the
         # load-bearing oracle MUST be consumer-side. A circuit-v2 connection is forwarded
         # THROUGH the relay, so stopping the relay SEVERS the consumer's only live path to the
-        # NAT'd provider; the consumer holds NO direct connection (DCUtR hole-punch cannot
-        # succeed across this symmetric NAT - asserted below), the direct addr is NAT-blocked
+        # NAT'd provider; the consumer holds NO direct connection (a successful DCUtR upgrade
+        # is asserted absent below), the direct addr is NAT-blocked
         # (B1), and zboot's relay server is disabled (relayServer=false, no alternative relay).
         # So a relay-down re-fetch must RE-DIAL and has NO reachable path. This deliberately
         # does NOT restart-and-rediscover (kad re-convergence via a single surviving bootstrap
@@ -742,6 +828,13 @@ pkgs.testers.runNixOSTest {
         assert up_hash == "${narHashA}", (
             f"relay-UP positive control: re-fetched NarHash {up_hash} != ${narHashA}"
         )
+        consumer_pid_relay_up = nodeb.succeed(
+            "systemctl show -p MainPID --value nix-p2p-daemon.service"
+        ).strip()
+        assert consumer_pid_relay_up == warm_consumer_pid, (
+            f"B2 relay-UP must use the converged nodeb daemon: "
+            f"MainPID {warm_consumer_pid} -> {consumer_pid_relay_up}"
+        )
         print("B2 POSITIVE CONTROL: consumer re-fetched ${storeHashA} byte-identical (relay UP).")
 
         # Capture the provider's MainPID at the point of stop (journal-cursor discipline for
@@ -758,15 +851,15 @@ pkgs.testers.runNixOSTest {
         # confound a REACHABILITY bite with a DISCOVERY one); instead it exploits that a
         # circuit-v2 connection is forwarded THROUGH the relay, so stopping the relay SEVERS
         # the consumer's only live path to the NAT'd provider. The consumer holds NO direct
-        # connection - DCUtR hole-punch cannot succeed across this NAT - so the re-fetch must
-        # RE-DIAL, and its only candidates (the now-dead relay circuit + the NAT-blocked
+        # connection (the successful-DCUtR log is asserted absent below), so the re-fetch
+        # must RE-DIAL, and its only candidates (the now-dead relay circuit + the NAT-blocked
         # private direct addr, B1) are both unreachable. The UP-succeeds / DOWN-fails delta on
         # the SAME converged consumer is the load-bearing proof the relay carries the bytes.
 
         # (a) Confirm the consumer NEVER upgraded its relayed connection to a DIRECT one via
         #     DCUtR: a hole-punched direct connection could survive the relay stop and confound
-        #     the bite. In this symmetric NAT the hole-punch cannot succeed, so the fabric's
-        #     success log MUST be absent (only failures, if any, are logged).
+        #     the bite. The fabric's success log MUST be absent (only failures, if any,
+        #     are logged); this observes the outcome without claiming a NAT taxonomy.
         nodeb.fail(
             "journalctl -u nix-p2p-daemon --no-pager | "
             "grep -q 'dcutr hole-punch upgraded a relayed connection to DIRECT'"
@@ -838,11 +931,142 @@ pkgs.testers.runNixOSTest {
             f"provider must stay ACTIVE across the relay stop (no crash/restart); "
             f"MainPID {pid_before} -> {pid_after}"
         )
+        consumer_pid_after_bite = nodeb.succeed(
+            "systemctl show -p MainPID --value nix-p2p-daemon.service"
+        ).strip()
+        assert consumer_pid_after_bite == warm_consumer_pid, (
+            f"B2 relay-DOWN must keep the SAME converged nodeb daemon: "
+            f"MainPID {warm_consumer_pid} -> {consumer_pid_after_bite}"
+        )
         print(
             "B2 LOAD-BEARING PROVEN: the converged consumer fetched ${storeHashA} byte-identical "
             "with the relay UP and FAILED to fetch it with the relay DOWN (no DCUtR direct "
             "upgrade; provider MainPID " + pid_before + " unchanged; sole reservation relay was "
             "the stopped relay). The relay circuit carries the NAR bytes - load-bearing, not incidental."
+        )
+
+    with subtest("AC#2 ALREADY-RAW FALLBACK: same consumer retries via the same upstream after atomic NAR activation"):
+        # B2 above MUST finish first: serving this NAR from boot would let an early DHT
+        # miss succeed over HTTP and make the relay-carriage proof vacuous. At this
+        # point the relay is DOWN, the path is absent, the provider process is unchanged,
+        # and the bite has been positively attributed to circuit reachability.
+        consumer_pid_before = nodeb.succeed(
+            "systemctl show -p MainPID --value nix-p2p-daemon.service"
+        ).strip()
+        upstream_pid_before = relay.succeed(
+            "systemctl show -p MainPID --value narinfo-upstream.service"
+        ).strip()
+        assert consumer_pid_before == warm_consumer_pid, (
+            f"AC#2 precondition: converged nodeb daemon restarted before fallback: "
+            f"MainPID {warm_consumer_pid} -> {consumer_pid_before}"
+        )
+        assert upstream_pid_before != "0", "AC#2 precondition: HTTP upstream is not running"
+
+        # Atomic activation: staged and served files live in the SAME RuntimeDirectory
+        # filesystem, so hard-link creation exposes an already-complete inode in one
+        # namespace operation. No daemon/service restart and no URL/config change.
+        relay.succeed(
+            "${pkgs.coreutils}/bin/mkdir -p ${narinfoServedRoot}/nar && "
+            "${pkgs.coreutils}/bin/ln -T ${narinfoStagedNar} "
+            "${narinfoServedRoot}/nar/${narDigestA}.nar"
+        )
+
+        # Cursor AFTER activation but BEFORE the retry. Every diagnostic below must
+        # be fresh evidence from this one AC#2 attempt, never an earlier B2 log.
+        fallback_daemon_cursor = nodeb.succeed(
+            "journalctl -u nix-p2p-daemon --no-pager --show-cursor | "
+            "sed -n 's/^-- cursor: //p' | tail -1"
+        ).strip()
+        fallback_http_cursor = relay.succeed(
+            "journalctl -u narinfo-upstream --no-pager --show-cursor | "
+            "sed -n 's/^-- cursor: //p' | tail -1"
+        ).strip()
+        assert fallback_daemon_cursor, "AC#2: failed to capture fresh nodeb daemon journal cursor"
+        assert fallback_http_cursor, "AC#2: failed to capture fresh HTTP-upstream journal cursor"
+
+        # Retry the SAME payload on the SAME warm consumer. The primary source must
+        # still fail to open a stream through the dead relay; production
+        # FallbackNarSource must then fetch the newly exposed NAR from the unchanged URL.
+        nodeb.succeed("timeout 180 nix-store --realise ${payloadA} >/dev/null")
+
+        # journald normally has these records before nix-store exits, but poll briefly
+        # rather than race its ingestion. HTTP retries are allowed; the count is >=1.
+        nodeb.wait_until_succeeds(
+            "journalctl -u nix-p2p-daemon --no-pager --after-cursor '"
+            + fallback_daemon_cursor
+            + "' | grep -qF 'falling back to upstream'",
+            timeout=15,
+        )
+        http_200_pattern = '"GET /nar/${narDigestA}[.]nar HTTP/[0-9]+[.][0-9]+" 200 '
+        relay.wait_until_succeeds(
+            "journalctl -u narinfo-upstream --no-pager --after-cursor '"
+            + fallback_http_cursor
+            + "' | grep -qE '"
+            + http_200_pattern
+            + "'",
+            timeout=15,
+        )
+
+        def fallback_daemon_count(pattern):
+            return int(nodeb.succeed(
+                "journalctl -u nix-p2p-daemon --no-pager --after-cursor '"
+                + fallback_daemon_cursor
+                + "' | grep -cF '"
+                + pattern
+                + "' || true"
+            ).strip())
+
+        unreachable_count = fallback_daemon_count("NAR fetch UNREACHABLE")
+        p2p_miss_count = fallback_daemon_count("p2p miss (")
+        upstream_fallback_count = fallback_daemon_count("falling back to upstream")
+        assert unreachable_count >= 1, (
+            "AC#2: no fresh NAR fetch UNREACHABLE diagnostic; peer failure was not observed"
+        )
+        assert p2p_miss_count >= 1, (
+            "AC#2: no fresh p2p miss diagnostic; FallbackNarSource primary failure was not observed"
+        )
+        assert upstream_fallback_count >= 1, (
+            "AC#2: no fresh falling-back-to-upstream diagnostic; production fallback was not observed"
+        )
+
+        upstream_200_count = int(relay.succeed(
+            "journalctl -u narinfo-upstream --no-pager --after-cursor '"
+            + fallback_http_cursor
+            + "' | grep -cE '"
+            + http_200_pattern
+            + "' || true"
+        ).strip())
+        assert upstream_200_count >= 1, (
+            f"AC#2: expected >=1 exact successful upstream GET for "
+            f"/nar/${narDigestA}.nar; observed {upstream_200_count}"
+        )
+
+        fallback_hash = nodeb.succeed("nix-store -q --hash ${payloadA}").strip()
+        assert fallback_hash == "${narHashA}", (
+            f"AC#2 fallback byte oracle: realised NarHash {fallback_hash} != ${narHashA}"
+        )
+        consumer_pid_after = nodeb.succeed(
+            "systemctl show -p MainPID --value nix-p2p-daemon.service"
+        ).strip()
+        upstream_pid_after = relay.succeed(
+            "systemctl show -p MainPID --value narinfo-upstream.service"
+        ).strip()
+        assert consumer_pid_after == warm_consumer_pid, (
+            f"AC#2 must use the SAME daemon captured after warm convergence: "
+            f"MainPID {warm_consumer_pid} -> {consumer_pid_after}"
+        )
+        assert upstream_pid_after == upstream_pid_before, (
+            f"AC#2 must mutate the SAME running HTTP service root: "
+            f"MainPID {upstream_pid_before} -> {upstream_pid_after}"
+        )
+        print(
+            "AC#2 ALREADY-RAW FALLBACK PROVEN: relay-down peer fetch was UNREACHABLE, "
+            "production FallbackNarSource fell back to the unchanged HTTP upstream, "
+            "exact NAR GET 200 count="
+            + str(upstream_200_count)
+            + ", and warm consumer MainPID "
+            + warm_consumer_pid
+            + " realised signed NarHash ${narHashA}."
         )
   '';
 }

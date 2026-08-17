@@ -352,12 +352,13 @@ e2e-vm:
 
 # The NAT-traversal VM truth layer (TASK-207): two NixOS VMs EACH behind its OWN
 # NAT + a public circuit-v2 relay, driving the shipped services.nix-p2p module +
-# daemon-libp2p. GATED proofs: the real-NAT boundary (direct dial blocked), the
-# relay RESERVATION over real NAT, and RECORD discovery over NAT. The relay being
-# LOAD-BEARING is NOT claimed (a provider-side relay-loss bite is tautological); the
-# load-bearing consumer-side reachability bite is DEFERRED to TASK-218. The end-to-end
-# byte fetch is NON-GATING evidence (documented residual TASK-218: the circuit
-# dial-address does not resolve via kad peer-routing). A PACKAGE; needs /dev/kvm.
+# daemon-libp2p. GATED proofs: the real-NAT boundary, relay reservation, kad record
+# discovery, byte-identical NAR carriage through the relay, and the warm single-
+# variable relay-UP succeeds / relay-DOWN circuit-unreachable load-bearing bite.
+# After that bite, the same consumer also proves production upstream fallback for
+# an already-raw Compression:none fixed-point URL by retrying against a runtime-
+# activated NAR at the unchanged HTTP URL. Compressed-to-raw fallback remains a
+# separate product gap. A PACKAGE; needs /dev/kvm.
 # HEAVY (boots 6 QEMU VMs: gwa, gwb, nodea, nodeb, relay, zboot).
 # Run the NAT-traversal NixOS VM test (relay circuit-v2 over real NAT).
 e2e-nat-vm: _headroom
