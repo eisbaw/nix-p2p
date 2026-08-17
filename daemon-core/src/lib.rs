@@ -32,6 +32,7 @@ pub mod content_id;
 pub mod discovery;
 pub mod narinfo_cache;
 mod nixbase32;
+pub mod observ;
 pub mod operator;
 pub mod peer_source;
 pub mod post_fetch;
@@ -70,6 +71,10 @@ pub use discovery::{
 pub use narinfo_cache::{
     Clock, NARINFO_CACHE_FLAG_CONFLICT, NarinfoCacheChoice, NarinfoDiskCache, NarinfoLayer,
     PassThroughReason, SystemClock, build_narinfo_layer, resolve_narinfo_cache_dir,
+};
+pub use observ::{
+    METRICS_PATH, NullStatusFacts, Observability, RuntimeMetrics, STATUS_PATH, StatusFactSnapshot,
+    StatusFacts, serve_admin,
 };
 pub use operator::{
     ContractError, ContractRequest, DIAGNOSTICS_WARNING, DhtRole, LookupOutcome, Mechanism,

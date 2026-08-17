@@ -1174,12 +1174,28 @@ impl Discovery for DirectDiscovery {
 pub struct FallbackNarSource {
     primary: Arc<dyn NarSource>,
     secondary: Arc<dyn NarSource>,
+    /// The runtime metrics registry (TASK-240 AC#5). The SINGLE serve-source boundary for the
+    /// UPSTREAM hit: recorded exactly once here when the secondary satisfies a p2p miss (the
+    /// production path enters through `resolve_within`; `resolve` delegates to it, so there is no
+    /// double count). `None` in a unit test that does not observe.
+    metrics: Option<Arc<crate::observ::RuntimeMetrics>>,
 }
 
 impl FallbackNarSource {
     /// Try `primary` first, `secondary` on a p2p miss.
     pub fn new(primary: Arc<dyn NarSource>, secondary: Arc<dyn NarSource>) -> Self {
-        Self { primary, secondary }
+        Self {
+            primary,
+            secondary,
+            metrics: None,
+        }
+    }
+
+    /// Attach the runtime metrics registry so an upstream fallback records a `hit_upstream` serve
+    /// (TASK-240). The composition root ([`crate::run`]) wires it; unit tests omit it.
+    pub fn with_metrics(mut self, metrics: Arc<crate::observ::RuntimeMetrics>) -> Self {
+        self.metrics = Some(metrics);
+        self
     }
 }
 
@@ -1232,9 +1248,17 @@ impl NarSource for FallbackNarSource {
                 // saturates to zero, so the CDN fetch fails fast rather than
                 // starting a fresh full wait the chain has no time for.
                 let remaining = budget.map(|b| b.saturating_sub(started.elapsed()));
-                self.secondary
+                let served = self
+                    .secondary
                     .resolve_within(key, expected_size, remaining)
-                    .await
+                    .await;
+                // The upstream served the bytes (the S2 fallback hit): record it ONCE here — the
+                // single serve-source boundary for the upstream path. A secondary error (a genuine
+                // absence, or a size abort surfaced through) is NOT a hit and is not recorded.
+                if let (true, Some(m)) = (served.is_ok(), &self.metrics) {
+                    m.record_upstream_serve();
+                }
+                served
             }
             // A size abort is not a "try elsewhere" - do not paper over it.
             Err(err @ SourceError::TooLarge { .. }) => Err(err),

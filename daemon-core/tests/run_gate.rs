@@ -51,6 +51,8 @@ async fn run_config(required_axes: Vec<Axis>) -> RunConfig {
         public_allowlist: Arc::new(daemon_core::PublicNarAllowlist::disabled()),
 
         post_fetch_announce: None,
+        observability: None,
+        admin_listener: None,
     }
 }
 

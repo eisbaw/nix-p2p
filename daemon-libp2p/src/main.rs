@@ -19,10 +19,12 @@ use daemon_core::{
     RegularFileNarDumper, StorePath,
 };
 use daemon_core::{
-    CacheInfo, ContractRequest, CorrelationStore, DhtRole, NARINFO_CACHE_FLAG_CONFLICT, NarSource,
-    NarinfoLayer, NarinfoSource, OperatorContract, PassThroughReason, PrivacyPolicy,
-    PublicNarAllowlist, RawUpstream, ResourceCaps, RunConfig, SharingProfile, SystemClock,
-    UpstreamHttp, build_narinfo_layer, resolve_narinfo_cache_dir, run,
+    CacheInfo, ContractRequest, CorrelationStore, DhtRole, METRICS_PATH,
+    NARINFO_CACHE_FLAG_CONFLICT, NarSource, NarinfoLayer, NarinfoSource, NullStatusFacts,
+    Observability, OperatorContract, PassThroughReason, PeerPath, PrivacyPolicy,
+    PublicNarAllowlist, RawUpstream, ResourceCaps, RunConfig, RuntimeMetrics, STATUS_PATH,
+    SharingProfile, StatusFactSnapshot, StatusFacts, SystemClock, UpstreamHttp,
+    build_narinfo_layer, resolve_narinfo_cache_dir, run,
 };
 use daemon_libp2p::{
     AllowlistEligibility, AnnounceAfterFetchDoor, LanReachability, LanShare,
@@ -33,7 +35,7 @@ use daemon_libp2p::{
 };
 use ed25519_dalek::SigningKey;
 use fabric_libp2p::{
-    CatalogNarSupplier, Libp2pFabric, MemoryNarSupplier, Multiaddr, PeerId,
+    CatalogNarSupplier, Libp2pFabric, MemoryNarSupplier, Multiaddr, PeerId, SwarmHandle,
     raw_nar_helper_authorized,
 };
 use peer_fabric::{
@@ -152,6 +154,12 @@ struct Config {
     /// that serves would be a backdoor), enforced fail-fast in `parse_config` and again by
     /// `SharingProfile::derive`. Threads to `NodeConfig::with_kad_server(true)` + the relay server.
     libp2p_router: bool,
+    /// TASK-240 AC#4/#5: the DEDICATED admin listener address for the operator observability
+    /// surfaces (`/nix-p2p/status`, `/nix-p2p/metrics`). `None` (the DEFAULT) = no admin surface at
+    /// all — the fail-safe posture. An operator opts in with `--status-listen <addr>` and SHOULD
+    /// bind a loopback address (`127.0.0.1:<port>`): the surface is served on its OWN listener, NEVER
+    /// on the peer-facing cache listener, so the trust boundary is structural, not redaction alone.
+    status_listen: Option<std::net::SocketAddr>,
 }
 
 /// The default announce-after-fetch budget (distinct paths announced before growth stops). An
@@ -159,6 +167,96 @@ struct Config {
 /// authoritative [`ResourceCaps`] so it cannot drift from the documented contract (TASK-120).
 fn default_libp2p_announce_budget() -> u64 {
     ResourceCaps::default().announce_distinct_paths_budget
+}
+
+/// TASK-240 AC#4: the LIVE swarm-facts provider for the status surface. It answers bootstrap health
+/// by asking the RUNNING swarm which configured bootstrap peers are currently connected
+/// ([`SwarmHandle::is_connected`]) — a genuinely live signal that degrades when a bootstrap dies
+/// (the dependency-outage drill keys on it). Peer path is a documented partial (see
+/// [`StatusFactSnapshot`]): the direct-vs-relay discriminator needs the swarm to track
+/// `ConnectedPoint::is_relayed` and expose it via a query command, a named follow-up.
+struct SwarmStatusFacts {
+    handle: SwarmHandle,
+    bootstrap: Vec<PeerId>,
+}
+
+#[async_trait::async_trait]
+impl StatusFacts for SwarmStatusFacts {
+    async fn snapshot(&self) -> StatusFactSnapshot {
+        let mut healthy = 0u32;
+        for peer in &self.bootstrap {
+            if self.handle.is_connected(*peer).await {
+                healthy += 1;
+            }
+        }
+        StatusFactSnapshot {
+            bootstrap_total: self.bootstrap.len() as u32,
+            bootstrap_healthy: healthy,
+            path: PeerPath::None,
+        }
+    }
+}
+
+/// TASK-240: if invoked as `daemon-libp2p --status <addr>` / `--metrics <addr>`, QUERY a running
+/// instance's admin surface over HTTP and print the (already-redacted) response, then exit. Returns
+/// `None` for the normal daemon path (so `fn main` proceeds to build a node). Handled BEFORE
+/// `parse_config` so the client flags never collide with the daemon flag grammar.
+async fn maybe_run_admin_query() -> Option<ExitCode> {
+    let mut args = std::env::args().skip(1);
+    let first = args.next()?;
+    let path = match first.as_str() {
+        "--status" => STATUS_PATH,
+        "--metrics" => METRICS_PATH,
+        _ => return None,
+    };
+    let Some(addr) = args.next() else {
+        eprintln!(
+            "daemon-libp2p: {first} requires an <addr> (the host:port of a running --status-listen)"
+        );
+        return Some(ExitCode::from(2));
+    };
+    match admin_get(&addr, path).await {
+        Ok(body) => {
+            print!("{body}");
+            Some(ExitCode::SUCCESS)
+        }
+        Err(err) => {
+            eprintln!("daemon-libp2p: {first} query to {addr} failed: {err}");
+            Some(ExitCode::FAILURE)
+        }
+    }
+}
+
+/// A minimal loopback HTTP/1.0 GET of an admin endpoint: connect, request `Connection: close`, read
+/// to EOF, return the body (everything after the blank line). HTTP/1.0 + close makes read-to-EOF
+/// unambiguous, so no chunked/length parsing is needed — and this is a client of our OWN loopback
+/// admin server, not a parser behind a trust boundary.
+async fn admin_get(addr: &str, path: &str) -> Result<String, String> {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let mut stream = tokio::net::TcpStream::connect(addr)
+        .await
+        .map_err(|e| format!("connect: {e}"))?;
+    let req = format!("GET {path} HTTP/1.0\r\nHost: {addr}\r\nConnection: close\r\n\r\n");
+    stream
+        .write_all(req.as_bytes())
+        .await
+        .map_err(|e| format!("write: {e}"))?;
+    let mut raw = Vec::new();
+    stream
+        .read_to_end(&mut raw)
+        .await
+        .map_err(|e| format!("read: {e}"))?;
+    let text = String::from_utf8_lossy(&raw);
+    match text.split_once("\r\n\r\n") {
+        Some((head, body)) => {
+            let status_line = head.lines().next().unwrap_or("");
+            if !status_line.contains(" 200 ") {
+                return Err(format!("admin endpoint returned: {status_line}"));
+            }
+            Ok(body.to_string())
+        }
+        None => Err("malformed HTTP response (no header/body separator)".to_string()),
+    }
 }
 
 /// Build the ONE authoritative [`OperatorContract`] from the parsed [`Config`] (TASK-120 AC#9).
@@ -178,9 +276,17 @@ fn build_contract(cfg: &Config) -> Result<OperatorContract, String> {
             DhtRole::Server
         }
     };
+    // TASK-240 (SSOT): the contract's announce-budget cap is the EFFECTIVE one the operator chose
+    // (`--libp2p-announce-budget`, default = the authoritative `ResourceCaps` value), so the LIVE
+    // status/preflight denominator (`announce_budget=used/CAP`) equals the cap the announce gate
+    // actually enforces — the flag drives BOTH, never a stale default alongside an overridden gate.
+    let caps = ResourceCaps {
+        announce_distinct_paths_budget: cfg.libp2p_announce_budget,
+        ..ResourceCaps::default()
+    };
     let contract = OperatorContract {
         profile: cfg.profile,
-        caps: ResourceCaps::default(),
+        caps,
         privacy: PrivacyPolicy {
             diagnostics_opt_in: cfg.diagnostics,
         },
@@ -292,6 +398,7 @@ fn parse_config<I: IntoIterator<Item = String>>(args: I) -> Result<Config, Strin
         libp2p_announce_budget: default_libp2p_announce_budget(),
         libp2p_leech: false,
         libp2p_router: false,
+        status_listen: None,
         preflight: false,
         diagnostics: false,
         explicit_profile: None,
@@ -364,6 +471,13 @@ fn parse_config<I: IntoIterator<Item = String>>(args: I) -> Result<Config, Strin
             "--libp2p-announce-after-fetch" => cfg.libp2p_announce_after_fetch = true,
             "--libp2p-leech" => cfg.libp2p_leech = true,
             "--libp2p-router" => cfg.libp2p_router = true,
+            "--status-listen" => {
+                cfg.status_listen = Some(
+                    value()?
+                        .parse()
+                        .map_err(|e| format!("bad --status-listen: {e}"))?,
+                )
+            }
             "--preflight" => cfg.preflight = true,
             "--diagnostics" => cfg.diagnostics = true,
             "--profile" => cfg.explicit_profile = Some(value()?),
@@ -1144,6 +1258,13 @@ async fn main() -> ExitCode {
 
     init_tracing();
 
+    // TASK-240: the `--status <addr>` / `--metrics <addr>` CLIENT subcommands query a RUNNING
+    // instance's admin surface and exit; handled before parse_config so they never collide with the
+    // daemon flag grammar.
+    if let Some(code) = maybe_run_admin_query().await {
+        return code;
+    }
+
     let cfg = match parse_config(std::env::args().skip(1)) {
         Ok(cfg) => cfg,
         Err(err) => {
@@ -1296,6 +1417,10 @@ async fn main() -> ExitCode {
     ];
     let _serve_guard: Option<ProviderGuard>;
     let fabric_dyn: Arc<dyn PeerFabric>;
+    // TASK-240: the LIVE status-facts provider and this node's identity, captured per branch so the
+    // status surface reports the ACTUAL running node (its swarm's bootstrap health, its NodeId).
+    let status_facts: Arc<dyn StatusFacts>;
+    let observ_node_id: String;
 
     if contract.profile == SharingProfile::UpstreamOnly {
         // FIX A: a pure HTTP node. No libp2p swarm is constructed, so it stores nothing, answers no
@@ -1308,6 +1433,10 @@ async fn main() -> ExitCode {
                 .verifying_key()
                 .to_bytes(),
         );
+        // No swarm: the status surface has no bootstrap health / peer path to report (NullFacts),
+        // but the node still has a stable identity to show.
+        observ_node_id = node_id.to_string();
+        status_facts = Arc::new(NullStatusFacts);
         fabric_dyn = Arc::new(peer_fabric::FakeFabric::upstream_only(node_id));
         println!(
             "daemon-libp2p: UPSTREAM-ONLY started - pure HTTP fallback, NO libp2p swarm (no DHT \
@@ -1342,6 +1471,13 @@ async fn main() -> ExitCode {
             eprintln!("daemon-libp2p: {err}");
             return ExitCode::FAILURE;
         }
+        // TASK-240: capture the live-facts provider (bootstrap health via the swarm handle) + the
+        // node identity BEFORE the fabric is moved into `fabric_dyn`.
+        observ_node_id = fabric.peer_id().to_string();
+        status_facts = Arc::new(SwarmStatusFacts {
+            handle: fabric.handle().clone(),
+            bootstrap: cfg.libp2p_bootstrap.iter().map(|(p, _)| *p).collect(),
+        });
         // A serving profile uses the concrete fabric (its serve gate is installed).
         fabric_dyn = fabric;
     } else {
@@ -1393,6 +1529,13 @@ async fn main() -> ExitCode {
             eprintln!("daemon-libp2p: {err}");
             return ExitCode::FAILURE;
         }
+        // TASK-240: capture the live-facts provider + node identity BEFORE the fabric is wrapped in
+        // the LeechFabric mask (a router/consumer still has a real swarm with bootstrap health).
+        observ_node_id = fabric.peer_id().to_string();
+        status_facts = Arc::new(SwarmStatusFacts {
+            handle: fabric.handle().clone(),
+            bootstrap: cfg.libp2p_bootstrap.iter().map(|(p, _)| *p).collect(),
+        });
         // AUTHORITY INVERSION (fix #3): a non-serving profile is wrapped in the LeechFabric mask so
         // serve + announce are structurally None at the seam.
         fabric_dyn = Arc::new(LeechFabric::new(fabric));
@@ -1413,6 +1556,44 @@ async fn main() -> ExitCode {
         "daemon-libp2p: listening on {local} -> upstream {}",
         cfg.upstream
     );
+
+    // TASK-240: the announce hook (its budget feeds the LIVE status figure), computed ONCE and
+    // shared by the observability bundle and the RunConfig (one source of truth).
+    let post_fetch = _serve_guard
+        .as_ref()
+        .and_then(|g| g.post_fetch_announce.clone());
+
+    // TASK-240: the runtime observability bundle (metrics SSOT + live facts + announce hook). The
+    // metrics are ALWAYS recorded (cheap); the operator `--status`/`--metrics` surface is served
+    // only when the operator opts in with `--status-listen`, on its OWN loopback socket — never on
+    // the peer-facing cache listener. No `--status-listen` = no introspection surface (fail-safe).
+    let observability = Arc::new(Observability {
+        contract: contract.clone(),
+        node_id_full: observ_node_id,
+        metrics: Arc::new(RuntimeMetrics::new()),
+        facts: status_facts,
+        announce: post_fetch.clone(),
+    });
+    let admin_listener = match cfg.status_listen {
+        Some(addr) => match TcpListener::bind(addr).await {
+            Ok(l) => {
+                let admin_local = l
+                    .local_addr()
+                    .map(|a| a.to_string())
+                    .unwrap_or_else(|_| addr.to_string());
+                println!(
+                    "daemon-libp2p: operator admin surface on {admin_local} \
+                     (GET {STATUS_PATH}, {METRICS_PATH}; redacted unless --diagnostics)"
+                );
+                Some(l)
+            }
+            Err(err) => {
+                eprintln!("daemon-libp2p: cannot bind --status-listen {addr}: {err}");
+                return ExitCode::FAILURE;
+            }
+        },
+        None => None,
+    };
 
     let run_cfg = RunConfig {
         listener,
@@ -1435,10 +1616,12 @@ async fn main() -> ExitCode {
         // populated file-backed one with it), matching the composite `daemon` binary.
         public_allowlist,
         // TASK-77: the announce-after-fetch hook the provider install built (present only with
-        // `--libp2p-announce-after-fetch`); `None` = consume-only (leech).
-        post_fetch_announce: _serve_guard
-            .as_ref()
-            .and_then(|g| g.post_fetch_announce.clone()),
+        // `--libp2p-announce-after-fetch`); `None` = consume-only (leech). Shared with the
+        // observability bundle above so the reported budget is the enforced one.
+        post_fetch_announce: post_fetch,
+        // TASK-240: the observability bundle + the OPT-IN admin listener.
+        observability: Some(observability),
+        admin_listener,
     };
 
     // `fabric_dyn` was built above per the AUTHORITATIVE profile: a FakeFabric (no swarm) for
@@ -1543,6 +1726,7 @@ mod bootstrap_guard_tests {
             preflight: false,
             diagnostics: false,
             explicit_profile: None,
+            status_listen: None,
             // This helper constructs a PROVIDER config directly for the lan_share_or_refuse guard
             // tests; those tests never consult `profile`, so lan-share is a faithful placeholder.
             profile: SharingProfile::LanShare,
@@ -1725,6 +1909,35 @@ mod operator_contract_tests {
     const FIXTURE_PUBKEY: &str = "nix-p2p-test-1:empdFBu9wVZG12rPKToHMOTsU1qzWzeCcLdq/KQH0JQ=";
     const BOOT: &str =
         "12D3KooWDpJ7As7BWAwRMfu1VU2WCqNjvq387JEYKDBj4kx6nXTN@/ip4/127.0.0.1/tcp/4001";
+
+    /// TASK-240 (SSOT): the contract's announce-budget CAP follows the operator's
+    /// `--libp2p-announce-budget` flag, so the LIVE status/preflight denominator
+    /// (`announce_budget=used/CAP`) equals the cap the announce gate actually enforces — not a stale
+    /// `ResourceCaps::default()` alongside an overridden gate. MUTATION: pinning `build_contract`'s
+    /// caps back to `ResourceCaps::default()` reddens the `== 10` (it would report 256).
+    #[test]
+    fn announce_budget_cap_follows_the_flag_for_the_surface() {
+        let cfg = parse_config(args(&["--libp2p-announce-budget", "10"])).expect("parses");
+        let contract = build_contract(&cfg).expect("valid contract");
+        assert_eq!(
+            contract.caps.announce_distinct_paths_budget, 10,
+            "the contract cap must be the effective flag value, not the default"
+        );
+        // The preflight surface renders that cap (the status denominator derives from the same).
+        assert!(
+            contract
+                .preflight()
+                .contains("announce_distinct_paths_budget=10"),
+            "the surface must report the effective announce cap:\n{}",
+            contract.preflight()
+        );
+        // A fresh node (no flag) still reports the authoritative default.
+        let fresh = build_contract(&parse_config(args(&[])).unwrap()).unwrap();
+        assert_eq!(
+            fresh.caps.announce_distinct_paths_budget,
+            ResourceCaps::default().announce_distinct_paths_budget
+        );
+    }
 
     /// AC#9 parity: the shipped serve/announce bounds are the authoritative `ResourceCaps`, not a
     /// second hardcoded set. If a local constant were reintroduced and drifted, this bites.

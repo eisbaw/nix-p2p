@@ -95,4 +95,12 @@ pub trait PostFetchAnnounce: Send + Sync {
     /// narinfo form (the impl canonicalises it to the wire key); `store_path` is the
     /// `/nix/store/<hash>-<name>` the local nix realises this NAR to.
     fn on_fetched(&self, nar_hash: &NarHash, store_path: &str);
+
+    /// The announce-after-fetch budget CONSUMED so far (TASK-240 AC#4: `distinct paths announced`),
+    /// for the live status surface. `None` (the default) when the impl carries no budget notion.
+    /// An impl returns `Some(cap - remaining)` read from the SAME ledger the budget gate CAS'es on,
+    /// so the reported figure cannot drift from what is enforced. Integer, no float.
+    fn budget_used(&self) -> Option<u64> {
+        None
+    }
 }

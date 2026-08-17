@@ -67,6 +67,11 @@ pub struct PeerFabricNarSource {
     discovery_budget: DiscoveryBudget,
     /// The fetch time envelope (dial / body-idle / total) handed to each transfer.
     envelope: SafetyEnvelope,
+    /// The runtime metrics registry (TASK-240 AC#5). This is the SINGLE discovery-outcome
+    /// recording boundary: the typed miss/unavailable/found + holder count is emitted here, NEVER
+    /// in the paired [`PeerFabricRawServe`] narinfo probe (which consults the same directory), so
+    /// one logical request cannot double-count. `None` in a unit test that does not observe.
+    metrics: Option<Arc<crate::observ::RuntimeMetrics>>,
 }
 
 impl PeerFabricNarSource {
@@ -81,6 +86,21 @@ impl PeerFabricNarSource {
             fabric,
             discovery_budget,
             envelope,
+            metrics: None,
+        }
+    }
+
+    /// Attach the runtime metrics registry so this source records its discovery outcomes + peer
+    /// serves (TASK-240). The composition root ([`crate::run`]) wires it; unit tests omit it.
+    pub fn with_metrics(mut self, metrics: Arc<crate::observ::RuntimeMetrics>) -> Self {
+        self.metrics = Some(metrics);
+        self
+    }
+
+    /// Record a typed discovery outcome if a metrics registry is attached (no-op otherwise).
+    fn record(&self, outcome: crate::operator::LookupOutcome, holders: Option<u32>) {
+        if let Some(m) = &self.metrics {
+            m.record_lookup(outcome, holders);
         }
     }
 }
@@ -150,6 +170,7 @@ impl NarSource for PeerFabricNarSource {
             Lookup::Found(records) => records,
             // A healthy authoritative absence: fast, clean miss -> upstream fallback (S2).
             Lookup::Miss => {
+                self.record(crate::operator::LookupOutcome::Miss, None);
                 return Err(SourceError::Unreachable(format!(
                     "no provider holds {content_key} (directory miss)"
                 )));
@@ -157,6 +178,7 @@ impl NarSource for PeerFabricNarSource {
             // Could-not-consult: NOT absence, but from the serving layer's view it is the
             // same fast fallback signal (never cached as a negative here).
             Lookup::Unavailable(why) => {
+                self.record(crate::operator::LookupOutcome::Unavailable, None);
                 return Err(SourceError::Unreachable(format!(
                     "directory unavailable for {content_key}: {why}"
                 )));
@@ -198,8 +220,19 @@ impl NarSource for PeerFabricNarSource {
                     .fetch(content, offer, expected_size, &self.envelope)
                     .await
                 {
-                    // Gate 1 already passed inside the transfer; hand the bytes up.
-                    Ok(bytes) => return Ok(ok_response(bytes)),
+                    // Gate 1 already passed inside the transfer; hand the bytes up. A peer served
+                    // the bytes: record the FOUND discovery outcome (with the holder count) and the
+                    // peer-serve hit — the single serve-source boundary for the decentralized path.
+                    Ok(bytes) => {
+                        self.record(
+                            crate::operator::LookupOutcome::Found,
+                            Some(records.len() as u32),
+                        );
+                        if let Some(m) = &self.metrics {
+                            m.record_peer_serve();
+                        }
+                        return Ok(ok_response(bytes));
+                    }
                     // A deliberate size abort PROPAGATES (never an upstream fallback): every
                     // offer addresses the same oversized content, so trying more is pointless
                     // and falling back would paper over a deliberate abort.
@@ -215,8 +248,13 @@ impl NarSource for PeerFabricNarSource {
             }
         }
 
-        // No discovered provider yielded verified bytes: a clean miss the FallbackNarSource
-        // turns into upstream fallback (S2). `last_failure` carries the specific cause.
+        // No discovered provider yielded verified bytes: providers WERE found but the fetch could
+        // not complete — that is UNAVAILABLE (could-not-complete), not a healthy absence. Record it
+        // with the holder count, then fold to the FallbackNarSource's upstream path (S2).
+        self.record(
+            crate::operator::LookupOutcome::Unavailable,
+            Some(records.len() as u32),
+        );
         Err(SourceError::Unreachable(format!(
             "discovered {} provider record(s) for {content_key} but none yielded verified bytes \
              (unlocatable provider or offer failure): {}",
@@ -360,6 +398,77 @@ mod shipped_path_tests {
             Ok(_) => panic!("a directory fault must NEVER become a false serve"),
             Err(other) => panic!("a directory fault must fold to a fast Unreachable, got {other}"),
         }
+    }
+
+    // ---- TASK-240: the discovery-outcome RECORDING boundary + no double count -------
+
+    /// The typed discovery outcome is recorded ONCE at the `PeerFabricNarSource` boundary, and the
+    /// paired `PeerFabricRawServe` narinfo probe (which consults the SAME directory) records
+    /// NOTHING — so one logical request cannot double-count. MUTATION: adding a `record_lookup` to
+    /// `PeerFabricRawServe`, or recording at both boundaries, doubles `miss`/`unavailable` and
+    /// reddens the `== 1` assertions below.
+    #[tokio::test]
+    async fn discovery_outcome_recorded_once_never_by_the_raw_serve_probe() {
+        use crate::observ::RuntimeMetrics;
+        use crate::rewrite::RawServeDecision;
+        use std::sync::Arc;
+
+        // A MISS directory: resolve records exactly one `miss`, and the raw-serve probe adds none.
+        let metrics = Arc::new(RuntimeMetrics::new());
+        let node = NodeId::from_bytes([0x01; 32]);
+        let fabric = Arc::new(
+            FakeFabric::upstream_only(node)
+                .with_provider_directory(Arc::new(fake_directory(Lookup::Miss))),
+        );
+        let source = super::PeerFabricNarSource::new(
+            fabric.clone(),
+            DiscoveryBudget::default(),
+            SafetyEnvelope::default(),
+        )
+        .with_metrics(metrics.clone());
+        let _ = source.resolve(&signed_key(), None).await;
+        assert_eq!(
+            metrics.lookup_totals(),
+            (0, 1, 0),
+            "the resolve boundary records exactly one miss"
+        );
+
+        // The raw-serve probe hits the SAME directory for the narinfo-rewrite decision; it must
+        // record NOTHING (no metrics handle), so the counters are unchanged.
+        let probe = super::PeerFabricRawServe::new(fabric, DiscoveryBudget::default());
+        let _ = probe
+            .will_serve_raw(&NarHashKey::from_sha256_bytes([0x11; 32]).to_string())
+            .await;
+        assert_eq!(
+            metrics.lookup_totals(),
+            (0, 1, 0),
+            "the raw-serve probe must not record a second lookup (no double count)"
+        );
+
+        // A FAULTING directory is recorded as UNAVAILABLE (could-not-complete), not a miss.
+        let m2 = Arc::new(RuntimeMetrics::new());
+        let faulted = super::PeerFabricNarSource::new(
+            Arc::new(
+                FakeFabric::upstream_only(NodeId::from_bytes([0x02; 32])).with_provider_directory(
+                    Arc::new(fake_directory(Lookup::Unavailable(
+                        Unavailable::BootstrapOutage,
+                    ))),
+                ),
+            ),
+            DiscoveryBudget::default(),
+            SafetyEnvelope::default(),
+        )
+        .with_metrics(m2.clone());
+        let _ = faulted.resolve(&signed_key(), None).await;
+        assert_eq!(
+            m2.lookup_totals(),
+            (0, 0, 1),
+            "a directory fault is recorded as UNAVAILABLE, distinct from a miss"
+        );
+        assert_eq!(
+            m2.last_lookup(),
+            Some(crate::operator::LookupOutcome::Unavailable)
+        );
     }
 
     #[tokio::test]

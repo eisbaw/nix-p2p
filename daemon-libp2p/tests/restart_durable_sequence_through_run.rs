@@ -457,6 +457,8 @@ async fn restart_durable_sequence_serves_through_run() {
         public_allowlist: Arc::new(daemon_core::PublicNarAllowlist::disabled()),
 
         post_fetch_announce: None,
+        observability: None,
+        admin_listener: None,
     };
     let fabric_dyn: Arc<dyn PeerFabric> = consumer.clone();
     let run_task = tokio::spawn(run(fabric_dyn, run_cfg));

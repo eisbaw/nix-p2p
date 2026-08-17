@@ -27,7 +27,7 @@ peer-fabric = { path = "../peer-fabric" }
 # ed25519 seed its libp2p identity is built from. Version "3" matches peer-fabric's SigningKey.
 ed25519-dalek = "3"
 # The runtime + the serve loop; `signal` so the bin shuts down on SIGINT/SIGTERM.
-tokio = { version = "1", features = ["rt-multi-thread", "net", "macros", "time", "signal"] }
+tokio = { version = "1", features = ["rt-multi-thread", "net", "macros", "time", "signal", "io-util"] }
 # async-trait (TASK-77): the announce-after-fetch GC-reconcile `Withdrawer` seam has an async
 # method (it drives the async `announcer.withdraw`), decoupled so the GC-withdraw bite needs no
 # live swarm. Not iroh - inside the no-iroh closure.

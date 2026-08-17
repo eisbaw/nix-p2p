@@ -67,6 +67,14 @@ pub struct RunConfig {
     /// successful fetch makes this node a discoverable holder; `None` is the privacy-preserving
     /// default (fetch without announcing what you fetched, TASK-78).
     pub post_fetch_announce: Option<Arc<dyn crate::post_fetch::PostFetchAnnounce>>,
+    /// TASK-240: runtime observability. `Some` wires the metrics recording into the discover/fetch
+    /// sources AND (with `admin_listener`) serves the operator `--status`/`--metrics` surfaces. The
+    /// bundle carries the metrics SSOT, the contract, the live-facts provider and the announce hook.
+    pub observability: Option<Arc<crate::observ::Observability>>,
+    /// TASK-240: the DEDICATED loopback admin listener for the observability surfaces, bound by the
+    /// binary (OFF by default — `None` means no admin surface at all, the fail-safe posture). Served
+    /// only when `observability` is also set, and torn down with `run` via the owned supervisor.
+    pub admin_listener: Option<TcpListener>,
 }
 
 /// Serve the Nix binary-cache frontend over `fabric` until the listener errors (or the
@@ -78,15 +86,22 @@ pub async fn run(fabric: Arc<dyn PeerFabric>, cfg: RunConfig) -> Result<(), Stri
     require_axes(fabric.as_ref(), &cfg.required_axes)
         .map_err(|missing| format!("fabric does not satisfy the required axes: {missing}"))?;
 
+    // TASK-240: the metrics registry (SSOT), threaded into BOTH sources so the discover/fetch path
+    // emits real outcomes. `None` when the binary wired no observability (unchanged wave-1 behaviour).
+    let metrics = cfg.observability.as_ref().map(|o| o.metrics.clone());
+
     // The decentralized fetch path: discover a provider via the fabric's directory, fetch the
     // gate-1-verified raw NAR over its transfer, falling back to HTTP upstream on a clean miss.
-    let p2p_source: Arc<dyn NarSource> = Arc::new(PeerFabricNarSource::new(
-        fabric.clone(),
-        cfg.discovery_budget,
-        cfg.envelope,
-    ));
-    let nar: Arc<dyn NarSource> =
-        Arc::new(FallbackNarSource::new(p2p_source, cfg.upstream.clone()));
+    let mut p2p = PeerFabricNarSource::new(fabric.clone(), cfg.discovery_budget, cfg.envelope);
+    if let Some(m) = &metrics {
+        p2p = p2p.with_metrics(m.clone());
+    }
+    let p2p_source: Arc<dyn NarSource> = Arc::new(p2p);
+    let mut fallback = FallbackNarSource::new(p2p_source, cfg.upstream.clone());
+    if let Some(m) = &metrics {
+        fallback = fallback.with_metrics(m.clone());
+    }
+    let nar: Arc<dyn NarSource> = Arc::new(fallback);
 
     // The dynamic raw-serve decision probes the SAME directory the fetch uses, so
     // serves-raw(h) <=> narinfo-rewritten-to-raw(h). OR in any static extras (e.g. a claim
@@ -119,6 +134,21 @@ pub async fn run(fabric: Arc<dyn PeerFabric>, cfg: RunConfig) -> Result<(), Stri
     // A standalone supervisor: its drop cancels/aborts every in-flight HTTP connection task,
     // giving the same no-detach shutdown property the iroh path gets from its node runtime.
     let supervisor = TaskSupervisor::new();
+
+    // TASK-240: the operator admin surface (`--status`/`--metrics`) on its DEDICATED loopback
+    // listener, served under the SAME supervisor so it is torn down with `run` (no detached task).
+    // Only when the binary bound an admin listener AND wired observability — off by default.
+    if let (Some(listener), Some(observ)) = (cfg.admin_listener, cfg.observability.clone()) {
+        let registration = supervisor.handle().spawn("admin-surface", async move {
+            if let Err(err) = crate::observ::serve_admin(listener, observ).await {
+                eprintln!("daemon: admin surface ended with error: {err}");
+            }
+        });
+        if let Err(error) = registration {
+            return Err(format!("could not start the admin surface: {error}"));
+        }
+    }
+
     serve(cfg.listener, app, supervisor.handle())
         .await
         .map_err(|error| format!("HTTP serve loop ended with error: {error}"))

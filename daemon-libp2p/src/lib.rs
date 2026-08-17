@@ -1792,6 +1792,9 @@ impl GrowSpawner for WorkerSpawner {
 pub struct Libp2pAnnounceAfterFetch {
     ledger: Arc<Mutex<AnnounceLedger>>,
     spawner: Arc<dyn GrowSpawner>,
+    /// The configured announce budget CAP (TASK-77 AC#2), retained so the live status surface can
+    /// report `used = cap - remaining` (TASK-240 AC#4) from the SAME ledger the gate enforces.
+    budget_cap: u64,
 }
 
 impl Libp2pAnnounceAfterFetch {
@@ -1832,6 +1835,7 @@ impl Libp2pAnnounceAfterFetch {
                 held: HashMap::new(),
             })),
             spawner: Arc::new(WorkerSpawner { grower, withdrawer }),
+            budget_cap: announce_budget_count,
         }
     }
 
@@ -1869,6 +1873,13 @@ impl PostFetchAnnounce for Libp2pAnnounceAfterFetch {
             }
         };
         self.spawner.dispatch(Arc::clone(&self.ledger), grow);
+    }
+
+    /// TASK-240 AC#4: the announce budget CONSUMED so far, read from the SAME ledger the gate
+    /// enforces — `cap - remaining`, saturating (a reseeded-from-disk remaining can never exceed
+    /// the cap in practice, but saturate rather than underflow).
+    fn budget_used(&self) -> Option<u64> {
+        Some(self.budget_cap.saturating_sub(self.remaining_budget()))
     }
 }
 
@@ -2750,6 +2761,7 @@ mod announce_after_fetch_tests {
         Libp2pAnnounceAfterFetch {
             ledger: empty_ledger(budget),
             spawner: Arc::new(FakeSpawner { grows }),
+            budget_cap: budget,
         }
     }
 
@@ -2773,6 +2785,28 @@ mod announce_after_fetch_tests {
             grows.lock().unwrap().len(),
             2,
             "a re-fetch does not re-dispatch"
+        );
+    }
+
+    /// TASK-240 AC#4: the LIVE announce-budget figure the status surface reports is read from the
+    /// SAME ledger the gate enforces — `cap - remaining` — so it cannot drift from what is spent.
+    /// MUTATION: reporting a constant (e.g. `Some(0)`) reddens the `== 2` after the budget is spent;
+    /// reading a second, non-enforcing counter would not track the exhaustion here.
+    #[test]
+    fn budget_used_tracks_the_enforced_ledger() {
+        use daemon_core::PostFetchAnnounce;
+        let grows = Arc::new(Mutex::new(Vec::new()));
+        let hook = hook_with_fake(2, Arc::clone(&grows));
+        assert_eq!(hook.budget_used(), Some(0), "fresh: nothing spent yet");
+        for seed in [1u8, 2, 3] {
+            hook.on_fetched(&nar_hash(seed), &store_path_str(seed));
+        }
+        // Two distinct paths announced under a cap of 2 -> the surface reports 2/2 (exhausted).
+        assert_eq!(hook.remaining_budget(), 0);
+        assert_eq!(
+            hook.budget_used(),
+            Some(2),
+            "budget_used = cap - remaining, read from the enforced ledger"
         );
     }
 
