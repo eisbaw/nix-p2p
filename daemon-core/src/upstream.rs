@@ -2487,17 +2487,17 @@ mod budget_tests {
     }
 }
 
-/// TASK-25: the streamed-body bounds (`fetch_streaming` / [`BoundedBody`]) proven
-/// against IN-PROCESS mock upstreams on loopback - the daemon-boundary oracle for a
-/// mid-body stall (AC#1) and an oversized/lying transfer (AC#2). These drive the
-/// PLAIN transport (the loopback fixtures below speak raw HTTP/1.1) with a shrunk
-/// `body_idle_timeout` so a stall bites in milliseconds. Each abort carries its OWN
-/// bite control (remove the bound -> the body flows / hangs) so the tests fail if
-/// the bound is decorative.
+/// TASK-25/TASK-251: deterministic in-memory bodies exercise [`BoundedBody`]'s
+/// exact-cap and per-read idle-reset policy without an unrelated TCP/header gate.
+/// Separately named loopback HTTP tests exercise the real `fetch_streaming` wiring
+/// and daemon-boundary stall/oversize behaviour. Each abort carries its own bite
+/// control (remove the bound -> the body flows / hangs), so the bounds cannot be
+/// decorative while the policy tests remain scheduler-independent.
 #[cfg(test)]
 mod streaming_bounds_tests {
     use super::*;
 
+    use std::collections::VecDeque;
     use std::net::SocketAddr;
 
     use http_body_util::BodyExt;
@@ -2535,6 +2535,313 @@ mod streaming_bounds_tests {
                 }
                 Err(_) => return,
             }
+        }
+    }
+
+    /// Read one request head while preserving any server-side I/O failure for
+    /// the test that owns the returned server task.
+    async fn read_request_checked<S: tokio::io::AsyncRead + Unpin>(
+        sock: &mut S,
+    ) -> std::io::Result<()> {
+        let mut acc = Vec::new();
+        let mut buf = [0u8; 1024];
+        loop {
+            let n = sock.read(&mut buf).await?;
+            if n == 0 {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    "checked mock client closed before completing HTTP request headers",
+                ));
+            }
+            acc.extend_from_slice(&buf[..n]);
+            if acc.windows(4).any(|w| w == b"\r\n\r\n") {
+                return Ok(());
+            }
+        }
+    }
+
+    const CHECKED_SERVER_FINISH_TIMEOUT: Duration = Duration::from_secs(2);
+
+    /// Owned handle for a checked mock server. `finish` cannot wait forever: it
+    /// aborts and then awaits the task at the deadline, so even a client that
+    /// never connects cannot leave a detached accept task behind. Dropping the
+    /// handle early (for example during a test panic) also requests cancellation.
+    struct CheckedServerTask {
+        task: Option<tokio::task::JoinHandle<std::io::Result<()>>>,
+    }
+
+    impl CheckedServerTask {
+        fn new(task: tokio::task::JoinHandle<std::io::Result<()>>) -> Self {
+            Self { task: Some(task) }
+        }
+
+        async fn finish(mut self) -> std::io::Result<()> {
+            // Keep the handle inside `self` across BOTH awaits. If the caller
+            // cancels `finish` at either point, `Drop` can still see and abort
+            // the owned server task instead of detaching it.
+            let joined = tokio::time::timeout(
+                CHECKED_SERVER_FINISH_TIMEOUT,
+                self.task.as_mut().expect("checked server task exists"),
+            )
+            .await;
+            match joined {
+                Ok(joined) => {
+                    let _completed = self.task.take().expect("completed server task exists");
+                    match joined {
+                        Ok(server_result) => server_result,
+                        Err(join_error) => Err(std::io::Error::other(format!(
+                            "checked mock-server task failed: {join_error}"
+                        ))),
+                    }
+                }
+                Err(_) => {
+                    self.task
+                        .as_ref()
+                        .expect("timed-out server task exists")
+                        .abort();
+                    let joined = self
+                        .task
+                        .as_mut()
+                        .expect("aborted server task exists")
+                        .await;
+                    let _completed = self.task.take().expect("joined server task exists");
+                    match joined {
+                        Ok(Ok(())) => {}
+                        Ok(Err(server_error)) => return Err(server_error),
+                        Err(join_error) if join_error.is_cancelled() => {}
+                        Err(join_error) => {
+                            return Err(std::io::Error::other(format!(
+                                "checked mock-server task failed while cancelling: {join_error}"
+                            )));
+                        }
+                    }
+                    Err(std::io::Error::new(
+                        std::io::ErrorKind::TimedOut,
+                        format!(
+                            "checked mock-server task did not finish within {} ms; abort requested and task joined",
+                            CHECKED_SERVER_FINISH_TIMEOUT.as_millis()
+                        ),
+                    ))
+                }
+            }
+        }
+    }
+
+    impl Drop for CheckedServerTask {
+        fn drop(&mut self) {
+            if let Some(task) = self.task.as_ref() {
+                task.abort();
+            }
+        }
+    }
+
+    /// A one-response HTTP server whose task is returned to the test. The
+    /// complete response is small enough to write before the client consumes
+    /// it, so every server-side I/O error is unexpected and can be surfaced.
+    async fn spawn_checked_chunked_body(body: Vec<u8>) -> (SocketAddr, CheckedServerTask) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        let server = tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await?;
+            read_request_checked(&mut sock).await?;
+            sock.write_all(
+                b"HTTP/1.1 200 OK\r\nContent-Type: application/x-nix-nar\r\n\
+                  Transfer-Encoding: chunked\r\nConnection: close\r\n\r\n",
+            )
+            .await?;
+            sock.write_all(format!("{:x}\r\n", body.len()).as_bytes())
+                .await?;
+            sock.write_all(&body).await?;
+            sock.write_all(b"\r\n0\r\n\r\n").await?;
+            sock.flush().await?;
+            sock.shutdown().await
+        });
+        (addr, CheckedServerTask::new(server))
+    }
+
+    /// Await server cleanup without losing the causal fetch error. If both
+    /// operations fail, the fetch failure is reported first and cleanup is
+    /// retained as secondary context; a cleanup-only failure stays visible too.
+    async fn finish_checked_fetch<T, E: std::fmt::Display>(
+        fetched: Result<T, E>,
+        server: CheckedServerTask,
+    ) -> Result<T, String> {
+        let cleanup = server.finish().await;
+        match (fetched, cleanup) {
+            (Ok(value), Ok(())) => Ok(value),
+            (Err(fetch_error), Ok(())) => Err(format!("fetch failed: {fetch_error}")),
+            (Err(fetch_error), Err(cleanup_error)) => Err(format!(
+                "fetch failed: {fetch_error}; checked mock-server cleanup also failed: {cleanup_error}"
+            )),
+            (Ok(_), Err(cleanup_error)) => Err(format!(
+                "fetch succeeded, but checked mock-server cleanup failed: {cleanup_error}"
+            )),
+        }
+    }
+
+    #[tokio::test]
+    async fn checked_request_reader_rejects_eof_before_header_terminator() {
+        let (mut writer, mut reader) = tokio::io::duplex(128);
+        writer
+            .write_all(b"GET / HTTP/1.1\r\nHost: incomplete")
+            .await
+            .expect("write incomplete request");
+        writer.shutdown().await.expect("close incomplete request");
+
+        let error = read_request_checked(&mut reader)
+            .await
+            .expect_err("EOF before CRLFCRLF must not look like a complete request");
+        assert_eq!(error.kind(), std::io::ErrorKind::UnexpectedEof);
+        assert!(
+            error
+                .to_string()
+                .contains("before completing HTTP request headers"),
+            "premature-EOF error must retain request-header context: {error}"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn checked_server_without_a_client_times_out_aborts_and_joins() {
+        let (_addr, server) = spawn_checked_chunked_body(b"unused".to_vec()).await;
+        let started = TokioInstant::now();
+
+        let error = server
+            .finish()
+            .await
+            .expect_err("a checked server with no client must terminate at its bound");
+        let elapsed = TokioInstant::now().duration_since(started);
+        assert_eq!(error.kind(), std::io::ErrorKind::TimedOut);
+        assert!(
+            error
+                .to_string()
+                .contains("abort requested and task joined"),
+            "timeout must confirm the accept task was cancelled and reaped: {error}"
+        );
+        assert!(
+            elapsed >= CHECKED_SERVER_FINISH_TIMEOUT,
+            "the no-client control must exercise the finish deadline; elapsed {elapsed:?}"
+        );
+    }
+
+    struct TaskDropSignal(Option<tokio::sync::oneshot::Sender<()>>);
+
+    impl Drop for TaskDropSignal {
+        fn drop(&mut self) {
+            if let Some(sender) = self.0.take() {
+                let _ = sender.send(());
+            }
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn cancelling_checked_server_finish_aborts_the_owned_task() {
+        let (ready_sender, ready_receiver) = tokio::sync::oneshot::channel();
+        let (dropped_sender, dropped_receiver) = tokio::sync::oneshot::channel();
+        let task = tokio::spawn(async move {
+            let _drop_signal = TaskDropSignal(Some(dropped_sender));
+            let _ = ready_sender.send(());
+            std::future::pending::<()>().await;
+            Ok::<(), std::io::Error>(())
+        });
+        let server = CheckedServerTask::new(task);
+        ready_receiver
+            .await
+            .expect("server task must construct its drop guard before cancellation");
+
+        let (cancel_sender, mut cancel_receiver) = tokio::sync::oneshot::channel();
+        let cancel_driver = tokio::spawn(async move {
+            tokio::task::yield_now().await;
+            let _ = cancel_sender.send(());
+        });
+        {
+            let finish = server.finish();
+            tokio::pin!(finish);
+            tokio::select! {
+                biased;
+                result = &mut finish => {
+                    panic!("never-ending server task completed before cancellation: {result:?}")
+                }
+                cancelled = &mut cancel_receiver => {
+                    cancelled.expect("cancellation driver must signal");
+                }
+            }
+        }
+        cancel_driver
+            .await
+            .expect("cancellation driver must not panic");
+
+        tokio::time::timeout(Duration::from_secs(1), dropped_receiver)
+            .await
+            .expect("dropping finish must abort the owned task, not detach it")
+            .expect("server task drop signal must remain connected");
+    }
+
+    #[tokio::test]
+    async fn checked_fetch_reports_causal_fetch_error_before_cleanup_error() {
+        let server = CheckedServerTask::new(tokio::spawn(async {
+            Err(std::io::Error::other("cleanup sentinel"))
+        }));
+        let fetched: Result<(), SourceError> =
+            Err(SourceError::Unreachable("fetch sentinel".to_string()));
+
+        let error = finish_checked_fetch(fetched, server)
+            .await
+            .expect_err("both sentinel failures must be reported");
+        let fetch_position = error.find("fetch sentinel").expect("fetch error retained");
+        let cleanup_position = error
+            .find("cleanup sentinel")
+            .expect("cleanup error retained");
+        assert!(
+            fetch_position < cleanup_position,
+            "causal fetch error must be reported before secondary cleanup: {error}"
+        );
+    }
+
+    /// A deterministic in-memory body. Each entry is `(delay since the prior
+    /// frame, bytes)`. Paused Tokio time lets the idle-reset test advance only
+    /// to scripted events, with no scheduler or loopback-connect dependency.
+    struct ScriptedBody {
+        frames: VecDeque<(Duration, Bytes)>,
+        delay: Option<Pin<Box<Sleep>>>,
+    }
+
+    impl ScriptedBody {
+        fn new(frames: impl IntoIterator<Item = (Duration, Bytes)>) -> Self {
+            Self {
+                frames: frames.into_iter().collect(),
+                delay: None,
+            }
+        }
+    }
+
+    impl Body for ScriptedBody {
+        type Data = Bytes;
+        type Error = std::io::Error;
+
+        fn poll_frame(
+            self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+        ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
+            let this = self.get_mut();
+            let Some((delay, _)) = this.frames.front() else {
+                return Poll::Ready(None);
+            };
+
+            if delay.is_zero() {
+                let (_, data) = this.frames.pop_front().expect("front exists");
+                return Poll::Ready(Some(Ok(Frame::data(data))));
+            }
+
+            let sleep = this
+                .delay
+                .get_or_insert_with(|| Box::pin(tokio::time::sleep(*delay)));
+            if sleep.as_mut().poll(cx).is_pending() {
+                return Poll::Pending;
+            }
+
+            this.delay = None;
+            let (_, data) = this.frames.pop_front().expect("front exists");
+            Poll::Ready(Some(Ok(Frame::data(data))))
         }
     }
 
@@ -2607,7 +2914,10 @@ mod streaming_bounds_tests {
     }
 
     /// Drain a body to completion, counting bytes; return the first body error.
-    async fn drain(body: crate::source::NarBody) -> Result<usize, std::io::Error> {
+    async fn drain<B>(body: B) -> Result<usize, std::io::Error>
+    where
+        B: Body<Data = Bytes, Error = std::io::Error> + Unpin,
+    {
         let mut body = body;
         let mut total = 0usize;
         while let Some(frame) = body.frame().await {
@@ -2655,8 +2965,8 @@ mod streaming_bounds_tests {
 
     /// A loopback upstream that answers with a CHUNKED body of the given FRAME sizes
     /// (one HTTP chunk per size, each a distinct fill byte so frame boundaries are
-    /// observable), sleeping `gap` between frames. No `Content-Length`. Used to prove
-    /// the per-read idle RESET (paced body, Finding 3) and exact frame accounting.
+    /// observable), sleeping `gap` between frames. No `Content-Length`. Used only by
+    /// the oversize crossing-frame test; paced idle-reset policy uses `ScriptedBody`.
     async fn spawn_chunked_frames(sizes: Vec<usize>, gap: Duration) -> SocketAddr {
         let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
         let addr = listener.local_addr().expect("addr");
@@ -2745,54 +3055,64 @@ mod streaming_bounds_tests {
     }
 
     #[tokio::test]
-    async fn raw_nar_body_over_signed_narsize_is_aborted_midstream() {
-        // AC#2 (unit-correct): a RAW `.nar` on-wire body streaming MORE raw bytes
-        // than the signed NarSize is cut off mid-stream. On-wire bytes ARE raw-NAR
-        // bytes here, so NarSize is the like-for-like bound (FileSize == NarSize).
-        let nar_size = 1000u64;
-        let oversize = 4096usize;
+    async fn fetch_streaming_http_integration_wires_bounded_body_transport_cap() {
+        // Real HTTP wiring control: fetch_streaming must wrap the hyper body in
+        // BoundedBody. The two-byte RAW body crosses the signed one-byte NarSize;
+        // without that wrapper the first drain would incorrectly succeed.
+        let nar_size = 1u64;
+        let body = b"xx".to_vec();
 
-        let addr = spawn_chunked_bytes(oversize).await;
+        let (addr, server) = spawn_checked_chunked_body(body.clone()).await;
         let client = plain_client(addr, Duration::from_secs(30));
-        let resp = client
+        let fetched = client
             .fetch_streaming("/nar/deadbeef.nar", Some(nar_size), raw_t(), None)
+            .await;
+        let resp = finish_checked_fetch(fetched, server)
             .await
-            .expect("headers arrive");
+            .unwrap_or_else(|error| panic!("checked upstream exchange failed: {error}"));
         let drained = drain(resp.body).await;
         assert!(
             drained.is_err(),
             "a raw body exceeding the signed NarSize must abort mid-stream, got {drained:?}"
         );
 
-        // BITE CONTROL: the SAME oversize body with NO cap -> every byte flows through.
-        let addr2 = spawn_chunked_bytes(oversize).await;
+        // BITE CONTROL: the same healthy response without a signed NarSize is
+        // bounded only by its exact HTTP framing and every byte flows through.
+        let (addr2, server2) = spawn_checked_chunked_body(body.clone()).await;
         let client2 = plain_client(addr2, Duration::from_secs(30));
-        let resp2 = client2
+        let fetched2 = client2
             .fetch_streaming("/nar/deadbeef.nar", None, raw_t(), None)
+            .await;
+        let resp2 = finish_checked_fetch(fetched2, server2)
             .await
-            .expect("headers arrive");
+            .unwrap_or_else(|error| panic!("checked upstream exchange failed: {error}"));
         let n = drain(resp2.body)
             .await
-            .expect("no cap -> whole body streams");
+            .expect("no signed cap -> whole body streams");
         assert_eq!(
-            n, oversize,
-            "without the cap the entire oversize body streams through (the cap is not decorative)"
+            n,
+            body.len(),
+            "without the signed cap the complete healthy body streams through"
         );
     }
 
     #[tokio::test]
-    async fn raw_nar_body_of_exactly_narsize_streams_uncut() {
-        // The strict `>` boundary: a raw body of EXACTLY the signed NarSize must
-        // stream to completion, never aborted (guards the strict `>` against a future
-        // `>=` regression that would 502 legitimate exactly-sized content).
+    async fn bounded_body_exact_cap_in_memory_streams_uncut() {
+        // Direct policy seam, with no TCP connect/header deadline: three
+        // deterministic frames total EXACTLY the cap. This guards strict `>`;
+        // mutating the production comparison to `>=` makes the final frame fail.
         let nar_size = 2048u64;
-        let addr = spawn_chunked_bytes(nar_size as usize).await;
-        let client = plain_client(addr, Duration::from_secs(30));
-        let resp = client
-            .fetch_streaming("/nar/deadbeef.nar", Some(nar_size), raw_t(), None)
-            .await
-            .expect("headers arrive");
-        let n = drain(resp.body)
+        let inner =
+            ScriptedBody::new([511usize, 513, 1024].into_iter().enumerate().map(
+                |(index, size)| (Duration::ZERO, Bytes::from(vec![b'a' + index as u8; size])),
+            ));
+        let body = BoundedBody::new(
+            inner,
+            Duration::from_secs(30),
+            Some(nar_size),
+            "scripted-in-memory".to_string(),
+        );
+        let n = drain(body)
             .await
             .expect("a raw body of exactly NarSize must NOT abort");
         assert_eq!(
@@ -2882,29 +3202,33 @@ mod streaming_bounds_tests {
         );
     }
 
-    #[tokio::test]
-    async fn paced_body_within_idle_gap_succeeds_even_when_total_exceeds_the_bound() {
-        // Finding 3: mutation-prove the PER-READ RESET. Five 100-byte frames, each
-        // arriving 120ms after the last (below the 300ms idle bound), so the TOTAL
-        // transfer (~480ms) EXCEEDS the idle bound. A per-read-reset timeout SUCCEEDS
-        // (each gap is under bound); a TOTAL deadline would wrongly abort. Deleting the
-        // re-arm on progress turns this green test red.
+    #[tokio::test(start_paused = true)]
+    async fn bounded_body_paced_in_memory_resets_idle_deadline_per_frame() {
+        // Direct policy seam, with no TCP connect/header deadline. Five scripted
+        // frames have sub-idle gaps but a total duration above the idle bound.
+        // Deleting the production re-arm on progress deterministically reddens.
         let idle = Duration::from_millis(300);
         let gap = Duration::from_millis(120);
-        let frames = vec![100usize; 5];
-        let expected: usize = frames.iter().sum();
-        let addr = spawn_chunked_frames(frames, gap).await;
-        let client = plain_client(addr, idle);
-        let resp = client
-            .fetch_streaming("/nar/deadbeef.nar", None, raw_t(), None)
-            .await
-            .expect("headers arrive");
-        let n = drain(resp.body)
+        let expected = 500usize;
+        let inner = ScriptedBody::new((0..5).map(|index| {
+            (
+                if index == 0 { Duration::ZERO } else { gap },
+                Bytes::from(vec![b'a' + index as u8; 100]),
+            )
+        }));
+        let body = BoundedBody::new(inner, idle, None, "scripted-in-memory".to_string());
+        let started = TokioInstant::now();
+        let n = drain(body)
             .await
             .expect("a paced body whose inter-frame gaps stay under the idle bound must SUCCEED");
+        let elapsed = TokioInstant::now().duration_since(started);
         assert_eq!(
             n, expected,
             "the full body arrives; the idle timeout resets on each frame, it is not a total deadline"
+        );
+        assert!(
+            elapsed > idle,
+            "the scripted total {elapsed:?} must exceed the {idle:?} idle bound"
         );
     }
 }
