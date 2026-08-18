@@ -6,7 +6,7 @@ title: >-
 status: To Do
 assignee: []
 created_date: '2026-08-18 20:54'
-updated_date: '2026-08-18 20:59'
+updated_date: '2026-08-18 21:00'
 labels:
   - libp2p
   - mainline
@@ -67,6 +67,7 @@ OUTCOME: reject is a fully valid and useful result. If the enumeration exposure 
 - [ ] #10 BITE: a second start with a warm cache emits ZERO Mainline packets, verified at packet level, and the guard bites under mutation. A corrupt or absent cache degrades to a normal Mainline lookup, never to a crash and never to dialing unvalidated addresses
 - [ ] #11 TEST-VACUITY GUARD: cold-discovery oracles must run with the peer cache empty or disabled, and assert it. A persisted cache would otherwise hand a test the address it was supposed to discover, silently making every no-injection bite in this task vacuous
 - [ ] #12 Deliverable is a written adopt / adopt-with-conditions / reject recommendation. Reject is a valid terminal outcome, and its honest consequence is NO PUBLIC POOL (private/enterprise pools only) -- not a fallback to operator-run routers, which the owner has ruled out
+- [ ] #13 Establish whether BEP5 IP:port announce is sufficient, given that a NATd peer whose only reachable address is a /p2p-circuit cannot express it in BEP5. Either evidence that NATd peers are reachable without announcing (found once they dial out and enter others routing tables), or add BEP44 signed records carrying PeerId plus circuit multiaddrs
 <!-- AC:END -->
 
 ## Implementation Notes
@@ -79,4 +80,16 @@ THIS CHANGES THIS TASKS STANDING. Mainline rendezvous is not one of three interc
 CORRECTION to the description and to AC#9: the stated fallback "reject falls back to DNSADDR plus operator routers" is WRONG under this constraint. There are no operator routers for the public case. The honest fallback on a reject verdict is: NO PUBLIC POOL -- the product ships as private/enterprise pools only (LAN via mDNS TASK-257, internal bootstrap via TASK-259), and the global permissionless swarm stays an unrealized aim rather than a deliverable.
 
 That raises the stakes of this spike: it is now the gate on whether a public nix-p2p network can exist at all without someone funding infrastructure. Judge the privacy cost against THAT, not against a comfortable alternative -- and if the enumeration exposure really is too high, say so plainly and let the public pool be the thing that does not ship.
+
+DESIGN FINDING 2026-08-18 (owner question: can Mainline point to a PeerId or only an IP?).
+
+BEP5 CARRIES IP:PORT ONLY. announce_peer records the announcing nodes address -- port from the message, IP from the packet source -- and get_peers returns compact peer info (6 bytes IPv4 / 18 bytes IPv6). There is no arbitrary payload and no way to carry a PeerId. This matches TASK-96s already-recorded finding about the inability of BEP5 announce_peer to carry a NodeId.
+
+THAT IS NOT FATAL FOR RENDEZVOUS. libp2p does not need the PeerId in advance: a bare multiaddr with no /p2p/<PeerId> suffix is dialable, and the Noise handshake authenticates the remote identity during connection setup. The scope protocol name (/nix-p2p/<scope>/kad/1.0.0) is what decides whether a dialed stranger is actually one of ours -- a non-member fails protocol negotiation. So BEP5 IP:port is SUFFICIENT for the basic bootstrap path.
+
+BEP44 CAN carry a PeerId: signed mutable items, ed25519, roughly 1000 bytes, sequence-numbered. This is what pkarr does and what iroh uses for EndpointId->addresses. But it solves a DIFFERENT problem -- it is key->record lookup, so you must already know which public key to fetch. That is one-to-one address lookup, not discovery of unknown peers, and it is exactly the limitation the PRD levels at iroh. BEP5 get_peers is many-to-one (many peers under one well-known infohash), which is what rendezvous actually requires. So BEP44 does not replace BEP5 here.
+
+THE REAL GAP IN BEP5, and the reason to evaluate a hybrid: A NATD PEER HAS NO USEFUL IP:PORT TO ANNOUNCE. Its reachable address is a /p2p-circuit through a relay, and BEP5 cannot express that -- it can only record the source address of the packet. So a NATd node either announces something undiallable or cannot participate. That population is most of a public pool, and TASK-218/219 have just landed multi-relay /p2p-circuit resolution through our own DHT, so the circuit addresses exist and are meaningful. It is also consistent with the no-public-infra constraint, since relays are peer-provided via SharingProfile::Router rather than centrally operated.
+
+LIKELY SHAPE: BEP5 to FIND unknown peers, plus optional BEP44 signed records for peers whose only reachable address is a circuit. Evaluate whether the NATd case is large enough to justify the second mechanism, or whether a NATd peer can simply skip announcing and rely on being found once it dials out and is added to others routing tables.
 <!-- SECTION:NOTES:END -->
