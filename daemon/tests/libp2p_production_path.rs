@@ -312,6 +312,8 @@ async fn production_config_builds_libp2p_source_that_discovers_and_serves_with_c
         identity_seed: [4u8; 32],
         network_scope: scope.to_string(),
         listen: Some("/ip4/127.0.0.1/tcp/0".parse().unwrap()),
+        additional_listens: Vec::new(),
+        external_addresses: Vec::new(),
         bootstrap: vec![(boot_peer, boot_addr.clone())],
         provider_addrs: vec![],
         discovery_budget: DiscoveryBudget::new(Duration::from_secs(10), 32),

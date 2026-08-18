@@ -109,6 +109,8 @@ async fn provider_serves_and_announces_a_nar_a_consumer_discovers_and_fetches_wi
         identity_seed: provider_seed,
         network_scope: scope.to_string(),
         listen: Some("/ip4/127.0.0.1/tcp/0".parse().unwrap()),
+        additional_listens: Vec::new(),
+        external_addresses: Vec::new(),
         bootstrap: vec![(boot_peer, boot_addr.clone())],
         provider_addrs: vec![],
         discovery_budget: DiscoveryBudget::new(Duration::from_secs(10), 32),
@@ -118,7 +120,7 @@ async fn provider_serves_and_announces_a_nar_a_consumer_discovers_and_fetches_wi
         kad_server: true,
     };
     let supplier = Arc::new(MemoryNarSupplier::new([nar.clone()]));
-    let (provider_fabric, _p_source, _p_raw_serve) = build_libp2p_provider_source(
+    let (provider_fabric, _p_source, _p_raw_serve, _readiness) = build_libp2p_provider_source(
         provider_cfg,
         supplier,
         Arc::new(peer_fabric::AdmitAllPublication),
@@ -144,10 +146,15 @@ async fn provider_serves_and_announces_a_nar_a_consumer_discovers_and_fetches_wi
         .await
         .expect("serve gate installs");
     let sequence = provider_fabric.next_announce_sequence(&content_key);
+    let relay_hints = provider_fabric
+        .live_relay_hints()
+        .await
+        .expect("read live relay listeners before signing");
     let record: ProviderRecord = sign_libp2p_provider_record(
         provider_seed,
         &nar_hash_key,
         &nar,
+        relay_hints,
         3600,
         unix_now(),
         sequence,
@@ -188,6 +195,8 @@ async fn provider_serves_and_announces_a_nar_a_consumer_discovers_and_fetches_wi
         identity_seed: [4u8; 32],
         network_scope: scope.to_string(),
         listen: Some("/ip4/127.0.0.1/tcp/0".parse().unwrap()),
+        additional_listens: Vec::new(),
+        external_addresses: Vec::new(),
         bootstrap: vec![(boot_peer, boot_addr.clone())],
         provider_addrs: vec![], // NEVER told P's address.
         discovery_budget: DiscoveryBudget::new(Duration::from_secs(10), 32),

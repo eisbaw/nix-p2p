@@ -28,8 +28,9 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use daemon_core::NarHashKey;
 use daemon_libp2p::{
-    LanShare, Libp2pSourceConfig, announce_provider_seeds, announce_public_seeds,
-    approve_seeds_for_public, build_libp2p_provider_source, open_public_allowlist,
+    InitialAnnounceConfig, LanShare, Libp2pSourceConfig, announce_provider_seeds,
+    announce_public_seeds, approve_seeds_for_public, build_libp2p_provider_source,
+    open_public_allowlist,
 };
 use fabric_libp2p::{Libp2pFabric, MemoryNarSupplier, Multiaddr, NodeConfig};
 use peer_fabric::{
@@ -108,6 +109,8 @@ async fn the_public_seed_door_refuses_an_unallowlisted_seed_on_a_real_fabric() {
         identity_seed: [8u8; 32],
         network_scope: scope.to_string(),
         listen: Some("/ip4/127.0.0.1/tcp/0".parse().unwrap()),
+        additional_listens: Vec::new(),
+        external_addresses: Vec::new(),
         bootstrap: vec![(boot_peer, boot_addr)],
         provider_addrs: vec![],
         discovery_budget: DiscoveryBudget::new(Duration::from_secs(10), 32),
@@ -117,7 +120,7 @@ async fn the_public_seed_door_refuses_an_unallowlisted_seed_on_a_real_fabric() {
         kad_server: true,
     };
     let supplier = Arc::new(MemoryNarSupplier::new([nar.clone()]));
-    let (fabric, _source, _raw) =
+    let (fabric, _source, _raw, readiness) =
         build_libp2p_provider_source(cfg, supplier, Arc::new(RefusePublication))
             .await
             .expect("production provider builder starts a serving fabric joined to the DHT");
@@ -136,12 +139,10 @@ async fn the_public_seed_door_refuses_an_unallowlisted_seed_on_a_real_fabric() {
     // drop the `self.eligibility.admit(record)?` consult in the fabric-libp2p announcer.
     let lan_refused = announce_provider_seeds(
         &fabric,
-        [8u8; 32],
+        &readiness,
+        InitialAnnounceConfig::new([8u8; 32], 3600, unix_now(), &budget),
         &[(seed_key, nar.clone())],
         LanShare::operator_assembled(),
-        3600,
-        unix_now(),
-        &budget,
     )
     .await;
     let lan_err = lan_refused.expect_err(
@@ -166,12 +167,10 @@ async fn the_public_seed_door_refuses_an_unallowlisted_seed_on_a_real_fabric() {
         open_public_allowlist(None, &[], &[8u8; 32], &[]).expect("a disabled allowlist opens");
     let refused = announce_public_seeds(
         &fabric,
-        [8u8; 32],
+        &readiness,
+        InitialAnnounceConfig::new([8u8; 32], 3600, unix_now(), &budget),
         &[(seed_key, nar.clone())],
         &empty,
-        3600,
-        unix_now(),
-        &budget,
     )
     .await;
     let err = refused.expect_err(

@@ -26,7 +26,7 @@ use daemon_core::{
     SystemClock, UpstreamHttp, build_narinfo_layer, resolve_narinfo_cache_dir, run,
 };
 use daemon_libp2p::{
-    AllowlistEligibility, AnnounceAfterFetchDoor, LanReachability, LanShare,
+    AllowlistEligibility, AnnounceAfterFetchDoor, InitialAnnounceConfig, LanReachability, LanShare,
     Libp2pAnnounceAfterFetch, Libp2pCatalogProbe, Libp2pSourceConfig, SwarmStatusFacts,
     announce_provider_seeds, announce_public_provisions, announce_public_seeds,
     announce_store_provisions, build_libp2p_nar_source, build_libp2p_provider_source,
@@ -62,9 +62,9 @@ struct Config {
     want_mass_query: bool,
     libp2p_bootstrap: Vec<(PeerId, Multiaddr)>,
     libp2p_provider_addrs: Vec<(PeerId, Multiaddr)>,
-    /// `--libp2p-listen` bind multiaddrs, REPEATABLE (TASK-207). The FIRST is bound through the
-    /// shared construction (`Libp2pSourceConfig.listen`); any EXTRA are applied post-build via the
-    /// fabric handle. A NAT'd provider needs two: a real transport bind (so the relay-client can
+    /// `--libp2p-listen` bind multiaddrs, REPEATABLE (TASK-207). Every address is handed to the
+    /// shared construction and registered before one bounded readiness wait. A NAT'd provider
+    /// needs two: a real transport bind (so the relay-client can
     /// open its reservation connection) AND a relay `/…/p2p-circuit` address (the reservation
     /// request) - the two `listen()` calls `fabric-libp2p/tests/nat_traversal.rs` makes.
     libp2p_listen: Vec<Multiaddr>,
@@ -720,9 +720,9 @@ fn source_config(
     Libp2pSourceConfig {
         identity_seed,
         network_scope: cfg.libp2p_scope.clone().unwrap_or_else(|| "v1".to_string()),
-        // The FIRST --libp2p-listen is bound by the shared construction; any EXTRA listens (and all
-        // external addresses) are applied post-build in `main` via the fabric handle (TASK-207).
         listen: cfg.libp2p_listen.first().cloned(),
+        additional_listens: cfg.libp2p_listen.iter().skip(1).cloned().collect(),
+        external_addresses: cfg.libp2p_external_addresses.clone(),
         bootstrap: cfg.libp2p_bootstrap.clone(),
         provider_addrs: cfg.libp2p_provider_addrs.clone(),
         discovery_budget: DiscoveryBudget::default(),
@@ -734,27 +734,6 @@ fn source_config(
         // A PROVIDER or ROUTER is a kad SERVER (DHT infrastructure); a CONSUMER is a kad CLIENT.
         kad_server: dht_server,
     }
-}
-
-/// Apply the EXTRA `--libp2p-listen` addresses (the first was bound by the shared construction) and
-/// ALL `--libp2p-external-address` self-advertisements to a running [`Libp2pFabric`] (TASK-207).
-/// Shared by the provider and consumer paths (both run a participating swarm); upstream-only has no
-/// swarm and never calls this. Fail-fast on a listen error (a reservation address that cannot be
-/// registered is a config fault); `add_external_address` is a fire-and-forget hint.
-async fn apply_swarm_addresses(fabric: &Arc<Libp2pFabric>, cfg: &Config) -> Result<(), String> {
-    for extra in cfg.libp2p_listen.iter().skip(1) {
-        fabric
-            .handle()
-            .listen(extra.clone())
-            .await
-            .map_err(|e| format!("cannot listen on {extra}: {e}"))?;
-        println!("daemon-libp2p: additional libp2p listen {extra}");
-    }
-    for ext in &cfg.libp2p_external_addresses {
-        fabric.handle().add_external_address(ext.clone()).await;
-        println!("daemon-libp2p: advertising external address {ext}");
-    }
-    Ok(())
 }
 
 /// What keeps a libp2p PROVIDER serving for the process. Dropping the [`ServeHandle`] stops
@@ -920,7 +899,7 @@ async fn install_seed_provider(
     let identity_seed = source_cfg.identity_seed;
     let supplier = Arc::new(MemoryNarSupplier::new(seeds.iter().map(|(_, b)| b.clone())));
     let authority = provider_publication_authority(cfg, allowlist);
-    let (fabric, _source, _raw) =
+    let (fabric, _source, _raw, readiness) =
         build_libp2p_provider_source(source_cfg, supplier, authority).await?;
 
     let serve = fabric
@@ -931,6 +910,8 @@ async fn install_seed_provider(
         .map_err(|e| format!("libp2p serve gate failed to install: {e}"))?;
 
     let announce_budget = AnnounceBudget::new(Duration::from_secs(10), 20);
+    let announce_config =
+        InitialAnnounceConfig::new(identity_seed, 3600, now_secs(), &announce_budget);
     // The announce path (TASK-103/204, parity with the composite `daemon` binary): PUBLIC-announce
     // mode (a configured allowlist) gates each seed on a trusted narinfo signature via the typed
     // claim-consuming door and legitimately announces over a bootstrapped substrate; ISOLATED-LAN
@@ -938,30 +919,12 @@ async fn install_seed_provider(
     // public-reach without a configured allowlist. The allowlist IS the enforcement for the
     // bootstrapped case, replacing the bootstrap-emptiness proxy.
     let records = if cfg.libp2p_public_allowlist_path.is_some() {
-        announce_public_seeds(
-            &fabric,
-            identity_seed,
-            &seeds,
-            allowlist,
-            3600,
-            now_secs(),
-            &announce_budget,
-        )
-        .await?
+        announce_public_seeds(&fabric, &readiness, announce_config, &seeds, allowlist).await?
     } else {
         // The shared SSOT provider announce loop (durable-allocate -> sign -> announce), the same
         // one the restart-durability test exercises (TASK-185 GB2).
         let lan = lan_share_or_refuse(cfg)?;
-        announce_provider_seeds(
-            &fabric,
-            identity_seed,
-            &seeds,
-            lan,
-            3600,
-            now_secs(),
-            &announce_budget,
-        )
-        .await?
+        announce_provider_seeds(&fabric, &readiness, announce_config, &seeds, lan).await?
     };
     for (record, (nar_hash, bytes)) in records.iter().zip(&seeds) {
         // TASK-120 fix #6: route the served-content identity fields through the privacy policy -
@@ -1039,7 +1002,7 @@ async fn install_store_provider(
         helper_program,
     ));
     let authority = provider_publication_authority(cfg, allowlist);
-    let (fabric, _source, _raw) =
+    let (fabric, _source, _raw, readiness) =
         build_libp2p_provider_source(source_cfg, supplier, authority).await?;
 
     let serve = fabric
@@ -1067,32 +1030,17 @@ async fn install_store_provider(
     }
 
     let announce_budget = AnnounceBudget::new(Duration::from_secs(10), 20);
+    let announce_config =
+        InitialAnnounceConfig::new(identity_seed, 3600, now_secs(), &announce_budget);
     // The announce path (TASK-103/204, see install_seed_provider): PUBLIC-announce mode (a
     // configured allowlist) gates each provision on a trusted narinfo signature via the typed
     // claim-consuming door; ISOLATED-LAN mode keeps the TASK-102 `lan_share_or_refuse` stopgap.
     let records = if cfg.libp2p_public_allowlist_path.is_some() {
-        announce_public_provisions(
-            &fabric,
-            identity_seed,
-            &provisions,
-            allowlist,
-            3600,
-            now_secs(),
-            &announce_budget,
-        )
-        .await?
+        announce_public_provisions(&fabric, &readiness, announce_config, &provisions, allowlist)
+            .await?
     } else {
         let lan = lan_share_or_refuse(cfg)?;
-        announce_store_provisions(
-            &fabric,
-            identity_seed,
-            &provisions,
-            lan,
-            3600,
-            now_secs(),
-            &announce_budget,
-        )
-        .await?
+        announce_store_provisions(&fabric, &readiness, announce_config, &provisions, lan).await?
     };
     for (record, provision) in records.iter().zip(&provisions) {
         // TASK-120 fix #6: content-identity fields routed through the privacy policy (marker + keys
@@ -1439,10 +1387,6 @@ async fn main() -> ExitCode {
                 return ExitCode::FAILURE;
             }
         };
-        if let Err(err) = apply_swarm_addresses(&fabric, &cfg).await {
-            eprintln!("daemon-libp2p: {err}");
-            return ExitCode::FAILURE;
-        }
         // TASK-240: capture the live-facts provider (bootstrap health via the swarm handle) + the
         // node identity BEFORE the fabric is moved into `fabric_dyn`.
         observ_node_id = fabric.peer_id().to_string();
@@ -1497,10 +1441,6 @@ async fn main() -> ExitCode {
                 return ExitCode::FAILURE;
             }
         };
-        if let Err(err) = apply_swarm_addresses(&fabric, &cfg).await {
-            eprintln!("daemon-libp2p: {err}");
-            return ExitCode::FAILURE;
-        }
         // TASK-240: capture the live-facts provider + node identity BEFORE the fabric is wrapped in
         // the LeechFabric mask (a router/consumer still has a real swarm with bootstrap health).
         observ_node_id = fabric.peer_id().to_string();
@@ -1654,7 +1594,8 @@ mod bootstrap_guard_tests {
     //! Config->reachability wrapper, so a call site that FORGOT to pass provider-addr/listen (the
     //! original hole) is caught here, not only in the lib-level policy test.
     use super::{Config, SharingProfile, lan_share_or_refuse};
-    use fabric_libp2p::{Multiaddr, PeerId};
+    use fabric_libp2p::{Libp2pFabric, Multiaddr, NodeConfig, PeerId};
+    use std::time::Duration;
 
     fn peer() -> PeerId {
         "12D3KooWDpJ7As7BWAwRMfu1VU2WCqNjvq387JEYKDBj4kx6nXTN"
@@ -1759,6 +1700,27 @@ mod bootstrap_guard_tests {
         let cfg = provider_cfg(Vec::new(), Vec::new(), Some(addr("/ip4/0.0.0.0/tcp/4001")));
         let err = lan_share_or_refuse(&cfg).expect_err("a wildcard/public listen must be refused");
         assert!(err.contains("TASK-103"), "must name TASK-103: {err}");
+    }
+
+    /// Listener startup is event-correlated and bounded: a direct ephemeral TCP listener must emit
+    /// its concrete `NewListenAddr` promptly rather than leaving startup in an unbounded poll loop.
+    #[tokio::test]
+    async fn direct_listener_readiness_wait_is_bounded() {
+        let fabric = Libp2pFabric::start(
+            NodeConfig::new([202u8; 32]).with_network_scope("task219-listener-ready"),
+        )
+        .expect("fabric starts");
+        tokio::time::timeout(
+            Duration::from_secs(2),
+            fabric.handle().listen(addr("/ip4/127.0.0.1/tcp/0")),
+        )
+        .await
+        .expect("direct listener readiness must not wait indefinitely")
+        .expect("direct listener emits NewListenAddr");
+        assert!(
+            !fabric.handle().listen_addrs().await.is_empty(),
+            "successful readiness corresponds to a concrete live listener"
+        );
     }
 }
 
@@ -2227,7 +2189,8 @@ mod nat_flags_tests {
     //! a real transport AND a `/…/p2p-circuit` reservation; a relay advertises its public address so
     //! reservation vouchers are not empty). These drive the binary's OWN `parse_config`, so a
     //! regression in the repeatable-listen or external-address wiring is caught here.
-    use super::parse_config;
+    use super::{parse_config, source_config};
+    use daemon_core::SharingProfile;
 
     const APP_NAR_HASH: &str = "sha256:0pgsb9mjmfj57w1ddmqn9z9667nwbqbnn699j1s1s99jhy6cppsm";
     const FIXTURE_PUBKEY: &str = "nix-p2p-test-1:empdFBu9wVZG12rPKToHMOTsU1qzWzeCcLdq/KQH0JQ=";
@@ -2238,8 +2201,7 @@ mod nat_flags_tests {
     }
 
     /// A NAT'd provider binds TWO listens: a direct transport bind AND a relay `/p2p-circuit`
-    /// reservation address. Both must be retained IN ORDER (the first flows through the shared
-    /// construction, the rest are applied post-build).
+    /// reservation address. Both must be retained IN ORDER and passed through shared construction.
     #[test]
     fn libp2p_listen_is_repeatable_and_ordered() {
         let circuit = format!("/ip4/10.0.0.1/tcp/4001/p2p/{RELAY_ID}/p2p-circuit");
@@ -2268,6 +2230,18 @@ mod nat_flags_tests {
             "the circuit reservation address is second: {}",
             cfg.libp2p_listen[1]
         );
+
+        let shared = source_config(&cfg, SharingProfile::LanShare, [9u8; 32]);
+        assert_eq!(
+            shared.listen.as_ref(),
+            cfg.libp2p_listen.first(),
+            "the first listen reaches shared startup configuration"
+        );
+        assert_eq!(
+            shared.additional_listens,
+            cfg.libp2p_listen[1..],
+            "every remaining listen reaches shared startup configuration in order"
+        );
     }
 
     /// A relay/bootstrap node (a consumer-shaped node) advertises its public address via
@@ -2287,6 +2261,12 @@ mod nat_flags_tests {
         assert_eq!(
             cfg.libp2p_external_addresses[0].to_string(),
             "/ip4/192.168.1.5/tcp/4001"
+        );
+
+        let shared = source_config(&cfg, SharingProfile::ConsumeOnly, [10u8; 32]);
+        assert_eq!(
+            shared.external_addresses, cfg.libp2p_external_addresses,
+            "external addresses reach shared startup configuration"
         );
     }
 

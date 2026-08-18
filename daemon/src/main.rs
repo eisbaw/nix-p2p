@@ -22,9 +22,9 @@ use daemon::{
     AvailabilityIndex, Blake3Digest, CONNECT_TIMEOUT_MS, CacheInfo, Claim, CommandNarDumper,
     ContractRequest, CorrelationStore, DEFAULT_MAX_INFLIGHT_NAR_BYTES, DEFAULT_MAX_SERVE_DURATION,
     DEFAULT_MAX_SERVE_NAR_BYTES, DhtRole, EndpointProfile, EndpointScope, FallbackNarSource,
-    FileNarSupplier, HEADER_TIMEOUT_MS, IdentitySource, InMemoryDiscovery, IrohNode,
-    IrohNodeBuilder, IrohPeerAddr, IrohProviderConfig, IrohTransport, KnownPayload, KnownTransport,
-    LanReachability, LanShare, Libp2pCatalogProbe, Libp2pSourceConfig, Mechanism,
+    FileNarSupplier, HEADER_TIMEOUT_MS, IdentitySource, InMemoryDiscovery, InitialAnnounceConfig,
+    IrohNode, IrohNodeBuilder, IrohPeerAddr, IrohProviderConfig, IrohTransport, KnownPayload,
+    KnownTransport, LanReachability, LanShare, Libp2pCatalogProbe, Libp2pSourceConfig, Mechanism,
     NARINFO_CACHE_FLAG_CONFLICT, NarCatalog, NarDumper, NarHashKey, NarSource, NarinfoLayer,
     NarinfoSource, NoRawServe, NodeId, NodeLocation, NodeLookupAuthorityAuthorization,
     NodeLookupConfig, NodePublicationCapability, NodePublicationConfig, NodePublicationHandle,
@@ -1208,6 +1208,8 @@ impl Config {
                 .clone()
                 .unwrap_or_else(|| "v1".to_string()),
             listen: self.libp2p_listen.clone(),
+            additional_listens: Vec::new(),
+            external_addresses: Vec::new(),
             bootstrap: self.libp2p_bootstrap.clone(),
             provider_addrs: self.libp2p_provider_addrs.clone(),
             discovery_budget: peer_fabric::DiscoveryBudget::default(),
@@ -1846,7 +1848,7 @@ async fn install_libp2p_provider(
     // Start the fabric WITH the supplier (serve axis present) + join the DHT, and get its
     // consumer source/raw-serve from the SAME fabric (one identity, one listen).
     let authority = provider_publication_authority(config, allowlist);
-    let (fabric, source, raw_serve) =
+    let (fabric, source, raw_serve, readiness) =
         build_libp2p_provider_source(cfg, supplier, authority).await?;
 
     // Install the serve gate (bounded by the serve budget). The returned ServeHandle MUST
@@ -1869,34 +1871,17 @@ async fn install_libp2p_provider(
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0);
+    let announce_config = InitialAnnounceConfig::new(identity_seed, 3600, now, &announce_budget);
     // The announce path (TASK-103): PUBLIC-announce mode (a configured allowlist) gates each seed
     // on a trusted narinfo signature and legitimately announces over a bootstrapped substrate;
     // ISOLATED-LAN mode (no allowlist) keeps the TASK-102 `lan_share_or_refuse` stopgap, which
     // still refuses any public-reach without a configured allowlist. The allowlist IS the
     // enforcement for the bootstrapped case, replacing the bootstrap-emptiness proxy.
     let records = if config.libp2p_public_allowlist_path.is_some() {
-        announce_public_seeds(
-            &fabric,
-            identity_seed,
-            &seeds,
-            allowlist,
-            3600,
-            now,
-            &announce_budget,
-        )
-        .await?
+        announce_public_seeds(&fabric, &readiness, announce_config, &seeds, allowlist).await?
     } else {
         let lan = lan_share_or_refuse(config)?;
-        announce_provider_seeds(
-            &fabric,
-            identity_seed,
-            &seeds,
-            lan,
-            3600,
-            now,
-            &announce_budget,
-        )
-        .await?
+        announce_provider_seeds(&fabric, &readiness, announce_config, &seeds, lan).await?
     };
     // TASK-120 fix #6 (mirror of daemon-libp2p): route the served-content identity fields through
     // the privacy policy - the MARKER + field KEYS stay (machine oracles bind on `LIBP2P-SEED
@@ -2031,7 +2016,7 @@ async fn install_libp2p_store_provider(
         helper_program,
     ));
     let authority = provider_publication_authority(config, allowlist);
-    let (fabric, source, raw_serve) =
+    let (fabric, source, raw_serve, readiness) =
         build_libp2p_provider_source(cfg, supplier, authority).await?;
 
     let serve = fabric
@@ -2062,32 +2047,16 @@ async fn install_libp2p_store_provider(
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0);
+    let announce_config = InitialAnnounceConfig::new(identity_seed, 3600, now, &announce_budget);
     // The announce path (TASK-103, see install_libp2p_provider): PUBLIC-announce mode (a
     // configured allowlist) gates each provision on a trusted narinfo signature via the typed
     // claim-consuming door; ISOLATED-LAN mode keeps the TASK-102 `lan_share_or_refuse` stopgap.
     let records = if config.libp2p_public_allowlist_path.is_some() {
-        announce_public_provisions(
-            &fabric,
-            identity_seed,
-            &provisions,
-            allowlist,
-            3600,
-            now,
-            &announce_budget,
-        )
-        .await?
+        announce_public_provisions(&fabric, &readiness, announce_config, &provisions, allowlist)
+            .await?
     } else {
         let lan = lan_share_or_refuse(config)?;
-        announce_store_provisions(
-            &fabric,
-            identity_seed,
-            &provisions,
-            lan,
-            3600,
-            now,
-            &announce_budget,
-        )
-        .await?
+        announce_store_provisions(&fabric, &readiness, announce_config, &provisions, lan).await?
     };
     // TASK-120 fix #6 (mirror): content-identity fields routed through the privacy policy.
     let privacy = PrivacyPolicy {
@@ -3240,6 +3209,14 @@ mod tests {
         assert_eq!(src.bootstrap.len(), 1);
         assert_eq!(src.provider_addrs.len(), 1);
         assert!(src.listen.is_some());
+        assert!(
+            src.additional_listens.is_empty(),
+            "the composite CLI currently exposes one listen address"
+        );
+        assert!(
+            src.external_addresses.is_empty(),
+            "the composite CLI currently exposes no external-address flag"
+        );
     }
 
     #[test]

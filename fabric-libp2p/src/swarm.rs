@@ -11,9 +11,12 @@ use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 
 use futures::{AsyncRead, StreamExt};
+use libp2p::core::ConnectedPoint;
+use libp2p::core::transport::ListenerId;
 use libp2p::kad::store::{MemoryStore, MemoryStoreConfig};
-use libp2p::swarm::SwarmEvent;
 use libp2p::swarm::behaviour::toggle::Toggle;
+use libp2p::swarm::dial_opts::{DialOpts, PeerCondition};
+use libp2p::swarm::{ConnectionId, SwarmEvent};
 use libp2p::{
     Multiaddr, PeerId, StreamProtocol, Swarm, autonat, dcutr, identify, kad, noise, relay, tcp,
     yamux,
@@ -355,6 +358,15 @@ pub enum Command {
         addr: Multiaddr,
         reply: oneshot::Sender<Result<(), String>>,
     },
+    /// Dial `peer` using exactly these ephemeral addresses. The caller already knows the
+    /// [`ConnectionId`] from `options`, so a dropped wait can tombstone that exact attempt.
+    /// Addresses stay in `DialOpts` and never enter kad or a provider-keyed side cache.
+    DialExact {
+        peer: PeerId,
+        options: DialOpts,
+        permitted_relays: BTreeSet<PeerId>,
+        reply: oneshot::Sender<Result<AuthorizedConnection, String>>,
+    },
     Bootstrap {
         reply: oneshot::Sender<Result<(), String>>,
     },
@@ -380,6 +392,18 @@ pub enum Command {
     ConnectionPath {
         peer: PeerId,
         reply: oneshot::Sender<ConnPath>,
+    },
+    /// Relay identities currently carrying connections to `peer`, for read-only attribution.
+    ConnectionRelays {
+        peer: PeerId,
+        reply: oneshot::Sender<Vec<PeerId>>,
+    },
+    /// Choose one exact live connection authorized by the current offer-derived relay set.
+    /// Direct wins; otherwise only an exact permitted relay is eligible. No connection is closed.
+    AuthorizedConnection {
+        peer: PeerId,
+        permitted_relays: BTreeSet<PeerId>,
+        reply: oneshot::Sender<Option<AuthorizedConnection>>,
     },
     StartProviding {
         key: kad::RecordKey,
@@ -478,6 +502,66 @@ impl Drop for CancelOnDrop {
     }
 }
 
+/// Lossless cancellation guard for one exact outbound dial. If the caller times out or its
+/// enclosing fetch future is dropped, the worker tombstones this [`ConnectionId`] until libp2p
+/// emits its terminal success/error event. A late success is closed and never admitted to the
+/// usable route ledger.
+struct CancelExactDialOnDrop {
+    cancels: mpsc::UnboundedSender<(PeerId, ConnectionId)>,
+    peer: PeerId,
+    connection: ConnectionId,
+    /// Owned so Drop can close reply delivery before publishing cancellation. The worker may
+    /// select the cancellation channel before its bounded command channel; it must nevertheless
+    /// observe a closed waiter if that command later establishes successfully.
+    receiver: Option<oneshot::Receiver<Result<AuthorizedConnection, String>>>,
+    armed: bool,
+}
+
+impl CancelExactDialOnDrop {
+    fn new(
+        cancels: mpsc::UnboundedSender<(PeerId, ConnectionId)>,
+        peer: PeerId,
+        connection: ConnectionId,
+        receiver: oneshot::Receiver<Result<AuthorizedConnection, String>>,
+    ) -> Self {
+        Self {
+            cancels,
+            peer,
+            connection,
+            receiver: Some(receiver),
+            armed: true,
+        }
+    }
+
+    async fn receive(&mut self) -> Result<AuthorizedConnection, String> {
+        let receiver = self.receiver.as_mut().ok_or_else(|| {
+            "exact authorized dial reply receiver was already consumed".to_string()
+        })?;
+        receiver.await.unwrap_or_else(|_| {
+            Err("swarm worker is gone during exact authorized dial".to_string())
+        })
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for CancelExactDialOnDrop {
+    fn drop(&mut self) {
+        // Close reply delivery first. This gives cancellation a stable happens-before fact even
+        // when another runtime thread handles the unbounded cancel immediately.
+        drop(self.receiver.take());
+        if self.armed && self.cancels.send((self.peer, self.connection)).is_err() {
+            tracing::debug!(
+                peer = %self.peer,
+                connection = %self.connection,
+                "fabric-libp2p: exact-dial cancel not delivered because the worker is gone"
+            );
+        }
+    }
+}
+
 /// A cloneable handle to the worker. Every capability holds one of these; a dropped
 /// last handle ends the worker loop (the mpsc closes).
 ///
@@ -493,8 +577,11 @@ pub struct SwarmHandle {
     /// the abandoned query's [`kad::QueryId`] here. Unbounded + dedicated so a cancel is never
     /// dropped by a full command channel (the previous best-effort `try_send` bug).
     cancels: mpsc::UnboundedSender<kad::QueryId>,
-    /// Opens outbound NAR substreams (auto-dialing the peer if not connected). Cloned per
-    /// fetch to satisfy `open_stream`'s `&mut self` one-stream-at-a-time backpressure.
+    /// Lossless exact-dial cancellation/tombstoning channel. Separate from the bounded command
+    /// channel because a future's `Drop` cannot await capacity.
+    exact_dial_cancels: mpsc::UnboundedSender<(PeerId, ConnectionId)>,
+    /// Opens outbound NAR substreams. Production offer fetches use the vendored exact-connection
+    /// method; peer-only auto-dial remains only for lower-level measurement/test callers.
     control: Control,
     /// The raw-stream NAR protocol name (`/nix-p2p/<scope>/nar/3`), for `open_stream`.
     nar_protocol: StreamProtocol,
@@ -516,6 +603,36 @@ pub struct StreamedFetch {
     /// The compressed body bytes actually read from the wire (excludes the 2 framing header
     /// bytes). For a raw fetch this equals `bytes.len()`; for a zstd fetch it is the frame size.
     pub wire_body_bytes: u64,
+}
+
+/// Immutable data for one attributed NAR stream request. Keeping the content contract and its
+/// timing/codec policy together prevents the peer-wide and exact-connection entry points from
+/// drifting as fields are added.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct NarFetchRequest {
+    content: Blake3Digest,
+    expected_size: Option<u64>,
+    dial_timeout: Duration,
+    body_idle_timeout: Duration,
+    offer_zstd: bool,
+}
+
+impl NarFetchRequest {
+    pub(crate) fn new(
+        content: Blake3Digest,
+        expected_size: Option<u64>,
+        dial_timeout: Duration,
+        body_idle_timeout: Duration,
+        offer_zstd: bool,
+    ) -> Self {
+        Self {
+            content,
+            expected_size,
+            dial_timeout,
+            body_idle_timeout,
+            offer_zstd,
+        }
+    }
 }
 
 /// The ATTRIBUTED outcome of a streaming NAR fetch (TASK-218): whether a failure happened
@@ -584,18 +701,70 @@ impl SwarmHandle {
         }
     }
 
-    /// Start listening on `addr`; resolves once a listen address is bound.
+    /// Start listening on `addr`; resolves only after the matching [`ListenerId`] emits
+    /// `NewListenAddr`, never merely because `Swarm::listen_on` accepted registration.
     pub async fn listen(&self, addr: Multiaddr) -> Result<(), String> {
-        let (reply, rx) = oneshot::channel();
-        self.send(Command::Listen { addr, reply }).await;
-        rx.await.unwrap_or_else(|_| Err("worker gone".into()))
+        self.listen_many(vec![addr], DEFAULT_LISTEN_READY_TIMEOUT)
+            .await
+    }
+
+    /// Register every address before awaiting any of them, then require all corresponding
+    /// listeners to become live under one absolute integer timeout. This matters for multiple
+    /// circuit reservations: waiting for R1 before even registering R2 would serialize the
+    /// readiness budget and could prevent the full configured set from ever being installed.
+    pub async fn listen_many(
+        &self,
+        addresses: Vec<Multiaddr>,
+        timeout: Duration,
+    ) -> Result<(), String> {
+        if addresses.is_empty() {
+            return Ok(());
+        }
+        let requested = addresses
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join(", ");
+        let install = async {
+            let mut waits = Vec::with_capacity(addresses.len());
+            for address in addresses {
+                let (reply, receiver) = oneshot::channel();
+                self.send(Command::Listen {
+                    addr: address.clone(),
+                    reply,
+                })
+                .await;
+                waits.push((address, receiver));
+            }
+            for (address, receiver) in waits {
+                receiver.await.map_err(|_| {
+                    format!("swarm worker is gone while waiting for listener {address}")
+                })??;
+            }
+            Ok(())
+        };
+        tokio::time::timeout(timeout, install).await.map_err(|_| {
+            format!("libp2p listener(s) did not emit NewListenAddr within {timeout:?}: {requested}")
+        })?
     }
 
     /// The concrete addresses the node is listening on (for a peer to dial).
     pub async fn listen_addrs(&self) -> Vec<Multiaddr> {
+        self.try_listen_addrs().await.unwrap_or_else(|reason| {
+            tracing::error!(%reason, "fabric-libp2p: cannot read current listen addresses");
+            Vec::new()
+        })
+    }
+
+    /// The concrete addresses the node is listening on, preserving worker failure instead of
+    /// collapsing it to an empty set. Production record signing uses this form: "no live relay"
+    /// and "the swarm is gone" are materially different truths and must not produce the same
+    /// signed offer.
+    pub async fn try_listen_addrs(&self) -> Result<Vec<Multiaddr>, String> {
         let (reply, rx) = oneshot::channel();
         self.send(Command::ListenAddrs { reply }).await;
-        rx.await.unwrap_or_default()
+        rx.await
+            .map_err(|_| "swarm worker is gone while reading listen addresses".to_string())
     }
 
     /// Teach kad how to reach `peer` at `addr` (a bootstrap/entry peer).
@@ -616,6 +785,106 @@ impl SwarmHandle {
         let (reply, rx) = oneshot::channel();
         self.send(Command::Dial { addr, reply }).await;
         rx.await.unwrap_or_else(|_| Err("worker gone".into()))
+    }
+
+    /// Establish or reuse one exact DIRECT connection to `peer`.
+    pub(crate) async fn connect_direct(
+        &self,
+        peer: PeerId,
+        addresses: Vec<Multiaddr>,
+        timeout: Duration,
+    ) -> Result<AuthorizedConnection, String> {
+        if addresses.iter().any(is_circuit_address) {
+            return Err("direct dial was given a /p2p-circuit address".to_string());
+        }
+        self.connect_authorized(peer, addresses, BTreeSet::new(), timeout)
+            .await
+    }
+
+    /// Establish or reuse one exact connection authorized by a bounded circuit candidate set.
+    ///
+    /// Unlike [`add_address`](Self::add_address), this does not persist a provider -> address
+    /// association in kad. Direct is always preferred; otherwise a live relayed connection is
+    /// eligible only when its observed relay occurs in these exact candidates. Unrelated routes
+    /// remain open but cannot carry the request because the returned [`ConnectionId`] is passed
+    /// through to the exact stream-open API.
+    pub(crate) async fn connect_transient(
+        &self,
+        peer: PeerId,
+        addresses: Vec<Multiaddr>,
+        timeout: Duration,
+    ) -> Result<AuthorizedConnection, String> {
+        if addresses.is_empty() {
+            return Err("transient dial requires at least one address".to_string());
+        }
+        let permitted_relays: BTreeSet<PeerId> =
+            addresses.iter().filter_map(circuit_relay_peer).collect();
+        if permitted_relays.is_empty()
+            || addresses.iter().any(|address| !is_circuit_address(address))
+        {
+            return Err(
+                "transient circuit dial requires only /p2p/<relay>/p2p-circuit addresses"
+                    .to_string(),
+            );
+        }
+        self.connect_authorized(peer, addresses, permitted_relays, timeout)
+            .await
+    }
+
+    async fn connect_authorized(
+        &self,
+        peer: PeerId,
+        addresses: Vec<Multiaddr>,
+        permitted_relays: BTreeSet<PeerId>,
+        timeout: Duration,
+    ) -> Result<AuthorizedConnection, String> {
+        let connect = async {
+            if let Some(connection) = self.authorized_connection(peer, &permitted_relays).await? {
+                return Ok(connection);
+            }
+            if addresses.is_empty() {
+                return Err(format!(
+                    "no live authorized connection to {peer} and no exact dial addresses"
+                ));
+            }
+
+            // `addresses(...)` keeps extend_addresses_through_behaviour=false, so kad cannot add
+            // ambient provider coordinates to this exact authorized attempt.
+            let options = DialOpts::peer_id(peer)
+                .condition(PeerCondition::Always)
+                .addresses(addresses)
+                .build();
+            let connection = options.connection_id();
+            let (reply, receiver) = oneshot::channel();
+            // Reserve bounded command capacity before arming cancellation. Once the guard exists,
+            // enqueue is synchronous: an exact-dial command can never become visible to the
+            // worker without its caller already having a lossless cancellation path. If this
+            // future is dropped while waiting for capacity, no command was enqueued and therefore
+            // no dial exists to cancel.
+            let permit = self.tx.reserve().await.map_err(|_| {
+                "swarm worker is gone before exact authorized dial registration".to_string()
+            })?;
+            let mut cancel = CancelExactDialOnDrop::new(
+                self.exact_dial_cancels.clone(),
+                peer,
+                connection,
+                receiver,
+            );
+            permit.send(Command::DialExact {
+                peer,
+                options,
+                permitted_relays,
+                reply,
+            });
+            let result = cancel.receive().await;
+            cancel.disarm();
+            result
+        };
+        tokio::time::timeout(timeout, connect).await.map_err(|_| {
+            format!(
+                "exact authorized dial to {peer} did not establish a connection within {timeout:?}"
+            )
+        })?
     }
 
     /// Run the kad bootstrap self-lookup to populate the routing table.
@@ -652,6 +921,34 @@ impl SwarmHandle {
         let (reply, rx) = oneshot::channel();
         self.send(Command::ConnectionPath { peer, reply }).await;
         rx.await.unwrap_or(ConnPath::None)
+    }
+
+    /// Relay identities carrying live connections to `peer`, derived from the exact current
+    /// `ConnectedPoint`s. Sorted and unique; empty for direct-only/disconnected peers. This is a
+    /// read-only observability fact, not an address book or dial input.
+    pub async fn connection_relay_peers(&self, peer: PeerId) -> Vec<PeerId> {
+        let (reply, rx) = oneshot::channel();
+        self.send(Command::ConnectionRelays { peer, reply }).await;
+        rx.await.unwrap_or_default()
+    }
+
+    /// Select one exact currently-live connection: direct first, then an exact permitted relay.
+    /// Unrelated live connections coexist and are never closed or used as fallbacks.
+    async fn authorized_connection(
+        &self,
+        peer: PeerId,
+        permitted_relays: &BTreeSet<PeerId>,
+    ) -> Result<Option<AuthorizedConnection>, String> {
+        let (reply, receiver) = oneshot::channel();
+        self.send(Command::AuthorizedConnection {
+            peer,
+            permitted_relays: permitted_relays.clone(),
+            reply,
+        })
+        .await;
+        receiver
+            .await
+            .map_err(|_| "swarm worker is gone while selecting an authorized route".to_string())
     }
 
     /// Bounded DIRECT-reachability probe (TASK-221): is `peer` reachable by a DIRECT
@@ -1014,10 +1311,61 @@ impl SwarmHandle {
         body_idle_timeout: Duration,
         offer_zstd: bool,
     ) -> FetchOutcome {
+        self.fetch_nar_streaming_attributed_inner(
+            peer,
+            None,
+            NarFetchRequest::new(
+                content,
+                expected_size,
+                dial_timeout,
+                body_idle_timeout,
+                offer_zstd,
+            ),
+        )
+        .await
+    }
+
+    /// Production offer fetch: open the NAR protocol only on `connection`. The vendored stream
+    /// control atomically verifies `(connection, peer)` and has no random peer-wide selection,
+    /// auto-dial, or fallback. A route that closes between authorization and this call is an
+    /// honest pre-open `NotConnected` failure.
+    pub(crate) async fn fetch_nar_streaming_attributed_on_connection(
+        &self,
+        peer: PeerId,
+        connection: ConnectionId,
+        request: NarFetchRequest,
+    ) -> FetchOutcome {
+        self.fetch_nar_streaming_attributed_inner(peer, Some(connection), request)
+            .await
+    }
+
+    async fn fetch_nar_streaming_attributed_inner(
+        &self,
+        peer: PeerId,
+        connection: Option<ConnectionId>,
+        request: NarFetchRequest,
+    ) -> FetchOutcome {
+        let NarFetchRequest {
+            content,
+            expected_size,
+            dial_timeout,
+            body_idle_timeout,
+            offer_zstd,
+        } = request;
         // Clone the Control per fetch: `open_stream` takes `&mut self` and opens one stream
         // at a time, so a fresh clone is the natural unit of concurrency here.
         let mut control = self.control.clone();
-        let open = control.open_stream(peer, self.nar_protocol.clone());
+        let protocol = self.nar_protocol.clone();
+        let open = async {
+            match connection {
+                Some(connection) => {
+                    control
+                        .open_stream_on_connection(peer, connection, protocol)
+                        .await
+                }
+                None => control.open_stream(peer, protocol).await,
+            }
+        };
         // THE ATTRIBUTION BOUNDARY: a failure to open/dial the substream means the provider was
         // never reached (unreachable). Everything past this point is a post-open transfer error.
         let mut stream = match tokio::time::timeout(dial_timeout, open).await {
@@ -1169,36 +1517,274 @@ struct Worker {
     /// [`Worker::cancel_query`]. Dedicated + unbounded so a cancel is never lost to command
     /// channel backpressure.
     cancels: mpsc::UnboundedReceiver<kad::QueryId>,
+    /// Lossless cancellation notices from dropped exact-dial waiters. Each notice converts the
+    /// pending entry to a tombstone; it never deletes authority while a late success is possible.
+    exact_dial_cancels: mpsc::UnboundedReceiver<(PeerId, ConnectionId)>,
     pending: HashMap<kad::QueryId, Pending>,
-    /// Per-peer live connection ledger (TASK-242): how many DIRECT vs RELAYED connections are open
-    /// to each peer right now. Written by `ConnectionEstablished`/`ConnectionClosed` (each carries
-    /// the `ConnectedPoint`, whose `is_relayed()` classifies the connection), read by
-    /// [`Command::ConnectionPath`]. An entry is removed when its last connection closes, so a peer
-    /// present here is one the swarm currently holds at least one connection to — kept in lockstep
-    /// with `Swarm::is_connected`. Bounded by the live connection count (small), never a leak.
-    conn_paths: HashMap<PeerId, ConnCounts>,
+    /// Listener registrations waiting for their exact ListenerId's first `NewListenAddr` event.
+    pending_listens: HashMap<ListenerId, PendingListen>,
+    /// Exact authorized dials awaiting terminal success/error. A dropped caller becomes a
+    /// tombstone, retained until that terminal event; the hard admission cap bounds memory.
+    pending_exact_dials: HashMap<ConnectionId, PendingExactDial>,
+    /// Exact live ConnectionId -> route provenance per peer. Derived and retired with connection
+    /// events; never populated from offers or routing results, so it is live transport fact rather
+    /// than a provider cache. Needed because libp2p-stream may choose any peer connection.
+    conn_routes: HashMap<PeerId, HashMap<ConnectionId, ConnectionRoute>>,
 }
 
-/// The open-connection tally to one peer, split by transport path (TASK-242). Both counters are the
-/// number of currently-open connections of that kind; the entry is dropped when both reach zero.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-struct ConnCounts {
-    direct: u32,
-    relayed: u32,
+struct PendingListen {
+    requested: Multiaddr,
+    reply: oneshot::Sender<Result<(), String>>,
 }
 
-impl ConnCounts {
-    /// The path this tally represents: `Direct` if ANY direct connection is open (a direct dial, or
-    /// a relayed one dcutr upgraded), else `Relay` if only relayed connections remain, else `None`.
-    /// Direct dominates so a hole-punched peer reports `direct` even while a stale circuit lingers.
-    fn path(self) -> ConnPath {
-        if self.direct > 0 {
-            ConnPath::Direct
-        } else if self.relayed > 0 {
-            ConnPath::Relay
-        } else {
-            ConnPath::None
+enum PendingExactDial {
+    Active {
+        peer: PeerId,
+        permitted_relays: BTreeSet<PeerId>,
+        reply: oneshot::Sender<Result<AuthorizedConnection, String>>,
+    },
+    Tombstone {
+        peer: PeerId,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ExactDialCancelTransition {
+    /// No pending attempt or admitted route exists. This includes cancellation winning the
+    /// worker's select race before its already-enqueued command; the command then carries a
+    /// closed reply, so a later success is rejected by [`apply_connection_established`].
+    None,
+    /// The dial is in flight. Its authority was replaced by a tombstone and must remain until
+    /// libp2p reports the exact attempt's terminal success or error.
+    AwaitTerminal,
+    /// The exact connection was admitted just before cancellation arrived. Its route was removed
+    /// and a tombstone installed; the worker must close precisely this [`ConnectionId`].
+    Close,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ConnectionEstablishedTransition {
+    Keep,
+    Close(ExactConnectionCloseReason),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ExactConnectionCloseReason {
+    Cancelled,
+    UnauthorizedRoute,
+    WaiterGone,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ConnectionRoute {
+    Direct,
+    Relayed { relay: PeerId },
+    RelayedUnknown,
+}
+
+/// The exact live connection selected for one offer. The transport passes `id` unchanged into
+/// `Control::open_stream_on_connection`; `route` drives event-accurate exposure accounting.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct AuthorizedConnection {
+    pub(crate) id: ConnectionId,
+    pub(crate) route: ConnectionRoute,
+}
+
+impl AuthorizedConnection {
+    pub(crate) fn relay_peer(self) -> Option<PeerId> {
+        match self.route {
+            ConnectionRoute::Relayed { relay } => Some(relay),
+            ConnectionRoute::Direct | ConnectionRoute::RelayedUnknown => None,
         }
+    }
+}
+
+/// Whether this live route may carry a request whose exact offer permits `relays`.
+/// Direct is always preferred/allowed. A circuit is allowed only when its observed relay
+/// identity occurs in the current offer-derived set; an unparseable circuit fails closed.
+fn connection_route_allowed(route: &ConnectionRoute, relays: &BTreeSet<PeerId>) -> bool {
+    match route {
+        ConnectionRoute::Direct => true,
+        ConnectionRoute::Relayed { relay } => relays.contains(relay),
+        ConnectionRoute::RelayedUnknown => false,
+    }
+}
+
+/// Remove one exact route and prune only its now-empty peer bucket. Other connections to the
+/// same peer are deliberately untouched: they may be carrying concurrent requests authorized by
+/// a different offer.
+fn remove_connection_route(
+    conn_routes: &mut HashMap<PeerId, HashMap<ConnectionId, ConnectionRoute>>,
+    peer: PeerId,
+    connection: ConnectionId,
+) -> bool {
+    let removed = conn_routes
+        .get_mut(&peer)
+        .is_some_and(|routes| routes.remove(&connection).is_some());
+    if conn_routes.get(&peer).is_some_and(HashMap::is_empty) {
+        conn_routes.remove(&peer);
+    }
+    removed
+}
+
+/// Apply one lossless cancellation notice without touching the swarm. The returned transition is
+/// the complete side-effect contract for the worker: only [`ExactDialCancelTransition::Close`]
+/// requires a libp2p close operation.
+fn apply_exact_dial_cancel(
+    pending_exact_dials: &mut HashMap<ConnectionId, PendingExactDial>,
+    conn_routes: &mut HashMap<PeerId, HashMap<ConnectionId, ConnectionRoute>>,
+    peer: PeerId,
+    connection: ConnectionId,
+) -> ExactDialCancelTransition {
+    if let Some(pending) = pending_exact_dials.get_mut(&connection) {
+        let expected_peer = match pending {
+            PendingExactDial::Active { peer, .. } | PendingExactDial::Tombstone { peer } => *peer,
+        };
+        *pending = PendingExactDial::Tombstone {
+            peer: expected_peer,
+        };
+        return ExactDialCancelTransition::AwaitTerminal;
+    }
+
+    if remove_connection_route(conn_routes, peer, connection) {
+        pending_exact_dials.insert(connection, PendingExactDial::Tombstone { peer });
+        ExactDialCancelTransition::Close
+    } else {
+        ExactDialCancelTransition::None
+    }
+}
+
+/// Apply one `ConnectionEstablished` event to the exact-dial authority state and route ledger.
+///
+/// For a valid active attempt, delivery of the exact [`AuthorizedConnection`] is the admission
+/// linearization point: the route is inserted only when `reply.send` succeeds. A closed waiter can
+/// therefore never leave a selectable route behind, even if it closes between an earlier status
+/// check and the send. The worker performs the returned close operation after this state change.
+fn apply_connection_established(
+    pending_exact_dials: &mut HashMap<ConnectionId, PendingExactDial>,
+    conn_routes: &mut HashMap<PeerId, HashMap<ConnectionId, ConnectionRoute>>,
+    peer_id: PeerId,
+    connection_id: ConnectionId,
+    route: ConnectionRoute,
+) -> ConnectionEstablishedTransition {
+    match pending_exact_dials.remove(&connection_id) {
+        Some(PendingExactDial::Tombstone { .. }) => {
+            ConnectionEstablishedTransition::Close(ExactConnectionCloseReason::Cancelled)
+        }
+        Some(PendingExactDial::Active {
+            peer,
+            permitted_relays,
+            reply,
+        }) if peer != peer_id || !connection_route_allowed(&route, &permitted_relays) => {
+            let _ = reply.send(Err(format!(
+                "exact dial {connection_id} expected authorized route to {peer}, but established peer {peer_id} via {route:?}"
+            )));
+            ConnectionEstablishedTransition::Close(ExactConnectionCloseReason::UnauthorizedRoute)
+        }
+        Some(PendingExactDial::Active { reply, .. }) => {
+            let authorized = AuthorizedConnection {
+                id: connection_id,
+                route,
+            };
+            if reply.send(Ok(authorized)).is_err() {
+                ConnectionEstablishedTransition::Close(ExactConnectionCloseReason::WaiterGone)
+            } else {
+                conn_routes
+                    .entry(peer_id)
+                    .or_default()
+                    .insert(connection_id, route);
+                ConnectionEstablishedTransition::Keep
+            }
+        }
+        None => {
+            conn_routes
+                .entry(peer_id)
+                .or_default()
+                .insert(connection_id, route);
+            ConnectionEstablishedTransition::Keep
+        }
+    }
+}
+
+/// Derive the aggregate operator-facing path from the one exact route ledger. Direct dominates so
+/// a hole-punched peer reports direct even while a relay circuit coexists.
+fn connection_path_from_routes(
+    routes: Option<&HashMap<ConnectionId, ConnectionRoute>>,
+) -> ConnPath {
+    let mut saw_relay = false;
+    for route in routes.into_iter().flat_map(HashMap::values) {
+        match route {
+            ConnectionRoute::Direct => return ConnPath::Direct,
+            ConnectionRoute::Relayed { .. } | ConnectionRoute::RelayedUnknown => saw_relay = true,
+        }
+    }
+    if saw_relay {
+        ConnPath::Relay
+    } else {
+        ConnPath::None
+    }
+}
+
+/// Select deterministically from current fact: lowest direct ConnectionId first, otherwise the
+/// lowest ConnectionId carried by a relay authorized by the current exact offer.
+fn select_authorized_connection(
+    routes: Option<&HashMap<ConnectionId, ConnectionRoute>>,
+    relays: &BTreeSet<PeerId>,
+) -> Option<AuthorizedConnection> {
+    let routes = routes?;
+    routes
+        .iter()
+        .filter(|(_, route)| matches!(route, ConnectionRoute::Direct))
+        .min_by_key(|(connection, _)| *connection)
+        .or_else(|| {
+            routes
+                .iter()
+                .filter(|(_, route)| connection_route_allowed(route, relays))
+                .min_by_key(|(connection, _)| *connection)
+        })
+        .map(|(id, route)| AuthorizedConnection {
+            id: *id,
+            route: *route,
+        })
+}
+
+/// The relay in a standard circuit-v2 address is the `/p2p/<relay>` component immediately before
+/// `/p2p-circuit`. Reject other shapes instead of guessing from some unrelated PeerId component.
+fn circuit_relay_peer(address: &Multiaddr) -> Option<PeerId> {
+    let mut previous_peer = None;
+    for protocol in address.iter() {
+        if matches!(protocol, libp2p::multiaddr::Protocol::P2pCircuit) {
+            return previous_peer;
+        }
+        previous_peer = match protocol {
+            libp2p::multiaddr::Protocol::P2p(peer) => Some(peer),
+            _ => None,
+        };
+    }
+    None
+}
+
+fn is_circuit_address(address: &Multiaddr) -> bool {
+    address
+        .iter()
+        .any(|protocol| matches!(protocol, libp2p::multiaddr::Protocol::P2pCircuit))
+}
+
+fn endpoint_relay_peer(endpoint: &ConnectedPoint) -> Option<PeerId> {
+    let address = match endpoint {
+        ConnectedPoint::Dialer { address, .. } => address,
+        ConnectedPoint::Listener { local_addr, .. } => local_addr,
+    };
+    circuit_relay_peer(address)
+}
+
+fn connection_route(endpoint: &ConnectedPoint) -> ConnectionRoute {
+    if !endpoint.is_relayed() {
+        ConnectionRoute::Direct
+    } else if let Some(relay) = endpoint_relay_peer(endpoint) {
+        ConnectionRoute::Relayed { relay }
+    } else {
+        ConnectionRoute::RelayedUnknown
     }
 }
 
@@ -1227,9 +1813,16 @@ impl Worker {
                 // command branch above also closes and ends the loop - so a `None` here is a
                 // harmless no-op, not a busy spin.
                 Some(id) = self.cancels.recv() => self.cancel_query(id),
+                Some((peer, connection)) = self.exact_dial_cancels.recv() => {
+                    self.tombstone_exact_dial(peer, connection);
+                },
                 // TASK-154 B3: reap any query whose caller went away in the buffered-id window
                 // (no CancelOnDrop armed) even if it never emits another event.
-                _ = sweep.tick() => self.reap_abandoned(),
+                _ = sweep.tick() => {
+                    self.reap_abandoned();
+                    self.reap_abandoned_listens();
+                    self.tombstone_abandoned_exact_dials();
+                },
                 event = self.swarm.select_next_some() => self.on_event(event),
             }
         }
@@ -1261,23 +1854,103 @@ impl Worker {
         self.pending.remove(&id);
     }
 
+    fn reap_abandoned_listens(&mut self) {
+        let abandoned: Vec<ListenerId> = self
+            .pending_listens
+            .iter()
+            .filter_map(|(id, pending)| pending.reply.is_closed().then_some(*id))
+            .collect();
+        for id in abandoned {
+            if let Some(pending) = self.pending_listens.remove(&id) {
+                tracing::debug!(
+                    listener = ?id,
+                    requested = %pending.requested,
+                    "fabric-libp2p: removing listener whose bounded readiness waiter expired"
+                );
+                self.swarm.remove_listener(id);
+            }
+        }
+    }
+
+    fn tombstone_abandoned_exact_dials(&mut self) {
+        let abandoned: Vec<(PeerId, ConnectionId)> = self
+            .pending_exact_dials
+            .iter()
+            .filter_map(|(id, pending)| match pending {
+                PendingExactDial::Active { peer, reply, .. } if reply.is_closed() => {
+                    Some((*peer, *id))
+                }
+                PendingExactDial::Active { .. } | PendingExactDial::Tombstone { .. } => None,
+            })
+            .collect();
+        for (peer, id) in abandoned {
+            self.tombstone_exact_dial(peer, id);
+        }
+    }
+
+    fn tombstone_exact_dial(&mut self, peer: PeerId, connection: ConnectionId) {
+        let expected_peer =
+            self.pending_exact_dials
+                .get(&connection)
+                .map(|pending| match pending {
+                    PendingExactDial::Active { peer, .. }
+                    | PendingExactDial::Tombstone { peer } => *peer,
+                });
+        if let Some(expected) = expected_peer.filter(|expected| *expected != peer) {
+            tracing::error!(
+                %peer,
+                expected_peer = %expected,
+                %connection,
+                "fabric-libp2p: exact-dial cancel named the wrong peer; retaining authority tombstone"
+            );
+        }
+
+        match apply_exact_dial_cancel(
+            &mut self.pending_exact_dials,
+            &mut self.conn_routes,
+            peer,
+            connection,
+        ) {
+            ExactDialCancelTransition::None => {}
+            ExactDialCancelTransition::AwaitTerminal => {
+                tracing::debug!(
+                    %peer,
+                    %connection,
+                    "fabric-libp2p: exact dial cancelled; awaiting its terminal event"
+                );
+            }
+            ExactDialCancelTransition::Close => {
+                self.swarm.close_connection(connection);
+                tracing::debug!(
+                    %peer,
+                    %connection,
+                    "fabric-libp2p: closing exact dial that succeeded after its caller expired"
+                );
+            }
+        }
+    }
+
     fn on_command(&mut self, command: Command) {
         // `kad` is reborrowed per-arm (not bound once at the top) so the arms that drive
         // OTHER behaviours (the NAR request-response) or plain swarm ops do not conflict
         // with a long-lived `&mut kad` borrow of the swarm.
         match command {
-            Command::Listen { addr, reply } => {
-                let result = self
-                    .swarm
-                    .listen_on(addr)
-                    .map(|_| ())
-                    .map_err(|e| e.to_string());
-                // If binding failed, answer now; if it succeeded, the concrete address
-                // arrives via NewListenAddr - but listen_on returning Ok already means
-                // the listener is registered, so answering here is correct and callers
-                // read the concrete addr via listen_addrs() afterwards.
-                let _ = reply.send(result);
-            }
+            Command::Listen { addr, reply } => match self.swarm.listen_on(addr.clone()) {
+                Ok(listener) => {
+                    self.pending_listens.insert(
+                        listener,
+                        PendingListen {
+                            requested: addr,
+                            reply,
+                        },
+                    );
+                }
+                Err(error) => {
+                    let _ = reply.send(Err(format!(
+                        "registering libp2p listener {addr} failed: {error}"
+                    )));
+                }
+            },
             Command::ListenAddrs { reply } => {
                 // Derive from the swarm's own listener set rather than a parallel Vec:
                 // it is always current (pruned on ListenerClosed/ExpiredListenAddr) and
@@ -1295,6 +1968,41 @@ impl Worker {
             Command::Dial { addr, reply } => {
                 let result = self.swarm.dial(addr).map_err(|e| e.to_string());
                 let _ = reply.send(result);
+            }
+            Command::DialExact {
+                peer,
+                options,
+                permitted_relays,
+                reply,
+            } => {
+                let connection_id = options.connection_id();
+                if self.pending_exact_dials.len() >= MAX_PENDING_EXACT_DIALS {
+                    let _ = reply.send(Err(format!(
+                        "refusing exact dial to {peer}: {} active/tombstoned attempts reached hard cap {}",
+                        self.pending_exact_dials.len(),
+                        MAX_PENDING_EXACT_DIALS
+                    )));
+                    return;
+                }
+                // Insert before dialing so every successfully registered exact attempt has an
+                // authority entry. The worker cannot poll a terminal event until this command
+                // returns, so there is no event-before-insert race.
+                self.pending_exact_dials.insert(
+                    connection_id,
+                    PendingExactDial::Active {
+                        peer,
+                        permitted_relays,
+                        reply,
+                    },
+                );
+                if let Err(error) = self.swarm.dial(options)
+                    && let Some(PendingExactDial::Active { reply, .. }) =
+                        self.pending_exact_dials.remove(&connection_id)
+                {
+                    let _ = reply.send(Err(format!(
+                        "registering exact authorized dial {connection_id} to {peer} failed: {error}"
+                    )));
+                }
             }
             Command::Bootstrap { reply } => match self.swarm.behaviour_mut().kad.bootstrap() {
                 Ok(id) => {
@@ -1321,14 +2029,32 @@ impl Worker {
                 let _ = reply.send(self.swarm.is_connected(&peer));
             }
             Command::ConnectionPath { peer, reply } => {
-                // Read the connection ledger the ConnectionEstablished/Closed events maintain. A
-                // peer absent from the map has no open connection (ConnPath::None) — the same
-                // verdict `is_connected` would give, since both are driven by the same events.
-                let path = self
-                    .conn_paths
-                    .get(&peer)
-                    .map_or(ConnPath::None, |counts| counts.path());
+                let path = connection_path_from_routes(self.conn_routes.get(&peer));
                 let _ = reply.send(path);
+            }
+            Command::ConnectionRelays { peer, reply } => {
+                let mut relays: Vec<PeerId> = self
+                    .conn_routes
+                    .get(&peer)
+                    .into_iter()
+                    .flat_map(|routes| routes.values())
+                    .filter_map(|route| match route {
+                        ConnectionRoute::Relayed { relay } => Some(*relay),
+                        ConnectionRoute::Direct | ConnectionRoute::RelayedUnknown => None,
+                    })
+                    .collect();
+                relays.sort_unstable();
+                relays.dedup();
+                let _ = reply.send(relays);
+            }
+            Command::AuthorizedConnection {
+                peer,
+                permitted_relays,
+                reply,
+            } => {
+                let selected =
+                    select_authorized_connection(self.conn_routes.get(&peer), &permitted_relays);
+                let _ = reply.send(selected);
             }
             Command::StartProviding { key, reply } => {
                 match self.swarm.behaviour_mut().kad.start_providing(key) {
@@ -1441,41 +2167,107 @@ impl Worker {
 
     fn on_event(&mut self, event: SwarmEvent<BehaviourEvent>) {
         match event {
-            SwarmEvent::NewListenAddr { address, .. } => {
+            SwarmEvent::NewListenAddr {
+                listener_id,
+                address,
+            } => {
                 tracing::debug!(%address, "fabric-libp2p: listening");
+                if let Some(pending) = self.pending_listens.remove(&listener_id) {
+                    let _ = pending.reply.send(Ok(()));
+                }
             }
-            // TASK-242: track the live transport path per peer for the operator status surface.
-            // Each ConnectionEstablished carries the ConnectedPoint; `is_relayed()` is the
-            // direct-vs-`/p2p-circuit` discriminator. We tally per connection (a peer can hold
-            // several at once, e.g. a relayed circuit dcutr later upgrades to a direct one) and
-            // classify direct-dominant. This ledger stays in lockstep with `Swarm::is_connected`
-            // because both are driven by the same paired Established/Closed events.
+            SwarmEvent::ListenerError { listener_id, error } => {
+                let requested = self
+                    .pending_listens
+                    .get(&listener_id)
+                    .map(|pending| pending.requested.to_string())
+                    .unwrap_or_else(|| "already-ready listener".to_string());
+                // libp2p documents ListenerError as non-terminal; keep waiting for either a
+                // concrete NewListenAddr or terminal ListenerClosed under the caller's bound.
+                tracing::warn!(
+                    listener = ?listener_id,
+                    %requested,
+                    %error,
+                    "fabric-libp2p: listener reported a non-terminal error while awaiting readiness"
+                );
+            }
+            SwarmEvent::ListenerClosed {
+                listener_id,
+                reason,
+                ..
+            } => {
+                if let Some(pending) = self.pending_listens.remove(&listener_id) {
+                    let detail = reason.map_or_else(
+                        |error| error.to_string(),
+                        |()| "listener closed without an error".to_string(),
+                    );
+                    let _ = pending.reply.send(Err(format!(
+                        "libp2p listener {} ({listener_id:?}) closed before NewListenAddr: {detail}",
+                        pending.requested
+                    )));
+                }
+            }
+            // One live ConnectionId ledger is the SSOT for route selection, exposure attribution,
+            // and aggregate status. Exact-dial terminal events additionally enforce their
+            // offer-derived route authority before admission.
             SwarmEvent::ConnectionEstablished {
-                peer_id, endpoint, ..
+                peer_id,
+                connection_id,
+                endpoint,
+                ..
             } => {
-                let counts = self.conn_paths.entry(peer_id).or_default();
-                if endpoint.is_relayed() {
-                    counts.relayed = counts.relayed.saturating_add(1);
-                } else {
-                    counts.direct = counts.direct.saturating_add(1);
+                let route = connection_route(&endpoint);
+                if let ConnectionEstablishedTransition::Close(reason) = apply_connection_established(
+                    &mut self.pending_exact_dials,
+                    &mut self.conn_routes,
+                    peer_id,
+                    connection_id,
+                    route,
+                ) {
+                    self.swarm.close_connection(connection_id);
+                    tracing::debug!(
+                        %peer_id,
+                        %connection_id,
+                        ?route,
+                        ?reason,
+                        "fabric-libp2p: closing exact connection rejected by authority transition"
+                    );
                 }
             }
-            SwarmEvent::ConnectionClosed {
-                peer_id, endpoint, ..
-            } => {
-                // Decrement the SAME class this connection was counted under; drop the entry when
-                // its last connection closes so an absent peer means "not connected" (== is_connected
-                // false). saturating_sub guards against any unpaired-event surprise (never underflow).
-                if let Some(counts) = self.conn_paths.get_mut(&peer_id) {
-                    if endpoint.is_relayed() {
-                        counts.relayed = counts.relayed.saturating_sub(1);
-                    } else {
-                        counts.direct = counts.direct.saturating_sub(1);
-                    }
-                    if *counts == ConnCounts::default() {
-                        self.conn_paths.remove(&peer_id);
-                    }
+            SwarmEvent::OutgoingConnectionError {
+                connection_id,
+                peer_id,
+                error,
+            } => match self.pending_exact_dials.remove(&connection_id) {
+                Some(PendingExactDial::Active { peer, reply, .. }) => {
+                    let target = peer_id.unwrap_or(peer);
+                    let _ = reply.send(Err(format!(
+                        "exact authorized dial {connection_id} to {target} failed: {error}"
+                    )));
                 }
+                Some(PendingExactDial::Tombstone { peer }) => {
+                    tracing::debug!(
+                        %peer,
+                        %connection_id,
+                        %error,
+                        "fabric-libp2p: cancelled exact dial reached its terminal error"
+                    );
+                }
+                None => {}
+            },
+            SwarmEvent::ConnectionClosed {
+                peer_id,
+                connection_id,
+                ..
+            } => {
+                if let Some(PendingExactDial::Active { reply, .. }) =
+                    self.pending_exact_dials.remove(&connection_id)
+                {
+                    let _ = reply.send(Err(format!(
+                        "exact authorized connection {connection_id} to {peer_id} closed before it became usable"
+                    )));
+                }
+                remove_connection_route(&mut self.conn_routes, peer_id, connection_id);
             }
             SwarmEvent::Behaviour(BehaviourEvent::Identify(identify::Event::Received {
                 peer_id,
@@ -1739,6 +2531,16 @@ async fn run_accept_loop(mut incoming: IncomingStreams, serve_slot: ServeSlot) {
 /// larger configured timeout and/or application-level retry — which is why this is
 /// configurable rather than a bigger magic number.
 pub const DEFAULT_KAD_QUERY_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Absolute bound for one or many listener registrations to emit their first concrete address.
+/// Circuit-v2 reservation refusal surfaces as ListenerClosed before this; a stalled transport is
+/// cut off here instead of letting provider startup wait forever.
+pub const DEFAULT_LISTEN_READY_TIMEOUT: Duration = Duration::from_secs(20);
+
+/// Hard cap across active exact dials and cancellation tombstones. Tombstones cannot be evicted
+/// before a terminal libp2p event without making a very-late success usable, so admission is
+/// bounded fail-closed instead of allowing attacker-driven state growth.
+const MAX_PENDING_EXACT_DIALS: usize = 64;
 
 /// How often the worker sweeps for abandoned queries (TASK-154 B3). The eager reap at the top of
 /// [`Worker::on_query`] cancels a query the instant its next event arrives; this periodic sweep
@@ -2022,23 +2824,14 @@ pub struct NodeConfig {
     /// address). This book is a pure LOCATOR concern: it never enters the swarm and does
     /// not affect discovery, dialing, or the kad routing table.
     pub peer_address_book: BTreeMap<NodeId, Vec<Multiaddr>>,
-    /// Relays this node ALREADY knows from bootstrap/relay config (each a libp2p
-    /// [`PeerId`] + its direct transport [`Multiaddr`], e.g. `/ip4/…/tcp/…`). TASK-218:
-    /// a discovery-only consumer that finds a NAT'd provider via kad `get_providers`
-    /// resolves the provider's `/p2p-circuit` dial-address by CONSTRUCTING it -
-    /// `<relayAddr>/p2p/<relayPeer>/p2p-circuit/p2p/<providerPeer>` - from the provider
-    /// PeerId (discovered via kad) plus one of these bootstrap-known relays. This is NOT
-    /// injection (the provider identity still came ONLY from kad; a relay in the bootstrap
-    /// set is explicitly permitted config, PRD §733-736) and touches NO frozen surface.
-    ///
-    /// GENERALITY LIMIT (documented, filed as TASK-219): the construction assumes the
-    /// provider reserved on a relay THIS node knows - true when there is one shared relay
-    /// in the bootstrap set (the harness, and the common "a known public relay" deployment).
-    /// The fully general multi-relay case, where the consumer does not know which relay a
-    /// provider chose, needs the relay identity to propagate through the DHT and is filed
-    /// separately. Empty by default (a node with no known relay synthesizes no circuit
-    /// candidate and falls back to the plain kad-resolved address). A pure LOCATOR concern:
-    /// it never enters the swarm and does not affect discovery or the kad routing table.
+    /// Legacy provider-independent relays known from bootstrap/relay config (each a libp2p
+    /// [`PeerId`] + its direct transport [`Multiaddr`], e.g. `/ip4/…/tcp/…`). The primary
+    /// TASK-219 path reads the provider's bounded, signature-bound relay identities from its
+    /// exact record and resolves each relay address through raw kad. This flat config set is
+    /// consulted only for an actually empty legacy hint set, preserving TASK-218 rollout
+    /// compatibility with the original single-shared-relay deployment without overriding signed
+    /// authority. It is never indexed by provider or
+    /// content and never becomes a mutable provider-address cache. Empty by default.
     pub known_relays: Vec<(PeerId, Multiaddr)>,
     /// The node's PUBLICATION-ELIGIBILITY authority (TASK-231, AC#2): the per-fabric
     /// [`PublicationEligibility`] the announcer consults FAIL-CLOSED before publishing any
@@ -2450,12 +3243,16 @@ impl Node {
         // command channel so an abandoned-query cancel is never dropped under command
         // backpressure.
         let (cancel_tx, cancel_rx) = mpsc::unbounded_channel();
+        let (exact_dial_cancel_tx, exact_dial_cancel_rx) = mpsc::unbounded_channel();
         let worker = Worker {
             swarm,
             commands: rx,
             cancels: cancel_rx,
+            exact_dial_cancels: exact_dial_cancel_rx,
             pending: HashMap::new(),
-            conn_paths: HashMap::new(),
+            pending_listens: HashMap::new(),
+            pending_exact_dials: HashMap::new(),
+            conn_routes: HashMap::new(),
         };
         let join = tokio::spawn(worker.run());
 
@@ -2463,6 +3260,7 @@ impl Node {
             handle: SwarmHandle {
                 tx,
                 cancels: cancel_tx,
+                exact_dial_cancels: exact_dial_cancel_tx,
                 control,
                 nar_protocol,
                 serve_slot,
@@ -2479,40 +3277,316 @@ impl Node {
 mod tests {
     use super::*;
 
-    // TASK-242: the direct-vs-relay classification of a peer's open-connection tally. The rule is
-    // direct-dominant so a hole-punched peer (a lingering circuit PLUS a fresh direct connection)
-    // reports `Direct`, and an entry with no connections collapses to `None` (== not connected).
-    // MUTATION: swapping the `direct`/`relayed` order (report `Relay` whenever a circuit exists,
-    // even alongside a direct link) reddens the mixed-tally `Direct` assertion; dropping the
-    // direct-dominance and returning `Relay` for `{direct:1, relayed:1}` fails the same line.
+    // TASK-242: derive aggregate status from the exact ConnectionId route SSOT. Direct remains
+    // dominant for a hole-punched peer with a lingering circuit, and no routes means disconnected.
     #[test]
-    fn conn_counts_classify_direct_dominant() {
-        assert_eq!(ConnCounts::default().path(), ConnPath::None);
+    fn exact_routes_classify_direct_dominant() {
+        assert_eq!(connection_path_from_routes(None), ConnPath::None);
+
+        let relay = PeerId::random();
+        let mut routes = HashMap::from([(
+            ConnectionId::new_unchecked(1),
+            ConnectionRoute::Relayed { relay },
+        )]);
+        assert_eq!(connection_path_from_routes(Some(&routes)), ConnPath::Relay);
+
+        routes.insert(ConnectionId::new_unchecked(2), ConnectionRoute::Direct);
+        assert_eq!(connection_path_from_routes(Some(&routes)), ConnPath::Direct);
+    }
+
+    /// TASK-219 route authority is current connection fact plus the exact offer-derived relay set.
+    /// MUTATIONS: accepting every relayed route fails the wrong-relay assertion; rejecting direct
+    /// fails the direct assertion. The integration overlap arm additionally bites peer-wide close.
+    #[test]
+    fn route_authorization_allows_direct_or_exact_relay_only() {
+        let signed_relay = PeerId::random();
+        let wrong_relay = PeerId::random();
+        let permitted = BTreeSet::from([signed_relay]);
+
+        assert!(connection_route_allowed(
+            &ConnectionRoute::Direct,
+            &permitted
+        ));
+        assert!(connection_route_allowed(
+            &ConnectionRoute::Relayed {
+                relay: signed_relay
+            },
+            &permitted
+        ));
+        assert!(!connection_route_allowed(
+            &ConnectionRoute::Relayed { relay: wrong_relay },
+            &permitted
+        ));
+        assert!(!connection_route_allowed(
+            &ConnectionRoute::RelayedUnknown,
+            &permitted
+        ));
+        assert!(connection_route_allowed(
+            &ConnectionRoute::Direct,
+            &BTreeSet::new()
+        ));
+    }
+
+    /// A live connection through R2 must not satisfy an offer authorizing only R1. When both
+    /// coexist, exact selection returns R1's ConnectionId; R2 remains in the ledger untouched.
+    #[test]
+    fn exact_selection_uses_authorized_relay_without_closing_conflicting_route() {
+        let r1 = PeerId::random();
+        let r2 = PeerId::random();
+        let r1_connection = ConnectionId::new_unchecked(11);
+        let r2_connection = ConnectionId::new_unchecked(12);
+        let routes = HashMap::from([
+            (r2_connection, ConnectionRoute::Relayed { relay: r2 }),
+            (r1_connection, ConnectionRoute::Relayed { relay: r1 }),
+        ]);
+
+        let selected = select_authorized_connection(Some(&routes), &BTreeSet::from([r1]))
+            .expect("R1 is live and authorized");
+        assert_eq!(selected.id, r1_connection);
+        assert_eq!(selected.route, ConnectionRoute::Relayed { relay: r1 });
         assert_eq!(
-            ConnCounts {
-                direct: 1,
-                relayed: 0
-            }
-            .path(),
-            ConnPath::Direct
+            routes.get(&r2_connection),
+            Some(&ConnectionRoute::Relayed { relay: r2 }),
+            "selection is read-only: conflicting R2 remains live for concurrent work"
+        );
+        assert!(
+            select_authorized_connection(Some(&routes), &BTreeSet::new()).is_none(),
+            "neither relayed connection is usable without an authorized hint"
+        );
+    }
+
+    /// Cancellation after command registration replaces the active authority with a tombstone.
+    /// A late success must request an exact close and must never enter the route ledger.
+    #[test]
+    fn cancelled_exact_dial_closes_late_success_without_route_admission() {
+        let peer = PeerId::random();
+        let connection = ConnectionId::new_unchecked(21);
+        let (reply, _receiver) = oneshot::channel::<Result<AuthorizedConnection, String>>();
+        let mut pending = HashMap::from([(
+            connection,
+            PendingExactDial::Active {
+                peer,
+                permitted_relays: BTreeSet::new(),
+                reply,
+            },
+        )]);
+        let mut routes = HashMap::new();
+
+        assert_eq!(
+            apply_exact_dial_cancel(&mut pending, &mut routes, peer, connection),
+            ExactDialCancelTransition::AwaitTerminal
+        );
+        assert!(matches!(
+            pending.get(&connection),
+            Some(PendingExactDial::Tombstone { peer: tombstoned_peer })
+                if *tombstoned_peer == peer
+        ));
+        assert_eq!(
+            apply_connection_established(
+                &mut pending,
+                &mut routes,
+                peer,
+                connection,
+                ConnectionRoute::Direct,
+            ),
+            ConnectionEstablishedTransition::Close(ExactConnectionCloseReason::Cancelled)
+        );
+        assert!(!pending.contains_key(&connection));
+        assert!(
+            routes.is_empty(),
+            "a cancelled late success is never admitted"
+        );
+    }
+
+    /// The cancellation channel and bounded command channel are independently selected. If the
+    /// cancel wins before the already-enqueued command, it sees no state; the later command's
+    /// closed waiter remains the authority and makes establishment close instead of admit.
+    #[test]
+    fn cancel_overtaking_exact_command_still_closes_late_success() {
+        let peer = PeerId::random();
+        let connection = ConnectionId::new_unchecked(22);
+        let mut pending = HashMap::new();
+        let mut routes = HashMap::new();
+
+        assert_eq!(
+            apply_exact_dial_cancel(&mut pending, &mut routes, peer, connection),
+            ExactDialCancelTransition::None
+        );
+
+        let (reply, receiver) = oneshot::channel::<Result<AuthorizedConnection, String>>();
+        drop(receiver);
+        pending.insert(
+            connection,
+            PendingExactDial::Active {
+                peer,
+                permitted_relays: BTreeSet::new(),
+                reply,
+            },
         );
         assert_eq!(
-            ConnCounts {
-                direct: 0,
-                relayed: 1
-            }
-            .path(),
-            ConnPath::Relay
+            apply_connection_established(
+                &mut pending,
+                &mut routes,
+                peer,
+                connection,
+                ConnectionRoute::Direct,
+            ),
+            ConnectionEstablishedTransition::Close(ExactConnectionCloseReason::WaiterGone)
         );
-        // A relayed circuit that dcutr upgraded (a direct connection now co-exists) is DIRECT.
+        assert!(
+            routes.is_empty(),
+            "the closed reply cannot authorize admission"
+        );
+    }
+
+    /// A success can linearize at reply delivery just before its cancel is observed. That cancel
+    /// removes and closes only the exact R2 connection; a conflicting live R1 route survives and
+    /// remains selectable for its own signed offer.
+    #[test]
+    fn cancel_after_success_removes_only_its_exact_connection() {
+        let provider = PeerId::random();
+        let r1 = PeerId::random();
+        let r2 = PeerId::random();
+        let r1_connection = ConnectionId::new_unchecked(23);
+        let r2_connection = ConnectionId::new_unchecked(24);
+        let mut routes = HashMap::from([(
+            provider,
+            HashMap::from([(r1_connection, ConnectionRoute::Relayed { relay: r1 })]),
+        )]);
+        let (reply, receiver) = oneshot::channel::<Result<AuthorizedConnection, String>>();
+        let mut pending = HashMap::from([(
+            r2_connection,
+            PendingExactDial::Active {
+                peer: provider,
+                permitted_relays: BTreeSet::from([r2]),
+                reply,
+            },
+        )]);
+
         assert_eq!(
-            ConnCounts {
-                direct: 1,
-                relayed: 1
-            }
-            .path(),
-            ConnPath::Direct
+            apply_connection_established(
+                &mut pending,
+                &mut routes,
+                provider,
+                r2_connection,
+                ConnectionRoute::Relayed { relay: r2 },
+            ),
+            ConnectionEstablishedTransition::Keep
         );
+        // `Keep` proves the success send linearized. Leave that buffered success unpolled, then
+        // model the timeout/drop racing immediately afterward: production has not consumed the
+        // reply and therefore has not disarmed its guard yet.
+        drop(receiver);
+        assert_eq!(
+            apply_exact_dial_cancel(&mut pending, &mut routes, provider, r2_connection),
+            ExactDialCancelTransition::Close
+        );
+        assert_eq!(
+            routes.get(&provider),
+            Some(&HashMap::from([(
+                r1_connection,
+                ConnectionRoute::Relayed { relay: r1 },
+            )])),
+            "cancelling R2 must preserve the concurrent R1 connection"
+        );
+        assert_eq!(
+            select_authorized_connection(routes.get(&provider), &BTreeSet::from([r1])),
+            Some(AuthorizedConnection {
+                id: r1_connection,
+                route: ConnectionRoute::Relayed { relay: r1 },
+            })
+        );
+    }
+
+    /// This is the former `is_closed`/`send` TOCTOU in isolation. Admission is conditional on the
+    /// authoritative send itself, so a receiver that closes immediately before that send yields
+    /// Close and leaves no derived route behind.
+    #[test]
+    fn closed_exact_waiter_send_failure_is_never_admitted() {
+        let peer = PeerId::random();
+        let relay = PeerId::random();
+        let connection = ConnectionId::new_unchecked(25);
+        let (reply, receiver) = oneshot::channel::<Result<AuthorizedConnection, String>>();
+        drop(receiver);
+        let mut pending = HashMap::from([(
+            connection,
+            PendingExactDial::Active {
+                peer,
+                permitted_relays: BTreeSet::from([relay]),
+                reply,
+            },
+        )]);
+        let mut routes = HashMap::new();
+
+        assert_eq!(
+            apply_connection_established(
+                &mut pending,
+                &mut routes,
+                peer,
+                connection,
+                ConnectionRoute::Relayed { relay },
+            ),
+            ConnectionEstablishedTransition::Close(ExactConnectionCloseReason::WaiterGone)
+        );
+        assert!(routes.is_empty());
+        assert!(!pending.contains_key(&connection));
+    }
+
+    /// Drop is the lossless cancellation boundary. An armed guard emits the exact peer/id once;
+    /// normal completion disarms it and emits nothing.
+    #[test]
+    fn exact_dial_cancel_guard_emits_only_while_armed() {
+        let peer = PeerId::random();
+        let armed_connection = ConnectionId::new_unchecked(26);
+        let disarmed_connection = ConnectionId::new_unchecked(27);
+        let (cancels, mut received) = mpsc::unbounded_channel();
+
+        let (armed_reply, armed_receiver) =
+            oneshot::channel::<Result<AuthorizedConnection, String>>();
+        {
+            let _armed =
+                CancelExactDialOnDrop::new(cancels.clone(), peer, armed_connection, armed_receiver);
+        }
+        assert!(
+            armed_reply.is_closed(),
+            "the reply receiver must close before cancellation becomes observable"
+        );
+        assert_eq!(received.try_recv(), Ok((peer, armed_connection)));
+
+        let (_disarmed_reply, disarmed_receiver) =
+            oneshot::channel::<Result<AuthorizedConnection, String>>();
+        {
+            let mut disarmed =
+                CancelExactDialOnDrop::new(cancels, peer, disarmed_connection, disarmed_receiver);
+            disarmed.disarm();
+        }
+        assert!(matches!(
+            received.try_recv(),
+            Err(mpsc::error::TryRecvError::Disconnected)
+        ));
+    }
+
+    /// Only the `/p2p/<relay>` component immediately before `/p2p-circuit` is authority.
+    /// Some other PeerId elsewhere in an address must not be guessed as the relay.
+    #[test]
+    fn circuit_relay_parser_requires_the_immediate_peer_component() {
+        let relay = PeerId::random();
+        let provider = PeerId::random();
+        let valid: Multiaddr =
+            format!("/ip4/127.0.0.1/tcp/4001/p2p/{relay}/p2p-circuit/p2p/{provider}")
+                .parse()
+                .unwrap();
+        assert_eq!(circuit_relay_peer(&valid), Some(relay));
+
+        let missing: Multiaddr = format!("/ip4/127.0.0.1/tcp/4001/p2p-circuit/p2p/{provider}")
+            .parse()
+            .unwrap();
+        assert_eq!(circuit_relay_peer(&missing), None);
+
+        let non_adjacent: Multiaddr = format!("/p2p/{relay}/tcp/4001/p2p-circuit/p2p/{provider}")
+            .parse()
+            .unwrap();
+        assert_eq!(circuit_relay_peer(&non_adjacent), None);
     }
 
     // The pure near-key mapping (TASK-174), deterministic and network-free. The

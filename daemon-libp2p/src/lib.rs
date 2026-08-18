@@ -38,8 +38,8 @@ use std::time::{Duration, Instant};
 use async_trait::async_trait;
 
 use fabric_libp2p::{
-    ANNOUNCE_SEQ_FILENAME, ConnPath, Libp2pNarSupplier, Multiaddr, NodeConfig,
-    PROVIDER_FLOOR_FILENAME, PeerId, SwarmHandle,
+    ANNOUNCE_SEQ_FILENAME, ConnPath, DEFAULT_LISTEN_READY_TIMEOUT, Libp2pNarSupplier, Multiaddr,
+    NodeConfig, PROVIDER_FLOOR_FILENAME, PeerId, SwarmHandle, relay_hints_from_circuit_addresses,
 };
 // `Libp2pFabric` is used in several places under its bare name; keep it a separate line so the
 // status-facts wiring above can re-order without churn.
@@ -49,7 +49,7 @@ use ed25519_dalek::SigningKey;
 use peer_fabric::{
     AdmitAllPublication, AnnounceBudget, AnnounceError, Axis, Blake3Digest, ContentKey,
     DiscoveryBudget, IneligibleReason, NodeId, PeerFabric, ProviderRecord, PublicationEligibility,
-    RefusePublication, SafetyEnvelope, TransportOffer, TransportTag, require_axes,
+    RefusePublication, RelayHints, SafetyEnvelope, TransportOffer, TransportTag, require_axes,
     sign_provider_record,
 };
 
@@ -93,6 +93,13 @@ pub struct Libp2pSourceConfig {
     pub network_scope: String,
     /// The multiaddr to listen on, if any (a pure dial-out consumer may omit it).
     pub listen: Option<Multiaddr>,
+    /// Additional listeners installed in the same shared startup transaction as [`Self::listen`].
+    /// All listener registrations are issued before awaiting any readiness event and share one
+    /// absolute timeout, so multiple relay reservations do not serialize their startup budgets.
+    pub additional_listens: Vec<Multiaddr>,
+    /// Addresses this node explicitly advertises as externally reachable. These are applied by
+    /// the shared construction path for both binaries before any provider readiness token exists.
+    pub external_addresses: Vec<Multiaddr>,
     /// kad bootstrap/entry peers (`PeerId` + dial `Multiaddr`). MUST be non-empty for
     /// discovery to work - an empty set is a consumer that can never find anyone.
     pub bootstrap: Vec<(PeerId, Multiaddr)>,
@@ -144,6 +151,79 @@ pub struct Libp2pSourceConfig {
     pub kad_server: bool,
 }
 
+/// Proof that a provider was built through the shared listener configuration path. Fields are
+/// private so callers cannot mint or alter the configured reservation set. Every initial batch
+/// announce door requires this token and captures one live snapshot through it after content /
+/// allowlist verification, immediately before signing the batch.
+#[derive(Debug, Clone)]
+pub struct ProviderRelayReadiness {
+    provider: NodeId,
+    requested: RelayHints,
+}
+
+/// Immutable inputs shared by every initial provider-record batch. Grouping the signing identity,
+/// validity window, observation time, and announce budget keeps the four readiness-gated doors on
+/// one data contract as their capabilities evolve.
+#[derive(Debug, Clone, Copy)]
+pub struct InitialAnnounceConfig<'a> {
+    identity_seed: [u8; 32],
+    ttl_secs: u64,
+    now: u64,
+    budget: &'a AnnounceBudget,
+}
+
+impl<'a> InitialAnnounceConfig<'a> {
+    pub fn new(
+        identity_seed: [u8; 32],
+        ttl_secs: u64,
+        now: u64,
+        budget: &'a AnnounceBudget,
+    ) -> Self {
+        Self {
+            identity_seed,
+            ttl_secs,
+            now,
+            budget,
+        }
+    }
+}
+
+impl ProviderRelayReadiness {
+    fn from_config(fabric: &Libp2pFabric, cfg: &Libp2pSourceConfig) -> Result<Self, String> {
+        let listeners: Vec<Multiaddr> = cfg
+            .listen
+            .iter()
+            .chain(cfg.additional_listens.iter())
+            .cloned()
+            .collect();
+        let requested = relay_hints_from_circuit_addresses(fabric.node_id(), &listeners)
+            .map_err(|error| format!("invalid configured libp2p circuit listener set: {error}"))?;
+        Ok(Self {
+            provider: fabric.node_id(),
+            requested,
+        })
+    }
+
+    async fn capture(&self, fabric: &Libp2pFabric) -> Result<RelayHints, String> {
+        if fabric.node_id() != self.provider {
+            return Err(format!(
+                "provider relay-readiness token belongs to {}, not {}",
+                self.provider,
+                fabric.node_id()
+            ));
+        }
+        fabric
+            .wait_for_live_relay_hints(self.requested, DEFAULT_LISTEN_READY_TIMEOUT)
+            .await
+            .map_err(|error| {
+                format!(
+                    "relay reservation readiness failed before initial announce: {error}; \
+                     refusing to announce configured/attempted relays as live"
+                )
+            })
+    }
+}
+
 /// Build the PRODUCTION libp2p [`NarSource`] from `cfg`: start a [`Libp2pFabric`],
 /// bind the listener, join the DHT through the configured bootstrap peers (kad
 /// self-lookup), seed any OPTIONAL `provider_addrs` into the kad routing table (normally
@@ -180,10 +260,13 @@ pub async fn build_libp2p_nar_source(
 /// answer inbound NAR requests. It runs the SAME connectivity join as the consumer
 /// builder ([`start_and_join_libp2p`]), so a serving node is reachable in the DHT, and
 /// returns the running fabric PLUS its own consumer source/raw-serve (a provider is also
-/// a consumer - it can discover+fetch what it does not hold). The composition root then
-/// installs the serve gate (`fabric.server().serve(budget)`) and announces the signed
-/// provider records; that stays in the caller because the records are minted from the
-/// caller's seed catalog (raw NAR + its NarHash), which the fabric does not know.
+/// a consumer - it can discover+fetch what it does not hold) and a fourth
+/// [`ProviderRelayReadiness`] token. All initial announce doors require that private-field token,
+/// revalidate requested reservations, and capture one live relay-hint snapshot immediately before
+/// signing their batch. The composition root installs the serve gate
+/// (`fabric.server().serve(budget)`) and announces the signed provider records; that stays in the
+/// caller because the records are minted from the caller's seed catalog (raw NAR + its NarHash),
+/// which the fabric does not know.
 ///
 /// ONE fabric serves AND consumes on ONE identity/listen, so there is no second
 /// same-identity swarm to collide with (the footgun a separate provider node would
@@ -198,6 +281,7 @@ pub async fn build_libp2p_provider_source(
         Arc<Libp2pFabric>,
         Arc<dyn NarSource>,
         Arc<dyn RawServeDecision>,
+        ProviderRelayReadiness,
     ),
     String,
 > {
@@ -227,7 +311,9 @@ pub async fn build_libp2p_provider_source(
         }
     }
 
-    Ok(wrap_consumer_source(fabric, &cfg))
+    let readiness = ProviderRelayReadiness::from_config(&fabric, &cfg)?;
+    let (fabric, source, raw_serve) = wrap_consumer_source(fabric, &cfg);
+    Ok((fabric, source, raw_serve, readiness))
 }
 
 /// Build + SIGN a [`ProviderRecord`] for one seeded NAR (TASK-178), signed by the node's
@@ -237,8 +323,9 @@ pub async fn build_libp2p_provider_source(
 /// load-bearing. The discovery [`ContentKey`] is derived from the Nix `NarHash`, so a
 /// consumer that derived the SAME key from a narinfo discovers this provider; the
 /// `content` [`Blake3Digest`] is the raw NAR's hash, the axis the transfer/serve keys on
-/// and gate-1 BLAKE3-verifies. The lone offer carries the native libp2p tag with an
-/// empty bounded relay-hint set; TASK-219 will populate it from live reservations.
+/// and gate-1 BLAKE3-verifies. The lone offer carries the native libp2p tag and the
+/// caller's canonical `relay_hints`, derived from the fabric's live listener set immediately
+/// before this function is called.
 ///
 /// This is the SINGLE SOURCE OF TRUTH for a provider record's construction: the daemon
 /// binary's `--libp2p-provider` path and the integration test both mint records here, so
@@ -256,6 +343,7 @@ pub fn sign_libp2p_provider_record(
     seed: [u8; 32],
     nar_hash: &NarHashKey,
     nar_bytes: &[u8],
+    relay_hints: RelayHints,
     ttl_secs: u64,
     now: u64,
     sequence: u64,
@@ -268,6 +356,7 @@ pub fn sign_libp2p_provider_record(
         seed,
         nar_hash,
         Blake3Digest::from_raw_nar(nar_bytes),
+        relay_hints,
         ttl_secs,
         now,
         sequence,
@@ -285,11 +374,20 @@ pub fn sign_libp2p_store_record(
     seed: [u8; 32],
     nar_hash: &NarHashKey,
     content: Blake3Digest,
+    relay_hints: RelayHints,
     ttl_secs: u64,
     now: u64,
     sequence: u64,
 ) -> ProviderRecord {
-    sign_libp2p_record_for_content(seed, nar_hash, content, ttl_secs, now, sequence)
+    sign_libp2p_record_for_content(
+        seed,
+        nar_hash,
+        content,
+        relay_hints,
+        ttl_secs,
+        now,
+        sequence,
+    )
 }
 
 /// The SINGLE record recipe both the seed (Memory) and store (dump-on-demand) announce paths
@@ -301,6 +399,7 @@ fn sign_libp2p_record_for_content(
     seed: [u8; 32],
     nar_hash: &NarHashKey,
     content: Blake3Digest,
+    relay_hints: RelayHints,
     ttl_secs: u64,
     now: u64,
     sequence: u64,
@@ -312,7 +411,10 @@ fn sign_libp2p_record_for_content(
         key,
         content,
         provider,
-        offers: vec![TransportOffer::libp2p(provider)],
+        offers: vec![TransportOffer::Libp2p {
+            node: provider,
+            relay_hints,
+        }],
         sequence,
         issued_at: now,
         expiry: now + ttl_secs,
@@ -586,27 +688,16 @@ pub fn resolve_durable_identity_seed(
 /// after the bootstrap guard refuses a bootstrapped announce without a configured allowlist.
 pub async fn announce_provider_seeds(
     fabric: &Libp2pFabric,
-    identity_seed: [u8; 32],
+    readiness: &ProviderRelayReadiness,
+    config: InitialAnnounceConfig<'_>,
     seeds: &[(NarHashKey, Vec<u8>)],
     _lan: LanShare,
-    ttl_secs: u64,
-    now: u64,
-    budget: &AnnounceBudget,
 ) -> Result<Vec<ProviderRecord>, String> {
     // LAN door (AC#3): the witness is minted via an EXPLICIT AdmitAllPublication - NOT
     // allowlist-gated. On a PUBLIC-reachable node the fabric's OWN authority (allowlist or
     // RefusePublication) still refuses at the adapter, so this permissive witness does not open a
     // bypass; on a genuinely-isolated node the fabric's AdmitAll authority admits.
-    announce_seed_records(
-        fabric,
-        identity_seed,
-        seeds,
-        &AdmitAllPublication,
-        ttl_secs,
-        now,
-        budget,
-    )
-    .await
+    announce_seed_records(fabric, readiness, config, seeds, &AdmitAllPublication).await
 }
 
 /// The shared raw-seed announce loop: TASK-56-verify every seed, then per key
@@ -617,12 +708,10 @@ pub async fn announce_provider_seeds(
 /// signs the exact same record a LAN one would.
 async fn announce_seed_records(
     fabric: &Libp2pFabric,
-    identity_seed: [u8; 32],
+    readiness: &ProviderRelayReadiness,
+    config: InitialAnnounceConfig<'_>,
     seeds: &[(NarHashKey, Vec<u8>)],
     witness_authority: &dyn PublicationEligibility,
-    ttl_secs: u64,
-    now: u64,
-    budget: &AnnounceBudget,
 ) -> Result<Vec<ProviderRecord>, String> {
     // TASK-56: verify every seed's bytes hash to its declared NarHash BEFORE signing or
     // announcing ANY record. This is the shipped SSOT where the provider CLAIM is minted
@@ -634,13 +723,24 @@ async fn announce_seed_records(
     let announcer = fabric
         .announcer()
         .ok_or_else(|| "internal: libp2p provider fabric exposes no announcer".to_string())?;
+    // Capture exactly once, after the all-or-nothing content verification and immediately before
+    // the initial signing loop. Every record in this batch therefore states the same verified
+    // startup route set, including an empty batch (which still crosses the readiness barrier).
+    let relay_hints = readiness.capture(fabric).await?;
     let mut records = Vec::with_capacity(seeds.len());
     for (nar_hash, bytes) in seeds {
         // Allocate the durable sequence, then sign, then announce - in that order, per key
         // (the allocation is a non-reserving read finalised by announce's save-before-publish).
         let sequence = fabric.next_announce_sequence(&provider_content_key(nar_hash));
-        let record =
-            sign_libp2p_provider_record(identity_seed, nar_hash, bytes, ttl_secs, now, sequence);
+        let record = sign_libp2p_provider_record(
+            config.identity_seed,
+            nar_hash,
+            bytes,
+            relay_hints,
+            config.ttl_secs,
+            config.now,
+            sequence,
+        );
         // TASK-231 (AC#1): mint the eligibility witness for THIS path's authority (AdmitAll for
         // the LAN door, the allowlist for the public door), then hand it to `announce`. The
         // announcer ALSO re-checks with its own per-fabric authority, so a public node still
@@ -649,7 +749,7 @@ async fn announce_seed_records(
             format!("publication eligibility refused libp2p seed record for {nar_hash}: {e}")
         })?;
         announcer
-            .announce(&witness, budget)
+            .announce(&witness, config.budget)
             .await
             .map_err(|e| format!("announcing libp2p provider record for {nar_hash}: {e}"))?;
         records.push(record);
@@ -987,25 +1087,27 @@ fn allowlist_admits(
 /// (via [`sign_libp2p_store_record`]), and publishes it under `budget`.
 async fn announce_store_records(
     fabric: &Libp2pFabric,
-    identity_seed: [u8; 32],
+    readiness: &ProviderRelayReadiness,
+    config: InitialAnnounceConfig<'_>,
     provisions: &[StoreProvision],
     witness_authority: &dyn PublicationEligibility,
-    ttl_secs: u64,
-    now: u64,
-    budget: &AnnounceBudget,
 ) -> Result<Vec<ProviderRecord>, String> {
     let announcer = fabric
         .announcer()
         .ok_or_else(|| "internal: libp2p provider fabric exposes no announcer".to_string())?;
+    // StoreProvision is already the verified capability. Capture one live startup snapshot before
+    // entering the initial batch loop; do this even for an empty provision batch.
+    let relay_hints = readiness.capture(fabric).await?;
     let mut records = Vec::with_capacity(provisions.len());
     for provision in provisions {
         let sequence = fabric.next_announce_sequence(&provider_content_key(&provision.nar_hash));
         let record = sign_libp2p_store_record(
-            identity_seed,
+            config.identity_seed,
             &provision.nar_hash,
             provision.content,
-            ttl_secs,
-            now,
+            relay_hints,
+            config.ttl_secs,
+            config.now,
             sequence,
         );
         // TASK-231 (AC#1): mint this path's eligibility witness (see `announce_seed_records`).
@@ -1015,12 +1117,15 @@ async fn announce_store_records(
                 provision.nar_hash
             )
         })?;
-        announcer.announce(&witness, budget).await.map_err(|e| {
-            format!(
-                "announcing libp2p store provider record for {}: {e}",
-                provision.nar_hash
-            )
-        })?;
+        announcer
+            .announce(&witness, config.budget)
+            .await
+            .map_err(|e| {
+                format!(
+                    "announcing libp2p store provider record for {}: {e}",
+                    provision.nar_hash
+                )
+            })?;
         records.push(record);
     }
     Ok(records)
@@ -1038,24 +1143,13 @@ async fn announce_store_records(
 /// len + BLAKE3 recheck (TASK-158/193) as the last-line integrity anchor.
 pub async fn announce_store_provisions(
     fabric: &Libp2pFabric,
-    identity_seed: [u8; 32],
+    readiness: &ProviderRelayReadiness,
+    config: InitialAnnounceConfig<'_>,
     provisions: &[StoreProvision],
     _lan: LanShare,
-    ttl_secs: u64,
-    now: u64,
-    budget: &AnnounceBudget,
 ) -> Result<Vec<ProviderRecord>, String> {
     // LAN door (AC#3): AdmitAll witness, as `announce_provider_seeds`.
-    announce_store_records(
-        fabric,
-        identity_seed,
-        provisions,
-        &AdmitAllPublication,
-        ttl_secs,
-        now,
-        budget,
-    )
-    .await
+    announce_store_records(fabric, readiness, config, provisions, &AdmitAllPublication).await
 }
 
 // -------------------------------------------------------------------------
@@ -1114,27 +1208,16 @@ pub fn approve_provisions_for_public(
 /// operator-provided paths by proving each public via the same narinfo-signature gate.
 pub async fn announce_public_provisions(
     fabric: &Libp2pFabric,
-    identity_seed: [u8; 32],
+    readiness: &ProviderRelayReadiness,
+    config: InitialAnnounceConfig<'_>,
     provisions: &[StoreProvision],
     allowlist: &PublicNarAllowlist,
-    ttl_secs: u64,
-    now: u64,
-    budget: &AnnounceBudget,
 ) -> Result<Vec<ProviderRecord>, String> {
     // THE GATE (fail-closed, before any record is signed or announced): every provision must be
     // allowlisted, minting a claim-bearing capability, or the whole public announce is refused.
     let approved = approve_provisions_for_public(provisions, allowlist)
         .map_err(|rejected| format!("public announce refused by the allowlist gate: {rejected}"))?;
-    announce_approved_public(
-        fabric,
-        identity_seed,
-        &approved,
-        allowlist,
-        ttl_secs,
-        now,
-        budget,
-    )
-    .await
+    announce_approved_public(fabric, readiness, config, &approved, allowlist).await
 }
 
 /// Announce a record per [`ApprovedPublicProvision`], the PUBLIC counterpart of
@@ -1143,12 +1226,10 @@ pub async fn announce_public_provisions(
 /// `allowlist` (AC#2/#3): allowlist-gated, distinct from the LAN path's AdmitAll witness.
 async fn announce_approved_public(
     fabric: &Libp2pFabric,
-    identity_seed: [u8; 32],
+    readiness: &ProviderRelayReadiness,
+    config: InitialAnnounceConfig<'_>,
     approved: &[ApprovedPublicProvision],
     allowlist: &PublicNarAllowlist,
-    ttl_secs: u64,
-    now: u64,
-    budget: &AnnounceBudget,
 ) -> Result<Vec<ProviderRecord>, String> {
     let provisions: Vec<StoreProvision> = approved
         .iter()
@@ -1160,12 +1241,10 @@ async fn announce_approved_public(
         .collect();
     announce_store_records(
         fabric,
-        identity_seed,
+        readiness,
+        config,
         &provisions,
         &AllowlistWitnessAuthority { allowlist },
-        ttl_secs,
-        now,
-        budget,
     )
     .await
 }
@@ -1541,10 +1620,19 @@ impl GrowWorker {
         let sequence = self
             .fabric
             .next_announce_sequence(&provider_content_key(provision.nar_hash()));
+        let relay_hints = match self.fabric.live_relay_hints().await {
+            Ok(hints) => hints,
+            Err(error) => {
+                return AnnounceAttempt::CleanFailure(format!(
+                    "cannot derive live relay hints before signing: {error}"
+                ));
+            }
+        };
         let record = sign_libp2p_store_record(
             self.identity_seed,
             provision.nar_hash(),
             provision.content(),
+            relay_hints,
             self.ttl_secs,
             now,
             sequence,
@@ -1961,12 +2049,10 @@ pub fn approve_seeds_for_public(
 /// claim UNREPRESENTABLE - there is no bare-seed public entry point.
 pub async fn announce_public_seeds(
     fabric: &Libp2pFabric,
-    identity_seed: [u8; 32],
+    readiness: &ProviderRelayReadiness,
+    config: InitialAnnounceConfig<'_>,
     seeds: &[(NarHashKey, Vec<u8>)],
     allowlist: &PublicNarAllowlist,
-    ttl_secs: u64,
-    now: u64,
-    budget: &AnnounceBudget,
 ) -> Result<Vec<ProviderRecord>, String> {
     // THE GATE (fail-closed, before any record is signed or announced): every seed must be
     // allowlisted, minting a claim-bearing capability, or the whole public announce is refused.
@@ -1985,12 +2071,10 @@ pub async fn announce_public_seeds(
     // from the LAN door's AdmitAll witness.
     announce_seed_records(
         fabric,
-        identity_seed,
+        readiness,
+        config,
         &approved_seeds,
         &AllowlistWitnessAuthority { allowlist },
-        ttl_secs,
-        now,
-        budget,
     )
     .await
 }
@@ -2113,13 +2197,10 @@ async fn start_and_join_libp2p(
         // CONSUMER passes RefusePublication (it never announces); a PROVIDER injects the
         // allowlist-backed (public) or AdmitAll (isolated-LAN) decision from the composition root.
         .with_publication_eligibility(publication_eligibility);
-    // TASK-218: teach the node-locator the relays this node knows from bootstrap config,
-    // so a discovery-only consumer can CONSTRUCT a NAT'd provider's /p2p-circuit
-    // dial-address (<relayAddr>/p2p/<relayPeer>/p2p-circuit/p2p/<providerPeer>) from the
-    // provider PeerId it discovered via kad plus a bootstrap-known relay. A bootstrap peer
-    // IS the relay a NAT'd provider reserves on in the shipped topology; this is permitted
-    // config, NOT out-of-band provider-address injection (the provider identity still comes
-    // ONLY from kad get_providers). See NodeConfig::known_relays for the generality limit.
+    // TASK-218 rollout fallback: keep bootstrap relays as a flat, provider-independent set.
+    // TASK-219's primary path instead takes the provider->relay binding from the exact signed
+    // offer and resolves that relay's direct address through raw kad. This config is consulted
+    // only for an actually empty legacy hint set; it is not an out-of-band provider-address map.
     for (peer, addr) in &cfg.bootstrap {
         node_config = node_config.with_known_relay(*peer, addr.clone());
     }
@@ -2159,13 +2240,7 @@ async fn start_and_join_libp2p(
         format!("libp2p fabric does not satisfy the required axes for this profile: {missing}")
     })?;
 
-    if let Some(listen) = &cfg.listen {
-        fabric
-            .handle()
-            .listen(listen.clone())
-            .await
-            .map_err(|e| format!("libp2p listen on {listen} failed: {e}"))?;
-    }
+    configure_swarm_addresses(fabric.as_ref(), cfg, DEFAULT_LISTEN_READY_TIMEOUT).await?;
 
     // Join the DHT through the bootstrap peers: add_address seeds kad's routing table
     // (so the subsequent bootstrap self-lookup has a peer to query) and dial opens the
@@ -2220,6 +2295,114 @@ async fn start_and_join_libp2p(
     }
 
     Ok(fabric)
+}
+
+/// Apply the complete listener/external-address set shared by both binaries. Factored only so a
+/// fast test can inject a short integer bound; production always passes
+/// [`DEFAULT_LISTEN_READY_TIMEOUT`].
+async fn configure_swarm_addresses(
+    fabric: &Libp2pFabric,
+    cfg: &Libp2pSourceConfig,
+    timeout: Duration,
+) -> Result<(), String> {
+    // Apply external self-advertisements before listener registration, then register EVERY
+    // listener before waiting for any one. `listen_many` correlates readiness by ListenerId and
+    // uses one absolute timeout, including circuit reservation acceptance.
+    for external in &cfg.external_addresses {
+        fabric.handle().add_external_address(external.clone()).await;
+    }
+    let listeners: Vec<Multiaddr> = cfg
+        .listen
+        .iter()
+        .chain(cfg.additional_listens.iter())
+        .cloned()
+        .collect();
+    if !listeners.is_empty() {
+        fabric
+            .handle()
+            .listen_many(listeners.clone(), timeout)
+            .await
+            .map_err(|error| {
+                let requested = listeners
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                format!("libp2p listener readiness failed for [{requested}]: {error}")
+            })?;
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod provider_relay_readiness_tests {
+    use super::*;
+    use fabric_libp2p::Protocol;
+
+    /// Shared-construction negative: a circuit listener pointed at a peer with its relay server
+    /// disabled never becomes publication truth. A correlated terminal close may fail immediately;
+    /// otherwise the one absolute injected bound stops startup promptly. Both binaries are covered
+    /// because both call `start_and_join_libp2p`, whose sole address path is this helper.
+    #[tokio::test]
+    async fn provider_startup_refuses_a_requested_but_unaccepted_reservation() {
+        let scope = "task219-shared-provider-readiness-refusal";
+        let relay = Libp2pFabric::start(
+            NodeConfig::new([201u8; 32])
+                .with_network_scope(scope)
+                .with_relay_server(false),
+        )
+        .expect("non-relaying kad node starts");
+        relay
+            .handle()
+            .listen("/ip4/127.0.0.1/tcp/0".parse().unwrap())
+            .await
+            .expect("non-relaying peer binds a direct address");
+        let relay_address = relay
+            .handle()
+            .listen_addrs()
+            .await
+            .into_iter()
+            .find(|address| address.iter().any(|part| matches!(part, Protocol::Tcp(_))))
+            .expect("direct listener has a concrete TCP address");
+
+        let provider = Libp2pFabric::start(NodeConfig::new([202u8; 32]).with_network_scope(scope))
+            .expect("provider fabric starts");
+        let circuit_listener = relay_address
+            .with(Protocol::P2p(relay.peer_id()))
+            .with(Protocol::P2pCircuit);
+        let cfg = Libp2pSourceConfig {
+            identity_seed: [202u8; 32],
+            network_scope: scope.to_string(),
+            listen: Some(circuit_listener),
+            additional_listens: Vec::new(),
+            external_addresses: Vec::new(),
+            bootstrap: Vec::new(),
+            provider_addrs: Vec::new(),
+            discovery_budget: DiscoveryBudget::default(),
+            envelope: SafetyEnvelope::default(),
+            state_dir: None,
+            relay_server_enabled: true,
+            kad_server: true,
+        };
+
+        let bound = Duration::from_millis(250);
+        let started = tokio::time::Instant::now();
+        let error = configure_swarm_addresses(&provider, &cfg, bound)
+            .await
+            .expect_err("startup must refuse an unaccepted reservation");
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "readiness refusal exceeded its injected bound: {:?}",
+            started.elapsed()
+        );
+        let correlated_terminal_close = error.contains("closed before NewListenAddr");
+        let bounded_timeout = error.contains("did not emit NewListenAddr");
+        assert!(
+            error.contains("listener readiness failed")
+                && (correlated_terminal_close || bounded_timeout),
+            "failure must identify either the correlated terminal close or readiness timeout: {error}"
+        );
+    }
 }
 
 /// The LIVE swarm-facts provider for the operator status surface (TASK-240/242). It answers the

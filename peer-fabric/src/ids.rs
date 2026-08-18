@@ -482,8 +482,8 @@ pub struct RelayHints {
 }
 
 impl RelayHints {
-    /// No relay hints. Production writers use this until live reservation truth is
-    /// wired by TASK-219.
+    /// No relay hints. This is the direct-provider and rollout-compatibility shape;
+    /// relay-using production writers derive hints from their live accepted reservations.
     pub const fn empty() -> Self {
         RelayHints {
             nodes: [NodeId::from_bytes([0; NODE_ID_LEN]); MAX_LIBP2P_RELAY_HINTS],
@@ -583,8 +583,8 @@ pub enum TransportOffer {
 }
 
 impl TransportOffer {
-    /// A direct libp2p locator with no relay hints. This is the TASK-156 production
-    /// writer shape until TASK-219 derives live reservation identities.
+    /// A direct libp2p locator with no relay hints. Relay-using production writers use the
+    /// explicit `Libp2p { node, relay_hints }` shape after deriving current live reservations.
     pub const fn libp2p(node: NodeId) -> Self {
         TransportOffer::Libp2p {
             node,

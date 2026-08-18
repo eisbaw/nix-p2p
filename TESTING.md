@@ -100,6 +100,24 @@ Gates (all must pass; `just` recipes are the canonical entry points):
    the layout, validates strict bounded relay identities, verifies signatures with
    a pure-Python RFC 8032 implementation, and proves a historical v1 reader returns
    `UnknownOffer` rather than silently dropping tag 2.
+   TASK-219's runtime proof is
+   `cargo test --locked -p daemon-libp2p --test multi_relay_hints -- --nocapture`:
+   C bootstraps only through R1, P has only a live reservation on R2, and the shipped
+   writer/reader fetches the exact NAR after resolving the signed R2 identity through
+   raw kad with no provider/relay address injection. The same test bites empty and
+   wrong hints while proving ambient R2 remains live but unusable, R2 loss after a warm
+   fetch without fallback to live R1, two hints with one dead, the at-most-two lookup
+   bound, two overlapping streams through the same authorized R2 connection, and
+   simultaneous R2-only/R1-only streams whose outcomes follow their exact connection
+   when R2 is severed. `direct_listener_readiness_wait_is_bounded` separately proves
+   successful direct-listener readiness is event-correlated and externally bounded;
+   `provider_startup_refuses_a_requested_but_unaccepted_reservation` proves the shared
+   construction used by both binaries fails closed, by correlated terminal close or bounded
+   timeout, when a requested relay reservation is not accepted. The production multi-relay
+   path crosses the provider builder's private readiness token before its initial signed batch.
+   `scripts/check-discovery-no-shortcut.py --self-test` permits only the exact bounded
+   signed `RelayHints` association and mutation-proves that auxiliary provider-keyed
+   relay maps/caches still fail the structural guard.
 4. `just e2e` — container harness, FAST subset: five scenarios, one
    per distinct path (S1 byte/counts, S2 fallback, the tamper-narhash
    safety bite, depth-3 chain composition, S6 p2p). Sized for the

@@ -21,21 +21,19 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use libp2p::Multiaddr;
-
 use peer_fabric::{
-    Blake3Digest, Lookup, NarTransfer, NodeLocator, RelayHints, ResolutionPolicy, SafetyEnvelope,
-    TransferError, TransportOffer, TransportTag,
+    Blake3Digest, Lookup, NarTransfer, RelayHints, SafetyEnvelope, TransferError, TransportOffer,
+    TransportTag,
 };
 
 use crate::keys::peer_id_of_provider;
 use crate::locator::Libp2pNodeLocator;
-use crate::swarm::{FetchOutcome, SwarmHandle};
+use crate::swarm::{FetchOutcome, NarFetchRequest, SwarmHandle};
 
 /// The libp2p [`NarTransfer`]. Holds a [`SwarmHandle`] to drive the shared swarm's NAR
-/// request-response protocol, and the in-fabric [`Libp2pNodeLocator`] so the dial is
-/// driven by an EXPLICIT DHT resolution (TASK-169), never by whatever addresses an
-/// earlier, unrelated query happened to leave in the shared routing table.
+/// request-response protocol, and the in-fabric [`Libp2pNodeLocator`] so every dial is
+/// driven by the current offer plus explicit DHT resolution, never by an unqualified
+/// provider address an earlier query happened to leave in the shared routing table.
 pub struct Libp2pTransport {
     handle: SwarmHandle,
     /// The SAME locator instance the fabric exposes on its `node_locator()` axis (a
@@ -76,47 +74,26 @@ impl NarTransfer for Libp2pTransport {
                 });
             }
         };
-        // TASK-156 freezes and authenticates the final relay-hint wire shape, while
-        // TASK-219 owns deriving live hints and resolving them through kad. Writers in
-        // this cycle emit none. A record from a newer coordinated writer may carry
-        // validated hints; this reader still tries the provider's ordinary kad-resolved
-        // addresses and falls back normally if unreachable. It never treats hint bytes
-        // as addresses or silently truncates them.
-        if !relay_hints.is_empty() {
-            tracing::debug!(
-                provider = %node,
-                relay_hint_count = relay_hints.len(),
-                "fabric-libp2p: signed relay hints present; TASK-156 reader uses the direct kad locator path"
-            );
-        }
         let peer = peer_id_of_provider(&node).ok_or_else(|| {
             TransferError::Unavailable(format!(
                 "provider {node} is not a valid ed25519 peer id, cannot dial over libp2p"
             ))
         })?;
 
-        // TASK-169: resolve WHERE the provider is dialable THROUGH the DHT (kad
-        // peer-routing) and seed this resolution's address(es) into the swarm's kad routing
-        // table EXPLICITLY before dialing. This is the root-cause fix for the rejected
-        // side-effect design (the daemon calling locate() only for its routing-table side
-        // effect and discarding the DialInfo): the resolve-then-dial now lives INSIDE the
-        // fabric, where the `DialInfo` is allowed to be (the seam keeps it out of the
-        // serving layer), and the address is fed to the dial EXPLICITLY rather than left to
-        // whatever an earlier query incidentally populated. `add_address` of a DHT-RESOLVED
-        // address is NOT injection - it came from the DHT, not the caller - and the shared
-        // locator records the OurNodeId->DhtNode disclosure to the fabric ledger.
+        // Resolve WHERE the provider is dialable inside the fabric. The locator first queries the
+        // provider through raw kad and retains only direct coordinates. A reachable direct route
+        // wins and performs no relay-hint queries. Otherwise it reads the exact offer's bounded,
+        // signature-bound RelayHints, resolves each relay address through raw kad, and constructs
+        // transient circuit candidates; the provider-independent known-relay set is rollout-only
+        // fallback for an actually empty legacy hint set. No caller injects the provider or relay
+        // address.
         //
-        // HONEST LIMIT (carried to TASK-161): `add_address` feeds the SAME shared kad
-        // routing table that prior queries also feed, and `fetch_nar` auto-dials off that
-        // shared table - so on a small loopback DHT the request-response fetch can reuse a
-        // connection an earlier discovery query already opened to the provider, and the
-        // byte path cannot attribute the dial to THIS resolution. What is established here:
-        // no address was injected out of band, resolution is CONSULTED before every dial,
-        // and a failed resolution refuses the dial. A Miss (healthy, no address known), an
-        // Unavailable (could-not-consult / empty routing), or a Found whose addresses are
-        // all unparseable all map to a typed `Unavailable` so the fetch driver falls
-        // through to the next offer/record (ultimately upstream) rather than silently
-        // dialing on stale routing state.
+        // Neither direct nor circuit candidates enter kad: exact DialOpts carry them for this one
+        // route establishment, and the resulting ConnectionId's observed route is checked against
+        // current offer authority. This prevents an ambient unsigned circuit from satisfying the
+        // request while preserving every unrelated connection for concurrent transfers.
+        // Miss/Unavailable fail verbosely so the fetch driver can continue to another offer or
+        // upstream.
         //
         // Resolution runs per FETCH (i.e. per offer), so a record with N libp2p offers
         // would record N OurNodeId disclosures for the same provider; libp2p is one offer
@@ -133,107 +110,122 @@ impl NarTransfer for Libp2pTransport {
         let dial_timeout = envelope.dial_timeout;
         let body_idle_timeout = envelope.body_idle_timeout;
         let remote = async {
-            match self
+            let authorized_connection = match self
                 .locator
-                .locate(&node, &ResolutionPolicy::PublicInfrastructure)
+                .locate_libp2p_offer(&node, relay_hints)
                 .await
             {
-                Lookup::Found(dial_info) => {
-                    let mut added = 0usize;
-                    for location in &dial_info.locations {
-                        match location.parse::<Multiaddr>() {
-                            Ok(addr) => {
-                                self.handle.add_address(peer, addr).await;
-                                added += 1;
-                            }
-                            Err(why) => {
-                                // A DHT-reported location that does not parse as a Multiaddr is
-                                // anomalous (the locator built each from a real Multiaddr's
-                                // `to_string`); log and skip it rather than dial a malformed
-                                // address.
-                                tracing::warn!(
-                                    %location, %why,
-                                    "fabric-libp2p: skipping unparseable DHT-resolved dial address"
-                                );
-                            }
-                        }
-                    }
-                    if added == 0 {
-                        return Err(TransferError::Unavailable(format!(
-                            "libp2p resolved provider {node} but none of its DHT-reported \
-                             addresses parsed as a dialable Multiaddr"
-                        )));
-                    }
-                    // Fail-verbose observability (TASK-218 finding 1): record WHICH addresses
-                    // we resolved and are about to dial. A NAT'd provider's set includes a
-                    // `/p2p-circuit` candidate, so this makes the circuit-dial ATTEMPT
-                    // observable - the B2 relay-down oracle uses it to confirm the consumer
-                    // still resolved the provider (and a circuit) before the fetch failed.
+                Lookup::Found(plan) => {
+                    let addresses: Vec<String> = plan
+                        .direct
+                        .iter()
+                        .chain(plan.circuits.iter())
+                        .map(ToString::to_string)
+                        .collect();
                     tracing::info!(
                         provider = %node,
-                        addresses = %dial_info.locations.join(", "),
-                        "fabric-libp2p: resolved provider dial address(es); dialing"
+                        addresses = %addresses.join(", "),
+                        direct_candidates = plan.direct.len(),
+                        transient_circuit_candidates = plan.circuits.len(),
+                        "fabric-libp2p: resolved provider dial address(es); establishing an exact authorized route"
                     );
+
+                    // One absolute budget covers BOTH route establishment and exact stream-open.
+                    // Spending `dial_timeout` independently on each would silently double the
+                    // caller's latency bound. Explicit DialOpts carry the candidate addresses and
+                    // disable behaviour extension, so neither direct nor circuit coordinates are
+                    // persisted as ambient provider routing state.
+                    let dial_deadline = tokio::time::Instant::now() + dial_timeout;
+                    let connect_budget =
+                        dial_deadline.saturating_duration_since(tokio::time::Instant::now());
+                    let connected = if plan.circuits.is_empty() {
+                        self.handle
+                            .connect_direct(peer, plan.direct, connect_budget)
+                            .await
+                    } else {
+                        self.handle
+                            .connect_transient(peer, plan.circuits, connect_budget)
+                            .await
+                    };
+                    let connection = match connected {
+                        Ok(connection) => connection,
+                        Err(error) => {
+                            tracing::warn!(
+                                provider = %node,
+                                %peer,
+                                error = %error,
+                                addresses = %addresses.join(", "),
+                                "fabric-libp2p: NAR fetch UNREACHABLE - no exact authorized route established, so the NAR substream was NotOpened"
+                            );
+                            return Err(TransferError::Unavailable(format!(
+                                "libp2p NAR substream was NotOpened: exact authorized route to provider {node} failed at every resolved candidate: {error}"
+                            )));
+                        }
+                    };
+                    if let Some(relay) = connection.relay_peer() {
+                        self.locator.record_selected_relay(peer, relay);
+                    }
+                    tracing::debug!(
+                        provider = %node,
+                        %peer,
+                        connection = %connection.id,
+                        route = ?connection.route,
+                        "fabric-libp2p: selected exact authorized connection for NAR fetch"
+                    );
+
+                    let stream_budget =
+                        dial_deadline.saturating_duration_since(tokio::time::Instant::now());
+                    (connection, stream_budget)
                 }
                 Lookup::Miss => {
                     return Err(TransferError::Unavailable(format!(
-                        "libp2p node-locator knows no DHT dial address for provider {node} \
-                         right now (kad peer-routing miss)"
+                        "libp2p NAR substream was NotOpened: node-locator knows no DHT dial \
+                         address for provider {node} right now (kad peer-routing miss)"
                     )));
                 }
                 Lookup::Unavailable(why) => {
                     return Err(TransferError::Unavailable(format!(
-                        "libp2p node-locator could not resolve provider {node}: {why}"
+                        "libp2p NAR substream was NotOpened: node-locator could not resolve \
+                         provider {node}: {why}"
                     )));
                 }
-            }
+            };
 
-            // STREAM the NAR over a raw libp2p substream (TASK-157). The envelope's fine-grained
-            // bounds are enforced INSIDE `fetch_nar_streaming`: `dial_timeout` on opening the
-            // stream, `body_idle_timeout` as a real inter-chunk stall guard, and the running
-            // mid-stream SIZE abort at exactly `expected_size` (the signed uncompressed NarSize,
-            // NEVER the compressed FileSize) plus the gate-1 BLAKE3 verify - so a lying provider
-            // is cut off at ~expected_size mid-transfer, and a corrupt one fails gate-1, never
-            // wrong bytes handed upward (Nix's sha256 gate remains the trust anchor downstream).
-            // ATTRIBUTED fetch (TASK-218 finding 1): only a failure BEFORE the substream opened
-            // (a dial / circuit-establishment failure) is "unreachable". A reachable provider
-            // that opens the stream and then replies NotHeld/Declined/TooLarge/etc. must NOT be
-            // logged UNREACHABLE - otherwise the B2 relay-down oracle would pass even though the
-            // relay WORKED. The `offer_zstd = true` matches the shipped `fetch_nar_streaming`.
+            // STREAM the NAR over the exact route authorized above. The connection ID is passed
+            // unchanged into the vendored libp2p-stream control; there is no peer-wide random
+            // selection, auto-dial, or fallback to an ambient wrong-relay connection.
+            let (connection, stream_budget) = authorized_connection;
             match self
                 .handle
-                .fetch_nar_streaming_attributed(
+                .fetch_nar_streaming_attributed_on_connection(
                     peer,
-                    content,
-                    expected_size,
-                    dial_timeout,
-                    body_idle_timeout,
-                    true,
+                    connection.id,
+                    NarFetchRequest::new(
+                        content,
+                        expected_size,
+                        stream_budget,
+                        body_idle_timeout,
+                        true,
+                    ),
                 )
                 .await
             {
                 FetchOutcome::Ok(fetch) => Ok(fetch.bytes),
                 FetchOutcome::NotOpened(err) => {
-                    // The provider was DISCOVERED and RESOLVED (a Found above, addresses dialed)
-                    // but the NAR substream NEVER OPENED at any resolved dial address - a genuine
-                    // dial / relay-circuit REACHABILITY failure. This DISTINCT marker is what the
-                    // B2 relay-down oracle greps to attribute the failure to the severed relay
-                    // circuit (with the direct path B1-blocked), never to a discovery miss.
                     tracing::warn!(
                         provider = %node, %peer, error = %err,
-                        "fabric-libp2p: NAR fetch UNREACHABLE - the NAR substream never opened \
-                         (dial / relay-circuit establishment failed) at any resolved dial address"
+                        connection = %connection.id,
+                        route = ?connection.route,
+                        "fabric-libp2p: NAR fetch UNREACHABLE - the exact authorized NAR substream never opened"
                     );
                     Err(err)
                 }
                 FetchOutcome::OpenedThenFailed(err) => {
-                    // The provider WAS REACHED (the substream opened and the /nar/3 protocol
-                    // negotiated) but the transfer then failed. The relay/dial WORKED, so this is
-                    // NOT logged UNREACHABLE - the info line keeps it diagnosable.
                     tracing::info!(
                         provider = %node, %peer, error = %err,
-                        "fabric-libp2p: NAR fetch reached the provider (substream opened) but the \
-                         transfer failed - NOT an unreachability"
+                        connection = %connection.id,
+                        route = ?connection.route,
+                        "fabric-libp2p: NAR fetch reached the provider on the exact authorized connection but the transfer failed - NOT an unreachability"
                     );
                     Err(err)
                 }

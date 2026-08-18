@@ -28,8 +28,8 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use daemon_core::NarHashKey;
 use daemon_core::content_id::Blake3Digest;
 use daemon_libp2p::{
-    LanShare, Libp2pSourceConfig, SeedNarHashMismatch, announce_provider_seeds,
-    build_libp2p_provider_source, verify_provider_seeds,
+    InitialAnnounceConfig, LanShare, Libp2pSourceConfig, SeedNarHashMismatch,
+    announce_provider_seeds, build_libp2p_provider_source, verify_provider_seeds,
 };
 use fabric_libp2p::{Libp2pFabric, MemoryNarSupplier, Multiaddr, NodeConfig};
 use peer_fabric::{AnnounceBudget, DiscoveryBudget, PeerFabric, SafetyEnvelope, ServeBudget};
@@ -116,6 +116,8 @@ async fn the_shipped_announce_path_refuses_a_mis_specified_seed() {
         identity_seed: [2u8; 32],
         network_scope: scope.to_string(),
         listen: Some("/ip4/127.0.0.1/tcp/0".parse().unwrap()),
+        additional_listens: Vec::new(),
+        external_addresses: Vec::new(),
         bootstrap: vec![(boot_peer, boot_addr)],
         provider_addrs: vec![],
         discovery_budget: DiscoveryBudget::new(Duration::from_secs(10), 32),
@@ -125,7 +127,7 @@ async fn the_shipped_announce_path_refuses_a_mis_specified_seed() {
         kad_server: true,
     };
     let supplier = Arc::new(MemoryNarSupplier::new([nar.clone()]));
-    let (fabric, _source, _raw) =
+    let (fabric, _source, _raw, readiness) =
         build_libp2p_provider_source(cfg, supplier, Arc::new(peer_fabric::AdmitAllPublication))
             .await
             .expect("production provider builder starts a serving fabric joined to the DHT");
@@ -142,12 +144,10 @@ async fn the_shipped_announce_path_refuses_a_mis_specified_seed() {
     // the guard, not a routing failure.
     let records = announce_provider_seeds(
         &fabric,
-        [2u8; 32],
+        &readiness,
+        InitialAnnounceConfig::new([2u8; 32], 3600, unix_now(), &budget),
         &[(honest_key, nar.clone())],
         LanShare::operator_assembled(),
-        3600,
-        unix_now(),
-        &budget,
     )
     .await
     .expect("an honest seed announces on the shipped path");
@@ -163,12 +163,10 @@ async fn the_shipped_announce_path_refuses_a_mis_specified_seed() {
     assert_ne!(lied, honest_key);
     let refused = announce_provider_seeds(
         &fabric,
-        [2u8; 32],
+        &readiness,
+        InitialAnnounceConfig::new([2u8; 32], 3600, unix_now(), &budget),
         &[(lied, nar.clone())],
         LanShare::operator_assembled(),
-        3600,
-        unix_now(),
-        &budget,
     )
     .await;
     let err = refused.expect_err(

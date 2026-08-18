@@ -13,9 +13,11 @@
 # the NAR bytes, not incidental). The relay DATA path is also proven at the fabric API
 # level in fabric-libp2p/tests/nat_traversal.rs (circuit address supplied directly) and
 # the ROUTE-1 resolution at fabric-libp2p/tests/nat_dht_resolve.rs (no injection).
-# GENERALITY LIMIT (TASK-219): ROUTE 1 resolves a provider that reserved on a relay the
-# consumer already knows from config (the single shared-relay case, as here); the fully
-# general multi-relay case is a filed follow-up.
+# This VM deliberately remains the single-relay physical-NAT/circuit-carriage proof. The
+# general TASK-219 multi-relay authority path (C bootstraps via R1, P reserves only on R2,
+# exact signed hint resolves R2 through raw kad, no address injection) is covered by
+# `daemon-libp2p/tests/multi_relay_hints.rs`; duplicating that topology in QEMU adds no new
+# physical-boundary claim.
 #
 # WHAT IS **NOT** CLAIMED. DCUtR/hole-punch is NOT claimed to SUCCEED; on the contrary,
 # the B2 bite ASSERTS the DCUtR success log is ABSENT (no relayed connection was ever
@@ -713,9 +715,10 @@ pkgs.testers.runNixOSTest {
         # H1 (TASK-207): GATE what is genuinely achieved - RECORD discovery via kad. The
         # consumer must OBSERVABLY discover >= 1 provider RECORD via kad get_providers.
         # TASK-218 additionally makes the end-to-end byte-fetch a HARD oracle: the consumer
-        # RESOLVES the provider's /p2p-circuit dial-address (kad-discovered PeerId + a
-        # bootstrap-known relay, ROUTE 1) and fetches the NAR byte-identical THROUGH the
-        # relay. Single-relay generality limit is documented in the locator + TASK-218.
+        # RESOLVES the provider's /p2p-circuit dial-address (kad-discovered identity plus
+        # its signature-bound live relay hint, with legacy bootstrap relay fallback) and
+        # fetches the NAR byte-identical THROUGH the relay. This physical-NAT harness uses
+        # one relay; the distinct-relay generality proof lives in multi_relay_hints.rs.
         nodeb.systemctl("start nix-p2p-daemon.service")
         nodeb.wait_for_unit("nix-p2p-daemon.service")
         # The consumer side of the SHIPPED module comes up + serves (proves the

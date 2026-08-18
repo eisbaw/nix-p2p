@@ -92,9 +92,11 @@
 //! Here: the crate and swarm worker, the kad-backed [`Libp2pProviderDirectory`] and
 //! [`Libp2pAvailabilityAnnouncer`], node locator, `NarTransfer` / `NarServer`, and a
 //! `Libp2pFabric` exposing them. TASK-156 gives that transfer its native Libp2p
-//! ProviderRecord tag; the tag-Iroh adapter is rollout compatibility only. General
-//! relay-hint consumption and multi-relay NAT topology remain TASK-219, separate from
-//! this typed wire/dispatch slice.
+//! ProviderRecord tag; the tag-Iroh adapter is rollout compatibility only. TASK-219
+//! completes the general multi-relay path: providers sign their current accepted
+//! reservations as bounded relay identities, and consumers resolve those relays through
+//! raw kad immediately before a transient circuit dial. No provider-keyed relay cache is
+//! kept beside the exact signed record.
 
 mod announcer;
 mod directory;
@@ -111,7 +113,7 @@ mod transport;
 pub use announcer::{Libp2pAvailabilityAnnouncer, MAX_RECORD_TTL_SECS};
 pub use directory::Libp2pProviderDirectory;
 pub use fabric::{ANNOUNCE_SEQ_FILENAME, Libp2pFabric, PROVIDER_FLOOR_FILENAME};
-pub use keys::VALUE_KEY_CONTEXT;
+pub use keys::{RelayHintDerivationError, VALUE_KEY_CONTEXT, relay_hints_from_circuit_addresses};
 pub use locator::Libp2pNodeLocator;
 pub use nar::{
     CatalogNarSupplier, CatalogProbe, Libp2pNarSupplier, MemoryNarSupplier, NarSupplyPlan,
@@ -120,8 +122,8 @@ pub use nar::{
 };
 pub use server::Libp2pServer;
 pub use swarm::{
-    ConnPath, DEFAULT_KAD_QUERY_TIMEOUT, FetchOutcome, Node, NodeConfig, NodeError, ProviderFanOut,
-    QueryFail, QueryReach, SwarmHandle,
+    ConnPath, DEFAULT_KAD_QUERY_TIMEOUT, DEFAULT_LISTEN_READY_TIMEOUT, FetchOutcome, Node,
+    NodeConfig, NodeError, ProviderFanOut, QueryFail, QueryReach, SwarmHandle,
 };
 pub use transport::Libp2pTransport;
 

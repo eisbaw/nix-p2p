@@ -6,24 +6,70 @@
 //! resolve-then-dial lives inside the fabric). The hold-query / LAN axes remain `None`
 //! (hold-query is unimplemented; NAT traversal for residential peers is TASK-168).
 
+use std::future::Future;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Duration;
 
 use libp2p::PeerId;
 use peer_fabric::{
     AvailabilityAnnouncer, ContentKey, ExposureLedger, LocalPeerDiscovery, NarServer, NarTransfer,
-    NodeId, NodeLocator, PeerFabric, PeerHoldQuery, ProviderDirectory, TransferRegistry,
-    TransportTag,
+    NodeId, NodeLocator, PeerFabric, PeerHoldQuery, ProviderDirectory, RelayHints,
+    TransferRegistry, TransportTag,
 };
 use proc_supervisor::TaskSupervisor;
 
 use crate::announcer::Libp2pAvailabilityAnnouncer;
 use crate::directory::Libp2pProviderDirectory;
+use crate::keys::{RelayHintDerivationError, relay_hints_from_circuit_addresses};
 use crate::locator::Libp2pNodeLocator;
 use crate::nar::Libp2pNarSupplier;
 use crate::server::Libp2pServer;
 use crate::swarm::{Node, NodeConfig, NodeError, SwarmHandle};
 use crate::transport::{LegacyIrohTagLibp2pAdapter, Libp2pTransport};
+
+/// Revalidate requested reservations under one absolute deadline, including every listener
+/// snapshot await. Factored from the fabric method so a pending snapshot can bite the timeout
+/// contract without constructing a deliberately wedged swarm worker.
+async fn wait_for_live_relay_hints_with<Snapshot, SnapshotFuture>(
+    requested: RelayHints,
+    timeout: Duration,
+    mut snapshot: Snapshot,
+) -> Result<RelayHints, RelayHintDerivationError>
+where
+    Snapshot: FnMut() -> SnapshotFuture,
+    SnapshotFuture: Future<Output = Result<RelayHints, RelayHintDerivationError>>,
+{
+    let requested_count = requested.len();
+    let mut latest_live_requested = 0usize;
+    let poll = async {
+        loop {
+            let live = snapshot().await?;
+            let live_requested = requested
+                .as_slice()
+                .iter()
+                .filter(|relay| live.as_slice().contains(relay))
+                .count();
+            latest_live_requested = live_requested;
+            if live_requested == requested_count {
+                return Ok(live);
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    };
+
+    match tokio::time::timeout(timeout, poll).await {
+        Ok(result) => result,
+        Err(_) if requested_count == 0 => {
+            Err(RelayHintDerivationError::ListenerReadTimedOut { timeout })
+        }
+        Err(_) => Err(RelayHintDerivationError::RequestedReservationsNotLive {
+            requested: requested_count,
+            live: latest_live_requested,
+            timeout,
+        }),
+    }
+}
 
 /// The durable sidecar filenames a fabric writes under its `state_dir` (TASK-185). Exposed as
 /// the SINGLE SOURCE for these names so the composition root can enforce STATE-DIR CONSISTENCY
@@ -264,6 +310,38 @@ impl Libp2pFabric {
         self.announcer_seq.next_sequence(key)
     }
 
+    /// Snapshot the relay reservations that are LIVE in the swarm's accepted listener set and
+    /// convert them to the bounded canonical identities carried by a signed libp2p offer.
+    ///
+    /// This is the only production source for relay hints. Configured/attempted bootstrap or
+    /// circuit addresses do not enter: a relay contributes only after libp2p reports the accepted
+    /// `/p2p-circuit` listener. Initial batch doors capture this once immediately before their
+    /// signing loop; announce-after-fetch captures it per event. No provider-keyed hint cache can
+    /// drift from the swarm.
+    pub async fn live_relay_hints(&self) -> Result<RelayHints, RelayHintDerivationError> {
+        let listeners = self
+            .handle
+            .try_listen_addrs()
+            .await
+            .map_err(|reason| RelayHintDerivationError::ListenerReadFailed { reason })?;
+        relay_hints_from_circuit_addresses(self.node_id, &listeners)
+    }
+
+    /// Wait until every requested circuit relay is present in the swarm's CURRENT accepted
+    /// listener set. Listener installation itself awaits `NewListenAddr`; this revalidation at the
+    /// signing boundary catches a reservation that disappeared between startup and first announce.
+    ///
+    /// `requested` is already a bounded canonical typed value (normally parsed from configured
+    /// circuit addresses). The wait is integer-duration bounded and reports how many requested
+    /// relays were actually live; it never promotes the request itself into record truth.
+    pub async fn wait_for_live_relay_hints(
+        &self,
+        requested: RelayHints,
+        timeout: Duration,
+    ) -> Result<RelayHints, RelayHintDerivationError> {
+        wait_for_live_relay_hints_with(requested, timeout, || self.live_relay_hints()).await
+    }
+
     /// The libp2p `PeerId` of this node (for a peer to dial / for tests to assert
     /// which provider answered).
     pub fn peer_id(&self) -> PeerId {
@@ -333,5 +411,70 @@ impl PeerFabric for Libp2pFabric {
 
     fn exposure_ledger(&self) -> &ExposureLedger {
         self.ledger.as_ref()
+    }
+}
+
+#[cfg(test)]
+mod relay_hint_wait_tests {
+    use std::cell::Cell;
+    use std::future::pending;
+
+    use super::*;
+    use crate::keys::{keypair_from_seed, node_id_of};
+
+    #[tokio::test]
+    async fn empty_request_still_bounds_a_stalled_listener_snapshot() {
+        let bound = Duration::from_millis(25);
+        let started = tokio::time::Instant::now();
+        let error = wait_for_live_relay_hints_with(RelayHints::empty(), bound, || {
+            pending::<Result<RelayHints, RelayHintDerivationError>>()
+        })
+        .await
+        .expect_err("an empty requested set must not make a stalled snapshot unbounded");
+
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "stalled empty-request snapshot exceeded its injected bound: {:?}",
+            started.elapsed()
+        );
+        assert_eq!(
+            error,
+            RelayHintDerivationError::ListenerReadTimedOut { timeout: bound }
+        );
+    }
+
+    #[tokio::test]
+    async fn timeout_reports_the_latest_observed_requested_relay_count() {
+        let relay_a = node_id_of(&keypair_from_seed(&[31u8; 32]));
+        let relay_b = node_id_of(&keypair_from_seed(&[32u8; 32]));
+        let mut requested_nodes = [relay_a, relay_b];
+        requested_nodes.sort();
+        let requested = RelayHints::try_from(requested_nodes).expect("strict relay identities");
+        let live = RelayHints::try_from([relay_a]).expect("one strict live relay identity");
+        let calls = Cell::new(0usize);
+        let bound = Duration::from_millis(80);
+
+        let error = wait_for_live_relay_hints_with(requested, bound, || {
+            let call = calls.get();
+            calls.set(call + 1);
+            async move {
+                if call == 0 {
+                    Ok(live)
+                } else {
+                    pending::<Result<RelayHints, RelayHintDerivationError>>().await
+                }
+            }
+        })
+        .await
+        .expect_err("one of two requested reservations never became live");
+
+        assert_eq!(
+            error,
+            RelayHintDerivationError::RequestedReservationsNotLive {
+                requested: 2,
+                live: 1,
+                timeout: bound,
+            }
+        );
     }
 }

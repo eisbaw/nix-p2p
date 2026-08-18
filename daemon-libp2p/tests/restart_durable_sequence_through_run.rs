@@ -52,9 +52,9 @@ use daemon_core::{
     RunConfig, SourceError, StoreHash, UpstreamResponse, run,
 };
 use daemon_libp2p::{
-    IDENTITY_SEED_FILENAME, LanShare, Libp2pSourceConfig, announce_provider_seeds,
-    build_libp2p_nar_source, build_libp2p_provider_source, provider_content_key,
-    resolve_durable_identity_seed,
+    IDENTITY_SEED_FILENAME, InitialAnnounceConfig, LanShare, Libp2pSourceConfig,
+    announce_provider_seeds, build_libp2p_nar_source, build_libp2p_provider_source,
+    provider_content_key, resolve_durable_identity_seed,
 };
 use fabric_libp2p::{
     ANNOUNCE_SEQ_FILENAME, Libp2pFabric, MemoryNarSupplier, Multiaddr, NodeConfig, PeerId,
@@ -109,6 +109,8 @@ fn durable_provider_cfg(
         identity_seed,
         network_scope: scope.to_string(),
         listen: Some("/ip4/127.0.0.1/tcp/0".parse().unwrap()),
+        additional_listens: Vec::new(),
+        external_addresses: Vec::new(),
         bootstrap: vec![boot],
         provider_addrs: vec![],
         discovery_budget: DiscoveryBudget::new(Duration::from_secs(10), 32),
@@ -131,7 +133,7 @@ async fn start_provider_and_announce(
 ) -> (Arc<Libp2pFabric>, peer_fabric::ServeHandle, ProviderRecord) {
     let seed = cfg.identity_seed;
     let supplier = Arc::new(MemoryNarSupplier::new([nar.to_vec()]));
-    let (fabric, _source, _raw) =
+    let (fabric, _source, _raw, readiness) =
         build_libp2p_provider_source(cfg, supplier, Arc::new(peer_fabric::AdmitAllPublication))
             .await
             .expect("production provider builder starts a serving fabric joined to the DHT");
@@ -142,14 +144,13 @@ async fn start_provider_and_announce(
         .await
         .expect("serve gate installs");
 
+    let budget = AnnounceBudget::new(Duration::from_secs(10), 20);
     let records = announce_provider_seeds(
         &fabric,
-        seed,
+        &readiness,
+        InitialAnnounceConfig::new(seed, 3600, unix_now(), &budget),
         &[(*nar_hash, nar.to_vec())],
         LanShare::operator_assembled(),
-        3600,
-        unix_now(),
-        &AnnounceBudget::new(Duration::from_secs(10), 20),
     )
     .await
     .expect("shipped announce loop admitted (provider is DHT-joined)");
@@ -390,6 +391,8 @@ async fn restart_durable_sequence_serves_through_run() {
         identity_seed: [4u8; 32],
         network_scope: scope.to_string(),
         listen: Some("/ip4/127.0.0.1/tcp/0".parse().unwrap()),
+        additional_listens: Vec::new(),
+        external_addresses: Vec::new(),
         bootstrap: vec![(boot_peer, boot_addr.clone())],
         provider_addrs: vec![],
         discovery_budget,

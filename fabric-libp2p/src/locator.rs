@@ -14,31 +14,31 @@
 //! learned them via identify when the target connected). The resolver thus learns the dial
 //! address through the DHT, not from the caller.
 //!
-//! Because the same peer-routing query also teaches this node's kad routing table (and
-//! usually leaves a live connection to the target), the subsequent request-response fetch
-//! dials via kad's own `handle_pending_outbound_connection` - so no `add_address` of the
-//! provider is needed anywhere on the resolver.
+//! Direct coordinates learned by that query are explicitly handed to the transport. Circuit
+//! coordinates learned incidentally for the provider are rejected: the provider-to-relay
+//! association is authoritative only when it occurs in that provider's exact signed offer.
 //!
-//! # `ResolutionPolicy` mapping (and its honest current limit)
+//! # `ResolutionPolicy` mapping
 //!
-//!   * [`ResolutionPolicy::PublicInfrastructure`] - a UNION of two independent dial-candidate
-//!     provenances (TASK-218): the active kad peer-routing query (which discloses this node's
-//!     identity to the DHT nodes / bootstrap it contacts, recorded to the ledger) AND, for a
-//!     provider that is NOT directly reachable, a `/p2p-circuit`
-//!     dial-address CONSTRUCTED from a relay this node knows via bootstrap config (a NAT'd
-//!     provider is reachable only THROUGH its relay; disclosing to that relay operator that we
-//!     relay to the target, also recorded). "Directly reachable" is decided by OBSERVED
-//!     reachability, not by the address alone (TASK-221): a PUBLIC IP or LOOPBACK address is
-//!     directly reachable a-priori; a provider kad could only place at PRIVATE (RFC1918) /
-//!     link-local addresses is PROBED — a bounded direct dial — because such an address is
-//!     directly reachable when the provider is on our OWN LAN (same-LAN) but NOT across a NAT,
-//!     and the two are indistinguishable from the address alone. A same-LAN provider whose
-//!     probe connects DIRECTLY composes NO circuit and records NO Relay disclosure (the
-//!     over-disclosure TASK-218 accepted is now suppressed); a cross-NAT provider (probe never
-//!     reaches it) or an addressless one still composes the circuit (the nat-vm-test 192.168.x
-//!     cornerstone). Returns [`Lookup::Found`] when the union is
-//!     non-empty - so `Found` means "at least one dial candidate exists, from DHT peer-routing
-//!     AND/OR permitted relay-circuit composition", NOT "learned exclusively through the DHT".
+//!   * [`ResolutionPolicy::PublicInfrastructure`] - resolve in a strict order. First query the
+//!     provider through raw kad and retain only direct coordinates. A PUBLIC IP or LOOPBACK is
+//!     directly reachable a-priori; PRIVATE/link-local coordinates are probed with a short bound
+//!     because they may be same-LAN or cross-NAT (TASK-221). A live direct route returns
+//!     immediately and performs zero relay-hint queries. Otherwise, resolve each of the exact
+//!     signed offer's at-most-two canonical relay identities through raw kad and compose bounded
+//!     transient `/p2p-circuit` candidates. The flat provider-independent `known_relays` rollout
+//!     fallback is used only when the signed hint set is actually empty (a legacy record), never
+//!     when a non-empty signed set is currently unresolved. The transient candidates
+//!     are never inserted into kad or a provider-keyed side cache. Candidate composition itself
+//!     records no exposure; the transport records relay use only after selecting the exact live
+//!     relayed connection that carries the request. Returns [`Lookup::Found`] when at least one
+//!     direct or authorized circuit candidate exists.
+//!
+//!     Raw provider peer-routing may incidentally open an unsigned circuit connection. Its
+//!     observed relay is accounted as an exposure, but it can carry the fetch only when its live
+//!     `ConnectedPoint` relay identity matches the current signed/fallback candidate set. Other
+//!     relayed connection IDs remain live for concurrent work but cannot carry this request.
+//!
 //!     When NEITHER provenance yields a candidate it returns the kad walk's OWN honest verdict:
 //!     [`Lookup::Miss`] when a query that reached responding peers near the key knows no
 //!     address, and [`Lookup::Unavailable`] when the mechanism could not be consulted
@@ -47,10 +47,7 @@
 //!     [`crate::QueryReach`], TASK-174; `DeadlineExceeded` on timeout). See
 //!     [`crate::QueryReach`] for the honest limit of the `Miss` direction: reaching this
 //!     node's REACHABLE subgraph is not proof of reaching the target's global custodians
-//!     (an inherent single-node-view partition/eclipse residue). GENERALITY LIMIT: the
-//!     relay-circuit provenance only resolves a provider that reserved on a relay THIS node
-//!     already knows from config (the single shared-relay case); the multi-relay case is
-//!     the filed follow-up TASK-219.
+//!     (an inherent single-node-view partition/eclipse residue).
 //!   * [`ResolutionPolicy::ExplicitPeersOnly`] - consult ONLY the statically configured peer
 //!     address book ([`NodeConfig::peer_address_book`](crate::NodeConfig::peer_address_book),
 //!     TASK-168 AC#2), disclosing NOTHING. This is a pure LOCAL map lookup:
@@ -77,12 +74,32 @@ use async_trait::async_trait;
 use libp2p::multiaddr::Protocol;
 use libp2p::{Multiaddr, PeerId};
 use peer_fabric::{
-    DialInfo, Disclosed, Exposure, ExposureLedger, ExposureSurface, Lookup, NodeId, NodeLocator,
-    Recipient, ResolutionPolicy, Unavailable,
+    DialInfo, Disclosed, Exposure, ExposureLedger, ExposureSurface, Lookup, MAX_LIBP2P_RELAY_HINTS,
+    NodeId, NodeLocator, Recipient, RelayHints, ResolutionPolicy, Unavailable,
 };
 
 use crate::keys::peer_id_of_provider;
-use crate::swarm::{QueryFail, SwarmHandle, absence_from_reach};
+use crate::swarm::{ConnPath, QueryFail, SwarmHandle, absence_from_reach};
+
+/// An internal libp2p dial plan. Both direct and circuit candidates are carried only in exact
+/// [`libp2p::swarm::dial_opts::DialOpts`] for this fetch; neither is persisted in kad or a
+/// provider-keyed side cache. This type stays below the public `NodeLocator` seam.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Libp2pDialPlan {
+    pub(crate) direct: Vec<Multiaddr>,
+    pub(crate) circuits: Vec<Multiaddr>,
+}
+
+impl Libp2pDialPlan {
+    fn into_dial_info(self) -> DialInfo {
+        DialInfo::new(
+            self.direct
+                .into_iter()
+                .chain(self.circuits)
+                .map(|address| address.to_string()),
+        )
+    }
+}
 
 /// The kad-backed [`NodeLocator`]. Holds a [`SwarmHandle`] to drive peer-routing, the
 /// shared [`ExposureLedger`] every capability appends to, and the statically-configured
@@ -147,97 +164,206 @@ impl Libp2pNodeLocator {
         }
     }
 
-    /// The active PublicInfrastructure resolution: a UNION of two INDEPENDENT dial-candidate
-    /// provenances (TASK-218, mped-architect ruling), each honest about what it did:
+    /// Resolve a signed libp2p offer below the public [`NodeLocator`] seam.
     ///
-    ///   1. the kad peer-routing walk (`get_closest_peers`) - the addresses the DHT learned
-    ///      for the target; it keeps its OWN [`crate::QueryReach`] classification and its own
-    ///      `OurNodeId->DhtNode` ledger disclosure EXACTLY as before, and records NO
-    ///      disclosure when the routing table is empty (no query happened);
-    ///   2. relay-circuit composition - for a provider that is NOT DIRECTLY REACHABLE (a PUBLIC
-    ///      IP or LOOPBACK is directly reachable a-priori and does NOT compose; a provider placed
-    ///      ONLY at PRIVATE/link-local addresses is PROBED via a bounded direct dial — TASK-221 —
-    ///      composing only if the probe never reaches it directly, i.e. it is across a NAT rather
-    ///      than on our own LAN; an addressless provider composes without a probe), and when this
-    ///      node knows relays from bootstrap config, we CONSTRUCT
-    ///      `<relayAddr>/p2p/<relayPeer>/p2p-circuit/p2p/<providerPeer>` for each known relay.
-    ///      This is the standard circuit-v2 dial pattern, not injection (the provider PeerId
-    ///      came from kad; the relays are provider-INDEPENDENT config). Composing candidates
-    ///      dials THROUGH the relay, which discloses to that relay operator that we relay to
-    ///      this provider - recorded as `OurNodeId->Relay`, and ONLY when candidates are
-    ///      actually added (so a localhost / public / same-LAN provider records NO Relay
-    ///      disclosure).
-    ///
-    /// [`Lookup::Found`] iff the union is non-empty; otherwise the DHT walk's OWN honest
-    /// absence ([`Lookup::Miss`] / [`Unavailable`]). So `Found` here means "at least one
-    /// dial candidate exists, from DHT peer-routing AND/OR permitted relay-circuit
-    /// composition" - NOT "learned exclusively through the DHT".
-    async fn locate_via_dht(&self, peer: PeerId) -> Lookup<DialInfo> {
-        // --- Provenance 1: the kad peer-routing walk (unchanged honesty). ---
-        // A peer-routing query over an EMPTY routing table is not authoritative: a Miss
-        // would be a lie (we simply are not on the network to ask). This cheap pre-check
-        // short-circuits the query, recording NO ledger disclosure (no query touched the
-        // network). The FINER near-key bar (TASK-174) is applied on the QueryReach an actual
-        // walk achieved. `dht_addrs` are the DHT-learned addresses; `dht_absence` is the
-        // honest Lookup to fall back to if NEITHER provenance yields a candidate.
-        let (dht_addrs, dht_absence): (Vec<Multiaddr>, Lookup<DialInfo>) =
-            if self.handle.routing_peers().await == 0 {
-                (
-                    Vec::new(),
-                    Lookup::Unavailable(Unavailable::InsufficientRouting),
-                )
-            } else {
-                // We are about to actually consult the DHT: record the disclosure HERE, after
-                // the short-circuit, so a query that never touched the network does not
-                // pollute the ledger. An active peer-routing query reveals OUR identity to the
-                // DHT nodes it contacts. HONEST GAP: it also reveals the QUERIED target NodeId
-                // to those nodes, but the frozen `peer_fabric::Disclosed` enum models OUR
-                // disclosures + ContentKey and has no third-party-NodeId variant (TASK-168).
-                self.ledger
-                    .record(Exposure::new(Recipient::DhtNode, Disclosed::OurNodeId));
-                match self.handle.locate_peer(peer).await {
-                    Ok((addrs, _)) if !addrs.is_empty() => (addrs, Lookup::Miss),
-                    // A completed query that learned no address: Miss vs InsufficientRouting
-                    // turns on the NEAR-KEY bar (TASK-174). `dht_addrs` stays empty.
-                    Ok((_, reach)) => (Vec::new(), absence_from_reach(reach)),
-                    Err(QueryFail::Timeout) => (
-                        Vec::new(),
-                        Lookup::Unavailable(Unavailable::DeadlineExceeded),
-                    ),
-                    Err(QueryFail::Backend(why)) => {
-                        (Vec::new(), Lookup::Unavailable(Unavailable::Backend(why)))
-                    }
-                }
-            };
+    /// Provider peer-routing is always attempted first. If it yields no usable direct path, each
+    /// relay identity bound into the signed offer is resolved through its own raw kad lookup and
+    /// composed into a transient circuit candidate. The provider-independent `known_relays`
+    /// configuration is a compatibility fallback only for an actually empty legacy hint set;
+    /// it never overrides a non-empty signed set whose relays are currently unresolved.
+    pub(crate) async fn locate_libp2p_offer(
+        &self,
+        node: &NodeId,
+        relay_hints: RelayHints,
+    ) -> Lookup<Libp2pDialPlan> {
+        let peer = match peer_id_of_provider(node) {
+            Some(peer) => peer,
+            None => {
+                return Lookup::Unavailable(Unavailable::Backend(format!(
+                    "node {node} is not a valid ed25519 peer id; cannot resolve over libp2p"
+                )));
+            }
+        };
+        self.locate_via_dht(peer, relay_hints).await
+    }
 
-        // --- Provenance 2: relay-circuit composition (TASK-218, refined by TASK-221). ---
-        // `circuit_provenance` couples the whole chain in ONE place (probe -> reachability
-        // verdict -> compose? -> record?), so the privacy invariant "a /p2p-circuit in the
-        // resolved dial set <=> exactly one Relay disclosure" holds over the UNION it will dial,
-        // not just over what THIS node composed (F2).
-        let circuit_locations = self.circuit_provenance(peer, &dht_addrs).await;
-
-        // --- Union. The frozen seam treats DialInfo locations as OPAQUE strings; for libp2p
-        // they are Multiaddr strings, reparsed inside the fabric when dialing. ---
-        let locations: Vec<String> = dht_addrs
+    async fn locate_via_dht(
+        &self,
+        peer: PeerId,
+        relay_hints: RelayHints,
+    ) -> Lookup<Libp2pDialPlan> {
+        // Provenance 1: query the provider itself. Only DIRECT coordinates are authoritative on
+        // this leg. A provider -> relay binding belongs to the exact signed offer; ambient circuit
+        // addresses in raw kad peer-routing are deliberately ignored. They may remain as ambient
+        // kad/live-connection facts, but production opens the NAR stream only on the exact
+        // ConnectionId selected from this offer, so they cannot substitute for an authorized path.
+        // `dht_absence` remains the honest verdict if no direct, signed-hint, or legacy-circuit
+        // candidate can be built.
+        let (dht_addrs, dht_absence) = self.query_peer_addresses(peer).await;
+        let mut direct: Vec<Multiaddr> = dht_addrs
             .iter()
-            .chain(circuit_locations.iter())
-            .map(|addr| addr.to_string())
+            .filter(|address| !is_circuit_multiaddr(address))
+            .cloned()
             .collect();
-        if locations.is_empty() {
-            // Neither provenance produced a candidate: return the DHT walk's OWN honest
-            // absence (Miss / InsufficientRouting / DeadlineExceeded / Backend).
+        canonicalize_addresses(&mut direct);
+
+        // libp2p-kad may dial the exact target while walking its key. If an intermediate peer
+        // happened to report an unsigned circuit address, the raw provider lookup can therefore
+        // leave one or more RELAYED connections open even though we rejected those addresses.
+        // Inspect per-connection relay facts rather than the direct-dominant aggregate path: a
+        // direct+relay mixed set still made a real relay disclosure. Ambient routes remain open,
+        // but only an offer-authorized exact ConnectionId may carry the later stream.
+        let live_relays_after_query = self.handle.connection_relay_peers(peer).await;
+        let live_path_after_query = self.handle.connection_path(peer).await;
+        if !live_relays_after_query.is_empty() {
+            // Record from the OBSERVED connection path, not from the returned addresses: the
+            // libp2p-kad multi-source overwrite that motivated TASK-219 can drop the very circuit
+            // address whose query-side dial established this connection.
+            self.ledger
+                .record(Exposure::new(Recipient::Relay, Disclosed::OurNodeId));
+            tracing::debug!(
+                %peer,
+                relays = ?live_relays_after_query,
+                "fabric-libp2p: raw provider peer-routing has live relay circuit(s); \
+                 route reuse remains gated by the exact offer's signed relay identities"
+            );
+        }
+
+        // A public/loopback address is directly reachable a-priori. Private addresses are
+        // ambiguous, so probe them when any relay route could otherwise be used. `ConnPath::Direct`
+        // is the only positive probe verdict; an existing relayed connection cannot suppress
+        // hint resolution. This decision happens BEFORE every hint lookup.
+        let has_relay_alternative = !relay_hints.is_empty() || !self.known_relays.is_empty();
+        let reachable_directly = if live_path_after_query == ConnPath::Direct
+            || addrs_include_directly_reachable(&direct)
+        {
+            true
+        } else if has_relay_alternative && !direct.is_empty() {
+            let targets: Vec<Multiaddr> = direct
+                .iter()
+                .map(|address| with_peer_id(address, peer))
+                .collect();
+            self.handle
+                .probe_direct_reachable(peer, &targets, DIRECT_PROBE_BUDGET)
+                .await
+        } else {
+            false
+        };
+        if reachable_directly {
+            // Zero relay queries and zero gratuitous circuit candidates on the direct path.
+            // Ambient relay connections coexist; the transport selects/opens an exact direct ID.
+            return Lookup::Found(Libp2pDialPlan {
+                direct,
+                circuits: Vec::new(),
+            });
+        }
+
+        // Provenance 2: signed exact-record relay identities. RelayHints' private shape already
+        // enforces <=2 canonical unique strict identities, so this loop performs at most two raw
+        // kad lookups. An unresolved relay is skipped; it never poisons the other hint.
+        let has_signed_hints = !relay_hints.is_empty();
+        let hinted = self.resolve_hinted_circuits(peer, relay_hints).await;
+        let circuits = if !hinted.is_empty() {
+            hinted
+        } else if has_signed_hints {
+            // A signed non-empty set is authoritative even when every member is dead/unresolved.
+            // Falling back here would let a provider-independent ambient relay replace the exact
+            // signed provider->relay binding.
+            Vec::new()
+        } else {
+            // TASK-218 compatibility fallback for pre-tag-2 / empty-hint records only.
+            bound_circuit_candidates(
+                compose_circuit_candidates(&self.known_relays, peer, false),
+                "legacy known-relay fallback",
+            )
+        };
+        if direct.is_empty() && circuits.is_empty() {
             dht_absence
         } else {
-            Lookup::Found(DialInfo::new(locations))
+            Lookup::Found(Libp2pDialPlan { direct, circuits })
         }
     }
 
-    /// Provenance 2 as ONE coupled decision (TASK-218 / TASK-221): decide reachability, compose
-    /// the `/p2p-circuit` candidates if warranted, and record the Relay disclosure — all here, so
-    /// a caller cannot suppress the circuit without ALSO dropping the disclosure and vice-versa
-    /// (the F1 coupling). Returns the candidates THIS node composed (empty when the provider is
-    /// directly reachable, when no relay is known, or when there is nothing to probe).
+    /// One raw kad peer-routing consultation, with the same honest absence classification and
+    /// exposure accounting for providers and relay identities. No cached address map is read.
+    async fn query_peer_addresses(&self, peer: PeerId) -> (Vec<Multiaddr>, Lookup<Libp2pDialPlan>) {
+        if self.handle.routing_peers().await == 0 {
+            return (
+                Vec::new(),
+                Lookup::Unavailable(Unavailable::InsufficientRouting),
+            );
+        }
+        self.ledger
+            .record(Exposure::new(Recipient::DhtNode, Disclosed::OurNodeId));
+        match self.handle.locate_peer(peer).await {
+            Ok((addresses, _)) if !addresses.is_empty() => (addresses, Lookup::Miss),
+            Ok((_, reach)) => (Vec::new(), absence_from_reach(reach)),
+            Err(QueryFail::Timeout) => (
+                Vec::new(),
+                Lookup::Unavailable(Unavailable::DeadlineExceeded),
+            ),
+            Err(QueryFail::Backend(why)) => {
+                (Vec::new(), Lookup::Unavailable(Unavailable::Backend(why)))
+            }
+        }
+    }
+
+    /// Resolve at most two signed relay identities through raw kad and compose at most two
+    /// transient circuit candidates. Selection is round-robin across relays: with two hints each
+    /// gets one candidate before a second address from either relay, so a dead first relay cannot
+    /// consume the entire dial bound and hide the live second relay.
+    async fn resolve_hinted_circuits(
+        &self,
+        provider: PeerId,
+        relay_hints: RelayHints,
+    ) -> Vec<Multiaddr> {
+        let mut per_hint = Vec::with_capacity(relay_hints.len());
+        for relay_node in relay_hints.as_slice() {
+            let Some(relay_peer) = peer_id_of_provider(relay_node) else {
+                // Defense in depth: the frozen RelayHints constructor already enforces strict
+                // ed25519 identities. Skip rather than turn one impossible bad hint into an
+                // unbounded retry or suppress a second valid hint.
+                tracing::warn!(relay = %relay_node, "fabric-libp2p: signed relay hint cannot derive a PeerId; skipping");
+                per_hint.push(Vec::new());
+                continue;
+            };
+            tracing::debug!(relay = %relay_node, %relay_peer, "fabric-libp2p: resolving signed relay hint through raw kad");
+            let (addresses, _) = self.query_peer_addresses(relay_peer).await;
+            let mut direct_addresses: Vec<Multiaddr> = addresses
+                .into_iter()
+                .filter(|address| !is_circuit_multiaddr(address))
+                .collect();
+            canonicalize_addresses(&mut direct_addresses);
+            if direct_addresses.is_empty() {
+                tracing::debug!(relay = %relay_node, %relay_peer, "fabric-libp2p: signed relay hint unresolved or had no direct address; skipping");
+            }
+            per_hint.push(
+                direct_addresses
+                    .into_iter()
+                    .map(|address| compose_circuit_candidate(relay_peer, &address, provider))
+                    .collect::<Vec<_>>(),
+            );
+        }
+
+        let mut candidates = Vec::with_capacity(MAX_LIBP2P_RELAY_HINTS);
+        let max_depth = per_hint.iter().map(Vec::len).max().unwrap_or(0);
+        'depths: for depth in 0..max_depth {
+            for addresses in &per_hint {
+                if let Some(address) = addresses.get(depth) {
+                    candidates.push(address.clone());
+                    if candidates.len() == MAX_LIBP2P_RELAY_HINTS {
+                        break 'depths;
+                    }
+                }
+            }
+        }
+        candidates
+    }
+
+    /// Test-only proof of the legacy known-relay fallback's coupled decision (TASK-218 /
+    /// TASK-221): decide reachability and compose `/p2p-circuit` candidates if warranted.
+    /// Production performs the same decision in `locate_via_dht`, with
+    /// signed hints before this fallback and with raw provider circuit coordinates rejected.
     ///
     /// Reachability is decided by OBSERVATION, not the address alone:
     ///   * a PUBLIC IP or LOOPBACK address (::1 / 127.0.0.0/8) is directly reachable a-priori —
@@ -268,6 +394,7 @@ impl Libp2pNodeLocator {
     /// new per-connection provenance bookkeeping in the swarm, and a hole-punched direct connection
     /// is arguably the RIGHT thing to prefer over the relay anyway (it already avoids the relay).
     /// The nat-vm cornerstone does not exercise this (DCUtR fails there and the link stays relayed).
+    #[cfg(test)]
     async fn circuit_provenance(&self, peer: PeerId, dht_addrs: &[Multiaddr]) -> Vec<Multiaddr> {
         let reachable_directly = if addrs_include_directly_reachable(dht_addrs) {
             true
@@ -285,7 +412,7 @@ impl Libp2pNodeLocator {
             // No relays to compose anyway, or nothing to probe: skip the probe latency.
             false
         };
-        self.circuit_from_verdict(peer, dht_addrs, reachable_directly)
+        self.circuit_from_verdict(peer, reachable_directly)
     }
 
     /// The LOCATOR's USE of the reachability `verdict` (F5), split out so BOTH directions are
@@ -293,43 +420,26 @@ impl Libp2pNodeLocator {
     /// bound on a test host, so `circuit_provenance`'s real probe can only ever produce
     /// verdict=false for a private address in a test. Here the verdict is a parameter, so a test
     /// drives verdict=true (a same-LAN private provider the probe DID reach) and asserts the
-    /// locator SUPPRESSES the circuit and records NO disclosure, and verdict=false and asserts it
-    /// composes + discloses. This is the load-bearing positive-direction coupling: if the locator's
+    /// locator SUPPRESSES the circuit, and verdict=false and asserts it composes. Candidate
+    /// composition itself records no exposure: the transport records only after an exact route is
+    /// selected. This is the load-bearing positive-direction coupling: if the locator's
     /// use of the verdict is broken (composes despite verdict=true), the over-disclosure TASK-221
     /// removes comes back and the verdict=true test reddens.
-    fn circuit_from_verdict(
-        &self,
-        peer: PeerId,
-        dht_addrs: &[Multiaddr],
-        reachable_directly: bool,
-    ) -> Vec<Multiaddr> {
-        let composed = compose_circuit_candidates(&self.known_relays, peer, reachable_directly);
-        self.record_relay_if_circuit_dialed(dht_addrs, &composed);
-        composed
+    #[cfg(test)]
+    fn circuit_from_verdict(&self, peer: PeerId, reachable_directly: bool) -> Vec<Multiaddr> {
+        compose_circuit_candidates(&self.known_relays, peer, reachable_directly)
     }
 
-    /// The END-TO-END privacy invariant (F2): dialing THROUGH a relay — a `/p2p-circuit` ANYWHERE
-    /// in the resolved dial set, whether WE composed it (cross-NAT) or one arrived among the
-    /// DHT-provided addresses — discloses to that relay operator that we relay to this provider.
-    /// Recording on the UNION (`dht_addrs` + `composed`), not just our composed set, closes a
-    /// circuit-WITHOUT-disclosure under-count. This is LOAD-BEARING, not merely defensive: kad
-    /// PEER-ROUTING (separate from the `ProviderRecord`, which carries no dial address) feeds a
-    /// target's identify listen addresses into the routing table UNFILTERED and returns them from
-    /// `get_closest_peers` (`swarm.rs`, identify->kad `add_address` and the `GetClosestPeers`
-    /// `info.addrs`), so a provider that advertises a `/p2p-circuit` listen address CAN surface one
-    /// in `dht_addrs`. That the harness provider currently advertises only a direct addr is OBSERVED
-    /// behaviour, not a frozen-schema guarantee — so the union-record here (with
-    /// [`addr_is_directly_reachable`] refusing to classify a circuit as directly reachable) is what
-    /// keeps "circuit dialed <=> Relay disclosed" true on that reachable path.
-    fn record_relay_if_circuit_dialed(&self, dht_addrs: &[Multiaddr], composed: &[Multiaddr]) {
-        let dials_via_circuit = dht_addrs
-            .iter()
-            .chain(composed.iter())
-            .any(is_circuit_multiaddr);
-        if dials_via_circuit {
-            self.ledger
-                .record(Exposure::new(Recipient::Relay, Disclosed::OurNodeId));
-        }
+    /// Record actual use of the exact selected relayed ConnectionId. Merely composing a candidate
+    /// is not a disclosure; this is called only after route establishment/selection succeeds.
+    pub(crate) fn record_selected_relay(&self, provider: PeerId, relay: PeerId) {
+        self.ledger
+            .record(Exposure::new(Recipient::Relay, Disclosed::OurNodeId));
+        tracing::debug!(
+            %provider,
+            %relay,
+            "fabric-libp2p: selected exact relayed connection for NAR stream"
+        );
     }
 }
 
@@ -358,19 +468,62 @@ fn with_peer_id(addr: &Multiaddr, peer: PeerId) -> Multiaddr {
 }
 
 /// Is `addr` a `/p2p-circuit` (relay) multiaddr? A circuit dial goes THROUGH a relay operator,
-/// so it is never a direct path and always incurs a Relay disclosure — [`circuit_provenance`]
-/// keys the end-to-end privacy invariant on this, and [`addr_is_directly_reachable`] uses it to
-/// refuse to classify a circuit as directly reachable (F2).
+/// so it is never a direct path and always incurs a Relay disclosure when it is an authorized
+/// candidate. [`addr_is_directly_reachable`] uses this to refuse to classify a circuit as direct.
 fn is_circuit_multiaddr(addr: &Multiaddr) -> bool {
     addr.iter().any(|p| matches!(p, Protocol::P2pCircuit))
+}
+
+/// Canonicalize an untrusted address result so candidate selection is deterministic and duplicate
+/// reports do not consume the finite circuit budget.
+fn canonicalize_addresses(addresses: &mut Vec<Multiaddr>) {
+    addresses.sort_by_key(|address| address.to_string());
+    addresses.dedup();
+}
+
+/// Enforce the same two-candidate work bound as the signed hint set. DHT/legacy address sets are
+/// not signed input, so excess candidates are resource-bounded at use time and logged rather than
+/// allowed to amplify a single fetch. Signed relay identities themselves are never truncated:
+/// their constructor/provider writer rejects over-cap input before this path.
+fn bound_circuit_candidates(
+    mut candidates: Vec<Multiaddr>,
+    provenance: &'static str,
+) -> Vec<Multiaddr> {
+    canonicalize_addresses(&mut candidates);
+    if candidates.len() > MAX_LIBP2P_RELAY_HINTS {
+        tracing::warn!(
+            found = candidates.len(),
+            cap = MAX_LIBP2P_RELAY_HINTS,
+            %provenance,
+            "fabric-libp2p: bounding transient circuit dial candidates"
+        );
+        candidates.truncate(MAX_LIBP2P_RELAY_HINTS);
+    }
+    candidates
+}
+
+/// Compose one standard circuit-v2 destination from a raw-kad-resolved direct relay address.
+fn compose_circuit_candidate(
+    relay_peer: PeerId,
+    relay_addr: &Multiaddr,
+    provider: PeerId,
+) -> Multiaddr {
+    let mut base: Multiaddr = relay_addr
+        .iter()
+        .filter(|p| !matches!(p, Protocol::P2p(_) | Protocol::P2pCircuit))
+        .collect();
+    base.push(Protocol::P2p(relay_peer));
+    base.push(Protocol::P2pCircuit);
+    base.push(Protocol::P2p(provider));
+    base
 }
 
 /// Compose the `/p2p-circuit` dial candidates for `provider` (TASK-218 / TASK-221): one per known
 /// relay, `<relayTransportAddr>/p2p/<relayPeer>/p2p-circuit/p2p/<providerPeer>`, IFF this node
 /// knows relays AND the provider is NOT directly reachable (`reachable_directly` is the caller's
 /// observed verdict). Returns empty otherwise. PURE — it records nothing; the single Relay
-/// disclosure is recorded by [`circuit_provenance`] over the whole resolved dial set, so
-/// "composed nothing" and "recorded nothing" cannot drift apart. Any trailing `/p2p/<x>` and any
+/// disclosure is recorded by the caller over the authorized candidate set, so "composed nothing"
+/// and "recorded nothing" cannot drift apart. Any trailing `/p2p/<x>` and any
 /// stray `/p2p-circuit` on the configured relay address are stripped first, so the composed
 /// address carries exactly ONE relay-peer component and ONE circuit hop.
 fn compose_circuit_candidates(
@@ -384,14 +537,7 @@ fn compose_circuit_candidates(
     known_relays
         .iter()
         .map(|(relay_peer, relay_addr)| {
-            let mut base: Multiaddr = relay_addr
-                .iter()
-                .filter(|p| !matches!(p, Protocol::P2p(_) | Protocol::P2pCircuit))
-                .collect();
-            base.push(Protocol::P2p(*relay_peer));
-            base.push(Protocol::P2pCircuit);
-            base.push(Protocol::P2p(provider));
-            base
+            compose_circuit_candidate(*relay_peer, relay_addr, provider)
         })
         .collect()
 }
@@ -493,7 +639,11 @@ impl NodeLocator for Libp2pNodeLocator {
                         )));
                     }
                 };
-                self.locate_via_dht(peer).await
+                match self.locate_via_dht(peer, RelayHints::empty()).await {
+                    Lookup::Found(plan) => Lookup::Found(plan.into_dial_info()),
+                    Lookup::Miss => Lookup::Miss,
+                    Lookup::Unavailable(reason) => Lookup::Unavailable(reason),
+                }
             }
         }
     }
@@ -501,11 +651,12 @@ impl NodeLocator for Libp2pNodeLocator {
     fn declared_exposure(&self) -> ExposureSurface {
         // The a-priori MAY-disclose surface, taken as the SUPERSET over policies: an active
         // peer-routing query (PublicInfrastructure) reveals OUR identity to the DHT nodes
-        // and the bootstrap it contacts; when it composes a relay-circuit dial candidate
-        // (TASK-218) it also reveals to the relay operator that we relay to the target. The
-        // Relay entry belongs to the superset whether or not any concrete resolve composes a
-        // circuit. ExplicitPeersOnly is a strict subset (discloses nothing). See the module
-        // note on the queried-NodeId gap (TASK-168).
+        // and the bootstrap it contacts. The Relay entry is also in this a-priori superset because
+        // selecting and opening a relayed route reveals to that relay operator that we contact the
+        // target. Merely composing a circuit candidate does not record actual exposure; accounting
+        // occurs only after a concrete live route is observed/selected. ExplicitPeersOnly is a
+        // strict subset (discloses nothing). See the module note on the queried-NodeId gap
+        // (TASK-168).
         ExposureSurface::from_exposures([
             Exposure::new(Recipient::DhtNode, Disclosed::OurNodeId),
             Exposure::new(Recipient::Bootstrap, Disclosed::OurNodeId),
@@ -620,9 +771,8 @@ mod ip_classification_tests {
 
 #[cfg(test)]
 mod circuit_compose_tests {
-    //! TASK-221 — the PURE compose decision + address classification (no network). The DISCLOSURE
-    //! side (which is coupled to the compose decision AND the probe in `circuit_provenance`) is
-    //! exercised end to end in `circuit_provenance_tests` below.
+    //! TASK-221 — the PURE compose decision + address classification (no network). Candidate
+    //! composition is intentionally distinct from actual selected-route disclosure.
     use super::{
         addr_is_directly_reachable, compose_circuit_candidates, is_circuit_multiaddr, with_peer_id,
     };
@@ -649,7 +799,7 @@ mod circuit_compose_tests {
     }
 
     /// F2(b): a `/p2p-circuit` multiaddr is NEVER directly reachable — even one whose leading IP is
-    /// PUBLIC (the relay's) — so it can never skip the probe/compose and dodge a Relay disclosure.
+    /// PUBLIC (the relay's) — so it can never skip the probe/compose decision.
     #[test]
     fn a_circuit_multiaddr_is_never_directly_reachable_even_with_a_public_relay_ip() {
         let relay = PeerId::random();
@@ -690,8 +840,7 @@ mod circuit_compose_tests {
 
 #[cfg(test)]
 mod circuit_provenance_tests {
-    //! TASK-221 — the COUPLED chain, asserted on the DISCLOSURE (ledger): probe result -> the
-    //! locator's reachability verdict -> circuit composed? -> Relay disclosure recorded?, driven
+    //! TASK-221 — probe result -> the locator's reachability verdict -> circuit composed?, driven
     //! through the REAL `Libp2pNodeLocator::circuit_provenance` over a live consumer swarm. These
     //! bite the CALLER's suppression decision, not just a helper fed a literal verdict (F1). A
     //! reachable PRIVATE provider (probe TRUE -> suppress) cannot be bound hermetically on a test
@@ -730,11 +879,9 @@ mod circuit_provenance_tests {
     }
 
     /// F1 COUPLED BITE: an UNREACHABLE private provider drives the REAL probe FALSE, so the locator
-    /// composes the circuit AND records the Relay disclosure. MUTATION in the CALLER (force the
-    /// reachability verdict true / skip the probe / suppress regardless) -> circuit suppressed +
-    /// NO disclosure for an unreachable provider -> this test reddens. The budget bounds the wait.
+    /// composes the circuit without claiming it was used. The budget bounds the wait.
     #[tokio::test]
-    async fn unreachable_private_provider_composes_and_discloses_through_the_real_locator() {
+    async fn unreachable_private_provider_composes_without_premature_disclosure() {
         let relay = (
             PeerId::random(),
             "/ip4/203.0.113.7/tcp/4001".parse().unwrap(),
@@ -753,8 +900,8 @@ mod circuit_provenance_tests {
         );
         assert_eq!(
             relay_disclosures(&ledger),
-            1,
-            "composing the circuit MUST record exactly one OurNodeId->Relay disclosure"
+            0,
+            "candidate composition is not route use and must not record a disclosure"
         );
     }
 
@@ -785,34 +932,6 @@ mod circuit_provenance_tests {
         );
     }
 
-    /// F2 END-TO-END INVARIANT: a `/p2p-circuit` that arrives among the DHT-provided addresses
-    /// (even with NO known relay, so this node composes nothing) still records a Relay disclosure —
-    /// dialing THROUGH a relay is disclosed however the circuit entered the resolved dial set.
-    /// MUTATION (record only over what WE composed, not the union) -> a DHT-provided circuit dials
-    /// a relay with NO disclosure -> reddens.
-    #[tokio::test]
-    async fn a_dht_provided_circuit_records_a_relay_disclosure_even_when_we_compose_nothing() {
-        let (_node, ledger, locator) = consumer([33u8; 32], Vec::new()).await;
-        let relay = PeerId::random();
-        let provider = PeerId::random();
-        let dht_circuit: Multiaddr =
-            format!("/ip4/8.8.8.8/tcp/4001/p2p/{relay}/p2p-circuit/p2p/{provider}")
-                .parse()
-                .unwrap();
-
-        let composed = locator.circuit_provenance(provider, &[dht_circuit]).await;
-
-        assert!(
-            composed.is_empty(),
-            "no known relay -> we compose nothing; the circuit came from the DHT set"
-        );
-        assert_eq!(
-            relay_disclosures(&ledger),
-            1,
-            "a DHT-provided /p2p-circuit in the dial set MUST still record a Relay disclosure"
-        );
-    }
-
     /// F5 POSITIVE-DIRECTION COUPLING: the locator's USE of a verdict=TRUE for a genuinely
     /// reachable PRIVATE provider SUPPRESSES the circuit and records NO disclosure (the exact
     /// over-disclosure TASK-221 removes). Driven through the real `circuit_from_verdict` with an
@@ -829,9 +948,7 @@ mod circuit_provenance_tests {
         let (_node, ledger, locator) = consumer([34u8; 32], vec![relay]).await;
         let provider = PeerId::random();
         // A PRIVATE (RFC1918) same-LAN address the probe DID reach -> verdict = true.
-        let dht_addrs: Vec<Multiaddr> = vec!["/ip4/192.168.3.9/tcp/4001".parse().unwrap()];
-
-        let composed = locator.circuit_from_verdict(provider, &dht_addrs, true);
+        let composed = locator.circuit_from_verdict(provider, true);
 
         assert!(
             composed.is_empty(),
@@ -846,20 +963,19 @@ mod circuit_provenance_tests {
     }
 
     /// F5 NEGATIVE-DIRECTION COUPLING (the mirror): the SAME private provider with verdict=FALSE
-    /// (probe did NOT reach it — cross-NAT) composes the circuit + records exactly one disclosure.
+    /// (probe did NOT reach it — cross-NAT) composes the circuit without recording use.
     /// MUTATION: the locator ignoring the verdict the OTHER way (always suppress — e.g.
     /// `compose_circuit_candidates(.., true)`) -> a cross-NAT provider gets no circuit -> reddens.
     #[tokio::test]
-    async fn unreachable_private_verdict_composes_circuit_and_discloses_once() {
+    async fn unreachable_private_verdict_composes_without_disclosure_until_selected() {
         let relay = (
             PeerId::random(),
             "/ip4/203.0.113.7/tcp/4001".parse().unwrap(),
         );
+        let relay_peer = relay.0;
         let (_node, ledger, locator) = consumer([35u8; 32], vec![relay]).await;
         let provider = PeerId::random();
-        let dht_addrs: Vec<Multiaddr> = vec!["/ip4/192.168.3.9/tcp/4001".parse().unwrap()];
-
-        let composed = locator.circuit_from_verdict(provider, &dht_addrs, false);
+        let composed = locator.circuit_from_verdict(provider, false);
 
         assert_eq!(
             composed.len(),
@@ -868,8 +984,15 @@ mod circuit_provenance_tests {
         );
         assert_eq!(
             relay_disclosures(&ledger),
+            0,
+            "composing a candidate MUST NOT record a relay disclosure"
+        );
+
+        locator.record_selected_relay(provider, relay_peer);
+        assert_eq!(
+            relay_disclosures(&ledger),
             1,
-            "composing the circuit MUST record exactly one Relay disclosure"
+            "selecting an exact live relayed route records the actual disclosure"
         );
     }
 

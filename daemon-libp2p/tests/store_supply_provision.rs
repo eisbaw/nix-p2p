@@ -18,8 +18,8 @@ use daemon_core::{
     RegularFileNarDumper, StorePath,
 };
 use daemon_libp2p::{
-    LanShare, Libp2pCatalogProbe, Libp2pSourceConfig, announce_store_provisions,
-    build_libp2p_provider_source, verify_store_provisions,
+    InitialAnnounceConfig, LanShare, Libp2pCatalogProbe, Libp2pSourceConfig,
+    announce_store_provisions, build_libp2p_provider_source, verify_store_provisions,
 };
 use fabric_libp2p::{
     CatalogNarSupplier, Libp2pFabric, Libp2pNarSupplier, MemoryNarSupplier, Multiaddr, NodeConfig,
@@ -230,6 +230,8 @@ async fn shipped_store_announce_carries_verified_content_and_refuses_quarantined
         identity_seed: [12u8; 32],
         network_scope: scope.to_string(),
         listen: Some("/ip4/127.0.0.1/tcp/0".parse().unwrap()),
+        additional_listens: Vec::new(),
+        external_addresses: Vec::new(),
         bootstrap: vec![(boot_peer, boot_addr)],
         provider_addrs: vec![],
         discovery_budget: DiscoveryBudget::new(Duration::from_secs(10), 32),
@@ -238,7 +240,7 @@ async fn shipped_store_announce_carries_verified_content_and_refuses_quarantined
         relay_server_enabled: true,
         kad_server: true,
     };
-    let (fabric, _source, _raw) = build_libp2p_provider_source(
+    let (fabric, _source, _raw, readiness) = build_libp2p_provider_source(
         cfg,
         Arc::new(MemoryNarSupplier::new([body.clone()])),
         Arc::new(peer_fabric::AdmitAllPublication),
@@ -270,12 +272,10 @@ async fn shipped_store_announce_carries_verified_content_and_refuses_quarantined
     let provisions = verify_store_provisions(&index, &[true_key]).expect("verifies");
     let records = announce_store_provisions(
         &fabric,
-        [12u8; 32],
+        &readiness,
+        InitialAnnounceConfig::new([12u8; 32], 3600, unix_now(), &budget),
         &provisions,
         LanShare::operator_assembled(),
-        3600,
-        unix_now(),
-        &budget,
     )
     .await
     .expect("a verified provision announces on the shipped store path");
@@ -309,12 +309,10 @@ async fn shipped_store_announce_carries_verified_content_and_refuses_quarantined
     let none = refused.unwrap_or_default();
     let records = announce_store_provisions(
         &fabric,
-        [12u8; 32],
+        &readiness,
+        InitialAnnounceConfig::new([12u8; 32], 3600, unix_now(), &budget),
         &none,
         LanShare::operator_assembled(),
-        3600,
-        unix_now(),
-        &budget,
     )
     .await
     .expect("announcing an empty (verify-refused) provision set is Ok");

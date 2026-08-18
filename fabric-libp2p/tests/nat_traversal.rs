@@ -257,33 +257,29 @@ async fn relay_server_opt_out_declines_reservations() {
         .clone()
         .with(Protocol::P2p(relay_peer))
         .with(Protocol::P2pCircuit);
-    // `listen` on the circuit only REQUESTS a reservation; it returns once the listener is
-    // registered, not once a reservation is granted. Against an opted-out relay the request
-    // is refused (no relay-server protocol), so no `/p2p-circuit` address is ever advertised.
-    provider
-        .handle
-        .listen(circuit_listen)
-        .await
-        .expect("provider registers the circuit listener (the request itself still issues)");
+    // Listener readiness is the exact ListenerId's first `NewListenAddr`, not mere registration.
+    // An opted-out relay therefore fails this bounded wait with the correlated terminal listener
+    // error. Reverting `listen` to registration-only success makes this assertion fail.
+    let listen_error = tokio::time::timeout(
+        Duration::from_secs(10),
+        provider.handle.listen(circuit_listen.clone()),
+    )
+    .await
+    .expect("reservation refusal must resolve inside the test's outer safety bound")
+    .expect_err("an opted-out relay must refuse the circuit listener before it becomes ready");
+    assert!(
+        listen_error.contains("closed before NewListenAddr")
+            && listen_error.contains("Failed to get Reservation")
+            && listen_error.contains(&circuit_listen.to_string()),
+        "reservation refusal must identify the requested listener and terminal readiness cause: {listen_error}"
+    );
 
-    // Bounded negative wait: poll well past the sub-second window the positive test needs, and
-    // assert NO `/p2p-circuit` listen address ever appears. ~6s (120 * 50ms) is comfortably
-    // longer than a granted reservation takes on loopback, so a miss here is a genuine refusal,
-    // not a slow grant.
-    let mut circuit_addr = None;
-    for _ in 0..120 {
-        if let Some(a) = provider
-            .handle
-            .listen_addrs()
-            .await
-            .into_iter()
-            .find(|a| a.iter().any(|p| matches!(p, Protocol::P2pCircuit)))
-        {
-            circuit_addr = Some(a);
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
+    let circuit_addr = provider
+        .handle
+        .listen_addrs()
+        .await
+        .into_iter()
+        .find(|a| a.iter().any(|p| matches!(p, Protocol::P2pCircuit)));
     assert!(
         circuit_addr.is_none(),
         "opted-out relay must grant NO reservation, but the provider advertised a circuit \

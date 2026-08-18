@@ -466,6 +466,39 @@ storage, so the opaque-value model holds no matter which backend TASK-103 adopts
   `peer-fabric/tests/golden/provider_record_libp2p_tag2.json`, checked by the Rust
   byte-pin and the independent pure-Python decoder/signature oracle
   `scripts/check-provider-record-libp2p-tag2.py`; the TASK-126 anchor is not edited.
+- **Signed relay-hint runtime** (TASK-219): both binaries pass every listen and
+  external address through the same construction path. All listeners are registered
+  before one bounded, `ListenerId`-correlated readiness wait. The provider builder
+  returns a private-field readiness token; all four initial seed/store, LAN/public
+  announce doors require it. After the whole batch is content/allowlist verified and
+  immediately before signing, the door crosses the token and captures the live
+  listener set exactly once, so every record in that batch carries one consistent
+  snapshot (an empty batch still crosses the barrier). Relay `NodeId`s must be strict
+  ed25519 identities; self, malformed, non-canonical, and over-two sets fail closed.
+  Configured or attempted reservations are never publication truth. Announce-after-fetch
+  remains event-scoped and derives live truth for that event; no event-driven churn
+  reannouncement exists yet, so an already-published stale hint remains TTL-bounded.
+  No separate mutable provider-to-relay state is kept.
+- **Consumer route order** (TASK-219): query P through raw kad and try direct first;
+  a live/public/loopback direct route performs zero hint queries. Otherwise read
+  P's exact signed `RelayHints`, query each relay identity through raw kad (at most
+  two), and compose bounded circuit addresses transiently. The flat provider-independent
+  `known_relays` rollout fallback is used only for an actually empty legacy hint set;
+  a non-empty signed set remains authoritative even when every member is unresolved.
+  Raw kad may supply relay transport addresses, but an unsigned raw P-to-relay circuit
+  address is not authority and is ignored as a candidate. Any connection it opened may
+  remain live for concurrent work, but cannot carry this offer unless its exact observed
+  relay is authorized. No candidate enters a provider-keyed address map/cache.
+- **Live-route authorization** (TASK-219): transient success is tied to the exact
+  `DialOpts` `ConnectionId`. Current `ConnectedPoint` facts classify each live
+  connection as direct, relayed-via-R, or unknown. The vendored, provenance-pinned
+  `libp2p-stream` delta opens the NAR protocol on that exact `(PeerId, ConnectionId)`
+  atomically and has no peer-wide random fallback or auto-dial. Mismatched/unknown
+  routes remain live but are ineligible for this request. Dropped/timed-out exact dials
+  leave bounded authority tombstones until their terminal event; a late success is
+  closed before it can become selectable. One absolute dial deadline covers both exact
+  connection establishment and stream open. The tests exercise simultaneous substitutions
+  on one R2 route and conflicting R2-only/R1-only requests without peer-wide teardown.
 - **Rollout dispatch compatibility**: `Libp2pTransport` registers natively under
   `TransportTag::Libp2p`. A separate fallback namespace may translate a historical
   Iroh-tagged offer to the libp2p implementation during rollout, but it reports and

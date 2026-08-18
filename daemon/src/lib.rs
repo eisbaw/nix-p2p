@@ -94,14 +94,14 @@ pub use iroh_runtime::{
 // `daemon::build_libp2p_nar_source`, etc. and the integration tests are unchanged.
 pub use daemon_libp2p::{
     AllowlistEligibility, AnnounceAfterFetchDoor, ApprovedPublicProvision, ApprovedPublicSeed,
-    IDENTITY_SEED_FILENAME, LanReachability, LanShare, Libp2pAnnounceAfterFetch,
-    Libp2pCatalogProbe, Libp2pNarSource, Libp2pRawServe, Libp2pSourceConfig, SeedNarHashMismatch,
-    StoreProvision, announce_provider_seeds, announce_public_provisions, announce_public_seeds,
-    announce_store_provisions, approve_provisions_for_public, approve_seeds_for_public,
-    build_libp2p_nar_source, build_libp2p_provider_source, lan_isolation_or_refuse,
-    open_public_allowlist, provider_content_key, resolve_durable_identity_seed,
-    sign_libp2p_provider_record, sign_libp2p_store_record, verify_provider_seeds,
-    verify_store_provisions,
+    IDENTITY_SEED_FILENAME, InitialAnnounceConfig, LanReachability, LanShare,
+    Libp2pAnnounceAfterFetch, Libp2pCatalogProbe, Libp2pNarSource, Libp2pRawServe,
+    Libp2pSourceConfig, SeedNarHashMismatch, StoreProvision, announce_provider_seeds,
+    announce_public_provisions, announce_public_seeds, announce_store_provisions,
+    approve_provisions_for_public, approve_seeds_for_public, build_libp2p_nar_source,
+    build_libp2p_provider_source, lan_isolation_or_refuse, open_public_allowlist,
+    provider_content_key, resolve_durable_identity_seed, sign_libp2p_provider_record,
+    sign_libp2p_store_record, verify_provider_seeds, verify_store_provisions,
 };
 pub use transport_iroh::{
     BODY_IDLE_TIMEOUT, DEFAULT_MAX_INFLIGHT_NAR_BYTES, DEFAULT_MAX_SERVE_DURATION,

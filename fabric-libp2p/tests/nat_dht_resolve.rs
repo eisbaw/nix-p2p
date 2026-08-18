@@ -1,9 +1,7 @@
-//! TASK-218: a consumer that did ONLY kad discovery must RESOLVE a NAT'd provider's
-//! `/p2p-circuit` dial-address WITHOUT any injected address. This file proves the RESOLUTION
-//! (CONSTRUCTION) half - the discovery-only consumer CONSTRUCTS the circuit dial-address
-//! (ROUTE 1, mped-architect-ruled) from the provider PeerId it got via kad `get_providers`
-//! PLUS a relay it already knows from bootstrap config - and that the resolved DialInfo is
-//! DIALABLE end to end.
+//! TASK-218/TASK-219 focused locator controls. A discovery-only consumer receives no injected
+//! provider address. The first test proves a directly reachable provider returns before querying
+//! even a real signed relay hint. The second preserves the provider-independent `known_relays`
+//! rollout fallback and proves it composes distinct circuit destinations without a provider map.
 //!
 //! SCOPE - this file proves CONSTRUCTION + DIALABILITY, NOT relay CARRIAGE. These are LOOPBACK
 //! tests: the provider's direct listen address (which it must bind for the relay-client
@@ -19,11 +17,10 @@
 //! so a fetch incidentally works; behind a real NAT it is a PRIVATE unreachable addr and the
 //! circuit is the only reachable one -> a "kad peer-routing miss" and upstream fallback.
 //!
-//! HONEST SCOPE / GENERALITY LIMIT: ROUTE 1 resolves a provider that reserved on a relay the
-//! consumer ALREADY knows from config (the single shared-relay case - the harness, and the
-//! common "a known public relay" deployment). The multi-relay case (consumer does not know
-//! which relay a provider chose) needs the relay identity to propagate through the DHT and is
-//! the filed follow-up TASK-219. These tests deliberately use ONE shared relay.
+//! HONEST SCOPE: these loopback controls are not the general multi-relay proof. The production
+//! writer/read path, a consumer bootstrapped only through R1, provider reserved only on R2,
+//! wrong/empty/dead hints, two-hint dead/live fallback, and exact NAR bytes are exercised in
+//! `daemon-libp2p/tests/multi_relay_hints.rs`.
 
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -33,9 +30,9 @@ use fabric_libp2p::{
     Libp2pFabric, Libp2pNarSupplier, MemoryNarSupplier, Multiaddr, NodeConfig, PeerId, Protocol,
 };
 use peer_fabric::{
-    AnnounceBudget, Blake3Digest, ContentKey, DiscoveryBudget, Lookup, NodeId, PeerFabric,
-    ProviderRecord, ResolutionPolicy, SafetyEnvelope, ServeBudget, TransportOffer, TransportTag,
-    sign_provider_record,
+    AnnounceBudget, Blake3Digest, ContentKey, Disclosed, DiscoveryBudget, Lookup, NodeId,
+    PeerFabric, ProviderRecord, Recipient, RelayHints, ResolutionPolicy, SafetyEnvelope,
+    ServeBudget, TransportOffer, TransportTag, sign_provider_record,
 };
 
 /// TASK-231: wrap a record in a PublicationWitness for the witness-taking `announce`. A test
@@ -314,11 +311,34 @@ async fn discovery_only_consumer_resolves_loopback_provider_directly_and_compose
     let transport = consumer
         .transfer(TransportTag::Libp2p)
         .expect("transport present");
-    let offer = TransportOffer::libp2p(provider_node);
+    // Give the direct provider a real signed-shape relay hint, then count the locator's DHT
+    // consultations. The fetch must query only P (one OurNodeId->DhtNode entry); querying the
+    // hinted relay despite the direct loopback path would make the delta two and fail.
+    let dht_queries_before = consumer
+        .exposure_ledger()
+        .entries()
+        .iter()
+        .filter(|entry| entry.to == Recipient::DhtNode && entry.disclosed == Disclosed::OurNodeId)
+        .count();
+    let offer = TransportOffer::Libp2p {
+        node: provider_node,
+        relay_hints: RelayHints::try_from([relay.node_id()]).expect("one strict relay hint"),
+    };
     let bytes = transport
         .fetch(&content, &offer, Some(nar.len() as u64), &envelope())
         .await
         .expect("fetch succeeds off the resolved dial address (no injection)");
+    let dht_queries_after = consumer
+        .exposure_ledger()
+        .entries()
+        .iter()
+        .filter(|entry| entry.to == Recipient::DhtNode && entry.disclosed == Disclosed::OurNodeId)
+        .count();
+    assert_eq!(
+        dht_queries_after - dht_queries_before,
+        1,
+        "a directly reachable provider must query P once and perform ZERO relay-hint queries"
+    );
     assert_eq!(
         bytes, nar,
         "fetched bytes are byte-identical to the served NAR"

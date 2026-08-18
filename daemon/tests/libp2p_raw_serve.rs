@@ -365,6 +365,8 @@ async fn libp2p_hit_under_compressed_narinfo_is_rewritten_to_raw_and_a_nix_clien
         identity_seed: [4u8; 32],
         network_scope: scope.to_string(),
         listen: Some("/ip4/127.0.0.1/tcp/0".parse().unwrap()),
+        additional_listens: Vec::new(),
+        external_addresses: Vec::new(),
         bootstrap: vec![(boot_peer, boot_addr.clone())],
         provider_addrs: vec![(provider_peer, provider_addr)],
         discovery_budget: DiscoveryBudget::new(Duration::from_secs(10), 32),

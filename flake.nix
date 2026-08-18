@@ -53,13 +53,16 @@
       # Task-48 widens it by exactly one class: the COMMITTED golden vectors
       # (daemon/tests/golden/*.json), which `daemon/tests/golden_vectors.rs`
       # `include_str!`s so the frozen addressed-unit encoding is conformance-tested
-      # inside the sandbox. These are a tracked source input (unlike the fixture
-      # cache), so keeping them is exactly the widening task-1 anticipated.
+      # inside the sandbox. TASK-219 also keeps the exact README + MIT license of the
+      # reproducibly vendored libp2p-stream patch; its crate root `include_str!`s the README and
+      # dropping either provenance file from the Nix source would make the vendored build
+      # incomplete. These are tracked source inputs (unlike the fixture cache).
       src = pkgs.lib.cleanSourceWith {
         src = ./.;
         name = "source";
         filter = path: type:
           (builtins.match ".*/tests/golden/.*\\.json$" path != null)
+          || (builtins.match ".*/vendor/libp2p-stream/(README\\.md|LICENSE)$" path != null)
           || craneLib.filterCargoSources path type;
       };
 

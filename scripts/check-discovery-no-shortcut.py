@@ -85,12 +85,12 @@ FORBIDDEN = {
 # asserted by the second self-test arm (a composition adding these must NOT trip).
 PERMITTED_DIAL_ASSISTANCE = ("autonat", "dcutr", "relay")
 
-# TASK-218 (mped-architect must-fix #3, tightened per codex finding #4): the relay-circuit
-# dial-address the locator COMPOSES for a NAT'd provider must come from a CONFIG-LEVEL,
-# provider-INDEPENDENT relay set (`known_relays`), never from a per-provider / per-content
-# channel. A per-provider relay association is "the relay THIS provider is on", i.e. address
-# injection under another name - reintroducing exactly what the kad-exclusive discovery
-# guarantee forbids. We enforce it STRUCTURALLY against THREE shapes:
+# TASK-218/TASK-219: the legacy relay-circuit input must remain the CONFIG-LEVEL,
+# provider-INDEPENDENT `known_relays`. TASK-219 adds one deliberate provider->relay association:
+# `TransportOffer::Libp2p { relay_hints: RelayHints }` inside the exact-key DHT record. That typed
+# value is bounded/canonical and covered by the provider's signature; it is the discovery proof,
+# not out-of-band injection. What remains forbidden is an AUXILIARY mutable provider/content-keyed
+# relay map/cache or untyped address channel alongside the record. We enforce that structurally:
 #   (A) `known_relays` declared as anything other than a flat `Vec<...>` (a map keyed by an
 #       identity) - the original check;
 #   (B) `known_relays: Vec<(NodeId|ContentKey|Provider..., ...)>` - a Vec whose element is
@@ -100,8 +100,8 @@ PERMITTED_DIAL_ASSISTANCE = ("autonat", "dcutr", "relay")
 #       provider/content identity (`relay_by_provider: BTreeMap<NodeId, _>`, etc). The
 #       legitimate `peer_address_book: BTreeMap<NodeId, Vec<Multiaddr>>` is NOT flagged - its
 #       name carries no relay/circuit token and it is the zero-disclosure ExplicitPeers book.
-# Prose/doc mentions (comment lines) are ignored. A NodeId/ContentKey identifies the
-# A NodeId/ContentKey/Provider* identifies the CONTENT/PROVIDER; a PeerId identifies the RELAY
+# Prose/doc mentions (comment lines) are ignored. A NodeId/ContentKey/Provider* identifies the
+# CONTENT/PROVIDER; a PeerId identifies the RELAY
 # transport. Keying a relay set by the FORMER is per-provider injection; by the latter is fine.
 IDENTITY_KEY = r"(?:NodeId|ContentKey|Provider\w*)"
 # An IDENTITY-KEYED CONTAINER: a map/set keyed by a provider/content identity, OR a tuple
@@ -144,9 +144,13 @@ def _strip_line_comments(text: str) -> str:
 
 
 def scan_relay_provider_independence(roots: list[Path]) -> list[str]:
-    """No relay/circuit set may be keyed by a provider/content identity - as a map, set,
-    tuple-Vec, one line or across several, DIRECTLY or via a type ALIAS (TASK-218, codex #2/#4).
-    The relay set the locator composes circuit addresses from must be provider-INDEPENDENT."""
+    """No AUXILIARY relay/circuit collection may be keyed by provider/content identity.
+
+    The exact signed record's typed, bounded `RelayHints` value is deliberately allowed; it is
+    the authority, not a map/cache. Literal or aliased maps, sets, and tuple-Vec side channels
+    remain forbidden (TASK-218/TASK-219, codex #2/#4). The legacy config relay set must remain
+    provider-independent.
+    """
     # Pass 1: collect every file's comment-stripped source AND the set of type-alias names that
     # resolve to an identity-keyed container (so alias INDIRECTION cannot launder the injection).
     files: list[tuple[Path, str]] = []
@@ -174,8 +178,9 @@ def scan_relay_provider_independence(roots: list[Path]) -> list[str]:
             violations.append(
                 f"{source}: a relay/circuit set keyed by a provider/content identity "
                 f"({snippet!r}) - associating relays with a provider/content is per-provider "
-                "circuit-address injection under another name (TASK-218). The relay set MUST "
-                "be provider-INDEPENDENT (e.g. Vec<(PeerId, Multiaddr)>)."
+                "circuit-address injection under another name (TASK-218/TASK-219). Use the "
+                "bounded signature-bound RelayHints value, or keep config provider-INDEPENDENT "
+                "(e.g. Vec<(PeerId, Multiaddr)>)."
             )
         for m in RELAY_FIELD_TYPE_NAME.finditer(code):
             if m.group(1) in tainted_aliases:
@@ -254,14 +259,14 @@ def self_test() -> int:
             )
             return 1
         (root / "dial_assistance.rs").unlink()
-        # TASK-218 provider-independence: the shipped provider-INDEPENDENT forms MUST pass;
-        # EVERY provider-keyed relay association (map, Vec-keyed, or a *relay* map) MUST bite.
-        # ALLOWED: the flat known_relays Vec AND the legit NodeId-keyed peer_address_book
-        # (its name carries no relay/circuit token, so it is NOT a relay association).
+        # TASK-218/TASK-219: allowed forms MUST pass: flat provider-independent known_relays,
+        # the explicit-peer book, and the bounded signature-bound RelayHints VALUE. Every
+        # auxiliary provider-keyed relay map/cache must still bite.
         (root / "relay_ok.rs").write_text(
             "pub struct Cfg {\n"
             "    pub known_relays: Vec<(PeerId, Multiaddr)>,\n"
             "    pub peer_address_book: BTreeMap<NodeId, Vec<Multiaddr>>,\n"
+            "    pub relay_hints: RelayHints,\n"
             "    /// doc prose: a known_relays: BTreeMap<NodeId, _> would be forbidden (comment)\n"
             "    pub relay: Toggle<relay::Behaviour>,\n"
             "}\n"
@@ -271,8 +276,8 @@ def self_test() -> int:
         )
         if relay_ok:
             print(
-                "self-test FAILED: a legit shape (flat known_relays Vec, NodeId-keyed "
-                "peer_address_book, a relay Toggle, or a comment mention) was flagged as "
+                "self-test FAILED: a legit shape (flat known_relays Vec, signed RelayHints, "
+                "NodeId-keyed peer_address_book, a relay Toggle, or a comment mention) was flagged as "
                 f"per-provider injection ({relay_ok})",
                 file=sys.stderr,
             )
@@ -287,6 +292,7 @@ def self_test() -> int:
             # codex #4: the tuple-Vec form (a map keyed by provider under a Vec of pairs).
             "relay_by_provider_vec": "    pub relay_by_provider: Vec<(NodeId, Multiaddr)>,",
             "provider_circuit_map": "    pub provider_circuits: HashMap<ContentKey, Multiaddr>,",
+            "relay_hint_cache": "    pub relay_hint_cache: HashMap<NodeId, RelayHints>,",
             # codex #4: a MULTILINE declaration (name and type on different lines).
             "relay_multiline": "    pub provider_relays:\n        BTreeMap<NodeId, Multiaddr>,",
             # codex #4: a type ALIAS whose name mentions relay and is identity-keyed.
@@ -344,7 +350,7 @@ def self_test() -> int:
         print(
             "check-discovery-no-shortcut: self-test OK - clean composition passes, the "
             "permitted NAT-traversal trio (autonat/dcutr/relay) is ALLOWED, and adding "
-            "mdns::Behaviour BITES (AC#9 mutation caught)"
+            "mdns::Behaviour or an auxiliary provider-keyed relay cache BITES"
         )
         return 0
 
@@ -360,7 +366,7 @@ def main(argv: list[str]) -> int:
             return 0
     roots = [Path(a) for a in args] if args else [Path(r) for r in DISCOVERY_ROOTS]
     violations, scanned = scan(roots)
-    # TASK-218: also enforce that the relay-circuit composition input is provider-independent.
+    # TASK-218/219: allow signed RelayHints, forbid auxiliary provider-keyed relay state.
     violations = violations + scan_relay_provider_independence(roots)
     if scanned == 0:
         print(
@@ -380,7 +386,8 @@ def main(argv: list[str]) -> int:
     print(
         f"check-discovery-no-shortcut: OK - {scanned} shipped discovery source file(s) "
         "scanned; discovery is kad-EXCLUSIVE (no mdns/rendezvous/gossipsub/floodsub); "
-        "the NAT-traversal trio (autonat/dcutr/relay) is permitted dial-assistance"
+        "signed RelayHints and the NAT-traversal trio are permitted dial-assistance; "
+        "auxiliary provider-keyed relay maps/caches remain forbidden"
     )
     return 0
 

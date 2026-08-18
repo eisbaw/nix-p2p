@@ -1,0 +1,39 @@
+# Normalized standalone manifest for the crates.io libp2p-stream 0.4.0-alpha source.
+# See README.md for the exact upstream checksum/commit and the local TASK-219 patch.
+[package]
+edition = "2021"
+rust-version = "1.83.0"
+name = "libp2p-stream"
+version = "0.4.0-alpha"
+description = "Generic stream protocols for libp2p"
+readme = "README.md"
+keywords = ["peer-to-peer", "libp2p", "networking"]
+categories = ["network-programming", "asynchronous"]
+license = "MIT"
+repository = "https://github.com/libp2p/rust-libp2p"
+
+[lib]
+name = "libp2p_stream"
+path = "src/lib.rs"
+
+[dependencies]
+futures = "0.3.30"
+libp2p-core = "0.43.1"
+libp2p-identity = { version = "0.2.12", features = ["peerid"] }
+libp2p-swarm = "0.47.0"
+rand = "0.8"
+tracing = "0.1.41"
+
+[lints.clippy]
+dbg_macro = "warn"
+manual_let_else = "warn"
+type_complexity = "allow"
+unnecessary_wraps = "warn"
+used_underscore_binding = "warn"
+
+[lints.clippy.pedantic]
+level = "allow"
+priority = -1
+
+[lints.rust]
+unreachable_pub = "warn"
