@@ -548,10 +548,21 @@ fn derive_contract(config: &Config) -> Result<OperatorContract, String> {
         // governed by the allowlist door. Iroh public reachability is handled by the #3a scope
         // gate below (a global iroh endpoint is the iroh analogue of a public self-address).
         advertises_public_address: false,
-        // "Reaches a peer substrate" - a libp2p bootstrap OR an iroh consume side (fix B). An
-        // iroh-consuming node with no give-side flag is CONSUME-ONLY (fetches from peers), never
-        // upstream-only: it is a lie to report HTTP-only while an iroh transport fetches.
-        has_bootstrap: !config.libp2p_bootstrap.is_empty() || iroh_consume_active(config),
+        // "Reaches a peer substrate" - a libp2p bootstrap, `--libp2p-mdns`, OR an iroh consume side
+        // (fix B). An iroh-consuming node with no give-side flag is CONSUME-ONLY (fetches from
+        // peers), never upstream-only: it is a lie to report HTTP-only while an iroh transport
+        // fetches. TASK-257 (F1): `--libp2p-mdns` IS a consumer's DHT ENTRY PATH exactly like an
+        // explicit `--libp2p-bootstrap` (mDNS discovers a LAN neighbour's address with zero config),
+        // so it must count here too. Without it, bare `--libp2p-mdns` would derive UPSTREAM-ONLY
+        // while `libp2p_requested()` still opens the mDNS multicast socket - reporting HTTP-only
+        // while the wire emits mDNS multicast and discloses presence+NodeId to the LAN (a
+        // report-does-not-match-wire AC#4 violation). Folding it here makes bare `--libp2p-mdns`
+        // derive CONSUME-ONLY (report matches wire), and an explicit `--profile upstream-only
+        // --libp2p-mdns` fail CLOSED at the compat-shim cross-check below (declared upstream-only !=
+        // implied consume-only).
+        has_bootstrap: !config.libp2p_bootstrap.is_empty()
+            || config.libp2p_mdns
+            || iroh_consume_active(config),
         // The composite daemon exposes no `--libp2p-router`: the pure kad-server/relay ROUTER mode
         // (TASK-241) is a daemon-libp2p-primary surface. Never a router here.
         is_router: false,
@@ -2880,6 +2891,63 @@ mod tests {
             "an iroh-consuming node must report iroh ACTIVE"
         );
         assert!(contract.preflight().contains("iroh-transport = ACTIVE"));
+    }
+
+    /// TASK-257 (F1): the COMPOSITE daemon must never report upstream-only while its swarm opens
+    /// the mDNS multicast socket. `--libp2p-mdns` IS a consumer's DHT ENTRY PATH (same as an
+    /// explicit `--libp2p-bootstrap`), so a bare `--libp2p-mdns` node derives CONSUME-ONLY - and
+    /// the WIRE really is mdns-active (the built source config opens the socket), so report matches
+    /// wire. MUTATION: dropping `config.libp2p_mdns` from `has_bootstrap` re-derives UpstreamOnly
+    /// while `libp2p_requested()` still opens the socket - the exact report-does-not-match-wire /
+    /// AC#4 bug; the profile assertion reddens.
+    #[test]
+    fn composite_bare_mdns_is_consume_only_and_report_matches_wire() {
+        let config = Config::from_args(vec!["--libp2p-mdns".to_string()])
+            .expect("bare --libp2p-mdns parses");
+        let contract = derive_contract(&config).expect("bare --libp2p-mdns derives a profile");
+        assert_ne!(
+            contract.profile,
+            SharingProfile::UpstreamOnly,
+            "a node opening the mDNS multicast socket must NOT report upstream-only (zero-P2P)"
+        );
+        assert_eq!(contract.profile, SharingProfile::ConsumeOnly);
+        assert!(
+            contract.lan_mdns_enabled,
+            "the contract must report mDNS active"
+        );
+        // The WIRE the report must match: the swarm this config builds opens the mDNS socket.
+        assert!(
+            config.libp2p_requested(),
+            "bare --libp2p-mdns must engage the libp2p swarm"
+        );
+        assert!(
+            config
+                .libp2p_source_config()
+                .expect("bare --libp2p-mdns builds a source config")
+                .mdns_enabled,
+            "the swarm this config builds opens the mDNS socket - the report must match the wire"
+        );
+    }
+
+    /// TASK-257 (F1): the explicit contradiction `--profile upstream-only --libp2p-mdns` must FAIL
+    /// CLOSED (as daemon-libp2p does) - upstream-only is zero-P2P/zero-multicast and cannot carry an
+    /// mDNS socket. Caught at parse OR at the compat-shim cross-check in derive_contract.
+    #[test]
+    fn composite_upstream_only_plus_mdns_is_refused() {
+        let parsed = Config::from_args(vec![
+            "--profile".to_string(),
+            "upstream-only".to_string(),
+            "--libp2p-mdns".to_string(),
+        ]);
+        let err = match parsed {
+            Err(e) => e,
+            Ok(cfg) => derive_contract(&cfg)
+                .expect_err("--profile upstream-only + --libp2p-mdns must fail closed"),
+        };
+        assert!(
+            err.contains("disagrees") || err.to_lowercase().contains("upstream"),
+            "the refusal must name the upstream-only contradiction: {err}"
+        );
     }
 
     /// #3b: `iroh_publish_node` is a give-side publication, so `publishes_records` must reflect it -

@@ -984,13 +984,15 @@ impl OperatorContract {
             .map(|m| m.as_str())
             .collect();
         out.push(format!("mechanisms_enabled={}", enabled.join(",")));
-        // TASK-257 EXPOSURE (AC#6): mDNS discloses this host's presence + NodeId to every device on
-        // the LAN via link-local multicast. Surface it on --status as an explicit disclosure line so
-        // an operator SEES the local exposure, never silently accepts it. Off = the honest `none`.
+        // TASK-257 EXPOSURE (AC#6): mDNS discloses to every device on the LAN, via link-local
+        // multicast, this host's presence, its NodeId, AND its libp2p LISTEN MULTIADDRS (IP:port -
+        // how a peer learns the dial address); it ANSWERS ANY querier regardless of scope (scope is
+        // enforced only later, at the kad/identify handshake). Surface the FULL disclosure on
+        // --status so an operator SEES it, never silently accepts it. Off = the honest `none`.
         out.push(format!(
             "lan_mdns_exposure={}",
             if self.lan_mdns_enabled {
-                "presence+node_id-disclosed-to-lan"
+                "presence + node_id + libp2p-listen-multiaddrs (LAN-broadcast, answers any querier incl cross-scope)"
             } else {
                 "none"
             }
@@ -1079,9 +1081,13 @@ impl OperatorContract {
         if self.lan_mdns_enabled {
             out.push(
                 "  EXPOSURE (lan-mdns): this node opens a link-local mDNS multicast socket and \
-                 DISCLOSES its presence + NodeId to every device on the LAN. This is axis-1 LOCAL \
-                 discovery only - it supplies peer ADDRESSES into the kad bootstrap path and does \
-                 NOT serve, announce, publish, or join any public substrate."
+                 DISCLOSES to every device on the LAN its presence, its NodeId, AND its libp2p \
+                 LISTEN MULTIADDRS (IP:port - the dial address); it ANSWERS ANY querier regardless \
+                 of scope (scope is enforced only later, at the kad/identify handshake, so a \
+                 cross-scope device still learns this host exists and where to reach it, it just \
+                 cannot JOIN the DHT). This is axis-1 LOCAL discovery only - it supplies peer \
+                 ADDRESSES into the kad bootstrap path and does NOT serve, announce, publish, or \
+                 join any public substrate."
                     .to_string(),
             );
         }
@@ -1585,10 +1591,12 @@ mod tests {
             on.status(&rt).contains("lan-mdns"),
             "an mDNS-enabled node must list lan-mdns among enabled mechanisms"
         );
+        let on_status = on.status(&rt);
         assert!(
-            on.status(&rt)
-                .contains("lan_mdns_exposure=presence+node_id-disclosed-to-lan"),
-            "an mDNS-enabled node must disclose its LAN presence+NodeId exposure on --status"
+            on_status.contains("lan_mdns_exposure=presence + node_id + libp2p-listen-multiaddrs")
+                && on_status.contains("answers any querier incl cross-scope"),
+            "an mDNS-enabled node's --status exposure must name presence + NodeId + listen \
+             multiaddrs AND that it answers any querier incl cross-scope: {on_status}"
         );
         assert!(
             on.preflight()
