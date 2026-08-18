@@ -7,7 +7,7 @@ status: In Progress
 assignee:
   - '@claude'
 created_date: '2026-08-15 15:35'
-updated_date: '2026-08-17 06:28'
+updated_date: '2026-08-18 00:27'
 labels:
   - libp2p
   - fabric
@@ -15,6 +15,7 @@ labels:
   - hardening
 dependencies:
   - TASK-218
+  - TASK-156
 priority: high
 ---
 
@@ -26,74 +27,30 @@ TASK-218 landed ROUTE 1: a discovery-only consumer RESOLVES a NAT'd provider's /
 
 ## Acceptance Criteria
 <!-- AC:BEGIN -->
-- [ ] #1 A consumer that does NOT know a NAT'd provider's relay from config resolves the provider's /p2p-circuit dial-address and fetches byte-identical through that relay, proven against a topology with >= 2 relays where the provider reserves on a relay NOT in the consumer's bootstrap set
-- [ ] #2 The relay identity reaches the consumer through kad/the record (not out-of-band injection); check-discovery-no-shortcut.py and the kad-exclusive discovery guarantee are NOT weakened
-- [ ] #3 If ROUTE (B) is taken: the record-codec change is ADDITIVE, wire-reviewed, and does not break the frozen golden vectors
+- [ ] #1 In a >=2-relay topology, consumer C bootstraps only R1 while provider P has a live reservation only on R2; C discovers P's signed Libp2p offer, resolves R2 through kad, and fetches the exact NAR through R2 with no provider or R2 address injected into C
+- [ ] #2 Relay identity reaches C only as a bounded, canonical, signature-bound TransportOffer::Libp2p relay hint from the exact-key DHT record; relay addresses are never on wire and are resolved through raw kad peer routing; check-discovery-no-shortcut and kad-exclusive discovery remain biting
+- [ ] #3 Production writers derive hints only from currently live /p2p-circuit listen addresses after reservation acceptance, never from configured/attempted/bootstrap relays; configured circuit listeners are applied before announce and a missing requested reservation blocks first announce within a bounded integer deadline
+- [ ] #4 Libp2pTransport consumes record hints through the existing offer argument and an internal locator path without widening NarTransfer, NodeLocator, ProviderRecord, or daemon-core; a directly reachable provider causes no relay query, while unresolved hints are skipped and normal upstream fallback remains intact
+- [ ] #5 Bites remove/replace R2 with R1, stop R2 on the same warm consumer and attribute failure to NotOpened/unreachable, and exercise two hints with one dead/one live; each mutation fails while discovery remains healthy
+- [ ] #6 At most two relay identities/lookups and bounded circuit candidates are enforced; duplicate/unsorted/invalid/self relay hints fail closed; no provider-keyed relay map/cache, opaque extension, content identity, or dial address is introduced
 <!-- AC:END -->
 
 ## Implementation Notes
 
 <!-- SECTION:NOTES:BEGIN -->
-## TASK-219 SPIKE findings (2026-08-17, re-verified on libp2p 0.56)
+## Authoritative Compass ruling (2026-08-17)
 
-### 1. Empirical 0.56 root-cause result: circuit address STILL dropped to a third party
-Probe (2-relay topology, reverted; not committed) added to nat_dht_resolve.rs. R1=bootstrap the
-consumer knows; R2=relay the provider P reserves on but the consumer NEVER learns from config; C=
-third-party consumer joining via R1 only. Four attribution points via SwarmHandle::locate_peer
-(raw get_closest_peers addrs):
-  (i)   P.listen_addrs():  HAS the circuit /ip4/.../tcp/<R2>/p2p/<R2peer>/p2p-circuit/p2p/<P>
-  (ii)  R2.locate_peer(P): direct addr ONLY (no circuit)
-  (iii) R1.locate_peer(P): BOTH direct AND the circuit addr  <-- identify+kad DID carry it
-  (iv)  C.locate_peer(P):  direct addr ONLY (circuit DROPPED)  answered=3 (C DID contact R1)
-VERDICT: on 0.56 the /p2p-circuit still does NOT reach a third party. The 0.54 diagnosis holds.
-BUT the attribution is REFINED vs TASK-218: the drop is NOT in identify and NOT in kad storage
-(R1 proves identify propagates the circuit and kad stores it, iii). The drop is in the MULTI-SOURCE
-QUERY ADDRESS COLLECTION.
+This ruling supersedes the earlier spike recommendation to introduce ProviderRecord schema v2. That recommendation is obsolete and MUST NOT be implemented. TASK-156 established the reviewed wire contract: OFFER_LIBP2P=2 is an explicit additive member of the existing schema-v1 tagged offer union. It does not alter the layouts or signing bytes of tag-0 Iroh, tag-1 BitTorrent, or withdrawals. Schema version 2 remains the exact historical reject vector. A historical reader fails closed with UnknownOffer { tag: 2 }; rollout is therefore reader-first and coordinated.
 
-### 2. Exact mechanism (libp2p-kad 0.48 source)
-behaviour.rs Behaviour::discovered() line ~1231:
-    query.peers.addresses.insert(peer.node_id, addrs)
-addresses is FnvHashMap<PeerId, SmallVec<[Multiaddr;8]>>. insert OVERWRITES the whole per-peer
-address set with each responding source's view; into_peerinfos_iter() (query.rs ~318) returns the
-final map. So the LAST source to report P wins. R2 and P themselves report P with only the thin
-DIRECT addr, clobbering R1's richer direct+circuit set. find_closest_local_peers/KadPeer::from DO
-include all kbucket addrs (the circuit would be served by R1), and there is NO receive-side filter -
-the loss is purely the OVERWRITE (union would fix it). (Overwrite-vs-filter inferred from source +
-observation; strongly supported: C contacted R1 which holds the circuit, yet C's final set is thin.)
+### Root cause and rejected route A
 
-### 3. Route A (make circuit survive identify->kad) = REJECTED
-No public Config knob controls this. Config setters are timeout/replication/parallelism/disjoint/
-record-filtering/kbucket-inserts/caching/... NONE affects query address merge. discovered() is
-private; query.peers is pub(crate). Fixing it = FORK libp2p-kad to UNION addresses across sources
-(and keep circuit addrs). That is exactly the non-converging-internals FORK hazard the task flags.
-The task's viability bar ("clean supported knob, NOT an internals fork") is NOT met. OUT.
+The multi-relay probe on libp2p 0.56 found that circuit addresses reach a directly connected kad peer but are lost when get_closest_peers combines reports from multiple sources. libp2p-kad Behaviour::discovered overwrites the per-peer address set instead of taking a union. No supported Config knob changes this private query behavior, so route A would require a libp2p-kad fork and is rejected. check-discovery-no-shortcut.py must remain biting.
 
-### 4. Route B (signed relay-hint in the record) = RECOMMENDED, but the task's premise needs correcting
-CORRECTION: the FROZEN ProviderRecord codec does NOT drop unknown transport kinds - it FAILS CLOSED
-(UnknownOffer/UnknownVersion/TrailingBytes). The tolerate-and-DROP forward-compat is the daemon JSON
-CLAIM wire, NOT this codec (record_codec.rs module doc lines 20-28 say so explicitly). Therefore:
-  - Route B CANNOT ride a silent tolerate-drop slot on the ProviderRecord; none exists, and adding one
-    would REOPEN the exact TASK-110/223/224 no-enumeration vector (opaque tolerate-drop slot smuggles
-    content ids). So the hint MUST be a TYPED, fully-validated, SIGNED field, not an opaque slot.
-  - It MUST be a VERSIONED evolution: bump PROVIDER_RECORD_SCHEMA_VERSION 1->2, NEW golden file; v1
-    goldens stay frozen/untouched (satisfies AC#3 "does not break the frozen golden vectors" - read as
-    v1 vectors unchanged, v2 is a new set). Any body change alters the signing preimage, so an
-    in-place additive-and-silently-ignored field is STRUCTURALLY IMPOSSIBLE here by design (AC#2
-    no-unasked-field). Interop cost: v1-only nodes fail-closed on a v2 record (no interop until fleet
-    upgrades) - the honest main risk, acceptable for a benign coordinated-fleet cache.
-  - WIRE SHAPE: carry the RELAY IDENTITY only (relay NodeId, 32B), NOT its address. The consumer still
-    resolves the relay's dial address via kad get_closest_peers(relay) - relays are PUBLIC/directly
-    reachable so their addr survives (no overwrite problem for a direct addr). Keeps discovery
-    kad-EXCLUSIVE (AC#2): relay identity arrives via the signed record, its address via kad; nothing
-    out-of-band; check-discovery-no-shortcut.py NOT weakened.
-  - SIGNATURE (task Q3): the hint is inside the signed preimage, so a HOSTILE RELAY cannot inject/forge
-    a hint - only the provider signs. A lying provider naming a wrong relay only costs the consumer a
-    wasted dial + fallback (same failure mode as today's over-compose). No attacker redirect.
-  - NO-ENUMERATION (task Q1): fixed-size typed NodeId consumed ONLY as a relay identity for circuit
-    composition; cannot carry a content id. Cap the relay-hint count (small, e.g. <=2) and require
-    STRICT-ASCENDING canonical order like offers, so count/duplicate is not a covert channel (the
-    223/224 count/byte/content trio).
+### Selected route B and wire constraints
 
-### Recommendation: Route B, as schema-v2 signed relay-hint (relay NodeId), NOT a tolerate-drop slot.
-Route A is a kad fork (rejected). Frozen-seam change -> full wire review + codex gate + golden regen.
+Use the TASK-156 TransportOffer::Libp2p { node, relay_hints } tag-2 shape. Hints are signed relay NodeIds only: no relay addresses, content identifiers, opaque bytes, or tolerate-and-drop extension. RelayHints enforces at most two strict Ed25519 identities in ascending unique order; the record codec rejects self-relays, provider-node mismatch, and multiple Libp2p offers. The consumer resolves each relay identity through raw kad.
+
+### Runtime ownership for TASK-219
+
+Provider truth comes only from live accepted /p2p-circuit listen addresses immediately before signing. Requested circuit listeners are installed before first announce, and a missing requested reservation blocks announce within a bounded integer deadline. A changed relay set produces a strictly newer Provide, never a content withdrawal. Consumer resolution first tries the provider directly, then transiently resolves signed hints and composes bounded circuit candidates, then retains TASK-218 known_relays only as a legacy fallback. Dynamic event-driven reannounce after later reservation churn is outside the minimum task scope; stale signed hints remain bounded retries until record TTL and should receive a follow-up if not implemented.
 <!-- SECTION:NOTES:END -->
