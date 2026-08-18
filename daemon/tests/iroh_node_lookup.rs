@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::net::{Ipv4Addr, SocketAddr};
+use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -14,6 +14,82 @@ use iroh_dns::pkarr::{SignedPacket, Timestamp};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::oneshot;
+
+const LOOKUP_SHUTDOWN_TEST_PORT: u16 = 31_035;
+const LINUX_EPHEMERAL_PORT_RANGE: &str = "/proc/sys/net/ipv4/ip_local_port_range";
+
+struct FixedPortLease {
+    _file: std::fs::File,
+}
+
+impl FixedPortLease {
+    fn acquire(port: u16) -> Self {
+        let range = std::fs::read_to_string(LINUX_EPHEMERAL_PORT_RANGE)
+            .expect("read the Linux ephemeral-port range for the fixed-port oracle");
+        let mut bounds = range.split_whitespace();
+        let first = bounds
+            .next()
+            .expect("ephemeral-port range has a lower bound")
+            .parse::<u16>()
+            .expect("ephemeral-port lower bound is a u16");
+        let last = bounds
+            .next()
+            .expect("ephemeral-port range has an upper bound")
+            .parse::<u16>()
+            .expect("ephemeral-port upper bound is a u16");
+        assert!(bounds.next().is_none(), "unexpected ephemeral-port range");
+        assert!(
+            port < first || port > last,
+            "fixed shutdown oracle port {port} overlaps the Linux ephemeral range {first}..={last}"
+        );
+
+        let path =
+            std::env::temp_dir().join(format!("nix-p2p-task177-iroh-fixed-port-{port}.lock"));
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&path)
+            .unwrap_or_else(|error| panic!("open fixed-port lease {}: {error}", path.display()));
+        let lock_started = std::time::Instant::now();
+        loop {
+            match file.try_lock() {
+                Ok(()) => break,
+                Err(std::fs::TryLockError::WouldBlock) => {
+                    let remaining =
+                        daemon::IROH_SHUTDOWN_DEADLINE.saturating_sub(lock_started.elapsed());
+                    assert!(
+                        !remaining.is_zero(),
+                        "fixed-port lease {} remained busy for the runtime shutdown deadline {:?}",
+                        path.display(),
+                        daemon::IROH_SHUTDOWN_DEADLINE
+                    );
+                    std::thread::sleep(std::cmp::min(remaining, Duration::from_millis(10)));
+                }
+                Err(std::fs::TryLockError::Error(error)) => {
+                    panic!("acquire fixed-port lease {}: {error}", path.display())
+                }
+            }
+        }
+
+        // Probe the exact wildcard addresses used by EndpointScope::Global.
+        // They are checked sequentially because a platform's dual-stack IPv6
+        // socket may itself cover IPv4; the Iroh bind below proves that its
+        // configured pair can coexist.
+        for address in [
+            SocketAddr::from((Ipv4Addr::UNSPECIFIED, port)),
+            SocketAddr::from((Ipv6Addr::UNSPECIFIED, port)),
+        ] {
+            let probe = std::net::UdpSocket::bind(address).unwrap_or_else(|error| {
+                panic!("fixed Iroh shutdown-oracle address {address} is unavailable: {error}")
+            });
+            drop(probe);
+        }
+
+        Self { _file: file }
+    }
+}
 
 #[derive(Clone)]
 struct HttpResponse {
@@ -804,11 +880,15 @@ async fn dropping_the_asker_cancels_the_owned_tcp_get() {
 
 #[tokio::test]
 async fn shutdown_cancels_an_active_lookup_and_releases_its_fixed_iroh_port() {
+    // A port obtained from `bind(..., 0)` belongs to Linux's ephemeral
+    // allocator. Once shutdown correctly releases it, a parallel endpoint can
+    // acquire it before this test restarts and manufacture an EADDRINUSE false
+    // failure. Keep this named non-ephemeral port leased across processes and
+    // restart immediately after shutdown; retaining the old endpoint would
+    // still make the second full Iroh bind fail.
+    let _port_lease = FixedPortLease::acquire(LOOKUP_SHUTDOWN_TEST_PORT);
     let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
     let authority = listener.local_addr().unwrap();
-    let port_probe = std::net::UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
-    let iroh_port = port_probe.local_addr().unwrap().port();
-    drop(port_probe);
     let (accepted_tx, accepted_rx) = oneshot::channel();
     let (closed_tx, closed_rx) = oneshot::channel();
     let server = tokio::spawn(async move {
@@ -820,7 +900,9 @@ async fn shutdown_cancels_an_active_lookup_and_releases_its_fixed_iroh_port() {
     });
     let runtime = IrohRuntimeBuilder::new(
         EndpointProfile {
-            scope: EndpointScope::Global { port: iroh_port },
+            scope: EndpointScope::Global {
+                port: LOOKUP_SHUTDOWN_TEST_PORT,
+            },
         },
         IdentitySource::Ephemeral,
         RelayCapability::Disabled,
@@ -836,29 +918,21 @@ async fn shutdown_cancels_an_active_lookup_and_releases_its_fixed_iroh_port() {
     let lookup = tokio::spawn(async move { handle.resolve(node_id).await });
     accepted_rx.await.unwrap();
 
-    assert_eq!(runtime.shutdown().await.unwrap(), ShutdownOutcome::Graceful);
-    assert_eq!(
-        lookup.await.unwrap().unwrap_err().kind(),
-        NodeLookupUnavailableKind::Closed
-    );
-    match tokio::time::timeout(Duration::from_secs(1), closed_rx)
-        .await
-        .expect("shutdown must close the active lookup request")
-        .unwrap()
-    {
-        Ok(0) => {}
-        Err(error)
-            if matches!(
-                error.kind(),
-                std::io::ErrorKind::ConnectionReset | std::io::ErrorKind::BrokenPipe
-            ) => {}
-        observed => panic!("lookup TCP request remained active after shutdown: {observed:?}"),
-    }
-    server.await.unwrap();
+    let retained_port =
+        std::net::UdpSocket::bind((Ipv4Addr::UNSPECIFIED, LOOKUP_SHUTDOWN_TEST_PORT))
+            .expect_err("a live Iroh endpoint must make the fixed-port oracle bite");
+    assert_eq!(retained_port.kind(), std::io::ErrorKind::AddrInUse);
 
+    assert_eq!(runtime.shutdown().await.unwrap(), ShutdownOutcome::Graceful);
+
+    // Claim the released port before awaiting the TCP-side cancellation
+    // observations below. Those observations prove lookup ownership; they do
+    // not own, and cannot prove release of, the endpoint's UDP sockets.
     let restarted = IrohRuntimeBuilder::new(
         EndpointProfile {
-            scope: EndpointScope::Global { port: iroh_port },
+            scope: EndpointScope::Global {
+                port: LOOKUP_SHUTDOWN_TEST_PORT,
+            },
         },
         IdentitySource::Ephemeral,
         RelayCapability::Disabled,
@@ -867,7 +941,27 @@ async fn shutdown_cancels_an_active_lookup_and_releases_its_fixed_iroh_port() {
     .unwrap()
     .spawn()
     .await
-    .expect("lookup shutdown must release the fixed Iroh port");
+    .expect("lookup shutdown must release the fixed Iroh port for an immediate full restart");
+
+    let (lookup, closed, server) = tokio::time::timeout(daemon::IROH_SHUTDOWN_DEADLINE, async {
+        tokio::join!(lookup, closed_rx, server)
+    })
+    .await
+    .expect("shutdown cancellation observations must complete within the runtime deadline");
+    assert_eq!(
+        lookup.unwrap().unwrap_err().kind(),
+        NodeLookupUnavailableKind::Closed
+    );
+    match closed.unwrap() {
+        Ok(0) => {}
+        Err(error)
+            if matches!(
+                error.kind(),
+                std::io::ErrorKind::ConnectionReset | std::io::ErrorKind::BrokenPipe
+            ) => {}
+        observed => panic!("lookup TCP request remained active after shutdown: {observed:?}"),
+    }
+    server.unwrap();
     restarted.shutdown().await.unwrap();
 }
 
