@@ -186,6 +186,10 @@ test: _headroom build _python fixtures
     # The evidence fixture is feature-gated out of the workspace-default suite.
     cargo test --locked --package daemon --bin iroh-node-lookup-fixture --features evidence-fixture
     "${NIX_P2P_PYTHON}/bin/python3" scripts/check-fixtures.py
+    # task-53: NO --allow-missing-fixtures here. `fixtures` is a dependency of
+    # this recipe, so the tree IS present; absence is a real failure and must
+    # fail-CLOSED (exit 1), never soft-skip the addressed-unit byte-check.
+    "${NIX_P2P_PYTHON}/bin/python3" scripts/check-golden-vectors.py --self-test
     "${NIX_P2P_PYTHON}/bin/python3" scripts/check-golden-vectors.py
     # TASK-126: the INDEPENDENT second-implementation half of the ProviderRecord /
     # ContentKey freeze - recompute the discovery key with stock blake3 derive_key and
