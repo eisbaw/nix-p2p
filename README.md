@@ -1,257 +1,155 @@
 # nix-p2p
 
-A decentralized Nix binary cache. A localhost substituter daemon speaks the
-standard binary-cache HTTP API, passes signed metadata through from
-cache.nixos.org, and fetches NAR payloads from peers it discovers over a
-decentralized DHT — every payload hash-verified against the signed NarHash. An
-unmodified Nix client re-verifies the signature and NarHash itself, so the daemon
-and every peer stay **outside the trusted computing base**: a hostile or broken
-peer costs a retry, never a bad store path.
+A decentralized Nix binary cache. A localhost substituter daemon speaks the standard
+binary-cache HTTP API, passes signed metadata through from cache.nixos.org, and fetches
+NAR payloads from peers it discovers over a DHT — every payload hash-verified against
+the signed NarHash.
 
-The aim is **bandwidth offload for cache.nixos.org — decentralizing the bytes, not
-the trust.** Signing stays the cache's job.
+**Why:** cache.nixos.org is a single point of failure for the Nix ecosystem's
+*bandwidth*. Its trust role — signing narinfos — is cheap and replicable; its
+byte-serving role is not. nix-p2p decentralizes the bytes and only the bytes. An
+unmodified Nix client re-verifies the signature and NarHash itself, so the daemon and
+every peer stay **outside the trusted computing base**: a hostile or broken peer costs
+a retry, never a bad store path.
 
-**See it run:** `nix develop` then `just e2e` stands up separate daemon containers
-and drives a real `nix build` whose NAR is discovered, resolved, fetched, and
-served **from a peer** — no injected addresses, upstream untouched on a hit.
+> **Research prototype.** It has not been run against the real cache.nixos.org in a
+> deployment and has not faced a public network — no residential uplinks. Today it runs
+> on loopback, in-process, and single-host rootless-podman containers (NAT and relay are
+> proven only on containerized NAT). Within that scope the decentralized path is real
+> end to end. Whether peers actually beat a CDN is a thesis being measured, not a
+> premise — see [Does this help?](#does-this-help) below.
 
-> **Research prototype.** The daemon fronts cache.nixos.org over verified TLS, but has
-> not been run against the real cache in a deployment and has not faced a public
-> network — no NAT hole-punching, no relay, no residential uplink. It runs on loopback,
-> in-process, and single-host rootless-podman containers. Within that scope the
-> decentralized path is real end to end: separate daemon containers on isolated
-> network namespaces discover a provider, resolve its address, fetch, and serve a
-> NAR to an unmodified `nix build` with **no injected addresses**. The addressed
-> unit, the claim wire schema, and the discovery key/record are frozen; the
-> public-network story (NAT traversal, relay, residential uplinks) is still ahead,
-> and the transport tournament is deferred behind getting decentralized discovery
-> and robust connectivity solid first.
+## Quick start
 
-## Architecture
+```sh
+nix develop          # pinned toolchain; the Justfile refuses any other
+just e2e             # see it work: containers discover a peer and serve a real nix build
+```
+
+`just e2e` stands up separate daemon containers — a bootstrap router holding no content,
+a provider, and a consumer told *only* the bootstrap — and drives a real `nix build`
+whose NAR is discovered over the DHT, resolved, fetched, and served from the peer, with
+no injected addresses and upstream untouched on a hit.
+
+**Run it as your substituter.** The daemon is additive: it advertises a priority below
+cache.nixos.org, so Nix falls back automatically if it is slow, stopped, or killed
+mid-transfer.
+
+```sh
+nix run .#daemon-libp2p -- --listen 127.0.0.1:8082 --upstream https://cache.nixos.org
+```
+
+```
+# /etc/nix/nix.conf  — nix-p2p first, the real cache as fallback
+substituters = http://127.0.0.1:8082 https://cache.nixos.org
+```
+
+On NixOS, use the module instead:
+
+```nix
+services.nix-p2p = {
+  enable = true;
+  port = 8082;                        # loopback only; it is a substituter, not a service
+  libp2p.enable = true;
+  libp2p.profile = "consume-only";    # upstream-only (default) | consume-only
+};                                    # | lan-share | public-share | router
+```
+
+**A fresh install gives nothing away.** The default profile is `upstream-only`: no
+serving, no announcing, no DHT participation, no discovery traffic at all. Sharing is
+an explicit opt-in, and a profile that contradicts an explicit flag fails closed at
+startup.
+
+## How it works
 
 ![nix-p2p architecture: the three seams, libp2p/iroh backends behind the PeerFabric seam, the trust boundary, and the crate topology](figures/fig-arch-5-peer-fabric.svg)
 
-A stack-neutral **frontend** (`daemon-core`) over a swappable P2P **backend** that
-the *binary* chooses — `daemon-libp2p` links one backend and nothing of the other,
-proven by its dependency graph. Alongside sits a separate test fixture
-(`just independence` keeps the product and the fixture from sharing code, so the
-fixture stays an independent witness of wire behaviour). The seam is documented in
-`docs/peer-fabric-seam.md`.
-
 **Three seams.** Serving sits behind `NarinfoSource` (narinfo lookup) and `NarSource`
 (resolve a signed NarHash to a verified byte stream). All P2P sits behind the
-intention-level **`PeerFabric`** seam — *find providers · announce · locate · fetch ·
-serve · hold-query · LAN* — so the serving core holds **zero** p2p types.
+intention-level `PeerFabric` seam — *find providers · announce · locate · fetch · serve
+· hold-query · LAN* — so the serving core holds **zero** p2p types.
 
-**libp2p-primary; iroh optional.** iroh is a strong *connectivity* substrate ("dial
-an `EndpointId`, get authenticated QUIC bytes") but has **no content-provider
-routing**: it answers "*where is this node?*", never "*who has hash X?*". So
-**discovery is `libp2p-kad`** — adopted from a robust existing library, not
-hand-rolled, and not Kademlia-over-iroh — and **iroh-blobs is an optional transport**
-kept for its NAT traversal. Discovery is libp2p-kad regardless of transport. (See
-"iroh's shortcomings" in `PRD.md`.)
+**The backend is the binary,** not a runtime flag: `daemon-libp2p` links libp2p and
+nothing of iroh, enforced by a crate-graph guard that walks `cargo tree` and bites if an
+iroh crate ever appears.
 
-Crates:
+**Discovery is libp2p-kad.** iroh is a strong *connectivity* substrate ("dial an
+`EndpointId`, get authenticated QUIC bytes") but has no content-provider routing — it
+answers "*where is this node?*", never "*who has hash X?*". So discovery uses
+libp2p-kad's `get_providers`, adopted from a mainnet-proven library rather than
+hand-rolled, and iroh-blobs remains an optional transport backend.
 
-- **`peer-fabric/`** — the seam: capability traits, `Lookup`/`Exposure`, and the
-  frozen `ContentKey`/`ProviderRecord` codec + validation oracle. **Zero** p2p-library deps.
-- **`fabric-libp2p/`** — the primary backend: the libp2p-kad `ProviderDirectory` +
-  `AvailabilityAnnouncer`, a `NodeLocator` (kad peer-routing → dialable address), and
-  a libp2p `NarTransfer`/`NarServer` on the same swarm.
-- **`fabric-iroh/`** — the optional backend behind the same seam: iroh-blobs
-  `NarTransfer`/`NarServer` + pkarr node lookup (`IrohFabric`, with `ProviderDirectory`
-  honestly absent — iroh has no content routing).
-- **`daemon-core/`** — the stack-neutral frontend: serving core, narinfo/NAR
-  correlation, policy, budgets, raw-serve rewrite, upstream fallback. Depends on the
-  seam only; **no** p2p-library deps.
-- **`daemon-libp2p/`** — the primary thin binary: `daemon_core::run(Libp2pFabric)`, with
-  a crate-graph guard proving it links no iroh. (`daemon/` is the interim composite that
-  links both backends and drives the container e2e while the per-backend split finishes.)
-- **`testproxy/`** — the permanent test fixture: a caching proxy that owns all fault
-  injection (latency, errors, corruption, throttling).
-- Supporting: `fixtures/` (signed mock cache), `scripts/` (rootless-podman e2e + the
-  measurement instrument), `nixos/` (module + VM test).
+**Serving costs no disk.** A node holds no second copy of anything: it regenerates a
+path's raw NAR from `/nix/store` on demand via `nix-store --dump`, so there is no blob
+store, no retention policy, and nothing at rest. Note the current limit — *which* paths a
+node offers is still per-path: either named explicitly with `--libp2p-provide-store`, or
+picked up automatically for paths fetched through the daemon
+(`--libp2p-announce-after-fetch`). Offering a store's existing contents wholesale is not
+wired up yet.
+
+Crates: `peer-fabric/` (the seam, zero p2p deps) · `fabric-libp2p/` (primary backend) ·
+`fabric-iroh/` (optional backend) · `daemon-core/` (stack-neutral frontend) ·
+`daemon-libp2p/` (the primary binary) · `testproxy/` (permanent test fixture owning all
+fault injection). Design: `docs/peer-fabric-seam.md`.
 
 ## Trust and verification
 
 ![what the ed25519 signature covers (the uncompressed NAR), which narinfo fields are rewritable, where each hash is taken in the pipeline, and the raw-versus-compressed wire cost](figures/fig-arch-4-signing-and-compression.svg)
 
 Trust stays where it is. cache.nixos.org signs narinfos; an unmodified Nix client
-re-verifies the ed25519 signature and the NarHash; the daemon and every peer are
-outside the TCB. A peer serves the **raw** NAR — the addressed unit, `RawNarV1`, the
-exact `nix-store --dump` bytes keyed by plain BLAKE3 — verified BLAKE3/bao on arrival
-and again by Nix's own signature + NarHash check.
+re-verifies the ed25519 signature and the NarHash; the daemon and every peer are outside
+the TCB. A peer serves the **raw** NAR — the addressed unit, `RawNarV1`, the exact
+`nix-store --dump` bytes keyed by plain BLAKE3 — verified BLAKE3/bao on arrival and again
+by Nix's own signature and NarHash check.
 
-**Frozen surfaces** (deep-reviewed because changing them splits the network, and
-pinned in bytes by golden vectors): the addressed unit; the claim wire schema; and
-the discovery key + provider record — a `ContentKey` derived from the signed NarHash
-and an ed25519-signed `ProviderRecord` stored as an **opaque value**, so the DHT
-substrate's own wire format can churn without touching the freeze.
+**No enumeration, by construction.** Peers answer yes/no about a NarHash you already
+name. There is no call that lists a node's holdings, so an outsider cannot discover
+which private paths you hold.
 
-**The open question — do peers beat a CDN?** A peer serves the raw NAR while the CDN
-serves a compressed file, so a peer moves more bytes per path and may not beat a fast
-CDN on speed until the peer link is itself compressed (an unsigned transport field;
-the addressed unit stays the raw NAR). The long tail is where a CDN is strong and
-swarms are weak. Whether peers usefully beat or supplement a CDN as a byte source is
-treated as a thesis to measure, not a premise. **Early measurement says supplement,
-not beat:** on shaped links a peer's raw NAR runs several times the CDN's compressed
-bytes and loses at every size raw, while fast negotiated link-compression closes most
-of that gap back toward parity — so on the evidence so far peers look like a bandwidth
-*supplement* to the CDN (which is exactly the stated aim), not a replacement. The
-measurement instrument is a first-class part of the project; true public-network and
-public-swarm results are still out.
+**Frozen surfaces** (deep-reviewed because changing them splits the network, and pinned
+in bytes by golden vectors): the addressed unit; the claim wire schema; and the discovery
+key + provider record — a `ContentKey` derived from the signed NarHash and an
+ed25519-signed `ProviderRecord` stored as an **opaque value**, so the DHT substrate's own
+wire format can churn without touching the freeze.
 
-## What is
+## Does this help?
 
-- **Decentralized content discovery.** A node announces a signed provider record
-  under a NarHash-derived key; another node resolves "who has this NAR?" through the
-  libp2p-kad DHT with no injected answer. The *found / miss / unavailable* outcomes
-  are distinct, and there is no "list my holdings" call at all — no enumeration, by
-  construction.
-- **Decentralized address discovery — nothing injected.** A discovered provider's
-  dial address is resolved through libp2p-kad peer-routing; the shipped path is never
-  handed the address. Proven *load-bearing* on isolated container network namespaces:
-  break only the address resolution while the provider stays alive and reachable, and
-  the fetch correctly falls back to upstream — so a peer-served result genuinely
-  required the decentralized resolution.
-- **The daemon uses it end-to-end, across real containers.** Separate daemon
-  containers — a bootstrap kad router that holds no content, a serving provider, and a
-  consumer told only the bootstrap — let the consumer discover the provider via kad,
-  resolve its address, fetch, verify, and serve a byte-identical NAR to a real
-  `nix build`: zero upstream NAR egress on a hit, a clean upstream fallback on a miss.
-- **Peer transfer over two backends,** each BLAKE3/bao-verified on arrival: iroh-blobs
-  whole-NAR over QUIC (a real `nix build` served from a peer across container network
-  namespaces — a corrupt peer fails the build, a dead peer falls back to upstream) and
-  Bao-authenticated libp2p raw substreams over the same swarm as discovery. Only `/nar/4`
-  is registered: an older-protocol peer is an availability failure, never a downgrade.
-- **The backend is the binary.** The serving core is a stack-neutral crate; the primary
-  binary links only libp2p, guaranteed by its dependency-graph guard — the choice of
-  backend is a compile-time fact, not a runtime flag, so tests and tournament runs can
-  never conflate the two stacks.
-- **Multi-provider robustness.** Several holders per NAR with fail-over to the next when
-  one is dead; ≥3 independent bootstrap nodes with resolution surviving the loss of any
-  one; signed provider records with monotonic-sequence replay/rollback rejection and
-  signed-withdrawal tombstones; and a bounded provider index an attacker cannot grow
-  without limit by announcing arbitrary keys. The bounded fan-out selection is **salted
-  per query**, so a PeerId-grinding attacker can no longer permanently evict a chosen
-  key's legit provider — an out-competed lookup self-heals on retry (a bounded
-  probabilistic degradation, never permanent denial; integrity is untouched throughout).
-- **A transparent substituter proxy:** `nix-cache-info` semantics, a persistent narinfo disk
-  cache **on by default** (see below), the NAR correlation catalog, correct serving of a raw NAR under a compressed
-  upstream narinfo (the hit is rewritten to match the bytes it serves), multi-daemon
-  chains, the additive-invariant crash behaviour (daemon dead or killed mid-transfer →
-  `nix build` still succeeds via fallback, the store never corrupted), a NixOS module +
-  VM test.
-- **A supply-integrity floor.** Before a node will advertise that it holds a NAR it
-  verifies that `sha256(nix-store --dump <path>)` equals the signed NarHash — at the
-  index and again at the shipped announce site — so a mis-registered path is quarantined
-  rather than announced as a false claim; and produced bytes are BLAKE3-rechecked against
-  the announced content before they leave the node.
-- **Fronts the real cache.nixos.org over verified TLS.** The daemon speaks HTTPS to the
-  upstream cache with full certificate-chain and hostname verification and no skip-verify
-  path in a production build; the test fixture fronts it too, over a deliberately
-  *disjoint* TLS stack so the product and the fixture stay independent witnesses of wire
-  behaviour.
-- **Regenerate-on-demand supply from a live `/nix/store`.** The shipped provider (with
-  `--libp2p-provide-store`) serves any announced store path by regenerating its raw NAR from
-  `/nix/store` on demand — a supervised, cancellation-safe process group, nothing held at rest,
-  no enumeration — and the announce is gated by the supply-integrity floor above, so it can only
-  advertise a path the index actually verified. Production runs off the swarm poll loop, so a
-  large serve never stalls discovery.
-- **Bao-authenticated bounded transfer pipeline.** `/nar/4` declares exact RawNarV1 size, then carries
-  full-range Bao proofs for fixed 64-KiB leaves with raw or independently bounded per-leaf zstd.
-  A fetcher exposes a leaf only after authenticating it against the requested BLAKE3; COMPLETE
-  plus clean FIN gates final completion. Process supply regenerates twice—ephemeral outboard/root
-  verification, then authenticated delivery—without a whole-NAR serve buffer. This does not claim
-  lower absolute TTFB: proof preparation remains and process serves perform a second dump. The
-  leaf stream is internal until TASK-62 connects it to HTTP; today that compatibility seam still
-  collects the verified NAR.
-- **Leech / consume-only mode (`--libp2p-leech`).** An affirmative opt-out for anyone who
-  cannot or will not contribute uplink: a leech still fetches from peers, but its fabric is
-  wrapped in a transport-agnostic `LeechFabric` that masks the *serve* and *announce* axes at
-  the capability seam, so peers can obtain nothing from it — verified from the peer side, not
-  self-reported. It is honest about its limits: a leech hides what it **serves and announces**,
-  not what it **looks up** (it still sends discovery queries), and it refuses fail-fast to be
-  combined with any give-side provider flag.
-- **An operator contract — one setting governs what a node gives.** A node's role is a single
-  **sharing profile** (upstream-only, consume-only, LAN-share, public-share, or router), and its
-  runtime behaviour *derives from that contract*: whether it serves, whether it announces, its
-  DHT mode, and its relay use are **computed from the profile**, not wired from ad-hoc booleans —
-  and a profile that disagrees with an explicit flag fails **closed** at startup. The fresh-install
-  default is **upstream-only** — a node gives nothing until its operator opts in. Consume-only and
-  router both ride the same capability-seam `LeechFabric` mask (above), so the give-side is masked
-  by construction, verified peer-side. A live, **loopback-only, off-by-default** `--status` /
-  `--metrics` surface reports the node's real state — bootstrap health, holder counts, the
-  announce and responder-derivation budgets — with every identifier privacy-redacted by default,
-  so an operator can see what a node is doing without it becoming a network disclosure.
+Honest answer: **not proven yet.** A peer serves the raw NAR while the CDN serves a
+compressed file, so a peer moves more bytes per path and may lose on speed until the peer
+link is itself compressed. The long tail is exactly where a CDN is strong and swarms are
+weak.
 
-## What is not yet
+Early shaped-link measurement says **supplement, not replace**: raw, a peer loses at
+every size; with fast negotiated link compression the gap closes back toward parity. That
+matches the stated aim — bandwidth offload — but real public-network numbers are still
+out, and the project treats this as a thesis to falsify rather than a premise.
 
-- **A public network.** NAT hole-punching, relay for residential peers, and running
-  against the real cache.nixos.org over a public network are future work; today it is
-  single-host loopback and containers.
-- **The container-packaged store-serve proof.** Serving from a live `/nix/store` is proven
-  in-process and across two swarms; the multi-container end-to-end of that exact journey — a
-  provider serving a store path it never held as a file, fetched by a consumer over the DHT —
-  is the one deferred piece.
-- **The iroh optional-transport journey.** iroh transfer works; its decentralized
-  public-node discovery / no-address connection, and the iroh-versus-libp2p transport
-  tournament that decides whether iroh's NAT traversal earns its place, are in progress.
-- **The narinfo disk cache is on by default.** With no flag the daemon persists narinfo at
-  an XDG state path (`$XDG_STATE_HOME/nix-p2p/narinfo`, else `$HOME/.local/state/nix-p2p/narinfo`),
-  so a warm daemon serves a repeat narinfo from local disk instead of re-fetching it upstream;
-  the fsync runs off the async worker, the cache is count-capped, and every
-  entry is re-derivable, so a lost or corrupt cache is only ever an extra refetch, never a wrong
-  serve. `--narinfo-cache-dir <dir>` picks an explicit directory; `--no-narinfo-cache` turns it
-  off. The NixOS module defaults it to `/var/lib/nix-p2p/narinfo` under a `StateDirectory`-managed
-  dir the DynamicUser owns (`services.nix-p2p.narinfoCacheDir = null` to disable). Scope note: this
-  records **which** narinfos an operator fetched on **local** disk — a local, re-derivable cache,
-  not a network disclosure; the operator contract (above) governs the state-dir and mode.
-- **Restart-durable state in the shipped daemon — now wired, gated on a state dir.**
-  With `--libp2p-state-dir <dir>` the shipped daemon runs in durable mode: the directory is
-  the single anchor for both the node's **identity** (a state-dir-only restart comes back as
-  the *same* NodeId, so it can still supersede and withdraw its own records) and its
-  **sequence floor** — it reloads the anti-rollback floor on restart and allocates
-  provider-record sequences durably (a restarted provider mints a strictly-newer sequence
-  instead of re-minting `1` and self-rolling-back), persisting the sequence fail-closed
-  *before* publishing (save-before-publish, parent-dir fsynced). Without the flag a node is
-  session-scoped by choice (fresh identity, re-earned floor) and providers say so loudly.
-  What remains is *hardening* the durable floor (fail-closed eviction bound, consumer-side
-  TTL-cap enforcement, durable-reload sweep/cap, fail-closed consumer durability, a
-  shared-state-dir advisory lock, save-before-publish for withdrawals, and per-line
-  persistence integrity) — tracked as the record-lifecycle hardening follow-up.
-- **Socket-to-HTTP streaming completion (TASK-62).** The `/nar/4` verifier/process pipeline is
-  bounded to leaf/chunk buffers, O(tree depth), and a declared-size-derived ephemeral outboard,
-  but the current `NarTransfer` compatibility seam still collects verified leaves into one `Vec`
-  before HTTP. TASK-62 removes that final O(N) collector. Hedged/prefetch fetches and deeper
-  eclipse/sybil bounds also remain.
-- **A verdict on the value thesis:** whether peers beat a CDN is unmeasured on a real
-  network.
+## Status
+
+The decentralized path works end to end across containers: kad discovery, address
+resolution with nothing injected, Bao-authenticated transfer, byte-identical delivery to
+a real `nix build`, multi-provider fail-over, and a clean upstream fallback on a miss.
+
+Not yet: a public network, a verdict on the value thesis, socket-to-HTTP streaming
+completion, record-lifecycle hardening, and standard profiling tooling.
+
+Full inventory: **`docs/status.md`**.
 
 ## Development
 
-Everything runs in the pinned flake devshell; the Justfile refuses any other
-toolchain.
-
 ```sh
-nix develop
 just            # list gates
-
 just build      # cargo build, all targets
 just lint       # clippy -D warnings, rustfmt, ruff, independence + source guards
-just test       # cargo test — incl. the multi-node discovery + address-resolution +
-                # transfer + daemon-integration tests — plus the fixture and measurement gates,
-                # and the property tests (proptest + hypothesis) at a FIXED seed
-just prop       # the SAME property tests at a FREE/random seed + many cases —
-                # exploration mode, run deliberately (kept out of the fast loop
-                # so `just test` stays deterministic)
+just test       # cargo test incl. multi-node discovery/transfer + fixture and
+                # measurement gates + property tests at a FIXED seed
+just prop       # the same property tests at a FREE seed — exploration, run deliberately
 ```
 
 Slow tier (containers / VMs):
 
 ```sh
-just e2e         # rootless-podman subset, incl. the iroh peer-served build and the
-                 # multi-daemon libp2p discover→resolve→fetch→serve journey
+just e2e         # rootless-podman subset
 just e2e-full    # every e2e scenario
 just e2e-vm      # NixOS VM test (needs /dev/kvm)
 just measure     # egress / latency / gap report
@@ -262,37 +160,31 @@ just profile     # p2p resource / throughput report
 
 ## Documents
 
-- **`PRD.md`** — the durable design record: essence, decisions, iroh's shortcomings,
-  the irreversibility map, risks, the tournament contract.
+- **`PRD.md`** — the durable design record: decisions, the irreversibility map, risks.
+- **`docs/status.md`** — the full capability inventory.
 - **`docs/peer-fabric-seam.md`** — the `PeerFabric` seam design.
-- **`TESTING.md`** — what "good" and "bad" observably mean; the oracles the gates
-  enforce.
-- **`figures/`** — architecture overviews (the two above; `fig-arch-1`/`-2` zoom into
-  the wave-1 daemon and the test harness).
+- **`TESTING.md`** — what "good" and "bad" observably mean; the oracles the gates enforce.
 - **`backlog/`** — the task tracker (use the `backlog` CLI, not direct edits).
 
 ## References
-
-Prior art and the problem this addresses:
 
 - [Peer-to-peer binary cache RFC / working-group poll](https://discourse.nixos.org/t/peer-to-peer-binary-cache-rfc-working-group-poll/29568)
   (NixOS Discourse) — polls the community on a decentralized binary cache motivated by
   CDN bandwidth cost; the availability / untrusted-peer / sharding objections raised
   there are the ones this design answers rather than assumes away.
 - [Migration of S3 bucket payments to the Foundation](https://github.com/NixOS/foundation/issues/86)
-  (NixOS/foundation) — the storage-cost side of the same problem, cataloguing
-  alternatives from distributed stores to decentralized mirrors.
+  (NixOS/foundation) — the storage-cost side of the same problem.
 
 Where this differs from most such proposals: it decentralizes the **bytes only** and
 leaves trust exactly where it is, and it targets *bandwidth* rather than storage.
 
 ## AI assistance
 
-This project's code and documentation were developed with substantial assistance from
-an AI coding agent (Anthropic's Claude). By project convention individual commits do
-**not** carry AI co-author trailers — the disclosure lives here instead. Design
-decisions, the trust model, and every merge remain human-owned; the AI implemented
-against a human-reviewed backlog under gated, test-grounded review.
+This project's code and documentation were developed with substantial assistance from an
+AI coding agent (Anthropic's Claude). By project convention individual commits do **not**
+carry AI co-author trailers — the disclosure lives here instead. Design decisions, the
+trust model, and every merge remain human-owned; the AI implemented against a
+human-reviewed backlog under gated, test-grounded review.
 
 ## License
 
