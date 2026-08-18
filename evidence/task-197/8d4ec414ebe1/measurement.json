@@ -1,0 +1,1533 @@
+{
+  "task": "task-197",
+  "acceptance_criterion": "AC9 live wire/two-pass/timing evidence",
+  "harness_lineage": "evolved from TASK-198's shaped-link harness",
+  "wire_revision": "TASK-197 Bao-authenticated /nar/4 with independently framed 64-KiB leaves",
+  "measures": "live raw-vs-zstd libp2p NAR transfer over a tc-netem shaped peer link with BOTH ends shaped (the two-ends-shaped serve trace TASK-203 deferred here). The timed window is an ALREADY-CONNECTED open-stream /nar/4 fetch: discovery, dial, and the Noise/yamux handshake happen out of band BEFORE the clock starts.",
+  "environment_boundary": "shaped-link EMULATION (unshare -Urn nested netns + veth + tc netem), NOT real hardware / a real WAN. Models mean RTT + a rate cap; NOT loss, jitter, competing traffic, or NAT traversal. Removes the pod-loopback UPPER bound on the peer arm; is not itself a field measurement (the real-hardware residual is TASK-207).",
+  "integer_exact": true,
+  "no_floats_in_decisions": true,
+  "accepted": true,
+  "verdict": "ACCEPTED",
+  "failure_reasons": [],
+  "load_bearing_flags": {
+    "zstd_faster_every_run": true,
+    "wire_smaller_every_run": true,
+    "margin_meets_predeclared_noise_threshold": true,
+    "all_runs_shape_gated": true,
+    "wire_bytes_consistent": true,
+    "paired_order_alternates": true,
+    "legacy_counterfactual_consistent": true,
+    "canonical_content_consistent": true,
+    "canonical_payload_consistent": true,
+    "cli_nar_size_consistent": true,
+    "payload_metadata_consistent": true,
+    "fetcher_identity_consistent": true,
+    "run_count_consistent": true,
+    "audit_evidence_consistent": true
+  },
+  "nar_bytes": 16777216,
+  "delay_ms": 20,
+  "rate_mbit": 20,
+  "nar_seed": 20198,
+  "payload_kind": "compressible",
+  "payload_construction": "splitmix64-1of4-entropy-plus-3of4-seeded-motif-v1",
+  "fetcher_identity_seed": 2,
+  "content_digest": "blake3:3415ff1418fcb9807087887d2826e441026b8712bcbf233409c849e1b592c64f",
+  "canonical_payload": {
+    "content": "blake3:3415ff1418fcb9807087887d2826e441026b8712bcbf233409c849e1b592c64f",
+    "raw_bytes": 16777216,
+    "nar_seed": 20198,
+    "payload_kind": "compressible",
+    "payload_construction": "splitmix64-1of4-entropy-plus-3of4-seeded-motif-v1"
+  },
+  "shaped_runs": 3,
+  "served_raw_bytes": 16777216,
+  "legacy_single_frame_bytes": 4219763,
+  "legacy_response_protocol_bytes": 4219765,
+  "legacy_counterfactual": {
+    "all_ok": true,
+    "per_run": [
+      {
+        "legacy_single_frame_bytes": 4219763,
+        "v4_encoded_leaf_bytes": 4270133,
+        "frame_reset_cost_pair": [
+          4270133,
+          4219763
+        ],
+        "frame_reset_delta_bytes": 50370,
+        "legacy_response_protocol_bytes": 4219765,
+        "v4_response_protocol_bytes": 4287491,
+        "response_protocol_cost_pair": [
+          4287491,
+          4219765
+        ],
+        "v4_response_delta_bytes": 67726
+      },
+      {
+        "legacy_single_frame_bytes": 4219763,
+        "v4_encoded_leaf_bytes": 4270133,
+        "frame_reset_cost_pair": [
+          4270133,
+          4219763
+        ],
+        "frame_reset_delta_bytes": 50370,
+        "legacy_response_protocol_bytes": 4219765,
+        "v4_response_protocol_bytes": 4287491,
+        "response_protocol_cost_pair": [
+          4287491,
+          4219765
+        ],
+        "v4_response_delta_bytes": 67726
+      },
+      {
+        "legacy_single_frame_bytes": 4219763,
+        "v4_encoded_leaf_bytes": 4270133,
+        "frame_reset_cost_pair": [
+          4270133,
+          4219763
+        ],
+        "frame_reset_delta_bytes": 50370,
+        "legacy_response_protocol_bytes": 4219765,
+        "v4_response_protocol_bytes": 4287491,
+        "response_protocol_cost_pair": [
+          4287491,
+          4219765
+        ],
+        "v4_response_delta_bytes": 67726
+      }
+    ]
+  },
+  "wire_raw_bytes": 16793550,
+  "wire_zstd_bytes": 4287491,
+  "wire_ratio_pair": [
+    16793550,
+    4287491
+  ],
+  "wire_ratio_display": "~3.917x (exact 16793550/4287491)",
+  "shaping_oracle": {
+    "all_gated": true,
+    "unshaped_rtt_ns": 54000,
+    "unshaped_raw_throughput_bytes_per_s": 29685113,
+    "per_run": [
+      {
+        "shaped_rtt_ns": 48162000,
+        "shaped_raw_throughput_bytes_per_s": 2091300,
+        "passed": true
+      },
+      {
+        "shaped_rtt_ns": 48153000,
+        "shaped_raw_throughput_bytes_per_s": 2235164,
+        "passed": true
+      },
+      {
+        "shaped_rtt_ns": 48167000,
+        "shaped_raw_throughput_bytes_per_s": 2225466,
+        "passed": true
+      }
+    ]
+  },
+  "measurement_contract": {
+    "expected_payload": {
+      "raw_bytes": 16777216,
+      "nar_seed": 20198,
+      "payload_kind": "compressible",
+      "payload_construction": "splitmix64-1of4-entropy-plus-3of4-seeded-motif-v1"
+    },
+    "expected_fetcher_identity_seed": 2,
+    "canonical_content_digest": "blake3:3415ff1418fcb9807087887d2826e441026b8712bcbf233409c849e1b592c64f",
+    "canonical_payload": {
+      "content": "blake3:3415ff1418fcb9807087887d2826e441026b8712bcbf233409c849e1b592c64f",
+      "raw_bytes": 16777216,
+      "nar_seed": 20198,
+      "payload_kind": "compressible",
+      "payload_construction": "splitmix64-1of4-entropy-plus-3of4-seeded-motif-v1"
+    },
+    "observed_content_digests": [
+      "blake3:3415ff1418fcb9807087887d2826e441026b8712bcbf233409c849e1b592c64f"
+    ],
+    "canonical_payload_consistent": true,
+    "canonical_content_consistent": true,
+    "cli_nar_size_consistent": true,
+    "payload_metadata_consistent": true,
+    "fetcher_identity_consistent": true,
+    "run_count_consistent": true,
+    "observed": [
+      {
+        "label": "shaped-0",
+        "contents": {
+          "provider_meta": "blake3:3415ff1418fcb9807087887d2826e441026b8712bcbf233409c849e1b592c64f",
+          "raw_fetch": "blake3:3415ff1418fcb9807087887d2826e441026b8712bcbf233409c849e1b592c64f",
+          "zstd_fetch": "blake3:3415ff1418fcb9807087887d2826e441026b8712bcbf233409c849e1b592c64f",
+          "raw_provider": "blake3:3415ff1418fcb9807087887d2826e441026b8712bcbf233409c849e1b592c64f",
+          "zstd_provider": "blake3:3415ff1418fcb9807087887d2826e441026b8712bcbf233409c849e1b592c64f"
+        },
+        "raw_sizes": {
+          "payload_config_raw_bytes": 16777216,
+          "provider_meta_raw_bytes": 16777216,
+          "raw_fetch_bytes": 16777216,
+          "raw_fetch_expect": 16777216,
+          "raw_fetch_encoded_leaf_bytes": 16777216,
+          "zstd_fetch_bytes": 16777216,
+          "zstd_fetch_expect": 16777216,
+          "raw_provider_pass1_bytes": 16777216,
+          "raw_provider_pass2_bytes": 16777216,
+          "raw_provider_encoded_leaf_bytes": 16777216,
+          "zstd_provider_pass1_bytes": 16777216,
+          "zstd_provider_pass2_bytes": 16777216
+        },
+        "payload_config": {
+          "nar_seed": 20198,
+          "payload_kind": "compressible",
+          "payload_construction": "splitmix64-1of4-entropy-plus-3of4-seeded-motif-v1",
+          "raw_bytes": 16777216,
+          "fetcher_identity_seed": 2
+        },
+        "provider_payload": {
+          "raw_bytes": 16777216,
+          "nar_seed": 20198,
+          "payload_kind": "compressible",
+          "payload_construction": "splitmix64-1of4-entropy-plus-3of4-seeded-motif-v1"
+        },
+        "arm_identity_seeds": {
+          "raw": 2,
+          "zstd": 2
+        }
+      },
+      {
+        "label": "shaped-1",
+        "contents": {
+          "provider_meta": "blake3:3415ff1418fcb9807087887d2826e441026b8712bcbf233409c849e1b592c64f",
+          "raw_fetch": "blake3:3415ff1418fcb9807087887d2826e441026b8712bcbf233409c849e1b592c64f",
+          "zstd_fetch": "blake3:3415ff1418fcb9807087887d2826e441026b8712bcbf233409c849e1b592c64f",
+          "raw_provider": "blake3:3415ff1418fcb9807087887d2826e441026b8712bcbf233409c849e1b592c64f",
+          "zstd_provider": "blake3:3415ff1418fcb9807087887d2826e441026b8712bcbf233409c849e1b592c64f"
+        },
+        "raw_sizes": {
+          "payload_config_raw_bytes": 16777216,
+          "provider_meta_raw_bytes": 16777216,
+          "raw_fetch_bytes": 16777216,
+          "raw_fetch_expect": 16777216,
+          "raw_fetch_encoded_leaf_bytes": 16777216,
+          "zstd_fetch_bytes": 16777216,
+          "zstd_fetch_expect": 16777216,
+          "raw_provider_pass1_bytes": 16777216,
+          "raw_provider_pass2_bytes": 16777216,
+          "raw_provider_encoded_leaf_bytes": 16777216,
+          "zstd_provider_pass1_bytes": 16777216,
+          "zstd_provider_pass2_bytes": 16777216
+        },
+        "payload_config": {
+          "nar_seed": 20198,
+          "payload_kind": "compressible",
+          "payload_construction": "splitmix64-1of4-entropy-plus-3of4-seeded-motif-v1",
+          "raw_bytes": 16777216,
+          "fetcher_identity_seed": 2
+        },
+        "provider_payload": {
+          "raw_bytes": 16777216,
+          "nar_seed": 20198,
+          "payload_kind": "compressible",
+          "payload_construction": "splitmix64-1of4-entropy-plus-3of4-seeded-motif-v1"
+        },
+        "arm_identity_seeds": {
+          "zstd": 2,
+          "raw": 2
+        }
+      },
+      {
+        "label": "shaped-2",
+        "contents": {
+          "provider_meta": "blake3:3415ff1418fcb9807087887d2826e441026b8712bcbf233409c849e1b592c64f",
+          "raw_fetch": "blake3:3415ff1418fcb9807087887d2826e441026b8712bcbf233409c849e1b592c64f",
+          "zstd_fetch": "blake3:3415ff1418fcb9807087887d2826e441026b8712bcbf233409c849e1b592c64f",
+          "raw_provider": "blake3:3415ff1418fcb9807087887d2826e441026b8712bcbf233409c849e1b592c64f",
+          "zstd_provider": "blake3:3415ff1418fcb9807087887d2826e441026b8712bcbf233409c849e1b592c64f"
+        },
+        "raw_sizes": {
+          "payload_config_raw_bytes": 16777216,
+          "provider_meta_raw_bytes": 16777216,
+          "raw_fetch_bytes": 16777216,
+          "raw_fetch_expect": 16777216,
+          "raw_fetch_encoded_leaf_bytes": 16777216,
+          "zstd_fetch_bytes": 16777216,
+          "zstd_fetch_expect": 16777216,
+          "raw_provider_pass1_bytes": 16777216,
+          "raw_provider_pass2_bytes": 16777216,
+          "raw_provider_encoded_leaf_bytes": 16777216,
+          "zstd_provider_pass1_bytes": 16777216,
+          "zstd_provider_pass2_bytes": 16777216
+        },
+        "payload_config": {
+          "nar_seed": 20198,
+          "payload_kind": "compressible",
+          "payload_construction": "splitmix64-1of4-entropy-plus-3of4-seeded-motif-v1",
+          "raw_bytes": 16777216,
+          "fetcher_identity_seed": 2
+        },
+        "provider_payload": {
+          "raw_bytes": 16777216,
+          "nar_seed": 20198,
+          "payload_kind": "compressible",
+          "payload_construction": "splitmix64-1of4-entropy-plus-3of4-seeded-motif-v1"
+        },
+        "arm_identity_seeds": {
+          "raw": 2,
+          "zstd": 2
+        }
+      },
+      {
+        "label": "unshaped-control",
+        "contents": {
+          "provider_meta": "blake3:3415ff1418fcb9807087887d2826e441026b8712bcbf233409c849e1b592c64f",
+          "raw_fetch": "blake3:3415ff1418fcb9807087887d2826e441026b8712bcbf233409c849e1b592c64f",
+          "zstd_fetch": "blake3:3415ff1418fcb9807087887d2826e441026b8712bcbf233409c849e1b592c64f",
+          "raw_provider": "blake3:3415ff1418fcb9807087887d2826e441026b8712bcbf233409c849e1b592c64f",
+          "zstd_provider": "blake3:3415ff1418fcb9807087887d2826e441026b8712bcbf233409c849e1b592c64f"
+        },
+        "raw_sizes": {
+          "payload_config_raw_bytes": 16777216,
+          "provider_meta_raw_bytes": 16777216,
+          "raw_fetch_bytes": 16777216,
+          "raw_fetch_expect": 16777216,
+          "raw_fetch_encoded_leaf_bytes": 16777216,
+          "zstd_fetch_bytes": 16777216,
+          "zstd_fetch_expect": 16777216,
+          "raw_provider_pass1_bytes": 16777216,
+          "raw_provider_pass2_bytes": 16777216,
+          "raw_provider_encoded_leaf_bytes": 16777216,
+          "zstd_provider_pass1_bytes": 16777216,
+          "zstd_provider_pass2_bytes": 16777216
+        },
+        "payload_config": {
+          "nar_seed": 20198,
+          "payload_kind": "compressible",
+          "payload_construction": "splitmix64-1of4-entropy-plus-3of4-seeded-motif-v1",
+          "raw_bytes": 16777216,
+          "fetcher_identity_seed": 2
+        },
+        "provider_payload": {
+          "raw_bytes": 16777216,
+          "nar_seed": 20198,
+          "payload_kind": "compressible",
+          "payload_construction": "splitmix64-1of4-entropy-plus-3of4-seeded-motif-v1"
+        },
+        "arm_identity_seeds": {
+          "zstd": 2,
+          "raw": 2
+        }
+      }
+    ]
+  },
+  "wire_fields_schema": [
+    "request_protocol_bytes",
+    "response_header_bytes",
+    "proof_bytes",
+    "leaf_count",
+    "leaf_length_prefix_bytes",
+    "encoded_leaf_bytes",
+    "complete_marker_bytes",
+    "response_body_bytes",
+    "response_protocol_bytes",
+    "exchange_protocol_bytes"
+  ],
+  "observations": {
+    "shaped": [
+      {
+        "label": "shaped-0",
+        "rtt_ns": 48162000,
+        "rtt_avg_source_decimal_ms": "48.162",
+        "arm_order": "raw-first",
+        "arm_identity_seeds": {
+          "raw": 2,
+          "zstd": 2
+        },
+        "payload_config": {
+          "nar_seed": 20198,
+          "payload_kind": "compressible",
+          "payload_construction": "splitmix64-1of4-entropy-plus-3of4-seeded-motif-v1",
+          "raw_bytes": 16777216,
+          "fetcher_identity_seed": 2
+        },
+        "provider_meta": {
+          "content": "blake3:3415ff1418fcb9807087887d2826e441026b8712bcbf233409c849e1b592c64f",
+          "raw_bytes": 16777216,
+          "nar_seed": 20198,
+          "payload_kind": "compressible",
+          "payload_construction": "splitmix64-1of4-entropy-plus-3of4-seeded-motif-v1",
+          "legacy_single_frame_bytes": 4219763,
+          "legacy_response_protocol_bytes": 4219765
+        },
+        "content": "blake3:3415ff1418fcb9807087887d2826e441026b8712bcbf233409c849e1b592c64f",
+        "arms": {
+          "raw": {
+            "fetch": {
+              "metadata": {
+                "authenticated_first_leaf_ns": 421665874,
+                "request_complete_ns": 26704,
+                "first_response_byte_ns": 324220059,
+                "total_fetch_ns": 7987099984,
+                "elapsed_ns": 8030193690,
+                "expect": 16777216,
+                "byte_identical": 1,
+                "bytes": 16777216,
+                "blake3_ok": 1,
+                "codec_requested": "raw",
+                "selected_codec": "raw",
+                "content": "blake3:3415ff1418fcb9807087887d2826e441026b8712bcbf233409c849e1b592c64f"
+              },
+              "wire": {
+                "request_protocol_bytes": 33,
+                "response_header_bytes": 10,
+                "proof_bytes": 16320,
+                "leaf_count": 256,
+                "leaf_length_prefix_bytes": 0,
+                "encoded_leaf_bytes": 16777216,
+                "complete_marker_bytes": 4,
+                "response_body_bytes": 16793540,
+                "response_protocol_bytes": 16793550,
+                "exchange_protocol_bytes": 16793583
+              },
+              "wire_equations": {
+                "response_body": {
+                  "reported_bytes": 16793540,
+                  "component_sum_bytes": 16793540,
+                  "holds": true
+                },
+                "response_protocol": {
+                  "reported_bytes": 16793550,
+                  "component_sum_bytes": 16793550,
+                  "holds": true
+                },
+                "exchange_protocol": {
+                  "reported_bytes": 16793583,
+                  "component_sum_bytes": 16793583,
+                  "holds": true
+                },
+                "all_hold": true
+              }
+            },
+            "provider": {
+              "metadata": {
+                "total_serve_ns": 7863436876,
+                "pass1_bytes": 16777216,
+                "proof_preparation_ns": 282658256,
+                "pass2_bytes": 16777216,
+                "content": "blake3:3415ff1418fcb9807087887d2826e441026b8712bcbf233409c849e1b592c64f",
+                "selected_codec": "raw"
+              },
+              "wire": {
+                "request_protocol_bytes": 33,
+                "response_header_bytes": 10,
+                "proof_bytes": 16320,
+                "leaf_count": 256,
+                "leaf_length_prefix_bytes": 0,
+                "encoded_leaf_bytes": 16777216,
+                "complete_marker_bytes": 4,
+                "response_body_bytes": 16793540,
+                "response_protocol_bytes": 16793550,
+                "exchange_protocol_bytes": 16793583
+              },
+              "wire_equations": {
+                "response_body": {
+                  "reported_bytes": 16793540,
+                  "component_sum_bytes": 16793540,
+                  "holds": true
+                },
+                "response_protocol": {
+                  "reported_bytes": 16793550,
+                  "component_sum_bytes": 16793550,
+                  "holds": true
+                },
+                "exchange_protocol": {
+                  "reported_bytes": 16793583,
+                  "component_sum_bytes": 16793583,
+                  "holds": true
+                },
+                "all_hold": true
+              }
+            },
+            "provider_fetch_parity": {
+              "wire_fields": {
+                "request_protocol_bytes": true,
+                "response_header_bytes": true,
+                "proof_bytes": true,
+                "leaf_count": true,
+                "leaf_length_prefix_bytes": true,
+                "encoded_leaf_bytes": true,
+                "complete_marker_bytes": true,
+                "response_body_bytes": true,
+                "response_protocol_bytes": true,
+                "exchange_protocol_bytes": true
+              },
+              "all_wire_fields_equal": true,
+              "content_equal": true
+            }
+          },
+          "zstd": {
+            "fetch": {
+              "metadata": {
+                "authenticated_first_leaf_ns": 371799719,
+                "request_complete_ns": 21560,
+                "first_response_byte_ns": 324100073,
+                "total_fetch_ns": 2215464190,
+                "elapsed_ns": 2296489191,
+                "expect": 16777216,
+                "byte_identical": 1,
+                "bytes": 16777216,
+                "blake3_ok": 1,
+                "codec_requested": "both",
+                "selected_codec": "zstd",
+                "content": "blake3:3415ff1418fcb9807087887d2826e441026b8712bcbf233409c849e1b592c64f"
+              },
+              "wire": {
+                "request_protocol_bytes": 33,
+                "response_header_bytes": 10,
+                "proof_bytes": 16320,
+                "leaf_count": 256,
+                "leaf_length_prefix_bytes": 1024,
+                "encoded_leaf_bytes": 4270133,
+                "complete_marker_bytes": 4,
+                "response_body_bytes": 4287481,
+                "response_protocol_bytes": 4287491,
+                "exchange_protocol_bytes": 4287524
+              },
+              "wire_equations": {
+                "response_body": {
+                  "reported_bytes": 4287481,
+                  "component_sum_bytes": 4287481,
+                  "holds": true
+                },
+                "response_protocol": {
+                  "reported_bytes": 4287491,
+                  "component_sum_bytes": 4287491,
+                  "holds": true
+                },
+                "exchange_protocol": {
+                  "reported_bytes": 4287524,
+                  "component_sum_bytes": 4287524,
+                  "holds": true
+                },
+                "all_hold": true
+              }
+            },
+            "provider": {
+              "metadata": {
+                "total_serve_ns": 2182196307,
+                "pass1_bytes": 16777216,
+                "proof_preparation_ns": 282807594,
+                "pass2_bytes": 16777216,
+                "content": "blake3:3415ff1418fcb9807087887d2826e441026b8712bcbf233409c849e1b592c64f",
+                "selected_codec": "zstd"
+              },
+              "wire": {
+                "request_protocol_bytes": 33,
+                "response_header_bytes": 10,
+                "proof_bytes": 16320,
+                "leaf_count": 256,
+                "leaf_length_prefix_bytes": 1024,
+                "encoded_leaf_bytes": 4270133,
+                "complete_marker_bytes": 4,
+                "response_body_bytes": 4287481,
+                "response_protocol_bytes": 4287491,
+                "exchange_protocol_bytes": 4287524
+              },
+              "wire_equations": {
+                "response_body": {
+                  "reported_bytes": 4287481,
+                  "component_sum_bytes": 4287481,
+                  "holds": true
+                },
+                "response_protocol": {
+                  "reported_bytes": 4287491,
+                  "component_sum_bytes": 4287491,
+                  "holds": true
+                },
+                "exchange_protocol": {
+                  "reported_bytes": 4287524,
+                  "component_sum_bytes": 4287524,
+                  "holds": true
+                },
+                "all_hold": true
+              }
+            },
+            "provider_fetch_parity": {
+              "wire_fields": {
+                "request_protocol_bytes": true,
+                "response_header_bytes": true,
+                "proof_bytes": true,
+                "leaf_count": true,
+                "leaf_length_prefix_bytes": true,
+                "encoded_leaf_bytes": true,
+                "complete_marker_bytes": true,
+                "response_body_bytes": true,
+                "response_protocol_bytes": true,
+                "exchange_protocol_bytes": true
+              },
+              "all_wire_fields_equal": true,
+              "content_equal": true
+            }
+          }
+        },
+        "parser_transcript": {
+          "text": "PAYLOAD_CONFIG nar_seed=20198 payload_kind=compressible payload_construction=splitmix64-1of4-entropy-plus-3of4-seeded-motif-v1 raw_bytes=16777216 fetcher_identity_seed=2\n=== RTT probe (shape=yes) ===\n5 packets transmitted, 5 received, 0% packet loss, time 802ms\nrtt min/avg/max/mdev = 40.132/48.162/80.212/16.025 ms\n=== PROVIDER (shape=yes, nar=16777216 bytes, compressible) ===\nPROVIDE_META content=blake3:3415ff1418fcb9807087887d2826e441026b8712bcbf233409c849e1b592c64f raw_bytes=16777216 nar_seed=20198 payload_kind=compressible payload_construction=splitmix64-1of4-entropy-plus-3of4-seeded-motif-v1 legacy_single_frame_bytes=4219763 legacy_response_protocol_bytes=4219765\nPROVIDE_READY peerid=12D3KooWK99VoVxNE7XzyBwXEzW7xhK7Gpv85r9F3V3fyKSUKPH5 addr=/ip4/10.98.0.1/tcp/9098 content=Blake3Digest([52, 21, 255, 20, 24, 252, 185, 128, 112, 135, 136, 125, 40, 38, 228, 65, 2, 107, 135, 18, 188, 191, 35, 52, 9, 200, 73, 225, 181, 146, 198, 79])\nREADY\nARM_ORDER order=raw-first\nARM_START arm=raw fetcher_identity_seed=2\n=== XFER raw ===\nFETCH_DONE content=blake3:3415ff1418fcb9807087887d2826e441026b8712bcbf233409c849e1b592c64f bytes=16777216 expect=16777216 elapsed_ns=8030193690 byte_identical=1 blake3_ok=1 request_protocol_bytes=33 response_header_bytes=10 proof_bytes=16320 leaf_count=256 leaf_length_prefix_bytes=0 encoded_leaf_bytes=16777216 complete_marker_bytes=4 response_body_bytes=16793540 response_protocol_bytes=16793550 exchange_protocol_bytes=16793583 codec_requested=raw selected_codec=raw request_complete_ns=26704 first_response_byte_ns=324220059 authenticated_first_leaf_ns=421665874 total_fetch_ns=7987099984\nARM_START arm=zstd fetcher_identity_seed=2\n=== XFER zstd ===\nFETCH_DONE content=blake3:3415ff1418fcb9807087887d2826e441026b8712bcbf233409c849e1b592c64f bytes=16777216 expect=16777216 elapsed_ns=2296489191 byte_identical=1 blake3_ok=1 request_protocol_bytes=33 response_header_bytes=10 proof_bytes=16320 leaf_count=256 leaf_length_prefix_bytes=1024 encoded_leaf_bytes=4270133 complete_marker_bytes=4 response_body_bytes=4287481 response_protocol_bytes=4287491 exchange_protocol_bytes=4287524 codec_requested=both selected_codec=zstd request_complete_ns=21560 first_response_byte_ns=324100073 authenticated_first_leaf_ns=371799719 total_fetch_ns=2215464190\nPROVIDE_DONE content=blake3:3415ff1418fcb9807087887d2826e441026b8712bcbf233409c849e1b592c64f selected_codec=raw pass1_bytes=16777216 pass2_bytes=16777216 proof_preparation_ns=282658256 total_serve_ns=7863436876 request_protocol_bytes=33 response_header_bytes=10 proof_bytes=16320 leaf_count=256 leaf_length_prefix_bytes=0 encoded_leaf_bytes=16777216 complete_marker_bytes=4 response_body_bytes=16793540 response_protocol_bytes=16793550 exchange_protocol_bytes=16793583\nPROVIDE_DONE content=blake3:3415ff1418fcb9807087887d2826e441026b8712bcbf233409c849e1b592c64f selected_codec=zstd pass1_bytes=16777216 pass2_bytes=16777216 proof_preparation_ns=282807594 total_serve_ns=2182196307 request_protocol_bytes=33 response_header_bytes=10 proof_bytes=16320 leaf_count=256 leaf_length_prefix_bytes=1024 encoded_leaf_bytes=4270133 complete_marker_bytes=4 response_body_bytes=4287481 response_protocol_bytes=4287491 exchange_protocol_bytes=4287524\n",
+          "sha256": "358a778012042838acfda092491b16a8231fa8be60d28a1aee9112555675923c",
+          "sha256_recipe": "sha256(utf8(text))"
+        },
+        "process_capture": {
+          "stdout": "PAYLOAD_CONFIG nar_seed=20198 payload_kind=compressible payload_construction=splitmix64-1of4-entropy-plus-3of4-seeded-motif-v1 raw_bytes=16777216 fetcher_identity_seed=2\n=== RTT probe (shape=yes) ===\n5 packets transmitted, 5 received, 0% packet loss, time 802ms\nrtt min/avg/max/mdev = 40.132/48.162/80.212/16.025 ms\n=== PROVIDER (shape=yes, nar=16777216 bytes, compressible) ===\nPROVIDE_META content=blake3:3415ff1418fcb9807087887d2826e441026b8712bcbf233409c849e1b592c64f raw_bytes=16777216 nar_seed=20198 payload_kind=compressible payload_construction=splitmix64-1of4-entropy-plus-3of4-seeded-motif-v1 legacy_single_frame_bytes=4219763 legacy_response_protocol_bytes=4219765\nPROVIDE_READY peerid=12D3KooWK99VoVxNE7XzyBwXEzW7xhK7Gpv85r9F3V3fyKSUKPH5 addr=/ip4/10.98.0.1/tcp/9098 content=Blake3Digest([52, 21, 255, 20, 24, 252, 185, 128, 112, 135, 136, 125, 40, 38, 228, 65, 2, 107, 135, 18, 188, 191, 35, 52, 9, 200, 73, 225, 181, 146, 198, 79])\nREADY\nARM_ORDER order=raw-first\nARM_START arm=raw fetcher_identity_seed=2\n=== XFER raw ===\nFETCH_DONE content=blake3:3415ff1418fcb9807087887d2826e441026b8712bcbf233409c849e1b592c64f bytes=16777216 expect=16777216 elapsed_ns=8030193690 byte_identical=1 blake3_ok=1 request_protocol_bytes=33 response_header_bytes=10 proof_bytes=16320 leaf_count=256 leaf_length_prefix_bytes=0 encoded_leaf_bytes=16777216 complete_marker_bytes=4 response_body_bytes=16793540 response_protocol_bytes=16793550 exchange_protocol_bytes=16793583 codec_requested=raw selected_codec=raw request_complete_ns=26704 first_response_byte_ns=324220059 authenticated_first_leaf_ns=421665874 total_fetch_ns=7987099984\nARM_START arm=zstd fetcher_identity_seed=2\n=== XFER zstd ===\nFETCH_DONE content=blake3:3415ff1418fcb9807087887d2826e441026b8712bcbf233409c849e1b592c64f bytes=16777216 expect=16777216 elapsed_ns=2296489191 byte_identical=1 blake3_ok=1 request_protocol_bytes=33 response_header_bytes=10 proof_bytes=16320 leaf_count=256 leaf_length_prefix_bytes=1024 encoded_leaf_bytes=4270133 complete_marker_bytes=4 response_body_bytes=4287481 response_protocol_bytes=4287491 exchange_protocol_bytes=4287524 codec_requested=both selected_codec=zstd request_complete_ns=21560 first_response_byte_ns=324100073 authenticated_first_leaf_ns=371799719 total_fetch_ns=2215464190\nPROVIDE_DONE content=blake3:3415ff1418fcb9807087887d2826e441026b8712bcbf233409c849e1b592c64f selected_codec=raw pass1_bytes=16777216 pass2_bytes=16777216 proof_preparation_ns=282658256 total_serve_ns=7863436876 request_protocol_bytes=33 response_header_bytes=10 proof_bytes=16320 leaf_count=256 leaf_length_prefix_bytes=0 encoded_leaf_bytes=16777216 complete_marker_bytes=4 response_body_bytes=16793540 response_protocol_bytes=16793550 exchange_protocol_bytes=16793583\nPROVIDE_DONE content=blake3:3415ff1418fcb9807087887d2826e441026b8712bcbf233409c849e1b592c64f selected_codec=zstd pass1_bytes=16777216 pass2_bytes=16777216 proof_preparation_ns=282807594 total_serve_ns=2182196307 request_protocol_bytes=33 response_header_bytes=10 proof_bytes=16320 leaf_count=256 leaf_length_prefix_bytes=1024 encoded_leaf_bytes=4270133 complete_marker_bytes=4 response_body_bytes=4287481 response_protocol_bytes=4287491 exchange_protocol_bytes=4287524\n",
+          "stderr": "",
+          "return_code": 0,
+          "sha256": "9cbfbd872567ba361f6f8f45a4881e687bc1ce3735e2c45d6eaf41cc6b950ead",
+          "sha256_recipe": "sha256(utf8(canonical-json(stdout,stderr,return_code)))"
+        },
+        "audit_checks": {
+          "transcript_sha256_matches": true,
+          "process_capture_sha256_matches": true,
+          "process_capture_matches_transcript": true,
+          "wire_equations_hold": true,
+          "provider_fetch_parity_holds": true,
+          "all_hold": true
+        }
+      },
+      {
+        "label": "shaped-1",
+        "rtt_ns": 48153000,
+        "rtt_avg_source_decimal_ms": "48.153",
+        "arm_order": "zstd-first",
+        "arm_identity_seeds": {
+          "zstd": 2,
+          "raw": 2
+        },
+        "payload_config": {
+          "nar_seed": 20198,
+          "payload_kind": "compressible",
+          "payload_construction": "splitmix64-1of4-entropy-plus-3of4-seeded-motif-v1",
+          "raw_bytes": 16777216,
+          "fetcher_identity_seed": 2
+        },
+        "provider_meta": {
+          "content": "blake3:3415ff1418fcb9807087887d2826e441026b8712bcbf233409c849e1b592c64f",
+          "raw_bytes": 16777216,
+          "nar_seed": 20198,
+          "payload_kind": "compressible",
+          "payload_construction": "splitmix64-1of4-entropy-plus-3of4-seeded-motif-v1",
+          "legacy_single_frame_bytes": 4219763,
+          "legacy_response_protocol_bytes": 4219765
+        },
+        "content": "blake3:3415ff1418fcb9807087887d2826e441026b8712bcbf233409c849e1b592c64f",
+        "arms": {
+          "raw": {
+            "fetch": {
+              "metadata": {
+                "authenticated_first_leaf_ns": 424332157,
+                "request_complete_ns": 23627,
+                "first_response_byte_ns": 326876868,
+                "total_fetch_ns": 7469883618,
+                "elapsed_ns": 7513338632,
+                "expect": 16777216,
+                "byte_identical": 1,
+                "bytes": 16777216,
+                "blake3_ok": 1,
+                "codec_requested": "raw",
+                "selected_codec": "raw",
+                "content": "blake3:3415ff1418fcb9807087887d2826e441026b8712bcbf233409c849e1b592c64f"
+              },
+              "wire": {
+                "request_protocol_bytes": 33,
+                "response_header_bytes": 10,
+                "proof_bytes": 16320,
+                "leaf_count": 256,
+                "leaf_length_prefix_bytes": 0,
+                "encoded_leaf_bytes": 16777216,
+                "complete_marker_bytes": 4,
+                "response_body_bytes": 16793540,
+                "response_protocol_bytes": 16793550,
+                "exchange_protocol_bytes": 16793583
+              },
+              "wire_equations": {
+                "response_body": {
+                  "reported_bytes": 16793540,
+                  "component_sum_bytes": 16793540,
+                  "holds": true
+                },
+                "response_protocol": {
+                  "reported_bytes": 16793550,
+                  "component_sum_bytes": 16793550,
+                  "holds": true
+                },
+                "exchange_protocol": {
+                  "reported_bytes": 16793583,
+                  "component_sum_bytes": 16793583,
+                  "holds": true
+                },
+                "all_hold": true
+              }
+            },
+            "provider": {
+              "metadata": {
+                "total_serve_ns": 7400623720,
+                "pass1_bytes": 16777216,
+                "proof_preparation_ns": 285351406,
+                "pass2_bytes": 16777216,
+                "content": "blake3:3415ff1418fcb9807087887d2826e441026b8712bcbf233409c849e1b592c64f",
+                "selected_codec": "raw"
+              },
+              "wire": {
+                "request_protocol_bytes": 33,
+                "response_header_bytes": 10,
+                "proof_bytes": 16320,
+                "leaf_count": 256,
+                "leaf_length_prefix_bytes": 0,
+                "encoded_leaf_bytes": 16777216,
+                "complete_marker_bytes": 4,
+                "response_body_bytes": 16793540,
+                "response_protocol_bytes": 16793550,
+                "exchange_protocol_bytes": 16793583
+              },
+              "wire_equations": {
+                "response_body": {
+                  "reported_bytes": 16793540,
+                  "component_sum_bytes": 16793540,
+                  "holds": true
+                },
+                "response_protocol": {
+                  "reported_bytes": 16793550,
+                  "component_sum_bytes": 16793550,
+                  "holds": true
+                },
+                "exchange_protocol": {
+                  "reported_bytes": 16793583,
+                  "component_sum_bytes": 16793583,
+                  "holds": true
+                },
+                "all_hold": true
+              }
+            },
+            "provider_fetch_parity": {
+              "wire_fields": {
+                "request_protocol_bytes": true,
+                "response_header_bytes": true,
+                "proof_bytes": true,
+                "leaf_count": true,
+                "leaf_length_prefix_bytes": true,
+                "encoded_leaf_bytes": true,
+                "complete_marker_bytes": true,
+                "response_body_bytes": true,
+                "response_protocol_bytes": true,
+                "exchange_protocol_bytes": true
+              },
+              "all_wire_fields_equal": true,
+              "content_equal": true
+            }
+          },
+          "zstd": {
+            "fetch": {
+              "metadata": {
+                "authenticated_first_leaf_ns": 368913940,
+                "request_complete_ns": 24217,
+                "first_response_byte_ns": 322312493,
+                "total_fetch_ns": 2207620248,
+                "elapsed_ns": 2250607541,
+                "expect": 16777216,
+                "byte_identical": 1,
+                "bytes": 16777216,
+                "blake3_ok": 1,
+                "codec_requested": "both",
+                "selected_codec": "zstd",
+                "content": "blake3:3415ff1418fcb9807087887d2826e441026b8712bcbf233409c849e1b592c64f"
+              },
+              "wire": {
+                "request_protocol_bytes": 33,
+                "response_header_bytes": 10,
+                "proof_bytes": 16320,
+                "leaf_count": 256,
+                "leaf_length_prefix_bytes": 1024,
+                "encoded_leaf_bytes": 4270133,
+                "complete_marker_bytes": 4,
+                "response_body_bytes": 4287481,
+                "response_protocol_bytes": 4287491,
+                "exchange_protocol_bytes": 4287524
+              },
+              "wire_equations": {
+                "response_body": {
+                  "reported_bytes": 4287481,
+                  "component_sum_bytes": 4287481,
+                  "holds": true
+                },
+                "response_protocol": {
+                  "reported_bytes": 4287491,
+                  "component_sum_bytes": 4287491,
+                  "holds": true
+                },
+                "exchange_protocol": {
+                  "reported_bytes": 4287524,
+                  "component_sum_bytes": 4287524,
+                  "holds": true
+                },
+                "all_hold": true
+              }
+            },
+            "provider": {
+              "metadata": {
+                "total_serve_ns": 2135848901,
+                "pass1_bytes": 16777216,
+                "proof_preparation_ns": 280906393,
+                "pass2_bytes": 16777216,
+                "content": "blake3:3415ff1418fcb9807087887d2826e441026b8712bcbf233409c849e1b592c64f",
+                "selected_codec": "zstd"
+              },
+              "wire": {
+                "request_protocol_bytes": 33,
+                "response_header_bytes": 10,
+                "proof_bytes": 16320,
+                "leaf_count": 256,
+                "leaf_length_prefix_bytes": 1024,
+                "encoded_leaf_bytes": 4270133,
+                "complete_marker_bytes": 4,
+                "response_body_bytes": 4287481,
+                "response_protocol_bytes": 4287491,
+                "exchange_protocol_bytes": 4287524
+              },
+              "wire_equations": {
+                "response_body": {
+                  "reported_bytes": 4287481,
+                  "component_sum_bytes": 4287481,
+                  "holds": true
+                },
+                "response_protocol": {
+                  "reported_bytes": 4287491,
+                  "component_sum_bytes": 4287491,
+                  "holds": true
+                },
+                "exchange_protocol": {
+                  "reported_bytes": 4287524,
+                  "component_sum_bytes": 4287524,
+                  "holds": true
+                },
+                "all_hold": true
+              }
+            },
+            "provider_fetch_parity": {
+              "wire_fields": {
+                "request_protocol_bytes": true,
+                "response_header_bytes": true,
+                "proof_bytes": true,
+                "leaf_count": true,
+                "leaf_length_prefix_bytes": true,
+                "encoded_leaf_bytes": true,
+                "complete_marker_bytes": true,
+                "response_body_bytes": true,
+                "response_protocol_bytes": true,
+                "exchange_protocol_bytes": true
+              },
+              "all_wire_fields_equal": true,
+              "content_equal": true
+            }
+          }
+        },
+        "parser_transcript": {
+          "text": "PAYLOAD_CONFIG nar_seed=20198 payload_kind=compressible payload_construction=splitmix64-1of4-entropy-plus-3of4-seeded-motif-v1 raw_bytes=16777216 fetcher_identity_seed=2\n=== RTT probe (shape=yes) ===\n5 packets transmitted, 5 received, 0% packet loss, time 801ms\nrtt min/avg/max/mdev = 40.130/48.153/80.209/16.027 ms\n=== PROVIDER (shape=yes, nar=16777216 bytes, compressible) ===\nPROVIDE_META content=blake3:3415ff1418fcb9807087887d2826e441026b8712bcbf233409c849e1b592c64f raw_bytes=16777216 nar_seed=20198 payload_kind=compressible payload_construction=splitmix64-1of4-entropy-plus-3of4-seeded-motif-v1 legacy_single_frame_bytes=4219763 legacy_response_protocol_bytes=4219765\nPROVIDE_READY peerid=12D3KooWK99VoVxNE7XzyBwXEzW7xhK7Gpv85r9F3V3fyKSUKPH5 addr=/ip4/10.98.0.1/tcp/9098 content=Blake3Digest([52, 21, 255, 20, 24, 252, 185, 128, 112, 135, 136, 125, 40, 38, 228, 65, 2, 107, 135, 18, 188, 191, 35, 52, 9, 200, 73, 225, 181, 146, 198, 79])\nREADY\nARM_ORDER order=zstd-first\nARM_START arm=zstd fetcher_identity_seed=2\n=== XFER zstd ===\nFETCH_DONE content=blake3:3415ff1418fcb9807087887d2826e441026b8712bcbf233409c849e1b592c64f bytes=16777216 expect=16777216 elapsed_ns=2250607541 byte_identical=1 blake3_ok=1 request_protocol_bytes=33 response_header_bytes=10 proof_bytes=16320 leaf_count=256 leaf_length_prefix_bytes=1024 encoded_leaf_bytes=4270133 complete_marker_bytes=4 response_body_bytes=4287481 response_protocol_bytes=4287491 exchange_protocol_bytes=4287524 codec_requested=both selected_codec=zstd request_complete_ns=24217 first_response_byte_ns=322312493 authenticated_first_leaf_ns=368913940 total_fetch_ns=2207620248\nARM_START arm=raw fetcher_identity_seed=2\n=== XFER raw ===\nFETCH_DONE content=blake3:3415ff1418fcb9807087887d2826e441026b8712bcbf233409c849e1b592c64f bytes=16777216 expect=16777216 elapsed_ns=7513338632 byte_identical=1 blake3_ok=1 request_protocol_bytes=33 response_header_bytes=10 proof_bytes=16320 leaf_count=256 leaf_length_prefix_bytes=0 encoded_leaf_bytes=16777216 complete_marker_bytes=4 response_body_bytes=16793540 response_protocol_bytes=16793550 exchange_protocol_bytes=16793583 codec_requested=raw selected_codec=raw request_complete_ns=23627 first_response_byte_ns=326876868 authenticated_first_leaf_ns=424332157 total_fetch_ns=7469883618\nPROVIDE_DONE content=blake3:3415ff1418fcb9807087887d2826e441026b8712bcbf233409c849e1b592c64f selected_codec=zstd pass1_bytes=16777216 pass2_bytes=16777216 proof_preparation_ns=280906393 total_serve_ns=2135848901 request_protocol_bytes=33 response_header_bytes=10 proof_bytes=16320 leaf_count=256 leaf_length_prefix_bytes=1024 encoded_leaf_bytes=4270133 complete_marker_bytes=4 response_body_bytes=4287481 response_protocol_bytes=4287491 exchange_protocol_bytes=4287524\nPROVIDE_DONE content=blake3:3415ff1418fcb9807087887d2826e441026b8712bcbf233409c849e1b592c64f selected_codec=raw pass1_bytes=16777216 pass2_bytes=16777216 proof_preparation_ns=285351406 total_serve_ns=7400623720 request_protocol_bytes=33 response_header_bytes=10 proof_bytes=16320 leaf_count=256 leaf_length_prefix_bytes=0 encoded_leaf_bytes=16777216 complete_marker_bytes=4 response_body_bytes=16793540 response_protocol_bytes=16793550 exchange_protocol_bytes=16793583\n",
+          "sha256": "f1beeefbb615fdd899980149b4cd57e79e022574051c997fb05873910229497c",
+          "sha256_recipe": "sha256(utf8(text))"
+        },
+        "process_capture": {
+          "stdout": "PAYLOAD_CONFIG nar_seed=20198 payload_kind=compressible payload_construction=splitmix64-1of4-entropy-plus-3of4-seeded-motif-v1 raw_bytes=16777216 fetcher_identity_seed=2\n=== RTT probe (shape=yes) ===\n5 packets transmitted, 5 received, 0% packet loss, time 801ms\nrtt min/avg/max/mdev = 40.130/48.153/80.209/16.027 ms\n=== PROVIDER (shape=yes, nar=16777216 bytes, compressible) ===\nPROVIDE_META content=blake3:3415ff1418fcb9807087887d2826e441026b8712bcbf233409c849e1b592c64f raw_bytes=16777216 nar_seed=20198 payload_kind=compressible payload_construction=splitmix64-1of4-entropy-plus-3of4-seeded-motif-v1 legacy_single_frame_bytes=4219763 legacy_response_protocol_bytes=4219765\nPROVIDE_READY peerid=12D3KooWK99VoVxNE7XzyBwXEzW7xhK7Gpv85r9F3V3fyKSUKPH5 addr=/ip4/10.98.0.1/tcp/9098 content=Blake3Digest([52, 21, 255, 20, 24, 252, 185, 128, 112, 135, 136, 125, 40, 38, 228, 65, 2, 107, 135, 18, 188, 191, 35, 52, 9, 200, 73, 225, 181, 146, 198, 79])\nREADY\nARM_ORDER order=zstd-first\nARM_START arm=zstd fetcher_identity_seed=2\n=== XFER zstd ===\nFETCH_DONE content=blake3:3415ff1418fcb9807087887d2826e441026b8712bcbf233409c849e1b592c64f bytes=16777216 expect=16777216 elapsed_ns=2250607541 byte_identical=1 blake3_ok=1 request_protocol_bytes=33 response_header_bytes=10 proof_bytes=16320 leaf_count=256 leaf_length_prefix_bytes=1024 encoded_leaf_bytes=4270133 complete_marker_bytes=4 response_body_bytes=4287481 response_protocol_bytes=4287491 exchange_protocol_bytes=4287524 codec_requested=both selected_codec=zstd request_complete_ns=24217 first_response_byte_ns=322312493 authenticated_first_leaf_ns=368913940 total_fetch_ns=2207620248\nARM_START arm=raw fetcher_identity_seed=2\n=== XFER raw ===\nFETCH_DONE content=blake3:3415ff1418fcb9807087887d2826e441026b8712bcbf233409c849e1b592c64f bytes=16777216 expect=16777216 elapsed_ns=7513338632 byte_identical=1 blake3_ok=1 request_protocol_bytes=33 response_header_bytes=10 proof_bytes=16320 leaf_count=256 leaf_length_prefix_bytes=0 encoded_leaf_bytes=16777216 complete_marker_bytes=4 response_body_bytes=16793540 response_protocol_bytes=16793550 exchange_protocol_bytes=16793583 codec_requested=raw selected_codec=raw request_complete_ns=23627 first_response_byte_ns=326876868 authenticated_first_leaf_ns=424332157 total_fetch_ns=7469883618\nPROVIDE_DONE content=blake3:3415ff1418fcb9807087887d2826e441026b8712bcbf233409c849e1b592c64f selected_codec=zstd pass1_bytes=16777216 pass2_bytes=16777216 proof_preparation_ns=280906393 total_serve_ns=2135848901 request_protocol_bytes=33 response_header_bytes=10 proof_bytes=16320 leaf_count=256 leaf_length_prefix_bytes=1024 encoded_leaf_bytes=4270133 complete_marker_bytes=4 response_body_bytes=4287481 response_protocol_bytes=4287491 exchange_protocol_bytes=4287524\nPROVIDE_DONE content=blake3:3415ff1418fcb9807087887d2826e441026b8712bcbf233409c849e1b592c64f selected_codec=raw pass1_bytes=16777216 pass2_bytes=16777216 proof_preparation_ns=285351406 total_serve_ns=7400623720 request_protocol_bytes=33 response_header_bytes=10 proof_bytes=16320 leaf_count=256 leaf_length_prefix_bytes=0 encoded_leaf_bytes=16777216 complete_marker_bytes=4 response_body_bytes=16793540 response_protocol_bytes=16793550 exchange_protocol_bytes=16793583\n",
+          "stderr": "",
+          "return_code": 0,
+          "sha256": "7e53e11fcca9a682a2562e8508ae6b6ca0809de0d7c671f4e4ad7a7fdd0273f9",
+          "sha256_recipe": "sha256(utf8(canonical-json(stdout,stderr,return_code)))"
+        },
+        "audit_checks": {
+          "transcript_sha256_matches": true,
+          "process_capture_sha256_matches": true,
+          "process_capture_matches_transcript": true,
+          "wire_equations_hold": true,
+          "provider_fetch_parity_holds": true,
+          "all_hold": true
+        }
+      },
+      {
+        "label": "shaped-2",
+        "rtt_ns": 48167000,
+        "rtt_avg_source_decimal_ms": "48.167",
+        "arm_order": "raw-first",
+        "arm_identity_seeds": {
+          "raw": 2,
+          "zstd": 2
+        },
+        "payload_config": {
+          "nar_seed": 20198,
+          "payload_kind": "compressible",
+          "payload_construction": "splitmix64-1of4-entropy-plus-3of4-seeded-motif-v1",
+          "raw_bytes": 16777216,
+          "fetcher_identity_seed": 2
+        },
+        "provider_meta": {
+          "content": "blake3:3415ff1418fcb9807087887d2826e441026b8712bcbf233409c849e1b592c64f",
+          "raw_bytes": 16777216,
+          "nar_seed": 20198,
+          "payload_kind": "compressible",
+          "payload_construction": "splitmix64-1of4-entropy-plus-3of4-seeded-motif-v1",
+          "legacy_single_frame_bytes": 4219763,
+          "legacy_response_protocol_bytes": 4219765
+        },
+        "content": "blake3:3415ff1418fcb9807087887d2826e441026b8712bcbf233409c849e1b592c64f",
+        "arms": {
+          "raw": {
+            "fetch": {
+              "metadata": {
+                "authenticated_first_leaf_ns": 419171293,
+                "request_complete_ns": 39152,
+                "first_response_byte_ns": 321960490,
+                "total_fetch_ns": 7464941980,
+                "elapsed_ns": 7546080809,
+                "expect": 16777216,
+                "byte_identical": 1,
+                "bytes": 16777216,
+                "blake3_ok": 1,
+                "codec_requested": "raw",
+                "selected_codec": "raw",
+                "content": "blake3:3415ff1418fcb9807087887d2826e441026b8712bcbf233409c849e1b592c64f"
+              },
+              "wire": {
+                "request_protocol_bytes": 33,
+                "response_header_bytes": 10,
+                "proof_bytes": 16320,
+                "leaf_count": 256,
+                "leaf_length_prefix_bytes": 0,
+                "encoded_leaf_bytes": 16777216,
+                "complete_marker_bytes": 4,
+                "response_body_bytes": 16793540,
+                "response_protocol_bytes": 16793550,
+                "exchange_protocol_bytes": 16793583
+              },
+              "wire_equations": {
+                "response_body": {
+                  "reported_bytes": 16793540,
+                  "component_sum_bytes": 16793540,
+                  "holds": true
+                },
+                "response_protocol": {
+                  "reported_bytes": 16793550,
+                  "component_sum_bytes": 16793550,
+                  "holds": true
+                },
+                "exchange_protocol": {
+                  "reported_bytes": 16793583,
+                  "component_sum_bytes": 16793583,
+                  "holds": true
+                },
+                "all_hold": true
+              }
+            },
+            "provider": {
+              "metadata": {
+                "total_serve_ns": 7434042468,
+                "pass1_bytes": 16777216,
+                "proof_preparation_ns": 280553369,
+                "pass2_bytes": 16777216,
+                "content": "blake3:3415ff1418fcb9807087887d2826e441026b8712bcbf233409c849e1b592c64f",
+                "selected_codec": "raw"
+              },
+              "wire": {
+                "request_protocol_bytes": 33,
+                "response_header_bytes": 10,
+                "proof_bytes": 16320,
+                "leaf_count": 256,
+                "leaf_length_prefix_bytes": 0,
+                "encoded_leaf_bytes": 16777216,
+                "complete_marker_bytes": 4,
+                "response_body_bytes": 16793540,
+                "response_protocol_bytes": 16793550,
+                "exchange_protocol_bytes": 16793583
+              },
+              "wire_equations": {
+                "response_body": {
+                  "reported_bytes": 16793540,
+                  "component_sum_bytes": 16793540,
+                  "holds": true
+                },
+                "response_protocol": {
+                  "reported_bytes": 16793550,
+                  "component_sum_bytes": 16793550,
+                  "holds": true
+                },
+                "exchange_protocol": {
+                  "reported_bytes": 16793583,
+                  "component_sum_bytes": 16793583,
+                  "holds": true
+                },
+                "all_hold": true
+              }
+            },
+            "provider_fetch_parity": {
+              "wire_fields": {
+                "request_protocol_bytes": true,
+                "response_header_bytes": true,
+                "proof_bytes": true,
+                "leaf_count": true,
+                "leaf_length_prefix_bytes": true,
+                "encoded_leaf_bytes": true,
+                "complete_marker_bytes": true,
+                "response_body_bytes": true,
+                "response_protocol_bytes": true,
+                "exchange_protocol_bytes": true
+              },
+              "all_wire_fields_equal": true,
+              "content_equal": true
+            }
+          },
+          "zstd": {
+            "fetch": {
+              "metadata": {
+                "authenticated_first_leaf_ns": 369586194,
+                "request_complete_ns": 19882,
+                "first_response_byte_ns": 322529013,
+                "total_fetch_ns": 2207569184,
+                "elapsed_ns": 2249776796,
+                "expect": 16777216,
+                "byte_identical": 1,
+                "bytes": 16777216,
+                "blake3_ok": 1,
+                "codec_requested": "both",
+                "selected_codec": "zstd",
+                "content": "blake3:3415ff1418fcb9807087887d2826e441026b8712bcbf233409c849e1b592c64f"
+              },
+              "wire": {
+                "request_protocol_bytes": 33,
+                "response_header_bytes": 10,
+                "proof_bytes": 16320,
+                "leaf_count": 256,
+                "leaf_length_prefix_bytes": 1024,
+                "encoded_leaf_bytes": 4270133,
+                "complete_marker_bytes": 4,
+                "response_body_bytes": 4287481,
+                "response_protocol_bytes": 4287491,
+                "exchange_protocol_bytes": 4287524
+              },
+              "wire_equations": {
+                "response_body": {
+                  "reported_bytes": 4287481,
+                  "component_sum_bytes": 4287481,
+                  "holds": true
+                },
+                "response_protocol": {
+                  "reported_bytes": 4287491,
+                  "component_sum_bytes": 4287491,
+                  "holds": true
+                },
+                "exchange_protocol": {
+                  "reported_bytes": 4287524,
+                  "component_sum_bytes": 4287524,
+                  "holds": true
+                },
+                "all_hold": true
+              }
+            },
+            "provider": {
+              "metadata": {
+                "total_serve_ns": 2135802578,
+                "pass1_bytes": 16777216,
+                "proof_preparation_ns": 281280939,
+                "pass2_bytes": 16777216,
+                "content": "blake3:3415ff1418fcb9807087887d2826e441026b8712bcbf233409c849e1b592c64f",
+                "selected_codec": "zstd"
+              },
+              "wire": {
+                "request_protocol_bytes": 33,
+                "response_header_bytes": 10,
+                "proof_bytes": 16320,
+                "leaf_count": 256,
+                "leaf_length_prefix_bytes": 1024,
+                "encoded_leaf_bytes": 4270133,
+                "complete_marker_bytes": 4,
+                "response_body_bytes": 4287481,
+                "response_protocol_bytes": 4287491,
+                "exchange_protocol_bytes": 4287524
+              },
+              "wire_equations": {
+                "response_body": {
+                  "reported_bytes": 4287481,
+                  "component_sum_bytes": 4287481,
+                  "holds": true
+                },
+                "response_protocol": {
+                  "reported_bytes": 4287491,
+                  "component_sum_bytes": 4287491,
+                  "holds": true
+                },
+                "exchange_protocol": {
+                  "reported_bytes": 4287524,
+                  "component_sum_bytes": 4287524,
+                  "holds": true
+                },
+                "all_hold": true
+              }
+            },
+            "provider_fetch_parity": {
+              "wire_fields": {
+                "request_protocol_bytes": true,
+                "response_header_bytes": true,
+                "proof_bytes": true,
+                "leaf_count": true,
+                "leaf_length_prefix_bytes": true,
+                "encoded_leaf_bytes": true,
+                "complete_marker_bytes": true,
+                "response_body_bytes": true,
+                "response_protocol_bytes": true,
+                "exchange_protocol_bytes": true
+              },
+              "all_wire_fields_equal": true,
+              "content_equal": true
+            }
+          }
+        },
+        "parser_transcript": {
+          "text": "PAYLOAD_CONFIG nar_seed=20198 payload_kind=compressible payload_construction=splitmix64-1of4-entropy-plus-3of4-seeded-motif-v1 raw_bytes=16777216 fetcher_identity_seed=2\n=== RTT probe (shape=yes) ===\n5 packets transmitted, 5 received, 0% packet loss, time 802ms\nrtt min/avg/max/mdev = 40.149/48.167/80.198/16.015 ms\n=== PROVIDER (shape=yes, nar=16777216 bytes, compressible) ===\nPROVIDE_META content=blake3:3415ff1418fcb9807087887d2826e441026b8712bcbf233409c849e1b592c64f raw_bytes=16777216 nar_seed=20198 payload_kind=compressible payload_construction=splitmix64-1of4-entropy-plus-3of4-seeded-motif-v1 legacy_single_frame_bytes=4219763 legacy_response_protocol_bytes=4219765\nPROVIDE_READY peerid=12D3KooWK99VoVxNE7XzyBwXEzW7xhK7Gpv85r9F3V3fyKSUKPH5 addr=/ip4/10.98.0.1/tcp/9098 content=Blake3Digest([52, 21, 255, 20, 24, 252, 185, 128, 112, 135, 136, 125, 40, 38, 228, 65, 2, 107, 135, 18, 188, 191, 35, 52, 9, 200, 73, 225, 181, 146, 198, 79])\nREADY\nARM_ORDER order=raw-first\nARM_START arm=raw fetcher_identity_seed=2\n=== XFER raw ===\nFETCH_DONE content=blake3:3415ff1418fcb9807087887d2826e441026b8712bcbf233409c849e1b592c64f bytes=16777216 expect=16777216 elapsed_ns=7546080809 byte_identical=1 blake3_ok=1 request_protocol_bytes=33 response_header_bytes=10 proof_bytes=16320 leaf_count=256 leaf_length_prefix_bytes=0 encoded_leaf_bytes=16777216 complete_marker_bytes=4 response_body_bytes=16793540 response_protocol_bytes=16793550 exchange_protocol_bytes=16793583 codec_requested=raw selected_codec=raw request_complete_ns=39152 first_response_byte_ns=321960490 authenticated_first_leaf_ns=419171293 total_fetch_ns=7464941980\nARM_START arm=zstd fetcher_identity_seed=2\n=== XFER zstd ===\nFETCH_DONE content=blake3:3415ff1418fcb9807087887d2826e441026b8712bcbf233409c849e1b592c64f bytes=16777216 expect=16777216 elapsed_ns=2249776796 byte_identical=1 blake3_ok=1 request_protocol_bytes=33 response_header_bytes=10 proof_bytes=16320 leaf_count=256 leaf_length_prefix_bytes=1024 encoded_leaf_bytes=4270133 complete_marker_bytes=4 response_body_bytes=4287481 response_protocol_bytes=4287491 exchange_protocol_bytes=4287524 codec_requested=both selected_codec=zstd request_complete_ns=19882 first_response_byte_ns=322529013 authenticated_first_leaf_ns=369586194 total_fetch_ns=2207569184\nPROVIDE_DONE content=blake3:3415ff1418fcb9807087887d2826e441026b8712bcbf233409c849e1b592c64f selected_codec=raw pass1_bytes=16777216 pass2_bytes=16777216 proof_preparation_ns=280553369 total_serve_ns=7434042468 request_protocol_bytes=33 response_header_bytes=10 proof_bytes=16320 leaf_count=256 leaf_length_prefix_bytes=0 encoded_leaf_bytes=16777216 complete_marker_bytes=4 response_body_bytes=16793540 response_protocol_bytes=16793550 exchange_protocol_bytes=16793583\nPROVIDE_DONE content=blake3:3415ff1418fcb9807087887d2826e441026b8712bcbf233409c849e1b592c64f selected_codec=zstd pass1_bytes=16777216 pass2_bytes=16777216 proof_preparation_ns=281280939 total_serve_ns=2135802578 request_protocol_bytes=33 response_header_bytes=10 proof_bytes=16320 leaf_count=256 leaf_length_prefix_bytes=1024 encoded_leaf_bytes=4270133 complete_marker_bytes=4 response_body_bytes=4287481 response_protocol_bytes=4287491 exchange_protocol_bytes=4287524\n",
+          "sha256": "88ec68d9a135a40dcd892eb63040fc1299d482959d5cbfc7db7a3bfcf137e6b0",
+          "sha256_recipe": "sha256(utf8(text))"
+        },
+        "process_capture": {
+          "stdout": "PAYLOAD_CONFIG nar_seed=20198 payload_kind=compressible payload_construction=splitmix64-1of4-entropy-plus-3of4-seeded-motif-v1 raw_bytes=16777216 fetcher_identity_seed=2\n=== RTT probe (shape=yes) ===\n5 packets transmitted, 5 received, 0% packet loss, time 802ms\nrtt min/avg/max/mdev = 40.149/48.167/80.198/16.015 ms\n=== PROVIDER (shape=yes, nar=16777216 bytes, compressible) ===\nPROVIDE_META content=blake3:3415ff1418fcb9807087887d2826e441026b8712bcbf233409c849e1b592c64f raw_bytes=16777216 nar_seed=20198 payload_kind=compressible payload_construction=splitmix64-1of4-entropy-plus-3of4-seeded-motif-v1 legacy_single_frame_bytes=4219763 legacy_response_protocol_bytes=4219765\nPROVIDE_READY peerid=12D3KooWK99VoVxNE7XzyBwXEzW7xhK7Gpv85r9F3V3fyKSUKPH5 addr=/ip4/10.98.0.1/tcp/9098 content=Blake3Digest([52, 21, 255, 20, 24, 252, 185, 128, 112, 135, 136, 125, 40, 38, 228, 65, 2, 107, 135, 18, 188, 191, 35, 52, 9, 200, 73, 225, 181, 146, 198, 79])\nREADY\nARM_ORDER order=raw-first\nARM_START arm=raw fetcher_identity_seed=2\n=== XFER raw ===\nFETCH_DONE content=blake3:3415ff1418fcb9807087887d2826e441026b8712bcbf233409c849e1b592c64f bytes=16777216 expect=16777216 elapsed_ns=7546080809 byte_identical=1 blake3_ok=1 request_protocol_bytes=33 response_header_bytes=10 proof_bytes=16320 leaf_count=256 leaf_length_prefix_bytes=0 encoded_leaf_bytes=16777216 complete_marker_bytes=4 response_body_bytes=16793540 response_protocol_bytes=16793550 exchange_protocol_bytes=16793583 codec_requested=raw selected_codec=raw request_complete_ns=39152 first_response_byte_ns=321960490 authenticated_first_leaf_ns=419171293 total_fetch_ns=7464941980\nARM_START arm=zstd fetcher_identity_seed=2\n=== XFER zstd ===\nFETCH_DONE content=blake3:3415ff1418fcb9807087887d2826e441026b8712bcbf233409c849e1b592c64f bytes=16777216 expect=16777216 elapsed_ns=2249776796 byte_identical=1 blake3_ok=1 request_protocol_bytes=33 response_header_bytes=10 proof_bytes=16320 leaf_count=256 leaf_length_prefix_bytes=1024 encoded_leaf_bytes=4270133 complete_marker_bytes=4 response_body_bytes=4287481 response_protocol_bytes=4287491 exchange_protocol_bytes=4287524 codec_requested=both selected_codec=zstd request_complete_ns=19882 first_response_byte_ns=322529013 authenticated_first_leaf_ns=369586194 total_fetch_ns=2207569184\nPROVIDE_DONE content=blake3:3415ff1418fcb9807087887d2826e441026b8712bcbf233409c849e1b592c64f selected_codec=raw pass1_bytes=16777216 pass2_bytes=16777216 proof_preparation_ns=280553369 total_serve_ns=7434042468 request_protocol_bytes=33 response_header_bytes=10 proof_bytes=16320 leaf_count=256 leaf_length_prefix_bytes=0 encoded_leaf_bytes=16777216 complete_marker_bytes=4 response_body_bytes=16793540 response_protocol_bytes=16793550 exchange_protocol_bytes=16793583\nPROVIDE_DONE content=blake3:3415ff1418fcb9807087887d2826e441026b8712bcbf233409c849e1b592c64f selected_codec=zstd pass1_bytes=16777216 pass2_bytes=16777216 proof_preparation_ns=281280939 total_serve_ns=2135802578 request_protocol_bytes=33 response_header_bytes=10 proof_bytes=16320 leaf_count=256 leaf_length_prefix_bytes=1024 encoded_leaf_bytes=4270133 complete_marker_bytes=4 response_body_bytes=4287481 response_protocol_bytes=4287491 exchange_protocol_bytes=4287524\n",
+          "stderr": "",
+          "return_code": 0,
+          "sha256": "7f1ab4a6271c28a6f4a3d90d5434ac99647c8c84066286060feacc5069924bf4",
+          "sha256_recipe": "sha256(utf8(canonical-json(stdout,stderr,return_code)))"
+        },
+        "audit_checks": {
+          "transcript_sha256_matches": true,
+          "process_capture_sha256_matches": true,
+          "process_capture_matches_transcript": true,
+          "wire_equations_hold": true,
+          "provider_fetch_parity_holds": true,
+          "all_hold": true
+        }
+      }
+    ],
+    "unshaped_control": {
+      "label": "unshaped-control",
+      "rtt_ns": 54000,
+      "rtt_avg_source_decimal_ms": "0.054",
+      "arm_order": "zstd-first",
+      "arm_identity_seeds": {
+        "zstd": 2,
+        "raw": 2
+      },
+      "payload_config": {
+        "nar_seed": 20198,
+        "payload_kind": "compressible",
+        "payload_construction": "splitmix64-1of4-entropy-plus-3of4-seeded-motif-v1",
+        "raw_bytes": 16777216,
+        "fetcher_identity_seed": 2
+      },
+      "provider_meta": {
+        "content": "blake3:3415ff1418fcb9807087887d2826e441026b8712bcbf233409c849e1b592c64f",
+        "raw_bytes": 16777216,
+        "nar_seed": 20198,
+        "payload_kind": "compressible",
+        "payload_construction": "splitmix64-1of4-entropy-plus-3of4-seeded-motif-v1",
+        "legacy_single_frame_bytes": 4219763,
+        "legacy_response_protocol_bytes": 4219765
+      },
+      "content": "blake3:3415ff1418fcb9807087887d2826e441026b8712bcbf233409c849e1b592c64f",
+      "arms": {
+        "raw": {
+          "fetch": {
+            "metadata": {
+              "authenticated_first_leaf_ns": 286089415,
+              "request_complete_ns": 15010,
+              "first_response_byte_ns": 282909407,
+              "total_fetch_ns": 563491633,
+              "elapsed_ns": 565722959,
+              "expect": 16777216,
+              "byte_identical": 1,
+              "bytes": 16777216,
+              "blake3_ok": 1,
+              "codec_requested": "raw",
+              "selected_codec": "raw",
+              "content": "blake3:3415ff1418fcb9807087887d2826e441026b8712bcbf233409c849e1b592c64f"
+            },
+            "wire": {
+              "request_protocol_bytes": 33,
+              "response_header_bytes": 10,
+              "proof_bytes": 16320,
+              "leaf_count": 256,
+              "leaf_length_prefix_bytes": 0,
+              "encoded_leaf_bytes": 16777216,
+              "complete_marker_bytes": 4,
+              "response_body_bytes": 16793540,
+              "response_protocol_bytes": 16793550,
+              "exchange_protocol_bytes": 16793583
+            },
+            "wire_equations": {
+              "response_body": {
+                "reported_bytes": 16793540,
+                "component_sum_bytes": 16793540,
+                "holds": true
+              },
+              "response_protocol": {
+                "reported_bytes": 16793550,
+                "component_sum_bytes": 16793550,
+                "holds": true
+              },
+              "exchange_protocol": {
+                "reported_bytes": 16793583,
+                "component_sum_bytes": 16793583,
+                "holds": true
+              },
+              "all_hold": true
+            }
+          },
+          "provider": {
+            "metadata": {
+              "total_serve_ns": 563480013,
+              "pass1_bytes": 16777216,
+              "proof_preparation_ns": 282048924,
+              "pass2_bytes": 16777216,
+              "content": "blake3:3415ff1418fcb9807087887d2826e441026b8712bcbf233409c849e1b592c64f",
+              "selected_codec": "raw"
+            },
+            "wire": {
+              "request_protocol_bytes": 33,
+              "response_header_bytes": 10,
+              "proof_bytes": 16320,
+              "leaf_count": 256,
+              "leaf_length_prefix_bytes": 0,
+              "encoded_leaf_bytes": 16777216,
+              "complete_marker_bytes": 4,
+              "response_body_bytes": 16793540,
+              "response_protocol_bytes": 16793550,
+              "exchange_protocol_bytes": 16793583
+            },
+            "wire_equations": {
+              "response_body": {
+                "reported_bytes": 16793540,
+                "component_sum_bytes": 16793540,
+                "holds": true
+              },
+              "response_protocol": {
+                "reported_bytes": 16793550,
+                "component_sum_bytes": 16793550,
+                "holds": true
+              },
+              "exchange_protocol": {
+                "reported_bytes": 16793583,
+                "component_sum_bytes": 16793583,
+                "holds": true
+              },
+              "all_hold": true
+            }
+          },
+          "provider_fetch_parity": {
+            "wire_fields": {
+              "request_protocol_bytes": true,
+              "response_header_bytes": true,
+              "proof_bytes": true,
+              "leaf_count": true,
+              "leaf_length_prefix_bytes": true,
+              "encoded_leaf_bytes": true,
+              "complete_marker_bytes": true,
+              "response_body_bytes": true,
+              "response_protocol_bytes": true,
+              "exchange_protocol_bytes": true
+            },
+            "all_wire_fields_equal": true,
+            "content_equal": true
+          }
+        },
+        "zstd": {
+          "fetch": {
+            "metadata": {
+              "authenticated_first_leaf_ns": 285568668,
+              "request_complete_ns": 15530,
+              "first_response_byte_ns": 281821766,
+              "total_fetch_ns": 562654724,
+              "elapsed_ns": 564982113,
+              "expect": 16777216,
+              "byte_identical": 1,
+              "bytes": 16777216,
+              "blake3_ok": 1,
+              "codec_requested": "both",
+              "selected_codec": "zstd",
+              "content": "blake3:3415ff1418fcb9807087887d2826e441026b8712bcbf233409c849e1b592c64f"
+            },
+            "wire": {
+              "request_protocol_bytes": 33,
+              "response_header_bytes": 10,
+              "proof_bytes": 16320,
+              "leaf_count": 256,
+              "leaf_length_prefix_bytes": 1024,
+              "encoded_leaf_bytes": 4270133,
+              "complete_marker_bytes": 4,
+              "response_body_bytes": 4287481,
+              "response_protocol_bytes": 4287491,
+              "exchange_protocol_bytes": 4287524
+            },
+            "wire_equations": {
+              "response_body": {
+                "reported_bytes": 4287481,
+                "component_sum_bytes": 4287481,
+                "holds": true
+              },
+              "response_protocol": {
+                "reported_bytes": 4287491,
+                "component_sum_bytes": 4287491,
+                "holds": true
+              },
+              "exchange_protocol": {
+                "reported_bytes": 4287524,
+                "component_sum_bytes": 4287524,
+                "holds": true
+              },
+              "all_hold": true
+            }
+          },
+          "provider": {
+            "metadata": {
+              "total_serve_ns": 562679460,
+              "pass1_bytes": 16777216,
+              "proof_preparation_ns": 280808689,
+              "pass2_bytes": 16777216,
+              "content": "blake3:3415ff1418fcb9807087887d2826e441026b8712bcbf233409c849e1b592c64f",
+              "selected_codec": "zstd"
+            },
+            "wire": {
+              "request_protocol_bytes": 33,
+              "response_header_bytes": 10,
+              "proof_bytes": 16320,
+              "leaf_count": 256,
+              "leaf_length_prefix_bytes": 1024,
+              "encoded_leaf_bytes": 4270133,
+              "complete_marker_bytes": 4,
+              "response_body_bytes": 4287481,
+              "response_protocol_bytes": 4287491,
+              "exchange_protocol_bytes": 4287524
+            },
+            "wire_equations": {
+              "response_body": {
+                "reported_bytes": 4287481,
+                "component_sum_bytes": 4287481,
+                "holds": true
+              },
+              "response_protocol": {
+                "reported_bytes": 4287491,
+                "component_sum_bytes": 4287491,
+                "holds": true
+              },
+              "exchange_protocol": {
+                "reported_bytes": 4287524,
+                "component_sum_bytes": 4287524,
+                "holds": true
+              },
+              "all_hold": true
+            }
+          },
+          "provider_fetch_parity": {
+            "wire_fields": {
+              "request_protocol_bytes": true,
+              "response_header_bytes": true,
+              "proof_bytes": true,
+              "leaf_count": true,
+              "leaf_length_prefix_bytes": true,
+              "encoded_leaf_bytes": true,
+              "complete_marker_bytes": true,
+              "response_body_bytes": true,
+              "response_protocol_bytes": true,
+              "exchange_protocol_bytes": true
+            },
+            "all_wire_fields_equal": true,
+            "content_equal": true
+          }
+        }
+      },
+      "parser_transcript": {
+        "text": "PAYLOAD_CONFIG nar_seed=20198 payload_kind=compressible payload_construction=splitmix64-1of4-entropy-plus-3of4-seeded-motif-v1 raw_bytes=16777216 fetcher_identity_seed=2\n=== RTT probe (shape=no) ===\n5 packets transmitted, 5 received, 0% packet loss, time 826ms\nrtt min/avg/max/mdev = 0.037/0.054/0.072/0.011 ms\n=== PROVIDER (shape=no, nar=16777216 bytes, compressible) ===\nPROVIDE_META content=blake3:3415ff1418fcb9807087887d2826e441026b8712bcbf233409c849e1b592c64f raw_bytes=16777216 nar_seed=20198 payload_kind=compressible payload_construction=splitmix64-1of4-entropy-plus-3of4-seeded-motif-v1 legacy_single_frame_bytes=4219763 legacy_response_protocol_bytes=4219765\nPROVIDE_READY peerid=12D3KooWK99VoVxNE7XzyBwXEzW7xhK7Gpv85r9F3V3fyKSUKPH5 addr=/ip4/10.98.0.1/tcp/9098 content=Blake3Digest([52, 21, 255, 20, 24, 252, 185, 128, 112, 135, 136, 125, 40, 38, 228, 65, 2, 107, 135, 18, 188, 191, 35, 52, 9, 200, 73, 225, 181, 146, 198, 79])\nREADY\nARM_ORDER order=zstd-first\nARM_START arm=zstd fetcher_identity_seed=2\n=== XFER zstd ===\nFETCH_DONE content=blake3:3415ff1418fcb9807087887d2826e441026b8712bcbf233409c849e1b592c64f bytes=16777216 expect=16777216 elapsed_ns=564982113 byte_identical=1 blake3_ok=1 request_protocol_bytes=33 response_header_bytes=10 proof_bytes=16320 leaf_count=256 leaf_length_prefix_bytes=1024 encoded_leaf_bytes=4270133 complete_marker_bytes=4 response_body_bytes=4287481 response_protocol_bytes=4287491 exchange_protocol_bytes=4287524 codec_requested=both selected_codec=zstd request_complete_ns=15530 first_response_byte_ns=281821766 authenticated_first_leaf_ns=285568668 total_fetch_ns=562654724\nARM_START arm=raw fetcher_identity_seed=2\n=== XFER raw ===\nFETCH_DONE content=blake3:3415ff1418fcb9807087887d2826e441026b8712bcbf233409c849e1b592c64f bytes=16777216 expect=16777216 elapsed_ns=565722959 byte_identical=1 blake3_ok=1 request_protocol_bytes=33 response_header_bytes=10 proof_bytes=16320 leaf_count=256 leaf_length_prefix_bytes=0 encoded_leaf_bytes=16777216 complete_marker_bytes=4 response_body_bytes=16793540 response_protocol_bytes=16793550 exchange_protocol_bytes=16793583 codec_requested=raw selected_codec=raw request_complete_ns=15010 first_response_byte_ns=282909407 authenticated_first_leaf_ns=286089415 total_fetch_ns=563491633\nPROVIDE_DONE content=blake3:3415ff1418fcb9807087887d2826e441026b8712bcbf233409c849e1b592c64f selected_codec=zstd pass1_bytes=16777216 pass2_bytes=16777216 proof_preparation_ns=280808689 total_serve_ns=562679460 request_protocol_bytes=33 response_header_bytes=10 proof_bytes=16320 leaf_count=256 leaf_length_prefix_bytes=1024 encoded_leaf_bytes=4270133 complete_marker_bytes=4 response_body_bytes=4287481 response_protocol_bytes=4287491 exchange_protocol_bytes=4287524\nPROVIDE_DONE content=blake3:3415ff1418fcb9807087887d2826e441026b8712bcbf233409c849e1b592c64f selected_codec=raw pass1_bytes=16777216 pass2_bytes=16777216 proof_preparation_ns=282048924 total_serve_ns=563480013 request_protocol_bytes=33 response_header_bytes=10 proof_bytes=16320 leaf_count=256 leaf_length_prefix_bytes=0 encoded_leaf_bytes=16777216 complete_marker_bytes=4 response_body_bytes=16793540 response_protocol_bytes=16793550 exchange_protocol_bytes=16793583\n",
+        "sha256": "2133c94f236177f98465c10577ecc64c31cb9b51027f577a356beb6277b9c126",
+        "sha256_recipe": "sha256(utf8(text))"
+      },
+      "process_capture": {
+        "stdout": "PAYLOAD_CONFIG nar_seed=20198 payload_kind=compressible payload_construction=splitmix64-1of4-entropy-plus-3of4-seeded-motif-v1 raw_bytes=16777216 fetcher_identity_seed=2\n=== RTT probe (shape=no) ===\n5 packets transmitted, 5 received, 0% packet loss, time 826ms\nrtt min/avg/max/mdev = 0.037/0.054/0.072/0.011 ms\n=== PROVIDER (shape=no, nar=16777216 bytes, compressible) ===\nPROVIDE_META content=blake3:3415ff1418fcb9807087887d2826e441026b8712bcbf233409c849e1b592c64f raw_bytes=16777216 nar_seed=20198 payload_kind=compressible payload_construction=splitmix64-1of4-entropy-plus-3of4-seeded-motif-v1 legacy_single_frame_bytes=4219763 legacy_response_protocol_bytes=4219765\nPROVIDE_READY peerid=12D3KooWK99VoVxNE7XzyBwXEzW7xhK7Gpv85r9F3V3fyKSUKPH5 addr=/ip4/10.98.0.1/tcp/9098 content=Blake3Digest([52, 21, 255, 20, 24, 252, 185, 128, 112, 135, 136, 125, 40, 38, 228, 65, 2, 107, 135, 18, 188, 191, 35, 52, 9, 200, 73, 225, 181, 146, 198, 79])\nREADY\nARM_ORDER order=zstd-first\nARM_START arm=zstd fetcher_identity_seed=2\n=== XFER zstd ===\nFETCH_DONE content=blake3:3415ff1418fcb9807087887d2826e441026b8712bcbf233409c849e1b592c64f bytes=16777216 expect=16777216 elapsed_ns=564982113 byte_identical=1 blake3_ok=1 request_protocol_bytes=33 response_header_bytes=10 proof_bytes=16320 leaf_count=256 leaf_length_prefix_bytes=1024 encoded_leaf_bytes=4270133 complete_marker_bytes=4 response_body_bytes=4287481 response_protocol_bytes=4287491 exchange_protocol_bytes=4287524 codec_requested=both selected_codec=zstd request_complete_ns=15530 first_response_byte_ns=281821766 authenticated_first_leaf_ns=285568668 total_fetch_ns=562654724\nARM_START arm=raw fetcher_identity_seed=2\n=== XFER raw ===\nFETCH_DONE content=blake3:3415ff1418fcb9807087887d2826e441026b8712bcbf233409c849e1b592c64f bytes=16777216 expect=16777216 elapsed_ns=565722959 byte_identical=1 blake3_ok=1 request_protocol_bytes=33 response_header_bytes=10 proof_bytes=16320 leaf_count=256 leaf_length_prefix_bytes=0 encoded_leaf_bytes=16777216 complete_marker_bytes=4 response_body_bytes=16793540 response_protocol_bytes=16793550 exchange_protocol_bytes=16793583 codec_requested=raw selected_codec=raw request_complete_ns=15010 first_response_byte_ns=282909407 authenticated_first_leaf_ns=286089415 total_fetch_ns=563491633\nPROVIDE_DONE content=blake3:3415ff1418fcb9807087887d2826e441026b8712bcbf233409c849e1b592c64f selected_codec=zstd pass1_bytes=16777216 pass2_bytes=16777216 proof_preparation_ns=280808689 total_serve_ns=562679460 request_protocol_bytes=33 response_header_bytes=10 proof_bytes=16320 leaf_count=256 leaf_length_prefix_bytes=1024 encoded_leaf_bytes=4270133 complete_marker_bytes=4 response_body_bytes=4287481 response_protocol_bytes=4287491 exchange_protocol_bytes=4287524\nPROVIDE_DONE content=blake3:3415ff1418fcb9807087887d2826e441026b8712bcbf233409c849e1b592c64f selected_codec=raw pass1_bytes=16777216 pass2_bytes=16777216 proof_preparation_ns=282048924 total_serve_ns=563480013 request_protocol_bytes=33 response_header_bytes=10 proof_bytes=16320 leaf_count=256 leaf_length_prefix_bytes=0 encoded_leaf_bytes=16777216 complete_marker_bytes=4 response_body_bytes=16793540 response_protocol_bytes=16793550 exchange_protocol_bytes=16793583\n",
+        "stderr": "",
+        "return_code": 0,
+        "sha256": "8e50d47670ca7de1c0c0316ed47d9ab73e770df53b7c165f8663854546c832da",
+        "sha256_recipe": "sha256(utf8(canonical-json(stdout,stderr,return_code)))"
+      },
+      "audit_checks": {
+        "transcript_sha256_matches": true,
+        "process_capture_sha256_matches": true,
+        "process_capture_matches_transcript": true,
+        "wire_equations_hold": true,
+        "provider_fetch_parity_holds": true,
+        "all_hold": true
+      }
+    }
+  },
+  "headline": {
+    "zstd_faster_every_run": true,
+    "wire_smaller_every_run": true,
+    "margin_meets_predeclared_noise_threshold": true,
+    "noise_threshold": {
+      "multiplier_numerator": 3,
+      "multiplier_denominator": 1,
+      "predicate": "min_margin_ns * denominator >= combined_observed_spread_ns * numerator",
+      "min_margin_ns": 5262731091,
+      "combined_observed_spread_ns": 563567453,
+      "scaled_margin": 5262731091,
+      "scaled_required_spread": 1690702359,
+      "passes": true
+    },
+    "min_margin_ns": 5262731091,
+    "raw_spread_ns": 516855058,
+    "zstd_spread_ns": 46712395,
+    "best_raw_elapsed_ns": 7513338632,
+    "best_zstd_elapsed_ns": 2249776796,
+    "best_wallclock_speedup_pair": [
+      7513338632,
+      2249776796
+    ],
+    "best_wallclock_speedup_display": "~3.340x (exact 1878334658/562444199)"
+  },
+  "per_run": [
+    {
+      "arm_order": "raw-first",
+      "raw_elapsed_ns": 8030193690,
+      "zstd_elapsed_ns": 2296489191,
+      "margin_ns": 5733704499,
+      "raw_throughput_bytes_per_s": 2091300,
+      "zstd_throughput_bytes_per_s": 1866976,
+      "wire_raw_bytes": 16793550,
+      "wire_zstd_bytes": 4287491,
+      "wallclock_speedup_pair": [
+        8030193690,
+        2296489191
+      ],
+      "wire_ratio_pair": [
+        16793550,
+        4287491
+      ],
+      "raw_request_origin_intervals_ns": {
+        "request_complete": 26704,
+        "first_response": 324220059,
+        "first_authenticated_leaf": 421665874,
+        "complete": 7987099984
+      },
+      "zstd_request_origin_intervals_ns": {
+        "request_complete": 21560,
+        "first_response": 324100073,
+        "first_authenticated_leaf": 371799719,
+        "complete": 2215464190
+      },
+      "raw_provider_serve": {
+        "pass1_bytes": 16777216,
+        "pass2_bytes": 16777216,
+        "proof_preparation_ns": 282658256,
+        "total_serve_ns": 7863436876
+      },
+      "zstd_provider_serve": {
+        "pass1_bytes": 16777216,
+        "pass2_bytes": 16777216,
+        "proof_preparation_ns": 282807594,
+        "total_serve_ns": 2182196307
+      },
+      "zstd_faster": true
+    },
+    {
+      "arm_order": "zstd-first",
+      "raw_elapsed_ns": 7513338632,
+      "zstd_elapsed_ns": 2250607541,
+      "margin_ns": 5262731091,
+      "raw_throughput_bytes_per_s": 2235164,
+      "zstd_throughput_bytes_per_s": 1905037,
+      "wire_raw_bytes": 16793550,
+      "wire_zstd_bytes": 4287491,
+      "wallclock_speedup_pair": [
+        7513338632,
+        2250607541
+      ],
+      "wire_ratio_pair": [
+        16793550,
+        4287491
+      ],
+      "raw_request_origin_intervals_ns": {
+        "request_complete": 23627,
+        "first_response": 326876868,
+        "first_authenticated_leaf": 424332157,
+        "complete": 7469883618
+      },
+      "zstd_request_origin_intervals_ns": {
+        "request_complete": 24217,
+        "first_response": 322312493,
+        "first_authenticated_leaf": 368913940,
+        "complete": 2207620248
+      },
+      "raw_provider_serve": {
+        "pass1_bytes": 16777216,
+        "pass2_bytes": 16777216,
+        "proof_preparation_ns": 285351406,
+        "total_serve_ns": 7400623720
+      },
+      "zstd_provider_serve": {
+        "pass1_bytes": 16777216,
+        "pass2_bytes": 16777216,
+        "proof_preparation_ns": 280906393,
+        "total_serve_ns": 2135848901
+      },
+      "zstd_faster": true
+    },
+    {
+      "arm_order": "raw-first",
+      "raw_elapsed_ns": 7546080809,
+      "zstd_elapsed_ns": 2249776796,
+      "margin_ns": 5296304013,
+      "raw_throughput_bytes_per_s": 2225466,
+      "zstd_throughput_bytes_per_s": 1905740,
+      "wire_raw_bytes": 16793550,
+      "wire_zstd_bytes": 4287491,
+      "wallclock_speedup_pair": [
+        7546080809,
+        2249776796
+      ],
+      "wire_ratio_pair": [
+        16793550,
+        4287491
+      ],
+      "raw_request_origin_intervals_ns": {
+        "request_complete": 39152,
+        "first_response": 321960490,
+        "first_authenticated_leaf": 419171293,
+        "complete": 7464941980
+      },
+      "zstd_request_origin_intervals_ns": {
+        "request_complete": 19882,
+        "first_response": 322529013,
+        "first_authenticated_leaf": 369586194,
+        "complete": 2207569184
+      },
+      "raw_provider_serve": {
+        "pass1_bytes": 16777216,
+        "pass2_bytes": 16777216,
+        "proof_preparation_ns": 280553369,
+        "total_serve_ns": 7434042468
+      },
+      "zstd_provider_serve": {
+        "pass1_bytes": 16777216,
+        "pass2_bytes": 16777216,
+        "proof_preparation_ns": 281280939,
+        "total_serve_ns": 2135802578
+      },
+      "zstd_faster": true
+    }
+  ],
+  "provenance": {
+    "harness_origin": "TASK-197 /nar/4 shaped-link evidence harness (evolved from TASK-198)",
+    "wire_revision": "TASK-197 Bao-authenticated /nar/4 with independently framed 64-KiB leaves",
+    "probe_binary": "/home/mpedersen/.cache/nix-p2p-target/debug/examples/shaped_probe",
+    "probe_sha256": "21e710647668f0ab214cdca66924fadf56fcb9ae9819d8eb5966b59b3db2ddc6",
+    "harness_sha256": "f5c73053b3271ff515bbd4722317b07b6825fa2c014311f87aefb0ac6af095e7",
+    "inner_harness_sha256": "2f400ca5adc5cb8e9339c94743ac4fa2344c9b865d268732bd81c75c2c0bc021",
+    "git_head": "8d4ec414ebe106d20ee0c55efad814dc8d9d21e7",
+    "git_worktree_dirty": false,
+    "verified_unchanged_after_run": true
+  }
+}

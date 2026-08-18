@@ -122,7 +122,8 @@ public-swarm results are still out.
 - **Peer transfer over two backends,** each BLAKE3/bao-verified on arrival: iroh-blobs
   whole-NAR over QUIC (a real `nix build` served from a peer across container network
   namespaces — a corrupt peer fails the build, a dead peer falls back to upstream) and
-  libp2p request-response over the same swarm as discovery.
+  Bao-authenticated libp2p raw substreams over the same swarm as discovery. Only `/nar/4`
+  is registered: an older-protocol peer is an availability failure, never a downgrade.
 - **The backend is the binary.** The serving core is a stack-neutral crate; the primary
   binary links only libp2p, guaranteed by its dependency-graph guard — the choice of
   backend is a compile-time fact, not a runtime flag, so tests and tournament runs can
@@ -157,12 +158,14 @@ public-swarm results are still out.
   no enumeration — and the announce is gated by the supply-integrity floor above, so it can only
   advertise a path the index actually verified. Production runs off the swarm poll loop, so a
   large serve never stalls discovery.
-- **Bao-authenticated streaming transfer.** `/nar/4` declares exact RawNarV1 size, then carries
+- **Bao-authenticated bounded transfer pipeline.** `/nar/4` declares exact RawNarV1 size, then carries
   full-range Bao proofs for fixed 64-KiB leaves with raw or independently bounded per-leaf zstd.
   A fetcher exposes a leaf only after authenticating it against the requested BLAKE3; COMPLETE
   plus clean FIN gates final completion. Process supply regenerates twice—ephemeral outboard/root
   verification, then authenticated delivery—without a whole-NAR serve buffer. This does not claim
-  lower absolute TTFB: proof preparation remains and process serves perform a second dump.
+  lower absolute TTFB: proof preparation remains and process serves perform a second dump. The
+  leaf stream is internal until TASK-62 connects it to HTTP; today that compatibility seam still
+  collects the verified NAR.
 - **Leech / consume-only mode (`--libp2p-leech`).** An affirmative opt-out for anyone who
   cannot or will not contribute uplink: a leech still fetches from peers, but its fabric is
   wrapped in a transport-agnostic `LeechFabric` that masks the *serve* and *announce* axes at

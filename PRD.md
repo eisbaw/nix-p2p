@@ -217,7 +217,7 @@ Non-goals (explicit):
 | Latency guardrails | Prefetch + hedge (throughput-abort) | The only thing keeping DHT seconds off the user path — load-bearing |
 | Metadata | cache.nixos.org only + daemon disk cache | Bandwidth offload MVP (round 1, owner) |
 | Privacy (historical; superseded by TASK-114/TASK-120) | Public swarm, documented risk, leech opt-out (round 1, owner) | Preserved provenance; fresh installs are upstream-only/private and LAN/public participation is explicit opt-in |
-| Trust | Signed fields untouched; Nix verifies sig + NarHash | Daemon/peers outside TCB. Note: passthrough is **not byte-verbatim** — see compression, open question 1 |
+| Trust | Signed fields untouched; Nix verifies sig + NarHash | Daemon/peers outside TCB. Note: passthrough is **not byte-verbatim** — the settled addressed unit is the raw NAR, while link compression is transport policy |
 | Language / toolchain | **Everything in Rust** (tokio); **nix flakes** for the dev/build environment (round 4, owner) | iroh is Rust; nix-compat crates exist; flakes pin the toolchain and feed the NixOS VM tests directly |
 | Test upstream shield | Separate simple local caching proxy, permanent fixture, fault injection lives there — never in the product (round 4, owner) | Protects cache.nixos.org from test load; keeps adversarial logic out of the modular daemon |
 
@@ -239,10 +239,9 @@ Non-goals (explicit):
 
 Frozen once peers exist (deep-review surfaces):
 - **The addressed unit and hash function** — raw NAR vs compressed
-  file, and BLAKE3-of-that-unit (open question 1 — must be settled
-  before any peer transfer ships). Bytes peers already hold cannot be
-  re-addressed; this freezes *harder* than the schema, which can at
-  least be versioned.
+  file, and BLAKE3-of-that-unit. This is settled as BLAKE3 of the raw
+  NAR; once peers exist, bytes they already hold cannot be re-addressed.
+  It freezes *harder* than the schema, which can at least be versioned.
 - **Claim record schema** (version field, payload enum, reserved
   fields).
 - **Any selected global discovery mechanism & key derivation** (substrate,
@@ -441,12 +440,14 @@ oracle that is not peak RSS.
    it. First-sight fetches always hit the cache; peer yes/no probes
    partially compensate. A young network offloads little — the kill
    criterion measures steady state, not launch day.
-5. **Raw-NAR wire cost**: if the addressed unit is the raw NAR
-   (open question 1), peers ship ~3x the bytes of xz'd transfers.
-   Per-connection compression can claw this back but is added
-   complexity. If the unit is the compressed file, `--dump` seeding
-   and all of Candidate C's dedup die. This tension is the sharpest
-   open decision.
+5. **Raw-NAR wire cost**: the addressed unit is settled as the raw NAR,
+   so an uncompressed peer transfer can ship roughly 3x the bytes of an
+   xz cache transfer. `/nar/4` per-leaf zstd reduces link bytes for
+   compressible content without changing identity; TASK-197 records the
+   synthetic shaped-link cost and benefit. Raw fallback remains required,
+   and real-corpus/field value remains an evidence question rather than an
+   addressing decision. Choosing compressed-file identity instead would
+   still break `--dump` seeding and Candidate C's dedup seam.
 6. **Claim spam is amplification DoS, not merely wasteful**: a lying
    claim can point at an attacker-chosen huge blob; iroh verifies
    against the *claimed* hash, so the NarHash gate fires only after
