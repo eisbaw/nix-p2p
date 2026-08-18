@@ -6,7 +6,7 @@ title: >-
 status: To Do
 assignee: []
 created_date: '2026-08-18 20:54'
-updated_date: '2026-08-18 20:54'
+updated_date: '2026-08-18 20:59'
 labels:
   - libp2p
   - mainline
@@ -63,7 +63,10 @@ OUTCOME: reject is a fully valid and useful result. If the enumeration exposure 
 - [ ] #6 Under consume_only, preflight explicitly reports it as public-network participation and records the lookup exposure
 - [ ] #7 The node-membership enumeration exposure is MEASURED: a third host runs get_peers on the rendezvous infohash and reports recoverable fraction and wall time; a run handed the peer list fails as vacuous
 - [ ] #8 Announce and lookup traffic are bounded and the bound is proven, not asserted
-- [ ] #9 Deliverable is a written adopt / adopt-with-conditions / reject recommendation. Reject is a valid terminal outcome, and its honest consequence is NO PUBLIC POOL (private/enterprise pools only) -- not a fallback to operator-run routers, which the owner has ruled out
+- [ ] #9 A bounded, expiring peer cache persists discovered nix-p2p peers (in the existing --libp2p-state-dir) and is tried BEFORE Mainline on subsequent starts; Mainline is contacted only when the cached peers are all unreachable
+- [ ] #10 BITE: a second start with a warm cache emits ZERO Mainline packets, verified at packet level, and the guard bites under mutation. A corrupt or absent cache degrades to a normal Mainline lookup, never to a crash and never to dialing unvalidated addresses
+- [ ] #11 TEST-VACUITY GUARD: cold-discovery oracles must run with the peer cache empty or disabled, and assert it. A persisted cache would otherwise hand a test the address it was supposed to discover, silently making every no-injection bite in this task vacuous
+- [ ] #12 Deliverable is a written adopt / adopt-with-conditions / reject recommendation. Reject is a valid terminal outcome, and its honest consequence is NO PUBLIC POOL (private/enterprise pools only) -- not a fallback to operator-run routers, which the owner has ruled out
 <!-- AC:END -->
 
 ## Implementation Notes
