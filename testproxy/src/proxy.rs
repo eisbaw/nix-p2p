@@ -20,8 +20,9 @@ use crate::record::{Log, Record};
 use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::net::{Shutdown, TcpStream};
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 /// Bytes streamed per read/write iteration for NAR bodies. Fixed so memory use
@@ -41,6 +42,10 @@ pub struct State {
     /// Non-admin request handlers that have started but not yet appended their
     /// completion record. Admin observation never contributes to this count.
     in_flight: AtomicU64,
+    /// Per-cold-path single-flight coordinator: collapses N concurrent misses
+    /// for the SAME NAR path into ONE upstream fetch (task-23). Distinct from
+    /// `in_flight` above, which is a request COUNTER, not a coalescer.
+    single_flight: Arc<SingleFlight>,
 }
 
 impl State {
@@ -53,6 +58,7 @@ impl State {
             log: Mutex::new(Log::default()),
             gaps: Mutex::new(HashMap::new()),
             in_flight: AtomicU64::new(0),
+            single_flight: Arc::new(SingleFlight::default()),
         }))
     }
 
@@ -78,6 +84,107 @@ impl Drop for InFlightGuard<'_> {
     fn drop(&mut self) {
         let previous = self.count.fetch_sub(1, Ordering::SeqCst);
         debug_assert!(previous > 0, "in-flight proxy request count underflow");
+    }
+}
+
+/// Per-cold-path single-flight coordinator for NAR misses (task-23).
+///
+/// The FIRST concurrent miss for a given resolved disk path becomes the LEADER
+/// and performs the one upstream fetch; every other concurrent miss for the
+/// SAME path becomes a WAITER that blocks until the leader has committed, then
+/// serves the committed entry as an ordinary cache HIT instead of fetching
+/// upstream itself. So N concurrent misses for one cold path cause exactly ONE
+/// upstream fetch.
+///
+/// Keyed by the resolved disk path, so DIFFERENT paths never block each other -
+/// this coalesces redundant work WITHOUT serialising unrelated fetches.
+///
+/// Deliberately narrow: this layer decides only WHO fetches. It does not touch
+/// the egress path, so every request (leader and waiter alike) still runs the
+/// normal hit/miss serve code that applies fault injection to its OWN client
+/// stream. Coalescing therefore cannot let a waiter bypass a
+/// truncate/corrupt/throttle fault, and the cache still receives only
+/// upstream-correct bytes from the single leader (AC#3 integrity unchanged).
+///
+/// Known limit (blast radius): same-path waiters block on the SINGLE leader's
+/// liveness with no independent deadline, so a slow leader stalls its whole
+/// same-path herd for as long as it runs. It is bounded, not unbounded - the
+/// leader's own upstream read is capped by the 60 s idle timeout in
+/// `http::upstream_get`, after which it abandons and a waiter re-leads - but a
+/// slow-drip upstream can keep the leader (and thus the herd) alive past that
+/// per-read idle bound. Acceptable for a localhost test fixture; noted so it is
+/// a known property, not a surprise.
+#[derive(Default)]
+struct SingleFlight {
+    inflight: Mutex<HashMap<PathBuf, Arc<Flight>>>,
+}
+
+/// One in-progress leader fetch that waiters block on. `done` flips true exactly
+/// once, when the leader's [`LeaseGuard`] is dropped (after commit OR failure).
+struct Flight {
+    done: Mutex<bool>,
+    ready: Condvar,
+}
+
+/// The result of trying to claim a cold path.
+enum Lease {
+    /// This request is the leader and must perform the upstream fetch. The guard
+    /// wakes every waiter (and clears the map entry) when dropped, so it MUST be
+    /// held until AFTER the cache commit.
+    Lead(LeaseGuard),
+    /// Another request led and has now finished; the caller re-checks the cache
+    /// (a committed leader makes it a hit; a failed leader leaves it a miss to
+    /// retry as a fresh leader).
+    Waited,
+}
+
+/// Held by the leader across the whole fetch + commit. Dropping it removes the
+/// map entry and wakes every waiter - so it must outlive the commit, else a
+/// waiter could wake to a not-yet-committed (still-missing) file.
+struct LeaseGuard {
+    sf: Arc<SingleFlight>,
+    path: PathBuf,
+    flight: Arc<Flight>,
+}
+
+impl SingleFlight {
+    /// Claim `path` as leader, or block until the current leader for `path`
+    /// finishes and return [`Lease::Waited`].
+    fn lease(self: &Arc<Self>, path: &Path) -> Lease {
+        let mut map = self.inflight.lock().unwrap();
+        if let Some(flight) = map.get(path).cloned() {
+            // Someone is already fetching this path: wait for them, holding no
+            // map lock so other paths stay unblocked.
+            drop(map);
+            let mut done = flight.done.lock().unwrap();
+            while !*done {
+                done = flight.ready.wait(done).unwrap();
+            }
+            Lease::Waited
+        } else {
+            let flight = Arc::new(Flight {
+                done: Mutex::new(false),
+                ready: Condvar::new(),
+            });
+            map.insert(path.to_path_buf(), Arc::clone(&flight));
+            Lease::Lead(LeaseGuard {
+                sf: Arc::clone(self),
+                path: path.to_path_buf(),
+                flight,
+            })
+        }
+    }
+}
+
+impl Drop for LeaseGuard {
+    fn drop(&mut self) {
+        // Remove the entry FIRST, then signal done and wake waiters. A brand-new
+        // miss arriving after the commit finds no entry AND a committed file, so
+        // it serves the hit without ever leasing; existing waiters re-check the
+        // cache on wake.
+        self.sf.inflight.lock().unwrap().remove(&self.path);
+        *self.flight.done.lock().unwrap() = true;
+        self.flight.ready.notify_all();
     }
 }
 
@@ -297,41 +404,79 @@ fn serve_nar(
         .get(&nar_key)
         .map(|since| since.elapsed().as_secs_f64() * 1000.0);
 
-    // Establish the byte source: cache hit (file) or upstream miss (stream +
-    // a cache writer that captures the correct bytes). NOTE(task-23):
-    // concurrent misses for the same cold path each fetch upstream and each
-    // rename over the final path (last wins). Integrity holds (atomic rename,
-    // every reader sees a whole file) but the upstream work is redundant;
-    // single-flight coalescing is deferred to the hardening wave.
+    // Establish the byte source: cache hit (file) or upstream miss (stream + a
+    // cache writer that captures the correct bytes). Concurrent misses for the
+    // same cold path are COALESCED (task-23): the first miss leads the single
+    // upstream fetch, and same-path waiters block until it commits, then serve
+    // the committed file as a hit - exactly one upstream fetch for N concurrent
+    // same-path misses. `lease_guard`, when set, is the leader's single-flight
+    // lease; it is dropped only AFTER the commit below so a woken waiter always
+    // finds a committed (not half-written) file.
+    let mut lease_guard: Option<LeaseGuard> = None;
     let (mut source, total_len, upstream, mut writer): (
         Box<dyn Read + Send>,
         Option<u64>,
         bool,
         Option<crate::cache::CacheWriter>,
-    ) = if let Some((file, len)) = state.cache.open(&disk) {
-        (Box::new(file), Some(len), false, None)
-    } else {
-        match http::upstream_get(&state.config.upstream, request.path()) {
-            Ok(resp) if resp.status == 200 => {
-                let len = resp.content_length();
-                let writer = match state.cache.begin_write() {
-                    Ok(writer) => writer,
-                    Err(err) => {
-                        eprintln!("testproxy: cache writer failed: {err}");
-                        let _ = http::write_response(stream, 500, "text/plain", b"cache error\n");
-                        return Outcome::served(500, 0, true);
+    ) = loop {
+        // Fast path: a hit needs neither a fetch nor a lease.
+        if let Some((file, len)) = state.cache.open(&disk) {
+            break (Box::new(file), Some(len), false, None);
+        }
+        match state.single_flight.lease(&disk) {
+            // A previous leader for this path just finished; re-check the cache.
+            // A committed leader turns the next iteration into a hit; a leader
+            // that failed to commit leaves the path cold, so this request then
+            // tries to lead the retry itself (bounded: each request leads at
+            // most once, so a persistently-failing upstream costs at most N
+            // sequential attempts, never an unbounded storm).
+            Lease::Waited => continue,
+            Lease::Lead(guard) => {
+                // Double-check under leadership: a prior leader may have
+                // committed between our miss above and acquiring this lease.
+                if let Some((file, len)) = state.cache.open(&disk) {
+                    break (Box::new(file), Some(len), false, None);
+                }
+                match http::upstream_get(&state.config.upstream, request.path()) {
+                    Ok(resp) if resp.status == 200 => {
+                        let len = resp.content_length();
+                        let writer = match state.cache.begin_write() {
+                            Ok(writer) => writer,
+                            Err(err) => {
+                                eprintln!("testproxy: cache writer failed: {err}");
+                                let _ = http::write_response(
+                                    stream,
+                                    500,
+                                    "text/plain",
+                                    b"cache error\n",
+                                );
+                                return Outcome::served(500, 0, true);
+                            }
+                        };
+                        // Hold the lease through streaming + commit; waiters wake
+                        // only once the guard drops after the commit below.
+                        lease_guard = Some(guard);
+                        break (resp.body, len, true, Some(writer));
                     }
-                };
-                (resp.body, len, true, Some(writer))
-            }
-            Ok(resp) => return forward_status(stream, resp),
-            Err(err) => {
-                eprintln!(
-                    "testproxy: upstream fetch failed for {}: {err}",
-                    request.path()
-                );
-                let _ = http::write_response(stream, 502, "text/plain", b"upstream error\n");
-                return Outcome::served(502, 0, true);
+                    // A non-200 or a fetch error is NOT cached: drop the lease
+                    // (waking waiters to retry) and report the failure to this
+                    // client. Waiters thus observe the same failure, never a
+                    // false success.
+                    Ok(resp) => {
+                        drop(guard);
+                        return forward_status(stream, resp);
+                    }
+                    Err(err) => {
+                        drop(guard);
+                        eprintln!(
+                            "testproxy: upstream fetch failed for {}: {err}",
+                            request.path()
+                        );
+                        let _ =
+                            http::write_response(stream, 502, "text/plain", b"upstream error\n");
+                        return Outcome::served(502, 0, true);
+                    }
+                }
             }
         }
     };
@@ -448,6 +593,12 @@ fn serve_nar(
             );
         }
     }
+
+    // Release the single-flight lease now the entry is committed (or abandoned),
+    // waking same-path waiters onto the finished result. Dropping it here rather
+    // than at function exit means waiters do not also wait out this leader's
+    // (possibly throttled) egress to its own client.
+    drop(lease_guard.take());
 
     let fault = if truncated {
         // A deliberately short body: close hard so the client sees a truncated
