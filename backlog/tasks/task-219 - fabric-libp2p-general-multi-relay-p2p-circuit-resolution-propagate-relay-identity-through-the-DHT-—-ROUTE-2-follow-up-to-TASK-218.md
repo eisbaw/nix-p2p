@@ -3,11 +3,11 @@ id: TASK-219
 title: >-
   fabric-libp2p: general multi-relay /p2p-circuit resolution (propagate relay
   identity through the DHT) — ROUTE 2 follow-up to TASK-218
-status: In Progress
+status: Done
 assignee:
   - '@claude'
 created_date: '2026-08-15 15:35'
-updated_date: '2026-08-18 00:27'
+updated_date: '2026-08-18 06:34'
 labels:
   - libp2p
   - fabric
@@ -27,12 +27,12 @@ TASK-218 landed ROUTE 1: a discovery-only consumer RESOLVES a NAT'd provider's /
 
 ## Acceptance Criteria
 <!-- AC:BEGIN -->
-- [ ] #1 In a >=2-relay topology, consumer C bootstraps only R1 while provider P has a live reservation only on R2; C discovers P's signed Libp2p offer, resolves R2 through kad, and fetches the exact NAR through R2 with no provider or R2 address injected into C
-- [ ] #2 Relay identity reaches C only as a bounded, canonical, signature-bound TransportOffer::Libp2p relay hint from the exact-key DHT record; relay addresses are never on wire and are resolved through raw kad peer routing; check-discovery-no-shortcut and kad-exclusive discovery remain biting
-- [ ] #3 Production writers derive hints only from currently live /p2p-circuit listen addresses after reservation acceptance, never from configured/attempted/bootstrap relays; configured circuit listeners are applied before announce and a missing requested reservation blocks first announce within a bounded integer deadline
-- [ ] #4 Libp2pTransport consumes record hints through the existing offer argument and an internal locator path without widening NarTransfer, NodeLocator, ProviderRecord, or daemon-core; a directly reachable provider causes no relay query, while unresolved hints are skipped and normal upstream fallback remains intact
-- [ ] #5 Bites remove/replace R2 with R1, stop R2 on the same warm consumer and attribute failure to NotOpened/unreachable, and exercise two hints with one dead/one live; each mutation fails while discovery remains healthy
-- [ ] #6 At most two relay identities/lookups and bounded circuit candidates are enforced; duplicate/unsorted/invalid/self relay hints fail closed; no provider-keyed relay map/cache, opaque extension, content identity, or dial address is introduced
+- [x] #1 In a >=2-relay topology, consumer C bootstraps only R1 while provider P has a live reservation only on R2; C discovers P's signed Libp2p offer, resolves R2 through kad, and fetches the exact NAR through R2 with no provider or R2 address injected into C
+- [x] #2 Relay identity reaches C only as a bounded, canonical, signature-bound TransportOffer::Libp2p relay hint from the exact-key DHT record; relay addresses are never on wire and are resolved through raw kad peer routing; check-discovery-no-shortcut and kad-exclusive discovery remain biting
+- [x] #3 Production writers derive hints only from currently live /p2p-circuit listen addresses after reservation acceptance, never from configured/attempted/bootstrap relays; configured circuit listeners are applied before announce and a missing requested reservation blocks first announce within a bounded integer deadline
+- [x] #4 Libp2pTransport consumes record hints through the existing offer argument and an internal locator path without widening NarTransfer, NodeLocator, ProviderRecord, or daemon-core; a directly reachable provider causes no relay query, while unresolved hints are skipped and normal upstream fallback remains intact
+- [x] #5 Bites remove/replace R2 with R1, stop R2 on the same warm consumer and attribute failure to NotOpened/unreachable, and exercise two hints with one dead/one live; each mutation fails while discovery remains healthy
+- [x] #6 At most two relay identities/lookups and bounded circuit candidates are enforced; duplicate/unsorted/invalid/self relay hints fail closed; no provider-keyed relay map/cache, opaque extension, content identity, or dial address is introduced
 <!-- AC:END -->
 
 ## Implementation Notes
@@ -54,3 +54,9 @@ Use the TASK-156 TransportOffer::Libp2p { node, relay_hints } tag-2 shape. Hints
 
 Provider truth comes only from live accepted /p2p-circuit listen addresses immediately before signing. Requested circuit listeners are installed before first announce, and a missing requested reservation blocks announce within a bounded integer deadline. A changed relay set produces a strictly newer Provide, never a content withdrawal. Consumer resolution first tries the provider directly, then transiently resolves signed hints and composes bounded circuit candidates, then retains TASK-218 known_relays only as a legacy fallback. Dynamic event-driven reannounce after later reservation churn is outside the minimum task scope; stale signed hints remain bounded retries until record TTL and should receive a follow-up if not implemented.
 <!-- SECTION:NOTES:END -->
+
+## Final Summary
+
+<!-- SECTION:FINAL_SUMMARY:BEGIN -->
+Commit 1842d1a implements bounded signature-bound relay NodeId hints, raw-kad relay resolution without address injection/cache, exact live accepted reservation truth before announce, exact ConnectionId routing, direct-first bounded circuit fallback, and multi-relay dead/live/severing/conflict bites. Vendored libp2p-stream is pinned at 0.4.0-alpha for exact open_stream_on_connection. Mandatory QA and architecture reviews passed; just e2e passed all 9 scenarios and 107 checks on the exact staged tree. Dynamic reannounce after later reservation-set churn remains intentionally out of scope and is tracked separately.
+<!-- SECTION:FINAL_SUMMARY:END -->

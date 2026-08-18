@@ -6,14 +6,16 @@ title: >-
 status: To Do
 assignee: []
 created_date: '2026-08-08 20:28'
-updated_date: '2026-08-14 21:48'
+updated_date: '2026-08-18 06:50'
 labels:
   - irreversible
-  - deferred-pending-202
+  - measurement
+  - pilot-critical
+  - counting-rule
 dependencies:
   - TASK-9
   - TASK-62
-priority: low
+priority: high
 ---
 
 ## Description
@@ -27,6 +29,7 @@ qa+arch: net-upstream-egress-v2 is UNDEFINED for the hedge regime (marks the hed
 - [ ] #1 A run containing a hedge (winner + cancelled loser) is VALID; winner bytes -> payload egress, loser bytes -> hedge_waste, discriminated by request provenance in the testproxy log (bite: a truncated PRIMARY still INVALID; a hedge loser is NOT)
 - [ ] #2 v3 is a version bump with rationale; existing v2 numbers remain comparable for the no-hedge regime (documented)
 - [ ] #3 testproxy request log carries provenance (which fetch a byte belongs to) so hedge_waste is attributable, not guessed
+- [ ] #4 The frozen schema uses exact unit-suffixed fields including upstream_cache_payload_bytes_compressed_wire, hedge_waste_upstream_bytes_compressed_wire, hedge_waste_peer_bytes_compressed_wire, peer_socket_total_bytes_compressed_wire and payload_bytes_uncompressed_nar; provider/requester socket witnesses and requester source attribution are independent, never derived from raw-fixture equality.
 <!-- AC:END -->
 
 ## Implementation Notes
@@ -72,4 +75,6 @@ payload (holder 248 MiB, fetcher 141 MiB, for a 110 MiB NAR - the blob store is
 `MemStore`). A hedge therefore costs loser BYTES *and* concurrent MEMORY.
 
 Deprioritized to Low in the Wave-2c cleanup (2026-08-14): libp2p-PRIMARY trunk proven (libp2p-kad discovery + store-supply + streamed NAR). Per PRD §634-691 (normative owner-direction authority) content discovery is libp2p-kad; iroh is an OPTIONAL transport only. This task belongs to a superseded-discovery / premature-tournament / far-future-BitTorrent / optional-comparator track. Fate confirmed by TASK-202 (owner-gated §693-743 reconcile). Reversible — not deleted; revisit after 202.
+
+2026-08-18 superseding priority ruling: TASK-237 and the field pilot require hedge-aware net egress, so this is pilot-critical after TASK-62, not deferred optional comparator work. Freeze v3 before any hedge/value measurement; v2 remains the explicit no-hedge rule.
 <!-- SECTION:NOTES:END -->

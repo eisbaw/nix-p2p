@@ -6,8 +6,11 @@ title: >-
 status: To Do
 assignee: []
 created_date: '2026-08-09 13:24'
-updated_date: '2026-08-10 22:26'
-labels: []
+updated_date: '2026-08-18 06:51'
+labels:
+  - streaming
+  - memory
+  - trust-boundary
 dependencies:
   - TASK-65
 priority: high
@@ -37,6 +40,9 @@ WHAT IT COSTS (do not merge without these): the INVISIBLE FALLBACK is lost. Toda
 - [ ] #3 FAILURE SEMANTICS at the new boundary: after a mid-body peer abort or corruption (kill a peer at ~50% of a 110 MiB NAR), the BUILD STILL SUCCEEDS via fallback and the store path is absent-or-correct, never wrong. The daemon can no longer prevent partial delivery, so the guarantee moves to gate-2 plus Nix's retry - extend TASK-7's killed-mid-NAR suite and prove by mutation
 - [ ] #4 FRAMING: Content-Length from the signed NarSize on the correlated path, chunked framing on the cold-start None path - both tested (transport_fetch.rs:481 currently sets it from bytes.len()). Peer stream torn down on HEAD and on client disconnect (server.rs:137 notes a HEAD NAR opens the stream)
 - [ ] #5 RSS decouples from NAR size, GATED on a fitted slope over >=5 sizes with CI (needs TASK-65's axis; a single-point check is unfalsifiable). Wall-clock is predicted UNCHANGED - record that prediction up front so 'no latency win' reads as confirmation, not failure
+- [ ] #6 The NarTransfer and PeerFabricNarSource contract is streaming end to end: no Result<Vec<u8>> or equivalent whole-object collect remains at the transport/HTTP boundary, and both iroh and libp2p adapters deliver the first verified chunk before the final peer chunk arrives.
+- [ ] #7 Cancellation, client disconnect, HEAD, timeout, and backpressure tear down the peer stream within existing integer deadlines and release every in-flight byte/accounting permit; a bounded-channel implementation whose producer can still accumulate O(NarSize) fails.
+- [ ] #8 Before implementation measurement, a machine-readable manifest freezes integer/rational TTFB-to-total, slow-reader buffered-byte/inflight, cancellation deadline, RSS-slope CI, framing, and A/A/noise bounds plus the exact sample sizes. Missing or post-result thresholds invalidate the claim; floating-point display never becomes the decision authority.
 <!-- AC:END -->
 
 ## Implementation Notes
@@ -181,4 +187,6 @@ in the FETCHER, but it shares this surface and there are three things you need.
    `Blake3Digest::stream_raw_nar` are already there if you need a bounded-memory
    pass over a NAR. The recipe stays in content_id.rs - there is a unit test that
    the streaming and one-shot constructors agree across the chunk boundary.
+
+2026-08-18 dependency audit: TASK-247 cannot honestly measure latency hiding while PeerFabricNarSource constructs the HTTP body only after NarTransfer::fetch has collected the entire NAR. TASK-62 is therefore a correctness/measurement prerequisite for TASK-247, even though its expected total-throughput win remains small.
 <!-- SECTION:NOTES:END -->

@@ -6,7 +6,7 @@ title: >-
 status: To Do
 assignee: []
 created_date: '2026-08-10 22:25'
-updated_date: '2026-08-14 21:48'
+updated_date: '2026-08-18 06:55'
 labels:
   - replan
   - production
@@ -17,6 +17,7 @@ dependencies:
   - TASK-45
   - TASK-120
   - TASK-123
+  - TASK-237
 priority: low
 ---
 
@@ -43,4 +44,6 @@ Terminal re-plan task, not feature code. Re-invoke phase2-backlog-snowball with 
 Terminal wave-2c task. It consumes evidence; it must not merely note that evidence exists.
 
 Deprioritized to Low in the Wave-2c cleanup (2026-08-14): libp2p-PRIMARY trunk proven (libp2p-kad discovery + store-supply + streamed NAR). Per PRD §634-691 (normative owner-direction authority) content discovery is libp2p-kad; iroh is an OPTIONAL transport only. This task belongs to a superseded-discovery / premature-tournament / far-future-BitTorrent / optional-comparator track. Fate confirmed by TASK-202 (owner-gated §693-743 reconcile). Reversible — not deleted; revisit after 202.
+
+TASK-237 is a required development-only planning input for the field-pilot matrix. TASK-124 consumes its hashed effect/noise/sample-size inputs after the holdout verdict; it never lets TASK-237 train, reinterpret, or replace TASK-123.
 <!-- SECTION:NOTES:END -->
