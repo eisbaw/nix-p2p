@@ -149,6 +149,12 @@ pub struct Libp2pSourceConfig {
     /// (issues queries, answers none). An upstream-only node runs no participating swarm at all
     /// and never builds this config. Default `true` (server); a consumer sets `false`.
     pub kad_server: bool,
+    /// Whether this node runs LAN mDNS peer-ADDRESS discovery (TASK-257). Threads straight to
+    /// [`NodeConfig::with_mdns`]. Set from the default-OFF `--libp2p-mdns` flag by any
+    /// swarm-participating profile; upstream-only never builds this config (it refuses the flag).
+    /// mDNS supplies peer ADDRESSES into the kad bootstrap path only - never content discovery -
+    /// and is TASK-120 axis-1 (local discovery) only. Default `false` (emits zero multicast).
+    pub mdns_enabled: bool,
 }
 
 /// Proof that a provider was built through the shared listener configuration path. Fields are
@@ -2193,6 +2199,10 @@ async fn start_and_join_libp2p(
         .with_relay_server(cfg.relay_server_enabled)
         // TASK-120 fix A: kad server/client mode from the participation profile.
         .with_kad_server(cfg.kad_server)
+        // TASK-257: LAN mDNS peer-ADDRESS discovery (default OFF). When on, mDNS-discovered
+        // neighbours feed the same kad bootstrap/address path, so a node with no configured
+        // bootstrap converges from a same-scope LAN peer. Never a content-discovery route.
+        .with_mdns(cfg.mdns_enabled)
         // TASK-231 (AC#2): the announcer's per-fabric publication-eligibility authority. A pure
         // CONSUMER passes RefusePublication (it never announces); a PROVIDER injects the
         // allowlist-backed (public) or AdmitAll (isolated-LAN) decision from the composition root.
@@ -2383,6 +2393,7 @@ mod provider_relay_readiness_tests {
             state_dir: None,
             relay_server_enabled: true,
             kad_server: true,
+            mdns_enabled: false,
         };
 
         let bound = Duration::from_millis(250);

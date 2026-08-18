@@ -18,8 +18,8 @@ use libp2p::swarm::behaviour::toggle::Toggle;
 use libp2p::swarm::dial_opts::{DialOpts, PeerCondition};
 use libp2p::swarm::{ConnectionId, SwarmEvent};
 use libp2p::{
-    Multiaddr, PeerId, StreamProtocol, Swarm, autonat, dcutr, identify, kad, noise, relay, tcp,
-    yamux,
+    Multiaddr, PeerId, StreamProtocol, Swarm, autonat, dcutr, identify, kad, mdns, noise, relay,
+    tcp, yamux,
 };
 use libp2p_stream::{Control, IncomingStreams};
 use tokio::sync::{mpsc, oneshot};
@@ -310,6 +310,21 @@ pub struct Behaviour {
     pub relay: Toggle<relay::Behaviour>,
     pub relay_client: relay::client::Behaviour,
     pub dcutr: dcutr::Behaviour,
+    /// LAN peer-ADDRESS discovery over mDNS link-local multicast (TASK-257), wrapped in a
+    /// [`Toggle`] so it is DEFAULT OFF: disabled = `Toggle::from(None)`, the behaviour is
+    /// ABSENT from the swarm, so the node opens no multicast socket and emits ZERO mDNS
+    /// packets (the axis-1-local-discovery opt-in, TASK-120: enabling it implies NOTHING
+    /// about serving/announcing/public participation). Enabled ([`NodeConfig::with_mdns`]),
+    /// its `Discovered` events feed the SAME `kad.add_address` bootstrap/address path
+    /// `identify` already feeds (see `on_event`) - a peer ADDRESS hint, never a
+    /// content-discovery route. It is NOT a second "who holds hash X?" mechanism: content
+    /// discovery stays kad-EXCLUSIVE (`check-discovery-no-shortcut.py` bites if an mDNS
+    /// event is ever wired to `find_providers`/`get_providers`). Scope isolation is
+    /// orthogonal and already enforced by the scoped `/nix-p2p/<scope>/kad` +
+    /// `/nix-p2p/<scope>/id` protocol names: a cross-scope mDNS peer gets `add_address`'d
+    /// but can never complete the scoped kad/identify handshake, so it never joins this
+    /// node's DHT (proven by the e2e scope-mismatch negative control).
+    pub mdns: Toggle<mdns::tokio::Behaviour>,
 }
 
 /// The live transport path to a peer, derived from the swarm's own `ConnectionEstablished` /
@@ -2383,6 +2398,41 @@ impl Worker {
                     "fabric-libp2p: dcutr hole-punch FAILED - staying on the relay circuit (fallback)"
                 ),
             },
+            // LAN peer-ADDRESS discovery over mDNS (TASK-257). mDNS carries a peer's
+            // (PeerId, Multiaddr) pairs; we feed them into the SAME kad routing/bootstrap
+            // ADDRESS path `identify` uses above (`kad.add_address`) so a node with NO
+            // --libp2p-bootstrap can still converge its DHT from a LAN neighbour. This is
+            // the ADDRESS path ONLY: mDNS is NEVER consulted for "who holds hash X?" - that
+            // stays kad-EXCLUSIVE (find_providers), and `check-discovery-no-shortcut.py`
+            // bites if an mDNS event is ever wired to get_providers/find_providers. Scope
+            // isolation is NOT re-checked here (mDNS cannot see a peer's kad protocol name):
+            // a cross-scope neighbour is `add_address`'d but can never complete the scoped
+            // `/nix-p2p/<scope>/kad` handshake, so it never joins - the scoped protocol name
+            // is the isolation, proven by the e2e scope-mismatch negative control.
+            SwarmEvent::Behaviour(BehaviourEvent::Mdns(mdns::Event::Discovered(peers))) => {
+                let kad = &mut self.swarm.behaviour_mut().kad;
+                for (peer_id, addr) in peers {
+                    tracing::debug!(
+                        %peer_id, %addr,
+                        "fabric-libp2p: mDNS discovered a LAN peer address; feeding kad routing \
+                         (address hint only, never content discovery)"
+                    );
+                    kad.add_address(&peer_id, addr);
+                }
+            }
+            SwarmEvent::Behaviour(BehaviourEvent::Mdns(mdns::Event::Expired(peers))) => {
+                // A LAN peer's mDNS record aged out. Drop the address hints from kad so a
+                // stale multiaddr is not dialed forever; kad re-learns a live address via
+                // identify/mDNS if the peer is still around.
+                let kad = &mut self.swarm.behaviour_mut().kad;
+                for (peer_id, addr) in peers {
+                    tracing::debug!(
+                        %peer_id, %addr,
+                        "fabric-libp2p: mDNS peer address expired; removing the stale kad hint"
+                    );
+                    kad.remove_address(&peer_id, &addr);
+                }
+            }
             // The stream behaviour emits no events we act on (its `ToSwarm` is `()`); the
             // NAR byte transfer is driven off this loop through the Control (TASK-157).
             _ => {}
@@ -2706,6 +2756,14 @@ pub const DEFAULT_RELAY_SERVER_ENABLED: bool = true;
 /// [`NodeConfig::with_kad_server`].
 pub const DEFAULT_KAD_SERVER: bool = true;
 
+/// Whether a node runs LAN mDNS peer-ADDRESS discovery by default (TASK-257). `false`:
+/// the mDNS behaviour is ABSENT (a disabled [`Toggle`]), so the node opens no multicast
+/// socket and emits ZERO mDNS packets - the fail-safe, off-by-default posture the
+/// operator opts into with `--libp2p-mdns` / [`NodeConfig::with_mdns`]. This is TASK-120
+/// axis-1 (local discovery) only: enabling it NEVER implies serving, announcing, or public
+/// participation.
+pub const DEFAULT_MDNS_ENABLED: bool = false;
+
 // ---------------------------------------------------------------------------------------
 // kad MemoryStore STORAGE bounds (TASK-154 AC#1).
 //
@@ -2875,6 +2933,18 @@ pub struct NodeConfig {
     /// upstream-only node runs no participating swarm at all. This is what makes a node's
     /// reported `public_dht_participation` match what it actually does on the wire.
     pub kad_server: bool,
+    /// Whether this node runs LAN mDNS peer-ADDRESS discovery (TASK-257). Defaults to
+    /// [`DEFAULT_MDNS_ENABLED`] (`false`): the mDNS behaviour is a disabled [`Toggle`], ABSENT
+    /// from the swarm, so the node opens no multicast socket and emits ZERO mDNS packets. Set
+    /// `true` ([`NodeConfig::with_mdns`]) to install the behaviour: its `Discovered` events feed
+    /// discovered LAN peers' addresses into the SAME `kad.add_address` bootstrap/address path
+    /// `identify` uses, so a node with NO configured bootstrap can converge its DHT from a
+    /// same-scope LAN neighbour. It is a peer-ADDRESS bootstrap only - NEVER a content-discovery
+    /// mechanism (content discovery stays kad-EXCLUSIVE) - and it is TASK-120 axis-1 (local
+    /// discovery) only: enabling it implies NOTHING about serving/announcing/public participation.
+    /// Scope isolation is orthogonal and already enforced by the scoped kad/identify protocol
+    /// names, so a cross-scope mDNS neighbour never joins this node's DHT.
+    pub mdns_enabled: bool,
     /// The statically-configured peer address book consulted LOCALLY under
     /// [`ResolutionPolicy::ExplicitPeersOnly`](peer_fabric::ResolutionPolicy::ExplicitPeersOnly)
     /// (TASK-168 AC#2). Maps a provider's ed25519 [`NodeId`] to the [`Multiaddr`]es it is
@@ -2919,6 +2989,7 @@ impl NodeConfig {
             kad_query_timeout: DEFAULT_KAD_QUERY_TIMEOUT,
             relay_server_enabled: DEFAULT_RELAY_SERVER_ENABLED,
             kad_server: DEFAULT_KAD_SERVER,
+            mdns_enabled: DEFAULT_MDNS_ENABLED,
             peer_address_book: BTreeMap::new(),
             known_relays: Vec::new(),
             // Fail-closed default (TASK-231, AC#2): a node that did not explicitly choose a
@@ -2956,6 +3027,16 @@ impl NodeConfig {
     /// [`NodeConfig::kad_server`].
     pub fn with_kad_server(mut self, enabled: bool) -> Self {
         self.kad_server = enabled;
+        self
+    }
+
+    /// Choose whether this node runs LAN mDNS peer-ADDRESS discovery (TASK-257, builder style).
+    /// Default is `false` ([`DEFAULT_MDNS_ENABLED`]): the behaviour is absent and the node emits
+    /// zero mDNS multicast. Pass `true` to install it so same-scope LAN neighbours are discovered
+    /// with NO configured bootstrap; discovered addresses feed the SAME kad bootstrap/address path
+    /// and NEVER content discovery. See [`NodeConfig::mdns_enabled`].
+    pub fn with_mdns(mut self, enabled: bool) -> Self {
+        self.mdns_enabled = enabled;
         self
     }
 
@@ -3200,6 +3281,10 @@ impl Node {
         // The relay-server opt-out (TASK-208). `bool` is `Copy`; capture it before the
         // behaviour closure so it can decide whether to install the relay SERVER behaviour.
         let relay_server_enabled = config.relay_server_enabled;
+        // The LAN mDNS peer-ADDRESS discovery opt-in (TASK-257). `bool` is `Copy`; capture it
+        // before the behaviour closure so it can decide whether to install the mDNS behaviour
+        // (a disabled `Toggle` when off = zero multicast, the default).
+        let mdns_enabled = config.mdns_enabled;
 
         let kad_protocol = StreamProtocol::try_from_owned(format!("/nix-p2p/{scope}/kad/1.0.0"))
             .map_err(|e| NodeError::Build(format!("invalid kad protocol name: {e:?}")))?;
@@ -3261,6 +3346,23 @@ impl Node {
                         .then(|| relay::Behaviour::new(peer_id, relay_server_config()))
                         .into();
                     let dcutr = dcutr::Behaviour::new(peer_id);
+                    // LAN peer-ADDRESS discovery (TASK-257): install the mDNS behaviour ONLY
+                    // when opted in. Off = `Toggle::from(None)`: the behaviour is absent, so no
+                    // multicast socket is opened and ZERO mDNS packets are emitted (the default,
+                    // and what keeps an upstream-only / unflagged node link-local-silent). On =
+                    // the tokio-runtime mDNS behaviour, whose `Discovered` events feed the kad
+                    // address/bootstrap path (never content discovery). Construction opens the
+                    // multicast socket and can fail (returns `io::Result`); that error is
+                    // propagated as a build error rather than silently swallowed (fail verbosely).
+                    let mdns: Toggle<mdns::tokio::Behaviour> = if mdns_enabled {
+                        Some(mdns::tokio::Behaviour::new(
+                            mdns::Config::default(),
+                            peer_id,
+                        )?)
+                    } else {
+                        None
+                    }
+                    .into();
                     Ok(Behaviour {
                         kad,
                         identify,
@@ -3269,6 +3371,7 @@ impl Node {
                         relay,
                         relay_client,
                         dcutr,
+                        mdns,
                     })
                 },
             )

@@ -404,6 +404,12 @@ struct Config {
     /// The kad/identify protocol network scope (`/nix-p2p/<scope>/kad/1.0.0`).
     /// Defaults to `v1` (matching `NodeConfig::new`).
     libp2p_scope: Option<String>,
+    /// TASK-257: `--libp2p-mdns` opts into LAN mDNS peer-ADDRESS discovery (DEFAULT OFF). When set,
+    /// a same-scope LAN neighbour is discovered with NO `--libp2p-bootstrap`; discovered addresses
+    /// feed the SAME kad bootstrap path and NEVER content discovery. It is TASK-120 axis-1 (local
+    /// discovery) only. As an entry path to the DHT it satisfies the bootstrap requirement for a
+    /// consumer, exactly like an explicit bootstrap peer.
+    libp2p_mdns: bool,
     /// Optional 32-byte ed25519 identity seed (64 hex chars). When omitted the
     /// composition root generates a fresh one from `/dev/urandom`.
     libp2p_identity_seed: Option<[u8; 32]>,
@@ -590,11 +596,20 @@ fn derive_contract(config: &Config) -> Result<OperatorContract, String> {
     // libp2p flags runs no libp2p swarm (iroh is a separate transport with no kad DHT) -> None.
     let libp2p_swarm_active = config.libp2p_provider
         || !config.libp2p_bootstrap.is_empty()
-        || config.libp2p_listen.is_some();
+        || config.libp2p_listen.is_some()
+        // TASK-257: --libp2p-mdns alone engages the libp2p swarm (zero-config LAN discovery).
+        || config.libp2p_mdns;
     let dht_role = if libp2p_swarm_active {
         DhtRole::Server
     } else {
         DhtRole::None
+    };
+    // TASK-257: --libp2p-mdns SELECTS the shipped LAN mDNS mechanism (fail-closed validate admits
+    // it; it is Enabled) and drives the per-node active+exposure report via `lan_mdns_enabled`.
+    let selected_mechanisms = if config.libp2p_mdns {
+        vec![Mechanism::LanMdns]
+    } else {
+        Vec::new()
     };
     let contract = OperatorContract {
         profile,
@@ -602,13 +617,15 @@ fn derive_contract(config: &Config) -> Result<OperatorContract, String> {
         privacy: PrivacyPolicy {
             diagnostics_opt_in: config.diagnostics,
         },
-        selected_mechanisms: Vec::new(),
+        selected_mechanisms,
         active_reference_mechanisms: active_reference,
         dht_role,
         // TASK-241: the composite exposes no `--libp2p-external-address` and no router mode, so it
         // advertises no libp2p public self-address here (iroh public reachability is governed by the
         // #3a endpoint-scope gate, not this field). Inert for every profile the composite derives.
         advertises_public_reachability: false,
+        // TASK-257: LAN mDNS active on this node iff the default-OFF flag was passed.
+        lan_mdns_enabled: config.libp2p_mdns,
     };
     contract.validate().map_err(|e| e.to_string())?;
 
@@ -683,6 +700,7 @@ impl Default for Config {
             libp2p_provider_addrs: Vec::new(),
             libp2p_listen: None,
             libp2p_scope: None,
+            libp2p_mdns: false,
             libp2p_identity_seed: None,
             libp2p_provider: false,
             libp2p_seed_nar: Vec::new(),
@@ -966,6 +984,7 @@ impl Config {
                     );
                 }
                 "--libp2p-scope" => config.libp2p_scope = Some(value()?),
+                "--libp2p-mdns" => config.libp2p_mdns = true,
                 "--libp2p-state-dir" => config.libp2p_state_dir = Some(value()?.into()),
                 "--libp2p-identity-seed" => {
                     config.libp2p_identity_seed = Some(parse_libp2p_seed(&value()?)?)
@@ -1149,9 +1168,12 @@ impl Config {
         }
 
         // equally needs one: its announce only propagates once it has joined the DHT.
-        if config.libp2p_requested() && config.libp2p_bootstrap.is_empty() {
+        if config.libp2p_requested() && config.libp2p_bootstrap.is_empty() && !config.libp2p_mdns {
+            // TASK-257: --libp2p-mdns is an alternative ENTRY PATH to the DHT (zero-config LAN
+            // discovery), so it satisfies the entry-peer requirement exactly as an explicit
+            // --libp2p-bootstrap does. Without EITHER, kad cannot discover anyone.
             return Err(
-                "libp2p is configured but --libp2p-bootstrap is missing; kad cannot discover a provider without an entry peer".into(),
+                "libp2p is configured but no DHT entry path is given; add --libp2p-bootstrap <PeerId>@<multiaddr>, or --libp2p-mdns for zero-config LAN discovery".into(),
             );
         }
         // Resolve the libp2p identity seed ONCE, here, so `libp2p_source_config()` is a pure,
@@ -1180,6 +1202,7 @@ impl Config {
             || !self.libp2p_provider_addrs.is_empty()
             || self.libp2p_listen.is_some()
             || self.libp2p_scope.is_some()
+            || self.libp2p_mdns
             || self.libp2p_identity_seed.is_some()
             || self.libp2p_state_dir.is_some()
             || self.libp2p_provider
@@ -1223,6 +1246,8 @@ impl Config {
             // pre-TASK-120 behaviour) so this defer changes nothing; the profile-derived
             // kad-client/relay-off wiring is the primary binary's job and a filed 202 follow-up.
             kad_server: true,
+            // TASK-257: LAN mDNS peer-ADDRESS discovery, straight from the default-OFF flag.
+            mdns_enabled: self.libp2p_mdns,
         })
     }
 

@@ -160,6 +160,10 @@ LIBP2P_CONVERGE_S = 12.0
 # podman host routing -> BOOT/P on net-p, SNAT'd), so give the DHT a slightly larger
 # bounded settle than the shared-pod path. Still bounded (not a retry loop).
 LIBP2P_NETNS_CONVERGE_S = 16.0
+# TASK-257: mDNS query cadence + kad convergence on a fresh two-node LAN. mDNS emits its
+# first query at startup, but discovery + routing-table population + a put/get round can take
+# a little longer than the routed-bootstrap S7, so give the zero-bootstrap DHT a bit more.
+LIBP2P_MDNS_CONVERGE_S = 22.0
 
 
 def die(message: str, code: int = 2) -> None:
@@ -2373,6 +2377,300 @@ class Libp2pNetnsTopology:
             run([self._pm, "rm", "-f", "--ignore", self._c(role)], check=False)
         for net in (self.NET_C, self.NET_P):
             run([self._pm, "network", "rm", "-f", net], check=False)
+
+
+class Libp2pMdnsTopology:
+    """TASK-257 mDNS bootstrap topology: the ZERO-BOOTSTRAP LAN proof.
+
+    Every daemon runs as its OWN `--network` container (own netns, own 127.0.0.1) but ALL
+    share ONE podman bridge network (a single multicast-capable L2 segment), because mDNS is
+    link-local MULTICAST and would NOT cross the isolated per-role netns the routed S7 uses.
+    NO node is EVER given `--libp2p-bootstrap`: a same-scope neighbour is discovered purely
+    over mDNS, its ADDRESS is fed into kad's routing/bootstrap path (`add_address`), and the
+    consumer then discovers WHO holds the content via kad get_providers and fetches it. The
+    ONLY way any node learns a peer's address is mDNS - proven by the no-injection argv
+    oracle (no bootstrap, no provider-addr) AND by the mutation the caller runs (different
+    `--libp2p-scope` => the scoped kad protocol refuses the join => upstream fallback).
+
+    Consumers are launched with `--libp2p-leech` (honest consume-only) but the COMPOSITE
+    `/bin/daemon` runs kad in SERVER mode (flag-authoritative, TASK-120 fix-C deferred), so a
+    consumer STORES the provider's put-record and satisfies the lone provider's put-quorum -
+    which is why a two-node P+C topology can bootstrap with no dedicated router.
+    """
+
+    SUBNET = "10.211.33.0/24"
+    IP_ORIGIN = "10.211.33.13"
+    IP_PROXY = "10.211.33.12"
+    IP_PROVIDER = "10.211.33.11"
+    # Consumer-like roles get their own IPs; the provider always discovers them via mDNS.
+    ROLE_IPS = {"lp-consumer": "10.211.33.10", "lp-helper": "10.211.33.14"}
+
+    def __init__(
+        self,
+        ctx: Ctx,
+        name: str,
+        served_cache: Path,
+        seed_dir: Path,
+        provider_seeds: tuple[P2pSeed, ...],
+        expect,
+        *,
+        provider_scope: str,
+        # role -> scope for each consumer-like daemon (a leech that fetches). Same scope as
+        # the provider => it can resolve; a different scope => scope isolation must block it.
+        consumers: tuple[tuple[str, str], ...],
+        libp2p_trusted_key: str,
+    ):
+        self.ctx = ctx
+        self._pm = ctx.podman
+        self.prefix = f"{POD_PREFIX}-{name}"
+        self.served_cache = served_cache
+        self.seed_dir = seed_dir
+        self.provider_seeds = tuple(provider_seeds)
+        self._expect = expect
+        self.provider_scope = provider_scope
+        self.consumers = tuple(consumers)
+        self.libp2p_trusted_key = libp2p_trusted_key
+        self.provider_identity: tuple[str, str] | None = None
+        self.NET = f"{self.prefix}-net"
+
+    def __enter__(self) -> "Libp2pMdnsTopology":
+        leaked = secret_key_problems(self.served_cache)
+        self._expect(
+            not leaked,
+            "AC#5 (mdns): no *.sec under the served cache tree (host-side walk)",
+            f"leaked: {leaked}",
+        )
+        if leaked:
+            raise RuntimeError(f"AC#5 abort (mdns): secret key(s) {leaked} present")
+        self._create()
+        return self
+
+    def __exit__(self, *_exc) -> None:
+        self.stop()
+
+    def _c(self, role: str) -> str:
+        return f"{self.prefix}-{role}"
+
+    def roles(self) -> list[str]:
+        return ["origin", "proxy", "lp-provider", *[r for r, _ in self.consumers]]
+
+    def _create(self) -> None:
+        pm = self._pm
+        for role in self.roles():
+            run([pm, "rm", "-f", "--ignore", self._c(role)], check=False)
+        run([pm, "network", "rm", "-f", self.NET], check=False)
+        # A dedicated bridge = ONE multicast-capable L2 segment all nodes share.
+        run(
+            [pm, "network", "create", "--label", PROJECT_LABEL, "--subnet", self.SUBNET, self.NET]
+        )
+
+        proxy_url = f"http://{self.IP_PROXY}:{PROXY_PORT}"
+        # origin: static file server over the served cache.
+        run(
+            [pm, "run", "-d", "--label", PROJECT_LABEL, "--name", self._c("origin"),
+             "--network", self.NET, "--ip", self.IP_ORIGIN,
+             "--volume", f"{self.served_cache}:/srv/cache:ro", self.ctx.image,
+             "python3", "-m", "http.server", str(ORIGIN_PORT), "--bind", "0.0.0.0",
+             "--directory", "/srv/cache"]
+        )
+        # testproxy: caching proxy fronting origin; its request log is the egress oracle.
+        run(
+            [pm, "run", "-d", "--label", PROJECT_LABEL, "--name", self._c("proxy"),
+             "--network", self.NET, "--ip", self.IP_PROXY, self.ctx.image,
+             "/bin/testproxy", "--listen", f"0.0.0.0:{PROXY_PORT}",
+             "--upstream", f"http://{self.IP_ORIGIN}:{ORIGIN_PORT}",
+             "--cache-dir", "/tmp/proxy-cache"]
+        )
+        self._await_http_ready("origin", self.IP_ORIGIN)
+        self._await_http_ready("proxy", self.IP_PROXY)
+
+        # CONSUMERS FIRST: they come up mDNS-live so that when the provider announces (a lone
+        # genesis provider needs a put-quorum peer), a same-scope consumer is already
+        # discoverable. NO --libp2p-bootstrap on ANY of them - mDNS is the only entry path.
+        for role, scope in self.consumers:
+            ip = self.ROLE_IPS[role]
+            run(
+                [pm, "run", "-d", "--label", PROJECT_LABEL, "--name", self._c(role),
+                 "--network", self.NET, "--ip", ip, self.ctx.image,
+                 "/bin/daemon", "--listen", f"0.0.0.0:{DAEMON_PORT}", "--upstream", proxy_url,
+                 "--libp2p-leech", "--libp2p-mdns",
+                 "--libp2p-listen", f"/ip4/{ip}/tcp/{LIBP2P_BASE_PORT}",
+                 "--libp2p-scope", scope]
+            )
+            self._await_http_ready(role, ip)
+
+        # PROVIDER LAST: same-scope, seeds the target, proves each seed public through the
+        # trusted-key allowlist door, announces over the mDNS-formed DHT. NO bootstrap. A DURABLE
+        # --libp2p-state-dir pins its identity across restarts, which is what makes the put-quorum
+        # RETRY below safe: the allowlist file's MAC is keyed by the identity seed, so a restart
+        # under a fresh identity would fail to reopen its own allowlist - the durable seed keeps the
+        # PeerId (and thus the MAC key) stable so a retried announce reopens the SAME allowlist.
+        allowlist_mount = libp2p_allowlist_volume(self.ctx.scratch, self.prefix)
+        state_host = self.ctx.scratch / f"{self.prefix}-provider-state"
+        state_host.mkdir(parents=True, exist_ok=True)
+        seed_args: list[str] = []
+        for s in self.provider_seeds:
+            seed_args += ["--libp2p-seed-nar", f"{s.nar_hash}=/srv/seed/{s.filename}"]
+        seed_args += ["--libp2p-trusted-public-key", self.libp2p_trusted_key,
+                      "--libp2p-public-allowlist-path", f"{LIBP2P_ALLOWLIST_MOUNT}/allowlist",
+                      "--libp2p-state-dir", "/srv/state"]
+        for s in self.provider_seeds:
+            sh = libp2p_store_hash(s.store_path)
+            seed_args += ["--libp2p-prove-public-narinfo",
+                          f"{sh}=/srv/seed/narinfos/{sh}.narinfo"]
+        provider_argv = [
+            "run", "-d", "--label", PROJECT_LABEL, "--name", self._c("lp-provider"),
+            "--network", self.NET, "--ip", self.IP_PROVIDER,
+            "--volume", f"{self.seed_dir}:/srv/seed:ro",
+            "--volume", f"{state_host}:/srv/state", *allowlist_mount, self.ctx.image,
+            "/bin/daemon", "--listen", f"0.0.0.0:{DAEMON_PORT}", "--upstream", proxy_url,
+            "--libp2p-provider", "--libp2p-mdns",
+            "--libp2p-listen", f"/ip4/{self.IP_PROVIDER}/tcp/{LIBP2P_BASE_PORT + 1}",
+            "--libp2p-scope", self.provider_scope, "--libp2p-print-peer-address", *seed_args,
+        ]
+        run([pm, *provider_argv])
+        # A lone genesis provider's startup put-quorum can lose a race with mDNS discovery settling
+        # (the daemon's initial announce is one-shot). If it exits before announcing, settle briefly
+        # so both nodes are steadily multicasting, then RESTART it under its DURABLE identity - the
+        # consumers are already up, so a retried announce discovers a quorum peer. Bounded, fail-loud.
+        # HONEST NOTE: this restart is a TEST-HARNESS scaffold for the lone-genesis race; a future
+        # production improvement is a bounded in-daemon announce retry for the zero-bootstrap case.
+        for attempt in range(6):
+            ident = self._try_await_provider_identity("lp-provider", len(self.provider_seeds))
+            if ident:
+                self.provider_identity = ident
+                return
+            state = run(
+                [pm, "inspect", "-f", "{{.State.Status}}", self._c("lp-provider")], check=False
+            ).stdout.strip()
+            print(f"mdns provider not yet announced (state={state!r}); settle+restart "
+                  f"{attempt + 1}/6", file=sys.stderr)
+            time.sleep(5.0)
+            run([pm, "restart", self._c("lp-provider")], check=False)
+        self._dump_logs()
+        die("mdns provider never announced its identity + seed(s) after retries")
+
+    def _await_http_ready(self, role: str, ip: str) -> None:
+        port = ORIGIN_PORT if role == "origin" else PROXY_PORT if role == "proxy" else DAEMON_PORT
+        url = f"http://{ip}:{port}/nix-cache-info"
+        deadline = time.time() + READY_TIMEOUT_S
+        while True:
+            res = run(
+                [self._pm, "run", "--rm", "--label", PROJECT_LABEL, "--network", self.NET,
+                 self.ctx.image, "python3", "-c",
+                 f"import urllib.request;print(urllib.request.urlopen('{url}',timeout=2).status)"],
+                check=False,
+            )
+            if (res.stdout or "").strip() == "200":
+                return
+            if time.time() > deadline:
+                self._dump_logs()
+                die(f"mdns {role} did not become HTTP-ready at {url}")
+            time.sleep(0.4)
+
+    def _try_await_provider_identity(self, role: str, n_seeds: int):
+        """Poll for LIBP2P-PROVIDER-ADDR + n_seeds seed announce lines (printed only AFTER a
+        successful announce). Returns (peer_id, listen) or None on timeout/provider-exit."""
+        deadline = time.time() + 30.0
+        addr_re = re.compile(r"LIBP2P-PROVIDER-ADDR peer_id=(\S+) listen=(\S+)")
+        seed_re = re.compile(r"LIBP2P-(?:SEED|PROVIDE-STORE) narhash=(\S+) ")
+        while time.time() < deadline:
+            log = self.logs(role)
+            addr = addr_re.search(log)
+            seeds = seed_re.findall(log)
+            if addr and len(seeds) >= n_seeds:
+                return addr.group(1), addr.group(2)
+            state = run(
+                [self._pm, "inspect", "-f", "{{.State.Status}}", self._c(role)], check=False
+            ).stdout.strip()
+            if state == "exited":
+                return None
+            time.sleep(0.3)
+        return None
+
+    def logs(self, role: str) -> str:
+        res = run([self._pm, "logs", self._c(role)], check=False)
+        return res.stdout + res.stderr
+
+    def _dump_logs(self) -> None:
+        for role in self.roles():
+            res = run([self._pm, "logs", self._c(role)], check=False)
+            if res.stdout or res.stderr:
+                print(f"--- logs {self._c(role)} ---", file=sys.stderr)
+                print(res.stdout, res.stderr, file=sys.stderr)
+
+    def consumer_argv(self, role: str = "lp-consumer") -> list[str]:
+        res = run(
+            [self._pm, "inspect", "-f", "{{json .Config.Cmd}}", self._c(role)], check=False
+        )
+        raw = (res.stdout or "").strip()
+        try:
+            argv = json.loads(raw)
+        except json.JSONDecodeError:
+            raise RuntimeError(f"consumer_argv: non-JSON {raw!r}") from None
+        return [str(a) for a in argv]
+
+    def provider_reachable_from(self, role: str) -> tuple[int | None, str]:
+        """From INSIDE `role`'s netns, GET the provider's /nix-cache-info at its routable IP -
+        proves the provider is ALIVE and the L2 path exists, so a fallback isolates SCOPE, not
+        liveness."""
+        py = (
+            "import sys,urllib.request\n"
+            f"try:\n    r=urllib.request.urlopen('http://{self.IP_PROVIDER}:{DAEMON_PORT}/nix-cache-info',timeout=3)\n"
+            "    sys.stdout.write(str(r.status))\n"
+            "except Exception as e:\n    sys.stdout.write('ERR '+type(e).__name__)\n"
+        )
+        res = run([self._pm, "exec", self._c(role), "python3", "-c", py], check=False)
+        out = (res.stdout or "").strip()
+        try:
+            return int(out), out
+        except ValueError:
+            return None, out
+
+    def proxy_reset(self) -> None:
+        status = self._post(self._c("proxy"), f"http://127.0.0.1:{PROXY_PORT}/__testproxy/reset")
+        if status != 200:
+            die(f"mdns proxy reset returned {status}")
+
+    def _post(self, container: str, url: str):
+        py = (
+            "import sys,urllib.request\n"
+            f"req=urllib.request.Request('{url}',method='POST',data=b'')\n"
+            "sys.stdout.write(str(urllib.request.urlopen(req,timeout=5).status))\n"
+        )
+        res = run([self._pm, "exec", container, "python3", "-c", py], check=False)
+        try:
+            return int((res.stdout or "").strip())
+        except ValueError:
+            return None
+
+    def proxy_stats(self) -> dict:
+        py = (
+            "import sys,urllib.request\n"
+            f"sys.stdout.write(urllib.request.urlopen('http://127.0.0.1:{PROXY_PORT}/__testproxy/stats',timeout=5).read().decode())\n"
+        )
+        res = run([self._pm, "exec", self._c("proxy"), "python3", "-c", py], check=False)
+        return json.loads(res.stdout)
+
+    def client_run(self, role: str, targets: list[str], keys: str) -> "ClientResult":
+        """Realise `targets` with a FRESH client substituting ONLY from `role`'s daemon (its
+        routable IP), the SAME `_CLIENT_SCRIPT`/`_parse_client` the pod path uses."""
+        ip = self.ROLE_IPS[role]
+        subs = f"http://{ip}:{DAEMON_PORT}?priority=10"
+        script = _CLIENT_SCRIPT.format(
+            subs=subs, keys=keys, targets=" ".join(targets), jobs=1, conns=1, start_at_ns=0
+        )
+        res = run(
+            [self._pm, "run", "--rm", "--label", PROJECT_LABEL, "--network", self.NET,
+             self.ctx.image, "bash", "-c", script],
+            check=False, timeout=300,
+        )
+        return _parse_client(res)
+
+    def stop(self) -> None:
+        for role in self.roles():
+            run([self._pm, "rm", "-f", "--ignore", self._c(role)], check=False)
+        run([self._pm, "network", "rm", "-f", self.NET], check=False)
 
 
 # Single-user client: realise into the container's own store, then report
@@ -6170,6 +6468,144 @@ def scenario_narinfo_default_cache_offload(ctx: Ctx, expect) -> None:
         )
 
 
+def scenario_libp2p_mdns_bootstrap(ctx: Ctx, expect) -> None:
+    """TASK-257: two daemons on ONE LAN segment, NEITHER given `--libp2p-bootstrap`, discover
+    each other purely via `--libp2p-mdns` and the consumer fetches a byte-identical NAR from the
+    provider with 0 upstream NAR egress. This is the zero-config LAN/org-pool proof: mDNS
+    supplies the peer ADDRESS (fed to kad's bootstrap path), kad supplies WHO-holds-content, and
+    NO address was injected (the consumer argv carries no bootstrap and no provider-addr).
+    """
+    fixtures = ctx.fixtures
+    seed_dir, prov_seeds, target_sp = _s7_seeds(ctx, "mdns", S7_TARGET)
+    with Libp2pMdnsTopology(
+        ctx, "mdns", fixtures.cache, seed_dir, prov_seeds, expect,
+        provider_scope=LIBP2P_SCOPE,
+        consumers=(("lp-consumer", LIBP2P_SCOPE),),
+        libp2p_trusted_key=fixtures.public_key,
+    ) as topo:
+        prov_id = topo.provider_identity[0] if topo.provider_identity else ""
+        argv = topo.consumer_argv("lp-consumer")
+        joined = " ".join(argv)
+        # NO-INJECTION oracle: the consumer was NEVER handed a bootstrap or the provider's
+        # address; the ONLY path to the provider's dial address is mDNS.
+        expect(
+            "--libp2p-bootstrap" not in argv,
+            "mdns no-injection: consumer has NO --libp2p-bootstrap (mDNS is the only entry path)",
+            f"argv={joined!r}",
+        )
+        expect(
+            "--libp2p-provider-addr" not in argv and (not prov_id or prov_id not in joined),
+            "mdns no-injection: consumer argv omits the provider's PeerId + any provider-addr",
+            f"prov_id={prov_id!r} argv={joined!r}",
+        )
+        expect(
+            "--libp2p-mdns" in argv,
+            "mdns: consumer runs with --libp2p-mdns (the sole discovery mechanism here)",
+            f"argv={joined!r}",
+        )
+
+        time.sleep(LIBP2P_MDNS_CONVERGE_S)
+        topo.proxy_reset()
+        res = topo.client_run("lp-consumer", [target_sp], fixtures.public_key)
+        expect(
+            res.exit_code == 0,
+            "mdns positive: nix build completes with the NAR served by the mDNS-discovered peer",
+            res.stderr[-800:],
+        )
+        got = res.narhash(target_sp)
+        expect(
+            got == fixtures.nar_hash(S7_TARGET),
+            "mdns positive byte-identity: NarHash matches the signed upstream",
+            f"got={got} want={fixtures.nar_hash(S7_TARGET)}",
+        )
+        stats = topo.proxy_stats()
+        nar_up = stats["upstream"].get("nar", 0)
+        expect(
+            nar_up == 0,
+            "mdns positive ORACLE: 0 upstream NAR egress (the target was peer-served over a DHT "
+            "the consumer joined with NO bootstrap - only mDNS could have supplied the address)",
+            f"upstream.nar={nar_up}",
+        )
+        # Corroboration: the consumer's log shows it DISCOVERED the provider's record via kad
+        # (content discovery stayed kad-exclusive) rather than a bare miss.
+        clog = topo.logs("lp-consumer")
+        expect(
+            "libp2p-kad miss" not in clog,
+            "mdns positive: the consumer did not log a kad discovery miss (it resolved the peer)",
+            f"consumer log tail: {clog[-500:]!r}",
+        )
+
+
+def scenario_libp2p_mdns_scope_isolation(ctx: Ctx, expect) -> None:
+    """TASK-257 negative control (bite #2): mDNS multicasts across the WHOLE LAN, but the scoped
+    `/nix-p2p/<scope>/kad` protocol still isolates. Provider P and a same-scope helper H (scope
+    A) form a DHT and H fetches the target (0 egress - proving mDNS discovery is live on this
+    bridge); a consumer C on a DIFFERENT scope (B), on the SAME bridge with mDNS ON, CANNOT join
+    P's DHT and falls back to upstream (>=1 egress). The H-resolves / C-does-not contrast, same
+    LAN + same mDNS + same key, attributes the isolation to the SCOPE alone.
+    """
+    fixtures = ctx.fixtures
+    seed_dir, prov_seeds, target_sp = _s7_seeds(ctx, "mdns-scope", S7_TARGET)
+    scope_a = f"{LIBP2P_SCOPE}-mdns-a"
+    scope_b = f"{LIBP2P_SCOPE}-mdns-b"
+    with Libp2pMdnsTopology(
+        ctx, "mdnsscope", fixtures.cache, seed_dir, prov_seeds, expect,
+        provider_scope=scope_a,
+        # H shares the provider's scope (its quorum peer + positive control); C is cross-scope.
+        consumers=(("lp-helper", scope_a), ("lp-consumer", scope_b)),
+        libp2p_trusted_key=fixtures.public_key,
+    ) as topo:
+        time.sleep(LIBP2P_MDNS_CONVERGE_S)
+
+        # POSITIVE within the arm: the SAME-scope helper resolves + fetches (0 egress). This
+        # proves mDNS discovery works on this bridge, so the negative below is not vacuous.
+        topo.proxy_reset()
+        res_h = topo.client_run("lp-helper", [target_sp], fixtures.public_key)
+        expect(
+            res_h.exit_code == 0 and res_h.narhash(target_sp) == fixtures.nar_hash(S7_TARGET),
+            "mdns scope positive: the SAME-scope helper fetches the target byte-identically",
+            res_h.stderr[-600:],
+        )
+        expect(
+            topo.proxy_stats()["upstream"].get("nar", 0) == 0,
+            "mdns scope positive: 0 upstream NAR egress for the same-scope helper (mDNS discovery "
+            "is live on this bridge)",
+            "",
+        )
+
+        # LOAD-BEARING EVIDENCE: from INSIDE C's netns, the provider is ALIVE + reachable at its
+        # routable IP - so C's fallback below isolates SCOPE, not liveness or L2 path.
+        status, _ = topo.provider_reachable_from("lp-consumer")
+        expect(
+            status == 200,
+            "mdns scope control: the provider is ALIVE + reachable from the cross-scope consumer's "
+            "netns (so the fallback isolates SCOPE, not liveness)",
+            f"status={status}",
+        )
+
+        # NEGATIVE: the DIFFERENT-scope consumer CANNOT join P's DHT -> upstream fallback.
+        topo.proxy_reset()
+        res_c = topo.client_run("lp-consumer", [target_sp], fixtures.public_key)
+        expect(
+            res_c.exit_code == 0,
+            "mdns scope control: the cross-scope build still succeeds via upstream fallback",
+            res_c.stderr[-600:],
+        )
+        expect(
+            res_c.narhash(target_sp) == fixtures.nar_hash(S7_TARGET),
+            "mdns scope control: still byte-identical (served by upstream fallback)",
+            f"got={res_c.narhash(target_sp)}",
+        )
+        nar_up = topo.proxy_stats()["upstream"].get("nar", 0)
+        expect(
+            nar_up >= 1,
+            "mdns scope control ORACLE BITE: a DIFFERENT-scope consumer served by upstream (>=1 "
+            "NAR) despite mDNS multicasting across the same bridge - the scoped kad protocol "
+            "isolates, so mDNS discovery and scope isolation compose",
+            f"upstream.nar={nar_up}",
+        )
+
+
 SCENARIOS = [
     ("topology", scenario_topology),
     ("s1-byte-and-counts", scenario_s1_byte_and_counts),
@@ -6224,6 +6660,11 @@ SCENARIOS = [
     # side - a second consumer that WOULD discover A (and does, in the serving mutation) gets
     # nothing from the leech and falls back to upstream. Minimal pair on A's mode (leech vs serving).
     ("libp2p-leech", scenario_libp2p_leech),
+    # TASK-257: mDNS zero-bootstrap LAN discovery - two daemons on one shared multicast bridge,
+    # NEITHER given --libp2p-bootstrap, discover each other via --libp2p-mdns and the consumer
+    # fetches byte-identical with 0 upstream egress; plus the scope-isolation negative control.
+    ("libp2p-mdns-bootstrap", scenario_libp2p_mdns_bootstrap),
+    ("libp2p-mdns-scope-isolation", scenario_libp2p_mdns_scope_isolation),
 ]
 
 

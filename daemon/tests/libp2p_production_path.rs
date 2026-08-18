@@ -321,6 +321,7 @@ async fn production_config_builds_libp2p_source_that_discovers_and_serves_with_c
         state_dir: None,
         relay_server_enabled: true,
         kad_server: true,
+        mdns_enabled: false,
     };
     // The builder also returns a Libp2pRawServe (TASK-164); this NoRawServe test does
     // not wire it (the compression-domain correctness it enables is covered by

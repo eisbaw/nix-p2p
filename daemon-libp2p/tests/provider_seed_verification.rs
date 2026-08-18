@@ -125,6 +125,7 @@ async fn the_shipped_announce_path_refuses_a_mis_specified_seed() {
         state_dir: None,
         relay_server_enabled: true,
         kad_server: true,
+        mdns_enabled: false,
     };
     let supplier = Arc::new(MemoryNarSupplier::new([nar.clone()]));
     let (fabric, _source, _raw, readiness) =

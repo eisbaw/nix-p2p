@@ -1,14 +1,29 @@
 #!/usr/bin/env python3
-"""AC#9 (TASK-103): the SHIPPED libp2p discovery path must be kad-EXCLUSIVE.
+"""AC#9 (TASK-103) + TASK-257: CONTENT discovery must stay kad-EXCLUSIVE.
 
-The s7-libp2p decentralized-discovery proof is only worth something if the
-consumer can reach the provider ONLY through the libp2p-kad DHT. If the shipped
-node also ran a LAN/broadcast or central-tracker discovery behaviour, a
-"discovered" peer could have been found by that shortcut instead - and the
-proof's attribution (0 upstream egress => DHT-mediated peer serve) would be a
-lie. So the node's `NetworkBehaviour` composition must run NO peer-DISCOVERY
-substitute: no mDNS (LAN multicast), no rendezvous (a central meeting-point
-tracker), no gossipsub/floodsub (pubsub flooding).
+The invariant this guard protects: the SHIPPED node learns WHO HOLDS content ("who
+has hash X?") ONLY through the libp2p-kad DHT (`get_providers` / the fabric's
+`find_providers`). If a "discovered" provider could have been found by a
+LAN/broadcast or central-tracker CONTENT path instead, the s7-libp2p proof's
+attribution (0 upstream egress => DHT-mediated peer serve) would be a lie. So no
+peer-DISCOVERY substitute may feed the content-resolution path: no
+gossipsub/floodsub (pubsub content flooding), no rendezvous (a central
+meeting-point tracker).
+
+THE mDNS BOUNDARY (TASK-257). mDNS is now SHIPPED, but ONLY in the peer-ADDRESS
+BOOTSTRAP role: it supplies a LAN neighbour's dial ADDRESS into the SAME kad
+routing/bootstrap path an explicit `--libp2p-bootstrap` (or identify) feeds
+(`kad.add_address`), so a node with no configured bootstrap can still CONVERGE its
+DHT. That is address bootstrap, NOT content discovery - the node still learns WHO
+holds hash X only through kad. This guard therefore:
+  * PERMITS mDNS wired to the address/bootstrap path (`add_address`/`dial`/
+    bootstrap) - the shipped wiring; and
+  * STILL FORBIDS mDNS wired into CONTENT discovery: if an mDNS event ever feeds
+    `find_providers`/`get_providers` (a non-kad answer to "who has hash X?"), a
+    bite fires. The distinction is made STRUCTURALLY - by which call the mDNS
+    EVENT-HANDLER (or an mDNS-named function) feeds (see `scan_mdns_wiring`).
+gossipsub/floodsub/rendezvous remain forbidden OUTRIGHT (their mere presence is a
+violation); mDNS is judged by its WIRING, not its presence.
 
 DISCOVERY vs DIAL-ASSISTANCE (TASK-168). The NAT-traversal trio - autonat
 (reachability detection), dcutr (hole punching), relay (circuit-v2 client+server)
@@ -29,15 +44,21 @@ and no bootstrap to the provider, so no out-of-band address is injected). It is
 modelled on `check-source-guard.py`: a dependency-free substring scan over the
 first-party discovery source, run in `just lint` and as evidence for TASK-103.
 
-THE BITE (AC#9's "a mutation enabling any substitute makes the proof fail"):
-`--self-test` synthesises a source file that adds `mdns::Behaviour` to the
-composition and asserts this guard REPORTS it. A guard that cannot be shown to
-fail is not a guard.
+THE BITE (AC#9's "a mutation enabling a content-discovery substitute makes the
+proof fail"): `--self-test` proves BOTH directions of the mDNS boundary - a
+composition wiring an mDNS event to `add_address` (bootstrap) PASSES, and one
+wiring an mDNS event to `get_providers`/`find_providers` (content discovery)
+FAILS - and that adding `gossipsub`/`floodsub`/`rendezvous` still bites. A guard
+that cannot be shown to fail is not a guard.
 
-Limits, stated plainly: this is a substring scan (like its sibling), so it
-catches an accidental or straightforward re-enablement, not a determined
-obfuscation (an aliased import, a macro). The behavioural no-injection oracle in
-the e2e is the complementary check that observes the running boundary.
+Limits, stated plainly: this is a source scan (like its sibling), so it catches an
+accidental or straightforward mis-wiring, not a determined obfuscation (routing an
+mDNS peer through an unnamed helper several hops away, an aliased import, a macro).
+The mDNS-wiring check reasons about the mDNS EVENT-HANDLER body and mDNS-named
+functions; a content sink reached through an intermediate un-named helper is the
+acknowledged gap. The behavioural no-injection oracle in the e2e (content served
+with 0 upstream egress and NO injected provider address) is the complementary
+check that observes the running boundary.
 
 Usage: check-discovery-no-shortcut.py [--self-test] [ROOT ...]
 Exit codes: 0 clean, 1 a forbidden discovery substrate is present, 2 nothing
@@ -63,22 +84,45 @@ DISCOVERY_ROOTS = ("fabric-libp2p/src", "daemon-libp2p/src")
 
 SKIP_DIRS = {".git", "target", "result", "fixtures", "backlog", ".direnv", "tests"}
 
-# libp2p peer-DISCOVERY behaviours that would give a node a NON-kad route to LEARN
-# OF a peer - each a "tracker / LAN / broadcast substitute" AC#9 forbids. Kept as the
-# libp2p module tokens (not bare English words like "broadcast", which appears in an
-# unrelated comment) so the scan does not false-positive on prose.
+# libp2p peer-DISCOVERY behaviours whose mere PRESENCE gives a node a NON-kad route to
+# a CONTENT holder - each a "tracker / broadcast substitute" the invariant forbids
+# OUTRIGHT. Kept as the libp2p module tokens (not bare English words like "broadcast",
+# which appears in an unrelated comment) so the scan does not false-positive on prose.
 #
-# NOTE (TASK-168): `autonat` was REMOVED from this set. It was originally forbidden as
-# "address-discovery signalling outside the kad proof", but autonat discovers only
-# whether OUR OWN address is publicly dialable - it never discovers OTHER peers or
-# content, so it is dial-assistance, not a discovery substitute (see the module
-# docstring). dcutr/relay were never forbidden and stay permitted for the same reason.
+# NOTE (TASK-168): `autonat` was REMOVED - it discovers only whether OUR OWN address is
+# publicly dialable, never OTHER peers or content (dial-assistance, not a substitute).
+# NOTE (TASK-257): `mdns` was REMOVED from this OUTRIGHT set. mDNS is now SHIPPED in the
+# peer-ADDRESS BOOTSTRAP role (it feeds `kad.add_address`, never content discovery), so
+# its PRESENCE is permitted; its WIRING is judged by `scan_mdns_wiring`, which STILL
+# forbids an mDNS event feeding `find_providers`/`get_providers`. `rendezvous` STAYS
+# forbidden outright: it is a central content meeting-point tracker and is not wired in
+# any bootstrap role yet (its own address-bootstrap refinement is TASK-258).
 FORBIDDEN = {
-    "mdns": "mDNS is LAN multicast peer discovery - a non-kad shortcut",
     "rendezvous": "rendezvous is a central meeting-point tracker - a non-kad shortcut",
     "gossipsub": "gossipsub is pubsub flooding - a non-kad discovery/broadcast path",
     "floodsub": "floodsub is pubsub flooding - a non-kad discovery/broadcast path",
 }
+
+# TASK-257: the CONTENT-DISCOVERY sinks an mDNS event must NEVER feed - the "who holds
+# hash X?" query entry points. `find_providers` is the fabric directory API; `get_providers`
+# is the raw kad query. If either appears inside an mDNS event-handler body (or an
+# mDNS-named function), mDNS has been wired as a second content-discovery mechanism and the
+# guard bites. These calls are LEGITIMATE elsewhere in the file (they ARE the kad-exclusive
+# content path); the violation is specifically an mDNS EVENT feeding one of them.
+MDNS_CONTENT_SINKS = ("find_providers", "get_providers")
+
+# Anchors that mark an mDNS EVENT-HANDLER (as opposed to the struct field, the behaviour
+# constructor `mdns::tokio::Behaviour::new`, or a config). Only these begin an mDNS wiring
+# region; a bare `mdns` token (e.g. the `pub mdns:` field) does NOT, so the struct
+# declaration cannot false-anchor onto an unrelated later match arm.
+MDNS_EVENT_ANCHORS = (
+    re.compile(r"mdns::Event\b"),
+    re.compile(r"BehaviourEvent::Mdns\s*\("),
+)
+# An mDNS-named function: its whole body is an mDNS wiring region, so routing an mDNS peer
+# into `on_mdns_discovered() { ... get_providers ... }` is caught even though the content
+# sink is one call away from the event arm.
+MDNS_NAMED_FN = re.compile(r"\bfn\s+[A-Za-z0-9_]*mdns[A-Za-z0-9_]*\s*(?:<[^>]*>)?\s*\(")
 
 # The NAT-traversal trio explicitly PERMITTED (TASK-168): dial-assistance, not
 # discovery. Documented here so a future reader sees the boundary is deliberate, and
@@ -190,6 +234,104 @@ def scan_relay_provider_independence(roots: list[Path]) -> list[str]:
                     f"resolves to a provider/content-keyed container ({snippet!r}) - alias "
                     "indirection cannot launder per-provider circuit injection (TASK-218)."
                 )
+    return violations
+
+
+def _balanced_block(code: str, open_idx: int) -> str:
+    """Return the substring from the `{` at `open_idx` through its matching `}` (inclusive).
+    If unbalanced (truncated source), returns to end-of-string - a conservative over-capture
+    that can only make the scan STRICTER, never miss a sink."""
+    depth = 0
+    k = open_idx
+    while k < len(code):
+        c = code[k]
+        if c == "{":
+            depth += 1
+        elif c == "}":
+            depth -= 1
+            if depth == 0:
+                return code[open_idx : k + 1]
+        k += 1
+    return code[open_idx:]
+
+
+def _arm_body_after(code: str, anchor_idx: int) -> str:
+    """Given an anchor at an mDNS event pattern, return the match-arm BODY that its `=>`
+    introduces: a balanced `{ ... }` block, or - for a brace-less single-expression arm
+    (`=> self.foo(x),`) - the expression up to the arm-terminating top-level comma. This is
+    the exact code the mDNS event feeds, so a content sink INSIDE it is an mDNS->content
+    wiring, while the file's OTHER (legitimate, kad-exclusive) `get_providers` calls are
+    outside any arm body and never inspected."""
+    arrow = code.find("=>", anchor_idx)
+    if arrow == -1:
+        return ""
+    j = arrow + 2
+    while j < len(code) and code[j].isspace():
+        j += 1
+    if j >= len(code):
+        return ""
+    if code[j] == "{":
+        return _balanced_block(code, j)
+    # Brace-less arm: capture to the terminating comma at paren/bracket/brace depth 0 (or
+    # the enclosing match's closing brace, whichever comes first).
+    depth = 0
+    k = j
+    while k < len(code):
+        c = code[k]
+        if c in "([{":
+            depth += 1
+        elif c in ")]}":
+            if depth == 0:
+                break
+            depth -= 1
+        elif c == "," and depth == 0:
+            break
+        k += 1
+    return code[j:k]
+
+
+def scan_mdns_wiring(roots: list[Path]) -> list[str]:
+    """TASK-257: mDNS is PERMITTED in the peer-address bootstrap role but FORBIDDEN as a
+    content-discovery mechanism. For every mDNS EVENT-HANDLER body and every mDNS-named
+    function body, flag a content-discovery sink (`find_providers`/`get_providers`) - that is
+    an mDNS event answering "who holds hash X?", which must stay kad-EXCLUSIVE. mDNS wired to
+    the address/bootstrap path (`add_address`/`dial`) is NOT a sink and passes.
+
+    Only mDNS EVENT/handler regions are inspected, so the file's legitimate kad content path
+    (its own `get_providers`, the struct field, the behaviour constructor) never trips."""
+    violations: list[str] = []
+    for root in roots:
+        if not root.exists():
+            continue
+        for source in sorted(root.rglob("*.rs")):
+            if SKIP_DIRS & set(source.relative_to(root).parts):
+                continue
+            try:
+                code = _strip_line_comments(source.read_text())
+            except (UnicodeDecodeError, OSError):
+                continue
+            if "mdns" not in code:
+                continue
+            regions: list[str] = []
+            # (a) event-handler arms: capture the body the `=>` introduces.
+            for anchor in MDNS_EVENT_ANCHORS:
+                for m in anchor.finditer(code):
+                    regions.append(_arm_body_after(code, m.start()))
+            # (b) mDNS-named functions: capture the whole `{ ... }` body.
+            for m in MDNS_NAMED_FN.finditer(code):
+                brace = code.find("{", m.end())
+                if brace != -1:
+                    regions.append(_balanced_block(code, brace))
+            for body in regions:
+                for sink in MDNS_CONTENT_SINKS:
+                    if sink in body:
+                        snippet = " ".join(body.split())[:90]
+                        violations.append(
+                            f"{source}: an mDNS event/handler feeds the content-discovery sink "
+                            f"{sink!r} ({snippet!r}) - mDNS may supply peer ADDRESSES to the kad "
+                            "bootstrap path (add_address/dial) ONLY, never answer 'who holds hash "
+                            "X?'. Content discovery must stay kad-EXCLUSIVE (TASK-257)."
+                        )
     return violations
 
 
@@ -331,26 +473,100 @@ def self_test() -> int:
                 file=sys.stderr,
             )
             return 1
-        # The MUTATION: re-enable a LAN discovery substitute. The guard MUST bite.
-        (root / "mutated.rs").write_text(
+        # TASK-257 DIRECTION (a): mDNS in the peer-ADDRESS BOOTSTRAP role must PASS. A
+        # composition that installs the mDNS behaviour AND wires its Discovered event to
+        # `kad.add_address` (the bootstrap/address path) is the SHIPPED wiring and must not trip
+        # either the outright-forbidden scan (mdns is no longer in FORBIDDEN) or the wiring scan
+        # (add_address is not a content sink).
+        (root / "mdns_bootstrap_ok.rs").write_text(
             "pub struct Behaviour {\n"
             "    pub kad: kad::Behaviour<MemoryStore>,\n"
             "    pub identify: identify::Behaviour,\n"
-            "    pub mdns: mdns::Behaviour,\n"
+            "    pub mdns: Toggle<mdns::tokio::Behaviour>,\n"
+            "}\n"
+            "fn on_event(&mut self, event: SwarmEvent<BehaviourEvent>) {\n"
+            "    match event {\n"
+            "        SwarmEvent::Behaviour(BehaviourEvent::Mdns(mdns::Event::Discovered(peers))) => {\n"
+            "            let kad = &mut self.swarm.behaviour_mut().kad;\n"
+            "            for (peer_id, addr) in peers { kad.add_address(&peer_id, addr); }\n"
+            "        }\n"
+            "        _ => {}\n"
+            "    }\n"
             "}\n"
         )
-        mutated_violations, _ = scan([Path(tmp) / "fabric-libp2p" / "src"])
-        if not any("mdns" in v for v in mutated_violations):
+        boot_violations, _ = scan([Path(tmp) / "fabric-libp2p" / "src"])
+        boot_wiring = scan_mdns_wiring([Path(tmp) / "fabric-libp2p" / "src"])
+        (root / "mdns_bootstrap_ok.rs").unlink()
+        if boot_violations or boot_wiring:
             print(
-                "self-test FAILED: adding mdns::Behaviour did NOT trip the guard - "
-                "the guard does not bite, so it proves nothing",
+                "self-test FAILED: mDNS wired to the ADDRESS/bootstrap path (add_address) was "
+                f"flagged (outright={boot_violations}, wiring={boot_wiring}) - the permitted "
+                "peer-address bootstrap role must PASS (TASK-257)",
                 file=sys.stderr,
             )
             return 1
+        # TASK-257 DIRECTION (b): mDNS wired into CONTENT discovery must FAIL. The ONLY change
+        # from (a) is the sink the Discovered event feeds: `get_providers`/`find_providers`
+        # instead of `add_address`. Both the event-arm form AND the mDNS-named-helper form must
+        # bite (a content sink one call away, inside `on_mdns_*`, is still caught).
+        for label, body in (
+            (
+                "event-arm get_providers",
+                "        SwarmEvent::Behaviour(BehaviourEvent::Mdns(mdns::Event::Discovered(peers))) => {\n"
+                "            for (peer_id, _addr) in peers {\n"
+                "                self.swarm.behaviour_mut().kad.get_providers(some_key);\n"
+                "            }\n"
+                "        }\n",
+            ),
+            (
+                "mdns-named-fn find_providers",
+                "        SwarmEvent::Behaviour(BehaviourEvent::Mdns(ev)) => self.on_mdns_discovered(ev),\n",
+            ),
+        ):
+            extra = ""
+            if "on_mdns_discovered" in body:
+                extra = (
+                    "fn on_mdns_discovered(&mut self, ev: mdns::Event) {\n"
+                    "    self.directory.find_providers(&key, &budget);\n"
+                    "}\n"
+                )
+            (root / "mdns_content.rs").write_text(
+                "fn on_event(&mut self, event: SwarmEvent<BehaviourEvent>) {\n"
+                "    match event {\n" + body + "        _ => {}\n    }\n}\n" + extra
+            )
+            content_wiring = scan_mdns_wiring([Path(tmp) / "fabric-libp2p" / "src"])
+            (root / "mdns_content.rs").unlink()
+            if not any("content-discovery sink" in v for v in content_wiring):
+                print(
+                    f"self-test FAILED: mDNS wired into CONTENT discovery ({label}) did NOT trip "
+                    "the guard - mDNS must never answer 'who holds hash X?' (TASK-257)",
+                    file=sys.stderr,
+                )
+                return 1
+        # The outright-forbidden substitutes must STILL bite by mere presence: gossipsub,
+        # floodsub, rendezvous. (mDNS is deliberately NOT in this set anymore.)
+        for token in ("gossipsub", "floodsub", "rendezvous"):
+            (root / "forbidden.rs").write_text(
+                "pub struct Behaviour {\n"
+                "    pub kad: kad::Behaviour<MemoryStore>,\n"
+                f"    pub sub: {token}::Behaviour,\n"
+                "}\n"
+            )
+            forbid_violations, _ = scan([Path(tmp) / "fabric-libp2p" / "src"])
+            (root / "forbidden.rs").unlink()
+            if not any(token in v for v in forbid_violations):
+                print(
+                    f"self-test FAILED: adding {token}::Behaviour did NOT trip the guard - the "
+                    "outright-forbidden content-discovery substitutes must still bite",
+                    file=sys.stderr,
+                )
+                return 1
         print(
-            "check-discovery-no-shortcut: self-test OK - clean composition passes, the "
-            "permitted NAT-traversal trio (autonat/dcutr/relay) is ALLOWED, and adding "
-            "mdns::Behaviour or an auxiliary provider-keyed relay cache BITES"
+            "check-discovery-no-shortcut: self-test OK - clean composition passes, the permitted "
+            "NAT-traversal trio (autonat/dcutr/relay) is ALLOWED, mDNS in the ADDRESS/bootstrap "
+            "role (add_address) PASSES while mDNS wired into content discovery "
+            "(find_providers/get_providers) BITES, gossipsub/floodsub/rendezvous still BITE, and "
+            "an auxiliary provider-keyed relay cache BITES"
         )
         return 0
 
@@ -368,6 +584,8 @@ def main(argv: list[str]) -> int:
     violations, scanned = scan(roots)
     # TASK-218/219: allow signed RelayHints, forbid auxiliary provider-keyed relay state.
     violations = violations + scan_relay_provider_independence(roots)
+    # TASK-257: mDNS is permitted for address bootstrap, forbidden for content discovery.
+    violations = violations + scan_mdns_wiring(roots)
     if scanned == 0:
         print(
             "check-discovery-no-shortcut: NOTHING scanned - nothing proven "
@@ -385,9 +603,10 @@ def main(argv: list[str]) -> int:
         return 1
     print(
         f"check-discovery-no-shortcut: OK - {scanned} shipped discovery source file(s) "
-        "scanned; discovery is kad-EXCLUSIVE (no mdns/rendezvous/gossipsub/floodsub); "
-        "signed RelayHints and the NAT-traversal trio are permitted dial-assistance; "
-        "auxiliary provider-keyed relay maps/caches remain forbidden"
+        "scanned; CONTENT discovery is kad-EXCLUSIVE (no rendezvous/gossipsub/floodsub, and no "
+        "mDNS event feeds find_providers/get_providers); mDNS is permitted in the peer-ADDRESS "
+        "bootstrap role; signed RelayHints and the NAT-traversal trio are permitted "
+        "dial-assistance; auxiliary provider-keyed relay maps/caches remain forbidden"
     )
     return 0
 

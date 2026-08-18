@@ -239,6 +239,7 @@ async fn shipped_store_announce_carries_verified_content_and_refuses_quarantined
         state_dir: None,
         relay_server_enabled: true,
         kad_server: true,
+        mdns_enabled: false,
     };
     let (fabric, _source, _raw, readiness) = build_libp2p_provider_source(
         cfg,

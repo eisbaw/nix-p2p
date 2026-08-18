@@ -118,6 +118,7 @@ fn durable_provider_cfg(
         state_dir: Some(state_dir.to_path_buf()),
         relay_server_enabled: true,
         kad_server: true,
+        mdns_enabled: false,
     }
 }
 
@@ -400,6 +401,7 @@ async fn restart_durable_sequence_serves_through_run() {
         state_dir: None,
         relay_server_enabled: true,
         kad_server: true,
+        mdns_enabled: false,
     };
     let (consumer, _c_source, _c_raw) = build_libp2p_nar_source(consumer_cfg)
         .await

@@ -118,6 +118,7 @@ async fn the_public_seed_door_refuses_an_unallowlisted_seed_on_a_real_fabric() {
         state_dir: None,
         relay_server_enabled: true,
         kad_server: true,
+        mdns_enabled: false,
     };
     let supplier = Arc::new(MemoryNarSupplier::new([nar.clone()]));
     let (fabric, _source, _raw, readiness) =

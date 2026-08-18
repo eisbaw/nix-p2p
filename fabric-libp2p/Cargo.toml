@@ -48,6 +48,16 @@ libp2p = { version = "0.56", default-features = false, features = [
     "autonat",
     "dcutr",
     "relay",
+    # LAN peer-ADDRESS bootstrap (TASK-257): mDNS link-local multicast so two
+    # same-scope nodes on one LAN segment discover each other's dial ADDRESS with
+    # NO --libp2p-bootstrap. DEFAULT OFF (a disabled `Toggle`, emits zero
+    # multicast). Discovered peers feed the SAME kad `add_address`/bootstrap path
+    # identify already feeds - mDNS supplies ADDRESSES ONLY and is NEVER a second
+    # content-discovery mechanism (scripts/check-discovery-no-shortcut.py enforces
+    # that mdns is wired to the address path, never to find_providers). The tokio
+    # variant matches this crate's tokio runtime. Scope isolation is orthogonal and
+    # already enforced by the scoped kad/identify protocol names.
+    "mdns",
 ] }
 # libp2p-stream (TASK-157): the RAW-STREAM NAR transfer (AsyncRead/AsyncWrite per
 # call) that REPLACES the request-response NAR carrier. The libp2p 0.56 meta-crate

@@ -165,6 +165,7 @@ fn source_config(
         state_dir: None,
         relay_server_enabled: true,
         kad_server: true,
+        mdns_enabled: false,
     }
 }
 

@@ -19,7 +19,7 @@ use daemon_core::{
     RegularFileNarDumper, StorePath,
 };
 use daemon_core::{
-    CacheInfo, ContractRequest, CorrelationStore, DhtRole, METRICS_PATH,
+    CacheInfo, ContractRequest, CorrelationStore, DhtRole, METRICS_PATH, Mechanism,
     NARINFO_CACHE_FLAG_CONFLICT, NarSource, NarinfoLayer, NarinfoSource, NullStatusFacts,
     Observability, OperatorContract, PassThroughReason, PrivacyPolicy, PublicNarAllowlist,
     RawUpstream, ResourceCaps, RunConfig, RuntimeMetrics, STATUS_PATH, SharingProfile, StatusFacts,
@@ -75,6 +75,14 @@ struct Config {
     /// advertises the node's OWN address (like autonat/identify), never a third-party dial hint.
     libp2p_external_addresses: Vec<Multiaddr>,
     libp2p_scope: Option<String>,
+    /// TASK-257: `--libp2p-mdns` opts into LAN mDNS peer-ADDRESS discovery. DEFAULT OFF. When set,
+    /// the swarm installs the mDNS behaviour (link-local multicast) so a same-scope LAN neighbour is
+    /// discovered with NO `--libp2p-bootstrap`; discovered addresses feed the SAME kad bootstrap
+    /// path an explicit bootstrap uses and NEVER content discovery. It is TASK-120 axis-1 (local
+    /// discovery) only - it implies NOTHING about serving/announcing/public participation - and is
+    /// REFUSED under upstream-only (which runs no swarm at all). Scope isolation is orthogonal and
+    /// already enforced by the scoped kad/identify protocol names.
+    libp2p_mdns: bool,
     libp2p_identity_seed: Option<[u8; 32]>,
     libp2p_provider: bool,
     libp2p_seed_nar: Vec<(daemon_core::NarHashKey, String)>,
@@ -256,15 +264,25 @@ fn build_contract(cfg: &Config) -> Result<OperatorContract, String> {
         announce_distinct_paths_budget: cfg.libp2p_announce_budget,
         ..ResourceCaps::default()
     };
+    // TASK-257: when --libp2p-mdns is set, the operator has SELECTED the shipped LAN mDNS
+    // peer-address mechanism. Naming it in `selected_mechanisms` puts it through the fail-closed
+    // `validate` gate (it is Enabled, so it passes) and surfaces it as an operator override; the
+    // per-node `lan_mdns_enabled` flag is what drives the status/preflight active+exposure report.
+    let selected_mechanisms = if cfg.libp2p_mdns {
+        vec![Mechanism::LanMdns]
+    } else {
+        Vec::new()
+    };
     let contract = OperatorContract {
         profile: cfg.profile,
         caps,
         privacy: PrivacyPolicy {
             diagnostics_opt_in: cfg.diagnostics,
         },
-        selected_mechanisms: Vec::new(),
+        selected_mechanisms,
         active_reference_mechanisms: Vec::new(),
         dht_role,
+        lan_mdns_enabled: cfg.libp2p_mdns,
         // TASK-241: does this node advertise a PUBLIC/reachable self-address? `--libp2p-external-address`
         // is the operator's explicit "I am reachable here" declaration (a relay/bootstrap sets it so
         // peers can dial it). This makes a PUBLIC router's `public_dht_participation` report the honest
@@ -356,6 +374,7 @@ fn parse_config<I: IntoIterator<Item = String>>(args: I) -> Result<Config, Strin
         libp2p_listen: Vec::new(),
         libp2p_external_addresses: Vec::new(),
         libp2p_scope: None,
+        libp2p_mdns: false,
         libp2p_identity_seed: None,
         libp2p_provider: false,
         libp2p_seed_nar: Vec::new(),
@@ -422,6 +441,7 @@ fn parse_config<I: IntoIterator<Item = String>>(args: I) -> Result<Config, Strin
                     .map_err(|e| format!("bad --libp2p-external-address multiaddr: {e}"))?,
             ),
             "--libp2p-scope" => cfg.libp2p_scope = Some(value()?),
+            "--libp2p-mdns" => cfg.libp2p_mdns = true,
             "--libp2p-identity-seed" => {
                 cfg.libp2p_identity_seed = Some(parse_libp2p_seed(&value()?)?)
             }
@@ -661,11 +681,18 @@ fn check_runtime_preconditions(cfg: &Config) -> Result<(), String> {
                 "a provider profile (lan-share/public-share) requires --libp2p-listen".into(),
             );
         }
-    } else if cfg.profile == SharingProfile::ConsumeOnly && cfg.libp2p_bootstrap.is_empty() {
-        // CONSUME-ONLY intends to fetch from peers, so it needs an entry peer; UPSTREAM-ONLY does
-        // NOT (it is pure HTTP fallback) - the guard keys off the profile, not "non-provider".
+    } else if cfg.profile == SharingProfile::ConsumeOnly
+        && cfg.libp2p_bootstrap.is_empty()
+        && !cfg.libp2p_mdns
+    {
+        // CONSUME-ONLY intends to fetch from peers, so it needs an ENTRY PATH to the DHT.
+        // TASK-257: `--libp2p-mdns` IS such an entry path (a same-scope LAN neighbour is
+        // discovered with zero configuration), so it satisfies this requirement exactly as an
+        // explicit `--libp2p-bootstrap` does - the whole point of mDNS is to remove the mandatory
+        // bootstrap for the LAN case. Without EITHER, a consumer can never find anyone; UPSTREAM-ONLY
+        // needs neither (it is pure HTTP fallback) - the guard keys off the profile, not "non-provider".
         return Err(
-            "consume-only requires at least one --libp2p-bootstrap <PeerId>@<multiaddr> (it fetches from peers); for pure HTTP fallback use --profile upstream-only with no bootstrap".into(),
+            "consume-only requires an entry path to the DHT: at least one --libp2p-bootstrap <PeerId>@<multiaddr>, OR --libp2p-mdns for zero-config LAN discovery. For pure HTTP fallback use --profile upstream-only with neither".into(),
         );
     } else if cfg.profile == SharingProfile::Router && cfg.libp2p_listen.is_empty() {
         // TASK-241: a router is a kad-server + relay OTHERS reach - it must BIND a transport, so a
@@ -690,6 +717,10 @@ fn check_runtime_preconditions(cfg: &Config) -> Result<(), String> {
                 "--libp2p-external-address",
                 !cfg.libp2p_external_addresses.is_empty(),
             ),
+            // TASK-257: upstream-only must stay zero-P2P and emit ZERO multicast. --libp2p-mdns
+            // would open a link-local multicast socket, so it is REFUSED here (not silently
+            // ignored) - the fail-fast, report-matches-wire posture.
+            ("--libp2p-mdns", cfg.libp2p_mdns),
         ];
         if let Some((flag, _)) = swarm_flag.iter().find(|(_, present)| *present) {
             return Err(format!(
@@ -733,6 +764,10 @@ fn source_config(
         relay_server_enabled: dht_server && cfg.libp2p_relay_server_enabled,
         // A PROVIDER or ROUTER is a kad SERVER (DHT infrastructure); a CONSUMER is a kad CLIENT.
         kad_server: dht_server,
+        // TASK-257: LAN mDNS peer-ADDRESS discovery, straight from the default-OFF flag. Any
+        // swarm-participating profile (consume-only / provider / router) may opt in; upstream-only
+        // never reaches here (it builds no swarm and refuses --libp2p-mdns in parse_config).
+        mdns_enabled: cfg.libp2p_mdns,
     }
 }
 
@@ -1629,6 +1664,7 @@ mod bootstrap_guard_tests {
             libp2p_listen: listen.into_iter().collect(),
             libp2p_external_addresses: Vec::new(),
             libp2p_scope: None,
+            libp2p_mdns: false,
             libp2p_identity_seed: None,
             libp2p_provider: true,
             libp2p_seed_nar: Vec::new(),
@@ -2166,6 +2202,63 @@ mod operator_contract_tests {
         let err = check_runtime_preconditions(&cfg)
             .expect_err("upstream-only must refuse --libp2p-listen (no participating swarm)");
         assert!(err.contains("NO libp2p swarm"), "{err}");
+    }
+
+    /// TASK-257: upstream-only stays zero-P2P - `--libp2p-mdns` alone derives upstream-only (mDNS
+    /// does NOT imply a participation profile: axis independence) and is REFUSED as a swarm flag,
+    /// so a pure-HTTP node can never open a multicast socket. MUTATION: dropping the mdns entry
+    /// from the upstream-only swarm-flag guard lets a multicast socket onto an upstream-only node.
+    #[test]
+    fn upstream_only_refuses_mdns() {
+        let cfg = parse_config(args(&["--libp2p-mdns"]))
+            .expect("bare --libp2p-mdns parses (the contract itself is valid)");
+        assert_eq!(
+            cfg.profile,
+            SharingProfile::UpstreamOnly,
+            "mDNS must not infer a participation profile (axis-1 discovery != participation)"
+        );
+        let err = check_runtime_preconditions(&cfg)
+            .expect_err("upstream-only must refuse --libp2p-mdns (zero-P2P, zero multicast)");
+        assert!(
+            err.contains("NO libp2p swarm") && err.contains("--libp2p-mdns"),
+            "{err}"
+        );
+    }
+
+    /// TASK-257: `--libp2p-mdns` is an ENTRY PATH to the DHT, so a consume-only node with mDNS and
+    /// NO `--libp2p-bootstrap` is ACCEPTED (the whole point: zero-config LAN discovery). MUTATION:
+    /// dropping the `!cfg.libp2p_mdns` relaxation re-imposes the bootstrap requirement and this
+    /// reddens. The contract also surfaces mDNS as active with its LAN exposure.
+    #[test]
+    fn consume_only_with_mdns_needs_no_bootstrap() {
+        let cfg = parse_config(args(&["--libp2p-leech", "--libp2p-mdns"]))
+            .expect("leech + mdns parses as consume-only");
+        assert_eq!(cfg.profile, SharingProfile::ConsumeOnly);
+        check_runtime_preconditions(&cfg).expect(
+            "a consume-only node with --libp2p-mdns and no --libp2p-bootstrap must be accepted \
+             (mDNS is its DHT entry path)",
+        );
+        let contract = build_contract(&cfg).expect("leech+mdns contract is valid");
+        assert!(contract.lan_mdns_enabled, "mDNS must be reported active");
+        assert!(
+            contract.preflight().contains("EXPOSURE (lan-mdns)"),
+            "the LAN mDNS exposure must be surfaced in preflight"
+        );
+    }
+
+    /// TASK-257 negative control: WITHOUT mDNS (and without a bootstrap), a consume-only node is
+    /// still refused - proving the relaxation above is scoped to mDNS, not a blanket drop of the
+    /// entry-path requirement.
+    #[test]
+    fn consume_only_without_mdns_or_bootstrap_still_refused() {
+        let cfg =
+            parse_config(args(&["--libp2p-leech"])).expect("bare leech parses (consume-only)");
+        let err = check_runtime_preconditions(&cfg)
+            .expect_err("consume-only with neither bootstrap nor mdns must be refused");
+        assert!(
+            err.contains("entry path") && err.contains("--libp2p-mdns"),
+            "{err}"
+        );
     }
 
     /// AC#7 + fix #3: `--preflight` renders the INTENDED profile with NO network-precondition

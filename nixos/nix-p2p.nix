@@ -229,6 +229,26 @@ in
         description = "`--libp2p-scope`: the kad/identify network scope, isolating this network from others.";
       };
 
+      mdns = lib.mkOption {
+        type = lib.types.bool;
+        default = false;
+        description = ''
+          `--libp2p-mdns` (TASK-257): LAN mDNS peer-ADDRESS discovery. DEFAULT OFF.
+          When enabled, a same-scope neighbour on the LAN is discovered over
+          link-local multicast with NO `bootstrap` entry - the zero-config answer
+          for a private org pool. Discovered addresses feed the SAME kad bootstrap
+          path an explicit `bootstrap` uses; mDNS supplies peer ADDRESSES only and
+          is NEVER a second content-discovery mechanism (content discovery stays
+          kad-exclusive). It is axis-1 LOCAL discovery only - it does NOT imply
+          serving, announcing, or public participation - and it DISCLOSES this
+          host's presence + NodeId to every device on the LAN (surfaced by
+          `--preflight`/`--status`). REFUSED under `profile = "upstream-only"`
+          (which runs no P2P). As an entry path it satisfies a consumer's
+          bootstrap requirement, so a consume-only node needs neither a `bootstrap`
+          nor a public entry peer when `mdns` is on.
+        '';
+      };
+
       identitySeed = lib.mkOption {
         type = lib.types.nullOr lib.types.str;
         default = null;
@@ -333,6 +353,13 @@ in
         assertion = !isRouter || lcfg.listen != [ ];
         message = "services.nix-p2p.libp2p: a router (profile = \"router\") requires libp2p.listen (it binds a kad-server + relay that others dial as a bootstrap/relay root).";
       }
+      {
+        # TASK-257: upstream-only stays zero-P2P and emits ZERO multicast; it cannot enable mDNS.
+        # Mirrors the daemon's refusal of --libp2p-mdns under upstream-only (axis-1 discovery must
+        # not sneak a swarm/multicast onto a pure-HTTP node). Select consume-only for a LAN consumer.
+        assertion = !lcfg.mdns || profile != "upstream-only";
+        message = "services.nix-p2p.libp2p.mdns = true requires a P2P profile (consume-only/lan-share/public-share/router); upstream-only runs no P2P and must emit zero mDNS multicast.";
+      }
     ];
 
     systemd.services.nix-p2p-daemon = {
@@ -384,6 +411,8 @@ in
             ++ lib.concatMap (a: [ "--libp2p-external-address" a ]) lcfg.externalAddresses
             ++ lib.concatMap (b: [ "--libp2p-bootstrap" b ]) lcfg.bootstrap
             ++ lib.optionals (lcfg.scope != null) [ "--libp2p-scope" lcfg.scope ]
+            # TASK-257: LAN mDNS peer-address discovery (default OFF).
+            ++ lib.optionals lcfg.mdns [ "--libp2p-mdns" ]
             ++ lib.optionals (lcfg.identitySeed != null) [ "--libp2p-identity-seed" lcfg.identitySeed ]
             ++ lib.optionals (lcfg.stateDir != null) [ "--libp2p-state-dir" lcfg.stateDir ]
             ++ lib.concatMap (s: [ "--libp2p-provide-store" s ]) lcfg.provideStore

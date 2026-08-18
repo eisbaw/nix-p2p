@@ -328,10 +328,13 @@ impl Mechanism {
                            (PRD Wave-2c execution order). It has no content-provider routing, \
                            so it is never a discovery path.",
             },
-            Mechanism::LanMdns => MechanismState::PendingUnsupported {
-                evidence: "LAN mDNS (TASK-130) is deferred-pending-202; the libp2p path is \
-                           usable without it.",
-            },
+            // TASK-257: LAN mDNS peer-ADDRESS bootstrap SHIPPED (fabric-libp2p mdns behaviour behind
+            // the default-OFF `--libp2p-mdns` flag). It is SELECTABLE now - so an operator may name
+            // it and `validate` admits it - but it is a per-node OPT-IN: whether it is ACTIVE on a
+            // given node is carried by [`OperatorContract::lan_mdns_enabled`] (set from the flag),
+            // NOT by this static state. It supplies peer ADDRESSES only and is never a
+            // content-discovery mechanism (discovery stays kad-EXCLUSIVE).
+            Mechanism::LanMdns => MechanismState::Enabled,
             Mechanism::DnsPkarr => MechanismState::PendingUnsupported {
                 evidence: "DNS/pkarr node-address discovery + relay (TASK-89) is \
                            deferred-pending-202.",
@@ -836,6 +839,17 @@ pub struct OperatorContract {
     /// them. See [`public_dht_participation`](OperatorContract::public_dht_participation). Default
     /// `false` (a fresh install advertises nothing).
     pub advertises_public_reachability: bool,
+    /// Whether LAN mDNS peer-ADDRESS discovery ([`Mechanism::LanMdns`]) is ACTIVE on this node
+    /// (TASK-257): set by each binary from the default-OFF `--libp2p-mdns` flag. mDNS is a
+    /// SELECTABLE-but-per-node-opt-in mechanism, so its static [`MechanismState`] is `Enabled`
+    /// (shipped) while THIS boolean is what says it is running HERE - the report-matches-wire
+    /// answer preflight/status print. When `true`, the node opens a link-local multicast socket
+    /// that DISCLOSES its presence + NodeId to every device on the LAN (an axis-1 local-discovery
+    /// EXPOSURE, surfaced in preflight/status), and feeds discovered peer ADDRESSES into the same
+    /// kad bootstrap path an explicit `--libp2p-bootstrap` uses - never a content-discovery route.
+    /// It is TASK-120 axis-1 only: enabling it implies NOTHING about serving/announcing/public
+    /// participation. Default `false` (a fresh install emits zero mDNS multicast).
+    pub lan_mdns_enabled: bool,
 }
 
 impl OperatorContract {
@@ -850,6 +864,21 @@ impl OperatorContract {
             active_reference_mechanisms: Vec::new(),
             dht_role: DhtRole::None,
             advertises_public_reachability: false,
+            // TASK-257: a fresh install runs no swarm and emits zero mDNS multicast.
+            lan_mdns_enabled: false,
+        }
+    }
+
+    /// Whether `mechanism` is ACTIVE on THIS node (report-matches-wire), distinct from whether it
+    /// is statically shipped/selectable ([`MechanismState::Enabled`]). The always-on primary
+    /// (libp2p-kad / libp2p-nar) is active whenever selectable; [`Mechanism::LanMdns`] is a
+    /// per-node OPT-IN, active iff [`lan_mdns_enabled`](OperatorContract::lan_mdns_enabled). This is
+    /// the single place the two notions are reconciled so status/preflight cannot claim mDNS is
+    /// running on a node that never enabled it (TASK-257 default-OFF honesty).
+    fn mechanism_active_here(&self, mechanism: Mechanism) -> bool {
+        match mechanism {
+            Mechanism::LanMdns => self.lan_mdns_enabled,
+            other => other.is_selectable(),
         }
     }
 
@@ -945,13 +974,27 @@ impl OperatorContract {
         if let Some((used, cap)) = rt.derive_budget_global {
             out.push(format!("derive_budget_global_bytes={used}/{cap}"));
         }
-        // Enabled mechanisms only (the pending set is the preflight's job).
+        // Mechanisms ACTIVE ON THIS NODE (the pending set is the preflight's job). Uses
+        // `mechanism_active_here`, so the always-on primary is listed while the per-node
+        // opt-in mDNS (TASK-257) appears ONLY when `--libp2p-mdns` enabled it - a default-OFF
+        // node never reports lan-mdns as enabled (report matches wire).
         let enabled: Vec<&str> = Mechanism::registry()
             .into_iter()
-            .filter(|m| m.is_selectable())
+            .filter(|m| self.mechanism_active_here(*m))
             .map(|m| m.as_str())
             .collect();
         out.push(format!("mechanisms_enabled={}", enabled.join(",")));
+        // TASK-257 EXPOSURE (AC#6): mDNS discloses this host's presence + NodeId to every device on
+        // the LAN via link-local multicast. Surface it on --status as an explicit disclosure line so
+        // an operator SEES the local exposure, never silently accepts it. Off = the honest `none`.
+        out.push(format!(
+            "lan_mdns_exposure={}",
+            if self.lan_mdns_enabled {
+                "presence+node_id-disclosed-to-lan"
+            } else {
+                "none"
+            }
+        ));
         // Deferred-reference mechanisms ACTIVE on the wire (fix #4: report matches wire).
         let active_ref: Vec<&str> = self
             .active_reference_mechanisms
@@ -1008,6 +1051,21 @@ impl OperatorContract {
         out.push("mechanisms:".to_string());
         for m in Mechanism::registry() {
             match m.state() {
+                // TASK-257: mDNS is shipped (Enabled) but a per-node OPT-IN, so its preflight line
+                // reflects whether it is ACTIVE HERE - ENABLED (active on this node) vs AVAILABLE
+                // (opt-in, not active) - rather than a bare static "ENABLED" on every node. This
+                // keeps a default-OFF node from reading as if it multicasts.
+                MechanismState::Enabled if m == Mechanism::LanMdns => {
+                    if self.lan_mdns_enabled {
+                        out.push(format!("  {} = ENABLED (active on this node)", m.as_str()));
+                    } else {
+                        out.push(format!(
+                            "  {} = AVAILABLE (opt-in, not active: pass --libp2p-mdns to enable \
+                             LAN peer-address discovery)",
+                            m.as_str()
+                        ));
+                    }
+                }
                 MechanismState::Enabled => out.push(format!("  {} = ENABLED", m.as_str())),
                 MechanismState::PendingUnsupported { evidence } => out.push(format!(
                     "  {} = PENDING (non-selectable): {}",
@@ -1015,6 +1073,17 @@ impl OperatorContract {
                     evidence
                 )),
             }
+        }
+        // TASK-257 EXPOSURE (AC#6): before any networking is enabled, preflight must state the LAN
+        // disclosure mDNS causes so the operator sees it up front. Only when active.
+        if self.lan_mdns_enabled {
+            out.push(
+                "  EXPOSURE (lan-mdns): this node opens a link-local mDNS multicast socket and \
+                 DISCLOSES its presence + NodeId to every device on the LAN. This is axis-1 LOCAL \
+                 discovery only - it supplies peer ADDRESSES into the kad bootstrap path and does \
+                 NOT serve, announce, publish, or join any public substrate."
+                    .to_string(),
+            );
         }
         if !self.selected_mechanisms.is_empty() {
             let sel: Vec<&str> = self
@@ -1449,12 +1518,16 @@ mod tests {
     // ---- AC#8: pending mechanisms are non-selectable --------------------
 
     #[test]
-    fn libp2p_pair_is_enabled_everything_else_pending() {
+    fn libp2p_pair_and_mdns_enabled_everything_else_pending() {
+        // The always-on primary AND the shipped mDNS bootstrap (TASK-257) are selectable.
         assert!(Mechanism::Libp2pKadDiscovery.is_selectable());
         assert!(Mechanism::Libp2pNarTransfer.is_selectable());
+        assert!(
+            Mechanism::LanMdns.is_selectable(),
+            "lan-mdns is shipped (TASK-257) and must be selectable"
+        );
         for m in [
             Mechanism::IrohTransport,
-            Mechanism::LanMdns,
             Mechanism::DnsPkarr,
             Mechanism::MainlineDht,
             Mechanism::BitTorrent,
@@ -1468,6 +1541,61 @@ mod tests {
                 MechanismState::Enabled => panic!("{} unexpectedly enabled", m.as_str()),
             }
         }
+    }
+
+    /// TASK-257 default-OFF honesty (AC#6): mDNS is SELECTABLE, but a node that did NOT pass
+    /// `--libp2p-mdns` must NOT report lan-mdns as active on --status/preflight, and its exposure
+    /// line must read `none`. Enabling it (the ONLY change) flips both — the report matches the
+    /// wire. Proven by mutation: if `mechanism_active_here`/`lan_mdns_enabled` were ignored, the
+    /// OFF node would already list lan-mdns and this test reddens.
+    #[test]
+    fn mdns_is_surfaced_only_when_enabled_on_this_node() {
+        let rt = StatusInputs {
+            node_id: "12D3KooW…".to_string(),
+            bootstrap_total: 0,
+            bootstrap_healthy: 0,
+            holder_count: None,
+            path: PeerPath::None,
+            last_lookup: None,
+            announce_budget_used: 0,
+            derive_budget_global: None,
+            fallback_reason: String::new(),
+        };
+        let off = OperatorContract::for_profile(SharingProfile::ConsumeOnly);
+        assert!(!off.lan_mdns_enabled, "default is OFF");
+        assert!(
+            !off.status(&rt).contains("lan-mdns"),
+            "a default-OFF node must NOT list lan-mdns as an enabled mechanism"
+        );
+        assert!(
+            off.status(&rt).contains("lan_mdns_exposure=none"),
+            "a default-OFF node's LAN mDNS exposure must be `none`"
+        );
+        assert!(
+            off.preflight().contains("lan-mdns = AVAILABLE"),
+            "preflight must show mDNS as available-but-not-active when off"
+        );
+
+        let mut on = OperatorContract::for_profile(SharingProfile::ConsumeOnly);
+        on.lan_mdns_enabled = true;
+        on.selected_mechanisms.push(Mechanism::LanMdns);
+        on.validate()
+            .expect("selecting the ENABLED lan-mdns mechanism must validate");
+        assert!(
+            on.status(&rt).contains("lan-mdns"),
+            "an mDNS-enabled node must list lan-mdns among enabled mechanisms"
+        );
+        assert!(
+            on.status(&rt)
+                .contains("lan_mdns_exposure=presence+node_id-disclosed-to-lan"),
+            "an mDNS-enabled node must disclose its LAN presence+NodeId exposure on --status"
+        );
+        assert!(
+            on.preflight()
+                .contains("lan-mdns = ENABLED (active on this node)")
+                && on.preflight().contains("EXPOSURE (lan-mdns)"),
+            "preflight must show mDNS active + its LAN exposure when enabled"
+        );
     }
 
     #[test]
