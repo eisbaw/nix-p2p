@@ -12,24 +12,23 @@ happened to land first.
 
 `nix build --rebuild` closes exactly that gap: it rebuilds each derivation and
 compares the result against the output already in the store, failing on any
-difference. That is slow by construction (it rebuilds the 110 MiB payload), so
-it is a dedicated recipe rather than part of the fast loop - and it is a
-REQUIRED step before the J2 measurement baseline is recorded, because a
-baseline taken against accidentally-unique bytes cannot be reproduced by
-anyone, including its author.
+difference. That is slow by construction, so each fixture family has a
+dedicated recipe rather than putting it in the fast loop. For the canonical
+family it is a REQUIRED step before the J2 measurement baseline is recorded;
+for the wide family it separately grounds the frozen workload's build
+repeatability.
 
 Limits worth stating, because task-9 will reuse this:
 
   * --rebuild compares against THIS store's copy, so it proves determinism
     here and now, on one machine. Cross-machine reproducibility is proven by
     nothing in this repository.
-  * It rebuilds each payload's OWN derivation, not its closure. The current
-    workload is leaf-shaped - the payloads are `runCommand`s over stdenv, and
-    the only intra-workload reference is app -> lib, which is itself a payload
-    - so every derivation the workload defines is covered. A payload that grew
-    a first-party dependency would NOT have that dependency rebuilt here, and
-    this list would need extending. Stated rather than assumed, because the
-    gap is invisible while the shape holds.
+  * It rebuilds each payload's OWN derivation, not an arbitrary transitive
+    closure. The canonical lock exposes app, big, lib, and zstd; the wide lock
+    exposes all 128 members plus its root. Thus every first-party derivation
+    currently defined by either fixture family is explicitly rebuilt. If an
+    unpinned first-party dependency is added later, the lock and this coverage
+    claim must be extended.
   * It checks that the payloads the LOCK pins rebuild identically. It does not
     re-derive the fixture cache; scripts/check-fixtures.py owns that.
 
@@ -40,6 +39,7 @@ nothing was proven (including a store where a payload was never realised).
 
 from __future__ import annotations
 
+import argparse
 import os
 import subprocess
 import sys
@@ -52,13 +52,14 @@ import fixturelib as fx
 # large payload is exactly what a measurement baseline depends on. The lock is
 # the AUTHORITATIVE one INSIDE the published generation (current -> gen/lock.json),
 # not the demoted git baseline - check-rebuild is runtime/consistency code.
-def published_lock(repo: Path) -> dict:
-    out_root = repo / "fixtures" / "out"
+def published_lock(repo: Path, wide: bool = False) -> dict:
+    out_root = repo / "fixtures" / ("out-wide" if wide else "out")
     generation = fx.resolve_current(out_root)
     if generation is None:
+        recipe = "just fixtures-wide" if wide else "just fixtures-large"
         fail(
             f"nothing published at {out_root / fx.CURRENT_LINK} - generate first with "
-            "`just fixtures` / `just fixtures-large`",
+            f"`{recipe}`",
             code=2,
         )
     return fx.load_generation_lock(generation)
@@ -97,11 +98,50 @@ def nix_build(repo: Path, attr: str, rebuild: bool):
 
 
 def main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--wide",
+        action="store_true",
+        help="rebuild the independent wide_closure fixture family",
+    )
+    args = parser.parse_args()
     repo = fx.repo_root()
-    lock = published_lock(repo)
+    lock = published_lock(repo, args.wide)
+    pinned_tiers = {payload["tier"] for payload in lock["paths"].values()}
+    is_wide_lock = lock.get("fixture_class") == fx.FIXTURE_CLASS_WIDE
+    if args.wide and (not is_wide_lock or pinned_tiers != {fx.TIER_WIDE}):
+        fail(
+            "--wide selected fixtures/out-wide, but its published lock is not an "
+            "all-wide wide_closure lock; regenerate with `just fixtures-wide`",
+            code=2,
+        )
+    if not args.wide and (
+        is_wide_lock or not pinned_tiers <= {fx.TIER_FAST, fx.TIER_FULL}
+    ):
+        fail(
+            "canonical rebuild selected fixtures/out, but its published lock is "
+            "not canonical fast/full; regenerate with `just fixtures-large`",
+            code=2,
+        )
     attrs = sorted(lock["paths"])
-    if not attrs:
-        fail("the lock pins no payloads; nothing to rebuild", code=2)
+    expected_attrs = (
+        {fx.WIDE_ROOT_ATTR}
+        | {
+            f"{fx.WIDE_MEMBER_PREFIX}{index:03d}"
+            for index in range(fx.WIDE_MEMBER_COUNT)
+        }
+        if args.wide
+        else {"app", "big", "lib", "zstd"}
+    )
+    if set(attrs) != expected_attrs:
+        fail(
+            f"the selected {'wide_closure' if args.wide else 'canonical full'} lock "
+            "does not pin the exact frozen rebuild set: "
+            f"missing={sorted(expected_attrs - set(attrs))}, "
+            f"extra={sorted(set(attrs) - expected_attrs)}. Regenerate with "
+            f"`{'just fixtures-wide' if args.wide else 'just fixtures-large'}`",
+            code=2,
+        )
 
     for attr in attrs:
         # REALISE FIRST. `nix build --rebuild` on a store where the output was
@@ -139,17 +179,23 @@ def main() -> int:
         print(f"check-rebuild: rebuilding fixture-{attr} ...", flush=True)
         result = nix_build(repo, attr, rebuild=True)
         if result.returncode != 0:
+            consequence = (
+                "the frozen wide_closure workload would not be repeatable"
+                if args.wide
+                else "the J2 baseline would be unreproducible"
+            )
             fail(
                 f"fixture-{attr} did not rebuild to the same output:\n"
                 f"{result.stderr.strip()}\n\n"
                 "The payload is NONDETERMINISTIC. The frozen workload currently "
-                "rests on whichever bytes were realised first, so the J2 baseline "
-                "would be unreproducible. Fix the derivation before recording any "
-                "measurement against this workload."
+                f"rests on whichever bytes were realised first, so {consequence}. "
+                "Fix the derivation before relying on this workload."
             )
+    family = "wide_closure" if args.wide else "canonical"
     print(
         f"check-rebuild: ok - {len(attrs)} payload(s) rebuilt to identical outputs "
-        f"and match the store paths pinned in the lock ({', '.join(attrs)}). "
+        f"and match the store paths pinned in the {family} lock "
+        f"({', '.join(attrs)}). "
         "Proven on THIS machine; cross-machine reproducibility remains unverified."
     )
     return 0

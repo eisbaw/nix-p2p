@@ -12,21 +12,26 @@ Determinism is the point of the `irreversible` label on task-3, so be exact
 about which of three different claims each check earns:
 
   * EXPORT repeatability - re-serialising, recompressing and re-signing
-    already-realised store paths gives identical bytes. `just test` proves
-    this by regenerating and diffing.
+    already-realised store paths gives identical portable fixture identity.
+    `just test` proves this for the canonical family; `just fixtures-wide`
+    proves it for the independent wide family while treating only local
+    allocated-byte observations as filesystem-specific.
   * BUILD determinism - the derivations themselves produce the same output
     twice. NOT covered above: regeneration finds the payloads already in the
     store and never rebuilds them, so a nondeterministic payload would be
-    realised once and pass forever. `just fixtures-verify-rebuild` covers it,
-    and is required before the J2 baseline is recorded.
+    realised once and pass forever. `just fixtures-verify-rebuild` covers the
+    canonical family and is required before the J2 baseline is recorded;
+    `just fixtures-wide-verify-rebuild` covers the wide family.
   * Cross-host / cross-nixpkgs reproducibility - NOT verified anywhere, and
-    not claimed. fixtures/workload.lock.json is the instrument for that case:
-    it fails loudly when the workload moves for any reason.
+    not claimed. The selected family's tracked review baseline
+    (`fixtures/workload.lock.json` or `fixtures/wide_closure.lock.json`) is the
+    instrument for that case: it fails loudly when the workload moves.
 
 Every assertion below is fatal rather than a warning, because a fixture that
-is subtly wrong is worse than no fixture: the J2 egress baseline is frozen
-against this workload and a silent change makes every cross-wave comparison
-meaningless without anything looking broken.
+is subtly wrong is worse than no fixture. The canonical J2 egress baseline is
+frozen against its four-path workload; the independent wide baseline is frozen
+against `wide_closure`. Silent drift invalidates results tied to the affected
+family without anything looking broken.
 
 PUBLICATION is immutable generations plus one atomic symlink flip, and the
 AUTHORITATIVE lock lives INSIDE the generation:
@@ -45,12 +50,13 @@ reconciliation but DELETING the second source. Crash consistency is therefore
 not "windowless via a clever read-back"; it is that there is nothing to split:
 kill before the flip -> old-complete, kill after -> new-complete.
 
-The git-tracked fixtures/workload.lock.json is DEMOTED to a review artifact:
-byte-identical content, but read only by the freeze/--write-lock path
-(assert_matches_baseline, prepare_baseline) and written only at --write-lock,
-AFTER publication. Its lag is fine and visible in git. Every runtime/gate reader
-resolves the lock through `current -> gen-<sha>/lock.json`; that boundary is
-enforced by scripts/check-lock-sources.py.
+The selected git-tracked baseline (`fixtures/workload.lock.json` for canonical,
+`fixtures/wide_closure.lock.json` for wide) is DEMOTED to a review artifact.
+It is read only by the freeze/--write-lock path (assert_matches_baseline,
+prepare_baseline) and written only at --write-lock, AFTER publication. Its lag
+is fine and visible in git. Every runtime/gate reader resolves the lock through
+`current -> gen-<sha>/lock.json`; that boundary is enforced by
+scripts/check-lock-sources.py.
 
 A failed run leaves its generation on disk, named and inspectable, and the next
 successful publication collects it.
@@ -79,7 +85,7 @@ import subprocess
 import sys
 import time
 from contextlib import contextmanager
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 
 import fixturelib as fx
 
@@ -101,10 +107,22 @@ FAST_PLAN = [
 LARGE_PLAN = [
     ("big", "none"),
 ]
+WIDE_MEMBER_ATTRS = tuple(
+    f"{fx.WIDE_MEMBER_PREFIX}{index:03d}" for index in range(fx.WIDE_MEMBER_COUNT)
+)
+WIDE_PLAN = [(attr, "none") for attr in WIDE_MEMBER_ATTRS] + [
+    (fx.WIDE_ROOT_ATTR, "none")
+]
 
 
-def plan_for(include_large: bool):
-    return FAST_PLAN + (LARGE_PLAN if include_large else [])
+def plan_for(tier: str):
+    if tier == fx.TIER_FAST:
+        return FAST_PLAN
+    if tier == fx.TIER_FULL:
+        return FAST_PLAN + LARGE_PLAN
+    if tier == fx.TIER_WIDE:
+        return WIDE_PLAN
+    fail(f"unknown fixture tier {tier!r}", code=2)
 
 
 def tier_of(attr: str) -> str:
@@ -120,8 +138,10 @@ def tier_of(attr: str) -> str:
         return fx.TIER_FULL
     if attr in {a for a, _ in FAST_PLAN}:
         return fx.TIER_FAST
+    if attr in {a for a, _ in WIDE_PLAN}:
+        return fx.TIER_WIDE
     fail(
-        f"payload {attr!r} is in neither FAST_PLAN nor LARGE_PLAN, so which tier "
+        f"payload {attr!r} is in no fixture plan, so which tier "
         "must contain it is undefined. Add it to a plan; do not let it default."
     )
 
@@ -152,16 +172,18 @@ def fail(message: str, code: int = 1) -> None:
 
 
 def note(message: str, stream=None) -> None:
-    """Report something that must NEVER change the outcome.
+    """Report a diagnostic whose output failure must NEVER poison success.
 
-    Used only once the publication is committed. Writing to a stream can fail
-    on its own - EPIPE when the caller closed the pipe (`gen-fixtures | head`),
-    ENOSPC on a full disk - and at that point the generation and the lock are
-    both on disk. Letting a message that could not be delivered turn a
-    completed publication into a non-zero exit reports a state that did not
-    happen, which is the same class of lie as the rollback that used to fire
-    when commit_lock's own success line failed to print. This is the one place
-    in this file where suppressing an OSError is the correct thing to do.
+    Used after publication is committed and on non-fatal pre-flip paths that
+    continue toward a possible successful publication or return. Writing to a
+    stream can fail on its own - EPIPE when the caller closed the pipe
+    (`gen-fixtures | head`), ENOSPC on a full disk. Letting that diagnostic turn
+    an existing or later committed publication into a non-zero exit reports a
+    state that did not happen, which is the same class of lie as the rollback
+    that used to fire when commit_lock's own success line failed to print. This
+    is the one place in this file where suppressing an OSError is correct. It is
+    deliberately not used while a real failure unwinds; unwind_warning preserves
+    that later failure channel instead of redirecting it.
 
     Suppressing the write is not enough on its own. The failed write leaves the
     message in the stream's buffer, and CPython exits 120 when its own flush at
@@ -188,8 +210,8 @@ def note(message: str, stream=None) -> None:
                 os.close(devnull)
 
 
-def warn(message: str) -> None:
-    """Report a problem on a PRE-commit path without letting it become one.
+def unwind_warning(message: str) -> None:
+    """Report cleanup trouble while an earlier pre-commit failure unwinds.
 
     Deliberately NOT note(). note() redirects the failing stream to /dev/null
     so the interpreter's shutdown flush cannot fail, and that redirect outlives
@@ -259,6 +281,19 @@ def copy_into_cache(cache: Path, secret_key: Path, store_path: str, compression:
         "--to",
         f"file://{cache}?compression={compression}&secret-key={secret_key}",
         store_path,
+        capture=False,
+    )
+
+
+def copy_many_into_cache(
+    cache: Path, secret_key: Path, store_paths: list[str], compression: str
+):
+    """Copy same-compression independent members in one pinned-Nix invocation."""
+    nix(
+        "copy",
+        "--to",
+        f"file://{cache}?compression={compression}&secret-key={secret_key}",
+        *store_paths,
         capture=False,
     )
 
@@ -346,9 +381,50 @@ def assert_no_unplanned_narinfos(cache: Path, store_paths: dict) -> None:
         )
 
 
-def build_into(
-    built: Path, repo: Path, secret_line: str, public_line: str, include_large: bool
-):
+def wide_store_paths(repo: Path) -> dict[str, str]:
+    """Realise the root once and map its store-truth closure to planned attrs."""
+    root_path = build_payload(repo, fx.WIDE_ROOT_ATTR)
+    closure = closure_of([root_path])
+    mapped = {}
+    for attr, _compression in WIDE_PLAN:
+        suffix = f"-nix-p2p-fixture-{attr}"
+        matches = [path for path in closure if Path(path).name.endswith(suffix)]
+        if len(matches) != 1:
+            fail(
+                f"wide closure maps attr {attr!r} to {len(matches)} store paths: "
+                f"{matches}. The Nix definition and generator plan drifted."
+            )
+        mapped[attr] = matches[0]
+    planned = set(mapped.values())
+    if set(closure) != planned:
+        fail(
+            "wide root closure contains unplanned store paths: "
+            f"{sorted(set(closure) - planned)}"
+        )
+    return mapped
+
+
+def assert_wide_store_contract(store_paths: dict[str, str]) -> None:
+    """Prove the fanout from Nix store truth before any cache metadata exists."""
+    closure = closure_of([store_paths[fx.WIDE_ROOT_ATTR]])
+    root_info = closure[store_paths[fx.WIDE_ROOT_ATTR]]
+    member_paths = {store_paths[attr] for attr in WIDE_MEMBER_ATTRS}
+    root_references = set(root_info.get("references", []))
+    if root_references != member_paths:
+        fail(
+            "wide root direct references differ from its 128 members: "
+            f"missing={sorted(member_paths - root_references)}, "
+            f"extra={sorted(root_references - member_paths)}"
+        )
+    if set(closure) != member_paths | {store_paths[fx.WIDE_ROOT_ATTR]}:
+        fail("wide recursive closure is not exactly root plus all members")
+    for attr in WIDE_MEMBER_ATTRS:
+        references = closure[store_paths[attr]].get("references", [])
+        if references:
+            fail(f"wide member {attr!r} unexpectedly references {references}")
+
+
+def build_into(built: Path, repo: Path, secret_line: str, public_line: str, tier: str):
     """Realise, sign and copy every planned payload into `built`.
 
     `built.mkdir` is deliberately NOT exist_ok: the build directory carries a
@@ -373,15 +449,30 @@ def build_into(
 
     cache_info = write_cache_info(cache)
 
-    plan = plan_for(include_large)
-    store_paths = {}
-    for attr, _compression in plan:
-        store_paths[attr] = build_payload(repo, attr)
+    plan = plan_for(tier)
+    if tier == fx.TIER_WIDE:
+        store_paths = wide_store_paths(repo)
+        assert_wide_store_contract(store_paths)
+    else:
+        store_paths = {}
+        for attr, _compression in plan:
+            store_paths[attr] = build_payload(repo, attr)
     # Checked over the whole closure before anything is signed, not per root
     # after each copy: the point is to know what will be transferred.
     assert_closure_is_planned(store_paths)
-    for attr, compression in plan:
-        copy_into_cache(cache, secret_key, store_paths[attr], compression)
+    if tier == fx.TIER_WIDE:
+        copy_many_into_cache(
+            cache,
+            secret_key,
+            [store_paths[attr] for attr in WIDE_MEMBER_ATTRS],
+            "none",
+        )
+        # Root last: a closure copy before the members exist would choose the
+        # root's compression for every member.
+        copy_into_cache(cache, secret_key, store_paths[fx.WIDE_ROOT_ATTR], "none")
+    else:
+        for attr, compression in plan:
+            copy_into_cache(cache, secret_key, store_paths[attr], compression)
     assert_no_unplanned_narinfos(cache, store_paths)
 
     # Re-read every narinfo from disk AFTER the whole plan has run, and build
@@ -406,7 +497,7 @@ def build_into(
             "would silently fall back to client defaults."
         )
 
-    if include_large:
+    if tier == fx.TIER_FULL:
         nar_size = int(
             fx.field(next(e for e in entries if e[0] == "big")[3], "NarSize")
         )
@@ -418,8 +509,8 @@ def build_into(
     return entries
 
 
-def read_workload_version(repo: Path) -> str:
-    """Read WORKLOAD_VERSION, insisting it needs no normalisation.
+def read_workload_version(repo: Path, tier: str) -> str:
+    """Read the selected family's version, insisting on one clean line.
 
     flake.nix strips only a newline while this strips all whitespace, so a
     trailing space would give Nix `"...-v1 "` - baked into every payload's
@@ -428,15 +519,21 @@ def read_workload_version(repo: Path) -> str:
     Rejecting anything but exactly one clean line makes the two normalisations
     provably equivalent instead of coincidentally so.
     """
+    if tier == fx.TIER_WIDE:
+        version_file = "WIDE_WORKLOAD_VERSION"
+    elif tier in (fx.TIER_FAST, fx.TIER_FULL):
+        version_file = "WORKLOAD_VERSION"
+    else:
+        raise ValueError(f"unknown fixture tier {tier!r}")
     # Read through the anchored fixtures descriptor for the same reason the
-    # lock is: it is the other file that defines the frozen workload, and it is
-    # embedded in every payload's seed.
+    # lock is: this file defines the frozen workload and is embedded in every
+    # payload's seed.
     with fx.anchored_fixtures_dir(repo) as fixtures_fd:
-        raw = fx.read_at(fixtures_fd, "WORKLOAD_VERSION")
+        raw = fx.read_at(fixtures_fd, version_file)
     version = raw.strip()
     if raw != version + "\n" or not version:
         fail(
-            f"fixtures/WORKLOAD_VERSION must be exactly one line with no leading or "
+            f"fixtures/{version_file} must be exactly one line with no leading or "
             f"trailing whitespace; got {raw!r}",
             code=2,
         )
@@ -444,7 +541,7 @@ def read_workload_version(repo: Path) -> str:
 
 
 def reusable(
-    out_dir: Path, repo: Path, version: str, public_line: str, include_large: bool
+    out_dir: Path, repo: Path, version: str, public_line: str, tier: str
 ) -> bool:
     """True when the PUBLISHED generation already IS the requested workload.
 
@@ -470,7 +567,8 @@ def reusable(
         return False
     if manifest.get("public_key") != public_line:
         return False
-    if include_large and manifest.get("tier") != fx.TIER_FULL:
+    actual_tier = manifest.get("tier")
+    if actual_tier not in fx.TIERS or not fx.tier_satisfies(actual_tier, tier):
         return False
     # EVERY class of tree defect the gate can reject, checked here too - blob
     # hashes included. The old rationale for skipping them ("re-hashing 110 MiB
@@ -501,6 +599,7 @@ def reusable(
             or fx.lock_problems(manifest, lock)
             or fx.completeness_problems(cache, manifest)
             or fx.blob_problems(cache, manifest)
+            or fx.wide_disk_problems(cache, manifest)
         ):
             return False
     except (OSError, fx.LockError):
@@ -647,10 +746,10 @@ def publication_lock(out_dir: Path):
 def anchored_publication(out_dir: Path):
     """Resolve the publication root ONCE and hold descriptors on it.
 
-    Yields (generations_path, generations_fd). Everything destructive is done
-    relative to the descriptor; the path is carried for messages and for the
-    two places a real path must be handed to another process, each guarded by
-    assert_anchor_intact.
+    Yields (out_fd, generations_path, generations_fd). Everything destructive
+    is done relative to those descriptors; the path is carried for messages and
+    for the two places a real path must be handed to another process, each
+    guarded by assert_anchor_intact.
 
     This is the sweep, not a patch: O_NOFOLLOW only ever guarded the FINAL
     component of a path, so every ancestor was still followed on every call.
@@ -664,11 +763,229 @@ def anchored_publication(out_dir: Path):
     try:
         generations_fd = fx.open_dir(fx.GENERATIONS_DIR, dir_fd=out_fd)
         try:
-            yield generations, generations_fd
+            yield out_fd, generations, generations_fd
         finally:
             os.close(generations_fd)
     finally:
         os.close(out_fd)
+
+
+def ownership_marker_problem(directory_fd: int, display: Path) -> str | None:
+    """Return why an anchored directory lacks a plain ownership marker."""
+    try:
+        marker_fd = os.open(
+            fx.OUT_MARKER,
+            os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW | os.O_CLOEXEC,
+            dir_fd=directory_fd,
+        )
+    except OSError as error:
+        return f"{display} has no plain {fx.OUT_MARKER} ownership marker ({error})"
+    try:
+        if not stat.S_ISREG(os.fstat(marker_fd).st_mode):
+            return f"{display / fx.OUT_MARKER} is not a regular file"
+    finally:
+        os.close(marker_fd)
+    return None
+
+
+def require_ownership_marker(directory_fd: int, display: Path) -> None:
+    """Require a plain marker in an already-open directory, without following it."""
+    problem = ownership_marker_problem(directory_fd, display)
+    if problem is not None:
+        fail(
+            f"{problem}; refusing to collect anything from a foreign directory",
+            code=2,
+        )
+
+
+@contextmanager
+def anchored_existing_publication(out_dir: Path):
+    """Anchor an existing owned publication without creating or repairing it."""
+    try:
+        out_fd = fx.open_dir(out_dir)
+    except OSError as error:
+        fail(f"cannot anchor existing fixture publication {out_dir}: {error}", code=2)
+    try:
+        require_ownership_marker(out_fd, out_dir)
+        try:
+            generations_fd = fx.open_dir(fx.GENERATIONS_DIR, dir_fd=out_fd)
+        except OSError as error:
+            fail(
+                f"{out_dir / fx.GENERATIONS_DIR} is missing, is not a plain "
+                f"directory, or is a symlink ({error}); refusing collection",
+                code=2,
+            )
+        try:
+            yield out_fd, out_dir / fx.GENERATIONS_DIR, generations_fd
+        finally:
+            os.close(generations_fd)
+    finally:
+        os.close(out_fd)
+
+
+def retained_generation_at(
+    out_fd: int,
+    generations_fd: int,
+    out_dir: Path,
+    link_name: str,
+    *,
+    strict: bool = True,
+) -> str | None:
+    """Resolve one publication link relative to held descriptors.
+
+    Collection is strict because a bad anchor must stop every deletion. Generation
+    is tolerant because a bad link is precisely what publishing a new `current`
+    repairs; it uses the same descriptor parser with ``strict=False`` and retains
+    only names this function could prove safe before the atomic flip.
+    """
+
+    def refuse(message: str) -> None:
+        if strict:
+            fail(message, code=2)
+
+    try:
+        link_info = os.stat(link_name, dir_fd=out_fd, follow_symlinks=False)
+    except FileNotFoundError:
+        return None
+    except OSError as error:
+        refuse(f"cannot inspect {out_dir / link_name}: {error}")
+        return None
+    if not stat.S_ISLNK(link_info.st_mode):
+        refuse(f"{out_dir / link_name} exists and is not a symlink")
+        return None
+    try:
+        target_text = os.readlink(link_name, dir_fd=out_fd)
+    except OSError as error:
+        refuse(f"cannot read {out_dir / link_name}: {error}")
+        return None
+    target = PurePosixPath(target_text)
+    if (
+        target.as_posix() != target_text
+        or len(target.parts) != 2
+        or target.parts[0] != fx.GENERATIONS_DIR
+        or not target.parts[1].startswith("gen-")
+    ):
+        refuse(
+            f"{out_dir / link_name} has malformed or unconfined target "
+            f"{target_text!r}; expected generations/gen-..."
+        )
+        return None
+    name = target.parts[1]
+    try:
+        generation_fd = fx.open_dir(name, dir_fd=generations_fd)
+    except OSError as error:
+        refuse(
+            f"{out_dir / link_name} points at missing, symlinked, or non-directory "
+            f"generation {name!r} ({error})"
+        )
+        return None
+    try:
+        marker_problem = ownership_marker_problem(
+            generation_fd, out_dir / fx.GENERATIONS_DIR / name
+        )
+        if marker_problem is not None:
+            refuse(f"{marker_problem}; refusing to retain an unowned generation")
+            return None
+    finally:
+        os.close(generation_fd)
+    return name
+
+
+def retained_generations_at(
+    out_fd: int,
+    generations_fd: int,
+    out_dir: Path,
+) -> set[str]:
+    """Resolve strict current+previous anchors for deletion-capable collection."""
+    current = retained_generation_at(out_fd, generations_fd, out_dir, fx.CURRENT_LINK)
+    previous = retained_generation_at(out_fd, generations_fd, out_dir, fx.PREVIOUS_LINK)
+    if current is None:
+        fail(
+            f"{out_dir} exists but has no {fx.CURRENT_LINK} publication link; "
+            "refusing to collect without an active-generation anchor",
+            code=2,
+        )
+    return {current} | ({previous} if previous is not None else set())
+
+
+def generator_retention_at(
+    out_fd: int,
+    generations_fd: int,
+    out_dir: Path,
+) -> tuple[str | None, str | None, bool]:
+    """Snapshot tolerant anchors and whether an existing previous needs repair.
+
+    ``None`` is a valid result for an absent ``previous`` link, but an existing
+    malformed/dangling link must not collapse to that same state: warm reuse
+    otherwise returns success while leaving strict collection inoperable. The
+    third result distinguishes that invalid-link case without weakening the
+    collector's fail-closed resolver.
+    """
+    try:
+        os.stat(fx.PREVIOUS_LINK, dir_fd=out_fd, follow_symlinks=False)
+    except FileNotFoundError:
+        previous_present = False
+    except OSError:
+        # An entry that cannot be inspected is not safely equivalent to an
+        # absent optional link. Let the generator's atomic repair either replace
+        # it or fail before reporting warm reuse as successful.
+        previous_present = True
+    else:
+        previous_present = True
+
+    current = retained_generation_at(
+        out_fd,
+        generations_fd,
+        out_dir,
+        fx.CURRENT_LINK,
+        strict=False,
+    )
+    previous = retained_generation_at(
+        out_fd,
+        generations_fd,
+        out_dir,
+        fx.PREVIOUS_LINK,
+        strict=False,
+    )
+    return current, previous, previous_present and previous is None
+
+
+def collect_only(out_dir: Path) -> None:
+    """Collect one existing fixture root under the normal publication lock."""
+    if out_dir.is_symlink():
+        fail(f"--out {out_dir} is a symlink; refusing collection through it", code=2)
+    if not os.path.lexists(out_dir):
+        note(f"gen-fixtures: no publication root at {out_dir}; nothing to collect")
+        return
+    with publication_lock(out_dir):
+        # The root may disappear while this process waits for a publisher. That
+        # is still an absent-root no-op, and must not recreate it.
+        if not os.path.lexists(out_dir):
+            note(f"gen-fixtures: no publication root at {out_dir}; nothing to collect")
+            return
+        if out_dir.is_symlink():
+            fail(
+                f"--out {out_dir} became a symlink while waiting for the publication "
+                "lock; refusing collection",
+                code=2,
+            )
+        with anchored_existing_publication(out_dir) as (
+            out_fd,
+            generations,
+            generations_fd,
+        ):
+            keep = retained_generations_at(out_fd, generations_fd, out_dir)
+            refusals = collect_generations(generations_fd, generations, keep)
+            if refusals:
+                fail(
+                    "fixture collection was incomplete; inspect the refused "
+                    "directories before retrying:\n  - " + "\n  - ".join(refusals),
+                    code=2,
+                )
+    note(
+        f"gen-fixtures: collected unreferenced generations under {out_dir}; "
+        f"retained {sorted(keep)}"
+    )
 
 
 def assert_anchor_intact(anchor_fd: int, path: Path) -> None:
@@ -690,13 +1007,13 @@ def assert_anchor_intact(anchor_fd: int, path: Path) -> None:
 
 def generate(
     out_dir: Path,
-    include_large: bool,
+    tier: str,
     write_lock: bool = False,
     retire_baseline: bool = False,
 ) -> None:
     repo = fx.repo_root()
     _name, _private, secret_line, public_line = fx.keypair()
-    version = read_workload_version(repo)
+    version = read_workload_version(repo, tier)
     assert_safe_out_dir(out_dir, repo)
 
     # No git-baseline read here any more. The derived public key is compared
@@ -709,20 +1026,57 @@ def generate(
     with (
         publication_lock(out_dir),
         anchored_publication(out_dir) as (
+            out_fd,
             generations,
             generations_fd,
         ),
     ):
-        if not write_lock and reusable(
-            out_dir, repo, version, public_line, include_large
+        current_before, previous_before, previous_invalid = generator_retention_at(
+            out_fd, generations_fd, out_dir
+        )
+        if (
+            not write_lock
+            and current_before is not None
+            and reusable(out_dir, repo, version, public_line, tier)
         ):
+            if previous_invalid:
+                # Missing previous is a valid one-generation state. An existing
+                # malformed/dangling previous is not: repair it before collection
+                # and before claiming this warm publication was successfully
+                # reused, so strict collect-only can immediately operate on it.
+                stamp = f"{time.time_ns()}-{os.getpid()}"
+                assert_anchor_intact(out_fd, out_dir)
+                try:
+                    point_link_at(
+                        out_dir,
+                        fx.PREVIOUS_LINK,
+                        current_before,
+                        f"{stamp}-reuse-prev",
+                    )
+                except OSError as error:
+                    fail(
+                        "could not repair the malformed previous retention link "
+                        f"({error}). {out_dir / fx.CURRENT_LINK} remains published "
+                        f"as {current_before!r}, but warm reuse was not completed.",
+                        code=2,
+                    )
+                previous_before = current_before
+            retained_before = {
+                name for name in (current_before, previous_before) if name is not None
+            }
             current = fx.resolve_current(out_dir)
             # Collect here too. collect_generations used to run only from
             # publish(), so on a warm tree - the common case, since `just test`
             # reuses - a generation stranded by a failed flip and a .building.*
             # left by a SIGKILL accumulated forever at 110 MiB each, silently,
             # because the warning lives in publish() as well.
-            collect_generations(generations_fd, generations, retained(out_dir, current))
+            report_collection_refusals(
+                collect_generations(
+                    generations_fd,
+                    generations,
+                    retained_before,
+                )
+            )
             # note(), not print(): reuse changed nothing and the published tree
             # is valid, so a stream this cannot be written to must not turn a
             # correct state into a non-zero exit.
@@ -736,12 +1090,14 @@ def generate(
             # `nix copy` needs a real path, so the anchor is re-checked here -
             # the one place a path leaves this process during publication.
             assert_anchor_intact(generations_fd, generations)
-            entries = build_into(
-                building, repo, secret_line, public_line, include_large
-            )
-            manifest = write_manifest(
-                building, version, public_line, include_large, entries
-            )
+            entries = build_into(building, repo, secret_line, public_line, tier)
+            # st_blocks can settle when freshly-created cache files receive
+            # their canonical metadata.  Wide disk evidence is sampled only
+            # after that operation; the later whole-tree normalisation is then
+            # idempotent for cache/ and cannot invalidate its own manifest.
+            if tier == fx.TIER_WIDE:
+                fx.normalise_tree(building, secret_names=frozenset({SECRET_KEY_NAME}))
+            manifest = write_manifest(building, version, public_line, tier, entries)
             # STEP 1b: write the AUTHORITATIVE lock INSIDE the generation. This
             # is the round-8 change: the lock the runtime and the gate resolve
             # is gen-<sha>/lock.json, committed atomically with the tree by the
@@ -751,7 +1107,21 @@ def generate(
                 json.dumps(lock_dict_from_manifest(manifest), indent=2, sort_keys=True)
                 + "\n"
             )
-            fx.normalise_tree(building, secret_names=frozenset({SECRET_KEY_NAME}))
+            if tier == fx.TIER_WIDE:
+                # cache/ was normalised before its filesystem-local st_blocks
+                # evidence was sampled. Touching it again can legitimately
+                # change extent accounting, so normalise only the two files
+                # created since then and the root directory they entered.
+                for metadata_file in (
+                    building / "manifest.json",
+                    building / fx.GEN_LOCK_NAME,
+                ):
+                    metadata_file.chmod(fx.TREE_FILE_MODE)
+                    os.utime(metadata_file, (fx.TREE_MTIME, fx.TREE_MTIME))
+                building.chmod(fx.TREE_DIR_MODE)
+                os.utime(building, (fx.TREE_MTIME, fx.TREE_MTIME))
+            else:
+                fx.normalise_tree(building, secret_names=frozenset({SECRET_KEY_NAME}))
 
             # STEP 2: validate it FULLY, before it becomes a generation. Blob
             # self-consistency is checked in both modes - it compares the tree
@@ -774,7 +1144,14 @@ def generate(
 
             # STEP 4: publish - ONE symlink flip, no rollback, no read-back.
             name = install_generation(building, generations, generations_fd, stamp)
-            published = publish(out_dir, generations, generations_fd, name)
+            published = publish(
+                out_dir,
+                generations,
+                generations_fd,
+                name,
+                current_before,
+                previous_before,
+            )
 
             # STEP 5: reconcile the DEMOTED git baseline, AFTER publication and
             # only at --write-lock. Publication is already committed; a failure
@@ -784,16 +1161,17 @@ def generate(
                 try:
                     write_baseline(repo, baseline)
                     note(
-                        f"gen-fixtures: rewrote {fx.lock_path(repo)} - commit it as a "
+                        f"gen-fixtures: rewrote {fx.lock_path(repo, tier)} - commit it as a "
                         "reviewed diff"
                     )
-                except OSError as error:
-                    warn(
+                except (OSError, fx.LockError) as error:
+                    note(
                         f"gen-fixtures: {published.name} is PUBLISHED and authoritative, "
-                        f"but the git baseline {fx.lock_path(repo)} could not be "
+                        f"but the git baseline {fx.lock_path(repo, tier)} could not be "
                         f"updated ({error}). The baseline now lags the published "
                         "workload; this is visible in git status and reconciled by "
-                        "re-running with --write-lock. Nothing was rolled back."
+                        "re-running with --write-lock. Nothing was rolled back.",
+                        sys.stderr,
                     )
         except BaseException:
             # Catches EVERYTHING, including the SystemExit that fail() raises
@@ -802,7 +1180,6 @@ def generate(
             # failure that caused the unwind.
             remove_build_directory(generations_fd, generations, building.name)
             raise
-    tier = "full" if include_large else "fast"
     note(f"gen-fixtures: {version} tier={tier} paths={len(entries)} -> {published}")
 
 
@@ -820,9 +1197,11 @@ def remove_build_directory(generations_fd: int, generations: Path, name: str) ->
     except Exception as error:  # noqa: BLE001 - unwinding path, see docstring
         refusal = f"{error}"
     if refusal is not None:
-        # warn(), not note(): this runs while unwinding, and note()'s /dev/null
-        # redirect would swallow the failure report that follows it.
-        warn(f"gen-fixtures: WARNING - left {generations / name} in place: {refusal}")
+        # unwind_warning(), not note(): this runs while unwinding, and note()'s
+        # /dev/null redirect would swallow the failure report that follows it.
+        unwind_warning(
+            f"gen-fixtures: WARNING - left {generations / name} in place: {refusal}"
+        )
 
 
 def purge_marked_dir(parent_fd: int, parent: Path, name: str) -> str | None:
@@ -869,18 +1248,24 @@ def purge_marked_dir(parent_fd: int, parent: Path, name: str) -> str | None:
         return f"{error}"
     try:
         try:
-            os.close(
-                os.open(
-                    fx.OUT_MARKER,
-                    os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC,
-                    dir_fd=dir_fd,
-                )
+            marker_fd = os.open(
+                fx.OUT_MARKER,
+                os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW | os.O_CLOEXEC,
+                dir_fd=dir_fd,
             )
         except OSError:
             return (
                 f"it carries no {fx.OUT_MARKER} marker, so this script cannot "
                 "show it created it"
             )
+        try:
+            if not stat.S_ISREG(os.fstat(marker_fd).st_mode):
+                return (
+                    f"its {fx.OUT_MARKER} marker is not a regular file, so this "
+                    "script cannot show it created the directory"
+                )
+        finally:
+            os.close(marker_fd)
         try:
             unlink_contents(dir_fd)
         except OSError as error:
@@ -949,7 +1334,9 @@ def assert_blobs_consistent(built: Path, manifest: dict) -> None:
     that disagrees with the blobs beside it is broken whether or not the
     workload is deliberately changing.
     """
-    problems = fx.blob_problems(built / "cache", manifest)
+    problems = fx.blob_problems(built / "cache", manifest) + fx.wide_disk_problems(
+        built / "cache", manifest
+    )
     if problems:
         fail(
             "the tree just built does not match its own manifest, so it was "
@@ -987,19 +1374,31 @@ def assert_matches_baseline(built: Path, repo: Path, manifest: dict) -> None:
     --write-lock, where the workload is deliberately changing and prepare_baseline
     owns the equivalent refusal.
     """
-    problems = fx.lock_problems(manifest, fx.load_baseline(repo))
+    tier = manifest["tier"]
+    baseline = fx.load_baseline(repo, tier)
+    problems = (
+        fx.portable_lock_problems(manifest, baseline)
+        if tier == fx.TIER_WIDE
+        else fx.lock_problems(manifest, baseline)
+    )
     if problems:
+        baseline_path = fx.lock_path(repo, tier)
+        remediation = (
+            "bump fixtures/WIDE_WORKLOAD_VERSION, run `gen-fixtures.py --wide "
+            "--write-lock`, and review fixtures/wide_closure.lock.json plus the "
+            "dedicated wide fixture documentation"
+            if tier == fx.TIER_WIDE
+            else "bump fixtures/WORKLOAD_VERSION, run `gen-fixtures.py --large "
+            "--write-lock`, update the TESTING.md fixture section, and mark the "
+            "existing baseline retired wherever it is quoted"
+        )
         fail(
             "the tree just built is NOT the workload recorded in the git baseline "
-            "fixtures/workload.lock.json, so it was discarded and nothing was "
+            f"{baseline_path}, so it was discarded and nothing was "
             "published:\n  - "
             + "\n  - ".join(problems)
-            + "\n\nMost likely flake.lock moved. Changing the pinned workload "
-            "RETIRES the J2 measurement baseline - every number recorded against "
-            "the old workload becomes incomparable. If that is what you intend: "
-            "bump fixtures/WORKLOAD_VERSION, run `gen-fixtures.py --large "
-            "--write-lock`, update the TESTING.md fixture section, and mark the "
-            "existing baseline retired wherever it is quoted."
+            + "\n\nMost likely flake.lock or a fixture definition moved. If that "
+            f"is intentional, {remediation}."
         )
 
 
@@ -1090,18 +1489,30 @@ def install_generation(
     os.rename(
         built.name, superseded, src_dir_fd=generations_fd, dst_dir_fd=generations_fd
     )
-    warn(
+    # This warning is pre-flip, but success continues into publication. It must
+    # therefore use the same poison-safe output as a post-commit diagnostic: a
+    # failed flush here must not lurk in stderr until interpreter shutdown and
+    # turn the later committed publication into exit 120.
+    note(
         f"gen-fixtures: WARNING - {target} already exists and {reason}. A generation "
         "is immutable by contract, so it was NOT modified or deleted.\n"
         f"  The freshly built tree was published as {superseded} instead; the old "
         "directory is inert and a later run collects it.\n"
         f"  If you want the plain name back, remove {target} once nothing is using "
-        "it and regenerate."
+        "it and regenerate.",
+        sys.stderr,
     )
     return superseded
 
 
-def publish(out_dir: Path, generations: Path, generations_fd: int, name: str) -> Path:
+def publish(
+    out_dir: Path,
+    generations: Path,
+    generations_fd: int,
+    name: str,
+    predecessor: str | None,
+    retained_previous: str | None,
+) -> Path:
     """Publish a generation with ONE symlink flip. No rollback, no read-back.
 
     This is the round-8 redesign, and the whole point is what is ABSENT. The
@@ -1125,26 +1536,31 @@ def publish(out_dir: Path, generations: Path, generations_fd: int, name: str) ->
       * after the flip            -> `current` names the new generation, whose
                                      lock.json is inside it: NEW-complete.
 
-    `previous` is pointed at the outgoing generation BEFORE the flip, so the
-    retention contract holds even if the process dies right after the flip. It
-    is only a hint for the collector; if the flip never happens, `previous` and
-    `current` name the same generation, which over-retains nothing.
+    `previous` is made valid BEFORE the flip: it names the descriptor-validated
+    outgoing `current` when one exists, otherwise a separately valid old
+    `previous`, otherwise the installed new generation. Thus a malformed pair is
+    repaired as one state transition and every successful publication is
+    immediately operable by the strict collector. If the `current` flip never
+    happens, `previous` may already name a valid retained/new generation; it is a
+    collector hint, not a second publication commit.
     """
-    previous = fx.resolve_current(out_dir)
     stamp = f"{time.time_ns()}-{os.getpid()}"
 
-    # Record the predecessor first (retention). A failure here is before the
-    # flip, so nothing is published and the old state stands.
-    if previous is not None:
-        try:
-            point_link_at(out_dir, fx.PREVIOUS_LINK, previous.name, f"{stamp}-prev")
-        except OSError as error:
-            fail(
-                f"could not record the predecessor ({error}). Nothing changed: "
-                f"{out_dir / fx.CURRENT_LINK} is as it was, and the new generation is "
-                f"on disk at {generations / name}.",
-                code=2,
-            )
+    # Establish a valid collector anchor first. Prefer the outgoing publication,
+    # then a separately valid old predecessor. On first publication or repair of
+    # a wholly malformed pair, pointing previous at the installed new generation
+    # means the later current flip leaves two valid links without any post-commit
+    # resolution or repair step. Failure is still before the publication flip.
+    previous_target = predecessor or retained_previous or name
+    try:
+        point_link_at(out_dir, fx.PREVIOUS_LINK, previous_target, f"{stamp}-prev")
+    except OSError as error:
+        fail(
+            f"could not establish the previous retention anchor ({error}). "
+            f"{out_dir / fx.CURRENT_LINK} is as it was, and the new generation is "
+            f"on disk at {generations / name}.",
+            code=2,
+        )
 
     # THE publication: one flip. Failure here changes nothing (point_link_at
     # cleans up its own temporary), so this is a plain OSError -> exit 2 with no
@@ -1153,18 +1569,21 @@ def publish(out_dir: Path, generations: Path, generations_fd: int, name: str) ->
         point_link_at(out_dir, fx.CURRENT_LINK, name, f"{stamp}-publish")
     except OSError as error:
         fail(
-            f"could not publish ({error}). Nothing changed: "
-            f"{out_dir / fx.CURRENT_LINK} is as it was; the validated new generation "
-            f"is on disk at {generations / name}.",
+            f"could not publish ({error}). {out_dir / fx.CURRENT_LINK} is as it was; "
+            f"{out_dir / fx.PREVIOUS_LINK} already names the valid retained generation "
+            f"{previous_target!r}, and the validated new generation is on disk at "
+            f"{generations / name}.",
             code=2,
         )
 
     note(f"gen-fixtures: published {name}")
 
-    # Published; from here nothing may turn this into a failure.
-    collect_generations(
-        generations_fd, generations, retained(out_dir, generations / name)
-    )
+    # Published; from here nothing may turn this into a failure. In particular,
+    # DO NOT re-read either retention link: malformed links were classified
+    # before the flip, when refusal was still safe. The known new name plus the
+    # precomputed predecessor are sufficient and cannot fail after commit.
+    keep = {name, previous_target}
+    report_collection_refusals(collect_generations(generations_fd, generations, keep))
     return generations / name
 
 
@@ -1191,21 +1610,10 @@ def point_link_at(out_dir: Path, link_name: str, name: str, stamp: str) -> None:
         raise
 
 
-def retained(out_dir: Path, current: Path) -> set[str]:
-    """The generations retention protects: the published one and its predecessor.
-
-    Read from the two symlinks rather than remembered, so it is the same answer
-    on the publish path and the warm-reuse path. Reuse used to keep only
-    `current`, which deleted the predecessor on the very next `just test` and
-    made the stated one-publication grace period false for any reader that
-    resolves a PATH rather than holding a descriptor open.
-    """
-    previous = fx.resolve_previous(out_dir)
-    return {current.name} | ({previous.name} if previous is not None else set())
-
-
-def collect_generations(generations_fd: int, generations: Path, keep: set[str]) -> None:
-    """Delete superseded generations. Never fatal, never touches `keep`.
+def collect_generations(
+    generations_fd: int, generations: Path, keep: set[str]
+) -> list[str]:
+    """Delete marked superseded generations and return every refusal.
 
     Two are kept: the one just published and the one it replaced. That buys a
     reader ONE generation of lag - it goes on reading a complete, immutable
@@ -1229,12 +1637,7 @@ def collect_generations(generations_fd: int, generations: Path, keep: set[str]) 
         # swapped after the root was anchored.
         candidates = sorted(os.listdir(generations_fd))
     except OSError as error:  # pragma: no cover - the directory just worked
-        note(
-            f"gen-fixtures: WARNING - published, but could not list {generations} "
-            f"to collect superseded generations: {error}",
-            sys.stderr,
-        )
-        return
+        return [f"{generations} (could not list directory: {error})"]
     for candidate in candidates:
         if candidate in keep:
             continue
@@ -1244,20 +1647,25 @@ def collect_generations(generations_fd: int, generations: Path, keep: set[str]) 
             refusal = f"{error}"
         if refusal is not None:
             left.append(f"{generations / candidate} ({refusal})")
-    if left:
-        # SUCCESS with a warning, deliberately. The tree and the lock are both
-        # committed at this point; reporting failure because some superseded
-        # bytes could not be removed would describe a state that did not happen.
-        note(
-            "gen-fixtures: WARNING - published successfully, but these superseded "
-            "directories could not be removed:\n  - "
-            + "\n  - ".join(left)
-            + "\n  They are inert. Note that a partial removal can strip the "
-            f"{fx.OUT_MARKER} marker before failing, after which this script will "
-            "never delete the remainder itself - reclaim it with:\n"
-            + "\n".join(f"    rm -rf {path.split(' (')[0]}" for path in left),
-            sys.stderr,
-        )
+    return left
+
+
+def report_collection_refusals(left: list[str]) -> None:
+    """Report post-publication collection refusals without changing success."""
+    if not left:
+        return
+    # SUCCESS with a warning, deliberately. The tree and the lock are both
+    # committed (or a valid warm generation was reused); reporting failure
+    # because superseded bytes remain would describe a state that did not happen.
+    note(
+        "gen-fixtures: WARNING - the fixture remains valid, but these superseded "
+        "directories could not be removed:\n  - "
+        + "\n  - ".join(left)
+        + "\n  They are inert. A partial removal can strip the ownership marker; "
+        "the collector will continue to refuse that remainder until an operator "
+        "inspects it.",
+        sys.stderr,
+    )
 
 
 # The fields that say what a payload IS, for the purpose of deciding whether
@@ -1272,7 +1680,19 @@ def collect_generations(generations_fd: int, generations: Path, keep: set[str]) 
 # class of silent redefinition the lock exists to prevent, and the cost of
 # being wrong is asymmetric: a spurious version bump is an annoyance, a
 # silently redefined baseline is a wrong decision about the kill criterion.
-MATERIAL_KEYS = ("store_path", "compression", "nar_hash", "file_hash", "tier")
+MATERIAL_KEYS = (
+    "store_path",
+    "compression",
+    "nar_hash",
+    "file_hash",
+    "tier",
+    "nar_size",
+    "file_size",
+    "url",
+    "references",
+    "role",
+    "cache_apparent_size",
+)
 
 
 def material(entry) -> dict:
@@ -1288,7 +1708,8 @@ def lock_dict_from_manifest(manifest: dict) -> dict:
     byte-identical to what it always was while the runtime source of truth moves
     inside the generation.
     """
-    return {
+    is_wide = manifest["tier"] == fx.TIER_WIDE
+    lock = {
         "workload_version": manifest["workload_version"],
         "public_key": manifest["public_key"],
         "paths": {
@@ -1302,10 +1723,38 @@ def lock_dict_from_manifest(manifest: dict) -> dict:
                 # from LARGE_PLAN rather than restated, so the plans stay the
                 # single place that decides what belongs to which tier.
                 "tier": tier_of(entry["attr"]),
+                **(
+                    {
+                        "nar_size": entry["nar_size"],
+                        "file_size": entry["file_size"],
+                        "url": entry["url"],
+                        "references": entry["references"],
+                        "role": entry["role"],
+                        "cache_apparent_size": entry["cache_apparent_size"],
+                        "cache_allocated_size": entry["cache_allocated_size"],
+                    }
+                    if is_wide
+                    else {}
+                ),
             }
             for entry in manifest["paths"]
         },
     }
+    if is_wide:
+        lock.update(
+            {
+                key: manifest[key]
+                for key in (
+                    "fixture_class",
+                    "root_attr",
+                    "cardinality",
+                    "totals",
+                    "budgets",
+                    "disk_accounting",
+                )
+            }
+        )
+    return lock
 
 
 def prepare_baseline(repo: Path, manifest: dict, retire_baseline: bool) -> dict:
@@ -1324,13 +1773,14 @@ def prepare_baseline(repo: Path, manifest: dict, retire_baseline: bool) -> dict:
     every recorded measurement was taken against, so it takes an explicit flag
     whose name says what it costs.
     """
-    lock_file = fx.lock_path(repo)
+    tier = manifest["tier"]
+    lock_file = fx.lock_path(repo, tier)
     new = lock_dict_from_manifest(manifest)
     if lock_file.is_file():
         # Read through load_baseline, not json.loads: a baseline whose schema
         # this code does not understand must not be silently compared
         # field-by-field and then overwritten. LockError -> exit 2.
-        old = fx.load_baseline(repo)
+        old = fx.load_baseline(repo, tier)
         same_version = old.get("workload_version") == new["workload_version"]
         # Compared on MATERIAL fields only - the bytes a measurement was taken
         # against. Adding a field to this file's schema is not a baseline
@@ -1342,21 +1792,52 @@ def prepare_baseline(repo: Path, manifest: dict, retire_baseline: bool) -> dict:
             if material(old.get("paths", {}).get(attr))
             != material(new["paths"].get(attr))
         )
-        rebinding = bool(changed) or old.get("public_key") != new["public_key"]
+        portable_old = fx.portable_fixture_document(old)
+        portable_new = fx.portable_fixture_document(new)
+        wide_metadata_changed = tier == fx.TIER_WIDE and any(
+            portable_old.get(key) != portable_new.get(key)
+            for key in (
+                "fixture_class",
+                "root_attr",
+                "cardinality",
+                "totals",
+                "budgets",
+                "disk_accounting",
+            )
+        )
+        rebinding = (
+            bool(changed)
+            or old.get("public_key") != new["public_key"]
+            or wide_metadata_changed
+        )
         if same_version and rebinding and not retire_baseline:
+            consequence = (
+                "the frozen wide_closure class"
+                if tier == fx.TIER_WIDE
+                else "the J2 measurement baseline"
+            )
+            version_remediation = (
+                "bump fixtures/WIDE_WORKLOAD_VERSION"
+                if tier == fx.TIER_WIDE
+                else "bump fixtures/WORKLOAD_VERSION"
+            )
             fail(
                 f"refusing to rebind workload version {new['workload_version']!r} to "
                 f"different bytes (changed: {changed or ['metadata']}).\n"
-                "Doing so RETIRES the J2 measurement baseline while leaving the "
+                f"Doing so RETIRES {consequence} while leaving the "
                 "version string that identifies it unchanged, so old and new numbers "
                 "would look comparable and would not be.\n"
-                "Either bump fixtures/WORKLOAD_VERSION (the documented path), or pass "
+                f"Either {version_remediation} (the documented path), or pass "
                 "--retire-baseline to say deliberately that every measurement recorded "
                 "against this version is now void.",
                 code=2,
             )
         if same_version and rebinding:
-            print(
+            # Success continues from here into publication. Buffering a plain
+            # print against a poisoned stdout can defer ENOSPC/EPIPE until
+            # interpreter shutdown, after `current` has committed, and lie with
+            # exit 120. Use the success-path helper even though this is pre-flip.
+            note(
                 "gen-fixtures: WARNING - rebinding workload version "
                 f"{new['workload_version']!r} (changed: {changed}); every measurement "
                 "recorded against it is now RETIRED and must be marked so where it "
@@ -1379,7 +1860,7 @@ def write_baseline(repo: Path, new: dict) -> None:
     Atomic all the same: a baseline truncated by an interrupted run would leave
     a confusing half-written review artifact.
     """
-    lock_file = fx.lock_path(repo)
+    lock_file = fx.lock_path(repo, new["paths"][next(iter(new["paths"]))]["tier"])
     # Every step relative to a descriptor on `fixtures/`, not to a path.
     # O_NOFOLLOW only ever guarded the FINAL component, so with `fixtures`
     # itself a symlink this wrote an unrelated file outside the repository and
@@ -1417,7 +1898,7 @@ def write_baseline(repo: Path, new: dict) -> None:
 
 
 def write_manifest(
-    out_dir: Path, version: str, public_line: str, include_large: bool, entries
+    out_dir: Path, version: str, public_line: str, tier: str, entries
 ) -> dict:
     """Machine-readable description of what was generated.
 
@@ -1427,34 +1908,91 @@ def write_manifest(
     that lists three payloads when the tier owes four is a red tree, not a
     smaller workload, and fixturelib.lock_problems() is where that is decided.
     """
+    paths = [
+        {
+            "attr": attr,
+            "compression": compression,
+            "store_path": store_path,
+            "nar_hash": fx.field(pairs, "NarHash"),
+            "nar_size": int(fx.field(pairs, "NarSize")),
+            # The compressed body is what crosses the wire, so the egress
+            # counting rule (TESTING.md) needs its size, and its hash is
+            # the only thing that moves when a compressor changes but the
+            # content does not.
+            "file_hash": fx.field(pairs, "FileHash"),
+            "file_size": int(fx.field(pairs, "FileSize")),
+            "url": fx.field(pairs, "URL"),
+            "references": fx.field(pairs, "References").split(),
+        }
+        for attr, compression, store_path, pairs in entries
+    ]
     manifest = {
         "workload_version": version,
-        "tier": "full" if include_large else "fast",
+        "tier": tier,
         "public_key": public_line,
         "cache_info": {
             "StoreDir": fx.STORE_DIR,
             "WantMassQuery": CACHE_INFO_WANT_MASS_QUERY,
             "Priority": CACHE_INFO_PRIORITY,
         },
-        "paths": [
-            {
-                "attr": attr,
-                "compression": compression,
-                "store_path": store_path,
-                "nar_hash": fx.field(pairs, "NarHash"),
-                "nar_size": int(fx.field(pairs, "NarSize")),
-                # The compressed body is what crosses the wire, so the egress
-                # counting rule (TESTING.md) needs its size, and its hash is
-                # the only thing that moves when a compressor changes but the
-                # content does not.
-                "file_hash": fx.field(pairs, "FileHash"),
-                "file_size": int(fx.field(pairs, "FileSize")),
-                "url": fx.field(pairs, "URL"),
-                "references": fx.field(pairs, "References").split(),
-            }
-            for attr, compression, store_path, pairs in entries
-        ],
+        "paths": paths,
     }
+    if tier == fx.TIER_WIDE:
+        cache = out_dir / "cache"
+
+        # ext4/XFS may report delayed-allocation st_blocks until data is
+        # flushed.  The allocated-byte budget is evidence, so sample it only
+        # after every served regular file has reached stable backing blocks.
+        for cache_file in sorted(cache.rglob("*")):
+            if cache_file.is_file():
+                with cache_file.open("rb") as handle:
+                    os.fsync(handle.fileno())
+
+        def disk_sizes(path: Path) -> tuple[int, int]:
+            info = path.stat()
+            return info.st_size, info.st_blocks * 512
+
+        for entry in paths:
+            entry["role"] = "root" if entry["attr"] == fx.WIDE_ROOT_ATTR else "member"
+            narinfo_sizes = disk_sizes(narinfo_path(cache, entry["store_path"]))
+            blob_sizes = disk_sizes(cache / entry["url"])
+            entry["cache_apparent_size"] = narinfo_sizes[0] + blob_sizes[0]
+            entry["cache_allocated_size"] = narinfo_sizes[1] + blob_sizes[1]
+        cache_info_apparent, cache_info_allocated = disk_sizes(cache / "nix-cache-info")
+        manifest.update(
+            {
+                "fixture_class": fx.FIXTURE_CLASS_WIDE,
+                "root_attr": fx.WIDE_ROOT_ATTR,
+                "cardinality": {
+                    "member_count": len(paths) - 1,
+                    "root_count": 1,
+                    "closure_path_count": len(paths),
+                },
+                "budgets": dict(fx.WIDE_BUDGETS),
+                "disk_accounting": {
+                    "scope": "cache_regular_files_v1",
+                    "block_unit_bytes": 512,
+                    "nix_cache_info_apparent_size": cache_info_apparent,
+                    "nix_cache_info_allocated_size": cache_info_allocated,
+                },
+                "totals": {
+                    "nar_size": sum(entry["nar_size"] for entry in paths),
+                    "file_size": sum(entry["file_size"] for entry in paths),
+                    "cache_apparent_size": cache_info_apparent
+                    + sum(entry["cache_apparent_size"] for entry in paths),
+                    "cache_allocated_size": cache_info_allocated
+                    + sum(entry["cache_allocated_size"] for entry in paths),
+                },
+            }
+        )
+        problems = fx.wide_contract_problems(manifest) + fx.wide_disk_problems(
+            cache, manifest
+        )
+        if problems:
+            fail(
+                "wide fixture contract failed before publication:\n  - "
+                + "\n  - ".join(problems)
+            )
     (out_dir / "manifest.json").write_text(
         json.dumps(manifest, indent=2, sort_keys=True) + "\n"
     )
@@ -1466,9 +2004,10 @@ def main() -> int:
     parser.add_argument(
         "--out",
         type=Path,
-        default=fx.repo_root() / "fixtures" / "out",
+        default=None,
         help="publication root: generations land in <dir>/generations and "
-        "<dir>/current is flipped to the new one",
+        "<dir>/current is flipped to the new one. Defaults to fixtures/out, "
+        "or fixtures/out-wide with --wide",
     )
     parser.add_argument(
         "--large",
@@ -1477,11 +2016,24 @@ def main() -> int:
         "`just test` and out of `nix flake check`)",
     )
     parser.add_argument(
+        "--wide",
+        action="store_true",
+        help="build the independent 128-member wide_closure fixture family; "
+        "publishes to fixtures/out-wide by default and never changes fixtures/out",
+    )
+    parser.add_argument(
+        "--collect-only",
+        action="store_true",
+        help="collect unreferenced generations from the selected existing fixture "
+        "root without building, publishing, repairing, or creating an absent root",
+    )
+    parser.add_argument(
         "--write-lock",
         action="store_true",
-        help="rewrite fixtures/workload.lock.json from what was just built - "
-        "do this only when the workload is meant to change, and bump "
-        "fixtures/WORKLOAD_VERSION in the same commit",
+        help="rewrite the selected family's tracked baseline from what was just "
+        "built. Do this only when that workload is meant to change; bump "
+        "fixtures/WORKLOAD_VERSION for canonical changes or "
+        "fixtures/WIDE_WORKLOAD_VERSION for wide changes in the same commit",
     )
     parser.add_argument(
         "--retire-baseline",
@@ -1494,10 +2046,18 @@ def main() -> int:
     # Validated before any work: rejecting the combination after building and
     # publishing a whole tree would waste the run and, worse, leave a fast-tier
     # tree behind as if the command had partly succeeded.
-    if args.write_lock and not args.large:
+    if args.large and args.wide:
+        fail("--large and --wide select different fixture families", code=2)
+    if args.collect_only and (args.large or args.write_lock or args.retire_baseline):
         fail(
-            "--write-lock requires --large: a lock covering three of four payloads "
-            "would pin nothing about the fourth.",
+            "--collect-only may be combined only with --wide and/or --out; build "
+            "tier, baseline-write, and retirement flags are meaningless for collection",
+            code=2,
+        )
+    if args.write_lock and not (args.large or args.wide):
+        fail(
+            "--write-lock requires --large (canonical) or --wide: a partial "
+            "canonical lock would pin nothing about its fourth payload.",
             code=2,
         )
     if args.retire_baseline and not args.write_lock:
@@ -1505,10 +2065,56 @@ def main() -> int:
     # Tested BEFORE resolve(), which dereferences symlinks - checking the
     # resolved path would have been dead code. Publishing through a symlink
     # would replace it with a real directory and orphan whatever it pointed at.
-    if args.out.is_symlink():
-        fail(f"--out {args.out} is a symlink; refusing to publish through it", code=2)
+    tier = fx.TIER_WIDE if args.wide else fx.TIER_FULL if args.large else fx.TIER_FAST
+    out = args.out or (
+        fx.repo_root() / "fixtures" / ("out-wide" if args.wide else "out")
+    )
+    if out.is_symlink():
+        action = "collect" if args.collect_only else "publish"
+        fail(f"--out {out} is a symlink; refusing to {action} through it", code=2)
+    resolved_out = out.resolve()
+    canonical_root = (fx.repo_root() / "fixtures" / "out").resolve()
+    wide_root = (fx.repo_root() / "fixtures" / "out-wide").resolve()
+    lexical_out = Path(os.path.abspath(out))
+
+    def reaches_subtree(candidate: Path, root: Path) -> bool:
+        return candidate == root or candidate.is_relative_to(root)
+
+    reaches_canonical = reaches_subtree(lexical_out, canonical_root) or reaches_subtree(
+        resolved_out, canonical_root
+    )
+    reaches_wide = reaches_subtree(lexical_out, wide_root) or reaches_subtree(
+        resolved_out, wide_root
+    )
+    exact_canonical = lexical_out == canonical_root and resolved_out == canonical_root
+    exact_wide = lexical_out == wide_root and resolved_out == wide_root
+    if reaches_canonical and not (not args.wide and exact_canonical):
+        message = (
+            "--wide cannot publish into the reserved canonical fixtures/out"
+            if args.wide and exact_canonical
+            else "--wide cannot publish inside the reserved canonical fixtures/out "
+            "subtree"
+            if args.wide
+            else "canonical fixtures may publish at reserved fixtures/out, not "
+            "inside its subtree"
+        )
+        fail(message, code=2)
+    if reaches_wide and not (args.wide and exact_wide):
+        message = (
+            "canonical fixtures cannot publish into reserved fixtures/out-wide"
+            if not args.wide and exact_wide
+            else "canonical fixtures cannot publish inside the reserved "
+            "fixtures/out-wide subtree"
+            if not args.wide
+            else "wide fixtures may publish at reserved fixtures/out-wide, not "
+            "inside its subtree"
+        )
+        fail(message, code=2)
     try:
-        generate(args.out.resolve(), args.large, args.write_lock, args.retire_baseline)
+        if args.collect_only:
+            collect_only(resolved_out)
+        else:
+            generate(resolved_out, tier, args.write_lock, args.retire_baseline)
     except OSError as error:
         # A read-only parent, a full disk or a vanished directory is an
         # environment failure, not a verdict about the workload. Reported as

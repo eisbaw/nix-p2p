@@ -72,8 +72,16 @@
       # this one. The J2 measurement baseline is frozen against it.
       workloadVersion = builtins.replaceStrings [ "\n" ] [ "" ]
         (builtins.readFile ./fixtures/WORKLOAD_VERSION);
+      wideWorkloadVersion = builtins.replaceStrings [ "\n" ] [ "" ]
+        (builtins.readFile ./fixtures/WIDE_WORKLOAD_VERSION);
 
-      fixtureWorkload = import ./fixtures/workload.nix { inherit pkgs workloadVersion; };
+      fixtureWorkloads = import ./fixtures/workload.nix {
+        inherit pkgs workloadVersion wideWorkloadVersion;
+      };
+      # Keep every existing e2e/VM consumer on the frozen four-path workload.
+      # The wide family is exported only as packages and selected explicitly by
+      # the dedicated wide-fixture tooling.
+      fixtureWorkload = fixtureWorkloads.canonical;
 
       # Python for the fixture scripts. cryptography derives the fixture
       # signing key from a seed phrase, which is what keeps key material out of
@@ -400,13 +408,14 @@
 
         default = self.packages.${system}.daemon;
       }
-      # Fixture payloads as packages.fixture-<name>, so `nix flake check`
+      # Both fixture families as packages.fixture-<name>, so `nix flake check`
       # type-checks them for free: it evaluates every package but builds only
       # `checks` (verified). They are deliberately NOT added to checks - the
-      # 110 MiB payload must stay out of both `nix flake check` and the devshell
-      # closure, and is built only by `just fixtures-large`.
+      # 110 MiB canonical payload and 256 MiB wide closure must stay out of both
+      # `nix flake check` and the devshell closure and are built only by their
+      # explicit fixture recipes.
       // pkgs.lib.mapAttrs' (n: v: pkgs.lib.nameValuePair "fixture-${n}" v)
-        fixtureWorkload;
+        (fixtureWorkload // fixtureWorkloads.wide);
 
       # `nix flake check` must be able to fail, otherwise it is a rubber stamp.
       # These mirror the Justfile gates so CI has a single entry point; the

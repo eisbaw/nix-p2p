@@ -2,8 +2,8 @@
 """Enforce the single runtime source of truth for the fixture lock (task-3 B).
 
 The round-8 redesign moved the AUTHORITATIVE lock inside each generation
-(`gen-<sha>/lock.json`) and DEMOTED the git-tracked
-`fixtures/workload.lock.json` to a review artifact. This check makes acceptance
+(`gen-<sha>/lock.json`) and DEMOTED the canonical and wide git-tracked locks to
+review artifacts. This check makes acceptance
 condition 1 a permanent gate: no runtime/gate code reads the git baseline;
 everything resolves through `current -> gen-<sha>/lock.json`
 (fx.load_generation_lock).
@@ -24,7 +24,7 @@ Two independent checks, because the call-name AST check alone was evadable:
      load_baseline.
 
   2. Literal-string scan on the GOVERNED modules. Any runtime/gate module that
-     names the baseline filename literal fails - this is what catches codex's
+     names either baseline filename literal fails - this is what catches codex's
      raw-read evasion `(repo / "fixtures" / "workload.lock.json").read_text()`
      and `open(...)` on the path, which reference no known name at all.
      Docstrings are excluded (prose, never a file access). The baseline OWNER
@@ -93,9 +93,10 @@ BASELINE_OWNERS = {
     "lock_dict_from_manifest",
 }
 
-# The baseline filename. Any governed module mentioning this literal (outside a
-# designated owner) is reaching for the file the redesign forbids at runtime.
-BASELINE_LITERAL = "workload.lock.json"
+# Both baseline filenames. Any governed module mentioning either literal
+# (outside a designated owner) is reaching for a git review artifact that the
+# redesign forbids at runtime.
+BASELINE_LITERALS = frozenset({"workload.lock.json", "wide_closure.lock.json"})
 
 
 def referenced_names(node: ast.AST) -> set[str]:
@@ -183,12 +184,13 @@ def main() -> int:
                 "resolve the lock only via current -> gen-<sha>/lock.json "
                 "(fx.load_generation_lock)"
             )
-        if any(BASELINE_LITERAL in s for s in string_constants(tree)):
-            violations.append(
-                f"{path.name} contains the literal {BASELINE_LITERAL!r} - runtime/gate "
-                "code must not name the demoted git baseline, even via a raw "
-                "read_text/open"
-            )
+        for literal in sorted(BASELINE_LITERALS):
+            if any(literal in s for s in string_constants(tree)):
+                violations.append(
+                    f"{path.name} contains the literal {literal!r} - runtime/gate "
+                    "code must not name a demoted git baseline, even via a raw "
+                    "read_text/open"
+                )
 
     gen = {
         node.name: node
@@ -230,8 +232,9 @@ def main() -> int:
     print(
         "check-lock-sources: ok - governed "
         f"{[p.name for p in governed_modules()]} resolve the lock through "
-        "current -> gen-<sha>/lock.json (no baseline call, no baseline literal); the "
-        f"git baseline is touched only by {sorted(BASELINE_OWNERS)} in {BASELINE_OWNER}"
+        "current -> gen-<sha>/lock.json (no baseline call, no baseline literal); "
+        f"both git baselines are touched only by {sorted(BASELINE_OWNERS)} in "
+        f"{BASELINE_OWNER}"
     )
     return 0
 

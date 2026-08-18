@@ -15,13 +15,15 @@ never be treated as such. What derivation avoids is a committed
 high-entropy base64 blob - the thing secret scanners flag, mirrors copy and
 downstream forks have to special-case forever - in a repo that runs a
 `secret-scan` policy. Determinism is unaffected: ed25519 public keys and
-signatures are functions of the seed, and fixtures/workload.lock.json pins the
-resulting public key so drift in the derivation is a hard failure.
+signatures are functions of the seed, and each fixture family's tracked review
+baseline pins the resulting public key so drift in the derivation is a hard
+failure.
 """
 
 from __future__ import annotations
 
 import base64
+import copy
 import functools
 import hashlib
 import http.server
@@ -45,9 +47,9 @@ KEY_NAME = "nix-p2p-test-1"
 KEY_SEED_PHRASE = b"nix-p2p UNSAFE TEST ONLY fixture signing key v1"
 # The derived public key is deliberately NOT pinned here. A constant sitting
 # two lines below the seed it is derived from only catches an edit to one of
-# them, and any coordinated edit sails past it. fixtures/workload.lock.json
-# holds the pin instead: it is committed, external to this derivation, and
-# readable by task-5's container nix.conf without importing Python.
+# them, and any coordinated edit sails past it. Each selected family's tracked
+# baseline holds the pin instead: it is external to this derivation and visible
+# in version control.
 
 # A second, deliberately untrusted keypair. Used by the gate to forge a
 # well-formed signature from a key the client does not trust - the exact
@@ -183,12 +185,36 @@ def resolve_previous(out_root: Path) -> Path | None:
 # or a partially published tree verifies whatever it happens to hold.
 TIER_FAST = "fast"
 TIER_FULL = "full"
-TIERS = (TIER_FAST, TIER_FULL)
-# Ordered, so "at least this tier" is a comparison rather than a special case
-# for the one tier anybody happened to pass. A third tier added to TIERS but
-# not to this map is a KeyError at the comparison, not a silently satisfied
-# requirement.
-TIER_RANK = {TIER_FAST: 0, TIER_FULL: 1}
+TIER_WIDE = "wide"
+TIERS = (TIER_FAST, TIER_FULL, TIER_WIDE)
+# `wide` is a separate fixture family, not a larger canonical tier.  The
+# inclusion relation is therefore explicit rather than a total rank: full may
+# satisfy a fast request, while neither canonical tier can satisfy wide (and a
+# wide tree cannot masquerade as the four-path J2 workload).
+TIER_INCLUDES = {
+    TIER_FAST: frozenset({TIER_FAST}),
+    TIER_FULL: frozenset({TIER_FAST, TIER_FULL}),
+    TIER_WIDE: frozenset({TIER_WIDE}),
+}
+
+FIXTURE_CLASS_WIDE = "wide_closure"
+WIDE_ROOT_ATTR = "wide-root"
+WIDE_MEMBER_PREFIX = "wide-member-"
+WIDE_MEMBER_COUNT = 128
+WIDE_BASELINE_NAME = "wide_closure.lock.json"
+
+# Integer-only, reviewable limits.  NarSize is the signed, uncompressed size;
+# disk accounting is a separate cache-filesystem safety bound.
+WIDE_BUDGETS = {
+    "member_count_min": 128,
+    "member_count_max": 512,
+    "closure_path_count_min": 129,
+    "closure_path_count_max": 513,
+    "total_nar_size_min": 256 * 1024 * 1024,
+    "total_nar_size_max": 2 * 1024 * 1024 * 1024,
+    "cache_apparent_size_max": 512 * 1024 * 1024,
+    "cache_allocated_size_max": 512 * 1024 * 1024,
+}
 
 # The lock's schema, stated EXHAUSTIVELY rather than as a minimum. An
 # unrecognised field used to be accepted, ignored, and then silently erased the
@@ -202,6 +228,39 @@ LOCK_TOP_KEYS = frozenset({"workload_version", "public_key", "paths"})
 LOCK_PAYLOAD_KEYS = frozenset(
     {"store_path", "compression", "nar_hash", "file_hash", "tier"}
 )
+WIDE_LOCK_TOP_KEYS = LOCK_TOP_KEYS | frozenset(
+    {
+        "fixture_class",
+        "root_attr",
+        "cardinality",
+        "totals",
+        "budgets",
+        "disk_accounting",
+    }
+)
+WIDE_LOCK_PAYLOAD_KEYS = LOCK_PAYLOAD_KEYS | frozenset(
+    {
+        "nar_size",
+        "file_size",
+        "url",
+        "references",
+        "role",
+        "cache_apparent_size",
+        "cache_allocated_size",
+    }
+)
+WIDE_CARDINALITY_KEYS = frozenset({"member_count", "root_count", "closure_path_count"})
+WIDE_TOTAL_KEYS = frozenset(
+    {"nar_size", "file_size", "cache_apparent_size", "cache_allocated_size"}
+)
+WIDE_DISK_ACCOUNTING_KEYS = frozenset(
+    {
+        "scope",
+        "block_unit_bytes",
+        "nix_cache_info_apparent_size",
+        "nix_cache_info_allocated_size",
+    }
+)
 
 NIX_BASE32_ALPHABET = "0123456789abcdfghijklmnpqrsvwxyz"
 
@@ -211,8 +270,14 @@ def repo_root() -> Path:
     return Path(__file__).resolve().parent.parent
 
 
-def lock_path(repo: Path) -> Path:
-    return repo / "fixtures" / "workload.lock.json"
+def lock_path(repo: Path, tier: str = TIER_FULL) -> Path:
+    if tier == TIER_WIDE:
+        name = WIDE_BASELINE_NAME
+    elif tier in (TIER_FAST, TIER_FULL):
+        name = "workload.lock.json"
+    else:
+        raise ValueError(f"unknown fixture tier {tier!r}")
+    return repo / "fixtures" / name
 
 
 class LockError(Exception):
@@ -225,8 +290,8 @@ class LockError(Exception):
 # and before it is used, and (2) an ancestor that is ALREADY a symlink being
 # silently written through, so the tooling edits a file outside the tree it
 # believes it is editing. It does NOT claim to defend a host where an attacker
-# already has write access under this uid: such an attacker edits
-# fixtures/workload.lock.json directly and no amount of descriptor discipline
+# already has write access under this uid: such an attacker edits a tracked
+# fixture baseline directly and no amount of descriptor discipline
 # helps. What is bought is that the fixture tooling cannot be TRICKED into
 # reaching outside its own root - which matters because it deletes directories
 # and rewrites the file that defines the frozen workload.
@@ -269,8 +334,8 @@ def same_inode(fd: int, path: Path) -> bool:
 def read_at(dir_fd: int, name: str) -> str:
     """Read one file by name relative to an anchored directory descriptor.
 
-    Used for the tracked lock and WORKLOAD_VERSION - the two files that define
-    the frozen workload. A symlink at the file itself is refused by O_NOFOLLOW;
+    Used for tracked baseline locks and WORKLOAD_VERSION - the files that define
+    frozen workloads. A symlink at the file itself is refused by O_NOFOLLOW;
     an ancestor cannot participate at all, because resolution starts at the
     descriptor. Reading through either would launder someone else's file into a
     green run.
@@ -307,6 +372,30 @@ def anchored_fixtures_dir(repo: Path):
         os.close(descriptor)
 
 
+def _validate_exact_int_object(
+    value,
+    integer_keys: frozenset[str],
+    source: str,
+    field_name: str,
+    allowed_extra: frozenset[str] = frozenset(),
+) -> None:
+    """Validate a closed metadata object whose named values are integers."""
+    if not isinstance(value, dict):
+        raise LockError(f"{source}: {field_name} is not a JSON object")
+    expected = integer_keys | allowed_extra
+    if set(value) != expected:
+        raise LockError(
+            f"{source}: {field_name} fields are {sorted(value)}, expected "
+            f"{sorted(expected)}"
+        )
+    for key in sorted(integer_keys):
+        item = value[key]
+        if isinstance(item, bool) or not isinstance(item, int) or item < 0:
+            raise LockError(
+                f"{source}: {field_name}.{key} must be a non-negative integer"
+            )
+
+
 def validate_lock(lock, source: str) -> dict:
     """Validate a parsed lock structure from any source. Shared, so the same
     schema binds the AUTHORITATIVE lock inside a generation and the demoted
@@ -320,37 +409,122 @@ def validate_lock(lock, source: str) -> dict:
     """
     if not isinstance(lock, dict):
         raise LockError(f"{source} is not a JSON object")
-    for key in sorted(LOCK_TOP_KEYS):
+    is_wide = lock.get("fixture_class") == FIXTURE_CLASS_WIDE
+    top_keys = WIDE_LOCK_TOP_KEYS if is_wide else LOCK_TOP_KEYS
+    payload_keys = WIDE_LOCK_PAYLOAD_KEYS if is_wide else LOCK_PAYLOAD_KEYS
+    for key in sorted(top_keys):
         if key not in lock:
             raise LockError(f"{source} has no {key!r}")
-    unknown = sorted(set(lock) - LOCK_TOP_KEYS)
+    unknown = sorted(set(lock) - top_keys)
     if unknown:
         raise LockError(
             f"{source} has unrecognised top-level field(s) {unknown}. Nothing reads "
             "them, and the next --write-lock would erase them without a word, so "
             f"they cannot be allowed to look like a pin. Known fields are "
-            f"{sorted(LOCK_TOP_KEYS)}."
+            f"{sorted(top_keys)}."
+        )
+    if "fixture_class" in lock and not is_wide:
+        raise LockError(
+            f"{source} declares unknown fixture_class {lock['fixture_class']!r}; "
+            f"the only extended class is {FIXTURE_CLASS_WIDE!r}"
         )
     if not isinstance(lock["paths"], dict) or not lock["paths"]:
         raise LockError(f"{source} pins no payloads")
     for attr, pinned in lock["paths"].items():
         if not isinstance(pinned, dict):
             raise LockError(f"{source}: payload {attr!r} is not a JSON object")
-        missing = sorted(LOCK_PAYLOAD_KEYS - set(pinned))
+        missing = sorted(payload_keys - set(pinned))
         if missing:
             raise LockError(f"{source}: payload {attr!r} is missing {missing}")
-        extra = sorted(set(pinned) - LOCK_PAYLOAD_KEYS)
+        extra = sorted(set(pinned) - payload_keys)
         if extra:
             raise LockError(
                 f"{source}: payload {attr!r} has unrecognised field(s) {extra}. Same "
                 "reason as above: an ignored field is a pin that is not a pin. "
-                f"Known fields are {sorted(LOCK_PAYLOAD_KEYS)}."
+                f"Known fields are {sorted(payload_keys)}."
             )
         if pinned["tier"] not in TIERS:
             raise LockError(
                 f"{source}: payload {attr!r} declares tier {pinned['tier']!r}, which "
                 f"is not one of {list(TIERS)}. An unknown tier would quietly excuse "
                 "the payload from every tier's required set."
+            )
+        if not is_wide and pinned["tier"] == TIER_WIDE:
+            raise LockError(
+                f"{source}: canonical lock payload {attr!r} declares tier 'wide'. "
+                "Wide paths belong only to a wide_closure lock; otherwise fast/full "
+                "would silently require neither the path nor its bytes."
+            )
+        if is_wide:
+            if pinned["tier"] != TIER_WIDE:
+                raise LockError(
+                    f"{source}: wide payload {attr!r} has tier {pinned['tier']!r}, "
+                    f"expected {TIER_WIDE!r}"
+                )
+            for key in (
+                "nar_size",
+                "file_size",
+                "cache_apparent_size",
+                "cache_allocated_size",
+            ):
+                if (
+                    isinstance(pinned[key], bool)
+                    or not isinstance(pinned[key], int)
+                    or pinned[key] < 0
+                ):
+                    raise LockError(
+                        f"{source}: payload {attr!r} field {key!r} must be a "
+                        "non-negative integer"
+                    )
+            if pinned["role"] not in ("member", "root"):
+                raise LockError(
+                    f"{source}: payload {attr!r} has invalid role {pinned['role']!r}"
+                )
+            if not isinstance(pinned["references"], list) or not all(
+                isinstance(reference, str) for reference in pinned["references"]
+            ):
+                raise LockError(
+                    f"{source}: payload {attr!r} references must be a string list"
+                )
+
+    if is_wide:
+        _validate_exact_int_object(
+            lock["cardinality"], WIDE_CARDINALITY_KEYS, source, "cardinality"
+        )
+        _validate_exact_int_object(lock["totals"], WIDE_TOTAL_KEYS, source, "totals")
+        _validate_exact_int_object(
+            lock["budgets"], frozenset(WIDE_BUDGETS), source, "budgets"
+        )
+        if lock["budgets"] != WIDE_BUDGETS:
+            raise LockError(
+                f"{source}: budgets are {lock['budgets']}, expected frozen integer "
+                f"budgets {WIDE_BUDGETS}"
+            )
+        _validate_exact_int_object(
+            lock["disk_accounting"],
+            WIDE_DISK_ACCOUNTING_KEYS - {"scope"},
+            source,
+            "disk_accounting",
+            allowed_extra=frozenset({"scope"}),
+        )
+        if lock["disk_accounting"].get("scope") != "cache_regular_files_v1":
+            raise LockError(
+                f"{source}: disk accounting scope must be 'cache_regular_files_v1'"
+            )
+        # Validate the ORIGINAL local accounting before any portable comparison
+        # neutralises allocated-byte observations.  Converting the lock's keyed
+        # payloads to the manifest shape lets one production semantic oracle own
+        # totals, integer budgets, cardinality, and fanout for both forms.
+        semantic_lock = copy.deepcopy(lock)
+        semantic_lock["tier"] = TIER_WIDE
+        semantic_lock["paths"] = [
+            {"attr": attr, **pinned} for attr, pinned in lock["paths"].items()
+        ]
+        semantic_problems = wide_contract_problems(semantic_lock)
+        if semantic_problems:
+            raise LockError(
+                f"{source}: wide semantic contract failed:\n  - "
+                + "\n  - ".join(semantic_problems)
             )
     return lock
 
@@ -388,8 +562,8 @@ def load_generation_lock(generation: Path) -> dict:
     return validate_lock(lock, str(lock_json))
 
 
-def load_baseline(repo: Path) -> dict:
-    """The DEMOTED, git-tracked baseline: `fixtures/workload.lock.json`.
+def load_baseline(repo: Path, tier: str = TIER_FULL) -> dict:
+    """The selected DEMOTED git baseline (canonical or independent wide).
 
     A review / version-control artifact, NOT a runtime source of truth. It is
     read only by the generator's freeze path - the fresh-build drift check and
@@ -398,7 +572,7 @@ def load_baseline(repo: Path) -> dict:
     runtime/gate/consistency code opens it; that is asserted by
     scripts/check-lock-sources.py.
     """
-    path = lock_path(repo)
+    path = lock_path(repo, tier)
     try:
         with anchored_fixtures_dir(repo) as fixtures_fd:
             lock = json.loads(read_at(fixtures_fd, path.name))
@@ -412,20 +586,23 @@ def load_baseline(repo: Path) -> dict:
 def expected_attrs(lock: dict, tier: str) -> set[str]:
     """Payload names a tree of `tier` must contain - no more, no fewer.
 
-    A tier owes every payload pinned at its rank or below, so `full` owes
-    everything and `fast` owes the fast payloads. Written as a RANK comparison
-    rather than "full means all, anything else means fast", which was a third
-    instance of the fail-open species this file has fixed twice: with a third
-    tier in TIERS, `expected_attrs(lock, "medium")` returned only the fast set,
-    so a medium-tier payload was excused from every tier's required set and a
-    tree missing it verified green. load_lock's tier validation does not help -
-    the tier is perfectly valid, it is this branch that loses it.
+    Full owes fast+full, while the independent wide family owes only wide.
+    Making that relation explicit prevents a wide cache from satisfying a
+    canonical request merely because somebody placed the word after `full`.
     """
     if tier not in TIERS:
         raise ValueError(f"unknown tier {tier!r}")
-    return {
-        a for a, p in lock["paths"].items() if TIER_RANK[p["tier"]] <= TIER_RANK[tier]
-    }
+    included = TIER_INCLUDES[tier]
+    return {a for a, p in lock["paths"].items() if p["tier"] in included}
+
+
+def tier_satisfies(actual: str, required: str) -> bool:
+    """Whether an actual fixture tier satisfies an explicitly required tier."""
+    if actual not in TIERS or required not in TIERS:
+        raise ValueError(
+            f"unknown tier relation: actual={actual!r}, required={required!r}"
+        )
+    return required in TIER_INCLUDES[actual]
 
 
 def nix_base32(data: bytes) -> str:
@@ -591,16 +768,340 @@ def lock_problems(manifest: dict, lock: dict) -> list[str]:
             f"payload {extra!r} is present but not pinned for tier {tier!r}"
         )
 
+    is_wide = lock.get("fixture_class") == FIXTURE_CLASS_WIDE
     for entry in manifest.get("paths", []):
         pinned = lock["paths"].get(entry["attr"])
         if pinned is None:
             continue  # already reported as an extra
-        for key in ("store_path", "compression", "nar_hash", "file_hash"):
+        compared = ["store_path", "compression", "nar_hash", "file_hash"]
+        if is_wide:
+            compared.extend(
+                [
+                    "nar_size",
+                    "file_size",
+                    "url",
+                    "references",
+                    "role",
+                    "cache_apparent_size",
+                    "cache_allocated_size",
+                ]
+            )
+        for key in compared:
             if pinned[key] != entry.get(key):
                 problems.append(
                     f"payload {entry['attr']!r}: {key} is {entry.get(key)!r}, lock "
                     f"pins {pinned[key]!r}"
                 )
+    if is_wide:
+        for key in (
+            "fixture_class",
+            "root_attr",
+            "cardinality",
+            "totals",
+            "budgets",
+            "disk_accounting",
+        ):
+            if lock[key] != manifest.get(key):
+                problems.append(
+                    f"wide metadata {key!r} is {manifest.get(key)!r}, lock pins "
+                    f"{lock[key]!r}"
+                )
+        problems.extend(wide_contract_problems(manifest))
+    return problems
+
+
+def portable_fixture_document(document: dict) -> dict:
+    """Copy a manifest/lock with local allocated-byte observations neutralised."""
+    result = copy.deepcopy(document)
+    if result.get("fixture_class") != FIXTURE_CLASS_WIDE:
+        return result
+    paths = result.get("paths", {})
+    values = paths.values() if isinstance(paths, dict) else paths
+    for entry in values:
+        entry["cache_allocated_size"] = 0
+    result["totals"]["cache_allocated_size"] = 0
+    result["disk_accounting"]["nix_cache_info_allocated_size"] = 0
+    return result
+
+
+def portable_lock_problems(manifest: dict, lock: dict) -> list[str]:
+    """Lock comparison excluding filesystem-local allocated-byte evidence.
+
+    Each generation's own lock still pins and verifies its observed st_blocks.
+    A tracked baseline or independently generated tree may live on a different
+    filesystem/extent layout, so portable equality replaces only those values
+    with a common sentinel before applying the otherwise exact lock oracle.
+    """
+    # This is deliberately before portable_fixture_document: otherwise a bad
+    # allocated total can be replaced by the same zero sentinel on both sides
+    # and disappear.  The manifest is not a lock-shaped document, so it uses
+    # the same wide semantic oracle directly.
+    try:
+        validate_lock(lock, "portable comparison lock")
+    except LockError as error:
+        return [str(error)]
+    if manifest.get("fixture_class") == FIXTURE_CLASS_WIDE:
+        semantic_problems = wide_contract_problems(manifest)
+        if semantic_problems:
+            return semantic_problems
+    return lock_problems(
+        portable_fixture_document(manifest), portable_fixture_document(lock)
+    )
+
+
+def wide_count_problems(
+    member_count: int, closure_path_count: int, root_reference_count: int | None
+) -> list[str]:
+    """Judge observed wide shape against frozen budgets and direct fanout.
+
+    This deliberately takes observations, not a manifest and not the nominal
+    WIDE_MEMBER_COUNT.  The budget bite can therefore exercise the independent
+    lower bound without mutating module state or manufacturing a second fixture.
+    """
+    problems = []
+    if not (
+        WIDE_BUDGETS["member_count_min"]
+        <= member_count
+        <= WIDE_BUDGETS["member_count_max"]
+    ):
+        problems.append(
+            f"wide member count {member_count} is outside the frozen budget"
+        )
+    if not (
+        WIDE_BUDGETS["closure_path_count_min"]
+        <= closure_path_count
+        <= WIDE_BUDGETS["closure_path_count_max"]
+    ):
+        problems.append(
+            f"wide closure path count {closure_path_count} is outside the frozen budget"
+        )
+    if root_reference_count is not None and root_reference_count != member_count:
+        problems.append(
+            f"wide root has {root_reference_count} direct references, expected one "
+            f"per {member_count} members"
+        )
+    return problems
+
+
+def wide_contract_problems(manifest: dict) -> list[str]:
+    """Semantic, independently recomputed contract for `wide_closure`."""
+    problems = []
+    if manifest.get("fixture_class") != FIXTURE_CLASS_WIDE:
+        return [
+            f"fixture_class is {manifest.get('fixture_class')!r}, expected "
+            f"{FIXTURE_CLASS_WIDE!r}"
+        ]
+    if manifest.get("tier") != TIER_WIDE:
+        problems.append(
+            f"wide fixture tier is {manifest.get('tier')!r}, expected 'wide'"
+        )
+    if manifest.get("root_attr") != WIDE_ROOT_ATTR:
+        problems.append(
+            f"wide root_attr is {manifest.get('root_attr')!r}, expected {WIDE_ROOT_ATTR!r}"
+        )
+    if manifest.get("budgets") != WIDE_BUDGETS:
+        problems.append(
+            f"wide budgets are {manifest.get('budgets')!r}, expected {WIDE_BUDGETS!r}"
+        )
+
+    entries = manifest.get("paths")
+    if not isinstance(entries, list):
+        return problems + ["wide paths is not a list"]
+    roots = [entry for entry in entries if entry.get("role") == "root"]
+    members = [entry for entry in entries if entry.get("role") == "member"]
+    expected_member_attrs = {
+        f"{WIDE_MEMBER_PREFIX}{index:03d}" for index in range(WIDE_MEMBER_COUNT)
+    }
+    actual_member_attrs = {entry.get("attr") for entry in members}
+    if actual_member_attrs != expected_member_attrs:
+        missing = sorted(expected_member_attrs - actual_member_attrs)
+        extra = sorted(actual_member_attrs - expected_member_attrs, key=str)
+        problems.append(f"wide member attrs differ: missing={missing}, extra={extra}")
+    if len(roots) != 1 or not roots or roots[0].get("attr") != WIDE_ROOT_ATTR:
+        problems.append(
+            f"wide fixture needs exactly one {WIDE_ROOT_ATTR!r} root; found "
+            f"{[entry.get('attr') for entry in roots]}"
+        )
+
+    cardinality = {
+        "member_count": len(members),
+        "root_count": len(roots),
+        "closure_path_count": len(entries),
+    }
+    if manifest.get("cardinality") != cardinality:
+        problems.append(
+            f"wide cardinality is {manifest.get('cardinality')!r}, recomputed "
+            f"{cardinality!r}"
+        )
+
+    store_paths = [entry.get("store_path") for entry in entries]
+    urls = [entry.get("url") for entry in entries]
+    if len(set(store_paths)) != len(store_paths):
+        problems.append("wide store paths are not all distinct")
+    if len(set(urls)) != len(urls):
+        problems.append("wide NAR URLs are not all distinct")
+
+    member_basenames = {
+        PurePosixPath(entry.get("store_path", "")).name for entry in members
+    }
+    for member in members:
+        if member.get("references") != []:
+            problems.append(
+                f"wide member {member.get('attr')!r} unexpectedly references "
+                f"{member.get('references')!r}"
+            )
+    if len(roots) == 1 and set(roots[0].get("references", [])) != member_basenames:
+        missing = sorted(member_basenames - set(roots[0].get("references", [])))
+        extra = sorted(set(roots[0].get("references", [])) - member_basenames)
+        problems.append(f"wide root fanout differs: missing={missing}, extra={extra}")
+    if len(roots) == 1 and len(roots[0].get("references", [])) != len(member_basenames):
+        problems.append("wide root fanout contains duplicate references")
+
+    total_keys = {
+        "nar_size": "nar_size",
+        "file_size": "file_size",
+        "cache_apparent_size": "cache_apparent_size",
+        "cache_allocated_size": "cache_allocated_size",
+    }
+    recomputed_totals = {}
+    for total_key, entry_key in total_keys.items():
+        values = [entry.get(entry_key) for entry in entries]
+        if not all(
+            isinstance(value, int) and not isinstance(value, bool) for value in values
+        ):
+            problems.append(f"wide per-path {entry_key} values are not all integers")
+            continue
+        recomputed_totals[total_key] = sum(values)
+    accounting = manifest.get("disk_accounting") or {}
+    for total_key, accounting_key in (
+        ("cache_apparent_size", "nix_cache_info_apparent_size"),
+        ("cache_allocated_size", "nix_cache_info_allocated_size"),
+    ):
+        if total_key in recomputed_totals:
+            extra = accounting.get(accounting_key)
+            if isinstance(extra, int) and not isinstance(extra, bool):
+                recomputed_totals[total_key] += extra
+            else:
+                problems.append(f"wide disk_accounting.{accounting_key} is not integer")
+    if manifest.get("totals") != recomputed_totals:
+        problems.append(
+            f"wide totals are {manifest.get('totals')!r}, recomputed "
+            f"{recomputed_totals!r}"
+        )
+    total_nar = recomputed_totals.get("nar_size")
+    if isinstance(total_nar, int) and not (
+        WIDE_BUDGETS["total_nar_size_min"]
+        <= total_nar
+        <= WIDE_BUDGETS["total_nar_size_max"]
+    ):
+        problems.append(f"wide total NarSize {total_nar} is outside the frozen budget")
+    member_count = len(members)
+    root_reference_count = (
+        len(roots[0].get("references", [])) if len(roots) == 1 else None
+    )
+    problems.extend(
+        wide_count_problems(member_count, len(entries), root_reference_count)
+    )
+    for total_key, budget_key in (
+        ("cache_apparent_size", "cache_apparent_size_max"),
+        ("cache_allocated_size", "cache_allocated_size_max"),
+    ):
+        value = recomputed_totals.get(total_key)
+        if isinstance(value, int) and value > WIDE_BUDGETS[budget_key]:
+            problems.append(f"wide {total_key} {value} exceeds {budget_key}")
+    if accounting.get("scope") != "cache_regular_files_v1":
+        problems.append("wide disk accounting scope is not cache_regular_files_v1")
+    if accounting.get("block_unit_bytes") != 512:
+        problems.append("wide disk accounting block unit is not 512 bytes")
+    return problems
+
+
+def wide_cache_file_set_problems(manifest: dict, actual_files: set[Path]) -> list[str]:
+    """Compare an observed cache regular-file set with the manifest's exact set."""
+    expected_files = {Path("nix-cache-info")}
+    for entry in manifest.get("paths", []):
+        expected_files.add(Path(narinfo_name(entry.get("store_path", ""))))
+        expected_files.add(Path(entry.get("url", "")))
+    problems = []
+    missing_files = sorted(str(path) for path in expected_files - actual_files)
+    extra_files = sorted(str(path) for path in actual_files - expected_files)
+    if missing_files:
+        problems.append(
+            f"cache accounting scope is missing regular files {missing_files}"
+        )
+    if extra_files:
+        problems.append(
+            f"cache accounting scope has unexpected regular files {extra_files}"
+        )
+    return problems
+
+
+def wide_disk_problems(cache: Path, manifest: dict) -> list[str]:
+    """Recompute cache-only apparent/allocated evidence from filesystem truth."""
+    if manifest.get("fixture_class") != FIXTURE_CLASS_WIDE:
+        return []
+    problems = []
+
+    actual_files = {
+        path.relative_to(cache)
+        for path in cache.rglob("*")
+        if stat.S_ISREG(path.lstat().st_mode)
+    }
+    problems.extend(wide_cache_file_set_problems(manifest, actual_files))
+
+    def sizes(path: Path) -> tuple[int, int]:
+        info = path.stat()
+        return info.st_size, info.st_blocks * 512
+
+    apparent_total = 0
+    allocated_total = 0
+    for entry in manifest.get("paths", []):
+        narinfo = cache / narinfo_name(entry.get("store_path", ""))
+        blob, refusal = confined_blob(cache, entry.get("url"))
+        if (
+            refusal is not None
+            or not narinfo.is_file()
+            or blob is None
+            or not blob.is_file()
+        ):
+            continue  # completeness/blob checks report the concrete absence
+        narinfo_sizes = sizes(narinfo)
+        blob_sizes = sizes(blob)
+        apparent = narinfo_sizes[0] + blob_sizes[0]
+        allocated = narinfo_sizes[1] + blob_sizes[1]
+        apparent_total += apparent
+        allocated_total += allocated
+        if entry.get("cache_apparent_size") != apparent:
+            problems.append(
+                f"payload {entry.get('attr')!r}: cache_apparent_size is "
+                f"{entry.get('cache_apparent_size')!r}, filesystem says {apparent}"
+            )
+        if entry.get("cache_allocated_size") != allocated:
+            problems.append(
+                f"payload {entry.get('attr')!r}: cache_allocated_size is "
+                f"{entry.get('cache_allocated_size')!r}, filesystem says {allocated}"
+            )
+    cache_info = cache / "nix-cache-info"
+    if cache_info.is_file():
+        info_apparent, info_allocated = sizes(cache_info)
+        apparent_total += info_apparent
+        allocated_total += info_allocated
+        accounting = manifest.get("disk_accounting") or {}
+        if accounting.get("nix_cache_info_apparent_size") != info_apparent:
+            problems.append("nix-cache-info apparent size differs from manifest")
+        if accounting.get("nix_cache_info_allocated_size") != info_allocated:
+            problems.append("nix-cache-info allocated size differs from manifest")
+    totals = manifest.get("totals") or {}
+    if totals.get("cache_apparent_size") != apparent_total:
+        problems.append(
+            f"cache apparent total is {apparent_total}, manifest says "
+            f"{totals.get('cache_apparent_size')!r}"
+        )
+    if totals.get("cache_allocated_size") != allocated_total:
+        problems.append(
+            f"cache allocated total is {allocated_total}, manifest says "
+            f"{totals.get('cache_allocated_size')!r}"
+        )
     return problems
 
 
@@ -803,6 +1304,22 @@ def completeness_problems(cache: Path, manifest: dict) -> list[str]:
                 f"{field(pairs, 'StorePath')!r}, manifest says {store_path!r}"
             )
             continue
+        declared_fields = {
+            "URL": entry.get("url"),
+            "Compression": entry.get("compression"),
+            "FileHash": entry.get("file_hash"),
+            "FileSize": str(entry.get("file_size")),
+            "NarHash": entry.get("nar_hash"),
+            "NarSize": str(entry.get("nar_size")),
+            "References": " ".join(entry.get("references") or []),
+        }
+        for key, declared_value in declared_fields.items():
+            served_value = field(pairs, key)
+            if served_value != declared_value:
+                problems.append(
+                    f"payload {attr!r}: narinfo {key} is {served_value!r}, "
+                    f"manifest says {declared_value!r}"
+                )
         if isinstance(public_line, str) and public_line:
             if not verify_narinfo(pairs, public_line):
                 problems.append(
@@ -970,6 +1487,59 @@ def static_server(directory: Path):
     thread.start()
     try:
         yield f"http://127.0.0.1:{server.server_address[1]}"
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)
+
+
+@contextmanager
+def recording_static_server(directory: Path, overrides: dict[str, bytes] | None = None):
+    """Serve a cache while recording response status for every GET/HEAD.
+
+    `overrides` is deliberately in-memory.  The wide fanout mutation can serve
+    one re-signed narinfo without copying a 256 MiB cache or mutating the
+    immutable published generation.
+    """
+    records: list[tuple[str, str, int]] = []
+    record_lock = threading.Lock()
+    response_overrides = overrides or {}
+
+    class RecordingHandler(_QuietHandler):
+        def _request_path(self) -> str:
+            return self.path.partition("?")[0]
+
+        def send_response(self, code, message=None):
+            with record_lock:
+                records.append((self.command, self._request_path(), code))
+            return super().send_response(code, message)
+
+        def _send_override(self, include_body: bool) -> bool:
+            body = response_overrides.get(self._request_path())
+            if body is None:
+                return False
+            self.send_response(200)
+            self.send_header("Content-Type", "text/x-nix-narinfo")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            if include_body:
+                self.wfile.write(body)
+            return True
+
+        def do_GET(self):  # noqa: N802 - stdlib handler API
+            if not self._send_override(include_body=True):
+                super().do_GET()
+
+        def do_HEAD(self):  # noqa: N802 - stdlib handler API
+            if not self._send_override(include_body=False):
+                super().do_HEAD()
+
+    handler = functools.partial(RecordingHandler, directory=str(directory))
+    server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        yield f"http://127.0.0.1:{server.server_address[1]}", records
     finally:
         server.shutdown()
         server.server_close()

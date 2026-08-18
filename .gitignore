@@ -22,8 +22,10 @@ __pycache__/
 # are an output, not an input. `just fixtures` recreates them. Holds the
 # immutable generations and the `current` symlink that publishes one of them.
 /fixtures/out/
+/fixtures/out-wide/
 # The publication flock, taken beside the root it serialises.
 /fixtures/.out.*
+/fixtures/.out-wide.publish.lock
 
 
 # Raw routed-evidence run outputs (pcaps + run.json). The finalized

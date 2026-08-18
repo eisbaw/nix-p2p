@@ -875,6 +875,52 @@ find no fixture and go vacuously green. It runs under `just test`
 payload). Any CI must invoke those inside `nix develop`, not rely on
 `nix flake check` alone.
 
+### Independent `wide_closure` fixture (task-57)
+
+The `wide_closure` class is a separate frozen fixture family; it does not
+extend or replace the canonical four-path workload above, and ordinary e2e
+continues to use `fixtures/out`. Its identity comes from the independent
+one-line `fixtures/WIDE_WORKLOAD_VERSION`, currently
+`nix-p2p-fixture-workload-v1-wide-closure-v1`. That same value seeds
+the wide Nix derivations and is recorded in their manifest and lock, so a
+canonical `WORKLOAD_VERSION` bump cannot rekey this family. It
+publishes under `fixtures/out-wide`, with its independent, git-tracked review
+baseline at `fixtures/wide_closure.lock.json`; generated wide cache and
+generation artifacts remain gitignored.
+
+The class budget permits 128--512 independently substitutable members plus one
+root, hence 129--513 closure paths. The frozen v1 fixture is exactly 128
+distinct, locally built 2 MiB members plus one root, 129 store paths total.
+Every member is reference-free; the root's direct `References` set is exactly
+all 128 current members.
+The sum of the closure's signed, uncompressed `NarSize` values must stay in the
+inclusive integer range 268435456--2147483648 bytes. `FileSize` and either disk
+measure are not substitutes for that NarSize oracle.
+
+The disk budget covers regular files in the served `cache/` only. Each object's
+apparent/allocated contribution is its NAR blob plus its narinfo; the totals add
+`nix-cache-info` exactly once. Apparent bytes are `st_size`, allocated bytes are
+`st_blocks * 512`, and both totals must be at most 536870912 bytes. Allocated
+bytes are filesystem-specific evidence, not workload identity or a cross-host
+reproducibility claim. Each generation lock pins its locally observed
+`st_blocks`, and the checker verifies that observation against the same
+generation. The git baseline retains one reviewed observation; portable
+baseline/regeneration equality excludes only allocated-byte fields and
+independently enforces the integer budget on both generated trees while keeping
+every portable field exact. Actual peak headroom is higher because generation and
+verification can coexist with source, destination, determinism, retained
+generation, and Nix-store copies.
+
+`just fixtures-wide` generates and gates this family. Its positive control asks
+real Nix to substitute the root only into a fresh store and cache, then requires
+all 129 NARs, the exact direct fan-out, and the exact recursive closure. A
+re-signed root with one reference removed and a trial with one member
+pre-realised must each make that cold-closure oracle fail. The existing
+signature, content-hash, and export-repeatability bites still apply;
+`just fixtures-wide-verify-rebuild` separately proves build repeatability on
+this host. This fixture establishes workload shape and integrity only: it makes
+no concurrency, performance, knob-effect, or scale-sweep claim.
+
 # WAVE 2 grounding — real p2p, modeling & profiling (design-for-test)
 
 Companion to PRD "Wave 2 scope". Wave-1 signals S1–S5 still hold; these
@@ -1550,7 +1596,7 @@ they are never collapsed into a 144-level tuple.
 
 | Factor | v1 levels / generation rule |
 |---|---|
-| Workload | `small_head`: 1–8 paths and 1–32 MiB total NarSize; `wide_closure`: 128–512 paths and 256 MiB–2 GiB total NarSize; `large_tail`: at least one 64–256 MiB NarSize and at most 4 GiB total; `compression_mix`: at least 20 paths spanning all available upstream FileSize/NarSize quartiles. Complete workload candidates, not individual paths, are selected from the versioned catalog by the partition seed; a catalog unable to satisfy a stratum emits unsupported, never a hand-picked substitute. |
+| Workload | `small_head`: 1–8 paths and 1–32 MiB total NarSize; `wide_closure`: 128–512 independently substitutable members plus one root (129–513 closure paths total) and 256 MiB–2 GiB total NarSize; `large_tail`: at least one 64–256 MiB NarSize and at most 4 GiB total; `compression_mix`: at least 20 paths spanning all available upstream FileSize/NarSize quartiles. Complete workload candidates, not individual paths, are selected from the versioned catalog by the partition seed; a catalog unable to satisfy a stratum emits unsupported, never a hand-picked substitute. |
 | Topology stratum/template binding | Logical levels are `component_2_namespace`, `swarm_10_namespace`, `swarm_30_process`, and `real_3_network`. `component_2_namespace` supports `component_discovery` and `component_transfer`; `swarm_10_namespace` supports all three layers; `swarm_30_process` supports **only** `component_discovery` resource-law qualification and can never emit `component_transfer` or `full_real_nix`; `real_3_network` supports only `full_real_nix`. Once a topology-stratum and NAT/path pair is chosen, the seeded binding rule below selects one compatible concrete `topology_id` before any capacity-dependent factor. Unsupported backend/topology cells stay present, but a layer mismatch is structurally invalid. |
 | Requester/store state | Requester Nix store, XDG/Nix narinfo cache and daemon cache are fresh for every scored pair. Swarm seen fraction is `0`, `2500`, `5000`, or `10000` basis points. Provider identity persistence is `false` or `true`, never inherited accidentally. |
 | Holder selector | The fixed five-level domain is `none`, `one`, `two`, `half`, `all`. After `topology_id` is bound with exact provider capacity `P>=1`, resolve respectively to `0`, `min(1,P)`, `min(2,P)`, `ceil(P/2)`, and `P` holders. Placement is seed-derived and recorded, not inferred from either selector or count. |

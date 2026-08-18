@@ -10,9 +10,11 @@ Tracked (the definition):
 
 | File | Role |
 |---|---|
-| `WORKLOAD_VERSION` | The workload's identity. Quoted by `flake.nix`, embedded in every payload, and asserted to appear in `TESTING.md`. |
+| `WORKLOAD_VERSION` | The canonical workload's identity. Quoted by `flake.nix`, embedded in every canonical payload, and asserted to appear in `TESTING.md`. |
+| `WIDE_WORKLOAD_VERSION` | The independent wide family's identity and payload seed. A canonical version bump cannot rekey wide paths. |
 | `workload.nix` | The payload derivations. Exposed as `packages.fixture-<name>`. |
 | `workload.lock.json` | Store path, NarHash, FileHash and **tier** of every payload — a **demoted, git-tracked baseline**, NOT the runtime source of truth. It is the reviewable record of the frozen workload (so a `flake.lock` bump is caught at build time and shows in `git diff`), read only by the generator's freeze/`--write-lock` path and written only at `--write-lock`. No runtime or gate code opens it; the authoritative lock lives inside each generation (below). |
+| `wide_closure.lock.json` | The independent wide family's demoted, git-tracked review baseline, with per-member shape, size, reference and disk-accounting pins. Runtime readers use the lock inside `out-wide/current`; the tracked allocated-byte fields are one reviewed filesystem-local observation, not a cross-filesystem identity claim. |
 
 Generated, gitignored (`fixtures/out/`, created by `just fixtures`):
 
@@ -20,14 +22,14 @@ Generated, gitignored (`fixtures/out/`, created by `just fixtures`):
 |---|---|
 | `generations/gen-<sha>/` | One **immutable** generation, named by the SHA-256 of its `manifest.json`. Built and fully validated before it is named; never written to, renamed or mutated afterwards. |
 | `current` | Symlink to the published generation. **Every consumer resolves through this** — the gate, `just fixtures-serve`, task-5's containers. |
-| `previous` | Symlink to the generation `current` replaced. This is the *implementation* of the two-generation retention claim, not a decoration: the collector reads both links, so retention holds on the warm-reuse path too. `ls -l fixtures/out` shows exactly what is retained. |
+| `previous` | Symlink to the generation `current` replaced, or to `current` itself on first publication / repair when no valid predecessor exists. This is the *implementation* of the two-generation retention claim, not a decoration: the collector reads both links, so retention holds on the warm-reuse path too. `ls -l fixtures/out` shows exactly what is retained. |
 
 Inside a generation:
 
 | Path | Role |
 |---|---|
 | `cache/` | The binary cache itself: `nix-cache-info`, `<hash>.narinfo`, `nar/`. Plain static files - any file server is a sufficient mock upstream. |
-| `lock.json` | The **authoritative** lock — the runtime source of truth. Byte-identical content to the git baseline above, but resolved via `current -> gen-<sha>/lock.json` by the gate and every consumer. Because it lives inside the generation, the single symlink flip that publishes the tree commits its lock in the same syscall. |
+| `lock.json` | The **authoritative** lock — the runtime source of truth, resolved via `current -> gen-<sha>/lock.json` by the gate and every consumer. Canonical locks are byte-identical to their git baseline. Wide locks keep every portable field identical but pin the generation's own filesystem-local allocated-byte observation, which may differ from the reviewed baseline. Because the lock lives inside the generation, the single symlink flip that publishes the tree commits its lock in the same syscall. |
 | `manifest.json` | What was generated: version, tier, public key, per-path compression / NarHash / NarSize / URL. Consumers read this instead of globbing. |
 | `test-key.pub` | The one public key the harness client trusts. |
 | `test-key.UNSAFE-TEST-ONLY.sec` | The signing key. Derived at generation time from a seed phrase that **is** committed, so it is fully reconstructible and **not secret** — it is worthless test-only key material. Deriving it just keeps a high-entropy blob out of git and out of the secret scanner's way (see `scripts/fixturelib.py`). |
@@ -55,13 +57,28 @@ The git baseline is written, if at all, **after** the flip and only at
 `--write-lock`. A failure there is `success`-with-a-warning: the published tree
 is authoritative and self-describing; the git file merely lags, which shows in
 `git status` and is reconciled by re-running `--write-lock`. Nothing is rolled
-back, because that file is not authoritative.
+back, because that file is not authoritative. Every diagnostic on this committed
+path is output-poison-safe: a closed pipe or full stdout/stderr cannot turn the
+successful publication into a non-zero process exit during interpreter shutdown.
 
 Two generations are kept: the published one (`current`) and its predecessor
 (`previous`). Older ones are deleted only through a file descriptor opened
 `O_NOFOLLOW|O_DIRECTORY` whose ownership marker is verified with `openat` on
 that same descriptor — a directory swapped in after a by-path check is not what
 gets removed. A directory without the marker is never deleted, empty or not.
+The generator and `just reclaim` invoke this same collector under the same
+publication lock; both resolve `current` and `previous` through the held root
+and `generations/` descriptors before collection. Collect-only reclaim treats an
+absent root as a no-op and refuses an existing root without valid ownership and
+retention anchors. Generation is deliberately different: a malformed or dangling
+publication link is repairable, so it snapshots only valid anchored names before
+the flip, atomically establishes a valid `previous` (using the outgoing current,
+a valid old previous, or the installed new generation), and then flips `current`.
+Warm reuse distinguishes a valid absent `previous` from an existing malformed or
+dangling one; the latter is atomically retargeted to the validated `current`
+before collection or a successful return. Generation never performs another
+fallible retention read after publication, and every successful repair is
+immediately accepted by strict collect-only reclaim.
 
 **Confinement — and what it is and is not for.** The anchoring defends against
 exactly two things: an ancestor directory swapped for a symlink *concurrently*,
@@ -95,6 +112,57 @@ written via `mkstemp` and read with `O_NOFOLLOW`.
 A reader that resolved `current` before a publication keeps reading a complete,
 immutable tree rather than racing a rename; it survives at least one further
 publication before its generation becomes collectable.
+
+## Independent `wide_closure` family
+
+TASK-57's wide fixture is intentionally independent of the canonical four-path
+cache. The canonical cache and all existing e2e scenarios continue to use
+`fixtures/out` and `fixtures/workload.lock.json`; the wide cache publishes to
+`fixtures/out-wide` and has its own git-tracked review baseline,
+`fixtures/wide_closure.lock.json`. Its identity and payload seed come directly
+from the clean one-line `fixtures/WIDE_WORKLOAD_VERSION`, currently
+`nix-p2p-fixture-workload-v1-wide-closure-v1`. Generated wide cache and
+generation artifacts are large and gitignored.
+
+The class is `wide_closure`, with an explicit budget of 128--512 independently
+substitutable members plus one root (129--513 closure paths). The frozen v1
+fixture is exactly 128 distinct, locally built 2 MiB, reference-free members
+and one root, for 129 closure paths. The root directly references every member
+and nothing else. The lock records each object's signed `NarSize`, transport
+`FileSize`, URL, references, role, and cache footprint. The recomputed sum of
+signed, uncompressed NarSize must be between 268435456 and 2147483648 bytes,
+inclusive.
+
+Disk accounting has the closed scope `cache_regular_files_v1`: each object's
+apparent and allocated sizes include its NAR blob and narinfo, and the totals
+add `nix-cache-info` once. Apparent size is `st_size`; allocated size is
+`st_blocks * 512`. Both totals must be at most 536870912 bytes. Allocated size
+depends on the filesystem and is evidence for the local disk bound, not part of
+the workload's byte identity. Each generation lock pins its locally observed
+`st_blocks`, and the checker verifies it against that same generation. The git
+baseline retains one reviewed observation; portable baseline/regeneration
+equality excludes only allocated fields and independently enforces the budget
+on both trees before those local observations are masked. Consequently a plain
+wide regeneration is not promised to produce a byte-identical generation lock
+or tracked baseline on a filesystem with different block allocation, even when
+every portable workload field is identical. The budget is not a peak-workspace claim: allow
+headroom for simultaneous source, destination, determinism, retained-generation,
+and Nix-store copies.
+
+```sh
+nix develop -c just fixtures-wide                 # generate + full integrity/cold-closure gate
+nix develop -c just fixtures-wide-verify-rebuild  # rebuild all 128 members and the root
+```
+
+The gate substitutes only the root into a fresh Nix store and fresh narinfo
+cache, then requires successful requests and realised paths for all 129 NARs,
+the exact direct root fan-out, and the exact recursive closure. Its two negative
+controls re-sign a root after removing one member reference and pre-realise one
+member before the nominally cold trial; both must fail the closure/request
+oracle. Signature rejection, NAR content-hash rejection, export repeatability,
+and build repeatability remain biting checks. Nothing in this fixture measures
+substitution concurrency, performance, Nix knob effects, or scale-sweep
+behaviour.
 
 ## Regenerating
 
@@ -186,6 +254,17 @@ cost is paid deliberately rather than discovered later.
 3. Update the `TESTING.md` section — the gate fails until you do.
 4. Mark the existing measurement baseline retired wherever it is quoted.
 5. `nix develop -c just fixtures-verify-rebuild` before any new baseline is recorded.
+
+The independent wide family does not retire or redefine that canonical J2
+baseline. A deliberate wide workload change has its own procedure:
+
+1. Bump `fixtures/WIDE_WORKLOAD_VERSION`.
+2. `nix develop -c sh -c '"$NIX_P2P_PYTHON/bin/python3" scripts/gen-fixtures.py --wide --write-lock'`
+3. Update the wide fixture sections in `TESTING.md` and this file.
+4. Mark measurements tied to the old wide fixture version retired wherever
+   they are quoted.
+5. `nix develop -c just fixtures-wide-verify-rebuild` before relying on the new
+   wide baseline.
 
 Rewriting the lock **without** bumping the version is refused: it would rebind
 a version string that measurements already cite, so old and new numbers would

@@ -64,13 +64,11 @@ _headroom:
         exit 1
     fi
 
-# Only THIS user's podman objects and THIS project's rebuildable artifacts - never
-# another session's files. Prunes podman images/volumes/build-cache, drops
-# unreferenced fixture generations, prunes stale git worktrees, and clears the cargo
-# target dir(s). Reports bytes freed. The next build after this is COLD by design.
-# See scripts/reclaim.sh.
-# Reclaim this project's rebuildable disk footprint + podman safely (reports bytes freed).
-reclaim:
+# Only THIS user's podman objects and THIS project's rebuildable artifacts. Retains
+# current+previous fixture generations, prunes stale worktrees, and clears cargo
+# targets. Reports bytes freed; the next build is cold. See scripts/reclaim.sh.
+# Reclaim this project's rebuildable footprint and rootless Podman objects safely.
+reclaim: _python
     scripts/reclaim.sh
 
 # Refuse to run the fixture gates against anything but the pinned Python.
@@ -254,6 +252,11 @@ fixtures-large: _python
     "${NIX_P2P_PYTHON}/bin/python3" scripts/gen-fixtures.py --large
     "${NIX_P2P_PYTHON}/bin/python3" scripts/check-fixtures.py --require-tier full
 
+# Build and gate the opt-in 128-member wide fixture under fixtures/out-wide.
+fixtures-wide: _headroom _python
+    "${NIX_P2P_PYTHON}/bin/python3" scripts/gen-fixtures.py --wide
+    "${NIX_P2P_PYTHON}/bin/python3" scripts/check-fixtures.py --require-tier wide
+
 # Rebuilds every payload derivation and compares against the realised output.
 # Slow by construction, so it is not in `just test` - but it is REQUIRED before
 # the J2 baseline is recorded: `just test` only proves export is repeatable,
@@ -261,6 +264,10 @@ fixtures-large: _python
 # Prove the fixture payloads BUILD deterministically, not just export so.
 fixtures-verify-rebuild: _python
     "${NIX_P2P_PYTHON}/bin/python3" scripts/check-rebuild.py
+
+# Prove each wide member and its root rebuild identically on this host.
+fixtures-wide-verify-rebuild: _headroom _python
+    "${NIX_P2P_PYTHON}/bin/python3" scripts/check-rebuild.py --wide
 
 # A Nix binary cache is static files, so any file server does; the containers
 # in task-5 serve the same tree their own way. Served through `current`, the
