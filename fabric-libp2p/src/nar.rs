@@ -1,92 +1,64 @@
-//! The libp2p NAR byte-transfer protocol `/nix-p2p/<scope>/nar/3`: a RAW libp2p-stream
-//! protocol (`AsyncRead`/`AsyncWrite` per call, TASK-157) carried over the SAME
-//! [`Swarm`](crate::swarm) as the kad+identify discovery behaviour. It REPLACES the
-//! original request-response carrier (TASK-151, protocol `/nar/1`), which buffered the
-//! whole NAR: bytes now FLOW as a stream, so the fetcher aborts mid-transfer at exactly
-//! the signed size and the server streams produced bytes OFF the poll loop. This module
-//! owns the WIRE framing ([`write_request`] / [`read_response_streamed`] / [`serve_stream`]),
-//! the substrate-internal supply seam the server produces bytes through, and the task-72
-//! admission gate that bounds what serving may cost.
+//! Bao-authenticated NAR transfer over the wholesale
+//! `/nix-p2p/<scope>/nar/4` libp2p-stream protocol.
 //!
-//! ## Two halves, one protocol
+//! The response declares exact RawNarV1 size and one response-global codec, then carries a
+//! full-range Bao preorder traversal over fixed 64-KiB raw leaves. Parent pairs stay raw;
+//! zstd uses one independently bounded frame per leaf. A fetch exposes each non-final leaf
+//! only after Bao authenticates it against the requested [`Blake3Digest`], and withholds final
+//! completion until `N4OK` plus clean FIN. Only v4 is registered; falling back to v3 would drop
+//! this security property.
 //!
-//!   * FETCH ([`crate::transport::Libp2pTransport`]): open a stream to a provider peer,
-//!     send a 32-byte [`Blake3Digest`] request, then STREAM the raw NAR bytes back with a
-//!     mid-stream size abort ([`read_response_streamed`], AC#1) and an inter-chunk idle
-//!     bound (AC#2), gate-1 BLAKE3-verifying them against the requested digest.
-//!   * SERVE ([`crate::server::Libp2pServer`]): answer an inbound digest request from a
-//!     substrate-internal [`Libp2pNarSupplier`] on a task OFF the poll loop
-//!     ([`serve_stream`], AC#3), admitting it against a [`ServeBudget`] BEFORE producing
-//!     any bytes (the peer-triggerable-OOM defense).
+//! Process-backed serving is bounded two-pass regeneration, not literal one-pass passthrough:
+//! pass 1 creates a declared-size-derived ephemeral outboard and verifies exact EOF, exit zero,
+//! and the requested root; pass 2 regenerates and authenticates every leaf against that outboard
+//! before socket write. Neither pass retains the whole NAR. This preserves roughly the prior
+//! proof-preparation delay and performs a second dump, so it is not an absolute-TTFB improvement.
+//! One absolute serve deadline covers request parsing, both passes, socket backpressure,
+//! COMPLETE, and FIN; cancellation kills and reaps owned process groups under a separately
+//! bounded measured tail.
 //!
-//! The concrete wire form is documented on the raw-stream wire functions below.
-//!
-//! ## Honest scope (filed as follow-ups, not faked)
-//!
-//!   * GATE-1 GRANULARITY. The SIZE abort is truly mid-stream (AC#1), but per-CHUNK
-//!     byte-corruption detection (a flipped byte caught before EOF, as iroh-blobs' bao
-//!     does) needs a bao outboard tree interleaved on the wire; this transport carries the
-//!     raw NAR alone, so BYTE corruption is caught at stream completion via the frozen
-//!     [`Blake3Digest::from_raw_nar`] recipe (single pass, memory bounded to the size cap +
-//!     one chunk), never after a second full buffer-and-rehash. The trust property holds -
-//!     a corrupt peer fails the fetch - only the detection is at EOF, not per chunk. TASK-197.
-//!   * SERVE PRODUCTION still BUFFERS the produced NAR before streaming it out, because the
-//!     serve-time integrity recheck (`len == declared_size` AND `BLAKE3(RawNarV1) == content`,
-//!     "never ship the wrong bytes under the right name") must complete BEFORE any byte is
-//!     shipped. The bytes reach the fetcher as a true stream; producing them by piping a
-//!     `nix-store --dump` stdout STRAIGHT to the socket (no serve-side buffer) would need
-//!     the same bao outboard so the recheck can be incremental. TASK-197 (same follow-up).
-//!   * PRODUCTION PLACEMENT (TASK-193, now extended). A [`NarSource::Process`] (store-dump /
-//!     raw-NAR helper) is produced OFF the poll loop; with libp2p-stream the ENTIRE inbound
-//!     serve - including the Memory inline case - runs on a spawned per-stream task
-//!     ([`serve_stream`]), so nothing but connection muxing touches the poll loop. A Process
-//!     reservation is held across the off-loop await (the in-flight ceiling BINDS via a CAS
-//!     reserve), production is RACED against the consumer hanging up (a dropped stream reaps
-//!     the supervised group), and `max_serve_duration` is now ENFORCED as a real serve
-//!     deadline around production ([`ServeGate::produce_admitted`]).
-//!   * A REAL node's store-dump / regular-file supplier ([`CatalogNarSupplier`] over the
-//!     [`CatalogProbe`] digest->store-path seam, regenerating on demand via a supervised
-//!     process group, mirroring `fabric-iroh`'s producer) LANDED in TASK-158 and is
-//!     exercised directly by this module's tests. It is NOT yet wired into the shipped
-//!     `daemon-libp2p` provider - that provider still stands up on the in-memory
-//!     [`MemoryNarSupplier`] from `--libp2p-seed-nar` files (TASK-178). Replacing that
-//!     with the store-dump supplier so a peer serves a `/nix/store` path it never held
-//!     as a `.nar`, plus the container e2e, is TASK-191 (the daemon consumer of this
-//!     capability; iroh analogue TASK-83). Supervised Process production is reachable from
-//!     the shipped serve loop OFF the poll thread (TASK-193) and now streams to the fetcher
-//!     over the raw-stream transport (TASK-157).
+//! The transport pipeline is bounded to codec/process chunks, one encoded leaf, one
+//! transport-owned verified raw leaf, and O(tree depth), plus the provider's ephemeral outboard.
+//! The raw-leaf bound assumes pull discipline: the verifier advances only when the caller asks
+//! for the next leaf, but returned [`bytes::Bytes`] can of course be cloned and retained by that
+//! caller. [`VerifiedNarStream`] is a crate-internal bounded handoff; TASK-62 still must expose it
+//! through `peer-fabric::NarStream`, connect that public stream to HTTP, and measure the real
+//! consumer high-water mark. The current [`crate::transport::Libp2pTransport`] compatibility path
+//! collects verified leaves into one `Vec`, so socket-to-HTTP memory remains O(N) until TASK-62.
 
 use std::ffi::OsString;
 use std::io;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock};
 use std::time::Duration;
 
-use tokio::sync::{OwnedSemaphorePermit, Semaphore};
+use tokio::sync::Semaphore;
 
 use futures::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
-use proc_supervisor::TaskSupervisorHandle;
-
-use peer_fabric::{
-    Blake3Digest, BoundedZstdDecoder, CodecChoiceReason, DecodeError, ServeBudget,
-    ServeCodecPolicy, StreamingZstdEncoder, TransferError, WireCodec, negotiate_serve_codec,
+use proc_supervisor::{
+    ProcessCleanupTicket, SupervisedProcessCompletion, SupervisedProcessStream,
+    TaskSupervisorHandle,
 };
 
-/// The absolute ceiling on a single NAR response the FETCH side will read off the
-/// wire, whatever the per-call `expected_size`. It is the peer-triggerable-OOM floor: a
-/// lying provider that declares a length over this is aborted BEFORE allocation.
+use peer_fabric::{
+    Blake3Digest, CodecChoiceReason, ServeBudget, ServeCodecPolicy, TransferError, WireCodec,
+    negotiate_serve_codec,
+};
+
+use crate::nar_v4;
+
+/// The fallback ceiling on a NAR response when FETCH has no signed/caller-provided
+/// `expected_size`. It is the cold-start peer-triggerable-OOM guard: an untrusted provider
+/// that declares a length over this is aborted before allocation.
 ///
-/// It is pinned to the `peer_fabric` serve default single-NAR ceiling
+/// The fallback is pinned to the `peer_fabric` serve default single-NAR ceiling
 /// ([`ServeBudget::default().max_nar_bytes_uncompressed_nar`] = 256 MiB), asserted by
 /// `max_response_cap_tracks_the_serve_default` so the two cannot silently drift when
-/// TASK-120 moves the authoritative ceiling. CAVEAT: because it is a FIXED const, it is
-/// also a hard FUNCTIONAL ceiling on the fetch side - a node configured (via a larger
-/// [`ServeBudget`]) to serve NARs bigger than this cannot be fetched over libp2p, and a
-/// cold-start fetch (`expected_size == None`) of a > 256 MiB NAR hard-fails. Since TASK-157
-/// the fetch is a true stream: when the caller SIGNED an `expected_size` the running abort
-/// caps at exactly that (this const is only the floor for the cold-start `None` case), so a
-/// lying provider is cut off at the signed size, never at this 256 MiB const.
+/// TASK-120 moves the authoritative default. It is not an absolute ceiling when a caller
+/// supplies `Some(expected_size)`: that exact size is the cap, even above 256 MiB, so an
+/// explicitly configured larger serve remains fetchable when its signed size is known.
+/// Only a cold-start `expected_size == None` fetch above this fallback hard-fails.
 pub const MAX_NAR_RESPONSE_BYTES: u64 = 256 * 1024 * 1024;
 
 // Response status bytes.
@@ -145,7 +117,8 @@ impl std::fmt::Display for DeclineReason {
 }
 
 /// A fetch response the [`ServeGate`] produces for one inbound request. `Nar` carries the
-/// raw (uncompressed) NAR bytes; the requester gate-1 BLAKE3-verifies them before use.
+/// raw (uncompressed) NAR bytes; `/nar/4` Bao-authenticates each leaf against the requested
+/// BLAKE3 before use and requires terminal COMPLETE + clean FIN.
 /// This is the SERVER-SIDE outcome type; on the wire it is framed by [`write_response`].
 #[derive(Debug, Clone)]
 pub enum NarResponse {
@@ -154,114 +127,449 @@ pub enum NarResponse {
     /// The provider declined to serve it (over budget / supply error).
     Declined(DeclineReason),
     /// The raw NAR bytes.
-    Nar(Vec<u8>),
+    Nar(Arc<Vec<u8>>),
 }
 
 // -------------------------------------------------------------------------
-// The RAW-STREAM NAR wire (TASK-157, + TASK-99 per-connection codec negotiation): bytes flow
-// as a stream, not a buffered request/response. The ADDRESSED UNIT on the wire is unchanged -
-// the exact `RawNarV1` bytes keyed by BLAKE3 - only the framing that MOVES them peer to peer
-// changed (the churnable transport layer, not a frozen surface). TASK-99 bumps the protocol
-// to `/nix-p2p/<scope>/nar/3` (wholesale, as TASK-157 replaced `/nar/1` with `/nar/2`; no
-// dual-accept) and adds an explicit per-connection codec byte, so a peer may serve the nar
-// COMPRESSED (negotiated zstd) while still being addressed by BLAKE3 of the UNCOMPRESSED nar.
+// `/nar/4` changes only the churnable transport framing. The addressed unit remains exact
+// RawNarV1 keyed by BLAKE3; response-global compression never changes the content identity.
 //
-// Wire form (over one raw substream of `/nix-p2p/<scope>/nar/3`):
+// Wire form (over one raw substream of `/nix-p2p/<scope>/nar/4`):
 //   Request  = 32 raw digest bytes + 1 `accept` byte (the codec bitmask the FETCHER can
-//              DECODE: bit0=raw MANDATORY, bit1=zstd - see peer_fabric::codec). The requester
-//              then KEEPS its write half OPEN for the whole transfer (the "still interested"
-//              signal the server races production against - see `serve_stream`), closing only
-//              when done reading.
+//              decode: bit0=raw mandatory, bit1=zstd). It keeps the write half open as the
+//              "still interested" signal raced by `serve_stream`.
 //   Response = 1 status byte, then:
-//     * `0` NotHeld  - nothing follows; the server closes its write half.
-//     * `1` Nar      - 1 `codec` byte (the codec the SERVER chose, always one the fetcher
-//                      offered; raw is the mandatory floor), then the body STREAMED to EOF
-//                      (NO length prefix, mirroring fabric-iroh's bao stream):
-//                        - codec 0 (raw):  the raw NAR bytes; the reader counts them and
-//                          aborts the INSTANT cumulative bytes exceed the per-call bound.
-//                        - codec 1 (zstd): a single zstd frame; the reader DECODES it
-//                          INCREMENTALLY and counts DECOMPRESSED bytes against the same
-//                          signed-NarSize bound, aborting mid-stream on a bomb, and caps the
-//                          compressed input at that bound too (a "compressed" body larger
-//                          than the raw nar is a lie). Either way memory is bounded and the
-//                          decoded bytes are gate-1 BLAKE3-verified - a corrupt/truncated
-//                          frame fails the fetch, never yields a short/wrong nar.
-//                      The server closes its write half at the end; that EOF is how the
-//                      reader knows the (length-prefix-free) body is complete.
+//     * `0` NotHeld  - nothing follows; clean FIN.
+//     * `1` Nar      - 1 codec byte + raw_size u64 LE, canonical full-range Bao preorder:
+//                      raw 64-byte parent pairs; each raw leaf verbatim, or for zstd a bounded
+//                      u32 LE length plus one independent frame. `N4OK`, then clean FIN.
 //     * `2` Declined - 1 reason byte (for the caller's log; the fetch still fails).
 // -------------------------------------------------------------------------
 
-/// The chunk the fetch read loop pulls per step. The running size cap is enforced AFTER
-/// each chunk, so peak fetch memory is bounded by `expected_size + NAR_STREAM_CHUNK` (the
-/// "bound + one chunk" property fabric-iroh states for its bao leaf).
+/// Socket-pump chunk size. Channels are capacity one and the decoder additionally bounds one
+/// encoded leaf and one raw leaf; this is not the compatibility collector's O(N) allocation.
 const NAR_STREAM_CHUNK: usize = 64 * 1024;
 
-/// The raw-input block the serve-side STREAMING compressor consumes per step (TASK-203): small
-/// enough that the first compressed bytes ship early and the serve deadline preempts at a fine
-/// grain, large enough that per-block channel/await overhead stays negligible. Mirrors the codec's
-/// decode block.
-const SERVE_COMPRESS_INPUT_BLOCK: usize = 128 * 1024;
+/// Bao hashing/verification is synchronous and intentionally runs off the async
+/// runtime. Independent fixed pools bound serve/proof workers and fetch verifiers.
+/// They must remain independent: a serve encoder can wait on socket backpressure,
+/// while its reciprocal fetch must be able to start a verifier and drain that
+/// socket. One shared pool creates a circular-wait deadlock under saturation.
+// Preserve the prior 64-worker capacity independently in each direction. A
+// 32/32 split would avoid the deadlock but silently halve pure-serve and
+// pure-fetch capacity without measurement; TASK-247 owns higher-concurrency
+// tuning/evidence. The combined ceiling is still explicit and finite (128).
+const BAO_SERVE_WORKER_MAX_CONCURRENT: usize = 64;
+const BAO_FETCH_WORKER_MAX_CONCURRENT: usize = 64;
 
-/// How many compressed blocks may sit in the serve compressor->writer channel at once. A small
-/// bound so a slow/non-reading consumer BACKPRESSURES the off-worker compressor (bounded memory:
-/// a few blocks on top of the already-resident raw nar) rather than letting it race ahead and
-/// buffer the whole compressed nar.
-const SERVE_COMPRESS_BLOCKS_IN_FLIGHT: usize = 2;
-
-/// The FIXED ceiling on how many detached serve-side blocking compressors may be running at once
-/// (TASK-203 F2). Each [`write_zstd_streamed`] holds ONE permit from before it spawns its
-/// `spawn_blocking` compressor until that closure EXITS - so however fast serves are aborted (a
-/// deadline/consumer drop returns the async future while the blocking compressor is still
-/// finishing its current block), the number of live compressor tails cannot exceed this bound and
-/// the blocking pool never accumulates unboundedly. A serve that finds all permits taken simply
-/// awaits one under its own serve deadline (the acquire is inside the deadline-bound
-/// `write_response`), so this is backpressure, not a leak. The tail at the default level 3 is
-/// sub-millisecond; the point is that it is BOUNDED and COUNTED, not unaccounted.
-const SERVE_COMPRESS_MAX_CONCURRENT: usize = 64;
-
-/// The fixed-capacity permit pool gating detached serve compressors (see
-/// [`SERVE_COMPRESS_MAX_CONCURRENT`]). Never closed, so `acquire_owned` never errors.
-static SERVE_COMPRESS_SLOTS: LazyLock<Arc<Semaphore>> =
-    LazyLock::new(|| Arc::new(Semaphore::new(SERVE_COMPRESS_MAX_CONCURRENT)));
-
-/// The number of serve-side blocking compressors CURRENTLY between SPAWN and closure exit - the
-/// live gauge [`CompressorSlot`] maintains. The slot is entered in the ASYNC context BEFORE
-/// `spawn_blocking` (not lazily when the blocking pool first runs the closure), so a compressor
-/// that is spawned but still QUEUED on the blocking pool is already counted here - the gauge cannot
-/// read low while spawns are pending. Bounded by [`SERVE_COMPRESS_MAX_CONCURRENT`] (the permit is
-/// held for exactly this interval, so at most that many slots exist at once); returns to zero once
-/// every producer has stopped. The F2 stress test asserts it climbs to the ceiling under a burst
-/// (proving queued work is counted), never exceeds it, and drains to zero after repeated aborts.
-static ACTIVE_SERVE_COMPRESSORS: AtomicUsize = AtomicUsize::new(0);
-
-/// RAII guard for one detached compressor: bumps [`ACTIVE_SERVE_COMPRESSORS`] when it is
-/// constructed (in the ASYNC context, BEFORE `spawn_blocking`) and drops it when the blocking
-/// closure EXITS (every early `return` included) - or, if the pool never runs the closure, when the
-/// closure is dropped. It HOLDS the [`SERVE_COMPRESS_SLOTS`] permit for the same interval so
-/// concurrency PLUS queued work stays bounded. Constructing it before the spawn - and moving it
-/// INTO the closure - is what makes a spawned-but-queued or aborted-serve compressor both COUNTED
-/// and CAPPED instead of an unaccounted blocking-pool entry.
-struct CompressorSlot {
-    _permit: OwnedSemaphorePermit,
+struct BaoWorkerPools {
+    serve: Arc<Semaphore>,
+    fetch: Arc<Semaphore>,
 }
 
-impl CompressorSlot {
-    /// Enter the pool: take the gauge slot for a permit already acquired in the async context.
-    /// Call this BEFORE `spawn_blocking` and move the returned guard into the closure.
-    fn enter(permit: OwnedSemaphorePermit) -> Self {
-        ACTIVE_SERVE_COMPRESSORS.fetch_add(1, Ordering::AcqRel);
-        CompressorSlot { _permit: permit }
+impl BaoWorkerPools {
+    fn new(serve: usize, fetch: usize) -> Self {
+        assert!(serve > 0, "Bao serve worker pool must not be empty");
+        assert!(fetch > 0, "Bao fetch worker pool must not be empty");
+        Self {
+            serve: Arc::new(Semaphore::new(serve)),
+            fetch: Arc::new(Semaphore::new(fetch)),
+        }
+    }
+
+    async fn acquire_serve(&self) -> tokio::sync::OwnedSemaphorePermit {
+        Arc::clone(&self.serve)
+            .acquire_owned()
+            .await
+            .expect("Bao serve worker semaphore is never closed")
+    }
+
+    async fn acquire_fetch(&self) -> tokio::sync::OwnedSemaphorePermit {
+        Arc::clone(&self.fetch)
+            .acquire_owned()
+            .await
+            .expect("Bao fetch worker semaphore is never closed")
     }
 }
 
-impl Drop for CompressorSlot {
-    fn drop(&mut self) {
-        ACTIVE_SERVE_COMPRESSORS.fetch_sub(1, Ordering::AcqRel);
+static BAO_WORKER_POOLS: LazyLock<BaoWorkerPools> = LazyLock::new(|| {
+    BaoWorkerPools::new(
+        BAO_SERVE_WORKER_MAX_CONCURRENT,
+        BAO_FETCH_WORKER_MAX_CONCURRENT,
+    )
+});
+
+const REAP_TAIL_TIMEOUT: Duration = Duration::from_secs(2);
+
+#[derive(Debug)]
+enum ProcessServeError {
+    /// Source start/replay, exactness, exit, root, or Bao authentication failed.
+    Supply(String),
+    /// The peer/socket failed after supply had been admitted.
+    Transport(String),
+}
+
+#[derive(Debug)]
+enum ResponseWriteError {
+    /// Resident bytes, root, or Bao framing did not match the admitted supply.
+    Supply(String),
+    /// Writing, flushing, or closing the peer stream failed.
+    Transport(io::Error),
+}
+
+impl std::fmt::Display for ResponseWriteError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Supply(why) => write!(formatter, "supply failed: {why}"),
+            Self::Transport(error) => write!(formatter, "transport failed: {error}"),
+        }
     }
+}
+
+#[derive(Clone, Default)]
+struct ServeProcessCleanup {
+    tickets: Arc<std::sync::Mutex<Vec<ProcessCleanupTicket>>>,
+}
+
+impl ServeProcessCleanup {
+    fn track(&self, ticket: ProcessCleanupTicket) {
+        match self.tickets.lock() {
+            Ok(mut tickets) => tickets.push(ticket),
+            Err(poisoned) => poisoned.into_inner().push(ticket),
+        }
+    }
+
+    async fn cancel_and_wait(&self) -> (usize, u128, bool) {
+        let tickets = match self.tickets.lock() {
+            Ok(tickets) => tickets.clone(),
+            Err(poisoned) => poisoned.into_inner().clone(),
+        };
+        for ticket in &tickets {
+            ticket.cancel();
+        }
+        let started = std::time::Instant::now();
+        let waits = futures::future::join_all(tickets.iter().map(|ticket| ticket.wait_reaped()));
+        let completed = tokio::time::timeout(REAP_TAIL_TIMEOUT, waits)
+            .await
+            .is_ok_and(|results| results.into_iter().all(|result| result.is_ok()));
+        (tickets.len(), started.elapsed().as_nanos(), completed)
+    }
+}
+
+struct BlockingChunkReader {
+    receiver: tokio::sync::mpsc::Receiver<io::Result<Vec<u8>>>,
+    current: io::Cursor<Vec<u8>>,
+    terminal_error: Option<io::Error>,
+}
+
+impl BlockingChunkReader {
+    fn new(receiver: tokio::sync::mpsc::Receiver<io::Result<Vec<u8>>>) -> Self {
+        Self {
+            receiver,
+            current: io::Cursor::new(Vec::new()),
+            terminal_error: None,
+        }
+    }
+}
+
+impl io::Read for BlockingChunkReader {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        loop {
+            if self.current.position() as usize != self.current.get_ref().len() {
+                return self.current.read(buf);
+            }
+            if let Some(error) = self.terminal_error.take() {
+                return Err(error);
+            }
+            match self.receiver.blocking_recv() {
+                Some(Ok(chunk)) if chunk.is_empty() => continue,
+                Some(Ok(chunk)) => self.current = io::Cursor::new(chunk),
+                Some(Err(error)) => self.terminal_error = Some(error),
+                None => return Ok(0),
+            }
+        }
+    }
+}
+
+struct BlockingChunkWriter {
+    sender: tokio::sync::mpsc::Sender<OwnedWireChunk>,
+}
+
+/// One ownership-preserving encoder-to-socket handoff. The encoder waits for
+/// `recycle` before it can produce another item, so removing an item from the
+/// capacity-one channel is not mistaken for completing its socket write.
+struct OwnedWireChunk {
+    bytes: Vec<u8>,
+    recycle: std::sync::mpsc::Sender<Vec<u8>>,
+}
+
+/// Explicit terminal framing between the async socket pump and the blocking
+/// Bao verifier. The verifier stream also retains a cancellation sender, so
+/// relying on "all senders dropped" for EOF would deadlock successful fetches:
+/// the collector cannot call `finish` (and drop that sender) until the
+/// verifier has itself observed EOF. Keep transport termination in the data
+/// model instead of inferring it from channel ownership.
+enum BaoWireItem {
+    Data(Vec<u8>),
+    Error(io::Error),
+    End,
+}
+
+struct BlockingBaoWireReader {
+    receiver: tokio::sync::mpsc::Receiver<BaoWireItem>,
+    current: io::Cursor<Vec<u8>>,
+    terminal_error: Option<io::Error>,
+    ended: bool,
+}
+
+impl BlockingBaoWireReader {
+    fn new(receiver: tokio::sync::mpsc::Receiver<BaoWireItem>) -> Self {
+        Self {
+            receiver,
+            current: io::Cursor::new(Vec::new()),
+            terminal_error: None,
+            ended: false,
+        }
+    }
+}
+
+impl io::Read for BlockingBaoWireReader {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        loop {
+            if self.current.position() as usize != self.current.get_ref().len() {
+                return self.current.read(buf);
+            }
+            if let Some(error) = self.terminal_error.take() {
+                return Err(error);
+            }
+            if self.ended {
+                return Ok(0);
+            }
+            match self.receiver.blocking_recv() {
+                Some(BaoWireItem::Data(chunk)) if chunk.is_empty() => continue,
+                Some(BaoWireItem::Data(chunk)) => self.current = io::Cursor::new(chunk),
+                Some(BaoWireItem::Error(error)) => {
+                    self.terminal_error = Some(error);
+                    self.ended = true;
+                }
+                Some(BaoWireItem::End) => self.ended = true,
+                None => {
+                    self.terminal_error = Some(io::Error::new(
+                        io::ErrorKind::UnexpectedEof,
+                        "Bao wire sender disappeared without explicit transport End",
+                    ));
+                    self.ended = true;
+                }
+            }
+        }
+    }
+}
+
+impl BlockingChunkWriter {
+    fn new(sender: tokio::sync::mpsc::Sender<OwnedWireChunk>) -> Self {
+        Self { sender }
+    }
+}
+
+impl nar_v4::OwnedWireSink for BlockingChunkWriter {
+    fn write_owned(&mut self, bytes: Vec<u8>) -> io::Result<Vec<u8>> {
+        let (recycle, recycled) = std::sync::mpsc::channel();
+        self.sender
+            .blocking_send(OwnedWireChunk { bytes, recycle })
+            .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "wire consumer closed"))?;
+        recycled.recv().map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "wire consumer closed before completing the socket write",
+            )
+        })
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+/// Receiver of independently Bao-authenticated RawNarV1 leaves. The final leaf
+/// appears only after the decoder has consumed COMPLETE and clean EOF. This is
+/// the crate-internal bounded primitive TASK-62 will expose through
+/// `peer-fabric::NarStream` and connect to the HTTP body; it is not a daemon API
+/// yet. The current `NarTransfer::fetch -> Vec` path is only a collector wrapper
+/// around it. Its one-raw-leaf invariant covers transport-owned buffers under
+/// pull-based use: a caller can retain clones of returned `Bytes`, and TASK-62
+/// must include the real HTTP consumer in its end-to-end memory oracle.
+pub(crate) struct VerifiedNarStream {
+    leaves: tokio::sync::mpsc::Receiver<VerifiedLeaf>,
+    verifier: tokio::task::JoinHandle<io::Result<u64>>,
+    expected: Blake3Digest,
+    cancel: tokio::sync::mpsc::Sender<BaoWireItem>,
+    transport_failure: Arc<std::sync::Mutex<Option<String>>>,
+    previous_leaf_release: Option<std::sync::mpsc::Sender<()>>,
+    leaves_finished: bool,
+}
+
+struct VerifiedLeaf {
+    bytes: bytes::Bytes,
+    release_on_next_pull: std::sync::mpsc::Sender<()>,
+}
+
+impl VerifiedNarStream {
+    pub(crate) async fn next_leaf(&mut self) -> Option<bytes::Bytes> {
+        // Do not let the verifier allocate the next raw leaf until the caller
+        // asks for it. `mpsc` capacity alone is insufficient because a send
+        // completes when queued. This is pull discipline, not a Bytes-drop
+        // oracle: callers may retain or clone earlier leaves.
+        if let Some(release) = self.previous_leaf_release.take() {
+            let _ = release.send(());
+        }
+        match self.leaves.recv().await {
+            Some(leaf) => {
+                self.previous_leaf_release = Some(leaf.release_on_next_pull);
+                Some(leaf.bytes)
+            }
+            None => {
+                self.leaves_finished = true;
+                None
+            }
+        }
+    }
+
+    pub(crate) async fn finish(mut self) -> Result<u64, TransferError> {
+        if !self.leaves_finished {
+            self.leaves.close();
+            // Dropping this acknowledgement releases a verifier blocked after
+            // handing out the previous leaf. It then fails closed rather than
+            // leaking a blocking worker while cancellation is delivered.
+            self.previous_leaf_release.take();
+            let _ = self
+                .cancel
+                .send(BaoWireItem::Error(io::Error::new(
+                    io::ErrorKind::Interrupted,
+                    "verified stream finish called before leaf EOF",
+                )))
+                .await;
+            let _ = self.verifier.await;
+            return Err(TransferError::Unavailable(format!(
+                "verified stream for {} was finished before all authenticated leaves were pulled",
+                self.expected
+            )));
+        }
+        let result = self.verifier.await.map_err(|error| {
+            TransferError::Unavailable(format!(
+                "Bao verifier worker failed for {}: {error}",
+                self.expected
+            ))
+        })?;
+        match result {
+            Ok(bytes) => Ok(bytes),
+            Err(error) => {
+                let transport_failure = match self.transport_failure.lock() {
+                    Ok(mut failure) => failure.take(),
+                    Err(poisoned) => poisoned.into_inner().take(),
+                };
+                if let Some(why) = transport_failure {
+                    Err(TransferError::Unavailable(why))
+                } else {
+                    Err(TransferError::AuthenticationFailed {
+                        expected: self.expected,
+                        reason: error.to_string(),
+                    })
+                }
+            }
+        }
+    }
+}
+
+pub(crate) struct VerifiedNarWireSink {
+    sender: tokio::sync::mpsc::Sender<BaoWireItem>,
+    transport_failure: Arc<std::sync::Mutex<Option<String>>>,
+}
+
+impl VerifiedNarWireSink {
+    async fn send(&self, chunk: Vec<u8>) -> Result<(), ()> {
+        self.sender
+            .send(BaoWireItem::Data(chunk))
+            .await
+            .map_err(|_| ())
+    }
+
+    async fn fail(&self, error: io::Error) {
+        let why = error.to_string();
+        match self.transport_failure.lock() {
+            Ok(mut failure) => *failure = Some(why),
+            Err(poisoned) => *poisoned.into_inner() = Some(why),
+        }
+        let _ = self.sender.send(BaoWireItem::Error(error)).await;
+    }
+
+    async fn finish(&self) -> Result<(), ()> {
+        self.sender.send(BaoWireItem::End).await.map_err(|_| ())
+    }
+
+    async fn closed(&self) {
+        self.sender.closed().await;
+    }
+}
+
+pub(crate) async fn verified_nar_stream(
+    content: Blake3Digest,
+    raw_size: u64,
+    codec: WireCodec,
+) -> (VerifiedNarWireSink, VerifiedNarStream) {
+    verified_nar_stream_with_pools(content, raw_size, codec, &BAO_WORKER_POOLS).await
+}
+
+async fn verified_nar_stream_with_pools(
+    content: Blake3Digest,
+    raw_size: u64,
+    codec: WireCodec,
+    pools: &BaoWorkerPools,
+) -> (VerifiedNarWireSink, VerifiedNarStream) {
+    let permit = pools.acquire_fetch().await;
+    let (wire_tx, wire_rx) = tokio::sync::mpsc::channel::<BaoWireItem>(1);
+    let (leaf_tx, leaf_rx) = tokio::sync::mpsc::channel::<VerifiedLeaf>(1);
+    let transport_failure = Arc::new(std::sync::Mutex::new(None));
+    let root = bao_tree::blake3::Hash::from(*content.as_bytes());
+    let verifier = tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        let mut blocking_reader = BlockingBaoWireReader::new(wire_rx);
+        nar_v4::decode_verified(&mut blocking_reader, root, raw_size, codec, |leaf| {
+            let (release_on_next_pull, wait_for_next_pull) = std::sync::mpsc::channel();
+            leaf_tx
+                .blocking_send(VerifiedLeaf {
+                    bytes: leaf,
+                    release_on_next_pull,
+                })
+                .map_err(|_| {
+                    io::Error::new(io::ErrorKind::BrokenPipe, "verified-leaf consumer closed")
+                })?;
+            wait_for_next_pull.recv().map_err(|_| {
+                io::Error::new(
+                    io::ErrorKind::BrokenPipe,
+                    "verified-leaf caller stopped before requesting the next leaf",
+                )
+            })
+        })
+    });
+    (
+        VerifiedNarWireSink {
+            sender: wire_tx.clone(),
+            transport_failure: Arc::clone(&transport_failure),
+        },
+        VerifiedNarStream {
+            leaves: leaf_rx,
+            verifier,
+            expected: content,
+            cancel: wire_tx,
+            transport_failure,
+            previous_leaf_release: None,
+            leaves_finished: false,
+        },
+    )
 }
 
 /// The serve-side exchange deadline used when this node is NOT serving (no [`ServeGate`] to
-/// source `max_serve_duration` from): a slowloris guard so a peer that opens a `/nar/3`
+/// source `max_serve_duration` from): a slowloris guard so a peer that opens a `/nar/4`
 /// stream and then never sends its request digest - or never reads the `NotHeld` reply -
 /// cannot park a serve task forever. A serving node uses its
 /// [`ServeBudget::max_serve_duration`] instead (see [`serve_stream`]).
@@ -285,31 +593,51 @@ where
     writer.flush().await
 }
 
-/// Read a fetch RESPONSE off an inbound stream with the full task-51 envelope, mirroring
-/// fabric-iroh's `dial_and_stream` (the gate-1 streaming-decode contract):
+/// Read and authenticate one `/nar/4` response. The untrusted header declares
+/// exact raw geometry before any tree allocation; every full-range Bao leaf is
+/// verified against `content` in a bounded worker before it reaches the
+/// collector. The final leaf is retained until COMPLETE and clean FIN.
 ///
-///   * INTER-CHUNK IDLE BOUND (AC#2): every read - the status byte and each body chunk -
-///     is bounded by `body_idle_timeout`; no forward progress within it is a stalled peer,
-///     aborted distinctly from the transport-level `total_timeout`.
-///   * MID-STREAM SIZE ABORT (AC#1): the body is streamed chunk by chunk and the moment
-///     cumulative bytes exceed the running cap - `expected_size` when the caller signed one,
-///     else the [`MAX_NAR_RESPONSE_BYTES`] unbounded-OOM floor - the stream is DROPPED and
-///     [`TransferError::TooLarge`] returned. A provider that streams MORE than declared is
-///     cut off at ~cap, never after 256 MiB and never after the whole (possibly huge) blob.
-///   * GATE-1 BLAKE3 VERIFY: the accumulated bytes are BLAKE3-verified against the requested
-///     identity with the frozen [`Blake3Digest::from_raw_nar`] recipe at completion, so a
-///     corrupt/lying provider yields [`TransferError::IntegrityMismatch`], never trusted
-///     bytes. HONEST LIMIT (TASK-197): the SIZE abort is truly mid-stream, but
-///     per-CHUNK byte-corruption detection (catching a flipped byte before EOF, as bao does)
-///     needs a bao outboard interleaved on the wire; this transport carries the raw NAR
-///     alone, so byte corruption is caught at stream completion (single pass, memory bounded
-///     to cap + one chunk), never after a second full buffer-and-rehash.
+/// `NarTransfer` still returns a `Vec` for seam compatibility; TASK-62 removes
+/// that final collector. The wire pump, encoded-leaf decoder, verifier, and
+/// verified-leaf handoff are each one-item bounded and independent of NAR size.
+#[cfg(test)]
 pub(crate) async fn read_response_streamed<R>(
     reader: &mut R,
     expected_size: Option<u64>,
     body_idle_timeout: Duration,
     content: &Blake3Digest,
 ) -> Result<Vec<u8>, TransferError>
+where
+    R: AsyncRead + Unpin,
+{
+    read_response_streamed_since(
+        reader,
+        expected_size,
+        body_idle_timeout,
+        content,
+        std::time::Instant::now(),
+        peer_fabric::ACCEPT_RAW_AND_ZSTD,
+    )
+    .await
+    .map(|response| response.bytes)
+}
+
+pub(crate) struct AuthenticatedNar {
+    pub(crate) bytes: Vec<u8>,
+    pub(crate) authenticated_first_leaf_ns: u128,
+    pub(crate) total_fetch_ns: u128,
+    pub(crate) selected_codec: WireCodec,
+}
+
+pub(crate) async fn read_response_streamed_since<R>(
+    reader: &mut R,
+    expected_size: Option<u64>,
+    body_idle_timeout: Duration,
+    content: &Blake3Digest,
+    request_started: std::time::Instant,
+    accept: u8,
+) -> Result<AuthenticatedNar, TransferError>
 where
     R: AsyncRead + Unpin,
 {
@@ -344,52 +672,91 @@ where
             )))
         }
         STATUS_NAR => {
-            // The negotiated codec byte the SERVER chose (TASK-99): raw or zstd, always one
-            // the fetcher offered. An unknown codec is a protocol fault - fail, never guess a
-            // framing.
-            let mut codec_byte = [0u8; 1];
-            match tokio::time::timeout(body_idle_timeout, reader.read_exact(&mut codec_byte)).await
-            {
+            let mut header = [0u8; 9];
+            match tokio::time::timeout(body_idle_timeout, reader.read_exact(&mut header)).await {
                 Ok(Ok(())) => {}
                 Ok(Err(error)) => {
                     return Err(TransferError::Unavailable(format!(
-                        "NAR stream for {content} closed before its codec byte: {error}"
+                        "NAR stream for {content} closed before its codec/size header: {error}"
                     )));
                 }
                 Err(_elapsed) => {
                     return Err(TransferError::Unavailable(format!(
-                        "NAR stream for {content} stalled before its codec byte for {body_idle_timeout:?}"
+                        "NAR stream for {content} stalled before its codec/size header for {body_idle_timeout:?}"
                     )));
                 }
             }
-            let codec = WireCodec::from_wire(codec_byte[0]).ok_or_else(|| {
+            let codec = WireCodec::from_wire(header[0]).ok_or_else(|| {
                 TransferError::Unavailable(format!(
                     "provider chose unknown NAR codec byte {} for {content}",
-                    codec_byte[0]
+                    header[0]
                 ))
             })?;
-
-            // The running cap: the signed per-call bound when present, else the fixed
-            // unbounded-OOM floor (a cold-start fetch of a > 256 MiB NAR hard-fails here).
-            // For BOTH codecs the cap is the UNCOMPRESSED NarSize - for zstd it bounds the
-            // DECOMPRESSED output (AC#6 bomb defense), never the compressed FileSize.
-            let cap = expected_size.unwrap_or(MAX_NAR_RESPONSE_BYTES);
-            let raw = match codec {
-                WireCodec::Raw => read_raw_body(reader, cap, body_idle_timeout, content).await?,
-                WireCodec::Zstd => read_zstd_body(reader, cap, body_idle_timeout, content).await?,
+            let codec_bit = match codec {
+                WireCodec::Raw => peer_fabric::ACCEPT_RAW,
+                WireCodec::Zstd => peer_fabric::ACCEPT_ZSTD,
             };
-            // Gate 1: BLAKE3-verify the DECODED bytes against the requested identity with the
-            // frozen SSOT recipe - identical whether the link was raw or compressed. A
-            // corrupt/lying provider (or a TRUNCATED zstd frame that decoded short) errors
-            // here, never wrong bytes handed upward. Nix's sha256 gate-2 remains the anchor.
-            let actual = Blake3Digest::from_raw_nar(&raw);
-            if &actual != content {
-                return Err(TransferError::IntegrityMismatch {
-                    expected: *content,
-                    actual,
+            if accept & codec_bit == 0 {
+                return Err(TransferError::Unavailable(format!(
+                    "provider selected {codec:?} for {content}, but request accept mask {accept:#04x} did not offer it"
+                )));
+            }
+            let raw_size = u64::from_le_bytes(header[1..].try_into().expect("8-byte size"));
+            let cap = expected_size.unwrap_or(MAX_NAR_RESPONSE_BYTES);
+            if raw_size > cap {
+                return Err(TransferError::TooLarge {
+                    limit: cap,
+                    streamed: raw_size,
                 });
             }
-            Ok(raw)
+            if let Some(expected) = expected_size
+                && raw_size != expected
+            {
+                return Err(TransferError::Unavailable(format!(
+                    "provider declared raw_size {raw_size} for {content}, signed NarSize is {expected}"
+                )));
+            }
+
+            let (wire_sink, mut verified) = verified_nar_stream(*content, raw_size, codec).await;
+
+            let pump = pump_bao_wire(reader, wire_sink, body_idle_timeout, content);
+            let collect = async {
+                let mut raw = Vec::new();
+                let mut first_leaf = None;
+                while let Some(leaf) = verified.next_leaf().await {
+                    first_leaf.get_or_insert_with(std::time::Instant::now);
+                    raw.extend_from_slice(&leaf);
+                }
+                (raw, first_leaf)
+            };
+            let (pump_result, (raw, first_leaf)) = tokio::join!(pump, collect);
+            let verified_bytes = verified.finish().await?;
+            pump_result?;
+            if verified_bytes != raw_size || raw.len() as u64 != raw_size {
+                return Err(TransferError::Unavailable(format!(
+                    "Bao verifier completed {verified_bytes} B and collector got {} B, header declared {raw_size} B",
+                    raw.len()
+                )));
+            }
+            let authenticated_first_leaf_ns = first_leaf
+                .map(|first_leaf| first_leaf.duration_since(request_started).as_nanos())
+                .ok_or_else(|| {
+                    TransferError::Unavailable(format!(
+                        "successful Bao verification for {content} emitted no authenticated leaf"
+                    ))
+                })?;
+            tracing::debug!(
+                %content,
+                authenticated_first_leaf_ns,
+                raw_size,
+                "libp2p fetch: first Bao-authenticated leaf exposed"
+            );
+            Ok(AuthenticatedNar {
+                bytes: raw,
+                authenticated_first_leaf_ns,
+                total_fetch_ns: request_started.elapsed().as_nanos(),
+                selected_codec: codec,
+            })
         }
         other => Err(TransferError::Unavailable(format!(
             "unknown NAR response status byte {other} from the provider for {content}"
@@ -397,268 +764,387 @@ where
     }
 }
 
-/// Read a RAW (uncompressed) NAR body to EOF with the mid-stream size abort: count bytes as
-/// they arrive and abort the INSTANT cumulative bytes exceed `cap` (never after buffering the
-/// whole blob), each read bounded by `body_idle_timeout`. Returns the raw bytes for the
-/// caller's gate-1 BLAKE3 verify. Peak memory is `cap + one chunk`.
-async fn read_raw_body<R>(
+pub(crate) async fn pump_bao_wire<R>(
     reader: &mut R,
-    cap: u64,
+    sender: VerifiedNarWireSink,
     body_idle_timeout: Duration,
     content: &Blake3Digest,
-) -> Result<Vec<u8>, TransferError>
+) -> Result<(), TransferError>
 where
     R: AsyncRead + Unpin,
 {
-    let mut raw: Vec<u8> = Vec::new();
     let mut buf = vec![0u8; NAR_STREAM_CHUNK];
     loop {
-        let read = tokio::time::timeout(body_idle_timeout, reader.read(&mut buf)).await;
+        let read = tokio::select! {
+            () = sender.closed() => {
+                return Err(TransferError::Unavailable(format!(
+                    "Bao verifier stopped before the wire ended for {content}"
+                )));
+            }
+            read = tokio::time::timeout(body_idle_timeout, reader.read(&mut buf)) => read,
+        };
         let n = match read {
-            Ok(Ok(0)) => break, // EOF: the server closed its write half - NAR complete.
+            Ok(Ok(0)) => {
+                sender.finish().await.map_err(|()| {
+                    TransferError::Unavailable(format!(
+                        "Bao verifier stopped before transport EOF for {content}"
+                    ))
+                })?;
+                break;
+            }
             Ok(Ok(n)) => n,
             Ok(Err(error)) => {
+                sender
+                    .fail(io::Error::new(error.kind(), error.to_string()))
+                    .await;
                 return Err(TransferError::Unavailable(format!(
                     "NAR stream for {content} failed mid-transfer: {error}"
                 )));
             }
             Err(_elapsed) => {
-                // Dropping `reader` (its stream) at this return ABORTS the transfer.
+                let why = format!(
+                    "NAR transfer for {content} stalled: no bytes for {body_idle_timeout:?}"
+                );
+                sender
+                    .fail(io::Error::new(io::ErrorKind::TimedOut, why.clone()))
+                    .await;
                 return Err(TransferError::Unavailable(format!(
                     "NAR transfer for {content} stalled: no bytes for {body_idle_timeout:?}"
                 )));
             }
         };
-        raw.extend_from_slice(&buf[..n]);
-        // Abort the INSTANT the running total crosses the cap - before reading more.
-        if raw.len() as u64 > cap {
-            return Err(TransferError::TooLarge {
-                limit: cap,
-                streamed: raw.len() as u64,
-            });
+        if sender.send(buf[..n].to_vec()).await.is_err() {
+            return Err(TransferError::Unavailable(format!(
+                "Bao verifier stopped before the wire ended for {content}"
+            )));
         }
     }
-    Ok(raw)
+    Ok(())
 }
 
-/// Read a ZSTD-compressed NAR body to EOF, DECODING INCREMENTALLY through the bounded
-/// [`BoundedZstdDecoder`] (TASK-99 AC#6). The decoder counts DECOMPRESSED cumulative bytes
-/// against `cap` (the signed UNCOMPRESSED NarSize) and aborts mid-stream the instant it would
-/// exceed it - so a decompression BOMB fails closed with memory bounded to `cap + one decode
-/// block`, never the whole expansion. Compressed INPUT is bounded by the same `cap` (a
-/// "compressed" body larger than the raw nar is a lie), the zstd window is bounded, and a
-/// corrupt frame errors. A TRUNCATED frame decodes short and is caught by the caller's
-/// gate-1 length/BLAKE3 recheck. Returns the decoded raw NAR bytes.
-async fn read_zstd_body<R>(
-    reader: &mut R,
-    cap: u64,
-    body_idle_timeout: Duration,
-    content: &Blake3Digest,
-) -> Result<Vec<u8>, TransferError>
-where
-    R: AsyncRead + Unpin,
-{
-    let mut decoder = BoundedZstdDecoder::new(cap).map_err(|error| {
-        TransferError::Unavailable(format!(
-            "could not start zstd decode for {content}: {error}"
-        ))
-    })?;
-    let mut buf = vec![0u8; NAR_STREAM_CHUNK];
-    loop {
-        let read = tokio::time::timeout(body_idle_timeout, reader.read(&mut buf)).await;
-        let n = match read {
-            Ok(Ok(0)) => break, // EOF: the compressed frame is complete (or truncated - see below).
-            Ok(Ok(n)) => n,
-            Ok(Err(error)) => {
-                return Err(TransferError::Unavailable(format!(
-                    "compressed NAR stream for {content} failed mid-transfer: {error}"
-                )));
-            }
-            Err(_elapsed) => {
-                return Err(TransferError::Unavailable(format!(
-                    "compressed NAR transfer for {content} stalled: no bytes for {body_idle_timeout:?}"
-                )));
-            }
-        };
-        // Feed the compressed chunk; the decoder enforces the output/input/window bounds and
-        // aborts mid-stream. A bomb or oversize lie is TooLarge (the deliberate abort); a
-        // corrupt frame is Unavailable (this holder is unusable, try the next).
-        if let Err(error) = decoder.push(&buf[..n]) {
-            return Err(match error {
-                DecodeError::OutputTooLarge { cap, produced } => TransferError::TooLarge {
-                    limit: cap,
-                    streamed: produced,
-                },
-                DecodeError::InputTooLarge { cap, consumed } => TransferError::TooLarge {
-                    limit: cap,
-                    streamed: consumed,
-                },
-                DecodeError::Zstd(why) => TransferError::Unavailable(format!(
-                    "corrupt zstd NAR frame for {content}: {why}"
-                )),
-                // Trailing bytes after a complete frame (or a mid-stream truncation surfaced by
-                // the codec): a malformed body from an unusable holder, fail the fetch.
-                other => TransferError::Unavailable(format!(
-                    "malformed zstd NAR frame for {content}: {other}"
-                )),
-            });
-        }
-    }
-    // Finish the frame and take the decoded nar. A truncated frame yields fewer bytes than
-    // the signed size; the caller's gate-1 recheck then rejects it (never a short/wrong nar).
-    decoder.finish().map_err(|error| {
-        TransferError::Unavailable(format!(
-            "zstd decode did not complete for {content}: {error}"
-        ))
-    })
-}
-
-/// Frame a [`NarResponse`] onto a serve stream's write half and CLOSE it, encoding the NAR
-/// body with the negotiated `codec` (TASK-99). For a `Nar` the wire is: `STATUS_NAR`, the
-/// chosen codec byte, then the body (raw bytes, or a single zstd frame at `level`). The close
-/// is the EOF the fetcher's read loop terminates on (there is no length prefix on the body).
+/// Frame a response and close its write half. A NAR uses the wholesale v4
+/// header (`status`, response-global codec, exact raw size), canonical Bao
+/// preorder body, COMPLETE marker, then FIN.
 async fn write_response<W>(
     writer: &mut W,
     response: NarResponse,
     codec: WireCodec,
     level: i32,
-) -> io::Result<()>
+    content: &Blake3Digest,
+) -> Result<(), ResponseWriteError>
 where
     W: AsyncWrite + Unpin,
 {
     match response {
-        NarResponse::NotHeld => writer.write_all(&[STATUS_NOT_HELD]).await?,
-        NarResponse::Declined(reason) => {
-            writer.write_all(&[STATUS_DECLINED, reason.wire()]).await?
-        }
+        NarResponse::NotHeld => writer
+            .write_all(&[STATUS_NOT_HELD])
+            .await
+            .map_err(ResponseWriteError::Transport)?,
+        NarResponse::Declined(reason) => writer
+            .write_all(&[STATUS_DECLINED, reason.wire()])
+            .await
+            .map_err(ResponseWriteError::Transport)?,
         NarResponse::Nar(bytes) => {
-            writer.write_all(&[STATUS_NAR, codec.wire()]).await?;
-            match codec {
-                WireCodec::Raw => writer.write_all(&bytes).await?,
-                WireCodec::Zstd => {
-                    // Stream the zstd frame in BLOCKS off the serve worker (TASK-203). The
-                    // serve-time integrity recheck (len == declared_size, BLAKE3 == content)
-                    // already ran on the RAW bytes before this point, so the compressed encoding
-                    // is a pure transport step - now pipelined, not a whole-buffer compress.
-                    write_zstd_streamed(writer, bytes, level).await?;
-                }
-            }
+            write_memory_nar_v4(writer, bytes, codec, level, content).await?;
         }
     }
-    writer.flush().await?;
+    writer
+        .flush()
+        .await
+        .map_err(ResponseWriteError::Transport)?;
     // Half-close: the FIN is how the fetcher knows the (length-prefix-free) NAR is complete.
-    writer.close().await
+    writer.close().await.map_err(ResponseWriteError::Transport)
 }
 
-/// Stream-compress `raw` into a single zstd frame and write it to `writer` in BLOCKS off the
-/// async serve worker (TASK-203) - the compress-side of TASK-157's off-worker streaming serve.
-///
-///   * OFF THE WORKER. The CPU-bound compression runs on the blocking pool
-///     ([`tokio::task::spawn_blocking`]) via [`StreamingZstdEncoder`], so a multi-second compress
-///     of a large nar never monopolizes an async worker thread.
-///   * PIPELINED. Compressed blocks flow back over a bounded channel and are written as they are
-///     produced, so the FIRST compressed bytes reach the fetcher BEFORE the whole nar is
-///     compressed - the compressor OVERLAPS the link instead of preceding it (removing the
-///     TASK-99 LAN serial penalty).
-///   * PREEMPTIBLE BETWEEN BLOCKS. Each block is written at a `.await`; the serve deadline wrapped
-///     around [`write_response`] fires at that boundary, dropping this future - which drops the
-///     receiver, so the blocking compressor's next `send` fails and it stops after the current
-///     block (a large nar no longer compresses inside one un-preemptible synchronous call).
-///
-/// Wire-identical to a bulk zstd frame: only the PRODUCTION is pipelined.
-///
-/// PEAK EXTRA MEMORY (compressed side, on top of the already-resident raw nar), integer bound:
-///
-/// * up to [`SERVE_COMPRESS_BLOCKS_IN_FLIGHT`] compressed blocks queued in the channel, PLUS
-/// * one compressed block the sender is holding while it awaits channel capacity
-///   (`blocking_send`), PLUS
-/// * one compressed block the writer is currently draining onto the socket, PLUS
-/// * the encoder's single [`peer_fabric`] `ENCODE_BLOCK` (128 KiB) reusable scratch.
-///
-/// i.e. at most `(SERVE_COMPRESS_BLOCKS_IN_FLIGHT + 2)` compressed blocks + one encoder scratch,
-/// never the whole compressed nar - a slow/non-reading consumer backpressures the compressor via
-/// the bounded channel. Concurrency across serves is itself bounded by
-/// [`SERVE_COMPRESS_MAX_CONCURRENT`] permits, so the fleet-wide compressed-side memory is bounded
-/// too.
-async fn write_zstd_streamed<W>(writer: &mut W, raw: Vec<u8>, level: i32) -> io::Result<()>
+async fn write_memory_nar_v4<W>(
+    writer: &mut W,
+    bytes: Arc<Vec<u8>>,
+    codec: WireCodec,
+    level: i32,
+    content: &Blake3Digest,
+) -> Result<(), ResponseWriteError>
 where
     W: AsyncWrite + Unpin,
 {
-    let pledged = raw.len() as u64;
-    let (tx, mut rx) =
-        tokio::sync::mpsc::channel::<io::Result<Vec<u8>>>(SERVE_COMPRESS_BLOCKS_IN_FLIGHT);
-
-    // Acquire one fixed-capacity permit AND enter the live-compressor gauge in the ASYNC context,
-    // BEFORE spawning the detached compressor, then MOVE the owned `CompressorSlot` into the closure
-    // so the permit + gauge are released only when the closure EXITS - not when this async future is
-    // dropped, and not lazily when the blocking pool first STARTS the closure. Counting at SPAWN
-    // (not at closure entry) is what makes a spawned-but-still-QUEUED compressor visible to the
-    // gauge and bounded by the ceiling: [`SERVE_COMPRESS_MAX_CONCURRENT`] now caps concurrent PLUS
-    // queued compressors, and the drain-to-zero invariant cannot read zero while spawns are pending
-    // (F2). The acquire is inside the deadline-bound `write_response`, so waiting for a slot is
-    // backpressure, never an unbounded stall. The pool is never closed.
-    let permit = Arc::clone(&SERVE_COMPRESS_SLOTS)
-        .acquire_owned()
-        .await
-        .expect("serve compress semaphore is never closed");
-    let slot = CompressorSlot::enter(permit);
-
-    // The off-worker compressor: owns the raw nar AND the slot, streams the frame block by block,
-    // and stops the instant the consumer/deadline drops the receiver (checked before EVERY block,
-    // and its `blocking_send` also errors on a closed channel). The slot drops when this closure
-    // exits (or, if the pool never runs it, when the closure is dropped), releasing permit + gauge.
-    tokio::task::spawn_blocking(move || {
-        let _slot = slot;
-        let mut encoder = match StreamingZstdEncoder::new(level, Some(pledged)) {
-            Ok(encoder) => encoder,
-            Err(error) => {
-                let _ = tx.blocking_send(Err(error));
-                return;
-            }
-        };
-        for chunk in raw.chunks(SERVE_COMPRESS_INPUT_BLOCK) {
-            // Stop before compressing ANY block - including one that will buffer with no output
-            // yet - once the receiver (deadline/consumer) is gone, so a block whose output is
-            // empty cannot keep the compressor running past an abort (the one-block-stop
-            // guarantee holds on the empty-output path too, not only where there are bytes to
-            // send).
-            if tx.is_closed() {
-                return;
-            }
-            let mut out = Vec::new();
-            if let Err(error) = encoder.compress_block(chunk, &mut out) {
-                let _ = tx.blocking_send(Err(error));
-                return;
-            }
-            // A block may buffer with no output yet; ship only real bytes. A closed channel
-            // (receiver dropped by the deadline/consumer) means stop compressing.
-            if !out.is_empty() && tx.blocking_send(Ok(out)).is_err() {
-                return;
-            }
-        }
-        // The frame tail (last buffered block + footer). With the size pledged, `finish` also
-        // verifies the whole nar was fed.
-        let mut tail = Vec::new();
-        match encoder.finish(&mut tail) {
-            Ok(()) => {
-                if !tail.is_empty() {
-                    let _ = tx.blocking_send(Ok(tail));
-                }
-            }
-            Err(error) => {
-                let _ = tx.blocking_send(Err(error));
-            }
-        }
-    });
-
-    // Drain compressed blocks and write each to the socket. Each recv/write is an await the serve
-    // deadline preempts between; on error/drop the receiver falls, stopping the producer.
-    while let Some(item) = rx.recv().await {
-        let block = item
-            .map_err(|error| io::Error::other(format!("zstd stream compress failed: {error}")))?;
-        writer.write_all(&block).await?;
+    let proof_started = std::time::Instant::now();
+    let permit = BAO_WORKER_POOLS.acquire_serve().await;
+    let prepared = tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        let raw_size = bytes.len() as u64;
+        let mut cursor = io::Cursor::new(bytes.as_slice());
+        let outboard = nar_v4::create_outboard(&mut cursor, raw_size)?;
+        Ok::<_, io::Error>((bytes, outboard))
+    })
+    .await
+    .map_err(|error| ResponseWriteError::Supply(format!("Bao proof worker failed: {error}")))?
+    .map_err(|error| ResponseWriteError::Supply(format!("Bao proof creation failed: {error}")))?;
+    let (bytes, outboard) = prepared;
+    let requested_root = bao_tree::blake3::Hash::from(*content.as_bytes());
+    if outboard.root != requested_root {
+        return Err(ResponseWriteError::Supply(format!(
+            "memory source root {} does not match requested {content}",
+            outboard.root.to_hex()
+        )));
     }
+    let proof_preparation_ns = proof_started.elapsed().as_nanos();
+    let raw_size = bytes.len() as u64;
+    writer
+        .write_all(&[&[STATUS_NAR, codec.wire()][..], &raw_size.to_le_bytes()].concat())
+        .await
+        .map_err(ResponseWriteError::Transport)?;
+
+    let (wire_tx, mut wire_rx) = tokio::sync::mpsc::channel::<OwnedWireChunk>(1);
+    let permit = BAO_WORKER_POOLS.acquire_serve().await;
+    let encoder = tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        let (sink, raw_bytes, framed_bao_bytes) = nar_v4::encode_validated(
+            bytes.as_slice(),
+            &outboard,
+            BlockingChunkWriter::new(wire_tx),
+            codec,
+            level,
+        )?;
+        drop(sink);
+        Ok::<_, io::Error>((raw_bytes, framed_bao_bytes))
+    });
+    let mut write_error = None;
+    while let Some(item) = wire_rx.recv().await {
+        let OwnedWireChunk { mut bytes, recycle } = item;
+        if let Err(error) = writer.write_all(&bytes).await {
+            write_error = Some(error);
+            wire_rx.close();
+            drop(recycle);
+            break;
+        }
+        bytes.clear();
+        let _ = recycle.send(bytes);
+    }
+    let encoded = encoder.await.map_err(|error| {
+        ResponseWriteError::Supply(format!("Bao encode worker failed: {error}"))
+    })?;
+    if let Some(error) = write_error {
+        return Err(ResponseWriteError::Transport(error));
+    }
+    let (pass2_bytes, framed_bao_bytes) = encoded.map_err(|error| {
+        ResponseWriteError::Supply(format!("Bao authentication/framing failed: {error}"))
+    })?;
+    if pass2_bytes != raw_size {
+        return Err(ResponseWriteError::Supply(format!(
+            "Bao pass encoded {pass2_bytes} B, expected {raw_size} B"
+        )));
+    }
+    writer
+        .write_all(nar_v4::COMPLETE_MARKER)
+        .await
+        .map_err(ResponseWriteError::Transport)?;
+    let wire =
+        nar_v4::NarV4WireAccounting::from_framed_bao_bytes(raw_size, codec, framed_bao_bytes)
+            .map_err(|error| {
+                ResponseWriteError::Supply(format!("/nar/4 byte accounting failed: {error}"))
+            })?;
+    tracing::debug!(
+        %content,
+        proof_preparation_ns,
+        pass1_bytes = raw_size,
+        pass2_bytes,
+        proof_bytes = wire.proof_bytes,
+        leaf_count = wire.leaf_count,
+        leaf_length_prefix_bytes = wire.leaf_length_prefix_bytes,
+        encoded_leaf_bytes = wire.encoded_leaf_bytes,
+        response_protocol_bytes = wire.response_protocol_bytes,
+        exchange_protocol_bytes = wire.exchange_protocol_bytes,
+        memory_proof_and_encode_ns = proof_started.elapsed().as_nanos(),
+        "libp2p serve: memory Bao response completed"
+    );
     Ok(())
+}
+
+fn validate_replay_completion(
+    source: &ReplayableProcessSource,
+    pass: &'static str,
+    completion: SupervisedProcessCompletion,
+) -> Result<u64, String> {
+    if completion.stdout_exceeded_limit {
+        return Err(format!(
+            "{pass} source {} exceeded declared raw_size {} B",
+            source.program.display(),
+            source.declared_size
+        ));
+    }
+    if completion.stdout_bytes_read as u64 != source.declared_size {
+        return Err(format!(
+            "{pass} source {} produced {} B, declared raw_size is {} B",
+            source.program.display(),
+            completion.stdout_bytes_read,
+            source.declared_size
+        ));
+    }
+    if !completion.status.success() {
+        return Err(format!(
+            "{pass} source process {} exited {} after {} B: {}",
+            source.program.display(),
+            completion.status,
+            completion.stdout_bytes_read,
+            String::from_utf8_lossy(&completion.stderr).trim()
+        ));
+    }
+    Ok(completion.stdout_bytes_read as u64)
+}
+
+async fn pump_process_stdout(
+    mut process: SupervisedProcessStream,
+    sender: tokio::sync::mpsc::Sender<io::Result<Vec<u8>>>,
+    source: &ReplayableProcessSource,
+    pass: &'static str,
+) -> Result<u64, String> {
+    while let Some(chunk) = process.next_chunk().await {
+        if sender.send(Ok(chunk)).await.is_err() {
+            let _ = process.cancel_and_wait().await;
+            return Err(format!(
+                "{pass} Bao worker stopped before source {} completed",
+                source.program.display()
+            ));
+        }
+    }
+    drop(sender);
+    let completion = process.finish().await.map_err(|error| {
+        format!(
+            "waiting for {pass} source process {}: {error}",
+            source.program.display()
+        )
+    })?;
+    validate_replay_completion(source, pass, completion)
+}
+
+#[derive(Clone, Copy)]
+struct ProcessServeContext<'a> {
+    source: &'a ReplayableProcessSource,
+    supervisor: &'a TaskSupervisorHandle,
+    cleanup: &'a ServeProcessCleanup,
+    pools: &'a BaoWorkerPools,
+}
+
+async fn prepare_process_outboard(
+    context: ProcessServeContext<'_>,
+    content: &Blake3Digest,
+) -> Result<(bao_tree::io::outboard::PreOrderOutboard<Vec<u8>>, u64, u128), String> {
+    let started = std::time::Instant::now();
+    // Admission owns the reservation already, but no producer may exist while
+    // this request is merely queued for bounded Bao capacity.
+    let permit = context.pools.acquire_serve().await;
+    let process = context
+        .source
+        .start(context.supervisor, context.cleanup, "pass1")?;
+    let (data_tx, data_rx) = tokio::sync::mpsc::channel::<io::Result<Vec<u8>>>(1);
+    let raw_size = context.source.declared_size;
+    let worker = tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        let mut reader = BlockingChunkReader::new(data_rx);
+        nar_v4::create_outboard(&mut reader, raw_size)
+    });
+    let (process_result, outboard_result) = tokio::join!(
+        pump_process_stdout(process, data_tx, context.source, "pass1"),
+        worker
+    );
+    let pass1_bytes = process_result?;
+    let outboard = outboard_result
+        .map_err(|error| format!("pass1 Bao proof worker failed: {error}"))?
+        .map_err(|error| format!("pass1 Bao proof creation failed: {error}"))?;
+    let requested = bao_tree::blake3::Hash::from(*content.as_bytes());
+    if outboard.root != requested {
+        return Err(format!(
+            "pass1 source {} for {content} has root {}, refusing before STATUS_NAR",
+            context.source.program.display(),
+            outboard.root.to_hex()
+        ));
+    }
+    Ok((outboard, pass1_bytes, started.elapsed().as_nanos()))
+}
+
+async fn write_process_nar_v4<W>(
+    writer: &mut W,
+    context: ProcessServeContext<'_>,
+    outboard: bao_tree::io::outboard::PreOrderOutboard<Vec<u8>>,
+    codec: WireCodec,
+    level: i32,
+) -> Result<(u64, nar_v4::NarV4WireAccounting), ProcessServeError>
+where
+    W: AsyncWrite + Unpin,
+{
+    // As in pass 1, capacity precedes process creation. Otherwise a saturated
+    // Bao pool admits up to the supervisor ceiling of idle producer groups.
+    let permit = context.pools.acquire_serve().await;
+    let process = context
+        .source
+        .start(context.supervisor, context.cleanup, "pass2")
+        .map_err(ProcessServeError::Supply)?;
+    let (data_tx, data_rx) = tokio::sync::mpsc::channel::<io::Result<Vec<u8>>>(1);
+    let (wire_tx, mut wire_rx) = tokio::sync::mpsc::channel::<OwnedWireChunk>(1);
+    let encoder = tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        let mut reader = BlockingChunkReader::new(data_rx);
+        let (sink, raw_bytes, framed_bao_bytes) = nar_v4::encode_validated_reader(
+            &mut reader,
+            &outboard,
+            BlockingChunkWriter::new(wire_tx),
+            codec,
+            level,
+        )?;
+        drop(sink);
+        Ok::<_, io::Error>((raw_bytes, framed_bao_bytes))
+    });
+    let drain_wire = async {
+        while let Some(item) = wire_rx.recv().await {
+            let OwnedWireChunk { mut bytes, recycle } = item;
+            if let Err(error) = writer.write_all(&bytes).await {
+                // This future borrows `wire_rx`; simply returning would leave
+                // the receiver open until the surrounding join completed.
+                // Closing it and dropping this ownership acknowledgement
+                // makes both the encoder and its process-input pump unwind.
+                wire_rx.close();
+                drop(recycle);
+                return Err(ProcessServeError::Transport(format!(
+                    "writing authenticated pass2 bytes: {error}"
+                )));
+            }
+            bytes.clear();
+            let _ = recycle.send(bytes);
+        }
+        Ok::<(), ProcessServeError>(())
+    };
+    let (process_result, wire_result, encode_result) = tokio::join!(
+        pump_process_stdout(process, data_tx, context.source, "pass2"),
+        drain_wire,
+        encoder
+    );
+    // Prefer the actual socket error over the secondary broken-pipe errors it
+    // induces in the encoder/process pipeline.
+    wire_result?;
+    let pass2_bytes = process_result.map_err(ProcessServeError::Supply)?;
+    let (encoded_raw_bytes, framed_bao_bytes) = encode_result
+        .map_err(|error| {
+            ProcessServeError::Supply(format!("pass2 Bao encoder worker failed: {error}"))
+        })?
+        .map_err(|error| {
+            ProcessServeError::Supply(format!("pass2 Bao authentication/framing failed: {error}"))
+        })?;
+    if encoded_raw_bytes != context.source.declared_size
+        || pass2_bytes != context.source.declared_size
+    {
+        return Err(ProcessServeError::Supply(format!(
+            "pass2 byte-accounting mismatch: process {pass2_bytes} B, Bao {encoded_raw_bytes} B, declared {} B",
+            context.source.declared_size
+        )));
+    }
+    let wire = nar_v4::NarV4WireAccounting::from_framed_bao_bytes(
+        context.source.declared_size,
+        codec,
+        framed_bao_bytes,
+    )
+    .map_err(|error| {
+        ProcessServeError::Supply(format!("pass2 /nar/4 byte accounting failed: {error}"))
+    })?;
+    Ok((pass2_bytes, wire))
 }
 
 /// Resolve once the CONSUMER hung up: after sending its 32-byte request the requester keeps
@@ -678,6 +1164,19 @@ where
             Err(_) => return,  // A read error is also "gone".
         }
     }
+}
+
+enum AdmittedServe {
+    Immediate {
+        response: NarResponse,
+        reservation: Option<InflightReservation>,
+        gate: Option<Arc<ServeGate>>,
+    },
+    Process {
+        gate: Arc<ServeGate>,
+        source: ReplayableProcessSource,
+        reservation: InflightReservation,
+    },
 }
 
 /// Serve ONE inbound NAR stream, entirely OFF the swarm poll loop (AC#3): this runs on a
@@ -705,14 +1204,28 @@ pub(crate) async fn serve_stream<S>(stream: S, gate: Option<Arc<ServeGate>>)
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
+    serve_stream_with_process_pools(stream, gate, &BAO_WORKER_POOLS).await;
+}
+
+/// Test seam for overriding the Bao pools consulted by process-backed pass 1/pass 2 serving.
+/// Memory-backed serving does not acquire from the injected process pool.
+async fn serve_stream_with_process_pools<S>(
+    stream: S,
+    gate: Option<Arc<ServeGate>>,
+    pools: &BaoWorkerPools,
+) where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    let serve_started = tokio::time::Instant::now();
     let (mut read_half, mut write_half) = stream.split();
 
-    // The per-phase deadline: a serving node bounds by its ServeBudget; a non-serving node
-    // (which only reads a digest and writes one NotHeld byte) uses the slowloris guard.
-    let deadline = gate
+    // One absolute deadline covers request parsing, both regeneration passes,
+    // socket backpressure, COMPLETE, and FIN. It is never renewed per phase.
+    let serve_duration = gate
         .as_ref()
         .map(|gate| gate.max_serve_duration())
         .unwrap_or(UNSERVED_STREAM_DEADLINE);
+    let deadline_at = serve_started + serve_duration;
 
     // The serve-side compression policy (TASK-99): what this node is WILLING to do. A
     // non-serving node never ships a body, so the default (unused) is fine.
@@ -725,7 +1238,7 @@ where
     // peer that opens a stream then stalls (sends a partial request, or nothing) cannot park
     // this task forever.
     let mut request = [0u8; 33];
-    match tokio::time::timeout(deadline, read_half.read_exact(&mut request)).await {
+    match tokio::time::timeout_at(deadline_at, read_half.read_exact(&mut request)).await {
         Ok(Ok(())) => {}
         Ok(Err(error)) => {
             tracing::debug!(%error, "libp2p serve: inbound NAR stream closed before its request");
@@ -733,7 +1246,7 @@ where
         }
         Err(_elapsed) => {
             tracing::debug!(
-                ?deadline,
+                ?serve_duration,
                 "libp2p serve: inbound NAR request did not arrive within the serve deadline"
             );
             return;
@@ -752,41 +1265,243 @@ where
     // synchronously at admit, so dropping this task at ANY point after admit - including a
     // drop before the first poll - releases the reserve exactly once (`None` for a non-admit,
     // which reserved nothing).
-    let mut _reservation: Option<InflightReservation> = None;
-
-    let response = match gate {
-        None => NarResponse::NotHeld,
+    let admitted = match gate {
+        None => AdmittedServe::Immediate {
+            response: NarResponse::NotHeld,
+            reservation: None,
+            gate: None,
+        },
         Some(gate) => match gate.admit(&content) {
             Serve::Now {
                 response,
                 reservation,
-            } => {
-                // `Some` for an inline Memory serve (held through the write below), `None` for
-                // a non-admit (NotHeld / Declined) that reserved nothing.
-                _reservation = reservation;
-                response
-            }
-            Serve::OffLoop {
-                plan,
-                content,
+            } => AdmittedServe::Immediate {
+                response,
                 reservation,
-            } => {
-                _reservation = Some(reservation);
-                tokio::select! {
-                    biased;
-                    // The consumer abandoned the transfer: drop the produce future, which
-                    // SIGKILL-reaps the supervised group. Nothing to deliver on a dead stream.
-                    () = consumer_hung_up(&mut read_half) => {
-                        tracing::debug!(
-                            %content,
-                            "libp2p serve: consumer hung up before off-loop NAR production finished; reaping"
-                        );
-                        return;
-                    }
-                    response = gate.produce_admitted(plan, content) => response,
+                gate: Some(Arc::clone(&gate)),
+            },
+            Serve::OffLoop {
+                plan, reservation, ..
+            } => match plan.into_replayable_process() {
+                Ok(source) => AdmittedServe::Process {
+                    gate,
+                    source,
+                    reservation,
+                },
+                Err(why) => {
+                    tracing::error!(%content, %why, "libp2p serve: admitted process plan was not replayable");
+                    return;
+                }
+            },
+        },
+    };
+
+    if let AdmittedServe::Process {
+        gate,
+        source,
+        reservation: _reservation,
+    } = &admitted
+    {
+        let (codec, reason) = match negotiate_serve_codec(
+            accept,
+            &codec_policy,
+            source.declared_size,
+        ) {
+            Ok(selected) => selected,
+            Err(no_codec) => {
+                tracing::debug!(%content, %no_codec, "libp2p serve: declining - no common NAR codec offered");
+                let result = tokio::time::timeout_at(
+                    deadline_at,
+                    write_response(
+                        &mut write_half,
+                        NarResponse::Declined(DeclineReason::NoCommonCodec),
+                        WireCodec::Raw,
+                        codec_policy.level,
+                        &content,
+                    ),
+                )
+                .await;
+                // This is a protocol decline after byte admission, not a completed NAR serve and
+                // not a supplier failure. It therefore owns no existing ServeGate counter; the
+                // reservation is released when this branch returns. Classify every write outcome
+                // explicitly so a failed/expired decline cannot disappear as apparent success.
+                match result {
+                    Ok(Ok(())) => tracing::debug!(
+                        %content,
+                        %no_codec,
+                        ?serve_duration,
+                        total_serve_ns = serve_started.elapsed().as_nanos(),
+                        "libp2p serve: no-common-codec decline response completed"
+                    ),
+                    Ok(Err(ResponseWriteError::Supply(why))) => tracing::error!(
+                        %content,
+                        %no_codec,
+                        %why,
+                        ?serve_duration,
+                        total_serve_ns = serve_started.elapsed().as_nanos(),
+                        "libp2p serve: body-free no-common-codec decline hit an impossible supply failure"
+                    ),
+                    Ok(Err(ResponseWriteError::Transport(error))) => tracing::debug!(
+                        %content,
+                        %no_codec,
+                        %error,
+                        ?serve_duration,
+                        total_serve_ns = serve_started.elapsed().as_nanos(),
+                        "libp2p serve: failed to write no-common-codec decline response"
+                    ),
+                    Err(_elapsed) => tracing::debug!(
+                        %content,
+                        %no_codec,
+                        ?serve_duration,
+                        total_serve_ns = serve_started.elapsed().as_nanos(),
+                        "libp2p serve: absolute deadline expired while writing no-common-codec decline response"
+                    ),
+                }
+                return;
+            }
+        };
+        if reason != CodecChoiceReason::ZstdNegotiated {
+            tracing::trace!(%content, %reason, "libp2p serve: raw NAR codec (named fallback)");
+        }
+        let cleanup = ServeProcessCleanup::default();
+        let exchange_cleanup = cleanup.clone();
+        let terminal_close_started = AtomicBool::new(false);
+        let exchange = async {
+            let process_context = ProcessServeContext {
+                source,
+                supervisor: &gate.supervisor,
+                cleanup: &exchange_cleanup,
+                pools,
+            };
+            let (outboard, pass1_bytes, proof_preparation_ns) =
+                prepare_process_outboard(process_context, &content)
+                    .await
+                    .map_err(ProcessServeError::Supply)?;
+            write_half
+                .write_all(
+                    &[
+                        &[STATUS_NAR, codec.wire()][..],
+                        &source.declared_size.to_le_bytes(),
+                    ]
+                    .concat(),
+                )
+                .await
+                .map_err(|error| {
+                    ProcessServeError::Transport(format!("writing /nar/4 response header: {error}"))
+                })?;
+            let (pass2_bytes, wire) = write_process_nar_v4(
+                &mut write_half,
+                process_context,
+                outboard,
+                codec,
+                codec_policy.level,
+            )
+            .await?;
+            write_half
+                .write_all(nar_v4::COMPLETE_MARKER)
+                .await
+                .map_err(|error| {
+                    ProcessServeError::Transport(format!("writing /nar/4 COMPLETE: {error}"))
+                })?;
+            write_half.flush().await.map_err(|error| {
+                ProcessServeError::Transport(format!("flushing /nar/4 COMPLETE: {error}"))
+            })?;
+            terminal_close_started.store(true, Ordering::Release);
+            write_half.close().await.map_err(|error| {
+                ProcessServeError::Transport(format!("closing /nar/4 response: {error}"))
+            })?;
+            Ok::<_, ProcessServeError>((pass1_bytes, pass2_bytes, wire, proof_preparation_ns))
+        };
+        let exchange = tokio::time::timeout_at(deadline_at, exchange);
+        tokio::pin!(exchange);
+        let result = tokio::select! {
+            biased;
+            result = &mut exchange => Some(result),
+            () = consumer_hung_up(&mut read_half) => {
+                if terminal_close_started.load(Ordering::Acquire) {
+                    // COMPLETE is flushed and no producer remains. A requester
+                    // may now close its request half as soon as it observes
+                    // response FIN. Let the already-deadline-bounded close
+                    // resolve so simultaneous readiness cannot erase success.
+                    Some((&mut exchange).await)
+                } else {
+                    None
                 }
             }
-        },
+        };
+        match result {
+            Some(result) => match result {
+                Ok(Ok((pass1_bytes, pass2_bytes, wire, proof_preparation_ns))) => {
+                    gate.admitted.fetch_add(1, Ordering::Relaxed);
+                    let total_serve_ns = serve_started.elapsed().as_nanos();
+                    tracing::info!(
+                        %content,
+                        pass1_bytes,
+                        pass2_bytes,
+                        proof_bytes = wire.proof_bytes,
+                        leaf_count = wire.leaf_count,
+                        leaf_length_prefix_bytes = wire.leaf_length_prefix_bytes,
+                        encoded_leaf_bytes = wire.encoded_leaf_bytes,
+                        response_protocol_bytes = wire.response_protocol_bytes,
+                        exchange_protocol_bytes = wire.exchange_protocol_bytes,
+                        proof_preparation_ns,
+                        total_serve_ns,
+                        "libp2p serve: two-pass bounded Bao regeneration completed"
+                    );
+                    if let Some(observations) = &gate.observations
+                        && let Err(error) = observations.try_send(ServeObservation {
+                            content,
+                            selected_codec: codec,
+                            pass1_bytes,
+                            pass2_bytes,
+                            proof_preparation_ns,
+                            total_serve_ns,
+                            wire,
+                        })
+                    {
+                        tracing::debug!(
+                            %content,
+                            %error,
+                            "libp2p serve: bounded process observation was not accepted"
+                        );
+                    }
+                }
+                Ok(Err(ProcessServeError::Supply(why))) => {
+                    gate.declined_supply_failed.fetch_add(1, Ordering::Relaxed);
+                    tracing::warn!(%content, %why, "libp2p serve: two-pass regeneration failed closed");
+                }
+                Ok(Err(ProcessServeError::Transport(why))) => {
+                    tracing::debug!(%content, %why, "libp2p serve: transport failed after process admission");
+                }
+                Err(_elapsed) => {
+                    let (reap_jobs, reap_tail_ns, reap_complete) = cleanup.cancel_and_wait().await;
+                    tracing::warn!(
+                        %content,
+                        ?serve_duration,
+                        total_serve_ns = serve_started.elapsed().as_nanos(),
+                        reap_jobs,
+                        reap_tail_ns,
+                        reap_complete,
+                        "libp2p serve: absolute serve deadline expired; cancelling producers"
+                    );
+                }
+            },
+            None => {
+                tracing::debug!(%content, "libp2p serve: consumer hung up; cancelling two-pass regeneration");
+                let (reap_jobs, reap_tail_ns, reap_complete) = cleanup.cancel_and_wait().await;
+                tracing::info!(%content, reap_jobs, reap_tail_ns, reap_complete, "libp2p serve: consumer-hangup reap tail measured");
+            }
+        }
+        return;
+    }
+
+    let AdmittedServe::Immediate {
+        response,
+        reservation: _reservation,
+        gate: immediate_gate,
+    } = admitted
+    else {
+        unreachable!("process serve returned above")
     };
 
     // Negotiate the wire codec for a NAR body (TASK-99): intersect what the fetcher offered
@@ -797,10 +1512,8 @@ where
     // rather than ship a codec it never offered. NotHeld/Declined carry no body, so the codec
     // is irrelevant there.
     //
-    // SCOPE (arbitrated, TASK-99 DEEP gate): "mixed-version" interop (AC#5) means codec-
-    // CAPABILITY mixing WITHIN /nar/3 via this `accept` bitmask (raw-only and raw+zstd fetchers
-    // both interoperate) - NOT cross-protocol /nar/2<->/nar/3. This pre-release wholesale-
-    // replaced /nar/1->2->3 (precedent TASK-157); there is no deployed old fleet to bridge.
+    // Codec capability mixing is within wholesale `/nar/4`; no prior protocol
+    // is registered or opened because doing so would silently drop Bao guarantees.
     let (response, codec, level) = match response {
         NarResponse::Nar(bytes) => {
             match negotiate_serve_codec(accept, &codec_policy, bytes.len() as u64) {
@@ -828,18 +1541,29 @@ where
     // on yamux backpressure forever, holding the reservation and parking this task. The
     // deadline caps that; dropping `write_half` on return resets the substream, and
     // `_reservation` releases as this function returns.
-    match tokio::time::timeout(
-        deadline,
-        write_response(&mut write_half, response, codec, level),
+    let served_nar = matches!(&response, NarResponse::Nar(_));
+    match tokio::time::timeout_at(
+        deadline_at,
+        write_response(&mut write_half, response, codec, level, &content),
     )
     .await
     {
-        Ok(Ok(())) => {}
-        Ok(Err(error)) => {
+        Ok(Ok(())) => {
+            if served_nar && let Some(gate) = &immediate_gate {
+                gate.admitted.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+        Ok(Err(ResponseWriteError::Supply(why))) => {
+            if served_nar && let Some(gate) = &immediate_gate {
+                gate.declined_supply_failed.fetch_add(1, Ordering::Relaxed);
+            }
+            tracing::warn!(%why, %content, "libp2p serve: admitted memory supply failed before clean response");
+        }
+        Ok(Err(ResponseWriteError::Transport(error))) => {
             tracing::debug!(%error, %content, "libp2p serve: failed to write NAR response (consumer gone?)");
         }
         Err(_elapsed) => {
-            tracing::debug!(?deadline, %content, "libp2p serve: response write exceeded the serve deadline (consumer not reading); dropping");
+            tracing::debug!(?serve_duration, %content, "libp2p serve: absolute response deadline expired (consumer not reading); dropping");
         }
     }
 }
@@ -860,13 +1584,14 @@ where
 /// file read can wedge uninterruptibly (D-state) on a broken FUSE/NFS mount, which no
 /// userspace shutdown deadline can defeat, whereas an owned process group is killed and
 /// reaped on shutdown.
+#[derive(Clone)]
 enum NarSource {
     /// The raw NAR is already resident (test/inline supply).
     Memory(Arc<Vec<u8>>),
     /// Regenerate the raw NAR by running `program args` in an OWNED process group and
     /// taking its stdout (`nix-store --dump <path>`, or the raw-NAR helper for a
-    /// regular file). Produced ONLY via [`NarSupplyPlan::produce_supervised`], so the
-    /// child rides in a killable, reaped-on-shutdown job (AC#2).
+    /// regular file). Served only by the bounded two-pass v4 regeneration path,
+    /// so the child rides in a killable, reaped-on-shutdown job (AC#2).
     Process {
         program: PathBuf,
         args: Vec<OsString>,
@@ -878,9 +1603,53 @@ enum NarSource {
 /// plus the source production is deferred to. Mirrors `fabric-iroh`'s `SupplyPlan`: the
 /// declared size answers "how big, and do we have it?" so the budget can decline a huge
 /// request having allocated nothing (task-72 GAP-1).
+#[derive(Clone)]
 pub struct NarSupplyPlan {
     declared_size: u64,
     source: NarSource,
+}
+
+#[derive(Clone)]
+struct ReplayableProcessSource {
+    declared_size: u64,
+    program: PathBuf,
+    args: Vec<OsString>,
+    environment: Vec<(OsString, OsString)>,
+}
+
+impl ReplayableProcessSource {
+    fn stdout_limit(&self) -> Result<usize, String> {
+        usize::try_from(self.declared_size).map_err(|_| {
+            format!(
+                "declared process output {} B does not fit this platform's address space",
+                self.declared_size
+            )
+        })
+    }
+
+    fn start(
+        &self,
+        supervisor: &TaskSupervisorHandle,
+        cleanup: &ServeProcessCleanup,
+        pass: &'static str,
+    ) -> Result<SupervisedProcessStream, String> {
+        let stream = supervisor
+            .stream_process(
+                format!("libp2p-nar-supplier-{pass}"),
+                self.program.clone(),
+                self.args.clone(),
+                self.environment.clone(),
+                self.stdout_limit()?,
+            )
+            .map_err(|error| {
+                format!(
+                    "starting {pass} source process {}: {error}",
+                    self.program.display()
+                )
+            })?;
+        cleanup.track(stream.cleanup_ticket());
+        Ok(stream)
+    }
 }
 
 impl NarSupplyPlan {
@@ -897,7 +1666,7 @@ impl NarSupplyPlan {
     }
 
     /// Whether producing this plan REQUIRES the off-poll-loop supervised path
-    /// ([`Self::produce_supervised`]) rather than the inline [`Self::produce`]: true for a
+    /// rather than the inline [`Self::produce`]: true for a
     /// [`NarSource::Process`] (a `nix-store --dump` / raw-NAR helper that must ride in a
     /// killable, reaped-on-shutdown process group), false for an already-resident
     /// [`NarSource::Memory`]. The swarm serve loop routes Process sources OFF the poll
@@ -906,113 +1675,48 @@ impl NarSupplyPlan {
         matches!(self.source, NarSource::Process { .. })
     }
 
-    /// Produce the raw NAR bytes on the SYNCHRONOUS inline swarm-worker path
-    /// ([`ServeGate::respond`]). This cycle that path is Memory-only, matching the
-    /// module's honest scope note: a real store-dump / regular-file source needs
-    /// off-worker supervised async production ([`Self::produce_supervised`]), and wiring
-    /// that into the worker's serve loop is the daemon end-to-end path (TASK-157 /
-    /// TASK-169). A [`NarSource::Process`] reaching this path is therefore a wiring
-    /// error, reported loudly rather than run un-supervised on the poll thread.
-    fn produce(self) -> Result<Vec<u8>, String> {
+    fn into_replayable_process(self) -> Result<ReplayableProcessSource, String> {
         match self.source {
-            NarSource::Memory(bytes) => Ok((*bytes).clone()),
-            NarSource::Process { program, .. } => Err(format!(
-                "a Process/RegularFile NAR source ({}) cannot be produced on the synchronous \
-                 swarm-worker path; it requires supervised async production via \
-                 NarSupplyPlan::produce_supervised (worker wiring is TASK-157 / the daemon \
-                 store-dump serve path)",
-                program.display()
-            )),
-        }
-    }
-
-    /// Produce the raw NAR bytes CANCELLATION-SAFELY (AC#2), regenerating on demand and
-    /// holding nothing at rest (task-61). Consumes the plan: production happens exactly
-    /// once, only after admission agreed to pay for `declared_size`.
-    ///
-    /// A [`NarSource::Process`] runs under `supervisor` in an OWNED process group
-    /// (`proc_supervisor::TaskSupervisorHandle::execute_process`): on node shutdown or
-    /// caller-abandonment the whole group is SIGKILLed and the child reaped, so a slow
-    /// or wedged `nix-store --dump` can never survive as an unkillable worker. Its
-    /// stdout is capped at `declared_size`, so a source that GREW past what admission
-    /// reserved is rejected before it can allocate past the budget.
-    ///
-    /// SERVE-TIME INTEGRITY RECHECK (byte-integrity anchor, forward-carried from
-    /// TASK-56/82): the produced bytes are checked `len == declared_size` AND
-    /// `BLAKE3(RawNarV1) == content` before they are returned. A store path that was
-    /// rebuilt, or a raw-NAR file that was replaced, since it was announced makes this
-    /// fail LOUD - the node never ships the wrong bytes under the right name.
-    pub async fn produce_supervised(
-        self,
-        supervisor: &TaskSupervisorHandle,
-        content: &Blake3Digest,
-    ) -> Result<Vec<u8>, String> {
-        let declared = self.declared_size;
-        let bytes = match self.source {
-            NarSource::Memory(bytes) => (*bytes).clone(),
             NarSource::Process {
                 program,
                 args,
                 environment,
-            } => {
-                let stdout_cap = usize::try_from(declared).map_err(|_| {
-                    format!(
-                        "declared size {declared} B for {content} exceeds this process's \
-                         addressable output cap"
-                    )
-                })?;
-                let output = supervisor
-                    .execute_process(
-                        "libp2p-nar-supplier-process",
-                        program.clone(),
-                        args,
-                        environment,
-                        stdout_cap,
-                    )
-                    .await
-                    .map_err(|error| {
-                        format!(
-                            "supervising source process {} for {content}: {error}",
-                            program.display()
-                        )
-                    })?;
-                if output.stdout_exceeded_limit {
-                    return Err(format!(
-                        "source {} for {content} exceeded its reserved output cap of {declared} B",
-                        program.display()
-                    ));
-                }
-                if !output.status.success() {
-                    return Err(format!(
-                        "source process {} for {content} exited {}: {}",
-                        program.display(),
-                        output.status,
-                        String::from_utf8_lossy(&output.stderr).trim()
-                    ));
-                }
-                output.stdout
+            } => Ok(ReplayableProcessSource {
+                declared_size: self.declared_size,
+                program,
+                args,
+                environment,
+            }),
+            NarSource::Memory(_) => {
+                Err("memory NAR cannot enter the two-pass process regeneration path".to_owned())
             }
-        };
-        // RECONCILE AGAINST WHAT ADMISSION RESERVED, not merely the per-NAR cap: a
-        // source that declared 1 MiB and produced 200 MiB (still under the 256 MiB cap)
-        // would otherwise slip through while the in-flight ledger still said 1 MiB.
-        if bytes.len() as u64 != declared {
-            return Err(format!(
-                "{content} was admitted as {declared} B but its source produced {} B - the \
-                 budget charged for a different NAR than it got",
-                bytes.len()
-            ));
         }
-        // The byte-integrity anchor: never serve bytes that do not hash to the announced
-        // content identity, whatever the source claimed.
-        let produced = Blake3Digest::from_raw_nar(&bytes);
-        if &produced != content {
-            return Err(format!(
-                "the source for {content} now hashes to {produced} - refusing to serve the \
-                 wrong bytes under the right name"
-            ));
+    }
+
+    /// Produce the raw NAR bytes on the SYNCHRONOUS inline swarm-worker path
+    /// ([`ServeGate::respond`]). This cycle that path is Memory-only, matching the
+    /// module's honest scope note: a real store-dump / regular-file source uses
+    /// v4's off-worker two-pass path. A [`NarSource::Process`] reaching this path
+    /// is therefore a wiring error, reported loudly rather than buffered or run
+    /// un-supervised on the poll thread.
+    fn produce(self) -> Result<Arc<Vec<u8>>, String> {
+        match self.source {
+            NarSource::Memory(bytes) => {
+                let actual = bytes.len() as u64;
+                if actual != self.declared_size {
+                    return Err(format!(
+                        "memory NAR produced {actual} B, declared_size is {} B",
+                        self.declared_size
+                    ));
+                }
+                Ok(bytes)
+            }
+            NarSource::Process { program, .. } => Err(format!(
+                "a Process/RegularFile NAR source ({}) cannot be produced on the synchronous \
+                 swarm-worker path; it requires bounded two-pass /nar/4 regeneration",
+                program.display()
+            )),
         }
-        Ok(bytes)
     }
 }
 
@@ -1047,8 +1751,8 @@ impl MemoryNarSupplier {
     }
 
     /// Bind `bytes` under an ARBITRARY `content` digest, even one they do NOT hash to -
-    /// a CORRUPT/LYING provider, so a test can prove the fetch side's gate-1 BLAKE3
-    /// verify rejects the mismatch rather than trusting the bytes.
+    /// a CORRUPT/LYING provider, so a test can prove Bao root authentication rejects
+    /// the mismatch rather than trusting the bytes.
     pub fn insert_raw(&mut self, content: Blake3Digest, bytes: Vec<u8>) {
         self.nars.insert(content, Arc::new(bytes));
     }
@@ -1161,8 +1865,8 @@ pub trait CatalogProbe: Send + Sync {
 ///
 /// The daemon end-to-end wiring that builds this over its `AvailabilityIndex` and serves
 /// a real `/nix/store` (replacing the `--libp2p-seed-nar` `MemoryNarSupplier`) is
-/// TASK-191; production through it is cancellation-safe via
-/// [`NarSupplyPlan::produce_supervised`].
+/// TASK-191; production through it is cancellation-safe via v4's two
+/// supervised regeneration passes.
 pub struct CatalogNarSupplier {
     catalog: Arc<dyn CatalogProbe>,
     /// The daemon's raw-NAR helper program, run for a [`ProbedSource::RegularFile`].
@@ -1226,6 +1930,19 @@ pub struct ServeCounters {
     pub refused_stopped: u64,
 }
 
+/// One successfully completed process-backed `/nar/4` serve, observed after COMPLETE, flush,
+/// and clean FIN. This is an event stream for evidence/telemetry, not mutable serve state.
+#[derive(Debug, Clone)]
+pub struct ServeObservation {
+    pub content: Blake3Digest,
+    pub selected_codec: WireCodec,
+    pub pass1_bytes: u64,
+    pub pass2_bytes: u64,
+    pub proof_preparation_ns: u128,
+    pub total_serve_ns: u128,
+    pub wire: nar_v4::NarV4WireAccounting,
+}
+
 /// The admission gate: the budget, the supplier, and what is in flight. Shared (via
 /// [`Arc`]) between the swarm worker (which calls [`respond`](ServeGate::respond) on
 /// each inbound request) and the serve teardown guard (which flips
@@ -1238,8 +1955,8 @@ pub struct ServeGate {
     codec_policy: ServeCodecPolicy,
     supplier: Arc<dyn Libp2pNarSupplier>,
     /// The supervisor OFF-loop Process production runs under (TASK-193): a
-    /// [`NarSource::Process`] source rides in a killable, reaped-on-shutdown process group
-    /// via [`NarSupplyPlan::produce_supervised`]. A [`TaskSupervisorHandle::disconnected`]
+    /// [`NarSource::Process`] source rides in killable, reaped-on-shutdown process groups
+    /// for both v4 passes. A [`TaskSupervisorHandle::disconnected`]
     /// handle disables Process serving (every Process serve is `Declined(SupplyFailed)`),
     /// which is exactly what a Memory-only server wants; a serving fabric threads a live
     /// handle from the supervisor it owns.
@@ -1262,6 +1979,7 @@ pub struct ServeGate {
     declined_unknown: AtomicU64,
     declined_supply_failed: AtomicU64,
     refused_stopped: AtomicU64,
+    observations: Option<tokio::sync::mpsc::Sender<ServeObservation>>,
 }
 
 impl ServeGate {
@@ -1277,8 +1995,7 @@ impl ServeGate {
         // ServeBudget::from_seam) so a new `peer_fabric::ServeBudget` field fails THIS
         // build rather than being silently unenforced by the gate. All three are now
         // enforced: the per-NAR and in-flight ceilings in `admit_plan`, and (TASK-157)
-        // `max_serve_duration` as a real serve deadline around off-loop production in
-        // `produce_admitted`.
+        // `max_serve_duration` as one absolute deadline around the complete exchange.
         let ServeBudget {
             max_nar_bytes_uncompressed_nar: _,
             max_inflight_bytes_uncompressed_nar: _,
@@ -1297,7 +2014,19 @@ impl ServeGate {
             declined_unknown: AtomicU64::new(0),
             declined_supply_failed: AtomicU64::new(0),
             refused_stopped: AtomicU64::new(0),
+            observations: None,
         }
+    }
+
+    /// Subscribe to successful process-backed serve observations. Emission is a non-blocking
+    /// `try_send` after `write_half.close()` succeeds; a full or closed receiver is logged and
+    /// dropped, so telemetry cannot backpressure a completed transfer or grow without bound.
+    pub fn with_observations(
+        mut self,
+        sender: tokio::sync::mpsc::Sender<ServeObservation>,
+    ) -> Self {
+        self.observations = Some(sender);
+        self
     }
 
     /// Set the serve-side link-compression policy (TASK-99). Builder-style so a fabric can
@@ -1370,7 +2099,10 @@ impl ServeGate {
         // can never both pass and blow past the ceiling.
         loop {
             let held = self.inflight_bytes.load(Ordering::Acquire);
-            let want = held.saturating_add(declared);
+            let Some(want) = held.checked_add(declared) else {
+                self.declined_busy.fetch_add(1, Ordering::Relaxed);
+                return Err(NarResponse::Declined(DeclineReason::Busy));
+            };
             if want > self.budget.max_inflight_bytes_uncompressed_nar {
                 self.declined_busy.fetch_add(1, Ordering::Relaxed);
                 return Err(NarResponse::Declined(DeclineReason::Busy));
@@ -1392,16 +2124,15 @@ impl ServeGate {
         Ok((plan, reservation))
     }
 
-    /// Produce an admitted plan INLINE (the Memory fast path / the synchronous test path)
-    /// and update the counters. Does NOT touch the reservation (the caller releases it). A
+    /// Produce an admitted plan INLINE (the Memory fast path / the synchronous test path).
+    /// Does NOT count it as served: the async path records success only after clean response
+    /// close, while [`respond`](Self::respond) records delivery to its synchronous caller.
+    /// Does NOT touch the reservation (the caller releases it). A
     /// [`NarSource::Process`] reaching here is `Declined(SupplyFailed)` - the sync
     /// [`NarSupplyPlan::produce`] refuses to run a supervised process on the poll thread.
     fn finish_inline(&self, plan: NarSupplyPlan, content: &Blake3Digest) -> NarResponse {
         match plan.produce() {
-            Ok(bytes) => {
-                self.admitted.fetch_add(1, Ordering::Relaxed);
-                NarResponse::Nar(bytes)
-            }
+            Ok(bytes) => NarResponse::Nar(bytes),
             Err(why) => {
                 tracing::warn!(%content, %why, "libp2p serve: supplier failed to produce NAR inline");
                 self.declined_supply_failed.fetch_add(1, Ordering::Relaxed);
@@ -1414,7 +2145,7 @@ impl ServeGate {
     /// in-memory/inline case and the unit tests; a [`NarSource::Process`] reaching here is
     /// `Declined(SupplyFailed)` (the RED path) because [`NarSupplyPlan::produce`] cannot run
     /// a supervised process - the swarm worker routes Process sources through
-    /// [`Self::admit`] + [`Self::produce_admitted`] off the poll loop instead (TASK-193).
+    /// [`Self::admit`] and the v4 two-pass serve path instead (TASK-193).
     pub fn respond(&self, content: &Blake3Digest) -> NarResponse {
         let (plan, _reservation) = match self.admit_plan(content) {
             Ok(admitted) => admitted,
@@ -1422,7 +2153,11 @@ impl ServeGate {
         };
         // `_reservation` releases when it drops at the end of this call, after the inline
         // production - the reserve/release pairing the async path gets from the guard too.
-        self.finish_inline(plan, content)
+        let response = self.finish_inline(plan, content);
+        if matches!(&response, NarResponse::Nar(_)) {
+            self.admitted.fetch_add(1, Ordering::Relaxed);
+        }
+        response
     }
 
     /// Admit one inbound request on the swarm poll loop, deciding WHERE its bytes are
@@ -1447,11 +2182,7 @@ impl ServeGate {
             // Hand the guard to the caller INSIDE the outcome: the per-stream serve task moves
             // it into the production future, so the reserve is released whenever that future is
             // dropped - including before its first poll (the DEEP-gate pre-first-poll leak).
-            Serve::OffLoop {
-                plan,
-                content: *content,
-                reservation,
-            }
+            Serve::OffLoop { plan, reservation }
         } else {
             // Memory produced inline; the reserve is HANDED BACK (not dropped here) so
             // `serve_stream` holds it THROUGH the response write, exactly as the Process path
@@ -1466,59 +2197,11 @@ impl ServeGate {
         }
     }
 
-    /// The serve exchange deadline (`ServeBudget::max_serve_duration`): bounds off-loop
-    /// production ([`Self::produce_admitted`]) AND the serve-side request read / response
+    /// The serve exchange deadline (`ServeBudget::max_serve_duration`): bounds both process
+    /// passes AND the serve-side request read / response
     /// write ([`serve_stream`]), so no phase of an inbound serve can hang unbounded.
     pub(crate) fn max_serve_duration(&self) -> Duration {
         self.budget.max_serve_duration
-    }
-
-    /// Produce an admitted [`Serve::OffLoop`] plan OFF the poll loop (TASK-193): run the
-    /// supervised process source under this gate's [`TaskSupervisorHandle`], keeping the
-    /// serve-time `len == declared_size` AND `BLAKE3(RawNarV1) == content` recheck
-    /// ([`NarSupplyPlan::produce_supervised`]).
-    ///
-    /// The in-flight reservation is NOT managed here: its [`InflightReservation`] guard was
-    /// constructed at admit and is owned by the caller (the per-stream serve task moves it in
-    /// alongside this call). That deliberately keeps the reserve released even when this future
-    /// is dropped BEFORE its first poll - the DEEP-gate leak an in-body guard missed. Dropping
-    /// the returned future still SIGKILL-reaps the `nix-store --dump` group, because dropping
-    /// the inner `produce_supervised` future signals caller-abandonment.
-    ///
-    /// SERVE DEADLINE (TASK-157): production is bounded by `budget.max_serve_duration`. A
-    /// source that has not produced its bytes within the deadline is `Declined(SupplyFailed)`
-    /// and, because the timeout DROPS the inner `produce_supervised` future, its supervised
-    /// process group is SIGKILL-reaped - a wedged / pathologically slow dump can never pin a
-    /// serve slot open forever now that production is a long-lived off-loop await.
-    pub(crate) async fn produce_admitted(
-        &self,
-        plan: NarSupplyPlan,
-        content: Blake3Digest,
-    ) -> NarResponse {
-        let production = plan.produce_supervised(&self.supervisor, &content);
-        match tokio::time::timeout(self.budget.max_serve_duration, production).await {
-            Ok(Ok(bytes)) => {
-                self.admitted.fetch_add(1, Ordering::Relaxed);
-                NarResponse::Nar(bytes)
-            }
-            Ok(Err(why)) => {
-                tracing::warn!(
-                    %content, %why,
-                    "libp2p serve: off-loop supplier failed to produce NAR"
-                );
-                self.declined_supply_failed.fetch_add(1, Ordering::Relaxed);
-                NarResponse::Declined(DeclineReason::SupplyFailed)
-            }
-            Err(_elapsed) => {
-                let deadline = self.budget.max_serve_duration;
-                tracing::warn!(
-                    %content, ?deadline,
-                    "libp2p serve: off-loop production exceeded the serve deadline; reaping"
-                );
-                self.declined_supply_failed.fetch_add(1, Ordering::Relaxed);
-                NarResponse::Declined(DeclineReason::SupplyFailed)
-            }
-        }
     }
 }
 
@@ -1535,13 +2218,12 @@ pub(crate) enum Serve {
         response: NarResponse,
         reservation: Option<InflightReservation>,
     },
-    /// An admitted process source to produce OFF the poll loop via
-    /// [`ServeGate::produce_admitted`]. Carries the [`InflightReservation`] guard that OWNS
+    /// An admitted process source to produce OFF the poll loop through v4's
+    /// two-pass path. Carries the [`InflightReservation`] guard that OWNS
     /// the reserve's release: the swarm worker moves it into the production future, so
     /// dropping that future - at any point, including before its first poll - releases it.
     OffLoop {
         plan: NarSupplyPlan,
-        content: Blake3Digest,
         reservation: InflightReservation,
     },
 }
@@ -1569,7 +2251,7 @@ impl Drop for InflightReservation {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use peer_fabric::{ACCEPT_RAW_AND_ZSTD, DEFAULT_ZSTD_LEVEL, compress_zstd};
+    use peer_fabric::{ACCEPT_RAW_AND_ZSTD, DEFAULT_ZSTD_LEVEL};
     use std::time::Duration;
 
     fn budget(max_nar: u64, max_inflight: u64) -> ServeBudget {
@@ -1592,8 +2274,9 @@ mod tests {
 
     #[test]
     fn max_response_cap_tracks_the_serve_default() {
-        // SSOT tripwire: the fetch-side hard cap must equal the authoritative serve
-        // per-NAR default, or an honest node could serve a NAR a peer cannot fetch.
+        // SSOT tripwire: the unknown-size fetch fallback must equal the authoritative
+        // serve per-NAR default, or a default-serving node could advertise a NAR that a
+        // cold-start peer refuses before it learns the signed size.
         // If TASK-120 moves the default, this fails until MAX_NAR_RESPONSE_BYTES follows.
         assert_eq!(
             MAX_NAR_RESPONSE_BYTES,
@@ -1608,7 +2291,7 @@ mod tests {
         let supplier = Arc::new(MemoryNarSupplier::new([nar.clone()]));
         let gate = memory_gate(supplier);
         match gate.respond(&content) {
-            NarResponse::Nar(bytes) => assert_eq!(bytes, nar),
+            NarResponse::Nar(bytes) => assert_eq!(bytes.as_slice(), nar),
             other => panic!("expected Nar, got {other:?}"),
         }
         assert_eq!(gate.counters().admitted, 1);
@@ -1643,6 +2326,30 @@ mod tests {
     }
 
     #[test]
+    fn inflight_reservation_overflow_declines_busy_without_wrapping() {
+        let nar = vec![0x7a];
+        let content = Blake3Digest::from_raw_nar(&nar);
+        let gate = ServeGate::new(
+            ServeBudget {
+                max_nar_bytes_uncompressed_nar: u64::MAX,
+                max_inflight_bytes_uncompressed_nar: u64::MAX,
+                max_serve_duration: Duration::from_secs(1),
+            },
+            Arc::new(MemoryNarSupplier::new([nar])),
+            TaskSupervisorHandle::disconnected(),
+        );
+        gate.inflight_bytes.store(u64::MAX, Ordering::Release);
+
+        assert!(matches!(
+            gate.respond(&content),
+            NarResponse::Declined(DeclineReason::Busy)
+        ));
+        assert_eq!(gate.inflight_bytes.load(Ordering::Acquire), u64::MAX);
+        assert_eq!(gate.counters().declined_busy, 1);
+        assert_eq!(gate.counters().admitted, 0);
+    }
+
+    #[test]
     fn stopped_gate_refuses_admission() {
         let nar = b"held after stop".to_vec();
         let content = Blake3Digest::from_raw_nar(&nar);
@@ -1673,7 +2380,7 @@ mod tests {
     }
 
     /// A one-content [`CatalogProbe`] that hands back a fixed [`ProbedSupply`], so a test
-    /// can drive `plan` / `produce_supervised` without the daemon catalog.
+    /// can drive supply planning and the two-pass serve without the daemon catalog.
     struct OneProbe {
         content: Blake3Digest,
         declared_size: u64,
@@ -1689,519 +2396,31 @@ mod tests {
         }
     }
 
-    /// AC#1 (declared-size-before-produce + no dump at plan time). The dumper program
-    /// TOUCHES a marker when it runs; `plan()` must learn the declared size WITHOUT
-    /// running it (marker absent), and only `produce_supervised()` regenerates the exact
-    /// bytes (marker present). BITE: make `plan()` run the dumper to learn the size and
-    /// the "marker absent after plan" assertion fails.
-    #[tokio::test]
-    async fn process_plan_learns_declared_size_without_running_the_dumper() {
-        let marker = unique_temp("dump-marker");
-        let _ = std::fs::remove_file(&marker);
-        let body = b"hello raw nar body produced on demand".to_vec();
-        let content = Blake3Digest::from_raw_nar(&body);
-        let body_str = String::from_utf8(body.clone()).unwrap();
-        let script = format!("touch \"$1\"; printf %s '{body_str}'");
-        let program = PathBuf::from("sh");
-        let args = vec![
-            OsString::from("-c"),
-            OsString::from(script),
-            OsString::from("sh"),
-            marker.clone().into_os_string(),
-        ];
-        let probe = OneProbe {
-            content,
-            declared_size: body.len() as u64,
-            make: Box::new(move || ProbedSource::Process {
-                program: program.clone(),
-                args: args.clone(),
-            }),
-        };
-        let supplier = CatalogNarSupplier::new(probe, "unused-helper");
-
-        let plan = supplier.plan(&content).expect("probe supplies the content");
-        assert_eq!(
-            plan.declared_size(),
-            body.len() as u64,
-            "declared size comes from the probe, not a dump"
-        );
-        assert!(
-            !marker.exists(),
-            "plan() must NOT run the dumper to learn the size (declared-size-before-produce)"
-        );
-
-        let supervisor = TaskSupervisor::new();
-        let produced = plan
-            .produce_supervised(&supervisor.handle(), &content)
-            .await
-            .expect("produce regenerates the bytes");
-        assert_eq!(
-            produced, body,
-            "produce_supervised regenerates the exact NAR"
-        );
-        assert!(
-            marker.exists(),
-            "produce_supervised actually ran the dumper"
-        );
-        let _ = std::fs::remove_file(&marker);
-    }
-
-    /// AC#1 (RegularFile source round-trips a raw NAR without holding it at rest). The
-    /// file is dumped by a helper PROCESS (never an in-process read - see `NarSource`),
-    /// and the produced bytes hash back to the announced content.
-    #[tokio::test]
-    async fn regular_file_source_round_trips_via_helper_process() {
-        use std::os::unix::fs::PermissionsExt;
-
-        let body = b"a raw nar regular file, streamed on demand and not held".to_vec();
-        let content = Blake3Digest::from_raw_nar(&body);
-        let nar_path = unique_temp("file.nar");
-        std::fs::write(&nar_path, &body).unwrap();
-        // The daemon's raw-NAR helper is `helper __dump-raw-nar <path>`; here a tiny
-        // script that ignores $1 (the marker arg) and cats $2 (the path) stands in.
-        let helper = unique_temp("dump-helper.sh");
-        std::fs::write(&helper, "#!/bin/sh\nexec cat \"$2\"\n").unwrap();
-        std::fs::set_permissions(&helper, std::fs::Permissions::from_mode(0o755)).unwrap();
-
-        let file_path = nar_path.clone();
-        let probe = OneProbe {
-            content,
-            declared_size: body.len() as u64,
-            make: Box::new(move || ProbedSource::RegularFile(file_path.clone())),
-        };
-        let supplier = CatalogNarSupplier::new(probe, helper.clone());
-
-        let plan = supplier.plan(&content).expect("probe supplies the file");
-        assert_eq!(plan.declared_size(), body.len() as u64);
-        let supervisor = TaskSupervisor::new();
-        let produced = plan
-            .produce_supervised(&supervisor.handle(), &content)
-            .await
-            .expect("regular-file round-trip");
-        assert_eq!(produced, body);
-        let _ = std::fs::remove_file(&nar_path);
-        let _ = std::fs::remove_file(&helper);
-    }
-
-    /// AC#1 (serve-time integrity anchor). A source that produces bytes NOT hashing to
-    /// the announced content must fail LOUD, never ship the wrong bytes under a right
-    /// name (a store path rebuilt / a raw-NAR file replaced since announce).
-    #[tokio::test]
-    async fn produce_rejects_bytes_that_do_not_hash_to_the_announced_content() {
-        let announced = b"the bytes that were announced".to_vec();
-        let content = Blake3Digest::from_raw_nar(&announced);
-        // The dumper prints DIFFERENT bytes of the SAME length (so the size guard passes
-        // and only the BLAKE3 recheck can catch it).
-        let changed = b"the bytes that got changed!!!".to_vec();
-        assert_eq!(announced.len(), changed.len());
-        let changed_str = String::from_utf8(changed.clone()).unwrap();
-        let program = PathBuf::from("sh");
-        let args = vec![
-            OsString::from("-c"),
-            OsString::from(format!("printf %s '{changed_str}'")),
-        ];
-        let probe = OneProbe {
-            content,
-            declared_size: announced.len() as u64,
-            make: Box::new(move || ProbedSource::Process {
-                program: program.clone(),
-                args: args.clone(),
-            }),
-        };
-        let supplier = CatalogNarSupplier::new(probe, "unused-helper");
-        let plan = supplier.plan(&content).unwrap();
-        let supervisor = TaskSupervisor::new();
-        let error = plan
-            .produce_supervised(&supervisor.handle(), &content)
-            .await
-            .expect_err("bytes that do not hash to the announced content are rejected");
-        assert!(
-            error.contains("now hashes to"),
-            "expected a byte-integrity rejection, got: {error}"
-        );
-    }
-
-    /// AC#2 (cancellation-safety: the process GROUP is reaped on shutdown, no unkillable
-    /// worker). A supervised producer starts a blocking `sh` that spawns a grandchild;
-    /// once the job is live, node cancel must SIGKILL and reap the whole group. The reap
-    /// oracle is the registry: a job is removed only after its worker proves the group is
-    /// child-free. BITE: run the producer UN-supervised (a raw detached spawn instead of
-    /// `execute_process`) and the grandchild survives cancel - the `/proc/<pid>` and
-    /// `active_len()==0` assertions fail. BOUNDED: one spawn + one reap.
-    #[tokio::test]
-    async fn supervised_process_source_is_reaped_on_cancel() {
-        let pid_file = unique_temp("reap-pids");
-        let _ = std::fs::remove_file(&pid_file);
-        let content = Blake3Digest::from_bytes([0x5a; 32]);
-        let program = PathBuf::from("sh");
-        let script = "(while :; do sleep 0.05; done) & grand=$!; printf '%s %s' \"$$\" \"$grand\" > \"$1\"; wait";
-        let pid_file_arg = pid_file.clone();
-        let probe = OneProbe {
-            content,
-            declared_size: 1 << 20, // never reached; the process is cancelled first
-            make: Box::new(move || ProbedSource::Process {
-                program: PathBuf::from("sh"),
-                args: vec![
-                    OsString::from("-c"),
-                    OsString::from(script),
-                    OsString::from("reaper-helper"),
-                    pid_file_arg.clone().into_os_string(),
-                ],
-            }),
-        };
-        let _ = program; // documents the source program; the probe rebuilds it per call
-        let supplier = CatalogNarSupplier::new(probe, "unused-helper");
-        let plan = supplier.plan(&content).unwrap();
-
-        let supervisor = TaskSupervisor::new();
-        let handle = supervisor.handle();
-        let probe_content = content;
-        let op =
-            tokio::spawn(async move { plan.produce_supervised(&handle, &probe_content).await });
-
-        // Wait until the helper AND grandchild published their pids and the job is live.
-        let pids = tokio::time::timeout(Duration::from_secs(3), async {
-            loop {
-                if let Ok(raw) = std::fs::read_to_string(&pid_file)
-                    && raw.split_whitespace().count() == 2
-                    && supervisor.process_jobs().active_len() == 1
-                {
-                    break raw;
-                }
-                tokio::time::sleep(Duration::from_millis(5)).await;
-            }
-        })
-        .await
-        .expect("the supervised process group started and published its pids");
-        let pids = pids
-            .split_whitespace()
-            .map(|raw| raw.parse::<u32>().expect("decimal pid"))
-            .collect::<Vec<_>>();
-
-        // Node shutdown: SIGKILL the group and reap.
-        supervisor.cancel_now();
-
-        // The reap oracle: the job leaves the registry only after it proved the group is
-        // child-free.
-        tokio::time::timeout(Duration::from_secs(3), async {
-            while supervisor.process_jobs().active_len() != 0 {
-                tokio::time::sleep(Duration::from_millis(5)).await;
-            }
-        })
-        .await
-        .expect("the process job was reaped and left the registry");
-
-        let produced = op.await.expect("producer task joined");
-        assert!(
-            produced.is_err(),
-            "a cancelled supervised produce fails rather than returning bytes"
-        );
-
-        for pid in pids {
-            assert!(
-                !PathBuf::from(format!("/proc/{pid}")).exists(),
-                "supervised pid {pid} (or its grandchild) survived node cancel - an orphan"
-            );
-        }
-        let _ = std::fs::remove_file(&pid_file);
-    }
-
-    // -------------------------------------------------------------------------
-    // TASK-193: the off-loop serve seam - a Process source is served through
-    // admit()+produce_admitted(), where the synchronous respond() path declines it.
-    // -------------------------------------------------------------------------
-
-    /// A serve gate over a one-content Process source producing `body` via `sh -c 'printf'`,
-    /// with a LIVE supervisor. `body` must contain no single quote.
-    fn process_gate(body: &[u8], supervisor: &TaskSupervisor) -> (ServeGate, Blake3Digest) {
+    fn no_codec_process_gate(
+        body: &[u8],
+        max_serve_duration: Duration,
+    ) -> (TaskSupervisor, Arc<ServeGate>, Blake3Digest) {
         let content = Blake3Digest::from_raw_nar(body);
-        let body_str = String::from_utf8(body.to_vec()).expect("ascii test body");
         let probe = OneProbe {
             content,
             declared_size: body.len() as u64,
-            make: Box::new(move || ProbedSource::Process {
-                program: PathBuf::from("sh"),
-                args: vec![
-                    OsString::from("-c"),
-                    OsString::from(format!("printf %s '{body_str}'")),
-                ],
-            }),
-        };
-        let supplier = Arc::new(CatalogNarSupplier::new(probe, "unused-helper"));
-        let gate = ServeGate::new(budget(1 << 20, 1 << 30), supplier, supervisor.handle());
-        (gate, content)
-    }
-
-    /// RED vs GREEN, the core unblock: the SYNC `respond()` path DECLINES a Process source
-    /// (it cannot run a supervised process on the poll thread), while the async
-    /// `admit()` + `produce_admitted()` path SERVES the exact bytes and the BLAKE3 of the
-    /// served bytes matches the announced content. BITE: route the Process source through
-    /// `respond()` (the old sync path) and it is `Declined(SupplyFailed)`.
-    #[tokio::test]
-    async fn process_source_is_declined_inline_but_served_off_loop() {
-        let body = b"raw nar produced by a process source, off the poll loop".to_vec();
-        let supervisor = TaskSupervisor::new();
-        let (gate, content) = process_gate(&body, &supervisor);
-        let gate = Arc::new(gate);
-
-        // RED: the synchronous inline path declines a Process source.
-        assert!(
-            matches!(
-                gate.respond(&content),
-                NarResponse::Declined(DeclineReason::SupplyFailed)
-            ),
-            "the sync respond() path must decline a Process source (the pre-193 behaviour)"
-        );
-
-        // GREEN: admit -> off-loop supervised production serves the exact bytes. The
-        // reservation guard is created at admit; hold it across production (as the worker
-        // does by moving it into the future) and let it release on completion.
-        let (plan, admitted_content, reservation) = match gate.admit(&content) {
-            Serve::OffLoop {
-                plan,
-                content,
-                reservation,
-            } => (plan, content, reservation),
-            Serve::Now { response, .. } => {
-                panic!("expected OffLoop for a Process source, got {response:?}")
-            }
-        };
-        assert_eq!(admitted_content, content);
-        assert_eq!(
-            gate.inflight_bytes.load(Ordering::Acquire),
-            body.len() as u64,
-            "admit reserved the declared bytes"
-        );
-        let response = {
-            let _reservation = reservation;
-            gate.produce_admitted(plan, admitted_content).await
-        };
-        match response {
-            NarResponse::Nar(bytes) => {
-                assert_eq!(bytes, body, "off-loop production serves the exact bytes");
-                assert_eq!(Blake3Digest::from_raw_nar(&bytes), content);
-            }
-            other => panic!("expected Nar from the off-loop path, got {other:?}"),
-        }
-        assert_eq!(gate.counters().admitted, 1);
-        assert_eq!(
-            gate.inflight_bytes.load(Ordering::Acquire),
-            0,
-            "the reservation is released after off-loop production completes"
-        );
-    }
-
-    /// TASK-193 cancellation-safety THROUGH the gate: a slow Process serve admitted and
-    /// producing off-loop is REAPED (the process group is SIGKILLed and its job leaves the
-    /// registry) when the node's supervisor is cancelled, AND the in-flight reservation is
-    /// released - no orphan `nix-store --dump`, no leaked reservation. BITE: skip the reap
-    /// (an un-supervised spawn) and the grandchild survives in `/proc`; drop the RAII
-    /// reservation guard and the in-flight ledger stays non-zero. BOUNDED: one spawn + reap.
-    #[tokio::test]
-    async fn off_loop_serve_is_reaped_and_reservation_released_on_cancel() {
-        let pid_file = unique_temp("task193-reap-pids");
-        let _ = std::fs::remove_file(&pid_file);
-        let content = Blake3Digest::from_bytes([0x5b; 32]);
-        let declared: u64 = 1 << 20; // never produced; the serve is cancelled first
-        let script = "(while :; do sleep 0.05; done) & grand=$!; printf '%s %s' \"$$\" \"$grand\" > \"$1\"; wait";
-        let pid_file_arg = pid_file.clone();
-        let probe = OneProbe {
-            content,
-            declared_size: declared,
-            make: Box::new(move || ProbedSource::Process {
-                program: PathBuf::from("sh"),
-                args: vec![
-                    OsString::from("-c"),
-                    OsString::from(script),
-                    OsString::from("task193-reaper"),
-                    pid_file_arg.clone().into_os_string(),
-                ],
+            make: Box::new(|| ProbedSource::Process {
+                program: PathBuf::from("process-must-not-start-for-no-common-codec"),
+                args: Vec::new(),
             }),
         };
         let supervisor = TaskSupervisor::new();
-        let supplier = Arc::new(CatalogNarSupplier::new(probe, "unused-helper"));
         let gate = Arc::new(ServeGate::new(
-            budget(1 << 30, 1 << 30),
-            supplier,
+            ServeBudget {
+                max_nar_bytes_uncompressed_nar: 1 << 20,
+                max_inflight_bytes_uncompressed_nar: 1 << 30,
+                max_serve_duration,
+            },
+            Arc::new(CatalogNarSupplier::new(probe, "unused-helper")),
             supervisor.handle(),
         ));
-
-        // Admit on the "poll loop": this RESERVES `declared` and hands back the guard.
-        let (plan, admitted_content, reservation) = match gate.admit(&content) {
-            Serve::OffLoop {
-                plan,
-                content,
-                reservation,
-            } => (plan, content, reservation),
-            Serve::Now { response, .. } => panic!("expected OffLoop, got {response:?}"),
-        };
-        assert_eq!(
-            gate.inflight_bytes.load(Ordering::Acquire),
-            declared,
-            "admit reserved the declared bytes"
-        );
-        // Move the guard into the production future, exactly as the swarm worker does.
-        let gate_task = Arc::clone(&gate);
-        let op = tokio::spawn(async move {
-            let _reservation = reservation;
-            gate_task.produce_admitted(plan, admitted_content).await
-        });
-
-        // Wait until the supervised group is live (pids published + one active job).
-        let pids = tokio::time::timeout(Duration::from_secs(3), async {
-            loop {
-                if let Ok(raw) = std::fs::read_to_string(&pid_file)
-                    && raw.split_whitespace().count() == 2
-                    && supervisor.process_jobs().active_len() == 1
-                {
-                    break raw;
-                }
-                tokio::time::sleep(Duration::from_millis(5)).await;
-            }
-        })
-        .await
-        .expect("the off-loop supervised group started and published its pids");
-        let pids = pids
-            .split_whitespace()
-            .map(|raw| raw.parse::<u32>().expect("decimal pid"))
-            .collect::<Vec<_>>();
-
-        // Node shutdown: SIGKILL + reap the group.
-        supervisor.cancel_now();
-        tokio::time::timeout(Duration::from_secs(3), async {
-            while supervisor.process_jobs().active_len() != 0 {
-                tokio::time::sleep(Duration::from_millis(5)).await;
-            }
-        })
-        .await
-        .expect("the off-loop process job was reaped and left the registry");
-
-        let response = op.await.expect("producer task joined");
-        assert!(
-            matches!(response, NarResponse::Declined(DeclineReason::SupplyFailed)),
-            "a cancelled off-loop serve declines rather than shipping bytes"
-        );
-        assert_eq!(
-            gate.inflight_bytes.load(Ordering::Acquire),
-            0,
-            "the in-flight reservation must be released on the cancelled path (no leak)"
-        );
-        for pid in pids {
-            assert!(
-                !PathBuf::from(format!("/proc/{pid}")).exists(),
-                "supervised pid {pid} (or its grandchild) survived cancel - an orphan"
-            );
-        }
-        let _ = std::fs::remove_file(&pid_file);
+        (supervisor, gate, content)
     }
-
-    /// TASK-193 DEEP-gate bite (the decisive one): admitting an `OffLoop` reserves against
-    /// the in-flight ceiling, and DROPPING the production future WITHOUT EVER POLLING IT (a
-    /// peer that abandons the request before the task is scheduled) must still release the
-    /// reserve. No ResponseChannel is needed - this is the pure reservation-lifetime oracle.
-    ///
-    /// BITE: with the reservation guard constructed INSIDE `produce_admitted`'s async body
-    /// (the pre-fix code), the guard is never built for an unpolled future, so the reserve
-    /// LEAKS and the final `inflight == 0` assertion fails (RED). With the guard owned from
-    /// admit and moved into the future (the fix), the unpolled drop releases it (GREEN).
-    /// Repeated leaks would retire serve capacity - an availability/DoS hole.
-    #[tokio::test]
-    async fn dropping_an_unpolled_off_loop_future_releases_the_reservation() {
-        let body = b"an abandoned request must not leak the in-flight reserve".to_vec();
-        let supervisor = TaskSupervisor::new();
-        let (gate, content) = process_gate(&body, &supervisor);
-        let gate = Arc::new(gate);
-
-        let (plan, reservation) = match gate.admit(&content) {
-            Serve::OffLoop {
-                plan, reservation, ..
-            } => (plan, reservation),
-            Serve::Now { response, .. } => {
-                panic!("expected OffLoop for a Process source, got {response:?}")
-            }
-        };
-        assert_eq!(
-            gate.inflight_bytes.load(Ordering::Acquire),
-            body.len() as u64,
-            "admit reserved the declared bytes"
-        );
-
-        // Build the EXACT future the swarm worker builds (the guard moved in alongside the
-        // plan), then DROP it without ever polling it.
-        let gate_fut = Arc::clone(&gate);
-        let fut = async move {
-            let _reservation = reservation;
-            gate_fut.produce_admitted(plan, content).await
-        };
-        drop(fut);
-
-        assert_eq!(
-            gate.inflight_bytes.load(Ordering::Acquire),
-            0,
-            "dropping the unpolled production future must release the reserve (no leak)"
-        );
-        // Nothing was ever produced, so no supervised process was spawned.
-        assert_eq!(supervisor.process_jobs().active_len(), 0);
-    }
-
-    /// TASK-193 DEEP-gate bite (the declared-size / exact-length arm, distinct from the hash
-    /// arm): a Process source whose dump produces a DIFFERENT LENGTH than its declared size
-    /// must be `Declined(SupplyFailed)`, never served/mislabeled. Here the probe DECLARES
-    /// more bytes than the dump emits; the produced bytes DO hash to the announced content,
-    /// so ONLY the `len == declared_size` recheck can catch the lie.
-    ///
-    /// BITE: remove that exact-length check in `produce_supervised` and the short dump is
-    /// served under the wrong (larger) declared size - the `Declined` assertion goes RED.
-    #[tokio::test]
-    async fn process_source_with_wrong_declared_length_is_declined() {
-        let actual = b"short dump body".to_vec();
-        // The announced content is the honest hash of the ACTUAL bytes, so the BLAKE3 arm
-        // passes; the lie is purely in the declared size.
-        let content = Blake3Digest::from_raw_nar(&actual);
-        let declared = actual.len() as u64 + 100; // claim 100 more bytes than produced
-        let actual_str = String::from_utf8(actual.clone()).expect("ascii body");
-        let probe = OneProbe {
-            content,
-            declared_size: declared,
-            make: Box::new(move || ProbedSource::Process {
-                program: PathBuf::from("sh"),
-                args: vec![
-                    OsString::from("-c"),
-                    OsString::from(format!("printf %s '{actual_str}'")),
-                ],
-            }),
-        };
-        let supervisor = TaskSupervisor::new();
-        let supplier = Arc::new(CatalogNarSupplier::new(probe, "unused-helper"));
-        let gate = Arc::new(ServeGate::new(
-            budget(1 << 20, 1 << 30),
-            supplier,
-            supervisor.handle(),
-        ));
-
-        let (plan, admitted_content, reservation) = match gate.admit(&content) {
-            Serve::OffLoop {
-                plan,
-                content,
-                reservation,
-            } => (plan, content, reservation),
-            Serve::Now { response, .. } => panic!("expected OffLoop, got {response:?}"),
-        };
-        let response = {
-            let _reservation = reservation;
-            gate.produce_admitted(plan, admitted_content).await
-        };
-        assert!(
-            matches!(response, NarResponse::Declined(DeclineReason::SupplyFailed)),
-            "a dump whose length != declared_size must be Declined, got {response:?}"
-        );
-        assert_eq!(
-            gate.inflight_bytes.load(Ordering::Acquire),
-            0,
-            "the reservation is released after the declined serve"
-        );
-    }
-
     // -------------------------------------------------------------------------
     // TASK-157: the FETCH-side streaming read core (`read_response_streamed`), unit-bitten
     // over in-memory readers. These are the crisp, load-tolerant bites for AC#1 (mid-stream
@@ -2215,21 +2434,371 @@ mod tests {
     /// hiccup, short enough that the test finishes fast.
     const IDLE: Duration = Duration::from_millis(150);
 
-    /// Frame a RAW wire response: the status byte, the RAW codec byte (TASK-99), then the
-    /// body verbatim, exactly what a well-behaved server writes for an uncompressed body (no
-    /// length prefix - EOF terminates the NAR).
+    /// Frame a complete v4 response using the production Bao codec.
     fn wire_nar(body: &[u8]) -> Vec<u8> {
-        let mut v = vec![STATUS_NAR, WireCodec::Raw.wire()];
-        v.extend_from_slice(body);
-        v
+        wire_nar_codec(body, WireCodec::Raw, DEFAULT_ZSTD_LEVEL)
     }
 
-    /// Frame a ZSTD wire response: the status byte, the ZSTD codec byte, then a single zstd
-    /// frame of `body` at `level` (TASK-99). Models a compressing server's wire.
+    /// Frame a ZSTD v4 response with one independently compressed frame per Bao leaf.
     fn wire_nar_zstd(body: &[u8], level: i32) -> Vec<u8> {
-        let mut v = vec![STATUS_NAR, WireCodec::Zstd.wire()];
-        v.extend_from_slice(&compress_zstd(body, level).expect("compress"));
-        v
+        wire_nar_codec(body, WireCodec::Zstd, level)
+    }
+
+    fn wire_nar_codec(body: &[u8], codec: WireCodec, level: i32) -> Vec<u8> {
+        let mut cursor = io::Cursor::new(body);
+        let outboard = nar_v4::create_outboard(&mut cursor, body.len() as u64).unwrap();
+        let mut wire = vec![STATUS_NAR, codec.wire()];
+        wire.extend_from_slice(&(body.len() as u64).to_le_bytes());
+        nar_v4::encode_validated(body, &outboard, &mut wire, codec, level).unwrap();
+        wire.extend_from_slice(nar_v4::COMPLETE_MARKER);
+        wire
+    }
+
+    /// The async socket pump and blocking verifier have independent lifetimes.
+    /// A retained cancellation sender must not prevent normal EOF, and a leaf
+    /// that has already been authenticated must be observable before the peer
+    /// sends FIN. The final leaf remains withheld until the explicit End item.
+    #[tokio::test]
+    async fn verified_stream_exposes_early_leaf_and_explicit_end_completes() {
+        let raw = (0..((64 * 1024) + 17))
+            .map(|index| index as u8)
+            .collect::<Vec<_>>();
+        let content = Blake3Digest::from_raw_nar(&raw);
+        let wire = wire_nar(&raw);
+        let (sink, mut verified) =
+            verified_nar_stream(content, raw.len() as u64, WireCodec::Raw).await;
+
+        // Exclude the status/codec/raw-size header: this seam carries only the
+        // canonical Bao body, COMPLETE marker, and explicit transport End.
+        // For this two-leaf tree the body starts with one 64-byte parent
+        // pair, then the first 64-KiB leaf. Stop exactly there: receiving the
+        // first leaf must not depend on any byte from leaf two.
+        let through_first_leaf = 64 + (64 * 1024);
+        sink.send(wire[10..10 + through_first_leaf].to_vec())
+            .await
+            .unwrap();
+        let first = tokio::time::timeout(IDLE, verified.next_leaf())
+            .await
+            .expect("the first authenticated leaf is exposed before any later-leaf byte")
+            .expect("the stream has a first leaf");
+        assert_eq!(&first[..], &raw[..64 * 1024]);
+
+        sink.send(wire[10 + through_first_leaf..].to_vec())
+            .await
+            .unwrap();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(25), verified.next_leaf())
+                .await
+                .is_err(),
+            "the final leaf must remain withheld before clean transport EOF"
+        );
+        sink.finish().await.unwrap();
+        let final_leaf = tokio::time::timeout(IDLE, verified.next_leaf())
+            .await
+            .expect("clean EOF releases the final authenticated leaf")
+            .expect("the stream has a final leaf");
+        assert_eq!(&final_leaf[..], &raw[64 * 1024..]);
+        assert!(verified.next_leaf().await.is_none());
+        assert_eq!(verified.finish().await.unwrap(), raw.len() as u64);
+    }
+
+    #[test]
+    fn disappearing_wire_sender_is_not_clean_fin_and_never_releases_final_leaf() {
+        let raw = vec![0x31; 4096];
+        let content = Blake3Digest::from_raw_nar(&raw);
+        let wire = wire_nar(&raw);
+        let (sender, receiver) = tokio::sync::mpsc::channel(1);
+        sender
+            .try_send(BaoWireItem::Data(wire[10..].to_vec()))
+            .unwrap();
+        drop(sender);
+
+        let mut reader = BlockingBaoWireReader::new(receiver);
+        let mut exposed = Vec::new();
+        let error = nar_v4::decode_verified(
+            &mut reader,
+            bao_tree::blake3::Hash::from(*content.as_bytes()),
+            raw.len() as u64,
+            WireCodec::Raw,
+            |leaf| {
+                exposed.push(leaf);
+                Ok(())
+            },
+        )
+        .expect_err("sender disappearance without explicit End is not a clean FIN");
+        assert_eq!(error.kind(), io::ErrorKind::UnexpectedEof);
+        assert!(
+            error.to_string().contains("without explicit transport End"),
+            "unexpected sender-drop error: {error}"
+        );
+        assert!(
+            exposed.is_empty(),
+            "the final authenticated leaf must remain withheld without clean FIN"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn blocked_socket_handoff_cannot_queue_a_second_owned_leaf() {
+        const LEAF: usize = 64 * 1024;
+        for codec in [WireCodec::Raw, WireCodec::Zstd] {
+            let raw = vec![0x4d; (3 * LEAF) + 17];
+            let mut source = io::Cursor::new(&raw);
+            let outboard = nar_v4::create_outboard(&mut source, raw.len() as u64).unwrap();
+            let (wire_tx, mut wire_rx) = tokio::sync::mpsc::channel(1);
+            let encoder = tokio::task::spawn_blocking(move || {
+                let result = nar_v4::encode_validated(
+                    &raw[..],
+                    &outboard,
+                    BlockingChunkWriter::new(wire_tx),
+                    codec,
+                    DEFAULT_ZSTD_LEVEL,
+                );
+                result.map(|(_sink, raw_bytes, wire_bytes)| (raw_bytes, wire_bytes))
+            });
+
+            let first_leaf = loop {
+                let item = tokio::time::timeout(IDLE, wire_rx.recv())
+                    .await
+                    .expect("encoder hands off its next wire item")
+                    .expect("encoder remains connected before its first leaf");
+                let is_leaf = match codec {
+                    WireCodec::Raw => item.bytes.len() == LEAF,
+                    WireCodec::Zstd => item.bytes.len() != 64,
+                };
+                if is_leaf {
+                    break item;
+                }
+                let OwnedWireChunk { mut bytes, recycle } = item;
+                bytes.clear();
+                recycle.send(bytes).unwrap();
+            };
+
+            tokio::time::sleep(Duration::from_millis(25)).await;
+            assert!(
+                !encoder.is_finished(),
+                "{codec:?} encoder must wait for the socket-write acknowledgement"
+            );
+            assert!(
+                matches!(
+                    wire_rx.try_recv(),
+                    Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+                ),
+                "{codec:?} handoff must not queue another item behind the owned leaf"
+            );
+
+            let OwnedWireChunk { mut bytes, recycle } = first_leaf;
+            bytes.clear();
+            recycle.send(bytes).unwrap();
+            while let Some(item) = wire_rx.recv().await {
+                let OwnedWireChunk { mut bytes, recycle } = item;
+                bytes.clear();
+                let _ = recycle.send(bytes);
+            }
+            let (raw_bytes, _wire_bytes) = encoder.await.unwrap().unwrap();
+            assert_eq!(raw_bytes, ((3 * LEAF) + 17) as u64);
+        }
+    }
+
+    #[tokio::test]
+    async fn verified_stream_waits_for_next_pull_before_allocating_the_next_leaf() {
+        const LEAF: usize = 64 * 1024;
+        let raw = vec![0x52; (3 * LEAF) + 17];
+        let content = Blake3Digest::from_raw_nar(&raw);
+        let wire = wire_nar(&raw);
+        let (sink, mut verified) =
+            verified_nar_stream(content, raw.len() as u64, WireCodec::Raw).await;
+        let producer = tokio::spawn(async move {
+            for chunk in wire[10..].chunks(16 * 1024) {
+                sink.send(chunk.to_vec()).await.unwrap();
+            }
+            sink.finish().await.unwrap();
+        });
+
+        let first = verified.next_leaf().await.expect("first verified leaf");
+        assert_eq!(first.len(), LEAF);
+        tokio::time::sleep(Duration::from_millis(25)).await;
+        assert!(
+            matches!(
+                verified.leaves.try_recv(),
+                Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+            ),
+            "the verifier must wait until the caller pulls the next leaf"
+        );
+
+        let second = verified.next_leaf().await.expect("second verified leaf");
+        assert_eq!(second.len(), LEAF);
+        assert_eq!(
+            first.len(),
+            LEAF,
+            "callers may retain an earlier Bytes leaf"
+        );
+        drop(first);
+        drop(second);
+        let third = verified.next_leaf().await.expect("third verified leaf");
+        assert_eq!(third.len(), LEAF);
+        drop(third);
+        let final_leaf = verified.next_leaf().await.expect("terminal verified leaf");
+        assert_eq!(final_leaf.len(), 17);
+        drop(final_leaf);
+        assert!(verified.next_leaf().await.is_none());
+        assert_eq!(verified.finish().await.unwrap(), raw.len() as u64);
+        producer.await.unwrap();
+    }
+
+    /// Reciprocal-fetch deadlock regression: every serve worker may be blocked
+    /// on peer socket backpressure, yet a fetch verifier must still start and
+    /// drain a response. Sharing one permit pool makes the constructor below
+    /// wait forever when the serve side is saturated.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn fetch_verifier_starts_while_all_serve_worker_permits_are_occupied() {
+        let pools = BaoWorkerPools::new(2, 1);
+        let _all_serve_permits = Arc::clone(&pools.serve)
+            .acquire_many_owned(2)
+            .await
+            .unwrap();
+        assert_eq!(pools.serve.available_permits(), 0);
+        assert_eq!(pools.fetch.available_permits(), 1);
+
+        let raw = vec![0x53; 4096];
+        let content = Blake3Digest::from_raw_nar(&raw);
+        let wire = wire_nar(&raw);
+        let (sink, mut verified) = tokio::time::timeout(
+            IDLE,
+            verified_nar_stream_with_pools(content, raw.len() as u64, WireCodec::Raw, &pools),
+        )
+        .await
+        .expect("fetch verifier pool remains available when serve pool is saturated");
+
+        sink.send(wire[10..].to_vec()).await.unwrap();
+        sink.finish().await.unwrap();
+        let leaf = tokio::time::timeout(IDLE, verified.next_leaf())
+            .await
+            .expect("independent fetch verifier authenticates the response")
+            .expect("one authenticated leaf");
+        assert_eq!(leaf.as_ref(), raw.as_slice());
+        assert!(verified.next_leaf().await.is_none());
+        assert_eq!(verified.finish().await.unwrap(), raw.len() as u64);
+    }
+
+    /// A process-backed admission may reserve bytes while waiting for Bao
+    /// capacity, but it must not create a producer process until that capacity
+    /// is owned. Cancelling the queued serve releases the reservation without
+    /// leaving a process or supervisor entry behind.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn saturated_serve_pool_queues_before_process_start_and_cancels_cleanly() {
+        let pools = Arc::new(BaoWorkerPools::new(1, 1));
+        let _occupied_serve_permit = Arc::clone(&pools.serve).acquire_owned().await.unwrap();
+        let body_path = unique_temp("nar4-permit-before-process-body");
+        let started_path = unique_temp("nar4-permit-before-process-started");
+        let _files = RemoveTestFiles(vec![body_path.clone(), started_path.clone()]);
+        let body = vec![0x54; 4096];
+        std::fs::write(&body_path, &body).unwrap();
+        let content = Blake3Digest::from_raw_nar(&body);
+        let marker_arg = started_path.clone();
+        let body_arg = body_path.clone();
+        let probe = OneProbe {
+            content,
+            declared_size: body.len() as u64,
+            make: Box::new(move || ProbedSource::Process {
+                program: PathBuf::from("sh"),
+                args: vec![
+                    OsString::from("-c"),
+                    OsString::from("printf started > \"$1\"; cat \"$2\""),
+                    OsString::from("nar4-permit-before-process"),
+                    marker_arg.clone().into_os_string(),
+                    body_arg.clone().into_os_string(),
+                ],
+            }),
+        };
+        let supervisor = TaskSupervisor::new();
+        let gate = Arc::new(ServeGate::new(
+            ServeBudget {
+                max_nar_bytes_uncompressed_nar: 1 << 20,
+                max_inflight_bytes_uncompressed_nar: 1 << 20,
+                max_serve_duration: Duration::from_secs(5),
+            },
+            Arc::new(CatalogNarSupplier::new(probe, "unused-helper")),
+            supervisor.handle(),
+        ));
+        let mock = RequestThenCapture::new(&content, peer_fabric::ACCEPT_RAW);
+        let task_gate = Arc::clone(&gate);
+        let task_pools = Arc::clone(&pools);
+        let serve = tokio::spawn(async move {
+            serve_stream_with_process_pools(mock, Some(task_gate), task_pools.as_ref()).await;
+        });
+
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while gate.inflight_bytes.load(Ordering::Acquire) != body.len() as u64 {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .expect("process serve reaches admission while Bao capacity is occupied");
+        tokio::time::sleep(Duration::from_millis(25)).await;
+        assert!(
+            !serve.is_finished(),
+            "serve remains queued for Bao capacity"
+        );
+        assert_eq!(
+            supervisor.process_jobs().active_len(),
+            0,
+            "queued Bao work must not create a supervised producer"
+        );
+        assert!(
+            !started_path.exists(),
+            "producer command must not execute before a serve permit is owned"
+        );
+
+        serve.abort();
+        let _ = serve.await;
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while gate.inflight_bytes.load(Ordering::Acquire) != 0
+                || supervisor.process_jobs().active_len() != 0
+            {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .expect("cancelling queued serve releases reservation and process state");
+    }
+
+    #[tokio::test]
+    async fn prematurely_finished_verified_stream_cancels_without_deadlock() {
+        let content = Blake3Digest::from_bytes([0x5a; 32]);
+        let (_sink, verified) = verified_nar_stream(content, 1, WireCodec::Raw).await;
+        let error = tokio::time::timeout(IDLE, verified.finish())
+            .await
+            .expect("premature finish must cancel and reap the verifier")
+            .expect_err("premature finish must not claim success");
+        assert!(
+            matches!(error, TransferError::Unavailable(ref why) if why.contains("before all authenticated leaves")),
+            "unexpected premature-finish error: {error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn authenticated_first_leaf_timing_uses_request_origin() {
+        let raw = vec![0x42; (64 * 1024) + 1];
+        let content = Blake3Digest::from_raw_nar(&raw);
+        let mut reader = futures::io::Cursor::new(wire_nar(&raw));
+        let request_started = std::time::Instant::now()
+            .checked_sub(Duration::from_millis(20))
+            .unwrap();
+        let response = read_response_streamed_since(
+            &mut reader,
+            Some(raw.len() as u64),
+            IDLE,
+            &content,
+            request_started,
+            peer_fabric::ACCEPT_RAW_AND_ZSTD,
+        )
+        .await
+        .unwrap();
+        assert_eq!(response.bytes, raw);
+        assert!(
+            response.authenticated_first_leaf_ns >= 20_000_000,
+            "timing must include request/header time, not restart at verifier creation"
+        );
     }
 
     /// A reader that yields the status byte, the RAW codec byte, THEN one real body chunk,
@@ -2238,7 +2807,8 @@ mod tests {
     /// happens AFTER a chunk was already delivered), not merely on the first body read.
     /// Phases: 0=status, 1=codec byte, 2=one body chunk, 3=stall.
     struct StatusChunkThenStall {
-        phase: u8,
+        prefix: io::Cursor<Vec<u8>>,
+        sent_partial_proof: bool,
     }
 
     impl AsyncRead for StatusChunkThenStall {
@@ -2247,40 +2817,26 @@ mod tests {
             _cx: &mut Context<'_>,
             buf: &mut [u8],
         ) -> Poll<io::Result<usize>> {
-            match self.phase {
-                0 if !buf.is_empty() => {
-                    self.phase = 1;
-                    buf[0] = STATUS_NAR;
-                    Poll::Ready(Ok(1))
-                }
-                1 if !buf.is_empty() => {
-                    self.phase = 2;
-                    buf[0] = WireCodec::Raw.wire();
-                    Poll::Ready(Ok(1))
-                }
-                2 if !buf.is_empty() => {
-                    self.phase = 3;
-                    // One modest body chunk, well under any cap so ONLY the idle guard can fire
-                    // on the following stall (not the size abort).
-                    let n = buf.len().min(1024);
-                    for byte in &mut buf[..n] {
-                        *byte = 0x5a;
-                    }
-                    Poll::Ready(Ok(n))
-                }
-                // Stall AFTER a chunk was delivered: the re-armed body-idle guard must abort.
-                _ => Poll::Pending,
+            if self.prefix.position() as usize != self.prefix.get_ref().len() {
+                return Poll::Ready(std::io::Read::read(&mut self.prefix, buf));
+            }
+            if !self.sent_partial_proof {
+                self.sent_partial_proof = true;
+                let n = buf.len().min(32);
+                buf[..n].fill(0x5a);
+                Poll::Ready(Ok(n))
+            } else {
+                Poll::Pending
             }
         }
     }
 
-    /// AC#1 the DECISIVE mid-stream bite: a provider streams a body far LARGER than the
-    /// signed `expected_size`. The read must abort the INSTANT the running total crosses the
-    /// cap - after ONE chunk - not after buffering the whole (here 512 KiB) blob, and not at
-    /// the 256 MiB floor. BITE: move the size check to AFTER the read loop (a post-receive
-    /// buffer check, the pre-157 behaviour) and `streamed` becomes the full 512 KiB.
+    /// AC#1 declared-size bite: v4 carries exact raw geometry in its fixed header. A value above
+    /// signed `expected_size` is rejected before reading or allocating the Bao body, rather than
+    /// after buffering the whole (here 512 KiB) NAR. `TooLarge::streamed` retains its historical
+    /// field name but reports the rejected declared raw size on v4.
     #[tokio::test]
-    async fn read_aborts_mid_stream_when_body_exceeds_expected_size() {
+    async fn read_rejects_declared_raw_size_above_signed_limit_before_body() {
         let big = vec![0x5au8; 512 * 1024];
         let content = Blake3Digest::from_raw_nar(&big); // honest hash; only SIZE is over
         let cap: u64 = 4 * 1024; // the consumer signed 4 KiB
@@ -2295,19 +2851,12 @@ mod tests {
                 assert_eq!(limit, cap, "the abort limit is the signed expected_size");
                 assert!(
                     streamed > cap,
-                    "streamed ({streamed}) must have crossed the cap ({cap})"
+                    "declared raw size ({streamed}) must exceed the signed cap ({cap})"
                 );
-                // The decisive mid-stream property: aborted after ONE chunk, NOT after the
-                // whole 512 KiB, and bounded by cap + one chunk.
-                assert!(
-                    streamed <= cap + NAR_STREAM_CHUNK as u64,
-                    "streamed ({streamed}) must be bounded by cap + one chunk, not the whole body"
-                );
-                assert!(
-                    (streamed as usize) < big.len(),
-                    "streamed ({streamed}) must be far less than the full body ({}) - proof the \
-                     read did NOT buffer the whole thing",
-                    big.len()
+                assert_eq!(
+                    streamed,
+                    big.len() as u64,
+                    "v4 rejects the exact raw_size header before reading its body"
                 );
             }
             other => panic!("expected TooLarge, got {other}"),
@@ -2336,7 +2885,13 @@ mod tests {
     #[tokio::test]
     async fn read_aborts_on_inter_chunk_stall_within_the_idle_bound() {
         let content = Blake3Digest::from_bytes([0x11; 32]);
-        let mut reader = StatusChunkThenStall { phase: 0 };
+        let raw_size = 1u64 << 20;
+        let mut prefix = vec![STATUS_NAR, WireCodec::Raw.wire()];
+        prefix.extend_from_slice(&raw_size.to_le_bytes());
+        let mut reader = StatusChunkThenStall {
+            prefix: io::Cursor::new(prefix),
+            sent_partial_proof: false,
+        };
         let started = std::time::Instant::now();
         // A cap far above the 1 KiB chunk, so ONLY the post-chunk idle stall can abort here.
         let err = read_response_streamed(&mut reader, Some(1 << 20), IDLE, &content)
@@ -2357,10 +2912,8 @@ mod tests {
         );
     }
 
-    /// GATE-1 preserved: a provider whose streamed bytes do NOT hash to the requested
-    /// identity (same length, different bytes) fails the BLAKE3 verify at completion -
-    /// `IntegrityMismatch`, never trusted bytes. BITE: drop the final `from_raw_nar` check
-    /// and corrupt bytes are returned as if valid.
+    /// A provider whose bytes do NOT match the requested root (same length, different bytes)
+    /// fails at the first inconsistent Bao leaf and never exposes untrusted bytes.
     #[tokio::test]
     async fn read_rejects_bytes_that_do_not_hash_to_the_requested_identity() {
         let wanted = b"the honest bytes the consumer asked for".to_vec();
@@ -2370,13 +2923,16 @@ mod tests {
         let mut reader = futures::io::Cursor::new(wire_nar(&corrupt));
         let err = read_response_streamed(&mut reader, Some(wanted.len() as u64), IDLE, &requested)
             .await
-            .expect_err("corrupt bytes must fail gate-1");
+            .expect_err("corrupt bytes must fail Bao authentication");
         match err {
-            TransferError::IntegrityMismatch { expected, actual } => {
+            TransferError::AuthenticationFailed { expected, reason } => {
                 assert_eq!(expected, requested);
-                assert_ne!(actual, requested);
+                assert!(
+                    reason.to_ascii_lowercase().contains("leaf hash mismatch"),
+                    "{reason}"
+                );
             }
-            other => panic!("expected IntegrityMismatch, got {other}"),
+            other => panic!("expected AuthenticationFailed, got {other}"),
         }
     }
 
@@ -2399,9 +2955,10 @@ mod tests {
         let mut wire = futures::io::Cursor::new(Vec::new());
         write_response(
             &mut wire,
-            NarResponse::Nar(raw.clone()),
+            NarResponse::Nar(Arc::new(raw.clone())),
             WireCodec::Zstd,
             DEFAULT_ZSTD_LEVEL,
+            &content,
         )
         .await
         .expect("serve writes the compressed response");
@@ -2440,9 +2997,10 @@ mod tests {
             let mut wire = futures::io::Cursor::new(Vec::new());
             write_response(
                 &mut wire,
-                NarResponse::Nar(raw.clone()),
+                NarResponse::Nar(Arc::new(raw.clone())),
                 WireCodec::Zstd,
                 level,
+                &content,
             )
             .await
             .unwrap();
@@ -2463,10 +3021,10 @@ mod tests {
         assert_eq!(got[0], got[1], "but the same decoded nar");
     }
 
-    /// AC#6 the DECISIVE bomb bite ON THE WIRE: a zstd body that decompresses to FAR more than
-    /// the signed size aborts with `TooLarge`, bounded, never materialising the expansion.
+    /// AC#6 size-bound bite: even a highly compressible response whose v4 header declares FAR
+    /// more raw data than the signed size is rejected before decoding any leaf.
     #[tokio::test]
-    async fn zstd_decompression_bomb_aborts_on_the_wire() {
+    async fn zstd_response_above_signed_raw_size_rejects_before_decode() {
         let bomb = vec![0u8; 8 * 1024 * 1024]; // 8 MiB of zeros -> tiny zstd frame
         let content = Blake3Digest::from_raw_nar(&bomb);
         let wire = wire_nar_zstd(&bomb, DEFAULT_ZSTD_LEVEL);
@@ -2479,21 +3037,18 @@ mod tests {
         match err {
             TransferError::TooLarge { limit, streamed } => {
                 assert_eq!(limit, cap);
-                assert!(
-                    streamed > cap,
-                    "decoded ({streamed}) crossed the cap ({cap})"
-                );
-                assert!(
-                    streamed <= cap + 256 * 1024,
-                    "decoded ({streamed}) must be bounded by cap + one decode block, not the 8 MiB expansion"
+                assert_eq!(
+                    streamed,
+                    bomb.len() as u64,
+                    "v4 rejects the declared raw_size before decoding any leaf"
                 );
             }
             other => panic!("expected TooLarge, got {other}"),
         }
     }
 
-    /// AC#3 corruption ON THE WIRE: a flipped byte inside the zstd frame fails the fetch
-    /// (either a frame error or a BLAKE3 mismatch), never a silent short/wrong nar.
+    /// AC#3 corruption ON THE WIRE: a flipped byte inside a leaf's zstd frame fails the fetch
+    /// (either a frame error or a Bao mismatch), never a silent short/wrong nar.
     #[tokio::test]
     async fn corrupt_zstd_frame_fails_the_fetch() {
         let raw = b"honest compressed nar bytes to be corrupted mid-frame".repeat(100);
@@ -2511,12 +3066,8 @@ mod tests {
         );
     }
 
-    /// AC#3 truncation ON THE WIRE: a zstd frame cut short is rejected AT THE CODEC - `finish`
-    /// sees the frame never reached a clean boundary (`DecodeError::Truncated`), surfacing as
-    /// `Unavailable("zstd decode did not complete")` BEFORE gate-1. This DISTINGUISHES the new
-    /// codec from the old short-decode decoder: the OLD path returned correct-but-short bytes
-    /// that gate-1 caught as `IntegrityMismatch`, so requiring the codec-completion failure here
-    /// is what bites a regression to the short-decode behaviour.
+    /// AC#3 truncation ON THE WIRE: cutting the v4 response before its final leaf/COMPLETE is
+    /// rejected by leaf framing or Bao authentication; a correct-but-short NAR is never released.
     #[tokio::test]
     async fn truncated_zstd_frame_fails_at_the_codec() {
         let raw = b"a nar whose compressed frame is cut short before EOF".repeat(120);
@@ -2528,16 +3079,14 @@ mod tests {
             .await
             .expect_err("a truncated frame must fail rather than yield a short nar");
         match err {
-            TransferError::Unavailable(why) => assert!(
-                why.contains("did not complete") || why.contains("truncated"),
-                "a truncated frame must be rejected at the codec (DecodeError::Truncated), got \
-                 Unavailable({why})"
+            TransferError::AuthenticationFailed { reason, .. } => assert!(
+                reason.contains("failed to fill")
+                    || reason.contains("truncated")
+                    || reason.contains("early eof")
+                    || reason.contains("LeafNotFound"),
+                "a truncated v4 body must fail authentication/framing, got {reason}"
             ),
-            other => panic!(
-                "expected a codec-completion failure (Unavailable/did-not-complete); an \
-                 IntegrityMismatch would mean the codec accepted a short nar and leaned on \
-                 gate-1 (the OLD behaviour) - got {other}"
-            ),
+            other => panic!("expected v4 authentication/framing failure, got {other}"),
         }
     }
 
@@ -2546,7 +3095,8 @@ mod tests {
     #[tokio::test]
     async fn unknown_codec_byte_fails_the_fetch() {
         let content = Blake3Digest::from_bytes([0x33; 32]);
-        let wire = vec![STATUS_NAR, 0x7f]; // 0x7f is not a known codec
+        let mut wire = vec![STATUS_NAR, 0x7f]; // 0x7f is not a known codec
+        wire.extend_from_slice(&1024u64.to_le_bytes());
         let mut reader = futures::io::Cursor::new(wire);
         let err = read_response_streamed(&mut reader, Some(1024), IDLE, &content)
             .await
@@ -2567,6 +3117,9 @@ mod tests {
         request: [u8; 33],
         read_pos: usize,
         written: Arc<std::sync::Mutex<Vec<u8>>>,
+        close_pending_once: bool,
+        close_started: bool,
+        fail_after_response_bytes: Option<usize>,
     }
 
     impl RequestThenCapture {
@@ -2578,7 +3131,29 @@ mod tests {
                 request,
                 read_pos: 0,
                 written: Arc::new(std::sync::Mutex::new(Vec::new())),
+                close_pending_once: false,
+                close_started: false,
+                fail_after_response_bytes: None,
             }
+        }
+
+        /// Model a requester that closes its request half as soon as response
+        /// FIN is observable. The provider's first `poll_close` deliberately
+        /// returns Pending so, on the next poll, both exchange completion and
+        /// `consumer_hung_up` are ready and select ordering is exercised.
+        fn with_close_completion_race(mut self) -> Self {
+            self.close_pending_once = true;
+            self
+        }
+
+        fn with_write_failure(mut self) -> Self {
+            self.fail_after_response_bytes = Some(0);
+            self
+        }
+
+        fn with_write_failure_after(mut self, response_bytes: usize) -> Self {
+            self.fail_after_response_bytes = Some(response_bytes);
+            self
         }
     }
 
@@ -2594,6 +3169,8 @@ mod tests {
                 buf[..n].copy_from_slice(&self.request[start..start + n]);
                 self.read_pos += n;
                 Poll::Ready(Ok(n))
+            } else if self.close_pending_once && self.close_started {
+                Poll::Ready(Ok(0))
             } else {
                 Poll::Pending // connected but idle (a Memory serve does not read again)
             }
@@ -2606,14 +3183,815 @@ mod tests {
             _cx: &mut Context<'_>,
             buf: &[u8],
         ) -> Poll<io::Result<usize>> {
+            if let Some(limit) = self.fail_after_response_bytes {
+                let already_written = self.written.lock().unwrap().len();
+                if already_written >= limit {
+                    return Poll::Ready(Err(io::Error::new(
+                        io::ErrorKind::BrokenPipe,
+                        "synthetic response write failure",
+                    )));
+                }
+                let accepted = (limit - already_written).min(buf.len());
+                self.written
+                    .lock()
+                    .unwrap()
+                    .extend_from_slice(&buf[..accepted]);
+                return Poll::Ready(Ok(accepted));
+            }
             self.written.lock().unwrap().extend_from_slice(buf);
             Poll::Ready(Ok(buf.len()))
         }
         fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
             Poll::Ready(Ok(()))
         }
+        fn poll_close(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            if self.close_pending_once && !self.close_started {
+                self.close_started = true;
+                cx.waker().wake_by_ref();
+                Poll::Pending
+            } else {
+                Poll::Ready(Ok(()))
+            }
+        }
+    }
+
+    /// A process-backed request with an empty accept mask is declined before either regeneration
+    /// pass. A completed decline and a socket failure are distinct outcomes, but neither is a
+    /// completed NAR serve or a supplier failure, so both release the reservation without changing
+    /// the existing admission counters.
+    #[tokio::test]
+    async fn process_no_common_codec_classifies_completed_and_failed_decline_writes() {
+        let body = b"process source that codec negotiation must reject before start";
+        let (supervisor, gate, content) = no_codec_process_gate(body, Duration::from_secs(1));
+
+        let success = RequestThenCapture::new(&content, 0);
+        let success_wire = Arc::clone(&success.written);
+        serve_stream(success, Some(Arc::clone(&gate))).await;
+        assert_eq!(
+            success_wire.lock().unwrap().as_slice(),
+            [STATUS_DECLINED, DeclineReason::NoCommonCodec.wire()],
+            "successful branch writes the exact no-common-codec decline"
+        );
+        assert_eq!(gate.counters(), ServeCounters::default());
+        assert_eq!(gate.inflight_bytes.load(Ordering::Acquire), 0);
+        assert_eq!(supervisor.process_jobs().active_len(), 0);
+
+        let failed = RequestThenCapture::new(&content, 0).with_write_failure();
+        serve_stream(failed, Some(Arc::clone(&gate))).await;
+        assert_eq!(
+            gate.counters(),
+            ServeCounters::default(),
+            "transport failure is neither a completed serve nor a supply failure"
+        );
+        assert_eq!(gate.inflight_bytes.load(Ordering::Acquire), 0);
+        assert_eq!(supervisor.process_jobs().active_len(), 0);
+    }
+
+    /// Accept exactly `write_budget` response bytes, then model a live consumer whose socket
+    /// window never advances. The shared flag makes the test observe real pass-2 socket
+    /// backpressure rather than merely assuming a Pending write was reached.
+    struct RequestThenBudgetedWrite {
+        request: [u8; 33],
+        read_pos: usize,
+        write_budget: usize,
+        written: Arc<std::sync::Mutex<Vec<u8>>>,
+        write_blocked: Arc<AtomicBool>,
+    }
+
+    impl RequestThenBudgetedWrite {
+        fn new(content: &Blake3Digest, write_budget: usize) -> Self {
+            let mut request = [0u8; 33];
+            request[..32].copy_from_slice(content.as_bytes());
+            request[32] = peer_fabric::ACCEPT_RAW;
+            Self {
+                request,
+                read_pos: 0,
+                write_budget,
+                written: Arc::new(std::sync::Mutex::new(Vec::new())),
+                write_blocked: Arc::new(AtomicBool::new(false)),
+            }
+        }
+    }
+
+    impl AsyncRead for RequestThenBudgetedWrite {
+        fn poll_read(
+            mut self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            buf: &mut [u8],
+        ) -> Poll<io::Result<usize>> {
+            if self.read_pos < self.request.len() && !buf.is_empty() {
+                let start = self.read_pos;
+                let count = (self.request.len() - start).min(buf.len());
+                buf[..count].copy_from_slice(&self.request[start..start + count]);
+                self.read_pos += count;
+                Poll::Ready(Ok(count))
+            } else {
+                Poll::Pending
+            }
+        }
+    }
+
+    impl AsyncWrite for RequestThenBudgetedWrite {
+        fn poll_write(
+            mut self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            buf: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            if self.write_budget == 0 {
+                self.write_blocked.store(true, Ordering::Release);
+                return Poll::Pending;
+            }
+            let count = self.write_budget.min(buf.len());
+            self.written
+                .lock()
+                .unwrap()
+                .extend_from_slice(&buf[..count]);
+            self.write_budget -= count;
+            Poll::Ready(Ok(count))
+        }
+
+        fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            if self.write_budget == 0 {
+                self.write_blocked.store(true, Ordering::Release);
+                Poll::Pending
+            } else {
+                Poll::Ready(Ok(()))
+            }
+        }
+
         fn poll_close(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-            Poll::Ready(Ok(()))
+            if self.write_budget == 0 {
+                self.write_blocked.store(true, Ordering::Release);
+                Poll::Pending
+            } else {
+                Poll::Ready(Ok(()))
+            }
+        }
+    }
+
+    struct ProcessServeProbe {
+        wire: Vec<u8>,
+        invocations: u64,
+        inflight_after: u64,
+        active_jobs_after: usize,
+        observations: Vec<ServeObservation>,
+        counters: ServeCounters,
+        serve_elapsed: Duration,
+    }
+
+    async fn run_two_pass_process_serve(
+        announced: &[u8],
+        pass1: &[u8],
+        pass2: &[u8],
+        nonzero_pass: Option<u64>,
+    ) -> ProcessServeProbe {
+        run_two_pass_process_serve_with_close_race(
+            announced,
+            pass1,
+            pass2,
+            nonzero_pass,
+            false,
+            None,
+        )
+        .await
+    }
+
+    async fn run_two_pass_process_serve_with_close_race(
+        announced: &[u8],
+        pass1: &[u8],
+        pass2: &[u8],
+        nonzero_pass: Option<u64>,
+        close_completion_race: bool,
+        fail_after_response_bytes: Option<usize>,
+    ) -> ProcessServeProbe {
+        let counter = unique_temp("nar4-pass-counter");
+        let pass1_path = unique_temp("nar4-pass1");
+        let pass2_path = unique_temp("nar4-pass2");
+        let _ = std::fs::remove_file(&counter);
+        std::fs::write(&pass1_path, pass1).unwrap();
+        std::fs::write(&pass2_path, pass2).unwrap();
+        let content = Blake3Digest::from_raw_nar(announced);
+        let fail_pass = nonzero_pass.unwrap_or(0);
+        let script = format!(
+            "n=$(cat \"$1\" 2>/dev/null || printf 0); n=$((n + 1)); \
+             printf %s \"$n\" > \"$1\"; \
+             if [ \"$n\" -eq 1 ]; then cat \"$2\"; else cat \"$3\"; fi; \
+             if [ \"$n\" -eq {fail_pass} ]; then exit 7; fi"
+        );
+        let counter_arg = counter.clone();
+        let pass1_arg = pass1_path.clone();
+        let pass2_arg = pass2_path.clone();
+        let probe = OneProbe {
+            content,
+            declared_size: announced.len() as u64,
+            make: Box::new(move || ProbedSource::Process {
+                program: PathBuf::from("sh"),
+                args: vec![
+                    OsString::from("-c"),
+                    OsString::from(script.clone()),
+                    OsString::from("nar4-two-pass-test"),
+                    counter_arg.clone().into_os_string(),
+                    pass1_arg.clone().into_os_string(),
+                    pass2_arg.clone().into_os_string(),
+                ],
+            }),
+        };
+        let supervisor = TaskSupervisor::new();
+        let (observation_tx, mut observation_rx) = tokio::sync::mpsc::channel(2);
+        let gate = Arc::new(
+            ServeGate::new(
+                ServeBudget {
+                    max_nar_bytes_uncompressed_nar: 1 << 20,
+                    max_inflight_bytes_uncompressed_nar: 1 << 30,
+                    max_serve_duration: Duration::from_secs(2),
+                },
+                Arc::new(CatalogNarSupplier::new(probe, "unused-helper")),
+                supervisor.handle(),
+            )
+            .with_observations(observation_tx),
+        );
+        let mut mock = RequestThenCapture::new(&content, peer_fabric::ACCEPT_RAW);
+        if close_completion_race {
+            mock = mock.with_close_completion_race();
+        }
+        if let Some(limit) = fail_after_response_bytes {
+            mock = mock.with_write_failure_after(limit);
+        }
+        let captured = Arc::clone(&mock.written);
+        let serve_started = std::time::Instant::now();
+        tokio::time::timeout(
+            Duration::from_secs(3),
+            serve_stream(mock, Some(Arc::clone(&gate))),
+        )
+        .await
+        .expect("two-pass serve stays within its absolute deadline");
+        let serve_elapsed = serve_started.elapsed();
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while supervisor.process_jobs().active_len() != 0 {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .expect("every started pass is child-free after serve completion");
+        let invocations = std::fs::read_to_string(&counter)
+            .ok()
+            .and_then(|raw| raw.parse().ok())
+            .unwrap_or(0);
+        let mut observations = Vec::new();
+        while let Ok(observation) = observation_rx.try_recv() {
+            observations.push(observation);
+        }
+        let result = ProcessServeProbe {
+            wire: captured.lock().unwrap().clone(),
+            invocations,
+            inflight_after: gate.inflight_bytes.load(Ordering::Acquire),
+            active_jobs_after: supervisor.process_jobs().active_len(),
+            observations,
+            counters: gate.counters(),
+            serve_elapsed,
+        };
+        let _ = std::fs::remove_file(counter);
+        let _ = std::fs::remove_file(pass1_path);
+        let _ = std::fs::remove_file(pass2_path);
+        result
+    }
+
+    fn assert_process_serve_cleaned(result: &ProcessServeProbe) {
+        assert_eq!(result.inflight_after, 0, "reservation released");
+        assert_eq!(result.active_jobs_after, 0, "all process groups reaped");
+    }
+
+    struct RemoveTestFiles(Vec<PathBuf>);
+
+    impl Drop for RemoveTestFiles {
+        fn drop(&mut self) {
+            for path in &self.0 {
+                let _ = std::fs::remove_file(path);
+            }
+        }
+    }
+
+    fn process_exists(pid: u32) -> bool {
+        PathBuf::from(format!("/proc/{pid}")).exists()
+    }
+
+    async fn wait_for_process_cleanup(supervisor: &TaskSupervisor, gate: &ServeGate, pids: &[u32]) {
+        tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                if supervisor.process_jobs().active_len() == 0
+                    && gate.inflight_bytes.load(Ordering::Acquire) == 0
+                    && pids.iter().all(|pid| !process_exists(*pid))
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("process groups, registry entry, and reservation clean up");
+    }
+
+    struct BackpressuredProcessFixture {
+        _files: RemoveTestFiles,
+        content: Blake3Digest,
+        raw_size: usize,
+        counter: PathBuf,
+        pass2_pid: PathBuf,
+        pass2_grandchild: PathBuf,
+        gate: Arc<ServeGate>,
+        supervisor: TaskSupervisor,
+    }
+
+    fn backpressured_process_fixture(
+        max_serve_duration: Duration,
+        pass_delay: &str,
+    ) -> BackpressuredProcessFixture {
+        let body_path = unique_temp("nar4-backpressure-body");
+        let counter = unique_temp("nar4-backpressure-counter");
+        let pass2_pid = unique_temp("nar4-backpressure-pass2-pid");
+        let pass2_grandchild = unique_temp("nar4-backpressure-pass2-grandchild");
+        let body = (0..(4 * 1024 * 1024))
+            .map(|index| (index as u8).wrapping_mul(17))
+            .collect::<Vec<_>>();
+        std::fs::write(&body_path, &body).unwrap();
+        let content = Blake3Digest::from_raw_nar(&body);
+        let script = format!(
+            "n=$(cat \"$1\" 2>/dev/null || printf 0); n=$((n + 1)); printf %s \"$n\" > \"$1\"; \
+             sleep {pass_delay}; \
+             if [ \"$n\" -eq 1 ]; then cat \"$2\"; exit $?; fi; \
+             printf %s $$ > \"$3\"; sleep 1000 & child=$!; printf %s \"$child\" > \"$4\"; \
+             cat \"$2\"; wait"
+        );
+        let counter_arg = counter.clone();
+        let body_arg = body_path.clone();
+        let pid_arg = pass2_pid.clone();
+        let grandchild_arg = pass2_grandchild.clone();
+        let probe = OneProbe {
+            content,
+            declared_size: body.len() as u64,
+            make: Box::new(move || ProbedSource::Process {
+                program: PathBuf::from("sh"),
+                args: vec![
+                    OsString::from("-c"),
+                    OsString::from(script.clone()),
+                    OsString::from("nar4-backpressure"),
+                    counter_arg.clone().into_os_string(),
+                    body_arg.clone().into_os_string(),
+                    pid_arg.clone().into_os_string(),
+                    grandchild_arg.clone().into_os_string(),
+                ],
+            }),
+        };
+        let supervisor = TaskSupervisor::new();
+        let gate = Arc::new(ServeGate::new(
+            ServeBudget {
+                max_nar_bytes_uncompressed_nar: 8 * 1024 * 1024,
+                max_inflight_bytes_uncompressed_nar: 8 * 1024 * 1024,
+                max_serve_duration,
+            },
+            Arc::new(CatalogNarSupplier::new(probe, "unused-helper")),
+            supervisor.handle(),
+        ));
+        BackpressuredProcessFixture {
+            _files: RemoveTestFiles(vec![
+                body_path,
+                counter.clone(),
+                pass2_pid.clone(),
+                pass2_grandchild.clone(),
+            ]),
+            content,
+            raw_size: body.len(),
+            counter,
+            pass2_pid,
+            pass2_grandchild,
+            gate,
+            supervisor,
+        }
+    }
+
+    async fn observe_backpressured_pass2(
+        fixture: &BackpressuredProcessFixture,
+        blocked: &AtomicBool,
+    ) -> (u32, u32) {
+        tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                let pid = std::fs::read_to_string(&fixture.pass2_pid)
+                    .ok()
+                    .and_then(|value| value.trim().parse::<u32>().ok());
+                let grandchild = std::fs::read_to_string(&fixture.pass2_grandchild)
+                    .ok()
+                    .and_then(|value| value.trim().parse::<u32>().ok());
+                if let (Some(pid), Some(grandchild)) = (pid, grandchild)
+                    && blocked.load(Ordering::Acquire)
+                    && fixture.supervisor.process_jobs().active_len() != 0
+                {
+                    break (pid, grandchild);
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("pass 2 reaches measured socket backpressure with live descendants")
+    }
+
+    #[tokio::test]
+    async fn process_v4_success_invokes_exactly_two_equal_replays() {
+        let body = vec![0x31; (64 * 1024) + 17];
+        let result = run_two_pass_process_serve(&body, &body, &body, None).await;
+        assert_eq!(result.invocations, 2);
+        let content = Blake3Digest::from_raw_nar(&body);
+        let mut wire = futures::io::Cursor::new(result.wire.clone());
+        assert_eq!(
+            read_response_streamed(&mut wire, Some(body.len() as u64), IDLE, &content)
+                .await
+                .unwrap(),
+            body
+        );
+        assert_process_serve_cleaned(&result);
+    }
+
+    #[tokio::test]
+    async fn process_observation_emits_once_after_success_and_never_on_failure() {
+        let body = vec![0x29; (64 * 1024) + 9];
+        let success = run_two_pass_process_serve(&body, &body, &body, None).await;
+        let [observation] = success.observations.as_slice() else {
+            panic!(
+                "one successful COMPLETE+FIN must emit exactly one observation, got {}",
+                success.observations.len()
+            );
+        };
+        assert_eq!(observation.content, Blake3Digest::from_raw_nar(&body));
+        assert_eq!(observation.pass1_bytes, body.len() as u64);
+        assert_eq!(observation.pass2_bytes, body.len() as u64);
+        assert!(observation.proof_preparation_ns > 0);
+        assert!(observation.total_serve_ns >= observation.proof_preparation_ns);
+        observation.wire.validate().unwrap();
+
+        let failed = run_two_pass_process_serve(&body, &body[..body.len() - 1], &body, None).await;
+        assert!(
+            failed.observations.is_empty(),
+            "pass-1 failure before STATUS_NAR must not emit a successful observation"
+        );
+    }
+
+    #[tokio::test]
+    async fn clean_fin_wins_simultaneous_request_half_close_and_records_success() {
+        let body = vec![0x2a; (64 * 1024) + 11];
+        let result =
+            run_two_pass_process_serve_with_close_race(&body, &body, &body, None, true, None).await;
+        assert_eq!(result.invocations, 2);
+        assert!(
+            result.wire.ends_with(nar_v4::COMPLETE_MARKER),
+            "the response completed before the requester closed its request half"
+        );
+        assert_eq!(
+            result.observations.len(),
+            1,
+            "a clean response FIN must not be reclassified as consumer hangup"
+        );
+        assert_process_serve_cleaned(&result);
+    }
+
+    #[tokio::test]
+    async fn process_transport_failure_is_not_counted_as_served_or_supply_failed() {
+        let body = vec![0x2b; 4096];
+        let result =
+            run_two_pass_process_serve_with_close_race(&body, &body, &body, None, false, Some(0))
+                .await;
+        assert_eq!(
+            result.invocations, 1,
+            "header write fails before pass 2 starts"
+        );
+        assert_eq!(result.counters.admitted, 0);
+        assert_eq!(
+            result.counters.declined_supply_failed, 0,
+            "a peer/socket failure is not a supplier failure"
+        );
+        assert!(result.observations.is_empty());
+        assert_process_serve_cleaned(&result);
+    }
+
+    #[tokio::test]
+    async fn process_mid_body_transport_failure_unwinds_before_the_serve_deadline() {
+        let body = vec![0x2c; (3 * 64 * 1024) + 17];
+        let failure_after = nar_v4::NarV4WireAccounting::RESPONSE_HEADER_BYTES as usize + 1024;
+        let result = run_two_pass_process_serve_with_close_race(
+            &body,
+            &body,
+            &body,
+            None,
+            false,
+            Some(failure_after),
+        )
+        .await;
+
+        assert_eq!(result.invocations, 2, "the socket fails during pass 2");
+        assert_eq!(result.wire.len(), failure_after);
+        assert!(
+            !result.wire.ends_with(nar_v4::COMPLETE_MARKER),
+            "a failed socket must never receive COMPLETE"
+        );
+        assert!(
+            result.serve_elapsed < Duration::from_secs(1),
+            "socket failure took {:?}, suggesting the encoder channel stayed open until the 2 s serve deadline",
+            result.serve_elapsed
+        );
+        assert_eq!(result.counters.admitted, 0);
+        assert_eq!(result.counters.declined_supply_failed, 0);
+        assert!(result.observations.is_empty());
+        assert_process_serve_cleaned(&result);
+    }
+
+    #[tokio::test]
+    async fn process_v4_pass1_short_emits_no_status() {
+        let body = vec![0x32; 4096];
+        let result = run_two_pass_process_serve(&body, &body[..body.len() - 1], &body, None).await;
+        assert_eq!(result.invocations, 1);
+        assert!(result.wire.is_empty(), "pass1 failure must precede status");
+        assert_process_serve_cleaned(&result);
+    }
+
+    #[tokio::test]
+    async fn process_v4_pass1_long_emits_no_status() {
+        let body = vec![0x33; 4096];
+        let mut long = body.clone();
+        long.push(1);
+        let result = run_two_pass_process_serve(&body, &long, &body, None).await;
+        assert_eq!(result.invocations, 1);
+        assert!(result.wire.is_empty(), "pass1 overrun must precede status");
+        assert_process_serve_cleaned(&result);
+    }
+
+    #[tokio::test]
+    async fn process_v4_pass1_nonzero_after_exact_emits_no_status() {
+        let body = vec![0x34; 4096];
+        let result = run_two_pass_process_serve(&body, &body, &body, Some(1)).await;
+        assert_eq!(result.invocations, 1);
+        assert!(
+            result.wire.is_empty(),
+            "pass1 exit status is checked before status"
+        );
+        assert_process_serve_cleaned(&result);
+    }
+
+    async fn assert_pass2_terminal_failure(pass2: Vec<u8>, nonzero_pass: Option<u64>) {
+        let body = vec![0x35; (64 * 1024) + 17];
+        let result = run_two_pass_process_serve(&body, &body, &pass2, nonzero_pass).await;
+        assert_eq!(result.invocations, 2);
+        assert_eq!(result.wire.first(), Some(&STATUS_NAR));
+        assert!(
+            !result.wire.ends_with(nar_v4::COMPLETE_MARKER),
+            "a failed pass2 must never emit COMPLETE"
+        );
+        let content = Blake3Digest::from_raw_nar(&body);
+        let mut wire = futures::io::Cursor::new(result.wire.clone());
+        assert!(
+            read_response_streamed(&mut wire, Some(body.len() as u64), IDLE, &content)
+                .await
+                .is_err(),
+            "terminally failed pass2 must not complete the fetch"
+        );
+        assert_process_serve_cleaned(&result);
+    }
+
+    #[tokio::test]
+    async fn process_v4_pass2_short_has_no_complete() {
+        let body = vec![0x35; (64 * 1024) + 17];
+        assert_pass2_terminal_failure(body[..body.len() - 1].to_vec(), None).await;
+    }
+
+    #[tokio::test]
+    async fn process_v4_pass2_long_has_no_complete() {
+        let mut body = vec![0x35; (64 * 1024) + 17];
+        body.push(1);
+        assert_pass2_terminal_failure(body, None).await;
+    }
+
+    #[tokio::test]
+    async fn process_v4_pass2_nonzero_after_exact_has_no_complete() {
+        let body = vec![0x35; (64 * 1024) + 17];
+        assert_pass2_terminal_failure(body, Some(2)).await;
+    }
+
+    #[tokio::test]
+    async fn process_v4_same_size_nondeterminism_fails_pass2_authentication() {
+        let body = vec![0x36; (64 * 1024) + 17];
+        let mut changed = body.clone();
+        changed[64 * 1024] ^= 1;
+        let result = run_two_pass_process_serve(&body, &body, &changed, None).await;
+        assert_eq!(result.invocations, 2);
+        assert_eq!(result.wire.first(), Some(&STATUS_NAR));
+        assert!(!result.wire.ends_with(nar_v4::COMPLETE_MARKER));
+        assert_eq!(
+            result.wire.len(),
+            10 + 64 + (64 * 1024),
+            "socket contains only header + root proof + authenticated leaf1; changed final leaf never crosses"
+        );
+        assert_eq!(
+            &result.wire[10 + 64..],
+            &body[..64 * 1024],
+            "the only raw content on the socket is the authenticated prefix"
+        );
+        assert_process_serve_cleaned(&result);
+    }
+
+    #[tokio::test]
+    async fn absolute_deadline_reaps_a_backpressured_pass2_and_releases_its_reservation() {
+        let serve_limit = Duration::from_millis(500);
+        let fixture = backpressured_process_fixture(serve_limit, "0.05");
+        let proof_bytes = bao_tree::BaoTree::new(fixture.raw_size as u64, nar_v4::BAO_BLOCK_SIZE)
+            .outboard_size() as usize;
+        let accepted_before_block = 10 + proof_bytes + (64 * 1024);
+        let mock = RequestThenBudgetedWrite::new(&fixture.content, accepted_before_block);
+        let blocked = Arc::clone(&mock.write_blocked);
+        let written = Arc::clone(&mock.written);
+        let started = std::time::Instant::now();
+        let serve = tokio::spawn(serve_stream(mock, Some(Arc::clone(&fixture.gate))));
+        let (pass2_pid, pass2_grandchild) = observe_backpressured_pass2(&fixture, &blocked).await;
+        assert_eq!(
+            written.lock().unwrap().len(),
+            accepted_before_block,
+            "header, exact proof, and one authenticated leaf cross before backpressure"
+        );
+        serve.await.expect("deadline-bounded serve task joins");
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed >= Duration::from_millis(400),
+            "serve returned before its configured absolute deadline: {elapsed:?}"
+        );
+        assert!(
+            elapsed < Duration::from_millis(900),
+            "pass delays plus blocked write must share one 500-ms absolute deadline: {elapsed:?}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&fixture.counter).unwrap().trim(),
+            "2",
+            "deadline reaches pass 2 after exact pass 1"
+        );
+        wait_for_process_cleanup(
+            &fixture.supervisor,
+            &fixture.gate,
+            &[pass2_pid, pass2_grandchild],
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn dropping_a_backpressured_pass2_reaps_descendants_and_releases_reservation() {
+        let fixture = backpressured_process_fixture(Duration::from_secs(30), "0");
+        let proof_bytes = bao_tree::BaoTree::new(fixture.raw_size as u64, nar_v4::BAO_BLOCK_SIZE)
+            .outboard_size() as usize;
+        let mock = RequestThenBudgetedWrite::new(&fixture.content, 10 + proof_bytes + (64 * 1024));
+        let blocked = Arc::clone(&mock.write_blocked);
+        let serve = tokio::spawn(serve_stream(mock, Some(Arc::clone(&fixture.gate))));
+        let (pass2_pid, pass2_grandchild) = observe_backpressured_pass2(&fixture, &blocked).await;
+        serve.abort();
+        let _ = serve.await;
+        wait_for_process_cleanup(
+            &fixture.supervisor,
+            &fixture.gate,
+            &[pass2_pid, pass2_grandchild],
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn dropping_pass1_reaps_descendants_and_releases_reservation() {
+        let body = vec![0x71; 4096];
+        let content = Blake3Digest::from_raw_nar(&body);
+        let pass1_pid = unique_temp("nar4-drop-pass1-pid");
+        let pass1_grandchild = unique_temp("nar4-drop-pass1-grandchild");
+        let _files = RemoveTestFiles(vec![pass1_pid.clone(), pass1_grandchild.clone()]);
+        let pid_arg = pass1_pid.clone();
+        let grandchild_arg = pass1_grandchild.clone();
+        let probe = OneProbe {
+            content,
+            declared_size: body.len() as u64,
+            make: Box::new(move || ProbedSource::Process {
+                program: PathBuf::from("sh"),
+                args: vec![
+                    OsString::from("-c"),
+                    OsString::from(
+                        "printf %s $$ > \"$1\"; sleep 1000 & child=$!; \
+                         printf %s \"$child\" > \"$2\"; wait",
+                    ),
+                    OsString::from("nar4-drop-pass1"),
+                    pid_arg.clone().into_os_string(),
+                    grandchild_arg.clone().into_os_string(),
+                ],
+            }),
+        };
+        let supervisor = TaskSupervisor::new();
+        let gate = Arc::new(ServeGate::new(
+            budget(1 << 20, 1 << 20),
+            Arc::new(CatalogNarSupplier::new(probe, "unused-helper")),
+            supervisor.handle(),
+        ));
+        let serve = tokio::spawn(serve_stream(
+            RequestThenCapture::new(&content, peer_fabric::ACCEPT_RAW),
+            Some(Arc::clone(&gate)),
+        ));
+        let (pid, grandchild) = tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                let pid = std::fs::read_to_string(&pass1_pid)
+                    .ok()
+                    .and_then(|value| value.trim().parse::<u32>().ok());
+                let grandchild = std::fs::read_to_string(&pass1_grandchild)
+                    .ok()
+                    .and_then(|value| value.trim().parse::<u32>().ok());
+                if let (Some(pid), Some(grandchild)) = (pid, grandchild)
+                    && supervisor.process_jobs().active_len() != 0
+                    && gate.inflight_bytes.load(Ordering::Acquire) == body.len() as u64
+                {
+                    break (pid, grandchild);
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("pass 1 and its descendant are live under an owned reservation");
+        serve.abort();
+        let _ = serve.await;
+        wait_for_process_cleanup(&supervisor, &gate, &[pid, grandchild]).await;
+    }
+
+    #[tokio::test]
+    async fn memory_serve_counts_only_authenticated_cleanly_closed_delivery() {
+        let announced = vec![0x41; 4096];
+        let wrong = Arc::new(vec![0x42; announced.len()]);
+        let content = Blake3Digest::from_raw_nar(&announced);
+        let wrong_for_probe = Arc::clone(&wrong);
+        let probe = OneProbe {
+            content,
+            declared_size: announced.len() as u64,
+            make: Box::new(move || ProbedSource::Memory(Arc::clone(&wrong_for_probe))),
+        };
+        let wrong_root_gate = Arc::new(ServeGate::new(
+            budget(1 << 20, 1 << 30),
+            Arc::new(CatalogNarSupplier::new(probe, "unused-helper")),
+            TaskSupervisorHandle::disconnected(),
+        ));
+        let mock = RequestThenCapture::new(&content, peer_fabric::ACCEPT_RAW);
+        let wire = Arc::clone(&mock.written);
+        serve_stream(mock, Some(Arc::clone(&wrong_root_gate))).await;
+        assert!(
+            wire.lock().unwrap().is_empty(),
+            "memory root mismatch must fail before STATUS_NAR"
+        );
+        assert_eq!(
+            wrong_root_gate.counters().admitted,
+            0,
+            "root-invalid memory supply was not served"
+        );
+        assert_eq!(
+            wrong_root_gate.counters().declined_supply_failed,
+            1,
+            "root-invalid resident bytes are a supplier failure"
+        );
+
+        let honest = vec![0x43; 4096];
+        let honest_content = Blake3Digest::from_raw_nar(&honest);
+        let write_failure_gate = Arc::new(memory_gate(Arc::new(MemoryNarSupplier::new([honest]))));
+        let mock =
+            RequestThenCapture::new(&honest_content, peer_fabric::ACCEPT_RAW).with_write_failure();
+        serve_stream(mock, Some(Arc::clone(&write_failure_gate))).await;
+        let counters = write_failure_gate.counters();
+        assert_eq!(
+            counters.admitted, 0,
+            "socket failure before clean close was not a completed serve"
+        );
+        assert_eq!(
+            counters.declined_supply_failed, 0,
+            "transport failure must not be mislabeled as supplier failure"
+        );
+    }
+
+    #[tokio::test]
+    async fn memory_supply_must_match_declared_size_before_any_response() {
+        let raw = vec![0x44; 4096];
+        let content = Blake3Digest::from_raw_nar(&raw);
+        for declared_size in [0, (raw.len() as u64) + 1] {
+            let mut supplier = MemoryNarSupplier::new([raw.clone()]);
+            supplier.set_declared_size(content, declared_size);
+            let gate = Arc::new(memory_gate(Arc::new(supplier)));
+            let mock = RequestThenCapture::new(&content, peer_fabric::ACCEPT_RAW);
+            let wire = Arc::clone(&mock.written);
+
+            serve_stream(mock, Some(Arc::clone(&gate))).await;
+
+            assert_eq!(
+                wire.lock().unwrap().as_slice(),
+                [STATUS_DECLINED, DeclineReason::SupplyFailed.wire()],
+                "declared={declared_size}: mismatch may decline but must not emit STATUS_NAR/body"
+            );
+            let counters = gate.counters();
+            assert_eq!(counters.admitted, 0);
+            assert_eq!(counters.declined_supply_failed, 1);
+            assert_eq!(
+                gate.inflight_bytes.load(Ordering::Acquire),
+                0,
+                "declared={declared_size}: reservation releases after fail-closed mismatch"
+            );
         }
     }
 
@@ -2754,6 +4132,7 @@ mod tests {
     /// never reads, so writes never drain). Models the serve-side slowloris.
     struct DigestThenUnreadable {
         digest: [u8; 32],
+        accept: u8,
         read_pos: usize,
     }
 
@@ -2763,10 +4142,10 @@ mod tests {
             _cx: &mut Context<'_>,
             buf: &mut [u8],
         ) -> Poll<io::Result<usize>> {
-            // The request is 33 bytes: 32 digest + 1 accept byte (offering both codecs).
+            // The request is 33 bytes: 32 digest + the configured accept byte.
             let mut request = [0u8; 33];
             request[..32].copy_from_slice(&self.digest);
-            request[32] = ACCEPT_RAW_AND_ZSTD;
+            request[32] = self.accept;
             if self.read_pos < request.len() && !buf.is_empty() {
                 let start = self.read_pos;
                 let n = (request.len() - start).min(buf.len());
@@ -2830,6 +4209,7 @@ mod tests {
 
         let mock = DigestThenUnreadable {
             digest: *content.as_bytes(),
+            accept: ACCEPT_RAW_AND_ZSTD,
             read_pos: 0,
         };
         let serve = tokio::spawn(serve_stream(mock, Some(Arc::clone(&gate))));
@@ -2845,6 +4225,30 @@ mod tests {
             0,
             "the in-flight reservation must be released after the bounded serve write"
         );
+    }
+
+    /// The body-free process/no-codec decline uses the same absolute deadline as every other
+    /// response. Since this mock's write side stays Pending and its read side never reaches EOF,
+    /// returning from `serve_stream` logically pins the deadline classification without log capture.
+    #[tokio::test]
+    async fn process_no_common_codec_decline_write_expires_at_the_absolute_deadline() {
+        let body = b"process source whose no-codec decline peer never reads";
+        let (supervisor, gate, content) = no_codec_process_gate(body, Duration::from_millis(100));
+        let mock = DigestThenUnreadable {
+            digest: *content.as_bytes(),
+            accept: 0,
+            read_pos: 0,
+        };
+
+        tokio::time::timeout(
+            Duration::from_secs(2),
+            serve_stream(mock, Some(Arc::clone(&gate))),
+        )
+        .await
+        .expect("no-common-codec decline returns at its absolute response deadline");
+        assert_eq!(gate.counters(), ServeCounters::default());
+        assert_eq!(gate.inflight_bytes.load(Ordering::Acquire), 0);
+        assert_eq!(supervisor.process_jobs().active_len(), 0);
     }
 
     /// THE DECISIVE ceiling oracle (codex DEEP-gate finding): the in-flight byte ceiling must
@@ -2880,6 +4284,7 @@ mod tests {
         // BLOCKS on the write, holding its reservation THROUGH the write (the fix).
         let mock = DigestThenUnreadable {
             digest: *content.as_bytes(),
+            accept: ACCEPT_RAW_AND_ZSTD,
             read_pos: 0,
         };
         let serve1 = tokio::spawn(serve_stream(mock, Some(Arc::clone(&gate))));
@@ -2933,14 +4338,14 @@ mod tests {
     }
 
     // -------------------------------------------------------------------------
-    // TASK-203: the SERVE-side PIPELINED streaming zstd compress. End-to-end through
-    // serve_stream (a genuinely multi-block nar), plus the deadline-bound + write-error paths
-    // that prove the off-worker pipeline stays preemptible and leak-free.
+    // TASK-203/TASK-197: serve-side streaming zstd, now one frame per authenticated v4 leaf.
+    // End-to-end through serve_stream, plus deadline-bound + write-error paths that prove the
+    // off-worker pipeline stays preemptible and leak-free.
     // -------------------------------------------------------------------------
 
-    /// A ~512 KiB low-entropy raw nar - big enough to span several `SERVE_COMPRESS_INPUT_BLOCK`s
-    /// (a genuinely multi-block streamed frame), compressible so the frame stays small.
-    fn multi_block_nar(len: usize, seed: u32) -> Vec<u8> {
+    /// A ~512 KiB low-entropy raw NAR: large enough for several 64-KiB Bao leaves and
+    /// compressible enough that their independent zstd frames remain small.
+    fn multi_leaf_nar(len: usize, seed: u32) -> Vec<u8> {
         let mut raw = Vec::with_capacity(len);
         let mut x = seed;
         while raw.len() < len {
@@ -2950,33 +4355,11 @@ mod tests {
         raw
     }
 
-    /// A HIGH-entropy (incompressible) raw nar: deterministic splitmix64 bytes, so zstd cannot
-    /// shrink it and the compressor emits ~one output block per input block. Used where a serve
-    /// compressor must produce ENOUGH output to overflow the bounded serve->writer channel and
-    /// therefore STALL (stay alive holding its permit + gauge slot) against a non-reading consumer -
-    /// a low-entropy nar compresses to a few bytes and the compressor finishes instantly instead.
-    fn high_entropy_nar(len: usize, seed: u64) -> Vec<u8> {
-        let mut raw = Vec::with_capacity(len + 8);
-        let mut s = seed;
-        while raw.len() < len {
-            // splitmix64
-            s = s.wrapping_add(0x9E37_79B9_7F4A_7C15);
-            let mut z = s;
-            z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
-            z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
-            z ^= z >> 31;
-            raw.extend_from_slice(&z.to_le_bytes());
-        }
-        raw.truncate(len);
-        raw
-    }
-
-    /// AC#1 end-to-end: a large multi-block nar served through `serve_stream` streams a zstd frame
-    /// (pipelined off the worker) that the fetch path decodes to the EXACT nar and the frozen blob
-    /// id - the streamed production is wire-compatible with `/nar/3`.
+    /// AC#1 end-to-end: a large multi-leaf nar served through `serve_stream` uses independently
+    /// framed zstd leaves that the fetch path decodes to the exact nar and frozen blob id.
     #[tokio::test]
-    async fn serve_stream_pipelines_a_large_multi_block_nar() {
-        let raw = multi_block_nar(512 * 1024, 0x0f0f_0f0f);
+    async fn serve_stream_authenticates_a_large_multi_leaf_nar() {
+        let raw = multi_leaf_nar(512 * 1024, 0x0f0f_0f0f);
         let content = Blake3Digest::from_raw_nar(&raw);
         let supplier = Arc::new(MemoryNarSupplier::new([raw.clone()]));
         let gate = Arc::new(memory_gate(supplier));
@@ -2995,32 +4378,38 @@ mod tests {
         assert_eq!(
             wire[1],
             WireCodec::Zstd.wire(),
-            "server streamed a zstd frame for a large nar"
+            "server selected per-leaf zstd for a large NAR"
         );
-        // A real compression happened: the streamed body is smaller than the raw nar.
+        let accounting = nar_v4::NarV4WireAccounting::from_response_protocol_bytes(
+            raw.len() as u64,
+            WireCodec::Zstd,
+            wire.len() as u64,
+        )
+        .expect("captured response has exact v4 accounting");
+        // A real compression happened despite proof/prefix/header/COMPLETE overhead.
         assert!(
-            (wire.len() as u64 - 2) < raw.len() as u64,
-            "the streamed frame ({} B) must be smaller than the raw nar ({} B)",
-            wire.len() - 2,
+            accounting.response_protocol_bytes < raw.len() as u64,
+            "the exact v4 response ({} B) must be smaller than the raw NAR ({} B)",
+            accounting.response_protocol_bytes,
             raw.len()
         );
         let mut reader = futures::io::Cursor::new(wire);
         let got = read_response_streamed(&mut reader, Some(raw.len() as u64), IDLE, &content)
             .await
             .expect("the captured streamed zstd wire decodes");
-        assert_eq!(got, raw, "the streamed frame decodes to the exact nar");
+        assert_eq!(got, raw, "the v4 response decodes to the exact NAR");
         assert_eq!(Blake3Digest::from_raw_nar(&got), content, "same blob id");
         assert_eq!(gate.counters().admitted, 1);
     }
 
-    /// AC#1 preemption + no-leak: a large nar whose consumer NEVER reads must have its pipelined
-    /// zstd write PREEMPTED by the serve deadline (each block is an await), the serve task
+    /// AC#1 preemption + no-leak: a large NAR whose consumer NEVER reads must have its streaming
+    /// zstd write PREEMPTED by the serve deadline (each owned handoff reaches an await), the serve task
     /// terminate, and the in-flight reservation RELEASE - the streaming path stays deadline-bound
     /// and leak-free. BITE: an un-preemptible whole-nar compress + a never-released reservation
     /// would trip the 5 s guard / leave inflight non-zero.
     #[tokio::test]
     async fn serve_streaming_zstd_stays_deadline_bounded_for_a_non_reading_consumer() {
-        let raw = multi_block_nar(400 * 1024, 0xbeef_1234);
+        let raw = multi_leaf_nar(400 * 1024, 0xbeef_1234);
         let content = Blake3Digest::from_raw_nar(&raw);
         let supplier = Arc::new(MemoryNarSupplier::new([raw.clone()]));
         let short = ServeBudget {
@@ -3036,6 +4425,7 @@ mod tests {
 
         let mock = DigestThenUnreadable {
             digest: *content.as_bytes(),
+            accept: ACCEPT_RAW_AND_ZSTD,
             read_pos: 0,
         };
         let serve = tokio::spawn(serve_stream(mock, Some(Arc::clone(&gate))));
@@ -3048,241 +4438,5 @@ mod tests {
             0,
             "the reservation must release after the deadline-bounded streamed write"
         );
-    }
-
-    /// A writer that accepts `fail_after` bytes total, then ERRORS every write (a consumer that
-    /// went away mid-transfer).
-    struct FailingWriter {
-        fail_after: usize,
-        written: usize,
-    }
-
-    impl AsyncWrite for FailingWriter {
-        fn poll_write(
-            mut self: Pin<&mut Self>,
-            _cx: &mut Context<'_>,
-            buf: &[u8],
-        ) -> Poll<io::Result<usize>> {
-            if self.written >= self.fail_after {
-                Poll::Ready(Err(io::Error::other("consumer gone mid-transfer")))
-            } else {
-                self.written += buf.len();
-                Poll::Ready(Ok(buf.len()))
-            }
-        }
-        fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-            Poll::Ready(Ok(()))
-        }
-        fn poll_close(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-            Poll::Ready(Ok(()))
-        }
-    }
-
-    /// A write error mid-stream propagates out of the pipelined compressor and abandons it (the
-    /// dropped receiver stops the off-worker producer) - the serve never spins compressing a dead
-    /// stream to completion.
-    #[tokio::test]
-    async fn write_zstd_streamed_surfaces_a_write_error_and_abandons_the_pipeline() {
-        let raw = multi_block_nar(300 * 1024, 0x1357_9bdf);
-        let mut writer = FailingWriter {
-            fail_after: 0, // error on the very first block write
-            written: 0,
-        };
-        let err = write_zstd_streamed(&mut writer, raw, DEFAULT_ZSTD_LEVEL)
-            .await
-            .expect_err("a write error must propagate and abandon the pipeline");
-        assert!(
-            err.to_string().contains("consumer gone mid-transfer"),
-            "expected the underlying write error, got {err}"
-        );
-    }
-
-    /// A consumer that sends the request and ACCEPTS the first `accept_cap` response bytes (the
-    /// status + codec byte, so `write_response` gets PAST them into the pipelined compressor and
-    /// the off-worker producer actually SPAWNS and runs), then STALLS every further write - so the
-    /// compressor produces into the bounded channel, backpressures, and is aborted by the serve
-    /// deadline while genuinely mid-flight. Unlike `DigestThenUnreadable` (which stalls on the very
-    /// first byte, before the compressor is ever reached) this exercises the compressor pool.
-    struct RequestThenStall {
-        digest: [u8; 32],
-        read_pos: usize,
-        accepted: usize,
-        accept_cap: usize,
-    }
-
-    impl AsyncRead for RequestThenStall {
-        fn poll_read(
-            mut self: Pin<&mut Self>,
-            _cx: &mut Context<'_>,
-            buf: &mut [u8],
-        ) -> Poll<io::Result<usize>> {
-            let mut request = [0u8; 33];
-            request[..32].copy_from_slice(&self.digest);
-            request[32] = ACCEPT_RAW_AND_ZSTD;
-            if self.read_pos < request.len() && !buf.is_empty() {
-                let start = self.read_pos;
-                let n = (request.len() - start).min(buf.len());
-                buf[..n].copy_from_slice(&request[start..start + n]);
-                self.read_pos += n;
-                Poll::Ready(Ok(n))
-            } else {
-                Poll::Pending // connected but idle: NOT EOF.
-            }
-        }
-    }
-
-    impl AsyncWrite for RequestThenStall {
-        fn poll_write(
-            mut self: Pin<&mut Self>,
-            _cx: &mut Context<'_>,
-            buf: &[u8],
-        ) -> Poll<io::Result<usize>> {
-            if self.accepted >= self.accept_cap {
-                Poll::Pending // stall once the status bytes are past: the compressor backpressures.
-            } else {
-                let n = buf.len().min(self.accept_cap - self.accepted);
-                self.accepted += n;
-                Poll::Ready(Ok(n))
-            }
-        }
-        fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-            Poll::Ready(Ok(()))
-        }
-        fn poll_close(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-            Poll::Ready(Ok(()))
-        }
-    }
-
-    /// F2 (codex NO-GO, re-gate #2): the serve-side blocking compressors must be COUNTED and
-    /// BOUNDED from the moment they are SPAWNED - not lazily when the blocking pool first RUNS
-    /// them - so that a compressor which is spawned but still QUEUED on the pool is (a) visible to
-    /// the live gauge and (b) already holding a permit that backpressures further spawns. The fix
-    /// enters the [`CompressorSlot`] (permit + gauge) in the ASYNC context BEFORE `spawn_blocking`
-    /// and moves it into the closure; the previous code entered it INSIDE the closure, so
-    /// queued-but-not-started closures were unaccounted (a drain-to-zero check could read low while
-    /// spawns were pending, and there was no bound on concurrent+queued compressors).
-    ///
-    /// We prove the pre-spawn accounting deterministically by STARVING the blocking pool: the test
-    /// runtime is built with FEWER blocking threads than the permit ceiling, and every serve stalls
-    /// its consumer so its compressor blocks on the bounded channel (a high-entropy nar so the
-    /// compressor actually produces enough output to fill the channel and stay alive). Under a
-    /// 4x-ceiling burst:
-    ///   * SATURATION: the gauge must climb to the ceiling (permits, not running-closures, are the
-    ///     bound). Only a few closures RUN on the starved pool; the rest are spawned-but-queued.
-    ///     With the pre-spawn slot they are all counted, so the gauge reaches the ceiling; with the
-    ///     OLD in-closure slot only the running handful would be counted and the gauge would STALL
-    ///     far below the ceiling - so `max_seen` near the ceiling is the mutation bite.
-    ///   * BOUNDED: the gauge never exceeds the ceiling (only that many permits exist).
-    ///   * LEAK-FREE: after aborting every serve, the gauge drains back to zero (dropping the
-    ///     `CompressorSlot` decrement would pin it above zero and time this out).
-    #[test]
-    fn serve_compressors_are_counted_and_bounded_from_spawn_not_from_pool_start() {
-        // Fewer blocking threads than the permit ceiling: only this many compressors can be RUNNING
-        // at once, so under the burst the majority are spawned-but-queued. If the gauge only counted
-        // running closures it would stall near this value; the pre-spawn slot makes it reach the
-        // full ceiling regardless of how many the pool has started.
-        const POOL: usize = 8;
-        const {
-            assert!(
-                POOL < SERVE_COMPRESS_MAX_CONCURRENT,
-                "the pool must be starved below the permit ceiling for the bite to be meaningful"
-            )
-        };
-        let rt = tokio::runtime::Builder::new_multi_thread()
-            .worker_threads(4)
-            .max_blocking_threads(POOL)
-            .enable_all()
-            .build()
-            .expect("build a blocking-pool-starved test runtime");
-
-        rt.block_on(async move {
-            // A high-entropy, multi-block nar: incompressible, so each compressor emits many output
-            // blocks, overflows the cap-`SERVE_COMPRESS_BLOCKS_IN_FLIGHT` channel against the
-            // non-reading consumer, and STALLS (stays alive holding its permit + gauge slot for the
-            // whole sampling window) rather than finishing instantly. SIZE: only large enough to
-            // overflow the cap-`SERVE_COMPRESS_BLOCKS_IN_FLIGHT` (=2) channel and block the producer
-            // on its 3rd `ENCODE_BLOCK` (128 KiB) send — 512 KiB (~4 incompressible blocks) suffices.
-            // Kept deliberately small: this test clones `raw` per serve across `n` serves, so a large
-            // nar would balloon RSS (a 4 MiB nar x 256 serves reached ~1 GiB — a low-memory-CI OOM
-            // risk); 512 KiB x 256 caps the clone footprint at ~128 MiB.
-            let raw = high_entropy_nar(512 * 1024, 0xa5a5_1234_dead_beef);
-            let content = Blake3Digest::from_raw_nar(&raw);
-
-            let n = 4 * SERVE_COMPRESS_MAX_CONCURRENT; // far more serves than the permit ceiling
-            let mut handles = Vec::with_capacity(n);
-            for _ in 0..n {
-                let supplier = Arc::new(MemoryNarSupplier::new([raw.clone()]));
-                // A LONG deadline: the drain is driven by our explicit abort below, not by deadlines
-                // firing mid-sample (which would race the saturation measurement).
-                let budget = ServeBudget {
-                    max_nar_bytes_uncompressed_nar: 16 << 20,
-                    max_inflight_bytes_uncompressed_nar: 1 << 30,
-                    max_serve_duration: Duration::from_secs(10),
-                };
-                let gate = Arc::new(ServeGate::new(
-                    budget,
-                    supplier,
-                    TaskSupervisorHandle::disconnected(),
-                ));
-                // Accept the 2 status bytes (STATUS_NAR + codec) so write_response REACHES the
-                // pipelined compressor and the off-worker producer actually spawns, then stall.
-                let mock = RequestThenStall {
-                    digest: *content.as_bytes(),
-                    read_pos: 0,
-                    accepted: 0,
-                    accept_cap: 2,
-                };
-                handles.push(tokio::spawn(serve_stream(mock, Some(gate))));
-            }
-
-            // SATURATION + BOUNDED oracle: sample the gauge until it climbs to the ceiling. It can
-            // NEVER exceed the ceiling (only that many permits exist), and it must REACH it (allowing
-            // a small slack for a permit transiently held by another parallel serve test - the gauge
-            // is a process-global static). With the OLD in-closure slot the gauge would stall around
-            // POOL (only running closures counted) and never approach the ceiling.
-            const SLACK: usize = 8; // headroom below the ceiling for a parallel test's transient permit
-            let target = SERVE_COMPRESS_MAX_CONCURRENT - SLACK;
-            let mut max_seen = 0usize;
-            let saturated = tokio::time::timeout(Duration::from_secs(8), async {
-                loop {
-                    let g = ACTIVE_SERVE_COMPRESSORS.load(Ordering::Acquire);
-                    assert!(
-                        g <= SERVE_COMPRESS_MAX_CONCURRENT,
-                        "live compressors {g} exceeded the fixed ceiling \
-                         {SERVE_COMPRESS_MAX_CONCURRENT}"
-                    );
-                    max_seen = max_seen.max(g);
-                    if g >= target {
-                        return;
-                    }
-                    tokio::time::sleep(Duration::from_millis(2)).await;
-                }
-            })
-            .await;
-            assert!(
-                saturated.is_ok(),
-                "the live gauge stalled at {max_seen} (< {target}) under a {n}-serve burst on a \
-                 {POOL}-thread blocking pool: spawned-but-queued compressors are NOT counted - the \
-                 permit + gauge are not taken before spawn_blocking (F2)"
-            );
-
-            // Abort every serve -> each receiver drops -> a RUNNING compressor's next `blocking_send`
-            // errors and it returns; a QUEUED one, once the pool starts it, sees the closed channel
-            // and returns immediately. Every `CompressorSlot` drops, so the gauge drains to zero.
-            for h in &handles {
-                h.abort();
-            }
-            let drained = tokio::time::timeout(Duration::from_secs(30), async {
-                while ACTIVE_SERVE_COMPRESSORS.load(Ordering::Acquire) != 0 {
-                    tokio::time::sleep(Duration::from_millis(5)).await;
-                }
-            })
-            .await;
-            assert!(
-                drained.is_ok(),
-                "serve compressor slots did not drain to zero: {} still live (a blocking-pool leak)",
-                ACTIVE_SERVE_COMPRESSORS.load(Ordering::Acquire)
-            );
-        });
     }
 }

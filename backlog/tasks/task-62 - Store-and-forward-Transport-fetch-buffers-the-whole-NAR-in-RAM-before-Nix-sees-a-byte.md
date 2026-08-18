@@ -6,13 +6,14 @@ title: >-
 status: To Do
 assignee: []
 created_date: '2026-08-09 13:24'
-updated_date: '2026-08-18 06:51'
+updated_date: '2026-08-18 10:26'
 labels:
   - streaming
   - memory
   - trust-boundary
 dependencies:
   - TASK-65
+  - TASK-197
 priority: high
 ---
 
@@ -189,4 +190,6 @@ in the FETCHER, but it shares this surface and there are three things you need.
    the streaming and one-shot constructors agree across the chunk boundary.
 
 2026-08-18 dependency audit: TASK-247 cannot honestly measure latency hiding while PeerFabricNarSource constructs the HTTP body only after NarTransfer::fetch has collected the entire NAR. TASK-62 is therefore a correctness/measurement prerequisite for TASK-247, even though its expected total-throughput win remains small.
+
+2026-08-18 dependency correction: TASK-197 is a hard prerequisite for AC#6 on libp2p. /nar/3 authenticates the whole BLAKE3 only at EOF, so releasing libp2p bytes to the HTTP body earlier would not be a verified-chunk stream. Implement and mutation-prove the bao-capable protocol first; iroh already has bao leaves but still needs its Vec seam removed here.
 <!-- SECTION:NOTES:END -->

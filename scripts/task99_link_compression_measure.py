@@ -3,8 +3,10 @@
 INTEGER-EXACT measurement, honestly and without a single float in any decision.
 
 The harness (`peer-fabric/examples/measure_link_compression.rs`) measures, on REAL nar data,
-the SHIPPED /nar/3 codec: for each file and level, the exact `(compressed_bytes, raw_bytes)`
+the THEN-SHIPPED /nar/3 codec: for each file and level, the exact `(compressed_bytes, raw_bytes)`
 pair and integer compress/decompress nanoseconds. This finalizer re-reads that raw artifact
+as historical evidence; current `/nar/4` independently frames each Bao leaf and has a different
+wire model.
 and derives every conclusion by INTEGER / EXACT-RATIONAL arithmetic (`fractions.Fraction`,
 cross-multiplication), mirroring the TASK-94 finalizer discipline (a float tolerance + NaN is
 fail-open): it REJECTS a non-finite or non-integer field rather than deriving a decision from
@@ -419,7 +421,7 @@ def derive(
 
     return {
         "task": "task-99",
-        "measures": "peer-LINK zstd compression on real nar data (the shipped /nar/3 codec)",
+        "measures": "peer-LINK zstd compression on real nar data (the then-shipped /nar/3 codec; historical wire model superseded by /nar/4)",
         "integer_exact": True,
         "no_floats_in_decisions": True,
         "cdn_baseline_pair_file_over_nar": [base_num, base_den],

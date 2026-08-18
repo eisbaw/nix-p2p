@@ -1,7 +1,8 @@
 //! [`Libp2pTransport`] - the libp2p [`NarTransfer`]: fetch a NAR from a provider peer by
-//! STREAMING it over the shared swarm's `/nix-p2p/<scope>/nar/3` raw libp2p-stream protocol
-//! (TASK-157), gate-1 BLAKE3-verify it, and honour the [`SafetyEnvelope`] (dial / body-idle /
-//! total bounds) and the signed NarSize as a true mid-stream size abort.
+//! streaming it over the shared swarm's Bao-authenticated `/nix-p2p/<scope>/nar/4`
+//! libp2p-stream protocol. It honours the [`SafetyEnvelope`] and signed NarSize header,
+//! and exposes only leaves authenticated against the requested BLAKE3. The compatibility
+//! `NarTransfer` result still collects those leaves into a `Vec` until TASK-62.
 //!
 //! # ADR (TASK-156): native libp2p dispatch + rollout-only legacy reader
 //!
@@ -217,6 +218,15 @@ impl NarTransfer for Libp2pTransport {
                         connection = %connection.id,
                         route = ?connection.route,
                         "fabric-libp2p: NAR fetch UNREACHABLE - the exact authorized NAR substream never opened"
+                    );
+                    Err(err)
+                }
+                FetchOutcome::ProtocolIncompatible(err) => {
+                    tracing::info!(
+                        provider = %node, %peer, error = %err,
+                        connection = %connection.id,
+                        route = ?connection.route,
+                        "fabric-libp2p: provider reached but required /nar/4 is unsupported; no /nar/3 downgrade"
                     );
                     Err(err)
                 }

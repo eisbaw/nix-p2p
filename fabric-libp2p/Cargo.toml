@@ -89,6 +89,13 @@ rand = "0.8"
 # withdraws records it itself signed). `sign_provider_withdrawal` takes an
 # ed25519-dalek `SigningKey`; "3" matches peer-fabric's, so it is the one shared type.
 ed25519-dalek = "3"
+# TASK-197: canonical BLAKE3/Bao tree geometry and verified full-range
+# encode/decode. Only the synchronous FSM is used, inside explicitly bounded
+# blocking workers; disabling defaults avoids pulling the non-Send async FSM.
+bao-tree = { version = "0.16.0", default-features = false }
+# Verified Bao leaves are immutable handoff units between the bounded blocking
+# verifier and the async transport collector (TASK-62 consumes the stream next).
+bytes = "1"
 
 [dev-dependencies]
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "net"] }

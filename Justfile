@@ -100,7 +100,11 @@ build: _toolchain
 lint: _toolchain _python independence
     cargo clippy --locked --workspace --all-targets -- -D warnings
     cargo clippy --locked --package daemon --all-targets --features evidence-fixture -- -D warnings
+    # The production Iroh patch is intentionally excluded from workspace-wide
+    # upstream integration targets; lint its patched library explicitly.
+    cargo clippy --locked --manifest-path vendor/iroh/Cargo.toml --lib -- -D warnings
     cargo fmt --all --check
+    cargo fmt --manifest-path vendor/iroh/Cargo.toml -- --check
     ruff check scripts
     ruff format --check scripts
     "${NIX_P2P_PYTHON}/bin/python3" scripts/check-source-guard.py
@@ -176,6 +180,9 @@ check-commit-msg range="HEAD~1..HEAD":
 # Run the fast unit, integration, fixture, and evidence self-test suite.
 test: _headroom build _python fixtures
     cargo test --locked --workspace
+    # Exercise only the deterministic release-barrier regressions in vendored
+    # Iroh; its upstream integration targets contact staging infrastructure.
+    cargo test --locked --manifest-path vendor/iroh/Cargo.toml --lib fixed_port_
     # The evidence fixture is feature-gated out of the workspace-default suite.
     cargo test --locked --package daemon --bin iroh-node-lookup-fixture --features evidence-fixture
     "${NIX_P2P_PYTHON}/bin/python3" scripts/check-fixtures.py

@@ -1,6 +1,6 @@
 //! Shaped-link kad-DHT DISCOVERY probe (TASK-209, test/measurement surface only).
 //!
-//! TASK-206 proved a real libp2p `/nar/3` fetch is BYTE-IDENTICAL over a `tc netem`-shaped
+//! TASK-206 proved a real libp2p NAR fetch is BYTE-IDENTICAL over a `tc netem`-shaped
 //! `veth` pair, but drove the fetch via a DIRECT-multiaddr dial - so the DISCOVER half (kad
 //! `get_providers` + peer-routing `get_closest_peers`) never crossed the shaped link; that
 //! half is shown only unshaped (TASK-179 routed netns at ~0 RTT). This probe closes it: a
@@ -30,7 +30,7 @@
 //!       (2) kad peer-routing `get_closest_peers` (NodeLocator) to resolve the discovered
 //!       provider's dial address - WITHOUT ever `add_address`-injecting P. Print a
 //!       machine-parseable DISCOVERY_DONE line (outcomes + elapsed), and, if discovery
-//!       succeeded, fetch the NAR over `/nar/3` and print FETCH_DONE (byte-identity +
+//!       succeeded, fetch the NAR over `/nar/4` and print FETCH_DONE (byte-identity +
 //!       BLAKE3). AC#9: C is given NO provider addr/PeerId - the answer is Kademlia's.
 //!
 //! Both P and C regenerate the SAME NAR and the SAME discovery key from the SAME
@@ -233,7 +233,7 @@ async fn provide_dht_mode(args: &[String]) {
         .expect("listen binds");
     let listen_addr = wait_listen_addr(&fabric).await;
 
-    // Install the serve gate so the consumer's later /nar/3 fetch is admitted.
+    // Install the serve gate so the consumer's later /nar/4 fetch is admitted.
     let _serve = fabric
         .server()
         .expect("provider fabric serves")

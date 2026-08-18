@@ -16,7 +16,9 @@ streamed-vs-bulk delta is WITHIN MEASUREMENT NOISE - it STRADDLES ZERO (both sig
 <~ 15% either direction, scheduler-dominated on a loaded single box) - so it bounds the delta's
 MAGNITUDE, not its sign. So the honest re-evaluation reuses
 TASK-99's committed INTEGER-EXACT harness measurement (`compressed_bytes`, `raw_bytes`,
-`compress_ns`, `decompress_ns` for the shipped /nar/3 codec on real nar data) AS THAT ESTIMATE
+`compress_ns`, `decompress_ns` for the then-shipped /nar/3 codec on real nar data) AS THAT
+HISTORICAL ESTIMATE. Current `/nar/4` independently frames each Bao leaf and supersedes this wire
+model;
 and applies the PIPELINED makespan model to it. It does NOT need a fresh shaped-link run; it needs
 the same measured byte counts with a per-stage cost whose deviation from the streamed path is
 bounded in magnitude (<~ 15%, far under the ~55% flip margin below), of unknown sign.
@@ -348,7 +350,7 @@ def derive(raw: dict, task99: dict | None) -> dict:
         "task": "task-203",
         "measures": "the TASK-99 net-LAN verdict re-evaluated under an IDEALIZED (best-case, "
         "constant-aggregate-rate) PIPELINED serve model",
-        "reuses": "the committed TASK-99 harness_raw.json (same shipped /nar/3 codec, same "
+        "reuses": "the committed TASK-99 harness_raw.json (same then-shipped /nar/3 codec, same "
         "integer-exact compressed/raw byte counts); pipelining changes only the SCHEDULING of the "
         "same wire bytes. The bulk CPU-ns are reused as the ESTIMATE for the streamed path's CPU "
         "(the new raw-stream/channel/alloc overhead is not separately modeled); the evidence "

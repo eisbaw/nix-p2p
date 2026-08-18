@@ -10,7 +10,7 @@
 # The ONLY difference from the TASK-70 inner script is the payload that crosses
 # the link: instead of a bare bulk-TCP transfer, it launches TWO REAL libp2p
 # swarm nodes -- a PROVIDER in ns A (bound to the veth addr) and a CONSUMER in
-# ns B (via `nsenter`) -- and runs a real `discover->fetch->serve` `/nar/3`
+# ns B (via `nsenter`) -- and runs a real `discover->fetch->serve` `/nar/4`
 # transfer over the shaped veth. This is the libp2p-through-shaped-netns wiring.
 #
 # Emits the machine-parseable lines `scripts/shaped_libp2p.py` consumes:

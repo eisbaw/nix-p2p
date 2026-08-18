@@ -1280,7 +1280,9 @@ name = "fabric-libp2p"
 version = "0.0.1"
 dependencies = [
  "async-trait",
+ "bao-tree",
  "blake3",
+ "bytes",
  "ed25519-dalek 3.0.0",
  "futures",
  "libp2p",
@@ -2250,8 +2252,6 @@ dependencies = [
 [[package]]
 name = "iroh"
 version = "1.0.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "460de6bc52163b41b1646931f2897e5ab986f0966ade444467fec25024751a72"
 dependencies = [
  "axum",
  "backon",

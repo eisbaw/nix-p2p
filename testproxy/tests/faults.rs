@@ -5,7 +5,8 @@
 
 mod common;
 
-use common::{Fixture, get};
+use common::{Fixture, get, raw_request};
+use std::thread;
 use std::time::{Duration, Instant};
 
 /// How long [`await_fault_count`] will wait for the server thread to catch up.
@@ -36,7 +37,8 @@ fn fault_count(fx: &Fixture, name: &str) -> u64 {
         .unwrap_or(0)
 }
 
-/// Wait for `name` to have been counted `want` times, then assert it.
+/// Wait for `name` to have been counted `want` times with no active handler,
+/// then assert both facts.
 ///
 /// WHY THIS IS NOT `assert_eq!(fault_count(..), want)` (task-109). The client and
 /// the proxy's bookkeeping are not ordered with respect to each other: the proxy
@@ -52,19 +54,85 @@ fn fault_count(fx: &Fixture, name: &str) -> u64 {
 /// and never re-rolls the fault, so a fault that genuinely never fired still fails
 /// the test - just `LOG_VISIBILITY_DEADLINE` later than it would have.
 ///
-/// It asserts EQUALITY at the end, not `>=`, so an over-count (the same fault
-/// recorded twice) still fails exactly as it did before.
+/// The in-flight count reaches zero only after the completion record is pushed.
+/// Waiting for both makes the final EQUALITY conclusive: a duplicate handler
+/// cannot still be active and append another matching record after acceptance.
 #[track_caller]
 fn await_fault_count(fx: &Fixture, name: &str, want: u64) {
     let deadline = Instant::now() + LOG_VISIBILITY_DEADLINE;
-    while fault_count(fx, name) < want && Instant::now() < deadline {
+    while (fx.state.in_flight() != 0 || fault_count(fx, name) != want) && Instant::now() < deadline
+    {
         std::thread::sleep(Duration::from_millis(5));
     }
+    assert_eq!(
+        fx.state.in_flight(),
+        0,
+        "proxy still has a non-admin request in flight after {LOG_VISIBILITY_DEADLINE:?}"
+    );
     assert_eq!(
         fault_count(fx, name),
         want,
         "fault {name:?} count after waiting up to {LOG_VISIBILITY_DEADLINE:?} for the \
          proxy to record it"
+    );
+}
+
+fn admin_in_flight(fx: &Fixture) -> u64 {
+    let response = raw_request(fx.proxy_addr, "GET", "/__testproxy/in-flight")
+        .expect("in-flight endpoint reachable");
+    assert_eq!(response.status, Some(200));
+    let body = response.body_string();
+    body.strip_prefix("{\"in_flight\":")
+        .and_then(|value| value.strip_suffix('}'))
+        .and_then(|value| value.parse().ok())
+        .unwrap_or_else(|| panic!("in-flight endpoint returned malformed JSON: {body:?}"))
+}
+
+/// The admin oracle observes delayed work without counting itself, and zero is
+/// published only after that work's completion record is visible.
+#[test]
+fn in_flight_endpoint_tracks_only_unrecorded_non_admin_requests() {
+    let fx = Fixture::with_nar(4096);
+    fx.reset_log();
+    fx.set_faults("latency_narinfo_ms=2000");
+
+    let proxy_addr = fx.proxy_addr;
+    let request = thread::spawn(move || {
+        get(proxy_addr, "/test.narinfo").expect("delayed narinfo request completes")
+    });
+
+    let deadline = Instant::now() + LOG_VISIBILITY_DEADLINE;
+    while fx.state.in_flight() != 1 && Instant::now() < deadline {
+        thread::sleep(Duration::from_millis(5));
+    }
+    assert_eq!(
+        fx.state.in_flight(),
+        1,
+        "delayed narinfo handler becomes observably active"
+    );
+    assert_eq!(
+        admin_in_flight(&fx),
+        1,
+        "admin endpoint observes the active non-admin handler"
+    );
+    assert_eq!(
+        fx.state.in_flight(),
+        1,
+        "the admin observation itself is excluded from in-flight activity"
+    );
+
+    assert_eq!(
+        request
+            .join()
+            .expect("request thread does not panic")
+            .status,
+        Some(200)
+    );
+    await_fault_count(&fx, "latency-narinfo", 1);
+    assert_eq!(
+        admin_in_flight(&fx),
+        0,
+        "endpoint reports quiescence after the completion record is visible"
     );
 }
 

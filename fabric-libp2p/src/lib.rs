@@ -105,6 +105,7 @@ mod floor_store;
 mod keys;
 mod locator;
 mod nar;
+mod nar_v4;
 mod persist;
 mod server;
 mod swarm;
@@ -117,13 +118,14 @@ pub use keys::{RelayHintDerivationError, VALUE_KEY_CONTEXT, relay_hints_from_cir
 pub use locator::Libp2pNodeLocator;
 pub use nar::{
     CatalogNarSupplier, CatalogProbe, Libp2pNarSupplier, MemoryNarSupplier, NarSupplyPlan,
-    ProbedSource, ProbedSupply, RAW_NAR_HELPER_ARG, ServeCounters, ServeGate,
+    ProbedSource, ProbedSupply, RAW_NAR_HELPER_ARG, ServeCounters, ServeGate, ServeObservation,
     raw_nar_helper_authorized,
 };
+pub use nar_v4::NarV4WireAccounting;
 pub use server::Libp2pServer;
 pub use swarm::{
     ConnPath, DEFAULT_KAD_QUERY_TIMEOUT, DEFAULT_LISTEN_READY_TIMEOUT, FetchOutcome, Node,
-    NodeConfig, NodeError, ProviderFanOut, QueryFail, QueryReach, SwarmHandle,
+    NodeConfig, NodeError, ProviderFanOut, QueryFail, QueryReach, StreamedFetch, SwarmHandle,
 };
 pub use transport::Libp2pTransport;
 

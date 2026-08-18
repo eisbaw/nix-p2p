@@ -55,6 +55,29 @@ async fn authority() -> (PublicationAuthority, TempDir) {
     (authority, state)
 }
 
+#[test]
+fn authority_lock_is_explicitly_released_while_duplicate_fd_remains_open() {
+    let state = TempDir::new("authority-explicit-unlock");
+    let config = PublicationAuthorityConfig {
+        listen: "127.0.0.1:0".parse().unwrap(),
+        state_dir: state.0.clone(),
+        namespace: "run-explicit-unlock".into(),
+        signed_recipient: "authority.test:v1".into(),
+        expected_host: "authority.test".into(),
+        owner: "test operator".into(),
+        signer_admission: AuthoritySignerAdmission::TestOnlyUnrestricted,
+    };
+
+    let (store, _) = AuthorityStateStore::open(&config).unwrap();
+    let inherited_duplicate = rustix::io::dup(&store._lock.fd).unwrap();
+    drop(store);
+
+    let (reopened, _) = AuthorityStateStore::open(&config)
+        .expect("LOCK_UN must release the OFD lock despite a live duplicate descriptor");
+    drop(reopened);
+    drop(inherited_duplicate);
+}
+
 #[tokio::test]
 async fn stock_iroh_pkarr_client_publishes_and_resolves_exact_packet() {
     let state = TempDir::new("authority-stock-iroh");

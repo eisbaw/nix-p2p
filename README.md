@@ -157,10 +157,12 @@ public-swarm results are still out.
   no enumeration — and the announce is gated by the supply-integrity floor above, so it can only
   advertise a path the index actually verified. Production runs off the swarm poll loop, so a
   large serve never stalls discovery.
-- **True streaming transfer.** NARs move over a raw libp2p stream: the fetcher aborts the
-  instant a transfer exceeds its declared size — mid-stream, not after buffering — enforces an
-  inter-chunk idle bound, and a bounded in-flight ceiling caps concurrent serves, while every
-  byte is still BLAKE3/bao-verified before the build accepts it.
+- **Bao-authenticated streaming transfer.** `/nar/4` declares exact RawNarV1 size, then carries
+  full-range Bao proofs for fixed 64-KiB leaves with raw or independently bounded per-leaf zstd.
+  A fetcher exposes a leaf only after authenticating it against the requested BLAKE3; COMPLETE
+  plus clean FIN gates final completion. Process supply regenerates twice—ephemeral outboard/root
+  verification, then authenticated delivery—without a whole-NAR serve buffer. This does not claim
+  lower absolute TTFB: proof preparation remains and process serves perform a second dump.
 - **Leech / consume-only mode (`--libp2p-leech`).** An affirmative opt-out for anyone who
   cannot or will not contribute uplink: a leech still fetches from peers, but its fabric is
   wrapped in a transport-agnostic `LeechFabric` that masks the *serve* and *announce* axes at
@@ -215,10 +217,11 @@ public-swarm results are still out.
   TTL-cap enforcement, durable-reload sweep/cap, fail-closed consumer durability, a
   shared-state-dir advisory lock, save-before-publish for withdrawals, and per-line
   persistence integrity) — tracked as the record-lifecycle hardening follow-up.
-- **Deeper swarm dynamics:** per-chunk (bao) stream verification and true serve-side
-  passthrough (the stream currently verifies at completion and buffers before shipping),
-  hedged/prefetch fetches, and eclipse/sybil bounds beyond the current replay/rollback/DoS
-  guards.
+- **Socket-to-HTTP streaming completion (TASK-62).** The `/nar/4` verifier/process pipeline is
+  bounded to leaf/chunk buffers, O(tree depth), and a declared-size-derived ephemeral outboard,
+  but the current `NarTransfer` compatibility seam still collects verified leaves into one `Vec`
+  before HTTP. TASK-62 removes that final O(N) collector. Hedged/prefetch fetches and deeper
+  eclipse/sybil bounds also remain.
 - **A verdict on the value thesis:** whether peers beat a CDN is unmeasured on a real
   network.
 

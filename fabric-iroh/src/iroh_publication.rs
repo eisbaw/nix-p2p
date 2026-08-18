@@ -494,12 +494,61 @@ impl PublicationStateBody {
 struct PublicationStateStore {
     state_dir: PathBuf,
     dirfd: rustix::fd::OwnedFd,
-    _lock: rustix::fd::OwnedFd,
+    _lock: PublicationStateLock,
     #[cfg(test)]
     fail_writes_remaining: AtomicU64,
     #[cfg(test)]
     fail_next_post_rename: std::sync::atomic::AtomicBool,
     poisoned: AtomicBool,
+}
+
+/// Owns the publication-state advisory lock and releases the open-file-description
+/// lock explicitly before closing the descriptor.
+///
+/// `flock` locks survive `close(2)` while any descriptor duplicated from the same
+/// open-file description remains alive (including a descriptor inherited across
+/// `fork` before a successful `exec`).  Relying on `OwnedFd::drop` alone therefore
+/// makes an awaited publisher shutdown race a newly spawned replacement process.
+struct PublicationStateLock {
+    fd: rustix::fd::OwnedFd,
+    path: PathBuf,
+    locked: AtomicBool,
+}
+
+impl PublicationStateLock {
+    fn new(fd: rustix::fd::OwnedFd, path: PathBuf) -> Self {
+        Self {
+            fd,
+            path,
+            locked: AtomicBool::new(true),
+        }
+    }
+
+    fn unlock(&self) -> Result<(), rustix::io::Errno> {
+        if self
+            .locked
+            .compare_exchange(true, false, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return Ok(());
+        }
+        if let Err(error) = fs::flock(&self.fd, FlockOperation::Unlock) {
+            self.locked.store(true, Ordering::Release);
+            return Err(error);
+        }
+        Ok(())
+    }
+}
+
+impl Drop for PublicationStateLock {
+    fn drop(&mut self) {
+        if let Err(error) = self.unlock() {
+            eprintln!(
+                "IROH-NODE-PUBLICATION-LOCK-RELEASE-FAILED path={} error={error}",
+                self.path.display()
+            );
+        }
+    }
 }
 
 impl fmt::Debug for PublicationStateStore {
@@ -561,7 +610,7 @@ impl PublicationStateStore {
         let store = Self {
             state_dir: state_dir.to_path_buf(),
             dirfd,
-            _lock: lock,
+            _lock: PublicationStateLock::new(lock, state_dir.join(PUBLICATION_LOCK_FILENAME)),
             #[cfg(test)]
             fail_writes_remaining: AtomicU64::new(0),
             #[cfg(test)]
@@ -2328,6 +2377,47 @@ fn hex_nibble(byte: u8) -> Result<u8, PublicationError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn publication_lock_is_explicitly_released_while_duplicate_fd_remains_open() {
+        let state_dir = std::env::temp_dir().join(format!(
+            "nix-p2p-publication-explicit-unlock-{}-{}",
+            std::process::id(),
+            unix_micros().unwrap()
+        ));
+        std::fs::create_dir(&state_dir).unwrap();
+        std::fs::set_permissions(
+            &state_dir,
+            std::os::unix::fs::PermissionsExt::from_mode(0o700),
+        )
+        .unwrap();
+        let key = SecretKey::generate();
+        let node = NodeId::from_bytes(*key.public().as_bytes());
+        let config = NodePublicationConfig::new(
+            "run-explicit-unlock",
+            "authority.test:v1",
+            "127.0.0.1:8080".parse().unwrap(),
+            "authority.test",
+            PublicationAuthorityAuthorization::LocalProductionShaped {
+                owner: "operator".into(),
+            },
+            Duration::from_secs(30),
+            Duration::from_secs(10),
+            Duration::from_secs(2),
+            [NodeLocation::direct("127.0.0.1:4433".parse().unwrap()).unwrap()],
+        )
+        .unwrap();
+
+        let (store, _) = PublicationStateStore::open(&state_dir, node, &config).unwrap();
+        let inherited_duplicate = rustix::io::dup(&store._lock.fd).unwrap();
+        drop(store);
+
+        let (reopened, _) = PublicationStateStore::open(&state_dir, node, &config)
+            .expect("LOCK_UN must release the OFD lock despite a live duplicate descriptor");
+        drop(reopened);
+        drop(inherited_duplicate);
+        std::fs::remove_dir_all(state_dir).unwrap();
+    }
 
     #[test]
     fn config_is_closed_and_external_contact_requires_authorization() {

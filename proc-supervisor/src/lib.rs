@@ -20,6 +20,6 @@ pub mod process_group;
 pub mod task_supervisor;
 
 pub use task_supervisor::{
-    MAX_OWNED_TASKS, SupervisedProcessOutput, SupervisorError, TaskSupervisor,
-    TaskSupervisorHandle, TrackedTask,
+    MAX_OWNED_TASKS, ProcessCleanupTicket, SupervisedProcessCompletion, SupervisedProcessOutput,
+    SupervisedProcessStream, SupervisorError, TaskSupervisor, TaskSupervisorHandle, TrackedTask,
 };

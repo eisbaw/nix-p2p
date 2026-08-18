@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
 """Shaped-link kad-DHT DISCOVERY proof + RTT sweep (TASK-209).
 
-WHAT THIS IS. TASK-206 proved a real libp2p `/nar/3` fetch is BYTE-IDENTICAL over a
+WHAT THIS IS. TASK-206 proved a real libp2p NAR fetch is BYTE-IDENTICAL over a
 `tc netem`-shaped `veth` pair, but it drove the fetch via a DIRECT-multiaddr dial, so the
 DISCOVER half (kad `get_providers` + peer-routing `get_closest_peers`) never crossed the
 shaped link -- that half is shown only unshaped (TASK-179 routed netns at ~0 RTT). This
 closes it. A 3-node kad topology -- BOOTSTRAP B + PROVIDER P in ns A, CONSUMER C in ns B --
 where C, knowing ONLY B, DISCOVERS P purely through the DHT and then fetches, with EVERY C
-round-trip (join, get_providers, get_closest_peers, /nar/3 fetch) traversing the shaped veth.
+round-trip (join, get_providers, get_closest_peers, /nar/4 fetch) traversing the shaped veth.
 
 TWO deliverables, one harness:
 

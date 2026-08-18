@@ -9,7 +9,7 @@
 #
 # TOPOLOGY (the whole point): BOOTSTRAP (B) and PROVIDER (P) live in ns A; CONSUMER (C)
 # lives in ns B. So B<->P is unshaped (same ns), but EVERY C round-trip - join, kad
-# get_providers, kad get_closest_peers (locate), and the /nar/3 fetch - crosses the shaped
+# get_providers, kad get_closest_peers (locate), and the /nar/4 fetch - crosses the shaped
 # veth. C is told ONLY B's address (AC#9: discovery must be genuinely kad).
 #
 # Emits the machine-parseable lines `scripts/shaped_kad.py` consumes:

@@ -327,6 +327,14 @@ pub enum TransferError {
         expected: Blake3Digest,
         actual: Blake3Digest,
     },
+    /// Bao proof/leaf authentication failed against the requested identity.
+    /// Unlike [`Self::IntegrityMismatch`], no alternate whole-object digest is
+    /// available or fabricated: the verifier rejected a specific authenticated
+    /// tree step before exposing that leaf.
+    AuthenticationFailed {
+        expected: Blake3Digest,
+        reason: String,
+    },
     /// The offer handed to this transport is not the variant it services (a
     /// registry-dispatch bug; guarded defensively).
     WrongOffer {
@@ -336,9 +344,12 @@ pub enum TransferError {
     /// A transport-specific failure (dial refused, timeout, reset): this holder is
     /// unusable, try the next offer.
     Unavailable(String),
-    /// The size abort: the holder streamed MORE than the signed NarSize bound
-    /// (uncompressed raw NAR, NEVER the compressed FileSize). A deliberate abort of
-    /// a lying claim, not a "try the next holder" signal.
+    /// The size abort, always in uncompressed raw-NAR bytes (NEVER compressed
+    /// FileSize). Legacy streaming carriers set `streamed` to the cumulative
+    /// count that crossed `limit`; `/nar/4` rejects an oversized declared
+    /// `raw_size` before reading its body and sets `streamed` to that rejected
+    /// declaration. A deliberate abort of a lying claim, not a "try the next
+    /// holder" signal.
     TooLarge { limit: u64, streamed: u64 },
 }
 
@@ -350,6 +361,10 @@ impl std::fmt::Display for TransferError {
                 f,
                 "transport-integrity gate failed: got bytes hashing to {actual}, expected {expected}"
             ),
+            TransferError::AuthenticationFailed { expected, reason } => write!(
+                f,
+                "transport Bao authentication failed against {expected}: {reason}"
+            ),
             TransferError::WrongOffer { expected, got } => {
                 write!(
                     f,
@@ -359,7 +374,7 @@ impl std::fmt::Display for TransferError {
             TransferError::Unavailable(why) => write!(f, "transport unavailable: {why}"),
             TransferError::TooLarge { limit, streamed } => write!(
                 f,
-                "size abort: holder streamed {streamed} bytes, over the signed NarSize bound {limit}"
+                "size abort: transfer reported {streamed} raw bytes, over the signed NarSize bound {limit}"
             ),
         }
     }
@@ -386,10 +401,11 @@ pub trait NarTransfer: Send + Sync {
     /// bytes. Time-bounded by `envelope`; size-bounded by `expected_size` (the
     /// signed NarSize from the record/claim - UNCOMPRESSED raw-NAR bytes, NEVER the
     /// compressed FileSize; `None` when no signed bound is known, e.g. a cold-start
-    /// fallback). The size abort ([`TransferError::TooLarge`]) fires DURING the
-    /// stream the instant cumulative bytes exceed `expected_size`, never post-hoc -
-    /// which is why the bound is a per-call INPUT and not construction config. Its
-    /// absence in an earlier draft left `TransferError::TooLarge.limit` unsourced.
+    /// fallback). A legacy streaming carrier fires [`TransferError::TooLarge`]
+    /// when its cumulative raw bytes cross `expected_size`; `/nar/4` compares
+    /// the header's declared `raw_size` first and rejects before body allocation,
+    /// with `streamed` carrying that declaration. In both cases the per-call
+    /// signed bound is enforced before a whole oversized NAR can be buffered.
     async fn fetch(
         &self,
         content: &Blake3Digest,

@@ -15,12 +15,17 @@ resolver = "3"
 # Both are shared only AMONG the daemon's own components; testproxy shares nothing
 # with either, so `just independence` stays green.
 members = ["daemon", "daemon-core", "daemon-libp2p", "fabric-iroh", "fabric-libp2p", "peer-fabric", "proc-supervisor", "testproxy", "vendor/libp2p-stream"]
+# Iroh is a crates.io patch used by production, but not a workspace member:
+# its upstream integration suite reaches staging DNS/relays and Linux network
+# namespaces. Canonical gates exercise our focused vendored regression explicitly.
+exclude = ["vendor/iroh"]
 
 # TASK-219: crates.io libp2p-stream 0.4.0-alpha chooses a random connection for a peer and exposes
 # no exact-ConnectionId stream-open API. The tiny upstream crate is vendored verbatim (MIT,
 # provenance in vendor/libp2p-stream/README.md) with a narrow exact-open method and matching
 # sender cleanup so a signature-authorized route cannot be substituted or reused after closure.
 [patch.crates-io]
+iroh = { path = "vendor/iroh" }
 libp2p-stream = { path = "vendor/libp2p-stream" }
 
 [workspace.package]

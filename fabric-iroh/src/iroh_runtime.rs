@@ -1069,8 +1069,11 @@ impl IrohNodeRuntime {
             supervisor.abort_active()?;
             for task in &tasks {
                 // Keep the registry manager alive so it can join and account
-                // for the active tasks whose abort was just requested.
-                if task.name != "owned-task-registry" {
+                // for the active tasks whose abort was just requested. Keep
+                // the endpoint-close waiter alive too: Endpoint::close is the
+                // fixed-port release barrier, and a Forced result is honest
+                // only after that barrier completes.
+                if task.name != "owned-task-registry" && task.name != "endpoint-close" {
                     task.join.abort();
                 }
             }
@@ -1094,6 +1097,10 @@ impl IrohNodeRuntime {
                     task_errors.push(format!(
                         "absolute shutdown deadline expired with tasks={task_names:?}, active_tasks={active_tasks}, process_jobs={process_labels:?}"
                     ));
+                    // The detached Iroh close driver remains alive even when
+                    // this public waiter is finally abandoned. Returning an
+                    // error is mandatory: this shutdown did not prove that the
+                    // fixed port was restart-safe by the absolute deadline.
                     for task in &tasks {
                         task.join.abort();
                     }
@@ -1108,10 +1115,10 @@ impl IrohNodeRuntime {
             eprintln!("IROH-OWNED-TASK-SHUTDOWN-FAILED {error}");
         }
         // The router has closed (or been aborted). Dropping the runtime's final
-        // strong owner makes surviving provider/fetch weak handles inert and
-        // releases the UDP sockets even if application objects outlive us.
+        // strong owner leaves surviving provider/fetch weak handles inert. The
+        // awaited Endpoint close above is the socket-release barrier, including
+        // when application endpoint clones outlive this runtime owner.
         self.owner.take();
-        tokio::task::yield_now().await;
         let mut failures = router_failures
             .lock()
             .map_err(|_| IrohRuntimeError::Shutdown("router-failure mutex poisoned".into()))?

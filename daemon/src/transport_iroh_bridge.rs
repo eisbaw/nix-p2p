@@ -16,7 +16,9 @@
 //! converts the wire offer to a seam [`TransportOffer`](peer_fabric::TransportOffer), hands the
 //! transport's configured envelope through [`IrohTransport::seam_envelope`], delegates to the
 //! native [`NarTransfer::fetch`], and maps the seam [`TransferError`] back to the daemon
-//! [`TransportError`] (the two enums are variant-for-variant identical).
+//! [`TransportError`]. The older daemon error type has no structured Bao-authentication
+//! variant; that one mapping is intentionally flattened to fail-closed `Unavailable` until
+//! TASK-144 removes this bridge.
 //!
 //! Retiring this bridge entirely - moving the daemon fetch path onto a PeerFabric
 //! `IrohNarSource`, as `daemon_core::PeerFabricNarSource` already does for libp2p - is TASK-144.
@@ -53,15 +55,25 @@ impl Transport for IrohTransport {
     }
 }
 
-/// Map the seam [`TransferError`] to the daemon [`TransportError`]. The two enums are
-/// variant-for-variant identical (same names, fields and `Display`); this is the mechanical
-/// bridge that lets the seam-native fetch core report through the daemon trait until the
-/// daemon fetch path itself adopts `NarTransfer` (TASK-144).
+/// Map the seam [`TransferError`] to the older daemon [`TransportError`]. Most
+/// variants retain their structure. The daemon enum predates Bao and cannot
+/// represent [`TransferError::AuthenticationFailed`], so that case is
+/// deliberately flattened to `Unavailable`: it remains fail closed and eligible
+/// for trying another holder, but loses structured authentication attribution at
+/// this legacy boundary. TASK-144 removes the boundary instead of duplicating a
+/// second evolving error model.
 fn transfer_error_to_transport_error(error: TransferError) -> TransportError {
     match error {
         TransferError::NotHeld(id) => TransportError::NotHeld(id),
         TransferError::IntegrityMismatch { expected, actual } => {
             TransportError::IntegrityMismatch { expected, actual }
+        }
+        TransferError::AuthenticationFailed { expected, reason } => {
+            // Intentional information loss: `TransportError` has no Bao-auth
+            // variant. Keep the full context in the message and fail closed.
+            TransportError::Unavailable(format!(
+                "transport Bao authentication failed against {expected}: {reason}"
+            ))
         }
         TransferError::WrongOffer { expected, got } => TransportError::WrongOffer { expected, got },
         TransferError::Unavailable(why) => TransportError::Unavailable(why),

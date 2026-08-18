@@ -6,7 +6,7 @@ loopback or unshaped netns routing (TASK-103 discovery, TASK-179 routed netns,
 TASK-194 store-supply, the two-node `nar_transport.rs`), so the fetch-over-a-
 realistic-link half is unproven for the libp2p-primary path the way TASK-94/99's
 shaped links proved it for compression. This closes that credibility residual: it
-runs the REAL libp2p `discover->fetch->serve` (`/nar/3` raw-stream, BLAKE3-verified)
+runs the REAL libp2p `discover->fetch->serve` (`/nar/4`, Bao-authenticated)
 BETWEEN two swarm nodes whose kad/stream traffic traverses a `tc netem`-shaped
 `veth` pair (real RTT + bandwidth cap), and proves the fetched NAR is BYTE-IDENTICAL
 over that shaped link -- not secretly loopback.

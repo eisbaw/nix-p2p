@@ -300,6 +300,94 @@ pub struct SupervisedProcessOutput {
     pub stdout_exceeded_limit: bool,
 }
 
+/// Terminal record for a bounded stdout-streaming subprocess. Stdout bytes are
+/// delivered incrementally by [`SupervisedProcessStream::next_chunk`]; this
+/// record is separate so pipe EOF is never mistaken for a successful exit.
+#[derive(Debug)]
+pub struct SupervisedProcessCompletion {
+    pub status: ExitStatus,
+    pub stderr: Vec<u8>,
+    pub stdout_exceeded_limit: bool,
+    pub stdout_bytes_read: usize,
+}
+
+/// Cancellation-safe subprocess stdout with one queued 64-KiB chunk.
+///
+/// Dropping the stream closes its receiver capabilities. The registered worker
+/// then kills and reaps the owned process group. Callers must observe stdout EOF
+/// before asking for the terminal completion record.
+pub struct SupervisedProcessStream {
+    stdout: mpsc::Receiver<Vec<u8>>,
+    completion: oneshot::Receiver<Result<SupervisedProcessCompletion, SupervisorError>>,
+    cancel: Option<oneshot::Sender<()>>,
+    cleanup: ProcessCleanupTicket,
+    stdout_finished: bool,
+}
+
+/// Cloneable control/observation capability for one exact supervised process
+/// group. It carries no output and cannot detach ownership: cancellation is
+/// idempotent, and `wait_reaped` resolves only after the dedicated worker has
+/// published child-free completion.
+#[derive(Clone)]
+pub struct ProcessCleanupTicket {
+    cancel: watch::Sender<bool>,
+    reaped: watch::Receiver<bool>,
+}
+
+impl ProcessCleanupTicket {
+    pub fn cancel(&self) {
+        self.cancel.send_replace(true);
+    }
+
+    pub async fn wait_reaped(&self) -> Result<(), SupervisorError> {
+        let mut reaped = self.reaped.clone();
+        if *reaped.borrow() {
+            return Ok(());
+        }
+        reaped.wait_for(|complete| *complete).await.map_err(|_| {
+            SupervisorError::Poisoned(
+                "per-process cleanup ticket closed before reap completion".to_owned(),
+            )
+        })?;
+        Ok(())
+    }
+}
+
+impl SupervisedProcessStream {
+    pub fn cleanup_ticket(&self) -> ProcessCleanupTicket {
+        self.cleanup.clone()
+    }
+
+    pub async fn next_chunk(&mut self) -> Option<Vec<u8>> {
+        let chunk = self.stdout.recv().await;
+        if chunk.is_none() {
+            self.stdout_finished = true;
+        }
+        chunk
+    }
+
+    pub async fn finish(self) -> Result<SupervisedProcessCompletion, SupervisorError> {
+        if !self.stdout_finished {
+            return Err(SupervisorError::Poisoned(
+                "streaming process completion requested before stdout EOF".to_owned(),
+            ));
+        }
+        self.completion.await.map_err(|_| SupervisorError::Closed)?
+    }
+
+    /// Request cancellation and wait until the process worker has killed and
+    /// reaped the complete group. The terminal result is normally `Closed`;
+    /// completion of this future, not its value, is the cleanup proof.
+    pub async fn cancel_and_wait(mut self) -> Result<(), SupervisorError> {
+        self.stdout.close();
+        if let Some(cancel) = self.cancel.take() {
+            let _ = cancel.send(());
+        }
+        let _ = self.completion.await.map_err(|_| SupervisorError::Closed)?;
+        Ok(())
+    }
+}
+
 async fn wait_for_supervisor_cancel(mut cancelled: watch::Receiver<bool>) {
     if *cancelled.borrow() {
         return;
@@ -596,5 +684,238 @@ impl TaskSupervisorHandle {
             false,
         )?;
         result_rx.await.map_err(|_| SupervisorError::Closed)?
+    }
+
+    /// Start one killable subprocess and expose stdout through a one-chunk
+    /// bounded stream. A slow reader backpressures the child pipe while the
+    /// process-group worker continues servicing stderr, cancellation, and exit.
+    pub fn stream_process(
+        &self,
+        name: impl Into<String>,
+        program: PathBuf,
+        args: Vec<OsString>,
+        environment: Vec<(OsString, OsString)>,
+        stdout_limit: usize,
+    ) -> Result<SupervisedProcessStream, SupervisorError> {
+        let inner = self.inner.upgrade().ok_or(SupervisorError::Closed)?;
+        if inner.closing.load(Ordering::Acquire) {
+            return Err(SupervisorError::Closed);
+        }
+        let cancelled = inner.cancel.subscribe();
+        let process_jobs = inner.process_jobs.clone();
+        let supervisor_inner = Arc::downgrade(&inner);
+        let (stdout_tx, stdout_rx) = mpsc::channel(1);
+        let (mut completion_tx, completion_rx) = oneshot::channel();
+        let (cancel_tx, mut cancel_rx) = oneshot::channel();
+        let (cleanup_cancel_tx, mut cleanup_cancel_rx) = watch::channel(false);
+        let (reaped_tx, reaped_rx) = watch::channel(false);
+
+        self.spawn_inner(
+            name.into(),
+            async move {
+                let result = async {
+                    let job = match process_jobs.start_streaming(
+                            format!("{} (supervised streaming supplier)", program.display()),
+                            ProcessJobSpec {
+                                program: program.clone(),
+                                args,
+                                environment,
+                                stdout_limit: Some(stdout_limit),
+                                stderr_limit: 64 * 1024,
+                            },
+                            stdout_tx,
+                        ) {
+                        Ok(job) => job,
+                        Err(error) => {
+                            reaped_tx.send_replace(true);
+                            return Err(SupervisorError::Poisoned(format!(
+                                "starting supervised streaming process {}: {error}",
+                                program.display()
+                            )));
+                        }
+                    };
+                    if supervisor_inner
+                        .upgrade()
+                        .is_none_or(|inner| inner.closing.load(Ordering::Acquire))
+                    {
+                        job.cancel();
+                    }
+                    let cancellation = wait_for_supervisor_cancel(cancelled);
+                    let caller_closed = completion_tx.closed();
+                    tokio::pin!(cancellation, caller_closed);
+                    let mut cancelled_or_abandoned = false;
+                    let output = loop {
+                        if let Some(result) = job.try_take_result() {
+                            break result;
+                        }
+                        tokio::select! {
+                            () = &mut cancellation, if !cancelled_or_abandoned => {
+                                cancelled_or_abandoned = true;
+                                job.cancel();
+                            }
+                            () = &mut caller_closed, if !cancelled_or_abandoned => {
+                                cancelled_or_abandoned = true;
+                                job.cancel();
+                            }
+                            _ = &mut cancel_rx, if !cancelled_or_abandoned => {
+                                cancelled_or_abandoned = true;
+                                job.cancel();
+                            }
+                            result = cleanup_cancel_rx.wait_for(|cancel| *cancel), if !cancelled_or_abandoned => {
+                                let _ = result;
+                                cancelled_or_abandoned = true;
+                                job.cancel();
+                            }
+                            () = tokio::time::sleep(Duration::from_millis(1)) => {}
+                        }
+                    };
+                    reaped_tx.send_replace(true);
+                    let output = output.map_err(|error| {
+                        SupervisorError::Poisoned(format!(
+                            "supervised streaming process {} failed: {error}",
+                            program.display()
+                        ))
+                    })?;
+
+                    if cancelled_or_abandoned {
+                        return Err(SupervisorError::Closed);
+                    }
+                    Ok(SupervisedProcessCompletion {
+                        status: output.status,
+                        stderr: output.stderr,
+                        stdout_exceeded_limit: output.stdout_exceeded_limit,
+                        stdout_bytes_read: output.stdout_bytes_read,
+                    })
+                }
+                .await;
+                let _ = completion_tx.send(result);
+            },
+            false,
+        )?;
+
+        Ok(SupervisedProcessStream {
+            stdout: stdout_rx,
+            completion: completion_rx,
+            cancel: Some(cancel_tx),
+            cleanup: ProcessCleanupTicket {
+                cancel: cleanup_cancel_tx,
+                reaped: reaped_rx,
+            },
+            stdout_finished: false,
+        })
+    }
+}
+
+#[cfg(test)]
+mod streaming_process_tests {
+    use super::*;
+
+    async fn run_stream(
+        script: &str,
+        stdout_limit: usize,
+    ) -> (Vec<u8>, SupervisedProcessCompletion) {
+        tokio::time::timeout(Duration::from_secs(3), async {
+            let supervisor = TaskSupervisor::new();
+            let mut stream = supervisor
+                .handle()
+                .stream_process(
+                    "stream-accounting-test",
+                    PathBuf::from("sh"),
+                    vec![OsString::from("-c"), OsString::from(script)],
+                    Vec::new(),
+                    stdout_limit,
+                )
+                .unwrap();
+            let mut stdout = Vec::new();
+            while let Some(chunk) = stream.next_chunk().await {
+                stdout.extend_from_slice(&chunk);
+            }
+            let completion = stream.finish().await.unwrap();
+            (stdout, completion)
+        })
+        .await
+        .expect("streaming process and terminal accounting must stay bounded")
+    }
+
+    #[tokio::test]
+    async fn streaming_process_distinguishes_exact_from_exact_plus_one() {
+        let (exact, completion) = run_stream("head -c 65536 /dev/zero", 65536).await;
+        assert_eq!(exact.len(), 65536);
+        assert_eq!(completion.stdout_bytes_read, 65536);
+        assert!(!completion.stdout_exceeded_limit);
+        assert!(completion.status.success());
+
+        let (over, completion) = run_stream("head -c 65537 /dev/zero", 65536).await;
+        assert_eq!(over.len(), 65536, "the crossing byte is never exposed");
+        assert_eq!(completion.stdout_bytes_read, 65537);
+        assert!(completion.stdout_exceeded_limit);
+    }
+
+    #[tokio::test]
+    async fn streaming_process_reports_nonzero_after_exact_stdout() {
+        let (stdout, completion) = run_stream("printf abc; exit 7", 3).await;
+        assert_eq!(stdout, b"abc");
+        assert_eq!(completion.stdout_bytes_read, 3);
+        assert!(!completion.stdout_exceeded_limit);
+        assert_eq!(completion.status.code(), Some(7));
+    }
+
+    #[tokio::test]
+    async fn cleanup_ticket_reaps_while_stdout_is_full_and_stderr_progresses() {
+        let marker = std::env::temp_dir().join(format!(
+            "nix-p2p-stream-stderr-progress-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_file(&marker);
+        let supervisor = TaskSupervisor::new();
+        let script = "(dd if=/dev/zero bs=65536 count=64 2>/dev/null) & \
+                      dd if=/dev/zero bs=65536 count=8 1>&2 2>/dev/null; \
+                      touch \"$1\"; wait";
+        let stream = supervisor
+            .handle()
+            .stream_process(
+                "stream-stderr-progress-test",
+                PathBuf::from("sh"),
+                vec![
+                    OsString::from("-c"),
+                    OsString::from(script),
+                    OsString::from("stream-stderr-progress-test"),
+                    marker.clone().into_os_string(),
+                ],
+                Vec::new(),
+                1024 * 1024,
+            )
+            .unwrap();
+        let ticket = stream.cleanup_ticket();
+
+        tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                if stream.stdout.len() == stream.stdout.max_capacity() && marker.exists() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .expect("stderr drained to progress while the stdout channel stayed full");
+
+        ticket.cancel();
+        tokio::time::timeout(Duration::from_secs(3), ticket.wait_reaped())
+            .await
+            .expect("cleanup ticket has a bounded reap tail")
+            .expect("cleanup ticket observes exact child-free completion");
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while supervisor.process_jobs().active_len() != 0 {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .expect("child-free job is removed from the registry after result publication");
+        drop(stream);
+        let _ = std::fs::remove_file(marker);
     }
 }

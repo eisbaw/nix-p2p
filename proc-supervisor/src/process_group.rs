@@ -25,6 +25,7 @@ use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::time::Duration;
 
 use rustix::process::{Pid, Signal, WaitOptions};
+use tokio::sync::mpsc;
 
 static JOB_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 
@@ -75,6 +76,19 @@ pub struct ProcessJobOutput {
     pub stdout: Vec<u8>,
     pub stderr: Vec<u8>,
     pub stdout_exceeded_limit: bool,
+    /// Number of stdout bytes observed, saturated at `stdout_limit + 1` when a
+    /// limit is configured. This remains meaningful for streaming jobs, whose
+    /// stdout is deliberately not retained in [`Self::stdout`].
+    pub stdout_bytes_read: usize,
+}
+
+enum StdoutMode {
+    Retain,
+    /// Send at most one 64-KiB chunk at a time. The worker uses `try_send` and
+    /// retains one pending chunk while continuing to drain stderr and poll
+    /// cancellation/child exit, so a slow consumer cannot deadlock the sole
+    /// process-group supervision loop.
+    Stream(mpsc::Sender<Vec<u8>>),
 }
 
 /// Enable process-global child adoption before any worker is allowed to spawn.
@@ -106,6 +120,8 @@ struct ProcessJobControl {
     launch: Mutex<LaunchState>,
     completion: Mutex<CompletionState>,
     completion_changed: Condvar,
+    #[cfg(test)]
+    stream_backpressured: std::sync::atomic::AtomicBool,
 }
 
 impl ProcessJobControl {
@@ -157,7 +173,39 @@ impl ProcessJobRegistry {
         label: impl Into<String>,
         spec: ProcessJobSpec,
     ) -> Result<ProcessJob, ProcessJobError> {
-        let result = ProcessJob::start(label.into(), spec, Some(Arc::clone(&self.inner)));
+        let result = ProcessJob::start(
+            label.into(),
+            spec,
+            StdoutMode::Retain,
+            Some(Arc::clone(&self.inner)),
+        );
+        if let Err(error) = &result
+            && error.report_to_registry
+        {
+            match self.inner.failures.lock() {
+                Ok(mut failures) => failures.record(error.to_string()),
+                Err(poisoned) => poisoned.into_inner().record(error.to_string()),
+            }
+        }
+        result
+    }
+
+    /// Start a job whose stdout is delivered through a bounded channel instead
+    /// of retained in memory. Closing `stdout` cancels and reaps the process
+    /// group. The receiver capacity is chosen by the caller; the worker itself
+    /// never accumulates more than one additional pending 64-KiB chunk.
+    pub fn start_streaming(
+        &self,
+        label: impl Into<String>,
+        spec: ProcessJobSpec,
+        stdout: mpsc::Sender<Vec<u8>>,
+    ) -> Result<ProcessJob, ProcessJobError> {
+        let result = ProcessJob::start(
+            label.into(),
+            spec,
+            StdoutMode::Stream(stdout),
+            Some(Arc::clone(&self.inner)),
+        );
         if let Err(error) = &result
             && error.report_to_registry
         {
@@ -221,12 +269,13 @@ impl ProcessJob {
         label: impl Into<String>,
         spec: ProcessJobSpec,
     ) -> Result<Self, ProcessJobError> {
-        Self::start(label.into(), spec, None)
+        Self::start(label.into(), spec, StdoutMode::Retain, None)
     }
 
     fn start(
         label: String,
         spec: ProcessJobSpec,
+        stdout_mode: StdoutMode,
         registry: Option<Arc<ProcessJobRegistryInner>>,
     ) -> Result<Self, ProcessJobError> {
         ensure_child_subreaper()?;
@@ -237,6 +286,8 @@ impl ProcessJob {
             launch: Mutex::new(LaunchState::default()),
             completion: Mutex::new(CompletionState { result: None }),
             completion_changed: Condvar::new(),
+            #[cfg(test)]
+            stream_backpressured: std::sync::atomic::AtomicBool::new(false),
         });
         if let Some(registry) = registry.as_ref() {
             registry
@@ -249,7 +300,7 @@ impl ProcessJob {
         let worker_registry = registry.clone();
         if let Err(error) = std::thread::Builder::new()
             .name(format!("nix-p2p-process-{id}"))
-            .spawn(move || run_worker(worker_control, spec, worker_registry))
+            .spawn(move || run_worker(worker_control, spec, stdout_mode, worker_registry))
         {
             if let Some(registry) = registry.as_ref()
                 && let Ok(mut jobs) = registry.jobs.lock()
@@ -499,10 +550,11 @@ fn maybe_panic_after_spawn(label: &str) {
 fn run_worker(
     control: Arc<ProcessJobControl>,
     spec: ProcessJobSpec,
+    stdout_mode: StdoutMode,
     registry: Option<Arc<ProcessJobRegistryInner>>,
 ) {
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        run_worker_inner(&control, spec)
+        run_worker_inner(&control, spec, stdout_mode)
     }))
     .unwrap_or_else(|panic| {
         let detail = panic_detail(panic.as_ref());
@@ -549,6 +601,7 @@ fn run_worker(
 fn run_worker_inner(
     control: &Arc<ProcessJobControl>,
     spec: ProcessJobSpec,
+    stdout_mode: StdoutMode,
 ) -> Result<ProcessJobOutput, ProcessJobError> {
     let mut command = std::process::Command::new(&spec.program);
     command
@@ -593,7 +646,7 @@ fn run_worker_inner(
     match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         #[cfg(test)]
         maybe_panic_after_spawn(&control.label);
-        supervise_owned_process_group(control, spec, &mut owned)
+        supervise_owned_process_group(control, spec, stdout_mode, &mut owned)
     })) {
         Ok(result) => result,
         Err(panic) => {
@@ -613,6 +666,7 @@ fn run_worker_inner(
 fn supervise_owned_process_group(
     control: &Arc<ProcessJobControl>,
     spec: ProcessJobSpec,
+    stdout_mode: StdoutMode,
     owned: &mut OwnedProcessGroup,
 ) -> Result<ProcessJobOutput, ProcessJobError> {
     let pgid = owned.pgid;
@@ -643,12 +697,88 @@ fn supervise_owned_process_group(
     }
 
     let mut stdout_bytes = Vec::new();
+    let mut stdout_bytes_read = 0usize;
     let mut stderr_bytes = Vec::new();
     let mut stdout_exceeded_limit = false;
+    let mut pending_stdout = None;
+    let stdout_sender = match stdout_mode {
+        StdoutMode::Retain => None,
+        StdoutMode::Stream(sender) => Some(sender),
+    };
+    // Reused across every WouldBlock poll. A fresh allocation is needed only
+    // when an actual chunk transfers ownership into the bounded channel.
+    let mut stdout_scratch = stdout_sender.as_ref().map(|_| vec![0u8; 64 * 1024]);
     let mut kill_sent = false;
 
     loop {
-        if let Some(pipe) = stdout.as_mut() {
+        // Cancellation must not depend on a streaming consumer making room.
+        // Discard the one bounded pending chunk and close our stdout pipe before
+        // trying the channel again; otherwise a cleanup-ticket/supervisor cancel
+        // can leave the worker retrying `Full` forever after the child is dead.
+        if control.is_cancelled() {
+            pending_stdout = None;
+            stdout = None;
+        }
+        if let Some(sender) = stdout_sender.as_ref() {
+            if let Some(chunk) = pending_stdout.take() {
+                match sender.try_send(chunk) {
+                    Ok(()) => {}
+                    Err(mpsc::error::TrySendError::Full(chunk)) => {
+                        #[cfg(test)]
+                        control.stream_backpressured.store(true, Ordering::Release);
+                        pending_stdout = Some(chunk);
+                    }
+                    Err(mpsc::error::TrySendError::Closed(_chunk)) => {
+                        stdout = None;
+                        control.cancel();
+                    }
+                }
+            }
+            // Read only when the previous chunk has been accepted. This is the
+            // process-pipe backpressure point; stderr/cancel/wait handling below
+            // continues even while `pending_stdout` occupies the one slot.
+            if pending_stdout.is_none()
+                && let Some(pipe) = stdout.as_mut()
+            {
+                let scratch = stdout_scratch
+                    .as_mut()
+                    .expect("streaming stdout always has one reusable scratch buffer");
+                match pipe.read(scratch) {
+                    Ok(0) => stdout = None,
+                    Ok(read) => {
+                        let previous = stdout_bytes_read;
+                        stdout_bytes_read = match spec.stdout_limit {
+                            Some(limit) => {
+                                previous.saturating_add(read).min(limit.saturating_add(1))
+                            }
+                            None => previous.saturating_add(read),
+                        };
+                        let allowed = spec
+                            .stdout_limit
+                            .map(|limit| limit.saturating_sub(previous))
+                            .unwrap_or(read)
+                            .min(read);
+                        if allowed != 0 {
+                            let mut chunk = std::mem::replace(scratch, vec![0u8; 64 * 1024]);
+                            chunk.truncate(allowed);
+                            pending_stdout = Some(chunk);
+                        }
+                        if allowed != read {
+                            stdout_exceeded_limit = true;
+                            stdout = None;
+                            control.cancel();
+                        }
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
+                    Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+                    Err(error) => {
+                        failures.record(format!("reading subprocess stdout: {error}"));
+                        stdout = None;
+                        control.cancel();
+                    }
+                }
+            }
+        } else if let Some(pipe) = stdout.as_mut() {
             match drain_pipe(pipe, &mut stdout_bytes, spec.stdout_limit, true) {
                 Ok(DrainState::Open) => {}
                 Ok(DrainState::Eof) => stdout = None,
@@ -663,6 +793,7 @@ fn supervise_owned_process_group(
                     control.cancel();
                 }
             }
+            stdout_bytes_read = stdout_bytes.len();
         }
         if let Some(pipe) = stderr.as_mut() {
             match drain_pipe(pipe, &mut stderr_bytes, Some(spec.stderr_limit), false) {
@@ -712,6 +843,7 @@ fn supervise_owned_process_group(
         if owned.direct_status.is_some()
             && owned.descendants_reaped
             && stdout.is_none()
+            && pending_stdout.is_none()
             && stderr.is_none()
         {
             break;
@@ -732,6 +864,7 @@ fn supervise_owned_process_group(
         stdout: stdout_bytes,
         stderr: stderr_bytes,
         stdout_exceeded_limit,
+        stdout_bytes_read,
     })
 }
 
@@ -808,6 +941,61 @@ fn reap_descendants_once(pgid: Pid) -> Result<bool, ProcessJobError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cancellation_reaps_with_a_full_stream_receiver() {
+        let registry = ProcessJobRegistry::default();
+        let (stdout_tx, held_full_receiver) = mpsc::channel(1);
+        let job = registry
+            .start_streaming(
+                "full-stream-cancel-regression",
+                ProcessJobSpec {
+                    program: PathBuf::from("sh"),
+                    args: vec![
+                        OsString::from("-c"),
+                        OsString::from("dd if=/dev/zero bs=65536 count=8 2>/dev/null; sleep 60"),
+                    ],
+                    environment: Vec::new(),
+                    stdout_limit: Some(1024 * 1024),
+                    stderr_limit: 1024,
+                },
+                stdout_tx,
+            )
+            .expect("start streaming process");
+
+        // Keep the receiver alive but deliberately never drain it. Prove both
+        // preconditions rather than sleeping and hoping: the channel is full,
+        // and the worker has hit `TrySendError::Full` while retaining its one
+        // permitted pending chunk.
+        let full_deadline = std::time::Instant::now() + Duration::from_secs(2);
+        while held_full_receiver.len() != held_full_receiver.max_capacity()
+            || !job.control.stream_backpressured.load(Ordering::Acquire)
+        {
+            assert!(
+                std::time::Instant::now() < full_deadline,
+                "stream did not reach a proven full+pending state"
+            );
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        job.cancel();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = done_tx.send(job.wait());
+        });
+        let result = done_rx
+            .recv_timeout(Duration::from_secs(3))
+            .expect("cancellation must reap despite the full retained receiver");
+        let output = result.expect("SIGKILL cleanup itself remains operational");
+        assert!(
+            !output.status.success(),
+            "cancelled child must not report success"
+        );
+        assert_eq!(
+            registry.active_len(),
+            0,
+            "child-free job unregisters exactly once"
+        );
+    }
 
     #[test]
     fn post_spawn_panic_reaps_child_and_grandchild_before_unregistering() {

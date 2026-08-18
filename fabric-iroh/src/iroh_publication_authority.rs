@@ -270,7 +270,7 @@ struct AuthorityAnchorEnvelope {
 struct AuthorityStateStore {
     state_dir: PathBuf,
     dirfd: rustix::fd::OwnedFd,
-    _lock: rustix::fd::OwnedFd,
+    _lock: AuthorityStateLock,
     #[cfg(test)]
     fail_next_write: std::sync::atomic::AtomicBool,
     #[cfg(test)]
@@ -278,6 +278,53 @@ struct AuthorityStateStore {
     #[cfg(test)]
     successful_writes: AtomicU64,
     poisoned: std::sync::atomic::AtomicBool,
+}
+
+/// RAII owner for the authority-state advisory lock.
+///
+/// The explicit unlock is load-bearing: closing one descriptor does not release
+/// an `flock` while a forked or duplicated descriptor still refers to the same
+/// open-file description.
+struct AuthorityStateLock {
+    fd: rustix::fd::OwnedFd,
+    path: PathBuf,
+    locked: std::sync::atomic::AtomicBool,
+}
+
+impl AuthorityStateLock {
+    fn new(fd: rustix::fd::OwnedFd, path: PathBuf) -> Self {
+        Self {
+            fd,
+            path,
+            locked: std::sync::atomic::AtomicBool::new(true),
+        }
+    }
+
+    fn unlock(&self) -> Result<(), rustix::io::Errno> {
+        if self
+            .locked
+            .compare_exchange(true, false, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return Ok(());
+        }
+        if let Err(error) = fs::flock(&self.fd, FlockOperation::Unlock) {
+            self.locked.store(true, Ordering::Release);
+            return Err(error);
+        }
+        Ok(())
+    }
+}
+
+impl Drop for AuthorityStateLock {
+    fn drop(&mut self) {
+        if let Err(error) = self.unlock() {
+            eprintln!(
+                "IROH-PUBLICATION-AUTHORITY-LOCK-RELEASE-FAILED path={} error={error}",
+                self.path.display()
+            );
+        }
+    }
 }
 
 impl AuthorityStateStore {
@@ -338,7 +385,7 @@ impl AuthorityStateStore {
         let store = Self {
             state_dir: config.state_dir.clone(),
             dirfd,
-            _lock: lock,
+            _lock: AuthorityStateLock::new(lock, config.state_dir.join(AUTHORITY_LOCK_FILENAME)),
             #[cfg(test)]
             fail_next_write: std::sync::atomic::AtomicBool::new(false),
             #[cfg(test)]

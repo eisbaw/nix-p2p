@@ -72,7 +72,7 @@ fn main() {
 
     let mut out = String::new();
     out.push_str("{\n");
-    out.push_str("  \"harness\": \"peer_fabric::compress_zstd + BoundedZstdDecoder (the shipped /nar/3 codec)\",\n");
+    out.push_str("  \"harness\": \"peer_fabric::compress_zstd + BoundedZstdDecoder (the then-shipped /nar/3 codec; current /nar/4 uses independently framed leaves)\",\n");
     out.push_str("  \"cpu_ns_note\": \"min wall-ns of single-threaded runs on an idle core; a proxy for CPU-ns\",\n");
     out.push_str(&format!("  \"default_level\": {DEFAULT_ZSTD_LEVEL},\n"));
     out.push_str("  \"files\": [\n");

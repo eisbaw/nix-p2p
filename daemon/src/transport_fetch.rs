@@ -136,12 +136,11 @@ pub enum TransportError {
     /// A transport-specific failure (dial refused, timeout, reset). Real backends
     /// (task-39) produce this; it means "this holder is unusable, try the next".
     Unavailable(String),
-    /// The risk-6 SIZE ABORT (task-51): the holder streamed MORE than the signed
-    /// NarSize bound. `streamed` is the byte count when the cap tripped (at least
-    /// `limit`): a lower bound on the true blob size, since the stream is aborted
-    /// early rather than drained. The bound is the SIGNED NarSize (uncompressed raw
-    /// NAR),
-    /// NEVER the compressed FileSize (the unit trap). Unlike [`Self::Unavailable`],
+    /// The risk-6 SIZE ABORT (task-51). `streamed` is a carrier-neutral raw-byte report:
+    /// a legacy streaming carrier reports its cumulative raw bytes when they cross the
+    /// limit, while `/nar/4` reports the rejected declared `raw_size` before reading its
+    /// body. Both values and `limit` are in uncompressed `RawNarV1` bytes (the signed
+    /// NarSize), NEVER compressed FileSize. Unlike [`Self::Unavailable`],
     /// this is a DELIBERATE abort of a lying claim, not a "try the next holder"
     /// signal: every offer in the claim addresses the SAME oversized BLAKE3, so the
     /// driver short-circuits it (see [`fetch_via_offers`]) into a propagating
@@ -164,7 +163,7 @@ impl fmt::Display for TransportError {
             TransportError::Unavailable(why) => write!(f, "transport unavailable: {why}"),
             TransportError::TooLarge { limit, streamed } => write!(
                 f,
-                "size abort: holder streamed {streamed} bytes, over the signed NarSize bound {limit}"
+                "size abort: transfer reported {streamed} raw bytes, over the signed NarSize bound {limit}"
             ),
         }
     }
@@ -185,8 +184,9 @@ pub enum FetchError {
         skipped: Vec<TransportTag>,
         failed: Vec<(TransportTag, String)>,
     },
-    /// The risk-6 SIZE ABORT short-circuited the offer loop (task-51): a holder
-    /// streamed more than the signed NarSize bound. This is NOT "try the next
+    /// The risk-6 SIZE ABORT short-circuited the offer loop (task-51): a carrier
+    /// reported more raw bytes than the signed NarSize bound, either at a legacy
+    /// cumulative crossing or from `/nar/4`'s rejected declaration. This is NOT "try the next
     /// offer" - every offer in the claim addresses the SAME oversized BLAKE3 - so
     /// the driver stops immediately and the caller maps this to a PROPAGATING
     /// [`daemon_core::source::SourceError::TooLarge`] (never an upstream fallback, which
@@ -214,7 +214,7 @@ impl fmt::Display for FetchError {
             }
             FetchError::TooLarge { limit, streamed } => write!(
                 f,
-                "size abort: a holder streamed {streamed} bytes, over the signed NarSize bound {limit}"
+                "size abort: a transfer reported {streamed} raw bytes, over the signed NarSize bound {limit}"
             ),
         }
     }
@@ -247,11 +247,11 @@ impl std::error::Error for FetchError {}
 /// (`Some` on the normal correlated path, `None` on the cold-start fallback where
 /// no signed bound is known). It is the UNCOMPRESSED raw-NAR byte count - the same
 /// unit as the transferred `RawNarV1` for a peer-served path - NEVER the compressed
-/// FileSize (the recurring unit trap). A streaming impl MUST enforce it DURING the
-/// transfer (abort the moment cumulative bytes exceed it), so a lying holder that
-/// claims a small NarSize but serves a huge blob is cut off at ~NarSize rather than
-/// buffered whole (risk 6 / OOM). `None` disables the size abort but not the
-/// transport's own time/idle envelope.
+/// FileSize (the recurring unit trap). A carrier MUST enforce it at its earliest
+/// authenticated framing boundary: legacy body-only streaming aborts when cumulative
+/// raw bytes cross it; `/nar/4` rejects an oversized declared `raw_size` before reading
+/// the body. Thus a lying holder is cut off without buffering the blob (risk 6 / OOM).
+/// `None` disables this caller-provided bound but not the transport's own size/time/idle envelope.
 #[async_trait]
 pub trait Transport: Send + Sync {
     /// Which offer variant this transport services. Its registration key.
@@ -315,7 +315,7 @@ impl TransportRegistry {
 /// gate-1-verified bytes.
 ///
 /// `expected_size` is the signed NarSize bound (task-51), threaded to each
-/// [`Transport::fetch`] so the risk-6 abort fires at the streaming boundary.
+/// [`Transport::fetch`] so the risk-6 abort fires at the carrier's earliest size boundary.
 ///
 /// Selection + fail-closed policy (AC#2):
 ///   * An offer whose transport has NO registered backend is SKIPPED (recorded,

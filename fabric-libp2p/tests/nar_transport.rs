@@ -2,12 +2,12 @@
 //! bar): a SERVING node A and a CONSUMER node B, two independent libp2p swarms over real
 //! loopback TCP, prove that:
 //!
-//!   * B fetches a NAR from A over the shared swarm's `/nix-p2p/<scope>/nar/3` raw
-//!     libp2p-stream protocol (TASK-157 + TASK-99 negotiated codec) and gets
-//!     BYTE-IDENTICAL, BLAKE3-verified bytes - the default policy compresses the LINK
-//!     with zstd, decoded back to the identical raw NAR on the fetch side;
+//!   * B fetches a NAR from A over the shared swarm's Bao-authenticated
+//!     `/nix-p2p/<scope>/nar/4` protocol and gets BYTE-IDENTICAL bytes - the
+//!     default policy compresses each leaf on the LINK with zstd, decoded and
+//!     authenticated back to the identical raw NAR on the fetch side;
 //!   * a CORRUPT provider (bytes that do not hash to the requested digest) is rejected
-//!     by the fetch-side gate-1 BLAKE3 verify (`IntegrityMismatch`), never trusted;
+//!     by fetch-side Bao authentication (`AuthenticationFailed`), never trusted;
 //!   * an OVERSIZED response (larger than the signed NarSize) trips the size abort
 //!     (`TooLarge`);
 //!   * a serve budget DECLINES an over-per-NAR request (task-72 admission), surfaced to
@@ -20,6 +20,7 @@
 use std::ffi::OsString;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use fabric_libp2p::{
@@ -34,8 +35,8 @@ use peer_fabric::{
 };
 use proc_supervisor::{TaskSupervisor, TaskSupervisorHandle};
 
-// TASK-99 live-adversary imports: a MINIMAL bare libp2p-stream swarm stood up IN THE TEST that
-// writes attacker-chosen `/nar/3` bytes (truncated frame / bogus codec byte) the honest serve
+// Live-adversary imports: a MINIMAL bare libp2p-stream swarm stood up IN THE TEST that
+// writes attacker-chosen `/nar/4` bytes (truncated frame / bogus codec byte) the honest serve
 // loop never emits. No production seam is added (mped-architect judgment): the honest
 // `serve_stream` stays the single always-installed inbound path; the codec-level unit tests in
 // peer-fabric are the PRIMARY oracle for truncation/trailing/unknown-codec, and these live
@@ -47,10 +48,11 @@ use libp2p::swarm::SwarmEvent;
 use libp2p::{StreamProtocol, SwarmBuilder, noise, tcp, yamux};
 use tokio::sync::oneshot;
 
-/// The `/nar/3` `STATUS_NAR` response byte (private to `nar.rs`; re-stated for the adversary).
+/// The `/nar/4` `STATUS_NAR` response byte (private to `nar.rs`; re-stated for the adversary).
 const STATUS_NAR: u8 = 1;
+const COMPLETE: &[u8; 4] = b"N4OK";
 
-/// Fetch `content` from a provider by its PeerId over the RAW-stream `/nar/3` path directly
+/// Fetch `content` from a provider by its PeerId over the `/nar/4` path directly
 /// (add its dial address, then open a stream) - no DHT round trip. This exercises the SAME
 /// `serve_stream` + `read_response_streamed` byte path over real libp2p streams the transport
 /// uses, but without the bootstrap/discovery machinery, so the compression tests stay cheap and
@@ -228,7 +230,7 @@ async fn fetch_attribution_distinguishes_dial_failure_from_post_open_not_held() 
     let _ = node_b.handle.dial(addr_a.clone()).await;
 
     // (1) POST-OPEN: fetch content the REACHABLE provider does NOT hold. The substream OPENS
-    //     (the provider is reached, the /nar/3 protocol negotiates) and the reply is NotHeld ->
+    //     (the provider is reached, the /nar/4 protocol negotiates) and the reply is NotHeld ->
     //     `OpenedThenFailed(NotHeld)`. This must NOT be classified as unreachable.
     let after_open = node_b
         .handle
@@ -318,7 +320,7 @@ async fn fetch_is_byte_identical_and_blake3_verified_across_two_nodes() {
 }
 
 #[tokio::test]
-async fn corrupt_provider_is_rejected_by_gate1_blake3_verify() {
+async fn corrupt_memory_provider_fails_before_shipping_a_v4_status() {
     let scope = "nar-corrupt";
     // The consumer ASKS for the digest of the honest bytes...
     let honest = b"the bytes the consumer actually wants".to_vec();
@@ -351,13 +353,10 @@ async fn corrupt_provider_is_rejected_by_gate1_blake3_verify() {
         .fetch(&requested, &offer, None, &envelope())
         .await
         .expect_err("a corrupt provider must not yield trusted bytes");
-    match err {
-        TransferError::IntegrityMismatch { expected, actual } => {
-            assert_eq!(expected, requested);
-            assert_ne!(actual, requested);
-        }
-        other => panic!("expected IntegrityMismatch, got {other}"),
-    }
+    assert!(
+        matches!(err, TransferError::Unavailable(ref why) if why.contains("before its status byte")),
+        "the provider must authenticate memory supply before STATUS_NAR, got {err}"
+    );
 }
 
 #[tokio::test]
@@ -401,12 +400,9 @@ async fn signed_bound_smaller_than_served_bytes_trips_size_abort() {
 }
 
 #[tokio::test]
-async fn a_large_over_bound_serve_is_aborted_mid_stream_not_after_the_whole_nar() {
-    // AC#1 over the REAL two-node transport: a provider holds a 1 MiB NAR but the consumer
-    // signed a tiny 4 KiB bound. The streaming fetch must abort the INSTANT the running total
-    // crosses the bound - after ~one 64 KiB chunk - NOT after receiving all 1 MiB and NOT at
-    // the 256 MiB floor. BITE (pre-157): a post-receive buffer check reports streamed == the
-    // whole 1 MiB. The mid-stream property is `streamed << served_size`.
+async fn a_large_over_bound_v4_response_is_rejected_from_its_exact_size_header() {
+    // `/nar/4` declares exact RawNarV1 geometry in its fixed header. A signed 4-KiB bound
+    // rejects this 1-MiB response before allocating a tree or accepting any Bao body byte.
     let scope = "nar-oversize-large";
     let nar = vec![0x5au8; 1024 * 1024]; // 1 MiB, honestly hashed
     let content = Blake3Digest::from_raw_nar(&nar);
@@ -434,24 +430,14 @@ async fn a_large_over_bound_serve_is_aborted_mid_stream_not_after_the_whole_nar(
     let err = transport
         .fetch(&content, &offer, Some(signed_bound), &envelope())
         .await
-        .expect_err("a 1 MiB serve under a 4 KiB signed bound must abort mid-stream");
+        .expect_err("a 1 MiB serve under a 4 KiB signed bound must fail at the v4 header");
     match err {
         TransferError::TooLarge { limit, streamed } => {
             assert_eq!(limit, signed_bound, "the abort limit is the signed bound");
-            assert!(
-                streamed > signed_bound,
-                "streamed ({streamed}) crossed the bound ({signed_bound})"
-            );
-            // Decisive: aborted far below the served 1 MiB, proving the read stopped
-            // mid-stream rather than buffering the whole NAR (or waiting for the 256 MiB cap).
-            assert!(
-                streamed < 256 * 1024,
-                "streamed ({streamed}) must be far below the served 1 MiB - it aborted mid-stream"
-            );
-            assert!(
-                (streamed as usize) < nar.len(),
-                "streamed ({streamed}) must be less than the full NAR ({})",
-                nar.len()
+            assert_eq!(
+                streamed,
+                nar.len() as u64,
+                "TooLarge reports the untrusted declared raw_size, not bytes buffered"
             );
         }
         other => panic!("expected TooLarge, got {other}"),
@@ -551,7 +537,7 @@ async fn dropping_the_serve_handle_stops_admission() {
 /// consequence DIRECTLY, at the swarm boundary and INDEPENDENTLY of discovery: a consumer that
 /// has the leech's exact dial address (the "told the leech is a provider" case - `add_address` +
 /// `dial` in `direct_fetch`) and asks for content the leech holds gets `NotHeld` - the leech's
-/// inbound `/nar/3` handler answers "not held" for EVERY request because its serve slot is empty
+/// inbound `/nar/4` handler answers "not held" for EVERY request because its serve slot is empty
 /// (`nar.rs`: `None => NarResponse::NotHeld`). So a peer cannot obtain bytes from a leech by ANY
 /// path: not via the DHT (a leech never announces, so there is no record to find), and not via a
 /// direct dial (this test). MUTATION: install a serve gate on the "leech" (make it serve) and the
@@ -790,12 +776,10 @@ async fn a_slow_process_serve_does_not_block_the_poll_loop() {
 /// AC#3 (TASK-191) - the byte-identity bite for the STORE-supply serve, at the two-swarm level.
 /// A Process source (the `nix-store --dump` analogue) whose bytes NO LONGER hash to the announced
 /// content - a store path REBUILT since it was announced, emitting DIFFERENT bytes of the SAME
-/// length so the declared-size admission passes and ONLY the serve-time BLAKE3 recheck can catch
-/// it - must fail the serve LOUD (the provider Declines, `SupplyFailed`), so the consumer's fetch
-/// FAILS and it NEVER receives the wrong bytes under the right name. BITE: drop the
-/// `BLAKE3(RawNarV1) == content` recheck in `produce_supervised` and the provider ships the
-/// rebuilt bytes; the fetch then either succeeds with wrong bytes or trips the consumer's gate-1
-/// IntegrityMismatch instead of this provider-side `Unavailable` decline.
+/// length so declared-size admission passes and ONLY pass-1 root verification can catch it - must
+/// fail the serve before `STATUS_NAR`, so the consumer NEVER receives wrong bytes under the right
+/// name. BITE: drop pass-1 root verification and the provider starts an unauthenticatable v4
+/// response, moving detection to the consumer after response status instead of failing at source.
 #[tokio::test]
 async fn a_rebuilt_store_source_is_declined_and_never_ships_wrong_bytes() {
     let scope = "nar-process-rebuilt";
@@ -852,24 +836,19 @@ async fn a_rebuilt_store_source_is_declined_and_never_ships_wrong_bytes() {
         .fetch(&content, &offer, Some(announced.len() as u64), &envelope())
         .await
         .expect_err("a rebuilt store source must fail the fetch, never ship wrong bytes");
-    // The PROVIDER refused before shipping (serve-time recheck), so this is an `Unavailable`
-    // decline - NOT a consumer-side `IntegrityMismatch` (no bytes were shipped to verify) and
-    // certainly not a success. That is the whole point: the wrong bytes never left node A.
-    match err {
-        TransferError::Unavailable(why) => assert!(
-            why.contains("declined") || why.to_lowercase().contains("produce"),
-            "expected a supply-failed decline, got: {why}"
-        ),
-        other => panic!("expected an Unavailable decline (provider refused to ship), got {other}"),
-    }
+    // Pass 1 checks the regenerated root before STATUS_NAR, so the wrong bytes never leave A.
+    assert!(
+        matches!(err, TransferError::Unavailable(ref why) if why.contains("before its status byte")),
+        "rebuilt pass 1 must close before STATUS_NAR, got {err}"
+    );
 }
 
 // -------------------------------------------------------------------------
 // TASK-99 (codex DEEP-gate fix #5): LIVE 2-node coverage of the COMPRESSED path with payloads
 // OVER the 1 KiB compress threshold, so the zstd link is ACTUALLY exercised (the earlier
 // happy/corrupt tests use ~60 B bodies that fall back to RAW and never touch the codec). These
-// use the direct `/nar/3` fetch so the byte path - serve_stream negotiates zstd, the fetcher
-// decodes it - is the real one, over real libp2p streams.
+// use the direct `/nar/4` fetch so the byte path - serve_stream selects per-leaf zstd, the fetcher
+// decodes and authenticates it - is the real one, over real libp2p streams.
 // -------------------------------------------------------------------------
 
 /// A >1 KiB compressible NAR body: large enough to clear the compress threshold (so serve_stream
@@ -921,11 +900,9 @@ async fn compressed_fetch_is_byte_identical_over_the_link() {
 }
 
 #[tokio::test]
-async fn corrupt_compressed_provider_is_rejected_over_the_link() {
-    // A CORRUPT provider binds >1 KiB bytes that do NOT hash to the requested digest; the server
-    // COMPRESSES them (a valid zstd frame of the wrong bytes), and the consumer decodes a clean
-    // frame whose BLAKE3 mismatches -> gate-1 IntegrityMismatch. Proves the compressed path
-    // fails closed on wrong content (not only the tiny-RAW path the old test covered).
+async fn corrupt_compressed_memory_provider_fails_before_shipping_a_v4_status() {
+    // A corrupt provider binds >1 KiB bytes under another digest. V4 prepares and checks its
+    // Bao root before the status/codec decision, so not even a compressed leaf crosses the link.
     let scope = "nar99-corrupt-zstd";
     let honest = compressible_nar("honest");
     let requested = Blake3Digest::from_raw_nar(&honest);
@@ -951,13 +928,10 @@ async fn corrupt_compressed_provider_is_rejected_over_the_link() {
     let err = direct_fetch(&node_b, node_a.peer_id, &addr_a, requested, None)
         .await
         .expect_err("a corrupt compressed provider must not yield trusted bytes");
-    match err {
-        TransferError::IntegrityMismatch { expected, actual } => {
-            assert_eq!(expected, requested);
-            assert_ne!(actual, requested);
-        }
-        other => panic!("expected IntegrityMismatch over the compressed link, got {other}"),
-    }
+    assert!(
+        matches!(err, TransferError::Unavailable(ref why) if why.contains("before its status byte")),
+        "the provider must reject the bad root before compressed v4 delivery, got {err}"
+    );
 }
 
 #[tokio::test]
@@ -1027,7 +1001,7 @@ async fn two_servers_at_different_levels_serve_one_blob_id() {
 }
 
 // -------------------------------------------------------------------------
-// TASK-99 (codex DEEP-gate fix #1/#5): LIVE adversarial `/nar/3` responders. A minimal bare
+// TASK-99/TASK-197: LIVE adversarial `/nar/4` responders. A minimal bare
 // libp2p-stream swarm writes attacker-chosen wire bytes the honest server never emits - a
 // TRUNCATED zstd frame (the P0 case) and an UNKNOWN codec byte - and the consumer's real
 // fetch path must fail CLOSED. See the module-top import note for why this needs no production
@@ -1035,15 +1009,25 @@ async fn two_servers_at_different_levels_serve_one_blob_id() {
 // -------------------------------------------------------------------------
 
 /// Stand up a MINIMAL bare libp2p swarm (tcp+noise+yamux + a `libp2p_stream::Behaviour`) that
-/// accepts `/nix-p2p/<scope>/nar/3` and, per inbound stream, reads the 33-byte request then
+/// accepts `/nix-p2p/<scope>/nar/4` and, per inbound stream, reads the 33-byte request then
 /// writes `response` verbatim and closes. Returns its PeerId + concrete listen address. The
 /// swarm + accept tasks are detached; the `#[tokio::test]` runtime aborts them at test end (no
 /// leak). Deliberately carries NO kad/identify (a direct dial needs neither), keeping the
 /// duplicated swarm construction - the maintenance cost of this approach - as small as possible.
 async fn spawn_adversary(scope: &str, seed: u8, response: Vec<u8>) -> (PeerId, Multiaddr) {
+    spawn_protocol_adversary(scope, seed, 4, response, Arc::new(AtomicUsize::new(0))).await
+}
+
+async fn spawn_protocol_adversary(
+    scope: &str,
+    seed: u8,
+    version: u8,
+    response: Vec<u8>,
+    accepted: Arc<AtomicUsize>,
+) -> (PeerId, Multiaddr) {
     let keypair = Keypair::ed25519_from_bytes([seed; 32]).expect("adversary keypair");
     let peer_id = keypair.public().to_peer_id();
-    let proto = StreamProtocol::try_from_owned(format!("/nix-p2p/{scope}/nar/3"))
+    let proto = StreamProtocol::try_from_owned(format!("/nix-p2p/{scope}/nar/{version}"))
         .expect("nar protocol name");
 
     let mut swarm = SwarmBuilder::with_existing_identity(keypair)
@@ -1062,7 +1046,9 @@ async fn spawn_adversary(scope: &str, seed: u8, response: Vec<u8>) -> (PeerId, M
         .build();
 
     let mut control = swarm.behaviour().new_control();
-    let mut incoming = control.accept(proto).expect("accept /nar/3");
+    let mut incoming = control
+        .accept(proto)
+        .expect("accept adversary NAR protocol");
     swarm
         .listen_on("/ip4/127.0.0.1/tcp/0".parse().unwrap())
         .expect("listen");
@@ -1080,9 +1066,10 @@ async fn spawn_adversary(scope: &str, seed: u8, response: Vec<u8>) -> (PeerId, M
         }
     });
 
-    // Per inbound `/nar/3` stream: read the 33-byte request, then ship the crafted response.
+    // Per inbound `/nar/4` stream: read the 33-byte request, then ship the crafted response.
     tokio::spawn(async move {
         while let Some((_peer, mut stream)) = incoming.next().await {
+            accepted.fetch_add(1, Ordering::SeqCst);
             let response = response.clone();
             tokio::spawn(async move {
                 let mut request = [0u8; 33];
@@ -1100,18 +1087,20 @@ async fn spawn_adversary(scope: &str, seed: u8, response: Vec<u8>) -> (PeerId, M
 
 #[tokio::test]
 async fn adversarial_truncated_zstd_frame_fails_the_fetch() {
-    // The P0 case OVER A REAL LINK: a well-formed `Nar` header + zstd codec byte, then a valid
-    // zstd frame with its tail CUT OFF. The consumer must fail CLOSED (the codec's finish() sees
-    // the frame is not complete -> Unavailable), never accept a short/wrong NAR. The payload is
-    // >1 KiB so the zstd path is genuinely exercised.
+    // The P0 case OVER A REAL LINK: a well-formed v4 header and one-leaf length prefix, then a
+    // valid independent zstd leaf frame with its tail CUT OFF. The consumer must fail closed
+    // before exposing that leaf. The payload is <64 KiB, so its Bao full-range proof is empty.
     let scope = "nar99-adv-trunc";
     let nar = compressible_nar("adversarial-truncation");
     assert!(nar.len() > 1024);
     let content = Blake3Digest::from_raw_nar(&nar);
 
     let frame = compress_zstd(&nar, 3).expect("compress");
-    let truncated = &frame[..frame.len() - 6]; // drop the frame tail
+    assert!(nar.len() < 64 * 1024, "one-leaf adversary fixture");
+    let truncated = &frame[..frame.len() - 6];
     let mut response = vec![STATUS_NAR, CODEC_ZSTD];
+    response.extend_from_slice(&(nar.len() as u64).to_le_bytes());
+    response.extend_from_slice(&(frame.len() as u32).to_le_bytes());
     response.extend_from_slice(truncated);
 
     let (adv_peer, adv_addr) = spawn_adversary(scope, 51, response).await;
@@ -1126,23 +1115,13 @@ async fn adversarial_truncated_zstd_frame_fails_the_fetch() {
     )
     .await
     .expect_err("a truncated zstd frame over the link must fail the fetch");
-    // Truncation is now rejected AT THE CODEC (finish -> Truncated -> Unavailable "zstd decode
-    // did not complete"), never a silent short NAR. This test DISTINGUISHES the new codec from
-    // the old short-decode decoder: the OLD path returned correct-but-short bytes that gate-1
-    // caught as IntegrityMismatch, so an IntegrityMismatch here would mean the codec accepted a
-    // truncated frame and we regressed. Require the codec-completion failure specifically.
-    match err {
-        TransferError::Unavailable(why) => assert!(
-            why.contains("did not complete") || why.contains("truncated"),
-            "a truncated frame must be rejected AT THE CODEC (DecodeError::Truncated surfacing \
-             as a codec-completion failure), got Unavailable({why})"
+    assert!(
+        matches!(
+            err,
+            TransferError::AuthenticationFailed { .. } | TransferError::Unavailable(_)
         ),
-        other => panic!(
-            "expected the truncated fetch to fail AT THE CODEC (Unavailable/did-not-complete); \
-             an IntegrityMismatch would mean the OLD short-decode path accepted a truncated \
-             frame and leaned on gate-1 - got {other}"
-        ),
-    }
+        "truncated encoded leaf must fail at v4 framing/authentication, got {err}"
+    );
 }
 
 #[tokio::test]
@@ -1151,7 +1130,8 @@ async fn adversarial_unknown_codec_byte_fails_the_fetch() {
     // must fail rather than guess a framing (AC#5), over the real link.
     let scope = "nar99-adv-codec";
     let content = Blake3Digest::from_bytes([0x9c; 32]);
-    let response = vec![STATUS_NAR, 0x7f]; // 0x7f is not a known codec byte
+    let mut response = vec![STATUS_NAR, 0x7f]; // 0x7f is not a known codec byte
+    response.extend_from_slice(&4096u64.to_le_bytes());
 
     let (adv_peer, adv_addr) = spawn_adversary(scope, 53, response).await;
 
@@ -1166,4 +1146,81 @@ async fn adversarial_unknown_codec_byte_fails_the_fetch() {
         ),
         other => panic!("expected Unavailable(unknown codec), got {other}"),
     }
+}
+
+#[tokio::test]
+async fn adversarial_provider_cannot_select_a_codec_the_request_did_not_offer() {
+    let scope = "nar4-adv-unoffered-codec";
+    let content = Blake3Digest::from_bytes([0x7b; 32]);
+    let mut response = vec![STATUS_NAR, CODEC_ZSTD];
+    response.extend_from_slice(&0u64.to_le_bytes());
+    response.extend_from_slice(COMPLETE);
+    let (adv_peer, adv_addr) = spawn_adversary(scope, 55, response).await;
+    let (consumer, _addr) = start_listening([56u8; 32], scope).await;
+    consumer
+        .handle
+        .add_address(adv_peer, adv_addr.clone())
+        .await;
+    consumer
+        .handle
+        .dial(adv_addr)
+        .await
+        .expect("dial adversary");
+
+    let error = consumer
+        .handle
+        .fetch_nar_streaming_measured(
+            adv_peer,
+            content,
+            Some(0),
+            Duration::from_secs(5),
+            Duration::from_secs(5),
+            false,
+        )
+        .await
+        .expect_err("raw-only request must reject a selected zstd response");
+    assert!(
+        matches!(error, TransferError::Unavailable(ref why) if why.contains("did not offer")),
+        "selected codec outside the accept mask must fail explicitly, got {error}"
+    );
+}
+
+#[tokio::test]
+async fn v3_only_peer_is_protocol_incompatible_and_v3_is_never_opened() {
+    let scope = "nar4-no-v3-downgrade";
+    let accepted_v3 = Arc::new(AtomicUsize::new(0));
+    let (old_peer, old_addr) =
+        spawn_protocol_adversary(scope, 57, 3, vec![0], Arc::clone(&accepted_v3)).await;
+    let (consumer, _addr) = start_listening([58u8; 32], scope).await;
+    consumer
+        .handle
+        .add_address(old_peer, old_addr.clone())
+        .await;
+    consumer
+        .handle
+        .dial(old_addr)
+        .await
+        .expect("dial v3-only peer");
+
+    let outcome = consumer
+        .handle
+        .fetch_nar_streaming_attributed(
+            old_peer,
+            Blake3Digest::from_bytes([0x4d; 32]),
+            Some(1),
+            Duration::from_secs(5),
+            Duration::from_secs(5),
+            false,
+        )
+        .await;
+    assert!(
+        matches!(outcome, FetchOutcome::ProtocolIncompatible(_)),
+        "a reached v3-only peer must be classified as protocol-incompatible, got {outcome:?}"
+    );
+    tokio::task::yield_now().await;
+    assert_eq!(
+        accepted_v3.load(Ordering::SeqCst),
+        0,
+        "the consumer must never attempt a /nar/3 downgrade"
+    );
 }

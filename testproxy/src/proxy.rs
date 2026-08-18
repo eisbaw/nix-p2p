@@ -20,6 +20,7 @@ use crate::record::{Log, Record};
 use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::net::{Shutdown, TcpStream};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
@@ -37,6 +38,9 @@ pub struct State {
     /// nar-url -> the instant the narinfo pointing at it was served. Feeds the
     /// gap oracle (narinfo -> nar request gap, per path).
     gaps: Mutex<HashMap<String, Instant>>,
+    /// Non-admin request handlers that have started but not yet appended their
+    /// completion record. Admin observation never contributes to this count.
+    in_flight: AtomicU64,
 }
 
 impl State {
@@ -48,7 +52,32 @@ impl State {
             faults: Mutex::new(FaultConfig::default()),
             log: Mutex::new(Log::default()),
             gaps: Mutex::new(HashMap::new()),
+            in_flight: AtomicU64::new(0),
         }))
+    }
+
+    /// Number of non-admin handlers whose completion record is not yet visible.
+    pub fn in_flight(&self) -> u64 {
+        self.in_flight.load(Ordering::SeqCst)
+    }
+}
+
+/// Keeps [`State::in_flight`] correct on every exit path, including panics.
+struct InFlightGuard<'a> {
+    count: &'a AtomicU64,
+}
+
+impl<'a> InFlightGuard<'a> {
+    fn enter(count: &'a AtomicU64) -> Self {
+        count.fetch_add(1, Ordering::SeqCst);
+        Self { count }
+    }
+}
+
+impl Drop for InFlightGuard<'_> {
+    fn drop(&mut self) {
+        let previous = self.count.fetch_sub(1, Ordering::SeqCst);
+        debug_assert!(previous > 0, "in-flight proxy request count underflow");
     }
 }
 
@@ -83,6 +112,7 @@ pub fn handle(state: &Arc<State>, request: Request, mut stream: TcpStream) {
         admin(state, &request, &mut stream);
         return;
     }
+    let _in_flight = InFlightGuard::enter(&state.in_flight);
 
     let kind = classify(&path);
     let seq = state.log.lock().unwrap().next_seq();
@@ -520,6 +550,10 @@ fn admin(state: &Arc<State>, request: &Request, stream: &mut TcpStream) {
         }
         ("GET", "/__testproxy/log") => {
             let json = state.log.lock().unwrap().to_json();
+            let _ = http::write_response(stream, 200, "application/json", json.as_bytes());
+        }
+        ("GET", "/__testproxy/in-flight") => {
+            let json = format!("{{\"in_flight\":{}}}", state.in_flight());
             let _ = http::write_response(stream, 200, "application/json", json.as_bytes());
         }
         ("POST", "/__testproxy/reset") => {

@@ -16,13 +16,14 @@
 //!      relay's circuit-v2 connection. This exercises `relay` (server, on R) + `relay_client`
 //!      (P's reservation, C's circuit dial) end to end over real libp2p streams.
 //!
-//! HONEST SCOPE (do not over-read): this is LOOPBACK, so there is NO NAT to hole-punch and
-//! DCUtR is not exercised here - the true "peer behind a NAT is reachable ONLY via
-//! hole-punch/relay, and undiallable when they are disabled" minimal-pair needs a real
-//! containerized-NAT topology (the e2e harness). What THIS proves is that the relay
-//! circuit-v2 data path is wired and load-bearing: a peer with no directly-reachable address
-//! is fetched from purely through the relay. The remaining NAT-harness proof is tracked
-//! separately (see the TASK-168 notes / follow-up).
+//! HONEST SCOPE (do not over-read): this is LOOPBACK, so there is NO NAT to hole-punch. DCUtR
+//! remains enabled, but P has no direct listener and therefore offers no direct candidate for
+//! it to upgrade to. The true "peer behind a NAT is reachable ONLY via hole-punch/relay, and
+//! undiallable when they are disabled" minimal-pair needs a real containerized-NAT topology
+//! (the e2e harness). What THIS proves is that the relay circuit-v2 data path is wired and
+//! load-bearing: a peer with no directly-reachable address is fetched from purely through the
+//! relay. The remaining NAT-harness proof is tracked separately (see the TASK-168 notes /
+//! follow-up).
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -107,12 +108,10 @@ async fn provider_reachable_only_via_relay_circuit_fetches_byte_identical() {
 
     // P: the provider. It serves the NAR but listens ONLY on the relay circuit - it advertises
     // NO directly-dialable address, so the ONLY way to reach it is through R.
-    let (provider, _p_direct) = {
-        // P still needs to bind SOMETHING to run identify/relay-client; it binds a loopback
-        // port (the relay reservation is opened over a connection to R), but crucially C is
-        // NEVER given this direct address - C only ever learns the circuit address below.
-        start_listening([172u8; 32], scope).await
-    };
+    // P needs no direct listener: listening on the circuit dials R outbound and requests the
+    // reservation. With no direct candidate, shipped DCUtR cannot upgrade this relay-only path.
+    let provider = Node::start(NodeConfig::new([172u8; 32]).with_network_scope(scope))
+        .expect("provider starts without a direct listener");
     let provider_peer: PeerId = provider.peer_id;
     let server = Libp2pServer::new(
         provider.handle.clone(),
@@ -153,6 +152,17 @@ async fn provider_reachable_only_via_relay_circuit_fetches_byte_identical() {
         have_reservation.is_some(),
         "provider never obtained a relay reservation (no /p2p-circuit listen address appeared)"
     );
+    let provider_listen_addrs = provider.handle.listen_addrs().await;
+    assert!(
+        !provider_listen_addrs.is_empty(),
+        "provider reservation must publish at least one listen address"
+    );
+    assert!(
+        provider_listen_addrs.iter().all(|address| address
+            .iter()
+            .any(|protocol| matches!(protocol, Protocol::P2pCircuit))),
+        "provider must advertise circuit-only listen addresses, never a direct DCUtR candidate: {provider_listen_addrs:?}"
+    );
 
     // C: the consumer. It is given ONLY the circuit address to P (relay addr + P2pCircuit +
     // P's PeerId). It has NO direct address for P. The fetch must succeed THROUGH the relay.
@@ -169,6 +179,17 @@ async fn provider_reachable_only_via_relay_circuit_fetches_byte_identical() {
         .await;
     // Establish the relayed connection to P via the circuit before opening the NAR stream.
     let _ = consumer.handle.dial(circuit_to_provider.clone()).await;
+    let provider_relays = wait_for(|| async {
+        let relays = consumer.handle.connection_relay_peers(provider_peer).await;
+        (!relays.is_empty()).then_some(relays)
+    })
+    .await
+    .expect("consumer establishes a relayed connection to the provider before fetching");
+    assert_eq!(
+        provider_relays,
+        vec![relay_peer],
+        "the provider connection must name the exact relay carrying it"
+    );
 
     let bytes = consumer
         .handle

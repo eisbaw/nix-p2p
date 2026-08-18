@@ -664,7 +664,8 @@ class Pod:
         # bind-mounted state dir (used as `--narinfo-cache-dir`). Present so
         # task-42 can measure a node's on-disk footprint by walking the host side
         # of the mount - the only observation point that needs no binary inside
-        # the image. None (every existing scenario) leaves the daemon stateless.
+        # the image. None means there is no host-persisted state mount; the daemon
+        # may still keep pod-local state for the lifetime of its container.
         self.state_root = Path(state_root).resolve() if state_root else None
         # Parsed once node B announces (node_id, sockets); oracles read it.
         self.iroh_identity: tuple[str, str] | None = None
@@ -797,8 +798,9 @@ class Pod:
     def _state_args(self, role: str) -> list[str]:
         """`podman run` fragments giving `role` its own host-backed state dir.
 
-        Empty for a pod without `state_root`, so every pre-task-42 scenario runs
-        the daemon with exactly the arguments it ran with before."""
+        Empty for a pod without `state_root`, so no daemon state is persisted or
+        measured on the host. This does not make the daemon stateless inside its
+        container."""
         if self.state_root is None:
             return []
         host_dir = self.state_dir(role)
@@ -1630,6 +1632,15 @@ class Pod:
         if status != 200:
             die(f"proxy log returned {status}")
         return json.loads(body)
+
+    def proxy_in_flight(self) -> int:
+        status, body = http_get(f"http://127.0.0.1:{HOST_PROXY}/__testproxy/in-flight")
+        if status != 200:
+            die(f"proxy in-flight returned {status}")
+        value = json.loads(body).get("in_flight")
+        if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+            die(f"proxy in-flight returned invalid count: {body!r}")
+        return value
 
     def proxy_faults(self, params: str) -> None:
         status, body = http_post(
@@ -2825,6 +2836,43 @@ def _wait_for_proxy_record(
     return False
 
 
+def _expect_exact_proxy_fault_count(
+    pod: Pod,
+    fault: str,
+    expected: int,
+    expect,
+    assertion: str,
+    *,
+    deadline_s: float = 3.0,
+) -> None:
+    """Wait for completed proxy handlers, then require one exact fault count.
+
+    A daemon header timeout can return 502 before testproxy's delayed handler
+    appends its completion record. Polling observable activity and then the
+    ground-truth log is readiness synchronization. Zero activity means every
+    started handler has appended its record, so the exact final count rejects
+    both missing and duplicated upstream attempts.
+    """
+    deadline = time.monotonic() + deadline_s
+    in_flight = -1
+    records = []
+    while True:
+        in_flight = pod.proxy_in_flight()
+        records = [record for record in pod.proxy_log() if record.get("fault") == fault]
+        if (
+            in_flight == 0 and len(records) == expected
+        ) or time.monotonic() >= deadline:
+            break
+        time.sleep(0.02)
+    expect(
+        in_flight == 0 and len(records) == expected,
+        assertion,
+        f"fault={fault!r} expected={expected} observed={len(records)} "
+        f"in_flight={in_flight} "
+        f"records={[(r.get('kind'), r.get('path'), r.get('status')) for r in records]}",
+    )
+
+
 def _section(stdout: str, name: str) -> str | None:
     """Extract a `===NAME_BEGIN=== ... ===NAME_END===` block from client output."""
     begin_marker = f"==={name}_BEGIN==="
@@ -3947,6 +3995,7 @@ def scenario_chain_timeout_invariant(ctx: Ctx, expect) -> None:
         with_daemon=False,
         expect=expect,
         daemon_chain=CHAIN_DEPTH,
+        daemon_extra_args=("--no-narinfo-cache",),
     ) as pod:
         shallow_url = (
             f"http://127.0.0.1:{pod.daemon_host_port(CHAIN_DEPTH)}/{present_narinfo}"
@@ -3986,8 +4035,8 @@ def scenario_chain_timeout_invariant(ctx: Ctx, expect) -> None:
         # passthrough incurs it once regardless of depth; a per-hop multiplying
         # design would incur it at every hop.
         #
-        # The delay is kept WELL BELOW the daemon's default 1000ms header budget
-        # (daemon/src/upstream.rs `header_timeout`). TASK-33 replaced the wave-1
+        # The delay is kept WELL BELOW the daemon's default 15000ms header budget
+        # (`daemon_core::HEADER_TIMEOUT_MS`). TASK-33 replaced the wave-1
         # FIXED per-hop timeout with a COMPOSING budget: the entry hop seeds an
         # end-to-end budget from its header_timeout and propagates a shrinking
         # remaining-budget (`x-nix-p2p-hop-budget-ms`) down the chain, so the whole
@@ -3999,12 +4048,20 @@ def scenario_chain_timeout_invariant(ctx: Ctx, expect) -> None:
         # (TASK-35/TASK-111). This oracle stays below the budget to measure the
         # non-multiplication property it names.
         delay_ms = 300
+        pod.proxy_reset()
         pod.proxy_faults(f"latency_narinfo_ms={delay_ms}")
         t_shallow_d, shallow_d_status = _time_get_median_ms(
             shallow_url, samples=3, warm=0
         )
         t_deep_d, deep_d_status = _time_get_median_ms(deep_url, samples=3, warm=0)
         pod.proxy_faults("")
+        _expect_exact_proxy_fault_count(
+            pod,
+            "latency-narinfo",
+            6,
+            expect,
+            "chain AC#2 proxy bite: all 3 shallow + 3 deep delayed probes reached the armed fault exactly once",
+        )
         # Fail-fast: the whole invariant is vacuous if the delay never registered
         # (a degenerate ~0ms shallow would make the ratio predicate pass on
         # anything). Assert both probes were 200 AND the shallow entry actually
@@ -4230,6 +4287,7 @@ def scenario_fault_depth_matrix(ctx: Ctx, expect) -> None:
         with_daemon=False,
         expect=expect,
         daemon_chain=CHAIN_DEPTH,
+        daemon_extra_args=("--no-narinfo-cache",),
     ) as pod:
         ports = {d: _matrix_depth_port(pod, d) for d in depths}
 
@@ -4271,6 +4329,7 @@ def scenario_fault_depth_matrix(ctx: Ctx, expect) -> None:
         # A no-op fault gives ~0 delta and FAILS this cell (not a fixed threshold a
         # slow baseline could clear). Tolerance 0.6x absorbs scheduling jitter.
         injected_ms = 200
+        pod.proxy_reset()
         pod.proxy_faults(f"latency_narinfo_ms={injected_ms}")
         for d in depths:
             r, on_ms = _timed_get(ports[d], present_narinfo)
@@ -4283,8 +4342,16 @@ def scenario_fault_depth_matrix(ctx: Ctx, expect) -> None:
                 f"delta={delta_ms:.0f}ms want>={0.6 * injected_ms:.0f}ms",
             )
         pod.proxy_faults("")
+        _expect_exact_proxy_fault_count(
+            pod,
+            "latency-narinfo",
+            len(depths),
+            expect,
+            "matrix mode1 proxy bite: every depth reached the latency fault exactly once",
+        )
 
         # -- mode 2: HTTP 503 - forwarded verbatim (status fidelity) ----------
+        pod.proxy_reset()
         pod.proxy_faults("http_error=503&http_error_kind=narinfo")
         for d in depths:
             r = _raw_get(ports[d], present_narinfo)
@@ -4294,8 +4361,16 @@ def scenario_fault_depth_matrix(ctx: Ctx, expect) -> None:
                 f"status={r['status']}",
             )
         pod.proxy_faults("")
+        _expect_exact_proxy_fault_count(
+            pod,
+            "http-error-503",
+            len(depths),
+            expect,
+            "matrix mode2 proxy bite: every depth reached the HTTP 503 fault exactly once",
+        )
 
         # -- mode 3: connection reset - fast, clean 502 to the client ---------
+        pod.proxy_reset()
         pod.proxy_faults("connection_reset=narinfo")
         for d in depths:
             r = _raw_get(ports[d], present_narinfo)
@@ -4305,6 +4380,13 @@ def scenario_fault_depth_matrix(ctx: Ctx, expect) -> None:
                 f"status={r['status']}",
             )
         pod.proxy_faults("")
+        _expect_exact_proxy_fault_count(
+            pod,
+            "connection-reset",
+            len(depths),
+            expect,
+            "matrix mode3 proxy bite: every depth reached the reset fault exactly once",
+        )
 
         # -- mode 4: truncated NAR - short body survives the chain ------------
         pod.proxy_faults("truncate_pct=50")
@@ -4336,6 +4418,7 @@ def scenario_fault_depth_matrix(ctx: Ctx, expect) -> None:
         pod.proxy_faults("")
 
         # -- mode 6: wrong/stale narinfo - mutated metadata survives ----------
+        pod.proxy_reset()
         pod.proxy_faults("wrong_narinfo=1")
         for d in depths:
             r = _raw_get(ports[d], present_narinfo)
@@ -4346,8 +4429,16 @@ def scenario_fault_depth_matrix(ctx: Ctx, expect) -> None:
                 f"status={r['status']} differs={r['body'] != clean_info_bytes}",
             )
         pod.proxy_faults("")
+        _expect_exact_proxy_fault_count(
+            pod,
+            "wrong-narinfo",
+            len(depths),
+            expect,
+            "matrix mode6 proxy bite: every depth reached the wrong-narinfo fault exactly once",
+        )
 
         # -- mode 7: upstream unreachable - fast, clean 502 at every depth ----
+        pod.proxy_reset()
         pod.proxy_faults("unreachable=1")
         for d in depths:
             start = time.perf_counter()
@@ -4360,6 +4451,13 @@ def scenario_fault_depth_matrix(ctx: Ctx, expect) -> None:
                 f"status={r['status']} elapsed={elapsed_ms:.0f}ms",
             )
         pod.proxy_faults("")
+        _expect_exact_proxy_fault_count(
+            pod,
+            "unreachable",
+            len(depths),
+            expect,
+            "matrix mode7 proxy bite: every depth reached the unreachable fault exactly once",
+        )
 
 
 def scenario_chain_timeout_boundary(ctx: Ctx, expect) -> None:
@@ -4393,14 +4491,23 @@ def scenario_chain_timeout_boundary(ctx: Ctx, expect) -> None:
     deep = CHAIN_DEPTH  # depth-3 entry (daemon-1): worst case, the full chain
 
     def status_at_depth(pod: Pod, depth: int, latency_ms: int) -> int:
+        pod.proxy_reset()
         pod.proxy_faults(f"latency_narinfo_ms={latency_ms}")
         st = _raw_get(_matrix_depth_port(pod, depth), present_narinfo, timeout=15.0)[
             "status"
         ]
         pod.proxy_faults("")
+        _expect_exact_proxy_fault_count(
+            pod,
+            "latency-narinfo",
+            1,
+            expect,
+            f"timeout boundary proxy bite: the L={latency_ms}ms depth-{depth} probe reached the latency fault exactly once",
+        )
         return st
 
     def observe_all(pod: Pod, latency_ms: int) -> dict:
+        pod.proxy_reset()
         pod.proxy_faults(f"latency_narinfo_ms={latency_ms}")
         out = {
             d: _raw_get(_matrix_depth_port(pod, d), present_narinfo, timeout=15.0)[
@@ -4409,6 +4516,13 @@ def scenario_chain_timeout_boundary(ctx: Ctx, expect) -> None:
             for d in depths
         }
         pod.proxy_faults("")
+        _expect_exact_proxy_fault_count(
+            pod,
+            "latency-narinfo",
+            len(depths),
+            expect,
+            f"timeout boundary observation: L={latency_ms}ms reached the latency fault exactly once at every depth",
+        )
         return out
 
     # Pod A: tight per-hop timeout T=500ms. Assert the L-vs-T flip at FULL depth.
@@ -4419,7 +4533,7 @@ def scenario_chain_timeout_boundary(ctx: Ctx, expect) -> None:
         with_daemon=False,
         expect=expect,
         daemon_chain=CHAIN_DEPTH,
-        daemon_extra_args=("--header-timeout-ms", "500"),
+        daemon_extra_args=("--no-narinfo-cache", "--header-timeout-ms", "500"),
     ) as pod:
         below = status_at_depth(pod, deep, 250)  # L < T -> served
         above = status_at_depth(pod, deep, 900)  # L > T -> timed out
@@ -4449,7 +4563,7 @@ def scenario_chain_timeout_boundary(ctx: Ctx, expect) -> None:
         with_daemon=False,
         expect=expect,
         daemon_chain=CHAIN_DEPTH,
-        daemon_extra_args=("--header-timeout-ms", "1200"),
+        daemon_extra_args=("--no-narinfo-cache", "--header-timeout-ms", "1200"),
     ) as pod:
         moved = status_at_depth(pod, deep, 900)  # L < new T -> served again
         expect(

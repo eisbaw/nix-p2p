@@ -18,18 +18,20 @@
 //!
 //! # The integrity core (AC#3/#6) - fail closed, bounded resource use
 //!
-//! A hostile peer sends the compressed body; the fetcher must never let it turn into a
-//! short, wrong, or memory-exhausting nar:
+//! A hostile peer sends a compressed framing unit; the fetcher must never let it turn into
+//! short, wrong, or memory-exhausting raw bytes. The carrier defines that unit: current
+//! libp2p `/nar/4` uses one independently framed zstd unit per authenticated 64-KiB Bao
+//! leaf, while historical/offline harnesses may use one whole-NAR frame.
 //!
 //!   * DECODE IS STREAMING AND OUTPUT-BOUNDED. [`BoundedZstdDecoder`] feeds compressed
 //!     chunks through the zstd streaming decoder and counts DECOMPRESSED bytes against the
-//!     signed uncompressed `NarSize` cap, aborting the INSTANT the running total would
+//!     caller-provided uncompressed unit cap, aborting the INSTANT the running total would
 //!     exceed it. A decompression BOMB (tiny on the wire, huge on decode) fails closed
-//!     with memory bounded to `cap + one decode block`, never the whole expansion.
-//!   * INPUT IS ALSO BOUNDED. The compressed body has no length prefix (it streams to
-//!     EOF), so a peer could stream unbounded compressed bytes. A legitimate compressed
-//!     nar is SMALLER than the raw nar, so compressed input over the same uncompressed cap
-//!     is itself a lie and aborts - bounding the CPU a peer can make the decoder spend.
+//!     with memory bounded to O(cap), one bounded decode block, and the bounded window,
+//!     never the whole hostile expansion.
+//!   * INPUT IS ALSO BOUNDED. The decoder independently caps compressed input by zstd's
+//!     worst-case bound for the raw unit. `/nar/4` additionally checks its u32 encoded-leaf
+//!     length against fixed leaf geometry before allocation.
 //!   * THE WINDOW IS BOUNDED. [`ZSTD_WINDOW_LOG_MAX`] caps the decoder's window so a frame
 //!     header claiming a giant window cannot force a large allocation before any output. It
 //!     is the only unbounded-by-`cap` term in the memory footprint (see [`BoundedZstdDecoder`]).
@@ -39,14 +41,15 @@
 //!     the decoder is not at a clean frame boundary - the codec fails closed itself, not only
 //!     via the downstream length/BLAKE3 recheck (defense in depth). A complete frame FOLLOWED
 //!     by extra bytes is rejected as [`DecodeError::TrailingInput`]: a well-formed transfer is
-//!     exactly ONE frame, so anything after it is a lie. Either way the fetch fails rather than
-//!     yielding a short/wrong nar.
+//!     exactly ONE frame, so anything after it is a lie. The carrier may then start a fresh
+//!     decoder for its next explicitly framed unit. Either way the fetch fails rather than
+//!     yielding short/wrong bytes.
 
 use zstd::stream::raw::{DParameter, Decoder, Encoder, Operation, OutBuffer};
 
-/// Wire byte for the RAW codec (body is the uncompressed nar verbatim).
+/// Wire byte selecting raw carrier framing.
 pub const CODEC_RAW: u8 = 0;
-/// Wire byte for the ZSTD codec (body is a single zstd frame of the raw nar).
+/// Wire byte selecting zstd carrier framing. Frame boundaries are defined by the carrier.
 pub const CODEC_ZSTD: u8 = 1;
 
 /// `accept` bitmask bit for RAW. A compliant fetcher ALWAYS sets it: raw is the mandatory
@@ -70,8 +73,10 @@ pub const ZSTD_WINDOW_LOG_MAX: u32 = 27;
 /// The measurement (real nar data, `evidence/task-99/`) refutes a HIGH default: zstd -19
 /// reaches a near-xz ratio (~0.168 vs xz's ~0.162 on the same paths) but compresses at only
 /// ~2.9 MB/s single-thread - SLOWER than a home uplink - so, because this backend compresses
-/// the whole nar before sending the first byte, level 19 net-LOSES end-to-end even at 2.5
-/// MB/s (the compressor becomes the bottleneck, PRD risk 11). Level 3 compresses at ~340
+/// sustained level-19 compression is slower than a home uplink and therefore net-LOSES at
+/// 2.5 MB/s (the compressor becomes the bottleneck, PRD risk 11). `/nar/4`'s per-leaf frames
+/// improve authentication granularity and bound pre-first-leaf work; they do not make that
+/// sustained CPU cost disappear. Level 3 compresses at ~340
 /// MB/s for a ~0.223 ratio: it does NOT reach xz parity, but it still moves ~4.5x FEWER
 /// bytes than the raw nar and, being far faster than any home uplink, gives the best NET
 /// end-to-end throughput in the target regime. So 3 is the throughput-safe default; a
@@ -79,13 +84,13 @@ pub const ZSTD_WINDOW_LOG_MAX: u32 = 27;
 /// (raw is always available). NOT frozen (unsigned transport policy).
 pub const DEFAULT_ZSTD_LEVEL: i32 = 3;
 
-/// A negotiated wire codec: which framing the compressed-or-not body uses. Raw is the
-/// mandatory floor; zstd is the negotiated win.
+/// A negotiated wire codec. The enclosing transport defines how raw bytes or zstd frames
+/// are delimited; raw is the mandatory floor and zstd is the negotiated win.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WireCodec {
-    /// The body is the uncompressed raw nar (identical to the pre-TASK-99 `/nar/2` body).
+    /// The carrier transmits raw bytes without zstd transformation.
     Raw,
-    /// The body is a single zstd frame whose decode is the raw nar.
+    /// The carrier transmits one or more explicitly delimited zstd framing units.
     Zstd,
 }
 
@@ -208,7 +213,7 @@ pub fn negotiate_serve_codec(
         return Ok((WireCodec::Zstd, CodecChoiceReason::ZstdNegotiated));
     }
     // Otherwise fall back to RAW - but ONLY if the fetcher actually offered raw. Serving a
-    // codec the client never offered would violate the /nar/3 contract.
+    // codec the client never offered would violate the negotiated carrier contract.
     if offers_raw {
         let reason = if !policy.zstd_enabled {
             CodecChoiceReason::ServerZstdDisabled
@@ -226,13 +231,11 @@ pub fn negotiate_serve_codec(
 /// result is an UNSIGNED transport encoding - the peer re-derives the signed identity from the
 /// decoded bytes.
 ///
-/// The SERVE PATH no longer uses this: a whole-buffer compress of a large nar runs for seconds
-/// inside ONE un-preemptible call and precedes the first byte on the wire (the TASK-99 LAN
-/// serial penalty + cancellation-preemption gap). The serve path streams the frame in blocks via
-/// [`StreamingZstdEncoder`] instead. This bulk helper remains for the offline measurement harness
-/// (`measure_link_compression.rs`) and the codec tests, where a single deterministic frame is
-/// what is wanted. A bulk frame and a streamed frame are BOTH a single zstd frame - wire-
-/// interchangeable and decoded identically by [`BoundedZstdDecoder`].
+/// Current `/nar/4` serving does not use this whole-NAR helper: it creates one bounded
+/// [`StreamingZstdEncoder`] per authenticated Bao leaf. This bulk helper remains for the
+/// offline measurement harness (`measure_link_compression.rs`) and codec tests, where one
+/// deterministic whole-input frame is wanted. For the same input, bulk and streamed
+/// production both yield a standard frame decoded identically by [`BoundedZstdDecoder`].
 pub fn compress_zstd(raw: &[u8], level: i32) -> std::io::Result<Vec<u8>> {
     zstd::bulk::compress(raw, level)
 }
@@ -242,22 +245,12 @@ pub fn compress_zstd(raw: &[u8], level: i32) -> std::io::Result<Vec<u8>> {
 /// [`compress_block`](StreamingZstdEncoder::compress_block) step buffers before it is drained.
 const ENCODE_BLOCK: usize = 128 * 1024;
 
-/// A STREAMING, block-wise zstd ENCODER for the serve path (TASK-203) - the compress-side mirror
-/// of [`BoundedZstdDecoder`]. It drives the low-level zstd streaming encoder
-/// ([`zstd::stream::raw::Encoder`]) one block at a time so the serve loop can:
-///
-///   * SHIP THE FIRST COMPRESSED BYTES BEFORE THE WHOLE NAR IS COMPRESSED. Feeding the raw nar in
-///     blocks and draining the output after each emits completed zstd blocks as they form, so the
-///     compressor OVERLAPS the link instead of preceding it (removing the TASK-99 LAN serial
-///     penalty: whole-nar-compress-before-first-byte), and
-///   * PREEMPT BETWEEN BLOCKS. Each block is a natural await boundary for the caller's serve
-///     deadline, so a large nar no longer compresses inside one un-preemptible synchronous call
-///     (the cancellation-preemption gap codex flagged at the TASK-99 DEEP gate).
-///
-/// It produces a SINGLE zstd frame - wire-identical to [`compress_zstd`]'s bulk frame (a zstd
-/// frame is a zstd frame): only the PRODUCTION is pipelined, not the wire format or the addressed
-/// unit. The decode side ([`BoundedZstdDecoder`]) is UNCHANGED and stays fully fail-closed on the
-/// streamed frame (its exhaustive boundary bites cover streamed frames too - see the codec tests).
+/// A reusable block-wise zstd encoder for one framing unit, the compress-side mirror of
+/// [`BoundedZstdDecoder`]. It drives the low-level encoder in bounded scratch and produces
+/// one standard zstd frame across any number of [`compress_block`](Self::compress_block)
+/// calls followed by [`finish`](Self::finish). Some callers can drain early output between
+/// blocks; `/nar/4` instead uses one instance for each already-authenticated 64-KiB leaf and
+/// retains that bounded frame until its u32 length prefix is known.
 pub struct StreamingZstdEncoder {
     encoder: Encoder<'static>,
     /// One reusable output block; a single encode step drains at most this many bytes at a time.
@@ -265,11 +258,9 @@ pub struct StreamingZstdEncoder {
 }
 
 impl StreamingZstdEncoder {
-    /// A streaming encoder at `level`. When the total uncompressed size is known up front (the
-    /// serve path already buffers the produced nar), pass it as `pledged_size` so the frame
-    /// carries the content-size header and a tight window - keeping the streamed frame ~identical
-    /// to the bulk frame - and so `finish` VERIFIES the fed byte count. Pass `None` when the size
-    /// is not known.
+    /// A streaming encoder at `level`. When this framing unit's total uncompressed size is
+    /// known, pass it as `pledged_size` so the frame carries that size and `finish` verifies
+    /// exactly that many input bytes. Pass `None` when the unit size is not known.
     pub fn new(level: i32, pledged_size: Option<u64>) -> std::io::Result<Self> {
         let mut encoder = Encoder::new(level)?;
         encoder.set_pledged_src_size(pledged_size)?;
@@ -303,7 +294,7 @@ impl StreamingZstdEncoder {
     /// Finish the frame, APPENDING the trailing compressed bytes (the epilogue: the last buffered
     /// block plus the frame footer) to `out`. Consumes the encoder: production happens once. With
     /// a `pledged_size` set, zstd ERRORS here if the fed byte count did not match it - a cheap
-    /// extra check that the whole nar was streamed.
+    /// extra check that the whole pledged framing unit was streamed.
     pub fn finish(mut self, out: &mut Vec<u8>) -> std::io::Result<()> {
         loop {
             // Scope the OutBuffer's borrow of `scratch` so `out` can read `scratch` after it.
@@ -465,14 +456,11 @@ impl BoundedZstdDecoder {
         Self::with_window_log_max(output_cap, ZSTD_WINDOW_LOG_MAX)
     }
 
-    /// As [`new`](Self::new) but with an explicit decoder window-log ceiling. Production always
-    /// uses [`ZSTD_WINDOW_LOG_MAX`] via [`new`]; a smaller ceiling exists so a test can PROVE
-    /// the window bound bites (a frame whose window exceeds the ceiling is rejected before any
-    /// output).
-    pub(crate) fn with_window_log_max(
-        output_cap: u64,
-        window_log_max: u32,
-    ) -> Result<Self, DecodeError> {
+    /// As [`new`](Self::new) but with an explicit decoder window-log ceiling. Protocols whose
+    /// framing has a smaller independently authenticated unit should pass that unit's
+    /// geometry-derived ceiling here. A frame whose header exceeds the ceiling is rejected by
+    /// zstd before its advertised window can be allocated.
+    pub fn with_window_log_max(output_cap: u64, window_log_max: u32) -> Result<Self, DecodeError> {
         let mut decoder = Decoder::new().map_err(|error| DecodeError::Zstd(error.to_string()))?;
         // Bound the decoder window so a hostile frame header cannot force a huge allocation.
         decoder

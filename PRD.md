@@ -323,60 +323,83 @@ uncompressed NAR** (95% CI 2.0021..2.0046, R² 1.0000, ≥5 NAR sizes):
 
 ### The arms
 
-**(a) Regenerate on demand via `nix-store --dump`; hold only the in-flight
-serve.** Optionally persist bao outboards (~0.4% of content ≈ 0.6 GiB) rather
+**(a) Regenerate on demand via `nix-store --dump`; hold only bounded in-flight
+state.** Optionally persist 64-KiB-leaf Bao outboards (~0.098% of NAR content ≈
+103 MiB / 0.10 GiB for this corpus) rather
 than content.
 
 **(b) A bounded, evicting on-disk content store (`FsStore`).** An unbounded one
-is a full second copy of /nix/store — 152 GiB, which does not even fit on this
-project's development host (43 GiB free). A *bounded* one fits, but then supply
+is a full second copy of the serialized NAR corpus — about 103 GiB for the
+measured 105,713-MiB corpus, which does not even fit on this project's
+development host (43 GiB free). A *bounded* one fits, but then supply
 is capped at the budget, which throws away the exact property the "Seeding
 scope: whole /nix/store via `--dump`" decision bought: **largest supply at zero
 storage cost**.
 
 ### Decision: arm (a). No local blob copy exists at rest.
 
-A copy of a NAR exists only for the duration of a serve, and its size is now
-bounded by an explicit budget (task-72). The PRD's "no second copy of the store,
-no retention policy problem" position is **upheld and implemented**, not
-weakened.
+No local blob copy exists at rest. On the primary libp2p `/nar/4` process path,
+not even a whole-NAR serve copy exists: a serve retains bounded process/codec
+chunks, at most one raw and one encoded 64-KiB leaf, an O(tree-depth)
+authentication stack, and a declared-size-derived ephemeral Bao outboard. The
+optional iroh-blobs whole-object backend and memory-backed test supply still
+materialize their input, and the current libp2p fetch compatibility collector
+still builds one `Vec`; TASK-62 owns exposing the bounded verified-leaf primitive
+through `peer-fabric::NarStream` and removing that fetch-side O(N) collector. The
+PRD's "no second copy of the store, no retention policy problem" position is
+**upheld and implemented**, with those boundaries stated rather than hidden.
 
 ### What arm (a) costs — stated, not hand-waved
 
-1. **Re-hash on demand.** Every serve of a path whose `BLAKE3(RawNarV1)` is not
-   already cached in memory costs one full `nix-store --dump` (a read of the
-   whole path off disk) plus one BLAKE3 pass, and iroh-blobs recomputes the bao
-   outboard on add. Task-64 measured the peer path at ~204 MB/s CPU-bound with
-   72% of the work below our code, so the hash is not the bottleneck — the dump
-   is. Repeat serves inside one process pay it once (the availability index
-   caches the digest under a single-flight lock).
+1. **The primary libp2p process path pays two exact dumps per serve.** `/nar/4`
+   pass 1 reads exactly `NarSize`, proves EOF + exit zero, prepares the ephemeral
+   Bao outboard, and checks its root before status. Pass 2 regenerates exactly
+   the same bytes, authenticates each leaf against that outboard before socket
+   write, and again proves EOF + exit zero. This removes whole-NAR buffering but
+   does not remove preparation latency and adds a second dump. The in-memory
+   digest cache avoids rediscovering the address digest; it does not waive either
+   serve-time replay because pass-2 nondeterminism must fail closed. Task-64's
+   earlier ~204 MB/s whole-object measurement remains context, not evidence that
+   the new two-pass path is free. The optional iroh-blobs backend retains its
+   separate whole-object add/outboard behavior.
 2. **A real, bounded seeding gap.** A restart empties the blob store *and* the
    in-memory digest cache. Until a hold-query re-derives a path's digest, a
    claim already published to the DHT naming that digest is undiallable: the
    fetching peer gets a bounded `Unavailable` and falls back to upstream. This
    is an AVAILABILITY cost, never an integrity one (Nix re-verifies sig +
    NarHash; the daemon is outside the TCB). Warming the whole cache at boot is
-   NOT an option — it would re-dump and re-hash 152 GiB.
-3. **In-flight memory becomes the whole memory cost, so it must be bounded.**
-   With nothing held at rest, the only RAM the supply path costs is the NAR
-   being served right now. Bounding it is task-72 and is a hard requirement of
-   this decision, not a follow-up.
+   NOT an option — it would re-dump and re-hash about 103 GiB of NAR content.
+3. **In-flight memory becomes the whole memory cost, so every term is explicit.**
+   Process serving uses bounded process/codec chunks, one ownership-preserving
+   raw/encoded leaf handoff, O(tree depth), and the ephemeral outboard; task-72's
+   declared-size reservation bounds concurrent admission. Memory-backed supply
+   may own its input `Vec`. Fetch remains O(N) only at the named compatibility
+   collector until TASK-62 wires the already-bounded internal leaf stream to
+   HTTP. Those are hard boundaries of this decision, not implied follow-ups.
 
 ### Rejected sub-option: persisting bao outboards
 
-The brief's candidate was the outboard (~0.4% of content, ~0.6 GiB for this
-store) as the artifact worth keeping. Rejected, for two reasons:
+The brief's candidate was the outboard. Under `/nar/4`'s fixed 64-KiB leaves,
+64 proof bytes per internal node are ~0.098% of NAR content: about 103 MiB
+(0.10 GiB) for this corpus, not the earlier estimate based on physical
+`/nix/store` disk usage. It now buys real work on the primary libp2p path: a
+valid persisted outboard would remove pass 1 and its proof-
+preparation latency on repeat serves. It would not remove pass 2, because each
+fresh `nix-store --dump` still has to authenticate against the requested root
+before its leaves ship. It remains rejected for now because AC9 has not shown
+enough measured repeat-serve benefit to justify ~103 MiB of retained derived
+state plus its format, atomic durability, source binding/invalidation, and
+operator lifecycle design. Revisit with that evidence; do not claim it buys
+nothing.
 
-- **It does not buy the thing that hurts.** The outboard removes the *tree*
-  recomputation, not the dump — bao still verifies against the content, so the
-  content must still be regenerated. Cost #1 above is dominated by the dump.
-- **The pinned API cannot express it.** iroh-blobs 0.103 ships exactly two
-  writable stores (`mem`, `fs`), and each owns its content; there is no public
-  way to serve a blob whose outboard is persisted while its content is produced
-  on demand. Implementing it means a custom `Store` impl against an unstable
-  trait. Re-openable if that is ever justified; not justified now.
+The API constraint is backend-specific. The new libp2p `/nar/4` implementation
+owns its wire and could be extended to load a designed persisted outboard.
+Pinned iroh-blobs 0.103 still exposes only content-owning `mem`/`fs` writable
+stores, so using the same on-demand-content scheme there would require a custom
+`Store` implementation against an unstable trait. That iroh limitation is not a
+reason to misdescribe what the libp2p path can do.
 
-**What IS worth persisting is the 32-byte digest, not the 620 MiB outboard.**
+**What IS worth persisting now is the 32-byte digest, not the ~103 MiB outboard.**
 Binding `NarHashKey -> (StorePath, Blake3Digest, NarSize)` on disk costs about
 40 bytes per path beyond the registration already persisted — **~0.5 MB for the
 12,396 servable paths, 0.0005% of content** — and closes cost #2 (the seeding gap)

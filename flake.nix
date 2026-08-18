@@ -29,6 +29,7 @@
       rustToolchain = pkgs.rust-bin.fromRustupToolchainFile ./rust-toolchain.toml;
 
       craneLib = (crane.mkLib pkgs).overrideToolchain rustToolchain;
+      irohPatchSource = craneLib.cleanCargoSource ./vendor/iroh;
 
       # Cargo.toml owns the version; duplicating it here would let the store
       # path (daemon-0.0.1) drift from what the binary reports.
@@ -54,16 +55,31 @@
       # (daemon/tests/golden/*.json), which `daemon/tests/golden_vectors.rs`
       # `include_str!`s so the frozen addressed-unit encoding is conformance-tested
       # inside the sandbox. TASK-219 also keeps the exact README + MIT license of the
-      # reproducibly vendored libp2p-stream patch; its crate root `include_str!`s the README and
-      # dropping either provenance file from the Nix source would make the vendored build
-      # incomplete. These are tracked source inputs (unlike the fixture cache).
+      # reproducibly vendored libp2p-stream patch. The Iroh 1.0.3 shutdown patch likewise
+      # carries its exact upstream license texts, packaged BSD-3-Clause notice,
+      # and a narrow local provenance record.
+      # These are tracked source inputs (unlike the fixture cache).
       src = pkgs.lib.cleanSourceWith {
         src = ./.;
         name = "source";
         filter = path: type:
           (builtins.match ".*/tests/golden/.*\\.json$" path != null)
           || (builtins.match ".*/vendor/libp2p-stream/(README\\.md|LICENSE)$" path != null)
+          || (builtins.match ".*/vendor/iroh/(README\\.md|PATCH-PROVENANCE\\.md|LICENSE-(MIT|APACHE|BSD3)|\\.cargo_vcs_info\\.json)$" path != null)
           || craneLib.filterCargoSources path type;
+      };
+
+      # Crane normally dummifies every workspace path dependency. Because Iroh
+      # is a global crates.io path patch, that hides its real public API from
+      # external dependants such as iroh-util while building daemon deps. Put
+      # the cleaned real patch back into workspace dummy sources at the root.
+      workspaceDummySrc = craneLib.mkDummySrc {
+        inherit src;
+        extraDummyScript = ''
+          rm -rf "$out/vendor/iroh"
+          mkdir -p "$out/vendor"
+          cp -R --no-preserve=mode,ownership "${irohPatchSource}" "$out/vendor/iroh"
+        '';
       };
 
       # The mock upstream's payload set (task-3). Read from a file rather than
@@ -119,9 +135,28 @@
         buildInputs = [ pkgs.openssl ];
       };
 
+      buildWorkspaceDeps = args: craneLib.buildDepsOnly (args // {
+        dummySrc = workspaceDummySrc;
+      });
+
       # Workspace-wide dependency closure. Used ONLY by workspace-level checks
       # (clippy/test), never by the two packages - see memberPackage.
-      workspaceArtifacts = craneLib.buildDepsOnly commonArgs;
+      workspaceArtifacts = buildWorkspaceDeps commonArgs;
+
+      # The patched Iroh crate is deliberately excluded from the root workspace:
+      # its upstream integration targets contact staging infrastructure. Keep a
+      # separate dependency closure from its preserved crates.io lockfile so the
+      # sandbox can lint the production delta and run only our deterministic
+      # fixed-port release regressions.
+      irohPatchCargoVendorDir = craneLib.vendorCargoDeps {
+        cargoLock = ./vendor/iroh/Cargo.lock;
+      };
+      irohPatchArgs = commonArgs // {
+        pname = "iroh-shutdown-patch";
+        cargoExtraArgs = "--locked --manifest-path vendor/iroh/Cargo.toml";
+        cargoVendorDir = irohPatchCargoVendorDir;
+      };
+      irohPatchArtifacts = craneLib.buildDepsOnly irohPatchArgs;
 
       # Per-member argument set. Each package gets its OWN dependency closure,
       # so a broken testproxy dependency no longer fails `nix build .#daemon`
@@ -139,7 +174,7 @@
       memberPackage = name:
         let args = memberArgs name;
         in craneLib.buildPackage (args // {
-          cargoArtifacts = craneLib.buildDepsOnly args;
+          cargoArtifacts = buildWorkspaceDeps args;
           meta.mainProgram = name;
         });
 
@@ -160,7 +195,7 @@
         cargoExtraArgs = "--locked --package daemon --features evidence-fixture";
       };
       daemonLookupEvidence = craneLib.buildPackage (lookupEvidenceDaemonArgs // {
-        cargoArtifacts = craneLib.buildDepsOnly lookupEvidenceDaemonArgs;
+        cargoArtifacts = buildWorkspaceDeps lookupEvidenceDaemonArgs;
       });
 
       # Static /etc for the e2e image. A real /etc/passwd is what lets the
@@ -428,6 +463,11 @@
           cargoClippyExtraArgs = "--workspace --all-targets -- -D warnings";
         });
 
+        iroh-shutdown-clippy = craneLib.cargoClippy (irohPatchArgs // {
+          cargoArtifacts = irohPatchArtifacts;
+          cargoClippyExtraArgs = "--lib -- -D warnings";
+        });
+
         iroh-lookup-fixture-clippy = craneLib.cargoClippy (commonArgs // {
           pname = "nix-p2p-iroh-lookup-fixture-clippy";
           cargoArtifacts = workspaceArtifacts;
@@ -436,6 +476,13 @@
 
         fmt = craneLib.cargoFmt { inherit src; pname = "nix-p2p-workspace"; version = cargoVersion; };
 
+        iroh-shutdown-fmt = craneLib.cargoFmt {
+          inherit src;
+          pname = "iroh-shutdown-patch";
+          version = cargoVersion;
+          cargoExtraArgs = "--manifest-path vendor/iroh/Cargo.toml";
+        };
+
         test = craneLib.cargoTest (commonArgs // {
           cargoArtifacts = workspaceArtifacts;
           # buildDepsOnly leaves dependency-shaped dummy binaries in the
@@ -443,6 +490,11 @@
           # the real packaged fixture instead of letting it mistake that dummy
           # for a runnable testproxy.
           TESTPROXY_BIN = "${self.packages.${system}.testproxy}/bin/testproxy";
+        });
+
+        iroh-shutdown-test = craneLib.cargoTest (irohPatchArgs // {
+          cargoArtifacts = irohPatchArtifacts;
+          cargoTestExtraArgs = "--lib fixed_port_";
         });
 
         # Compile and test the feature-gated adversarial lookup fixture on the

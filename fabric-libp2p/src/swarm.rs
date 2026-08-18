@@ -28,7 +28,7 @@ use crate::keys::{keypair_from_seed, node_id_of};
 use crate::nar::{self, ServeGate};
 use peer_fabric::{
     AdmitAllPublication, Blake3Digest, Lookup, NodeId, PublicationEligibility, RefusePublication,
-    TransferError, Unavailable,
+    TransferError, Unavailable, WireCodec,
 };
 
 /// The shared serve-gate slot (TASK-157): the installed [`ServeGate`], or `None` when this
@@ -583,26 +583,34 @@ pub struct SwarmHandle {
     /// Opens outbound NAR substreams. Production offer fetches use the vendored exact-connection
     /// method; peer-only auto-dial remains only for lower-level measurement/test callers.
     control: Control,
-    /// The raw-stream NAR protocol name (`/nix-p2p/<scope>/nar/3`), for `open_stream`.
+    /// The Bao-authenticated NAR protocol name (`/nix-p2p/<scope>/nar/4`).
     nar_protocol: StreamProtocol,
     /// The installed serve gate (or `None`); read by the accept loop, written by install /
     /// uninstall. See [`ServeSlot`].
     serve_slot: ServeSlot,
 }
 
-/// The outcome of a measurement-facing NAR fetch ([`SwarmHandle::fetch_nar_streaming_measured`]):
-/// the gate-1-verified decoded NAR plus the number of COMPRESSED body bytes that crossed the wire.
-/// `bytes.len()` is always the uncompressed NarSize (post-decode); `wire_body_bytes` is what the
-/// link actually carried — equal to the NarSize for a raw fetch, the compressed frame for a zstd
-/// fetch. Keeping both explicit is how the harness compares like-for-like without conflating the
-/// uncompressed and compressed units.
+/// Measurement-facing result for one successful `/nar/4` fetch. Byte counts are exact NAR
+/// substream protocol bytes; timings share the instant immediately before request writing.
+/// They intentionally exclude TCP/IP, Noise/yamux overhead, retransmissions, discovery and dial.
 #[derive(Debug, Clone)]
 pub struct StreamedFetch {
     /// The decoded, BLAKE3-verified NAR bytes (uncompressed).
     pub bytes: Vec<u8>,
-    /// The compressed body bytes actually read from the wire (excludes the 2 framing header
-    /// bytes). For a raw fetch this equals `bytes.len()`; for a zstd fetch it is the frame size.
-    pub wire_body_bytes: u64,
+    /// Exact component accounting and asserted totals for the successful exchange.
+    pub wire: crate::NarV4WireAccounting,
+    /// Request flush completion relative to the shared request-write origin.
+    pub request_complete_ns: u128,
+    /// First response byte relative to the shared request-write origin.
+    pub first_response_byte_ns: u128,
+    /// First Bao-authenticated raw leaf relative to the same origin. This is not absolute
+    /// TTFB: v4 proof preparation occurs before the provider's first response byte.
+    pub authenticated_first_leaf_ns: u128,
+    /// COMPLETE, clean FIN and final authentication relative to the same origin.
+    pub total_fetch_ns: u128,
+    /// Codec byte actually selected by the provider and validated against the
+    /// request accept mask. Measurements must not infer this from the offer.
+    pub selected_codec: WireCodec,
 }
 
 /// Immutable data for one attributed NAR stream request. Keeping the content contract and its
@@ -639,39 +647,53 @@ impl NarFetchRequest {
 /// BEFORE the substream opened or AFTER. This distinction is load-bearing for the
 /// relay-reachability oracle - only a `NotOpened` failure means the provider was UNREACHABLE.
 ///
-///   * [`FetchOutcome::Ok`] - the NAR was fetched and gate-1-verified.
+///   * [`FetchOutcome::Ok`] - the NAR was fetched and Bao-authenticated.
 ///   * [`FetchOutcome::NotOpened`] - the substream was NEVER opened: `open_stream` returned an
 ///     error or the dial timed out. Over a relay this is a dial / circuit-establishment failure
 ///     (the provider was NOT reached at any resolved dial address). This, and ONLY this, is an
 ///     "unreachable" failure.
 ///   * [`FetchOutcome::OpenedThenFailed`] - the substream OPENED (the provider WAS reached and
-///     the `/nar/3` protocol negotiated), but the transfer then failed: a `NotHeld` / `Declined`
-///     reply, a `TooLarge` size abort, a gate-1 `IntegrityMismatch`, a mid-body idle timeout, or
+///     `/nar/4` negotiated), but the transfer then failed: `NotHeld` / `Declined`, a declared-size
+///     rejection, Bao authentication/framing failure, a mid-body idle timeout, or
 ///     a post-open write error. The relay WORKED here - conflating this with `NotOpened` would
 ///     falsely blame the relay for a reachable provider that merely does not hold the content.
 #[derive(Debug)]
 pub enum FetchOutcome {
     Ok(StreamedFetch),
     NotOpened(TransferError),
+    /// The peer was reached, but does not implement wholesale `/nar/4`.
+    /// This is an offer-compatibility failure, never an unreachability signal,
+    /// and there is deliberately no `/nar/3` downgrade attempt.
+    ProtocolIncompatible(TransferError),
     OpenedThenFailed(TransferError),
 }
 
-/// A pass-through [`AsyncRead`] that tallies every byte it yields. It lets a measurement caller
-/// learn how many bytes actually crossed the wire (the compressed body volume for a zstd fetch,
-/// the raw volume for a raw fetch) without touching the framing reader. Measurement-only; not on
-/// any hot path.
+/// A pass-through [`AsyncRead`] that counts exact `/nar/4` response protocol bytes and records
+/// first response byte against the request-write origin. Measurement-only; not a network-layer
+/// byte counter (Noise/yamux/TCP overhead and retransmissions are outside this unit).
 struct CountingReader<'a, R> {
     inner: &'a mut R,
     count: u64,
+    request_started: Instant,
+    first_response_byte_ns: Option<u128>,
 }
 
 impl<'a, R> CountingReader<'a, R> {
-    fn new(inner: &'a mut R) -> Self {
-        CountingReader { inner, count: 0 }
+    fn new(inner: &'a mut R, request_started: Instant) -> Self {
+        CountingReader {
+            inner,
+            count: 0,
+            request_started,
+            first_response_byte_ns: None,
+        }
     }
 
     fn count(&self) -> u64 {
         self.count
+    }
+
+    fn first_response_byte_ns(&self) -> Option<u128> {
+        self.first_response_byte_ns
     }
 }
 
@@ -684,6 +706,9 @@ impl<R: AsyncRead + Unpin> AsyncRead for CountingReader<'_, R> {
         match Pin::new(&mut *self.inner).poll_read(cx, buf) {
             Poll::Ready(Ok(n)) => {
                 self.count += n as u64;
+                if n != 0 && self.first_response_byte_ns.is_none() {
+                    self.first_response_byte_ns = Some(self.request_started.elapsed().as_nanos());
+                }
                 Poll::Ready(Ok(n))
             }
             other => other,
@@ -1221,14 +1246,16 @@ impl SwarmHandle {
         out
     }
 
-    /// Fetch `content` from `peer` by STREAMING it over a raw NAR substream (TASK-157),
-    /// returning the gate-1 BLAKE3-verified bytes. The full envelope is enforced INSIDE:
+    /// Fetch `content` from `peer` over the Bao-authenticated `/nar/4` substream,
+    /// returning collected, authenticated raw NAR bytes. The full envelope is enforced INSIDE:
     ///
     ///   * `dial_timeout` bounds opening the stream (`open_stream` auto-dials `peer` off the
     ///     kad-known address the transport resolved and `add_address`'d before calling here);
     ///   * `body_idle_timeout` bounds each inter-chunk read (a stalled peer aborts);
-    ///   * the running SIZE abort at `expected_size` (mid-stream) and the gate-1 verify live
-    ///     in [`nar::read_response_streamed`].
+    ///   * the response's declared raw size is checked against `expected_size` before tree
+    ///     allocation;
+    ///   * each decoded raw leaf is authenticated against `content`, and the final leaf is
+    ///     released only after COMPLETE plus clean FIN in [`nar::read_response_streamed`].
     ///
     /// The requester keeps its write half OPEN for the whole transfer (the server's
     /// still-interested signal). The transport wraps this in the coarse `total_timeout`.
@@ -1257,15 +1284,15 @@ impl SwarmHandle {
 
     /// Measurement-facing fetch (TASK-198): like [`fetch_nar_streaming`], but lets the caller
     /// choose whether to OFFER zstd (`offer_zstd = false` sends the raw-only accept set, the
-    /// mandatory floor a compliant fetcher always includes) and reports the COMPRESSED body
-    /// bytes that actually crossed the wire alongside the gate-1-verified NAR.
+    /// mandatory floor a compliant fetcher always includes) and reports exact successful v4
+    /// protocol-byte components alongside the Bao-authenticated NAR.
     ///
     /// It exists so the shaped-link harness can transfer the SAME nar RAW vs ZSTD over the SAME
-    /// link and compare like-for-like — the raw arm's `wire_body_bytes` is the uncompressed
-    /// NarSize; the zstd arm's is the compressed frame (the recurring unit trap made observable,
-    /// never conflated). It changes NO wire framing: same request bytes, same
-    /// [`nar::read_response_streamed`] reader; only the offered `accept` byte differs and a
-    /// pass-through counter tallies the body. Not on the hot path.
+    /// link and compare like-for-like. Both arms use exact response-protocol totals from
+    /// [`crate::NarV4WireAccounting`]: header, Bao proofs, optional per-leaf length prefixes,
+    /// encoded leaves, and COMPLETE. It changes no wire framing: the same request and
+    /// [`nar::read_response_streamed`] reader are used; only the offered `accept` byte differs.
+    /// Not on the hot path.
     pub async fn fetch_nar_streaming_measured(
         &self,
         peer: PeerId,
@@ -1290,7 +1317,9 @@ impl SwarmHandle {
             .await
         {
             FetchOutcome::Ok(fetch) => Ok(fetch),
-            FetchOutcome::NotOpened(error) | FetchOutcome::OpenedThenFailed(error) => Err(error),
+            FetchOutcome::NotOpened(error)
+            | FetchOutcome::ProtocolIncompatible(error)
+            | FetchOutcome::OpenedThenFailed(error) => Err(error),
         }
     }
 
@@ -1298,8 +1327,9 @@ impl SwarmHandle {
     /// (TASK-218). The split point is `open_stream`: an error/timeout there is a dial /
     /// circuit-establishment failure ([`FetchOutcome::NotOpened`] — the provider was UNREACHABLE
     /// at every resolved dial address); once the stream is open the provider WAS reached and
-    /// every subsequent failure (a `NotHeld`/`Declined` reply, a `TooLarge` abort, a gate-1
-    /// `IntegrityMismatch`, a mid-body idle timeout, a post-open write error) is
+    /// every subsequent failure (a `NotHeld`/`Declined` reply, declared-size rejection, Bao
+    /// `AuthenticationFailed`, malformed/truncated framing, a body-idle timeout, or a post-open
+    /// write error) is
     /// [`FetchOutcome::OpenedThenFailed`]. The transport uses this to log "UNREACHABLE" ONLY on
     /// a genuine dial failure, never for a reachable provider that merely does not hold the NAR.
     pub async fn fetch_nar_streaming_attributed(
@@ -1370,6 +1400,11 @@ impl SwarmHandle {
         // never reached (unreachable). Everything past this point is a post-open transfer error.
         let mut stream = match tokio::time::timeout(dial_timeout, open).await {
             Ok(Ok(stream)) => stream,
+            Ok(Err(libp2p_stream::OpenStreamError::UnsupportedProtocol(protocol))) => {
+                return FetchOutcome::ProtocolIncompatible(TransferError::Unavailable(format!(
+                    "peer {peer} does not support required {protocol}; /nar/3 downgrade is forbidden"
+                )));
+            }
             Ok(Err(error)) => {
                 return FetchOutcome::NotOpened(TransferError::Unavailable(format!(
                     "libp2p could not open a NAR stream to {peer}: {error}"
@@ -1387,25 +1422,53 @@ impl SwarmHandle {
         } else {
             peer_fabric::ACCEPT_RAW
         };
+        let request_started = std::time::Instant::now();
         // The substream is OPEN — the provider was REACHED. From here, failures are post-open.
         if let Err(error) = nar::write_request(&mut stream, &content, accept).await {
             return FetchOutcome::OpenedThenFailed(TransferError::Unavailable(format!(
                 "libp2p failed to send the NAR request to {peer}: {error}"
             )));
         }
-        // Count every byte the reader pulls so the caller learns the COMPRESSED body volume
-        // without any change to the framing reader. On the success (NAR) path the reader
-        // consumes exactly a 1-byte status + a 1-byte codec header before the body, so the
-        // body volume is the tally minus those two framing bytes.
-        let mut counting = CountingReader::new(&mut stream);
-        match nar::read_response_streamed(&mut counting, expected_size, body_idle_timeout, &content)
-            .await
+        let request_complete_ns = request_started.elapsed().as_nanos();
+        // Count the exact successful response protocol bytes and timestamp its first byte at
+        // the same request-write origin used by first-authenticated-leaf and total-fetch.
+        let mut counting = CountingReader::new(&mut stream, request_started);
+        match nar::read_response_streamed_since(
+            &mut counting,
+            expected_size,
+            body_idle_timeout,
+            &content,
+            request_started,
+            accept,
+        )
+        .await
         {
-            Ok(bytes) => {
-                let wire_body_bytes = counting.count().saturating_sub(2);
+            Ok(authenticated) => {
+                let wire = match crate::NarV4WireAccounting::from_response_protocol_bytes(
+                    authenticated.bytes.len() as u64,
+                    authenticated.selected_codec,
+                    counting.count(),
+                ) {
+                    Ok(wire) => wire,
+                    Err(error) => {
+                        return FetchOutcome::OpenedThenFailed(TransferError::Unavailable(
+                            format!("invalid /nar/4 byte accounting for {content}: {error}"),
+                        ));
+                    }
+                };
+                let Some(first_response_byte_ns) = counting.first_response_byte_ns() else {
+                    return FetchOutcome::OpenedThenFailed(TransferError::Unavailable(format!(
+                        "successful /nar/4 response for {content} had no first-byte timestamp"
+                    )));
+                };
                 FetchOutcome::Ok(StreamedFetch {
-                    bytes,
-                    wire_body_bytes,
+                    bytes: authenticated.bytes,
+                    wire,
+                    request_complete_ns,
+                    first_response_byte_ns,
+                    authenticated_first_leaf_ns: authenticated.authenticated_first_leaf_ns,
+                    total_fetch_ns: authenticated.total_fetch_ns,
+                    selected_codec: authenticated.selected_codec,
                 })
             }
             Err(error) => FetchOutcome::OpenedThenFailed(error),
@@ -3141,13 +3204,11 @@ impl Node {
         let kad_protocol = StreamProtocol::try_from_owned(format!("/nix-p2p/{scope}/kad/1.0.0"))
             .map_err(|e| NodeError::Build(format!("invalid kad protocol name: {e:?}")))?;
         let id_protocol = format!("/nix-p2p/{scope}/id/1.0.0");
-        // `/nar/3`: TASK-99 adds an explicit per-connection codec byte (negotiated zstd, raw
-        // fallback) to the raw-stream framing, wire-incompatible with `/nar/2` (TASK-157),
-        // so the version is bumped wholesale - exactly as `/nar/2` replaced the
-        // request-response `/nar/1` (TASK-151), with no dual-accept. The protocol NAME is a
-        // transport detail, not a frozen surface - the RawNarV1 bytes it carries (and their
-        // BLAKE3 id) are unchanged; only the LINK encoding is negotiable.
-        let nar_protocol = StreamProtocol::try_from_owned(format!("/nix-p2p/{scope}/nar/3"))
+        // `/nar/4` is a wholesale security bump: fixed 64-KiB Bao leaves,
+        // response-global raw/per-leaf-zstd codec, exact raw_size, COMPLETE and
+        // clean FIN. Only v4 is registered; accepting v3 would silently discard
+        // per-leaf authentication.
+        let nar_protocol = StreamProtocol::try_from_owned(format!("/nix-p2p/{scope}/nar/4"))
             .map_err(|e| NodeError::Build(format!("invalid nar protocol name: {e:?}")))?;
 
         let swarm = libp2p::SwarmBuilder::with_existing_identity(keypair)
@@ -3182,7 +3243,7 @@ impl Node {
                         identify::Behaviour::new(identify::Config::new(id_protocol, key.public()));
                     // The RAW-STREAM NAR byte-transfer substrate (TASK-157): opened and
                     // accepted through a Control on tasks OFF this poll loop. It is
-                    // protocol-agnostic here; the concrete `/nar/3` name is registered on the
+                    // protocol-agnostic here; the concrete `/nar/4` name is registered on the
                     // accept side below.
                     let stream = libp2p_stream::Behaviour::new();
                     // NAT traversal (TASK-168). See the `Behaviour` doc for the role of each.
@@ -3228,7 +3289,7 @@ impl Node {
             .map_err(NodeError::Build)?;
 
         // The raw-stream NAR surface (TASK-157). One Control drives both directions: it
-        // registers the inbound `/nar/3` protocol (once) via `accept`, and opens outbound
+        // registers the inbound `/nar/4` protocol (once) via `accept`, and opens outbound
         // NAR streams for fetches. The accept loop runs the SERVE half entirely off the poll
         // loop, reading the current gate from the shared slot.
         let mut control = swarm.behaviour().stream.new_control();
@@ -3276,6 +3337,70 @@ impl Node {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use futures::AsyncReadExt as _;
+    use proc_supervisor::TaskSupervisor;
+    use std::ffi::OsString;
+    use std::path::PathBuf;
+
+    struct ProcessProbe {
+        content: Blake3Digest,
+        body: PathBuf,
+        counter: PathBuf,
+        pass2_ready: PathBuf,
+        pass2_release: PathBuf,
+    }
+
+    impl nar::CatalogProbe for ProcessProbe {
+        fn probe(&self, content: &Blake3Digest) -> Option<nar::ProbedSupply> {
+            (content == &self.content).then(|| {
+                let script = "n=$(cat \"$1\" 2>/dev/null || printf 0); n=$((n + 1)); \
+                     printf %s \"$n\" > \"$1\"; \
+                     if [ \"$n\" -eq 1 ]; then cat \"$2\"; exit $?; fi; \
+                     head -c 65536 \"$2\"; : > \"$3\"; \
+                     while [ ! -e \"$4\" ]; do sleep 0.01; done; \
+                     tail -c +65537 \"$2\"";
+                nar::ProbedSupply {
+                    declared_size: std::fs::metadata(&self.body)
+                        .expect("test NAR exists")
+                        .len(),
+                    source: nar::ProbedSource::Process {
+                        program: PathBuf::from("sh"),
+                        args: vec![
+                            OsString::from("-c"),
+                            OsString::from(script),
+                            OsString::from("nar4-real-two-node"),
+                            self.counter.clone().into_os_string(),
+                            self.body.clone().into_os_string(),
+                            self.pass2_ready.clone().into_os_string(),
+                            self.pass2_release.clone().into_os_string(),
+                        ],
+                    },
+                }
+            })
+        }
+    }
+
+    struct Nar4TestFiles(Vec<PathBuf>);
+
+    impl Drop for Nar4TestFiles {
+        fn drop(&mut self) {
+            for path in &self.0 {
+                let _ = std::fs::remove_file(path);
+            }
+        }
+    }
+
+    fn nar4_test_nonce() -> String {
+        let time = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock after epoch")
+            .as_nanos();
+        format!("{}-{time}", std::process::id())
+    }
+
+    fn nar4_test_path(stem: &str, nonce: &str) -> PathBuf {
+        std::env::temp_dir().join(format!("nix-p2p-nar4-{stem}-{nonce}"))
+    }
 
     // TASK-242: derive aggregate status from the exact ConnectionId route SSOT. Direct remains
     // dominant for a hole-punched peer with a lingering circuit, and no routes means disconnected.
@@ -4312,5 +4437,154 @@ mod tests {
             "fresh INDEPENDENT-salt retries must self-heal the out-competed victim within {retries} \
              retries; it was never selected - the per-query salt is not renewing the selection"
         );
+    }
+
+    /// AC#6 real-network oracle: two production `Node` swarms negotiate only `/nar/4`.
+    /// The provider's second supervised dump writes exactly one raw leaf and then blocks
+    /// before its later bytes and EOF. The consumer must receive that leaf from the
+    /// bounded verifier while the release marker is still absent; waiting for EOF or the
+    /// whole NAR would deadlock this test.
+    #[tokio::test]
+    async fn real_two_node_process_serve_exposes_first_authenticated_leaf_before_later_eof() {
+        let body = (0..((64 * 1024) + 37))
+            .map(|index| (index as u8).wrapping_mul(31))
+            .collect::<Vec<_>>();
+        let content = Blake3Digest::from_raw_nar(&body);
+        let nonce = nar4_test_nonce();
+        let body_path = nar4_test_path("body", &nonce);
+        let counter = nar4_test_path("counter", &nonce);
+        let pass2_ready = nar4_test_path("pass2-ready", &nonce);
+        let pass2_release = nar4_test_path("pass2-release", &nonce);
+        let _cleanup = Nar4TestFiles(vec![
+            body_path.clone(),
+            counter.clone(),
+            pass2_ready.clone(),
+            pass2_release.clone(),
+        ]);
+        std::fs::write(&body_path, &body).expect("write test NAR");
+
+        let scope = format!("nar4-real-two-node-{nonce}");
+        let provider = Node::start(
+            NodeConfig::new([0xa1; 32])
+                .with_network_scope(scope.clone())
+                .with_relay_server(false),
+        )
+        .expect("start provider node");
+        let consumer = Node::start(
+            NodeConfig::new([0xb2; 32])
+                .with_network_scope(scope)
+                .with_relay_server(false),
+        )
+        .expect("start consumer node");
+        provider
+            .handle
+            .listen("/ip4/127.0.0.1/tcp/0".parse().unwrap())
+            .await
+            .expect("provider listens");
+        let provider_addr = provider
+            .handle
+            .listen_addrs()
+            .await
+            .into_iter()
+            .next()
+            .expect("provider has a concrete listener")
+            .with(libp2p::multiaddr::Protocol::P2p(provider.peer_id));
+
+        let supervisor = TaskSupervisor::new();
+        let supplier = Arc::new(nar::CatalogNarSupplier::new(
+            ProcessProbe {
+                content,
+                body: body_path.clone(),
+                counter: counter.clone(),
+                pass2_ready: pass2_ready.clone(),
+                pass2_release: pass2_release.clone(),
+            },
+            "unused-helper",
+        ));
+        let gate = Arc::new(ServeGate::new(
+            peer_fabric::ServeBudget {
+                max_nar_bytes_uncompressed_nar: 1 << 20,
+                max_inflight_bytes_uncompressed_nar: 1 << 20,
+                max_serve_duration: Duration::from_secs(10),
+            },
+            supplier,
+            supervisor.handle(),
+        ));
+        provider.handle.install_serve(Arc::clone(&gate)).await;
+
+        consumer
+            .handle
+            .dial(provider_addr)
+            .await
+            .expect("consumer connects to provider");
+        let mut control = consumer.handle.control.clone();
+        let mut stream = control
+            .open_stream(provider.peer_id, consumer.handle.nar_protocol.clone())
+            .await
+            .expect("open the required /nar/4 stream");
+        nar::write_request(&mut stream, &content, peer_fabric::ACCEPT_RAW)
+            .await
+            .expect("write v4 request");
+
+        let mut header = [0u8; 10];
+        tokio::time::timeout(Duration::from_secs(5), stream.read_exact(&mut header))
+            .await
+            .expect("provider prepares the proof and sends the v4 header")
+            .expect("read v4 header");
+        assert_eq!(header[0], 1, "STATUS_NAR");
+        assert_eq!(header[1], WireCodec::Raw.wire());
+        assert_eq!(
+            u64::from_le_bytes(header[2..].try_into().unwrap()),
+            body.len() as u64
+        );
+
+        let (wire_sink, mut verified) =
+            nar::verified_nar_stream(content, body.len() as u64, WireCodec::Raw).await;
+        let pump = nar::pump_bao_wire(&mut stream, wire_sink, Duration::from_secs(5), &content);
+        tokio::pin!(pump);
+        let first_leaf = tokio::select! {
+            leaf = verified.next_leaf() => leaf.expect("one authenticated full leaf"),
+            result = &mut pump => panic!("wire ended before an early authenticated leaf: {result:?}"),
+            () = tokio::time::sleep(Duration::from_secs(5)) => {
+                panic!("first authenticated leaf waited for pass-2 EOF")
+            }
+        };
+        assert_eq!(&first_leaf[..], &body[..64 * 1024]);
+        assert!(
+            pass2_ready.exists(),
+            "provider reached the intentional pass-2 block"
+        );
+        assert!(
+            !pass2_release.exists(),
+            "the first authenticated leaf crossed before later stdout/EOF was released"
+        );
+
+        std::fs::write(&pass2_release, []).expect("release pass 2");
+        let drain = async {
+            let mut tail = Vec::new();
+            while let Some(leaf) = verified.next_leaf().await {
+                tail.extend_from_slice(&leaf);
+            }
+            tail
+        };
+        let (pump_result, tail) = tokio::join!(&mut pump, drain);
+        pump_result.expect("COMPLETE and clean FIN");
+        assert_eq!(verified.finish().await.unwrap(), body.len() as u64);
+        let mut received = first_leaf.to_vec();
+        received.extend_from_slice(&tail);
+        assert_eq!(received, body);
+        assert_eq!(
+            std::fs::read_to_string(&counter).unwrap().trim(),
+            "2",
+            "exactly two process regenerations"
+        );
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while supervisor.process_jobs().active_len() != 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("both process groups are reaped");
+        assert_eq!(gate.counters().admitted, 1);
     }
 }

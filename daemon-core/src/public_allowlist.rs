@@ -573,6 +573,77 @@ enum OpenMode {
     ReadWrite,
 }
 
+/// An advisory-lock guard that issues `LOCK_UN` before its file descriptor is
+/// closed. This is stronger than close-only cleanup because a duplicated or
+/// pre-exec inherited descriptor keeps the same open-file description alive.
+struct AllowlistFileLock<'a> {
+    file: &'a std::fs::File,
+    path: &'a std::path::Path,
+    locked: bool,
+}
+
+impl<'a> AllowlistFileLock<'a> {
+    fn acquire(
+        file: &'a std::fs::File,
+        path: &'a std::path::Path,
+        operation: rustix::fs::FlockOperation,
+        purpose: &str,
+    ) -> Result<Self, AllowlistPersistError> {
+        rustix::fs::flock(file, operation).map_err(|error| {
+            AllowlistPersistError(format!("locking {} for {purpose}: {error}", path.display()))
+        })?;
+        Ok(Self {
+            file,
+            path,
+            locked: true,
+        })
+    }
+
+    fn unlock(&mut self) -> Result<(), AllowlistPersistError> {
+        if !self.locked {
+            return Ok(());
+        }
+        rustix::fs::flock(self.file, rustix::fs::FlockOperation::Unlock).map_err(|error| {
+            AllowlistPersistError(format!(
+                "unlocking {} after allowlist I/O: {error}",
+                self.path.display()
+            ))
+        })?;
+        self.locked = false;
+        Ok(())
+    }
+
+    fn finish<T>(
+        mut self,
+        operation: Result<T, AllowlistPersistError>,
+    ) -> Result<T, AllowlistPersistError> {
+        let unlock = self.unlock();
+        match (operation, unlock) {
+            (Ok(value), Ok(())) => Ok(value),
+            (Ok(_), Err(unlock_error)) => Err(unlock_error),
+            (Err(operation_error), Ok(())) => Err(operation_error),
+            (Err(operation_error), Err(unlock_error)) => {
+                eprintln!(
+                    "PUBLIC-ALLOWLIST-LOCK-RELEASE-FAILED path={} error={unlock_error}",
+                    self.path.display()
+                );
+                Err(operation_error)
+            }
+        }
+    }
+}
+
+impl Drop for AllowlistFileLock<'_> {
+    fn drop(&mut self) {
+        if let Err(error) = self.unlock() {
+            eprintln!(
+                "PUBLIC-ALLOWLIST-LOCK-RELEASE-FAILED path={} error={error}",
+                self.path.display()
+            );
+        }
+    }
+}
+
 impl FileAllowlistStore {
     /// Persist to `path`, MAC-protected under `mac_key` (a per-node secret). The parent
     /// directory is created on first append if absent.
@@ -786,25 +857,34 @@ impl AllowlistStore for FileAllowlistStore {
             return Ok(Vec::new());
         };
         // Shared lock: a concurrent writer's append is serialised against this read.
-        rustix::fs::flock(&file, rustix::fs::FlockOperation::LockShared).map_err(|e| {
-            AllowlistPersistError(format!("locking {} for read: {e}", self.path.display()))
-        })?;
-        let stat = rustix::fs::fstat(&file)
-            .map_err(|e| AllowlistPersistError(format!("sizing {}: {e}", self.path.display())))?;
-        if stat.st_size as u64 > MAX_ALLOWLIST_FILE_BYTES {
-            return Err(AllowlistPersistError(format!(
-                "{} is {} bytes, over the {MAX_ALLOWLIST_FILE_BYTES}-byte bound; refusing to load",
-                self.path.display(),
-                stat.st_size
-            )));
-        }
-        let mut bytes = Vec::new();
-        // Bounded read (defence-in-depth against a file that grew past the stat).
-        (&file)
-            .take(MAX_ALLOWLIST_FILE_BYTES)
-            .read_to_end(&mut bytes)
-            .map_err(|e| AllowlistPersistError(format!("reading {}: {e}", self.path.display())))?;
-        self.parse_committed(&bytes)
+        let lock = AllowlistFileLock::acquire(
+            &file,
+            &self.path,
+            rustix::fs::FlockOperation::LockShared,
+            "read",
+        )?;
+        let result = (|| {
+            let stat = rustix::fs::fstat(&file).map_err(|e| {
+                AllowlistPersistError(format!("sizing {}: {e}", self.path.display()))
+            })?;
+            if stat.st_size as u64 > MAX_ALLOWLIST_FILE_BYTES {
+                return Err(AllowlistPersistError(format!(
+                    "{} is {} bytes, over the {MAX_ALLOWLIST_FILE_BYTES}-byte bound; refusing to load",
+                    self.path.display(),
+                    stat.st_size
+                )));
+            }
+            let mut bytes = Vec::new();
+            // Bounded read (defence-in-depth against a file that grew past the stat).
+            (&file)
+                .take(MAX_ALLOWLIST_FILE_BYTES)
+                .read_to_end(&mut bytes)
+                .map_err(|e| {
+                    AllowlistPersistError(format!("reading {}: {e}", self.path.display()))
+                })?;
+            self.parse_committed(&bytes)
+        })();
+        lock.finish(result)
     }
 
     fn append(&self, nar_hash: &NarHashKey, nar_size: u64) -> Result<(), AllowlistPersistError> {
@@ -819,60 +899,71 @@ impl AllowlistStore for FileAllowlistStore {
         // Strict parent-directory checks (symlinked/foreign/writable parent refused).
         self.check_parent()?;
 
-        let mut file = self
+        let file = self
             .open_strict(OpenMode::ReadWrite)?
             .expect("open_strict(ReadWrite) never returns None");
         // Exclusive cross-process writer lock: two daemons sharing a state dir cannot
         // interleave appends (and a reader takes a shared lock).
-        rustix::fs::flock(&file, rustix::fs::FlockOperation::LockExclusive).map_err(|e| {
-            AllowlistPersistError(format!("locking {} for append: {e}", self.path.display()))
-        })?;
+        let lock = AllowlistFileLock::acquire(
+            &file,
+            &self.path,
+            rustix::fs::FlockOperation::LockExclusive,
+            "append",
+        )?;
+        let result = (|| {
+            // TRUNCATE any torn tail before appending, so the new record is never concatenated
+            // onto a partial line (which would make BOTH fail their MAC). The committed prefix
+            // is everything up to and including the last newline.
+            let mut existing = Vec::new();
+            (&file)
+                .take(MAX_ALLOWLIST_FILE_BYTES)
+                .read_to_end(&mut existing)
+                .map_err(|e| {
+                    AllowlistPersistError(format!("reading {}: {e}", self.path.display()))
+                })?;
+            let committed_len = match existing.iter().rposition(|b| *b == b'\n') {
+                Some(i) => i + 1,
+                None => 0,
+            };
+            if committed_len as u64 != existing.len() as u64 {
+                rustix::fs::ftruncate(&file, committed_len as u64).map_err(|e| {
+                    AllowlistPersistError(format!(
+                        "truncating torn tail of {}: {e}",
+                        self.path.display()
+                    ))
+                })?;
+            }
+            (&file)
+                .seek(SeekFrom::Start(committed_len as u64))
+                .map_err(|e| {
+                    AllowlistPersistError(format!("seeking {}: {e}", self.path.display()))
+                })?;
 
-        // TRUNCATE any torn tail before appending, so the new record is never concatenated
-        // onto a partial line (which would make BOTH fail their MAC). The committed prefix
-        // is everything up to and including the last newline.
-        let mut existing = Vec::new();
-        (&file)
-            .take(MAX_ALLOWLIST_FILE_BYTES)
-            .read_to_end(&mut existing)
-            .map_err(|e| AllowlistPersistError(format!("reading {}: {e}", self.path.display())))?;
-        let committed_len = match existing.iter().rposition(|b| *b == b'\n') {
-            Some(i) => i + 1,
-            None => 0,
-        };
-        if committed_len as u64 != existing.len() as u64 {
-            rustix::fs::ftruncate(&file, committed_len as u64).map_err(|e| {
-                AllowlistPersistError(format!(
-                    "truncating torn tail of {}: {e}",
-                    self.path.display()
-                ))
+            let mac = record_mac(&self.mac_key, nar_hash, nar_size);
+            let line = format!("{} {mac}\n", record_canonical(nar_hash, nar_size));
+            (&file).write_all(line.as_bytes()).map_err(|e| {
+                AllowlistPersistError(format!("appending to {}: {e}", self.path.display()))
             })?;
-        }
-        file.seek(SeekFrom::Start(committed_len as u64))
-            .map_err(|e| AllowlistPersistError(format!("seeking {}: {e}", self.path.display())))?;
-
-        let mac = record_mac(&self.mac_key, nar_hash, nar_size);
-        let line = format!("{} {mac}\n", record_canonical(nar_hash, nar_size));
-        file.write_all(line.as_bytes()).map_err(|e| {
-            AllowlistPersistError(format!("appending to {}: {e}", self.path.display()))
-        })?;
-        file.sync_all()
-            .map_err(|e| AllowlistPersistError(format!("fsyncing {}: {e}", self.path.display())))?;
-        // On first creation, fsync the parent directory so the new file's name->inode link
-        // is itself durable. Do NOT silently discard the error: a failed parent fsync means
-        // the file could vanish on a crash, so surface it (fail-verbose).
-        if !existed {
-            let dir = std::fs::File::open(&parent).map_err(|e| {
-                AllowlistPersistError(format!(
-                    "opening parent dir {} to fsync: {e}",
-                    parent.display()
-                ))
+            file.sync_all().map_err(|e| {
+                AllowlistPersistError(format!("fsyncing {}: {e}", self.path.display()))
             })?;
-            dir.sync_all().map_err(|e| {
-                AllowlistPersistError(format!("fsyncing parent dir {}: {e}", parent.display()))
-            })?;
-        }
-        Ok(())
+            // On first creation, fsync the parent directory so the new file's name->inode link
+            // is itself durable. Do NOT silently discard the error: a failed parent fsync means
+            // the file could vanish on a crash, so surface it (fail-verbose).
+            if !existed {
+                let dir = std::fs::File::open(&parent).map_err(|e| {
+                    AllowlistPersistError(format!(
+                        "opening parent dir {} to fsync: {e}",
+                        parent.display()
+                    ))
+                })?;
+                dir.sync_all().map_err(|e| {
+                    AllowlistPersistError(format!("fsyncing parent dir {}: {e}", parent.display()))
+                })?;
+            }
+            Ok(())
+        })();
+        lock.finish(result)
     }
 }
 
@@ -1704,6 +1795,44 @@ Sig: nix-p2p-test-1:kvRtCi6KujoW6x7esqgP8QdiaaVX4OL1beI/xmfobVHzM/tSSqmy7jcnI7QD
         ));
         assert_eq!(reopened.status().count, 2);
 
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn allowlist_lock_is_explicitly_released_while_duplicate_fd_remains_open() {
+        let dir = temp_dir("explicit-unlock");
+        let path = dir.join("public-allowlist");
+        std::fs::write(&path, "").unwrap();
+        set_0600(&path);
+        let store = FileAllowlistStore::new(&path, TEST_MAC_KEY);
+        let file = store
+            .open_strict(OpenMode::ReadWrite)
+            .unwrap()
+            .expect("read-write open always returns a file");
+        let lock = AllowlistFileLock::acquire(
+            &file,
+            &path,
+            rustix::fs::FlockOperation::LockExclusive,
+            "duplicate-fd regression",
+        )
+        .unwrap();
+        let inherited_duplicate = rustix::io::dup(&file).unwrap();
+        drop(lock);
+
+        let second = store
+            .open_strict(OpenMode::ReadWrite)
+            .unwrap()
+            .expect("read-write open always returns a file");
+        rustix::fs::flock(
+            &second,
+            rustix::fs::FlockOperation::NonBlockingLockExclusive,
+        )
+        .expect("LOCK_UN must release the OFD lock despite a live duplicate descriptor");
+        rustix::fs::flock(&second, rustix::fs::FlockOperation::Unlock).unwrap();
+
+        drop(second);
+        drop(inherited_duplicate);
+        drop(file);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
