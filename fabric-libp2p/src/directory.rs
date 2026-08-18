@@ -535,7 +535,7 @@ mod tests {
     fn provider_of(sk: &SigningKey) -> NodeId {
         NodeId::from_bytes(sk.verifying_key().to_bytes())
     }
-    /// A signed provide from `sk` over `key`, self-serve iroh offer at its own node.
+    /// A signed provide from `sk` over `key`, with the native self-serve libp2p offer.
     fn signed_provide(
         sk: &SigningKey,
         key: ContentKey,
@@ -547,7 +547,7 @@ mod tests {
             key,
             content: Blake3Digest::from_bytes([0xaa; 32]),
             provider,
-            offers: vec![TransportOffer::Iroh { node: provider }],
+            offers: vec![TransportOffer::libp2p(provider)],
             sequence,
             issued_at: 0,
             expiry,

@@ -237,8 +237,8 @@ pub async fn build_libp2p_provider_source(
 /// load-bearing. The discovery [`ContentKey`] is derived from the Nix `NarHash`, so a
 /// consumer that derived the SAME key from a narinfo discovers this provider; the
 /// `content` [`Blake3Digest`] is the raw NAR's hash, the axis the transfer/serve keys on
-/// and gate-1 BLAKE3-verifies. The lone offer carries the libp2p NAR transport (registered
-/// under [`TransportOffer::Iroh`], per fabric-libp2p's ADR).
+/// and gate-1 BLAKE3-verifies. The lone offer carries the native libp2p tag with an
+/// empty bounded relay-hint set; TASK-219 will populate it from live reservations.
 ///
 /// This is the SINGLE SOURCE OF TRUTH for a provider record's construction: the daemon
 /// binary's `--libp2p-provider` path and the integration test both mint records here, so
@@ -312,7 +312,7 @@ fn sign_libp2p_record_for_content(
         key,
         content,
         provider,
-        offers: vec![TransportOffer::Iroh { node: provider }],
+        offers: vec![TransportOffer::libp2p(provider)],
         sequence,
         issued_at: now,
         expiry: now + ttl_secs,
@@ -2142,14 +2142,14 @@ async fn start_and_join_libp2p(
     // dilemma" resolution): fail fast HERE, at construction, if the selected profile needs
     // an axis this fabric does not offer - never a silent runtime degrade (a fetch that
     // always falls back, a provider that announces then cannot serve). A libp2p CONSUMER
-    // needs content discovery, node-address resolution and the fetch transport (registered
-    // under the Iroh tag per the fabric-libp2p ADR); a PROVIDER additionally needs the
+    // needs content discovery, node-address resolution and the native libp2p fetch
+    // transport; a PROVIDER additionally needs the
     // serve + announce axes. The single check lives in `peer_fabric::require_axes`, shared
     // with the iroh composition root so the two cannot drift on what "required" means.
     let mut required = vec![
         Axis::ProviderDirectory,
         Axis::NodeLocator,
-        Axis::Transfer(TransportTag::Iroh),
+        Axis::Transfer(TransportTag::Libp2p),
     ];
     if serving {
         required.push(Axis::Server);

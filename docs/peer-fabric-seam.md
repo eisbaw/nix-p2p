@@ -447,13 +447,31 @@ storage, so the opaque-value model holds no matter which backend TASK-103 adopts
 - **`ProviderRecord` / `ProviderWithdrawal` codec** (`record_codec.rs`): a versioned,
   canonical **fixed-layout binary** opaque value, ed25519-signed over
   `SIGNING_DOMAIN || body`; the `provider` `NodeId` **is** the verifying key
-  (self-verifying). A fixed layout structurally forecloses any IP/port/relay/
-  StorePath/second-digest/unasked field (AC#2). Fail-closed decode
+  (self-verifying). A fixed layout structurally forecloses any IP/port/relay
+  **address**/StorePath/second-digest/unasked field (AC#2). Fail-closed decode
   (`decode_provider_assertion`) with a distinct typed rejection — oversized,
   truncated, trailing-bytes, unknown-version, unknown-kind, unknown-offer,
   too-many-offers, bad-provider-key, bad-signature, **wrong-key (SSOT)**, stale —
-  each with a bite test. Byte-pinned goldens in
-  `peer-fabric/tests/golden/provider_record_v1.json`.
+  each with a bite test. The original tag-0 Iroh/tag-1 BitTorrent bytes remain
+  pinned, byte-for-byte, in `peer-fabric/tests/golden/provider_record_v1.json`.
+- **Additive ProviderRecord tag 2** (TASK-156): schema and signing domain stay v1;
+  the explicit union gains `OFFER_LIBP2P = 2` with
+  `tag:u8 | provider_node:32 | hint_count:u8 | relay_node:32 * count`. The provider
+  node is self-serve. Relay identities are signed, strict non-small-order ed25519
+  keys, strictly ascending and unique, distinct from the provider, and capped at
+  two. Relay addresses are intentionally absent. There may be at most one Libp2p
+  offer per record. A historical v1 reader fails closed with `UnknownOffer { tag:
+  2 }`; an upgraded reader accepts both the original v1 vectors and tag 2. The
+  additive bytes live in the separate
+  `peer-fabric/tests/golden/provider_record_libp2p_tag2.json`, checked by the Rust
+  byte-pin and the independent pure-Python decoder/signature oracle
+  `scripts/check-provider-record-libp2p-tag2.py`; the TASK-126 anchor is not edited.
+- **Rollout dispatch compatibility**: `Libp2pTransport` registers natively under
+  `TransportTag::Libp2p`. A separate fallback namespace may translate a historical
+  Iroh-tagged offer to the libp2p implementation during rollout, but it reports and
+  consumes the Iroh tag explicitly; it does not pretend to be an Iroh transport.
+  Native registration always wins regardless of registration order, so the fallback
+  cannot clobber a real Iroh backend in a later dual-stack composition.
 - **Validation rules** (`record_store.rs`, the salvaged `FakeProviderDirectory`
   oracle — NOT a running DHT, which is TASK-103): monotonic sequence, idempotent
   refresh, explicit signed withdrawal, expiry, replay rejection, concurrent-provider

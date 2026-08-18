@@ -119,7 +119,7 @@ fn signed_record(
         key,
         content,
         provider,
-        offers: vec![TransportOffer::Iroh { node: provider }],
+        offers: vec![TransportOffer::libp2p(provider)],
         sequence: 1,
         issued_at: now,
         expiry: now + 3600,
@@ -271,11 +271,9 @@ async fn node_locator_resolves_dial_address_via_kad_and_fetches_without_injectio
     // locate() as the SOLE connectivity path is not robust in a small kad network (whether
     // an iterative query dials P depends on XOR distance), so we do not assert it. ----
     let transport = resolver
-        .transfer(TransportTag::Iroh)
+        .transfer(TransportTag::Libp2p)
         .expect("transport present");
-    let offer = TransportOffer::Iroh {
-        node: provider_node,
-    };
+    let offer = TransportOffer::libp2p(provider_node);
     let bytes = transport
         .fetch(&content, &offer, Some(nar.len() as u64), &envelope())
         .await
@@ -285,6 +283,23 @@ async fn node_locator_resolves_dial_address_via_kad_and_fetches_without_injectio
         "fetched bytes must be byte-identical to the served NAR"
     );
     assert_eq!(Blake3Digest::from_raw_nar(&bytes), content);
+
+    // Rollout boundary: a pure-libp2p reader still consumes a pre-TASK-156 record
+    // carrying the historical Iroh-tag NodeId locator. This lookup reaches the
+    // explicitly registered compatibility FALLBACK, not the native Libp2p key; a
+    // future actual Iroh backend would take native precedence in TransferRegistry.
+    let legacy_reader = resolver
+        .transfer(TransportTag::Iroh)
+        .expect("rollout-only legacy record reader present");
+    assert_eq!(legacy_reader.tag(), TransportTag::Iroh);
+    let legacy_offer = TransportOffer::Iroh {
+        node: provider_node,
+    };
+    let legacy_bytes = legacy_reader
+        .fetch(&content, &legacy_offer, Some(nar.len() as u64), &envelope())
+        .await
+        .expect("legacy Iroh-tag record is translated to the native libp2p transport");
+    assert_eq!(legacy_bytes, nar);
 
     // ---- MISS arm: resolving a peer nobody on the network knows an address for ----
     // A distinct, un-joined identity: the query completes healthily but the DHT knows no

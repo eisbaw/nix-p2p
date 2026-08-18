@@ -187,6 +187,10 @@ test: _headroom build _python fixtures
     # re-verify the record signature with stock ed25519, against the same golden JSON
     # the Rust byte-pin test reads. A wrong recipe or a moved preimage fails here.
     "${NIX_P2P_PYTHON}/bin/python3" scripts/check-content-key-derivation.py
+    # TASK-156: independently decode the additive schema-v1 libp2p tag-2 layout,
+    # validate its bounded strict relay identities and signatures, and prove a
+    # historical tag-0/tag-1 reader fails closed with UnknownOffer.
+    "${NIX_P2P_PYTHON}/bin/python3" scripts/check-provider-record-libp2p-tag2.py
     "${NIX_P2P_PYTHON}/bin/python3" scripts/measure.py --self-test
     # task-18: the S5 fitter and the sweep's honesty logic are container-free by
     # design, so the machinery that decides "is this growth superlinear" and

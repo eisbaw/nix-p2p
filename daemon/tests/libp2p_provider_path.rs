@@ -35,7 +35,7 @@ use daemon::{
 use fabric_libp2p::{Libp2pFabric, MemoryNarSupplier, Multiaddr, NodeConfig};
 use peer_fabric::{
     AnnounceBudget, Blake3Digest, ContentKey, DiscoveryBudget, Lookup, PeerFabric, ProviderRecord,
-    ResolutionPolicy, SafetyEnvelope, ServeBudget,
+    ResolutionPolicy, SafetyEnvelope, ServeBudget, TransportOffer,
 };
 
 fn unix_now() -> u64 {
@@ -164,6 +164,14 @@ async fn provider_serves_and_announces_a_nar_a_consumer_discovers_and_fetches_wi
     assert_eq!(
         record.content, content,
         "the record carries the raw NAR's BLAKE3"
+    );
+    assert!(
+        matches!(
+            record.offers.as_slice(),
+            [TransportOffer::Libp2p { node, relay_hints }]
+                if *node == record.provider && relay_hints.is_empty()
+        ),
+        "the production writer must publish one native Libp2p offer with empty TASK-156 hints"
     );
     provider_fabric
         .announcer()

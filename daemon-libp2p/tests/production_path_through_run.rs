@@ -105,7 +105,7 @@ fn signed_record(
         key,
         content,
         provider,
-        offers: vec![TransportOffer::Iroh { node: provider }],
+        offers: vec![TransportOffer::libp2p(provider)],
         sequence: 1,
         issued_at: now,
         expiry: now + 3600,
@@ -414,7 +414,7 @@ async fn run_serves_a_discovered_libp2p_nar_and_falls_back_on_miss() {
         required_axes: vec![
             Axis::ProviderDirectory,
             Axis::NodeLocator,
-            Axis::Transfer(TransportTag::Iroh),
+            Axis::Transfer(TransportTag::Libp2p),
         ],
         extra_raw_serve: Vec::new(),
         public_allowlist: Arc::new(daemon_core::PublicNarAllowlist::disabled()),

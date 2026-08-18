@@ -1385,7 +1385,7 @@ async fn main() -> ExitCode {
     let mut required_axes = vec![
         Axis::ProviderDirectory,
         Axis::NodeLocator,
-        Axis::Transfer(TransportTag::Iroh),
+        Axis::Transfer(TransportTag::Libp2p),
     ];
     let _serve_guard: Option<ProviderGuard>;
     let fabric_dyn: Arc<dyn PeerFabric>;

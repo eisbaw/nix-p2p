@@ -81,8 +81,8 @@ pub use fake::{
 };
 pub use ids::{
     BLAKE3_DIGEST_LEN, BLAKE3_DOMAIN_SEPARATION, BLAKE3_PREFIX, Blake3Digest, DigestParseError,
-    InfoHash, InfoHashParseError, NODE_ID_LEN, NodeId, NodeIdParseError, STREAM_CHUNK_BYTES,
-    TransportOffer, TransportTag,
+    InfoHash, InfoHashParseError, MAX_LIBP2P_RELAY_HINTS, NODE_ID_LEN, NodeId, NodeIdParseError,
+    RelayHints, RelayHintsError, STREAM_CHUNK_BYTES, TransportOffer, TransportTag,
 };
 pub use outcome::{Lookup, Unavailable};
 pub use record_codec::{

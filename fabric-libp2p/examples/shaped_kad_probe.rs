@@ -268,7 +268,7 @@ async fn provide_dht_mode(args: &[String]) {
         key,
         content,
         provider,
-        offers: vec![TransportOffer::Iroh { node: provider }],
+        offers: vec![TransportOffer::libp2p(provider)],
         sequence: 1,
         issued_at: now,
         expiry: now + 3600,
@@ -454,11 +454,9 @@ async fn fetch_dht_mode(args: &[String]) {
         body_idle_timeout: Duration::from_secs(30),
         total_timeout: Duration::from_secs(120),
     };
-    let offer = TransportOffer::Iroh {
-        node: provider_node,
-    };
+    let offer = TransportOffer::libp2p(provider_node);
     let transport = fabric
-        .transfer(TransportTag::Iroh)
+        .transfer(TransportTag::Libp2p)
         .expect("transport present");
     let t1 = Instant::now();
     let bytes = transport

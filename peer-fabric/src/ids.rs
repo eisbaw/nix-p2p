@@ -31,6 +31,7 @@
 use std::fmt;
 use std::str::FromStr;
 
+use ed25519_dalek::VerifyingKey;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 use crate::hexfmt;
@@ -292,6 +293,9 @@ pub enum TransportTag {
     /// BitTorrent - representable so a second transport is not a network fork; no
     /// backend yet. Its locator is an [`InfoHash`].
     BitTorrent,
+    /// Raw NAR transfer over libp2p streams. Its locator is the provider [`NodeId`]
+    /// plus a bounded set of signed relay-identity hints.
+    Libp2p,
 }
 
 impl TransportTag {
@@ -302,15 +306,18 @@ impl TransportTag {
         match offer {
             TransportOffer::Iroh { .. } => TransportTag::Iroh,
             TransportOffer::BitTorrent { .. } => TransportTag::BitTorrent,
+            TransportOffer::Libp2p { .. } => TransportTag::Libp2p,
         }
     }
 
-    /// The wire-tag string (matches the daemon's `KnownTransport` serde tags
-    /// `"iroh"`/`"bittorrent"`).
+    /// Stable seam/log name. `iroh` and `bittorrent` also match the frozen daemon
+    /// `KnownTransport` JSON tags; `libp2p` deliberately does NOT extend that legacy
+    /// enum or wire. ProviderRecord's separate binary union assigns libp2p tag 2.
     pub fn as_str(&self) -> &'static str {
         match self {
             TransportTag::Iroh => "iroh",
             TransportTag::BitTorrent => "bittorrent",
+            TransportTag::Libp2p => "libp2p",
         }
     }
 }
@@ -418,6 +425,142 @@ impl<'de> Deserialize<'de> for InfoHash {
     }
 }
 
+/// Maximum signed relay identities carried by one libp2p offer. This is a wire
+/// bound, not a policy default: a decoder refuses a larger count and a constructor
+/// never truncates it.
+pub const MAX_LIBP2P_RELAY_HINTS: usize = 2;
+
+/// Why a [`RelayHints`] value could not be constructed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RelayHintsError {
+    /// More than [`MAX_LIBP2P_RELAY_HINTS`] identities were supplied.
+    TooMany { found: usize, cap: usize },
+    /// A relay is not a strict ed25519 identity: its compressed point is invalid or
+    /// it is a weak/small-order key that strict verification would reject.
+    InvalidIdentity { relay: NodeId },
+    /// Relay identities were duplicated or not strictly ascending by their canonical
+    /// 32-byte [`NodeId`] encoding.
+    NotCanonical { previous: NodeId, found: NodeId },
+}
+
+impl fmt::Display for RelayHintsError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            RelayHintsError::TooMany { found, cap } => {
+                write!(
+                    f,
+                    "libp2p offer carries {found} relay hints, exceeds the {cap} cap"
+                )
+            }
+            RelayHintsError::InvalidIdentity { relay } => write!(
+                f,
+                "libp2p relay hint {relay} is not a strict ed25519 identity"
+            ),
+            RelayHintsError::NotCanonical { previous, found } => write!(
+                f,
+                "libp2p relay hints are not strictly ascending: {previous} then {found}"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for RelayHintsError {}
+
+/// A bounded, canonical set of relay identities carried inside a signed libp2p
+/// transport offer.
+///
+/// The representation is private so callers cannot construct an over-cap,
+/// duplicate, descending, malformed-point, or small-order hint set. Use
+/// [`RelayHints::try_from_nodes`]; it rejects bad input instead of sorting or
+/// truncating it. The fixed two-element backing keeps this value, and therefore
+/// [`TransportOffer`], [`Copy`]. A provider/self-relay relationship is contextual
+/// to the containing record and is checked by the ProviderRecord codec.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct RelayHints {
+    nodes: [NodeId; MAX_LIBP2P_RELAY_HINTS],
+    len: u8,
+}
+
+impl RelayHints {
+    /// No relay hints. Production writers use this until live reservation truth is
+    /// wired by TASK-219.
+    pub const fn empty() -> Self {
+        RelayHints {
+            nodes: [NodeId::from_bytes([0; NODE_ID_LEN]); MAX_LIBP2P_RELAY_HINTS],
+            len: 0,
+        }
+    }
+
+    /// Validate and copy a relay-hint slice. The input must already be strictly
+    /// ascending; this function never silently sorts or truncates signed input.
+    pub fn try_from_nodes(nodes: &[NodeId]) -> Result<Self, RelayHintsError> {
+        if nodes.len() > MAX_LIBP2P_RELAY_HINTS {
+            return Err(RelayHintsError::TooMany {
+                found: nodes.len(),
+                cap: MAX_LIBP2P_RELAY_HINTS,
+            });
+        }
+
+        let mut hints = RelayHints::empty();
+        for (index, relay) in nodes.iter().copied().enumerate() {
+            let key = VerifyingKey::from_bytes(relay.as_bytes())
+                .map_err(|_| RelayHintsError::InvalidIdentity { relay })?;
+            if key.is_weak() {
+                return Err(RelayHintsError::InvalidIdentity { relay });
+            }
+            if index > 0 {
+                let previous = hints.nodes[index - 1];
+                if previous >= relay {
+                    return Err(RelayHintsError::NotCanonical {
+                        previous,
+                        found: relay,
+                    });
+                }
+            }
+            hints.nodes[index] = relay;
+        }
+        hints.len = nodes.len() as u8;
+        Ok(hints)
+    }
+
+    /// The canonical relay identities in strict ascending order.
+    pub fn as_slice(&self) -> &[NodeId] {
+        &self.nodes[..usize::from(self.len)]
+    }
+
+    /// Number of relay identities carried on wire.
+    pub const fn len(&self) -> usize {
+        self.len as usize
+    }
+
+    /// Whether no relay identities are carried.
+    pub const fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+}
+
+impl Default for RelayHints {
+    fn default() -> Self {
+        Self::empty()
+    }
+}
+
+impl<const N: usize> TryFrom<[NodeId; N]> for RelayHints {
+    type Error = RelayHintsError;
+
+    fn try_from(nodes: [NodeId; N]) -> Result<Self, Self::Error> {
+        Self::try_from_nodes(&nodes)
+    }
+}
+
+impl TryFrom<&[NodeId]> for RelayHints {
+    type Error = RelayHintsError;
+
+    fn try_from(nodes: &[NodeId]) -> Result<Self, Self::Error> {
+        Self::try_from_nodes(nodes)
+    }
+}
+
 /// A PURE LOCATOR: the transport-specific coordinate to reach a holder, carrying
 /// NEVER the content identity (which appears exactly once, in a
 /// [`ProviderRecord`](crate::ProviderRecord)'s content field). So a record can
@@ -431,9 +574,24 @@ pub enum TransportOffer {
     Iroh { node: NodeId },
     /// BitTorrent (representable only): the locator is an [`InfoHash`].
     BitTorrent { infohash: InfoHash },
+    /// Raw NAR transfer over libp2p: the provider's own [`NodeId`] plus at most two
+    /// canonical, signature-bound relay identities. Relay addresses never appear here.
+    Libp2p {
+        node: NodeId,
+        relay_hints: RelayHints,
+    },
 }
 
 impl TransportOffer {
+    /// A direct libp2p locator with no relay hints. This is the TASK-156 production
+    /// writer shape until TASK-219 derives live reservation identities.
+    pub const fn libp2p(node: NodeId) -> Self {
+        TransportOffer::Libp2p {
+            node,
+            relay_hints: RelayHints::empty(),
+        }
+    }
+
     /// The transport tag this offer dispatches on.
     pub fn tag(&self) -> TransportTag {
         TransportTag::of(self)
@@ -583,10 +741,70 @@ mod tests {
         let bt = TransportOffer::BitTorrent {
             infohash: InfoHash::V2([0x33; 32]),
         };
+        let libp2p = TransportOffer::Libp2p {
+            node: NodeId::from_bytes([0x44; NODE_ID_LEN]),
+            relay_hints: RelayHints::empty(),
+        };
         assert_eq!(iroh.tag(), TransportTag::Iroh);
         assert_eq!(bt.tag(), TransportTag::BitTorrent);
+        assert_eq!(libp2p.tag(), TransportTag::Libp2p);
         assert_eq!(TransportTag::Iroh.as_str(), "iroh");
         assert_eq!(TransportTag::BitTorrent.as_str(), "bittorrent");
+        assert_eq!(TransportTag::Libp2p.as_str(), "libp2p");
+
+        fn assert_copy<T: Copy>() {}
+        assert_copy::<TransportOffer>();
+    }
+
+    fn valid_node(seed: u8) -> NodeId {
+        NodeId::from_bytes(
+            ed25519_dalek::SigningKey::from_bytes(&[seed; 32])
+                .verifying_key()
+                .to_bytes(),
+        )
+    }
+
+    #[test]
+    fn relay_hints_are_bounded_strict_and_canonical() {
+        let mut relays = [valid_node(1), valid_node(2)];
+        relays.sort();
+        let hints = RelayHints::try_from(relays).expect("two sorted strict keys");
+        assert_eq!(hints.as_slice(), &relays);
+        assert_eq!(hints.len(), 2);
+        assert!(!hints.is_empty());
+
+        assert!(RelayHints::empty().is_empty());
+        assert!(matches!(
+            RelayHints::try_from([relays[0], relays[1], valid_node(3)]),
+            Err(RelayHintsError::TooMany { found: 3, cap: 2 })
+        ));
+        assert!(matches!(
+            RelayHints::try_from([relays[0], relays[0]]),
+            Err(RelayHintsError::NotCanonical { .. })
+        ));
+        assert!(matches!(
+            RelayHints::try_from([relays[1], relays[0]]),
+            Err(RelayHintsError::NotCanonical { .. })
+        ));
+    }
+
+    #[test]
+    fn relay_hints_reject_invalid_and_small_order_ed25519_identities() {
+        let invalid_point = NodeId::from_bytes([0xdf; NODE_ID_LEN]);
+        assert_eq!(
+            RelayHints::try_from([invalid_point]),
+            Err(RelayHintsError::InvalidIdentity {
+                relay: invalid_point
+            })
+        );
+
+        let mut identity = [0; NODE_ID_LEN];
+        identity[0] = 1;
+        let small_order = NodeId::from_bytes(identity);
+        assert_eq!(
+            RelayHints::try_from([small_order]),
+            Err(RelayHintsError::InvalidIdentity { relay: small_order })
+        );
     }
 
     // --- InfoHash -------------------------------------------------------------

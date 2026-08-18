@@ -23,9 +23,11 @@
 //! peer-to-peer velocity surface; this is a FROZEN, SIGNED opaque value where every
 //! byte is under signature, so an unknown offer tag or a bad version FAILS CLOSED
 //! rather than being skipped - skipping would either desync a variable-length parse
-//! or admit bytes the signer did not commit to. A genuinely new transport or record
-//! shape is a VERSIONED evolution ([`PROVIDER_RECORD_SCHEMA_VERSION`]), not a silent
-//! tolerated field.
+//! or admit bytes the signer did not commit to. New transport tags are explicit,
+//! additive members of this v1 tagged union: an older reader rejects an unknown
+//! tag, while a coordinated upgraded reader understands the newly assigned layout.
+//! A breaking record/withdrawal shape still requires a versioned evolution
+//! ([`PROVIDER_RECORD_SCHEMA_VERSION`]); no opaque tolerate-and-drop field exists.
 //!
 //! ## The signing preimage
 //!
@@ -65,7 +67,7 @@
 //!     a from-scratch ed25519 verifier (NOT a library) so the two agree byte-for-byte on
 //!     which signatures are valid.
 //!
-//! ## Canonical offer list + iroh self-serve identity
+//! ## Canonical offer list + self-serve transport identities
 //!
 //!   * OFFERS ARE CANONICALLY ORDERED. The offer list is STRICTLY ASCENDING by each
 //!     offer's wire encoding, which forbids duplicates and gives ONE signed encoding per
@@ -80,6 +82,11 @@
 //!     valid curve point, since `provider` is validated and the node equals it.
 //!     Delegation (offering a DIFFERENT node) would need that node's authorization and
 //!     is deferred to a later schema version.
+//!   * LIBP2P OFFERS ARE SELF-SERVE TOO. Tag 2 is additive inside schema v1 and is
+//!     `node:32 || hint_count:u8 || relay_node:32 * count`. `node` MUST equal the
+//!     provider. The signed relay identities are strict ed25519 keys, strictly
+//!     ascending, unique, never the provider, and capped at two. At most one libp2p
+//!     offer may appear in a record. Relay ADDRESSES are not on this wire.
 //!
 //! ## Fail-closed decode (AC#4)
 //!
@@ -87,7 +94,9 @@
 //! [`RecordDecodeError`], every one of: oversized, truncated/malformed, trailing
 //! bytes, unknown version, unknown kind, unknown offer tag, a bad infohash version,
 //! too many offers, offers not in canonical order, an iroh offer whose node is not the
-//! provider, a provider id that is not a valid ed25519 point, a NON-CANONICAL
+//! provider, or a libp2p offer with an over-cap/non-canonical/invalid relay set,
+//! provider-node mismatch, self-relay, or duplicate libp2p offer; it also rejects a
+//! provider id that is not a valid ed25519 point, a NON-CANONICAL
 //! signature scalar (`S >= L`), a bad signature, a record whose carried `key` does not
 //! match the DHT storage key it was fetched under (the SSOT invariant), and a stale
 //! (expired) record. Each rule has a negative test that BITES: remove the guard and
@@ -96,7 +105,10 @@
 use ed25519_dalek::{Signature, Signer, SigningKey, VerifyingKey};
 
 use crate::content::{ContentKey, PROVIDER_SIGNATURE_LEN, ProviderRecord};
-use crate::ids::{BLAKE3_DIGEST_LEN, Blake3Digest, InfoHash, NODE_ID_LEN, NodeId, TransportOffer};
+use crate::ids::{
+    BLAKE3_DIGEST_LEN, Blake3Digest, InfoHash, MAX_LIBP2P_RELAY_HINTS, NODE_ID_LEN, NodeId,
+    RelayHints, RelayHintsError, TransportOffer,
+};
 
 /// Wire schema version of the ProviderRecord opaque value. A decoder REJECTS any
 /// other version ([`RecordDecodeError::UnknownVersion`]); a breaking change to the
@@ -112,9 +124,10 @@ pub const PROVIDER_RECORD_SCHEMA_VERSION: u16 = 1;
 pub const MAX_OFFERS_PER_RECORD: usize = 4;
 
 /// The maximum on-wire size of the opaque value, checked BEFORE any parse. A record
-/// is a few fixed fields plus <= [`MAX_OFFERS_PER_RECORD`] small locators (worst case
-/// ~324 bytes), so 1024 is generous headroom and past it the input is not a
-/// well-formed record. 1024 is also the `data` cap of `iroh-dht-experiment`'s
+/// is a few fixed fields plus <= [`MAX_OFFERS_PER_RECORD`] bounded locators (even four
+/// maximally-sized tag-2 offers are 580 bytes including signature and are later
+/// rejected by the one-tag-2 invariant), so 1024 is generous headroom; an input past
+/// it is not a well-formed record. 1024 is also the `data` cap of `iroh-dht-experiment`'s
 /// `ED25519SignedMessage` carrier (TASK-126 spike), so this value keeps that fallback
 /// backend viable on size even though the primary freeze target is libp2p-kad
 /// `put_record` (whose opaque `value: Vec<u8>` is the model this codec realises).
@@ -137,6 +150,7 @@ const KIND_WITHDRAW: u8 = 1;
 // Transport-offer tags.
 const OFFER_IROH: u8 = 0;
 const OFFER_BITTORRENT: u8 = 1;
+const OFFER_LIBP2P: u8 = 2;
 // BitTorrent infohash version bytes (length-disambiguated on the wire too).
 const INFOHASH_V1: u8 = 1;
 const INFOHASH_V2: u8 = 2;
@@ -239,6 +253,15 @@ pub enum RecordEncodeError {
         offer_node: NodeId,
         provider: NodeId,
     },
+    /// A libp2p offer advertises a node other than the signing provider.
+    Libp2pNodeNotProvider {
+        offer_node: NodeId,
+        provider: NodeId,
+    },
+    /// A libp2p relay hint names the provider itself, which is not a relay route.
+    Libp2pRelayIsProvider { relay: NodeId, provider: NodeId },
+    /// More than one libp2p offer would make relay/dispatch interpretation ambiguous.
+    MultipleLibp2pOffers { found: usize },
 }
 
 impl std::fmt::Display for RecordEncodeError {
@@ -270,6 +293,22 @@ impl std::fmt::Display for RecordEncodeError {
                 f,
                 "iroh offer node {offer_node} is not the provider {provider} \
                  (v1 iroh offers are self-serve; delegation is not permitted)"
+            ),
+            RecordEncodeError::Libp2pNodeNotProvider {
+                offer_node,
+                provider,
+            } => write!(
+                f,
+                "libp2p offer node {offer_node} is not the provider {provider} \
+                 (libp2p offers are self-serve; delegation is not permitted)"
+            ),
+            RecordEncodeError::Libp2pRelayIsProvider { relay, provider } => write!(
+                f,
+                "libp2p relay hint {relay} equals provider {provider}; a provider cannot relay through itself"
+            ),
+            RecordEncodeError::MultipleLibp2pOffers { found } => write!(
+                f,
+                "provider record carries {found} libp2p offers; at most one is permitted"
             ),
         }
     }
@@ -311,6 +350,21 @@ pub enum RecordDecodeError {
         offer_node: NodeId,
         provider: NodeId,
     },
+    /// A libp2p offer's `node` is not the signing provider.
+    Libp2pNodeNotProvider {
+        offer_node: NodeId,
+        provider: NodeId,
+    },
+    /// A tag-2 offer declared more than two relay identities.
+    TooManyRelayHints { found: usize, cap: usize },
+    /// Tag-2 relay identities are duplicated or not strictly ascending.
+    RelayHintsNotCanonical,
+    /// A tag-2 relay identity is not a strict, non-small-order ed25519 key.
+    BadRelayIdentity { relay: NodeId },
+    /// A tag-2 relay identity names the provider itself.
+    Libp2pRelayIsProvider { relay: NodeId, provider: NodeId },
+    /// More than one tag-2 offer appeared in one record.
+    MultipleLibp2pOffers { found: usize },
     /// The `provider` field is not a valid ed25519 verifying key (curve point).
     BadProviderKey,
     /// The signature's scalar `S` is NON-CANONICAL (`S >= L`, the group order). This is
@@ -389,6 +443,34 @@ impl std::fmt::Display for RecordDecodeError {
                 "iroh offer node {offer_node} is not the provider {provider} \
                  (v1 iroh offers are self-serve; delegation is not permitted)"
             ),
+            RecordDecodeError::Libp2pNodeNotProvider {
+                offer_node,
+                provider,
+            } => write!(
+                f,
+                "libp2p offer node {offer_node} is not the provider {provider} \
+                 (libp2p offers are self-serve; delegation is not permitted)"
+            ),
+            RecordDecodeError::TooManyRelayHints { found, cap } => write!(
+                f,
+                "libp2p offer carries {found} relay hints, exceeds the {cap} cap"
+            ),
+            RecordDecodeError::RelayHintsNotCanonical => write!(
+                f,
+                "libp2p relay hints are not strictly ascending (descending or duplicate)"
+            ),
+            RecordDecodeError::BadRelayIdentity { relay } => write!(
+                f,
+                "libp2p relay hint {relay} is not a strict ed25519 identity"
+            ),
+            RecordDecodeError::Libp2pRelayIsProvider { relay, provider } => write!(
+                f,
+                "libp2p relay hint {relay} equals provider {provider}; a provider cannot relay through itself"
+            ),
+            RecordDecodeError::MultipleLibp2pOffers { found } => write!(
+                f,
+                "provider record carries {found} libp2p offers; at most one is permitted"
+            ),
             RecordDecodeError::BadProviderKey => {
                 write!(f, "provider id is not a valid ed25519 verifying key")
             }
@@ -441,6 +523,14 @@ fn write_offer(out: &mut Vec<u8>, offer: &TransportOffer) {
                 }
             }
         }
+        TransportOffer::Libp2p { node, relay_hints } => {
+            out.push(OFFER_LIBP2P);
+            out.extend_from_slice(node.as_bytes());
+            out.push(relay_hints.len() as u8);
+            for relay in relay_hints.as_slice() {
+                out.extend_from_slice(relay.as_bytes());
+            }
+        }
     }
 }
 
@@ -462,8 +552,9 @@ fn offers_are_canonical(offers: &[TransportOffer]) -> bool {
 }
 
 /// The offer-list structural invariants a Provide must satisfy to be ENCODED, checked
-/// on the sender (fail fast): the cap, canonical order, and iroh-offer self-serve
-/// identity. Decode re-checks all of these on untrusted bytes.
+/// on the sender (fail fast): the cap, canonical order, self-serve identities,
+/// non-self libp2p relays, and a single libp2p offer. Decode re-checks all of these
+/// on untrusted bytes.
 fn check_provide_invariants(record: &ProviderRecord) -> Result<(), RecordEncodeError> {
     if record.offers.len() > MAX_OFFERS_PER_RECORD {
         return Err(RecordEncodeError::TooManyOffers {
@@ -474,15 +565,37 @@ fn check_provide_invariants(record: &ProviderRecord) -> Result<(), RecordEncodeE
     if !offers_are_canonical(&record.offers) {
         return Err(RecordEncodeError::OffersNotCanonical);
     }
+    let mut libp2p_offers = 0usize;
     for offer in &record.offers {
-        if let TransportOffer::Iroh { node } = offer
-            && node != &record.provider
-        {
-            return Err(RecordEncodeError::IrohNodeNotProvider {
-                offer_node: *node,
-                provider: record.provider,
-            });
+        match offer {
+            TransportOffer::Iroh { node } if node != &record.provider => {
+                return Err(RecordEncodeError::IrohNodeNotProvider {
+                    offer_node: *node,
+                    provider: record.provider,
+                });
+            }
+            TransportOffer::Libp2p { node, relay_hints } => {
+                libp2p_offers += 1;
+                if node != &record.provider {
+                    return Err(RecordEncodeError::Libp2pNodeNotProvider {
+                        offer_node: *node,
+                        provider: record.provider,
+                    });
+                }
+                if relay_hints.as_slice().contains(&record.provider) {
+                    return Err(RecordEncodeError::Libp2pRelayIsProvider {
+                        relay: record.provider,
+                        provider: record.provider,
+                    });
+                }
+            }
+            _ => {}
         }
+    }
+    if libp2p_offers > 1 {
+        return Err(RecordEncodeError::MultipleLibp2pOffers {
+            found: libp2p_offers,
+        });
     }
     Ok(())
 }
@@ -619,19 +732,40 @@ pub fn sign_provider_record(signing_key: &SigningKey, record: &ProviderRecord) -
          identity, signed by another)"
     );
     // Establish the offer-list invariants the decoder REQUIRES so the convenience path
-    // cannot silently sign a record a peer would reject: iroh offers must be self-serve
-    // (node == this signer), and offers are put in canonical (ascending) order. A
-    // duplicate or a delegated iroh node is a caller bug and fails fast here.
+    // cannot silently sign a record a peer would reject: iroh/libp2p offers must be
+    // self-serve (node == this signer), a libp2p hint cannot name the signer, there
+    // can be only one libp2p offer, and offers are put in canonical order. Invalid
+    // relay ordering/identity/count cannot enter through RelayHints' private shape.
     let mut offers = record.offers.clone();
+    let mut libp2p_offers = 0usize;
     for offer in &offers {
-        if let TransportOffer::Iroh { node } = offer {
-            assert!(
-                *node == provider,
-                "sign_provider_record: an iroh offer must advertise the signer's own \
-                 node id (v1 self-serve); delegation is not permitted"
-            );
+        match offer {
+            TransportOffer::Iroh { node } => {
+                assert!(
+                    *node == provider,
+                    "sign_provider_record: an iroh offer must advertise the signer's own \
+                     node id (v1 self-serve); delegation is not permitted"
+                );
+            }
+            TransportOffer::Libp2p { node, relay_hints } => {
+                libp2p_offers += 1;
+                assert!(
+                    *node == provider,
+                    "sign_provider_record: a libp2p offer must advertise the signer's own \
+                     node id; delegation is not permitted"
+                );
+                assert!(
+                    !relay_hints.as_slice().contains(&provider),
+                    "sign_provider_record: a libp2p relay hint cannot name the provider itself"
+                );
+            }
+            TransportOffer::BitTorrent { .. } => {}
         }
     }
+    assert!(
+        libp2p_offers <= 1,
+        "sign_provider_record: at most one libp2p offer is permitted per record"
+    );
     offers.sort_by_key(offer_encoding);
     assert!(
         offers_are_canonical(&offers),
@@ -745,6 +879,33 @@ fn read_offer(r: &mut Reader) -> Result<TransportOffer, RecordDecodeError> {
                 other => Err(RecordDecodeError::BadInfoHash { version: other }),
             }
         }
+        OFFER_LIBP2P => {
+            let node = NodeId::from_bytes(r.array::<NODE_ID_LEN>()?);
+            let hint_count = r.u8()? as usize;
+            if hint_count > MAX_LIBP2P_RELAY_HINTS {
+                return Err(RecordDecodeError::TooManyRelayHints {
+                    found: hint_count,
+                    cap: MAX_LIBP2P_RELAY_HINTS,
+                });
+            }
+            let mut relay_nodes = Vec::with_capacity(hint_count);
+            for _ in 0..hint_count {
+                relay_nodes.push(NodeId::from_bytes(r.array::<NODE_ID_LEN>()?));
+            }
+            let relay_hints =
+                RelayHints::try_from_nodes(&relay_nodes).map_err(|error| match error {
+                    RelayHintsError::TooMany { found, cap } => {
+                        RecordDecodeError::TooManyRelayHints { found, cap }
+                    }
+                    RelayHintsError::InvalidIdentity { relay } => {
+                        RecordDecodeError::BadRelayIdentity { relay }
+                    }
+                    RelayHintsError::NotCanonical { .. } => {
+                        RecordDecodeError::RelayHintsNotCanonical
+                    }
+                })?;
+            Ok(TransportOffer::Libp2p { node, relay_hints })
+        }
         other => Err(RecordDecodeError::UnknownOffer { tag: other }),
     }
 }
@@ -800,9 +961,11 @@ fn verify(provider: &NodeId, body: &[u8], sig_bytes: &[u8; 64]) -> Result<(), Re
 ///
 /// ORDER IS DELIBERATE and each step is a fail-closed guard with a bite test:
 /// oversize (before any parse / allocation) -> version -> kind -> fields -> offer cap
-/// -> offers (iroh self-serve identity, then canonical order) -> no trailing bytes ->
-/// canonical-S check -> signature verify (self-verifying via `provider`) -> key SSOT
-/// match -> expiry. Parsing alone is never acceptance.
+/// -> offers (tag-2 cap before relay reads; strict/canonical relay identities) ->
+/// self-serve Iroh/Libp2p identity + non-self relay + single-Libp2p context -> outer
+/// offer canonical order -> no trailing bytes -> canonical-S check -> signature verify
+/// (self-verifying via `provider`) -> key SSOT match -> expiry. Parsing alone is never
+/// acceptance.
 pub fn decode_provider_assertion(
     bytes: &[u8],
     expected_key: &ContentKey,
@@ -855,19 +1018,41 @@ pub fn decode_provider_assertion(
             for _ in 0..offers_len {
                 offers.push(read_offer(&mut r)?);
             }
-            // Finding #3: an iroh offer must advertise the provider's OWN node id
-            // (self-serve; v1 forbids delegation). This also transitively validates the
-            // node is a valid ed25519 point, because `provider` is validated as a
-            // verifying key below (BadProviderKey) and the node equals it.
+            // Self-serve identity and libp2p relay-context checks. The offer node
+            // transitively gets the provider's strict signature validation because it
+            // must equal `provider`; RelayHints already validated each relay as a strict
+            // ed25519 identity while parsing.
+            let mut libp2p_offers = 0usize;
             for offer in &offers {
-                if let TransportOffer::Iroh { node } = offer
-                    && node != &provider
-                {
-                    return Err(RecordDecodeError::IrohNodeNotProvider {
-                        offer_node: *node,
-                        provider,
-                    });
+                match offer {
+                    TransportOffer::Iroh { node } if node != &provider => {
+                        return Err(RecordDecodeError::IrohNodeNotProvider {
+                            offer_node: *node,
+                            provider,
+                        });
+                    }
+                    TransportOffer::Libp2p { node, relay_hints } => {
+                        libp2p_offers += 1;
+                        if node != &provider {
+                            return Err(RecordDecodeError::Libp2pNodeNotProvider {
+                                offer_node: *node,
+                                provider,
+                            });
+                        }
+                        if relay_hints.as_slice().contains(&provider) {
+                            return Err(RecordDecodeError::Libp2pRelayIsProvider {
+                                relay: provider,
+                                provider,
+                            });
+                        }
+                    }
+                    _ => {}
                 }
+            }
+            if libp2p_offers > 1 {
+                return Err(RecordDecodeError::MultipleLibp2pOffers {
+                    found: libp2p_offers,
+                });
             }
             // Finding #2: offers must be STRICTLY ASCENDING by encoding (one signed
             // encoding per logical set; forbids duplicates). A non-canonical order whose
@@ -939,6 +1124,44 @@ mod tests {
     fn a_key() -> ContentKey {
         ContentKey::derive_from_signed_nar_hash(&[0x11u8; NAR_HASH_LEN])
     }
+    fn node_from_seed(seed: u8) -> NodeId {
+        NodeId::from_bytes(
+            SigningKey::from_bytes(&[seed; 32])
+                .verifying_key()
+                .to_bytes(),
+        )
+    }
+
+    fn signed_raw_body(sk: &SigningKey, body: Vec<u8>) -> Vec<u8> {
+        let sig = sk.sign(&signing_preimage(&body));
+        let mut wire = body;
+        wire.extend_from_slice(&sig.to_bytes());
+        wire
+    }
+
+    fn body_with_raw_libp2p_offers(sk: &SigningKey, offers: &[(&NodeId, &[NodeId])]) -> Vec<u8> {
+        let key = a_key();
+        let mut body = provide_body(&ProviderRecord {
+            key,
+            content: Blake3Digest::from_bytes([0xaa; BLAKE3_DIGEST_LEN]),
+            provider: provider_of(sk),
+            offers: vec![],
+            sequence: 1,
+            issued_at: 0,
+            expiry: 1_000,
+            signature: [0; PROVIDER_SIGNATURE_LEN],
+        });
+        *body.last_mut().expect("offers count") = offers.len() as u8;
+        for (node, relay_hints) in offers {
+            body.push(OFFER_LIBP2P);
+            body.extend_from_slice(node.as_bytes());
+            body.push(relay_hints.len() as u8);
+            for relay in *relay_hints {
+                body.extend_from_slice(relay.as_bytes());
+            }
+        }
+        body
+    }
 
     /// A fully-populated, correctly-signed provide over `key`, fresh at now<1000.
     fn good_record() -> (ProviderRecord, ContentKey) {
@@ -970,6 +1193,228 @@ mod tests {
         let bytes = encode_provider_record(&record).expect("encode");
         let decoded = decode_provider_assertion(&bytes, &key, 500).expect("decode");
         assert_eq!(decoded, ProviderAssertion::Provide(record));
+    }
+
+    #[test]
+    fn libp2p_offers_with_zero_one_and_two_hints_round_trip() {
+        let sk = signer();
+        let provider = provider_of(&sk);
+        let mut relays = [node_from_seed(0x11), node_from_seed(0x12)];
+        relays.sort();
+
+        for relay_hints in [
+            RelayHints::empty(),
+            RelayHints::try_from([relays[0]]).unwrap(),
+            RelayHints::try_from(relays).unwrap(),
+        ] {
+            let record = sign_provider_record(
+                &sk,
+                &ProviderRecord {
+                    key: a_key(),
+                    content: Blake3Digest::from_bytes([0xaa; BLAKE3_DIGEST_LEN]),
+                    provider,
+                    offers: vec![TransportOffer::Libp2p {
+                        node: provider,
+                        relay_hints,
+                    }],
+                    sequence: 1,
+                    issued_at: 0,
+                    expiry: 1_000,
+                    signature: [0; PROVIDER_SIGNATURE_LEN],
+                },
+            );
+            let wire = encode_provider_record(&record).unwrap();
+            assert_eq!(
+                decode_provider_assertion(&wire, &a_key(), 500).unwrap(),
+                ProviderAssertion::Provide(record)
+            );
+        }
+    }
+
+    #[test]
+    fn libp2p_hint_count_over_cap_is_rejected_before_hint_reads() {
+        let sk = signer();
+        let provider = provider_of(&sk);
+        let mut body = body_with_raw_libp2p_offers(&sk, &[(&provider, &[])]);
+        *body.last_mut().expect("hint count") = 3;
+        let wire = signed_raw_body(&sk, body);
+        assert_eq!(
+            decode_provider_assertion(&wire, &a_key(), 500),
+            Err(RecordDecodeError::TooManyRelayHints { found: 3, cap: 2 })
+        );
+    }
+
+    #[test]
+    fn libp2p_hint_truncation_is_rejected() {
+        let sk = signer();
+        let provider = provider_of(&sk);
+        let mut body = body_with_raw_libp2p_offers(&sk, &[(&provider, &[])]);
+        *body.last_mut().expect("hint count") = 1;
+        let wire = signed_raw_body(&sk, body);
+        assert!(matches!(
+            decode_provider_assertion(&wire, &a_key(), 500),
+            Err(RecordDecodeError::Truncated {
+                need: NODE_ID_LEN,
+                have: 0
+            })
+        ));
+    }
+
+    #[test]
+    fn libp2p_duplicate_and_descending_hints_are_rejected() {
+        let sk = signer();
+        let provider = provider_of(&sk);
+        let mut relays = [node_from_seed(0x11), node_from_seed(0x12)];
+        relays.sort();
+        for raw_hints in [[relays[0], relays[0]], [relays[1], relays[0]]] {
+            let body = body_with_raw_libp2p_offers(&sk, &[(&provider, &raw_hints)]);
+            let wire = signed_raw_body(&sk, body);
+            assert_eq!(
+                decode_provider_assertion(&wire, &a_key(), 500),
+                Err(RecordDecodeError::RelayHintsNotCanonical)
+            );
+        }
+    }
+
+    #[test]
+    fn libp2p_invalid_relay_identity_is_rejected() {
+        let sk = signer();
+        let provider = provider_of(&sk);
+        let invalid = NodeId::from_bytes([0xdf; NODE_ID_LEN]);
+        let body = body_with_raw_libp2p_offers(&sk, &[(&provider, &[invalid])]);
+        let wire = signed_raw_body(&sk, body);
+        assert_eq!(
+            decode_provider_assertion(&wire, &a_key(), 500),
+            Err(RecordDecodeError::BadRelayIdentity { relay: invalid })
+        );
+    }
+
+    #[test]
+    fn libp2p_self_relay_and_non_provider_node_are_rejected() {
+        let sk = signer();
+        let provider = provider_of(&sk);
+        let self_relay = body_with_raw_libp2p_offers(&sk, &[(&provider, &[provider])]);
+        assert_eq!(
+            decode_provider_assertion(&signed_raw_body(&sk, self_relay), &a_key(), 500),
+            Err(RecordDecodeError::Libp2pRelayIsProvider {
+                relay: provider,
+                provider,
+            })
+        );
+
+        let stranger = node_from_seed(0x23);
+        let wrong_node = body_with_raw_libp2p_offers(&sk, &[(&stranger, &[])]);
+        assert_eq!(
+            decode_provider_assertion(&signed_raw_body(&sk, wrong_node), &a_key(), 500),
+            Err(RecordDecodeError::Libp2pNodeNotProvider {
+                offer_node: stranger,
+                provider,
+            })
+        );
+    }
+
+    #[test]
+    fn more_than_one_libp2p_offer_is_rejected() {
+        let sk = signer();
+        let provider = provider_of(&sk);
+        let relay = node_from_seed(0x31);
+        let body = body_with_raw_libp2p_offers(&sk, &[(&provider, &[]), (&provider, &[relay])]);
+        assert_eq!(
+            decode_provider_assertion(&signed_raw_body(&sk, body), &a_key(), 500),
+            Err(RecordDecodeError::MultipleLibp2pOffers { found: 2 })
+        );
+    }
+
+    #[test]
+    fn libp2p_encode_side_context_guards_return_exact_errors() {
+        let provider = provider_of(&signer());
+        let stranger = provider_of(&SigningKey::from_bytes(&[0x43; 32]));
+        let base = ProviderRecord {
+            key: a_key(),
+            content: Blake3Digest::from_bytes([0xaa; BLAKE3_DIGEST_LEN]),
+            provider,
+            offers: vec![],
+            sequence: 1,
+            issued_at: 0,
+            expiry: 1_000,
+            signature: [0; PROVIDER_SIGNATURE_LEN],
+        };
+
+        let wrong_node = ProviderRecord {
+            offers: vec![TransportOffer::Libp2p {
+                node: stranger,
+                relay_hints: RelayHints::empty(),
+            }],
+            ..base.clone()
+        };
+        assert_eq!(
+            encode_provider_record(&wrong_node),
+            Err(RecordEncodeError::Libp2pNodeNotProvider {
+                offer_node: stranger,
+                provider,
+            })
+        );
+
+        let self_relay = ProviderRecord {
+            offers: vec![TransportOffer::Libp2p {
+                node: provider,
+                relay_hints: RelayHints::try_from([provider]).expect("valid ed25519 key"),
+            }],
+            ..base.clone()
+        };
+        assert_eq!(
+            encode_provider_record(&self_relay),
+            Err(RecordEncodeError::Libp2pRelayIsProvider {
+                relay: provider,
+                provider,
+            })
+        );
+
+        // The zero-hint encoding is a strict prefix of the one-hint encoding, so this
+        // input is already in canonical outer-offer order. MultipleLibp2pOffers is
+        // therefore the sole fault and its sender-side guard must be the one that fires.
+        let duplicate_transport = ProviderRecord {
+            offers: vec![
+                TransportOffer::libp2p(provider),
+                TransportOffer::Libp2p {
+                    node: provider,
+                    relay_hints: RelayHints::try_from([stranger]).expect("valid relay"),
+                },
+            ],
+            ..base
+        };
+        assert_eq!(
+            encode_provider_record(&duplicate_transport),
+            Err(RecordEncodeError::MultipleLibp2pOffers { found: 2 })
+        );
+    }
+
+    #[test]
+    fn libp2p_signed_body_tamper_is_rejected() {
+        let sk = signer();
+        let provider = provider_of(&sk);
+        let record = sign_provider_record(
+            &sk,
+            &ProviderRecord {
+                key: a_key(),
+                content: Blake3Digest::from_bytes([0xaa; BLAKE3_DIGEST_LEN]),
+                provider,
+                offers: vec![TransportOffer::Libp2p {
+                    node: provider,
+                    relay_hints: RelayHints::empty(),
+                }],
+                sequence: 1,
+                issued_at: 0,
+                expiry: 1_000,
+                signature: [0; PROVIDER_SIGNATURE_LEN],
+            },
+        );
+        let mut wire = encode_provider_record(&record).unwrap();
+        wire[BODY_HEADER_LEN] ^= 1;
+        assert_eq!(
+            decode_provider_assertion(&wire, &a_key(), 500),
+            Err(RecordDecodeError::BadSignature)
+        );
     }
 
     #[test]

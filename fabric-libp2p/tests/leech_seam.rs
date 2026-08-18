@@ -105,7 +105,7 @@ fn signed_record(seed_byte: u8, nar_hash: [u8; 32]) -> (ContentKey, ProviderReco
         key,
         content: Blake3Digest::from_bytes([0x5a; 32]),
         provider,
-        offers: vec![TransportOffer::Iroh { node: provider }],
+        offers: vec![TransportOffer::libp2p(provider)],
         sequence: 1,
         issued_at: now,
         expiry: now + 3600,

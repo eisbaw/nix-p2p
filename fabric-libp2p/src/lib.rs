@@ -89,13 +89,12 @@
 //!
 //! # What is here vs deferred
 //!
-//! Here (TASK-103 cornerstone): the crate, the swarm worker, the kad-backed
-//! [`Libp2pProviderDirectory`] + [`Libp2pAvailabilityAnnouncer`], a `Libp2pFabric`
-//! exposing the directory, and the multi-node decentralized-discovery test. Deferred:
-//! the libp2p `NarTransfer` / `NarServer` transport and node discovery / NAT traversal
-//! (TASK-151, shares this crate's `Swarm`), and the hardening / evidence ACs
-//! (withdrawal/expiry/replay/partition, sybil/eclipse bounds, packet guards, the
-//! `decentralized-content-discovery-v1` artifact, TASK-132 cold journey).
+//! Here: the crate and swarm worker, the kad-backed [`Libp2pProviderDirectory`] and
+//! [`Libp2pAvailabilityAnnouncer`], node locator, `NarTransfer` / `NarServer`, and a
+//! `Libp2pFabric` exposing them. TASK-156 gives that transfer its native Libp2p
+//! ProviderRecord tag; the tag-Iroh adapter is rollout compatibility only. General
+//! relay-hint consumption and multi-relay NAT topology remain TASK-219, separate from
+//! this typed wire/dispatch slice.
 
 mod announcer;
 mod directory;

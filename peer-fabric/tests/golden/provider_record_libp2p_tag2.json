@@ -1,0 +1,140 @@
+{
+  "_comment": "TASK-156 additive OFFER_LIBP2P=2 vectors inside ProviderRecord schema v1. Separate from the immutable TASK-126 provider_record_v1.json anchor.",
+  "layout": {
+    "schema_version": 1,
+    "signing_domain_hex": "6e69782d7032702f646973636f766572792f50726f76696465725265636f72642f763100",
+    "offer_libp2p_tag": 2,
+    "offer_layout": "tag:u8 | provider_node:32 | hint_count:u8 | relay_node:32 * count",
+    "max_relay_hints": 2
+  },
+  "identity": {
+    "signer_seed_hex": "4242424242424242424242424242424242424242424242424242424242424242",
+    "provider_hex": "2152f8d19b791d24453242e15f2eab6cb7cffa7b6a5ed30097960e069881db12",
+    "key_hex": "4e61db15d59529f33ad8f264c93302500233a84605dc58cb2ac3b8f4a2ed007c",
+    "content_hex": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "relay_hex": [
+      "204040e364c10f2bec9c1fe500a1cd4c247c89d650a01ed7e82caba867877c21",
+      "d04ab232742bb4ab3a1368bd4615e4e6d0224ab71a016baf8520a332c9778737"
+    ],
+    "stranger_hex": "74f85cda34d1c27c4621484731e91579c3d9c6cfc0d94b281aa11e9162058aa9"
+  },
+  "vectors": [
+    {
+      "name": "libp2p_zero_hints",
+      "direction": "both",
+      "sequence": 20,
+      "relay_hints_hex": [],
+      "wire_hex": "0001004e61db15d59529f33ad8f264c93302500233a84605dc58cb2ac3b8f4a2ed007c2152f8d19b791d24453242e15f2eab6cb7cffa7b6a5ed30097960e069881db120000000000000014000000000000006400000000000003e8aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa01022152f8d19b791d24453242e15f2eab6cb7cffa7b6a5ed30097960e069881db120065eb7faf6d0ad3ac991fd283ca82c2bed1353382479088420676f0e0929c284c3ebbf94a000f4d5ac8ca1b40279a5490863952cfb0925d6ad5b042250968de0a"
+    },
+    {
+      "name": "libp2p_one_hint",
+      "direction": "both",
+      "sequence": 21,
+      "relay_hints_hex": [
+        "204040e364c10f2bec9c1fe500a1cd4c247c89d650a01ed7e82caba867877c21"
+      ],
+      "wire_hex": "0001004e61db15d59529f33ad8f264c93302500233a84605dc58cb2ac3b8f4a2ed007c2152f8d19b791d24453242e15f2eab6cb7cffa7b6a5ed30097960e069881db120000000000000015000000000000006400000000000003e8aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa01022152f8d19b791d24453242e15f2eab6cb7cffa7b6a5ed30097960e069881db1201204040e364c10f2bec9c1fe500a1cd4c247c89d650a01ed7e82caba867877c21d8a25beafe38037e5fc1de13ba9512501d306a0cf92630c237dfb0f651e66dc1fc7454a9d21b6e729a2d146dd1426cf8edd195e04648c4696f9f4d162d6d4408"
+    },
+    {
+      "name": "libp2p_two_hints",
+      "direction": "both",
+      "sequence": 22,
+      "relay_hints_hex": [
+        "204040e364c10f2bec9c1fe500a1cd4c247c89d650a01ed7e82caba867877c21",
+        "d04ab232742bb4ab3a1368bd4615e4e6d0224ab71a016baf8520a332c9778737"
+      ],
+      "wire_hex": "0001004e61db15d59529f33ad8f264c93302500233a84605dc58cb2ac3b8f4a2ed007c2152f8d19b791d24453242e15f2eab6cb7cffa7b6a5ed30097960e069881db120000000000000016000000000000006400000000000003e8aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa01022152f8d19b791d24453242e15f2eab6cb7cffa7b6a5ed30097960e069881db1202204040e364c10f2bec9c1fe500a1cd4c247c89d650a01ed7e82caba867877c21d04ab232742bb4ab3a1368bd4615e4e6d0224ab71a016baf8520a332c97787372177f404109fd3c4bd1fd6a992cff4b07b36e868910e4b5859fdc1ba8ebf9841c757741edaae36065ee91ed4124eda31b41d2d42ffe459edddb0a78d2a167902"
+    },
+    {
+      "name": "mixed_iroh_bittorrent_libp2p",
+      "direction": "both",
+      "sequence": 23,
+      "relay_hints_hex": [],
+      "bittorrent_v1_hex": "cccccccccccccccccccccccccccccccccccccccc",
+      "wire_hex": "0001004e61db15d59529f33ad8f264c93302500233a84605dc58cb2ac3b8f4a2ed007c2152f8d19b791d24453242e15f2eab6cb7cffa7b6a5ed30097960e069881db120000000000000017000000000000006400000000000003e8aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa03002152f8d19b791d24453242e15f2eab6cb7cffa7b6a5ed30097960e069881db120101cccccccccccccccccccccccccccccccccccccccc022152f8d19b791d24453242e15f2eab6cb7cffa7b6a5ed30097960e069881db12001689aedaf10139d8bf11c38e1a636b3d390d1e07a69ca001f91be9678363ee8f4355f2d6ba8a4a7f92d479942d3fc56a2dc5dff90d43fdff35c0776f3e1ffe0c"
+    },
+    {
+      "name": "reject_tampered_signed_body",
+      "direction": "reject",
+      "reject_reason": "BadSignature",
+      "reject_fields": {},
+      "wire_hex": "0001004e61db15d59529f33ad8f264c93302500233a84605dc58cb2ac3b8f4a2ed007c2152f8d19b791d24453242e15f2eab6cb7cffa7b6a5ed30097960e069881db120000000000000014000000000000006400000000000003e8abaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa01022152f8d19b791d24453242e15f2eab6cb7cffa7b6a5ed30097960e069881db120065eb7faf6d0ad3ac991fd283ca82c2bed1353382479088420676f0e0929c284c3ebbf94a000f4d5ac8ca1b40279a5490863952cfb0925d6ad5b042250968de0a"
+    },
+    {
+      "name": "reject_relay_hint_signed_body_tamper",
+      "direction": "reject",
+      "reject_reason": "BadSignature",
+      "reject_fields": {},
+      "wire_hex": "0001004e61db15d59529f33ad8f264c93302500233a84605dc58cb2ac3b8f4a2ed007c2152f8d19b791d24453242e15f2eab6cb7cffa7b6a5ed30097960e069881db120000000000000016000000000000006400000000000003e8aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa01022152f8d19b791d24453242e15f2eab6cb7cffa7b6a5ed30097960e069881db120274f85cda34d1c27c4621484731e91579c3d9c6cfc0d94b281aa11e9162058aa9d04ab232742bb4ab3a1368bd4615e4e6d0224ab71a016baf8520a332c97787372177f404109fd3c4bd1fd6a992cff4b07b36e868910e4b5859fdc1ba8ebf9841c757741edaae36065ee91ed4124eda31b41d2d42ffe459edddb0a78d2a167902"
+    },
+    {
+      "name": "reject_truncated_hint",
+      "direction": "reject",
+      "reject_reason": "Truncated",
+      "reject_fields": { "need": 32, "have": 0 },
+      "wire_hex": "0001004e61db15d59529f33ad8f264c93302500233a84605dc58cb2ac3b8f4a2ed007c2152f8d19b791d24453242e15f2eab6cb7cffa7b6a5ed30097960e069881db12000000000000001e000000000000006400000000000003e8aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa01022152f8d19b791d24453242e15f2eab6cb7cffa7b6a5ed30097960e069881db12018a9f65dfeb3245bb8e304bf32b6d80f7904207e516254af37c8d73c92fe87b183f5e45be170d52822b649d1ff5c2a48745386ac915dfd75df2de8cf02667ca09"
+    },
+    {
+      "name": "reject_over_cap_hints",
+      "direction": "reject",
+      "reject_reason": "TooManyRelayHints",
+      "reject_fields": { "found": 3, "cap": 2 },
+      "wire_hex": "0001004e61db15d59529f33ad8f264c93302500233a84605dc58cb2ac3b8f4a2ed007c2152f8d19b791d24453242e15f2eab6cb7cffa7b6a5ed30097960e069881db12000000000000001f000000000000006400000000000003e8aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa01022152f8d19b791d24453242e15f2eab6cb7cffa7b6a5ed30097960e069881db1203a209056ac983439249144ad396e3b0f3558a6841cfe0e6f36fc4d2aee3ec43b8a9f1d691e9f105593475e0b1ef79d1094a4aae13a3ed782ac00ca2cc58363b0a"
+    },
+    {
+      "name": "reject_duplicate_hints",
+      "direction": "reject",
+      "reject_reason": "RelayHintsNotCanonical",
+      "reject_fields": {},
+      "wire_hex": "0001004e61db15d59529f33ad8f264c93302500233a84605dc58cb2ac3b8f4a2ed007c2152f8d19b791d24453242e15f2eab6cb7cffa7b6a5ed30097960e069881db120000000000000020000000000000006400000000000003e8aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa01022152f8d19b791d24453242e15f2eab6cb7cffa7b6a5ed30097960e069881db1202204040e364c10f2bec9c1fe500a1cd4c247c89d650a01ed7e82caba867877c21204040e364c10f2bec9c1fe500a1cd4c247c89d650a01ed7e82caba867877c2127ce30adcb6e422116c96c2144b2a42b16afe77a5db92be8ad3e6a1799d1be73054fd8768fe1af23ac2cf31f812204060a3aa53a50fefbe8e8a64a0cdffab30e"
+    },
+    {
+      "name": "reject_descending_hints",
+      "direction": "reject",
+      "reject_reason": "RelayHintsNotCanonical",
+      "reject_fields": {},
+      "wire_hex": "0001004e61db15d59529f33ad8f264c93302500233a84605dc58cb2ac3b8f4a2ed007c2152f8d19b791d24453242e15f2eab6cb7cffa7b6a5ed30097960e069881db120000000000000021000000000000006400000000000003e8aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa01022152f8d19b791d24453242e15f2eab6cb7cffa7b6a5ed30097960e069881db1202d04ab232742bb4ab3a1368bd4615e4e6d0224ab71a016baf8520a332c9778737204040e364c10f2bec9c1fe500a1cd4c247c89d650a01ed7e82caba867877c217f8076159133d962c2c9eb10edaed4fbf7c6023fd40db6a0e47f714146682dea35cd8bd949380e86be2c80f08af69de6bfab997bc2bc90d1142289ffc3754708"
+    },
+    {
+      "name": "reject_invalid_relay_identity",
+      "direction": "reject",
+      "reject_reason": "BadRelayIdentity",
+      "reject_fields": { "relay_hex": "dfdfdfdfdfdfdfdfdfdfdfdfdfdfdfdfdfdfdfdfdfdfdfdfdfdfdfdfdfdfdfdf" },
+      "wire_hex": "0001004e61db15d59529f33ad8f264c93302500233a84605dc58cb2ac3b8f4a2ed007c2152f8d19b791d24453242e15f2eab6cb7cffa7b6a5ed30097960e069881db120000000000000022000000000000006400000000000003e8aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa01022152f8d19b791d24453242e15f2eab6cb7cffa7b6a5ed30097960e069881db1201dfdfdfdfdfdfdfdfdfdfdfdfdfdfdfdfdfdfdfdfdfdfdfdfdfdfdfdfdfdfdfdf3b5301e30ca56c0c06d4e02839930302de05516a5dcaff0c5dc982560b719cd265e45d54e74594014e1f11409bfced703d46f932ed74035bbd42bdd0e119860e"
+    },
+    {
+      "name": "reject_small_order_relay_identity",
+      "direction": "reject",
+      "reject_reason": "BadRelayIdentity",
+      "reject_fields": { "relay_hex": "0100000000000000000000000000000000000000000000000000000000000000" },
+      "wire_hex": "0001004e61db15d59529f33ad8f264c93302500233a84605dc58cb2ac3b8f4a2ed007c2152f8d19b791d24453242e15f2eab6cb7cffa7b6a5ed30097960e069881db120000000000000023000000000000006400000000000003e8aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa01022152f8d19b791d24453242e15f2eab6cb7cffa7b6a5ed30097960e069881db120101000000000000000000000000000000000000000000000000000000000000004bc16fe13081076f459d9afe47a013cd141d44b04dbb338b4161b5e5bbf22be8a434a587518f4f916c658593385985f25dba55434f48c3d90d198e7dea4a4307"
+    },
+    {
+      "name": "reject_self_relay",
+      "direction": "reject",
+      "reject_reason": "Libp2pRelayIsProvider",
+      "reject_fields": {
+        "relay_hex": "2152f8d19b791d24453242e15f2eab6cb7cffa7b6a5ed30097960e069881db12",
+        "provider_hex": "2152f8d19b791d24453242e15f2eab6cb7cffa7b6a5ed30097960e069881db12"
+      },
+      "wire_hex": "0001004e61db15d59529f33ad8f264c93302500233a84605dc58cb2ac3b8f4a2ed007c2152f8d19b791d24453242e15f2eab6cb7cffa7b6a5ed30097960e069881db120000000000000024000000000000006400000000000003e8aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa01022152f8d19b791d24453242e15f2eab6cb7cffa7b6a5ed30097960e069881db12012152f8d19b791d24453242e15f2eab6cb7cffa7b6a5ed30097960e069881db12fb38e752315246e59ead12e806b61400979ef21dab7cfe738ac35108980800e46f42db08c6238d76a6e88dc25a0ea839e66f3238e55a5ea1824efdb1fe533108"
+    },
+    {
+      "name": "reject_node_not_provider",
+      "direction": "reject",
+      "reject_reason": "Libp2pNodeNotProvider",
+      "reject_fields": {
+        "offer_node_hex": "74f85cda34d1c27c4621484731e91579c3d9c6cfc0d94b281aa11e9162058aa9",
+        "provider_hex": "2152f8d19b791d24453242e15f2eab6cb7cffa7b6a5ed30097960e069881db12"
+      },
+      "wire_hex": "0001004e61db15d59529f33ad8f264c93302500233a84605dc58cb2ac3b8f4a2ed007c2152f8d19b791d24453242e15f2eab6cb7cffa7b6a5ed30097960e069881db120000000000000025000000000000006400000000000003e8aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa010274f85cda34d1c27c4621484731e91579c3d9c6cfc0d94b281aa11e9162058aa9005d597868188c804728b938ab6d6f06ec119cadca62eb5fc7f475858b4e63d893a12027feb1ceb47cbc91bc18c243eafb9e8a810c13ab031bb8bb0f4b129b9a01"
+    },
+    {
+      "name": "reject_multiple_libp2p_offers",
+      "direction": "reject",
+      "reject_reason": "MultipleLibp2pOffers",
+      "reject_fields": { "found": 2 },
+      "wire_hex": "0001004e61db15d59529f33ad8f264c93302500233a84605dc58cb2ac3b8f4a2ed007c2152f8d19b791d24453242e15f2eab6cb7cffa7b6a5ed30097960e069881db120000000000000026000000000000006400000000000003e8aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa02022152f8d19b791d24453242e15f2eab6cb7cffa7b6a5ed30097960e069881db1200022152f8d19b791d24453242e15f2eab6cb7cffa7b6a5ed30097960e069881db1201204040e364c10f2bec9c1fe500a1cd4c247c89d650a01ed7e82caba867877c21673fd11e5fe0fd7aabfdd7d2a1143575863bccedd31bce0b9767492eeb1d8dd8b37b939e11f1d84a5766bd378a34b4ba13822abaa92ca109a229d0a8beee1b0d"
+    }
+  ]
+}

@@ -92,6 +92,14 @@ Gates (all must pass; `just` recipes are the canonical entry points):
    mode, run deliberately, NOT on every cycle. A failure in either mode
    persists a replayable reproducer (proptest `.proptest-regressions` /
    hypothesis "Falsifying example").
+   The frozen ProviderRecord wire has two independent anchors in this tier:
+   `provider_record_v1.json` remains the immutable TASK-126 tag-0/tag-1 fixture,
+   while `provider_record_libp2p_tag2.json` separately pins TASK-156's additive
+   schema-v1 tag 2. Rust checks exact emitted/accepted bytes and typed reject
+   payloads; `scripts/check-provider-record-libp2p-tag2.py` independently parses
+   the layout, validates strict bounded relay identities, verifies signatures with
+   a pure-Python RFC 8032 implementation, and proves a historical v1 reader returns
+   `UnknownOffer` rather than silently dropping tag 2.
 4. `just e2e` — container harness, FAST subset: five scenarios, one
    per distinct path (S1 byte/counts, S2 fallback, the tamper-narhash
    safety bite, depth-3 chain composition, S6 p2p). Sized for the

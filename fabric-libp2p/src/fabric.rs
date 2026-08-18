@@ -23,7 +23,7 @@ use crate::locator::Libp2pNodeLocator;
 use crate::nar::Libp2pNarSupplier;
 use crate::server::Libp2pServer;
 use crate::swarm::{Node, NodeConfig, NodeError, SwarmHandle};
-use crate::transport::Libp2pTransport;
+use crate::transport::{LegacyIrohTagLibp2pAdapter, Libp2pTransport};
 
 /// The durable sidecar filenames a fabric writes under its `state_dir` (TASK-185). Exposed as
 /// the SINGLE SOURCE for these names so the composition root can enforce STATE-DIR CONSISTENCY
@@ -194,14 +194,22 @@ impl Libp2pFabric {
             known_relays,
         ));
 
-        // The fetch transport is always available (a consumer needs it); it registers
-        // under the NodeId-locator tag (see transport.rs ADR). It resolves the provider's
-        // dial address through the shared locator BEFORE dialing (TASK-169).
+        // The fetch transport is always available (a consumer needs it). Its native
+        // registration is the distinct Libp2p tag. A separate rollout-only fallback
+        // reads historical records that used the Iroh tag for this libp2p path; the
+        // registry keeps compatibility fallbacks outside the native namespace, so a
+        // future actual Iroh backend deterministically wins that key without collision.
+        // Both paths resolve the provider through the same locator before dialing.
         let mut transfers = TransferRegistry::new();
-        transfers.register(Arc::new(Libp2pTransport::new(
+        let libp2p_transport = Arc::new(Libp2pTransport::new(
             node.handle.clone(),
             node_locator.clone(),
-        )));
+        ));
+        transfers.register(libp2p_transport.clone());
+        transfers.register_compatibility_fallback(
+            TransportTag::Iroh,
+            Arc::new(LegacyIrohTagLibp2pAdapter::new(libp2p_transport)),
+        );
 
         let locator: Arc<dyn NodeLocator> = node_locator;
 
@@ -305,8 +313,8 @@ impl PeerFabric for Libp2pFabric {
     }
 
     fn transfer(&self, tag: TransportTag) -> Option<&dyn NarTransfer> {
-        // The libp2p NarTransfer (request-response, BLAKE3-verified) is registered under
-        // the NodeId-locator tag (TransportTag::Iroh; see transport.rs ADR).
+        // Native libp2p dispatch plus the rollout-only legacy-record fallback described
+        // at construction. TransferRegistry always prefers a native backend.
         self.transfers.get(tag)
     }
 

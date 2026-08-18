@@ -138,7 +138,7 @@ fn signed_record(
         key,
         content,
         provider,
-        offers: vec![TransportOffer::Iroh { node: provider }],
+        offers: vec![TransportOffer::libp2p(provider)],
         sequence: 1,
         issued_at: now,
         expiry: now + 3600,

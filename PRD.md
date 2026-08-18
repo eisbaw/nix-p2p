@@ -711,8 +711,10 @@ tasks (TASK-130/TASK-116) as **superseded for discovery** — now Low priority +
 `deferred-pending-202`, retained only as optional iroh-transport reference; and
 (c) **preserves iroh as an optional, measured transport backend** — the transport
 tournament is deferred basics-first (owner steer: decentralized discovery and
-robust connectivity first), **not dropped**, so the dual-stack transport-tag work
-(TASK-156/TASK-183) stays deferred-not-cancelled. (Updated owner steer 2026-08-15:
+robust connectivity first), **not dropped**. TASK-156's typed-wire work is now
+landed (native Libp2p tag 2 plus rollout compatibility), resolving TASK-183's
+tag/collision prerequisite; the actual composition and measurement work (TASK-163
+and later tournament tasks) stays deferred-not-cancelled. (Updated owner steer 2026-08-15:
 fast link-compression is pulled EARLIER — it is the value-thesis lever that brings
 the peer path to near-parity, an unsigned transport field that never touches the
 frozen addressed unit — see TASK-203; content-addressed variable chunking à la
@@ -750,9 +752,12 @@ The build order below is implementation risk ordering only:
    beats libp2p's own transport (request-response/stream over AutoNAT/DCUtR/relay)
    on real NATs is exactly what the transport tournament measures, under one
    libp2p-kad discovery; if it does not, the product collapses to pure libp2p.
-   Per the owner's basics-first steer, the tournament and its dual-stack
-   transport-tag work (TASK-156/TASK-183) are **deferred, not cancelled** — iroh
-   stays a funded measured arm and the winner is decided by evidence, not here.
+   Per the owner's basics-first steer, TASK-156 now lands the bounded, native
+   Libp2p transport tag without activating the tournament and thereby resolves
+   TASK-183's tag/collision prerequisite. The actual dual-stack composition and
+   measurement work (TASK-163 and later tournament tasks) remains **deferred, not
+   cancelled** — iroh stays a funded measured arm and the winner is decided by
+   evidence, not here.
    The LAN component (TASK-130) and LAN BatchHoldQuery slice (TASK-116) are
    likewise deferred (Low, `deferred-pending-202`) and are no longer gated behind
    an iroh global verdict.

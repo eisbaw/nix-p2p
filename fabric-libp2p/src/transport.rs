@@ -3,34 +3,20 @@
 //! (TASK-157), gate-1 BLAKE3-verify it, and honour the [`SafetyEnvelope`] (dial / body-idle /
 //! total bounds) and the signed NarSize as a true mid-stream size abort.
 //!
-//! # ADR (TASK-151): why this services the `Iroh` tag (offer-driven dispatch)
+//! # ADR (TASK-156): native libp2p dispatch + rollout-only legacy reader
 //!
-//! Two facts force `tag() == TransportTag::Iroh` this cycle:
+//! [`Libp2pTransport`] is registered under its real [`TransportTag::Libp2p`] and
+//! accepts only [`TransportOffer::Libp2p`]. This lets one registry hold real iroh and
+//! libp2p backends simultaneously under distinct keys.
 //!
-//!   1. A [`ProviderRecord`](peer_fabric::ProviderRecord) can only carry the FROZEN
-//!      offer variants, and the only reachability offer is self-serve
-//!      [`TransportOffer::Iroh`]`{ node: NodeId }` - the provider's ed25519 identity
-//!      (TASK-103/126). `NodeId` is transport-blind, and a libp2p `PeerId` derives from
-//!      that SAME ed25519 key ([`crate::keys::peer_id_of_provider`]), so a libp2p daemon
-//!      MUST consume that offer to fetch anything discovered through existing records.
-//!   2. Dispatch is OFFER-DRIVEN: the fetch driver computes `offer.tag()`
-//!      (= `TransportTag::of(offer)`) and looks up the registry by it. For an `Iroh`
-//!      offer that is always `TransportTag::Iroh`. So a transport that wants to be
-//!      dispatched for the existing offer has NO CHOICE but to register under `Iroh` -
-//!      this is mechanical, not a claim that the tag "means a NodeId locator".
-//!
-//! In a SINGLE-STACK libp2p build there is exactly one transport per tag, so no
-//! collision arises. The tag string still literally reads `"iroh"` (the frozen type's
-//! own SSOT), which is a known cosmetic wart in a libp2p-only process; it is not
-//! reinterpreted here.
-//!
-//! DUAL-STACK LIMITATION (the transport tournament, both transfers in one process):
-//! because dispatch is offer-driven, a bare `TransportTag::Libp2p` would NEVER be
-//! selected for an `Iroh` offer - the tournament genuinely needs a distinct
-//! `TransportOffer::Libp2p` on the FROZEN wire (additive `OFFER_LIBP2P` in the record
-//! codec), and until then registering both transfers would SILENTLY clobber one under
-//! the shared `Iroh` tag ([`peer_fabric::TransferRegistry::register`] overwrites).
-//! Filed as TASK-156 (frozen-seam change with wire review); NOT attempted here.
+//! Coordinated rollout still has to consume records written before tag 2 existed.
+//! [`LegacyIrohTagLibp2pAdapter`] is the explicit, internal reader for those records:
+//! it translates the old self-serve NodeId locator into a libp2p offer with no relay
+//! hints, then calls the native transport. It does NOT implement iroh and is never
+//! installed as a native backend. [`peer_fabric::TransferRegistry`] stores it in a
+//! separate compatibility-fallback namespace where a future real iroh backend always
+//! wins, independent of registration order. New records are never written through
+//! this adapter.
 
 use std::sync::Arc;
 
@@ -38,7 +24,7 @@ use async_trait::async_trait;
 use libp2p::Multiaddr;
 
 use peer_fabric::{
-    Blake3Digest, Lookup, NarTransfer, NodeLocator, ResolutionPolicy, SafetyEnvelope,
+    Blake3Digest, Lookup, NarTransfer, NodeLocator, RelayHints, ResolutionPolicy, SafetyEnvelope,
     TransferError, TransportOffer, TransportTag,
 };
 
@@ -70,9 +56,7 @@ impl Libp2pTransport {
 #[async_trait]
 impl NarTransfer for Libp2pTransport {
     fn tag(&self) -> TransportTag {
-        // Services the NodeId-locator offer; see the module ADR (TASK-156 tracks a
-        // distinct Libp2p tag for the dual-stack tournament).
-        TransportTag::Iroh
+        TransportTag::Libp2p
     }
 
     async fn fetch(
@@ -83,15 +67,28 @@ impl NarTransfer for Libp2pTransport {
         envelope: &SafetyEnvelope,
     ) -> Result<Vec<u8>, TransferError> {
         // The locator is the provider's ed25519 NodeId; derive its libp2p PeerId.
-        let node = match offer {
-            TransportOffer::Iroh { node } => *node,
+        let (node, relay_hints) = match offer {
+            TransportOffer::Libp2p { node, relay_hints } => (*node, *relay_hints),
             other => {
                 return Err(TransferError::WrongOffer {
-                    expected: TransportTag::Iroh,
+                    expected: TransportTag::Libp2p,
                     got: other.tag(),
                 });
             }
         };
+        // TASK-156 freezes and authenticates the final relay-hint wire shape, while
+        // TASK-219 owns deriving live hints and resolving them through kad. Writers in
+        // this cycle emit none. A record from a newer coordinated writer may carry
+        // validated hints; this reader still tries the provider's ordinary kad-resolved
+        // addresses and falls back normally if unreachable. It never treats hint bytes
+        // as addresses or silently truncates them.
+        if !relay_hints.is_empty() {
+            tracing::debug!(
+                provider = %node,
+                relay_hint_count = relay_hints.len(),
+                "fabric-libp2p: signed relay hints present; TASK-156 reader uses the direct kad locator path"
+            );
+        }
         let peer = peer_id_of_provider(&node).ok_or_else(|| {
             TransferError::Unavailable(format!(
                 "provider {node} is not a valid ed25519 peer id, cannot dial over libp2p"
@@ -249,5 +246,61 @@ impl NarTransfer for Libp2pTransport {
                 "libp2p fetch exceeded the total timeout {total_timeout:?}"
             ))),
         }
+    }
+}
+
+/// Rollout-only reader for pre-TASK-156 records whose libp2p provider was encoded
+/// using the historical `Iroh { node }` offer. This adapter performs libp2p I/O;
+/// its name and logs keep that fact explicit. It is registered only in the
+/// compatibility-fallback namespace, never under the native backend map.
+pub(crate) struct LegacyIrohTagLibp2pAdapter {
+    native: Arc<Libp2pTransport>,
+}
+
+impl LegacyIrohTagLibp2pAdapter {
+    pub(crate) fn new(native: Arc<Libp2pTransport>) -> Self {
+        Self { native }
+    }
+}
+
+#[async_trait]
+impl NarTransfer for LegacyIrohTagLibp2pAdapter {
+    fn tag(&self) -> TransportTag {
+        // This is the legacy OFFER tag consumed by the adapter, not the transport it
+        // runs. The real backend remains registered as TransportTag::Libp2p.
+        TransportTag::Iroh
+    }
+
+    async fn fetch(
+        &self,
+        content: &Blake3Digest,
+        offer: &TransportOffer,
+        expected_size: Option<u64>,
+        envelope: &SafetyEnvelope,
+    ) -> Result<Vec<u8>, TransferError> {
+        let node = match offer {
+            TransportOffer::Iroh { node } => *node,
+            other => {
+                return Err(TransferError::WrongOffer {
+                    expected: TransportTag::Iroh,
+                    got: other.tag(),
+                });
+            }
+        };
+        tracing::debug!(
+            provider = %node,
+            "fabric-libp2p: reading legacy Iroh-tag provider record through the rollout-only libp2p adapter"
+        );
+        self.native
+            .fetch(
+                content,
+                &TransportOffer::Libp2p {
+                    node,
+                    relay_hints: RelayHints::empty(),
+                },
+                expected_size,
+                envelope,
+            )
+            .await
     }
 }

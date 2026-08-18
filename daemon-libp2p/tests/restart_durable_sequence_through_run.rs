@@ -451,7 +451,7 @@ async fn restart_durable_sequence_serves_through_run() {
         required_axes: vec![
             Axis::ProviderDirectory,
             Axis::NodeLocator,
-            Axis::Transfer(TransportTag::Iroh),
+            Axis::Transfer(TransportTag::Libp2p),
         ],
         extra_raw_serve: Vec::new(),
         public_allowlist: Arc::new(daemon_core::PublicNarAllowlist::disabled()),

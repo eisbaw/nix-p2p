@@ -201,7 +201,7 @@ mod tests {
             key,
             content: Blake3Digest::from_bytes([0xaa; 32]),
             provider,
-            offers: vec![TransportOffer::Iroh { node: provider }],
+            offers: vec![TransportOffer::libp2p(provider)],
             sequence,
             issued_at: 0,
             expiry,

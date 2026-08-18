@@ -30,7 +30,7 @@ use fabric_libp2p::{
 use peer_fabric::{
     Blake3Digest, CODEC_ZSTD, ExposureLedger, Lookup, NarServer, NarTransfer, NodeLocator,
     ResolutionPolicy, SafetyEnvelope, ServeBudget, ServeCodecPolicy, TransferError, TransportOffer,
-    compress_zstd,
+    TransportTag, compress_zstd,
 };
 use proc_supervisor::{TaskSupervisor, TaskSupervisorHandle};
 
@@ -301,9 +301,8 @@ async fn fetch_is_byte_identical_and_blake3_verified_across_two_nodes() {
     // Node B: fetch it (resolves A's dial address through the DHT via B).
     let (node_b, _addr_b) = start_listening([2u8; 32], scope).await;
     let transport = wire_consumer(&node_b, &node_a, boot_peer, boot_addr.clone()).await;
-    let offer = TransportOffer::Iroh {
-        node: node_a.node_id,
-    };
+    assert_eq!(transport.tag(), TransportTag::Libp2p);
+    let offer = TransportOffer::libp2p(node_a.node_id);
 
     let bytes = transport
         .fetch(&content, &offer, Some(nar.len() as u64), &envelope())
@@ -346,9 +345,7 @@ async fn corrupt_provider_is_rejected_by_gate1_blake3_verify() {
 
     let (node_b, _addr_b) = start_listening([4u8; 32], scope).await;
     let transport = wire_consumer(&node_b, &node_a, boot_peer, boot_addr.clone()).await;
-    let offer = TransportOffer::Iroh {
-        node: node_a.node_id,
-    };
+    let offer = TransportOffer::libp2p(node_a.node_id);
 
     let err = transport
         .fetch(&requested, &offer, None, &envelope())
@@ -386,9 +383,7 @@ async fn signed_bound_smaller_than_served_bytes_trips_size_abort() {
 
     let (node_b, _addr_b) = start_listening([6u8; 32], scope).await;
     let transport = wire_consumer(&node_b, &node_a, boot_peer, boot_addr.clone()).await;
-    let offer = TransportOffer::Iroh {
-        node: node_a.node_id,
-    };
+    let offer = TransportOffer::libp2p(node_a.node_id);
 
     // Claim a signed NarSize SMALLER than the served bytes: the size abort must fire.
     let lying_bound = (nar.len() - 1) as u64;
@@ -433,9 +428,7 @@ async fn a_large_over_bound_serve_is_aborted_mid_stream_not_after_the_whole_nar(
 
     let (node_b, _addr_b) = start_listening([32u8; 32], scope).await;
     let transport = wire_consumer(&node_b, &node_a, boot_peer, boot_addr.clone()).await;
-    let offer = TransportOffer::Iroh {
-        node: node_a.node_id,
-    };
+    let offer = TransportOffer::libp2p(node_a.node_id);
 
     let signed_bound: u64 = 4 * 1024; // 4 KiB
     let err = transport
@@ -491,9 +484,7 @@ async fn serve_budget_declines_over_per_nar_request() {
 
     let (node_b, _addr_b) = start_listening([8u8; 32], scope).await;
     let transport = wire_consumer(&node_b, &node_a, boot_peer, boot_addr.clone()).await;
-    let offer = TransportOffer::Iroh {
-        node: node_a.node_id,
-    };
+    let offer = TransportOffer::libp2p(node_a.node_id);
 
     let err = transport
         .fetch(&content, &offer, Some(nar.len() as u64), &envelope())
@@ -526,9 +517,7 @@ async fn dropping_the_serve_handle_stops_admission() {
 
     let (node_b, _addr_b) = start_listening([10u8; 32], scope).await;
     let transport = wire_consumer(&node_b, &node_a, boot_peer, boot_addr.clone()).await;
-    let offer = TransportOffer::Iroh {
-        node: node_a.node_id,
-    };
+    let offer = TransportOffer::libp2p(node_a.node_id);
 
     // While serving: the fetch succeeds.
     let serve = server
@@ -621,9 +610,7 @@ async fn a_stale_teardown_does_not_clobber_a_live_successor_session() {
 
     let (node_b, _addr_b) = start_listening([12u8; 32], scope).await;
     let transport = wire_consumer(&node_b, &node_a, boot_peer, boot_addr.clone()).await;
-    let offer = TransportOffer::Iroh {
-        node: node_a.node_id,
-    };
+    let offer = TransportOffer::libp2p(node_a.node_id);
 
     let handle1 = server.serve(ServeBudget::default()).await.expect("serve 1");
     // Install the successor BEFORE dropping handle1 (the exact handoff order the fix
@@ -714,9 +701,7 @@ async fn process_source_is_served_across_two_nodes() {
 
     let (node_b, _addr_b) = start_listening([22u8; 32], scope).await;
     let transport = wire_consumer(&node_b, &node_a, boot_peer, boot_addr.clone()).await;
-    let offer = TransportOffer::Iroh {
-        node: node_a.node_id,
-    };
+    let offer = TransportOffer::libp2p(node_a.node_id);
 
     let bytes = transport
         .fetch(&content, &offer, Some(body.len() as u64), &envelope())
@@ -760,9 +745,7 @@ async fn a_slow_process_serve_does_not_block_the_poll_loop() {
 
     let (node_b, _addr_b) = start_listening([24u8; 32], scope).await;
     let transport = wire_consumer(&node_b, &node_a, boot_peer, boot_addr.clone()).await;
-    let offer = TransportOffer::Iroh {
-        node: node_a.node_id,
-    };
+    let offer = TransportOffer::libp2p(node_a.node_id);
 
     // Kick off the SLOW fetch (drives the ~2s off-loop production on A) without awaiting it.
     let fetch = tokio::spawn(async move {
@@ -863,9 +846,7 @@ async fn a_rebuilt_store_source_is_declined_and_never_ships_wrong_bytes() {
 
     let (node_b, _addr_b) = start_listening([26u8; 32], scope).await;
     let transport = wire_consumer(&node_b, &node_a, boot_peer, boot_addr.clone()).await;
-    let offer = TransportOffer::Iroh {
-        node: node_a.node_id,
-    };
+    let offer = TransportOffer::libp2p(node_a.node_id);
 
     let err = transport
         .fetch(&content, &offer, Some(announced.len() as u64), &envelope())

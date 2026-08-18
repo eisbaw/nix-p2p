@@ -125,7 +125,7 @@ fn signed_record(
         key,
         content,
         provider,
-        offers: vec![TransportOffer::Iroh { node: provider }],
+        offers: vec![TransportOffer::libp2p(provider)],
         sequence: 1,
         issued_at: now,
         expiry: now + 3600,
@@ -312,11 +312,9 @@ async fn discovery_only_consumer_resolves_loopback_provider_directly_and_compose
     // This proves the resolved DialInfo is DIALABLE and yields the exact served bytes (here via
     // the direct loopback address - a loopback provider needs no relay).
     let transport = consumer
-        .transfer(TransportTag::Iroh)
+        .transfer(TransportTag::Libp2p)
         .expect("transport present");
-    let offer = TransportOffer::Iroh {
-        node: provider_node,
-    };
+    let offer = TransportOffer::libp2p(provider_node);
     let bytes = transport
         .fetch(&content, &offer, Some(nar.len() as u64), &envelope())
         .await

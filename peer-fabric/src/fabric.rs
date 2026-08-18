@@ -54,7 +54,12 @@ use crate::ids::{NodeId, TransportTag};
 /// `TransportRegistry`.
 #[derive(Default)]
 pub struct TransferRegistry {
+    /// Native backends, keyed only by their real transport tag.
     by_tag: HashMap<TransportTag, Arc<dyn NarTransfer>>,
+    /// Rollout-only readers for an older offer tag. Kept in a separate namespace so
+    /// a native backend for that tag always wins and is never overwritten by a
+    /// compatibility registration.
+    compatibility_fallbacks: HashMap<TransportTag, Arc<dyn NarTransfer>>,
 }
 
 impl TransferRegistry {
@@ -70,20 +75,46 @@ impl TransferRegistry {
         self
     }
 
+    /// Register a rollout-only adapter for records that carry `legacy_offer_tag`.
+    ///
+    /// This is deliberately separate from [`register`](Self::register): a future
+    /// native backend registered under the legacy tag deterministically takes
+    /// precedence, regardless of registration order, so compatibility cannot
+    /// clobber an actual dual-stack composition. The adapter must report the tag it
+    /// consumes; a mismatched registration is a composition bug and fails fast.
+    pub fn register_compatibility_fallback(
+        &mut self,
+        legacy_offer_tag: TransportTag,
+        adapter: Arc<dyn NarTransfer>,
+    ) -> &mut Self {
+        assert_eq!(
+            adapter.tag(),
+            legacy_offer_tag,
+            "compatibility transfer registered for {legacy_offer_tag} but consumes {}",
+            adapter.tag()
+        );
+        self.compatibility_fallbacks
+            .insert(legacy_offer_tag, adapter);
+        self
+    }
+
     /// The transport servicing `tag`, or `None` if none is registered (the offer is
     /// skipped by the caller).
     pub fn get(&self, tag: TransportTag) -> Option<&dyn NarTransfer> {
-        self.by_tag.get(&tag).map(Arc::as_ref)
+        self.by_tag
+            .get(&tag)
+            .or_else(|| self.compatibility_fallbacks.get(&tag))
+            .map(Arc::as_ref)
     }
 
     /// Whether a backend is registered for `tag`.
     pub fn has(&self, tag: TransportTag) -> bool {
-        self.by_tag.contains_key(&tag)
+        self.by_tag.contains_key(&tag) || self.compatibility_fallbacks.contains_key(&tag)
     }
 
     /// Whether the registry has no transports at all (the upstream_only case).
     pub fn is_empty(&self) -> bool {
-        self.by_tag.is_empty()
+        self.by_tag.is_empty() && self.compatibility_fallbacks.is_empty()
     }
 }
 
@@ -123,4 +154,61 @@ pub trait PeerFabric: Send + Sync {
 
     /// The single exposure sink for this fabric (AC#3).
     fn exposure_ledger(&self) -> &ExposureLedger;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::FakeNarTransfer;
+
+    #[test]
+    fn registry_keeps_distinct_iroh_and_libp2p_backends() {
+        let mut registry = TransferRegistry::new();
+        registry.register(Arc::new(FakeNarTransfer::new(TransportTag::Iroh)));
+        registry.register(Arc::new(FakeNarTransfer::new(TransportTag::Libp2p)));
+
+        assert_eq!(
+            registry.get(TransportTag::Iroh).map(NarTransfer::tag),
+            Some(TransportTag::Iroh)
+        );
+        assert_eq!(
+            registry.get(TransportTag::Libp2p).map(NarTransfer::tag),
+            Some(TransportTag::Libp2p)
+        );
+    }
+
+    #[test]
+    fn native_backend_always_wins_over_a_legacy_compatibility_fallback() {
+        let fallback: Arc<dyn NarTransfer> = Arc::new(FakeNarTransfer::new(TransportTag::Iroh));
+        let native: Arc<dyn NarTransfer> = Arc::new(FakeNarTransfer::new(TransportTag::Iroh));
+        let mut registry = TransferRegistry::new();
+
+        registry.register_compatibility_fallback(TransportTag::Iroh, fallback.clone());
+        assert!(std::ptr::eq(
+            registry
+                .get(TransportTag::Iroh)
+                .expect("fallback registered"),
+            fallback.as_ref()
+        ));
+
+        registry.register(native.clone());
+        registry.register_compatibility_fallback(
+            TransportTag::Iroh,
+            Arc::new(FakeNarTransfer::new(TransportTag::Iroh)),
+        );
+        assert!(std::ptr::eq(
+            registry.get(TransportTag::Iroh).expect("native registered"),
+            native.as_ref()
+        ));
+    }
+
+    #[test]
+    #[should_panic(expected = "compatibility transfer registered for iroh but consumes libp2p")]
+    fn compatibility_fallback_rejects_a_mismatched_key_and_adapter_tag() {
+        let mut registry = TransferRegistry::new();
+        registry.register_compatibility_fallback(
+            TransportTag::Iroh,
+            Arc::new(FakeNarTransfer::new(TransportTag::Libp2p)),
+        );
+    }
 }
