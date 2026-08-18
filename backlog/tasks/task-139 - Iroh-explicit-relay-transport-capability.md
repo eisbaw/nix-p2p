@@ -1,11 +1,11 @@
 ---
 id: TASK-139
 title: Iroh explicit relay transport capability
-status: In Progress
+status: To Do
 assignee:
   - claude
 created_date: '2026-08-11 06:01'
-updated_date: '2026-08-11 23:03'
+updated_date: '2026-08-18 20:23'
 labels:
   - iroh
   - discovery
@@ -14,10 +14,11 @@ labels:
   - transport
   - privacy
   - wave-2c
+  - deferred-pending-202
 dependencies:
   - TASK-114
   - TASK-115
-priority: high
+priority: low
 ---
 
 ## Description

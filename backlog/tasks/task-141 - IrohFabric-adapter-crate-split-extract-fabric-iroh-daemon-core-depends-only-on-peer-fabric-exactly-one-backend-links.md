@@ -3,23 +3,24 @@ id: TASK-141
 title: >-
   IrohFabric adapter + crate split: extract fabric-iroh, daemon-core depends
   only on peer-fabric, exactly one backend links
-status: In Progress
+status: To Do
 assignee:
   - '@claude'
 created_date: '2026-08-11 21:22'
-updated_date: '2026-08-11 23:58'
+updated_date: '2026-08-18 20:24'
 labels:
   - iroh
   - seam
   - adapter
   - de-welding
   - wave-2c
+  - deferred-pending-202
 dependencies:
   - TASK-115
   - TASK-140
 documentation:
   - docs/peer-fabric-seam.md
-priority: high
+priority: low
 ---
 
 ## Description
@@ -99,4 +100,6 @@ DEFERRED (large; filed):
 - TASK-145 = increment 3 (daemon-iroh thin binary + no-libp2p dep-closure guard). deps TASK-144.
 - TASK-146 = daemon-libp2p thin binary, BLOCKED on a future fabric-libp2p (deps TASK-103); deliberately NOT stubbed per the contract.
 ACs #1-#7 of TASK-141 remain to be completed by TASK-144/145 (the IrohFabric struct, backend wiring, crate split, two-binary composition root); inc 1 delivered the debt-removal keystone (delete daemon dups + re-point + guard) those build on.
+
+PARKED 2026-08-18 (owner steer: deprioritize iroh; tournament is eventually-nice, not required). Verified at HEAD: daemon-core/Cargo.toml declares NO iroh dependency (deps are peer-fabric, proc-supervisor, hyper/tokio stack, serde, rustls). The 124 iroh hits in daemon-core/src are frozen claim-wire TAG STRINGS (TransportTag::Iroh, "transport":"iroh") which are stack-neutral by design, not concrete iroh types. So inc-1/inc-2 AC#1 is satisfied IN FACT. The only real residual is the missing GUARD asserting it stays true, plus the AC#6 s6-p2p re-run. The guard is extracted to its own small task so parking this does not lose it. Remaining iroh-specific de-welding value is low while iroh is deprioritized.
 <!-- SECTION:NOTES:END -->

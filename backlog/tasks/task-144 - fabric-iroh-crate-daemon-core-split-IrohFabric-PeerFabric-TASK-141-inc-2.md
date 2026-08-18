@@ -3,21 +3,22 @@ id: TASK-144
 title: >-
   fabric-iroh crate + daemon-core split + IrohFabric: PeerFabric (TASK-141 inc
   2)
-status: In Progress
+status: To Do
 assignee:
   - '@claude'
 created_date: '2026-08-11 23:57'
-updated_date: '2026-08-13 00:16'
+updated_date: '2026-08-18 20:24'
 labels:
   - iroh
   - seam
   - adapter
   - de-welding
   - wave-2c
+  - deferred-pending-202
 dependencies:
   - TASK-141
   - TASK-148
-priority: high
+priority: low
 ---
 
 ## Description
@@ -87,4 +88,6 @@ DEFERRED (honestly, filed): AC#1 daemon-core crate extraction = LARGEST part, NO
 GOTCHAS: (a) IrohNode::shutdown consumes self -> IrohFabric::into_node() added so the composition root can drive clean teardown (axes borrow only the runtime). (b) offline_ephemeral disables address lookup -> node_lookup_handle()=None -> node_locator() honestly None (proven by the consumer test). (c) require_axes' Transfer axis is tag-keyed (checks fabric.transfer(tag).is_some()), the other axes are the Option accessors.
 
 GATE: cargo build --workspace ok; just lint ok (clippy -D x2, fmt, ruff, check-independence [daemon->fabric-iroh only, no daemon<->testproxy], check-source-guard 120 files, check-lock-sources); cargo test --workspace ok - 0 failed (peer-fabric lib 70 incl 2 require tests, fabric-iroh lib 92 + iroh_fabric 2, daemon serving-core guard 1, iroh_serve_teardown 2, serve_budget_and_supply 16, all libp2p + testproxy suites green). NO frozen surface touched (RawNarV1/claim WIRE/ContentKey/ProviderRecord codec untouched - Rust boundaries only). crate-independence green; daemon->fabric-iroh edge only. s6-p2p e2e is the PENDING orchestrator-gated regression guard (NOT run here per contract).
+
+PARKED 2026-08-18 (owner steer: deprioritize iroh; tournament is eventually-nice, not required). Verified at HEAD: daemon-core/Cargo.toml declares NO iroh dependency (deps are peer-fabric, proc-supervisor, hyper/tokio stack, serde, rustls). The 124 iroh hits in daemon-core/src are frozen claim-wire TAG STRINGS (TransportTag::Iroh, "transport":"iroh") which are stack-neutral by design, not concrete iroh types. So inc-1/inc-2 AC#1 is satisfied IN FACT. The only real residual is the missing GUARD asserting it stays true, plus the AC#6 s6-p2p re-run. The guard is extracted to its own small task so parking this does not lose it. Remaining iroh-specific de-welding value is low while iroh is deprioritized.
 <!-- SECTION:NOTES:END -->

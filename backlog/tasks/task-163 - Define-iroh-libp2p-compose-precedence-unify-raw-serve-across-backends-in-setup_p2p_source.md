@@ -6,14 +6,17 @@ title: >-
 status: To Do
 assignee: []
 created_date: '2026-08-12 11:00'
+updated_date: '2026-08-18 20:25'
 labels:
   - libp2p
   - iroh
   - daemon
   - compose
   - wave-2c
+  - deferred-pending-202
 dependencies:
   - TASK-162
+priority: low
 ---
 
 ## Description

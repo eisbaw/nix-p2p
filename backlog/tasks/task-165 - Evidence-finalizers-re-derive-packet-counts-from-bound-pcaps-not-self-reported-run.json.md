@@ -3,18 +3,20 @@ id: TASK-165
 title: >-
   Evidence finalizers re-derive packet counts from bound pcaps (not
   self-reported run.json)
-status: In Progress
+status: To Do
 assignee:
   - '@claude'
 created_date: '2026-08-12 14:12'
-updated_date: '2026-08-13 05:54'
+updated_date: '2026-08-18 20:23'
 labels:
   - iroh
   - evidence
   - hardening
   - integrity
   - wave-2c
+  - deferred-pending-202
 dependencies: []
+priority: low
 ---
 
 ## Description

@@ -6,13 +6,14 @@ title: >-
 status: Done
 assignee: []
 created_date: '2026-08-11 23:07'
-updated_date: '2026-08-18 19:19'
+updated_date: '2026-08-18 20:25'
 labels:
   - flaky
   - hardening
   - test
+  - deferred-pending-202
 dependencies: []
-priority: medium
+priority: low
 ---
 
 ## Description

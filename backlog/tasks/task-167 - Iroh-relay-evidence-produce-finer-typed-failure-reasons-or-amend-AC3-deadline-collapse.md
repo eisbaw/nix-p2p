@@ -6,13 +6,16 @@ title: >-
 status: To Do
 assignee: []
 created_date: '2026-08-12 14:13'
+updated_date: '2026-08-18 20:25'
 labels:
   - iroh
   - evidence
   - relay
   - hardening
   - wave-2c
+  - deferred-pending-202
 dependencies: []
+priority: low
 ---
 
 ## Description

@@ -3,11 +3,11 @@ id: TASK-142
 title: >-
   Iroh relay-capability routed evidence harness + artifact
   (iroh-relay-capability-v1)
-status: In Progress
+status: To Do
 assignee:
   - '@claude'
 created_date: '2026-08-11 22:55'
-updated_date: '2026-08-12 14:18'
+updated_date: '2026-08-18 20:23'
 labels:
   - iroh
   - discovery
@@ -15,8 +15,10 @@ labels:
   - transport
   - evidence
   - wave-2c
+  - deferred-pending-202
 dependencies:
   - TASK-139
+priority: low
 ---
 
 ## Description
