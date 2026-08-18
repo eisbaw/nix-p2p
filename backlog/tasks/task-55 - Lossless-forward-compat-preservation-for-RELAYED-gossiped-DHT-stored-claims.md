@@ -4,14 +4,14 @@ title: Lossless forward-compat preservation for RELAYED/gossiped/DHT-stored clai
 status: To Do
 assignee: []
 created_date: '2026-08-08 22:15'
-updated_date: '2026-08-10 22:27'
+updated_date: '2026-08-18 20:36'
 labels:
   - wave-2
 dependencies:
   - TASK-101
   - TASK-103
   - TASK-118
-priority: high
+priority: low
 ---
 
 ## Description
@@ -25,3 +25,9 @@ Deferred from task-48 (mark-emulator decision B, 2026-08-09). Wave-2a drops loss
 - [ ] #1 A relay/gossip node forwards a claim carrying an unknown future field byte-for-byte (the field survives; a v2 consumer downstream reads it intact) - proven with a real relay hop
 - [ ] #2 Preservation is via exact-received-bytes, not a lossy re-parse; bounded in size
 <!-- AC:END -->
+
+## Implementation Notes
+
+<!-- SECTION:NOTES:BEGIN -->
+Downgraded 2026-08-18 (COMPASS §4): hardens lossless preservation for RELAYED/gossiped claims; there is no claim relay, and its deps (TASK-101 tracker, TASK-118 BitTorrent) are both Low/deferred.
+<!-- SECTION:NOTES:END -->

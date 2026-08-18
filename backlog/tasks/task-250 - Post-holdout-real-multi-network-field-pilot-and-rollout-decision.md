@@ -4,7 +4,7 @@ title: Post-holdout real multi-network field pilot and rollout decision
 status: To Do
 assignee: []
 created_date: '2026-08-18 06:38'
-updated_date: '2026-08-18 06:52'
+updated_date: '2026-08-18 20:36'
 labels:
   - pilot
   - measurement
@@ -16,7 +16,7 @@ dependencies:
   - TASK-124
   - TASK-237
   - TASK-249
-priority: high
+priority: medium
 ---
 
 ## Description
@@ -35,6 +35,12 @@ Execute the real multi-network field pilot defined by TASK-124 for the exact pol
 - [ ] #6 Execution follows exactly the TASK-124 matrix. For a holdout-validated P2P policy it independently records cache payload egress, symmetric peer socket/application octets, source attribution, latency, resources, failures/fallbacks, paths, churn, privacy, and UX. For no-candidate/upstream-only/LAN-only/consume-only outcomes, inapplicable P2P rows remain witnessed no-execution and cannot be resurrected.
 - [ ] #7 The scored operator journey covers install/profile selection, precise invalid-config errors, preflight, local health/status, effective budget and queue use, dependency/fallback explanation, privacy-safe diagnostics, kill switch, rollback, and recovery on the released configuration; support-facing and normal-user output are separately reviewed.
 <!-- AC:END -->
+
+## Implementation Notes
+
+<!-- SECTION:NOTES:BEGIN -->
+Downgraded 2026-08-18 (COMPASS F7): depends on TASK-124 (Low, post-holdout tournament re-plan), so it is unreachable while the tournament is deprioritized.
+<!-- SECTION:NOTES:END -->
 
 ## Definition of Done
 <!-- DOD:BEGIN -->

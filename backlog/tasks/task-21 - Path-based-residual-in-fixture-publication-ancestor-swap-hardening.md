@@ -4,12 +4,12 @@ title: Path-based residual in fixture publication (ancestor-swap hardening)
 status: To Do
 assignee: []
 created_date: '2026-08-08 06:32'
-updated_date: '2026-08-10 22:58'
+updated_date: '2026-08-18 20:36'
 labels:
   - hardening
 dependencies:
   - TASK-113
-priority: high
+priority: low
 ---
 
 ## Description
@@ -35,4 +35,6 @@ REMEDIATION SHAPE (for the hardening wave, not now): thread the held out_fd into
 Additional guard residual (task-3 round 9, orchestrator-verified): check-lock-sources.py exempts gen-fixtures.py (the baseline owner) from the literal scan, so a bare-literal baseline read smuggled into a NON-owner helper INSIDE gen-fixtures.py is not caught (verified exit 0). Low severity - gen-fixtures legitimately owns the baseline; the runtime GATE modules (which must derive only from current->gen/lock.json) ARE fully covered (literal+alias+deny-by-default, all verified biting). Full coverage needs function-level analysis inside the owner. Hardening-wave item, not a blocker.
 
 task-13 triage (KEEP, distinct concern): path-based ancestor-swap residual in scripts/gen-fixtures.py PUBLICATION internals, exploitable only by an out-of-threat-model same-uid attacker who can already edit the fixture trees directly. LOW priority, unrelated to the HTTP daemon/proxy surfaces this hardening wave stabilized. Kept with its 'hardening' label for a later fixture-tooling pass; removed deferred-finding (it is already a fully-specified task with ACs).
+
+Downgraded 2026-08-18 (COMPASS §4): the task text itself states the attacker is outside the threat model and can already edit the fixtures directly. Descriptor discipline buys nothing against that.
 <!-- SECTION:NOTES:END -->

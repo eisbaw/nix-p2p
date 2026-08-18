@@ -6,7 +6,7 @@ title: >-
 status: To Do
 assignee: []
 created_date: '2026-08-09 21:02'
-updated_date: '2026-08-10 22:37'
+updated_date: '2026-08-18 20:36'
 labels:
   - wave-2b
 dependencies:
@@ -16,7 +16,7 @@ dependencies:
   - TASK-89
   - TASK-118
   - TASK-125
-priority: high
+priority: low
 ---
 
 ## Description
@@ -82,4 +82,6 @@ declined_supply_failed), `IROH-STORE-RESIDENT` (what it holds NOW - not VmHWM),
 `IROH-SERVE-WINDOW` (per-serve intervals on the holder's clock).
 
 For Stage B, apply each pathology to both backends where the mechanism exists and report backend-specific unsupported cells; do not assume an Iroh failure mode maps to BitTorrent.
+
+Downgraded 2026-08-18 (COMPASS F1): deps TASK-89/118/125 are all Low/deferred, so this is unreachable as filed. The CONTENT (thundering herd, single-flight, peer scoring, seeder churn) is genuinely valuable -- re-file it against the shipped libp2p path rather than resurrecting the iroh/BitTorrent framing.
 <!-- SECTION:NOTES:END -->

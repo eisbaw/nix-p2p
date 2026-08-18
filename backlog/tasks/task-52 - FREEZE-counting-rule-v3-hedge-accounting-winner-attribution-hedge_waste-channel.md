@@ -6,7 +6,7 @@ title: >-
 status: To Do
 assignee: []
 created_date: '2026-08-08 20:28'
-updated_date: '2026-08-18 06:50'
+updated_date: '2026-08-18 20:36'
 labels:
   - irreversible
   - measurement
@@ -15,7 +15,7 @@ labels:
 dependencies:
   - TASK-9
   - TASK-62
-priority: high
+priority: low
 ---
 
 ## Description
@@ -77,4 +77,6 @@ payload (holder 248 MiB, fetcher 141 MiB, for a 110 MiB NAR - the blob store is
 Deprioritized to Low in the Wave-2c cleanup (2026-08-14): libp2p-PRIMARY trunk proven (libp2p-kad discovery + store-supply + streamed NAR). Per PRD §634-691 (normative owner-direction authority) content discovery is libp2p-kad; iroh is an OPTIONAL transport only. This task belongs to a superseded-discovery / premature-tournament / far-future-BitTorrent / optional-comparator track. Fate confirmed by TASK-202 (owner-gated §693-743 reconcile). Reversible — not deleted; revisit after 202.
 
 2026-08-18 superseding priority ruling: TASK-237 and the field pilot require hedge-aware net egress, so this is pilot-critical after TASK-62, not deferred optional comparator work. Freeze v3 before any hedge/value measurement; v2 remains the explicit no-hedge rule.
+
+Downgraded 2026-08-18 (COMPASS F3): an IRREVERSIBLE freeze for a mechanism (hedging) that is not implemented, whose only consumer TASK-44 is Low/deferred. The TASK-237 edge is dropped. Re-raise when a hedge policy is actually on the near path -- freezing a counting rule before the mechanism exists is how a frozen surface gets burned.
 <!-- SECTION:NOTES:END -->

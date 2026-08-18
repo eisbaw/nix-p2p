@@ -6,12 +6,11 @@ title: >-
 status: To Do
 assignee: []
 created_date: '2026-08-10 21:39'
-updated_date: '2026-08-10 23:07'
+updated_date: '2026-08-18 20:35'
 labels: []
 dependencies:
   - TASK-112
-  - TASK-119
-priority: high
+priority: medium
 ---
 
 ## Description
@@ -32,3 +31,9 @@ The existing deterministic seeded loops remain valuable regression tests but are
 - [ ] #8 An Iroh target fuzzes compressed negotiation/framing and bounded decode across raw fallback/version skew; coverage reports prove the new targets executed rather than only legacy HTTP/NAR parsers.
 - [ ] #9 A coverage-guided engine is selected and its toolchain decision is recorded: separately pinned nightly cargo-fuzz or stable honggfuzz/afl. A seeded-loop-only result cannot close the task; if neither engine is viable, leave the task blocked with evidence and re-plan it. No nightly enters the default devshell or crane build.
 <!-- AC:END -->
+
+## Implementation Notes
+
+<!-- SECTION:NOTES:BEGIN -->
+Dropped the TASK-119 dependency and downgraded to Medium 2026-08-18 (COMPASS F1, owner steer #2: iroh/BitTorrent deprioritized). TASK-119 is the zero-injection BitTorrent journey, Low + deferred-pending-202, so this edge made a High task unreachable AND transitively blocked TASK-14, TASK-21 and TASK-36. AC#7/#8 (BitTorrent metainfo + iroh framing fuzz targets) are dead by the same steer and should be deleted when this is picked up.
+<!-- SECTION:NOTES:END -->

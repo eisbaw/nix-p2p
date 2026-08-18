@@ -4,13 +4,13 @@ title: 'testproxy: single-flight concurrent same-path cache misses'
 status: To Do
 assignee: []
 created_date: '2026-08-08 07:31'
-updated_date: '2026-08-10 22:36'
+updated_date: '2026-08-18 20:36'
 labels:
   - testproxy
   - follow-up
   - wave-hardening
 dependencies: []
-priority: high
+priority: low
 ---
 
 ## Description
@@ -28,4 +28,6 @@ task-2's cache is integrity-safe under concurrency (atomic tmp+rename; every rea
 
 <!-- SECTION:NOTES:BEGIN -->
 task-13 triage: KEEP for wave-2 - testproxy single-flight coalescing is a redundant-work OPTIMISATION; integrity already holds under concurrency (atomic rename). Not a correctness finding on the stabilized surfaces; distinct concern.
+
+Downgraded 2026-08-18 (COMPASS §4): an optimisation of the TEST FIXTURE. Integrity already holds; zero user value.
 <!-- SECTION:NOTES:END -->

@@ -4,11 +4,11 @@ title: 'measure: time inner nix-store --realise for a clean S4 build wall-clock'
 status: To Do
 assignee: []
 created_date: '2026-08-08 13:35'
-updated_date: '2026-08-10 23:07'
+updated_date: '2026-08-18 20:36'
 labels:
   - measurement
 dependencies: []
-priority: high
+priority: low
 ---
 
 ## Description
@@ -33,4 +33,6 @@ measure.py (task-9) times the whole 'podman run --rm' per run, so the p95 build 
 task-12 data point (J2 baseline read-out, 2026-08-08): the two J2 runs observed A/A noise floors of 0.161 and 0.103 - BOTH >= the 10% S4 threshold, so s4_usable=false in both reports and no container-tier p95 bound was quoted in the J2 baseline (TESTING.md). Confirms this task blocks a usable container-tier S4. The egress axis was byte-identical run-to-run and unaffected, as predicted here.
 
 task-13 triage: KEEP for wave-2 - measure inner nix-store --realise wall-clock is measurement-instrument work (S4 noise floor), not a daemon/proxy hardening finding. Distinct concern.
+
+Downgraded 2026-08-18 (COMPASS §4/§5A): largely subsumed by TASK-253 -- hyperfine gives warmups, outlier detection and --export-json for free. Hand-rolling REALISE_START/END markers plus an A/A calibration protocol is exactly the bespoke-harness habit TASK-253 exists to end. Fold into 253 rather than doing separately.
 <!-- SECTION:NOTES:END -->

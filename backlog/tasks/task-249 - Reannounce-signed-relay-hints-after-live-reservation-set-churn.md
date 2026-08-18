@@ -4,7 +4,7 @@ title: Reannounce signed relay hints after live reservation-set churn
 status: To Do
 assignee: []
 created_date: '2026-08-18 06:35'
-updated_date: '2026-08-18 06:51'
+updated_date: '2026-08-18 20:36'
 labels:
   - libp2p
   - nat
@@ -14,7 +14,7 @@ labels:
 dependencies:
   - TASK-120
   - TASK-219
-priority: high
+priority: medium
 ---
 
 ## Description
@@ -32,6 +32,12 @@ After TASK-219, refresh signed relay hints when the live accepted reservation se
 - [ ] #5 Each claim refresh is admitted by the selected TASK-120 profile announcement count, signed-wire-octet, and rate-window budgets. Budget exhaustion defers work with a stable reason and operator-visible queue/staleness metrics; it never bypasses limits, withdraws content, blocks serving, or silently drops the latest generation.
 - [ ] #6 Rate/volume and work accounting have biting large-holdings/churn tests: an unbounded reannounce-all loop, per-event duplicate queue, missing coalescing, or hidden exhaustion fails while a bounded R2-to-R3 refresh eventually converges after budget becomes available.
 <!-- AC:END -->
+
+## Implementation Notes
+
+<!-- SECTION:NOTES:BEGIN -->
+Downgraded 2026-08-18 (COMPASS §4): pilot-readiness for a public RESIDENTIAL swarm; a LAN/org pool has no relay churn. Re-raise when the public-network pilot is actually next.
+<!-- SECTION:NOTES:END -->
 
 ## Definition of Done
 <!-- DOD:BEGIN -->
