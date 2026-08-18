@@ -995,19 +995,15 @@ pub(crate) fn seed_pending_state_for_test(
         ));
     }
     let (store, mut state) = PublicationStateStore::open(state_dir, node_id, config)?;
-    let pending_desired_revision = state.desired_revision;
-    state.desired_revision = state
-        .desired_revision
-        .checked_add(1)
-        .ok_or_else(|| PublicationError::state("test desired revision overflow"))?;
     state.high_water_sequence = high_water_sequence;
     state.pending = Some(StoredPacket {
         sequence: record.sequence,
-        desired_revision: pending_desired_revision,
+        desired_revision: state.desired_revision,
         expires_unix_micros: record.expires_unix_micros,
         kind: record.state.into(),
         packet_hex: encode_hex(packet),
     });
+    validate_loaded_state(&state, node_id, config)?;
     store.write(&state)
 }
 
@@ -1281,10 +1277,13 @@ fn canonical_locations(
     Ok(locations)
 }
 
+type PublicationWallClock = dyn Fn() -> Result<u64, PublicationError> + Send + Sync + 'static;
+
 struct PublisherInner {
     key: SecretKey,
     node_id: NodeId,
     config: NodePublicationConfig,
+    wall_clock: Arc<PublicationWallClock>,
     client: PinnedHttpEndpoint,
     store: Arc<PublicationStateStore>,
     state: Mutex<PublicationStateBody>,
@@ -1311,6 +1310,7 @@ impl PublisherInner {
         state_dir: &Path,
         key: SecretKey,
         config: NodePublicationConfig,
+        wall_clock: Arc<PublicationWallClock>,
     ) -> Result<Arc<Self>, PublicationError> {
         let node_id = NodeId::from_bytes(*key.public().as_bytes());
         let client =
@@ -1325,6 +1325,7 @@ impl PublisherInner {
             key,
             node_id,
             config,
+            wall_clock,
             client,
             store: Arc::new(store),
             state: Mutex::new(state),
@@ -1334,6 +1335,10 @@ impl PublisherInner {
             closing: AtomicBool::new(false),
             close,
         }))
+    }
+
+    fn wall_unix_micros(&self) -> Result<u64, PublicationError> {
+        (self.wall_clock)()
     }
 
     async fn transition(
@@ -1527,7 +1532,7 @@ impl PublisherInner {
         } else {
             None
         };
-        let now = unix_micros()?;
+        let now = self.wall_unix_micros()?;
         let retry_reserve = publication_retry_reserve(self.config.request_deadline);
         let completion_reserve = retry_reserve.saturating_add(PUBLICATION_COMPLETION_MARGIN);
         let completion_reserve_micros = duration_micros(completion_reserve)?;
@@ -1637,7 +1642,7 @@ impl PublisherInner {
             *state = candidate;
             return Ok(None);
         }
-        let now = unix_micros()?;
+        let now = self.wall_unix_micros()?;
         let minimum_remaining = single_submission_bound(self.config.request_deadline)
             .saturating_add(publication_retry_reserve(self.config.request_deadline))
             .saturating_add(PUBLICATION_COMPLETION_MARGIN);
@@ -1809,7 +1814,7 @@ impl NodePublicationHandle {
             return Err(error);
         }
         if let Some(record) = &record
-            && !record.is_visible_at(unix_micros()?)
+            && !record.is_visible_at(inner.wall_unix_micros()?)
         {
             return Err(PublicationError::state(format!(
                 "last committed node-publication record expired at {} and is not current",
@@ -2011,11 +2016,50 @@ impl NodePublicationRuntime {
         .await
     }
 
+    #[cfg(test)]
+    pub(crate) async fn start_with_wall_clock_for_test(
+        state_dir: &Path,
+        key: SecretKey,
+        config: NodePublicationConfig,
+        wall_unix_micros: u64,
+        absolute_startup_deadline: Instant,
+    ) -> Result<(Self, PublicationReceipt), PublicationError> {
+        let initial_locations = config.initial_locations.clone();
+        Self::start_with_effective_locations_and_clock(
+            state_dir,
+            key,
+            config,
+            initial_locations,
+            Arc::new(move || Ok(wall_unix_micros)),
+            absolute_startup_deadline,
+        )
+        .await
+    }
+
     pub(crate) async fn start_with_effective_locations(
         state_dir: &Path,
         key: SecretKey,
         config: NodePublicationConfig,
         initial_locations: Vec<NodeLocation>,
+        absolute_startup_deadline: Instant,
+    ) -> Result<(Self, PublicationReceipt), PublicationError> {
+        Self::start_with_effective_locations_and_clock(
+            state_dir,
+            key,
+            config,
+            initial_locations,
+            Arc::new(unix_micros),
+            absolute_startup_deadline,
+        )
+        .await
+    }
+
+    async fn start_with_effective_locations_and_clock(
+        state_dir: &Path,
+        key: SecretKey,
+        config: NodePublicationConfig,
+        initial_locations: Vec<NodeLocation>,
+        wall_clock: Arc<PublicationWallClock>,
         absolute_startup_deadline: Instant,
     ) -> Result<(Self, PublicationReceipt), PublicationError> {
         let initial_locations = canonical_locations(initial_locations)?;
@@ -2036,7 +2080,7 @@ impl NodePublicationRuntime {
         // They are assumed to run on a responsive local filesystem; detaching
         // them behind `spawn_blocking` would allow a canceled write to rename
         // state after the publication transition had returned.
-        let inner = PublisherInner::open(state_dir, key, config)?;
+        let inner = PublisherInner::open(state_dir, key, config, wall_clock)?;
         let receipt = tokio::time::timeout_at(
             absolute_startup_deadline,
             inner.transition(initial_locations.clone(), PublicationFailpoint::None),
@@ -2084,8 +2128,20 @@ impl NodePublicationRuntime {
         let mut refresh_record = receipt.record.clone();
         let refresh = tokio::spawn(async move {
             loop {
-                let delay = match refresh_delay(&refresh_record, refresh_interval, refresh_reserve)
-                {
+                let wall_unix_micros = match refresh_inner.wall_unix_micros() {
+                    Ok(now) => now,
+                    Err(error) => {
+                        eprintln!("IROH-NODE-PUBLICATION-FATAL source=refresh-clock error={error}");
+                        refresh_inner.mark_fatal(error);
+                        break;
+                    }
+                };
+                let delay = match refresh_delay(
+                    &refresh_record,
+                    refresh_interval,
+                    refresh_reserve,
+                    wall_unix_micros,
+                ) {
                     Ok(delay) => delay,
                     Err(error) => {
                         eprintln!(
@@ -2184,8 +2240,9 @@ fn refresh_delay(
     record: &NodeRecord,
     configured_interval: Duration,
     transition_reserve: Duration,
+    wall_unix_micros: u64,
 ) -> Result<Duration, PublicationError> {
-    let remaining_micros = record.expires_unix_micros.saturating_sub(unix_micros()?);
+    let remaining_micros = record.expires_unix_micros.saturating_sub(wall_unix_micros);
     let reserve_micros =
         duration_micros(transition_reserve.saturating_add(PUBLICATION_COMPLETION_MARGIN))?;
     Ok(configured_interval.min(Duration::from_micros(
@@ -2410,13 +2467,14 @@ mod tests {
 
     #[test]
     fn refresh_delay_keeps_retry_window_and_completion_margin_before_expiry() {
+        let now = unix_micros().unwrap();
         let record = NodeRecord {
             node_id: NodeId::from_bytes([0; 32]),
             namespace: "run-1".into(),
             recipient: "authority.test:v1".into(),
             ttl_seconds: 12,
             sequence: 1,
-            expires_unix_micros: unix_micros().unwrap() + 6_050_000,
+            expires_unix_micros: now + 6_050_000,
             state: PublicationState::Withdrawn,
             locations: Vec::new(),
         };
@@ -2424,6 +2482,7 @@ mod tests {
             &record,
             Duration::from_secs(4),
             PUBLICATION_TRANSITION_DEADLINE,
+            now,
         )
         .unwrap();
         assert!(
@@ -2432,7 +2491,7 @@ mod tests {
         );
 
         let at_boundary = NodeRecord {
-            expires_unix_micros: unix_micros().unwrap() + 6_000_000,
+            expires_unix_micros: now + 6_000_000,
             ..record
         };
         assert_eq!(
@@ -2440,6 +2499,7 @@ mod tests {
                 &at_boundary,
                 Duration::from_secs(4),
                 PUBLICATION_TRANSITION_DEADLINE,
+                now,
             )
             .unwrap(),
             Duration::ZERO,

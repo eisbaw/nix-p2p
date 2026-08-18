@@ -1,8 +1,8 @@
 use super::*;
-use crate::iroh_node_record::{NodeLocation, encode_node_record};
+use crate::iroh_node_record::{NodeLocation, decode_node_record, encode_node_record};
 use crate::iroh_publication::{
-    NodePublicationConfig, NodePublicationRuntime, PUBLICATION_STATE_FILENAME,
-    PublicationAuthorityAuthorization, seed_pending_state_for_test,
+    NodePublicationConfig, NodePublicationRuntime, PUBLICATION_STARTUP_DEADLINE,
+    PUBLICATION_STATE_FILENAME, PublicationAuthorityAuthorization, seed_pending_state_for_test,
 };
 use crate::iroh_runtime::{
     AddressLookupCapability, DAEMON_TEST_ENDPOINT_PROFILE, IdentitySource, RelayCapability,
@@ -1268,7 +1268,7 @@ async fn expired_pending_is_not_resurrected_and_high_water_survives_clock_rollba
         expired_sequence,
         expired_sequence + 30_000_000,
         PublicationState::Live,
-        &[NodeLocation::direct("127.0.0.1:4999".parse().unwrap()).unwrap()],
+        std::slice::from_ref(&location),
     )
     .unwrap();
     seed_pending_state_for_test(
@@ -1280,27 +1280,49 @@ async fn expired_pending_is_not_resurrected_and_high_water_survives_clock_rollba
     )
     .unwrap();
 
+    let expired_record = decode_node_record(expired.as_bytes()).unwrap();
+    assert!(
+        expired_record.expires_unix_micros <= now,
+        "fixture pending packet must be expired at the injected recovery clock"
+    );
+    assert!(
+        now < future_high_water,
+        "injected recovery clock must exercise the durable high-water rollback branch"
+    );
+    let expected_sequence = future_high_water + 1;
+    let expected_expiry = expected_sequence + 30_000_000;
+    let authority_now = unix_micros().unwrap();
+    let startup_budget_micros = u64::try_from(PUBLICATION_STARTUP_DEADLINE.as_micros()).unwrap();
+    assert!(
+        expected_expiry.saturating_sub(authority_now) > startup_budget_micros,
+        "fixture setup left insufficient authority-valid lifetime for the bounded startup"
+    );
+
     let requests_before = authority.request_count();
-    let (runtime, recovered) = NodePublicationRuntime::start(
+    let (runtime, recovered) = NodePublicationRuntime::start_with_wall_clock_for_test(
         &client_state.0,
         key,
         config,
-        tokio::time::Instant::now() + Duration::from_secs(10),
+        now,
+        tokio::time::Instant::now() + PUBLICATION_STARTUP_DEADLINE,
     )
     .await
     .unwrap();
-    assert_eq!(recovered.record.sequence, future_high_water + 1);
+    assert_eq!(
+        recovered.record.sequence, expected_sequence,
+        "ignoring the durable future high-water must fail this rollback oracle"
+    );
     assert_eq!(
         recovered.record.expires_unix_micros,
         recovered.record.sequence + 30_000_000,
         "clock rollback/high-water recovery must derive expiry from the signed sequence"
     );
     assert_eq!(recovered.record.locations, vec![location]);
-    assert!(recovered.record.expires_unix_micros > unix_micros().unwrap());
+    assert!(recovered.record.expires_unix_micros > now);
     assert_eq!(
         authority.request_count(),
         requests_before + 2,
-        "expired pending must be cleared locally, then only the replacement PUT+GET is sent"
+        "resurrecting the expired pending packet must fail this request-count oracle"
     );
     runtime
         .shutdown(tokio::time::Instant::now() + Duration::from_secs(5))
