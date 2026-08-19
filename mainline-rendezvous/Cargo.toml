@@ -1,0 +1,33 @@
+[package]
+name = "mainline-rendezvous"
+description = "SPIKE (TASK-258): the BitTorrent Mainline DHT as a peer-ADDRESS RENDEZVOUS for nix-p2p nodes. Announces membership under ONE well-known infohash and get_peers it to learn addresses; content routing stays on our own /nix-p2p kad. This crate NEVER answers 'who holds hash X?'. Not a shipped default - the deliverable is a decision + measured privacy cost."
+version.workspace = true
+edition.workspace = true
+
+[lib]
+name = "mainline_rendezvous"
+path = "src/lib.rs"
+
+[[bin]]
+name = "rendezvous-spike"
+path = "src/bin/rendezvous_spike.rs"
+
+[dependencies]
+# The pubky/pkarr-lineage pure-Rust BEP5+BEP44 Mainline implementation. libp2p has
+# NO Mainline implementation, so this is a SEPARATE dependency and evaluating it IS
+# part of the spike (AC#1). Constructed WITHOUT server_mode() => strictly CLIENT
+# (never promoted to a serving node); the local-bootstrap subcommand is the ONLY
+# server_mode() caller and exists only to give the hermetic e2e an in-topology
+# Mainline entry point (never router.bittorrent.com).
+mainline = "8"
+# BLAKE3 is already a first-party workspace dep (peer-fabric); reused here to DERIVE
+# the well-known rendezvous infohash from a fixed domain string (no new supply-chain
+# surface, and the infohash is a documented constant rather than magic bytes).
+blake3 = "1"
+# The `mainline` SYNC surface is deprecated in v8 (it directs callers to the async
+# API); with the workspace `-D warnings` lint gate we MUST use `AsyncDht`. tokio is
+# the runtime (already the tree's runtime); futures-lite provides the `StreamExt`
+# that drives `get_peers`' `GetStream` (the exact Stream trait mainline implements).
+# Both are already in Cargo.lock via other crates — no new supply-chain surface.
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }
+futures-lite = "2"

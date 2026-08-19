@@ -14,7 +14,11 @@ resolver = "3"
 # peer-fabric (never on the daemon) and the daemon depends on it (one-way edge).
 # Both are shared only AMONG the daemon's own components; testproxy shares nothing
 # with either, so `just independence` stays green.
-members = ["daemon", "daemon-core", "daemon-libp2p", "fabric-iroh", "fabric-libp2p", "peer-fabric", "proc-supervisor", "testproxy", "vendor/libp2p-stream"]
+# mainline-rendezvous (TASK-258 SPIKE): the BitTorrent Mainline DHT peer-address
+# rendezvous prototype. A separate workspace member (not depended on by the shipped
+# discovery crates yet — adoption is gated on the spike's decision) so `just build`,
+# `just test` and `just audit` all exercise it and its new `mainline` supply-chain edge.
+members = ["daemon", "daemon-core", "daemon-libp2p", "fabric-iroh", "fabric-libp2p", "mainline-rendezvous", "peer-fabric", "proc-supervisor", "testproxy", "vendor/libp2p-stream"]
 # Iroh is a crates.io patch used by production, but not a workspace member:
 # its upstream integration suite reaches staging DNS/relays and Linux network
 # namespaces. Canonical gates exercise our focused vendored regression explicitly.

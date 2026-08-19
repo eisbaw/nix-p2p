@@ -187,6 +187,17 @@
       # (nixos/nat-vm-test.nix, TASK-207) which drives it through a real relay.
       daemonLibp2p = memberPackage "daemon-libp2p";
 
+      # TASK-258 SPIKE: the Mainline rendezvous prototype's `rendezvous-spike` bin. Its own
+      # crane package (own dependency closure incl. the `mainline` crate), mainProgram set to
+      # the bin name (which differs from the crate name) so lib.getExe resolves it. Consumed by
+      # nixos/mainline-rendezvous-vm-test.nix — NOT depended on by the shipped daemon packages.
+      mainlineRendezvous =
+        let args = memberArgs "mainline-rendezvous";
+        in craneLib.buildPackage (args // {
+          cargoArtifacts = buildWorkspaceDeps args;
+          meta.mainProgram = "rendezvous-spike";
+        });
+
       # TASK-138's adversarial authority is deliberately absent from the
       # production daemon package. Build a separate derivation with the narrow
       # evidence feature so only the routed lookup image contains that binary.
@@ -440,6 +451,17 @@
         nat-vm-test = import ./nixos/nat-vm-test.nix {
           inherit pkgs daemonLibp2p;
         };
+
+        # TASK-258 SPIKE: the Mainline peer-address rendezvous KVM VM e2e — two NAT'd VMs that
+        # cannot connect directly + a LOCAL Mainline DHT node on the public segment; node A
+        # announces, node B boots ~10s later and discovers A via BEP5 despite the NAT. A
+        # PACKAGE, not a check (needs /dev/kvm); `nix build .#mainline-rendezvous-vm-test`.
+        mainline-rendezvous-vm-test = import ./nixos/mainline-rendezvous-vm-test.nix {
+          inherit pkgs;
+          rendezvousSpike = mainlineRendezvous;
+        };
+
+        mainline-rendezvous = mainlineRendezvous;
 
         default = self.packages.${system}.daemon;
       }

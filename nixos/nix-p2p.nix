@@ -249,6 +249,37 @@ in
         '';
       };
 
+      mainlineRendezvous = lib.mkOption {
+        type = lib.types.bool;
+        default = false;
+        description = ''
+          `--libp2p-mainline-rendezvous` (TASK-258 SPIKE): use the BitTorrent
+          Mainline DHT as a peer-ADDRESS RENDEZVOUS - announce membership under one
+          well-known infohash and `get_peers` it to learn member addresses that feed
+          the SAME kad bootstrap path. DEFAULT OFF. Unlike LAN mDNS this is
+          PUBLIC-network participation, so it is REFUSED fail-closed under
+          `profile = "upstream-only"` AND `profile = "lan-share"` (both must emit
+          ZERO packets to public DHT/Mainline infrastructure per the Wave-2c privacy
+          contract). It requires at least one `mainlineBootstrap` entry - there is NO
+          default (we never contact router.bittorrent.com). SPIKE STATUS: it is an
+          EXPERIMENTAL decision-prototype, not a shipped default; it supplies
+          ADDRESSES only and is NEVER a content-discovery mechanism. The measured
+          node-MEMBERSHIP enumeration cost is recorded in the TASK-258 report; this
+          does NOT enumerate content HOLDINGS.
+        '';
+      };
+
+      mainlineBootstrap = lib.mkOption {
+        type = lib.types.listOf lib.types.str;
+        default = [ ];
+        description = ''
+          `--libp2p-mainline-bootstrap <host:port>` (TASK-258): the LOCAL Mainline
+          DHT entry point(s) the rendezvous bootstraps against. There is deliberately
+          NO default (no public router), so `mainlineRendezvous = true` with an empty
+          list fails closed at startup.
+        '';
+      };
+
       identitySeed = lib.mkOption {
         type = lib.types.nullOr lib.types.str;
         default = null;
@@ -360,6 +391,18 @@ in
         assertion = !lcfg.mdns || profile != "upstream-only";
         message = "services.nix-p2p.libp2p.mdns = true requires a P2P profile (consume-only/lan-share/public-share/router); upstream-only runs no P2P and must emit zero mDNS multicast.";
       }
+      {
+        # TASK-258 SPIKE: the Mainline rendezvous is PUBLIC-network participation, REFUSED under
+        # upstream-only AND lan-share (both emit ZERO packets to public DHT/Mainline infra per the
+        # Wave-2c contract). Mirrors the daemon's parse_config refusal.
+        assertion = !lcfg.mainlineRendezvous || (profile != "upstream-only" && profile != "lan-share");
+        message = "services.nix-p2p.libp2p.mainlineRendezvous = true is public-network participation and is refused under profile = \"upstream-only\" and profile = \"lan-share\" (both must emit ZERO packets to public DHT/Mainline infrastructure). Select consume-only/public-share/router.";
+      }
+      {
+        # TASK-258: no default public router — an enabled rendezvous needs a local Mainline entry.
+        assertion = !lcfg.mainlineRendezvous || lcfg.mainlineBootstrap != [ ];
+        message = "services.nix-p2p.libp2p.mainlineRendezvous = true requires at least one libp2p.mainlineBootstrap host:port (there is no default; we never contact router.bittorrent.com).";
+      }
     ];
 
     systemd.services.nix-p2p-daemon = {
@@ -413,6 +456,9 @@ in
             ++ lib.optionals (lcfg.scope != null) [ "--libp2p-scope" lcfg.scope ]
             # TASK-257: LAN mDNS peer-address discovery (default OFF).
             ++ lib.optionals lcfg.mdns [ "--libp2p-mdns" ]
+            # TASK-258 SPIKE: Mainline DHT peer-address rendezvous (default OFF).
+            ++ lib.optionals lcfg.mainlineRendezvous [ "--libp2p-mainline-rendezvous" ]
+            ++ lib.concatMap (s: [ "--libp2p-mainline-bootstrap" s ]) lcfg.mainlineBootstrap
             ++ lib.optionals (lcfg.identitySeed != null) [ "--libp2p-identity-seed" lcfg.identitySeed ]
             ++ lib.optionals (lcfg.stateDir != null) [ "--libp2p-state-dir" lcfg.stateDir ]
             ++ lib.concatMap (s: [ "--libp2p-provide-store" s ]) lcfg.provideStore

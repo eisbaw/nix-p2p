@@ -100,6 +100,11 @@ license-files = []
 crate = "testproxy"
 expression = "MIT"
 license-files = []
+# TASK-258 SPIKE crate: same repo-root MIT LICENSE, no per-manifest license field.
+[[licenses.clarify]]
+crate = "mainline-rendezvous"
+expression = "MIT"
+license-files = []
 
 # ring 0.16.20 (via rcgen 0.11 -> libp2p-tls) ships a non-SPDX `license-file`
 # instead of a `license` expression, so cargo-deny cannot classify it. Pin its

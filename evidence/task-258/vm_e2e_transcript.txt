@@ -1,0 +1,12 @@
+mainline: waiting for success: grep -q READY=1 /tmp/mainline.log
+mainline: (finished: waiting for success: grep -q READY=1 /tmp/mainline.log, in 1.06 seconds)
+nodea: waiting for success: grep -q ANNOUNCE_OK /tmp/announce.log
+nodea: (finished: waiting for success: grep -q ANNOUNCE_OK /tmp/announce.log, in 5.14 seconds)
+nodeb: must succeed: sleep 10
+nodeb: (finished: must succeed: sleep 10, in 10.03 seconds)
+DISCOVER_OK count=1 peerid=none addrs=192.168.1.1:4001 elapsed_ms=2142
+nodeb: must fail: timeout 3 nc -z 192.168.2.4 4001
+nodeb: (finished: must fail: timeout 3 nc -z 192.168.2.4 4001, in 3.01 seconds)
+nodeb: must fail: timeout 3 nc -z 192.168.1.1 4001
+nodeb: (finished: must fail: timeout 3 nc -z 192.168.1.1 4001, in 0.02 seconds)
+test script finished in 54.37s

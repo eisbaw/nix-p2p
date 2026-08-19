@@ -1,0 +1,24 @@
+{
+  "enumeration": {
+    "announced_members": [
+      "127.0.0.2:14001",
+      "127.0.0.3:14002",
+      "127.0.0.4:14003",
+      "127.0.0.5:14004",
+      "127.0.0.6:14005"
+    ],
+    "krpc_messages_observed": 9,
+    "observer_get_peers_walltime_ms": 2148,
+    "recoverable_fraction_den": 5,
+    "recoverable_fraction_num": 5,
+    "recovered_members": [
+      "127.0.0.2:14001",
+      "127.0.0.3:14002",
+      "127.0.0.4:14003",
+      "127.0.0.5:14004",
+      "127.0.0.6:14005"
+    ],
+    "responses_with_values": 1
+  },
+  "pcap": "/tmp/claude-1000/-home-mpedersen-topics-nix-decentralized-cache/eefa311f-89e2-4fdd-ace9-d1057c734fef/scratchpad/spike_e2e/observer.pcap"
+}

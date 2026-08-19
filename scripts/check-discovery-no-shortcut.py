@@ -22,8 +22,23 @@ holds hash X only through kad. This guard therefore:
     `find_providers`/`get_providers` (a non-kad answer to "who has hash X?"), a
     bite fires. The distinction is made STRUCTURALLY - by which call the mDNS
     EVENT-HANDLER (or an mDNS-named function) feeds (see `scan_mdns_wiring`).
-gossipsub/floodsub/rendezvous remain forbidden OUTRIGHT (their mere presence is a
-violation); mDNS is judged by its WIRING, not its presence.
+
+THE MAINLINE-RENDEZVOUS BOUNDARY (TASK-258 SPIKE). The Mainline (BitTorrent DHT)
+rendezvous is the SAME address-bootstrap shape as mDNS, just over a different
+substrate: a node `get_peers` a well-known infohash to learn member ADDRESSES and
+hands the bare IP:port into the libp2p dial/bootstrap path. BEP5 carries IP:port
+ONLY (no PeerId, no arbitrary payload), so it structurally CANNOT answer "who holds
+hash X?". So the plain-substring `rendezvous` outright-ban is REFINED exactly like
+mDNS was: a mainline/rendezvous-named region may feed the ADDRESS/dial/bootstrap
+path but BITES if it feeds `find_providers`/`get_providers` (see
+`scan_rendezvous_wiring`). What STAYS forbidden outright is the libp2p RENDEZVOUS
+PROTOCOL behaviour itself (`libp2p::rendezvous` / `rendezvous::{client,server,
+Behaviour,...}`) - a central meeting-point registration tracker we do NOT use; the
+Mainline rendezvous is the `mainline` crate on its OWN UDP socket, never a libp2p
+behaviour. The precise pattern (see `FORBIDDEN_PROTOCOL_RE`) matches the libp2p
+protocol path but NOT the `mainline_rendezvous` crate/flag naming.
+gossipsub/floodsub remain forbidden OUTRIGHT (their mere presence is a violation);
+mDNS and the Mainline rendezvous are judged by their WIRING, not their presence.
 
 DISCOVERY vs DIAL-ASSISTANCE (TASK-168). The NAT-traversal trio - autonat
 (reachability detection), dcutr (hole punching), relay (circuit-v2 client+server)
@@ -93,15 +108,35 @@ SKIP_DIRS = {".git", "target", "result", "fixtures", "backlog", ".direnv", "test
 # publicly dialable, never OTHER peers or content (dial-assistance, not a substitute).
 # NOTE (TASK-257): `mdns` was REMOVED from this OUTRIGHT set. mDNS is now SHIPPED in the
 # peer-ADDRESS BOOTSTRAP role (it feeds `kad.add_address`, never content discovery), so
-# its PRESENCE is permitted; its WIRING is judged by `scan_mdns_wiring`, which STILL
-# forbids an mDNS event feeding `find_providers`/`get_providers`. `rendezvous` STAYS
-# forbidden outright: it is a central content meeting-point tracker and is not wired in
-# any bootstrap role yet (its own address-bootstrap refinement is TASK-258).
+# its PRESENCE is permitted; its WIRING is judged by `scan_mdns_wiring`.
+# NOTE (TASK-258): the bare `rendezvous` SUBSTRING was REMOVED from this OUTRIGHT set. The
+# Mainline rendezvous is the SAME address-bootstrap shape as mDNS over a different
+# substrate (BEP5 `get_peers` -> IP:port -> the libp2p dial path); its WIRING is judged by
+# `scan_rendezvous_wiring`, which still forbids a mainline/rendezvous region feeding
+# `find_providers`/`get_providers`. What stays forbidden OUTRIGHT is the libp2p RENDEZVOUS
+# PROTOCOL behaviour (`FORBIDDEN_PROTOCOL_RE`) - a genuine central meeting-point
+# registration tracker we do NOT use. The precise regex matches the libp2p protocol path
+# but NOT the `mainline_rendezvous` crate/flag naming (whose `rendezvous` is preceded by
+# `_`, so a `\b`-anchored match never fires inside it).
 FORBIDDEN = {
-    "rendezvous": "rendezvous is a central meeting-point tracker - a non-kad shortcut",
     "gossipsub": "gossipsub is pubsub flooding - a non-kad discovery/broadcast path",
     "floodsub": "floodsub is pubsub flooding - a non-kad discovery/broadcast path",
 }
+
+# The libp2p RENDEZVOUS PROTOCOL behaviour stays forbidden outright (TASK-258): installing
+# `libp2p::rendezvous` / a `rendezvous::{client,server,Behaviour,Event,Config,register,
+# Registration,Namespace}` is a central meeting-point registration tracker - a non-kad
+# discovery substrate. These patterns are `\b`-anchored so they match the libp2p protocol
+# path (`libp2p::rendezvous`, `rendezvous::Behaviour`) but NEVER the `mainline_rendezvous`
+# crate/flag identifiers (there `rendezvous` follows `_`, a word char, so `\b` fails) and
+# NEVER a prose comment mentioning the word (comments are stripped first).
+FORBIDDEN_PROTOCOL_RE = (
+    re.compile(r"\blibp2p[_:]{1,2}rendezvous\b"),
+    re.compile(
+        r"\brendezvous::(?:client|server|Behaviour|Event|Config|register|"
+        r"Registration|Namespace)\b"
+    ),
+)
 
 # TASK-257: the CONTENT-DISCOVERY sinks an mDNS event must NEVER feed - the "who holds
 # hash X?" query entry points. `find_providers` is the fabric directory API; `get_providers`
@@ -110,6 +145,20 @@ FORBIDDEN = {
 # guard bites. These calls are LEGITIMATE elsewhere in the file (they ARE the kad-exclusive
 # content path); the violation is specifically an mDNS EVENT feeding one of them.
 MDNS_CONTENT_SINKS = ("find_providers", "get_providers")
+
+# TASK-258: the SAME content-discovery sinks a mainline/rendezvous region must NEVER feed.
+# Shared with the mDNS check: whatever answers "who holds hash X?" must stay kad-exclusive.
+RENDEZVOUS_CONTENT_SINKS = ("find_providers", "get_providers")
+
+# A mainline/rendezvous-named function: its WHOLE body is a rendezvous wiring region. The
+# Mainline rendezvous is a side task (its own UDP socket), NOT a libp2p behaviour, so unlike
+# mDNS there is no `SwarmEvent` arm to anchor on - the anchor is the FUNCTION NAME. This
+# catches `fn spawn_mainline_rendezvous(){...}`, `fn on_rendezvous_addr(){...}`, etc. The
+# `mainline`/`rendezvous` tokens here are plain substrings of the fn NAME (not `\b`-anchored),
+# so `mainline_rendezvous`-derived helper names are covered too.
+RENDEZVOUS_NAMED_FN = re.compile(
+    r"\bfn\s+[A-Za-z0-9_]*(?:rendezvous|mainline)[A-Za-z0-9_]*\s*(?:<[^>]*>)?\s*\("
+)
 
 # Anchors that mark an mDNS EVENT-HANDLER (as opposed to the struct field, the behaviour
 # constructor `mdns::tokio::Behaviour::new`, or a config). Only these begin an mDNS wiring
@@ -335,6 +384,75 @@ def scan_mdns_wiring(roots: list[Path]) -> list[str]:
     return violations
 
 
+def scan_forbidden_protocols(roots: list[Path]) -> list[str]:
+    """TASK-258: the libp2p RENDEZVOUS PROTOCOL behaviour stays forbidden OUTRIGHT.
+
+    `FORBIDDEN_PROTOCOL_RE` matches the libp2p protocol path (`libp2p::rendezvous`,
+    `rendezvous::Behaviour`, ...) but NOT the `mainline_rendezvous` crate/flag identifiers
+    (there `rendezvous` follows `_`, so the `\\b` anchor never fires). Comments are stripped
+    first, so a prose mention of the word never trips."""
+    violations: list[str] = []
+    for root in roots:
+        if not root.exists():
+            continue
+        for source in sorted(root.rglob("*.rs")):
+            if SKIP_DIRS & set(source.relative_to(root).parts):
+                continue
+            try:
+                code = _strip_line_comments(source.read_text())
+            except (UnicodeDecodeError, OSError):
+                continue
+            for pattern in FORBIDDEN_PROTOCOL_RE:
+                m = pattern.search(code)
+                if m:
+                    violations.append(
+                        f"{source}: contains the libp2p rendezvous PROTOCOL token "
+                        f"{m.group(0)!r} - a central meeting-point registration tracker is a "
+                        "non-kad discovery substrate, forbidden outright (TASK-258). The Mainline "
+                        "rendezvous is the `mainline` crate on its own UDP socket, never a libp2p "
+                        "behaviour."
+                    )
+    return violations
+
+
+def scan_rendezvous_wiring(roots: list[Path]) -> list[str]:
+    """TASK-258: the Mainline rendezvous is PERMITTED in the peer-address bootstrap role but
+    FORBIDDEN as a content-discovery mechanism. For every mainline/rendezvous-named function
+    body, flag a content-discovery sink (`find_providers`/`get_providers`) - that would be a
+    rendezvous answering "who holds hash X?", which must stay kad-EXCLUSIVE. A rendezvous
+    region wired to the address/dial/bootstrap path (`dial`/`add_address`/`join_bootstraps`)
+    is NOT a sink and passes - exactly the mDNS boundary, over a different substrate."""
+    violations: list[str] = []
+    for root in roots:
+        if not root.exists():
+            continue
+        for source in sorted(root.rglob("*.rs")):
+            if SKIP_DIRS & set(source.relative_to(root).parts):
+                continue
+            try:
+                code = _strip_line_comments(source.read_text())
+            except (UnicodeDecodeError, OSError):
+                continue
+            if "rendezvous" not in code and "mainline" not in code:
+                continue
+            for m in RENDEZVOUS_NAMED_FN.finditer(code):
+                brace = code.find("{", m.end())
+                if brace == -1:
+                    continue
+                body = _balanced_block(code, brace)
+                for sink in RENDEZVOUS_CONTENT_SINKS:
+                    if sink in body:
+                        snippet = " ".join(body.split())[:90]
+                        violations.append(
+                            f"{source}: a mainline/rendezvous-named function feeds the "
+                            f"content-discovery sink {sink!r} ({snippet!r}) - the Mainline "
+                            "rendezvous may supply peer ADDRESSES to the dial/bootstrap path "
+                            "ONLY, never answer 'who holds hash X?'. Content discovery must stay "
+                            "kad-EXCLUSIVE (TASK-258)."
+                        )
+    return violations
+
+
 def scan(roots: list[Path]) -> tuple[list[str], int]:
     violations: list[str] = []
     scanned = 0
@@ -543,9 +661,10 @@ def self_test() -> int:
                     file=sys.stderr,
                 )
                 return 1
-        # The outright-forbidden substitutes must STILL bite by mere presence: gossipsub,
-        # floodsub, rendezvous. (mDNS is deliberately NOT in this set anymore.)
-        for token in ("gossipsub", "floodsub", "rendezvous"):
+        # The pubsub substitutes must STILL bite by mere presence (via `scan`): gossipsub,
+        # floodsub. (mDNS and the bare `rendezvous` substring are deliberately NOT in this
+        # set anymore - mDNS/rendezvous are judged by WIRING.)
+        for token in ("gossipsub", "floodsub"):
             (root / "forbidden.rs").write_text(
                 "pub struct Behaviour {\n"
                 "    pub kad: kad::Behaviour<MemoryStore>,\n"
@@ -557,16 +676,89 @@ def self_test() -> int:
             if not any(token in v for v in forbid_violations):
                 print(
                     f"self-test FAILED: adding {token}::Behaviour did NOT trip the guard - the "
-                    "outright-forbidden content-discovery substitutes must still bite",
+                    "outright-forbidden pubsub content-discovery substitutes must still bite",
+                    file=sys.stderr,
+                )
+                return 1
+        # TASK-258 OUTRIGHT: the libp2p RENDEZVOUS PROTOCOL behaviour must still bite (via
+        # `scan_forbidden_protocols`), while the `mainline_rendezvous` crate/flag identifier
+        # must NOT (the `\b`-anchored regex never fires inside `mainline_rendezvous`).
+        for label, decl, want_bite in (
+            ("rendezvous::Behaviour", "    pub rzv: rendezvous::Behaviour,", True),
+            (
+                "libp2p::rendezvous",
+                "    pub rzv: libp2p::rendezvous::client::Behaviour,",
+                True,
+            ),
+            (
+                "mainline_rendezvous flag",
+                "    pub libp2p_mainline_rendezvous: bool,",
+                False,
+            ),
+        ):
+            (root / "proto.rs").write_text("pub struct S {\n" + decl + "\n}\n")
+            proto_hits = scan_forbidden_protocols([Path(tmp) / "fabric-libp2p" / "src"])
+            (root / "proto.rs").unlink()
+            if want_bite and not proto_hits:
+                print(
+                    f"self-test FAILED: the libp2p rendezvous PROTOCOL ({label}) did NOT bite - a "
+                    "central meeting-point tracker must be forbidden outright (TASK-258)",
+                    file=sys.stderr,
+                )
+                return 1
+            if not want_bite and proto_hits:
+                print(
+                    f"self-test FAILED: the `mainline_rendezvous` identifier ({label}) tripped the "
+                    f"libp2p-protocol ban ({proto_hits}) - the crate/flag naming must be allowed",
+                    file=sys.stderr,
+                )
+                return 1
+        # TASK-258 DIRECTION (a): the Mainline rendezvous in the ADDRESS/dial role must PASS. A
+        # mainline/rendezvous-named function that hands the recovered bare IP:port to the dial
+        # path is the permitted wiring.
+        (root / "rzv_addr_ok.rs").write_text(
+            "async fn spawn_mainline_rendezvous(&self) {\n"
+            "    let addrs = self.discover().await;\n"
+            "    for addr in addrs { let _ = self.swarm.dial(addr).await; }\n"
+            "}\n"
+        )
+        rzv_ok = scan_rendezvous_wiring([Path(tmp) / "fabric-libp2p" / "src"])
+        (root / "rzv_addr_ok.rs").unlink()
+        if rzv_ok:
+            print(
+                "self-test FAILED: the Mainline rendezvous wired to the dial/ADDRESS path was "
+                f"flagged ({rzv_ok}) - the permitted peer-address bootstrap role must PASS (TASK-258)",
+                file=sys.stderr,
+            )
+            return 1
+        # TASK-258 DIRECTION (b): the Mainline rendezvous wired into CONTENT discovery must FAIL.
+        # The ONLY change is the sink the rendezvous-named function feeds.
+        for label, sink in (
+            ("get_providers", "get_providers"),
+            ("find_providers", "find_providers"),
+        ):
+            (root / "rzv_content.rs").write_text(
+                "async fn on_rendezvous_discovered(&self, key: Key) {\n"
+                f"    let _ = self.swarm.behaviour_mut().kad.{sink}(key);\n"
+                "}\n"
+            )
+            rzv_bad = scan_rendezvous_wiring([Path(tmp) / "fabric-libp2p" / "src"])
+            (root / "rzv_content.rs").unlink()
+            if not any("content-discovery sink" in v for v in rzv_bad):
+                print(
+                    f"self-test FAILED: the Mainline rendezvous wired into CONTENT discovery "
+                    f"({label}) did NOT trip the guard - it must never answer 'who holds hash X?' "
+                    "(TASK-258)",
                     file=sys.stderr,
                 )
                 return 1
         print(
             "check-discovery-no-shortcut: self-test OK - clean composition passes, the permitted "
-            "NAT-traversal trio (autonat/dcutr/relay) is ALLOWED, mDNS in the ADDRESS/bootstrap "
-            "role (add_address) PASSES while mDNS wired into content discovery "
-            "(find_providers/get_providers) BITES, gossipsub/floodsub/rendezvous still BITE, and "
-            "an auxiliary provider-keyed relay cache BITES"
+            "NAT-traversal trio (autonat/dcutr/relay) is ALLOWED, mDNS AND the Mainline rendezvous "
+            "in the ADDRESS/bootstrap role (add_address/dial) PASS while either wired into content "
+            "discovery (find_providers/get_providers) BITES, gossipsub/floodsub AND the libp2p "
+            "rendezvous PROTOCOL behaviour still BITE (but the `mainline_rendezvous` flag naming "
+            "does not), and an auxiliary provider-keyed relay cache BITES"
         )
         return 0
 
@@ -586,6 +778,10 @@ def main(argv: list[str]) -> int:
     violations = violations + scan_relay_provider_independence(roots)
     # TASK-257: mDNS is permitted for address bootstrap, forbidden for content discovery.
     violations = violations + scan_mdns_wiring(roots)
+    # TASK-258: the libp2p rendezvous PROTOCOL behaviour is forbidden outright; the Mainline
+    # rendezvous is permitted for address bootstrap, forbidden for content discovery.
+    violations = violations + scan_forbidden_protocols(roots)
+    violations = violations + scan_rendezvous_wiring(roots)
     if scanned == 0:
         print(
             "check-discovery-no-shortcut: NOTHING scanned - nothing proven "
@@ -603,9 +799,10 @@ def main(argv: list[str]) -> int:
         return 1
     print(
         f"check-discovery-no-shortcut: OK - {scanned} shipped discovery source file(s) "
-        "scanned; CONTENT discovery is kad-EXCLUSIVE (no rendezvous/gossipsub/floodsub, and no "
-        "mDNS event feeds find_providers/get_providers); mDNS is permitted in the peer-ADDRESS "
-        "bootstrap role; signed RelayHints and the NAT-traversal trio are permitted "
+        "scanned; CONTENT discovery is kad-EXCLUSIVE (no gossipsub/floodsub, no libp2p rendezvous "
+        "PROTOCOL behaviour, and no mDNS/mainline-rendezvous region feeds "
+        "find_providers/get_providers); mDNS and the Mainline rendezvous are permitted in the "
+        "peer-ADDRESS bootstrap role; signed RelayHints and the NAT-traversal trio are permitted "
         "dial-assistance; auxiliary provider-keyed relay maps/caches remain forbidden"
     )
     return 0

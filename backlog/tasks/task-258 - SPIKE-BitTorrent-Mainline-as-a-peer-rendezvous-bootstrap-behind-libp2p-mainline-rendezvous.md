@@ -3,10 +3,11 @@ id: TASK-258
 title: >-
   SPIKE: BitTorrent Mainline as a peer-rendezvous bootstrap behind
   --libp2p-mainline-rendezvous
-status: To Do
-assignee: []
+status: In Progress
+assignee:
+  - '@claude'
 created_date: '2026-08-18 20:54'
-updated_date: '2026-08-18 21:22'
+updated_date: '2026-08-19 09:38'
 labels:
   - libp2p
   - mainline
@@ -55,19 +56,19 @@ OUTCOME: reject is a fully valid and useful result. If the enumeration exposure 
 
 ## Acceptance Criteria
 <!-- AC:BEGIN -->
-- [ ] #1 A Rust Mainline client crate is selected with a written rationale, and can run strictly as a client with no adaptive promotion to a serving DHT node
+- [x] #1 A Rust Mainline client crate is selected with a written rationale, and can run strictly as a client with no adaptive promotion to a serving DHT node
 - [ ] #2 New default-OFF --libp2p-mainline-rendezvous flag plus the mirrored NixOS module option; it feeds peer addresses into the existing bootstrap path only
 - [ ] #3 Two hosts, neither given the others address, discover each other via Mainline rendezvous and complete a real byte-identical fetch over our own kad
-- [ ] #4 BITE: disabling rendezvous on one host makes discovery fail, proving no address arrived by another path
-- [ ] #5 It is REFUSED fail-closed under upstream_only and lan_share, with packet-level proof of zero Mainline traffic and a guard that bites under mutation
-- [ ] #6 Under consume_only, preflight explicitly reports it as public-network participation and records the lookup exposure
-- [ ] #7 The node-membership enumeration exposure is MEASURED: a third host runs get_peers on the rendezvous infohash and reports recoverable fraction and wall time; a run handed the peer list fails as vacuous
+- [x] #4 BITE: disabling rendezvous on one host makes discovery fail, proving no address arrived by another path
+- [x] #5 It is REFUSED fail-closed under upstream_only and lan_share, with packet-level proof of zero Mainline traffic and a guard that bites under mutation
+- [x] #6 Under consume_only, preflight explicitly reports it as public-network participation and records the lookup exposure
+- [x] #7 The node-membership enumeration exposure is MEASURED: a third host runs get_peers on the rendezvous infohash and reports recoverable fraction and wall time; a run handed the peer list fails as vacuous
 - [ ] #8 Announce and lookup traffic are bounded and the bound is proven, not asserted
 - [ ] #9 A bounded, expiring peer cache persists discovered nix-p2p peers (in the existing --libp2p-state-dir) and is tried BEFORE Mainline on subsequent starts; Mainline is contacted only when the cached peers are all unreachable
 - [ ] #10 BITE: a second start with a warm cache emits ZERO Mainline packets, verified at packet level, and the guard bites under mutation. A corrupt or absent cache degrades to a normal Mainline lookup, never to a crash and never to dialing unvalidated addresses
 - [ ] #11 TEST-VACUITY GUARD: cold-discovery oracles must run with the peer cache empty or disabled, and assert it. A persisted cache would otherwise hand a test the address it was supposed to discover, silently making every no-injection bite in this task vacuous
-- [ ] #12 Deliverable is a written adopt / adopt-with-conditions / reject recommendation. Reject is a valid terminal outcome, and its honest consequence is NO PUBLIC POOL (private/enterprise pools only) -- not a fallback to operator-run routers, which the owner has ruled out
-- [ ] #13 Establish whether BEP5 IP:port announce is sufficient, given that a NATd peer whose only reachable address is a /p2p-circuit cannot express it in BEP5. Either evidence that NATd peers are reachable without announcing (found once they dial out and enter others routing tables), or add BEP44 signed records carrying PeerId plus circuit multiaddrs
+- [x] #12 Deliverable is a written adopt / adopt-with-conditions / reject recommendation. Reject is a valid terminal outcome, and its honest consequence is NO PUBLIC POOL (private/enterprise pools only) -- not a fallback to operator-run routers, which the owner has ruled out
+- [x] #13 Establish whether BEP5 IP:port announce is sufficient, given that a NATd peer whose only reachable address is a /p2p-circuit cannot express it in BEP5. Either evidence that NATd peers are reachable without announcing (found once they dial out and enter others routing tables), or add BEP44 signed records carrying PeerId plus circuit multiaddrs
 <!-- AC:END -->
 
 ## Implementation Notes
@@ -94,4 +95,22 @@ THE REAL GAP IN BEP5, and the reason to evaluate a hybrid: A NATD PEER HAS NO US
 LIKELY SHAPE: BEP5 to FIND unknown peers, plus optional BEP44 signed records for peers whose only reachable address is a circuit. Evaluate whether the NATd case is large enough to justify the second mechanism, or whether a NATd peer can simply skip announcing and rely on being found once it dials out and is added to others routing tables.
 
 OWNER E2E REQUIREMENT (2026-08-18): the spike MUST include a WORKING VM e2e demonstrating Mainline rendezvous discovery. Topology: two VMs (KVM, extending the nat-vm-test topology), NATd so they CANNOT connect DIRECTLY. Node A boots first and announces to the Mainline DHT under the well-known nix-p2p infohash; Node B boots ~10s LATER and get_peers that infohash. DEMONSTRATION: B (late joiner) discovers A via BEP5 (Mainline get_peers) EVEN THOUGH they cannot connect directly -- Mainline rendezvous is the meeting point; connectivity is then established via the existing relay/hole-punch NAT traversal (TASK-168/218). Owner words: we need to SEE the bittorrent bootstrap work in e2e between VMs, one initial node and another booting 10s later, eventually seeing each other via BEP5 even if they cant connect directly. HERMETICITY design point for the spike: do NOT hit the REAL public Mainline DHT (router.bittorrent.com/dht.transmissionbt.com) in a hermetic e2e -- external dependency + announcing test nodes to the real Mainline swarm is leaky and rude. Stand up a LOCAL Mainline DHT bootstrap node inside the VM topology that both nix-p2p nodes use as their Mainline entry point (a real Mainline node, but in-topology); optionally a separate manual/opt-in run can validate against the real Mainline. The PRIVACY-COST measurement (BEP5 announce_peer exposes our IP -> node-MEMBERSHIP enumeration, NOT content holdings; consult TASK-96) remains the central spike deliverable ALONGSIDE this working demo.
+
+SPIKE OUTCOME 2026-08-19 — RECOMMENDATION: ADOPT-WITH-CONDITIONS (as a no-owned-infra public bootstrap RENDEZVOUS for DISCOVERY only; NOT a NAT-traversal solution).
+
+CENTRAL FINDING (AC#13). BEP5 announce_peer records ONLY the source IP:port of the announce packet; get_peers returns Vec<SocketAddrV4> — bare IP:port, NO PeerId, NO payload, NO /p2p-circuit. Proven with the pubky mainline v8 crate AND demonstrated in a passing KVM VM e2e: a NATd A announcing behind a MASQUERADE is recorded at its NAT gateway IP (192.168.1.1:4001, not its private 192.168.2.4), which B recovers via BEP5 but CANNOT dial (both reachability probes fail). So BEP5-as-rendezvous lets B DISCOVER A membership/existence, but does NOT let B REACH a NATd A. To reach NATd peers a working design needs EITHER (a) BEP44 signed mutable records carrying PeerId+relay /p2p-circuit multiaddrs (pkarr-style; the crate supports BEP44) — but that is 1:1 key->record lookup, not many:1 discovery, so it COMPLEMENTS BEP5, not replaces it — OR (b) BEP5 finds the DIALABLE public subset (relays/public nodes) and a NATd A becomes reachable once it dials out and its circuit address is learned via our OWN kad/identify. Net: BEP5 rendezvous bootstraps INTO our existing circuit-v2 relay + kad; it does not itself provide NAT traversal.
+
+CRATE + CLIENT-ONLY (AC#1). mainline v8.0.0 (pubky/pkarr lineage, MIT, actively maintained), pure-Rust BEP5+BEP44. Held strictly CLIENT (no server_mode()). PROVEN client-only FROM RAW WIRE (not the README): a client answered 0 outbound responses (it received 21 inbound probe queries but SERVED none); the identical node flipped to server_mode answered 44 — the bite fires. The v8 sync API is deprecated; used AsyncDht.
+
+ENUMERATION PRIVACY COST (AC#7, from raw capture). A third-party observer recovered the ENTIRE announced node population from ITS OWN get_peers wire capture: recoverable fraction 5/5 (exact rational), observer get_peers wall time 2148 ms. A values-stripped/handed capture recovers 0/3 (vacuous run fails). FRAME EXACTLY: this enumerates node MEMBERSHIP (which IPs speak nix-p2p), NOT content HOLDINGS — it does NOT touch the frozen no-enumeration (holdings) invariant. The exposure is inherent to BEP5 announce and is the price of a public pool.
+
+VM E2E (AC#3, owner requirement — PASSED). nixos/mainline-rendezvous-vm-test.nix: local Mainline node on the public segment + two NATd VMs on separate NATs (cannot connect directly). nodea announces first; nodeb boots 10s later and DISCOVERS nodea via BEP5 (DISCOVER_OK count=1 peerid=none addrs=192.168.1.1:4001) despite the NAT. Byte-identical FETCH was NOT attempted: it is blocked by the AC#13 reachability finding (B cannot reach a NATd A over BEP5 alone) and is the deferred adoption work.
+
+AC STATUS: DONE #1 #4 #5 #6 #7 #12 #13. PARTIAL: #2 (default-OFF flag + NixOS option + fail-closed profile refusal are DONE as operator scaffold; the daemon does not LIVE-run the DHT — the rendezvous-spike bin does — so feeding addresses into SwarmHandle::dial is the deferred live wiring); #3 (discovery DONE incl VM; fetch blocked by the finding); #8 (LookupBound deadline+max_addrs documented and the lookup returns within bound in tests; announce cadence bounded — a formal traffic-bound harness is light). DEFERRED to an adopt-gated follow-up: #9 #10 #11 (bounded expiring peer cache productionization) — the spike is COLD-CACHE-ONLY to keep the no-injection bites honest.
+
+258 does NOT close TASK-96: 96 real-swarm verdict needs owner-authorized two-network infra. This hermetic spike answers structural feasibility + in-vitro privacy cost + the demo only.
+
+SUPPLY CHAIN: cargo deny licenses/bans/sources GREEN with the new mainline dep. cargo deny advisories has 3 PRE-EXISTING failures (h2 RUSTSEC-2026-0258 via iroh; hickory-dns RUSTSEC-2026-0118/0119 via iroh/libp2p DNS) — confirmed present in HEAD Cargo.lock, NOT introduced by mainline (mainline pulls neither). They warrant their own triage follow-up.
+
+GATES: fmt clean; clippy -D warnings clean on changed crates; discovery-guard self-test bites + real scan green; enumeration analyzer self-test bites; spike default tests 2/2 + ignored load-bearing 2/2 + scaffold mutation-bite 4/4 green; VM e2e PASSED. Evidence in evidence/task-258/.
 <!-- SECTION:NOTES:END -->

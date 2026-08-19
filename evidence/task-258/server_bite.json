@@ -1,0 +1,10 @@
+{
+  "client_only": {
+    "inbound_queries": 44,
+    "inbound_responses": 0,
+    "is_client_only": false,
+    "outbound_queries": 0,
+    "outbound_responses": 44
+  },
+  "pcap": "/tmp/claude-1000/-home-mpedersen-topics-nix-decentralized-cache/eefa311f-89e2-4fdd-ace9-d1057c734fef/scratchpad/spike_e2e/observer.pcap"
+}

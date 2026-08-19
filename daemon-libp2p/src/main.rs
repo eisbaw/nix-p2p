@@ -83,6 +83,24 @@ struct Config {
     /// REFUSED under upstream-only (which runs no swarm at all). Scope isolation is orthogonal and
     /// already enforced by the scoped kad/identify protocol names.
     libp2p_mdns: bool,
+    /// TASK-258 SPIKE: `--libp2p-mainline-rendezvous` opts into using the BitTorrent Mainline
+    /// DHT as a peer-ADDRESS RENDEZVOUS (announce membership under one well-known infohash;
+    /// `get_peers` it to learn member addresses that feed the SAME kad bootstrap path). DEFAULT
+    /// OFF. It is PUBLIC-network participation (unlike LAN mDNS), so it is REFUSED fail-closed
+    /// under `upstream-only` AND `lan-share` (the two zero-egress profiles — the Wave-2c privacy
+    /// contract says lan-share emits ZERO packets to public DHT/Mainline infrastructure). Under
+    /// `consume-only` it is surfaced as public participation. There is NO default bootstrap (we
+    /// never contact router.bittorrent.com), so it REQUIRES at least one
+    /// `--libp2p-mainline-bootstrap`. NB (spike honesty): this binary does NOT itself run the
+    /// Mainline DHT yet — the flag is the operator-contract scaffold (refusal + surfacing);
+    /// live Mainline execution lives in the `rendezvous-spike` bin and is the deferred
+    /// adoption productionization (AC#9/#10/#11). It supplies ADDRESSES only, never content
+    /// discovery (scripts/check-discovery-no-shortcut.py enforces that structurally).
+    libp2p_mainline_rendezvous: bool,
+    /// TASK-258: the LOCAL Mainline DHT entry point(s) `host:port` the rendezvous bootstraps
+    /// against. REPEATABLE. There is deliberately NO default (no public router), so an enabled
+    /// rendezvous with an empty list fails closed.
+    libp2p_mainline_bootstrap: Vec<String>,
     libp2p_identity_seed: Option<[u8; 32]>,
     libp2p_provider: bool,
     libp2p_seed_nar: Vec<(daemon_core::NarHashKey, String)>,
@@ -375,6 +393,8 @@ fn parse_config<I: IntoIterator<Item = String>>(args: I) -> Result<Config, Strin
         libp2p_external_addresses: Vec::new(),
         libp2p_scope: None,
         libp2p_mdns: false,
+        libp2p_mainline_rendezvous: false,
+        libp2p_mainline_bootstrap: Vec::new(),
         libp2p_identity_seed: None,
         libp2p_provider: false,
         libp2p_seed_nar: Vec::new(),
@@ -442,6 +462,15 @@ fn parse_config<I: IntoIterator<Item = String>>(args: I) -> Result<Config, Strin
             ),
             "--libp2p-scope" => cfg.libp2p_scope = Some(value()?),
             "--libp2p-mdns" => cfg.libp2p_mdns = true,
+            "--libp2p-mainline-rendezvous" => cfg.libp2p_mainline_rendezvous = true,
+            "--libp2p-mainline-bootstrap" => {
+                let raw = value()?;
+                // Validate as SocketAddrV4 at parse time (fail fast, no silent bad address).
+                raw.parse::<std::net::SocketAddrV4>().map_err(|e| {
+                    format!("bad --libp2p-mainline-bootstrap host:port {raw:?}: {e}")
+                })?;
+                cfg.libp2p_mainline_bootstrap.push(raw);
+            }
             "--libp2p-identity-seed" => {
                 cfg.libp2p_identity_seed = Some(parse_libp2p_seed(&value()?)?)
             }
@@ -628,6 +657,41 @@ fn parse_config<I: IntoIterator<Item = String>>(args: I) -> Result<Config, Strin
         }
     }
     cfg.profile = derived;
+
+    // TASK-258 SPIKE — Mainline rendezvous fail-closed refusals (AC#5/#6). These are
+    // CONTRADICTION checks (enforced even under `--preflight`, not just the live path) so the
+    // operator cannot even DESCRIBE a zero-egress profile as also doing public Mainline traffic.
+    if cfg.libp2p_mainline_rendezvous {
+        // (1) NO default public router: the rendezvous has no entry point without an explicit
+        // LOCAL Mainline bootstrap, so an enabled rendezvous with none fails closed.
+        if cfg.libp2p_mainline_bootstrap.is_empty() {
+            return Err(
+                "--libp2p-mainline-rendezvous requires at least one --libp2p-mainline-bootstrap \
+                 <host:port>: there is NO default (we never contact router.bittorrent.com), so a \
+                 rendezvous with no local Mainline entry point can reach nobody"
+                    .into(),
+            );
+        }
+        // (2) Wave-2c HARD CONSTRAINT: lan-share (and upstream-only) emit ZERO packets to public
+        // DHT/Mainline infrastructure. The Mainline rendezvous IS public-network participation, so
+        // it is REFUSED fail-closed under both — never a silent no-op. (upstream-only is normally
+        // unreachable here because the flag implies consume-only via has_bootstrap, but an explicit
+        // `--profile upstream-only --libp2p-mainline-rendezvous` reaches this after the cross-check
+        // only if the derivation ever changes; the guard is kept explicit and belt-and-braces.)
+        if matches!(
+            cfg.profile,
+            SharingProfile::LanShare | SharingProfile::UpstreamOnly
+        ) {
+            return Err(format!(
+                "--libp2p-mainline-rendezvous is PUBLIC-network participation and is refused under \
+                 {} (the Wave-2c privacy contract requires {} to emit ZERO packets to public \
+                 DHT/Mainline infrastructure). Use --profile consume-only to fetch from peers over \
+                 the public network, or drop the flag.",
+                cfg.profile, cfg.profile
+            ));
+        }
+    }
+
     Ok(cfg)
 }
 
@@ -652,7 +716,14 @@ fn contract_request(cfg: &Config) -> ContractRequest {
         // --libp2p-mdns` report consume-only instead of the old upstream-only/mDNS-active
         // inconsistency. An explicit `--profile upstream-only --libp2p-mdns` still fails CLOSED at
         // the compat-shim cross-check above (declared upstream-only != implied consume-only).
-        has_bootstrap: !cfg.libp2p_bootstrap.is_empty() || cfg.libp2p_mdns,
+        // TASK-258: the Mainline rendezvous is ALSO a DHT ENTRY PATH (it learns member addresses
+        // and feeds them to bootstrap), so a bare `--libp2p-mainline-rendezvous` derives
+        // CONSUME-ONLY exactly like `--libp2p-mdns` — and `--profile upstream-only
+        // --libp2p-mainline-rendezvous` therefore fails CLOSED at the compat-shim cross-check
+        // (declared upstream-only != implied consume-only), the same mechanism mDNS relies on.
+        has_bootstrap: !cfg.libp2p_bootstrap.is_empty()
+            || cfg.libp2p_mdns
+            || cfg.libp2p_mainline_rendezvous,
     }
 }
 
@@ -692,6 +763,7 @@ fn check_runtime_preconditions(cfg: &Config) -> Result<(), String> {
     } else if cfg.profile == SharingProfile::ConsumeOnly
         && cfg.libp2p_bootstrap.is_empty()
         && !cfg.libp2p_mdns
+        && !cfg.libp2p_mainline_rendezvous
     {
         // CONSUME-ONLY intends to fetch from peers, so it needs an ENTRY PATH to the DHT.
         // TASK-257: `--libp2p-mdns` IS such an entry path (a same-scope LAN neighbour is
@@ -700,7 +772,7 @@ fn check_runtime_preconditions(cfg: &Config) -> Result<(), String> {
         // bootstrap for the LAN case. Without EITHER, a consumer can never find anyone; UPSTREAM-ONLY
         // needs neither (it is pure HTTP fallback) - the guard keys off the profile, not "non-provider".
         return Err(
-            "consume-only requires an entry path to the DHT: at least one --libp2p-bootstrap <PeerId>@<multiaddr>, OR --libp2p-mdns for zero-config LAN discovery. For pure HTTP fallback use --profile upstream-only with neither".into(),
+            "consume-only requires an entry path to the DHT: at least one --libp2p-bootstrap <PeerId>@<multiaddr>, OR --libp2p-mdns for zero-config LAN discovery, OR --libp2p-mainline-rendezvous (with --libp2p-mainline-bootstrap) for public Mainline rendezvous. For pure HTTP fallback use --profile upstream-only with none".into(),
         );
     } else if cfg.profile == SharingProfile::Router && cfg.libp2p_listen.is_empty() {
         // TASK-241: a router is a kad-server + relay OTHERS reach - it must BIND a transport, so a
@@ -1674,6 +1746,8 @@ mod bootstrap_guard_tests {
             libp2p_external_addresses: Vec::new(),
             libp2p_scope: None,
             libp2p_mdns: false,
+            libp2p_mainline_rendezvous: false,
+            libp2p_mainline_bootstrap: Vec::new(),
             libp2p_identity_seed: None,
             libp2p_provider: true,
             libp2p_seed_nar: Vec::new(),
@@ -2246,6 +2320,86 @@ mod operator_contract_tests {
     fn explicit_upstream_only_plus_mdns_is_refused() {
         let Err(err) = parse_config(args(&["--profile", "upstream-only", "--libp2p-mdns"])) else {
             panic!("--profile upstream-only + --libp2p-mdns must fail closed");
+        };
+        assert!(
+            err.contains("disagrees") && err.contains("consume-only"),
+            "the refusal must name the upstream-only/consume-only disagreement: {err}"
+        );
+    }
+
+    /// TASK-258 SPIKE: a bare `--libp2p-mainline-rendezvous` (with a local Mainline bootstrap) is a
+    /// DHT ENTRY PATH, so it derives CONSUME-ONLY (public-network participation), not upstream-only.
+    /// MUTATION: dropping `cfg.libp2p_mainline_rendezvous` from `has_bootstrap` re-derives
+    /// upstream-only and this assertion reddens.
+    #[test]
+    fn bare_mainline_rendezvous_is_consume_only() {
+        let cfg = parse_config(args(&[
+            "--libp2p-mainline-rendezvous",
+            "--libp2p-mainline-bootstrap",
+            "127.0.0.1:16881",
+        ]))
+        .expect("bare --libp2p-mainline-rendezvous parses");
+        assert_eq!(
+            cfg.profile,
+            SharingProfile::ConsumeOnly,
+            "the Mainline rendezvous is a DHT entry path => consume-only, not upstream-only"
+        );
+        check_runtime_preconditions(&cfg)
+            .expect("consume-only with the rendezvous and no --libp2p-bootstrap must be accepted");
+    }
+
+    /// TASK-258: there is NO default public router, so an enabled rendezvous with no local Mainline
+    /// bootstrap fails CLOSED. MUTATION: removing the requires-bootstrap check lets it parse.
+    #[test]
+    fn mainline_rendezvous_requires_local_bootstrap() {
+        let Err(err) = parse_config(args(&["--libp2p-mainline-rendezvous"])) else {
+            panic!(
+                "--libp2p-mainline-rendezvous with no --libp2p-mainline-bootstrap must fail closed"
+            );
+        };
+        assert!(
+            err.contains("requires at least one --libp2p-mainline-bootstrap"),
+            "the refusal must name the missing local Mainline entry point: {err}"
+        );
+    }
+
+    /// TASK-258 AC#5: the Mainline rendezvous is PUBLIC-network participation and is REFUSED
+    /// fail-closed under lan-share (a give-side zero-egress profile). MUTATION: removing the
+    /// LanShare arm of the refusal lets a lan-share node also do public Mainline traffic — the
+    /// exact zero-egress violation the Wave-2c contract forbids — and this reddens.
+    #[test]
+    fn mainline_rendezvous_refused_under_lan_share() {
+        let Err(err) = parse_config(args(&[
+            "--libp2p-provider",
+            "--libp2p-listen",
+            "/ip4/127.0.0.1/tcp/0",
+            "--libp2p-seed-nar",
+            &format!("{APP_NAR_HASH}=/tmp/app.nar"),
+            "--libp2p-mainline-rendezvous",
+            "--libp2p-mainline-bootstrap",
+            "127.0.0.1:16881",
+        ])) else {
+            panic!("lan-share + --libp2p-mainline-rendezvous must fail closed");
+        };
+        assert!(
+            err.contains("refused under lan-share") && err.contains("ZERO packets"),
+            "the refusal must name the lan-share zero-egress contract: {err}"
+        );
+    }
+
+    /// TASK-258 AC#5: the explicit contradiction `--profile upstream-only
+    /// --libp2p-mainline-rendezvous` fails CLOSED — caught at the compat-shim cross-check (declared
+    /// upstream-only != implied consume-only), the same mechanism that guards mDNS.
+    #[test]
+    fn explicit_upstream_only_plus_mainline_rendezvous_is_refused() {
+        let Err(err) = parse_config(args(&[
+            "--profile",
+            "upstream-only",
+            "--libp2p-mainline-rendezvous",
+            "--libp2p-mainline-bootstrap",
+            "127.0.0.1:16881",
+        ])) else {
+            panic!("--profile upstream-only + the rendezvous must fail closed");
         };
         assert!(
             err.contains("disagrees") && err.contains("consume-only"),
