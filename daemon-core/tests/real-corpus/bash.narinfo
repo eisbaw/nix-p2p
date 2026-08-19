@@ -1,0 +1,10 @@
+StorePath: /nix/store/00zrahbb32nzawrmv9sjxn36h7qk9vrs-bash-5.2p37
+URL: nar/08lg95m879r3yarkg6ndjg3db9an3bzg5ha9iba2vd8hfrw06q93.nar.xz
+Compression: xz
+FileHash: sha256:08lg95m879r3yarkg6ndjg3db9an3bzg5ha9iba2vd8hfrw06q93
+FileSize: 448312
+NarHash: sha256:0hbgkq56i09xjh7jkm3z1lwgbrhwazkyab7mw108m0fp0f59dj48
+NarSize: 1654112
+References: 00zrahbb32nzawrmv9sjxn36h7qk9vrs-bash-5.2p37 q4wq65gl3r8fy746v9bbwgx4gzn0r2kl-glibc-2.40-66
+Deriver: c8dsr967ap3j1l01l565w926bahlxpmc-bash-5.2p37.drv
+Sig: cache.nixos.org-1:DCeO+o0Q4DlnCPr8TeBZE77GhRlm11H9x609XtU7rUS69am2qkhX4zTsK4URTHG/vEMX4avP8HVcIHwXHq3+CQ==

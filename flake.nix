@@ -69,6 +69,12 @@
         name = "source";
         filter = path: type:
           (builtins.match ".*/tests/golden/.*\\.json$" path != null)
+          # TASK-254: the vendored REAL cache.nixos.org narinfo corpus, which
+          # daemon-core/tests/real_corpus_narinfo.rs `include_str!`s so the shipped
+          # parse+rewrite path is conformance-tested against real xz/zstd shapes
+          # inside the sandbox - not only the mock `Compression: none` fixtures.
+          # Tracked source inputs (unlike the generated fixture cache).
+          || (builtins.match ".*/tests/real-corpus/.*\\.narinfo$" path != null)
           || (builtins.match ".*/artifacts/profile-budget-v1\\.json$" path != null)
           || (builtins.match ".*/vendor/libp2p-stream/(README\\.md|LICENSE)$" path != null)
           || (builtins.match ".*/vendor/iroh/(README\\.md|PATCH-PROVENANCE\\.md|LICENSE-(MIT|APACHE|BSD3)|\\.cargo_vcs_info\\.json)$" path != null)

@@ -1,0 +1,9 @@
+StorePath: /nix/store/5k1cggdm36x8mr0pldpqdfnk15vs7371-coreutils-full-9.11-info
+URL: nar/0yd3lg4nyfnkcs84ij0kz0falh26lw908b0pakxfbzcy46rjns45.nar.zst
+Compression: zstd
+FileHash: sha256:0gn17w1g2fjq1d2m7yd1xg0pgfsxk1dwfc4b6cwm6zx8ga6k34px
+FileSize: 262221
+NarHash: sha256:0yd3lg4nyfnkcs84ij0kz0falh26lw908b0pakxfbzcy46rjns45
+NarSize: 1059840
+Deriver: qg94qs58c7fczlzgprf4j9p29zhz25zk-coreutils-full-9.11.drv
+Sig: cache.nixos.org-1:Ct2qqpB44YU9FYGOXQ6SL8kULJy2ytJcdatKuZ8xKTIh8YDrKzevdwioje7W4AIWeROBgV8moi19gBozaL0mAw==
