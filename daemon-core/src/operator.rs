@@ -1138,7 +1138,7 @@ impl OperatorContract {
         }
         out.push(String::new());
 
-        // TASK-120 AC#10: the frozen, content-hashed, owner-reviewed per-profile budget artifact is
+        // TASK-120 AC#10: the frozen, content-hashed per-profile budget artifact is
         // the ONE source of truth these effective controls parity-check against. Surfacing it here
         // makes the FULL declared budget (upload/RAM/disk/fd/discovery/announce) visible, and its
         // fail-closed verification (hash + normative envelope + parity) runs on the running node.
@@ -1844,10 +1844,12 @@ mod tests {
         assert!(p.contains("frozen profile-budget artifact"));
         assert!(p.contains("single_nar_bytes_uncompressed_nar=268435456"));
         // Enforced fields are marked enforced; declared-only ceilings are marked as such so the
-        // surface never advertises a phantom bound as effective (honesty fix).
-        assert!(p.contains("single_nar_bytes_uncompressed_nar=268435456  [enforced]"));
+        // surface never advertises a phantom bound as effective (honesty fix). announce_count is
+        // labelled operator-overridable, not enforced.
+        assert!(p.contains("single_nar_bytes_uncompressed_nar=268435456  [enforced"));
         assert!(p.contains("transient_ram_bytes_ram=268435456  [declared ceiling"));
         assert!(p.contains("open_fds_count=4096  [declared ceiling"));
+        assert!(p.contains("announce_count=256  [operator-overridable"));
         // Default privacy stance is stated.
         assert!(p.contains("NEVER exported unless diagnostics_opt_in"));
     }

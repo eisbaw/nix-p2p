@@ -654,6 +654,26 @@ fn derive_contract(config: &Config) -> Result<OperatorContract, String> {
     Ok(contract)
 }
 
+/// TASK-120 AC#10 (+ codex #1): the full fail-closed budget contract for the composite daemon,
+/// extracted so it is unit-testable (the startup path AND a bite test call THIS). It runs the two
+/// checks whose conjunction makes the frozen envelope binding on the running node:
+///  1. the frozen artifact verify — content hash (freeze/identity), normative envelope, parity vs
+///     the running `contract.caps`;
+///  2. the EFFECTIVE serve-budget ceiling — the CLI-overridable values that actually reach
+///     `ServeBudget` on BOTH serve paths (`config.iroh_max_*`) must be within the frozen envelope,
+///     so an override can only TIGHTEN it. This is the check that closes the runtime bypass where
+///     `--iroh-max-serve-nar-bytes 536870912` would serve 512 MiB while a defaults-only verify passed.
+fn enforce_budget_contract(contract: &OperatorContract, config: &Config) -> Result<(), String> {
+    daemon::profile_budget::verify(contract.profile, &contract.caps).map_err(|e| e.to_string())?;
+    daemon::profile_budget::check_serve_ms_within_envelope(
+        config.iroh_max_serve_nar_bytes,
+        config.iroh_max_inflight_nar_bytes,
+        config.iroh_max_serve_duration_ms,
+    )
+    .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
 impl Default for Config {
     fn default() -> Self {
         Config {
@@ -2547,17 +2567,30 @@ async fn main() -> ExitCode {
             return ExitCode::from(2);
         }
     };
-    // TASK-120 AC#7: `--preflight` is a pure static one-shot - render and EXIT before any bind.
+    // TASK-120 AC#10 (+ codex #1): the full fail-closed budget contract. TWO checks:
+    //  (1) the frozen artifact verify — hash (freeze/identity), normative envelope, parity vs caps;
+    //  (2) the EFFECTIVE serve-override ceiling — the values that ACTUALLY reach `ServeBudget`
+    //      (`config.iroh_max_*`, CLI-overridable at :965) must be within the frozen envelope, so an
+    //      override can only TIGHTEN it, never loosen it. Without (2) a `--iroh-max-serve-nar-bytes
+    //      536870912` would serve 512 MiB while verify (which checks defaults) passed — the runtime
+    //      bypass codex found. This guards BOTH serve paths (iroh :1496, libp2p :1995), which read
+    //      the same config fields.
+    let budget_check = || enforce_budget_contract(&contract, &config);
+
+    // TASK-120 AC#7: `--preflight` is a static one-shot - render and EXIT. codex #5b: it must EXIT
+    // NONZERO when the budget contract fails, so automation that checks only preflight's status
+    // cannot accept a drifted/over-envelope budget (fail-OPEN).
     if config.preflight {
         println!("{}", contract.preflight());
+        if let Err(err) = budget_check() {
+            eprintln!("daemon: profile-budget contract rejected: {err}");
+            return ExitCode::FAILURE;
+        }
         return ExitCode::SUCCESS;
     }
 
-    // TASK-120 AC#10: fail-closed on the frozen per-profile budget artifact BEFORE serving, the
-    // same gate the libp2p-primary binary applies (hash + normative envelope + parity vs the
-    // running caps). Blocks startup on a drifted/exceeded/diverged budget; a genuinely missing
-    // artifact is a BUILD-time compile error (the artifact is `include_str!`'d).
-    if let Err(err) = daemon::profile_budget::verify(contract.profile, &contract.caps) {
+    // Fail-closed BEFORE serving on the live path.
+    if let Err(err) = budget_check() {
         eprintln!("daemon: profile-budget contract rejected: {err}");
         return ExitCode::FAILURE;
     }
@@ -3013,6 +3046,48 @@ mod tests {
             DEFAULT_MAX_SERVE_DURATION.as_millis() as u64,
             caps.serve_duration_ms,
             "AC#10: libp2p-primary caps must adopt the normative 120 s serve duration"
+        );
+    }
+
+    /// codex #1 BITE (composite binary wiring): an operator serve-override that LOOSENS the frozen
+    /// 256 MiB / 1 GiB / 120 s envelope must fail the startup budget contract that the live path AND
+    /// preflight call (`enforce_budget_contract`). Proves the runtime bypass is closed: verify alone
+    /// (defaults) passed such an override before this fix.
+    #[test]
+    fn over_envelope_serve_override_is_rejected_at_startup() {
+        let contract = OperatorContract::for_profile(SharingProfile::PublicShare);
+        // Baseline: the shipped defaults (256 MiB / 1 GiB / 120 s) pass.
+        enforce_budget_contract(&contract, &Config::default())
+            .expect("the shipped defaults are within the envelope");
+        // 512 MiB single-NAR override → rejected at startup.
+        let over_single = Config {
+            iroh_max_serve_nar_bytes: 512 * 1024 * 1024,
+            ..Config::default()
+        };
+        let err = enforce_budget_contract(&contract, &over_single)
+            .expect_err("a 512 MiB serve override must be rejected");
+        assert!(
+            err.contains("exceeds the frozen normative ceiling")
+                && err.contains("single_nar_bytes_uncompressed_nar"),
+            "{err}"
+        );
+        // >1 GiB inflight override → rejected.
+        let over_inflight = Config {
+            iroh_max_inflight_nar_bytes: 2 * 1024 * 1024 * 1024,
+            ..Config::default()
+        };
+        assert!(
+            enforce_budget_contract(&contract, &over_inflight).is_err(),
+            "a >1 GiB inflight override must be rejected"
+        );
+        // 300 s serve-duration override → rejected.
+        let over_dur = Config {
+            iroh_max_serve_duration_ms: 300_000,
+            ..Config::default()
+        };
+        assert!(
+            enforce_budget_contract(&contract, &over_dur).is_err(),
+            "a 300 s serve-duration override must be rejected"
         );
     }
 

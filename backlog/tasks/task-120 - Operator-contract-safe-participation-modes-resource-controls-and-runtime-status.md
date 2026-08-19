@@ -7,7 +7,7 @@ status: In Progress
 assignee:
   - '@claude'
 created_date: '2026-08-10 22:24'
-updated_date: '2026-08-19 12:09'
+updated_date: '2026-08-19 12:24'
 labels:
   - production
   - operator
@@ -39,7 +39,7 @@ Define and implement the production operator contract for the libp2p-primary pro
 <!-- AC:BEGIN -->
 - [x] #1 A fresh install is fail-safe: upstream fallback works, while serving, publication, public DHT/Mainline participation and third-party discovery are OFF until the operator explicitly selects a sharing profile.
 - [x] #2 The NixOS module exposes validated upstream-only, consume-only, LAN-share and public-share profiles plus explicit Iroh mechanism overrides; invalid or privacy-contradictory combinations fail evaluation/startup precisely.
-- [x] #3 Upload rate/bytes, concurrent serves, per-NAR/inflight memory, hold-query work, discovery deadline, announce volume, disk and file-descriptor budgets are bounded, documented and visible in effective configuration.
+- [ ] #3 Upload rate/bytes, concurrent serves, per-NAR/inflight memory, hold-query work, discovery deadline, announce volume, disk and file-descriptor budgets are bounded, documented and visible in effective configuration.
 - [x] #4 A local status surface reports stable NodeId, enabled discovery/transport/codec mechanisms, bootstrap health, holder counts, direct/hole-punched/relay path, miss versus unavailable, fallback reasons and current budget use.
 - [x] #5 Metrics/logs use bounded-cardinality labels and never export StorePath, NarHash, peer IP or full NodeId by default; opt-in diagnostics carry an explicit privacy warning and lifecycle.
 - [x] #6 Restart, dependency outage, exhausted budget and kill-switch drills yield actionable health while S2 holds; the registry contract lets TASK-119 add BitTorrent without redefining profiles or weakening safe defaults.
@@ -69,4 +69,15 @@ GATE NUMBERS: fmt green; clippy -D warnings green (daemon-core/libp2p/daemon); d
 RESIDUAL: TASK-264 (Medium) - wire runtime enforcement for the declared-only fields (upload rate/bytes, RAM, disk bytes, fd, concurrent-serve count); today they are frozen+hashed+surfaced (declared ceilings) but not runtime-enforced, consistent with the ResourceCaps no-phantom-bound honesty rule.
 
 EVIDENCE for #4/#5/#6 (TASK-240, unchanged by this cycle, re-verified green): #4 status surface daemon-core/src/observ.rs render_status_reports_live_state_redacted + operator.rs status_reports_miss_vs_unavailable_and_budget; #5 redaction observ.rs metrics_redact_node_id_by_default_reveal_under_diagnostics + metric_labels_are_only_the_fixed_vocabulary (new budget fields add no StorePath/NarHash/IP/NodeId); #6 drills daemon-libp2p/tests/operator_drills.rs 4 drills + Mechanism::registry contract.
+
+codex DEEP review NOGO -> fixed all 5 findings (round 2).
+#1 (CRITICAL runtime bypass): composite daemon serve budget is built from CLI-overridable config.iroh_max_* (daemon/src/main.rs:1496 iroh, :1995 libp2p) but verify checked ResourceCaps::default(). Added profile_budget::check_serve_within_envelope + check_serve_ms_within_envelope (BudgetError::OverrideExceedsEnvelope): an override may only TIGHTEN the frozen 256MiB/1GiB/120s envelope. Extracted enforce_budget_contract() in the composite (verify + effective-serve ceiling), called on BOTH the live path and preflight, guarding both serve paths (they read the same config fields). daemon-libp2p has NO serve-size override (provider_serve_budget()=ResourceCaps::default().serve_budget(), main.rs:871) so its serve envelope was already enforced; added the same ceiling check as a structural guard-rail. PUSHBACK: the over-serve-override launch bite is composite-only (libp2p has no such flag).
+#2 (announce mislabel): announce_count relabeled [operator-overridable - runtime-limited, not envelope-bounded] (it IS runtime-limited but operator-chosen via --libp2p-announce-budget and NOT a safety envelope; it is self-limiting politeness). Removed the [enforced] label. Judgment (Mark-emulator): announce volume is politeness, not a network-safety ceiling, so relabel over hard-ceiling.
+#3: UNCHECKED AC#3 (14 declared-not-enforced fields; TASK-264 completes it).
+#4 (owner-review overclaim): reworded artifact JSON review note + all code sites - the hash pins BYTES (freeze/identity), it does NOT constitute human owner review/authorization. Hash re-frozen f38fbebdbf99b0fb0b2846bf99d9c84a36466950c9e7aeb8901d21db89128c4b.
+#5a: module doc states the runtime missing path is compile-time (include_str!) and PROFILE_BUDGET_ARTIFACT_MISSING is for the path-based tooling/Stage-B loader only.
+#5b (fail-OPEN preflight): both binaries preflight now EXIT NONZERO when the budget contract fails (was exit 0 after printing).
+
+LAUNCH-LEVEL BITE (real binaries): daemon --preflight --iroh-max-serve-nar-bytes 536870912 -> exit 1 (single_nar exceeds ceiling 268435456); --iroh-max-serve-duration-ms 300000 -> exit 1 (serve_duration_ns 300000000000 exceeds 120000000000); defaults -> exit 0; daemon-libp2p --preflight -> exit 0. Plus unit bites: profile_budget::effective_serve_override_over_envelope_fails_closed; daemon::over_envelope_serve_override_is_rejected_at_startup.
+GATE r3: fmt+clippy green; daemon-core --lib 316; profile_budget 19; operator 24; libp2p preflight 2 + drills 4; daemon budget 3; no-floats green. e2e re-running.
 <!-- SECTION:NOTES:END -->

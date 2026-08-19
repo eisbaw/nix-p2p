@@ -92,6 +92,7 @@ pub use profile_budget::{
     BudgetError, ENVELOPE_MAX_INFLIGHT_NAR_BYTES, ENVELOPE_MAX_SERVE_DURATION_NS,
     ENVELOPE_MAX_SINGLE_NAR_BYTES, EXPECTED_PROFILE_BUDGET_HASH, PROFILE_BUDGET_ARTIFACT_MISSING,
     PROFILE_BUDGET_ARTIFACT_PATH, ProfileBudget, ProfileBudgetArtifact,
+    check_serve_ms_within_envelope, check_serve_within_envelope,
 };
 // The peer-fabric DeriveBudget POLICY type (mirrors ServeBudget); re-exported so the
 // binaries construct a PeerDeriveLedger from their ResourceCaps (TASK-229).

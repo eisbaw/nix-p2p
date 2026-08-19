@@ -1319,11 +1319,37 @@ async fn main() -> ExitCode {
         }
     };
 
+    // TASK-120 AC#10 (+ codex #1/#5b): the full fail-closed budget contract — the frozen artifact
+    // verify (hash/identity + normative envelope + parity) AND the EFFECTIVE serve-budget ceiling
+    // (an override may only tighten the envelope). This binary's serve budget is the fixed
+    // `provider_serve_budget()` (= `ResourceCaps::default().serve_budget()`, no serve-size CLI
+    // override), so the ceiling check is a guard-rail today, not a live gate — but it makes the
+    // invariant "whatever reaches ServeBudget is within the envelope" hold structurally here too,
+    // and it bites if a future flag ever loosens it.
+    let budget_check = || -> Result<(), String> {
+        daemon_core::profile_budget::verify(contract.profile, &contract.caps)
+            .map_err(|e| e.to_string())?;
+        let sb = provider_serve_budget();
+        daemon_core::profile_budget::check_serve_ms_within_envelope(
+            sb.max_nar_bytes_uncompressed_nar,
+            sb.max_inflight_bytes_uncompressed_nar,
+            sb.max_serve_duration.as_millis() as u64,
+        )
+        .map_err(|e| e.to_string())?;
+        Ok(())
+    };
+
     // TASK-120 AC#7 + fix #3: `--preflight` renders the contract and EXITS BEFORE any
     // network-precondition guard (a pure static read of the INTENDED profile), so e.g.
     // `daemon-libp2p --preflight` shows the upstream-only preflight without demanding a bootstrap.
+    // codex #5b: preflight must EXIT NONZERO when the budget contract fails, so automation that
+    // checks only preflight's status cannot accept a drifted/over-envelope budget (fail-OPEN).
     if cfg.preflight {
         println!("{}", contract.preflight());
+        if let Err(err) = budget_check() {
+            eprintln!("daemon-libp2p: profile-budget contract rejected: {err}");
+            return ExitCode::from(2);
+        }
         return ExitCode::SUCCESS;
     }
 
@@ -1335,14 +1361,14 @@ async fn main() -> ExitCode {
         return ExitCode::from(2);
     }
 
-    // TASK-120 AC#10: fail-closed on the frozen per-profile budget artifact BEFORE serving. This
-    // verifies the embedded artifact's content hash (owner-review marker), the normative envelope
-    // (256 MiB / 1 GiB / 120 s), and that the artifact's enforced fields match the running caps. A
-    // drifted/exceeded/diverged budget BLOCKS startup with a precise reason — never a silent
-    // zero/unbounded default. (A genuinely MISSING artifact is caught earlier, at BUILD time: the
-    // artifact is `include_str!`'d, so its absence is a compile error; the runtime
-    // PROFILE_BUDGET_ARTIFACT_MISSING token is for the path-based tooling loader.)
-    if let Err(err) = daemon_core::profile_budget::verify(contract.profile, &contract.caps) {
+    // TASK-120 AC#10: fail-closed on the frozen per-profile budget contract BEFORE serving (the same
+    // `budget_check` preflight ran): content hash (freeze/identity), normative envelope, parity vs
+    // the running caps, and the effective serve-budget ceiling. A drifted/exceeded/diverged budget
+    // BLOCKS startup with a precise reason — never a silent zero/unbounded default. (A genuinely
+    // MISSING artifact is caught earlier, at BUILD time: the artifact is `include_str!`'d, so its
+    // absence is a compile error; the runtime PROFILE_BUDGET_ARTIFACT_MISSING token is for the
+    // path-based tooling loader.)
+    if let Err(err) = budget_check() {
         eprintln!("daemon-libp2p: profile-budget contract rejected: {err}");
         return ExitCode::from(2);
     }

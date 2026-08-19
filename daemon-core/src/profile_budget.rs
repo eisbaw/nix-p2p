@@ -4,15 +4,19 @@
 //! ## What this is
 //!
 //! [`artifacts/profile-budget-v1.json`](../../../artifacts/profile-budget-v1.json) is the ONE
-//! owner-reviewed source of truth for the numeric operator budget of EVERY [`SharingProfile`]. It
+//! FROZEN source of truth for the numeric operator budget of EVERY [`SharingProfile`]. It
 //! is a versioned JSON document of TYPED INTEGER, unit-suffixed fields (bytes/octets/counts/ns —
-//! never a float). The daemon EMBEDS it and, before serving, verifies it against three independent
+//! never a float). The daemon EMBEDS it and, before serving, verifies it against these independent
 //! oracles, any of which FAIL-CLOSES startup:
 //!
-//! 1. **Content hash** — the daemon recomputes `BLAKE3(JCS(artifact))` and compares it to the
-//!    checked-in [`EXPECTED_PROFILE_BUDGET_HASH`]. This is how "owner-reviewed" is represented
-//!    operationally: a human who revises a budget MUST re-freeze the hash, and the daemon refuses
-//!    any artifact whose bytes drift from the reviewed hash ([`BudgetError::HashDrift`]).
+//! 1. **Content hash (freeze/identity — NOT human authorization)** — the daemon recomputes
+//!    `BLAKE3(JCS(artifact))` and compares it to the checked-in [`EXPECTED_PROFILE_BUDGET_HASH`].
+//!    This pins the artifact's BYTES: any drift from the frozen value fails closed
+//!    ([`BudgetError::HashDrift`]), and revising a budget forces a deliberate re-freeze of the
+//!    constant (a reviewable one-line diff). It proves IDENTITY/immutability, NOT that a human
+//!    approved the numbers — a content hash cannot attest human authorization. Treating the frozen
+//!    hash as a proxy for "owner sign-off" would overclaim; a real attestation (signed approval) is
+//!    a separate mechanism not built here.
 //! 2. **Normative envelope** — every profile's single/inflight served NarSize and serve duration
 //!    are checked against the PRD.md:839-842 admission envelope inherited by every sharing profile:
 //!    **256 MiB single, 1 GiB inflight, 120 s**. The artifact may not even DECLARE a looser
@@ -76,11 +80,12 @@ pub const PROFILE_BUDGET_ARTIFACT_JSON: &str =
 /// The relative repo path of the frozen artifact (for status/preflight display + tooling).
 pub const PROFILE_BUDGET_ARTIFACT_PATH: &str = "artifacts/profile-budget-v1.json";
 
-/// The owner-reviewed content hash: `BLAKE3(JCS(artifact))`, lowercase hex. A human who revises a
-/// budget re-runs [`content_hash`] and updates this constant — THAT is the review gate. The daemon
-/// fail-closes on any drift from this value.
+/// The frozen content hash: `BLAKE3(JCS(artifact))`, lowercase hex. It pins the artifact's BYTES —
+/// a human who revises a budget re-runs [`content_hash`] and updates this constant, and the daemon
+/// fail-closes on any drift. It proves the artifact has not changed since this value was frozen; it
+/// does NOT prove a human reviewed or authorized the numbers (a content hash cannot attest that).
 pub const EXPECTED_PROFILE_BUDGET_HASH: &str =
-    "bb2a819c302fd7809d67b5e353b3e0d821f7d0ba50165634d44912692d056506";
+    "f38fbebdbf99b0fb0b2846bf99d9c84a36466950c9e7aeb8901d21db89128c4b";
 
 /// The stable fail-closed token for a missing artifact (PRD.md:945). Emitted in the
 /// [`BudgetError::Missing`] display so an operator/harness sees exactly this string.
@@ -155,13 +160,14 @@ pub struct NormativeEnvelope {
     pub max_serve_duration_ns: u64,
 }
 
-/// The owner-review marker (documentary; not part of any budget comparison).
+/// The freeze/revision marker (documentary; not part of any budget comparison, and NOT a human
+/// authorization — the hash proves the bytes are frozen, not that anyone approved them).
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct ReviewMarker {
-    /// A human-readable revision label the owner bumps on re-freeze.
+    /// A human-readable revision label bumped on each deliberate re-freeze.
     pub reviewed_revision: String,
-    /// A human-readable note describing what "owner-reviewed" means here.
+    /// A human-readable note describing what the freeze hash does (and does not) attest.
     pub reviewed_note: String,
 }
 
@@ -171,7 +177,7 @@ pub struct ReviewMarker {
 pub struct ProfileBudgetArtifact {
     /// The schema version (bumped on any incompatible field change).
     pub schema_version: u32,
-    /// The owner-review marker.
+    /// The freeze/revision marker.
     pub review: ReviewMarker,
     /// The declared normative envelope (must equal the `ENVELOPE_MAX_*` constants).
     pub envelope: NormativeEnvelope,
@@ -233,6 +239,18 @@ pub enum BudgetError {
         /// The value the runtime caps enforce.
         runtime: u64,
     },
+    /// An EFFECTIVE (post-CLI-override) serve budget value exceeds the frozen normative envelope.
+    /// This is the runtime-bypass guard: an operator override may only TIGHTEN the frozen ceiling,
+    /// never loosen it, so whatever value actually reaches `ServeBudget` is provably within the
+    /// envelope on every serve path.
+    OverrideExceedsEnvelope {
+        /// Which effective field exceeded (`single_nar_bytes_uncompressed_nar`, ...).
+        field: &'static str,
+        /// The effective (override) value.
+        value: u64,
+        /// The frozen normative ceiling it exceeded.
+        ceiling: u64,
+    },
     /// An internal integer overflow while converting a runtime cap to `_ns` for comparison
     /// (fail-closed rather than wrap).
     Overflow {
@@ -282,6 +300,15 @@ impl std::fmt::Display for BudgetError {
                 f,
                 "profile '{profile}' budget field {field}: artifact froze {artifact} but runtime \
                  caps enforce {runtime} (divergence)"
+            ),
+            BudgetError::OverrideExceedsEnvelope {
+                field,
+                value,
+                ceiling,
+            } => write!(
+                f,
+                "effective serve override {field}={value} exceeds the frozen normative ceiling \
+                 {ceiling} (an override may only tighten the envelope, never loosen it)"
             ),
             BudgetError::Overflow { what } => {
                 write!(f, "integer overflow computing {what}")
@@ -453,6 +480,57 @@ pub fn parity_with_caps(
     Ok(())
 }
 
+/// The runtime-bypass guard (codex #1): the EFFECTIVE serve budget that will actually reach
+/// [`peer_fabric::ServeBudget`] — AFTER any CLI override — must be within the frozen normative
+/// envelope. An override may only TIGHTEN it. A `single`/`inflight`/`serve_duration_ns` above the
+/// frozen ceiling fails closed with [`BudgetError::OverrideExceedsEnvelope`], so a
+/// `--iroh-max-serve-nar-bytes 536870912` (512 MiB) can never widen the shipped 256 MiB ceiling.
+/// Call this at startup with the SAME values the binary will hand to `ServeBudget`, on every serve
+/// path.
+pub fn check_serve_within_envelope(
+    single_nar_bytes_uncompressed_nar: u64,
+    inflight_nar_bytes_uncompressed_nar: u64,
+    serve_duration_ns: u64,
+) -> Result<(), BudgetError> {
+    if single_nar_bytes_uncompressed_nar > ENVELOPE_MAX_SINGLE_NAR_BYTES {
+        return Err(BudgetError::OverrideExceedsEnvelope {
+            field: "single_nar_bytes_uncompressed_nar",
+            value: single_nar_bytes_uncompressed_nar,
+            ceiling: ENVELOPE_MAX_SINGLE_NAR_BYTES,
+        });
+    }
+    if inflight_nar_bytes_uncompressed_nar > ENVELOPE_MAX_INFLIGHT_NAR_BYTES {
+        return Err(BudgetError::OverrideExceedsEnvelope {
+            field: "inflight_nar_bytes_uncompressed_nar",
+            value: inflight_nar_bytes_uncompressed_nar,
+            ceiling: ENVELOPE_MAX_INFLIGHT_NAR_BYTES,
+        });
+    }
+    if serve_duration_ns > ENVELOPE_MAX_SERVE_DURATION_NS {
+        return Err(BudgetError::OverrideExceedsEnvelope {
+            field: "serve_duration_ns",
+            value: serve_duration_ns,
+            ceiling: ENVELOPE_MAX_SERVE_DURATION_NS,
+        });
+    }
+    Ok(())
+}
+
+/// [`check_serve_within_envelope`] taking serve duration in MILLISECONDS (the CLI unit), converting
+/// fail-closed to ns (a huge ms value saturates and therefore correctly EXCEEDS the ceiling).
+pub fn check_serve_ms_within_envelope(
+    single_nar_bytes_uncompressed_nar: u64,
+    inflight_nar_bytes_uncompressed_nar: u64,
+    serve_duration_ms: u64,
+) -> Result<(), BudgetError> {
+    let serve_duration_ns = serve_duration_ms.saturating_mul(1_000_000);
+    check_serve_within_envelope(
+        single_nar_bytes_uncompressed_nar,
+        inflight_nar_bytes_uncompressed_nar,
+        serve_duration_ns,
+    )
+}
+
 /// The full fail-closed verification for a running binary: load the EMBEDDED artifact, verify its
 /// content hash against the reviewed [`EXPECTED_PROFILE_BUDGET_HASH`], check the normative envelope
 /// for every profile, then parity-check `profile`'s enforced fields against `caps`. Returns the
@@ -534,117 +612,140 @@ pub fn preflight_lines(profile: SharingProfile, caps: &ResourceCaps) -> Vec<Stri
 /// never misled into reading it as an enforced ceiling (the `effective_lines` honesty rule extended
 /// to the artifact surface).
 const DECLARED_ONLY_MARKER: &str = "  [declared ceiling — not yet runtime-enforced; TASK-264]";
-/// The marker appended to a runtime-enforced budget line (the admission-envelope + announce fields
-/// the peer-fabric budgets actually gate on).
-const ENFORCED_MARKER: &str = "  [enforced]";
+/// The marker for a frozen, ENVELOPE-BOUNDED field: it is parity-checked against the running caps
+/// and its effective (post-override) value is guarded to never exceed the frozen ceiling
+/// ([`check_serve_within_envelope`]). These are the single/inflight served NarSize, serve duration,
+/// and discovery deadline.
+const ENFORCED_MARKER: &str = "  [enforced — envelope-bounded]";
+/// The marker for `announce_count`: it IS applied by the runtime announce limiter, but its value is
+/// OPERATOR-CHOSEN (`--libp2p-announce-budget`) and is NOT bounded by the safety envelope — it is
+/// self-limiting politeness (how much this node advertises of what it fetched), not a network-safety
+/// ceiling. Labelled honestly so it is not read as a frozen envelope bound.
+const ANNOUNCE_TUNABLE_MARKER: &str =
+    "  [operator-overridable — runtime-limited, not envelope-bounded]";
+
+/// How a budget field's runtime status is surfaced on the preflight line, so a label never lies.
+#[derive(Clone, Copy)]
+enum FieldTag {
+    /// Frozen, parity-checked, effective value envelope-guarded.
+    Enforced,
+    /// Applied at runtime but operator-chosen and not envelope-bounded (announce_count).
+    AnnounceTunable,
+    /// Frozen + hashed ceiling with no runtime limiter yet (TASK-264).
+    DeclaredOnly,
+}
 
 /// One `key=value` integer line per artifact field, stable order — greppable/diffable. Each line is
-/// tagged ENFORCED (the admission-envelope + announce fields the peer-fabric budgets gate on) or
-/// declared-only (a frozen owner-reviewed ceiling whose runtime shaper is TASK-264), so the surface
-/// cannot advertise a phantom bound as if it were effective.
+/// tagged so the surface cannot advertise a phantom bound as if it were an enforced envelope ceiling.
 fn budget_lines(b: &ProfileBudget) -> Vec<String> {
-    // (key=value, enforced?). The enforced set is exactly the peer-fabric-gated fields: single /
-    // inflight served NarSize, serve duration, discovery deadline, and the (tunable) announce count.
-    let rows: [(String, bool); 19] = [
+    use FieldTag::{AnnounceTunable, DeclaredOnly, Enforced};
+    let rows: [(String, FieldTag); 19] = [
         (
             format!(
                 "upload_payload_bytes_compressed_wire={}",
                 b.upload_payload_bytes_compressed_wire
             ),
-            false,
+            DeclaredOnly,
         ),
         (
             format!(
                 "upload_total_bytes_compressed_wire={}",
                 b.upload_total_bytes_compressed_wire
             ),
-            false,
+            DeclaredOnly,
         ),
         (
             format!(
                 "upload_rate_bytes_compressed_wire_per_window={}",
                 b.upload_rate_bytes_compressed_wire_per_window
             ),
-            false,
+            DeclaredOnly,
         ),
         (
             format!("upload_rate_window_ns={}", b.upload_rate_window_ns),
-            false,
+            DeclaredOnly,
         ),
         (
             format!("concurrent_serves_count={}", b.concurrent_serves_count),
-            false,
+            DeclaredOnly,
         ),
         (
             format!(
                 "single_nar_bytes_uncompressed_nar={}",
                 b.single_nar_bytes_uncompressed_nar
             ),
-            true,
+            Enforced,
         ),
         (
             format!(
                 "inflight_nar_bytes_uncompressed_nar={}",
                 b.inflight_nar_bytes_uncompressed_nar
             ),
-            true,
+            Enforced,
         ),
         (
             format!("transient_ram_bytes_ram={}", b.transient_ram_bytes_ram),
-            false,
+            DeclaredOnly,
         ),
         (
             format!(
                 "apparent_disk_bytes_ondisk={}",
                 b.apparent_disk_bytes_ondisk
             ),
-            false,
+            DeclaredOnly,
         ),
         (
             format!(
                 "allocated_disk_bytes_ondisk={}",
                 b.allocated_disk_bytes_ondisk
             ),
-            false,
+            DeclaredOnly,
         ),
-        (format!("open_fds_count={}", b.open_fds_count), false),
+        (format!("open_fds_count={}", b.open_fds_count), DeclaredOnly),
         (
             format!("discovery_work_octets={}", b.discovery_work_octets),
-            false,
+            DeclaredOnly,
         ),
         (
             format!("discovery_control_octets={}", b.discovery_control_octets),
-            false,
+            DeclaredOnly,
         ),
         (
             format!("discovery_deadline_ns={}", b.discovery_deadline_ns),
-            true,
+            Enforced,
         ),
-        (format!("announce_count={}", b.announce_count), true),
+        (
+            format!("announce_count={}", b.announce_count),
+            AnnounceTunable,
+        ),
         (
             format!("announce_wire_octets={}", b.announce_wire_octets),
-            false,
+            DeclaredOnly,
         ),
         (
             format!(
                 "announce_rate_octets_per_window={}",
                 b.announce_rate_octets_per_window
             ),
-            false,
+            DeclaredOnly,
         ),
         (
             format!("announce_rate_window_ns={}", b.announce_rate_window_ns),
-            false,
+            DeclaredOnly,
         ),
-        (format!("serve_duration_ns={}", b.serve_duration_ns), true),
+        (
+            format!("serve_duration_ns={}", b.serve_duration_ns),
+            Enforced,
+        ),
     ];
     rows.into_iter()
-        .map(|(line, enforced)| {
-            if enforced {
-                format!("{line}{ENFORCED_MARKER}")
-            } else {
-                format!("{line}{DECLARED_ONLY_MARKER}")
-            }
+        .map(|(line, tag)| {
+            let marker = match tag {
+                Enforced => ENFORCED_MARKER,
+                AnnounceTunable => ANNOUNCE_TUNABLE_MARKER,
+                DeclaredOnly => DECLARED_ONLY_MARKER,
+            };
+            format!("{line}{marker}")
         })
         .collect()
 }
@@ -674,8 +775,9 @@ mod tests {
 
     #[test]
     fn embedded_artifact_hash_is_frozen() {
-        // Reviewed hash pin: if this reddens, a budget changed — RE-REVIEW then update
-        // EXPECTED_PROFILE_BUDGET_HASH. This is the owner-review gate.
+        // Freeze pin: if this reddens, a budget changed — recompute and update
+        // EXPECTED_PROFILE_BUDGET_HASH (a deliberate, reviewable one-line diff). The hash proves the
+        // bytes are frozen; it is NOT a human authorization of the numbers.
         let actual = content_hash(PROFILE_BUDGET_ARTIFACT_JSON).expect("hashable");
         assert_eq!(
             actual, EXPECTED_PROFILE_BUDGET_HASH,
@@ -748,6 +850,89 @@ mod tests {
                 "{declared} must be marked declared-only, got: {line}"
             );
         }
+        // announce_count is operator-overridable, NOT envelope-bounded — its label must say so and
+        // must NOT claim the enforced-envelope marker (codex #2: label == reality).
+        let announce = lines
+            .lines()
+            .find(|l| l.trim_start().starts_with("announce_count"))
+            .expect("announce_count line");
+        assert!(
+            announce.contains(ANNOUNCE_TUNABLE_MARKER),
+            "announce_count must be labelled operator-overridable, got: {announce}"
+        );
+        assert!(
+            !announce.contains(ENFORCED_MARKER),
+            "announce_count must NOT claim the enforced-envelope marker, got: {announce}"
+        );
+    }
+
+    // ---- codex #1 BITE: an effective over-envelope serve OVERRIDE must fail closed ----
+
+    #[test]
+    fn effective_serve_override_over_envelope_fails_closed() {
+        // The shipped defaults are within the envelope.
+        check_serve_within_envelope(
+            ENVELOPE_MAX_SINGLE_NAR_BYTES,
+            ENVELOPE_MAX_INFLIGHT_NAR_BYTES,
+            ENVELOPE_MAX_SERVE_DURATION_NS,
+        )
+        .expect("the frozen defaults are within the envelope");
+        // A 512 MiB single-NAR override exceeds the frozen 256 MiB ceiling → fail closed.
+        match check_serve_within_envelope(
+            512 * 1024 * 1024,
+            ENVELOPE_MAX_INFLIGHT_NAR_BYTES,
+            ENVELOPE_MAX_SERVE_DURATION_NS,
+        ) {
+            Err(BudgetError::OverrideExceedsEnvelope {
+                field,
+                value,
+                ceiling,
+            }) => {
+                assert_eq!(field, "single_nar_bytes_uncompressed_nar");
+                assert_eq!(value, 512 * 1024 * 1024);
+                assert_eq!(ceiling, ENVELOPE_MAX_SINGLE_NAR_BYTES);
+            }
+            other => panic!("512 MiB serve override must fail closed, got {other:?}"),
+        }
+        // An inflight override above 1 GiB fails closed.
+        assert!(matches!(
+            check_serve_within_envelope(
+                ENVELOPE_MAX_SINGLE_NAR_BYTES,
+                2 * 1024 * 1024 * 1024,
+                ENVELOPE_MAX_SERVE_DURATION_NS,
+            ),
+            Err(BudgetError::OverrideExceedsEnvelope {
+                field: "inflight_nar_bytes_uncompressed_nar",
+                ..
+            })
+        ));
+        // A 300 s serve-duration override (via the ms entry point) fails closed.
+        match check_serve_ms_within_envelope(
+            ENVELOPE_MAX_SINGLE_NAR_BYTES,
+            ENVELOPE_MAX_INFLIGHT_NAR_BYTES,
+            300_000,
+        ) {
+            Err(BudgetError::OverrideExceedsEnvelope { field, ceiling, .. }) => {
+                assert_eq!(field, "serve_duration_ns");
+                assert_eq!(ceiling, ENVELOPE_MAX_SERVE_DURATION_NS);
+            }
+            other => panic!("300 s serve override must fail closed, got {other:?}"),
+        }
+        // A huge ms value saturates rather than wrapping, and still fails closed.
+        assert!(matches!(
+            check_serve_ms_within_envelope(
+                ENVELOPE_MAX_SINGLE_NAR_BYTES,
+                ENVELOPE_MAX_INFLIGHT_NAR_BYTES,
+                u64::MAX,
+            ),
+            Err(BudgetError::OverrideExceedsEnvelope {
+                field: "serve_duration_ns",
+                ..
+            })
+        ));
+        // Tightening (a SMALLER override) is allowed.
+        check_serve_ms_within_envelope(64 * 1024 * 1024, 128 * 1024 * 1024, 30_000)
+            .expect("a tighter override must be allowed");
     }
 
     #[test]
