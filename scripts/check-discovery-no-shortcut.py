@@ -26,8 +26,12 @@ holds hash X only through kad. This guard therefore:
 THE MAINLINE-RENDEZVOUS BOUNDARY (TASK-258 SPIKE). The Mainline (BitTorrent DHT)
 rendezvous is the SAME address-bootstrap shape as mDNS, just over a different
 substrate: a node `get_peers` a well-known infohash to learn member ADDRESSES and
-hands the bare IP:port into the libp2p dial/bootstrap path. BEP5 carries IP:port
-ONLY (no PeerId, no arbitrary payload), so it structurally CANNOT answer "who holds
+hands the bare IP:port into the libp2p dial/bootstrap path. `get_peers(info_hash)`
+IS a find-peers-under-a-key call and BEP5 CAN answer "who holds key K?" for a
+BitTorrent info_hash - what makes OUR USE address-bootstrap-only is the WRAPPER, not
+BEP5's structure: we hardcode ONE well-known membership infohash and NEVER derive an
+infohash from a Nix content hash, and the returned value is a bare IP:port with no
+PeerId/payload - so it can supply member ADDRESSES but cannot answer "who holds Nix
 hash X?". So the plain-substring `rendezvous` outright-ban is REFINED exactly like
 mDNS was: a mainline/rendezvous-named region may feed the ADDRESS/dial/bootstrap
 path but BITES if it feeds `find_providers`/`get_providers` (see
@@ -47,7 +51,8 @@ proof that content discovery is Kademlia-exclusive. Two blind spots are explicit
     peers under a key). This guard permits it in the ADDRESS-bootstrap role by the
     region's naming + its sinks, so the guard alone does NOT establish that the
     rendezvous is semantically not-content-discovery; that rests on the crate
-    boundary below, plus the structural fact that BEP5 carries no content key.
+    boundary below, plus the WRAPPER fact that our use hardcodes one membership
+    infohash and derives none from a Nix content hash (BEP5 itself CAN key on a hash).
   * `FORBIDDEN_PROTOCOL_RE` matches the CANONICAL libp2p paths (`libp2p::rendezvous`,
     `rendezvous::Behaviour`, ...); it does NOT catch arbitrary aliases such as
     `use libp2p::rendezvous as rz;`. A determined rename can evade the substring arm.

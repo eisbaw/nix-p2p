@@ -7,7 +7,7 @@ status: In Progress
 assignee:
   - '@claude'
 created_date: '2026-08-18 20:54'
-updated_date: '2026-08-19 10:03'
+updated_date: '2026-08-19 10:13'
 labels:
   - libp2p
   - mainline
@@ -127,4 +127,12 @@ CODEX 258R NARROWING 2026-08-19 (cross-model gate NOGO on OVERSTATED decision-be
 5. ENUMERATION 5/5 is a HERMETIC recoverable-FRACTION, not a general enumeration RATE. In the hermetic 5-node topology a third-party observer recovered 5/5 (num=den=5, exact rational) of the announced membership from ITS OWN get_peers capture, and a values-stripped capture recovers 0/3 (vacuous-run bite fires). This proves (a) BEP5 announce EXPOSES member IPs and the analyzer recovers exactly what the wire carries, and (b) the oracle bites a handed result. It is NOT a claim about what fraction of a REAL public swarm is enumerable, nor the real-swarm wall-time (2148 ms is the hermetic single-lookup latency). Real-swarm enumeration cost is TASK-96 domain (owner-authorized two-network infra). The QUALITATIVE privacy conclusion is unchanged: BEP5 announce enumerates node MEMBERSHIP (which IPs speak nix-p2p), NOT content HOLDINGS — the frozen no-enumeration (holdings) invariant is untouched.
 
 NET: the recommendation (adopt-with-conditions), the central finding (discovers-membership-not-circuit-reachability), the client-only proof, supply-chain isolation, and the deferred AC#2/#3/#9-11 follow-ups all STAND. Only the five claim STRENGTHS above are narrowed to the evidence. Follow-ups the adopt decision must carry: semantic-not-just-naming discovery guard, real-swarm enumeration cost (96), packet-level OFF bite after live wiring, BEP44-or-dial-out for circuit-only peers.
+
+CODEX 258R2 CORRECTION 2026-08-19 (two residual over-attributions in the 258R narrowing; #2 #4 #5 passed):
+
+R2-1 NAT attribution (narrowing point 1 was still too strong). The VM topology instantiates NO relay path, so it does NOT establish that a /p2p-circuit is A ONLY reachable address. What the VM actually demonstrates is the UNMAPPED-MASQUERADE DIRECT-ADDRESS failure: an unforwarded MASQUERADE endpoint is undialable and BEP5 supplied no alternative address. It is BEP5 FORMAT (bare IP:port, no circuit multiaddr) — NOT the VM — that establishes the circuit-address limitation. So: the VM proves direct-address unreachability for an unmapped-NAT peer; BEP5 format proves it cannot carry a circuit address for the peers whose only reachable address IS a circuit. Do not read the VM as demonstrating the circuit-only case itself.
+
+R2-3 guard docstring self-contradiction (FIXED in the guard, recorded here). The docstring previously said BEP5 STRUCTURALLY cannot answer who-holds-hash-X / carries no content key. That is false: get_peers(info_hash) IS a find-peers-under-a-key call and BEP5 CAN key on a hash. The honest structural claim is about OUR WRAPPER: we hardcode ONE well-known membership infohash and NEVER derive an infohash from a Nix content hash, and the return is a bare IP:port — so our USE supplies member ADDRESSES only. Corrected in check-discovery-no-shortcut.py so it no longer contradicts the acknowledged get_peers(info_hash) blind spot.
+
+NET unchanged: adopt-with-conditions; central finding sound; no proven claim weakened.
 <!-- SECTION:NOTES:END -->
