@@ -6,7 +6,7 @@ title: >-
 status: To Do
 assignee: []
 created_date: '2026-08-18 22:43'
-updated_date: '2026-08-18 23:15'
+updated_date: '2026-08-19 14:06'
 labels:
   - security
   - supply-chain
@@ -40,4 +40,6 @@ PLAN (per mped ruling on TASK-257): add all three IDs to deny.toml [advisories] 
 
 <!-- SECTION:NOTES:BEGIN -->
 WORDING CORRECTION (TASK-257 DEEP gate, mped Finding 4). This tasks rationale should NOT assert hickory-proto 0.25.2 was already reachable at RUNTIME via libp2p-dns: the `dns` feature is NOT in fabric-libp2ps libp2p feature list (kad/tcp/quic/identify/request-response/tokio/macros/noise/yamux/autonat/dcutr/relay + the new mdns), so at HEAD hickory-proto 0.25.2 was in the LOCKFILE but NOT compiled into the binary. Enabling --libp2p-mdns newly compiles libp2p-mdns -> hickory-proto INTO the running binary. The audit DEFERRAL stays SOUND -- Cargo.lock is byte-identical so cargo-deny (all-features=true) produces an identical verdict at HEAD, and the advisories are DoS-class (RUSTSEC-2026-0118 dnssec-gated with no dnssec feature enabled; 0119 encode-side over records we construct; mDNS is default-OFF + LAN-only). But state the provenance as unchanged at the LOCKFILE/AUDIT granularity, NOT as prior runtime reachability. Keep the deny.toml ignore + upstream-bump follow-ups as filed.
+
+IMPLEMENTATION 2026-08-19 (recovered directly after the first implementer died on a transient API error; ignore-only change, Cargo.lock untouched). All 3 rationales VERIFIED via cargo tree -e features + cargo deny (NOT transcribed — the task description had TWO wrong rationales): (1) the "grep dnssec is empty" claim is FALSE (BASE32_DNSSEC exists in vendor/iroh, an unrelated base32 alphabet); the CORRECT check is the feature set: hickory-proto 0.25.2 enabled features = futures-io/std/mdns/socket2 ONLY, no dnssec-ring/dnssec-aws-lc-rs node in the tree, so 0118 DNSSEC validation never runs. (2) "0258 rides the iroh subtree" is INCOMPLETE: h2 0.4.15 is also reachable via hyper 1.11, BUT the shipped daemon enables ONLY hyper http1 (daemon-core/Cargo.toml:27, daemon/Cargo.toml:117; http1-only usage in observ.rs/server.rs/upstream.rs), so no h2/HTTP-2 server ever runs on the shipped path — h2 is present solely via the iroh subtree (prune=TASK-202). 0119 = encode-side O(n2) over our own bounded mDNS records. All 3 DoS-class, integrity TCB untouched. just audit (cargo deny check) now rc=0: advisories ok, bans ok, licenses ok, sources ok; exactly the 3 IDs ignored (before: exactly 3 RED, 1:1, no silent suppression). Follow-ups: TASK-265 (libp2p/hickory bump, blocked on MSRV-aware resolution dragging 14 collateral downgrades), TASK-202 (iroh prune clears 0258). Pending cross-model codex gate on rationale soundness before Done.
 <!-- SECTION:NOTES:END -->

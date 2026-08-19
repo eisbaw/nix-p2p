@@ -23,7 +23,34 @@ yanked = "deny"
 unmaintained = "workspace"
 # No blanket ignores. Add a specific `ID = "..."` here ONLY with a filed
 # follow-up task explaining why the advisory does not apply to our usage.
-ignore = []
+# The three below are ALL DoS-class (never a bad store path — the integrity TCB
+# is untouched) and unfixable without an upstream bump; each is verified N/A or
+# bounded on our SHIPPED usage and carries a follow-up. Provenance verified via
+# `cargo tree -e features` / `cargo deny check advisories` on 2026-08-19 (TASK-260).
+ignore = [
+    # h2 0.4.15 unbounded empty DATA frames (server-side DoS). Provenance: h2 ->
+    # hyper 1.11 http2 AND hickory-net 0.26.1 -> hickory-resolver -> iroh v1.0.3.
+    # DOES NOT APPLY on the shipped path: the shipped daemon enables ONLY hyper's
+    # `http1` feature (daemon-core/Cargo.toml:27, daemon/Cargo.toml:117; server &
+    # client use hyper::{server,client}::conn::http1 exclusively), so no h2/HTTP-2
+    # server is ever run. h2 is in the tree solely via the iroh subtree.
+    # Follow-up: iroh prune (TASK-202) removes the h2 tree entirely.
+    { id = "RUSTSEC-2026-0258", reason = "shipped daemon is hyper http1-only; h2 present only via the iroh subtree (prune=TASK-202); DoS-class, no integrity impact" },
+    # hickory-proto 0.25.2 NSEC3 closest-encloser unbounded loop (DoS). Provenance:
+    # hickory-proto 0.25.2 -> libp2p-mdns 0.48 / libp2p-dns 0.44 -> libp2p 0.56 (TASK-257).
+    # DOES NOT APPLY: triggers only with the dnssec-ring/dnssec-aws-lc-rs feature +
+    # DNSSEC validation. Verified via `cargo tree -e features`: hickory-proto's
+    # enabled features are futures-io/std/mdns/socket2 ONLY — no dnssec node in the
+    # tree, so DnssecDnsHandle / DNSSEC validation is never constructed.
+    # Follow-up: TASK-265 (libp2p/hickory bump to >=0.26.1, blocked on MSRV resolution).
+    { id = "RUSTSEC-2026-0118", reason = "hickory dnssec-ring/dnssec-aws-lc-rs feature NOT enabled (features=futures-io/std/mdns/socket2); DNSSEC validation never runs; bump=TASK-265" },
+    # hickory-proto 0.25.2 O(n^2) name-compression CPU on ENCODE (DoS). Provenance:
+    # same hickory-proto 0.25.2 via libp2p-mdns 0.48 (TASK-257). Bounded on our usage:
+    # the amplification is on ENCODING a message with many candidate labels; libp2p-mdns
+    # encodes our OWN node's mDNS service records (a bounded, small, self-authored set),
+    # not attacker-controlled input. Follow-up: TASK-265 (libp2p/hickory bump).
+    { id = "RUSTSEC-2026-0119", reason = "encode-side O(n^2) over our own bounded mDNS service records, not attacker-controlled; bump=TASK-265" },
+]
 
 [licenses]
 # version = 2 semantics: a crate passes iff its SPDX expression is satisfied by
