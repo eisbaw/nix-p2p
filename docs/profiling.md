@@ -58,29 +58,36 @@ scans the Python gate scripts; this change adds none.
 
 ## Findings on real packages (2026-08-19)
 
-The codec lenses above are hermetic micro-benchmarks. A first *real-package* pass profiled
-the shipped serve path's dominant cost — **NAR regeneration** (`nix-store --dump`, a
-subprocess; the daemon then Bao-hashes + streams the bytes). hyperfine, 5 runs each, on a
-loaded shared host (treat as rough, ±10-20%):
+The codec lenses above are hermetic micro-benchmarks. A *real-package* pass profiled the
+shipped serve path's dominant cost — **NAR regeneration** (`nix-store --dump`, a subprocess;
+the daemon then Bao-hashes + streams the bytes). hyperfine, warmup 3 + 15 runs each, on an
+**idle** host (σ 2.8-4 ms; still treat as indicative, not a benchmark of record):
 
-| package | NAR size | regen mean | effective MB/s | fixed-overhead share |
-| --- | ---: | ---: | ---: | ---: |
-| hello | 274 KB | 20.7 ms | 13 | ~62% |
-| curl | 1.18 MB | 25.3 ms | 47 | ~51% |
-| git | 50.5 MB | 35.0 ms | 1445 | ~37% |
-| python3 | 133 MB | 71.1 ms | 1874 | ~18% |
+| package | NAR size | regen mean | effective MB/s |
+| --- | ---: | ---: | ---: |
+| hello | 274 KB | 22.2 ms | 12 |
+| curl | 1.18 MB | 21.2 ms | 56 |
+| bash | 1.65 MB | 22.6 ms | 73 |
+| glibc-locales | 3.07 MB | 22.7 ms | 135 |
+| git | 50.5 MB | 32.0 ms | 1579 |
+| python3 | 133 MB | 68.8 ms | 1937 |
 
-Fitting the two largest (least overhead-dominated) gives a clean model:
-**~13 ms FIXED per-path overhead** (subprocess spawn + nix DB lookup) **+ ~2.3 GB/s per-byte**
-streaming. BLAKE3/bao hashing (~1-3 GB/s) and loopback transport are comparable-or-faster, so
-neither is the bottleneck.
+Two regimes, stated separately rather than over-fit to one line:
+- **A ~22 ms per-path FLOOR.** The four packages from 274 KB to 3 MB all land at ~22 ms,
+  essentially size-independent — that is the fixed cost of `nix-store --dump` (fork/exec +
+  nix DB lookup). (An earlier loaded-box pass mis-fit this as ~13 ms by extrapolating from the
+  two largest points; the real small-path floor is ~22 ms.)
+- **~2.2 GB/s per-byte** streaming above the floor (git→python3 slope), so large packages
+  amortize it. BLAKE3/bao hashing (~1-3 GB/s, comparable) and loopback transport are not the
+  bottleneck. (`b3sum` was absent from the shell, so hashing is characterized from its known
+  rate, not measured here.)
 
-**The load-bearing insight:** for small paths the ~13 ms *fixed* cost dominates (a 274 KB
-`hello` regenerates at an effective 13 MB/s — 62% overhead), and **real closures are
+**The load-bearing insight:** small paths are floor-bound (`hello`'s 274 KB regenerates at an
+effective 12 MB/s — almost all of the 22 ms is fixed overhead), and **real closures are
 many-small-paths** (the TASK-256 probe found closures of 20-166 paths, mostly small). So a
-50-small-path closure spends **~0.6 s in `nix-store --dump` spawns alone, independent of
+50-small-path closure spends **~1.1 s in `nix-store --dump` spawns alone, independent of
 bytes**. The serve-side lever for the org/LAN same-pin case (the honest first product) is
-therefore **per-path subprocess overhead**, not NAR throughput — e.g. batching regeneration
-or a persistent nix-store connection would cut it. This is consistent with TASK-64/62's
-"~70% of the per-byte cost sits below our code": on real packages our serve code is cheap;
-the cost is the external `nix-store` regeneration overhead + the bytes themselves.
+therefore **per-path subprocess overhead**, not NAR throughput — batching regeneration or a
+persistent nix-store connection would cut it. This is consistent with TASK-64/62's "~70% of
+the per-byte cost sits below our code": on real packages our serve code is cheap; the cost is
+the external `nix-store` regeneration overhead + the bytes themselves.
