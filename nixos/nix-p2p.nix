@@ -40,7 +40,25 @@ let
   # NOTHING). It is the DHT-infrastructure role the give/consume modes cannot express - a
   # dedicated bootstrap/relay root. Selected via `profile = "router"` (or the low-level `router`).
   isRouter = lcfg.router || profile == "router";
-  wantsAnnounceAfterFetch = lcfg.announceAfterFetch || profile == "public-share";
+  # TASK-273: lan-share is a COMPLETE zero-config participant, so it defaults announce-after-fetch
+  # ON (warm the LAN from what it fetches) exactly as the daemon does for a bare `--profile
+  # lan-share`. public-share keeps its own default. Mirroring the daemon here keeps the generated
+  # ExecStart self-consistent (and the daemon's compat-shim cross-check validates the mapping).
+  wantsAnnounceAfterFetch = lcfg.announceAfterFetch || profile == "public-share" || profile == "lan-share";
+  # TASK-273: resolve the tri-state mDNS option against the profile — the SAME rule the daemon's
+  # SharingProfile::default_lan_mdns encodes (ON only for lan-share). `null` follows the profile;
+  # an explicit true/false wins. Drives both the ExecStart flag and the upstream-only assertion.
+  mdnsEnabled = if lcfg.mdns != null then lcfg.mdns else (profile == "lan-share");
+  # TASK-273: the LOOPBACK listen the daemon defaults under lan-share (must match
+  # DEFAULT_LAN_SHARE_LISTEN in daemon-libp2p/src/main.rs). Loopback, NOT a wildcard: a no-allowlist
+  # lan-share is refused a routable listen by the TASK-102 isolation guard, so a wildcard default
+  # would fail to start. It enables zero-config mDNS DISCOVERY + peer FETCH; genuine cross-host
+  # SERVING needs the trusted-key allowlist door or an explicit routable listen (see the Rust const
+  # doc + TASK-276). Mirrored here so a bare `profile = "lan-share"` yields a self-evidently complete
+  # ExecStart; an explicit `listen` suppresses it.
+  defaultLanShareListen = "/ip4/127.0.0.1/tcp/0";
+  lanShareListen =
+    if profile == "lan-share" && lcfg.listen == [ ] then [ defaultLanShareListen ] else lcfg.listen;
   # Local daemon URL, pinned ahead of everything with an explicit priority so
   # ordering does not depend on the advertised nix-cache-info Priority.
   daemonSubstituter = "http://127.0.0.1:${toString cfg.port}?priority=10";
@@ -230,10 +248,16 @@ in
       };
 
       mdns = lib.mkOption {
-        type = lib.types.bool;
-        default = false;
+        type = lib.types.nullOr lib.types.bool;
+        default = null;
         description = ''
-          `--libp2p-mdns` (TASK-257): LAN mDNS peer-ADDRESS discovery. DEFAULT OFF.
+          `--libp2p-mdns` (TASK-257): LAN mDNS peer-ADDRESS discovery. TRI-STATE
+          (TASK-273): `null` (DEFAULT) follows the profile — ON for
+          `profile = "lan-share"` (genuinely zero-config same-pin LAN sharing),
+          OFF for every other profile; `true` forces it on; `false` is an explicit
+          opt-out that reaches the daemon as `--libp2p-no-mdns` (so a lan-share
+          operator can decline LAN discovery and get the fail-loud undiscoverable
+          -provider guard instead of a silent default-on).
           When enabled, a same-scope neighbour on the LAN is discovered over
           link-local multicast with NO `bootstrap` entry - the zero-config answer
           for a private org pool. Discovered addresses feed the SAME kad bootstrap
@@ -388,7 +412,7 @@ in
         # TASK-257: upstream-only stays zero-P2P and emits ZERO multicast; it cannot enable mDNS.
         # Mirrors the daemon's refusal of --libp2p-mdns under upstream-only (axis-1 discovery must
         # not sneak a swarm/multicast onto a pure-HTTP node). Select consume-only for a LAN consumer.
-        assertion = !lcfg.mdns || profile != "upstream-only";
+        assertion = !mdnsEnabled || profile != "upstream-only";
         message = "services.nix-p2p.libp2p.mdns = true requires a P2P profile (consume-only/lan-share/public-share/router); upstream-only runs no P2P and must emit zero mDNS multicast.";
       }
       {
@@ -450,12 +474,16 @@ in
             ++ lib.optionals isRouter [ "--libp2p-router" ]
             ++ lib.optionals wantsAnnounceAfterFetch [ "--libp2p-announce-after-fetch" ]
             ++ lib.optionals (!lcfg.relayServer) [ "--libp2p-no-relay-server" ]
-            ++ lib.concatMap (a: [ "--libp2p-listen" a ]) lcfg.listen
+            ++ lib.concatMap (a: [ "--libp2p-listen" a ]) lanShareListen
             ++ lib.concatMap (a: [ "--libp2p-external-address" a ]) lcfg.externalAddresses
             ++ lib.concatMap (b: [ "--libp2p-bootstrap" b ]) lcfg.bootstrap
             ++ lib.optionals (lcfg.scope != null) [ "--libp2p-scope" lcfg.scope ]
-            # TASK-257: LAN mDNS peer-address discovery (default OFF).
-            ++ lib.optionals lcfg.mdns [ "--libp2p-mdns" ]
+            # TASK-257/273: tri-state LAN mDNS. `--libp2p-mdns` when resolved ON; the explicit
+            # `--libp2p-no-mdns` opt-out MUST reach the daemon when the operator set mdns = false
+            # (so it hits the fail-loud undiscoverable-provider guard, never a silent default-on).
+            # Under a null non-lan-share profile neither is emitted (mDNS stays off by default).
+            ++ lib.optionals mdnsEnabled [ "--libp2p-mdns" ]
+            ++ lib.optionals (lcfg.mdns == false) [ "--libp2p-no-mdns" ]
             # TASK-258 SPIKE: Mainline DHT peer-address rendezvous (default OFF).
             ++ lib.optionals lcfg.mainlineRendezvous [ "--libp2p-mainline-rendezvous" ]
             ++ lib.concatMap (s: [ "--libp2p-mainline-bootstrap" s ]) lcfg.mainlineBootstrap
