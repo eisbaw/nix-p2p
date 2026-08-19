@@ -6,6 +6,7 @@ title: >-
 status: To Do
 assignee: []
 created_date: '2026-08-18 20:25'
+updated_date: '2026-08-19 14:23'
 labels:
   - measurement
   - profiling
@@ -35,3 +36,14 @@ Explicit non-goals: this is instrumentation, NOT the value-thesis measurement (T
 
 Cautions from prior rounds: obey the no-floats rule for any gate or decision field (integers or exact rationals; floats only as terminal display). Bound the run cost -- the box is shared and prior stress loops exhausted disk and tmpfs. Do not build a CPU-hog farm.
 <!-- SECTION:DESCRIPTION:END -->
+
+## Acceptance Criteria
+<!-- AC:BEGIN -->
+- [ ] #1 flake.nix provides hyperfine + criterion (dev-dep) + a flamegraph/perf tool; just recipes bench, profile-cpu, profile-ram exist and run on the dev host
+- [ ] #2 hyperfine A/B recipe benchmarks a shipped binary/just-recipe on the PRIMARY libp2p path (NOT iroh), with --export-json; run cost BOUNDED (small warmup + capped run count, documented)
+- [ ] #3 at least one criterion microbench on a hot path (NAR serve two-pass regenerate OR zstd codec OR claim-wire encode/decode), runnable via just bench, bounded sample size
+- [ ] #4 a RAM oracle better than peak RSS (dhat or heaptrack allocation profile) via just profile-ram on the libp2p serve path; the existing serve-budget residency oracle stays intact
+- [ ] #5 just profile-cpu produces a flamegraph on the libp2p serve OR fetch path (primary stack, not the deprioritized iroh path)
+- [ ] #6 NO floats in any gate/decision field the tooling emits (integers/exact rationals; floats only as terminal display); run cost BOUNDED — no CPU-hog farm, bench sample counts + durations capped and documented
+- [ ] #7 instrumentation ONLY — explicitly NOT the value-thesis measurement (TASK-237), NOT tournament/policy training material, no PRD success claim
+<!-- AC:END -->
