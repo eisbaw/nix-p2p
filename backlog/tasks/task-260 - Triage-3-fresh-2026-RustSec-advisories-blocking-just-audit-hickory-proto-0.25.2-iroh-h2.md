@@ -3,10 +3,10 @@ id: TASK-260
 title: >-
   Triage 3 fresh 2026 RustSec advisories blocking just audit (hickory-proto
   0.25.2 + iroh h2)
-status: To Do
+status: Done
 assignee: []
 created_date: '2026-08-18 22:43'
-updated_date: '2026-08-19 14:22'
+updated_date: '2026-08-19 14:23'
 labels:
   - security
   - supply-chain
@@ -31,9 +31,9 @@ PLAN (per mped ruling on TASK-257): add all three IDs to deny.toml [advisories] 
 
 ## Acceptance Criteria
 <!-- AC:BEGIN -->
-- [ ] #1 deny.toml ignores RUSTSEC-2026-0118, -0119, -0258 with a per-ID comment stating provenance + why it does not apply / is DoS-class + the upstream-bump follow-up
-- [ ] #2 just audit returns RC 0
-- [ ] #3 no advisory is suppressed silently: each ignore line carries a rationale and a filed upstream-bump follow-up reference
+- [x] #1 deny.toml ignores RUSTSEC-2026-0118, -0119, -0258 with a per-ID comment stating provenance + why it does not apply / is DoS-class + the upstream-bump follow-up
+- [x] #2 just audit returns RC 0
+- [x] #3 no advisory is suppressed silently: each ignore line carries a rationale and a filed upstream-bump follow-up reference
 <!-- AC:END -->
 
 ## Implementation Notes
