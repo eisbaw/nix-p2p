@@ -79,6 +79,14 @@ answers "*where is this node?*", never "*who has hash X?*". So discovery uses
 libp2p-kad's `get_providers`, adopted from a mainnet-proven library rather than
 hand-rolled, and iroh-blobs remains an optional transport backend.
 
+**Bootstrapping the first peer.** A DHT can't start from nothing, so a fresh node needs a
+way to meet its first peer. On a LAN this is zero-config: mDNS (`--libp2p-mdns`, off by
+default) finds neighbours by multicast and hands their addresses to the kad bootstrap path
+— never to content discovery. A zero-infrastructure global rendezvous over the BitTorrent
+Mainline DHT was prototyped and found to discover node *membership* across NAT (though not
+to traverse it); it too feeds only the address path, so content routing stays
+kad-exclusive. Both are opt-in and gated by the sharing profile.
+
 **Serving costs no disk.** A node holds no second copy of anything: it regenerates a
 path's raw NAR from `/nix/store` on demand via `nix-store --dump`, so there is no blob
 store, no retention policy, and nothing at rest. Note the current limit — *which* paths a
@@ -121,8 +129,17 @@ weak.
 
 Early shaped-link measurement says **supplement, not replace**: raw, a peer loses at
 every size; with fast negotiated link compression the gap closes back toward parity. That
-matches the stated aim — bandwidth offload — but real public-network numbers are still
-out, and the project treats this as a thesis to falsify rather than a premise.
+is the *bytes-per-hit* half of the question, and it matches the stated aim — bandwidth
+offload — but real public-network numbers are still out.
+
+An offline overlap probe measured the other half — *hit-rate*. Machines on the **same
+nixpkgs pin** (a LAN, or an org) share almost all of a cold build's closure: overlap warms
+to ~95% of paths. Machines on **different** nixpkgs revisions share essentially nothing —
+store paths are input-addressed, so a different stdenv rehashes everything downstream, and
+cross-revision overlap is structurally zero. So the honest first product is the **org / LAN
+same-pin pool**; a global permissionless swarm across arbitrary revisions offloads nothing
+unless it is segmented into same-pin cohorts. The project treats all of this as a thesis to
+falsify rather than a premise.
 
 ## Status
 
@@ -130,8 +147,12 @@ The decentralized path works end to end across containers: kad discovery, addres
 resolution with nothing injected, Bao-authenticated transfer, byte-identical delivery to
 a real `nix build`, multi-provider fail-over, and a clean upstream fallback on a miss.
 
-Not yet: a public network, a verdict on the value thesis, socket-to-HTTP streaming
-completion, record-lifecycle hardening, and standard profiling tooling.
+Landed since: zero-config LAN bootstrap (mDNS), a frozen operator-contract budget
+artifact, an offline value-thesis probe (org/LAN-first), and profiling tooling.
+
+Not yet: a public network, a real-cache deployment, and socket-to-HTTP streaming
+completion — the mid-transfer failure semantics are de-risked (a killed peer still
+yields a correct build via fallback), the streaming refactor itself is scoped and pending.
 
 Full inventory: **`docs/status.md`**.
 
@@ -154,6 +175,9 @@ just e2e-full    # every e2e scenario
 just e2e-vm      # NixOS VM test (needs /dev/kvm)
 just measure     # egress / latency / gap report
 just profile     # p2p resource / throughput report
+just bench       # criterion + hyperfine micro / wall-clock benchmarks
+just profile-cpu # flamegraph (or callgrind) CPU attribution
+just profile-ram # dhat allocation profile
 ```
 
 `nix flake check` re-runs build/lint/test in the CI sandbox.
