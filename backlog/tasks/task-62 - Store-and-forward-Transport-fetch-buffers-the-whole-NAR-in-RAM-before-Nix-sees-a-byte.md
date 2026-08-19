@@ -3,10 +3,10 @@ id: TASK-62
 title: >-
   Store-and-forward: Transport::fetch buffers the whole NAR in RAM before Nix
   sees a byte
-status: To Do
+status: In Progress
 assignee: []
 created_date: '2026-08-09 13:24'
-updated_date: '2026-08-18 10:26'
+updated_date: '2026-08-19 15:50'
 labels:
   - streaming
   - memory
@@ -192,4 +192,46 @@ in the FETCHER, but it shares this surface and there are three things you need.
 2026-08-18 dependency audit: TASK-247 cannot honestly measure latency hiding while PeerFabricNarSource constructs the HTTP body only after NarTransfer::fetch has collected the entire NAR. TASK-62 is therefore a correctness/measurement prerequisite for TASK-247, even though its expected total-throughput win remains small.
 
 2026-08-18 dependency correction: TASK-197 is a hard prerequisite for AC#6 on libp2p. /nar/3 authenticates the whole BLAKE3 only at EOF, so releasing libp2p bytes to the HTTP body earlier would not be a verified-chunk stream. Implement and mutation-prove the bao-capable protocol first; iroh already has bao leaves but still needs its Vec seam removed here.
+
+2026-08-19 front-loaded de-risking (no source touched; two data files committed):
+
+AC#8 measurement manifest FROZEN before any streaming measurement:
+artifacts/task62-streaming-manifest-v1.json. Integer/rational thresholds + sample
+sizes, no float as decision authority (sizeaxis/scalefit float slope-CI flagged as
+an implementation obligation to reduce to a rational + cross-multiply, not silently
+accepted). Bites: AC#1 TTFB ttfb*4<=total (buffering counterfactual >=3/4 fails; a
+flush-at-end unbounded channel fails because first-byte is measured AT THE CLIENT);
+AC#2/#7 inflight hwm <= 4*STREAM_CHUNK_BYTES (262144) and size-independent (a
+bounded channel that still accumulates O(NarSize) fails); AC#7 permits released
+within an injected 2s deadline; AC#5 fetcher RSS slope 95% CI must EXCLUDE 1 and
+CI-high < 1/2 over the 5-size grid (single-point unfalsifiable).
+
+AC#3 NIX-retry empirical question answered EARLY and GREEN -> NOT design-blocking.
+Ran crash-kill-mid-nar (SIGKILL daemon at ~50% of the 110 MiB NAR): 11/11 checks,
+40.0s, exit 0. Build succeeds via fallback; surviving store path NarHash matches
+signed upstream (correct, never wrong); no orphaned tmp/lock residue; verify-path
+BITES red on an injected corrupt path. Evidence: evidence/task-62/9b71c48/.
+CAVEAT (honest): this de-risks the NIX half only -- it kills the DAEMON on the
+upstream path, a faithful proxy for "200 + truncated body -> Nix falls back". It
+does NOT prove the DAEMON-side truncation streaming introduces (peer dies mid-body,
+daemon alive, daemon truncates its own response). That is a to-build mutation
+oracle (kill the iroh/libp2p PEER at ~50% of a p2p-served NAR) for AC#3's
+implementation half.
+
+SCOPE: the streaming refactor (AC#1,2,4,5,6,7 + AC#3 daemon-side oracle) is NOT
+done this session. The irreducible core is a trait-signature change: NarTransfer::fetch
+-> Result<Vec<u8>> (peer-fabric/src/capabilities.rs:409) must yield incrementally,
+rippling through BOTH adapters (fabric-iroh transport_iroh.rs dial_and_stream collects
+a Vec; fabric-libp2p transport.rs collects /nar/4 leaves -- its own comment says "until
+TASK-62"), the serve swap at transport_fetch.rs:460 (Full::new(Bytes::from(bytes)) ->
+Stream), a NEW fetcher-side inflight accounting counter + its oracle, and the 5-size
+RSS grid + e2e. The HTTP body is ALREADY streaming-capable (NarBody = BoxBody, source.rs:56),
+so there is no cheap "wire up the body" bite left -- the only remaining work IS the DEEP
+core. TASK-197 (bao /nar/4) is Done so libp2p AC#6 is unblocked at the protocol level.
+Committing a half version would fake green under the codex integrity gate. GO
+recommendation: AC#3's Nix-half holds, design is not blocked, refactor is safe to
+pursue against the frozen manifest. No honest partial exists short of the trait change
+(any fetch->Vec wrapped in a channel is flush-at-end = exactly the AC#1/#7 anti-pattern).
+
+ORCHESTRATOR VERIFICATION 2026-08-19: AC#3 evidence RE-DERIVED from evidence/task-62/9b71c48/ (not self-report): rawlog 11/11 PASS exit 0 — build succeeds via fallback after SIGKILL at ~50% of the 115343872 B NAR, surviving NarHash matches signed upstream, fallback served full NAR (bytes_sent==file_size), verify-path passes on surviving path AND BITES red on an injected corrupt path. measurement.json records the honest residual (the post-head-truncation-specifically property rests on the code path upstream.rs::fetch_streaming, not a client assertion — a client-side "saw 200 then short body" strengthening is to add with the implementation-half peer-kill scenario). SHOWSTOPPER CLEARED: NOT design-blocking; S2 holds under the new mid-body-abort class. Manifest artifacts/task62-streaming-manifest-v1.json frozen (integer/rational, no float authority; mped added the below-the-counter negative control + the float-CI-must-reduce-to-rational obligation). STATE: this is a de-risking MILESTONE (AC#8 manifest frozen + AC#3 Nix-half GREEN); the streaming REFACTOR (AC#1/#2/#4/#5/#6/#7 — trait fetch->Vec removal rippling through both fabric-iroh + fabric-libp2p adapters, serve swap at transport_fetch.rs:460, fetcher accounting counter+oracle, 5-size RSS grid, e2e) is a GO-recommended DEDICATED multi-session DEEP change against the frozen manifest. TO-BUILD residuals for the refactor: the daemon-side truncation mutation oracle, and reducing sizeaxis/scalefit float CI to the frozen outward-rounded rational.
 <!-- SECTION:NOTES:END -->
