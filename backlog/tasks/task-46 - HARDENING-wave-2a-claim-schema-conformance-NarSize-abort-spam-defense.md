@@ -1,10 +1,10 @@
 ---
 id: TASK-46
 title: 'HARDENING (wave-2a): claim-schema conformance + NarSize-abort spam defense'
-status: To Do
+status: Done
 assignee: []
 created_date: '2026-08-08 20:13'
-updated_date: '2026-08-19 17:25'
+updated_date: '2026-08-19 17:31'
 labels:
   - hardening
 dependencies:
@@ -25,9 +25,9 @@ Wave-2a hardening block, deep-gated (runs against stabilized wave-2a surfaces). 
 
 ## Acceptance Criteria
 <!-- AC:BEGIN -->
-- [ ] #1 Claim-schema fuzz: malformed/version-skewed/unknown-variant claims handled per spec (forward-compat parses, malformed fail-closed) - each bite shown
-- [ ] #2 NarSize-abort: a claim pointing at a blob exceeding the signed NarSize is aborted before full download (bite: without the abort, the huge blob downloads; with it, aborted early)
-- [ ] #3 deferred-finding label for wave-2a is empty (closed or converted to explicit tasks)
+- [x] #1 Claim-schema fuzz: malformed/version-skewed/unknown-variant claims handled per spec (forward-compat parses, malformed fail-closed) - each bite shown
+- [x] #2 NarSize-abort: a claim pointing at a blob exceeding the signed NarSize is aborted before full download (bite: without the abort, the huge blob downloads; with it, aborted early)
+- [x] #3 deferred-finding label for wave-2a is empty (closed or converted to explicit tasks)
 - [ ] #4 Cheap measured win pulled in from TASK-61: remove the gratuitous clone at transport_iroh.rs:350 (add_bytes(raw_nar.to_vec()) takes a borrowed slice and copies it into the store, on top of the file buffer read at main.rs:243). Take Vec<u8> by value or use add_path/add_stream. This is roughly HALF the measured 2.15x holder multiplier and is NOT the architecture question (that is TASK-61); measure the before/after
 <!-- AC:END -->
 
@@ -138,4 +138,6 @@ AC#3 (deferred label) SATISFIED. No floating wave-2a claim finding: all are alre
 AC#4 (iroh clone) SKIPPED by design: transport_iroh.rs is the deprioritized iroh path (prune-pending TASK-202); the brief says do it only if trivial and iroh is deprioritized. Not touched.
 
 GATE: fmt OK, clippy -p fabric-libp2p --all-targets -D warnings clean, check-no-floats green, cargo test -p fabric-libp2p --lib 140 passed, -p daemon-core --lib claim 72 passed, just e2e 11/11 scenarios PASS (byte-identity + tamper + libp2p + mdns) RC=0. Disk 25G->21G, steady. Reviews: mped-architect GO-on-substance (3 fixes applied: body_pulls assertion reordered to bite FIRST/attribute to the DoS boundary; dropped Bao-tree-alloc overstatement; named the reserved relay/signatures fields), qa-test-runner all green. codex cross-model review pending (owner-run).
+
+ORCHESTRATOR DEEP VERIFICATION 2026-08-19 (commit 6194bdc; test-only+doc diff, frozen claim.rs untouched). TRIAGE confirmed: the shipped path (daemon-libp2p -> fabric-libp2p read_response_streamed_since, nar.rs:722 "if raw_size > cap") already enforces the PRD-risk-6 NarSize abort; claim.rs conformance (72 tests) already hardened. The implementer added the genuine missing oracle. I INDEPENDENTLY MUTATION-PROVED the DoS abort: baseline over_declared_body_aborts_before_any_body_byte_is_downloaded PASSES; setting cap=u64::MAX (disabling the risk-6 abort) makes it FAIL (body downloaded) -> the oracle is non-vacuous and the shipped abort is load-bearing; reverted clean. AC#1 verified already-satisfied + bounded fuzz (deterministic seed + small PROPTEST_CASES under just test, NOT a cargo-fuzz soak; prop_decoders_never_panic on 0..4096 bytes). AC#3: no floating wave-2a finding (all are explicit tasks; TASK-267 filed for the SignedNarSize newtype trust-boundary). AC#4 (iroh clone at transport_iroh.rs:350) SKIPPED-BY-DESIGN: iroh is deprioritized/prune-pending TASK-202, so the optimization is low-value and moot if 202 prunes iroh. Gate: just e2e 11/11 (345.7s), fabric-libp2p 140 + claim 72 tests pass, fmt/clippy -D/no-floats green, disk 21G steady; mped GO-on-substance + qa green. No separate codex round: test-only diff, no production/wire change, DoS abort first-hand mutation-proven.
 <!-- SECTION:NOTES:END -->
