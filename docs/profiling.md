@@ -55,3 +55,32 @@ wire byte lengths, dhat block/byte totals). The raw tool JSON (criterion estimat
 seconds) contains the tools' own statistical floats — those are terminal display, not a
 gate/decision field of ours, so the owner no-floats rule is not engaged. `check-no-floats.py`
 scans the Python gate scripts; this change adds none.
+
+## Findings on real packages (2026-08-19)
+
+The codec lenses above are hermetic micro-benchmarks. A first *real-package* pass profiled
+the shipped serve path's dominant cost — **NAR regeneration** (`nix-store --dump`, a
+subprocess; the daemon then Bao-hashes + streams the bytes). hyperfine, 5 runs each, on a
+loaded shared host (treat as rough, ±10-20%):
+
+| package | NAR size | regen mean | effective MB/s | fixed-overhead share |
+| --- | ---: | ---: | ---: | ---: |
+| hello | 274 KB | 20.7 ms | 13 | ~62% |
+| curl | 1.18 MB | 25.3 ms | 47 | ~51% |
+| git | 50.5 MB | 35.0 ms | 1445 | ~37% |
+| python3 | 133 MB | 71.1 ms | 1874 | ~18% |
+
+Fitting the two largest (least overhead-dominated) gives a clean model:
+**~13 ms FIXED per-path overhead** (subprocess spawn + nix DB lookup) **+ ~2.3 GB/s per-byte**
+streaming. BLAKE3/bao hashing (~1-3 GB/s) and loopback transport are comparable-or-faster, so
+neither is the bottleneck.
+
+**The load-bearing insight:** for small paths the ~13 ms *fixed* cost dominates (a 274 KB
+`hello` regenerates at an effective 13 MB/s — 62% overhead), and **real closures are
+many-small-paths** (the TASK-256 probe found closures of 20-166 paths, mostly small). So a
+50-small-path closure spends **~0.6 s in `nix-store --dump` spawns alone, independent of
+bytes**. The serve-side lever for the org/LAN same-pin case (the honest first product) is
+therefore **per-path subprocess overhead**, not NAR throughput — e.g. batching regeneration
+or a persistent nix-store connection would cut it. This is consistent with TASK-64/62's
+"~70% of the per-byte cost sits below our code": on real packages our serve code is cheap;
+the cost is the external `nix-store` regeneration overhead + the bytes themselves.
