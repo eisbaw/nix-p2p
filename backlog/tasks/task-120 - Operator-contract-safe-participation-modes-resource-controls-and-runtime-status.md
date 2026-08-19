@@ -7,7 +7,7 @@ status: In Progress
 assignee:
   - '@claude'
 created_date: '2026-08-10 22:24'
-updated_date: '2026-08-19 12:24'
+updated_date: '2026-08-19 13:00'
 labels:
   - production
   - operator
@@ -80,4 +80,8 @@ codex DEEP review NOGO -> fixed all 5 findings (round 2).
 
 LAUNCH-LEVEL BITE (real binaries): daemon --preflight --iroh-max-serve-nar-bytes 536870912 -> exit 1 (single_nar exceeds ceiling 268435456); --iroh-max-serve-duration-ms 300000 -> exit 1 (serve_duration_ns 300000000000 exceeds 120000000000); defaults -> exit 0; daemon-libp2p --preflight -> exit 0. Plus unit bites: profile_budget::effective_serve_override_over_envelope_fails_closed; daemon::over_envelope_serve_override_is_rejected_at_startup.
 GATE r3: fmt+clippy green; daemon-core --lib 316; profile_budget 19; operator 24; libp2p preflight 2 + drills 4; daemon budget 3; no-floats green. e2e re-running.
+
+CORRECTION (supersedes the earlier "AC#10/#3 DONE / Full DEEP gate GREEN" note, which was written before the codex re-gate reopened this task): AC#3 is OPEN (declared != enforced; 14 fields surfaced+hashed but not runtime-enforced, TASK-264 completes it). AC#10 is checked. The DEEP gate is NOT green-complete yet - it is mid codex re-gate: R1 NOGO (serve-override envelope bypass + enforced-vs-declared honesty) was fixed and R2 VERIFIED the critical fix on real binaries; 4 minor honesty/accuracy residuals (R2-1 effective-value display, R2-2 hash-vs-review wording, R2-3 no path-based loader, R2-4 tracker drift) are being closed now; R3 final re-gate pending. Do not read the earlier DONE/GREEN as current truth.
+
+AC#10 "explicitly owner-reviewed" clarification (R2-2c): there is NO separate human-attestation artifact in this repo. "Owner-reviewed" is represented OPERATIONALLY by the checked-in frozen content hash (EXPECTED_PROFILE_BUDGET_HASH) plus the artifact reviewed_revision field: any budget change forces a deliberate, reviewable one-line hash re-freeze, and the daemon fail-closes on drift. The hash attests IDENTITY/FREEZE of the canonical JCS content, NOT human authorization of the numbers - a content hash cannot attest that. A real signed approval attestation is future work, not built here. AC#10 is checked on that operational reading; if the owner requires a literal human-attestation record, AC#10 is partial pending that separate mechanism.
 <!-- SECTION:NOTES:END -->

@@ -11,8 +11,10 @@
 //!
 //! 1. **Content hash (freeze/identity — NOT human authorization)** — the daemon recomputes
 //!    `BLAKE3(JCS(artifact))` and compares it to the checked-in [`EXPECTED_PROFILE_BUDGET_HASH`].
-//!    This pins the artifact's BYTES: any drift from the frozen value fails closed
-//!    ([`BudgetError::HashDrift`]), and revising a budget forces a deliberate re-freeze of the
+//!    This pins the artifact's CANONICAL JCS CONTENT: any content drift from the frozen value fails
+//!    closed ([`BudgetError::HashDrift`]) — incidental whitespace/key-order reformatting is invariant
+//!    by design (the hash is over the canonical form, not the raw bytes). Revising a budget forces a
+//!    deliberate re-freeze of the
 //!    constant (a reviewable one-line diff). It proves IDENTITY/immutability, NOT that a human
 //!    approved the numbers — a content hash cannot attest human authorization. Treating the frozen
 //!    hash as a proxy for "owner sign-off" would overclaim; a real attestation (signed approval) is
@@ -26,14 +28,16 @@
 //!    binary runs with, so the frozen document and the running budget cannot silently diverge
 //!    ([`BudgetError::ParityMismatch`]).
 //!
-//! A MISSING artifact (empty bytes) yields [`BudgetError::Missing`], whose token is
+//! An empty-input [`load`] yields [`BudgetError::Missing`], whose token is
 //! `PROFILE_BUDGET_ARTIFACT_MISSING` (PRD.md:945) — never a zero or "unbounded" default. NOTE on
-//! reachability: the SHIPPED daemon `include_str!`s the artifact, so a genuinely missing file is a
-//! BUILD-TIME compile error (strictly stronger than a runtime check) and the embedded string is
-//! never empty. The `Missing` runtime token is therefore reachable only through the path-based
-//! [`load`]/[`verify_raw`] entry points a TOOL/harness uses when reading the artifact off disk
-//! (the Stage-B training gate of PRD.md:944). Both are honest fail-closed behaviours; only the
-//! stage differs.
+//! reachability (be precise): the SHIPPED daemon `include_str!`s the artifact, so a genuinely missing
+//! file is a BUILD-TIME compile error (strictly stronger than a runtime check) and the embedded
+//! string is never empty. There is NO filesystem/path-based loader in the repo today: [`load`] and
+//! [`verify_raw`] take a raw string, and the `Missing` variant is exercised ONLY by in-module unit
+//! tests (empty input). `PROFILE_BUDGET_ARTIFACT_MISSING` therefore has NO production caller yet — it
+//! is the fail-closed contract a future filesystem/Stage-B loader (PRD.md:944) would use, not a path
+//! that runs in the shipped daemon. Stated plainly so the doc does not imply a loader that isn't
+//! there.
 //!
 //! ## Canonicalization (RFC 8785 JSON Canonicalization Scheme)
 //!
@@ -80,12 +84,13 @@ pub const PROFILE_BUDGET_ARTIFACT_JSON: &str =
 /// The relative repo path of the frozen artifact (for status/preflight display + tooling).
 pub const PROFILE_BUDGET_ARTIFACT_PATH: &str = "artifacts/profile-budget-v1.json";
 
-/// The frozen content hash: `BLAKE3(JCS(artifact))`, lowercase hex. It pins the artifact's BYTES —
-/// a human who revises a budget re-runs [`content_hash`] and updates this constant, and the daemon
-/// fail-closes on any drift. It proves the artifact has not changed since this value was frozen; it
-/// does NOT prove a human reviewed or authorized the numbers (a content hash cannot attest that).
+/// The frozen content hash: `BLAKE3(JCS(artifact))`, lowercase hex. It pins the artifact's CANONICAL
+/// JCS CONTENT — a human who revises a budget re-runs [`content_hash`] and updates this constant, and
+/// the daemon fail-closes on any content drift (incidental whitespace/key-order reformatting is
+/// invariant by design). It proves the content has not changed since this value was frozen; it does
+/// NOT prove a human reviewed or authorized the numbers (a content hash cannot attest that).
 pub const EXPECTED_PROFILE_BUDGET_HASH: &str =
-    "f38fbebdbf99b0fb0b2846bf99d9c84a36466950c9e7aeb8901d21db89128c4b";
+    "d5d71004f97f3ea59cc515830a0316fa877782cec433d067c5c568083e31665e";
 
 /// The stable fail-closed token for a missing artifact (PRD.md:945). Emitted in the
 /// [`BudgetError::Missing`] display so an operator/harness sees exactly this string.
@@ -161,7 +166,7 @@ pub struct NormativeEnvelope {
 }
 
 /// The freeze/revision marker (documentary; not part of any budget comparison, and NOT a human
-/// authorization — the hash proves the bytes are frozen, not that anyone approved them).
+/// authorization — the hash proves the canonical JCS content is frozen, not that anyone approved it).
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct ReviewMarker {
@@ -197,7 +202,7 @@ pub enum BudgetError {
     Parse(String),
     /// The recomputed content hash disagrees with [`EXPECTED_PROFILE_BUDGET_HASH`].
     HashDrift {
-        /// The reviewed (expected) hash.
+        /// The expected (frozen) hash.
         expected: String,
         /// The hash recomputed from the loaded bytes.
         actual: String,
@@ -266,8 +271,8 @@ impl std::fmt::Display for BudgetError {
             BudgetError::Parse(e) => write!(f, "profile budget artifact did not parse: {e}"),
             BudgetError::HashDrift { expected, actual } => write!(
                 f,
-                "profile budget artifact hash drift: reviewed {expected}, got {actual} \
-                 (re-review and re-freeze EXPECTED_PROFILE_BUDGET_HASH)"
+                "profile budget artifact hash drift: frozen {expected}, got {actual} \
+                 (recompute and re-freeze EXPECTED_PROFILE_BUDGET_HASH)"
             ),
             BudgetError::EnvelopeMismatch {
                 field,
@@ -532,7 +537,7 @@ pub fn check_serve_ms_within_envelope(
 }
 
 /// The full fail-closed verification for a running binary: load the EMBEDDED artifact, verify its
-/// content hash against the reviewed [`EXPECTED_PROFILE_BUDGET_HASH`], check the normative envelope
+/// content hash against the frozen [`EXPECTED_PROFILE_BUDGET_HASH`], check the normative envelope
 /// for every profile, then parity-check `profile`'s enforced fields against `caps`. Returns the
 /// verified artifact on success; ANY failure blocks startup.
 pub fn verify(
@@ -570,12 +575,16 @@ pub fn verify_raw(
 }
 
 /// The preflight/status lines that make the frozen artifact VISIBLE (AC#3/#10): the artifact path,
-/// its content hash, and the selected profile's typed integer budget. Integers only — a human MiB
-/// gloss is a terminal display concern, not stored here. Fail-closed: if the embedded artifact does
-/// not verify against `caps`, the lines say so loudly rather than pretending a budget exists.
-pub fn preflight_lines(profile: SharingProfile, caps: &ResourceCaps) -> Vec<String> {
+/// its content hash, and the selected profile's typed integer FROZEN CEILING budget. Integers only —
+/// a human MiB gloss is a terminal display concern, not stored here. This surfaces the frozen
+/// artifact (the CEILING), which is separate from the caller's "effective resource controls" display
+/// (the values actually in force, possibly a tightened override). Verification here is the
+/// artifact↔frozen-DEFAULT SSOT (against [`ResourceCaps::default`]), independent of any runtime
+/// override — a tightening override must not make this fail. Fail-closed: if the embedded artifact
+/// does not verify, the lines say so loudly rather than pretending a budget exists.
+pub fn preflight_lines(profile: SharingProfile) -> Vec<String> {
     let mut out = Vec::new();
-    match verify(profile, caps) {
+    match verify(profile, &ResourceCaps::default()) {
         Ok(artifact) => {
             out.push(format!(
                 "frozen profile-budget artifact: {PROFILE_BUDGET_ARTIFACT_PATH} \
@@ -777,11 +786,11 @@ mod tests {
     fn embedded_artifact_hash_is_frozen() {
         // Freeze pin: if this reddens, a budget changed — recompute and update
         // EXPECTED_PROFILE_BUDGET_HASH (a deliberate, reviewable one-line diff). The hash proves the
-        // bytes are frozen; it is NOT a human authorization of the numbers.
+        // canonical JCS content is frozen; it is NOT a human authorization of the numbers.
         let actual = content_hash(PROFILE_BUDGET_ARTIFACT_JSON).expect("hashable");
         assert_eq!(
             actual, EXPECTED_PROFILE_BUDGET_HASH,
-            "profile-budget artifact hash drifted; re-review and re-freeze"
+            "profile-budget artifact hash drifted; recompute and re-freeze"
         );
     }
 
@@ -826,8 +835,7 @@ mod tests {
 
     #[test]
     fn preflight_lines_mark_enforced_vs_declared_only() {
-        let caps = ResourceCaps::default();
-        let lines = preflight_lines(SharingProfile::PublicShare, &caps).join("\n");
+        let lines = preflight_lines(SharingProfile::PublicShare).join("\n");
         // Enforced admission-envelope fields carry the enforced marker.
         assert!(lines.contains(&format!(
             "single_nar_bytes_uncompressed_nar=268435456{ENFORCED_MARKER}"

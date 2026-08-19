@@ -1366,8 +1366,8 @@ async fn main() -> ExitCode {
     // the running caps, and the effective serve-budget ceiling. A drifted/exceeded/diverged budget
     // BLOCKS startup with a precise reason — never a silent zero/unbounded default. (A genuinely
     // MISSING artifact is caught earlier, at BUILD time: the artifact is `include_str!`'d, so its
-    // absence is a compile error; the runtime PROFILE_BUDGET_ARTIFACT_MISSING token is for the
-    // path-based tooling loader.)
+    // absence is a compile error; PROFILE_BUDGET_ARTIFACT_MISSING has no production caller today — it
+    // is the fail-closed contract a future filesystem/Stage-B loader would use.)
     if let Err(err) = budget_check() {
         eprintln!("daemon-libp2p: profile-budget contract rejected: {err}");
         return ExitCode::from(2);

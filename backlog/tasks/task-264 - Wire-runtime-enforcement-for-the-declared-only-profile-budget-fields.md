@@ -4,6 +4,7 @@ title: Wire runtime enforcement for the declared-only profile-budget fields
 status: To Do
 assignee: []
 created_date: '2026-08-19 10:55'
+updated_date: '2026-08-19 13:00'
 labels:
   - production
   - operator
@@ -17,7 +18,7 @@ priority: medium
 ## Description
 
 <!-- SECTION:DESCRIPTION:BEGIN -->
-TASK-120 AC#10 froze the complete per-profile budget artifact (artifacts/profile-budget-v1.json). Its ENFORCED fields (single/inflight served NarSize, serve_duration, discovery deadline, announce count) are parity-checked against the running ResourceCaps and enforced by the peer-fabric budgets. The remaining artifact fields are DECLARED owner-reviewed CEILINGS that are surfaced (preflight/status) and fail-closed hashed, but NOT yet wired to a runtime shaper/limiter: upload_payload/total/rate_*_compressed_wire (no upload-rate shaper), transient_ram_bytes_ram (no RAM cap), apparent/allocated_disk_bytes_ondisk (only the narinfo entry-count cache is enforced, not a byte ceiling), open_fds_count (no fd rlimit wiring), concurrent_serves_count (concurrency is bounded by inflight BYTES today, not a serve COUNT). This mirrors the existing ResourceCaps honesty note that unenforced caps are deliberately not advertised as enforced. Wire each with an enforcement point + a bite test, then extend parity_with_caps to cover it, one field-class per bite.
+TASK-120 AC#10 froze the complete per-profile budget artifact (artifacts/profile-budget-v1.json). Its ENVELOPE-ENFORCED fields are single/inflight served NarSize, serve_duration and discovery deadline: they are parity-checked against ResourceCaps::default() (the artifact<->frozen-default SSOT) AND their effective post-override values are guarded within the frozen envelope. announce_count is NOT parity-checked - it is operator-overridable via --libp2p-announce-budget and is runtime-limited politeness, not an envelope-bounded safety ceiling. The remaining artifact fields are DECLARED, FROZEN (content-hashed) CEILINGS - surfaced in preflight and marked declared-only - but NOT yet wired to a runtime shaper/limiter, and NOT owner-reviewed (the hash freezes canonical content/identity; it does not attest human review): upload_payload/total/rate_*_compressed_wire (no upload-rate shaper), transient_ram_bytes_ram (no RAM cap), apparent/allocated_disk_bytes_ondisk (only the narinfo entry-count cache is enforced, not a byte ceiling), open_fds_count (no fd rlimit wiring), concurrent_serves_count (concurrency is bounded by inflight BYTES today, not a serve COUNT). This mirrors the ResourceCaps honesty rule that unenforced caps are not advertised as enforced. Wire each with an enforcement point + a mutation-proven bite test, then extend the effective/parity checks to cover it, one field-class per bite.
 <!-- SECTION:DESCRIPTION:END -->
 
 ## Acceptance Criteria

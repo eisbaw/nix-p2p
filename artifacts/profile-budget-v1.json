@@ -1,8 +1,8 @@
 {
   "schema_version": 1,
   "review": {
-    "reviewed_revision": "task-120-ac10-freeze-2",
-    "reviewed_note": "This artifact is FROZEN by a checked-in content hash (EXPECTED_PROFILE_BUDGET_HASH in daemon-core/src/profile_budget.rs): the daemon recomputes BLAKE3(JCS(this artifact)) and FAIL-CLOSES on any drift. The hash pins the BYTES (freeze/identity) and forces a deliberate re-freeze when a budget changes; it does NOT constitute human owner-review or authorization of the numbers - a content hash cannot attest that. A real approval attestation would be a separate signed mechanism, not built here."
+    "reviewed_revision": "task-120-ac10-freeze-3",
+    "reviewed_note": "This artifact is FROZEN by a checked-in content hash (EXPECTED_PROFILE_BUDGET_HASH in daemon-core/src/profile_budget.rs): the daemon recomputes BLAKE3(JCS(this artifact)) and FAIL-CLOSES on drift. The hash pins the canonical JCS CONTENT (freeze/identity) and forces a deliberate re-freeze when a budget changes; it catches any content drift (canonical-JCS - incidental whitespace/key-order reformatting is invariant by design). It does NOT constitute human owner-review or authorization of the numbers - a content hash cannot attest that. A real approval attestation would be a separate signed mechanism, not built here."
   },
   "envelope": {
     "max_single_nar_bytes_uncompressed_nar": 268435456,

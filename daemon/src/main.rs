@@ -622,9 +622,22 @@ fn derive_contract(config: &Config) -> Result<OperatorContract, String> {
     } else {
         Vec::new()
     };
+    // TASK-120 R2-1: `contract.caps` is the EFFECTIVE resource configuration the preflight displays.
+    // The composite's serve budget is CLI-overridable (`--iroh-max-serve-*`), so reflect those
+    // EFFECTIVE serve values here (an override that TIGHTENS the frozen ceiling must SHOW as the
+    // tightened value, not the 256 MiB / 1 GiB / 120 s default). The frozen CEILING is still surfaced
+    // separately by `profile_budget::preflight_lines`, and `enforce_budget_contract` guarantees these
+    // effective values are within the envelope, so display and enforcement agree. The other caps
+    // fields have no composite override and stay at their frozen defaults.
+    let caps = ResourceCaps {
+        max_nar_bytes_uncompressed: config.iroh_max_serve_nar_bytes,
+        max_inflight_bytes_uncompressed: config.iroh_max_inflight_nar_bytes,
+        serve_duration_ms: config.iroh_max_serve_duration_ms,
+        ..ResourceCaps::default()
+    };
     let contract = OperatorContract {
         profile,
-        caps: ResourceCaps::default(),
+        caps,
         privacy: PrivacyPolicy {
             diagnostics_opt_in: config.diagnostics,
         },
@@ -664,7 +677,13 @@ fn derive_contract(config: &Config) -> Result<OperatorContract, String> {
 ///     so an override can only TIGHTEN it. This is the check that closes the runtime bypass where
 ///     `--iroh-max-serve-nar-bytes 536870912` would serve 512 MiB while a defaults-only verify passed.
 fn enforce_budget_contract(contract: &OperatorContract, config: &Config) -> Result<(), String> {
-    daemon::profile_budget::verify(contract.profile, &contract.caps).map_err(|e| e.to_string())?;
+    // Parity is the artifact↔frozen-DEFAULT SSOT (that the code's frozen defaults match the reviewed
+    // artifact) — it uses `ResourceCaps::default()`, NOT `contract.caps`, because `contract.caps` now
+    // carries the EFFECTIVE (possibly TIGHTENED) serve values and a tightening must not fail parity.
+    daemon::profile_budget::verify(contract.profile, &ResourceCaps::default())
+        .map_err(|e| e.to_string())?;
+    // The EFFECTIVE serve budget (what actually reaches `ServeBudget` on both serve paths) must be
+    // within the frozen envelope — an override may only tighten it.
     daemon::profile_budget::check_serve_ms_within_envelope(
         config.iroh_max_serve_nar_bytes,
         config.iroh_max_inflight_nar_bytes,
@@ -3088,6 +3107,46 @@ mod tests {
         assert!(
             enforce_budget_contract(&contract, &over_dur).is_err(),
             "a 300 s serve-duration override must be rejected"
+        );
+    }
+
+    /// R2-1: a valid TIGHTENING serve override (64 MiB / 200 MiB inflight / 90 s, all below the
+    /// frozen ceiling) must be REFLECTED in `contract.caps` and in preflight's "effective resource
+    /// controls" — the display shows what is actually in force, not the frozen ceiling/default. The
+    /// frozen CEILING (256 MiB) is still surfaced separately. `derive_contract` derives the profile
+    /// from flags (default = upstream-only), which is enough to exercise the effective-caps wiring.
+    #[test]
+    fn tightened_serve_override_is_reflected_in_effective_controls() {
+        let config = Config {
+            iroh_max_serve_nar_bytes: 64 * 1024 * 1024, // 64 MiB — a valid tightening
+            iroh_max_inflight_nar_bytes: 200 * 1024 * 1024, // 200 MiB
+            iroh_max_serve_duration_ms: 90_000,         // 90 s
+            ..Config::default()
+        };
+        let contract = derive_contract(&config).expect("contract derives");
+        // The effective caps carry the tightened override, not the frozen default.
+        assert_eq!(contract.caps.max_nar_bytes_uncompressed, 64 * 1024 * 1024);
+        assert_eq!(
+            contract.caps.max_inflight_bytes_uncompressed,
+            200 * 1024 * 1024
+        );
+        assert_eq!(contract.caps.serve_duration_ms, 90_000);
+        // A tightening is within the envelope, so startup passes.
+        enforce_budget_contract(&contract, &config).expect("a tightening override passes");
+        let preflight = contract.preflight();
+        // Effective resource controls show the EFFECTIVE (tightened) value, not the 256 MiB default.
+        assert!(
+            preflight.contains("max_nar_bytes_uncompressed=67108864"),
+            "effective controls must reflect the 64 MiB tightening:\n{preflight}"
+        );
+        assert!(
+            !preflight.contains("max_nar_bytes_uncompressed=268435456"),
+            "effective controls must NOT still show the 256 MiB default:\n{preflight}"
+        );
+        // The frozen artifact CEILING is still surfaced (256 MiB) as the separate normative envelope.
+        assert!(
+            preflight.contains("single_nar_bytes_uncompressed_nar=268435456"),
+            "the frozen ceiling must still be surfaced:\n{preflight}"
         );
     }
 

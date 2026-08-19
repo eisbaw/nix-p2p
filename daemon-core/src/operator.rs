@@ -1138,11 +1138,13 @@ impl OperatorContract {
         }
         out.push(String::new());
 
-        // TASK-120 AC#10: the frozen, content-hashed per-profile budget artifact is
-        // the ONE source of truth these effective controls parity-check against. Surfacing it here
-        // makes the FULL declared budget (upload/RAM/disk/fd/discovery/announce) visible, and its
-        // fail-closed verification (hash + normative envelope + parity) runs on the running node.
-        for line in crate::profile_budget::preflight_lines(self.profile, &self.caps) {
+        // TASK-120 AC#10: the frozen, content-hashed per-profile budget artifact is the ONE source
+        // of truth the effective controls above parity-check against. This surfaces the frozen
+        // CEILING (path + hash + the FULL declared budget: upload/RAM/disk/fd/discovery/announce);
+        // the "effective resource controls" block above shows the values ACTUALLY IN FORCE (a
+        // tightening override is reflected there). Verification (hash + envelope + parity vs the
+        // frozen default) runs on the running node.
+        for line in crate::profile_budget::preflight_lines(self.profile) {
             out.push(line);
         }
         out.push(String::new());
