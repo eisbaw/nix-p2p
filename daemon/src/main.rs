@@ -1041,10 +1041,16 @@ impl Config {
                 // on unknown flags - so it must ACCEPT `--libp2p-no-mdns` or an explicit opt-out
                 // crashes the daemon at startup. This binary has no lan-share mDNS-default (mDNS is
                 // always default-OFF here), so `--libp2p-no-mdns` sets the already-default OFF state
-                // explicitly (a no-op on the value, but a legible, non-crashing surface). FULL
-                // zero-config lan-share parity (default_lan_mdns / provider back-fill / AC#5 supply
-                // defaults / the undiscoverable-provider fail-loud guard) lives only in daemon-libp2p
-                // today and is the deferred parity follow-up (TASK-277).
+                // explicitly (a no-op on the value, but a legible, non-crashing surface). NOTE: this
+                // binary does NOT run an undiscoverable provider silently dark — the pre-existing
+                // entry-path guard below (search `no DHT entry path`, ~line 1232) already fails a
+                // libp2p-requested node loud when it has neither `--libp2p-bootstrap` nor
+                // `--libp2p-mdns`. The residual vs daemon-libp2p's TASK-273 guard is narrow: this
+                // guard does not accept `--libp2p-external-address` as an entry path (daemon-libp2p
+                // does) and its message/scope differ — external-address entry-path parity + message
+                // unification are the deferred, low-priority follow-up (TASK-277). The other
+                // daemon-libp2p conveniences (default_lan_mdns / provider back-fill / AC#5 supply
+                // defaults) are supplied here by the NixOS module emitting the explicit flags.
                 "--libp2p-no-mdns" => config.libp2p_mdns = false,
                 "--libp2p-state-dir" => config.libp2p_state_dir = Some(value()?.into()),
                 "--libp2p-identity-seed" => {

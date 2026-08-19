@@ -717,11 +717,15 @@ fn parse_config<I: IntoIterator<Item = String>>(args: I) -> Result<Config, Strin
     // TASK-273 AC#5: lan-share zero-config SUPPLY + REACHABILITY. A bare `--profile lan-share` must
     // clear the nothing-to-serve (announce-after-fetch OR a static supply) and no-listen guards with
     // no extra flags, so under lan-share default announce-after-fetch ON (warm the LAN from what this
-    // node fetches — the same overlap mechanism as same-pin sharing) and default a wildcard listen
-    // when none was given. Applied AFTER derivation (announce-after-fetch is NOT fed back into the
-    // derivation, so this cannot change the derived profile). An explicit `--libp2p-listen`
-    // suppresses the listen default; there is deliberately no announce-after-fetch opt-out (a
-    // lan-share node that announces nothing has nothing to share — see TASK-273 limitations).
+    // node fetches — the same overlap mechanism as same-pin sharing) and default a LOOPBACK listen
+    // (`DEFAULT_LAN_SHARE_LISTEN`) when none was given — NOT a wildcard: a no-allowlist lan-share is
+    // refused a routable/`0.0.0.0` listen by the TASK-102 `lan_isolation_or_refuse` guard (it would
+    // be reachable by strangers with unauthorized content), so a wildcard default would fail to
+    // start; loopback binds, discovers over mDNS multicast, and fetches (see the const's doc).
+    // Applied AFTER derivation (announce-after-fetch is NOT fed back into the derivation, so this
+    // cannot change the derived profile). An explicit `--libp2p-listen` suppresses the listen
+    // default; there is deliberately no announce-after-fetch opt-out (a lan-share node that
+    // announces nothing has nothing to share — see TASK-273 limitations).
     if cfg.profile == SharingProfile::LanShare {
         if cfg.profile.default_announce_after_fetch() {
             cfg.libp2p_announce_after_fetch = true;
@@ -1487,13 +1491,26 @@ async fn main() -> ExitCode {
     }
     // TASK-273 AC#4: when LAN mDNS is ACTIVE (default under lan-share), disclose the presence
     // EXPOSURE on the first log line so the operator can tell it is working — and what it discloses
-    // — without RUST_LOG surgery. This is the sensitive off->on privacy default made legible.
+    // — without RUST_LOG surgery. This is the sensitive off->on privacy default made legible. It
+    // also names the SECOND new lan-share default exposure (announce-after-fetch), so the operator
+    // sees both consequences of a bare `--profile lan-share` at once.
     if cfg.mdns_active {
+        // A SECOND lan-share default exposure, disclosed in the SAME line only when it is actually
+        // ON: announce-after-fetch makes the node advertise the content-keys of what it fetches to
+        // same-pin DHT peers (disclosing WHAT it fetched), on top of the mDNS presence exposure.
+        let announce_clause = if cfg.libp2p_announce_after_fetch {
+            " It ALSO announces the content-keys of the store paths it fetches to same-pin DHT \
+             peers (announce-after-fetch, a lan-share default) — disclosing WHAT you have fetched; \
+             give a static supply set (--libp2p-seed-nar/--libp2p-provide-store) or --profile \
+             consume-only to avoid it."
+        } else {
+            ""
+        };
         println!(
             "daemon-libp2p: LAN discovery ACTIVE via mDNS (lan-share default). This host \
              multicasts its presence, NodeId, and libp2p listen multiaddrs to the local link and \
              answers any LAN querier — this is how same-pin peers find you with zero config. Opt \
-             out: --libp2p-no-mdns (NixOS: services.nix-p2p.libp2p.mdns = false)."
+             out: --libp2p-no-mdns (NixOS: services.nix-p2p.libp2p.mdns = false).{announce_clause}"
         );
     }
 

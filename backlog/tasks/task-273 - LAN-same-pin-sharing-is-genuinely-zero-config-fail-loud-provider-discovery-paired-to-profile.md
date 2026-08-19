@@ -6,7 +6,7 @@ title: >-
 status: In Progress
 assignee: []
 created_date: '2026-08-19 21:41'
-updated_date: '2026-08-19 23:14'
+updated_date: '2026-08-19 23:49'
 labels:
   - usability
   - cornerstone
@@ -25,10 +25,10 @@ daemon-libp2p/src/main.rs:758 lets a lan-share/public-share provider start with 
 ## Acceptance Criteria
 <!-- AC:BEGIN -->
 - [x] #1 A lan-share/public-share provider with no shareable entry path fails loud at startup (symmetry with consume-only), never a silent no-op
-- [x] #2 A node given ONLY --profile lan-share (no bootstrap, no injected peer address) discovers a same-pin peer on the LAN and serves a real nix build; proven by a two-node e2e that BITES (mutation: disable the auto-mDNS/zero-config wiring -> fetch falls back to upstream)
-- [x] #3 The mDNS-default-on-with-opt-out vs fail-loud-only fork is decided by mped-architect (Mark-emulator) with the privacy tradeoff (mDNS discloses LAN presence) made explicit, and the chosen contract documented
-- [x] #4 First-run: a startup line states the discovery entry path and the LAN-presence disclosure, so the user can tell it is working without RUST_LOG surgery
-- [x] #5 Supply/reachability zero-config: under lan-share, announce-after-fetch and a listen multiaddr are DEFAULTED so a bare --profile lan-share passes the nothing-shareable (main.rs:740-748) and listen (758-762) guards with no extra flags (folded in so AC#2 is genuinely achievable end-to-end)
+- [x] #2 The mDNS-default-on-with-opt-out vs fail-loud-only fork is decided by mped-architect (Mark-emulator) with the privacy tradeoff (mDNS discloses LAN presence) made explicit, and the chosen contract documented
+- [x] #3 First-run: a startup line states the discovery entry path and the LAN-presence disclosure, so the user can tell it is working without RUST_LOG surgery
+- [x] #4 Supply/reachability zero-config: under lan-share, announce-after-fetch and a listen multiaddr are DEFAULTED so a bare --profile lan-share passes the nothing-shareable (main.rs:740-748) and listen (758-762) guards with no extra flags (folded in so AC#2 is genuinely achievable end-to-end)
+- [ ] #5 A node given ONLY --profile lan-share (no bootstrap, no injected peer address) DISCOVERS a same-pin peer on the LAN and is SERVED a real nix build BY that peer (zero-config = discovery + consume/fetch), proven by a biting e2e (mutation: disable auto-mDNS -> RED). NOTE: cross-host SERVING from a bare lan-share node is NOT zero-config (loopback default listen; routable serve needs the allowlist) -> deferred TASK-276
 <!-- AC:END -->
 
 ## Implementation Plan
@@ -55,4 +55,8 @@ DEEP gate = YES (codex + qa + mped): flips a privacy default off->on (presence d
 Implementation (commit b1be7da): tri-state mDNS (Option<bool> + --libp2p-no-mdns), operator.rs default_lan_mdns()/default_announce_after_fetch() helpers, explicit --profile lan-share back-fills provider axis, AC#5 lan-share defaults (announce-after-fetch ON + LOOPBACK listen), AC#1 undiscoverable-provider fail-loud guard, AC#4 startup disclosure line. nixos: mdns nullOr bool + resolved mdnsEnabled + lan-share mirrors defaults. 4 new unit tests. Per-crate: 432 passed 0 failed; fmt+ruff clean. IMPORTANT correction to the plan: DEFAULT_LAN_SHARE_LISTEN is LOOPBACK not 0.0.0.0 - the TASK-102 lan-isolation guard refuses a routable listen for a no-allowlist lan-share, so a wildcard default would fail startup. Zero-config gets mDNS discovery + peer FETCH; cross-host SERVING needs the allowlist door or explicit routable listen -> filed TASK-276. e2e scenario libp2p-lan-share-zeroconfig added (node B argv ONLY --profile lan-share on /bin/daemon-libp2p, scope defaults to v1 so provider runs on v1). Image build + biting run + mutation proof pending.
 
 E2E verified (commit 3328c28, image .#e2e-image). BASELINE PASS: libp2p-lan-share-zeroconfig 13/13 checks, 76.8s - node B (bare --profile lan-share, /bin/daemon-libp2p) argv teeth all green (NO --libp2p-mdns/bootstrap/listen/scope/provider-addr), fetch exit0 + byte-identical NarHash + upstream.nar==0 (peer-served) + provider-liveness control. MUTATION PROOF (bites): (1) default_lan_mdns->false rebuilt+reran: RED - node B fails LOUD via the AC#1 undiscoverable-provider guard (no way to be discovered), never HTTP-ready, harness FATAL exit2 (also reddened 2 unit tests). (2) source_config mdns_enabled->false rebuilt+reran: RED exit2 - node B runs but its mDNS-off means the lone-genesis provider node A cannot find its put-quorum peer (node B) -> node A exits without announcing -> FATAL. NEITHER reaches the upstream.nar oracle because node B mDNS is load-bearing for the whole 2-node topology (node B is also node A quorum peer) - the bite is broader than upstream fallback. upstream.nar oracle discrimination is independently established by sibling libp2p-mdns-scope-isolation (>=1 on discovery failure). All temp mutations reverted; tree == committed; per-crate 432+4 green. HONEST DEVIATION from plan: brief expected upstream.nar>=1 RED but my AC#1 guard converts the silent-dark path into a loud refusal (stronger).
+
+DEEP-gate (mped) correction to record honestly: the zero-config guarantee is DISCOVERY + CONSUME (fetch), NOT cross-host serving. A bare --profile lan-share defaults a LOOPBACK listen (TASK-102 lan_isolation_or_refuse refuses a routable listen without the allowlist), so it discovers+fetches over the LAN but only serves to loopback/same-host; cross-host serving is TASK-276. AC#2 reworded accordingly.
+
+Also: the composite /bin/daemon (NixOS-shipped) is NOT silently dark for the undiscoverable case -- a pre-existing entry-path guard (daemon/src/main.rs:1232) already fails it loud; TASK-277 residual is external-address parity + message unification, NOT a missing guard.
 <!-- SECTION:NOTES:END -->
