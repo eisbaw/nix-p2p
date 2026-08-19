@@ -3,10 +3,10 @@ id: TASK-256
 title: >-
   Offline closure-overlap probe: measure peer hit-rate potential without any
   network code
-status: To Do
+status: Done
 assignee: []
 created_date: '2026-08-18 20:35'
-updated_date: '2026-08-19 10:18'
+updated_date: '2026-08-19 10:33'
 labels:
   - measurement
   - value-thesis
@@ -41,11 +41,19 @@ NOT: policy training material, holdout material, or a PRD success claim. TASK-95
 
 ## Acceptance Criteria
 <!-- AC:BEGIN -->
-- [ ] #1 Overlap computed OFFLINE from nix path-info closures across k>=2 stores + a request/build trace — NO protocol code, NO network, NO containers
-- [ ] #2 Run for BOTH populations: (a) same-org / same-pinned-flake stores; (b) unrelated stores on DIFFERENT nixpkgs revisions. The DIFFERENCE between (a) and (b) is reported as the finding
-- [ ] #3 Overlap reported as EXACT integer numerator/denominator (path counts AND byte totals); floats only as terminal display. NarSize (uncompressed) vs compressed-wire bytes kept as separate unit-suffixed fields, NEVER compared
-- [ ] #4 Cold-start and steady-state hit-rate reported SEPARATELY
-- [ ] #5 VACUITY BITE (mutation): the measurement RE-DERIVES overlap from raw path-info; a run handed a fabricated/injected overlap or the wrong closure set FAILS the check (demonstrated by mutation)
-- [ ] #6 Written finding: whether org/LAN or global-swarm is the honest first product, whether TASK-255 (whole-store supply) is worth building, and PRD risk 4 (supply lags demand) priced with data. An honest LOW-overlap result is an explicitly VALID outcome (the cheap kill signal)
-- [ ] #7 Labeled decision-input ONLY — NOT policy-training, NOT holdout, NOT a PRD success claim
+- [x] #1 Overlap computed OFFLINE from nix path-info closures across k>=2 stores + a request/build trace — NO protocol code, NO network, NO containers
+- [x] #2 Run for BOTH populations: (a) same-org / same-pinned-flake stores; (b) unrelated stores on DIFFERENT nixpkgs revisions. The DIFFERENCE between (a) and (b) is reported as the finding
+- [x] #3 Overlap reported as EXACT integer numerator/denominator (path counts AND byte totals); floats only as terminal display. NarSize (uncompressed) vs compressed-wire bytes kept as separate unit-suffixed fields, NEVER compared
+- [x] #4 Cold-start and steady-state hit-rate reported SEPARATELY
+- [x] #5 VACUITY BITE (mutation): the measurement RE-DERIVES overlap from raw path-info; a run handed a fabricated/injected overlap or the wrong closure set FAILS the check (demonstrated by mutation)
+- [x] #6 Written finding: whether org/LAN or global-swarm is the honest first product, whether TASK-255 (whole-store supply) is worth building, and PRD risk 4 (supply lags demand) priced with data. An honest LOW-overlap result is an explicitly VALID outcome (the cheap kill signal)
+- [x] #7 Labeled decision-input ONLY — NOT policy-training, NOT holdout, NOT a PRD success claim
 <!-- AC:END -->
+
+## Implementation Notes
+
+<!-- SECTION:NOTES:BEGIN -->
+TASK-256 DONE in commit 7ec27e9. Offline closure-overlap probe scripts/task256_closure_overlap.py + evidence/task-256/. Data: nix path-info --recursive closures for 9 pkgs x 2 nixpkgs pins (A=445d861c nixos-26.05 flake pin = same-pin; B=50ab7937 nixos-24.11 = cross-rev), via cache narinfo (narSize, no NAR download). DEMAND=curl@A (21 paths). FINDING (exact int num/den): (a) same-pin cold 4/21 paths (55.45% NAR bytes 37730224/68039832) -> steady 20/21 (99.44% bytes 67657296/68039832); (b) cross-rev 0/21 in BOTH cold and steady, 0 NAR bytes. Cross-rev overlap is STRUCTURALLY 0 (input-addressed store paths rehash across revs) -> bytes-per-hit irrelevant when hit-rate=0. RECOMMENDATION: org/LAN same-pin is the honest first product (95%+ warm); global permissionless swarm across arbitrary revs is a kill unless segmented into same-pin cohorts. PRD risk 4 = bounded cold-start transient on same-pin only. Defer TASK-255 (no cross-rev hits to announce; same-pin warms to 95% via announce-on-fetch). VACUITY BITE (AC#5) demonstrated on real results: --verify green unmutated, RED (rc1) when b_cross_rev__steady_state paths_num injected 0->21; --self-test green (fabrication+tamper fire, overlap(D,D)!=overlap(D,S_real), empty=nothing-proven). GATES: check-no-floats self+real green (task256 added to SCANNED); check-discovery-no-shortcut self+real green (no discovery code added); ruff check+format green (flake pin ruff). Did NOT run just e2e (no e2e surface). Label: decision-input ONLY (AC#7).
+
+ORCHESTRATOR VERIFICATION 2026-08-19 (escalated past LIGHT because the finding is product-direction-bearing). Independently RE-DERIVED from the raw captures (not the implementer self-report): same-pin steady overlap 39/40 (97.5%), cross-rev steady 0/40; decisively, A_curl vs B_curl share 6 package NAMES but 0 exact store paths — confirming the cross-rev 0 is genuine input-addressed rehashing, NOT an empty-operand or failed-build artifact (B closures are all non-empty: B_curl 36, B_git 154, ...). Oracle BITE run by the orchestrator: injecting a fabricated cross-rev numerator (0->21) drove --verify to exit 1 (RED); real --verify exit 0; --self-test exit 0. Guards: check-no-floats green, check-discovery-no-shortcut green. VERDICT: finding CONFIRMED. IMPLICATION for TASK-258: the global public pool across arbitrary nixpkgs revs offloads NOTHING (0 overlap) — 258 BEP5 rendezvous is valuable only for bootstrapping SAME-PIN cohorts (which is the org/LAN case at global scale). Does not invalidate 258; reframes its value.
+<!-- SECTION:NOTES:END -->
