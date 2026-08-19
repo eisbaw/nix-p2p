@@ -9,12 +9,14 @@
 #
 # SAFETY CONTRACT — this script touches ONLY:
 #   * THIS rootless user's podman objects (system prune is per-user by construction),
-#   * THIS project's cargo target dir(s) (rebuildable by `cargo build`),
+#   * STALE cargo artifacts inside this project's target dir (pruned by cargo-sweep, which
+#     keeps the current dep cache; the old full `rm -rf <target>` wipe is gone),
 #   * unreferenced fixture generations (rebuildable by `just fixtures`),
 #   * stale git worktree registrations (`git worktree prune`).
 # It NEVER removes another session's files and NEVER touches /tmp/claude-* scratch of
-# other sessions. Every rm is guarded (a path must actually look like what we claim it
-# is before it is removed).
+# other sessions. The cargo stage runs NO `rm` — cargo-sweep deletes only cargo artifacts
+# inside a target dir it resolves via `cargo metadata`; the podman/worktree/fixture stages
+# use their own tools' prune primitives, never an unqualified path rm.
 #
 # Not `set -e`: a single failing prune must NOT abort the rest of the reclaim — the
 # whole point is to free as much as possible in one shot. Failures are printed.
@@ -72,35 +74,41 @@ collect_fixture_root() {
 collect_fixture_root "canonical" || :
 collect_fixture_root "wide" --wide || :
 
-# 4. Cargo target dir(s) — the biggest consumer. A dir is cleared ONLY if it actually
-#    looks like a cargo target dir (CACHEDIR.TAG or a debug/release tree), so a mistyped
-#    or empty CARGO_TARGET_DIR can never turn this into a catastrophic rm. Removing the
-#    warm cache is the intended reclaim tradeoff: the next build is COLD.
-clean_cargo_dir() {
-    local dir="$1"
-    [[ -n "${dir}" && -d "${dir}" ]] || return 0
-    if [[ -f "${dir}/CACHEDIR.TAG" || -d "${dir}/debug" || -d "${dir}/release" ]]; then
-        local sz
-        sz=$(du -sh "${dir}" 2>/dev/null | cut -f1)
-        echo "reclaim: clearing cargo target dir ${dir} (${sz:-?})"
-        rm -rf "${dir}"
-    else
-        echo "reclaim: ${dir} does not look like a cargo target dir, skipping" >&2
+# 4. Cargo target — the biggest consumer. We PRUNE STALE artifacts (old dependency versions
+#    from dependency churn, other branches) while KEEPING the current dep cache, via
+#    `cargo-sweep`. This replaces the old `rm -rf <target>` full wipe: a reclaim no longer
+#    forces a cold rebuild of every dependency from source. NO `rm` runs here at all —
+#    cargo-sweep only ever deletes cargo artifacts inside a target dir it identifies via
+#    `cargo metadata` (run from the repo root, honouring CARGO_TARGET_DIR), so there is no
+#    unqualified path to delete. If cargo-sweep is unavailable (run outside `nix develop`),
+#    we skip rather than fall back to a wipe.
+sweep_cargo_target() {
+    if ! command -v cargo-sweep >/dev/null 2>&1; then
+        echo "reclaim: cargo-sweep not on PATH — run via 'nix develop -c just reclaim'; skipping cargo cleanup (NO full wipe)" >&2
+        return 0
+    fi
+    local tgt="${CARGO_TARGET_DIR:-$HOME/.cache/nix-p2p-target}"
+    if [[ ! -d "${tgt}" ]] || [[ ! -f "${tgt}/CACHEDIR.TAG" && ! -d "${tgt}/debug" && ! -d "${tgt}/release" ]]; then
+        echo "reclaim: ${tgt} is not a cargo target dir, skipping cargo cleanup" >&2
+        return 0
+    fi
+    local sz
+    sz=$(du -sh "${tgt}" 2>/dev/null | cut -f1)
+    echo "reclaim: sweeping cargo target ${tgt} (${sz:-?}) — keep current deps, prune stale (cargo-sweep, no cold rebuild)"
+    # SAFE default: drop artifacts not touched in > N days (stale versions / old branches);
+    # everything from recent builds (the current dep cache) is kept, so no cold rebuild.
+    cargo sweep --time "${NIX_P2P_RECLAIM_DAYS:-2}" \
+        || echo "reclaim: cargo sweep --time failed (continuing)" >&2
+    # Optional AGGRESSIVE cap: set NIX_P2P_RECLAIM_MAXSIZE (e.g. 40GB) to evict the OLDEST
+    # artifacts until the target is under that size — under real disk pressure. This MAY evict
+    # some current deps (a partial, not full, rebuild). Off by default.
+    if [[ -n "${NIX_P2P_RECLAIM_MAXSIZE:-}" ]]; then
+        echo "reclaim: aggressive cap NIX_P2P_RECLAIM_MAXSIZE=${NIX_P2P_RECLAIM_MAXSIZE}"
+        cargo sweep --maxsize "${NIX_P2P_RECLAIM_MAXSIZE}" \
+            || echo "reclaim: cargo sweep --maxsize failed (continuing)" >&2
     fi
 }
-# Resolve to real paths so the repo-local ./target and a shared CARGO_TARGET_DIR that
-# happen to be the same place are not cleared twice.
-# The $HOME/.cache/nix-p2p-target default mirrors the devShell shellHook (flake.nix,
-# TASK-238): CARGO_TARGET_DIR is normally inherited from `nix develop`, but list the
-# HOME-based default too so a reclaim run WITHOUT that env still clears the shared dir.
-declare -A seen_target=()
-for candidate in "${repo_root}/target" "${CARGO_TARGET_DIR:-$HOME/.cache/nix-p2p-target}"; do
-    [[ -n "${candidate}" ]] || continue
-    real=$(readlink -f "${candidate}" 2>/dev/null || echo "${candidate}")
-    [[ -n "${seen_target[${real}]:-}" ]] && continue
-    seen_target[${real}]=1
-    clean_cargo_dir "${real}"
-done
+sweep_cargo_target
 
 after=$(avail_bytes "${repo_root}")
 reclaimed=$(( after - before ))

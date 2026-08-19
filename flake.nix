@@ -613,6 +613,10 @@
           pkgs.cargo-flamegraph
           pkgs.perf
           pkgs.valgrind
+          # cargo-sweep: `just reclaim` prunes STALE cargo artifacts (old dep versions from
+          # dependency churn) while KEEPING the current dep cache - so a reclaim no longer forces
+          # a cold rebuild of every dependency from source (the prior `rm -rf target` did).
+          pkgs.cargo-sweep
         ];
         # Exact toolchain derivation, so the Justfile's `_toolchain` guard can
         # prove the tools come from THIS one rather than from any /nix/store

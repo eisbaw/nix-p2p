@@ -38,3 +38,32 @@ edition = "2024"
 
 [workspace.lints.rust]
 unsafe_code = "forbid"
+
+# Debug-info split for disk (dev profile). Most of `target/debug/deps` is dependency
+# DEBUG INFO, not code. Dependencies build with line-tables-only (`debug = 1`) — enough for
+# backtraces, a fraction of the size — while our OWN crates keep full `debug = 2` for
+# stepping/variable inspection. Done as base=1 + explicit per-member overrides (NOT the
+# `package."*"` glob, whose treatment of workspace members is version-ambiguous). `[profile]`
+# is only honoured in the workspace ROOT. Reclaim stale artifacts with `just reclaim`
+# (cargo-sweep), never a full target wipe.
+[profile.dev]
+debug = 1
+
+[profile.dev.package.daemon]
+debug = 2
+[profile.dev.package.daemon-core]
+debug = 2
+[profile.dev.package.daemon-libp2p]
+debug = 2
+[profile.dev.package.fabric-iroh]
+debug = 2
+[profile.dev.package.fabric-libp2p]
+debug = 2
+[profile.dev.package.peer-fabric]
+debug = 2
+[profile.dev.package.proc-supervisor]
+debug = 2
+[profile.dev.package.testproxy]
+debug = 2
+[profile.dev.package.mainline-rendezvous]
+debug = 2

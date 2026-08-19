@@ -66,7 +66,9 @@ _headroom:
 
 # Only THIS user's podman objects and THIS project's rebuildable artifacts. Retains
 # current+previous fixture generations, prunes stale worktrees, and clears cargo
-# targets. Reports bytes freed; the next build is cold. See scripts/reclaim.sh.
+# targets: cargo-sweep prunes STALE artifacts but KEEPS the current dep cache, so the
+# next build is incremental (NOT cold). Set NIX_P2P_RECLAIM_MAXSIZE for an aggressive cap.
+# See scripts/reclaim.sh.
 # Reclaim this project's rebuildable footprint and rootless Podman objects safely.
 reclaim: _python
     scripts/reclaim.sh
@@ -351,6 +353,13 @@ e2e: _headroom _python fixtures-large
 # Run EVERY e2e scenario (the real gate; slower than `just e2e`).
 e2e-full: _headroom _python fixtures-large
     "${NIX_P2P_PYTHON}/bin/python3" scripts/e2e_harness.py
+
+# TASK-272: mDNS + kad get_providers discovery-latency measurement (instrument, not a gate).
+# Reuses the zero-bootstrap mDNS topology with RUST_LOG=info and writes integer-ms latencies +
+# raw daemon logs to evidence/task-272/. See the discovery-latency section of docs/profiling.md.
+# Measure discovery latency (mDNS + kad get_providers) to evidence/task-272/.
+discovery-latency: _headroom _python fixtures-large
+    "${NIX_P2P_PYTHON}/bin/python3" scripts/e2e_harness.py --only measure-discovery-latency
 
 # Scoped to the harness's own label - never the fixture tree. Also the manual
 # counterpart of the Ctrl-C leak trap. Beyond pods/containers/networks it also
