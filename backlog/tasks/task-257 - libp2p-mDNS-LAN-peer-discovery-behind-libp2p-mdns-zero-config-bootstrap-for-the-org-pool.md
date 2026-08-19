@@ -3,10 +3,11 @@ id: TASK-257
 title: >-
   libp2p mDNS LAN peer discovery behind --libp2p-mdns (zero-config bootstrap for
   the org pool)
-status: To Do
-assignee: []
+status: Done
+assignee:
+  - '@claude'
 created_date: '2026-08-18 20:53'
-updated_date: '2026-08-18 20:56'
+updated_date: '2026-08-19 08:52'
 labels:
   - libp2p
   - mdns
@@ -61,4 +62,12 @@ TESTING IS REQUIRED (owner: "we need to test both"). The oracle must BITE by mut
 
 <!-- SECTION:NOTES:BEGIN -->
 Sequence (owner 2026-08-18): mDNS FIRST, then TASK-258 Mainline rendezvous, then TASK-259 DNSADDR. Owner will NOT run public server infra, so there are no public bootstrap nodes: TASK-258 is the only path to a global public pool, TASK-259 is enterprise/internal only, and this task (mDNS) is the zero-infrastructure answer for the LAN/org pool. All three are default-OFF CLI flags plus mirrored NixOS options; all three need tests whose oracles bite by mutation.
+
+IMPLEMENTED + committed bd12c02 (explicit pathspec, no push). Full gate GREEN: cargo test --workspace (1178 passed), fmt --check clean, clippy -D warnings clean, check-no-floats green, check-golden-vectors BYTE-IDENTICAL, check-discovery-no-shortcut refined guard (self-test proves BOTH mdns directions + real-code mutation bites), just e2e exit 0 (all 11 fast scenarios incl libp2p-mdns-bootstrap 8/8 and libp2p-mdns-scope-isolation 7/7, no regression).
+
+just audit is the ONE non-green gate, and it is a PRE-EXISTING HEAD condition, NOT a 257 regression: Cargo.lock is BYTE-IDENTICAL to HEAD (diff empty), so 257 introduces ZERO new advisories. Three fresh 2026 advisories fail at HEAD (RUSTSEC-2026-0118/0119 on hickory-proto 0.25.2 reachable via libp2p-mdns AND libp2p-dns; 0258 on h2/hickory-net in the iroh subtree). deny.toml all-features=true resolves the superset. mped ruling: 257 ships on its own merits; the honest audit unblock is the separate owner-visible TASK-260 (adds the 3 IDs to deny.toml ignore with per-ID rationale + upstream-bump follow-ups). Not marking Done (orchestrator owns Done + the cross-model gate).
+
+DEEP GATE codex-257R NO-GO (afeb96d). F1 (composite report-matches-wire) CONFIRMED FIXED. FOUR substantive findings for the fix round: (1) ROUTING-FLOOD/ECLIPSE: mDNS accepts UNAUTHENTICATED + UNCAPPED LAN advertisements (attacker PeerId/addr/TTL), app loops all into kad.add_address with NO admission/rate cap (swarm.rs:2412; libp2p-mdns keeps every pair in an uncapped SmallVec + trusts advertised TTL) -> a malicious LAN host floods/skews the Kad routing table. Materially worse than a finite explicit bootstrap list. FIX: bounded admission/rate cap on mDNS-discovered peers. (2) CROSS-SCOPE ROUTING POLLUTION: scope blocks cross-scope CONTENT but a cross-scope mDNS peer still gets add_addressd -> occupies routing state + is propagated as a routing hint (kad add_address inserts as Disconnected before any handshake; kad server responses do not filter disconnected peers). FIX: remove cross-scope peers from routing after the failed scoped handshake (or filter). Scope e2e must assert the cross-scope peer is ABSENT from routing, not just content-unresolved. (3) EXPOSURELEDGER GAP (AC): the mDNS NodeId/address disclosure is a --status LABEL only; it is NOT appended to the real ExposureLedger (peer-fabric/src/exposure.rs) by the mDNS handler/startup. FIX: record OurNodeId/OurAddress (broadcast) + LanPeer (discovered) disclosures in the ledger when mDNS fires. (4) NONDETERMINISM/WORKAROUND: the e2e passes only via a harness provider-restart up-to-6x (e2e_harness.py:2532) compensating for the ONE-SHOT startup announce (daemon-libp2p/main.rs:956) losing the put-quorum race; production has no retry -> nondeterministic. FIX: fold TASK-261 (in-daemon bounded announce-retry) into 257 so the e2e passes WITHOUT the restart workaround (CLAUDE.md: no workarounds). Minor: daemon-libp2p --preflight --libp2p-mdns prints upstream-only + active mDNS (dry-run, no socket) - report inconsistency; exposure wording LAN-broadcast->link-local multicast, cannot-JOIN should acknowledge routing pollution. Audit-HEAD-condition (TASK-260) confirmed honest, NOT the rejection basis. Content integrity chain SOUND (sig/PeerId-binding/Bao/NarHash) - a hostile mDNS peer costs a retry, never a bad store path. ALL FIXES NEED cargo+e2e -> BLOCKED on disk (9.6G).
+
+DEEP GATE PASSED (arbitrated), 2026-08-19. Commits bd12c02+afeb96d+3028ef1+a014590. mDNS zero-config LAN bootstrap WORKS OUT OF THE BOX: e2e libp2p-mdns-bootstrap 8/8 RESTART-FREE (lone first node discoverable, no --libp2p-bootstrap) + scope-isolation 9/9. F1 admission cap, F2 sweep-deleted->bounded-by-cap+TASK-262 (arbitrated within TCB via mped, codex eviction-demand exceeds TCB), F3 ExposureLedger, F4 restart-free (TASK-261 folded). mped arbitration GO + required doc-fix applied. Residuals: TASK-260 (audit HEAD-condition), 262 (deterministic eviction), 263 (readiness gate). Full gate green except audit(260).
 <!-- SECTION:NOTES:END -->
