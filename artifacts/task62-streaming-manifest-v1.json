@@ -1,0 +1,84 @@
+{
+  "schema_version": 1,
+  "task": "task-62",
+  "artifact": "streaming-peer-fetch measurement manifest (AC#8)",
+  "freeze": {
+    "frozen_before_measurement": true,
+    "frozen_at_commit": "PRE-IMPLEMENTATION (no streaming refactor exists yet at freeze time)",
+    "rule": "Thresholds and sample sizes are PRE-REGISTERED. Any threshold added or edited AFTER a streaming measurement is taken INVALIDATES the corresponding claim (AC#8). The AC#3 Nix-retry de-risk run (crash-kill-mid-nar) is NOT a streaming measurement governed by this freeze; it is the pre-existing standing oracle, cited here as evidence, not tuned against these numbers.",
+    "no_float_decision_authority": "No float is ever the decision authority. Every gate below decides on integers (ns, bytes) or exact rationals {num,den} compared by cross-multiplication. Floats appear ONLY in *_display fields as terminal, human-facing renderings. KNOWN TENSION (flagged honestly, not hidden): scripts/sizeaxis.py + scripts/scalefit.py currently compute the fitted RSS slope and its 95% CI in Python float. AC#5's gate (below) therefore carries an IMPLEMENTATION OBLIGATION: reduce the reported CI endpoints to an exact rational and decide by cross-multiplication; a gate that lets the raw float be the decision authority violates the owner no-float rule and must be treated as a defect."
+  },
+  "units": {
+    "time": "ns (integer)",
+    "ram": "bytes RSS (integer)",
+    "nar": "bytes UNCOMPRESSED RawNarV1 (NarSize); NEVER compressed FileSize",
+    "ratios": "exact rational {num,den}; compare by cross-multiplication, never by dividing to a float"
+  },
+  "stream_chunk_bytes": 65536,
+  "sample_sizes": {
+    "rss_slope_grid_mib": [8, 16, 32, 64, 128],
+    "rss_slope_grid_note": "TASK-65 DEFAULT_SIZE_GRID_MIB; >=5 distinct sizes so the fit is not on 3 points. Driven by `just profile` / scripts/sizeaxis.py, model key size.fetcher_rss_hwm_bytes_ram.",
+    "rss_size_repeats_min": 1,
+    "ttfb_fixture": "the ~110 MiB `big` / s6 correlated NAR (Content-Length path)",
+    "ttfb_size_independence_contrast_mib": 8,
+    "ttfb_repeats_per_arm_min": 3,
+    "inflight_sizes_mib": [8, 128]
+  },
+  "wall_clock_prediction": {
+    "recorded_up_front": true,
+    "claim": "UNCHANGED. Streaming is NOT a throughput/latency win. Per TASK-64, ~70% of the peer-path per-byte cost is below our code (QUIC-over-UDP + bao) and cannot move; the removable buffer copy is ~0.7 ns/B. A 110 MiB peer fetch predicted ~0.549 s -> ~0.55 s.",
+    "so": "A measured 'no wall-clock win' reads as CONFIRMATION of this prediction, not as a failure of the task. The task's value is time-to-first-byte overlap and fetcher RSS decouple, not MB/s."
+  },
+  "thresholds": {
+    "ac1_ttfb": {
+      "measured_at": "the HTTP client (Nix / test client), NOT inside the daemon; inspection is not an oracle",
+      "ttfb_ns": "request-sent -> first body byte received",
+      "total_ns": "request-sent -> last body byte received",
+      "pass_rule": "streaming PASSES iff ttfb_ns * 4 <= total_ns  (ratio <= 1/4)",
+      "pass_ratio": {"num": 1, "den": 4},
+      "bite_rule": "the buffering counterfactual MUST FAIL the pass_rule: revert TransportNarSource::resolve to collect-then-Full and its ttfb_ns * 4 > total_ns (predeclared buffering ratio >= 3/4, i.e. ttfb_ns * 4 >= total_ns * 3), because under buffering the client sees byte one only after the whole NAR is fetched+verified",
+      "buffering_bite_ratio": {"num": 3, "den": 4},
+      "unbounded_channel_trap": "streaming into an UNBOUNDED channel that flushes at the end MUST also fail pass_rule (its TTFB equals the buffering TTFB); the oracle must observe first-byte-at-client, so a flush-at-end producer cannot sneak a pass"
+    },
+    "ac2_ac7_backpressure_inflight": {
+      "counter": "a NEW fetcher-side in-flight-byte accounting counter around the in-flight buffer (NOT holder store residency, which is the wrong side per the TASK-65 trap note); high-water mark observed under a deliberately SLOW-reading client",
+      "counter_placement_obligation": "The counter MUST sit at the LOWEST point that holds bytes pending client consumption - below any adapter-internal (iroh-blobs / libp2p /nar/4) accumulation. A counter placed ABOVE an adapter that internally buffers the whole NAR reads ~1 chunk and passes trivially at both 8 and 128 MiB while real RSS blows up - a green-for-the-wrong-reason gate. The counter's placement is the load-bearing assumption; it must be proven, not asserted.",
+      "max_inflight_fetch_bytes_ram": 262144,
+      "max_inflight_fetch_bytes_ram_derivation": "4 * STREAM_CHUNK_BYTES (65536). A small bounded window, independent of NarSize.",
+      "pass_rule": "hwm_bytes <= 262144 at BOTH 8 MiB and 128 MiB NAR",
+      "size_independence_rule": "hwm(128MiB) / hwm(8MiB) <= 5/4 (near 1); the bound does not scale with NAR size",
+      "size_independence_ratio": {"num": 5, "den": 4},
+      "bite_rule": "TWO negative controls, both must FAIL: (1) a bounded-channel producer that still accumulates O(NarSize) ABOVE the counter - hwm scales with size, exceeds 262144 at 128 MiB; (2) a producer that buffers the whole NAR BELOW the counter - this proves the counter actually OBSERVES the buffer it claims to bound (a counter that stays ~0 while RSS blows up FAILS the placement obligation). If the counter is vacuous (never populated) the AC is not met."
+    },
+    "ac7_cancellation": {
+      "triggers": ["client disconnect", "HEAD request", "header/idle timeout", "slow-reader teardown"],
+      "cancellation_deadline_ns": 2000000000,
+      "cancellation_deadline_ns_note": "test-injected SHORT bound (2 s). In production the existing integer envelope bounds it: body_idle_timeout 10 s (10000000000 ns), total 60 s (60000000000 ns).",
+      "pass_rule": "after a trigger, the fetcher in-flight counter returns to 0 AND the peer connection is closed within cancellation_deadline_ns; every accounting permit (serve-side reservation via Admission Drop, and the new fetcher-side counter) is released",
+      "bite_rule": "a producer that keeps filling the buffer after the consumer is gone, or a permit that leaks past the deadline, FAILS"
+    },
+    "ac5_rss_slope": {
+      "model_key": "size.fetcher_rss_hwm_bytes_ram",
+      "driver": "`just profile` / scripts/sizeaxis.py over the 5-size grid, slope_ci95 from scalefit (Monte-Carlo-verified coverage)",
+      "before_buffering_slope_display": "1.0322 [0.9928 .. 1.0717] (TASK-65/72; ~1.0 B RAM per B NAR, the whole-NAR buffer)",
+      "pass_rule": "THE GATE is: streaming PASSES iff the fetcher slope 95% CI-high < 1/2 (decisive decouple from the ~1.0 buffering slope). A weaker sanity note that the CI must also EXCLUDE 1 is subsumed by the 1/2 gate and is NOT a co-equal condition.",
+      "gate_ci_high_decouple": {"num": 1, "den": 2},
+      "sanity_note_ci_high_excludes_one": {"num": 1, "den": 1},
+      "decision_representation": "reduce the reported float CI-high to an exact rational h_num/h_den, ROUNDING OUTWARD (UP) so the rational is never looser than the float (outward rounding is the ONLY direction that cannot launder a fail into a pass); then require 2*h_num < h_den (below 1/2) by cross-multiplication. The rounding direction is FROZEN here so the implementer cannot pick it post-hoc and re-open the freeze. See freeze.no_float_decision_authority for the sizeaxis-float obligation.",
+      "bite_rule": "a single-point RSS check is unfalsifiable (TASK-65 note); the gate MUST be the fitted slope over >=5 sizes. Revert-to-buffering: the slope CI includes or exceeds 1 and FAILS."
+    },
+    "ac4_framing": {
+      "correlated_path_expected_size_some": "response carries Content-Length == the signed NarSize (uncompressed RawNarV1 bytes), NOT bytes.len() of a collected Vec",
+      "cold_start_path_expected_size_none": "NO Content-Length; chunked transfer-encoding",
+      "teardown": "peer stream torn down on HEAD and on client disconnect (bounded by ac7_cancellation)",
+      "pass_rule": "both framing shapes asserted at the HTTP client; both teardown conditions observed"
+    },
+    "a_a_noise": {
+      "a_a_band_ratio": {"num": 1, "den": 20},
+      "a_a_rule": "two identical streaming runs of the TTFB measurement must agree within the A/A band: |ratio_a - ratio_a'| <= 1/20",
+      "separation_rule": "the streaming-vs-buffering TTFB separation (>= 3/4 - 1/4 = 1/2) must exceed 4 * a_a_band (4/20 = 1/5); 1/2 > 1/5 by construction, but the MEASURED separation must still exceed the MEASURED A/A spread, else the delta is noise",
+      "repeats_min_per_arm": 3
+    }
+  },
+  "oracles_must_bite": "Each threshold above names its BITE (the counterfactual that must fail). Per TESTING.md, a gate that cannot be made to fail by a plausible regression is not an oracle. The load-bearing bites: (1) revert-to-buffering fails AC#1 TTFB; (2) a size-scaling buffer fails AC#2 inflight; (3) a leaked permit fails AC#7; (4) a single-point / CI-includes-1 fit fails AC#5."
+}

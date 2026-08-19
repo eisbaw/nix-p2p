@@ -1,0 +1,22 @@
+e2e: 1 scenarios registered
+
+=== scenario: crash-kill-mid-nar ===
+  ok   AC#5: no *.sec under the served cache tree (host-side walk)
+  ok   AC#5 precondition: the signing key exists in the generation root
+  ok   crash(b): kill fired at >=50% of the NAR by BYTES OBSERVED at the proxy
+  ok   crash(b): daemon is gone after the kill
+  ok   crash(b): build succeeds via fallback despite the mid-NAR kill
+  ok   crash(b): byte oracle - big NarHash matches upstream via fallback
+  ok   crash(b): proxy log shows a truncated-transfer event (bytes_sent < file_size)
+  ok   crash(b): the fallback ACTUALLY served the full NAR (bytes_sent == file_size)
+  ok   crash(b)/AC#3: nix-store --verify-path passes on the surviving path
+  ok   crash(b)/AC#3: no orphaned tmp/lock residue in the store after the crash
+  ok   crash(b)/AC#3 BITE: verify-path FAILS on an injected corrupt store path
+  => crash-kill-mid-nar: PASS
+
+=== summary ===
+  PASS crash-kill-mid-nar (11/11 checks, 40.0s)
+  ---- 1 scenarios, 40.0s total
+
+e2e: ALL SCENARIOS PASSED
+EXIT=0 2026-08-19T17:38:11+02:00; free after: 26580688896

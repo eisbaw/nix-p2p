@@ -1,0 +1,39 @@
+{
+  "task": "task-62",
+  "acceptance_criterion": "AC#3 (de-risk half): the Nix-retry EMPIRICAL question, front-loaded before implementation",
+  "measured_at_head": "9b71c48",
+  "measured_on": "2026-08-19",
+  "integer_exact": true,
+  "no_floats_in_decisions": true,
+  "question": "Streaming makes a mid-body peer failure CLIENT-VISIBLE (today TransportNarSource::resolve fails BEFORE the response head, so FallbackNarSource turns a peer failure into an invisible upstream fetch, S2). The design-blocking risk: after streaming, does NIX still complete the build via fallback when a substituter delivers a 200 + truncated body, with the store path absent-or-correct, never wrong? This is a question about NIX behavior, not our code.",
+  "experiment": {
+    "harness": "scripts/e2e_harness.py --only crash-kill-mid-nar (rootless-podman pod: nix client -> daemon substituter -> testproxy -> mock origin, plus a fallback substituter)",
+    "trigger": "SIGKILL the daemon at ~50% of the 110 MiB `big` NAR, fired on BYTES OBSERVED at the proxy (not a sleep); the NAR is throttled so the transfer window is wide and the kill lands mid-stream",
+    "why_this_models_streaming": "Killing the daemon mid-NAR produces exactly the CLIENT-VISIBLE mid-body truncation that end-to-end streaming newly introduces on the p2p path: Nix receives a 200 + Content-Length from a substituter and then the body is cut short. It is a FAITHFUL proxy for the NIX-behavior half of AC#3.",
+    "provenance_the_kill_lands_post_head": "The wave-1 upstream serve path already RELAYS the NAR to Nix streaming (daemon-core/src/upstream.rs fetch_streaming wraps response.into_body() in BoundedBody(..).boxed()), it does NOT collect-then-send. That is WHY a SIGKILL fired on ~50%-of-bytes-observed-at-the-proxy reaches Nix as a 200 + Content-Length + truncated body (POST-head), not a pre-head socket drop. The p2p path the refactor changes is daemon/src/transport_fetch.rs:460 (Full::new(Bytes::from(bytes)).boxed(), collect-then-Full); streaming converges it to the SAME post-head-truncation behavior the upstream path already exhibits, so the upstream-kill is a faithful reference, not merely an analogy.",
+    "nar_bytes_uncompressed_nar": 115343872,
+    "kill_threshold_bytes_min": 57671936
+  },
+  "result": {
+    "verdict": "PASS",
+    "checks_passed": 11,
+    "checks_total": 11,
+    "duration_s_display": 40.0,
+    "exit_code": 0,
+    "load_bearing_checks": {
+      "kill_fired_at_ge_50pct_by_observed_bytes": true,
+      "daemon_gone_after_kill": true,
+      "build_succeeds_via_fallback_despite_mid_nar_kill": true,
+      "byte_oracle_big_narhash_matches_upstream_via_fallback": true,
+      "proxy_log_shows_truncated_transfer_bytes_sent_lt_file_size": true,
+      "fallback_actually_served_full_nar_bytes_sent_eq_file_size": true,
+      "nix_store_verify_path_passes_on_surviving_path": true,
+      "no_orphaned_tmp_or_lock_residue_after_crash": true,
+      "BITE_verify_path_fails_on_injected_corrupt_store_path": true
+    }
+  },
+  "finding": "NOT DESIGN-BLOCKING. Nix survives a client-visible mid-body abort of a substituter: it falls back to the next substituter, completes the build, and the surviving store path's NarHash matches the signed upstream (correct, never wrong). No partial NAR is accepted; no orphaned tmp/lock residue remains; and the integrity check BITES (goes RED) on an injected corrupt path. The S2 additive invariant holds under the new mid-body-abort class, resting on gate-2 (Nix's sha256==NarHash) plus Nix's cross-substituter retry.",
+  "oracle_vs_code_path_residual": "No check in scenario_crash_kill_mid_nar asserts that NIX ITSELF observed a 200 + partial body from the primary (as opposed to a pre-head socket drop). The 11 checks prove proxy-side truncation + fallback-served-full + integrity-bites, which would pass identically for a pre-head drop. That the primary failure was specifically POST-HEAD truncation rests on the CODE PATH (daemon-core/src/upstream.rs fetch_streaming relays streaming, so the kill lands post-head), NOT on a client-side assertion. The oracle proves fallback+integrity robustly; the post-head property is a code-path fact. A client-side 'saw 200 then short body' assertion is a strengthening to add with the AC#3 implementation-half peer-kill scenario.",
+  "honesty_caveat": "This de-risks the NIX half of AC#3 only. It kills the DAEMON PROCESS on the upstream-fetch path; it does NOT yet exercise the DAEMON-side truncation that streaming introduces (daemon stays ALIVE, PEER dies mid-body, daemon must truncate its OWN response to Nix rather than invisibly falling back). That daemon-side truncation is OUR code and must be built and mutation-proven by a NEW peer-kill scenario (kill the iroh/libp2p PEER at ~50% of a p2p-served NAR) once the streaming refactor lands. The Nix dependency is GREEN; the daemon-side streaming-truncation oracle is a to-build item tracked under AC#3's implementation half.",
+  "wall_clock_prediction_recorded_up_front": "Streaming does not change throughput (~70% of the peer per-byte cost is below our code; see TASK-64). Wall clock is predicted UNCHANGED. This experiment concerns failure semantics, not latency."
+}
