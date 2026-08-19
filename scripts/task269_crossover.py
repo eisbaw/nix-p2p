@@ -140,7 +140,7 @@ def build_map(sweep: dict) -> dict:
             "regen_floor_ns": REGEN_FLOOR_NS,
             "regen_per_byte_num": REGEN_PER_BYTE_NUM,
             "regen_per_byte_den": REGEN_PER_BYTE_DEN,
-            "links": [{"id": i, "bytes_per_s": b, "label": l} for i, b, l in LINKS],
+            "links": [{"id": i, "bytes_per_s": b, "label": lbl} for i, b, lbl in LINKS],
         },
         "cdn_baseline": CDN_BASELINE,
         "packages": [],
@@ -223,8 +223,8 @@ def print_report(m: dict) -> None:
               f"regen={fmt_ms(pkg['regen_ns'])}  "
               f"CDN={fmt_ms(pkg['cdn_wall_ns'])} / {pkg['cdn_filesize_bytes']} B")
         header = f"{'codec':<11}{'ratio':>7}{'comp_cpu':>11}{'decomp':>10}"
-        for l in links:
-            header += f"{l['id'].split('_')[0]:>9}"
+        for lk in links:
+            header += f"{lk['id'].split('_')[0]:>9}"
         header += f"{'xover':>11}"
         print(header)
         for codec, cell in pkg["cells"].items():
@@ -234,8 +234,8 @@ def print_report(m: dict) -> None:
             row = (f"{codec:<11}{fmt_ratio(cell['ratio_num'], cell['ratio_den']):>7}"
                    f"{fmt_ms(cell['compress_cpu_ns']):>11}"
                    f"{fmt_ms(cell['decompress_cpu_ns']):>10}")
-            for l in links:
-                pl = cell["per_link"][l["id"]]
+            for lk in links:
+                pl = cell["per_link"][lk["id"]]
                 row += f"{('WIN' if pl['peer_beats_cdn'] else '.'):>9}"
             row += f"{fmt_mbs(cell['crossover_link_bps']):>11}"
             print(row)
@@ -247,18 +247,18 @@ def print_report(m: dict) -> None:
     print("=" * 78)
     for pkg in m["packages"]:
         print(f"\n{pkg['name']}:")
-        for l in links:
+        for lk in links:
             best_codec, best_wall, best_win = None, None, None
             for codec, cell in pkg["cells"].items():
                 if cell.get("status") != "ok":
                     continue
-                pl = cell["per_link"][l["id"]]
+                pl = cell["per_link"][lk["id"]]
                 if best_wall is None or pl["peer_wall_ns"] < best_wall:
                     best_wall = pl["peer_wall_ns"]
                     best_codec = codec
                     best_win = pl["peer_beats_cdn"]
             verdict = "PEER WINS" if best_win else "CDN wins"
-            print(f"  {l['label']:<34} best={best_codec:<10} "
+            print(f"  {lk['label']:<34} best={best_codec:<10} "
                   f"wall={fmt_ms(best_wall):>9}  -> {verdict}")
 
 
