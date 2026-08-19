@@ -61,7 +61,7 @@
   <line x1="500" y1="370" x2="500" y2="396" stroke="#2e7d32" marker-end="url(#arrg)"/>
   <rect x="330" y="396" width="470" height="56" rx="5" fill="#e8f5e9" stroke="#2e7d32"/>
   <text x="342" y="414" font-size="11" font-weight="bold" fill="#1b5e20">NarHash = sha256(RAW NAR)   —   SIGNED, taken HERE</text>
-  <text x="342" y="430" font-size="10.5" fill="#1b5e20">BLAKE3(RAW NAR) = the iroh blob id — our content address. Because the raw</text>
+  <text x="342" y="430" font-size="10.5" fill="#1b5e20">BLAKE3(RAW NAR) = the ContentKey — our content address. Because the raw</text>
   <text x="342" y="443" font-size="10.5" fill="#1b5e20">nar is deterministic, every peer computes the SAME id, so a blob is shareable.</text>
 
   <line x1="929" y1="364" x2="929" y2="396" stroke="#f9a825" marker-end="url(#arr)"/>

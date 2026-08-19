@@ -16,8 +16,8 @@
   seams (NarinfoSource / NarSource / PeerFabric), iroh vs libp2p as swappable
   backends behind PeerFabric, the trust boundary (metadata upstream, bytes P2P,
   Nix re-verifies), and the crate topology (peer-fabric <- daemon-core <-
-  fabric-* <- one binary per backend). TARGET — the seam is a proposal
-  (docs/peer-fabric-seam.md), not yet built. This is the onboarding overview;
+  fabric-* <- one binary per backend). CURRENT — the seam is built
+  (docs/peer-fabric-seam.md); libp2p is the primary backend, iroh optional. This is the onboarding overview;
   fig-arch-1..4 zoom into subsystems.
 - `fig-candidate-{A,B,C}-*.svg`, `fig-D.svg` — early PRD-round candidate
   sketches. B and C are STALE: they show the superseded gossip-first/tracker
