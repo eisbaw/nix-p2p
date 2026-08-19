@@ -6,6 +6,7 @@ title: >-
 status: To Do
 assignee: []
 created_date: '2026-08-19 18:30'
+updated_date: '2026-08-19 18:48'
 labels:
   - testing
   - real-upstream
@@ -34,3 +35,9 @@ NUMBER DISCIPLINE: NarSize (uncompressed) vs FileSize/on-wire (compressed transp
 - [ ] #2 Two-node peer-serve time (discovery + peer fetch) is measured against the CDN download on a real (shaped, non-loopback) link
 - [ ] #3 Result reported as an integer-unit, float-free, magnitude-bounded delta with NarSize-vs-transport units kept separate and every number provenance-labelled
 <!-- AC:END -->
+
+## Implementation Notes
+
+<!-- SECTION:NOTES:BEGIN -->
+TRANSFER-MODEL HALF 2026-08-19 (docs/profiling.md). CDN side MEASURED (this host link to cache.nixos.org ~1-4 MB/s, single timed fetch each): hello 0.05s/57KB, curl 0.26s/554KB, git 2.14s/8MB, python3 48.3s/56.6MB. raw/compressed penalty (real narinfos) 2.1-6.3x. Peer side MODELLED from the measured serve cost (22ms floor + 2.2GB/s regen, streaming; serves RAW NAR). Verdict: on TRANSFER alone the peer wins on a fast LOCAL link (LAN 1Gbps: 2-44x; confirms 256 org/LAN thesis) and loses over a link comparable to the CDN (compression wins); git (6.3x compression) is the peer worst case. LOAD-BEARING CAVEAT: EXCLUDES discovery latency (PRD risk-3, seconds-scale, UNMEASURED) which for small packages could dominate + flip the result; peer side is an optimistic MODEL (no dial/handshake/framing/discovery). REMAINING: a real two-machine e2e INCLUDING discovery over a shaped/LAN link — the measured (not modelled) half. 268 stays In Progress.
+<!-- SECTION:NOTES:END -->

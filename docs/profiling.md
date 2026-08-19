@@ -91,3 +91,38 @@ therefore **per-path subprocess overhead**, not NAR throughput — batching rege
 persistent nix-store connection would cut it. This is consistent with TASK-64/62's "~70% of
 the per-byte cost sits below our code": on real packages our serve code is cheap; the cost is
 the external `nix-store` regeneration overhead + the bytes themselves.
+
+## Peer-serve vs CDN — a first competitive cut (TASK-268, 2026-08-19)
+
+The **CDN side is measured** (this host's real link to cache.nixos.org, one timed fetch each);
+the **peer side is MODELLED** from the measured serve cost — so the peer numbers are an
+*optimistic lower bound*, and this is a first cut, not a verdict of record.
+
+Real CDN download (this host's WAN link to Fastly was ~1-4 MB/s — box-specific, single sample):
+
+| package | compressed (CDN) | CDN time | raw NAR (peer) | raw / compressed |
+| --- | ---: | ---: | ---: | ---: |
+| hello | 57 KB | 0.05 s | 275 KB | 4.8x |
+| curl | 554 KB | 0.26 s | 1.18 MB | 2.1x |
+| git | 8.0 MB | 2.14 s | 50.5 MB | 6.3x |
+| python3 | 56.6 MB | 48.3 s | 133 MB | 2.4x |
+
+Peer TRANSFER model (serves the RAW NAR; wall ≈ 22 ms floor + max(regen@2.2 GB/s, transfer))
+vs the measured CDN, by peer-link speed:
+- **LAN 1 Gbps:** peer wins **2-44x** — the local link so outweighs the 2.4-6.3x raw-byte
+  penalty that it stops mattering.
+- **home 100 Mbps:** mixed — peer wins *except* `git`, whose 6.3x compression ratio (the
+  best-compressing package) is the peer's worst case.
+- **WAN comparable to the CDN link:** CDN wins everywhere (it moves 2.4-6.3x fewer bytes).
+
+**Verdict, with the caveat that decides it:**
+- On **data transfer alone**, the peer wins on a fast *local* link — confirming the org/LAN
+  same-pin thesis (256) with numbers — and loses over a link comparable to the CDN's, where
+  compression wins.
+- **This EXCLUDES discovery latency**, which the PRD flags as seconds-scale and which is **not
+  measured here**. For small packages (sub-second transfers) a multi-second DHT lookup would
+  dominate and could *flip* the result. So the end-to-end verdict is **unsettled**: transfer
+  favours the LAN peer; discovery is the unmeasured wildcard.
+- The peer side is a model (ignores dial/handshake/framing/**discovery**); the CDN side is a
+  single sample on one host's link. A real two-machine e2e that *includes discovery* is the
+  honest confirmation — still to run (this is the transfer-model half of TASK-268).
