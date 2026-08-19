@@ -4,7 +4,7 @@ title: 'HARDENING (wave-2a): claim-schema conformance + NarSize-abort spam defen
 status: To Do
 assignee: []
 created_date: '2026-08-08 20:13'
-updated_date: '2026-08-19 16:52'
+updated_date: '2026-08-19 16:53'
 labels:
   - hardening
 dependencies:
@@ -29,11 +29,6 @@ Wave-2a hardening block, deep-gated (runs against stabilized wave-2a surfaces). 
 - [ ] #2 NarSize-abort: a claim pointing at a blob exceeding the signed NarSize is aborted before full download (bite: without the abort, the huge blob downloads; with it, aborted early)
 - [ ] #3 deferred-finding label for wave-2a is empty (closed or converted to explicit tasks)
 - [ ] #4 Cheap measured win pulled in from TASK-61: remove the gratuitous clone at transport_iroh.rs:350 (add_bytes(raw_nar.to_vec()) takes a borrowed slice and copies it into the store, on top of the file buffer read at main.rs:243). Take Vec<u8> by value or use add_path/add_stream. This is roughly HALF the measured 2.15x holder multiplier and is NOT the architecture question (that is TASK-61); measure the before/after
-- [ ] #5 NarSize-abort against claim-spam (PRD risk 6): a claim asserting/pointing at an oversized blob is ABORTED at the SIGNED NarSize threshold BEFORE downloading in full — mutation-proven (a lying oversized claim aborts early, never downloads the full attacker-chosen blob; a within-bound claim proceeds). NarSize(uncompressed) vs FileSize(compressed) kept as separate units, never compared
-- [ ] #6 Malformed/truncated/version-skewed claims are REJECTED fail-closed (never a bad store path; a hostile claim costs at most a retry) — proven by mutation; forward-compat: UNKNOWN claim variants are TOLERATED (dropped, not a hard error) consistent with the no-enumeration forward-compat discipline
-- [ ] #7 Claim-schema conformance fuzz is BOUNDED (capped iterations + short duration + small corpus — NO CPU-hog farm on the shared box; caps documented); it exercises unknown-variant/version-skew/malformed inputs and asserts the tolerate-vs-reject boundary holds
-- [ ] #8 Wasted-dial bounding on lying claims: a peer serving lying claims is bounded in the dial/derivation work it can waste (per-peer bound); prove the bound holds by mutation — OR file it as a focused follow-up if this cycle grows too large
-- [ ] #9 NO floats in any bound/gate/decision/serialized field (integers/exact rationals); deferred wave-2a findings filed as follow-up tasks, not fixed inline
 <!-- AC:END -->
 
 ## Implementation Notes
