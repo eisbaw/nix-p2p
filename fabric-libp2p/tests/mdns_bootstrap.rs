@@ -211,6 +211,34 @@ async fn mdns_toggle_default_off_and_enabled_node_starts() {
     );
 }
 
+/// TASK-257 F-3 (AC#6): the mDNS LAN disclosure must be recorded in the real ExposureLedger (the
+/// disclosure source-of-truth), not merely surfaced as a status label. With mDNS ENABLED the
+/// ledger CONTAINS `LanPeer <- OurNodeId` and `LanPeer <- OurAddress`; with mDNS OFF the ledger
+/// records NO LanPeer disclosure. MUTATION: dropping the `ledger.record_all(...)` in fabric.rs
+/// leaves the ledger without the LanPeer entries -> this reddens.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn mdns_records_lan_exposure_in_the_ledger() {
+    use peer_fabric::{Disclosed, Exposure, PeerFabric, Recipient};
+
+    let on = start_mdns_node(10, "mdns-ledger", true).await;
+    let entries = on.exposure_ledger().entries();
+    assert!(
+        entries.contains(&Exposure::new(Recipient::LanPeer, Disclosed::OurNodeId))
+            && entries.contains(&Exposure::new(Recipient::LanPeer, Disclosed::OurAddress)),
+        "an mDNS-enabled fabric must record its LAN NodeId + address disclosure in the \
+         ExposureLedger; got {entries:?}"
+    );
+
+    let off = start_mdns_node(11, "mdns-ledger", false).await;
+    assert!(
+        !off.exposure_ledger()
+            .entries()
+            .iter()
+            .any(|e| e.to == Recipient::LanPeer),
+        "a default-OFF node must record NO LanPeer disclosure"
+    );
+}
+
 /// BITE #1 (load-bearing) + the positive discover->resolve path. Two SAME-scope nodes,
 /// mDNS ON, NEITHER given the other's address: they must discover each other via mDNS
 /// (their routing tables populate) and C must resolve P's announced record. The paired

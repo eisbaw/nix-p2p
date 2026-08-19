@@ -789,6 +789,14 @@ pub struct StatusInputs {
     /// A short fallback reason if the node is currently on the upstream path, e.g.
     /// "no-provider", "discovery-unavailable", "budget-exhausted". Empty if none.
     pub fallback_reason: String,
+    /// The live kad routing-table size (distinct peers across all k-buckets), if this node runs a
+    /// participating swarm (TASK-257 F-2). `None` for an upstream-only node with no swarm - the
+    /// status line is then OMITTED. It is the honest observable of ROUTING STATE: a same-scope
+    /// mDNS peer that completes the scoped kad handshake is counted here, while a CROSS-SCOPE mDNS
+    /// peer - which is dialed but never inserted (its `ProtocolNotSupported` is not admitted) - is
+    /// NOT, so an operator (and the scope-isolation e2e) can SEE that cross-scope neighbours never
+    /// pollute routing, not merely that content did not resolve.
+    pub kad_routing_peers: Option<u32>,
 }
 
 // ===========================================================================
@@ -940,6 +948,11 @@ impl OperatorContract {
             "bootstrap_healthy={}/{}",
             rt.bootstrap_healthy, rt.bootstrap_total
         ));
+        // TASK-257 F-2: the live kad routing-table size, so an operator sees ROUTING STATE (a
+        // cross-scope mDNS neighbour never enters it). Emitted only for a participating swarm.
+        if let Some(n) = rt.kad_routing_peers {
+            out.push(format!("kad_routing_peers={n}"));
+        }
         out.push(format!(
             "holders={}",
             rt.holder_count
@@ -992,7 +1005,7 @@ impl OperatorContract {
         out.push(format!(
             "lan_mdns_exposure={}",
             if self.lan_mdns_enabled {
-                "presence + node_id + libp2p-listen-multiaddrs (LAN-broadcast, answers any querier incl cross-scope)"
+                "presence + node_id + libp2p-listen-multiaddrs (link-local multicast, answers any querier incl cross-scope)"
             } else {
                 "none"
             }
@@ -1566,6 +1579,7 @@ mod tests {
             announce_budget_used: 0,
             derive_budget_global: None,
             fallback_reason: String::new(),
+            kad_routing_peers: None,
         };
         let off = OperatorContract::for_profile(SharingProfile::ConsumeOnly);
         assert!(!off.lan_mdns_enabled, "default is OFF");
@@ -1705,6 +1719,7 @@ mod tests {
             // the status cap is single-sourced from the ledger, not re-read from caps.
             derive_budget_global: Some((123, 999)),
             fallback_reason: "discovery-unavailable".to_string(),
+            kad_routing_peers: None,
         };
         let s = c.status(&rt);
         assert!(s.contains("profile=public-share"));
@@ -1740,6 +1755,7 @@ mod tests {
             announce_budget_used: 0,
             derive_budget_global: None,
             fallback_reason: String::new(),
+            kad_routing_peers: None,
         };
         let s = c.status(&rt);
         assert!(
@@ -1790,6 +1806,7 @@ mod tests {
             announce_budget_used: 0,
             derive_budget_global: None,
             fallback_reason: String::new(),
+            kad_routing_peers: None,
         };
         let s = c.status(&rt);
         assert!(s.contains("peer_path=unknown"), "{s}");
@@ -1843,6 +1860,7 @@ mod tests {
             announce_budget_used: 0,
             derive_budget_global: None,
             fallback_reason: String::new(),
+            kad_routing_peers: None,
         };
         assert!(s.status(&rt).contains("dht_role=server"));
     }

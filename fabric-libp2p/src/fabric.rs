@@ -13,9 +13,9 @@ use std::time::Duration;
 
 use libp2p::PeerId;
 use peer_fabric::{
-    AvailabilityAnnouncer, ContentKey, ExposureLedger, LocalPeerDiscovery, NarServer, NarTransfer,
-    NodeId, NodeLocator, PeerFabric, PeerHoldQuery, ProviderDirectory, RelayHints,
-    TransferRegistry, TransportTag,
+    AvailabilityAnnouncer, ContentKey, Disclosed, Exposure, ExposureLedger, LocalPeerDiscovery,
+    NarServer, NarTransfer, NodeId, NodeLocator, PeerFabric, PeerHoldQuery, ProviderDirectory,
+    Recipient, RelayHints, TransferRegistry, TransportTag,
 };
 use proc_supervisor::TaskSupervisor;
 
@@ -191,8 +191,25 @@ impl Libp2pFabric {
         // gate; capture it (an Arc clone) BEFORE `Node::start` consumes `config`, like the
         // signing key above. It never enters the swarm.
         let publication_eligibility = Arc::clone(&config.publication_eligibility);
+        // TASK-257 F-3: whether this node runs LAN mDNS. Capture BEFORE `Node::start` consumes the
+        // config, so the disclosure can be recorded in the ledger created just below.
+        let mdns_enabled = config.mdns_enabled;
         let node = Node::start(config)?;
         let ledger = Arc::new(ExposureLedger::new());
+        // TASK-257 F-3 (AC#6): the ExposureLedger is the SINGLE source of truth for what this
+        // fabric discloses, read by preflight/status. LAN mDNS, when active, broadcasts THIS host's
+        // NodeId and its dialable listen ADDRESS to every device on the link-local segment (and
+        // answers any querier), so record BOTH disclosures to the `LanPeer` recipient AS the mDNS
+        // node comes up. Without this the mDNS disclosure would be only a status LABEL and the
+        // ledger - the audited disclosure history - would omit it (the F-3 gap). Recorded once here
+        // rather than per-advertisement: the disclosure is intrinsic to running mDNS at all, and the
+        // ledger records WHAT is disclosed to WHOM, not a packet count.
+        if mdns_enabled {
+            ledger.record_all([
+                Exposure::new(Recipient::LanPeer, Disclosed::OurNodeId),
+                Exposure::new(Recipient::LanPeer, Disclosed::OurAddress),
+            ]);
+        }
 
         // The durable-floor files (TASK-176 #1) live under `state_dir` when configured:
         // the directory's anti-rollback floor and the announcer's per-key sequence, each

@@ -299,14 +299,31 @@ pub async fn build_libp2p_provider_source(
     // `Unavailable(InsufficientRouting)`. So WAIT (bounded) for the bootstrap join to
     // populate at least one routing peer before the caller announces. Fail-fast with a
     // clear message on timeout rather than letting the caller's announce fail obscurely.
-    // Only relevant when a bootstrap set was configured (the join target).
-    if !cfg.bootstrap.is_empty() {
-        let deadline = Instant::now() + Duration::from_secs(20);
+    // Relevant when a bootstrap set was configured (the join target) OR when mDNS is enabled
+    // (TASK-257 F-4: a same-scope LAN neighbour is the zero-config join target). For mDNS the
+    // window is a touch longer (link-local discovery + a dial handshake), and a timeout is NOT
+    // fatal: a lone-genesis mDNS provider that has not yet seen a LAN peer proceeds to announce
+    // under the BOUNDED in-daemon retry below (announce_seed_records), so the feature needs no
+    // external supervisor restart.
+    if !cfg.bootstrap.is_empty() || cfg.mdns_enabled {
+        let window_secs = if cfg.bootstrap.is_empty() { 30 } else { 20 };
+        let deadline = Instant::now() + Duration::from_secs(window_secs);
         loop {
             if fabric.handle().routing_peers().await >= 1 {
                 break;
             }
             if Instant::now() >= deadline {
+                if cfg.bootstrap.is_empty() {
+                    // mDNS-only lone genesis: no same-scope LAN peer has appeared YET. Do NOT fail
+                    // startup - the bounded announce retry re-attempts once mDNS brings a put-quorum
+                    // peer. Warn and proceed.
+                    tracing::warn!(
+                        "libp2p provider: no same-scope mDNS LAN peer joined the routing table \
+                         within the discovery window; announcing lone-genesis under a bounded \
+                         retry (it will land once a same-scope LAN peer appears)"
+                    );
+                    break;
+                }
                 return Err(
                     "libp2p provider: kad routing table stayed empty after joining the \
                      bootstrap peer(s); cannot announce into an unreachable DHT"
@@ -712,6 +729,12 @@ pub async fn announce_provider_seeds(
 /// door ([`announce_public_seeds`]) funnel through it, so the verify-then-sign SSOT (the
 /// site where a provider CLAIM is minted) is single-sourced and a public seed announce
 /// signs the exact same record a LAN one would.
+/// The BOUNDED total window (INTEGER seconds) for retrying a lone-genesis provider's announce
+/// while a same-scope LAN peer joins the routing table via mDNS (TASK-257 F-4). Finite, so a
+/// genuinely-alone provider fails with a clear error rather than hanging; long enough to absorb
+/// link-local discovery + a dial handshake. No float enters the bound.
+const ANNOUNCE_QUORUM_RETRY_WINDOW_SECS: u64 = 30;
+
 async fn announce_seed_records(
     fabric: &Libp2pFabric,
     readiness: &ProviderRelayReadiness,
@@ -754,10 +777,41 @@ async fn announce_seed_records(
         let witness = witness_authority.authorize(record.clone()).map_err(|e| {
             format!("publication eligibility refused libp2p seed record for {nar_hash}: {e}")
         })?;
-        announcer
-            .announce(&witness, config.budget)
-            .await
-            .map_err(|e| format!("announcing libp2p provider record for {nar_hash}: {e}"))?;
+        // TASK-257 F-4: a lone GENESIS provider (zero-bootstrap / mDNS) can lose the startup
+        // put-quorum race - its first announce fails `Unreachable` because no same-scope peer is in
+        // the routing table YET. Retry within a BOUNDED integer window, WAITING for a routing peer
+        // to appear (via mDNS) between attempts, so the zero-bootstrap feature does not depend on an
+        // external supervisor restart. Only `Unreachable` (no-quorum) is retried; a record-level
+        // fault (Rejected/Ineligible/Persist) or a budget DeadlineExceeded returns immediately (a
+        // retry cannot help and must not mask it). The TASK-56 supply-integrity floor already ran
+        // (verify_provider_seeds above), and each attempt still respects the caller's announce
+        // budget - the retry adds a bounded WAIT, never an unbounded or un-budgeted publish.
+        let retry_deadline =
+            Instant::now() + Duration::from_secs(ANNOUNCE_QUORUM_RETRY_WINDOW_SECS);
+        loop {
+            match announcer.announce(&witness, config.budget).await {
+                Ok(_receipt) => break,
+                Err(AnnounceError::Unreachable(why)) => {
+                    if Instant::now() >= retry_deadline {
+                        return Err(format!(
+                            "announcing libp2p provider record for {nar_hash}: publication \
+                             substrate unreachable after a bounded retry: {why}"
+                        ));
+                    }
+                    // Wait (bounded) for a routing peer to appear, then retry the announce.
+                    while fabric.handle().routing_peers().await == 0
+                        && Instant::now() < retry_deadline
+                    {
+                        tokio::time::sleep(Duration::from_millis(250)).await;
+                    }
+                }
+                Err(e) => {
+                    return Err(format!(
+                        "announcing libp2p provider record for {nar_hash}: {e}"
+                    ));
+                }
+            }
+        }
         records.push(record);
     }
     Ok(records)
@@ -2481,6 +2535,10 @@ impl daemon_core::StatusFacts for SwarmStatusFacts {
             bootstrap_total: self.bootstrap.len() as u32,
             bootstrap_healthy: healthy,
             path,
+            // TASK-257 F-2: the live routing-table size, read from the running swarm. A cross-scope
+            // mDNS neighbour is dialed but never inserted (ProtocolNotSupported is not admitted), so
+            // it never appears in this count - the honest routing-state observable.
+            kad_routing_peers: Some(self.handle.routing_peers().await as u32),
         }
     }
 }

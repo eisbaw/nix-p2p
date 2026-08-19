@@ -256,6 +256,10 @@ pub struct StatusFactSnapshot {
     /// `SwarmStatusFacts` for the honest scope (this classifies the path to the CONFIGURED bootstrap
     /// peers, not a NAT-reachability verdict).
     pub path: PeerPath,
+    /// The live kad routing-table size (distinct peers), if this node runs a participating swarm
+    /// (TASK-257 F-2). `None` for an upstream-only node with no swarm. Surfaced so an operator can
+    /// see routing state - a cross-scope mDNS neighbour is never counted here.
+    pub kad_routing_peers: Option<u32>,
 }
 
 impl StatusFactSnapshot {
@@ -265,6 +269,7 @@ impl StatusFactSnapshot {
             bootstrap_total: 0,
             bootstrap_healthy: 0,
             path: PeerPath::None,
+            kad_routing_peers: None,
         }
     }
 }
@@ -347,6 +352,7 @@ impl Observability {
             announce_budget_used,
             derive_budget_global,
             fallback_reason: fallback_reason(last_lookup, &facts).to_string(),
+            kad_routing_peers: facts.kad_routing_peers,
         };
         self.contract.status(&inputs)
     }
@@ -561,6 +567,7 @@ mod tests {
                 bootstrap_total: 3,
                 bootstrap_healthy: 2,
                 path: PeerPath::None,
+                kad_routing_peers: None,
             },
         );
         o.metrics.record_lookup(LookupOutcome::Unavailable, Some(5));
@@ -589,6 +596,7 @@ mod tests {
                     bootstrap_total: 2,
                     bootstrap_healthy: 0,
                     path: PeerPath::None,
+                    kad_routing_peers: None,
                 }
             ),
             "bootstrap-outage"
@@ -597,6 +605,7 @@ mod tests {
             bootstrap_total: 2,
             bootstrap_healthy: 2,
             path: PeerPath::None,
+            kad_routing_peers: None,
         };
         assert_eq!(
             fallback_reason(Some(LookupOutcome::Unavailable), &healthy),

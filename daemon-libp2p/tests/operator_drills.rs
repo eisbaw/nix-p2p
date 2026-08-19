@@ -352,6 +352,7 @@ async fn drill_dependency_outage_reports_and_s2_holds() {
         bootstrap_total: 2,
         bootstrap_healthy: 2,
         path: PeerPath::None,
+        kad_routing_peers: None,
     }));
     let d = start_daemon(
         OperatorContract::for_profile(SharingProfile::ConsumeOnly),

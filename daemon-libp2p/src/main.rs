@@ -644,7 +644,15 @@ fn contract_request(cfg: &Config) -> ContractRequest {
         is_router: cfg.libp2p_router,
         has_public_allowlist: cfg.libp2p_public_allowlist_path.is_some(),
         advertises_public_address: !cfg.libp2p_external_addresses.is_empty(),
-        has_bootstrap: !cfg.libp2p_bootstrap.is_empty(),
+        // TASK-257 (DEEP minor a): "reaches a peer substrate" - an explicit `--libp2p-bootstrap` OR
+        // `--libp2p-mdns`. mDNS IS a consumer's DHT ENTRY PATH (a same-scope LAN neighbour is
+        // discovered with zero config), exactly like a bootstrap peer, so a bare `--libp2p-mdns`
+        // node derives CONSUME-ONLY (not upstream-only) - consistent with the composite `daemon` and
+        // with the LIVE path (the swarm opens the mDNS socket). This also makes `--preflight
+        // --libp2p-mdns` report consume-only instead of the old upstream-only/mDNS-active
+        // inconsistency. An explicit `--profile upstream-only --libp2p-mdns` still fails CLOSED at
+        // the compat-shim cross-check above (declared upstream-only != implied consume-only).
+        has_bootstrap: !cfg.libp2p_bootstrap.is_empty() || cfg.libp2p_mdns,
     }
 }
 
@@ -717,10 +725,11 @@ fn check_runtime_preconditions(cfg: &Config) -> Result<(), String> {
                 "--libp2p-external-address",
                 !cfg.libp2p_external_addresses.is_empty(),
             ),
-            // TASK-257: upstream-only must stay zero-P2P and emit ZERO multicast. --libp2p-mdns
-            // would open a link-local multicast socket, so it is REFUSED here (not silently
-            // ignored) - the fail-fast, report-matches-wire posture.
-            ("--libp2p-mdns", cfg.libp2p_mdns),
+            // TASK-257 (DEEP minor a): `--libp2p-mdns` is NOT listed here. mDNS is a DHT ENTRY PATH,
+            // so it derives CONSUME-ONLY (never upstream-only) - this branch is unreachable with
+            // mDNS. An explicit `--profile upstream-only --libp2p-mdns` is refused earlier by the
+            // compat-shim cross-check (declared upstream-only != implied consume-only), so the
+            // zero-P2P guarantee still holds without a dead entry here.
         ];
         if let Some((flag, _)) = swarm_flag.iter().find(|(_, present)| *present) {
             return Err(format!(
@@ -2204,24 +2213,43 @@ mod operator_contract_tests {
         assert!(err.contains("NO libp2p swarm"), "{err}");
     }
 
-    /// TASK-257: upstream-only stays zero-P2P - `--libp2p-mdns` alone derives upstream-only (mDNS
-    /// does NOT imply a participation profile: axis independence) and is REFUSED as a swarm flag,
-    /// so a pure-HTTP node can never open a multicast socket. MUTATION: dropping the mdns entry
-    /// from the upstream-only swarm-flag guard lets a multicast socket onto an upstream-only node.
+    /// TASK-257 (DEEP minor a): `--libp2p-mdns` is a consumer's DHT ENTRY PATH, so a bare
+    /// `--libp2p-mdns` node derives CONSUME-ONLY (report matches the LIVE path, which opens the
+    /// mDNS socket) - NOT upstream-only. `--preflight --libp2p-mdns` therefore reports consume-only
+    /// with active mDNS consistently. MUTATION: dropping `cfg.libp2p_mdns` from `has_bootstrap`
+    /// re-derives upstream-only (the old dry-run/live inconsistency) - the profile assertion reddens.
     #[test]
-    fn upstream_only_refuses_mdns() {
-        let cfg = parse_config(args(&["--libp2p-mdns"]))
-            .expect("bare --libp2p-mdns parses (the contract itself is valid)");
+    fn bare_mdns_is_consume_only_and_preflight_matches() {
+        let cfg = parse_config(args(&["--libp2p-mdns"])).expect("bare --libp2p-mdns parses");
         assert_eq!(
             cfg.profile,
-            SharingProfile::UpstreamOnly,
-            "mDNS must not infer a participation profile (axis-1 discovery != participation)"
+            SharingProfile::ConsumeOnly,
+            "mDNS is a DHT entry path, so bare --libp2p-mdns is consume-only, not upstream-only"
         );
-        let err = check_runtime_preconditions(&cfg)
-            .expect_err("upstream-only must refuse --libp2p-mdns (zero-P2P, zero multicast)");
+        check_runtime_preconditions(&cfg)
+            .expect("consume-only with --libp2p-mdns and no bootstrap must be accepted");
+        let p = build_contract(&cfg).unwrap().preflight();
         assert!(
-            err.contains("NO libp2p swarm") && err.contains("--libp2p-mdns"),
-            "{err}"
+            p.contains("consume-only"),
+            "preflight must report consume-only for --libp2p-mdns: {p}"
+        );
+        assert!(
+            p.contains("lan-mdns = ENABLED (active on this node)"),
+            "preflight must show mDNS active: {p}"
+        );
+    }
+
+    /// TASK-257 (DEEP minor a): the explicit contradiction `--profile upstream-only --libp2p-mdns`
+    /// still fails CLOSED - upstream-only is zero-P2P and cannot carry an mDNS socket. Caught at the
+    /// compat-shim cross-check (declared upstream-only != implied consume-only).
+    #[test]
+    fn explicit_upstream_only_plus_mdns_is_refused() {
+        let Err(err) = parse_config(args(&["--profile", "upstream-only", "--libp2p-mdns"])) else {
+            panic!("--profile upstream-only + --libp2p-mdns must fail closed");
+        };
+        assert!(
+            err.contains("disagrees") && err.contains("consume-only"),
+            "the refusal must name the upstream-only/consume-only disagreement: {err}"
         );
     }
 

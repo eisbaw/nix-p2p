@@ -315,15 +315,24 @@ pub struct Behaviour {
     /// ABSENT from the swarm, so the node opens no multicast socket and emits ZERO mDNS
     /// packets (the axis-1-local-discovery opt-in, TASK-120: enabling it implies NOTHING
     /// about serving/announcing/public participation). Enabled ([`NodeConfig::with_mdns`]),
-    /// its `Discovered` events feed the SAME `kad.add_address` bootstrap/address path
-    /// `identify` already feeds (see `on_event`) - a peer ADDRESS hint, never a
-    /// content-discovery route. It is NOT a second "who holds hash X?" mechanism: content
-    /// discovery stays kad-EXCLUSIVE (`check-discovery-no-shortcut.py` bites if an mDNS
-    /// event is ever wired to `find_providers`/`get_providers`). Scope isolation is
-    /// orthogonal and already enforced by the scoped `/nix-p2p/<scope>/kad` +
-    /// `/nix-p2p/<scope>/id` protocol names: a cross-scope mDNS peer gets `add_address`'d
-    /// but can never complete the scoped kad/identify handshake, so it never joins this
-    /// node's DHT (proven by the e2e scope-mismatch negative control).
+    /// its `Discovered` events feed the discovered LAN peer's address to `kad.add_address` (see
+    /// `on_event`) - a peer ADDRESS hint into the SAME bootstrap/address path `identify` uses, never
+    /// a content-discovery route. Discovered peers are admitted through a BOUNDED per-window cap
+    /// ([`MdnsAdmission`], TASK-257 F-1) so an unauthenticated LAN flood cannot admit an UNBOUNDED
+    /// set of generated PeerIds - the routing skew a malicious LAN host can induce is bounded.
+    ///
+    /// SCOPE ISOLATION + the BOUNDED RESIDUAL (TASK-257 F-2). A CROSS-scope neighbour can never
+    /// complete this node's scoped `/nix-p2p/<scope>/kad` handshake, so it NEVER JOINS this node's
+    /// content DHT: content discovery stays kad-EXCLUSIVE and a cross-scope peer can neither answer
+    /// nor be resolved for "who holds hash X?" (proven by the e2e scope-mismatch control, where the
+    /// cross-scope consumer resolves nothing and falls back to upstream). HONEST RESIDUAL: a
+    /// cross-scope mDNS peer that was `add_address`'d occupies at most `cap` routing slots as a
+    /// DECAYING DEAD-END - it answers no scoped query, costs at most one wasted dial, leaks nothing
+    /// new, and is bounded by the F-1 admission cap (not unbounded). This matches the product TCB
+    /// ("never a bad store path; a cross peer costs a retry"), not a stricter routing-purity
+    /// invariant; full deterministic cross-scope eviction is deferred to a follow-up.
+    /// `check-discovery-no-shortcut.py` bites if an mDNS event is ever wired to
+    /// `find_providers`/`get_providers`.
     pub mdns: Toggle<mdns::tokio::Behaviour>,
 }
 
@@ -1584,6 +1593,57 @@ fn abandoned_query_ids(pending: &HashMap<kad::QueryId, Pending>) -> Vec<kad::Que
         .collect()
 }
 
+/// Bounded admission control for mDNS-discovered LAN peers (TASK-257 F-1). mDNS advertisements
+/// are UNAUTHENTICATED and UNCAPPED: any LAN host can multicast arbitrary (PeerId, addr, TTL)
+/// pairs, so a single malicious host emitting many generated PeerIds could flood us into dialing
+/// (and, for same-scope-speaking floods, admitting) an unbounded number of peers - a routing-table
+/// eclipse/skew vector. This gate caps the number of DISTINCT mDNS peers we ACT ON (dial) per
+/// fixed integer-seconds window, so a flood is bounded, not unbounded. All quantities are INTEGERS
+/// (a count and an integer-seconds window; owner no-floats rule) and the state is bounded (the
+/// admitted set is cleared each window, so its size is <= `cap`). A same-window re-advertisement of
+/// an already-admitted peer is free (it refreshes, never re-charges the cap), so legitimate churn
+/// within the cap is unaffected; the (N - cap) surplus of a burst is dropped.
+struct MdnsAdmission {
+    /// Max DISTINCT mDNS peers admitted (dialed) per window. INTEGER.
+    cap: usize,
+    /// The window length. Integer seconds (constructed from an integer-seconds constant).
+    window: Duration,
+    /// Start of the current window; the admitted set is cleared when `window` elapses.
+    window_start: Instant,
+    /// The mDNS peers already admitted in THIS window (bounded by `cap`).
+    admitted: std::collections::HashSet<PeerId>,
+}
+
+impl MdnsAdmission {
+    fn new(cap: usize, window: Duration, now: Instant) -> Self {
+        MdnsAdmission {
+            cap,
+            window,
+            window_start: now,
+            admitted: std::collections::HashSet::new(),
+        }
+    }
+
+    /// Decide whether to ACT ON (dial) an mDNS-discovered `peer` now. Returns `true` iff admitted.
+    /// Rolls the window (clearing the admitted set) when `window` has elapsed. An already-admitted
+    /// peer this window is admitted again for free (refresh); an unseen peer is admitted only while
+    /// `admitted.len() < cap`, so at most `cap` DISTINCT peers are admitted per window.
+    fn admit(&mut self, peer: PeerId, now: Instant) -> bool {
+        if now.duration_since(self.window_start) >= self.window {
+            self.window_start = now;
+            self.admitted.clear();
+        }
+        if self.admitted.contains(&peer) {
+            return true;
+        }
+        if self.admitted.len() >= self.cap {
+            return false;
+        }
+        self.admitted.insert(peer);
+        true
+    }
+}
+
 /// The worker: owns the swarm, drives it, and matches kad query terminals back to the
 /// oneshot the command carried. The NAR byte transfer is NOT here (TASK-157): it runs on
 /// the accept loop + per-stream tasks through the [`libp2p_stream::Control`], off this loop.
@@ -1608,6 +1668,9 @@ struct Worker {
     /// events; never populated from offers or routing results, so it is live transport fact rather
     /// than a provider cache. Needed because libp2p-stream may choose any peer connection.
     conn_routes: HashMap<PeerId, HashMap<ConnectionId, ConnectionRoute>>,
+    /// Bounded admission control for mDNS-discovered peers (TASK-257 F-1): caps how many distinct
+    /// LAN advertisements we act on per window, so an unauthenticated mDNS flood cannot skew routing.
+    mdns_admission: MdnsAdmission,
 }
 
 struct PendingListen {
@@ -2410,27 +2473,46 @@ impl Worker {
             // `/nix-p2p/<scope>/kad` handshake, so it never joins - the scoped protocol name
             // is the isolation, proven by the e2e scope-mismatch negative control.
             SwarmEvent::Behaviour(BehaviourEvent::Mdns(mdns::Event::Discovered(peers))) => {
+                // TASK-257 F-1 (FLOOD BOUND): admit at most a bounded, INTEGER number of DISTINCT
+                // mDNS peers to ACT ON per window, so an unauthenticated LAN flood of generated
+                // PeerIds cannot make us admit an unbounded set. F-2 (SCOPE / ROUTING): `add_address`
+                // makes the peer routable/dialable (needed so a lone-genesis provider's put_record has
+                // a target and a consumer's find_providers has a peer to query). A CROSS-scope peer is
+                // add_address'd but can NEVER complete the scoped `/nix-p2p/<scope>/kad` handshake, so
+                // it answers no scoped query: it occupies at most `cap` routing slots as a decaying
+                // dead-end (BOUNDED by F-1), never resolves scoped content (proven by the 7/7 e2e
+                // content-isolation control), and costs at most one wasted dial - inside the "a cross
+                // peer costs a retry" guarantee. Deterministic event-driven cross-scope eviction is
+                // deferred to TASK-262 (the earlier timing-sweep was flaky + above the product line).
+                // This is the ADDRESS/bootstrap path ONLY: mDNS is never consulted for "who holds hash
+                // X?" (that stays kad-EXCLUSIVE; `check-discovery-no-shortcut.py` bites if it feeds
+                // find_providers).
+                let now = Instant::now();
                 let kad = &mut self.swarm.behaviour_mut().kad;
                 for (peer_id, addr) in peers {
-                    tracing::debug!(
-                        %peer_id, %addr,
-                        "fabric-libp2p: mDNS discovered a LAN peer address; feeding kad routing \
-                         (address hint only, never content discovery)"
-                    );
+                    if !self.mdns_admission.admit(peer_id, now) {
+                        tracing::debug!(
+                            %peer_id, %addr,
+                            "fabric-libp2p: mDNS admission cap reached this window; dropping surplus \
+                             LAN advertisement (flood bound, TASK-257 F-1)"
+                        );
+                        continue;
+                    }
                     kad.add_address(&peer_id, addr);
                 }
             }
             SwarmEvent::Behaviour(BehaviourEvent::Mdns(mdns::Event::Expired(peers))) => {
-                // A LAN peer's mDNS record aged out. Drop the address hints from kad so a
-                // stale multiaddr is not dialed forever; kad re-learns a live address via
-                // identify/mDNS if the peer is still around.
-                let kad = &mut self.swarm.behaviour_mut().kad;
+                // A LAN peer's mDNS record aged out. We do NOT evict on TTL expiry: an expiry is
+                // periodic (mDNS re-advertises), NOT a departure, and a same-scope peer's kad
+                // membership should outlive one TTL. kad's own liveness (failed queries) evicts
+                // genuinely-dead peers; cross-scope peers are bounded by the F-1 admission cap
+                // (deterministic eviction is TASK-262).
                 for (peer_id, addr) in peers {
                     tracing::debug!(
                         %peer_id, %addr,
-                        "fabric-libp2p: mDNS peer address expired; removing the stale kad hint"
+                        "fabric-libp2p: mDNS record expired (TTL); leaving kad routing to its own \
+                         liveness + the scope-verification sweep"
                     );
-                    kad.remove_address(&peer_id, &addr);
                 }
             }
             // The stream behaviour emits no events we act on (its `ToSwarm` is `()`); the
@@ -2763,6 +2845,19 @@ pub const DEFAULT_KAD_SERVER: bool = true;
 /// axis-1 (local discovery) only: enabling it NEVER implies serving, announcing, or public
 /// participation.
 pub const DEFAULT_MDNS_ENABLED: bool = false;
+
+/// The bounded admission cap for mDNS-discovered LAN peers (TASK-257 F-1): at most this many
+/// DISTINCT mDNS peers are dialed per [`MDNS_ADMISSION_WINDOW_SECS`] window. INTEGER. A real
+/// LAN/org pool rarely presents more than a few dozen distinct nodes in a window; a burst beyond
+/// this is a flood and its surplus is dropped, bounding the routing-table skew a malicious LAN host
+/// can induce. Large enough not to throttle a genuine deployment, finite so a flood cannot be
+/// unbounded.
+pub const MDNS_ADMISSION_CAP: usize = 64;
+
+/// The mDNS admission window, in INTEGER seconds (TASK-257 F-1). The admitted-peer set is cleared
+/// each window, so at most [`MDNS_ADMISSION_CAP`] distinct mDNS peers are admitted per window and
+/// the tracking state stays bounded. No float ever enters the cap or the window.
+pub const MDNS_ADMISSION_WINDOW_SECS: u64 = 30;
 
 // ---------------------------------------------------------------------------------------
 // kad MemoryStore STORAGE bounds (TASK-154 AC#1).
@@ -3417,6 +3512,11 @@ impl Node {
             pending_listens: HashMap::new(),
             pending_exact_dials: HashMap::new(),
             conn_routes: HashMap::new(),
+            mdns_admission: MdnsAdmission::new(
+                MDNS_ADMISSION_CAP,
+                Duration::from_secs(MDNS_ADMISSION_WINDOW_SECS),
+                Instant::now(),
+            ),
         };
         let join = tokio::spawn(worker.run());
 
@@ -3444,6 +3544,45 @@ mod tests {
     use proc_supervisor::TaskSupervisor;
     use std::ffi::OsString;
     use std::path::PathBuf;
+
+    /// TASK-257 F-1: the mDNS admission gate bounds how many DISTINCT LAN peers we act on per
+    /// window, so an unauthenticated flood cannot make us dial/admit an unbounded set. BITE: emit
+    /// N > cap distinct mDNS PeerIds in ONE window -> exactly `cap` admitted, the surplus dropped.
+    /// MUTATION: removing the `admitted.len() >= cap` check (always admit) -> all N admitted ->
+    /// this reddens. Also proves an already-admitted peer refreshes for free and the window rolls.
+    #[test]
+    fn mdns_admission_caps_a_flood_and_refreshes_within_the_cap() {
+        let cap = 4usize;
+        let window = Duration::from_secs(30);
+        let t0 = Instant::now();
+        let mut gate = MdnsAdmission::new(cap, window, t0);
+
+        // A flood of N = cap + 6 DISTINCT peers in ONE window: exactly `cap` admitted.
+        let flood: Vec<PeerId> = (0..cap + 6).map(|_| PeerId::random()).collect();
+        let admitted = flood.iter().filter(|p| gate.admit(**p, t0)).count();
+        assert_eq!(
+            admitted,
+            cap,
+            "a burst of {} distinct mDNS peers must admit exactly cap={cap}, not all of them",
+            flood.len()
+        );
+
+        // An already-admitted peer re-advertising THIS window is admitted again for free (refresh),
+        // never re-charging the cap.
+        assert!(
+            gate.admit(flood[0], t0),
+            "an already-admitted peer must refresh for free"
+        );
+
+        // The window rolls: after `window` elapses the set clears, so a fresh distinct peer is
+        // admitted again (legitimate churn across windows is unaffected).
+        let later = t0 + window + Duration::from_secs(1);
+        let fresh = PeerId::random();
+        assert!(
+            gate.admit(fresh, later),
+            "after the window rolls, a fresh peer is admitted again"
+        );
+    }
 
     struct ProcessProbe {
         content: Blake3Digest,

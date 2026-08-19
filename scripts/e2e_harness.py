@@ -2529,26 +2529,17 @@ class Libp2pMdnsTopology:
             "--libp2p-scope", self.provider_scope, "--libp2p-print-peer-address", *seed_args,
         ]
         run([pm, *provider_argv])
-        # A lone genesis provider's startup put-quorum can lose a race with mDNS discovery settling
-        # (the daemon's initial announce is one-shot). If it exits before announcing, settle briefly
-        # so both nodes are steadily multicasting, then RESTART it under its DURABLE identity - the
-        # consumers are already up, so a retried announce discovers a quorum peer. Bounded, fail-loud.
-        # HONEST NOTE: this restart is a TEST-HARNESS scaffold for the lone-genesis race; a future
-        # production improvement is a bounded in-daemon announce retry for the zero-bootstrap case.
-        for attempt in range(6):
-            ident = self._try_await_provider_identity("lp-provider", len(self.provider_seeds))
-            if ident:
-                self.provider_identity = ident
-                return
-            state = run(
-                [pm, "inspect", "-f", "{{.State.Status}}", self._c("lp-provider")], check=False
-            ).stdout.strip()
-            print(f"mdns provider not yet announced (state={state!r}); settle+restart "
-                  f"{attempt + 1}/6", file=sys.stderr)
-            time.sleep(5.0)
-            run([pm, "restart", self._c("lp-provider")], check=False)
-        self._dump_logs()
-        die("mdns provider never announced its identity + seed(s) after retries")
+        # TASK-257 F-4: NO external restart. A lone-genesis provider (zero-bootstrap / mDNS) can
+        # lose the startup put-quorum race, but the daemon now RETRIES the announce IN-PROCESS
+        # within a bounded window (ANNOUNCE_QUORUM_RETRY_WINDOW_SECS), waiting for a same-scope LAN
+        # peer to join via mDNS - so the process STAYS ALIVE and announces without any supervisor
+        # restart. We simply await the identity within a window that covers that in-daemon retry.
+        # If it never announces, the feature is broken (a lone provider stayed undiscoverable) and
+        # this fails LOUD - it is NOT papered over by a restart.
+        ident = self._await_provider_identity_no_restart(
+            "lp-provider", len(self.provider_seeds), READY_TIMEOUT_S + 45.0
+        )
+        self.provider_identity = ident
 
     def _await_http_ready(self, role: str, ip: str) -> None:
         port = ORIGIN_PORT if role == "origin" else PROXY_PORT if role == "proxy" else DAEMON_PORT
@@ -2568,10 +2559,13 @@ class Libp2pMdnsTopology:
                 die(f"mdns {role} did not become HTTP-ready at {url}")
             time.sleep(0.4)
 
-    def _try_await_provider_identity(self, role: str, n_seeds: int):
+    def _await_provider_identity_no_restart(self, role: str, n_seeds: int, window_s: float):
         """Poll for LIBP2P-PROVIDER-ADDR + n_seeds seed announce lines (printed only AFTER a
-        successful announce). Returns (peer_id, listen) or None on timeout/provider-exit."""
-        deadline = time.time() + 30.0
+        successful announce), WITHOUT ever restarting the provider (TASK-257 F-4). The daemon's
+        in-process bounded announce retry keeps the process alive while a same-scope LAN peer joins
+        via mDNS, so the announce lands with no external supervisor. Dies LOUD if the provider
+        exits (announce hard-failed) or never announces within `window_s`."""
+        deadline = time.time() + window_s
         addr_re = re.compile(r"LIBP2P-PROVIDER-ADDR peer_id=(\S+) listen=(\S+)")
         seed_re = re.compile(r"LIBP2P-(?:SEED|PROVIDE-STORE) narhash=(\S+) ")
         while time.time() < deadline:
@@ -2584,9 +2578,14 @@ class Libp2pMdnsTopology:
                 [self._pm, "inspect", "-f", "{{.State.Status}}", self._c(role)], check=False
             ).stdout.strip()
             if state == "exited":
-                return None
+                self._dump_logs()
+                die(
+                    f"mdns provider ({role}) EXITED without announcing - the in-daemon announce "
+                    "retry did not land a lone-genesis announce (feature broken; NOT restarting)"
+                )
             time.sleep(0.3)
-        return None
+        self._dump_logs()
+        die(f"mdns provider ({role}) never announced within {window_s:.0f}s (no restart, F-4)")
 
     def logs(self, role: str) -> str:
         res = run([self._pm, "logs", self._c(role)], check=False)
@@ -6603,6 +6602,32 @@ def scenario_libp2p_mdns_scope_isolation(ctx: Ctx, expect) -> None:
             "NAR) despite mDNS multicasting across the same bridge - the scoped kad protocol "
             "isolates, so mDNS discovery and scope isolation compose",
             f"upstream.nar={nar_up}",
+        )
+        # TASK-257 F-2 CONTENT-ISOLATION BITE (the load-bearing scope property): the cross-scope
+        # consumer must not JOIN the provider's content DHT. Both nodes share the same multicast
+        # bridge and mDNS discovers everyone, but the scoped `/nix-p2p/<scope>/kad` protocol means a
+        # scope-B consumer cannot complete the scope-A kad handshake, so it DISCOVERS NO provider
+        # record(s) and its find_providers returns InsufficientRouting - it resolves nothing and
+        # falls back to upstream (asserted above by upstream.nar>=1). The SAME-scope helper, by
+        # contrast, DID discover provider record(s). This A/B on the SAME bridge attributes the
+        # content isolation to scope. (mDNS supplies ADDRESSES only; a cross-scope address that got
+        # add_address'd is BOUNDED by the F-1 admission cap and carries NO content-discovery power -
+        # see the swarm.rs `mdns` doc for the honest bounded routing-hint residual and the filed
+        # follow-up for deterministic cross-scope eviction.) MUTATION: same-scope the consumer and it
+        # WOULD discover records + resolve -> upstream.nar drops to 0 -> the >=1 oracle above reddens.
+        clog = topo.logs("lp-consumer")
+        hlog = topo.logs("lp-helper")
+        expect(
+            "provider record(s)" not in clog,
+            "mdns scope control: the cross-scope consumer discovered NO provider record(s) via kad "
+            "(it never joined the scope-A content DHT) - content discovery stays scope-isolated",
+            f"consumer log tail: {clog[-600:]!r}",
+        )
+        expect(
+            "discovered" in hlog and "provider record(s)" in hlog,
+            "mdns scope positive: the SAME-scope helper DID discover provider record(s) via kad "
+            "(it joined the scope-A DHT) - so content-DHT membership is attributable to scope",
+            f"helper log tail: {hlog[-500:]!r}",
         )
 
 
