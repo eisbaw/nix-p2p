@@ -1035,6 +1035,17 @@ impl Config {
                 }
                 "--libp2p-scope" => config.libp2p_scope = Some(value()?),
                 "--libp2p-mdns" => config.libp2p_mdns = true,
+                // TASK-273 FLAG-SURFACE PARITY: the NixOS module (nixos/nix-p2p.nix) resolves the
+                // tri-state `libp2p.mdns` and emits `--libp2p-no-mdns` for an explicit opt-out. That
+                // module drives THIS composite binary (`packages.<system>.daemon`), which fails fast
+                // on unknown flags - so it must ACCEPT `--libp2p-no-mdns` or an explicit opt-out
+                // crashes the daemon at startup. This binary has no lan-share mDNS-default (mDNS is
+                // always default-OFF here), so `--libp2p-no-mdns` sets the already-default OFF state
+                // explicitly (a no-op on the value, but a legible, non-crashing surface). FULL
+                // zero-config lan-share parity (default_lan_mdns / provider back-fill / AC#5 supply
+                // defaults / the undiscoverable-provider fail-loud guard) lives only in daemon-libp2p
+                // today and is the deferred parity follow-up (TASK-277).
+                "--libp2p-no-mdns" => config.libp2p_mdns = false,
                 "--libp2p-state-dir" => config.libp2p_state_dir = Some(value()?.into()),
                 "--libp2p-identity-seed" => {
                     config.libp2p_identity_seed = Some(parse_libp2p_seed(&value()?)?)
@@ -3292,6 +3303,21 @@ mod tests {
         assert!(Config::from_args(["--nope".to_string()]).is_err());
         assert!(Config::from_args(["--listen".to_string()]).is_err());
         assert!(Config::from_args(["--priority".to_string(), "abc".to_string()]).is_err());
+    }
+
+    /// TASK-273 FLAG-SURFACE PARITY: the composite binary must ACCEPT `--libp2p-no-mdns` (the NixOS
+    /// module emits it for an explicit tri-state opt-out) rather than fail-fast as an unknown flag,
+    /// and it sets mDNS OFF. MUTATION: dropping the parse arm makes this an `unknown flag` error and
+    /// the accept assertion reddens - proving the arm is what keeps a `libp2p.mdns = false` NixOS
+    /// deployment from crashing the daemon at startup.
+    #[test]
+    fn libp2p_no_mdns_is_accepted_and_sets_mdns_off() {
+        let cfg = Config::from_args(["--libp2p-no-mdns".to_string()])
+            .expect("--libp2p-no-mdns must be accepted (the NixOS module emits it)");
+        assert!(!cfg.libp2p_mdns, "--libp2p-no-mdns sets mDNS off");
+        // ...and the affirmative flag still turns it on (the two are a legible pair).
+        let on = Config::from_args(["--libp2p-mdns".to_string()]).expect("--libp2p-mdns parses");
+        assert!(on.libp2p_mdns);
     }
 
     #[test]
