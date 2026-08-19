@@ -6,6 +6,7 @@ title: >-
 status: To Do
 assignee: []
 created_date: '2026-08-18 20:26'
+updated_date: '2026-08-19 18:32'
 labels:
   - testing
   - real-upstream
@@ -41,3 +42,19 @@ CANDIDATE COVERAGE, roughly in user-value order:
 
 Report divergences honestly as defects in OUR fixture or OUR parser, and fix at the owning boundary -- do not paper over a real-cache behaviour by special-casing it.
 <!-- SECTION:DESCRIPTION:END -->
+
+## Implementation Notes
+
+<!-- SECTION:NOTES:BEGIN -->
+CHEAP PROBE HALF DONE (commit 9735656, test-only, no production parser change). Validated the SHIPPED narinfo parse+rewrite path (catalog::parse_correlation + rewrite::to_raw) against 7 UNMODIFIED real cache.nixos.org narinfos (4x xz: bash/git/glibc/hello, 3x zstd: coreutils/curl/python3; 274 KB -> 133 MB NAR span). Result: parser ALREADY handles the real corpus correctly. xz AND zstd both classify NarCompression::Compressed (any-coding arm, keyed on authoritative Compression not URL suffix); to_raw converges each to raw taking FileSize:=NarSize (raw), never the compressed upstream FileSize; all signed fields incl real cache.nixos.org-1 Sig byte-identical.
+
+CORPUS GAP CLOSED (candidate coverage #1 + differential #3): vendored the corpus as a CHECKED-IN fixture daemon-core/tests/real-corpus/*.narinfo + conformance test daemon-core/tests/real_corpus_narinfo.rs, wired into just test (default workspace set). Flake source filter widened by one class (tests/real-corpus/*.narinfo) so it holds in the Nix sandbox too (golden-vectors mechanism). Test BITES: classification mutation (xz->Raw) and rewrite FileSize-source mutation both go red (verified+reverted).
+
+MOCK-vs-REAL DIFFERENTIAL: no behavioural divergence. Two structural shapes the mock never produced, handled identically: coreutils has NO References line at all; Sig uses real cache.nixos.org-1 key name. Both pass through unchanged. NarSize-vs-FileSize genuinely differ on every real entry (e.g. curl NarSize 1181408 vs FileSize 554177 zstd) - the exact shape the Compression:none mocks never exercised.
+
+GATE: cargo test -p daemon-core green (lib 316 + real_corpus 5, exit 0); fmt/clippy -D warnings clean; check-no-floats + check-source-guard green.
+
+HONEST LIMIT: proves real narinfos PARSE/CLASSIFY/REWRITE in-process ONLY. Does NOT fetch a real .nar.zst, does not decompress, does not prove the real FETCH/peer-serve path is competitive with the CDN. Candidate coverage #2 (real e2e substitution) and #4 (real-RTT latency) remain open on this parent.
+
+FOLLOW-UP FILED: TASK-268 (real-cache FETCH timing: peer-serve vs CDN on a real link).
+<!-- SECTION:NOTES:END -->
