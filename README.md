@@ -141,19 +141,29 @@ same-pin pool**; a global permissionless swarm across arbitrary revisions offloa
 unless it is segmented into same-pin cohorts. The project treats all of this as a thesis to
 falsify rather than a premise.
 
-**Measured, on real packages (a first cut) — who's faster when a peer has the path:**
+**Measured, on real packages (a first cut) — who's faster, by the peer's link speed** (when a
+peer has the path):
 
-| setting | faster | why |
+| peer link | faster | codec + effective (post-decompress) |
 | --- | --- | --- |
-| **LAN / org** (1 Gbit) | **nix-p2p — 2–44×** | local link beats the WAN hop; serves the raw NAR, so the client skips the CDN's xz-decompress (~270 ms for `git`) |
-| home swarm (100 Mbit) | nix-p2p, with light **zstd** | zstd decompresses ~3.5× faster than the CDN's xz and is cheap enough per-serve |
-| open internet, comparable link | `cache.nixos.org` | its smaller xz file wins on the wire |
-| no same-pin peer (cross-rev) | `cache.nixos.org` | nothing local to serve — nix-p2p falls back |
+| **16 Mbps** (DSL) | mostly `cache.nixos.org` | its smaller xz file wins the wire; nix-p2p (zstd-3) wins only poorly-compressing packages |
+| **32 Mbps** | mostly **nix-p2p** | light **zstd-3** tips most packages; the CDN holds only the best-compressing (`git`) |
+| **64 Mbps** | mostly **nix-p2p** | zstd-1/3; the CDN holds only the single most-compressible package |
+| **100 Mbps** (home) | **nix-p2p** — all | **zstd-1..3**, which decompresses ~3.5× faster than the CDN's xz |
+| **300 Mbps** | **nix-p2p** — all | link fast enough that even raw wins — compression stops paying |
+| **1000 Mbps** (LAN) | **nix-p2p — 2–44×** | serves **raw**: zero compress, zero client decompress |
 
-*First cut: **transfer** time only — **excludes discovery latency** (the unsettled wildcard,
-esp. for small packages), and holds only where a peer has the path. Effective, apples-to-apples
-(the CDN's compressed file must be client-decompressed; nix-p2p serves raw). Details:
-`docs/profiling.md`.*
+**Why the CDN keeps the slow links:** nix-p2p compresses (and the client decompresses) **on
+the fly, per serve**, and *compression is the bottleneck* — a codec small enough to match the
+CDN's `xz` (zstd-19 ≈ xz's size, and decompresses 10× faster) costs ~24 s of CPU on **every
+serve**, so it never pays; the cheap codecs that *do* pay lose on ratio. The CDN serves an
+artifact **compressed once at build time**, paying that cost zero times per download. So
+nix-p2p wins the fast links on raw bytes and a shorter hop, not on compression — and a
+compressed-NAR cache (compress once, serve many) is the lever that would change the slow links.
+
+*First cut: **transfer** only — **excludes discovery latency**, and holds only where a peer has
+the path. CDN baseline is this host's WAN (~16 Mbps effective, incl. its xz-decompress); the
+crossover scales with your CDN link. Details: `docs/profiling.md`.*
 
 ## Status
 

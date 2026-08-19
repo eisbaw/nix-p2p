@@ -216,3 +216,23 @@ enough to compress per-serve, which xz is not. The xz-vs-zstd asymmetry favours 
 the decompression leg in both regimes. (`cdn_wall` in the crossover map is still
 download-only; folding client-decompress in only widens nix-p2p's margin — it never narrows
 it.)
+
+**Why the CDN holds the slow links — the per-serve compression moat.** At a slow link, transfer
+dominates, so ratio should matter — yet no codec lets nix-p2p win, because it compresses **on
+the fly, per serve**. The full zstd ladder on `git` (50.5 MB NAR) at 16 Mbps, vs the CDN's
+precomputed xz (`FileSize` 8.01 MB, 4.35 s effective incl. its 0.34 s client xz-decompress):
+
+| peer codec | size | compress (per serve) | transfer | total | vs CDN |
+| --- | ---: | ---: | ---: | ---: | --- |
+| zstd-9 | 11.4 MB | 0.88 s | 5.71 s | **6.66 s** (best) | CDN |
+| zstd-17 | 9.0 MB | 14.4 s | 4.51 s | 18.98 s | CDN |
+| zstd-19 | 8.7 MB | **24.0 s** | 4.33 s | 28.44 s | CDN |
+
+`zstd-19` actually *matches* xz's file size (8.66 vs 8.01 MB) and decompresses **10× faster**
+(0.04 vs 0.34 s) — but it costs **24 s of compress CPU on every serve**, while the CDN's xz is
+**compressed once at build time** (zero per-serve cost). The cheap levels that avoid that CPU
+lose on ratio. There is no level that is both small *and* cheap-to-compress-per-serve, so the
+build-once-vs-serve-every-time asymmetry is the CDN's moat on slow links; nix-p2p wins the fast
+links on raw bytes, not compression. **The lever** (TASK-271): a peer that *cached* the
+compressed NAR (compress once, serve many) amortizes the CPU and would let `zstd-19` win even at
+16 Mbps — at the cost of the current stateless "nothing at rest" design.
