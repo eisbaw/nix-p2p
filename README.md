@@ -141,20 +141,19 @@ same-pin pool**; a global permissionless swarm across arbitrary revisions offloa
 unless it is segmented into same-pin cohorts. The project treats all of this as a thesis to
 falsify rather than a premise.
 
-**Measured, on real packages (a first cut).** On a fast local link, with the path already on
-a peer, **nix-p2p beats a `cache.nixos.org` download** — at 1 Gbit it's 2–44× faster on
-transfer, and needs no link compression at all. And that's *effective, apples-to-apples* time
-to usable bytes: the CDN serves an **xz** file the client must decompress — a real cost,
-~270 ms for `git` — whereas nix-p2p serves the raw NAR **ready to use** and skips that step.
-Where a peer link *does* compress (home bandwidth), **zstd** is the right codec — it
-decompresses ~3.5× faster than the CDN's xz and is cheap enough to run per-serve, unlike xz.
-Two caveats keep this a *first cut*, not a verdict: it is **transfer** time and **excludes
-discovery latency** (finding a provider), which for a small package could still decide it; and
-it holds only where a peer actually has the path (the same-pin case). Over the open internet
-against a comparable link, the CDN's smaller file wins. So the honest value proposition is:
-**on a LAN/org with the path resident, nix-p2p delivers it faster than the CDN** — an
-end-to-end number that includes discovery is the measurement still owed. (Details:
-`docs/profiling.md`.)
+**Measured, on real packages (a first cut) — who's faster when a peer has the path:**
+
+| setting | faster | why |
+| --- | --- | --- |
+| **LAN / org** (1 Gbit) | **nix-p2p — 2–44×** | local link beats the WAN hop; serves the raw NAR, so the client skips the CDN's xz-decompress (~270 ms for `git`) |
+| home swarm (100 Mbit) | nix-p2p, with light **zstd** | zstd decompresses ~3.5× faster than the CDN's xz and is cheap enough per-serve |
+| open internet, comparable link | `cache.nixos.org` | its smaller xz file wins on the wire |
+| no same-pin peer (cross-rev) | `cache.nixos.org` | nothing local to serve — nix-p2p falls back |
+
+*First cut: **transfer** time only — **excludes discovery latency** (the unsettled wildcard,
+esp. for small packages), and holds only where a peer has the path. Effective, apples-to-apples
+(the CDN's compressed file must be client-decompressed; nix-p2p serves raw). Details:
+`docs/profiling.md`.*
 
 ## Status
 
