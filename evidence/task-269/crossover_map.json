@@ -1,0 +1,1613 @@
+{
+  "task": "TASK-269",
+  "derived_from": "evidence/task-269/sweep_results.json",
+  "model": {
+    "regen_floor_ns": 22000000,
+    "regen_per_byte_num": 10,
+    "regen_per_byte_den": 22,
+    "links": [
+      {
+        "id": "wan_2MBs",
+        "bytes_per_s": 2000000,
+        "label": "2 MB/s (~16 Mbit/s slow WAN)"
+      },
+      {
+        "id": "home_12_5MBs",
+        "bytes_per_s": 12500000,
+        "label": "12.5 MB/s (100 Mbit/s home)"
+      },
+      {
+        "id": "lan_125MBs",
+        "bytes_per_s": 125000000,
+        "label": "125 MB/s (1 Gbit/s LAN)"
+      },
+      {
+        "id": "fast_1000MBs",
+        "bytes_per_s": 1000000000,
+        "label": "1000 MB/s (~10 GbE / datacenter)"
+      }
+    ]
+  },
+  "cdn_baseline": {
+    "hello": {
+      "cdn_wall_ns": 50000000,
+      "cdn_filesize_bytes": 57568,
+      "cdn_compression": "xz",
+      "source": "TASK-268 measured, single WAN sample (0.05 s, coarse)"
+    },
+    "curl": {
+      "cdn_wall_ns": 260000000,
+      "cdn_filesize_bytes": 554177,
+      "cdn_compression": "zstd",
+      "source": "TASK-268 measured, single WAN sample (0.26 s)"
+    },
+    "bash": {
+      "cdn_wall_ns": 378112000,
+      "cdn_filesize_bytes": 448312,
+      "cdn_compression": "xz",
+      "source": "TASK-269 measured this session, single WAN sample (0.378112 s)"
+    },
+    "glibc-locales": {
+      "cdn_wall_ns": 235198000,
+      "cdn_filesize_bytes": 234832,
+      "cdn_compression": "xz",
+      "source": "TASK-269 measured this session, single WAN sample (0.235198 s)"
+    },
+    "git": {
+      "cdn_wall_ns": 2140000000,
+      "cdn_filesize_bytes": 8011464,
+      "cdn_compression": "xz",
+      "source": "TASK-268 measured, single WAN sample (2.14 s)"
+    },
+    "python3": {
+      "cdn_wall_ns": 48300000000,
+      "cdn_filesize_bytes": 56616908,
+      "cdn_compression": "zstd",
+      "source": "TASK-268 measured, single WAN sample (48.3 s)"
+    }
+  },
+  "packages": [
+    {
+      "name": "hello",
+      "raw_nar_bytes": 274568,
+      "regen_ns": 22124803,
+      "cdn_wall_ns": 50000000,
+      "cdn_filesize_bytes": 57568,
+      "cells": {
+        "none": {
+          "status": "ok",
+          "compressed_bytes": 274568,
+          "ratio_num": 274568,
+          "ratio_den": 274568,
+          "compress_cpu_ns": 0,
+          "decompress_cpu_ns": 0,
+          "fixed_ns": 22124803,
+          "per_link": {
+            "wan_2MBs": {
+              "peer_wall_ns": 159408803,
+              "peer_beats_cdn": false
+            },
+            "home_12_5MBs": {
+              "peer_wall_ns": 44090243,
+              "peer_beats_cdn": true
+            },
+            "lan_125MBs": {
+              "peer_wall_ns": 24321347,
+              "peer_beats_cdn": true
+            },
+            "fast_1000MBs": {
+              "peer_wall_ns": 22399371,
+              "peer_beats_cdn": true
+            }
+          },
+          "crossover_link_bps": 9849904
+        },
+        "lz4": {
+          "status": "ok",
+          "compressed_bytes": 101456,
+          "ratio_num": 101456,
+          "ratio_den": 274568,
+          "compress_cpu_ns": 1417000,
+          "decompress_cpu_ns": 967000,
+          "fixed_ns": 24508803,
+          "per_link": {
+            "wan_2MBs": {
+              "peer_wall_ns": 75236803,
+              "peer_beats_cdn": false
+            },
+            "home_12_5MBs": {
+              "peer_wall_ns": 32625283,
+              "peer_beats_cdn": true
+            },
+            "lan_125MBs": {
+              "peer_wall_ns": 25320451,
+              "peer_beats_cdn": true
+            },
+            "fast_1000MBs": {
+              "peer_wall_ns": 24610259,
+              "peer_beats_cdn": true
+            }
+          },
+          "crossover_link_bps": 3980041
+        },
+        "zstd-1": {
+          "status": "ok",
+          "compressed_bytes": 81828,
+          "ratio_num": 81828,
+          "ratio_den": 274568,
+          "compress_cpu_ns": 2212000,
+          "decompress_cpu_ns": 1290000,
+          "fixed_ns": 25626803,
+          "per_link": {
+            "wan_2MBs": {
+              "peer_wall_ns": 66540803,
+              "peer_beats_cdn": false
+            },
+            "home_12_5MBs": {
+              "peer_wall_ns": 32173043,
+              "peer_beats_cdn": true
+            },
+            "lan_125MBs": {
+              "peer_wall_ns": 26281427,
+              "peer_beats_cdn": true
+            },
+            "fast_1000MBs": {
+              "peer_wall_ns": 25708631,
+              "peer_beats_cdn": true
+            }
+          },
+          "crossover_link_bps": 3357295
+        },
+        "zstd-3": {
+          "status": "ok",
+          "compressed_bytes": 74345,
+          "ratio_num": 74345,
+          "ratio_den": 274568,
+          "compress_cpu_ns": 3206000,
+          "decompress_cpu_ns": 1469000,
+          "fixed_ns": 26799803,
+          "per_link": {
+            "wan_2MBs": {
+              "peer_wall_ns": 63972303,
+              "peer_beats_cdn": false
+            },
+            "home_12_5MBs": {
+              "peer_wall_ns": 32747403,
+              "peer_beats_cdn": true
+            },
+            "lan_125MBs": {
+              "peer_wall_ns": 27394563,
+              "peer_beats_cdn": true
+            },
+            "fast_1000MBs": {
+              "peer_wall_ns": 26874148,
+              "peer_beats_cdn": true
+            }
+          },
+          "crossover_link_bps": 3204499
+        },
+        "zstd-9": {
+          "status": "ok",
+          "compressed_bytes": 70468,
+          "ratio_num": 70468,
+          "ratio_den": 274568,
+          "compress_cpu_ns": 10882000,
+          "decompress_cpu_ns": 1439000,
+          "fixed_ns": 34445803,
+          "per_link": {
+            "wan_2MBs": {
+              "peer_wall_ns": 69679803,
+              "peer_beats_cdn": false
+            },
+            "home_12_5MBs": {
+              "peer_wall_ns": 40083243,
+              "peer_beats_cdn": true
+            },
+            "lan_125MBs": {
+              "peer_wall_ns": 35009547,
+              "peer_beats_cdn": true
+            },
+            "fast_1000MBs": {
+              "peer_wall_ns": 34516271,
+              "peer_beats_cdn": true
+            }
+          },
+          "crossover_link_bps": 4530482
+        },
+        "zstd-19": {
+          "status": "ok",
+          "compressed_bytes": 63132,
+          "ratio_num": 63132,
+          "ratio_den": 274568,
+          "compress_cpu_ns": 86419000,
+          "decompress_cpu_ns": 1778000,
+          "fixed_ns": 110321803,
+          "per_link": {
+            "wan_2MBs": {
+              "peer_wall_ns": 141887803,
+              "peer_beats_cdn": false
+            },
+            "home_12_5MBs": {
+              "peer_wall_ns": 115372363,
+              "peer_beats_cdn": false
+            },
+            "lan_125MBs": {
+              "peer_wall_ns": 110826859,
+              "peer_beats_cdn": false
+            },
+            "fast_1000MBs": {
+              "peer_wall_ns": 110384935,
+              "peer_beats_cdn": false
+            }
+          },
+          "crossover_link_bps": null
+        },
+        "xz-6": {
+          "status": "ok",
+          "compressed_bytes": 57568,
+          "ratio_num": 57568,
+          "ratio_den": 274568,
+          "compress_cpu_ns": 47751000,
+          "decompress_cpu_ns": 4632000,
+          "fixed_ns": 74507803,
+          "per_link": {
+            "wan_2MBs": {
+              "peer_wall_ns": 103291803,
+              "peer_beats_cdn": false
+            },
+            "home_12_5MBs": {
+              "peer_wall_ns": 79113243,
+              "peer_beats_cdn": false
+            },
+            "lan_125MBs": {
+              "peer_wall_ns": 74968347,
+              "peer_beats_cdn": false
+            },
+            "fast_1000MBs": {
+              "peer_wall_ns": 74565371,
+              "peer_beats_cdn": false
+            }
+          },
+          "crossover_link_bps": null
+        },
+        "xz-9": {
+          "status": "ok",
+          "compressed_bytes": 57568,
+          "ratio_num": 57568,
+          "ratio_den": 274568,
+          "compress_cpu_ns": 70149000,
+          "decompress_cpu_ns": 5483000,
+          "fixed_ns": 97756803,
+          "per_link": {
+            "wan_2MBs": {
+              "peer_wall_ns": 126540803,
+              "peer_beats_cdn": false
+            },
+            "home_12_5MBs": {
+              "peer_wall_ns": 102362243,
+              "peer_beats_cdn": false
+            },
+            "lan_125MBs": {
+              "peer_wall_ns": 98217347,
+              "peer_beats_cdn": false
+            },
+            "fast_1000MBs": {
+              "peer_wall_ns": 97814371,
+              "peer_beats_cdn": false
+            }
+          },
+          "crossover_link_bps": null
+        },
+        "brotli-5": {
+          "status": "ok",
+          "compressed_bytes": 65274,
+          "ratio_num": 65274,
+          "ratio_den": 274568,
+          "compress_cpu_ns": 4608000,
+          "decompress_cpu_ns": 1488000,
+          "fixed_ns": 28220803,
+          "per_link": {
+            "wan_2MBs": {
+              "peer_wall_ns": 60857803,
+              "peer_beats_cdn": false
+            },
+            "home_12_5MBs": {
+              "peer_wall_ns": 33442723,
+              "peer_beats_cdn": true
+            },
+            "lan_125MBs": {
+              "peer_wall_ns": 28742995,
+              "peer_beats_cdn": true
+            },
+            "fast_1000MBs": {
+              "peer_wall_ns": 28286077,
+              "peer_beats_cdn": true
+            }
+          },
+          "crossover_link_bps": 2997081
+        },
+        "brotli-11": {
+          "status": "ok",
+          "compressed_bytes": 57108,
+          "ratio_num": 57108,
+          "ratio_den": 274568,
+          "compress_cpu_ns": 272200000,
+          "decompress_cpu_ns": 3149000,
+          "fixed_ns": 297473803,
+          "per_link": {
+            "wan_2MBs": {
+              "peer_wall_ns": 326027803,
+              "peer_beats_cdn": false
+            },
+            "home_12_5MBs": {
+              "peer_wall_ns": 302042443,
+              "peer_beats_cdn": false
+            },
+            "lan_125MBs": {
+              "peer_wall_ns": 297930667,
+              "peer_beats_cdn": false
+            },
+            "fast_1000MBs": {
+              "peer_wall_ns": 297530911,
+              "peer_beats_cdn": false
+            }
+          },
+          "crossover_link_bps": null
+        }
+      }
+    },
+    {
+      "name": "curl",
+      "raw_nar_bytes": 1181408,
+      "regen_ns": 22537003,
+      "cdn_wall_ns": 260000000,
+      "cdn_filesize_bytes": 554177,
+      "cells": {
+        "none": {
+          "status": "ok",
+          "compressed_bytes": 1181408,
+          "ratio_num": 1181408,
+          "ratio_den": 1181408,
+          "compress_cpu_ns": 0,
+          "decompress_cpu_ns": 0,
+          "fixed_ns": 22537003,
+          "per_link": {
+            "wan_2MBs": {
+              "peer_wall_ns": 613241003,
+              "peer_beats_cdn": false
+            },
+            "home_12_5MBs": {
+              "peer_wall_ns": 117049643,
+              "peer_beats_cdn": true
+            },
+            "lan_125MBs": {
+              "peer_wall_ns": 31988267,
+              "peer_beats_cdn": true
+            },
+            "fast_1000MBs": {
+              "peer_wall_ns": 23718411,
+              "peer_beats_cdn": true
+            }
+          },
+          "crossover_link_bps": 4975125
+        },
+        "lz4": {
+          "status": "ok",
+          "compressed_bytes": 753418,
+          "ratio_num": 753418,
+          "ratio_den": 1181408,
+          "compress_cpu_ns": 4537000,
+          "decompress_cpu_ns": 2784000,
+          "fixed_ns": 29858003,
+          "per_link": {
+            "wan_2MBs": {
+              "peer_wall_ns": 406567003,
+              "peer_beats_cdn": false
+            },
+            "home_12_5MBs": {
+              "peer_wall_ns": 90131443,
+              "peer_beats_cdn": true
+            },
+            "lan_125MBs": {
+              "peer_wall_ns": 35885347,
+              "peer_beats_cdn": true
+            },
+            "fast_1000MBs": {
+              "peer_wall_ns": 30611421,
+              "peer_beats_cdn": true
+            }
+          },
+          "crossover_link_bps": 3273710
+        },
+        "zstd-1": {
+          "status": "ok",
+          "compressed_bytes": 609120,
+          "ratio_num": 609120,
+          "ratio_den": 1181408,
+          "compress_cpu_ns": 6613000,
+          "decompress_cpu_ns": 3933000,
+          "fixed_ns": 33083003,
+          "per_link": {
+            "wan_2MBs": {
+              "peer_wall_ns": 337643003,
+              "peer_beats_cdn": false
+            },
+            "home_12_5MBs": {
+              "peer_wall_ns": 81812603,
+              "peer_beats_cdn": true
+            },
+            "lan_125MBs": {
+              "peer_wall_ns": 37955963,
+              "peer_beats_cdn": true
+            },
+            "fast_1000MBs": {
+              "peer_wall_ns": 33692123,
+              "peer_beats_cdn": true
+            }
+          },
+          "crossover_link_bps": 2684330
+        },
+        "zstd-3": {
+          "status": "ok",
+          "compressed_bytes": 552736,
+          "ratio_num": 552736,
+          "ratio_den": 1181408,
+          "compress_cpu_ns": 11188000,
+          "decompress_cpu_ns": 4141000,
+          "fixed_ns": 37866003,
+          "per_link": {
+            "wan_2MBs": {
+              "peer_wall_ns": 314234003,
+              "peer_beats_cdn": false
+            },
+            "home_12_5MBs": {
+              "peer_wall_ns": 82084883,
+              "peer_beats_cdn": true
+            },
+            "lan_125MBs": {
+              "peer_wall_ns": 42287891,
+              "peer_beats_cdn": true
+            },
+            "fast_1000MBs": {
+              "peer_wall_ns": 38418739,
+              "peer_beats_cdn": true
+            }
+          },
+          "crossover_link_bps": 2488300
+        },
+        "zstd-9": {
+          "status": "ok",
+          "compressed_bytes": 517511,
+          "ratio_num": 517511,
+          "ratio_den": 1181408,
+          "compress_cpu_ns": 28015000,
+          "decompress_cpu_ns": 3688000,
+          "fixed_ns": 54240003,
+          "per_link": {
+            "wan_2MBs": {
+              "peer_wall_ns": 312995503,
+              "peer_beats_cdn": false
+            },
+            "home_12_5MBs": {
+              "peer_wall_ns": 95640883,
+              "peer_beats_cdn": true
+            },
+            "lan_125MBs": {
+              "peer_wall_ns": 58380091,
+              "peer_beats_cdn": true
+            },
+            "fast_1000MBs": {
+              "peer_wall_ns": 54757514,
+              "peer_beats_cdn": true
+            }
+          },
+          "crossover_link_bps": 2515120
+        },
+        "zstd-19": {
+          "status": "ok",
+          "compressed_bytes": 465931,
+          "ratio_num": 465931,
+          "ratio_den": 1181408,
+          "compress_cpu_ns": 239295000,
+          "decompress_cpu_ns": 4237000,
+          "fixed_ns": 266069003,
+          "per_link": {
+            "wan_2MBs": {
+              "peer_wall_ns": 499034503,
+              "peer_beats_cdn": false
+            },
+            "home_12_5MBs": {
+              "peer_wall_ns": 303343483,
+              "peer_beats_cdn": false
+            },
+            "lan_125MBs": {
+              "peer_wall_ns": 269796451,
+              "peer_beats_cdn": false
+            },
+            "fast_1000MBs": {
+              "peer_wall_ns": 266534934,
+              "peer_beats_cdn": false
+            }
+          },
+          "crossover_link_bps": null
+        },
+        "xz-6": {
+          "status": "ok",
+          "compressed_bytes": 438060,
+          "ratio_num": 438060,
+          "ratio_den": 1181408,
+          "compress_cpu_ns": 267905000,
+          "decompress_cpu_ns": 14890000,
+          "fixed_ns": 305332003,
+          "per_link": {
+            "wan_2MBs": {
+              "peer_wall_ns": 524362003,
+              "peer_beats_cdn": false
+            },
+            "home_12_5MBs": {
+              "peer_wall_ns": 340376803,
+              "peer_beats_cdn": false
+            },
+            "lan_125MBs": {
+              "peer_wall_ns": 308836483,
+              "peer_beats_cdn": false
+            },
+            "fast_1000MBs": {
+              "peer_wall_ns": 305770063,
+              "peer_beats_cdn": false
+            }
+          },
+          "crossover_link_bps": null
+        },
+        "xz-9": {
+          "status": "ok",
+          "compressed_bytes": 438060,
+          "ratio_num": 438060,
+          "ratio_den": 1181408,
+          "compress_cpu_ns": 307622000,
+          "decompress_cpu_ns": 15015000,
+          "fixed_ns": 345174003,
+          "per_link": {
+            "wan_2MBs": {
+              "peer_wall_ns": 564204003,
+              "peer_beats_cdn": false
+            },
+            "home_12_5MBs": {
+              "peer_wall_ns": 380218803,
+              "peer_beats_cdn": false
+            },
+            "lan_125MBs": {
+              "peer_wall_ns": 348678483,
+              "peer_beats_cdn": false
+            },
+            "fast_1000MBs": {
+              "peer_wall_ns": 345612063,
+              "peer_beats_cdn": false
+            }
+          },
+          "crossover_link_bps": null
+        },
+        "brotli-5": {
+          "status": "ok",
+          "compressed_bytes": 496834,
+          "ratio_num": 496834,
+          "ratio_den": 1181408,
+          "compress_cpu_ns": 29241000,
+          "decompress_cpu_ns": 5977000,
+          "fixed_ns": 57755003,
+          "per_link": {
+            "wan_2MBs": {
+              "peer_wall_ns": 306172003,
+              "peer_beats_cdn": false
+            },
+            "home_12_5MBs": {
+              "peer_wall_ns": 97501723,
+              "peer_beats_cdn": true
+            },
+            "lan_125MBs": {
+              "peer_wall_ns": 61729675,
+              "peer_beats_cdn": true
+            },
+            "fast_1000MBs": {
+              "peer_wall_ns": 58251837,
+              "peer_beats_cdn": true
+            }
+          },
+          "crossover_link_bps": 2456595
+        },
+        "brotli-11": {
+          "status": "ok",
+          "compressed_bytes": 445819,
+          "ratio_num": 445819,
+          "ratio_den": 1181408,
+          "compress_cpu_ns": 1819001000,
+          "decompress_cpu_ns": 8421000,
+          "fixed_ns": 1849959003,
+          "per_link": {
+            "wan_2MBs": {
+              "peer_wall_ns": 2072868503,
+              "peer_beats_cdn": false
+            },
+            "home_12_5MBs": {
+              "peer_wall_ns": 1885624523,
+              "peer_beats_cdn": false
+            },
+            "lan_125MBs": {
+              "peer_wall_ns": 1853525555,
+              "peer_beats_cdn": false
+            },
+            "fast_1000MBs": {
+              "peer_wall_ns": 1850404822,
+              "peer_beats_cdn": false
+            }
+          },
+          "crossover_link_bps": null
+        }
+      }
+    },
+    {
+      "name": "bash",
+      "raw_nar_bytes": 1654112,
+      "regen_ns": 22751869,
+      "cdn_wall_ns": 378112000,
+      "cdn_filesize_bytes": 448312,
+      "cells": {
+        "none": {
+          "status": "ok",
+          "compressed_bytes": 1654112,
+          "ratio_num": 1654112,
+          "ratio_den": 1654112,
+          "compress_cpu_ns": 0,
+          "decompress_cpu_ns": 0,
+          "fixed_ns": 22751869,
+          "per_link": {
+            "wan_2MBs": {
+              "peer_wall_ns": 849807869,
+              "peer_beats_cdn": false
+            },
+            "home_12_5MBs": {
+              "peer_wall_ns": 155080829,
+              "peer_beats_cdn": true
+            },
+            "lan_125MBs": {
+              "peer_wall_ns": 35984765,
+              "peer_beats_cdn": true
+            },
+            "fast_1000MBs": {
+              "peer_wall_ns": 24405981,
+              "peer_beats_cdn": true
+            }
+          },
+          "crossover_link_bps": 4654749
+        },
+        "lz4": {
+          "status": "ok",
+          "compressed_bytes": 818860,
+          "ratio_num": 818860,
+          "ratio_den": 1654112,
+          "compress_cpu_ns": 6384000,
+          "decompress_cpu_ns": 3570000,
+          "fixed_ns": 32705869,
+          "per_link": {
+            "wan_2MBs": {
+              "peer_wall_ns": 442135869,
+              "peer_beats_cdn": false
+            },
+            "home_12_5MBs": {
+              "peer_wall_ns": 98214669,
+              "peer_beats_cdn": true
+            },
+            "lan_125MBs": {
+              "peer_wall_ns": 39256749,
+              "peer_beats_cdn": true
+            },
+            "fast_1000MBs": {
+              "peer_wall_ns": 33524729,
+              "peer_beats_cdn": true
+            }
+          },
+          "crossover_link_bps": 2370717
+        },
+        "zstd-1": {
+          "status": "ok",
+          "compressed_bytes": 634359,
+          "ratio_num": 634359,
+          "ratio_den": 1654112,
+          "compress_cpu_ns": 7039000,
+          "decompress_cpu_ns": 4237000,
+          "fixed_ns": 34027869,
+          "per_link": {
+            "wan_2MBs": {
+              "peer_wall_ns": 351207369,
+              "peer_beats_cdn": true
+            },
+            "home_12_5MBs": {
+              "peer_wall_ns": 84776589,
+              "peer_beats_cdn": true
+            },
+            "lan_125MBs": {
+              "peer_wall_ns": 39102741,
+              "peer_beats_cdn": true
+            },
+            "fast_1000MBs": {
+              "peer_wall_ns": 34662228,
+              "peer_beats_cdn": true
+            }
+          },
+          "crossover_link_bps": 1843616
+        },
+        "zstd-3": {
+          "status": "ok",
+          "compressed_bytes": 575551,
+          "ratio_num": 575551,
+          "ratio_den": 1654112,
+          "compress_cpu_ns": 10415000,
+          "decompress_cpu_ns": 4360000,
+          "fixed_ns": 37526869,
+          "per_link": {
+            "wan_2MBs": {
+              "peer_wall_ns": 325302369,
+              "peer_beats_cdn": true
+            },
+            "home_12_5MBs": {
+              "peer_wall_ns": 83570949,
+              "peer_beats_cdn": true
+            },
+            "lan_125MBs": {
+              "peer_wall_ns": 42131277,
+              "peer_beats_cdn": true
+            },
+            "fast_1000MBs": {
+              "peer_wall_ns": 38102420,
+              "peer_beats_cdn": true
+            }
+          },
+          "crossover_link_bps": 1689889
+        },
+        "zstd-9": {
+          "status": "ok",
+          "compressed_bytes": 529471,
+          "ratio_num": 529471,
+          "ratio_den": 1654112,
+          "compress_cpu_ns": 29052000,
+          "decompress_cpu_ns": 3887000,
+          "fixed_ns": 55690869,
+          "per_link": {
+            "wan_2MBs": {
+              "peer_wall_ns": 320426369,
+              "peer_beats_cdn": true
+            },
+            "home_12_5MBs": {
+              "peer_wall_ns": 98048549,
+              "peer_beats_cdn": true
+            },
+            "lan_125MBs": {
+              "peer_wall_ns": 59926637,
+              "peer_beats_cdn": true
+            },
+            "fast_1000MBs": {
+              "peer_wall_ns": 56220340,
+              "peer_beats_cdn": true
+            }
+          },
+          "crossover_link_bps": 1642173
+        },
+        "zstd-19": {
+          "status": "ok",
+          "compressed_bytes": 477774,
+          "ratio_num": 477774,
+          "ratio_den": 1654112,
+          "compress_cpu_ns": 307946000,
+          "decompress_cpu_ns": 4525000,
+          "fixed_ns": 335222869,
+          "per_link": {
+            "wan_2MBs": {
+              "peer_wall_ns": 574109869,
+              "peer_beats_cdn": false
+            },
+            "home_12_5MBs": {
+              "peer_wall_ns": 373444789,
+              "peer_beats_cdn": true
+            },
+            "lan_125MBs": {
+              "peer_wall_ns": 339045061,
+              "peer_beats_cdn": true
+            },
+            "fast_1000MBs": {
+              "peer_wall_ns": 335700643,
+              "peer_beats_cdn": true
+            }
+          },
+          "crossover_link_bps": 11139746
+        },
+        "xz-6": {
+          "status": "ok",
+          "compressed_bytes": 448312,
+          "ratio_num": 448312,
+          "ratio_den": 1654112,
+          "compress_cpu_ns": 332338000,
+          "decompress_cpu_ns": 17816000,
+          "fixed_ns": 372905869,
+          "per_link": {
+            "wan_2MBs": {
+              "peer_wall_ns": 597061869,
+              "peer_beats_cdn": false
+            },
+            "home_12_5MBs": {
+              "peer_wall_ns": 408770829,
+              "peer_beats_cdn": false
+            },
+            "lan_125MBs": {
+              "peer_wall_ns": 376492365,
+              "peer_beats_cdn": true
+            },
+            "fast_1000MBs": {
+              "peer_wall_ns": 373354181,
+              "peer_beats_cdn": true
+            }
+          },
+          "crossover_link_bps": 86112317
+        },
+        "xz-9": {
+          "status": "ok",
+          "compressed_bytes": 448312,
+          "ratio_num": 448312,
+          "ratio_den": 1654112,
+          "compress_cpu_ns": 366617000,
+          "decompress_cpu_ns": 14716000,
+          "fixed_ns": 404084869,
+          "per_link": {
+            "wan_2MBs": {
+              "peer_wall_ns": 628240869,
+              "peer_beats_cdn": false
+            },
+            "home_12_5MBs": {
+              "peer_wall_ns": 439949829,
+              "peer_beats_cdn": false
+            },
+            "lan_125MBs": {
+              "peer_wall_ns": 407671365,
+              "peer_beats_cdn": false
+            },
+            "fast_1000MBs": {
+              "peer_wall_ns": 404533181,
+              "peer_beats_cdn": false
+            }
+          },
+          "crossover_link_bps": null
+        },
+        "brotli-5": {
+          "status": "ok",
+          "compressed_bytes": 519145,
+          "ratio_num": 519145,
+          "ratio_den": 1654112,
+          "compress_cpu_ns": 31591000,
+          "decompress_cpu_ns": 7516000,
+          "fixed_ns": 61858869,
+          "per_link": {
+            "wan_2MBs": {
+              "peer_wall_ns": 321431369,
+              "peer_beats_cdn": true
+            },
+            "home_12_5MBs": {
+              "peer_wall_ns": 103390469,
+              "peer_beats_cdn": true
+            },
+            "lan_125MBs": {
+              "peer_wall_ns": 66012029,
+              "peer_beats_cdn": true
+            },
+            "fast_1000MBs": {
+              "peer_wall_ns": 62378014,
+              "peer_beats_cdn": true
+            }
+          },
+          "crossover_link_bps": 1641549
+        },
+        "brotli-11": {
+          "status": "ok",
+          "compressed_bytes": 453964,
+          "ratio_num": 453964,
+          "ratio_den": 1654112,
+          "compress_cpu_ns": 2175189000,
+          "decompress_cpu_ns": 7733000,
+          "fixed_ns": 2205673869,
+          "per_link": {
+            "wan_2MBs": {
+              "peer_wall_ns": 2432655869,
+              "peer_beats_cdn": false
+            },
+            "home_12_5MBs": {
+              "peer_wall_ns": 2241990989,
+              "peer_beats_cdn": false
+            },
+            "lan_125MBs": {
+              "peer_wall_ns": 2209305581,
+              "peer_beats_cdn": false
+            },
+            "fast_1000MBs": {
+              "peer_wall_ns": 2206127833,
+              "peer_beats_cdn": false
+            }
+          },
+          "crossover_link_bps": null
+        }
+      }
+    },
+    {
+      "name": "glibc-locales",
+      "raw_nar_bytes": 3070464,
+      "regen_ns": 23395665,
+      "cdn_wall_ns": 235198000,
+      "cdn_filesize_bytes": 234832,
+      "cells": {
+        "none": {
+          "status": "ok",
+          "compressed_bytes": 3070464,
+          "ratio_num": 3070464,
+          "ratio_den": 3070464,
+          "compress_cpu_ns": 0,
+          "decompress_cpu_ns": 0,
+          "fixed_ns": 23395665,
+          "per_link": {
+            "wan_2MBs": {
+              "peer_wall_ns": 1558627665,
+              "peer_beats_cdn": false
+            },
+            "home_12_5MBs": {
+              "peer_wall_ns": 269032785,
+              "peer_beats_cdn": false
+            },
+            "lan_125MBs": {
+              "peer_wall_ns": 47959377,
+              "peer_beats_cdn": true
+            },
+            "fast_1000MBs": {
+              "peer_wall_ns": 26466129,
+              "peer_beats_cdn": true
+            }
+          },
+          "crossover_link_bps": 14496838
+        },
+        "lz4": {
+          "status": "ok",
+          "compressed_bytes": 1445349,
+          "ratio_num": 1445349,
+          "ratio_den": 3070464,
+          "compress_cpu_ns": 7689000,
+          "decompress_cpu_ns": 5882000,
+          "fixed_ns": 36966665,
+          "per_link": {
+            "wan_2MBs": {
+              "peer_wall_ns": 759641165,
+              "peer_beats_cdn": false
+            },
+            "home_12_5MBs": {
+              "peer_wall_ns": 152594585,
+              "peer_beats_cdn": true
+            },
+            "lan_125MBs": {
+              "peer_wall_ns": 48529457,
+              "peer_beats_cdn": true
+            },
+            "fast_1000MBs": {
+              "peer_wall_ns": 38412014,
+              "peer_beats_cdn": true
+            }
+          },
+          "crossover_link_bps": 7291224
+        },
+        "zstd-1": {
+          "status": "ok",
+          "compressed_bytes": 838169,
+          "ratio_num": 838169,
+          "ratio_den": 3070464,
+          "compress_cpu_ns": 11845000,
+          "decompress_cpu_ns": 6078000,
+          "fixed_ns": 41318665,
+          "per_link": {
+            "wan_2MBs": {
+              "peer_wall_ns": 460403165,
+              "peer_beats_cdn": false
+            },
+            "home_12_5MBs": {
+              "peer_wall_ns": 108372185,
+              "peer_beats_cdn": true
+            },
+            "lan_125MBs": {
+              "peer_wall_ns": 48024017,
+              "peer_beats_cdn": true
+            },
+            "fast_1000MBs": {
+              "peer_wall_ns": 42156834,
+              "peer_beats_cdn": true
+            }
+          },
+          "crossover_link_bps": 4323148
+        },
+        "zstd-3": {
+          "status": "ok",
+          "compressed_bytes": 771735,
+          "ratio_num": 771735,
+          "ratio_den": 3070464,
+          "compress_cpu_ns": 12301000,
+          "decompress_cpu_ns": 7039000,
+          "fixed_ns": 42735665,
+          "per_link": {
+            "wan_2MBs": {
+              "peer_wall_ns": 428603165,
+              "peer_beats_cdn": false
+            },
+            "home_12_5MBs": {
+              "peer_wall_ns": 104474465,
+              "peer_beats_cdn": true
+            },
+            "lan_125MBs": {
+              "peer_wall_ns": 48909545,
+              "peer_beats_cdn": true
+            },
+            "fast_1000MBs": {
+              "peer_wall_ns": 43507400,
+              "peer_beats_cdn": true
+            }
+          },
+          "crossover_link_bps": 4009798
+        },
+        "zstd-9": {
+          "status": "ok",
+          "compressed_bytes": 726342,
+          "ratio_num": 726342,
+          "ratio_den": 3070464,
+          "compress_cpu_ns": 40821000,
+          "decompress_cpu_ns": 6080000,
+          "fixed_ns": 70296665,
+          "per_link": {
+            "wan_2MBs": {
+              "peer_wall_ns": 433467665,
+              "peer_beats_cdn": false
+            },
+            "home_12_5MBs": {
+              "peer_wall_ns": 128404025,
+              "peer_beats_cdn": true
+            },
+            "lan_125MBs": {
+              "peer_wall_ns": 76107401,
+              "peer_beats_cdn": true
+            },
+            "fast_1000MBs": {
+              "peer_wall_ns": 71023007,
+              "peer_beats_cdn": true
+            }
+          },
+          "crossover_link_bps": 4404707
+        },
+        "zstd-19": {
+          "status": "ok",
+          "compressed_bytes": 403747,
+          "ratio_num": 403747,
+          "ratio_den": 3070464,
+          "compress_cpu_ns": 766854000,
+          "decompress_cpu_ns": 6883000,
+          "fixed_ns": 797132665,
+          "per_link": {
+            "wan_2MBs": {
+              "peer_wall_ns": 999006165,
+              "peer_beats_cdn": false
+            },
+            "home_12_5MBs": {
+              "peer_wall_ns": 829432425,
+              "peer_beats_cdn": false
+            },
+            "lan_125MBs": {
+              "peer_wall_ns": 800362641,
+              "peer_beats_cdn": false
+            },
+            "fast_1000MBs": {
+              "peer_wall_ns": 797536412,
+              "peer_beats_cdn": false
+            }
+          },
+          "crossover_link_bps": null
+        },
+        "xz-6": {
+          "status": "ok",
+          "compressed_bytes": 234832,
+          "ratio_num": 234832,
+          "ratio_den": 3070464,
+          "compress_cpu_ns": 605508000,
+          "decompress_cpu_ns": 21468000,
+          "fixed_ns": 650371665,
+          "per_link": {
+            "wan_2MBs": {
+              "peer_wall_ns": 767787665,
+              "peer_beats_cdn": false
+            },
+            "home_12_5MBs": {
+              "peer_wall_ns": 669158225,
+              "peer_beats_cdn": false
+            },
+            "lan_125MBs": {
+              "peer_wall_ns": 652250321,
+              "peer_beats_cdn": false
+            },
+            "fast_1000MBs": {
+              "peer_wall_ns": 650606497,
+              "peer_beats_cdn": false
+            }
+          },
+          "crossover_link_bps": null
+        },
+        "xz-9": {
+          "status": "ok",
+          "compressed_bytes": 234832,
+          "ratio_num": 234832,
+          "ratio_den": 3070464,
+          "compress_cpu_ns": 635252000,
+          "decompress_cpu_ns": 21530000,
+          "fixed_ns": 680177665,
+          "per_link": {
+            "wan_2MBs": {
+              "peer_wall_ns": 797593665,
+              "peer_beats_cdn": false
+            },
+            "home_12_5MBs": {
+              "peer_wall_ns": 698964225,
+              "peer_beats_cdn": false
+            },
+            "lan_125MBs": {
+              "peer_wall_ns": 682056321,
+              "peer_beats_cdn": false
+            },
+            "fast_1000MBs": {
+              "peer_wall_ns": 680412497,
+              "peer_beats_cdn": false
+            }
+          },
+          "crossover_link_bps": null
+        },
+        "brotli-5": {
+          "status": "ok",
+          "compressed_bytes": 513329,
+          "ratio_num": 513329,
+          "ratio_den": 3070464,
+          "compress_cpu_ns": 56211000,
+          "decompress_cpu_ns": 8819000,
+          "fixed_ns": 88425665,
+          "per_link": {
+            "wan_2MBs": {
+              "peer_wall_ns": 345090165,
+              "peer_beats_cdn": false
+            },
+            "home_12_5MBs": {
+              "peer_wall_ns": 129491985,
+              "peer_beats_cdn": true
+            },
+            "lan_125MBs": {
+              "peer_wall_ns": 92532297,
+              "peer_beats_cdn": true
+            },
+            "fast_1000MBs": {
+              "peer_wall_ns": 88938994,
+              "peer_beats_cdn": true
+            }
+          },
+          "crossover_link_bps": 3497451
+        },
+        "brotli-11": {
+          "status": "ok",
+          "compressed_bytes": 420909,
+          "ratio_num": 420909,
+          "ratio_den": 3070464,
+          "compress_cpu_ns": 4739049000,
+          "decompress_cpu_ns": 9331000,
+          "fixed_ns": 4771775665,
+          "per_link": {
+            "wan_2MBs": {
+              "peer_wall_ns": 4982230165,
+              "peer_beats_cdn": false
+            },
+            "home_12_5MBs": {
+              "peer_wall_ns": 4805448385,
+              "peer_beats_cdn": false
+            },
+            "lan_125MBs": {
+              "peer_wall_ns": 4775142937,
+              "peer_beats_cdn": false
+            },
+            "fast_1000MBs": {
+              "peer_wall_ns": 4772196574,
+              "peer_beats_cdn": false
+            }
+          },
+          "crossover_link_bps": null
+        }
+      }
+    },
+    {
+      "name": "git",
+      "raw_nar_bytes": 50548816,
+      "regen_ns": 44976734,
+      "cdn_wall_ns": 2140000000,
+      "cdn_filesize_bytes": 8011464,
+      "cells": {
+        "none": {
+          "status": "ok",
+          "compressed_bytes": 50548816,
+          "ratio_num": 50548816,
+          "ratio_den": 50548816,
+          "compress_cpu_ns": 0,
+          "decompress_cpu_ns": 0,
+          "fixed_ns": 44976734,
+          "per_link": {
+            "wan_2MBs": {
+              "peer_wall_ns": 25319384734,
+              "peer_beats_cdn": false
+            },
+            "home_12_5MBs": {
+              "peer_wall_ns": 4088882014,
+              "peer_beats_cdn": false
+            },
+            "lan_125MBs": {
+              "peer_wall_ns": 449367262,
+              "peer_beats_cdn": true
+            },
+            "fast_1000MBs": {
+              "peer_wall_ns": 95525550,
+              "peer_beats_cdn": true
+            }
+          },
+          "crossover_link_bps": 24128046
+        },
+        "lz4": {
+          "status": "ok",
+          "compressed_bytes": 31649169,
+          "ratio_num": 31649169,
+          "ratio_den": 50548816,
+          "compress_cpu_ns": 125556000,
+          "decompress_cpu_ns": 51381000,
+          "fixed_ns": 221913734,
+          "per_link": {
+            "wan_2MBs": {
+              "peer_wall_ns": 16046498234,
+              "peer_beats_cdn": false
+            },
+            "home_12_5MBs": {
+              "peer_wall_ns": 2753847254,
+              "peer_beats_cdn": false
+            },
+            "lan_125MBs": {
+              "peer_wall_ns": 475107086,
+              "peer_beats_cdn": true
+            },
+            "fast_1000MBs": {
+              "peer_wall_ns": 253562903,
+              "peer_beats_cdn": true
+            }
+          },
+          "crossover_link_bps": 16500389
+        },
+        "zstd-1": {
+          "status": "ok",
+          "compressed_bytes": 25153472,
+          "ratio_num": 25153472,
+          "ratio_den": 50548816,
+          "compress_cpu_ns": 179171000,
+          "decompress_cpu_ns": 67908000,
+          "fixed_ns": 292055734,
+          "per_link": {
+            "wan_2MBs": {
+              "peer_wall_ns": 12868791734,
+              "peer_beats_cdn": false
+            },
+            "home_12_5MBs": {
+              "peer_wall_ns": 2304333494,
+              "peer_beats_cdn": false
+            },
+            "lan_125MBs": {
+              "peer_wall_ns": 493283510,
+              "peer_beats_cdn": true
+            },
+            "fast_1000MBs": {
+              "peer_wall_ns": 317209206,
+              "peer_beats_cdn": true
+            }
+          },
+          "crossover_link_bps": 13611597
+        },
+        "zstd-3": {
+          "status": "ok",
+          "compressed_bytes": 21649628,
+          "ratio_num": 21649628,
+          "ratio_den": 50548816,
+          "compress_cpu_ns": 266994000,
+          "decompress_cpu_ns": 77347000,
+          "fixed_ns": 389317734,
+          "per_link": {
+            "wan_2MBs": {
+              "peer_wall_ns": 11214131734,
+              "peer_beats_cdn": false
+            },
+            "home_12_5MBs": {
+              "peer_wall_ns": 2121287974,
+              "peer_beats_cdn": true
+            },
+            "lan_125MBs": {
+              "peer_wall_ns": 562514758,
+              "peer_beats_cdn": true
+            },
+            "fast_1000MBs": {
+              "peer_wall_ns": 410967362,
+              "peer_beats_cdn": true
+            }
+          },
+          "crossover_link_bps": 12366395
+        },
+        "zstd-9": {
+          "status": "skipped",
+          "reason": "bounded-sweep cap: zstd-9 not run on large packages"
+        },
+        "zstd-19": {
+          "status": "ok",
+          "compressed_bytes": 8664338,
+          "ratio_num": 8664338,
+          "ratio_den": 50548816,
+          "compress_cpu_ns": 17462043000,
+          "decompress_cpu_ns": 70972000,
+          "fixed_ns": 17577991734,
+          "per_link": {
+            "wan_2MBs": {
+              "peer_wall_ns": 21910160734,
+              "peer_beats_cdn": false
+            },
+            "home_12_5MBs": {
+              "peer_wall_ns": 18271138774,
+              "peer_beats_cdn": false
+            },
+            "lan_125MBs": {
+              "peer_wall_ns": 17647306438,
+              "peer_beats_cdn": false
+            },
+            "fast_1000MBs": {
+              "peer_wall_ns": 17586656072,
+              "peer_beats_cdn": false
+            }
+          },
+          "crossover_link_bps": null
+        },
+        "xz-6": {
+          "status": "skipped",
+          "reason": "bounded-sweep cap: xz-6 not run on large packages"
+        },
+        "xz-9": {
+          "status": "ok",
+          "compressed_bytes": 6640608,
+          "ratio_num": 6640608,
+          "ratio_den": 50548816,
+          "compress_cpu_ns": 17456919000,
+          "decompress_cpu_ns": 270437000,
+          "fixed_ns": 17772332734,
+          "per_link": {
+            "wan_2MBs": {
+              "peer_wall_ns": 21092636734,
+              "peer_beats_cdn": false
+            },
+            "home_12_5MBs": {
+              "peer_wall_ns": 18303581374,
+              "peer_beats_cdn": false
+            },
+            "lan_125MBs": {
+              "peer_wall_ns": 17825457598,
+              "peer_beats_cdn": false
+            },
+            "fast_1000MBs": {
+              "peer_wall_ns": 17778973342,
+              "peer_beats_cdn": false
+            }
+          },
+          "crossover_link_bps": null
+        },
+        "brotli-5": {
+          "status": "skipped",
+          "reason": "bounded-sweep cap: brotli-5 not run on large packages"
+        },
+        "brotli-11": {
+          "status": "skipped",
+          "reason": "bounded-sweep cap: brotli-11 not run on large packages"
+        }
+      }
+    },
+    {
+      "name": "python3",
+      "raw_nar_bytes": 133215664,
+      "regen_ns": 82552574,
+      "cdn_wall_ns": 48300000000,
+      "cdn_filesize_bytes": 56616908,
+      "cells": {
+        "none": {
+          "status": "ok",
+          "compressed_bytes": 133215664,
+          "ratio_num": 133215664,
+          "ratio_den": 133215664,
+          "compress_cpu_ns": 0,
+          "decompress_cpu_ns": 0,
+          "fixed_ns": 82552574,
+          "per_link": {
+            "wan_2MBs": {
+              "peer_wall_ns": 66690384574,
+              "peer_beats_cdn": false
+            },
+            "home_12_5MBs": {
+              "peer_wall_ns": 10739805694,
+              "peer_beats_cdn": true
+            },
+            "lan_125MBs": {
+              "peer_wall_ns": 1148277886,
+              "peer_beats_cdn": true
+            },
+            "fast_1000MBs": {
+              "peer_wall_ns": 215768238,
+              "peer_beats_cdn": true
+            }
+          },
+          "crossover_link_bps": 2762811
+        },
+        "lz4": {
+          "status": "ok",
+          "compressed_bytes": 73449400,
+          "ratio_num": 73449400,
+          "ratio_den": 133215664,
+          "compress_cpu_ns": 285995000,
+          "decompress_cpu_ns": 171399000,
+          "fixed_ns": 539946574,
+          "per_link": {
+            "wan_2MBs": {
+              "peer_wall_ns": 37264646574,
+              "peer_beats_cdn": true
+            },
+            "home_12_5MBs": {
+              "peer_wall_ns": 6415898574,
+              "peer_beats_cdn": true
+            },
+            "lan_125MBs": {
+              "peer_wall_ns": 1127541774,
+              "peer_beats_cdn": true
+            },
+            "fast_1000MBs": {
+              "peer_wall_ns": 613395974,
+              "peer_beats_cdn": true
+            }
+          },
+          "crossover_link_bps": 1537884
+        },
+        "zstd-1": {
+          "status": "ok",
+          "compressed_bytes": 58874486,
+          "ratio_num": 58874486,
+          "ratio_den": 133215664,
+          "compress_cpu_ns": 345716000,
+          "decompress_cpu_ns": 171017000,
+          "fixed_ns": 599285574,
+          "per_link": {
+            "wan_2MBs": {
+              "peer_wall_ns": 30036528574,
+              "peer_beats_cdn": true
+            },
+            "home_12_5MBs": {
+              "peer_wall_ns": 5309244454,
+              "peer_beats_cdn": true
+            },
+            "lan_125MBs": {
+              "peer_wall_ns": 1070281462,
+              "peer_beats_cdn": true
+            },
+            "fast_1000MBs": {
+              "peer_wall_ns": 658160060,
+              "peer_beats_cdn": true
+            }
+          },
+          "crossover_link_bps": 1234248
+        },
+        "zstd-3": {
+          "status": "ok",
+          "compressed_bytes": 56332047,
+          "ratio_num": 56332047,
+          "ratio_den": 133215664,
+          "compress_cpu_ns": 518968000,
+          "decompress_cpu_ns": 174737000,
+          "fixed_ns": 776257574,
+          "per_link": {
+            "wan_2MBs": {
+              "peer_wall_ns": 28942281074,
+              "peer_beats_cdn": true
+            },
+            "home_12_5MBs": {
+              "peer_wall_ns": 5282821334,
+              "peer_beats_cdn": true
+            },
+            "lan_125MBs": {
+              "peer_wall_ns": 1226913950,
+              "peer_beats_cdn": true
+            },
+            "fast_1000MBs": {
+              "peer_wall_ns": 832589621,
+              "peer_beats_cdn": true
+            }
+          },
+          "crossover_link_bps": 1185346
+        },
+        "zstd-9": {
+          "status": "skipped",
+          "reason": "bounded-sweep cap: zstd-9 not run on large packages"
+        },
+        "zstd-19": {
+          "status": "ok",
+          "compressed_bytes": 51729277,
+          "ratio_num": 51729277,
+          "ratio_den": 133215664,
+          "compress_cpu_ns": 34291537000,
+          "decompress_cpu_ns": 169858000,
+          "fixed_ns": 34543947574,
+          "per_link": {
+            "wan_2MBs": {
+              "peer_wall_ns": 60408586074,
+              "peer_beats_cdn": false
+            },
+            "home_12_5MBs": {
+              "peer_wall_ns": 38682289734,
+              "peer_beats_cdn": true
+            },
+            "lan_125MBs": {
+              "peer_wall_ns": 34957781790,
+              "peer_beats_cdn": true
+            },
+            "fast_1000MBs": {
+              "peer_wall_ns": 34595676851,
+              "peer_beats_cdn": true
+            }
+          },
+          "crossover_link_bps": 3760474
+        },
+        "xz-6": {
+          "status": "skipped",
+          "reason": "bounded-sweep cap: xz-6 not run on large packages"
+        },
+        "xz-9": {
+          "status": "ok",
+          "compressed_bytes": 50023744,
+          "ratio_num": 50023744,
+          "ratio_den": 133215664,
+          "compress_cpu_ns": 51369938000,
+          "decompress_cpu_ns": 1255201000,
+          "fixed_ns": 52707691574,
+          "per_link": {
+            "wan_2MBs": {
+              "peer_wall_ns": 77719563574,
+              "peer_beats_cdn": false
+            },
+            "home_12_5MBs": {
+              "peer_wall_ns": 56709591094,
+              "peer_beats_cdn": false
+            },
+            "lan_125MBs": {
+              "peer_wall_ns": 53107881526,
+              "peer_beats_cdn": false
+            },
+            "fast_1000MBs": {
+              "peer_wall_ns": 52757715318,
+              "peer_beats_cdn": false
+            }
+          },
+          "crossover_link_bps": null
+        },
+        "brotli-5": {
+          "status": "skipped",
+          "reason": "bounded-sweep cap: brotli-5 not run on large packages"
+        },
+        "brotli-11": {
+          "status": "skipped",
+          "reason": "bounded-sweep cap: brotli-11 not run on large packages"
+        }
+      }
+    }
+  ]
+}

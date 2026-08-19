@@ -126,3 +126,73 @@ vs the measured CDN, by peer-link speed:
 - The peer side is a model (ignores dial/handshake/framing/**discovery**); the CDN side is a
   single sample on one host's link. A real two-machine e2e that *includes discovery* is the
   honest confirmation — still to run (this is the transfer-model half of TASK-268).
+
+## Compression x link-speed sweep — the crossover map (TASK-269, 2026-08-19)
+
+The 268 cut modelled the peer serving the **raw** NAR. 269 asks the next question:
+if the **peer link itself compresses** (on the fly, per serve), does that move the
+crossover? The sweep measures every real package NAR against a codec grid
+(`none, lz4, zstd-1/3/9/19, xz-6/9, brotli-5/11`) — exact compressed **bytes**,
+compress **CPU**, decompress **CPU** — then models the peer wall at four link
+speeds and compares to the measured CDN. Raw data:
+`evidence/task-269/sweep_results.json`; the map is COMPUTED from it by
+`scripts/task269_crossover.py` (`evidence/task-269/crossover_map.json`).
+
+Model: `peer_wall = regen + compress_cpu + compressed_bytes/link + decompress_cpu`.
+**The asymmetry that decides it:** the peer regenerates the raw NAR and compresses
+it **on every serve**, so `compress_cpu` is a real per-serve tax; the CDN serves a
+**precomputed** file and pays no per-serve compress cost. (`regen` = the measured
+serve model: 22 ms floor + NAR/2.2 GB/s. All quantities integer ns/bytes; the
+crossover decision is an integer `peer_wall_ns < cdn_wall_ns`; ratios are exact
+`compressed/raw` rationals — `check-no-floats.py` scans both new scripts.)
+
+**Sweet spot per (package, link)** — the codec giving the minimum peer wall:
+
+| link | best codec | peer vs CDN |
+| --- | --- | --- |
+| 2 MB/s (16 Mbit WAN) | light zstd / brotli-5 | mixed (CDN wins the small pkgs) |
+| 12.5 MB/s (100 Mbit home) | **zstd-1..3** | **peer wins every package** |
+| 125 MB/s (1 Gbit LAN) | **none (raw)** | peer wins every package |
+| 1000 MB/s (10 GbE) | **none (raw)** | peer wins every package |
+
+Three findings, stated separately:
+
+- **Heavy codecs NEVER beat the CDN — the per-serve compress CPU sinks them.**
+  `zstd-19`, `xz-6/9`, `brotli-11` cost hundreds of ms (python3 `xz-9` = **51 s** of
+  compress CPU *per serve*) — more than they save in transfer at any link, so their
+  crossover is "never". On-the-fly per-serve compression rules out the high-ratio
+  codecs categorically; only the *cheap* end of the curve is viable.
+- **At home bandwidth (100 Mbit), light link-compression is the sweet spot and
+  flips the peer to a win.** `zstd-1..3` (ratio ~2-4x, compress CPU 2-12 ms on
+  small pkgs, ~0.2-0.5 s on python3) minimizes wall and beats the CDN on every
+  package — where raw ("none") alone was mixed in the 268 cut.
+- **At LAN/datacenter speed, raw wins — don't compress.** Above ~125 MB/s the link
+  so outpaces the codec that any compress CPU is pure overhead; `none` is the min-wall
+  choice and the peer wins outright. This is the **org/LAN-first product regime
+  (256)**: it needs **no link compression at all**.
+
+**Headline answer:** link compression makes the peer competitive **only in the
+home-bandwidth WAN-swarm regime (~100 Mbit)**, and only with a **light** codec
+(`zstd-1..3`); for the org/LAN-first product the fast link already wins with raw
+bytes, so link compression is a **non-priority** there. If a home-bandwidth swarm
+becomes a target, a **negotiated `zstd-3` link option** is the candidate default —
+NOT a fixed high-ratio codec, because the per-serve compress CPU is the binding
+constraint. Follow-up: TASK-270 (consider negotiated light-compression on the peer
+link) — deliberately deferred behind discovery/LAN-first per the North Star.
+
+**Caveats (this is a model, not an e2e):**
+- **EXCLUDES discovery latency** (PRD risk 3) — transfer+compression only; a
+  multi-second DHT lookup could still flip the small-package cases.
+- It is a **model**: measured compression + the transfer model, NOT a shaped-link
+  e2e. The additive wall is conservative for the peer (a real serve could pipeline
+  compress with transfer).
+- CDN walls are **single WAN samples** on this host's link (1-4 MB/s,
+  package-dependent) — the 2 MB/s column is the noisiest because the peer's modelled
+  link and the CDN's measured link differ per package. `cdn_wall` is download-only
+  (excludes the client's decompress of the CDN file); negligible in the crossover
+  region, where transfer dominates.
+- **Bounded-sweep caps:** full grid on the <=3 MB packages (3 runs, min CPU); on
+  git/python3 the high-CPU middle levels (`zstd-9`, `xz-6`) and the slow `brotli`
+  levels were **skipped** (recorded as `status: skipped` cells, never dropped) and
+  large packages ran a single pass. Disk held flat at 21.9 GB (NARs streamed to
+  memory, no temp files on disk).

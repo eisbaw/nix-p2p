@@ -1,0 +1,407 @@
+{
+  "task": "TASK-269",
+  "generated_unix": 1787166699,
+  "model_note": "raw_nar_bytes and compressed_bytes are DIFFERENT units; never conflated. CPU times are single-thread getrusage user+sys, integer ns.",
+  "packages": [
+    {
+      "name": "hello",
+      "store_path": "/nix/store/2bcv91i8fahqghn8dmyr791iaycbsjdd-hello-2.12.2",
+      "raw_nar_bytes": 274568,
+      "tier": "small",
+      "runs_per_cell": 3,
+      "cells": {
+        "none": {
+          "status": "ok",
+          "compressed_bytes": 274568,
+          "compress_cpu_ns": 0,
+          "decompress_cpu_ns": 0
+        },
+        "lz4": {
+          "status": "ok",
+          "compressed_bytes": 101456,
+          "compress_cpu_ns": 1417000,
+          "decompress_cpu_ns": 967000
+        },
+        "zstd-1": {
+          "status": "ok",
+          "compressed_bytes": 81828,
+          "compress_cpu_ns": 2212000,
+          "decompress_cpu_ns": 1290000
+        },
+        "zstd-3": {
+          "status": "ok",
+          "compressed_bytes": 74345,
+          "compress_cpu_ns": 3206000,
+          "decompress_cpu_ns": 1469000
+        },
+        "zstd-9": {
+          "status": "ok",
+          "compressed_bytes": 70468,
+          "compress_cpu_ns": 10882000,
+          "decompress_cpu_ns": 1439000
+        },
+        "zstd-19": {
+          "status": "ok",
+          "compressed_bytes": 63132,
+          "compress_cpu_ns": 86419000,
+          "decompress_cpu_ns": 1778000
+        },
+        "xz-6": {
+          "status": "ok",
+          "compressed_bytes": 57568,
+          "compress_cpu_ns": 47751000,
+          "decompress_cpu_ns": 4632000
+        },
+        "xz-9": {
+          "status": "ok",
+          "compressed_bytes": 57568,
+          "compress_cpu_ns": 70149000,
+          "decompress_cpu_ns": 5483000
+        },
+        "brotli-5": {
+          "status": "ok",
+          "compressed_bytes": 65274,
+          "compress_cpu_ns": 4608000,
+          "decompress_cpu_ns": 1488000
+        },
+        "brotli-11": {
+          "status": "ok",
+          "compressed_bytes": 57108,
+          "compress_cpu_ns": 272200000,
+          "decompress_cpu_ns": 3149000
+        }
+      }
+    },
+    {
+      "name": "curl",
+      "store_path": "/nix/store/0y90rp9g4i4rahyw18k0zcyfs8gl1v37-curl-8.21.0",
+      "raw_nar_bytes": 1181408,
+      "tier": "small",
+      "runs_per_cell": 3,
+      "cells": {
+        "none": {
+          "status": "ok",
+          "compressed_bytes": 1181408,
+          "compress_cpu_ns": 0,
+          "decompress_cpu_ns": 0
+        },
+        "lz4": {
+          "status": "ok",
+          "compressed_bytes": 753418,
+          "compress_cpu_ns": 4537000,
+          "decompress_cpu_ns": 2784000
+        },
+        "zstd-1": {
+          "status": "ok",
+          "compressed_bytes": 609120,
+          "compress_cpu_ns": 6613000,
+          "decompress_cpu_ns": 3933000
+        },
+        "zstd-3": {
+          "status": "ok",
+          "compressed_bytes": 552736,
+          "compress_cpu_ns": 11188000,
+          "decompress_cpu_ns": 4141000
+        },
+        "zstd-9": {
+          "status": "ok",
+          "compressed_bytes": 517511,
+          "compress_cpu_ns": 28015000,
+          "decompress_cpu_ns": 3688000
+        },
+        "zstd-19": {
+          "status": "ok",
+          "compressed_bytes": 465931,
+          "compress_cpu_ns": 239295000,
+          "decompress_cpu_ns": 4237000
+        },
+        "xz-6": {
+          "status": "ok",
+          "compressed_bytes": 438060,
+          "compress_cpu_ns": 267905000,
+          "decompress_cpu_ns": 14890000
+        },
+        "xz-9": {
+          "status": "ok",
+          "compressed_bytes": 438060,
+          "compress_cpu_ns": 307622000,
+          "decompress_cpu_ns": 15015000
+        },
+        "brotli-5": {
+          "status": "ok",
+          "compressed_bytes": 496834,
+          "compress_cpu_ns": 29241000,
+          "decompress_cpu_ns": 5977000
+        },
+        "brotli-11": {
+          "status": "ok",
+          "compressed_bytes": 445819,
+          "compress_cpu_ns": 1819001000,
+          "decompress_cpu_ns": 8421000
+        }
+      }
+    },
+    {
+      "name": "bash",
+      "store_path": "/nix/store/00zrahbb32nzawrmv9sjxn36h7qk9vrs-bash-5.2p37",
+      "raw_nar_bytes": 1654112,
+      "tier": "small",
+      "runs_per_cell": 3,
+      "cells": {
+        "none": {
+          "status": "ok",
+          "compressed_bytes": 1654112,
+          "compress_cpu_ns": 0,
+          "decompress_cpu_ns": 0
+        },
+        "lz4": {
+          "status": "ok",
+          "compressed_bytes": 818860,
+          "compress_cpu_ns": 6384000,
+          "decompress_cpu_ns": 3570000
+        },
+        "zstd-1": {
+          "status": "ok",
+          "compressed_bytes": 634359,
+          "compress_cpu_ns": 7039000,
+          "decompress_cpu_ns": 4237000
+        },
+        "zstd-3": {
+          "status": "ok",
+          "compressed_bytes": 575551,
+          "compress_cpu_ns": 10415000,
+          "decompress_cpu_ns": 4360000
+        },
+        "zstd-9": {
+          "status": "ok",
+          "compressed_bytes": 529471,
+          "compress_cpu_ns": 29052000,
+          "decompress_cpu_ns": 3887000
+        },
+        "zstd-19": {
+          "status": "ok",
+          "compressed_bytes": 477774,
+          "compress_cpu_ns": 307946000,
+          "decompress_cpu_ns": 4525000
+        },
+        "xz-6": {
+          "status": "ok",
+          "compressed_bytes": 448312,
+          "compress_cpu_ns": 332338000,
+          "decompress_cpu_ns": 17816000
+        },
+        "xz-9": {
+          "status": "ok",
+          "compressed_bytes": 448312,
+          "compress_cpu_ns": 366617000,
+          "decompress_cpu_ns": 14716000
+        },
+        "brotli-5": {
+          "status": "ok",
+          "compressed_bytes": 519145,
+          "compress_cpu_ns": 31591000,
+          "decompress_cpu_ns": 7516000
+        },
+        "brotli-11": {
+          "status": "ok",
+          "compressed_bytes": 453964,
+          "compress_cpu_ns": 2175189000,
+          "decompress_cpu_ns": 7733000
+        }
+      }
+    },
+    {
+      "name": "glibc-locales",
+      "store_path": "/nix/store/0blk7gr1f1qcf1h59igmgxr9qkz520pn-glibc-locales-2.42-51",
+      "raw_nar_bytes": 3070464,
+      "tier": "small",
+      "runs_per_cell": 3,
+      "cells": {
+        "none": {
+          "status": "ok",
+          "compressed_bytes": 3070464,
+          "compress_cpu_ns": 0,
+          "decompress_cpu_ns": 0
+        },
+        "lz4": {
+          "status": "ok",
+          "compressed_bytes": 1445349,
+          "compress_cpu_ns": 7689000,
+          "decompress_cpu_ns": 5882000
+        },
+        "zstd-1": {
+          "status": "ok",
+          "compressed_bytes": 838169,
+          "compress_cpu_ns": 11845000,
+          "decompress_cpu_ns": 6078000
+        },
+        "zstd-3": {
+          "status": "ok",
+          "compressed_bytes": 771735,
+          "compress_cpu_ns": 12301000,
+          "decompress_cpu_ns": 7039000
+        },
+        "zstd-9": {
+          "status": "ok",
+          "compressed_bytes": 726342,
+          "compress_cpu_ns": 40821000,
+          "decompress_cpu_ns": 6080000
+        },
+        "zstd-19": {
+          "status": "ok",
+          "compressed_bytes": 403747,
+          "compress_cpu_ns": 766854000,
+          "decompress_cpu_ns": 6883000
+        },
+        "xz-6": {
+          "status": "ok",
+          "compressed_bytes": 234832,
+          "compress_cpu_ns": 605508000,
+          "decompress_cpu_ns": 21468000
+        },
+        "xz-9": {
+          "status": "ok",
+          "compressed_bytes": 234832,
+          "compress_cpu_ns": 635252000,
+          "decompress_cpu_ns": 21530000
+        },
+        "brotli-5": {
+          "status": "ok",
+          "compressed_bytes": 513329,
+          "compress_cpu_ns": 56211000,
+          "decompress_cpu_ns": 8819000
+        },
+        "brotli-11": {
+          "status": "ok",
+          "compressed_bytes": 420909,
+          "compress_cpu_ns": 4739049000,
+          "decompress_cpu_ns": 9331000
+        }
+      }
+    },
+    {
+      "name": "git",
+      "store_path": "/nix/store/2z9pz49718aq8cnxbxc3x4ahmwrxaqx7-git-2.42.2",
+      "raw_nar_bytes": 50548816,
+      "tier": "large",
+      "runs_per_cell": 1,
+      "cells": {
+        "none": {
+          "status": "ok",
+          "compressed_bytes": 50548816,
+          "compress_cpu_ns": 0,
+          "decompress_cpu_ns": 0
+        },
+        "lz4": {
+          "status": "ok",
+          "compressed_bytes": 31649169,
+          "compress_cpu_ns": 125556000,
+          "decompress_cpu_ns": 51381000
+        },
+        "zstd-1": {
+          "status": "ok",
+          "compressed_bytes": 25153472,
+          "compress_cpu_ns": 179171000,
+          "decompress_cpu_ns": 67908000
+        },
+        "zstd-3": {
+          "status": "ok",
+          "compressed_bytes": 21649628,
+          "compress_cpu_ns": 266994000,
+          "decompress_cpu_ns": 77347000
+        },
+        "zstd-9": {
+          "status": "skipped",
+          "reason": "bounded-sweep cap: zstd-9 not run on large packages"
+        },
+        "zstd-19": {
+          "status": "ok",
+          "compressed_bytes": 8664338,
+          "compress_cpu_ns": 17462043000,
+          "decompress_cpu_ns": 70972000
+        },
+        "xz-6": {
+          "status": "skipped",
+          "reason": "bounded-sweep cap: xz-6 not run on large packages"
+        },
+        "xz-9": {
+          "status": "ok",
+          "compressed_bytes": 6640608,
+          "compress_cpu_ns": 17456919000,
+          "decompress_cpu_ns": 270437000
+        },
+        "brotli-5": {
+          "status": "skipped",
+          "reason": "bounded-sweep cap: brotli-5 not run on large packages"
+        },
+        "brotli-11": {
+          "status": "skipped",
+          "reason": "bounded-sweep cap: brotli-11 not run on large packages"
+        }
+      }
+    },
+    {
+      "name": "python3",
+      "store_path": "/nix/store/05xfwnl62nipbw1ankbcv2crjhb9a918-python3-3.13.14",
+      "raw_nar_bytes": 133215664,
+      "tier": "large",
+      "runs_per_cell": 1,
+      "cells": {
+        "none": {
+          "status": "ok",
+          "compressed_bytes": 133215664,
+          "compress_cpu_ns": 0,
+          "decompress_cpu_ns": 0
+        },
+        "lz4": {
+          "status": "ok",
+          "compressed_bytes": 73449400,
+          "compress_cpu_ns": 285995000,
+          "decompress_cpu_ns": 171399000
+        },
+        "zstd-1": {
+          "status": "ok",
+          "compressed_bytes": 58874486,
+          "compress_cpu_ns": 345716000,
+          "decompress_cpu_ns": 171017000
+        },
+        "zstd-3": {
+          "status": "ok",
+          "compressed_bytes": 56332047,
+          "compress_cpu_ns": 518968000,
+          "decompress_cpu_ns": 174737000
+        },
+        "zstd-9": {
+          "status": "skipped",
+          "reason": "bounded-sweep cap: zstd-9 not run on large packages"
+        },
+        "zstd-19": {
+          "status": "ok",
+          "compressed_bytes": 51729277,
+          "compress_cpu_ns": 34291537000,
+          "decompress_cpu_ns": 169858000
+        },
+        "xz-6": {
+          "status": "skipped",
+          "reason": "bounded-sweep cap: xz-6 not run on large packages"
+        },
+        "xz-9": {
+          "status": "ok",
+          "compressed_bytes": 50023744,
+          "compress_cpu_ns": 51369938000,
+          "decompress_cpu_ns": 1255201000
+        },
+        "brotli-5": {
+          "status": "skipped",
+          "reason": "bounded-sweep cap: brotli-5 not run on large packages"
+        },
+        "brotli-11": {
+          "status": "skipped",
+          "reason": "bounded-sweep cap: brotli-11 not run on large packages"
+        }
+      }
+    }
+  ],
+  "disk_free_start_bytes": 21875384320,
+  "disk_free_end_bytes": 21875093504
+}
