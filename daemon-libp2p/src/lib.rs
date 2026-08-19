@@ -2535,9 +2535,13 @@ impl daemon_core::StatusFacts for SwarmStatusFacts {
             bootstrap_total: self.bootstrap.len() as u32,
             bootstrap_healthy: healthy,
             path,
-            // TASK-257 F-2: the live routing-table size, read from the running swarm. A cross-scope
-            // mDNS neighbour is dialed but never inserted (ProtocolNotSupported is not admitted), so
-            // it never appears in this count - the honest routing-state observable.
+            // TASK-257 F-2: the live routing-table size, read from the running swarm. NOTE: a
+            // cross-scope mDNS neighbour IS inserted here (kad.add_address inserts it as Disconnected
+            // BEFORE any handshake; ProtocolNotSupported only updates status, never removes) and IS
+            // counted by routing_peers(). It occupies at most the F-1 admission cap of slots as a
+            // decaying dead-end, never resolves scoped content (the scoped protocol name isolates it,
+            // proven by the 7/7 e2e content-isolation control), and is a bounded cost inside "a cross
+            // peer costs a retry". Deterministic event-driven eviction is deferred to TASK-262.
             kad_routing_peers: Some(self.handle.routing_peers().await as u32),
         }
     }
