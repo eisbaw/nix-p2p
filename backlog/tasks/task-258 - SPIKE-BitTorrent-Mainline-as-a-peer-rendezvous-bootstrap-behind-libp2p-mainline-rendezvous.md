@@ -3,11 +3,11 @@ id: TASK-258
 title: >-
   SPIKE: BitTorrent Mainline as a peer-rendezvous bootstrap behind
   --libp2p-mainline-rendezvous
-status: In Progress
+status: Done
 assignee:
   - '@claude'
 created_date: '2026-08-18 20:54'
-updated_date: '2026-08-19 10:13'
+updated_date: '2026-08-19 10:17'
 labels:
   - libp2p
   - mainline
@@ -135,4 +135,14 @@ R2-1 NAT attribution (narrowing point 1 was still too strong). The VM topology i
 R2-3 guard docstring self-contradiction (FIXED in the guard, recorded here). The docstring previously said BEP5 STRUCTURALLY cannot answer who-holds-hash-X / carries no content key. That is false: get_peers(info_hash) IS a find-peers-under-a-key call and BEP5 CAN key on a hash. The honest structural claim is about OUR WRAPPER: we hardcode ONE well-known membership infohash and NEVER derive an infohash from a Nix content hash, and the return is a bare IP:port — so our USE supplies member ADDRESSES only. Corrected in check-discovery-no-shortcut.py so it no longer contradicts the acknowledged get_peers(info_hash) blind spot.
 
 NET unchanged: adopt-with-conditions; central finding sound; no proven claim weakened.
+
+SPIKE CLOSED 2026-08-19 — DEEP GATE GREEN (codex GO-VERDICT-258R3 + guard self-test + real scan + enumeration/client-only oracles bite). RECOMMENDATION: ADOPT-WITH-CONDITIONS.
+
+Cross-model gate ran 3 rounds (codex): R (5 overstatements) and R2 (2 residuals: a guard docstring self-contradiction + a VM over-attribution) each caught REAL claim-honesty defects, all fixed by narrowing to the evidence (commits ee1a7f9 -> c6fa0a3 -> 227684d); R3 GO. The SUBSTANCE was confirmed sound every round: BEP5 structure, supply-chain isolation (mainline dep only in the isolated workspace member, not any shipped daemon binary), client-only proven from raw wire (0 outbound responses vs 44 in server_mode), config-level fail-closed profile refusal (upstream-only + lan-share), enumeration recoverable-fraction 5/5 hermetic with a 0/3 vacuous-run bite, and a passing KVM VM e2e (nodeb discovers nodea via BEP5 across NAT, DISCOVER_OK addrs=192.168.1.1:4001 peerid=none).
+
+CENTRAL FINDING (honest, narrowed): BEP5 rendezvous DISCOVERS a nix-p2p node membership across NAT but does NOT itself provide NAT traversal — announce_peer records the packet source IP + supplied port (source port only when implied_port=1); get_peers returns bare IP:port (no PeerId, no /p2p-circuit). It bootstraps INTO our existing circuit-v2 relay + kad. The VM proves the unmapped-MASQUERADE direct-address failure; BEP5 FORMAT establishes that a peer whose ONLY reachable address is a /p2p-circuit cannot be expressed in BEP5. Enumeration exposes node MEMBERSHIP (which IPs speak nix-p2p), NOT content HOLDINGS — frozen no-enumeration (holdings) invariant untouched.
+
+ADOPT-GATED FOLLOW-UPS (the adopt decision must carry these; NOT done in the spike): AC#2 live SwarmHandle::dial wiring (daemon runs no DHT today; only the spike bin does) + a real packet-level OFF bite once wired; AC#3 byte-identical fetch (blocked by the reachability finding); AC#9/#10/#11 bounded expiring peer cache (spike is cold-cache-only to keep the no-injection bites honest); BEP44-or-dial-out for circuit-only peers; a SEMANTIC (not just naming) content-discovery guard; and real-swarm enumeration cost = TASK-96 (owner-authorized two-network infra). 258 does NOT close TASK-96.
+
+Guard change is SHIPPED (check-discovery-no-shortcut.py: Mainline rendezvous permitted in the ADDRESS-bootstrap role, bites if wired to find_providers/get_providers; libp2p rendezvous PROTOCOL behaviour stays forbidden outright) with the honest scope recorded: it is a naming/wiring heuristic; the load-bearing content-path isolation is the CRATE BOUNDARY enforced by cargo. Evidence in evidence/task-258/.
 <!-- SECTION:NOTES:END -->
