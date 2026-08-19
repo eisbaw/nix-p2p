@@ -7,7 +7,7 @@ status: In Progress
 assignee:
   - '@claude'
 created_date: '2026-08-10 22:24'
-updated_date: '2026-08-19 13:00'
+updated_date: '2026-08-19 13:30'
 labels:
   - production
   - operator
@@ -84,4 +84,6 @@ GATE r3: fmt+clippy green; daemon-core --lib 316; profile_budget 19; operator 24
 CORRECTION (supersedes the earlier "AC#10/#3 DONE / Full DEEP gate GREEN" note, which was written before the codex re-gate reopened this task): AC#3 is OPEN (declared != enforced; 14 fields surfaced+hashed but not runtime-enforced, TASK-264 completes it). AC#10 is checked. The DEEP gate is NOT green-complete yet - it is mid codex re-gate: R1 NOGO (serve-override envelope bypass + enforced-vs-declared honesty) was fixed and R2 VERIFIED the critical fix on real binaries; 4 minor honesty/accuracy residuals (R2-1 effective-value display, R2-2 hash-vs-review wording, R2-3 no path-based loader, R2-4 tracker drift) are being closed now; R3 final re-gate pending. Do not read the earlier DONE/GREEN as current truth.
 
 AC#10 "explicitly owner-reviewed" clarification (R2-2c): there is NO separate human-attestation artifact in this repo. "Owner-reviewed" is represented OPERATIONALLY by the checked-in frozen content hash (EXPECTED_PROFILE_BUDGET_HASH) plus the artifact reviewed_revision field: any budget change forces a deliberate, reviewable one-line hash re-freeze, and the daemon fail-closes on drift. The hash attests IDENTITY/FREEZE of the canonical JCS content, NOT human authorization of the numbers - a content hash cannot attest that. A real signed approval attestation is future work, not built here. AC#10 is checked on that operational reading; if the owner requires a literal human-attestation record, AC#10 is partial pending that separate mechanism.
+
+STATE 2026-08-19 (post codex R1/R2/R3): DELIVERED SCOPE is DEEP-gate substance-GREEN and codex-verified — AC#10 frozen budget artifact (hash d5d71004) + the ENFORCED serve envelope (single/inflight served NarSize + serve duration; a CLI override may only TIGHTEN; 512 MiB/300 s fails closed; verified on real binaries). Commits 4ff3b39->02951bd->188b57e->801902c (the last three closed codex NOGO findings incl the CRITICAL runtime-override bypass R1 found and the R3 doc-drift). ONLY AC#3 remains OPEN — the 14 declared-only budget fields (upload rate/bytes, transient RAM, disk bytes, open_fds, concurrent-serve count) are frozen+surfaced ceilings, NOT runtime-shaped — tracked in TASK-264. Do NOT re-select 120 as a whole; pick TASK-264 to finish AC#3, at which point 120 flips Done with its final gate.
 <!-- SECTION:NOTES:END -->
