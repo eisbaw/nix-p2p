@@ -40,6 +40,23 @@ protocol path but NOT the `mainline_rendezvous` crate/flag naming.
 gossipsub/floodsub remain forbidden OUTRIGHT (their mere presence is a violation);
 mDNS and the Mainline rendezvous are judged by their WIRING, not their presence.
 
+WHAT THIS GUARD DOES AND DOES NOT PROVE (TASK-258 codex 258R honesty scope). This is
+a NAMING/WIRING heuristic - defense-in-depth over the source text - NOT a semantic
+proof that content discovery is Kademlia-exclusive. Two blind spots are explicit:
+  * BEP5 `get_peers(info_hash)` is itself a provider-DISCOVERY-SHAPED call (find
+    peers under a key). This guard permits it in the ADDRESS-bootstrap role by the
+    region's naming + its sinks, so the guard alone does NOT establish that the
+    rendezvous is semantically not-content-discovery; that rests on the crate
+    boundary below, plus the structural fact that BEP5 carries no content key.
+  * `FORBIDDEN_PROTOCOL_RE` matches the CANONICAL libp2p paths (`libp2p::rendezvous`,
+    `rendezvous::Behaviour`, ...); it does NOT catch arbitrary aliases such as
+    `use libp2p::rendezvous as rz;`. A determined rename can evade the substring arm.
+THE LOAD-BEARING GUARANTEE is not this guard: it is that the `mainline` crate is NOT
+a dependency of ANY shipped daemon binary - daemon, daemon-libp2p and fabric-libp2p
+declare no `mainline` dep; it is a separate workspace member exercised only by the
+spike bin - so Mainline code cannot reach the shipped content path AT ALL. cargo, not
+this naming scan, enforces that. This guard is the cheaper second line.
+
 DISCOVERY vs DIAL-ASSISTANCE (TASK-168). The NAT-traversal trio - autonat
 (reachability detection), dcutr (hole punching), relay (circuit-v2 client+server)
 - is EXPLICITLY PERMITTED. These are dial-assistance / CONNECTIVITY, not discovery:

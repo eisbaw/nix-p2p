@@ -7,7 +7,7 @@ status: In Progress
 assignee:
   - '@claude'
 created_date: '2026-08-18 20:54'
-updated_date: '2026-08-19 09:38'
+updated_date: '2026-08-19 10:03'
 labels:
   - libp2p
   - mainline
@@ -113,4 +113,18 @@ AC STATUS: DONE #1 #4 #5 #6 #7 #12 #13. PARTIAL: #2 (default-OFF flag + NixOS op
 SUPPLY CHAIN: cargo deny licenses/bans/sources GREEN with the new mainline dep. cargo deny advisories has 3 PRE-EXISTING failures (h2 RUSTSEC-2026-0258 via iroh; hickory-dns RUSTSEC-2026-0118/0119 via iroh/libp2p DNS) — confirmed present in HEAD Cargo.lock, NOT introduced by mainline (mainline pulls neither). They warrant their own triage follow-up.
 
 GATES: fmt clean; clippy -D warnings clean on changed crates; discovery-guard self-test bites + real scan green; enumeration analyzer self-test bites; spike default tests 2/2 + ignored load-bearing 2/2 + scaffold mutation-bite 4/4 green; VM e2e PASSED. Evidence in evidence/task-258/.
+
+CODEX 258R NARROWING 2026-08-19 (cross-model gate NOGO on OVERSTATED decision-bearing claims; the SUBSTANCE all checked out — BEP5 structure, supply-chain isolation, remedies, client-only, config-level profile refusal — but five claims above were stated STRONGER than the evidence proves. Narrowed here; recommendation stands ADOPT-WITH-CONDITIONS):
+
+1. NAT REACHABILITY was TOO BROAD. "BEP5 cannot let B REACH a NATd A" overreaches: a NATd peer reachable via port-forward, UPnP, hole-punched mapped endpoint, or any dialable mapped address IS reachable, and BEP5 records that dialable mapped address fine. The PROVEN limitation is narrower and specific: BEP5 cannot express a peer whose ONLY reachable address is a /p2p-circuit through a relay (BEP5 carries a bare IP:port, not a circuit multiaddr). The VM e2e demonstrates exactly that circuit-only-behind-MASQUERADE case (recorded at the NAT-gateway IP, undialable), not the general NATd case.
+
+2. BEP5 ANNOUNCE-ADDRESS WORDING corrected. announce_peer records the packet SOURCE IP plus the PORT SUPPLIED IN THE announce_peer MESSAGE; the packet source PORT is used only when implied_port=1 (BEP5). Prior "source IP:port" conflated the two. The finding (NAT-gateway IP recovered, private IP not) is unaffected — the IP is the packet source either way.
+
+3. GUARD CLAIM narrowed to what the guard actually proves. check-discovery-no-shortcut.py is a NAMING/WIRING heuristic (defense-in-depth), NOT a semantic proof that content discovery is Kademlia-exclusive: BEP5 get_peers(info_hash) is itself a provider-discovery-SHAPED call permitted by naming, and FORBIDDEN_PROTOCOL_RE misses aliases such as `use libp2p::rendezvous as rz`. The LOAD-BEARING isolation is the CRATE BOUNDARY: the mainline crate is NOT a dependency of any shipped daemon binary (daemon, daemon-libp2p, fabric-libp2p declare no mainline dep — verified by manifest grep; codex confirmed via cargo tree), so Mainline code cannot reach the shipped content path at all. cargo enforces that; the guard is the cheaper second line. Guard docstring updated to say so.
+
+4. PROFILE-REFUSAL packet-level claim was true only BY CONSTRUCTION. AC#5 refusal is proven at the CONFIG/PARSE level: fail-closed under upstream-only AND lan-share, default OFF, 4 mutation-bite tests. But a PACKET-LEVEL zero-Mainline-traffic bite is VACUOUS today because the shipped daemon runs NO Mainline DHT even when the flag is ON (live wiring is the deferred AC#2 — only the spike bin runs the DHT). A meaningful packet-level bite becomes possible only after AC#2 lands. The config-level proof is what stands now; do not read it as a wire-observed zero.
+
+5. ENUMERATION 5/5 is a HERMETIC recoverable-FRACTION, not a general enumeration RATE. In the hermetic 5-node topology a third-party observer recovered 5/5 (num=den=5, exact rational) of the announced membership from ITS OWN get_peers capture, and a values-stripped capture recovers 0/3 (vacuous-run bite fires). This proves (a) BEP5 announce EXPOSES member IPs and the analyzer recovers exactly what the wire carries, and (b) the oracle bites a handed result. It is NOT a claim about what fraction of a REAL public swarm is enumerable, nor the real-swarm wall-time (2148 ms is the hermetic single-lookup latency). Real-swarm enumeration cost is TASK-96 domain (owner-authorized two-network infra). The QUALITATIVE privacy conclusion is unchanged: BEP5 announce enumerates node MEMBERSHIP (which IPs speak nix-p2p), NOT content HOLDINGS — the frozen no-enumeration (holdings) invariant is untouched.
+
+NET: the recommendation (adopt-with-conditions), the central finding (discovers-membership-not-circuit-reachability), the client-only proof, supply-chain isolation, and the deferred AC#2/#3/#9-11 follow-ups all STAND. Only the five claim STRENGTHS above are narrowed to the evidence. Follow-ups the adopt decision must carry: semantic-not-just-naming discovery guard, real-swarm enumeration cost (96), packet-level OFF bite after live wiring, BEP44-or-dial-out for circuit-only peers.
 <!-- SECTION:NOTES:END -->
