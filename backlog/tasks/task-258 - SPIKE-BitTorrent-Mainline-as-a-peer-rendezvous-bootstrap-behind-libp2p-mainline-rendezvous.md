@@ -6,7 +6,7 @@ title: >-
 status: To Do
 assignee: []
 created_date: '2026-08-18 20:54'
-updated_date: '2026-08-18 21:00'
+updated_date: '2026-08-18 21:22'
 labels:
   - libp2p
   - mainline
@@ -92,4 +92,6 @@ BEP44 CAN carry a PeerId: signed mutable items, ed25519, roughly 1000 bytes, seq
 THE REAL GAP IN BEP5, and the reason to evaluate a hybrid: A NATD PEER HAS NO USEFUL IP:PORT TO ANNOUNCE. Its reachable address is a /p2p-circuit through a relay, and BEP5 cannot express that -- it can only record the source address of the packet. So a NATd node either announces something undiallable or cannot participate. That population is most of a public pool, and TASK-218/219 have just landed multi-relay /p2p-circuit resolution through our own DHT, so the circuit addresses exist and are meaningful. It is also consistent with the no-public-infra constraint, since relays are peer-provided via SharingProfile::Router rather than centrally operated.
 
 LIKELY SHAPE: BEP5 to FIND unknown peers, plus optional BEP44 signed records for peers whose only reachable address is a circuit. Evaluate whether the NATd case is large enough to justify the second mechanism, or whether a NATd peer can simply skip announcing and rely on being found once it dials out and is added to others routing tables.
+
+OWNER E2E REQUIREMENT (2026-08-18): the spike MUST include a WORKING VM e2e demonstrating Mainline rendezvous discovery. Topology: two VMs (KVM, extending the nat-vm-test topology), NATd so they CANNOT connect DIRECTLY. Node A boots first and announces to the Mainline DHT under the well-known nix-p2p infohash; Node B boots ~10s LATER and get_peers that infohash. DEMONSTRATION: B (late joiner) discovers A via BEP5 (Mainline get_peers) EVEN THOUGH they cannot connect directly -- Mainline rendezvous is the meeting point; connectivity is then established via the existing relay/hole-punch NAT traversal (TASK-168/218). Owner words: we need to SEE the bittorrent bootstrap work in e2e between VMs, one initial node and another booting 10s later, eventually seeing each other via BEP5 even if they cant connect directly. HERMETICITY design point for the spike: do NOT hit the REAL public Mainline DHT (router.bittorrent.com/dht.transmissionbt.com) in a hermetic e2e -- external dependency + announcing test nodes to the real Mainline swarm is leaky and rude. Stand up a LOCAL Mainline DHT bootstrap node inside the VM topology that both nix-p2p nodes use as their Mainline entry point (a real Mainline node, but in-topology); optionally a separate manual/opt-in run can validate against the real Mainline. The PRIVACY-COST measurement (BEP5 announce_peer exposes our IP -> node-MEMBERSHIP enumeration, NOT content holdings; consult TASK-96) remains the central spike deliverable ALONGSIDE this working demo.
 <!-- SECTION:NOTES:END -->
