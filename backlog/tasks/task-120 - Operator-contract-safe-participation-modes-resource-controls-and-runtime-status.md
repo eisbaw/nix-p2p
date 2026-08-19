@@ -3,11 +3,11 @@ id: TASK-120
 title: >-
   Operator contract: safe participation modes, resource controls and runtime
   status
-status: Done
+status: In Progress
 assignee:
   - '@claude'
 created_date: '2026-08-10 22:24'
-updated_date: '2026-08-19 11:54'
+updated_date: '2026-08-19 12:09'
 labels:
   - production
   - operator
