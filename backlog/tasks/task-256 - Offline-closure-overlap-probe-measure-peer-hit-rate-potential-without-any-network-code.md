@@ -6,6 +6,7 @@ title: >-
 status: To Do
 assignee: []
 created_date: '2026-08-18 20:35'
+updated_date: '2026-08-19 10:18'
 labels:
   - measurement
   - value-thesis
@@ -37,3 +38,14 @@ DISCIPLINE: obey the no-floats rule -- overlap as exact integer numerator/denomi
 
 NOT: policy training material, holdout material, or a PRD success claim. TASK-95 and TASK-127 are the nearest existing tasks; both are Low and both are over-specified (127 wants 14 days of longitudinal churn and a running swarm). This is deliberately smaller.
 <!-- SECTION:DESCRIPTION:END -->
+
+## Acceptance Criteria
+<!-- AC:BEGIN -->
+- [ ] #1 Overlap computed OFFLINE from nix path-info closures across k>=2 stores + a request/build trace — NO protocol code, NO network, NO containers
+- [ ] #2 Run for BOTH populations: (a) same-org / same-pinned-flake stores; (b) unrelated stores on DIFFERENT nixpkgs revisions. The DIFFERENCE between (a) and (b) is reported as the finding
+- [ ] #3 Overlap reported as EXACT integer numerator/denominator (path counts AND byte totals); floats only as terminal display. NarSize (uncompressed) vs compressed-wire bytes kept as separate unit-suffixed fields, NEVER compared
+- [ ] #4 Cold-start and steady-state hit-rate reported SEPARATELY
+- [ ] #5 VACUITY BITE (mutation): the measurement RE-DERIVES overlap from raw path-info; a run handed a fabricated/injected overlap or the wrong closure set FAILS the check (demonstrated by mutation)
+- [ ] #6 Written finding: whether org/LAN or global-swarm is the honest first product, whether TASK-255 (whole-store supply) is worth building, and PRD risk 4 (supply lags demand) priced with data. An honest LOW-overlap result is an explicitly VALID outcome (the cheap kill signal)
+- [ ] #7 Labeled decision-input ONLY — NOT policy-training, NOT holdout, NOT a PRD success claim
+<!-- AC:END -->
