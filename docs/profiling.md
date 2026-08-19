@@ -92,7 +92,7 @@ persistent nix-store connection would cut it. This is consistent with TASK-64/62
 the per-byte cost sits below our code": on real packages our serve code is cheap; the cost is
 the external `nix-store` regeneration overhead + the bytes themselves.
 
-## Peer-serve vs CDN — a first competitive cut (TASK-268, 2026-08-19)
+## nix-p2p vs cache.nixos.org — a first competitive cut (TASK-268, 2026-08-19)
 
 The **CDN side is measured** (this host's real link to cache.nixos.org, one timed fetch each);
 the **peer side is MODELLED** from the measured serve cost — so the peer numbers are an
@@ -109,14 +109,14 @@ Real CDN download (this host's WAN link to Fastly was ~1-4 MB/s — box-specific
 
 Peer TRANSFER model (serves the RAW NAR; wall ≈ 22 ms floor + max(regen@2.2 GB/s, transfer))
 vs the measured CDN, by peer-link speed:
-- **LAN 1 Gbps:** peer wins **2-44x** — the local link so outweighs the 2.4-6.3x raw-byte
+- **LAN 1 Gbps:** nix-p2p wins **2-44x** — the local link so outweighs the 2.4-6.3x raw-byte
   penalty that it stops mattering.
-- **home 100 Mbps:** mixed — peer wins *except* `git`, whose 6.3x compression ratio (the
+- **home 100 Mbps:** mixed — nix-p2p wins *except* `git`, whose 6.3x compression ratio (the
   best-compressing package) is the peer's worst case.
-- **WAN comparable to the CDN link:** CDN wins everywhere (it moves 2.4-6.3x fewer bytes).
+- **WAN comparable to the CDN link:** cache.nixos.org wins everywhere (it moves 2.4-6.3x fewer bytes).
 
 **Verdict, with the caveat that decides it:**
-- On **data transfer alone**, the peer wins on a fast *local* link — confirming the org/LAN
+- On **data transfer alone**, nix-p2p wins on a fast *local* link — confirming the org/LAN
   same-pin thesis (256) with numbers — and loses over a link comparable to the CDN's, where
   compression wins.
 - **This EXCLUDES discovery latency**, which the PRD flags as seconds-scale and which is **not
@@ -148,12 +148,12 @@ crossover decision is an integer `peer_wall_ns < cdn_wall_ns`; ratios are exact
 
 **Sweet spot per (package, link)** — the codec giving the minimum peer wall:
 
-| link | best codec | peer vs CDN |
+| link | best codec | nix-p2p vs cache.nixos.org |
 | --- | --- | --- |
-| 2 MB/s (16 Mbit WAN) | light zstd / brotli-5 | mixed (CDN wins the small pkgs) |
-| 12.5 MB/s (100 Mbit home) | **zstd-1..3** | **peer wins every package** |
-| 125 MB/s (1 Gbit LAN) | **none (raw)** | peer wins every package |
-| 1000 MB/s (10 GbE) | **none (raw)** | peer wins every package |
+| 2 MB/s (16 Mbit WAN) | light zstd / brotli-5 | mixed (cache.nixos.org wins the small pkgs) |
+| 12.5 MB/s (100 Mbit home) | **zstd-1..3** | **nix-p2p wins every package** |
+| 125 MB/s (1 Gbit LAN) | **none (raw)** | nix-p2p wins every package |
+| 1000 MB/s (10 GbE) | **none (raw)** | nix-p2p wins every package |
 
 Three findings, stated separately:
 
@@ -168,7 +168,7 @@ Three findings, stated separately:
   package — where raw ("none") alone was mixed in the 268 cut.
 - **At LAN/datacenter speed, raw wins — don't compress.** Above ~125 MB/s the link
   so outpaces the codec that any compress CPU is pure overhead; `none` is the min-wall
-  choice and the peer wins outright. This is the **org/LAN-first product regime
+  choice and nix-p2p wins outright. This is the **org/LAN-first product regime
   (256)**: it needs **no link compression at all**.
 
 **Headline answer:** link compression makes the peer competitive **only in the
@@ -196,3 +196,23 @@ link) — deliberately deferred behind discovery/LAN-first per the North Star.
   levels were **skipped** (recorded as `status: skipped` cells, never dropped) and
   large packages ran a single pass. Disk held flat at 21.9 GB (NARs streamed to
   memory, no temp files on disk).
+
+**Effective (post-decompression), apples-to-apples.** The crossover above compares
+*download* bytes. But the fair unit is *time to usable RAW bytes* — and the CDN's
+compressed file is not free to the client, which must decompress it. The CDN serves
+**xz** for most packages (`hello/bash/git/glibc`); nix-p2p, when it compresses at all,
+wants **zstd** (the sweet spot). Client decompress cost, measured in the sweep:
+
+| package | CDN codec | CDN file | client decompress | nix-p2p zstd-3 decompress |
+| --- | --- | ---: | ---: | ---: |
+| hello | xz | 57 KB | 4.6 ms | 1.5 ms |
+| git | xz | 8.0 MB | **270 ms** | 77 ms |
+| python3 | zstd | 56.6 MB | 175 ms | 175 ms |
+
+So: (1) on a LAN nix-p2p serves **raw** — client decompress is **0**, while the CDN still
+pays its xz-decompress (git: +270 ms); (2) where nix-p2p *does* compress (home bandwidth),
+**zstd-3 decompresses ~3.5× faster than the CDN's xz** (git 77 ms vs 270 ms) *and* is cheap
+enough to compress per-serve, which xz is not. The xz-vs-zstd asymmetry favours nix-p2p on
+the decompression leg in both regimes. (`cdn_wall` in the crossover map is still
+download-only; folding client-decompress in only widens nix-p2p's margin — it never narrows
+it.)
