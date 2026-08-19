@@ -540,3 +540,89 @@ discovery-evidence-finalize out="artifacts/decentralized-content-discovery": _py
 # Re-verify the tracked discovery artifact against its on-disk raw captures (hash match).
 discovery-evidence-verify out="artifacts/decentralized-content-discovery": _python
     "${NIX_P2P_PYTHON}/bin/python3" scripts/decentralized_discovery_evidence.py --verify --out {{ quote(out) }}
+
+# ---- TASK-253 profiling & benchmark toolchain (INSTRUMENTATION, not the value thesis) ----
+# All three recipes target the claim/hold-query WIRE CODEC (daemon-core/src/claim.rs) - the
+# frozen format the PRIMARY libp2p discovery+serve path speaks (consumed by daemon-libp2p;
+# NOT the deprioritized iroh path). They produce NO policy evidence, NO PRD success claim,
+# and gate nothing (owner: this is TASK-253, explicitly not TASK-237). Every derived number
+# they emit is an INTEGER (counts/byte totals); raw tool JSON is kept verbatim. Run cost is
+# BOUNDED and documented per recipe - the box is SHARED, so none of these is a soak or a
+# parallel farm. Tool choices + the perf privilege note live in docs/profiling.md.
+
+# Benchmark the libp2p claim-wire codec two ways: (1) a criterion in-process microbench
+# (per-op time estimate) and (2) a hyperfine whole-process wall-clock A/B (small vs large
+# claim payload). BOUNDED: criterion sample_size=20 / 2s measure / 0.5s warmup (in the
+# harness's bounded() config); hyperfine --warmup 2 --runs 10, each invocation --iters 20000.
+# JSON is exported under artifacts/profiling/ for a later report layer.
+# Benchmark the libp2p claim-wire codec: criterion microbench + hyperfine A/B (bounded).
+bench: _toolchain
+    #!/usr/bin/env bash
+    set -euo pipefail
+    mkdir -p artifacts/profiling
+    # (1) criterion microbench - in-process, statistical per-op estimate (bounded config).
+    cargo bench --locked -p daemon-core --bench claim_wire
+    # (2) hyperfine A/B - whole-process wall-clock, small vs large claim payload.
+    cargo build --locked --release -p daemon-core --example claim_wire_load
+    bin="${CARGO_TARGET_DIR:-$PWD/target}/release/examples/claim_wire_load"
+    hyperfine --warmup 2 --runs 10 \
+        --export-json artifacts/profiling/hyperfine-claim-wire.json \
+        -n small "${bin} --iters 20000 --payload small" \
+        -n large "${bin} --iters 20000 --payload large"
+
+# CPU-attribute the libp2p claim-wire codec. PRIMARY: cargo-flamegraph (perf) - a real
+# flamegraph of the release example, written to artifacts/profiling/flamegraph.svg. perf
+# needs kernel.perf_event_paranoid <= 2 for the unprivileged USER-SPACE sampling this uses
+# (our attribution is user-space; kernel frames need <= 1). If perf is unavailable or too
+# restricted, FALL BACK to valgrind/callgrind (privilege-independent) and say so - a precise
+# "perf needs X, used callgrind" is the honest outcome, never a faked flamegraph. BOUNDED:
+# perf run --iters 400000 (~1-2s of samples); callgrind --iters 4000 (callgrind is ~50x slower).
+# CPU-flamegraph the libp2p claim-wire codec (perf; valgrind/callgrind fallback).
+profile-cpu: _toolchain
+    #!/usr/bin/env bash
+    set -euo pipefail
+    mkdir -p artifacts/profiling
+    cargo build --locked --release -p daemon-core --example claim_wire_load
+    bin="${CARGO_TARGET_DIR:-$PWD/target}/release/examples/claim_wire_load"
+    paranoid="$(cat /proc/sys/kernel/perf_event_paranoid 2>/dev/null || echo 99)"
+    use_callgrind=0
+    if command -v flamegraph >/dev/null 2>&1 && [ "${paranoid}" -le 2 ]; then
+        echo "profile-cpu: perf_event_paranoid=${paranoid} (<=2) -> cargo-flamegraph (user-space perf)"
+        if flamegraph -o artifacts/profiling/flamegraph.svg -- "${bin}" --iters 400000 --payload large; then
+            echo "profile-cpu: flamegraph -> artifacts/profiling/flamegraph.svg"
+        else
+            echo "profile-cpu: perf/flamegraph failed at runtime; falling back to callgrind" >&2
+            use_callgrind=1
+        fi
+        # perf writes a multi-hundred-MB perf.data next to the CWD; drop it (the SHARED box is
+        # disk-tight) - the flamegraph.svg is the kept artifact.
+        rm -f perf.data perf.data.old
+    else
+        echo "profile-cpu: perf unavailable or perf_event_paranoid=${paranoid} (>2) -> valgrind/callgrind fallback" >&2
+        use_callgrind=1
+    fi
+    if [ "${use_callgrind}" -eq 1 ]; then
+        valgrind --tool=callgrind \
+            --callgrind-out-file=artifacts/profiling/callgrind.out \
+            "${bin}" --iters 4000 --payload large
+        echo "profile-cpu: CPU attribution in artifacts/profiling/callgrind.out"
+        echo "profile-cpu: view with 'callgrind_annotate artifacts/profiling/callgrind.out' (no flamegraph: perf sampling unavailable)"
+    fi
+
+# ALLOCATION-profile the libp2p claim-wire codec via dhat - the RAM oracle that is BETTER
+# than peak RSS (it counts what the codec actually allocates, total and at-peak, not the
+# process high-water mark; the existing serve-budget residency oracle is untouched). Builds
+# the example with --features dhat-heap (dhat's global allocator), runs a BOUNDED --iters
+# 2000 (dhat instruments every allocation, ~10-50x slower; the per-op allocation profile is
+# iteration-count-independent, so a small run suffices). Prints an integer alloc summary and
+# writes dhat-heap.json under artifacts/profiling/ (view at https://nnethercote.github.io/dh_view/dh_view.html).
+# Allocation-profile the libp2p claim-wire codec via dhat (an oracle better than peak RSS).
+profile-ram: _toolchain
+    #!/usr/bin/env bash
+    set -euo pipefail
+    mkdir -p artifacts/profiling
+    cargo build --locked -p daemon-core --example claim_wire_load --features dhat-heap
+    bin="${CARGO_TARGET_DIR:-$PWD/target}/debug/examples/claim_wire_load"
+    # dhat writes dhat-heap.json to CWD; run inside artifacts/profiling so it lands there.
+    ( cd artifacts/profiling && "${bin}" --iters 2000 --payload large )
+    echo "profile-ram: allocation profile in artifacts/profiling/dhat-heap.json"

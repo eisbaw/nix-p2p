@@ -591,7 +591,23 @@
         # directly and does not invoke rustc, so it is independent of the
         # `_toolchain` pin. At runtime it fetches the RustSec advisory-db from
         # GitHub (fine for local `just audit` and Determinate-Nix CI).
-        packages = [ pkgs.just pythonEnv pkgs.ruff pkgs.cargo-deny ];
+        # TASK-253 profiling/benchmark toolchain (instrumentation on the PRIMARY libp2p
+        # path). hyperfine: whole-process wall-clock A/B (`just bench`). cargo-flamegraph:
+        # CPU flamegraph via perf (`just profile-cpu`); linuxPackages.perf supplies the
+        # `perf` it drives. valgrind: the privilege-independent CPU-attribution fallback
+        # (callgrind) when perf_event_paranoid forbids sampling. criterion + dhat are cargo
+        # deps, not here. All are cached binaries (no source build), so they add fetch —
+        # not compile — cost to the dev shell.
+        packages = [
+          pkgs.just
+          pythonEnv
+          pkgs.ruff
+          pkgs.cargo-deny
+          pkgs.hyperfine
+          pkgs.cargo-flamegraph
+          pkgs.perf
+          pkgs.valgrind
+        ];
         # Exact toolchain derivation, so the Justfile's `_toolchain` guard can
         # prove the tools come from THIS one rather than from any /nix/store
         # path that happens to be on PATH.

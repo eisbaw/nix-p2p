@@ -71,8 +71,30 @@ rustix = { version = "1", features = ["fs", "process"] }
 # Neither is a p2p stack nor an HTTP-logic crate, so the independence denylist is unaffected.
 ed25519-dalek = "3"
 base64 = "0.22"
+# TASK-253 profiling: dhat is the ALLOCATION profiler behind `just profile-ram` — a
+# residency oracle better than peak RSS (it counts what the codec actually allocates,
+# total and at-peak, not the process high-water mark). OPTIONAL and OFF by default, so it
+# is absent from every shipped/e2e closure (the `daemon`/`daemon-libp2p` packages never
+# enable `dhat-heap`); it enters only the `claim_wire_load` example built with the feature.
+# Not a p2p stack nor an HTTP-logic crate, so the independence denylist is unaffected.
+dhat = { version = "0.3", optional = true }
+
+[features]
+# Opt-in heap profiling for the `claim_wire_load` example (TASK-253 `just profile-ram`).
+# Enabling it installs dhat's global allocator; keep it OUT of any shipped build.
+dhat-heap = ["dep:dhat"]
+
+[[bench]]
+# The claim-wire criterion microbench (TASK-253 `just bench`). harness = false: criterion
+# provides its own main via `criterion_main!`, so the built-in libtest bench harness is off.
+name = "claim_wire"
+harness = false
 
 [dev-dependencies]
+# TASK-253 microbench harness. default-features = false drops the plotters/gnuplot/rayon
+# tree (we call `.without_plots()` and cap sample size), keeping the bench build lean on a
+# shared, disk-tight host; `cargo_bench_support` is the piece `criterion_main!` needs.
+criterion = { version = "0.5", default-features = false, features = ["cargo_bench_support"] }
 # The serving-core in-process integration tests moved here with the modules; several stand
 # up fake NAR sources + drive time.
 tokio = { version = "1", features = ["rt-multi-thread", "net", "macros", "io-util", "time", "sync", "test-util"] }

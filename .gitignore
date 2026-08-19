@@ -35,5 +35,10 @@ __pycache__/
 /artifacts/iroh-publication/
 /artifacts/decentralized-content-discovery/
 
+# TASK-253 profiling/benchmark outputs (flamegraph.svg, callgrind.out, dhat-heap.json,
+# hyperfine-*.json). Regenerable via `just bench`/`profile-cpu`/`profile-ram`; they go stale
+# quickly, so they are an output, not tracked content.
+/artifacts/profiling/
+
 # hypothesis example DB (prop_tests.py uses database=None, but ignore any stray dir)
 /.hypothesis/
