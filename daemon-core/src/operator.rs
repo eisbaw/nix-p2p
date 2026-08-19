@@ -438,9 +438,14 @@ impl Default for ResourceCaps {
     /// FROM here, and a parity test enforces it). Large-but-finite, integer.
     fn default() -> Self {
         ResourceCaps {
-            max_nar_bytes_uncompressed: 512 * 1024 * 1024, // 512 MiB per NAR
-            max_inflight_bytes_uncompressed: 1024 * 1024 * 1024, // 1 GiB in flight
-            serve_duration_ms: 300_000,                    // 5 min per serve
+            // TASK-120 AC#10: the libp2p-primary caps ADOPT the PRD.md:839-842 normative
+            // admission envelope (256 MiB single / 1 GiB inflight / 120 s), the SAME frozen
+            // ceiling `peer-fabric`'s ServeBudget::default() and the composite iroh path carry.
+            // These are parity-checked against the frozen profile-budget artifact
+            // (`crate::profile_budget`); a divergence fails `profile_budget::verify`.
+            max_nar_bytes_uncompressed: 256 * 1024 * 1024, // 256 MiB per NAR (normative)
+            max_inflight_bytes_uncompressed: 1024 * 1024 * 1024, // 1 GiB in flight (normative)
+            serve_duration_ms: 120_000,                    // 120 s per serve (normative)
             discovery_deadline_ms: 5_000, // matches DiscoveryBudget provisional deadline
             discovery_max_peers: 16,
             // TASK-229 responder-derivation defaults. CONSERVATIVE PLACEHOLDERS, not
@@ -1133,6 +1138,15 @@ impl OperatorContract {
         }
         out.push(String::new());
 
+        // TASK-120 AC#10: the frozen, content-hashed, owner-reviewed per-profile budget artifact is
+        // the ONE source of truth these effective controls parity-check against. Surfacing it here
+        // makes the FULL declared budget (upload/RAM/disk/fd/discovery/announce) visible, and its
+        // fail-closed verification (hash + normative envelope + parity) runs on the running node.
+        for line in crate::profile_budget::preflight_lines(self.profile, &self.caps) {
+            out.push(line);
+        }
+        out.push(String::new());
+
         out.push("privacy controls:".to_string());
         out.push(format!(
             "  diagnostics_opt_in: {}",
@@ -1651,12 +1665,13 @@ mod tests {
     fn caps_default_drive_the_peer_fabric_budgets() {
         let caps = ResourceCaps::default();
         let serve = caps.serve_budget();
-        assert_eq!(serve.max_nar_bytes_uncompressed_nar, 512 * 1024 * 1024);
+        // TASK-120 AC#10: the caps now carry the normative envelope (256 MiB / 1 GiB / 120 s).
+        assert_eq!(serve.max_nar_bytes_uncompressed_nar, 256 * 1024 * 1024);
         assert_eq!(
             serve.max_inflight_bytes_uncompressed_nar,
             1024 * 1024 * 1024
         );
-        assert_eq!(serve.max_serve_duration, Duration::from_millis(300_000));
+        assert_eq!(serve.max_serve_duration, Duration::from_millis(120_000));
         let disc = caps.discovery_budget();
         assert_eq!(disc.deadline, Duration::from_millis(5_000));
         assert_eq!(disc.max_peers, 16);
@@ -1823,8 +1838,16 @@ mod tests {
         assert!(p.contains("libp2p-kad-discovery = ENABLED"));
         // The public-share dependency list names the allowlist gate.
         assert!(p.contains("public-NAR allowlist"));
-        // Effective integer controls appear.
-        assert!(p.contains("max_nar_bytes_uncompressed=536870912"));
+        // Effective integer controls appear (256 MiB normative envelope).
+        assert!(p.contains("max_nar_bytes_uncompressed=268435456"));
+        // TASK-120 AC#10: the frozen profile-budget artifact is surfaced in preflight.
+        assert!(p.contains("frozen profile-budget artifact"));
+        assert!(p.contains("single_nar_bytes_uncompressed_nar=268435456"));
+        // Enforced fields are marked enforced; declared-only ceilings are marked as such so the
+        // surface never advertises a phantom bound as effective (honesty fix).
+        assert!(p.contains("single_nar_bytes_uncompressed_nar=268435456  [enforced]"));
+        assert!(p.contains("transient_ram_bytes_ram=268435456  [declared ceiling"));
+        assert!(p.contains("open_fds_count=4096  [declared ceiling"));
         // Default privacy stance is stated.
         assert!(p.contains("NEVER exported unless diagnostics_opt_in"));
     }

@@ -1335,6 +1335,18 @@ async fn main() -> ExitCode {
         return ExitCode::from(2);
     }
 
+    // TASK-120 AC#10: fail-closed on the frozen per-profile budget artifact BEFORE serving. This
+    // verifies the embedded artifact's content hash (owner-review marker), the normative envelope
+    // (256 MiB / 1 GiB / 120 s), and that the artifact's enforced fields match the running caps. A
+    // drifted/exceeded/diverged budget BLOCKS startup with a precise reason — never a silent
+    // zero/unbounded default. (A genuinely MISSING artifact is caught earlier, at BUILD time: the
+    // artifact is `include_str!`'d, so its absence is a compile error; the runtime
+    // PROFILE_BUDGET_ARTIFACT_MISSING token is for the path-based tooling loader.)
+    if let Err(err) = daemon_core::profile_budget::verify(contract.profile, &contract.caps) {
+        eprintln!("daemon-libp2p: profile-budget contract rejected: {err}");
+        return ExitCode::from(2);
+    }
+
     // TASK-120 AC#4 (startup surface): always announce the derived operator MODE so the running
     // node's participation is legible from its first log line; AC#5: print the mandatory privacy
     // banner when opt-in diagnostics are enabled.
@@ -2452,7 +2464,9 @@ mod operator_contract_tests {
         assert_eq!(cfg.profile, SharingProfile::UpstreamOnly);
         let p = build_contract(&cfg).unwrap().preflight();
         assert!(p.contains("iroh-transport = PENDING"));
-        assert!(p.contains("max_nar_bytes_uncompressed=536870912"));
+        assert!(p.contains("max_nar_bytes_uncompressed=268435456"));
+        // TASK-120 AC#10: the frozen profile-budget artifact is surfaced + verified in preflight.
+        assert!(p.contains("frozen profile-budget artifact"));
         assert!(p.contains("serves_bytes: false"));
     }
 }

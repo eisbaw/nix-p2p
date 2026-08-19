@@ -690,13 +690,12 @@ impl Default for Config {
             iroh_lookup_owner: None,
             iroh_lookup_external_authorization: None,
             iroh_seed_nar: Vec::new(),
-            // TASK-120 fix #5: the iroh serve budget is DELIBERATELY the fabric-iroh FROZEN values
-            // (256 MiB / 1 GiB / 120 s), NOT the libp2p-primary `ResourceCaps` (512 MiB / 1 GiB /
-            // 300 s). This is an EXPLICIT freeze, prune-pending TASK-202 (the iroh transport is the
-            // deferred reference), not a silent divergence: the test
-            // `iroh_budget_is_the_frozen_reference_distinct_from_caps` pins it. When TASK-202
-            // decides iroh's fate this either adopts `ResourceCaps` or is
-            // removed with the iroh give-side.
+            // TASK-120 AC#10: the iroh serve budget is the fabric-iroh FROZEN values
+            // (256 MiB / 1 GiB / 120 s). As of the AC#10 freeze the libp2p-primary `ResourceCaps`
+            // ADOPT the SAME normative envelope, so the two now CONVERGE on the PRD.md:839-842
+            // ceiling rather than diverging (the earlier 512 MiB / 300 s libp2p caps were the
+            // divergence AC#10 eliminated). The test `iroh_budget_matches_the_normative_caps`
+            // pins the convergence; the iroh give-side remains prune-pending TASK-202.
             iroh_max_serve_nar_bytes: DEFAULT_MAX_SERVE_NAR_BYTES,
             iroh_max_inflight_nar_bytes: DEFAULT_MAX_INFLIGHT_NAR_BYTES,
             iroh_max_serve_duration_ms: DEFAULT_MAX_SERVE_DURATION.as_millis() as u64,
@@ -2554,6 +2553,15 @@ async fn main() -> ExitCode {
         return ExitCode::SUCCESS;
     }
 
+    // TASK-120 AC#10: fail-closed on the frozen per-profile budget artifact BEFORE serving, the
+    // same gate the libp2p-primary binary applies (hash + normative envelope + parity vs the
+    // running caps). Blocks startup on a drifted/exceeded/diverged budget; a genuinely missing
+    // artifact is a BUILD-time compile error (the artifact is `include_str!`'d).
+    if let Err(err) = daemon::profile_budget::verify(contract.profile, &contract.caps) {
+        eprintln!("daemon: profile-budget contract rejected: {err}");
+        return ExitCode::FAILURE;
+    }
+
     let shutdown_signals = match install_shutdown_signals() {
         Ok(signals) => signals,
         Err(error) => {
@@ -2985,20 +2993,26 @@ mod tests {
         assert!(err.contains("disagrees"), "{err}");
     }
 
-    /// #5: the composite iroh serve budget is the FROZEN fabric-iroh reference (256 MiB / 1 GiB /
-    /// 120 s), DELIBERATELY distinct from the libp2p-primary `ResourceCaps` - an explicit,
-    /// documented, prune-pending-202 divergence, never a silent one.
+    /// TASK-120 AC#10: the composite iroh serve budget is the FROZEN fabric-iroh reference
+    /// (256 MiB / 1 GiB / 120 s), and after the AC#10 freeze the libp2p-primary `ResourceCaps`
+    /// CONVERGE on the SAME normative envelope. What used to be a documented 512 MiB / 300 s
+    /// divergence is now a single ceiling both paths honour.
     #[test]
-    fn iroh_budget_is_the_frozen_reference_distinct_from_caps() {
+    fn iroh_budget_matches_the_normative_caps() {
         assert_eq!(DEFAULT_MAX_SERVE_NAR_BYTES, 256 * 1024 * 1024);
         assert_eq!(
             DEFAULT_MAX_SERVE_DURATION,
             std::time::Duration::from_secs(120)
         );
         let caps = ResourceCaps::default();
-        assert_ne!(
+        assert_eq!(
             DEFAULT_MAX_SERVE_NAR_BYTES, caps.max_nar_bytes_uncompressed,
-            "the frozen iroh budget must be a KNOWN divergence from the libp2p-primary caps"
+            "AC#10: libp2p-primary caps must adopt the normative 256 MiB single-NAR envelope"
+        );
+        assert_eq!(
+            DEFAULT_MAX_SERVE_DURATION.as_millis() as u64,
+            caps.serve_duration_ms,
+            "AC#10: libp2p-primary caps must adopt the normative 120 s serve duration"
         );
     }
 

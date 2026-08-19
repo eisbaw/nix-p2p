@@ -37,6 +37,7 @@ pub mod observ;
 pub mod operator;
 pub mod peer_source;
 pub mod post_fetch;
+pub mod profile_budget;
 // Property-test support (TASK-112): the shared, determinism-controlled proptest
 // runner used by the `prop_*` tests in `claim` and `narinfo_cache`. Test-only.
 #[cfg(test)]
@@ -86,6 +87,11 @@ pub use operator::{
     ContractError, ContractRequest, DIAGNOSTICS_WARNING, DhtRole, LookupOutcome, Mechanism,
     MechanismState, MetricLabel, OperatorContract, PeerPath, PrivacyPolicy, ResourceCaps,
     SharingProfile, StatusInputs,
+};
+pub use profile_budget::{
+    BudgetError, ENVELOPE_MAX_INFLIGHT_NAR_BYTES, ENVELOPE_MAX_SERVE_DURATION_NS,
+    ENVELOPE_MAX_SINGLE_NAR_BYTES, EXPECTED_PROFILE_BUDGET_HASH, PROFILE_BUDGET_ARTIFACT_MISSING,
+    PROFILE_BUDGET_ARTIFACT_PATH, ProfileBudget, ProfileBudgetArtifact,
 };
 // The peer-fabric DeriveBudget POLICY type (mirrors ServeBudget); re-exported so the
 // binaries construct a PeerDeriveLedger from their ResourceCaps (TASK-229).

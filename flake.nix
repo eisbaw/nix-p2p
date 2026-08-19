@@ -58,12 +58,18 @@
       # reproducibly vendored libp2p-stream patch. The Iroh 1.0.3 shutdown patch likewise
       # carries its exact upstream license texts, packaged BSD-3-Clause notice,
       # and a narrow local provenance record.
+      # TASK-120 widens it by one more committed class: the frozen operator
+      # profile-budget artifact (artifacts/profile-budget-v1.json), which
+      # `daemon-core/src/profile_budget.rs` `include_str!`s so the daemon
+      # fail-closes on it inside the sandbox and its content hash is verified
+      # against the reviewed EXPECTED_PROFILE_BUDGET_HASH at build/test time.
       # These are tracked source inputs (unlike the fixture cache).
       src = pkgs.lib.cleanSourceWith {
         src = ./.;
         name = "source";
         filter = path: type:
           (builtins.match ".*/tests/golden/.*\\.json$" path != null)
+          || (builtins.match ".*/artifacts/profile-budget-v1\\.json$" path != null)
           || (builtins.match ".*/vendor/libp2p-stream/(README\\.md|LICENSE)$" path != null)
           || (builtins.match ".*/vendor/iroh/(README\\.md|PATCH-PROVENANCE\\.md|LICENSE-(MIT|APACHE|BSD3)|\\.cargo_vcs_info\\.json)$" path != null)
           || craneLib.filterCargoSources path type;
