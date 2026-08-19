@@ -6,13 +6,14 @@ title: >-
 status: To Do
 assignee: []
 created_date: '2026-08-18 20:35'
+updated_date: '2026-08-19 10:40'
 labels:
   - supply
   - cornerstone
   - user-value
   - prd-risk-4
 dependencies: []
-priority: high
+priority: low
 ---
 
 ## Description
@@ -34,3 +35,9 @@ DESIGN CONSTRAINTS THAT MAKE THIS NON-TRIVIAL:
 
 SEQUENCING: this should be decided by evidence, not assumption. Run the offline closure-overlap probe first. If overlap says announce-after-fetch is already sufficient for the org/LAN case, this may not be worth building; if a cold node must be able to offer what it already holds, this is the next cornerstone.
 <!-- SECTION:DESCRIPTION:END -->
+
+## Implementation Notes
+
+<!-- SECTION:NOTES:BEGIN -->
+256 DOWNSCOPE 2026-08-19: TASK-256 (verified) shows same-pin peers warm to 95% paths / 99% NAR bytes via announce-on-fetch ALONE, and cross-rev supply overlap is structurally 0 (nothing to announce). Whole-store cold supply buys ~nothing for the org/LAN case. Priority->Low; revisit only if a same-pin org pilot shows announce-after-fetch leaving real hits on the table.
+<!-- SECTION:NOTES:END -->

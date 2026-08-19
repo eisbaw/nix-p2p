@@ -6,7 +6,7 @@ title: >-
 status: To Do
 assignee: []
 created_date: '2026-08-16 14:04'
-updated_date: '2026-08-18 20:35'
+updated_date: '2026-08-19 10:40'
 labels:
   - measurement
   - value-thesis
@@ -17,7 +17,7 @@ dependencies:
   - TASK-206
   - TASK-219
   - TASK-247
-priority: high
+priority: low
 ---
 
 ## Description
@@ -45,6 +45,8 @@ Development-only directional value-thesis measurement. Extend TASK-206 to a repr
 Consume the proven effective real-daemon concurrency result from TASK-247, the v3 provenance rule from TASK-52, and the symmetric evidence from TASK-180. TASK-120 is a required In Progress prerequisite; TASK-206 and TASK-219 are completed prerequisites. This task emits only development_shaped_3_node planning evidence. TASK-250 is the post-holdout field successor, and TASK-124 consumes the hashed planning artifact before freezing that field matrix. No favorable TASK-237 result is policy training, holdout, real_3_network, field-pilot, or PRD success.
 
 Dropped the TASK-52 dependency 2026-08-18 (COMPASS F3, owner steer: no academic gymnastics). Hedging is UNIMPLEMENTED; TASK-247 AC#8 already mandates net-upstream-egress-v2 with hedging explicitly disabled and forbids emitting hedge evidence; TASK-52 s stated consumer is TASK-44, which is Low/deferred. Holding the value thesis hostage to an irreversible freeze for a mechanism that does not exist was the single largest self-inflicted block in the backlog. AC#7 should be rewritten to v2 hedge-off to match TASK-247.
+
+256 DOWNSCOPE 2026-08-19: TASK-256 answered 237s headline (the hit-rate half of offload) in a day, offline. 237 is a 3-deep-blocked shaped-topology probe whose own ACs forbid PRD-success meaning. Priority->Low; if resurrected, re-scope to org/LAN same-pin offload CONFIRMATION consuming TASK-254 real-cache tier, not a synthetic 3-node swarm.
 <!-- SECTION:NOTES:END -->
 
 ## Definition of Done
