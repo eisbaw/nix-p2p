@@ -1088,14 +1088,15 @@ def run_self_test() -> int:
     check("client exit nonzero -> INVALID", not r.valid, "unexpectedly valid")
 
     # 9. PROVENANCE fail-closed (codex blocker 2): preflight_gate threaded with an
-    #    unverified --out tree must fail closed (SystemExit nonzero).
+    #    unverified --out tree must fail closed. TASK-60: preflight_gate's die()
+    #    now raises HarnessError (nonzero .code) instead of SystemExit.
     with tempfile.TemporaryDirectory() as d:
         empty = Path(d) / "empty-out"
         empty.mkdir()
         raised_nonzero = False
         try:
             e2e.preflight_gate(empty)
-        except SystemExit as ex:
+        except e2e.HarnessError as ex:
             raised_nonzero = (ex.code or 0) != 0
         check(
             "preflight_gate(--out unverified tree) -> fail-closed",
@@ -1204,6 +1205,12 @@ def main() -> int:
 if __name__ == "__main__":
     try:
         sys.exit(main())
+    except e2e.HarnessError as err:
+        # TASK-60: die() (e.g. the AC#5 key-exclusion or gap-injection guards, or
+        # preflight_gate) raises HarnessError instead of exiting. Translate it back
+        # to the historical `e2e: FATAL` line + exit code here.
+        print(f"e2e: FATAL - {err}", file=sys.stderr)
+        sys.exit(err.code)
     except KeyboardInterrupt:
         e2e.cleanup_pods("(interrupted)")
         sys.exit(130)

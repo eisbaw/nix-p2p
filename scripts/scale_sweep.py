@@ -843,6 +843,13 @@ def sweep_clients(ctx, fixtures, counts, jobs: int, conns: int, repeats: int) ->
                     ),
                     require_concurrency=True,
                 )
+            except e2e.HarnessError as err:
+                # TASK-60: die() raises HarnessError now. Invalidate just THIS
+                # point (a Pod-seam failure at one N must not lose the sweep) and
+                # carry the reason off the exception. MUST precede the RuntimeError
+                # clause (HarnessError is a RuntimeError); SIGTERM's SystemExit(143)
+                # is uncaught and still stops the sweep.
+                point.reason = f"sweep point aborted by the Pod seam (e2e.die): {err}"
             except (RuntimeError, SampleError, OSError) as error:
                 point.reason = f"sweep point raised: {error!r}"
             axis.points.append(point)
@@ -898,6 +905,11 @@ def sweep_chain(ctx, fixtures, depths, repeats: int) -> Axis:
                     ),
                     require_concurrency=False,
                 )
+            except e2e.HarnessError as err:
+                # TASK-60: invalidate just this depth-point on a die(), reason off
+                # the exception. Precedes the RuntimeError clause; SIGTERM(143) is
+                # uncaught and still stops the sweep. See sweep_clients.
+                point.reason = f"sweep point aborted by the Pod seam (e2e.die): {err}"
             except (RuntimeError, SampleError, OSError) as error:
                 point.reason = f"sweep point raised: {error!r}"
             axis.points.append(point)
@@ -991,6 +1003,11 @@ def sweep_knobs(ctx, fixtures, values, clients: int, repeats: int) -> Axis:
                 point.detail["knob_confirmed"] = confirmed
                 point.detail["above_workload_ceiling"] = value > len(SWEEP_ATTRS)
                 point.detail["concurrent_clients"] = clients
+            except e2e.HarnessError as err:
+                # TASK-60: invalidate just this knob-value point on a die(), reason
+                # off the exception. Precedes the RuntimeError clause; SIGTERM(143)
+                # is uncaught and still stops the sweep. See sweep_clients.
+                point.reason = f"sweep point aborted by the Pod seam (e2e.die): {err}"
             except (RuntimeError, SampleError, OSError) as error:
                 point.reason = f"sweep point raised: {error!r}"
             axis.points.append(point)
@@ -1637,6 +1654,12 @@ def main() -> int:
 if __name__ == "__main__":
     try:
         sys.exit(main())
+    except e2e.HarnessError as err:
+        # TASK-60: a die() in SETUP (e.g. the free-disk guard, before any sweep
+        # point) is fatal to the whole run. die() no longer exits, so translate it
+        # back to the historical `e2e: FATAL` line + exit code here.
+        print(f"e2e: FATAL - {err}", file=sys.stderr)
+        sys.exit(err.code)
     except KeyboardInterrupt:
         e2e.cleanup_pods("(interrupted)")
         sys.exit(130)

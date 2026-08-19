@@ -943,19 +943,16 @@ def measure_point(
                 "ram_per_nar_byte": ram_per_nar_byte(metrics, seeded_bytes),
             },
         )
+    except e2e.HarnessError as err:
+        # Same contract as `profile_p2p.sweep_swarm`: `e2e.die` is fatal to a
+        # SCENARIO but must only invalidate a POINT here. TASK-60: die() now raises
+        # HarnessError, so the reason travels ON the exception. MUST precede the
+        # RuntimeError clause (HarnessError is a RuntimeError); SIGTERM's
+        # SystemExit(143) is uncaught and still stops the run.
+        point.reason = f"size-axis point aborted by the Pod seam (e2e.die): {err}"
     except (RuntimeError, ss.SampleError, OSError, ValueError) as error:
         point.reason = f"size-axis point raised: {error!r}"
         point.detail["traceback"] = traceback.format_exc()
-    except SystemExit as error:
-        # Same contract as `profile_p2p.sweep_swarm`: `e2e.die`'s exit code 2 is
-        # fatal to a SCENARIO but must only invalidate a POINT here. Any other
-        # code - notably the SIGTERM handler's 143 - is a real request to stop.
-        if error.code != 2:
-            raise
-        point.reason = (
-            f"size-axis point aborted by the Pod seam (e2e.die, exit {error.code}); "
-            "see the harness output above"
-        )
     finally:
         shutil.rmtree(scratch, ignore_errors=True)
     return point
@@ -1743,4 +1740,12 @@ def main(argv: list[str]) -> int:
 
 
 if __name__ == "__main__":
-    sys.exit(main(sys.argv[1:]))
+    try:
+        sys.exit(main(sys.argv[1:]))
+    except e2e.HarnessError as err:
+        # TASK-60: die() raises HarnessError instead of exiting. sizeaxis is a
+        # library (the axis runs under profile_p2p, which has its own translation),
+        # but keep the standalone entry honest: a die surfaces as the `e2e: FATAL`
+        # line + its exit code rather than an uncaught traceback.
+        print(f"e2e: FATAL - {err}", file=sys.stderr)
+        sys.exit(err.code)

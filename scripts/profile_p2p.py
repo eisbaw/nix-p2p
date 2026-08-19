@@ -1688,31 +1688,24 @@ def sweep_swarm(ctx, fixtures, sizes, repeats: int, state_root: Path) -> ss.Axis
                         "per_role_resources": label_resources(resources)["per_role"],
                     },
                 )
+            except e2e.HarnessError as err:
+                # `e2e.die` is fatal to a SCENARIO but must only invalidate a
+                # POINT here: a swarm of 17 containers has 17 chances for one
+                # holder to miss its identity announcement, and losing the whole
+                # sweep to that would be a harness fault reported as a missing law.
+                #
+                # TASK-60: die() now RAISES HarnessError, so the reason travels ON
+                # the exception - no exit-code sniffing, no lost message, no
+                # stderr scrollback. MUST precede the RuntimeError clause below
+                # (HarnessError is a RuntimeError). SIGTERM's SystemExit(143) is
+                # not caught here, so it still stops the sweep.
+                point.reason = f"swarm point aborted by the Pod seam (e2e.die): {err}"
             except (RuntimeError, ss.SampleError, OSError, ValueError) as error:
                 point.reason = f"swarm point raised: {error!r}"
                 # Fail VERBOSELY: a 20-minute instrument whose deliverable is a
                 # JSON file must be able to explain its own invalid points
                 # without a stderr scrollback.
                 point.detail["traceback"] = traceback.format_exc()
-            except SystemExit as error:
-                # `e2e.die` (exit code 2) is fatal to a SCENARIO but must only
-                # invalidate a POINT here: a swarm of 17 containers has 17 chances
-                # for one holder to miss its identity announcement, and losing the
-                # whole sweep to that would be a harness fault reported as a
-                # missing law. Any OTHER exit code - notably the SIGTERM handler's
-                # 143 - is a real request to stop and is re-raised.
-                #
-                # TASK-60: this is a WORKAROUND for `die()` being control flow.
-                # Sniffing an exit code loses the message (the reason below can
-                # only point at a stderr scrollback) and demotes any future
-                # genuinely-fatal `die(..., code=2)` to a bad data point. The
-                # root fix is a raisable `e2e.HarnessError`.
-                if error.code != 2:
-                    raise
-                point.reason = (
-                    f"swarm point aborted by the Pod seam (e2e.die, exit "
-                    f"{error.code}); see the harness output above for the reason"
-                )
             finally:
                 shutil.rmtree(scratch, ignore_errors=True)
             axis.points.append(point)
@@ -2382,6 +2375,17 @@ def run_speedup_conditions(
                 condition=condition,
                 shaping=None if condition == LOOPBACK_CONTROL else shaping,
             )
+        except e2e.HarnessError as err:
+            # TASK-60: die() raises HarnessError now. Contain it PER-CONDITION so
+            # a later condition's Pod-seam abort cannot discard an earlier valid
+            # measurement, and carry the reason off the exception. MUST precede
+            # the RuntimeError clause (HarnessError is a RuntimeError); SIGTERM's
+            # SystemExit(143) is uncaught and still stops the run.
+            by_condition[condition] = {
+                "ran": False,
+                "upstream_condition": condition,
+                "reason": f"aborted by the Pod seam (e2e.die): {err}",
+            }
         except (RuntimeError, ss.SampleError, OSError, ValueError) as error:
             # Per-CONDITION containment, for the reason `main` states for the
             # whole arm: a later failure must not destroy an earlier
@@ -2401,14 +2405,6 @@ def run_speedup_conditions(
                 "upstream_condition": condition,
                 "reason": f"{error!r}",
                 "traceback": traceback.format_exc(),
-            }
-        except SystemExit as error:
-            if error.code != 2:  # see sweep_swarm for the code-2 contract
-                raise
-            by_condition[condition] = {
-                "ran": False,
-                "upstream_condition": condition,
-                "reason": f"aborted by the Pod seam (e2e.die, exit {error.code})",
             }
     return {
         "ran": True,
@@ -5182,18 +5178,20 @@ def main() -> int:
                 speedup = run_speedup_conditions(
                     ctx, fixtures, args.speedup_runs, state_root, shaping
                 )
+            except e2e.HarnessError as err:
+                # TASK-60: die() raises HarnessError; invalidate the speedup arm
+                # with the reason off the exception rather than aborting the run.
+                # Precedes the RuntimeError clause (HarnessError is a RuntimeError);
+                # SIGTERM's SystemExit(143) is uncaught and still stops the run.
+                speedup = {
+                    "ran": False,
+                    "reason": f"aborted by the Pod seam (e2e.die): {err}",
+                }
             except (RuntimeError, ss.SampleError, OSError, ValueError) as error:
                 speedup = {
                     "ran": False,
                     "reason": f"{error!r}",
                     "traceback": traceback.format_exc(),
-                }
-            except SystemExit as error:
-                if error.code != 2:  # see sweep_swarm for the code-2 contract
-                    raise
-                speedup = {
-                    "ran": False,
-                    "reason": f"aborted by the Pod seam (e2e.die, exit {error.code})",
                 }
     finally:
         # Label-scoped teardown, same contract as `just e2e-clean`. Cleanup
@@ -5245,6 +5243,12 @@ def main() -> int:
 if __name__ == "__main__":
     try:
         sys.exit(main())
+    except e2e.HarnessError as err:
+        # TASK-60: a die() in the instrument's SETUP (before any sweep point) is
+        # fatal to the whole run. die() no longer exits, so translate it back to
+        # the historical `e2e: FATAL` line + exit code here.
+        print(f"e2e: FATAL - {err}", file=sys.stderr)
+        sys.exit(err.code)
     except KeyboardInterrupt:
         e2e.cleanup_pods("(interrupted)")
         sys.exit(130)

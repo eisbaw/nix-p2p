@@ -166,9 +166,37 @@ LIBP2P_NETNS_CONVERGE_S = 16.0
 LIBP2P_MDNS_CONVERGE_S = 22.0
 
 
+class HarnessError(RuntimeError):
+    """A raisable Pod-seam failure - replaces die()'s process-exit control flow.
+
+    die() used to sys.exit(code). That is correct for the top-level scenario
+    runner (`just e2e`) but wrong for the sweep INSTRUMENTS (profile_p2p,
+    scale_sweep, sizeaxis): those must invalidate a single sweep POINT and record
+    WHY, not abandon a multi-hour run. The old workaround caught SystemExit and
+    sniffed `code == 2`, which LOST the message (only a stderr scrollback pointer)
+    and demoted any argument error to a data-quality reason (TASK-60).
+
+    Carries the human message via RuntimeError's args (so `str(err)` IS the
+    message) plus the integer `code` die() would have exited with, so the
+    top-level entry points reproduce the exact exit contract while the sweep
+    instruments read the reason straight off the exception.
+    """
+
+    def __init__(self, message: str, code: int = 2) -> None:
+        super().__init__(message)
+        self.code = code
+
+
 def die(message: str, code: int = 2) -> None:
-    print(f"e2e: FATAL - {message}", file=sys.stderr)
-    raise SystemExit(code)
+    """Fail the Pod seam by RAISING HarnessError - it never returns.
+
+    Deliberately does NOT print: printing is deferred to the boundaries. The
+    top-level scenario/journey/measure runners translate HarnessError back to a
+    single `e2e: FATAL` line + `sys.exit(code)` (so `just e2e` is unchanged); the
+    sweep instruments catch it and record `str(err)` as the point's reason. A die
+    that is caught-and-recorded therefore does not also spam stderr, and the
+    message is never lost to a scrollback."""
+    raise HarnessError(message, code)
 
 
 # ---- podman plumbing -------------------------------------------------------
@@ -6812,6 +6840,13 @@ def run_scenarios(ctx: Ctx, selected) -> int:
         started = time.monotonic()
         try:
             fn(ctx, make_expect(checks))
+        except HarnessError:
+            # A die() inside a scenario is fatal to the whole run, exactly as when
+            # it sys.exit'd: propagate to the top-level translation, which
+            # reproduces the historical exit code. MUST precede `except Exception`
+            # (HarnessError is a RuntimeError) or a die would be demoted to a
+            # per-scenario check failure and `just e2e` would not exit 2.
+            raise
         except SystemExit:
             raise
         except Exception as error:  # noqa: BLE001 - a scenario crash is a failure
@@ -6915,6 +6950,13 @@ def main() -> int:
 if __name__ == "__main__":
     try:
         sys.exit(main())
+    except HarnessError as err:
+        # die() no longer exits the process; translate it back here so the
+        # scenario runner keeps its historical contract (e.g. an unknown --only
+        # scenario -> the single `e2e: FATAL` line + exit 2). This is the one
+        # place `just e2e` turns a Pod-seam failure into a process exit.
+        print(f"e2e: FATAL - {err}", file=sys.stderr)
+        sys.exit(err.code)
     except KeyboardInterrupt:
         cleanup_pods("(interrupted)")
         sys.exit(130)

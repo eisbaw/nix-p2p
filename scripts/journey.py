@@ -232,6 +232,12 @@ def run_journey() -> int:
 if __name__ == "__main__":
     try:
         sys.exit(run_journey())
+    except e2e.HarnessError as err:
+        # TASK-60: die() (via preflight_gate, load_image, podman, Pod, ...) raises
+        # HarnessError instead of exiting. Translate it back to the historical
+        # `e2e: FATAL` line + exit code here.
+        print(f"e2e: FATAL - {err}", file=sys.stderr)
+        sys.exit(err.code)
     except KeyboardInterrupt:
         e2e.cleanup_pods("(interrupted)")
         sys.exit(130)
