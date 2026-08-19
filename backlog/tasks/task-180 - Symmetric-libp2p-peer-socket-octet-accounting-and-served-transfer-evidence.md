@@ -4,7 +4,7 @@ title: Symmetric libp2p peer-socket octet accounting and served-transfer evidenc
 status: To Do
 assignee: []
 created_date: '2026-08-12 23:03'
-updated_date: '2026-08-18 06:52'
+updated_date: '2026-08-19 16:50'
 labels:
   - libp2p
   - daemon
@@ -14,7 +14,7 @@ labels:
 dependencies:
   - TASK-179
   - TASK-219
-priority: high
+priority: low
 ---
 
 ## Description
@@ -37,4 +37,6 @@ Build independent symmetric peer-byte evidence for the libp2p path at two explic
 
 <!-- SECTION:NOTES:BEGIN -->
 The former ServeGate bytes.len() turnkey design is superseded and intentionally removed: it measured produced uncompressed NAR bytes before send. Implement both metered transfer events and isolated connection/interface capture; neither substitutes for the other.
+
+256 DOWNSCOPE 2026-08-19 (COMPASS): 180 largely feeds the synthetic value-thesis chain (237/247) that TASK-256 pre-empted and that is now Low. Symmetric octet accounting has some standalone wire-honesty value but is not out-of-box-critical; priority->Low, revisit if a served-transfer accounting gap surfaces on the shipped path.
 <!-- SECTION:NOTES:END -->
