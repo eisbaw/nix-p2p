@@ -55,7 +55,7 @@ a lie. Every key in this report ending in `_bytes` MUST end in one of:
     _bytes_uncompressed_nar NarSize units - `nix-store --dump` output length
     _bytes_compressed_wire  FileSize units - what crosses the cache boundary
 
-`unit_violations()` walks the assembled report and FAILS the run on any other
+`scalefit.unit_violations()` walks the assembled report and FAILS the run on any other
 `*_bytes` key, and the self-test proves it by mutation. On top of that the
 speedup arm uses ONLY `compression: none` fixture attrs and ASSERTS
 `file_size == nar_size` from the manifest, so for that arm the two units
@@ -111,7 +111,6 @@ import os
 import random
 import shutil
 import statistics
-import subprocess
 import sys
 import tempfile
 import time
@@ -288,23 +287,11 @@ SHAPING_CONTROL_MAX_LATENCY_FRACTION = 0.5
 # scheduler hiccup without making the probe expensive.
 SHAPING_LATENCY_SAMPLES = 7
 
-# Refuse to start below this much free disk. The host runs at ~95% used and this
-# instrument spins swarms that each hold a blob store plus a per-pod seed copy of
-# the 110 MiB payload; a mid-run ENOSPC would corrupt a sweep point into looking
-# like a product failure. TASK-54 owns bounding the footprint properly - this is
-# the guard that keeps the harness from being the thing that fills the disk.
-MIN_FREE_DISK_BYTES = 8 * 1024**3
-
-# The recognised byte units. A `*_bytes` key that ends in none of these is a
-# violation: it would let NarSize and FileSize sit in one report under
-# indistinguishable names, which is precisely how the three previous unit
-# confusions in this project happened.
-UNIT_SUFFIXES = (
-    "_bytes_ram",
-    "_bytes_ondisk",
-    "_bytes_uncompressed_nar",
-    "_bytes_compressed_wire",
-)
+# The free-disk floor + its check, and the recognised byte-unit suffixes, are
+# shared in scalefit (task-59): `scalefit.MIN_FREE_DISK_BYTES` /
+# `scalefit.disk_headroom_ok` and `scalefit.UNIT_SUFFIXES`. They used to be
+# defined here and policed only THIS instrument's report; the unit rule
+# (`scalefit.unit_violations`) now polices scale_sweep's sibling report too.
 
 # S9 study parameters. 5 classes x 3 noise levels x 120 replicates = 1800 fits,
 # MEASURED at 4.0-4.8 s on this host (ten samples). That is the honest cost of
@@ -362,52 +349,10 @@ CLASS_FAMILY = {
 
 
 # ---- pure: the unit gate ----------------------------------------------------
-
-
-def unit_labelled(key: str) -> bool:
-    """Is `key` a properly unit-labelled byte quantity?
-
-    ANY key mentioning `bytes` anywhere - not just as a suffix - must END in a
-    recognised unit, optionally followed by the rate marker `_per_s`. The
-    endswith-only version of this rule was itself the vacuous-oracle shape it
-    exists to prevent: `bytes_sent` (a real key name in this codebase, see
-    `Pod.proxy_stats`), `egress_bytes_total` and `total_bytes_moved` all passed
-    it CLEAN, and the self-test's mutations had been chosen to match the
-    implementation rather than the claim. A rule stated as "a reader cannot mix
-    what the schema will not let the writer spell" has to cover what the writer
-    can actually spell.
-    """
-    body = key[: -len("_per_s")] if key.endswith("_per_s") else key
-    return any(body.endswith(suffix) for suffix in UNIT_SUFFIXES)
-
-
-def unit_violations(node, path: str = "") -> list[str]:
-    """Every key naming a byte quantity must carry a recognised unit. Empty == clean.
-
-    This is the mechanical form of the rule the project keeps breaking in prose:
-    NarSize (uncompressed, signed) and FileSize (compressed, on-wire) are
-    DIFFERENT UNITS, and a report that names both `bytes` invites the ratio that
-    has already been wrong three times.
-    """
-    problems: list[str] = []
-    if isinstance(node, dict):
-        for key, value in node.items():
-            here = f"{path}.{key}" if path else str(key)
-            # `bytes` as a whole TOKEN, so `bytesize`-style words do not trip it
-            # while `bytes_sent` and `total_bytes_moved` do.
-            names_bytes = isinstance(key, str) and "bytes" in key.split("_")
-            if names_bytes and not unit_labelled(key):
-                problems.append(
-                    f"{here}: byte-valued key without a unit label. It must END "
-                    f"in one of {', '.join(UNIT_SUFFIXES)} (optionally + "
-                    "'_per_s') - NarSize and FileSize are different units and an "
-                    "unlabelled byte key lets them be compared"
-                )
-            problems += unit_violations(value, here)
-    elif isinstance(node, list):
-        for index, value in enumerate(node):
-            problems += unit_violations(value, f"{path}[{index}]")
-    return problems
+#
+# The unit rule (`unit_labelled` / `unit_violations`) moved to scalefit in
+# task-59 so it is enforced on BOTH sweep reports, not just this one. Call it as
+# `scalefit.unit_violations(report)`.
 
 
 def assert_unit_coincidence(fixtures, attrs) -> dict:
@@ -1080,13 +1025,15 @@ SWARM_METRICS = (
 
 def label_resources(resources: dict) -> dict:
     """THE translation from `scale_sweep.aggregate_samples` keys to this report's
-    UNIT-LABELLED names. One function, used by every caller.
+    PEER-oriented names. One function, used by every caller.
 
-    The renaming is not cosmetic: `aggregate_samples` returns bare `*_bytes`
-    keys and this report's unit gate rejects those. It is also the ONLY place
-    the mapping exists on purpose - three near-copies of it had already drifted
-    into `swarm_total_rss_hwm_bytes_ram` in one and `total_rss_hwm_bytes_ram` in
-    another, which is exactly how a report grows two names for one measurement.
+    Since task-59 `aggregate_samples` already labels its byte keys
+    (`daemon_rss_hwm_bytes_ram`, ...), so both instruments' reports pass the
+    shared unit rule at the source; this function's job is the PEER/INFRASTRUCTURE
+    split and the daemon-centric renaming (`daemon_*` -> `peer_*` /
+    `chain_total_*` -> `swarm_total_*`), the mapping kept in ONE place because
+    three near-copies had already drifted into `swarm_total_rss_hwm_bytes_ram` in
+    one and `total_rss_hwm_bytes_ram` in another - two names for one measurement.
     """
     # `aggregate_samples` samples EVERY long-lived pod role, so `per_role`
     # carries the fixture `origin` and the `testproxy` alongside the daemons.
@@ -1112,9 +1059,9 @@ def label_resources(resources: dict) -> dict:
     def rows(selector) -> dict:
         return {
             role: {
-                "rss_hwm_bytes_ram": row["rss_hwm_bytes"],
-                "rss_point_max_bytes_ram": row["rss_point_max_bytes"],
-                "rss_point_last_bytes_ram": row["rss_point_last_bytes"],
+                "rss_hwm_bytes_ram": row["rss_hwm_bytes_ram"],
+                "rss_point_max_bytes_ram": row["rss_point_max_bytes_ram"],
+                "rss_point_last_bytes_ram": row["rss_point_last_bytes_ram"],
                 "fd_max": row["fd_max"],
                 "ticks": row["ticks"],
             }
@@ -1123,9 +1070,9 @@ def label_resources(resources: dict) -> dict:
         }
 
     return {
-        "peer_rss_hwm_bytes_ram": resources["daemon_rss_hwm_bytes"],
-        "peer_rss_point_max_bytes_ram": resources["daemon_rss_point_max_bytes"],
-        "swarm_total_rss_hwm_bytes_ram": resources["chain_total_rss_hwm_bytes"],
+        "peer_rss_hwm_bytes_ram": resources["daemon_rss_hwm_bytes_ram"],
+        "peer_rss_point_max_bytes_ram": resources["daemon_rss_point_max_bytes_ram"],
+        "swarm_total_rss_hwm_bytes_ram": resources["chain_total_rss_hwm_bytes_ram"],
         "peer_fd_max": resources["daemon_fd_max"],
         # DAEMON roles only - the peers. Every per-role statistic in this report
         # is computed from this.
@@ -2532,13 +2479,13 @@ def build_report(
 
     Two independent honesty gates run on the assembled object and BOTH must come
     back empty: `scalefit.sweep_report_violations` (the S5 measured/model split,
-    fit quality, red-flag coverage, the resource-laws-only caveat) and this
-    module's `unit_violations` (no unlabelled byte quantity anywhere).
+    fit quality, red-flag coverage, the resource-laws-only caveat) and the repo
+    unit rule `scalefit.unit_violations` (no unlabelled byte quantity anywhere) -
+    the latter shared in scalefit since task-59, so it polices scale_sweep's
+    report too and not only this one.
     """
     models: dict = {}
     problems: list[str] = []
-    valid_points = sum(1 for p in axis.points if p.valid)
-    distinct_valid = len({p.n for p in axis.points if p.valid})
 
     fits, fit_problems = ss.fit_axis(axis, SWARM_METRICS, targets)
     # TASK-65: the swarm HOST-TOTAL extrapolation is not a deployment figure and
@@ -2576,33 +2523,14 @@ def build_report(
         for problem in (discovery or {}).get("problems", [])
     ]
 
-    measured = {
-        "swarm": {
-            "variable": axis.variable,
-            "description": axis.description,
-            "notes": axis.notes,
-            "distinct_n": sorted({p.n for p in axis.points}),
-            "valid_observations_per_n": {
-                str(n): sum(1 for p in axis.points if p.n == n and p.valid)
-                for n in sorted({p.n for p in axis.points})
-            },
-            "points": [
-                {
-                    "n": p.n,
-                    "valid": p.valid,
-                    "reason": p.reason,
-                    "metrics": p.metrics,
-                    "detail": p.detail,
-                }
-                for p in axis.points
-            ],
-            "invalid_points": [
-                {"n": p.n, "reason": p.reason} for p in axis.points if not p.valid
-            ],
-            "high_water_vs_point_sample": hwm_vs_point(axis.points),
-            "observed_replicate_spread": replicate_spread(axis.points),
-        }
-    }
+    # The measured-axis skeleton (distinct_n / valid_observations_per_n / points
+    # / invalid_points) is built by the SHARED scalefit helper so it cannot drift
+    # from scale_sweep's copy (task-59). The high-water and replicate-spread
+    # blocks are this instrument's extras.
+    swarm_block = scalefit.measured_axis_block(axis)
+    swarm_block["high_water_vs_point_sample"] = hwm_vs_point(axis.points)
+    swarm_block["observed_replicate_spread"] = replicate_spread(axis.points)
+    measured = {"swarm": swarm_block}
     measured.update(size_measured)
     measured["discovery"] = discovery or {
         "ran": False,
@@ -2647,7 +2575,7 @@ def build_report(
             ),
             "units": (
                 "every `*_bytes` key carries one of "
-                + ", ".join(UNIT_SUFFIXES)
+                + ", ".join(scalefit.UNIT_SUFFIXES)
                 + ". NarSize (uncompressed, signed) and FileSize (compressed, "
                 "on-wire) are DIFFERENT UNITS and are never compared; the speedup "
                 "arm additionally ASSERTS file_size == nar_size for its payloads "
@@ -2692,7 +2620,7 @@ def build_report(
         },
     }
     s5_violations = scalefit.sweep_report_violations(report)
-    unit_problems = unit_violations(report)
+    unit_problems = scalefit.unit_violations(report)
     qualifier_problems = speedup_qualifier_violations(report)
     derived_problems = derived_quantity_violations(report)
     report["honesty"] = {
@@ -2777,9 +2705,15 @@ def build_report(
         "size_axis_ran": size_ran,
         "size_axis_usable": size_usable,
         "size_axis_derived_quantity_independence": size_independence,
-        "swarm_valid_observations": valid_points,
-        "swarm_total_observations": len(axis.points),
-        "swarm_distinct_valid_n": distinct_valid,
+        # task-59: the valid/total/distinct-valid observation triple now uses the
+        # CANONICAL `axis_status[]` schema (the count key was the concrete
+        # divergence the refactor names: this instrument spelled it flat as
+        # `swarm_valid_observations`, scale_sweep nested it as
+        # `axis_status[].valid_observations`; both now come from
+        # scalefit.axis_status_counts, so the two reports converge on one schema).
+        "axis_status": [
+            {"axis": "swarm", "fitted": True, **scalefit.axis_status_counts(axis)}
+        ],
         "fit_problems": problems,
         "all_metrics_fitted": problems == [],
         "speedup_arms_usable": speedup_usable,
@@ -2972,65 +2906,25 @@ def provenance(fixtures, out_root: Path) -> dict:
     `unavailable` instead of leaving a blank field. This is the one block whose
     entire job is re-derivability, so "unknown" quietly reading as "" is exactly
     the failure it must not have.
-    """
+
+    Shared with scale_sweep via `scalefit.base_provenance` (task-59): the git
+    commit/cleanliness, the /proc/meminfo read (labelled `mem_total_bytes_ram`),
+    the host dict and the fail-verbose `unavailable` map were byte-for-byte the
+    same machinery in both instruments. The per-instrument extra here is the two
+    attr lists (this instrument has both a swarm arm and a speedup arm)."""
     generation = fx.resolve_current(out_root)
     lock = json.loads((generation / "lock.json").read_text())
-    unavailable: dict[str, str] = {}
-
-    total_ram = None
-    try:
-        for line in Path("/proc/meminfo").read_text().splitlines():
-            if line.startswith("MemTotal:"):
-                total_ram = int(line.split()[1]) * 1024
-    except OSError as error:
-        unavailable["mem_total_bytes_ram"] = str(error)
-
-    def git(*argv) -> str | None:
-        try:
-            result = subprocess.run(
-                ["git", *argv],
-                capture_output=True,
-                text=True,
-                check=False,
-                cwd=str(fx.repo_root()),
-            )
-        except OSError as error:
-            unavailable[f"git {' '.join(argv)}"] = str(error)
-            return None
-        if result.returncode != 0:
-            unavailable[f"git {' '.join(argv)}"] = (
-                f"exit {result.returncode}: {result.stderr.strip()}"
-            )
-            return None
-        return result.stdout
-
-    commit = git("rev-parse", "HEAD")
-    dirty = git("status", "--porcelain")
-    return {
-        "workload_version": fixtures.manifest["workload_version"],
-        "fixture_tier": fixtures.manifest["tier"],
-        "fixture_public_key": lock["public_key"],
-        "generation": generation.name,
-        "swarm_attrs": list(SWARM_ATTRS),
-        "speedup_attrs": list(SPEEDUP_ATTRS),
-        "git_commit": None if commit is None else commit.strip(),
-        # A commit hash alone does NOT describe the code that produced these
-        # numbers when the tree is dirty - and `just profile` is normally run
-        # from a dirty tree during development. Say which it was.
-        "git_clean": None if dirty is None else dirty.strip() == "",
-        "unavailable": unavailable,
-        "host": {
-            "kernel": os.uname().release,
-            "machine": os.uname().machine,
-            "cpu_count": os.cpu_count(),
-            "mem_total_bytes_ram": total_ram,
-            "note": (
-                "a resource scaling law is a property of the system ON THIS HOST; "
-                "the constants do not transfer to different hardware, though the "
-                "growth CLASS usually does"
-            ),
+    return scalefit.base_provenance(
+        workload_version=fixtures.manifest["workload_version"],
+        fixture_tier=fixtures.manifest["tier"],
+        public_key=lock["public_key"],
+        generation=generation.name,
+        repo_root=fx.repo_root(),
+        extra={
+            "swarm_attrs": list(SWARM_ATTRS),
+            "speedup_attrs": list(SPEEDUP_ATTRS),
         },
-    }
+    )
 
 
 # ---- human summary -----------------------------------------------------------
@@ -3422,29 +3316,30 @@ def run_self_test() -> int:  # noqa: C901 - a flat list of checks reads better h
     print("\n  -- unit discipline --")
     check(
         "a unit-suffixed byte key passes",
-        unit_violations({"peer_rss_hwm_bytes_ram": 1}) == [],
+        scalefit.unit_violations({"peer_rss_hwm_bytes_ram": 1}) == [],
     )
-    for suffix in UNIT_SUFFIXES:
+    for suffix in scalefit.UNIT_SUFFIXES:
         check(
             f"suffix {suffix} is accepted",
-            unit_violations({f"x{suffix}": 1}) == [],
+            scalefit.unit_violations({f"x{suffix}": 1}) == [],
         )
     check(
         "MUTATION: a bare `_bytes` key is REJECTED",
-        unit_violations({"egress_bytes": 1}) != [],
+        scalefit.unit_violations({"egress_bytes": 1}) != [],
     )
     check(
         "MUTATION: a bare `_bytes` key nested in a list is REJECTED",
-        unit_violations({"arms": [{"served_bytes": 1}]}) != [],
+        scalefit.unit_violations({"arms": [{"served_bytes": 1}]}) != [],
     )
     check(
         "the violation names the offending path",
-        "arms[0].served_bytes" in unit_violations({"arms": [{"served_bytes": 1}]})[0],
-        str(unit_violations({"arms": [{"served_bytes": 1}]})),
+        "arms[0].served_bytes"
+        in scalefit.unit_violations({"arms": [{"served_bytes": 1}]})[0],
+        str(scalefit.unit_violations({"arms": [{"served_bytes": 1}]})),
     )
     check(
         "a non-byte key is untouched",
-        unit_violations({"client_realise_s": 1, "fd_max": 3}) == [],
+        scalefit.unit_violations({"client_realise_s": 1, "fd_max": 3}) == [],
     )
     # The rule must cover what a WRITER CAN SPELL, not just the suffix shape the
     # implementation happened to test. Every name below passed the earlier
@@ -3464,15 +3359,15 @@ def run_self_test() -> int:  # noqa: C901 - a flat list of checks reads better h
         check(
             f"MUTATION: `{spelling}` is REJECTED (bytes named anywhere, not just "
             "as a suffix)",
-            unit_violations({spelling: 1}) != [],
+            scalefit.unit_violations({spelling: 1}) != [],
         )
     check(
         "a rate key keeps its unit through `_per_s`",
-        unit_violations({"throughput_bytes_uncompressed_nar_per_s": 1}) == [],
+        scalefit.unit_violations({"throughput_bytes_uncompressed_nar_per_s": 1}) == [],
     )
     check(
         "a word merely CONTAINING 'bytes' is not a byte key",
-        unit_violations({"bytesize_note": "x"}) == [],
+        scalefit.unit_violations({"bytesize_note": "x"}) == [],
     )
 
     # --- TASK-78: the leech-FRACTION knob (AC#2/#3) --------------------------
@@ -3512,7 +3407,7 @@ def run_self_test() -> int:  # noqa: C901 - a flat list of checks reads better h
     lm = leech_model([1, 4, 16], 3, 4)
     check(
         "leech_model is unit-clean and observable in the report",
-        unit_violations({"leech_model": lm}) == []
+        scalefit.unit_violations({"leech_model": lm}) == []
         and lm["per_swarm_size"][2]
         == {"n_peers": 16, "serving_peers": 4, "leech_peers": 12},
         str(lm["per_swarm_size"]),
@@ -4421,12 +4316,12 @@ def run_self_test() -> int:  # noqa: C901 - a flat list of checks reads better h
     check(
         "MUTATION: an UNLABELLED byte quantity in the report -> REJECTED by the "
         "unit gate",
-        unit_violations(broken) != [],
+        scalefit.unit_violations(broken) != [],
     )
     check(
         "and the real report has no unlabelled byte quantity anywhere",
-        unit_violations(quad_report) == [],
-        str(unit_violations(quad_report)[:3]),
+        scalefit.unit_violations(quad_report) == [],
+        str(scalefit.unit_violations(quad_report)[:3]),
     )
     broken = json.loads(json.dumps(quad_report))
     broken.pop("caveat")
@@ -4496,16 +4391,16 @@ def run_self_test() -> int:  # noqa: C901 - a flat list of checks reads better h
     # three copies had already drifted to two different names for the same
     # measurement, and because every key it emits must survive the unit gate.
     raw = {
-        "daemon_rss_hwm_bytes": 300,
-        "daemon_rss_point_max_bytes": 100,
-        "chain_total_rss_hwm_bytes": 400,
+        "daemon_rss_hwm_bytes_ram": 300,
+        "daemon_rss_point_max_bytes_ram": 100,
+        "chain_total_rss_hwm_bytes_ram": 400,
         "daemon_fd_max": 12,
         "daemon_roles_sampled": ["node-b"],
         "per_role": {
             "node-b": {
-                "rss_hwm_bytes": 300,
-                "rss_point_max_bytes": 100,
-                "rss_point_last_bytes": 90,
+                "rss_hwm_bytes_ram": 300,
+                "rss_point_max_bytes_ram": 100,
+                "rss_point_last_bytes_ram": 90,
                 "fd_max": 12,
                 "ticks": 5,
             }
@@ -4514,7 +4409,7 @@ def run_self_test() -> int:  # noqa: C901 - a flat list of checks reads better h
     labelled = label_resources(raw)
     check(
         "label_resources is the ONE translation and its output passes the unit gate",
-        unit_violations(labelled) == []
+        scalefit.unit_violations(labelled) == []
         and labelled["peer_rss_hwm_bytes_ram"] == 300
         and labelled["swarm_total_rss_hwm_bytes_ram"] == 400
         and labelled["per_role"]["node-b"]["rss_hwm_bytes_ram"] == 300,
@@ -4526,7 +4421,7 @@ def run_self_test() -> int:  # noqa: C901 - a flat list of checks reads better h
         "the fitter) and use the same names",
         "per_role" not in scalars
         and scalars["peer_rss_hwm_bytes_ram"] == labelled["peer_rss_hwm_bytes_ram"]
-        and unit_violations(scalars) == [],
+        and scalefit.unit_violations(scalars) == [],
         str(scalars),
     )
 
@@ -4578,24 +4473,24 @@ def run_self_test() -> int:  # noqa: C901 - a flat list of checks reads better h
 
     # Infrastructure roles must never enter a claim about what a PEER costs.
     mixed = {
-        "daemon_rss_hwm_bytes": 300,
-        "daemon_rss_point_max_bytes": 100,
-        "chain_total_rss_hwm_bytes": 300,
+        "daemon_rss_hwm_bytes_ram": 300,
+        "daemon_rss_point_max_bytes_ram": 100,
+        "chain_total_rss_hwm_bytes_ram": 300,
         "daemon_fd_max": 12,
         "daemon_roles_sampled": ["node-b"],
         "per_role": {
             "node-b": {
-                "rss_hwm_bytes": 300,
-                "rss_point_max_bytes": 100,
-                "rss_point_last_bytes": 90,
+                "rss_hwm_bytes_ram": 300,
+                "rss_point_max_bytes_ram": 100,
+                "rss_point_last_bytes_ram": 90,
                 "fd_max": 12,
                 "ticks": 5,
             },
             # The fixture HTTP server, deliberately the LARGEST RSS here.
             "origin": {
-                "rss_hwm_bytes": 900,
-                "rss_point_max_bytes": 900,
-                "rss_point_last_bytes": 900,
+                "rss_hwm_bytes_ram": 900,
+                "rss_point_max_bytes_ram": 900,
+                "rss_point_last_bytes_ram": 900,
                 "fd_max": 4,
                 "ticks": 5,
             },
@@ -5013,13 +4908,13 @@ def main() -> int:
             "error, not a data point."
         )
     free = shutil.disk_usage(fx.repo_root()).free
-    if free < MIN_FREE_DISK_BYTES:
+    if not scalefit.disk_headroom_ok(free):
         e2e.die(
             f"only {free / 1024**3:.1f} GiB free; this profile spins peer swarms "
             f"that each hold a blob store and copies the 110 MiB payload per pod, "
-            f"and needs at least {MIN_FREE_DISK_BYTES / 1024**3:.0f} GiB. Refusing "
-            "to start rather than dying with ENOSPC mid-run. Bounding the harness "
-            "footprint is TASK-54."
+            f"and needs at least {scalefit.MIN_FREE_DISK_BYTES / 1024**3:.0f} GiB. "
+            "Refusing to start rather than dying with ENOSPC mid-run. Bounding the "
+            "harness footprint is TASK-54."
         )
 
     out_root = args.out.resolve()
@@ -5093,7 +4988,7 @@ def main() -> int:
         # PRECONDITION, before anything expensive and BEFORE the graded cache is
         # written: this arm's disk appetite is a function of the grid, so someone
         # widening --size-grid must be told the new number rather than checked
-        # against `MIN_FREE_DISK_BYTES`, which was sized for a different arm.
+        # against `scalefit.MIN_FREE_DISK_BYTES`, which was sized for a different arm.
         for problem in sz.disk_precondition_violations(free, full_plan):
             e2e.die(f"profile: {problem}")
         if len(size_plan) < scalefit.MIN_POINTS:

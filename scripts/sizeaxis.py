@@ -692,8 +692,11 @@ def role_metrics(resources: dict) -> dict:
     out = {}
     for label, role in (("holder", HOLDER_ROLE), ("fetcher", FETCHER_ROLE)):
         row = per_role[role]
-        out[f"{label}_rss_hwm_bytes_ram"] = row["rss_hwm_bytes"]
-        out[f"{label}_rss_point_max_bytes_ram"] = row["rss_point_max_bytes"]
+        # task-59: `ss.aggregate_samples` labels its per_role byte keys at the
+        # source now (`rss_hwm_bytes_ram`, ...), so this consumer reads the
+        # labelled names directly rather than relabelling a bare key.
+        out[f"{label}_rss_hwm_bytes_ram"] = row["rss_hwm_bytes_ram"]
+        out[f"{label}_rss_point_max_bytes_ram"] = row["rss_point_max_bytes_ram"]
         out[f"{label}_fd_max"] = row["fd_max"]
     return out
 
@@ -1564,23 +1567,18 @@ def run_self_test() -> int:  # noqa: C901 - a flat list of checks reads better h
     )
 
     # --- 10. role metrics are fail-closed on a missing end ------------------
-    resources = {
-        "daemon_roles_sampled": [HOLDER_ROLE, FETCHER_ROLE],
-        "per_role": {
-            HOLDER_ROLE: {
-                "rss_hwm_bytes": 300,
-                "rss_point_max_bytes": 280,
-                "fd_max": 30,
-                "ticks": 5,
-            },
-            FETCHER_ROLE: {
-                "rss_hwm_bytes": 200,
-                "rss_point_max_bytes": 190,
-                "fd_max": 20,
-                "ticks": 5,
-            },
-        },
-    }
+    # Drive the REAL `ss.aggregate_samples` producer (task-59) rather than a
+    # hand-built per_role dict: a hand-built fixture drifts in lockstep with the
+    # consumer and would keep passing after a producer key rename, which is a
+    # vacuous oracle across the aggregate_samples -> role_metrics seam. This way
+    # the producer/consumer byte-key contract actually bites.
+    resources = ss.aggregate_samples(
+        [
+            ss.NodeSample(HOLDER_ROLE, 0.0, 300, 280, 30),
+            ss.NodeSample(FETCHER_ROLE, 0.0, 200, 190, 20),
+        ],
+        [HOLDER_ROLE, FETCHER_ROLE],
+    )
     metrics = role_metrics(resources)
     check(
         "holder and fetcher are reported SEPARATELY, not as a worst-node max",

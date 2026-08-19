@@ -53,9 +53,12 @@ from __future__ import annotations
 
 import json
 import math
+import os
 import random
+import subprocess
 import sys
 from dataclasses import dataclass, field
+from pathlib import Path
 
 # ---- frozen constants -------------------------------------------------------
 
@@ -112,6 +115,189 @@ CAVEAT = {
         "model-class uncertainty. Read `competitive_models` first."
     ),
 }
+
+
+# ---- shared sweep-instrument report layer (task-59) -------------------------
+#
+# `scale_sweep.py` and `profile_p2p.py` are two S5 sweep instruments that build
+# the SAME kind of report. The mechanically-identical pieces live here so there
+# is ONE definition of "what a compliant S5 sweep report looks like" - two
+# copies is exactly the shape that lets one drift silently, and one already had
+# (`swarm_valid_observations` vs `axis_status[].valid_observations`, and a whole
+# UNIT RULE that policed only one of the two reports).
+#
+# These helpers are duck-typed, never importing the harness's `Axis`/`SweepPoint`
+# dataclasses (that would defeat the standalone-by-design property above): an
+# `axis` is anything with `.variable`, `.description`, `.notes` and `.points`,
+# and a `point` anything with `.n`, `.valid`, `.reason`, `.metrics`, `.detail`.
+
+# Refuse to start a container sweep below this much free disk. Both instruments
+# spin swarms/chains that each hold a blob store plus a per-pod payload copy; a
+# mid-run ENOSPC would corrupt a sweep point into looking like a product
+# failure. TASK-54 owns bounding the footprint properly - this is the guard that
+# keeps the harness from being the thing that fills the disk.
+MIN_FREE_DISK_BYTES = 8 * 1024**3
+
+# The recognised byte units (the NarSize-vs-FileSize trap, made mechanical). A
+# `*_bytes` key that ends in none of these lets NarSize (uncompressed, signed)
+# and FileSize (compressed, on-wire) sit in one report under indistinguishable
+# names, which is precisely how the three previous unit confusions happened.
+UNIT_SUFFIXES = (
+    "_bytes_ram",  # resident memory (VmHWM / VmRSS)
+    "_bytes_ondisk",  # bytes in files on a filesystem
+    "_bytes_uncompressed_nar",  # NarSize units - `nix-store --dump` output length
+    "_bytes_compressed_wire",  # FileSize units - what crosses the cache boundary
+)
+
+# The host note both instruments stamp on their provenance: a resource law is a
+# property of the machine it ran on, and a reader must be able to tell.
+HOST_NOTE = (
+    "a resource scaling law is a property of the system ON THIS HOST; "
+    "the constants do not transfer to different hardware, though the "
+    "growth CLASS usually does"
+)
+
+
+def disk_headroom_ok(free_bytes: int) -> bool:
+    """Is there at least `MIN_FREE_DISK_BYTES` free? Integer comparison, no
+    float in the DECISION (the caller formats the human message, where a float
+    is a terminal display and allowed). Defined once so the threshold and the
+    comparison cannot drift between the two instruments."""
+    return free_bytes >= MIN_FREE_DISK_BYTES
+
+
+def measured_axis_block(axis) -> dict:
+    """The measured-side block for ONE swept axis, in the CANONICAL schema.
+
+    The distinct-n grid, the per-n valid-observation counts, and the
+    point/invalid-point lists - the construction that had grown a near-copy in
+    each instrument. Replicates are separate OBSERVATIONS at the same n, never
+    averaged (the fitter needs the spread to size its intervals honestly), and a
+    reader needs to see how many draws each n actually got, so both are exposed.
+
+    Callers `.update()` their per-instrument extras onto the returned dict
+    (scale_sweep adds `fitted`; profile_p2p adds the high-water and
+    replicate-spread blocks); the SHARED core is defined here exactly once."""
+    distinct = sorted({p.n for p in axis.points})
+    return {
+        "variable": axis.variable,
+        "description": axis.description,
+        "notes": axis.notes,
+        "distinct_n": distinct,
+        "valid_observations_per_n": {
+            str(n): sum(1 for p in axis.points if p.n == n and p.valid)
+            for n in distinct
+        },
+        "points": [
+            {
+                "n": p.n,
+                "valid": p.valid,
+                "reason": p.reason,
+                "metrics": p.metrics,
+                "detail": p.detail,
+            }
+            for p in axis.points
+        ],
+        "invalid_points": [
+            {"n": p.n, "reason": p.reason} for p in axis.points if not p.valid
+        ],
+    }
+
+
+def axis_status_counts(axis) -> dict:
+    """The valid/total/distinct-valid observation triple a verdict reports for
+    one axis, in the CANONICAL `axis_status[]` schema.
+
+    This is the key that had DIVERGED: profile_p2p spelled it flat
+    (`swarm_valid_observations`, ...), scale_sweep nested it
+    (`axis_status[].valid_observations`). Both now spell it the same way through
+    this helper, so the two reports converge on one schema."""
+    return {
+        "valid_observations": sum(1 for p in axis.points if p.valid),
+        "total_observations": len(axis.points),
+        "distinct_valid_n": len({p.n for p in axis.points if p.valid}),
+    }
+
+
+def host_provenance(*, note: str = HOST_NOTE) -> tuple[dict, dict]:
+    """Host identity + total RAM (bytes, unit-labelled by NAME), fail-verbose.
+
+    Returns `(host_dict, unavailable)`: a MemTotal that could not be read is
+    recorded under `unavailable` with the reason, never left as a silent blank
+    (this block's whole job is re-derivability, so "unknown" quietly reading as
+    the number's absence is exactly the failure it must not have). The RAM key
+    is `mem_total_bytes_ram` - unit-labelled, so it passes the repo unit rule."""
+    unavailable: dict[str, str] = {}
+    total_ram = None
+    try:
+        for line in Path("/proc/meminfo").read_text().splitlines():
+            if line.startswith("MemTotal:"):
+                total_ram = int(line.split()[1]) * 1024
+    except OSError as error:
+        unavailable["mem_total_bytes_ram"] = str(error)
+    host = {
+        "kernel": os.uname().release,
+        "machine": os.uname().machine,
+        "cpu_count": os.cpu_count(),
+        "mem_total_bytes_ram": total_ram,
+        "note": note,
+    }
+    return host, unavailable
+
+
+def _git(repo_root, argv: list[str], unavailable: dict) -> str | None:
+    """One git command's stdout, or None with the reason recorded. Shared by the
+    commit-hash and working-tree-clean lookups below."""
+    try:
+        result = subprocess.run(
+            ["git", *argv],
+            capture_output=True,
+            text=True,
+            check=False,
+            cwd=str(repo_root),
+        )
+    except OSError as error:
+        unavailable[f"git {' '.join(argv)}"] = str(error)
+        return None
+    if result.returncode != 0:
+        unavailable[f"git {' '.join(argv)}"] = (
+            f"exit {result.returncode}: {result.stderr.strip()}"
+        )
+        return None
+    return result.stdout
+
+
+def base_provenance(
+    *,
+    workload_version,
+    fixture_tier,
+    public_key,
+    generation: str,
+    repo_root,
+    extra: dict,
+) -> dict:
+    """The re-derivability block both sweep instruments share.
+
+    Workload + fixture identity, git commit AND working-tree cleanliness (a
+    commit hash alone does NOT describe the code when the tree is dirty, and
+    these instruments are normally run dirty during development), the host, and
+    whatever could not be read named under `unavailable`. `extra` carries the
+    per-instrument bits - which attrs were swept - and is spliced in after the
+    fixture identity so the schema reads the same order in both reports."""
+    host, unavailable = host_provenance()
+    commit = _git(repo_root, ["rev-parse", "HEAD"], unavailable)
+    dirty = _git(repo_root, ["status", "--porcelain"], unavailable)
+    return {
+        "workload_version": workload_version,
+        "fixture_tier": fixture_tier,
+        "fixture_public_key": public_key,
+        "generation": generation,
+        **extra,
+        "git_commit": None if commit is None else commit.strip(),
+        "git_clean": None if dirty is None else dirty.strip() == "",
+        "unavailable": unavailable,
+        "host": host,
+    }
 
 
 # ---- candidate model family -------------------------------------------------
@@ -715,6 +901,56 @@ def sweep_report_violations(report: dict) -> list[str]:
     return problems
 
 
+def unit_labelled(key: str) -> bool:
+    """Is `key` a properly unit-labelled byte quantity?
+
+    ANY key mentioning `bytes` anywhere - not just as a suffix - must END in a
+    recognised unit, optionally followed by the rate marker `_per_s`. The
+    endswith-only version of this rule was itself the vacuous-oracle shape it
+    exists to prevent: `bytes_sent` (a real key name in this codebase, see
+    `Pod.proxy_stats`), `egress_bytes_total` and `total_bytes_moved` all passed
+    it CLEAN. A rule stated as "a reader cannot mix what the schema will not let
+    the writer spell" has to cover what the writer can actually spell."""
+    body = key[: -len("_per_s")] if key.endswith("_per_s") else key
+    return any(body.endswith(suffix) for suffix in UNIT_SUFFIXES)
+
+
+def unit_violations(node, path: str = "") -> list[str]:
+    """Every key naming a byte quantity must carry a recognised unit. Empty == clean.
+
+    THE REPO-WIDE UNIT RULE (task-59). It used to live in profile_p2p and police
+    only ITS report, while scale_sweep emitted an unpoliced sibling report
+    carrying `daemon_rss_hwm_bytes`, `chain_total_rss_hwm_bytes` and
+    `mem_total_bytes` - all of which this gate rejects. It belongs here, in the
+    shared honesty module, and both instruments now call it on their reports.
+
+    This is the mechanical form of the rule the project keeps breaking in prose:
+    NarSize (uncompressed, signed) and FileSize (compressed, on-wire) are
+    DIFFERENT UNITS, and a report that names both `bytes` invites the ratio that
+    has already been wrong three times. Pure and structural - strings and
+    set/endswith membership only, no float - so it introduces nothing into a
+    gated decision that the no-floats rule forbids."""
+    problems: list[str] = []
+    if isinstance(node, dict):
+        for key, value in node.items():
+            here = f"{path}.{key}" if path else str(key)
+            # `bytes` as a whole TOKEN, so `bytesize`-style words do not trip it
+            # while `bytes_sent` and `total_bytes_moved` do.
+            names_bytes = isinstance(key, str) and "bytes" in key.split("_")
+            if names_bytes and not unit_labelled(key):
+                problems.append(
+                    f"{here}: byte-valued key without a unit label. It must END "
+                    f"in one of {', '.join(UNIT_SUFFIXES)} (optionally + "
+                    "'_per_s') - NarSize and FileSize are different units and an "
+                    "unlabelled byte key lets them be compared"
+                )
+            problems += unit_violations(value, here)
+    elif isinstance(node, list):
+        for index, value in enumerate(node):
+            problems += unit_violations(value, f"{path}[{index}]")
+    return problems
+
+
 def red_flags_for(models: dict) -> list[dict]:
     """The red-flag section: one entry per SUPERLINEAR RAM/latency/fd fit.
 
@@ -1175,7 +1411,7 @@ def run_self_test() -> int:  # noqa: C901 - a flat list of checks reads better h
         ),
     }
     good = {
-        "measured": {"clients": {"points": [{"n": 1, "rss_hwm_bytes": 123}]}},
+        "measured": {"clients": {"points": [{"n": 1, "rss_hwm_bytes_ram": 123}]}},
         "models": models,
         "red_flags": red_flags_for(models),
         "caveat": CAVEAT,
@@ -1241,6 +1477,91 @@ def run_self_test() -> int:  # noqa: C901 - a flat list of checks reads better h
     for name, mutation in mutations:
         problems = sweep_report_violations(mutated(mutation))
         check(name, problems != [], "validator accepted a broken report")
+
+    # --- 7. the shared sweep-report layer (task-59) ------------------------
+    # The unit rule now lives here (it policed only ONE of the two sweep reports
+    # before). Proven to BITE by mutation: an unlabelled byte key is rejected,
+    # every recognised suffix is accepted, and a word merely CONTAINING "bytes"
+    # is untouched.
+    print("\n  -- shared report layer (task-59) --")
+    check(
+        "unit rule: a unit-suffixed byte key passes",
+        unit_violations({"peer_rss_hwm_bytes_ram": 1}) == [],
+    )
+    for suffix in UNIT_SUFFIXES:
+        check(
+            f"unit rule: suffix {suffix} is accepted",
+            unit_violations({f"x{suffix}": 1}) == [],
+        )
+    check(
+        "unit rule MUTATION: a bare `_bytes` key is REJECTED",
+        unit_violations({"chain_total_rss_hwm_bytes": 1}) != [],
+    )
+    check(
+        "unit rule MUTATION: `mem_total_bytes` (scale_sweep's old key) is REJECTED",
+        unit_violations({"host": {"mem_total_bytes": 1}}) != [],
+    )
+    check(
+        "unit rule: the labelled `mem_total_bytes_ram` passes",
+        unit_violations({"host": {"mem_total_bytes_ram": 1}}) == [],
+    )
+    check(
+        "unit rule: a rate key keeps its unit through `_per_s`",
+        unit_violations({"throughput_bytes_compressed_wire_per_s": 1}) == [],
+    )
+    check(
+        "unit rule: a word merely CONTAINING 'bytes' is not a byte key",
+        unit_violations({"bytesize_note": "x"}) == [],
+    )
+    check(
+        "unit rule names the offending path",
+        "arms[0].served_bytes" in unit_violations({"arms": [{"served_bytes": 1}]})[0],
+        str(unit_violations({"arms": [{"served_bytes": 1}]})),
+    )
+
+    class _P:
+        def __init__(self, n, valid):
+            self.n, self.valid, self.reason, self.metrics, self.detail = (
+                n,
+                valid,
+                "",
+                {},
+                {},
+            )
+
+    class _A:
+        variable, description, notes = "v", "d", []
+
+        def __init__(self, points):
+            self.points = points
+
+    axis = _A([_P(1, True), _P(1, True), _P(2, True), _P(2, False), _P(4, True)])
+    block = measured_axis_block(axis)
+    check(
+        "measured_axis_block: distinct_n is the sorted unique n",
+        block["distinct_n"] == [1, 2, 4],
+    )
+    check(
+        "measured_axis_block: per-n valid counts (replicates counted, invalids not)",
+        block["valid_observations_per_n"] == {"1": 2, "2": 1, "4": 1},
+        str(block["valid_observations_per_n"]),
+    )
+    check(
+        "measured_axis_block: invalid points keep their slot",
+        len(block["invalid_points"]) == 1 and len(block["points"]) == 5,
+    )
+    counts = axis_status_counts(axis)
+    check(
+        "axis_status_counts: valid/total/distinct-valid triple",
+        counts
+        == {"valid_observations": 4, "total_observations": 5, "distinct_valid_n": 3},
+        str(counts),
+    )
+    check(
+        "disk_headroom_ok: at/above the floor passes, below fails (integer decision)",
+        disk_headroom_ok(MIN_FREE_DISK_BYTES)
+        and not disk_headroom_ok(MIN_FREE_DISK_BYTES - 1),
+    )
 
     print(f"\nscalefit --self-test: {'ALL PASS' if ok else 'FAILURES PRESENT'}")
     return 0 if ok else 1

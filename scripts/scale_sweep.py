@@ -70,7 +70,6 @@ import os
 import shutil
 import signal
 import statistics
-import subprocess
 import sys
 import threading
 import time
@@ -116,10 +115,8 @@ KNOB_ARM_CLIENTS = 4
 # TASK-54's subject; this constant is where the bound lives.
 SWEEP_ATTRS = ("lib", "app", "zstd")
 
-# Refuse to start a container sweep below this much free disk. TASK-54 tracks
-# bounding the footprint properly; this is the guard that keeps a sweep from
-# being the thing that fills the disk.
-MIN_FREE_DISK_BYTES = 8 * 1024**3
+# The free-disk floor and its check are `scalefit.MIN_FREE_DISK_BYTES` /
+# `scalefit.disk_headroom_ok` (task-59: defined once, shared with profile_p2p).
 
 # Replicates per sweep point. NOT cosmetic: with one observation per N the
 # daemon's peak RSS is a single noisy draw (allocator behaviour, chunking), and
@@ -259,11 +256,15 @@ def aggregate_samples(samples: list[NodeSample], daemon_roles: list[str]) -> dic
 
     per_role = {}
     for role, rows in sorted(by_role.items()):
+        # Byte keys carry the `_bytes_ram` unit label AT THE SOURCE (task-59), so
+        # every downstream report - scale_sweep's own and profile_p2p's, which
+        # relabels these into its peer/infrastructure split - is unit-clean and
+        # the shared unit rule (scalefit.unit_violations) can police both.
         per_role[role] = {
             "ticks": len(rows),
-            "rss_hwm_bytes": max(r.rss_hwm_bytes for r in rows),
-            "rss_point_max_bytes": max(r.rss_point_bytes for r in rows),
-            "rss_point_last_bytes": rows[-1].rss_point_bytes,
+            "rss_hwm_bytes_ram": max(r.rss_hwm_bytes for r in rows),
+            "rss_point_max_bytes_ram": max(r.rss_point_bytes for r in rows),
+            "rss_point_last_bytes_ram": rows[-1].rss_point_bytes,
             "fd_max": max(r.fd_count for r in rows),
             "fd_last": rows[-1].fd_count,
         }
@@ -278,14 +279,18 @@ def aggregate_samples(samples: list[NodeSample], daemon_roles: list[str]) -> dic
         "per_role": per_role,
         # Per-NODE peak: the figure a single peer would pay. This is the one the
         # 1000-peer extrapolation is about.
-        "daemon_rss_hwm_bytes": max(per_role[r]["rss_hwm_bytes"] for r in present),
-        "daemon_rss_point_max_bytes": max(
-            per_role[r]["rss_point_max_bytes"] for r in present
+        "daemon_rss_hwm_bytes_ram": max(
+            per_role[r]["rss_hwm_bytes_ram"] for r in present
+        ),
+        "daemon_rss_point_max_bytes_ram": max(
+            per_role[r]["rss_point_max_bytes_ram"] for r in present
         ),
         "daemon_fd_max": max(per_role[r]["fd_max"] for r in present),
         # Whole-topology total: what the HOST pays for the chain, which is a
         # different question and is fitted separately on the chain axis.
-        "chain_total_rss_hwm_bytes": sum(per_role[r]["rss_hwm_bytes"] for r in present),
+        "chain_total_rss_hwm_bytes_ram": sum(
+            per_role[r]["rss_hwm_bytes_ram"] for r in present
+        ),
         "daemon_roles_sampled": present,
     }
 
@@ -310,13 +315,25 @@ def latency_block(realise_s: list[float], wall_s: list[float]) -> dict:
 
 # (metric key in point.metrics, unit, human description) per axis.
 CLIENT_AXIS_METRICS = (
-    ("daemon_rss_hwm_bytes", "bytes", "daemon peak RSS (VmHWM) vs concurrent clients"),
+    (
+        "daemon_rss_hwm_bytes_ram",
+        "bytes (RSS)",
+        "daemon peak RSS (VmHWM) vs concurrent clients",
+    ),
     ("daemon_fd_max", "descriptors", "daemon peak open fds vs concurrent clients"),
     ("realise_p95_s", "seconds", "client p95 realise latency vs concurrent clients"),
 )
 CHAIN_AXIS_METRICS = (
-    ("daemon_rss_hwm_bytes", "bytes", "worst per-hop peak RSS (VmHWM) vs chain depth"),
-    ("chain_total_rss_hwm_bytes", "bytes", "whole-chain peak RSS total vs chain depth"),
+    (
+        "daemon_rss_hwm_bytes_ram",
+        "bytes (RSS)",
+        "worst per-hop peak RSS (VmHWM) vs chain depth",
+    ),
+    (
+        "chain_total_rss_hwm_bytes_ram",
+        "bytes (RSS)",
+        "whole-chain peak RSS total vs chain depth",
+    ),
     ("daemon_fd_max", "descriptors", "worst per-hop peak open fds vs chain depth"),
     ("realise_p95_s", "seconds", "client p95 realise latency vs chain depth"),
 )
@@ -370,35 +387,15 @@ def build_report(axes: list[Axis], provenance: dict, config: dict, targets) -> d
     axis_status: list[dict] = []
 
     for axis in axes:
-        measured[axis.name] = {
-            "variable": axis.variable,
-            "description": axis.description,
-            "fitted": axis.fitted,
-            "notes": axis.notes,
-            # Replicates are separate OBSERVATIONS at the same n, never averaged
-            # (see DEFAULT_REPEATS): the fitter needs the spread to size its
-            # intervals honestly, and a reader needs to see how many draws each
-            # n actually got.
-            "distinct_n": sorted({p.n for p in axis.points}),
-            "valid_observations_per_n": {
-                str(n): sum(1 for p in axis.points if p.n == n and p.valid)
-                for n in sorted({p.n for p in axis.points})
-            },
-            "points": [
-                {
-                    "n": p.n,
-                    "valid": p.valid,
-                    "reason": p.reason,
-                    "metrics": p.metrics,
-                    "detail": p.detail,
-                }
-                for p in axis.points
-            ],
-            "invalid_points": [
-                {"n": p.n, "reason": p.reason} for p in axis.points if not p.valid
-            ],
-        }
-        valid_points = sum(1 for p in axis.points if p.valid)
+        # The measured-axis skeleton (distinct_n / valid_observations_per_n /
+        # points / invalid_points) is built by the SHARED scalefit helper, so it
+        # cannot drift from profile_p2p's copy (task-59). `fitted` is this
+        # instrument's extra - it sweeps arms of differing fitted-ness.
+        block = scalefit.measured_axis_block(axis)
+        block["fitted"] = axis.fitted
+        measured[axis.name] = block
+        counts = scalefit.axis_status_counts(axis)
+        valid_points = counts["valid_observations"]
         if not axis.fitted:
             # An UNFITTED arm (the knobs comparison) has no fit to fail, so its
             # only honest health signal is point validity - which is where the
@@ -408,9 +405,7 @@ def build_report(axes: list[Axis], provenance: dict, config: dict, targets) -> d
                 {
                     "axis": axis.name,
                     "fitted": False,
-                    "valid_observations": valid_points,
-                    "total_observations": len(axis.points),
-                    "distinct_valid_n": len({p.n for p in axis.points if p.valid}),
+                    **counts,
                     "usable": valid_points == len(axis.points) and valid_points > 0,
                     "why": "reported per value; usable iff every point is valid",
                 }
@@ -425,9 +420,7 @@ def build_report(axes: list[Axis], provenance: dict, config: dict, targets) -> d
             {
                 "axis": axis.name,
                 "fitted": True,
-                "valid_observations": valid_points,
-                "total_observations": len(axis.points),
-                "distinct_valid_n": len({p.n for p in axis.points if p.valid}),
+                **counts,
                 "usable": axis_problems == [],
                 "why": (
                     "usable iff every metric fitted; a point lost to a flaky "
@@ -452,10 +445,12 @@ def build_report(axes: list[Axis], provenance: dict, config: dict, targets) -> d
                 "host-side podman wall clock is reported but NEVER fitted: it "
                 "carries container create/start/teardown, which itself scales."
             ),
-            "bytes_unit": (
-                "compressed on-wire bytes (file_size) wherever bytes appear; "
-                "NarSize (uncompressed, signed) is a different unit and is never "
-                "mixed in"
+            "units": (
+                "every `*_bytes` key carries one of "
+                + ", ".join(scalefit.UNIT_SUFFIXES)
+                + "; compressed on-wire bytes (file_size) and NarSize "
+                "(uncompressed, signed) are DIFFERENT units and are never mixed "
+                "in. Enforced by scalefit.unit_violations on this report."
             ),
             "observation_point": (
                 "host-side /proc of the container init pid (rootless podman runs "
@@ -482,11 +477,21 @@ def build_report(axes: list[Axis], provenance: dict, config: dict, targets) -> d
         "red_flags": red_flags,
     }
     violations = scalefit.sweep_report_violations(report)
+    # task-59: the repo-wide UNIT RULE now polices THIS report too - it lived in
+    # profile_p2p and left scale_sweep's sibling report (daemon_rss_hwm_bytes_ram,
+    # chain_total_rss_hwm_bytes_ram, mem_total_bytes) UNPOLICED. It is shared in
+    # scalefit and enforced here, so no unlabelled byte quantity can ship.
+    unit_problems = scalefit.unit_violations(report)
     report["honesty"] = {
-        "rules": "TESTING.md S5 (a)-(d), asserted by scalefit.sweep_report_violations",
+        "rules": (
+            "TESTING.md S5 (a)-(d) via scalefit.sweep_report_violations, plus the "
+            "repo unit rule (no unlabelled byte quantity) via scalefit.unit_violations"
+        ),
         "violations": violations,
-        "compliant": violations == [],
+        "unit_violations": unit_problems,
+        "compliant": violations == [] and unit_problems == [],
     }
+    compliant = report["honesty"]["compliant"]
     arms_usable = all(status["usable"] for status in axis_status)
     report["verdict"] = {
         "axes_run": [a.name for a in axes],
@@ -494,9 +499,9 @@ def build_report(axes: list[Axis], provenance: dict, config: dict, targets) -> d
         "fit_problems": problems,
         "all_axes_fitted": problems == [],
         "all_arms_usable": arms_usable,
-        "honesty_compliant": violations == [],
+        "honesty_compliant": compliant,
         "red_flag_count": len(red_flags),
-        "usable": problems == [] and violations == [] and arms_usable,
+        "usable": problems == [] and compliant and arms_usable,
         "note": (
             "`usable` is about the INSTRUMENT. Red flags are findings about the "
             "PRODUCT and do not make the sweep unusable - they make it useful."
@@ -837,8 +842,8 @@ def sweep_clients(ctx, fixtures, counts, jobs: int, conns: int, repeats: int) ->
                     sampler.errors,
                     resources,
                     metric_keys=(
-                        "daemon_rss_hwm_bytes",
-                        "daemon_rss_point_max_bytes",
+                        "daemon_rss_hwm_bytes_ram",
+                        "daemon_rss_point_max_bytes_ram",
                         "daemon_fd_max",
                     ),
                     require_concurrency=True,
@@ -899,8 +904,8 @@ def sweep_chain(ctx, fixtures, depths, repeats: int) -> Axis:
                     sampler.errors,
                     resources,
                     metric_keys=(
-                        "daemon_rss_hwm_bytes",
-                        "chain_total_rss_hwm_bytes",
+                        "daemon_rss_hwm_bytes_ram",
+                        "chain_total_rss_hwm_bytes_ram",
                         "daemon_fd_max",
                     ),
                     require_concurrency=False,
@@ -979,7 +984,7 @@ def sweep_knobs(ctx, fixtures, values, clients: int, repeats: int) -> Axis:
                     arm,
                     sampler.errors,
                     resources,
-                    metric_keys=("daemon_rss_hwm_bytes", "daemon_fd_max"),
+                    metric_keys=("daemon_rss_hwm_bytes_ram", "daemon_fd_max"),
                     require_concurrency=True,
                 )
                 # PRECONDITION, asserted: the knob must be confirmed to have LANDED,
@@ -1021,46 +1026,25 @@ def provenance(fixtures, out_root: Path) -> dict:
     """What makes these numbers re-derivable. A SCALING report's provenance is
     not the same as the egress instrument's: the HOST is part of the result
     here (cpu count, kernel, memory), because a resource law measured on one
-    machine is not transferable to another and a reader must be able to tell."""
+    machine is not transferable to another and a reader must be able to tell.
+
+    Shared with profile_p2p via `scalefit.base_provenance` (task-59): the two
+    used to keep near-copies, and scale_sweep's had already drifted to an
+    UNLABELLED `mem_total_bytes` key (the shared version labels it
+    `mem_total_bytes_ram`) and lacked the fail-verbose `unavailable`/`git_clean`
+    honesty profile_p2p's had grown. The per-instrument extra here is which
+    attrs were swept."""
     generation = fx.resolve_current(out_root)
     lock = json.loads((generation / "lock.json").read_text())
     manifest = fixtures.manifest
-    try:
-        commit = subprocess.run(
-            ["git", "rev-parse", "HEAD"],
-            capture_output=True,
-            text=True,
-            check=False,
-            cwd=str(fx.repo_root()),
-        ).stdout.strip()
-    except OSError:
-        commit = ""
-    total_ram = None
-    try:
-        for line in Path("/proc/meminfo").read_text().splitlines():
-            if line.startswith("MemTotal:"):
-                total_ram = int(line.split()[1]) * 1024
-    except OSError:
-        pass
-    return {
-        "workload_version": manifest["workload_version"],
-        "fixture_tier": manifest["tier"],
-        "fixture_public_key": lock["public_key"],
-        "generation": generation.name,
-        "swept_attrs": list(SWEEP_ATTRS),
-        "git_commit": commit,
-        "host": {
-            "kernel": os.uname().release,
-            "machine": os.uname().machine,
-            "cpu_count": os.cpu_count(),
-            "mem_total_bytes": total_ram,
-            "note": (
-                "a resource scaling law is a property of the system ON THIS HOST; "
-                "the constants do not transfer to different hardware, though the "
-                "growth CLASS usually does"
-            ),
-        },
-    }
+    return scalefit.base_provenance(
+        workload_version=manifest["workload_version"],
+        fixture_tier=manifest["tier"],
+        public_key=lock["public_key"],
+        generation=generation.name,
+        repo_root=fx.repo_root(),
+        extra={"swept_attrs": list(SWEEP_ATTRS)},
+    )
 
 
 # ---- human summary ----------------------------------------------------------
@@ -1152,7 +1136,9 @@ def print_human_summary(report: dict) -> None:
     )
     for problem in verdict["fit_problems"]:
         print(f"    PROBLEM: {problem}", file=out)
-    for violation in report["honesty"]["violations"]:
+    for violation in (
+        report["honesty"]["violations"] + report["honesty"]["unit_violations"]
+    ):
         print(f"    HONESTY VIOLATION: {violation}", file=out)
     print("========================================================\n", file=out)
 
@@ -1226,12 +1212,12 @@ def run_self_test() -> int:  # noqa: C901 - a flat list of checks reads better h
     agg = aggregate_samples(samples, ["daemon"])
     check(
         "high-water is the peak, not the last point",
-        agg["daemon_rss_hwm_bytes"] == 200_000_000,
+        agg["daemon_rss_hwm_bytes_ram"] == 200_000_000,
     )
     check(
         "point sample is reported separately and is SMALLER here",
-        agg["daemon_rss_point_max_bytes"] == 50_000_000
-        and agg["daemon_rss_point_max_bytes"] < agg["daemon_rss_hwm_bytes"],
+        agg["daemon_rss_point_max_bytes_ram"] == 50_000_000
+        and agg["daemon_rss_point_max_bytes_ram"] < agg["daemon_rss_hwm_bytes_ram"],
     )
     check("fd max is the peak, not the last", agg["daemon_fd_max"] == 20)
     chain_agg = aggregate_samples(
@@ -1241,8 +1227,12 @@ def run_self_test() -> int:  # noqa: C901 - a flat list of checks reads better h
         ],
         ["daemon-1", "daemon-2"],
     )
-    check("per-node peak is the WORST hop", chain_agg["daemon_rss_hwm_bytes"] == 300)
-    check("chain total sums the hops", chain_agg["chain_total_rss_hwm_bytes"] == 400)
+    check(
+        "per-node peak is the WORST hop", chain_agg["daemon_rss_hwm_bytes_ram"] == 300
+    )
+    check(
+        "chain total sums the hops", chain_agg["chain_total_rss_hwm_bytes_ram"] == 400
+    )
     raised = False
     try:
         aggregate_samples([NodeSample("proxy", 0.0, 1, 1, 1)], ["daemon"])
@@ -1326,8 +1316,8 @@ def run_self_test() -> int:  # noqa: C901 - a flat list of checks reads better h
         3,
         serialised,
         [],
-        {"daemon_rss_hwm_bytes": 1, "daemon_fd_max": 2},
-        metric_keys=("daemon_rss_hwm_bytes", "daemon_fd_max"),
+        {"daemon_rss_hwm_bytes_ram": 1, "daemon_fd_max": 2},
+        metric_keys=("daemon_rss_hwm_bytes_ram", "daemon_fd_max"),
         require_concurrency=True,
     )
     check(
@@ -1339,8 +1329,8 @@ def run_self_test() -> int:  # noqa: C901 - a flat list of checks reads better h
         3,
         ClientArm(realise_s=[1.0], observed_max_overlap=1, requested_count=1),
         [],
-        {"daemon_rss_hwm_bytes": 1, "daemon_fd_max": 2},
-        metric_keys=("daemon_rss_hwm_bytes", "daemon_fd_max"),
+        {"daemon_rss_hwm_bytes_ram": 1, "daemon_fd_max": 2},
+        metric_keys=("daemon_rss_hwm_bytes_ram", "daemon_fd_max"),
         require_concurrency=False,
     )
     check(
@@ -1361,7 +1351,7 @@ def run_self_test() -> int:  # noqa: C901 - a flat list of checks reads better h
     prov = {"workload_version": "test", "fixture_tier": "fast", "host": {}}
     config = {"self_test": True}
     linear_axis = _synthetic_axis(
-        "clients", "concurrent clients", "linear", "daemon_rss_hwm_bytes"
+        "clients", "concurrent clients", "linear", "daemon_rss_hwm_bytes_ram"
     )
     report = build_report([linear_axis], prov, config, (10, 100, 1000))
     check(
@@ -1371,17 +1361,18 @@ def run_self_test() -> int:  # noqa: C901 - a flat list of checks reads better h
     )
     check(
         "known O(n) RSS axis recovers linear",
-        report["models"]["clients.daemon_rss_hwm_bytes"]["selected_model"] == "linear",
-        report["models"]["clients.daemon_rss_hwm_bytes"]["selected_model"],
+        report["models"]["clients.daemon_rss_hwm_bytes_ram"]["selected_model"]
+        == "linear",
+        report["models"]["clients.daemon_rss_hwm_bytes_ram"]["selected_model"],
     )
     check("no red flag for a linear RSS law", report["red_flags"] == [])
     check("verdict usable on a clean synthetic sweep", report["verdict"]["usable"])
 
     quad_axis = _synthetic_axis(
-        "clients", "concurrent clients", "quadratic", "daemon_rss_hwm_bytes"
+        "clients", "concurrent clients", "quadratic", "daemon_rss_hwm_bytes_ram"
     )
     quad_report = build_report([quad_axis], prov, config, (10, 100, 1000))
-    fit = quad_report["models"]["clients.daemon_rss_hwm_bytes"]
+    fit = quad_report["models"]["clients.daemon_rss_hwm_bytes_ram"]
     check(
         "known O(n^2) RSS axis is NOT reported as linear",
         fit["selected_model"] != "linear",
@@ -1390,7 +1381,8 @@ def run_self_test() -> int:  # noqa: C901 - a flat list of checks reads better h
     check("known O(n^2) RSS axis is flagged superlinear", fit["superlinear"])
     check(
         "the superlinear fit reaches the red-flag section, by id",
-        [f["id"] for f in quad_report["red_flags"]] == ["clients.daemon_rss_hwm_bytes"],
+        [f["id"] for f in quad_report["red_flags"]]
+        == ["clients.daemon_rss_hwm_bytes_ram"],
         str([f["id"] for f in quad_report["red_flags"]]),
     )
     check(
@@ -1410,7 +1402,9 @@ def run_self_test() -> int:  # noqa: C901 - a flat list of checks reads better h
         scalefit.sweep_report_violations(broken) != [],
     )
     broken2 = json.loads(json.dumps(quad_report))
-    broken2["models"]["clients.daemon_rss_hwm_bytes"]["extrapolations"][0].pop("kind")
+    broken2["models"]["clients.daemon_rss_hwm_bytes_ram"]["extrapolations"][0].pop(
+        "kind"
+    )
     check(
         "MUTATION: extrapolation label stripped -> REJECTED",
         scalefit.sweep_report_violations(broken2) != [],
@@ -1425,9 +1419,46 @@ def run_self_test() -> int:  # noqa: C901 - a flat list of checks reads better h
         scalefit.sweep_report_violations(broken3) != [],
     )
 
+    # --- the UNIT RULE now polices THIS report (task-59) --------------------
+    # scale_sweep's report used to carry `daemon_rss_hwm_bytes`,
+    # `chain_total_rss_hwm_bytes` and `mem_total_bytes` UNLABELLED while the unit
+    # rule lived in profile_p2p and never saw them. It is now shared in scalefit
+    # and enforced here. Proven to BITE by mutation: an unlabelled byte key is
+    # rejected, and passes once it carries a `_bytes_ram` label.
+    check(
+        "a clean assembled report carries an EMPTY unit_violations list",
+        report["honesty"]["unit_violations"] == [],
+        str(report["honesty"]["unit_violations"]),
+    )
+    unit_broken = json.loads(json.dumps(quad_report))
+    unit_broken["measured"]["clients"]["points"][0]["metrics"][
+        "daemon_rss_hwm_bytes"
+    ] = 123
+    check(
+        "MUTATION: an UNLABELLED byte key in scale_sweep's report -> unit rule "
+        "REJECTS (the previously-unpoliced report now bites)",
+        scalefit.unit_violations(unit_broken) != [],
+        str(scalefit.unit_violations(unit_broken)),
+    )
+    unit_ok = json.loads(json.dumps(quad_report))
+    unit_ok["measured"]["clients"]["points"][0]["metrics"][
+        "daemon_rss_hwm_bytes_ram"
+    ] = 123
+    check(
+        "and the SAME value under a `_bytes_ram` label passes the unit rule",
+        scalefit.unit_violations(unit_ok) == [],
+        str(scalefit.unit_violations(unit_ok)),
+    )
+    check(
+        "the config free-disk key is unit-labelled (mutation: the old bare name "
+        "would be REJECTED)",
+        scalefit.unit_violations({"free_disk_at_start_bytes_ondisk": 1}) == []
+        and scalefit.unit_violations({"free_disk_bytes_at_start": 1}) != [],
+    )
+
     # --- invalid points are excluded, and a starved axis is NOT fitted ------
     starved = _synthetic_axis(
-        "clients", "concurrent clients", "linear", "daemon_rss_hwm_bytes"
+        "clients", "concurrent clients", "linear", "daemon_rss_hwm_bytes_ram"
     )
     for point in starved.points[:3]:
         point.valid = False
@@ -1450,7 +1481,7 @@ def run_self_test() -> int:  # noqa: C901 - a flat list of checks reads better h
 
     # --- replicates are observations, not an average --------------------------
     replicated = _synthetic_axis(
-        "clients", "concurrent clients", "linear", "daemon_rss_hwm_bytes"
+        "clients", "concurrent clients", "linear", "daemon_rss_hwm_bytes_ram"
     )
     jitter = 0.0
     for extra in list(replicated.points):
@@ -1458,10 +1489,10 @@ def run_self_test() -> int:  # noqa: C901 - a flat list of checks reads better h
         clone = SweepPoint(
             n=extra.n, valid=True, metrics=dict(extra.metrics), detail={}
         )
-        clone.metrics["daemon_rss_hwm_bytes"] += jitter
+        clone.metrics["daemon_rss_hwm_bytes_ram"] += jitter
         replicated.points.append(clone)
     rep_report = build_report([replicated], prov, config, (10, 100, 1000))
-    rep_fit = rep_report["models"]["clients.daemon_rss_hwm_bytes"]
+    rep_fit = rep_report["models"]["clients.daemon_rss_hwm_bytes_ram"]
     check(
         "replicates reach the fitter as SEPARATE observations (not averaged)",
         len(rep_fit["n_values"]) == 12,
@@ -1474,7 +1505,7 @@ def run_self_test() -> int:  # noqa: C901 - a flat list of checks reads better h
     check(
         "replicate spread shows up in the residual std error (intervals widen)",
         rep_fit["residual_std_error"]
-        > report["models"]["clients.daemon_rss_hwm_bytes"]["residual_std_error"],
+        > report["models"]["clients.daemon_rss_hwm_bytes_ram"]["residual_std_error"],
     )
     check(
         "the report says how many valid observations each n got",
@@ -1581,11 +1612,11 @@ def main() -> int:
 
     install_sigterm_cleanup()
     free = shutil.disk_usage(fx.repo_root()).free
-    if free < MIN_FREE_DISK_BYTES:
+    if not scalefit.disk_headroom_ok(free):
         e2e.die(
             f"only {free / 1024**3:.1f} GiB free; a container sweep needs at least "
-            f"{MIN_FREE_DISK_BYTES / 1024**3:.0f} GiB. Refusing to start rather "
-            "than filling the disk. Bounding the harness footprint is TASK-54."
+            f"{scalefit.MIN_FREE_DISK_BYTES / 1024**3:.0f} GiB. Refusing to start "
+            "rather than filling the disk. Bounding the harness footprint is TASK-54."
         )
 
     out_root = args.out.resolve()
@@ -1608,7 +1639,7 @@ def main() -> int:
         "axes": sorted(wanted),
         "poll_interval_s": POLL_INTERVAL_S,
         "extrapolation_targets": list(args.extrapolate_to),
-        "free_disk_bytes_at_start": free,
+        "free_disk_at_start_bytes_ondisk": free,
     }
 
     axes: list[Axis] = []
