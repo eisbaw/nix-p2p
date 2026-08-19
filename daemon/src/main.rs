@@ -671,13 +671,14 @@ fn derive_contract(config: &Config) -> Result<OperatorContract, String> {
 /// extracted so it is unit-testable (the startup path AND a bite test call THIS). It runs the two
 /// checks whose conjunction makes the frozen envelope binding on the running node:
 ///  1. the frozen artifact verify — content hash (freeze/identity), normative envelope, parity vs
-///     the running `contract.caps`;
+///     the frozen `ResourceCaps::default()` SSOT (the tunable serve fields are separately
+///     envelope-guarded in step 2, so parity must NOT use the effective `contract.caps`);
 ///  2. the EFFECTIVE serve-budget ceiling — the CLI-overridable values that actually reach
 ///     `ServeBudget` on BOTH serve paths (`config.iroh_max_*`) must be within the frozen envelope,
 ///     so an override can only TIGHTEN it. This is the check that closes the runtime bypass where
 ///     `--iroh-max-serve-nar-bytes 536870912` would serve 512 MiB while a defaults-only verify passed.
 fn enforce_budget_contract(contract: &OperatorContract, config: &Config) -> Result<(), String> {
-    // Parity is the artifact↔frozen-DEFAULT SSOT (that the code's frozen defaults match the reviewed
+    // Parity is the artifact↔frozen-DEFAULT SSOT (that the code's frozen defaults match the frozen
     // artifact) — it uses `ResourceCaps::default()`, NOT `contract.caps`, because `contract.caps` now
     // carries the EFFECTIVE (possibly TIGHTENED) serve values and a tightening must not fail parity.
     daemon::profile_budget::verify(contract.profile, &ResourceCaps::default())

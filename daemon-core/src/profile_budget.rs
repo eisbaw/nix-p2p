@@ -24,9 +24,10 @@
 //!    **256 MiB single, 1 GiB inflight, 120 s**. The artifact may not even DECLARE a looser
 //!    envelope than these normative constants. A profile at 512 MiB / 300 s FAILS
 //!    ([`BudgetError::EnvelopeExceeded`]) — this is the bite AC#10 mandates.
-//! 3. **Runtime parity** — the artifact's enforced fields must equal the live [`ResourceCaps`] the
-//!    binary runs with, so the frozen document and the running budget cannot silently diverge
-//!    ([`BudgetError::ParityMismatch`]).
+//! 3. **Runtime parity** — the artifact's admission-envelope fields must equal the binary's frozen
+//!    [`ResourceCaps::default`] SSOT, so the frozen document and the code's defaults cannot
+//!    silently diverge ([`BudgetError::ParityMismatch`]). The tunable serve fields are additionally
+//!    guarded post-override in step 2; parity itself is the default↔artifact check.
 //!
 //! An empty-input [`load`] yields [`BudgetError::Missing`], whose token is
 //! `PROFILE_BUDGET_ARTIFACT_MISSING` (PRD.md:945) — never a zero or "unbounded" default. NOTE on
@@ -75,9 +76,11 @@ use serde::{Deserialize, Serialize};
 
 use crate::operator::{ResourceCaps, SharingProfile};
 
-/// The frozen artifact, embedded at build time. The path-based [`load`] entry point is what the
-/// fail-closed `Missing` semantics are for (a tool reading it from disk); the daemon uses the
-/// embedded copy so it can never ship without its budget contract.
+/// The frozen artifact, embedded at build time via `include_str!` (a missing file is a compile
+/// error). The path-based [`load`] entry point / fail-closed `Missing` semantics have NO production
+/// caller today — they are exercised only by unit tests and are the fail-closed contract a future
+/// filesystem/Stage-B loader would use; the daemon uses the embedded copy so it can never ship
+/// without its budget contract.
 pub const PROFILE_BUDGET_ARTIFACT_JSON: &str =
     include_str!("../../artifacts/profile-budget-v1.json");
 
@@ -204,7 +207,7 @@ pub enum BudgetError {
     HashDrift {
         /// The expected (frozen) hash.
         expected: String,
-        /// The hash recomputed from the loaded bytes.
+        /// The hash recomputed from the artifact's canonical JCS content.
         actual: String,
     },
     /// The artifact's DECLARED envelope does not equal the normative `ENVELOPE_MAX_*` constants.
@@ -425,11 +428,13 @@ fn ms_to_ns(ms: u64, what: &'static str) -> Result<u64, BudgetError> {
         .ok_or(BudgetError::Overflow { what })
 }
 
-/// Parity: the artifact's FROZEN, NON-TUNABLE admission-envelope fields must equal the live
-/// [`ResourceCaps`] for `profile` — the single / inflight served NarSize, the serve duration and the
-/// discovery deadline. These are inherited by every profile and are NOT operator-tunable (the
-/// binaries always take them from [`ResourceCaps::default`]), so a divergence here is a code bug the
-/// gate must bite.
+/// Parity: the artifact's admission-envelope fields must equal the binary's frozen
+/// [`ResourceCaps::default`] for `profile` — the single / inflight served NarSize, the serve duration
+/// and the discovery deadline. This proves the code's FROZEN DEFAULTS match the frozen artifact. The
+/// served-NarSize and serve-duration fields ARE operator-tunable via `--iroh-max-serve-*` and are
+/// additionally guarded post-override so an override can only tighten them
+/// ([`check_serve_within_envelope`]); the discovery deadline is non-tunable (always the default). A
+/// divergence of the defaults here is a code bug the gate must bite.
 ///
 /// The distinct-announce COUNT is deliberately NOT parity-checked: it is an OPERATOR-TUNABLE budget
 /// (`daemon-libp2p --libp2p-announce-budget` overrides `caps.announce_distinct_paths_budget`), so a
@@ -621,10 +626,11 @@ pub fn preflight_lines(profile: SharingProfile) -> Vec<String> {
 /// never misled into reading it as an enforced ceiling (the `effective_lines` honesty rule extended
 /// to the artifact surface).
 const DECLARED_ONLY_MARKER: &str = "  [declared ceiling — not yet runtime-enforced; TASK-264]";
-/// The marker for a frozen, ENVELOPE-BOUNDED field: it is parity-checked against the running caps
-/// and its effective (post-override) value is guarded to never exceed the frozen ceiling
-/// ([`check_serve_within_envelope`]). These are the single/inflight served NarSize, serve duration,
-/// and discovery deadline.
+/// The marker for a frozen, ENVELOPE-BOUNDED field. The post-override-guarded fields — single/inflight
+/// served NarSize and serve duration ([`check_serve_within_envelope`]) — may be tightened by an
+/// override but never loosened past the frozen ceiling. The discovery deadline is also frozen and
+/// envelope-bound, but non-tunable: it is enforced by default-parity alone (there is no override to
+/// guard). All are default-parity-checked against the artifact.
 const ENFORCED_MARKER: &str = "  [enforced — envelope-bounded]";
 /// The marker for `announce_count`: it IS applied by the runtime announce limiter, but its value is
 /// OPERATOR-CHOSEN (`--libp2p-announce-budget`) and is NOT bounded by the safety envelope — it is

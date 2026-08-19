@@ -4,7 +4,7 @@ title: Wire runtime enforcement for the declared-only profile-budget fields
 status: To Do
 assignee: []
 created_date: '2026-08-19 10:55'
-updated_date: '2026-08-19 13:00'
+updated_date: '2026-08-19 13:28'
 labels:
   - production
   - operator
@@ -27,3 +27,9 @@ TASK-120 AC#10 froze the complete per-profile budget artifact (artifacts/profile
 - [ ] #2 parity_with_caps is extended to parity-check each newly-enforced field against its runtime limiter, and the module doc-comment stops listing it as declared-only
 - [ ] #3 The frozen artifact hash is re-frozen only if a value changes; otherwise unchanged
 <!-- AC:END -->
+
+## Implementation Notes
+
+<!-- SECTION:NOTES:BEGIN -->
+CODEX 120R3 CORRECTION 2026-08-19: the earlier note overstated DISCOVERY DEADLINE as post-override envelope-guarded. Correction: check_serve_within_envelope guards ONLY the operator-tunable serve fields — single served NarSize, inflight served NarSize, and serve duration (an --iroh-max-serve-* override may only TIGHTEN these). The discovery deadline is NON-TUNABLE (no override path): it is frozen and enforced by default-parity against the artifact alone, not by a post-override envelope guard. So the ENVELOPE-ENFORCED-post-override set is exactly {single_nar, inflight_nar, serve_duration}; discovery_deadline is frozen+default-parity-checked but non-tunable. The 14 declared-only fields remain frozen ceilings not wired to a runtime shaper (this task).
+<!-- SECTION:NOTES:END -->
