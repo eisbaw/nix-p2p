@@ -1,0 +1,197 @@
+{
+ "closure": {
+  "/nix/store/1mki18fkwb4j6hfqfl5s1xc7jw44431q-attr-2.6.0": {
+   "ca": null,
+   "compression": "zstd",
+   "deriver": "/nix/store/g3m7xqm6bayaxwqxpmbbz25hrmy56fpn-attr-2.6.0.drv",
+   "downloadHash": "sha256-t0KY1TH+bVTh5E4oNF1kcllwS0dz0JnBzuth81ArQPc=",
+   "downloadSize": 21052,
+   "narHash": "sha256-2esC6nyxurj6hpedY4FZGQ9a9/vnMfuzbGbw6vrTrag=",
+   "narSize": 90936,
+   "references": [
+    "/nix/store/1mki18fkwb4j6hfqfl5s1xc7jw44431q-attr-2.6.0",
+    "/nix/store/avld9cdn23zab2ssl30h2r6444rqh6ms-glibc-2.42-67"
+   ],
+   "registrationTime": null,
+   "signatures": [
+    "cache.nixos.org-1:jfG2c48jr4hObhXEM9a09a55ey4D/SiFt4gvu9ZBi2GK21zGGQzFnSOeuAy7ZK2ZjdCCKRQkN+HgSTOsir1TBw=="
+   ],
+   "ultimate": false,
+   "url": "nar/1a5dsgxfmw36djrzncg7zgvml3qrb60n77cphvxbifmigkm05syr.nar.zst"
+  },
+  "/nix/store/5kcc5rnag7yymmsr6yqs7993xpdqs62w-coreutils-9.11": {
+   "ca": null,
+   "compression": "zstd",
+   "deriver": "/nix/store/hwq1wqg0pwx1kdny3ayfxq7i2sfppjxq-coreutils-9.11.drv",
+   "downloadHash": "sha256-54pzqjGj03TCiAPZmWwQ4aQTWW2muyuHJSf65gvjfG4=",
+   "downloadSize": 805396,
+   "narHash": "sha256-s0k+byGZi+QtxhBxzRutZbJnrqdaxLPaRf0jGJrR3mU=",
+   "narSize": 1806736,
+   "references": [
+    "/nix/store/1mki18fkwb4j6hfqfl5s1xc7jw44431q-attr-2.6.0",
+    "/nix/store/5kcc5rnag7yymmsr6yqs7993xpdqs62w-coreutils-9.11",
+    "/nix/store/avld9cdn23zab2ssl30h2r6444rqh6ms-glibc-2.42-67",
+    "/nix/store/n50dfi236jpk9ci483593fl5kc1q2d5j-gmp-with-cxx-6.3.0",
+    "/nix/store/q0vs3p7ykhsmcinhh1cjfbc7jj8xf27q-acl-2.4.0"
+   ],
+   "registrationTime": null,
+   "signatures": [
+    "cache.nixos.org-1:zhZNGGpXhj/BZM7VaKrfwS30DLZsfOkHnMszOXYFGEfYeO5URqAaZRBBRUZlG3mBvRKCYM7O4JvB+N1y3X8sAg=="
+   ],
+   "ultimate": false,
+   "url": "nar/0rfys6d1h8zx8pdb7i2slyp6gck5mldwsw8hqqny92wr45pkwjdk.nar.zst"
+  },
+  "/nix/store/7vafhlh0lmcvi75jfyy09qwr4m3x1ks3-gcc-15.2.0-lib": {
+   "ca": null,
+   "compression": "zstd",
+   "deriver": "/nix/store/6akq1pfgkcvf9ja2xh4g53mwapj2a5v7-gcc-15.2.0.drv",
+   "downloadHash": "sha256-xrTzhwax8w6Wik5onvwIIez3ZPlVUtgCBAFqmt2jG+E=",
+   "downloadSize": 3101991,
+   "narHash": "sha256-4m2An4VVG8+wN1RrJ323IbQf0PPjAYaeLIpvZf0q9zs=",
+   "narSize": 10313656,
+   "references": [
+    "/nix/store/7vafhlh0lmcvi75jfyy09qwr4m3x1ks3-gcc-15.2.0-lib",
+    "/nix/store/avld9cdn23zab2ssl30h2r6444rqh6ms-glibc-2.42-67",
+    "/nix/store/pvc1kn4r39y8jk0wskzl8rb4m6jmy4fp-gcc-15.2.0-libgcc"
+   ],
+   "registrationTime": null,
+   "signatures": [
+    "cache.nixos.org-1:V+/CRFdI4IXfz1SsZitqUZEEXL8XpUylZTveLn8/KXJgB56jyhVKlPRiuH8qAyjhsCuRhPsW/kQT8uyW2rIYBg=="
+   ],
+   "ultimate": false,
+   "url": "nar/0fzp5bynavwa5jg8c0g3yg81zd11nxyjfssl6yqcy6smhngq0vg2.nar.zst"
+  },
+  "/nix/store/avld9cdn23zab2ssl30h2r6444rqh6ms-glibc-2.42-67": {
+   "ca": null,
+   "compression": "zstd",
+   "deriver": "/nix/store/fs49aawjsq9j0yiiblcnkbcmyxazp4xv-glibc-2.42-67.drv",
+   "downloadHash": "sha256-w2RfvcwyM/lNbdX/6ehrwiFYMRHoVmpXTYm1boMslV0=",
+   "downloadSize": 10245639,
+   "narHash": "sha256-+eccwsRvwpkghftChy8bYEh95amnj9YjKOV+7dHOP8A=",
+   "narSize": 35085432,
+   "references": [
+    "/nix/store/avld9cdn23zab2ssl30h2r6444rqh6ms-glibc-2.42-67",
+    "/nix/store/rdw0n35z6xhipyiq6sc8qv0mg7vrldaj-xgcc-15.2.0-libgcc",
+    "/nix/store/xidgjdv05b8yz6w6qrhk4mmjxm4l2zjf-libidn2-2.3.8"
+   ],
+   "registrationTime": null,
+   "signatures": [
+    "cache.nixos.org-1:Stj5hRHjVpfw2KrIuffz6DBKZalqwOaLorHyOglbJ3PnMAPMbcWo1WMEhPnKDR2g4VVhsN30jyUhq8blvtxBAQ=="
+   ],
+   "ultimate": false,
+   "url": "nar/1h1zrv8yszp550ixd3x7m7jpsj303cpqfhpvhlh9khkgqk11rrzr.nar.zst"
+  },
+  "/nix/store/fp6wnyklwzdncp0nvhdy9d5fnir0mjq5-libunistring-1.4.2": {
+   "ca": null,
+   "compression": "zstd",
+   "deriver": "/nix/store/j2q5wz1gxvv48wvk966sfr9fdv5l3kff-libunistring-1.4.2.drv",
+   "downloadHash": "sha256-kff+g1J0MSd+pSDqt9n4uecEaLHOvZr95tXTCz78F0k=",
+   "downloadSize": 796682,
+   "narHash": "sha256-B0svs1psbsjMs87sWx4pfZKUxu3Gn3pVvpFpAPWZ/50=",
+   "narSize": 2078944,
+   "references": [
+    "/nix/store/fp6wnyklwzdncp0nvhdy9d5fnir0mjq5-libunistring-1.4.2"
+   ],
+   "registrationTime": null,
+   "signatures": [
+    "cache.nixos.org-1:iJAxQCOVfjQ18xd3BadFP27Co1YA8dIYnsYouiCYa5i2clP1GyyHXahQFuPh/oK+RAPSY8fO26ltCPSxY6D2AQ=="
+   ],
+   "ultimate": false,
+   "url": "nar/17gzk7sh0sciprapm7y6xp3994kx54g5pv6fng6chvkcbarjyjq7.nar.zst"
+  },
+  "/nix/store/n50dfi236jpk9ci483593fl5kc1q2d5j-gmp-with-cxx-6.3.0": {
+   "ca": null,
+   "compression": "zstd",
+   "deriver": "/nix/store/133ll0h0idq4452h9yika9k2z6dqqldg-gmp-with-cxx-6.3.0.drv",
+   "downloadHash": "sha256-7FtMFfD9P81nIx+qy5Mabp3PeVCtw+Ij8IYed5rWgfE=",
+   "downloadSize": 348849,
+   "narHash": "sha256-Y4xYbCiRxgKasyREZql8pV9XGuJ4CehU6Vp3Ed2qDJ4=",
+   "narSize": 783432,
+   "references": [
+    "/nix/store/7vafhlh0lmcvi75jfyy09qwr4m3x1ks3-gcc-15.2.0-lib",
+    "/nix/store/avld9cdn23zab2ssl30h2r6444rqh6ms-glibc-2.42-67",
+    "/nix/store/n50dfi236jpk9ci483593fl5kc1q2d5j-gmp-with-cxx-6.3.0"
+   ],
+   "registrationTime": null,
+   "signatures": [
+    "cache.nixos.org-1:tgmr96y5SbEQVheATEtmuq7DZVvXLvW6om3m4PWBm17otv5aFaikaRgBGD3zpOAy2bV96Sno2HGKPjttb50UDg=="
+   ],
+   "ultimate": false,
+   "url": "nar/17hcmbfi2xssx5afh2bqw8d5fpx5gjlnci14nfd05ili51n5i333.nar.zst"
+  },
+  "/nix/store/pvc1kn4r39y8jk0wskzl8rb4m6jmy4fp-gcc-15.2.0-libgcc": {
+   "ca": null,
+   "compression": "zstd",
+   "deriver": "/nix/store/6akq1pfgkcvf9ja2xh4g53mwapj2a5v7-gcc-15.2.0.drv",
+   "downloadHash": "sha256-/uz3EchWFjtUmtQ7K1AHCxLPweTQk+JPnCJioZjA/no=",
+   "downloadSize": 92751,
+   "narHash": "sha256-GkJzVhEtaWEUg0P9+A9Qq5nZe001soxylzRNlSUO76M=",
+   "narSize": 197752,
+   "references": [],
+   "registrationTime": null,
+   "signatures": [
+    "cache.nixos.org-1:fTP5q8dDJzdvuwz5YXjVerU7cAUt4EJmJ2sMwn8pLC7e7WAcoqBumO/APwN+gQO06S7jtT7Iyq/+IEljAHjjDQ=="
+   ],
+   "ultimate": false,
+   "url": "nar/18zg1qjrak9ljxr8rcim9mxxk6dba07ziza3hca62s9d25b76hhs.nar.zst"
+  },
+  "/nix/store/q0vs3p7ykhsmcinhh1cjfbc7jj8xf27q-acl-2.4.0": {
+   "ca": null,
+   "compression": "zstd",
+   "deriver": "/nix/store/irz7q5j5djjmgp27hvmj5wnbcswcp15f-acl-2.4.0.drv",
+   "downloadHash": "sha256-IlC5NnvOB8WkdSZnahixp1EeR3PWVDZAkzx2Za3MfMs=",
+   "downloadSize": 36641,
+   "narHash": "sha256-sQGKAnWsWL/br3ATdi8aK6pWWwvWDMiHy22N+sjiLEI=",
+   "narSize": 137600,
+   "references": [
+    "/nix/store/avld9cdn23zab2ssl30h2r6444rqh6ms-glibc-2.42-67",
+    "/nix/store/q0vs3p7ykhsmcinhh1cjfbc7jj8xf27q-acl-2.4.0"
+   ],
+   "registrationTime": null,
+   "signatures": [
+    "cache.nixos.org-1:k78lSSkuOI8PCqY3Z8a0amtC0QwV2a54IGlHAIZDVAVlXN1NYJIVOjbJmi0BdWU73GSC7Sgnp67F6UKD5r2QAg=="
+   ],
+   "ultimate": false,
+   "url": "nar/0hicwb4gm3bdrf3wh36n1ddmdaib38ppc4vhmzdvyn5cfl18l0di.nar.zst"
+  },
+  "/nix/store/rdw0n35z6xhipyiq6sc8qv0mg7vrldaj-xgcc-15.2.0-libgcc": {
+   "ca": null,
+   "compression": "zstd",
+   "deriver": "/nix/store/ngvmv5byddgbm7gcyc96rmnw43cgal9w-xgcc-15.2.0.drv",
+   "downloadHash": "sha256-Dt8UTiOcV+rDQRXb3TroPcUq8PmZENcN8L11dGhjVKs=",
+   "downloadSize": 92637,
+   "narHash": "sha256-u2gDQqzCTqFkyG5vv4lk/1NJNN5KX080ISYzHSVaviY=",
+   "narSize": 197672,
+   "references": [],
+   "registrationTime": null,
+   "signatures": [
+    "cache.nixos.org-1:ZBwtVoy3eokmrdQlZmPv0XiD1AQipnRGE/DYYg8Qm6OGRYfXTU9mvBQrYMyF7NIBi76HQtbVGG5FPxh8wZ3iDw=="
+   ],
+   "ultimate": false,
+   "url": "nar/09myb8jiscr644s4ypsavqs4jlzzcj4vyvvfr1ja2kn2mi106s5v.nar.zst"
+  },
+  "/nix/store/xidgjdv05b8yz6w6qrhk4mmjxm4l2zjf-libidn2-2.3.8": {
+   "ca": null,
+   "compression": "zstd",
+   "deriver": "/nix/store/8injyx1z38allpqjwycg8c7dm9r93mzk-libidn2-2.3.8.drv",
+   "downloadHash": "sha256-qVAe5e+u3vksbO8OitilhWNwTyH7B7XXWCJRGTOtUlM=",
+   "downloadSize": 142618,
+   "narHash": "sha256-WZInQ1AE4SxVAGGxV2gBUoqSCWgxJP/luU6w+2vTBek=",
+   "narSize": 368176,
+   "references": [
+    "/nix/store/fp6wnyklwzdncp0nvhdy9d5fnir0mjq5-libunistring-1.4.2",
+    "/nix/store/xidgjdv05b8yz6w6qrhk4mmjxm4l2zjf-libidn2-2.3.8"
+   ],
+   "registrationTime": null,
+   "signatures": [
+    "cache.nixos.org-1:UJZb697xKzQrmswZCHTEaNBCWRgOXadKkWLhSzj6+xwvCnzmJ28QOA6qKCoH0vZz5+OZpzSJ5zRqWRl4hrxOBA=="
+   ],
+   "ultimate": false,
+   "url": "nar/1s85sdmzpc2fp7jzy91id04r52jj05l5gcb101ajrq84a11jg4jr.nar.zst"
+  }
+ },
+ "flakeref": "github:NixOS/nixpkgs/445d861c6d31b4af0c79d8d4be2331f762a361d7",
+ "pin_label": "A",
+ "pkg": "coreutils",
+ "root_outpath": "/nix/store/5kcc5rnag7yymmsr6yqs7993xpdqs62w-coreutils-9.11"
+}

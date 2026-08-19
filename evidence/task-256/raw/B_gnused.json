@@ -1,0 +1,100 @@
+{
+ "closure": {
+  "/nix/store/2745pvn6cv32yn9gp2rlqiqhqgs01pb5-libunistring-1.2": {
+   "ca": null,
+   "compression": "xz",
+   "deriver": "/nix/store/k67vi0d42n33f1zr4wnym7dmcyhm4q54-libunistring-1.2.drv",
+   "downloadHash": "sha256-AXOkAodKCQG2OxQ2b4Kf1MlsstYg1R6ehQK/TR00MpU=",
+   "downloadSize": 417896,
+   "narHash": "sha256-WZ+KDSJSpfwtPncLNXB2zV17agbkuZdkL/DCUzV+KoA=",
+   "narSize": 1856616,
+   "references": [
+    "/nix/store/2745pvn6cv32yn9gp2rlqiqhqgs01pb5-libunistring-1.2"
+   ],
+   "registrationTime": null,
+   "signatures": [
+    "cache.nixos.org-1:xXzwj90HbdE6ttKQjDwb0Mou8BvTPk8B/w34hRJ1eh1YvqceWhsfIEs6MPPsLE9A6GXpreg6P+5rEPwTg20WAA=="
+   ],
+   "ultimate": false,
+   "url": "nar/159j6hflvgq2hng1xm90ssr6rjflky16ydhl7fv022aahw1a8wq1.nar.xz"
+  },
+  "/nix/store/5m9amsvvh2z8sl7jrnc87hzy21glw6k1-glibc-2.40-66": {
+   "ca": null,
+   "compression": "xz",
+   "deriver": "/nix/store/q8capfh88g65xmsrcv6qaczgy804n7gi-glibc-2.40-66.drv",
+   "downloadHash": "sha256-beSO6FxIGsZ3pzY5zXd+aQ8As2tsxvyh1xqUlwM3fVM=",
+   "downloadSize": 6533868,
+   "narHash": "sha256-TMkaP9MrLtAXlBzoT+GH26lUjaWC2lYsQ8lZksqKg8I=",
+   "narSize": 30220560,
+   "references": [
+    "/nix/store/5m9amsvvh2z8sl7jrnc87hzy21glw6k1-glibc-2.40-66",
+    "/nix/store/c47b963idja6h1d8n91pf28v2jcq96kp-libidn2-2.3.7",
+    "/nix/store/y4d9iir0yqmrcswaqfi368d8m1rkv14s-xgcc-13.3.0-libgcc"
+   ],
+   "registrationTime": null,
+   "signatures": [
+    "cache.nixos.org-1:rhiXR3s4E64/iaOn77zueVtQ8o342KoU17Q+pDe5wDqxGoiQKJAIxTi6fygKCQjHux4agsm7IrHT39hXcq8qBw=="
+   ],
+   "ultimate": false,
+   "url": "nar/0lvx6w1rg50ssyhzrikcdfrh03v9grvwsf9nlxvwc6j8bkl8xr3d.nar.xz"
+  },
+  "/nix/store/c47b963idja6h1d8n91pf28v2jcq96kp-libidn2-2.3.7": {
+   "ca": null,
+   "compression": "xz",
+   "deriver": "/nix/store/dc035pbndywzgnj7mh4wnjgj6h6d0352-libidn2-2.3.7.drv",
+   "downloadHash": "sha256-ec1xpqcfUGQlAqXUpJGpnSXrN6XOWxtcp62JOh9dt2o=",
+   "downloadSize": 89840,
+   "narHash": "sha256-1LwHty4O7kDOuBPlRWM6W39GZ1WNLQCsFAuWOaz33z4=",
+   "narSize": 361096,
+   "references": [
+    "/nix/store/2745pvn6cv32yn9gp2rlqiqhqgs01pb5-libunistring-1.2",
+    "/nix/store/c47b963idja6h1d8n91pf28v2jcq96kp-libidn2-2.3.7"
+   ],
+   "registrationTime": null,
+   "signatures": [
+    "cache.nixos.org-1:AZhzsbC7CEtWYdFcDkUgzG14OX11wD9BmprerVtQ1Od4l+DWC/XljUoR/Yk3VTOdPjU6jiTJfSRpY2rn9wrYCQ=="
+   ],
+   "ultimate": false,
+   "url": "nar/0smpblgkm2ddlxf1nnyfllvyn9cxm68s9m5508jn8l0zlyk73kbr.nar.xz"
+  },
+  "/nix/store/nw2lnn0jwp2w5xmwr93h2a99dz4d2n7w-gnused-4.9": {
+   "ca": null,
+   "compression": "xz",
+   "deriver": "/nix/store/2badclj40qb8bwxmgz0z578ah6b3prmb-gnused-4.9.drv",
+   "downloadHash": "sha256-I2Yqc14Fflh7ZaOTSONK7j/HTqYIRMR5S6F8f2glnBU=",
+   "downloadSize": 145896,
+   "narHash": "sha256-Lh+Wr6ZPGsW6qXphwDAIuZkKk+DFnpq6LDdukl0WAck=",
+   "narSize": 735312,
+   "references": [
+    "/nix/store/5m9amsvvh2z8sl7jrnc87hzy21glw6k1-glibc-2.40-66",
+    "/nix/store/nw2lnn0jwp2w5xmwr93h2a99dz4d2n7w-gnused-4.9"
+   ],
+   "registrationTime": null,
+   "signatures": [
+    "cache.nixos.org-1:SdJhnj09hVYkr5JA6e6A4R1G/S131R9sbn4SetHRud6hfMO0QNLGmyAttmT1R679yG818DhK+fGrMXExzknqCA=="
+   ],
+   "ultimate": false,
+   "url": "nar/05cw4ml7yz519dww8i08lr7cfgzf9bili4x3cmxmhzh5brrjlri3.nar.xz"
+  },
+  "/nix/store/y4d9iir0yqmrcswaqfi368d8m1rkv14s-xgcc-13.3.0-libgcc": {
+   "ca": null,
+   "compression": "xz",
+   "deriver": "/nix/store/fwh0qbryiqv54xj9mrhdky1rj8d9xn8n-xgcc-13.3.0.drv",
+   "downloadHash": "sha256-YuptBj7gh49rFqdubNA1ECrPBI1m7gB9SsJCcKgSRCA=",
+   "downloadSize": 59120,
+   "narHash": "sha256-C6bMzrYUK1ySg1GeVE7r1T63HBEpYd22ESGJEJsdvCw=",
+   "narSize": 159624,
+   "references": [],
+   "registrationTime": null,
+   "signatures": [
+    "cache.nixos.org-1:GAvuNEPseRHFTMLAlx9wIhbZcZVkkfJhFPtdzNiuGkfRHYI9lFP5n8ATtP40ZRahVDRvvNIDCBXnv2EeI0cwDw=="
+   ],
+   "ultimate": false,
+   "url": "nar/08242al70hn299yh1vk6il2cyahh6p86qvm72rmqz1z07q36vsk2.nar.xz"
+  }
+ },
+ "flakeref": "github:NixOS/nixpkgs/50ab793786d9de88ee30ec4e4c24fb4236fc2674",
+ "pin_label": "B",
+ "pkg": "gnused",
+ "root_outpath": "/nix/store/nw2lnn0jwp2w5xmwr93h2a99dz4d2n7w-gnused-4.9"
+}

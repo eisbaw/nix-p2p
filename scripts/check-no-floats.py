@@ -96,6 +96,7 @@ SCANNED = [
     "scalefit.py",
     "scale_sweep.py",
     "measure_real_gap.py",
+    "task256_closure_overlap.py",
 ]
 
 # A function NAME carrying one of these (lowercased substring) marks its body a

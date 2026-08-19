@@ -1,0 +1,247 @@
+{
+  "cells": {
+    "a_same_pin__cold_start": {
+      "narSize_uncompressed_bytes_den": 68039832,
+      "narSize_uncompressed_bytes_display": "55.4531% (exact 37730224/68039832)",
+      "narSize_uncompressed_bytes_num": 37730224,
+      "paths_den": 21,
+      "paths_display": "19.0476% (exact 4/21)",
+      "paths_num": 4,
+      "supply_captures": [
+        {
+          "capture_file": "A_hello.json",
+          "n_paths": 5,
+          "pin_label": "A",
+          "pkg": "hello",
+          "root_outpath": "/nix/store/6i6xl6bmcpxqd51m8nlva40d5c1bhndx-hello-2.12.3",
+          "sha256": "2d2e1cc85b0211cdd06a1e64c1e3fb74556d768abeba38b6b4ba0c3bb399cbe5"
+        }
+      ],
+      "supply_n_paths_total": 5,
+      "supply_pin_label": "A",
+      "supply_pkgs": [
+        "hello"
+      ]
+    },
+    "a_same_pin__steady_state": {
+      "narSize_uncompressed_bytes_den": 68039832,
+      "narSize_uncompressed_bytes_display": "99.4378% (exact 67657296/68039832)",
+      "narSize_uncompressed_bytes_num": 67657296,
+      "paths_den": 21,
+      "paths_display": "95.2381% (exact 20/21)",
+      "paths_num": 20,
+      "supply_captures": [
+        {
+          "capture_file": "A_hello.json",
+          "n_paths": 5,
+          "pin_label": "A",
+          "pkg": "hello",
+          "root_outpath": "/nix/store/6i6xl6bmcpxqd51m8nlva40d5c1bhndx-hello-2.12.3",
+          "sha256": "2d2e1cc85b0211cdd06a1e64c1e3fb74556d768abeba38b6b4ba0c3bb399cbe5"
+        },
+        {
+          "capture_file": "A_coreutils.json",
+          "n_paths": 10,
+          "pin_label": "A",
+          "pkg": "coreutils",
+          "root_outpath": "/nix/store/5kcc5rnag7yymmsr6yqs7993xpdqs62w-coreutils-9.11",
+          "sha256": "5131642680e3f74bba4d1fe39ebd1fd7d85e81f812a3531ee976a4e58b1d89fd"
+        },
+        {
+          "capture_file": "A_bash.json",
+          "n_paths": 7,
+          "pin_label": "A",
+          "pkg": "bash",
+          "root_outpath": "/nix/store/sz15z7hh6c2dycdbh1h45shh8bvxda88-bash-interactive-5.3p9",
+          "sha256": "6a26b040cd095580394e6171d828c7920242209569929709ddc8868f201f311a"
+        },
+        {
+          "capture_file": "A_git.json",
+          "n_paths": 84,
+          "pin_label": "A",
+          "pkg": "git",
+          "root_outpath": "/nix/store/8yh8zbb0r4na7gkqk0db0gbdid2ax7zm-git-2.54.0",
+          "sha256": "ed106453858e1786656565de8cd78bfcd3acab4dd4fd8fb1c9f1daf72ab93332"
+        },
+        {
+          "capture_file": "A_wget.json",
+          "n_paths": 8,
+          "pin_label": "A",
+          "pkg": "wget",
+          "root_outpath": "/nix/store/vnjdvajhv139vr9rjkml5195m2bcrg87-wget-1.25.0",
+          "sha256": "494eb81d4f820e07f789099eec810b961a81a6b48c8aa0c62b6a9d9e9fb579d7"
+        },
+        {
+          "capture_file": "A_gnused.json",
+          "n_paths": 5,
+          "pin_label": "A",
+          "pkg": "gnused",
+          "root_outpath": "/nix/store/c3pj1yrqn88cc8zkr5hywmvy15m0r6c9-gnused-4.10",
+          "sha256": "fce973991fe526005f82b1baf471bb407f697049e7e9a6655c3d2df288df3070"
+        },
+        {
+          "capture_file": "A_gnugrep.json",
+          "n_paths": 6,
+          "pin_label": "A",
+          "pkg": "gnugrep",
+          "root_outpath": "/nix/store/q0n8l9xz66pbpj37fxk5vid6dsfpx5vb-gnugrep-3.12",
+          "sha256": "a8bc379a2696fb64133fb440ca950a9145867579a65bbaba2db91951ca11cc2f"
+        },
+        {
+          "capture_file": "A_gzip.json",
+          "n_paths": 6,
+          "pin_label": "A",
+          "pkg": "gzip",
+          "root_outpath": "/nix/store/nmrwsdjdncfn7n9drhjfah9pp0c80lav-gzip-1.14",
+          "sha256": "36c07dcf4e35b6ebcf498ef5059758932715d4b022eff18b62f38e6990b03e86"
+        }
+      ],
+      "supply_n_paths_total": 86,
+      "supply_pin_label": "A",
+      "supply_pkgs": [
+        "hello",
+        "coreutils",
+        "bash",
+        "git",
+        "wget",
+        "gnused",
+        "gnugrep",
+        "gzip"
+      ]
+    },
+    "b_cross_rev__cold_start": {
+      "narSize_uncompressed_bytes_den": 68039832,
+      "narSize_uncompressed_bytes_display": "0.0000% (exact 0/68039832)",
+      "narSize_uncompressed_bytes_num": 0,
+      "paths_den": 21,
+      "paths_display": "0.0000% (exact 0/21)",
+      "paths_num": 0,
+      "supply_captures": [
+        {
+          "capture_file": "B_hello.json",
+          "n_paths": 5,
+          "pin_label": "B",
+          "pkg": "hello",
+          "root_outpath": "/nix/store/hwz2l7ihv2skq7gr5l3paavs3rr9il7z-hello-2.12.1",
+          "sha256": "073988ad930c5bfd85cabf251ce0efadf69a6b1ab65e61bd2dce0f0881cc8c17"
+        }
+      ],
+      "supply_n_paths_total": 5,
+      "supply_pin_label": "B",
+      "supply_pkgs": [
+        "hello"
+      ]
+    },
+    "b_cross_rev__steady_state": {
+      "narSize_uncompressed_bytes_den": 68039832,
+      "narSize_uncompressed_bytes_display": "0.0000% (exact 0/68039832)",
+      "narSize_uncompressed_bytes_num": 0,
+      "paths_den": 21,
+      "paths_display": "0.0000% (exact 0/21)",
+      "paths_num": 0,
+      "supply_captures": [
+        {
+          "capture_file": "B_hello.json",
+          "n_paths": 5,
+          "pin_label": "B",
+          "pkg": "hello",
+          "root_outpath": "/nix/store/hwz2l7ihv2skq7gr5l3paavs3rr9il7z-hello-2.12.1",
+          "sha256": "073988ad930c5bfd85cabf251ce0efadf69a6b1ab65e61bd2dce0f0881cc8c17"
+        },
+        {
+          "capture_file": "B_coreutils.json",
+          "n_paths": 10,
+          "pin_label": "B",
+          "pkg": "coreutils",
+          "root_outpath": "/nix/store/f8bb29v1w8mhkkxc15xan6mxvbkcbg3s-coreutils-9.5",
+          "sha256": "bfb5c4f59c0c6584e6974aae0350f02153163764ac08adb738d15d5acd4761ab"
+        },
+        {
+          "capture_file": "B_bash.json",
+          "n_paths": 5,
+          "pin_label": "B",
+          "pkg": "bash",
+          "root_outpath": "/nix/store/mjhcjikhxps97mq5z54j4gjjfzgmsir5-bash-5.2p37",
+          "sha256": "3f6dd050cf3fde0dee052c3675bcdb4cf887d5f1a938da77871cd99fcdf8bd1f"
+        },
+        {
+          "capture_file": "B_git.json",
+          "n_paths": 78,
+          "pin_label": "B",
+          "pkg": "git",
+          "root_outpath": "/nix/store/49ny89ra9jhj59j0m6xfqhi5sm0r0yl6-git-2.47.2",
+          "sha256": "9498c1c7d2f3d2340de5bfb87870a37b4375a87158a1979887543051dccde76f"
+        },
+        {
+          "capture_file": "B_wget.json",
+          "n_paths": 9,
+          "pin_label": "B",
+          "pkg": "wget",
+          "root_outpath": "/nix/store/d4kgzhxwwrfz0nqgqbrz8z153mhqphr7-wget-1.25.0",
+          "sha256": "21c7e04a2d420b2a3c3602f015eeef597e4f74ef5f27d81666650461b2fcaa6a"
+        },
+        {
+          "capture_file": "B_gnused.json",
+          "n_paths": 5,
+          "pin_label": "B",
+          "pkg": "gnused",
+          "root_outpath": "/nix/store/nw2lnn0jwp2w5xmwr93h2a99dz4d2n7w-gnused-4.9",
+          "sha256": "9cb3911b7ae8f5b8a93040cfb6907277160a2f530ac511cddeff7cc75ad5bc82"
+        },
+        {
+          "capture_file": "B_gnugrep.json",
+          "n_paths": 6,
+          "pin_label": "B",
+          "pkg": "gnugrep",
+          "root_outpath": "/nix/store/nnskpiqakc1kxpbrr9lbdcqj9jflk03m-gnugrep-3.11",
+          "sha256": "c914dc700c149457074b3fa7674f37fd4f02cd71c3ea959fef937771feefbd97"
+        },
+        {
+          "capture_file": "B_gzip.json",
+          "n_paths": 6,
+          "pin_label": "B",
+          "pkg": "gzip",
+          "root_outpath": "/nix/store/2jamrqz6pl1bsswv4fm3jsr7v1dal64z-gzip-1.13",
+          "sha256": "b28e4c25bf0bcbfa4db8d640b6d5ebc5ac8ebdb62b06be7e1a373f4e58cda227"
+        }
+      ],
+      "supply_n_paths_total": 82,
+      "supply_pin_label": "B",
+      "supply_pkgs": [
+        "hello",
+        "coreutils",
+        "bash",
+        "git",
+        "wget",
+        "gnused",
+        "gnugrep",
+        "gzip"
+      ]
+    }
+  },
+  "finding": {
+    "cross_rev_steady_overlap_paths": "0.0000% (exact 0/21)",
+    "interpretation": "The (a)-vs-(b) gap IS the finding: nix store paths are input-addressed, so a cross-rev peer path-matches almost nothing of a client's closure (bytes-per-hit is irrelevant when hit-rate is ~0). Meaningful peer offload requires supply on the SAME nixpkgs pin. See results README.",
+    "same_pin_cold_overlap_paths": "19.0476% (exact 4/21)",
+    "same_pin_steady_STRICTLY_beats_cross_rev_steady": true,
+    "same_pin_steady_STRICTLY_beats_same_pin_cold": true,
+    "same_pin_steady_overlap_paths": "95.2381% (exact 20/21)"
+  },
+  "label": "decision-input ONLY \u2014 NOT policy-training, NOT holdout, NOT a PRD success claim (AC#7)",
+  "measures": "peer HIT-RATE potential = fraction of a cold build's closure (DEMAND) already resident on a peer (SUPPLY), computed offline from nix path-info closures. NO protocol code, NO network, NO containers.",
+  "no_floats_in_decisions": true,
+  "provenance": {
+    "demand_capture_file": "A_curl.json",
+    "demand_capture_sha256": "119c7651009806363d493acb84a4eec43ef791f130b21ab94efa56a699ffffe5",
+    "demand_downloadSize_compressed_wire_bytes_CONTEXT_NEVER_COMPARED": 22083389,
+    "demand_n_paths": 21,
+    "demand_narSize_uncompressed_bytes": 68039832,
+    "demand_pin_label": "A",
+    "demand_pkg": "curl",
+    "demand_root_outpath": "/nix/store/82knz13wjnsgpihsfaywrhpy6prjks6v-curl-8.21.0-bin",
+    "pin_A_rev_same_pin": "445d861c6d31b4af0c79d8d4be2331f762a361d7",
+    "pin_B_rev_cross_rev": "50ab793786d9de88ee30ec4e4c24fb4236fc2674"
+  },
+  "task": "task-256",
+  "unit_discipline": "overlap ratios are in PATH-COUNT and uncompressed-narSize units, kept separate; the compressed-wire downloadSize is a DIFFERENT unit, recorded as context and NEVER compared to a narSize"
+}
