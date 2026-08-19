@@ -4,7 +4,7 @@ title: 'HARDENING (wave-2a): claim-schema conformance + NarSize-abort spam defen
 status: To Do
 assignee: []
 created_date: '2026-08-08 20:13'
-updated_date: '2026-08-19 16:53'
+updated_date: '2026-08-19 17:25'
 labels:
   - hardening
 dependencies:
@@ -124,4 +124,18 @@ whatever suppression you choose can drop repeats without losing the signal.
 
 Suggested shape, not prescribed: rate-limit per (reason, peer) with a periodic
 'suppressed N' line, so a burst costs one line and the count survives.
+
+TASK-46 delivered (test-only + one doc comment; no wire/logic change). One file: fabric-libp2p/src/nar.rs (+158).
+
+FINDINGS-FIRST TRIAGE: on the SHIPPED path the abort and claim-conformance were ALREADY implemented + tested by prior tasks. daemon/src/transport_fetch.rs is the IROH-bridge path (prune-pending TASK-202), NOT shipped; the shipped fetch is daemon-libp2p -> peer_fabric::Libp2pTransport -> swarm -> read_response_streamed_since, which threads Some(meta.nar_size) from daemon-core/src/server.rs:228 (the signed narinfo NarSize) as expected_size. So TASK-46 hardens, it does not build from scratch.
+
+AC#2 (DoS, highest value) DONE. Added over_declared_body_aborts_before_any_body_byte_is_downloaded: a HeaderThenExplodingBody reader yields ONLY the 10-byte v4 prelude declaring an 8 GiB blob and COUNTS any body pull; the abort must leave body_pulls==0 (the wasted-download never begins - strictly stronger than the pre-existing read_rejects_* Cursor test, which cannot witness body-not-read). Two cases attribute the bite: cold-start (expected_size=None) ISOLATES the raw_size>cap guard (the raw_size!=expected sibling is skipped on the None path, so it is the ONLY body guard); signed (8 GiB vs 4 KiB) shows the redundant belt-and-braces. Plus a within-bound contrast that streams fully. MUTATION-PROVEN: disabling if raw_size>cap makes the cold-start body_pulls==0 assertion bite (RED), because the code enters verified_nar_stream/pump_bao_wire and pulls the 8 GiB body; restored + re-green. Threshold + reported over-size are in signed-NarSize (uncompressed RawNarV1) units, never compressed FileSize. Also documented the TRUST PRECONDITION at the abort site: the ceiling is sound only because expected_size is a SIGNED NarSize from a trusted narinfo (cache.nixos.org wave-2a); the claim schema carries NO size field; a v2 signed-narinfo-relay via the reserved Claim.relay/Claim.signatures slots must carry its own signature trust.
+
+AC#1 (conformance) VERIFIED already-satisfied + bounded. The claim wire is FROZEN and was NOT changed. malformed->reject fail-closed (malformed_known_payload/transport_in_a_claim_errors, malformed_bytes_are_a_clean_error_not_a_panic), version-skew->reject (wrong_schema_version_is_rejected_cleanly, hold_query_wrong_version_is_rejected_cleanly), unknown-variant->tolerate-drop (unknown_kind_is_tolerated_inert_and_not_carried) all green (72 claim tests). Bounded fuzz already exists via prop_support::runner (FIXED deterministic seed + small env-tunable PROPTEST_CASES in just test / nix flake check; free random seed + larger count only under just prop) - NOT a cargo-fuzz soak: prop_decoders_never_panic_on_arbitrary_bytes (0..4096 bytes), prop_claim_wire_roundtrips, prop_oversize_valid_claim_is_rejected_by_the_size_cap, offer count/byte caps. Representative fail-closed INTEGRITY bite shown by mutation: forcing the known/unknown decision off makes a malformed whole_nar payload silently inert -> malformed_known_payload_in_a_claim_errors RED; restored.
+
+AC#3 (deferred label) SATISFIED. No floating wave-2a claim finding: all are already explicit tasks (TASK-227 TEXT residual, TASK-244 whitespace frame-inflation, TASK-55 lossless relay, TASK-107 batch log hygiene). The only deferred LABEL in the repo is deferred-pending-202 (iroh/BT prune-pending, a different concept). New follow-up filed from mped Finding 4: TASK-267 (SignedNarSize newtype to enforce the trust boundary at the type level rather than by comment).
+
+AC#4 (iroh clone) SKIPPED by design: transport_iroh.rs is the deprioritized iroh path (prune-pending TASK-202); the brief says do it only if trivial and iroh is deprioritized. Not touched.
+
+GATE: fmt OK, clippy -p fabric-libp2p --all-targets -D warnings clean, check-no-floats green, cargo test -p fabric-libp2p --lib 140 passed, -p daemon-core --lib claim 72 passed, just e2e 11/11 scenarios PASS (byte-identity + tamper + libp2p + mdns) RC=0. Disk 25G->21G, steady. Reviews: mped-architect GO-on-substance (3 fixes applied: body_pulls assertion reordered to bite FIRST/attribute to the DoS boundary; dropped Bao-tree-alloc overstatement; named the reserved relay/signatures fields), qa-test-runner all green. codex cross-model review pending (owner-run).
 <!-- SECTION:NOTES:END -->

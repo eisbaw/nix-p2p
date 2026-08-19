@@ -702,6 +702,23 @@ where
                 )));
             }
             let raw_size = u64::from_le_bytes(header[1..].try_into().expect("8-byte size"));
+            // The risk-6 size abort (PRD risk 6). `raw_size` is the provider-DECLARED
+            // uncompressed geometry; `cap` is the signed NarSize the CONSUMER holds. Rejecting
+            // here - before `verified_nar_stream` spawns its incremental verifier or
+            // `pump_bao_wire` pulls one body byte - is what bounds a lying claim's wasted-download
+            // DoS to a 10-byte header read (proven by
+            // `over_declared_body_aborts_before_any_body_byte_is_downloaded`).
+            //
+            // TRUST PRECONDITION (TASK-46, do not weaken silently): this bound is only sound
+            // because `expected_size` is the SIGNED NarSize from a TRUSTED narinfo - in wave-2a,
+            // cache.nixos.org (`server.rs` threads `Some(meta.nar_size)` from the correlated
+            // narinfo). The p2p CLAIM/offer schema carries NO size field of its own, by design,
+            // so a peer cannot move this ceiling. The reserved `Claim.relay`/`Claim.signatures`
+            // slots (inert in v1, `daemon-core/src/claim.rs`) are where a future v2
+            // signed-narinfo-relay would let a PEER supply the narinfo; that path must carry its
+            // own signature trust, or this abort degrades to mere self-consistency (declared ==
+            // its own declaration). Units: both sides are uncompressed `RawNarV1` bytes, NEVER a
+            // compressed FileSize.
             let cap = expected_size.unwrap_or(MAX_NAR_RESPONSE_BYTES);
             if raw_size > cap {
                 return Err(TransferError::TooLarge {
@@ -2428,6 +2445,7 @@ mod tests {
     // -------------------------------------------------------------------------
 
     use std::pin::Pin;
+    use std::sync::atomic::AtomicUsize;
     use std::task::{Context, Poll};
 
     /// A short body-idle bound for the unit bites: long enough not to flake on a scheduler
@@ -2861,6 +2879,146 @@ mod tests {
             }
             other => panic!("expected TooLarge, got {other}"),
         }
+    }
+
+    /// A hostile provider that DECLARES a raw geometry far above the signed cap and stands
+    /// ready to stream an attacker-chosen huge body. This reader hands over ONLY the 10-byte
+    /// v4 prelude (status + codec + declared `raw_size`); every byte past it is an EXPLODING
+    /// tail that RECORDS the read (`body_reads`). It is the physical embodiment of the risk-6
+    /// wasted-download DoS: if the fetch pulls the body, that pull is observable.
+    ///
+    /// Phases: header bytes drain from `prelude`; any read past it is a body read.
+    struct HeaderThenExplodingBody {
+        prelude: io::Cursor<Vec<u8>>,
+        body_reads: Arc<AtomicUsize>,
+    }
+
+    impl AsyncRead for HeaderThenExplodingBody {
+        fn poll_read(
+            mut self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            buf: &mut [u8],
+        ) -> Poll<io::Result<usize>> {
+            let served = self.prelude.position();
+            let total = self.prelude.get_ref().len() as u64;
+            if served < total {
+                // Still inside the 10-byte prelude: serve header bytes verbatim.
+                return Poll::Ready(io::Read::read(&mut self.prelude, buf));
+            }
+            // The body was requested. In a real fetch this is where the attacker's
+            // over-declared blob would start streaming. Record it and end the stream so
+            // the failure surfaces as a missed abort, not a hang.
+            self.body_reads.fetch_add(1, Ordering::SeqCst);
+            Poll::Ready(Ok(0))
+        }
+    }
+
+    /// Drive a `read_response_streamed` against a provider that declares `declared` raw bytes
+    /// and then EXPLODES on the body, returning the abort error and how many times the body was
+    /// pulled. `body_pulls == 0` is the risk-6 DoS property: the over-declared blob never began
+    /// downloading. No `declared`-sized buffer is ever allocated - the body is refused first.
+    async fn abort_pulls_for(declared: u64, signed: Option<u64>) -> (TransferError, usize) {
+        let content = Blake3Digest::from_bytes([0x33; 32]);
+        // The 10-byte v4 prelude ONLY: status, RAW codec, 8-byte LE declared size.
+        let mut prelude = vec![STATUS_NAR, WireCodec::Raw.wire()];
+        prelude.extend_from_slice(&declared.to_le_bytes());
+        let body_reads = Arc::new(AtomicUsize::new(0));
+        let mut reader = HeaderThenExplodingBody {
+            prelude: io::Cursor::new(prelude),
+            body_reads: body_reads.clone(),
+        };
+        let err = read_response_streamed(&mut reader, signed, IDLE, &content)
+            .await
+            .expect_err("an over-declared body must abort, never stream");
+        (err, body_reads.load(Ordering::SeqCst))
+    }
+
+    /// AC#2 (TASK-46) the DECISIVE DoS bite: the over-declared abort fires BEFORE a single
+    /// body byte is downloaded, so a lying claim pointing at an attacker-chosen huge blob costs
+    /// a 10-byte header read, not a full transfer. Strictly stronger than
+    /// `read_rejects_declared_raw_size_above_signed_limit_before_body` (a `Cursor` over a
+    /// fully-buffered body cannot witness "the body was never read"): here the body is an
+    /// exploding tail whose first pull is counted, so the oracle observes the exact
+    /// wasted-download boundary the defense must hold.
+    ///
+    /// Two cases, because two guards jointly protect the SIGNED path but only ONE protects the
+    /// cold-start path - so the cases ATTRIBUTE the body-not-read property to the right guard:
+    ///   * COLD START (`signed == None`): the running cap is the 256 MiB floor and the
+    ///     `raw_size != expected` sibling check is SKIPPED, so `raw_size > cap` is the ONLY
+    ///     guard on the body. Disabling it lets the exploding body stream (`body_pulls > 0`) -
+    ///     the clean, attributable mutation bite for THIS guard.
+    ///   * SIGNED NarSize (the headline): a declared 8 GiB over a signed 4 KiB. `body_pulls`
+    ///     is still 0; here `raw_size > cap` and `raw_size != expected` REDUNDANTLY protect the
+    ///     body, which is the belt-and-braces the shipped path actually has.
+    ///
+    /// All sizes are UNCOMPRESSED signed-NarSize units, never a compressed FileSize (the
+    /// recurring unit trap).
+    ///
+    /// BITE (mutation-proven): delete the `if raw_size > cap { TooLarge }` guard in
+    /// `read_response_streamed_since`; the COLD-START case then proceeds into
+    /// `verified_nar_stream` + `pump_bao_wire`, which pull the exploding body - `body_pulls`
+    /// becomes non-zero and this fails at the body-read boundary.
+    #[tokio::test]
+    async fn over_declared_body_aborts_before_any_body_byte_is_downloaded() {
+        const FLOOR_OVER: u64 = 8 * 1024 * 1024 * 1024; // 8 GiB, over the 256 MiB cold floor
+        const SIGNED: u64 = 4 * 1024; // a 4 KiB signed NarSize
+        const SIGNED_OVER: u64 = 8 * 1024 * 1024 * 1024; // 8 GiB claimed against 4 KiB signed
+
+        // COLD START: only `raw_size > cap` (vs the floor) stands between us and the body.
+        let (err, body_pulls) = abort_pulls_for(FLOOR_OVER, None).await;
+        // THE DoS ORACLE FIRST, so the failure ATTRIBUTES to the wasted-download boundary (not
+        // to an incidental error-type mismatch): with the guard deleted, the code enters the
+        // verifier and pulls the exploding body, so `body_pulls > 0` and THIS line bites.
+        assert_eq!(
+            body_pulls, 0,
+            "cold-start: the abort must fire before the body is read; a non-zero pull is a \
+             downloaded blob (this is the guard-attributable DoS bite)"
+        );
+        match err {
+            TransferError::TooLarge { limit, streamed } => {
+                assert_eq!(limit, MAX_NAR_RESPONSE_BYTES, "cold-start cap is the floor");
+                assert_eq!(
+                    streamed, FLOOR_OVER,
+                    "reported over-size is the declared raw_size"
+                );
+            }
+            other => panic!("cold-start over-floor must be TooLarge before body, got {other}"),
+        }
+
+        // SIGNED NarSize headline: an 8 GiB claim against a 4 KiB signed size, refused early.
+        let (err, body_pulls) = abort_pulls_for(SIGNED_OVER, Some(SIGNED)).await;
+        assert_eq!(
+            body_pulls, 0,
+            "signed: no body byte pulled for an over-signed claim"
+        );
+        match err {
+            TransferError::TooLarge { limit, streamed } => {
+                assert_eq!(limit, SIGNED, "the abort limit is the signed NarSize");
+                assert_eq!(
+                    streamed, SIGNED_OVER,
+                    "reported over-size is the declared raw_size"
+                );
+            }
+            other => panic!("signed over-size must be TooLarge before body, got {other}"),
+        }
+
+        // CONTRAST: a within-bound claim (declared == signed) proceeds normally and streams its
+        // whole body - the abort does not falsely fire on an honest transfer.
+        let honest = b"an honest NAR whose declared size equals the signed NarSize".to_vec();
+        let honest_content = Blake3Digest::from_raw_nar(&honest);
+        let mut honest_reader = futures::io::Cursor::new(wire_nar(&honest));
+        let got = read_response_streamed(
+            &mut honest_reader,
+            Some(honest.len() as u64),
+            IDLE,
+            &honest_content,
+        )
+        .await
+        .expect("a within-bound transfer streams normally");
+        assert_eq!(
+            got, honest,
+            "the honest within-bound NAR round-trips in full"
+        );
     }
 
     /// AC#1 the cold-start floor: with NO signed size the running cap is the 256 MiB floor,
