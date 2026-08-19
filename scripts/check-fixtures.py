@@ -1311,17 +1311,26 @@ def check_reclaim_direct_execution_control(repo: Path) -> None:
                     f"message for {label}: stderr={result.stderr!r}"
                 )
         resolved_target = later_target.resolve()
-        if f"clearing cargo target dir {resolved_target}" not in result.stdout:
+        # reclaim.sh stage 4 now prunes STALE cargo artifacts with cargo-sweep
+        # (keeping the current dep cache) instead of `rm -rf <target>`, so this
+        # oracle no longer looks for a wipe. Its JOB is unchanged: prove the
+        # skipped fixture stage did NOT abort reclaim, so the LATER cargo stage is
+        # still REACHED. Accept any stage-4 marker (a sweep, or a documented skip),
+        # and bite only if NONE appear (== the run aborted before stage 4). The
+        # sweep line goes to stdout; the skip variants go to stderr.
+        reached_markers = (
+            f"sweeping cargo target {later_target}",
+            f"sweeping cargo target {resolved_target}",
+            "is not a cargo target dir, skipping cargo cleanup",
+            "cargo-sweep not on PATH",
+        )
+        if not any(
+            m in result.stdout or m in result.stderr for m in reached_markers
+        ):
             fail(
                 "BITE DID NOT BITE (direct reclaim continuation): unset pinned Python "
-                "prevented the later cargo cleanup stage; "
-                f"stdout={result.stdout!r}"
-            )
-        logged = calls.read_text()
-        if "rm -rf" not in logged or str(resolved_target) not in logged:
-            fail(
-                "direct reclaim control did not reach the safely mocked removal for "
-                f"the later cargo target; calls={logged!r}"
+                "prevented the later cargo-sweep cleanup stage; "
+                f"stdout={result.stdout!r} stderr={result.stderr!r}"
             )
     ok(
         "direct reclaim with pinned Python unset reports both skipped collectors and "
