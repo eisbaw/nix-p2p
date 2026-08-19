@@ -23,19 +23,15 @@ yanked = "deny"
 unmaintained = "workspace"
 # No blanket ignores. Add a specific `ID = "..."` here ONLY with a filed
 # follow-up task explaining why the advisory does not apply to our usage.
-# The three below are ALL DoS-class (never a bad store path — the integrity TCB
-# is untouched) and unfixable without an upstream bump; each is verified N/A or
-# bounded on our SHIPPED usage and carries a follow-up. Provenance verified via
-# `cargo tree -e features` / `cargo deny check advisories` on 2026-08-19 (TASK-260).
+# The two below are BOTH DoS-class (never a bad store path — the integrity TCB
+# is untouched), verified N/A or bounded on our SHIPPED usage, and carry a
+# follow-up (TASK-265) to remove them once libp2p/hickory is bumped. Provenance
+# verified via `cargo tree -e features` on 2026-08-19 (TASK-260, codex-gated).
+# NOTE: RUSTSEC-2026-0258 (h2 empty DATA frames) is NOT ignored — it was FIXED
+# directly by bumping h2 0.4.15 -> 0.4.16 (codex 260R1: `cargo update -p h2
+# --precise 0.4.16` changes only h2; TASK-202 is Done and retains iroh, so an
+# ignore-with-prune-follow-up would have been unsound).
 ignore = [
-    # h2 0.4.15 unbounded empty DATA frames (server-side DoS). Provenance: h2 ->
-    # hyper 1.11 http2 AND hickory-net 0.26.1 -> hickory-resolver -> iroh v1.0.3.
-    # DOES NOT APPLY on the shipped path: the shipped daemon enables ONLY hyper's
-    # `http1` feature (daemon-core/Cargo.toml:27, daemon/Cargo.toml:117; server &
-    # client use hyper::{server,client}::conn::http1 exclusively), so no h2/HTTP-2
-    # server is ever run. h2 is in the tree solely via the iroh subtree.
-    # Follow-up: iroh prune (TASK-202) removes the h2 tree entirely.
-    { id = "RUSTSEC-2026-0258", reason = "shipped daemon is hyper http1-only; h2 present only via the iroh subtree (prune=TASK-202); DoS-class, no integrity impact" },
     # hickory-proto 0.25.2 NSEC3 closest-encloser unbounded loop (DoS). Provenance:
     # hickory-proto 0.25.2 -> libp2p-mdns 0.48 / libp2p-dns 0.44 -> libp2p 0.56 (TASK-257).
     # DOES NOT APPLY: triggers only with the dnssec-ring/dnssec-aws-lc-rs feature +
