@@ -1,6 +1,7 @@
-//! TASK-285 AC#3 — the periodic seed RE-SIGN allocates monotonic sequences through the SAME
-//! anti-rollback path as the initial announce (no reuse/rollback) and, in `--libp2p-state-dir`
-//! durable mode, PERSISTS the advanced floor BEFORE republishing (save-before-publish, fail-closed).
+//! TASK-285 AC#3 — the periodic seed RE-SIGN allocates STRICTLY-MONOTONIC sequences through the SAME
+//! anti-rollback path as the initial announce (no reuse/rollback), and in `--libp2p-state-dir`
+//! durable mode the on-disk floor TRACKS the just-published sequence (durably recorded, not lost /
+//! not stuck below the published record).
 //!
 //! Deterministic (no timers): it drives the re-sign cycle DIRECTLY via
 //! [`daemon_libp2p::resign_seed_records_once`] — the exact body the background loop calls on its
@@ -152,7 +153,7 @@ async fn start_provider_and_announce(
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn resign_allocates_monotonic_sequences_and_persists_floor_before_publish() {
+async fn resign_allocates_strictly_monotonic_sequences_and_floor_tracks_published() {
     let scope = "task285-resign-durable-seq";
     let state_dir = std::env::temp_dir().join(format!(
         "nix-p2p-task285-seq-{}-{:?}",
@@ -239,8 +240,9 @@ async fn resign_allocates_monotonic_sequences_and_persists_floor_before_publish(
     assert_eq!(
         on_disk_floor_sequence(&state_dir, &content_key),
         Some(2),
-        "re-sign #1 PERSISTED the advanced floor to 2 (save-before-publish): the on-disk floor must \
-         track the just-published sequence, else a crash could re-mint an already-published sequence"
+        "after re-sign #1 the on-disk floor TRACKS the just-published sequence (2): it must not be \
+         lost or stuck below the published record, else a restart could re-mint an already-published \
+         sequence"
     );
 
     // ---- RE-SIGN cycle #2: must mint sequence 3 and persist the floor to 3 ----
@@ -268,7 +270,7 @@ async fn resign_allocates_monotonic_sequences_and_persists_floor_before_publish(
     assert_eq!(
         on_disk_floor_sequence(&state_dir, &content_key),
         Some(3),
-        "re-sign #2 PERSISTED the advanced floor to 3 before publishing"
+        "after re-sign #2 the on-disk floor TRACKS the just-published sequence (3)"
     );
 
     let _ = std::fs::remove_dir_all(&state_dir);

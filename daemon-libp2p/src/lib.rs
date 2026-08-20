@@ -2586,9 +2586,15 @@ pub enum SeedResignAuthority {
     Public(Arc<PublicNarAllowlist>),
 }
 
-/// A running seed RE-SIGN task (TASK-285 AC#1). Owning it keeps the background loop alive; DROPPING
-/// it ABORTS the loop (a clean shutdown, no leaked task). The provider install path stores it in its
-/// guard so the loop lives exactly as long as the serving process.
+/// A running seed RE-SIGN task (TASK-285 AC#1). Owning it keeps the SUPERVISOR loop alive; the
+/// provider install path stores it in its guard so the loop lives as long as the serving process.
+///
+/// DROP aborts the SUPERVISOR JoinHandle so no further cycles are scheduled. It does NOT cancel a
+/// cycle that is ALREADY IN FLIGHT: the supervisor `await`s each cycle in its own `tokio::spawn`
+/// child, and aborting the supervisor at that await DETACHES the child rather than cancelling it, so
+/// an in-flight re-sign runs to completion and can still publish AFTER the drop. That is harmless
+/// under the TCB — a late but signed, strictly-monotonic positive SUPERSEDE (never a rollback, never
+/// a tombstone) — but it means "no leaked in-flight work" is not guaranteed at the drop instant.
 pub struct SeedResignTask {
     task: tokio::task::JoinHandle<()>,
 }
@@ -2637,9 +2643,6 @@ pub async fn resign_seed_records_once(
     budget: &AnnounceBudget,
     authority: &SeedResignAuthority,
 ) -> Result<SeedResignOutcome, String> {
-    // A FRESH observation time each cycle ⇒ a fresh signed issued_at + expiry (= now + ttl_secs),
-    // superseding the prior record with a strictly-later validity window. All integer, no float.
-    let config = InitialAnnounceConfig::new(identity_seed, ttl_secs, now_unix_secs(), budget);
     let announcer = fabric
         .announcer()
         .ok_or_else(|| "internal: libp2p provider fabric exposes no announcer".to_string())?;
@@ -2668,6 +2671,14 @@ pub async fn resign_seed_records_once(
             outcome.failed.push((*nar_hash, e.to_string()));
             continue;
         }
+        // FIX 1: re-time PER SEED. Each seed signs from its OWN fresh `now`, so its `expiry =
+        // now + ttl_secs` is fresh at sign time. Because the seeds are signed SEQUENTIALLY and a
+        // slow earlier seed can burn up to ANNOUNCE_QUORUM_RETRY_WINDOW_SECS (30s) in its bounded
+        // put-quorum retry, one shared `now` captured before the loop could leave a LATER seed
+        // signed with an already-elapsed `now + ttl` at a small TTL — which `announce` then rejects
+        // as `record.expiry <= now`. A fresh `now` per seed keeps every record's validity window
+        // forward at the moment it is minted. (Integer seconds, no float.)
+        let config = InitialAnnounceConfig::new(identity_seed, ttl_secs, now_unix_secs(), budget);
         match announce_one_verified_seed(
             fabric,
             &**announcer,
