@@ -164,6 +164,20 @@ LIBP2P_NETNS_CONVERGE_S = 16.0
 # first query at startup, but discovery + routing-table population + a put/get round can take
 # a little longer than the routed-bootstrap S7, so give the zero-bootstrap DHT a bit more.
 LIBP2P_MDNS_CONVERGE_S = 22.0
+# TASK-280 WIRE FREEZE: the FROZEN, versioned kad/nar/identify scope a `--profile lan-share` node
+# derives (fabric-libp2p LAN_SHARE_NETWORK_SCOPE). A lan-share node is STRUCTURALLY not on the
+# public `v1` DHT: this string, negotiated as the kad/nar protocol name, is the KEY-leg mitigation
+# (AC#3) the isolation-bridge negative control below exercises. If this constant ever drifts from
+# the Rust constant, the isolation-bridge scenario's lan-share pool would silently scope-isolate
+# from itself (H could not reach P) -> its own positive control reddens, so a drift fails LOUD.
+LIBP2P_LAN_SHARE_SCOPE = "lan-share.v1"
+# The PUBLIC, un-scoped DEFAULT kad/nar scope a standard node derives when no `--profile lan-share`
+# and no `--libp2p-scope` is given (fabric-libp2p; a bare consume-only leech resolves to exactly
+# this — daemon-libp2p main.rs). Passed EXPLICITLY to the bridge X and the public leech P_pub in the
+# isolation-bridge control to make "they are on the public v1 DHT, P is not" legible at the call site
+# (explicit == the default, per the parity unit tests). Distinct from LIBP2P_SCOPE ("e2e-s7"), the
+# arbitrary shared scope the OTHER libp2p scenarios pin their whole swarm to.
+LIBP2P_DEFAULT_SCOPE = "v1"
 
 
 class HarnessError(RuntimeError):
@@ -2991,6 +3005,401 @@ class Libp2pLanShareServeTopology:
             run([self._pm, "rm", "-f", "--ignore", self._c(role)], check=False)
         run([self._pm, "rm", "-f", "--ignore", f"{self.prefix}-neg"], check=False)
         run([self._pm, "network", "rm", "-f", self.NET], check=False)
+
+
+class Libp2pIsolationBridgeTopology:
+    """TASK-280 AC#4: the DUAL-HOMED-BRIDGE negative control (the codex egress-transitivity exploit
+    as a biting e2e). TWO podman networks:
+
+      * LAN net  10.211.34.0/24  (RFC1918 -> the classifier reads any addr here as LAN)
+      * PUBLIC net 203.0.113.0/24 (TEST-NET-3 -> genuinely NON-private; the classifier reads any
+        addr here as NON-LAN. NB: do NOT use 10.99.0.0/24 — RFC1918 would classify as LAN.)
+
+    Roles:
+      * P   (lp-provider)  : `--profile lan-share` (scope `lan-share.v1`), LAN net ONLY, seeds the
+                             content key K, LAN-only `--libp2p-listen` on its 10.211.34.x IP,
+                             announces K over profile-default mDNS. NO allowlist (the isolated-LAN
+                             door admits the seed, mirroring the cross-host-serve server).
+      * H   (lp-lan-helper): a same-scope (`lan-share.v1`) LAN leech. It is P's put-quorum peer
+                             (a lone-genesis lan-share provider cannot announce without one) AND the
+                             POSITIVE CONTROL — H fetches K from P peer-served (0 upstream), proving
+                             the lan-share.v1 DHT works, so the P_pub negative below is not vacuous.
+      * X   (lp-bridge)    : the malicious/misconfigured DUAL-HOMED same-network bridge. A STANDARD
+                             `/bin/daemon` on the un-scoped default scope `v1`, on BOTH nets
+                             (`--network lan --network public`). P discovers X via mDNS on the LAN;
+                             X is wired toward the public side. X reuses the FIXED BOOT identity
+                             (LIBP2P_BOOT_SEED_HEX -> LIBP2P_BOOT_PEER_ID) so P_pub can bootstrap to
+                             it with an offline-derivable PeerId (no printed-address round-trip).
+      * P_pub (lp-public-leech): the public leech, PUBLIC net ONLY, scope `v1`, bootstrapped to X.
+                             Runs get_providers(K) then attempts a `/nar` fetch of K. Its only
+                             reachable cache upstream is the PUBLIC proxy (the honest public path).
+
+    Support (mirrors every other libp2p topology — an origin+testproxy pair PER net so egress is
+    attributable to the net the fetch happened on): lan-origin/lan-proxy on the LAN (P & H
+    upstream); pub-origin/pub-proxy on the PUBLIC net (P_pub upstream = "the public internet",
+    which legitimately holds K so P_pub's fallback build succeeds byte-identically).
+
+    -- MITIGATIONS UNDER TEST + PER-ORACLE ATTRIBUTION (each oracle is structured so REVERTING the
+    named mitigation reddens THAT assertion; the scenario as authored runs the MITIGATED/GREEN
+    config, and each oracle's docstring/inline comment states the precise revert that reproduces
+    RED-at-HEAD):
+
+      (1) KEY leg  <- AC#3 SCOPE SPLIT. P is on `/nix-p2p/lan-share.v1/kad`; X/P_pub are on
+          `/nix-p2p/v1/kad`. Even though P dials X at transport level (X's LAN literal is admitted),
+          the scoped kad substream never negotiates, so P's provider record never crosses into the
+          v1 DHT -> P_pub's get_providers(K) is EMPTY. REVERT: put the LAN pool (P + H) back on `v1`
+          -> the record propagates through X -> P_pub learns K (RED).
+      (2) DIAL leg <- FIX#1 exact LAN-provenance grammar (+ the guard-first dial veto). X advertises
+          its PUBLIC listen addr 203.0.113.x to P via (cross-scope) identify; the grammar filters
+          any non-LAN literal BEFORE it enters kad/the dial queue, so P emits NO connection to
+          203.0.113.x. REVERT: relax multiaddr_lan_provenance (first-hop-only / accept compound)
+          -> P dials 203.0.113.x -> a SYN appears (RED).
+      (3) SERVE leg <- FIX#2 per-connection serve provenance. A `/nar` arriving over a
+          non-LAN-provenance connection is refused. This two-network topology CANNOT force a
+          non-LAN-provenance connection INTO P at system level (P is LAN-only-listen; P_pub has no
+          route to P), so this leg is wired as an explicitly-marked in-harness/unit-level gate (see
+          the scenario) with a TODO: it needs the per-(PeerId,ConnectionId) ledger to bite.
+      (4) CROSS-SCOPE identify <- FIX#4 identify with_cache_size(0) + protocol_version receive-gate.
+          A `v1` peer (X) completes identify with P, but its addresses are NOT ingested into P's kad
+          and it is never dialed. REVERT: restore the identify address cache / drop the
+          protocol_version gate -> X's (public) addr becomes a dial candidate (RED, and it feeds #2).
+      (5) END-TO-END <- the composition. P_pub's fetch of K comes from the PUBLIC upstream (or fails),
+          NEVER peer-served from P: pub-proxy.upstream.nar >= 1. REVERT the scope split (#1) -> P_pub
+          peer-fetches K from P through the bridge -> pub-proxy.upstream.nar == 0 (RED).
+
+    -- HONESTY (compile-frozen, author-only): NONE of the above has been RUN. The composition is
+    plausible from the sources but UNVERIFIED end-to-end; every construct that depends on real
+    runtime behavior carries an inline `# TODO(TASK-280 validate)` marker. NOT registered in
+    E2E_FAST (an unvalidated scenario in the fast gate broke a prior gate — see TASK-276 notes);
+    registered in SCENARIOS only (runnable via `--only`) until it is proven RED-at-HEAD then GREEN.
+    """
+
+    LAN_SUBNET = "10.211.34.0/24"
+    PUB_SUBNET = "203.0.113.0/24"
+    # LAN net
+    IP_LAN_ORIGIN = "10.211.34.13"
+    IP_LAN_PROXY = "10.211.34.12"
+    IP_P = "10.211.34.11"          # provider: --profile lan-share, seeds K, LAN-only listen
+    IP_H = "10.211.34.14"          # lan helper: same-scope quorum + positive control
+    IP_X_LAN = "10.211.34.20"      # bridge, LAN leg
+    # PUBLIC net
+    IP_PUB_ORIGIN = "203.0.113.13"
+    IP_PUB_PROXY = "203.0.113.12"
+    IP_X_PUB = "203.0.113.20"      # bridge, PUBLIC leg (P_pub bootstraps here)
+    IP_P_PUB = "203.0.113.30"      # public leech
+
+    def __init__(self, ctx, name, served_cache, seed_dir, provider_seeds, expect):
+        self.ctx = ctx
+        self._pm = ctx.podman
+        self.prefix = f"{POD_PREFIX}-{name}"
+        self.served_cache = served_cache
+        self.seed_dir = seed_dir
+        self.provider_seeds = tuple(provider_seeds)
+        self._expect = expect
+        self.LAN_NET = f"{self.prefix}-lan"
+        self.PUB_NET = f"{self.prefix}-pub"
+        self.provider_identity = None
+        # Per-role (network, ip) so a fresh client / probe attaches to the RIGHT net.
+        self._role_net_ip = {
+            "lp-lan-helper": (self.LAN_NET, self.IP_H),
+            "lp-public-leech": (self.PUB_NET, self.IP_P_PUB),
+        }
+
+    # ---- lifecycle ----------------------------------------------------------
+    def __enter__(self):
+        leaked = secret_key_problems(self.served_cache)
+        self._expect(
+            not leaked,
+            "AC#4 (isolation-bridge): no *.sec under the served cache tree (host-side walk)",
+            f"leaked: {leaked}",
+        )
+        if leaked:
+            raise RuntimeError(f"AC#4 abort (isolation-bridge): secret key(s) {leaked} present")
+        self._create()
+        return self
+
+    def __exit__(self, *_exc):
+        self.stop()
+
+    def _c(self, role):
+        return f"{self.prefix}-{role}"
+
+    def roles(self):
+        return [
+            "lan-origin", "lan-proxy", "lp-provider", "lp-lan-helper",
+            "lp-bridge", "lp-public-leech", "pub-origin", "pub-proxy", "dial-pcap",
+        ]
+
+    def _create(self):
+        pm = self._pm
+        for role in self.roles():
+            run([pm, "rm", "-f", "--ignore", self._c(role)], check=False)
+        # TODO(TASK-280 validate): two networks with DISTINCT subnets so podman never rejects a
+        # duplicate-subnet coexistence (10.211.34.0/24 is also used by the cross-host-serve
+        # topology, but that scenario tears its net down first; if a run ever overlaps, bump the
+        # third octet here). Both are needed: the LAN net is RFC1918 (classifies LAN), the PUBLIC
+        # net is TEST-NET-3 (classifies NON-LAN) — the whole exploit hinges on that split.
+        run([pm, "network", "rm", "-f", self.LAN_NET], check=False)
+        run([pm, "network", "rm", "-f", self.PUB_NET], check=False)
+        run([pm, "network", "create", "--label", PROJECT_LABEL,
+             "--subnet", self.LAN_SUBNET, self.LAN_NET])
+        run([pm, "network", "create", "--label", PROJECT_LABEL,
+             "--subnet", self.PUB_SUBNET, self.PUB_NET])
+
+        lan_proxy_url = f"http://{self.IP_LAN_PROXY}:{PROXY_PORT}"
+        pub_proxy_url = f"http://{self.IP_PUB_PROXY}:{PROXY_PORT}"
+
+        # --- support: origin + testproxy PER net (both fronting the SAME served cache, which holds
+        #     K; the PUBLIC pair is the honest "public internet" P_pub legitimately falls back to).
+        self._run_origin("lan-origin", self.LAN_NET, self.IP_LAN_ORIGIN)
+        self._run_proxy("lan-proxy", self.LAN_NET, self.IP_LAN_PROXY, self.IP_LAN_ORIGIN)
+        self._run_origin("pub-origin", self.PUB_NET, self.IP_PUB_ORIGIN)
+        self._run_proxy("pub-proxy", self.PUB_NET, self.IP_PUB_PROXY, self.IP_PUB_ORIGIN)
+        self._await_http_ready("lan-origin", self.LAN_NET, self.IP_LAN_ORIGIN)
+        self._await_http_ready("lan-proxy", self.LAN_NET, self.IP_LAN_PROXY)
+        self._await_http_ready("pub-origin", self.PUB_NET, self.IP_PUB_ORIGIN)
+        self._await_http_ready("pub-proxy", self.PUB_NET, self.IP_PUB_PROXY)
+
+        # --- H FIRST: the same-scope LAN helper comes up mDNS-live so it is P's put-quorum peer the
+        #     moment P announces (a lone-genesis lan-share provider needs a same-scope peer). It is a
+        #     consume-only leech that JOINS P's frozen pool by passing --libp2p-scope lan-share.v1
+        #     EXPLICITLY (SCOPE = AUDIENCE: the pool agrees on lan-share.v1 regardless of role).
+        run(
+            [pm, "run", "-d", "--label", PROJECT_LABEL, "--name", self._c("lp-lan-helper"),
+             "--network", self.LAN_NET, "--ip", self.IP_H, self.ctx.image,
+             "/bin/daemon", "--listen", f"0.0.0.0:{DAEMON_PORT}", "--upstream", lan_proxy_url,
+             "--libp2p-leech", "--libp2p-mdns",
+             "--libp2p-listen", f"/ip4/{self.IP_H}/tcp/{LIBP2P_BASE_PORT}",
+             "--libp2p-scope", LIBP2P_LAN_SHARE_SCOPE]
+        )
+        self._await_http_ready("lp-lan-helper", self.LAN_NET, self.IP_H)
+
+        # --- X (bridge): dual-homed STANDARD v1 node. A wildcard listen binds BOTH interface addrs
+        #     (10.211.34.20 + 203.0.113.20); X is NOT a lan-share node so no isolation guard applies
+        #     to its bind. mDNS lets P discover it on the LAN; the FIXED BOOT identity makes X's
+        #     PeerId offline-derivable so P_pub can bootstrap to /ip4/203.0.113.20/... with a known
+        #     PeerId. The dummy bootstrap entry mirrors the genesis BOOT node (kad self-lookup fails
+        #     best-effort; the node still binds and routes). X reaches a cache upstream on either leg.
+        # TODO(TASK-280 validate): confirm the composite /bin/daemon accepts a wildcard
+        #   --libp2p-listen and that mDNS/identify then ADVERTISE the concrete 203.0.113.20 addr to
+        #   P (that advertisement is what the DIAL/identify legs rely on); and confirm `--network
+        #   lan --network public` attaches both NICs (podman rootless CNI/netavark two-net join).
+        # TODO(TASK-280 validate): pin BOTH legs' IPs via podman's `--network <net>:ip=<addr>` form
+        #   so P_pub's bootstrap entry (IP_X_PUB) and the LAN readiness probe (IP_X_LAN) address X's
+        #   REAL interfaces (a bare `--network a --network b` auto-assigns, leaving these IPs a guess).
+        #   Confirm this rootless netavark syntax is accepted by the podman in the gate image.
+        run(
+            [pm, "run", "-d", "--label", PROJECT_LABEL, "--name", self._c("lp-bridge"),
+             "--network", f"{self.LAN_NET}:ip={self.IP_X_LAN}",
+             "--network", f"{self.PUB_NET}:ip={self.IP_X_PUB}",
+             self.ctx.image,
+             "/bin/daemon", "--listen", f"0.0.0.0:{DAEMON_PORT}", "--upstream", pub_proxy_url,
+             "--libp2p-mdns",
+             "--libp2p-listen", f"/ip4/0.0.0.0/tcp/{LIBP2P_BASE_PORT}",
+             "--libp2p-bootstrap", f"{LIBP2P_DUMMY_PEER}@/ip4/127.0.0.1/tcp/1",
+             "--libp2p-identity-seed", LIBP2P_BOOT_SEED_HEX,
+             "--libp2p-scope", LIBP2P_DEFAULT_SCOPE]
+        )
+        # X has no HTTP daemon path we depend on for gating besides liveness; a readiness probe on
+        # its LAN leg confirms it booted. TODO(TASK-280 validate): pick whichever leg podman makes
+        # the primary /nix-cache-info route; the LAN leg is asserted here.
+        self._await_http_ready("lp-bridge", self.LAN_NET, self.IP_X_LAN)
+
+        # --- P_pub (public leech): PUBLIC net only, scope v1, bootstrapped to X's PUBLIC leg with
+        #     X's offline-derivable PeerId. NO --libp2p-provider-addr injection: it must LEARN K only
+        #     via get_providers over the DHT X bridges. Its upstream is the PUBLIC proxy.
+        run(
+            [pm, "run", "-d", "--label", PROJECT_LABEL, "--name", self._c("lp-public-leech"),
+             "--network", self.PUB_NET, "--ip", self.IP_P_PUB, self.ctx.image,
+             "/bin/daemon", "--listen", f"0.0.0.0:{DAEMON_PORT}", "--upstream", pub_proxy_url,
+             "--libp2p-leech",
+             "--libp2p-listen", f"/ip4/{self.IP_P_PUB}/tcp/{LIBP2P_BASE_PORT}",
+             "--libp2p-bootstrap",
+             f"{LIBP2P_BOOT_PEER_ID}@/ip4/{self.IP_X_PUB}/tcp/{LIBP2P_BASE_PORT}",
+             "--libp2p-scope", LIBP2P_DEFAULT_SCOPE]
+        )
+        self._await_http_ready("lp-public-leech", self.PUB_NET, self.IP_P_PUB)
+
+        # --- P (provider) LAST: bare --profile lan-share, seeds K on an EXPLICIT private-LAN listen
+        #     (the isolated-LAN door admits the seed), mDNS is the profile default (NO
+        #     --libp2p-bootstrap / --libp2p-scope: it derives the FROZEN lan-share.v1). Announces to
+        #     the lan-share.v1 DHT (quorum via H).
+        seed_args = []
+        for s in self.provider_seeds:
+            seed_args += ["--libp2p-seed-nar", f"{s.nar_hash}=/srv/seed/{s.filename}"]
+        run(
+            [pm, "run", "-d", "--label", PROJECT_LABEL, "--name", self._c("lp-provider"),
+             "--network", self.LAN_NET, "--ip", self.IP_P,
+             "--volume", f"{self.seed_dir}:/srv/seed:ro", self.ctx.image,
+             "/bin/daemon-libp2p", "--listen", f"0.0.0.0:{DAEMON_PORT}", "--upstream", lan_proxy_url,
+             "--profile", "lan-share", "--libp2p-provider",
+             "--libp2p-listen", f"/ip4/{self.IP_P}/tcp/0",
+             "--libp2p-print-peer-address", *seed_args]
+        )
+
+        # --- DIAL-leg pcap: a tcpdump SHARING P's netns (so it sees P's LAN eth0) that prints every
+        #     outbound TCP SYN destined to the PUBLIC subnet to stdout (greppable via `podman logs`,
+        #     no binary pcap parsing). Started AFTER P so P's netns exists; it must be live through
+        #     convergence (P would dial X's public addr — if unmitigated — right after it processes
+        #     X's identify, i.e. around convergence, NOT during P_pub's fetch).
+        # TODO(TASK-280 validate): (a) the shared-netns interface name (assumed `eth0`) — confirm
+        #   with `ip -o link` inside P; (b) the tcpdump BPF `tcp[tcpflags] & tcp-syn != 0` matches
+        #   only SYNs; (c) NON-VACUITY: a single-homed P must have a DEFAULT ROUTE so a connect() to
+        #   203.0.113.x actually EMITS a SYN on eth0 (else ENETUNREACH emits NOTHING and the oracle
+        #   is a false green even at reverted HEAD) — prove by observing the SYN at reverted HEAD;
+        #   (d) --cap-add NET_RAW works rootless here (the iroh relay evidence path relies on it).
+        run(
+            [pm, "run", "-d", "--label", PROJECT_LABEL, "--name", self._c("dial-pcap"),
+             "--cap-add", "NET_RAW",
+             "--network", f"container:{self._c('lp-provider')}",
+             self.ctx.image,
+             "/bin/tcpdump", "-i", "eth0", "-nn", "-l",
+             f"dst net {self.PUB_SUBNET} and tcp[tcpflags] & tcp-syn != 0"],
+            check=False,
+        )
+
+        self.provider_identity = self._await_provider_announce(
+            "lp-provider", len(self.provider_seeds), READY_TIMEOUT_S + 45.0
+        )
+
+    # ---- container spawn helpers -------------------------------------------
+    def _run_origin(self, role, net, ip):
+        run(
+            [self._pm, "run", "-d", "--label", PROJECT_LABEL, "--name", self._c(role),
+             "--network", net, "--ip", ip,
+             "--volume", f"{self.served_cache}:/srv/cache:ro", self.ctx.image,
+             "python3", "-m", "http.server", str(ORIGIN_PORT), "--bind", "0.0.0.0",
+             "--directory", "/srv/cache"]
+        )
+
+    def _run_proxy(self, role, net, ip, origin_ip):
+        run(
+            [self._pm, "run", "-d", "--label", PROJECT_LABEL, "--name", self._c(role),
+             "--network", net, "--ip", ip, self.ctx.image,
+             "/bin/testproxy", "--listen", f"0.0.0.0:{PROXY_PORT}",
+             "--upstream", f"http://{origin_ip}:{ORIGIN_PORT}",
+             "--cache-dir", "/tmp/proxy-cache"]
+        )
+
+    def _await_http_ready(self, role, net, ip, timeout=READY_TIMEOUT_S):
+        port = ORIGIN_PORT if role.endswith("origin") else (
+            PROXY_PORT if role.endswith("proxy") else DAEMON_PORT
+        )
+        url = f"http://{ip}:{port}/nix-cache-info"
+        deadline = time.time() + timeout
+        while True:
+            res = run(
+                [self._pm, "run", "--rm", "--label", PROJECT_LABEL, "--network", net,
+                 self.ctx.image, "python3", "-c",
+                 f"import urllib.request;print(urllib.request.urlopen('{url}',timeout=2).status)"],
+                check=False,
+            )
+            if (res.stdout or "").strip() == "200":
+                return
+            if time.time() > deadline:
+                self._dump_logs()
+                die(f"isolation-bridge {role} did not become HTTP-ready at {url}")
+            time.sleep(0.4)
+
+    def _await_provider_announce(self, role, n_seeds, window_s):
+        """Poll for P's LIBP2P-PROVIDER-ADDR + n_seeds LIBP2P-SEED lines (printed only AFTER a
+        successful announce; the announce needs H's put-quorum). Dies LOUD if P exits or never
+        announces — a lone lan-share provider that cannot announce is a broken premise, NOT a green.
+        """
+        deadline = time.time() + window_s
+        addr_re = re.compile(r"LIBP2P-PROVIDER-ADDR peer_id=(\S+) addrs=(\S+)")
+        seed_re = re.compile(r"LIBP2P-SEED narhash=(\S+) ")
+        while time.time() < deadline:
+            log = self.logs(role)
+            addr = addr_re.search(log)
+            seeds = seed_re.findall(log)
+            if addr and len(seeds) >= n_seeds:
+                return addr.group(1), addr.group(2)
+            state = run(
+                [self._pm, "inspect", "-f", "{{.State.Status}}", self._c(role)], check=False
+            ).stdout.strip()
+            if state == "exited":
+                self._dump_logs()
+                die(
+                    f"isolation-bridge provider ({role}) EXITED without announcing — a lan-share "
+                    "provider could not seed+announce with its same-scope LAN quorum peer H "
+                    "(broken premise; NOT a pass)"
+                )
+            time.sleep(0.3)
+        self._dump_logs()
+        die(f"isolation-bridge provider ({role}) never announced within {window_s:.0f}s")
+
+    # ---- observation helpers -----------------------------------------------
+    def logs(self, role):
+        res = run([self._pm, "logs", self._c(role)], check=False)
+        return res.stdout + res.stderr
+
+    def _dump_logs(self):
+        for role in self.roles():
+            res = run([self._pm, "logs", self._c(role)], check=False)
+            if res.stdout or res.stderr:
+                print(f"--- logs {self._c(role)} ---", file=sys.stderr)
+                print(res.stdout, res.stderr, file=sys.stderr)
+
+    def dial_pcap_public_syns(self):
+        """Return the tcpdump lines showing an outbound TCP SYN from P to the PUBLIC subnet. EMPTY
+        (mitigated/GREEN) means P never tried to open a connection to 203.0.113.x. See the pcap
+        NON-VACUITY TODO in `_create` — an empty result is only load-bearing once a reverted-HEAD run
+        has POSITIVELY shown a SYN here (else routing, not the mitigation, could be suppressing it).
+        """
+        out = self.logs("dial-pcap")
+        return [ln for ln in out.splitlines() if "203.0.113." in ln and "IP " in ln]
+
+    def _proxy_container(self, which):
+        return self._c("lan-proxy") if which == "lan" else self._c("pub-proxy")
+
+    def _post(self, container, url):
+        py = (
+            "import sys,urllib.request\n"
+            f"req=urllib.request.Request('{url}',method='POST',data=b'')\n"
+            "sys.stdout.write(str(urllib.request.urlopen(req,timeout=5).status))\n"
+        )
+        res = run([self._pm, "exec", container, "python3", "-c", py], check=False)
+        try:
+            return int((res.stdout or "").strip())
+        except ValueError:
+            return None
+
+    def proxy_reset(self, which):
+        self._post(self._proxy_container(which), f"http://127.0.0.1:{PROXY_PORT}/__testproxy/reset")
+
+    def proxy_stats(self, which):
+        py = (
+            "import sys,urllib.request\n"
+            f"sys.stdout.write(urllib.request.urlopen('http://127.0.0.1:{PROXY_PORT}/__testproxy/stats',timeout=5).read().decode())\n"
+        )
+        res = run([self._pm, "exec", self._proxy_container(which), "python3", "-c", py], check=False)
+        return json.loads(res.stdout)
+
+    def client_run(self, role, targets, keys):
+        """Realise `targets` with a FRESH client substituting ONLY from `role`'s daemon, on `role`'s
+        OWN net. For `lp-public-leech` this drives P_pub's get_providers(K)+/nar path; the call
+        BLOCKS until the build completes, and the daemon consults the peer path (find_providers ->
+        terminal Found/Miss/Unavailable) BEFORE any upstream fallback — so completion is a genuine
+        TERMINAL-event wait on the query, not a fixed sleep (a Miss returns before upstream is even
+        tried; see daemon-core/src/peer_source.rs)."""
+        net, ip = self._role_net_ip[role]
+        subs = f"http://{ip}:{DAEMON_PORT}?priority=10"
+        script = _CLIENT_SCRIPT.format(
+            subs=subs, keys=keys, targets=" ".join(targets), jobs=1, conns=1, start_at_ns=0
+        )
+        res = run(
+            [self._pm, "run", "--rm", "--label", PROJECT_LABEL, "--network", net,
+             self.ctx.image, "bash", "-c", script],
+            check=False, timeout=300,
+        )
+        return _parse_client(res)
+
+    def stop(self):
+        for role in self.roles():
+            run([self._pm, "rm", "-f", "--ignore", self._c(role)], check=False)
+        run([self._pm, "network", "rm", "-f", self.LAN_NET], check=False)
+        run([self._pm, "network", "rm", "-f", self.PUB_NET], check=False)
 
 
 # Single-user client: realise into the container's own store, then report
@@ -7428,6 +7837,192 @@ def scenario_libp2p_lan_share_cross_host_serve(ctx: Ctx, expect) -> None:
         )
 
 
+def scenario_libp2p_lan_share_isolation_bridge(ctx: Ctx, expect) -> None:
+    """TASK-280 AC#4 NEGATIVE CONTROL: the dual-homed-bridge egress-transitivity exploit (the leak
+    codex found during TASK-276) as a biting e2e. A no-allowlist `--profile lan-share` provider P
+    must NOT be bridged to the public internet by a dual-homed same-network peer X.
+
+    TOPOLOGY (see `Libp2pIsolationBridgeTopology`): TWO podman nets — LAN 10.211.34.0/24 (RFC1918)
+    and PUBLIC 203.0.113.0/24 (TEST-NET-3, genuinely non-private). P (`--profile lan-share`,
+    lan-share.v1) seeds K on the LAN; H is P's same-scope quorum peer + POSITIVE CONTROL; X is the
+    DUAL-HOMED standard `v1` bridge P meets over mDNS; P_pub is the PUBLIC `v1` leech bootstrapped to
+    X that runs get_providers(K) + a /nar fetch.
+
+    ORACLES — each ATTRIBUTES to one mitigation; reverting THAT mitigation reddens THAT assertion
+    (RED-at-HEAD -> GREEN-after). The scenario runs the MITIGATED/GREEN config; the precise revert is
+    stated per oracle:
+      1. KEY leg  <- AC#3 SCOPE SPLIT: P_pub's get_providers(K) obtains NO provider record.
+      2. DIAL leg <- FIX#1 grammar + guard-first veto: P opens NO connection to any 203.0.113.x.
+      3. SERVE leg <- FIX#2 per-connection provenance: DOCUMENTED (unit-proven; not system-forcible
+         here — see the assertion's TODO).
+      4. CROSS-SCOPE identify <- FIX#4 cache_size(0)+protocol_version gate: a v1 peer's identify
+         addresses are not ingested/dialed.
+      5. END-TO-END <- the composition: P_pub gets K from the PUBLIC upstream (or not at all), never
+         peer-served from P.
+
+    HONESTY: compile-frozen, AUTHOR-ONLY — NOT RUN, NOT VALIDATED. Every runtime-dependent construct
+    carries an inline `# TODO(TASK-280 validate)`. RED-at-HEAD for each oracle must be DEMONSTRATED by
+    reverting the specific mitigation (not assumed). This scenario is deliberately NOT in E2E_FAST
+    (the Justfile fast gate) until it is proven RED-at-HEAD then GREEN post-compile-resume; it is
+    registered in SCENARIOS only, runnable via `--only libp2p-lan-share-isolation-bridge`.
+    """
+    fixtures = ctx.fixtures
+    seed_dir, prov_seeds, target_sp = _s7_seeds(ctx, "isobridge", S7_TARGET)
+    with Libp2pIsolationBridgeTopology(
+        ctx, "isobridge", fixtures.cache, seed_dir, prov_seeds, expect
+    ) as topo:
+        # Bounded settle for mDNS discovery + kad convergence (P<->H announce/quorum, P<->X transport
+        # meet, X<->P_pub bootstrap). Bounded, not a retry loop, so a genuinely broken pool still
+        # fails an oracle rather than hiding. TODO(TASK-280 validate): confirm this window covers the
+        # two-net convergence (P_pub bootstrapping across the public leg may need longer than the
+        # single-bridge mDNS scenarios).
+        time.sleep(LIBP2P_MDNS_CONVERGE_S)
+
+        # POSITIVE CONTROL (non-vacuity): H (same scope lan-share.v1, on the LAN) fetches K from P
+        # peer-served with 0 LAN-upstream egress. Proves the lan-share.v1 DHT + P's serve gate work,
+        # so the P_pub negatives below isolate the SCOPE boundary, not a dead pool. (Same
+        # positive/negative-on-one-bridge structure as libp2p-mdns-scope-isolation.)
+        topo.proxy_reset("lan")
+        res_h = topo.client_run("lp-lan-helper", [target_sp], fixtures.public_key)
+        expect(
+            res_h.exit_code == 0 and res_h.narhash(target_sp) == fixtures.nar_hash(S7_TARGET),
+            "isolation-bridge POSITIVE CONTROL: the same-scope LAN helper H fetches K byte-identically",
+            res_h.stderr[-600:],
+        )
+        expect(
+            topo.proxy_stats("lan")["upstream"].get("nar", 0) == 0,
+            "isolation-bridge POSITIVE CONTROL: 0 LAN-upstream NAR egress for H — the lan-share.v1 "
+            "DHT resolves + P serves, so the P_pub negatives are attributable to the scope boundary",
+            f"lan upstream.nar={topo.proxy_stats('lan')['upstream'].get('nar', 0)}",
+        )
+
+        # === ORACLE 1: KEY leg — attribution: AC#3 SCOPE SPLIT ===================================
+        # P_pub runs get_providers(K) then a /nar fetch. `client_run` BLOCKS until the build
+        # completes; the daemon resolves the peer query to a TERMINAL Found/Miss/Unavailable BEFORE
+        # any upstream fallback (peer_source.rs returns Err on Miss, THEN FallbackNarSource) — so
+        # completion is a genuine terminal-event wait on the query, closing the slow-propagation
+        # false-negative a fixed sleep would leave open. Re-derive from the RAW log: the
+        # "discovered N provider record(s) ... via kad" line (peer_source.rs:194, shared by the leech
+        # path — see libp2p-mdns-scope-isolation) must be ABSENT.
+        # REVERT (RED-at-HEAD): put the LAN pool (P + H) back on `v1` (undo AC#3) -> P's record
+        # crosses X into the v1 DHT -> the "discovered ... provider record(s)" line APPEARS here.
+        topo.proxy_reset("pub")
+        res_p = topo.client_run("lp-public-leech", [target_sp], fixtures.public_key)
+        plog = topo.logs("lp-public-leech")
+        # TODO(TASK-280 validate): ALSO positively assert a NON-Found terminal fired — pin the leech
+        #   Miss/Unavailable tokens ("(directory miss)" / "directory unavailable for" in
+        #   peer_source.rs) so the oracle proves the query TERMINATED empty, not that it is still
+        #   in-flight. (client_run completion already implies termination, but a token makes it
+        #   explicit and mutation-resistant.)
+        expect(
+            "provider record(s)" not in plog,
+            "isolation-bridge KEY leg (AC#3 scope split): P_pub's get_providers(K) obtained NO "
+            "provider record — P's record never crossed the lan-share.v1 <-> v1 scope boundary via "
+            "the bridge X. REVERT: P+H back on v1 -> the 'discovered ... provider record(s)' line "
+            "appears in P_pub's log (RED)",
+            f"P_pub log tail: {plog[-700:]!r}",
+        )
+
+        # === ORACLE 5: END-TO-END — attribution: the composition ================================
+        # P_pub's build completes byte-identically, and it got K from the PUBLIC upstream (>=1 NAR),
+        # NEVER peer-served from P across the bridge. REVERT the scope split -> P_pub peer-fetches K
+        # from P -> pub upstream.nar == 0 (RED). This is the same where-did-the-bytes-come-from bite
+        # the leech/mdns scenarios use.
+        expect(
+            res_p.exit_code == 0,
+            "isolation-bridge END-TO-END: P_pub's build completes (honest public-upstream fallback)",
+            res_p.stderr[-700:],
+        )
+        expect(
+            res_p.narhash(target_sp) == fixtures.nar_hash(S7_TARGET),
+            "isolation-bridge END-TO-END: byte-identical K (served by the public upstream)",
+            f"got={res_p.narhash(target_sp)} want={fixtures.nar_hash(S7_TARGET)}",
+        )
+        pub_nar_up = topo.proxy_stats("pub")["upstream"].get("nar", 0)
+        expect(
+            pub_nar_up >= 1,
+            "isolation-bridge END-TO-END ORACLE BITE (#5 composition): P_pub obtained K from the "
+            "PUBLIC upstream (>=1 NAR), never peer-served from P through the dual-homed bridge. "
+            "REVERT the scope split -> P_pub peer-fetches K from P -> pub upstream.nar==0 (RED)",
+            f"pub upstream.nar={pub_nar_up}",
+        )
+
+        # === ORACLE 2: DIAL leg — attribution: FIX#1 exact grammar + guard-first dial veto ======
+        # P must never open an outbound connection to any 203.0.113.x address. X advertises its
+        # PUBLIC listen addr (203.0.113.20) to P via (cross-scope) identify; the exact
+        # LAN-provenance grammar filters any non-LAN literal before it enters kad/the dial queue.
+        # Primary attribution = P's own log (no dial/connection to 203.0.113.x); the pcap is
+        # corroborating (see its non-vacuity TODO).
+        syns = topo.dial_pcap_public_syns()
+        # TODO(TASK-280 validate): pcap NON-VACUITY — an empty capture is only load-bearing once a
+        #   reverted-HEAD run has POSITIVELY shown a SYN here; until then treat it as corroboration,
+        #   not sole proof (single-homed P may emit nothing on ENETUNREACH). See _create's pcap TODO.
+        expect(
+            len(syns) == 0,
+            "isolation-bridge DIAL leg (FIX#1 grammar) [pcap corroboration]: P emitted NO TCP SYN to "
+            "the PUBLIC subnet 203.0.113.0/24. REVERT the grammar -> P dials X's public addr -> a SYN "
+            "appears (RED). NB: non-vacuity pending a reverted-HEAD SYN (TODO).",
+            f"public-subnet SYN lines: {syns}",
+        )
+        plog_p = topo.logs("lp-provider")
+        # TODO(TASK-280 validate): pin the exact 'dialing/ConnectionEstablished to <addr>' token vs a
+        #   possibly-benign 'filtered non-LAN address' log that may ALSO contain '203.0.113'. If the
+        #   mitigated path logs the filtered addr, this literal-substring check FALSE-REDs; refine it
+        #   to match only a DIAL/CONNECT event to 203.0.113.x once the real tokens are known.
+        expect(
+            "203.0.113." not in plog_p,
+            "isolation-bridge DIAL leg (FIX#1 grammar) [log, PRIMARY]: P's log shows no outbound "
+            "dial/connection to any 203.0.113.x address. REVERT the grammar -> a dial/connection line "
+            "to X's public addr appears (RED). TODO: pin dial-vs-filter token.",
+            f"P log tail: {plog_p[-700:]!r}",
+        )
+
+        # === ORACLE 4: CROSS-SCOPE identify — attribution: FIX#4 cache_size(0)+protocol_version ==
+        # X (v1) completes identify with P (identify negotiates /ipfs/id/1.0.0 regardless of scope,
+        # so a cross-scope peer DOES identify), but P must NOT ingest X's advertised addresses into
+        # kad nor dial X's PeerId afterwards. The system-visible consequence here overlaps the DIAL
+        # leg (no 203.0.113.x dial follows identify); the identify-SPECIFIC bite is that the
+        # cross-scope protocol_version peer's addresses are dropped rather than cached as candidates.
+        # REVERT: restore the identify address cache / drop the protocol_version receive-gate -> X's
+        # public addr becomes a dial candidate (RED; it then feeds the DIAL leg).
+        # TODO(TASK-280 validate): STRENGTHEN to a DEDICATED observable so this does not merely
+        #   re-assert the DIAL consequence: (a) a swarm.rs receive-gate reject log when X identifies
+        #   under confinement, or (b) ABSENCE of X's PeerId from P's kad routing via a debug/--status
+        #   surface; AND add a NON-VACUITY check that identify with X DID complete (P met X on the LAN
+        #   literal 10.211.34.20) so "not ingested" is meaningful. Pending those tokens, this asserts
+        #   the shared no-public-ingest consequence and DOCUMENTS the identify attribution.
+        expect(
+            "203.0.113." not in plog_p,
+            "isolation-bridge CROSS-SCOPE identify (FIX#4): a v1 peer's identify-advertised addresses "
+            "were NOT ingested/dialed by P (no 203.0.113.x dial follows identify). REVERT "
+            "cache_size(0)/protocol_version gate -> X's public addr becomes a dial candidate (RED). "
+            "TODO: strengthen to the receive-gate reject log / kad-absence + an identify-completed "
+            "non-vacuity check.",
+            f"P log tail: {plog_p[-700:]!r}",
+        )
+
+        # === ORACLE 3: SERVE leg — attribution: FIX#2 per-connection serve provenance ============
+        # This two-network topology CANNOT force a /nar to arrive at P over a NON-LAN-provenance
+        # connection at system level: P listens LAN-only and P_pub has no route to P, so every
+        # connection P holds is LAN-provenance (even the bidirectional-serve vector — P dials X, X
+        # requests /nar back over that conn — is LAN-provenance, since X's remote is its LAN literal).
+        # The non-LAN-provenance serve refusal is proven at UNIT level (fabric-libp2p:
+        # lan_serve_gate_refuses_a_non_lan_connection_of_a_lan_peer, keyed (PeerId,ConnectionId) via
+        # the vendored libp2p-stream). This is a DOCUMENTED, non-biting gate, clearly marked as such.
+        # TODO(TASK-280 validate): to bite FIX#2 at SYSTEM level needs a peer holding BOTH a LAN and a
+        #   non-LAN connection to P and a /nar request forced over the non-LAN ConnectionId — not
+        #   expressible without a third, doubly-connected node and per-ConnectionId request steering.
+        expect(
+            True,
+            "isolation-bridge SERVE leg (FIX#2 per-connection provenance): DOCUMENTED / NOT A SYSTEM "
+            "BITE — non-LAN-provenance /nar refusal is unit-proven "
+            "(lan_serve_gate_refuses_a_non_lan_connection_of_a_lan_peer); this topology cannot force a "
+            "non-LAN-provenance connection INTO P (LAN-only listen; no route from P_pub). Needs the "
+            "per-(PeerId,ConnectionId) ledger + a doubly-connected node to bite at system level (TODO)",
+            "unit-level gate; intentionally always-true placeholder (see TODO)",
+        )
+
+
 SCENARIOS = [
     ("topology", scenario_topology),
     ("s1-byte-and-counts", scenario_s1_byte_and_counts),
@@ -7510,6 +8105,17 @@ SCENARIOS = [
     # wildcard/global --libp2p-listen fails loud (relax admits ONLY provably-private ranges). Heavy
     # tier (own multicast bridge topology). Complements the unit guard-mutation proofs.
     ("libp2p-lan-share-cross-host-serve", scenario_libp2p_lan_share_cross_host_serve),
+    # TASK-280 AC#4: the dual-homed-bridge egress-transitivity NEGATIVE CONTROL. TWO podman nets
+    # (LAN 10.211.34.0/24 + PUBLIC 203.0.113.0/24): P `--profile lan-share` seeds K on the LAN, X is
+    # a dual-homed standard `v1` bridge P meets over mDNS, P_pub is a PUBLIC `v1` leech bootstrapped
+    # to X. Oracles: KEY leg (scope split -> get_providers(K) empty), DIAL leg (FIX#1 -> no
+    # 203.0.113.x dial), CROSS-SCOPE identify (FIX#4), SERVE leg (FIX#2, unit-proven doc gate),
+    # END-TO-END (P_pub gets K from public upstream, never from P). AUTHOR-ONLY / compile-frozen:
+    # UNVALIDATED — must be proven RED-at-HEAD (revert each mitigation) then GREEN before it may be
+    # added to the Justfile E2E_FAST set. Registered here (runnable via --only) only; E2E_FAST
+    # registration is PENDING VALIDATION (an unvalidated scenario in the fast gate broke a prior
+    # gate — TASK-276). Heavy tier (two-network dual-homed topology + a NET_RAW pcap sidecar).
+    ("libp2p-lan-share-isolation-bridge", scenario_libp2p_lan_share_isolation_bridge),
 ]
 
 
