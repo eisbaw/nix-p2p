@@ -640,6 +640,40 @@ fn parse_config<I: IntoIterator<Item = String>>(args: I) -> Result<Config, Strin
     // TASK-278: `--libp2p-seed-nar` + `--libp2p-announce-after-fetch` is now VALID - `install_provider`
     // builds an ADDITIVE union (seed leg + store leg), so the seed is served AND the node grows via
     // announce-after-fetch. The old interim fail-closed that refused this combo is removed.
+    // TASK-278 #3 (fail-loud, NOT silent dedup): a NarHash may appear at most ONCE across the whole
+    // static supply set. A provider serves + announces each NarHash EXACTLY once (it keys the
+    // supplier), so a repeat within --libp2p-seed-nar, within --libp2p-provide-store, or ACROSS the
+    // two would make the startup count (raw .len()) over-state the distinct served set. Reject rather
+    // than silently dedup, matching the `--iroh-*` duplicate rejects above, so `.len() == distinct ==
+    // served` holds by construction.
+    {
+        let mut seen = std::collections::HashSet::new();
+        for (nar_hash, _) in cfg
+            .libp2p_seed_nar
+            .iter()
+            .chain(cfg.libp2p_provide_store.iter())
+        {
+            if !seen.insert(*nar_hash) {
+                return Err(format!(
+                    "--libp2p-seed-nar / --libp2p-provide-store lists NarHash {nar_hash} more than \
+                     once (or in both): a provider serves and announces each NarHash exactly once; \
+                     pass it a single time"
+                ));
+            }
+        }
+    }
+    // TASK-278 #4: announce-after-fetch with a ZERO growth budget grows nothing - the hook would
+    // reject every fetch while the startup report claims "grows on demand". `--libp2p-announce-budget`
+    // is the DISTINCT-PATHS growth budget the announce-after-fetch hook consumes (static seed/provision
+    // announces use a separate rate limiter), so this guard cannot catch a static-only provider.
+    if cfg.libp2p_announce_after_fetch && cfg.libp2p_announce_budget == 0 {
+        return Err(
+            "--libp2p-announce-after-fetch with --libp2p-announce-budget 0 grows nothing: the hook \
+             would reject every fetch while the startup report claims \"grows on demand\". Raise the \
+             budget or drop --libp2p-announce-after-fetch"
+                .into(),
+        );
+    }
     // TASK-207 fail-closed CONTRADICTION (safety): on a PROVIDER, an external address advertises
     // PUBLIC reachability, and without the public-NAR allowlist door that is an isolated-LAN
     // announce over a self-declared public address - refuse rather than leak local content. A
@@ -1170,7 +1204,7 @@ fn build_provider_supply(
     );
 
     Ok(ProviderSupply {
-        supplier: Arc::new(UnionNarSupplier(legs)),
+        supplier: Arc::new(UnionNarSupplier::new(legs)),
         seeds,
         index,
         provisions,
@@ -1192,9 +1226,10 @@ fn provider_supply_report(seeds: usize, provisions: usize, announce_after_fetch:
 
 /// Node B (PROVIDER): build the ADDITIVE supply (TASK-278), start ONE fabric over the union
 /// supplier, install ONE serve gate, and announce EVERY built leg (seeds AND store provisions) plus
-/// install the announce-after-fetch hook. Seeds and provisions are DISTINCT content keys, so the
-/// two announce loops share the one durable-sequence allocator without collision. Returns the
-/// fabric + the [`ProviderGuard`] the caller must keep alive for the process.
+/// install the announce-after-fetch hook. Every announced NarHash is distinct (the parse-time #3
+/// dedup rejects a repeat within or across the two lists), so the per-ContentKey durable-sequence
+/// allocator the two announce loops share cannot collide. Returns the fabric + the [`ProviderGuard`]
+/// the caller must keep alive for the process.
 async fn install_provider(
     cfg: &Config,
     contract: &OperatorContract,
@@ -1265,8 +1300,9 @@ async fn install_provider(
         }
     }
 
-    // Announce the STORE leg (if any provisions were verified). Distinct content keys from the seeds,
-    // so no durable-sequence collision against the same fabric/identity.
+    // Announce the STORE leg (if any provisions were verified). The parse-time #3 dedup guarantees
+    // every provision's NarHash differs from every seed's, so no per-ContentKey durable-sequence
+    // collision against the same fabric/identity.
     if !provisions.is_empty() {
         let records = if cfg.libp2p_public_allowlist_path.is_some() {
             announce_public_provisions(&fabric, &readiness, announce_config, &provisions, allowlist)
@@ -2835,6 +2871,71 @@ mod operator_contract_tests {
         assert!(
             cfg.libp2p_announce_after_fetch,
             "announce-after-fetch stays on alongside the seed"
+        );
+    }
+
+    /// TASK-278 #3: the SAME NarHash as both a --libp2p-seed-nar AND a --libp2p-provide-store is
+    /// rejected fail-loud (a provider serves + announces each NarHash exactly once). MUTATION: delete
+    /// the dedup guard -> parses Ok and the report counts 2 while the supplier answers one digest.
+    #[test]
+    fn duplicate_narhash_across_seed_and_store_is_rejected() {
+        let Err(err) = parse_config(args(&[
+            "--libp2p-provider",
+            "--libp2p-listen",
+            "/ip4/127.0.0.1/tcp/0",
+            "--libp2p-mdns",
+            "--libp2p-seed-nar",
+            &format!("{APP_NAR_HASH}=/tmp/app.nar"),
+            "--libp2p-provide-store",
+            &format!("{APP_NAR_HASH}=/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-app"),
+        ])) else {
+            panic!("a NarHash appearing as both a seed and a store path must be rejected");
+        };
+        assert!(
+            err.contains(APP_NAR_HASH) && err.contains("more than once"),
+            "the refusal must name the duplicated NarHash: {err}"
+        );
+    }
+
+    /// TASK-278 #4: announce-after-fetch with a ZERO growth budget is rejected (it would grow nothing
+    /// while the report claims "grows on demand"). MUTATION: remove the guard -> parses and the
+    /// report's "grows on demand" clause is falsified with remaining==0.
+    #[test]
+    fn announce_after_fetch_with_zero_growth_budget_is_rejected() {
+        let Err(err) = parse_config(args(&[
+            "--libp2p-provider",
+            "--libp2p-listen",
+            "/ip4/127.0.0.1/tcp/0",
+            "--libp2p-mdns",
+            "--libp2p-announce-after-fetch",
+            "--libp2p-announce-budget",
+            "0",
+        ])) else {
+            panic!("announce-after-fetch with a zero growth budget must be rejected");
+        };
+        assert!(
+            err.contains("grows nothing") && err.contains("--libp2p-announce-budget 0"),
+            "the refusal must name the zero growth budget: {err}"
+        );
+    }
+
+    /// TASK-278 #4 precision: a STATIC-only provider (no announce-after-fetch) with
+    /// --libp2p-announce-budget 0 is NOT caught - the growth-budget guard keys off the hook, and a
+    /// static seed/provision announce uses a separate rate limiter.
+    #[test]
+    fn static_provider_with_zero_announce_budget_is_accepted() {
+        parse_config(args(&[
+            "--libp2p-provider",
+            "--libp2p-listen",
+            "/ip4/127.0.0.1/tcp/0",
+            "--libp2p-mdns",
+            "--libp2p-seed-nar",
+            &format!("{APP_NAR_HASH}=/tmp/app.nar"),
+            "--libp2p-announce-budget",
+            "0",
+        ]))
+        .expect(
+            "a static-only provider with announce-budget 0 is valid (growth guard must not fire)",
         );
     }
 

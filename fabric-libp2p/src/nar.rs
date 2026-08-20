@@ -1934,7 +1934,17 @@ impl Libp2pNarSupplier for CatalogNarSupplier {
 ///
 /// NO ENUMERATION is preserved: the union exposes only the same single-digest `plan` probe, never
 /// a `list`/`iter`/`len` - it cannot reveal what any leg holds beyond a caller-named digest.
-pub struct UnionNarSupplier(pub Vec<Arc<dyn Libp2pNarSupplier>>);
+pub struct UnionNarSupplier(Vec<Arc<dyn Libp2pNarSupplier>>);
+
+impl UnionNarSupplier {
+    /// Union the given legs; each is asked in order and the FIRST that can produce the digest wins.
+    /// The leg vector is PRIVATE (this constructor is the only way in), so no caller can reach past
+    /// the single-digest `plan` probe into a `list`/`iter`/`len` over the union - the NO-ENUMERATION
+    /// invariant is type-enforced, not just documented.
+    pub fn new(legs: Vec<Arc<dyn Libp2pNarSupplier>>) -> Self {
+        Self(legs)
+    }
+}
 
 impl Libp2pNarSupplier for UnionNarSupplier {
     fn plan(&self, content: &Blake3Digest) -> Option<NarSupplyPlan> {
