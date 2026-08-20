@@ -3067,11 +3067,16 @@ class Libp2pIsolationBridgeTopology:
           NEVER peer-served from P: pub-proxy.upstream.nar >= 1. REVERT the scope split (#1) -> P_pub
           peer-fetches K from P through the bridge -> pub-proxy.upstream.nar == 0 (RED).
 
-    -- HONESTY (compile-frozen, author-only): NONE of the above has been RUN. The composition is
-    plausible from the sources but UNVERIFIED end-to-end; every construct that depends on real
-    runtime behavior carries an inline `# TODO(TASK-280 validate)` marker. NOT registered in
-    E2E_FAST (an unvalidated scenario in the fast gate broke a prior gate — see TASK-276 notes);
-    registered in SCENARIOS only (runnable via `--only`) until it is proven RED-at-HEAD then GREEN.
+    -- VALIDATION (TASK-280 AC#4, 2026-08-20, rootless podman): RUN and GREEN 11/11 at HEAD. The
+    two-network rootless join, the dual-homed bridge, the provider announce with H's quorum, and
+    P_pub's public-leg bootstrap all work. The scope-split KEY + END-TO-END oracles are proven
+    RED-at-HEAD by reverting ONLY the scope split (P+H -> v1): P_pub POSITIVELY learns K
+    (`discovered 1 provider record(s) via kad`) and peer-fetches it from P (pub upstream.nar==0),
+    the exact codex leak — restored -> GREEN. DIAL/identify oracles stay GREEN at HEAD (dial veto is
+    profile-derived) and are UNIT-mutation-proven; their system-level single-mitigation RED is
+    entangled by the layered defenses and left as a documented pending step (needs a multi-mitigation
+    revert + image rebuild), never faked. The identify-completed non-vacuity TODO below is likewise
+    documented, not resolved. Now registered in E2E_FAST.
     """
 
     LAN_SUBNET = "10.211.34.0/24"
@@ -3180,14 +3185,13 @@ class Libp2pIsolationBridgeTopology:
         #     PeerId offline-derivable so P_pub can bootstrap to /ip4/203.0.113.20/... with a known
         #     PeerId. The dummy bootstrap entry mirrors the genesis BOOT node (kad self-lookup fails
         #     best-effort; the node still binds and routes). X reaches a cache upstream on either leg.
-        # TODO(TASK-280 validate): confirm the composite /bin/daemon accepts a wildcard
-        #   --libp2p-listen and that mDNS/identify then ADVERTISE the concrete 203.0.113.20 addr to
-        #   P (that advertisement is what the DIAL/identify legs rely on); and confirm `--network
-        #   lan --network public` attaches both NICs (podman rootless CNI/netavark two-net join).
-        # TODO(TASK-280 validate): pin BOTH legs' IPs via podman's `--network <net>:ip=<addr>` form
-        #   so P_pub's bootstrap entry (IP_X_PUB) and the LAN readiness probe (IP_X_LAN) address X's
-        #   REAL interfaces (a bare `--network a --network b` auto-assigns, leaving these IPs a guess).
-        #   Confirm this rootless netavark syntax is accepted by the podman in the gate image.
+        # VALIDATED (2026-08-20, rootless podman): `--network lan --network public` attaches BOTH
+        #   NICs and the `--network <net>:ip=<addr>` pin form is accepted by rootless netavark here, so
+        #   IP_X_LAN/IP_X_PUB address X's REAL interfaces (P_pub's bootstrap to IP_X_PUB and the LAN
+        #   readiness probe on IP_X_LAN both succeed). The composite /bin/daemon accepts the wildcard
+        #   --libp2p-listen (X binds and routes). STILL OPEN (identify non-vacuity, below): whether X
+        #   then ADVERTISES the concrete 203.0.113.20 to P over identify is NOT directly observed — the
+        #   DIAL/identify GREEN is consistent with "advertised-then-filtered" OR "never advertised".
         run(
             [pm, "run", "-d", "--label", PROJECT_LABEL, "--name", self._c("lp-bridge"),
              "--network", f"{self.LAN_NET}:ip={self.IP_X_LAN}",
@@ -7860,11 +7864,19 @@ def scenario_libp2p_lan_share_isolation_bridge(ctx: Ctx, expect) -> None:
       5. END-TO-END <- the composition: P_pub gets K from the PUBLIC upstream (or not at all), never
          peer-served from P.
 
-    HONESTY: compile-frozen, AUTHOR-ONLY — NOT RUN, NOT VALIDATED. Every runtime-dependent construct
-    carries an inline `# TODO(TASK-280 validate)`. RED-at-HEAD for each oracle must be DEMONSTRATED by
-    reverting the specific mitigation (not assumed). This scenario is deliberately NOT in E2E_FAST
-    (the Justfile fast gate) until it is proven RED-at-HEAD then GREEN post-compile-resume; it is
-    registered in SCENARIOS only, runnable via `--only libp2p-lan-share-isolation-bridge`.
+    VALIDATION (TASK-280 AC#4, run 2026-08-20 rootless podman): the topology STANDS UP — two-network
+    rootless join (`--network net:ip=`), the dual-homed bridge, the wildcard-listen bridge, the
+    provider announce with H's put-quorum, and P_pub bootstrapping across the public leg all work.
+    HEAD (mitigated) = 11/11 GREEN in ~72s. The CORE GUARANTEE is proven to BITE: reverting ONLY the
+    AC#3 scope split (put P+H back on `v1`) reddens EXACTLY the two scope-split oracles — KEY leg
+    (P_pub's log POSITIVELY shows `discovered 1 provider record(s) ... via kad`, the codex leak firing)
+    and END-TO-END (pub upstream.nar==0, i.e. P_pub peer-fetched K from P through the bridge) — while
+    the DIAL/identify oracles stay GREEN (the dial veto is profile-derived, scope-independent). That is
+    a positively-observed leak, not a slow-propagation false-negative. The DIAL/identify oracles pass
+    GREEN at HEAD and their mitigations are UNIT-mutation-proven (fabric-libp2p); a clean SYSTEM-level
+    single-mitigation RED for them is entangled by the layered defenses (relaxing one leaves another
+    covering) and needs a multi-mitigation revert + image rebuild — documented, not faked. The SERVE
+    leg stays a documented unit-level bite. Now registered in E2E_FAST.
     """
     fixtures = ctx.fixtures
     seed_dir, prov_seeds, target_sp = _s7_seeds(ctx, "isobridge", S7_TARGET)

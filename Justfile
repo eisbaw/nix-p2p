@@ -341,9 +341,12 @@ package:
 #   * There is a ~11s floor per scenario (pod setup), so the COUNT of scenarios
 #     dominates the cost far more than which ones are chosen. Adding a sixth
 #     "cheap" scenario here costs ~11s, not ~1s.
-E2E_FAST := "--only s1-byte-and-counts --only narinfo-default-cache-offload --only s2-fallback --only tamper-narhash --only chain-s1-and-counts --only s6-p2p --only s9-libp2p-grow --only s10-libp2p-seed-and-grow --only libp2p-leech --only libp2p-bootstrap-outage --only libp2p-mdns-bootstrap --only libp2p-mdns-scope-isolation --only libp2p-lan-share-zeroconfig --only libp2p-lan-share-cross-host-serve"
+E2E_FAST := "--only s1-byte-and-counts --only narinfo-default-cache-offload --only s2-fallback --only tamper-narhash --only chain-s1-and-counts --only s6-p2p --only s9-libp2p-grow --only s10-libp2p-seed-and-grow --only libp2p-leech --only libp2p-bootstrap-outage --only libp2p-mdns-bootstrap --only libp2p-mdns-scope-isolation --only libp2p-lan-share-zeroconfig --only libp2p-lan-share-cross-host-serve --only libp2p-lan-share-isolation-bridge"
 
-# Run the fast breadth-first e2e subset (14 scenarios) - the common pre-commit loop.
+# Run the fast breadth-first e2e subset (15 scenarios) - the common pre-commit loop.
+# NB: libp2p-lan-share-isolation-bridge (TASK-280 AC#4) needs rootless two-network podman
+# (LAN 10.211.34.0/24 + PUBLIC 203.0.113.0/24 TEST-NET-3) and a NET_RAW pcap sidecar; validated
+# GREEN 11/11 at HEAD with the scope-split KEY+END-TO-END oracles proven RED-at-HEAD on revert.
 e2e: _headroom _python fixtures-large
     "${NIX_P2P_PYTHON}/bin/python3" scripts/e2e_harness.py {{E2E_FAST}}
 
