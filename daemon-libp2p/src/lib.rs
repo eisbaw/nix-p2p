@@ -1623,6 +1623,20 @@ struct AnnounceLedger {
     /// dropped from here ONLY on a SUCCESSFUL withdraw (a failed one is KEPT for retry); it stays in
     /// `announced` for dedup, so its one budget unit is not re-spent.
     held: HashMap<NarHashKey, (ContentKey, String)>,
+    /// The NarHashes owned by the DURABLE, memory-resident `--libp2p-seed-nar` leg (TASK-279 AC#1).
+    /// This hook is a strict NO-OP for any key in here: it never reserves a budget unit, never
+    /// announces, and — the load-bearing part — never TRACKS it in `held`, so [`reconcile`] can never
+    /// WITHDRAW it.
+    ///
+    /// Why: the seed leg is a `MemoryNarSupplier` that is NEVER GC'd, and it announced the key ONCE at
+    /// startup (`announce_provider_seeds`). If the announce-after-fetch hook ALSO announced the same
+    /// key (a self-fetch that self-realises it into `/nix/store`) and later a store-path GC drove
+    /// `reconcile` to withdraw it, the minted tombstone would SUPERSEDE the seed leg's still-valid
+    /// announce — tombstoning discovery for a NAR the node can STILL serve from memory (served-but-not-
+    /// announced), and unrepairably so (the key stays in `announced`, so a re-fetch is `AlreadyHandled`
+    /// and never re-announces). The durable seed leg OWNS discovery for these keys; the hook must not
+    /// touch them.
+    seed_owned: HashSet<NarHashKey>,
 }
 
 /// The outcome of [`begin`]: whether `on_fetched` should proceed to spawn a grow.
@@ -1632,6 +1646,12 @@ enum Begin {
     Proceed,
     /// The key is already announced or a grow for it is in flight; do nothing (not a failure).
     AlreadyHandled,
+    /// The key is owned by the DURABLE, memory-resident seed leg (TASK-279 AC#1). The hook is a strict
+    /// NO-OP: never reserve, never announce, never track (so `reconcile` can never withdraw it and
+    /// tombstone the seed leg's own never-GC'd announce). Distinct from `AlreadyHandled` (which is
+    /// same-key dedup within the hook's own grows) so the state machine — and the mutation that would
+    /// re-introduce the tombstone — is legible.
+    SeedOwned,
     /// The budget is spent; announcing STOPS. This is the AC#2 enforcement point that `on_fetched`
     /// consults - the mutation that removes the guard (or the `begin` CALL in `on_fetched`) makes
     /// the announce count grow unbounded.
@@ -1645,6 +1665,13 @@ enum Begin {
 /// - lets the announce count grow unbounded (both mutations reddened by the budget bite).
 fn begin(ledger: &Mutex<AnnounceLedger>, key: &NarHashKey) -> Begin {
     let mut led = ledger.lock().expect("announce ledger poisoned");
+    // TASK-279 AC#1 (STATE MACHINE, checked FIRST): a key the durable memory-resident seed leg owns
+    // is never touched by this hook — no reserve, no announce, no `held` track. This is what prevents
+    // a later store-path GC from withdrawing (tombstoning) the seed leg's own never-GC'd announce.
+    // MUST precede the dedup/budget arms: a seed-owned key must never enter `inflight`/`held`.
+    if led.seed_owned.contains(key) {
+        return Begin::SeedOwned;
+    }
     if led.announced.contains(key) || led.inflight.contains(key) {
         return Begin::AlreadyHandled;
     }
@@ -2223,6 +2250,10 @@ impl Libp2pAnnounceAfterFetch {
         ttl_secs: u64,
         store_dir: String,
         announce_budget_count: u64,
+        // TASK-279 AC#1: the NarHashes the DURABLE memory-resident seed leg owns. The hook is a strict
+        // no-op for these (never grows/tracks/withdraws them), so a store-path GC can never tombstone
+        // the seed leg's own never-GC'd announce. Empty when there is no seed leg.
+        seed_owned: HashSet<NarHashKey>,
     ) -> Self {
         let worker = GrowWorker {
             fabric: Arc::clone(&fabric),
@@ -2243,6 +2274,7 @@ impl Libp2pAnnounceAfterFetch {
                 inflight: HashSet::new(),
                 announced: HashSet::new(),
                 held: HashMap::new(),
+                seed_owned,
             })),
             spawner: Arc::new(WorkerSpawner { grower, withdrawer }),
             budget_cap: announce_budget_count,
@@ -2274,6 +2306,11 @@ impl PostFetchAnnounce for Libp2pAnnounceAfterFetch {
         let grow = match begin(&self.ledger, &key) {
             Begin::Proceed => Some((key, store_path.to_string())),
             Begin::AlreadyHandled => None,
+            // TASK-279 AC#1: the durable seed leg OWNS discovery for this key (it announced it once at
+            // startup and never GCs). The hook must not grow/track/withdraw it, or a later store-path
+            // GC would tombstone the seed leg's still-valid announce (served-but-not-announced). No
+            // grow; `dispatch` still runs reconcile for the OTHER (genuinely grown) holdings.
+            Begin::SeedOwned => None,
             Begin::Exhausted => {
                 eprintln!(
                     "LIBP2P-ANNOUNCE-AFTER-FETCH budget-exhausted narhash={key} \
@@ -2377,8 +2414,23 @@ pub async fn announce_public_seeds(
     // allowlisted, minting a claim-bearing capability, or the whole public announce is refused.
     let approved = approve_seeds_for_public(seeds, allowlist)
         .map_err(|rejected| format!("public announce refused by the allowlist gate: {rejected}"))?;
-    // The claim is held to HERE, so a public seed announce is unrepresentable without an
-    // allowlist-minted claim. Reconstruct the (already-verified) seeds for the shared loop.
+    announce_approved_seeds(fabric, readiness, config, &approved, allowlist).await
+}
+
+/// Announce a record per ALREADY-APPROVED [`ApprovedPublicSeed`] (the public-seed counterpart of
+/// [`announce_approved_public`]). Split out of [`announce_public_seeds`] so a caller that has ALREADY
+/// authorized the seed leg (TASK-279 AC#2 authorize-all-first) announces WITHOUT re-approving. The
+/// claim is held to HERE, so a public seed announce is unrepresentable without an allowlist-minted
+/// claim; the witness is minted from the SAME allowlist (allowlist-gated), distinct from the LAN
+/// door's AdmitAll witness.
+async fn announce_approved_seeds(
+    fabric: &Libp2pFabric,
+    readiness: &ProviderRelayReadiness,
+    config: InitialAnnounceConfig<'_>,
+    approved: &[ApprovedPublicSeed],
+    allowlist: &PublicNarAllowlist,
+) -> Result<Vec<ProviderRecord>, String> {
+    // Reconstruct the (already-verified) seeds for the shared loop.
     let approved_seeds: Vec<(NarHashKey, Vec<u8>)> = approved
         .iter()
         .map(|a| {
@@ -2386,8 +2438,6 @@ pub async fn announce_public_seeds(
             (a.nar_hash, a.bytes.clone())
         })
         .collect();
-    // Public door (AC#2/#3): mint the witness from the SAME allowlist (allowlist-gated), distinct
-    // from the LAN door's AdmitAll witness.
     announce_seed_records(
         fabric,
         readiness,
@@ -2396,6 +2446,60 @@ pub async fn announce_public_seeds(
         &AllowlistWitnessAuthority { allowlist },
     )
     .await
+}
+
+/// TASK-279 AC#2 (TRANSACTION — authorize-all-first): authorize EVERY public leg (seeds AND
+/// provisions) against the allowlist BEFORE any record is announced. ALL-OR-NOTHING: `?` short-
+/// circuits on the FIRST refusal from EITHER leg, so a refusal returns `Err` with NO partial
+/// approval — the caller then announces nothing.
+///
+/// This closes the non-atomic publish window: the provider install path used to
+/// `announce_public_seeds` (which PUBLISHES the seed records to the DHT) and only THEN
+/// `announce_public_provisions` (which authorizes the provision leg). An un-allowlisted provision
+/// would `Err` the whole startup AFTER the seed records were already on the wire, leaving them to
+/// linger to their TTL. Authorizing both legs up front means one refused leg publishes zero records.
+pub fn authorize_public_supply(
+    seeds: &[(NarHashKey, Vec<u8>)],
+    provisions: &[StoreProvision],
+    allowlist: &PublicNarAllowlist,
+) -> Result<(Vec<ApprovedPublicSeed>, Vec<ApprovedPublicProvision>), PublicationRejected> {
+    let approved_seeds = approve_seeds_for_public(seeds, allowlist)?;
+    let approved_provisions = approve_provisions_for_public(provisions, allowlist)?;
+    Ok((approved_seeds, approved_provisions))
+}
+
+/// TASK-279 AC#2: announce a PUBLIC provider's WHOLE additive supply ATOMICALLY w.r.t. allowlist
+/// authorization — authorize every leg FIRST ([`authorize_public_supply`]), and only then announce
+/// the approved seeds AND provisions. On ANY allowlist refusal, NO record is published (authorize
+/// fails before the first announce). Returns `(seed_records, provision_records)`, index-aligned with
+/// `seeds` / `provisions`.
+///
+/// It REPLACES the previous per-leg `announce_public_seeds` + `announce_public_provisions` call
+/// sequence in the provider install path, whose ordering published the seed records before the
+/// provision leg was authorized (the non-atomic window this closes). A PHASE-2 (post-authorization)
+/// failure is a NETWORK error, not an allowlist refusal — those are the ambiguous best-effort
+/// announces the announcer's TTL semantics already cover, not a partial publish of an UNAUTHORIZED
+/// record.
+pub async fn announce_public_supply(
+    fabric: &Libp2pFabric,
+    readiness: &ProviderRelayReadiness,
+    config: InitialAnnounceConfig<'_>,
+    seeds: &[(NarHashKey, Vec<u8>)],
+    provisions: &[StoreProvision],
+    allowlist: &PublicNarAllowlist,
+) -> Result<(Vec<ProviderRecord>, Vec<ProviderRecord>), String> {
+    // PHASE 1 — authorize EVERY leg before announcing ANY record (fail-closed, all-or-nothing).
+    let (approved_seeds, approved_provisions) =
+        authorize_public_supply(seeds, provisions, allowlist).map_err(|rejected| {
+            format!("public announce refused by the allowlist gate: {rejected}")
+        })?;
+    // PHASE 2 — every leg is authorized; announce them (config is Copy, so it is reused per leg).
+    let seed_records =
+        announce_approved_seeds(fabric, readiness, config, &approved_seeds, allowlist).await?;
+    let provision_records =
+        announce_approved_public(fabric, readiness, config, &approved_provisions, allowlist)
+            .await?;
+    Ok((seed_records, provision_records))
 }
 
 /// Build the node's ONE public-NAR allowlist (TASK-103), the single authority the PUBLIC announce
@@ -3128,6 +3232,65 @@ Sig: nix-p2p-test-1:Xqf1bjNJ1ReFahm86zY+hv80+7QeJer5V/HjlEAvP39yJEK8w8jHG9WH5lM7
             other => panic!("expected SizeMismatch, got {other:?}"),
         }
     }
+
+    // ---- TASK-279 AC#2: the WHOLE-supply authorize-all-first transaction ----
+
+    /// AC#2 TRANSACTION BITE: a public provider authorizes its WHOLE additive supply (seeds AND
+    /// provisions) BEFORE announcing ANY record. With an ALLOWLISTED seed S and an UN-ALLOWLISTED
+    /// provision P, [`authorize_public_supply`] REFUSES the whole supply (Err) and approves NOTHING —
+    /// so `announce_public_supply` announces nothing and S is never published to the DHT. This closes
+    /// the non-atomic window where the seed leg was announced (published) before the provision leg was
+    /// even authorized, leaving S to linger to its TTL on a P-refusal.
+    ///
+    /// MUTATION (reopens the window): make `authorize_public_supply` return the approved seed leg even
+    /// when the provision leg is refused (e.g. `.unwrap_or_default()` on the provision arm instead of
+    /// `?`) and the `NotAllowlisted` assertion below flips to an Ok(S approved) — the exact leak.
+    #[test]
+    fn authorize_public_supply_refuses_the_whole_supply_on_one_unallowlisted_leg() {
+        use super::authorize_public_supply;
+        let list = allowlist_with_app();
+        const UNALLOWLISTED: &str = "sha256:1nn8563y6j55y003xjk1bvb1854abmigsas2jgzy4shy0f4vnzpa";
+
+        // S allowlisted, P NOT allowlisted -> the WHOLE supply is refused (S is never approved to
+        // announce). Attribute the refusal to the provision leg's allowlist decision.
+        match authorize_public_supply(
+            &[seed(APP_NAR_HASH, 408)],
+            &[provision(UNALLOWLISTED, 524_808)],
+            &list,
+        ) {
+            Err(PublicationRejected::NotAllowlisted(_)) => {}
+            other => panic!(
+                "an un-allowlisted provision must refuse the WHOLE supply (so the allowlisted seed \
+                 S is never announced), got {other:?}"
+            ),
+        }
+
+        // Symmetric: an un-allowlisted SEED alongside an allowlisted provision also refuses the whole.
+        assert!(
+            authorize_public_supply(
+                &[seed(UNALLOWLISTED, 524_808)],
+                &[provision(APP_NAR_HASH, 408)],
+                &list,
+            )
+            .is_err(),
+            "an un-allowlisted seed must refuse the whole supply too"
+        );
+
+        // NON-VACUOUS: a fully-allowlisted supply authorizes BOTH legs (both use the APP proof here),
+        // so the refusal above is the allowlist decision, not an always-Err primitive.
+        let (approved_seeds, approved_provisions) = authorize_public_supply(
+            &[seed(APP_NAR_HASH, 408)],
+            &[provision(APP_NAR_HASH, 408)],
+            &list,
+        )
+        .expect("a fully-allowlisted supply authorizes both legs");
+        assert_eq!(approved_seeds.len(), 1, "the seed leg is approved");
+        assert_eq!(
+            approved_provisions.len(),
+            1,
+            "the provision leg is approved"
+        );
+    }
 }
 
 #[cfg(test)]
@@ -3662,11 +3825,18 @@ mod announce_after_fetch_tests {
         format!("/nix/store/{HASH32}-pkg-{seed}")
     }
     fn empty_ledger(budget: u64) -> Arc<Mutex<AnnounceLedger>> {
+        ledger_with_seed_owned(budget, HashSet::new())
+    }
+    fn ledger_with_seed_owned(
+        budget: u64,
+        seed_owned: HashSet<NarHashKey>,
+    ) -> Arc<Mutex<AnnounceLedger>> {
         Arc::new(Mutex::new(AnnounceLedger {
             remaining: budget,
             inflight: HashSet::new(),
             announced: HashSet::new(),
             held: HashMap::new(),
+            seed_owned,
         }))
     }
 
@@ -3687,10 +3857,19 @@ mod announce_after_fetch_tests {
         }
     }
     fn hook_with_fake(budget: u64, grows: Arc<Mutex<Vec<NarHashKey>>>) -> Libp2pAnnounceAfterFetch {
+        hook_over(empty_ledger(budget), budget, grows)
+    }
+    /// A hook over an EXPLICIT ledger (so a test can pre-seed `seed_owned`) whose FakeSpawner records
+    /// the keys it is asked to grow.
+    fn hook_over(
+        ledger: Arc<Mutex<AnnounceLedger>>,
+        budget_cap: u64,
+        grows: Arc<Mutex<Vec<NarHashKey>>>,
+    ) -> Libp2pAnnounceAfterFetch {
         Libp2pAnnounceAfterFetch {
-            ledger: empty_ledger(budget),
+            ledger,
             spawner: Arc::new(FakeSpawner { grows }),
-            budget_cap: budget,
+            budget_cap,
         }
     }
 
@@ -3736,6 +3915,125 @@ mod announce_after_fetch_tests {
             hook.budget_used(),
             Some(2),
             "budget_used = cap - remaining, read from the enforced ledger"
+        );
+    }
+
+    // ---- TASK-279 AC#1: the seed-owned key STATE MACHINE (never grown/tracked/withdrawn) ----
+
+    /// AC#1 BITE (production `on_fetched` + ledger): a NarHash the durable memory-resident seed leg
+    /// owns is classified `SeedOwned` — NOT `Proceed` — so `on_fetched` dispatches NO grow, reserves
+    /// no budget, and never marks it in-flight (the reserve that would later become a `held` track).
+    /// A key that is NOT seed-owned still grows, proving the guard is the seed-ownership, not a blanket
+    /// no-op. MUTATION: drop the `seed_owned` arm in `begin` and the seed-owned key returns `Proceed`
+    /// -> a grow is dispatched, budget is spent, and it is marked in-flight -> every assertion below
+    /// reddens.
+    #[test]
+    fn a_seed_owned_key_is_classified_seedowned_and_never_reserved() {
+        use daemon_core::PostFetchAnnounce;
+        let seed_key = key(1); // owned by the durable seed leg
+        let grown_key = key(2); // an ordinary fetched path
+        let ledger = ledger_with_seed_owned(10, [seed_key].into_iter().collect());
+
+        // begin classifies the two keys differently at the ledger boundary.
+        assert_eq!(
+            begin(&ledger, &seed_key),
+            Begin::SeedOwned,
+            "a seed-owned key is SeedOwned (the durable seed leg owns discovery for it)"
+        );
+        {
+            let led = ledger.lock().unwrap();
+            assert_eq!(led.remaining, 10, "a seed-owned key reserves no budget");
+            assert!(
+                led.inflight.is_empty(),
+                "a seed-owned key is never in-flight"
+            );
+            assert!(
+                led.held.is_empty(),
+                "a seed-owned key is never tracked/held"
+            );
+        }
+
+        // Through the PRODUCTION on_fetched path: the seed-owned key dispatches NO grow; the ordinary
+        // key does (non-vacuous — the two differ only by seed-ownership).
+        let grows = Arc::new(Mutex::new(Vec::new()));
+        let hook = hook_over(Arc::clone(&ledger), 10, Arc::clone(&grows));
+        hook.on_fetched(&nar_hash(1), &store_path_str(1)); // seed-owned -> no grow
+        assert!(
+            grows.lock().unwrap().is_empty(),
+            "on_fetched must dispatch NO grow for a seed-owned key"
+        );
+        hook.on_fetched(&nar_hash(2), &store_path_str(2)); // ordinary -> grows
+        assert_eq!(
+            *grows.lock().unwrap(),
+            vec![grown_key],
+            "an ordinary (non-seed-owned) fetched path still grows"
+        );
+    }
+
+    /// AC#1 END-TO-END BITE (the tombstone hazard): a seed-owned key that the node self-fetches and
+    /// self-realises into `/nix/store`, then GCs, must NEVER be withdrawn by the hook — else the minted
+    /// tombstone would SUPERSEDE the seed leg's own never-GC'd announce, making the NAR served-but-not-
+    /// announced (and unrepairably so). Drive the production reserve (`begin`, mapped exactly as
+    /// `on_fetched` does) + the production dispatch body (`WorkerSpawner::run`) across the self-fetch
+    /// and a post-GC reconcile: the withdrawer is called ZERO times and nothing is tracked.
+    /// MUTATION: drop the `seed_owned` arm in `begin` -> the self-fetch reserves + the FakeGrower's
+    /// announce commit_success-TRACKS the key in `held` -> the post-GC reconcile WITHDRAWS it
+    /// (tombstone) -> `withdrawn` is non-empty. RED.
+    #[tokio::test]
+    async fn a_seed_owned_key_is_never_withdrawn_after_a_store_gc() {
+        let seed_key = key(1);
+        // A store path that never exists on disk == a GC'd path (reconcile's `!exists()` signal).
+        let gc_path = format!("/nix/store/{HASH32}-gc-d-seed");
+        let ledger = ledger_with_seed_owned(10, [seed_key].into_iter().collect());
+
+        // The self-fetch of the seed-owned key. `on_fetched` maps begin's outcome to a grow exactly
+        // this way (Proceed -> Some, everything else -> None); replicate that mapping, then run the
+        // production dispatch body. Under the fix this is None (SeedOwned) -> no announce, no track.
+        let grow = match begin(&ledger, &seed_key) {
+            Begin::Proceed => Some((seed_key, gc_path.clone())),
+            _ => None,
+        };
+        let withdrawn = Arc::new(Mutex::new(Vec::new()));
+        let wd: Arc<dyn Withdrawer> = Arc::new(FakeWithdrawer {
+            result: Arc::new(Mutex::new(true)),
+            withdrawn: Arc::clone(&withdrawn),
+        });
+        // A grower that WOULD announce (Some) if it were ever handed a grow — so the only thing keeping
+        // the key out of `held` is the SeedOwned classification, not a failing announce.
+        WorkerSpawner::run(
+            Arc::clone(&ledger),
+            Arc::new(FakeGrower {
+                outcome: Arc::new(Mutex::new(Some(content_key(1)))),
+            }),
+            Arc::clone(&wd),
+            grow,
+        )
+        .await;
+        // A later fetch (budget-exhausted / any) drives reconcile over the (now GC'd) path.
+        WorkerSpawner::run(
+            Arc::clone(&ledger),
+            Arc::new(NoopGrower),
+            Arc::clone(&wd),
+            None,
+        )
+        .await;
+
+        assert!(
+            withdrawn.lock().unwrap().is_empty(),
+            "a seed-owned key must NEVER be withdrawn (no tombstone over the seed leg's announce)"
+        );
+        let led = ledger.lock().unwrap();
+        assert!(
+            led.held.is_empty(),
+            "a seed-owned key is never tracked in `held`"
+        );
+        assert!(
+            !led.announced.contains(&seed_key),
+            "a seed-owned key never enters the hook's `announced` dedup set"
+        );
+        assert_eq!(
+            led.remaining, 10,
+            "no budget was ever spent on the seed-owned key"
         );
     }
 
@@ -3887,6 +4185,7 @@ mod announce_after_fetch_tests {
             inflight: HashSet::new(),
             announced: [key(1), key(2)].into_iter().collect(),
             held,
+            seed_owned: HashSet::new(),
         }));
         let withdrawn = Arc::new(Mutex::new(Vec::new()));
         let wd: Arc<dyn Withdrawer> = Arc::new(FakeWithdrawer {
@@ -3923,6 +4222,7 @@ mod announce_after_fetch_tests {
             inflight: HashSet::new(),
             announced: [key(5)].into_iter().collect(),
             held,
+            seed_owned: HashSet::new(),
         }));
         let result = Arc::new(Mutex::new(false)); // fail the first withdraw
         let withdrawn = Arc::new(Mutex::new(Vec::new()));

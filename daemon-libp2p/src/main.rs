@@ -28,11 +28,11 @@ use daemon_core::{
 use daemon_libp2p::{
     AnnounceAfterFetchDoor, InitialAnnounceConfig, LAN_SHARE_SCOPE_HINT, LanReachability, LanShare,
     Libp2pAnnounceAfterFetch, Libp2pCatalogProbe, Libp2pSourceConfig, PublicationPlan,
-    StoreProvision, SwarmStatusFacts, announce_provider_seeds, announce_public_provisions,
-    announce_public_seeds, announce_store_provisions, build_libp2p_nar_source,
-    build_libp2p_provider_source, disclose_then_activate_serve, effective_network_scope,
-    lan_isolation_or_refuse, lan_serving_disclosures, open_public_allowlist,
-    resolve_durable_identity_seed, should_hint_lan_share_scope, verify_store_provisions,
+    StoreProvision, SwarmStatusFacts, announce_provider_seeds, announce_public_supply,
+    announce_store_provisions, build_libp2p_nar_source, build_libp2p_provider_source,
+    disclose_then_activate_serve, effective_network_scope, lan_isolation_or_refuse,
+    lan_serving_disclosures, open_public_allowlist, resolve_durable_identity_seed,
+    should_hint_lan_share_scope, verify_store_provisions,
 };
 use ed25519_dalek::SigningKey;
 use fabric_libp2p::{
@@ -628,6 +628,27 @@ fn parse_config<I: IntoIterator<Item = String>>(args: I) -> Result<Config, Strin
             ));
         }
     }
+    // TASK-273: an explicit provider `--profile lan-share` IS the give-side intent, so it back-fills
+    // the provider axis. Without this a bare `--profile lan-share` (no `--libp2p-provider`) would
+    // derive UPSTREAM-ONLY and then fail the compat-shim cross-check below — the exact "lan-share is
+    // not zero-config" gap. lan-share is a PROVIDER (is_provider, no public allowlist), so setting
+    // the flag makes the derivation AGREE with the declaration while keeping the cross-check honest
+    // (e.g. `--profile lan-share --libp2p-leech` still fails closed as LeechServes). public-share is
+    // intentionally NOT back-filled: it additionally requires its allowlist flags, so `--profile
+    // public-share` alone must still fail loud (declared public-share != derived lan-share).
+    //
+    // TASK-279 AC#3 (parse ordering): this back-fill MUST run BEFORE the `--libp2p-announce-after-
+    // fetch` PROVIDER-companion check below. `--profile lan-share --libp2p-seed-nar S
+    // --libp2p-announce-after-fetch` (NO explicit `--libp2p-provider`) is the NORTH-STAR zero-config
+    // combo: the back-fill makes `libp2p_provider` true so the companion check sees a provider and
+    // the config parses, instead of rejecting the operator's own declared give-side intent. It is
+    // placed AFTER the leech/router give-side checks so `--profile lan-share --libp2p-leech` still
+    // fails closed at derivation (LeechServes), not with a confusing "leech + --libp2p-provider"
+    // message for a flag the operator never passed.
+    if cfg.explicit_profile.as_deref() == Some(SharingProfile::LanShare.as_str()) {
+        cfg.libp2p_provider = true;
+    }
+
     // --libp2p-announce-after-fetch is a PROVIDER companion (it needs the serve axis + announcer):
     // reject it on a consumer rather than silently ignore it.
     if cfg.libp2p_announce_after_fetch && !cfg.libp2p_provider {
@@ -712,18 +733,6 @@ fn parse_config<I: IntoIterator<Item = String>>(args: I) -> Result<Config, Strin
         return Err(
             "--libp2p-public-allowlist-path requires at least one --libp2p-trusted-public-key; without a trusted narinfo-signing key nothing can be proven public and every announce would be refused".into(),
         );
-    }
-
-    // TASK-273: an explicit provider `--profile lan-share` IS the give-side intent, so it back-fills
-    // the provider axis. Without this a bare `--profile lan-share` (no `--libp2p-provider`) would
-    // derive UPSTREAM-ONLY and then fail the compat-shim cross-check below — the exact "lan-share is
-    // not zero-config" gap. lan-share is a PROVIDER (is_provider, no public allowlist), so setting
-    // the flag makes the derivation AGREE with the declaration while keeping the cross-check honest
-    // (e.g. `--profile lan-share --libp2p-leech` still fails closed as LeechServes). public-share is
-    // intentionally NOT back-filled: it additionally requires its allowlist flags, so `--profile
-    // public-share` alone must still fail loud (declared public-share != derived lan-share).
-    if cfg.explicit_profile.as_deref() == Some(SharingProfile::LanShare.as_str()) {
-        cfg.libp2p_provider = true;
     }
 
     // AUTHORITY INVERSION (TASK-120): derive the AUTHORITATIVE profile from the flags, then
@@ -1328,58 +1337,62 @@ async fn install_provider(
     // Announce the SEED leg (if built). The announce door mirrors the store leg's: PUBLIC-announce
     // mode (a configured allowlist) gates each record on a trusted narinfo signature; ISOLATED-LAN
     // mode keeps the TASK-102 `lan_share_or_refuse` stopgap.
-    if !seeds.is_empty() {
-        let records = match &plan {
-            PublicationPlan::Allowlist => {
-                announce_public_seeds(&fabric, &readiness, announce_config, &seeds, allowlist)
-                    .await?
-            }
-            PublicationPlan::Lan(lan) => {
-                announce_provider_seeds(&fabric, &readiness, announce_config, &seeds, *lan).await?
-            }
-        };
-        for (record, (nar_hash, bytes)) in records.iter().zip(&seeds) {
-            // TASK-120 fix #6: content-identity fields routed through the privacy policy (marker +
-            // keys stay for machine oracles; secret values masked unless --diagnostics).
-            println!(
-                "LIBP2P-SEED narhash={} content={} content_key={} bytes={}",
-                privacy.content_id(&nar_hash.to_string()),
-                privacy.content_id(&record.content.to_hex()),
-                privacy.content_id(&record.key.to_string()),
-                bytes.len()
-            );
+    //
+    // TASK-279 AC#2 (TRANSACTION — atomic public publish): for a PUBLIC (allowlist) plan, authorize
+    // EVERY leg (seeds AND provisions) BEFORE announcing ANY record via `announce_public_supply`
+    // (authorize-all-then-announce-all). An un-allowlisted provision therefore publishes ZERO seed
+    // records, instead of the old ordering that announced the seed leg to the DHT and only then
+    // authorized the provision leg (leaving seed records to linger to TTL on a provision refusal).
+    // The LAN plan has no allowlist refusal (AdmitAll) and each leg's only announce-time failure is a
+    // network error, so it stays per-leg (nothing to be non-atomic about).
+    let (seed_records, provision_records) = match &plan {
+        PublicationPlan::Allowlist => {
+            announce_public_supply(
+                &fabric,
+                &readiness,
+                announce_config,
+                &seeds,
+                &provisions,
+                allowlist,
+            )
+            .await?
         }
-    }
-
-    // Announce the STORE leg (if any provisions were verified). The parse-time #3 dedup guarantees
-    // every provision's NarHash differs from every seed's, so no per-ContentKey durable-sequence
-    // collision against the same fabric/identity.
-    if !provisions.is_empty() {
-        let records = match &plan {
-            PublicationPlan::Allowlist => {
-                announce_public_provisions(
-                    &fabric,
-                    &readiness,
-                    announce_config,
-                    &provisions,
-                    allowlist,
-                )
-                .await?
-            }
-            PublicationPlan::Lan(lan) => {
+        PublicationPlan::Lan(lan) => {
+            let seed_records = if seeds.is_empty() {
+                Vec::new()
+            } else {
+                announce_provider_seeds(&fabric, &readiness, announce_config, &seeds, *lan).await?
+            };
+            // The parse-time #3 dedup guarantees every provision's NarHash differs from every seed's,
+            // so no per-ContentKey durable-sequence collision against the same fabric/identity.
+            let provision_records = if provisions.is_empty() {
+                Vec::new()
+            } else {
                 announce_store_provisions(&fabric, &readiness, announce_config, &provisions, *lan)
                     .await?
-            }
-        };
-        for (record, provision) in records.iter().zip(&provisions) {
-            println!(
-                "LIBP2P-PROVIDE-STORE narhash={} content={} content_key={} nar_size={}",
-                privacy.content_id(&provision.nar_hash().to_string()),
-                privacy.content_id(&record.content.to_hex()),
-                privacy.content_id(&record.key.to_string()),
-                provision.declared_size(),
-            );
+            };
+            (seed_records, provision_records)
         }
+    };
+    for (record, (nar_hash, bytes)) in seed_records.iter().zip(&seeds) {
+        // TASK-120 fix #6: content-identity fields routed through the privacy policy (marker +
+        // keys stay for machine oracles; secret values masked unless --diagnostics).
+        println!(
+            "LIBP2P-SEED narhash={} content={} content_key={} bytes={}",
+            privacy.content_id(&nar_hash.to_string()),
+            privacy.content_id(&record.content.to_hex()),
+            privacy.content_id(&record.key.to_string()),
+            bytes.len()
+        );
+    }
+    for (record, provision) in provision_records.iter().zip(&provisions) {
+        println!(
+            "LIBP2P-PROVIDE-STORE narhash={} content={} content_key={} nar_size={}",
+            privacy.content_id(&provision.nar_hash().to_string()),
+            privacy.content_id(&record.content.to_hex()),
+            privacy.content_id(&record.key.to_string()),
+            provision.declared_size(),
+        );
     }
 
     // ANNOUNCE-AFTER-FETCH (TASK-77): build the hook over the SAME store index + fabric + identity so
@@ -1396,6 +1409,11 @@ async fn install_provider(
                 PublicationPlan::Allowlist => AnnounceAfterFetchDoor::Public(allowlist.clone()),
                 PublicationPlan::Lan(lan) => AnnounceAfterFetchDoor::Lan(*lan),
             };
+            // TASK-279 AC#1: hand the hook the NarHashes the durable memory-resident seed leg owns, so
+            // it never grows/tracks/withdraws a seed-owned key (a store-path GC would otherwise
+            // tombstone the seed leg's own never-GC'd announce). Empty when there is no seed leg.
+            let seed_owned: std::collections::HashSet<daemon_core::NarHashKey> =
+                seeds.iter().map(|(nar_hash, _)| *nar_hash).collect();
             let hook = Libp2pAnnounceAfterFetch::new(
                 Arc::clone(&fabric),
                 identity_seed,
@@ -1406,6 +1424,7 @@ async fn install_provider(
                 3600,
                 cfg.store_dir.clone(),
                 cfg.libp2p_announce_budget,
+                seed_owned,
             );
             println!(
                 "LIBP2P-ANNOUNCE-AFTER-FETCH enabled budget={}",
@@ -2962,6 +2981,49 @@ mod operator_contract_tests {
         assert!(
             err.contains("--libp2p-seed-nar") || err.contains("--libp2p-provide-store"),
             "the failure must name the missing supply set: {err}"
+        );
+    }
+
+    /// TASK-279 AC#3 (parse ordering; NORTH-STAR zero-config combo): the exact argv
+    /// `--profile lan-share --libp2p-seed-nar S --libp2p-announce-after-fetch` with NO explicit
+    /// `--libp2p-provider` MUST PARSE — the lan-share provider back-fill runs BEFORE the
+    /// announce-after-fetch PROVIDER-companion check, so the operator's declared give-side intent is
+    /// honoured instead of rejected. It carries the seed leg (S) AND the growing hook.
+    ///
+    /// MUTATION (restores the ordering bug): move the `explicit_profile == lan-share` back-fill back
+    /// to after the `libp2p_announce_after_fetch && !libp2p_provider` check and this `expect` flips to
+    /// an Err ("--libp2p-announce-after-fetch requires --libp2p-provider"), because the check would
+    /// see `libp2p_provider` still false.
+    #[test]
+    fn lan_share_seed_plus_announce_after_fetch_parses_without_explicit_provider() {
+        let cfg = parse_config(args(&[
+            "--profile",
+            "lan-share",
+            "--libp2p-seed-nar",
+            &format!("{APP_NAR_HASH}=/tmp/app.nar"),
+            "--libp2p-announce-after-fetch",
+        ]))
+        .expect(
+            "the NORTH-STAR combo (lan-share + seed + announce-after-fetch, no explicit provider) \
+             must parse: the back-fill precedes the announce-after-fetch companion check",
+        );
+        assert_eq!(
+            cfg.profile,
+            SharingProfile::LanShare,
+            "the declared lan-share must derive lan-share"
+        );
+        assert!(
+            cfg.libp2p_provider,
+            "the lan-share back-fill must set the provider axis (else the companion check rejects it)"
+        );
+        assert!(
+            cfg.libp2p_announce_after_fetch,
+            "announce-after-fetch stays on (the growing hook)"
+        );
+        assert_eq!(
+            cfg.libp2p_seed_nar.len(),
+            1,
+            "the seed leg S is carried through"
         );
     }
 

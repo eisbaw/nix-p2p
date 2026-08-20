@@ -32,11 +32,11 @@ use daemon::{
     PassThroughReason, PrivacyPolicy, PublicNarAllowlist, PublicationAuthorityAuthorization,
     PublicationPlan, RawServeDecision, RelayCapability, ResourceCaps, ServeBudget, SharingProfile,
     StorePath, StoreProvision, SystemClock, TaskSupervisor, TransportNarSource, TransportRegistry,
-    UpstreamHttp, announce_provider_seeds, announce_public_provisions, announce_public_seeds,
-    announce_store_provisions, build_libp2p_nar_source, build_libp2p_provider_source,
-    build_narinfo_layer, disclose_then_activate_serve, effective_network_scope,
-    lan_isolation_or_refuse, lan_serving_disclosures, resolve_durable_identity_seed,
-    resolve_narinfo_cache_dir, serve, should_hint_lan_share_scope, verify_store_provisions,
+    UpstreamHttp, announce_provider_seeds, announce_public_supply, announce_store_provisions,
+    build_libp2p_nar_source, build_libp2p_provider_source, build_narinfo_layer,
+    disclose_then_activate_serve, effective_network_scope, lan_isolation_or_refuse,
+    lan_serving_disclosures, resolve_durable_identity_seed, resolve_narinfo_cache_dir, serve,
+    should_hint_lan_share_scope, verify_store_provisions,
 };
 use fabric_libp2p::{
     CatalogNarSupplier, Libp2pFabric, Libp2pNarSupplier, MemoryNarSupplier, Multiaddr, PeerId,
@@ -2173,56 +2173,58 @@ async fn install_libp2p_provider(
 
     // Announce the SEED leg (if built). PUBLIC-announce mode (a configured allowlist) gates each
     // record; ISOLATED-LAN mode keeps the TASK-102 `lan_share_or_refuse` stopgap.
-    if !seeds.is_empty() {
-        let records = match &plan {
-            PublicationPlan::Allowlist => {
-                announce_public_seeds(&fabric, &readiness, announce_config, &seeds, allowlist)
-                    .await?
-            }
-            PublicationPlan::Lan(lan) => {
-                announce_provider_seeds(&fabric, &readiness, announce_config, &seeds, *lan).await?
-            }
-        };
-        for (record, (nar_hash, bytes)) in records.iter().zip(&seeds) {
-            println!(
-                "LIBP2P-SEED narhash={} content={} content_key={} bytes={}",
-                privacy.content_id(&nar_hash.to_string()),
-                privacy.content_id(&record.content.to_hex()),
-                privacy.content_id(&record.key.to_string()),
-                bytes.len()
-            );
+    //
+    // TASK-279 AC#2 (TRANSACTION — atomic public publish): for a PUBLIC (allowlist) plan, authorize
+    // EVERY leg (seeds AND provisions) BEFORE announcing ANY record via `announce_public_supply`
+    // (authorize-all-then-announce-all), so an un-allowlisted provision publishes ZERO seed records
+    // rather than leaving already-announced seed records to linger to TTL. The LAN plan has no
+    // allowlist refusal (AdmitAll), so it stays per-leg.
+    let (seed_records, provision_records) = match &plan {
+        PublicationPlan::Allowlist => {
+            announce_public_supply(
+                &fabric,
+                &readiness,
+                announce_config,
+                &seeds,
+                &provisions,
+                allowlist,
+            )
+            .await?
         }
-    }
-
-    // Announce the STORE leg (if any provisions were verified). The parse-time #3 dedup guarantees
-    // every provision's NarHash differs from every seed's, so no per-ContentKey durable-sequence
-    // collision against the same fabric/identity.
-    if !provisions.is_empty() {
-        let records = match &plan {
-            PublicationPlan::Allowlist => {
-                announce_public_provisions(
-                    &fabric,
-                    &readiness,
-                    announce_config,
-                    &provisions,
-                    allowlist,
-                )
-                .await?
-            }
-            PublicationPlan::Lan(lan) => {
+        PublicationPlan::Lan(lan) => {
+            let seed_records = if seeds.is_empty() {
+                Vec::new()
+            } else {
+                announce_provider_seeds(&fabric, &readiness, announce_config, &seeds, *lan).await?
+            };
+            // The parse-time #3 dedup guarantees every provision's NarHash differs from every seed's,
+            // so no per-ContentKey durable-sequence collision against the same fabric/identity.
+            let provision_records = if provisions.is_empty() {
+                Vec::new()
+            } else {
                 announce_store_provisions(&fabric, &readiness, announce_config, &provisions, *lan)
                     .await?
-            }
-        };
-        for (record, provision) in records.iter().zip(&provisions) {
-            println!(
-                "LIBP2P-PROVIDE-STORE narhash={} content={} content_key={} nar_size={}",
-                privacy.content_id(&provision.nar_hash().to_string()),
-                privacy.content_id(&record.content.to_hex()),
-                privacy.content_id(&record.key.to_string()),
-                provision.declared_size(),
-            );
+            };
+            (seed_records, provision_records)
         }
+    };
+    for (record, (nar_hash, bytes)) in seed_records.iter().zip(&seeds) {
+        println!(
+            "LIBP2P-SEED narhash={} content={} content_key={} bytes={}",
+            privacy.content_id(&nar_hash.to_string()),
+            privacy.content_id(&record.content.to_hex()),
+            privacy.content_id(&record.key.to_string()),
+            bytes.len()
+        );
+    }
+    for (record, provision) in provision_records.iter().zip(&provisions) {
+        println!(
+            "LIBP2P-PROVIDE-STORE narhash={} content={} content_key={} nar_size={}",
+            privacy.content_id(&provision.nar_hash().to_string()),
+            privacy.content_id(&record.content.to_hex()),
+            privacy.content_id(&record.key.to_string()),
+            provision.declared_size(),
+        );
     }
 
     println!(
@@ -2247,6 +2249,11 @@ async fn install_libp2p_provider(
             PublicationPlan::Allowlist => daemon::AnnounceAfterFetchDoor::Public(allowlist.clone()),
             PublicationPlan::Lan(lan) => daemon::AnnounceAfterFetchDoor::Lan(*lan),
         };
+        // TASK-279 AC#1: hand the hook the NarHashes the durable memory-resident seed leg owns, so it
+        // never grows/tracks/withdraws a seed-owned key (a store-path GC would otherwise tombstone the
+        // seed leg's own never-GC'd announce). Empty when there is no seed leg.
+        let seed_owned: std::collections::HashSet<NarHashKey> =
+            seeds.iter().map(|(nar_hash, _)| *nar_hash).collect();
         let hook = daemon::Libp2pAnnounceAfterFetch::new(
             Arc::clone(&fabric),
             identity_seed,
@@ -2257,6 +2264,7 @@ async fn install_libp2p_provider(
             3600,
             config.store_dir.clone(),
             config.libp2p_announce_budget,
+            seed_owned,
         );
         println!(
             "LIBP2P-ANNOUNCE-AFTER-FETCH enabled budget={}",
