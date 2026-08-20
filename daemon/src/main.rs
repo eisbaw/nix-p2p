@@ -3258,6 +3258,42 @@ mod tests {
     }
 
     #[test]
+    fn lan_isolation_guard_permits_a_private_lan_listen_provider() {
+        // TASK-276 PARITY (composite binary): the shared isolation predicate reached via this
+        // crate's `lan_share_or_refuse` now admits RFC1918/ULA private listens for a no-allowlist
+        // lan-share, so two same-pin machines serve each other cross-host. A GLOBAL/wildcard listen
+        // (above) still refuses.
+        for a in [
+            "/ip4/10.0.0.5/tcp/4001",
+            "/ip4/192.168.1.5/tcp/4001",
+            "/ip4/172.16.9.9/tcp/4001",
+            "/ip6/fd00::1/tcp/4001",
+        ] {
+            let config = Config {
+                libp2p_listen: Some(guard_addr(a)),
+                ..Config::default()
+            };
+            assert!(
+                lan_share_or_refuse(&config).is_ok(),
+                "a private-LAN listen ({a}) is LAN-only and must be permitted"
+            );
+        }
+    }
+
+    #[test]
+    fn lan_isolation_guard_refuses_a_global_listen_provider() {
+        // TASK-276: distinct from the wildcard test — a GLOBAL/routable unicast listen must still
+        // refuse under a no-allowlist lan-share (the relax admits ONLY provably-private ranges).
+        let config = Config {
+            libp2p_listen: Some(guard_addr("/ip4/8.8.8.8/tcp/4001")),
+            ..Config::default()
+        };
+        let err =
+            lan_share_or_refuse(&config).expect_err("a global/routable listen must be refused");
+        assert!(err.contains("TASK-103"), "must name TASK-103: {err}");
+    }
+
+    #[test]
     fn banner_names_this_crate_and_a_version() {
         let text = banner();
         assert!(
