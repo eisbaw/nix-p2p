@@ -103,6 +103,7 @@ mod directory;
 mod fabric;
 mod floor_store;
 mod keys;
+mod lan;
 mod locator;
 mod nar;
 mod nar_v4;
@@ -115,6 +116,9 @@ pub use announcer::{Libp2pAvailabilityAnnouncer, MAX_RECORD_TTL_SECS};
 pub use directory::Libp2pProviderDirectory;
 pub use fabric::{ANNOUNCE_SEQ_FILENAME, Libp2pFabric, PROVIDER_FLOOR_FILENAME};
 pub use keys::{RelayHintDerivationError, VALUE_KEY_CONTEXT, relay_hints_from_circuit_addresses};
+pub use lan::{
+    LAN_SHARE_NETWORK_SCOPE, ip_is_lan_literal, ip_is_provably_private, multiaddr_lan_provenance,
+};
 pub use locator::Libp2pNodeLocator;
 pub use nar::{
     CatalogNarSupplier, CatalogProbe, Libp2pNarSupplier, MemoryNarSupplier, NarSupplyPlan,

@@ -4,7 +4,7 @@
 //! is the standard rust-libp2p driver shape; it keeps the async capability traits free
 //! of the swarm's single-threaded ownership.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
@@ -25,6 +25,7 @@ use libp2p_stream::{Control, IncomingStreams};
 use tokio::sync::{mpsc, oneshot};
 
 use crate::keys::{keypair_from_seed, node_id_of};
+use crate::lan::{LanDialGuard, multiaddr_lan_provenance};
 use crate::nar::{self, ServeGate};
 use peer_fabric::{
     AdmitAllPublication, Blake3Digest, Lookup, NodeId, PublicationEligibility, RefusePublication,
@@ -38,6 +39,17 @@ use peer_fabric::{
 /// `.await`, never on the swarm poll loop) is all it needs - the hot path is a single `Arc`
 /// clone per inbound stream, off the poll loop.
 type ServeSlot = Arc<Mutex<Option<Arc<ServeGate>>>>;
+
+/// The live set of LAN-PROVENANCE connections per peer (TASK-280 mitigation #2), maintained by the
+/// worker on `ConnectionEstablished`/`ConnectionClosed` and read by the NAR accept loop before it
+/// serves. A connection is recorded here IFF its remote address (the dialed address for an outbound
+/// connection, the observed `send_back_addr` for an inbound one) has LAN provenance
+/// ([`multiaddr_lan_provenance`]). `Some` ONLY on the no-allowlist `lan-share` path
+/// ([`NodeConfig::with_lan_confinement`]); `None` for every other profile, where serving is
+/// unrestricted (public-share serves per its allowlist, a consumer never serves). A brief
+/// `std::sync::Mutex` shared with the accept loop — like [`ServeSlot`], never held across an
+/// `.await` and never on the swarm poll loop.
+type LanServeConns = Arc<Mutex<HashMap<PeerId, HashSet<ConnectionId>>>>;
 
 /// Why a kad query did not return a healthy answer. Mapped to
 /// [`peer_fabric::Unavailable`] by the directory.
@@ -334,6 +346,15 @@ pub struct Behaviour {
     /// `check-discovery-no-shortcut.py` bites if an mDNS event is ever wired to
     /// `find_providers`/`get_providers`.
     pub mdns: Toggle<mdns::tokio::Behaviour>,
+    /// The outbound-dial VETO that confines a no-allowlist `lan-share` node's egress to LAN peer
+    /// addresses (TASK-280 mitigation #1), wrapped in a [`Toggle`] so it is DEFAULT OFF: disabled =
+    /// `Toggle::from(None)`, the guard is ABSENT and dialing is unrestricted (public-share /
+    /// consume-only). Enabled ([`NodeConfig::with_lan_confinement`]), the derived `NetworkBehaviour`
+    /// runs its `handle_established_outbound_connection` on EVERY behaviour-initiated dial — including
+    /// kad's autonomous by-`PeerId` dials of query-learned addresses, which never pass through
+    /// `add_address` — and denies any concrete address without LAN provenance. See [`LanDialGuard`]
+    /// for why the per-address (established) hook, not (only) the pending hook, is the real chokepoint.
+    pub lan_dial_guard: Toggle<LanDialGuard>,
 }
 
 /// The live transport path to a peer, derived from the swarm's own `ConnectionEstablished` /
@@ -1671,6 +1692,12 @@ struct Worker {
     /// Bounded admission control for mDNS-discovered peers (TASK-257 F-1): caps how many distinct
     /// LAN advertisements we act on per window, so an unauthenticated mDNS flood cannot skew routing.
     mdns_admission: MdnsAdmission,
+    /// The LAN-confinement live view (TASK-280): `Some` ONLY on the no-allowlist `lan-share` path.
+    /// Its presence is the SINGLE source of truth for LAN confinement in the worker — it both (a)
+    /// gates the `identify`/`mDNS` `add_address` callsites to LAN-only addresses (k-bucket hygiene)
+    /// and (b) records each connection's LAN provenance for the accept loop's serve gate. `None` for
+    /// every other profile (unrestricted dialing + serving).
+    lan_serve_conns: Option<LanServeConns>,
 }
 
 struct PendingListen {
@@ -2373,6 +2400,22 @@ impl Worker {
                         ?reason,
                         "fabric-libp2p: closing exact connection rejected by authority transition"
                     );
+                } else if let Some(lan_conns) = &self.lan_serve_conns {
+                    // LAN confinement (TASK-280 mitigation #2): record this KEPT connection's LAN
+                    // provenance for the accept loop's serve gate. The remote address is the DIALED
+                    // address for an outbound connection and the observed `send_back_addr` for an
+                    // inbound one; a relayed (`/p2p-circuit`) endpoint classifies NON-LAN. Only
+                    // LAN-provenance connections are recorded, so a serve over an outbound connection
+                    // to a non-LAN peer (the bidirectional-serve leg) finds no entry and is refused.
+                    let remote = endpoint.get_remote_address();
+                    if multiaddr_lan_provenance(remote) {
+                        lan_conns
+                            .lock()
+                            .expect("lan serve conns poisoned")
+                            .entry(peer_id)
+                            .or_default()
+                            .insert(connection_id);
+                    }
                 }
             }
             SwarmEvent::OutgoingConnectionError {
@@ -2409,6 +2452,18 @@ impl Worker {
                     )));
                 }
                 remove_connection_route(&mut self.conn_routes, peer_id, connection_id);
+                // Retire this connection from the LAN-provenance serve view (TASK-280). Remove by
+                // id (no need to re-classify the endpoint); prune the peer's now-empty bucket so a
+                // peer with zero live LAN connections is no longer serve-eligible.
+                if let Some(lan_conns) = &self.lan_serve_conns {
+                    let mut map = lan_conns.lock().expect("lan serve conns poisoned");
+                    if let Some(conns) = map.get_mut(&peer_id) {
+                        conns.remove(&connection_id);
+                        if conns.is_empty() {
+                            map.remove(&peer_id);
+                        }
+                    }
+                }
             }
             SwarmEvent::Behaviour(BehaviourEvent::Identify(identify::Event::Received {
                 peer_id,
@@ -2416,9 +2471,22 @@ impl Worker {
                 ..
             })) => {
                 // Identify tells us a peer's real listen addresses; feed them into kad
-                // routing so iterative lookups can reach it.
+                // routing so iterative lookups can reach it. Under LAN confinement (TASK-280),
+                // admit ONLY LAN-provenance addresses into the k-buckets (hygiene): the dial
+                // VETO is the real chokepoint (it also stops query-learned addresses that never
+                // reach `add_address`), but keeping non-LAN addresses out of routing avoids
+                // wasted denied-dial churn.
+                let confined = self.lan_serve_conns.is_some();
                 let kad = &mut self.swarm.behaviour_mut().kad;
                 for addr in info.listen_addrs {
+                    if confined && !multiaddr_lan_provenance(&addr) {
+                        tracing::debug!(
+                            %peer_id, %addr,
+                            "fabric-libp2p: lan-share confinement dropping non-LAN identify address \
+                             (not added to kad routing)"
+                        );
+                        continue;
+                    }
                     kad.add_address(&peer_id, addr);
                 }
             }
@@ -2488,6 +2556,7 @@ impl Worker {
                 // X?" (that stays kad-EXCLUSIVE; `check-discovery-no-shortcut.py` bites if it feeds
                 // find_providers).
                 let now = Instant::now();
+                let confined = self.lan_serve_conns.is_some();
                 let kad = &mut self.swarm.behaviour_mut().kad;
                 for (peer_id, addr) in peers {
                     if !self.mdns_admission.admit(peer_id, now) {
@@ -2495,6 +2564,19 @@ impl Worker {
                             %peer_id, %addr,
                             "fabric-libp2p: mDNS admission cap reached this window; dropping surplus \
                              LAN advertisement (flood bound, TASK-257 F-1)"
+                        );
+                        continue;
+                    }
+                    // Under LAN confinement (TASK-280), keep non-LAN mDNS-advertised addresses out
+                    // of the k-buckets (hygiene). mDNS is link-local so its addresses are normally
+                    // LAN already, but a malicious LAN host can multicast a peer record naming a
+                    // GLOBAL address; the dial veto would deny the dial regardless, this just avoids
+                    // seeding routing with an address we would never dial.
+                    if confined && !multiaddr_lan_provenance(&addr) {
+                        tracing::debug!(
+                            %peer_id, %addr,
+                            "fabric-libp2p: lan-share confinement dropping non-LAN mDNS address \
+                             (not added to kad routing)"
                         );
                         continue;
                     }
@@ -2691,8 +2773,42 @@ impl Worker {
 /// capped per connection by yamux, so parked tasks cannot accumulate without bound. A global
 /// concurrent-serve semaphore (a stricter cap than the request-response carrier's built-in
 /// inbound limit) is a possible future hardening, not needed for the current trust model.
-async fn run_accept_loop(mut incoming: IncomingStreams, serve_slot: ServeSlot) {
+/// The LAN-confinement SERVE gate (TASK-280 mitigation #2). `true` = this peer may be served:
+///   * off the lan-share path (`lan_serve_conns` is `None`) every peer is permitted (public-share
+///     serves per its allowlist; a consumer never serves);
+///   * on the lan-share path the peer must have at least one LIVE LAN-provenance connection recorded
+///     by the worker. This closes the bidirectional-serve leg — a peer reachable ONLY over an
+///     OUTBOUND connection we opened to a NON-LAN address (or over a relay circuit) has no LAN entry
+///     and is refused. FAIL-CLOSED: an unrecorded peer is denied (a genuine LAN peer whose
+///     `ConnectionEstablished` has not yet been processed simply retries — within the "a peer costs a
+///     retry" TCB). Extracted as a pure function so the gate is unit-mutation-provable.
+fn lan_serve_permitted(lan_serve_conns: &Option<LanServeConns>, peer: &PeerId) -> bool {
+    match lan_serve_conns {
+        None => true,
+        Some(lan_conns) => lan_conns
+            .lock()
+            .expect("lan serve conns poisoned")
+            .get(peer)
+            .is_some_and(|conns| !conns.is_empty()),
+    }
+}
+
+async fn run_accept_loop(
+    mut incoming: IncomingStreams,
+    serve_slot: ServeSlot,
+    lan_serve_conns: Option<LanServeConns>,
+) {
     while let Some((peer, stream)) = incoming.next().await {
+        // LAN-confinement serve gate (TASK-280 mitigation #2): see `lan_serve_permitted`.
+        if !lan_serve_permitted(&lan_serve_conns, &peer) {
+            tracing::warn!(
+                %peer,
+                "fabric-libp2p: lan-share confinement REFUSING NAR serve — peer has no live \
+                 LAN-provenance connection (serving only same-LAN peers; dropping stream)"
+            );
+            drop(stream);
+            continue;
+        }
         // A brief lock, off the poll loop, to snapshot the current gate (an `Arc` clone or
         // `None`); never held across the serve `.await`.
         let gate = serve_slot.lock().expect("serve slot poisoned").clone();
@@ -2845,6 +2961,12 @@ pub const DEFAULT_KAD_SERVER: bool = true;
 /// axis-1 (local discovery) only: enabling it NEVER implies serving, announcing, or public
 /// participation.
 pub const DEFAULT_MDNS_ENABLED: bool = false;
+
+/// Whether a node confines its egress + serving to LAN peers by default (TASK-280). `false`: the
+/// [`LanDialGuard`] is ABSENT and dialing/serving are unrestricted. The composition root sets it
+/// `true` ([`NodeConfig::with_lan_confinement`]) ONLY for a no-allowlist `lan-share` node, whose
+/// public-isolation guarantee it holds end-to-end.
+pub const DEFAULT_LAN_CONFINEMENT: bool = false;
 
 /// The bounded admission cap for mDNS-discovered LAN peers (TASK-257 F-1): at most this many
 /// DISTINCT mDNS peers are dialed per [`MDNS_ADMISSION_WINDOW_SECS`] window. INTEGER. A real
@@ -3072,6 +3194,17 @@ pub struct NodeConfig {
     /// silently reopen the bypass). This is the ONE place the announcer's authority is set; it
     /// never enters the swarm.
     pub publication_eligibility: Arc<dyn PublicationEligibility>,
+    /// LAN CONFINEMENT (TASK-280): when `true`, this node's egress and serving are restricted to
+    /// LAN peers, holding the no-allowlist `lan-share` public-isolation GUARANTEE end-to-end. It
+    /// (1) installs the [`LanDialGuard`] outbound-dial veto so the node opens NO usable connection
+    /// to a non-LAN address (covering kad's autonomous by-`PeerId` dials of query-learned
+    /// addresses), (2) gates the `identify`/`mDNS` `add_address` callsites to LAN-only addresses,
+    /// and (3) refuses to serve NAR bytes over any connection lacking LAN provenance (closing the
+    /// bidirectional-serve leg). Defaults to [`DEFAULT_LAN_CONFINEMENT`] (`false`): every other
+    /// profile dials and serves unrestricted. Set by the composition root ONLY for a
+    /// [`PublicationPlan::Lan`](../../daemon_libp2p/enum.PublicationPlan.html)-equivalent
+    /// `lan-share` node; `public-share` (allowlist-gated) and `consume-only` never set it.
+    pub lan_confinement: bool,
 }
 
 impl NodeConfig {
@@ -3092,6 +3225,7 @@ impl NodeConfig {
             // `with_admit_all_publication` (isolated LAN) or `with_publication_eligibility`
             // (the allowlist-backed public authority).
             publication_eligibility: Arc::new(RefusePublication),
+            lan_confinement: DEFAULT_LAN_CONFINEMENT,
         }
     }
 
@@ -3132,6 +3266,16 @@ impl NodeConfig {
     /// and NEVER content discovery. See [`NodeConfig::mdns_enabled`].
     pub fn with_mdns(mut self, enabled: bool) -> Self {
         self.mdns_enabled = enabled;
+        self
+    }
+
+    /// Confine this node's egress + serving to LAN peers (TASK-280, builder style). Default is
+    /// `false` ([`DEFAULT_LAN_CONFINEMENT`]): dialing and serving are unrestricted. Pass `true`
+    /// ONLY for a no-allowlist `lan-share` node — it installs the [`LanDialGuard`] outbound-dial
+    /// veto, gates the `identify`/`mDNS` `add_address` callsites to LAN-only addresses, and refuses
+    /// to serve NAR bytes over any non-LAN-provenance connection. See [`NodeConfig::lan_confinement`].
+    pub fn with_lan_confinement(mut self, enabled: bool) -> Self {
+        self.lan_confinement = enabled;
         self
     }
 
@@ -3380,6 +3524,10 @@ impl Node {
         // before the behaviour closure so it can decide whether to install the mDNS behaviour
         // (a disabled `Toggle` when off = zero multicast, the default).
         let mdns_enabled = config.mdns_enabled;
+        // LAN confinement (TASK-280). `bool` is `Copy`; capture it before the behaviour closure so
+        // it can decide whether to install the `LanDialGuard` outbound-dial veto, and so the worker
+        // + accept loop can be wired with the LAN-provenance serve view.
+        let lan_confinement = config.lan_confinement;
 
         let kad_protocol = StreamProtocol::try_from_owned(format!("/nix-p2p/{scope}/kad/1.0.0"))
             .map_err(|e| NodeError::Build(format!("invalid kad protocol name: {e:?}")))?;
@@ -3458,6 +3606,12 @@ impl Node {
                         None
                     }
                     .into();
+                    // LAN confinement (TASK-280): install the outbound-dial VETO ONLY on the
+                    // no-allowlist `lan-share` path. Off = `Toggle::from(None)`: the guard is absent
+                    // and dialing is unrestricted. On, the derived `NetworkBehaviour` runs its
+                    // per-address veto on every behaviour-initiated dial (see [`LanDialGuard`]).
+                    let lan_dial_guard: Toggle<LanDialGuard> =
+                        lan_confinement.then_some(LanDialGuard).into();
                     Ok(Behaviour {
                         kad,
                         identify,
@@ -3467,6 +3621,7 @@ impl Node {
                         relay_client,
                         dcutr,
                         mdns,
+                        lan_dial_guard,
                     })
                 },
             )
@@ -3495,7 +3650,16 @@ impl Node {
             NodeError::Build(format!("failed to register the NAR stream protocol: {e}"))
         })?;
         let serve_slot: ServeSlot = Arc::new(Mutex::new(None));
-        let accept_join = tokio::spawn(run_accept_loop(incoming, Arc::clone(&serve_slot)));
+        // The LAN-provenance serve view (TASK-280 mitigation #2): `Some` ONLY under LAN
+        // confinement. Shared between the worker (writer, on connection events) and the accept loop
+        // (reader, per inbound stream). `None` off the lan-share path -> unrestricted serving.
+        let lan_serve_conns: Option<LanServeConns> =
+            lan_confinement.then(|| Arc::new(Mutex::new(HashMap::new())));
+        let accept_join = tokio::spawn(run_accept_loop(
+            incoming,
+            Arc::clone(&serve_slot),
+            lan_serve_conns.clone(),
+        ));
 
         let (tx, rx) = mpsc::channel(64);
         // The dedicated LOSSLESS query-cancel channel (TASK-154 B3), separate from the bounded
@@ -3517,6 +3681,7 @@ impl Node {
                 Duration::from_secs(MDNS_ADMISSION_WINDOW_SECS),
                 Instant::now(),
             ),
+            lan_serve_conns,
         };
         let join = tokio::spawn(worker.run());
 
@@ -4227,6 +4392,101 @@ mod tests {
             .expect("the legitimate private-scope node must pass the startup isolation invariant");
         // Sanity: the node came up with the identity we seeded (the invariant ran on ITS behaviour).
         let _ = node.peer_id;
+    }
+
+    // ===================== TASK-280 LAN confinement (mitigations #1 + #2) =====================
+
+    #[tokio::test]
+    async fn lan_confinement_dial_veto_is_wired_only_on_the_lan_share_path() {
+        // PROVES mitigation #1 is WIRED into the production swarm on the confined path ONLY: a
+        // LAN-confined node REFUSES an outbound dial to a GLOBAL address (the LanDialGuard's
+        // pre-transport pending hook denies it synchronously) and ADMITS a LAN address; an
+        // UNCONFINED node admits the global dial (guard absent). The confined-vs-unconfined
+        // contrast IS the attribution — flip `with_lan_confinement(true)` to `false` (or drop the
+        // guard's veto) and the first assertion turns Ok.
+        let confined = Node::start(
+            NodeConfig::new([21u8; 32])
+                .with_network_scope("lan-veto-test")
+                .with_lan_confinement(true),
+        )
+        .expect("confined node starts");
+        // A GLOBAL address: denied before any transport dial -> synchronous Err.
+        assert!(
+            confined
+                .handle
+                .dial("/ip4/8.8.8.8/tcp/4001".parse().unwrap())
+                .await
+                .is_err(),
+            "a LAN-confined node must REFUSE an outbound dial to a global address"
+        );
+        // A LAN address: admitted by the guard (the async transport attempt then fails to connect,
+        // but the dial CALL is accepted) -> Ok.
+        assert!(
+            confined
+                .handle
+                .dial("/ip4/127.0.0.1/tcp/1".parse().unwrap())
+                .await
+                .is_ok(),
+            "a LAN-confined node must ADMIT an outbound dial to a LAN address"
+        );
+
+        // Control: without confinement the guard is absent, so the global dial is admitted.
+        let open = Node::start(NodeConfig::new([22u8; 32]).with_network_scope("lan-veto-test"))
+            .expect("unconfined node starts");
+        assert!(
+            open.handle
+                .dial("/ip4/8.8.8.8/tcp/4001".parse().unwrap())
+                .await
+                .is_ok(),
+            "an UNCONFINED node admits a global dial (the guard is not installed)"
+        );
+    }
+
+    #[test]
+    fn lan_serve_gate_permits_only_lan_provenance_peers() {
+        // PROVES mitigation #2's serve gate decision. MUTATION: invert `lan_serve_permitted` (or
+        // drop the accept-loop `if !lan_serve_permitted` guard) and the confined-empty / confined-
+        // non-LAN assertions flip to permitting a serve.
+        let peer = PeerId::random();
+
+        // Off the lan-share path (None): serving is unrestricted.
+        assert!(
+            lan_serve_permitted(&None, &peer),
+            "with no confinement, every peer may be served"
+        );
+
+        // On the lan-share path with NO recorded LAN connection for the peer: REFUSED (fail-closed).
+        let map: LanServeConns = Arc::new(Mutex::new(HashMap::new()));
+        assert!(
+            !lan_serve_permitted(&Some(map.clone()), &peer),
+            "a confined node must REFUSE a peer with no live LAN-provenance connection"
+        );
+
+        // After recording a LAN-provenance connection (as the ConnectionEstablished handler does):
+        // PERMITTED.
+        map.lock()
+            .unwrap()
+            .entry(peer)
+            .or_default()
+            .insert(ConnectionId::new_unchecked(7));
+        assert!(
+            lan_serve_permitted(&Some(map.clone()), &peer),
+            "a confined node must PERMIT a peer with a live LAN-provenance connection"
+        );
+
+        // After the connection retires (ConnectionClosed prunes the empty bucket): REFUSED again.
+        {
+            let mut m = map.lock().unwrap();
+            let conns = m.get_mut(&peer).unwrap();
+            conns.remove(&ConnectionId::new_unchecked(7));
+            if conns.is_empty() {
+                m.remove(&peer);
+            }
+        }
+        assert!(
+            !lan_serve_permitted(&Some(map), &peer),
+            "once the peer's last LAN connection closes it is no longer serve-eligible"
+        );
     }
 
     // ===================== TASK-154 S4 query-cancel (work bound) =====================
