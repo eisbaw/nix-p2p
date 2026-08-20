@@ -2494,36 +2494,32 @@ impl Worker {
                 // TASK-280 #4 (cross-scope identify): identify negotiates the FIXED /ipfs/id/1.0.0
                 // name, so a cross-scope (e.g. public v1) peer completes identify with us even though
                 // it can never complete our SCOPED kad/nar handshakes. The scope rides only in the
-                // `protocol_version` METADATA. Under confinement, REJECT a peer whose advertised
-                // protocol_version is not our scoped id string and drop ALL its addresses — so a
-                // v1 bridge cannot seed our routing (and thus be dialed) via the identify address
-                // path. Without this gate, #1's address filtering would still let a cross-scope peer's
-                // LAN-looking addresses in.
-                if !identify_protocol_version_admitted(
+                // `protocol_version` METADATA. The COMPLETE gate — the cross-scope protocol_version
+                // REJECT and the per-address LAN-provenance FILTER — lives in the pure
+                // `identify_admitted_addresses`; this handler only APPLIES its result (adds exactly
+                // the returned addresses to kad routing), so it holds NO gate logic of its own and a
+                // mutation of EITHER sub-gate is caught by the unit test that drives that function
+                // (codex TEST-QUALITY: the earlier test was a string-equality on the protocol_version
+                // predicate and never exercised the address filter / production apply at all).
+                let admitted = identify_admitted_addresses(
                     confined,
                     &info.protocol_version,
                     &self.id_protocol,
-                ) {
+                    info.listen_addrs.iter().cloned(),
+                );
+                if confined && admitted.is_empty() && !info.listen_addrs.is_empty() {
                     tracing::debug!(
                         %peer_id,
                         advertised = %info.protocol_version,
                         expected = %self.id_protocol,
-                        "fabric-libp2p: lan-share confinement REJECTING cross-scope identify \
-                         (protocol_version mismatch); dropping all its addresses"
+                        "fabric-libp2p: lan-share confinement admitted NO identify addresses \
+                         (cross-scope protocol_version and/or no LAN-provenance address); none added \
+                         to kad routing"
                     );
-                } else {
-                    let kad = &mut self.swarm.behaviour_mut().kad;
-                    for addr in info.listen_addrs {
-                        if confined && !multiaddr_lan_provenance(&addr) {
-                            tracing::debug!(
-                                %peer_id, %addr,
-                                "fabric-libp2p: lan-share confinement dropping non-LAN identify \
-                                 address (not added to kad routing)"
-                            );
-                            continue;
-                        }
-                        kad.add_address(&peer_id, addr);
-                    }
+                }
+                let kad = &mut self.swarm.behaviour_mut().kad;
+                for addr in admitted {
+                    kad.add_address(&peer_id, addr);
                 }
             }
             SwarmEvent::Behaviour(BehaviourEvent::Kad(kad::Event::OutboundQueryProgressed {
@@ -2832,6 +2828,35 @@ fn identify_protocol_version_admitted(confined: bool, advertised: &str, expected
     !confined || advertised == expected
 }
 
+/// The addresses from a peer's identify record that may seed our kad routing under the current
+/// confinement (TASK-280 #4). This is the COMPLETE identify address gate — BOTH the cross-scope
+/// `protocol_version` reject AND the per-address LAN-provenance filter — so the production handler is
+/// a thin `for addr in identify_admitted_addresses(...) { kad.add_address(...) }` with NO gate logic
+/// of its own; mutating either sub-gate reddens the unit test that drives THIS function:
+///   * off the lan-share path (`confined == false`): every advertised address is admitted (public
+///     participation — identify discovery is how public nodes learn each other's addresses);
+///   * under confinement: EMPTY if the advertised protocol_version is not our scoped id string (a
+///     cross-scope peer's addresses never seed routing); otherwise ONLY the LAN-provenance addresses
+///     (a same-scope peer that advertises a global address still cannot seed a non-LAN dial target).
+fn identify_admitted_addresses(
+    confined: bool,
+    advertised_protocol_version: &str,
+    expected_protocol_version: &str,
+    listen_addrs: impl IntoIterator<Item = Multiaddr>,
+) -> Vec<Multiaddr> {
+    if !identify_protocol_version_admitted(
+        confined,
+        advertised_protocol_version,
+        expected_protocol_version,
+    ) {
+        return Vec::new();
+    }
+    listen_addrs
+        .into_iter()
+        .filter(|addr| !confined || multiaddr_lan_provenance(addr))
+        .collect()
+}
+
 fn lan_serve_permitted(
     lan_serve_conns: &Option<LanServeConns>,
     peer: &PeerId,
@@ -2847,12 +2872,23 @@ fn lan_serve_permitted(
     }
 }
 
-async fn run_accept_loop(
-    mut incoming: IncomingStreams,
-    serve_slot: ServeSlot,
+/// The PRODUCTION accept-loop body, generic over the stream ITEM so a unit test can drive the EXACT
+/// control flow with sentinel items (a real `libp2p_swarm::Stream` cannot be constructed off a live
+/// connection, so the earlier test called `lan_serve_permitted` in isolation — deleting the gate here
+/// stayed green, i.e. the "mutation proof" was decoration; codex TEST-QUALITY finding). Here the
+/// TASK-280 #2 serve gate is the ONLY gate in the loop and every accepted item flows through it: an
+/// item is handed to `serve` iff `lan_serve_permitted` admits its exact `(PeerId, ConnectionId)`;
+/// otherwise it is dropped. Deleting the `if !lan_serve_permitted` guard makes a non-LAN item reach
+/// `serve`, which `accept_loop_serves_only_lan_provenance_connections` observes and reddens.
+async fn accept_loop_core<St, T, F>(
+    mut incoming: St,
     lan_serve_conns: Option<LanServeConns>,
-) {
-    while let Some((peer, connection, stream)) = incoming.next().await {
+    mut serve: F,
+) where
+    St: futures::Stream<Item = (PeerId, ConnectionId, T)> + Unpin,
+    F: FnMut(PeerId, ConnectionId, T),
+{
+    while let Some((peer, connection, item)) = incoming.next().await {
         // LAN-confinement serve gate (TASK-280 mitigation #2): see `lan_serve_permitted`. The gate
         // keys on the EXACT connection the stream arrived on, so a non-LAN connection of an otherwise
         // LAN-connected peer is refused.
@@ -2863,16 +2899,27 @@ async fn run_accept_loop(
                 "fabric-libp2p: lan-share confinement REFUSING NAR serve — this connection has no \
                  recorded LAN provenance (serving only same-LAN connections; dropping stream)"
             );
-            drop(stream);
+            drop(item);
             continue;
         }
+        serve(peer, connection, item);
+    }
+    tracing::debug!("fabric-libp2p: NAR accept loop ended (swarm shut down)");
+}
+
+async fn run_accept_loop(
+    incoming: IncomingStreams,
+    serve_slot: ServeSlot,
+    lan_serve_conns: Option<LanServeConns>,
+) {
+    accept_loop_core(incoming, lan_serve_conns, |peer, _connection, stream| {
         // A brief lock, off the poll loop, to snapshot the current gate (an `Arc` clone or
         // `None`); never held across the serve `.await`.
         let gate = serve_slot.lock().expect("serve slot poisoned").clone();
         tracing::trace!(%peer, "fabric-libp2p: inbound NAR stream accepted");
         tokio::spawn(nar::serve_stream(stream, gate));
-    }
-    tracing::debug!("fabric-libp2p: NAR accept loop ended (swarm shut down)");
+    })
+    .await;
 }
 
 /// Default kad iterative-query timeout (the per-query deadline libp2p-kad enforces on a
@@ -3628,8 +3675,24 @@ impl Node {
                     // default `kad::Behaviour::new` (the PUBLIC IPFS DHT preset) bites (TASK-154 F2).
                     let kad =
                         build_kad_behaviour(peer_id, kad_protocol, kad_query_timeout, kad_server);
-                    let identify =
-                        identify::Behaviour::new(identify::Config::new(id_protocol, key.public()));
+                    // TASK-280 #4 (codex fix-review BLOCKER): the identify RECEIVE-gate below only
+                    // suppresses the app's explicit `kad.add_address`, but libp2p-identify 0.47
+                    // INTERNALLY caches every advertised listen address (default cache 100) and emits
+                    // `ToSwarm::NewExternalAddrOfPeer` BEFORE our event handler runs — seeding the
+                    // swarm address book so a cross-scope peer's GLOBAL address stays a dial candidate
+                    // for a later kad by-PeerId dial (the dial VETO denies it, but only AFTER a
+                    // transport connect). Under LAN confinement, build identify with `cache_size(0)`
+                    // (`PeerCache::disabled`): the internal cache never fires, so a mismatched-scope
+                    // peer's advertised address is never a dial candidate at all. Off the lan-share
+                    // path we keep the library default (public nodes rely on identify address
+                    // discovery for connectivity). The receive-gate is KEPT as defence in depth.
+                    let identify_config = identify::Config::new(id_protocol, key.public());
+                    let identify_config = if lan_confinement {
+                        identify_config.with_cache_size(0)
+                    } else {
+                        identify_config
+                    };
+                    let identify = identify::Behaviour::new(identify_config);
                     // The RAW-STREAM NAR byte-transfer substrate (TASK-157): opened and
                     // accepted through a Control on tasks OFF this poll loop. It is
                     // protocol-agnostic here; the concrete `/nar/4` name is registered on the
@@ -4606,6 +4669,91 @@ mod tests {
             !lan_serve_permitted(&Some(map), &peer, non_lan_conn),
             "a stream on a non-LAN connection of a LAN-connected peer must be REFUSED \
              (the bidirectional/connection-confusion serve leg)"
+        );
+    }
+
+    #[tokio::test]
+    async fn accept_loop_serves_only_lan_provenance_connections() {
+        // codex TEST-QUALITY (#4): the predicate tests above call `lan_serve_permitted` in isolation,
+        // so DELETING the accept-loop `if !lan_serve_permitted` guard stayed GREEN — the mutation
+        // proof was decoration. This drives the ACTUAL production loop body (`accept_loop_core`, the
+        // one `run_accept_loop` delegates to) with sentinel items and observes which reach the serve
+        // sink. MUTATION: delete the `if !lan_serve_permitted { drop; continue }` guard in
+        // `accept_loop_core` -> the non-LAN item is served too -> `served == [lan_conn, non_lan_conn]`
+        // and the length assertion reddens. Restore -> GREEN.
+        let peer = PeerId::random();
+        let lan_conn = ConnectionId::new_unchecked(7);
+        let non_lan_conn = ConnectionId::new_unchecked(8); // e.g. an outbound conn we opened to a public addr
+
+        let map: LanServeConns = Arc::new(Mutex::new(HashMap::new()));
+        map.lock()
+            .unwrap()
+            .entry(peer)
+            .or_default()
+            .insert(lan_conn);
+
+        // Two accepted streams (T = &str sentinel, so no real libp2p Stream is needed): one on the
+        // recorded LAN connection, one on a non-LAN connection of the SAME peer.
+        let incoming = futures::stream::iter(vec![
+            (peer, lan_conn, "lan"),
+            (peer, non_lan_conn, "non-lan"),
+        ]);
+        let served = Arc::new(Mutex::new(Vec::new()));
+        let sink = served.clone();
+        accept_loop_core(incoming, Some(map), move |_peer, connection, tag| {
+            sink.lock().unwrap().push((connection, tag));
+        })
+        .await;
+
+        let served = served.lock().unwrap();
+        assert_eq!(
+            served.len(),
+            1,
+            "exactly the LAN-provenance stream is served; the non-LAN stream is dropped by the gate \
+             (mutation: delete the accept-loop guard -> both are served -> this reddens)"
+        );
+        assert_eq!(
+            served[0],
+            (lan_conn, "lan"),
+            "the served stream is the one on the recorded LAN-provenance connection"
+        );
+    }
+
+    #[test]
+    fn identify_gate_admits_only_lan_addresses_of_same_scope_under_confinement() {
+        // codex TEST-QUALITY (#4): the identify predicate test above is string-equality only and
+        // never exercises the per-address LAN filter or the production APPLY. This drives
+        // `identify_admitted_addresses` — the COMPLETE gate the handler applies verbatim — so a
+        // mutation of EITHER sub-gate reddens it: (a) make the protocol_version check always-admit
+        // -> the cross-scope case returns the addresses; (b) drop the `multiaddr_lan_provenance`
+        // filter -> the global address is admitted. Restore -> GREEN.
+        let expected = "/nix-p2p/lan-share.v1/id/1.0.0";
+        let lan: Multiaddr = "/ip4/192.168.1.5/tcp/4001".parse().unwrap();
+        let global: Multiaddr = "/ip4/8.8.8.8/tcp/4001".parse().unwrap();
+        let addrs = || vec![lan.clone(), global.clone()];
+
+        // Off the lan-share path: every advertised address is admitted (public participation),
+        // regardless of protocol_version.
+        assert_eq!(
+            identify_admitted_addresses(false, "/nix-p2p/v1/id/1.0.0", expected, addrs()),
+            addrs(),
+            "unconfined: all identify addresses are admitted"
+        );
+
+        // Confined + SAME scope: ONLY the LAN-provenance address is admitted; the global one is
+        // filtered out (mutation: drop the LAN filter -> `global` appears -> reddens).
+        assert_eq!(
+            identify_admitted_addresses(true, expected, expected, addrs()),
+            vec![lan.clone()],
+            "confined same-scope: only the LAN-provenance address seeds routing"
+        );
+
+        // Confined + CROSS scope (public v1): EMPTY — not even the LAN-looking address is admitted,
+        // because the whole record is rejected on protocol_version (mutation: always-admit the
+        // protocol_version -> returns [lan] -> reddens).
+        assert!(
+            identify_admitted_addresses(true, "/nix-p2p/v1/id/1.0.0", expected, addrs()).is_empty(),
+            "confined cross-scope: NO addresses admitted (record rejected on protocol_version)"
         );
     }
 
