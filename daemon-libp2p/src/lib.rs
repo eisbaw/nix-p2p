@@ -48,10 +48,10 @@ use fabric_libp2p::Libp2pFabric;
 
 use ed25519_dalek::SigningKey;
 use peer_fabric::{
-    AdmitAllPublication, AnnounceBudget, AnnounceError, Axis, Blake3Digest, ContentKey,
-    DiscoveryBudget, IneligibleReason, NodeId, PeerFabric, ProviderRecord, PublicationEligibility,
-    RefusePublication, RelayHints, SafetyEnvelope, TransportOffer, TransportTag, require_axes,
-    sign_provider_record,
+    AdmitAllPublication, AnnounceBudget, AnnounceError, AvailabilityAnnouncer, Axis, Blake3Digest,
+    ContentKey, DiscoveryBudget, IneligibleReason, NodeId, PeerFabric, ProviderRecord,
+    PublicationEligibility, RefusePublication, RelayHints, SafetyEnvelope, TransportOffer,
+    TransportTag, require_axes, sign_provider_record,
 };
 
 use daemon_core::claim::NarHashKey;
@@ -793,63 +793,93 @@ async fn announce_seed_records(
     let relay_hints = readiness.capture(fabric).await?;
     let mut records = Vec::with_capacity(seeds.len());
     for (nar_hash, bytes) in seeds {
-        // Allocate the durable sequence, then sign, then announce - in that order, per key
-        // (the allocation is a non-reserving read finalised by announce's save-before-publish).
-        let sequence = fabric.next_announce_sequence(&provider_content_key(nar_hash));
-        let record = sign_libp2p_provider_record(
-            config.identity_seed,
-            nar_hash,
-            bytes,
-            relay_hints,
-            config.ttl_secs,
-            config.now,
-            sequence,
+        // INITIAL announce is all-or-nothing (fail-fast): a `?` on the first failure. The periodic
+        // RE-SIGN path deliberately does NOT reuse this batch loop - it isolates per seed (HIGH-2)
+        // so one persistently-failing seed cannot starve the others of their refresh.
+        records.push(
+            announce_one_verified_seed(
+                fabric,
+                &**announcer,
+                relay_hints,
+                &config,
+                nar_hash,
+                bytes,
+                witness_authority,
+            )
+            .await?,
         );
-        // TASK-231 (AC#1): mint the eligibility witness for THIS path's authority (AdmitAll for
-        // the LAN door, the allowlist for the public door), then hand it to `announce`. The
-        // announcer ALSO re-checks with its own per-fabric authority, so a public node still
-        // refuses an unallowlisted record even if this witness is permissive.
-        let witness = witness_authority.authorize(record.clone()).map_err(|e| {
-            format!("publication eligibility refused libp2p seed record for {nar_hash}: {e}")
-        })?;
-        // TASK-257 F-4: a lone GENESIS provider (zero-bootstrap / mDNS) can lose the startup
-        // put-quorum race - its first announce fails `Unreachable` because no same-scope peer is in
-        // the routing table YET. Retry within a BOUNDED integer window, WAITING for a routing peer
-        // to appear (via mDNS) between attempts, so the zero-bootstrap feature does not depend on an
-        // external supervisor restart. Only `Unreachable` (no-quorum) is retried; a record-level
-        // fault (Rejected/Ineligible/Persist) or a budget DeadlineExceeded returns immediately (a
-        // retry cannot help and must not mask it). The TASK-56 supply-integrity floor already ran
-        // (verify_provider_seeds above), and each attempt still respects the caller's announce
-        // budget - the retry adds a bounded WAIT, never an unbounded or un-budgeted publish.
-        let retry_deadline =
-            Instant::now() + Duration::from_secs(ANNOUNCE_QUORUM_RETRY_WINDOW_SECS);
-        loop {
-            match announcer.announce(&witness, config.budget).await {
-                Ok(_receipt) => break,
-                Err(AnnounceError::Unreachable(why)) => {
-                    if Instant::now() >= retry_deadline {
-                        return Err(format!(
-                            "announcing libp2p provider record for {nar_hash}: publication \
-                             substrate unreachable after a bounded retry: {why}"
-                        ));
-                    }
-                    // Wait (bounded) for a routing peer to appear, then retry the announce.
-                    while fabric.handle().routing_peers().await == 0
-                        && Instant::now() < retry_deadline
-                    {
-                        tokio::time::sleep(Duration::from_millis(250)).await;
-                    }
-                }
-                Err(e) => {
-                    return Err(format!(
-                        "announcing libp2p provider record for {nar_hash}: {e}"
-                    ));
-                }
-            }
-        }
-        records.push(record);
     }
     Ok(records)
+}
+
+/// Allocate the durable sequence, sign, mint the eligibility witness, and announce ONE
+/// already-content-verified seed - the shared per-seed body of both the INITIAL announce
+/// ([`announce_seed_records`], all-or-nothing) and the periodic RE-SIGN
+/// ([`resign_seed_records_once`], per-seed isolated). Keeping it in one place means the two paths
+/// cannot drift on the allocate -> sign -> witness -> announce recipe or the bounded put-quorum retry.
+///
+/// The caller MUST have TASK-56-verified `bytes` against `nar_hash` first (this does not re-verify).
+async fn announce_one_verified_seed(
+    fabric: &Libp2pFabric,
+    announcer: &dyn AvailabilityAnnouncer,
+    relay_hints: RelayHints,
+    config: &InitialAnnounceConfig<'_>,
+    nar_hash: &NarHashKey,
+    bytes: &[u8],
+    witness_authority: &dyn PublicationEligibility,
+) -> Result<ProviderRecord, String> {
+    // Allocate the durable sequence, then sign, then announce - in that order, per key
+    // (the allocation is a non-reserving read finalised by announce's save-before-publish).
+    let sequence = fabric.next_announce_sequence(&provider_content_key(nar_hash));
+    let record = sign_libp2p_provider_record(
+        config.identity_seed,
+        nar_hash,
+        bytes,
+        relay_hints,
+        config.ttl_secs,
+        config.now,
+        sequence,
+    );
+    // TASK-231 (AC#1): mint the eligibility witness for THIS path's authority (AdmitAll for
+    // the LAN door, the allowlist for the public door), then hand it to `announce`. The
+    // announcer ALSO re-checks with its own per-fabric authority, so a public node still
+    // refuses an unallowlisted record even if this witness is permissive.
+    let witness = witness_authority.authorize(record.clone()).map_err(|e| {
+        format!("publication eligibility refused libp2p seed record for {nar_hash}: {e}")
+    })?;
+    // TASK-257 F-4: a lone GENESIS provider (zero-bootstrap / mDNS) can lose the startup
+    // put-quorum race - its first announce fails `Unreachable` because no same-scope peer is in
+    // the routing table YET. Retry within a BOUNDED integer window, WAITING for a routing peer
+    // to appear (via mDNS) between attempts, so the zero-bootstrap feature does not depend on an
+    // external supervisor restart. Only `Unreachable` (no-quorum) is retried; a record-level
+    // fault (Rejected/Ineligible/Persist) or a budget DeadlineExceeded returns immediately (a
+    // retry cannot help and must not mask it). Each attempt still respects the caller's announce
+    // budget - the retry adds a bounded WAIT, never an unbounded or un-budgeted publish.
+    let retry_deadline = Instant::now() + Duration::from_secs(ANNOUNCE_QUORUM_RETRY_WINDOW_SECS);
+    loop {
+        match announcer.announce(&witness, config.budget).await {
+            Ok(_receipt) => break,
+            Err(AnnounceError::Unreachable(why)) => {
+                if Instant::now() >= retry_deadline {
+                    return Err(format!(
+                        "announcing libp2p provider record for {nar_hash}: publication \
+                         substrate unreachable after a bounded retry: {why}"
+                    ));
+                }
+                // Wait (bounded) for a routing peer to appear, then retry the announce.
+                while fabric.handle().routing_peers().await == 0 && Instant::now() < retry_deadline
+                {
+                    tokio::time::sleep(Duration::from_millis(250)).await;
+                }
+            }
+            Err(e) => {
+                return Err(format!(
+                    "announcing libp2p provider record for {nar_hash}: {e}"
+                ));
+            }
+        }
+    }
+    Ok(record)
 }
 
 /// One VERIFIED store-supply provision: a `nar_hash` this node will announce, the availability
@@ -2569,18 +2599,35 @@ impl Drop for SeedResignTask {
     }
 }
 
-/// Run ONE seed re-sign cycle (TASK-285): for the durable seed set, allocate the NEXT monotonic
-/// sequence per key, sign a FRESH record (new `issued_at`/`expiry` from a fresh `now`), and announce
-/// it through the SAME anti-rollback + save-before-publish path the INITIAL announce uses
-/// ([`announce_seed_records`] → [`Libp2pFabric::next_announce_sequence`] →
-/// `Libp2pAvailabilityAnnouncer::announce`). Reusing that SSOT is exactly what makes the re-sign
-/// monotonic (strictly-higher sequence, never a rollback/reuse) AND fail-closed (the advanced floor
-/// is persisted BEFORE the DHT publish) — AC#3 — with NO second announce path to drift. A re-sign is
-/// always a SUPERSEDE (a strictly-newer positive record), never a tombstone/withdraw. Returns the
-/// freshly-signed records (one per seed).
+/// The result of ONE seed re-sign cycle (TASK-285). Per-seed isolation (HIGH-2): a seed that fails
+/// this cycle lands in `failed` (logged, retried next cycle) WITHOUT aborting the others' refresh, so
+/// one persistently-unreachable seed can never starve a healthy seed into permanent expiry.
+#[derive(Debug, Default)]
+pub struct SeedResignOutcome {
+    /// The seeds freshly re-signed + announced this cycle (each a strictly-superseding record).
+    pub records: Vec<ProviderRecord>,
+    /// The seeds that FAILED this cycle (per-seed verify or announce), isolated from the rest. Each
+    /// retries next cycle; its prior record stays valid until its own signed expiry regardless.
+    pub failed: Vec<(NarHashKey, String)>,
+}
+
+/// Run ONE seed re-sign cycle (TASK-285): for EACH durable seed INDEPENDENTLY, allocate the NEXT
+/// monotonic sequence, sign a FRESH record (new `issued_at`/`expiry` from a fresh `now`), and announce
+/// it through the SAME anti-rollback + save-before-publish path the initial announce uses
+/// ([`announce_one_verified_seed`] → [`Libp2pFabric::next_announce_sequence`] →
+/// `Libp2pAvailabilityAnnouncer::announce`). Reusing that SSOT is what makes the re-sign monotonic
+/// (strictly-higher sequence, never a rollback/reuse) AND fail-closed (the advanced floor is persisted
+/// BEFORE the DHT publish) — AC#3 — with NO second announce path to drift. A re-sign is always a
+/// SUPERSEDE (a strictly-newer positive record), never a tombstone/withdraw.
 ///
-/// Exposed so the loop, an operator-triggered manual refresh, and the AC#3 test can drive exactly
-/// ONE re-sign cycle deterministically (the loop just calls it on a timer).
+/// HIGH-2 (per-seed isolation): unlike the initial [`announce_seed_records`] (all-or-nothing), this
+/// isolates each seed - a verify/announce failure for one seed is collected into
+/// [`SeedResignOutcome::failed`] and the loop CONTINUES, so a persistently-failing seed cannot starve
+/// the healthy ones out of their refresh. A NODE-LEVEL fault (no announcer, relay-readiness capture)
+/// returns `Err` (the whole cycle retries next interval); only PER-SEED faults are isolated.
+///
+/// Exposed so the loop, an operator-triggered manual refresh, and the AC#3 test can drive exactly ONE
+/// re-sign cycle deterministically (the loop just calls it on a timer).
 pub async fn resign_seed_records_once(
     fabric: &Libp2pFabric,
     readiness: &ProviderRelayReadiness,
@@ -2589,33 +2636,113 @@ pub async fn resign_seed_records_once(
     ttl_secs: u64,
     budget: &AnnounceBudget,
     authority: &SeedResignAuthority,
-) -> Result<Vec<ProviderRecord>, String> {
+) -> Result<SeedResignOutcome, String> {
     // A FRESH observation time each cycle ⇒ a fresh signed issued_at + expiry (= now + ttl_secs),
     // superseding the prior record with a strictly-later validity window. All integer, no float.
     let config = InitialAnnounceConfig::new(identity_seed, ttl_secs, now_unix_secs(), budget);
-    match authority {
-        SeedResignAuthority::Lan => {
-            announce_seed_records(fabric, readiness, config, seeds, &AdmitAllPublication).await
+    let announcer = fabric
+        .announcer()
+        .ok_or_else(|| "internal: libp2p provider fabric exposes no announcer".to_string())?;
+    // NODE-LEVEL capture (fail the whole cycle, retry next interval): one live route snapshot every
+    // re-signed record in this cycle states, exactly as the initial announce.
+    let relay_hints = readiness.capture(fabric).await?;
+    // Bind the witness authority so its borrow outlives the loop (the Public arm borrows the
+    // allowlist). It MIRRORS the initial announce door so a re-signed record passes the SAME gate.
+    let admit_all = AdmitAllPublication;
+    let allow_auth = match authority {
+        SeedResignAuthority::Public(allowlist) => Some(AllowlistWitnessAuthority {
+            allowlist: allowlist.as_ref(),
+        }),
+        SeedResignAuthority::Lan => None,
+    };
+    let witness_authority: &dyn PublicationEligibility = match &allow_auth {
+        Some(auth) => auth,
+        None => &admit_all,
+    };
+    let mut outcome = SeedResignOutcome::default();
+    for seed in seeds {
+        let (nar_hash, bytes) = seed;
+        // Per-seed TASK-56 re-verify (isolated): a corrupted seed is refused WITHOUT blocking the
+        // others - it never announces a false claim, and a healthy sibling still refreshes.
+        if let Err(e) = verify_provider_seeds(std::slice::from_ref(seed)) {
+            outcome.failed.push((*nar_hash, e.to_string()));
+            continue;
         }
-        SeedResignAuthority::Public(allowlist) => {
-            announce_seed_records(
-                fabric,
-                readiness,
-                config,
-                seeds,
-                &AllowlistWitnessAuthority {
-                    allowlist: allowlist.as_ref(),
-                },
-            )
-            .await
+        match announce_one_verified_seed(
+            fabric,
+            &**announcer,
+            relay_hints,
+            &config,
+            nar_hash,
+            bytes,
+            witness_authority,
+        )
+        .await
+        {
+            Ok(record) => outcome.records.push(record),
+            Err(e) => outcome.failed.push((*nar_hash, e)),
+        }
+    }
+    Ok(outcome)
+}
+
+/// The SUPERVISED re-sign loop (TASK-285 HIGH-3): sleep one interval, then run ONE cycle IN A CHILD
+/// TASK so a panic inside the cycle is caught as a `JoinError`, logged at ERROR, and the loop
+/// CONTINUES - the durability task can never silently die from a cycle panic. All logging is
+/// `tracing` (never `println!`/`eprintln!`, which PANIC on a closed output pipe (EPIPE) - the other
+/// silent-death vector). Generic over the cycle so the supervision (panic isolation + continue) is
+/// unit-testable without a live fabric. Never returns (the caller aborts it on shutdown).
+async fn run_resign_supervised<F, Fut>(interval: Duration, mut cycle: F)
+where
+    F: FnMut() -> Fut + Send + 'static,
+    Fut: std::future::Future<Output = Result<SeedResignOutcome, String>> + Send + 'static,
+{
+    loop {
+        // Sleep FIRST: the initial announce already published; the earliest a record needs a refresh
+        // is one interval later.
+        tokio::time::sleep(interval).await;
+        match tokio::spawn(cycle()).await {
+            Ok(Ok(outcome)) => {
+                if outcome.failed.is_empty() {
+                    tracing::info!(
+                        re_signed = outcome.records.len(),
+                        next_secs = interval.as_secs(),
+                        "LIBP2P-SEED-RESIGN cycle re-signed all seeds"
+                    );
+                } else {
+                    tracing::warn!(
+                        re_signed = outcome.records.len(),
+                        failed = outcome.failed.len(),
+                        "LIBP2P-SEED-RESIGN cycle: some seeds failed this cycle (isolated; each \
+                         retried next cycle; their prior records stay valid until signed expiry)"
+                    );
+                }
+            }
+            Ok(Err(e)) => {
+                tracing::warn!(
+                    error = %e,
+                    "LIBP2P-SEED-RESIGN cycle fault (whole cycle retried next interval; prior \
+                     records valid until their signed expiry)"
+                );
+            }
+            Err(join_err) => {
+                // The cycle PANICKED: the child task died, but the supervisor loop continues, so the
+                // durability feature is NOT silently dead. Loud ERROR so an operator notices.
+                tracing::error!(
+                    error = %join_err,
+                    "LIBP2P-SEED-RESIGN cycle PANICKED; supervisor loop continues (durability task \
+                     is NOT dead) - the next interval retries"
+                );
+            }
         }
     }
 }
 
-/// Spawn the periodic seed RE-SIGN background task (TASK-285 AC#1): a loop, OFF the swarm poll loop
-/// (a `tokio::spawn`, like the announce-after-fetch dispatch), that re-signs + re-announces every
-/// durable `--libp2p-seed-nar` record BEFORE its signed expiry, so a continuously-running seeding
-/// node stays discoverable for its seeded NarHashes INDEFINITELY (no 24h TTL cliff, no restart).
+/// Spawn the periodic seed RE-SIGN background task (TASK-285 AC#1): a supervised loop, OFF the swarm
+/// poll loop (a `tokio::spawn`, like the announce-after-fetch dispatch), that re-signs + re-announces
+/// every durable `--libp2p-seed-nar` record BEFORE its signed expiry, so a continuously-running
+/// seeding node stays discoverable for its seeded NarHashes INDEFINITELY (no 24h TTL cliff, no
+/// restart).
 ///
 /// Cadence: [`seed_resign_interval_secs`] = `ttl_secs / 2` (integer), strictly inside the TTL for
 /// `ttl_secs >= 2`, so a record never lapses. Each cycle mints the NEXT monotonic sequence and
@@ -2626,9 +2753,9 @@ pub async fn resign_seed_records_once(
 /// announce-after-fetch hook owns GROWN keys (its `seed_owned` set makes it a strict no-op on these),
 /// so the two never both mint a record for the same key.
 ///
-/// A per-cycle announce failure (e.g. a transient loss of every routing peer) is LOGGED and RETRIED
-/// on the next cycle — it never aborts the loop; the prior record stays valid until its own signed
-/// expiry regardless. Returns `None` for an EMPTY seed set (nothing to re-sign).
+/// SUPERVISION (HIGH-3): the loop runs each cycle in a child task and survives a cycle panic (logged
+/// ERROR, loop continues); a per-seed failure is isolated (HIGH-2); a whole-cycle fault retries next
+/// interval. Returns `None` for an EMPTY seed set (nothing to re-sign).
 pub fn spawn_seed_resign(
     fabric: Arc<Libp2pFabric>,
     readiness: ProviderRelayReadiness,
@@ -2643,46 +2770,83 @@ pub fn spawn_seed_resign(
     }
     let interval = Duration::from_secs(seed_resign_interval_secs(ttl_secs));
     let key_count = seeds.len();
-    println!(
-        "LIBP2P-SEED-RESIGN enabled seeds={key_count} ttl={ttl_secs}s interval={}s",
-        interval.as_secs()
+    tracing::info!(
+        seeds = key_count,
+        ttl_secs,
+        interval_secs = interval.as_secs(),
+        "LIBP2P-SEED-RESIGN enabled"
     );
-    let task = tokio::spawn(async move {
-        loop {
-            // Sleep FIRST: the initial announce already published the records; the earliest a record
-            // needs refreshing is one interval later. On a large/slow re-sign the sleep-then-work loop
-            // never stalls the swarm (it runs on its own task).
-            tokio::time::sleep(interval).await;
-            match resign_seed_records_once(
+    // Share the immutable inputs so each cycle spins up a fresh future in its own child task.
+    let seeds = Arc::new(seeds);
+    let authority = Arc::new(authority);
+    let task = tokio::spawn(run_resign_supervised(interval, move || {
+        let fabric = Arc::clone(&fabric);
+        let readiness = readiness.clone();
+        let seeds = Arc::clone(&seeds);
+        let authority = Arc::clone(&authority);
+        async move {
+            resign_seed_records_once(
                 &fabric,
                 &readiness,
                 identity_seed,
-                &seeds,
+                seeds.as_slice(),
                 ttl_secs,
                 &budget,
                 &authority,
             )
             .await
-            {
-                Ok(records) => {
-                    println!(
-                        "LIBP2P-SEED-RESIGN re-signed {} durable seed record(s) \
-                         (fresh expiry now+{ttl_secs}s, next cycle in {}s)",
-                        records.len(),
-                        interval.as_secs()
-                    );
-                }
-                Err(e) => {
-                    eprintln!(
-                        "LIBP2P-SEED-RESIGN cycle failed for {key_count} seed record(s): {e} \
-                         (retried on the next cycle; the prior records stay valid until their signed \
-                         expiry)"
-                    );
-                }
-            }
         }
-    });
+    }));
     Some(SeedResignTask { task })
+}
+
+#[cfg(test)]
+mod seed_resign_supervision_tests {
+    //! TASK-285 HIGH-3: the supervised re-sign loop must SURVIVE a panicking cycle (never silently
+    //! die), so the durability feature keeps refreshing. Driven through the REAL supervision body
+    //! [`run_resign_supervised`], no live fabric needed.
+
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::{Duration, Instant};
+
+    use super::{SeedResignOutcome, run_resign_supervised};
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn supervisor_survives_a_panicking_cycle() {
+        // The FIRST cycle PANICS; the supervisor must catch it and keep running, so the counter
+        // advances well past the panic. BITE: run the cycle INLINE (`cycle().await`) instead of in a
+        // child task and the panic kills the whole loop -> the counter sticks at 1 and this times out.
+        let count = Arc::new(AtomicUsize::new(0));
+        let c = Arc::clone(&count);
+        let handle = tokio::spawn(run_resign_supervised(
+            Duration::from_millis(20),
+            move || {
+                let c = Arc::clone(&c);
+                async move {
+                    let n = c.fetch_add(1, Ordering::SeqCst);
+                    if n == 0 {
+                        panic!("cycle 0 panics on purpose");
+                    }
+                    Ok(SeedResignOutcome::default())
+                }
+            },
+        ));
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            if count.load(Ordering::SeqCst) >= 4 {
+                break; // it ran the panicking cycle AND several more -> the supervisor survived.
+            }
+            assert!(
+                Instant::now() < deadline,
+                "the supervisor did not keep running past the panicking cycle (count={})",
+                count.load(Ordering::SeqCst)
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        handle.abort();
+    }
 }
 
 /// Build the node's ONE public-NAR allowlist (TASK-103), the single authority the PUBLIC announce

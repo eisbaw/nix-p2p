@@ -2439,7 +2439,8 @@ mod public_allowlist_parity_tests {
         let default_cfg = parse_config(args(&["--libp2p-leech"]))
             .expect("a bare leech config parses with the default TTL");
         assert_eq!(
-            default_cfg.libp2p_record_ttl_secs, super::DEFAULT_LIBP2P_RECORD_TTL_SECS,
+            default_cfg.libp2p_record_ttl_secs,
+            super::DEFAULT_LIBP2P_RECORD_TTL_SECS,
             "the record TTL defaults to 1h when the flag is absent"
         );
 

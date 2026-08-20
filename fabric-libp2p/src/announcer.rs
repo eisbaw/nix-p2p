@@ -141,9 +141,10 @@ pub struct Libp2pAvailabilityAnnouncer {
     /// sequence 1 to) a consumer already at the record's real sequence. When `seq_path`
     /// is `None` it is in-memory only (a restart loses it). Guarded by a std Mutex; only
     /// ever held for the synchronous update.
-    announced: Mutex<HashMap<ContentKey, LastPublished>>,
-    /// The durable per-key sequence file, or `None` for an in-memory announcer.
-    seq_path: Option<PathBuf>,
+    /// The durable per-key sequence floor + its SERIALIZED persistence (TASK-285 HIGH-1). Concurrent
+    /// announce paths (initial announce, announce-after-fetch, seed re-sign) all persist through this
+    /// one serialized writer, so none can race the atomic rename and drop another key's advance.
+    floor: DurableSeqFloor,
 }
 
 /// The `(sequence, expiry)` of the last positive record this announcer published for a
@@ -152,6 +153,141 @@ pub struct Libp2pAvailabilityAnnouncer {
 struct LastPublished {
     sequence: u64,
     expiry: u64,
+}
+
+/// The durable per-key SEQUENCE FLOOR + its serialized persistence (TASK-185 / TASK-285 HIGH-1).
+///
+/// It owns the in-memory `(ContentKey -> LastPublished)` floor AND its on-disk file, and is the
+/// SINGLE writer authority for that file. The persist path is a SERIALIZED critical section: a
+/// `persist_lock` is held across BOTH the in-memory snapshot AND the atomic file write, so two
+/// concurrent savers can never interleave `snapshot` / `rename` and drop a newer key's advance
+/// (`fabric-libp2p/src/persist.rs` write_atomic is atomic per-write but NOT serialized across
+/// writers; without this lock a saver holding an OLDER snapshot could land its `rename` AFTER a
+/// newer one and clobber a durably-advanced sequence — the restart-rollback the floor exists to
+/// prevent). This is REQUIRED once more than one announce path runs concurrently: the periodic
+/// seed re-sign task (TASK-285) runs alongside the detached announce-after-fetch dispatch and the
+/// initial announce, so the "shipped loop is strictly sequential" precondition no longer holds.
+///
+/// The floor map and the persist critical section use DISTINCT locks (a saver briefly takes the
+/// map lock to snapshot, then the persist lock spans snapshot+write): the `advance`/`next`/`last`
+/// map operations never block on the slower file write.
+struct DurableSeqFloor {
+    /// The per-key floor (allocation basis for the next positive sequence, and the
+    /// withdrawal-sequencing floor). Guarded by a std Mutex; only ever held for a synchronous
+    /// map update or snapshot.
+    announced: Mutex<HashMap<ContentKey, LastPublished>>,
+    /// Serializes `snapshot + write` so concurrent savers cannot race the atomic rename and drop a
+    /// key's durable advance. DISTINCT from `announced` (no lock-ordering coupling on the map path).
+    persist_lock: Mutex<()>,
+    /// The durable per-key sequence file, or `None` for an in-memory-only floor (a restart loses it).
+    seq_path: Option<PathBuf>,
+}
+
+impl DurableSeqFloor {
+    /// Build the floor, re-seeding the in-memory map from `seq_path` (empty if `None`/unreadable).
+    fn from_disk(seq_path: Option<PathBuf>) -> Self {
+        let mut announced = HashMap::new();
+        if let Some(path) = &seq_path {
+            for (key, sequence, expiry) in crate::persist::load_seqs(path) {
+                announced.insert(key, LastPublished { sequence, expiry });
+            }
+        }
+        DurableSeqFloor {
+            announced: Mutex::new(announced),
+            persist_lock: Mutex::new(()),
+            seq_path,
+        }
+    }
+
+    /// The next durably-allocated POSITIVE sequence for `key`: `last + 1`, or 1 if never published.
+    /// PURE read; the reservation is made durable by [`persist_checked`](Self::persist_checked).
+    fn next_sequence(&self, key: &ContentKey) -> u64 {
+        self.announced
+            .lock()
+            .expect("announced-sequence mutex poisoned")
+            .get(key)
+            .map(|last| last.sequence + 1)
+            .unwrap_or(1)
+    }
+
+    /// Whether this floor has ever recorded `key` (the self-serve set a withdrawal may retract).
+    fn contains(&self, key: &ContentKey) -> bool {
+        self.announced
+            .lock()
+            .expect("announced-sequence mutex poisoned")
+            .contains_key(key)
+    }
+
+    /// The last recorded `(sequence, expiry)` for `key`, for minting a strictly-newer withdrawal.
+    fn last_published(&self, key: &ContentKey) -> Option<LastPublished> {
+        self.announced
+            .lock()
+            .expect("announced-sequence mutex poisoned")
+            .get(key)
+            .copied()
+    }
+
+    /// MONOTONICALLY advance `key`'s floor to `(sequence, expiry)` — only forward (`>=`), so a
+    /// concurrent re-announce never regresses it. In-memory only; call `persist_*` to make durable.
+    fn advance(&self, key: &ContentKey, sequence: u64, expiry: u64) {
+        let mut announced = self
+            .announced
+            .lock()
+            .expect("announced-sequence mutex poisoned");
+        let slot = announced
+            .entry(*key)
+            .or_insert(LastPublished { sequence, expiry });
+        if sequence >= slot.sequence {
+            *slot = LastPublished { sequence, expiry };
+        }
+    }
+
+    /// Snapshot the per-key floor for serialization (taken under the map lock, written outside it).
+    fn snapshot(&self) -> Vec<(ContentKey, u64, u64)> {
+        self.announced
+            .lock()
+            .expect("announced-sequence mutex poisoned")
+            .iter()
+            .map(|(key, last)| (*key, last.sequence, last.expiry))
+            .collect()
+    }
+
+    /// Flush the floor to disk, PROPAGATING any I/O error (the fail-closed announce path).
+    /// Serialized: see [`persist_checked_hooked`](Self::persist_checked_hooked).
+    fn persist_checked(&self) -> std::io::Result<()> {
+        self.persist_checked_hooked(|| {})
+    }
+
+    /// The serialized snapshot+write. `after_snapshot` runs INSIDE the `persist_lock` critical
+    /// section, AFTER the snapshot but BEFORE the write — a no-op in production (the closure is
+    /// inlined away), a test seam that forces the concurrent-write window so the serialization can
+    /// be proven by mutation. Holding `persist_lock` across snapshot AND write is the HIGH-1 fix:
+    /// a second saver cannot snapshot-and-rename in between, so no advance is lost.
+    fn persist_checked_hooked(&self, after_snapshot: impl FnOnce()) -> std::io::Result<()> {
+        let Some(path) = &self.seq_path else {
+            return Ok(());
+        };
+        let _persist = self
+            .persist_lock
+            .lock()
+            .expect("persist-serialize mutex poisoned");
+        let snapshot = self.snapshot();
+        after_snapshot();
+        crate::persist::save_seqs_checked(path, &snapshot)
+    }
+
+    /// Flush the floor to disk, LOGGING any error (the withdraw path, where a failed flush only
+    /// costs a re-minted-but-idempotent same-process withdrawal). Serialized like the checked path.
+    fn persist_lossy(&self) {
+        let Some(path) = &self.seq_path else {
+            return;
+        };
+        let _persist = self
+            .persist_lock
+            .lock()
+            .expect("persist-serialize mutex poisoned");
+        crate::persist::save_seqs(path, &self.snapshot());
+    }
 }
 
 impl Libp2pAvailabilityAnnouncer {
@@ -224,13 +360,6 @@ impl Libp2pAvailabilityAnnouncer {
             node_id,
             "announcer signing key must be this node's identity (self-serve v1)"
         );
-        // Re-seed the per-key sequence floor from disk (empty if none / unreadable).
-        let mut announced = HashMap::new();
-        if let Some(path) = &seq_path {
-            for (key, sequence, expiry) in crate::persist::load_seqs(path) {
-                announced.insert(key, LastPublished { sequence, expiry });
-            }
-        }
         Libp2pAvailabilityAnnouncer {
             handle,
             ledger,
@@ -238,8 +367,9 @@ impl Libp2pAvailabilityAnnouncer {
             node_id,
             peer_id,
             signing_key,
-            announced: Mutex::new(announced),
-            seq_path,
+            // Re-seed the per-key sequence floor from disk (empty if none / unreadable) and own its
+            // serialized persistence (TASK-285 HIGH-1).
+            floor: DurableSeqFloor::from_disk(seq_path),
         }
     }
 
@@ -252,54 +382,13 @@ impl Libp2pAvailabilityAnnouncer {
     /// back after a restart, the F3 defect). PURE read; the actual reservation happens when
     /// [`announce`](AvailabilityAnnouncer::announce) persists the floor before publishing.
     pub fn next_sequence(&self, key: &ContentKey) -> u64 {
-        self.announced
-            .lock()
-            .expect("announced-sequence mutex poisoned")
-            .get(key)
-            .map(|last| last.sequence + 1)
-            .unwrap_or(1)
-    }
-
-    /// Snapshot the per-key floor for serialization (taken under the lock, written outside).
-    fn snapshot_announced(&self) -> Vec<(ContentKey, u64, u64)> {
-        self.announced
-            .lock()
-            .expect("announced-sequence mutex poisoned")
-            .iter()
-            .map(|(key, last)| (*key, last.sequence, last.expiry))
-            .collect()
-    }
-
-    /// Flush the per-key sequence floor to disk (atomic) when durable, LOGGING any error.
-    /// Used on the withdraw path where a failed flush costs only that a later same-process
-    /// withdraw re-mints the same tombstone sequence (idempotent), not a rollback.
-    fn persist_announced(&self) {
-        let Some(path) = &self.seq_path else {
-            return;
-        };
-        crate::persist::save_seqs(path, &self.snapshot_announced());
-    }
-
-    /// Flush the per-key sequence floor to disk, PROPAGATING any I/O error (TASK-185, AC#3).
-    /// The announce path uses this to FAIL-CLOSED (no DHT publish) when the sequence cannot
-    /// be durably recorded. A `None` seq_path (non-durable announcer) is `Ok(())` - there is
-    /// nothing to persist and nothing to fail on.
-    fn persist_announced_checked(&self) -> std::io::Result<()> {
-        let Some(path) = &self.seq_path else {
-            return Ok(());
-        };
-        crate::persist::save_seqs_checked(path, &self.snapshot_announced())
+        self.floor.next_sequence(key)
     }
 
     /// Mint a SIGNED withdrawal tombstone that STRICTLY SUPERSEDES the last record this
-    /// announcer published for `key` (AC#1), reading the tracked floor under the lock.
+    /// announcer published for `key` (AC#1), reading the tracked floor.
     fn mint_withdrawal(&self, key: &ContentKey, now: u64) -> ProviderWithdrawal {
-        let last = self
-            .announced
-            .lock()
-            .expect("announced-sequence mutex poisoned")
-            .get(key)
-            .copied();
+        let last = self.floor.last_published(key);
         mint_withdrawal(&self.signing_key, key, last, now)
     }
 }
@@ -440,23 +529,8 @@ impl AvailabilityAnnouncer for Libp2pAvailabilityAnnouncer {
         // monotonic allocator's safe direction. (Previously this map was updated only AFTER a
         // successful publish, which is exactly the publish-before-save ordering TASK-185
         // closes.)
-        {
-            let mut announced = self
-                .announced
-                .lock()
-                .expect("announced-sequence mutex poisoned");
-            let slot = announced.entry(key).or_insert(LastPublished {
-                sequence: record.sequence,
-                expiry: record.expiry,
-            });
-            if record.sequence >= slot.sequence {
-                *slot = LastPublished {
-                    sequence: record.sequence,
-                    expiry: record.expiry,
-                };
-            }
-        }
-        if let Err(why) = self.persist_announced_checked() {
+        self.floor.advance(&key, record.sequence, record.expiry);
+        if let Err(why) = self.floor.persist_checked() {
             // Fail-closed: the record and network may be fine, but publishing a record whose
             // sequence is not on disk is the F3 rollback hazard, so we refuse rather than
             // announce non-durably in silence.
@@ -498,12 +572,7 @@ impl AvailabilityAnnouncer for Libp2pAvailabilityAnnouncer {
         // eligibility consult above, so a refused announce leaves no key to later withdraw. This
         // needs no allowlist at withdraw time: you can only retract what you (eligibly)
         // published.
-        if !self
-            .announced
-            .lock()
-            .expect("announced-sequence mutex poisoned")
-            .contains_key(key)
-        {
+        if !self.floor.contains(key) {
             return Err(AnnounceError::Rejected(format!(
                 "refusing to withdraw {key}: this node never announced it (self-serve v1 \
                  retracts only its own records; a tombstone for an unannounced key would emit an \
@@ -575,25 +644,11 @@ impl AvailabilityAnnouncer for Libp2pAvailabilityAnnouncer {
         // stale one (the caller owns record sequencing above the seam - the rollback test
         // relies on a stale re-put being admitted at the substrate). So this map is an
         // allocation + withdrawal-sequencing floor, not an announce-time monotonicity GATE.
-        {
-            let mut announced = self
-                .announced
-                .lock()
-                .expect("announced-sequence mutex poisoned");
-            let slot = announced.entry(*key).or_insert(LastPublished {
-                sequence: withdrawal.sequence,
-                expiry: withdrawal.expiry,
-            });
-            if withdrawal.sequence >= slot.sequence {
-                *slot = LastPublished {
-                    sequence: withdrawal.sequence,
-                    expiry: withdrawal.expiry,
-                };
-            }
-        }
+        self.floor
+            .advance(key, withdrawal.sequence, withdrawal.expiry);
         // Persist the advanced per-key floor so a restart mints the NEXT withdrawal
-        // strictly newer still (TASK-176 #1).
-        self.persist_announced();
+        // strictly newer still (TASK-176 #1). Serialized with every other saver (HIGH-1).
+        self.floor.persist_lossy();
         self.handle.stop_providing(provider_index_key(key)).await;
         Ok(Receipt::new("libp2p-kad-withdraw"))
     }
@@ -696,5 +751,63 @@ mod tests {
         // (The MIN_TOMBSTONE_TTL_SECS >= MAX_RECORD_TTL_SECS invariant itself is pinned at
         // COMPILE TIME by the `const _` assertion above, so it is not restated here as a
         // runtime const-assert.)
+    }
+
+    /// TASK-285 HIGH-1 BITE: two concurrent savers advancing DIFFERENT keys must BOTH survive on
+    /// disk. The persist path holds `persist_lock` across snapshot AND write, so a second saver
+    /// cannot snapshot-and-rename inside the first's window and clobber it. This is DETERMINISTIC:
+    /// saver A pauses (a test-only hook) after snapshotting {k1} but before writing, WHILE HOLDING
+    /// the persist lock; saver B advances k2 and persists in that window. Serialized, B blocks on
+    /// the lock and writes LAST (its snapshot sees k1+k2) -> both survive. Removing the
+    /// `persist_lock` acquisition in `persist_checked_hooked` (the mutation) lets B write during A's
+    /// pause and A's stale {k1} snapshot renames LAST, DROPPING k2's durable advance -> RED (the
+    /// restart-rollback hazard the floor exists to prevent).
+    #[test]
+    fn concurrent_persist_never_drops_a_key_floor() {
+        use std::sync::mpsc;
+        use std::thread;
+        use std::time::Duration;
+
+        let path = std::env::temp_dir().join(format!(
+            "nix-p2p-high1-{}-{:?}.txt",
+            std::process::id(),
+            thread::current().id()
+        ));
+        let _ = std::fs::remove_file(&path);
+
+        let floor = Arc::new(DurableSeqFloor::from_disk(Some(path.clone())));
+        let k1 = key(1);
+        let k2 = key(2);
+        floor.advance(&k1, 7, 1_000);
+
+        // Saver A: persist k1; its hook signals after snapshot, then PAUSES (holding persist_lock in
+        // the fixed build) to open the concurrent-write window for B.
+        let (snapped_tx, snapped_rx) = mpsc::channel();
+        let floor_a = Arc::clone(&floor);
+        let a = thread::spawn(move || {
+            floor_a
+                .persist_checked_hooked(|| {
+                    let _ = snapped_tx.send(());
+                    thread::sleep(Duration::from_millis(400));
+                })
+                .expect("saver A persist ok");
+        });
+
+        // Saver B: once A has snapshotted, advance a DIFFERENT key and persist it.
+        snapped_rx.recv().expect("saver A signalled its snapshot");
+        floor.advance(&k2, 3, 2_000);
+        floor.persist_checked().expect("saver B persist ok");
+
+        a.join().expect("saver A joined");
+
+        let on_disk = crate::persist::load_seqs(&path);
+        let has_k1 = on_disk.iter().any(|(k, s, _)| *k == k1 && *s == 7);
+        let has_k2 = on_disk.iter().any(|(k, s, _)| *k == k2 && *s == 3);
+        let _ = std::fs::remove_file(&path);
+        assert!(
+            has_k1 && has_k2,
+            "both concurrently-advanced key floors must survive on disk (snapshot+write serialized); \
+             got k1={has_k1} k2={has_k2}, disk={on_disk:?}"
+        );
     }
 }

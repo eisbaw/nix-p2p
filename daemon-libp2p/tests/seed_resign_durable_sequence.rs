@@ -6,18 +6,22 @@
 //! [`daemon_libp2p::resign_seed_records_once`] — the exact body the background loop calls on its
 //! timer — against a REAL durable provider joined to a bootstrap, and after each cycle asserts BOTH:
 //!   * the freshly-signed record carries a STRICTLY-HIGHER sequence (1 → 2 → 3) — no reuse/rollback;
-//!   * the on-disk `announce-seq-v1.txt` floor advanced to EXACTLY that sequence — the sequence was
-//!     durably recorded (and, because `announce` persists BEFORE the DHT publish, it is recorded
-//!     before the record is ever discoverable).
+//!   * the on-disk `announce-seq-v1.txt` floor advanced to EXACTLY that sequence — the advanced
+//!     sequence WAS durably recorded (not lost / not stuck below the published record).
 //!
-//! What BITES BY MUTATION:
+//! What THIS test BITES BY MUTATION:
 //!   * SEQUENCE REUSE/ROLLBACK: make the re-sign mint a fixed/stale sequence (e.g. sign at a
-//!     hardcoded `1`, or skip `next_announce_sequence`) — the record's sequence stops strictly
-//!     increasing and the on-disk floor stops advancing → both asserts below go RED.
-//!   * PUBLISH-BEFORE-SAVE: reorder `Libp2pAvailabilityAnnouncer::announce` to publish before it
-//!     persists the floor — the on-disk floor lags the just-published sequence → the floor assert
-//!     goes RED (the re-sign would expose a record whose sequence is not durably recorded, the F3
-//!     rollback hazard).
+//!     hardcoded `1`, skip `next_announce_sequence`, or reuse a captured sequence) — the record's
+//!     sequence stops strictly increasing and the on-disk floor stops advancing → both asserts go
+//!     RED. It also bites a re-sign routed through a NON-durable announce path (the floor file would
+//!     never advance past 1).
+//!
+//! What this test does NOT bite (HONEST SCOPE): it does NOT prove the save-BEFORE-publish ORDERING
+//! inside `Libp2pAvailabilityAnnouncer::announce`. Both asserts read disk only AFTER the awaited
+//! announce returns, so a hypothetical publish-then-persist-before-return reorder would keep them
+//! GREEN (the disk is consistent by the time we read it). The publish-before-save crash-window
+//! ordering is a property of `announce` itself and is covered by the announcer's own TASK-185
+//! save-before-publish discipline + `restart_durable_sequence_through_run.rs`, not re-claimed here.
 //!
 //! NO FLOAT anywhere: sequences and expiries are integers throughout.
 
@@ -204,7 +208,16 @@ async fn resign_allocates_monotonic_sequences_and_persists_floor_before_publish(
     )
     .await
     .expect("re-sign cycle #1 announces through the durable path");
-    let record2 = records2.into_iter().next().expect("one re-signed record");
+    assert!(
+        records2.failed.is_empty(),
+        "no seed should fail this re-sign cycle: {:?}",
+        records2.failed
+    );
+    let record2 = records2
+        .records
+        .into_iter()
+        .next()
+        .expect("one re-signed record");
     assert!(
         record2.sequence > record1.sequence,
         "re-sign must mint a STRICTLY-HIGHER sequence (no reuse/rollback): got {} <= {}",
@@ -242,7 +255,12 @@ async fn resign_allocates_monotonic_sequences_and_persists_floor_before_publish(
     )
     .await
     .expect("re-sign cycle #2 announces through the durable path");
-    let record3 = records3.into_iter().next().expect("one re-signed record");
+    assert!(records3.failed.is_empty(), "no seed should fail cycle #2");
+    let record3 = records3
+        .records
+        .into_iter()
+        .next()
+        .expect("one re-signed record");
     assert_eq!(
         record3.sequence, 3,
         "each re-sign strictly advances the monotonic sequence (never reused/rolled back)"
@@ -251,6 +269,96 @@ async fn resign_allocates_monotonic_sequences_and_persists_floor_before_publish(
         on_disk_floor_sequence(&state_dir, &content_key),
         Some(3),
         "re-sign #2 PERSISTED the advanced floor to 3 before publishing"
+    );
+
+    let _ = std::fs::remove_dir_all(&state_dir);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn resign_isolates_a_failing_seed_and_still_refreshes_the_healthy_one() {
+    // TASK-285 HIGH-2 BITE: a re-sign cycle over [A(fails), B(ok)] must ISOLATE A and STILL re-sign
+    // B. A is content-MISMATCHED (declared NarHash != its bytes), so its per-seed TASK-56 re-verify
+    // fails; B is well-formed. Per-seed isolation: A -> outcome.failed, B -> outcome.records
+    // (re-signed at a strictly-newer sequence). MUTATION: route the re-sign back through the batch
+    // all-or-nothing verify (`announce_seed_records`) and A's mismatch aborts the WHOLE cycle -> the
+    // node-level `expect` below fails (Err) and B is never refreshed (it would expire permanently).
+    let scope = "task285-resign-isolation";
+    let state_dir = std::env::temp_dir().join(format!(
+        "nix-p2p-task285-iso-{}-{:?}",
+        std::process::id(),
+        std::thread::current().id()
+    ));
+    let _ = std::fs::remove_dir_all(&state_dir);
+
+    let nar_b = b"nix-archive-1 the HEALTHY seed B, re-signed despite sibling A failing".to_vec();
+    let nar_hash_b = NarHashKey::from_raw_nar(&nar_b);
+    let content_key_b = provider_content_key(&nar_hash_b);
+
+    let (bootstrap, boot_addr) = start_fabric(
+        Libp2pFabric::start(NodeConfig::new([1u8; 32]).with_network_scope(scope))
+            .expect("bootstrap starts"),
+    )
+    .await;
+    let boot_peer = bootstrap.peer_id();
+
+    // Durable provider seeding B, announced once (B @ seq 1).
+    let (fabric, readiness, _serve, record_b1) = start_provider_and_announce(
+        durable_provider_cfg(scope, (boot_peer, boot_addr.clone()), &state_dir),
+        &nar_b,
+        &nar_hash_b,
+    )
+    .await;
+    assert_eq!(record_b1.sequence, 1);
+
+    // Seed A: DECLARED NarHash does not match its bytes -> its per-seed re-verify fails.
+    let a_bytes = b"nix-archive-1 seed A raw bytes".to_vec();
+    let a_declared = NarHashKey::from_raw_nar(b"COMPLETELY DIFFERENT bytes than A carries");
+    assert_ne!(
+        a_declared,
+        NarHashKey::from_raw_nar(&a_bytes),
+        "A must be a genuine content mismatch for the isolation bite"
+    );
+
+    let identity_seed = resolve_durable_identity_seed(Some(&state_dir), None).unwrap();
+    let budget = AnnounceBudget::new(Duration::from_secs(10), 20);
+    // A FIRST so a batch-abort mutation would drop B specifically.
+    let seeds = vec![(a_declared, a_bytes.clone()), (nar_hash_b, nar_b.clone())];
+
+    let outcome = resign_seed_records_once(
+        &fabric,
+        &readiness,
+        identity_seed,
+        &seeds,
+        3600,
+        &budget,
+        &SeedResignAuthority::Lan,
+    )
+    .await
+    .expect("a per-seed fault is ISOLATED, so the cycle returns Ok (node-level ok)");
+
+    // A failed (isolated); B still re-signed at a strictly-newer sequence.
+    assert_eq!(
+        outcome.failed.len(),
+        1,
+        "exactly the mismatched seed A failed this cycle, isolated: failed={:?}",
+        outcome.failed
+    );
+    assert_eq!(
+        outcome.failed[0].0, a_declared,
+        "the isolated failure is seed A (the content mismatch)"
+    );
+    assert_eq!(
+        outcome.records.len(),
+        1,
+        "the HEALTHY seed B still re-signed despite sibling A failing"
+    );
+    let record_b2 = &outcome.records[0];
+    assert_eq!(record_b2.key, content_key_b, "B's record is for B's key");
+    assert!(
+        record_b2.sequence > record_b1.sequence,
+        "B re-signed with a STRICTLY-NEWER sequence ({} > {})",
+        record_b2.sequence,
+        record_b1.sequence
     );
 
     let _ = std::fs::remove_dir_all(&state_dir);

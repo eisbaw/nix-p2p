@@ -73,17 +73,18 @@ fn hex32(s: &str) -> Option<[u8; 32]> {
 /// fsynced (`sync_all`) before the rename, so the rename can only ever expose fully-written
 /// bytes.
 ///
-/// CONCURRENCY (honest limit): this save is NOT internally serialized. The announcer
-/// snapshots its per-key map under the lock and writes OUTSIDE the lock, so two concurrent
-/// `announce` calls (even for different keys) can each take a snapshot and then race the
-/// `rename` - a writer holding an OLDER snapshot can land AFTER a newer one and DROP the
-/// newer key's durable advance from disk, a lost-update / restart-rollback for that key even
-/// though its announce already returned `Ok`. A unique per-write temp name does NOT close
-/// this (the lost update is at the rename, not the temp); the real fix is to make the
-/// snapshot+write ONE serialized critical section (or a persistence mutex). This is SAFE
-/// TODAY only because the shipped provider announce loop (`install_provider`) is strictly
-/// sequential - one awaited announce per seed - so no two saves are ever in flight. The
-/// serialized-save fix (and the shared-`state_dir` advisory lock) is filed in TASK-188.
+/// CONCURRENCY: this function is a SINGLE atomic write (temp + rename); it is NOT itself a
+/// serialized snapshot+write. If a caller took its snapshot under one lock and then called
+/// `write_atomic` OUTSIDE it, two concurrent savers could race the `rename` - a writer holding an
+/// OLDER snapshot could land AFTER a newer one and DROP the newer key's durable advance, a
+/// lost-update / restart-rollback even though its save returned `Ok`. That is exactly the hazard the
+/// periodic seed re-sign (TASK-285) introduced by making concurrent savers real (re-sign + the
+/// detached announce-after-fetch dispatch + the initial announce). It is CLOSED at the caller: the
+/// announcer's [`crate::announcer::DurableSeqFloor`] holds a persistence mutex across BOTH its
+/// snapshot AND this write, so the snapshot+rename is one serialized critical section and no save can
+/// clobber a newer one (TASK-285 HIGH-1, subsuming TASK-188's serialized-save portion; the
+/// shared-`state_dir` cross-process advisory lock stays TASK-188). `write_atomic` keeps only its own
+/// guarantee: a reader/crash sees either the whole old file or the whole new one, never a torn write.
 fn write_atomic(path: &Path, text: &str) -> std::io::Result<()> {
     let parent = path.parent();
     if let Some(parent) = parent {

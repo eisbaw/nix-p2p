@@ -11,11 +11,19 @@
 //! Both arms use a SHORT `ttl_secs` (so the test does not wait hours) and differ ONLY by whether the
 //! re-sign task is spawned — that single toggle IS the mutation proof:
 //!   * GREEN (with re-sign): [`seed_stays_discoverable_and_fetchable_past_ttl_with_resign`] — the
-//!     fresh consumer (built AFTER the original expiry) discovers an UNEXPIRED, strictly-superseding
-//!     record (sequence > 1) and FETCHES S byte-identically over libp2p, 0 upstream fallback.
+//!     fresh consumer (built AFTER the original expiry) discovers a strictly-superseding record and,
+//!     to prove CONTINUOUS re-signing (not a one-shot refresh), watches the discovered sequence
+//!     STRICTLY INCREASE across ≥2 further refresh cycles past the original TTL, then FETCHES S
+//!     byte-identically over libp2p with 0 upstream fallback. (A task that refreshed once and exited
+//!     would plateau and fail this arm.)
 //!   * RED-without (the negative control): [`seed_goes_undiscoverable_past_ttl_without_resign`] — the
-//!     SAME setup with NO re-sign leaves only the original (now-expired) record, so the fresh
-//!     consumer's discovery of S returns NOT-Found (the expired record is filtered at decode).
+//!     SAME setup with NO re-sign leaves only the original (now-expired) record. The fresh consumer's
+//!     discovery of S settles to `Lookup::Miss` — the AUTHORITATIVE healthy-absence the directory
+//!     returns when it REACHED the provider's record and skipped it as EXPIRED (the `Stale`
+//!     decode-reject boundary in `directory.rs`), which is DISTINCT from `Unavailable` (a routing /
+//!     consult failure). Asserting `Miss` (never `Found`, and specifically not accepting a transient
+//!     `Unavailable` as success) attributes the failure to the expiry boundary, not a broken harness
+//!     — and the GREEN arm proves the SAME setup IS discoverable when the re-sign runs.
 //!
 //! Real loopback-TCP libp2p swarms (BOOT + a durable provider + a fresh consumer), the SHIPPED
 //! production builders + announce loop + re-sign task — no containers, no mock DHT.
@@ -41,18 +49,53 @@ use fabric_libp2p::{Libp2pFabric, MemoryNarSupplier, Multiaddr, NodeConfig, Peer
 use http::HeaderMap;
 use http_body_util::{BodyExt, Full};
 use peer_fabric::{
-    AnnounceBudget, Axis, DiscoveryBudget, Lookup, PeerFabric, SafetyEnvelope, ServeBudget,
-    ServeHandle, TransportTag,
+    AnnounceBudget, Axis, ContentKey, DiscoveryBudget, Lookup, NodeId, PeerFabric, SafetyEnvelope,
+    ServeBudget, ServeHandle, TransportTag,
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-/// The SHORT record TTL both arms use (seconds). Re-sign fires at `ttl/2` = 5s; the fresh consumer
+/// Poll `find_providers(key)` on `consumer` until it discovers a record for `provider_id` whose
+/// sequence is STRICTLY GREATER than `min_exclusive`, returning that sequence. Bounded (panics on
+/// timeout) so a PLATEAUED (one-shot) re-sign — which never produces a higher sequence — fails the
+/// CONTINUOUS-refresh assertion in the positive arm.
+async fn poll_discovered_sequence_above(
+    consumer: &Arc<Libp2pFabric>,
+    key: &ContentKey,
+    provider_id: NodeId,
+    budget: &DiscoveryBudget,
+    min_exclusive: u64,
+) -> u64 {
+    let deadline = Instant::now() + Duration::from_secs(SHORT_TTL_SECS * 3);
+    loop {
+        if let Lookup::Found(records) = consumer
+            .provider_directory()
+            .expect("consumer has a directory")
+            .find_providers(key, budget)
+            .await
+            && let Some(seq) = records
+                .iter()
+                .find(|r| r.provider == provider_id)
+                .map(|r| r.sequence)
+            && seq > min_exclusive
+        {
+            return seq;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the consumer never discovered a re-signed record for S with sequence > {min_exclusive} \
+             past the TTL — the re-sign is not continuously refreshing"
+        );
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+}
+
+/// The SHORT record TTL both arms use (seconds). Re-sign fires at `ttl/2` = 4s; the fresh consumer
 /// is built at `WAIT_PAST_TTL_S` (past the ORIGINAL expiry), where only a re-signed record can be
 /// valid. Small enough to keep the test quick, large enough to give the loopback swarm headroom.
-const SHORT_TTL_SECS: u64 = 10;
+const SHORT_TTL_SECS: u64 = 8;
 /// Wall-clock wait after the initial announce before building the fresh consumer: PAST the original
 /// `SHORT_TTL_SECS` window, so the original signed record has certainly expired.
-const WAIT_PAST_TTL_S: u64 = 12;
+const WAIT_PAST_TTL_S: u64 = 10;
 
 fn unix_now() -> u64 {
     SystemTime::now()
@@ -210,30 +253,23 @@ async fn seed_stays_discoverable_and_fetchable_past_ttl_with_resign() {
             .await
             .expect("production consumer builder constructs a running libp2p fabric");
 
-    // The fresh consumer must discover an UNEXPIRED record for S that STRICTLY SUPERSEDES the
-    // original (sequence > 1) — proof the re-sign kept it alive, not a lingering original.
-    let deadline = Instant::now() + Duration::from_secs(20);
-    let discovered_sequence = loop {
-        if let Lookup::Found(records) = consumer
-            .provider_directory()
-            .expect("consumer has a directory")
-            .find_providers(&content_key, &discovery_budget)
-            .await
-            && let Some(r) = records.iter().find(|r| r.provider == provider_id)
-        {
-            break r.sequence;
-        }
-        assert!(
-            Instant::now() < deadline,
-            "the fresh consumer never discovered a valid (unexpired) record for S past the TTL — \
-             the re-sign did not keep the seed alive"
-        );
-        tokio::time::sleep(Duration::from_millis(200)).await;
-    };
+    // CONTINUOUS re-signing (not a one-shot refresh): the discovered sequence for S must STRICTLY
+    // INCREASE across ≥2 further refresh cycles, ALL observed PAST the original TTL. A task that
+    // re-signed once and exited would plateau here and fail. Every observed sequence is > 1 (a
+    // re-signed supersede), and each strictly exceeds the previous — proof the seed keeps refreshing.
+    let s1 =
+        poll_discovered_sequence_above(&consumer, &content_key, provider_id, &discovery_budget, 1)
+            .await;
+    let s2 =
+        poll_discovered_sequence_above(&consumer, &content_key, provider_id, &discovery_budget, s1)
+            .await;
+    let s3 =
+        poll_discovered_sequence_above(&consumer, &content_key, provider_id, &discovery_budget, s2)
+            .await;
     assert!(
-        discovered_sequence > 1,
-        "the record discovered past the TTL must be a RE-SIGNED one (sequence > 1), not the \
-         original — got sequence {discovered_sequence}"
+        s1 > 1 && s1 < s2 && s2 < s3,
+        "past the original TTL the seed must stay discoverable through CONTINUOUS re-signing: the \
+         discovered sequence must strictly increase across ≥2 refresh cycles (got {s1} < {s2} < {s3})"
     );
 
     // ---- FETCH S byte-identically over libp2p through the exact `run` glue the binary uses ----
@@ -338,28 +374,50 @@ async fn seed_goes_undiscoverable_past_ttl_without_resign() {
 
     tokio::time::sleep(Duration::from_secs(WAIT_PAST_TTL_S)).await;
 
-    let discovery_budget = DiscoveryBudget::new(Duration::from_secs(10), 32);
+    // HIGH-5(b): the per-lookup budget (3s) is STRICTLY LESS than the confirmation window (8s), so
+    // the window fits multiple independent lookups (a single 10s budget could swallow the whole
+    // window in one call).
+    let discovery_budget = DiscoveryBudget::new(Duration::from_secs(3), 32);
     let (consumer, _c_source, _c_raw) =
         build_libp2p_nar_source(consumer_cfg(scope, (boot_peer, boot_addr.clone())))
             .await
             .expect("production consumer builder constructs a running libp2p fabric");
 
-    // Confirm discovery of S FAILS across a bounded window: the only record was the original, now
-    // expired, and it is filtered at decode — so the provider is never returned with a valid record.
-    let confirm_until = Instant::now() + Duration::from_secs(6);
-    while Instant::now() < confirm_until {
-        let found_valid = matches!(
-            consumer
-                .provider_directory()
-                .expect("consumer has a directory")
-                .find_providers(&content_key, &discovery_budget)
-                .await,
-            Lookup::Found(records) if records.iter().any(|r| r.provider == provider_id)
-        );
+    // HIGH-5(a): attribute the failure to the EXPIRY boundary, not a generic "not Found". Discovery
+    // of S must SETTLE to `Lookup::Miss` — the AUTHORITATIVE healthy-absence the directory returns
+    // ONLY when it reached the provider's record store and every candidate was skipped as EXPIRED /
+    // withdrawn / absent (the `Stale` decode-reject in `directory.rs::classify`). That is DISTINCT
+    // from `Unavailable` (a routing / consult failure), which we do NOT accept as success — we keep
+    // polling toward the steady `Miss`. And it is NEVER `Found` for our provider. The GREEN arm
+    // proves the SAME setup IS discoverable when the re-sign runs, so this `Miss` is the missing
+    // re-sign (expiry), not a broken harness.
+    let confirm_until = Instant::now() + Duration::from_secs(8);
+    loop {
+        match consumer
+            .provider_directory()
+            .expect("consumer has a directory")
+            .find_providers(&content_key, &discovery_budget)
+            .await
+        {
+            Lookup::Found(records) if records.iter().any(|r| r.provider == provider_id) => {
+                panic!(
+                    "without re-sign, S must NOT be discoverable past the TTL, but the fresh \
+                     consumer FOUND a valid record for the provider"
+                );
+            }
+            // Reached the record store; the only record was the expired original -> healthy,
+            // AUTHORITATIVE absence. This is the expiry boundary, cleanly attributed (and DISTINCT
+            // from `Unavailable`, which we do NOT accept as success). Breaking here IS the assertion
+            // that discovery settled to `Miss`.
+            Lookup::Miss => break,
+            // A stray `Found` without our provider, or a transient `Unavailable` (consult/routing):
+            // not success — keep polling toward the steady `Miss`.
+            _ => {}
+        }
         assert!(
-            !found_valid,
-            "without re-sign, the fresh consumer must NOT discover a valid record for S past the \
-             TTL (the original signed record has expired) — but it did"
+            Instant::now() < confirm_until,
+            "discovery of S never settled to the authoritative Miss (expired-record) boundary past \
+             the TTL — it stayed Unavailable, which would not attribute the failure to expiry"
         );
         tokio::time::sleep(Duration::from_millis(300)).await;
     }
