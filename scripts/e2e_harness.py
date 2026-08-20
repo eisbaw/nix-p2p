@@ -2495,9 +2495,16 @@ class Libp2pMdnsTopology:
         # `consumers` is IGNORED (a zeroconfig node carries NO --libp2p-scope; it derives the FROZEN
         # `lan-share.v1` from the profile, so the caller must set the whole pool to lan-share.v1).
         zeroconfig_roles: tuple[str, ...] = (),
+        # TASK-283: extra environment passed into the DAEMON containers only (never origin/proxy).
+        # The discovery-latency scenario sets {"RUST_LOG": "info"} so the composite /bin/daemon's
+        # `init_tracing()` (TASK-272) installs its stderr subscriber and the fabric-libp2p
+        # `DISCOVERY-LATENCY-*` markers surface in `podman logs`. Empty by default so every OTHER
+        # scenario sharing this topology stays byte-for-byte unchanged (no subscriber installed).
+        daemon_env: dict[str, str] | None = None,
     ):
         self.ctx = ctx
         self._pm = ctx.podman
+        self.daemon_env = dict(daemon_env or {})
         self.prefix = f"{POD_PREFIX}-{name}"
         self.served_cache = served_cache
         self.seed_dir = seed_dir
@@ -2527,6 +2534,14 @@ class Libp2pMdnsTopology:
 
     def _c(self, role: str) -> str:
         return f"{self.prefix}-{role}"
+
+    def _env_args(self) -> list[str]:
+        """`podman run` `-e KEY=VALUE` fragments for the daemon containers (TASK-283). Sorted so
+        the argv is deterministic (stable across runs); empty when no daemon_env was requested."""
+        args: list[str] = []
+        for k, v in sorted(self.daemon_env.items()):
+            args += ["-e", f"{k}={v}"]
+        return args
 
     def roles(self) -> list[str]:
         return ["origin", "proxy", "lp-provider", *[r for r, _ in self.consumers]]
@@ -2588,7 +2603,7 @@ class Libp2pMdnsTopology:
                 ]
                 run(
                     [pm, "run", "-d", "--label", PROJECT_LABEL, "--name", self._c(role),
-                     "--network", self.NET, "--ip", ip, self.ctx.image, *argv]
+                     "--network", self.NET, "--ip", ip, *self._env_args(), self.ctx.image, *argv]
                 )
                 # A lone-genesis lan-share provider waits (bounded) for a same-scope mDNS peer before
                 # it binds its HTTP listener, so allow the same generous window the provider gets.
@@ -2596,7 +2611,7 @@ class Libp2pMdnsTopology:
             else:
                 run(
                     [pm, "run", "-d", "--label", PROJECT_LABEL, "--name", self._c(role),
-                     "--network", self.NET, "--ip", ip, self.ctx.image,
+                     "--network", self.NET, "--ip", ip, *self._env_args(), self.ctx.image,
                      "/bin/daemon", "--listen", f"0.0.0.0:{DAEMON_PORT}", "--upstream", proxy_url,
                      "--libp2p-leech", "--libp2p-mdns",
                      "--libp2p-listen", f"/ip4/{ip}/tcp/{LIBP2P_BASE_PORT}",
@@ -2627,7 +2642,8 @@ class Libp2pMdnsTopology:
             "run", "-d", "--label", PROJECT_LABEL, "--name", self._c("lp-provider"),
             "--network", self.NET, "--ip", self.IP_PROVIDER,
             "--volume", f"{self.seed_dir}:/srv/seed:ro",
-            "--volume", f"{state_host}:/srv/state", *allowlist_mount, self.ctx.image,
+            "--volume", f"{state_host}:/srv/state", *allowlist_mount, *self._env_args(),
+            self.ctx.image,
             "/bin/daemon", "--listen", f"0.0.0.0:{DAEMON_PORT}", "--upstream", proxy_url,
             "--libp2p-provider", "--libp2p-mdns",
             "--libp2p-listen", f"/ip4/{self.IP_PROVIDER}/tcp/{LIBP2P_BASE_PORT + 1}",
@@ -7447,6 +7463,122 @@ def scenario_libp2p_mdns_bootstrap(ctx: Ctx, expect) -> None:
         )
 
 
+_DL_MDNS_RE = re.compile(r"DISCOVERY-LATENCY-MDNS.*?\belapsed_ms=(\d+)")
+_DL_KAD_RE = re.compile(r"DISCOVERY-LATENCY-KAD.*?\belapsed_ms=(\d+)")
+
+
+def _parse_discovery_latencies(log: str) -> tuple[list[int], list[int]]:
+    """Extract INTEGER-ms mDNS + kad latencies from one daemon's `RUST_LOG=info` log.
+
+    Returns (mdns_ms, kad_ms). Empty lists when the markers are absent - which is EXACTLY the
+    TASK-283 bite: strip the fabric-libp2p instrumentation OR the composite RUST_LOG subscriber
+    and this returns ([], []), so the scenario's "at least one of each" assertions go RED. The
+    parse re-derives from the raw captured log (written to evidence/), never a self-reported
+    number.
+    """
+    return (
+        [int(m) for m in _DL_MDNS_RE.findall(log)],
+        [int(m) for m in _DL_KAD_RE.findall(log)],
+    )
+
+
+def scenario_measure_discovery_latency(ctx: Ctx, expect) -> None:
+    """TASK-283: measure the REAL shipped-path discovery latency (mDNS peer-discovery + kad
+    `get_providers`) in INTEGER ms, off the same zero-bootstrap mDNS topology the bootstrap proof
+    uses. RUST_LOG=info is plumbed into the daemon containers (TASK-272 `init_tracing` on the
+    composite /bin/daemon), a real fetch drives a real `get_providers` walk, and the integer-ms
+    `DISCOVERY-LATENCY-*` markers are parsed FROM the raw daemon logs and written to
+    evidence/task-272/.
+
+    CONTAINER/LOOPBACK FLOOR, not real-network latency: all nodes share one podman bridge on one
+    host, so these numbers are a lower bound. Real-network discovery latency is TASK-268/237/282.
+
+    THE BITE: this scenario FAILS/null if the fabric-libp2p instrumentation OR the composite
+    RUST_LOG subscriber is removed - with no markers the parse yields no integers and the
+    "captured >= 1 mDNS latency / >= 1 kad latency" assertions go RED. It measures the real path,
+    not a hardcoded value.
+    """
+    fixtures = ctx.fixtures
+    seed_dir, prov_seeds, target_sp = _s7_seeds(ctx, "dlat", S7_TARGET)
+    evidence_dir = Path(__file__).resolve().parent.parent / "evidence" / "task-272"
+    evidence_dir.mkdir(parents=True, exist_ok=True)
+
+    with Libp2pMdnsTopology(
+        ctx, "dlat", fixtures.cache, seed_dir, prov_seeds, expect,
+        provider_scope=LIBP2P_SCOPE,
+        consumers=(("lp-consumer", LIBP2P_SCOPE),),
+        libp2p_trusted_key=fixtures.public_key,
+        daemon_env={"RUST_LOG": "info"},
+    ) as topo:
+        # Drive a REAL discovery: converge mDNS, then fetch the target so the consumer daemon
+        # issues a real kad get_providers walk on the shipped path.
+        time.sleep(LIBP2P_MDNS_CONVERGE_S)
+        topo.proxy_reset()
+        res = topo.client_run("lp-consumer", [target_sp], fixtures.public_key)
+        expect(
+            res.exit_code == 0,
+            "discovery-latency: the driving fetch completed (a real get_providers walk ran)",
+            res.stderr[-800:],
+        )
+
+        # Re-derive from the RAW logs of every daemon role, and persist them so a verifier can
+        # recompute the numbers independently (evidence verdict re-derives from raw, TASK-269 rule).
+        roles = ["lp-provider", "lp-consumer"]
+        raw_logs = {role: topo.logs(role) for role in roles}
+        for role, log in raw_logs.items():
+            (evidence_dir / f"{role}.log").write_text(log)
+
+        mdns_by_role: dict[str, list[int]] = {}
+        kad_by_role: dict[str, list[int]] = {}
+        for role, log in raw_logs.items():
+            mdns_ms, kad_ms = _parse_discovery_latencies(log)
+            mdns_by_role[role] = mdns_ms
+            kad_by_role[role] = kad_ms
+
+        all_mdns = [ms for v in mdns_by_role.values() for ms in v]
+        all_kad = [ms for v in kad_by_role.values() for ms in v]
+
+        # Persist the parsed integers (NO floats in any serialized field - project rule).
+        result = {
+            "task": "TASK-283",
+            "unit": "integer milliseconds (wall-clock)",
+            "caveat": (
+                "CONTAINER/LOOPBACK FLOOR - one podman bridge on one host; a lower bound, "
+                "not real-network discovery latency (TASK-268/237/282)."
+            ),
+            "target_store_path": target_sp,
+            "mdns_first_peer_ms_by_role": mdns_by_role,
+            "kad_get_providers_ms_by_role": kad_by_role,
+        }
+        (evidence_dir / "discovery-latency.json").write_text(json.dumps(result, indent=2) + "\n")
+
+        # THE BITE (proves it measures the real path): at least one integer-ms latency of EACH
+        # kind must have been parsed from the raw logs. Remove the instrumentation or the RUST_LOG
+        # subscriber and these go RED (no markers -> empty lists).
+        expect(
+            len(all_mdns) >= 1,
+            "discovery-latency: >=1 INTEGER-ms mDNS peer-discovery latency parsed from raw logs "
+            "(bite: null if the fabric instrumentation or RUST_LOG subscriber is removed)",
+            f"mdns_by_role={mdns_by_role}",
+        )
+        expect(
+            len(all_kad) >= 1,
+            "discovery-latency: >=1 INTEGER-ms kad get_providers latency parsed from raw logs "
+            "(bite: null if the fabric instrumentation or RUST_LOG subscriber is removed)",
+            f"kad_by_role={kad_by_role}",
+        )
+        # Sanity: the parsed values really are non-negative integers (no float/NaN smuggled in).
+        expect(
+            all(isinstance(ms, int) and ms >= 0 for ms in all_mdns + all_kad),
+            "discovery-latency: every captured latency is a non-negative integer (no floats)",
+            f"mdns={all_mdns} kad={all_kad}",
+        )
+        print(
+            f"e2e: discovery-latency (container floor) mdns_ms={all_mdns} kad_ms={all_kad} "
+            f"-> {evidence_dir}/discovery-latency.json"
+        )
+
+
 def scenario_libp2p_mdns_scope_isolation(ctx: Ctx, expect) -> None:
     """TASK-257 negative control (bite #2): mDNS multicasts across the WHOLE LAN, but the scoped
     `/nix-p2p/<scope>/kad` protocol still isolates. Provider P and a same-scope helper H (scope
@@ -8098,6 +8230,7 @@ SCENARIOS = [
     # NEITHER given --libp2p-bootstrap, discover each other via --libp2p-mdns and the consumer
     # fetches byte-identical with 0 upstream egress; plus the scope-isolation negative control.
     ("libp2p-mdns-bootstrap", scenario_libp2p_mdns_bootstrap),
+    ("measure-discovery-latency", scenario_measure_discovery_latency),
     ("libp2p-mdns-scope-isolation", scenario_libp2p_mdns_scope_isolation),
     # TASK-273 (discovery-only): the zero-config-DISCOVERY teeth - node B carries `--profile
     # lan-share` with NO --libp2p-mdns/--libp2p-bootstrap/--libp2p-scope flag (mDNS auto-enabled by

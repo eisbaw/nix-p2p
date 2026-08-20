@@ -1,0 +1,25 @@
+{
+  "task": "TASK-283",
+  "unit": "integer milliseconds (wall-clock)",
+  "caveat": "CONTAINER/LOOPBACK FLOOR - one podman bridge on one host; a lower bound, not real-network discovery latency (TASK-268/237/282).",
+  "target_store_path": "/nix/store/0a0lslqb6gbqnj6xqjlaljjqg6kgb3wz-nix-p2p-fixture-lib",
+  "mdns_first_peer_ms_by_role": {
+    "lp-provider": [
+      1
+    ],
+    "lp-consumer": [
+      610
+    ]
+  },
+  "kad_get_providers_ms_by_role": {
+    "lp-provider": [],
+    "lp-consumer": [
+      0,
+      0,
+      0,
+      0,
+      0,
+      0
+    ]
+  }
+}

@@ -1573,6 +1573,13 @@ enum Pending {
         /// strict subset). Carried out so the directory can distinguish a bounded result from
         /// a complete one (TASK-154 B2 Miss-vs-Unavailable).
         truncated: bool,
+        /// TASK-283 discovery-latency anchor: the instant this `get_providers` walk was issued.
+        /// The kad latency is `started.elapsed()` in INTEGER ms, emitted at info on the terminal
+        /// event (surfaces under `RUST_LOG=info`). Provenance only — never a decision input.
+        started: Instant,
+        /// TASK-283 provenance: the exact content key this walk resolves ("which query key"),
+        /// carried so the emitted latency marker names WHAT was discovered, not just how long.
+        key: kad::RecordKey,
         reply: oneshot::Sender<Result<ProviderFanOut, QueryFail>>,
     },
     GetRecord {
@@ -1712,6 +1719,15 @@ struct Worker {
     /// path REJECTS a peer whose advertised `protocol_version` differs from this (TASK-280 #4),
     /// dropping its addresses. Plain data (always known); its USE is gated on confinement.
     id_protocol: String,
+    /// TASK-283 discovery-latency anchor: the instant the worker was constructed (node start).
+    /// The mDNS "time-to-first-peer" latency is measured against this and emitted ONCE at
+    /// info level (surfaces under `RUST_LOG=info`). It is the honest discovery-latency floor:
+    /// elapsed from node start to the first LAN peer this node acts on (`add_address`).
+    started_at: Instant,
+    /// TASK-283: set true after the first mDNS peer's latency has been reported, so the
+    /// `DISCOVERY-LATENCY-MDNS` marker is emitted exactly once per node (time-to-first-peer),
+    /// not once per re-advertised record.
+    first_mdns_reported: bool,
 }
 
 struct PendingListen {
@@ -2281,6 +2297,11 @@ impl Worker {
                 id_reply,
                 reply,
             } => {
+                // TASK-283: clone the key for the latency marker's provenance BEFORE it is
+                // moved into the walk; the clone is a short Vec (the content key), off the
+                // hot path (one per discovery, not per byte).
+                let key_provenance = key.clone();
+                let started = Instant::now();
                 let id = self.swarm.behaviour_mut().kad.get_providers(key);
                 // Hand the id back BEFORE the result so the caller can cancel this query on an
                 // abandoned wait (TASK-154 S4). If the caller ALREADY went away (dropped before
@@ -2304,6 +2325,8 @@ impl Worker {
                         max_peers,
                         salt,
                         truncated: false,
+                        started,
+                        key: key_provenance,
                         reply,
                     },
                 );
@@ -2589,6 +2612,10 @@ impl Worker {
                 // find_providers).
                 let now = Instant::now();
                 let confined = self.lan_serve_conns.is_some();
+                // TASK-283 discovery-latency: capture the anchor + this node's identity BEFORE the
+                // kad borrow (local_peer_id borrows the swarm immutably; kad borrows it mutably).
+                let started_at = self.started_at;
+                let local_peer = *self.swarm.local_peer_id();
                 let kad = &mut self.swarm.behaviour_mut().kad;
                 for (peer_id, addr) in peers {
                     if !self.mdns_admission.admit(peer_id, now) {
@@ -2611,6 +2638,23 @@ impl Worker {
                              (not added to kad routing)"
                         );
                         continue;
+                    }
+                    // TASK-283 discovery-latency: report the time-to-first-mDNS-peer ONCE, in
+                    // INTEGER ms (no floats), at the moment this node acts on (routes) its first
+                    // LAN peer. `RUST_LOG=info` surfaces it; provenance names this node + the peer.
+                    if !self.first_mdns_reported {
+                        self.first_mdns_reported = true;
+                        // u64 ms (integer; no float). `try_from` keeps it exact; the saturating
+                        // fallback is unreachable (would need ~5.8e8 years of uptime).
+                        let elapsed_ms =
+                            u64::try_from(started_at.elapsed().as_millis()).unwrap_or(u64::MAX);
+                        tracing::info!(
+                            %local_peer,
+                            %peer_id,
+                            %addr,
+                            elapsed_ms,
+                            "DISCOVERY-LATENCY-MDNS first LAN peer discovered (elapsed since node start)"
+                        );
                     }
                     kad.add_address(&peer_id, addr);
                 }
@@ -2705,10 +2749,32 @@ impl Worker {
                     && let Some(Pending::GetProviders {
                         found,
                         truncated,
+                        started,
+                        key,
                         reply,
                         ..
                     }) = self.pending.remove(&id)
                 {
+                    // TASK-283 discovery-latency: emit the kad `get_providers` wall-clock in
+                    // INTEGER ms (no floats — project rule), labelled with this node's PeerId and
+                    // the exact content key, so `RUST_LOG=info` surfaces the REAL shipped-path
+                    // latency. Off the byte path (one marker per completed discovery walk). u64 ms
+                    // is exact via `try_from`; the saturating fallback is unreachable at any
+                    // realistic uptime.
+                    let elapsed_ms =
+                        u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+                    let key_hex: String = key.as_ref().iter().map(|b| format!("{b:02x}")).collect();
+                    let local_peer = *self.swarm.local_peer_id();
+                    let outcome = if failed { "timeout" } else { "resolved" };
+                    tracing::info!(
+                        %local_peer,
+                        key = %key_hex,
+                        providers = found.len() as u64,
+                        answered = stats.num_successes() as u64,
+                        elapsed_ms,
+                        outcome,
+                        "DISCOVERY-LATENCY-KAD get_providers terminal (elapsed since query issued)"
+                    );
                     // The terminal-step stats are cumulative for the whole query, so
                     // `num_successes` is how many peers answered the walk toward the key
                     // (TASK-174: the near-key bar for an EMPTY provider set). The `found`
@@ -3808,6 +3874,8 @@ impl Node {
             ),
             lan_serve_conns,
             id_protocol: worker_id_protocol,
+            started_at: Instant::now(),
+            first_mdns_reported: false,
         };
         let join = tokio::spawn(worker.run());
 
@@ -4886,6 +4954,8 @@ mod tests {
                 max_peers: 16,
                 salt: 0,
                 truncated: false,
+                started: std::time::Instant::now(),
+                key: kad::RecordKey::new(&b"t".to_vec()),
                 reply: dropped_get_providers,
             }
             .reply_is_closed()
@@ -4897,6 +4967,8 @@ mod tests {
                 max_peers: 16,
                 salt: 0,
                 truncated: false,
+                started: std::time::Instant::now(),
+                key: kad::RecordKey::new(&b"t".to_vec()),
                 reply: held_get_providers,
             }
             .reply_is_closed()
@@ -4955,6 +5027,8 @@ mod tests {
                 max_peers: 16,
                 salt: 0,
                 truncated: false,
+                started: std::time::Instant::now(),
+                key: kad::RecordKey::new(&b"gone".to_vec()),
                 reply: abandoned_reply,
             },
         );
@@ -4968,6 +5042,8 @@ mod tests {
                 max_peers: 16,
                 salt: 0,
                 truncated: false,
+                started: std::time::Instant::now(),
+                key: kad::RecordKey::new(&b"here".to_vec()),
                 reply: live_reply,
             },
         );

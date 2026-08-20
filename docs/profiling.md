@@ -236,3 +236,42 @@ build-once-vs-serve-every-time asymmetry is the CDN's moat on slow links; nix-p2
 links on raw bytes, not compression. **The lever** (TASK-271): a peer that *cached* the
 compressed NAR (compress once, serve many) amortizes the CPU and would let `zstd-19` win even at
 16 Mbps — at the cost of the current stateless "nothing at rest" design.
+
+## Discovery latency — the container floor (TASK-283, 2026-08-20)
+
+The compression sweeps above **exclude** discovery latency (PRD risk 3), and it was the one
+unmeasured leg. This is the first real measurement of the **shipped** libp2p discovery path —
+mDNS peer-discovery + kad `get_providers` — in **integer milliseconds**. It is produced, not
+modelled: `fabric-libp2p` emits a `DISCOVERY-LATENCY-*` `tracing::info!` marker at each real
+boundary (`swarm.rs`), the composite `/bin/daemon` installs the subscriber when `RUST_LOG` is
+set (TASK-272 `init_tracing`), and `just discovery-latency` drives a real two-node zero-bootstrap
+mDNS fetch and parses the integers **from the raw daemon logs** into `evidence/task-272/`
+(`discovery-latency.json` + `lp-provider.log` / `lp-consumer.log`).
+
+**Measured (one run, one podman bridge, one host):**
+
+| boundary | node | integer ms | provenance |
+| --- | --- | ---: | --- |
+| mDNS time-to-first-peer | provider (`.11`) | **1** | discovered the already-present consumer instantly |
+| mDNS time-to-first-peer | consumer (`.10`) | **610** | came up first; waited for the provider to join the multicast segment |
+| kad `get_providers` | consumer (`.10`) | **0** (×6 walks) | sub-millisecond; the provider's address was already in the k-buckets (mDNS `add_address`), so the walk is a local lookup |
+
+The **kad `0 ms`** is an honest observation, not a missing number: on loopback, once mDNS has
+seeded the provider's address, the `get_providers` walk resolves in **under one millisecond** and
+integer-flooring reports `0`. The measurement is per real query (the fetch issued six walks, all
+`0`). What this says: on a LAN with the peer already known, kad content-discovery is effectively
+free; the real cost on a real network is the RTT-bound walk, which this loopback floor does **not**
+capture.
+
+**Caveat — this is a CONTAINER/LOOPBACK FLOOR, a lower bound.** All nodes share one podman bridge
+on one host, so these are the smallest numbers the mechanism can produce, not real-network
+discovery latency. The mDNS `610 ms` is dominated by **startup ordering** (the consumer starting
+before the provider announced) plus the provider's lone-genesis announce-quorum retry, not by
+multicast propagation. Real-network discovery latency — multi-hop DHT walks, WAN RTT, NAT
+traversal — is **TASK-268 / TASK-237 / TASK-282**, not this. The number here exists to (a) prove
+the shipped path is instrumented and (b) give the LAN floor the compression sweeps were missing.
+
+**Integers only.** Every emitted latency is a `u64` millisecond (`Duration::as_millis` floored via
+`u64::try_from`); the serialized `discovery-latency.json` carries only integers and provenance
+strings — no float enters any field. The instrumentation is off the byte path (one marker per
+discovered peer / completed walk), so it does not perturb transfer timing.

@@ -1,0 +1,16 @@
+daemon 0.0.1
+daemon: operator profile=public-share (public-share: serve + announce over a public substrate, allowlist-gated per NAR)
+daemon: LAN discovery ACTIVE via mDNS. This host multicasts its presence, NodeId, and libp2p listen multiaddrs to the local link and answers any LAN querier — this is how same-pin peers find you with zero config. Opt out: --libp2p-no-mdns (NixOS: services.nix-p2p.libp2p.mdns = false).
+daemon: narinfo disk cache at /root/.local/state/nix-p2p/narinfo
+LIBP2P-PUBLIC-LEARN store_hash=0a0lslqb6gbqnj6xqjlaljjqg6kgb3wz nar_hash=sha256:06rgb4vfjsg365xwwdjz12qhjnvg3w0agfvyqfp977hp3yk2bczb nar_size=66048
+daemon: /nar serve gate active
+LIBP2P-SEED narhash=<redacted-content-id> content=<redacted-content-id> content_key=<redacted-content-id> bytes=66048
+LIBP2P-SERVE-BUDGET max_nar_bytes_uncompressed_nar=268435456 max_inflight_bytes_uncompressed_nar=1073741824 max_serve_duration_ms=120000
+daemon: libp2p PROVIDER started, serving + announcing 1 seeded NAR(s) + 0 /nix/store path(s) on demand (0 bootstrap peer(s))
+LIBP2P-PROVIDER-ADDR peer_id=12D3KooWHxsrJEREZN5dazPdiDDXaHeXr4pRQqBpCCdSvZmhaPRP listen=/ip4/10.211.33.11/tcp/37001
+daemon: listening on 0.0.0.0:8082 -> upstream http://10.211.33.12:8081
+2026-08-20T15:44:30.780311Z  INFO libp2p_swarm: local_peer_id=12D3KooWHxsrJEREZN5dazPdiDDXaHeXr4pRQqBpCCdSvZmhaPRP
+2026-08-20T15:44:30.781107Z  INFO libp2p_mdns::behaviour::iface: creating instance on iface address address=10.211.33.11
+2026-08-20T15:44:30.782649Z  INFO libp2p_mdns::behaviour: discovered peer on address peer=12D3KooWRYwY21kwDTjFVVprjH25DXMro1jeRKkfVcft2iHZPyoh address=/ip4/10.211.33.10/tcp/37000/p2p/12D3KooWRYwY21kwDTjFVVprjH25DXMro1jeRKkfVcft2iHZPyoh
+2026-08-20T15:44:30.782678Z  INFO fabric_libp2p::swarm: DISCOVERY-LATENCY-MDNS first LAN peer discovered (elapsed since node start) local_peer=12D3KooWHxsrJEREZN5dazPdiDDXaHeXr4pRQqBpCCdSvZmhaPRP peer_id=12D3KooWRYwY21kwDTjFVVprjH25DXMro1jeRKkfVcft2iHZPyoh addr=/ip4/10.211.33.10/tcp/37000/p2p/12D3KooWRYwY21kwDTjFVVprjH25DXMro1jeRKkfVcft2iHZPyoh elapsed_ms=1
+2026-08-20T15:44:30.832996Z  INFO fabric_libp2p::server: fabric-libp2p: NAR serve session started
