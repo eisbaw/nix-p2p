@@ -865,8 +865,10 @@ fn check_runtime_preconditions(cfg: &Config) -> Result<(), String> {
                  ONLY entry path — do not pass --libp2p-no-mdns (NixOS: services.nix-p2p.libp2p.mdns \
                  = true)".into()
             } else {
-                "public-share has no way to be discovered: enable LAN mDNS (drop --libp2p-no-mdns), \
-                 OR give a --libp2p-bootstrap <PeerId>@<multiaddr>, OR a --libp2p-provider-addr \
+                // public-share defaults mDNS OFF, so the operator must ADD --libp2p-mdns (not "drop
+                // --libp2p-no-mdns"), OR give a real Kad entry hint.
+                "public-share has no way to be discovered: add --libp2p-mdns for LAN discovery, OR \
+                 give a --libp2p-bootstrap <PeerId>@<multiaddr>, OR a --libp2p-provider-addr \
                  <PeerId>@<multiaddr> dial hint. A self-advertised --libp2p-external-address is NOT \
                  an entry path (it only propagates identify metadata after a connection, never dials \
                  or seeds Kad)".into()
@@ -1497,13 +1499,19 @@ async fn main() -> ExitCode {
     if contract.privacy.diagnostics_opt_in {
         eprintln!("daemon-libp2p: {}", daemon_core::DIAGNOSTICS_WARNING);
     }
-    // TASK-273 AC#4: when LAN mDNS is ACTIVE (default under lan-share), disclose the presence
-    // EXPOSURE on the first log line so the operator can tell it is working — and what it discloses
-    // — without RUST_LOG surgery. This is the sensitive off->on privacy default made legible. It
-    // also names the SECOND new lan-share default exposure (announce-after-fetch), so the operator
-    // sees both consequences of a bare `--profile lan-share` at once.
+    // TASK-273 AC#4: when LAN mDNS is ACTIVE, disclose the presence EXPOSURE on the first log line
+    // so the operator can tell it is working — and what it discloses — without RUST_LOG surgery.
+    // This is the sensitive privacy default made legible.
     if cfg.mdns_active {
-        // A SECOND exposure, disclosed in the SAME line only when it is actually ON:
+        // #6: label mDNS honestly by HOW it was enabled — the lan-share PROFILE DEFAULT (raw opt-in
+        // unset + profile is lan-share) vs an EXPLICIT `--libp2p-mdns` (e.g. under consume-only /
+        // public-share / router). Only the former is a "default".
+        let how = if cfg.libp2p_mdns.is_none() && cfg.profile == SharingProfile::LanShare {
+            "lan-share default"
+        } else {
+            "explicitly enabled via --libp2p-mdns"
+        };
+        // A SEPARATE exposure, disclosed in the SAME line only when it is actually ON:
         // `--libp2p-announce-after-fetch` makes the node advertise the content-keys of what it
         // fetches to same-pin DHT peers (disclosing WHAT it fetched), on top of the mDNS presence
         // exposure. It is an explicit opt-in (NOT a lan-share default), so name the accurate way to
@@ -1516,10 +1524,10 @@ async fn main() -> ExitCode {
             ""
         };
         println!(
-            "daemon-libp2p: LAN discovery ACTIVE via mDNS (lan-share default). This host \
-             multicasts its presence, NodeId, and libp2p listen multiaddrs to the local link and \
-             answers any LAN querier — this is how same-pin peers find you with zero config. Opt \
-             out: --libp2p-no-mdns (NixOS: services.nix-p2p.libp2p.mdns = false).{announce_clause}"
+            "daemon-libp2p: LAN discovery ACTIVE via mDNS ({how}). This host multicasts its \
+             presence, NodeId, and libp2p listen multiaddrs to the local link and answers any LAN \
+             querier — this is how same-pin peers find you with zero config. Opt out: \
+             --libp2p-no-mdns (NixOS: services.nix-p2p.libp2p.mdns = false).{announce_clause}"
         );
     }
 

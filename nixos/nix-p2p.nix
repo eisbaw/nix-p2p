@@ -242,11 +242,16 @@ in
         description = ''
           `--libp2p-mdns` (TASK-257): LAN mDNS peer-ADDRESS discovery. TRI-STATE
           (TASK-273): `null` (DEFAULT) follows the profile — ON for
-          `profile = "lan-share"` (genuinely zero-config same-pin LAN sharing),
-          OFF for every other profile; `true` forces it on; `false` is an explicit
-          opt-out that reaches the daemon as `--libp2p-no-mdns` (so a lan-share
-          operator can decline LAN discovery and get the fail-loud undiscoverable
-          -provider guard instead of a silent default-on).
+          `profile = "lan-share"`, OFF for every other profile; `true` forces it
+          on; `false` is an explicit opt-out that reaches the daemon as
+          `--libp2p-no-mdns` (so a lan-share operator can decline LAN discovery and
+          get the fail-loud undiscoverable-provider guard instead of a silent
+          default-on). SCOPE (TASK-273 is discovery-only): lan-share auto-enables
+          LAN mDNS DISCOVERY only — the node must still be given a supply
+          (`seedNar` / `provideStore` / `announceAfterFetch`) AND a `listen` to
+          actually SERVE; a bare `profile = "lan-share"` with neither FAILS LOUD at
+          startup (it does not silently pretend to serve). Full zero-config supply
+          + reachability defaults are deferred to TASK-278.
           When enabled, a same-scope neighbour on the LAN is discovered over
           link-local multicast with NO `bootstrap` entry - the zero-config answer
           for a private org pool. Discovered addresses feed the SAME kad bootstrap

@@ -2447,12 +2447,13 @@ class Libp2pMdnsTopology:
         # the provider => it can resolve; a different scope => scope isolation must block it.
         consumers: tuple[tuple[str, str], ...],
         libp2p_trusted_key: str,
-        # TASK-273: roles whose ONLY libp2p intent is `--profile lan-share`. Such a role runs the
-        # PRIMARY /bin/daemon-libp2p binary with argv = `--profile lan-share` and NOTHING else
-        # libp2p (no --libp2p-mdns, no --libp2p-bootstrap, no --libp2p-scope, no --libp2p-listen):
-        # mDNS + a loopback libp2p listen + announce-after-fetch are all DEFAULTED by the profile.
-        # This is the zero-config teeth. Its `scope` in `consumers` is IGNORED (it uses the daemon's
-        # default scope "v1", so the provider must be launched on "v1" to be same-scope).
+        # TASK-273 (discovery-only): roles that run the PRIMARY /bin/daemon-libp2p binary as a
+        # `--profile lan-share` node whose DISCOVERY is implicit from the profile (NO --libp2p-mdns,
+        # NO --libp2p-bootstrap, NO --libp2p-scope — mDNS is the profile default; that is the real
+        # teeth). SUPPLY + a listen are passed EXPLICITLY (--libp2p-provider, a loopback
+        # --libp2p-listen, --libp2p-announce-after-fetch) because the AC#5 auto-defaults were
+        # reverted to TASK-278 — a bare lan-share fails loud on missing supply/listen. Its `scope` in
+        # `consumers` is IGNORED (it uses the daemon default scope "v1", so the provider is on "v1").
         zeroconfig_roles: tuple[str, ...] = (),
     ):
         self.ctx = ctx
@@ -6696,8 +6697,9 @@ def scenario_libp2p_lan_share_zeroconfig(ctx: Ctx, expect) -> None:
     """TASK-273 (DISCOVERY-ONLY): node B is given `--profile lan-share` and — the teeth — NO
     `--libp2p-mdns`, NO `--libp2p-bootstrap`, NO `--libp2p-scope`. Its LAN DISCOVERY is therefore
     IMPLICIT from the profile (`default_lan_mdns`). SUPPLY + a listen are the operator's explicit
-    choice (the AC#5 auto-defaults were reverted to TASK-278), so B additionally carries a loopback
-    `--libp2p-listen` and `--libp2p-announce-after-fetch`. B discovers the S7 provider (A) purely
+    choice (the AC#5 auto-defaults were reverted to TASK-278), so B additionally carries an explicit
+    `--libp2p-provider`, a loopback `--libp2p-listen`, and `--libp2p-announce-after-fetch`. B
+    discovers the S7 provider (A) purely
     over the profile-defaulted mDNS and serves a real nix build fetched from A with 0 upstream egress.
 
     THREE nodes make the result ATTRIBUTABLE to B's boundary:
