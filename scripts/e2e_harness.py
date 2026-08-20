@@ -2529,13 +2529,16 @@ class Libp2pMdnsTopology:
                 # TASK-273 DISCOVERY-ONLY TEETH: mDNS is IMPLICIT from `--profile lan-share` (the node
                 # carries NO --libp2p-mdns, NO --libp2p-bootstrap, NO --libp2p-scope). SUPPLY + a
                 # listen are the operator's EXPLICIT choice (the AC#5 auto-defaults were reverted to
-                # TASK-278), so this node DOES pass a loopback --libp2p-listen (the isolated-LAN guard
-                # refuses a routable listen for a no-allowlist lan-share) and --libp2p-announce-after
-                # -fetch as its supply. The load-bearing bit under test is that DISCOVERY (mDNS) is
-                # defaulted by the profile alone. Runs the PRIMARY /bin/daemon-libp2p.
+                # TASK-278), so this node passes a loopback --libp2p-listen (the isolated-LAN guard
+                # refuses a routable listen for a no-allowlist lan-share) and an explicit give side
+                # (--libp2p-provider + --libp2p-announce-after-fetch as its grows-from-fetch supply;
+                # the provider flag is required because the announce-after-fetch companion check runs
+                # before the --profile back-fill). The load-bearing bit under test is that DISCOVERY
+                # (mDNS) is defaulted by the profile alone. Runs the PRIMARY /bin/daemon-libp2p.
                 argv = [
                     "/bin/daemon-libp2p", "--listen", f"0.0.0.0:{DAEMON_PORT}",
                     "--upstream", proxy_url, "--profile", "lan-share",
+                    "--libp2p-provider",
                     "--libp2p-listen", "/ip4/127.0.0.1/tcp/0",
                     "--libp2p-announce-after-fetch",
                 ]
