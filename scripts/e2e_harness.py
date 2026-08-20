@@ -2478,7 +2478,8 @@ class Libp2pMdnsTopology:
         # teeth). SUPPLY + a listen are passed EXPLICITLY (--libp2p-provider, a loopback
         # --libp2p-listen, --libp2p-announce-after-fetch) because the AC#5 auto-defaults were
         # reverted to TASK-278 — a bare lan-share fails loud on missing supply/listen. Its `scope` in
-        # `consumers` is IGNORED (it uses the daemon default scope "v1", so the provider is on "v1").
+        # `consumers` is IGNORED (a zeroconfig node carries NO --libp2p-scope; it derives the FROZEN
+        # `lan-share.v1` from the profile, so the caller must set the whole pool to lan-share.v1).
         zeroconfig_roles: tuple[str, ...] = (),
     ):
         self.ctx = ctx
@@ -7139,8 +7140,10 @@ def scenario_libp2p_lan_share_zeroconfig(ctx: Ctx, expect) -> None:
     over the profile-defaulted mDNS and serves a real nix build fetched from A with 0 upstream egress.
 
     THREE nodes make the result ATTRIBUTABLE to B's boundary:
-      * A (lp-provider): the S7-seed mDNS provider (allowlist door), on the daemon DEFAULT scope "v1"
-        so the bare B (which cannot be given --libp2p-scope without breaking the teeth) is same-scope.
+      * A (lp-provider): the S7-seed mDNS provider (allowlist door). Node B is `--profile lan-share`
+        and derives the FROZEN `lan-share.v1` scope, so A (and C) JOIN B's pool by passing
+        `--libp2p-scope lan-share.v1` EXPLICITLY (TASK-280: the pool agrees on the lan-share scope;
+        B cannot be given --libp2p-scope without breaking the discovery-only teeth).
       * C (lp-helper): a same-scope mDNS leech. It is A's INDEPENDENT put-quorum peer AND a POSITIVE
         CONTROL — C fetches the target with 0 upstream, proving A announced and the DHT works WITHOUT
         B. So B's own 0-upstream result is attributable to B's profile-default discovery, not luck.
@@ -7159,14 +7162,20 @@ def scenario_libp2p_lan_share_zeroconfig(ctx: Ctx, expect) -> None:
     """
     fixtures = ctx.fixtures
     seed_dir, prov_seeds, target_sp = _s7_seeds(ctx, "lanshare", S7_TARGET)
-    # The provider runs on the daemon's DEFAULT libp2p scope so the bare node B (which cannot be
-    # given --libp2p-scope without breaking the teeth) is same-scope by construction. C shares it.
-    default_scope = "v1"
+    # TASK-280 FIX: the whole pool runs on the FROZEN lan-share scope. Node B is `--profile lan-share`
+    # and derives `lan-share.v1` from the profile (it cannot be given --libp2p-scope without breaking
+    # the discovery-only teeth), so A (provider) and C (helper) must JOIN B's pool by passing
+    # `--libp2p-scope lan-share.v1` EXPLICITLY — otherwise B is scope-isolated from them and silently
+    # falls back to upstream (the regression codex + the live e2e caught: B moved to lan-share.v1 while
+    # the pool stayed on v1). SCOPE = AUDIENCE: a same-pin pool agrees on lan-share.v1 regardless of
+    # role (A is an allowlist provider, C a leech, B a lan-share provider), and the override always
+    # wins, so A/C land on lan-share.v1 to match B.
+    pool_scope = "lan-share.v1"  # == fabric_libp2p::LAN_SHARE_NETWORK_SCOPE (frozen wire surface)
     with Libp2pMdnsTopology(
         ctx, "lanshare", fixtures.cache, seed_dir, prov_seeds, expect,
-        provider_scope=default_scope,
+        provider_scope=pool_scope,
         # C (lp-helper) FIRST so it is mDNS-live as A's independent quorum + positive control; then B.
-        consumers=(("lp-helper", default_scope), ("lp-consumer", default_scope)),
+        consumers=(("lp-helper", pool_scope), ("lp-consumer", pool_scope)),
         libp2p_trusted_key=fixtures.public_key,
         zeroconfig_roles=("lp-consumer",),
     ) as topo:

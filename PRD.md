@@ -548,35 +548,74 @@ oracle that is not peak RSS.
     with THREE composed mitigations, all gated on the no-allowlist lan-share
     path only (public-share / consume-only are unchanged):
 
-    - **egress dial VETO** — a swarm-level `LanDialGuard` (`fabric-libp2p`)
-      denies any outbound connection to a non-LAN address, including kad's
-      autonomous by-`PeerId` dials of query-learned addresses (the per-address
-      `handle_established_outbound_connection` hook is the real chokepoint; the
-      `add_address` callsites are gated too, as k-bucket hygiene). Honest
-      residual: a transport-level connect may be briefly attempted before the
-      deny, but no libp2p session becomes usable, so no record, membership, or
-      byte crosses it.
-    - **serve PROVENANCE** — a lan-share node serves `/nar` only over a
-      connection whose remote address has LAN provenance, closing the
-      bidirectional-serve leg (a serve back over an outbound connection to a
-      non-LAN peer, or over a relay circuit, is refused).
-    - **distinct scope (WIRE FREEZE)** — a lan-share node's kad/identify/nar
-      protocols are namespaced under `LAN_SHARE_NETWORK_SCOPE = "lan-share.v1"`
-      (single-sourced in `fabric-libp2p`), so a same-`v1` bridge is cross-scope
-      on all three and can never relay a lan-share record onto the public DHT.
-      **This string is now a COMPATIBILITY SURFACE:** a lan-share PROVIDER and
-      the zero-config lan-share CONSUMER both derive their scope from this ONE
-      constant (parity is structural — one fabric, one `effective_network_scope`
-      decision), so changing the string would silently break discovery between
-      deployed nodes. It is VERSIONED (`.v1`) so an incompatible change mints
-      `lan-share.v2` with a migration story rather than stranding nodes; picked
-      now while cross-host lan-share serving is unreleased (no deployed
-      lan-share-on-`v1` base to strand). `--libp2p-scope` overrides it for the
-      deliberate advanced case of a shared scope.
+    - **egress dial VETO** — a swarm-level `LanDialGuard` (`fabric-libp2p`,
+      ordered FIRST in the behaviour so it denies before any sibling can act)
+      denies any outbound connection to a non-LAN address, under an EXACT
+      positive multiaddr grammar (one LAN IP literal + one direct transport
+      TCP/QUIC-v1 + an optional terminal `/p2p/<id>`; a COMPOUND address with a
+      second public hop is rejected — the terminal pair is what the transport
+      dials), including kad's autonomous by-`PeerId` dials of query-learned
+      addresses (the per-address `handle_established_outbound_connection` hook is
+      the real chokepoint; the `add_address` callsites are gated too, as k-bucket
+      hygiene). Honest residual (corrected): because the swarm calls that hook
+      only AFTER the transport upgrade, a non-LAN dial COMPLETES A NOISE SESSION
+      before the deny — the remote learns our peer-id and observes our source
+      address — but NO kad/identify/nar application substream ever opens on it
+      (the connection handler is never built), so no record, membership, or
+      content byte crosses. A pre-Noise (transport-level) filter would need a
+      dial predicate the pinned libp2p 0.56 phased `SwarmBuilder`
+      (`.with_tcp/.with_quic/.with_relay_client`) exposes no hook for; the leak
+      is the connection metadata of one dropped session (disclosed residual).
+    - **serve PROVENANCE (per CONNECTION)** — a lan-share node serves `/nar`
+      only over the EXACT connection a stream arrived on AND only if THAT
+      connection has recorded LAN provenance. Keying on `(PeerId, ConnectionId)`
+      — not "the peer has SOME LAN connection" — closes the connection-confusion
+      leg: a peer with one LAN connection AND a second connection over a non-LAN
+      address (a serve back over an outbound connection we opened, or a relay
+      circuit) is refused on the non-LAN connection. This required threading
+      `ConnectionId` through the vendored `libp2p-stream` (its `IncomingStreams`
+      item became `(PeerId, ConnectionId, Stream)`).
+    - **distinct scope (WIRE FREEZE)** — a lan-share node's KAD and NAR
+      substreams negotiate SCOPED protocol names
+      (`/nix-p2p/<scope>/{kad/1.0.0,nar/4}`) under
+      `LAN_SHARE_NETWORK_SCOPE = "lan-share.v1"` (single-sourced in
+      `fabric-libp2p`), so a same-`v1` bridge is cross-scope on the two protocols
+      that carry records and content and can never relay a lan-share record onto
+      the public DHT. IDENTIFY is DIFFERENT: it negotiates the FIXED libp2p name
+      `/ipfs/id/1.0.0` and carries the scope only in its `protocol_version`
+      METADATA (`/nix-p2p/<scope>/id/1.0.0`) — it is NOT a scoped substream, so
+      the scope split alone does not stop a cross-scope peer from completing
+      identify. The swarm therefore also REJECTS, under confinement, an identify
+      whose advertised `protocol_version` is not this node's scoped id string,
+      dropping its addresses before they seed routing. FROZEN WIRE STRINGS: the
+      kad name `/nix-p2p/<scope>/kad/1.0.0`, the nar name `/nix-p2p/<scope>/nar/4`,
+      AND (now) the identify `protocol_version` `/nix-p2p/<scope>/id/1.0.0`. The
+      `#1` multiaddr grammar and the `#2` per-connection serve auth are LOCAL
+      admission decisions, NOT frozen wire.
+      **The scope string is a COMPATIBILITY SURFACE:** a lan-share PROVIDER and a
+      lan-share CONSUMER both derive their scope from this ONE constant
+      (parity is structural — one `effective_network_scope` decision; SCOPE names
+      the AUDIENCE/pool a node joins, independent of role, so a LAN leech joins by
+      passing `--libp2p-scope lan-share.v1`), so changing the string would
+      silently break discovery between deployed nodes. It is VERSIONED (`.v1`) so
+      an incompatible change mints `lan-share.v2` with a migration story rather
+      than stranding nodes; picked now while cross-host lan-share serving is
+      unreleased (no deployed lan-share-on-`v1` base to strand). `--libp2p-scope`
+      overrides it for the deliberate advanced case of a shared scope.
 
-    Irreversibility: the frozen scope string is the durable surface here; the
-    three enforcement mechanisms are internal and revisable, but the wire scope
-    is not, once nodes ship on it.
+    DELIBERATELY-BRIDGED INSIDER RESIDUAL (honest): these mitigations confine
+    egress and serving to the LAN and namespace the DHT, but they do NOT defend
+    against an operator who DELIBERATELY bridges the pool — e.g. runs a second
+    node on `--libp2p-scope lan-share.v1` that is ALSO on the public network, or
+    DNATs the serve port. Such a same-scope insider is inside the audience by
+    construction; the disclosure names this and the "keep it on the LAN" guidance
+    stands. The guarantee is "an ORDINARY public peer cannot join or fetch," not
+    "no bridge can ever be built by a cooperating insider."
+
+    Irreversibility: the frozen wire strings (kad + nar + identify
+    `protocol_version`) are the durable surface here; the three enforcement
+    mechanisms are internal and revisable, but those wire strings are not, once
+    nodes ship on them.
 
 ## Open questions (remaining — deferred to phase 2 unless grilled further)
 
