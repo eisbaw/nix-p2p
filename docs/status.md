@@ -119,11 +119,34 @@ sequence fail-closed before publishing (save-before-publish, parent-dir fsynced)
 Without the flag a node is session-scoped by choice (fresh identity, re-earned floor)
 and providers say so loudly.
 
+**Zero-config org/LAN same-pin sharing.** `--profile lan-share` makes the node a same-pin
+LAN pool member with no further config: it auto-enables LAN mDNS (default-on under this
+profile only), so same-pin peers discover each other by multicast with no bootstrap; it
+serves cross-host on a private-LAN listen (loopback/link-local/RFC1918/ULA admitted by a
+positive-grammar guard; global/wildcard/DNS/relay refused before bind), proven across
+separate container network namespaces — a peer fetches a byte-identical NAR from a bare
+`lan-share` node with zero upstream egress; and its supply is additive: static seeds
+(`--libp2p-seed-nar`), named store paths (`--libp2p-provide-store`), and
+announce-after-fetch coexist under one node with an honest served-set report. Whenever
+mDNS is active the host multicasts its presence, NodeId, and listen multiaddrs to the LAN
+— a disclosed presence exposure; opt out with `--libp2p-no-mdns`.
+
 ## What does not work yet
 
-**A public network.** NAT hole-punching and relay for residential peers are proven only
-on containerized NAT; running against the real cache.nixos.org over a public network is
-future work. Today it is single-host loopback and containers.
+**A public network.** Cross-host serving now works on a *local* network — a bare
+`lan-share` node serves same-pin peers over a private-LAN listen, proven across separate
+container network namespaces. But NAT hole-punching and relay for residential peers are
+proven only on containerized NAT, and running against the real cache.nixos.org over the
+public internet is future work.
+
+**The LAN↔public isolation guarantee.** A no-allowlist `lan-share` node's public-internet
+isolation is not yet enforced end-to-end: libp2p connections are bidirectional and address
+ingestion (mDNS/kad/identify) is not yet fully LAN-confined, so a *dual-homed* peer on the
+LAN that is also joined to a public swarm could bridge content keys beyond it. It is
+default-SAFE today (no default public swarm exists — the DHT cannot self-bootstrap) and is
+honestly disclosed at startup and in PRD risk #13; the structural fix (a distinct
+`lan-share.v1` DHT scope + LAN-confined address ingestion + per-connection serve
+provenance) is in progress.
 
 **A verdict on the value thesis.** Whether peers usefully beat or supplement a CDN is
 unmeasured on a real network. Early shaped-link measurement suggests *supplement*: a
