@@ -1035,7 +1035,8 @@ pub fn effective_network_scope(explicit: Option<&str>, lan_share: bool) -> Strin
 /// cache runs on [`LAN_SHARE_NETWORK_SCOPE`]; a consumer that defaults to [`DEFAULT_NETWORK_SCOPE`]
 /// silently finds nothing there. Named so the message is identical across both binaries.
 pub const LAN_SHARE_SCOPE_HINT: &str = "on the public \"v1\" scope, but a LAN lan-share cache runs on \
-     \"lan-share.v1\" — pass --libp2p-scope lan-share.v1 (or --profile lan-share) to join it.";
+     \"lan-share.v1\" — pass --libp2p-scope lan-share.v1 to join it as a consumer. (--profile \
+     lan-share would make this a PROVIDER, not what a leech wants.)";
 
 /// TASK-280 #3: whether to emit [`LAN_SHARE_SCOPE_HINT`] at startup. A node lands on the PUBLIC
 /// default scope unless told otherwise, but a LAN `lan-share` cache is on `lan-share.v1`, so a
@@ -1251,8 +1252,8 @@ pub fn lan_serving_disclosures(
         format!(
             "This node is LAN-CONFINED (TASK-280): it dials and serves only LAN-provenance peers. But \
              you have OVERRIDDEN its DHT scope to the PUBLIC \"{DEFAULT_NETWORK_SCOPE}\" scope, so its \
-             DHT namespace is NOT separate from the public DHT — the dial veto and serve provenance \
-             still confine dialing and serving, but this is the deliberate shared-scope case."
+             DHT namespace is SHARED WITH the public DHT (NOT isolated) — the dial veto and serve \
+             provenance still confine dialing and serving, but this is the deliberate shared-scope case."
         )
     } else {
         format!(

@@ -2732,15 +2732,18 @@ async fn main() -> ExitCode {
     if contract.privacy.diagnostics_opt_in {
         eprintln!("daemon: {}", daemon::DIAGNOSTICS_WARNING);
     }
-    // TASK-280 #3: hint a LAN-oriented consumer (a `--libp2p-leech`) that defaults to the public v1
-    // scope and would silently miss a lan-share.v1 pool. Consume-capable here = the leech flag; the
-    // effective scope is the SAME canonical decision the fabric uses (a leech is never a lan-share
-    // provider, so `lan_share == false`).
+    // TASK-280 #3: hint a LAN-oriented consumer that defaults to the public v1 scope and would
+    // silently miss a lan-share.v1 pool. Consume-capable = the DERIVED consume-only profile, NOT the
+    // raw `--libp2p-leech` flag: a bare `--libp2p-mdns` (no `--libp2p-leech`) derives ConsumeOnly too
+    // (has_bootstrap without a give-side), and without folding it here that node would discover a
+    // lan-share.v1 provider, find NOTHING on v1, and get NO warning (codex HIGH). The effective scope
+    // is the SAME canonical decision the fabric uses (a consumer is never a lan-share provider, so
+    // `lan_share == false`).
     {
         let effective_scope = effective_network_scope(config.libp2p_scope.as_deref(), false);
         if should_hint_lan_share_scope(
             &effective_scope,
-            config.libp2p_leech,
+            matches!(contract.profile, SharingProfile::ConsumeOnly),
             config.libp2p_mdns,
             !config.libp2p_bootstrap.is_empty(),
         ) {

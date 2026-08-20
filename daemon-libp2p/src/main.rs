@@ -963,15 +963,19 @@ fn source_config(
     cfg: &Config,
     profile: SharingProfile,
     identity_seed: [u8; 32],
+    lan_share: bool,
 ) -> Libp2pSourceConfig {
     // TASK-241: the DHT-infrastructure axis (kad SERVER + the relay server) is run by a PROVIDER
     // AND by a ROUTER; a CONSUMER is a kad CLIENT that relays for nobody. `runs_dht_server()` is
     // that axis, distinct from `serves()` (which is content-serving, false for a router).
     let dht_server = profile.runs_dht_server();
-    // TASK-280: a no-allowlist lan-share node is LAN-CONFINED (dial veto + serve provenance) AND
-    // scoped away from the public v1 DHT. Both derive from this ONE profile check, so a lan-share
-    // PROVIDER and a lan-share CONSUMER agree on scope (AC#5 parity) and confinement.
-    let lan_share = profile == SharingProfile::LanShare;
+    // TASK-280 #3 single-source: a no-allowlist lan-share node is LAN-CONFINED (dial veto + serve
+    // provenance) AND scoped away from the public v1 DHT. `lan_share` is DECIDED BY THE CALLER, not
+    // recomputed here from the profile: the provider path passes `matches!(plan,
+    // PublicationPlan::Lan(_))` from the ONE `provider_publication_decision` mint, and the
+    // non-provider path passes `false` (confinement is a PROVIDER egress control; a consumer dials
+    // the pool it was told to join). Threading BOTH the scope and the confinement flag from that
+    // SINGLE authority is what stops them drifting from the publication decision.
     Libp2pSourceConfig {
         identity_seed,
         network_scope: effective_network_scope(cfg.libp2p_scope.as_deref(), lan_share),
@@ -1242,14 +1246,17 @@ async fn install_provider(
     cfg: &Config,
     contract: &OperatorContract,
     source_cfg: Libp2pSourceConfig,
+    plan: PublicationPlan,
     allowlist: &Arc<PublicNarAllowlist>,
 ) -> Result<(Arc<Libp2pFabric>, ProviderGuard), String> {
     warn_if_non_durable_provider(&source_cfg);
-    // TASK-276 FIX #2: decide publication eligibility ONCE, BEFORE any fabric or listener is built.
-    // A no-allowlist non-LAN-isolated provider aborts HERE (`?`), so no listener ever binds and no
-    // queued request is admitted in a bind-before-guard window. The bound witness is threaded into
-    // every announce branch below (no per-leg re-derivation of the guard).
-    let plan = provider_publication_decision(cfg)?;
+    // TASK-276 FIX #2 / TASK-280 #3 single-source: publication eligibility is decided ONCE by the
+    // caller (`provider_publication_decision`, BEFORE any fabric or listener is built) and the taken
+    // `plan` is threaded in here — the SAME decision that produced this `plan` also drove
+    // `source_cfg`'s scope + confinement (`matches!(plan, PublicationPlan::Lan(_))`), so they cannot
+    // drift. A no-allowlist non-LAN-isolated provider already aborted at the mint, so no listener
+    // ever binds in a bind-before-guard window. The bound witness is threaded into every announce
+    // branch below (no per-leg re-derivation of the guard).
     let privacy = &contract.privacy;
     let serve_budget = provider_serve_budget();
     let identity_seed = source_cfg.identity_seed;
@@ -1803,20 +1810,33 @@ async fn main() -> ExitCode {
     } else if contract.profile.serves() {
         required_axes.push(Axis::Server);
         required_axes.push(Axis::Announcer);
-        let source_cfg = source_config(&cfg, contract.profile, identity_seed);
-        let fabric = match install_provider(&cfg, &contract, source_cfg, &public_allowlist).await {
-            Ok((fabric, guard)) => {
-                // The accurate served-set report line (S seeds + P store paths + hook) is printed
-                // INSIDE `install_provider`, from the ACTUAL built legs (TASK-278) - never a
-                // one-or-the-other count derived from the CLI flags here.
-                _serve_guard = Some(guard);
-                fabric
-            }
+        // TASK-280 #3 single-source: mint the publication plan ONCE here. The SAME decision that
+        // produces PublicationPlan::Lan (no allowlist + LAN-isolation witness) drives the fabric's
+        // scope + confinement, so the two cannot drift. A public-reachable no-allowlist provider
+        // aborts HERE, before any fabric/listener is built.
+        let plan = match provider_publication_decision(&cfg) {
+            Ok(plan) => plan,
             Err(err) => {
                 eprintln!("daemon-libp2p: provider setup failed: {err}");
                 return ExitCode::FAILURE;
             }
         };
+        let lan_share = matches!(plan, PublicationPlan::Lan(_));
+        let source_cfg = source_config(&cfg, contract.profile, identity_seed, lan_share);
+        let fabric =
+            match install_provider(&cfg, &contract, source_cfg, plan, &public_allowlist).await {
+                Ok((fabric, guard)) => {
+                    // The accurate served-set report line (S seeds + P store paths + hook) is printed
+                    // INSIDE `install_provider`, from the ACTUAL built legs (TASK-278) - never a
+                    // one-or-the-other count derived from the CLI flags here.
+                    _serve_guard = Some(guard);
+                    fabric
+                }
+                Err(err) => {
+                    eprintln!("daemon-libp2p: provider setup failed: {err}");
+                    return ExitCode::FAILURE;
+                }
+            };
         // TASK-240: capture the live-facts provider (bootstrap health via the swarm handle) + the
         // node identity BEFORE the fabric is moved into `fabric_dyn`.
         observ_node_id = fabric.peer_id().to_string();
@@ -1832,7 +1852,10 @@ async fn main() -> ExitCode {
         // the serve + announce axes are structurally None - a router carries NO content just like a
         // leech. `source_config` already set kad_server + the relay server from the profile.
         _serve_guard = None;
-        let source_cfg = source_config(&cfg, contract.profile, identity_seed);
+        // A non-serving participant (CONSUME-ONLY or ROUTER) is never LAN-confined: confinement is a
+        // PROVIDER egress control, and there is no PublicationPlan on this path (`lan_share = false`).
+        // A consumer that wants to join a lan-share pool passes `--libp2p-scope lan-share.v1`.
+        let source_cfg = source_config(&cfg, contract.profile, identity_seed, false);
         let fabric = match build_libp2p_nar_source(source_cfg).await {
             Ok((fabric, _source, _raw)) => {
                 if contract.profile == SharingProfile::Router {
@@ -2035,17 +2058,21 @@ mod bootstrap_guard_tests {
 
     #[test]
     fn source_config_wires_lan_confinement_and_scope_by_profile() {
-        // TASK-280: the composition-root wiring. A lan-share profile with no explicit --libp2p-scope
-        // yields the frozen lan-share.v1 scope AND lan_confinement = true; every other swarm profile
-        // stays on public v1 and unconfined. MUTATION: drop `lan_confinement: lan_share` or the
-        // `effective_network_scope` call and the corresponding assertion flips.
+        // TASK-280 #3 single-source: `source_config` faithfully applies the caller's ONE `lan_share`
+        // decision (derived at the production callsite from `matches!(plan, PublicationPlan::Lan(_))`)
+        // to BOTH the frozen lan-share.v1 scope AND `lan_confinement`; `lan_share == false` stays on
+        // public v1 and unconfined. Threading the SAME bool into both fields is what stops the scope
+        // and the confinement drifting from the publication decision. MUTATION: drop
+        // `lan_confinement: lan_share` or the `effective_network_scope` call and the corresponding
+        // assertion flips. (The plan -> lan_share derivation itself is covered by the
+        // `provider_publication_decision` tests.)
         let base = provider_cfg(
             Vec::new(),
             Vec::new(),
             Some(addr("/ip4/192.168.1.7/tcp/4001")),
         );
 
-        let lan = source_config(&base, SharingProfile::LanShare, [9u8; 32]);
+        let lan = source_config(&base, SharingProfile::LanShare, [9u8; 32], true);
         assert_eq!(
             lan.network_scope,
             daemon_libp2p::LAN_SHARE_NETWORK_SCOPE,
@@ -2054,7 +2081,7 @@ mod bootstrap_guard_tests {
         assert!(lan.lan_confinement, "a lan-share node is LAN-confined");
 
         for other in [SharingProfile::PublicShare, SharingProfile::ConsumeOnly] {
-            let sc = source_config(&base, other, [9u8; 32]);
+            let sc = source_config(&base, other, [9u8; 32], false);
             assert_eq!(sc.network_scope, "v1", "{other:?} stays on public v1");
             assert!(!sc.lan_confinement, "{other:?} is NOT LAN-confined");
         }
@@ -2066,7 +2093,7 @@ mod bootstrap_guard_tests {
             Some(addr("/ip4/192.168.1.7/tcp/4001")),
         );
         explicit.libp2p_scope = Some("deliberately-shared".to_string());
-        let overridden = source_config(&explicit, SharingProfile::LanShare, [9u8; 32]);
+        let overridden = source_config(&explicit, SharingProfile::LanShare, [9u8; 32], true);
         assert_eq!(overridden.network_scope, "deliberately-shared");
         assert!(
             overridden.lan_confinement,
@@ -2092,6 +2119,7 @@ mod bootstrap_guard_tests {
             ),
             SharingProfile::LanShare,
             [1u8; 32],
+            true,
         );
         assert_eq!(
             provider.network_scope,
@@ -2103,6 +2131,7 @@ mod bootstrap_guard_tests {
             &provider_cfg(Vec::new(), Vec::new(), None),
             SharingProfile::ConsumeOnly,
             [2u8; 32],
+            false,
         );
         assert_eq!(
             bare_leech.network_scope, "v1",
@@ -2113,7 +2142,7 @@ mod bootstrap_guard_tests {
         // the provider (scope = audience, role-independent).
         let mut opt_in = provider_cfg(Vec::new(), Vec::new(), None);
         opt_in.libp2p_scope = Some(daemon_libp2p::LAN_SHARE_NETWORK_SCOPE.to_string());
-        let joined_leech = source_config(&opt_in, SharingProfile::ConsumeOnly, [3u8; 32]);
+        let joined_leech = source_config(&opt_in, SharingProfile::ConsumeOnly, [3u8; 32], false);
         assert_eq!(
             joined_leech.network_scope, provider.network_scope,
             "a consume-only leech that passes --libp2p-scope lan-share.v1 joins the provider's pool"
@@ -2536,7 +2565,12 @@ mod operator_contract_tests {
         );
         check_runtime_preconditions(&cfg).expect("a router with a listen starts");
         // The wire the swarm actually runs: kad SERVER + relay server ON.
-        let src = source_config(&cfg, cfg.profile, [7u8; 32]);
+        let src = source_config(
+            &cfg,
+            cfg.profile,
+            [7u8; 32],
+            cfg.profile == SharingProfile::LanShare,
+        );
         assert!(src.kad_server, "router swarm must be a kad SERVER");
         assert!(
             src.relay_server_enabled,
@@ -2591,7 +2625,12 @@ mod operator_contract_tests {
         ]))
         .expect("a kad-only router parses");
         assert_eq!(kad_only.profile, SharingProfile::Router);
-        let kad_only_src = source_config(&kad_only, kad_only.profile, [7u8; 32]);
+        let kad_only_src = source_config(
+            &kad_only,
+            kad_only.profile,
+            [7u8; 32],
+            kad_only.profile == SharingProfile::LanShare,
+        );
         assert!(kad_only_src.kad_server, "still a kad SERVER");
         assert!(
             !kad_only_src.relay_server_enabled,
@@ -2703,7 +2742,12 @@ mod operator_contract_tests {
     fn swarm_participation_mode_derives_from_the_profile() {
         let consumer = parse_config(args(&["--libp2p-bootstrap", BOOT])).expect("consumer parses");
         assert_eq!(consumer.profile, SharingProfile::ConsumeOnly);
-        let sc = source_config(&consumer, consumer.profile, [7u8; 32]);
+        let sc = source_config(
+            &consumer,
+            consumer.profile,
+            [7u8; 32],
+            consumer.profile == SharingProfile::LanShare,
+        );
         assert!(
             !sc.kad_server,
             "consume-only must be a kad CLIENT, not a server"
@@ -2721,7 +2765,12 @@ mod operator_contract_tests {
             &format!("{APP_NAR_HASH}=/tmp/app.nar"),
         ]))
         .expect("provider parses");
-        let sc2 = source_config(&provider, provider.profile, [7u8; 32]);
+        let sc2 = source_config(
+            &provider,
+            provider.profile,
+            [7u8; 32],
+            provider.profile == SharingProfile::LanShare,
+        );
         assert!(
             sc2.kad_server,
             "a provider must be a kad SERVER (DHT participation)"
@@ -3222,7 +3271,7 @@ mod nat_flags_tests {
             cfg.libp2p_listen[1]
         );
 
-        let shared = source_config(&cfg, SharingProfile::LanShare, [9u8; 32]);
+        let shared = source_config(&cfg, SharingProfile::LanShare, [9u8; 32], true);
         assert_eq!(
             shared.listen.as_ref(),
             cfg.libp2p_listen.first(),
@@ -3254,7 +3303,7 @@ mod nat_flags_tests {
             "/ip4/192.168.1.5/tcp/4001"
         );
 
-        let shared = source_config(&cfg, SharingProfile::ConsumeOnly, [10u8; 32]);
+        let shared = source_config(&cfg, SharingProfile::ConsumeOnly, [10u8; 32], false);
         assert_eq!(
             shared.external_addresses, cfg.libp2p_external_addresses,
             "external addresses reach shared startup configuration"
