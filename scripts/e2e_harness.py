@@ -2526,13 +2526,18 @@ class Libp2pMdnsTopology:
         for role, scope in self.consumers:
             ip = self.ROLE_IPS[role]
             if role in self.zeroconfig_roles:
-                # TASK-273 ZERO-CONFIG TEETH: the ONLY libp2p flag is `--profile lan-share`. mDNS,
-                # the loopback libp2p listen, and announce-after-fetch are DEFAULTED by the profile;
-                # NO --libp2p-mdns / --libp2p-bootstrap / --libp2p-listen / --libp2p-scope is passed.
-                # Runs the PRIMARY /bin/daemon-libp2p (the binary carrying the profile logic).
+                # TASK-273 DISCOVERY-ONLY TEETH: mDNS is IMPLICIT from `--profile lan-share` (the node
+                # carries NO --libp2p-mdns, NO --libp2p-bootstrap, NO --libp2p-scope). SUPPLY + a
+                # listen are the operator's EXPLICIT choice (the AC#5 auto-defaults were reverted to
+                # TASK-278), so this node DOES pass a loopback --libp2p-listen (the isolated-LAN guard
+                # refuses a routable listen for a no-allowlist lan-share) and --libp2p-announce-after
+                # -fetch as its supply. The load-bearing bit under test is that DISCOVERY (mDNS) is
+                # defaulted by the profile alone. Runs the PRIMARY /bin/daemon-libp2p.
                 argv = [
                     "/bin/daemon-libp2p", "--listen", f"0.0.0.0:{DAEMON_PORT}",
                     "--upstream", proxy_url, "--profile", "lan-share",
+                    "--libp2p-listen", "/ip4/127.0.0.1/tcp/0",
+                    "--libp2p-announce-after-fetch",
                 ]
                 run(
                     [pm, "run", "-d", "--label", PROJECT_LABEL, "--name", self._c(role),
@@ -6685,56 +6690,63 @@ def scenario_libp2p_mdns_scope_isolation(ctx: Ctx, expect) -> None:
 
 
 def scenario_libp2p_lan_share_zeroconfig(ctx: Ctx, expect) -> None:
-    """TASK-273 AC#2 (the cornerstone teeth): a node given ONLY `--profile lan-share` - no
-    bootstrap, no injected peer address, no --libp2p-mdns, no --libp2p-listen, no --libp2p-scope -
-    discovers a same-pin peer on the LAN purely via the mDNS the lan-share profile DEFAULTS on, and
-    serves a real nix build fetched from that peer with 0 upstream NAR egress.
+    """TASK-273 (DISCOVERY-ONLY): node B is given `--profile lan-share` and — the teeth — NO
+    `--libp2p-mdns`, NO `--libp2p-bootstrap`, NO `--libp2p-scope`. Its LAN DISCOVERY is therefore
+    IMPLICIT from the profile (`default_lan_mdns`). SUPPLY + a listen are the operator's explicit
+    choice (the AC#5 auto-defaults were reverted to TASK-278), so B additionally carries a loopback
+    `--libp2p-listen` and `--libp2p-announce-after-fetch`. B discovers the S7 provider (A) purely
+    over the profile-defaulted mDNS and serves a real nix build fetched from A with 0 upstream egress.
 
-    This is the zero-config claim reduced to its minimum: the ONLY thing the operator typed for the
-    node under test is the profile. mDNS (default_lan_mdns), a loopback libp2p listen, and
-    announce-after-fetch are all DEFAULTED by the profile - the argv oracle below proves the daemon
-    received nothing else, so a green result can ONLY come from the profile's auto-wiring.
+    THREE nodes make the result ATTRIBUTABLE to B's boundary:
+      * A (lp-provider): the S7-seed mDNS provider (allowlist door), on the daemon DEFAULT scope "v1"
+        so the bare B (which cannot be given --libp2p-scope without breaking the teeth) is same-scope.
+      * C (lp-helper): a same-scope mDNS leech. It is A's INDEPENDENT put-quorum peer AND a POSITIVE
+        CONTROL — C fetches the target with 0 upstream, proving A announced and the DHT works WITHOUT
+        B. So B's own 0-upstream result is attributable to B's profile-default discovery, not luck.
+      * B (lp-consumer): the discovery-only lan-share node on /bin/daemon-libp2p.
 
-    Node A is the S7-seed mDNS provider (allowlist door), launched on the daemon's DEFAULT libp2p
-    scope "v1" so the bare node B (which uses that default) is same-scope. Node B is the zero-config
-    lan-share node on the PRIMARY /bin/daemon-libp2p binary.
-
-    MUTATION (run separately by the implementer, not in CI): make SharingProfile::default_lan_mdns
-    return false -> node B's bare `--profile lan-share` no longer defaults mDNS on -> it has no LAN
-    entry path, discovers nobody, and falls back to upstream (upstream.nar >= 1) -> the peer-served
-    oracle below reddens. That proves this scenario BITES on the auto-mDNS wiring, not a coincidence.
+    MUTATION (run separately by the implementer, not in CI) — two honest facets:
+      (i) `default_lan_mdns -> false`: a bare-profile B gets mdns_active=false and, with no other
+          entry path, is REFUSED by the undiscoverable-provider guard (fail-loud) — B never starts.
+          So this mutation reddens the scenario at B's readiness (the mDNS default is load-bearing:
+          B cannot even run without it), NOT via upstream fallback.
+      (ii) `source_config.mdns_enabled -> false` (daemon-libp2p): B still STARTS (guard sees
+          mdns_active=true) but its swarm opens no mDNS socket, so B alone cannot discover A. A still
+          announces (quorum via C) and C still peer-fetches, so ONLY B falls back to upstream
+          (upstream.nar>=1) — the peer-served oracle below reddens, attributable to B. The 3rd node C
+          is what isolates this to B (without it, disabling B's mDNS also starves A's quorum).
     """
     fixtures = ctx.fixtures
     seed_dir, prov_seeds, target_sp = _s7_seeds(ctx, "lanshare", S7_TARGET)
     # The provider runs on the daemon's DEFAULT libp2p scope so the bare node B (which cannot be
-    # given --libp2p-scope without breaking the zero-config teeth) is same-scope by construction.
+    # given --libp2p-scope without breaking the teeth) is same-scope by construction. C shares it.
     default_scope = "v1"
     with Libp2pMdnsTopology(
         ctx, "lanshare", fixtures.cache, seed_dir, prov_seeds, expect,
         provider_scope=default_scope,
-        consumers=(("lp-consumer", default_scope),),
+        # C (lp-helper) FIRST so it is mDNS-live as A's independent quorum + positive control; then B.
+        consumers=(("lp-helper", default_scope), ("lp-consumer", default_scope)),
         libp2p_trusted_key=fixtures.public_key,
         zeroconfig_roles=("lp-consumer",),
     ) as topo:
         prov_id = topo.provider_identity[0] if topo.provider_identity else ""
         argv = topo.consumer_argv("lp-consumer")
         joined = " ".join(argv)
-        # ZERO-CONFIG TEETH: the node under test received ONLY `--profile lan-share` (+ the HTTP
-        # --listen/--upstream infra). If ANY of these libp2p flags appear, the discovery was NOT
-        # implicit-from-the-profile and the test would be decoration.
+        # DISCOVERY-ONLY TEETH: B's DISCOVERY intent is ONLY `--profile lan-share`. If any of these
+        # discovery flags appear, mDNS was NOT implicit-from-the-profile and the test is decoration.
+        # (B legitimately carries --libp2p-listen + --libp2p-announce-after-fetch as explicit SUPPLY;
+        # those are NOT discovery flags, so they are not in the forbidden set.)
         expect(
             "--profile" in argv and "lan-share" in argv,
-            "lan-share zeroconfig: node B argv carries --profile lan-share (the sole libp2p intent)",
+            "lan-share zeroconfig: node B argv carries --profile lan-share (its sole DISCOVERY intent)",
             f"argv={joined!r}",
         )
-        for forbidden in (
-            "--libp2p-mdns", "--libp2p-bootstrap", "--libp2p-provider-addr",
-            "--libp2p-listen", "--libp2p-scope", "--libp2p-leech",
-        ):
+        for forbidden in ("--libp2p-mdns", "--libp2p-bootstrap", "--libp2p-scope",
+                          "--libp2p-provider-addr", "--libp2p-leech"):
             expect(
                 forbidden not in argv,
                 f"lan-share zeroconfig teeth: node B argv has NO {forbidden} "
-                "(mDNS/listen/scope must be IMPLICIT from the profile)",
+                "(mDNS discovery must be IMPLICIT from the profile)",
                 f"argv={joined!r}",
             )
         expect(
@@ -6745,22 +6757,39 @@ def scenario_libp2p_lan_share_zeroconfig(ctx: Ctx, expect) -> None:
 
         time.sleep(LIBP2P_MDNS_CONVERGE_S)
 
-        # LIVENESS CONTROL (evidence the RED below would isolate MISSING WIRING, not a dead peer):
-        # from INSIDE node B's netns the provider is alive + reachable at its routable IP.
+        # POSITIVE CONTROL / ATTRIBUTION: the same-scope mDNS helper C fetches the target with 0
+        # upstream — proving A announced and the DHT resolves INDEPENDENTLY of B. This is what makes
+        # B's result below attributable to B's own profile-default discovery (not a dead A / dead DHT).
+        topo.proxy_reset()
+        res_h = topo.client_run("lp-helper", [target_sp], fixtures.public_key)
+        expect(
+            res_h.exit_code == 0 and res_h.narhash(target_sp) == fixtures.nar_hash(S7_TARGET),
+            "lan-share zeroconfig positive control: the mDNS helper C fetches the target "
+            "byte-identically (A announced + DHT works independently of B)",
+            res_h.stderr[-600:],
+        )
+        expect(
+            topo.proxy_stats()["upstream"].get("nar", 0) == 0,
+            "lan-share zeroconfig positive control: 0 upstream NAR egress for helper C (A/DHT live)",
+            "",
+        )
+
+        # LIVENESS CONTROL: from INSIDE node B's netns the provider is alive + reachable at its
+        # routable IP, so a B fallback would isolate B's discovery wiring, not liveness.
         status, detail = topo.provider_reachable_from("lp-consumer")
         expect(
             status == 200,
-            "lan-share zeroconfig control: the provider is ALIVE + reachable from node B's netns "
-            "(so a fallback would isolate the auto-mDNS wiring, not liveness)",
+            "lan-share zeroconfig control: the provider is ALIVE + reachable from node B's netns",
             f"status={status} detail={detail!r}",
         )
 
+        # NODE B UNDER TEST: discovered A purely via the profile-DEFAULTED mDNS and peer-served it.
         topo.proxy_reset()
         res = topo.client_run("lp-consumer", [target_sp], fixtures.public_key)
         expect(
             res.exit_code == 0,
             "lan-share zeroconfig positive: nix build completes, NAR served by the mDNS-discovered "
-            "peer (node B typed ONLY --profile lan-share)",
+            "peer (node B's DISCOVERY intent was ONLY --profile lan-share)",
             res.stderr[-800:],
         )
         got = res.narhash(target_sp)
@@ -6772,9 +6801,10 @@ def scenario_libp2p_lan_share_zeroconfig(ctx: Ctx, expect) -> None:
         nar_up = topo.proxy_stats()["upstream"].get("nar", 0)
         expect(
             nar_up == 0,
-            "lan-share zeroconfig ORACLE BITE: 0 upstream NAR egress - the target was PEER-SERVED "
-            "over a DHT node B joined with mDNS it NEVER asked for (only the profile default could "
-            "have supplied it). Mutating default_lan_mdns->false reddens this to upstream.nar>=1.",
+            "lan-share zeroconfig ORACLE BITE: 0 upstream NAR egress — B peer-served the target over a "
+            "DHT it joined with mDNS it NEVER asked for (only the profile default could supply it). "
+            "Attributable to B: helper C (same scope, explicit mDNS) succeeded, so A/DHT are live; "
+            "disabling B's mDNS socket reddens THIS to upstream.nar>=1 while C stays green.",
             f"upstream.nar={nar_up}",
         )
 
