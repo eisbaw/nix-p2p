@@ -61,12 +61,42 @@ DISK_FLOOR_BYTES = 10 * 1000 * 1000 * 1000  # stop below ~10 GB free
 # raw NAR size is MEASURED at runtime (dump byte count) and cross-checked against
 # this declared NarSize from the narinfo; a mismatch aborts (fail fast).
 PACKAGES = [
-    ("hello", "/nix/store/2bcv91i8fahqghn8dmyr791iaycbsjdd-hello-2.12.2", 274568, "small"),
-    ("curl", "/nix/store/0y90rp9g4i4rahyw18k0zcyfs8gl1v37-curl-8.21.0", 1181408, "small"),
-    ("bash", "/nix/store/00zrahbb32nzawrmv9sjxn36h7qk9vrs-bash-5.2p37", 1654112, "small"),
-    ("glibc-locales", "/nix/store/0blk7gr1f1qcf1h59igmgxr9qkz520pn-glibc-locales-2.42-51", 3070464, "small"),
-    ("git", "/nix/store/2z9pz49718aq8cnxbxc3x4ahmwrxaqx7-git-2.42.2", 50548816, "large"),
-    ("python3", "/nix/store/05xfwnl62nipbw1ankbcv2crjhb9a918-python3-3.13.14", 133215664, "large"),
+    (
+        "hello",
+        "/nix/store/2bcv91i8fahqghn8dmyr791iaycbsjdd-hello-2.12.2",
+        274568,
+        "small",
+    ),
+    (
+        "curl",
+        "/nix/store/0y90rp9g4i4rahyw18k0zcyfs8gl1v37-curl-8.21.0",
+        1181408,
+        "small",
+    ),
+    (
+        "bash",
+        "/nix/store/00zrahbb32nzawrmv9sjxn36h7qk9vrs-bash-5.2p37",
+        1654112,
+        "small",
+    ),
+    (
+        "glibc-locales",
+        "/nix/store/0blk7gr1f1qcf1h59igmgxr9qkz520pn-glibc-locales-2.42-51",
+        3070464,
+        "small",
+    ),
+    (
+        "git",
+        "/nix/store/2z9pz49718aq8cnxbxc3x4ahmwrxaqx7-git-2.42.2",
+        50548816,
+        "large",
+    ),
+    (
+        "python3",
+        "/nix/store/05xfwnl62nipbw1ankbcv2crjhb9a918-python3-3.13.14",
+        133215664,
+        "large",
+    ),
 ]
 
 # codec id -> (compress argv reading stdin/writing stdout, decompress argv, tiers)
@@ -140,14 +170,18 @@ def measure_cell(codec, comp_argv, decomp_argv, nar: bytes, runs: int) -> dict:
                 f"non-deterministic compressed size for {codec}: "
                 f"{len(out)} != {compressed_bytes}"
             )
-        best_compress_ns = c_ns if best_compress_ns is None else min(best_compress_ns, c_ns)
+        best_compress_ns = (
+            c_ns if best_compress_ns is None else min(best_compress_ns, c_ns)
+        )
     for _ in range(runs):
         back, d_ns = run_codec(decomp_argv, comp_blob)
         if len(back) != len(nar):
             raise SystemExit(
                 f"roundtrip size mismatch for {codec}: {len(back)} != {len(nar)}"
             )
-        best_decompress_ns = d_ns if best_decompress_ns is None else min(best_decompress_ns, d_ns)
+        best_decompress_ns = (
+            d_ns if best_decompress_ns is None else min(best_decompress_ns, d_ns)
+        )
     return {
         "status": "ok",
         "compressed_bytes": compressed_bytes,
@@ -160,7 +194,8 @@ def dump_nar(store_path: str) -> bytes:
     """`nix-store --dump` to memory. The byte count IS the raw NAR size."""
     proc = subprocess.run(
         ["nix-store", "--dump", store_path],
-        stdout=subprocess.PIPE, check=True,
+        stdout=subprocess.PIPE,
+        check=True,
     )
     return proc.stdout
 
@@ -178,8 +213,8 @@ def main() -> int:
         "task": "TASK-269",
         "generated_unix": int(time.time()),
         "model_note": "raw_nar_bytes and compressed_bytes are DIFFERENT units; "
-                      "never conflated. CPU times are single-thread getrusage "
-                      "user+sys, integer ns.",
+        "never conflated. CPU times are single-thread getrusage "
+        "user+sys, integer ns.",
         "packages": [],
     }
 
@@ -225,8 +260,11 @@ def main() -> int:
             )
         results["packages"].append(pkg)
         del nar  # free the big buffer before the next package
-        print(f"[{name}] done in {time.time() - t0:.1f}s; "
-              f"disk free {free_bytes() / 1e9:.1f} GB", file=sys.stderr)
+        print(
+            f"[{name}] done in {time.time() - t0:.1f}s; "
+            f"disk free {free_bytes() / 1e9:.1f} GB",
+            file=sys.stderr,
+        )
 
     disk_end = free_bytes()
     results["disk_free_start_bytes"] = disk_start

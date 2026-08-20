@@ -51,8 +51,8 @@ SWEEP_FILE = ROOT / "evidence" / "task-269" / "sweep_results.json"
 MAP_FILE = ROOT / "evidence" / "task-269" / "crossover_map.json"
 
 # --- serve model constants (integers) ---
-REGEN_FLOOR_NS = 22_000_000          # 22 ms per-path floor
-REGEN_PER_BYTE_NUM = 10              # 10/22 ns per byte == 1e9/2.2e9 s/byte
+REGEN_FLOOR_NS = 22_000_000  # 22 ms per-path floor
+REGEN_PER_BYTE_NUM = 10  # 10/22 ns per byte == 1e9/2.2e9 s/byte
 REGEN_PER_BYTE_DEN = 22
 
 # --- link speeds: (id, bytes_per_s, human label). Decimal MB (10^6 bytes). ---
@@ -68,32 +68,38 @@ LINKS = [
 #     (narinfo FileSize). Provenance is carried explicitly. ---
 CDN_BASELINE = {
     "hello": {
-        "cdn_wall_ns": 50_000_000, "cdn_filesize_bytes": 57568,
+        "cdn_wall_ns": 50_000_000,
+        "cdn_filesize_bytes": 57568,
         "cdn_compression": "xz",
         "source": "TASK-268 measured, single WAN sample (0.05 s, coarse)",
     },
     "curl": {
-        "cdn_wall_ns": 260_000_000, "cdn_filesize_bytes": 554177,
+        "cdn_wall_ns": 260_000_000,
+        "cdn_filesize_bytes": 554177,
         "cdn_compression": "zstd",
         "source": "TASK-268 measured, single WAN sample (0.26 s)",
     },
     "bash": {
-        "cdn_wall_ns": 378_112_000, "cdn_filesize_bytes": 448312,
+        "cdn_wall_ns": 378_112_000,
+        "cdn_filesize_bytes": 448312,
         "cdn_compression": "xz",
         "source": "TASK-269 measured this session, single WAN sample (0.378112 s)",
     },
     "glibc-locales": {
-        "cdn_wall_ns": 235_198_000, "cdn_filesize_bytes": 234832,
+        "cdn_wall_ns": 235_198_000,
+        "cdn_filesize_bytes": 234832,
         "cdn_compression": "xz",
         "source": "TASK-269 measured this session, single WAN sample (0.235198 s)",
     },
     "git": {
-        "cdn_wall_ns": 2_140_000_000, "cdn_filesize_bytes": 8011464,
+        "cdn_wall_ns": 2_140_000_000,
+        "cdn_filesize_bytes": 8011464,
         "cdn_compression": "xz",
         "source": "TASK-268 measured, single WAN sample (2.14 s)",
     },
     "python3": {
-        "cdn_wall_ns": 48_300_000_000, "cdn_filesize_bytes": 56616908,
+        "cdn_wall_ns": 48_300_000_000,
+        "cdn_filesize_bytes": 56616908,
         "cdn_compression": "zstd",
         "source": "TASK-268 measured, single WAN sample (48.3 s)",
     },
@@ -164,8 +170,10 @@ def build_map(sweep: dict) -> dict:
         }
         for codec, cell in pkg["cells"].items():
             if cell.get("status") != "ok":
-                pkg_out["cells"][codec] = {"status": cell.get("status"),
-                                           "reason": cell.get("reason")}
+                pkg_out["cells"][codec] = {
+                    "status": cell.get("status"),
+                    "reason": cell.get("reason"),
+                }
                 continue
             cb = cell["compressed_bytes"]
             comp = cell["compress_cpu_ns"]
@@ -182,7 +190,7 @@ def build_map(sweep: dict) -> dict:
             pkg_out["cells"][codec] = {
                 "status": "ok",
                 "compressed_bytes": cb,
-                "ratio_num": cb,            # exact rational compressed/raw
+                "ratio_num": cb,  # exact rational compressed/raw
                 "ratio_den": raw,
                 "compress_cpu_ns": comp,
                 "decompress_cpu_ns": dec,
@@ -219,9 +227,11 @@ def print_report(m: dict) -> None:
     links = m["model"]["links"]
 
     for pkg in m["packages"]:
-        print(f"\n### {pkg['name']}  raw NAR={pkg['raw_nar_bytes']} B  "
-              f"regen={fmt_ms(pkg['regen_ns'])}  "
-              f"CDN={fmt_ms(pkg['cdn_wall_ns'])} / {pkg['cdn_filesize_bytes']} B")
+        print(
+            f"\n### {pkg['name']}  raw NAR={pkg['raw_nar_bytes']} B  "
+            f"regen={fmt_ms(pkg['regen_ns'])}  "
+            f"CDN={fmt_ms(pkg['cdn_wall_ns'])} / {pkg['cdn_filesize_bytes']} B"
+        )
         header = f"{'codec':<11}{'ratio':>7}{'comp_cpu':>11}{'decomp':>10}"
         for lk in links:
             header += f"{lk['id'].split('_')[0]:>9}"
@@ -229,11 +239,13 @@ def print_report(m: dict) -> None:
         print(header)
         for codec, cell in pkg["cells"].items():
             if cell.get("status") != "ok":
-                print(f"{codec:<11}  [{cell.get('status')}] {cell.get('reason','')}")
+                print(f"{codec:<11}  [{cell.get('status')}] {cell.get('reason', '')}")
                 continue
-            row = (f"{codec:<11}{fmt_ratio(cell['ratio_num'], cell['ratio_den']):>7}"
-                   f"{fmt_ms(cell['compress_cpu_ns']):>11}"
-                   f"{fmt_ms(cell['decompress_cpu_ns']):>10}")
+            row = (
+                f"{codec:<11}{fmt_ratio(cell['ratio_num'], cell['ratio_den']):>7}"
+                f"{fmt_ms(cell['compress_cpu_ns']):>11}"
+                f"{fmt_ms(cell['decompress_cpu_ns']):>10}"
+            )
             for lk in links:
                 pl = cell["per_link"][lk["id"]]
                 row += f"{('WIN' if pl['peer_beats_cdn'] else '.'):>9}"
@@ -243,7 +255,9 @@ def print_report(m: dict) -> None:
     # Per-link winning codecs and the min-wall (sweet-spot) codec.
     print("\n" + "=" * 78)
     print("SWEET SPOT: codec giving MIN peer_wall per (package, link), and whether")
-    print("that best codec beats the CDN. (min wall accounts for per-serve compress CPU)")
+    print(
+        "that best codec beats the CDN. (min wall accounts for per-serve compress CPU)"
+    )
     print("=" * 78)
     for pkg in m["packages"]:
         print(f"\n{pkg['name']}:")
@@ -258,8 +272,10 @@ def print_report(m: dict) -> None:
                     best_codec = codec
                     best_win = pl["peer_beats_cdn"]
             verdict = "PEER WINS" if best_win else "CDN wins"
-            print(f"  {lk['label']:<34} best={best_codec:<10} "
-                  f"wall={fmt_ms(best_wall):>9}  -> {verdict}")
+            print(
+                f"  {lk['label']:<34} best={best_codec:<10} "
+                f"wall={fmt_ms(best_wall):>9}  -> {verdict}"
+            )
 
 
 def main() -> int:

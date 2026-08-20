@@ -1324,9 +1324,7 @@ def check_reclaim_direct_execution_control(repo: Path) -> None:
             "is not a cargo target dir, skipping cargo cleanup",
             "cargo-sweep not on PATH",
         )
-        if not any(
-            m in result.stdout or m in result.stderr for m in reached_markers
-        ):
+        if not any(m in result.stdout or m in result.stderr for m in reached_markers):
             fail(
                 "BITE DID NOT BITE (direct reclaim continuation): unset pinned Python "
                 "prevented the later cargo-sweep cleanup stage; "

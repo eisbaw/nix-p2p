@@ -1543,7 +1543,9 @@ class Pod:
         # `listen=<csv>` while the thin `/bin/daemon-libp2p` prints `addrs=<csv>` (the same drift the
         # lan-share awaits already handle). Either way the captured value is a comma-separated
         # multiaddr list the loopback filter below consumes.
-        addr_re = re.compile(r"LIBP2P-PROVIDER-ADDR peer_id=(\S+) (?:listen|addrs)=(\S+)")
+        addr_re = re.compile(
+            r"LIBP2P-PROVIDER-ADDR peer_id=(\S+) (?:listen|addrs)=(\S+)"
+        )
         # Matches BOTH the seed-nar announce (`LIBP2P-SEED`) and the STORE-supply announce
         # (`LIBP2P-PROVIDE-STORE`, TASK-194), so identity-await works in either provider mode.
         seed_re = re.compile(r"LIBP2P-(?:SEED|PROVIDE-STORE) narhash=(\S+) ")
@@ -2358,7 +2360,9 @@ class Libp2pNetnsTopology:
         # `listen=<csv>` while the thin `/bin/daemon-libp2p` prints `addrs=<csv>` (the same drift the
         # lan-share awaits already handle). Either way the captured value is a comma-separated
         # multiaddr list the loopback filter below consumes.
-        addr_re = re.compile(r"LIBP2P-PROVIDER-ADDR peer_id=(\S+) (?:listen|addrs)=(\S+)")
+        addr_re = re.compile(
+            r"LIBP2P-PROVIDER-ADDR peer_id=(\S+) (?:listen|addrs)=(\S+)"
+        )
         # Matches BOTH the seed-nar announce (`LIBP2P-SEED`) and the STORE-supply announce
         # (`LIBP2P-PROVIDE-STORE`, TASK-194), so identity-await works in either provider mode.
         seed_re = re.compile(r"LIBP2P-(?:SEED|PROVIDE-STORE) narhash=(\S+) ")
@@ -2574,25 +2578,69 @@ class Libp2pMdnsTopology:
         run([pm, "network", "rm", "-f", self.NET], check=False)
         # A dedicated bridge = ONE multicast-capable L2 segment all nodes share.
         run(
-            [pm, "network", "create", "--label", PROJECT_LABEL, "--subnet", self.SUBNET, self.NET]
+            [
+                pm,
+                "network",
+                "create",
+                "--label",
+                PROJECT_LABEL,
+                "--subnet",
+                self.SUBNET,
+                self.NET,
+            ]
         )
 
         proxy_url = f"http://{self.IP_PROXY}:{PROXY_PORT}"
         # origin: static file server over the served cache.
         run(
-            [pm, "run", "-d", "--label", PROJECT_LABEL, "--name", self._c("origin"),
-             "--network", self.NET, "--ip", self.IP_ORIGIN,
-             "--volume", f"{self.served_cache}:/srv/cache:ro", self.ctx.image,
-             "python3", "-m", "http.server", str(ORIGIN_PORT), "--bind", "0.0.0.0",
-             "--directory", "/srv/cache"]
+            [
+                pm,
+                "run",
+                "-d",
+                "--label",
+                PROJECT_LABEL,
+                "--name",
+                self._c("origin"),
+                "--network",
+                self.NET,
+                "--ip",
+                self.IP_ORIGIN,
+                "--volume",
+                f"{self.served_cache}:/srv/cache:ro",
+                self.ctx.image,
+                "python3",
+                "-m",
+                "http.server",
+                str(ORIGIN_PORT),
+                "--bind",
+                "0.0.0.0",
+                "--directory",
+                "/srv/cache",
+            ]
         )
         # testproxy: caching proxy fronting origin; its request log is the egress oracle.
         run(
-            [pm, "run", "-d", "--label", PROJECT_LABEL, "--name", self._c("proxy"),
-             "--network", self.NET, "--ip", self.IP_PROXY, self.ctx.image,
-             "/bin/testproxy", "--listen", f"0.0.0.0:{PROXY_PORT}",
-             "--upstream", f"http://{self.IP_ORIGIN}:{ORIGIN_PORT}",
-             "--cache-dir", "/tmp/proxy-cache"]
+            [
+                pm,
+                "run",
+                "-d",
+                "--label",
+                PROJECT_LABEL,
+                "--name",
+                self._c("proxy"),
+                "--network",
+                self.NET,
+                "--ip",
+                self.IP_PROXY,
+                self.ctx.image,
+                "/bin/testproxy",
+                "--listen",
+                f"0.0.0.0:{PROXY_PORT}",
+                "--upstream",
+                f"http://{self.IP_ORIGIN}:{ORIGIN_PORT}",
+                "--cache-dir",
+                "/tmp/proxy-cache",
+            ]
         )
         self._await_http_ready("origin", self.IP_ORIGIN)
         self._await_http_ready("proxy", self.IP_PROXY)
@@ -2616,27 +2664,67 @@ class Libp2pMdnsTopology:
                 # libp2p-lan-share-cross-host-serve scenario; this scenario keeps loopback because its
                 # subject is B's DISCOVERY, not its reachability.) Runs the PRIMARY /bin/daemon-libp2p.
                 argv = [
-                    "/bin/daemon-libp2p", "--listen", f"0.0.0.0:{DAEMON_PORT}",
-                    "--upstream", proxy_url, "--profile", "lan-share",
+                    "/bin/daemon-libp2p",
+                    "--listen",
+                    f"0.0.0.0:{DAEMON_PORT}",
+                    "--upstream",
+                    proxy_url,
+                    "--profile",
+                    "lan-share",
                     "--libp2p-provider",
-                    "--libp2p-listen", "/ip4/127.0.0.1/tcp/0",
+                    "--libp2p-listen",
+                    "/ip4/127.0.0.1/tcp/0",
                     "--libp2p-announce-after-fetch",
                 ]
                 run(
-                    [pm, "run", "-d", "--label", PROJECT_LABEL, "--name", self._c(role),
-                     "--network", self.NET, "--ip", ip, *self._env_args(), self.ctx.image, *argv]
+                    [
+                        pm,
+                        "run",
+                        "-d",
+                        "--label",
+                        PROJECT_LABEL,
+                        "--name",
+                        self._c(role),
+                        "--network",
+                        self.NET,
+                        "--ip",
+                        ip,
+                        *self._env_args(),
+                        self.ctx.image,
+                        *argv,
+                    ]
                 )
                 # A lone-genesis lan-share provider waits (bounded) for a same-scope mDNS peer before
                 # it binds its HTTP listener, so allow the same generous window the provider gets.
                 self._await_http_ready(role, ip, timeout=READY_TIMEOUT_S + 45.0)
             else:
                 run(
-                    [pm, "run", "-d", "--label", PROJECT_LABEL, "--name", self._c(role),
-                     "--network", self.NET, "--ip", ip, *self._env_args(), self.ctx.image,
-                     "/bin/daemon", "--listen", f"0.0.0.0:{DAEMON_PORT}", "--upstream", proxy_url,
-                     "--libp2p-leech", "--libp2p-mdns",
-                     "--libp2p-listen", f"/ip4/{ip}/tcp/{LIBP2P_BASE_PORT}",
-                     "--libp2p-scope", scope]
+                    [
+                        pm,
+                        "run",
+                        "-d",
+                        "--label",
+                        PROJECT_LABEL,
+                        "--name",
+                        self._c(role),
+                        "--network",
+                        self.NET,
+                        "--ip",
+                        ip,
+                        *self._env_args(),
+                        self.ctx.image,
+                        "/bin/daemon",
+                        "--listen",
+                        f"0.0.0.0:{DAEMON_PORT}",
+                        "--upstream",
+                        proxy_url,
+                        "--libp2p-leech",
+                        "--libp2p-mdns",
+                        "--libp2p-listen",
+                        f"/ip4/{ip}/tcp/{LIBP2P_BASE_PORT}",
+                        "--libp2p-scope",
+                        scope,
+                    ]
                 )
                 self._await_http_ready(role, ip)
 
@@ -2652,23 +2740,51 @@ class Libp2pMdnsTopology:
         seed_args: list[str] = []
         for s in self.provider_seeds:
             seed_args += ["--libp2p-seed-nar", f"{s.nar_hash}=/srv/seed/{s.filename}"]
-        seed_args += ["--libp2p-trusted-public-key", self.libp2p_trusted_key,
-                      "--libp2p-public-allowlist-path", f"{LIBP2P_ALLOWLIST_MOUNT}/allowlist",
-                      "--libp2p-state-dir", "/srv/state"]
+        seed_args += [
+            "--libp2p-trusted-public-key",
+            self.libp2p_trusted_key,
+            "--libp2p-public-allowlist-path",
+            f"{LIBP2P_ALLOWLIST_MOUNT}/allowlist",
+            "--libp2p-state-dir",
+            "/srv/state",
+        ]
         for s in self.provider_seeds:
             sh = libp2p_store_hash(s.store_path)
-            seed_args += ["--libp2p-prove-public-narinfo",
-                          f"{sh}=/srv/seed/narinfos/{sh}.narinfo"]
+            seed_args += [
+                "--libp2p-prove-public-narinfo",
+                f"{sh}=/srv/seed/narinfos/{sh}.narinfo",
+            ]
         provider_argv = [
-            "run", "-d", "--label", PROJECT_LABEL, "--name", self._c("lp-provider"),
-            "--network", self.NET, "--ip", self.IP_PROVIDER,
-            "--volume", f"{self.seed_dir}:/srv/seed:ro",
-            "--volume", f"{state_host}:/srv/state", *allowlist_mount, *self._env_args(),
+            "run",
+            "-d",
+            "--label",
+            PROJECT_LABEL,
+            "--name",
+            self._c("lp-provider"),
+            "--network",
+            self.NET,
+            "--ip",
+            self.IP_PROVIDER,
+            "--volume",
+            f"{self.seed_dir}:/srv/seed:ro",
+            "--volume",
+            f"{state_host}:/srv/state",
+            *allowlist_mount,
+            *self._env_args(),
             self.ctx.image,
-            "/bin/daemon", "--listen", f"0.0.0.0:{DAEMON_PORT}", "--upstream", proxy_url,
-            "--libp2p-provider", "--libp2p-mdns",
-            "--libp2p-listen", f"/ip4/{self.IP_PROVIDER}/tcp/{LIBP2P_BASE_PORT + 1}",
-            "--libp2p-scope", self.provider_scope, "--libp2p-print-peer-address", *seed_args,
+            "/bin/daemon",
+            "--listen",
+            f"0.0.0.0:{DAEMON_PORT}",
+            "--upstream",
+            proxy_url,
+            "--libp2p-provider",
+            "--libp2p-mdns",
+            "--libp2p-listen",
+            f"/ip4/{self.IP_PROVIDER}/tcp/{LIBP2P_BASE_PORT + 1}",
+            "--libp2p-scope",
+            self.provider_scope,
+            "--libp2p-print-peer-address",
+            *seed_args,
         ]
         run([pm, *provider_argv])
         # TASK-257 F-4: NO external restart. A lone-genesis provider (zero-bootstrap / mDNS) can
@@ -2683,15 +2799,33 @@ class Libp2pMdnsTopology:
         )
         self.provider_identity = ident
 
-    def _await_http_ready(self, role: str, ip: str, timeout: float = READY_TIMEOUT_S) -> None:
-        port = ORIGIN_PORT if role == "origin" else PROXY_PORT if role == "proxy" else DAEMON_PORT
+    def _await_http_ready(
+        self, role: str, ip: str, timeout: float = READY_TIMEOUT_S
+    ) -> None:
+        port = (
+            ORIGIN_PORT
+            if role == "origin"
+            else PROXY_PORT
+            if role == "proxy"
+            else DAEMON_PORT
+        )
         url = f"http://{ip}:{port}/nix-cache-info"
         deadline = time.time() + timeout
         while True:
             res = run(
-                [self._pm, "run", "--rm", "--label", PROJECT_LABEL, "--network", self.NET,
-                 self.ctx.image, "python3", "-c",
-                 f"import urllib.request;print(urllib.request.urlopen('{url}',timeout=2).status)"],
+                [
+                    self._pm,
+                    "run",
+                    "--rm",
+                    "--label",
+                    PROJECT_LABEL,
+                    "--network",
+                    self.NET,
+                    self.ctx.image,
+                    "python3",
+                    "-c",
+                    f"import urllib.request;print(urllib.request.urlopen('{url}',timeout=2).status)",
+                ],
                 check=False,
             )
             if (res.stdout or "").strip() == "200":
@@ -2701,7 +2835,9 @@ class Libp2pMdnsTopology:
                 die(f"mdns {role} did not become HTTP-ready at {url}")
             time.sleep(0.4)
 
-    def _await_provider_identity_no_restart(self, role: str, n_seeds: int, window_s: float):
+    def _await_provider_identity_no_restart(
+        self, role: str, n_seeds: int, window_s: float
+    ):
         """Poll for LIBP2P-PROVIDER-ADDR + n_seeds seed announce lines (printed only AFTER a
         successful announce), WITHOUT ever restarting the provider (TASK-257 F-4). The daemon's
         in-process bounded announce retry keeps the process alive while a same-scope LAN peer joins
@@ -2717,7 +2853,8 @@ class Libp2pMdnsTopology:
             if addr and len(seeds) >= n_seeds:
                 return addr.group(1), addr.group(2)
             state = run(
-                [self._pm, "inspect", "-f", "{{.State.Status}}", self._c(role)], check=False
+                [self._pm, "inspect", "-f", "{{.State.Status}}", self._c(role)],
+                check=False,
             ).stdout.strip()
             if state == "exited":
                 self._dump_logs()
@@ -2727,7 +2864,9 @@ class Libp2pMdnsTopology:
                 )
             time.sleep(0.3)
         self._dump_logs()
-        die(f"mdns provider ({role}) never announced within {window_s:.0f}s (no restart, F-4)")
+        die(
+            f"mdns provider ({role}) never announced within {window_s:.0f}s (no restart, F-4)"
+        )
 
     def logs(self, role: str) -> str:
         res = run([self._pm, "logs", self._c(role)], check=False)
@@ -2742,7 +2881,8 @@ class Libp2pMdnsTopology:
 
     def consumer_argv(self, role: str = "lp-consumer") -> list[str]:
         res = run(
-            [self._pm, "inspect", "-f", "{{json .Config.Cmd}}", self._c(role)], check=False
+            [self._pm, "inspect", "-f", "{{json .Config.Cmd}}", self._c(role)],
+            check=False,
         )
         raw = (res.stdout or "").strip()
         try:
@@ -2769,7 +2909,9 @@ class Libp2pMdnsTopology:
             return None, out
 
     def proxy_reset(self) -> None:
-        status = self._post(self._c("proxy"), f"http://127.0.0.1:{PROXY_PORT}/__testproxy/reset")
+        status = self._post(
+            self._c("proxy"), f"http://127.0.0.1:{PROXY_PORT}/__testproxy/reset"
+        )
         if status != 200:
             die(f"mdns proxy reset returned {status}")
 
@@ -2790,7 +2932,9 @@ class Libp2pMdnsTopology:
             "import sys,urllib.request\n"
             f"sys.stdout.write(urllib.request.urlopen('http://127.0.0.1:{PROXY_PORT}/__testproxy/stats',timeout=5).read().decode())\n"
         )
-        res = run([self._pm, "exec", self._c("proxy"), "python3", "-c", py], check=False)
+        res = run(
+            [self._pm, "exec", self._c("proxy"), "python3", "-c", py], check=False
+        )
         return json.loads(res.stdout)
 
     def client_run(self, role: str, targets: list[str], keys: str) -> "ClientResult":
@@ -2799,12 +2943,29 @@ class Libp2pMdnsTopology:
         ip = self.ROLE_IPS[role]
         subs = f"http://{ip}:{DAEMON_PORT}?priority=10"
         script = _CLIENT_SCRIPT.format(
-            subs=subs, keys=keys, targets=" ".join(targets), jobs=1, conns=1, start_at_ns=0
+            subs=subs,
+            keys=keys,
+            targets=" ".join(targets),
+            jobs=1,
+            conns=1,
+            start_at_ns=0,
         )
         res = run(
-            [self._pm, "run", "--rm", "--label", PROJECT_LABEL, "--network", self.NET,
-             self.ctx.image, "bash", "-c", script],
-            check=False, timeout=300,
+            [
+                self._pm,
+                "run",
+                "--rm",
+                "--label",
+                PROJECT_LABEL,
+                "--network",
+                self.NET,
+                self.ctx.image,
+                "bash",
+                "-c",
+                script,
+            ],
+            check=False,
+            timeout=300,
         )
         return _parse_client(res)
 
@@ -2857,7 +3018,9 @@ class Libp2pLanShareServeTopology:
             f"leaked: {leaked}",
         )
         if leaked:
-            raise RuntimeError(f"AC#5 abort (lan-serve): secret key(s) {leaked} present")
+            raise RuntimeError(
+                f"AC#5 abort (lan-serve): secret key(s) {leaked} present"
+            )
         self._create()
         return self
 
@@ -2875,22 +3038,68 @@ class Libp2pLanShareServeTopology:
         for role in self.roles():
             run([pm, "rm", "-f", "--ignore", self._c(role)], check=False)
         run([pm, "network", "rm", "-f", self.NET], check=False)
-        run([pm, "network", "create", "--label", PROJECT_LABEL, "--subnet", self.SUBNET, self.NET])
+        run(
+            [
+                pm,
+                "network",
+                "create",
+                "--label",
+                PROJECT_LABEL,
+                "--subnet",
+                self.SUBNET,
+                self.NET,
+            ]
+        )
 
         proxy_url = f"http://{self.IP_PROXY}:{PROXY_PORT}"
         run(
-            [pm, "run", "-d", "--label", PROJECT_LABEL, "--name", self._c("origin"),
-             "--network", self.NET, "--ip", self.IP_ORIGIN,
-             "--volume", f"{self.served_cache}:/srv/cache:ro", self.ctx.image,
-             "python3", "-m", "http.server", str(ORIGIN_PORT), "--bind", "0.0.0.0",
-             "--directory", "/srv/cache"]
+            [
+                pm,
+                "run",
+                "-d",
+                "--label",
+                PROJECT_LABEL,
+                "--name",
+                self._c("origin"),
+                "--network",
+                self.NET,
+                "--ip",
+                self.IP_ORIGIN,
+                "--volume",
+                f"{self.served_cache}:/srv/cache:ro",
+                self.ctx.image,
+                "python3",
+                "-m",
+                "http.server",
+                str(ORIGIN_PORT),
+                "--bind",
+                "0.0.0.0",
+                "--directory",
+                "/srv/cache",
+            ]
         )
         run(
-            [pm, "run", "-d", "--label", PROJECT_LABEL, "--name", self._c("proxy"),
-             "--network", self.NET, "--ip", self.IP_PROXY, self.ctx.image,
-             "/bin/testproxy", "--listen", f"0.0.0.0:{PROXY_PORT}",
-             "--upstream", f"http://{self.IP_ORIGIN}:{ORIGIN_PORT}",
-             "--cache-dir", "/tmp/proxy-cache"]
+            [
+                pm,
+                "run",
+                "-d",
+                "--label",
+                PROJECT_LABEL,
+                "--name",
+                self._c("proxy"),
+                "--network",
+                self.NET,
+                "--ip",
+                self.IP_PROXY,
+                self.ctx.image,
+                "/bin/testproxy",
+                "--listen",
+                f"0.0.0.0:{PROXY_PORT}",
+                "--upstream",
+                f"http://{self.IP_ORIGIN}:{ORIGIN_PORT}",
+                "--cache-dir",
+                "/tmp/proxy-cache",
+            ]
         )
         self._await_http_ready("origin", self.IP_ORIGIN)
         self._await_http_ready("proxy", self.IP_PROXY)
@@ -2901,11 +3110,31 @@ class Libp2pLanShareServeTopology:
         # listen). NO --libp2p-mdns/bootstrap/scope (mDNS is the profile default). announce-after-fetch
         # is its grow-from-fetch SUPPLY (a lan-share is always a provider and needs some supply).
         run(
-            [pm, "run", "-d", "--label", PROJECT_LABEL, "--name", self._c("lp-consumer"),
-             "--network", self.NET, "--ip", self.IP_B, self.ctx.image,
-             "/bin/daemon-libp2p", "--listen", f"0.0.0.0:{DAEMON_PORT}", "--upstream", proxy_url,
-             "--profile", "lan-share", "--libp2p-provider", "--libp2p-announce-after-fetch",
-             "--libp2p-listen", f"/ip4/{self.IP_B}/tcp/0"]
+            [
+                pm,
+                "run",
+                "-d",
+                "--label",
+                PROJECT_LABEL,
+                "--name",
+                self._c("lp-consumer"),
+                "--network",
+                self.NET,
+                "--ip",
+                self.IP_B,
+                self.ctx.image,
+                "/bin/daemon-libp2p",
+                "--listen",
+                f"0.0.0.0:{DAEMON_PORT}",
+                "--upstream",
+                proxy_url,
+                "--profile",
+                "lan-share",
+                "--libp2p-provider",
+                "--libp2p-announce-after-fetch",
+                "--libp2p-listen",
+                f"/ip4/{self.IP_B}/tcp/0",
+            ]
         )
         self._await_http_ready("lp-consumer", self.IP_B, timeout=READY_TIMEOUT_S + 45.0)
 
@@ -2917,27 +3146,64 @@ class Libp2pLanShareServeTopology:
         for s in self.provider_seeds:
             seed_args += ["--libp2p-seed-nar", f"{s.nar_hash}=/srv/seed/{s.filename}"]
         run(
-            [pm, "run", "-d", "--label", PROJECT_LABEL, "--name", self._c("lp-server"),
-             "--network", self.NET, "--ip", self.IP_A,
-             "--volume", f"{self.seed_dir}:/srv/seed:ro", self.ctx.image,
-             "/bin/daemon-libp2p", "--listen", f"0.0.0.0:{DAEMON_PORT}", "--upstream", proxy_url,
-             "--profile", "lan-share", "--libp2p-provider",
-             "--libp2p-listen", f"/ip4/{self.IP_A}/tcp/0",
-             "--libp2p-print-peer-address", *seed_args]
+            [
+                pm,
+                "run",
+                "-d",
+                "--label",
+                PROJECT_LABEL,
+                "--name",
+                self._c("lp-server"),
+                "--network",
+                self.NET,
+                "--ip",
+                self.IP_A,
+                "--volume",
+                f"{self.seed_dir}:/srv/seed:ro",
+                self.ctx.image,
+                "/bin/daemon-libp2p",
+                "--listen",
+                f"0.0.0.0:{DAEMON_PORT}",
+                "--upstream",
+                proxy_url,
+                "--profile",
+                "lan-share",
+                "--libp2p-provider",
+                "--libp2p-listen",
+                f"/ip4/{self.IP_A}/tcp/0",
+                "--libp2p-print-peer-address",
+                *seed_args,
+            ]
         )
         self.server_identity = self._await_server_announce(
             "lp-server", len(self.provider_seeds), READY_TIMEOUT_S + 45.0
         )
 
     def _await_http_ready(self, role, ip, timeout=READY_TIMEOUT_S):
-        port = ORIGIN_PORT if role == "origin" else PROXY_PORT if role == "proxy" else DAEMON_PORT
+        port = (
+            ORIGIN_PORT
+            if role == "origin"
+            else PROXY_PORT
+            if role == "proxy"
+            else DAEMON_PORT
+        )
         url = f"http://{ip}:{port}/nix-cache-info"
         deadline = time.time() + timeout
         while True:
             res = run(
-                [self._pm, "run", "--rm", "--label", PROJECT_LABEL, "--network", self.NET,
-                 self.ctx.image, "python3", "-c",
-                 f"import urllib.request;print(urllib.request.urlopen('{url}',timeout=2).status)"],
+                [
+                    self._pm,
+                    "run",
+                    "--rm",
+                    "--label",
+                    PROJECT_LABEL,
+                    "--network",
+                    self.NET,
+                    self.ctx.image,
+                    "python3",
+                    "-c",
+                    f"import urllib.request;print(urllib.request.urlopen('{url}',timeout=2).status)",
+                ],
                 check=False,
             )
             if (res.stdout or "").strip() == "200":
@@ -2960,7 +3226,8 @@ class Libp2pLanShareServeTopology:
             if addr and len(seeds) >= n_seeds:
                 return addr.group(1), addr.group(2)
             state = run(
-                [self._pm, "inspect", "-f", "{{.State.Status}}", self._c(role)], check=False
+                [self._pm, "inspect", "-f", "{{.State.Status}}", self._c(role)],
+                check=False,
             ).stdout.strip()
             if state == "exited":
                 self._dump_logs()
@@ -3003,7 +3270,9 @@ class Libp2pLanShareServeTopology:
             "import sys,urllib.request\n"
             f"sys.stdout.write(urllib.request.urlopen('http://127.0.0.1:{PROXY_PORT}/__testproxy/stats',timeout=5).read().decode())\n"
         )
-        res = run([self._pm, "exec", self._c("proxy"), "python3", "-c", py], check=False)
+        res = run(
+            [self._pm, "exec", self._c("proxy"), "python3", "-c", py], check=False
+        )
         return json.loads(res.stdout)
 
     def client_run(self, targets, keys):
@@ -3011,12 +3280,29 @@ class Libp2pLanShareServeTopology:
         routable IP). B peer-fetches the NAR from A cross-host over libp2p."""
         subs = f"http://{self.IP_B}:{DAEMON_PORT}?priority=10"
         script = _CLIENT_SCRIPT.format(
-            subs=subs, keys=keys, targets=" ".join(targets), jobs=1, conns=1, start_at_ns=0
+            subs=subs,
+            keys=keys,
+            targets=" ".join(targets),
+            jobs=1,
+            conns=1,
+            start_at_ns=0,
         )
         res = run(
-            [self._pm, "run", "--rm", "--label", PROJECT_LABEL, "--network", self.NET,
-             self.ctx.image, "bash", "-c", script],
-            check=False, timeout=300,
+            [
+                self._pm,
+                "run",
+                "--rm",
+                "--label",
+                PROJECT_LABEL,
+                "--network",
+                self.NET,
+                self.ctx.image,
+                "bash",
+                "-c",
+                script,
+            ],
+            check=False,
+            timeout=300,
         )
         return _parse_client(res)
 
@@ -3027,13 +3313,31 @@ class Libp2pLanShareServeTopology:
         name = f"{self.prefix}-neg"
         run([self._pm, "rm", "-f", "--ignore", name], check=False)
         res = run(
-            [self._pm, "run", "--rm", "--label", PROJECT_LABEL, "--name", name,
-             "--network", self.NET, self.ctx.image,
-             "/bin/daemon-libp2p", "--listen", f"0.0.0.0:{DAEMON_PORT}",
-             "--upstream", f"http://{self.IP_PROXY}:{PROXY_PORT}",
-             "--profile", "lan-share", "--libp2p-provider",
-             "--libp2p-announce-after-fetch", "--libp2p-listen", listen],
-            check=False, timeout=60,
+            [
+                self._pm,
+                "run",
+                "--rm",
+                "--label",
+                PROJECT_LABEL,
+                "--name",
+                name,
+                "--network",
+                self.NET,
+                self.ctx.image,
+                "/bin/daemon-libp2p",
+                "--listen",
+                f"0.0.0.0:{DAEMON_PORT}",
+                "--upstream",
+                f"http://{self.IP_PROXY}:{PROXY_PORT}",
+                "--profile",
+                "lan-share",
+                "--libp2p-provider",
+                "--libp2p-announce-after-fetch",
+                "--libp2p-listen",
+                listen,
+            ],
+            check=False,
+            timeout=60,
         )
         return res.returncode, (res.stdout or "") + (res.stderr or "")
 
@@ -3121,14 +3425,14 @@ class Libp2pIsolationBridgeTopology:
     # LAN net
     IP_LAN_ORIGIN = "10.211.34.13"
     IP_LAN_PROXY = "10.211.34.12"
-    IP_P = "10.211.34.11"          # provider: --profile lan-share, seeds K, LAN-only listen
-    IP_H = "10.211.34.14"          # lan helper: same-scope quorum + positive control
-    IP_X_LAN = "10.211.34.20"      # bridge, LAN leg
+    IP_P = "10.211.34.11"  # provider: --profile lan-share, seeds K, LAN-only listen
+    IP_H = "10.211.34.14"  # lan helper: same-scope quorum + positive control
+    IP_X_LAN = "10.211.34.20"  # bridge, LAN leg
     # PUBLIC net
     IP_PUB_ORIGIN = "203.0.113.13"
     IP_PUB_PROXY = "203.0.113.12"
-    IP_X_PUB = "203.0.113.20"      # bridge, PUBLIC leg (P_pub bootstraps here)
-    IP_P_PUB = "203.0.113.30"      # public leech
+    IP_X_PUB = "203.0.113.20"  # bridge, PUBLIC leg (P_pub bootstraps here)
+    IP_P_PUB = "203.0.113.30"  # public leech
 
     def __init__(self, ctx, name, served_cache, seed_dir, provider_seeds, expect):
         self.ctx = ctx
@@ -3156,7 +3460,9 @@ class Libp2pIsolationBridgeTopology:
             f"leaked: {leaked}",
         )
         if leaked:
-            raise RuntimeError(f"AC#4 abort (isolation-bridge): secret key(s) {leaked} present")
+            raise RuntimeError(
+                f"AC#4 abort (isolation-bridge): secret key(s) {leaked} present"
+            )
         self._create()
         return self
 
@@ -3168,8 +3474,15 @@ class Libp2pIsolationBridgeTopology:
 
     def roles(self):
         return [
-            "lan-origin", "lan-proxy", "lp-provider", "lp-lan-helper",
-            "lp-bridge", "lp-public-leech", "pub-origin", "pub-proxy", "dial-pcap",
+            "lan-origin",
+            "lan-proxy",
+            "lp-provider",
+            "lp-lan-helper",
+            "lp-bridge",
+            "lp-public-leech",
+            "pub-origin",
+            "pub-proxy",
+            "dial-pcap",
         ]
 
     def _create(self):
@@ -3183,10 +3496,30 @@ class Libp2pIsolationBridgeTopology:
         # net is TEST-NET-3 (classifies NON-LAN) — the whole exploit hinges on that split.
         run([pm, "network", "rm", "-f", self.LAN_NET], check=False)
         run([pm, "network", "rm", "-f", self.PUB_NET], check=False)
-        run([pm, "network", "create", "--label", PROJECT_LABEL,
-             "--subnet", self.LAN_SUBNET, self.LAN_NET])
-        run([pm, "network", "create", "--label", PROJECT_LABEL,
-             "--subnet", self.PUB_SUBNET, self.PUB_NET])
+        run(
+            [
+                pm,
+                "network",
+                "create",
+                "--label",
+                PROJECT_LABEL,
+                "--subnet",
+                self.LAN_SUBNET,
+                self.LAN_NET,
+            ]
+        )
+        run(
+            [
+                pm,
+                "network",
+                "create",
+                "--label",
+                PROJECT_LABEL,
+                "--subnet",
+                self.PUB_SUBNET,
+                self.PUB_NET,
+            ]
+        )
 
         lan_proxy_url = f"http://{self.IP_LAN_PROXY}:{PROXY_PORT}"
         pub_proxy_url = f"http://{self.IP_PUB_PROXY}:{PROXY_PORT}"
@@ -3194,9 +3527,13 @@ class Libp2pIsolationBridgeTopology:
         # --- support: origin + testproxy PER net (both fronting the SAME served cache, which holds
         #     K; the PUBLIC pair is the honest "public internet" P_pub legitimately falls back to).
         self._run_origin("lan-origin", self.LAN_NET, self.IP_LAN_ORIGIN)
-        self._run_proxy("lan-proxy", self.LAN_NET, self.IP_LAN_PROXY, self.IP_LAN_ORIGIN)
+        self._run_proxy(
+            "lan-proxy", self.LAN_NET, self.IP_LAN_PROXY, self.IP_LAN_ORIGIN
+        )
         self._run_origin("pub-origin", self.PUB_NET, self.IP_PUB_ORIGIN)
-        self._run_proxy("pub-proxy", self.PUB_NET, self.IP_PUB_PROXY, self.IP_PUB_ORIGIN)
+        self._run_proxy(
+            "pub-proxy", self.PUB_NET, self.IP_PUB_PROXY, self.IP_PUB_ORIGIN
+        )
         self._await_http_ready("lan-origin", self.LAN_NET, self.IP_LAN_ORIGIN)
         self._await_http_ready("lan-proxy", self.LAN_NET, self.IP_LAN_PROXY)
         self._await_http_ready("pub-origin", self.PUB_NET, self.IP_PUB_ORIGIN)
@@ -3207,12 +3544,31 @@ class Libp2pIsolationBridgeTopology:
         #     consume-only leech that JOINS P's frozen pool by passing --libp2p-scope lan-share.v1
         #     EXPLICITLY (SCOPE = AUDIENCE: the pool agrees on lan-share.v1 regardless of role).
         run(
-            [pm, "run", "-d", "--label", PROJECT_LABEL, "--name", self._c("lp-lan-helper"),
-             "--network", self.LAN_NET, "--ip", self.IP_H, self.ctx.image,
-             "/bin/daemon", "--listen", f"0.0.0.0:{DAEMON_PORT}", "--upstream", lan_proxy_url,
-             "--libp2p-leech", "--libp2p-mdns",
-             "--libp2p-listen", f"/ip4/{self.IP_H}/tcp/{LIBP2P_BASE_PORT}",
-             "--libp2p-scope", LIBP2P_LAN_SHARE_SCOPE]
+            [
+                pm,
+                "run",
+                "-d",
+                "--label",
+                PROJECT_LABEL,
+                "--name",
+                self._c("lp-lan-helper"),
+                "--network",
+                self.LAN_NET,
+                "--ip",
+                self.IP_H,
+                self.ctx.image,
+                "/bin/daemon",
+                "--listen",
+                f"0.0.0.0:{DAEMON_PORT}",
+                "--upstream",
+                lan_proxy_url,
+                "--libp2p-leech",
+                "--libp2p-mdns",
+                "--libp2p-listen",
+                f"/ip4/{self.IP_H}/tcp/{LIBP2P_BASE_PORT}",
+                "--libp2p-scope",
+                LIBP2P_LAN_SHARE_SCOPE,
+            ]
         )
         self._await_http_ready("lp-lan-helper", self.LAN_NET, self.IP_H)
 
@@ -3230,16 +3586,34 @@ class Libp2pIsolationBridgeTopology:
         #   then ADVERTISES the concrete 203.0.113.20 to P over identify is NOT directly observed — the
         #   DIAL/identify GREEN is consistent with "advertised-then-filtered" OR "never advertised".
         run(
-            [pm, "run", "-d", "--label", PROJECT_LABEL, "--name", self._c("lp-bridge"),
-             "--network", f"{self.LAN_NET}:ip={self.IP_X_LAN}",
-             "--network", f"{self.PUB_NET}:ip={self.IP_X_PUB}",
-             self.ctx.image,
-             "/bin/daemon", "--listen", f"0.0.0.0:{DAEMON_PORT}", "--upstream", pub_proxy_url,
-             "--libp2p-mdns",
-             "--libp2p-listen", f"/ip4/0.0.0.0/tcp/{LIBP2P_BASE_PORT}",
-             "--libp2p-bootstrap", f"{LIBP2P_DUMMY_PEER}@/ip4/127.0.0.1/tcp/1",
-             "--libp2p-identity-seed", LIBP2P_BOOT_SEED_HEX,
-             "--libp2p-scope", LIBP2P_DEFAULT_SCOPE]
+            [
+                pm,
+                "run",
+                "-d",
+                "--label",
+                PROJECT_LABEL,
+                "--name",
+                self._c("lp-bridge"),
+                "--network",
+                f"{self.LAN_NET}:ip={self.IP_X_LAN}",
+                "--network",
+                f"{self.PUB_NET}:ip={self.IP_X_PUB}",
+                self.ctx.image,
+                "/bin/daemon",
+                "--listen",
+                f"0.0.0.0:{DAEMON_PORT}",
+                "--upstream",
+                pub_proxy_url,
+                "--libp2p-mdns",
+                "--libp2p-listen",
+                f"/ip4/0.0.0.0/tcp/{LIBP2P_BASE_PORT}",
+                "--libp2p-bootstrap",
+                f"{LIBP2P_DUMMY_PEER}@/ip4/127.0.0.1/tcp/1",
+                "--libp2p-identity-seed",
+                LIBP2P_BOOT_SEED_HEX,
+                "--libp2p-scope",
+                LIBP2P_DEFAULT_SCOPE,
+            ]
         )
         # X has no HTTP daemon path we depend on for gating besides liveness; a readiness probe on
         # its LAN leg confirms it booted. TODO(TASK-280 validate): pick whichever leg podman makes
@@ -3250,14 +3624,32 @@ class Libp2pIsolationBridgeTopology:
         #     X's offline-derivable PeerId. NO --libp2p-provider-addr injection: it must LEARN K only
         #     via get_providers over the DHT X bridges. Its upstream is the PUBLIC proxy.
         run(
-            [pm, "run", "-d", "--label", PROJECT_LABEL, "--name", self._c("lp-public-leech"),
-             "--network", self.PUB_NET, "--ip", self.IP_P_PUB, self.ctx.image,
-             "/bin/daemon", "--listen", f"0.0.0.0:{DAEMON_PORT}", "--upstream", pub_proxy_url,
-             "--libp2p-leech",
-             "--libp2p-listen", f"/ip4/{self.IP_P_PUB}/tcp/{LIBP2P_BASE_PORT}",
-             "--libp2p-bootstrap",
-             f"{LIBP2P_BOOT_PEER_ID}@/ip4/{self.IP_X_PUB}/tcp/{LIBP2P_BASE_PORT}",
-             "--libp2p-scope", LIBP2P_DEFAULT_SCOPE]
+            [
+                pm,
+                "run",
+                "-d",
+                "--label",
+                PROJECT_LABEL,
+                "--name",
+                self._c("lp-public-leech"),
+                "--network",
+                self.PUB_NET,
+                "--ip",
+                self.IP_P_PUB,
+                self.ctx.image,
+                "/bin/daemon",
+                "--listen",
+                f"0.0.0.0:{DAEMON_PORT}",
+                "--upstream",
+                pub_proxy_url,
+                "--libp2p-leech",
+                "--libp2p-listen",
+                f"/ip4/{self.IP_P_PUB}/tcp/{LIBP2P_BASE_PORT}",
+                "--libp2p-bootstrap",
+                f"{LIBP2P_BOOT_PEER_ID}@/ip4/{self.IP_X_PUB}/tcp/{LIBP2P_BASE_PORT}",
+                "--libp2p-scope",
+                LIBP2P_DEFAULT_SCOPE,
+            ]
         )
         self._await_http_ready("lp-public-leech", self.PUB_NET, self.IP_P_PUB)
 
@@ -3269,13 +3661,34 @@ class Libp2pIsolationBridgeTopology:
         for s in self.provider_seeds:
             seed_args += ["--libp2p-seed-nar", f"{s.nar_hash}=/srv/seed/{s.filename}"]
         run(
-            [pm, "run", "-d", "--label", PROJECT_LABEL, "--name", self._c("lp-provider"),
-             "--network", self.LAN_NET, "--ip", self.IP_P,
-             "--volume", f"{self.seed_dir}:/srv/seed:ro", self.ctx.image,
-             "/bin/daemon-libp2p", "--listen", f"0.0.0.0:{DAEMON_PORT}", "--upstream", lan_proxy_url,
-             "--profile", "lan-share", "--libp2p-provider",
-             "--libp2p-listen", f"/ip4/{self.IP_P}/tcp/0",
-             "--libp2p-print-peer-address", *seed_args]
+            [
+                pm,
+                "run",
+                "-d",
+                "--label",
+                PROJECT_LABEL,
+                "--name",
+                self._c("lp-provider"),
+                "--network",
+                self.LAN_NET,
+                "--ip",
+                self.IP_P,
+                "--volume",
+                f"{self.seed_dir}:/srv/seed:ro",
+                self.ctx.image,
+                "/bin/daemon-libp2p",
+                "--listen",
+                f"0.0.0.0:{DAEMON_PORT}",
+                "--upstream",
+                lan_proxy_url,
+                "--profile",
+                "lan-share",
+                "--libp2p-provider",
+                "--libp2p-listen",
+                f"/ip4/{self.IP_P}/tcp/0",
+                "--libp2p-print-peer-address",
+                *seed_args,
+            ]
         )
 
         # --- DIAL-leg pcap: a tcpdump SHARING P's netns (so it sees P's LAN eth0) that prints every
@@ -3290,12 +3703,26 @@ class Libp2pIsolationBridgeTopology:
         #   is a false green even at reverted HEAD) — prove by observing the SYN at reverted HEAD;
         #   (d) --cap-add NET_RAW works rootless here (the iroh relay evidence path relies on it).
         run(
-            [pm, "run", "-d", "--label", PROJECT_LABEL, "--name", self._c("dial-pcap"),
-             "--cap-add", "NET_RAW",
-             "--network", f"container:{self._c('lp-provider')}",
-             self.ctx.image,
-             "/bin/tcpdump", "-i", "eth0", "-nn", "-l",
-             f"dst net {self.PUB_SUBNET} and tcp[tcpflags] & tcp-syn != 0"],
+            [
+                pm,
+                "run",
+                "-d",
+                "--label",
+                PROJECT_LABEL,
+                "--name",
+                self._c("dial-pcap"),
+                "--cap-add",
+                "NET_RAW",
+                "--network",
+                f"container:{self._c('lp-provider')}",
+                self.ctx.image,
+                "/bin/tcpdump",
+                "-i",
+                "eth0",
+                "-nn",
+                "-l",
+                f"dst net {self.PUB_SUBNET} and tcp[tcpflags] & tcp-syn != 0",
+            ],
             check=False,
         )
 
@@ -3306,33 +3733,80 @@ class Libp2pIsolationBridgeTopology:
     # ---- container spawn helpers -------------------------------------------
     def _run_origin(self, role, net, ip):
         run(
-            [self._pm, "run", "-d", "--label", PROJECT_LABEL, "--name", self._c(role),
-             "--network", net, "--ip", ip,
-             "--volume", f"{self.served_cache}:/srv/cache:ro", self.ctx.image,
-             "python3", "-m", "http.server", str(ORIGIN_PORT), "--bind", "0.0.0.0",
-             "--directory", "/srv/cache"]
+            [
+                self._pm,
+                "run",
+                "-d",
+                "--label",
+                PROJECT_LABEL,
+                "--name",
+                self._c(role),
+                "--network",
+                net,
+                "--ip",
+                ip,
+                "--volume",
+                f"{self.served_cache}:/srv/cache:ro",
+                self.ctx.image,
+                "python3",
+                "-m",
+                "http.server",
+                str(ORIGIN_PORT),
+                "--bind",
+                "0.0.0.0",
+                "--directory",
+                "/srv/cache",
+            ]
         )
 
     def _run_proxy(self, role, net, ip, origin_ip):
         run(
-            [self._pm, "run", "-d", "--label", PROJECT_LABEL, "--name", self._c(role),
-             "--network", net, "--ip", ip, self.ctx.image,
-             "/bin/testproxy", "--listen", f"0.0.0.0:{PROXY_PORT}",
-             "--upstream", f"http://{origin_ip}:{ORIGIN_PORT}",
-             "--cache-dir", "/tmp/proxy-cache"]
+            [
+                self._pm,
+                "run",
+                "-d",
+                "--label",
+                PROJECT_LABEL,
+                "--name",
+                self._c(role),
+                "--network",
+                net,
+                "--ip",
+                ip,
+                self.ctx.image,
+                "/bin/testproxy",
+                "--listen",
+                f"0.0.0.0:{PROXY_PORT}",
+                "--upstream",
+                f"http://{origin_ip}:{ORIGIN_PORT}",
+                "--cache-dir",
+                "/tmp/proxy-cache",
+            ]
         )
 
     def _await_http_ready(self, role, net, ip, timeout=READY_TIMEOUT_S):
-        port = ORIGIN_PORT if role.endswith("origin") else (
-            PROXY_PORT if role.endswith("proxy") else DAEMON_PORT
+        port = (
+            ORIGIN_PORT
+            if role.endswith("origin")
+            else (PROXY_PORT if role.endswith("proxy") else DAEMON_PORT)
         )
         url = f"http://{ip}:{port}/nix-cache-info"
         deadline = time.time() + timeout
         while True:
             res = run(
-                [self._pm, "run", "--rm", "--label", PROJECT_LABEL, "--network", net,
-                 self.ctx.image, "python3", "-c",
-                 f"import urllib.request;print(urllib.request.urlopen('{url}',timeout=2).status)"],
+                [
+                    self._pm,
+                    "run",
+                    "--rm",
+                    "--label",
+                    PROJECT_LABEL,
+                    "--network",
+                    net,
+                    self.ctx.image,
+                    "python3",
+                    "-c",
+                    f"import urllib.request;print(urllib.request.urlopen('{url}',timeout=2).status)",
+                ],
                 check=False,
             )
             if (res.stdout or "").strip() == "200":
@@ -3357,7 +3831,8 @@ class Libp2pIsolationBridgeTopology:
             if addr and len(seeds) >= n_seeds:
                 return addr.group(1), addr.group(2)
             state = run(
-                [self._pm, "inspect", "-f", "{{.State.Status}}", self._c(role)], check=False
+                [self._pm, "inspect", "-f", "{{.State.Status}}", self._c(role)],
+                check=False,
             ).stdout.strip()
             if state == "exited":
                 self._dump_logs()
@@ -3368,7 +3843,9 @@ class Libp2pIsolationBridgeTopology:
                 )
             time.sleep(0.3)
         self._dump_logs()
-        die(f"isolation-bridge provider ({role}) never announced within {window_s:.0f}s")
+        die(
+            f"isolation-bridge provider ({role}) never announced within {window_s:.0f}s"
+        )
 
     # ---- observation helpers -----------------------------------------------
     def logs(self, role):
@@ -3407,14 +3884,20 @@ class Libp2pIsolationBridgeTopology:
             return None
 
     def proxy_reset(self, which):
-        self._post(self._proxy_container(which), f"http://127.0.0.1:{PROXY_PORT}/__testproxy/reset")
+        self._post(
+            self._proxy_container(which),
+            f"http://127.0.0.1:{PROXY_PORT}/__testproxy/reset",
+        )
 
     def proxy_stats(self, which):
         py = (
             "import sys,urllib.request\n"
             f"sys.stdout.write(urllib.request.urlopen('http://127.0.0.1:{PROXY_PORT}/__testproxy/stats',timeout=5).read().decode())\n"
         )
-        res = run([self._pm, "exec", self._proxy_container(which), "python3", "-c", py], check=False)
+        res = run(
+            [self._pm, "exec", self._proxy_container(which), "python3", "-c", py],
+            check=False,
+        )
         return json.loads(res.stdout)
 
     def client_run(self, role, targets, keys):
@@ -3427,12 +3910,29 @@ class Libp2pIsolationBridgeTopology:
         net, ip = self._role_net_ip[role]
         subs = f"http://{ip}:{DAEMON_PORT}?priority=10"
         script = _CLIENT_SCRIPT.format(
-            subs=subs, keys=keys, targets=" ".join(targets), jobs=1, conns=1, start_at_ns=0
+            subs=subs,
+            keys=keys,
+            targets=" ".join(targets),
+            jobs=1,
+            conns=1,
+            start_at_ns=0,
         )
         res = run(
-            [self._pm, "run", "--rm", "--label", PROJECT_LABEL, "--network", net,
-             self.ctx.image, "bash", "-c", script],
-            check=False, timeout=300,
+            [
+                self._pm,
+                "run",
+                "--rm",
+                "--label",
+                PROJECT_LABEL,
+                "--network",
+                net,
+                self.ctx.image,
+                "bash",
+                "-c",
+                script,
+            ],
+            check=False,
+            timeout=300,
         )
         return _parse_client(res)
 
@@ -7056,10 +7556,7 @@ def _seed_and_grow_impl(ctx: Ctx, expect, thin: bool) -> None:
         deadline = time.time() + READY_TIMEOUT_S
         while time.time() < deadline:
             plog = pod.logs("lp-provider")
-            if (
-                "LIBP2P-ANNOUNCE-AFTER-FETCH narhash=" in plog
-                and grow_nar_hash in plog
-            ):
+            if "LIBP2P-ANNOUNCE-AFTER-FETCH narhash=" in plog and grow_nar_hash in plog:
                 announced = True
                 break
             time.sleep(0.5)
@@ -7464,7 +7961,12 @@ def scenario_libp2p_mdns_bootstrap(ctx: Ctx, expect) -> None:
     fixtures = ctx.fixtures
     seed_dir, prov_seeds, target_sp = _s7_seeds(ctx, "mdns", S7_TARGET)
     with Libp2pMdnsTopology(
-        ctx, "mdns", fixtures.cache, seed_dir, prov_seeds, expect,
+        ctx,
+        "mdns",
+        fixtures.cache,
+        seed_dir,
+        prov_seeds,
+        expect,
         provider_scope=LIBP2P_SCOPE,
         consumers=(("lp-consumer", LIBP2P_SCOPE),),
         libp2p_trusted_key=fixtures.public_key,
@@ -7480,7 +7982,8 @@ def scenario_libp2p_mdns_bootstrap(ctx: Ctx, expect) -> None:
             f"argv={joined!r}",
         )
         expect(
-            "--libp2p-provider-addr" not in argv and (not prov_id or prov_id not in joined),
+            "--libp2p-provider-addr" not in argv
+            and (not prov_id or prov_id not in joined),
             "mdns no-injection: consumer argv omits the provider's PeerId + any provider-addr",
             f"prov_id={prov_id!r} argv={joined!r}",
         )
@@ -7563,7 +8066,12 @@ def scenario_measure_discovery_latency(ctx: Ctx, expect) -> None:
     evidence_dir.mkdir(parents=True, exist_ok=True)
 
     with Libp2pMdnsTopology(
-        ctx, "dlat", fixtures.cache, seed_dir, prov_seeds, expect,
+        ctx,
+        "dlat",
+        fixtures.cache,
+        seed_dir,
+        prov_seeds,
+        expect,
         provider_scope=LIBP2P_SCOPE,
         consumers=(("lp-consumer", LIBP2P_SCOPE),),
         libp2p_trusted_key=fixtures.public_key,
@@ -7609,7 +8117,9 @@ def scenario_measure_discovery_latency(ctx: Ctx, expect) -> None:
             "mdns_first_peer_ms_by_role": mdns_by_role,
             "kad_get_providers_ms_by_role": kad_by_role,
         }
-        (evidence_dir / "discovery-latency.json").write_text(json.dumps(result, indent=2) + "\n")
+        (evidence_dir / "discovery-latency.json").write_text(
+            json.dumps(result, indent=2) + "\n"
+        )
 
         # THE BITE (proves it measures the real path): at least one integer-ms latency of EACH
         # kind must have been parsed from the raw logs. Remove the instrumentation or the RUST_LOG
@@ -7651,7 +8161,12 @@ def scenario_libp2p_mdns_scope_isolation(ctx: Ctx, expect) -> None:
     scope_a = f"{LIBP2P_SCOPE}-mdns-a"
     scope_b = f"{LIBP2P_SCOPE}-mdns-b"
     with Libp2pMdnsTopology(
-        ctx, "mdnsscope", fixtures.cache, seed_dir, prov_seeds, expect,
+        ctx,
+        "mdnsscope",
+        fixtures.cache,
+        seed_dir,
+        prov_seeds,
+        expect,
         provider_scope=scope_a,
         # H shares the provider's scope (its quorum peer + positive control); C is cross-scope.
         consumers=(("lp-helper", scope_a), ("lp-consumer", scope_b)),
@@ -7664,7 +8179,8 @@ def scenario_libp2p_mdns_scope_isolation(ctx: Ctx, expect) -> None:
         topo.proxy_reset()
         res_h = topo.client_run("lp-helper", [target_sp], fixtures.public_key)
         expect(
-            res_h.exit_code == 0 and res_h.narhash(target_sp) == fixtures.nar_hash(S7_TARGET),
+            res_h.exit_code == 0
+            and res_h.narhash(target_sp) == fixtures.nar_hash(S7_TARGET),
             "mdns scope positive: the SAME-scope helper fetches the target byte-identically",
             res_h.stderr[-600:],
         )
@@ -7776,7 +8292,12 @@ def scenario_libp2p_lan_share_zeroconfig(ctx: Ctx, expect) -> None:
     # wins, so A/C land on lan-share.v1 to match B.
     pool_scope = "lan-share.v1"  # == fabric_libp2p::LAN_SHARE_NETWORK_SCOPE (frozen wire surface)
     with Libp2pMdnsTopology(
-        ctx, "lanshare", fixtures.cache, seed_dir, prov_seeds, expect,
+        ctx,
+        "lanshare",
+        fixtures.cache,
+        seed_dir,
+        prov_seeds,
+        expect,
         provider_scope=pool_scope,
         # C (lp-helper) FIRST so it is mDNS-live as A's independent quorum + positive control; then B.
         consumers=(("lp-helper", pool_scope), ("lp-consumer", pool_scope)),
@@ -7795,8 +8316,13 @@ def scenario_libp2p_lan_share_zeroconfig(ctx: Ctx, expect) -> None:
             "lan-share zeroconfig: node B argv carries --profile lan-share (its sole DISCOVERY intent)",
             f"argv={joined!r}",
         )
-        for forbidden in ("--libp2p-mdns", "--libp2p-bootstrap", "--libp2p-scope",
-                          "--libp2p-provider-addr", "--libp2p-leech"):
+        for forbidden in (
+            "--libp2p-mdns",
+            "--libp2p-bootstrap",
+            "--libp2p-scope",
+            "--libp2p-provider-addr",
+            "--libp2p-leech",
+        ):
             expect(
                 forbidden not in argv,
                 f"lan-share zeroconfig teeth: node B argv has NO {forbidden} "
@@ -7817,7 +8343,8 @@ def scenario_libp2p_lan_share_zeroconfig(ctx: Ctx, expect) -> None:
         topo.proxy_reset()
         res_h = topo.client_run("lp-helper", [target_sp], fixtures.public_key)
         expect(
-            res_h.exit_code == 0 and res_h.narhash(target_sp) == fixtures.nar_hash(S7_TARGET),
+            res_h.exit_code == 0
+            and res_h.narhash(target_sp) == fixtures.nar_hash(S7_TARGET),
             "lan-share zeroconfig positive control: the mDNS helper C fetches the target "
             "byte-identically (A announced + DHT works independently of B)",
             res_h.stderr[-600:],
@@ -7905,7 +8432,11 @@ def scenario_libp2p_lan_share_cross_host_serve(ctx: Ctx, expect) -> None:
         # keyword may appear ANYWHERE in A's serving/startup output (which includes the profile label).
         # This makes the gate bite future overclaims mechanically, not only by codex review.
         serving_line = next(
-            (ln for ln in alog.splitlines() if ln.startswith("SERVING on /ip4/10.211.34.11")),
+            (
+                ln
+                for ln in alog.splitlines()
+                if ln.startswith("SERVING on /ip4/10.211.34.11")
+            ),
             "",
         )
         expect(
@@ -7996,7 +8527,9 @@ def scenario_libp2p_lan_share_cross_host_serve(ctx: Ctx, expect) -> None:
         def _no_serve_disclosure(log):
             # With the guard hoisted before fabric construction, no listener binds and no serve gate
             # installs, so these post-bind disclosures never print on the refusal path.
-            return "SERVING on" not in log and "PROVIDER serving + announcing" not in log
+            return (
+                "SERVING on" not in log and "PROVIDER serving + announcing" not in log
+            )
 
         # (a) WILDCARD (would expose the serve port beyond the LAN). Bindable, so the ONLY failure
         # path is the guard -> attributable.
@@ -8088,7 +8621,8 @@ def scenario_libp2p_lan_share_isolation_bridge(ctx: Ctx, expect) -> None:
         topo.proxy_reset("lan")
         res_h = topo.client_run("lp-lan-helper", [target_sp], fixtures.public_key)
         expect(
-            res_h.exit_code == 0 and res_h.narhash(target_sp) == fixtures.nar_hash(S7_TARGET),
+            res_h.exit_code == 0
+            and res_h.narhash(target_sp) == fixtures.nar_hash(S7_TARGET),
             "isolation-bridge POSITIVE CONTROL: the same-scope LAN helper H fetches K byte-identically",
             res_h.stderr[-600:],
         )
